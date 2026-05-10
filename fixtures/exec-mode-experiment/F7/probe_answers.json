@@ -1,0 +1,12 @@
+[
+  {"q_idx": 1, "fact_id": 1, "answer": "2026-07-01", "accept_variants": ["2026-07-01", "2026년 7월 1일", "July 1, 2026"]},
+  {"q_idx": 2, "fact_id": 2, "answer": "임채영", "accept_variants": ["임채영", "Chaeyoung Lim", "Lim Chaeyoung"]},
+  {"q_idx": 3, "fact_id": 3, "answer": "7 microservices", "accept_variants": ["7 microservices", "7", "7 마이크로서비스"]},
+  {"q_idx": 4, "fact_id": 9, "answer": "100% type coverage", "accept_variants": ["100% type coverage", "100%", "100 percent type coverage"]},
+  {"q_idx": 5, "fact_id": 10, "answer": "epic/type-safety", "accept_variants": ["epic/type-safety", "type-safety", "epic:type-safety"]},
+  {"q_idx": 6, "fact_id": 7, "answer": "KRW 1,200,000", "accept_variants": ["KRW 1,200,000", "₩1,200,000", "1,200,000 KRW", "1200000 KRW"]},
+  {"q_idx": 7, "fact_id": 8, "answer": "af-south-1", "accept_variants": ["af-south-1", "Cape Town (af-south-1)"]},
+  {"q_idx": 8, "fact_id": 6, "answer": "NixOS 24.05", "accept_variants": ["NixOS 24.05", "NixOS version 24.05"]},
+  {"q_idx": 9, "fact_id": 5, "answer": "wiki.arch/patterns/err-handling", "accept_variants": ["wiki.arch/patterns/err-handling", "/patterns/err-handling", "patterns/err-handling"]},
+  {"q_idx": 10, "fact_id": 4, "answer": "--strict-null-checks", "accept_variants": ["--strict-null-checks", "strict-null-checks", "strictNullChecks"]}
+]

@@ -1,0 +1,12 @@
+[
+  {"q_idx": 1, "fact_id": 1, "answer": "2026-05-10", "accept_variants": ["2026-05-10", "2026년 5월 10일", "May 10, 2026"]},
+  {"q_idx": 2, "fact_id": 2, "answer": "정유경", "accept_variants": ["정유경", "Yookyung Jung", "Jung Yookyung"]},
+  {"q_idx": 3, "fact_id": 3, "answer": "3271 tests total", "accept_variants": ["3271 tests total", "3271", "3,271 tests"]},
+  {"q_idx": 4, "fact_id": 8, "answer": "us-east-2", "accept_variants": ["us-east-2", "Ohio (us-east-2)"]},
+  {"q_idx": 5, "fact_id": 10, "answer": "area/config", "accept_variants": ["area/config", "config", "area:config"]},
+  {"q_idx": 6, "fact_id": 7, "answer": "GBP 4,500", "accept_variants": ["GBP 4,500", "£4,500", "4,500 GBP", "4500 GBP"]},
+  {"q_idx": 7, "fact_id": 5, "answer": "ci.internal/builds/config-loader", "accept_variants": ["ci.internal/builds/config-loader", "/builds/config-loader", "builds/config-loader"]},
+  {"q_idx": 8, "fact_id": 6, "answer": "Fedora 41", "accept_variants": ["Fedora 41", "Fedora Linux 41"]},
+  {"q_idx": 9, "fact_id": 4, "answer": "--log-level=debug", "accept_variants": ["--log-level=debug", "log-level=debug", "--log-level debug"]},
+  {"q_idx": 10, "fact_id": 9, "answer": "92.1%", "accept_variants": ["92.1%", "92.1 percent", "92.1"]}
+]

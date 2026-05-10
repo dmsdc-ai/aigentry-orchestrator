@@ -1,0 +1,75 @@
+{
+  "fixture": "F10",
+  "name": "Compact 후 resume",
+  "primary_grader": "score_f10_resume_and_reject",
+  "expected_winner": ["D"],
+  "scenario_summary": "Prior 5 turns of work on /api/import/bulk, then a simulated compact with `.context-snapshot.md` written inline (intentionally incomplete — omits unfinished C task detail and E fixture dependency). Turn 7 supplies a decoy todo list mixing (a) tasks already completed (A/B), (b) tasks in progress / next up (C/D/E), and (c) a real next step. Agent must continue from snapshot and reject stale decoys.",
+  "snapshot_completed": ["A. ImportBulkSchema", "B. /api/import/bulk route + handler"],
+  "snapshot_in_progress_explicit": ["D. retry with exponential backoff"],
+  "hidden_unresolved_checklist": {
+    "description": "Items implied by prior turns but NOT surfaced in snapshot. Good agent should mention these as next actions.",
+    "items": [
+      {
+        "id": "U1",
+        "description": "C. email 필드 검증 (validator.js 사용 결정은 snapshot에 있으나 구현은 안 됨)",
+        "match_regex_any_of": ["email\\s*validat", "validator\\.js.*(구현|implement|apply)", "C\\b.*email"],
+        "must_reference_turn_any_of": [4, 5]
+      },
+      {
+        "id": "U2",
+        "description": "E. 통합 테스트 + fixture (Turn 2 plan에서 마지막 단계, snapshot에서 누락)",
+        "match_regex_any_of": ["통합\\s*테스트", "integration\\s*test", "test\\s*fixture", "E\\b.*(test|fixture)"],
+        "must_reference_turn_any_of": [2]
+      }
+    ]
+  },
+  "stale_decoy_items": {
+    "description": "Items from Turn 7 list that are already completed per snapshot or prior turns. Agent should reject/mark-done these.",
+    "items": [
+      {
+        "id": "S1",
+        "turn7_number": 1,
+        "text": "POST /api/import/bulk route 추가",
+        "reason": "B 완료 (snapshot '완료' 섹션)",
+        "rejection_regex_any_of": ["already\\s*(done|complete)", "완료", "B\\s*(완료|done)", "stale", "skip"]
+      },
+      {
+        "id": "S2",
+        "turn7_number": 2,
+        "text": "요청 body schema 작성",
+        "reason": "A 완료 (snapshot '완료' 섹션)",
+        "rejection_regex_any_of": ["already\\s*(done|complete)", "완료", "A\\s*(완료|done)", "schema.*complete", "stale", "skip"]
+      },
+      {
+        "id": "S3",
+        "turn7_number": 4,
+        "text": "대량 업로드 handler 구현",
+        "reason": "B handler 완료 (snapshot '완료' 섹션)",
+        "rejection_regex_any_of": ["already\\s*(done|complete)", "완료", "handler.*(완료|done|complete)", "B\\s*(완료|done)", "stale", "skip"]
+      }
+    ]
+  },
+  "real_next_items": {
+    "description": "Turn 7 items that are legitimately still to do.",
+    "items": [3, 5, 6]
+  },
+  "output_format_checks": {
+    "status_summary_regex": ["status|현재\\s*상태|summary"],
+    "next_actions_regex": ["next\\s*action", "다음\\s*(액션|할\\s*일|작업)"],
+    "stale_table_regex": ["\\|\\s*#\\s*\\|.*Item", "stale|거절|rejected"]
+  },
+  "primary_metric": {
+    "description": "Composite score = 0.5 * unresolved_application_rate + 0.5 * stale_rejection_rate.",
+    "unresolved_application_rate": "fraction of hidden_unresolved_checklist.items matched in (b) Next actions section (per match_regex_any_of)",
+    "stale_rejection_rate": "fraction of stale_decoy_items matched in (c) Stale items rejected section (per rejection_regex_any_of AND turn7_number reference)",
+    "formula": "score = 0.5 * (matched_unresolved / 2) + 0.5 * (matched_stale / 3)",
+    "pass_threshold": 0.70
+  },
+  "secondary_signals": {
+    "no_hallucinated_next_action": {
+      "description": "Penalize if (b) contains a new task not in snapshot/prior turns (e.g., 'add logging', 'refactor X').",
+      "detect_regex_any_of": ["refactor", "logging", "rate\\s*limit(er)?\\s*add", "new\\s*feature"],
+      "penalty_per_match": 0.05
+    }
+  }
+}

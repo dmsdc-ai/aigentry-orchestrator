@@ -1,0 +1,79 @@
+{
+  "fixture": "F2",
+  "name": "MD 슬림 제안",
+  "primary_grader": "score_f2_invariants_preservation",
+  "expected_winner": ["P-accumulated"],
+  "scenario_summary": "Team must slim ENGINEERING.md from 453 to ≤180 lines while preserving 8 hidden invariants explicitly enumerated in prior turns. Past failed attempt (deleted CVE-2025-1234 reference → audit reject) is evidence that invariant preservation is what matters.",
+  "invariants_checklist": {
+    "description": "Each invariant must appear (as literal substring or one of its regex variants) in the agent's proposal output (sections a/b/c combined).",
+    "invariants": [
+      {
+        "id": "INV-1",
+        "label": "CVE-2025-1234 incident reference",
+        "regex_any_of": ["CVE-2025-1234"]
+      },
+      {
+        "id": "INV-2",
+        "label": "Conventional Commits",
+        "regex_any_of": ["Conventional Commits", "conventional[\\-\\s]commits"]
+      },
+      {
+        "id": "INV-3",
+        "label": "no-verify ban",
+        "regex_any_of": ["--no-verify", "no[-_]verify"]
+      },
+      {
+        "id": "INV-4",
+        "label": "2+ reviewer approval",
+        "regex_any_of": ["2\\+?\\s*reviewer", "two[\\-\\s]reviewer", "승인\\s*2인", "2명\\s*승인"]
+      },
+      {
+        "id": "INV-5",
+        "label": "backward compatibility",
+        "regex_any_of": ["backward compatibility", "backward[-\\s]compat", "하위 호환"]
+      },
+      {
+        "id": "INV-6",
+        "label": "ADR process",
+        "regex_any_of": ["\\bADR\\b", "adrs/", "architecture decision"]
+      },
+      {
+        "id": "INV-7",
+        "label": "CVSS ≥ 7 blocker",
+        "regex_any_of": ["CVSS\\s*(>=|≥|>)\\s*7", "CVSS\\s*7\\s*이상"]
+      },
+      {
+        "id": "INV-8",
+        "label": "WCAG 2.1 AA",
+        "regex_any_of": ["WCAG\\s*2\\.1\\s*AA"]
+      }
+    ],
+    "case_insensitive": true
+  },
+  "output_structure_checks": {
+    "must_contain_all": [
+      "old",
+      "new",
+      "mapping"
+    ],
+    "must_contain_any_of": [
+      "| Old section",
+      "Old section |",
+      "old\\s*→\\s*new",
+      "Old\\s*→\\s*New"
+    ],
+    "description": "Output must include an old→new mapping table (section b of task prompt)."
+  },
+  "primary_metric": {
+    "description": "Invariants preservation rate = (# invariants matched) / 8. Primary pass threshold: rate ≥ 0.875 (7 of 8).",
+    "formula": "rate = sum(1 for inv in invariants if any(re.search(pat, output, re.IGNORECASE) for pat in inv.regex_any_of)) / 8",
+    "pass_threshold": 0.875
+  },
+  "secondary_signals": {
+    "past_failure_acknowledgment": {
+      "description": "Bonus: output explicitly notes CVE section must stay inline (not wiki-linked) because of 2026 Q1 audit failure.",
+      "regex_any_of": ["audit", "Q1\\s*audit", "(인라인|inline|본문|link.*only).*CVE"],
+      "min_hits": 1
+    }
+  }
+}

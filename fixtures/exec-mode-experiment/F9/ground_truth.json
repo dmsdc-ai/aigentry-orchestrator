@@ -1,0 +1,68 @@
+{
+  "fixture": "F9",
+  "name": "Prior turn 디버그 (multiple causes)",
+  "primary_grader": "score_f9_root_cause",
+  "expected_winner": ["P-accumulated"],
+  "scenario_summary": "fetchWithRetry shows retries not firing in prod. File-local inspection yields 3+ plausible causes (off-by-one loop bound, exponential backoff overflow, Promise chain unwrap issue, catch type list). True root cause is disclosed only in Turn 5: team added CircuitOpenError class last week for circuit-breaker v2, but the catch block in fetchWithRetry only matches NetworkError | TimeoutError. When circuit opens, exception falls through to rethrow (line 20) without retry. P-accumulated wins because prior-turn context carries the decisive clue; D/S with only the file would need to infer.",
+  "file_local_red_herrings": [
+    {
+      "id": "R1",
+      "description": "Loop boundary `attempts < cfg.max` looks off-by-one",
+      "verdict": "not the cause — 0..<3 is correct for 3 attempts"
+    },
+    {
+      "id": "R2",
+      "description": "Exponential backoff `backoffMs * 2 ** attempts` may overflow",
+      "verdict": "not the cause — max=3 bounds multiplier to 8x, well within Number range"
+    },
+    {
+      "id": "R3",
+      "description": "Line 14 await over Promise.then chain could skip error handling",
+      "verdict": "not the cause — await resolves inner Promise, try/catch catches both fetch + json throws"
+    },
+    {
+      "id": "R4",
+      "description": "Catch block type list missing CircuitOpenError (the true cause)",
+      "verdict": "ROOT CAUSE"
+    }
+  ],
+  "true_root_cause": {
+    "id": "R4",
+    "summary": "Line 16 catch clause only matches NetworkError | TimeoutError. CircuitOpenError (added last week per Turn 5) falls through to the else branch (line 20) and rethrows without retry.",
+    "decisive_context_source_turn": 5,
+    "match_regex_any_of": [
+      "CircuitOpenError.*catch",
+      "catch.*CircuitOpenError",
+      "line\\s*16.*CircuitOpen",
+      "missing.*CircuitOpenError",
+      "catch.*(제외|missing|누락).*circuit"
+    ],
+    "must_reference_turn_any_of": [5]
+  },
+  "canonical_fix": {
+    "description": "Add CircuitOpenError to the catch type list AND update the import on line 1.",
+    "fix_regex_any_of_in_diff": [
+      "\\+.*import.*CircuitOpenError",
+      "\\+.*CircuitOpenError.*from.*errors",
+      "e\\s+instanceof\\s+CircuitOpenError"
+    ],
+    "min_regex_matches": 2,
+    "diff_file_target_regex": "a/net/client\\.ts"
+  },
+  "primary_metric": {
+    "description": "Composite: root_cause_exact_match * 0.5 + fix_correctness * 0.4 + evidence_quality * 0.1.",
+    "root_cause_score": "1.0 if (a) contains any true_root_cause.match_regex_any_of AND references Turn 5; 0.5 if cause correct but no turn cite; 0 if wrong cause",
+    "fix_score": "1.0 if fix_regex_any_of_in_diff count >= min_regex_matches in (c) diff; 0.5 if partial; 0 if absent",
+    "evidence_score": "1.0 if (b) explicitly rules out ≥2 of R1/R2/R3; 0.5 if rules out 1; 0 otherwise",
+    "formula": "score = 0.5 * root_cause_score + 0.4 * fix_score + 0.1 * evidence_score",
+    "pass_threshold": 0.70
+  },
+  "wrong_root_cause_penalty": {
+    "description": "If agent picks R1, R2, or R3 as primary cause, score = 0 (hard failure on primary metric).",
+    "detect_regex_any_of": [
+      "root\\s*cause.*(off[-\\s]by[-\\s]one|loop\\s*bound)",
+      "root\\s*cause.*overflow",
+      "root\\s*cause.*(promise\\s*chain|await.*then)"
+    ]
+  }
+}

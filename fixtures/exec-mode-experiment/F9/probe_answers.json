@@ -1,0 +1,12 @@
+[
+  {"q_idx": 1, "fact_id": 1, "answer": "2026-04-25", "accept_variants": ["2026-04-25", "2026년 4월 25일", "April 25, 2026"]},
+  {"q_idx": 2, "fact_id": 2, "answer": "한솔", "accept_variants": ["한솔", "Hansol", "한솔 on-call"]},
+  {"q_idx": 3, "fact_id": 9, "answer": "99.9% success target", "accept_variants": ["99.9% success target", "99.9% SLO", "99.9%"]},
+  {"q_idx": 4, "fact_id": 8, "answer": "ap-southeast-1", "accept_variants": ["ap-southeast-1", "Singapore (ap-southeast-1)"]},
+  {"q_idx": 5, "fact_id": 10, "answer": "sev/2-major", "accept_variants": ["sev/2-major", "2-major", "sev:2-major"]},
+  {"q_idx": 6, "fact_id": 7, "answer": "AUD 3,300", "accept_variants": ["AUD 3,300", "A$3,300", "3,300 AUD", "3300 AUD"]},
+  {"q_idx": 7, "fact_id": 6, "answer": "Alpine 3.20", "accept_variants": ["Alpine 3.20", "Alpine Linux 3.20"]},
+  {"q_idx": 8, "fact_id": 5, "answer": "alerts.ops/pd/retry-missing", "accept_variants": ["alerts.ops/pd/retry-missing", "/pd/retry-missing", "pd/retry-missing"]},
+  {"q_idx": 9, "fact_id": 3, "answer": "47 incidents", "accept_variants": ["47 incidents", "47", "47건"]},
+  {"q_idx": 10, "fact_id": 4, "answer": "--feature-circuit-v2", "accept_variants": ["--feature-circuit-v2", "feature-circuit-v2"]}
+]

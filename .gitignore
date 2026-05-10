@@ -1,0 +1,30 @@
+state
+
+# AGENTS.md slim backup (2026-04-20)
+AGENTS.md.pre-slim.*.bak
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local Claude Code settings (shared settings.json is OK, local overrides excluded)
+.claude/settings.local.json
+
+# Env / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# node
+node_modules/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# generic bak
+*.bak

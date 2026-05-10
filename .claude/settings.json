@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'CHECKLIST: (1) 직접수행금지-위임했는가? (2) 파일별세션분리? (3) 보고MANDATORY? (4) lessons포함? (5) 범용/크로스블로킹없음? (6) 증거기반? (7) 영어inject?'"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'ORCHESTRATOR: telepty inject 시 (1) --ref + --submit + --from (2) MANDATORY 보고 (3) [SAWP] envelope 포함 확인. SAWP 빠뜨리면 rule 17 위반'"
+          }
+        ]
+      }
+    ]
+  }
+}

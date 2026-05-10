@@ -1,0 +1,12 @@
+[
+  {"q_idx": 1, "fact_id": 1, "answer": "2026-06-10", "accept_variants": ["2026-06-10", "June 10, 2026", "2026년 6월 10일"]},
+  {"q_idx": 2, "fact_id": 2, "answer": "김세련", "accept_variants": ["김세련", "Seryun Kim", "Kim Seryun"]},
+  {"q_idx": 3, "fact_id": 9, "answer": "99.5% uptime", "accept_variants": ["99.5% uptime", "99.5 percent uptime", "99.5%"]},
+  {"q_idx": 4, "fact_id": 10, "answer": "kind/refactor", "accept_variants": ["kind/refactor", "refactor", "kind:refactor"]},
+  {"q_idx": 5, "fact_id": 7, "answer": "EUR 1,500", "accept_variants": ["EUR 1,500", "€1,500", "1,500 EUR", "1500 EUR"]},
+  {"q_idx": 6, "fact_id": 6, "answer": "Debian 12.7", "accept_variants": ["Debian 12.7", "Debian Bookworm 12.7"]},
+  {"q_idx": 7, "fact_id": 8, "answer": "eu-west-1", "accept_variants": ["eu-west-1", "Ireland (eu-west-1)"]},
+  {"q_idx": 8, "fact_id": 5, "answer": "ops.pulse/metrics/rtf", "accept_variants": ["ops.pulse/metrics/rtf", "/metrics/rtf", "metrics/rtf"]},
+  {"q_idx": 9, "fact_id": 4, "answer": "--no-default-features", "accept_variants": ["--no-default-features", "no-default-features"]},
+  {"q_idx": 10, "fact_id": 3, "answer": "384 commits", "accept_variants": ["384 commits", "384", "384 git commits"]}
+]

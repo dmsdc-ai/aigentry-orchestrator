@@ -1,0 +1,82 @@
+[
+  {
+    "id": 1,
+    "keyword": "2026-05-15",
+    "sentence": "컴플라이언스 audit 마감이 2026-05-15",
+    "type": "date",
+    "turn": 1,
+    "embed_variants": ["2026-05-15", "May 15 2026", "2026년 5월 15일", "audit deadline 2026-05-15"]
+  },
+  {
+    "id": 2,
+    "keyword": "박도윤",
+    "sentence": "팀장은 박도윤 님이 승인권자",
+    "type": "name",
+    "turn": 2,
+    "embed_variants": ["박도윤", "Dohyun Park", "team lead 박도윤", "박도윤 팀장"]
+  },
+  {
+    "id": 3,
+    "keyword": "453 lines",
+    "sentence": "현재 문서는 453 lines",
+    "type": "number",
+    "turn": 1,
+    "embed_variants": ["453 lines", "453 줄", "current doc 453 lines"]
+  },
+  {
+    "id": 4,
+    "keyword": "--skip-changelog",
+    "sentence": "CI 빌드는 --skip-changelog 플래그 켜진 환경에서도 통과",
+    "type": "cli_flag",
+    "turn": 3,
+    "embed_variants": ["--skip-changelog", "skip-changelog flag", "skip changelog 플래그"]
+  },
+  {
+    "id": 5,
+    "keyword": "wiki.internal/eng/adr-index",
+    "sentence": "wiki.internal/eng/adr-index에 링크만 남기는 형태로는 컴플라이언스 불통",
+    "type": "url_slug",
+    "turn": 4,
+    "embed_variants": ["wiki.internal/eng/adr-index", "ADR index wiki path", "adr-index 페이지"]
+  },
+  {
+    "id": 6,
+    "keyword": "macOS Sequoia 15.2",
+    "sentence": "내 로컬은 macOS Sequoia 15.2",
+    "type": "os_version",
+    "turn": 5,
+    "embed_variants": ["macOS Sequoia 15.2", "Sequoia 15.2", "macOS 15.2 Sequoia"]
+  },
+  {
+    "id": 7,
+    "keyword": "USD 6,200",
+    "sentence": "팀 SaaS 월 비용 USD 6,200으로 잡혀 있다",
+    "type": "currency",
+    "turn": 5,
+    "embed_variants": ["USD 6,200", "$6,200", "6,200 USD SaaS monthly"]
+  },
+  {
+    "id": 8,
+    "keyword": "us-west-2",
+    "sentence": "배포는 us-west-2에서 진행 중",
+    "type": "region_code",
+    "turn": 6,
+    "embed_variants": ["us-west-2", "Oregon us-west-2", "us-west-2 region"]
+  },
+  {
+    "id": 9,
+    "keyword": "p95<120ms",
+    "sentence": "현재 API 서비스 p95<120ms SLO가 걸려 있다",
+    "type": "slo",
+    "turn": 7,
+    "embed_variants": ["p95<120ms", "p95 under 120ms", "p95 latency < 120ms"]
+  },
+  {
+    "id": 10,
+    "keyword": "severity/blocker",
+    "sentence": "관련 티켓 라벨은 severity/blocker",
+    "type": "label",
+    "turn": 7,
+    "embed_variants": ["severity/blocker", "blocker 라벨", "label severity/blocker"]
+  }
+]

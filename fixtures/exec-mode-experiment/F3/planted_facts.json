@@ -1,0 +1,82 @@
+[
+  {
+    "id": 1,
+    "keyword": "2026-04-22",
+    "sentence": "마감은 2026-04-22 오후 6시",
+    "type": "date",
+    "turn": 1,
+    "embed_variants": ["2026-04-22", "April 22, 2026", "2026년 4월 22일"]
+  },
+  {
+    "id": 2,
+    "keyword": "오찬우",
+    "sentence": "담당자 오찬우가 오늘 PTO라 대리 리뷰",
+    "type": "name",
+    "turn": 1,
+    "embed_variants": ["오찬우", "Chanwoo Oh", "오찬우님"]
+  },
+  {
+    "id": 3,
+    "keyword": "7981",
+    "sentence": "build 7981",
+    "type": "number",
+    "turn": 3,
+    "embed_variants": ["build 7981", "7981번", "current build 7981"]
+  },
+  {
+    "id": 4,
+    "keyword": "mysql2@3.11.3",
+    "sentence": "드라이버는 mysql2@3.11.3",
+    "type": "package_version",
+    "turn": 3,
+    "embed_variants": ["mysql2@3.11.3", "mysql2 3.11.3", "mysql2 v3.11.3"]
+  },
+  {
+    "id": 5,
+    "keyword": "grafana.ops/auth-p95",
+    "sentence": "모니터링은 grafana.ops/auth-p95에서 latency 패널 추적",
+    "type": "url_slug",
+    "turn": 4,
+    "embed_variants": ["grafana.ops/auth-p95", "grafana auth-p95 dashboard", "auth-p95 panel"]
+  },
+  {
+    "id": 6,
+    "keyword": "Ubuntu 24.04.1 LTS",
+    "sentence": "러너는 Ubuntu 24.04.1 LTS",
+    "type": "os_version",
+    "turn": 5,
+    "embed_variants": ["Ubuntu 24.04.1 LTS", "Ubuntu 24.04", "Ubuntu 24.04.1"]
+  },
+  {
+    "id": 7,
+    "keyword": "USD 42",
+    "sentence": "per-issue LLM call 비용을 USD 42로 상한",
+    "type": "currency",
+    "turn": 5,
+    "embed_variants": ["USD 42", "$42", "42 USD per issue"]
+  },
+  {
+    "id": 8,
+    "keyword": "ap-northeast-2",
+    "sentence": "배포 region은 ap-northeast-2",
+    "type": "region_code",
+    "turn": 5,
+    "embed_variants": ["ap-northeast-2", "Seoul ap-northeast-2", "ap-northeast-2 리전"]
+  },
+  {
+    "id": 9,
+    "keyword": "91.4%",
+    "sentence": "현재 coverage 91.4%",
+    "type": "ratio",
+    "turn": 7,
+    "embed_variants": ["91.4%", "coverage 91.4", "91.4 percent"]
+  },
+  {
+    "id": 10,
+    "keyword": "area/auth",
+    "sentence": "관련 티켓 라벨은 area/auth",
+    "type": "label",
+    "turn": 7,
+    "embed_variants": ["area/auth", "auth area label", "label area/auth"]
+  }
+]

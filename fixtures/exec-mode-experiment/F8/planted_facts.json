@@ -1,0 +1,82 @@
+[
+  {
+    "id": 1,
+    "keyword": "2026-08-20",
+    "sentence": "프로젝트 핸드오프 2026-08-20",
+    "type": "date",
+    "turn": 1,
+    "embed_variants": ["2026-08-20", "August 20 2026", "2026년 8월 20일"]
+  },
+  {
+    "id": 2,
+    "keyword": "배우진",
+    "sentence": "엔지니어 배우진이 owner",
+    "type": "name",
+    "turn": 1,
+    "embed_variants": ["배우진", "Woojin Bae", "engineer 배우진"]
+  },
+  {
+    "id": 3,
+    "keyword": "180 validators",
+    "sentence": "전체 validator 180 validators 중 ingest가 3개 차지",
+    "type": "number",
+    "turn": 1,
+    "embed_variants": ["180 validators", "180 validator 함수", "180 total validators"]
+  },
+  {
+    "id": 4,
+    "keyword": "--experimental-validator-cache",
+    "sentence": "--experimental-validator-cache 옵션을 고려해야 하나요",
+    "type": "cli_flag",
+    "turn": 4,
+    "embed_variants": ["--experimental-validator-cache", "experimental-validator-cache flag", "validator-cache 플래그"]
+  },
+  {
+    "id": 5,
+    "keyword": "code.internal/refactor/ingest-dedup",
+    "sentence": "리팩토링 추적은 code.internal/refactor/ingest-dedup에 올려놨다",
+    "type": "url_slug",
+    "turn": 3,
+    "embed_variants": ["code.internal/refactor/ingest-dedup", "/refactor/ingest-dedup", "ingest-dedup tracker"]
+  },
+  {
+    "id": 6,
+    "keyword": "openSUSE Tumbleweed 20260210",
+    "sentence": "러너는 openSUSE Tumbleweed 20260210",
+    "type": "os_version",
+    "turn": 5,
+    "embed_variants": ["openSUSE Tumbleweed 20260210", "Tumbleweed 20260210", "openSUSE 20260210"]
+  },
+  {
+    "id": 7,
+    "keyword": "SGD 2,750",
+    "sentence": "이번 스프린트 리팩토링 예산 SGD 2,750",
+    "type": "currency",
+    "turn": 5,
+    "embed_variants": ["SGD 2,750", "S$2,750", "2,750 SGD"]
+  },
+  {
+    "id": 8,
+    "keyword": "me-central-1",
+    "sentence": "배포 region이 me-central-1",
+    "type": "region_code",
+    "turn": 6,
+    "embed_variants": ["me-central-1", "UAE me-central-1", "me-central-1 리전"]
+  },
+  {
+    "id": 9,
+    "keyword": "DAU 42k",
+    "sentence": "현재 DAU 42k 규모",
+    "type": "ratio",
+    "turn": 7,
+    "embed_variants": ["DAU 42k", "42k DAU", "42,000 DAU"]
+  },
+  {
+    "id": 10,
+    "keyword": "type/dedup",
+    "sentence": "티켓 라벨 type/dedup",
+    "type": "label",
+    "turn": 7,
+    "embed_variants": ["type/dedup", "dedup 라벨", "label type/dedup"]
+  }
+]

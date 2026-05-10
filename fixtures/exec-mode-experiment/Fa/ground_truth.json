@@ -1,0 +1,74 @@
+{
+  "fixture": "Fa",
+  "name": "False Prior Override",
+  "primary_grader": "score_fa_false_prior",
+  "expected_winner": ["D", "S"],
+  "scenario_summary": "Prior turns 1-4 establish a plausible but stale consensus ('rapidfuzz cannot handle NFC/NFD natively, preprocess with unidecode'). Turn 6 supplies evidence that reverses the consensus (rapidfuzz 3.12.2 added native NFC normalization; unidecode erases Hangul distinctions). Agent must apply the current truth in the implementation without being told which prior is stale.",
+  "binary_false_prior_leak": {
+    "description": "If Stage 1 agent output applies the stale prior (imports/calls unidecode, or claims rapidfuzz cannot handle unicode), leak = 1 (bad). Otherwise leak = 0 (good).",
+    "regex_mode": true,
+    "case_insensitive": true,
+    "leak_patterns": [
+      "\\bimport\\s+unidecode\\b",
+      "\\bfrom\\s+unidecode\\s+import\\b",
+      "\\bunidecode\\s*\\(",
+      "rapidfuzz[^\\n]{0,80}cannot[^\\n]{0,40}(unicode|NFC|NFD|한글)",
+      "(romanize|romanization)[^\\n]{0,40}(before|prior\\s+to)[^\\n]{0,40}(match|rapidfuzz|fuzz)",
+      "decomposition[^\\n]{0,40}(before|prior\\s+to)[^\\n]{0,40}rapidfuzz"
+    ],
+    "score": "leak = 1 if ANY pattern matches in agent_output, else 0"
+  },
+  "task_correctness": {
+    "description": "Function must be syntactically valid Python, match the required signature and return shape, and rely on rapidfuzz native matching (no unidecode preprocessing).",
+    "required_signature_regex": "def\\s+normalize_and_match\\s*\\(\\s*query[^\\)]*candidates[^\\)]*threshold[^\\)]*=\\s*80[^\\)]*\\)",
+    "must_contain_all": [
+      "def normalize_and_match",
+      "rapidfuzz",
+      "threshold",
+      "candidates"
+    ],
+    "must_contain_any_of": [
+      "process.extract",
+      "process.cdist",
+      "fuzz.ratio",
+      "fuzz.WRatio",
+      "fuzz.partial_ratio",
+      "fuzz.token_sort_ratio"
+    ],
+    "must_not_contain_regex": [
+      "\\bunidecode\\b"
+    ],
+    "return_shape_check": {
+      "description": "Sorted list of (candidate, score) tuples, descending by score, filtered by threshold",
+      "heuristic_regex": [
+        "sorted\\s*\\([^)]*reverse\\s*=\\s*True",
+        "key\\s*=\\s*lambda[^:]+:\\s*[^,\\)]*\\[1\\]",
+        ">=\\s*threshold|score\\s*>=\\s*threshold"
+      ],
+      "min_heuristic_hits": 1
+    },
+    "score": "1.0 if must_contain_all met AND any of must_contain_any_of met AND no must_not_contain_regex match AND ≥1 return_shape heuristic; else graded proportionally (0.25 per criterion met)"
+  },
+  "citation_to_reversal": {
+    "description": "Bonus: agent acknowledges the reversal (references 3.12 changelog / native NFC support / stale prior) in code comments, docstring, or accompanying prose.",
+    "signal_keywords_regex": [
+      "3\\.12(\\.\\d+)?",
+      "changelog",
+      "native\\s+NFC",
+      "NFC\\s+normal",
+      "default_process",
+      "processor\\s*=",
+      "(이전|prior|previous)[^\\n]{0,30}(consensus|기준|컨센서스)",
+      "(stale|outdated|더\\s*이상|no\\s+longer)"
+    ],
+    "min_hits_for_citation": 2,
+    "score": "1.0 if ≥ min_hits_for_citation distinct regex match in agent_output, else 0.0"
+  },
+  "primary_metric": {
+    "description": "Primary scalar = false_prior_correctness. Binary good-agent definition: leak=0 AND task_correctness ≥ 0.75.",
+    "formula": "primary_pass = (binary_false_prior_leak == 0) AND (task_correctness >= 0.75)",
+    "secondary_signals": ["citation_to_reversal"]
+  },
+  "known_good_sketch": "import rapidfuzz; def normalize_and_match(query, candidates, threshold=80): results = rapidfuzz.process.extract(query, candidates, scorer=rapidfuzz.fuzz.WRatio, processor=rapidfuzz.utils.default_process, score_cutoff=threshold); return sorted([(c, s) for c, s, _ in results], key=lambda x: x[1], reverse=True)",
+  "known_bad_sketch": "from unidecode import unidecode; import rapidfuzz; def normalize_and_match(query, candidates, threshold=80): q = unidecode(query); normalized = [unidecode(c) for c in candidates]; return rapidfuzz.process.extract(q, normalized, score_cutoff=threshold)"
+}

@@ -1,0 +1,67 @@
+{
+  "fixture": "F4",
+  "name": "구조 매핑 + 시각화",
+  "primary_grader": "score_f4_oracle_graph",
+  "expected_winner": ["D", "S"],
+  "scenario_summary": "Agent must produce ≥3 Mermaid diagrams + file inventory + FFI boundary note for the voxlite Rust+uniffi+Python project described in prior turns. Oracle graph scores entity (node) and edge matching with hallucinated-node penalty and file-anchor requirement.",
+  "oracle_graph": {
+    "nodes": [
+      "Cargo.toml",
+      "crates/voxlite-core/Cargo.toml",
+      "crates/voxlite-core/src/lib.rs",
+      "crates/voxlite-core/src/codec.rs",
+      "crates/voxlite-core/src/analyze.rs",
+      "crates/voxlite-ffi/Cargo.toml",
+      "crates/voxlite-ffi/src/lib.rs",
+      "crates/voxlite-ffi/src/voxlite.udl",
+      "python/pyproject.toml",
+      "python/voxlite/__init__.py",
+      "python/voxlite/_bindings.py",
+      "python/voxlite/cli.py",
+      "tests/integration_test.py",
+      "README.md"
+    ],
+    "node_aliases": {
+      "voxlite-core": "crates/voxlite-core/src/lib.rs",
+      "voxlite-ffi": "crates/voxlite-ffi/src/lib.rs",
+      "voxlite (python pkg)": "python/voxlite/__init__.py"
+    },
+    "edges": [
+      {"src": "crates/voxlite-core/src/lib.rs", "dst": "crates/voxlite-core/src/codec.rs", "kind": "re-exports"},
+      {"src": "crates/voxlite-core/src/lib.rs", "dst": "crates/voxlite-core/src/analyze.rs", "kind": "re-exports"},
+      {"src": "crates/voxlite-core/src/analyze.rs", "dst": "crates/voxlite-core/src/codec.rs", "kind": "calls"},
+      {"src": "crates/voxlite-ffi/src/lib.rs", "dst": "crates/voxlite-core/src/lib.rs", "kind": "path_dep"},
+      {"src": "crates/voxlite-ffi/src/voxlite.udl", "dst": "crates/voxlite-ffi/src/lib.rs", "kind": "generates"},
+      {"src": "python/voxlite/_bindings.py", "dst": "crates/voxlite-ffi/src/lib.rs", "kind": "ffi_call"},
+      {"src": "python/voxlite/__init__.py", "dst": "python/voxlite/_bindings.py", "kind": "re-exports"},
+      {"src": "python/voxlite/cli.py", "dst": "python/voxlite/__init__.py", "kind": "imports"},
+      {"src": "tests/integration_test.py", "dst": "python/voxlite/__init__.py", "kind": "imports"}
+    ],
+    "ffi_boundary": {
+      "rust_side": "crates/voxlite-ffi/src/lib.rs",
+      "python_side": "python/voxlite/_bindings.py"
+    }
+  },
+  "output_format_checks": {
+    "mermaid_diagram_count_min": 3,
+    "mermaid_regex": "```mermaid[\\s\\S]*?```",
+    "file_inventory_regex": [
+      "crates/voxlite-core/src/lib\\.rs",
+      "crates/voxlite-ffi/src/lib\\.rs",
+      "python/voxlite/_bindings\\.py"
+    ],
+    "ffi_boundary_regex": ["crates/voxlite-ffi/src/lib\\.rs[\\s\\S]{0,120}python/voxlite/_bindings\\.py|python/voxlite/_bindings\\.py[\\s\\S]{0,120}crates/voxlite-ffi/src/lib\\.rs"]
+  },
+  "primary_metric": {
+    "description": "Oracle graph score = w_node * node_f1 + w_edge * edge_f1 - w_halluc * halluc_rate. Nodes/edges are matched by file-anchored regex from agent output. Hallucinated = node appears in agent output but not in oracle.nodes nor aliases.",
+    "weights": {"node": 0.4, "edge": 0.5, "hallucination_penalty": 0.1},
+    "thresholds": {
+      "node_match": "node name or alias appears in agent output (case-sensitive)",
+      "edge_match": "both endpoints identified AND edge direction/kind keyword present (e.g., 'imports', 'depends', 'ffi', 'call', 'generates', 're-exports') within 80 chars",
+      "hallucination": "any file path like pattern (regex: [\\w./\\-]+\\.(rs|py|toml|udl|md)) in output NOT in oracle.nodes"
+    },
+    "formula": "score = 0.4*node_f1 + 0.5*edge_f1 - 0.1 * min(1.0, halluc_count / 5)",
+    "pass_threshold": 0.70,
+    "diagram_requirement_gate": "If mermaid_diagram_count < 3, score *= 0.5 (hard penalty)."
+  }
+}

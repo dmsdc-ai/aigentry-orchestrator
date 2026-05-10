@@ -1,0 +1,82 @@
+[
+  {
+    "id": 1,
+    "keyword": "2026-07-01",
+    "sentence": "2026-07-01 롤아웃 목표",
+    "type": "date",
+    "turn": 1,
+    "embed_variants": ["2026-07-01", "July 1 2026", "2026년 7월 1일"]
+  },
+  {
+    "id": 2,
+    "keyword": "임채영",
+    "sentence": "아키텍트는 임채영",
+    "type": "name",
+    "turn": 1,
+    "embed_variants": ["임채영", "Chaeyoung Lim", "architect 임채영"]
+  },
+  {
+    "id": 3,
+    "keyword": "7 microservices",
+    "sentence": "스코프 7 microservices",
+    "type": "number",
+    "turn": 1,
+    "embed_variants": ["7 microservices", "7개 마이크로서비스", "seven microservices"]
+  },
+  {
+    "id": 4,
+    "keyword": "--strict-null-checks",
+    "sentence": "--strict-null-checks 아래서",
+    "type": "cli_flag",
+    "turn": 7,
+    "embed_variants": ["--strict-null-checks", "strictNullChecks", "strict-null-checks flag"]
+  },
+  {
+    "id": 5,
+    "keyword": "wiki.arch/patterns/err-handling",
+    "sentence": "wiki.arch/patterns/err-handling에 대안 문서",
+    "type": "url_slug",
+    "turn": 3,
+    "embed_variants": ["wiki.arch/patterns/err-handling", "/patterns/err-handling", "err-handling wiki"]
+  },
+  {
+    "id": 6,
+    "keyword": "NixOS 24.05",
+    "sentence": "러너 NixOS 24.05",
+    "type": "os_version",
+    "turn": 5,
+    "embed_variants": ["NixOS 24.05", "nixos 24.05", "NixOS version 24.05"]
+  },
+  {
+    "id": 7,
+    "keyword": "KRW 1,200,000",
+    "sentence": "이번 분기 리팩토링 예산 KRW 1,200,000",
+    "type": "currency",
+    "turn": 5,
+    "embed_variants": ["KRW 1,200,000", "₩1,200,000", "1,200,000 원"]
+  },
+  {
+    "id": 8,
+    "keyword": "af-south-1",
+    "sentence": "배포 region은 af-south-1",
+    "type": "region_code",
+    "turn": 7,
+    "embed_variants": ["af-south-1", "Cape Town af-south-1", "af-south-1 리전"]
+  },
+  {
+    "id": 9,
+    "keyword": "100% type coverage",
+    "sentence": "타입 커버리지 100% type coverage 목표",
+    "type": "ratio",
+    "turn": 9,
+    "embed_variants": ["100% type coverage", "100 percent type coverage", "타입 커버리지 100%"]
+  },
+  {
+    "id": 10,
+    "keyword": "epic/type-safety",
+    "sentence": "관련 epic label epic/type-safety",
+    "type": "label",
+    "turn": 9,
+    "embed_variants": ["epic/type-safety", "type-safety epic", "label epic/type-safety"]
+  }
+]

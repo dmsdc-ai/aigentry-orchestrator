@@ -1,0 +1,12 @@
+[
+  {"q_idx": 1, "fact_id": 1, "answer": "2026-08-20", "accept_variants": ["2026-08-20", "2026년 8월 20일", "August 20, 2026"]},
+  {"q_idx": 2, "fact_id": 2, "answer": "배우진", "accept_variants": ["배우진", "Woojin Bae", "Bae Woojin"]},
+  {"q_idx": 3, "fact_id": 9, "answer": "DAU 42k", "accept_variants": ["DAU 42k", "42k DAU", "42,000 DAU"]},
+  {"q_idx": 4, "fact_id": 8, "answer": "me-central-1", "accept_variants": ["me-central-1", "UAE (me-central-1)"]},
+  {"q_idx": 5, "fact_id": 10, "answer": "type/dedup", "accept_variants": ["type/dedup", "dedup", "type:dedup"]},
+  {"q_idx": 6, "fact_id": 7, "answer": "SGD 2,750", "accept_variants": ["SGD 2,750", "S$2,750", "2,750 SGD", "2750 SGD"]},
+  {"q_idx": 7, "fact_id": 6, "answer": "openSUSE Tumbleweed 20260210", "accept_variants": ["openSUSE Tumbleweed 20260210", "Tumbleweed 20260210"]},
+  {"q_idx": 8, "fact_id": 5, "answer": "code.internal/refactor/ingest-dedup", "accept_variants": ["code.internal/refactor/ingest-dedup", "/refactor/ingest-dedup", "refactor/ingest-dedup"]},
+  {"q_idx": 9, "fact_id": 4, "answer": "--experimental-validator-cache", "accept_variants": ["--experimental-validator-cache", "experimental-validator-cache"]},
+  {"q_idx": 10, "fact_id": 3, "answer": "180 validators", "accept_variants": ["180 validators", "180", "180 validator 함수"]}
+]

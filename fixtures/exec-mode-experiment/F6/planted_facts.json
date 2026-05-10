@@ -1,0 +1,82 @@
+[
+  {
+    "id": 1,
+    "keyword": "2026-05-10",
+    "sentence": "릴리스 게이트 2026-05-10",
+    "type": "date",
+    "turn": 1,
+    "embed_variants": ["2026-05-10", "May 10 2026", "2026년 5월 10일"]
+  },
+  {
+    "id": 2,
+    "keyword": "정유경",
+    "sentence": "담당은 정유경",
+    "type": "name",
+    "turn": 1,
+    "embed_variants": ["정유경", "Yookyung Jung", "owner 정유경"]
+  },
+  {
+    "id": 3,
+    "keyword": "3271 tests total",
+    "sentence": "총 테스트 3271 tests total",
+    "type": "number",
+    "turn": 3,
+    "embed_variants": ["3271 tests total", "3,271 tests", "3271 전체 테스트"]
+  },
+  {
+    "id": 4,
+    "keyword": "--log-level=debug",
+    "sentence": "--log-level=debug로 log 정보 확인 권장",
+    "type": "cli_flag",
+    "turn": 4,
+    "embed_variants": ["--log-level=debug", "log-level debug", "--log-level debug"]
+  },
+  {
+    "id": 5,
+    "keyword": "ci.internal/builds/config-loader",
+    "sentence": "CI 대시보드는 ci.internal/builds/config-loader",
+    "type": "url_slug",
+    "turn": 2,
+    "embed_variants": ["ci.internal/builds/config-loader", "/builds/config-loader", "config-loader CI"]
+  },
+  {
+    "id": 6,
+    "keyword": "Fedora 41",
+    "sentence": "Fedora 41 러너에서 돌리고 있다",
+    "type": "os_version",
+    "turn": 3,
+    "embed_variants": ["Fedora 41", "Fedora Linux 41", "fedora 41"]
+  },
+  {
+    "id": 7,
+    "keyword": "GBP 4,500",
+    "sentence": "월 tool spend GBP 4,500",
+    "type": "currency",
+    "turn": 3,
+    "embed_variants": ["GBP 4,500", "£4,500", "4,500 파운드"]
+  },
+  {
+    "id": 8,
+    "keyword": "us-east-2",
+    "sentence": "배포 region은 us-east-2",
+    "type": "region_code",
+    "turn": 5,
+    "embed_variants": ["us-east-2", "Ohio us-east-2", "us-east-2 리전"]
+  },
+  {
+    "id": 9,
+    "keyword": "92.1%",
+    "sentence": "이 파일 커버리지 92.1%",
+    "type": "ratio",
+    "turn": 3,
+    "embed_variants": ["92.1%", "coverage 92.1", "92.1 percent"]
+  },
+  {
+    "id": 10,
+    "keyword": "area/config",
+    "sentence": "티켓 라벨 area/config",
+    "type": "label",
+    "turn": 7,
+    "embed_variants": ["area/config", "config area label", "label area/config"]
+  }
+]

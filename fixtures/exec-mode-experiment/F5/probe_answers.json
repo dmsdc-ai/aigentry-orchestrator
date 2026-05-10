@@ -1,0 +1,12 @@
+[
+  {"q_idx": 1, "fact_id": 1, "answer": "2026-06-01", "accept_variants": ["2026-06-01", "2026년 6월 1일", "June 1, 2026"]},
+  {"q_idx": 2, "fact_id": 2, "answer": "오세훈", "accept_variants": ["오세훈", "Sehun Oh", "Oh Sehun"]},
+  {"q_idx": 3, "fact_id": 8, "answer": "ca-central-1", "accept_variants": ["ca-central-1", "Canada Central (ca-central-1)"]},
+  {"q_idx": 4, "fact_id": 9, "answer": "15k daily active users", "accept_variants": ["15k daily active users", "15k DAU", "15,000 DAU"]},
+  {"q_idx": 5, "fact_id": 10, "answer": "team/platform", "accept_variants": ["team/platform", "platform", "team:platform"]},
+  {"q_idx": 6, "fact_id": 7, "answer": "JPY 120,000", "accept_variants": ["JPY 120,000", "¥120,000", "120,000 JPY", "120000 JPY"]},
+  {"q_idx": 7, "fact_id": 6, "answer": "RHEL 9.4", "accept_variants": ["RHEL 9.4", "Red Hat Enterprise Linux 9.4", "rhel 9.4"]},
+  {"q_idx": 8, "fact_id": 3, "answer": "8 pages", "accept_variants": ["8 pages", "8", "8 페이지"]},
+  {"q_idx": 9, "fact_id": 4, "answer": "--no-warmup-logs", "accept_variants": ["--no-warmup-logs", "no-warmup-logs"]},
+  {"q_idx": 10, "fact_id": 5, "answer": "research.internal/python314-tracker", "accept_variants": ["research.internal/python314-tracker", "/python314-tracker", "python314-tracker"]}
+]

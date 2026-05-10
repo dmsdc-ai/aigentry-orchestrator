@@ -1,0 +1,92 @@
+{
+  "fixture": "F3",
+  "name": "독립 블라인드 리뷰",
+  "primary_grader": "score_f3_severity_weighted_f1",
+  "expected_winner": ["S"],
+  "scenario_summary": "Reviewer must produce a severity-tiered issue table over a PR diff embedded in prior turns. Diff contains 5 real issues (2 distinct high-severity + 3 medium) and 2-3 distractor lines that look suspect but are intentional idioms (explicitly allowed by team lint rules per Turn 6/7). Grader: severity-weighted F1 on issue IDs with false-positive penalty for flagging distractors.",
+  "diff_line_anchor": "auth-middleware.ts diff lines numbered 1-13 in setup_history Turn 1",
+  "ground_truth_issues": [
+    {
+      "id": "A1",
+      "severity": "Critical",
+      "line": 5,
+      "kind": "sql_injection",
+      "description": "Raw template-string SQL interpolation of user-controlled token value (SELECT * FROM users WHERE token = '${token}'). Removes previously safe parameterized query. Allows authentication bypass and arbitrary SQL execution.",
+      "match_regex_any_of": ["SQL\\s*inject", "injection", "parameterized", "prepared statement", "placeholder", "template.*string.*SQL"],
+      "must_cite_line": 5
+    },
+    {
+      "id": "A2",
+      "severity": "High",
+      "line": 5,
+      "kind": "missing_await",
+      "description": "db.query returns a Promise; await/async removed from function signature. user.email access returns undefined, authentication path broken.",
+      "match_regex_any_of": ["await", "async", "Promise", "unresolved promise", "thenable"],
+      "must_cite_line_any_of": [1, 5, 6]
+    },
+    {
+      "id": "A3",
+      "severity": "High",
+      "line": 6,
+      "kind": "secret_logging",
+      "description": "Logging auth token in logger.info. Secrets must not appear in logs (PII/secret-scrub compliance).",
+      "match_regex_any_of": ["log.*token", "secret.*log", "credential.*log", "PII", "redact", "민감.*로그"],
+      "must_cite_line": 6
+    },
+    {
+      "id": "A4",
+      "severity": "Medium",
+      "line": 7,
+      "kind": "off_by_one",
+      "description": "Object.keys(...).slice(1, length - 1) drops both first and last key. Off-by-one boundary.",
+      "match_regex_any_of": ["off[\\-\\s]by[\\-\\s]one", "boundary", "slice.*1.*length", "first.*last.*key", "경계"],
+      "must_cite_line": 7
+    },
+    {
+      "id": "A5",
+      "severity": "Medium",
+      "line": 11,
+      "kind": "empty_catch",
+      "description": "Empty catch block swallows exceptions from next(). Errors disappear silently.",
+      "match_regex_any_of": ["empty\\s*catch", "swallow", "silent.*error", "빈\\s*catch", "catch\\s*\\{\\s*\\}"],
+      "must_cite_line_any_of": [9, 10, 11, 12]
+    }
+  ],
+  "distractors_must_not_flag": [
+    {
+      "id": "D1",
+      "line": 3,
+      "idiom": "token == null",
+      "description": "Explicitly allowed by team lint rule (Turn 7): covers both null and undefined. Flagging this counts as false positive.",
+      "fp_regex_any_of": ["== null", "loose\\s*equality", "strict\\s*equality", "\\bequality\\b.*null"]
+    },
+    {
+      "id": "D2",
+      "line": 4,
+      "idiom": "res.status(401)",
+      "description": "401 Unauthorized is the correct status code for missing token. Flagging as wrong status is false positive.",
+      "fp_regex_any_of": ["401.*wrong", "wrong.*status", "status.*403", "should.*be\\s*403"]
+    }
+  ],
+  "severity_weights": {
+    "Critical": 4.0,
+    "High": 2.0,
+    "Medium": 1.0
+  },
+  "primary_metric": {
+    "description": "Severity-weighted F1 on issue IDs with false-positive (distractor) penalty.",
+    "formula": "tp_weight = sum(weight(issue.severity) for issue in ground_truth if matched); fp_weight = sum(weight('Medium') for d in distractors if flagged); fn_weight = sum(weight(issue.severity) for issue in ground_truth if not matched); precision = tp_weight / (tp_weight + fp_weight); recall = tp_weight / (tp_weight + fn_weight); f1 = 2*precision*recall / (precision+recall)",
+    "match_rule": "An issue is considered matched if agent output contains the ground-truth line in File:Line column AND any of match_regex_any_of matches the Issue/Recommendation text (case-insensitive).",
+    "pass_threshold": 0.70
+  },
+  "secondary_signals": {
+    "table_format": {
+      "description": "Output must include markdown table with ID|Severity|File:Line|Issue|Recommendation header.",
+      "regex_any_of": ["\\|\\s*ID\\s*\\|\\s*Severity\\s*\\|", "Severity.*File:Line"]
+    },
+    "verdict_paragraph": {
+      "description": "Final verdict paragraph on merge readiness.",
+      "regex_any_of": ["merge", "block", "hold", "approve", "reject"]
+    }
+  }
+}

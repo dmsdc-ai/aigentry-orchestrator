@@ -1,0 +1,94 @@
+{
+  "fixture": "F8",
+  "name": "Multi-file refactor",
+  "primary_grader": "score_f8_dedup_refactor",
+  "expected_winner": ["P-accumulated"],
+  "scenario_summary": "Three ingest files contain identical email+phone validators. Task: consolidate into shared `src/ingest/validators.ts`, preserve 9 public export names across orders/users/webhooks, do not touch test files, behave identically for hidden regression suite. Grader: known+hidden test pass rate + duplication-reduction structural metric + test-edit penalty.",
+  "public_api_required_exports": {
+    "src/ingest/orders.ts": ["validateOrderEmail", "validateOrderPhone", "ingestOrder"],
+    "src/ingest/users.ts": ["validateUserEmail", "validateUserPhone", "ingestUser"],
+    "src/ingest/webhooks.ts": ["validateWebhookEmail", "validateWebhookPhone", "ingestWebhook"]
+  },
+  "behavioral_contract": {
+    "email_validation": {
+      "description": "Returns true iff: email is truthy AND length ≤ 254 AND matches /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/",
+      "examples": {
+        "true": ["a@b.co", "user.name@sub.example.com", "üser@exämple.co"],
+        "false": ["", "no-at-sign", "a@b", "a@@b.co", "overlength_email_exceeds_254_chars"]
+      }
+    },
+    "phone_validation": {
+      "description": "Returns true iff stripped digit count is in [7, 15]",
+      "examples": {
+        "true": ["1234567", "+1 (555) 010-1234", "010-1234-5678"],
+        "false": ["123456", "1234567890123456", "abc"]
+      }
+    },
+    "ingest_behavior": {
+      "description": "Each ingest* function throws 'bad_email' or 'bad_phone' before returning the object. Exact error message strings preserved."
+    }
+  },
+  "hidden_regression_tests": {
+    "description": "Applied by grader, not visible to agent. Verifies behavioral_contract edge cases across all 3 modules.",
+    "test_cases": [
+      {"module": "orders", "fn": "validateOrderEmail", "input": "üser@exämple.co", "expected": true, "kind": "i18n_email"},
+      {"module": "orders", "fn": "validateOrderEmail", "input": "", "expected": false, "kind": "empty"},
+      {"module": "users", "fn": "validateUserPhone", "input": "+1 (555) 010-1234", "expected": true, "kind": "formatted_phone"},
+      {"module": "users", "fn": "validateUserPhone", "input": "12345", "expected": false, "kind": "too_short"},
+      {"module": "webhooks", "fn": "validateWebhookEmail", "input": "no-at-sign", "expected": false, "kind": "no_at"},
+      {"module": "webhooks", "fn": "ingestWebhook", "input": {"email": "a@b.co", "phone": "1234567"}, "expected": "returns_input", "kind": "happy_path"},
+      {"module": "orders", "fn": "ingestOrder", "input": {"email": "bad", "phone": "1234567"}, "expects_throw": "bad_email", "kind": "bad_email_error"},
+      {"module": "users", "fn": "ingestUser", "input": {"email": "a@b.co", "phone": "12"}, "expects_throw": "bad_phone", "kind": "bad_phone_error"}
+    ]
+  },
+  "duplication_reduction_metric": {
+    "description": "Count identical blocks of 5+ consecutive non-trivial lines across orders/users/webhooks after refactor. Before: 12 duplicated lines × 3 files. Target: 0 duplicated validation blocks across the 3 wrappers.",
+    "measurement": "run `jscpd --min-lines 5 --min-tokens 40 src/ingest/orders.ts src/ingest/users.ts src/ingest/webhooks.ts`. Count total duplicated lines reported.",
+    "baseline_duplicated_lines": 36,
+    "pass_threshold_duplicated_lines_max": 4
+  },
+  "test_edit_penalty": {
+    "description": "If output contains any tests (describe/it/expect, or test file path like `*.test.ts`, `__tests__/*`), apply hard penalty.",
+    "detect_regex_any_of": [
+      "describe\\s*\\(",
+      "it\\s*\\(\\s*['\"`]",
+      "expect\\s*\\([^)]*\\)\\.",
+      "\\.test\\.ts",
+      "__tests__/"
+    ],
+    "penalty_multiplier": 0.3
+  },
+  "output_structure_checks": {
+    "required_file_sections_regex": [
+      "###\\s+src/ingest/validators\\.ts",
+      "###\\s+src/ingest/orders\\.ts",
+      "###\\s+src/ingest/users\\.ts",
+      "###\\s+src/ingest/webhooks\\.ts"
+    ],
+    "required_export_names_regex_any_of": [
+      "validateOrderEmail",
+      "validateOrderPhone",
+      "ingestOrder",
+      "validateUserEmail",
+      "validateUserPhone",
+      "ingestUser",
+      "validateWebhookEmail",
+      "validateWebhookPhone",
+      "ingestWebhook"
+    ]
+  },
+  "primary_metric": {
+    "description": "Composite: known+hidden test pass rate * 0.5 + duplication reduction score * 0.3 + public-api preservation * 0.2 − test_edit_penalty.",
+    "formula": "score = (0.5 * test_pass_rate + 0.3 * dup_reduction_score + 0.2 * api_preservation_score) * test_edit_penalty_multiplier",
+    "test_pass_rate": "fraction of hidden_regression_tests passing after applying agent output",
+    "dup_reduction_score": "1 - (duplicated_lines_after / baseline_duplicated_lines), clamped to [0,1]",
+    "api_preservation_score": "fraction of public_api_required_exports present with correct name in agent output",
+    "pass_threshold": 0.70
+  },
+  "secondary_signals": {
+    "shared_util_exists": {
+      "description": "Bonus: agent creates shared `validateEmail`/`validatePhone` in validators.ts and re-uses across 3 wrappers.",
+      "regex_any_of": ["export\\s+function\\s+validateEmail", "export\\s+function\\s+validatePhone", "from\\s+['\"`]\\.\\/validators['\"`]"]
+    }
+  }
+}

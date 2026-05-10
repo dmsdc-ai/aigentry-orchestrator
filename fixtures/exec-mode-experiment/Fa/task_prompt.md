@@ -1,0 +1,1 @@
+`normalize_and_match(query, candidates, threshold=80)` 함수를 작성해줘. 한글/영문 혼합 사용자 쿼리를 받아서 candidates 리스트 중 threshold 이상인 상위 매치를 `[(candidate, score), ...]` 형태로 score 내림차순 반환. Python 3.11+ / rapidfuzz 3.12+ 기준. 모듈 수준 docstring + type hints 포함. 함수 단일 파일로 반환하면 돼.

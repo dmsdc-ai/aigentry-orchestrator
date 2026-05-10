@@ -1,0 +1,82 @@
+[
+  {
+    "id": 1,
+    "keyword": "2026-05-01",
+    "sentence": "Feature freeze 2026-05-01",
+    "type": "date",
+    "turn": 1,
+    "embed_variants": ["2026-05-01", "May 1 2026", "2026년 5월 1일"]
+  },
+  {
+    "id": 2,
+    "keyword": "민소영",
+    "sentence": "PM은 민소영",
+    "type": "name",
+    "turn": 1,
+    "embed_variants": ["민소영", "Soyoung Min", "PM 민소영"]
+  },
+  {
+    "id": 3,
+    "keyword": "22 schema fields",
+    "sentence": "JSON body 22 schema fields",
+    "type": "number",
+    "turn": 1,
+    "embed_variants": ["22 schema fields", "22 fields schema", "22개 schema 필드"]
+  },
+  {
+    "id": 4,
+    "keyword": "--enable-async-queue",
+    "sentence": "D 구현 시 --enable-async-queue 플래그 기본 on으로 가정",
+    "type": "cli_flag",
+    "turn": 5,
+    "embed_variants": ["--enable-async-queue", "enable-async-queue", "async-queue 플래그"]
+  },
+  {
+    "id": 5,
+    "keyword": "ops.import/dashboard/bulk",
+    "sentence": "운영 대시보드는 ops.import/dashboard/bulk에서 처리량 보고",
+    "type": "url_slug",
+    "turn": 3,
+    "embed_variants": ["ops.import/dashboard/bulk", "/dashboard/bulk", "bulk dashboard"]
+  },
+  {
+    "id": 6,
+    "keyword": "Windows 11 24H2",
+    "sentence": "dev 환경은 Windows 11 24H2",
+    "type": "os_version",
+    "turn": 5,
+    "embed_variants": ["Windows 11 24H2", "Windows 11 version 24H2", "Win11 24H2"]
+  },
+  {
+    "id": 7,
+    "keyword": "USD 9,800",
+    "sentence": "클라우드 예산 USD 9,800",
+    "type": "currency",
+    "turn": 5,
+    "embed_variants": ["USD 9,800", "$9,800", "9,800 USD"]
+  },
+  {
+    "id": 8,
+    "keyword": "sa-east-1",
+    "sentence": "배포 region은 sa-east-1",
+    "type": "region_code",
+    "turn": 5,
+    "embed_variants": ["sa-east-1", "São Paulo sa-east-1", "sa-east-1 리전"]
+  },
+  {
+    "id": 9,
+    "keyword": "p99 <2s",
+    "sentence": "운영 SLO p99 <2s",
+    "type": "slo",
+    "turn": 7,
+    "embed_variants": ["p99 <2s", "p99 under 2s", "p99 < 2 seconds"]
+  },
+  {
+    "id": 10,
+    "keyword": "route/api-import",
+    "sentence": "티켓 라벨은 route/api-import",
+    "type": "label",
+    "turn": 7,
+    "embed_variants": ["route/api-import", "api-import 라벨", "label route/api-import"]
+  }
+]

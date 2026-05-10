@@ -1,0 +1,82 @@
+[
+  {
+    "id": 1,
+    "keyword": "2026-04-25",
+    "sentence": "hotfix window 2026-04-25 새벽 2시",
+    "type": "date",
+    "turn": 1,
+    "embed_variants": ["2026-04-25", "April 25 2026", "2026년 4월 25일"]
+  },
+  {
+    "id": 2,
+    "keyword": "한솔",
+    "sentence": "on-call은 한솔",
+    "type": "name",
+    "turn": 1,
+    "embed_variants": ["한솔", "Hansol", "on-call 한솔"]
+  },
+  {
+    "id": 3,
+    "keyword": "47 incidents",
+    "sentence": "지난 달 incidents 47 incidents 찍혔다",
+    "type": "number",
+    "turn": 3,
+    "embed_variants": ["47 incidents", "47건 incidents", "47 incidents last month"]
+  },
+  {
+    "id": 4,
+    "keyword": "--feature-circuit-v2",
+    "sentence": "--feature-circuit-v2 플래그 켜졌을 때",
+    "type": "cli_flag",
+    "turn": 4,
+    "embed_variants": ["--feature-circuit-v2", "feature-circuit-v2 flag", "circuit-v2 플래그"]
+  },
+  {
+    "id": 5,
+    "keyword": "alerts.ops/pd/retry-missing",
+    "sentence": "알람은 alerts.ops/pd/retry-missing 패널에 뜬다",
+    "type": "url_slug",
+    "turn": 3,
+    "embed_variants": ["alerts.ops/pd/retry-missing", "/pd/retry-missing", "retry-missing panel"]
+  },
+  {
+    "id": 6,
+    "keyword": "Alpine 3.20",
+    "sentence": "러너 Alpine 3.20",
+    "type": "os_version",
+    "turn": 5,
+    "embed_variants": ["Alpine 3.20", "Alpine Linux 3.20", "alpine 3.20"]
+  },
+  {
+    "id": 7,
+    "keyword": "AUD 3,300",
+    "sentence": "이번 달 모니터링 예산 AUD 3,300",
+    "type": "currency",
+    "turn": 5,
+    "embed_variants": ["AUD 3,300", "A$3,300", "3,300 AUD"]
+  },
+  {
+    "id": 8,
+    "keyword": "ap-southeast-1",
+    "sentence": "주 배포 region ap-southeast-1",
+    "type": "region_code",
+    "turn": 5,
+    "embed_variants": ["ap-southeast-1", "Singapore ap-southeast-1", "ap-southeast-1 리전"]
+  },
+  {
+    "id": 9,
+    "keyword": "99.9% success target",
+    "sentence": "운영 SLO가 99.9% success target",
+    "type": "slo",
+    "turn": 6,
+    "embed_variants": ["99.9% success target", "99.9% SLO", "99.9 percent success"]
+  },
+  {
+    "id": 10,
+    "keyword": "sev/2-major",
+    "sentence": "티켓 라벨은 sev/2-major",
+    "type": "label",
+    "turn": 7,
+    "embed_variants": ["sev/2-major", "2-major 라벨", "label sev/2-major"]
+  }
+]

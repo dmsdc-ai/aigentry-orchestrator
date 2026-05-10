@@ -1,0 +1,75 @@
+{
+  "fixture": "F6",
+  "name": "Fix-loop (sequential reveal)",
+  "primary_grader": "score_f6_fix_loop",
+  "expected_winner": ["P-accumulated"],
+  "scenario_summary": "Multi-turn fix loop. Setup shows first 2 fix rounds completed (Fix 1: SyntaxError colon; Fix 2: toml→tomllib API swap). Turn 7 reveals third error (dict.get keyword argument). Task = produce Fix 3 as unified diff. After agent's fix, harness applies patch, runs build, injects next error or 'BUILD GREEN'. Max 10 turns to reach green. Grader: binary build-pass + turns-to-success.",
+  "initial_source_file": "aigentry_config/loader.py",
+  "build_command": "uv run pytest aigentry_config/tests/test_loader.py -x",
+  "expected_fix_sequence": [
+    {
+      "round": 1,
+      "error_kind": "SyntaxError",
+      "error_line": 4,
+      "error_message_regex": "SyntaxError.*invalid syntax",
+      "canonical_fix_regex": "path:\\s*str",
+      "status": "already_applied_in_setup"
+    },
+    {
+      "round": 2,
+      "error_kind": "ModuleNotFoundError",
+      "error_line": 1,
+      "error_message_regex": "ModuleNotFoundError.*toml",
+      "canonical_fix_regex": "import\\s+tomllib",
+      "status": "already_applied_in_setup"
+    },
+    {
+      "round": 3,
+      "error_kind": "TypeError",
+      "error_line": 9,
+      "error_message_regex": "TypeError.*dict\\.get.*takes no keyword arguments",
+      "canonical_fix": {
+        "description": "Remove default= keyword; pass as positional arg.",
+        "diff_regex": "cfg\\.get\\(\\s*['\\\"]timeout['\\\"],\\s*30\\s*\\)",
+        "anti_pattern_regex": ["default\\s*="]
+      },
+      "status": "current_task"
+    },
+    {
+      "round": 4,
+      "error_kind": "TestFailure",
+      "error_message_regex": "AssertionError|FAILED.*test_get_timeout_default",
+      "canonical_fix_summary": "Ensure return type is int (not str). Adjust default value type if test asserts int.",
+      "status": "future"
+    }
+  ],
+  "build_green_criteria": {
+    "description": "All tests in test_loader.py pass. Stdout contains 'passed' and no FAILED/ERROR.",
+    "regex_any_of": ["\\d+\\s+passed", "test result:\\s*ok"],
+    "must_not_regex": ["FAILED", "ERROR", "assert"]
+  },
+  "stage1_fix_3_checks": {
+    "diff_format_regex": "^---\\s*a/aigentry_config/loader\\.py\\s*\\n\\+\\+\\+\\s*b/aigentry_config/loader\\.py\\s*\\n@@.*@@",
+    "fix_content_regex_any_of": [
+      "cfg\\.get\\(\\s*['\\\"]timeout['\\\"],\\s*30\\s*\\)",
+      "cfg\\.get\\(\\s*['\\\"]timeout['\\\"],\\s*30\\s*\\)"
+    ],
+    "must_not_contain_regex": [
+      "default\\s*="
+    ],
+    "next_step_prediction_regex": "(next|다음)\\s*(error|에러|green|통과)"
+  },
+  "primary_metric": {
+    "description": "Composite of build-pass binary and turns-to-green.",
+    "formula": "if build_green within max_turns: score = 1 - 0.05 * (turns_used - optimal_turns) ; else 0. optimal_turns = 2 remaining rounds = 2 extra turns from current state.",
+    "max_turns": 10,
+    "optimal_remaining_turns": 2,
+    "pass_threshold": 0.70
+  },
+  "secondary_signals": {
+    "one_patch_per_turn": {
+      "description": "Each agent turn proposes exactly one diff (no multi-patch bundles).",
+      "violation_regex": "(\\+\\+\\+\\s*b/[^\\s]+\\s*\\n){2,}"
+    }
+  }
+}

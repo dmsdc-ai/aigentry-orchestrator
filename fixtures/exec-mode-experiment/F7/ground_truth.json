@@ -1,0 +1,68 @@
+{
+  "fixture": "F7",
+  "name": "결정 전파 + semantic masking (hardest)",
+  "primary_grader": "score_f7_decision_propagation",
+  "expected_winner": ["P-accumulated"],
+  "scenario_summary": "Four decisions across 10 turns: D1 (Turn 2, Result<T,E>) → D2 (Turn 4, supersede D1, use Either<L,R>) → D3 (Turn 6, add Option<T> for nullable, Either still owns errors) → D4 (Turn 8, supersede D2, revert errors to Result<T,E> due to async Promise<Either> variance clash; Option<T> from D3 stays; Either now banned). Task: apply the *current* pattern stack to user-service.ts — must use Option<T> for optional and Result<T,E> for errors; must NOT use Either. Pattern names are NOT mentioned in task — agent must infer from decision trail.",
+  "decision_timeline": [
+    {"id": "D1", "turn": 2, "pattern": "Result<T, E>", "target": "errors", "status": "reverted-to-then-supersede"},
+    {"id": "D2", "turn": 4, "pattern": "Either<L, R>", "target": "errors", "status": "superseded_by_D4"},
+    {"id": "D3", "turn": 6, "pattern": "Option<T>", "target": "nullable/optional", "status": "active"},
+    {"id": "D4", "turn": 8, "pattern": "Result<T, E>", "target": "errors", "status": "active_latest"}
+  ],
+  "current_pattern_stack": {
+    "optional_pattern": "Option<T>",
+    "error_pattern": "Result<T, E>",
+    "banned_pattern": "Either<L, R>"
+  },
+  "stage1_output_checks": {
+    "refactored_file_must_contain_regex_any_of": [
+      "\\bOption<User>",
+      "\\bOption<",
+      "type\\s+Option\\b"
+    ],
+    "error_pattern_regex_any_of": [
+      "\\bResult<",
+      "Result<\\s*void",
+      "Result<\\s*User"
+    ],
+    "banned_pattern_detect_regex": "\\bEither<",
+    "decision_citation_regex_any_of": [
+      "Turn\\s*(6|8).*D(3|4)",
+      "D(3|4).*Turn\\s*(6|8)",
+      "Turn\\s*8.*supersede.*Turn\\s*4"
+    ],
+    "superseded_mention_regex_any_of": [
+      "(D2|Either).*supersed",
+      "Turn\\s*4.*supersed",
+      "Either.*(banned|금지|avoid|피했)"
+    ]
+  },
+  "primary_metric": {
+    "description": "Composite: latest_decision_correctness * 0.45 + superseded_rejection * 0.35 + citation_to_turn * 0.2.",
+    "latest_decision_correctness": {
+      "description": "1.0 if refactored file uses Option<T> for the findUserById return AND Result<T,E> for deleteUser return AND no Either usage. Partial credit per pattern matched.",
+      "component_weights": {"option_present": 0.4, "result_present": 0.4, "no_either": 0.2}
+    },
+    "superseded_rejection": {
+      "description": "1.0 if output has a (c) Superseded section mentioning Either + D2 + Turn 4/8 supersede relation. 0.5 if mentions superseded without turn cite. 0 if missing.",
+      "regex": "stage1_output_checks.superseded_mention_regex_any_of"
+    },
+    "citation_to_turn": {
+      "description": "1.0 if (b) cites Turn 6 for Option AND Turn 8 (or D4) for Result. 0.5 if one of them cited. 0 if no turn cite.",
+      "regex": "stage1_output_checks.decision_citation_regex_any_of"
+    },
+    "formula": "score = 0.45 * latest_decision + 0.35 * superseded + 0.20 * citation",
+    "pass_threshold": 0.70
+  },
+  "hard_failure_modes": {
+    "use_of_either": {
+      "description": "If refactored file uses Either<L,R> anywhere, score *= 0.3 (semantic masking failed).",
+      "detect_regex": "\\bEither<"
+    },
+    "pattern_name_in_task_prompt": {
+      "description": "Sanity: pattern names (Option, Result, Either) must NOT appear in task_prompt.md. Verified by lint.",
+      "enforcement": "fixture_lint_gate"
+    }
+  }
+}

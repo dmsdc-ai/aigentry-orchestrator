@@ -1,0 +1,75 @@
+{
+  "fixture": "F5",
+  "name": "외부 리서치 + 인용",
+  "primary_grader": "score_f5_research_citation",
+  "expected_winner": ["S"],
+  "scenario_summary": "Agent writes a 1000-1500 word research brief on Python 3.14 release status, citing ≥5 primary sources in blockquote + inline link form. Whitelisted primary domains only (python.org, peps.python.org, CPython GitHub, Python Steering Council). Grader checks URL liveness via HEAD request, counts primary-source citations, and spot-checks 3 random claim↔source alignments via Claude CLI judge.",
+  "word_count_bounds": {"min": 1000, "max": 1500},
+  "section_requirements": {
+    "description": "Six sections per Turn 6 structure must appear as H2 or similar headings.",
+    "required_heading_regex_any_of": [
+      ["executive\\s*summary|요약"],
+      ["3\\.14\\s*GA|release\\s*timeline|릴리스\\s*타임라인"],
+      ["PEP|주요\\s*PEP"],
+      ["breaking\\s*change|하위\\s*호환|backward"],
+      ["ecosystem|라이브러리\\s*지원"],
+      ["권고|recommend"]
+    ]
+  },
+  "primary_source_allowlist": {
+    "domains": [
+      "python.org",
+      "peps.python.org",
+      "docs.python.org",
+      "github.com/python/cpython",
+      "github.com/python/peps",
+      "discuss.python.org"
+    ],
+    "blocklist_hint": [
+      "medium.com",
+      "dev.to",
+      "reddit.com",
+      "stackoverflow.com",
+      "realpython.com",
+      "towardsdatascience.com"
+    ]
+  },
+  "citation_quota": {
+    "min_primary_citations": 5,
+    "citation_form_regex": ">\\s*\"[^\"]{10,}\"\\s*[—–-]\\s*\\[[^\\]]+\\]\\(https?://[^\\)]+\\)"
+  },
+  "sources_section_requirement": {
+    "description": "Output must include a final `## Sources` section listing every cited URL.",
+    "heading_regex": "^##\\s*Sources",
+    "min_urls_in_section": 5
+  },
+  "grader_procedure": {
+    "url_liveness": {
+      "description": "Extract all URLs in output. HEAD request (5s timeout, 3 retries). Liveness rate = (alive HTTP 2xx or 3xx) / total.",
+      "pass_threshold": 0.80
+    },
+    "primary_source_quota": {
+      "description": "Count citations whose domain matches primary_source_allowlist.domains. Must be ≥5.",
+      "pass_threshold": 5
+    },
+    "claim_citation_spot_check": {
+      "description": "Randomly sample 3 citation blocks. For each, fetch source (or cached content if URL was pre-crawled), spawn Claude CLI judge with prompt: 'Does the quoted sentence appear in this source, substantively? yes/no'. Rate = (yes / 3).",
+      "pass_threshold": 0.67
+    }
+  },
+  "primary_metric": {
+    "description": "Composite = 0.3 * url_liveness + 0.3 * min(1, primary_citations/5) + 0.4 * spot_check_rate.",
+    "formula": "score = 0.3 * liveness_rate + 0.3 * min(1.0, n_primary / 5) + 0.4 * spot_check_yes_rate",
+    "pass_threshold": 0.70,
+    "gates": [
+      "Word count must be in [1000, 1500]; outside → score *= 0.5",
+      "Any citation from blocklist_hint → score *= 0.7 per occurrence (max 3 stacks)"
+    ]
+  },
+  "secondary_signals": {
+    "section_first_sentence_summary": {
+      "description": "Bonus: each section's first sentence is a single-sentence summary (<= 2 sentences).",
+      "regex_any_of": ["^([^.]+\\.)\\s*\\n", "^([^.]+\\.){1,2}\\s*"]
+    }
+  }
+}
