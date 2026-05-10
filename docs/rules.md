@@ -382,3 +382,47 @@ Memory: `feedback_session_cleanup_protocol.md`.
 ### 위임 시 컨텍스트 전달
 - 빌드 에러 → 동일 세션에 에러 메시지만 전달 (새 inject, /clear 없음)
 - 다른 세션 파일에서 에러 발생 시 → 해당 파일 소유자에 위임
+
+---
+
+### Rule 30. Operational Autonomy (HARD RULE)
+
+운영 이슈는 **orchestrator 자율 처리**. 사용자 인터렉션은 architecture / business / destructive action 차원에 한정한다. 발단: 2026-05-10 grill에서 codex sandbox prompt / cmux UI blank / stuck session 처리를 매 5분 사용자에 escalation. 사용자 정정: "이런 상황은 오케스트레이터가 조율해줘야돼." Tracking: `dmsdc-ai/aigentry#1`.
+
+**Why:** 매 운영 prompt마다 사용자에 surface 시 control-tower 역할이 사용자-세션 사이 단순 relay로 전락. 자율 처리는 control tower의 본질.
+
+#### 자율 처리 영역 (사용자 인터렉션 X)
+
+| 이슈 | 자동 액션 |
+|---|---|
+| Codex sandbox / approval prompt | 즉시 `p` (session-wide) 또는 `y` (one-time) inject. 반복 시 즉시 kill + respawn (post-config-fix). |
+| Claude trust prompt | 자동 승인 또는 trusted projects 추가. |
+| MCP tool permission prompt (`brain_search` 등) | 자동 "allow for this session". |
+| cmux main panel blank | `telepty read-screen <id>`로 progress 직접 inspect. 사용자에 사이드바 클릭 요청 X. |
+| Session stuck > 5 min | (1) read-screen 진단 → (2) prompt면 자동 응답 / (3) deadlock이면 kill+respawn. |
+| `TASK_COMPLETE` 5-15s post-inject | 100% false-positive (inject latency). 무시 — 사용자 surface X. |
+| `TASK_COMPLETE` 30s+ post-inject | 실제 idle. REPORT 검토. |
+| Stale 세션 (DONE 후) | Rule 28 따라 즉시 `cmux close-workspace` + `telepty delete` (사용자 승인 X). |
+| Disk artifact 검증 | 직접 `ls`/`cat`/`read-screen` 실행. 사용자에 read 요청 X. |
+| Background progress polling | 사용자 명시 X면 self-poll (~5-10min interval). 매 인터벌 "어떻게 할까요?" 금지. |
+
+#### 사용자 인터렉션이 정당한 영역 (자율 X)
+
+| 이슈 | 사유 |
+|---|---|
+| Architecture / design decision | 사용자 vision + business 차원 |
+| Verdict 분기 (ACCEPT vs REQUEST_CHANGES) | 사용자 final say |
+| Phase scope (Phase 1 vs Phase 2) | 사용자 우선순위 |
+| Cross-LLM verification trigger | 사용자가 객관성 기준 정함 |
+| Commit / push / external destructive | Git Safety Protocol |
+| Spec 모호 시 multi-interpretation surface | Karpathy 4-principle |
+
+#### Cross-references
+- Rule 4 (직접 수행 금지): code/research delegation. **Rule 30 = 운영 보완**.
+- Rule 21 (위임 우선): 동일 delegation 테마.
+- Rule 28 (세션 완료 후 정리): Rule 30이 trigger를 명시 (no user approval needed).
+- Memory: `~/.claude/projects/-Users-duckyoungkim-projects/memory/feedback_orchestrator_autonomous_ops.md`.
+
+#### Acceptance criteria
+- 향후 grill 세션에서 운영 이슈 (sandbox prompt / cmux blank / stuck session) 처리 시 "어떻게 할까요?" 질문 0건.
+- AGENTS.md 위임 전 체크리스트에 Rule 30 row 등록됨.

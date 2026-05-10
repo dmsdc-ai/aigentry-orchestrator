@@ -24,6 +24,7 @@
 - [ ] **보고 vs 토론 구분** (Rule 15): 위임 보고 라인인가, 자유 토론인가?
 - [ ] **세션 ID 하드코딩 금지** (Rule 16): `aigentry-orchestrator-claude` 하드코딩 피하고 configurable로?
 - [ ] **외과적 변경 (Rule 29)**: 변경 라인이 모두 요청에 추적 가능한가? Drive-by reformat/refactor 금지, dead code는 mention only?
+- [ ] **운영 자율 (Rule 30)**: codex sandbox prompt / cmux UI blank / session stuck 등 운영 이슈를 사용자에게 escalation하지 않고 자율 처리(자동 응답/respawn/read-screen)했는가? 사용자 인터렉션은 architecture/business/destructive action에 한정?
 
 ### 실행 모드 체크 (Rule 4-A — Phase 6 Conclusion 기반, 2026-05-04 lock (4-way Layer 1 selector LOCKED per ADR `2026-05-04-phase6-conclusion.md` §4.2, commit c7b2e79))
 
