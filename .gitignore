@@ -30,3 +30,4 @@ __pycache__/
 # generic bak
 *.bak
 !state/draft/
+!state/migration/
