@@ -1,7 +1,7 @@
 ---
 type: adr
 status: accepted
-revision: r5+amend-A1A3
+revision: r5+amend-A1A3+r6
 date: 2026-05-10
 author: aigentry-orchestrator (best-of-both synthesis: claude r1 + codex r1)
 scope: ecosystem
@@ -44,6 +44,7 @@ revision_history:
   - r1: "2026-05-10 — best-of-both synthesis from claude r1 (829 lines) + codex r1 (1261 lines) parallel drafts. Locked architecture: 3-Layer separation + Q'''-bis core + 31 binding requirements (39 visible acceptance checks) + 19 mandates M22–M40. Synthesis report at docs/reports/2026-05-10-q-prime-bis-adr-synthesis-report.md."
   - r2: "2026-05-10 — E3 amendment integration (per ADR-E3-r1, Option A ≤ 15 MB) + Path C disqualification (Go ConPTY limitation, per bilingual-ops report) + §14 TBD supervisor-language refinement + M28 conditional callout. Verdict: post-r1 ACCEPT_WITH_FIXES (Explore subagent review)."
   - r5_amend_A1A3: "2026-05-12 — A1 wire signal enum extension, A2 error code additions, A3 manifest exit_reason enum, per C3 spec r1 §9.3 mandatory amendments + codex r2 Q6 single-SSOT recommendation. Status remains 'accepted'; this is an additive contract amendment, not an architecture change."
+  - r6: "2026-05-12 — Supervisor binary language LOCKED to Rust per Phase 0 C2 (cdylib-in-tokio PoC PASS_WITH_CONDITIONS — 5/5 scenarios, RSS 3.25–3.42 MiB ≪ 15 MB E3) + C4 Path B selection (bilingual ops cost analysis; Path C / Go DISQUALIFIED per §15.2.5 on ConPTY limitation, Go #62708 + #6271). Textual flips at §1.6 / §3 / §5.1 r3 notice / §7.2 r3 notice / §9.1 / §14 (row + count 8→7) / §16.2 / §16.3 / §17.5 (TBD risk → MITIGATED) / §20.1 (decision 11) / §20.2 (count 8→7) / §20.3 / §21.1 r3 notice. Status remains 'accepted'; this is the evidence-based closure of §14 supervisor-language TBD row, not an architecture change. Path A (Node maintain) preserved as documented fallback in §14 / §16.2 but is no longer load-bearing. A1–A3 enums, M22–M40 (including M28 row), 31/39 requirements, §17 14-entry count, B3 trace_id, E3=15MB ceiling, and manifest schema invariants all untouched."
 ---
 
 # ADR 2026-05-10: telepty L2 Session Architecture (Q'''-bis)
@@ -124,7 +125,7 @@ This ADR **preserves the source label "31 Binding Requirements"** for compatibil
 
 **Defers (TBD blanks — see §15):**
 
-- **Supervisor binary language**. Rust is the leading candidate but the prior lock was revoked; selection is evidence-gated by Phase 0 C2 (cdylib-in-tokio-host PoC), C3 (sidecar spike kill gate), C4 (bilingual ops cost).
+- **Supervisor binary language**. **LOCKED 2026-05-12 → Rust** per Phase 0 C2 PASS_WITH_CONDITIONS + C4 Path B (see §14 LOCK declaration). Path A (Node maintain) retained as documented fallback only. *(This bullet records the Defers→Lock transition; entry retained in §1.6 for audit-trail continuity.)*
 - Migration plan (0.3.x → 1.0) — separate plan ADR (#379), drafted after Phase 1 closure.
 - V4 cross-mesh full design — separate Phase 2 ADR; this ADR only locks the M39/M40 surface needed for forward-compat.
 
@@ -390,7 +391,7 @@ Supervisor crate shape:
 crate-type = ["cdylib", "rlib"]
 ```
 
-This supports both standalone process mode and embedded host mode without inventing a second implementation. **Language remains TBD** pending C1–C4; Rust is the current leading candidate.
+This supports both standalone process mode and embedded host mode without inventing a second implementation. **Language LOCKED to Rust 2026-05-12** per Phase 0 C2 PASS_WITH_CONDITIONS + C4 Path B (see §14 LOCK declaration).
 
 ---
 
@@ -518,7 +519,7 @@ Mandates are **derived rules** that constrain implementation while leaving room 
 
 ### §5.1 Mandate roster
 
-> **Rust-conditional mandate notice (r3)**: M24 (single-thread tokio + jemalloc), M27 (sccache + cargo workspace + selective LTO), M28 (`cdylib + rlib`), and M31 (jemalloc tuning) **presuppose a Rust supervisor** — the leading C2 candidate. If C2 PoC FAILS, Path A (Node 0.3.x maintained) replaces those mandates with their Node-equivalent ops (Node single-thread event loop, esbuild/turbopack equivalents, no jemalloc surface) per the bilingual-ops report. M28 row already encodes this conditional explicitly; M24/M27/M31 are voided in lockstep when C2 fails. The schema/wire/IPC mandates (M22, M23, M25, M37', M38', etc.) are language-neutral and survive either path.
+> **Rust-conditional mandate notice (r3; closed r6 2026-05-12)**: M24 (single-thread tokio + jemalloc), M27 (sccache + cargo workspace + selective LTO), M28 (`cdylib + rlib`), and M31 (jemalloc tuning) **presuppose a Rust supervisor** — **LOCKED per Phase 0 C2 PASS_WITH_CONDITIONS + C4 Path B selection (see §14)**. The historical contingency below is retained as audit context; it is no longer load-bearing. *(Historical contingency, r3)*: had C2 PoC failed, Path A (Node 0.3.x maintained) would have replaced those mandates with their Node-equivalent ops (Node single-thread event loop, esbuild/turbopack equivalents, no jemalloc surface) per the bilingual-ops report; M28 row encodes this contingency explicitly; M24/M27/M31 would have been voided in lockstep with C2 fail. The schema/wire/IPC mandates (M22, M23, M25, M37', M38', etc.) are language-neutral and survive either path.
 
 | Mandate | Binding decision | Serves | Why the rejected alternative is wrong |
 |---|---|---|---|
@@ -687,7 +688,7 @@ Implementation behind those commands changes from daemon HTTP/WS to manifest dis
 
 ### §7.2 Manifest schema version 1
 
-> **Conditional example notice (r3)**: the example below assumes the **Rust supervisor** path (leading C2 candidate). If C2 PoC FAILS, Path A (Node 0.3.x maintained) keeps the existing 0.3.x manifest format and the `"lang": "rust"` field is replaced with `"lang": "node"` — the surrounding schema invariants in §7.3 hold for either implementation. See §17.5 (Rust bias self-criticism) and §15.2.5 (Path C / Go disqualification, ConPTY).
+> **Conditional example notice (r3; resolved r6 2026-05-12)**: the example below uses the **Rust supervisor** path — **LOCKED per §14 (C2 PASS + C4 Path B)**. Historical contingency *(r3, retained for audit)*: had C2 PoC failed, Path A (Node 0.3.x maintained) would have kept the existing 0.3.x manifest format and `"lang": "rust"` would have read `"lang": "node"` — the surrounding schema invariants in §7.3 hold for either implementation. See §17.5 (closure note) and §15.2.5 (Path C / Go disqualification, ConPTY).
 
 Illustrative:
 
@@ -820,7 +821,7 @@ Therefore M23 mandates a persistent telepty-relay per host instead.
 
 - 1 OS process per session, owns 1 PTY, 1 UDS endpoint, 1 manifest, 1 log.
 - Single-thread tokio runtime + jemalloc (M24, M31).
-- Linkable as `cdylib` for embed (M28, conditional on Rust language lock).
+- Linkable as `cdylib` for embed (M28, per §14 Rust LOCK 2026-05-12).
 
 ### §9.2 RAM cost — honest accounting
 
@@ -1137,7 +1138,7 @@ Should implementation stay Node, move to Rust sidecar, or choose Go full rewrite
 
 | Area | Status | Owner | Resolution path |
 |---|---|---|---|
-| **Supervisor binary language** | Rust (PASS C2/C4) vs Node maintain (FAIL C2) vs Go (DISQUALIFIED C4 ConPTY). Selection evidence-gated on C1–C4 + bilingual-ops report | architect + orchestrator | C2 (cdylib PoC) + C3 (sidecar kill gate) + C4 (bilingual cost). Go path disqualified by Windows ConPTY language/stdlib limitation (see §15.2.5 + bilingual-ops report) |
+| **Supervisor binary language** | **LOCKED 2026-05-12 → Rust.** *Locked 2026-05-12 per Phase 0 C2 (cdylib-in-tokio PoC, RSS 3.25 MiB, 5/5 PASS) + C4 Path B (bilingual ops cost report, Path C disqualified on Go #62708/#6271). See ADR-E3-r1 for E3=15MB and `docs/reports/2026-05-10-telepty-bilingual-ops-cost.md`.* Path A (Node maintain) retained as documented fallback only. | architect + orchestrator | **CLOSED (r6)** — closure artifacts: C2 report at `~/projects/aigentry-aterm/docs/experiments/2026-05-10-cdylib-tokio-nesting-poc/report.md`; C4 report at `docs/reports/2026-05-10-telepty-bilingual-ops-cost.md` |
 | **Migration plan (0.3.x → 1.0)** | Separate plan ADR (#379), drafted after Phase 1 closure | builder + tester | Write `docs/adr/{date}-telepty-1-0-migration.md` once Phase 1 ships |
 | **V4 cross-mesh full design** | Separate Phase 2 ADR. Sketch at `docs/specs/2026-05-10-v4-cross-mesh-sketch.md` | architect | Promote sketch → ADR after Phase 1 lands |
 | **E3 (RAM 10 vs 15 MB)** | closed (ADR-E3-r1) | architect + orchestrator | Phase 0 C1 closed |
@@ -1147,7 +1148,7 @@ Should implementation stay Node, move to Rust sidecar, or choose Go full rewrite
 | **Exact NDJSON contract fixture path** | TBD | telepty implementer | Phase 1 |
 | **0.3.x migration shim lifetime** | TBD | migration ADR #379 | After Phase 1 |
 
-Total: **8 explicit TBD blanks** (1 hard supervisor-language + 5 deferred from claude draft + 2 implementer-path TBDs from codex draft; E3 row retained as closed audit entry per ADR-E3-r1, not counted).
+Total: **7 explicit TBD blanks** (5 deferred from claude draft + 2 implementer-path TBDs from codex draft; supervisor-language row closed r6 per C2+C4 — retained as closed audit entry, not counted; E3 row retained as closed audit entry per ADR-E3-r1, not counted).
 
 ---
 
@@ -1253,14 +1254,14 @@ Q'''-bis is the **only** point that simultaneously satisfies (D1–D3, F1, K1, M
 | **Rewrite cost** (~30% of 0.3.x replaced; 8–12 person-weeks Phase 1 estimate) | phase plan gates + migration ADR #379 |
 | **Linear RAM scaling** (N = 100 → 500–800 MB RSS; visible vs. 0.3.x shared-daemon footprint) | jemalloc tuning (M31), measurement gates (Phase 4), hybrid path (§9.3) |
 | **OS-specific adapter complexity** (UDS + Named Pipe diverge ~500–1000 LOC) | M25 contract test enforces wire equality |
-| **Transitional bilingual ops cost** (Node 0.3.x + Rust/TBD 1.0 in parallel during migration) | C4 measures the cost; sunset by migration ADR #379 |
+| **Transitional bilingual ops cost** (Node 0.3.x + Rust 1.0 in parallel during migration) | C4 measures the cost; sunset by migration ADR #379 |
 | **More process management** (every supervisor needs a launchd/systemd unit or generator) | unit templates shipped; first-spawn ulimit check (M30) |
 | **Manifest fan-out on disk** (N supervisors → N manifest dirs + N log files) | not a bottleneck below N = 10 000; monitor inode usage on small filesystems |
 
 ### §16.3 Neutral
 
 - **V4 cross-mesh details deferred** — separate Phase 2 ADR; no risk to Phase 1 if V4 changes shape.
-- **Supervisor language TBD** — explicitly deferred per §14. Architecture decisions in this ADR (M28 Rust assumption) are flagged conditional.
+- **Supervisor language LOCKED to Rust 2026-05-12** per §14 (Phase 0 C2+C4 closure). M28 Rust crate-type binding is now load-bearing — see §14 LOCK declaration. Path A (Node maintain) preserved as documented fallback only.
 - **0.3.x sunset timing** — separate migration plan ADR; Phase 1 ships the bridge (J3); sunset is a later policy call.
 - **Terminal app remains a user choice** — orthogonal by design.
 - **Existing `telepty` commands may remain stable** while the implementation behind them changes.
@@ -1295,10 +1296,11 @@ per Constitution Article 13, this ADR records the strongest self-criticism the s
 - **Constructive answer**: M37' is locked for Phase 1, but a "kind-conditional binary frame" extension is technically compatible with M38' (add `kind:"output_b64"` for binary payloads, or `kind:"stream_open"` followed by raw bytes). Phase 4+ can promote a binary path if profiling shows JSON encoding is the bottleneck.
 - **Closure note (r3 — trace_id required leakage)**: B3 r3 makes `trace_id` required for `inject`/`output` in Phase 1 (not Phase 2+ opt-in). This raises the cost of every future Phase 2+ wire change — Phase 2 HMAC token (B4 / M11), V4 contact identity, future kind additions — because the `trace_id` baseline is now a contract surface rather than an evolutionary field. Net cost ≈ 1.5× JSON-Schema scope per kind. Accepted as the lesser evil: the alternative (B3 enforced inconsistently against §6) is worse for cross-session causality and audit traceability.
 
-### §17.5 Supervisor language TBD is the largest unresolved risk (Rust bias)  *(source: claude draft §14.5 + codex draft §11.4(3), merged)*
+### §17.5 Supervisor language TBD risk — MITIGATED 2026-05-12 (Rust LOCKED per C2+C4)  *(source: claude draft §14.5 + codex draft §11.4(3), merged; closure r6)*
 
-- **Criticism**: §14 lists "supervisor binary language" as TBD with Rust leading. M28 (`crate-type = ["cdylib", "rlib"]`) presupposes Rust. If C2 fails and the language flips to Go, M28 is replaced by Go's `c-shared` build mode and the entire embed story is re-derived. The ADR is structurally Rust-leaning while claiming neutrality.
-- **Constructive answer**: r2 should add a "language decision rubric" cross-referenced from M28, so when C2 closes, only one section needs amendment. Until then, treat M28 as conditional and update if C2/C4 reject Rust.
+- **Criticism** *(retained as historical record)*: §14 lists "supervisor binary language" as TBD with Rust leading. M28 (`crate-type = ["cdylib", "rlib"]`) presupposes Rust. If C2 fails and the language flips to Go, M28 is replaced by Go's `c-shared` build mode and the entire embed story is re-derived. The ADR is structurally Rust-leaning while claiming neutrality.
+- **Constructive answer** *(retained as historical record)*: r2 should add a "language decision rubric" cross-referenced from M28, so when C2 closes, only one section needs amendment. Until then, treat M28 as conditional and update if C2/C4 reject Rust.
+- **Closure note (r6, 2026-05-12) — risk MITIGATED (per C2+C4)**: Phase 0 evidence resolves both the TBD framing and the Rust-bias self-criticism in this entry's favor. C2 cdylib-in-tokio PoC PASSED_WITH_CONDITIONS (5/5 scenarios; RSS 3.25–3.42 MiB ≪ 15 MB E3; recommended pattern = extern "C" cdylib boundary + supervisor-owned tokio runtime + host `spawn_blocking`). C4 bilingual ops cost analysis selected Path B (Rust sidecar); Path C (Go full migration) DISQUALIFIED on Go `os/exec` ConPTY limitation (Go upstream issues #62708, #6271 — see §15.2.5). §14 supervisor-language row is now LOCKED → Rust. M28 Rust `crate-type` is now binding (no longer conditional on C2 outcome). Path A (Node 0.3.x maintain) is preserved as documented fallback at §14 and §16.2 for audit/contingency continuity, but is **no longer load-bearing** for any architecture decision in this ADR. The §5.1 r3 "Rust-conditional mandate notice" is retained with an r6 closure marker; M24/M27/M28/M31 are now simply Rust mandates rather than Rust-conditional mandates.
 
 ### §17.6 Phase 1 → Phase 2 dependency is steep  *(source: claude draft §14.6)*
 
@@ -1447,14 +1449,14 @@ This ADR only requires that migration not be forgotten. It does not specify the 
 8. Wire protocol is NDJSON with `v: 1`, kind-conditional fields.
 9. Phase 1 auth is OS permission + SSH key auth only; **no telepty-level token** in Phase 1.
 10. Single-binary multi-mode shape is required (`supervisor` / `relay` / `cli` / `embed`).
-11. Supervisor binary language remains **TBD** until C1–C4.
+11. Supervisor binary language **LOCKED to Rust 2026-05-12** per Phase 0 C2 PASS_WITH_CONDITIONS + C4 Path B (see §14 LOCK declaration).
 12. Migration plan is a separate ADR after Phase 1.
 
-### §20.2 Explicit TBD blanks (8)
+### §20.2 Explicit TBD blanks (7) — supervisor-language row closed r6
 
 | TBD | Owner | When resolved |
 |---|---|---|
-| supervisor binary language | orchestrator + telepty implementer | Phase 0 (C1–C4) |
+| ~~supervisor binary language~~ → **LOCKED 2026-05-12 → Rust** (retained as closed audit entry) | orchestrator + telepty implementer | **r6 (2026-05-12)** — C2 PASS_WITH_CONDITIONS + C4 Path B selection |
 | exact manifest JSON Schema file path | telepty implementer | Phase 1 |
 | exact NDJSON contract fixture path | telepty implementer | Phase 1 |
 | 0.3.x migration shim lifetime | migration ADR #379 | after Phase 1 |
@@ -1465,7 +1467,6 @@ This ADR only requires that migration not be forgotten. It does not specify the 
 
 ### §20.3 Non-binding recommendations
 
-- Prefer Rust unless C1–C4 evidence rejects it.
 - Keep supervisor process code small enough to audit.
 - Keep relay feature set narrow until V4 ADR lands.
 - Write contract tests before broad implementation (TDD per Phase 1 §12.3).
@@ -1478,7 +1479,7 @@ This ADR only requires that migration not be forgotten. It does not specify the 
 
 ### §21.1 Manifest example
 
-> **Conditional example notice (r3)**: as in §7.2, this manifest example assumes the **Rust supervisor** path (illustrative; locked in C2 PASS scenario). Under Path A (C2 FAIL → Node maintained), `"lang": "rust"` reads `"lang": "node"`; all other fields are language-neutral.
+> **Conditional example notice (r3; resolved r6 2026-05-12)**: as in §7.2, this manifest example uses the **Rust supervisor** path — **LOCKED per §14 (C2 PASS + C4 Path B)**. Historical contingency *(r3, retained for audit)*: under Path A (C2 FAIL → Node maintained), `"lang": "rust"` would have read `"lang": "node"`; all other fields are language-neutral.
 
 ```json
 {
@@ -1572,5 +1573,6 @@ Self-check: **7/7 PASS**.
 - **r3 (2026-05-10)**: 8 codex review fixes (E1 trace_id required for inject/output across §4 acceptance gate / §6.1 / §6.2 / 5+ frame examples; E2 H1 + M34 + L3a PTY recovery wording corrected to "crash detection + audit replay, not live PTY recovery"; E3 §12.7.1 gate matrix normalization separating Phase 1 / Phase 2 / Phase 4 entry; E4 §13.1 closure artifact reads "Q'''-bis ADR amendment, Constitution untouched" + OS/no-WSL acceptance detail inlined; E5 §17.13 numbered constructive frame + LLM source tags on §17.1–§17.12; E6 §15 alternative count normalized to 14 in §17.8 + §22; E7 §18.7 Article 17 dependency/fallback inventory for Tailscale + OpenSSH + jemalloc; E8 §7.2 + §21.1 manifest examples + §5.1 M24/M27/M28/M31 marked Rust-conditional). Verdict: post-r2 codex ACCEPT_WITH_FIXES → r3 surgical fixes only (architecture untouched). r3 self-criticism: trace_id-required leakage (B3 → §6 → all examples) increases future Phase 2+ wire-change cost — adding HMAC-token (B4/M11) or V4 contact-identity fields must accommodate `trace_id` as a Phase 1 baseline rather than a Phase 2 opt-in, ~1.5× JSON-Schema scope per kind.
 - **r5 (2026-05-10)**: 3 minor textual fixes post-r4 codex review (ACCEPT_WITH_MINOR_FIXES) — Fix 1 trace_id leakage residue closed in §3.8 inject/output examples + §6.5 idempotency walkthrough (B3 + r3 E1 consistency); Fix 2 §9.2 line 802 stale E3 wording rewritten to "target 5–8 MB; binding E3 ceiling ≤15 MB per ADR-E3-r1; future Phase 4 may tighten to ≤10 MB by follow-up ADR (evidence-gated)"; Fix 3 §20.2 E3 TBD row removed (option a — explicit TBD count 9 → 8) + §14 total adjusted to 8 with E3 retained as closed audit entry. Status flipped `proposed → accepted` per C1 closure (E3) + r4 verdict. No architecture change.
 - **r5+amend-A1A3 (2026-05-12)**: A1 wire `signal` enum extended (§6.2 + §6.2.1) to add `SIGKILL`, `JOB_TERMINATE`, `CTRL_BREAK_EVENT` and mark `SIGINT` POSIX-only. A2 error-code taxonomy extended (§6.4) with `ERR_UNKILLABLE_CHILD`, `ERR_PARENT_GONE`, `ERR_SUPERVISOR_GONE`, `ERR_MANIFEST_WRITE_FAIL`, `ERR_ESCAPED_DESCENDANT`, `ERR_PGRP_LIVE_AFTER_KILL`. A3 manifest `exit_reason` enum defined in §7.3 — `{normal, signaled, killed, crashed, unkillable}`; `orphan` explicitly NOT terminal. Drives **single-SSOT closure** of SPEC-C3-r1 §9.3 mandatory amendments per codex r2 Q6 recommendation. Status remains `accepted`; this is an additive contract amendment, not an architecture change. r5+amend-A1A3 self-criticism: the new `ERR_*` taxonomy adds 6 codes to the Phase 1 minimal set, increasing implementer/test-fixture surface — mitigated by marking `ERR_ESCAPED_DESCENDANT` and `ERR_PGRP_LIVE_AFTER_KILL` as optional/advisory in their cells (no enforced emission). No new §17 inventory row added (count remains at 14 per E5/E6 lock — the amendment is contract surface, not a new architectural risk).
+- **r5+amend-A1A3+r6 (2026-05-12)**: supervisor language LOCKED to Rust per Phase 0 C2 (cdylib-in-tokio PoC PASS_WITH_CONDITIONS — 5/5 scenarios, RSS 3.25–3.42 MiB ≪ 15 MB E3; recommended pattern: extern "C" cdylib boundary + supervisor-owned tokio runtime + host `spawn_blocking`) + C4 Path B (bilingual ops cost analysis; Path C / Go DISQUALIFIED per §15.2.5 on Go `os/exec` ConPTY limitation, Go upstream issues #62708 + #6271). r6 textual flips: §1.6 Defers bullet (Defers → Locks audit entry); §3 line 393 (TBD pending C1–C4 → LOCKED per C2+C4); §5.1 r3 Rust-conditional mandate notice (closed marker + historical contingency frame); §7.2 r3 manifest conditional notice (closed marker); §9.1 cdylib bullet (`conditional on Rust language lock` → `per §14 Rust LOCK`); §14 supervisor-language row (TBD → LOCKED with exact dispatch-mandated declaration phrasing once); §14 TBD total 8 → 7; §16.2 Negative table (`Rust/TBD 1.0` → `Rust 1.0`); §16.3 Neutral bullet (TBD deferred → LOCKED per §14, conditional framing removed); §17.5 (title + closure note — risk MITIGATED, criticism + constructive answer retained as historical record); §20.1 binding decision 11 (TBD until C1–C4 → LOCKED per C2+C4); §20.2 TBD blanks table (count 8 → 7, supervisor-language row retained as closed audit entry); §20.3 first bullet removed (Rust now binding in §20.1.11); §21.1 r3 conditional example notice (closed marker). Status remains `accepted`; this is the evidence-based closure of §14 supervisor-language TBD row + §17.5 risk row, not an architecture change. Path A (Node 0.3.x maintain) preserved as documented fallback at §14 + §16.2 but is **no longer load-bearing**. A1–A3 enums, M22–M40 (including M28 row), 31/39 requirements, §17 14-entry inventory count, B3 trace_id required, E3=15MB ceiling, and manifest schema invariants all untouched. r6 self-criticism: with M28 binding now positive (not conditional), the §5.1 r3 "Rust-conditional mandate notice" has reduced load-bearing meaning — M24/M27/M28/M31 are now simply Rust mandates rather than Rust-conditional mandates. The notice is retained with an r6 closure marker rather than rewritten, preserving the historical contingency frame per audit-trail invariant.
 
 ---
