@@ -1,5 +1,12 @@
-// ADR-MF §4.3 — G1–G6 spawn validation gates.
+// ADR-MF §4.3 — G1–G6 spawn validation gates + P1 capability gate (ADR-MF #8).
 // Uniform invariants across enforcement classes A/B/C. Returns discriminated union.
+//
+// Gate-label mapping (SPEC §2):
+//   G1 role / G2 orchestrator-clone / G3 role-override / G4 cwd / G5 task / G6 cycle
+//     all owned by this file (#99 / ADR-MF #3, commit d06e9cb).
+//   P1 capability-subset owned by permission-manager.ts (ADR-MF #8); invoked below
+//     after G6, no-op when neither parent.permissions nor req.requested_permissions
+//     is set (preserves #99 backwards-compat byte-for-byte).
 import { existsSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import {
@@ -9,6 +16,10 @@ import {
   type SessionContext,
   type SpawnRequest,
 } from "./types.js";
+import {
+  checkSpawnPermissions,
+  type PermissionErrorCode,
+} from "./permission-manager.js";
 
 export type ValidateSpawnErrorCode =
   | "ERR_ROLE_MISSING"
@@ -19,7 +30,11 @@ export type ValidateSpawnErrorCode =
   | "ERR_CWD_NOT_ABSOLUTE"
   | "ERR_CWD_NOT_EXISTS"
   | "ERR_TASK_MISSING"
-  | "ERR_CYCLE_DETECTED";
+  | "ERR_CYCLE_DETECTED"
+  | "ERR_CAPABILITY_UNKNOWN"
+  | "ERR_CAPABILITY_DENIED"
+  | "ERR_CAPABILITY_EXPANSION"
+  | "ERR_INVALID_REQUEST";
 
 export type ValidateSpawnResult =
   | { ok: true }
@@ -191,6 +206,24 @@ function g6Cycle(
   return undefined;
 }
 
+// P1 — capability subset (ADR §4.3 G5 invariant; ADR-MF #8).
+// No-op when neither parent.permissions nor req.requested_permissions is set,
+// which preserves every #99 test verbatim.
+function p1Permissions(
+  req: SpawnRequest,
+  opts: ValidateSpawnOptions,
+): ValidateSpawnResult | undefined {
+  const has_parent_caps = opts.parent?.permissions !== undefined;
+  const has_requested = req.requested_permissions !== undefined;
+  if (!has_parent_caps && !has_requested) return undefined;
+
+  const res = checkSpawnPermissions(opts.parent, req);
+  if (res.ok) return undefined;
+  // PermissionErrorCode is a strict subset of ValidateSpawnErrorCode by construction;
+  // see ValidateSpawnErrorCode union above. The cast is provably safe.
+  return { ok: false, code: res.code as PermissionErrorCode, detail: res.detail };
+}
+
 export function validateSpawn(
   req: SpawnRequest,
   opts: ValidateSpawnOptions = {},
@@ -201,6 +234,7 @@ export function validateSpawn(
     g3RoleOverride(req, opts.parent) ??
     g4Cwd(req, opts) ??
     g5Task(req) ??
-    g6Cycle(req, opts) ?? { ok: true }
+    g6Cycle(req, opts) ??
+    p1Permissions(req, opts) ?? { ok: true }
   );
 }

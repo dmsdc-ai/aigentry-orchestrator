@@ -33,6 +33,26 @@ export interface LayerMeta {
   read_at: string;
 }
 
+// Capability identifiers — closed minimum set per ADR §4.6 / §4.6.1.
+// Finer-grained capabilities (per-MCP allowlist, per-domain network, per-glob fs)
+// = Q-OPEN-2-FOLLOWUP (ADR §7.2 + §8); out of scope for ADR-MF #8.
+export const CAPABILITIES = [
+  "spawn_l1",
+  "spawn_l2",
+  "read_fs",
+  "write_fs",
+  "bash",
+  "network",
+  "mcp_deliberation",
+  "task_dispatch",
+] as const;
+
+export type Capability = (typeof CAPABILITIES)[number];
+
+export function isCapability(v: unknown): v is Capability {
+  return typeof v === "string" && (CAPABILITIES as readonly string[]).includes(v);
+}
+
 // L1 SessionContext — immutable snapshot persisted at L1 spawn time (ADR §4.2).
 export interface SessionContext {
   session_id: string;
@@ -48,6 +68,8 @@ export interface SessionContext {
   spawn_chain: readonly string[];
   depth: number;
   created_at: string;
+  // Optional — set by the Permission Manager (ADR §4.6 / ADR-MF #8). Sorted on disk.
+  permissions?: readonly Capability[];
 }
 
 // L2 AgentRecord — lightweight child of a persisted L1 snapshot (ADR §4.2.1).
@@ -74,4 +96,6 @@ export interface SpawnRequest {
   parent_session_id?: string;
   parent_role_override?: boolean;
   role_override_reason?: string;
+  // Optional — omit to inherit the role-default (ADR-MF #8 / SPEC §5.3).
+  requested_permissions?: readonly Capability[];
 }

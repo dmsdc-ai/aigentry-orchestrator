@@ -124,3 +124,63 @@ test("G6 — clean linear chain (proposed id absent) passes", () => {
     { ok: true },
   );
 });
+
+// ── P1 — capability subset (ADR-MF #8 integration, SPEC §7.3) ────────────────
+
+test("P1 — no-op when neither parent.permissions nor requested_permissions set", () => {
+  // Regression guard for SPEC §5.2: #99 happy paths must keep passing.
+  const p = parent({ role: Role.coder });
+  assert.deepEqual(
+    validateSpawn(req({ role: Role.coder }), { parent: p }),
+    { ok: true },
+  );
+});
+
+test("P1 — parent without spawn_l1 ⇒ child requesting spawn_l1 is ERR_CAPABILITY_EXPANSION", () => {
+  // Use orchestrator parent so role-default allows spawn_l1; expansion must come
+  // from the parent ceiling, not the role-default. parent permissions omit spawn_l1.
+  const p = parent({
+    role: Role.orchestrator,
+    permissions: ["read_fs", "write_fs"],
+  });
+  expectFail(
+    validateSpawn(
+      req({
+        role: Role.orchestrator,
+        parent_role_override: true,
+        role_override_reason: "tree-search branch",
+        requested_permissions: ["spawn_l1"],
+      }),
+      { parent: p },
+    ),
+    "ERR_CAPABILITY_EXPANSION",
+  );
+});
+
+test("P1 — request lists unknown cap ⇒ ERR_CAPABILITY_UNKNOWN", () => {
+  const p = parent({ role: Role.coder, permissions: ["read_fs"] });
+  expectFail(
+    validateSpawn(
+      req({
+        role: Role.coder,
+        requested_permissions: ["god_mode"] as unknown as readonly never[],
+      }),
+      { parent: p },
+    ),
+    "ERR_CAPABILITY_UNKNOWN",
+  );
+});
+
+test("P1 — in-bounds request passes alongside G1–G6", () => {
+  const p = parent({
+    role: Role.coder,
+    permissions: ["read_fs", "write_fs", "bash"],
+  });
+  assert.deepEqual(
+    validateSpawn(
+      req({ role: Role.coder, requested_permissions: ["read_fs", "bash"] }),
+      { parent: p },
+    ),
+    { ok: true },
+  );
+});
