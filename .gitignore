@@ -20,6 +20,7 @@ AGENTS.md.pre-slim.*.bak
 
 # node
 node_modules/
+dist/
 *.log
 
 # Python
