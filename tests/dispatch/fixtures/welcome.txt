@@ -1,0 +1,7 @@
+╭─────────────────────────────────────────╮
+│ Welcome back to Claude                  │
+│ Tips for getting started                │
+│ Trust this folder to enable tools       │
+╰─────────────────────────────────────────╯
+
+ ❯ Try "build a feature for me"

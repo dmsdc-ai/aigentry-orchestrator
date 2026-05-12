@@ -1,0 +1,4 @@
+[some old scrollback that mentions setup completed]
+[user pressed enter twice; welcome banner cleared]
+
+ ❯ Try "what should I work on next?"

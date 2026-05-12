@@ -1,0 +1,6 @@
+Running tests...
+Traceback (most recent call last):
+  File "foo.py", line 12, in <module>
+    raise RuntimeError("boom")
+RuntimeError: boom
+Error: process exited 1

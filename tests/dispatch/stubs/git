@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Stub `git`. Driven by env files:
+#   STUB_GIT_LOG_FILE        — content for `git log`
+#   STUB_GIT_CONFIG_FILE     — content for `git config user.email`
+#   STUB_GIT_SHORTSTAT_FILE  — content for `git diff --shortstat`
+# Always accepts `rev-parse --git-dir` and `rev-parse --short HEAD`.
+shift_until() {
+  while [ $# -gt 0 ]; do
+    case "$1" in -C) shift 2;; *) break;; esac
+  done
+  printf '%s\n' "$@"
+}
+args=$(shift_until "$@")
+set -- $args
+case "$1" in
+  rev-parse)
+    case "${2:-}" in
+      --git-dir) echo ".git"; exit 0;;
+      --short) echo "abc1234"; exit 0;;
+    esac
+    ;;
+  config)  cat "${STUB_GIT_CONFIG_FILE:-/dev/null}";;
+  log)     cat "${STUB_GIT_LOG_FILE:-/dev/null}";;
+  diff)    cat "${STUB_GIT_SHORTSTAT_FILE:-/dev/null}";;
+  *)       echo "stub git $*";;
+esac

@@ -1,0 +1,3 @@
+[no response after inject — still showing placeholder]
+
+ ❯ Try "what should I work on next?"

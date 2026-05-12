@@ -1,0 +1,30 @@
+Welcome back to Claude
+Tips for getting started in this project
+Trust this folder to enable tools
+Press Enter to continue and dismiss this banner
+
+ran a quick build
+build succeeded
+checked logs
+all clean
+ready for next instruction
+yes the change landed
+verified
+ok
+ok
+ok
+done
+done
+done
+just waiting
+all good
+status nominal
+no blockers
+checked files
+re-ran tests
+green
+green
+all green
+holding here
+
+ ❯

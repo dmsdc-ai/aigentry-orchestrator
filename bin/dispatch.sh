@@ -15,16 +15,22 @@
 # Ready detection: per-CLI prompt-symbol probe of `telepty read-screen` plus
 # welcome/boot banner absence (claude ❯ / codex › / gemini ›|│ >).
 #
-# Exit codes: 0 OK, 1 timeout, 2 spawn failed, 3 inject failed, 4 usage.
+# Exit codes: 0 OK, 1 timeout, 2 spawn failed, 3 inject failed, 4 usage,
+#             5 --verify-delivered detected delivery failure.
 set -euo pipefail
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+if [ "${DISPATCH_SH_NO_MAIN:-0}" != "1" ]; then
+  export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+TRACKER_SH="$SCRIPT_DIR/dispatch-tracker.sh"
+TELEPTY="${TELEPTY:-telepty}"
 
 usage() { sed -n '2,18p' "$0"; }
 
 target=""; ref_file=""; from_id=""; timeout_ms=30000
 spawn=0; track=""; name=""; cwd=""; cli="claude"
+verify_delivered=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -37,13 +43,16 @@ while [ $# -gt 0 ]; do
     --name) name="$2"; shift 2;;
     --cwd) cwd="$2"; shift 2;;
     --cli) cli="$2"; shift 2;;
+    --verify-delivered) verify_delivered=1; shift;;
     -h|--help) usage; exit 0;;
     *) echo "dispatch.sh: unknown arg: $1" >&2; usage >&2; exit 4;;
   esac
 done
 
-[ -n "$ref_file" ] || { echo "dispatch.sh: --ref required" >&2; exit 4; }
-[ -f "$ref_file" ] || { echo "dispatch.sh: ref file not found: $ref_file" >&2; exit 4; }
+if [ "${DISPATCH_SH_NO_MAIN:-0}" != "1" ]; then
+  [ -n "$ref_file" ] || { echo "dispatch.sh: --ref required" >&2; exit 4; }
+  [ -f "$ref_file" ] || { echo "dispatch.sh: ref file not found: $ref_file" >&2; exit 4; }
+fi
 
 now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
 
@@ -63,37 +72,38 @@ except Exception:
 }
 
 # Returns 0 if the wrapped CLI's REPL is past the welcome/boot screen.
-# Strategy: banner-absent AND prompt-symbol-present (rendered screen probe).
+# Strategy: tail-only banner check + prompt-symbol-present + placeholder allow.
+# (Pre-2026-05-12 logic scanned the full 80-line scrollback, which kept matching
+# "Tips for getting started" forever and caused #113's false timeouts.)
 is_ready() {
   local sid="$1" cli_kind="$2" screen
-  screen=$(telepty read-screen "$sid" --lines 80 2>/dev/null) || screen=""
-  [ -n "$screen" ] || return 1
-  case "$cli_kind" in
-    claude)
-      if printf '%s' "$screen" | grep -qE 'Welcome back|Tips for getting started|Trust this folder|Do you want to enable|Press Enter to continue'; then
-        return 1
-      fi
-      printf '%s' "$screen" | grep -qF '❯'
-      ;;
-    codex)
-      if printf '%s' "$screen" | grep -qE 'Welcome to .*Codex|OpenAI Codex CLI|Loading…|Initializing'; then
-        return 1
-      fi
-      printf '%s' "$screen" | grep -qF '›'
-      ;;
-    gemini)
-      if printf '%s' "$screen" | grep -qE 'Welcome to Gemini|Loading model|Initializing|Authenticating'; then
-        return 1
-      fi
-      printf '%s' "$screen" | grep -qE '›|│ >'
-      ;;
-    *)
-      if printf '%s' "$screen" | grep -qE 'Welcome|Initializing|Loading|Tips for getting started'; then
-        return 1
-      fi
-      printf '%s' "$screen" | grep -qE '❯|›'
-      ;;
-  esac
+  screen=$("$TELEPTY" read-screen "$sid" --lines 60 2>/dev/null || true)
+  CLI_KIND="$cli_kind" SCREEN="$screen" python3 - <<'PY'
+import os, re, sys
+cli = os.environ.get("CLI_KIND", "")
+text = os.environ.get("SCREEN", "")
+lines = [l.rstrip() for l in text.splitlines() if l.strip()]
+if not lines: sys.exit(1)
+tail   = "\n".join(lines[-20:])
+last3  = "\n".join(lines[-3:])
+
+BANNERS = {
+  "claude": r"Welcome back|Tips for getting started|Trust this folder|Do you want to enable|Press Enter to continue",
+  "codex":  r"Welcome to .*Codex|OpenAI Codex CLI|Loading…|Initializing",
+  "gemini": r"Welcome to Gemini|Loading model|Initializing|Authenticating",
+}
+PROMPT = {"claude": r"❯", "codex": r"›", "gemini": r"›|│ >"}
+banner = BANNERS.get(cli, r"Welcome|Initializing|Loading|Tips for getting started")
+prompt = PROMPT.get(cli, r"❯|›")
+
+if re.search(banner, tail):
+    sys.exit(1)
+if re.search(rf'(?m){prompt}\s+Try "[^"]+"', last3):
+    sys.exit(0)  # input-empty placeholder = ready
+if re.search(prompt, last3):
+    sys.exit(0)
+sys.exit(1)
+PY
 }
 
 wait_for_ready() {
@@ -116,18 +126,19 @@ wait_for_ready() {
 
 dedup_dir="$HOME/.aigentry/dispatch-helper"
 mkdir -p "$dedup_dir"
+ref_hash=""
 
 # Returns 0 to proceed, 1 to skip (idempotent — same ref already dispatched).
 # Records the new hash so a subsequent identical re-run will skip.
 dedup_check_and_mark() {
-  local sid="$1" hash mark
-  hash=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$ref_file")
+  local sid="$1" mark
+  ref_hash=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$ref_file")
   mark="$dedup_dir/$sid"
-  if [ -f "$mark" ] && [ "$(cat "$mark" 2>/dev/null)" = "$hash" ]; then
+  if [ -f "$mark" ] && [ "$(cat "$mark" 2>/dev/null)" = "$ref_hash" ]; then
     echo "OK already dispatched to $sid (same ref hash, skip)"
     return 1
   fi
-  printf '%s\n' "$hash" > "$mark"
+  printf '%s\n' "$ref_hash" > "$mark"
 }
 
 do_inject() {
@@ -138,7 +149,42 @@ do_inject() {
   telepty "${a[@]}"
 }
 
+# Returns 0 if the inject visibly landed (placeholder cleared or payload's
+# first line echoed), 1 otherwise. Called only when --verify-delivered is set.
+verify_delivered() {
+  local sid="$1" first_line post
+  first_line=$(head -n1 "$ref_file" | tr -d '\r')
+  sleep 5
+  post=$("$TELEPTY" read-screen "$sid" --lines 30 2>/dev/null || true)
+  FIRST="$first_line" POST="$post" python3 - <<'PY'
+import os, re, sys
+post = os.environ.get("POST", "")
+first = os.environ.get("FIRST", "")
+lines = [l.rstrip() for l in post.splitlines() if l.strip()]
+tail = "\n".join(lines[-10:]) if lines else ""
+placeholder = re.search(r'[❯›]\s+Try "[^"]+"', tail) is not None
+echoed = bool(first) and first[:60] in post
+if placeholder and not echoed:
+    sys.exit(1)
+sys.exit(0)
+PY
+}
+
+# Best-effort tracker hook: append on-success entry. Tracker absence is fatal-free.
+tracker_append() {
+  local sid="$1" hash="$2"
+  [ -x "$TRACKER_SH" ] || return 0
+  local -a a=(append "$sid" "$ref_file" "$hash")
+  [ -n "$cwd" ] && a+=(--cwd "$cwd")
+  [ -n "$from_id" ] && a+=(--from "$from_id")
+  "$TRACKER_SH" "${a[@]}" >/dev/null 2>&1 || true
+}
+
 # --- main ---
+# Sourceable for tests: `DISPATCH_SH_NO_MAIN=1 source dispatch.sh` exposes
+# is_ready / verify_delivered without running the dispatch flow.
+if [ "${DISPATCH_SH_NO_MAIN:-0}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
+
 sid=""
 if [ "$spawn" -eq 1 ]; then
   if [ -z "$track" ] || [ -z "$name" ] || [ -z "$cwd" ]; then
@@ -161,11 +207,19 @@ if ! dedup_check_and_mark "$sid"; then exit 0; fi
 
 if ! wait_for_ready "$sid"; then exit 1; fi
 
-if do_inject "$sid"; then
-  echo "OK dispatched to $sid"
-  exit 0
-else
+if ! do_inject "$sid"; then
   echo "dispatch.sh: telepty inject failed for $sid" >&2
   rm -f "$dedup_dir/$sid"
   exit 3
 fi
+
+if [ "$verify_delivered" -eq 1 ]; then
+  if ! verify_delivered "$sid"; then
+    echo "dispatch.sh: DELIVERY_FAILED for $sid (placeholder untouched)" >&2
+    exit 5
+  fi
+fi
+
+tracker_append "$sid" "$ref_hash"
+echo "OK dispatched to $sid"
+exit 0

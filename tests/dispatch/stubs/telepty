@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Stub `telepty` for tests. Driven by env files exported by lib.sh:
+#   STUB_SCREEN_FILE   — content for `read-screen`
+#   STUB_LIST_FILE     — JSON for `list --json`
+case "$1" in
+  read-screen) cat "${STUB_SCREEN_FILE:-/dev/null}";;
+  list)        shift; if [ "${1:-}" = "--json" ]; then cat "${STUB_LIST_FILE:-/dev/null}"; else echo "stub: telepty list"; fi;;
+  inject)      printf '%s ' "telepty inject" "$@" >> "${STUB_DISPATCH_LOG:-/dev/null}"; printf '\n' >> "${STUB_DISPATCH_LOG:-/dev/null}"; echo "stub inject OK";;
+  *)           echo "stub telepty $*";;
+esac
