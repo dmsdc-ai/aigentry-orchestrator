@@ -27,6 +27,7 @@
 - [ ] **운영 자율 (Rule 30)**: codex sandbox prompt / cmux UI blank / session stuck 등 운영 이슈를 사용자에게 escalation하지 않고 자율 처리(자동 응답/respawn/read-screen)했는가? 사용자 인터렉션은 architecture/business/destructive action에 한정?
 - [ ] **영구 fix 강제 (Rule 32)**: 발생한 이슈는 1회성 workaround로 끝내지 않고 (1) workaround + (2) root cause + (3) GitHub issue 또는 Task 등록 + (4) permanent fix dispatch 4 step 모두 수행했는가? 2번째 재발 시 즉시 fix dispatch?
 - [ ] **dispatch helper 사용 (Rule 32 + telepty#18, 2026-05-12)**: 새 세션에 첫 dispatch 시 `bin/dispatch.sh --spawn-and-dispatch ...` (또는 spawn 후 `bin/dispatch.sh --target <sid> --ref <ref>`) 경유했는가? welcome-bootstrap race 회피 (sleep heuristic 또는 raw `telepty inject` 직후 spawn 금지). telepty#18 daemon-side proper fix land 후 이 row 완화 가능.
+- [ ] **Snyk Security At Inception (CLAUDE.md global + Rule 32, 2026-05-12)**: 위임된 코더가 새/수정 first-party 코드 (Snyk-supported language)를 생성하면 DONE 보고 전 `snyk_code_scan` (MCP) 또는 `bin/snyk-scan.sh` (shell)을 호출하고 findings를 fix-rescan 루프로 0건까지 처리하도록 inject에 명시했는가? 설치/auth 절차: `docs/setup/snyk-mcp.md`.
 
 ### 실행 모드 체크 (Rule 4-A — Phase 6 Conclusion 기반, 2026-05-04 lock (4-way Layer 1 selector LOCKED per ADR `2026-05-04-phase6-conclusion.md` §4.2, commit c7b2e79))
 
