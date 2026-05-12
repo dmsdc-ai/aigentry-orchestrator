@@ -105,9 +105,26 @@
 
 **결론 (objective)**: Amendment land 시 **하드 브레이킹 케이스 없음**. 두 영역 (`bin/dispatch.sh` capability flag, SAWP role table reconciliation)이 follow-up task로 추적 필요. 둘 다 #103 land 후 비차단.
 
-**Critical observation**: 현행 Rule 4의 strict interpretation에 *암시적으로* 의존하는 운영 패턴은 "위임 inject는 항상 orchestrator → leaf session" 단일-홉 모델이다. Amendment 후에는 architect 같은 spawn_l1 보유 role이 multi-hop spawn 을 합법적으로 수행할 수 있으므로, 보고 라인 (Rule 7) 의 "위임자에게 보고" 정의가 *직접 부모* (immediate parent) 인지 *루트 orchestrator* 인지 명시 필요. → **OQ-RULE4-AMEND-1** 로 추적 (follow-up; land 전 user clarification 요청).
+**Critical observation**: 현행 Rule 4의 strict interpretation에 *암시적으로* 의존하는 운영 패턴은 "위임 inject는 항상 orchestrator → leaf session" 단일-홉 모델이다. Amendment 후에는 architect 같은 spawn_l1 보유 role이 multi-hop spawn 을 합법적으로 수행할 수 있으므로, 보고 라인 (Rule 7) 의 "위임자에게 보고" 정의가 *직접 부모* (immediate parent) 인지 *루트 orchestrator* 인지 명시 필요 → **OQ-RULE4-AMEND-1**. **Resolution: §6 below (orchestrator answer 2026-05-12).**
 
-**Constructive recommendation**: Amendment commit 메시지에 OQ-RULE4-AMEND-1을 노출하여 #103 review 사이클 중에 함께 결정. 별도 grill 불필요.
+---
+
+## Section 6 — Reporting line transition (OQ-RULE4-AMEND-1 resolution)
+
+**Transition note (binding for this amendment):**
+
+Reporting line: current pattern = **R-A** (sub-sessions report directly to root orchestrator). Transition to **R-B** (immediate parent + aggregator propagation) is gated on ADR-MF #103 (Permission Manager) + aggregator mechanism land. Until then, R-A maintained.
+
+**Implications for Rule 4 amendment land:**
+
+- Rule 7 (완료 보고 강제) 본문은 본 amendment 와 함께 변경되지 **않는다** — R-A 가 현행. Multi-hop spawn 으로 architect 가 sub-session 을 생성해도, sub-session 의 MANDATORY REPORT 는 **root orchestrator** 로 직접 inject 한다 (`telepty inject ... <orchestrator-session-id>`).
+- R-B (immediate-parent reporting + aggregator) 는 별도 land 단위: (i) #103 Permission Manager land → (ii) aggregator mechanism (parent session 이 child REPORT 를 collect 하고 propagate 하는 surface) 설계 + impl → (iii) Rule 7 amendment 가 R-B 를 적용.
+- R-A → R-B 전환은 **본 Rule 4 amendment 의 scope 가 아니다** (Article 13 objective; user lock F11 — limits / 추가 제약은 follow-up ADR).
+- Section 1 Rule 4 amendment 본문은 R-A 가정 하에서 정합 — `spawn_l1` capability 보유 세션이 sub-spawn 시 자식 REPORT 의 destination 은 root orchestrator 로 변경 없음.
+
+**Cross-refs**: Rule 7 (현행 보고 강제) · ADR §4.6 (capability-gated spawn) · ADR §4.7 F1 (dispatch prelude — interim role 선언) · Permission Manager #103 + aggregator follow-up (R-B 전환의 두 blocker).
+
+**OQ-RULE4-AMEND-1 closed:** R-A confirmed; R-B 전환 plan 명문화. No further user clarification 필요 for this amendment.
 
 ---
 
