@@ -20,6 +20,11 @@ import {
   checkSpawnPermissions,
   type PermissionErrorCode,
 } from "./permission-manager.js";
+import {
+  emit as defaultEmit,
+  type SpawnEvent,
+  type ValidationMode,
+} from "../telemetry/spawn-events.js";
 
 export type ValidateSpawnErrorCode =
   | "ERR_ROLE_MISSING"
@@ -237,4 +242,162 @@ export function validateSpawn(
     g6Cycle(req, opts) ??
     p1Permissions(req, opts) ?? { ok: true }
   );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADR-MF #9 — Warn-mode wrapper. Additive layer over validateSpawn().
+//
+// validateSpawn() above stays pure (returns a result, no I/O, no throw).
+// enforceSpawn() below applies the operating mode and emits telemetry.
+// Rule 29: G1–G6 + P1 bodies above remain byte-for-byte unchanged.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type { ValidationMode };
+
+export const DEFAULT_VALIDATION_MODE: ValidationMode = "warn"; // OQ1 — ADR §6 #9 compat window
+
+export class SpawnValidationError extends Error {
+  readonly code: ValidateSpawnErrorCode;
+  readonly detail: string;
+  constructor(code: ValidateSpawnErrorCode, detail: string) {
+    super(`${code}: ${detail}`);
+    this.name = "SpawnValidationError";
+    this.code = code;
+    this.detail = detail;
+  }
+}
+
+// OQ2 — degraded fallback role = logger (least-privileged role per role-capabilities.ts).
+// Rationale: a spawn that fails any gate must not be granted a fallback role that
+// carries MORE default capabilities than the original request. `logger` has only
+// `read_fs` in the §4.6.2 table, so a degraded session cannot escalate privilege.
+export const DEGRADED_FALLBACK_ROLE: Role = Role.logger;
+
+export function readValidationMode(
+  env: NodeJS.ProcessEnv = process.env,
+): ValidationMode {
+  const raw = env["AIGENTRY_SPAWN_VALIDATION_MODE"];
+  return raw === "hard-fail" || raw === "warn" || raw === "off"
+    ? raw
+    : DEFAULT_VALIDATION_MODE;
+}
+
+export interface EnforceSpawnOptions extends ValidateSpawnOptions {
+  mode?: ValidationMode;
+  ctx_digest?: string;
+  now?: () => Date;
+  emit?: (e: SpawnEvent) => void;
+}
+
+type ValidateSpawnFailure = Extract<ValidateSpawnResult, { ok: false }>;
+
+export type EnforceSpawnResult =
+  | { ok: true; mode: ValidationMode; effective_role: Role; degraded: false }
+  | {
+      ok: true;
+      mode: "warn";
+      effective_role: Role;
+      degraded: true;
+      validation: ValidateSpawnFailure;
+    };
+
+let _lastObservedMode: ValidationMode | undefined;
+
+// Test-only escape hatch. Underscored to discourage production callers.
+export function __resetModeTrackingForTests(): void {
+  _lastObservedMode = undefined;
+}
+
+function maybeEmitModeChange(
+  current: ValidationMode,
+  parent_id: string | null,
+  emitFn: (e: SpawnEvent) => void,
+  now: () => Date,
+): void {
+  if (_lastObservedMode !== undefined && _lastObservedMode !== current) {
+    emitFn({
+      ts: now().toISOString(),
+      event: "mode_changed",
+      mode: current,
+      session_id: null,
+      parent_id,
+      reason: `${_lastObservedMode}→${current}`,
+      violations: [],
+      ctx_digest: null,
+    });
+  }
+  _lastObservedMode = current;
+}
+
+export function enforceSpawn(
+  req: SpawnRequest,
+  opts: EnforceSpawnOptions = {},
+): EnforceSpawnResult {
+  const mode = opts.mode ?? readValidationMode();
+  const now = opts.now ?? ((): Date => new Date());
+  const emitFn = opts.emit ?? ((e: SpawnEvent): void => defaultEmit(e));
+  const parent_id = req.parent_session_id ?? null;
+  const session_id = opts.proposed_session_id ?? null;
+  const ctx_digest =
+    opts.ctx_digest ?? opts.parent?.effective_prompt_digest ?? null;
+
+  maybeEmitModeChange(mode, parent_id, emitFn, now);
+
+  if (mode === "off") {
+    return { ok: true, mode, effective_role: req.role, degraded: false };
+  }
+
+  const validation = validateSpawn(req, opts);
+
+  if (validation.ok) {
+    emitFn({
+      ts: now().toISOString(),
+      event: "spawn_accepted",
+      mode,
+      session_id,
+      parent_id,
+      reason: "ok",
+      violations: [],
+      ctx_digest,
+    });
+    return { ok: true, mode, effective_role: req.role, degraded: false };
+  }
+
+  emitFn({
+    ts: now().toISOString(),
+    event: "spawn_rejected",
+    mode,
+    session_id,
+    parent_id,
+    reason: validation.code,
+    violations: [{ code: validation.code, detail: validation.detail }],
+    ctx_digest,
+  });
+
+  if (mode === "hard-fail") {
+    // OQ4 — preserve #99 G1–G6 + #103 P1 throw semantics for the eventual
+    // #15 spawn-path integration. Result-style API is a follow-up if needed.
+    throw new SpawnValidationError(validation.code, validation.detail);
+  }
+
+  emitFn({
+    ts: now().toISOString(),
+    event: "spawn_degraded",
+    mode,
+    session_id,
+    parent_id,
+    reason: validation.code,
+    violations: [{ code: validation.code, detail: validation.detail }],
+    ctx_digest,
+  });
+  console.warn(
+    `[spawn-warn] ${validation.code}: ${validation.detail} — degrading role ${req.role} → ${DEGRADED_FALLBACK_ROLE}`,
+  );
+  return {
+    ok: true,
+    mode: "warn",
+    effective_role: DEGRADED_FALLBACK_ROLE,
+    degraded: true,
+    validation,
+  };
 }

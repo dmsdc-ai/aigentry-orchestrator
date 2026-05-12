@@ -48,6 +48,7 @@
 > **헌법 원본**: `../aigentry/docs/CONSTITUTION.md` (sibling repo)
 > **Rule 4 ADR (2026-04-22 origin → 2026-05-01 final lock → 2026-05-03 Q1+Q2 sub-ADRs → 2026-05-04 Phase 6 conclusion final integration / Track #329 E27 closure)**: `docs/adr/2026-04-22-rule-4-mode-selection.md` ; `docs/adr/2026-05-01-rule-4-a-step-4-final-lock.md` ; `docs/adr/2026-05-03-substitute-compact-phase6-promote.md` ; `docs/adr/2026-05-03-d-promotion-phase6-promote.md` ; `docs/adr/2026-05-04-phase6-conclusion.md`
 > **Permission Manager (spawn-capability gate / role→capability subset; ADR-MF #8, commit `3a13fb5`)**: `src/session/permission-manager.ts` + `src/session/role-capabilities.ts`. Capability↔CLI adapter (§4.6.1) + default role→capability table (§4.6.2): `docs/adr/2026-05-12-cwd-role-decoupling-immutable-session-contract.md`. **Hard-fail enforcement pending ADR §6 task #11** (warn-mode until #9 audit + #15 spawn-path unification ship; §8 Q-OPEN-2 + Q-OPEN-4 acceptance-blocking).
+> **Spawn validation mode (ADR-MF #9)**: `enforceSpawn()` in `src/session/validate-spawn.ts` wraps `validateSpawn()` with mode `'hard-fail' | 'warn' | 'off'` via env `AIGENTRY_SPAWN_VALIDATION_MODE` (default `'warn'`, ADR §6 #9 compat window). Violations in `'warn'` emit telemetry to `~/.aigentry/telemetry/spawn-events-YYYY-MM-DD.ndjson` (NDJSON, UTC daily) and degrade `effective_role → logger` (least-privileged per `role-capabilities.ts`); aggregator `bin/spawn-telemetry-report.sh`. Flip to `'hard-fail'` lands with ADR §6 task #11.
 
 ## 워크플로우
 
