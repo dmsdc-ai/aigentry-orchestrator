@@ -6,7 +6,7 @@
 
 매 위임 전 아래를 반드시 확인한다. 하나라도 위반 시 중단하고 수정.
 
-- [ ] **직접 수행 금지** (Rule 4, 21): 리서치/구현/분석을 subagent 포함 직접 하지 않는가? → 해당 세션에 위임
+- [ ] **직접 수행 금지** (Rule 4, 21; **spawn-capability-gated** — Permission Manager `src/session/permission-manager.ts` (ADR-MF #8, commit `3a13fb5`); ADR §4.6 / §4.6.1 capability↔CLI adapter / §4.6.2 default role→capability table): 리서치/구현/분석을 subagent 포함 직접 하지 않는가? → 해당 세션에 위임. spawn은 `SessionContext.permissions` capability (예: `spawn_l1`, `spawn_l2`)로 게이팅 — 오케스트레이터는 default `spawn_l1`+`spawn_l2` 보유, 하위 역할에 G5 subset 전파 시 capability 범위 내 spawn 허용 (§4.6 Q-R-B Yes; "orchestrator-only spawn"은 더 이상 implicit 아님). **하드 enforcement는 ADR §6 task #11 (hard-fail flip) 착지 전까지 warn-mode** — Rule 4 amendment DRAFT는 `state/draft/2026-05-12-rule4-amendment-draft.md` (#102, commit `846c792`) 참조.
 - [ ] **사용자 확인** (Rule 6): inject 대상 세션을 사용자에게 확인했는가?
 - [ ] **파일별 세션 분리** (Rule 9, 10): 다른 파일 태스크를 하나의 세션에 묶지 않았는가?
 - [ ] **보고 MANDATORY 포함** (Rule 7): 위임 inject에 보고 문구가 있는가?
@@ -47,6 +47,7 @@
 > **aterm 렌더링 교훈 + 세션 통신**: `../aigentry-aterm/aterm-context.md` (sibling repo)
 > **헌법 원본**: `../aigentry/docs/CONSTITUTION.md` (sibling repo)
 > **Rule 4 ADR (2026-04-22 origin → 2026-05-01 final lock → 2026-05-03 Q1+Q2 sub-ADRs → 2026-05-04 Phase 6 conclusion final integration / Track #329 E27 closure)**: `docs/adr/2026-04-22-rule-4-mode-selection.md` ; `docs/adr/2026-05-01-rule-4-a-step-4-final-lock.md` ; `docs/adr/2026-05-03-substitute-compact-phase6-promote.md` ; `docs/adr/2026-05-03-d-promotion-phase6-promote.md` ; `docs/adr/2026-05-04-phase6-conclusion.md`
+> **Permission Manager (spawn-capability gate / role→capability subset; ADR-MF #8, commit `3a13fb5`)**: `src/session/permission-manager.ts` + `src/session/role-capabilities.ts`. Capability↔CLI adapter (§4.6.1) + default role→capability table (§4.6.2): `docs/adr/2026-05-12-cwd-role-decoupling-immutable-session-contract.md`. **Hard-fail enforcement pending ADR §6 task #11** (warn-mode until #9 audit + #15 spawn-path unification ship; §8 Q-OPEN-2 + Q-OPEN-4 acceptance-blocking).
 
 ## 워크플로우
 
