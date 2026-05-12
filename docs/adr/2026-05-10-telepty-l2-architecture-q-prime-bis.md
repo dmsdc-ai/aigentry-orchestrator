@@ -1,7 +1,7 @@
 ---
 type: adr
 status: accepted
-revision: r2
+revision: r5+amend-A1A3
 date: 2026-05-10
 author: aigentry-orchestrator (best-of-both synthesis: claude r1 + codex r1)
 scope: ecosystem
@@ -43,6 +43,7 @@ reviewers_recommended: [codex, gemini]
 revision_history:
   - r1: "2026-05-10 — best-of-both synthesis from claude r1 (829 lines) + codex r1 (1261 lines) parallel drafts. Locked architecture: 3-Layer separation + Q'''-bis core + 31 binding requirements (39 visible acceptance checks) + 19 mandates M22–M40. Synthesis report at docs/reports/2026-05-10-q-prime-bis-adr-synthesis-report.md."
   - r2: "2026-05-10 — E3 amendment integration (per ADR-E3-r1, Option A ≤ 15 MB) + Path C disqualification (Go ConPTY limitation, per bilingual-ops report) + §14 TBD supervisor-language refinement + M28 conditional callout. Verdict: post-r1 ACCEPT_WITH_FIXES (Explore subagent review)."
+  - r5_amend_A1A3: "2026-05-12 — A1 wire signal enum extension, A2 error code additions, A3 manifest exit_reason enum, per C3 spec r1 §9.3 mandatory amendments + codex r2 Q6 single-SSOT recommendation. Status remains 'accepted'; this is an additive contract amendment, not an architecture change."
 ---
 
 # ADR 2026-05-10: telepty L2 Session Architecture (Q'''-bis)
@@ -575,10 +576,27 @@ Every frame has this base envelope:
 | `spawn` | `sid`, `argv` (or `profile`), `cwd` | `env_policy`, `parent_id` (B2), `cost_budget` (I2) |
 | `delete` | `sid` | `reason`, `force` (default false) |
 | `resize` | `sid`, `cols` (int), `rows` (int) | — |
-| `signal` | `sid`, `signal` (enum: SIGINT/SIGTERM/SIGHUP, platform-normalized) | — |
+| `signal` | `sid`, `signal` (enum: see §6.2.1 — extended A1) | — |
 | `ping` | — | `ts` |
 | `pong` | — | `rtt_ms`, `ts` |
 | `error` | `code`, `data` (human-readable message) | `frame_ref` (offending line), `sid` if applicable |
+
+#### §6.2.1 `signal` enum (A1 amendment — 2026-05-12)
+
+The `signal` field on `kind:"signal"` and (informationally) on `kind:"shutdown_drain"` log events uses this enum. Per SPEC-C3-r1 §1.3 / §2.2 / §9.3 A1 (codex r2 Q6 single-SSOT closure):
+
+| Value | Platform | Meaning |
+|---|---|---|
+| `"SIGINT"` | POSIX-only | interactive interrupt; on Windows the supervisor returns `kind:"error" code:"ERR_BAD_FRAME" data:"signal_not_supported_on_windows"` (no group-targeted CTRL_C per Microsoft docs) |
+| `"SIGTERM"` | POSIX | graceful termination request; Windows observable parity = `CTRL_BREAK_EVENT` (handler-based, not a POSIX signal) |
+| `"SIGHUP"` | POSIX | controlling-terminal hangup; emitted by kernel when PTY master closes |
+| `"SIGKILL"` | POSIX | uncatchable forced termination; Windows observable parity = `JOB_TERMINATE` |
+| `"JOB_TERMINATE"` | Windows-only | result of `TerminateJobObject(job_handle, 1)` cascade; observable equivalent of POSIX `kill(-pgid, SIGKILL)` |
+| `"CTRL_BREAK_EVENT"` | Windows-only | result of `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, console_group_id)`; observable equivalent of POSIX SIGTERM-to-pgrp |
+
+**Cross-OS rule**: this is **observable parity, not primitive equivalence** (per SPEC-C3-r1 §3.2.3 / §3.5). The wire `signal` value names the supervisor-observed mechanism; the orchestrator MUST treat the POSIX-side and Windows-side values as parity pairs (`SIGTERM` ↔ `CTRL_BREAK_EVENT`; `SIGKILL` ↔ `JOB_TERMINATE`) when comparing kill outcomes across platforms.
+
+**Receiver behavior**: receivers MUST fail-closed on `signal` values outside this enum (`kind:"error" code:"ERR_BAD_FRAME"`).
 
 ### §6.3 Worked examples
 
@@ -590,7 +608,7 @@ Every frame has this base envelope:
 {"v":1,"kind":"error","code":"ERR_BAD_FRAME","data":"unknown_kind","frame_ref":"<offending-line>"}
 ```
 
-### §6.4 Error codes (Phase 1 minimal set)
+### §6.4 Error codes (Phase 1 minimal set + A2 kill-gate extensions per SPEC-C3-r1)
 
 | Code | Meaning |
 |---|---|
@@ -603,6 +621,12 @@ Every frame has this base envelope:
 | `ERR_SPAWN_FAILED` | spawn failed after retry budget (M33) |
 | `ERR_SHUTTING_DOWN` | supervisor draining; rejects new work |
 | `ERR_UNKNOWN_KIND` | kind not in enum (graceful degrade; sender retries with v↓ if applicable) |
+| `ERR_UNKILLABLE_CHILD` | child still alive after `child_reap_timeout_ms` past forced kill (POSIX D-state / Windows IRP-stuck) — see SPEC-C3-r1 §7.B / §7.C (A2 amendment) |
+| `ERR_PARENT_GONE` | orchestrator/relay disappearance detected past `parent_death_grace_ms` heartbeat budget — supervisor logs and continues per §1.4 of SPEC-C3-r1 (A2 amendment) |
+| `ERR_SUPERVISOR_GONE` | observer-side detection: stale-supervisor pid no longer running for a manifest that still claims `status:"ready"` / `"draining"` — SPEC-C3-r1 §1.5 (A2 amendment) |
+| `ERR_MANIFEST_WRITE_FAIL` | atomic manifest write failed (ENOSPC, fs error, permission) — SPEC-C3-r1 §7.F (A2 amendment) |
+| `ERR_ESCAPED_DESCENDANT` | advisory warn: pgrp/Job Object empty but external descendants observable via out-of-band marker — SPEC-C3-r1 §6.7 (A2 amendment, optional emission) |
+| `ERR_PGRP_LIVE_AFTER_KILL` | advisory warn: pgrp non-empty after expected kill window, before escalation — SPEC-C3-r1 §4.1.2 (A2 amendment, optional emission) |
 
 ### §6.5 Idempotency walkthrough
 
@@ -706,6 +730,7 @@ Illustrative:
 - `id` (or `sid`) must match the directory basename.
 - `ipc.kind` is `uds` or `named_pipe`.
 - `status` ∈ {`spawning`, `ready`, `draining`, `stopped`, `error`}.
+- `exit_reason` (A3 amendment — 2026-05-12; **only present on tombstoned manifests** per SPEC-C3-r1 §6.3.2): enum ∈ {`"normal"`, `"signaled"`, `"killed"`, `"crashed"`, `"unkillable"`}. Clean exits **unlink** the manifest per A8 (no tombstone, no `exit_reason` written); only `crashed` and `unkillable` retain a tombstone manifest. **`"orphan"` is NOT a terminal `exit_reason`** — orphaned supervisors stay `status:"ready"` per §1.4 of SPEC-C3-r1 and never write `exit_reason`. Audit detail (`exit_signal`, `exit_code`, `escalated`) lives in `log.jsonl` per SPEC-C3-r1 §6.3.1, NOT in the manifest.
 - Partial writes are invalid by construction — readers only read `manifest.json` after atomic rename.
 - Stale manifests are detected by validating `pid`, IPC reachability, and optional heartbeat timestamp.
 
@@ -1546,5 +1571,6 @@ Self-check: **7/7 PASS**.
 - **r2 (2026-05-10)**: E3 amendment integration (per ADR-E3-r1) + Path C disqualification (per bilingual-ops report) + §14 TBD language refinement. Verdict: post-r1 ACCEPT_WITH_FIXES. Edits: F1.1–F1.6 (E3 closure across §4.E / §10.1 / §10.3 / §13.1 / §14 / §17.1), F2 (§15.2.5 Path C — Go ConPTY disqualification), F3 (§14 supervisor-language row refinement), F4 (M28 callout). C1 precondition closed.
 - **r3 (2026-05-10)**: 8 codex review fixes (E1 trace_id required for inject/output across §4 acceptance gate / §6.1 / §6.2 / 5+ frame examples; E2 H1 + M34 + L3a PTY recovery wording corrected to "crash detection + audit replay, not live PTY recovery"; E3 §12.7.1 gate matrix normalization separating Phase 1 / Phase 2 / Phase 4 entry; E4 §13.1 closure artifact reads "Q'''-bis ADR amendment, Constitution untouched" + OS/no-WSL acceptance detail inlined; E5 §17.13 numbered constructive frame + LLM source tags on §17.1–§17.12; E6 §15 alternative count normalized to 14 in §17.8 + §22; E7 §18.7 Article 17 dependency/fallback inventory for Tailscale + OpenSSH + jemalloc; E8 §7.2 + §21.1 manifest examples + §5.1 M24/M27/M28/M31 marked Rust-conditional). Verdict: post-r2 codex ACCEPT_WITH_FIXES → r3 surgical fixes only (architecture untouched). r3 self-criticism: trace_id-required leakage (B3 → §6 → all examples) increases future Phase 2+ wire-change cost — adding HMAC-token (B4/M11) or V4 contact-identity fields must accommodate `trace_id` as a Phase 1 baseline rather than a Phase 2 opt-in, ~1.5× JSON-Schema scope per kind.
 - **r5 (2026-05-10)**: 3 minor textual fixes post-r4 codex review (ACCEPT_WITH_MINOR_FIXES) — Fix 1 trace_id leakage residue closed in §3.8 inject/output examples + §6.5 idempotency walkthrough (B3 + r3 E1 consistency); Fix 2 §9.2 line 802 stale E3 wording rewritten to "target 5–8 MB; binding E3 ceiling ≤15 MB per ADR-E3-r1; future Phase 4 may tighten to ≤10 MB by follow-up ADR (evidence-gated)"; Fix 3 §20.2 E3 TBD row removed (option a — explicit TBD count 9 → 8) + §14 total adjusted to 8 with E3 retained as closed audit entry. Status flipped `proposed → accepted` per C1 closure (E3) + r4 verdict. No architecture change.
+- **r5+amend-A1A3 (2026-05-12)**: A1 wire `signal` enum extended (§6.2 + §6.2.1) to add `SIGKILL`, `JOB_TERMINATE`, `CTRL_BREAK_EVENT` and mark `SIGINT` POSIX-only. A2 error-code taxonomy extended (§6.4) with `ERR_UNKILLABLE_CHILD`, `ERR_PARENT_GONE`, `ERR_SUPERVISOR_GONE`, `ERR_MANIFEST_WRITE_FAIL`, `ERR_ESCAPED_DESCENDANT`, `ERR_PGRP_LIVE_AFTER_KILL`. A3 manifest `exit_reason` enum defined in §7.3 — `{normal, signaled, killed, crashed, unkillable}`; `orphan` explicitly NOT terminal. Drives **single-SSOT closure** of SPEC-C3-r1 §9.3 mandatory amendments per codex r2 Q6 recommendation. Status remains `accepted`; this is an additive contract amendment, not an architecture change. r5+amend-A1A3 self-criticism: the new `ERR_*` taxonomy adds 6 codes to the Phase 1 minimal set, increasing implementer/test-fixture surface — mitigated by marking `ERR_ESCAPED_DESCENDANT` and `ERR_PGRP_LIVE_AFTER_KILL` as optional/advisory in their cells (no enforced emission). No new §17 inventory row added (count remains at 14 per E5/E6 lock — the amendment is contract surface, not a new architectural risk).
 
 ---
