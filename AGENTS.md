@@ -20,11 +20,13 @@
 - [ ] **빌드/실행 builder 위임** (Rule 13): 직접 빌드/실행/배포 하지 않는가?
 - [ ] **Cross-OS abstraction** (Rule 26): bash 신규 코드가 `lib/platform.sh` 경유하는가?
 - [ ] **워크어라운드 금지** (Rule 27): 증상 우회가 아닌 근본 원인 수정 지시인가?
-- [ ] **세션 완료 후 정리** (Rule 28): DONE 보고 검증 후 `cmux close-workspace` 즉시 실행 (SPEC FIRST 재사용 예외)?
+- [ ] **세션 완료 후 정리** (Rule 28, 강화 2026-05-12): DONE 보고 검증 후 `bin/session-cleanup.sh <sid>` 즉시 실행 (cmux workspace 닫기 + telepty session 정리 통합; SPEC FIRST 재사용 예외). telepty#17 (DISCONNECTED 누적) 회피.
 - [ ] **보고 vs 토론 구분** (Rule 15): 위임 보고 라인인가, 자유 토론인가?
 - [ ] **세션 ID 하드코딩 금지** (Rule 16): `aigentry-orchestrator-claude` 하드코딩 피하고 configurable로?
 - [ ] **외과적 변경 (Rule 29)**: 변경 라인이 모두 요청에 추적 가능한가? Drive-by reformat/refactor 금지, dead code는 mention only?
 - [ ] **운영 자율 (Rule 30)**: codex sandbox prompt / cmux UI blank / session stuck 등 운영 이슈를 사용자에게 escalation하지 않고 자율 처리(자동 응답/respawn/read-screen)했는가? 사용자 인터렉션은 architecture/business/destructive action에 한정?
+- [ ] **영구 fix 강제 (Rule 32)**: 발생한 이슈는 1회성 workaround로 끝내지 않고 (1) workaround + (2) root cause + (3) GitHub issue 또는 Task 등록 + (4) permanent fix dispatch 4 step 모두 수행했는가? 2번째 재발 시 즉시 fix dispatch?
+- [ ] **dispatch helper 사용 (Rule 32 + telepty#18, 2026-05-12)**: 새 세션에 첫 dispatch 시 `bin/dispatch.sh --spawn-and-dispatch ...` (또는 spawn 후 `bin/dispatch.sh --target <sid> --ref <ref>`) 경유했는가? welcome-bootstrap race 회피 (sleep heuristic 또는 raw `telepty inject` 직후 spawn 금지). telepty#18 daemon-side proper fix land 후 이 row 완화 가능.
 
 ### 실행 모드 체크 (Rule 4-A — Phase 6 Conclusion 기반, 2026-05-04 lock (4-way Layer 1 selector LOCKED per ADR `2026-05-04-phase6-conclusion.md` §4.2, commit c7b2e79))
 
