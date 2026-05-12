@@ -5,6 +5,11 @@
 // macOS / Linux / Windows machines reading the same NDJSON line up.
 // Privacy: schema-fixed. emit() rejects any event carrying unknown keys
 // (TypeError) so user content cannot leak even if a caller adds it by accident.
+//
+// ADR-MF #15 (OQ-15-4, 2026-05-12) — additional `reason` string values used by
+// the Class C MCP deliberation adapter: `mcp_phase1_logged`, `mcp_phase1_ungated`,
+// `mcp_phase2_accepted`, `mcp_phase2_rejected` (suffixed with `:<tool_name>`).
+// These reuse the existing `SpawnEventKind` set — no schema-guard impact.
 import {
   mkdirSync,
   appendFileSync,
