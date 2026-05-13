@@ -254,7 +254,7 @@ export function validateSpawn(
 
 export type { ValidationMode };
 
-export const DEFAULT_VALIDATION_MODE: ValidationMode = "warn"; // OQ1 — ADR §6 #9 compat window
+export const DEFAULT_VALIDATION_MODE: ValidationMode = "hard-fail"; // ADR §6 #11 flip — #9 compat window CLOSED
 
 export class SpawnValidationError extends Error {
   readonly code: ValidateSpawnErrorCode;

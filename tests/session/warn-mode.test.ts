@@ -34,12 +34,12 @@ const collect = (): { events: SpawnEvent[]; sink: (e: SpawnEvent) => void } => {
 
 const reset = (): void => __resetModeTrackingForTests();
 
-test("default mode constant matches ADR §6 #9 compat window", () => {
-  assert.equal(DEFAULT_VALIDATION_MODE, "warn");
+test("default mode constant matches ADR §6 #11 hard-fail flip", () => {
+  assert.equal(DEFAULT_VALIDATION_MODE, "hard-fail");
   assert.equal(DEGRADED_FALLBACK_ROLE, Role.logger);
-  assert.equal(readValidationMode({}), "warn");
+  assert.equal(readValidationMode({}), "hard-fail");
   assert.equal(readValidationMode({ AIGENTRY_SPAWN_VALIDATION_MODE: "off" }), "off");
-  assert.equal(readValidationMode({ AIGENTRY_SPAWN_VALIDATION_MODE: "garbage" }), "warn");
+  assert.equal(readValidationMode({ AIGENTRY_SPAWN_VALIDATION_MODE: "garbage" }), "hard-fail");
 });
 
 test("warn-mode (1) — G1 violation: telemetry + degrade to logger, spawn proceeds", (t: TestContext) => {
