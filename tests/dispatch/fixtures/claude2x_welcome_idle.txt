@@ -1,0 +1,4 @@
+Welcome back 김덕영_gmail!
+Tips for getting started in this project
+
+ ❯ Try "fix lint errors"

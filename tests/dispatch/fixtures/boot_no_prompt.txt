@@ -1,0 +1,5 @@
+Initializing Claude session
+Welcome back to Claude
+Tips for getting started in this project
+Loading agent configuration
+Loading skills

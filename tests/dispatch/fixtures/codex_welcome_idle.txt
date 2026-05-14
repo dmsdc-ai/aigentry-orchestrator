@@ -1,0 +1,5 @@
+OpenAI Codex CLI v0.42
+Welcome to Codex
+Loading…
+
+ › Try "/help for commands"

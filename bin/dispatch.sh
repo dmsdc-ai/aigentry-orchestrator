@@ -72,9 +72,13 @@ except Exception:
 }
 
 # Returns 0 if the wrapped CLI's REPL is past the welcome/boot screen.
-# Strategy: tail-only banner check + prompt-symbol-present + placeholder allow.
-# (Pre-2026-05-12 logic scanned the full 80-line scrollback, which kept matching
-# "Tips for getting started" forever and caused #113's false timeouts.)
+# Strategy: positive override — an idle-prompt signal in last3 wins over a
+# banner signal in the wider tail. Hard-negatives in last3 (working spinner,
+# trust-folder modal) reject regardless of prompt.
+# Fallback for telepty#22 (https://github.com/dmsdc-ai/aigentry-telepty/issues/22):
+# Claude 2.x's welcome banner persists in scrollback until the first input,
+# so banner-in-tail alone can no longer mean not-ready. Drop this branch once
+# `telepty wait-ready` lands; the function shape stays as a defensive fallback.
 is_ready() {
   local sid="$1" cli_kind="$2" screen
   screen=$("$TELEPTY" read-screen "$sid" --lines 60 2>/dev/null || true)
@@ -93,15 +97,21 @@ BANNERS = {
   "gemini": r"Welcome to Gemini|Loading model|Initializing|Authenticating",
 }
 PROMPT = {"claude": r"❯", "codex": r"›", "gemini": r"›|│ >"}
+HARD_NEG = r"Working\.\.\.|Thinking|esc to interrupt|Press Enter to continue|Do you trust"
 banner = BANNERS.get(cli, r"Welcome|Initializing|Loading|Tips for getting started")
 prompt = PROMPT.get(cli, r"❯|›")
 
-if re.search(banner, tail):
+banner_match = re.search(banner, tail)
+placeholder  = re.search(rf'(?m){prompt}\s+Try "[^"]+"', last3)
+prompt_only  = re.search(prompt, last3)
+hard_neg     = re.search(HARD_NEG, last3)
+
+if hard_neg:
     sys.exit(1)
-if re.search(rf'(?m){prompt}\s+Try "[^"]+"', last3):
-    sys.exit(0)  # input-empty placeholder = ready
-if re.search(prompt, last3):
-    sys.exit(0)
+if placeholder or prompt_only:
+    sys.exit(0)  # idle prompt in last3 = ready (banner in tail tolerated)
+if banner_match:
+    sys.exit(1)
 sys.exit(1)
 PY
 }
