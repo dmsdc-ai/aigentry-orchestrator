@@ -426,3 +426,60 @@ Memory: `feedback_session_cleanup_protocol.md`.
 #### Acceptance criteria
 - 향후 grill 세션에서 운영 이슈 (sandbox prompt / cmux blank / stuck session) 처리 시 "어떻게 할까요?" 질문 0건.
 - AGENTS.md 위임 전 체크리스트에 Rule 30 row 등록됨.
+
+---
+
+### Rule 32. Permanent Fix Only — No One-Off Workarounds (HARD RULE)
+
+**모든 이슈는 1회성 fix가 아닌 root-cause 영구 fix로 처리한다.** 발단: 2026-05-12 grill. 세션 cleanup 누락 / telepty status false-positive / claude welcome-bootstrap dispatch loss 등 같은 패턴이 반복 발생 — 매번 수동 workaround로 해결 → 다음 세션에서 또 재발. 사용자 정정: "모든 이슈는 1회성 픽스가 아닌 항상 영구픽스해야돼."
+
+**Why:** 1회성 workaround는 **root cause를 가린다**. 동일 증상이 다른 세션·다른 시점에 반복 → 매번 사용자 cognitive load. 영구 fix만이 control tower의 본질 — 시스템을 시간에 따라 *더 적은 사용자 개입*으로 운영 가능하게 만드는 것.
+
+#### Mandatory permanent-fix workflow
+
+모든 이슈 처리 시 아래 4 step 모두 수행:
+
+1. **즉시 workaround** (현재 task unblock — required)
+2. **Root cause analysis** (왜 발생했나? 어디서 fix해야 재발 불가?)
+3. **GitHub issue 등록** (cross-component fix 필요한 경우, upstream repo로) — `dmsdc-ai/<repo>` 적합한 repo로
+4. **Permanent fix tracking** — 다음 중 하나:
+   - Task queue 등록 (orchestrator side fix)
+   - GitHub issue + label `bug` (component side fix)
+   - 둘 다 (cross-component)
+
+#### Permanent fix mandate
+
+| 발견 시점 | Action |
+|---|---|
+| 첫 발견 | Workaround + GitHub issue + Task — 3 step 모두 |
+| 2번째 재발 | Permanent fix 즉시 dispatch (사용자 결정 X — Rule 30 자율 영역) |
+| 3번째 재발 | **STOP — fix dispatch 안 한 trace를 자기 비판**. 그 후 즉시 dispatch + memory에 lesson 저장 |
+
+#### Examples (2026-05-12 day-of)
+
+| 이슈 | 1차 발견 | 영구 fix 처리 |
+|---|---|---|
+| telepty status false-positive 'working' on idle gemini | Manual ignore | GitHub issue #16 → spec → impl → commit `3ed1e83` → push → issue closed |
+| Session cleanup (cmux close + telepty disconnect 누락) | Manual `cmux close-workspace` loop | GitHub issue #17 + Task #106 + AGENTS.md Rule 28 reference 강화 + `bin/session-cleanup.sh` impl (진행 중) |
+| claude welcome-bootstrap dispatch loss | Re-inject (manual) | GitHub issue #18 + Task (orchestrator-side dispatch helper `bin/dispatch.sh`) |
+
+각 이슈에서 fix가 land될 때까지 manual workaround 누적 X — issue + task로 영구 close.
+
+#### What this rule rejects
+
+- "이번 한 번만 workaround" — Rule 32 위반
+- "사용자에게 매번 동일 이슈 보고" — Rule 30 + Rule 32 위반
+- "GitHub issue 안 만들고 자기 메모에만 적음" — fix tracking 부재
+- "Task queue에 등록하고 dispatch 안 함" — tracking-only는 fix가 아님
+- "Workaround code를 그대로 commit + push" — Rule 27 (워크어라운드 금지) + Rule 32 양쪽 위반
+
+#### Cross-references
+- Rule 27 (워크어라운드 금지): code 차원 — root cause 수정 강제. Rule 32 = process 차원 — issue 추적 + permanent fix dispatch 강제.
+- Rule 28 (세션 완료 후 정리): permanent enforcement via `bin/session-cleanup.sh` (Rule 32 instance).
+- Rule 30 (Operational Autonomy): 운영 이슈를 자율 처리 — Rule 32가 그 처리를 **임시가 아닌 영구**로 강제.
+
+#### Acceptance criteria
+- 향후 grill 세션에서 동일 이슈 2회 이상 반복 발생 = Rule 32 위반 (orchestrator self-critique 필수)
+- 모든 식별된 운영 이슈는 GitHub issue 또는 Task queue에 tracked
+- 모든 GitHub issue / Task는 fix 완료 시 close
+- Memory: `~/.claude/projects/-Users-duckyoungkim-projects/memory/feedback_permanent_fix_only.md`
