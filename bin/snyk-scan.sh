@@ -32,7 +32,9 @@ if ! command -v snyk >/dev/null 2>&1; then
   exit 2
 fi
 
-if [[ -z "$(snyk config get api 2>/dev/null)" && -z "${SNYK_TOKEN:-}" ]]; then
+if [[ -z "${SNYK_TOKEN:-}" ]] \
+   && ! snyk whoami >/dev/null 2>&1 \
+   && [[ -z "$(snyk config get api 2>/dev/null)" ]]; then
   echo "[snyk-scan] error: Snyk not authenticated. Run: snyk auth (or set SNYK_TOKEN env var)" >&2
   exit 2
 fi
@@ -61,15 +63,16 @@ printf '  %s\n' "${changed[@]}"
 
 # Snyk Code scans by path, not file list. Compute the set of unique parent dirs
 # of changed files (capped to repo root if any file is at root).
+# Note: dirname returns "." for files at the repo root; we keep "." as the
+# sentinel because bash associative arrays reject the empty string as a key.
 declare -A dir_set=()
 for f in "${changed[@]}"; do
   d="$(dirname "$f")"
-  [[ "$d" == "." ]] && d=""
   dir_set["$d"]=1
 done
 
 # If repo root is in the set, just scan once at root.
-if [[ -n "${dir_set[""]:-}" ]]; then
+if [[ -n "${dir_set["."]:-}" ]]; then
   echo "[snyk-scan] root-level changes — scanning whole repo"
   exec snyk code test
 fi

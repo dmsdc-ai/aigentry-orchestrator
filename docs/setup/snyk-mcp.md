@@ -8,14 +8,14 @@
 ## One-paste OAuth quickstart (run once per machine)
 
 ```bash
-npm install -g snyk && snyk auth && snyk config get api && echo "✓ Snyk ready"
+npm install -g snyk && snyk auth && snyk whoami && echo "✓ Snyk ready"
 ```
 
 What happens, in order:
 
 1. `npm install -g snyk` — installs the Snyk CLI globally (≈ 30 s on a fresh machine).
 2. `snyk auth` — opens your default browser to `https://app.snyk.io/login/cli` (or prints a URL to paste). Approve the device. The CLI then prints something like `Your account has been authenticated. Snyk is now ready to be used.`
-3. `snyk config get api` — should print a UUID token (the value is written to `~/Library/Application Support/configstore/snyk.json` on macOS / `~/.config/configstore/snyk.json` on Linux). If this prints **blank**, auth did not complete — see Troubleshooting → "OAuth completes but `snyk config get api` is blank".
+3. `snyk whoami` — should print your Snyk account name / username (e.g., `dmsdc-ai`). This is the canonical post-OAuth probe. **Do not use `snyk config get api`** as a verification — it returns blank under the OAuth flow used since CLI ≥ 1.1293 (OAuth credentials live in the CLI's own keystore, not the legacy `configstore/snyk.json` API-token file). `snyk config get api` is only meaningful for the token-mode flow (Step 2-alt).
 4. `echo "✓ Snyk ready"` — only prints if the preceding commands all exit 0.
 
 If you are in a headless / no-browser environment, skip the oneliner and use the **token fallback** (Step 2-alt below).
@@ -109,14 +109,16 @@ The token method writes the same `~/Library/Application Support/configstore/snyk
 ### Step 3 — verify
 
 ```bash
-snyk config get api
-# Expected: a UUID string, not blank.
+# Canonical post-OAuth probe (works for both OAuth and token modes):
+snyk whoami
+# Expected: your Snyk account name / username (e.g. dmsdc-ai), exit 0.
 
-snyk auth --help >/dev/null && echo "auth-ok"
-# Expected: auth-ok
+# Token-mode-only probe (OAuth returns blank here — DO NOT use as OAuth verification):
+snyk config get api
+# Expected (token mode): a UUID. (OAuth mode): blank — that is normal.
 ```
 
-If `snyk config get api` prints blank, auth did **not** complete (browser was closed early, network drop, port-busy fallback failed). Re-run Step 2 or use Step 2-alt.
+If `snyk whoami` fails with `not authenticated` or non-zero exit, auth did **not** complete (browser was closed early, network drop, port-busy fallback failed). Re-run Step 2 or use Step 2-alt.
 
 **Free tier limits**: 100 SAST tests/month (Snyk Code), 200 open-source tests/month. Enough for personal / OSS work; for the orchestrator project's commit cadence this is adequate. Upgrade only if rate-limited.
 
@@ -183,14 +185,15 @@ See `bin/snyk-scan.sh --help`. See also the CLI-only quickstart above.
 
 - **`snyk: command not found`** — re-run `npm install -g snyk`; check `which snyk` and `$PATH`.
 - **`claude mcp list` doesn't show snyk** — re-run `claude mcp add snyk -s user -- snyk mcp -t stdio` and restart the session.
-- **`snyk_code_scan` returns "User not authenticated"** — run `snyk auth` (one-time). Verify with `snyk config get api`.
+- **`snyk_code_scan` returns "User not authenticated"** — first verify shell auth with `snyk whoami` (NOT `snyk config get api`, which returns blank under OAuth). If `snyk whoami` succeeds but MCP still says unauthenticated, the MCP server process was spawned **before** OAuth completed and cached the un-auth state — restart the Claude Code session (or kill the `snyk mcp` child process so Claude reconnects). New sessions inherit the post-OAuth state immediately.
+- **`snyk code test` returns "Snyk Code is not enabled" (SNYK-CODE-0005, HTTP 403)** — account-level, not tooling. Snyk Code (SAST) must be enabled for your Snyk organization. Enable in the Snyk dashboard: <https://app.snyk.io/org/<your-org>/manage/settings> → Code → toggle on. Free tier supports Snyk Code for individuals; org/team accounts may require admin approval. The CLI / MCP setup is correct in this case — the gate is on Snyk's side.
+- **`snyk config get api` is blank after OAuth completes** — **expected**, not a bug. Use `snyk whoami` instead. The OAuth flow (CLI ≥ 1.1293) stores credentials in its own keystore; `snyk config get api` reads the legacy token-mode location only.
 - **OAuth browser opens but never returns / stuck on "Authenticating…"** — the local callback listener (default port 8080) is occupied or blocked. Diagnose:
   ```bash
   lsof -nP -iTCP:8080 -sTCP:LISTEN    # see who holds the port
   ```
   Workarounds, in order: (a) free port 8080 (kill the held process if safe), (b) use the **token fallback** (Step 2-alt) — no port needed, (c) if your corporate firewall blocks the OAuth redirect, the token fallback is the only reliable path.
 - **`snyk auth` prints a URL but no browser opens** — common in headless / SSH sessions. Copy the URL into a browser on your local machine, complete login, then return — the CLI on the remote will detect the callback if the machine is reachable. If not reachable, use the token fallback.
-- **OAuth completes but `snyk config get api` is blank** — the OAuth callback failed silently (closed browser too early, network drop, port-busy). Re-run `snyk auth`. If still blank, force the token fallback.
 - **Rate-limited (`429` / `quota exceeded`)** — free-tier limit reached (100 SAST tests/month); either wait for next billing cycle or upgrade plan.
 - **`snyk mcp` MCP server exits immediately** — check `snyk --version` (need ≥ 1.1293 for MCP subcommand). Update with `npm install -g snyk@latest`.
 
