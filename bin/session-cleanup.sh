@@ -18,11 +18,19 @@
 #   0 — success (including idempotent no-op when session already gone)
 #   1 — usage error
 #   2 — missing dependency
+#   3 — telepty list --json failed or returned non-JSON (binary/daemon mismatch)
 #
 # Sibling: bin/open-session.sh (spawn counterpart).
 
 set -euo pipefail
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+
+# Intentionally do NOT override PATH here. A previous hardcoded
+# PATH="/opt/homebrew/bin:..." caused this script to pick a stale
+# homebrew telepty (v0.4.0) while the running daemon was v0.3.5; the
+# resulting "Daemon version mismatch" banner contaminated jq stdin
+# and triggered "Invalid numeric literal at line 1, column 2" (task #400).
+# `require_deps` is the gate — it fails loudly if telepty/jq are missing
+# from the inherited PATH.
 
 PROTECTED_SID="orchestrator"
 
@@ -40,15 +48,37 @@ require_deps() {
   done
 }
 
+# telepty_list_json — fetch `telepty list --json` and fail-fast if the result
+# is not parseable JSON. Prevents silent "session not found" reports when the
+# real cause is a contaminated stdout (e.g., daemon-version-mismatch banner
+# from the wrong telepty binary on PATH — see task #400 root cause).
+telepty_list_json() {
+  local raw
+  raw=$(telepty list --json 2>/dev/null) || {
+    err "telepty list --json exited non-zero"
+    exit 3
+  }
+  if ! printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
+    err "telepty list --json returned non-JSON output (telepty binary/daemon version mismatch?)"
+    err "first 200 bytes of stdout:"
+    printf '%s' "$raw" | head -c 200 >&2
+    echo >&2
+    err "PATH=$PATH"
+    err "which telepty: $(command -v telepty || echo NOT_FOUND)"
+    exit 3
+  fi
+  printf '%s' "$raw"
+}
+
 # session_info <sid> → json record on stdout (empty if not in telepty list)
 session_info() {
   local sid="$1"
-  telepty list --json 2>/dev/null | jq -c --arg sid "$sid" '.[] | select(.id == $sid)' | head -1
+  telepty_list_json | jq -c --arg sid "$sid" '.[] | select(.id == $sid)' | head -1
 }
 
 # disconnected_sids → one sid per line for DISCONNECTED sessions, excluding PROTECTED
 disconnected_sids() {
-  telepty list --json 2>/dev/null \
+  telepty_list_json \
     | jq -r --arg p "$PROTECTED_SID" '
         .[]
         | select(.healthStatus == "DISCONNECTED" and .id != $p)
@@ -80,7 +110,7 @@ poll_disconnected() {
   local sid="$1" deadline status
   deadline=$(( $(date +%s) + 5 ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    status=$(telepty list --json 2>/dev/null \
+    status=$(telepty_list_json \
       | jq -r --arg sid "$sid" '.[] | select(.id == $sid) | .healthStatus' \
       | head -1 || true)
     [ -z "$status" ] && return 0
