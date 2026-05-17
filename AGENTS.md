@@ -6,7 +6,7 @@
 
 매 위임 전 아래를 반드시 확인한다. 하나라도 위반 시 중단하고 수정.
 
-- [ ] **직접 수행 금지** (Rule 4, 21; **spawn-capability-gated** — Permission Manager `src/session/permission-manager.ts` (ADR-MF #8, commit `3a13fb5`); ADR §4.6 / §4.6.1 capability↔CLI adapter / §4.6.2 default role→capability table): 리서치/구현/분석을 subagent 포함 직접 하지 않는가? → 해당 세션에 위임. spawn은 `SessionContext.permissions` capability (예: `spawn_l1`, `spawn_l2`)로 게이팅 — 오케스트레이터는 default `spawn_l1`+`spawn_l2` 보유, 하위 역할에 G5 subset 전파 시 capability 범위 내 spawn 허용 (§4.6 Q-R-B Yes; "orchestrator-only spawn"은 더 이상 implicit 아님). **하드 enforcement 활성 (ADR §6 #11 hard-fail flip, commit `<TBD-MF11>`)** — Rule 4 amendment DRAFT는 `state/draft/2026-05-12-rule4-amendment-draft.md` (#102, commit `846c792`) 참조.
+- [ ] **직접 수행 금지** (Rule 4, 21; **spawn-capability-gated** — Permission Manager `src/session/permission-manager.ts` (ADR-MF #8); ADR §4.6 / §4.6.1 capability↔CLI adapter / §4.6.2 default role→capability table): 리서치/구현/분석을 subagent 포함 직접 하지 않는가? → 해당 세션에 위임. spawn은 `SessionContext.permissions` capability (예: `spawn_l1`, `spawn_l2`)로 게이팅 — 오케스트레이터는 default `spawn_l1`+`spawn_l2` 보유, 하위 역할에 G5 subset 전파 시 capability 범위 내 spawn 허용 (§4.6 Q-R-B Yes; "orchestrator-only spawn"은 더 이상 implicit 아님). **하드 enforcement 활성 (ADR §6 #11 hard-fail flip)** — Rule 4 amendment DRAFT는 `state/draft/2026-05-12-rule4-amendment-draft.md` (#102) 참조.
 - [ ] **사용자 확인** (Rule 6): inject 대상 세션을 사용자에게 확인했는가?
 - [ ] **파일별 세션 분리** (Rule 9, 10): 다른 파일 태스크를 하나의 세션에 묶지 않았는가?
 - [ ] **보고 MANDATORY 포함** (Rule 7): 위임 inject에 보고 문구가 있는가?
@@ -20,22 +20,24 @@
 - [ ] **빌드/실행 builder 위임** (Rule 13): 직접 빌드/실행/배포 하지 않는가?
 - [ ] **Cross-OS abstraction** (Rule 26): bash 신규 코드가 `lib/platform.sh` 경유하는가?
 - [ ] **워크어라운드 금지** (Rule 27): 증상 우회가 아닌 근본 원인 수정 지시인가?
-- [ ] **세션 완료 후 정리** (Rule 28, 강화 2026-05-12): DONE 보고 검증 후 `bin/session-cleanup.sh <sid>` 즉시 실행 (cmux workspace 닫기 + telepty session 정리 통합; SPEC FIRST 재사용 예외). telepty#17 (DISCONNECTED 누적) 회피.
+- [ ] **세션 완료 후 정리** (Rule 28): DONE 보고 검증 후 `bin/session-cleanup.sh <sid>` 즉시 실행 (cmux workspace 닫기 + telepty session 정리 통합; SPEC FIRST 재사용 예외). telepty#17 (DISCONNECTED 누적) 회피.
 - [ ] **보고 vs 토론 구분** (Rule 15): 위임 보고 라인인가, 자유 토론인가?
 - [ ] **세션 ID 하드코딩 금지** (Rule 16): `aigentry-orchestrator-claude` 하드코딩 피하고 configurable로?
 - [ ] **외과적 변경 (Rule 29)**: 변경 라인이 모두 요청에 추적 가능한가? Drive-by reformat/refactor 금지, dead code는 mention only?
 - [ ] **운영 자율 (Rule 30)**: codex sandbox prompt / cmux UI blank / session stuck 등 운영 이슈를 사용자에게 escalation하지 않고 자율 처리(자동 응답/respawn/read-screen)했는가? 사용자 인터렉션은 architecture/business/destructive action에 한정?
 - [ ] **영구 fix 강제 (Rule 32)**: 발생한 이슈는 1회성 workaround로 끝내지 않고 (1) workaround + (2) root cause + (3) GitHub issue 또는 Task 등록 + (4) permanent fix dispatch 4 step 모두 수행했는가? 2번째 재발 시 즉시 fix dispatch?
-- [ ] **dispatch helper 강제 (Rule 32 HARD — 2026-05-12 #113 후 revision)**: 새 세션 첫 dispatch 뿐 아니라 **모든 wave dispatch + 모든 ref-payload 위임**은 `bin/dispatch.sh --target <sid> --ref <ref> [--verify-delivered]` 또는 `--spawn-and-dispatch` 경유. raw `telepty inject <sid> "..."`는 (a) 대화형 1라인 ack/follow-up, (b) `telepty send-key`, (c) `telepty broadcast`로만 한정. 또한 모든 dispatch는 자동으로 `state/dispatch/active.json`에 등록되며, 30분 내 REPORT 없으면 `bin/dispatch-tracker.sh check`가 분류(welcome/error/active/done)·git-log pull·재dispatch(1회 cap)·AUTO_REPORT를 자율 처리. SPEC: `docs/specs/2026-05-12-dispatch-healthcheck.md`. 위반 시 즉시 wave abort + #113 재현 리포트. telepty#18 daemon-side handshake land 후 본 row 완화 검토.
-- [ ] **Snyk Security At Inception (CLAUDE.md global + Rule 32, 2026-05-12)**: 위임된 코더가 새/수정 first-party 코드 (Snyk-supported language)를 생성하면 DONE 보고 전 `snyk_code_scan` (MCP) 또는 `bin/snyk-scan.sh` (shell)을 호출하고 findings를 fix-rescan 루프로 0건까지 처리하도록 inject에 명시했는가? 설치/auth 절차: `docs/setup/snyk-mcp.md`.
+- [ ] **영구 fix 진행 시퀀스 (Rule 32-A)**: 영구 fix 필요 사항 발견 시 다음 둘 중 하나를 **명시적으로** 선택 — silent 통과 절대 금지. **(A)** 즉시 영구 fix dispatch 가능하면 바로 진행. **(B)** 컨텍스트 부담/타이밍으로 즉시 불가하면 `state/task-queue.json` 등록 + 차후 fix dispatch 일정. 등록 시 task note에 root cause + 적용한 workaround + dispatch trigger 조건 명시. 진행 중 사례마다 명시적으로 (A)/(B) 어느 트랙인지 발화. (관련 패턴 예: task #395 #396 #397)
+- [ ] **dispatch helper 강제 (Rule 32 HARD — #113 후 revision)**: 새 세션 첫 dispatch 뿐 아니라 **모든 wave dispatch + 모든 ref-payload 위임**은 `bin/dispatch.sh --target <sid> --ref <ref> [--verify-delivered]` 또는 `--spawn-and-dispatch` 경유. raw `telepty inject <sid> "..."`는 (a) 대화형 1라인 ack/follow-up, (b) `telepty send-key`, (c) `telepty broadcast`로만 한정. 또한 모든 dispatch는 자동으로 `state/dispatch/active.json`에 등록되며, 30분 내 REPORT 없으면 `bin/dispatch-tracker.sh check`가 분류(welcome/error/active/done)·git-log pull·재dispatch(1회 cap)·AUTO_REPORT를 자율 처리. SPEC: `docs/specs/2026-05-12-dispatch-healthcheck.md`. 위반 시 즉시 wave abort + #113 재현 리포트. telepty#18 daemon-side handshake land 후 본 row 완화 검토.
+- [ ] **Snyk Security At Inception (CLAUDE.md global + Rule 32)**: 위임된 코더가 새/수정 first-party 코드 (Snyk-supported language)를 생성하면 DONE 보고 전 `snyk_code_scan` (MCP) 또는 `bin/snyk-scan.sh` (shell)을 호출하고 findings를 fix-rescan 루프로 0건까지 처리하도록 inject에 명시했는가? 설치/auth 절차: `docs/setup/snyk-mcp.md`.
+- [ ] **Dispatch ref 자체완결성 (Rule 32-A-template — #396 #397 fix)**: 새 dispatch ref가 `docs/templates/dispatch-ref-template.md` 스켈레톤 + `docs/templates/dispatch-ref-checklist.md` 통과? `dispatch_kind: fresh-session`이면 인용 Rule/§/[SAWP] envelope 모두 §Inline excerpts에 verbatim + 모든 phase boundary에 `telepty inject`로 보내는 HOLD inject 명시 (markdown 인라인 HOLD ≠ 실제 HOLD)? orchestrator-side path (`state/...` 등) 명시적 disclaimer?
 
-### 실행 모드 체크 (Rule 4-A — Phase 6 Conclusion 기반, 2026-05-04 lock (4-way Layer 1 selector LOCKED per ADR `2026-05-04-phase6-conclusion.md` §4.2, commit c7b2e79))
+### 실행 모드 체크 (Rule 4-A — Phase 6 Conclusion 기반, 4-way Layer 1 selector LOCKED per ADR `2026-05-04-phase6-conclusion.md` §4.2)
 
 - [ ] **Mode 선택 근거** (Rule 4-A): 선택한 execution mode 근거를 기록했는가?
 - [ ] **Rule 4-0 scope 통과** (Rule 4-0): 태스크가 Phase 3 scope 밖이면 Universal D fallback 적용했는가?
 - [ ] **Pacc 회피 (sunset 2026-08-01; ADR final-lock §4.4 / phase6-conclusion §6 reaffirmed)** (Rule 4-A Step 3): Pacc auto-routing 없이, accumulated session 연속 시에도 D/S 재시작이 우선 아닌가?
 - [ ] **Pfresh justification** (Rule 4-A Step 2): Pfresh 선택 시 reuse horizon ≥10 + homogeneous workload 증거가 있는가?
-- [ ] **Layer 1 4-way deterministic selector LOCKED (PC | S | D | sc-conditional; ADR `2026-05-04-phase6-conclusion.md` §4.2 — C1-C6 binding constraints + B1-B6 mapping, commit c7b2e79)** (Rule 4-A Step 4): 4-way 선택이 §4.2.1 C1-C6 (deterministic single-signal, observable inputs only, mutually exclusive AND exhaustive, fallback edges defined, sc-conditional cut grid honored, D no cross-CLI claim)과 §4.2.2 B1-B6 mapping (top-to-bottom B1→B2→B3→B4→B5→B6 lexical 평가 순서)를 거쳤는가? (random/weighted-random co-equal 금지)
+- [ ] **Layer 1 4-way deterministic selector LOCKED (PC | S | D | sc-conditional; ADR `2026-05-04-phase6-conclusion.md` §4.2 — C1-C6 binding constraints + B1-B6 mapping)** (Rule 4-A Step 4): 4-way 선택이 §4.2.1 C1-C6 (deterministic single-signal, observable inputs only, mutually exclusive AND exhaustive, fallback edges defined, sc-conditional cut grid honored, D no cross-CLI claim)과 §4.2.2 B1-B6 mapping (top-to-bottom B1→B2→B3→B4→B5→B6 lexical 평가 순서)를 거쳤는가? (random/weighted-random co-equal 금지)
 - [ ] **OQ-P6-1 selector signals (ADR phase6-conclusion §4.2.1 C2)** (Rule 4-A Step 4): 입력이 4종 observable 신호 (`chain_state.session_count` + `chain_state.expected_position_count` + `workload_type` + `capability.claude_only_chain_supported`)으로만 구성되었는가? (opaque heuristic 금지; C2 invariant)
 - [ ] **sc-conditional cut grid (ADR phase6-conclusion §4.2 B3a/b/c, C5)** (Rule 4-A Step 4): chain_length=5 → cut=5; chain_length=10 → cut=30; out-of-grid chain length → PC fallback (Q1 sub-ADR §4.3 + C5). 결정론적 selector + PC Layer 3 fallback 준수했는가?
 - [ ] **D Layer 1 co-equal under Rule 4-0 narrow lock (ADR phase6-conclusion §4.2 B1/B5, C6; §4.4 FU-4 BLOCKING)** (Rule 4-A Step 4): D 반환은 capability gate (B1: ¬claude_only_chain_supported) 또는 explicit external_dispatch workload (B5)에서만 — cross-CLI deployment claim은 Phase 7+ FU-4 cross-CLI verification 선행 필수 (C6 invariant: Q2 evidence는 Claude-only)?
@@ -48,7 +50,7 @@
 > **헌법 원본**: `../aigentry/docs/CONSTITUTION.md` (sibling repo)
 > **Snyk 셋업 가이드** (At-Inception 철학: 위임된 코더의 commit/PR-time 스캔 — 블랭킷 release-time 강제 아님; release-time 정책은 별도 결정 보류 중): `docs/setup/snyk-mcp.md`. 사이블링 repo로의 propagation은 `aigentry-devkit` scaffold가 자동 처리 (task #130, 2026-05-17).
 > **Rule 4 ADR (2026-04-22 origin → 2026-05-01 final lock → 2026-05-03 Q1+Q2 sub-ADRs → 2026-05-04 Phase 6 conclusion final integration / Track #329 E27 closure)**: `docs/adr/2026-04-22-rule-4-mode-selection.md` ; `docs/adr/2026-05-01-rule-4-a-step-4-final-lock.md` ; `docs/adr/2026-05-03-substitute-compact-phase6-promote.md` ; `docs/adr/2026-05-03-d-promotion-phase6-promote.md` ; `docs/adr/2026-05-04-phase6-conclusion.md`
-> **Permission Manager (spawn-capability gate / role→capability subset; ADR-MF #8, commit `3a13fb5`)**: `src/session/permission-manager.ts` + `src/session/role-capabilities.ts`. Capability↔CLI adapter (§4.6.1) + default role→capability table (§4.6.2): `docs/adr/2026-05-12-cwd-role-decoupling-immutable-session-contract.md`. **Hard-fail enforcement ACTIVE (ADR §6 #11 landed, commit `<TBD-MF11>`; see §11 changelog).**
+> **Permission Manager (spawn-capability gate / role→capability subset; ADR-MF #8)**: `src/session/permission-manager.ts` + `src/session/role-capabilities.ts`. Capability↔CLI adapter (§4.6.1) + default role→capability table (§4.6.2): `docs/adr/2026-05-12-cwd-role-decoupling-immutable-session-contract.md`. **Hard-fail enforcement ACTIVE (ADR §6 #11 landed; see §11 changelog).**
 > **Spawn validation mode (ADR-MF #9)**: `enforceSpawn()` in `src/session/validate-spawn.ts` wraps `validateSpawn()` with mode `'hard-fail' | 'warn' | 'off'` via env `AIGENTRY_SPAWN_VALIDATION_MODE` (default `'hard-fail'` per ADR §6 #11; `'warn'` / `'off'` are explicit opt-outs). In `'warn'` mode (opt-in) violations emit telemetry to `~/.aigentry/telemetry/spawn-events-YYYY-MM-DD.ndjson` (NDJSON, UTC daily) and degrade `effective_role → logger` (least-privileged per `role-capabilities.ts`); aggregator `bin/spawn-telemetry-report.sh`. Hard-fail throws `SpawnValidationError` on any G1–G6 + P1 violation (ADR §11 changelog).
 > **Gate integration (ADR-MF #15, this dispatch)**: `src/gate/{class-a,class-b,class-c}/` — three enforcement surfaces over the same `enforceSpawn()` core (Rule 29 surgical).
 > Class A (L1 process spawn) — `class-a/{telepty,cmux,cli_direct}.ts` wrap real spawn primitives via injected `Dispatcher<TArg,TResult>`; on accept, `ctx_persist` callback (#5) runs G6 BEFORE dispatch.
@@ -71,7 +73,7 @@
 1. **비판적**: 약점, 리스크, 빠진 부분 항상 지적
 2. **건설적**: 문제만 지적하지 않고 대안/해결책 제시
 3. **객관적**: 편향 없이 장단점 균형. 자기 제안에도 비판적
-4. **다중 해석 surface**: 모호한 요청 시 N개 해석 제시 후 선택 요청. 묵시적으로 한 해석 골라 진행 금지 (Karpathy 4-principle inline benchmark, 2026-05-05).
+4. **다중 해석 surface**: 모호한 요청 시 N개 해석 제시 후 선택 요청. 묵시적으로 한 해석 골라 진행 금지 (Karpathy 4-principle inline benchmark).
 
 ## 위임 명령어
 
@@ -102,6 +104,7 @@ telepty list
 4. **[SPEC FIRST]** (Rule 24) — 구현 승인 전
 5. **lessons** (Rule 7-1) — invariants + failed approaches
 6. **CLI별 역량**: claude=superpowers+MCP+subagent, codex=코드생성+테스트, gemini=웹검색+문서화
+7. **Self-contained dispatch ref** (Rule 32-A-template / #396 #397) — 스켈레톤 `docs/templates/dispatch-ref-template.md`, 체크리스트 `docs/templates/dispatch-ref-checklist.md`. `dispatch_kind: fresh-session` 시 인용 verbatim + HOLD inject 실제 `telepty inject` 호출 + orchestrator-side path disclaimer 필수.
 
 ## dustcraw 태스크 피드 (필수)
 
