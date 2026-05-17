@@ -1,17 +1,28 @@
 #!/usr/bin/env bash
-# session-cleanup.sh — Cleanup orchestrator-spawned session (cmux workspace + telepty advisory).
+# session-cleanup.sh — Actually remove orchestrator-spawned sessions.
 #
-# Closes the cmux workspace for a given session id and confirms the telepty session
-# has moved to DISCONNECTED. Actual telepty session removal is pending telepty#17
-# (telepty 0.3.5 has no `rm`/`prune` command); this helper emits an advisory line so
-# operators know the disconnected entry will linger in `telepty list` until #17 lands.
+# Three-step removal per session:
+#   1. Kill the parent `telepty allow --id <sid> ...` process via SIGTERM
+#      (process tree dies → wrapped CLI dies, telepty auto-deregisters most cases).
+#   2. cmux close-workspace (best-effort, harmless if cmux unavailable).
+#   3. DELETE /api/sessions/<sid> on local daemon (force-remove from registry —
+#      handles the edge case where parent kill alone did not propagate).
 #
-# Enforces AGENTS.md Rule 28 by refusing to clean the protected `orchestrator` session
-# unless --force is passed.
+# Discovered 2026-05-17: prior version of this script only attempted cmux close +
+# advisory "telepty#17 pending" emit, which left 21 wrapped sessions accumulated
+# for days. The DELETE API existed in daemon.js:2367 but was unused by this helper.
+# parent-PID SIGTERM is the load-bearing step (auto-deregisters in ~404 of cases);
+# DELETE is the backup that handles residual entries.
+#
+# Enforces AGENTS.md Rule 28 by refusing to clean the protected `orchestrator`
+# session unless --force is passed. The active-builder session(s) currently working
+# may be additionally protected via --keep <sid>.
 #
 # Usage:
 #   session-cleanup.sh <sid> [--force]
-#   session-cleanup.sh --all-disconnected     # batch: prune all DISCONNECTED sessions
+#   session-cleanup.sh --all-disconnected           # batch: only DISCONNECTED entries
+#   session-cleanup.sh --all-unused [--keep <sid>]  # batch: every non-orchestrator session
+#                                                    # (multiple --keep allowed for active builders)
 #   session-cleanup.sh --help
 #
 # Exit codes:
@@ -105,19 +116,34 @@ close_cmux_workspace() {
   fi
 }
 
-# poll_disconnected <sid> — return 0 if telepty marks sid as DISCONNECTED (or gone) within ~5s
-poll_disconnected() {
-  local sid="$1" deadline status
-  deadline=$(( $(date +%s) + 5 ))
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    status=$(telepty_list_json \
-      | jq -r --arg sid "$sid" '.[] | select(.id == $sid) | .healthStatus' \
-      | head -1 || true)
-    [ -z "$status" ] && return 0
-    [ "$status" = "DISCONNECTED" ] && return 0
-    sleep 0.5
-  done
-  return 1
+# kill_parent_telepty_allow <sid> — find the `node ... telepty allow --id <sid> ...`
+# process and SIGTERM it. Its child wrapped CLI (claude/codex/gemini/...) dies with it.
+kill_parent_telepty_allow() {
+  local sid="$1" pid
+  pid=$(ps -eo pid,command 2>/dev/null \
+    | awk -v s="$sid" '$0 ~ ("telepty allow --id " s " ") {print $1; exit}' || true)
+  if [ -z "$pid" ]; then
+    log "no parent telepty-allow process for $sid (already exited?)"
+    return 0
+  fi
+  if kill -TERM "$pid" 2>/dev/null; then
+    log "killed parent telepty-allow PID $pid for $sid"
+  else
+    log "kill -TERM PID $pid failed for $sid (may be exiting)"
+  fi
+}
+
+# delete_session_registry <sid> — call DELETE /api/sessions/<sid> on local daemon
+# (daemon.js:2367). 200 = removed, 404 = already gone (after parent kill).
+delete_session_registry() {
+  local sid="$1" port="${TELEPTY_PORT:-3848}" http
+  http=$(curl -s -o /dev/null -w '%{http_code}' \
+    -X DELETE "http://127.0.0.1:${port}/api/sessions/${sid}" 2>/dev/null || echo "000")
+  case "$http" in
+    200) log "DELETE /api/sessions/$sid → 200 (removed from registry)";;
+    404) log "DELETE /api/sessions/$sid → 404 (already gone — parent kill propagated)";;
+    *)   log "DELETE /api/sessions/$sid → $http (unexpected; manual verify)";;
+  esac
 }
 
 cleanup_one() {
@@ -132,12 +158,14 @@ cleanup_one() {
     log "session not in telepty list: $sid (already cleaned or never registered)"
     return 0
   fi
+  # Step 1 — kill parent (load-bearing; auto-deregisters most cases)
+  kill_parent_telepty_allow "$sid"
+  # Step 2 — cmux workspace close (best-effort)
   close_cmux_workspace "$sid" "$info"
-  if poll_disconnected "$sid"; then
-    log "telepty session DISCONNECTED; will be auto-pruned when telepty#17 lands (currently retained in list)."
-  else
-    log "telepty session $sid not yet DISCONNECTED — verify manually."
-  fi
+  # Brief settle so daemon notices parent death
+  sleep 0.5
+  # Step 3 — DELETE registry (force-remove residue)
+  delete_session_registry "$sid"
   return 0
 }
 
@@ -145,7 +173,7 @@ cleanup_all_disconnected() {
   local sids count=0
   sids=$(disconnected_sids)
   if [ -z "$sids" ]; then
-    echo "cleaned: 0 disconnected sessions (cmux workspace close attempted; telepty rm pending #17)"
+    echo "cleaned: 0 disconnected sessions"
     return 0
   fi
   while IFS= read -r sid; do
@@ -153,18 +181,47 @@ cleanup_all_disconnected() {
     cleanup_one "$sid" 0 || true
     count=$((count + 1))
   done <<< "$sids"
-  echo "cleaned: $count disconnected sessions (cmux workspace close attempted; telepty rm pending #17)"
+  echo "cleaned: $count disconnected sessions"
+}
+
+# cleanup_all_unused [--keep <sid> ...] — every session not in keep-list and not protected
+cleanup_all_unused() {
+  local keep_csv="$1" count=0
+  local keep_csv_quoted
+  keep_csv_quoted=$(jq -nc --arg s "$keep_csv" '$s | split(",") | map(select(length > 0))')
+  local sids
+  sids=$(telepty_list_json \
+    | jq -r --argjson keep "$keep_csv_quoted" --arg p "$PROTECTED_SID" '
+        .[]
+        | select(.id != $p)
+        | select(([.id] | inside($keep)) | not)
+        | .id')
+  if [ -z "$sids" ]; then
+    echo "cleaned: 0 unused sessions"
+    return 0
+  fi
+  while IFS= read -r sid; do
+    [ -z "$sid" ] && continue
+    cleanup_one "$sid" 0 || true
+    count=$((count + 1))
+  done <<< "$sids"
+  echo "cleaned: $count unused sessions"
 }
 
 main() {
   [ $# -eq 0 ] && usage 1
   require_deps
 
-  local mode_all=0 force=0 sid=""
+  local mode_all_disc=0 mode_all_unused=0 force=0 sid=""
+  local keep_list=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -h|--help) usage 0;;
-      --all-disconnected) mode_all=1; shift;;
+      --all-disconnected) mode_all_disc=1; shift;;
+      --all-unused) mode_all_unused=1; shift;;
+      --keep)
+        [ $# -lt 2 ] && { err "--keep requires <sid>"; exit 1; }
+        keep_list="${keep_list:+$keep_list,}$2"; shift 2;;
       --force) force=1; shift;;
       --*) err "unknown flag: $1"; exit 1;;
       *)
@@ -173,13 +230,19 @@ main() {
     esac
   done
 
-  if [ "$mode_all" -eq 1 ]; then
+  if [ "$mode_all_disc" -eq 1 ]; then
     [ -n "$sid" ] && { err "--all-disconnected does not take a sid argument"; exit 1; }
     cleanup_all_disconnected
     exit 0
   fi
 
-  [ -z "$sid" ] && { err "<sid> required (or use --all-disconnected)"; usage 1; }
+  if [ "$mode_all_unused" -eq 1 ]; then
+    [ -n "$sid" ] && { err "--all-unused does not take a sid argument"; exit 1; }
+    cleanup_all_unused "$keep_list"
+    exit 0
+  fi
+
+  [ -z "$sid" ] && { err "<sid> required (or use --all-disconnected / --all-unused)"; usage 1; }
   cleanup_one "$sid" "$force"
 }
 
