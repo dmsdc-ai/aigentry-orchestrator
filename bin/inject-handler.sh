@@ -29,6 +29,16 @@ HOLDS_LOG="$STATE_DIR/holds.log"
 PARSER_JS="${INJECT_PARSER_JS:-$REPO_DIR/dist/src/session/inject-parser.js}"
 TRACKER_SH="${TRACKER_SH:-$SCRIPT_DIR/dispatch-tracker.sh}"
 SCHEDULER_SH="${SCHEDULER_SH:-$SCRIPT_DIR/dispatch-cleanup-scheduler.sh}"
+EMIT_TELEMETRY_MJS="${EMIT_TELEMETRY_MJS:-$SCRIPT_DIR/emit-telemetry.mjs}"
+
+# §9 독립: telemetry failure must NEVER block the inject-handler primary path.
+# The shim itself swallows transport errors; we additionally `|| true` here so
+# even a hard exec failure (missing node, etc.) is non-fatal.
+emit_telemetry() {
+  if [ -x "$EMIT_TELEMETRY_MJS" ]; then
+    "$EMIT_TELEMETRY_MJS" "$@" >/dev/null 2>&1 || true
+  fi
+}
 
 mkdir -p "$STATE_DIR"
 
@@ -91,6 +101,9 @@ case "$kind" in
     if [ -x "$TRACKER_SH" ]; then
       "$TRACKER_SH" mark-reported "$sid" || true
     fi
+    emit_telemetry --helper report --subtype report \
+      --payload-json "$(printf '{"target_sid":"%s","transport":"%s"}' "$sid" "$transport")" \
+      --correlation-id "$sid"
     echo "[inject-handler] report kind=report sid=$sid transport=$transport — scheduler armed"
     ;;
   cleanup-request)
@@ -101,6 +114,9 @@ case "$kind" in
     [ -n "$reason" ] && args+=(--reason "$reason")
     [ -n "$grace" ] && args+=(--grace-seconds "$grace")
     if [ -x "$SCHEDULER_SH" ]; then "$SCHEDULER_SH" "${args[@]}" >/dev/null 2>&1 || true; fi
+    emit_telemetry --helper lifecycle --subtype cleanup \
+      --payload-json "$(printf '{"target":"%s","reason":"%s","grace_seconds":"%s","transport":"%s"}' "$target" "$reason" "$grace" "$transport")" \
+      --correlation-id "$target"
     echo "[inject-handler] cleanup-request target=$target transport=$transport"
     ;;
   extend-lifetime)
@@ -111,15 +127,23 @@ case "$kind" in
       args=(defer "$target" --minutes "$defer")
       [ -n "$reason" ] && args+=(--reason "$reason")
       if [ -x "$SCHEDULER_SH" ]; then "$SCHEDULER_SH" "${args[@]}" >/dev/null 2>&1 || true; fi
+      emit_telemetry --helper lifecycle --subtype extend \
+        --payload-json "$(printf '{"target":"%s","defer_minutes":"%s","reason":"%s","transport":"%s"}' "$target" "$defer" "$reason" "$transport")" \
+        --correlation-id "$target"
       echo "[inject-handler] extend-lifetime target=$target defer=${defer}m transport=$transport"
     else
       if [ -x "$SCHEDULER_SH" ]; then "$SCHEDULER_SH" cancel "$target" >/dev/null 2>&1 || true; fi
+      emit_telemetry --helper lifecycle --subtype extend \
+        --payload-json "$(printf '{"target":"%s","cancel":true,"transport":"%s"}' "$target" "$transport")" \
+        --correlation-id "$target"
       echo "[inject-handler] extend-lifetime target=$target cancel-pending transport=$transport"
     fi
     ;;
   hold)
     # Audit log only — orchestrator session reads this when deciding next phase.
     printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$parsed" >> "$HOLDS_LOG"
+    emit_telemetry --helper report --subtype hold \
+      --payload-json "$(printf '{"transport":"%s"}' "$transport")"
     echo "[inject-handler] hold logged transport=$transport"
     ;;
   test-report)
@@ -139,6 +163,9 @@ out["_transport"] = data["transport"]
 print(json.dumps(out, indent=2, ensure_ascii=False))
 ' > "$tmp"
     mv "$tmp" "$target_file"
+    emit_telemetry --helper report --subtype test_report \
+      --payload-json "$(printf '{"target_sid":"%s","path":"%s","transport":"%s"}' "$sid" "$target_file" "$transport")" \
+      --correlation-id "$sid"
     echo "[inject-handler] test-report written sid=$sid path=$target_file transport=$transport"
     ;;
   *)

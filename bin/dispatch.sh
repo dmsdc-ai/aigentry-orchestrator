@@ -30,6 +30,15 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 TRACKER_SH="$SCRIPT_DIR/dispatch-tracker.sh"
 TELEPTY="${TELEPTY:-telepty}"
+EMIT_TELEMETRY_MJS="${EMIT_TELEMETRY_MJS:-$SCRIPT_DIR/emit-telemetry.mjs}"
+
+# §9 독립: telemetry failure must NEVER block dispatch. Shim swallows
+# transport errors; `|| true` guards against exec-level failures too.
+emit_telemetry() {
+  if [ -x "$EMIT_TELEMETRY_MJS" ]; then
+    "$EMIT_TELEMETRY_MJS" "$@" >/dev/null 2>&1 || true
+  fi
+}
 
 usage() { sed -n '2,24p' "$0"; }
 
@@ -265,6 +274,10 @@ else
   exit 4
 fi
 
+emit_telemetry --helper dispatch --subtype dispatch_start \
+  --payload-json "$(printf '{"target_sid":"%s","mode":"%s","cli":"%s","role":"%s"}' "$sid" "$([ "$spawn" -eq 1 ] && echo spawn-and-dispatch || echo target)" "$cli" "$role")" \
+  --correlation-id "$sid"
+
 if ! dedup_check_and_mark "$sid"; then exit 0; fi
 
 if ! wait_for_ready "$sid"; then exit 1; fi
@@ -283,5 +296,8 @@ if [ "$verify_delivered" -eq 1 ]; then
 fi
 
 tracker_append "$sid" "$ref_hash"
+emit_telemetry --helper dispatch --subtype dispatch_ack \
+  --payload-json "$(printf '{"target_sid":"%s","verified":%s}' "$sid" "$([ "$verify_delivered" -eq 1 ] && echo true || echo false)")" \
+  --correlation-id "$sid"
 echo "OK dispatched to $sid"
 exit 0

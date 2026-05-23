@@ -8,6 +8,35 @@ ongoing `## [Unreleased]` working set.
 
 ## [Unreleased]
 
+### Added
+
+- **`@aigentry/logger` emit wiring at dispatch + inject-handler sites (#440).**
+  New `src/telemetry/logger-emit.ts` wrapper exposes typed A1 helpers
+  (`emitLifecycleEvent`, `emitDispatchEvent`, `emitReportEvent`) that map
+  spec event names onto the closed ssot `TelemetryEventKind` enum via
+  `payload.subtype` discrimination — no ssot bump. New
+  `bin/emit-telemetry.mjs` CLI shim lets bash callers invoke the helpers
+  without `node -e` heredoc inlining.
+  - `bin/dispatch.sh` → `state-change`/`dispatch_start` after sid is
+    resolved, `state-change`/`dispatch_ack` after successful inject +
+    tracker append (correlated by target sid).
+  - `bin/inject-handler.sh` → five per-kind emit calls covering
+    REPORT / CLEANUP_REQUEST / EXTEND_LIFETIME (defer + cancel branches) /
+    HOLD / TEST_REPORT envelopes.
+  Wrapper falls back to `AIGENTRY_SESSION_ID=pid-${pid}` and
+  `AIGENTRY_ROLE='orchestrator'` (the repo's natural Role enum value)
+  when env is unset. Honors `AIGENTRY_LOGGER_DISABLED=1` and swallows
+  all transport failures (§9 독립). ADR-MF #9
+  `src/telemetry/spawn-events.ts` is **untouched** (decision C3 per
+  #440 ACK — orchestrator's existing spawn-events emit remains the
+  authoritative source for the spawn gate; consolidation deferred).
+- **Wrapper unit tests** at `tests/telemetry/logger-emit.test.ts`
+  (9 cases). End-to-end smoke: emit shim produced a schema-valid
+  NDJSON line in `~/.aigentry/telemetry/`. Two pre-existing failures in
+  `warn-mode-telemetry.test.js` / `warn-mode.test.js` (spawn-telemetry-
+  report.sh aggregation path) confirmed unrelated to #440 via baseline
+  `git stash` run.
+
 ## [2026-05-23] — R2 lifecycle 3-layer + R5a TestReport handoff
 
 ### Added

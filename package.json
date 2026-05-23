@@ -14,6 +14,7 @@
     "test:adr-mf": "tsc -p . && node --test dist/tests/session/deep-hierarchy.test.js dist/tests/session/no-implicit-inheritance.test.js dist/tests/session/digest-reproducibility.test.js dist/tests/session/boot-adapter-conformance.test.js dist/tests/session/persistence-protocol.test.js dist/tests/session/warn-mode-telemetry.test.js dist/tests/session/cycle-detection.test.js"
   },
   "dependencies": {
+    "@aigentry/logger": "file:../aigentry-logger",
     "@aigentry/ssot": "file:../aigentry-ssot/pkg"
   },
   "devDependencies": {
