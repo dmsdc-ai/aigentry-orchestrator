@@ -129,17 +129,18 @@ PY
 
 cmd_append() {
   local sid="$1" ref_path="$2" ref_hash="$3"; shift 3
-  local cwd="" from=""
+  local cwd="" from="" keep_alive=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --cwd) cwd="$2"; shift 2;;
       --from) from="$2"; shift 2;;
+      --keep-alive) keep_alive=1; shift;;
       *) echo "append: unknown $1" >&2; exit 4;;
     esac
   done
   local now; now=$(now_iso)
   ACTIVE_JSON="$ACTIVE_JSON" SID="$sid" RP="$ref_path" RH="$ref_hash" \
-    CWD="$cwd" FROM="$from" NOW="$now" \
+    CWD="$cwd" FROM="$from" NOW="$now" KEEPALIVE="$keep_alive" \
     python3 - <<'PY'
 import fcntl, json, os, datetime
 def plus30(iso):
@@ -163,6 +164,7 @@ with open(path,"r+") as f:
         "cwd":os.environ.get("CWD",""),
         "from_sid":os.environ.get("FROM",""),
         "re_dispatch_count":0,
+        "keep_alive": os.environ.get("KEEPALIVE","0") == "1",
     })
     f.seek(0); f.truncate()
     json.dump(entries,f,indent=2,ensure_ascii=False); f.write("\n")
@@ -177,6 +179,12 @@ for e in entries:
     if e.get('sid') == sid and e.get('status') in ('in_flight','re_dispatched','auto_reported','stuck_welcome'):
         e['status'] = 'reported'
 "
+  # Layer D — schedule cleanup if scheduler script is available + sid is not keep-alive.
+  # Scheduler internally skips when active.json has keep_alive=true for sid.
+  local scheduler="${SCHEDULER_SH:-$SCRIPT_DIR/dispatch-cleanup-scheduler.sh}"
+  if [ -x "$scheduler" ]; then
+    "$scheduler" schedule "$sid" --grace-seconds 60 --source layer-d-timeout >/dev/null 2>&1 || true
+  fi
 }
 
 # --- iterate entries needing a check, classify, act ---

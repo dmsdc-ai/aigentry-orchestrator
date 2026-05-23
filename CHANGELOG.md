@@ -8,7 +8,87 @@ ongoing `## [Unreleased]` working set.
 
 ## [Unreleased]
 
-## [2026-05-23]
+## [2026-05-23] — R2 lifecycle 3-layer + R5a TestReport handoff
+
+### Added
+- **Session lifecycle 3-layer cleanup landed (#433, ADR 2026-05-20).** Owner-initiated
+  cleanup with two safety nets, per the production patterns surveyed in
+  `docs/reports/2026-05-20-session-mgmt-benchmark.md`:
+  - **Layer A (worker self-declared).** Worker emits `REPORT: ...-DONE`, then after a
+    30s grace emits `CLEANUP_REQUEST: <sid> | reason: ...`. The new `bin/dispatch.sh`
+    `--keep-alive` flag opts a session out of Layer A (reusable workers, SPEC FIRST
+    re-dispatch). The flag is persisted in `state/dispatch/active.json` as a boolean
+    field and honored by every downstream layer.
+  - **Layer D (orchestrator timeout fallback).** `bin/dispatch-cleanup-scheduler.sh`
+    `schedule | cancel | defer | tick | list` maintains
+    `state/dispatch/cleanup-pending.json` (atomic tmpfile+mv writes per pattern
+    introduced in #114) with the schema
+    `{sid, report_time, scheduled_cleanup_time, source: "layer-d-timeout" | "reconciler" | "explicit-request", preempt_reason?}`.
+    Auto-armed by `bin/dispatch-tracker.sh mark-reported`; tick AT deadline invokes
+    `bin/session-cleanup.sh <sid>` once (idempotent). `EXTEND_LIFETIME` envelopes
+    cancel (no `defer_minutes`) or push the deadline. Skips entries flagged
+    `keep_alive: true`.
+  - **Layer Reconciler (level-triggered safety net).** `bin/session-reconciler.sh`
+    runs every 60s via launchd. GC root = `active.json` LIVE-status entries ∪
+    `{orchestrator}` (PROTECTED) ∪ `keep_alive` sids. Candidate sweep set =
+    `telepty list` minus GC root, gated by `RECONCILER_AGE_FLOOR` (default 300s,
+    anti-spawn-race floor) and dead-PID / `DISCONNECTED` for
+    `RECONCILER_DISCONNECT_FLOOR` (default 240s). Per-sid exponential backoff in
+    `state/dispatch/reconciler-backoff.json` (initial 5s, max 1000s — controller-runtime
+    defaults). First step of every tick is `dispatch-cleanup-scheduler.sh tick`,
+    so Layer D fires on the reconciler cadence as well.
+- **`bin/lib/workspace-host.sh` adapter seam (ADR 2026-05-20 §Consequences).**
+  Four-method contract — `wh_lookup` / `wh_close` / `wh_alive` / `wh_list_ids` —
+  with cmux + headless adapters shipped together. Auto-select via
+  `AIGENTRY_WORKSPACE_HOST` env or PATH heuristic. `bin/session-cleanup.sh` now
+  routes through the seam (`close_workspace_for`) instead of hardcoding
+  `cmux close-workspace`; headless is the documented degrade path for
+  CI/docker/windows-terminal/zellij hosts.
+- **`@aigentry/ssot` consumed via `file:` import.** Orchestrator `package.json` now
+  declares `"@aigentry/ssot": "file:../aigentry-ssot/pkg"`; `npm install` symlinks
+  `node_modules/@aigentry/ssot → ../aigentry-ssot/pkg`. Local path only — no registry
+  dependency (Constitution §17 무의존). Pin matches ssot tag `v1.0.0-rc.0`
+  (commit `7e44974`).
+- **`src/session/inject-parser.ts` envelope parser.** Thin wrapper over
+  `parsePtyEnvelope` from `@aigentry/ssot/envelope/pty-envelope`. Recognizes five
+  envelope kinds — `report`, `hold`, `cleanup-request`, `extend-lifetime`,
+  `test-report` — across both transports (fenced JSON `\`\`\`json aigentry-envelope/v1`
+  and markdown line fallback). Backward-compatible with the pre-envelope markdown
+  REPORT / HOLD shape; markdown forms for the three new kinds are documented in the
+  module header. 18 unit tests cover positive/negative paths and the
+  fenced→markdown precedence rule.
+- **R5a tester→orchestrator handoff (#436).** `bin/inject-handler.sh` parses an
+  inbound inject body (stdin or `--body-file`) and dispatches per kind:
+  - `report` → `dispatch-tracker.sh mark-reported`
+  - `cleanup-request` → scheduler `schedule --source explicit-request`
+  - `extend-lifetime` → scheduler `defer` or `cancel`
+  - `hold` → append to `state/dispatch/holds.log`
+  - `test-report` → atomic write to `state/test-reports/<YYYY-MM-DD>/<sid>.json`
+    (ssot `TestReport` schema, `_transport` field preserved for audit). Malformed
+    envelopes are rejected without silent acceptance.
+  `docs/templates/dispatch-ref-template.md` gains a `Tester role REPORT format`
+  section with both transports + the ssot field-semantics index.
+- **Integration tests.** `tests/dispatch/T17_lifecycle_3layer.sh` exercises four
+  scenarios — Layer A success, Layer D timeout, EXTEND_LIFETIME defer / cancel,
+  Reconciler crash sweep with `RECONCILER_AGE_FLOOR=10` override — plus the
+  keep-alive opt-out across paths. `tests/dispatch/T18_test_report_handoff.sh`
+  covers both TestReport transports + the negative path. Five additional unit-style
+  tests (`T19`–`T23`) pin scheduler schedule / cancel / defer / tick, keep-alive
+  short-circuit, reconciler GC root computation, and the workspace-host adapter
+  contract. `T24` covers the inject-handler test-report write end-to-end.
+- **`~/Library/LaunchAgents/com.aigentry.reconciler.plist`.** `StartInterval=60`,
+  `RunAtLoad`, stdout/stderr to `~/Library/Logs/aigentry-orchestrator/reconciler.log`.
+  `plutil -lint OK`. **Not auto-loaded** — operators run
+  `launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.aigentry.reconciler.plist`
+  once. Linux systemd equivalent is registered as a follow-up task (cross-platform §2).
+
+### Notes
+- Pre-existing test baseline before this changeset: 185 TS tests with 2 failures
+  in `spawn-telemetry-report.sh` (`W4 — composed-stack events aggregate` and
+  `report.sh aggregation (12)`). Both are unrelated to this change — verified by
+  running the suite without the new files. They remain on the failure list and
+  are NOT touched by this changeset.
+- All new TypeScript passed `mcp__snyk__snyk_code_scan` with 0 findings.
 
 ### Fixed
 - **cwd→role contamination at process-spawn boundary (#431, ADR 2026-05-12 enforcement).**

@@ -45,6 +45,10 @@ set -euo pipefail
 
 PROTECTED_SID="orchestrator"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=lib/workspace-host.sh
+. "$SCRIPT_DIR/lib/workspace-host.sh"
+
 usage() {
   sed -n '2,20p' "$0"
   exit "${1:-0}"
@@ -96,23 +100,20 @@ disconnected_sids() {
         | .id'
 }
 
-# close_cmux_workspace <sid> <session-json>
-close_cmux_workspace() {
-  local sid="$1" json="$2"
-  if ! command -v cmux >/dev/null 2>&1; then
-    log "cmux CLI not on PATH; skipping workspace close for $sid"
+# close_workspace_for <sid> <session-json>
+# Routes through the Workspace Host adapter seam (bin/lib/workspace-host.sh).
+# Currently 1 adapter active (cmux); headless = no-op. ADR 2026-05-20.
+close_workspace_for() {
+  local sid="$1" json="$2" host_id
+  host_id=$(wh_lookup "$sid" "$json")
+  if [ -z "$host_id" ]; then
+    log "no workspace host id mapped for $sid; skipping"
     return 0
   fi
-  local ws_id
-  ws_id=$(echo "$json" | jq -r '.cmuxWorkspaceId // empty')
-  if [ -z "$ws_id" ]; then
-    log "no cmux workspace mapped for $sid; skipping"
-    return 0
-  fi
-  if cmux close-workspace --workspace "$ws_id" >/dev/null 2>&1; then
-    log "cmux workspace closed: $sid ($ws_id)"
+  if wh_close "$host_id"; then
+    log "workspace host closed: $sid ($host_id)"
   else
-    log "cmux close-workspace non-zero for $sid (already closed?)"
+    log "workspace host close non-zero for $sid (already closed?)"
   fi
 }
 
@@ -160,8 +161,8 @@ cleanup_one() {
   fi
   # Step 1 — kill parent (load-bearing; auto-deregisters most cases)
   kill_parent_telepty_allow "$sid"
-  # Step 2 — cmux workspace close (best-effort)
-  close_cmux_workspace "$sid" "$info"
+  # Step 2 — workspace host close via adapter seam (best-effort)
+  close_workspace_for "$sid" "$info"
   # Brief settle so daemon notices parent death
   sleep 0.5
   # Step 3 — DELETE registry (force-remove residue)

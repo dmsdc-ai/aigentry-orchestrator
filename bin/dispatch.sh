@@ -37,6 +37,7 @@ target=""; ref_file=""; from_id=""; timeout_ms=30000
 spawn=0; track=""; name=""; cwd=""; cli="claude"
 verify_delivered=0
 role=""  # #431: when set + cli=claude, enables boot-adapter wiring (--bare + --system-prompt-file)
+keep_alive=0  # ADR 2026-05-20 Layer A opt-out — worker won't emit CLEANUP_REQUEST.
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -51,6 +52,7 @@ while [ $# -gt 0 ]; do
     --cli) cli="$2"; shift 2;;
     --role) role="$2"; shift 2;;
     --verify-delivered) verify_delivered=1; shift;;
+    --keep-alive) keep_alive=1; shift;;
     -h|--help) usage; exit 0;;
     *) echo "dispatch.sh: unknown arg: $1" >&2; usage >&2; exit 4;;
   esac
@@ -200,6 +202,7 @@ tracker_append() {
   local -a a=(append "$sid" "$ref_file" "$hash")
   [ -n "$cwd" ] && a+=(--cwd "$cwd")
   [ -n "$from_id" ] && a+=(--from "$from_id")
+  [ "$keep_alive" -eq 1 ] && a+=(--keep-alive)
   "$TRACKER_SH" "${a[@]}" >/dev/null 2>&1 || true
 }
 

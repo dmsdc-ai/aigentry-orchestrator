@@ -95,6 +95,54 @@ Silent waiting at any of the above = Constitution §13 violation = task #397 rep
 telepty inject --ref --submit --submit-retry 2 --from <session-id> <orchestrator-session-id> "REPORT: <task-tag>-DONE | <key1>: <value> | <key2>: <value> | task: #<issue-number>"
 ```
 
+## Tester role REPORT format (R5a handoff — task #436)
+
+> When the dispatched role is `tester`, the final report MUST use the `TestReport`
+> envelope so the orchestrator can write structured evidence to
+> `state/test-reports/<YYYY-MM-DD>/<session-id>.json`. Both transports below are
+> parseable by `src/session/inject-parser.ts`; the envelope-in-PTY form is
+> preferred because it preserves typed totals and optional `coverage_line_pct`.
+
+**Envelope-in-PTY (preferred — fenced JSON, ssot `@aigentry/ssot/contracts/handoff` shape):**
+```bash
+telepty inject --submit --from <tester-session-id> <orchestrator-session-id> "$(cat <<'BODY'
+TEST_REPORT inbound — see envelope below.
+```json aigentry-envelope/v1
+{
+  "schema_version": "1",
+  "kind": "test-report",
+  "payload": {
+    "schema_version": "1",
+    "session_id": "<tester-session-id>",
+    "suite": "<suite-name e.g. vitest/contract-roundtrip>",
+    "totals": { "total": 42, "passed": 41, "failed": 1, "skipped": 0 },
+    "finished_at": "<ISO 8601 timestamp>",
+    "duration_ms": 1234,
+    "failures": ["<failing-test-name-1>"],
+    "coverage_line_pct": 87.5
+  }
+}
+```
+BODY
+)"
+```
+
+**Markdown fallback (backward-compat — for runners that can't emit fenced JSON):**
+```bash
+telepty inject --submit --from <tester-session-id> <orchestrator-session-id> "TEST_REPORT: <tester-session-id> | suite=<suite-name> | total=42 | passed=41 | failed=1 | skipped=0 | duration_ms=1234"
+```
+
+Field semantics (mirror `pkg/src/contracts/handoff.ts` exactly — see ssot v1):
+- `session_id` — the tester session that produced the report
+- `suite` — free-form identifier (e.g. `pkg/test/contract-roundtrip`)
+- `totals` — `total === passed + failed + skipped` (invariant)
+- `failures` — optional list of failing test names for triage
+- `coverage_line_pct` — optional 0..100 line-coverage percentage
+
+Malformed TestReport (missing required field, non-numeric total) is rejected by
+the parser — there is no silent acceptance. The tester session MUST retry with
+a corrected envelope or fall back to the markdown form.
+
 ## [SAWP] envelope (Rule 17 — MANDATORY in every dispatch)
 
 After completing this task:
