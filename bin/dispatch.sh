@@ -9,8 +9,13 @@
 # Modes:
 #   dispatch.sh --target <sid> --ref <file> [--from <orch-sid>] [--timeout-ms 30000]
 #   dispatch.sh --spawn-and-dispatch --track T --name N --cwd P --cli claude \
-#               --ref <file> [--from <orch-sid>]
+#               --ref <file> [--from <orch-sid>] [--role coder|architect|...]
 #   dispatch.sh --help
+#
+# --role (cli=claude only, #431 / ADR 2026-05-12): wires boot-prepare.mjs to
+#   spawn `claude --bare --system-prompt-file <staged>` so the wrapped CLI
+#   skips cwd CLAUDE.md auto-discovery — preventing the cwd→role contamination
+#   exposed by the 2026-05-23 incident. Omit to use legacy spawn (back-compat).
 #
 # Ready detection: per-CLI prompt-symbol probe of `telepty read-screen` plus
 # welcome/boot banner absence (claude ❯ / codex › / gemini ›|│ >).
@@ -26,11 +31,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 TRACKER_SH="$SCRIPT_DIR/dispatch-tracker.sh"
 TELEPTY="${TELEPTY:-telepty}"
 
-usage() { sed -n '2,18p' "$0"; }
+usage() { sed -n '2,24p' "$0"; }
 
 target=""; ref_file=""; from_id=""; timeout_ms=30000
 spawn=0; track=""; name=""; cwd=""; cli="claude"
 verify_delivered=0
+role=""  # #431: when set + cli=claude, enables boot-adapter wiring (--bare + --system-prompt-file)
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -43,6 +49,7 @@ while [ $# -gt 0 ]; do
     --name) name="$2"; shift 2;;
     --cwd) cwd="$2"; shift 2;;
     --cli) cli="$2"; shift 2;;
+    --role) role="$2"; shift 2;;
     --verify-delivered) verify_delivered=1; shift;;
     -h|--help) usage; exit 0;;
     *) echo "dispatch.sh: unknown arg: $1" >&2; usage >&2; exit 4;;
@@ -102,14 +109,20 @@ banner = BANNERS.get(cli, r"Welcome|Initializing|Loading|Tips for getting starte
 prompt = PROMPT.get(cli, r"❯|›")
 
 banner_match = re.search(banner, tail)
-placeholder  = re.search(rf'(?m){prompt}\s+Try "[^"]+"', last3)
-prompt_only  = re.search(prompt, last3)
+# Prompt/placeholder may sit ABOVE status-bar lines (claude 2.x renders
+# "context | model | budget" + "bypass permissions" + occasional MCP notices
+# AFTER the prompt area) so last3 alone misses real idle states (#431 T16
+# regression — 2026-05-23). Search the wider tail; HARD_NEG still checks last3
+# only because "Working...", "Thinking", trust-folder are reliably the
+# bottom-most active states.
+placeholder  = re.search(rf'(?m){prompt}\s+Try "[^"]+"', tail)
+prompt_only  = re.search(prompt, tail)
 hard_neg     = re.search(HARD_NEG, last3)
 
 if hard_neg:
     sys.exit(1)
 if placeholder or prompt_only:
-    sys.exit(0)  # idle prompt in last3 = ready (banner in tail tolerated)
+    sys.exit(0)  # idle prompt anywhere in tail = ready (banner tolerated)
 if banner_match:
     sys.exit(1)
 sys.exit(1)
@@ -201,11 +214,47 @@ if [ "$spawn" -eq 1 ]; then
     echo "dispatch.sh: --track --name --cwd required for --spawn-and-dispatch" >&2
     exit 4
   fi
-  if ! "$SCRIPT_DIR/open-session.sh" --track "$track" --name "$name" --cwd "$cwd" --cli "$cli" >/dev/null; then
-    echo "dispatch.sh: open-session.sh failed" >&2
-    exit 2
-  fi
   sid="${track}-${name}"
+  # #431 (ADR 2026-05-12 enforcement) — hybrid (b-2)+(c) boot wiring (claude only).
+  # When --role is set and cli is claude, invoke boot-prepare.mjs to:
+  #   - Compute a sandbox spawn cwd ($HOME/.aigentry/role-sandbox/<role>-<sid>/)
+  #     with no CLAUDE.md → no project auto-discovery contamination
+  #   - Emit `--append-system-prompt-file <staged>` for OAuth-compatible role contract
+  #   - Set AIGENTRY_TARGET_CWD env so the worker can `cd $AIGENTRY_TARGET_CWD`
+  #     when it needs the original project root
+  # boot-prepare.mjs failure = stderr WARNING + legacy spawn (not silent fail).
+  boot_spawn_cli=""
+  boot_spawn_cwd=""
+  if [ "$cli" = "claude" ] && [ -n "$role" ]; then
+    if [ -x "$SCRIPT_DIR/boot-prepare.mjs" ]; then
+      boot_json=$(node "$SCRIPT_DIR/boot-prepare.mjs" --role "$role" --cwd "$cwd" --sid "$sid" --cli claude) && bp_status=0 || bp_status=$?
+      if [ "$bp_status" -eq 0 ] && [ -n "$boot_json" ]; then
+        # Parse JSON via python3 (already a dispatch.sh dep — see is_ready / dedup).
+        boot_spawn_cli=$(BOOT_JSON="$boot_json" python3 -c 'import json,os; print(json.loads(os.environ["BOOT_JSON"])["spawn_cli"])')
+        boot_spawn_cwd=$(BOOT_JSON="$boot_json" python3 -c 'import json,os; print(json.loads(os.environ["BOOT_JSON"])["spawn_cwd"])')
+      else
+        echo "dispatch.sh: WARNING boot-prepare.mjs failed (exit $bp_status) for sid=$sid role=$role" >&2
+        echo "dispatch.sh: WARNING falling back to legacy open-session.sh path; cwd CLAUDE.md auto-load risk active (#431)" >&2
+      fi
+    else
+      echo "dispatch.sh: WARNING boot-prepare.mjs not executable at $SCRIPT_DIR; legacy path active (#431)" >&2
+    fi
+  fi
+  if [ -n "$boot_spawn_cli" ] && [ -n "$boot_spawn_cwd" ]; then
+    # Hybrid path active: spawn the per-session launcher.sh in sandbox cwd.
+    # Launcher already encodes AIGENTRY_TARGET_CWD export + --append-system-prompt-file.
+    # Pass empty --extra-flags so open-session.sh's claude-default flags do NOT
+    # apply (we control the full argv via the launcher).
+    if ! "$SCRIPT_DIR/open-session.sh" --track "$track" --name "$name" --cwd "$boot_spawn_cwd" --cli "$boot_spawn_cli" --extra-flags " " >/dev/null; then
+      echo "dispatch.sh: open-session.sh failed" >&2
+      exit 2
+    fi
+  else
+    if ! "$SCRIPT_DIR/open-session.sh" --track "$track" --name "$name" --cwd "$cwd" --cli "$cli" >/dev/null; then
+      echo "dispatch.sh: open-session.sh failed" >&2
+      exit 2
+    fi
+  fi
 elif [ -n "$target" ]; then
   sid="$target"
 else

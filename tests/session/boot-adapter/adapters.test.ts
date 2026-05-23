@@ -16,12 +16,18 @@ import {
 const STAGING = "/tmp/sess-A";
 const ALL = () => ({ claude: readyScript(), codex: readyScript(), gemini: readyScript() });
 
-test("3. claude argv = --bare + --system-prompt-file <staged>", async () => {
+test("3. claude argv = --append-system-prompt-file <staged> (#431 hybrid pivot from --bare)", async () => {
+  // 2026-05-23 (#431): argv changed from `--bare --system-prompt-file` to
+  // `--append-system-prompt-file` because `--bare` disables OAuth/keychain auth
+  // and the deployed user runs on OAuth (verified empirically: `claude --bare`
+  // → "Not logged in"). The cwd→role contamination is closed instead by the
+  // hybrid (b-2)+(c): system-prompt-level role override + sandbox cwd
+  // (the latter chosen by bin/boot-prepare.mjs, not this adapter).
   const cmd = await getBootAdapter("claude").buildBootCommand(makeCtx(), makeResolved(), {
     staging_dir: STAGING, fs: memoryBootFs(), spawner: mockSpawner(ALL()),
   });
   assert.deepEqual([...cmd.argv], [
-    "claude", "--bare", "--system-prompt-file",
+    "claude", "--append-system-prompt-file",
     path.join(STAGING, "effective_prompt.md"),
   ]);
   assert.equal(cmd.cwd, "/work/myproj");

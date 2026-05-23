@@ -28,6 +28,7 @@
 - [ ] **영구 fix 강제 (Rule 32)**: 발생한 이슈는 1회성 workaround로 끝내지 않고 (1) workaround + (2) root cause + (3) GitHub issue 또는 Task 등록 + (4) permanent fix dispatch 4 step 모두 수행했는가? 2번째 재발 시 즉시 fix dispatch?
 - [ ] **영구 fix 진행 시퀀스 (Rule 32-A)**: 영구 fix 필요 사항 발견 시 다음 둘 중 하나를 **명시적으로** 선택 — silent 통과 절대 금지. **(A)** 즉시 영구 fix dispatch 가능하면 바로 진행. **(B)** 컨텍스트 부담/타이밍으로 즉시 불가하면 `state/task-queue.json` 등록 + 차후 fix dispatch 일정. 등록 시 task note에 root cause + 적용한 workaround + dispatch trigger 조건 명시. 진행 중 사례마다 명시적으로 (A)/(B) 어느 트랙인지 발화. (관련 패턴 예: task #395 #396 #397)
 - [ ] **dispatch helper 강제 (Rule 32 HARD — #113 후 revision)**: 새 세션 첫 dispatch 뿐 아니라 **모든 wave dispatch + 모든 ref-payload 위임**은 `bin/dispatch.sh --target <sid> --ref <ref> [--verify-delivered]` 또는 `--spawn-and-dispatch` 경유. raw `telepty inject <sid> "..."`는 (a) 대화형 1라인 ack/follow-up, (b) `telepty send-key`, (c) `telepty broadcast`로만 한정. 또한 모든 dispatch는 자동으로 `state/dispatch/active.json`에 등록되며, 30분 내 REPORT 없으면 `bin/dispatch-tracker.sh check`가 분류(welcome/error/active/done)·git-log pull·재dispatch(1회 cap)·AUTO_REPORT를 자율 처리. SPEC: `docs/specs/2026-05-12-dispatch-healthcheck.md`. 위반 시 즉시 wave abort + #113 재현 리포트. telepty#18 daemon-side handshake land 후 본 row 완화 검토.
+- [ ] **cwd→role boundary type-encoded (Rule 4 + Rule 32 — #431, ADR 2026-05-12 hybrid (b-2)+(c) wiring landed 2026-05-23)**: `--spawn-and-dispatch --cli claude --role <role>` 사용. dispatch.sh가 자동으로 `bin/boot-prepare.mjs` 경유 → `$HOME/.aigentry/role-sandbox/<role>-<sid>/` 샌드박스 cwd + `--append-system-prompt-file <staged>` (OAuth 호환; `--bare` 아님) + `AIGENTRY_TARGET_CWD` env로 원본 프로젝트 cwd 전달. 워커는 cwd CLAUDE.md auto-discovery 차단 → 위임 역할 외 컨텍스트 오염 차단. claude만 지원 (codex/gemini는 ADR-MF #13 UPSTREAM-GAP 유지). 위반 사례 = `--role` 없이 claude spawn 후 워커가 orchestrator self-id 보이면 즉시 #431 회귀 보고. CHANGELOG 2026-05-23 + ADR 2026-05-12 addendum 참조.
 - [ ] **Snyk Security At Inception (CLAUDE.md global + Rule 32)**: 위임된 코더가 새/수정 first-party 코드 (Snyk-supported language)를 생성하면 DONE 보고 전 `snyk_code_scan` (MCP) 또는 `bin/snyk-scan.sh` (shell)을 호출하고 findings를 fix-rescan 루프로 0건까지 처리하도록 inject에 명시했는가? 설치/auth 절차: `docs/setup/snyk-mcp.md`.
 - [ ] **Dispatch ref 자체완결성 (Rule 32-A-template — #396 #397 fix)**: 새 dispatch ref가 `docs/templates/dispatch-ref-template.md` 스켈레톤 + `docs/templates/dispatch-ref-checklist.md` 통과? `dispatch_kind: fresh-session`이면 인용 Rule/§/[SAWP] envelope 모두 §Inline excerpts에 verbatim + 모든 phase boundary에 `telepty inject`로 보내는 HOLD inject 명시 (markdown 인라인 HOLD ≠ 실제 HOLD)? orchestrator-side path (`state/...` 등) 명시적 disclaimer?
 
@@ -61,6 +62,7 @@
 ## 워크플로우
 
 1. 메시지 분류 → 태스크 등록 → 우선순위 판단
+   - `kind: runtime-addition` 인 task는 §1.2 필드 의무 (`§1.2_question` + `§1.2_answer` — `pending` 허용). 헌법 §1.2 framework-introduction 자기 적용 강제 (architect external review 2026-05-23 amendment #1: rubric/runtime 분리). task-queue.json이 곧 runtime additions tracker.
 2. 위임 시 충분한 스펙 제공 (SPEC FIRST 모드, Rule 24)
 3. 세션 기술 질문은 헌법 기반 자율 판단 → 사용자에게 안 물음
 4. 유휴턴 시 자동으로 다음 태스크 추천
