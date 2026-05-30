@@ -102,7 +102,11 @@ disconnected_sids() {
 
 # close_workspace_for <sid> <session-json>
 # Routes through the Workspace Host adapter seam (bin/lib/workspace-host.sh).
-# Currently 1 adapter active (cmux); headless = no-op. ADR 2026-05-20.
+# Adapters: cmux / warp / headless(no-op). ADR 2026-05-20.
+# Per verdict 2026-05-30 this is the SOLE surface-close path — telepty no longer
+# actuates surface close (it probes liveness + emits surface_orphaned only). The
+# adapter's wh_close is idempotent, so a transient double-close during the
+# telepty-side rollout is harmless (re-probe → already-gone → 0).
 close_workspace_for() {
   local sid="$1" json="$2" host_id
   host_id=$(wh_lookup "$sid" "$json")

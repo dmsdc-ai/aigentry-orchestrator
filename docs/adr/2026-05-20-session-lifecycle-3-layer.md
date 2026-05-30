@@ -75,3 +75,55 @@ R2 + R5a impl landed via the `β1-lifecycle-handoff` dispatch
   short-circuit, reconciler GC root, workspace-host adapter, inject-handler.
   18 TS tests under `tests/session/inject-parser.test.ts`. Snyk: 0 findings
   on new TS.
+
+## Addendum — 2026-05-30 (Workspace Host = single source of truth for surface close + focus; +`warp` adapter, +`wh_focus`)
+
+**Status:** DECIDED + user-ratified. Source:
+[`2026-05-30-surface-ownership-boundary-verdict.md`](./2026-05-30-surface-ownership-boundary-verdict.md).
+The verdict ruled terminal-surface lifecycle (spawn / **close** / **focus** / alive-probe-as-policy-input)
+belongs to the orchestrator's `bin/lib/workspace-host.sh` adapter seam; telepty probes liveness
+read-only, emits `surface_orphaned`, and reclaims its own *sessions*. This addendum extends the
+Workspace Host contract introduced in the 2026-05-23 addendum accordingly.
+
+### `workspace-host.sh` is the SINGLE SOURCE OF TRUTH for surface close + focus
+
+Across **all** backends (cmux / warp / headless / zellij / windows-terminal / ghostty), surface close
+and focus actuation live in `workspace-host.sh` and **nowhere else**. The duplicate
+`cmux close-workspace` that the #30 working-tree diff added to telepty's `terminal-backend.js` is
+removed (verdict §3) — eliminating the double-close on the Layer-A/D path and honoring
+`CONSTITUTION.md:74` (중복 구현 금지 / single source of truth). `_wh_cmux_close`'s
+re-probe-confirms-already-closed idempotency remains the one `cmux close-workspace` implementation.
+
+### NEW: `warp` adapter
+
+Add the Warp auto-manage adapter alongside the existing cmux + headless adapters — four functions
+implementing the same contract as cmux (verdict §4):
+
+- `_wh_warp_lookup()`   — map `sid` → warp surface id (via `telepty list .warpSurfaceId`, or warp CLI)
+- `_wh_warp_close()`    — warp CLI close; idempotent (already-gone → 0); cmd-not-found → 0 (§17 degrade)
+- `_wh_warp_alive()`    — warp CLI liveness probe → 0 alive / 1 gone
+- `_wh_warp_list_ids()` — enumerate warp-known surface ids (host-orphan detection)
+
+Extend `_wh_adapter` selection: `AIGENTRY_WORKSPACE_HOST=warp` force + auto-detect (`command -v warp`).
+Adding a backend touches **one** file in **one** repo — never the telepty daemon — which is the
+structural proof the boundary is correct (verdict §4). *Caveat (verdict §10):* the warp CLI
+surface-close/list/focus verbs are unverified against a real Warp API; if Warp lacks a scriptable
+surface-close, the `headless` no-op fallback covers it (§17) — no correctness regression.
+
+### NEW: `wh_focus` — surface focus contract method
+
+Focus moves wholesale to the orchestrator (verdict §4). Add `wh_focus <host_id>` to the contract,
+with per-adapter `_wh_{cmux,warp,headless}_focus`. The spawner
+(`bin/open-session.sh` / `bin/dispatch.sh`) decides *when* to foreground (an opt-in policy flag) and
+calls `wh_focus`. Wire focus as **spawn-time-foregrounding only, behind an opt-in flag** — the
+codex `Starting MCP servers` unblock hypothesis (ADR 2026-05-29 OQ-4) is **unproven**; do not let an
+unproven trigger justify always-on focus (verdict §4/§10).
+
+### Reconciler consumes `surface_orphaned`
+
+The Reconciler (`bin/session-reconciler.sh`) consumes telepty's new `surface_orphaned` bus event to
+make surface-close event-driven (reacting on the event, not only on its 60s tick), then calls
+`wh_close`. The kill decision stays **corroborated** by multiple signals (PID-dead, disconnect-age,
+`wh_alive`, `surface_orphaned`) plus telepty's probe-side `'unknown'`-on-unreachable gate — two
+independent gates preserve INV-17 / #486 non-regression (verdict §5). `session-cleanup.sh`'s
+`wh_close` is now the **sole** surface-close path.

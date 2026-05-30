@@ -47,6 +47,12 @@ AGE_FLOOR_SECONDS="${RECONCILER_AGE_FLOOR:-300}"
 DISCONNECT_FLOOR_SECONDS="${RECONCILER_DISCONNECT_FLOOR:-240}"
 BACKOFF_INITIAL="${RECONCILER_BACKOFF_INITIAL:-5}"
 BACKOFF_MAX="${RECONCILER_BACKOFF_MAX:-1000}"
+# surface_orphaned event source (verdict 2026-05-30 §5). DORMANT by default:
+# telepty emits surface_orphaned on its WS bus (broadcastSessionEvent), not to a
+# file, so this JSONL does not exist yet — a future bus→file bridge would
+# populate it. Until then the consumer is a no-op and the wh_alive sweep (step 2)
+# is the always-on actuation path. Override the source via env.
+SURFACE_ORPHANED_SRC="${AIGENTRY_SURFACE_ORPHANED_SOURCE:-$STATE_DIR/surface-orphaned.jsonl}"
 
 # shellcheck source=lib/workspace-host.sh
 . "$SCRIPT_DIR/lib/workspace-host.sh"
@@ -196,6 +202,46 @@ print(json.dumps(data, indent=2, ensure_ascii=False))
 PY
 }
 
+# consume_surface_orphaned — event-driven complement to the wh_alive sweep
+# (verdict 2026-05-30 §5). DORMANT until a telepty bus→file bridge populates
+# SURFACE_ORPHANED_SRC; absent file → no-op, so actuation never depends on it.
+# Each JSONL line: {sid, backend, cmuxWorkspaceId, surfaceGoneSeconds, livenessVerdict}.
+# Two INV-17 gates before any close: (1) drop livenessVerdict=='unknown' (telepty
+# already filters these probe-side — never close on indeterminate liveness);
+# (2) corroborate against gc_root/keep_alive (never close a live/protected sid).
+# Requires globals gc_root, keep_alive, DRY_RUN to be set before invocation.
+consume_surface_orphaned() {
+  [ -f "$SURFACE_ORPHANED_SRC" ] || return 0 # dormant: no bridge yet → no-op
+  local processed=0 line sid verdict host_id
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    sid=$(printf '%s' "$line" | jq -r '.sid // empty' 2>/dev/null || true)
+    verdict=$(printf '%s' "$line" | jq -r '.livenessVerdict // empty' 2>/dev/null || true)
+    [ -z "$sid" ] && continue
+    [ "$verdict" = "unknown" ] && continue           # INV-17 gate 1
+    case ",$gc_root,"    in *",$sid,"*) continue;; esac # INV-17 gate 2 (live)
+    case ",$keep_alive," in *",$sid,"*) continue;; esac # INV-17 gate 2 (keep_alive)
+    if [ "$DRY_RUN" -eq 1 ]; then
+      log "SURFACE_ORPHANED would-close sid=$sid verdict=${verdict:-?}"
+      processed=$((processed + 1)); continue
+    fi
+    host_id=$(wh_lookup "$sid")
+    if [ -n "$host_id" ]; then
+      if wh_close "$host_id"; then
+        log "SURFACE_ORPHANED closed sid=$sid host=$host_id"
+      else
+        log "SURFACE_ORPHANED close non-zero sid=$sid host=$host_id"
+      fi
+    fi
+    processed=$((processed + 1))
+  done < "$SURFACE_ORPHANED_SRC"
+  if [ "$DRY_RUN" -eq 0 ] && [ "$processed" -gt 0 ]; then
+    : > "$SURFACE_ORPHANED_SRC" 2>/dev/null || true # drain consumed events
+  fi
+  [ "$processed" -gt 0 ] && log "surface_orphaned consumed=$processed"
+  return 0
+}
+
 DRY_RUN=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -215,6 +261,9 @@ fi
 listing=$(telepty_list_json) || { log "abort sweep — bad telepty list"; exit 0; }
 gc_root=$(compute_gc_root | sort -u | tr '\n' ',' | sed 's/,$//')
 keep_alive=$(keep_alive_sids | sort -u | tr '\n' ',' | sed 's/,$//')
+
+# event-driven surface_orphaned consumer (dormant until a bus→file bridge exists)
+consume_surface_orphaned
 
 candidates=$(printf '%s' "$listing" | LISTING_GC="$gc_root" LISTING_KA="$keep_alive" python3 -c '
 import json,os,sys
@@ -251,10 +300,24 @@ while IFS=$'\t' read -r sid started health last_seen; do
       reasons="${reasons:+$reasons,}disconnected_${disc_age}s"
     fi
   fi
-  # workspace_host_orphan: telepty entry has no host_id mapping AND the host
-  # itself doesn't claim a parent — we treat this as a degenerate case here
-  # and rely on the dead-PID/disconnect signal. Future adapters can extend.
+  # surface_gone (workspace-host probe): the always-on consume of the surface-
+  # orphan signal (verdict 2026-05-30 §5). Look up this sid's host_id and probe
+  # the adapter via wh_alive. A "gone" surface is a CORROBORATING signal only —
+  # see the INV-17 guard below.
+  sid_json=$(printf '%s' "$listing" | jq -c --arg s "$sid" '.[] | select(.id == $s)' 2>/dev/null | head -1 || true)
+  surface_host_id=$(wh_lookup "$sid" "$sid_json")
+  if [ -n "$surface_host_id" ] && ! wh_alive "$surface_host_id"; then
+    reasons="${reasons:+$reasons,}surface_gone"
+  fi
   if [ -z "$reasons" ]; then continue; fi
+  # INV-17 (#486 non-regression): surface_gone ALONE is NEVER sufficient. A
+  # cmux/warp app quit or restart vanishes ALL surfaces at once → every sid
+  # would probe "gone" → mass-kill. Require corroboration by a PID/disconnect
+  # signal; skip when surface_gone is the only reason (no single-signal close).
+  if [ "$reasons" = "surface_gone" ]; then
+    log "INV-17 skip sid=$sid — surface_gone single-signal (no pid/disconnect corroboration)"
+    continue
+  fi
   log "SWEEP candidate sid=$sid age=${age}s health=$health reasons=$reasons"
   if [ "$DRY_RUN" -eq 1 ]; then continue; fi
   if "$CLEANUP_SH" "$sid" >/dev/null 2>&1; then
