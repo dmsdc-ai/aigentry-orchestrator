@@ -4,7 +4,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { TelemetryEvent } from "@aigentry/logger";
+import type { TelemetryEvent } from "@dmsdc-ai/aigentry-logger";
 import {
   emitDispatchEvent,
   emitLifecycleEvent,

@@ -1,4 +1,4 @@
-// Thin wrapper around @aigentry/logger.emit() with orchestrator-flavoured
+// Thin wrapper around @dmsdc-ai/aigentry-logger.emit() with orchestrator-flavoured
 // discovery, schema mapping, and non-blocking failure semantics.
 //
 // Decisions consumed (δ2 Phase 1 ACK, #440):
@@ -15,8 +15,8 @@
 // Failure mode: logger unreachable → console.error fallback. The primary
 // code path MUST NOT block on telemetry failure (§9 독립).
 
-import type { TelemetryEvent } from "@aigentry/logger";
-import { emit as loggerEmit } from "@aigentry/logger";
+import type { TelemetryEvent } from "@dmsdc-ai/aigentry-logger";
+import { emit as loggerEmit } from "@dmsdc-ai/aigentry-logger";
 
 const VALID_ROLES = new Set([
   "orchestrator",

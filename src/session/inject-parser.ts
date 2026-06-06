@@ -24,7 +24,7 @@ import {
   type Hold,
   type Report,
   type TestReport,
-} from "@aigentry/ssot";
+} from "@dmsdc-ai/aigentry-ssot";
 
 export interface ExtendLifetimePayload {
   target: string;
