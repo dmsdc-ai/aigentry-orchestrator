@@ -11,6 +11,8 @@ from typing import Any
 
 
 ACTIVE_STATUSES = {"", "in_flight", "re_dispatched", "stuck_welcome"}
+VERIFY_STATUS = "verify_started"
+TRACKER_STATUS = "tracker_check"
 SURFACE_UNKNOWN = "unknown"
 AGE_FLOOR_SECONDS = 300
 DISCONNECT_FLOOR_SECONDS = 240
@@ -113,6 +115,25 @@ def decide(status: str, state: dict[str, Any]) -> dict[str, str]:
         return action("ESCALATE", f"probe failed: {d.get('probe_error')}", status)
     if surface == SURFACE_UNKNOWN:
         return action("ESCALATE", "ambiguous SessionState surface=unknown", status)
+
+    if status == VERIFY_STATUS:
+        if d.get("verify_started") is True:
+            return action("NOOP", "session verified started-working", "verified")
+        if surface == "thinking_block":
+            return action("RESPAWN", "thinking-block / invalid request", status)
+        if surface in {"unsubmitted", "idle", "welcome", "modal", "sandbox_prompt"}:
+            return action("RESUBMIT_ENTER", "not-moving startup surface", status, key="enter")
+        return action("ESCALATE", "session did not verify started-working", status)
+
+    if status == TRACKER_STATUS:
+        cls = str(d.get("tracker_class") or "blank")
+        if cls == "error":
+            return action("ESCALATE", "tracker legacy class=error", "stuck_error")
+        if cls == "welcome":
+            return action("REDISPATCH", "tracker legacy class=welcome", "stuck_welcome")
+        if cls == "active":
+            return action("NOOP", "tracker legacy class=active", "in_flight")
+        return action("NOOP", f"tracker legacy class={cls}; auto-report candidate", "in_flight")
 
     allow_cleanup, cleanup_reason = cleanup_allowed(state)
     if allow_cleanup:

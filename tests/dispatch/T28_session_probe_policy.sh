@@ -55,6 +55,31 @@ for case in cases:
     )
     assert_subset(f"{case['name']} action", decided, case["expect_action"])
 
+    verify_action = run_json(
+        [policy, "--status", "verify_started", "--state", "-"],
+        stdin=json.dumps(state),
+    )
+    if case["name"] in {"codex-init-spinner", "working-spinner"}:
+        assert_subset(f"{case['name']} verify", verify_action, {"action": "NOOP", "status": "verified"})
+    elif case["name"] == "unsubmitted-context-ref":
+        assert_subset(
+            f"{case['name']} verify",
+            verify_action,
+            {"action": "RESUBMIT_ENTER", "status": "verify_started", "key": "enter"},
+        )
+
+    tracker_action = run_json(
+        [policy, "--status", "tracker_check", "--state", "-"],
+        stdin=json.dumps(state),
+    )
+    cls = state["detail"]["tracker_class"]
+    if cls == "welcome":
+        assert_subset(f"{case['name']} tracker", tracker_action, {"action": "REDISPATCH", "status": "stuck_welcome"})
+    elif cls == "error":
+        assert_subset(f"{case['name']} tracker", tracker_action, {"action": "ESCALATE", "status": "stuck_error"})
+    else:
+        assert_subset(f"{case['name']} tracker", tracker_action, {"action": "NOOP"})
+
 
 def decide(state, status="orphaned"):
     return run_json([policy, "--status", status, "--state", "-"], stdin=json.dumps(state))
