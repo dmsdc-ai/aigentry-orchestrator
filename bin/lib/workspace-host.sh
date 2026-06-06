@@ -39,6 +39,20 @@
 #       mechanism is unavailable (§17).
 #       Exit: 0 (focused or gracefully degraded).
 #
+# Additive sidebar-keeping methods (SPEC 2026-06-06-cmux-adaptor-prune-status;
+# every adapter implements them — cmux acts, warp/headless no-op per §17):
+#
+#   wh_prune_orphans <live_ids_csv> <protected_refs_csv>
+#       Close host workspaces whose session vanished from <live_ids_csv>, gated by
+#       ownership + a seen-twice debounce ledger (SPEC §A). Prints count closed.
+#       Exit: 0 (best-effort; never blocks the sweep).
+#
+#   wh_set_status <host_id> <state>     # state ∈ {working,idle,disconnected}
+#       Push session state to the host sidebar pill (SPEC §B). Exit: 0 (always).
+#
+#   wh_clear_status <host_id>
+#       Remove the aigentry status pill. Idempotent. Exit: 0 (always).
+#
 # Constitution §17 (무의존): every adapter degrades gracefully when its
 # underlying tool is missing (e.g., cmux not installed → headless behavior).
 
@@ -47,6 +61,10 @@ if [ "${WORKSPACE_HOST_SH_LOADED:-0}" = "1" ]; then
   return 0
 fi
 WORKSPACE_HOST_SH_LOADED=1
+
+# _wh_log <msg> — best-effort stderr line with the standard prefix. The reconciler
+# tees its own `log`; the adapter only emits to stderr so it never blocks a sweep.
+_wh_log() { echo "[workspace-host] $*" >&2; }
 
 # -----------------------------------------------------------------------------
 # cmux adapter
@@ -77,20 +95,126 @@ _wh_cmux_close() {
 }
 
 _wh_cmux_alive() {
-  local host_id="$1"
+  # F9 fix: liveness via `sidebar-state` (the only per-handle probe). The handle
+  # may be a UUID (cmuxWorkspaceId from telepty) or a ref (workspace:N); cmux
+  # accepts <id|ref|index>. Judge by STDOUT content, not exit code (F7): a missing
+  # tab prints an "Error:" line, so alive iff stdout is non-empty AND not an Error.
+  local host_id="$1" out
   [ -z "$host_id" ] && return 1
   command -v cmux >/dev/null 2>&1 || return 1
-  if cmux list-workspaces --json 2>/dev/null \
-       | jq -e --arg id "$host_id" '.[] | select(.id == $id)' >/dev/null 2>&1; then
-    return 0
-  fi
-  return 1
+  out=$(cmux sidebar-state --workspace "$host_id" 2>/dev/null)
+  [ -z "$out" ] && return 1
+  case "$out" in
+    Error:*) return 1 ;;
+  esac
+  return 0
 }
 
 _wh_cmux_list_ids() {
+  # F9 fix: the workspace listing carries NO UUID field (F3); `ref` (workspace:N)
+  # is the stable per-workspace handle. wh_list_ids semantics are unchanged for
+  # callers ("host_ids the adapter knows" = refs). Correct shape: `--json` is a
+  # GLOBAL flag before the command (F2), and the array lives under `.workspaces`.
   command -v cmux >/dev/null 2>&1 || return 0
-  cmux list-workspaces --json 2>/dev/null \
-    | jq -r '.[].id // empty' 2>/dev/null || true
+  cmux --json list-workspaces 2>/dev/null \
+    | jq -r '.workspaces[].ref // empty' 2>/dev/null || true
+}
+
+# _wh_cmux_list_titles — emit one `ref<TAB>title<TAB>current_directory` row per
+# workspace (F2/F3 correct shape). Title is the session-correlation key (F4);
+# current_directory is the ownership signal (F5).
+_wh_cmux_list_titles() {
+  command -v cmux >/dev/null 2>&1 || return 0
+  cmux --json list-workspaces 2>/dev/null \
+    | jq -r '.workspaces[] | [.ref, .title, .current_directory] | @tsv' 2>/dev/null || true
+}
+
+# _wh_cmux_set_status <host_id> <state> — map an aigentry session state to the
+# cmux sidebar pill under the DISTINCT key `aigentry` (F8: never clobber
+# claude_code's own `claude_code` pill). Best-effort; always returns 0 (§17).
+_wh_cmux_set_status() {
+  local host_id="$1" state="$2" icon color
+  [ -z "$host_id" ] && return 0
+  command -v cmux >/dev/null 2>&1 || return 0
+  case "$state" in
+    working)      icon=hammer;          color="#ff9500" ;;
+    idle)         icon=checkmark;       color="#34c759" ;;
+    disconnected) icon=exclamationmark; color="#ff3b30" ;;
+    *) return 0 ;; # unknown state — no-op (never emit a speculative pill)
+  esac
+  cmux set-status aigentry "$state" --icon "$icon" --color "$color" \
+    --workspace "$host_id" >/dev/null 2>&1 || true
+  return 0
+}
+
+# _wh_cmux_clear_status <host_id> — remove the `aigentry` pill. Idempotent; 0.
+_wh_cmux_clear_status() {
+  local host_id="$1"
+  [ -z "$host_id" ] && return 0
+  command -v cmux >/dev/null 2>&1 || return 0
+  cmux clear-status aigentry --workspace "$host_id" >/dev/null 2>&1 || true
+  return 0
+}
+
+# _wh_cmux_prune_orphans <live_ids_csv> <protected_refs_csv> — close cmux
+# workspaces whose session has vanished from the live set, gated per SPEC §2:
+#   orphan := title ∉ live_ids  AND  owned(W)  AND  ref ∉ protected_refs
+#   owned(W) := current_directory under $AIGENTRY_ROLE_SANDBOX_DIR (F5).
+# Two guards before any close (INV-17 style):
+#   1. caller-supplied live_ids / protected_refs corroboration;
+#   2. seen-twice debounce — a candidate is closed only if it was ALSO a candidate
+#      on the previous tick (persisted in the ledger), giving a freshly-spawned
+#      workspace ≥1 reconcile cycle to register with telepty (replaces the missing
+#      creation timestamp, F3).
+# Honors DRY_RUN (log-only, never closes). Prints the count closed; always 0.
+_wh_cmux_prune_orphans() {
+  local live_csv="$1" protected_csv="$2"
+  command -v cmux >/dev/null 2>&1 || { echo 0; return 0; }
+  local sandbox="${AIGENTRY_ROLE_SANDBOX_DIR:-$HOME/.aigentry/role-sandbox}"
+  local ledger="${AIGENTRY_CMUX_ORPHAN_LEDGER:-${TMPDIR:-/tmp}/aigentry-cmux-orphan-ledger.json}"
+  local dry="${DRY_RUN:-0}"
+  local old_ledger now new_ledger closed=0 ref title cwd
+  old_ledger=$(cat "$ledger" 2>/dev/null || echo '{}')
+  printf '%s' "$old_ledger" | jq -e . >/dev/null 2>&1 || old_ledger='{}'
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")
+  new_ledger='{}'
+  while IFS=$'\t' read -r ref title cwd; do
+    [ -z "$ref" ] && continue
+    [ -z "$title" ] && continue
+    # live corroboration — never prune a live session's workspace.
+    case ",$live_csv," in *",$title,"*) continue;; esac
+    # protected refs (orchestrator) — never prune.
+    case ",$protected_csv," in *",$ref,"*) continue;; esac
+    # ownership gate (F5) — only aigentry-spawned role-sandbox workspaces.
+    case "$cwd" in "$sandbox"/*|"$sandbox") ;; *) continue;; esac
+    # ── candidate confirmed ── apply the seen-twice debounce via the ledger.
+    if printf '%s' "$old_ledger" | jq -e --arg r "$ref" 'has($r)' >/dev/null 2>&1; then
+      # seen on a previous tick → eligible to close.
+      if [ "$dry" = "1" ]; then
+        _wh_log "PRUNE would-close ref=$ref title=$title"
+        # dry-run never advances the ledger past recording → carry the entry.
+        new_ledger=$(printf '%s' "$new_ledger" | jq --arg r "$ref" --arg t "$now" '.[$r]=$t')
+        continue
+      fi
+      if _wh_cmux_close "$ref"; then
+        _wh_log "PRUNE closed ref=$ref title=$title"
+        closed=$((closed + 1))
+        # successfully closed → drop from ledger (do NOT carry forward).
+      else
+        _wh_log "PRUNE close-failed ref=$ref title=$title"
+        # carry forward so it retries next tick.
+        new_ledger=$(printf '%s' "$new_ledger" | jq --arg r "$ref" --arg t "$now" '.[$r]=$t')
+      fi
+    else
+      # first sighting → record + skip (debounce floor).
+      new_ledger=$(printf '%s' "$new_ledger" | jq --arg r "$ref" --arg t "$now" '.[$r]=$t')
+    fi
+  done <<EOF
+$(_wh_cmux_list_titles)
+EOF
+  printf '%s\n' "$new_ledger" > "$ledger" 2>/dev/null || true
+  echo "$closed"
+  return 0
 }
 
 _wh_cmux_focus() {
@@ -262,14 +386,22 @@ _wh_warp_focus() {
   return 0
 }
 
+# Warp has no status/listing CLI → prune/status degrade to no-ops (§17).
+_wh_warp_prune_orphans() { echo 0; return 0; }
+_wh_warp_set_status()    { return 0; }
+_wh_warp_clear_status()  { return 0; }
+
 # -----------------------------------------------------------------------------
 # headless adapter (no-op — for CI/docker/windows-terminal/zellij stubs)
 # -----------------------------------------------------------------------------
-_wh_headless_lookup()   { echo ""; }
-_wh_headless_close()    { return 0; }
-_wh_headless_alive()    { return 1; }
-_wh_headless_list_ids() { :; }
-_wh_headless_focus()    { return 0; }
+_wh_headless_lookup()        { echo ""; }
+_wh_headless_close()         { return 0; }
+_wh_headless_alive()         { return 1; }
+_wh_headless_list_ids()      { :; }
+_wh_headless_focus()         { return 0; }
+_wh_headless_prune_orphans() { echo 0; return 0; }
+_wh_headless_set_status()    { return 0; }
+_wh_headless_clear_status()  { return 0; }
 
 # -----------------------------------------------------------------------------
 # dispatcher — selects adapter then forwards
@@ -312,6 +444,26 @@ wh_list_ids() {
 wh_focus() {
   local adapter; adapter=$(_wh_adapter)
   "_wh_${adapter}_focus" "$@"
+}
+
+# wh_prune_orphans <live_ids_csv> <protected_refs_csv> — close host workspaces
+# whose session has vanished, gated (SPEC §A). Prints count closed; always 0.
+wh_prune_orphans() {
+  local adapter; adapter=$(_wh_adapter)
+  "_wh_${adapter}_prune_orphans" "$@"
+}
+
+# wh_set_status <host_id> <state> — push session state to the host sidebar
+# (SPEC §B). state ∈ {working,idle,disconnected}. Best-effort; always 0.
+wh_set_status() {
+  local adapter; adapter=$(_wh_adapter)
+  "_wh_${adapter}_set_status" "$@"
+}
+
+# wh_clear_status <host_id> — remove the aigentry status pill. Idempotent; 0.
+wh_clear_status() {
+  local adapter; adapter=$(_wh_adapter)
+  "_wh_${adapter}_clear_status" "$@"
 }
 
 # Convenience composite: lookup + close for a sid in one call.

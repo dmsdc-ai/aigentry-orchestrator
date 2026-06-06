@@ -28,6 +28,11 @@
 #   session-reconciler.sh --dry-run # report what would happen, don't act
 #   session-reconciler.sh --shadow  # observe+decide only; append shadow JSONL
 #   session-reconciler.sh --once    # alias for default
+#   session-reconciler.sh --loop    # long-lived daemon: re-exec `--once` every
+#                                    #   RECONCILER_LOOP_INTERVAL (default 60s).
+#                                    #   For launchd KeepAlive (survives sleep,
+#                                    #   unlike StartInterval which does not re-arm
+#                                    #   after battery/clamshell maintenance-sleep).
 #   session-reconciler.sh --help
 
 set -euo pipefail
@@ -39,6 +44,9 @@ STATE_DIR="${DISPATCH_STATE_DIR:-$REPO_DIR/state/dispatch}"
 ACTIVE_JSON="$STATE_DIR/active.json"
 BACKOFF_JSON="$STATE_DIR/reconciler-backoff.json"
 RECONCILER_LOG="$STATE_DIR/reconciler.log"
+# cmux orphan-prune seen-twice ledger (SPEC §2.2). Exported so the workspace-host
+# adapter persists it under dispatch state rather than the /tmp default.
+export AIGENTRY_CMUX_ORPHAN_LEDGER="${AIGENTRY_CMUX_ORPHAN_LEDGER:-$STATE_DIR/cmux-orphan-ledger.json}"
 SCHEDULER_SH="${SCHEDULER_SH:-$SCRIPT_DIR/dispatch-cleanup-scheduler.sh}"
 CLEANUP_SH="${CLEANUP_SH:-$SCRIPT_DIR/session-cleanup.sh}"
 DISPATCH_SH="${DISPATCH_SH:-$SCRIPT_DIR/dispatch.sh}"
@@ -541,15 +549,29 @@ consume_surface_mismatched() {
 
 DRY_RUN=0
 SHADOW=0
+LOOP=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift;;
     --shadow)  SHADOW=1; shift;;
+    --loop)    LOOP=1; shift;;
     --once)    shift;;
     -h|--help) usage 0;;
     *) echo "unknown: $1" >&2; usage 4;;
   esac
 done
+
+# --loop: long-lived KeepAlive daemon. Re-exec a fresh `--once` tick every
+# interval (fresh process per tick → no in-process state leak). A crashing tick
+# never kills the loop (|| log); if the loop process itself dies, launchd
+# KeepAlive relaunches it. This is what makes the reconciler survive system sleep.
+if [ "$LOOP" -eq 1 ]; then
+  log "loop mode start interval=${RECONCILER_LOOP_INTERVAL:-60}s pid=$$"
+  while :; do
+    "$0" --once || log "ERR loop tick non-zero (continuing)"
+    sleep "${RECONCILER_LOOP_INTERVAL:-60}"
+  done
+fi
 
 if [ "$SHADOW" -eq 1 ]; then
   run_shadow_loop
@@ -657,4 +679,33 @@ PY
   swept=$((swept + 1))
 done <<< "$candidates"
 
-log "tick: gc_root=[$gc_root] keep_alive=[$keep_alive] swept=$swept dry_run=$DRY_RUN"
+# --- step 2b: cmux-adaptor sidebar keeping (SPEC 2026-06-06) ---
+# Best-effort, never blocks the sweep (wh_* always return 0). Honors DRY_RUN via
+# the exported flag (wh_prune_orphans reads $DRY_RUN; status push is skipped here).
+#
+# §A prune — live_ids = telepty ids ∪ gc_root ∪ keep_alive (titles are sids, F4);
+# protected_refs = the orchestrator's own workspace ref when known ($CMUX_WORKSPACE_ID;
+# empty under launchd — the ownership gate already protects the orchestrator, whose
+# cwd is the repo dir, not the role-sandbox). DRY_RUN is honored inside the adapter.
+telepty_ids=$(printf '%s' "$listing" | jq -r '.[].id // empty' 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//')
+live_ids=$(printf '%s,%s,%s' "$telepty_ids" "$gc_root" "$keep_alive" | tr ',' '\n' | sed '/^$/d' | sort -u | tr '\n' ',' | sed 's/,$//')
+protected_refs="${CMUX_WORKSPACE_ID:-}"
+# DRY_RUN is visible to the adapter via the inherited shell var (read as $DRY_RUN).
+pruned=$(wh_prune_orphans "$live_ids" "$protected_refs" 2>/dev/null || echo 0)
+
+# §B status push — one sidebar pill per live telepty session. Conservative default
+# (orchestrator decision 3): CONNECTED→idle, DISCONNECTED→disconnected; never emit
+# a false "working" (no richer activity signal wired this phase — Article 1).
+status_pushed=0
+if [ "$DRY_RUN" -eq 0 ]; then
+  while IFS=$'\t' read -r host_id health; do
+    [ -z "$host_id" ] && continue
+    case "$health" in
+      DISCONNECTED) wh_set_status "$host_id" disconnected ;;
+      CONNECTED|*)  wh_set_status "$host_id" idle ;;
+    esac
+    status_pushed=$((status_pushed + 1))
+  done < <(printf '%s' "$listing" | jq -r '.[] | select(.cmuxWorkspaceId != null and .cmuxWorkspaceId != "") | [.cmuxWorkspaceId, (.healthStatus // .status // "")] | @tsv' 2>/dev/null)
+fi
+
+log "tick: gc_root=[$gc_root] keep_alive=[$keep_alive] swept=$swept pruned=${pruned:-0} status_pushed=$status_pushed dry_run=$DRY_RUN"
