@@ -20,6 +20,13 @@
 # Ready detection: per-CLI prompt-symbol probe of `telepty read-screen` plus
 # welcome/boot banner absence (claude ❯ / codex › / gemini ›|│ >).
 #
+# Post-dispatch START verification (Rule 33, default ON): after a successful
+#   inject, dispatch-verify.sh confirms the session actually STARTED WORKING as
+#   intended (CONNECTED + ready + clean surface + activity) — not just that the
+#   inject landed. A SUSPECT verdict is printed loudly but is non-fatal (the
+#   inject did land); resolve the surface before treating the worker as started.
+#   Opt out with --no-verify-started.
+#
 # Exit codes: 0 OK, 1 timeout, 2 spawn failed, 3 inject failed, 4 usage,
 #             5 --verify-delivered detected delivery failure.
 set -euo pipefail
@@ -29,6 +36,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 TRACKER_SH="$SCRIPT_DIR/dispatch-tracker.sh"
+VERIFY_SH="$SCRIPT_DIR/dispatch-verify.sh"
 TELEPTY="${TELEPTY:-telepty}"
 EMIT_TELEMETRY_MJS="${EMIT_TELEMETRY_MJS:-$SCRIPT_DIR/emit-telemetry.mjs}"
 
@@ -45,6 +53,7 @@ usage() { sed -n '2,24p' "$0"; }
 target=""; ref_file=""; from_id=""; timeout_ms=30000
 spawn=0; track=""; name=""; cwd=""; cli="claude"
 verify_delivered=0
+verify_started=1  # Rule 33: confirm session actually started working post-inject. --no-verify-started to skip.
 role=""  # #431: when set + cli=claude, enables boot-adapter wiring (--bare + --system-prompt-file)
 keep_alive=0  # ADR 2026-05-20 Layer A opt-out — worker won't emit CLEANUP_REQUEST.
 
@@ -61,6 +70,7 @@ while [ $# -gt 0 ]; do
     --cli) cli="$2"; shift 2;;
     --role) role="$2"; shift 2;;
     --verify-delivered) verify_delivered=1; shift;;
+    --no-verify-started) verify_started=0; shift;;
     --keep-alive) keep_alive=1; shift;;
     -h|--help) usage; exit 0;;
     *) echo "dispatch.sh: unknown arg: $1" >&2; usage >&2; exit 4;;
@@ -300,4 +310,21 @@ emit_telemetry --helper dispatch --subtype dispatch_ack \
   --payload-json "$(printf '{"target_sid":"%s","verified":%s}' "$sid" "$([ "$verify_delivered" -eq 1 ] && echo true || echo false)")" \
   --correlation-id "$sid"
 echo "OK dispatched to $sid"
+
+# Rule 33: post-dispatch START verification (default ON; non-fatal — the inject
+# already landed). SUSPECT means "delivered but not started as intended"; the
+# orchestrator must resolve the surface (read-screen / answer modal / respawn).
+if [ "$verify_started" -eq 1 ] && [ -x "$VERIFY_SH" ]; then
+  # --resubmit: auto-recover the #412 codex submit race (Enter not registered →
+  # inject sits unsubmitted) by re-sending Enter once when the only fault is idle.
+  if TELEPTY="$TELEPTY" "$VERIFY_SH" "$sid" --resubmit; then
+    started=true
+  else
+    started=false
+    echo "dispatch.sh: ⚠️ Rule 33 — $sid did NOT verify as started-working (see SUSPECT above). Resolve before relying on the worker." >&2
+  fi
+  emit_telemetry --helper dispatch --subtype dispatch_started_check \
+    --payload-json "$(printf '{"target_sid":"%s","started":%s}' "$sid" "$started")" \
+    --correlation-id "$sid"
+fi
 exit 0

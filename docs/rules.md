@@ -483,3 +483,37 @@ Memory: `feedback_session_cleanup_protocol.md`.
 - 모든 식별된 운영 이슈는 GitHub issue 또는 Task queue에 tracked
 - 모든 GitHub issue / Task는 fix 완료 시 close
 - Memory: `~/.claude/projects/-Users-duckyoungkim-projects/memory/feedback_permanent_fix_only.md`
+
+### Rule 33. Post-Dispatch Session-Start Verification (HARD RULE)
+
+**telepty로 위임(dispatch/inject)한 직후, 세션이 *의도대로 정상 시작·작동 중*인지 항상 검증한다.** 발단: 2026-06-06. 오케스트레이터가 cambrian dispatch 후 garbled read-screen + 워커가 출력한 plan 한 번 보고 "세션 시작됨"으로 판단하고 넘어감 — 세션 health/ready/error surface를 실제로 확인 안 함. 사용자 정정: "telepty로 위임하고 나면 정상적으로 세션이 의도대로 시작되었는지 항상 검증을 해야돼."
+
+**Why:** `delivered ≠ started-working`. inject가 도착해도(=`dispatch.sh --verify-delivered` 통과) 세션은 trust-folder modal / API-error 배너 / codex sandbox 승인 프롬프트 / raw shell prompt / crash 에 멈춰 있을 수 있다. "화면이 뭔가 떴고 plan을 출력했으니 시작됐겠지"는 **추측**(Rule 22/25 위반) — 검증이 아니다. 검증 없이 넘어가면 워커가 실제로는 안 움직이는데 오케스트레이터는 진행 중이라 믿고 시간을 버린다.
+
+#### What "started as intended" means (3 signal, 2-probe)
+1. **ALIVE** — transport `healthStatus=CONNECTED` + `ready=true` + `bootstrap.ready` (살아있고 boot 통과)
+2. **CLEAN** — stuck/error surface 없음 (trust modal / API error / thinking-block #502 / crash·traceback / codex sandbox 승인 / CLI exit 후 raw shell)
+3. **MOVING** — 실제로 진행 중 (working spinner 표시, 또는 두 probe 사이 화면 churn / `lastActivityAt` 전진)
+
+#### Mandatory
+- **모든 dispatch 후 검증 의무.** `bin/dispatch.sh`는 inject 성공 후 자동으로 `bin/dispatch-verify.sh <sid>`를 호출 (default ON, `--no-verify-started`로만 opt-out). raw `telepty inject`(허용된 예외: 1라인 ack / send-key / broadcast 외 task-bearing inject)를 쓴 경우 **수동으로 `bin/dispatch-verify.sh <sid>` 호출**.
+- **SUSPECT verdict = non-fatal but blocking-attention.** inject는 도착했으므로 dispatch 자체는 실패 아님. 그러나 SUSPECT면 워커를 "시작됨"으로 취급 금지 — surface를 먼저 해소 (`telepty read-screen` → modal 응답 / 재inject / respawn). thinking-block #502는 inject 복구 불가 → 즉시 cleanup+respawn (nudge 금지).
+- **추측으로 PASS 선언 금지.** garbled 화면 + plan echo만 보고 started 판단 = Rule 33 위반.
+
+#### What this rule rejects
+- "read-screen에 뭔가 떴으니 시작됨" — 추측, 검증 아님
+- "plan을 출력했으니 working" — plan echo ≠ moving (다음 turn에 modal/error로 멈출 수 있음)
+- "`--verify-delivered` 통과했으니 됐음" — delivered ≠ started-working
+- dispatch 후 verify 없이 다음 작업으로 진행 — 의무 위반
+
+#### Cross-references
+- Rule 22 (가설 생성 금지) / Rule 25 (추측 패치 금지): "시작됐겠지"는 추측. Rule 33은 dispatch 차원의 evidence-first.
+- Rule 30 (Operational Autonomy): SUSPECT가 codex sandbox / modal이면 자율 해소 (사용자 escalation X).
+- Rule 32 (Permanent Fix Only): 본 rule 자체가 32의 instance — 검증 누락을 helper(`dispatch-verify.sh`) + auto-wire(`dispatch.sh`) + hook으로 영구 enforcement.
+- `bin/dispatch.sh --verify-delivered` (delivery layer) ↔ `bin/dispatch-verify.sh` (started-working layer) — 보완 관계.
+
+#### Acceptance criteria
+- 모든 task-bearing dispatch/inject 후 verify 호출 (auto via dispatch.sh, 또는 수동)
+- SUSPECT 시 surface 해소 전 "워커 진행 중" 발화 금지
+- Hook: `.claude/settings.json` PostToolUse/Bash가 dispatch/inject 감지 시 verify 리마인더 emit
+- Memory: `~/.claude/projects/-Users-duckyoungkim-projects-aigentry-orchestrator/memory/feedback_post_dispatch_verify.md`
