@@ -34,6 +34,8 @@ TRACKER_SID="${TRACKER_FROM_SID:-dispatch-tracker}"
 TELEPTY="${TELEPTY:-telepty}"
 GIT="${GIT:-git}"
 DISPATCH_SH="${DISPATCH_SH:-$SCRIPT_DIR/dispatch.sh}"
+SESSION_PROBE_PY="${SESSION_PROBE_PY:-$SCRIPT_DIR/session-probe.py}"
+POLICY_PY="${POLICY_PY:-$SCRIPT_DIR/policy.py}"
 NOW_OVERRIDE="${TRACKER_NOW:-}"
 
 mkdir -p "$STATE_DIR"
@@ -73,34 +75,44 @@ except Exception:
 PY
 }
 
-# --- classify: print one of: error welcome active done blank. Screen via $SCREEN env. ---
-classify_screen() {
-  SCREEN="${1:-}" python3 - <<'PY'
-import os, sys, re
-text = os.environ.get("SCREEN", "")
-lines = [l.rstrip() for l in text.splitlines() if l.strip()]
-if not lines:
-    print("blank"); sys.exit(0)
-tail = "\n".join(lines[-20:])
-last3 = "\n".join(lines[-3:])
+probe_from_screen() {
+  local sid="$1" screen="$2" tmp state
+  tmp=$(mktemp)
+  printf '%s' "$screen" > "$tmp"
+  state=$(TELEPTY="$TELEPTY" "$SESSION_PROBE_PY" --sid "$sid" --screen-file "$tmp" 2>/dev/null || true)
+  rm -f "$tmp"
+  if [ -z "$state" ]; then
+    printf '%s\n' '{"alive":false,"ready":false,"surface":"unknown","activity":"static","cli":"unknown","detail":{"probe_error":"session-probe failed","tracker_class":"blank"}}'
+  else
+    printf '%s\n' "$state"
+  fi
+}
 
-ERR = r"(?i)error:|traceback|panic:|command not found|killed:|exited [0-9]+"
-WELCOME = r"Welcome back|Tips for getting started|Trust this folder|Press Enter to continue"
-BRAILLE = "\u280B\u2819\u2839\u2838\u283C\u2834\u2826\u2827\u2807\u280F"
-ACTIVE_TEXT = r"\(esc to interrupt\)|thinking with xhigh effort|⏵\s*\d+s"
+policy_for_tracker() {
+  local state_json="$1"
+  printf '%s\n' "$state_json" | "$POLICY_PY" --status tracker_check --state - 2>/dev/null || \
+    printf '%s\n' '{"action":"ESCALATE","reason":"policy failed","status":"stuck_error"}'
+}
 
-if re.search(ERR, tail):
-    print("error"); sys.exit(0)
-welcome_in_tail = re.search(WELCOME, tail)
-prompt_in_last3 = re.search(r"^[❯›]", last3, flags=re.MULTILINE) or ("❯" in last3) or ("›" in last3)
-placeholder = re.search(r'[❯›]\s+Try "[^"]+"', last3)
-if welcome_in_tail and (placeholder or prompt_in_last3):
-    print("welcome"); sys.exit(0)
-if any(g in tail for g in BRAILLE) or re.search(ACTIVE_TEXT, tail):
-    print("active"); sys.exit(0)
-if prompt_in_last3:
-    print("done"); sys.exit(0)
-print("blank")
+json_get() {
+  local json_text="$1" expr="$2"
+  JSON_TEXT="$json_text" EXPR="$expr" python3 - <<'PY'
+import json, os
+
+try:
+    data = json.loads(os.environ.get("JSON_TEXT", "") or "{}")
+except Exception:
+    data = {}
+cur = data
+for part in os.environ.get("EXPR", "").split("."):
+    if not part:
+        continue
+    if isinstance(cur, dict):
+        cur = cur.get(part, "")
+    else:
+        cur = ""
+        break
+print(cur if cur is not None else "")
 PY
 }
 
@@ -227,25 +239,30 @@ for e in entries:
 "
       continue
     fi
-    local screen class
+    local screen state_json action_json class action status
     screen=$(read_screen "$sid" 60)
-    class=$(classify_screen "$screen")
+    state_json=$(probe_from_screen "$sid" "$screen")
+    action_json=$(policy_for_tracker "$state_json")
+    class=$(json_get "$state_json" detail.tracker_class)
+    [ -n "$class" ] || class=blank
+    action=$(json_get "$action_json" action)
+    status=$(json_get "$action_json" status)
     _record_classification "$sid" "$class"
 
-    case "$class" in
-      error)   emit_alert "STUCK_ERROR sid=$sid"; _set_status "$sid" stuck_error;;
-      welcome)
+    if [ "$status" = "stuck_error" ]; then
+      emit_alert "STUCK_ERROR sid=$sid"
+      _set_status "$sid" stuck_error
+    elif [ "$action" = "REDISPATCH" ] && [ "$status" = "stuck_welcome" ]; then
         emit_alert "STUCK_WELCOME sid=$sid"
         _set_status "$sid" stuck_welcome
         _maybe_redispatch "$sid" "$cwd" "$ref_path" "$dispatched_at" "$rdc"
-        ;;
-      active)  _bump_expected "$sid";;
-      done|blank)
-        if ! _git_check_and_autoreport "$sid" "$cwd" "$ref_path" "$dispatched_at" "$screen"; then
-          : # no new commits → leave entry; alert already emitted by helper if applicable
-        fi
-        ;;
-    esac
+    elif [ "$class" = "active" ]; then
+      _bump_expected "$sid"
+    else
+      if ! _git_check_and_autoreport "$sid" "$cwd" "$ref_path" "$dispatched_at" "$screen"; then
+        : # no new commits → leave entry; alert already emitted by helper if applicable
+      fi
+    fi
   done < "$snap"
   rm -f "$snap"
   echo "tracker check: $processed entries processed"
