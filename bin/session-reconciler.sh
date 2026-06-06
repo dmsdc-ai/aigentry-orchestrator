@@ -53,6 +53,15 @@ BACKOFF_MAX="${RECONCILER_BACKOFF_MAX:-1000}"
 # populate it. Until then the consumer is a no-op and the wh_alive sweep (step 2)
 # is the always-on actuation path. Override the source via env.
 SURFACE_ORPHANED_SRC="${AIGENTRY_SURFACE_ORPHANED_SOURCE:-$STATE_DIR/surface-orphaned.jsonl}"
+# surface_mismatched event source (task #507, verdict 2026-05-30 §4 focus-actuation
+# = orchestrator). DORMANT by default, same as surface_orphaned: telepty (probe+
+# signal owner) will emit `surface_mismatched` on its WS bus when a session's bound
+# surface is ALIVE but foregrounding a PTY ≠ session.ptyPid (stray shell after cmux
+# restart/surface reassign — the codex-on-ttysNNN vs workspace-shows-ttysMMM case).
+# A future bus→file bridge populates this JSONL; until then the consumer is a no-op.
+# Event contract (one JSONL object per line):
+#   {sid, backend, cmuxWorkspaceId, expectedPtyPid, observedSurface, mismatchSeconds}
+SURFACE_MISMATCHED_SRC="${AIGENTRY_SURFACE_MISMATCHED_SOURCE:-$STATE_DIR/surface-mismatched.jsonl}"
 
 # shellcheck source=lib/workspace-host.sh
 . "$SCRIPT_DIR/lib/workspace-host.sh"
@@ -242,6 +251,47 @@ consume_surface_orphaned() {
   return 0
 }
 
+# consume_surface_mismatched — re-bind a live session's workspace onto its real PTY
+# surface when telepty signals the surface is ALIVE-but-mismatched (task #507).
+# Verdict 2026-05-30 §4: surface focus/select actuation = orchestrator (conductor's
+# call); telepty owns only the read-only probe + the signal. So this consumer
+# actuates `wh_focus` (re-bind), the dual of consume_surface_orphaned's `wh_close`.
+# DORMANT until a telepty bus→file bridge populates SURFACE_MISMATCHED_SRC; absent
+# file → no-op, so actuation never depends on it.
+# wh_focus is NON-DESTRUCTIVE (best-effort raise; never throws/blocks, always 0), so
+# unlike orphan-close it needs no INV-17 kill-corroboration — re-focusing a stray
+# surface cannot lose work. Single safety gate: the sid must resolve to a host_id
+# (wh_lookup non-empty) — i.e. a real workspace still exists to re-bind.
+# Requires globals DRY_RUN to be set before invocation.
+consume_surface_mismatched() {
+  [ -f "$SURFACE_MISMATCHED_SRC" ] || return 0 # dormant: no bridge yet → no-op
+  local processed=0 line sid host_id exppty
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    sid=$(printf '%s' "$line" | jq -r '.sid // empty' 2>/dev/null || true)
+    exppty=$(printf '%s' "$line" | jq -r '.expectedPtyPid // empty' 2>/dev/null || true)
+    [ -z "$sid" ] && continue
+    if [ "$DRY_RUN" -eq 1 ]; then
+      log "SURFACE_MISMATCHED would-refocus sid=$sid expectedPty=${exppty:-?}"
+      processed=$((processed + 1)); continue
+    fi
+    host_id=$(wh_lookup "$sid")
+    if [ -n "$host_id" ]; then
+      if wh_focus "$host_id"; then
+        log "SURFACE_MISMATCHED refocused sid=$sid host=$host_id expectedPty=${exppty:-?}"
+      else
+        log "SURFACE_MISMATCHED refocus non-zero sid=$sid host=$host_id"
+      fi
+    fi
+    processed=$((processed + 1))
+  done < "$SURFACE_MISMATCHED_SRC"
+  if [ "$DRY_RUN" -eq 0 ] && [ "$processed" -gt 0 ]; then
+    : > "$SURFACE_MISMATCHED_SRC" 2>/dev/null || true # drain consumed events
+  fi
+  [ "$processed" -gt 0 ] && log "surface_mismatched consumed=$processed"
+  return 0
+}
+
 DRY_RUN=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -264,6 +314,8 @@ keep_alive=$(keep_alive_sids | sort -u | tr '\n' ',' | sed 's/,$//')
 
 # event-driven surface_orphaned consumer (dormant until a bus→file bridge exists)
 consume_surface_orphaned
+# event-driven surface_mismatched consumer — re-focus stray surfaces (#507, dormant)
+consume_surface_mismatched
 
 candidates=$(printf '%s' "$listing" | LISTING_GC="$gc_root" LISTING_KA="$keep_alive" python3 -c '
 import json,os,sys
