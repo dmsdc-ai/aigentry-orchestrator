@@ -37,6 +37,15 @@
 
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+# launchd does NOT propagate HOME to this daemon (verified: `launchctl print
+# gui/<uid>/com.aigentry.reconciler` env has PATH but no HOME). With HOME empty,
+# the cmux-prune ownership gate (workspace-host.sh: sandbox=$HOME/.aigentry/
+# role-sandbox) resolves to "/.aigentry/role-sandbox" and matches NO real
+# workspace cwd → wh_prune_orphans records 0 candidates → orphans never prune
+# (regression in 2c12619). Recover HOME from the passwd db — bash `~` expansion
+# works even when HOME is unset (getpwuid fallback), so this stays pure-shell (§17).
+: "${HOME:=$(cd ~ 2>/dev/null && pwd -P)}"
+export HOME
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"

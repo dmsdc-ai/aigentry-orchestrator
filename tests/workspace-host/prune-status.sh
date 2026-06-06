@@ -160,6 +160,43 @@ hrc=0
 ) || hrc=$?
 chk "headless adapter: new fns no-op return 0" "$hrc" "0"
 
+# === Test 8: daemon HOME-unset regression (2c12619) ==========================
+# launchd runs the reconciler WITHOUT HOME, so the ownership gate
+# (sandbox=$HOME/.aigentry/role-sandbox) resolved to "/.aigentry/role-sandbox"
+# and matched NO real workspace cwd → prune recorded 0 candidates → orphans
+# never pruned. The reconciler now recovers HOME (passwd-db `~` expansion) before
+# the tick. This test reproduces the daemon condition: HOME-unset WITHOUT recovery
+# must NOT prune (bug); HOME-unset WITH the reconciler's recovery idiom MUST prune.
+RECONCILER="$(cd "$SCRIPT_DIR/../../bin" && pwd -P)/session-reconciler.sh"
+if grep -q 'HOME:=' "$RECONCILER"; then ok "reconciler has a HOME-recovery guard"
+else nok "reconciler has a HOME-recovery guard"; fi
+
+T8="${THROW_PREFIX}homeless-$$"
+ref8=$(make_throwaway "$T8" "$TMP_CWD")
+if [ -n "$ref8" ]; then
+  LIVE8="$(real_live_ids)" # excludes zz-throwaway-* → T8 is a candidate
+  # (a) HOME unset, NO recovery → ownership gate breaks → never closes (the bug).
+  c8a=$(env -u HOME LIB="$LIB" LIVE8="$LIVE8" \
+        AIGENTRY_CMUX_ORPHAN_LEDGER="$(mktemp -t cmux-orphan-ledger.XXXXXX)" bash -c '
+          . "$LIB"
+          DRY_RUN=0 wh_prune_orphans "$LIVE8" "" >/dev/null
+          DRY_RUN=0 wh_prune_orphans "$LIVE8" ""')
+  chk "HOME-unset, no recovery: orphan NOT pruned (reproduces bug)" "$c8a" "0"
+  chk "HOME-unset, no recovery: workspace survives" "$(ref_by_title "$T8")" "$ref8"
+  # (b) HOME unset, WITH the reconciler's recovery idiom → gate resolves → closes.
+  c8b=$(env -u HOME LIB="$LIB" LIVE8="$LIVE8" \
+        AIGENTRY_CMUX_ORPHAN_LEDGER="$(mktemp -t cmux-orphan-ledger.XXXXXX)" bash -c '
+          : "${HOME:=$(cd ~ 2>/dev/null && pwd -P)}"; export HOME
+          . "$LIB"
+          DRY_RUN=0 wh_prune_orphans "$LIVE8" "" >/dev/null
+          DRY_RUN=0 wh_prune_orphans "$LIVE8" ""')
+  # ≥1 (not ==1): earlier tests leave their own owned throwaways alive, so the
+  # recovered gate may prune several — the point is recovery RE-ENABLED pruning.
+  if [ "${c8b:-0}" -ge 1 ]; then ok "HOME-unset + recovery: pruning re-enabled (closed=$c8b)"
+  else nok "HOME-unset + recovery: pruning re-enabled (closed=$c8b)"; fi
+  chk "HOME-unset + recovery: T8 workspace gone" "$(ref_by_title "$T8")" ""
+fi
+
 echo "1..$((pass+fail))"
 echo "# pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]
