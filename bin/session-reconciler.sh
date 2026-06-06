@@ -26,6 +26,7 @@
 # Usage:
 #   session-reconciler.sh           # one tick
 #   session-reconciler.sh --dry-run # report what would happen, don't act
+#   session-reconciler.sh --shadow  # observe+decide only; append shadow JSONL
 #   session-reconciler.sh --once    # alias for default
 #   session-reconciler.sh --help
 
@@ -40,8 +41,11 @@ BACKOFF_JSON="$STATE_DIR/reconciler-backoff.json"
 RECONCILER_LOG="$STATE_DIR/reconciler.log"
 SCHEDULER_SH="${SCHEDULER_SH:-$SCRIPT_DIR/dispatch-cleanup-scheduler.sh}"
 CLEANUP_SH="${CLEANUP_SH:-$SCRIPT_DIR/session-cleanup.sh}"
+SESSION_PROBE_PY="${SESSION_PROBE_PY:-$SCRIPT_DIR/session-probe.py}"
+POLICY_PY="${POLICY_PY:-$SCRIPT_DIR/policy.py}"
 TELEPTY="${TELEPTY:-telepty}"
 NOW_OVERRIDE="${RECONCILER_NOW:-}"
+SHADOW_LOG="${RECONCILE_SHADOW_LOG:-$STATE_DIR/reconcile-shadow.jsonl}"
 PROTECTED_SIDS=(orchestrator)
 AGE_FLOOR_SECONDS="${RECONCILER_AGE_FLOOR:-300}"
 DISCONNECT_FLOOR_SECONDS="${RECONCILER_DISCONNECT_FLOOR:-240}"
@@ -86,6 +90,69 @@ atomic_write_json() {
   tmp=$(mktemp "${path}.tmp.XXXXXX")
   cat > "$tmp"
   mv "$tmp" "$path"
+}
+
+append_shadow_record() {
+  local sid="$1" status="$2" state_json="$3" action_json="$4" now
+  now=$(now_iso)
+  SHADOW_LOG="$SHADOW_LOG" NOW="$now" SID="$sid" STATUS="$status" \
+    STATE_JSON="$state_json" ACTION_JSON="$action_json" python3 - <<'PY'
+import json, os
+
+path = os.environ["SHADOW_LOG"]
+try:
+    state = json.loads(os.environ.get("STATE_JSON", "") or "{}")
+except Exception:
+    state = {"alive": False, "ready": False, "surface": "unknown", "activity": "static", "cli": "unknown", "detail": {"probe_error": "shadow state JSON parse failed"}}
+try:
+    action = json.loads(os.environ.get("ACTION_JSON", "") or "{}")
+except Exception:
+    action = {"action": "ESCALATE", "reason": "shadow action JSON parse failed", "status": os.environ.get("STATUS", "")}
+record = {
+    "ts": os.environ["NOW"],
+    "sid": os.environ["SID"],
+    "status": os.environ.get("STATUS", ""),
+    "state": state,
+    "action": action,
+}
+with open(path, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+PY
+}
+
+run_shadow_loop() {
+  mkdir -p "$STATE_DIR"
+  [ -f "$ACTIVE_JSON" ] || { log "shadow tick: no active registry"; return 0; }
+  local snap processed state_json action_json
+  snap=$(mktemp)
+  ACTIVE_JSON="$ACTIVE_JSON" python3 - > "$snap" <<'PY'
+import json, os
+
+try:
+    entries = json.load(open(os.environ["ACTIVE_JSON"], encoding="utf-8"))
+except Exception:
+    entries = []
+for entry in entries if isinstance(entries, list) else []:
+    sid = entry.get("sid")
+    if sid:
+        print(f"{sid}\t{entry.get('status', '')}")
+PY
+  processed=0
+  while IFS=$'\t' read -r sid status; do
+    [ -z "$sid" ] && continue
+    state_json=$(TELEPTY="$TELEPTY" "$SESSION_PROBE_PY" --sid "$sid" 2>/dev/null || true)
+    if [ -z "$state_json" ]; then
+      state_json='{"alive":false,"ready":false,"surface":"unknown","activity":"static","cli":"unknown","detail":{"probe_error":"session-probe failed"}}'
+    fi
+    action_json=$(printf '%s\n' "$state_json" | "$POLICY_PY" --status "$status" --state - 2>/dev/null || true)
+    if [ -z "$action_json" ]; then
+      action_json='{"action":"ESCALATE","reason":"policy failed","status":"'"$status"'"}'
+    fi
+    append_shadow_record "$sid" "$status" "$state_json" "$action_json"
+    processed=$((processed + 1))
+  done < "$snap"
+  rm -f "$snap"
+  log "shadow tick: processed=$processed log=$SHADOW_LOG"
 }
 
 # compute_gc_root — print one sid per line for every "live" session.
@@ -293,14 +360,21 @@ consume_surface_mismatched() {
 }
 
 DRY_RUN=0
+SHADOW=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift;;
+    --shadow)  SHADOW=1; shift;;
     --once)    shift;;
     -h|--help) usage 0;;
     *) echo "unknown: $1" >&2; usage 4;;
   esac
 done
+
+if [ "$SHADOW" -eq 1 ]; then
+  run_shadow_loop
+  exit 0
+fi
 
 # --- step 1: scheduler tick (Layer D fires due) ---
 if [ -x "$SCHEDULER_SH" ] && [ "$DRY_RUN" -eq 0 ]; then
