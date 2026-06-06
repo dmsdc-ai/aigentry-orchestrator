@@ -162,6 +162,13 @@ chmod 0755 "$FAKE_BIN/telepty"
 
 REF_FILE="$TMP_ROOT/ref.md"
 printf '%s\n' "T28 dispatch propagation ref" > "$REF_FILE"
+# dispatch.sh's pre-inject wait_for_ready ALWAYS runs — it is NOT gated by
+# --no-verify-started (that flag only skips the post-inject Rule-33 START check).
+# The fake codex launcher attempts its push then exits, so this throwaway session
+# never reaches REPL-ready and dispatch times out by design (--timeout-ms 1000).
+# The push-guard assertions below depend only on the launcher's side effects
+# (FAKE_OPEN_STATUS + dispatch-launcher.err), which are written during
+# open-session BEFORE the wait — so the expected non-zero timeout exit is tolerated.
 HOME="$TMP_ROOT/home" \
 AIGENTRY_SESSIONS_ROOT="$TMP_ROOT/sessions" \
 DISPATCH_STATE_DIR="$TMP_ROOT/state" \
@@ -174,7 +181,8 @@ PATH="$FAKE_BIN:$PATH" \
 TELEPTY="$FAKE_BIN/telepty" \
   "$REPO_ROOT/bin/dispatch.sh" --spawn-and-dispatch \
     --track t28 --name dispatch-main --cwd "$WORK" --cli codex \
-    --from t28-test --ref "$REF_FILE" --timeout-ms 1000 --no-verify-started >/dev/null
+    --from t28-test --ref "$REF_FILE" --timeout-ms 1000 --no-verify-started \
+    >/dev/null 2>&1 || true
 
 if [ "$(cat "$FAKE_OPEN_STATUS")" -eq 0 ]; then
   echo "FAIL: dispatch-generated worker launcher did not block protected push" >&2

@@ -7,19 +7,29 @@ t_setup; trap t_teardown EXIT
 
 REPO_ROOT="$(cd "$HERE/../.." && pwd -P)"
 
-# Stub cmux on PATH that records calls + answers list/close.
+# Stub cmux on PATH that records calls + answers list/sidebar-state/close, modelling
+# the cmux CLI contract verified live in SPEC 2026-06-06-cmux-adaptor-prune-status:
+#   F2 — the global `--json` flag PRECEDES the command (`cmux --json list-workspaces`).
+#   F3 — the listing shape is `{"workspaces":[{ref,...}]}` (no top-level array / `id`).
+#   F7/F9 — per-handle liveness is `sidebar-state`, judged by STDOUT: alive iff
+#           non-empty AND not an `Error:` line (a missing tab prints `Error:`).
 CMUX_CALLS="$T_TMP/cmux-calls.log"
 cat > "$STUB_BIN/cmux" <<EOF
 #!/usr/bin/env bash
 echo "cmux \$*" >> "$CMUX_CALLS"
+if [ "\$1" = "--json" ] && [ "\$2" = "list-workspaces" ]; then
+  cat "$T_TMP/cmux-workspaces.json"; exit 0
+fi
 case "\$1" in
-  list-workspaces)
-    if [ "\${2:-}" = "--json" ]; then
-      cat "$T_TMP/cmux-workspaces.json"
-    fi
+  sidebar-state)
+    # \$2=--workspace \$3=<id>; known handles are alive, unknown => Error: (F7).
+    case "\${3:-}" in
+      ws-alive|ws-other) echo "tab=\${3} status_count=0";;
+      *) echo "Error: ERROR: Tab not found";;
+    esac
     ;;
   close-workspace)
-    # --workspace <id> — succeed for "ws-alive", fail for "ws-bad"
+    # \$2=--workspace \$3=<id> — succeed for "ws-alive", fail for "ws-bad"
     if [ "\${3:-}" = "ws-bad" ]; then exit 1; fi
     exit 0
     ;;
@@ -27,7 +37,7 @@ case "\$1" in
 esac
 EOF
 chmod +x "$STUB_BIN/cmux"
-printf '[{"id":"ws-alive"},{"id":"ws-other"}]' > "$T_TMP/cmux-workspaces.json"
+printf '{"workspaces":[{"ref":"ws-alive"},{"ref":"ws-other"}]}' > "$T_TMP/cmux-workspaces.json"
 
 # telepty list with cmuxWorkspaceId mapping.
 cat > "$STUB_LIST_FILE" <<EOF

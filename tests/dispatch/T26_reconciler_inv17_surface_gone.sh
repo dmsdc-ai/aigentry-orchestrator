@@ -21,6 +21,12 @@ NOW="2026-05-30T12:00:00Z"          # fixed clock
 STARTED="2026-05-30T11:50:00Z"      # 600s old > 300s age floor
 DISC_SEEN="2026-05-30T11:54:00Z"    # 360s disconnect age > 240s floor
 SID="sid-orphan"
+# F7/F9 surface_gone fixture: a well-formed but ABSENT cmux workspace UUID. The
+# liveness probe is now `sidebar-state --workspace <id>` (SPEC 2026-06-06), which
+# returns `Error: Tab not found` for an unknown handle => _wh_cmux_alive reports
+# gone. A non-UUID placeholder (e.g. "ws-gone") is instead loosely resolved by a
+# real cmux to the focused workspace (alive), so it can no longer signal gone.
+WS_GONE="00000000-DEAD-BEEF-0000-000000000000"
 
 # --- stubs (reconciler prepends /usr/bin to PATH, so use env-injected paths) ---
 SCHED_STUB="$STUB_BIN/sched-noop.sh"
@@ -39,12 +45,20 @@ exit 0
 EOF
 chmod +x "$CLEANUP_STUB"
 
-# cmux stub: list-workspaces --json returns [] -> ws-gone is NOT present ->
-# _wh_cmux_alive(ws-gone) == gone (surface_gone signal).
+# cmux stub (F9 contract). Used only where cmux is ABSENT (e.g. CI); on a dev box
+# the real cmux shadows it via the reconciler's PATH hardening (line "export
+# PATH=/opt/homebrew/bin:..."), but BOTH paths agree on "gone" for $WS_GONE:
+#   * `sidebar-state` on the absent UUID prints `Error:` (F7) => _wh_cmux_alive
+#     reports gone — the surface_gone signal under test.
+#   * `--json list-workspaces` (flag first, F2) returns an empty workspace set so
+#     the step-2b prune never finds a candidate (no real workspace is touched).
 cat > "$STUB_BIN/cmux" <<'EOF'
 #!/usr/bin/env bash
+if [ "$1" = "--json" ] && [ "$2" = "list-workspaces" ]; then
+  echo '{"workspaces":[]}'; exit 0
+fi
 case "$1" in
-  list-workspaces) [ "${2:-}" = "--json" ] && echo '[]';;
+  sidebar-state) echo "Error: ERROR: Tab not found";;
   *) exit 0;;
 esac
 EOF
@@ -79,6 +93,7 @@ run_reconciler() { # $@ = extra args; writes combined log to $RUN_LOG
   SCHEDULER_SH="$SCHED_STUB" \
   CLEANUP_SH="$CLEANUP_STUB" \
   AIGENTRY_SURFACE_ORPHANED_SOURCE="$T_TMP/no-such-surface-orphaned.jsonl" \
+  AIGENTRY_ROLE_SANDBOX_DIR="$T_TMP/no-such-sandbox" \
   DISPATCH_STATE_DIR="$DISPATCH_STATE_DIR" \
     bash "$RECONCILER" "$@" >"$RUN_LOG" 2>&1 || fail "reconciler exited non-zero ($*):
 $(cat "$RUN_LOG")"
@@ -90,7 +105,7 @@ $(cat "$RUN_LOG")"
 # A) surface_gone ALONE -> SKIP. CONNECTED (no disconnect), parent alive
 #    (no pid reason) -> surface_gone is the only reason -> INV-17 skip.
 # ===========================================================================
-write_list "[{\"id\":\"$SID\",\"healthStatus\":\"CONNECTED\",\"cmuxWorkspaceId\":\"ws-gone\",\"startedAt\":\"$STARTED\"}]"
+write_list "[{\"id\":\"$SID\",\"healthStatus\":\"CONNECTED\",\"cmuxWorkspaceId\":\"$WS_GONE\",\"startedAt\":\"$STARTED\"}]"
 run_reconciler
 grep -q "INV-17 skip sid=$SID" "$RUN_LOG" \
   || fail "expected 'INV-17 skip sid=$SID' (surface_gone single-signal); log:
@@ -108,7 +123,7 @@ grep -q "surface_orphaned consumed" "$RUN_LOG" \
 #    is a genuine double-gate (corroboration opens it), not "never close".
 # ===========================================================================
 : > "$CLEANUP_CALLS"
-write_list "[{\"id\":\"$SID\",\"healthStatus\":\"DISCONNECTED\",\"lastSeenAt\":\"$DISC_SEEN\",\"cmuxWorkspaceId\":\"ws-gone\",\"startedAt\":\"$STARTED\"}]"
+write_list "[{\"id\":\"$SID\",\"healthStatus\":\"DISCONNECTED\",\"lastSeenAt\":\"$DISC_SEEN\",\"cmuxWorkspaceId\":\"$WS_GONE\",\"startedAt\":\"$STARTED\"}]"
 run_reconciler
 grep -q "SWEEP candidate sid=$SID" "$RUN_LOG" \
   || fail "expected corroborated SWEEP candidate for $SID (disconnect+surface_gone); log:
@@ -124,7 +139,7 @@ $(cat "$CLEANUP_CALLS")"
 # C) --dry-run clean with ABSENT JSONL source -> exit 0, no actuation.
 # ===========================================================================
 : > "$CLEANUP_CALLS"
-write_list "[{\"id\":\"$SID\",\"healthStatus\":\"CONNECTED\",\"cmuxWorkspaceId\":\"ws-gone\",\"startedAt\":\"$STARTED\"}]"
+write_list "[{\"id\":\"$SID\",\"healthStatus\":\"CONNECTED\",\"cmuxWorkspaceId\":\"$WS_GONE\",\"startedAt\":\"$STARTED\"}]"
 run_reconciler --dry-run
 [ -s "$CLEANUP_CALLS" ] && fail "--dry-run actuated cleanup (must be report-only):
 $(cat "$CLEANUP_CALLS")"
