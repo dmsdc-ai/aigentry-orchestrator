@@ -272,7 +272,13 @@ apply_action() {
   next_status=$(json_get "$action_json" status)
   case "$act" in
     NOOP)
-      [ -n "$next_status" ] && [ "$next_status" != "$status" ] && registry_update_status "$sid" "$next_status"
+      # Proper if-guard: the prior `[ ] && [ ] && cmd` chain returned 1 whenever
+      # next_status == status (a no-op is the common case), which under the
+      # caller's `set -euo pipefail` aborted the whole tick. An if-statement makes
+      # "nothing to do" exit 0. (Pre-existing bug, distinct from cmux-adaptor scope.)
+      if [ -n "$next_status" ] && [ "$next_status" != "$status" ]; then
+        registry_update_status "$sid" "$next_status"
+      fi
       ;;
     RESUBMIT_ENTER|SEND_KEY)
       [ -n "$key" ] || key=enter
