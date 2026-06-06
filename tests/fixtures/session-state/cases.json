@@ -1,0 +1,65 @@
+[
+  {
+    "name": "codex-init-spinner",
+    "screen": "codex-init-spinner.screen",
+    "info": "codex-connected.info",
+    "status": "in_flight",
+    "expect_state": {"surface": "working", "activity": "moving", "cli": "codex", "ready": false},
+    "expect_detail": {"tracker_class": "active"},
+    "expect_action": {"action": "NOOP", "status": "in_flight"}
+  },
+  {
+    "name": "unsubmitted-context-ref",
+    "screen": "unsubmitted-context-ref.screen",
+    "info": "codex-connected.info",
+    "status": "in_flight",
+    "expect_state": {"surface": "unsubmitted", "activity": "static", "cli": "codex", "ready": false},
+    "expect_detail": {"tracker_class": "active"},
+    "expect_action": {"action": "RESUBMIT_ENTER", "status": "in_flight", "key": "enter"}
+  },
+  {
+    "name": "thinking-block-400",
+    "screen": "thinking-block-400.screen",
+    "info": "claude-connected.info",
+    "status": "in_flight",
+    "expect_state": {"surface": "thinking_block", "activity": "static", "cli": "claude", "ready": false},
+    "expect_detail": {"tracker_class": "error"},
+    "expect_action": {"action": "RESPAWN", "status": "respawn_requested"}
+  },
+  {
+    "name": "trust-modal",
+    "screen": "trust-modal.screen",
+    "info": "claude-connected.info",
+    "status": "in_flight",
+    "expect_state": {"surface": "modal", "activity": "static", "cli": "claude", "ready": false},
+    "expect_detail": {"tracker_class": "welcome"},
+    "expect_action": {"action": "SEND_KEY", "status": "in_flight", "key": "enter"}
+  },
+  {
+    "name": "raw-shell",
+    "screen": "raw-shell.screen",
+    "info": "claude-connected.info",
+    "status": "in_flight",
+    "expect_state": {"surface": "raw_shell", "activity": "static", "cli": "claude", "ready": false},
+    "expect_detail": {"tracker_class": "blank"},
+    "expect_action": {"action": "REDISPATCH", "status": "re_dispatched"}
+  },
+  {
+    "name": "working-spinner",
+    "screen": "working-spinner.screen",
+    "info": "claude-connected.info",
+    "status": "in_flight",
+    "expect_state": {"surface": "working", "activity": "moving", "cli": "claude", "ready": false},
+    "expect_detail": {"tracker_class": "blank"},
+    "expect_action": {"action": "NOOP", "status": "in_flight"}
+  },
+  {
+    "name": "idle-holding",
+    "screen": "idle-holding.screen",
+    "info": "claude-connected.info",
+    "status": "in_flight",
+    "expect_state": {"surface": "idle", "activity": "static", "cli": "claude", "ready": true},
+    "expect_detail": {"tracker_class": "done"},
+    "expect_action": {"action": "NOOP", "status": "in_flight"}
+  }
+]
