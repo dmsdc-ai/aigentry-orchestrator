@@ -160,7 +160,14 @@ cleanup_one() {
   local info
   info=$(session_info "$sid")
   if [ -z "$info" ]; then
-    log "session not in telepty list: $sid (already cleaned or never registered)"
+    # telepty-orphan: gone from telepty but the terminal surface may still be
+    # alive (idle worker deregistered → cmux workspace lingers, #323/#340). Step 4
+    # requires BOTH surfaces cleaned regardless of telepty state. $info is EMPTY
+    # here, so close BY SID (wh_close_for_sid) — close_workspace_for <sid> <empty>
+    # would silent-no-op. DELETE backup still runs to drop any registry residue.
+    log "session not in telepty list: $sid (already cleaned or never registered); closing terminal surface by sid"
+    wh_close_for_sid "$sid"
+    delete_session_registry "$sid"
     return 0
   fi
   # Step 1 — kill parent (load-bearing; auto-deregisters most cases)
