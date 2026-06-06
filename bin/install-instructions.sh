@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ADR-MF #4 — bootstrap default instruction tree (SPEC §5.4).
-# ADR-MF #6 — installs common.md + roles/orchestrator.md from tooling/instructions/.
+# ADR-MF #6 — installs common.md + roles/*.md from tooling/instructions/ (placeholder fallback when a role file is absent).
 # Idempotent: by default skip existing files. With --force overwrite.
 # Honors $AIGENTRY_HOME (default ~/.aigentry) for CI / test isolation.
 set -euo pipefail
@@ -60,11 +60,16 @@ ensure_dir "$ROOT/roles"
 ensure_dir "$ROOT/projects"
 
 install_file "$ROOT/common.md" "copy:common.md"
-install_file "$ROOT/roles/orchestrator.md" "copy:roles/orchestrator.md"
 
+# For each role: copy the real contract when source provides one; otherwise
+# fall back to a generic placeholder (#519 — source previously shipped only
+# orchestrator.md, so the other 8 were placeholdered on every fresh/--force install).
 for r in "${ROLES[@]}"; do
-  [ "$r" = "orchestrator" ] && continue
-  install_file "$ROOT/roles/$r.md" "placeholder:$r"
+  if [ -f "$SRC_ROOT/roles/$r.md" ]; then
+    install_file "$ROOT/roles/$r.md" "copy:roles/$r.md"
+  else
+    install_file "$ROOT/roles/$r.md" "placeholder:$r"
+  fi
 done
 
 echo "install-instructions.sh: complete (prefix=$PREFIX, force=$FORCE)"
