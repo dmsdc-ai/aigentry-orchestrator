@@ -307,6 +307,14 @@ if [ -x "$SCHEDULER_SH" ] && [ "$DRY_RUN" -eq 0 ]; then
   "$SCHEDULER_SH" tick || log "ERR scheduler tick non-zero"
 fi
 
+# --- step 1b: autonomous post-dispatch verify (orchestrator's role — automatic) ---
+# Verify+resubmit every still-in-flight dispatched session so a dropped submit CR
+# (#412/#508 codex init race) is auto-recovered without the user or an interactive
+# orchestrator turn. PASS → marker (stop); SUSPECT → escalation file.
+if [ -x "$SCRIPT_DIR/dispatch-autoverify.sh" ] && [ "$DRY_RUN" -eq 0 ]; then
+  "$SCRIPT_DIR/dispatch-autoverify.sh" || log "ERR dispatch-autoverify non-zero"
+fi
+
 # --- step 2: orphan sweep ---
 listing=$(telepty_list_json) || { log "abort sweep — bad telepty list"; exit 0; }
 gc_root=$(compute_gc_root | sort -u | tr '\n' ',' | sed 's/,$//')
