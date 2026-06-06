@@ -9,7 +9,7 @@ import os
 import re
 import subprocess
 import sys
-from typing import Any
+from typing import Any, TextIO
 
 
 SURFACE_UNKNOWN = "unknown"
@@ -33,22 +33,38 @@ WORKING = r"esc to interrupt|Working\s*\(|Working\.\.\.|\u273b|\u23fa|\u27f3|Thi
 TRACKER_ERR = r"error:|traceback|panic:|command not found|killed:|exited [0-9]+"
 TRACKER_WELCOME = r"Welcome back|Tips for getting started|Trust this folder|Press Enter to continue"
 TRACKER_ACTIVE_TEXT = r"\(esc to interrupt\)|thinking with xhigh effort|\u23f5\s*\d+s"
+SAFE_SID = re.compile(r"^[A-Za-z0-9_.:@-]{1,160}$")
+SAFE_CLI = re.compile(r"^[A-Za-z0-9_.:/@+-]{1,240}$")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Emit SessionState JSON for a telepty sid.")
     parser.add_argument("--sid", required=True)
-    parser.add_argument("--screen-file", help="Read captured screen text instead of telepty.")
-    parser.add_argument("--info-file", help="Read captured session-info JSON instead of telepty.")
+    parser.add_argument(
+        "--screen-file",
+        type=argparse.FileType("r", encoding="utf-8"),
+        help="Read captured screen text instead of telepty.",
+    )
+    parser.add_argument(
+        "--info-file",
+        type=argparse.FileType("r", encoding="utf-8"),
+        help="Read captured session-info JSON instead of telepty.",
+    )
     parser.add_argument("--cli", help="Override CLI kind for caller-owned readiness checks.")
     parser.add_argument("--screen-lines", type=int, default=60)
     parser.add_argument("--telepty", default=os.environ.get("TELEPTY", "telepty"))
     return parser.parse_args()
 
 
-def read_text(path: str) -> str:
-    with open(path, "r", encoding="utf-8") as fh:
-        return fh.read()
+def safe_token(value: str, pattern: re.Pattern[str], label: str) -> str:
+    if not pattern.fullmatch(value):
+        raise ValueError(f"unsafe {label}: {value!r}")
+    return value
+
+
+def read_text(handle: TextIO) -> str:
+    with handle:
+        return handle.read()
 
 
 def load_json_text(text: str) -> dict[str, Any]:
@@ -220,11 +236,13 @@ def verification_problems(
 
 def observe(args: argparse.Namespace) -> dict[str, Any]:
     probe_error = ""
+    sid = safe_token(args.sid, SAFE_SID, "sid")
+    telepty = safe_token(args.telepty, SAFE_CLI, "telepty executable")
     if args.info_file:
         info_text = read_text(args.info_file)
         info = load_json_text(info_text)
     else:
-        rc, out, err = run_capture([args.telepty, "session", "info", args.sid, "--json"])
+        rc, out, err = run_capture([telepty, "session", "info", sid, "--json"])
         info = load_json_text(out)
         if rc != 0 or not out.strip():
             probe_error = (err or "session info unavailable").strip()
@@ -233,7 +251,7 @@ def observe(args: argparse.Namespace) -> dict[str, Any]:
         screen = read_text(args.screen_file)
     else:
         rc, out, err = run_capture(
-            [args.telepty, "read-screen", args.sid, "--lines", str(args.screen_lines)]
+            [telepty, "read-screen", sid, "--lines", str(args.screen_lines)]
         )
         screen = out
         if rc != 0 and not probe_error:

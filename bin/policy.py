@@ -7,7 +7,7 @@ import argparse
 import json
 import re
 import sys
-from typing import Any
+from typing import Any, TextIO
 
 
 ACTIVE_STATUSES = {"", "in_flight", "re_dispatched", "stuck_welcome"}
@@ -21,12 +21,17 @@ DISCONNECT_FLOOR_SECONDS = 240
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Decide a reconcile Action for a SessionState.")
     parser.add_argument("--status", required=True, help="Dispatch Registry entry status.")
-    parser.add_argument("--state", required=True, help="Path to state JSON, or '-' for stdin.")
+    parser.add_argument(
+        "--state",
+        required=True,
+        type=argparse.FileType("r", encoding="utf-8"),
+        help="Path to state JSON, or '-' for stdin.",
+    )
     return parser.parse_args()
 
 
-def load_state(path: str) -> dict[str, Any]:
-    raw = sys.stdin.read() if path == "-" else open(path, "r", encoding="utf-8").read()
+def load_state(handle: TextIO) -> dict[str, Any]:
+    raw = handle.read()
     try:
         value = json.loads(raw or "{}")
     except Exception:
