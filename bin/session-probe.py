@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sid", required=True)
     parser.add_argument("--screen-file", help="Read captured screen text instead of telepty.")
     parser.add_argument("--info-file", help="Read captured session-info JSON instead of telepty.")
+    parser.add_argument("--cli", help="Override CLI kind for caller-owned readiness checks.")
     parser.add_argument("--screen-lines", type=int, default=60)
     parser.add_argument("--telepty", default=os.environ.get("TELEPTY", "telepty"))
     return parser.parse_args()
@@ -80,7 +81,9 @@ def tail(lines: list[str], count: int) -> str:
     return "\n".join(lines[-count:])
 
 
-def cli_from_info_or_screen(info: dict[str, Any], screen: str) -> str:
+def cli_from_info_or_screen(info: dict[str, Any], screen: str, override: str = "") -> str:
+    if override:
+        return override
     raw = " ".join(
         str(v or "")
         for v in (
@@ -236,7 +239,7 @@ def observe(args: argparse.Namespace) -> dict[str, Any]:
         if rc != 0 and not probe_error:
             probe_error = (err or "read-screen unavailable").strip()
 
-    cli = cli_from_info_or_screen(info, screen)
+    cli = cli_from_info_or_screen(info, screen, args.cli or "")
     health = str(field(info, "healthStatus") or field(info, "transport", "health_status") or "")
     transport_ready = bool(field(info, "ready")) or bool(field(info, "transport", "ready"))
     raw_bootstrap = field(info, "transport", "bootstrap", "ready")
