@@ -113,18 +113,31 @@ if re.search(r"(\$|%|➜)\s*$", tail) and not re.search(r"esc to interrupt|Worki
 # --- 3. MOVING ---
 working_tok = re.search(r"esc to interrupt|Working\s*\(|✻|⠋|⠙|⠹|⠸|Thinking|Compacting|Esc to interrupt", s2, re.I)
 churned = (s1 != s2) or (last1 and last2 and last1 != last2)
+# UNSUBMITTED-INJECT detector (most reliable; overrides spinner false-positives).
+# `telepty inject --ref` types "[context-ref] Read ~/.telepty/shared/<hash>.md ..."
+# into the prompt then sends a submit CR. On a freshly-spawned codex the CR is
+# dropped during init, so that marker SITS at the live prompt = unsubmitted. A
+# SUBMITTED inject scrolls the marker into history (working output fills the tail),
+# so the marker is NOT in the last lines. codex's MCP-init ALSO shows spinners, so
+# working_tok alone is not enough — if the marker is still at the tail, it is
+# UNSUBMITTED regardless of any spinner → force not-moving so --resubmit fires.
+last4 = "\n".join([l for l in s2.splitlines() if l.strip()][-4:])
+unsubmitted = bool(re.search(r"\[context-ref\]|/shared/[0-9a-f]{6,}\.md", last4))
 # A WORKING token (spinner / "esc to interrupt") is the ONLY reliable "task started"
 # signal. Raw screen churn alone false-positives on spawn-time banner/MCP-init
 # rendering: a freshly-spawned codex whose injected text is still UNSUBMITTED at the
 # prompt (the submit CR was dropped during init — #412/#509) ALSO churns while it
 # boots. So churn does NOT confirm moving — require the working token. When absent,
 # treat as not-moving → --resubmit re-sends Enter to land the unsubmitted inject.
-moving = bool(working_tok)
+# Unsubmitted marker at the prompt OVERRIDES a spinner (codex init shows spinners).
+moving = bool(working_tok) and not unsubmitted
 # Tag the not-moving case distinctly so the caller can try a submit-resend (#412).
 NOT_MOVING_TAG = "[not-moving]"
-if not moving:
+if unsubmitted:
+    problems.append(f"injected context-ref still at the live prompt — UNSUBMITTED inject (submit CR dropped during codex init) {NOT_MOVING_TAG}")
+elif not moving:
     detail = "no working spinner"
-    detail += " (screen churning — likely spawn-init or UNSUBMITTED inject at prompt)" if churned else " (idle/static)"
+    detail += " (screen churning — likely spawn-init)" if churned else " (idle/static)"
     problems.append(f"{detail} {NOT_MOVING_TAG} (idle/stuck, unsubmitted inject, or finished without reporting)")
 
 if problems:
