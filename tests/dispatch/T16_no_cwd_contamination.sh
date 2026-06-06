@@ -22,6 +22,15 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd -P)"
 
+# Live-integration gate (#525): this test spawns a REAL telepty/cmux session via
+# dispatch.sh, which pollutes the live session graph + active.json registry and
+# leaks orphans when teardown races. Keep it OUT of the default hermetic unit run;
+# opt in explicitly with AIGENTRY_RUN_LIVE_TESTS=1 (orchestrator-supervised).
+if [ "${AIGENTRY_RUN_LIVE_TESTS:-0}" != "1" ]; then
+  echo "T16 SKIP — live-integration test (set AIGENTRY_RUN_LIVE_TESTS=1 to run)"
+  exit 0
+fi
+
 require_or_skip() {
   for cmd in claude telepty node python3; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
