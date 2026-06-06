@@ -113,11 +113,19 @@ if re.search(r"(\$|%|➜)\s*$", tail) and not re.search(r"esc to interrupt|Worki
 # --- 3. MOVING ---
 working_tok = re.search(r"esc to interrupt|Working\s*\(|✻|⠋|⠙|⠹|⠸|Thinking|Compacting|Esc to interrupt", s2, re.I)
 churned = (s1 != s2) or (last1 and last2 and last1 != last2)
-moving = bool(working_tok) or bool(churned)
+# A WORKING token (spinner / "esc to interrupt") is the ONLY reliable "task started"
+# signal. Raw screen churn alone false-positives on spawn-time banner/MCP-init
+# rendering: a freshly-spawned codex whose injected text is still UNSUBMITTED at the
+# prompt (the submit CR was dropped during init — #412/#509) ALSO churns while it
+# boots. So churn does NOT confirm moving — require the working token. When absent,
+# treat as not-moving → --resubmit re-sends Enter to land the unsubmitted inject.
+moving = bool(working_tok)
 # Tag the not-moving case distinctly so the caller can try a submit-resend (#412).
 NOT_MOVING_TAG = "[not-moving]"
 if not moving:
-    problems.append(f"no activity across probes {NOT_MOVING_TAG} (idle/stuck, unsubmitted inject, or finished without reporting)")
+    detail = "no working spinner"
+    detail += " (screen churning — likely spawn-init or UNSUBMITTED inject at prompt)" if churned else " (idle/static)"
+    problems.append(f"{detail} {NOT_MOVING_TAG} (idle/stuck, unsubmitted inject, or finished without reporting)")
 
 if problems:
     print(f"SUSPECT {sid} — {'; '.join(problems)}")
