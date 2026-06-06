@@ -6,6 +6,12 @@ TEST_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$TEST_LIB_DIR/../.." && pwd -P)"
 
 t_setup() {
+  # Env hygiene: the suite may be run FROM a worker session (which exports
+  # AIGENTRY_WORKER_SESSION=1, dispatch.sh:97). The orchestrator-only guard in
+  # session-cleanup.sh (#524) would then refuse on every orchestrator-path test.
+  # Tests that exercise the worker guard (T28/T34) set this marker inline per
+  # invocation, so clearing the inherited value here is safe and deterministic.
+  unset AIGENTRY_WORKER_SESSION
   T_TMP=$(mktemp -d)
   export T_TMP
   export DISPATCH_STATE_DIR="$T_TMP/state"

@@ -30,6 +30,8 @@
 #   1 — usage error
 #   2 — missing dependency
 #   3 — telepty list --json failed or returned non-JSON (binary/daemon mismatch)
+#   4 — invoked from a worker session (AIGENTRY_WORKER_SESSION set) — refused;
+#       session lifecycle is the orchestrator's exclusive domain (#524).
 #
 # Sibling: bin/open-session.sh (spawn counterpart).
 
@@ -241,6 +243,17 @@ main() {
         sid="$1"; shift;;
     esac
   done
+
+  # Worker-guard (#524, Defense in Depth): session lifecycle (spawn + de-spawn)
+  # is the orchestrator's exclusive domain. A spawned worker carries
+  # AIGENTRY_WORKER_SESSION=1 (dispatch.sh:97); refuse fail-fast before any
+  # kill/close so a worker can never mass-kill peers via --all-unused. The
+  # orchestrator and the autonomous reconciler daemon run WITHOUT this marker,
+  # so both pass. Precedent: dispatch.sh:70 install_worker_git_guard.
+  if [ -n "${AIGENTRY_WORKER_SESSION:-}" ]; then
+    err "session-cleanup.sh is orchestrator-only — refusing to run from a worker session (AIGENTRY_WORKER_SESSION set). Session lifecycle is the orchestrator's domain."
+    exit 4
+  fi
 
   if [ "$mode_all_disc" -eq 1 ]; then
     [ -n "$sid" ] && { err "--all-disconnected does not take a sid argument"; exit 1; }

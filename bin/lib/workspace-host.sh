@@ -74,7 +74,12 @@ _wh_cmux_lookup() {
   if [ -z "$info" ]; then
     info=$(telepty list --json 2>/dev/null | jq -c --arg sid "$sid" '.[] | select(.id == $sid)' 2>/dev/null | head -1)
   fi
-  [ -z "$info" ] && { echo ""; return 0; }
+  if [ -z "$info" ]; then
+    # FALLBACK: telepty has no record (orphan) → resolve by cmux title == sid so a
+    # manual `wh_close_for_sid` still closes a deregistered worker's surface (#523).
+    _wh_cmux_list_titles | awk -F'\t' -v s="$sid" '$2==s {print $1; exit}'
+    return 0
+  fi
   echo "$info" | jq -r '.cmuxWorkspaceId // empty' 2>/dev/null || true
 }
 
