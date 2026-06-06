@@ -33,6 +33,7 @@ TRACKER_SID="${TRACKER_FROM_SID:-dispatch-tracker}"
 
 # Test seams (override in tests via env)
 TELEPTY="${TELEPTY:-telepty}"
+CURL="${CURL:-curl}"
 GIT="${GIT:-git}"
 DISPATCH_SH="${DISPATCH_SH:-$SCRIPT_DIR/dispatch.sh}"
 SESSION_PROBE_PY="${SESSION_PROBE_PY:-$SCRIPT_DIR/session-probe.py}"
@@ -286,6 +287,16 @@ for e in entries:
 "
       continue
     fi
+    # #528 bus-event consumer: poll telepty's persistent pendingReports state for
+    # this dispatch. On idle_notified (worker went idle after our inject but its
+    # REPORT/HOLD push never landed — the "Enter 안눌림" bug) surface an AUTO_HOLD to
+    # the FILE LOGS (the source of truth; the inject channel is the one that fails)
+    # and `continue`. Any other outcome (404 cleared/dead, idle_notified:false,
+    # curl fail) falls through to the existing stuck/active/#517-git chain below —
+    # the existing branches are neither removed nor reordered.
+    if _poll_pending_and_autohold "$sid" "$cwd" "$dispatched_at"; then
+      continue
+    fi
     local screen state_json action_json class action status
     screen=$(read_screen "$sid" 60)
     state_json=$(probe_from_screen "$sid" "$screen")
@@ -446,6 +457,105 @@ t=sys.stdin.read()
 f=re.search(r"(\d+) files? changed", t); a=re.search(r"(\d+) insertions?", t); d=re.search(r"(\d+) deletions?", t)
 print((f.group(1) if f else "0"), (a.group(1) if a else "0"), (d.group(1) if d else "0"))
 '
+}
+
+# --- #528: pendingReports poll + AUTO_HOLD ---------------------------------
+# _poll_pending_and_autohold <sid> <cwd> <dispatched_at>
+# Polls telepty GET /api/pendingReports/:sid (curl precedent: session-cleanup.sh).
+# Returns 0 ONLY when a fresh AUTO_HOLD was surfaced (caller should `continue`).
+# Returns 1 on every other outcome — curl fail (daemon down), 404 (cleared/dead),
+# idle_notified:false, or already-seen — so the caller falls through to the
+# existing #517 git chain. localhost is trusted, no token (http-auth.js) — §17:
+# curl + the daemon are already in use, no new dependency.
+_poll_pending_and_autohold() {
+  local sid="$1" cwd="$2" dispatched_at="$3"
+  local port="${TELEPTY_PORT:-3848}" resp http body
+  if ! resp=$("$CURL" -s -w $'\n%{http_code}' \
+        "http://127.0.0.1:${port}/api/pendingReports/${sid}" 2>/dev/null); then
+    # daemon down — best-effort skip + log, fall through (reconciler posture).
+    printf '%s %s\n' "$(now_iso)" "PENDING_POLL_SKIP sid=$sid curl_failed" >> "$DISCONNECTED_LOG"
+    return 1
+  fi
+  http="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+  [ "$http" = "200" ] || return 1            # 404 cleared/dead → #517 git path
+  local idle; idle=$(json_get "$body" idle_notified)
+  case "$idle" in True|true) ;; *) return 1;; esac   # idle_notified:false → NOOP
+  local inject_id; inject_id=$(json_get "$body" inject_id)
+  # Idempotency: one AUTO_HOLD per (dispatch, idle). New key form
+  # `sid<TAB>IDLE<TAB>inject_id` (whole-line grep -qxF; never collides with the
+  # AUTO_REPORT `sid<TAB>head_sha` form — shas are hex, never the literal IDLE).
+  # A re-dispatch gets a new inject_id, so a genuinely new idle re-surfaces.
+  if grep -qxF "$(printf '%s\tIDLE\t%s' "$sid" "$inject_id")" "$AUTO_REPORTS_SEEN" 2>/dev/null; then
+    return 1
+  fi
+  local auto_summary idle_at idle_secs spec_path files added removed now
+  auto_summary=$(json_get "$body" auto_summary)   # already daemon-redacted
+  idle_at=$(json_get "$body" idle_at)
+  now=$(now_iso)
+  idle_secs=$(_idle_secs "$idle_at" "$now")
+  spec_path=$(_spec_since "$cwd" "$dispatched_at")
+  read -r files added removed < <(_git_shortstat "$cwd" "$dispatched_at")
+  # auto-reports.log (JSON) — source of truth.
+  SID="$sid" NOW="$now" IDLE="$idle_secs" SUMMARY="$auto_summary" SPEC="$spec_path" \
+    FILES="$files" ADDED="$added" REMOVED="$removed" \
+    python3 - >> "$AUTO_REPORTS_LOG" <<'PY'
+import json,os
+print(json.dumps({"kind":"AUTO_HOLD","sid":os.environ["SID"],
+                  "emitted_at":os.environ["NOW"],
+                  "idle_for_secs":int(os.environ.get("IDLE","0") or 0),
+                  "summary":os.environ.get("SUMMARY",""),
+                  "spec_path":os.environ.get("SPEC",""),
+                  "files_changed":int(os.environ.get("FILES","0") or 0),
+                  "loc_added":int(os.environ.get("ADDED","0") or 0),
+                  "loc_removed":int(os.environ.get("REMOVED","0") or 0),
+                  "review_required":True}, ensure_ascii=False))
+PY
+  printf '%s\tIDLE\t%s\n' "$sid" "$inject_id" >> "$AUTO_REPORTS_SEEN"
+  emit_alert "AUTO_HOLD sid=$sid idle=${idle_secs}s spec=${spec_path:-none} — review/respond required"
+  if command -v "$TELEPTY" >/dev/null 2>&1; then
+    "$TELEPTY" inject --from "$TRACKER_SID" "$ORCH_SID" \
+      "AUTO_HOLD sid=$sid idle=${idle_secs}s spec=${spec_path:-none} — review/respond required" \
+      >/dev/null 2>&1 || true
+  fi
+  # Belt-and-suspenders: free daemon memory (fires a harmless TASK_DISMISSED we
+  # ignore). The seen-ledger is the primary idempotency guard, not this DELETE.
+  "$CURL" -s -o /dev/null -X DELETE \
+    "http://127.0.0.1:${port}/api/pendingReports/${sid}" 2>/dev/null || true
+  return 0
+}
+
+# _idle_secs <idle_at_iso|null|""> <now_iso> — whole seconds since idle_at (0 if absent).
+_idle_secs() {
+  IDLE_AT="$1" NOW="$2" python3 - <<'PY'
+import os,datetime
+def p(s):
+    try: return datetime.datetime.fromisoformat((s or "").replace("Z","+00:00"))
+    except Exception: return None
+a=p(os.environ.get("IDLE_AT","")); n=p(os.environ.get("NOW",""))
+print(max(0,int((n-a).total_seconds())) if a and n else 0)
+PY
+}
+
+# _spec_since <cwd> <dispatched_at> — first docs/specs/*.md written since dispatch
+# (SPEC FIRST evidence for an architect that wrote a spec but did not commit).
+# Best-effort: empty when cwd has no docs/specs or nothing is newer.
+_spec_since() {
+  local cwd="$1" since="$2"
+  [ -n "$cwd" ] && [ -d "$cwd/docs/specs" ] || { printf ''; return 0; }
+  CWD="$cwd" SINCE="$since" python3 - <<'PY'
+import os,glob,datetime
+cwd=os.environ["CWD"]; since=os.environ.get("SINCE","")
+try: sdt=datetime.datetime.fromisoformat(since.replace("Z","+00:00")).timestamp()
+except Exception: sdt=0
+hits=[]
+for p in glob.glob(os.path.join(cwd,"docs","specs","*.md")):
+    try:
+        if os.path.getmtime(p) >= sdt: hits.append(os.path.relpath(p,cwd))
+    except OSError: pass
+hits.sort()
+print(hits[0] if hits else "")
+PY
 }
 
 cmd_status() {
