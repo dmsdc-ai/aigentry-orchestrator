@@ -38,6 +38,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 TRACKER_SH="$SCRIPT_DIR/dispatch-tracker.sh"
 VERIFY_SH="$SCRIPT_DIR/dispatch-verify.sh"
 OPEN_SESSION_SH="${OPEN_SESSION_SH:-$SCRIPT_DIR/open-session.sh}"
+SESSION_PROBE_PY="${SESSION_PROBE_PY:-$SCRIPT_DIR/session-probe.py}"
 TELEPTY="${TELEPTY:-telepty}"
 EMIT_TELEMETRY_MJS="${EMIT_TELEMETRY_MJS:-$SCRIPT_DIR/emit-telemetry.mjs}"
 
@@ -174,45 +175,17 @@ except Exception:
 # so banner-in-tail alone can no longer mean not-ready. Drop this branch once
 # `telepty wait-ready` lands; the function shape stays as a defensive fallback.
 is_ready() {
-  local sid="$1" cli_kind="$2" screen
-  screen=$("$TELEPTY" read-screen "$sid" --lines 60 2>/dev/null || true)
-  CLI_KIND="$cli_kind" SCREEN="$screen" python3 - <<'PY'
-import os, re, sys
-cli = os.environ.get("CLI_KIND", "")
-text = os.environ.get("SCREEN", "")
-lines = [l.rstrip() for l in text.splitlines() if l.strip()]
-if not lines: sys.exit(1)
-tail   = "\n".join(lines[-20:])
-last3  = "\n".join(lines[-3:])
+  local sid="$1" cli_kind="$2" state
+  state=$(TELEPTY="$TELEPTY" "$SESSION_PROBE_PY" --sid "$sid" --cli "$cli_kind" 2>/dev/null || true)
+  [ -n "$state" ] || return 1
+  STATE_JSON="$state" python3 - <<'PY'
+import json, os, sys
 
-BANNERS = {
-  "claude": r"Welcome back|Tips for getting started|Trust this folder|Do you want to enable|Press Enter to continue",
-  "codex":  r"Welcome to .*Codex|OpenAI Codex CLI|Loading…|Initializing",
-  "gemini": r"Welcome to Gemini|Loading model|Initializing|Authenticating",
-}
-PROMPT = {"claude": r"❯", "codex": r"›", "gemini": r"›|│ >"}
-HARD_NEG = r"Working\.\.\.|Thinking|esc to interrupt|Press Enter to continue|Do you trust"
-banner = BANNERS.get(cli, r"Welcome|Initializing|Loading|Tips for getting started")
-prompt = PROMPT.get(cli, r"❯|›")
-
-banner_match = re.search(banner, tail)
-# Prompt/placeholder may sit ABOVE status-bar lines (claude 2.x renders
-# "context | model | budget" + "bypass permissions" + occasional MCP notices
-# AFTER the prompt area) so last3 alone misses real idle states (#431 T16
-# regression — 2026-05-23). Search the wider tail; HARD_NEG still checks last3
-# only because "Working...", "Thinking", trust-folder are reliably the
-# bottom-most active states.
-placeholder  = re.search(rf'(?m){prompt}\s+Try "[^"]+"', tail)
-prompt_only  = re.search(prompt, tail)
-hard_neg     = re.search(HARD_NEG, last3)
-
-if hard_neg:
-    sys.exit(1)
-if placeholder or prompt_only:
-    sys.exit(0)  # idle prompt anywhere in tail = ready (banner tolerated)
-if banner_match:
-    sys.exit(1)
-sys.exit(1)
+try:
+    state = json.loads(os.environ.get("STATE_JSON", "") or "{}")
+except Exception:
+    state = {}
+sys.exit(0 if state.get("ready") is True else 1)
 PY
 }
 

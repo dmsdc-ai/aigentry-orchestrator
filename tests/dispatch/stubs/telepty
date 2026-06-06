@@ -4,6 +4,7 @@
 #   STUB_LIST_FILE     — JSON for `list --json`
 case "$1" in
   read-screen) cat "${STUB_SCREEN_FILE:-/dev/null}";;
+  session)     shift; if [ "${1:-}" = "info" ]; then cat "${STUB_INFO_FILE:-/dev/null}"; else echo "stub telepty session $*"; fi;;
   list)        shift; if [ "${1:-}" = "--json" ]; then cat "${STUB_LIST_FILE:-/dev/null}"; else echo "stub: telepty list"; fi;;
   inject)      printf '%s ' "telepty inject" "$@" >> "${STUB_DISPATCH_LOG:-/dev/null}"; printf '\n' >> "${STUB_DISPATCH_LOG:-/dev/null}"; echo "stub inject OK";;
   *)           echo "stub telepty $*";;

@@ -26,6 +26,7 @@
 # Usage:
 #   session-reconciler.sh           # one tick
 #   session-reconciler.sh --dry-run # report what would happen, don't act
+#   session-reconciler.sh --shadow  # observe+decide only; append shadow JSONL
 #   session-reconciler.sh --once    # alias for default
 #   session-reconciler.sh --help
 
@@ -40,8 +41,14 @@ BACKOFF_JSON="$STATE_DIR/reconciler-backoff.json"
 RECONCILER_LOG="$STATE_DIR/reconciler.log"
 SCHEDULER_SH="${SCHEDULER_SH:-$SCRIPT_DIR/dispatch-cleanup-scheduler.sh}"
 CLEANUP_SH="${CLEANUP_SH:-$SCRIPT_DIR/session-cleanup.sh}"
+DISPATCH_SH="${DISPATCH_SH:-$SCRIPT_DIR/dispatch.sh}"
+SESSION_PROBE_PY="${SESSION_PROBE_PY:-$SCRIPT_DIR/session-probe.py}"
+POLICY_PY="${POLICY_PY:-$SCRIPT_DIR/policy.py}"
 TELEPTY="${TELEPTY:-telepty}"
 NOW_OVERRIDE="${RECONCILER_NOW:-}"
+SHADOW_LOG="${RECONCILE_SHADOW_LOG:-$STATE_DIR/reconcile-shadow.jsonl}"
+ESCALATION_LOG="$STATE_DIR/verify-escalations.jsonl"
+ALERTS_LOG="$STATE_DIR/alerts.log"
 PROTECTED_SIDS=(orchestrator)
 AGE_FLOOR_SECONDS="${RECONCILER_AGE_FLOOR:-300}"
 DISCONNECT_FLOOR_SECONDS="${RECONCILER_DISCONNECT_FLOOR:-240}"
@@ -86,6 +93,246 @@ atomic_write_json() {
   tmp=$(mktemp "${path}.tmp.XXXXXX")
   cat > "$tmp"
   mv "$tmp" "$path"
+}
+
+append_shadow_record() {
+  local sid="$1" status="$2" state_json="$3" action_json="$4" now
+  now=$(now_iso)
+  SHADOW_LOG="$SHADOW_LOG" NOW="$now" SID="$sid" STATUS="$status" \
+    STATE_JSON="$state_json" ACTION_JSON="$action_json" python3 - <<'PY'
+import json, os
+
+path = os.environ["SHADOW_LOG"]
+try:
+    state = json.loads(os.environ.get("STATE_JSON", "") or "{}")
+except Exception:
+    state = {"alive": False, "ready": False, "surface": "unknown", "activity": "static", "cli": "unknown", "detail": {"probe_error": "shadow state JSON parse failed"}}
+try:
+    action = json.loads(os.environ.get("ACTION_JSON", "") or "{}")
+except Exception:
+    action = {"action": "ESCALATE", "reason": "shadow action JSON parse failed", "status": os.environ.get("STATUS", "")}
+record = {
+    "ts": os.environ["NOW"],
+    "sid": os.environ["SID"],
+    "status": os.environ.get("STATUS", ""),
+    "state": state,
+    "action": action,
+}
+with open(path, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+PY
+}
+
+json_get() {
+  local json_text="$1" expr="$2"
+  JSON_TEXT="$json_text" EXPR="$expr" python3 - <<'PY'
+import json, os
+
+try:
+    data = json.loads(os.environ.get("JSON_TEXT", "") or "{}")
+except Exception:
+    data = {}
+cur = data
+for part in os.environ.get("EXPR", "").split("."):
+    if not part:
+        continue
+    if isinstance(cur, dict):
+        cur = cur.get(part, "")
+    else:
+        cur = ""
+        break
+print(cur if cur is not None else "")
+PY
+}
+
+registry_update_status() {
+  local sid="$1" status="$2" now
+  [ -n "$status" ] || return 0
+  now=$(now_iso)
+  ACTIVE_JSON="$ACTIVE_JSON" SID="$sid" ST="$status" NOW="$now" python3 - <<'PY'
+import fcntl, json, os
+
+path = os.environ["ACTIVE_JSON"]
+with open(path, "r+") as fh:
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    try:
+        entries = json.load(fh)
+    except Exception:
+        entries = []
+    for entry in entries if isinstance(entries, list) else []:
+        if entry.get("sid") == os.environ["SID"]:
+            entry["status"] = os.environ["ST"]
+            entry["last_seen_at"] = os.environ["NOW"]
+    fh.seek(0)
+    fh.truncate()
+    json.dump(entries, fh, indent=2, ensure_ascii=False)
+    fh.write("\n")
+PY
+}
+
+registry_note_redispatch() {
+  local sid="$1" now
+  now=$(now_iso)
+  ACTIVE_JSON="$ACTIVE_JSON" SID="$sid" NOW="$now" python3 - <<'PY'
+import fcntl, json, os, datetime
+
+path = os.environ["ACTIVE_JSON"]
+now = os.environ["NOW"]
+with open(path, "r+") as fh:
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    try:
+        entries = json.load(fh)
+    except Exception:
+        entries = []
+    for entry in entries if isinstance(entries, list) else []:
+        if entry.get("sid") == os.environ["SID"]:
+            entry["status"] = "re_dispatched"
+            entry["re_dispatch_count"] = int(entry.get("re_dispatch_count", 0)) + 1
+            entry["last_seen_at"] = now
+            dt = datetime.datetime.fromisoformat(now.replace("Z", "+00:00"))
+            entry["expected_report_by"] = (dt + datetime.timedelta(minutes=30)).isoformat(timespec="seconds").replace("+00:00", "Z")
+    fh.seek(0)
+    fh.truncate()
+    json.dump(entries, fh, indent=2, ensure_ascii=False)
+    fh.write("\n")
+PY
+}
+
+emit_alert() {
+  local line="$1"
+  printf '%s %s\n' "$(now_iso)" "$line" | tee -a "$ALERTS_LOG" >&2
+}
+
+emit_escalation() {
+  local sid="$1" action_json="$2"
+  TS="$(now_iso)" SID="$sid" ACTION_JSON="$action_json" python3 - <<'PY' >> "$ESCALATION_LOG"
+import json, os
+
+try:
+    action = json.loads(os.environ.get("ACTION_JSON", "") or "{}")
+except Exception:
+    action = {"action": "ESCALATE", "reason": "action JSON parse failed"}
+print(json.dumps({
+    "sid": os.environ["SID"],
+    "ts": os.environ["TS"],
+    "rc": 6,
+    "detail": action.get("reason", "reconciler escalation"),
+}, ensure_ascii=False))
+PY
+}
+
+policy_decide() {
+  local status="$1" state_json="$2"
+  printf '%s\n' "$state_json" | "$POLICY_PY" --status "$status" --state - 2>/dev/null || \
+    printf '%s\n' '{"action":"ESCALATE","reason":"policy failed","status":"'"$status"'"}'
+}
+
+probe_session() {
+  local sid="$1" state
+  state=$(TELEPTY="$TELEPTY" "$SESSION_PROBE_PY" --sid "$sid" 2>/dev/null || true)
+  if [ -z "$state" ]; then
+    printf '%s\n' '{"alive":false,"ready":false,"surface":"unknown","activity":"static","cli":"unknown","detail":{"probe_error":"session-probe failed"}}'
+  else
+    printf '%s\n' "$state"
+  fi
+}
+
+maybe_redispatch() {
+  local sid="$1" ref_path="$2" rdc="${3:-0}"
+  [ -z "$rdc" ] && rdc=0
+  if [ "$rdc" -ge 1 ]; then
+    emit_alert "REDISPATCH_CAP sid=$sid count=$rdc — user gate required"
+    return 0
+  fi
+  if [ -z "$ref_path" ] || [ ! -f "$ref_path" ]; then
+    emit_alert "REDISPATCH_FAILED sid=$sid ref_missing=$ref_path"
+    return 0
+  fi
+  emit_alert "REDISPATCH sid=$sid attempt=1 ref=$ref_path"
+  if "$DISPATCH_SH" --target "$sid" --ref "$ref_path" --verify-delivered >/dev/null 2>&1; then
+    registry_note_redispatch "$sid"
+  else
+    emit_alert "REDISPATCH_FAILED sid=$sid"
+  fi
+}
+
+apply_action() {
+  local sid="$1" status="$2" ref_path="$3" rdc="$4" action_json="$5"
+  local act key next_status
+  act=$(json_get "$action_json" action)
+  key=$(json_get "$action_json" key)
+  next_status=$(json_get "$action_json" status)
+  case "$act" in
+    NOOP)
+      [ -n "$next_status" ] && [ "$next_status" != "$status" ] && registry_update_status "$sid" "$next_status"
+      ;;
+    RESUBMIT_ENTER|SEND_KEY)
+      [ -n "$key" ] || key=enter
+      "$TELEPTY" send-key "$sid" "$key" >/dev/null 2>&1 || emit_alert "SEND_KEY_FAILED sid=$sid key=$key"
+      ;;
+    REDISPATCH)
+      maybe_redispatch "$sid" "$ref_path" "$rdc"
+      ;;
+    RESPAWN)
+      registry_update_status "$sid" "${next_status:-respawn_requested}"
+      emit_alert "RESPAWN_REQUESTED sid=$sid — spawn metadata unavailable; escalated"
+      emit_escalation "$sid" "$action_json"
+      ;;
+    CLEANUP)
+      if "$CLEANUP_SH" "$sid" >/dev/null 2>&1; then
+        log "CLEANUP ok sid=$sid"
+        backoff_reset "$sid"
+      else
+        log "CLEANUP fail sid=$sid — backoff"
+        backoff_record_failure "$sid"
+      fi
+      ;;
+    ESCALATE|*)
+      [ -n "$next_status" ] && [ "$next_status" != "$status" ] && registry_update_status "$sid" "$next_status"
+      emit_escalation "$sid" "$action_json"
+      ;;
+  esac
+}
+
+run_registry_loop() {
+  local act="$1" snap processed sid status ref_path rdc state_json action_json
+  [ -f "$ACTIVE_JSON" ] || { log "registry tick: no active registry"; return 0; }
+  snap=$(mktemp)
+  ACTIVE_JSON="$ACTIVE_JSON" python3 - > "$snap" <<'PY'
+import json, os
+
+try:
+    entries = json.load(open(os.environ["ACTIVE_JSON"], encoding="utf-8"))
+except Exception:
+    entries = []
+LIVE = {"in_flight", "re_dispatched", "stuck_welcome"}
+for entry in entries if isinstance(entries, list) else []:
+    sid = entry.get("sid")
+    if sid and entry.get("status", "") in LIVE:
+        print("\t".join([
+            sid,
+            entry.get("status", ""),
+            entry.get("ref_path", ""),
+            str(entry.get("re_dispatch_count", 0)),
+        ]))
+PY
+  processed=0
+  while IFS=$'\t' read -r sid status ref_path rdc; do
+    [ -z "$sid" ] && continue
+    state_json=$(probe_session "$sid")
+    action_json=$(policy_decide "$status" "$state_json")
+    append_shadow_record "$sid" "$status" "$state_json" "$action_json"
+    if [ "$act" = "1" ] && [ "$DRY_RUN" -eq 0 ]; then
+      apply_action "$sid" "$status" "$ref_path" "$rdc" "$action_json"
+    fi
+    processed=$((processed + 1))
+  done < "$snap"
+  rm -f "$snap"
+  log "registry tick: processed=$processed act=$act dry_run=$DRY_RUN"
+}
+
+run_shadow_loop() {
+  run_registry_loop 0
 }
 
 # compute_gc_root — print one sid per line for every "live" session.
@@ -293,26 +540,28 @@ consume_surface_mismatched() {
 }
 
 DRY_RUN=0
+SHADOW=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift;;
+    --shadow)  SHADOW=1; shift;;
     --once)    shift;;
     -h|--help) usage 0;;
     *) echo "unknown: $1" >&2; usage 4;;
   esac
 done
 
+if [ "$SHADOW" -eq 1 ]; then
+  run_shadow_loop
+  exit 0
+fi
+
+# --- step 0: Dispatch Registry observe→decide→act loop ---
+run_registry_loop 1
+
 # --- step 1: scheduler tick (Layer D fires due) ---
 if [ -x "$SCHEDULER_SH" ] && [ "$DRY_RUN" -eq 0 ]; then
   "$SCHEDULER_SH" tick || log "ERR scheduler tick non-zero"
-fi
-
-# --- step 1b: autonomous post-dispatch verify (orchestrator's role — automatic) ---
-# Verify+resubmit every still-in-flight dispatched session so a dropped submit CR
-# (#412/#508 codex init race) is auto-recovered without the user or an interactive
-# orchestrator turn. PASS → marker (stop); SUSPECT → escalation file.
-if [ -x "$SCRIPT_DIR/dispatch-autoverify.sh" ] && [ "$DRY_RUN" -eq 0 ]; then
-  "$SCRIPT_DIR/dispatch-autoverify.sh" || log "ERR dispatch-autoverify non-zero"
 fi
 
 # --- step 2: orphan sweep ---
@@ -354,6 +603,7 @@ while IFS=$'\t' read -r sid started health last_seen; do
   ppid=$(parent_pid_for_sid "$sid")
   if [ -n "$ppid" ] && ! pid_alive "$ppid"; then reasons="pid_dead"; fi
   if [ -z "$ppid" ]; then reasons="${reasons:+$reasons,}no_parent_pid"; fi
+  disc_age=0
   if [ "$health" = "DISCONNECTED" ]; then
     disc_age=$(seconds_since_iso "$last_seen")
     if [ "$disc_age" -ge "$DISCONNECT_FLOOR_SECONDS" ]; then
@@ -370,23 +620,40 @@ while IFS=$'\t' read -r sid started health last_seen; do
     reasons="${reasons:+$reasons,}surface_gone"
   fi
   if [ -z "$reasons" ]; then continue; fi
-  # INV-17 (#486 non-regression): surface_gone ALONE is NEVER sufficient. A
-  # cmux/warp app quit or restart vanishes ALL surfaces at once → every sid
-  # would probe "gone" → mass-kill. Require corroboration by a PID/disconnect
-  # signal; skip when surface_gone is the only reason (no single-signal close).
-  if [ "$reasons" = "surface_gone" ]; then
-    log "INV-17 skip sid=$sid — surface_gone single-signal (no pid/disconnect corroboration)"
+  state_json=$(SID="$sid" HEALTH="$health" AGE="$age" REASONS="$reasons" DISC_AGE="$disc_age" python3 - <<'PY'
+import json, os
+
+health = os.environ.get("HEALTH", "")
+cleanup = {
+    "age_seconds": int(os.environ.get("AGE") or 0),
+    "disconnect_age_seconds": int(os.environ.get("DISC_AGE") or 0),
+    "gc_root": False,
+    "keep_alive": False,
+    "reasons": [part for part in os.environ.get("REASONS", "").split(",") if part],
+}
+print(json.dumps({
+    "alive": health == "CONNECTED",
+    "ready": False,
+    "surface": "idle",
+    "activity": "static",
+    "cli": "unknown",
+    "detail": {"health": health, "cleanup": cleanup},
+}, separators=(",", ":")))
+PY
+)
+  action_json=$(policy_decide orphaned "$state_json")
+  append_shadow_record "$sid" orphaned "$state_json" "$action_json"
+  if [ "$(json_get "$action_json" action)" != "CLEANUP" ]; then
+    if [ "$reasons" = "surface_gone" ]; then
+      log "INV-17 skip sid=$sid — surface_gone single-signal (no pid/disconnect corroboration)"
+    else
+      log "SWEEP skip sid=$sid reason=$(json_get "$action_json" reason)"
+    fi
     continue
   fi
   log "SWEEP candidate sid=$sid age=${age}s health=$health reasons=$reasons"
   if [ "$DRY_RUN" -eq 1 ]; then continue; fi
-  if "$CLEANUP_SH" "$sid" >/dev/null 2>&1; then
-    log "SWEEP ok sid=$sid"
-    backoff_reset "$sid"
-  else
-    log "SWEEP fail sid=$sid — backoff"
-    backoff_record_failure "$sid"
-  fi
+  apply_action "$sid" orphaned "" 0 "$action_json"
   swept=$((swept + 1))
 done <<< "$candidates"
 
