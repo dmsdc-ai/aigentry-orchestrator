@@ -264,6 +264,20 @@ tracker_append() {
   "$TRACKER_SH" "${a[@]}" >/dev/null 2>&1 || true
 }
 
+# Best-effort registry registration (#517): record track/role/branch metadata for
+# this spawned dispatch so the reconciler's pull-AUTO_REPORT sweep can find it.
+# Upserts onto the append entry (single-owner active.json). Failure must NOT fail
+# the dispatch — the inject already landed.
+tracker_register() {
+  local sid="$1" branch=""
+  [ -x "$TRACKER_SH" ] || return 0
+  if [ -n "$cwd" ]; then
+    branch=$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+  fi
+  "$TRACKER_SH" register "$sid" --track "$track" --role "$role" --cwd "$cwd" --branch "$branch" \
+    >/dev/null 2>&1 || true
+}
+
 # --- main ---
 # Sourceable for tests: `DISPATCH_SH_NO_MAIN=1 source dispatch.sh` exposes
 # is_ready / verify_delivered without running the dispatch flow.
@@ -357,6 +371,7 @@ if [ "$verify_delivered" -eq 1 ]; then
 fi
 
 tracker_append "$sid" "$ref_hash"
+[ "$spawn" -eq 1 ] && tracker_register "$sid"
 emit_telemetry --helper dispatch --subtype dispatch_ack \
   --payload-json "$(printf '{"target_sid":"%s","verified":%s}' "$sid" "$([ "$verify_delivered" -eq 1 ] && echo true || echo false)")" \
   --correlation-id "$sid"

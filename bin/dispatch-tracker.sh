@@ -8,6 +8,7 @@
 #
 # Commands:
 #   dispatch-tracker.sh append <sid> <ref_path> <ref_hash> [--cwd <p>] [--from <sid>]
+#   dispatch-tracker.sh register <sid> [--track T] [--role R] [--cwd P] [--branch B] [--started-at TS]
 #   dispatch-tracker.sh check                    — one-shot scan; alerts to stdout + log
 #   dispatch-tracker.sh mark-reported <sid>      — orchestrator REPORT-receipt hook
 #   dispatch-tracker.sh status [<sid>]
@@ -41,7 +42,7 @@ NOW_OVERRIDE="${TRACKER_NOW:-}"
 mkdir -p "$STATE_DIR"
 [ -f "$ACTIVE_JSON" ] || printf '[]\n' > "$ACTIVE_JSON"
 
-usage() { sed -n '2,17p' "$0"; }
+usage() { sed -n '2,18p' "$0"; }
 
 now_iso() {
   if [ -n "$NOW_OVERRIDE" ]; then printf '%s' "$NOW_OVERRIDE"; return; fi
@@ -181,6 +182,52 @@ with open(path,"r+") as f:
     f.seek(0); f.truncate()
     json.dump(entries,f,indent=2,ensure_ascii=False); f.write("\n")
 PY
+}
+
+# register <sid> [--track T] [--role R] [--cwd P] [--branch B] [--started-at TS]
+# Upserts the tracker registry entry for <sid> (idempotent on sid) via the same
+# _mutate_state fcntl lock as every other writer — keeps active.json single-owner
+# (#517: dispatch.sh never populated the registry, so `check` found nothing to
+# AUTO_REPORT). Merges onto an existing entry (e.g. one already created by
+# `append`) rather than clobbering it; creates a fresh in_flight entry otherwise.
+cmd_register() {
+  local sid="$1"; shift
+  local track="" role="" cwd="" branch="" started_at=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --track) track="$2"; shift 2;;
+      --role) role="$2"; shift 2;;
+      --cwd) cwd="$2"; shift 2;;
+      --branch) branch="$2"; shift 2;;
+      --started-at) started_at="$2"; shift 2;;
+      *) echo "register: unknown $1" >&2; exit 4;;
+    esac
+  done
+  [ -n "$started_at" ] || started_at=$(now_iso)
+  SID="$sid" TRACK="$track" ROLE="$role" CWD="$cwd" BRANCH="$branch" STARTED="$started_at" \
+    _mutate_state "
+sid = os.environ['SID']
+fields = {
+    'track': os.environ['TRACK'],
+    'role': os.environ['ROLE'],
+    'cwd': os.environ['CWD'],
+    'branch': os.environ['BRANCH'],
+    'started_at': os.environ['STARTED'],
+}
+found = None
+for e in entries:
+    if e.get('sid') == sid:
+        found = e
+        break
+if found is None:
+    entry = {'sid': sid, 'status': 'in_flight', 'reported': None}
+    entry.update(fields)
+    entries.append(entry)
+else:
+    found.update(fields)
+    found.setdefault('reported', None)
+    found.setdefault('status', 'in_flight')
+"
 }
 
 cmd_mark_reported() {
@@ -435,6 +482,7 @@ main() {
   local cmd="$1"; shift
   case "$cmd" in
     append)         cmd_append "$@";;
+    register)       cmd_register "$@";;
     check)          cmd_check "$@";;
     mark-reported)  cmd_mark_reported "$@";;
     status)         cmd_status "$@";;

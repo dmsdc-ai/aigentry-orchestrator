@@ -59,6 +59,7 @@ export AIGENTRY_CMUX_ORPHAN_LEDGER="${AIGENTRY_CMUX_ORPHAN_LEDGER:-$STATE_DIR/cm
 SCHEDULER_SH="${SCHEDULER_SH:-$SCRIPT_DIR/dispatch-cleanup-scheduler.sh}"
 CLEANUP_SH="${CLEANUP_SH:-$SCRIPT_DIR/session-cleanup.sh}"
 DISPATCH_SH="${DISPATCH_SH:-$SCRIPT_DIR/dispatch.sh}"
+TRACKER_SH="${TRACKER_SH:-$SCRIPT_DIR/dispatch-tracker.sh}"
 SESSION_PROBE_PY="${SESSION_PROBE_PY:-$SCRIPT_DIR/session-probe.py}"
 POLICY_PY="${POLICY_PY:-$SCRIPT_DIR/policy.py}"
 TELEPTY="${TELEPTY:-telepty}"
@@ -595,6 +596,16 @@ fi
 
 # --- step 0: Dispatch Registry observe→decide→act loop ---
 run_registry_loop 1
+
+# --- step 0b: pull-AUTO_REPORT (#517) — the tracker scans in-flight dispatches
+# whose expected_report_by elapsed and emits AUTO_REPORT for any with new authored
+# commits. This is the orchestrator's pull-fallback for missed REPORT injects.
+# Best-effort: a non-zero scan never blocks the sweep. Skipped under --dry-run
+# because `check` mutates state (auto-reports.seen / status) and injects to the
+# orchestrator — emission is act-only. Idempotency lives in the tracker.
+if [ -x "$TRACKER_SH" ] && [ "$DRY_RUN" -eq 0 ]; then
+  "$TRACKER_SH" check >/dev/null 2>&1 || log "ERR tracker check non-zero (continuing)"
+fi
 
 # --- step 1: scheduler tick (Layer D fires due) ---
 if [ -x "$SCHEDULER_SH" ] && [ "$DRY_RUN" -eq 0 ]; then
