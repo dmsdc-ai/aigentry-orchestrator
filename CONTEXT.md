@@ -44,6 +44,30 @@ _Avoid_: pause, wait, idle.
 A self-contained spec file (`state/dispatch/YYYY-MM-DD-<topic>.md`) used as `--ref` payload for `telepty inject`. `dispatch_kind: fresh-session` requires inline excerpts of all cited Rules/§/envelopes (receiver has no prior context).
 _Avoid_: spec, prompt, brief.
 
+**Session Reconcile Loop**:
+The single level-triggered control loop (driven by the existing 60s launchd Reconciler) that owns all workflow automation: per Session in the Dispatch Registry it runs **observe → decide → act** (`SessionProbe` → `Policy` → `Action`). Generalizes the ADR 2026-05-20 Reconciler from cleanup-only to the whole lifecycle. ADR 2026-06-06.
+_Avoid_: scheduler, watchdog, controller.
+
+**SessionProbe**:
+The single authority that observes a Session's current state — `observe(sid) → SessionState`. Reads telepty screen + session-info and classifies. Replaces the three drifting classifiers (`dispatch.sh:is_ready`, `dispatch-verify`, `dispatch-tracker:classify_screen`). All banner/error/spinner/modal regex lives here and nowhere else. ADR 2026-06-06.
+_Avoid_: classifier, detector, parser.
+
+**SessionState**:
+The structured value SessionProbe returns: `{ alive, ready, surface, activity, cli, detail }`. `surface ∈ {working, idle, unsubmitted, welcome, modal, error, crash, thinking_block, sandbox_prompt, raw_shell}`; `activity ∈ {moving, static}`. The unit-test surface for Policy.
+_Avoid_: status, screen, health.
+
+**Policy**:
+A **pure function** `decide(status, SessionState) → Action` — the orchestrator's autonomous decision-making in one place, a table, testable on SessionState fixtures with no I/O. ADR 2026-06-06.
+_Avoid_: rules, handler, logic.
+
+**Action**:
+What Policy decides the Session Reconcile Loop should do: `{ NOOP, RESUBMIT_ENTER, SEND_KEY, RESPAWN, REDISPATCH, CLEANUP, ESCALATE }` (v1). Applied via existing primitives (`dispatch.sh`, `telepty send-key`, `session-cleanup.sh`).
+_Avoid_: command, op, task.
+
+**Escalate**:
+The single Action that surfaces to the interactive orchestrator (genuine business/architecture decision) via `verify-escalations.jsonl` — now the *exception* channel, not the default. Every other Action resolves autonomously. ESCALATE is also the ambiguity default (when SessionState is unknown, never act destructively).
+_Avoid_: alert, notify.
+
 ## Relationships
 
 - A **Session** is registered in **telepty** (mandatory) and may have a **Workspace Host** (optional).
