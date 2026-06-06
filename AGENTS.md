@@ -68,6 +68,18 @@
 4. 유휴턴 시 자동으로 다음 태스크 추천
 5. 매 응답 끝 1줄 태스크 요약
 
+### 표준 오케스트레이션 시퀀스
+
+매 위임 턴은 `orchestrate-turn` 스킬(`.agents/skills/orchestrate-turn/SKILL.md`)의 5단계 rigid 체크리스트를 따른다. 스킬은 actuation을 재구현하지 않고 atomic 스크립트 계층(`bin/dispatch.sh`, `bin/session-cleanup.sh`, `bin/tq-*.sh`, deliberation MCP)에 위임한다 (DRY / Rule 4 — 오케스트레이터는 `bin/` 코드를 직접 작성하지 않는다). 단계별 상세 command form + step→infra 매핑 + skip 시 failure mode는 스킬 본문 참조.
+
+1. **컨텍스트 확인** — 사용자와 작업 맥락 확정 (모호 시 N개 해석 surface). 1-1 분해 → 세션 수 결정 (`bin/tq-track.sh`); 1-2 parallel-first, 충돌 시 sequential (Rule 9; ≥3 ⇒ deliberation); 1-3 CLI 매칭 (claude/codex/gemini → `--cli`/`--role`).
+2. **spawn + inject** — `bin/dispatch.sh --spawn-and-dispatch --cli <c> --role <r> --ref <file>` (long-context ref file; 짧은 inline ack/follow-up만 raw `telepty inject`) → `open-session.sh` → `workspace-host.sh` 어댑터. 2-1 clarification은 오케스트레이터에 HOLD; 2-2 사용자 확인 후 re-inject; 2-3 세션 간 통신은 info-only (위 "세션 간 통신" 규칙).
+3. **REPORT** — worker `telepty inject` push + #517 pull-AUTO_REPORT fallback (`bin/dispatch-tracker.sh check` via reconcile tick; push만 의존 금지).
+4. **리뷰 → 사용자 확인 → cleanup** — `bin/session-cleanup.sh <sid>` (telepty DELETE + 터미널 어댑터 close, **양쪽** surface; Rule 28).
+5. **다음 태스크 추천** — `bin/tq-status.sh` / `bin/tq-focus.sh` + `state/task-queue.json` (추천 ≠ fire; confirm 후 실행).
+
+> 전체 체크리스트 + 정확한 커맨드 형식 + step→infra 매핑: `orchestrate-turn` 스킬. ADR: `docs/adr/2026-06-06-orchestration-sequence.md`.
+
 태스크 보드: `state/task-queue.json`
 
 ## 응답 원칙
@@ -96,7 +108,7 @@ telepty list
 
 **경유 흐름**: 오케스트레이터 → deliberation에 병렬 태스크 등록 → deliberation이 각 세션에 inject + 추적 → 각 세션이 deliberation에 보고 → deliberation이 충돌 감지 + 합성 → 오케스트레이터에 최종 1건 보고.
 
-**세션 간 자유 토론**: deliberation 경유 필수. 세션 간 직접 inject 금지. 3라운드 이상 시 오케스트레이터에 에스컬레이션.
+**세션 간 통신**: **정보 확보 목적의 직접 telepty inject 허용** (read-only context request). 구현/작업의 세션 간 위임 금지 — 구현 필요 시 요청 세션 → 오케스트레이터 경유 → 사용자 확인(HITL) → **오케스트레이터가** 적절한 세션에 위임 (세션이 세션에 위임 ❌; spawn-capability gate 보존 ADR-MF #8). 직접 info 교환은 **3라운드 cap** — 초과 또는 충돌 시 deliberation MCP(≥3자) 또는 오케스트레이터로 에스컬레이션.
 
 ## 위임 inject 필수 포함 (요약)
 
