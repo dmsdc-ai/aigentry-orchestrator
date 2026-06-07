@@ -3,15 +3,18 @@
 # Reads ~/.aigentry/telemetry/spawn-events-YYYY-MM-DD.ndjson files and writes
 # a markdown summary (orch dashboard surface, default state/telemetry/SUMMARY.md).
 # OQ6 — parser is `node -e` (Article 17 무의존: no jq dep; Node ≥20 already required).
-# Usage: spawn-telemetry-report.sh [--days N] [--root DIR] [--out PATH]
+# Usage: spawn-telemetry-report.sh [--days N] [--root DIR] [--out PATH] [--asof YYYY-MM-DD]
+# --asof anchors the freshness window to a fixed UTC date (default: today). Used to
+# backfill/replay a specific date and to make date-sensitive tests deterministic.
 set -euo pipefail
 
-days=7; root="${HOME}/.aigentry/telemetry"; out=""
+days=7; root="${HOME}/.aigentry/telemetry"; out=""; asof=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --days) days="$2"; shift 2 ;;
     --root) root="$2"; shift 2 ;;
     --out)  out="$2";  shift 2 ;;
+    --asof) asof="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 64 ;;
   esac
 done
@@ -19,7 +22,12 @@ if [ -z "$out" ]; then mkdir -p state/telemetry; out="state/telemetry/SUMMARY.md
 
 files=()
 for ((i = days - 1; i >= 0; i--)); do
-  d=$(date -u -v "-${i}d" +%Y-%m-%d 2>/dev/null || date -u -d "${i} days ago" +%Y-%m-%d)
+  if [ -n "$asof" ]; then
+    d=$(date -u -j -v "-${i}d" -f "%Y-%m-%d" "$asof" +%Y-%m-%d 2>/dev/null \
+        || date -u -d "$asof - ${i} days" +%Y-%m-%d)
+  else
+    d=$(date -u -v "-${i}d" +%Y-%m-%d 2>/dev/null || date -u -d "${i} days ago" +%Y-%m-%d)
+  fi
   f="${root}/spawn-events-${d}.ndjson"
   [ -f "$f" ] && files+=("$f")
 done

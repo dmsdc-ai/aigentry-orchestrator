@@ -228,7 +228,7 @@ test("report.sh aggregation (12) — counts events by kind, surfaces top reasons
     spawnSync("mkdir", ["-p", dir]);
     writeFileSync(fp, lines, "utf8");
     const out = join(outDir, "SUMMARY.md");
-    const r = spawnSync("bash", ["bin/spawn-telemetry-report.sh", "--root", root, "--out", out, "--days", "1"], { encoding: "utf8" });
+    const r = spawnSync("bash", ["bin/spawn-telemetry-report.sh", "--root", root, "--out", out, "--days", "1", "--asof", "2026-05-12"], { encoding: "utf8" });
     assert.equal(r.status, 0, r.stderr);
     const md = readFileSync(out, "utf8");
     assert.match(md, /spawn_accepted.*1/);
