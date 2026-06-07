@@ -252,7 +252,7 @@ const CLI_MATRIX = [
     settingsFile: "settings.json",
     globalCanary: "GLOBAL-GEMINI-CANARY-532-must-not-leak",
     forbiddenFlags: ["--append-system-prompt-file", "--bare", "--permission-mode"],
-    requiredFlags: ["-m", "gemini-3.1-pro-preview", "--approval-mode", "yolo", "--skip-trust"],
+    requiredFlags: ["-m", "gemini-2.5-flash", "--approval-mode", "yolo", "--skip-trust"],
   },
 ] as const;
 
@@ -374,3 +374,25 @@ for (const m of CLI_MATRIX) {
     }
   });
 }
+
+test("551-gemini — AIGENTRY_GEMINI_MODEL overrides boot-prep launcher model", () => {
+  if (!cliAvailable("gemini")) { console.error("551-gemini SKIP — gemini not installed"); return; }
+  const { home, targetCwd, cleanup } = setupTempHome();
+  try {
+    const gemini = CLI_MATRIX.find((m) => m.cli === "gemini")!;
+    const fakeReal = setupFakeCliHome(home, gemini);
+    const r = runBootPrepareEnv(home, {
+      GEMINI_CLI_HOME: fakeReal,
+      AIGENTRY_GEMINI_MODEL: "gemini-test-override",
+    }, ["--role", "coder", "--cwd", targetCwd, "--sid", "t551-gemini", "--cli", "gemini"]);
+    assert.equal(r.code, 0, `exit ${r.code} stderr=${r.stderr}`);
+    const j = parseJson(r.stdout);
+    const execLine = readFileSync(j.spawn_cli, "utf8")
+      .split("\n")
+      .find((l) => /^\s*exec\b/.test(l));
+    assert.ok(execLine, "launcher must contain an exec line");
+    assert.match(execLine!, /-m gemini-test-override\b/);
+  } finally {
+    cleanup();
+  }
+});

@@ -68,7 +68,7 @@ test("5. gemini argv = real default flags; additive descriptor (GEMINI.md / GEMI
     staging_dir: STAGING, fs: memoryBootFs(), spawner: mockSpawner(ALL()),
   });
   assert.deepEqual([...cmd.argv], [
-    "gemini", "-m", "gemini-3.1-pro-preview",
+    "gemini", "-m", "gemini-2.5-flash",
     "--approval-mode", "yolo", "--skip-trust",
   ]);
   assert.equal(cmd.cwd, "/work/myproj");
@@ -77,6 +77,23 @@ test("5. gemini argv = real default flags; additive descriptor (GEMINI.md / GEMI
   assert.equal(adapter.contextFile, "GEMINI.md");
   assert.equal(adapter.homeEnv, "GEMINI_CLI_HOME");
   assert.deepEqual([...adapter.homeExclude], ["GEMINI.md"]);
+});
+
+test("5b. gemini argv reads AIGENTRY_GEMINI_MODEL override (#551)", async () => {
+  const prior = process.env.AIGENTRY_GEMINI_MODEL;
+  process.env.AIGENTRY_GEMINI_MODEL = "gemini-test-override";
+  try {
+    const cmd = await getBootAdapter("gemini").buildBootCommand(makeCtx(), makeResolved(), {
+      staging_dir: STAGING, fs: memoryBootFs(), spawner: mockSpawner(ALL()),
+    });
+    assert.deepEqual([...cmd.argv], [
+      "gemini", "-m", "gemini-test-override",
+      "--approval-mode", "yolo", "--skip-trust",
+    ]);
+  } finally {
+    if (prior === undefined) delete process.env.AIGENTRY_GEMINI_MODEL;
+    else process.env.AIGENTRY_GEMINI_MODEL = prior;
+  }
 });
 
 test("6. codex additive path does NOT probe --cd (no scratch /control dir) (#532)", async () => {

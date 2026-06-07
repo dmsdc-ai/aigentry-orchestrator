@@ -39,7 +39,7 @@ export function geminiAdapter() {
       argv: [
         "gemini",
         "-m",
-        "gemini-3.1-pro-preview",
+        process.env.AIGENTRY_GEMINI_MODEL || "gemini-2.5-flash",
         "--approval-mode",
         "yolo",
         "--skip-trust",

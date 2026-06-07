@@ -60,7 +60,7 @@ default_cli_flags() {
   case "$1" in
     claude) printf '%s\n' "--permission-mode bypassPermissions";;
     codex)  printf '%s\n' "-c check_for_update_on_startup=false --dangerously-bypass-approvals-and-sandbox";;
-    gemini) printf '%s\n' "-m gemini-3.1-pro-preview --approval-mode yolo";;
+    gemini) printf '%s\n' "-m \"${AIGENTRY_GEMINI_MODEL:-gemini-2.5-flash}\" --approval-mode yolo";;
     *)      printf '%s\n' "";;
   esac
 }
