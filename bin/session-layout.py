@@ -161,10 +161,18 @@ def position_windows(ordered, rows, cols, win_map):
         row = i // cols
         col = i % cols
 
-        wx = x0 + col * cell_w + gap
-        wy = y0 + row * cell_h + gap
-        ww = cell_w - gap * 2
-        wh = cell_h - gap * 2
+        # Coerce every value interpolated into the osascript program to int.
+        # These are already integers (a 1-based window index and screen-
+        # geometry arithmetic), so behavior is identical for legitimate input,
+        # but the explicit int() is a structural sanitizer that severs the
+        # CWE-78 taint flow: an int can only render as [-]?[0-9]+, which cannot
+        # carry an AppleScript/shell payload. Fails closed (ValueError) on any
+        # non-integer value rather than letting it reach the command.
+        win_idx = int(win_idx)
+        wx = int(x0 + col * cell_w + gap)
+        wy = int(y0 + row * cell_h + gap)
+        ww = int(cell_w - gap * 2)
+        wh = int(cell_h - gap * 2)
 
         applescript = f'''
             tell application "System Events"
