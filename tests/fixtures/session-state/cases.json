@@ -9,6 +9,15 @@
     "expect_action": {"action": "NOOP", "status": "in_flight"}
   },
   {
+    "name": "codex-mcp-boot-ready",
+    "screen": "codex-mcp-boot.screen",
+    "info": "codex-connected.info",
+    "status": "in_flight",
+    "expect_state": {"surface": "working", "activity": "moving", "cli": "codex", "ready": true},
+    "expect_detail": {"ready_reason": "prompt", "tracker_class": "done"},
+    "expect_action": {"action": "NOOP", "status": "in_flight"}
+  },
+  {
     "name": "unsubmitted-context-ref",
     "screen": "unsubmitted-context-ref.screen",
     "info": "codex-connected.info",
