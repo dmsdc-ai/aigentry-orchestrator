@@ -6,6 +6,12 @@
 #   session-start.sh --kill       # Kill all sessions first, then start
 #   session-start.sh --layout     # Start + arrange grid layout
 #   session-start.sh --kill --layout  # Full reset: kill, start, layout
+#
+# NOTE (#539): this launches WORKER/project sessions. The orchestrator
+# ("control tower") boots separately via bin/orchestrator-boot.sh, which enforces
+# singleton-at-boot (SIGKILL any stale `telepty allow --id <orchestrator-sid>`
+# bridge before exec). Boot the orchestrator via that wrapper, not a bare
+# `telepty allow`.
 
 set -uo pipefail
 
