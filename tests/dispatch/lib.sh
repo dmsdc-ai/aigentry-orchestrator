@@ -49,7 +49,10 @@ t_teardown() {
 
 t_assert_contains() {
   local file="$1" needle="$2"
-  if ! grep -qF "$needle" "$file" 2>/dev/null; then
+  # `--` ends option parsing so a needle starting with `-`/`--` (e.g. an inject's
+  # `--from <sid>` flag, T44) is matched literally rather than mis-read as a grep
+  # option (ugrep/BSD grep both reject leading-dash patterns otherwise).
+  if ! grep -qF -- "$needle" "$file" 2>/dev/null; then
     echo "FAIL: $file does not contain: $needle" >&2
     echo "--- file content ---" >&2
     cat "$file" >&2 || true
