@@ -109,7 +109,7 @@ telepty list
 
 **경유 흐름**: 오케스트레이터 → deliberation에 병렬 태스크 등록 → deliberation이 각 세션에 inject + 추적 → 각 세션이 deliberation에 보고 → deliberation이 충돌 감지 + 합성 → 오케스트레이터에 최종 1건 보고.
 
-**세션 간 통신**: **정보 확보 목적의 직접 telepty inject 허용** (read-only context request). 구현/작업의 세션 간 위임 금지 — 구현 필요 시 요청 세션 → 오케스트레이터 경유 → 사용자 확인(HITL) → **오케스트레이터가** 적절한 세션에 위임 (세션이 세션에 위임 ❌; spawn-capability gate 보존 ADR-MF #8). 직접 info 교환은 **3라운드 cap** — 초과 또는 충돌 시 deliberation MCP(≥3자) 또는 오케스트레이터로 에스컬레이션.
+**세션 간 통신**: **정보 확보 목적의 직접 telepty inject 허용** (read-only context request). 구현/작업의 세션 간 위임 금지 — 구현 필요 시 요청 세션 → 오케스트레이터 경유 → 사용자 확인(HITL) → **오케스트레이터가** 적절한 세션에 위임 (세션이 세션에 위임 ❌; spawn-capability gate 보존 ADR-MF #8). 직접 info 교환은 **3라운드 cap** — 초과 또는 충돌 시 deliberation MCP(≥3자) 또는 오케스트레이터로 에스컬레이션. **가드레일 (Phase 1, #533)**: 유일한 sanctioned peer 채널은 `bin/ask.sh` (`ask-request`/`ask-reply` 구조적 envelope + 라운드 카운터); raw peer→peer inject는 reconcile-tick auditor `bin/session-comms-auditor.sh`가 warn-mode로 감사 (out-of-policy → telemetry + 오케스트레이터 HOLD). 카운터: `state/session-comms/<pairkey>__<thread>.json`. daemon hard-block은 Phase 2 (telepty#18). SPEC: `docs/adr/2026-06-07-session-comms-guardrail.md` + `docs/superpowers/specs/2026-06-07-session-comms-guardrail.md`.
 
 ## 위임 inject 필수 포함 (요약)
 
