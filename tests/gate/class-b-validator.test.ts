@@ -64,6 +64,12 @@ test("persistAgentRecord writes canonical JSON under sessions/{parent}/agents/",
     if (res.ok) {
       const { path: target, sha256 } = await persistAgentRecord("S-parent", res.record, root);
       assert.ok(existsSync(target));
+      // #554 false positive: `target` = mkdtemp `root` + hardcoded "S-parent" +
+      // hardcoded agent_id "A-1" (persistAgentRecord path.join). Snyk taints it via
+      // a Role-enum value formatted into an ERR_ROLE_UNKNOWN message
+      // (permission-manager.ts:104) — a closed enum validated upstream, never the
+      // path component, never external input. Test-only read of a self-made temp file.
+      // deepcode ignore javascript/PT/test: see #554 note above — test-fixture false positive
       assert.equal(JSON.parse(readFileSync(target, "utf8")).agent_id, "A-1");
       assert.equal(sha256.length, 64);
     }

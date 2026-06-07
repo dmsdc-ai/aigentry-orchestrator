@@ -25,6 +25,12 @@ test("W1 — degraded role flows through resolver to logger layer", async (t: Te
   assert.equal(r.effective_role, Role.logger);
   const ROOT = "/instr-W";
   const vfs = buildLayeredFs({ root: ROOT, layers: { roles: { [Role.logger]: "LOGGER ONLY\n", [Role.coder]: "CODER ONLY\n" } } });
+  // #554 false positive: resolveInstructions reads role-instruction files from the
+  // in-memory `vfs` (buildLayeredFs), not real disk; the path is a validated Role
+  // enum (Role.logger) joined to the fixed ROOT. Snyk taints it via a Role-enum
+  // value formatted into an ERR_ROLE_UNKNOWN message (permission-manager.ts:104) —
+  // a closed enum, never external input. No attacker-controlled traversal reachable.
+  // deepcode ignore javascript/PT/test: see #554 note above — test-fixture false positive
   const resolved = await resolveInstructions({ role: r.effective_role, cwd: "/nowhere", task_prompt: "T\n", task_source_path: "/d/t.md", instructions_root: ROOT }, vfs);
   assert.ok(resolved.effective_prompt.includes("LOGGER ONLY"));
   assert.equal(resolved.effective_prompt.includes("CODER ONLY"), false);
