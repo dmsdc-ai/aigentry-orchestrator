@@ -22,6 +22,11 @@ BANNERS = {
 }
 PROMPTS = {"claude": r"\u276f", "codex": r"\u203a", "gemini": r"\u203a|\u2502 >"}
 HARD_NEG = r"Working\.\.\.|Thinking|esc to interrupt|Press Enter to continue|Do you trust"
+# #557: codex's `\u203a` REPL is interactive WHILE its MCP servers boot, but the
+# "Starting MCP servers (n/6) \u2026 (esc to interrupt)" status line trips HARD_NEG via
+# the "esc to interrupt" affordance. This pattern marks that boot status so the
+# ready probe can treat the prompt as ready during MCP boot (NOT a working spinner).
+CODEX_MCP_BOOT = r"Starting MCP servers?\s*\(\d+/\d+\)"
 
 TRUST_MODAL = r"trust this folder|do you trust|Yes, (proceed|I trust)|Press Enter to continue"
 SANDBOX_PROMPT = r"Allow command\?|sandbox.*approv|approve this command|Do you want to (run|allow)"
@@ -156,7 +161,18 @@ def ready_by_screen(cli: str, screen: str) -> tuple[bool, str]:
     prompt = PROMPTS.get(cli, r"\u276f|\u203a")
 
     if re.search(HARD_NEG, last3, re.I):
-        return False, "hard-negative"
+        # #557: a codex session mid MCP-server boot shows its interactive `›` REPL
+        # alongside "Starting MCP servers (n/6) … (esc to interrupt)". That status
+        # line is the boot affordance, not a working/thinking spinner — accept the
+        # prompt as ready so dispatch need not wait out the full 6-server boot.
+        codex_mcp_boot = (
+            cli == "codex"
+            and re.search(CODEX_MCP_BOOT, tail20, re.I)
+            and not re.search(r"Working|Thinking|Compacting", last3, re.I)
+            and re.search(prompt, tail20)
+        )
+        if not codex_mcp_boot:
+            return False, "hard-negative"
     if re.search(rf'(?m){prompt}\s+Try "[^"]+"', tail20) or re.search(prompt, tail20):
         return True, "prompt"
     if re.search(banner, tail20, re.I):

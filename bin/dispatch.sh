@@ -119,7 +119,7 @@ write_worker_launcher() {
 
 usage() { sed -n '2,24p' "$0"; }
 
-target=""; ref_file=""; from_id=""; timeout_ms=30000
+target=""; ref_file=""; from_id=""; timeout_ms=30000; timeout_explicit=0
 spawn=0; track=""; name=""; cwd=""; cli="claude"
 verify_delivered=0
 verify_started=1  # Rule 33: confirm session actually started working post-inject. --no-verify-started to skip.
@@ -131,7 +131,7 @@ while [ $# -gt 0 ]; do
     --target) target="$2"; shift 2;;
     --ref) ref_file="$2"; shift 2;;
     --from) from_id="$2"; shift 2;;
-    --timeout-ms) timeout_ms="$2"; shift 2;;
+    --timeout-ms) timeout_ms="$2"; timeout_explicit=1; shift 2;;
     --spawn-and-dispatch) spawn=1; shift;;
     --track) track="$2"; shift 2;;
     --name) name="$2"; shift 2;;
@@ -192,17 +192,25 @@ PY
 }
 
 wait_for_ready() {
-  local sid="$1" cli_kind deadline
+  local sid="$1" cli_kind deadline effective_timeout
   cli_kind=$(cli_of "$sid")
   if [ -z "$cli_kind" ]; then
     echo "dispatch.sh: session '$sid' not found in telepty list" >&2
     return 1
   fi
-  deadline=$(( $(now_ms) + timeout_ms ))
+  effective_timeout="$timeout_ms"
+  # #557: codex reaches its interactive `›` REPL within seconds, but its 6 MCP
+  # servers can take >30s to finish booting; on slow boots the prompt-ready signal
+  # may not stabilize until that completes. Give codex a longer default ceiling
+  # (claude/gemini unchanged). An explicit --timeout-ms always wins.
+  if [ "$cli_kind" = "codex" ] && [ "$timeout_explicit" -eq 0 ]; then
+    effective_timeout="${AIGENTRY_CODEX_READY_TIMEOUT_MS:-90000}"
+  fi
+  deadline=$(( $(now_ms) + effective_timeout ))
   while :; do
     if is_ready "$sid" "$cli_kind"; then return 0; fi
     if [ "$(now_ms)" -ge "$deadline" ]; then
-      echo "dispatch.sh: timeout (${timeout_ms}ms) waiting for $sid REPL ready (cli=$cli_kind)" >&2
+      echo "dispatch.sh: timeout (${effective_timeout}ms) waiting for $sid REPL ready (cli=$cli_kind)" >&2
       return 1
     fi
     sleep 0.5
