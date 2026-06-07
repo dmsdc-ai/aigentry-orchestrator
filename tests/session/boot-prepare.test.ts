@@ -183,14 +183,12 @@ test("431-H — effective_prompt.md appends the session contract preamble", () =
   }
 });
 
-test("431-C — codex/gemini rejected at this dispatch (UPSTREAM-GAP deferred)", () => {
+test("431-C — unknown --cli still rejected (#532 lifted claude-only gate to claude|codex|gemini)", () => {
   const { home, targetCwd, cleanup } = setupTempHome();
   try {
-    for (const cli of ["codex", "gemini"] as const) {
-      const r = runBootPrepare(home, ["--role", "coder", "--cwd", targetCwd, "--sid", "test-431-C", "--cli", cli]);
-      assert.notEqual(r.code, 0);
-      assert.match(r.stderr, /only --cli claude supported/);
-    }
+    const r = runBootPrepare(home, ["--role", "coder", "--cwd", targetCwd, "--sid", "test-431-C", "--cli", "opencode"]);
+    assert.notEqual(r.code, 0);
+    assert.match(r.stderr, /unsupported --cli|unknown CLI|opencode/);
   } finally {
     cleanup();
   }
@@ -212,3 +210,167 @@ test("431-E — missing required arg surfaces usage exit (4)", () => {
   assert.equal(r.status, 4);
   assert.match(r.stderr, /--cwd required/);
 });
+
+// ---------------------------------------------------------------------------
+// #532 — codex / gemini additive role-injection (cwd context file + shadow home).
+//
+// boot-prepare stages the SAME effective_prompt.md (role layers + session
+// contract) into the sandbox cwd under the CLI's auto-discovered context
+// filename (codex AGENTS.md / gemini GEMINI.md) instead of a flag, and redirects
+// the CLI config-home env to a per-session shadow home that symlink-mirrors the
+// real home MINUS the global doc (so the per-user global AGENTS.md/GEMINI.md
+// cannot leak) while PRESERVING auth (auth.json / oauth_creds.json).
+//
+// These spawn the real boot-prepare, which version-gates the actual CLI — skipped
+// when the CLI binary is absent (CI). The config-home is pointed at a FAKE real
+// home via env so no live ~/.codex / ~/.gemini is touched.
+// ---------------------------------------------------------------------------
+
+function cliAvailable(cli: string): boolean {
+  const r = spawnSync(cli, ["--version"], { encoding: "utf8" });
+  return r.status === 0;
+}
+
+const CLI_MATRIX = [
+  {
+    cli: "codex",
+    contextFile: "AGENTS.md",
+    homeEnv: "CODEX_HOME",
+    shadowDir: ".codexhome",
+    authFile: "auth.json",
+    settingsFile: "config.toml",
+    globalCanary: "GLOBAL-CODEX-CANARY-532-must-not-leak",
+    forbiddenFlags: ["--append-system-prompt-file", "--bare", "--permission-mode"],
+    requiredFlags: ["-c", "check_for_update_on_startup=false", "--dangerously-bypass-approvals-and-sandbox"],
+  },
+  {
+    cli: "gemini",
+    contextFile: "GEMINI.md",
+    homeEnv: "GEMINI_CLI_HOME",
+    shadowDir: ".geminihome",
+    authFile: "oauth_creds.json",
+    settingsFile: "settings.json",
+    globalCanary: "GLOBAL-GEMINI-CANARY-532-must-not-leak",
+    forbiddenFlags: ["--append-system-prompt-file", "--bare", "--permission-mode"],
+    requiredFlags: ["-m", "gemini-3.1-pro-preview", "--approval-mode", "yolo", "--skip-trust"],
+  },
+] as const;
+
+function setupFakeCliHome(root: string, m: typeof CLI_MATRIX[number]): string {
+  const fakeReal = join(root, `real-${m.cli}`);
+  mkdirSync(fakeReal, { recursive: true });
+  writeFileSync(join(fakeReal, m.authFile), `{"token":"FAKE-${m.cli}-CREDENTIAL"}\n`);
+  writeFileSync(join(fakeReal, m.settingsFile), `# fake ${m.cli} settings\n`);
+  writeFileSync(join(fakeReal, m.contextFile), `# global ${m.cli} doc\n${m.globalCanary}\n`);
+  return fakeReal;
+}
+
+function runBootPrepareEnv(
+  home: string,
+  extraEnv: Record<string, string>,
+  args: string[],
+): { code: number; stdout: string; stderr: string } {
+  const r = spawnSync("node", [BOOT_PREPARE, ...args], {
+    env: { ...process.env, AIGENTRY_HOME: home, ...extraEnv },
+    encoding: "utf8",
+  });
+  return { code: r.status ?? -1, stdout: r.stdout, stderr: r.stderr };
+}
+
+for (const m of CLI_MATRIX) {
+  test(`532-${m.cli}-A — launcher execs ${m.cli} with real flags (NOT --append-system-prompt-file/--bare/--permission-mode)`, () => {
+    if (!cliAvailable(m.cli)) { console.error(`532-${m.cli}-A SKIP — ${m.cli} not installed`); return; }
+    const { home, targetCwd, cleanup } = setupTempHome();
+    try {
+      const fakeReal = setupFakeCliHome(home, m);
+      const r = runBootPrepareEnv(home, { [m.homeEnv]: fakeReal },
+        ["--role", "coder", "--cwd", targetCwd, "--sid", `t532-${m.cli}-A`, "--cli", m.cli]);
+      assert.equal(r.code, 0, `exit ${r.code} stderr=${r.stderr}`);
+      const j = parseJson(r.stdout);
+      const body = readFileSync(j.spawn_cli, "utf8");
+      const execLine = body.split("\n").find((l) => /^\s*exec\b/.test(l));
+      assert.ok(execLine, "launcher must contain an exec line");
+      assert.match(execLine!, new RegExp(`exec\\s+-a\\s+${m.cli}\\s+${m.cli}\\b`), `must exec -a ${m.cli} ${m.cli}`);
+      for (const f of m.requiredFlags) {
+        assert.ok(execLine!.includes(f), `exec line must include ${f}; got: ${execLine}`);
+      }
+      // Forbidden flags must not be EXECUTED (the launcher comment may name them).
+      for (const f of m.forbiddenFlags) {
+        assert.ok(!execLine!.includes(f), `exec line must NOT contain ${f}; got: ${execLine}`);
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  test(`532-${m.cli}-B — staged ${m.contextFile} in sandbox is byte-identical to effective_prompt.md (role + contract, no CLAUDE.md leak)`, () => {
+    if (!cliAvailable(m.cli)) { console.error(`532-${m.cli}-B SKIP — ${m.cli} not installed`); return; }
+    const { home, targetCwd, cleanup } = setupTempHome();
+    try {
+      const fakeReal = setupFakeCliHome(home, m);
+      const r = runBootPrepareEnv(home, { [m.homeEnv]: fakeReal },
+        ["--role", "coder", "--cwd", targetCwd, "--sid", `t532-${m.cli}-B`, "--cli", m.cli]);
+      assert.equal(r.code, 0, `exit ${r.code} stderr=${r.stderr}`);
+      const j = parseJson(r.stdout);
+      const staged = join(j.spawn_cwd, m.contextFile);
+      assert.ok(existsSync(staged), `staged ${m.contextFile} must exist in sandbox`);
+      const stagedBytes = readFileSync(staged);
+      const effective = readFileSync(join(home, "sessions", `t532-${m.cli}-B`, "boot", "effective_prompt.md"));
+      assert.deepEqual(stagedBytes, effective, "staged context file must byte-match effective_prompt.md");
+      const content = stagedBytes.toString("utf8");
+      assert.match(content, /MARKER-CODER-431-allowed/, "role layer present");
+      assert.match(content, /Session boot contract/, "session contract present");
+      assert.doesNotMatch(content, /MARKER-FORBIDDEN-431-must-not-leak/, "project CLAUDE.md must not leak");
+      assert.doesNotMatch(content, new RegExp(m.globalCanary), "global doc must not leak into staged prompt");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test(`532-${m.cli}-C — launcher exports ${m.homeEnv} shadow home + AIGENTRY_TARGET_CWD`, () => {
+    if (!cliAvailable(m.cli)) { console.error(`532-${m.cli}-C SKIP — ${m.cli} not installed`); return; }
+    const { home, targetCwd, cleanup } = setupTempHome();
+    try {
+      const fakeReal = setupFakeCliHome(home, m);
+      const r = runBootPrepareEnv(home, { [m.homeEnv]: fakeReal },
+        ["--role", "coder", "--cwd", targetCwd, "--sid", `t532-${m.cli}-C`, "--cli", m.cli]);
+      assert.equal(r.code, 0, `exit ${r.code} stderr=${r.stderr}`);
+      const j = parseJson(r.stdout);
+      const body = readFileSync(j.spawn_cli, "utf8");
+      const shadow = join(j.spawn_cwd, m.shadowDir);
+      assert.match(body, new RegExp(`export ${m.homeEnv}=.{0,2}${shadow.replace(/[.\\()[\]]/g, ".")}`),
+        `launcher must export ${m.homeEnv}=${shadow}`);
+      assert.match(body, /export AIGENTRY_TARGET_CWD=/);
+      assert.equal(j.env.AIGENTRY_TARGET_CWD, targetCwd);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test(`532-${m.cli}-D — shadow home mirrors auth + settings but OMITS the global ${m.contextFile}`, () => {
+    if (!cliAvailable(m.cli)) { console.error(`532-${m.cli}-D SKIP — ${m.cli} not installed`); return; }
+    const { home, targetCwd, cleanup } = setupTempHome();
+    try {
+      const fakeReal = setupFakeCliHome(home, m);
+      const r = runBootPrepareEnv(home, { [m.homeEnv]: fakeReal },
+        ["--role", "coder", "--cwd", targetCwd, "--sid", `t532-${m.cli}-D`, "--cli", m.cli]);
+      assert.equal(r.code, 0, `exit ${r.code} stderr=${r.stderr}`);
+      const j = parseJson(r.stdout);
+      const shadow = join(j.spawn_cwd, m.shadowDir);
+      assert.ok(existsSync(shadow), "shadow home must exist");
+      // Auth preserved (symlink resolves to fake credential).
+      assert.ok(existsSync(join(shadow, m.authFile)), `auth (${m.authFile}) must be mirrored`);
+      assert.match(readFileSync(join(shadow, m.authFile), "utf8"), /FAKE-.*-CREDENTIAL/,
+        "auth mirror must resolve to real credential (symlink)");
+      // Settings preserved.
+      assert.ok(existsSync(join(shadow, m.settingsFile)), `settings (${m.settingsFile}) must be mirrored`);
+      // Global doc OMITTED → no leak.
+      assert.equal(existsSync(join(shadow, m.contextFile)), false,
+        `global ${m.contextFile} must be OMITTED from shadow home`);
+      // Entry is a symlink (mirror, not copy).
+      assert.ok(statSync(join(shadow, m.authFile)).isFile(), "auth entry resolves");
+    } finally {
+      cleanup();
+    }
+  });
+}

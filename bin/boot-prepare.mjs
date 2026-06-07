@@ -43,11 +43,30 @@
 //
 // Failure modes (per orchestrator reminder a): every unrecoverable error exits
 // non-zero with a clear stderr message — never silently emit a broken contract.
-// Scope: --cli claude only (per ADR-MF #13 codex/gemini UPSTREAM-GAP markers).
+//
+// Scope: --cli claude | codex | gemini (#532). claude uses the flag-based path
+// (--append-system-prompt-file). codex/gemini use the ADDITIVE path: the staged
+// effective_prompt.md is also copied into the sandbox cwd under the CLI's
+// auto-discovered context filename (codex AGENTS.md / gemini GEMINI.md), and the
+// CLI config-home env (CODEX_HOME / GEMINI_CLI_HOME) is redirected to a
+// per-session SHADOW home that symlink-mirrors the real home MINUS the global
+// context doc — neutralizing the per-user global AGENTS.md/GEMINI.md leak while
+// PRESERVING auth (auth.json / oauth_creds.json). The per-CLI knowledge lives in
+// the boot adapter ({contextFile, homeEnv, homeExclude}); this script consumes it.
+// See docs/superpowers/specs/2026-06-07-codex-gemini-role-injection.md.
 
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  copyFile,
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -62,8 +81,8 @@ function die(msg, code = 1) {
 
 function usage() {
   process.stdout.write(
-    "Usage: boot-prepare.mjs --role R --cwd C --sid S [--cli claude]\n" +
-      "  Emits a JSON object on stdout with {extra_flags, spawn_cwd, env}.\n" +
+    "Usage: boot-prepare.mjs --role R --cwd C --sid S [--cli claude|codex|gemini]\n" +
+      "  Emits a JSON object on stdout with {spawn_cli, extra_flags, spawn_cwd, env}.\n" +
       "  Exits non-zero on any error.\n",
   );
 }
@@ -200,10 +219,25 @@ async function ensureSandboxTrusted(sandboxCwd) {
   }
 }
 
-function buildSessionContract({ role, sandboxCwd, targetCwd, sid }) {
-  // Documented session contract — no surprise for the worker. Appended to
-  // the staged effective_prompt.md so claude reads it via --append-system-prompt-file
-  // (system-prompt level, high precedence over any auto-loaded CLAUDE.md memory).
+// Per-CLI memory-file noun for the session contract wording. claude auto-loads
+// CLAUDE.md; codex AGENTS.md; gemini GEMINI.md. Defaults to a neutral phrase so a
+// future CLI without a registered noun still reads sensibly (#532).
+function projectMemoryNoun(cli) {
+  switch (cli) {
+    case "claude": return "CLAUDE.md";
+    case "codex": return "AGENTS.md";
+    case "gemini": return "GEMINI.md";
+    default: return "project context file";
+  }
+}
+
+function buildSessionContract({ role, sandboxCwd, targetCwd, sid, cli }) {
+  // Documented session contract — no surprise for the worker. Appended to the
+  // staged effective_prompt.md. claude reads it via --append-system-prompt-file;
+  // codex/gemini read it via the staged cwd context file (AGENTS.md / GEMINI.md)
+  // they auto-discover. Either way it sits at role/system level, high precedence
+  // over any auto-loaded project memory.
+  const memNoun = projectMemoryNoun(cli);
   return (
     `\n` +
     `---\n` +
@@ -213,13 +247,50 @@ function buildSessionContract({ role, sandboxCwd, targetCwd, sid }) {
     `This session was spawned with role-cwd decoupling enforced at the process boundary.\n` +
     `\n` +
     `- **Role**: \`${role}\` (from boot-prepare; overrides any role hinted by your shell cwd)\n` +
-    `- **Sandbox cwd** (your shell pwd): \`${sandboxCwd}\` — clean directory, no project CLAUDE.md auto-loaded\n` +
+    `- **Sandbox cwd** (your shell pwd): \`${sandboxCwd}\` — clean directory, no project ${memNoun} auto-loaded\n` +
     `- **Target project cwd**: \`${targetCwd}\` — \`cd $AIGENTRY_TARGET_CWD\` as your first action if you need git operations or relative-path access\n` +
     `- **AIGENTRY_TARGET_CWD** env var = \`${targetCwd}\`\n` +
     `- **Session id**: \`${sid}\`\n` +
     `\n` +
-    `The role contract above takes precedence over any per-project CLAUDE.md you may later discover via tool calls or \`cd\`. Do not infer your role from cwd; trust this contract.\n`
+    `The role contract above takes precedence over any per-project ${memNoun} you may later discover via tool calls or \`cd\`. Do not infer your role from cwd; trust this contract.\n`
   );
+}
+
+// #532 shadow config-home builder. Mirrors every top-level entry of the real CLI
+// config-home into a per-session shadow dir via symlinks, EXCEPT the global
+// context doc(s) in `exclude`. This neutralizes the per-user global
+// AGENTS.md/GEMINI.md leak while PRESERVING auth + settings + skills (symlinked,
+// not copied). An empty home would hard-break auth (creds live there), so the
+// mirror is strictly safer than a blank CODEX_HOME/GEMINI_CLI_HOME.
+//
+// Graceful degradation: if the real home is absent there is no auth to preserve,
+// so the shadow is just an empty dir (warned). Symlink targets are absolute
+// real-home paths; entry names come from readdir (basenames only) so no path
+// traversal escapes the shadow dir. Re-run safe (EEXIST per-entry is ignored).
+async function buildShadowHome(homeReal, homeShadow, exclude) {
+  await mkdir(homeShadow, { recursive: true });
+  let entries;
+  try {
+    entries = await readdir(homeReal);
+  } catch (e) {
+    process.stderr.write(
+      `boot-prepare: WARNING config-home ${homeReal} not readable (${e?.message ?? e}); ` +
+        `shadow home is empty — CLI auth may be unavailable\n`,
+    );
+    return;
+  }
+  const excludeSet = new Set(exclude);
+  for (const name of entries) {
+    if (excludeSet.has(name)) continue;
+    try {
+      await symlink(join(homeReal, name), join(homeShadow, name));
+    } catch (e) {
+      if (e?.code === "EEXIST") continue;
+      process.stderr.write(
+        `boot-prepare: WARNING could not mirror ${name} into shadow home (${e?.message ?? e})\n`,
+      );
+    }
+  }
 }
 
 // CWE-23 path-traversal mitigation (Snyk #431 review): sid flows into
@@ -250,9 +321,13 @@ async function main() {
   if (!args.sid) die("--sid required", 4);
   assertSidSafe(args.sid);
   assertCwdSafe(args.cwd);
-  if (args.cli !== "claude") {
+  // #532: gate lifted from claude-only to claude|codex|gemini. Unknown CLIs are
+  // still rejected here (and again by getBootAdapter's registry) with a non-zero
+  // exit + clear stderr — never a silent broken contract.
+  const SUPPORTED_CLIS = ["claude", "codex", "gemini"];
+  if (!SUPPORTED_CLIS.includes(args.cli)) {
     die(
-      `only --cli claude supported in this dispatch (#431, ADR-MF #13 UPSTREAM-GAP for codex/gemini); got ${args.cli}`,
+      `unsupported --cli ${JSON.stringify(args.cli)}; supported: ${SUPPORTED_CLIS.join(", ")}`,
       4,
     );
   }
@@ -291,7 +366,12 @@ async function main() {
     `${args.role}-${args.sid}`,
   );
   await mkdir(sandboxCwd, { recursive: true });
-  await ensureSandboxTrusted(sandboxCwd);
+  // claude-only: pre-accept the fresh sandbox in ~/.claude.json (skips claude's
+  // trust modal). gemini uses --skip-trust (§3.3); codex relies on
+  // --dangerously-bypass-approvals-and-sandbox (folder-trust verified live, §5).
+  if (args.cli === "claude") {
+    await ensureSandboxTrusted(sandboxCwd);
+  }
 
   const fs = nodeBootFs();
   const resolved = await resolveInstructions(
@@ -333,9 +413,9 @@ async function main() {
     die(`buildBootCommand returned but ${cmd.prompt_file} missing`, 2);
   }
 
-  // Append session contract — documents sandbox + target cwd inside the
-  // --append-system-prompt-file content, so the worker reads it at boot time
-  // alongside the role layer (no out-of-band coordination needed).
+  // Append session contract — documents sandbox + target cwd. claude reads it via
+  // --append-system-prompt-file; codex/gemini read it via the staged cwd context
+  // file (below). Either way the worker reads it at boot alongside the role layer.
   await appendFile(
     cmd.prompt_file,
     buildSessionContract({
@@ -343,20 +423,44 @@ async function main() {
       sandboxCwd,
       targetCwd: args.cwd,
       sid: args.sid,
+      cli: args.cli,
     }),
   );
 
-  const flagsArgv = [
-    ...cmd.argv.slice(1),
-    "--permission-mode",
-    "bypassPermissions",
-  ];
+  // #532 additive path (codex/gemini): the role prompt is delivered NOT by a flag
+  // (none exists) but by (a) copying the finished effective_prompt.md into the
+  // sandbox cwd under the CLI's auto-discovered context filename, and (b)
+  // redirecting the CLI config-home env to a per-session shadow home that mirrors
+  // the real home minus the global doc (neutralizes the per-user global
+  // AGENTS.md/GEMINI.md leak; preserves auth). claude leaves both as no-ops.
+  const homeEnvAssignments = {};
+  if (adapter.contextFile) {
+    await copyFile(cmd.prompt_file, join(sandboxCwd, adapter.contextFile));
+  }
+  if (adapter.homeEnv) {
+    const homeRealEnv = process.env[adapter.homeEnv];
+    const homeReal =
+      homeRealEnv && homeRealEnv.length > 0
+        ? homeRealEnv
+        : join(homedir(), `.${args.cli}`);
+    const homeShadow = join(sandboxCwd, `.${args.cli}home`);
+    await buildShadowHome(homeReal, homeShadow, adapter.homeExclude);
+    homeEnvAssignments[adapter.homeEnv] = homeShadow;
+  }
+
+  // claude appends --permission-mode bypassPermissions to the staged flags. The
+  // codex/gemini default flags (from the adapter) already carry their own
+  // bypass/yolo modes, so no claude-specific flag is added.
+  const flagsArgv =
+    args.cli === "claude"
+      ? [...cmd.argv.slice(1), "--permission-mode", "bypassPermissions"]
+      : [...cmd.argv.slice(1)];
   const flagsLine = flagsArgv.map(shellQuote).join(" ");
 
-  // Per-session launcher.sh — sets AIGENTRY_TARGET_CWD env then execs claude
-  // with the staged flags. exec -a claude preserves argv[0] so `telepty list`
-  // and downstream tooling still see "claude" as the wrapped CLI name (rather
-  // than the launcher script path).
+  // Per-session launcher.sh — exports env (AIGENTRY_TARGET_CWD always; the CLI
+  // config-home redirect for codex/gemini) then execs the wrapped CLI with the
+  // staged flags. exec -a <cli> preserves argv[0] so `telepty list` and the
+  // dispatch.sh prompt-symbol probe still resolve the right CLI name.
   const sessionsRoot = resolve(aigentryHome(), "sessions");
   const launcherPath = resolve(stagingDir, "launcher.sh");
   // Defense-in-depth: even though sid/cwd are charset-validated above, confirm
@@ -365,14 +469,20 @@ async function main() {
   if (!`${launcherPath}${sep}`.startsWith(`${sessionsRoot}${sep}`)) {
     die(`launcher path escaped sessions root: ${launcherPath}`, 2);
   }
+  const execName = cmd.argv[0]; // "claude" | "codex" | "gemini"
+  const homeExportLines = Object.entries(homeEnvAssignments)
+    .map(([k, v]) => `export ${k}=${shellQuote(v)}\n`)
+    .join("");
   const launcherBody =
     `#!/usr/bin/env bash\n` +
-    `# Per-session launcher for #431 hybrid (b-2)+(c).\n` +
-    `# Sets AIGENTRY_TARGET_CWD env (cmux drops env from CLI invocation; this\n` +
-    `# wrapper restores it inside the workspace shell) then execs claude with\n` +
-    `# the staged --append-system-prompt-file pointing at effective_prompt.md.\n` +
+    `# Per-session launcher (#431 hybrid + #532 codex/gemini additive path).\n` +
+    `# Exports env (cmux drops env from the CLI invocation; this wrapper restores\n` +
+    `# it inside the workspace shell) then execs ${execName} with the staged flags.\n` +
+    `# Role prompt: claude via --append-system-prompt-file; codex/gemini via the\n` +
+    `# staged cwd context file (AGENTS.md / GEMINI.md) + config-home shadow home.\n` +
     `export AIGENTRY_TARGET_CWD=${shellQuote(args.cwd)}\n` +
-    `exec -a claude claude ${flagsLine} "$@"\n`;
+    homeExportLines +
+    `exec -a ${shellQuote(execName)} ${shellQuote(execName)} ${flagsLine} "$@"\n`;
   // writeFile with mode atomically sets +x — avoids a separate chmodSync call
   // (CWE-23 Snyk avoidance: single FS op on the validated path).
   await writeFile(launcherPath, launcherBody, { mode: 0o755 });
@@ -381,7 +491,7 @@ async function main() {
     spawn_cli: launcherPath,
     extra_flags: "",
     spawn_cwd: sandboxCwd,
-    env: { AIGENTRY_TARGET_CWD: args.cwd },
+    env: { AIGENTRY_TARGET_CWD: args.cwd, ...homeEnvAssignments },
   };
   process.stdout.write(JSON.stringify(out) + "\n");
 }
