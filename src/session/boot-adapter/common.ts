@@ -20,6 +20,11 @@ export interface AdapterConfig {
   min_version: string;
   needScratchCwd: boolean;
   codeCwdFlag: string | null;  // null = no separate flag (claude --bare case)
+  // #532 additive role-injection descriptor (see BootAdapter in types.ts).
+  // Defaulted for claude (flag-based), set for codex/gemini.
+  contextFile?: string | null;
+  homeEnv?: string | null;
+  homeExclude?: readonly string[];
   buildArgvEnv(args: {
     ctx: SessionContext;
     prompt_file: string;
@@ -52,6 +57,9 @@ export function makeAdapter(cfg: AdapterConfig): BootAdapter {
   const adapter: BootAdapter = {
     name: cfg.name,
     min_version: cfg.min_version,
+    contextFile: cfg.contextFile ?? null,
+    homeEnv: cfg.homeEnv ?? null,
+    homeExclude: Object.freeze([...(cfg.homeExclude ?? [])]),
     async buildBootCommand(
       ctx: SessionContext,
       resolved: ResolvedInstructions,

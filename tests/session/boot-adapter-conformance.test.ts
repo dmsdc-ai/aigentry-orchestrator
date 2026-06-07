@@ -28,8 +28,11 @@ test("B1 — every adapter yields a frozen BootCommand satisfying the contract",
     assert.equal(cmd.code_scope_cwd, "/work/myproj");
     assert.ok(cmd.prompt_file.endsWith("effective_prompt.md"));
     assert.equal(Object.isFrozen(cmd), true);
-    if (cli === "claude") assert.equal(cmd.cwd, "/work/myproj");
-    else { assert.ok(cmd.cwd.startsWith(join(staging, cli))); assert.ok(cmd.cwd.endsWith("/control")); }
+    // #532 reconcile: codex/gemini moved to the additive path (cwd = ctx.cwd, set
+    // by boot-prepare to the sandbox; role prompt arrives via a staged cwd
+    // AGENTS.md/GEMINI.md, not a scratch /control dir). So every adapter now runs
+    // in code_scope_cwd, matching claude.
+    assert.equal(cmd.cwd, "/work/myproj");
   }
 }));
 

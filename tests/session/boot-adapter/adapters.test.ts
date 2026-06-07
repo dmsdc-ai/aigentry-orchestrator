@@ -3,7 +3,6 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as path from "node:path";
 import {
-  BootAdapterError,
   getBootAdapter,
   memoryBootFs,
   mockSpawner,
@@ -35,42 +34,70 @@ test("3. claude argv = --append-system-prompt-file <staged> (#431 hybrid pivot f
   assert.deepEqual({ ...cmd.env }, {});
 });
 
-test("4. codex argv + scratch cwd + env vars (suppression belt-and-suspenders)", async () => {
+test("4. codex argv = real default flags; additive descriptor (AGENTS.md / CODEX_HOME) (#532)", async () => {
+  // #532 reconcile (2026-06-07): the prior `--cd` argv + CODEX_NO_CONTEXT_AUTOLOAD /
+  // CODEX_SYSTEM_PROMPT_FILE env did NOT exist in codex 0.133.0. The additive design
+  // delivers the role prompt via a cwd `AGENTS.md` (staged by boot-prepare in the
+  // sandbox cwd) and neutralizes the global doc via a CODEX_HOME shadow home. The
+  // adapter only declares the REAL launch flags + the additive descriptor; the boot
+  // process cwd = ctx.cwd (sandbox), not a scratch /control dir.
   const fs = memoryBootFs();
-  const cmd = await getBootAdapter("codex").buildBootCommand(makeCtx(), makeResolved(), {
+  const adapter = getBootAdapter("codex");
+  const cmd = await adapter.buildBootCommand(makeCtx(), makeResolved(), {
     staging_dir: STAGING, fs, spawner: mockSpawner(ALL()),
   });
-  assert.deepEqual([...cmd.argv], ["codex", "--cd", "/work/myproj"]);
-  assert.equal(cmd.cwd, path.join(STAGING, "control"));
+  assert.deepEqual([...cmd.argv], [
+    "codex", "-c", "check_for_update_on_startup=false",
+    "--dangerously-bypass-approvals-and-sandbox",
+  ]);
+  assert.equal(cmd.cwd, "/work/myproj");
   assert.equal(cmd.code_scope_cwd, "/work/myproj");
-  assert.equal(cmd.env["CODEX_NO_CONTEXT_AUTOLOAD"], "1");
-  assert.equal(cmd.env["CODEX_SYSTEM_PROMPT_FILE"], cmd.prompt_file);
-  assert.ok(await fs.exists(cmd.cwd), "scratch cwd materialized");
+  assert.deepEqual({ ...cmd.env }, {});
+  assert.equal(adapter.contextFile, "AGENTS.md");
+  assert.equal(adapter.homeEnv, "CODEX_HOME");
+  assert.deepEqual([...adapter.homeExclude], ["AGENTS.md", "AGENTS.override.md"]);
 });
 
-test("5. gemini argv + --workspace-root + env suppression", async () => {
-  const cmd = await getBootAdapter("gemini").buildBootCommand(makeCtx(), makeResolved(), {
+test("5. gemini argv = real default flags; additive descriptor (GEMINI.md / GEMINI_CLI_HOME) (#532)", async () => {
+  // #532 reconcile: gemini 0.42.0 has NO `--system` / `--workspace-root` flags and
+  // no GEMINI_NO_CONTEXT_AUTOLOAD env. Real flags are -m/--approval-mode/--skip-trust;
+  // the role prompt is delivered via cwd `GEMINI.md`, global doc neutralized via the
+  // GEMINI_CLI_HOME shadow home.
+  const adapter = getBootAdapter("gemini");
+  const cmd = await adapter.buildBootCommand(makeCtx(), makeResolved(), {
     staging_dir: STAGING, fs: memoryBootFs(), spawner: mockSpawner(ALL()),
   });
   assert.deepEqual([...cmd.argv], [
-    "gemini", "--system", path.join(STAGING, "effective_prompt.md"),
-    "--workspace-root", "/work/myproj",
+    "gemini", "-m", "gemini-3.1-pro-preview",
+    "--approval-mode", "yolo", "--skip-trust",
   ]);
-  assert.equal(cmd.cwd, path.join(STAGING, "control"));
-  assert.equal(cmd.env["GEMINI_NO_CONTEXT_AUTOLOAD"], "1");
+  assert.equal(cmd.cwd, "/work/myproj");
+  assert.equal(cmd.code_scope_cwd, "/work/myproj");
+  assert.deepEqual({ ...cmd.env }, {});
+  assert.equal(adapter.contextFile, "GEMINI.md");
+  assert.equal(adapter.homeEnv, "GEMINI_CLI_HOME");
+  assert.deepEqual([...adapter.homeExclude], ["GEMINI.md"]);
 });
 
-test("6. ERR_BOOT_ADAPTER_UNSUPPORTED when codex lacks --cd flag (§4.5.1.1)", async () => {
+test("6. codex additive path does NOT probe --cd (no scratch /control dir) (#532)", async () => {
+  // #532: the additive path keeps cwd=sandbox and never passes codex `-C/--cd`, so a
+  // spawner reporting zero features must still build (the obsolete codeCwdFlag probe
+  // that previously rejected codex-without-`--cd` no longer applies).
   const sp = mockSpawner({
-    codex: { version: "1.0.0", features: [], on_run: () => new Error("unreached") },
+    codex: { version: "1.0.0", features: [], on_run: () => ({ stdout: "", stderr: "", exit_code: 0, duration_ms: 1 }) },
   });
-  await assert.rejects(
-    getBootAdapter("codex").buildBootCommand(makeCtx(), makeResolved(), {
-      staging_dir: STAGING, fs: memoryBootFs(), spawner: sp,
-    }),
-    (e: unknown) => e instanceof BootAdapterError
-      && (e as BootAdapterError).code === "ERR_BOOT_ADAPTER_UNSUPPORTED",
-  );
+  const cmd = await getBootAdapter("codex").buildBootCommand(makeCtx(), makeResolved(), {
+    staging_dir: STAGING, fs: memoryBootFs(), spawner: sp,
+  });
+  assert.equal(cmd.argv[0], "codex");
+  assert.equal(cmd.cwd, "/work/myproj");
+});
+
+test("6b. claude exposes a null additive descriptor (flag-based role delivery) (#532)", async () => {
+  const a = getBootAdapter("claude");
+  assert.equal(a.contextFile, null);
+  assert.equal(a.homeEnv, null);
+  assert.deepEqual([...a.homeExclude], []);
 });
 
 test("13. prompt bytes byte-equal resolved.effective_prompt (no in-flight mutation)", async () => {

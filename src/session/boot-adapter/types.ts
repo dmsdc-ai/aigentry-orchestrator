@@ -72,6 +72,17 @@ export interface BuildOptions {
 export interface BootAdapter {
   readonly name: CliKind;
   readonly min_version: string;
+  // #532 additive role-injection descriptor. `contextFile` is the cwd file the
+  // CLI auto-discovers and reads additively (codex `AGENTS.md`, gemini
+  // `GEMINI.md`); boot-prepare stages the role prompt there. `null` = flag-based
+  // delivery (claude `--append-system-prompt-file`). `homeEnv` is the config-home
+  // env boot-prepare redirects to a per-session shadow home so the per-user
+  // global doc cannot leak; `homeExclude` lists the global-doc filename(s) the
+  // shadow mirror must omit (everything else — auth, settings, skills — is
+  // symlink-preserved). Empty/null for claude.
+  readonly contextFile: string | null;
+  readonly homeEnv: string | null;
+  readonly homeExclude: readonly string[];
   buildBootCommand(
     ctx: SessionContext,
     resolved: ResolvedInstructions,

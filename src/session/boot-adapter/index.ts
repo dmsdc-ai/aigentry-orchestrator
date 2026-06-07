@@ -39,10 +39,10 @@ export {
 export { runSelfTest, semverGte } from "./self-test.js";
 export { claudeAdapter, CLAUDE_MIN_VERSION } from "./claude.js";
 export {
-  codexAdapter, CODEX_MIN_VERSION, CODEX_NO_AUTOLOAD_ENV,
-  CODEX_SYSTEM_PROMPT_ENV, CODEX_CODE_CWD_FLAG,
+  codexAdapter, CODEX_MIN_VERSION, CODEX_CONTEXT_FILE,
+  CODEX_HOME_ENV, CODEX_HOME_EXCLUDE,
 } from "./codex.js";
 export {
-  geminiAdapter, GEMINI_MIN_VERSION, GEMINI_NO_AUTOLOAD_ENV,
-  GEMINI_SYSTEM_FLAG, GEMINI_CODE_CWD_FLAG,
+  geminiAdapter, GEMINI_MIN_VERSION, GEMINI_CONTEXT_FILE,
+  GEMINI_HOME_ENV, GEMINI_HOME_EXCLUDE,
 } from "./gemini.js";
