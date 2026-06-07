@@ -17,6 +17,8 @@ import {
   rmSync,
   existsSync,
   statSync,
+  lstatSync,
+  realpathSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -374,6 +376,48 @@ for (const m of CLI_MATRIX) {
     }
   });
 }
+
+// #552 — codex pre-trust: the shadow config.toml must carry the sandbox cwd as a
+// trusted project (codex's own on-disk schema) so codex skips its blocking
+// folder-trust modal at boot, while the real ~/.codex/config.toml stays untouched
+// (credential/config boundary — we de-symlink, never write through the link).
+test("552-codex-E — shadow config.toml pre-trusts the sandbox cwd; real config untouched", () => {
+  if (!cliAvailable("codex")) { console.error("552-codex-E SKIP — codex not installed"); return; }
+  const { home, targetCwd, cleanup } = setupTempHome();
+  try {
+    const codex = CLI_MATRIX.find((m) => m.cli === "codex")!;
+    const fakeReal = setupFakeCliHome(home, codex);
+    const realConfig = join(fakeReal, "config.toml");
+    const realBefore = readFileSync(realConfig, "utf8");
+    const r = runBootPrepareEnv(home, { CODEX_HOME: fakeReal },
+      ["--role", "coder", "--cwd", targetCwd, "--sid", "t552-codex-E", "--cli", "codex"]);
+    assert.equal(r.code, 0, `exit ${r.code} stderr=${r.stderr}`);
+    const j = parseJson(r.stdout);
+    const shadowConfig = join(j.spawn_cwd, codex.shadowDir, "config.toml");
+    assert.ok(existsSync(shadowConfig), "shadow config.toml must exist");
+    const shadowText = readFileSync(shadowConfig, "utf8");
+    // Trust entry for the CANONICAL sandbox cwd (codex keys trust on getcwd(),
+    // symlinks collapsed — e.g. macOS tmp /var → /private/var), in codex's
+    // `[projects."<abspath>"]` + trust_level = "trusted" on-disk schema.
+    const canonicalCwd = realpathSync(j.spawn_cwd);
+    assert.ok(
+      shadowText.includes(`[projects."${canonicalCwd}"]`),
+      `shadow config must declare [projects."${canonicalCwd}"]; got:\n${shadowText}`,
+    );
+    assert.match(shadowText, /trust_level\s*=\s*"trusted"/, "must set trust_level = trusted");
+    // Real config contents preserved in the shadow copy (settings not dropped).
+    assert.match(shadowText, /fake codex settings/, "shadow must preserve real config contents");
+    // Shadow config is a REAL file, not a symlink into the real home — else the
+    // write would have mutated ~/.codex/config.toml.
+    assert.equal(lstatSync(shadowConfig).isSymbolicLink(), false,
+      "shadow config.toml must be de-symlinked (real file), not a link to the real home");
+    // The real config.toml must be byte-identical (boundary: never written through).
+    assert.equal(readFileSync(realConfig, "utf8"), realBefore,
+      "real config.toml must NOT be modified");
+  } finally {
+    cleanup();
+  }
+});
 
 test("551-gemini — AIGENTRY_GEMINI_MODEL overrides boot-prep launcher model", () => {
   if (!cliAvailable("gemini")) { console.error("551-gemini SKIP — gemini not installed"); return; }

@@ -63,8 +63,10 @@ import {
   mkdir,
   readdir,
   readFile,
+  realpath,
   rename,
   symlink,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -293,6 +295,91 @@ async function buildShadowHome(homeReal, homeShadow, exclude) {
   }
 }
 
+// TOML basic-string quoting for a `[projects."<path>"]` key. Paths are absolute
+// POSIX (assertCwdSafe-validated) so backslash/quote are not expected, but escape
+// the two basic-string metachars defensively to keep emitted TOML valid.
+function tomlBasicString(s) {
+  return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+// #552: codex shows an interactive folder-trust modal ("Do you trust this
+// directory? 1.Yes 2.No") on a fresh role-sandbox cwd, blocking its REPL —
+// dispatch.sh's ready-probe then times out (30s) BEFORE the inject, aborting the
+// dispatch. `--dangerously-bypass-approvals-and-sandbox` does NOT bypass
+// folder-trust (verified live, codex 0.133.0). Pre-seed the trust exactly the way
+// codex itself records it (verified from a live #551 dispatch: codex wrote
+// `[projects."<abspath>"]\ntrust_level = "trusted"` into config.toml after the
+// user answered "Yes"). Trust is keyed on the project root — the sandbox is a
+// non-git dir so codex uses the exact cwd path; the inherited `[projects."$HOME"]`
+// entry does NOT cover it (that is why the modal fires despite it).
+//
+// Boundary: write ONLY into the per-session SHADOW config.toml. buildShadowHome
+// SYMLINKS config.toml to the real ~/.codex/config.toml, so we de-symlink it
+// first (writeFile through a symlink would follow it and mutate the real file —
+// violating the credential/config boundary) and replace it with a real copy
+// carrying the extra trust entry. auth.json stays a symlink, untouched.
+//
+// Graceful degradation mirrors ensureSandboxTrusted: any FS failure → stderr
+// WARNING + continue (worst case the worker hits the modal, visible to the user,
+// not a silent break). Re-run safe: rebuilt from the real config each time.
+async function ensureCodexTrust(homeReal, homeShadow, sandboxCwd) {
+  const realConfig = join(homeReal, "config.toml");
+  const shadowConfig = join(homeShadow, "config.toml");
+  let base = "";
+  if (existsSync(realConfig)) {
+    try {
+      base = await readFile(realConfig, "utf8");
+    } catch (e) {
+      process.stderr.write(
+        `boot-prepare: WARNING read ${realConfig} failed (${e?.message ?? e}); codex may show trust modal\n`,
+      );
+      return;
+    }
+  }
+  // Match codex's on-disk key to the path codex actually checks: codex resolves
+  // its cwd via getcwd() (symlinks collapsed), so the trust key must be the
+  // CANONICAL sandbox path. With the default ~/.aigentry (no symlinks) this equals
+  // sandboxCwd, but a symlinked AIGENTRY_HOME (e.g. under macOS /tmp → /private/tmp)
+  // would otherwise silently mismatch and re-expose the modal. realpath needs the
+  // dir to exist — it does (mkdir'd before this runs); fall back to the literal
+  // path if resolution fails.
+  let canonicalCwd = sandboxCwd;
+  try {
+    canonicalCwd = await realpath(sandboxCwd);
+  } catch {
+    // keep sandboxCwd
+  }
+  const key = `[projects.${tomlBasicString(canonicalCwd)}]`;
+  // Append only when the real config does not already trust this exact path —
+  // avoids a duplicate-key TOML parse error and keeps the op idempotent.
+  const trustBlock = base.includes(key)
+    ? ""
+    : `\n# aigentry boot-prepare (#552): pre-trust this per-session role-sandbox cwd\n` +
+      `# so codex starts past its folder-trust modal (else dispatch.sh ready-probe\n` +
+      `# times out before inject). Shadow-home only — real ~/.codex/config.toml untouched.\n` +
+      `${key}\ntrust_level = "trusted"\n`;
+  // De-symlink before write: buildShadowHome symlinked config.toml to the real
+  // file. Removing the link makes the writeFile below create a fresh real file in
+  // the shadow instead of following the link into ~/.codex/config.toml.
+  try {
+    await unlink(shadowConfig);
+  } catch (e) {
+    if (e?.code !== "ENOENT") {
+      process.stderr.write(
+        `boot-prepare: WARNING could not unlink shadow ${shadowConfig} (${e?.message ?? e}); codex may show trust modal\n`,
+      );
+      return;
+    }
+  }
+  try {
+    await writeFile(shadowConfig, base + trustBlock);
+  } catch (e) {
+    process.stderr.write(
+      `boot-prepare: WARNING write shadow ${shadowConfig} failed (${e?.message ?? e}); codex may show trust modal\n`,
+    );
+  }
+}
+
 // CWE-23 path-traversal mitigation (Snyk #431 review): sid flows into
 // `$HOME/.aigentry/sessions/<sid>/boot/launcher.sh` (chmodSync) and into
 // `$HOME/.aigentry/role-sandbox/<role>-<sid>/`. Restrict to a conservative
@@ -445,6 +532,12 @@ async function main() {
         : join(homedir(), `.${args.cli}`);
     const homeShadow = join(sandboxCwd, `.${args.cli}home`);
     await buildShadowHome(homeReal, homeShadow, adapter.homeExclude);
+    // #552: codex-only — pre-seed folder-trust for the sandbox cwd in the shadow
+    // config.toml so codex skips its blocking trust modal at boot (no probe
+    // timeout). Other CLIs handle trust via their own flags (gemini --skip-trust).
+    if (args.cli === "codex") {
+      await ensureCodexTrust(homeReal, homeShadow, sandboxCwd);
+    }
     homeEnvAssignments[adapter.homeEnv] = homeShadow;
   }
 
