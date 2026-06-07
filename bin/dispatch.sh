@@ -12,10 +12,12 @@
 #               --ref <file> [--from <orch-sid>] [--role coder|architect|...]
 #   dispatch.sh --help
 #
-# --role (cli=claude only, #431 / ADR 2026-05-12): wires boot-prepare.mjs to
-#   spawn `claude --bare --system-prompt-file <staged>` so the wrapped CLI
-#   skips cwd CLAUDE.md auto-discovery — preventing the cwd→role contamination
-#   exposed by the 2026-05-23 incident. Omit to use legacy spawn (back-compat).
+# --role (cli=claude|codex|gemini, #431 / #532): wires boot-prepare.mjs so the
+#   wrapped CLI skips project context-file auto-discovery (the cwd→role
+#   contamination exposed by the 2026-05-23 incident). claude uses
+#   `--append-system-prompt-file`; codex/gemini use the additive path (staged cwd
+#   AGENTS.md/GEMINI.md + CODEX_HOME/GEMINI_CLI_HOME shadow home). Omit --role to
+#   use the legacy spawn (back-compat).
 #
 # Ready detection: per-CLI prompt-symbol probe of `telepty read-screen` plus
 # welcome/boot banner absence (claude ❯ / codex › / gemini ›|│ >).
@@ -300,9 +302,16 @@ if [ "$spawn" -eq 1 ]; then
   # boot-prepare.mjs failure = stderr WARNING + legacy spawn (not silent fail).
   boot_spawn_cli=""
   boot_spawn_cwd=""
-  if [ "$cli" = "claude" ] && [ -n "$role" ]; then
+  # #532: boot-prepare role wiring now covers claude (flag-based) + codex/gemini
+  # (additive cwd context file + config-home shadow). Pass the actual --cli so
+  # boot-prepare stages the right context file (AGENTS.md/GEMINI.md) and env.
+  case "$cli" in
+    claude|codex|gemini) boot_eligible=1 ;;
+    *) boot_eligible=0 ;;
+  esac
+  if [ "$boot_eligible" = "1" ] && [ -n "$role" ]; then
     if [ -x "$SCRIPT_DIR/boot-prepare.mjs" ]; then
-      boot_json=$(node "$SCRIPT_DIR/boot-prepare.mjs" --role "$role" --cwd "$cwd" --sid "$sid" --cli claude) && bp_status=0 || bp_status=$?
+      boot_json=$(node "$SCRIPT_DIR/boot-prepare.mjs" --role "$role" --cwd "$cwd" --sid "$sid" --cli "$cli") && bp_status=0 || bp_status=$?
       if [ "$bp_status" -eq 0 ] && [ -n "$boot_json" ]; then
         # Parse JSON via python3 (already a dispatch.sh dep — see is_ready / dedup).
         boot_spawn_cli=$(BOOT_JSON="$boot_json" python3 -c 'import json,os; print(json.loads(os.environ["BOOT_JSON"])["spawn_cli"])')
@@ -320,11 +329,14 @@ if [ "$spawn" -eq 1 ]; then
     exit 2
   }
   if [ -n "$boot_spawn_cli" ] && [ -n "$boot_spawn_cwd" ]; then
-    # Hybrid path active: spawn the per-session launcher.sh in sandbox cwd.
-    # boot_spawn_cli already encodes AIGENTRY_TARGET_CWD export +
-    # --append-system-prompt-file. Wrap it again at dispatch-owned layer so
-    # worker push protection is not dependent on boot-prepare (#509).
-    worker_launcher=$(write_worker_launcher "$sid" "claude" "$boot_spawn_cli" "" "$worker_hooks_dir")
+    # Hybrid/additive path active: spawn the per-session boot launcher.sh in the
+    # sandbox cwd. boot_spawn_cli already encodes AIGENTRY_TARGET_CWD export +
+    # the role delivery (claude --append-system-prompt-file; codex/gemini staged
+    # cwd context file + config-home shadow). Wrap it again at the dispatch-owned
+    # layer so worker push protection is not dependent on boot-prepare (#509).
+    # display_cli = "$cli" (#532) so the guard wrapper's `exec -a <cli>` and
+    # telepty visibility match the actual CLI, not a hardcoded "claude".
+    worker_launcher=$(write_worker_launcher "$sid" "$cli" "$boot_spawn_cli" "" "$worker_hooks_dir")
     # Pass empty --extra-flags so open-session.sh's claude-default flags do NOT
     # apply (we control the full argv via the launcher).
     if ! "$OPEN_SESSION_SH" --track "$track" --name "$name" --cwd "$boot_spawn_cwd" --cli "$worker_launcher" --extra-flags " " >/dev/null; then
