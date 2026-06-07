@@ -412,10 +412,43 @@ sys.exit(1)
 PY
 }
 
+# _shared_cwd_branch_ambiguous <sid> <cwd> — exit 0 (AMBIGUOUS) when 2+ active
+# (in_flight/re_dispatched) active.json entries share <cwd> AND the branch recorded
+# for <sid>; exit 1 otherwise. #541: a single commit cannot be attributed to one
+# sid when sessions collide on (cwd, branch) — same cwd+author+branch yields no
+# discriminator — so git-AUTO_REPORT must skip rather than misattribute.
+_shared_cwd_branch_ambiguous() {
+  local sid="$1" cwd="$2"
+  ACTIVE_JSON="$ACTIVE_JSON" SID="$sid" CWD="$cwd" python3 - <<'PY'
+import json, os
+path = os.environ["ACTIVE_JSON"]; sid = os.environ["SID"]; cwd = os.environ["CWD"]
+try:
+    entries = json.load(open(path))
+except Exception:
+    entries = []
+branch = ""
+for e in entries:
+    if e.get("sid") == sid:
+        branch = e.get("branch", "") or ""
+        break
+active = ("in_flight", "re_dispatched")
+n = sum(1 for e in entries
+        if e.get("status") in active
+        and (e.get("cwd", "") or "") == cwd
+        and (e.get("branch", "") or "") == branch)
+raise SystemExit(0 if n > 1 else 1)
+PY
+}
+
 _git_check_and_autoreport() {
   local sid="$1" cwd="$2" ref_path="$3" dispatched_at="$4" screen="$5"
   [ -n "$cwd" ] || return 0
   _has_new_commits "$cwd" "$dispatched_at" || return 0
+  # #541 — ambiguous-attribution guard: when 2+ active sessions share this sid's
+  # (cwd, branch), skip git-AUTO_REPORT to avoid crediting another session's commit
+  # (the pendingReports/idle path is unaffected). SECONDARY fix (Dispatch-Session
+  # commit-trailer matching in dispatch.sh) is out of scope — tracked as follow-up.
+  _shared_cwd_branch_ambiguous "$sid" "$cwd" && return 0
   local head_sha files added removed test_signal
   head_sha=$("$GIT" -C "$cwd" rev-parse --short HEAD 2>/dev/null || echo unknown)
   if grep -qxF "$sid	$head_sha" "$AUTO_REPORTS_SEEN" 2>/dev/null; then
