@@ -10,6 +10,9 @@ import * as fs from "node:fs/promises";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const POLL_INTERVAL_MS = 25;
 
+// Per-process monotonic counter for unique lock-staging temp names (#561).
+let stagingSeq = 0;
+
 export interface WithIndexLockOptions {
   timeoutMs?: number;
 }
@@ -38,32 +41,49 @@ async function isStaleLock(lockPath: string): Promise<boolean> {
 
 async function acquire(lockPath: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
-  while (true) {
-    try {
-      const fh = await open(lockPath, "wx", 0o600);
+  // Stage the PID content in a per-acquirer temp, then hard-link it onto lockPath.
+  // link(2) is atomic and fails EEXIST if held, so the lock file never exists in a
+  // half-created (empty) state. The previous open(O_CREAT|O_EXCL)-then-write left an
+  // empty window in which a concurrent waiter read the lock as malformed, swept it as
+  // stale, and entered alongside the holder — breaking serialization and colliding on
+  // the shared index tmp (`index.json.tmp.__index__.<pid>` → rename ENOENT) (#561).
+  // The `.tmp.` infix lets crash-recovery sweep a staging file orphaned by a crash.
+  const staging = `${lockPath}.tmp.${process.pid}.${stagingSeq++}`;
+  const fh = await open(staging, "w", 0o600);
+  try {
+    await fh.writeFile(`${process.pid}\n`);
+    await fh.sync();
+  } finally {
+    await fh.close();
+  }
+  try {
+    while (true) {
       try {
-        await fh.writeFile(`${process.pid}\n`);
-        await fh.sync();
-      } finally {
-        await fh.close();
-      }
-      return;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      if (await isStaleLock(lockPath)) {
-        try {
-          await fs.unlink(lockPath);
-        } catch {
-          /* another waiter may have swept it — retry */
+        await fs.link(staging, lockPath);
+        return;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+        if (await isStaleLock(lockPath)) {
+          try {
+            await fs.unlink(lockPath);
+          } catch {
+            /* another waiter may have swept it — retry */
+          }
+          continue;
         }
-        continue;
+        if (Date.now() >= deadline) {
+          throw new Error(
+            `index-lock: timeout (${timeoutMs}ms) acquiring ${lockPath}`,
+          );
+        }
+        await sleep(POLL_INTERVAL_MS);
       }
-      if (Date.now() >= deadline) {
-        throw new Error(
-          `index-lock: timeout (${timeoutMs}ms) acquiring ${lockPath}`,
-        );
-      }
-      await sleep(POLL_INTERVAL_MS);
+    }
+  } finally {
+    try {
+      await fs.unlink(staging);
+    } catch {
+      /* already gone */
     }
   }
 }

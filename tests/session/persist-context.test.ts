@@ -214,6 +214,32 @@ test("T12 corrupt index.json: persist a 2nd id throws ERR_INDEX_CORRUPT; new con
   } finally { await rmRoot(paths); }
 });
 
+test("T13 #561 high-concurrency spawns: index-lock serializes — no shared-tmp ENOENT, no lost index entries", async () => {
+  // Repros the #561 flake: concurrent persists collided on the shared index tmp
+  // (`index.json.tmp.__index__.<pid>`) → rename ENOENT, and racing read-modify-write
+  // dropped index entries — both because index-lock acquisition mis-swept an in-flight
+  // (empty) lock as stale. Several high-fanout rounds make the race reliably surface.
+  const N = 24;
+  const ROUNDS = 12;
+  for (let r = 0; r < ROUNDS; r++) {
+    const paths = await mkRoot(`t13-${r}`);
+    try {
+      const ids = Array.from({ length: N }, (_, i) => `sess-T13-${i}`);
+      const settled = await Promise.allSettled(
+        ids.map((id) => persistContext(fixture({ session_id: id, parent_id: `parent-${id}` }), paths)),
+      );
+      const rejected = settled.filter((s) => s.status === "rejected") as PromiseRejectedResult[];
+      assert.deepEqual(
+        rejected.map((s) => String((s.reason as Error)?.message ?? s.reason)),
+        [],
+        `round ${r}: concurrent persists must all succeed (no ENOENT)`,
+      );
+      const idx = await readIdx(paths);
+      assert.equal(idx.sessions.length, N, `round ${r}: index lost entries (read-modify-write race)`);
+    } finally { await rmRoot(paths); }
+  }
+});
+
 test("defaultPathConfig honors AIGENTRY_SESSIONS_ROOT env override", async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "aigentry-mf5-env-"));
   const prev = process.env["AIGENTRY_SESSIONS_ROOT"];
