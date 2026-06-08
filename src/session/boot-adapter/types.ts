@@ -80,9 +80,17 @@ export interface BootAdapter {
   // global doc cannot leak; `homeExclude` lists the global-doc filename(s) the
   // shadow mirror must omit (everything else — auth, settings, skills — is
   // symlink-preserved). Empty/null for claude.
+  //
+  // `homeConfigSubdir` (#569): the subdirectory UNDER `homeEnv` where the CLI
+  // actually keeps its config + creds. `null` = `homeEnv` IS the config dir
+  // directly (codex: `$CODEX_HOME/auth.json`). gemini differs — `GEMINI_CLI_HOME`
+  // is the HOME and gemini reads creds from `$GEMINI_CLI_HOME/.gemini/`
+  // (Storage.getGlobalGeminiDir() = join(homedir(), ".gemini")), so the shadow
+  // mirror must land under that subdir or gemini hits its auth-selector.
   readonly contextFile: string | null;
   readonly homeEnv: string | null;
   readonly homeExclude: readonly string[];
+  readonly homeConfigSubdir: string | null;
   buildBootCommand(
     ctx: SessionContext,
     resolved: ResolvedInstructions,

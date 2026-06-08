@@ -59,6 +59,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
   appendFile,
+  chmod,
   copyFile,
   mkdir,
   readdir,
@@ -380,6 +381,50 @@ async function ensureCodexTrust(homeReal, homeShadow, sandboxCwd) {
   }
 }
 
+// #569: gemini refreshes its OAuth token at runtime and writes oauth_creds.json
+// (and, on first sight of an account, google_accounts.json) via fs.writeFile
+// under getGlobalGeminiDir() (= the shadow `.gemini` dir). buildShadowHome
+// SYMLINKS those entries to the real ~/.gemini, so a refresh write would FOLLOW
+// the link and TRUNCATE/OVERWRITE the real credential — violating the credential
+// boundary. De-symlink them: replace each link with a real 0600 COPY inside the
+// shadow so refresh-writes stay sandboxed (per-session, ephemeral). The real
+// ~/.gemini stays byte-identical (we only READ it to copy). Mirrors #552's
+// config.toml de-symlink. Every other entry stays a symlink (read-only ref).
+//
+// Graceful degradation mirrors ensureCodexTrust: any FS failure → stderr WARNING
+// + continue. A missing real file (e.g. keychain-only auth) is skipped silently.
+const GEMINI_WRITABLE_CREDS = Object.freeze([
+  "oauth_creds.json",
+  "google_accounts.json",
+]);
+async function ensureGeminiAuth(homeReal, geminiConfigShadow) {
+  for (const name of GEMINI_WRITABLE_CREDS) {
+    const realFile = join(homeReal, name);
+    const shadowFile = join(geminiConfigShadow, name);
+    if (!existsSync(realFile)) continue; // nothing to seed (keychain-only auth)
+    try {
+      await unlink(shadowFile); // drop the symlink buildShadowHome created
+    } catch (e) {
+      if (e?.code !== "ENOENT") {
+        process.stderr.write(
+          `boot-prepare: WARNING could not unlink shadow ${shadowFile} (${e?.message ?? e}); ` +
+            `gemini token refresh may mutate real ~/.gemini\n`,
+        );
+        continue; // leave the symlink rather than risk a half-broken state
+      }
+    }
+    try {
+      await copyFile(realFile, shadowFile);
+      await chmod(shadowFile, 0o600);
+    } catch (e) {
+      process.stderr.write(
+        `boot-prepare: WARNING could not copy ${name} into shadow (${e?.message ?? e}); ` +
+          `gemini auth may be unavailable\n`,
+      );
+    }
+  }
+}
+
 // CWE-23 path-traversal mitigation (Snyk #431 review): sid flows into
 // `$HOME/.aigentry/sessions/<sid>/boot/launcher.sh` (chmodSync) and into
 // `$HOME/.aigentry/role-sandbox/<role>-<sid>/`. Restrict to a conservative
@@ -531,12 +576,24 @@ async function main() {
         ? homeRealEnv
         : join(homedir(), `.${args.cli}`);
     const homeShadow = join(sandboxCwd, `.${args.cli}home`);
-    await buildShadowHome(homeReal, homeShadow, adapter.homeExclude);
+    // #569: the env points at the HOME (homeShadow), but the CLI may keep its
+    // config + creds in a SUBDIR of it (gemini: `$GEMINI_CLI_HOME/.gemini`).
+    // Mirror into that config dir so the CLI actually finds auth there. codex
+    // (homeConfigSubdir=null) keeps homeShadow as its config dir — unchanged.
+    const configShadow = adapter.homeConfigSubdir
+      ? join(homeShadow, adapter.homeConfigSubdir)
+      : homeShadow;
+    await buildShadowHome(homeReal, configShadow, adapter.homeExclude);
     // #552: codex-only — pre-seed folder-trust for the sandbox cwd in the shadow
     // config.toml so codex skips its blocking trust modal at boot (no probe
     // timeout). Other CLIs handle trust via their own flags (gemini --skip-trust).
     if (args.cli === "codex") {
-      await ensureCodexTrust(homeReal, homeShadow, sandboxCwd);
+      await ensureCodexTrust(homeReal, configShadow, sandboxCwd);
+    }
+    // #569: gemini-only — de-symlink the writable OAuth creds into the shadow so
+    // gemini's token-refresh write stays sandboxed (real ~/.gemini untouched).
+    if (args.cli === "gemini") {
+      await ensureGeminiAuth(homeReal, configShadow);
     }
     homeEnvAssignments[adapter.homeEnv] = homeShadow;
   }

@@ -25,6 +25,13 @@ export const GEMINI_HOME_ENV = "GEMINI_CLI_HOME";
 export const GEMINI_HOME_EXCLUDE: readonly string[] = Object.freeze([
   "GEMINI.md",
 ]);
+// #569: GEMINI_CLI_HOME is gemini's HOME, not its config dir. gemini reads creds
+// + settings from `$GEMINI_CLI_HOME/.gemini/` (Storage.getGlobalGeminiDir() =
+// join(homedir(), ".gemini"), and gemini's homedir() honors GEMINI_CLI_HOME).
+// So the shadow mirror must land under this subdir — else gemini finds no creds
+// at `$GEMINI_CLI_HOME/.gemini/` and falls through to its auth-selector (#569).
+// Contrast codex: CODEX_HOME IS the config dir directly (homeConfigSubdir=null).
+export const GEMINI_CONFIG_SUBDIR = ".gemini";
 
 export function geminiAdapter() {
   return makeAdapter({
@@ -35,6 +42,7 @@ export function geminiAdapter() {
     contextFile: GEMINI_CONTEXT_FILE,
     homeEnv: GEMINI_HOME_ENV,
     homeExclude: GEMINI_HOME_EXCLUDE,
+    homeConfigSubdir: GEMINI_CONFIG_SUBDIR,
     buildArgvEnv: () => ({
       argv: [
         "gemini",

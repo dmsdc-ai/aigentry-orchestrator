@@ -25,6 +25,9 @@ export interface AdapterConfig {
   contextFile?: string | null;
   homeEnv?: string | null;
   homeExclude?: readonly string[];
+  // #569: config subdir under homeEnv (gemini ".gemini"; null = homeEnv is the
+  // config dir directly, e.g. codex). See BootAdapter.homeConfigSubdir.
+  homeConfigSubdir?: string | null;
   buildArgvEnv(args: {
     ctx: SessionContext;
     prompt_file: string;
@@ -60,6 +63,7 @@ export function makeAdapter(cfg: AdapterConfig): BootAdapter {
     contextFile: cfg.contextFile ?? null,
     homeEnv: cfg.homeEnv ?? null,
     homeExclude: Object.freeze([...(cfg.homeExclude ?? [])]),
+    homeConfigSubdir: cfg.homeConfigSubdir ?? null,
     async buildBootCommand(
       ctx: SessionContext,
       resolved: ResolvedInstructions,

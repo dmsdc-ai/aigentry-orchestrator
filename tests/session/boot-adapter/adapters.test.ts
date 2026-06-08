@@ -56,6 +56,8 @@ test("4. codex argv = real default flags; additive descriptor (AGENTS.md / CODEX
   assert.equal(adapter.contextFile, "AGENTS.md");
   assert.equal(adapter.homeEnv, "CODEX_HOME");
   assert.deepEqual([...adapter.homeExclude], ["AGENTS.md", "AGENTS.override.md"]);
+  // #569: CODEX_HOME IS the config dir directly — no subdir.
+  assert.equal(adapter.homeConfigSubdir, null);
 });
 
 test("5. gemini argv = real default flags; additive descriptor (GEMINI.md / GEMINI_CLI_HOME) (#532)", async () => {
@@ -77,6 +79,8 @@ test("5. gemini argv = real default flags; additive descriptor (GEMINI.md / GEMI
   assert.equal(adapter.contextFile, "GEMINI.md");
   assert.equal(adapter.homeEnv, "GEMINI_CLI_HOME");
   assert.deepEqual([...adapter.homeExclude], ["GEMINI.md"]);
+  // #569: GEMINI_CLI_HOME is the HOME; gemini reads creds from `$HOME/.gemini`.
+  assert.equal(adapter.homeConfigSubdir, ".gemini");
 });
 
 test("5b. gemini argv reads AIGENTRY_GEMINI_MODEL override (#551)", async () => {
@@ -115,6 +119,7 @@ test("6b. claude exposes a null additive descriptor (flag-based role delivery) (
   assert.equal(a.contextFile, null);
   assert.equal(a.homeEnv, null);
   assert.deepEqual([...a.homeExclude], []);
+  assert.equal(a.homeConfigSubdir, null);
 });
 
 test("13. prompt bytes byte-equal resolved.effective_prompt (no in-flight mutation)", async () => {

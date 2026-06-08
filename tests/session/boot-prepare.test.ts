@@ -239,6 +239,9 @@ const CLI_MATRIX = [
     contextFile: "AGENTS.md",
     homeEnv: "CODEX_HOME",
     shadowDir: ".codexhome",
+    // #569: CODEX_HOME IS the config dir directly → no subdir, auth stays a symlink.
+    configSubdir: "",
+    authDesymlinked: false,
     authFile: "auth.json",
     settingsFile: "config.toml",
     globalCanary: "GLOBAL-CODEX-CANARY-532-must-not-leak",
@@ -250,6 +253,11 @@ const CLI_MATRIX = [
     contextFile: "GEMINI.md",
     homeEnv: "GEMINI_CLI_HOME",
     shadowDir: ".geminihome",
+    // #569: GEMINI_CLI_HOME is the HOME; gemini reads creds from `$HOME/.gemini`.
+    // The writable OAuth creds are de-symlinked (real 0600 copy) so a token
+    // refresh write stays sandboxed instead of mutating the real ~/.gemini.
+    configSubdir: ".gemini",
+    authDesymlinked: true,
     authFile: "oauth_creds.json",
     settingsFile: "settings.json",
     globalCanary: "GLOBAL-GEMINI-CANARY-532-must-not-leak",
@@ -360,17 +368,26 @@ for (const m of CLI_MATRIX) {
       const j = parseJson(r.stdout);
       const shadow = join(j.spawn_cwd, m.shadowDir);
       assert.ok(existsSync(shadow), "shadow home must exist");
-      // Auth preserved (symlink resolves to fake credential).
-      assert.ok(existsSync(join(shadow, m.authFile)), `auth (${m.authFile}) must be mirrored`);
-      assert.match(readFileSync(join(shadow, m.authFile), "utf8"), /FAKE-.*-CREDENTIAL/,
-        "auth mirror must resolve to real credential (symlink)");
+      // #569: the CLI's config dir may be a SUBDIR of the home env (gemini
+      // `.gemini`); codex keeps the home as its config dir (configSubdir === "").
+      const shadowCfg = m.configSubdir ? join(shadow, m.configSubdir) : shadow;
+      // Auth present + carrying the real credential (symlink for codex; 0600 copy
+      // for gemini — either way the credential bytes are reachable).
+      assert.ok(existsSync(join(shadowCfg, m.authFile)), `auth (${m.authFile}) must be mirrored`);
+      assert.match(readFileSync(join(shadowCfg, m.authFile), "utf8"), /FAKE-.*-CREDENTIAL/,
+        "auth mirror must carry the real credential");
       // Settings preserved.
-      assert.ok(existsSync(join(shadow, m.settingsFile)), `settings (${m.settingsFile}) must be mirrored`);
+      assert.ok(existsSync(join(shadowCfg, m.settingsFile)), `settings (${m.settingsFile}) must be mirrored`);
       // Global doc OMITTED → no leak.
-      assert.equal(existsSync(join(shadow, m.contextFile)), false,
+      assert.equal(existsSync(join(shadowCfg, m.contextFile)), false,
         `global ${m.contextFile} must be OMITTED from shadow home`);
-      // Entry is a symlink (mirror, not copy).
-      assert.ok(statSync(join(shadow, m.authFile)).isFile(), "auth entry resolves");
+      // Entry resolves to a regular file.
+      assert.ok(statSync(join(shadowCfg, m.authFile)).isFile(), "auth entry resolves");
+      // #569: writable creds are de-symlinked (real copy) for gemini so a token
+      // refresh cannot follow the link and mutate the real home; codex auth stays
+      // a symlink (codex creds are not written through the shadow here).
+      assert.equal(lstatSync(join(shadowCfg, m.authFile)).isSymbolicLink(), !m.authDesymlinked,
+        `auth ${m.authDesymlinked ? "must be de-symlinked (real copy)" : "stays a symlink"}`);
     } finally {
       cleanup();
     }
@@ -414,6 +431,79 @@ test("552-codex-E — shadow config.toml pre-trusts the sandbox cwd; real config
     // The real config.toml must be byte-identical (boundary: never written through).
     assert.equal(readFileSync(realConfig, "utf8"), realBefore,
       "real config.toml must NOT be modified");
+  } finally {
+    cleanup();
+  }
+});
+
+// #569 — gemini shadow-home auth. GEMINI_CLI_HOME is gemini's HOME, not its
+// config dir: gemini reads creds from `$GEMINI_CLI_HOME/.gemini/`
+// (Storage.getGlobalGeminiDir()). The pre-#569 flat mirror put creds at
+// `$GEMINI_CLI_HOME/` top-level, so gemini found none and fell through to its
+// auth-selector (never reached the REPL). The shadow must mirror under the
+// `.gemini` subdir, and the writable OAuth creds must be de-symlinked (real 0600
+// copy) so a token-refresh write stays sandboxed and never mutates real ~/.gemini.
+test("569-gemini-A — creds mirror lands under the .gemini subdir, NOT the home top-level", () => {
+  if (!cliAvailable("gemini")) { console.error("569-gemini-A SKIP — gemini not installed"); return; }
+  const { home, targetCwd, cleanup } = setupTempHome();
+  try {
+    const gemini = CLI_MATRIX.find((m) => m.cli === "gemini")!;
+    const fakeReal = setupFakeCliHome(home, gemini);
+    const r = runBootPrepareEnv(home, { GEMINI_CLI_HOME: fakeReal },
+      ["--role", "coder", "--cwd", targetCwd, "--sid", "t569-gemini-A", "--cli", "gemini"]);
+    assert.equal(r.code, 0, `exit ${r.code} stderr=${r.stderr}`);
+    const j = parseJson(r.stdout);
+    const homeShadow = join(j.spawn_cwd, gemini.shadowDir);
+    const cfgShadow = join(homeShadow, ".gemini");
+    // The config dir gemini actually reads (`$GEMINI_CLI_HOME/.gemini`) holds creds.
+    assert.ok(existsSync(join(cfgShadow, "oauth_creds.json")),
+      "creds must live under the .gemini subdir gemini reads (getGlobalGeminiDir)");
+    assert.ok(existsSync(join(cfgShadow, "settings.json")), "settings under .gemini");
+    // The home top-level must NOT hold the creds (that was the #569 bug layout).
+    assert.equal(existsSync(join(homeShadow, "oauth_creds.json")), false,
+      "creds must NOT be at the home top-level (pre-#569 bug layout)");
+    // GEMINI_CLI_HOME is exported as the HOME (parent of .gemini), not the cfg dir.
+    const body = readFileSync(j.spawn_cli, "utf8");
+    assert.match(body, new RegExp(`export GEMINI_CLI_HOME=.{0,2}${homeShadow.replace(/[.\\()[\]]/g, ".")}\\b`),
+      "GEMINI_CLI_HOME must point at the home (parent of .gemini)");
+  } finally {
+    cleanup();
+  }
+});
+
+test("569-gemini-B — writable creds de-symlinked (0600 copy); real ~/.gemini byte-identical", () => {
+  if (!cliAvailable("gemini")) { console.error("569-gemini-B SKIP — gemini not installed"); return; }
+  const { home, targetCwd, cleanup } = setupTempHome();
+  try {
+    const gemini = CLI_MATRIX.find((m) => m.cli === "gemini")!;
+    const fakeReal = setupFakeCliHome(home, gemini);
+    // Seed google_accounts.json too — gemini writes it on auth; it must also be
+    // de-symlinked so the write cannot follow the link into the real home.
+    writeFileSync(join(fakeReal, "google_accounts.json"), `{"active":"FAKE@example.com","old":[]}\n`);
+    const realOauthBefore = readFileSync(join(fakeReal, "oauth_creds.json"));
+    const realAcctBefore = readFileSync(join(fakeReal, "google_accounts.json"));
+    const r = runBootPrepareEnv(home, { GEMINI_CLI_HOME: fakeReal },
+      ["--role", "coder", "--cwd", targetCwd, "--sid", "t569-gemini-B", "--cli", "gemini"]);
+    assert.equal(r.code, 0, `exit ${r.code} stderr=${r.stderr}`);
+    const j = parseJson(r.stdout);
+    const cfgShadow = join(j.spawn_cwd, gemini.shadowDir, ".gemini");
+    for (const credFile of ["oauth_creds.json", "google_accounts.json"]) {
+      const shadowFile = join(cfgShadow, credFile);
+      assert.ok(existsSync(shadowFile), `${credFile} present in shadow .gemini`);
+      // De-symlinked: a real file, not a link into the real home (else a refresh
+      // write would follow the link and overwrite the real credential).
+      assert.equal(lstatSync(shadowFile).isSymbolicLink(), false,
+        `${credFile} must be a real copy, not a symlink into the real home`);
+      // Owner-only perms (0600) on the cred copy.
+      assert.equal(statSync(shadowFile).mode & 0o777, 0o600, `${credFile} copy must be mode 0600`);
+    }
+    // The copy carries the real credential content (so auth still works).
+    assert.match(readFileSync(join(cfgShadow, "oauth_creds.json"), "utf8"), /FAKE-.*-CREDENTIAL/);
+    // Boundary: the real (fake) ~/.gemini creds are byte-identical — never written.
+    assert.deepEqual(readFileSync(join(fakeReal, "oauth_creds.json")), realOauthBefore,
+      "real oauth_creds.json must NOT be modified");
+    assert.deepEqual(readFileSync(join(fakeReal, "google_accounts.json")), realAcctBefore,
+      "real google_accounts.json must NOT be modified");
   } finally {
     cleanup();
   }
