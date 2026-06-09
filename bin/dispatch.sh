@@ -383,15 +383,23 @@ if ! do_inject "$sid"; then
   exit 3
 fi
 
+# #574: the inject already landed (do_inject succeeded above), so the active.json
+# row MUST be created regardless of the verify_delivered verdict — a missing row
+# hides a started session from #517 pull-AUTO_REPORT fallback, which is worse than
+# a row for a verify false-negative (the fallback re-validates against git-log).
+# Honors tracker_register()'s contract: "Failure must NOT fail the dispatch — the
+# inject already landed." Both helpers are idempotent upserts (safe to call once
+# here on every inject-landed path). exit 5 (DELIVERY_FAILED) is still emitted for
+# callers that depend on it — only now after the row exists.
+tracker_append "$sid" "$ref_hash"
+[ "$spawn" -eq 1 ] && tracker_register "$sid"
+
 if [ "$verify_delivered" -eq 1 ]; then
   if ! verify_delivered "$sid"; then
-    echo "dispatch.sh: DELIVERY_FAILED for $sid (placeholder untouched)" >&2
+    echo "dispatch.sh: DELIVERY_FAILED for $sid (placeholder untouched; registered for pull-fallback despite verify-FN)" >&2
     exit 5
   fi
 fi
-
-tracker_append "$sid" "$ref_hash"
-[ "$spawn" -eq 1 ] && tracker_register "$sid"
 emit_telemetry --helper dispatch --subtype dispatch_ack \
   --payload-json "$(printf '{"target_sid":"%s","verified":%s}' "$sid" "$([ "$verify_delivered" -eq 1 ] && echo true || echo false)")" \
   --correlation-id "$sid"
