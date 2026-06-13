@@ -47,6 +47,13 @@ set -euo pipefail
 
 PROTECTED_SID="orchestrator"
 
+# Test seams (#606, mirrors orchestrator-boot.sh:40-42): override the process
+# lister + killer + self pid so the self/ancestor guard is exercisable with NO
+# real process touched.
+CLEANUP_PS_CMD="${CLEANUP_PS_CMD:-ps}"
+KILL_CMD="${KILL_CMD:-kill}"
+CLEANUP_SELF_PID="${CLEANUP_SELF_PID:-$$}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # Test seam (#540): dispatch-tracker invoked to flip the cleaned session out of
 # in_flight so the reconciler stops false-AUTO_HOLD/AUTO_REPORTing an already-gone
@@ -127,17 +134,70 @@ close_workspace_for() {
   fi
 }
 
+# _ps_snapshot — "pid ppid command..." rows. The -o set is portable across
+# BSD/macOS + GNU/Linux (same columns as orchestrator-boot.sh:48 /
+# session-reconciler.sh). Routed through CLEANUP_PS_CMD so tests can inject a
+# fixed table without touching the real process list.
+_ps_snapshot() {
+  "$CLEANUP_PS_CMD" -eo pid,ppid,command 2>/dev/null || true
+}
+
+# _self_ancestry <snapshot> — print SELF pid plus every ancestor pid (walk the
+# ppid chain up to pid 1). Mirrors orchestrator-boot.sh:54 (#539): used to never
+# SIGTERM the bridge we are running inside.
+_self_ancestry() {
+  local snap="$1" pid="$CLEANUP_SELF_PID" ppid hops=0
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; do
+    printf '%s\n' "$pid"
+    ppid="$(awk -v p="$pid" '$1==p {print $2; exit}' <<<"$snap")"
+    [ -z "$ppid" ] && break
+    pid="$ppid"
+    hops=$((hops + 1)); [ "$hops" -gt 64 ] && break   # cycle / runaway guard
+  done
+  return 0
+}
+
+# pid_is_self_or_ancestor <pid> — true (0) when <pid> is the cleanup process
+# itself ($$), one of its ancestors, or an explicitly env-provided orchestrator
+# bridge PID (ORCHESTRATOR_BRIDGE_PIDS, comma/space separated). #606 (cleanup
+# side of #539): SIGTERMing such a PID fires inside the orchestrator's own
+# process tree and cascades a DELETE 'Session destroyed' close to the live
+# control tower. This happens when <sid> was spawned surface-less (forbidden) so
+# its `telepty allow` process is a sibling/child under the tower.
+pid_is_self_or_ancestor() {
+  local pid="$1" snap ancestry bp bridge_pids
+  [ -z "$pid" ] && return 1
+  case "$pid" in (*[!0-9]*) return 1 ;; esac          # numeric pids only
+  snap="$(_ps_snapshot)"
+  ancestry="$(_self_ancestry "$snap")"
+  grep -qxF "$pid" <<<"$ancestry" && return 0
+  bridge_pids="${ORCHESTRATOR_BRIDGE_PIDS:-}"
+  for bp in ${bridge_pids//,/ }; do
+    [ "$pid" = "$bp" ] && return 0
+  done
+  return 1
+}
+
 # kill_parent_telepty_allow <sid> — find the `node ... telepty allow --id <sid> ...`
 # process and SIGTERM it. Its child wrapped CLI (claude/codex/gemini/...) dies with it.
 kill_parent_telepty_allow() {
   local sid="$1" pid
-  pid=$(ps -eo pid,command 2>/dev/null \
+  pid=$(_ps_snapshot \
     | awk -v s="$sid" '$0 ~ ("telepty allow --id " s " ") {print $1; exit}' || true)
   if [ -z "$pid" ]; then
     log "no parent telepty-allow process for $sid (already exited?)"
     return 0
   fi
-  if kill -TERM "$pid" 2>/dev/null; then
+  # #606/#539 self/ancestor guard — refuse to SIGTERM a PID inside the
+  # orchestrator's own process tree. Skip the kill ONLY; cleanup_one still runs
+  # the surface close + registry DELETE. Applies regardless of --force, because
+  # force only gates the PROTECTED_SID string check in cleanup_one, never this
+  # kill — so no force path can ever signal our own tree.
+  if pid_is_self_or_ancestor "$pid"; then
+    err "refusing to SIGTERM PID $pid for $sid — it is in the orchestrator's own process tree; this session was spawned surface-less (forbidden). Close it from the user's terminal."
+    return 0
+  fi
+  if "$KILL_CMD" -TERM "$pid" 2>/dev/null; then
     log "killed parent telepty-allow PID $pid for $sid"
   else
     log "kill -TERM PID $pid failed for $sid (may be exiting)"
@@ -281,4 +341,8 @@ main() {
   cleanup_one "$sid" "$force"
 }
 
-main "$@"
+# Sourceable for hermetic tests (mirrors orchestrator-boot.sh:99): run main only
+# when executed directly, not when sourced (T52 calls the functions in isolation).
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi
