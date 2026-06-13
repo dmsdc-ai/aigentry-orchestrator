@@ -138,16 +138,20 @@ _wh_cmux_list_titles() {
 # cmux sidebar pill under the DISTINCT key `aigentry` (F8: never clobber
 # claude_code's own `claude_code` pill). Best-effort; always returns 0 (§17).
 _wh_cmux_set_status() {
-  local host_id="$1" state="$2" icon color
+  # CMUX seam (${CMUX:-cmux}): same injectable binary _wh_cmux_open uses, so the #616
+  # spawn-time set_status wiring is hermetically testable and NEVER reaches the live
+  # cmux daemon 3848 under test (open-session.sh prepends the real cmux to PATH, so a
+  # bare `cmux` here would escape the stub). Defaults to the real `cmux` in production.
+  local host_id="$1" state="$2" icon color cmux_bin="${CMUX:-cmux}"
   [ -z "$host_id" ] && return 0
-  command -v cmux >/dev/null 2>&1 || return 0
+  command -v "$cmux_bin" >/dev/null 2>&1 || return 0
   case "$state" in
     working)      icon=hammer;          color="#ff9500" ;;
     idle)         icon=checkmark;       color="#34c759" ;;
     disconnected) icon=exclamationmark; color="#ff3b30" ;;
     *) return 0 ;; # unknown state — no-op (never emit a speculative pill)
   esac
-  cmux set-status aigentry "$state" --icon "$icon" --color "$color" \
+  "$cmux_bin" set-status aigentry "$state" --icon "$icon" --color "$color" \
     --workspace "$host_id" >/dev/null 2>&1 || true
   return 0
 }
@@ -681,8 +685,102 @@ _wh_warp_open() {
 }
 
 # -----------------------------------------------------------------------------
+# legacy terminal spawn adapters — aterm / tmux / wezterm / iterm (#608 Phase 3).
+# Each _wh_<term>_open is the inline open-session.sh:open_in_terminal() spawn branch
+# moved 1:1 (byte-equivalent — current behavior preserved, Rule 29). These are
+# SPAWN-only adapters: the orchestrator runs inside cmux, so lifecycle verbs
+# (lookup/close/alive/...) keep routing through the cmux adapter — only `open`
+# dispatches to the host the user is actually in. They consume platform.sh
+# primitives (platform::spawn_*), sourced by the caller (open-session.sh) and by
+# the Tier-1 contract tests; cmux/warp/headless paths never touch them.
+#
+# BC3 tier classification (declared per the §12 BC3 gate; mirrored in the contract
+# tests): Tier 1 = full-lifecycle-IPC host (queryable/ready-gateable surface) —
+# cmux, tmux, wezterm, iterm. Tier 2 = fire-and-forget spawn (no surface-ready
+# proof) — aterm, warp, headless (the ghostty/generic daemon fold). The 1:1 move
+# adds NO ready-gate to tmux/wezterm/iterm (none existed in the legacy branches),
+# so their ready_attestation is honestly `none` (BC2 / §13) — the Tier-1 label is
+# the capability ceiling (these hosts CAN be ready-gated), not a claim of one today.
+
+# _wh_fallback_spawn <sid> <cwd> <cli_cmd> — shared spawn fallback when a preferred
+# terminal CLI is unavailable (moved 1:1 from open-session.sh:fallback_spawn).
+# tmux window if inside a tmux session, else a daemon PTY with attach instructions.
+# Goes through platform.sh (Rule 26) so a Windows backend can satisfy the tmux
+# branch natively. Caller must have sourced platform.sh (open-session.sh does).
+_wh_fallback_spawn() {
+  local _sid="$1" _cwd="$2" _cli_cmd="$3"
+  if command -v tmux >/dev/null 2>&1 && platform::has_tmux_session; then
+    platform::spawn_tmux_window "$_sid" "$_cwd" "telepty allow --id '$_sid' --auto-restart $_cli_cmd"
+    echo "$_sid"
+  else
+    telepty spawn --id "$_sid" -- bash -c "cd '$_cwd' && exec $_cli_cmd" >/dev/null
+    echo "⚠️  Session spawned as daemon (no visible terminal). Attach: telepty attach $_sid" >&2
+    echo "$_sid"
+  fi
+}
+
+# _wh_aterm_open <sid> <cwd> <cli_cmd> — aterm new-session, else fallback (Tier 2).
+# bash -c wrapper for cwd propagation into claude (#311).
+_wh_aterm_open() {
+  local sid="$1" cwd="$2" cli_cmd="$3"
+  if command -v aterm >/dev/null 2>&1 \
+    && aterm new-session --cwd "$cwd" --cmd "bash -c 'cd $cwd && exec telepty allow --id $sid --auto-restart $cli_cmd'" 2>/dev/null; then
+    echo "$sid"
+  else
+    _wh_fallback_spawn "$sid" "$cwd" "$cli_cmd"
+  fi
+}
+
+# _wh_tmux_open <sid> <cwd> <cli_cmd> — tmux new-window via platform:: (Tier 1).
+# `tmux new-window -c` propagates cwd correctly. (Legacy used $title == $sid.)
+_wh_tmux_open() {
+  local sid="$1" cwd="$2" cli_cmd="$3"
+  platform::spawn_tmux_window "$sid" "$cwd" "telepty allow --id '$sid' --auto-restart $cli_cmd"
+  echo "$sid"
+}
+
+# _wh_wezterm_open <sid> <cwd> <cli_cmd> — wezterm cli spawn, else fallback (Tier 1).
+# Explicit cd inside bash -c guarantees cwd propagation into claude (#311).
+_wh_wezterm_open() {
+  local sid="$1" cwd="$2" cli_cmd="$3"
+  if command -v wezterm >/dev/null 2>&1; then
+    wezterm cli spawn --cwd "$cwd" -- bash -c "cd '$cwd' && exec telepty allow --id $sid --auto-restart $cli_cmd" >/dev/null
+    echo "$sid"
+  else
+    _wh_fallback_spawn "$sid" "$cwd" "$cli_cmd"
+  fi
+}
+
+# _wh_iterm_open <sid> <cwd> <cli_cmd> — iTerm tab via platform:: AppleScript (Tier 1).
+# Legacy contract: spawn failure → exit 2 (here: return 2, no handle).
+_wh_iterm_open() {
+  local sid="$1" cwd="$2" cli_cmd="$3"
+  platform::spawn_iterm_tab "$cwd" "telepty allow --id $sid --auto-restart $cli_cmd" \
+    || { echo "ERR iTerm spawn failed" >&2; return 2; }
+  echo "$sid"
+}
+
+# ready_attestation declarations (BC2): the byte-equivalent moves carry no ready-gate
+# → none. A declared FIELD per adapter, not a 10th verb (9-verb boundary invariant).
+_wh_aterm_ready_attestation()   { printf 'none'; }
+_wh_tmux_ready_attestation()    { printf 'none'; }
+_wh_wezterm_ready_attestation() { printf 'none'; }
+_wh_iterm_ready_attestation()   { printf 'none'; }
+
+# -----------------------------------------------------------------------------
 # headless adapter (no-op — for CI/docker/windows-terminal/zellij stubs)
 # -----------------------------------------------------------------------------
+# _wh_headless_open <sid> <cwd> <cli_cmd> — daemon-PTY spawn with attach instructions
+# (Tier 2; moved 1:1 from open-session.sh's `ghostty|generic|*` branch — the generic
+# fallback, ADR §7 Phase 3 "generic→headless adapter"). No visible UI surface.
+_wh_headless_open() {
+  local sid="$1" cwd="$2" cli_cmd="$3"
+  telepty spawn --id "$sid" -- bash -c "cd '$cwd' && exec $cli_cmd" >/dev/null
+  echo "⚠️  Session spawned as daemon (headless: no spawn-tab CLI)." >&2
+  echo "    Attach via: telepty attach $sid" >&2
+  echo "$sid"
+}
+_wh_headless_ready_attestation() { printf 'none'; }
 _wh_headless_lookup()        { echo ""; }
 _wh_headless_close()         { return 0; }
 _wh_headless_alive()         { return 1; }
@@ -693,21 +791,115 @@ _wh_headless_set_status()    { return 0; }
 _wh_headless_clear_status()  { return 0; }
 
 # -----------------------------------------------------------------------------
+# D2 — single terminal adapter registry (ADR §D2, #608 Phase 3). Collapses the two
+# formerly-disjoint vocabularies — open-session.sh:detect_terminal() and _wh_adapter()
+# (G4) — into ONE ordered data table. Each row: NAME<TAB>AUTO_DETECTABLE<TAB>TIER.
+#   AUTO_DETECTABLE — may _wh_adapter pick it WITHOUT an explicit env-force? Only
+#     cmux + headless (the orchestrator's spawn/lifecycle host & its fallback). warp
+#     has no desktop CLI (design 2026-05-29) and aterm/tmux/wezterm/iterm are
+#     reached only via detect_terminal→env-force, so all four are auto_detectable=no
+#     — _wh_adapter's lifecycle selection stays cmux-or-headless (T25 §4 invariant).
+#   TIER (BC3) — 1 = full-lifecycle-IPC host (cmux,tmux,wezterm,iterm);
+#     2 = fire-and-forget spawn (aterm,warp,headless[=ghostty/generic fold]).
+# Order = detection precedence — detect_terminal returns the FIRST row whose detect
+# predicate matches; headless is the always-matching catch-all terminator. The detect
+# predicate is shell (env / TERM_PROGRAM / PATH) so it cannot be a table cell — it is
+# keyed by NAME in _wh_detect_match — but there is ONE list, ONE vocabulary (G4 gone).
+_wh_registry() {
+  cat <<'EOF'
+cmux	yes	1
+aterm	no	2
+tmux	no	1
+wezterm	no	1
+iterm	no	1
+warp	no	2
+headless	yes	2
+EOF
+}
+
+# _wh_detect_match <name> — "am I running INSIDE this terminal" (context probe, used
+# by detect_terminal; byte-identical to the legacy open-session.sh:detect_terminal
+# env/TERM_PROGRAM checks). cmux here is CMUX_WORKSPACE_ID (the in-pane env), NOT a
+# PATH probe — _wh_adapter uses the separate host-availability probe below, so this
+# stays a faithful "which terminal am I in" check.
+_wh_detect_match() {
+  case "$1" in
+    cmux)     [ -n "${CMUX_WORKSPACE_ID:-}" ] ;;
+    aterm)    [ -n "${ATERM_IPC_SOCKET:-}" ] ;;
+    tmux)     [ -n "${TMUX:-}" ] ;;
+    wezterm)  [ "${TERM_PROGRAM:-}" = "WezTerm" ] ;;
+    iterm)    [ "${TERM_PROGRAM:-}" = "iTerm.app" ] ;;
+    warp)     return 1 ;;     # no desktop CLI → never auto-detected (env-force only)
+    headless) return 0 ;;     # always matches — folds the ghostty/generic fallback
+    *)        return 1 ;;
+  esac
+}
+
+# _wh_host_available <name> — "can I SPAWN into this host right now" (availability
+# probe, used by _wh_adapter for auto_detectable rows). Distinct from the context
+# probe above: cmux availability is the binary on PATH (what the legacy _wh_adapter
+# checked, T25 §4); headless is always available (daemon-PTY fallback). The generic
+# arm is future-proofing — no current auto_detectable adapter reaches it.
+_wh_host_available() {
+  case "$1" in
+    cmux)     command -v cmux >/dev/null 2>&1 ;;
+    headless) return 0 ;;
+    *)        command -v "$1" >/dev/null 2>&1 ;;
+  esac
+}
+
+# _wh_is_registered <name> — 0 if <name> is a registry adapter (env-force validation).
+_wh_is_registered() {
+  local want="$1" name rest
+  while IFS=$'\t' read -r name rest; do
+    [ "$name" = "$want" ] && return 0
+  done <<EOF
+$(_wh_registry)
+EOF
+  return 1
+}
+
+# detect_terminal — the host terminal the caller is running inside, as a registry
+# adapter NAME (ADR §D2; moved here from open-session.sh, #608 Phase 3 — both
+# detect_terminal and _wh_adapter now derive from the single _wh_registry, so G4's
+# two disjoint vocabularies are unrepresentable). "First adapter whose detect
+# predicate matches"; headless is the catch-all (the legacy ghostty/generic daemon
+# branch). open-session.sh sources this lib, so it still calls detect_terminal.
+detect_terminal() {
+  local name auto tier
+  while IFS=$'\t' read -r name auto tier; do
+    [ -z "$name" ] && continue
+    if _wh_detect_match "$name"; then printf '%s\n' "$name"; return 0; fi
+  done <<EOF
+$(_wh_registry)
+EOF
+  printf '%s\n' "headless"
+}
+
+# -----------------------------------------------------------------------------
 # dispatcher — selects adapter then forwards
 # -----------------------------------------------------------------------------
+# _wh_adapter — adapter selection for the lifecycle verbs (ADR §D2): an explicit
+# AIGENTRY_WORKSPACE_HOST env-force (any REGISTERED adapter) wins; else the first
+# auto_detectable adapter that is an available host; else headless. Shares the single
+# registry with detect_terminal (G4 resolved). Only cmux + headless are
+# auto_detectable, so auto-selection stays "cmux if on PATH, else headless" exactly
+# as before (T25 §4) — terminal SPAWN routing comes from detect_terminal→env-force in
+# open-session.sh, never from auto-detect here.
 _wh_adapter() {
   local pref="${AIGENTRY_WORKSPACE_HOST:-}"
-  case "$pref" in
-    cmux|warp|headless) printf '%s' "$pref"; return 0;;
-  esac
-  # Auto-detect: cmux if on PATH, else headless. NOTE: warp has no desktop CLI
-  # (design 2026-05-29) so it is never auto-detected — select it explicitly via
-  # AIGENTRY_WORKSPACE_HOST=warp.
-  if command -v cmux >/dev/null 2>&1; then
-    printf '%s' "cmux"
-  else
-    printf '%s' "headless"
+  if [ -n "$pref" ] && _wh_is_registered "$pref"; then
+    printf '%s' "$pref"; return 0
   fi
+  local name auto tier
+  while IFS=$'\t' read -r name auto tier; do
+    [ -z "$name" ] && continue
+    [ "$auto" = "yes" ] || continue
+    if _wh_host_available "$name"; then printf '%s' "$name"; return 0; fi
+  done <<EOF
+$(_wh_registry)
+EOF
+  printf '%s' "headless"
 }
 
 # wh_open <sid> <cwd> <cli_cmd> — spawn a visible surface wrapping
@@ -715,15 +907,15 @@ _wh_adapter() {
 # internal obligation — NOT a public verb, BC2/D3), then print the stable host_id.
 # Exit 0 only when the surface can accept input; non-zero ⇒ no handle emitted.
 # BC4 (observability): logs the selected adapter so a rollback can be traced.
-# Migrated adapters: cmux (Phase 1), warp (Phase 2). Adapters whose `open` is not
-# yet migrated (headless=Phase 3) fail LOUDLY with a labelled UNSUPPORTED line
-# rather than a raw "command not found" or a silent no-op (§2 explicit-error
-# policy — never a silent surface failure).
+# Migrated adapters: cmux (Phase 1), warp (Phase 2), aterm/tmux/wezterm/iterm/headless
+# (Phase 3). An adapter with no `_wh_<name>_open` fails LOUDLY with a labelled
+# UNSUPPORTED line rather than a raw "command not found" or a silent no-op (§2
+# explicit-error policy — never a silent surface failure).
 wh_open() {
   local adapter; adapter=$(_wh_adapter)
   _wh_log "open: adapter=$adapter sid=${1:-}"
   if ! declare -F "_wh_${adapter}_open" >/dev/null 2>&1; then
-    _wh_log "$adapter wh_open: UNSUPPORTED — adapter spawn not migrated yet (#608 Phase 1=cmux, Phase 2=warp)"
+    _wh_log "$adapter wh_open: UNSUPPORTED — no _wh_${adapter}_open spawn adapter registered (#608: cmux/warp/aterm/tmux/wezterm/iterm/headless migrated)"
     return 64
   fi
   "_wh_${adapter}_open" "$@"

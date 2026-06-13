@@ -138,33 +138,10 @@ case "$cli" in
   gemini) [ -z "$extra_flags" ] && extra_flags="-m ${AIGENTRY_GEMINI_MODEL:-gemini-2.5-flash} --approval-mode yolo";;
 esac
 
-# Detect host terminal environment
-detect_terminal() {
-  [ -n "${CMUX_WORKSPACE_ID:-}" ] && { echo cmux; return; }
-  [ -n "${ATERM_IPC_SOCKET:-}" ] && { echo aterm; return; }
-  [ -n "${TMUX:-}" ] && { echo tmux; return; }
-  case "${TERM_PROGRAM:-}" in
-    WezTerm)   echo wezterm ;;
-    iTerm.app) echo iterm ;;
-    ghostty)   echo ghostty ;;
-    *)         echo generic ;;
-  esac
-}
-
-# Fallback chain when a preferred terminal CLI is unavailable.
-# Goes through the platform abstraction (Rule 26) so a future Windows backend
-# can satisfy the tmux branch natively (WSL tmux / wt.exe etc.).
-fallback_spawn() {
-  local _sid="$1" _cwd="$2" _cli_cmd="$3"
-  if command -v tmux >/dev/null 2>&1 && platform::has_tmux_session; then
-    platform::spawn_tmux_window "$_sid" "$_cwd" "telepty allow --id '$_sid' --auto-restart $_cli_cmd"
-    echo "$_sid"
-  else
-    telepty spawn --id "$_sid" -- bash -c "cd '$_cwd' && exec $_cli_cmd" >/dev/null
-    echo "⚠️  Session spawned as daemon (no visible terminal). Attach: telepty attach $_sid" >&2
-    echo "$_sid"
-  fi
-}
+# detect_terminal + the spawn adapters now live in lib/workspace-host.sh (#608 Phase 3,
+# ADR §D2). detect_terminal is registry-driven there and shared with _wh_adapter, so the
+# two terminal vocabularies can never again diverge (G4). The per-terminal spawn
+# fallback (legacy fallback_spawn) moved 1:1 to _wh_fallback_spawn in the same lib.
 
 # _cmux_wait_ready <workspace-ref> [cmux-bin] — readiness barrier for a freshly created
 # cmux workspace (BUG-A: close the daemon submit-race at the source, Rule 27).
@@ -211,82 +188,57 @@ _cmux_wait_ready() {
   return 1
 }
 
-# Open session in detected terminal. Always wraps in `telepty allow --id <sid>`
-# so the daemon registers it (visible to `telepty list` + inject targets).
+# Open session in the detected terminal (ADR §7 Phase 3, D1/D2). Always wraps in
+# `telepty allow --id <sid>` so the daemon registers it (visible to `telepty list` +
+# inject targets). open_in_terminal is now a THIN dispatch: detect_terminal names the
+# adapter, wh_open spawns through the single Workspace Host seam. The legacy inline
+# per-terminal `case` is gone — each terminal's spawn now lives in its _wh_<term>_open
+# adapter (moved 1:1, byte-equivalent). BC4-a: AIGENTRY_WH_LEGACY_SPAWN=1 still forces
+# the original inline cmux path for an immediate revert if the cmux seam regresses
+# (live daemon 3848 protection).
 open_in_terminal() {
   local term cli_cmd ref out
   term=$(detect_terminal)
   cli_cmd="$cli $extra_flags"
 
-  case "$term" in
-    cmux)
-      # cmux --command sends text+Enter; telepty allow runs as the workspace's foreground process.
-      # bash -c 'cd ... && exec ...' wrapper: cmux --cwd only affects workspace shell, not the
-      # telepty-allow-wrapped CLI. Explicit cd inside wrapper guarantees claude inherits cwd (#311).
-      if [ "${AIGENTRY_WH_LEGACY_SPAWN:-}" = "1" ]; then
-        # BC4-a rollback switch: force the legacy inline cmux path (devkit original,
-        # byte-for-byte) instead of wh_open. Immediate revert if the seam regresses.
-        # CMUX seam: injectable cmux binary so the readiness gate is hermetically testable
-        # (BUG-A); defaults to the real `cmux` in production.
-        local CMUX_BIN="${CMUX:-cmux}"
-        out=$("$CMUX_BIN" new-workspace --cwd "$cwd" --command "bash -c 'cd $cwd && exec telepty allow --id $sid --auto-restart $cli_cmd'" 2>&1)
-        ref=$(echo "$out" | grep -oE 'workspace:[0-9]+' | head -1)
-        [ -z "$ref" ] && { echo "ERR cmux new-workspace failed: $out" >&2; exit 2; }
-        "$CMUX_BIN" rename-workspace --workspace "$ref" "$title" >/dev/null 2>&1 || true
-        # Readiness barrier (BUG-A, Rule 27): return the ref ONLY once the pane surface can
-        # accept `send-key`, so the daemon submit never races a not-yet-live socket.
-        if ! _cmux_wait_ready "$ref" "$CMUX_BIN"; then
-          echo "ERR cmux workspace $ref pane not ready after ${CMUX_READY_TIMEOUT_MS:-10000}ms — surface cannot accept send-key (daemon submit would race 'Failed to write to socket'). Not returning a ref for a dead workspace." >&2
-          "$CMUX_BIN" close-workspace --workspace "$ref" >/dev/null 2>&1 || true
-          exit 3
-        fi
-        echo "$ref"
-      else
-        # #608 step2: wh_open is the byte-equivalent cmux spawn. _wh_cmux_open does
-        # new-workspace + rename + the 3-part ready-gate internally, returning the ref
-        # ONLY once the pane can accept send-key. Its exit codes match the legacy inline
-        # contract above (2 = spawn failure, 3 = ready-timeout with the ws closed), so
-        # propagate them verbatim — same observable behavior, single SSOT spawn path.
-        ref=$(wh_open "$sid" "$cwd" "$cli_cmd") || exit $?
-        echo "$ref"
-      fi
-      ;;
-    aterm)
-      # bash -c wrapper for cwd propagation into claude (#311).
-      if command -v aterm >/dev/null 2>&1 \
-        && aterm new-session --cwd "$cwd" --cmd "bash -c 'cd $cwd && exec telepty allow --id $sid --auto-restart $cli_cmd'" 2>/dev/null; then
-        echo "$sid"
-      else
-        fallback_spawn "$sid" "$cwd" "$cli_cmd"
-      fi
-      ;;
-    tmux)
-      # tmux new-window -c propagates cwd correctly via platform::spawn_tmux_window.
-      platform::spawn_tmux_window "$title" "$cwd" "telepty allow --id '$sid' --auto-restart $cli_cmd"
-      echo "$sid"
-      ;;
-    wezterm)
-      if command -v wezterm >/dev/null 2>&1; then
-        # Explicit cd inside bash -c guarantees cwd propagation into claude (#311).
-        wezterm cli spawn --cwd "$cwd" -- bash -c "cd '$cwd' && exec telepty allow --id $sid --auto-restart $cli_cmd" >/dev/null
-        echo "$sid"
-      else
-        fallback_spawn "$sid" "$cwd" "$cli_cmd"
-      fi
-      ;;
-    iterm)
-      platform::spawn_iterm_tab "$cwd" "telepty allow --id $sid --auto-restart $cli_cmd" \
-        || { echo "ERR iTerm spawn failed" >&2; exit 2; }
-      echo "$sid"
-      ;;
-    ghostty|generic|*)
-      # No clean spawn-tab CLI — fall back to daemon PTY with attach instructions.
-      telepty spawn --id "$sid" -- bash -c "cd '$cwd' && exec $cli_cmd" >/dev/null
-      echo "⚠️  Session spawned as daemon ($term has no spawn-tab CLI)." >&2
-      echo "    Attach via: telepty attach $sid" >&2
-      echo "$sid"
-      ;;
-  esac
+  if [ "$term" = "cmux" ] && [ "${AIGENTRY_WH_LEGACY_SPAWN:-}" = "1" ]; then
+    # BC4-a rollback switch: force the legacy inline cmux path (devkit original,
+    # byte-for-byte) instead of wh_open. CMUX seam: injectable cmux binary so the
+    # readiness gate is hermetically testable (BUG-A); defaults to the real `cmux`.
+    # cmux --command sends text+Enter; telepty allow runs as the workspace's foreground
+    # process. The bash -c 'cd ... && exec ...' wrapper guarantees claude inherits cwd
+    # (#311): cmux --cwd only affects the workspace shell, not the wrapped CLI.
+    local CMUX_BIN="${CMUX:-cmux}"
+    out=$("$CMUX_BIN" new-workspace --cwd "$cwd" --command "bash -c 'cd $cwd && exec telepty allow --id $sid --auto-restart $cli_cmd'" 2>&1)
+    ref=$(echo "$out" | grep -oE 'workspace:[0-9]+' | head -1)
+    [ -z "$ref" ] && { echo "ERR cmux new-workspace failed: $out" >&2; exit 2; }
+    "$CMUX_BIN" rename-workspace --workspace "$ref" "$title" >/dev/null 2>&1 || true
+    # Readiness barrier (BUG-A, Rule 27): return the ref ONLY once the pane surface can
+    # accept `send-key`, so the daemon submit never races a not-yet-live socket.
+    if ! _cmux_wait_ready "$ref" "$CMUX_BIN"; then
+      echo "ERR cmux workspace $ref pane not ready after ${CMUX_READY_TIMEOUT_MS:-10000}ms — surface cannot accept send-key (daemon submit would race 'Failed to write to socket'). Not returning a ref for a dead workspace." >&2
+      "$CMUX_BIN" close-workspace --workspace "$ref" >/dev/null 2>&1 || true
+      exit 3
+    fi
+    echo "$ref"
+    return 0
+  fi
+
+  # Phase 3 single dispatch (D1/D2): the detected terminal IS the adapter. Force it so
+  # wh_open routes to _wh_<term>_open (env-force beats _wh_adapter auto-detect, which
+  # only auto-selects cmux/headless). Adapter exit codes propagate verbatim — e.g. the
+  # cmux contract: 2 = spawn failure, 3 = ready-timeout with the workspace closed.
+  ref=$(AIGENTRY_WORKSPACE_HOST="$term" wh_open "$sid" "$cwd" "$cli_cmd") || exit $?
+
+  # #616 (사용자확정 옵션2 = 사이드바): surface the freshly-spawned worker as a ⚡working
+  # pill in the cmux sidebar immediately — visibility WITHOUT focus theft (the
+  # orchestrator keeps its surface; NO select-workspace). wh_set_status routes via
+  # _wh_adapter (cmux in the live orchestrator, where cmux is on PATH); it is a
+  # degraded-noop on non-cmux adapters (§17). Best-effort — never gates the spawn,
+  # never writes to stdout (the ref must be the sole stdout line).
+  wh_set_status "$ref" working >/dev/null 2>&1 || true
+
+  echo "$ref"
 }
 
 # EXIT trap — best-effort session-lifecycle hook (Plan A Task 8 integration).
