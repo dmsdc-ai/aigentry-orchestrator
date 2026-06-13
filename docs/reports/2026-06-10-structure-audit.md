@@ -24,7 +24,7 @@
 
 ### R2. Role/Capability 레지스트리 양방향 거울 — SSOT 부재 (MAJOR, §4)
 
-`@dmsdc-ai/aigentry-ssot`는 `Capability, CAPABILITIES, isCapability, Role, ROLES, isRole, ROLE_CAPABILITY_SUBSET`를 export하고(`node_modules/@dmsdc-ai/aigentry-ssot/dist/index.d.ts:5`), 그 docstring은 "Mirrors `aigentry-orchestrator/src/session/types.ts`" / "Mirrors orchestrator's `ROLE_CAPABILITIES` registry"라고 자인한다(`dist/contracts/capability.d.ts:20-22, 36-38`).
+`@dmsdc-ai/aigentry-ssot`는 orchestrator의 role/capability 타입·레지스트리에 대응하는 export를 제공하고, 그 docstring은 orchestrator의 해당 타입/레지스트리를 "Mirrors"한다고 자인한다. *(ssot 내부 export 이름·dist 경로 상세는 공개 위생상 redact — tq#622)*
 
 - 이 repo는 같은 데이터를 `src/session/types.ts:39-54`(CAPABILITIES)와 `src/session/role-capabilities.ts:21+`(ROLE_CAPABILITIES)에 **로컬 재정의**.
 - src/ 전체에서 ssot를 import하는 파일은 `src/session/inject-parser.ts:27` 단 1개.
