@@ -61,6 +61,7 @@ CLEANUP_SH="${CLEANUP_SH:-$SCRIPT_DIR/session-cleanup.sh}"
 DISPATCH_SH="${DISPATCH_SH:-$SCRIPT_DIR/dispatch.sh}"
 TRACKER_SH="${TRACKER_SH:-$SCRIPT_DIR/dispatch-tracker.sh}"
 COMMS_AUDITOR_SH="${COMMS_AUDITOR_SH:-$SCRIPT_DIR/session-comms-auditor.sh}"
+BRIDGE_AUDITOR_SH="${BRIDGE_AUDITOR_SH:-$SCRIPT_DIR/orchestrator-bridge-auditor.sh}"
 SESSION_PROBE_PY="${SESSION_PROBE_PY:-$SCRIPT_DIR/session-probe.py}"
 POLICY_PY="${POLICY_PY:-$SCRIPT_DIR/policy.py}"
 TELEPTY="${TELEPTY:-telepty}"
@@ -616,6 +617,16 @@ fi
 # --dry-run) — it injects HOLDs + mutates the round-counter state. ---
 if [ -x "$COMMS_AUDITOR_SH" ] && [ "$DRY_RUN" -eq 0 ]; then
   TELEPTY="$TELEPTY" "$COMMS_AUDITOR_SH" >/dev/null 2>&1 || log "ERR comms-auditor non-zero (continuing)"
+fi
+
+# --- step 0d: orchestrator-bridge singleton belt (#620, #618 recurrence) — detect
+# a stale DUPLICATE `telepty allow --id orchestrator ` bridge (raw restart that
+# bypassed orchestrator-boot.sh) and push a HOLD inject naming the pids + the
+# `kill -9` remedy. WARN-ONLY: never kills (orchestrator bridge cleanup is
+# USER-ONLY, #606). Best-effort: a non-zero pass never blocks the tick. Act-only
+# (skipped under --dry-run) — the HOLD inject is the action. ---
+if [ -x "$BRIDGE_AUDITOR_SH" ] && [ "$DRY_RUN" -eq 0 ]; then
+  TELEPTY="$TELEPTY" "$BRIDGE_AUDITOR_SH" >/dev/null 2>&1 || log "ERR bridge-auditor non-zero (continuing)"
 fi
 
 # --- step 1: scheduler tick (Layer D fires due) ---

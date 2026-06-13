@@ -21,7 +21,7 @@
 - [ ] **Cross-OS abstraction** (Rule 26): bash 신규 코드가 `lib/platform.sh` 경유하는가?
 - [ ] **워크어라운드 금지** (Rule 27): 증상 우회가 아닌 근본 원인 수정 지시인가?
 - [ ] **세션 완료 후 정리** (Rule 28): DONE 보고 검증 후 `bin/session-cleanup.sh <sid>` 즉시 실행 (cmux workspace 닫기 + telepty session 정리 통합; SPEC FIRST 재사용 예외). telepty#17 (DISCONNECTED 누적) 회피.
-- [ ] **오케스트레이터(컨트롤 타워) 부팅** (#539): bare `telepty allow`가 아닌 `bin/orchestrator-boot.sh` 경유로 부팅 — 기존 `telepty allow --id <orchestrator-sid>` stale bridge를 `kill -9`(SIGTERM 금지: DELETE cascade로 live 세션 동반 종료)로 제거 후 exec. singleton-at-boot 강제 (중복 bridge → live orchestrator self-exit 회귀 회피). self/조상 PID는 절대 미살해.
+- [ ] **오케스트레이터(컨트롤 타워) 부팅/재시작** (#539, #620): 최초 부팅이든 재시작이든 **항상** `bin/orchestrator-boot.sh` 경유 — bare `telepty allow` **절대 금지**. bare 재시작은 stale 중복 bridge를 남기고, telepty `--id` register는 idempotent(2nd allow가 같은 세션 공유)이라 daemon이 모든 inject를 registered-first stale owner로 라우팅 → worker REPORT가 live TUI에 0건 도달하는 silent 장애 (#618). boot.sh는 기존 `telepty allow --id <orchestrator-sid>` stale bridge를 `kill -9`(SIGTERM 금지: DELETE cascade로 live 세션 동반 종료)로 제거 후 exec — singleton-at-boot 강제, self/조상 PID는 절대 미살해. Belt: `bin/orchestrator-bridge-auditor.sh`(reconcile tick step 0d)가 중복 bridge를 감지해 orchestrator에 HOLD(검출+경고 only; **auto-kill 금지** — bridge cleanup은 사용자 전용 #606).
 - [ ] **보고 vs 토론 구분** (Rule 15): 위임 보고 라인인가, 자유 토론인가?
 - [ ] **세션 ID 하드코딩 금지** (Rule 16): `aigentry-orchestrator-claude` 하드코딩 피하고 configurable로?
 - [ ] **외과적 변경 (Rule 29)**: 변경 라인이 모두 요청에 추적 가능한가? Drive-by reformat/refactor 금지, dead code는 mention only?
