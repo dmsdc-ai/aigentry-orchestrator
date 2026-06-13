@@ -356,7 +356,8 @@ if [ "$spawn" -eq 1 ]; then
     worker_launcher=$(write_worker_launcher "$sid" "$cli" "$cli" "$worker_flags" "$worker_hooks_dir")
     # Use the dispatch-owned launcher as the CLI so codex/claude/gemini all
     # receive AIGENTRY_WORKER_SESSION + Git env-config without editing
-    # symlinked devkit open-session.sh.
+    # the orchestrator's open-session.sh (#613 A2: now an orchestrator real
+    # file, no longer a symlink into devkit; resolution path is unchanged).
     if ! "$OPEN_SESSION_SH" --track "$track" --name "$name" --cwd "$cwd" --cli "$worker_launcher" --extra-flags " " >/dev/null; then
       echo "dispatch.sh: open-session.sh failed" >&2
       exit 2
