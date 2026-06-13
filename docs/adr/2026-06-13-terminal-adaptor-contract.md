@@ -1,6 +1,6 @@
 # ADR 2026-06-13 — Terminal Adaptor Contract: complete unification (cmux ↔ warp seamless parity)
 
-- **Status**: PROPOSED (SPEC FIRST — Rule 24). Awaiting user/orchestrator approval. **No code shipped in this ADR.** Premise independently verified — see §11 (workflow 6-lens + 3-refute, confidence 0.93).
+- **Status**: PROPOSED (SPEC FIRST — Rule 24). Awaiting user/orchestrator approval. **No code shipped in this ADR.** Premise independently verified — see §11 (workflow 6-lens + 3-refute, confidence 0.93). Adversarially reviewed by 3-LLM deliberation (claude/codex/gemini, unanimous) — **§12 binds 6 Blocking Migration Criteria as approval conditions.**
 - **Role**: architect (design only — implementation is a separate coder task after approval).
 - **Task**: tq#608 — 터미널 어댑터 계약 완전 통일.
 - **Worktree**: `/private/tmp/wt-arch-608` (repo `aigentry-orchestrator`, branch `wt/arch-608`, base `277ff97`).
@@ -244,3 +244,22 @@ Any reading that the telepty `closeSurface`/`focusSurface` rework is an *uncommi
 The §5 conformance suite must include **#486 INV-17 non-regression**: on host app-quit, both cmux and warp must resolve `INDETERMINATE → alive` (never mass-kill sessions) — `_wh_warp_alive:360-363` + `isSurfaceAlive` `'unknown'→skip`. A unified `wh_open`/registry change must not regress this app-quit safety.
 
 > §11 is orchestrator-authored (ADR finalization is an orchestrator role per the role table); §1–§10 are the architect's design, unchanged except the §1.0 status line. Implementation remains gated on user approval.
+
+---
+
+## 12. Blocking Migration Criteria (3-LLM deliberation, 2026-06-13 — unanimous)
+
+Adversarial review by claude (critic) / codex (implementer) / gemini (researcher), 3 rounds, unanimous. Full synthesis: `docs/reports/2026-06-13-608-adr-deliberation-synthesis.md`. Verdict: **no structural defect** (9-verb not over-engineered, ownership split sound, §1/§2/§3/§17 hold). Approval is **conditional** on these 6 criteria being satisfied as the migration proceeds — each is a BLOCKING gate, not advisory.
+
+| # | Criterion | Gate |
+|---|-----------|------|
+| **BC1** | **warp ready-gate = V2** (bounded `osascript`+AX read-screen) + degraded fallback. **V1 (`telepty --on-ready`) is REJECTED** — gemini established that Warp's `warp://` is an async launchd handoff with **no IPC/socket callback for surface-ready**, so a transport/process hook can never attest *surface* readiness. In degraded warp (AX unavailable), `wh_open` MUST NOT route work that requires a guaranteed-visible foreground surface. | Phase 2 gate: warp `wh_open` returns a handle only after V2 attestation OR declares `degraded`; no V1 code path ships. |
+| **BC2** | **9-verb boundary is invariant.** No 10th verb (`wh_probe_ready` rejected). Ready is a `wh_open` internal obligation (D3). Add capability field **`ready_attestation: surface \| process \| none`** per adapter. | Contract test asserts exactly 9 public verbs; `ready_attestation` declared for every adapter. |
+| **BC3** | **Phase 3 = Tiered conformance gate.** **Tier 1** (full lifecycle IPC: cmux, tmux, wezterm, iterm) / **Tier 2** (fire-and-forget spawn: warp, ghostty, generic). Each adapter must pass **its tier's** contract test **before** it is folded in (closes the mid-migration verification gap). Add the Tier classification table to §4/§5. | Phase 3 entry: per-adapter tier test green; no adapter folded without its tier test existing first. |
+| **BC4** | **Rollback / observability (per phase).** ADR §7 had only forward gates — no reverse path. Add: (a) **per-phase** old-path fallback flag (individual env, not one global — preserves phase isolation), (b) adapter-selection logging, (c) one-command rollback. Protects the live cmux daemon (3848). | Each phase ships with its fallback flag + rollback command + selection log, verified before the phase is declared done. |
+| **BC5** | **kitty-label boundary.** telepty-internal terminal-title escape (`websocket.js:88`, reconnect label) stays in the transport layer — **permanently allowed** (not a temporary waiver). BUT any **orchestrator-originated** workspace/session logical-label intent MUST go through a route the adapter owns (`wh_label` if/when a second call site appears). Discriminator: *origin* = telepty-internal (allowed) vs orchestrator-intent (adapter route). Supersedes §11.1's "carve-out, revisit later" with this explicit boundary. | Boundary documented; no orchestrator-intent label write bypasses the adapter. |
+| **BC6** | **§2 honest re-definition.** "Seamless parity" = **functional parity achieved** (spawn/close/focus/alive/list/prune/status/inject all work on cmux AND warp) **+ bounded ready-attestation asymmetry** (cmux=surface-attested, warp=process-or-AX-attested). The asymmetry is the honest declaration of a platform limit (Warp has no CLI), **not a design defect**. Update §6/§8 wording from "one caveat" to this framing. | §6/§8 reworded; matrix labels warp ready-gate as `bounded`, not `unsupported` or silent. |
+
+**Separated scope (NOT part of #608):** standalone telepty ghost-tab accumulation — `closeSurface` is a gated no-op already landed (`AIGENTRY_TELEPTY_SELF_CLOSE_SURFACE` default OFF), so a standalone telepty (no orchestrator) currently ships leaking ghost tabs. This is a **distinct active P1** (telepty surface-GC / default policy), tracked separately (tq#609) and noted in §9 Consequences. Folding it into #608 would be scope creep.
+
+**Approval path:** these 6 criteria are now part of the spec. User approval of this ADR (with §12) → coder Phase 1 (cmux `wh_open` move, byte-equivalent gate). No implementation before approval.
