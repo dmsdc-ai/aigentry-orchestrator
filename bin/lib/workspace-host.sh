@@ -229,6 +229,93 @@ _wh_cmux_focus() {
   cmux select-workspace --workspace "$host_id" >/dev/null 2>&1
 }
 
+# _wh_cmux_ready_attestation — capability metadata (§12 BC2). ready_attestation ∈
+# {surface,process,none}: HOW this adapter's wh_open ready-gate attests pane
+# readiness. cmux reads the pane content (read-screen) → surface-attested. This is
+# a declared capability FIELD, not a 10th lifecycle verb (the 9-verb boundary is
+# invariant, BC2 — readiness stays an internal obligation of wh_open, D3). Note:
+# warp(process/AX) + headless(none) declarations land with their phases (2/3).
+_wh_cmux_ready_attestation() { printf 'surface'; }
+
+# _wh_cmux_wait_ready <workspace-ref> [cmux-bin] — readiness barrier for a freshly
+# created cmux workspace (BUG-A: close the daemon submit-race at the source, Rule 27).
+# Moved byte-for-byte from open-session.sh:_cmux_wait_ready (#608 Phase 1, ADR §7) so
+# the ready-gate is an internal obligation of _wh_cmux_open (D3), not a public verb.
+#
+# `cmux new-workspace` returns `workspace:N` on a string-parse, but the pane's surface PTY
+# + `telepty allow` foreground proc come up async AFTER that. Returning the ref before the
+# surface can accept `send-key` lets the daemon submit fire into a not-yet-live socket
+# ("Failed to write to socket") → the worker's Enter is lost → it never starts. This gate
+# makes the returned ref mean "the pane is ready to receive keys".
+#
+# Proof is 3-part, re-checked each poll. cmux's EXIT STATUS IS UNRELIABLE (it prints
+# "Error:" lines with rc=0) and a BOGUS REF SILENTLY FALLS BACK to the caller's own surface
+# — so every check inspects OUTPUT TEXT, and existence is anchored on list-workspaces (which
+# never lists a bogus ref):
+#   (a) list-workspaces contains the exact ref → workspace registered (fallback-immune)
+#   (b) surface-health shows a `type=terminal` line and no `Error:` → pane surface exists
+#   (c) read-screen returns non-empty content and no `Error:`      → surface renders/responds
+# Checks short-circuit existence-first, so the fallback-prone probes are never consulted for
+# an unregistered ref. The cmux branch is macOS-only, so the loop uses only portable
+# primitives (awk/sleep/grep) — no OS abstraction needed (Rule 26).
+_wh_cmux_wait_ready() {
+  local ref="$1" cmux_bin="${2:-cmux}"
+  local timeout_ms="${CMUX_READY_TIMEOUT_MS:-10000}"
+  local interval_ms="${CMUX_READY_INTERVAL_MS:-200}"
+  local interval_s; interval_s=$(awk -v ms="$interval_ms" 'BEGIN{printf "%.3f", ms/1000}')
+  local max_iters=$(( timeout_ms / interval_ms )); [ "$max_iters" -lt 1 ] && max_iters=1
+  local i=0 lw sh rs
+  while [ "$i" -lt "$max_iters" ]; do
+    lw=$("$cmux_bin" list-workspaces 2>/dev/null || true)
+    if printf '%s\n' "$lw" | grep -qE "(^|[[:space:]])${ref}([[:space:]]|$)"; then
+      sh=$("$cmux_bin" surface-health --workspace "$ref" 2>&1 || true)
+      if printf '%s\n' "$sh" | grep -q 'type=terminal' \
+         && ! printf '%s\n' "$sh" | grep -q '^Error:'; then
+        rs=$("$cmux_bin" read-screen --workspace "$ref" --lines 1 2>&1 || true)
+        if [ -n "$(printf '%s' "$rs" | tr -d '[:space:]')" ] \
+           && ! printf '%s\n' "$rs" | grep -q '^Error:'; then
+          return 0
+        fi
+      fi
+    fi
+    i=$((i+1))
+    sleep "$interval_s"
+  done
+  return 1
+}
+
+# _wh_cmux_open <sid> <cwd> <cli_cmd> — spawn a visible cmux workspace wrapping
+# `telepty allow --id <sid>`, BLOCK until the ready-gate passes, then emit the
+# workspace ref (workspace:N) as the host_id (ADR §3 D1 contract). Moved byte-for-byte
+# from open-session.sh:open_in_terminal()'s cmux branch (#608 Phase 1, ADR §7).
+# Exit contract (handle emitted ⇒ pane ready; no half-spawned surface on failure):
+#   0  → ref printed on stdout (surface can accept send-key).
+#   2  → new-workspace produced no ref (spawn failed); nothing to clean up.
+#   3  → ready-gate timed out; the workspace is closed, NO ref emitted.
+# CMUX seam: injectable cmux binary so the readiness gate is hermetically testable
+# (BUG-A); defaults to the real `cmux` in production.
+_wh_cmux_open() {
+  local sid="$1" cwd="$2" cli_cmd="$3"
+  # cmux --command sends text+Enter; telepty allow runs as the workspace's foreground process.
+  # bash -c 'cd ... && exec ...' wrapper: cmux --cwd only affects workspace shell, not the
+  # telepty-allow-wrapped CLI. Explicit cd inside wrapper guarantees claude inherits cwd (#311).
+  local CMUX_BIN="${CMUX:-cmux}"
+  local out ref
+  out=$("$CMUX_BIN" new-workspace --cwd "$cwd" --command "bash -c 'cd $cwd && exec telepty allow --id $sid --auto-restart $cli_cmd'" 2>&1)
+  ref=$(echo "$out" | grep -oE 'workspace:[0-9]+' | head -1)
+  [ -z "$ref" ] && { echo "ERR cmux new-workspace failed: $out" >&2; return 2; }
+  # title == sid (open-session.sh SID convention); rename to the stable handle.
+  "$CMUX_BIN" rename-workspace --workspace "$ref" "$sid" >/dev/null 2>&1 || true
+  # Readiness barrier (BUG-A, Rule 27): emit the ref ONLY once the pane surface can
+  # accept `send-key`, so the daemon submit never races a not-yet-live socket.
+  if ! _wh_cmux_wait_ready "$ref" "$CMUX_BIN"; then
+    echo "ERR cmux workspace $ref pane not ready after ${CMUX_READY_TIMEOUT_MS:-10000}ms — surface cannot accept send-key (daemon submit would race 'Failed to write to socket'). Not returning a ref for a dead workspace." >&2
+    "$CMUX_BIN" close-workspace --workspace "$ref" >/dev/null 2>&1 || true
+    return 3
+  fi
+  echo "$ref"
+}
+
 # -----------------------------------------------------------------------------
 # warp adapter (macOS System Events UI-scripting + sentinel files)
 # -----------------------------------------------------------------------------
@@ -424,6 +511,24 @@ _wh_adapter() {
   else
     printf '%s' "headless"
   fi
+}
+
+# wh_open <sid> <cwd> <cli_cmd> — spawn a visible surface wrapping
+# `telepty allow --id <sid>`, block until the per-adapter ready-gate passes (an
+# internal obligation — NOT a public verb, BC2/D3), then print the stable host_id.
+# Exit 0 only when the surface can accept input; non-zero ⇒ no handle emitted.
+# BC4 (observability): logs the selected adapter so a rollback can be traced.
+# Adapters whose `open` is not yet migrated (warp=Phase 2, headless=Phase 3) fail
+# LOUDLY with a labelled UNSUPPORTED line rather than a raw "command not found"
+# or a silent no-op (§2 explicit-error policy — never a silent surface failure).
+wh_open() {
+  local adapter; adapter=$(_wh_adapter)
+  _wh_log "open: adapter=$adapter sid=${1:-}"
+  if ! declare -F "_wh_${adapter}_open" >/dev/null 2>&1; then
+    _wh_log "$adapter wh_open: UNSUPPORTED — adapter spawn not migrated yet (#608 Phase 1 = cmux only)"
+    return 64
+  fi
+  "_wh_${adapter}_open" "$@"
 }
 
 wh_lookup() {
