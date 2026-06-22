@@ -58,7 +58,7 @@ shell_quote() {
 
 default_cli_flags() {
   case "$1" in
-    claude) printf '%s\n' "--permission-mode bypassPermissions";;
+    claude) printf '%s\n' "--model \"${AIGENTRY_CLAUDE_MODEL:-claude-opus-4-8}\" --effort \"${AIGENTRY_CLAUDE_EFFORT:-xhigh}\" --permission-mode bypassPermissions";;
     codex)  printf '%s\n' "-c check_for_update_on_startup=false --dangerously-bypass-approvals-and-sandbox";;
     gemini) printf '%s\n' "-m \"${AIGENTRY_GEMINI_MODEL:-gemini-2.5-flash}\" --approval-mode yolo";;
     *)      printf '%s\n' "";;

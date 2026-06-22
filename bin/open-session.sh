@@ -133,7 +133,7 @@ if [ -z "$extra_flags" ] && [ -n "$cli_flags_from_config" ]; then
   extra_flags="$cli_flags_from_config"
 fi
 case "$cli" in
-  claude) [ -z "$extra_flags" ] && extra_flags="--permission-mode bypassPermissions";;
+  claude) [ -z "$extra_flags" ] && extra_flags="--model ${AIGENTRY_CLAUDE_MODEL:-claude-opus-4-8} --effort ${AIGENTRY_CLAUDE_EFFORT:-xhigh} --permission-mode bypassPermissions";;
   codex)  [ -z "$extra_flags" ] && extra_flags="-c check_for_update_on_startup=false --dangerously-bypass-approvals-and-sandbox";;
   gemini) [ -z "$extra_flags" ] && extra_flags="-m ${AIGENTRY_GEMINI_MODEL:-gemini-2.5-flash} --approval-mode yolo";;
 esac

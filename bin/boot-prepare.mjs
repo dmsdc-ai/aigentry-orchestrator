@@ -598,12 +598,17 @@ async function main() {
     homeEnvAssignments[adapter.homeEnv] = homeShadow;
   }
 
-  // claude appends --permission-mode bypassPermissions to the staged flags. The
-  // codex/gemini default flags (from the adapter) already carry their own
-  // bypass/yolo modes, so no claude-specific flag is added.
+  // claude appends --model + --effort (ultracode tier) + --permission-mode
+  // bypassPermissions to the staged flags. model/effort are per-user configurable
+  // via env (AIGENTRY_CLAUDE_MODEL / AIGENTRY_CLAUDE_EFFORT) so spawned sessions
+  // inherit the best model + reasoning tier rather than the account default (was
+  // silently 4.7). codex/gemini default flags (from the adapter) already carry
+  // their own bypass/yolo modes, so no claude-specific flag is added there.
+  const claudeModel = process.env.AIGENTRY_CLAUDE_MODEL || "claude-opus-4-8";
+  const claudeEffort = process.env.AIGENTRY_CLAUDE_EFFORT || "xhigh";
   const flagsArgv =
     args.cli === "claude"
-      ? [...cmd.argv.slice(1), "--permission-mode", "bypassPermissions"]
+      ? [...cmd.argv.slice(1), "--model", claudeModel, "--effort", claudeEffort, "--permission-mode", "bypassPermissions"]
       : [...cmd.argv.slice(1)];
   const flagsLine = flagsArgv.map(shellQuote).join(" ");
 
