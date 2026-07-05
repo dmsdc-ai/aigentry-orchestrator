@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Aigentry orchestrator session/persistence library (ADR §6 #14 et al.)",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "engines": {
     "node": ">=20"
   },
