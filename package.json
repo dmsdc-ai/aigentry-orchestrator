@@ -1,7 +1,6 @@
 {
-  "name": "aigentry-orchestrator",
-  "version": "0.0.0",
-  "private": true,
+  "name": "@dmsdc-ai/aigentry-orchestrator",
+  "version": "0.1.0",
   "type": "module",
   "description": "Aigentry orchestrator session/persistence library (ADR §6 #14 et al.)",
   "license": "MIT",
@@ -20,5 +19,24 @@
   "devDependencies": {
     "@types/node": "^20.11.0",
     "typescript": "^5.4.0"
+  },
+  "files": [
+    "dist/src",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    "./gate": "./dist/src/gate/index.js",
+    "./session/persistence": "./dist/src/session/persistence/index.js",
+    "./session/boot-adapter": "./dist/src/session/boot-adapter/index.js"
+  },
+  "main": "./dist/src/session/persistence/index.js",
+  "types": "./dist/src/session/persistence/index.d.ts",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dmsdc-ai/aigentry-orchestrator.git"
   }
 }
