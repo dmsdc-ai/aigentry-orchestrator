@@ -1,0 +1,38 @@
+name: readme-regen
+
+# orchestrator is internal infra (not npm-published). This keeps README.md's ecosystem
+# section synced when its inputs change. The `paths` filter deliberately EXCLUDES
+# README.md, so the bot's own README push never retriggers this workflow (anti-loop,
+# independent of GITHUB_TOKEN's no-retrigger behavior).
+on:
+  push:
+    branches: [main]
+    paths:
+      - package.json
+      - README.tmpl.md
+      - ecosystem.json
+      - scripts/gen-readme.mjs
+      - .github/workflows/readme-regen.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  regen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Regenerate README
+        run: node scripts/gen-readme.mjs
+      - name: Commit & push if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- README.md; then echo "README already current"; exit 0; fi
+          git add README.md
+          git commit -m "docs: regen README [skip ci]"
+          git push origin HEAD:main
