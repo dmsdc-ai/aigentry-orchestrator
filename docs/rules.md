@@ -517,3 +517,36 @@ Memory: `feedback_session_cleanup_protocol.md`.
 - SUSPECT 시 surface 해소 전 "워커 진행 중" 발화 금지
 - Hook: `.claude/settings.json` PostToolUse/Bash가 dispatch/inject 감지 시 verify 리마인더 emit
 - Memory: `~/.claude/projects/-Users-duckyoungkim-projects-aigentry-orchestrator/memory/feedback_post_dispatch_verify.md`
+
+## Rule 34. Task-Based Execution — 모든 작업은 task-queue 경유 (HARD RULE)
+
+**어떤 작업이든 시작 전 `state/task-queue.json`에 태스크로 등록하고, 그 태스크 ID를 기준으로 진행한다.** ad-hoc으로 등록 없이 수행하지 않는다. 발단: 2026-07-05. 사용자 지시: "어떤 작업을 할때 무조건 태스크 베이스로 진행하는 것 명시해줘. 그래야 로그가 쌓이면서 지식화를 할 수가 있어."
+
+**Why:** task-queue가 곧 **구조화된 실행 로그**다. 모든 작업이 여기를 거치면 (1) 무엇을 왜 했는지, (2) root cause·검증·교훈이 태스크 노트에 축적 → 시간이 지나며 **지식화(knowledge base)**된다. 등록 없이 수행한 작업은 로그에 남지 않아 재발 방지·회고·패턴 추출이 불가능하다. 이것은 Imperative→Declarative(모든 태스크를 verifiable goal로) + Rule 32(영구 fix + issue/task 등록) + §1.2(runtime additions tracker)의 실행 계층 통합이다.
+
+#### Mandatory (lifecycle)
+1. **시작 시 등록** — 작업 착수 전 태스크 생성 (`status: pending`/`in_progress`). 신규 작업뿐 아니라 **위임·분석·수리·릴리스·문서 편집 등 모든 작업 항목** 포함. 사용자가 명명한 즉석 요청도 등록 후 진행.
+2. **진행 중 상태 반영** — 위임 시 `delegated`, 대기 시 `blocked`/`blocked-by-observation`, 대기-사용자 시 `awaiting-user`.
+3. **완료 시 즉시 done + 지식 노트** — DONE 검증 후 곧바로 `status: done` + note에 **root cause / 적용한 수정 / 검증 방법 / 교훈** 기재. 완료 작업을 미등록·미갱신으로 누락 금지 (2026-07-02 교정 사례).
+4. **`updated_at` 스탬프** — 상태 변경 시 절대 날짜로 기록 (staleness 추적).
+
+#### What this rule rejects
+- 등록 없이 바로 실행하고 "나중에 정리" — 로그 누락, 지식화 실패
+- 완료했는데 done 갱신·노트 없이 넘어감 — 회고 불가 (Rule 34 위반)
+- pending만 잔뜩 쌓고 완료 작업은 태스크로 안 남김 — 실행 로그 왜곡
+
+#### 예외 (등록 불필요)
+- **순수 대화 턴** (사용자 질문에 답변만, 상태 변경 없음)
+- **1라인 ack / send-key / broadcast** 같은 마이크로 상호작용
+- 이미 등록된 태스크 안에서의 세부 단계 (하위 단계는 노트로, 별도 태스크 아님 — 단 독립 산출물이면 sub-id로 분리)
+
+#### Cross-references
+- Rule 32 (Permanent Fix Only): 이슈/태스크 등록이 32의 4-step 중 3번. Rule 34는 그것을 **모든 작업**으로 일반화.
+- §1.2 (runtime-addition tracker): `kind: runtime-addition` 태스크의 framework-introduction 자기적용. task-queue.json이 곧 tracker.
+- Imperative→Declarative (공통 가이드라인): 모든 태스크는 verifiable goal로 등록.
+- Memory: `~/.claude/projects/-Users-duckyoungkim-projects-aigentry-orchestrator/memory/feedback_register_every_work_item_as_task.md`
+
+#### Acceptance criteria
+- 모든 작업 항목(대화·마이크로 예외 제외)이 착수 전 task-queue에 존재
+- 완료 시 done + root cause/검증/교훈 노트 동반 (동일 턴 내)
+- `bin/tq-status.sh` / `bin/tq-focus.sh`로 언제든 실행 로그 조회 가능
