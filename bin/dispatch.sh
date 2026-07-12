@@ -9,7 +9,7 @@
 # Modes:
 #   dispatch.sh --target <sid> --ref <file> [--from <orch-sid>] [--timeout-ms 30000]
 #   dispatch.sh --spawn-and-dispatch --track T --name N --cwd P --cli claude \
-#               --ref <file> [--from <orch-sid>] [--role coder|architect|...]
+#               --ref <file> [--from <orch-sid>] [--role coder|architect|...] [--worktree P]
 #   dispatch.sh --help
 #
 # --role (cli=claude|codex|gemini, #431 / #532): wires boot-prepare.mjs so the
@@ -120,7 +120,7 @@ write_worker_launcher() {
 usage() { sed -n '2,24p' "$0"; }
 
 target=""; ref_file=""; from_id=""; timeout_ms=30000; timeout_explicit=0
-spawn=0; track=""; name=""; cwd=""; cli="claude"
+spawn=0; track=""; name=""; cwd=""; cli="claude"; worktree=""
 verify_delivered=0
 verify_started=1  # Rule 33: confirm session actually started working post-inject. --no-verify-started to skip.
 role=""  # #431: when set + cli=claude, enables boot-adapter wiring (--bare + --system-prompt-file)
@@ -136,6 +136,7 @@ while [ $# -gt 0 ]; do
     --track) track="$2"; shift 2;;
     --name) name="$2"; shift 2;;
     --cwd) cwd="$2"; shift 2;;
+    --worktree) worktree="$2"; shift 2;;
     --cli) cli="$2"; shift 2;;
     --role) role="$2"; shift 2;;
     --verify-delivered) verify_delivered=1; shift;;
@@ -279,13 +280,17 @@ tracker_append() {
 # Upserts onto the append entry (single-owner active.json). Failure must NOT fail
 # the dispatch — the inject already landed.
 tracker_register() {
-  local sid="$1" branch=""
+  local sid="$1" branch="" gitref
   [ -x "$TRACKER_SH" ] || return 0
-  if [ -n "$cwd" ]; then
-    branch=$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+  # #718: when a worker gets a dedicated --worktree, read its branch (and record the
+  # worktree) so the tracker attributes the worker's HEAD there, not the shared cwd's.
+  gitref="${worktree:-$cwd}"
+  if [ -n "$gitref" ]; then
+    branch=$(git -C "$gitref" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
   fi
-  "$TRACKER_SH" register "$sid" --track "$track" --role "$role" --cwd "$cwd" --branch "$branch" \
-    >/dev/null 2>&1 || true
+  local -a a=(register "$sid" --track "$track" --role "$role" --cwd "$cwd" --branch "$branch")
+  [ -n "$worktree" ] && a+=(--worktree "$worktree")
+  "$TRACKER_SH" "${a[@]}" >/dev/null 2>&1 || true
 }
 
 # --- main ---

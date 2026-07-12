@@ -8,7 +8,7 @@
 #
 # Commands:
 #   dispatch-tracker.sh append <sid> <ref_path> <ref_hash> [--cwd <p>] [--from <sid>]
-#   dispatch-tracker.sh register <sid> [--track T] [--role R] [--cwd P] [--branch B] [--started-at TS]
+#   dispatch-tracker.sh register <sid> [--track T] [--role R] [--cwd P] [--branch B] [--worktree W] [--started-at TS]
 #   dispatch-tracker.sh check                    — one-shot scan; alerts to stdout + log
 #   dispatch-tracker.sh mark-reported <sid>      — orchestrator REPORT-receipt hook
 #   dispatch-tracker.sh status [<sid>]
@@ -185,27 +185,32 @@ with open(path,"r+") as f:
 PY
 }
 
-# register <sid> [--track T] [--role R] [--cwd P] [--branch B] [--started-at TS]
+# register <sid> [--track T] [--role R] [--cwd P] [--branch B] [--worktree W] [--started-at TS]
 # Upserts the tracker registry entry for <sid> (idempotent on sid) via the same
 # _mutate_state fcntl lock as every other writer — keeps active.json single-owner
 # (#517: dispatch.sh never populated the registry, so `check` found nothing to
 # AUTO_REPORT). Merges onto an existing entry (e.g. one already created by
 # `append`) rather than clobbering it; creates a fresh in_flight entry otherwise.
+# --worktree (#718): the worker's dedicated git worktree, when the dispatch spawns
+# one distinct from --cwd. Recorded so git-AUTO_REPORT reads the worker's HEAD there
+# instead of the (possibly shared, orchestrator-advanced) cwd HEAD. Set only when
+# non-empty so entries without a worktree keep their existing shape.
 cmd_register() {
   local sid="$1"; shift
-  local track="" role="" cwd="" branch="" started_at=""
+  local track="" role="" cwd="" branch="" worktree="" started_at=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --track) track="$2"; shift 2;;
       --role) role="$2"; shift 2;;
       --cwd) cwd="$2"; shift 2;;
       --branch) branch="$2"; shift 2;;
+      --worktree) worktree="$2"; shift 2;;
       --started-at) started_at="$2"; shift 2;;
       *) echo "register: unknown $1" >&2; exit 4;;
     esac
   done
   [ -n "$started_at" ] || started_at=$(now_iso)
-  SID="$sid" TRACK="$track" ROLE="$role" CWD="$cwd" BRANCH="$branch" STARTED="$started_at" \
+  SID="$sid" TRACK="$track" ROLE="$role" CWD="$cwd" BRANCH="$branch" WORKTREE="$worktree" STARTED="$started_at" \
     _mutate_state "
 sid = os.environ['SID']
 fields = {
@@ -215,6 +220,8 @@ fields = {
     'branch': os.environ['BRANCH'],
     'started_at': os.environ['STARTED'],
 }
+if os.environ.get('WORKTREE'):
+    fields['worktree'] = os.environ['WORKTREE']
 found = None
 for e in entries:
     if e.get('sid') == sid:
@@ -440,27 +447,90 @@ raise SystemExit(0 if n > 1 else 1)
 PY
 }
 
+# _worker_git_dir <sid> <cwd> — the directory whose git HEAD reflects THIS worker's
+# work: the dispatch-recorded `worktree` when present + a valid git dir, else <cwd>.
+# #718: a worker often commits in a dedicated worktree while the record's cwd points
+# at the shared main checkout, so `git -C cwd rev-parse HEAD` reads the orchestrator's
+# own just-landed main commit and misattributes it. Prefer the worktree.
+_worker_git_dir() {
+  local sid="$1" cwd="$2" wt
+  wt=$(ACTIVE_JSON="$ACTIVE_JSON" SID="$sid" python3 - <<'PY'
+import json, os
+try: entries = json.load(open(os.environ["ACTIVE_JSON"]))
+except Exception: entries = []
+sid = os.environ["SID"]
+for e in entries:
+    if e.get("sid") == sid:
+        print(e.get("worktree", "") or ""); break
+PY
+)
+  if [ -n "$wt" ] && "$GIT" -C "$wt" rev-parse --git-dir >/dev/null 2>&1; then
+    printf '%s' "$wt"
+  else
+    printf '%s' "$cwd"
+  fi
+}
+
+# _on_protected_branch <git_dir> — exit 0 when <git_dir>'s CURRENT branch is the
+# shared mainline (main/master). #718: a worker's isolated work never lives on main
+# (install_worker_git_guard blocks worker pushes to it), so a mainline HEAD in the
+# only resolvable context is the orchestrator's commit, not the worker's — git
+# attribution must then degrade to screen-state-only and never cite that sha.
+_on_protected_branch() {
+  local gdir="$1" br
+  br=$("$GIT" -C "$gdir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+  case "$br" in main|master) return 0;; *) return 1;; esac
+}
+
 _git_check_and_autoreport() {
   local sid="$1" cwd="$2" ref_path="$3" dispatched_at="$4" screen="$5"
   [ -n "$cwd" ] || return 0
-  _has_new_commits "$cwd" "$dispatched_at" || return 0
+  # #718: attribute against the WORKER's git context (its worktree if recorded),
+  # never the shared cwd HEAD.
+  local gdir; gdir=$(_worker_git_dir "$sid" "$cwd")
+  _has_new_commits "$gdir" "$dispatched_at" || return 0
   # #541 — ambiguous-attribution guard: when 2+ active sessions share this sid's
   # (cwd, branch), skip git-AUTO_REPORT to avoid crediting another session's commit
   # (the pendingReports/idle path is unaffected). SECONDARY fix (Dispatch-Session
   # commit-trailer matching in dispatch.sh) is out of scope — tracked as follow-up.
   _shared_cwd_branch_ambiguous "$sid" "$cwd" && return 0
-  local head_sha files added removed test_signal
-  head_sha=$("$GIT" -C "$cwd" rev-parse --short HEAD 2>/dev/null || echo unknown)
-  if grep -qxF "$sid	$head_sha" "$AUTO_REPORTS_SEEN" 2>/dev/null; then
-    return 0
-  fi
-  read -r files added removed < <(_git_shortstat "$cwd" "$dispatched_at")
+  local head_sha files added removed test_signal now
   test_signal=$(printf '%s' "$screen" | python3 -c '
 import sys,re
 m=re.findall(r"(\d+ passed|\d+ failed|\d+ FAIL|ok \d+ tests?)", sys.stdin.read())
 print(" / ".join(m) if m else "none")
 ')
-  local now; now=$(now_iso)
+  now=$(now_iso)
+  # #718 honest degradation: when the only resolvable git context is a mainline
+  # checkout (main/master), the worker's work is NOT here — emit screen-state ONLY,
+  # never cite the (orchestrator's) HEAD sha. One AUTO_REPORT per sid (NOSHA key);
+  # _set_status auto_reported also stops the entry being revisited.
+  if _on_protected_branch "$gdir"; then
+    if grep -qxF "$(printf '%s\tNOSHA' "$sid")" "$AUTO_REPORTS_SEEN" 2>/dev/null; then
+      return 0
+    fi
+    python3 - "$sid" "$now" "$test_signal" >> "$AUTO_REPORTS_LOG" <<'PY'
+import json,sys
+sid,now,ts=sys.argv[1:4]
+print(json.dumps({"kind":"AUTO_REPORT","sid":sid,"emitted_at":now,"head_sha":None,
+                  "attribution":"omitted","reason":"cwd_on_protected_branch",
+                  "test_signal":ts,"review_required":True}))
+PY
+    printf '%s\tNOSHA\n' "$sid" >> "$AUTO_REPORTS_SEEN"
+    _set_status "$sid" auto_reported
+    emit_alert "AUTO_REPORT sid=$sid sha=omitted (worker git context unresolved; cwd on protected branch) tests=$test_signal — screen-state only, review required"
+    if command -v "$TELEPTY" >/dev/null 2>&1; then
+      "$TELEPTY" inject --from "$TRACKER_SID" "$ORCH_SID" \
+        "AUTO_REPORT sid=$sid sha=omitted (worker git context unresolved) tests=$test_signal — screen-state only, review required" \
+        >/dev/null 2>&1 || true
+    fi
+    return 0
+  fi
+  head_sha=$("$GIT" -C "$gdir" rev-parse --short HEAD 2>/dev/null || echo unknown)
+  if grep -qxF "$sid	$head_sha" "$AUTO_REPORTS_SEEN" 2>/dev/null; then
+    return 0
+  fi
+  read -r files added removed < <(_git_shortstat "$gdir" "$dispatched_at")
   python3 - "$sid" "$now" "$head_sha" "$files" "$added" "$removed" "$test_signal" \
     >> "$AUTO_REPORTS_LOG" <<'PY'
 import json,sys

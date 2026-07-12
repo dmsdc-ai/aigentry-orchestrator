@@ -3,20 +3,24 @@
 #   STUB_GIT_LOG_FILE        — content for `git log`
 #   STUB_GIT_CONFIG_FILE     — content for `git config user.email`
 #   STUB_GIT_SHORTSTAT_FILE  — content for `git diff --shortstat`
+#   STUB_GIT_BRANCH_FILE     — global content for `git rev-parse --abbrev-ref HEAD`
+#                              (default empty). A per-dir `<-C dir>/.stub-branch` file,
+#                              when present, overrides it — lets a test give a cwd and
+#                              a worktree distinct branches (#718).
 # Always accepts `rev-parse --git-dir` and `rev-parse --short HEAD`.
-shift_until() {
-  while [ $# -gt 0 ]; do
-    case "$1" in -C) shift 2;; *) break;; esac
-  done
-  printf '%s\n' "$@"
-}
-args=$(shift_until "$@")
-set -- $args
+gitdir="."
+while [ $# -gt 0 ]; do
+  case "$1" in -C) gitdir="$2"; shift 2;; *) break;; esac
+done
 case "$1" in
   rev-parse)
     case "${2:-}" in
       --git-dir) echo ".git"; exit 0;;
       --short) echo "abc1234"; exit 0;;
+      --abbrev-ref)
+        if [ -f "$gitdir/.stub-branch" ]; then cat "$gitdir/.stub-branch"
+        else cat "${STUB_GIT_BRANCH_FILE:-/dev/null}"; fi
+        exit 0;;
     esac
     ;;
   config)  cat "${STUB_GIT_CONFIG_FILE:-/dev/null}";;
