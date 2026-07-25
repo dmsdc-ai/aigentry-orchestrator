@@ -604,7 +604,7 @@ async function main() {
   // inherit the best model + reasoning tier rather than the account default (was
   // silently 4.7). codex/gemini default flags (from the adapter) already carry
   // their own bypass/yolo modes, so no claude-specific flag is added there.
-  const claudeModel = process.env.AIGENTRY_CLAUDE_MODEL || "claude-opus-4-8";
+  const claudeModel = process.env.AIGENTRY_CLAUDE_MODEL || "claude-opus-5";
   const claudeEffort = process.env.AIGENTRY_CLAUDE_EFFORT || "xhigh";
   const flagsArgv =
     args.cli === "claude"
