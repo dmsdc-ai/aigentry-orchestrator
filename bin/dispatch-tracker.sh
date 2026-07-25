@@ -379,7 +379,10 @@ _maybe_redispatch() {
     return 0
   fi
   emit_alert "REDISPATCH sid=$sid attempt=1 ref=$ref_path"
-  if "$DISPATCH_SH" --target "$sid" --ref "$ref_path" --verify-delivered >/dev/null 2>&1; then
+  # Rule 34 task-gate (#736): a re-dispatch re-actuates work already registered
+  # under the original dispatch's task, so it takes the audited exemption.
+  if "$DISPATCH_SH" --target "$sid" --ref "$ref_path" --verify-delivered \
+      --no-task "tracker-redispatch $sid" >/dev/null 2>&1; then
     SID="$sid" NOW="$(now_iso)" _mutate_state "
 sid, now = os.environ['SID'], os.environ['NOW']
 for e in entries:

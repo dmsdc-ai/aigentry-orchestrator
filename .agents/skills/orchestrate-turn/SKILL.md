@@ -19,9 +19,9 @@ Read each step as a failure-mode tripwire: it states **what goes wrong if you sk
 | 1-1 | Break down → decide # sessions | `work-breakdown` skill (decompose to parallelizable tasks) + register via direct `state/task-queue.json` edit (jq); `bin/tq-track.sh`/`bin/tq-status.sh` read-only views |
 | 1-2 | Parallel-first, conflict-aware | Rule 9 file-separation judgment → conflict risk ⇒ sequential; ≥3 parallel ⇒ deliberation MCP |
 | 1-3 | Match CLI to task | "CLI별 역할" table (claude=architecture/MCP, codex=impl/test, gemini=websearch/docs) → `--cli` / `--role` |
-| 2 | Spawn + ref/inline + adaptor | `bin/dispatch.sh --spawn-and-dispatch --cli <c> --role <r> --ref <file>` → `bin/open-session.sh` (`detect_terminal`) → `bin/lib/workspace-host.sh` adaptor |
+| 2 | Spawn + ref/inline + adaptor | `bin/dispatch.sh --spawn-and-dispatch --cli <c> --role <r> --ref <file> --task <id>` → `bin/open-session.sh` (`detect_terminal`) → `bin/lib/workspace-host.sh` adaptor |
 | 2-1 | Session → orchestrator clarification | `telepty inject` HOLD → orchestrator |
-| 2-2 | Orchestrator → user → re-inject | Rule 6 confirm → `bin/dispatch.sh --target` (long ref-payload) / `telepty inject` (short ack) |
+| 2-2 | Orchestrator → user → re-inject | Rule 6 confirm → `bin/dispatch.sh --target ... --task <id>` (long ref-payload) / `telepty inject` (short ack) |
 | 2-3 | Session ↔ session communication | direct `telepty inject` — **information-request only** (invariant below) |
 | 3 | REPORT | `telepty inject` push **+ #517 pull-AUTO_REPORT fallback** (`bin/dispatch-tracker.sh check` via reconcile tick) |
 | 4 | Review → confirm → cleanup BOTH | Rule 6 confirm → `bin/session-cleanup.sh <sid>` (telepty DELETE + terminal-adaptor close) |
@@ -58,7 +58,10 @@ First confirm the full 위임 전 체크리스트 (user-confirmed target, MANDAT
 
 ```bash
 bin/dispatch.sh --spawn-and-dispatch --track <T> --name <N> --cwd <P> \
-  --cli claude --role <role> --ref <ref-file> --from <orch-sid> [--verify-delivered]
+  --cli claude --role <role> --ref <ref-file> --from <orch-sid> --task <id> [--verify-delivered]
+# Rule 34 task-gate (#736): --task <id> must name a registered task in
+# state/task-queue.json (a confirmed dispatch auto-sets it to `delegated`).
+# Exempt work uses --no-task "<reason>" — audited to ~/.aigentry/telemetry/.
 ```
 
 `dispatch.sh` registers the dispatch in `state/dispatch/active.json` (the pull-report registry), boots the role-sandbox cwd, and routes through `open-session.sh` (`detect_terminal`) → `workspace-host.sh` adaptor. The skill does NOT spawn terminals directly. After dispatch, **verify started-working** (Rule 33): CONNECTED + ready + clean + moving — `delivered ≠ started`.
@@ -71,7 +74,7 @@ A worker that needs clarification injects a HOLD question back to the orchestrat
 > **If skipped (HOLD-ignored self-progress):** the worker invents an answer and builds the wrong thing — a §13 violation. Enforce explicit HOLD inject; never let a session guess past a HOLD.
 
 ### 2-2 Orchestrator → user → re-inject
-Confirm the answer with the user (Rule 6), then re-inject as context: `bin/dispatch.sh --target <sid> --ref <file>` for a long re-context payload, or `telepty inject` for a short inline ack.
+Confirm the answer with the user (Rule 6), then re-inject as context: `bin/dispatch.sh --target <sid> --ref <file> --task <id>` for a long re-context payload, or `telepty inject` for a short inline ack.
 
 > **If skipped:** you answer a business/UX question yourself → answer diverges from user intent → the worker's output is rejected at review.
 

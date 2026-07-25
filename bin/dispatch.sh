@@ -12,6 +12,15 @@
 #               --ref <file> [--from <orch-sid>] [--role coder|architect|...] [--worktree P]
 #   dispatch.sh --help
 #
+# Rule 34 task-gate (#736): every dispatch must name the task it actuates.
+#   --task <id>           id from state/task-queue.json; status must be one of
+#                         pending|queued|in_progress|delegated|blocked-by-observation.
+#                         A confirmed dispatch auto-ledgers it (→ delegated + note).
+#   --no-task "<reason>"  audited exemption (NDJSON line to
+#                         ~/.aigentry/telemetry/dispatch-notask-<UTC-date>.ndjson).
+#   AIGENTRY_TASK_GATE=hard|warn|off (default hard) — warn audits+proceeds, off = legacy.
+#   AIGENTRY_TASK_QUEUE=<path> overrides the queue (default <repo>/state/task-queue.json).
+#
 # --role (cli=claude|codex|gemini, #431 / #532): wires boot-prepare.mjs so the
 #   wrapped CLI skips project context-file auto-discovery (the cwd→role
 #   contamination exposed by the 2026-05-23 incident). claude uses
@@ -117,7 +126,7 @@ write_worker_launcher() {
   printf '%s\n' "$launcher"
 }
 
-usage() { sed -n '2,24p' "$0"; }
+usage() { sed -n '2,33p' "$0"; }
 
 target=""; ref_file=""; from_id=""; timeout_ms=30000; timeout_explicit=0
 spawn=0; track=""; name=""; cwd=""; cli="claude"; worktree=""
@@ -125,6 +134,7 @@ verify_delivered=0
 verify_started=1  # Rule 33: confirm session actually started working post-inject. --no-verify-started to skip.
 role=""  # #431: when set + cli=claude, enables boot-adapter wiring (--bare + --system-prompt-file)
 keep_alive=0  # ADR 2026-05-20 Layer A opt-out — worker won't emit CLEANUP_REQUEST.
+task_id=""; no_task=0; no_task_reason=""  # Rule 34 task-gate (#736)
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -139,6 +149,8 @@ while [ $# -gt 0 ]; do
     --worktree) worktree="$2"; shift 2;;
     --cli) cli="$2"; shift 2;;
     --role) role="$2"; shift 2;;
+    --task) task_id="$2"; shift 2;;
+    --no-task) no_task=1; no_task_reason="$2"; shift 2;;
     --verify-delivered) verify_delivered=1; shift;;
     --no-verify-started) verify_started=0; shift;;
     --keep-alive) keep_alive=1; shift;;
@@ -293,10 +305,153 @@ tracker_register() {
   "$TRACKER_SH" "${a[@]}" >/dev/null 2>&1 || true
 }
 
+# --- Rule 34 task-gate (#736) ---
+# Rule 34 requires every delegated work item to be registered in the task queue
+# before dispatch. That relied on operator discipline and leaked, so the gate
+# lives here — dispatch.sh is the actuation chokepoint every delegation flows
+# through. It runs BEFORE any side effect (no spawn, no inject) so a violation
+# can never leave a half-started worker behind.
+TASK_QUEUE="${AIGENTRY_TASK_QUEUE:-$SCRIPT_DIR/../state/task-queue.json}"
+TASK_GATE_MODE="${AIGENTRY_TASK_GATE:-hard}"
+TASK_GATE_HINT='register the task in state/task-queue.json first (--task <id>), or use --no-task "<reason>" for exempt work.'
+
+# Audit trail for every gate exemption (--no-task and warn-mode bypasses), so
+# the escape hatch stays countable. Best-effort: never fails the dispatch.
+notask_telemetry() {
+  local reason="$1" day dir caller
+  day=$(date -u +%Y-%m-%d)
+  dir="$HOME/.aigentry/telemetry"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  caller="${AIGENTRY_DISPATCH_CALLER:-$(ps -o comm= -p "$PPID" 2>/dev/null || true)}"
+  REASON="$reason" SID_OR_TARGET="${target:-${track:+$track-$name}}" REF="$ref_file" CALLER="$caller" \
+    python3 -c '
+import datetime, json, os, sys
+sys.stdout.write(json.dumps({
+    "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    "sid_or_target": os.environ.get("SID_OR_TARGET", ""),
+    "ref": os.environ.get("REF", ""),
+    "reason": os.environ.get("REASON", ""),
+    "caller_env": os.environ.get("CALLER", "").strip(),
+}, ensure_ascii=False) + "\n")
+' >> "$dir/dispatch-notask-$day.ndjson" 2>/dev/null || true
+}
+
+# hard → refuse (exit 4); warn → print + audit, then proceed (migration aid);
+# off → legacy silence.
+task_gate_reject() {
+  local msg="$1"
+  case "$TASK_GATE_MODE" in
+    off) return 0;;
+    warn)
+      echo "dispatch.sh: WARNING (AIGENTRY_TASK_GATE=warn) $msg" >&2
+      notask_telemetry "task-gate-warn: $msg"
+      return 0;;
+    *) echo "dispatch.sh: $msg" >&2; exit 4;;
+  esac
+}
+
+task_gate_check() {
+  if [ -n "$task_id" ] && [ "$no_task" -eq 1 ]; then
+    echo "dispatch.sh: --task and --no-task are mutually exclusive" >&2
+    exit 4
+  fi
+  if [ "$no_task" -eq 1 ]; then
+    # Usage errors are mode-independent: an unexplained exemption is never valid.
+    case "$no_task_reason" in
+      *[![:space:]]*) ;;
+      *) echo "dispatch.sh: --no-task requires a non-empty reason" >&2; exit 4;;
+    esac
+    notask_telemetry "$no_task_reason"
+    return 0
+  fi
+  if [ -z "$task_id" ]; then
+    task_gate_reject "Rule 34 task-gate: $TASK_GATE_HINT"
+    return 0
+  fi
+  local status rc
+  status=$(TQ="$TASK_QUEUE" TASK_ID="$task_id" python3 - <<'PY'
+import json, os, sys
+
+ALLOWED = {"pending", "in_progress", "delegated", "queued", "blocked-by-observation"}
+TERMINAL = {"done", "completed", "superseded", "cancelled", "closed"}
+try:
+    data = json.load(open(os.environ["TQ"], encoding="utf-8"))
+except Exception:
+    sys.exit(2)
+tid = os.environ["TASK_ID"]
+task = next((t for t in data.get("tasks", []) if str(t.get("id")) == tid), None)
+if task is None:
+    # completed[] is the archive tail — a hit there is a stale id, not an unknown one.
+    if any(str(t.get("id")) == tid for t in data.get("completed", [])):
+        print("completed")
+        sys.exit(4)
+    sys.exit(3)
+status = str(task.get("status") or "")
+if status in ALLOWED:
+    sys.exit(0)
+print(status)
+sys.exit(4 if status in TERMINAL or status.startswith(("done", "completed")) else 5)
+PY
+  ) && rc=0 || rc=$?
+  case "$rc" in
+    0) return 0;;
+    2) task_gate_reject "Rule 34 task-gate: task queue unreadable at $TASK_QUEUE — $TASK_GATE_HINT";;
+    3) task_gate_reject "Rule 34 task-gate: unknown task id '$task_id' in $TASK_QUEUE — $TASK_GATE_HINT";;
+    4) task_gate_reject "Rule 34 task-gate: task $task_id is already '$status' — stale-id reuse. Register a NEW task for this work, or use --no-task \"<reason>\".";;
+    *) task_gate_reject "Rule 34 task-gate: task $task_id status '$status' is not dispatchable (need pending|queued|in_progress|delegated|blocked-by-observation) — $TASK_GATE_HINT";;
+  esac
+}
+
+# Auto-ledger: a confirmed dispatch writes itself into the task row, so the queue
+# reflects reality without operator discipline. Best-effort — the inject already
+# landed, so a queue-write failure must warn, never fail the dispatch.
+task_ledger_update() {
+  local sid="$1"
+  [ -n "$task_id" ] || return 0
+  [ -f "$TASK_QUEUE" ] || return 0
+  if ! TQ="$TASK_QUEUE" TASK_ID="$task_id" SID="$sid" REF="$(basename "$ref_file")" TRACK="$track" python3 - <<'PY'
+import datetime, json, os, sys, tempfile
+
+path, tid = os.environ["TQ"], os.environ["TASK_ID"]
+data = json.load(open(path, encoding="utf-8"))
+task = next((t for t in data.get("tasks", []) if str(t.get("id")) == tid), None)
+if task is None:
+    sys.exit(1)
+now = datetime.datetime.now(datetime.timezone.utc)
+# Only promote from a not-yet-started state; in_progress must never regress.
+if task.get("status") in ("pending", "queued"):
+    task["status"] = "delegated"
+task["updated_at"] = now.strftime("%Y-%m-%d")
+stamp = " | dispatched {ts} sid={sid} ref={ref} track={track}".format(
+    ts=now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+    sid=os.environ.get("SID", ""), ref=os.environ.get("REF", ""),
+    track=os.environ.get("TRACK", "") or "-")
+note = task.get("note") or ""
+task["note"] = note + stamp if note else stamp.lstrip(" |")
+# Atomic: same-dir temp + rename, so a crash can never truncate the live queue.
+tmp = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False,
+                                  dir=os.path.dirname(os.path.abspath(path)))
+try:
+    tmp.write(json.dumps(data, ensure_ascii=False, indent=1))
+    tmp.flush()
+    os.fsync(tmp.fileno())
+    tmp.close()
+    os.replace(tmp.name, path)
+except Exception:
+    os.unlink(tmp.name)
+    raise
+PY
+  then
+    echo "dispatch.sh: WARNING task-gate ledger update failed for task $task_id (dispatch already landed)" >&2
+  fi
+}
+
 # --- main ---
 # Sourceable for tests: `DISPATCH_SH_NO_MAIN=1 source dispatch.sh` exposes
 # is_ready / verify_delivered without running the dispatch flow.
 if [ "${DISPATCH_SH_NO_MAIN:-0}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
+
+task_gate_check
 
 sid=""
 if [ "$spawn" -eq 1 ]; then
@@ -406,6 +561,8 @@ if [ "$verify_delivered" -eq 1 ]; then
     exit 5
   fi
 fi
+task_ledger_update "$sid"
+
 emit_telemetry --helper dispatch --subtype dispatch_ack \
   --payload-json "$(printf '{"target_sid":"%s","verified":%s}' "$sid" "$([ "$verify_delivered" -eq 1 ] && echo true || echo false)")" \
   --correlation-id "$sid"

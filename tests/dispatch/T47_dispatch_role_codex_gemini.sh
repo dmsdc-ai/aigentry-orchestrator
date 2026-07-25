@@ -82,6 +82,7 @@ run_one() {
     "$REPO_ROOT/bin/dispatch.sh" --spawn-and-dispatch \
       --track t47 --name "$cli" --cwd "$PROJECT_CWD" --cli "$cli" --role coder \
       --from t47-test --ref "$ref_file" --timeout-ms 800 --no-verify-started \
+      --no-task "test-fixture T47" \
       >/dev/null 2>&1 || true
 
   if [ ! -s "$OPEN_ARGS_FILE" ]; then

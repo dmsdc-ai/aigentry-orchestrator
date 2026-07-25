@@ -49,7 +49,7 @@ TELEPTY="$STUB_BIN/telepty" \
   "$REPO_ROOT/bin/dispatch.sh" --spawn-and-dispatch \
     --track t51 --name fn --cwd "$T_TMP/cwd" --cli claude \
     --from t51-test --ref "$ref" --timeout-ms 800 \
-    --verify-delivered --no-verify-started \
+    --verify-delivered --no-verify-started --no-task "test-fixture T51" \
     >/dev/null 2>&1
 rc=$?
 set -e
