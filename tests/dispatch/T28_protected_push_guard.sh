@@ -182,6 +182,7 @@ TELEPTY="$FAKE_BIN/telepty" \
   "$REPO_ROOT/bin/dispatch.sh" --spawn-and-dispatch \
     --track t28 --name dispatch-main --cwd "$WORK" --cli codex \
     --from t28-test --ref "$REF_FILE" --timeout-ms 1000 --no-verify-started \
+    --no-task "test-fixture T28" \
     >/dev/null 2>&1 || true
 
 if [ "$(cat "$FAKE_OPEN_STATUS")" -eq 0 ]; then

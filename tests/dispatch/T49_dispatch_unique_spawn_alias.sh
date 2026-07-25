@@ -47,6 +47,7 @@ for name in one two; do
     "$REPO_ROOT/bin/dispatch.sh" --spawn-and-dispatch \
       --track t49 --name "$name" --cwd "$T_TMP/cwd-$name" --cli codex \
       --from t49-test --ref "$ref" --timeout-ms 800 --no-verify-started \
+      --no-task "test-fixture T49" \
       >/dev/null
 done
 

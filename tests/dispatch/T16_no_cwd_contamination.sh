@@ -86,6 +86,7 @@ if ! "$REPO_ROOT/bin/dispatch.sh" \
     --cli claude --role coder \
     --from t16-test \
     --ref "$T_REF" \
+    --no-task "test-fixture T16" \
     --timeout-ms 60000 >/tmp/t16-dispatch.log 2>&1; then
   echo "FAIL: dispatch.sh --spawn-and-dispatch exited non-zero" >&2
   echo "--- dispatch.log ---" >&2; cat /tmp/t16-dispatch.log >&2 || true

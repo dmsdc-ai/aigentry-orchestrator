@@ -530,6 +530,9 @@ Memory: `feedback_session_cleanup_protocol.md`.
 3. **완료 시 즉시 done + 지식 노트** — DONE 검증 후 곧바로 `status: done` + note에 **root cause / 적용한 수정 / 검증 방법 / 교훈** 기재. 완료 작업을 미등록·미갱신으로 누락 금지 (2026-07-02 교정 사례).
 4. **`updated_at` 스탬프** — 상태 변경 시 절대 날짜로 기록 (staleness 추적).
 
+#### 구조적 강제 (#736 — dispatch task-gate)
+운영자 규율에 의존하던 1·2번을 `bin/dispatch.sh`(모든 위임의 actuation chokepoint)에서 강제한다. 모든 dispatch는 `--task <id>`를 요구하며(등록된 task + status ∈ pending|queued|in_progress|delegated|blocked-by-observation), 성공 시 자동으로 `delegated` + dispatch note + `updated_at`을 기록한다(2번 자동화). 예외는 `--no-task "<reason>"`만 허용되고 `~/.aigentry/telemetry/dispatch-notask-<date>.ndjson`에 감사 기록이 남는다. 마이그레이션용으로 `AIGENTRY_TASK_GATE=hard|warn|off` (기본 `hard`).
+
 #### What this rule rejects
 - 등록 없이 바로 실행하고 "나중에 정리" — 로그 누락, 지식화 실패
 - 완료했는데 done 갱신·노트 없이 넘어감 — 회고 불가 (Rule 34 위반)
