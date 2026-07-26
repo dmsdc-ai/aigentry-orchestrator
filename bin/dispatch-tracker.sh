@@ -239,11 +239,13 @@ else:
 }
 
 cmd_mark_reported() {
+  # `awaiting_user` is accepted (ADR 2026-07-26-hitl-gate-primitive M1, belt): a
+  # worker that reports out-of-band while gated must not be silently dropped.
   local sid="$1"
   SID="$sid" _mutate_state "
 sid = os.environ['SID']
 for e in entries:
-    if e.get('sid') == sid and e.get('status') in ('in_flight','re_dispatched','auto_reported','stuck_welcome'):
+    if e.get('sid') == sid and e.get('status') in ('in_flight','re_dispatched','auto_reported','stuck_welcome','awaiting_user'):
         e['status'] = 'reported'
 "
   # Layer D — schedule cleanup if scheduler script is available + sid is not keep-alive.
