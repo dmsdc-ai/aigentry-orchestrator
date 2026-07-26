@@ -12,7 +12,6 @@ export interface RunResult {
 export interface Spawner {
   run(cmd: BootCommand, stdin?: string, timeout_ms?: number): Promise<RunResult>;
   probeVersion(executable: string): Promise<string>;
-  probeFeature(executable: string, flag: string): Promise<boolean>;
 }
 
 function collect(exe: string, args: readonly string[]): Promise<string> {
@@ -63,16 +62,11 @@ export function nodeSpawner(): Spawner {
         return m ? m[0] : out.trim();
       } catch { throw new Error("CLI_NOT_FOUND"); }
     },
-    async probeFeature(exe, flag) {
-      try { return (await collect(exe, ["--help"])).includes(flag); }
-      catch { return false; }
-    },
   };
 }
 
 export interface MockScript {
   version?: string;
-  features?: readonly string[];
   on_run?: (cmd: BootCommand, stdin?: string) => RunResult | Error;
 }
 
@@ -97,6 +91,5 @@ export function mockSpawner(
       if (!v) throw new Error("CLI_NOT_FOUND");
       return v;
     },
-    async probeFeature(exe, flag) { return !!scripts[exe]?.features?.includes(flag); },
   };
 }

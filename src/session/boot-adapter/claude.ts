@@ -18,8 +18,6 @@ export function claudeAdapter() {
   return makeAdapter({
     name: "claude",
     min_version: CLAUDE_MIN_VERSION,
-    needScratchCwd: false,
-    codeCwdFlag: null,
     buildArgvEnv: ({ prompt_file }) => ({
       argv: ["claude", "--append-system-prompt-file", prompt_file],
       env: {},

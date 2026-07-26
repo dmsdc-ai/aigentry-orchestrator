@@ -38,7 +38,6 @@ export function makeResolved(): ResolvedInstructions {
 export function readyScript(version = "1.0.0"): MockScript {
   return {
     version,
-    features: ["--cd", "--workspace-root", "--bare"],
     on_run: (cmd) => ({
       stdout: `READY ${cmd.expected_digest}\n`,
       stderr: "",

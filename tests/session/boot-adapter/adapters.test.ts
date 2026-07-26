@@ -30,7 +30,6 @@ test("3. claude argv = --append-system-prompt-file <staged> (#431 hybrid pivot f
     path.join(STAGING, "effective_prompt.md"),
   ]);
   assert.equal(cmd.cwd, "/work/myproj");
-  assert.equal(cmd.code_scope_cwd, "/work/myproj");
   assert.deepEqual({ ...cmd.env }, {});
 });
 
@@ -51,7 +50,6 @@ test("4. codex argv = real default flags; additive descriptor (AGENTS.md / CODEX
     "--dangerously-bypass-approvals-and-sandbox",
   ]);
   assert.equal(cmd.cwd, "/work/myproj");
-  assert.equal(cmd.code_scope_cwd, "/work/myproj");
   assert.deepEqual({ ...cmd.env }, {});
   assert.equal(adapter.contextFile, "AGENTS.md");
   assert.equal(adapter.homeEnv, "CODEX_HOME");
@@ -74,7 +72,6 @@ test("5. gemini argv = real default flags; additive descriptor (GEMINI.md / GEMI
     "--approval-mode", "yolo", "--skip-trust",
   ]);
   assert.equal(cmd.cwd, "/work/myproj");
-  assert.equal(cmd.code_scope_cwd, "/work/myproj");
   assert.deepEqual({ ...cmd.env }, {});
   assert.equal(adapter.contextFile, "GEMINI.md");
   assert.equal(adapter.homeEnv, "GEMINI_CLI_HOME");
@@ -102,10 +99,10 @@ test("5b. gemini argv reads AIGENTRY_GEMINI_MODEL override (#551)", async () => 
 
 test("6. codex additive path does NOT probe --cd (no scratch /control dir) (#532)", async () => {
   // #532: the additive path keeps cwd=sandbox and never passes codex `-C/--cd`, so a
-  // spawner reporting zero features must still build (the obsolete codeCwdFlag probe
-  // that previously rejected codex-without-`--cd` no longer applies).
+  // bare spawner must still build (the obsolete codeCwdFlag probe that previously
+  // rejected codex-without-`--cd` no longer applies).
   const sp = mockSpawner({
-    codex: { version: "1.0.0", features: [], on_run: () => ({ stdout: "", stderr: "", exit_code: 0, duration_ms: 1 }) },
+    codex: { version: "1.0.0", on_run: () => ({ stdout: "", stderr: "", exit_code: 0, duration_ms: 1 }) },
   });
   const cmd = await getBootAdapter("codex").buildBootCommand(makeCtx(), makeResolved(), {
     staging_dir: STAGING, fs: memoryBootFs(), spawner: sp,
