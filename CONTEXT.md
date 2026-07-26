@@ -68,6 +68,22 @@ _Avoid_: command, op, task.
 The single Action that surfaces to the interactive orchestrator (genuine business/architecture decision) via `verify-escalations.jsonl` — now the *exception* channel, not the default. Every other Action resolves autonomously. ESCALATE is also the ambiguity default (when SessionState is unknown, never act destructively).
 _Avoid_: alert, notify.
 
+**HITL Gate**:
+A durable, resumable human decision point: a gate file under `state/hitl/`, opened by `bin/hitl.sh open --kind <decision|destructive|…>`, which notifies the orchestrator and (with `--subject-sid`) sets that session's Dispatch Registry status to `awaiting_user` until answered. Built for **unwatched** surfaces — a worker blocked on a human. ADR `2026-07-26-hitl-gate-primitive.md`.
+_Avoid_: prompt, approval dialog, escalation.
+
+**awaiting_user**:
+The `state/dispatch/active.json` status meaning "this session is blocked on a human". Excluded from probe, AUTO_REPORT, and re-dispatch, and **included in `compute_gc_root`** so a gated worker is never swept. The previous status is stashed and restored compare-and-set on resume. This is why a HOLD is not idling under the SAWP "never idle" rule.
+_Avoid_: paused, blocked, idle.
+
+**AWAIT_USER**:
+The `Policy` Action (`bin/policy.py`) that classifies a SessionState as needing a human, producing a **HITL Gate** instead of an autonomous action. Distinct from **Escalate**, which remains the ambiguity default for unknown state.
+_Avoid_: ASK, PAUSE, HOLD (HOLD is the worker-side inject, not a Policy Action).
+
+**Ambiguity Gate**:
+The stop-before-acting checkpoint Rule 37 imposes on a **task-shaped request whose ambiguity survives reading** — ≥2 competing readings writable verbatim, differing on the user's *intent* rather than on repo *facts*. Branches by whether a human watches the surface: interactive ⇒ Claude Code plan mode with the interpretations as the plan's §1; dispatched worker (`AIGENTRY_WORKER_SESSION=1`) ⇒ **HOLD inject, never plan mode**. Normative text = `docs/rules.md` Rule 37; the every-session floor = `tooling/instructions/common.md`; the `ambiguity-gate` skill (devkit) is an operational aid, not a precondition. ADR `2026-07-26-ambiguity-plan-mode.md`.
+_Avoid_: plan mode (one branch's mechanism, not the gate), clarification, HOLD (the worker branch's output, not the gate).
+
 ## Relationships
 
 - A **Session** is registered in **telepty** (mandatory) and may have a **Workspace Host** (optional).
@@ -86,6 +102,7 @@ _Avoid_: alert, notify.
 ## Flagged ambiguities
 
 - "Session" was previously conflated with "cmux workspace" in some bash scripts (`session-cleanup.sh:107` extracted `.cmuxWorkspaceId` from telepty session) — resolved: a **Session** is the telepty-registered context, a **Workspace Host** is a separate concern accessed via adapter.
+- "Gate" now names three unrelated things — resolved: **always qualify, never say "gate" bare.** (1) **spawn-capability Gate** — `src/gate/class-{a,b,c}/` over `enforceSpawn()` (ADR-MF #15); gates *who may spawn a session*; defined + tested but unwired in production (WIRING-GAP). (2) **HITL Gate** — `state/hitl/` + `bin/hitl.sh`; gates *a running session waiting on a human answer*; durable and resumable via `awaiting_user`. (3) **Ambiguity Gate** — `docs/rules.md` Rule 37 + the `ambiguity-gate` skill; gates *acting before the interpretation of a request is chosen*; a per-turn predicate with no state directory of its own. They share no state, no code path, and no lifecycle; only (2) and (3) meet at all — a worker's Ambiguity Gate HOLD is what makes the orchestrator open a HITL Gate.
 - "Cleanup" was overloaded: meant "kill PID" in some places, "close cmux workspace" in others, "DELETE registry entry" in others — resolved: the 3-step `cleanup_one()` in `session-cleanup.sh` is the canonical sequence, all three steps required.
 
 ## Decision review log
