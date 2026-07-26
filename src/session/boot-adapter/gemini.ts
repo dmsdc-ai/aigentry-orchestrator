@@ -37,8 +37,6 @@ export function geminiAdapter() {
   return makeAdapter({
     name: "gemini",
     min_version: GEMINI_MIN_VERSION,
-    needScratchCwd: false, // additive path runs in ctx.cwd (sandbox), no /control dir
-    codeCwdFlag: null, // do NOT pass --include-directories <project> (re-leak, §4)
     contextFile: GEMINI_CONTEXT_FILE,
     homeEnv: GEMINI_HOME_ENV,
     homeExclude: GEMINI_HOME_EXCLUDE,

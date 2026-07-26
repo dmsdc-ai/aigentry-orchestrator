@@ -5,21 +5,35 @@ import type { ResolvedInstructions } from "../resolve-instructions.js";
 import type { SessionContext } from "../types.js";
 import { canonicalBytes } from "../persistence/canonical-bytes.js";
 import type { Spawner } from "./spawner.js";
-import { semverGte, runSelfTest } from "./self-test.js";
 import {
   BootAdapterError,
   type BootAdapter,
   type BootCommand,
   type BuildOptions,
   type CliKind,
-  type SelfTestInput,
 } from "./types.js";
+
+// SemVer 2 §11 minimal compare: major.minor.patch numeric; any prerelease < release.
+export function semverGte(installed: string, minimum: string): boolean {
+  const parse = (s: string): [number, number, number, boolean] => {
+    const m = s.match(/^(\d+)\.(\d+)\.(\d+)(-[A-Za-z0-9.-]+)?/);
+    return m
+      ? [Number(m[1]), Number(m[2]), Number(m[3]), Boolean(m[4])]
+      : [0, 0, 0, false];
+  };
+  const [aM, an, ap, apre] = parse(installed);
+  const [bM, bn, bp, bpre] = parse(minimum);
+  if (aM !== bM) return aM > bM;
+  if (an !== bn) return an > bn;
+  if (ap !== bp) return ap > bp;
+  // equal core: release ≥ prerelease; prerelease < release; same-flag treat equal.
+  if (apre === bpre) return true;
+  return !apre;
+}
 
 export interface AdapterConfig {
   name: CliKind;
   min_version: string;
-  needScratchCwd: boolean;
-  codeCwdFlag: string | null;  // null = no separate flag (claude --bare case)
   // #532 additive role-injection descriptor (see BootAdapter in types.ts).
   // Defaulted for claude (flag-based), set for codex/gemini.
   contextFile?: string | null;
@@ -70,35 +84,17 @@ export function makeAdapter(cfg: AdapterConfig): BootAdapter {
       opts: BuildOptions,
     ): Promise<BootCommand> {
       await versionGate(opts.spawner);
-      if (cfg.codeCwdFlag) {
-        const ok = await opts.spawner.probeFeature(cfg.name, cfg.codeCwdFlag);
-        if (!ok) {
-          throw new BootAdapterError(
-            "ERR_BOOT_ADAPTER_UNSUPPORTED",
-            `${cfg.name} lacks ${cfg.codeCwdFlag} (ADR §4.5.1.1 two-axis separation)`,
-          );
-        }
-      }
       await opts.fs.mkdirP(opts.staging_dir);
-      let processCwd = ctx.cwd;
-      if (cfg.needScratchCwd) {
-        processCwd = path.join(opts.staging_dir, "control");
-        await opts.fs.mkdirP(processCwd);
-      }
       const prompt_file = path.join(opts.staging_dir, "effective_prompt.md");
       await opts.fs.writeFile(prompt_file, canonicalBytes(resolved.effective_prompt));
       const { argv, env } = cfg.buildArgvEnv({ ctx, prompt_file });
       return Object.freeze({
         argv: Object.freeze([...argv]),
         env: Object.freeze({ ...env }),
-        cwd: processCwd,
-        code_scope_cwd: ctx.cwd,
+        cwd: ctx.cwd,
         prompt_file,
         expected_digest: resolved.effective_prompt_digest,
       });
-    },
-    async verifyBootSelfTest(input: SelfTestInput) {
-      return await runSelfTest(adapter, input);
     },
   };
   return adapter;

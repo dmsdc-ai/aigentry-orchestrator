@@ -29,14 +29,14 @@ export function getBootAdapter(cli: string): BootAdapter {
 export { CLI_KINDS, isCliKind, BootAdapterError };
 export type {
   BootAdapter, BootCommand, BootError, BootErrorCode,
-  BuildOptions, CliKind, SelfTestInput, SelfTestResult,
+  BuildOptions, CliKind,
 } from "./types.js";
 export { memoryBootFs, nodeBootFs, type BootFS } from "./boot-fs.js";
 export {
   mockSpawner, nodeSpawner,
   type MockScript, type RunResult, type Spawner,
 } from "./spawner.js";
-export { runSelfTest, semverGte } from "./self-test.js";
+export { semverGte } from "./common.js";
 export { claudeAdapter, CLAUDE_MIN_VERSION } from "./claude.js";
 export {
   codexAdapter, CODEX_MIN_VERSION, CODEX_CONTEXT_FILE,

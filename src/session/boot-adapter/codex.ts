@@ -32,8 +32,6 @@ export function codexAdapter() {
   return makeAdapter({
     name: "codex",
     min_version: CODEX_MIN_VERSION,
-    needScratchCwd: false, // additive path runs in ctx.cwd (sandbox), no /control dir
-    codeCwdFlag: null, // do NOT pass -C/--cd (re-exposes project AGENTS.md, §4)
     contextFile: CODEX_CONTEXT_FILE,
     homeEnv: CODEX_HOME_ENV,
     homeExclude: CODEX_HOME_EXCLUDE,
