@@ -85,6 +85,7 @@
 5. **다음 태스크 추천** — `bin/tq-status.sh` / `bin/tq-focus.sh` + `state/task-queue.json` (추천 ≠ fire; confirm 후 실행).
 
 > 전체 체크리스트 + 정확한 커맨드 형식 + step→infra 매핑: `orchestrate-turn` 스킬. ADR: `docs/adr/2026-06-06-orchestration-sequence.md`.
+> **스킬 소유권 라우팅**: 크로스커팅 스킬은 devkit SSOT(`aigentry-devkit/skills/` → 설치 시 `~/.claude/skills/`), 이 repo `.agents/skills/`에는 repo-coupled 스킬만(현재 `orchestrate-turn` 하나). 타이브레이크 = "이 repo의 `bin/`을 경로로 직접 호출하는가?" → YES면 repo, NO면 devkit. ADR: `docs/adr/2026-07-26-skill-ownership-routing.md`.
 
 태스크 보드: `state/task-queue.json`
 
@@ -123,7 +124,7 @@ telepty list
 3. **[SAWP] envelope** (Rule 17) — `docs/sawp.md` 전문
 4. **[SPEC FIRST]** (Rule 24) — 구현 승인 전
 5. **lessons** (Rule 7-1) — invariants + failed approaches
-6. **CLI별 역량**: claude=superpowers+MCP+subagent, codex=코드생성+테스트, gemini=웹검색+문서화
+6. **CLI별 역량**: claude=superpowers+MCP+subagent, codex=코드생성+테스트, gemini=웹검색+문서화 — §17.4 fallback: `superpowers` 플러그인 부재 시 해당 워크플로우(브레인스토밍/플랜 실행/TDD)는 세션이 직접 수행한다; 플러그인은 편의 수단이며 전제조건이 아니다.
 7. **Self-contained dispatch ref** (Rule 32-A-template / #396 #397) — 스켈레톤 `docs/templates/dispatch-ref-template.md`, 체크리스트 `docs/templates/dispatch-ref-checklist.md`. `dispatch_kind: fresh-session` 시 인용 verbatim + HOLD inject 실제 `telepty inject` 호출 + orchestrator-side path disclaimer 필수.
 
 ## dustcraw 태스크 피드 (필수)
