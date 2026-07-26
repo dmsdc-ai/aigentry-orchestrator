@@ -28,6 +28,14 @@
 #   AGENTS.md/GEMINI.md + CODEX_HOME/GEMINI_CLI_HOME shadow home). Omit --role to
 #   use the legacy spawn (back-compat).
 #
+# Registration wait (#727): a freshly spawned worker needs tens of seconds to
+#   appear in `telepty list` (workspace boot → CLI boot → bridge registration).
+#   The spawn path polls every 5s up to AIGENTRY_DISPATCH_REGISTER_TIMEOUT_MS
+#   (default 180000) before giving up with exit 6, so a slow spawn stays on the
+#   gated path instead of being hand-recovered with a raw `telepty inject`
+#   (which bypasses the task-gate ledger, delivery confirm and tracker register).
+#   --target keeps the historical fail-fast; set the knob to make it wait too.
+#
 # Ready detection: per-CLI prompt-symbol probe of `telepty read-screen` plus
 # welcome/boot banner absence (claude ❯ / codex › / gemini ›|│ >).
 #
@@ -39,7 +47,8 @@
 #   Opt out with --no-verify-started.
 #
 # Exit codes: 0 OK, 1 timeout, 2 spawn failed, 3 inject failed, 4 usage,
-#             5 --verify-delivered detected delivery failure.
+#             5 --verify-delivered detected delivery failure,
+#             6 session never registered in telepty list (#727).
 set -euo pipefail
 if [ "${DISPATCH_SH_NO_MAIN:-0}" != "1" ]; then
   export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
@@ -126,7 +135,7 @@ write_worker_launcher() {
   printf '%s\n' "$launcher"
 }
 
-usage() { sed -n '2,33p' "$0"; }
+usage() { sed -n '2,41p' "$0"; }
 
 target=""; ref_file=""; from_id=""; timeout_ms=30000; timeout_explicit=0
 spawn=0; track=""; name=""; cwd=""; cli="claude"; worktree=""
@@ -204,13 +213,51 @@ sys.exit(0 if state.get("ready") is True else 1)
 PY
 }
 
+# #727: presence wait, kept separate from wait_for_ready's REPL-ready wait
+# (telepty#18). Registration = "the bridge has published the session"; ready =
+# "its REPL is past the boot screen". A freshly spawned worker takes tens of
+# seconds to reach the first, and the old one-shot check gave up long before —
+# so every spawn-and-dispatch got hand-recovered with a raw `telepty inject`,
+# bypassing the #736 task-gate ledger, delivery confirm and tracker register.
+# Echoes the wrapped CLI kind on success; 1 = never registered.
+REGISTER_TIMEOUT_MS_DEFAULT=180000
+wait_for_registration() {
+  local sid="$1" timeout start deadline now kind elapsed nap notes=0
+  timeout="${AIGENTRY_DISPATCH_REGISTER_TIMEOUT_MS:-}"
+  if [ -z "$timeout" ]; then
+    # --target names a session that is supposed to exist already, so waiting
+    # minutes there would only slow a genuine failure down. Only a fresh spawn
+    # is worth the patience.
+    if [ "$spawn" -eq 1 ]; then timeout="$REGISTER_TIMEOUT_MS_DEFAULT"; else timeout=0; fi
+  fi
+  start=$(now_ms)
+  deadline=$(( start + timeout ))
+  while :; do
+    kind=$(cli_of "$sid")
+    if [ -n "$kind" ]; then printf '%s\n' "$kind"; return 0; fi
+    now=$(now_ms)
+    if [ "$now" -ge "$deadline" ]; then
+      echo "dispatch.sh: session '$sid' never registered in telepty list after ${timeout}ms — raise AIGENTRY_DISPATCH_REGISTER_TIMEOUT_MS (default ${REGISTER_TIMEOUT_MS_DEFAULT} for --spawn-and-dispatch)" >&2
+      if [ "$spawn" -eq 1 ]; then
+        echo "dispatch.sh: the workspace opened for '$sid' is still running; close it manually before retrying" >&2
+      fi
+      return 1
+    fi
+    elapsed=$(( (now - start) / 1000 ))
+    if [ "$elapsed" -ge $(( (notes + 1) * 30 )) ]; then
+      notes=$(( elapsed / 30 ))
+      echo "dispatch.sh: waiting for session registration… ${elapsed}s" >&2
+    fi
+    # Cap the nap at what is left so the knob's value is also the worst-case wait.
+    nap=$(( deadline - now ))
+    [ "$nap" -gt 5000 ] && nap=5000
+    sleep "$(printf '%d.%03d' "$(( nap / 1000 ))" "$(( nap % 1000 ))")"
+  done
+}
+
 wait_for_ready() {
   local sid="$1" cli_kind deadline effective_timeout
-  cli_kind=$(cli_of "$sid")
-  if [ -z "$cli_kind" ]; then
-    echo "dispatch.sh: session '$sid' not found in telepty list" >&2
-    return 1
-  fi
+  cli_kind=$(wait_for_registration "$sid") || return 6
   effective_timeout="$timeout_ms"
   # #557: codex reaches its interactive `›` REPL within seconds, but its 6 MCP
   # servers can take >30s to finish booting; on slow boots the prompt-ready signal
@@ -536,7 +583,14 @@ emit_telemetry --helper dispatch --subtype dispatch_start \
 
 if ! dedup_check_and_mark "$sid"; then exit 0; fi
 
-if ! wait_for_ready "$sid"; then exit 1; fi
+wait_for_ready "$sid" || {
+  rc=$?
+  # #727: a registration timeout must leave no trace behind the workspace itself.
+  # The operator's next move is a retry with the same ref (usually with a wider
+  # knob), and a stale dedup mark would turn that retry into a silent no-op.
+  [ "$rc" -eq 6 ] && rm -f "$dedup_dir/$sid"
+  exit "$rc"
+}
 
 if ! do_inject "$sid"; then
   echo "dispatch.sh: telepty inject failed for $sid" >&2
