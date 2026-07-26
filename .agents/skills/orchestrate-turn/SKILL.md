@@ -33,6 +33,8 @@ Read each step as a failure-mode tripwire: it states **what goes wrong if you sk
 
 Confirm the working context before any breakdown. On ambiguity, surface N interpretations and ask (AskUserQuestion / multi-interpretation surface) — never silently pick one (응답 원칙 §4).
 
+**Run the ambiguity gate here, BEFORE 1-1** (Rule 37, HARD): if ≥2 competing readings survive reading and the residual difference is about the user's *intent* rather than repo *facts*, `EnterPlanMode` with those interpretations as the plan's §1 and change no state until approved — breakdown, task registration, and dispatch all wait behind the gate. `AskUserQuestion` stays the asking mechanism *inside* plan mode.
+
 > **If skipped:** you delegate against a guessed intent. The whole wave runs on the wrong target and burns N sessions before the mistake surfaces.
 
 ### 1-1 Break down → decide # sessions

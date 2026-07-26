@@ -34,6 +34,31 @@ REPORT: <modified files> | <change summary> | <build result> | <remaining issues
 
 Source: `docs/rules.md` Rule 7.
 
+## Ambiguity gate (Rule 37 — HARD RULE)
+
+For a task-shaped request, resolve what was asked by **reading first**
+(grep the named symbol, open the named file). Ambiguity is what survives
+that: ≥2 competing readings you can write down verbatim, differing on the
+user's *intent* rather than on repo *facts* — facts are readable, intent
+is not in the repo. Suspicion alone is not a signal; but once you can
+write two readings, silently picking one is forbidden.
+
+- **Dispatched worker** (`AIGENTRY_WORKER_SESSION=1`): **MUST NOT enter
+  plan mode** — nobody is watching that screen. HOLD-inject the written
+  interpretations plus your recommendation to the orchestrator and wait.
+  Never proceed on a guess. Do not call `bin/hitl.sh` yourself; the
+  orchestrator opens the gate on receipt.
+- **Interactive session** (variable unset): enter plan mode with the
+  interpretations as the plan's first section — no state-changing call
+  before approval. Where plan mode does not exist (non-Claude CLI),
+  write the numbered interpretations out and stop until answered.
+
+Exception: when the user acknowledges the ambiguity and says to proceed
+("그냥 해"), name the chosen interpretation in one line and continue —
+silence is the only violation. Operational autonomy (Rule 30) is
+unaffected: this fires on task-shaped user requests, never on
+operational conditions. Source: `docs/rules.md` Rule 37.
+
 ## Snyk Security At Inception (user-global directive)
 
 When a session generates or modifies first-party code in a Snyk-supported

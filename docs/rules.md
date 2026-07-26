@@ -611,3 +611,30 @@ Memory: `feedback_session_cleanup_protocol.md`.
 - 병렬 dispatch는 **task-id 기반 고유 `--track`** 필수 (track 공유 시 shared-fate cascade-kill) — memory `feedback_telepty_duplicate_id_shared_fate.md`.
 - 병렬 세션 **≥3이면 deliberation MCP 경유** — AGENTS.md "병렬 위임 시 Deliberation 경유".
 - Memory: `~/.claude/projects/-Users-duckyoungkim-projects-aigentry-orchestrator/memory/feedback_mandatory_parallel_breakdown_dispatch.md`
+
+## Rule 37. 모호한 태스크는 게이트를 통과해야 한다 (HARD RULE)
+
+**task-shaped 요청에 모호함이 남아 있으면, 해석이 확정되기 전에는 상태를 바꾸는 행동을 시작하지 않는다.** 발단: 2026-07-26. 사용자 지시: "태스크에 모호함이 있을때는 항상 무조건 plan mode로 동작하도록 해줘. 이것도 스킬로 만들어줘."
+
+**Why:** 응답원칙 §4(다중 해석 surface)와 Rule 30의 "Spec 모호 시 multi-interpretation surface" 행은 *무엇을 할지*만 규정하고 *행동을 막지*는 않았다. 같은 턴에 N개 해석을 제시하고 그중 하나로 그냥 진행하는 것이 문법적으로 허용됐다. Rule 37은 그 문장을 **게이트**로 승격한다. HARD 지정은 의견이 아니라 측정에 근거한다 (ADR §8.2 — 10-fixture blind M2 2회 통과: v1 inter-reader 10/10, v2 amended-A5에서 inter-reader 10/10 + expected 대비 10/10, reader 3개 family).
+
+#### Mandatory
+1. **읽어서 풀 수 있으면 게이트 아님** — 값싼 해소가 먼저다. 판정 기준은 노력량이 아니라 **남은 차이의 성격**이다: 차이가 저장소의 *사실*에 관한 것이면 읽으면 풀린다(grep/파일읽기/`bin/tq-status.sh`) — 계속 읽어라. 차이가 사용자의 *의도*에 관한 것이면 repo에 답이 없다 — 더 읽어도 풀리지 않고, 그때가 게이트다. (targeted 호출 ~3회는 사실형 차이가 대개 해소되는 실무 가늠일 뿐 임계값이 아니다.)
+2. **두 개를 쓸 수 있을 때만 발동** — 경쟁하는 해석 ≥2개를 그대로 적어낼 수 있어야 신호가 선다. 의심만으로는 발동하지 않는다. 반대로 두 개를 적었으면 조용히 하나를 고르는 것은 금지다. 적어낸 해석이 그대로 plan의 §1이 된다 — 탐지와 plan 작성이 같은 행위다.
+3. **신호** — 대상 / 범위 / 산출물 / 성공기준 중 하나라도 ≥2해석이면, 또는 대상 없는 모호 동사(improve / fix / refactor / 정리 / 개선), 또는 기존 규칙·ADR·헌법과의 충돌, 또는 **파괴적 작업이 (i) 범위가 없거나 (ii) 원격·백업 어디서도 복구 불가능한 작업물을 되돌릴 수 없게 파괴하는 경우** — 후자는 범위가 명시돼 있어도 발동한다 (사용자가 그 손실을 명시적으로 인지·수용한 경우만 예외). `git reset --hard`, `push --force`, `rm -rf ./dir`, `DROP TABLE`처럼 *범위가 분명한* 파괴가 실제 사고의 대부분이다 — 범위는 무엇이 지워지는지 말해줄 뿐, 사용자가 그것의 존재를 아는지는 말해주지 않는다.
+4. **분기는 화면을 보는 사람이 있느냐로 정한다** — interactive 세션은 plan mode 진입(해석을 plan §1에 기재, 승인 전 상태 변경 금지). dispatched worker(`AIGENTRY_WORKER_SESSION=1`)는 **plan mode 진입 금지** — 승인 UI를 아무도 보지 않으므로 같은 내용을 HOLD inject로 오케스트레이터에 올리고 대기한다. 워커는 `bin/hitl.sh`를 직접 호출하지 않는다 — HOLD 수신 시 오케스트레이터가 게이트를 연다. 환경변수 미설정 시 기본값은 **interactive** (fail-open: 그 오판은 회귀 1건에만 닿고, 반대 기본값은 모든 사람 사용자에게 닿는다).
+5. **plan mode 중 컨텍스트 회수 의무** — 진입 시 `mktemp`로 마커 파일을 만들어 그 경로를 이 plan 동안 들고 있고, 턴 경계와 **첫 상태 변경 직전**에 POSIX `find "$HOME/.telepty/shared" -name '*.md' -newer "$MARKER"`로 신착 ref를 스윕한다 (자기가 보낸 ref는 버리고 남은 것만 읽는다 — shared 디렉터리는 전 세션 공용이다). 마커가 사라졌으면 `SWEEP-WINDOW-LOST`를 plan에 명시하고 그 구간의 inject를 미검증으로 취급한다 — 조용히 건너뛰는 것이 곧 #743이다. 스윕 없이 승인된 plan을 실행하지 않는다. 전체 계약: ADR §2.3.
+6. **비-task 대화는 대상 아님** — 1라인 ack / send-key / broadcast, 상태·읽기 전용 질의, 이미 로드된 컨텍스트로 답하는 질문, 톤·모드 지시, 이미 내린 결정에 대한 대화.
+
+#### 예외
+- 사용자가 모호함을 인지한 상태로 명시적으로 진행을 지시한 경우 ("그냥 해", "네 판단대로") — 선택한 해석을 **1줄로 명시**하고 진행한다. 침묵한 채 고르는 것만이 위반이다.
+- Rule 30 자율 처리 영역(sandbox prompt / blank panel / stuck session / stale cleanup / AUTO_REPORT 등 운영 이슈)은 그대로 자율. 이 규칙은 **task-shaped 사용자 요청**에만 발동하며 운영 자율성을 축소하지 않는다.
+
+#### Cross-references
+- 응답원칙 §4 (다중 해석 surface): §4는 *무엇을* 하는지, Rule 37은 *언제 멈추는지*. §4 본문은 불변이고 그 절차는 plan mode 안으로 흡수된다.
+- Rule 30: "Spec 모호 시 multi-interpretation surface" 행의 **메커니즘**이 Rule 37이다 (행 자체는 verbatim 유지).
+- Rule 24 (SPEC FIRST): Rule 37은 그 앞단 — 스펙을 쓰기 전에 *무엇의* 스펙인지 확정한다.
+- SAWP / HOLD + HITL Gate: worker 분기의 실행 경로. HOLD는 idle이 아니다 — `awaiting_user` 상태로 표현된다 (`docs/adr/2026-07-26-hitl-gate-primitive.md`).
+- 세션 floor: `tooling/instructions/common.md` — 모든 세션·역할·CLI에 도달하는 유일한 레이어. 워커가 `docs/rules.md`를 읽지 않아도 이 규칙이 닿는 경로다.
+- 스킬: `ambiguity-gate` (devkit `skills/`). 스킬은 운영 보조일 뿐이고, 부재 시에도 이 규칙은 그대로 구속력을 갖는다 (§17.4 fallback = `written-plan-hold`).
+- ADR: `docs/adr/2026-07-26-ambiguity-plan-mode.md` (accepted, r3).
