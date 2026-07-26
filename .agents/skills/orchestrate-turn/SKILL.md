@@ -17,7 +17,7 @@ Read each step as a failure-mode tripwire: it states **what goes wrong if you sk
 |------|--------|----------------|
 | 1 | Confirm context with user | conversation; AskUserQuestion for ambiguity (multi-interpretation surface) |
 | 1-1 | Break down → decide # sessions | `work-breakdown` skill (decompose to parallelizable tasks) + register via direct `state/task-queue.json` edit (jq); `bin/tq-track.sh`/`bin/tq-status.sh` read-only views |
-| 1-2 | Parallel-first, conflict-aware | Rule 9 file-separation judgment → conflict risk ⇒ sequential; ≥3 parallel ⇒ deliberation MCP |
+| 1-2 | Parallel breakdown MANDATORY, conflict-aware | Rule 36 mandate + Rule 9/10 file-separation judgment → same-file conflict or data dependency ⇒ sequential **with recorded reason**; ≥3 parallel ⇒ deliberation MCP |
 | 1-3 | Match CLI to task | "CLI별 역할" table (claude=architecture/MCP, codex=impl/test, gemini=websearch/docs) → `--cli` / `--role` |
 | 2 | Spawn + ref/inline + adaptor | `bin/dispatch.sh --spawn-and-dispatch --cli <c> --role <r> --ref <file> --task <id>` → `bin/open-session.sh` (`detect_terminal`) → `bin/lib/workspace-host.sh` adaptor |
 | 2-1 | Session → orchestrator clarification | `telepty inject` HOLD → orchestrator |
@@ -40,10 +40,10 @@ Decompose the confirmed work into file/task units — invoke the `work-breakdown
 
 > **If skipped:** no task-queue trail → step 5 has nothing to propose from, and reconcile cannot reconcile dispatches it never saw.
 
-### 1-2 Parallel-first, conflict-aware
-Prefer parallel sessions. Apply Rule 9 file-separation: if two units touch the same file → run **sequentially**, not parallel. ≥3 parallel sessions → route through **deliberation MCP** (conflict detection + synthesis + non-response tracking), per AGENTS.md "병렬 위임 시 Deliberation 경유".
+### 1-2 Parallel breakdown is MANDATORY, conflict-aware
+Parallel is not a preference — it is the required default (**Rule 36**, 2026-07-12 user directive). Before ANY dispatch, decompose the work into parallel-safe units and inject them to multiple sessions **concurrently, in one wave**. Sequential is allowed ONLY for (a) same-file / same-resource conflict (Rule 9/10 file-separation) or (b) intrinsic data dependency (A's output = B's input) — and every sequential decision MUST record which of the two, in the task note (`state/task-queue.json`) or the dispatch log. Keep the existing safeguards: same-repo parallel coders need **worktree isolation**, every parallel dispatch needs a **task-id-based unique `--track`**, and ≥3 parallel sessions → route through **deliberation MCP** (conflict detection + synthesis + non-response tracking), per AGENTS.md "병렬 위임 시 Deliberation 경유". Parallel is the default *form*; firing still waits on user confirm (Rule 6).
 
-> **If skipped:** two sessions edit the same file → merge corruption / lost work. ≥3 parallel without deliberation → no conflict detection, silent divergence.
+> **If skipped:** an undecomposed monolith goes to one session and independent work serializes into pure wall-clock waiting (Rule 36 violation), or a sequential wave leaves no recorded reason to audit. Two sessions edit the same file → merge corruption / lost work. Shared `--track` → shared-fate cascade-kill. ≥3 parallel without deliberation → no conflict detection, silent divergence.
 
 ### 1-3 Match the CLI to the task
 Pick `--cli` by strength: claude (architecture, integration, MCP, debugging), codex (impl, porting, tests), gemini (web search, docs). Pass `--role` so the worker boots in its role-sandbox (Rule 4 cwd→role boundary).
