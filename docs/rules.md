@@ -553,3 +553,29 @@ Memory: `feedback_session_cleanup_protocol.md`.
 - 모든 작업 항목(대화·마이크로 예외 제외)이 착수 전 task-queue에 존재
 - 완료 시 done + root cause/검증/교훈 노트 동반 (동일 턴 내)
 - `bin/tq-status.sh` / `bin/tq-focus.sh`로 언제든 실행 로그 조회 가능
+
+## Rule 35. Reproduce-First — 재현·확인된 해결책 후에만 영구 fix (HARD RULE)
+
+**영구 fix는 (1) 정확한 재현 테스트로 근본 원인을 실증하고 (2) 정확한 해결책이 그 재현을 실제로 해소함을 확인한 뒤에만 dispatch/구현한다.** 증상 → fix로 건너뛰지 않는다. 발단: 2026-07-05. 사용자 지시: "정확히 재현 테스트를 진행하고 정확한 해결책이 나오고 나서야 영구 픽스를 해야지."
+
+**Why:** 재현 없이 dispatch한 fix는 (a) 잘못된 원인을 고칠 수 있고(이번 세션 #694 paste-race 가설이 재현으로 반증된 사례, #679 "resolved-as-artifact" 성급 판정 사례), (b) 해결됐는지 검증 기준이 없어 회귀·재발을 부른다. 재현은 **검증 가능한 goal**(Imperative→Declarative)의 전제다 — 재현 = 실패 테스트, fix = 그 테스트를 pass로.
+
+#### Mandatory (순서 강제)
+1. **재현(Reproduce)** — 근본 원인을 통제된 조건에서 실증. hermetic(격리 데몬/페이크 타겟) 또는 라이브(정확한 조건 명시). 비결정 이슈는 N회 시행으로 rate 측정. 재현 산출물(스크립트/로그/before-number)을 남긴다.
+2. **정확한 해결책 확인(Confirm exact solution)** — 그 재현 위에서 후보 해결책이 실제로 증상을 해소함을 확인. "그럴듯한 가설"만으로 fix 착수 금지. (SPEC-first HOLD가 이 게이트 — 재현 결과 CONFIRM/REFUTE + 확정 해결책을 오케스트레이터가 승인.)
+3. **그 다음 영구 fix(Then permanent fix)** — 확인된 해결책만 구현. Rule 32의 4-step은 이 게이트 통과 후 실행.
+4. **재현으로 retest** — fix 후 동일 재현이 이제 통과(before→after)함을 실증. Rule 32 검증 단계와 통합.
+
+#### What this rule rejects
+- 재현 없이 "이게 원인일 것" → 곧바로 fix dispatch (증상→fix 점프)
+- 확인 안 된 가설로 영구 fix 착수 (이번 세션 #679 fix를 재현 전 dispatch 시도 사례)
+- idle-only 등 조건 회피로 "된다" 판정 후 fix (= Rule 27 워크어라운드 위반과 결합)
+
+#### 예외
+- **명백·자명한 1라인 오타/오류** (재현이 오버헤드보다 큰 trivial) — 단 그래도 fix 후 최소 1회 검증.
+- 이미 재현·확인된 이슈의 후속(동일 근본, sibling site) — 재현 재실행 불요, 근거 인용.
+
+#### Cross-references
+- Rule 27 (워크어라운드 금지) + Rule 32 (Permanent Fix Only): 무엇을(root cause 영구 fix) — Rule 35는 **언제**(재현·확인 후에만).
+- Rule 24 (SPEC FIRST): SPEC-first HOLD가 §2 "확인" 게이트의 실행 형태.
+- Imperative→Declarative (공통 가이드라인): 재현 = 실패 테스트, fix = pass 전환.
