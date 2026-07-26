@@ -63,4 +63,34 @@ case "$out" in *"already decided"*) ;; *)
   echo "FAIL: second approve message = $out (want 'already decided')" >&2; exit 1;; esac
 t_assert_status sid-A in_flight
 
+# --- resume=registry-clear-redispatch — both arms of the reconciler cap gate ---
+t_seed_entry sid-B "2026-07-26T03:00:00Z" "2026-07-26T03:30:00Z" re_dispatched
+t_seed_entry sid-C "2026-07-26T03:00:00Z" "2026-07-26T03:30:00Z" re_dispatched
+python3 - "$DISPATCH_STATE_DIR/active.json" <<'PY'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p))
+for e in d:
+    if e["sid"] in ("sid-B","sid-C"): e["re_dispatch_count"]=1
+json.dump(d,open(p,"w"),indent=2)
+PY
+
+for sid in sid-B sid-C; do
+  gid=$(RECONCILER_NOW="2026-07-26T06:00:00Z" "$HITL" open \
+    --source reconciler --subject-sid "$sid" --kind decision \
+    --resume registry-clear-redispatch \
+    --question "re-dispatch cap reached (count=1) for $sid")
+  t_assert_status "$sid" awaiting_user
+  case "$sid" in
+    sid-B) RECONCILER_NOW="2026-07-26T06:10:00Z" "$HITL" approve "$gid" >/dev/null;;
+    sid-C) RECONCILER_NOW="2026-07-26T06:10:00Z" "$HITL" reject  "$gid" >/dev/null;;
+  esac
+done
+
+# approve → counter cleared, status restored ⇒ next tick may re-dispatch once more.
+t_assert_status sid-B re_dispatched
+got=$(t_field sid-B re_dispatch_count)
+if [ "$got" != "0" ]; then echo "FAIL: sid-B re_dispatch_count=$got, want 0" >&2; exit 1; fi
+# reject → terminal; the resume hook overrides the restored prev_status.
+t_assert_status sid-C stuck_error
+
 echo "T64 PASS"
