@@ -292,7 +292,9 @@ Existing seams suffice: `tests/dispatch/lib.sh`, `stubs/` (telepty stub), `RECON
 | `T65_hitl_reminder_24h.sh` | `RECONCILER_NOW` +25h ⇒ exactly one re-notify; +1h ⇒ zero; `notified_at=null` ⇒ immediate retry |
 | `T66_policy_await_user.sh` | `policy.py` `surface=error` ⇒ `AWAIT_USER`; `surface=unknown` ⇒ still `ESCALATE` ← guards the autonomy boundary against future drift |
 
-Registered under `tests/dispatch/run-all.sh` (auto-globs `T*.sh`) and therefore `npm test`.
+Registered under `tests/dispatch/run-all.sh` (auto-globs `T*.sh`), which is run on its own —
+**not** by `npm test` (`scripts/run-tests.mjs` enumerates compiled tests under `dist/tests` only,
+so no shell test has ever been reachable from it). Corrects the original claim; found by W1a.
 
 ## 위헌 심사 (Constitutional review — 5문항)
 

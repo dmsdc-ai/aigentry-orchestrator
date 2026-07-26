@@ -14,6 +14,12 @@ t_setup() {
   unset AIGENTRY_WORKER_SESSION
   T_TMP=$(mktemp -d)
   export T_TMP
+  # A reconciler tick under test runs wh_prune_orphans, whose ONLY ownership gate
+  # is "workspace cwd under $AIGENTRY_ROLE_SANDBOX_DIR" (workspace-host.sh:182).
+  # With the real default a test that ticks twice closes live workers' cmux
+  # workspaces for real (observed: 7 closed by T63's 3-tick run). Point ownership
+  # at the tmpdir so no test can ever match a real workspace.
+  export AIGENTRY_ROLE_SANDBOX_DIR="$T_TMP/role-sandbox"
   export DISPATCH_STATE_DIR="$T_TMP/state"
   mkdir -p "$DISPATCH_STATE_DIR"
   printf '[]\n' > "$DISPATCH_STATE_DIR/active.json"

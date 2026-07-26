@@ -64,6 +64,8 @@ COMMS_AUDITOR_SH="${COMMS_AUDITOR_SH:-$SCRIPT_DIR/session-comms-auditor.sh}"
 BRIDGE_AUDITOR_SH="${BRIDGE_AUDITOR_SH:-$SCRIPT_DIR/orchestrator-bridge-auditor.sh}"
 SESSION_PROBE_PY="${SESSION_PROBE_PY:-$SCRIPT_DIR/session-probe.py}"
 POLICY_PY="${POLICY_PY:-$SCRIPT_DIR/policy.py}"
+HITL_SH="${HITL_SH:-$SCRIPT_DIR/hitl.sh}"
+HITL_PENDING_DIR="${HITL_STATE_DIR:-$REPO_DIR/state/hitl}/pending"
 TELEPTY="${TELEPTY:-telepty}"
 NOW_OVERRIDE="${RECONCILER_NOW:-}"
 SHADOW_LOG="${RECONCILE_SHADOW_LOG:-$STATE_DIR/reconcile-shadow.jsonl}"
@@ -257,11 +259,30 @@ probe_session() {
   fi
 }
 
+# hitl_open <hitl.sh open args…> — open a gate, alerting (never aborting the
+# tick) if the CLI is missing or fails. The gate's own file-before-notify design
+# is what makes this safe to call from a level-triggered loop.
+hitl_open() {
+  if [ ! -x "$HITL_SH" ]; then
+    emit_alert "HITL_GATE_UNAVAILABLE $HITL_SH not executable — args: $*"
+    return 0
+  fi
+  "$HITL_SH" open "$@" >/dev/null 2>&1 || emit_alert "HITL_GATE_OPEN_FAILED args: $*"
+}
+
 maybe_redispatch() {
   local sid="$1" ref_path="$2" rdc="${3:-0}"
   [ -z "$rdc" ] && rdc=0
   if [ "$rdc" -ge 1 ]; then
-    emit_alert "REDISPATCH_CAP sid=$sid count=$rdc — user gate required"
+    # ADR 2026-07-26-hitl-gate-primitive producer (a): this line said "user gate
+    # required" since 2026-06 — now the gate exists. Idempotent on gate-id, so a
+    # 60s level-triggered tick opens it once and never re-notifies.
+    # approve ⇒ re_dispatch_count=0 (next tick re-dispatches); reject ⇒ stuck_error.
+    hitl_open --source reconciler --subject-sid "$sid" --kind decision \
+      --resume registry-clear-redispatch \
+      --question "re-dispatch cap reached (count=$rdc) for $sid" \
+      --options "approve=re-dispatch once more,reject=mark stuck_error" \
+      --context-ref "$ref_path"
     return 0
   fi
   if [ -z "$ref_path" ] || [ ! -f "$ref_path" ]; then
@@ -301,6 +322,18 @@ apply_action() {
       ;;
     REDISPATCH)
       maybe_redispatch "$sid" "$ref_path" "$rdc"
+      ;;
+    AWAIT_USER)
+      # ADR 2026-07-26-hitl-gate-primitive producer (b): policy.py returns this for
+      # surface=error only — the 3.3% of escalations whose own text asks for an
+      # operator. The gate owns the status (awaiting_user, prev stashed for resume),
+      # so no registry_update_status here; the escalation line is still written so
+      # the audit trail is unchanged.
+      hitl_open --source reconciler --subject-sid "$sid" --kind decision --resume none \
+        --question "$sid: $(json_get "$action_json" reason)" \
+        --options "approve=resume the session as-is,reject=hand back to the operator" \
+        --context-ref "$ref_path"
+      emit_escalation "$sid" "$action_json"
       ;;
     RESPAWN)
       registry_update_status "$sid" "${next_status:-respawn_requested}"
@@ -365,6 +398,9 @@ run_shadow_loop() {
 }
 
 # compute_gc_root — print one sid per line for every "live" session.
+# `awaiting_user` is LIVE (ADR 2026-07-26-hitl-gate-primitive M1): a session
+# blocked on a HITL gate drops out of the registry loop and the tracker scans by
+# design, but it must NEVER be swept while it waits for the human.
 compute_gc_root() {
   local p
   for p in "${PROTECTED_SIDS[@]}"; do printf '%s\n' "$p"; done
@@ -373,7 +409,7 @@ compute_gc_root() {
 import json,sys
 try: entries = json.load(open(sys.argv[1]))
 except Exception: entries = []
-LIVE = {"in_flight","re_dispatched","auto_reported","disconnected","stuck_welcome"}
+LIVE = {"in_flight","re_dispatched","auto_reported","disconnected","stuck_welcome","awaiting_user"}
 for e in entries:
     if e.get("status") in LIVE:
         sid = e.get("sid")
@@ -568,6 +604,28 @@ consume_surface_mismatched() {
   return 0
 }
 
+# hitl_pause_gates — print "PAUSE<TAB><gate-id>" for every pending gate that
+# pauses autonomous actions (ADR 2026-07-26-hitl-gate-primitive §3), and
+# "CORRUPT<TAB><path>" for every unparseable one. A corrupt gate is treated as
+# destructive: fail-safe, the same "never act when ambiguous" bias the loop's
+# ESCALATE default already has. Level-triggered — recomputed from the directory
+# each tick, so a daemon restart mid-gate needs no recovery logic.
+hitl_pause_gates() {
+  [ -d "$HITL_PENDING_DIR" ] || return 0
+  PENDING_DIR="$HITL_PENDING_DIR" python3 - <<'PY'
+import glob, json, os
+
+for path in sorted(glob.glob(os.path.join(os.environ["PENDING_DIR"], "*.json"))):
+    try:
+        gate = json.load(open(path, encoding="utf-8"))
+    except Exception:
+        print("CORRUPT\t%s" % path)
+        continue
+    if gate.get("kind") == "destructive":
+        print("PAUSE\t%s" % (gate.get("id") or os.path.basename(path)))
+PY
+}
+
 DRY_RUN=0
 SHADOW=0
 LOOP=0
@@ -598,6 +656,25 @@ if [ "$SHADOW" -eq 1 ]; then
   run_shadow_loop
   exit 0
 fi
+
+# --- step 0a: HITL gates (ADR 2026-07-26-hitl-gate-primitive M3) ---
+# Reminder FIRST, pause second: a destructive gate pauses actions, but the 24h
+# reminder is the mitigation for a forgotten gate — it must survive its own
+# pause. An operator's explicit --dry-run still sends nothing.
+if [ "$DRY_RUN" -eq 0 ] && [ -x "$HITL_SH" ]; then
+  "$HITL_SH" remind >/dev/null 2>&1 || log "ERR hitl remind non-zero (continuing)"
+fi
+# Global pause = the existing --dry-run path: probe → policy → shadow record all
+# still run, every actuation is skipped. No new blocking mechanism.
+hitl_gates=$(hitl_pause_gates || true)
+while IFS=$'\t' read -r kind which; do
+  [ -z "$kind" ] && continue
+  case "$kind" in
+    CORRUPT) log "HITL_GATE_CORRUPT $which — unparseable gate, treating as destructive (fail-safe)";;
+    *)       log "HITL_PAUSE gate=$which — autonomous actions paused (destructive gate pending)";;
+  esac
+  DRY_RUN=1
+done <<< "$hitl_gates"
 
 # --- step 0: Dispatch Registry observe→decide→act loop ---
 run_registry_loop 1
