@@ -1,9 +1,16 @@
 ---
 type: adr
-status: proposed
+status: accepted
+accepted_at: 2026-07-26
 scope: ecosystem
 decision_type: two-way
 tier: T2
+revision: r3
+previous_revision: 42e3481
+acceptance_basis: "T2 threshold (2 reviewers) SATISFIED. Reviewer 1 (codex, r759c-adr-review) r1 **ACCEPT** — 0 blocking, 4 non-blocking (N1-N4), all folded into r2. Reviewer 2 (gemini-family) r1 **REQUEST_CHANGES** — 3 blocking + 3 claims → resolved in r2 → r2 **ACCEPT**, with the reviewer independently recomputing the §5 matrix and matching the published derivations (A 71 / B 37 / C 55 / D 57 / Chosen 87), and ruling both r2 rebuttals SOUND. Cumulative: 3 blocking + 4 non-blocking + 3 claims = ALL RESOLVED (4 accepted-and-fixed, 2 rebutted-with-citations and upheld). Decision content additionally gated on empirical evidence, not reviewer opinion alone: M2 v2 (§8.1) cleared the Rule-37-HARD threshold at 10/10 inter-reader AND 10/10 vs-expected. User approval of the decision content is the orchestrator's to record on commit."
+r3_basis: "Bookkeeping only. status proposed → accepted + accepted_at; review_state and the new acceptance_basis synced so frontmatter cannot contradict status; §8.1 records M2 v2 (amended-A5 re-run: 10/10 inter-reader AND 10/10 vs-expected, readers = fresh Claude + Gemini) and the satisfied Rule-37-HARD gate; three consequential in-document syncs so the ADR does not contradict itself — §8.1's 're-run obligation' marked discharged, §11's ordering constraint released (W1b may designate HARD), §7.3's 'until the amended re-run' clause closed. NO ruling, alternative, verdict, signal, score, metric, migration step, or scope boundary changed in r3."
+review_state: "T2 threshold = 2 reviewers — **SATISFIED**. | Reviewer 1 (codex, r759c-adr-review): r1 **ACCEPT**, 0 blocking, 4 non-blocking (N1 find/bfs evidence wording, N2 marker collision, N3 30-min catch overclaim, N4 exit-sweep race) — all 4 folded into r2. No re-review required. | Reviewer 2 (gemini-family): r1 **REQUEST_CHANGES**, 3 blocking + 3 claims → 4 accepted-and-fixed, 2 rebutted with line citations → r2 **ACCEPT**, all 3 blocking verified resolved, matrix independently recomputed and matching, both rebuttals ruled SOUND. | Cumulative: ALL findings resolved; 0 outstanding. Status flipped proposed → accepted at r3."
+r2_basis: "Folds BOTH r1 reviews in one round. — REVIEWER 1 (codex), ACCEPT, 4 non-blocking, all accepted: [N1] the find/bfs evidence was NOT reproducible in its environment (`/usr/bin/find` accepted `-newermt`). r1's claim 'on this machine find resolves to bfs' was WRONG; investigating the rebuttal found the real mechanism — `find` here is a shell FUNCTION in the Claude Code shell snapshot routing to bfs, while the host's /usr/bin/find is BSD find and accepts -newermt. §2.3 softened to 'non-portable, observed failing in at least one environment', and the corrected mechanism strengthens the decision (an agent may have find shimmed to an implementation it cannot observe). POSIX -newer unchanged. [N2] duplicate of reviewer 2's (2a) — fixed once, via mktemp. [N3] '30-minute catch' overclaimed: true only for active.json-registered sessions, and neither SessionProbe nor dispatch-tracker has a plan-mode classifier — §2.2 and the §7.4 row both qualified; a classifier is recorded as §9 Q7 and explicitly NOT proposed (scope). [N4] the exit sweep has an inherent race (ref created after the final sweep starts, before the first mutation) — named in §2.3, M4 rescoped to 'present at sweep time', #760 remains the full fix. Reviewer 1 also independently verified the branch-predicate evidence chain (dispatch.sh:104-134/546-568, session-cleanup.sh:317-326, T34, lib.sh:8-14), ran T34 + T62 (both PASS), confirmed both sibling ADRs consistent with line cites now used in the §2.2/§2.4 rebuttals, and ran the §2.1 decidability test on 3 constructed requests reporting 3/3 verdicts 'felt forced' — added to §8 as an explicit M2 *preview*, with its own caveat that n=3 by one reader does not replace M2. — REVIEWER 2 (gemini-family), ACCEPTED 4: (1) §2.2/§7.4 contradiction is REAL and the root cause was worse than the wording — the fail-open argument was built on the wrong event pair (an env leak, which the default cannot produce). §2.2's asymmetry rewritten on the correct pair (which POPULATION the default's error hits); §7.4's 'loud' row was right and is unchanged. (2a) marker collision REAL — `${TELEPTY_SESSION_ID:-local}` collides across concurrent local sessions; replaced by mktemp + carry-the-path, which removes the naming scheme entirely, plus a POSIX stale reap. (2b) deleted-marker non-zero exit REAL — guard added, and it FAILS LOUD rather than swallowing: a skipped sweep silently reintroduces #743. (2c) cross-session contamination REAL, remedy PARTIALLY accepted — per-session scoping is not implementable today (`~/.telepty/shared` is content-addressed with no addressee metadata, verified), so the global sweep is justified explicitly + a triage step + self-authored-ref exclusion added, and the structural gap is recorded as §9 Q6 rather than hand-waved. (3) ARITHMETIC REAL and worse than the sample: ALL FIVE option columns were understated by 6-7 (A 65→71, B 31→37, C 48→55, D 51→57, Chosen 80→87). Ranking unaffected — luck, not exculpation. Per-cell derivations + a 95-point ceiling anchor now published so the error class is self-detecting; the durable process fix (add 'publish weighted derivations' to references/adr-template.md) is named but out of this round's edit scope. (6) '~3 tool calls' subjectivity REAL — replaced with a decidable criterion (does the residual difference concern user INTENT or repo FACTS?), the count demoted to explicit guidance. REBUTTED 2, both with citations: (4) 'worker HOLD bypasses hitl.sh' misreads ADR 2026-07-26 producer (c), which specifies the orchestrator opens the gate ON HOLD RECEIPT — the worker calling hitl.sh directly would additionally be the bin/-invocation that flips this skill's own SSOT to the orchestrator repo (§2.4), so the implied fix contradicts finding 5. (5) 'Claude-only skill in devkit breaks the tiebreak' misreads the test, which is bin/-coupling, 'never location or convenience' — and ADR 2026-07-26 r3 explicitly scoped devkit skill distribution to Claude Code, making this the documented normal case. BUT the reviewer's underlying dead-letter concern was UNDER-stated by r1 and is now strengthened with new evidence found under that pressure: the multi-interpretation principle lives ONLY at tooling/instructions/roles/orchestrator.md:119-120 and reaches NO worker session of any role or CLI; common.md (43 lines, the layer that reaches every session) has no ambiguity content at all. Rule-37-as-floor promoted to a named FLOOR INVARIANT in §2, §1.2's reach claim corrected, §3.1 sharpened, and coder B's file list gains tooling/instructions/common.md (migration tests assert structure only, no pinned digest — verified, additive edit safe). — M2 BLIND EVAL (run during r2, 2 readers x 10 W1a fixtures): inter-reader agreement **10/10**, threshold >=8/10 — PASS, the predicate is decidable. vs-expected 9/10 for BOTH readers, the single divergence identical across them (fixture 01, `reset feat/... to origin/main`) and therefore calibration, not reader variance. RESOLVED via option (b): **A5 amended** to fire on destruction that is unbounded **OR irreversible** (work unrecoverable from any remote/backup, absent explicit user acknowledgement of the loss); the fixture stands. Option (a) — rewriting the request to be genuinely unbounded — was rejected on the merits: r1's A5 used 'unbounded' as a proxy for 'dangerous', and the trial disproved the proxy (a bound says WHAT is destroyed, not whether the user knows it exists). Bounded-but-irreversible is the typical destructive incident — `git reset --hard`, `push --force`, `rm -rf ./dir`, `DROP TABLE` are all bounded — so option (a) would have discarded the set's most valuable case to protect a defective rule. Both readers applied the r1 text CORRECTLY to reach the unexpected verdict, which is why this is evidence against the rule, not against the readers. §2.1 A5 row, the §2.5 Rule 37 draft signal clause, §8 M2 row + new §8.1, and §7.3 all updated; M2 must be RE-RUN against the amended A5 before Rule 37 lands as HARD (the 10/10 decidability result carries over; the vs-expected figure does not). — UNCHANGED in r2: the thesis, the write-two rule, Gate A, signals A1-A4/A6/A7, the dual-branch split, detection signal, SSOT verdict, skill name, all 5 alternative rejections, all 5 constitution verdicts, Rule 4-A mode, and every matrix SCORE (only the sums were wrong). CHANGED: A5's firing test (second limb added, per M2)."
 date: 2026-07-26
 author: aigentry-architect-claude (a759m-ambiguity-adr)
 tags: [plan-mode, ambiguity, skill, rule-37, hitl, devkit, article-17, context-preservation]
@@ -41,7 +48,7 @@ why reading (i) is rejected rather than merely unchosen.
 
 | Capability | Already exists | Location | Gap |
 |---|:-:|---|---|
-| "Surface N interpretations, never silently pick one" | **YES** | `AGENTS.md` 응답원칙 §4 | Reply-level prose. Nothing prevents the agent from surfacing N *and then acting anyway* in the same turn. |
+| "Surface N interpretations, never silently pick one" | **YES, but orchestrator-only** | `AGENTS.md` 응답원칙 §4 → composed into `tooling/instructions/roles/orchestrator.md:119-120` | Two gaps, not one. (i) Reply-level prose — nothing prevents surfacing N *and then acting anyway* in the same turn. (ii) **It reaches no worker session of any role or CLI**: it was routed to the orchestrator role layer, and `tooling/instructions/common.md` — the 43-line layer that reaches *every* session — contains no ambiguity content at all (verified r2). |
 | "Spec 모호 시 multi-interpretation surface" as a legitimate user-interaction class | **YES** | `docs/rules.md` Rule 30, 사용자 인터렉션 정당 영역 table | Names the class; specifies no mechanism. |
 | Ambiguity handling in the per-turn loop | **YES** | `.agents/skills/orchestrate-turn/SKILL.md` Step 1 ("On ambiguity, surface N interpretations and ask") | Same gap — no gate; step 1-1 breakdown may begin in the same turn. |
 | Worker-side "do not guess past a boundary" | **YES** | `docs/sawp.md` HOLD protocol + `CONTEXT.md` **HOLD inject** | Convention. Structure arrived only 2026-07-26 via the HITL Gate. |
@@ -78,8 +85,18 @@ the gate safe standalone by recovering the high-value loss class from disk. The 
 ## §2 Decision
 
 Add **one skill — `ambiguity-gate`** — carrying a decidable ambiguity test and a two-branch
-response, made normative by **`docs/rules.md` Rule 37** and surfaced by one **AGENTS.md checklist
-row**. No new script, no daemon, no dependency.
+response, made normative by **`docs/rules.md` Rule 37**, carried to every session by a short
+**`tooling/instructions/common.md`** clause, and surfaced by one **AGENTS.md checklist row**. No
+new script, no daemon, no dependency.
+
+**FLOOR INVARIANT.** *The rule is the artifact; the skill is its operational aid.* Any statement of
+this gate that only works when the skill is installed is a defect. The floor has a specific
+address, established in r2: **`tooling/instructions/common.md`** — the layer `resolveInstructions()`
+composes into **every** session, every role, every CLI (ADR-MF §4.4). This matters because the
+existing multi-interpretation principle sits in the *orchestrator* role layer and reaches no worker
+(§1.2), and because codex sessions receive no devkit skills at all today (§2.4). `docs/rules.md`
+Rule 37 is the full normative text; the `common.md` clause is the reaching mechanism. Neither
+depends on `ambiguity-gate` existing.
 
 **Thesis.** The branch variable is not the session's role. It is **whether a human is watching the
 surface on which the question would appear.** Plan mode is a blocking modal: on a watched surface
@@ -113,12 +130,26 @@ closed exclusion list does not.
 | **A2** | **Scope** | The change boundary has ≥2 defensible cut points (this call site / this module / every caller) |
 | **A3** | **Deliverable** | You cannot name the exact file(s) or artifact(s) that will exist when it is done |
 | **A4** | **Success criteria** | You cannot state one checkable pass/fail condition |
-| **A5** | **Unbounded destructive op** | delete / overwrite / push / publish / reset / kill without an explicit bound (which files, which remote, which sessions). **Fires alone, always** |
+| **A5** | **Destructive op: unbounded *or* irreversible** | delete / overwrite / force-push / reset / drop / publish / kill that **either** (i) lacks an explicit bound (which files, which remote, which sessions), **or** (ii) **irreversibly destroys work not recoverable from any remote or backup**, absent an explicit user acknowledgement of that loss. **Fires alone, always** |
 | **A6** | **Vague verb, no target** | improve / enhance / fix / refactor / 정리 / 개선 with no named file, function, or symbol |
 | **A7** | **Constraint conflict** | Proceeding requires choosing which standing rule, ADR, or constitutional article to violate |
 
 A6 is the oh-my-claudecode "Broad Request Detection" heuristic, cited rather than reinvented
 (Art.1 경량; the heuristic is sound, only its plugin coupling is unacceptable — §3.2).
+
+**A5's second limb is an r2 amendment, and the M2 trial is why** (§8). r1 encoded A5 as
+*unbounded* destruction, using "no bound" as a proxy for "dangerous". The blind trial exposed the
+proxy as wrong: both readers ruled **no-fire** on `reset feat/… to origin/main` — correctly, under
+r1's text, because the request names its bound exactly — while that command permanently destroys
+three unpushed commits. **A bound tells you what will be destroyed; it does not tell you whether
+the user knows it exists.** Nearly every serious destructive incident is *bounded*:
+`git reset --hard`, `push --force`, `rm -rf ./that-dir`, `DROP TABLE users`. An A5 that fires only
+on unboundedness would sleep through all of them.
+
+The residual question in that request is not "which branch" — reading answers that — but "does the
+user intend to lose those three commits?" Two readings, differing in **intent**, surfaced *by*
+reading the repo: exactly the §2.1 brake working as designed, then the gate firing. The fixture was
+right and the rule was wrong.
 
 **The write-two rule — what makes this reproducible.** A signal fires **only if you can write
 down the ≥2 competing readings verbatim.** Suspicion is not a signal. If you can produce two, you
@@ -130,8 +161,20 @@ interpretations *are* the first section of the plan, so detecting the ambiguity 
 plan are the same act — no extra work, and the plan cannot be vaguer than the detection.
 
 **The resolve-by-reading brake — what makes it survivable.** Cheap disambiguation comes **first**.
-If ~3 tool calls (a grep, a file read, a `tq-status`) resolve the referent, it was never ambiguous
-and the gate must not fire. Only **residual ambiguity that survives reading** triggers the gate.
+Only **residual ambiguity that survives reading** triggers the gate.
+
+The stopping condition is a criterion, not a budget (r2 — an effort count is not a test two readers
+can apply):
+
+> **Does the residual difference between the readings concern the user's *intent*, or the
+> repository's *facts*?** Facts are readable — keep reading. **Intent is not in the repo** — no
+> amount of further reading will settle it, and that is exactly when the gate fires.
+
+A targeted search (grep the named symbol, read the named file, `tq-status`) settles fact-shaped
+differences; roughly three such calls is the practical point past which a fact-shaped difference
+would already have resolved. That figure is **guidance for the judgment, not the threshold** — the
+decidable test is the intent-vs-facts distinction above, and a reader who reaches a different call
+count but the same intent-vs-facts verdict has applied the rule correctly.
 
 Without this brake, "무조건" degenerates into an interview before every task, users learn to
 approve without reading, and the gate becomes a tax that buys nothing. It is the single most
@@ -164,16 +207,39 @@ Signals considered and rejected:
 | `AIGENTRY_TARGET_CWD` | Works, but is a side effect of cwd decoupling, not a purpose-built discriminator. One signal is enough (Art.1). |
 | `TELEPTY_SESSION_ID` | Present for the orchestrator too — does not discriminate. |
 
-**Default when unset ⇒ interactive.** Deliberately fail-open, and the asymmetry is the reason:
+**Protocol boundary — the worker never calls `bin/hitl.sh`.** The worker's whole obligation is the
+HOLD inject; the orchestrator opens the gate **on receipt**, per
+`docs/adr/2026-07-26-hitl-gate-primitive.md:156-168` producer (c) — line range independently
+verified by reviewer 1, which also confirmed `awaiting_user` blocking behaviour by running
+`tests/dispatch/T62_hitl_blocking_status.sh` (PASS):
+*"The `HOLD:` inject already lands in the orchestrator's conversation — that is the reachable path,
+and the orchestrator is already its only reader. On receiving a HOLD the orchestrator runs
+`hitl.sh open …`"*. (That ADR also records why the alternative producer is unavailable:
+`inject-handler.sh`'s `hold` arm *"has no caller"* and is deferred to Phase 2.) Stated explicitly
+because it is load-bearing twice — it is the correct protocol, **and** a worker invoking
+`bin/hitl.sh` by path would flip this skill's SSOT to the orchestrator repo under the §2.4
+tiebreak.
 
-- A false *worker* verdict on the orchestrator silently removes the user's own gate — reintroducing
-  exactly the failure the directive exists to eliminate, invisibly.
-- A false *interactive* verdict on a worker produces a plan-mode stall on an unwatched screen —
-  bad, but **already instrumented**: `dispatch-tracker.sh check` classifies it and AUTO_REPORTs or
-  re-dispatches within the 30-minute window.
+**Default when unset ⇒ interactive.** Fail-open — and the reason is *which population the default's
+error lands on*, not how loudly it fails (r2 correction; the earlier framing argued from an env-leak
+scenario that the default cannot produce — see §7.4, which is right and unchanged):
 
-A public devkit user running `claude` directly has no env var and *is* interactive. The default is
-correct for them by construction.
+| Default | Who has the var unset | Error population |
+|---|---|---|
+| **unset ⇒ interactive** (chosen) | the orchestrator; any human-driven CLI; every public devkit user running `claude` directly — **all genuinely interactive** | only a worker whose launcher env failed to propagate — **a regression, not a population** |
+| unset ⇒ worker | same set | **every human user, by construction** — each one's gate replaced by a HOLD inject to an orchestrator that, for a public user, does not exist |
+
+The chosen default is wrong only when something else is already broken. The inverse is wrong for
+the entire population it was meant to serve. That asymmetry — not fault visibility — is the
+argument.
+
+The residual error is bounded but **only partly instrumented** (reviewer 1 N3 — r1 overclaimed
+here): a worker wrongly judged interactive stalls in plan mode on an unwatched screen. It is caught
+within the 30-minute window **only if that session is registered in `state/dispatch/active.json`**,
+and even then it is caught as a *generic* stall — neither `SessionProbe` nor `dispatch-tracker.sh`
+has a plan-mode classifier, so the diagnosis will not name the cause. An unregistered session
+(spawned outside `bin/dispatch.sh`) is not caught at all. The direction of the asymmetry is
+unchanged; the safety net under it is thinner than r1 claimed (§7.4).
 
 ### §2.3 Context-preservation contract (Track 2)
 
@@ -181,8 +247,9 @@ The skill's plan-mode steps **mandate** a shared-ref sweep. Three points: **entr
 **each user-turn boundary** during a multi-turn interview, and **exit before acting** on the
 approved plan.
 
-**The proposed command does not work here.** The dispatch specifies
-`find ~/.telepty/shared -name '*.md' -newermt <entry time>`. Verified on this machine:
+**The proposed command is non-portable, and observed failing in at least one environment.** The
+dispatch specifies `find ~/.telepty/shared -name '*.md' -newermt <entry time>`. In this architect
+session it fails:
 
 ```
 $ find ~/.telepty/shared -name '*.md' -newermt '-10 minutes'
@@ -190,27 +257,76 @@ bfs: error: ... -newermt "-10 minutes"
 bfs: error: Invalid timestamp.
 ```
 
-`find` resolves to `bfs`, which rejects relative `-newermt` arguments; `-newermt` is in any case a
-GNU/BSD extension, not POSIX — **a Rule 26 (Cross-OS Abstraction Mandate) and Art.2 violation** in
-a command that ships to every user.
+**r1 overstated this and r2 corrects it** (reviewer 1 N1 — codex could not reproduce it; `/usr/bin/
+find` accepted `-newermt` in its environment). The claim "on this machine `find` resolves to `bfs`"
+was wrong. The actual mechanism, found while checking the rebuttal: `find` here is a **shell
+function defined in the Claude Code shell snapshot**
+(`~/.claude/shell-snapshots/snapshot-zsh-*.sh`) that routes to `bfs`; the host's `/usr/bin/find` is
+BSD find and accepts `-newermt` normally. Both reviewer environments were reporting their own
+`find` accurately.
+
+**The decision is unchanged, and the corrected mechanism argues for it more strongly.** `-newermt`
+is a GNU/BSD extension, not POSIX — a **Rule 26 (Cross-OS Abstraction Mandate) / Art.2** hazard in
+a command that ships to every user. And the agent executing a skill may have `find` shimmed to an
+implementation it cannot observe and did not choose: a skill that ships `-newermt` bets on an
+implementation nobody has verified at the point of use. POSIX `-newer` removes the bet.
 
 **Replacement — marker file + POSIX `-newer`** (verified working under `bfs` on this machine):
 
 ```sh
-# entry — one 0-byte marker
+# entry — unique marker; the skill records $MARKER and carries the literal path for this plan
 mkdir -p "$HOME/.aigentry/plan-mode"
-: > "$HOME/.aigentry/plan-mode/${TELEPTY_SESSION_ID:-local}.entry"
+find "$HOME/.aigentry/plan-mode" -name 'entry.*' -mtime +1 -exec rm -f {} +   # reap orphans
+MARKER=$(mktemp "$HOME/.aigentry/plan-mode/entry.XXXXXX")
 
-# turn boundary + exit — sweep, read anything new BEFORE acting
-[ -d "$HOME/.telepty/shared" ] && find "$HOME/.telepty/shared" -name '*.md' \
-  -newer "$HOME/.aigentry/plan-mode/${TELEPTY_SESSION_ID:-local}.entry" 2>/dev/null
+# turn boundary + exit — sweep BEFORE acting. A lost window must be loud, never swallowed.
+if [ -f "$MARKER" ] && [ -d "$HOME/.telepty/shared" ]; then
+  find "$HOME/.telepty/shared" -name '*.md' -newer "$MARKER"
+else
+  echo "SWEEP-WINDOW-LOST"
+fi
 
-# exit — remove marker (no GC needed: the file that creates it also removes it)
-rm -f "$HOME/.aigentry/plan-mode/${TELEPTY_SESSION_ID:-local}.entry"
+# exit — after the sweep, after acting
+rm -f "$MARKER"
 ```
 
-`-newer FILE` is POSIX and universal. The marker is 0 bytes, self-cleaning, and doubles as an
-observable "in plan mode" flag for any future probe.
+All four commands executed successfully in this session's environment (r2). `-newer FILE`,
+`-mtime`, and `-exec … {} +` are POSIX and `mktemp` is universal — which is the actual warrant;
+the local run is corroboration, not the basis (N1).
+
+**Inherent race — named, not solved (reviewer 1 N4).** The exit sweep closes the window it can
+see. A ref written *after* the final sweep starts but *before* the first state-mutating action is
+still missed. No sweep-side fix closes this: it is a transport-delivery problem, and **#760 is the
+full fix**. Consequences: M4 (§8) is scoped to "ref-carrying injects **present at sweep time**",
+and the skill places the exit sweep as late as possible — immediately before the first mutation,
+not at plan approval.
+
+**Three r2 corrections, all from reviewer 2:**
+
+1. **No shared marker name.** `${TELEPTY_SESSION_ID:-local}` collided across concurrent local
+   interactive sessions — two plain `claude` windows both resolve to `local`, and the second
+   session's marker re-stamps the first's, silently shortening its sweep window. `mktemp` +
+   carrying the returned path removes the naming scheme rather than fixing it: there is no name to
+   collide, and entry/exit are the same conversation, so the agent already holds the path. Cost:
+   orphan markers if a session dies mid-plan, handled by the one-line POSIX reap.
+2. **Missing marker fails loud.** `find … -newer <deleted>` exits non-zero and, under `set -e`,
+   aborts the block mid-flow. The guard is not there to make the error quiet — a silently skipped
+   sweep is precisely how #743 happened. `SWEEP-WINDOW-LOST` must be stated in the plan and the
+   prior injects treated as unverified.
+3. **The global sweep is a candidate list, not context to ingest.** `~/.telepty/shared` is shared
+   across all sessions, so a sweep sees refs addressed elsewhere. Demonstrated live while writing
+   this revision: the first test sweep returned exactly one hit — **this session's own outbound
+   report ref**. Hence a mandatory triage step: *discard refs this session authored* (their paths
+   were printed by `telepty inject`), then read only what is addressed here.
+
+**Why not per-session scoping, as the reviewer proposed?** It is not implementable from the
+filesystem today: `~/.telepty/shared` is **content-addressed** (sha256 filenames) and carries **no
+addressee metadata**, so no filter short of reading each file can tell recipient from sender. The
+global sweep plus triage is therefore the honest maximum at this layer; the structural gap is a
+telepty-side capability question, recorded as **§9 Q6** and plausibly folded into #760's design
+rather than papered over here. For the orchestrator — the interactive session #743 is actually
+about — the global sweep is also *mostly correct by construction*, since nearly all REPORT traffic
+in that directory is addressed to it.
 
 **Honest coverage limit.** The sweep recovers **ref-carrying** injects only (`shared/*.md`).
 Inline injects (`telepty inject "<text>"` with no `--ref`) leave no file and are **not**
@@ -228,6 +344,18 @@ reads an env var; the gate uses harness tools; the sweep uses POSIX `find`; the 
 a `telepty inject` (telepty's public CLI). The HITL Gate is opened by the **orchestrator** on
 receipt of the HOLD (ADR 2026-07-26-hitl-gate-primitive producer (c)) — already its job, not the
 skill's. No `bin/` path invocation ⇒ **devkit**.
+
+**Rebuttal (r2) — "a Claude-only skill in devkit breaks the routing rule."** It does not, because
+CLI reach is not what the rule tests. `docs/adr/2026-07-26-skill-ownership-routing.md:189-193`
+states the principle as *"Skill ownership routes by **coupling**, never by location or
+convenience"*, and the tiebreak there is one question about `bin/` invocation — the same line range
+reviewer 1 cited when independently checking this ADR against its sibling and finding them
+consistent. Reach appears in that ADR only as a **descriptive** per-CLI table, and its r3
+revision narrowed the whole decision to *"Claude Code skill distribution"* — so a Claude-reaching
+skill in devkit is the documented normal case, not an exception. Routing this skill *out* of devkit
+would require it to invoke orchestrator `bin/` by path, which §2.2 shows the protocol forbids. The
+reviewer's underlying concern — that reach is genuinely incomplete — is real, and is answered by
+the §2 FLOOR INVARIANT and point 3 below, not by moving the skill.
 
 **Name: `ambiguity-gate`.** Kebab-case; no collision with any of the 23 installed skills; parallel
 to the established `deliberation-gate` (a `-gate` skill = an automatic checkpoint inserted into a
@@ -273,11 +401,21 @@ Two facts shrink the §17.4 exposure, and one keeps it real:
 1. The **worker branch needs no plan mode at all** — HOLD inject is already CLI-agnostic. That is
    the majority of sessions in this ecosystem.
 2. The orchestrator — the only routinely interactive session here — is Claude.
-3. But devkit ships to the public, where an interactive codex/gemini session is ordinary. And
-   today devkit's installer writes `~/.claude/skills/` only; codex reads `$CODEX_HOME/skills/`
-   (ADR 2026-07-26 §2 per-CLI reach table, §9 Q5). **For those sessions the skill is not installed
-   at all** — which is precisely why Rule 37 in `docs/rules.md` is the normative text and the skill
-   is only its operational aid. The rule must be legible and complete without the skill.
+3. **The dead-letter case is real and larger than r1 said.** devkit ships to the public, where an
+   interactive codex/gemini session is ordinary, and devkit's installer writes `~/.claude/skills/`
+   only — codex reads `$CODEX_HOME/skills/` (ADR 2026-07-26 §2 per-CLI reach table, §9 Q5). **For
+   those sessions the skill is not installed at all.** Pressed on this in review, r2 found the
+   deeper half: the *existing* multi-interpretation principle is composed only into
+   `tooling/instructions/roles/orchestrator.md:119-120`, so **no worker session of any role or CLI
+   receives it either** — and `tooling/instructions/common.md`, the 43-line layer that does reach
+   every session, contains nothing about ambiguity. Today the gate would be a dead letter for
+   *every* non-orchestrator session, skill or no skill.
+
+   This is why the §2 **FLOOR INVARIANT** names `common.md` as the floor's address, and why coder B
+   (§11) edits it. Concretely: a codex worker gets the gate from `common.md`, not from a skill it
+   will never receive; Rule 37 supplies the full text; the skill supplies convenience for the
+   sessions that can load it. The rule must be legible and complete without the skill — now with a
+   delivery path, not just an assertion.
 
 ### §2.5 Rule 37 — normative text (draft for coder B)
 
@@ -298,8 +436,11 @@ Next free number verified: `docs/rules.md` currently ends at Rule 36 (line 583).
    읽기가 먼저다.
 2. **두 개를 쓸 수 있을 때만 발동** — 경쟁하는 해석 ≥2개를 그대로 적어낼 수 있어야 신호가 선다.
    의심만으로는 발동하지 않는다. 반대로 두 개를 적었으면 조용히 하나를 고르는 것은 금지다.
-3. **신호** — 대상 / 범위 / 산출물 / 성공기준 중 하나라도 ≥2해석이면, 또는 범위 없는 파괴적 작업,
-   또는 대상 없는 모호 동사, 또는 기존 규칙·ADR과의 충돌.
+3. **신호** — 대상 / 범위 / 산출물 / 성공기준 중 하나라도 ≥2해석이면, 또는 대상 없는 모호 동사,
+   또는 기존 규칙·ADR과의 충돌, 또는 **파괴적 작업이 (i) 범위가 없거나 (ii) 원격·백업 어디서도
+   복구 불가능한 작업물을 되돌릴 수 없게 파괴하는 경우** — 후자는 범위가 명시돼 있어도 발동한다
+   (사용자가 그 손실을 명시적으로 인지·수용한 경우만 예외). `git reset --hard`, `push --force`처럼
+   *범위가 분명한* 파괴가 실제 사고의 대부분이다.
 4. **분기는 화면을 보는 사람이 있느냐로 정한다** — interactive 세션은 plan mode 진입(해석을 plan §1에
    기재, 승인 전 상태 변경 금지). dispatched worker(`AIGENTRY_WORKER_SESSION=1`)는 **plan mode 진입
    금지** — 같은 내용을 HOLD inject로 오케스트레이터에 올린다(승인 UI를 아무도 보지 않으므로).
@@ -344,11 +485,14 @@ table verbatim:
 - **Description**: `docs/rules.md` Rule 37 + AGENTS.md row. No skill, no devkit change.
 - **Pros**: zero distribution cost; reaches every CLI equally; nothing to install or version.
 - **Cons**: the user explicitly asked for a skill ("이것도 스킬로 만들어줘"). `docs/rules.md` lives
-  in the orchestrator repo and does **not** reach worker sessions — they boot with composed role
-  instructions, not the full rules file. And a rule cannot carry the operational steps (detection,
-  sweep commands, routing table).
-- **탈락 이유**: fails the directive and has no reach into the sessions that most need the worker
-  branch. Retained as the *floor*: Rule 37 is written to be binding with the skill absent (§2.4).
+  in the orchestrator repo and is **not** itself composed into worker sessions — they boot with
+  `common.md` + a role layer, not the full rules file (r2: the reaching layer has a name and an
+  address, §2 FLOOR INVARIANT). And a rule cannot carry the operational steps (detection, sweep
+  commands, routing table).
+- **탈락 이유**: fails the directive and, alone, carries no operational content. **But its core is
+  retained, not discarded**: r2 promotes exactly the part that works — a short `common.md` clause —
+  into the chosen design as the floor. Alternative A is rejected as a *complete* answer while being
+  adopted as the *base layer* of one.
 
 ### §3.2 Alternative B — Hook-enforced (UserPromptSubmit hook forces plan mode)
 
@@ -423,14 +567,17 @@ today's 응답원칙 §4 prose. Nothing else breaks. That is the correct blast r
 
 ### Q4: 모든 크로스 환경에서 동작하는가? (제2조, 제14조)
 
-**PASS — with a stated limitation.** Plan mode is Claude-Code-only. Three mitigations: (i) the
+**PASS — with a stated limitation.** Plan mode is Claude-Code-only. Four mitigations: (i) the
 worker branch — most sessions — needs no plan mode; HOLD inject is CLI-agnostic; (ii) §17.4
 `written-plan-hold` fallback for interactive codex/gemini, declared in frontmatter; (iii) the sweep
-is POSIX, and this ADR **fixes** a non-POSIX command the brief proposed (`-newermt`, §2.3) that
-would have shipped a Rule 26 violation to every user.
-Residual, carried honestly: codex sessions do not receive devkit skills at all today (ADR
-2026-07-26 §9 Q5) — for them Rule 37's text is the reaching mechanism, not the skill. Not a FAIL:
-the fallback exists, is written, and no core function is blocked.
+is POSIX, replacing a non-POSIX command the brief proposed (`-newermt`, §2.3) that would have
+carried a Rule 26 hazard to every user; (iv) **r2 — the reach gap now has a concrete remedy, not
+just an acknowledgement**: the `tooling/instructions/common.md` clause (§2 FLOOR INVARIANT) is
+composed into every session of every role and CLI, so a codex worker receives the gate even though
+it receives no devkit skill (ADR 2026-07-26 §9 Q5) and never loads `docs/rules.md`.
+Residual, carried honestly: an interactive codex/gemini session still gets the weaker written
+fallback rather than a harness-enforced modal, because no such primitive exists there. Not a FAIL:
+the fallback is written, the floor reaches every session, and no core function is blocked.
 
 ### Q5: 사용자에게 "어떻게"를 강요하지 않는가?
 
@@ -455,7 +602,27 @@ skill leaves every component working), 제13조, 제15조 (§11 registers the ne
 | 크로스 플랫폼 호환 | 3 | 5 | 1 | 3 | 5 | 4 |
 | 지시 충족도 (스킬 + 무조건) | 4 | 1 | 4 | 3 | 2 | 5 |
 | 가역성 | 2 | 5 | 3 | 4 | 2 | 5 |
-| **Total (weighted)** | | **65** | **31** | **48** | **51** | **80** |
+| **Total (weighted)** | | **71** | **37** | **55** | **57** | **87** |
+
+**Derivations** (r2 — every r1 total was wrong; scores unchanged, only the sums). Weight sum = 19,
+so the ceiling is 19 × 5 = **95**:
+
+| Option | Weighted terms | Total | r1 published | Δ |
+|---|---|:-:|:-:|:-:|
+| **A** rule-only | 2·5 + 3·4 + 5·4 + 3·5 + 4·1 + 2·5 = 10+12+20+15+4+10 | **71** | 65 | +6 |
+| **B** hook | 2·2 + 3·1 + 5·1 + 3·1 + 4·4 + 2·3 = 4+3+5+3+16+6 | **37** | 31 | +6 |
+| **C** always-plan | 2·4 + 3·1 + 5·3 + 3·3 + 4·3 + 2·4 = 8+3+15+9+12+8 | **55** | 48 | +7 |
+| **D** uniform HITL | 2·3 + 3·3 + 5·3 + 3·5 + 4·2 + 2·2 = 6+9+15+15+8+4 | **57** | 51 | +6 |
+| **Chosen** | 2·4 + 3·4 + 5·5 + 3·4 + 4·5 + 2·5 = 8+12+25+12+20+10 | **87** | 80 | +7 |
+
+Ranking is unchanged (Chosen ≫ A > D > C > B) — **luck, not exculpation**: five independent sums
+were each understated by 6–7, and nothing in the r1 presentation would have revealed it. The
+reviewer's meta-point is accepted: this is the same failure class as skill-ownership r1, so the
+structural fix is to make the arithmetic *checkable at a glance* rather than to promise more care.
+Publishing per-cell terms plus the 95-point ceiling does that. **The durable fix belongs in
+`~/projects/aigentry-architect/references/adr-template.md`** — add "§5 must publish weighted
+derivations and the ceiling" to the template — which is outside this round's edit scope (ADR-only)
+and is flagged for the orchestrator as a separate one-line task.
 
 Chosen loses points only on cross-platform (plan mode is Claude-only, §4 Q4) and implementation
 complexity (a two-branch predicate is more than a rule sentence). It wins where it must: Art.1/17
@@ -469,6 +636,8 @@ table is untouched — no operational issue becomes a plan-mode question.
 | Existing consumer | Change needed |
 |---|---|
 | `AGENTS.md` 응답원칙 §4 (다중 해석 surface) | **None — text unchanged.** §4 still says what to do; Rule 37 upgrades the *container*: the N interpretations are now presented inside a plan awaiting approval rather than as free prose in an acting turn. The procedure is absorbed as a step inside plan mode, not rewritten. |
+| `tooling/instructions/roles/orchestrator.md:119-120` (composed 응답원칙 §4) | **None — unchanged.** It remains correct for the orchestrator; it was simply never the floor (§1.2). |
+| `tooling/instructions/common.md` (43 lines; reaches every session/role/CLI) | **Additive — one short clause** (the FLOOR INVARIANT's address, §2). This is the only way a codex/gemini worker ever receives the gate. Verified safe: `tests/migration/claude-md-migration.test.ts` reads the real file but asserts **structure only** — layer count, digest determinism, absence of leak markers — with **no pinned digest and no content assertion**, and `tests/session/digest-reproducibility.test.ts` uses synthetic fixtures. Coder B re-runs both. |
 | `docs/rules.md` Rule 30 "Spec 모호 시 multi-interpretation surface" row | **None — row stays verbatim.** Rule 37 supplies its missing mechanism. One cross-reference line added under Rule 37, not inside Rule 30. |
 | `docs/rules.md` Rule 30 자율 처리 영역 table | **None. Explicit anti-regression statement**: sandbox prompts, trust modals, blank panels, stuck sessions, stale cleanup, AUTO_REPORT stay autonomous. Rule 37 fires on **task-shaped user requests**, never on operational conditions. |
 | `.agents/skills/orchestrate-turn/SKILL.md` Step 1 / 1-1 | **One line.** Step 1 gains: run the ambiguity test → if it fires, gate **before** 1-1 breakdown. `AskUserQuestion` remains the asking mechanism *inside* plan mode. Step-1 wording ("surface N interpretations and ask") already describes the content; only the gate is new. Repo-coupled skill ⇒ orchestrator repo owns this edit (tiebreak: it names `bin/` scripts throughout). |
@@ -496,15 +665,23 @@ table is untouched — no operational issue becomes a plan-mode question.
 - Every ambiguous task costs one approval round trip. Over-triggering is the failure mode (§4 Q5).
 - A third meaning for "Gate" in the domain language (§2.4) — `CONTEXT.md` must disambiguate three.
 - Cross-repo change: devkit `files[]` edit + version bump to reach anyone (ADR 2026-07-26 §7).
-- Interactive codex/gemini sessions get the weaker written fallback, and today do not receive the
-  skill at all.
+- Interactive codex/gemini sessions get the weaker written fallback (no harness modal exists there)
+  and receive no devkit skill today — they are reached only by the `common.md` floor clause, which
+  makes that clause load-bearing rather than decorative.
+- The exit sweep has an inherent, unclosable race (§2.3, reviewer 1 N4); full closure waits on #760.
+- A stalled worker in plan mode is caught only generically and only when registered (§7.4).
 - Rule 37 makes `docs/rules.md` longer — Rule 3 (MD 크기 관리) pressure, accepted: the rule is
   load-bearing and 크기 제한 explicitly yields to 컨텍스트 유실 금지.
 
 ### §7.3 Unknown risks
 
-- Whether the write-two rule genuinely produces inter-reader agreement is **unmeasured**. The
-  fixture set (§11 coder A) exists to find out, and M2 is its metric.
+- ~~Whether the write-two rule genuinely produces inter-reader agreement is unmeasured.~~
+  **Resolved: 10/10 inter-reader in r2, and 10/10 vs-expected on the amended re-run in r3
+  (§8.1, §8.2).** The residual risk narrowed rather than vanished: decidability now holds across
+  three reader families, and the one calibration defect the trial found (A5) is fixed and
+  re-verified. What remains unmeasured is behaviour on *adversarial* cases outside the 10-fixture
+  set — the fixtures were constructed, not harvested from real traffic. M1 over two weeks of live
+  turns is the next real evidence.
 - Whether ≥1 signal is the right threshold, or whether A1–A4 should require ≥2 (§9 Q1).
 - Whether an agent reliably distinguishes "residual after reading" from "resolvable by reading"
   under time pressure — the brake is a judgment, and judgments drift.
@@ -515,7 +692,7 @@ table is untouched — no operational issue becomes a plan-mode question.
 |---|---|
 | #760 never lands | Gate still works; Track 2 sweep recovers ref-carrying injects. Residue = inline acks. Degradation, not breakage — the graceful dependency §1.3 requires. |
 | `~/.telepty/shared` absent (fresh machine, telepty not installed) | `[ -d ]` guard ⇒ sweep is a no-op. Gate unaffected. |
-| `AIGENTRY_WORKER_SESSION` unset on a real worker (env regression) | Worker enters plan mode on an unwatched screen → stall → caught by `dispatch-tracker.sh check` within 30 min (classify → AUTO_REPORT / re-dispatch). Detectable, already instrumented, and the less harmful direction of the asymmetry (§2.2). |
+| `AIGENTRY_WORKER_SESSION` unset on a real worker (env regression) | Worker enters plan mode on an unwatched screen → stall. **Caught within 30 min only if registered in `state/dispatch/active.json`** (`dispatch-tracker.sh check` → AUTO_REPORT / re-dispatch), and then only as a *generic* stall — there is **no plan-mode classifier** in `SessionProbe` or the tracker, so the cause is not named. Unregistered sessions are not caught at all. Still the less harmful direction of the asymmetry (§2.2), but the net is thinner than r1 stated (r2, reviewer 1 N3). A plan-mode surface classifier is a plausible follow-up — deliberately **not** proposed here (scope). |
 | Env var leaks into the orchestrator | Orchestrator sends a HOLD inject to itself instead of gating. Loud, immediate, and visible in its own conversation — self-diagnosing. |
 | Skill absent (not installed / codex session) | Rule 37 remains binding; behavior degrades to `written-plan-hold`. This is why the rule is written to be complete standalone (§2.4). |
 | oh-my-claudecode absent | No effect — native plan mode, Art.17.2 honoured by construction. |
@@ -527,14 +704,74 @@ table is untouched — no operational issue becomes a plan-mode question.
 | # | Metric | Measurement | Success threshold | Rollback trigger |
 |:-:|---|---|---|---|
 | **M1** | **Over-trigger rate** | Over 2 weeks of orchestrator turns: gate firings ÷ task-shaped requests | ≤ 30%, and ≥ 80% of firings produce a user answer that *differs* from the agent's recommendation **or** materially narrows scope | > 50% firing, or > 40% of firings rubber-stamped ⇒ raise A1–A4 to ≥2 signals (§9 Q1) |
-| **M2** | **Inter-reader agreement** | 10-case fixture set (5 fire / 5 don't), run against two independent readers (fresh Claude session + codex) | ≥ 8/10 agreement on the verdict | < 7/10 ⇒ the test is not decidable; rewrite the firing tests before shipping the rule |
+| **M2** | **Inter-reader agreement** | 10-case fixture set (5 fire / 5 don't), run blind against two independent readers | ≥ 8/10 agreement on the verdict | < 7/10 ⇒ the test is not decidable; rewrite the firing tests before shipping the rule — **RUN TWICE, PASSED: v1 10/10, v2 10/10 + 10/10 vs-expected** (§8.1, §8.2) |
 | **M3** | **Worker branch correctness** | Count of dispatched workers observed in plan mode | **0** | any occurrence ⇒ detection bug; check `AIGENTRY_WORKER_SESSION` propagation |
-| **M4** | **Context recovery** | Injects landing in `~/.telepty/shared` during a plan-mode window that are read before the plan executes | 100% of ref-carrying injects | any missed ref ⇒ sweep not wired at the exit point |
+| **M4** | **Context recovery** | Ref-carrying injects in `~/.telepty/shared` **present at sweep time** that are read before the plan executes | 100% of refs present at sweep time | any ref present at sweep time but unread ⇒ sweep not wired at the exit point. **Refs arriving after the final sweep begins are out of scope** — an inherent race, not a defect of this design; #760 is its fix (§2.3, reviewer 1 N4) |
 | **M5** | **Autonomy non-regression** | Rule 30 operational escalations to the user (sandbox prompt / stuck session / blank panel) | **0** — unchanged from today | any increase ⇒ Rule 37 is firing on operational conditions; tighten Gate A |
 | **M6** | **Distribution** | `aigentry doctor --skills` (ADR 2026-07-26 step 7) after `npm i -g` + install on a second machine | `ambiguity-gate` present, digest matches devkit | absent ⇒ `files[]` entry shape wrong (`lib/skills-drift.js:18` regex) |
 
 M2 is the gate on shipping Rule 37 as HARD: if two readers cannot agree on the fixtures, the rule
 is not enforceable and must not be written as one.
+
+### §8.1 M2 result (r2) — PASS, with one calibration finding
+
+Blind evaluation, 2 independent readers (fresh Claude + codex) × 10 W1a fixtures:
+
+| Measure | Result | Reading |
+|---|:-:|---|
+| **Inter-reader agreement** | **10/10** | **The predicate is decidable.** Threshold was ≥8/10; this is the metric M2 exists to measure, and it passed outright. |
+| Agreement with expected verdict | 9/10, **both readers** | One divergence, **identical across readers** — therefore not reader variance. |
+
+The single divergence — fixture 01, `reset feat/… to origin/main` — is **calibration, not
+decidability**, and the distinction is the whole point: two independent readers applying the text
+to the same case reached the same answer, which is what "decidable" means. They simply reached an
+answer the fixture did not expect, because **r1's A5 was wrong** (§2.1).
+
+**Resolution: option (b) — A5 amended, fixture stands.** Option (a) (rewrite the request to be
+genuinely unbounded) was rejected: it would have discarded the most valuable case in the set to
+protect a defective rule. Bounded-but-irreversible destruction is not an edge case, it is the
+*typical* destructive incident, and a rule that sleeps through `git reset --hard` and
+`push --force` is not worth shipping. The convergent "miss" was the highest-value signal in the
+whole review cycle — it could only appear because the predicate was decidable enough for two
+readers to be wrong the same way.
+
+**Re-run obligation — DISCHARGED (r3).** See §8.2.
+
+### §8.2 M2 v2 (r3) — amended A5, gate cleared
+
+Blind re-run against the **amended** A5, 2 independent readers (fresh Claude + Gemini) × the same
+10 fixtures:
+
+| Measure | v1 (r2, original A5) | **v2 (r3, amended A5)** |
+|---|:-:|:-:|
+| Inter-reader agreement | 10/10 | **10/10** |
+| Agreement with expected verdict | 9/10 both readers | **10/10 both readers** |
+
+The v1 divergence was the sole outstanding calibration defect, and amending A5 closed it without
+disturbing any other verdict — the nine cases that already agreed still agree, so the amendment was
+correctly scoped and did not over-fire. Decidability held across a **third** reader family
+(v1 used Claude + codex, v2 Claude + Gemini), which is stronger evidence than a repeat with the
+same pair.
+
+**The Rule-37-HARD gate (§8 M2, §11) is therefore satisfied.** W1b may designate Rule 37 a HARD
+RULE; no further M2 round is a precondition for landing it.
+
+**Reviewer 1's earlier n=3 trial** (below) was a preview and is retained only as such — this blind
+2×10 run is the measurement.
+
+**M2 preview (r2, encouraging but not a substitute).** Reviewer 1 ran the §2.1 test unprompted on
+three constructed requests and reported **3/3 verdicts "felt forced"** — i.e. the test *compelled*
+the answer rather than leaving it to taste, which is exactly the property M2 measures:
+
+| Request | Verdict | What fired |
+|---|---|---|
+| "Fix the flaky dispatch tests." | **fires** | two readings survive reading (one known test vs. audit the suite); A6 also fires |
+| "In `bin/session-cleanup.sh`, update the `AIGENTRY_WORKER_SESSION` refusal message to mention Rule 28." | **does not fire** | target and boundary named; *"I could not produce two competing readings without inventing ambiguity"* — the write-two rule doing its job in the negative direction |
+| "Delete old session state." | **fires** | A5 alone (unbounded destructive) |
+
+Its own conclusion — *"reproducible enough for the ADR stage… the ADR correctly keeps M2 as the
+real acceptance gate"* — is adopted verbatim: n=3 by one reader is a preview, not the measurement.
+M2's 10-case, two-reader threshold stands unchanged.
 
 ## §9 Open Questions
 
@@ -554,6 +791,16 @@ is not enforceable and must not be written as one.
   `~/.aigentry/telemetry/` would match the spawn-telemetry precedent, but it is new state for a
   skill that otherwise has none. Recommendation: **manual count for the first two weeks**; add
   telemetry only if M1 proves hard to measure by hand. Art.1.
+- **Q6 (new, r2)** — **Can a sweep be scoped to one recipient?** Not today: `~/.telepty/shared` is
+  content-addressed (sha256 filenames) with **no addressee metadata**, so nothing short of reading
+  each file distinguishes recipient from sender (§2.3). This is a telepty-side capability question
+  — an addressee field, a per-recipient index, or delivery-confirmation state — and it overlaps
+  what **#760** must reason about anyway. Carried, not designed here. Until then the contract is
+  *global sweep + triage + discard self-authored refs*.
+- **Q7 (new, r2)** — Should `SessionProbe` gain a **plan-mode surface classifier**? Reviewer 1 N3
+  showed a stalled worker in plan mode is caught only generically, and only when registered. A
+  classifier would name the cause. Deliberately **not** proposed here: it is a telepty/probe change
+  outside this ADR's scope, and it is only worth building if M3 ever reports a non-zero count.
 
 ## §10 Related
 
@@ -580,22 +827,30 @@ genuine parallel wave, no worktree isolation needed:
 | Wave | Session | Repo | Files | Deliverable |
 |---|---|---|---|---|
 | **W1a** | coder A | `aigentry-devkit` | `skills/ambiguity-gate/SKILL.md` (new)<br>`skills/ambiguity-gate/tests/*.md` (new)<br>`package.json` (`files[]` += `"skills/ambiguity-gate/**"`) | The skill: §2.1 test, §2.2 branch + detection, §2.3 sweep, §2.4 frontmatter, §2.6 routing table. Plus the M2 fixture set — 10 cases (5 fire / 5 don't) in the existing devkit RED/GREEN scenario shape (`templates/skills/propose-next-task/tests/*.md`). |
-| **W1b** | coder B | `aigentry-orchestrator` | `docs/rules.md` (Rule 37)<br>`AGENTS.md` (one checklist row)<br>`.agents/skills/orchestrate-turn/SKILL.md` (Step 1, one line)<br>`CONTEXT.md` (glossary) | Rule 37 per §2.5 draft; checklist row in the Rule 36 codify pattern; step-1 gate line; `CONTEXT.md` entries for **Ambiguity Gate** + a three-way "Gate" disambiguation (spawn Gate / HITL Gate / Ambiguity Gate) — absorbing the HITL ADR's outstanding M5 obligation. |
+| **W1b** | coder B | `aigentry-orchestrator` | `docs/rules.md` (Rule 37)<br>**`tooling/instructions/common.md` (the floor clause)**<br>`AGENTS.md` (one checklist row)<br>`.agents/skills/orchestrate-turn/SKILL.md` (Step 1, one line)<br>`CONTEXT.md` (glossary) | Rule 37 per §2.5 draft; **the `common.md` clause carrying the FLOOR INVARIANT (§2) — the only artifact that reaches a codex/gemini worker, and the highest-priority item in this wave**; checklist row in the Rule 36 codify pattern; step-1 gate line; `CONTEXT.md` entries for **Ambiguity Gate** + a three-way "Gate" disambiguation (spawn Gate / HITL Gate / Ambiguity Gate) — absorbing the HITL ADR's outstanding M5 obligation. |
 
 **W1a ∥ W1b.** Different repos, no shared file, no data dependency.
 
-**Within W1b, sequential — recorded reason (b), intrinsic dependency:** the AGENTS.md row and the
-`CONTEXT.md` entry both quote Rule 37's text, so the rule must be written first or they drift.
-Splitting four coupled markdown files across worktree-isolated sessions to satisfy the letter of
-Rule 36 would cost more than it buys and would break that invariant — Rule 36 exception (b) applies
-and is recorded here.
+**Within W1b, sequential — recorded reason (b), intrinsic dependency:** the `common.md` clause, the
+AGENTS.md row, and the `CONTEXT.md` entry all restate or compress Rule 37's text, so the rule must
+be written first or they drift. Splitting five coupled markdown files across worktree-isolated
+sessions to satisfy the letter of Rule 36 would cost more than it buys and would break that
+invariant — Rule 36 exception (b) applies and is recorded here.
+
+**W1b verification step (r2):** after editing `common.md`, re-run
+`tests/migration/claude-md-migration.test.ts` and `tests/session/digest-reproducibility.test.ts`.
+Both were inspected this round — the former reads the real `common.md` but asserts structure only,
+the latter uses synthetic fixtures; **no pinned digest exists**, so an additive clause is safe. The
+re-run is confirmation, not a gamble.
 
 **Task registration (Rule 34):** each wave gets its own `state/task-queue.json` entry before
 dispatch; `bin/dispatch.sh --task <id>` enforces it.
 
-**Ordering constraint:** M2 (§8) runs on W1a's fixtures **before** Rule 37 lands as HARD in
-`docs/rules.md`. If two readers cannot agree ≥8/10, the firing tests are rewritten first. Coder B
-may write Rule 37 in parallel but the HARD designation waits on M2.
+**Ordering constraint — RELEASED (r3).** This gate required M2 to clear on W1a's fixtures before
+Rule 37 could land as HARD. It ran twice and cleared: v1 10/10 inter-reader, v2 (amended A5) 10/10
+inter-reader **and** 10/10 vs-expected (§8.1, §8.2). **W1b may designate Rule 37 a HARD RULE with
+no further precondition.** W1a still owns the fixture set as the regression artifact — fixture 01
+stands as written, and the amended A5 is the version under test.
 
 **Not in scope for either coder** (explicit, to prevent scope creep):
 - Track 1 (#760) — separate session `c760m`, telepty repo. Referenced only.
