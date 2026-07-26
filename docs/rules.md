@@ -579,3 +579,35 @@ Memory: `feedback_session_cleanup_protocol.md`.
 - Rule 27 (워크어라운드 금지) + Rule 32 (Permanent Fix Only): 무엇을(root cause 영구 fix) — Rule 35는 **언제**(재현·확인 후에만).
 - Rule 24 (SPEC FIRST): SPEC-first HOLD가 §2 "확인" 게이트의 실행 형태.
 - Imperative→Declarative (공통 가이드라인): 재현 = 실패 테스트, fix = pass 전환.
+
+## Rule 36. Mandatory Parallel Breakdown — 세션 주입 전 병렬 분해 의무 (HARD RULE)
+
+**어떤 dispatch든 주입 전에 작업 집합을 병렬 안전 단위로 분해하고, 기본값으로 다중 세션에 동시 주입한다.** 순차 실행은 예외이며 그 사유를 기록해야 한다. 발단: 2026-07-12. 사용자 지시: "세션에 주입할때 무조건적으로 병렬 작업으로 브레이크다운해서 세션에 주입하는걸로 진행해야돼."
+
+**Why:** Rule 9의 "브레이크다운 후 병렬 처리"와 memory의 parallel-first가 실무에서 *권장*으로 소비돼, 분해 없이 통짜 태스크를 1세션에 밀어넣는 순차 dispatch가 반복됐다. 오케스트레이션 루프는 async wall-clock이라 독립 작업의 순차 실행은 그대로 대기 시간으로 남는다. Rule 36은 그 권장을 **의무**로 격상한다 — 병렬이 default form이고, 순차는 사유를 남겨야 하는 예외다.
+
+#### Mandatory
+1. **분해 먼저** — dispatch 전에 작업 집합을 병렬 안전 단위(파일/모듈/산출물 경계)로 분해한다 (orchestrate-turn 1-1/1-2). 분해를 건너뛴 dispatch ref 작성 금지.
+2. **동시 주입이 default** — 분해된 단위는 한 wave에서 다중 세션에 동시 주입한다. "일단 1세션 보내고 보자"는 위반.
+3. **순차 허용은 2가지뿐** — (a) 같은 파일/같은 자원 충돌, (b) 본질적 데이터 의존(A의 출력 = B의 입력). 그 외 순차 dispatch 금지.
+4. **순차 결정은 사유 기록** — 순차를 택할 때마다 (a)/(b) 중 무엇인지 task note(`state/task-queue.json`) 또는 dispatch 로그에 남긴다. 미기록 순차 = 위반.
+
+#### What this rule rejects
+- 통짜 태스크를 분해 없이 1세션에 주입 ("한 세션이 다 하면 되지")
+- "같은 프로젝트니까 1세션" — 판단 단위는 프로젝트가 아니라 파일 (Rule 9/10)
+- 사유 없는 순차 wave — 왜 병렬이 아니었는지 사후 재구성 불가
+- 병렬 분해는 했으나 아래 Cross-references의 안전장치(worktree 격리 / 고유 `--track` / deliberation)를 빠뜨린 주입
+
+#### 예외
+- **더 쪼갤 경계가 없는 단일 파일·단일 산출물** 작업 (Rule 9의 "bin/aterm 커맨드 10개 = 1세션" 예시). 이 판단도 파일 단위로 한다.
+- **1라인 ack / send-key / broadcast** 같은 마이크로 상호작용 (dispatch 아님).
+- 이미 병렬로 분해된 wave 안의 후속 follow-up inject.
+
+#### Cross-references
+- Rule 9 (병렬 브레이크다운 필수) + Rule 10 (동일 파일 동시 수정 금지): 파일 단위 분리 판단 기준. Rule 36은 그 판단을 **매 dispatch 전 의무 게이트**로 승격하고 순차 사유 기록을 더한다.
+- Rule 6 (inject 전 사용자 확인): 병렬은 default **form**이고 fire는 여전히 user confirm 후 — "병렬로 OK?"가 아니라 "fire OK?"만 묻는다.
+- Rule 34 (Task-Based Execution): 분해된 각 단위를 개별 task로 등록해야 dispatch task-gate(`--task <id>`)를 통과한다.
+- 같은 repo 병렬 coder는 **worktree 격리** 필요 (공유 git index race) — memory `feedback_parallel_coders_same_repo_worktree.md`.
+- 병렬 dispatch는 **task-id 기반 고유 `--track`** 필수 (track 공유 시 shared-fate cascade-kill) — memory `feedback_telepty_duplicate_id_shared_fate.md`.
+- 병렬 세션 **≥3이면 deliberation MCP 경유** — AGENTS.md "병렬 위임 시 Deliberation 경유".
+- Memory: `~/.claude/projects/-Users-duckyoungkim-projects-aigentry-orchestrator/memory/feedback_mandatory_parallel_breakdown_dispatch.md`
