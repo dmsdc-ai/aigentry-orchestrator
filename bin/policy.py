@@ -158,7 +158,10 @@ def decide(status: str, state: dict[str, Any]) -> dict[str, str]:
     if surface in {"raw_shell", "crash"}:
         return action("REDISPATCH", f"{surface} means wrapped CLI exited or crashed", "re_dispatched")
     if surface == "error":
-        return action("ESCALATE", "API/transport error requires operator classification", "stuck_error")
+        # ADR 2026-07-26-hitl-gate-primitive §1: the one row that is a human decision, not an
+        # ambiguity default. Every other ESCALATE here stays log-only. Consumer arm lands in W2;
+        # until then session-reconciler.sh's `ESCALATE|*)` default treats it exactly as before.
+        return action("AWAIT_USER", "API/transport error requires operator classification", "stuck_error")
     if surface == "welcome" and status in ACTIVE_STATUSES:
         return action("REDISPATCH", "session is still at welcome/bootstrap prompt", "re_dispatched")
     if surface == "working" or activity == "moving":
