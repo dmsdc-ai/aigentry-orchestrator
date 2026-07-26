@@ -5,8 +5,9 @@ accepted_at: 2026-07-26
 scope: ecosystem
 decision_type: two-way
 tier: T2
-revision: r3
-previous_revision: 42e3481
+revision: r4
+previous_revision: fdcac10
+r4_basis: "One-line transcription sync flagged by W1a during the skill's r3-sync pass: the §2.4 frontmatter yaml quote's description still carried r1's 'unbounded destructive operation' while the amended A5 (§2.1, r2) reads unbounded-or-irreversible. The quoted skill frontmatter now matches the amended signal. Also records M2 v3 (shipped-skill-text re-run over the brake-amended Steps 1-3): decidability re-verified against the text that actually ships. Nothing else changed."
 acceptance_basis: "T2 threshold (2 reviewers) SATISFIED. Reviewer 1 (codex, r759c-adr-review) r1 **ACCEPT** — 0 blocking, 4 non-blocking (N1-N4), all folded into r2. Reviewer 2 (gemini-family) r1 **REQUEST_CHANGES** — 3 blocking + 3 claims → resolved in r2 → r2 **ACCEPT**, with the reviewer independently recomputing the §5 matrix and matching the published derivations (A 71 / B 37 / C 55 / D 57 / Chosen 87), and ruling both r2 rebuttals SOUND. Cumulative: 3 blocking + 4 non-blocking + 3 claims = ALL RESOLVED (4 accepted-and-fixed, 2 rebutted-with-citations and upheld). Decision content additionally gated on empirical evidence, not reviewer opinion alone: M2 v2 (§8.1) cleared the Rule-37-HARD threshold at 10/10 inter-reader AND 10/10 vs-expected. User approval of the decision content is the orchestrator's to record on commit."
 r3_basis: "Bookkeeping only. status proposed → accepted + accepted_at; review_state and the new acceptance_basis synced so frontmatter cannot contradict status; §8.1 records M2 v2 (amended-A5 re-run: 10/10 inter-reader AND 10/10 vs-expected, readers = fresh Claude + Gemini) and the satisfied Rule-37-HARD gate; three consequential in-document syncs so the ADR does not contradict itself — §8.1's 're-run obligation' marked discharged, §11's ordering constraint released (W1b may designate HARD), §7.3's 'until the amended re-run' clause closed. NO ruling, alternative, verdict, signal, score, metric, migration step, or scope boundary changed in r3."
 review_state: "T2 threshold = 2 reviewers — **SATISFIED**. | Reviewer 1 (codex, r759c-adr-review): r1 **ACCEPT**, 0 blocking, 4 non-blocking (N1 find/bfs evidence wording, N2 marker collision, N3 30-min catch overclaim, N4 exit-sweep race) — all 4 folded into r2. No re-review required. | Reviewer 2 (gemini-family): r1 **REQUEST_CHANGES**, 3 blocking + 3 claims → 4 accepted-and-fixed, 2 rebutted with line citations → r2 **ACCEPT**, all 3 blocking verified resolved, matrix independently recomputed and matching, both rebuttals ruled SOUND. | Cumulative: ALL findings resolved; 0 outstanding. Status flipped proposed → accepted at r3."
@@ -377,7 +378,7 @@ description: |
   enter plan mode with the competing interpretations written out; dispatched workers send a HOLD
   inject instead (plan-approval UI is on a screen nobody watches). Fires on task-shaped requests
   only. Use when a request has ≥2 plausible readings of target/scope/deliverable/success-criteria,
-  or implies an unbounded destructive operation.
+  or implies a destructive operation that is unbounded or irreversibly destroys unrecoverable work.
   Triggers: "ambiguous", "not sure what you mean", "plan mode", "which one", "모호", "애매",
   "플랜 모드", "뭘 말하는지", "범위가", "어디까지".
 version: 0.1.0
