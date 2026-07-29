@@ -12,6 +12,7 @@ t_run_tracker check >/dev/null
 t_assert_lifecycle sid-A delivery_attempt_started
 t_assert_outcome_unknown sid-A
 t_assert_observation sid-A screen_class_observed
+t_assert_observation sid-A deadline_extended
 got=$(t_v2 sid-A expected_report_by)
 if [ "$got" != "2026-05-12T12:15:00Z" ]; then
   echo "FAIL: expected_report_by = $got, want 2026-05-12T12:15:00Z" >&2; exit 1

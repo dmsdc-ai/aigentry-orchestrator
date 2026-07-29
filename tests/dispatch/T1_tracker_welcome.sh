@@ -12,6 +12,14 @@ cp "$HERE/fixtures/welcome.txt" "$STUB_SCREEN_FILE"
 t_run_tracker check >/dev/null
 t_assert_contains "$DISPATCH_STATE_DIR/alerts.log" "STUCK_WELCOME sid=sid-A"
 t_assert_observation sid-A welcome_surface_observed
+python3 - "$DISPATCH_STATE_DIR/active.json" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1], encoding="utf-8"))
+rec = [r for r in doc["dispatches"] if r["assigned"]["sid"] == "sid-A"][0]
+obs = [o for o in rec["observations"] if o["kind"] == "welcome_surface_observed"][0]
+assert obs.get("basis") == "screen_surface_classification", f"FAIL: basis={obs.get('basis')!r}"
+assert obs.get("actuation") == "redispatch_attempted", f"FAIL: actuation={obs.get('actuation')!r}"
+PY
 # Lifecycle moves stuck_welcome → re_dispatched when the cap is not yet hit.
 got=$(t_v2 sid-A lifecycle.state)
 case "$got" in stuck_welcome|re_dispatched) ;; *)

@@ -27,4 +27,38 @@ t_assert_observation sid-A worktree_activity_observed
 # The dispatch is NOT settled and is NOT taken out of the poll set.
 t_assert_outcome_unknown sid-A
 t_assert_lifecycle sid-A delivery_attempt_started
+
+# --- the scraped test result names what it scraped, and can actually see it ---
+# A3 (#810): the field measures "a runner summary on the visible screen", not
+# "what the commit contains". It was blind to BOTH runners this ecosystem uses,
+# so it reported the equivalent of "no tests" on three real test-carrying commits
+# in one day. Each form below must be matched, and no match must read as
+# `unmatched` rather than as a claim about the change.
+scrape() {
+  local screen="$1" want="$2"
+  t_init_v2
+  : > "$DISPATCH_STATE_DIR/observations.log"; : > "$DISPATCH_STATE_DIR/observations.seen"
+  printf '%s\n' "$screen" > "$STUB_SCREEN_FILE"
+  printf '\n\u276f\n' >> "$STUB_SCREEN_FILE"     # prompt, so the git arm is reached
+  t_seed_dispatch sid-S cwd="$T_TMP" transport.inject_id=uuid-1 \
+    expected_report_by="2026-05-12T11:30:00Z"
+  t_run_tracker check >/dev/null
+  local got
+  got=$(python3 -c '
+import json, sys
+rec = [r for r in json.load(open(sys.argv[1]))["dispatches"]
+       if r["assigned"]["sid"] == "sid-S"][0]
+obs = [o for o in rec["observations"] if o["kind"] == "worktree_activity_observed"]
+print(obs[0].get("test_result_scraped", "<missing>") if obs else "<no-snapshot>")
+' "$DISPATCH_STATE_DIR/active.json")
+  [ "$got" = "$want" ] || {
+    echo "FAIL: test_result_scraped=$got, want $want (screen: $screen)" >&2; exit 1; }
+}
+
+scrape 'passed: 68  failed: 0' 'passed: 68  failed: 0'   # tests/dispatch/run-all.sh
+scrape '# pass 68'             '# pass 68'               # node --test TAP
+scrape '# fail 0'              '# fail 0'                # node --test TAP
+scrape '9 passed, 0 failed'    '9 passed / 0 failed'     # vitest / jest
+scrape 'Implementation done.'  'unmatched'               # nothing to scrape
+
 echo "T8 PASS"

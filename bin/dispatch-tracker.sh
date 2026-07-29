@@ -164,8 +164,12 @@ cmd_check() {
     if [ "$hs" = "DISCONNECTED" ]; then
       printf '%s %s\n' "$(now_iso)" "DISCONNECTED $sid skip" >> "$DISCONNECTED_LOG"
       # Connectivity, not outcome: a session that went away has said nothing
-      # about whether the assigned work finished.
-      registry observe --sid "$sid" --kind session_disconnected_observed --now "$(now_iso)"
+      # about whether the assigned work finished. Every operational actuation
+      # below records WHAT it inferred and FROM WHAT, so a Stage-B author can see
+      # the inference instead of rediscovering it.
+      registry observe --sid "$sid" --kind session_disconnected_observed \
+        --field basis=telepty_list_health --field actuation=lifecycle_disconnected \
+        --now "$(now_iso)"
       registry set-lifecycle --sid "$sid" --state disconnected --now "$(now_iso)"
       continue
     fi
@@ -180,9 +184,10 @@ cmd_check() {
     # answer). It does NOT stop the operational branches — a disconnect, an error
     # surface or a stuck welcome screen still need actuating, and none of them
     # settles anything.
-    local evidence_blocked=0
+    local evidence_blocked=0 ledger=available
     if _poll_observations_and_hold "$sid" "$dispatch_id" "$inject_id"; then
       evidence_blocked=1
+      ledger=unavailable
     fi
     local screen state_json action_json class action status
     screen=$(read_screen "$sid" 60)
@@ -196,14 +201,21 @@ cmd_check() {
 
     if [ "$status" = "stuck_error" ]; then
       emit_alert "STUCK_ERROR sid=$sid"
-      registry observe --sid "$sid" --kind error_surface_observed --field "class=$class" --now "$(now_iso)"
+      registry observe --sid "$sid" --kind error_surface_observed --field "class=$class" \
+        --field basis=screen_surface_classification --field actuation=lifecycle_stuck_error \
+        --field "observation_ledger=$ledger" --now "$(now_iso)"
       registry set-lifecycle --sid "$sid" --state stuck_error --now "$(now_iso)"
     elif [ "$action" = "REDISPATCH" ] && [ "$status" = "stuck_welcome" ]; then
         emit_alert "STUCK_WELCOME sid=$sid"
-        registry observe --sid "$sid" --kind welcome_surface_observed --now "$(now_iso)"
+        registry observe --sid "$sid" --kind welcome_surface_observed \
+          --field basis=screen_surface_classification --field actuation=redispatch_attempted \
+          --field "observation_ledger=$ledger" --now "$(now_iso)"
         registry set-lifecycle --sid "$sid" --state stuck_welcome --now "$(now_iso)"
         _maybe_redispatch "$sid" "$cwd" "$ref_path" "$dispatched_at" "$rdc"
     elif [ "$class" = "active" ]; then
+      registry observe --sid "$sid" --kind deadline_extended \
+        --field basis=screen_surface_classification --field actuation=expected_report_by_plus_15m \
+        --field "observation_ledger=$ledger" --now "$(now_iso)"
       _bump_expected "$sid"
     elif [ "$evidence_blocked" -eq 0 ]; then
       _git_check_and_observe "$sid" "$cwd" "$ref_path" "$dispatched_at" "$screen" || true
@@ -369,11 +381,34 @@ _git_check_and_observe() {
   # #541 — ambiguous-attribution guard: when 2+ open dispatches share this sid's
   # (cwd, branch), skip the snapshot rather than crediting another session's commit.
   _shared_cwd_branch_ambiguous "$sid" "$cwd" && return 0
-  local head_sha files added removed test_signal now seen_key
-  test_signal=$(printf '%s' "$screen" | python3 -c '
-import sys,re
-m=re.findall(r"(\d+ passed|\d+ failed|\d+ FAIL|ok \d+ tests?)", sys.stdin.read())
-print(" / ".join(m) if m else "none")
+  local head_sha files added removed test_result now seen_key
+  # A3: this field must not claim more than it measured. It scrapes the VISIBLE
+  # SCREEN for a test-runner summary line — it does not know what the commit
+  # contains. The old name/value pair (`test_signal=none`) read as "this change
+  # ships no tests" and was false on three real commits in one day, because the
+  # pattern only matched the vitest/jest `N passed` shape while this ecosystem
+  # emits `passed: N  failed: N` (tests/dispatch/run-all.sh) and `# pass N` /
+  # `# fail N` (node --test TAP). No match is now `unmatched`, which is a
+  # statement about the scrape, not about the change. (#810)
+  test_result=$(printf '%s' "$screen" | python3 -c '
+import re, sys
+text = sys.stdin.read()
+PATTERNS = (
+    r"passed:\s*\d+\s+failed:\s*\d+",   # tests/dispatch/run-all.sh
+    r"#\s*(?:pass|fail)\s+\d+",           # node --test TAP summary
+    r"\d+\s+(?:passed|failed)",            # vitest / jest
+    r"\d+\s+FAIL",
+    r"ok\s+\d+\s+tests?",
+)
+# Most specific form first, and stop at the first that matches: the forms
+# overlap, so scanning them all reports one summary line three ways.
+for pattern in PATTERNS:
+    hits = re.findall(pattern, text, re.I)
+    if hits:
+        print(" / ".join(dict.fromkeys(hits)))
+        break
+else:
+    print("unmatched")
 ')
   now=$(now_iso)
   # #718 honest degradation: when the only resolvable git context is a mainline
@@ -390,7 +425,7 @@ print(" / ".join(m) if m else "none")
   read -r files added removed < <(_git_shortstat "$gdir" "$dispatched_at")
 
   local -a obs=(observe --sid "$sid" --kind worktree_activity_observed
-                --field review_required=true --field "test_signal=$test_signal"
+                --field review_required=true --field "test_result_scraped=$test_result"
                 --field "files_changed=$files" --field "loc_added=$added"
                 --field "loc_removed=$removed" --now "$now")
   if [ -n "$head_sha" ]; then
@@ -401,7 +436,7 @@ print(" / ".join(m) if m else "none")
   registry "${obs[@]}"
 
   SID="$sid" NOW="$now" SHA="$head_sha" FILES="$files" ADDED="$added" \
-    REMOVED="$removed" TS="$test_signal" python3 - >> "$OBSERVATIONS_LOG" <<'PY'
+    REMOVED="$removed" TS="$test_result" python3 - >> "$OBSERVATIONS_LOG" <<'PY'
 import json, os
 sha = os.environ.get("SHA") or None
 print(json.dumps({"kind": "WORKTREE_ACTIVITY", "sid": os.environ["SID"],
@@ -410,11 +445,11 @@ print(json.dumps({"kind": "WORKTREE_ACTIVITY", "sid": os.environ["SID"],
                   "files_changed": int(os.environ.get("FILES") or 0),
                   "loc_added": int(os.environ.get("ADDED") or 0),
                   "loc_removed": int(os.environ.get("REMOVED") or 0),
-                  "test_signal": os.environ.get("TS", ""),
+                  "test_result_scraped": os.environ.get("TS", ""),
                   "completion_fact": None, "review_required": True}))
 PY
   printf '%s\n' "$seen_key" >> "$OBSERVATIONS_SEEN"
-  local note="WORKTREE_ACTIVITY sid=$sid sha=${head_sha:-omitted} files=$files +$added/-$removed tests=$test_signal — evidence only, no completion fact, review required"
+  local note="WORKTREE_ACTIVITY sid=$sid sha=${head_sha:-omitted} files=$files +$added/-$removed test_result_scraped=$test_result — evidence only, no completion fact, review required"
   emit_alert "$note"
   if command -v "$TELEPTY" >/dev/null 2>&1; then
     "$TELEPTY" inject --from "$TRACKER_SID" "$ORCH_SID" "$note" >/dev/null 2>&1 || true

@@ -80,6 +80,30 @@ def state_dir() -> str:
     anything that is not a plain absolute path: a relative value would resolve
     against whatever directory the caller happened to be in, and a traversal
     segment would silently retarget the whole registry.
+
+    ACCEPTED SNYK FINDING — `python/PT` Path Traversal, Low, 5 occurrences
+    (2026-07-30, reviewed and accepted by the orchestrator).
+
+    Snyk taints this env var and follows it into `open()` and `os.replace()`.
+    The finding is accepted rather than fixed, for these reasons:
+
+      * every filename under this directory is a FIXED LITERAL — `active.json`,
+        `active.json.lock`, `registry-health.log`, `active.json.legacy-v1.bak`,
+        and the `.<pid>.tmp` sibling. No sid, dispatch_id, track, ref path or any
+        other record value is ever interpolated into a path;
+      * the value is orchestrator configuration, not request data. Anyone who can
+        set it on the orchestrator process already has code execution as that user;
+      * the normalisation below (absolute, no `..`, no NUL) is real hardening, but
+        Snyk's rule wants containment against a fixed allowed root, and this
+        component cannot have one: production uses `<repo>/state/dispatch` and
+        every test uses its own `mktemp -d`. An allow-list would be a functional
+        constraint invented to quiet a Low on operator configuration.
+
+    WHAT INVALIDATES THIS WAIVER: any future path built from a record field
+    (per-sid files, per-dispatch directories, an operator-supplied filename). At
+    that point the taint is genuine and this must be re-reviewed, not re-waived.
+    The one place a filesystem-derived name becomes a path — `op_archive_sidecars`
+    — is confined explicitly at its call site.
     """
     default = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            "state", "dispatch")
@@ -645,8 +669,21 @@ def op_archive_sidecars(args: dict) -> int:
         return OK
     dest = src + ".archived"
     os.makedirs(dest, exist_ok=True)
+    dest_root = os.path.realpath(dest)
     for name in os.listdir(src):
-        shutil.move(os.path.join(src, name), os.path.join(dest, name))
+        # This is the ONE place in this file where a name read off the filesystem
+        # becomes part of a path. Everything else joins a fixed literal. Confine
+        # it: a plain basename only, and a destination that provably stays inside
+        # the archive directory. Fails closed — an unexpected entry aborts the
+        # archival rather than being moved somewhere unexamined.
+        if name != os.path.basename(name) or name in (os.curdir, os.pardir):
+            raise RegistryError("registry_unavailable",
+                                f"refusing to archive a non-basename sidecar entry {name!r}")
+        target = os.path.join(dest, name)
+        if os.path.realpath(os.path.dirname(target)) != dest_root:
+            raise RegistryError("registry_unavailable",
+                                f"sidecar {name!r} resolves outside the archive directory")
+        shutil.move(os.path.join(src, name), target)
     os.rmdir(src)
     emit({"result": "archived", "dir": dest})
     return OK
