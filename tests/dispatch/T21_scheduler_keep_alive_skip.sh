@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# T21 — schedule MUST skip when active.json marks the sid keep_alive=true.
+# T21 — schedule MUST skip when the registry marks the sid keep_alive=true.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
@@ -9,16 +9,9 @@ REPO_ROOT="$(cd "$HERE/../.." && pwd -P)"
 SCHED="$REPO_ROOT/bin/dispatch-cleanup-scheduler.sh"
 pending="$DISPATCH_STATE_DIR/cleanup-pending.json"
 
-# Seed active.json with keep_alive=true for sid-KA.
-python3 - "$DISPATCH_STATE_DIR/active.json" <<'PY'
-import json,sys
-p=sys.argv[1]
-json.dump([{"sid":"sid-KA","status":"in_flight","keep_alive":True,
-            "ref_path":"/tmp/r","ref_hash":"x","dispatched_at":"2026-05-23T12:00:00Z",
-            "expected_report_by":"2026-05-23T12:30:00Z","last_seen_at":"2026-05-23T12:00:00Z",
-            "classification_history":[],"cwd":"","from_sid":"orchestrator","re_dispatch_count":0}],
-          open(p,"w"))
-PY
+# Seed a keep_alive dispatch for sid-KA.
+t_seed_dispatch sid-KA keep_alive=true dispatched_at="2026-05-23T12:00:00Z" \
+  expected_report_by="2026-05-23T12:30:00Z" last_seen_at="2026-05-23T12:00:00Z"
 
 export SCHEDULER_NOW="2026-05-23T12:10:00Z"
 out=$("$SCHED" schedule sid-KA --grace-seconds 60 2>&1)

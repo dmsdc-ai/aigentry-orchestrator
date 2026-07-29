@@ -6,11 +6,11 @@
 #   1) Layer D fire-due — invoke dispatch-cleanup-scheduler.sh tick. Any sid
 #      whose scheduled_cleanup_time has passed gets session-cleanup.sh.
 #
-#   2) Orphan sweep — compute GC root from state/dispatch/active.json
+#   2) Orphan sweep — compute GC root from the dispatch registry
 #      (sessions with an in-flight dispatch) ∪ {orchestrator} (PROTECTED).
 #      For every telepty session NOT in the root and not in PROTECTED:
 #        - age_since_spawn > 5min (anti-spawn-race floor)
-#        - keep_alive flag in active.json: skipped (preserves long-lived workers)
+#        - keep_alive flag on the dispatch record: skipped (preserves long-lived workers)
 #        - PID_dead OR
 #          (telepty.healthStatus == DISCONNECTED AND disconnect_age > 4min) OR
 #          workspace_host_orphan (wh_lookup empty AND telepty stale)
@@ -50,7 +50,7 @@ export HOME
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 STATE_DIR="${DISPATCH_STATE_DIR:-$REPO_DIR/state/dispatch}"
-ACTIVE_JSON="$STATE_DIR/active.json"
+DISPATCH_REGISTRY_PY="${DISPATCH_REGISTRY_PY:-$SCRIPT_DIR/dispatch-registry.py}"
 BACKOFF_JSON="$STATE_DIR/reconciler-backoff.json"
 RECONCILER_LOG="$STATE_DIR/reconciler.log"
 # cmux orphan-prune seen-twice ledger (SPEC §2.2). Exported so the workspace-host
@@ -167,57 +167,15 @@ print(cur if cur is not None else "")
 PY
 }
 
-registry_update_status() {
-  local sid="$1" status="$2" now
-  [ -n "$status" ] || return 0
-  now=$(now_iso)
-  ACTIVE_JSON="$ACTIVE_JSON" SID="$sid" ST="$status" NOW="$now" python3 - <<'PY'
-import fcntl, json, os
+# telepty#60 Stage A: the reconciler no longer opens the registry file. Every
+# access is a typed call to the one transactional component, and none of the
+# operations it may call can move the outcome axis.
+registry() { "$DISPATCH_REGISTRY_PY" "$@"; }
 
-path = os.environ["ACTIVE_JSON"]
-with open(path, "r+") as fh:
-    fcntl.flock(fh, fcntl.LOCK_EX)
-    try:
-        entries = json.load(fh)
-    except Exception:
-        entries = []
-    for entry in entries if isinstance(entries, list) else []:
-        if entry.get("sid") == os.environ["SID"]:
-            entry["status"] = os.environ["ST"]
-            entry["last_seen_at"] = os.environ["NOW"]
-    fh.seek(0)
-    fh.truncate()
-    json.dump(entries, fh, indent=2, ensure_ascii=False)
-    fh.write("\n")
-PY
-}
-
-registry_note_redispatch() {
-  local sid="$1" now
-  now=$(now_iso)
-  ACTIVE_JSON="$ACTIVE_JSON" SID="$sid" NOW="$now" python3 - <<'PY'
-import fcntl, json, os, datetime
-
-path = os.environ["ACTIVE_JSON"]
-now = os.environ["NOW"]
-with open(path, "r+") as fh:
-    fcntl.flock(fh, fcntl.LOCK_EX)
-    try:
-        entries = json.load(fh)
-    except Exception:
-        entries = []
-    for entry in entries if isinstance(entries, list) else []:
-        if entry.get("sid") == os.environ["SID"]:
-            entry["status"] = "re_dispatched"
-            entry["re_dispatch_count"] = int(entry.get("re_dispatch_count", 0)) + 1
-            entry["last_seen_at"] = now
-            dt = datetime.datetime.fromisoformat(now.replace("Z", "+00:00"))
-            entry["expected_report_by"] = (dt + datetime.timedelta(minutes=30)).isoformat(timespec="seconds").replace("+00:00", "Z")
-    fh.seek(0)
-    fh.truncate()
-    json.dump(entries, fh, indent=2, ensure_ascii=False)
-    fh.write("\n")
-PY
+registry_set_lifecycle() {
+  local sid="$1" state="$2"
+  [ -n "$state" ] || return 0
+  registry set-lifecycle --sid "$sid" --state "$state" --now "$(now_iso)" >/dev/null
 }
 
 emit_alert() {
@@ -289,15 +247,43 @@ maybe_redispatch() {
     emit_alert "REDISPATCH_FAILED sid=$sid ref_missing=$ref_path"
     return 0
   fi
-  emit_alert "REDISPATCH sid=$sid attempt=1 ref=$ref_path"
   # Rule 34 task-gate (#736): same as the tracker's path — a re-dispatch replays
   # an already-registered task, so it takes the audited exemption.
-  if "$DISPATCH_SH" --target "$sid" --ref "$ref_path" --verify-delivered \
-      --no-task "reconciler-redispatch $sid" >/dev/null 2>&1; then
-    registry_note_redispatch "$sid"
-  else
-    emit_alert "REDISPATCH_FAILED sid=$sid"
-  fi
+  #
+  # Only exit 0 means a new transport write happened. 8 (deduplicated) and 7
+  # (delivery unknown) are "no new delivery", and advancing the counter on either
+  # records an attempt that never occurred. The alert reports the outcome of the
+  # call rather than the intention to make it.
+  local rc=0
+  "$DISPATCH_SH" --target "$sid" --ref "$ref_path" --verify-delivered \
+    --no-task "reconciler-redispatch $sid" >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0)
+      registry set-lifecycle --sid "$sid" --state re_dispatched \
+        --bump-re-dispatch-count --extend-minutes 30 --now "$(now_iso)" >/dev/null
+      emit_alert "REDISPATCH_OK sid=$sid attempt=$((rdc + 1)) ref=$ref_path"
+      ;;
+    8)
+      registry observe --sid "$sid" --kind redispatch_suppressed_duplicate \
+        --field "ref_path=$ref_path" --now "$(now_iso)" >/dev/null
+      emit_alert "REDISPATCH_SUPPRESSED sid=$sid — identical ref already delivered; no new delivery"
+      # Without this the suppression would only ever repeat a HOLD: the counter
+      # never reaches the cap, so the one-shot operator gate below is unreachable.
+      hitl_open --source reconciler --subject-sid "$sid" --kind decision \
+        --resume registry-clear-redispatch \
+        --question "duplicate suppressed: $sid is already holding an identical delivered ref" \
+        --options "approve=re-dispatch once more,reject=hand back to the operator" \
+        --context-ref "$ref_path"
+      ;;
+    7)
+      registry observe --sid "$sid" --kind redispatch_held_delivery_unknown \
+        --field "ref_path=$ref_path" --now "$(now_iso)" >/dev/null
+      emit_alert "REDISPATCH_HELD sid=$sid — a prior attempt's delivery is unknown; not replayed"
+      ;;
+    *)
+      emit_alert "REDISPATCH_FAILED sid=$sid rc=$rc"
+      ;;
+  esac
 }
 
 apply_action() {
@@ -313,7 +299,7 @@ apply_action() {
       # caller's `set -euo pipefail` aborted the whole tick. An if-statement makes
       # "nothing to do" exit 0. (Pre-existing bug, distinct from cmux-adaptor scope.)
       if [ -n "$next_status" ] && [ "$next_status" != "$status" ]; then
-        registry_update_status "$sid" "$next_status"
+        registry_set_lifecycle "$sid" "$next_status"
       fi
       ;;
     RESUBMIT_ENTER|SEND_KEY)
@@ -327,7 +313,7 @@ apply_action() {
       # ADR 2026-07-26-hitl-gate-primitive producer (b): policy.py returns this for
       # surface=error only — the 3.3% of escalations whose own text asks for an
       # operator. The gate owns the status (awaiting_user, prev stashed for resume),
-      # so no registry_update_status here; the escalation line is still written so
+      # so no lifecycle write here; the escalation line is still written so
       # the audit trail is unchanged.
       hitl_open --source reconciler --subject-sid "$sid" --kind decision --resume none \
         --question "$sid: $(json_get "$action_json" reason)" \
@@ -336,7 +322,7 @@ apply_action() {
       emit_escalation "$sid" "$action_json"
       ;;
     RESPAWN)
-      registry_update_status "$sid" "${next_status:-respawn_requested}"
+      registry_set_lifecycle "$sid" "${next_status:-respawn_requested}"
       emit_alert "RESPAWN_REQUESTED sid=$sid — spawn metadata unavailable; escalated"
       emit_escalation "$sid" "$action_json"
       ;;
@@ -350,7 +336,7 @@ apply_action() {
       fi
       ;;
     ESCALATE|*)
-      [ -n "$next_status" ] && [ "$next_status" != "$status" ] && registry_update_status "$sid" "$next_status"
+      [ -n "$next_status" ] && [ "$next_status" != "$status" ] && registry_set_lifecycle "$sid" "$next_status"
       emit_escalation "$sid" "$action_json"
       ;;
   esac
@@ -358,29 +344,15 @@ apply_action() {
 
 run_registry_loop() {
   local act="$1" snap processed sid status ref_path rdc state_json action_json
-  [ -f "$ACTIVE_JSON" ] || { log "registry tick: no active registry"; return 0; }
   snap=$(mktemp)
-  ACTIVE_JSON="$ACTIVE_JSON" python3 - > "$snap" <<'PY'
-import json, os
-
-try:
-    entries = json.load(open(os.environ["ACTIVE_JSON"], encoding="utf-8"))
-except Exception:
-    entries = []
-LIVE = {"in_flight", "re_dispatched", "stuck_welcome"}
-for entry in entries if isinstance(entries, list) else []:
-    sid = entry.get("sid")
-    if sid and entry.get("status", "") in LIVE:
-        print("\t".join([
-            sid,
-            entry.get("status", ""),
-            entry.get("ref_path", ""),
-            str(entry.get("re_dispatch_count", 0)),
-        ]))
-PY
+  # Open dispatches that are not waiting on a human. A corrupt/unavailable
+  # registry fails the call, and errexit stops the tick before any actuation.
+  registry list --live --fields assigned.sid,lifecycle.state,ref_path,re_dispatch_count > "$snap"
   processed=0
   while IFS=$'\t' read -r sid status ref_path rdc; do
     [ -z "$sid" ] && continue
+    [ "$ref_path" = "null" ] && ref_path=""
+    [ "$rdc" = "null" ] && rdc=0
     state_json=$(probe_session "$sid")
     action_json=$(policy_decide "$status" "$state_json")
     append_shadow_record "$sid" "$status" "$state_json" "$action_json"
@@ -404,31 +376,14 @@ run_shadow_loop() {
 compute_gc_root() {
   local p
   for p in "${PROTECTED_SIDS[@]}"; do printf '%s\n' "$p"; done
-  if [ -f "$ACTIVE_JSON" ]; then
-    python3 -c '
-import json,sys
-try: entries = json.load(open(sys.argv[1]))
-except Exception: entries = []
-LIVE = {"in_flight","re_dispatched","auto_reported","disconnected","stuck_welcome","awaiting_user"}
-for e in entries:
-    if e.get("status") in LIVE:
-        sid = e.get("sid")
-        if sid: print(sid)
-' "$ACTIVE_JSON"
-  fi
+  # Everything the registry has not retired, INCLUDING gated dispatches: a
+  # session waiting on a human must never be swept out from under them.
+  registry list --not-retired --fields assigned.sid 2>/dev/null || true
 }
 
 # keep_alive_sids — print sids with keep_alive=true (also exempt from sweep).
 keep_alive_sids() {
-  [ -f "$ACTIVE_JSON" ] || return 0
-  python3 -c '
-import json,sys
-try: entries = json.load(open(sys.argv[1]))
-except Exception: entries = []
-for e in entries:
-    if e.get("keep_alive") is True and e.get("sid"):
-        print(e["sid"])
-' "$ACTIVE_JSON"
+  registry list --keep-alive --fields assigned.sid 2>/dev/null || true
 }
 
 # telepty_list_json — fail loudly on bad JSON (#400 lesson).
@@ -679,9 +634,9 @@ done <<< "$hitl_gates"
 # --- step 0: Dispatch Registry observe→decide→act loop ---
 run_registry_loop 1
 
-# --- step 0b: pull-AUTO_REPORT (#517) — the tracker scans in-flight dispatches
-# whose expected_report_by elapsed and emits AUTO_REPORT for any with new authored
-# commits. This is the orchestrator's pull-fallback for missed REPORT injects.
+# --- step 0b: tracker scan (#517) — the tracker polls every dispatch whose
+# expected_report_by elapsed and records what it measured. telepty#60 Stage A: it
+# emits HOLDs and evidence snapshots, never a completion.
 # Best-effort: a non-zero scan never blocks the sweep. Skipped under --dry-run
 # because `check` mutates state (auto-reports.seen / status) and injects to the
 # orchestrator — emission is act-only. Idempotency lives in the tracker.

@@ -14,7 +14,7 @@
     "info": "codex-connected.info",
     "status": "in_flight",
     "expect_state": {"surface": "working", "activity": "moving", "cli": "codex", "ready": true},
-    "expect_detail": {"ready_reason": "prompt", "tracker_class": "done"},
+    "expect_detail": {"ready_reason": "prompt", "tracker_class": "prompt_observed"},
     "expect_action": {"action": "NOOP", "status": "in_flight"}
   },
   {
@@ -68,7 +68,7 @@
     "info": "claude-connected.info",
     "status": "in_flight",
     "expect_state": {"surface": "idle", "activity": "static", "cli": "claude", "ready": true},
-    "expect_detail": {"tracker_class": "done"},
+    "expect_detail": {"tracker_class": "prompt_observed"},
     "expect_action": {"action": "NOOP", "status": "in_flight"}
   }
 ]

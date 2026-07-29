@@ -17,7 +17,7 @@
 #   dispatch-cleanup-scheduler.sh schedule <sid> [--grace-seconds N] [--source S] [--reason TEXT]
 #       Append a pending record. Default grace 60s. Default source layer-d-timeout.
 #       Idempotent on sid: replaces existing pending record for the same sid.
-#       Skips if active.json entry has keep_alive=true.
+#       Skips if the dispatch record has keep_alive=true.
 #
 #   dispatch-cleanup-scheduler.sh cancel <sid>
 #       Remove any pending record for sid. Used when EXTEND_LIFETIME arrives.
@@ -41,7 +41,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 STATE_DIR="${DISPATCH_STATE_DIR:-$REPO_DIR/state/dispatch}"
 PENDING_JSON="$STATE_DIR/cleanup-pending.json"
-ACTIVE_JSON="$STATE_DIR/active.json"
+DISPATCH_REGISTRY_PY="${DISPATCH_REGISTRY_PY:-$SCRIPT_DIR/dispatch-registry.py}"
 SESSION_CLEANUP_SH="${SESSION_CLEANUP_SH:-$SCRIPT_DIR/session-cleanup.sh}"
 NOW_OVERRIDE="${SCHEDULER_NOW:-}"
 
@@ -63,21 +63,17 @@ atomic_write_json() {
   mv "$tmp" "$path"
 }
 
+# is_keep_alive <sid> — 0 when the dispatch opted out of automatic cleanup.
+# telepty#60 Stage A: read through the schema-validating registry component and
+# fail CLOSED. A corrupt or unavailable registry used to read as "not keep-alive",
+# i.e. as permission to clean up a session it could not actually see.
 is_keep_alive() {
-  local sid="$1"
-  [ -f "$ACTIVE_JSON" ] || return 1
-  ACTIVE_JSON="$ACTIVE_JSON" SID="$sid" python3 - <<'PY' >/dev/null 2>&1
-import json, os, sys
-try:
-    entries = json.load(open(os.environ["ACTIVE_JSON"]))
-except Exception:
-    sys.exit(1)
-sid = os.environ["SID"]
-for e in entries:
-    if e.get("sid") == sid and e.get("keep_alive") is True:
-        sys.exit(0)
-sys.exit(1)
-PY
+  local sid="$1" out
+  [ -x "$DISPATCH_REGISTRY_PY" ] || return 0
+  if ! out=$("$DISPATCH_REGISTRY_PY" get --sid "$sid" --pointer keep_alive 2>/dev/null); then
+    return 0
+  fi
+  [ "$out" = "true" ]
 }
 
 cmd_schedule() {

@@ -55,10 +55,22 @@ KILL_CMD="${KILL_CMD:-kill}"
 CLEANUP_SELF_PID="${CLEANUP_SELF_PID:-$$}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-# Test seam (#540): dispatch-tracker invoked to flip the cleaned session out of
-# in_flight so the reconciler stops false-AUTO_HOLD/AUTO_REPORTing an already-gone
-# session. Override in tests with a recorder stub.
-TRACKER_SH="${TRACKER_SH:-$SCRIPT_DIR/dispatch-tracker.sh}"
+# Test seam (#540): the registry component is called to take a cleaned session
+# out of the pollers' way. telepty#60 Stage A — lifecycle only; there is no
+# operation here that could mark a dispatch reported, because a session vanishing
+# is not a task completing.
+DISPATCH_REGISTRY_PY="${DISPATCH_REGISTRY_PY:-$SCRIPT_DIR/dispatch-registry.py}"
+
+# registry_cleaned <sid> — best-effort: a cleaned session often has no dispatch
+# record at all (a hand-spawned or already-pruned one), and that must not fail
+# the cleanup.
+registry_cleaned() {
+  local sid="$1"
+  [ -x "$DISPATCH_REGISTRY_PY" ] || return 0
+  "$DISPATCH_REGISTRY_PY" observe --sid "$sid" --kind session_absent_observed \
+    >/dev/null 2>&1 || return 0
+  "$DISPATCH_REGISTRY_PY" set-lifecycle --sid "$sid" --state cleaned >/dev/null 2>&1 || true
+}
 # shellcheck source=lib/workspace-host.sh
 . "$SCRIPT_DIR/lib/workspace-host.sh"
 
@@ -234,9 +246,10 @@ cleanup_one() {
     log "session not in telepty list: $sid (already cleaned or never registered); closing terminal surface by sid"
     wh_close_for_sid "$sid"
     delete_session_registry "$sid"
-    # #540 — flip the tracker entry out of in_flight on this success path so the
-    # reconciler stops false-AUTO_HOLD/AUTO_REPORTing the now-gone session.
-    [ -x "$TRACKER_SH" ] && "$TRACKER_SH" mark-reported "$sid" || true
+    # #540 — take the cleaned session out of the pollers' way. telepty#60 Stage A:
+    # this is LIFECYCLE only. A session disappearing is not a task completing, so
+    # the outcome stays unknown and the record keeps its history.
+    registry_cleaned "$sid"
     return 0
   fi
   # Step 1 — kill parent (load-bearing; auto-deregisters most cases)
@@ -247,9 +260,8 @@ cleanup_one() {
   sleep 0.5
   # Step 3 — DELETE registry (force-remove residue)
   delete_session_registry "$sid"
-  # #540 — flip the tracker entry out of in_flight on this success path so the
-  # reconciler stops false-AUTO_HOLD/AUTO_REPORTing the now-gone session.
-  [ -x "$TRACKER_SH" ] && "$TRACKER_SH" mark-reported "$sid" || true
+  # #540 — same lifecycle-only mark on the normal kill+close+DELETE path.
+  registry_cleaned "$sid"
   return 0
 }
 

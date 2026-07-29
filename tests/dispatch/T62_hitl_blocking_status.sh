@@ -2,7 +2,8 @@
 # T62 — a gated session is blocked, not probed, and NOT swept
 # (ADR 2026-07-26-hitl-gate-primitive §2 + M1).
 #
-#   open --subject-sid ⇒ active.json status = awaiting_user
+#   open --subject-sid ⇒ gate.state = awaiting_user (its OWN axis: blocking a
+#                        session on a human says nothing about its task)
 #   reconciler tick    ⇒ probe count 0 (dropped out of the registry LIVE set)
 #   compute_gc_root    ⇒ still contains the sid ⇒ the orphan sweep leaves it alone
 #                        ← the regression that matters: without the gc_root entry
@@ -19,7 +20,8 @@ NOW="2026-07-26T12:00:00Z"
 
 # sid-A: dispatched, in flight, and (per telepty) long-disconnected — i.e. a
 # textbook sweep candidate the moment it falls out of the GC root.
-t_seed_entry sid-A "2026-07-26T11:00:00Z" "2026-07-26T12:30:00Z" in_flight ""
+t_seed_dispatch sid-A dispatched_at="2026-07-26T11:00:00Z" \
+  expected_report_by="2026-07-26T12:30:00Z" last_seen_at="2026-07-26T11:00:00Z"
 cat > "$STUB_LIST_FILE" <<'EOF'
 [
   {"id":"orchestrator","healthStatus":"CONNECTED","startedAt":"2026-07-26T10:00:00Z"},
@@ -29,11 +31,14 @@ EOF
 
 gid=$(RECONCILER_NOW="$NOW" "$HITL" open --source worker-sid-A --subject-sid sid-A \
   --kind decision --resume reinject --question "phase boundary: land as-is or amend scope?")
-t_assert_status sid-A awaiting_user
+t_assert_gate sid-A awaiting_user
+# The lifecycle is NOT overwritten by the gate, so there is nothing to restore.
+t_assert_lifecycle sid-A delivery_attempt_started
+t_assert_outcome_unknown sid-A
 prev=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("prev_status"))' \
   "$HITL_STATE_DIR/pending/$gid.json")
-if [ "$prev" != "in_flight" ]; then
-  echo "FAIL: gate.prev_status = $prev, want in_flight" >&2; exit 1
+if [ "$prev" != "delivery_attempt_started" ]; then
+  echo "FAIL: gate.prev_status = $prev, want delivery_attempt_started" >&2; exit 1
 fi
 
 PROBE_LOG="$T_TMP/probe.log"; : > "$PROBE_LOG"
@@ -71,10 +76,17 @@ if grep -q "cleanup sid-A" "$CLEANUP_LOG"; then
 fi
 t_assert_contains "$DISPATCH_STATE_DIR/reconciler.log" "gc_root=[orchestrator,sid-A]"
 # The tick must not have touched the gated entry either.
-t_assert_status sid-A awaiting_user
+t_assert_gate sid-A awaiting_user
 
-# Belt (ADR §2): a worker that reports out-of-band while gated is not dropped.
-TRACKER_NOW="$NOW" t_run_tracker mark-reported sid-A >/dev/null
-t_assert_status sid-A reported
+# Belt (ADR §2), rewritten by telepty#60 Stage A: a worker that reports
+# out-of-band while gated is still not dropped — but "reported" is no longer a
+# state anything can reach. There is no terminal tracker operation at all, and
+# the legacy REPORT envelope is recorded as an observation with its outcome
+# protocol named unavailable.
+if t_run_tracker mark-reported sid-A >/dev/null 2>&1; then
+  echo "FAIL: a terminal tracker operation still exists" >&2; exit 1
+fi
+t_assert_outcome_unknown sid-A
+t_assert_gate sid-A awaiting_user
 
 echo "T62 PASS"

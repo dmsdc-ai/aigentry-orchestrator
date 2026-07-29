@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# T64 — hitl.sh approve: pending→decided, compare-and-set status restore, resume
-# hook fires, second approve exits non-zero (ADR 2026-07-26 hitl-gate-primitive).
+# T64 — hitl.sh approve: pending→decided, gate cleared, resume hook fires, second
+# approve exits non-zero (ADR 2026-07-26 hitl-gate-primitive).
+#
+# telepty#60 Stage A: the gate is its own axis, so approval CLEARS the gate rather
+# than restoring a stashed status string. There is no window in which a restore
+# could resurrect a dispatch, and no path by which a gate decision touches outcome.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
@@ -9,22 +13,24 @@ t_setup; trap t_teardown EXIT
 export HITL_STATE_DIR="$T_TMP/hitl"
 HITL="$REPO_ROOT/bin/hitl.sh"
 
-t_seed_entry sid-A "2026-07-26T03:00:00Z" "2026-07-26T03:30:00Z" in_flight
+t_seed_dispatch sid-A dispatched_at="2026-07-26T03:00:00Z" \
+  expected_report_by="2026-07-26T03:30:00Z"
 
 id=$(RECONCILER_NOW="2026-07-26T04:00:00Z" "$HITL" open \
   --source sid-A --subject-sid sid-A --kind decision --resume reinject \
   --question "Phase A complete — land as-is or amend scope?" \
   --options "approve=land,reject=amend")
 
-# open --subject-sid blocks the worker in the registry, stashing prev_status.
-t_assert_status sid-A awaiting_user
+# open --subject-sid blocks the worker in the registry on the gate axis.
+t_assert_gate sid-A awaiting_user
+t_assert_lifecycle sid-A delivery_attempt_started
 if [ ! -f "$HITL_STATE_DIR/pending/$id.json" ]; then
   echo "FAIL: no pending gate file for $id" >&2; exit 1
 fi
 prev=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("prev_status"))' \
   "$HITL_STATE_DIR/pending/$id.json")
-if [ "$prev" != "in_flight" ]; then
-  echo "FAIL: gate.prev_status = $prev, want in_flight" >&2; exit 1
+if [ "$prev" != "delivery_attempt_started" ]; then
+  echo "FAIL: gate.prev_status = $prev, want delivery_attempt_started" >&2; exit 1
 fi
 
 RECONCILER_NOW="2026-07-26T05:00:00Z" "$HITL" approve "$id" --note "go ahead" >/dev/null
@@ -45,8 +51,10 @@ for k,v in want.items():
         print(f"FAIL: decided.{k} = {g.get(k)!r}, want {v!r}", file=sys.stderr); sys.exit(1)
 PY
 
-# Compare-and-set restore: awaiting_user → prev_status.
-t_assert_status sid-A in_flight
+# Approval clears the gate; the lifecycle underneath was never disturbed.
+t_assert_gate sid-A null
+t_assert_lifecycle sid-A delivery_attempt_started
+t_assert_outcome_unknown sid-A
 # resume=reinject → the gated worker is told the verdict.
 t_assert_contains "$STUB_DISPATCH_LOG" "[APPROVED] gate $id"
 t_assert_contains "$STUB_DISPATCH_LOG" "go ahead"
@@ -61,36 +69,37 @@ if [ "$rc" = "0" ]; then
 fi
 case "$out" in *"already decided"*) ;; *)
   echo "FAIL: second approve message = $out (want 'already decided')" >&2; exit 1;; esac
-t_assert_status sid-A in_flight
+t_assert_gate sid-A null
+t_assert_lifecycle sid-A delivery_attempt_started
 
 # --- resume=registry-clear-redispatch — both arms of the reconciler cap gate ---
-t_seed_entry sid-B "2026-07-26T03:00:00Z" "2026-07-26T03:30:00Z" re_dispatched
-t_seed_entry sid-C "2026-07-26T03:00:00Z" "2026-07-26T03:30:00Z" re_dispatched
-python3 - "$DISPATCH_STATE_DIR/active.json" <<'PY'
-import json,sys
-p=sys.argv[1]; d=json.load(open(p))
-for e in d:
-    if e["sid"] in ("sid-B","sid-C"): e["re_dispatch_count"]=1
-json.dump(d,open(p,"w"),indent=2)
-PY
+for sid in sid-B sid-C; do
+  t_seed_dispatch "$sid" lifecycle.state=re_dispatched re_dispatch_count=1 \
+    dispatched_at="2026-07-26T03:00:00Z" expected_report_by="2026-07-26T03:30:00Z"
+done
 
 for sid in sid-B sid-C; do
   gid=$(RECONCILER_NOW="2026-07-26T06:00:00Z" "$HITL" open \
     --source reconciler --subject-sid "$sid" --kind decision \
     --resume registry-clear-redispatch \
     --question "re-dispatch cap reached (count=1) for $sid")
-  t_assert_status "$sid" awaiting_user
+  t_assert_gate "$sid" awaiting_user
   case "$sid" in
     sid-B) RECONCILER_NOW="2026-07-26T06:10:00Z" "$HITL" approve "$gid" >/dev/null;;
     sid-C) RECONCILER_NOW="2026-07-26T06:10:00Z" "$HITL" reject  "$gid" >/dev/null;;
   esac
 done
 
-# approve → counter cleared, status restored ⇒ next tick may re-dispatch once more.
-t_assert_status sid-B re_dispatched
-got=$(t_field sid-B re_dispatch_count)
+# approve → counter cleared, gate released ⇒ next tick may re-dispatch once more.
+t_assert_gate sid-B null
+t_assert_lifecycle sid-B re_dispatched
+got=$(t_v2 sid-B re_dispatch_count)
 if [ "$got" != "0" ]; then echo "FAIL: sid-B re_dispatch_count=$got, want 0" >&2; exit 1; fi
-# reject → terminal; the resume hook overrides the restored prev_status.
-t_assert_status sid-C stuck_error
+# reject → the resume hook parks it on an error LIFECYCLE. Even a human rejecting
+# a gate cannot assert a task outcome — only that this dispatch is not resuming.
+t_assert_gate sid-C null
+t_assert_lifecycle sid-C stuck_error
+t_assert_outcome_unknown sid-B
+t_assert_outcome_unknown sid-C
 
 echo "T64 PASS"

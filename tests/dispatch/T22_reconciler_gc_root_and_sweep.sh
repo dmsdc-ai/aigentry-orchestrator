@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # T22 — Reconciler:
-#   - GC root = active.json in_flight ∪ {orchestrator} ∪ keep_alive ⇒ never sweeps
+#   - GC root = every non-retired dispatch ∪ {orchestrator} ∪ keep_alive ⇒ never sweeps
 #   - Candidate = telepty session not in root, age > floor, no parent PID ⇒ swept
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
@@ -39,21 +39,11 @@ cat > "$STUB_LIST_FILE" <<EOF
 ]
 EOF
 
-# Seed active.json: sid-live in_flight; sid-ka keep_alive.
-python3 - "$DISPATCH_STATE_DIR/active.json" <<'PY'
-import json,sys
-p=sys.argv[1]
-json.dump([
-  {"sid":"sid-live","status":"in_flight","keep_alive":False,
-   "ref_path":"/tmp/r","ref_hash":"x","dispatched_at":"2026-05-23T11:00:00Z",
-   "expected_report_by":"2026-05-23T12:30:00Z","last_seen_at":"2026-05-23T11:00:00Z",
-   "classification_history":[],"cwd":"","from_sid":"orchestrator","re_dispatch_count":0},
-  {"sid":"sid-ka","status":"in_flight","keep_alive":True,
-   "ref_path":"/tmp/r","ref_hash":"x","dispatched_at":"2026-05-23T11:00:00Z",
-   "expected_report_by":"2026-05-23T12:30:00Z","last_seen_at":"2026-05-23T11:00:00Z",
-   "classification_history":[],"cwd":"","from_sid":"orchestrator","re_dispatch_count":0}
-], open(p,"w"))
-PY
+# Seed: sid-live is an open dispatch; sid-ka opted out of automatic cleanup.
+t_seed_dispatch sid-live dispatched_at="2026-05-23T11:00:00Z" \
+  expected_report_by="2026-05-23T12:30:00Z" last_seen_at="2026-05-23T11:00:00Z"
+t_seed_dispatch sid-ka keep_alive=true dispatched_at="2026-05-23T11:00:00Z" \
+  expected_report_by="2026-05-23T12:30:00Z" last_seen_at="2026-05-23T11:00:00Z"
 
 export TELEPTY="$STUB_BIN/telepty"
 export CLEANUP_SH="$FAKE_CLEANUP"

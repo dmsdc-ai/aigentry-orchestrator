@@ -3,13 +3,17 @@
 # orchestrator address, never the phantom `aigentry-orchestrator-claude`.
 #   1. resolver: env override (sid+host) wins.
 #   2. resolver: sid-only override → bare <sid> or <sid>@<ip>, never phantom.
-#   3. dispatch.sh do_inject() substitutes {{ORCHESTRATOR_REPORT_TARGET}} in the
-#      injected ref with the resolved target.
+#   3. dispatch.sh prepare_effective_ref() substitutes {{ORCHESTRATOR_REPORT_TARGET}}
+#      in the injected ref with the resolved target.
 #   4. ref without the placeholder → passthrough unchanged (back-compat).
-#   5. resolver missing / failing / empty → do_inject FAILS CLOSED: non-zero, and
-#      NOTHING is injected. do_inject's call site (dispatch.sh `if ! do_inject`)
-#      disables errexit inside the body, so an unresolved target would otherwise
-#      be substituted as the empty string and reported as success — #690 reborn.
+#   5. resolver missing / failing / empty → FAILS CLOSED: non-zero, and NOTHING is
+#      injected. An unresolved target must never be substituted as the empty
+#      string and reported as success — #690 reborn.
+#
+# telepty#60 Stage A moved this substitution out of do_inject and in front of the
+# begin-delivery commit: no fallible preparation may run between the durable
+# record and the transport call. The #690 property is unchanged and now fails
+# even earlier — before a dispatch record exists at all.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
@@ -66,6 +70,7 @@ export REPORT_TARGET_SH="$myresolver"
 # shellcheck source=/dev/null
 source "$REPO_ROOT/bin/dispatch.sh"
 ref_file="$ref"; from_id="orchestrator"
+prepare_effective_ref
 do_inject sid-A >/dev/null
 
 t_assert_contains "$cap" 'orchestrator@100.72.155.21'
@@ -81,12 +86,14 @@ fi
 ref2="$T_TMP/ref2.md"
 printf 'plain body no placeholder\n' > "$ref2"
 ref_file="$ref2"
+prepare_effective_ref
 do_inject sid-A >/dev/null
 t_assert_contains "$cap" 'plain body no placeholder'
 
 # ---- 5. resolver missing / failing / empty → fail closed, inject NOTHING ----
-# Asserted through the real call site's shape (`if ! do_inject`), which disables
-# errexit inside the function body — the reason this needs an explicit guard.
+# Asserted through the real call site's shape (`prepare_effective_ref || exit 3`),
+# which runs with errexit disabled inside the function body — the reason this
+# needs an explicit guard.
 failing_empty="$T_TMP/resolver-empty"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$failing_empty"   # rc 0 but no output
 chmod +x "$failing_empty"
@@ -96,9 +103,9 @@ for bad in "$T_TMP/resolver-does-not-exist" "$failing_empty"; do
   ref_file="$ref"                       # the ref that DOES carry the placeholder
   REPORT_TARGET_SH="$bad"
   rc=0
-  if ! do_inject sid-A >/dev/null 2>&1; then rc=1; fi
+  if ! prepare_effective_ref >/dev/null 2>&1; then rc=1; fi
   [ "$rc" -ne 0 ] || {
-    echo "FAIL: do_inject returned 0 with an unresolvable target ($bad)" >&2
+    echo "FAIL: prepare_effective_ref returned 0 with an unresolvable target ($bad)" >&2
     echo "      injected: [$(cat "$cap")]" >&2; exit 1; }
   [ "$(cat "$cnt")" = "0" ] || {
     echo "FAIL: injected $(cat "$cnt")x despite an unresolvable target ($bad)" >&2

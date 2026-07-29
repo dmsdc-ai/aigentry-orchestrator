@@ -48,14 +48,21 @@
 #
 # Exit codes: 0 OK, 1 timeout, 2 spawn failed, 3 inject failed, 4 usage,
 #             5 --verify-delivered detected delivery failure,
-#             6 session never registered in telepty list (#727).
+#             6 session never registered in telepty list (#727),
+#             7 DELIVERY_UNKNOWN_RETRY_HELD, 8 DEDUPLICATED_NO_NEW_DELIVERY,
+#             9 DISPATCH_NOT_RECORDED (registry failure; telepty was never called).
+#
+# telepty#60 Stage A: exit 0 means BOTH a new telepty transport write AND its
+# durable registry commit succeeded. It is the only code that authorizes an
+# automatic re-dispatch caller to advance its counter/deadline — 7 and 8 are
+# "no new delivery happened", which used to be indistinguishable from success.
 set -euo pipefail
 if [ "${DISPATCH_SH_NO_MAIN:-0}" != "1" ]; then
   export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-TRACKER_SH="$SCRIPT_DIR/dispatch-tracker.sh"
+DISPATCH_REGISTRY_PY="${DISPATCH_REGISTRY_PY:-$SCRIPT_DIR/dispatch-registry.py}"
 VERIFY_SH="$SCRIPT_DIR/dispatch-verify.sh"
 OPEN_SESSION_SH="${OPEN_SESSION_SH:-$SCRIPT_DIR/open-session.sh}"
 SESSION_PROBE_PY="${SESSION_PROBE_PY:-$SCRIPT_DIR/session-probe.py}"
@@ -278,46 +285,52 @@ wait_for_ready() {
   done
 }
 
-dedup_dir="$HOME/.aigentry/dispatch-helper"
-mkdir -p "$dedup_dir"
 ref_hash=""
+eff_ref=""     # the bytes actually handed to telepty; prepared BEFORE begin-delivery
+tmp_ref=""
 
-# Returns 0 to proceed, 1 to skip (idempotent — same ref already dispatched).
-# Records the new hash so a subsequent identical re-run will skip.
-dedup_check_and_mark() {
-  local sid="$1" mark
+# --- telepty#60 Stage A registry seam --------------------------------------
+# The registry component is the single typed writer of the dispatch registry.
+# Its failure is the dispatch's failure: the old best-effort hooks ran AFTER the
+# inject and swallowed every error, so a delivered task could exist with nothing
+# recorded — silence, which is exactly what Stage A removes.
+registry() {
+  if [ ! -x "$DISPATCH_REGISTRY_PY" ]; then
+    echo "dispatch.sh: DISPATCH_NOT_RECORDED — registry component missing at $DISPATCH_REGISTRY_PY" >&2
+    return 9
+  fi
+  "$DISPATCH_REGISTRY_PY" "$@"
+}
+
+compute_ref_hash() {
   ref_hash=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$ref_file")
-  mark="$dedup_dir/$sid"
-  if [ -f "$mark" ] && [ "$(cat "$mark" 2>/dev/null)" = "$ref_hash" ]; then
-    echo "OK already dispatched to $sid (same ref hash, skip)"
+}
+
+# #690 (Rule 16): refs carry the {{ORCHESTRATOR_REPORT_TARGET}} placeholder so
+# workers are never handed a phantom/hardcoded orchestrator sid. Resolve the real
+# address (env override + tailnet auto-detect, NO hardcoded sid/IP) into a temp
+# copy — $ref_file (dedup hash / verify) stays the original.
+#
+# Stage A moved this OUT of do_inject: no fallible preparation may run between
+# the durable begin-delivery commit and the transport call, or a failure in that
+# window is indistinguishable from a delivery whose bytes may have landed.
+prepare_effective_ref() {
+  eff_ref="$ref_file"
+  grep -q '{{ORCHESTRATOR_REPORT_TARGET}}' "$ref_file" 2>/dev/null || return 0
+  local target_addr=""
+  # Fail CLOSED. No fallback default: guessing the target is the bug being removed.
+  target_addr="$("$REPORT_TARGET_SH")" || target_addr=""
+  if [ -z "$target_addr" ]; then
+    echo "dispatch.sh: could not resolve the orchestrator report target via $REPORT_TARGET_SH — refusing to inject a ref with an unresolved {{ORCHESTRATOR_REPORT_TARGET}} (#690)" >&2
     return 1
   fi
-  printf '%s\n' "$ref_hash" > "$mark"
+  tmp_ref="$(mktemp "${TMPDIR:-/tmp}/dispatch-ref.XXXXXX")"
+  sed "s|{{ORCHESTRATOR_REPORT_TARGET}}|$target_addr|g" "$ref_file" > "$tmp_ref"
+  eff_ref="$tmp_ref"
 }
 
 do_inject() {
-  local sid="$1" eff_ref="$ref_file" tmp_ref=""
-  # #690 (Rule 16): refs carry the {{ORCHESTRATOR_REPORT_TARGET}} placeholder so
-  # workers are never handed a phantom/hardcoded orchestrator sid. Resolve the
-  # real address (env override + tailnet auto-detect, NO hardcoded sid/IP) and
-  # substitute into a temp copy — $ref_file (dedup hash / verify / tracker) stays
-  # the original. No placeholder in the ref → no-op (back-compat).
-  if grep -q '{{ORCHESTRATOR_REPORT_TARGET}}' "$ref_file" 2>/dev/null; then
-    local target_addr=""
-    # Fail CLOSED. This function is called as `if ! do_inject ...` (below), which
-    # disables errexit inside the body — so a missing/failing resolver would
-    # otherwise substitute the empty string and still return 0, handing the worker
-    # a report target that resolves to nothing under a green success signal (#690
-    # reborn). No fallback default: guessing the target is the bug being removed.
-    target_addr="$("$REPORT_TARGET_SH")" || target_addr=""
-    if [ -z "$target_addr" ]; then
-      echo "dispatch.sh: could not resolve the orchestrator report target via $REPORT_TARGET_SH — refusing to inject a ref with an unresolved {{ORCHESTRATOR_REPORT_TARGET}} (#690)" >&2
-      return 1
-    fi
-    tmp_ref="$(mktemp "${TMPDIR:-/tmp}/dispatch-ref.XXXXXX")"
-    sed "s|{{ORCHESTRATOR_REPORT_TARGET}}|$target_addr|g" "$ref_file" > "$tmp_ref"
-    eff_ref="$tmp_ref"
-  fi
+  local sid="$1"
   local -a a=(inject --ref "$eff_ref" --submit --submit-retry 2)
   [ -n "$from_id" ] && a+=(--from "$from_id")
   a+=("$sid")
@@ -348,33 +361,22 @@ sys.exit(0)
 PY
 }
 
-# Best-effort tracker hook: append on-success entry. Tracker absence is fatal-free.
-tracker_append() {
-  local sid="$1" hash="$2"
-  [ -x "$TRACKER_SH" ] || return 0
-  local -a a=(append "$sid" "$ref_file" "$hash")
-  [ -n "$cwd" ] && a+=(--cwd "$cwd")
-  [ -n "$from_id" ] && a+=(--from "$from_id")
-  [ "$keep_alive" -eq 1 ] && a+=(--keep-alive)
-  "$TRACKER_SH" "${a[@]}" >/dev/null 2>&1 || true
-}
-
-# Best-effort registry registration (#517): record track/role/branch metadata for
-# this spawned dispatch so the reconciler's pull-AUTO_REPORT sweep can find it.
-# Upserts onto the append entry (single-owner active.json). Failure must NOT fail
-# the dispatch — the inject already landed.
-tracker_register() {
+# begin_delivery <sid> — the authoritative write-before-delivery transaction.
+# It re-runs the dedup check atomically and, only for a new attempt, commits the
+# durable unknown record. Its `proceed` result is what authorizes do_inject.
+# #718: a worker with a dedicated --worktree has its branch read there, so later
+# git evidence is attributed to the worker's HEAD and not the shared cwd's.
+begin_delivery() {
   local sid="$1" branch="" gitref
-  [ -x "$TRACKER_SH" ] || return 0
-  # #718: when a worker gets a dedicated --worktree, read its branch (and record the
-  # worktree) so the tracker attributes the worker's HEAD there, not the shared cwd's.
   gitref="${worktree:-$cwd}"
   if [ -n "$gitref" ]; then
     branch=$(git -C "$gitref" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
   fi
-  local -a a=(register "$sid" --track "$track" --role "$role" --cwd "$cwd" --branch "$branch")
+  local -a a=(begin-delivery --sid "$sid" --ref-hash "$ref_hash" --ref-path "$ref_file"
+              --cwd "$cwd" --from "$from_id" --track "$track" --role "$role" --branch "$branch")
   [ -n "$worktree" ] && a+=(--worktree "$worktree")
-  "$TRACKER_SH" "${a[@]}" >/dev/null 2>&1 || true
+  [ "$keep_alive" -eq 1 ] && a+=(--keep-alive)
+  registry "${a[@]}"
 }
 
 # --- Rule 34 task-gate (#736) ---
@@ -532,6 +534,33 @@ if [ "$spawn" -eq 1 ]; then
     exit 4
   fi
   sid="${track}-${name}"
+elif [ -n "$target" ]; then
+  sid="$target"
+else
+  echo "dispatch.sh: --target or --spawn-and-dispatch required" >&2
+  exit 4
+fi
+
+# telepty#60 Stage A: the read-only dedup query runs BEFORE any side effect, so a
+# duplicate never spawns a workspace or waits for readiness. It creates no record
+# and no sidecar — an abort in the steps below therefore leaves nothing behind to
+# swallow an identical retry (the exact failure the retired sidecar caused).
+compute_ref_hash
+set +e
+dedup_out=$(registry check-dedup --sid "$sid" --ref-hash "$ref_hash" 2>&1)
+dedup_rc=$?
+set -e
+case "$dedup_rc" in
+  0) ;;                     # no prior delivery for this (sid, ref) — carry on
+  7|8) skip_preparation=1;; # duplicate/ambiguous: go straight to the atomic recheck
+  *)  # The registry's own named result is the diagnosis; do not replace it with
+      # a generic one, or a corrupt registry looks like a missing helper.
+      printf '%s\n' "$dedup_out" >&2
+      echo "dispatch.sh: DISPATCH_NOT_RECORDED — dedup query failed (rc=$dedup_rc)" >&2
+      exit 9;;
+esac
+
+if [ "${skip_preparation:-0}" != "1" ] && [ "$spawn" -eq 1 ]; then
   # #431 (ADR 2026-05-12 enforcement) — hybrid (b-2)+(c) boot wiring (claude only).
   # When --role is set and cli is claude, invoke boot-prepare.mjs to:
   #   - Compute a sandbox spawn cwd ($HOME/.aigentry/role-sandbox/<role>-<sid>/)
@@ -595,44 +624,55 @@ if [ "$spawn" -eq 1 ]; then
       exit 2
     fi
   fi
-elif [ -n "$target" ]; then
-  sid="$target"
-else
-  echo "dispatch.sh: --target or --spawn-and-dispatch required" >&2
-  exit 4
 fi
 
 emit_telemetry --helper dispatch --subtype dispatch_start \
   --payload-json "$(printf '{"target_sid":"%s","mode":"%s","cli":"%s","role":"%s"}' "$sid" "$([ "$spawn" -eq 1 ] && echo spawn-and-dispatch || echo target)" "$cli" "$role")" \
   --correlation-id "$sid"
 
-if ! dedup_check_and_mark "$sid"; then exit 0; fi
+if [ "${skip_preparation:-0}" != "1" ]; then
+  # #727: a registration/readiness timeout leaves nothing behind but the
+  # workspace itself. No dedup mark is written any more, so the operator's retry
+  # with the same ref reaches the delivery transaction instead of no-opping.
+  wait_for_ready "$sid" || exit $?
+  prepare_effective_ref || exit 3
+fi
 
-wait_for_ready "$sid" || {
-  rc=$?
-  # #727: a registration timeout must leave no trace behind the workspace itself.
-  # The operator's next move is a retry with the same ref (usually with a wider
-  # knob), and a stale dedup mark would turn that retry into a silent no-op.
-  [ "$rc" -eq 6 ] && rm -f "$dedup_dir/$sid"
-  exit "$rc"
-}
+# Nothing fallible may run between this commit and do_inject: a crash in that
+# window is conservatively delivery-unknown, and a wider window means more
+# dispatches whose delivery nobody can answer for.
+set +e
+begin_out=$(begin_delivery "$sid")
+begin_rc=$?
+set -e
+case "$begin_rc" in
+  0) ;;
+  8) printf '%s\n' "$begin_out"
+     echo "dispatch.sh: DISPATCH_DEDUPLICATED for $sid — prior transport write observed, no new delivery" >&2
+     exit 8;;
+  7) printf '%s\n' "$begin_out"
+     echo "dispatch.sh: DISPATCH_RETRY_HELD for $sid — a prior attempt's delivery is unknown; review before retrying" >&2
+     exit 7;;
+  *) printf '%s\n' "$begin_out" >&2
+     echo "dispatch.sh: DISPATCH_NOT_RECORDED for $sid — no delivery attempted" >&2
+     exit 9;;
+esac
 
 if ! do_inject "$sid"; then
   echo "dispatch.sh: telepty inject failed for $sid" >&2
-  rm -f "$dedup_dir/$sid"
+  # A generic nonzero return is NOT proof that no bytes landed, so the record
+  # says delivery-unknown rather than claiming a clean failure.
+  registry set-transport-result --sid "$sid" --result unknown >/dev/null 2>&1 || true
   exit 3
 fi
 
-# #574: the inject already landed (do_inject succeeded above), so the active.json
-# row MUST be created regardless of the verify_delivered verdict — a missing row
-# hides a started session from #517 pull-AUTO_REPORT fallback, which is worse than
-# a row for a verify false-negative (the fallback re-validates against git-log).
-# Honors tracker_register()'s contract: "Failure must NOT fail the dispatch — the
-# inject already landed." Both helpers are idempotent upserts (safe to call once
-# here on every inject-landed path). exit 5 (DELIVERY_FAILED) is still emitted for
-# callers that depend on it — only now after the row exists.
-tracker_append "$sid" "$ref_hash"
-[ "$spawn" -eq 1 ] && tracker_register "$sid"
+# Exit 0 requires the transport result to be durable too — a caller that cannot
+# tell "delivered and recorded" from "delivered, bookkeeping lost" will book the
+# second as a successful re-dispatch.
+if ! registry set-transport-result --sid "$sid" --result write_observed >/dev/null; then
+  echo "dispatch.sh: DELIVERY_UNKNOWN for $sid — bytes were handed to telepty but the transport result could not be recorded" >&2
+  exit 7
+fi
 
 if [ "$verify_delivered" -eq 1 ]; then
   if ! verify_delivered "$sid"; then

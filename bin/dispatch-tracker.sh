@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
 # dispatch-tracker.sh — Orchestrator-side dispatch health-check + auto re-dispatch.
 #
-# Tracks every bin/dispatch.sh inject, polls stuck sessions, and (when configured)
-# emits AUTO_REPORT entries by reading the screen and the session cwd's git log.
+# Polls every dispatch the registry is still holding open and records what it
+# measured. telepty#60 Stage A: it can no longer settle anything. Screen state,
+# git commits, disconnects, errors and cleanups became observations; the outcome
+# axis is created "unknown" by the registry and has no writer at all in 0.8.0.
+# The honest answer for most dispatches is "no completion fact observed", and a
+# repeating HOLD is what surfaces that to a human.
 #
 # See docs/specs/2026-05-12-dispatch-healthcheck.md (Rule 32 영구 fix for #113).
 #
 # Commands:
-#   dispatch-tracker.sh append <sid> <ref_path> <ref_hash> [--cwd <p>] [--from <sid>]
-#   dispatch-tracker.sh register <sid> [--track T] [--role R] [--cwd P] [--branch B] [--worktree W] [--started-at TS]
 #   dispatch-tracker.sh check                    — one-shot scan; alerts to stdout + log
-#   dispatch-tracker.sh mark-reported <sid>      — orchestrator REPORT-receipt hook
 #   dispatch-tracker.sh status [<sid>]
 #   dispatch-tracker.sh prune
 #   dispatch-tracker.sh --help
+#
+# Records are created by bin/dispatch.sh's begin-delivery transaction BEFORE the
+# bytes are handed over, so there is no append/register hook here — a second
+# record-creation entrance is exactly what the single-writer proof would have to
+# keep excluding forever.
 #
 # Article 17: shell + Python stdlib only. macOS + Linux.
 set -euo pipefail
@@ -22,10 +28,9 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 STATE_DIR="${DISPATCH_STATE_DIR:-$REPO_DIR/state/dispatch}"
-ACTIVE_JSON="$STATE_DIR/active.json"
 ALERTS_LOG="$STATE_DIR/alerts.log"
-AUTO_REPORTS_LOG="$STATE_DIR/auto-reports.log"
-AUTO_REPORTS_SEEN="$STATE_DIR/auto-reports.seen"
+OBSERVATIONS_LOG="$STATE_DIR/observations.log"
+OBSERVATIONS_SEEN="$STATE_DIR/observations.seen"
 DISCONNECTED_LOG="$STATE_DIR/disconnected.log"
 
 ORCH_SID="${ORCHESTRATOR_SID:-orchestrator}"
@@ -38,12 +43,18 @@ GIT="${GIT:-git}"
 DISPATCH_SH="${DISPATCH_SH:-$SCRIPT_DIR/dispatch.sh}"
 SESSION_PROBE_PY="${SESSION_PROBE_PY:-$SCRIPT_DIR/session-probe.py}"
 POLICY_PY="${POLICY_PY:-$SCRIPT_DIR/policy.py}"
+DISPATCH_REGISTRY_PY="${DISPATCH_REGISTRY_PY:-$SCRIPT_DIR/dispatch-registry.py}"
+HITL_SH="${HITL_SH:-$SCRIPT_DIR/hitl.sh}"
 NOW_OVERRIDE="${TRACKER_NOW:-}"
 
 mkdir -p "$STATE_DIR"
-[ -f "$ACTIVE_JSON" ] || printf '[]\n' > "$ACTIVE_JSON"
 
-usage() { sed -n '2,18p' "$0"; }
+usage() { sed -n '2,22p' "$0"; }
+
+# Every registry access is a typed call to the one transactional component.
+# There is no local read/write path, so there is nothing here to fail open on a
+# corrupt registry: the component fails closed and this script inherits that.
+registry() { "$DISPATCH_REGISTRY_PY" "$@"; }
 
 now_iso() {
   if [ -n "$NOW_OVERRIDE" ]; then printf '%s' "$NOW_OVERRIDE"; return; fi
@@ -118,193 +129,60 @@ print(cur if cur is not None else "")
 PY
 }
 
-# --- _mutate_state <python-snippet>  — locks active.json, exposes `entries` list ---
-# Snippet is exec'd with: entries (list), json, os, datetime modules pre-imported.
-# Pass per-call data via env vars (SID=..., CLS=..., etc.).
-_mutate_state() {
-  local snippet="$1"
-  ACTIVE_JSON="$ACTIVE_JSON" python3 - "$snippet" <<'PY'
-import fcntl, json, os, sys, datetime
-path = os.environ["ACTIVE_JSON"]
-snippet = sys.argv[1]
-with open(path, "r+") as f:
-    fcntl.flock(f, fcntl.LOCK_EX)
-    try:
-        entries = json.load(f)
-    except Exception:
-        entries = []
-    ns = {"entries": entries, "json": json, "os": os, "datetime": datetime}
-    exec(snippet, ns)
-    f.seek(0); f.truncate()
-    json.dump(ns["entries"], f, indent=2, ensure_ascii=False)
-    f.write("\n")
+# _json_sub <json-text> <key> — the named sub-object as JSON ("{}" when absent).
+_json_sub() {
+  JSON_TEXT="$1" KEY="$2" python3 - <<'PY'
+import json, os
+try:
+    data = json.loads(os.environ.get("JSON_TEXT", "") or "{}")
+except Exception:
+    data = {}
+sub = data.get(os.environ["KEY"])
+print(json.dumps(sub if isinstance(sub, dict) else {}, ensure_ascii=False))
 PY
 }
 
-cmd_append() {
-  local sid="$1" ref_path="$2" ref_hash="$3"; shift 3
-  local cwd="" from="" keep_alive=0
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --cwd) cwd="$2"; shift 2;;
-      --from) from="$2"; shift 2;;
-      --keep-alive) keep_alive=1; shift;;
-      *) echo "append: unknown $1" >&2; exit 4;;
-    esac
-  done
-  local now; now=$(now_iso)
-  ACTIVE_JSON="$ACTIVE_JSON" SID="$sid" RP="$ref_path" RH="$ref_hash" \
-    CWD="$cwd" FROM="$from" NOW="$now" KEEPALIVE="$keep_alive" \
-    python3 - <<'PY'
-import fcntl, json, os, datetime
-def plus30(iso):
-    dt=datetime.datetime.fromisoformat(iso.replace("Z","+00:00"))
-    return (dt+datetime.timedelta(minutes=30)).isoformat(timespec="seconds").replace("+00:00","Z")
-path=os.environ["ACTIVE_JSON"]
-with open(path,"r+") as f:
-    fcntl.flock(f,fcntl.LOCK_EX)
-    try: entries=json.load(f)
-    except Exception: entries=[]
-    entries=[e for e in entries if e.get("sid")!=os.environ["SID"] or e.get("status") in ("reported","auto_reported","stuck_error","delivery_failed")]
-    entries.append({
-        "sid":os.environ["SID"],
-        "ref_path":os.environ["RP"],
-        "ref_hash":os.environ["RH"],
-        "dispatched_at":os.environ["NOW"],
-        "expected_report_by":plus30(os.environ["NOW"]),
-        "last_seen_at":os.environ["NOW"],
-        "status":"in_flight",
-        "classification_history":[],
-        "cwd":os.environ.get("CWD",""),
-        "from_sid":os.environ.get("FROM",""),
-        "re_dispatch_count":0,
-        "keep_alive": os.environ.get("KEEPALIVE","0") == "1",
-    })
-    f.seek(0); f.truncate()
-    json.dump(entries,f,indent=2,ensure_ascii=False); f.write("\n")
-PY
-}
-
-# register <sid> [--track T] [--role R] [--cwd P] [--branch B] [--worktree W] [--started-at TS]
-# Upserts the tracker registry entry for <sid> (idempotent on sid) via the same
-# _mutate_state fcntl lock as every other writer — keeps active.json single-owner
-# (#517: dispatch.sh never populated the registry, so `check` found nothing to
-# AUTO_REPORT). Merges onto an existing entry (e.g. one already created by
-# `append`) rather than clobbering it; creates a fresh in_flight entry otherwise.
-# --worktree (#718): the worker's dedicated git worktree, when the dispatch spawns
-# one distinct from --cwd. Recorded so git-AUTO_REPORT reads the worker's HEAD there
-# instead of the (possibly shared, orchestrator-advanced) cwd HEAD. Set only when
-# non-empty so entries without a worktree keep their existing shape.
-cmd_register() {
-  local sid="$1"; shift
-  local track="" role="" cwd="" branch="" worktree="" started_at=""
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --track) track="$2"; shift 2;;
-      --role) role="$2"; shift 2;;
-      --cwd) cwd="$2"; shift 2;;
-      --branch) branch="$2"; shift 2;;
-      --worktree) worktree="$2"; shift 2;;
-      --started-at) started_at="$2"; shift 2;;
-      *) echo "register: unknown $1" >&2; exit 4;;
-    esac
-  done
-  [ -n "$started_at" ] || started_at=$(now_iso)
-  SID="$sid" TRACK="$track" ROLE="$role" CWD="$cwd" BRANCH="$branch" WORKTREE="$worktree" STARTED="$started_at" \
-    _mutate_state "
-sid = os.environ['SID']
-fields = {
-    'track': os.environ['TRACK'],
-    'role': os.environ['ROLE'],
-    'cwd': os.environ['CWD'],
-    'branch': os.environ['BRANCH'],
-    'started_at': os.environ['STARTED'],
-}
-if os.environ.get('WORKTREE'):
-    fields['worktree'] = os.environ['WORKTREE']
-found = None
-for e in entries:
-    if e.get('sid') == sid:
-        found = e
-        break
-if found is None:
-    entry = {'sid': sid, 'status': 'in_flight', 'reported': None}
-    entry.update(fields)
-    entries.append(entry)
-else:
-    found.update(fields)
-    found.setdefault('reported', None)
-    found.setdefault('status', 'in_flight')
-"
-}
-
-cmd_mark_reported() {
-  # `awaiting_user` is accepted (ADR 2026-07-26-hitl-gate-primitive M1, belt): a
-  # worker that reports out-of-band while gated must not be silently dropped.
-  local sid="$1"
-  SID="$sid" _mutate_state "
-sid = os.environ['SID']
-for e in entries:
-    if e.get('sid') == sid and e.get('status') in ('in_flight','re_dispatched','auto_reported','stuck_welcome','awaiting_user'):
-        e['status'] = 'reported'
-"
-  # Layer D — schedule cleanup if scheduler script is available + sid is not keep-alive.
-  # Scheduler internally skips when active.json has keep_alive=true for sid.
-  local scheduler="${SCHEDULER_SH:-$SCRIPT_DIR/dispatch-cleanup-scheduler.sh}"
-  if [ -x "$scheduler" ]; then
-    "$scheduler" schedule "$sid" --grace-seconds 60 --source layer-d-timeout >/dev/null 2>&1 || true
-  fi
-}
-
-# --- iterate entries needing a check, classify, act ---
+# --- iterate dispatches needing a check, classify, act ---
 cmd_check() {
   local now; now=$(now_iso)
-  # snapshot candidate entries to a temp file (sid TAB cwd TAB ref_path TAB dispatched_at TAB rdc)
+  # Candidates: still-open dispatches whose expected_report_by has elapsed. A
+  # corrupt/unavailable registry makes this call fail, and errexit stops the tick
+  # before any actuation — fail-closed by construction.
   local snap; snap=$(mktemp)
-  ACTIVE_JSON="$ACTIVE_JSON" NOW="$now" python3 - > "$snap" <<'PY'
-import fcntl,json,os,datetime
-path=os.environ["ACTIVE_JSON"]; now=os.environ["NOW"]
-ndt=datetime.datetime.fromisoformat(now.replace("Z","+00:00"))
-with open(path,"r") as f:
-    fcntl.flock(f,fcntl.LOCK_SH)
-    try: entries=json.load(f)
-    except Exception: entries=[]
-for e in entries:
-    if e.get("status") not in ("in_flight","re_dispatched"): continue
-    exp=e.get("expected_report_by","")
-    try:
-        edt=datetime.datetime.fromisoformat(exp.replace("Z","+00:00"))
-    except Exception:
-        continue
-    if ndt<=edt: continue
-    print("\t".join([e["sid"],e.get("cwd",""),e.get("ref_path",""),e.get("dispatched_at",""),str(e.get("re_dispatch_count",0))]))
-PY
+  registry list --live --due-before "$now" \
+    --fields assigned.sid,cwd,ref_path,dispatched_at,re_dispatch_count,transport.inject_id,dispatch_id > "$snap"
 
   local processed=0
-  while IFS=$'\t' read -r sid cwd ref_path dispatched_at rdc; do
+  while IFS=$'\t' read -r sid cwd ref_path dispatched_at rdc inject_id dispatch_id; do
     [ -z "$sid" ] && continue
+    # `null` is the registry's literal for an absent/empty field.
+    [ "$cwd" = "null" ] && cwd=""
+    [ "$ref_path" = "null" ] && ref_path=""
+    [ "$rdc" = "null" ] && rdc=0
     processed=$((processed+1))
     local hs; hs=$(session_disconnected "$sid")
     if [ "$hs" = "DISCONNECTED" ]; then
       printf '%s %s\n' "$(now_iso)" "DISCONNECTED $sid skip" >> "$DISCONNECTED_LOG"
-      SID="$sid" NOW="$(now_iso)" _mutate_state "
-sid, now = os.environ['SID'], os.environ['NOW']
-for e in entries:
-    if e.get('sid') == sid and e.get('status') in ('in_flight','re_dispatched'):
-        e['status'] = 'disconnected'
-        e['last_seen_at'] = now
-"
+      # Connectivity, not outcome: a session that went away has said nothing
+      # about whether the assigned work finished.
+      registry observe --sid "$sid" --kind session_disconnected_observed --now "$(now_iso)"
+      registry set-lifecycle --sid "$sid" --state disconnected --now "$(now_iso)"
       continue
     fi
-    # #528 bus-event consumer: poll telepty's persistent pendingReports state for
-    # this dispatch. On idle_notified (worker went idle after our inject but its
-    # REPORT/HOLD push never landed — the "Enter 안눌림" bug) surface an AUTO_HOLD to
-    # the FILE LOGS (the source of truth; the inject channel is the one that fails)
-    # and `continue`. Any other outcome (404 cleared/dead, idle_notified:false,
-    # curl fail) falls through to the existing stuck/active/#517-git chain below —
-    # the existing branches are neither removed nor reordered.
-    if _poll_pending_and_autohold "$sid" "$cwd" "$dispatched_at"; then
-      continue
+    # Poll telepty's per-inject observation ledger. Anything that is not a valid
+    # schema-v2 observation — absent endpoint, legacy body, dead daemon, or no
+    # transport inject_id at all — is named absence: HOLD and keep polling. This
+    # path is what the whole maintenance window runs on while the telepty half is
+    # still unreleased.
+    #
+    # Named absence blocks the git-evidence fallback below (§8.3.2: the tracker
+    # HOLDs and continues, it does not fall back to screen/git as a substitute
+    # answer). It does NOT stop the operational branches — a disconnect, an error
+    # surface or a stuck welcome screen still need actuating, and none of them
+    # settles anything.
+    local evidence_blocked=0
+    if _poll_observations_and_hold "$sid" "$dispatch_id" "$inject_id"; then
+      evidence_blocked=1
     fi
     local screen state_json action_json class action status
     screen=$(read_screen "$sid" 60)
@@ -318,17 +196,17 @@ for e in entries:
 
     if [ "$status" = "stuck_error" ]; then
       emit_alert "STUCK_ERROR sid=$sid"
-      _set_status "$sid" stuck_error
+      registry observe --sid "$sid" --kind error_surface_observed --field "class=$class" --now "$(now_iso)"
+      registry set-lifecycle --sid "$sid" --state stuck_error --now "$(now_iso)"
     elif [ "$action" = "REDISPATCH" ] && [ "$status" = "stuck_welcome" ]; then
         emit_alert "STUCK_WELCOME sid=$sid"
-        _set_status "$sid" stuck_welcome
+        registry observe --sid "$sid" --kind welcome_surface_observed --now "$(now_iso)"
+        registry set-lifecycle --sid "$sid" --state stuck_welcome --now "$(now_iso)"
         _maybe_redispatch "$sid" "$cwd" "$ref_path" "$dispatched_at" "$rdc"
     elif [ "$class" = "active" ]; then
       _bump_expected "$sid"
-    else
-      if ! _git_check_and_autoreport "$sid" "$cwd" "$ref_path" "$dispatched_at" "$screen"; then
-        : # no new commits → leave entry; alert already emitted by helper if applicable
-      fi
+    elif [ "$evidence_blocked" -eq 0 ]; then
+      _git_check_and_observe "$sid" "$cwd" "$ref_path" "$dispatched_at" "$screen" || true
     fi
   done < "$snap"
   rm -f "$snap"
@@ -336,39 +214,19 @@ for e in entries:
 }
 
 _record_classification() {
-  local sid="$1" cls="$2" now; now=$(now_iso)
-  SID="$sid" CLS="$cls" NOW="$now" _mutate_state "
-sid, cls, now = os.environ['SID'], os.environ['CLS'], os.environ['NOW']
-for e in entries:
-    if e.get('sid') == sid:
-        e.setdefault('classification_history', []).append({'at': now, 'class': cls})
-        e['last_seen_at'] = now
-"
-}
-
-_set_status() {
-  local sid="$1" st="$2"
-  SID="$sid" ST="$st" _mutate_state "
-sid, st = os.environ['SID'], os.environ['ST']
-for e in entries:
-    if e.get('sid') == sid and e.get('status') in ('in_flight','re_dispatched'):
-        e['status'] = st
-"
+  local sid="$1" cls="$2"
+  registry observe --sid "$sid" --kind screen_class_observed --field "class=$cls" --now "$(now_iso)"
 }
 
 _bump_expected() {
   local sid="$1"
-  SID="$sid" _mutate_state "
-sid = os.environ['SID']
-for e in entries:
-    if e.get('sid') == sid and e.get('status') in ('in_flight','re_dispatched'):
-        try:
-            dt = datetime.datetime.fromisoformat(e['expected_report_by'].replace('Z','+00:00'))
-            e['expected_report_by'] = (dt + datetime.timedelta(minutes=15)).isoformat(timespec='seconds').replace('+00:00','Z')
-        except Exception: pass
-"
+  registry set-lifecycle --sid "$sid" --extend-minutes 15 --now "$(now_iso)"
 }
 
+# _maybe_redispatch — only dispatch exit 0 may advance the attempt counter, the
+# lifecycle and the deadline. Exits 8 (deduplicated) and 7 (delivery unknown)
+# mean NO new delivery happened; booking either as a re-dispatch is how the
+# ledger came to record attempts that never occurred.
 _maybe_redispatch() {
   local sid="$1" cwd="$2" ref_path="$3" dispatched_at="$4" rdc="${5:-0}"
   [ -z "$rdc" ] && rdc=0
@@ -380,25 +238,44 @@ _maybe_redispatch() {
     emit_alert "REDISPATCH_SKIP sid=$sid — new commits present, deferring to git path"
     return 0
   fi
-  emit_alert "REDISPATCH sid=$sid attempt=1 ref=$ref_path"
   # Rule 34 task-gate (#736): a re-dispatch re-actuates work already registered
   # under the original dispatch's task, so it takes the audited exemption.
-  if "$DISPATCH_SH" --target "$sid" --ref "$ref_path" --verify-delivered \
-      --no-task "tracker-redispatch $sid" >/dev/null 2>&1; then
-    SID="$sid" NOW="$(now_iso)" _mutate_state "
-sid, now = os.environ['SID'], os.environ['NOW']
-for e in entries:
-    if e.get('sid') == sid:
-        e['status'] = 're_dispatched'
-        e['re_dispatch_count'] = int(e.get('re_dispatch_count', 0)) + 1
-        try:
-            dt = datetime.datetime.fromisoformat(now.replace('Z','+00:00'))
-            e['expected_report_by'] = (dt + datetime.timedelta(minutes=30)).isoformat(timespec='seconds').replace('+00:00','Z')
-        except Exception: pass
-"
-  else
-    emit_alert "REDISPATCH_FAILED sid=$sid"
-  fi
+  local rc=0
+  "$DISPATCH_SH" --target "$sid" --ref "$ref_path" --verify-delivered \
+    --no-task "tracker-redispatch $sid" >/dev/null 2>&1 || rc=$?
+  # The alert reports the OUTCOME of the call, not the intention to make it.
+  case "$rc" in
+    0)
+      registry set-lifecycle --sid "$sid" --state re_dispatched \
+        --bump-re-dispatch-count --extend-minutes 30 --now "$(now_iso)"
+      emit_alert "REDISPATCH_OK sid=$sid attempt=$((rdc + 1)) ref=$ref_path"
+      ;;
+    8)
+      registry observe --sid "$sid" --kind redispatch_suppressed_duplicate \
+        --field "ref_path=$ref_path" --now "$(now_iso)"
+      emit_alert "REDISPATCH_SUPPRESSED sid=$sid — identical ref already delivered; no new delivery"
+      # Freezing the counter would make the one-shot operator gate unreachable,
+      # leaving a stuck dispatch surfaced only by a repeating HOLD. Open it here.
+      _open_redispatch_gate "$sid" "$ref_path" "duplicate suppressed: $sid is already holding an identical delivered ref"
+      ;;
+    7)
+      registry observe --sid "$sid" --kind redispatch_held_delivery_unknown \
+        --field "ref_path=$ref_path" --now "$(now_iso)"
+      emit_alert "REDISPATCH_HELD sid=$sid — a prior attempt's delivery is unknown; not replayed"
+      ;;
+    *)
+      emit_alert "REDISPATCH_FAILED sid=$sid rc=$rc"
+      ;;
+  esac
+}
+
+_open_redispatch_gate() {
+  local sid="$1" ref_path="$2" question="$3"
+  [ -x "$HITL_SH" ] || { emit_alert "HITL_GATE_UNAVAILABLE $HITL_SH not executable — sid=$sid"; return 0; }
+  "$HITL_SH" open --source dispatch-tracker --subject-sid "$sid" --kind decision \
+    --resume registry-clear-redispatch --question "$question" \
+    --options "approve=re-dispatch once more,reject=hand back to the operator" \
+    --context-ref "$ref_path" >/dev/null 2>&1 || emit_alert "HITL_GATE_OPEN_FAILED sid=$sid"
 }
 
 _has_new_commits() {
@@ -424,30 +301,27 @@ sys.exit(1)
 PY
 }
 
-# _shared_cwd_branch_ambiguous <sid> <cwd> — exit 0 (AMBIGUOUS) when 2+ active
-# (in_flight/re_dispatched) active.json entries share <cwd> AND the branch recorded
-# for <sid>; exit 1 otherwise. #541: a single commit cannot be attributed to one
-# sid when sessions collide on (cwd, branch) — same cwd+author+branch yields no
-# discriminator — so git-AUTO_REPORT must skip rather than misattribute.
+# _shared_cwd_branch_ambiguous <sid> <cwd> — exit 0 (AMBIGUOUS) when 2+ still-open
+# dispatches share <cwd> AND the branch recorded for <sid>; exit 1 otherwise.
+# #541: a single commit cannot be attributed to one sid when sessions collide on
+# (cwd, branch) — same cwd+author+branch yields no discriminator — so the git
+# evidence snapshot must skip rather than misattribute.
 _shared_cwd_branch_ambiguous() {
-  local sid="$1" cwd="$2"
-  ACTIVE_JSON="$ACTIVE_JSON" SID="$sid" CWD="$cwd" python3 - <<'PY'
-import json, os
-path = os.environ["ACTIVE_JSON"]; sid = os.environ["SID"]; cwd = os.environ["CWD"]
-try:
-    entries = json.load(open(path))
-except Exception:
-    entries = []
-branch = ""
-for e in entries:
-    if e.get("sid") == sid:
-        branch = e.get("branch", "") or ""
-        break
-active = ("in_flight", "re_dispatched")
-n = sum(1 for e in entries
-        if e.get("status") in active
-        and (e.get("cwd", "") or "") == cwd
-        and (e.get("branch", "") or "") == branch)
+  local sid="$1" cwd="$2" branch rows
+  branch=$(registry get --sid "$sid" --pointer branch)
+  [ "$branch" = "null" ] && branch=""
+  rows=$(registry list --live --fields cwd,branch)
+  ROWS="$rows" CWD="$cwd" BRANCH="$branch" python3 - <<'PY'
+import os
+rows = [r for r in os.environ.get("ROWS", "").splitlines() if r]
+cwd, branch = os.environ["CWD"], os.environ["BRANCH"]
+n = 0
+for row in rows:
+    parts = row.split("\t")
+    row_cwd = "" if parts[0] == "null" else parts[0]
+    row_branch = "" if len(parts) < 2 or parts[1] == "null" else parts[1]
+    if row_cwd == cwd and row_branch == branch:
+        n += 1
 raise SystemExit(0 if n > 1 else 1)
 PY
 }
@@ -459,16 +333,8 @@ PY
 # own just-landed main commit and misattributes it. Prefer the worktree.
 _worker_git_dir() {
   local sid="$1" cwd="$2" wt
-  wt=$(ACTIVE_JSON="$ACTIVE_JSON" SID="$sid" python3 - <<'PY'
-import json, os
-try: entries = json.load(open(os.environ["ACTIVE_JSON"]))
-except Exception: entries = []
-sid = os.environ["SID"]
-for e in entries:
-    if e.get("sid") == sid:
-        print(e.get("worktree", "") or ""); break
-PY
-)
+  wt=$(registry get --sid "$sid" --pointer worktree)
+  [ "$wt" = "null" ] && wt=""
   if [ -n "$wt" ] && "$GIT" -C "$wt" rev-parse --git-dir >/dev/null 2>&1; then
     printf '%s' "$wt"
   else
@@ -487,19 +353,23 @@ _on_protected_branch() {
   case "$br" in main|master) return 0;; *) return 1;; esac
 }
 
-_git_check_and_autoreport() {
+# _git_check_and_observe — a new authored commit in the worker's git context is
+# EVIDENCE FOR A HUMAN, not a completion. It records a nonterminal
+# worktree_activity_observed snapshot with review_required, leaves the outcome
+# untouched, and does not stop the dispatch being polled. The old version wrote
+# a terminal status here: a commit in a directory is not a report
+# from a session, and nothing in this path correlates the two.
+_git_check_and_observe() {
   local sid="$1" cwd="$2" ref_path="$3" dispatched_at="$4" screen="$5"
   [ -n "$cwd" ] || return 0
   # #718: attribute against the WORKER's git context (its worktree if recorded),
   # never the shared cwd HEAD.
   local gdir; gdir=$(_worker_git_dir "$sid" "$cwd")
   _has_new_commits "$gdir" "$dispatched_at" || return 0
-  # #541 — ambiguous-attribution guard: when 2+ active sessions share this sid's
-  # (cwd, branch), skip git-AUTO_REPORT to avoid crediting another session's commit
-  # (the pendingReports/idle path is unaffected). SECONDARY fix (Dispatch-Session
-  # commit-trailer matching in dispatch.sh) is out of scope — tracked as follow-up.
+  # #541 — ambiguous-attribution guard: when 2+ open dispatches share this sid's
+  # (cwd, branch), skip the snapshot rather than crediting another session's commit.
   _shared_cwd_branch_ambiguous "$sid" "$cwd" && return 0
-  local head_sha files added removed test_signal now
+  local head_sha files added removed test_signal now seen_key
   test_signal=$(printf '%s' "$screen" | python3 -c '
 import sys,re
 m=re.findall(r"(\d+ passed|\d+ failed|\d+ FAIL|ok \d+ tests?)", sys.stdin.read())
@@ -507,50 +377,47 @@ print(" / ".join(m) if m else "none")
 ')
   now=$(now_iso)
   # #718 honest degradation: when the only resolvable git context is a mainline
-  # checkout (main/master), the worker's work is NOT here — emit screen-state ONLY,
-  # never cite the (orchestrator's) HEAD sha. One AUTO_REPORT per sid (NOSHA key);
-  # _set_status auto_reported also stops the entry being revisited.
+  # checkout (main/master), the worker's work is NOT here — record screen-state
+  # only and never cite the (orchestrator's) HEAD sha.
   if _on_protected_branch "$gdir"; then
-    if grep -qxF "$(printf '%s\tNOSHA' "$sid")" "$AUTO_REPORTS_SEEN" 2>/dev/null; then
-      return 0
-    fi
-    python3 - "$sid" "$now" "$test_signal" >> "$AUTO_REPORTS_LOG" <<'PY'
-import json,sys
-sid,now,ts=sys.argv[1:4]
-print(json.dumps({"kind":"AUTO_REPORT","sid":sid,"emitted_at":now,"head_sha":None,
-                  "attribution":"omitted","reason":"cwd_on_protected_branch",
-                  "test_signal":ts,"review_required":True}))
-PY
-    printf '%s\tNOSHA\n' "$sid" >> "$AUTO_REPORTS_SEEN"
-    _set_status "$sid" auto_reported
-    emit_alert "AUTO_REPORT sid=$sid sha=omitted (worker git context unresolved; cwd on protected branch) tests=$test_signal — screen-state only, review required"
-    if command -v "$TELEPTY" >/dev/null 2>&1; then
-      "$TELEPTY" inject --from "$TRACKER_SID" "$ORCH_SID" \
-        "AUTO_REPORT sid=$sid sha=omitted (worker git context unresolved) tests=$test_signal — screen-state only, review required" \
-        >/dev/null 2>&1 || true
-    fi
-    return 0
+    head_sha=""
+    seen_key=$(printf '%s\tNOSHA' "$sid")
+  else
+    head_sha=$("$GIT" -C "$gdir" rev-parse --short HEAD 2>/dev/null || echo unknown)
+    seen_key=$(printf '%s\t%s' "$sid" "$head_sha")
   fi
-  head_sha=$("$GIT" -C "$gdir" rev-parse --short HEAD 2>/dev/null || echo unknown)
-  if grep -qxF "$sid	$head_sha" "$AUTO_REPORTS_SEEN" 2>/dev/null; then
-    return 0
-  fi
+  grep -qxF "$seen_key" "$OBSERVATIONS_SEEN" 2>/dev/null && return 0
   read -r files added removed < <(_git_shortstat "$gdir" "$dispatched_at")
-  python3 - "$sid" "$now" "$head_sha" "$files" "$added" "$removed" "$test_signal" \
-    >> "$AUTO_REPORTS_LOG" <<'PY'
-import json,sys
-sid,now,sha,fc,la,lr,ts=sys.argv[1:8]
-print(json.dumps({"kind":"AUTO_REPORT","sid":sid,"emitted_at":now,"head_sha":sha,
-                  "files_changed":int(fc or 0),"loc_added":int(la or 0),
-                  "loc_removed":int(lr or 0),"test_signal":ts,"review_required":True}))
+
+  local -a obs=(observe --sid "$sid" --kind worktree_activity_observed
+                --field review_required=true --field "test_signal=$test_signal"
+                --field "files_changed=$files" --field "loc_added=$added"
+                --field "loc_removed=$removed" --now "$now")
+  if [ -n "$head_sha" ]; then
+    obs+=(--field "head_sha=$head_sha")
+  else
+    obs+=(--field attribution=omitted --field reason=cwd_on_protected_branch)
+  fi
+  registry "${obs[@]}"
+
+  SID="$sid" NOW="$now" SHA="$head_sha" FILES="$files" ADDED="$added" \
+    REMOVED="$removed" TS="$test_signal" python3 - >> "$OBSERVATIONS_LOG" <<'PY'
+import json, os
+sha = os.environ.get("SHA") or None
+print(json.dumps({"kind": "WORKTREE_ACTIVITY", "sid": os.environ["SID"],
+                  "emitted_at": os.environ["NOW"], "head_sha": sha,
+                  "attribution": "omitted" if sha is None else "worker_git_dir",
+                  "files_changed": int(os.environ.get("FILES") or 0),
+                  "loc_added": int(os.environ.get("ADDED") or 0),
+                  "loc_removed": int(os.environ.get("REMOVED") or 0),
+                  "test_signal": os.environ.get("TS", ""),
+                  "completion_fact": None, "review_required": True}))
 PY
-  printf '%s\t%s\n' "$sid" "$head_sha" >> "$AUTO_REPORTS_SEEN"
-  _set_status "$sid" auto_reported
-  emit_alert "AUTO_REPORT sid=$sid sha=$head_sha files=$files +$added/-$removed tests=$test_signal — review required"
+  printf '%s\n' "$seen_key" >> "$OBSERVATIONS_SEEN"
+  local note="WORKTREE_ACTIVITY sid=$sid sha=${head_sha:-omitted} files=$files +$added/-$removed tests=$test_signal — evidence only, no completion fact, review required"
+  emit_alert "$note"
   if command -v "$TELEPTY" >/dev/null 2>&1; then
-    "$TELEPTY" inject --from "$TRACKER_SID" "$ORCH_SID" \
-      "AUTO_REPORT sid=$sid sha=$head_sha files=$files +$added/-$removed tests=$test_signal — review required" \
-      >/dev/null 2>&1 || true
+    "$TELEPTY" inject --from "$TRACKER_SID" "$ORCH_SID" "$note" >/dev/null 2>&1 || true
   fi
 }
 
@@ -567,142 +434,117 @@ print((f.group(1) if f else "0"), (a.group(1) if a else "0"), (d.group(1) if d e
 '
 }
 
-# --- #528: pendingReports poll + AUTO_HOLD ---------------------------------
-# _poll_pending_and_autohold <sid> <cwd> <dispatched_at>
-# Polls telepty GET /api/pendingReports/:sid (curl precedent: session-cleanup.sh).
-# Returns 0 ONLY when a fresh AUTO_HOLD was surfaced (caller should `continue`).
-# Returns 1 on every other outcome — curl fail (daemon down), 404 (cleared/dead),
-# idle_notified:false, or already-seen — so the caller falls through to the
-# existing #517 git chain. localhost is trusted, no token (http-auth.js) — §17:
-# curl + the daemon are already in use, no new dependency.
-_poll_pending_and_autohold() {
-  local sid="$1" cwd="$2" dispatched_at="$3"
-  local port="${TELEPTY_PORT:-3848}" resp http body
-  if ! resp=$("$CURL" -s -w $'\n%{http_code}' \
-        "http://127.0.0.1:${port}/api/pendingReports/${sid}" 2>/dev/null); then
-    # daemon down — best-effort skip + log, fall through (reconciler posture).
-    printf '%s %s\n' "$(now_iso)" "PENDING_POLL_SKIP sid=$sid curl_failed" >> "$DISCONNECTED_LOG"
-    return 1
+# --- telepty#60 Stage A: per-inject observation poll + HOLD -----------------
+# _poll_observations_and_hold <sid> <dispatch_id> <inject_id>
+#
+# Polls telepty GET /api/inject-observations/:inject_id, which returns a
+# discriminated schema-v2 body and never uses 404 as a task-state signal.
+# Returns 0 when the result is named ABSENCE (caller `continue`s: HOLD emitted,
+# dispatch keeps being polled, nothing settled). Returns 1 only when a valid
+# schema-v2 observation was recorded, so the caller may go on to collect
+# screen/git evidence.
+#
+# There is deliberately no DELETE here. The old code deleted the daemon's
+# pending record after surfacing a hold, which threw away the very history the
+# next poll needs — and a record the orchestrator does not own is not its to
+# discard. Idempotency lives in the seen-ledger.
+#
+# Every non-v2 shape is absence, including the legacy pre-v2 poll body: its
+# idle_notified flag is the PTY-derived false authority Stage A exists to remove,
+# so it is never read as evidence. This is the path the whole cutover window
+# runs on, because 0.7.1 has neither this endpoint nor a CLI-visible inject_id.
+_poll_observations_and_hold() {
+  local sid="$1" dispatch_id="$2" inject_id="$3"
+  local port="${TELEPTY_PORT:-3848}" reason="" body="" http="" resp=""
+
+  if [ -z "$inject_id" ] || [ "$inject_id" = "null" ]; then
+    reason=no_transport_inject_id
+  elif ! resp=$("$CURL" -s -w $'\n%{http_code}' \
+        "http://127.0.0.1:${port}/api/inject-observations/${inject_id}" 2>/dev/null); then
+    printf '%s %s\n' "$(now_iso)" "OBSERVATION_POLL_SKIP sid=$sid curl_failed" >> "$DISCONNECTED_LOG"
+    reason=observation_poll_failed
+  else
+    http="${resp##*$'\n'}"
+    body="${resp%$'\n'*}"
+    if [ "$http" != "200" ]; then
+      reason=observation_endpoint_absent
+    elif [ "$(json_get "$body" schema_version)" != "2" ]; then
+      reason=unknown_observation_schema
+    elif [ "$(json_get "$body" tracking_state)" = "unavailable" ]; then
+      reason=$(json_get "$body" reason)
+      [ -n "$reason" ] || reason=tracking_state_unavailable
+    else
+      local kind sub
+      kind=$(json_get "$body" observation.kind)
+      [ -n "$kind" ] || kind=unmapped_transition_cause
+      sub=$(_json_sub "$body" observation)
+      # Recorded verbatim as an observation. Consumption evidence is data here,
+      # never a licence: nothing downstream may read it as a stronger fact than
+      # the daemon's own screen-derived whitelist already allows.
+      registry observe --sid "$sid" --kind "$kind" --json "$sub" \
+        --field "consumption=$(json_get "$body" consumption.status)" \
+        --field "inject_id=$inject_id" --now "$(now_iso)"
+      return 1
+    fi
   fi
-  http="${resp##*$'\n'}"
-  body="${resp%$'\n'*}"
-  [ "$http" = "200" ] || return 1            # 404 cleared/dead → #517 git path
-  local idle; idle=$(json_get "$body" idle_notified)
-  case "$idle" in True|true) ;; *) return 1;; esac   # idle_notified:false → NOOP
-  local inject_id; inject_id=$(json_get "$body" inject_id)
-  # Idempotency: one AUTO_HOLD per (dispatch, idle). New key form
-  # `sid<TAB>IDLE<TAB>inject_id` (whole-line grep -qxF; never collides with the
-  # AUTO_REPORT `sid<TAB>head_sha` form — shas are hex, never the literal IDLE).
-  # A re-dispatch gets a new inject_id, so a genuinely new idle re-surfaces.
-  if grep -qxF "$(printf '%s\tIDLE\t%s' "$sid" "$inject_id")" "$AUTO_REPORTS_SEEN" 2>/dev/null; then
-    return 1
+
+  registry observe --sid "$sid" --kind tracking_unavailable \
+    --field "reason=$reason" --field "inject_id=${inject_id:-null}" --now "$(now_iso)"
+
+  # One HOLD per (dispatch, reason): a level-triggered loop keeps polling, but a
+  # human is told once per distinct absence rather than every 60 seconds.
+  local seen_key; seen_key=$(printf '%s\tHOLD\t%s\t%s' "$sid" "$dispatch_id" "$reason")
+  if grep -qxF "$seen_key" "$OBSERVATIONS_SEEN" 2>/dev/null; then
+    return 0
   fi
-  local auto_summary idle_at idle_secs spec_path files added removed now
-  auto_summary=$(json_get "$body" auto_summary)   # already daemon-redacted
-  idle_at=$(json_get "$body" idle_at)
-  now=$(now_iso)
-  idle_secs=$(_idle_secs "$idle_at" "$now")
-  spec_path=$(_spec_since "$cwd" "$dispatched_at")
-  read -r files added removed < <(_git_shortstat "$cwd" "$dispatched_at")
-  # auto-reports.log (JSON) — source of truth.
-  SID="$sid" NOW="$now" IDLE="$idle_secs" SUMMARY="$auto_summary" SPEC="$spec_path" \
-    FILES="$files" ADDED="$added" REMOVED="$removed" \
-    python3 - >> "$AUTO_REPORTS_LOG" <<'PY'
-import json,os
-print(json.dumps({"kind":"AUTO_HOLD","sid":os.environ["SID"],
-                  "emitted_at":os.environ["NOW"],
-                  "idle_for_secs":int(os.environ.get("IDLE","0") or 0),
-                  "summary":os.environ.get("SUMMARY",""),
-                  "spec_path":os.environ.get("SPEC",""),
-                  "files_changed":int(os.environ.get("FILES","0") or 0),
-                  "loc_added":int(os.environ.get("ADDED","0") or 0),
-                  "loc_removed":int(os.environ.get("REMOVED","0") or 0),
-                  "review_required":True}, ensure_ascii=False))
+  SID="$sid" NOW="$(now_iso)" REASON="$reason" DID="$dispatch_id" \
+    python3 - >> "$OBSERVATIONS_LOG" <<'PY'
+import json, os
+print(json.dumps({"kind": "HOLD", "sid": os.environ["SID"],
+                  "dispatch_id": os.environ["DID"],
+                  "emitted_at": os.environ["NOW"],
+                  "reason": os.environ["REASON"],
+                  "completion_fact": None,
+                  "outcome": "unknown",
+                  "review_required": True}, ensure_ascii=False))
 PY
-  printf '%s\tIDLE\t%s\n' "$sid" "$inject_id" >> "$AUTO_REPORTS_SEEN"
-  emit_alert "AUTO_HOLD sid=$sid idle=${idle_secs}s spec=${spec_path:-none} — review/respond required"
+  printf '%s\n' "$seen_key" >> "$OBSERVATIONS_SEEN"
+  local note="HOLD sid=$sid reason=$reason — no completion fact observed; outcome unknown, still polling"
+  emit_alert "$note"
   if command -v "$TELEPTY" >/dev/null 2>&1; then
-    "$TELEPTY" inject --from "$TRACKER_SID" "$ORCH_SID" \
-      "AUTO_HOLD sid=$sid idle=${idle_secs}s spec=${spec_path:-none} — review/respond required" \
-      >/dev/null 2>&1 || true
+    "$TELEPTY" inject --from "$TRACKER_SID" "$ORCH_SID" "$note" >/dev/null 2>&1 || true
   fi
-  # Belt-and-suspenders: free daemon memory (fires a harmless TASK_DISMISSED we
-  # ignore). The seen-ledger is the primary idempotency guard, not this DELETE.
-  "$CURL" -s -o /dev/null -X DELETE \
-    "http://127.0.0.1:${port}/api/pendingReports/${sid}" 2>/dev/null || true
   return 0
-}
-
-# _idle_secs <idle_at_iso|null|""> <now_iso> — whole seconds since idle_at (0 if absent).
-_idle_secs() {
-  IDLE_AT="$1" NOW="$2" python3 - <<'PY'
-import os,datetime
-def p(s):
-    try: return datetime.datetime.fromisoformat((s or "").replace("Z","+00:00"))
-    except Exception: return None
-a=p(os.environ.get("IDLE_AT","")); n=p(os.environ.get("NOW",""))
-print(max(0,int((n-a).total_seconds())) if a and n else 0)
-PY
-}
-
-# _spec_since <cwd> <dispatched_at> — first docs/specs/*.md written since dispatch
-# (SPEC FIRST evidence for an architect that wrote a spec but did not commit).
-# Best-effort: empty when cwd has no docs/specs or nothing is newer.
-_spec_since() {
-  local cwd="$1" since="$2"
-  [ -n "$cwd" ] && [ -d "$cwd/docs/specs" ] || { printf ''; return 0; }
-  CWD="$cwd" SINCE="$since" python3 - <<'PY'
-import os,glob,datetime
-cwd=os.environ["CWD"]; since=os.environ.get("SINCE","")
-try: sdt=datetime.datetime.fromisoformat(since.replace("Z","+00:00")).timestamp()
-except Exception: sdt=0
-hits=[]
-for p in glob.glob(os.path.join(cwd,"docs","specs","*.md")):
-    try:
-        if os.path.getmtime(p) >= sdt: hits.append(os.path.relpath(p,cwd))
-    except OSError: pass
-hits.sort()
-print(hits[0] if hits else "")
-PY
 }
 
 cmd_status() {
   local sid="${1:-}"
-  python3 - "$ACTIVE_JSON" "$sid" <<'PY'
-import json,sys
-path,sid=sys.argv[1],sys.argv[2]
-try: entries=json.load(open(path))
-except Exception: entries=[]
-rows=entries if not sid else [e for e in entries if e.get("sid")==sid]
-for e in rows:
-    print(f"{e.get('sid','?'):40s} {e.get('status','?'):16s} exp={e.get('expected_report_by','?')} rdc={e.get('re_dispatch_count',0)}")
-PY
+  local -a a=(list --fields assigned.sid,outcome.state,lifecycle.state,gate.state,expected_report_by,re_dispatch_count)
+  if [ -n "$sid" ]; then
+    printf '%-40s %-8s %-26s %-14s %s\n' "$sid" \
+      "$(registry get --sid "$sid" --pointer outcome.state)" \
+      "$(registry get --sid "$sid" --pointer lifecycle.state)" \
+      "$(registry get --sid "$sid" --pointer gate.state)" \
+      "exp=$(registry get --sid "$sid" --pointer expected_report_by)"
+    return 0
+  fi
+  registry "${a[@]}" | while IFS=$'\t' read -r s outcome lifecycle gate exp rdc; do
+    printf '%-40s %-8s %-26s %-14s exp=%s rdc=%s\n' "$s" "$outcome" "$lifecycle" "$gate" "$exp" "$rdc"
+  done
 }
 
+# Retired lifecycles age out after a day. A dispatch whose outcome is still
+# unknown is never pruned: its record is the only evidence the work was handed
+# out at all, and 0.8.0 has no way to learn it finished.
 cmd_prune() {
-  _mutate_state "
-keep = []
-now = datetime.datetime.now(datetime.timezone.utc)
-for e in entries:
-    st = e.get('status', '')
-    if st in ('reported','auto_reported','stuck_error','delivery_failed','disconnected'):
-        try:
-            ls = datetime.datetime.fromisoformat(e.get('last_seen_at','').replace('Z','+00:00'))
-            if (now - ls).total_seconds() > 86400: continue
-        except Exception: pass
-    keep.append(e)
-entries[:] = keep
-"
+  registry prune --older-than-seconds 86400
 }
 
 main() {
   [ $# -eq 0 ] && { usage; exit 4; }
   local cmd="$1"; shift
   case "$cmd" in
-    append)         cmd_append "$@";;
-    register)       cmd_register "$@";;
     check)          cmd_check "$@";;
-    mark-reported)  cmd_mark_reported "$@";;
     status)         cmd_status "$@";;
     prune)          cmd_prune "$@";;
     -h|--help)      usage;;

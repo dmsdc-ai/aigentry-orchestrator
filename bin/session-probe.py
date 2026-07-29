@@ -147,7 +147,11 @@ def tracker_class(screen: str) -> str:
     if any(ch in tail20 for ch in BRAILLE) or re.search(TRACKER_ACTIVE_TEXT, tail20, re.I):
         return "active"
     if prompt_in_last3:
-        return "done"
+        # telepty#60 Stage A: a prompt-like surface is an OBSERVATION. The old
+        # name for this class was "done", which let a glyph in the last three
+        # lines assert that the assigned task had finished — a claim this
+        # detector cannot make. Consumers must read it as "prompt observed".
+        return "prompt_observed"
     return "blank"
 
 

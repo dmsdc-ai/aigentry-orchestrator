@@ -4,7 +4,10 @@
 # Reads an inject body from stdin (or --body-file), parses it via the compiled
 # src/session/inject-parser.js, then takes the per-kind action:
 #
-#   report          → dispatch-tracker.sh mark-reported <sid> (which schedules Layer D)
+#   report          → nonterminal observation + Layer-D cleanup schedule.
+#                     telepty#60 Stage A: 0.8.0 has NO outcome protocol, so a
+#                     textual REPORT is an ordinary message. It cannot settle a
+#                     dispatch; it is recorded as evidence and named as such.
 #   cleanup-request → dispatch-cleanup-scheduler.sh schedule <target>
 #   extend-lifetime → dispatch-cleanup-scheduler.sh cancel or defer (per defer_minutes)
 #   hold            → emit to state/dispatch/holds.log (audit only — orch reads this)
@@ -27,7 +30,7 @@ STATE_DIR="${DISPATCH_STATE_DIR:-$REPO_DIR/state/dispatch}"
 TEST_REPORTS_DIR="${TEST_REPORTS_DIR:-$REPO_DIR/state/test-reports}"
 HOLDS_LOG="$STATE_DIR/holds.log"
 PARSER_JS="${INJECT_PARSER_JS:-$REPO_DIR/dist/src/session/inject-parser.js}"
-TRACKER_SH="${TRACKER_SH:-$SCRIPT_DIR/dispatch-tracker.sh}"
+DISPATCH_REGISTRY_PY="${DISPATCH_REGISTRY_PY:-$SCRIPT_DIR/dispatch-registry.py}"
 SCHEDULER_SH="${SCHEDULER_SH:-$SCRIPT_DIR/dispatch-cleanup-scheduler.sh}"
 EMIT_TELEMETRY_MJS="${EMIT_TELEMETRY_MJS:-$SCRIPT_DIR/emit-telemetry.mjs}"
 
@@ -98,13 +101,28 @@ case "$kind" in
       echo "inject-handler: --sid required for REPORT envelopes (markdown subject doesn't carry sid)" >&2
       exit 1
     fi
-    if [ -x "$TRACKER_SH" ]; then
-      "$TRACKER_SH" mark-reported "$sid" || true
+    # The envelope is unauthenticated and uncorrelated: nothing binds these bytes
+    # to the dispatch they claim to be reporting. It is recorded, not believed.
+    if [ -x "$DISPATCH_REGISTRY_PY" ]; then
+      "$DISPATCH_REGISTRY_PY" observe --sid "$sid" --kind legacy_report_envelope_observed \
+        --field "transport=$transport" --field outcome_protocol=unavailable \
+        --field reason=stage_b_deferred_to_0.9.0 >/dev/null 2>&1 || true
+      # Layer-D cleanup still arms off this envelope: dropping it would end
+      # automatic worker retirement fleet-wide. It IS an inference, so it is
+      # written down with its basis — when #816/#817 land and Stage B replaces
+      # this path, whoever does that work can see exactly what was inferred.
+      "$DISPATCH_REGISTRY_PY" observe --sid "$sid" \
+        --kind cleanup_scheduled_from_legacy_report_envelope \
+        --field basis=legacy_report_envelope >/dev/null 2>&1 || true
+    fi
+    if [ -x "$SCHEDULER_SH" ]; then
+      "$SCHEDULER_SH" schedule "$sid" --grace-seconds 60 --source legacy-report-envelope \
+        >/dev/null 2>&1 || true
     fi
     emit_telemetry --helper report --subtype report \
       --payload-json "$(printf '{"target_sid":"%s","transport":"%s"}' "$sid" "$transport")" \
       --correlation-id "$sid"
-    echo "[inject-handler] report kind=report sid=$sid transport=$transport — scheduler armed"
+    echo "[inject-handler] report kind=report sid=$sid transport=$transport — recorded as an observation; outcome_protocol_unavailable (0.8.0 has no terminal outcome); scheduler armed"
     ;;
   cleanup-request)
     target=$(printf '%s' "$parsed" | python3 -c 'import json,sys;print(json.load(sys.stdin)["payload"]["target"])')

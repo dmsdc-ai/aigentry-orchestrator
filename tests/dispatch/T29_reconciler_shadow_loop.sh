@@ -8,7 +8,8 @@ t_setup; trap t_teardown EXIT
 FIX="$REPO_ROOT/tests/fixtures/session-state"
 cp "$FIX/working-spinner.screen" "$STUB_SCREEN_FILE"
 cp "$FIX/claude-connected.info" "$STUB_INFO_FILE"
-t_seed_entry sid-A "2026-06-06T11:00:00Z" "2026-06-06T11:30:00Z" in_flight ""
+t_seed_dispatch sid-A dispatched_at="2026-06-06T11:00:00Z" \
+  expected_report_by="2026-06-06T11:30:00Z" last_seen_at="2026-06-06T11:00:00Z"
 
 CLEANUP_LOG="$T_TMP/cleanup.log"; : > "$CLEANUP_LOG"
 CLEANUP_STUB="$T_TMP/cleanup-stub.sh"
@@ -50,7 +51,9 @@ if len(rows) != 1:
 row = rows[0]
 checks = {
     "sid": "sid-A",
-    "status": "in_flight",
+    # The reconciler now shadows the dispatch LIFECYCLE, not a single overloaded
+    # status string that a prompt glyph could turn terminal.
+    "status": "delivery_attempt_started",
 }
 for key, want in checks.items():
     got = row.get(key)

@@ -1,0 +1,47 @@
+[
+  {
+    "sid": "live-worker",
+    "ref_path": "/tmp/live.md",
+    "ref_hash": "hash-live",
+    "dispatched_at": "2026-07-29T10:00:00Z",
+    "expected_report_by": "2026-07-29T10:30:00Z",
+    "last_seen_at": "2026-07-29T10:20:00Z",
+    "status": "in_flight",
+    "classification_history": [{"at": "2026-07-29T10:20:00Z", "class": "active"}],
+    "cwd": "/tmp/live",
+    "from_sid": "orchestrator",
+    "re_dispatch_count": 0,
+    "keep_alive": false,
+    "track": "L1",
+    "role": "coder",
+    "branch": "feat/live",
+    "worktree": "/tmp/live-wt"
+  },
+  {
+    "sid": "retried-worker",
+    "ref_path": "/tmp/retried.md",
+    "ref_hash": "hash-retried",
+    "dispatched_at": "2026-07-29T09:00:00Z",
+    "expected_report_by": "2026-07-29T09:30:00Z",
+    "last_seen_at": "2026-07-29T09:40:00Z",
+    "status": "re_dispatched",
+    "classification_history": [],
+    "cwd": "/tmp/retried",
+    "from_sid": "orchestrator",
+    "re_dispatch_count": 1,
+    "keep_alive": true
+  },
+  {
+    "sid": "claimed-done",
+    "ref_path": "/tmp/done.md",
+    "ref_hash": "hash-done",
+    "dispatched_at": "2026-07-28T08:00:00Z",
+    "expected_report_by": "2026-07-28T08:30:00Z",
+    "last_seen_at": "2026-07-28T08:45:00Z",
+    "status": "auto_reported",
+    "classification_history": [],
+    "cwd": "/tmp/done",
+    "from_sid": "orchestrator",
+    "re_dispatch_count": 0
+  }
+]

@@ -20,17 +20,11 @@ RECON_LOG="$DISPATCH_STATE_DIR/reconciler.log"
 
 # sid-A is at a welcome prompt ⇒ policy REDISPATCH ⇒ dispatch.sh, unless paused.
 # sid-orphan is a textbook sweep candidate ⇒ CLEANUP, unless paused.
-t_seed_entry sid-A "2026-07-26T11:00:00Z" "2026-07-26T12:30:00Z" in_flight ""
+REF="$T_TMP/ref.md"; printf 'ref\n' > "$REF"
+t_seed_dispatch sid-A ref_path="$REF" dispatched_at="2026-07-26T11:00:00Z" \
+  expected_report_by="2026-07-26T12:30:00Z" last_seen_at="2026-07-26T11:00:00Z"
 # maybe_redispatch requires the context-ref to exist, else it alerts instead of acting.
 REF="$T_TMP/ref.md"; printf 'ref\n' > "$REF"
-python3 - "$DISPATCH_STATE_DIR/active.json" "$REF" <<'PY'
-import json, sys
-path, ref = sys.argv[1:3]
-data = json.load(open(path))
-for e in data:
-    e["ref_path"] = ref
-json.dump(data, open(path, "w"), indent=2)
-PY
 cat > "$STUB_LIST_FILE" <<'EOF'
 [
   {"id":"orchestrator","healthStatus":"CONNECTED","startedAt":"2026-07-26T10:00:00Z"},
@@ -102,7 +96,8 @@ if got != want:
 PY
 t_assert_contains "$RECON_LOG" "HITL_PAUSE gate=$gid"
 t_assert_contains "$RECON_LOG" "dry_run=1"
-t_assert_status sid-A in_flight   # REDISPATCH never applied
+t_assert_lifecycle sid-A delivery_attempt_started   # REDISPATCH never applied
+t_assert_outcome_unknown sid-A
 
 # --- phase 2: corrupt gate file ⇒ fail-safe (still paused, logged loudly) ---
 "$HITL" approve "$gid" >/dev/null
@@ -130,6 +125,7 @@ fi
 if ! grep -q "cleanup sid-orphan" "$CLEANUP_LOG"; then
   echo "FAIL: no gate pending but the sweep did not run" >&2; exit 1
 fi
-t_assert_status sid-A re_dispatched
+t_assert_lifecycle sid-A re_dispatched
+t_assert_outcome_unknown sid-A
 
 echo "T63 PASS"

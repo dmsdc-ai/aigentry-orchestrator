@@ -10,7 +10,12 @@ import sys
 from typing import Any, TextIO
 
 
-ACTIVE_STATUSES = {"", "in_flight", "re_dispatched", "stuck_welcome"}
+# telepty#60 Stage A: the reconciler now passes the dispatch LIFECYCLE, not the
+# retired single `status` string. Both vocabularies are accepted so a registry
+# migrated mid-flight keeps being actuated.
+ACTIVE_STATUSES = {"", "in_flight", "re_dispatched", "stuck_welcome",
+                   "delivery_attempt_started", "delivery_state_unknown",
+                   "cutover_quarantine"}
 VERIFY_STATUS = "verify_started"
 TRACKER_STATUS = "tracker_check"
 SURFACE_UNKNOWN = "unknown"
@@ -138,7 +143,10 @@ def decide(status: str, state: dict[str, Any]) -> dict[str, str]:
             return action("REDISPATCH", "tracker legacy class=welcome", "stuck_welcome")
         if cls == "active":
             return action("NOOP", "tracker legacy class=active", "in_flight")
-        return action("NOOP", f"tracker legacy class={cls}; auto-report candidate", "in_flight")
+        # telepty#60 Stage A: every remaining class (prompt_observed, blank) is an
+        # observation with no outcome authority — there is no "report candidate"
+        # to promote it to.
+        return action("NOOP", f"tracker legacy class={cls}; observation only", "in_flight")
 
     allow_cleanup, cleanup_reason = cleanup_allowed(state)
     if allow_cleanup:
@@ -167,7 +175,7 @@ def decide(status: str, state: dict[str, Any]) -> dict[str, str]:
     if surface == "working" or activity == "moving":
         return action("NOOP", "session is actively working", status)
     if surface == "idle":
-        return action("NOOP", "idle prompt; wait for REPORT or auto-report evidence", status)
+        return action("NOOP", "prompt observed; outcome remains unknown", status)
     return action("ESCALATE", f"unhandled surface={surface}", status)
 
 

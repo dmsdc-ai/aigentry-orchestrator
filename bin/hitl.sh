@@ -30,7 +30,7 @@ HITL_DIR="${HITL_STATE_DIR:-$REPO_DIR/state/hitl}"
 PENDING_DIR="$HITL_DIR/pending"
 DECIDED_DIR="$HITL_DIR/decided"
 DISPATCH_DIR="${DISPATCH_STATE_DIR:-$REPO_DIR/state/dispatch}"
-ACTIVE_JSON="$DISPATCH_DIR/active.json"
+DISPATCH_REGISTRY_PY="${DISPATCH_REGISTRY_PY:-$SCRIPT_DIR/dispatch-registry.py}"
 
 TELEPTY="${TELEPTY:-telepty}"
 ORCH_SID="${ORCHESTRATOR_SID:-orchestrator}"
@@ -94,71 +94,34 @@ PY
   "$TELEPTY" inject --submit-force --from "$source" "$ORCH_SID" "$msg" >/dev/null 2>&1
 }
 
-# registry_status <sid> — current active.json status ("" when absent).
-registry_status() {
-  [ -f "$ACTIVE_JSON" ] || return 0
-  python3 - "$ACTIVE_JSON" "$1" <<'PY'
-import json, sys
-try:
-    entries = json.load(open(sys.argv[1]))
-except Exception:
-    entries = []
-for entry in entries if isinstance(entries, list) else []:
-    if entry.get("sid") == sys.argv[2]:
-        print(entry.get("status") or ""); break
-PY
+# telepty#60 Stage A: a gate is its OWN axis. Blocking a session on a human says
+# nothing about whether its task finished, so the gate never touches outcome and
+# never overwrites the lifecycle — it sets gate.state and clears it again, with
+# the lifecycle preserved underneath by the registry.
+registry() { "$DISPATCH_REGISTRY_PY" "$@"; }
+
+# registry_lifecycle <sid> — current lifecycle state ("" when absent).
+registry_lifecycle() {
+  local out
+  out=$(registry get --sid "$1" --pointer lifecycle.state 2>/dev/null) || return 0
+  [ "$out" = "null" ] && out=""
+  printf '%s' "$out"
 }
 
-# registry_set_status <sid> <status> [<expect>] — compare-and-set when <expect>
-# is given, so a worker that reported out-of-band while gated is never resurrected.
-registry_set_status() {
-  local sid="$1" status="$2" expect="${3:-}" now
-  [ -f "$ACTIVE_JSON" ] || return 0
-  now=$(now_iso)
-  ACTIVE_JSON="$ACTIVE_JSON" SID="$sid" ST="$status" EXPECT="$expect" NOW="$now" python3 - <<'PY'
-import fcntl, json, os
+registry_open_gate() {
+  registry set-gate --sid "$1" --state awaiting_user --now "$(now_iso)" >/dev/null 2>&1 || true
+}
 
-expect = os.environ["EXPECT"]
-with open(os.environ["ACTIVE_JSON"], "r+") as fh:
-    fcntl.flock(fh, fcntl.LOCK_EX)
-    try:
-        entries = json.load(fh)
-    except Exception:
-        entries = []
-    for entry in entries if isinstance(entries, list) else []:
-        if entry.get("sid") != os.environ["SID"]:
-            continue
-        if expect and entry.get("status") != expect:
-            continue
-        entry["status"] = os.environ["ST"]
-        entry["last_seen_at"] = os.environ["NOW"]
-    fh.seek(0)
-    fh.truncate()
-    json.dump(entries, fh, indent=2, ensure_ascii=False)
-    fh.write("\n")
-PY
+registry_close_gate() {
+  registry set-gate --sid "$1" --clear --now "$(now_iso)" >/dev/null 2>&1 || true
+}
+
+registry_set_lifecycle() {
+  registry set-lifecycle --sid "$1" --state "$2" --now "$(now_iso)" >/dev/null 2>&1 || true
 }
 
 registry_clear_redispatch() {
-  local sid="$1"
-  [ -f "$ACTIVE_JSON" ] || return 0
-  ACTIVE_JSON="$ACTIVE_JSON" SID="$sid" python3 - <<'PY'
-import fcntl, json, os
-
-with open(os.environ["ACTIVE_JSON"], "r+") as fh:
-    fcntl.flock(fh, fcntl.LOCK_EX)
-    try:
-        entries = json.load(fh)
-    except Exception:
-        entries = []
-    for entry in entries if isinstance(entries, list) else []:
-        if entry.get("sid") == os.environ["SID"]:
-            entry["re_dispatch_count"] = 0
-    fh.seek(0)
-    fh.truncate()
-    json.dump(entries, fh, indent=2, ensure_ascii=False)
-    fh.write("\n")
-PY
+  registry set-lifecycle --sid "$1" --re-dispatch-count 0 --now "$(now_iso)" >/dev/null 2>&1 || true
 }
 
 cmd_open() {
@@ -200,7 +163,7 @@ PY
 
   now=$(now_iso)
   local prev_status=""
-  [ -n "$subject" ] && prev_status=$(registry_status "$subject")
+  [ -n "$subject" ] && prev_status=$(registry_lifecycle "$subject")
 
   local tmp; tmp=$(mktemp "${file}.tmp.XXXXXX")
   ID="$id" KEY="$key" SOURCE="$source" SUBJECT="$subject" KIND="$kind" RESUME="$resume" \
@@ -241,7 +204,7 @@ PY
   fi
 
   # Blocking = registry status. The loops already filter on it.
-  [ -n "$subject" ] && registry_set_status "$subject" awaiting_user
+  [ -n "$subject" ] && registry_open_gate "$subject"
   printf '%s\n' "$id"
 }
 
@@ -334,10 +297,10 @@ cmd_decide() {
   prev=$(gate_field "$claim" prev_status)
   resume=$(gate_field "$claim" resume)
 
-  # Compare-and-set: only unblock what is still blocked by this gate.
-  if [ -n "$subject" ] && [ -n "$prev" ]; then
-    registry_set_status "$subject" "$prev" awaiting_user
-  fi
+  # Clearing the gate is enough: the lifecycle was never overwritten, so there is
+  # no prior status to restore and no window in which a worker that reported
+  # out-of-band while gated could be resurrected.
+  [ -n "$subject" ] && registry_close_gate "$subject"
 
   case "$resume" in
     reinject)
@@ -360,7 +323,7 @@ cmd_decide() {
       elif [ "$decision" = approve ]; then
         registry_clear_redispatch "$subject"
       else
-        registry_set_status "$subject" stuck_error
+        registry_set_lifecycle "$subject" stuck_error
       fi
       ;;
     *) ;;  # none — manual/info gate

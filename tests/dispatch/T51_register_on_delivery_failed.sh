@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # T51 — #574: when --verify-delivered reports a (false-negative) failure AFTER the
-#        inject has already landed, dispatch.sh must still register the dispatch in
-#        active.json (so #517 pull-AUTO_REPORT fallback can find the started session)
-#        AND still exit 5 (DELIVERY_FAILED) for callers that depend on the signal.
+#        inject has already landed, the dispatch record must still exist (so a
+#        started session is never invisible) AND dispatch.sh must still exit 5
+#        (DELIVERY_FAILED) for callers that depend on the signal.
+#
+# telepty#60 Stage A makes this structural rather than best-effort: the record is
+# committed BEFORE the bytes are handed over, so no post-delivery verdict can
+# decide whether it exists.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
@@ -57,14 +61,16 @@ set -e
 # (a) exit code 5 (DELIVERY_FAILED) preserved.
 [ "$rc" -eq 5 ] || { echo "FAIL: want exit 5 (DELIVERY_FAILED), got $rc" >&2; exit 1; }
 
-# (b) the dispatch was still registered in active.json despite verify-FN.
-t_assert_status t51-fn in_flight
+# (b) the dispatch record survives the verify-FN, with its outcome still unknown.
+t_assert_lifecycle t51-fn delivery_attempt_started
+t_assert_outcome_unknown t51-fn
+t_assert_v2 t51-fn transport.result write_observed
 
 python3 - "$DISPATCH_STATE_DIR/active.json" <<'PY'
 import json, sys
-data = json.load(open(sys.argv[1]))
-rows = [e for e in data if e.get("sid") == "t51-fn"]
-assert len(rows) == 1, f"FAIL: want 1 t51-fn entry, got {len(rows)}"
+doc = json.load(open(sys.argv[1], encoding="utf-8"))
+rows = [r for r in doc["dispatches"] if r["assigned"]["sid"] == "t51-fn"]
+assert len(rows) == 1, f"FAIL: want 1 t51-fn record, got {len(rows)}"
 assert rows[0].get("track") == "t51", f"FAIL: track={rows[0].get('track')!r}"
 PY
 

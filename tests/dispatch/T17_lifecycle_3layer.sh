@@ -39,17 +39,30 @@ export SCHEDULER_SH="$SCHED"
 
 pending="$DISPATCH_STATE_DIR/cleanup-pending.json"
 
-# Seed: worker sid-W1 (Layer A), sid-W2 (Layer D), sid-W3 (EXTEND), sid-W4 (crash).
-"$REPO_ROOT/bin/dispatch-tracker.sh" append sid-W1 /tmp/r hash1 --from orchestrator
-"$REPO_ROOT/bin/dispatch-tracker.sh" append sid-W2 /tmp/r hash2 --from orchestrator
-"$REPO_ROOT/bin/dispatch-tracker.sh" append sid-W3 /tmp/r hash3 --from orchestrator
-"$REPO_ROOT/bin/dispatch-tracker.sh" append sid-KA /tmp/r hashK --from orchestrator --keep-alive
+# Seed: worker sid-W1 (Layer A), sid-W2 (Layer D), sid-W3 (EXTEND), sid-KA (opt-out).
+# telepty#60 Stage A: records are created by the begin-delivery transaction, so
+# there is no `append` hook to call here.
+for sid in sid-W1 sid-W2 sid-W3; do
+  t_registry begin-delivery --sid "$sid" --ref-hash "hash-$sid" --ref-path /tmp/r \
+    --from orchestrator >/dev/null
+done
+t_registry begin-delivery --sid sid-KA --ref-hash hashK --ref-path /tmp/r \
+  --from orchestrator --keep-alive >/dev/null
+
+# Layer D is armed by the legacy REPORT envelope, which 0.8.0 records as an
+# observation with no outcome authority — the cleanup schedule is the lifecycle
+# side effect that survives (see T83).
+report_layer_d() {
+  local sid="$1" body="$T_TMP/report-$1.txt"
+  printf 'REPORT: %s-DONE | files=x\n' "$sid" > "$body"
+  "$HANDLER" --sid "$sid" --body-file "$body" >/dev/null
+}
 
 # ---------------------------------------------------------------------------
 # (a1) Layer A success path
 # ---------------------------------------------------------------------------
 export SCHEDULER_NOW="2026-05-23T12:00:00Z"
-TRACKER_NOW="$SCHEDULER_NOW" "$REPO_ROOT/bin/dispatch-tracker.sh" mark-reported sid-W1
+report_layer_d sid-W1
 sched=$(python3 -c "import json;print(next(p for p in json.load(open('$pending')) if p['sid']=='sid-W1')['scheduled_cleanup_time'])")
 [ "$sched" = "2026-05-23T12:01:00Z" ] || { echo "FAIL a1: schedule = $sched" >&2; exit 1; }
 
@@ -72,7 +85,7 @@ grep -q "cleanup sid-W1" "$CLEANUP_LOG" || { echo "FAIL a1: cleanup not invoked 
 # (a2) Layer D timeout path — sid-W2 reports, never sends CLEANUP_REQUEST
 # ---------------------------------------------------------------------------
 export SCHEDULER_NOW="2026-05-23T12:10:00Z"
-TRACKER_NOW="$SCHEDULER_NOW" "$REPO_ROOT/bin/dispatch-tracker.sh" mark-reported sid-W2
+report_layer_d sid-W2
 export SCHEDULER_NOW="2026-05-23T12:11:00Z"
 "$SCHED" tick >/dev/null
 grep -q "cleanup sid-W2" "$CLEANUP_LOG" || { echo "FAIL a2: Layer D did not fire for sid-W2" >&2; exit 1; }
@@ -81,7 +94,7 @@ firings=$(grep -c "cleanup sid-W2" "$CLEANUP_LOG")
 [ "$firings" = "1" ] || { echo "FAIL a2: Layer D re-fired (count=$firings) — not idempotent" >&2; exit 1; }
 
 # Also: keep-alive sid-KA must NOT have been armed at all.
-TRACKER_NOW="$SCHEDULER_NOW" "$REPO_ROOT/bin/dispatch-tracker.sh" mark-reported sid-KA
+report_layer_d sid-KA
 ka_count=$(python3 -c "import json;d=json.load(open('$pending'));print(sum(1 for p in d if p['sid']=='sid-KA'))")
 [ "$ka_count" = "0" ] || { echo "FAIL a2: keep-alive sid-KA was armed (count=$ka_count)" >&2; exit 1; }
 
@@ -89,7 +102,7 @@ ka_count=$(python3 -c "import json;d=json.load(open('$pending'));print(sum(1 for
 # (a3) EXTEND_LIFETIME path — sid-W3 reports, then defers
 # ---------------------------------------------------------------------------
 export SCHEDULER_NOW="2026-05-23T12:20:00Z"
-TRACKER_NOW="$SCHEDULER_NOW" "$REPO_ROOT/bin/dispatch-tracker.sh" mark-reported sid-W3
+report_layer_d sid-W3
 
 extend_body="$T_TMP/extend.txt"
 printf 'EXTEND_LIFETIME: sid-W3 | defer_minutes: 5 | reason: more-work\n' > "$extend_body"
