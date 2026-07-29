@@ -195,7 +195,7 @@ def position_windows(ordered, rows, cols, win_map):
 
 
 def main():
-    orchestrator_id = "aigentry-orchestrator-claude"
+    orchestrator_id = "orchestrator"  # #690 / Rule 16: real sid; override via --orchestrator=
     for arg in sys.argv[1:]:
         if arg.startswith("--orchestrator="):
             orchestrator_id = arg.split("=", 1)[1]

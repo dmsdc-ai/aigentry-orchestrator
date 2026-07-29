@@ -31,7 +31,7 @@ Parse `$ARGUMENTS` to extract target session(s). If empty, ask user which sessio
 
 1. **Identify target**: Match session ID to project from registry above
 2. **Determine project type**: npm / cargo / python / none
-3. **Self-ship check**: If target is `aigentry-orchestrator-claude` (self), execute directly instead of inject:
+3. **Self-ship check**: If target is the orchestrator itself (sid `${AIGENTRY_ORCHESTRATOR_SID:-orchestrator}`), execute directly instead of inject:
    - Run git commands directly in `~/projects/aigentry-orchestrator/`
    - No telepty inject needed
    - Follow the same commit/push/publish steps for the project type
@@ -45,7 +45,7 @@ Ship task: commit, push, and publish. Execute immediately without asking for con
 3. npm version patch (or minor/major if breaking changes)
 4. git push origin main
 5. npm publish --access public
-6. Report result to orchestrator: telepty inject --ref --from {session-id} aigentry-orchestrator-claude "ship report"
+6. Report result to orchestrator: telepty inject --ref --from {session-id} "${AIGENTRY_ORCHESTRATOR_SID:-orchestrator}" "ship report"
 Do NOT ask for user confirmation. Execute all steps directly.
 ```
 
@@ -58,7 +58,7 @@ Ship task: commit, push, and publish. Execute immediately without asking for con
 4. cargo check && cargo test
 5. git push origin main
 6. cargo publish
-7. Report result to orchestrator: telepty inject --ref --from {session-id} aigentry-orchestrator-claude "ship report"
+7. Report result to orchestrator: telepty inject --ref --from {session-id} "${AIGENTRY_ORCHESTRATOR_SID:-orchestrator}" "ship report"
 Do NOT ask for user confirmation. Execute all steps directly.
 ```
 
@@ -70,7 +70,7 @@ Ship task: commit, push, and publish. Execute immediately without asking for con
 3. Update version in pyproject.toml if needed
 4. git push origin main
 5. python -m build && twine upload dist/*
-6. Report result to orchestrator: telepty inject --ref --from {session-id} aigentry-orchestrator-claude "ship report"
+6. Report result to orchestrator: telepty inject --ref --from {session-id} "${AIGENTRY_ORCHESTRATOR_SID:-orchestrator}" "ship report"
 Do NOT ask for user confirmation. Execute all steps directly.
 ```
 
@@ -80,7 +80,7 @@ Ship task: commit and push. Execute immediately without asking for confirmation.
 1. git add -A && git status (review changes)
 2. git commit with conventional commit message
 3. git push origin main
-4. Report result to orchestrator: telepty inject --ref --from {session-id} aigentry-orchestrator-claude "ship report"
+4. Report result to orchestrator: telepty inject --ref --from {session-id} "${AIGENTRY_ORCHESTRATOR_SID:-orchestrator}" "ship report"
 Do NOT ask for user confirmation. Execute all steps directly.
 ```
 
@@ -88,7 +88,8 @@ Do NOT ask for user confirmation. Execute all steps directly.
    - Show: target session, project type, publish command
    - Ask: "Ship {project} via {session-id}? (y/n)"
 
-5. **Send inject** via telepty inject (use --ref for long prompts, --from aigentry-orchestrator-claude)
+5. **Send inject** via telepty inject (use --ref for long prompts, --from `${AIGENTRY_ORCHESTRATOR_SID:-orchestrator}`)
+   - Ship injects bypass `bin/dispatch.sh`, so no `{{ORCHESTRATOR_REPORT_TARGET}}` substitution happens here — the env form above self-resolves in the shell that runs the command (#690 / Rule 16). Optional: for a cross-machine target that needs the `<sid>@<tailnet-ip>` form, take it from `bin/orchestrator-report-target.sh`.
 
 6. **Wait for report** from target session
 

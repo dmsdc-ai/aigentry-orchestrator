@@ -44,7 +44,7 @@ If `dispatch_kind: re-dispatch`:
 
 ## E. REPORT format
 
-- [ ] **Final REPORT inject template present** with `telepty inject --ref --submit --submit-retry 2 --from <sid> <orchestrator-sid> "REPORT: <tag>-DONE | ..."` shape
+- [ ] **Final REPORT inject template present** with `telepty inject --ref --submit --submit-retry 2 --from <sid> {{ORCHESTRATOR_REPORT_TARGET}} "REPORT: <tag>-DONE | ..."` shape
 - [ ] **REPORT includes task #N reference** (links back to issue tracker / task queue)
 - [ ] **REPORT includes verifiable evidence keys** (commit sha, file path, command exit-code)
 

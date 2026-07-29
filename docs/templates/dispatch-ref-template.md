@@ -70,6 +70,12 @@ Final REPORT inject (format below).
 
 ## HOLD inject protocol (silent waiting forbidden)
 
+> **`{{ORCHESTRATOR_REPORT_TARGET}}`** (used below and in §REPORT): leave this token
+> verbatim in the ref — `bin/dispatch.sh` substitutes the resolved orchestrator
+> address (`<sid>@<tailnet-ip>`, env-overridable, auto-detected) at inject time so
+> the target resolves for both local and cross-machine workers. Do NOT hardcode a
+> session id here (#690 / Rule 16).
+
 **Format (single line, sent via real `telepty inject` — NOT printed as markdown):**
 ```
 HOLD: <task-tag> | phase: <N>/<total> awaiting | reason: <one-line of what happened + what's needed> | needs: <specific decision the orchestrator must make>
@@ -77,7 +83,7 @@ HOLD: <task-tag> | phase: <N>/<total> awaiting | reason: <one-line of what happe
 
 **Send via:**
 ```bash
-telepty inject --submit --submit-force --from <session-id> <orchestrator-session-id> "HOLD: ..."
+telepty inject --submit --submit-force --from <session-id> {{ORCHESTRATOR_REPORT_TARGET}} "HOLD: ..."
 ```
 
 > **Why `--submit-force`?** Telepty's default `--submit` runs a "ready gate" that returns `bootstrap_not_ready` (daemon.js:631) when the target session's state is transient — which happens whenever orchestrator is mid-tool-call. In that mode the text is injected to the input box but **enter is NOT pressed** (user sees stuck text). `--submit-force` bypasses the gate (cli.js:1657 escape hatch). MANDATORY for all worker→orchestrator injects until telepty land upstream fix (task #132).
@@ -94,7 +100,7 @@ Silent waiting at any of the above = Constitution §13 violation = task #397 rep
 
 ## REPORT format (final phase)
 ```bash
-telepty inject --ref --submit --submit-force --submit-retry 2 --from <session-id> <orchestrator-session-id> "REPORT: <task-tag>-DONE | <key1>: <value> | <key2>: <value> | task: #<issue-number>"
+telepty inject --ref --submit --submit-force --submit-retry 2 --from <session-id> {{ORCHESTRATOR_REPORT_TARGET}} "REPORT: <task-tag>-DONE | <key1>: <value> | <key2>: <value> | task: #<issue-number>"
 ```
 
 > Same `--submit-force` requirement as HOLD inject above (see "Why `--submit-force`?" note). Applies to PROGRESS / REPORT / ACK injects equally.
@@ -109,7 +115,7 @@ telepty inject --ref --submit --submit-force --submit-retry 2 --from <session-id
 
 **Envelope-in-PTY (preferred — fenced JSON, ssot `@aigentry/ssot/contracts/handoff` shape):**
 ```bash
-telepty inject --submit --submit-force --from <tester-session-id> <orchestrator-session-id> "$(cat <<'BODY'
+telepty inject --submit --submit-force --from <tester-session-id> {{ORCHESTRATOR_REPORT_TARGET}} "$(cat <<'BODY'
 TEST_REPORT inbound — see envelope below.
 ```json aigentry-envelope/v1
 {
@@ -133,7 +139,7 @@ BODY
 
 **Markdown fallback (backward-compat — for runners that can't emit fenced JSON):**
 ```bash
-telepty inject --submit --submit-force --from <tester-session-id> <orchestrator-session-id> "TEST_REPORT: <tester-session-id> | suite=<suite-name> | total=42 | passed=41 | failed=1 | skipped=0 | duration_ms=1234"
+telepty inject --submit --submit-force --from <tester-session-id> {{ORCHESTRATOR_REPORT_TARGET}} "TEST_REPORT: <tester-session-id> | suite=<suite-name> | total=42 | passed=41 | failed=1 | skipped=0 | duration_ms=1234"
 ```
 
 Field semantics (mirror `pkg/src/contracts/handoff.ts` exactly — see ssot v1):

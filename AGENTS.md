@@ -120,7 +120,7 @@ telepty list
 
 ## 위임 inject 필수 포함 (요약)
 
-1. **보고 경로** (Rule 7) — `⚠️ MANDATORY: ... telepty inject --ref --from {sid} aigentry-orchestrator-claude 'REPORT: ...'`
+1. **보고 경로** (Rule 7) — `⚠️ MANDATORY: ... telepty inject --ref --from {sid} {{ORCHESTRATOR_REPORT_TARGET}} 'REPORT: ...'` (`bin/dispatch.sh`가 inject 시점에 실제 오케스트레이터 주소 `<sid>@<tailnet-ip>`로 치환 — 하드코딩 sid 금지, #690 / Rule 16)
 2. **풀 역량 지시** — "가지고 있는 모든 스킬, 도구, MCP 서버, 워크플로우를 100% 활용해서 최고 품질로 구현해줘"
 3. **[SAWP] envelope** (Rule 17) — `docs/sawp.md` 전문
 4. **[SPEC FIRST]** (Rule 24) — 구현 승인 전

@@ -61,6 +61,7 @@ OPEN_SESSION_SH="${OPEN_SESSION_SH:-$SCRIPT_DIR/open-session.sh}"
 SESSION_PROBE_PY="${SESSION_PROBE_PY:-$SCRIPT_DIR/session-probe.py}"
 TELEPTY="${TELEPTY:-telepty}"
 EMIT_TELEMETRY_MJS="${EMIT_TELEMETRY_MJS:-$SCRIPT_DIR/emit-telemetry.mjs}"
+REPORT_TARGET_SH="${REPORT_TARGET_SH:-$SCRIPT_DIR/orchestrator-report-target.sh}"
 
 # §9 독립: telemetry failure must NEVER block dispatch. Shim swallows
 # transport errors; `|| true` guards against exec-level failures too.
@@ -295,11 +296,26 @@ dedup_check_and_mark() {
 }
 
 do_inject() {
-  local sid="$1"
-  local -a a=(inject --ref "$ref_file" --submit --submit-retry 2)
+  local sid="$1" eff_ref="$ref_file" tmp_ref=""
+  # #690 (Rule 16): refs carry the {{ORCHESTRATOR_REPORT_TARGET}} placeholder so
+  # workers are never handed a phantom/hardcoded orchestrator sid. Resolve the
+  # real address (env override + tailnet auto-detect, NO hardcoded sid/IP) and
+  # substitute into a temp copy — $ref_file (dedup hash / verify / tracker) stays
+  # the original. No placeholder in the ref → no-op (back-compat).
+  if grep -q '{{ORCHESTRATOR_REPORT_TARGET}}' "$ref_file" 2>/dev/null; then
+    local target_addr
+    target_addr="$("$REPORT_TARGET_SH")"
+    tmp_ref="$(mktemp "${TMPDIR:-/tmp}/dispatch-ref.XXXXXX")"
+    sed "s|{{ORCHESTRATOR_REPORT_TARGET}}|$target_addr|g" "$ref_file" > "$tmp_ref"
+    eff_ref="$tmp_ref"
+  fi
+  local -a a=(inject --ref "$eff_ref" --submit --submit-retry 2)
   [ -n "$from_id" ] && a+=(--from "$from_id")
   a+=("$sid")
-  "$TELEPTY" "${a[@]}"
+  local rc=0
+  "$TELEPTY" "${a[@]}" || rc=$?
+  [ -n "$tmp_ref" ] && rm -f "$tmp_ref"
+  return "$rc"  # preserve the inject's real exit code (callers gate on it)
 }
 
 # Returns 0 if the inject visibly landed (placeholder cleared or payload's

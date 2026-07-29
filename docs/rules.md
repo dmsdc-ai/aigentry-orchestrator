@@ -202,10 +202,12 @@ ADR: `docs/adr/2026-05-03-d-promotion-phase6-promote.md` §4 (D PROMOTION verdic
 
 ```
 ⚠️ MANDATORY: When done, you MUST immediately run:
-telepty inject --ref --from {your-session-id} aigentry-orchestrator-claude
+telepty inject --ref --from {your-session-id} {{ORCHESTRATOR_REPORT_TARGET}}
   'REPORT: {modified files} | {change summary} | {build result} | {remaining issues}'.
 Do NOT idle or wait — report is REQUIRED before any other action.
 ```
+
+> `{{ORCHESTRATOR_REPORT_TARGET}}` is a placeholder `bin/dispatch.sh` substitutes with the resolved orchestrator address (`<sid>@<tailnet-ip>`; `AIGENTRY_ORCHESTRATOR_SID`/`AIGENTRY_ORCHESTRATOR_HOST` overridable, tailnet auto-detected) at inject time — never a hardcoded session id (#690 / Rule 16). Only dispatch refs (which go through `bin/dispatch.sh`) may carry the token; paths that bypass dispatch (e.g. `.claude/commands/ship.md`) use `${AIGENTRY_ORCHESTRATOR_SID:-orchestrator}` directly, since nothing would substitute the token there.
 
 **codex 특별 조치**: codex는 자율 보고 안 하는 경우 다수 → 작업 완료 감지 시 오케스트레이터가 보고 명령을 **별도 단독 inject**로 재전송.
 
