@@ -6,6 +6,10 @@
 #   3. dispatch.sh do_inject() substitutes {{ORCHESTRATOR_REPORT_TARGET}} in the
 #      injected ref with the resolved target.
 #   4. ref without the placeholder → passthrough unchanged (back-compat).
+#   5. resolver missing / failing / empty → do_inject FAILS CLOSED: non-zero, and
+#      NOTHING is injected. do_inject's call site (dispatch.sh `if ! do_inject`)
+#      disables errexit inside the body, so an unresolved target would otherwise
+#      be substituted as the empty string and reported as success — #690 reborn.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
@@ -30,13 +34,17 @@ fi
 # ---- 3. do_inject() substitutes the placeholder ----
 cap="$T_TMP/injected-ref.txt"; : > "$cap"
 export CAP_FILE="$cap"
+cnt="$T_TMP/inject-count"; echo 0 > "$cnt"
+export CNT_FILE="$cnt"
 
 mystub="$T_TMP/telepty-capture"
 cat > "$mystub" <<'STUB'
 #!/usr/bin/env bash
 # capture the CONTENT of the --ref file actually injected (do_inject deletes its
-# temp copy after inject, so we must read it here, during the call).
+# temp copy after inject, so we must read it here, during the call) and count the
+# injects, so case 5 can assert that a failed resolve injected NOTHING at all.
 if [ "$1" = "inject" ]; then
+  echo $(( $(cat "$CNT_FILE") + 1 )) > "$CNT_FILE"
   prev=""
   for a in "$@"; do [ "$prev" = "--ref" ] && cat "$a" > "$CAP_FILE"; prev="$a"; done
   echo "stub inject OK"; exit 0
@@ -75,5 +83,26 @@ printf 'plain body no placeholder\n' > "$ref2"
 ref_file="$ref2"
 do_inject sid-A >/dev/null
 t_assert_contains "$cap" 'plain body no placeholder'
+
+# ---- 5. resolver missing / failing / empty → fail closed, inject NOTHING ----
+# Asserted through the real call site's shape (`if ! do_inject`), which disables
+# errexit inside the function body — the reason this needs an explicit guard.
+failing_empty="$T_TMP/resolver-empty"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$failing_empty"   # rc 0 but no output
+chmod +x "$failing_empty"
+
+for bad in "$T_TMP/resolver-does-not-exist" "$failing_empty"; do
+  : > "$cap"; echo 0 > "$cnt"
+  ref_file="$ref"                       # the ref that DOES carry the placeholder
+  REPORT_TARGET_SH="$bad"
+  rc=0
+  if ! do_inject sid-A >/dev/null 2>&1; then rc=1; fi
+  [ "$rc" -ne 0 ] || {
+    echo "FAIL: do_inject returned 0 with an unresolvable target ($bad)" >&2
+    echo "      injected: [$(cat "$cap")]" >&2; exit 1; }
+  [ "$(cat "$cnt")" = "0" ] || {
+    echo "FAIL: injected $(cat "$cnt")x despite an unresolvable target ($bad)" >&2
+    echo "      injected: [$(cat "$cap")]" >&2; exit 1; }
+done
 
 echo "T67 PASS"

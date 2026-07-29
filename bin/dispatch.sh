@@ -303,8 +303,17 @@ do_inject() {
   # substitute into a temp copy — $ref_file (dedup hash / verify / tracker) stays
   # the original. No placeholder in the ref → no-op (back-compat).
   if grep -q '{{ORCHESTRATOR_REPORT_TARGET}}' "$ref_file" 2>/dev/null; then
-    local target_addr
-    target_addr="$("$REPORT_TARGET_SH")"
+    local target_addr=""
+    # Fail CLOSED. This function is called as `if ! do_inject ...` (below), which
+    # disables errexit inside the body — so a missing/failing resolver would
+    # otherwise substitute the empty string and still return 0, handing the worker
+    # a report target that resolves to nothing under a green success signal (#690
+    # reborn). No fallback default: guessing the target is the bug being removed.
+    target_addr="$("$REPORT_TARGET_SH")" || target_addr=""
+    if [ -z "$target_addr" ]; then
+      echo "dispatch.sh: could not resolve the orchestrator report target via $REPORT_TARGET_SH — refusing to inject a ref with an unresolved {{ORCHESTRATOR_REPORT_TARGET}} (#690)" >&2
+      return 1
+    fi
     tmp_ref="$(mktemp "${TMPDIR:-/tmp}/dispatch-ref.XXXXXX")"
     sed "s|{{ORCHESTRATOR_REPORT_TARGET}}|$target_addr|g" "$ref_file" > "$tmp_ref"
     eff_ref="$tmp_ref"
