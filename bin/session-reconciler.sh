@@ -94,6 +94,11 @@ SURFACE_MISMATCHED_SRC="${AIGENTRY_SURFACE_MISMATCHED_SOURCE:-$STATE_DIR/surface
 
 # shellcheck source=lib/workspace-host.sh
 . "$SCRIPT_DIR/lib/workspace-host.sh"
+# #835 — an empty `telepty list --json` is also what a REFUSED list request looks
+# like, and this tick treats absent sids as authorization to prune their workspaces
+# and to open gates about them.
+# shellcheck source=lib/telepty-listing.sh
+. "$SCRIPT_DIR/lib/telepty-listing.sh"
 
 mkdir -p "$STATE_DIR"
 [ -f "$BACKOFF_JSON" ] || printf '{}\n' > "$BACKOFF_JSON"
@@ -220,7 +225,32 @@ probe_session() {
 # hitl_open <hitl.sh open args…> — open a gate, alerting (never aborting the
 # tick) if the CLI is missing or fails. The gate's own file-before-notify design
 # is what makes this safe to call from a level-triggered loop.
+#
+# #836 — every gate this loop opens names a subject session and offers the operator
+# an action ON that session ("re-dispatch once more", "resume the session as-is").
+# The subjects come from the DISPATCH registry, which outlives the session: a record
+# whose session was cleaned up still reaches here, and the gate then asks a question
+# nobody can answer. Two such gates fired this month, each costing an operator a
+# verification round. So the subject is verified against the live session registry
+# first, and an absent one is recorded as stale rather than escalated.
+#
+# UNKNOWN liveness is NOT absence (#835): when the listing was refused or the daemon
+# did not answer, telepty_sid_live returns 2 and the gate OPENS. Suppressing an
+# escalation on an untrustworthy absence would be the same defect one layer up — and
+# unlike a surface close, a spurious gate destroys nothing.
 hitl_open() {
+  local arg subject="" want_subject=0 live=0
+  for arg in "$@"; do
+    if [ "$want_subject" -eq 1 ]; then subject="$arg"; want_subject=0; continue; fi
+    [ "$arg" = "--subject-sid" ] && want_subject=1
+  done
+  if [ -n "$subject" ]; then
+    telepty_sid_live "$subject" || live=$?
+    if [ "$live" -eq 1 ]; then
+      emit_alert "HITL_GATE_STALE subject-sid=$subject is not in the live session registry — gate NOT opened (it would ask the operator to act on a session that no longer exists); args: $*"
+      return 0
+    fi
+  fi
   if [ ! -x "$HITL_SH" ]; then
     emit_alert "HITL_GATE_UNAVAILABLE $HITL_SH not executable — args: $*"
     return 0
@@ -386,12 +416,21 @@ keep_alive_sids() {
   registry list --keep-alive --fields assigned.sid 2>/dev/null || true
 }
 
-# telepty_list_json — fail loudly on bad JSON (#400 lesson).
+# telepty_list_json — fail loudly on bad JSON (#400 lesson) and on an EMPTY list
+# the daemon will not corroborate (#835 lesson). The whole sweep hangs off this
+# listing, and step 2b prunes every role-sandbox workspace whose title is not in
+# it — so under a refusal an empty listing closes every live worker's surface on
+# the second tick (the ledger debounce buys exactly 60 seconds). "Refused" and
+# "unreachable" are not "there are no sessions"; abort the tick instead.
 telepty_list_json() {
-  local raw
+  local raw verdict
   raw=$("$TELEPTY" list --json 2>/dev/null) || { log "ERR telepty list non-zero"; return 1; }
   if ! printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
     log "ERR telepty list --json returned non-JSON (binary/daemon version mismatch?)"
+    return 1
+  fi
+  if ! verdict=$(telepty_listing_trusted "$raw"); then
+    log "ERR telepty list --json returned [] but the daemon answered '$verdict' — a refusal is not an absence; refusing to sweep or prune on it"
     return 1
   fi
   printf '%s' "$raw"

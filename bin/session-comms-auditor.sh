@@ -23,6 +23,7 @@
 # Article 17 (무의존): pure bash + python3 stdlib + telepty. No npm runtime deps.
 #
 # Usage: session-comms-auditor.sh   # one audit pass over new peer-inject log lines
+# Exit codes: 0 pass complete, 5 one or more HOLD escalations could not be delivered.
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
@@ -195,15 +196,31 @@ PY
 
 # Route each out-of-policy inject upward: a HOLD into the orchestrator inbox so the
 # orchestrator (HITL) can correct the worker. Phase 1 cannot block in-band; it
-# detects + escalates. Best-effort — telemetry already recorded the violation.
+# detects + escalates.
+#
+# #835 — this used to end in `|| true`, and the byte cursor was ALREADY advanced by
+# the pass above. A refused inject therefore lost the escalation permanently: the
+# line is never re-read, so no later tick re-raises it, and the auditor still exited
+# 0. "Telemetry already recorded it" is not a substitute — telemetry is a file
+# nobody is watching; the HOLD is the part that reaches a human. The failure is
+# counted and carried into a non-zero exit, which is the only channel that survives
+# the reconciler's `>/dev/null 2>&1` on this call.
 orch_sid="${ORCH_SIDS%% *}"
+undelivered=0
 if [ -n "$holds" ]; then
   while IFS=$'\t' read -r _tag h_from h_to h_excerpt; do
     [ "$_tag" = "HOLD" ] || continue
-    "$TELEPTY" inject --submit "$orch_sid" \
+    if ! "$TELEPTY" inject --submit "$orch_sid" \
       "HOLD: peer-lane out-of-policy inject | from: $h_from | to: $h_to | excerpt: $h_excerpt" \
-      >/dev/null 2>&1 || true
+      >/dev/null 2>&1; then
+      undelivered=$((undelivered + 1))
+      echo "session-comms-auditor: HOLD UNDELIVERED to '$orch_sid' (from=$h_from to=$h_to) — telepty inject exited non-zero and the audit cursor has already advanced, so this violation will not be re-raised" >&2
+    fi
   done <<< "$holds"
 fi
 
+if [ "$undelivered" -gt 0 ]; then
+  echo "session-comms-auditor: $undelivered escalation(s) undelivered" >&2
+  exit 5
+fi
 exit 0

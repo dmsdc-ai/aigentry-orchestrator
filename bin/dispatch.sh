@@ -49,7 +49,9 @@
 # Exit codes: 0 OK, 1 timeout, 2 spawn failed, 3 inject failed, 4 usage,
 #             5 --verify-delivered detected delivery failure,
 #             6 session never registered in telepty list (#727),
-#             7 DELIVERY_UNKNOWN_RETRY_HELD, 8 DEDUPLICATED_NO_NEW_DELIVERY,
+#             7 DELIVERY_UNKNOWN_RETRY_HELD (also: --verify-delivered could not
+#               read the screen back, so delivery is unknown rather than failed),
+#             8 DEDUPLICATED_NO_NEW_DELIVERY,
 #             9 DISPATCH_NOT_RECORDED (registry failure; telepty was never called).
 #
 # telepty#60 Stage A: exit 0 means BOTH a new telepty transport write AND its
@@ -341,12 +343,24 @@ do_inject() {
 }
 
 # Returns 0 if the inject visibly landed (placeholder cleared or payload's
-# first line echoed), 1 otherwise. Called only when --verify-delivered is set.
+# first line echoed), 1 if it visibly did not, 2 if it could not be told either
+# way. Called only when --verify-delivered is set.
+#
+# #835: the `2>/dev/null || true` used to fold a FAILED read-screen into an empty
+# screen, and an empty screen matches no placeholder — so the check below fell
+# through to exit 0 and the dispatch reported `verified: true` on the strength of
+# having read nothing. A refused or unanswered read is not evidence of delivery;
+# it is the absence of evidence, and that is exit 2 (the caller maps it onto the
+# existing "delivery unknown" code rather than claiming either outcome).
 verify_delivered() {
-  local sid="$1" first_line post
+  local sid="$1" first_line post rc=0
   first_line=$(head -n1 "$ref_file" | tr -d '\r')
   sleep 5
-  post=$("$TELEPTY" read-screen "$sid" --lines 30 2>/dev/null || true)
+  post=$("$TELEPTY" read-screen "$sid" --lines 30 2>/dev/null) || rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$post" ]; then
+    echo "dispatch.sh: read-screen for $sid returned nothing (rc=$rc) — delivery is UNVERIFIABLE, not verified" >&2
+    return 2
+  fi
   FIRST="$first_line" POST="$post" python3 - <<'PY'
 import os, re, sys
 post = os.environ.get("POST", "")
@@ -675,10 +689,19 @@ if ! registry set-transport-result --sid "$sid" --result write_observed >/dev/nu
 fi
 
 if [ "$verify_delivered" -eq 1 ]; then
-  if ! verify_delivered "$sid"; then
-    echo "dispatch.sh: DELIVERY_FAILED for $sid (placeholder untouched; registered for pull-fallback despite verify-FN)" >&2
-    exit 5
-  fi
+  verify_rc=0
+  verify_delivered "$sid" || verify_rc=$?
+  case "$verify_rc" in
+    0) ;;
+    # #835 — "the screen could not be read" is not "the inject failed". Exit 7 is
+    # this repo's existing name for a delivery whose result is unknown, and the
+    # re-dispatch callers already hold rather than replay on it; claiming 5
+    # (DELIVERY_FAILED) would assert an outcome nothing measured.
+    2) echo "dispatch.sh: DELIVERY_UNKNOWN for $sid — the inject was written but the screen could not be read back, so nothing corroborates it" >&2
+       exit 7;;
+    *) echo "dispatch.sh: DELIVERY_FAILED for $sid (placeholder untouched; registered for pull-fallback despite verify-FN)" >&2
+       exit 5;;
+  esac
 fi
 task_ledger_update "$sid"
 
