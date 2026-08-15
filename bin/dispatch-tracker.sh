@@ -49,6 +49,11 @@ NOW_OVERRIDE="${TRACKER_NOW:-}"
 
 mkdir -p "$STATE_DIR"
 
+# The one daemon-credential resolver (#824). The observation poll below is a direct
+# HTTP call, so it has to present the token itself.
+# shellcheck source=lib/telepty-auth.sh
+. "$SCRIPT_DIR/lib/telepty-auth.sh"
+
 usage() { sed -n '2,22p' "$0"; }
 
 # Every registry access is a typed call to the one transactional component.
@@ -130,23 +135,6 @@ PY
 }
 
 # _json_sub <json-text> <key> — the named sub-object as JSON ("{}" when absent).
-# The daemon auth token, from the SAME source of truth the telepty CLI uses:
-# ~/.telepty/config.json `authToken` (cli.js getAuthToken → getConfig().authToken, cli.js:168-181;
-# mcp-server/index.mjs:28-34 reads the identical file). Deliberately NOT a second source — a
-# divergent copy of a credential is how the two ends silently stop agreeing about who is calling.
-# Empty output when the file is missing or unreadable: the poll then gets a truthful 401 and the
-# distinct `observation_poll_unauthorized` reason, rather than a confusing absence.
-_telepty_token() {
-  python3 - <<'PY' 2>/dev/null || true
-import json, os
-try:
-    with open(os.path.join(os.path.expanduser("~"), ".telepty", "config.json")) as fh:
-        print(json.load(fh).get("authToken", "") or "")
-except Exception:
-    print("")
-PY
-}
-
 _json_sub() {
   JSON_TEXT="$1" KEY="$2" python3 - <<'PY'
 import json, os
@@ -512,7 +500,7 @@ _poll_observations_and_hold() {
   if [ -z "$inject_id" ] || [ "$inject_id" = "null" ]; then
     reason=no_transport_inject_id
   elif ! resp=$("$CURL" -s -w $'\n%{http_code}' \
-        -H "x-telepty-token: $(_telepty_token)" \
+        -H "x-telepty-token: $(telepty_auth_token)" \
         "http://127.0.0.1:${port}/api/inject-observations/${inject_id}" 2>/dev/null); then
     printf '%s %s\n' "$(now_iso)" "OBSERVATION_POLL_SKIP sid=$sid curl_failed" >> "$DISCONNECTED_LOG"
     reason=observation_poll_failed

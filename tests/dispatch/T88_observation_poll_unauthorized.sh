@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# T84 — a daemon that REFUSES the poll is not a daemon that lacks the endpoint.
+# T88 — a daemon that REFUSES the poll is not a daemon that lacks the endpoint.
 #
 # The per-inject observation poll used to be token-less, and it worked only because the telepty
 # daemon trusted loopback before checking any credential. telepty#820/#823 removes that trust, so
@@ -62,4 +62,4 @@ t_assert_contains "$DISPATCH_STATE_DIR/alerts.log" 'HOLD sid=sid-A'
 printf 'sid-A\tHOLD\tdisp-sid-A\tobservation_poll_unauthorized\n' > "$T_TMP/want-seen.txt"
 t_assert_contains "$DISPATCH_STATE_DIR/observations.seen" "$(cat "$T_TMP/want-seen.txt")"
 
-echo "PASS T84"
+echo "PASS T88"

@@ -73,6 +73,12 @@ registry_cleaned() {
 }
 # shellcheck source=lib/workspace-host.sh
 . "$SCRIPT_DIR/lib/workspace-host.sh"
+# The one daemon-credential resolver (#824). delete_session_registry is a direct
+# HTTP call, so it has to present the token itself. Resolution never fails — an
+# unreadable config yields no credential, which is what keeps this teardown path
+# working (degraded) instead of aborting.
+# shellcheck source=lib/telepty-auth.sh
+. "$SCRIPT_DIR/lib/telepty-auth.sh"
 
 usage() {
   sed -n '2,20p' "$0"
@@ -221,10 +227,17 @@ kill_parent_telepty_allow() {
 delete_session_registry() {
   local sid="$1" port="${TELEPTY_PORT:-3848}" http
   http=$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "x-telepty-token: $(telepty_auth_token)" \
     -X DELETE "http://127.0.0.1:${port}/api/sessions/${sid}" 2>/dev/null || echo "000")
   case "$http" in
     200) log "DELETE /api/sessions/$sid → 200 (removed from registry)";;
     404) log "DELETE /api/sessions/$sid → 404 (already gone — parent kill propagated)";;
+    # A refusal is not an unexpected status. Folded into the catch-all it read as
+    # "unexpected; manual verify", which says nothing about what to verify — while
+    # the actual consequence is a session left in the daemon registry forever,
+    # accumulating exactly the way the 21 stale entries of 2026-05-17 did. Named
+    # separately, and on stderr, because the operator has to act on it.
+    401|403) err "DELETE /api/sessions/$sid → $http (daemon refused the credential — the entry STAYS in the daemon registry; check authToken in ~/.telepty/config.json is readable, then re-run)";;
     *)   log "DELETE /api/sessions/$sid → $http (unexpected; manual verify)";;
   esac
 }
