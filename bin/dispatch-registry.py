@@ -319,6 +319,50 @@ def require_record(doc: dict, sid: str) -> dict:
     return rec
 
 
+def live_records(doc: dict, sid: str) -> list[dict]:
+    """Every non-retired record for the sid — the set-valued sibling of find_by_sid.
+
+    A sid accumulates ONE RECORD PER DISPATCH, so the more a worker is talked to
+    the more records it has. find_by_sid is singular by design: it answers "which
+    dispatch", which is the right question for a per-dispatch fact. It is the
+    wrong question for a fact about the SESSION, and cleanup asked it anyway —
+    retiring one record per invocation and leaving the other N-1 permanently in
+    the --live set, polled forever and HOLDing every reconcile tick for a session
+    that no longer exists (#853).
+
+    Retired records are excluded deliberately, not incidentally: re-stamping one
+    would overwrite a more informative terminal lifecycle (not_delivered,
+    delivery_failed) with a blander one, and would reset the last_seen_at clock
+    that op_prune ages retired records out by.
+    """
+    return [r for r in doc["dispatches"]
+            if r["assigned"]["sid"] == sid
+            and r["lifecycle"]["state"] not in RETIRED_LIFECYCLES]
+
+
+def target_records(doc: dict, args: dict) -> list[dict]:
+    """Resolve an operation's target set: --all → every live record for the sid,
+    default → the single record find_by_sid picks.
+
+    Only the two operations that describe the SESSION rather than one dispatch
+    accept --all. set-gate and set-transport-result stay singular on purpose: a
+    HITL gate and a transport result are facts about one delivery, and fanning
+    either across a sid's history would assert something nothing measured.
+
+    An empty list is a legitimate answer — the sid has records but all of them
+    are already retired — and callers treat it as a quiet no-op. Only a sid with
+    no records at all is an error, which keeps `dispatch_not_found` meaning what
+    it always meant.
+    """
+    sid = args["sid"]
+    if not args.get("all"):
+        return [require_record(doc, sid)]
+    records = live_records(doc, sid)
+    if not records and find_by_sid(doc, sid) is None:
+        raise RegistryError("dispatch_not_found", f"no dispatch record for sid {sid!r}")
+    return records
+
+
 def append_observation(rec: dict, kind: str, at: str, **fields) -> None:
     obs = {"kind": kind, "at": at, "terminal": False}
     obs.update({k: v for k, v in fields.items() if v is not None})
@@ -445,8 +489,11 @@ def op_observe(args: dict) -> int:
     extra.pop("kind", None)
     with _Lock():
         doc = load()
-        rec = require_record(doc, args["sid"])
-        append_observation(rec, args["kind"], at, **extra)
+        records = target_records(doc, args)
+        if not records:
+            return OK
+        for rec in records:
+            append_observation(rec, args["kind"], at, **extra)
         commit(doc)
     return OK
 
@@ -455,20 +502,32 @@ def op_set_lifecycle(args: dict) -> int:
     """A re-dispatch IS a lifecycle transition, so the attempt counter and the
     deadline move with it rather than through an outcome-shaped operation."""
     at = now_iso(args.get("now"))
+    # The re-dispatch counter belongs to ONE delivery attempt. Fanning it across
+    # every live record for a sid would invent attempts nobody made, so the
+    # combination fails closed rather than being silently ignored — the same
+    # contract the flag parser applies to unknown field names.
+    if args.get("all") and (args.get("re-dispatch-count") is not None
+                            or args.get("bump-re-dispatch-count")):
+        raise RegistryError("invalid_argument",
+                            "set-lifecycle: --all cannot carry a re-dispatch count; "
+                            "the counter is per-dispatch, not per-session")
     with _Lock():
         doc = load()
-        rec = require_record(doc, args["sid"])
-        if args.get("state"):
-            rec["lifecycle"] = {"state": args["state"], "at": at}
-        if args.get("re-dispatch-count") is not None:
-            rec["re_dispatch_count"] = int(args["re-dispatch-count"])
-        if args.get("bump-re-dispatch-count"):
-            rec["re_dispatch_count"] = int(rec.get("re_dispatch_count", 0)) + 1
-        if args.get("expected-report-by"):
-            rec["expected_report_by"] = args["expected-report-by"]
-        if args.get("extend-minutes"):
-            rec["expected_report_by"] = plus_minutes(at, int(args["extend-minutes"]))
-        rec["last_seen_at"] = at
+        records = target_records(doc, args)
+        if not records:
+            return OK
+        for rec in records:
+            if args.get("state"):
+                rec["lifecycle"] = {"state": args["state"], "at": at}
+            if args.get("re-dispatch-count") is not None:
+                rec["re_dispatch_count"] = int(args["re-dispatch-count"])
+            if args.get("bump-re-dispatch-count"):
+                rec["re_dispatch_count"] = int(rec.get("re_dispatch_count", 0)) + 1
+            if args.get("expected-report-by"):
+                rec["expected_report_by"] = args["expected-report-by"]
+            if args.get("extend-minutes"):
+                rec["expected_report_by"] = plus_minutes(at, int(args["extend-minutes"]))
+            rec["last_seen_at"] = at
         commit(doc)
     return OK
 
@@ -714,15 +773,18 @@ FLAGS = {
     "get": {"sid", "pointer"},
     "list": {"fields", "live", "not-retired", "keep-alive", "due-before"},
     "migrate": {"now"},
-    "observe": {"sid", "kind", "field", "json", "now"},
+    # `all` is offered ONLY here and on set-lifecycle: these two describe the
+    # session, and a session has as many records as it had dispatches (#853).
+    "observe": {"sid", "kind", "field", "json", "now", "all"},
     "prune": {"older-than-seconds", "now"},
     "set-gate": {"sid", "state", "clear", "now"},
     "set-lifecycle": {"sid", "state", "re-dispatch-count", "bump-re-dispatch-count",
-                      "expected-report-by", "extend-minutes", "now"},
+                      "expected-report-by", "extend-minutes", "now", "all"},
     "set-transport-result": {"sid", "result", "inject-id", "now"},
     "snapshot": set(),
 }
-BOOLEAN_FLAGS = {"keep-alive", "live", "not-retired", "clear", "bump-re-dispatch-count"}
+BOOLEAN_FLAGS = {"keep-alive", "live", "not-retired", "clear", "bump-re-dispatch-count",
+                 "all"}
 REPEATED_FLAGS = {"field"}
 
 
