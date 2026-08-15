@@ -155,10 +155,20 @@ CLEANUP_STUB="$STUB_BIN/cleanup-noop.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$CLEANUP_STUB"; chmod +x "$CLEANUP_STUB"
 printf '%s' '[]' > "$STUB_LIST_FILE"     # no sessions -> the sweep has nothing to do
 
+# #900 — CURL is the same reachability seam part A sets above, and its absence here is
+# why this guard failed the first time it ever ran on a clean runner. Part C seeds an
+# EMPTY telepty listing, and an empty listing is the one case lib/telepty-listing.sh
+# refuses to trust without corroboration: it probes 127.0.0.1:3848 and, getting no
+# answer, the reconciler logs "a refusal is not an absence" and aborts the sweep before
+# any consumer runs. On a maintainer box the PRODUCTION daemon answers that probe, so the
+# guard passed — by reaching out of its own sandbox to the live daemon it is documented as
+# never touching. Pointing CURL at the 200 stub makes part C measure the bridged-event
+# handoff it is about, on any host.
 run_reconciler() {
   RUN_LOG="$T_TMP/recon.log"
   AIGENTRY_BUS_BRIDGE=0 \
   RECONCILER_NOW="2026-08-15T12:00:00Z" \
+  CURL="$STUB_BIN/curl-200" \
   TELEPTY="$STUB_BIN/telepty" \
   SCHEDULER_SH="$SCHED_STUB" \
   CLEANUP_SH="$CLEANUP_STUB" \

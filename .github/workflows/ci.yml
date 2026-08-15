@@ -68,7 +68,7 @@ jobs:
       # `npm test` is what builds it.
       - name: Dispatch guard suite
         run: bash tests/dispatch/run-all.sh
-        timeout-minutes: 15
+        timeout-minutes: 4
       - name: Ship-set agreement against the real tarball
         run: bash tests/packaging/T96_ship_set_agreement.sh
       # Announces its own skip when the upstream repo is absent, which it always is here.
@@ -126,12 +126,26 @@ jobs:
             *) echo "::error::init exited 2 but without the documented refusal (expected the 'does not support Windows natively' / WSL2 message)."; exit 1 ;;
           esac
 
-      # U23 — MEASUREMENT, not an assumption. npm applies os[] to the packages it
-      # installs; whether it also applies it to the ROOT project's own manifest is not
-      # something this repo had ever observed, and the difference decides whether a
-      # Windows user cloning the repo gets EBADPLATFORM or a working dev install. This
-      # step's log is the observation; the assertion below is pinned to what it found.
-      - name: U23 — what npm ci does on win32 given the root package's own os[]
+      # U23 — this was an open question, not an assumption: npm applies os[] to the
+      # packages it installs, but whether it also applies it to the ROOT project's own
+      # manifest is something this repo had never observed. The difference decides whether
+      # a Windows user who clones the repo gets a hard stop or a dev install that works
+      # right up until the first bin/ script.
+      #
+      # MEASURED on windows-latest, run 31890807632 (2026-08-15), npm 10 / node 20:
+      #
+      #   npm ci exit=1
+      #   npm error code EBADPLATFORM
+      #   npm error notsup Unsupported platform for @dmsdc-ai/aigentry-orchestrator@0.2.0:
+      #     wanted {"os":"darwin,linux"} (current: {"os":"win32"})
+      #
+      # npm DOES enforce the root manifest's own os[]. So the declaration is not merely
+      # advice to consumers — it stops a Windows contributor at `npm ci`, before any of
+      # the 33 bin/ scripts with no Windows interpreter can be reached. That is the
+      # behavior worth pinning, and this step now fails if it ever silently changes: an
+      # npm that started installing here would mean Windows users get a tree that looks
+      # fine and breaks later, which is strictly worse than EBADPLATFORM.
+      - name: U23 — npm ci must refuse on win32 with EBADPLATFORM
         shell: bash
         run: |
           set -uo pipefail
@@ -141,8 +155,6 @@ jobs:
           set -e
           echo "npm ci exit=${RC}"
           tail -n 40 "${RUNNER_TEMP}/npm-ci.log"
-          if grep -q 'EBADPLATFORM' "${RUNNER_TEMP}/npm-ci.log"; then
-            echo "OBSERVED: npm enforces the root manifest's os[] — EBADPLATFORM"
-          else
-            echo "OBSERVED: npm does NOT enforce the root manifest's os[] (exit ${RC})"
-          fi
+          [ "$RC" != "0" ] || { echo "::error::npm ci SUCCEEDED on win32. It refused with EBADPLATFORM when U23 was measured (2026-08-15). npm no longer enforces the root manifest's os[], so a Windows contributor now gets a dev install that works until the first bin/ script instead of a hard stop — re-decide the refusal strategy rather than relaxing this assertion."; exit 1; }
+          grep -q 'EBADPLATFORM' "${RUNNER_TEMP}/npm-ci.log" || { echo "::error::npm ci failed on win32 with exit ${RC} but not EBADPLATFORM. Something other than the os[] declaration is stopping the install; read the log above before assuming the refusal still works."; exit 1; }
+          echo "npm ci refused with EBADPLATFORM, as measured for U23"

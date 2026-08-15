@@ -112,7 +112,7 @@ jobs:
       # `npm test` is what builds it.
       - name: Dispatch guard suite
         run: bash tests/dispatch/run-all.sh
-        timeout-minutes: 15
+        timeout-minutes: 4
       - name: Ship-set agreement against the real tarball
         run: bash tests/packaging/T96_ship_set_agreement.sh
       # Announces its own skip when the upstream repo is absent, which it always is here.
