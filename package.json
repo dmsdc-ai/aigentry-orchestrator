@@ -1,6 +1,6 @@
 {
   "name": "@dmsdc-ai/aigentry-orchestrator",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Aigentry orchestrator session/persistence library (ADR §6 #14 et al.)",
   "license": "MIT",
@@ -9,12 +9,14 @@
   },
   "scripts": {
     "build": "tsc -p .",
+    "prepack": "npm run build",
     "test": "tsc -p . && node scripts/run-tests.mjs",
     "test:adr-mf": "tsc -p . && node --test dist/tests/session/deep-hierarchy.test.js dist/tests/session/no-implicit-inheritance.test.js dist/tests/session/digest-reproducibility.test.js dist/tests/session/boot-adapter-conformance.test.js dist/tests/session/persistence-protocol.test.js dist/tests/session/warn-mode-telemetry.test.js dist/tests/session/cycle-detection.test.js"
   },
   "dependencies": {
     "@dmsdc-ai/aigentry-logger": "^0.2.0",
-    "@dmsdc-ai/aigentry-ssot": "^1.0.0"
+    "@dmsdc-ai/aigentry-ssot": "^1.0.0",
+    "@dmsdc-ai/aigentry-telepty": "^0.8.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
@@ -22,8 +24,26 @@
   },
   "files": [
     "dist/src",
+    "bin",
+    "tooling/instructions",
+    "tooling/dispatch-prelude",
+    ".agents/skills",
+    ".claude/settings.json",
+    ".claude/hooks",
+    "docs/rules.md",
+    "docs/templates",
+    "git-hooks",
+    "AGENTS.md",
+    "CLAUDE.md",
     "README.md",
     "LICENSE"
+  ],
+  "bin": {
+    "aigentry-orchestrator": "bin/init/cli.mjs"
+  },
+  "os": [
+    "darwin",
+    "linux"
   ],
   "exports": {
     "./gate": "./dist/src/gate/index.js",

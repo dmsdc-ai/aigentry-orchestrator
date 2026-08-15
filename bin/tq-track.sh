@@ -2,7 +2,7 @@
 # Task Queue v2 — drill into a specific track
 # Usage: tq-track.sh <track-id> [--all]
 set -euo pipefail
-TQ="${TQ:-$HOME/projects/aigentry-orchestrator/state/task-queue.json}"
+TQ="${TQ:-$(cd "$(dirname "$0")/.." && pwd)/state/task-queue.json}"
 [ -f "$TQ" ] || { echo "ERR task queue not found: $TQ" >&2; exit 1; }
 
 track="${1:-}"

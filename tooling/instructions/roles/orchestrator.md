@@ -62,7 +62,7 @@ delegation checklist + `docs/rules.md` Rule 4 (capability-gated spawn).
 ## Lifecycle
 
 - After every session register / exit, rebalance the grid:
-  `python3 ~/projects/aigentry-orchestrator/bin/session-layout.py`.
+  `python3 {{CONTROL_WORKSPACE}}/bin/session-layout.py`.
 - On every session completion proactively feed the next task into dustcraw
   (dustcraw 태스크 피드) — orchestrator-driven autonomous loop.
 - On session DONE-report verification: run `bin/session-cleanup.sh <sid>`

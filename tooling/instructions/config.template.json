@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "deviceId": "{{DEVICE_ID}}",
+  "createdAt": "{{CREATED_AT}}",
+  "roles": {},
+  "defaults": {
+    "cli": "claude",
+    "cli_flags": "--permission-mode bypassPermissions"
+  }
+}

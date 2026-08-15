@@ -110,7 +110,7 @@ fi
 if [ -z "$cwd" ]; then
   echo "ERR cwd unresolved. Options:" >&2
   echo "  1. Pass --cwd PATH explicitly" >&2
-  echo "  2. Configure role in $CONFIG_FILE (see $HOME/projects/aigentry-devkit/docs/session-conventions.md)" >&2
+  echo "  2. Configure role in $CONFIG_FILE (see docs/session-conventions.md in @dmsdc-ai/aigentry-devkit)" >&2
   exit 1
 fi
 
@@ -249,6 +249,8 @@ cleanup_on_exit() {
   local ctx_router="${CTX_ROUTER_PATH:-$HOME/projects/aigentry-devkit/bin/ctx-router.sh}"
   if [ -x "$ctx_router" ] && [ -n "${sid:-}" ]; then
     "$ctx_router" on-session-end "$sid" >/dev/null 2>&1 || true
+  elif [ -n "${sid:-}" ]; then
+    echo "open-session.sh: ctx-router not found at $ctx_router — session-end journal/handoff flush skipped (set CTX_ROUTER_PATH to point at it)" >&2
   fi
   # Extended (#304): if --auto-cleanup-on-exit, also run session-cleanup.sh
   # so PTY + cmux workspace + orchestrator pid mutex all get torn down.

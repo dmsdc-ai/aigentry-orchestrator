@@ -1,10 +1,106 @@
 # Changelog
 
 All notable changes to the aigentry-orchestrator harness are recorded here.
-Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
-the repo does not version itself yet (orchestrator versioning policy TBD),
-so entries are grouped under a dated `## [<YYYY-MM-DD>]` section beneath the
-ongoing `## [Unreleased]` working set.
+Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Released versions get a `## [<x.y.z>]` section — `.github/workflows/release.yml`
+extracts the matching section as the GitHub Release notes, so a publish fails
+without one. Unreleased harness work is still grouped under a dated
+`## [<YYYY-MM-DD>]` section beneath the ongoing `## [Unreleased]` working set.
+
+## [0.2.0] — 2026-08-15
+
+`npm i -g @dmsdc-ai/aigentry-orchestrator && aigentry-orchestrator init` now reproduces the
+orchestrator environment on a machine that has never seen this repo. Implements the approved
+spec `docs/specs/2026-08-15-npm-init-environment.md` (#885).
+
+### Added
+
+- **`aigentry-orchestrator init` (`bin/init/{cli.mjs,manifest.mjs}`).** Materialises a
+  *control workspace* — the governance layer copied out of the installed package into a
+  directory the user owns, in the same shape as this repo, plus an empty writable `state/`.
+  A global npm install cannot be the runtime location: `orchestrate-turn` and seven `bin/`
+  scripts resolve `bin/**` and `state/**` relative to cwd, and the npm prefix is neither
+  user-writable state nor survivable across upgrades (SPEC §2).
+  - `manifest.mjs` is the single literal path list — **63 paths**: 51 governance + 12
+    scaffold. `init` iterates it; nothing else enumerates the ship set.
+  - Flags: `--workspace PATH` (default `~/aigentry/_orchestrator`, owner-chosen), `--yes`,
+    `--dry-run`, `--force`, `--upgrade`. `--upgrade` never touches `state/`.
+  - Every arm names its exit code and what it did: `2` unsupported platform · `3` missing
+    hard dependency · `4` workspace refused · `5` copy failure / packaging defect · `6`
+    scaffold failure · `7` substitution failure. No arm returns 0 without doing what it said.
+  - `jq` and `python3` are **hard** failures, not warnings: measured, 10 and 17 shipped
+    scripts invoke them unguarded, so a warning here becomes an opaque runtime failure later.
+    `telepty`, `claude` and the two devkit-owned skills warn and continue; `cmux` is
+    informational only — its absence is a supported configuration (Constitution §2).
+  - Three independent guards keep it off a maintainer's live environment: it refuses to write
+    into a git working tree (the owner's environment is a clone, so it always trips this),
+    `install-instructions.sh` preserves existing files, `~/.aigentry/config.json` is merged
+    key-wise and `CONSTITUTION.md` prompts. `init` never starts, stops or signals a daemon.
+- **`tooling/instructions/CONSTITUTION.md`** — the aigentry 헌법 (제1조–제18조 + 최종조)
+  vendored from `~/projects/aigentry/docs/CONSTITUTION.md`, which `common.md` cites but which
+  lives in a repo users do not have. `init` writes it to `~/.aigentry/CONSTITUTION.md` and
+  substitutes `{{CONSTITUTION_PATH}}` to point there.
+- **`tooling/instructions/config.template.json`** — `roles: {}`, never the owner's 9 absolute
+  project paths.
+- **`tests/packaging/T96_ship_set_agreement.sh`** — three-way agreement between the init
+  manifest, the **real tarball** (`npm pack --dry-run --json`, not a re-reading of `files[]`)
+  and `git ls-files`. Five assertions, each naming the offending paths. This is what stops
+  `files[]` and the manifest from drifting apart into an install that crashes on first run.
+- **`tests/packaging/T97_constitution_vendor_current.sh`** — vendor-drift guard. Byte-identity
+  when the upstream repo is present; an **announced skip** when it is not, never a silent pass.
+- **`tests/packaging/smoke-init.sh`** — the acceptance test. Builds the real tarball, installs
+  it globally into a throwaway prefix, inits into a throwaway `HOME`, and makes ten assertions
+  including idempotence and `--upgrade` leaving `state/` untouched. Its header states what a
+  green run does *not* measure (SPEC §7.2).
+- **`.github/workflows/release.yml`** — tag-triggered publish, modelled on telepty's. Gates:
+  tag must equal `package.json` version (never derived from the tag), `NPM_TOKEN` absent is a
+  failure rather than a no-op, full suite + T96/T97/smoke on ubuntu + macOS. After publishing
+  it reads the shasum back from the registry and installs from npm in a clean dir — a local
+  build agreeing with itself is not evidence.
+
+### Changed
+
+- **`package.json`**: `version` 0.2.0 · `bin.aigentry-orchestrator` · `files[]` extended from
+  3 entries to 14 (measured: 160 tarball entries, up from 100 — the dot-directories `.agents/`
+  and `.claude/` were the known packing risk and they pack correctly) · `os: ["darwin","linux"]`
+  so `npm i -g` on Windows fails with npm's own `EBADPLATFORM` instead of at first dispatch
+  (#663 stays open for the port) · `dependencies += @dmsdc-ai/aigentry-telepty ^0.8.0`.
+- **`scripts.prepack: "npm run build"`** — 0.1.0 reached npm only because the publishing tree
+  happened to be built locally; a publish from a clean checkout would have shipped a missing or
+  stale `dist/`. **`prepack`, not `prepublishOnly`**, and the distinction is load-bearing:
+  `npm pack` runs `prepack` but *not* `prepublishOnly`, and both T96 and the smoke measure a
+  packed tarball. Under `prepublishOnly` the tests would measure a different artifact than the
+  one `npm publish` ships — the same class of defect as the `files[]`/manifest drift T96 exists
+  to catch. With `prepack`, the measured bytes and the shipped bytes are one artifact.
+- **Path defects, six lines, surgical (Rule 29).** These also change the owner's live behaviour,
+  which is the point — each was wrong on every machine including the one that wrote it:
+  - `bin/tq-{focus,status,track}.sh` resolve `state/task-queue.json` from the script's own
+    location instead of defaulting to `$HOME/projects/aigentry-orchestrator/…`.
+  - `bin/session-cleanup.sh` reads `${ORCHESTRATOR_SID:-orchestrator}` instead of hardcoding
+    the sid — it was the only literal one of eight sites. (The three-name spread across
+    `ORCHESTRATOR_SID` / `AIGENTRY_ORCHESTRATOR_SID` / `AIGENTRY_ORCHESTRATOR_SIDS` is
+    pre-existing and deliberately **not** touched here.)
+  - `bin/open-session.sh` names the devkit npm package in its error text rather than a repo
+    path users lack, and the ctx-router fallback now prints what it skipped instead of
+    degrading silently.
+- **`tooling/instructions/{common.md,roles/orchestrator.md}`** carry `{{CONSTITUTION_PATH}}`
+  and `{{CONTROL_WORKSPACE}}`, substituted by `init` into the copies it writes. Files that
+  already exist are preserved unsubstituted — `install-instructions.sh`'s existing contract.
+- **`.github/workflows/readme-regen.yml`**: header comment no longer claims this package is
+  "internal infra (not npm-published)" — stale since 0.1.0 shipped.
+
+### Known limitations
+
+- Windows is **declared** unsupported, not ported. `bin/lib/platform-windows.sh` stubs every
+  primitive and `bin/dispatch-registry.py` locks with `fcntl.flock`; 33 of 38 `bin/` scripts
+  have no Windows interpreter. WSL2 is the supported path today (#663).
+- The smoke proves the workspace `claude` would boot *into* is correct and complete. It does
+  not boot it: no Claude CLI, credential or TTY exists in CI. That remains a manual acceptance
+  step on a fresh user account before release.
+- `init` creates five `~/.aigentry` runtime directories, not the six SPEC §2.5 lists. The
+  sixth is the dedup sidecar retired by telepty#60 Stage A;
+  `tests/dispatch/T69_registry_single_writer_invariant.sh` fails the build if anything under
+  `bin/` names it. Creating it on every fresh install would resurrect a retired path.
 
 ## [Unreleased]
 
