@@ -28,7 +28,19 @@ HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
 
 # BEFORE t_setup puts a stub telepty on PATH — part E needs the real CLI.
-REAL_TELEPTY="$(command -v telepty 2>/dev/null || true)"
+#
+# #900 — part E used to gate on nothing but this lookup, which made whether it ran a
+# property of the machine's PATH rather than a declared choice: absent on a CI runner
+# (npm puts the dep's `telepty` bin in node_modules/.bin, which a `run:` step does not
+# have on PATH), present on any maintainer box. A skip nobody declared is the defect
+# class #900 exists to close, and part E boots a real daemon and binds a socket — that
+# is a live-integration test by the same definition T16 and T48 already use. So it takes
+# the same gate. Parts A–D stay hermetic and always run.
+if [ "${AIGENTRY_RUN_LIVE_TESTS:-0}" = "1" ]; then
+  REAL_TELEPTY="$(command -v telepty 2>/dev/null || true)"
+else
+  REAL_TELEPTY=""
+fi
 
 t_setup
 DAEMON_PID=""; BRIDGE_PIDS=""
@@ -198,7 +210,7 @@ BRIDGE_PIDS=""
 # E) live subscribe against a real daemon we own
 # ===========================================================================
 if [ -z "$REAL_TELEPTY" ]; then
-  echo "T95: SKIP part E — no telepty CLI on PATH (transport untested here)" >&2
+  echo "T95: SKIP part E — live-integration (set AIGENTRY_RUN_LIVE_TESTS=1, needs a real telepty CLI on PATH); transport untested here" >&2
 else
   D_HOME="$T_TMP/dhome"
   mkdir -p "$D_HOME/.telepty"

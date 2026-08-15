@@ -49,7 +49,7 @@ const MANIFEST = [
   "bin/session-reconciler.sh",
   "bin/session-start.sh",
   "bin/snyk-scan.sh",
-  "bin/spawn-telemetry-report.sh",
+  "bin/spawn-telemetry-report.mjs",
   "bin/telepty-bus-bridge.sh",
   "bin/tq-focus.sh",
   "bin/tq-status.sh",

@@ -58,7 +58,7 @@ test("W3 — warn → hard-fail emits mode_changed once with reason 'warn→hard
   assert.equal(transitions[0]?.reason, "warn→hard-fail");
 });
 
-test("W4 — composed-stack events aggregate via spawn-telemetry-report.sh", (t: TestContext) => {
+test("W4 — composed-stack events aggregate via spawn-telemetry-report.mjs", (t: TestContext) => {
   __resetModeTrackingForTests();
   t.mock.method(console, "warn", () => undefined);
   const root = mkdtempSync(join(TMP, "mf10-W4-root-"));
@@ -69,7 +69,7 @@ test("W4 — composed-stack events aggregate via spawn-telemetry-report.sh", (t:
     enforceSpawn(req(), { mode: "warn", emit: sink, now });
     enforceSpawn(req({ role: undefined as unknown as Role }), { mode: "warn", emit: sink, now });
     const out = join(outDir, "SUMMARY.md");
-    const r = spawnSync("bash", ["bin/spawn-telemetry-report.sh", "--root", root, "--out", out, "--days", "1", "--asof", "2026-05-12"], { encoding: "utf8" });
+    const r = spawnSync(process.execPath, ["bin/spawn-telemetry-report.mjs", "--root", root, "--out", out, "--days", "1", "--asof", "2026-05-12"], { encoding: "utf8" });
     assert.equal(r.status, 0, r.stderr);
     const md = readFileSync(out, "utf8");
     assert.match(md, /spawn_accepted.*1/);

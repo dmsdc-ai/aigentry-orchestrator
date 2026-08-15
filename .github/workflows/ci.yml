@@ -12,9 +12,18 @@ name: CI
 # predict that if it measures the same thing. When release.yml's test job changes, this
 # changes with it; a divergence between the two is a bug in this file.
 #
-# What this does NOT run, stated so a green check is not read as more than it measured:
-# tests/dispatch/run-all.sh (96 tests, ~20 min, needs a live telepty daemon) remains a
-# maintainer-machine gate, exactly as release.yml documents.
+# #900 — tests/dispatch/run-all.sh now runs here, on both legs. The comment this replaces
+# said it "needs a live telepty daemon", and that was never true: tests/dispatch/lib.sh
+# puts stub telepty/git/dispatch.sh binaries on PATH for every guard, the two guards that
+# want real processes (T16, T48) are gated on AIGENTRY_RUN_LIVE_TESTS=1, and the one that
+# would boot a daemon (T95 part E) refuses the production port and is now gated the same
+# way. The suite is hermetic. The package has shipped os:["darwin","linux"] since 0.2.0
+# while its guard suite had never once run on Linux anywhere — that claim was prose, and
+# this is the measurement.
+#
+# What this still does NOT measure, stated so a green check is not read as more than it is:
+# the live-integration guards above, and anything Windows beyond the refusal asserted in
+# the windows-refuses job below.
 
 on:
   pull_request:
@@ -41,7 +50,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         node: [20]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -55,6 +64,11 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
       - name: Run the regression suite
         run: npm test
+      # Runs after npm test because several guards gate on dist/ being built, and
+      # `npm test` is what builds it.
+      - name: Dispatch guard suite
+        run: bash tests/dispatch/run-all.sh
+        timeout-minutes: 15
       - name: Ship-set agreement against the real tarball
         run: bash tests/packaging/T96_ship_set_agreement.sh
       # Announces its own skip when the upstream repo is absent, which it always is here.
@@ -62,3 +76,73 @@ jobs:
         run: bash tests/packaging/T97_constitution_vendor_current.sh
       - name: Acceptance smoke — install the tarball and init into a throwaway HOME
         run: bash tests/packaging/smoke-init.sh
+
+  # #900 (W0) — "unsupported on Windows" was, like the Linux claim above, a sentence
+  # rather than a measurement. release.yml asserts the os[] declaration, but it does so
+  # on ubuntu, which proves the string and nothing about what a Windows user experiences.
+  # This job runs ON windows-latest and asserts the two refusals that are supposed to
+  # protect that user: npm's own EBADPLATFORM on the declaration, and the runtime gate in
+  # bin/init/cli.mjs for anyone who gets past it (a tarball copied by hand, a --force
+  # install). It deliberately does NOT try to make anything work on Windows — a green run
+  # here means the package fails early and legibly, which is the supported behavior.
+  windows-refuses:
+    name: Windows W0 — the package refuses, correctly
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Same mechanism as release.yml's windows-declared-unsupported job (an exact-string
+      # compare on the serialised array, not a substring or a length check), run on the OS
+      # the declaration is about. If these two ever disagree, one of them is wrong.
+      - name: package.json must declare Windows out
+        shell: bash
+        run: |
+          set -euo pipefail
+          OS="$(node -p "JSON.stringify(require('./package.json').os)")"
+          [ "$OS" = '["darwin","linux"]' ] || { echo "::error::package.json os is ${OS}; expected [\"darwin\",\"linux\"] so npm refuses Windows installs with EBADPLATFORM (§6.2, #663)."; exit 1; }
+          echo "os declaration is ${OS}"
+
+      # The gate is step 0 of init — before dependency checks, before any path is
+      # resolved, before a single byte is written. Nothing to clean up if it fires, and
+      # the assertion covers the message too: an exit 2 that does not say why is a refusal
+      # the user cannot act on. cli.mjs imports only node: builtins plus its sibling
+      # manifest.mjs, so this needs no install.
+      - name: bin/init/cli.mjs platform gate must exit 2 on win32
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          OUT="$(node bin/init/cli.mjs init 2>&1)"
+          RC=$?
+          set -e
+          printf '%s\n' "$OUT"
+          [ "$RC" = "2" ] || { echo "::error::init exited ${RC} on win32; platformGate() in bin/init/cli.mjs must die(2, ...). An exit that is not 2 means the gate did not fire, or fired as something else."; exit 1; }
+          case "$OUT" in
+            *"does not support Windows natively"*WSL2*) echo "platform gate refused with its documented message and exit 2" ;;
+            *) echo "::error::init exited 2 but without the documented refusal (expected the 'does not support Windows natively' / WSL2 message)."; exit 1 ;;
+          esac
+
+      # U23 — MEASUREMENT, not an assumption. npm applies os[] to the packages it
+      # installs; whether it also applies it to the ROOT project's own manifest is not
+      # something this repo had ever observed, and the difference decides whether a
+      # Windows user cloning the repo gets EBADPLATFORM or a working dev install. This
+      # step's log is the observation; the assertion below is pinned to what it found.
+      - name: U23 — what npm ci does on win32 given the root package's own os[]
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          npm ci > "${RUNNER_TEMP}/npm-ci.log" 2>&1
+          RC=$?
+          set -e
+          echo "npm ci exit=${RC}"
+          tail -n 40 "${RUNNER_TEMP}/npm-ci.log"
+          if grep -q 'EBADPLATFORM' "${RUNNER_TEMP}/npm-ci.log"; then
+            echo "OBSERVED: npm enforces the root manifest's os[] — EBADPLATFORM"
+          else
+            echo "OBSERVED: npm does NOT enforce the root manifest's os[] (exit ${RC})"
+          fi

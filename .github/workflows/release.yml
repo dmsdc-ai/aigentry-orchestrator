@@ -79,9 +79,12 @@ jobs:
   # Gate 3. Two OS legs and no windows leg — §6.2: the package declares itself unsupported
   # there (os: [darwin, linux]) and 33 of its 38 bin/ scripts have no Windows interpreter.
   #
-  # NOT run here, stated so a green run is not read as more than it measured:
-  # tests/dispatch/run-all.sh (96 tests, ~20 min, needs a live telepty daemon) is a
-  # maintainer-machine gate. §7.2 lists what the smoke itself does not cover.
+  # #900 — tests/dispatch/run-all.sh runs here now. The comment it replaces called it a
+  # maintainer-machine gate that "needs a live telepty daemon"; tests/dispatch/lib.sh
+  # stubs telepty/git/dispatch.sh on PATH for every guard, and the guards that want real
+  # processes are gated on AIGENTRY_RUN_LIVE_TESTS=1. The suite is hermetic, so a release
+  # can be held to it. NOT run here: those live-integration guards. §7.2 lists what the
+  # smoke itself does not cover.
   test:
     name: Full suite
     needs: guard
@@ -91,7 +94,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         node: [20]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -105,6 +108,11 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
       - name: Run the regression suite
         run: npm test
+      # Runs after npm test because several guards gate on dist/ being built, and
+      # `npm test` is what builds it.
+      - name: Dispatch guard suite
+        run: bash tests/dispatch/run-all.sh
+        timeout-minutes: 15
       - name: Ship-set agreement against the real tarball
         run: bash tests/packaging/T96_ship_set_agreement.sh
       # Announces its own skip when the upstream repo is absent, which it always is here.
