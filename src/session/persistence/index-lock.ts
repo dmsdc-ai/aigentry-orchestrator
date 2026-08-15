@@ -21,21 +21,28 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function isStaleLock(lockPath: string): Promise<boolean> {
+// #897: "vanished" and "dead" used to be one boolean, and both led to unlink.
+// They must not: only a lock positively identified as dead-pid-held may be swept.
+//   held    — a live holder (or an unreadable lock we must not touch): wait.
+//   dead    — the recorded pid is gone, or the content is malformed: sweep it.
+//   vanished— nothing at lockPath any more: there is nothing to sweep, just retry.
+type LockVerdict = "held" | "dead" | "vanished";
+
+async function inspectLock(lockPath: string): Promise<LockVerdict> {
   try {
     const text = await fs.readFile(lockPath, "utf8");
     const pid = Number.parseInt(text.trim(), 10);
-    if (!Number.isInteger(pid) || pid <= 0) return true;
-    if (pid === process.pid) return false; // self-held — caller must wait
+    if (!Number.isInteger(pid) || pid <= 0) return "dead";
+    if (pid === process.pid) return "held"; // self-held — caller must wait
     try {
       process.kill(pid, 0);
-      return false;
+      return "held";
     } catch (err) {
-      return (err as NodeJS.ErrnoException).code === "ESRCH";
+      return (err as NodeJS.ErrnoException).code === "ESRCH" ? "dead" : "held";
     }
   } catch (err) {
-    // ENOENT = racy unlink between EEXIST and read; treat as stale so we retry the open.
-    return (err as NodeJS.ErrnoException).code === "ENOENT";
+    // ENOENT = the holder released between our EEXIST and this read.
+    return (err as NodeJS.ErrnoException).code === "ENOENT" ? "vanished" : "held";
   }
 }
 
@@ -63,7 +70,16 @@ async function acquire(lockPath: string, timeoutMs: number): Promise<void> {
         return;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-        if (await isStaleLock(lockPath)) {
+        const verdict = await inspectLock(lockPath);
+        // #897: retry the link, and do NOT unlink. The lock is already gone; the
+        // unlink that used to run here removed whatever was at lockPath by name —
+        // which, once a successor had linked its own lock into that same name in
+        // the interval, was the SUCCESSOR's lock. Both then entered the critical
+        // section and collided on the shared index tmp
+        // (`index.json.tmp.__index__.<pid>` → rename ENOENT), i.e. the very #561
+        // symptom the empty-lock-window fix above was meant to have closed.
+        if (verdict === "vanished") continue;
+        if (verdict === "dead") {
           try {
             await fs.unlink(lockPath);
           } catch {
