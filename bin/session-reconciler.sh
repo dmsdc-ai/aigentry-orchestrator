@@ -62,6 +62,7 @@ DISPATCH_SH="${DISPATCH_SH:-$SCRIPT_DIR/dispatch.sh}"
 TRACKER_SH="${TRACKER_SH:-$SCRIPT_DIR/dispatch-tracker.sh}"
 COMMS_AUDITOR_SH="${COMMS_AUDITOR_SH:-$SCRIPT_DIR/session-comms-auditor.sh}"
 BRIDGE_AUDITOR_SH="${BRIDGE_AUDITOR_SH:-$SCRIPT_DIR/orchestrator-bridge-auditor.sh}"
+BUS_BRIDGE_SH="${BUS_BRIDGE_SH:-$SCRIPT_DIR/telepty-bus-bridge.sh}"
 SESSION_PROBE_PY="${SESSION_PROBE_PY:-$SCRIPT_DIR/session-probe.py}"
 POLICY_PY="${POLICY_PY:-$SCRIPT_DIR/policy.py}"
 HITL_SH="${HITL_SH:-$SCRIPT_DIR/hitl.sh}"
@@ -76,18 +77,20 @@ AGE_FLOOR_SECONDS="${RECONCILER_AGE_FLOOR:-300}"
 DISCONNECT_FLOOR_SECONDS="${RECONCILER_DISCONNECT_FLOOR:-240}"
 BACKOFF_INITIAL="${RECONCILER_BACKOFF_INITIAL:-5}"
 BACKOFF_MAX="${RECONCILER_BACKOFF_MAX:-1000}"
-# surface_orphaned event source (verdict 2026-05-30 §5). DORMANT by default:
-# telepty emits surface_orphaned on its WS bus (broadcastSessionEvent), not to a
-# file, so this JSONL does not exist yet — a future bus→file bridge would
-# populate it. Until then the consumer is a no-op and the wh_alive sweep (step 2)
-# is the always-on actuation path. Override the source via env.
+# surface_orphaned event source (verdict 2026-05-30 §5). telepty emits
+# surface_orphaned on its WS bus (broadcastSessionEvent), not to a file;
+# bin/telepty-bus-bridge.sh (#847, step 0e) subscribes and writes this JSONL, so
+# the consumer below is live whenever that bridge is. Bridge down ⇒ absent file ⇒
+# the consumer no-ops exactly as it did while dormant, and the wh_alive sweep
+# (step 2) remains the always-on actuation path. Override the source via env.
 SURFACE_ORPHANED_SRC="${AIGENTRY_SURFACE_ORPHANED_SOURCE:-$STATE_DIR/surface-orphaned.jsonl}"
 # surface_mismatched event source (task #507, verdict 2026-05-30 §4 focus-actuation
-# = orchestrator). DORMANT by default, same as surface_orphaned: telepty (probe+
-# signal owner) will emit `surface_mismatched` on its WS bus when a session's bound
+# = orchestrator). Same shape as surface_orphaned: telepty (probe+
+# signal owner) emits `surface_mismatched` on its WS bus when a session's bound
 # surface is ALIVE but foregrounding a PTY ≠ session.ptyPid (stray shell after cmux
 # restart/surface reassign — the codex-on-ttysNNN vs workspace-shows-ttysMMM case).
-# A future bus→file bridge populates this JSONL; until then the consumer is a no-op.
+# bin/telepty-bus-bridge.sh (#847) populates this JSONL from the bus; with the
+# bridge down the file is absent and the consumer no-ops, as it did while dormant.
 # Event contract (one JSONL object per line):
 #   {sid, backend, cmuxWorkspaceId, expectedPtyPid, observedSurface, mismatchSeconds}
 SURFACE_MISMATCHED_SRC="${AIGENTRY_SURFACE_MISMATCHED_SOURCE:-$STATE_DIR/surface-mismatched.jsonl}"
@@ -518,8 +521,8 @@ PY
 }
 
 # consume_surface_orphaned — event-driven complement to the wh_alive sweep
-# (verdict 2026-05-30 §5). DORMANT until a telepty bus→file bridge populates
-# SURFACE_ORPHANED_SRC; absent file → no-op, so actuation never depends on it.
+# (verdict 2026-05-30 §5). Fed by bin/telepty-bus-bridge.sh (#847); absent file →
+# no-op, so actuation never depends on the bridge being up.
 # Each JSONL line: {sid, backend, cmuxWorkspaceId, surfaceGoneSeconds, livenessVerdict}.
 # Two INV-17 gates before any close: (1) drop livenessVerdict=='unknown' (telepty
 # already filters these probe-side — never close on indeterminate liveness);
@@ -550,8 +553,20 @@ consume_surface_orphaned() {
     fi
     processed=$((processed + 1))
   done < "$SURFACE_ORPHANED_SRC"
-  if [ "$DRY_RUN" -eq 0 ] && [ "$processed" -gt 0 ]; then
-    : > "$SURFACE_ORPHANED_SRC" 2>/dev/null || true # drain consumed events
+  # Drain by REMOVING, and unconditionally (#847). Two reasons, both about the
+  # bridge that now writes this file:
+  #  * rm, not `: >`: the bridge publishes a batch by renaming its spool into this
+  #    path and only ever does so while the path is ABSENT. Truncating leaves the
+  #    path present forever, which would wedge every later batch in the spool; and
+  #    the truncate races the bridge's append into silent loss, which the
+  #    rename+rm handoff has no window for (bin/telepty-bus-bridge.sh header).
+  #  * unconditionally, not `processed > 0`: a line the INV-17 gates rejected is
+  #    rejected FOREVER — livenessVerdict=='unknown' is never actionable, and a
+  #    sid that is live or keep_alive must not be closed now or later on evidence
+  #    this stale. Keeping those lines re-evaluated a dead judgement every tick
+  #    and, with a bridge appending, grew this file without bound.
+  if [ "$DRY_RUN" -eq 0 ]; then
+    rm -f "$SURFACE_ORPHANED_SRC" 2>/dev/null || true
   fi
   [ "$processed" -gt 0 ] && log "surface_orphaned consumed=$processed"
   return 0
@@ -562,8 +577,8 @@ consume_surface_orphaned() {
 # Verdict 2026-05-30 §4: surface focus/select actuation = orchestrator (conductor's
 # call); telepty owns only the read-only probe + the signal. So this consumer
 # actuates `wh_focus` (re-bind), the dual of consume_surface_orphaned's `wh_close`.
-# DORMANT until a telepty bus→file bridge populates SURFACE_MISMATCHED_SRC; absent
-# file → no-op, so actuation never depends on it.
+# Fed by bin/telepty-bus-bridge.sh (#847); absent SURFACE_MISMATCHED_SRC → no-op,
+# so actuation never depends on the bridge being up.
 # wh_focus is NON-DESTRUCTIVE (best-effort raise; never throws/blocks, always 0), so
 # unlike orphan-close it needs no INV-17 kill-corroboration — re-focusing a stray
 # surface cannot lose work. Single safety gate: the sid must resolve to a host_id
@@ -591,8 +606,10 @@ consume_surface_mismatched() {
     fi
     processed=$((processed + 1))
   done < "$SURFACE_MISMATCHED_SRC"
-  if [ "$DRY_RUN" -eq 0 ] && [ "$processed" -gt 0 ]; then
-    : > "$SURFACE_MISMATCHED_SRC" 2>/dev/null || true # drain consumed events
+  # rm, and unconditional — same handoff with bin/telepty-bus-bridge.sh as
+  # consume_surface_orphaned's drain; the reasoning is written out there.
+  if [ "$DRY_RUN" -eq 0 ]; then
+    rm -f "$SURFACE_MISMATCHED_SRC" 2>/dev/null || true
   fi
   [ "$processed" -gt 0 ] && log "surface_mismatched consumed=$processed"
   return 0
@@ -701,6 +718,23 @@ fi
 # (skipped under --dry-run) — the HOLD inject is the action. ---
 if [ -x "$BRIDGE_AUDITOR_SH" ] && [ "$DRY_RUN" -eq 0 ]; then
   TELEPTY="$TELEPTY" "$BRIDGE_AUDITOR_SH" >/dev/null 2>&1 || log "ERR bridge-auditor non-zero (continuing)"
+fi
+
+# --- step 0e: telepty bus→file bridge supervision (#847) — the two surface-event
+# consumers below read files only bin/telepty-bus-bridge.sh writes, so something
+# has to keep that bridge alive. This tick is that something: it already runs every
+# 60s under launchd KeepAlive, already survives sleep and session restarts, and
+# already owns this state dir — a second launchd plist would duplicate all of it,
+# and a child of this tick would die with the tick. `--ensure` is a pidfile check
+# and nothing else when the bridge is up; when it is not, the bridge is back within
+# one tick and reconciler.log names the window nothing was bridged.
+# Act-only (skipped under --dry-run): the spawn is the action. Best-effort: a
+# non-zero ensure never blocks the tick — the consumers no-op on an absent file, so
+# a bridge that will not start degrades to exactly the pre-#847 behaviour.
+# AIGENTRY_BUS_BRIDGE=0 is the kill switch; tests/dispatch/lib.sh sets it, because
+# a hermetic tick must not leave a long-lived process behind. ---
+if [ "${AIGENTRY_BUS_BRIDGE:-1}" != "0" ] && [ -x "$BUS_BRIDGE_SH" ] && [ "$DRY_RUN" -eq 0 ]; then
+  TELEPTY="$TELEPTY" "$BUS_BRIDGE_SH" --ensure >/dev/null 2>&1 || log "ERR bus-bridge ensure non-zero (continuing)"
 fi
 
 # --- step 1: scheduler tick (Layer D fires due) ---

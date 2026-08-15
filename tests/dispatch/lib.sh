@@ -20,6 +20,11 @@ t_setup() {
   # workspaces for real (observed: 7 closed by T63's 3-tick run). Point ownership
   # at the tmpdir so no test can ever match a real workspace.
   export AIGENTRY_ROLE_SANDBOX_DIR="$T_TMP/role-sandbox"
+  # #847: a reconcile tick supervises the telepty bus→file bridge (step 0e), which
+  # is a long-lived background process subscribed to the daemon's bus. Hermetic
+  # means no test leaves one of those behind, so the harness ticks with the bridge
+  # off; T95 turns it back on explicitly for the one test that exercises it.
+  export AIGENTRY_BUS_BRIDGE=0
   export DISPATCH_STATE_DIR="$T_TMP/state"
   mkdir -p "$DISPATCH_STATE_DIR"
   # telepty#60 Stage A: the registry is a versioned envelope, not a root array.
