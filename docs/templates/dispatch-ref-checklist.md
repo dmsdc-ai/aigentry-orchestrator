@@ -76,6 +76,10 @@ If you cannot answer YES to all 8 below, do NOT inject:
 6. Snyk section present (applicable phase OR N/A reason)?
 7. REPORT inject template + task #N + verifiable evidence keys?
 8. §Boundary + §Full capability complete?
+9. **Every enumeration in this ref marked as a starting set, with what it counted?** (Rule 39)
+   Any list, count, or file/door/caller inventory you hand a worker is *your past measurement*, not a
+   fact. Say what you counted and how, and tell them to re-measure it in source before building on it.
+   Measured: 3 of 3 workers who re-measured an orchestrator-supplied enumeration found an error in it.
 
 ---
 
@@ -89,3 +93,5 @@ If you cannot answer YES to all 8 below, do NOT inject:
 | A — unsubstituted placeholders | Receiver acts on `<session-name>` literal → undefined behavior | (preventive) |
 | D — Snyk missing | First-party code committed without scan → CLAUDE.md global rule violation | (preventive) |
 | G — wrong target sid | `telepty inject` exits 1 with "session not found" → dispatch fails silently | (preventive) |
+| 9 — enumeration shipped as fact | Orchestrator handed workers "4 PTY write doors"; source had 6 recorded + 3 unrecorded. `mailbox` was not a door, `submit-all` was a fifth CR door. Two docs then claimed coverage that was never measured | #843/#844 |
+| 9 — counted the wrong thing | "nothing runs them" approved deleting 26 files; the question was *citation* — 16 were cited by name from two files that ship to npm, including a test's fixture provenance | #846 |
