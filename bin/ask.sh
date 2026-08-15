@@ -43,6 +43,11 @@ ROUND_CAP="${PEER_ROUND_CAP:-3}"
 # spec (§1). Space-separated.
 ORCH_SIDS="${AIGENTRY_ORCHESTRATOR_SIDS:-orchestrator aigentry-orchestrator-claude}"
 
+# telepty_sid_live — "does this session exist?", with a refused listing answering
+# UNKNOWN rather than "no" (#835/#836). Used by escalate_orchestrator below.
+# shellcheck source=lib/telepty-listing.sh
+. "$SCRIPT_DIR/lib/telepty-listing.sh"
+
 usage() { sed -n '20,33p' "$0"; }
 
 now_iso() {
@@ -111,11 +116,35 @@ inject_peer() {
 
 # escalate_orchestrator <excerpt> — route a HOLD upward (the escalation REPLACES the
 # blocked inject; the channel never silently drops — §6).
+#
+# #836 — this escalation asserts a dispute between `from` and `to`. If a named party
+# is not a live session there is no dispute for the operator to arbitrate, and they
+# pay a verification round to discover that; two such escalations fired this month,
+# one of them carrying a copy-pasted placeholder id. So the parties are checked
+# first, and an escalation naming an absent one is recorded stale instead of sent.
+# An UNKNOWN answer (a refused or unreachable listing, #835) is NOT an absence — it
+# escalates, because a silently dropped escalation is the worse failure and a
+# spurious HOLD destroys nothing.
+#
+# #835 — and the send no longer ends in `|| true`. §6 says the channel never
+# silently drops; a swallowed non-zero from `telepty inject` (which a 401 now
+# produces) is exactly a silent drop, with the caller told it escalated.
 escalate_orchestrator() {
-  local excerpt="$1" orch
+  local excerpt="$1" orch party live
+  for party in "$from" "$to"; do
+    live=0
+    telepty_sid_live "$party" || live=$?
+    if [ "$live" -eq 1 ]; then
+      emit_tele peer_escalation_stale
+      echo "ask.sh: escalation NOT sent for ${pairkey}__${thread} — '$party' is not a live session; an escalation about parties that do not exist claims more than it measured (recorded stale)" >&2
+      return 0
+    fi
+  done
   orch="${ORCH_SIDS%% *}"
   "$TELEPTY" inject --from "$from" --submit "$orch" \
-    "HOLD: peer-comms guardrail | from: $from | to: $to | thread: $thread | $excerpt" || true
+    "HOLD: peer-comms guardrail | from: $from | to: $to | thread: $thread | $excerpt" \
+    || { emit_tele peer_escalation_undelivered
+         echo "ask.sh: ESCALATION UNDELIVERED for ${pairkey}__${thread} — telepty inject to '$orch' exited non-zero; the HOLD did NOT reach the orchestrator. Report it by hand." >&2; }
 }
 
 from=""; to=""; thread=""; conflict=0; action=""; text=""

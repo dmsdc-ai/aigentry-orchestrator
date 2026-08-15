@@ -18,6 +18,11 @@ fail() { echo "FAIL[T46]: $*" >&2; exit 1; }
 
 export SESSION_COMMS_DIR="$T_TMP/session-comms"
 export ASK_NOW="2026-06-07T12:00:00Z"
+# The escalation names both peers as parties to a dispute, and an escalation about
+# a party that does not exist is recorded stale rather than sent (#836) — so both
+# have to be sessions that actually exist for the cap/conflict paths to escalate.
+printf '%s' '[{"id":"coder-A","healthStatus":"CONNECTED"},{"id":"coder-B","healthStatus":"CONNECTED"}]' \
+  > "$STUB_LIST_FILE"
 STATE_FILE="$SESSION_COMMS_DIR/coder-A__coder-B__t2.json"
 TELE="$SESSION_COMMS_DIR/telemetry.jsonl"
 

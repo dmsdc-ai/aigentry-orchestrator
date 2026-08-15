@@ -21,6 +21,17 @@ t_setup; trap t_teardown EXIT
 
 RESOLVER="$REPO_ROOT/bin/orchestrator-report-target.sh"
 
+# The resolver now probes a candidate address before returning the `<sid>@<ip>`
+# form (#835 — it used to infer reachability from an interface having an address).
+# Pin that probe to a stub so this test stays hermetic and fast: otherwise case 1
+# dials a black-holed address for its connect timeout, and case 2 depends on
+# whether this machine's real tailnet listener happens to be up. Reachability
+# itself is T92's subject; this file is about WHICH address is chosen.
+CURL_OK="$T_TMP/curl-answers"
+printf '%s\n' '#!/usr/bin/env bash' 'echo 200' > "$CURL_OK"
+chmod +x "$CURL_OK"
+export CURL="$CURL_OK"
+
 # ---- 1. resolver: env override wins (sid + host) ----
 out=$(AIGENTRY_ORCHESTRATOR_SID=orch-x AIGENTRY_ORCHESTRATOR_HOST=100.99.1.2 "$RESOLVER")
 [ "$out" = "orch-x@100.99.1.2" ] || { echo "FAIL: override resolver = '$out'" >&2; exit 1; }

@@ -73,4 +73,45 @@ echo "$out2" | grep -q "lookup=$"     || { echo "FAIL: headless lookup not empty
 echo "$out2" | grep -q "alive-gone"   || { echo "FAIL: headless alive (should be gone)"; echo "$out2"; exit 1; }
 echo "$out2" | grep -q "close-ok"     || { echo "FAIL: headless close"; echo "$out2"; exit 1; }
 
+# --- #835: only a real answer may say "gone" -------------------------------
+# wh_alive's "gone" verdict is a CORROBORATING signal for a teardown
+# (session-reconciler.sh INV-17), so a probe that learned nothing must not supply
+# it. cmux answering `Error:` is an answer (covered above: gone=1). cmux saying
+# nothing, or not being reachable at all, is not — and used to read as "gone",
+# which is how a crashed or missing cmux manufactured half the evidence for
+# closing a live worker's surface. The warp adapter already maps "cannot probe"
+# to INDETERMINATE→alive (_wh_warp_alive, INV-17 #486); cmux must match.
+BASH_BIN="$(command -v bash)"
+SILENT_DIR="$T_TMP/silent-bin"; mkdir -p "$SILENT_DIR"
+cat > "$SILENT_DIR/cmux" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  sidebar-state) exit 1;;   # crashed / hung / wrong version: nothing on stdout
+  *) exit 0;;
+esac
+EOF
+chmod +x "$SILENT_DIR/cmux"
+
+out3=$(AIGENTRY_WORKSPACE_HOST=cmux "$BASH_BIN" -c "
+  export PATH='$SILENT_DIR:/usr/bin:/bin'
+  . '$REPO_ROOT/bin/lib/workspace-host.sh'
+  wh_alive ws-alive && echo silent=present || echo silent=gone
+" 2>/dev/null)
+echo "$out3" | grep -q "silent=present" \
+  || { echo "FAIL: a silent cmux probe reported the surface GONE — an unanswered probe is not evidence, and this verdict corroborates a teardown"; echo "$out3"; exit 1; }
+
+# cmux not on PATH at all — same reasoning, stronger case. Probed at the adapter
+# function directly (as T25 does for _wh_warp_alive) because with cmux absent the
+# public wh_alive resolves to the headless adapter, whose documented "gone" is a
+# separate contract asserted above and is unreachable from the sweep (headless
+# wh_lookup returns no host_id, so the reconciler never probes).
+EMPTY_DIR="$T_TMP/empty-bin"; mkdir -p "$EMPTY_DIR"
+out4=$("$BASH_BIN" -c "
+  export PATH='$EMPTY_DIR:/usr/bin:/bin'
+  . '$REPO_ROOT/bin/lib/workspace-host.sh'
+  _wh_cmux_alive ws-alive && echo nocmux=present || echo nocmux=gone
+" 2>/dev/null)
+echo "$out4" | grep -q "nocmux=present" \
+  || { echo "FAIL: an unreachable cmux reported the surface GONE — 'I cannot probe' is not 'it is not there'"; echo "$out4"; exit 1; }
+
 echo "T23 PASS"

@@ -39,7 +39,14 @@ EOF
 cat > "$STUB_BIN/curl" <<EOF
 #!/usr/bin/env bash
 echo "curl \$*" >> "$CURL_LOG"
-echo 404
+# The session-list corroboration answers 200 — this fixture's empty list is a
+# genuinely empty daemon, which is what lets the control run proceed to the
+# teardown at all (#835). The registry DELETE answers 404 (already gone), the
+# branch this test actually drives.
+case "\$*" in
+  *DELETE*) echo 404;;
+  *)        echo 200;;
+esac
 EOF
 chmod +x "$STUB_BIN/cmux" "$STUB_BIN/curl"
 

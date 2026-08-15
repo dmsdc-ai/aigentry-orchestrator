@@ -29,7 +29,9 @@
 #   0 — success (including idempotent no-op when session already gone)
 #   1 — usage error
 #   2 — missing dependency
-#   3 — telepty list --json failed or returned non-JSON (binary/daemon mismatch)
+#   3 — telepty list --json unusable: non-zero exit, non-JSON stdout (binary/daemon
+#       mismatch), or an EMPTY list the daemon would not corroborate with a 200 —
+#       i.e. a refusal/outage wearing the shape of "there is nothing here" (#835).
 #   4 — invoked from a worker session (AIGENTRY_WORKER_SESSION set) — refused;
 #       session lifecycle is the orchestrator's exclusive domain (#524).
 #
@@ -79,6 +81,11 @@ registry_cleaned() {
 # working (degraded) instead of aborting.
 # shellcheck source=lib/telepty-auth.sh
 . "$SCRIPT_DIR/lib/telepty-auth.sh"
+# An empty session list is what a REFUSED list request looks like (#835). Every
+# destructive step below draws its evidence from telepty_list_json, so the trust
+# check lives there and this is what it calls.
+# shellcheck source=lib/telepty-listing.sh
+. "$SCRIPT_DIR/lib/telepty-listing.sh"
 
 usage() {
   sed -n '2,20p' "$0"
@@ -98,8 +105,14 @@ require_deps() {
 # is not parseable JSON. Prevents silent "session not found" reports when the
 # real cause is a contaminated stdout (e.g., daemon-version-mismatch banner
 # from the wrong telepty binary on PATH — see task #400 root cause).
+#
+# It is also the SINGLE choke point for this script's evidence: kill_parent_…,
+# close_workspace_for, wh_close_for_sid and delete_session_registry are all
+# downstream of it, on both the single-sid and the batch paths. That is why the
+# #835 trust check belongs here and nowhere else — one guard covers every
+# destructive step, and no path can reach a teardown without passing it.
 telepty_list_json() {
-  local raw
+  local raw verdict
   raw=$(telepty list --json 2>/dev/null) || {
     err "telepty list --json exited non-zero"
     exit 3
@@ -111,6 +124,20 @@ telepty_list_json() {
     echo >&2
     err "PATH=$PATH"
     err "which telepty: $(command -v telepty || echo NOT_FOUND)"
+    exit 3
+  fi
+  # `jq -e .` is loud on empty input (exit 4) but exits 0 on `[]`, so the check
+  # above passes a refusal straight through — the #400 guard was built for the
+  # THROW-shaped failure and an auth refusal is not that shape. An empty list is
+  # the only ambiguous answer, and it is precisely the answer that authorizes
+  # destruction, so it has to be corroborated before it is believed.
+  if ! verdict=$(telepty_listing_trusted "$raw"); then
+    err "telepty list --json returned [] but the daemon answered '$verdict' — that is a refusal/failure, not an absence, and an absence is the only thing that may authorize closing a surface or deleting a registry entry. Refusing to clean anything."
+    case "$verdict" in
+      unauthorized) err "the daemon rejected the credential — check authToken in ~/.telepty/config.json is readable, then re-run";;
+      unreachable)  err "no answer from the daemon on 127.0.0.1:${TELEPTY_PORT:-3848} — every live session is its child, so 'unreachable' is not evidence that any session is gone";;
+      broken)       err "the daemon answered with an error status — treat the listing as unusable, not as empty";;
+    esac
     exit 3
   fi
   printf '%s' "$raw"
@@ -226,9 +253,13 @@ kill_parent_telepty_allow() {
 # (daemon.js:2367). 200 = removed, 404 = already gone (after parent kill).
 delete_session_registry() {
   local sid="$1" port="${TELEPTY_PORT:-3848}" http
+  # `|| true`, not `|| echo "000"`: with -w '%{http_code}' curl prints `000` on a
+  # connect failure and ALSO exits non-zero, so the echo idiom appended a second
+  # copy and produced `000000` — matching no arm and reaching the catch-all. That
+  # is why the no-answer case never had a voice here even after it was given one.
   http=$(curl -s -o /dev/null -w '%{http_code}' \
     -H "x-telepty-token: $(telepty_auth_token)" \
-    -X DELETE "http://127.0.0.1:${port}/api/sessions/${sid}" 2>/dev/null || echo "000")
+    -X DELETE "http://127.0.0.1:${port}/api/sessions/${sid}" 2>/dev/null || true)
   case "$http" in
     200) log "DELETE /api/sessions/$sid → 200 (removed from registry)";;
     404) log "DELETE /api/sessions/$sid → 404 (already gone — parent kill propagated)";;
@@ -238,6 +269,10 @@ delete_session_registry() {
     # accumulating exactly the way the 21 stale entries of 2026-05-17 did. Named
     # separately, and on stderr, because the operator has to act on it.
     401|403) err "DELETE /api/sessions/$sid → $http (daemon refused the credential — the entry STAYS in the daemon registry; check authToken in ~/.telepty/config.json is readable, then re-run)";;
+    # curl's own failure lands here as the literal "000" the || arm above prints.
+    # It shares the refusal's consequence — the entry stays in the registry — but
+    # not its cause, and "unexpected" told the operator neither. (#835)
+    000) err "DELETE /api/sessions/$sid → no answer from the daemon (the entry STAYS in the daemon registry; nothing was removed — re-run once the daemon answers)";;
     *)   log "DELETE /api/sessions/$sid → $http (unexpected; manual verify)";;
   esac
 }

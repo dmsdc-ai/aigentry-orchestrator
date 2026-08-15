@@ -15,12 +15,22 @@ export function nodeFs(): VirtualFS {
       const buf = await fsReadFile(p);
       return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
     },
+    // Only "this path is not there" may answer false. A bare `catch { return
+    // false }` also swallowed EACCES/EPERM/EIO/ELOOP — i.e. "I was refused" and
+    // "I am broken" reported as "it does not exist". readIfExists() in
+    // resolve-instructions.ts then drops the layer, so an unreadable role file
+    // composes a session whose contract is silently missing a layer rather than
+    // failing. A refusal is not an absence; let it propagate.
     async exists(p: string): Promise<boolean> {
       try {
         await access(p, fsConstants.F_OK);
         return true;
-      } catch {
-        return false;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException)?.code;
+        if (code === "ENOENT" || code === "ENOTDIR" || code === "ENAMETOOLONG") {
+          return false;
+        }
+        throw err;
       }
     },
   };
