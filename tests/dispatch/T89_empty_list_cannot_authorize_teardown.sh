@@ -166,6 +166,25 @@ if grep -q 'ARGV .*http://127.0.0.1:[0-9]*/api/sessions$' "$CURL_LOG"; then
   fail "a non-empty listing paid for a corroboration probe — only the ambiguous answer should"
 fi
 
+# ── (5b) a DELETE that got no answer says so, instead of "unexpected" ──────
+# curl's own failure reaches the status switch as the literal "000". It shares
+# the refusal's consequence — the registry entry stays — but not its cause, and
+# the catch-all named neither.
+res=$(run 000 "$SID")
+out=$(out_of "$res")
+case "$out" in
+  *"unexpected; manual verify"*)
+    fail "an unanswered DELETE fell through to the catch-all: $out";;
+esac
+case "$out" in
+  *"no answer from the daemon"*) ;;
+  *) fail "an unanswered DELETE did not name what happened: $out";;
+esac
+case "$out" in
+  *"STAYS in the daemon registry"*) ;;
+  *) fail "an unanswered DELETE did not state the consequence: $out";;
+esac
+
 # ── (6) Rule 28: the protected session is still refused, refusal or not ────
 printf '%s' '[]' > "$STUB_LIST_FILE"
 for http in 200 401; do

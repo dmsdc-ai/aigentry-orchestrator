@@ -265,6 +265,10 @@ delete_session_registry() {
     # accumulating exactly the way the 21 stale entries of 2026-05-17 did. Named
     # separately, and on stderr, because the operator has to act on it.
     401|403) err "DELETE /api/sessions/$sid → $http (daemon refused the credential — the entry STAYS in the daemon registry; check authToken in ~/.telepty/config.json is readable, then re-run)";;
+    # curl's own failure lands here as the literal "000" the || arm above prints.
+    # It shares the refusal's consequence — the entry stays in the registry — but
+    # not its cause, and "unexpected" told the operator neither. (#835)
+    000) err "DELETE /api/sessions/$sid → no answer from the daemon (the entry STAYS in the daemon registry; nothing was removed — re-run once the daemon answers)";;
     *)   log "DELETE /api/sessions/$sid → $http (unexpected; manual verify)";;
   esac
 }

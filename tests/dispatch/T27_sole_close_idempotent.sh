@@ -53,14 +53,21 @@ $(cat "$CMUX_CALLS")"
 
 # ===========================================================================
 # 2) Idempotent double wh_close: an already-gone host returns 0 BOTH times.
-#    cmux stub: close-workspace FAILS (already gone) + list shows it absent →
-#    _wh_cmux_close re-probes alive → gone → returns 0.
+#    cmux stub: close-workspace FAILS (already gone) + the liveness re-probe
+#    answers "Tab not found" → _wh_cmux_close sees a genuine gone verdict → 0.
+#
+#    #835: that re-probe answer used to be modelled as SILENCE (the catch-all
+#    `exit 0` with no output), which the adapter read as gone. Silence is no
+#    longer an answer, so the stub now gives the one a real cmux gives — an
+#    `Error:` line on stderr (verified against cmux 0.64.20). The claim under
+#    test is unchanged; it is now made against the shape the tool produces.
 # ===========================================================================
 cat > "$STUB_BIN/cmux" <<'EOF'
 #!/usr/bin/env bash
 case "$1" in
   list-workspaces) [ "${2:-}" = "--json" ] && echo '[]';;  # ws-gone absent
   close-workspace) exit 1;;                                  # "fails" = already gone
+  sidebar-state)   echo "Error: ERROR: Tab not found" >&2; exit 1;;
   *) exit 0;;
 esac
 EOF

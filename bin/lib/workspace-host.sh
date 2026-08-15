@@ -100,18 +100,39 @@ _wh_cmux_close() {
 }
 
 _wh_cmux_alive() {
-  # F9 fix: liveness via `sidebar-state` (the only per-handle probe). The handle
-  # may be a UUID (cmuxWorkspaceId from telepty) or a ref (workspace:N); cmux
-  # accepts <id|ref|index>. Judge by STDOUT content, not exit code (F7): a missing
-  # tab prints an "Error:" line, so alive iff stdout is non-empty AND not an Error.
-  local host_id="$1" out
+  # F9: liveness via `sidebar-state` (the only per-handle probe). The handle may be
+  # a UUID (cmuxWorkspaceId from telepty) or a ref (workspace:N); cmux accepts
+  # <id|ref|index>. The gone-answer is an "Error:" line, not an exit code (F7).
+  #
+  # #835, two corrections that only make sense together:
+  #
+  # (a) That "Error:" line goes to STDERR, not stdout — verified against cmux
+  #     0.64.20, which answers a missing handle with `Error: ERROR: Tab not found`
+  #     on fd 2 and an EMPTY stdout. The probe discarded stderr, so it never
+  #     matched the arm written for it; what actually detected a gone surface was
+  #     the empty-stdout fallback. Only the stub fixtures ever took the Error path,
+  #     because they print it on stdout. Both streams are read now, and the match
+  #     is line-anchored so a workspace whose own state text contains "Error:"
+  #     cannot be mistaken for the answer.
+  #
+  # (b) Silence is not an answer. Relying on the empty-stdout fallback meant a cmux
+  #     that crashed, hung, or was off PATH manufactured a "gone" verdict for every
+  #     session. "Gone" is a CORROBORATING signal for a teardown
+  #     (session-reconciler.sh INV-17), so an unanswered probe was supplying half
+  #     the evidence for closing a live worker. The warp adapter already gets this
+  #     right — _wh_warp_alive maps "cannot probe" and "Warp is down" to
+  #     INDETERMINATE→alive (#486). cmux now matches: only a real answer says gone.
+  local host_id="$1" out rc=0
   [ -z "$host_id" ] && return 1
-  command -v cmux >/dev/null 2>&1 || return 1
-  out=$(cmux sidebar-state --workspace "$host_id" 2>/dev/null)
-  [ -z "$out" ] && return 1
-  case "$out" in
-    Error:*) return 1 ;;
-  esac
+  if ! command -v cmux >/dev/null 2>&1; then
+    return 0 # cannot probe → INDETERMINATE→alive (INV-17), never a close signal
+  fi
+  out=$(cmux sidebar-state --workspace "$host_id" 2>&1) || rc=$?
+  if printf '%s\n' "$out" | grep -q '^Error:'; then
+    return 1                  # cmux answered: no such workspace → genuinely gone
+  fi
+  [ -n "$out" ] && return 0   # cmux answered with state → alive
+  _wh_log "sidebar-state said nothing for $host_id (rc=$rc) — treating the surface as PRESENT; an unanswered probe is not evidence that a surface is gone"
   return 0
 }
 
