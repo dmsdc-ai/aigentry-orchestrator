@@ -29,8 +29,8 @@ EXPECTED_GUARDS=96
 #         no-op elsewhere and the guard declines to assert on it. Linux-only entry.
 #   T47 — its codex and gemini legs sniff for those CLIs, which a clean CI runner does
 #         not have. Everything else in T47 runs; only the two per-CLI legs announce a
-#         skip. Present on a developer box that HAS codex/gemini installed — see the
-#         mismatch note printed on failure.
+#         skip. Capability-conditional, not OS-conditional — see the codex/gemini probe
+#         below, which drops this entry on a box that has both.
 #   T48 — live-integration, same gate as T16 (a real codex/gemini auth round-trip).
 #   T95 — part E boots a real telepty daemon on an ephemeral port. Gated on
 #         AIGENTRY_RUN_LIVE_TESTS=1 as of #900; parts A–D always run.
@@ -47,8 +47,18 @@ case "$(uname -s)" in
 esac
 if [ "${AIGENTRY_RUN_LIVE_TESTS:-0}" = "1" ]; then
   for g in $LIVE_GATED; do
-    expected=$(printf '%s\n' $expected | grep -vx "$g" | tr '\n' ' ')
+    expected=$(printf '%s\n' $expected | { grep -vx "$g" || true; } | tr '\n' ' ')
   done
+fi
+# T47 is the one entry whose skip is a CAPABILITY, not an OS: its two per-CLI legs skip
+# when codex/gemini are absent, which is every clean runner and no developer box that
+# actually dispatches to those CLIs. Modelling that here is the difference between an
+# assertion maintainers trust and one they learn to ignore — measured: on a box with both
+# CLIs installed, a flat per-OS declaration reports a mismatch on every single run, which
+# is precisely how a real signal gets muted. Both present => T47 runs both legs and is
+# expected NOT to skip; either absent => it announces and stays declared.
+if command -v codex >/dev/null 2>&1 && command -v gemini >/dev/null 2>&1; then
+  expected=$(printf '%s\n' $expected | { grep -vx T47 || true; } | tr '\n' ' ')
 fi
 
 # A guard announces a skip by printing, at the start of a line, its own id followed by
@@ -92,8 +102,8 @@ if [ "$guards" != "$EXPECTED_GUARDS" ]; then
   rc=1
 fi
 
-got=$(printf '%s\n' $skipped | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')
-want=$(printf '%s\n' $expected | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')
+got=$(printf '%s\n' $skipped | { grep -v '^$' || true; } | sort -u | tr '\n' ' ' | sed 's/ $//')
+want=$(printf '%s\n' $expected | { grep -v '^$' || true; } | sort -u | tr '\n' ' ' | sed 's/ $//')
 if [ "$got" != "$want" ]; then
   echo "SKIP-SET MISMATCH on $OSKEY:" >&2
   echo "  declared: ${want:-none}" >&2
@@ -102,8 +112,6 @@ if [ "$got" != "$want" ]; then
   echo "  nothing — that is the defect this assertion exists to catch. The reverse means the" >&2
   echo "  declaration above is stale. Either way, fix the guard or fix the declaration with a" >&2
   echo "  justification; do not widen the set to make this green." >&2
-  echo "  If this is a developer box whose extra CLIs (codex, gemini, telepty) legitimately" >&2
-  echo "  un-skip a guard, that is still a real difference from what CI measures." >&2
   rc=1
 fi
 
