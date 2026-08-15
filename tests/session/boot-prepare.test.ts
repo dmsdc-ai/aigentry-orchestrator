@@ -21,7 +21,7 @@ import {
   realpathSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..", "..", "..");
 const BOOT_PREPARE = join(REPO_ROOT, "bin", "boot-prepare.mjs");
@@ -33,10 +33,44 @@ interface BootJson {
   env: Record<string, string>;
 }
 
+// #894 — hermetic CLI stand-in. boot-prepare version-gates the target CLI via
+// `<cli> --version` (nodeSpawner.probeVersion → PATH lookup); a runner without
+// the real binary made every 431 test die CLI_NOT_FOUND, and every #532/#552/#569
+// test silently skip. The shim answers the probe and nothing else: the launcher.sh
+// these tests inspect is READ, never executed, so boot-prepare's own logic
+// (launcher generation, staging, sandbox layout, shadow homes, JSON output) is
+// still what is under test. 9.9.9 clears every adapter's min_version.
+// AIGENTRY_SHIM_LOG (unset here) makes it log argv if a future test needs that.
+const SHIM_CLIS = ["claude", "codex", "gemini"] as const;
+
+function writeCliShims(binDir: string): void {
+  mkdirSync(binDir, { recursive: true });
+  for (const cli of SHIM_CLIS) {
+    const p = join(binDir, cli);
+    writeFileSync(
+      p,
+      `#!/bin/sh\n` +
+        `# hermetic ${cli} stand-in (#894) — probe answerer, not a CLI.\n` +
+        `[ -n "$AIGENTRY_SHIM_LOG" ] && echo "${cli} $*" >> "$AIGENTRY_SHIM_LOG"\n` +
+        `case "$1" in --version) echo "9.9.9 (aigentry test shim)" ;; esac\n` +
+        `exit 0\n`,
+      { mode: 0o755 },
+    );
+  }
+}
+
 function setupTempHome(): { home: string; targetCwd: string; cleanup: () => void } {
   const root = mkdtempSync(join(tmpdir(), "boot-prepare-431-"));
   const home = join(root, "aig");
   const targetCwd = join(root, "cwd-with-claudemd");
+  writeCliShims(join(root, "shimbin"));
+  // #894 — boot-prepare rename-writes `~/.claude.json` to pre-accept the sandbox
+  // (ensureSandboxTrusted). Pointed at the real HOME that mutates the developer's
+  // own config on every test run, and on a runner without the file it degraded to
+  // a stderr WARNING, so the auto-trust path was never actually exercised. A seeded
+  // temp HOME makes the write land in the fixture and the path testable.
+  mkdirSync(join(root, "fakehome"), { recursive: true });
+  writeFileSync(join(root, "fakehome", ".claude.json"), "{}\n");
   mkdirSync(join(home, "instructions", "roles"), { recursive: true });
   mkdirSync(join(home, "instructions", "projects"), { recursive: true });
   mkdirSync(targetCwd, { recursive: true });
@@ -59,9 +93,23 @@ function setupTempHome(): { home: string; targetCwd: string; cleanup: () => void
   };
 }
 
+// The two knobs that make a boot-prepare run hermetic (#894): the shim bin dir
+// FIRST on PATH so the version probe resolves to the fixture rather than whatever
+// the machine happens to have installed, and HOME pointed at the fixture so
+// auto-trust cannot reach the developer's real ~/.claude.json. Both are derived
+// from the temp root that setupTempHome built, so every call site gets them.
+function hermeticEnv(home: string): Record<string, string> {
+  const root = dirname(home);
+  return {
+    AIGENTRY_HOME: home,
+    HOME: join(root, "fakehome"),
+    PATH: `${join(root, "shimbin")}:${process.env["PATH"] ?? ""}`,
+  };
+}
+
 function runBootPrepare(home: string, args: string[]): { code: number; stdout: string; stderr: string } {
   const r = spawnSync("node", [BOOT_PREPARE, ...args], {
-    env: { ...process.env, AIGENTRY_HOME: home },
+    env: { ...process.env, ...hermeticEnv(home) },
     encoding: "utf8",
   });
   return { code: r.status ?? -1, stdout: r.stdout, stderr: r.stderr };
@@ -162,6 +210,13 @@ test("431-G — spawn_cwd is under role-sandbox, exists, has no CLAUDE.md", () =
       false,
       "sandbox must not contain CLAUDE.md (auto-discovery defense)",
     );
+    // #894 — auto-trust landed in the fixture HOME, not the developer's real one.
+    const trusted = JSON.parse(readFileSync(join(dirname(home), "fakehome", ".claude.json"), "utf8"));
+    assert.equal(
+      trusted.projects?.[j.spawn_cwd]?.hasTrustDialogAccepted,
+      true,
+      "ensureSandboxTrusted must pre-accept the sandbox in $HOME/.claude.json",
+    );
   } finally {
     cleanup();
   }
@@ -207,6 +262,29 @@ test("431-D — unknown role rejected with non-zero", () => {
   }
 });
 
+// #894 — the arm the shim stands in FOR. Every other 431 test now proves
+// boot-prepare works when the CLI is present; this one proves it still refuses,
+// loudly and non-zero, when it is not — the exact condition that took the first
+// release run red. PATH is emptied rather than filtered so absence is real, and
+// boot-prepare is launched by absolute path (process.execPath) because a bare
+// "node" would no longer resolve either.
+test("431-I — absent CLI fails non-zero with CLI_NOT_FOUND (the arm the shim stands in for)", () => {
+  const { home, targetCwd, cleanup } = setupTempHome();
+  try {
+    const empty = join(dirname(home), "emptybin");
+    mkdirSync(empty, { recursive: true });
+    const r = spawnSync(
+      process.execPath,
+      [BOOT_PREPARE, "--role", "coder", "--cwd", targetCwd, "--sid", "test-431-I"],
+      { env: { ...process.env, ...hermeticEnv(home), PATH: empty }, encoding: "utf8" },
+    );
+    assert.notEqual(r.status, 0, `expected non-zero, got ${r.status}; stdout=${r.stdout}`);
+    assert.match(r.stderr, /CLI_NOT_FOUND/, `stderr must name the failure; got: ${r.stderr}`);
+  } finally {
+    cleanup();
+  }
+});
+
 test("431-E — missing required arg surfaces usage exit (4)", () => {
   const r = spawnSync("node", [BOOT_PREPARE, "--role", "coder"], { encoding: "utf8" });
   assert.equal(r.status, 4);
@@ -223,15 +301,12 @@ test("431-E — missing required arg surfaces usage exit (4)", () => {
 // real home MINUS the global doc (so the per-user global AGENTS.md/GEMINI.md
 // cannot leak) while PRESERVING auth (auth.json / oauth_creds.json).
 //
-// These spawn the real boot-prepare, which version-gates the actual CLI — skipped
-// when the CLI binary is absent (CI). The config-home is pointed at a FAKE real
-// home via env so no live ~/.codex / ~/.gemini is touched.
+// These spawn the real boot-prepare, which version-gates the target CLI. #894:
+// that gate used to be answered by whatever was installed on the machine, so the
+// whole block SKIPPED on CI and was never once measured there; it is answered by
+// the PATH shim above now. The config-home is pointed at a FAKE real home via env
+// so no live ~/.codex / ~/.gemini is touched.
 // ---------------------------------------------------------------------------
-
-function cliAvailable(cli: string): boolean {
-  const r = spawnSync(cli, ["--version"], { encoding: "utf8" });
-  return r.status === 0;
-}
 
 const CLI_MATRIX = [
   {
@@ -281,7 +356,7 @@ function runBootPrepareEnv(
   args: string[],
 ): { code: number; stdout: string; stderr: string } {
   const r = spawnSync("node", [BOOT_PREPARE, ...args], {
-    env: { ...process.env, AIGENTRY_HOME: home, ...extraEnv },
+    env: { ...process.env, ...hermeticEnv(home), ...extraEnv },
     encoding: "utf8",
   });
   return { code: r.status ?? -1, stdout: r.stdout, stderr: r.stderr };
@@ -289,7 +364,6 @@ function runBootPrepareEnv(
 
 for (const m of CLI_MATRIX) {
   test(`532-${m.cli}-A — launcher execs ${m.cli} with real flags (NOT --append-system-prompt-file/--bare/--permission-mode)`, () => {
-    if (!cliAvailable(m.cli)) { console.error(`532-${m.cli}-A SKIP — ${m.cli} not installed`); return; }
     const { home, targetCwd, cleanup } = setupTempHome();
     try {
       const fakeReal = setupFakeCliHome(home, m);
@@ -314,7 +388,6 @@ for (const m of CLI_MATRIX) {
   });
 
   test(`532-${m.cli}-B — staged ${m.contextFile} in sandbox is byte-identical to effective_prompt.md (role + contract, no CLAUDE.md leak)`, () => {
-    if (!cliAvailable(m.cli)) { console.error(`532-${m.cli}-B SKIP — ${m.cli} not installed`); return; }
     const { home, targetCwd, cleanup } = setupTempHome();
     try {
       const fakeReal = setupFakeCliHome(home, m);
@@ -338,7 +411,6 @@ for (const m of CLI_MATRIX) {
   });
 
   test(`532-${m.cli}-C — launcher exports ${m.homeEnv} shadow home + AIGENTRY_TARGET_CWD`, () => {
-    if (!cliAvailable(m.cli)) { console.error(`532-${m.cli}-C SKIP — ${m.cli} not installed`); return; }
     const { home, targetCwd, cleanup } = setupTempHome();
     try {
       const fakeReal = setupFakeCliHome(home, m);
@@ -358,7 +430,6 @@ for (const m of CLI_MATRIX) {
   });
 
   test(`532-${m.cli}-D — shadow home mirrors auth + settings but OMITS the global ${m.contextFile}`, () => {
-    if (!cliAvailable(m.cli)) { console.error(`532-${m.cli}-D SKIP — ${m.cli} not installed`); return; }
     const { home, targetCwd, cleanup } = setupTempHome();
     try {
       const fakeReal = setupFakeCliHome(home, m);
@@ -399,7 +470,6 @@ for (const m of CLI_MATRIX) {
 // folder-trust modal at boot, while the real ~/.codex/config.toml stays untouched
 // (credential/config boundary — we de-symlink, never write through the link).
 test("552-codex-E — shadow config.toml pre-trusts the sandbox cwd; real config untouched", () => {
-  if (!cliAvailable("codex")) { console.error("552-codex-E SKIP — codex not installed"); return; }
   const { home, targetCwd, cleanup } = setupTempHome();
   try {
     const codex = CLI_MATRIX.find((m) => m.cli === "codex")!;
@@ -444,7 +514,6 @@ test("552-codex-E — shadow config.toml pre-trusts the sandbox cwd; real config
 // `.gemini` subdir, and the writable OAuth creds must be de-symlinked (real 0600
 // copy) so a token-refresh write stays sandboxed and never mutates real ~/.gemini.
 test("569-gemini-A — creds mirror lands under the .gemini subdir, NOT the home top-level", () => {
-  if (!cliAvailable("gemini")) { console.error("569-gemini-A SKIP — gemini not installed"); return; }
   const { home, targetCwd, cleanup } = setupTempHome();
   try {
     const gemini = CLI_MATRIX.find((m) => m.cli === "gemini")!;
@@ -472,7 +541,6 @@ test("569-gemini-A — creds mirror lands under the .gemini subdir, NOT the home
 });
 
 test("569-gemini-B — writable creds de-symlinked (0600 copy); real ~/.gemini byte-identical", () => {
-  if (!cliAvailable("gemini")) { console.error("569-gemini-B SKIP — gemini not installed"); return; }
   const { home, targetCwd, cleanup } = setupTempHome();
   try {
     const gemini = CLI_MATRIX.find((m) => m.cli === "gemini")!;
@@ -510,7 +578,6 @@ test("569-gemini-B — writable creds de-symlinked (0600 copy); real ~/.gemini b
 });
 
 test("551-gemini — AIGENTRY_GEMINI_MODEL overrides boot-prep launcher model", () => {
-  if (!cliAvailable("gemini")) { console.error("551-gemini SKIP — gemini not installed"); return; }
   const { home, targetCwd, cleanup } = setupTempHome();
   try {
     const gemini = CLI_MATRIX.find((m) => m.cli === "gemini")!;

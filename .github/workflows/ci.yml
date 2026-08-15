@@ -1,0 +1,64 @@
+name: CI
+
+# #894. This file exists because the repo had no test-running CI at all, and the first
+# execution of release.yml — a tag push, at publish time — was therefore also the first
+# time the suite had ever run anywhere but a maintainer's laptop. It failed on both OS
+# legs, on tests that depended on a `claude` binary the runner does not have. The publish
+# was correctly skipped, but the defect was found at the worst possible moment.
+#
+# So the contract here is narrow and deliberate: this job runs the SAME gates as
+# release.yml's `test` job, in the same order, on the same matrix. Not "similar" — the
+# same. A green PR is only worth something if it predicts a green release, and it can only
+# predict that if it measures the same thing. When release.yml's test job changes, this
+# changes with it; a divergence between the two is a bug in this file.
+#
+# What this does NOT run, stated so a green check is not read as more than it measured:
+# tests/dispatch/run-all.sh (96 tests, ~20 min, needs a live telepty daemon) remains a
+# maintainer-machine gate, exactly as release.yml documents.
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+# A PR that gets three pushes in a minute does not need three full matrices; the newest
+# commit is the only one whose answer matters. This is the opposite of release.yml's
+# queue-never-cancel setting, and deliberately so: cancelling a test run loses nothing,
+# whereas cancelling a publish mid-flight is how you get a half-release.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Full suite
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [20]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Install jq (a hard dependency of init, checked at step 1)
+        run: command -v jq || sudo apt-get install -y jq
+        if: matrix.os == 'ubuntu-latest'
+      - name: Run the regression suite
+        run: npm test
+      - name: Ship-set agreement against the real tarball
+        run: bash tests/packaging/T96_ship_set_agreement.sh
+      # Announces its own skip when the upstream repo is absent, which it always is here.
+      - name: Vendored constitution currency
+        run: bash tests/packaging/T97_constitution_vendor_current.sh
+      - name: Acceptance smoke — install the tarball and init into a throwaway HOME
+        run: bash tests/packaging/smoke-init.sh
