@@ -77,6 +77,86 @@ jobs:
       - name: Acceptance smoke — install the tarball and init into a throwaway HOME
         run: bash tests/packaging/smoke-init.sh
 
+  # #901 (W1) — a REAL test run on windows-latest, now that the two persistence seams
+  # (atomic-write, index-lock) have win32 arms instead of throws. W0 below proves the
+  # package refuses to INSTALL on Windows; this proves the library's persistence layer
+  # WORKS there. Those are different claims and both are wanted: the refusal is the
+  # shipped product decision, and this leg is what stops the win32 arms from being
+  # asserted only by inference.
+  #
+  # WHY A SEPARATE JOB, not windows-latest added to the `test` matrix above. The test job
+  # is bound by the contract in this file's header — it must run the SAME gates in the
+  # SAME order as release.yml's test job, or a green PR stops predicting a green release.
+  # Windows cannot run four of its seven steps (the dispatch guard suite, T96, T97 and
+  # smoke-init are bash), so joining the matrix would mean per-OS `if:` guards, i.e. the
+  # steps would no longer be the same and the parity that #900 asserted would be gone.
+  # The alternative — adding windows to release.yml too — would put a Windows leg in the
+  # PUBLISH gate for a package that declares Windows unsupported. A separate job keeps
+  # both stories straight.
+  #
+  # WHY `npm ci --force`. U23, measured in W0 below: npm enforces the root manifest's own
+  # os[], so a plain `npm ci` here dies with EBADPLATFORM. --force is a CI-only bypass of
+  # exactly that check. It does NOT weaken the shipped refusal in any way — package.json
+  # os[] is untouched, and the W0 job below still asserts both the declaration and the
+  # EBADPLATFORM behaviour on this same runner, in this same workflow. The honest reading
+  # of a green W1 is "the code runs on win32 when you force it past the refusal", never
+  # "Windows is supported".
+  windows-persistence:
+    name: Windows W1 — the suite really runs
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies (CI-only --force past the os[] refusal, see above)
+        shell: bash
+        run: npm ci --force
+
+      # The gate. Also the resolution of U28: scripts/run-tests.mjs:30 normalises the
+      # enumerated paths with .split(sep).join('/') before handing them to `node --test`,
+      # which is a Windows-shaped line that had never run on Windows. If that normalisation
+      # were wrong, the runner would find zero tests or fail to load them, so a full pass
+      # here is the proof.
+      #
+      # Zero unexpected skips, asserted rather than eyeballed — the #900 doctrine applied
+      # to node:test. A win32 arm that quietly skipped its own tests would look identical
+      # to one that passed them.
+      - name: Run the regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm test 2>&1 | tee "${RUNNER_TEMP}/test.log"
+          SKIPPED="$(grep -E '^# skipped ' "${RUNNER_TEMP}/test.log" | tail -1 | awk '{print $3}')"
+          PASS="$(grep -E '^# pass ' "${RUNNER_TEMP}/test.log" | tail -1 | awk '{print $3}')"
+          echo "win32: pass=${PASS} skipped=${SKIPPED}"
+          [ -n "${SKIPPED}" ] || { echo "::error::could not read a '# skipped' line from the TAP summary; the assertion below would pass vacuously."; exit 1; }
+          [ "${SKIPPED}" = "0" ] || { echo "::error::${SKIPPED} test(s) skipped on win32. A skip here is a win32 behaviour that went unmeasured — name it and declare it, do not let it ride."; exit 1; }
+          [ "${PASS}" -gt 0 ] || { echo "::error::the TAP summary reports ${PASS} passing tests."; exit 1; }
+
+      # U21 — a `.mjs` bin has never been installed on Windows from this package, and npm
+      # generates its shims (.cmd/.ps1) from the shebang. If cmd-shim mishandled the .mjs
+      # extension, `aigentry-orchestrator` would be installed and unrunnable — a failure
+      # that only appears at a user's first invocation, which is the worst place for it.
+      # --version is the right probe: it returns before platformGate(), so this measures
+      # the shim, not the platform refusal (which W0 measures deliberately).
+      - name: U21 — the .mjs bin gets a working Windows shim
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREFIX="${RUNNER_TEMP}/w1-prefix"
+          mkdir -p "$PREFIX"
+          TARBALL="$(npm pack --silent)"
+          npm install --force --prefix "$PREFIX" "./${TARBALL}"
+          EXPECTED="$(node -p "require('./package.json').version")"
+          REPORTED="$("$PREFIX/node_modules/.bin/aigentry-orchestrator" --version)"
+          REPORTED="$(printf '%s' "$REPORTED" | tr -d '\r')"
+          [ "$REPORTED" = "$EXPECTED" ] || { echo "::error::the installed Windows shim reports '${REPORTED}', expected '${EXPECTED}'. npm's cmd-shim does not handle this .mjs bin correctly."; exit 1; }
+          echo "the .mjs bin runs through its Windows shim and reports ${REPORTED}"
+
   # #900 (W0) — "unsupported on Windows" was, like the Linux claim above, a sentence
   # rather than a measurement. release.yml asserts the os[] declaration, but it does so
   # on ubuntu, which proves the string and nothing about what a Windows user experiences.

@@ -12,6 +12,106 @@ async function mkTmpDir(label: string): Promise<string> {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+// #901 — see the same helper in atomic-write.test.ts for why this exists and what it does
+// NOT prove. Short version: it makes the win32 arm reachable from every CI leg; the W1
+// leg in ci.yml proves the platform itself behaves as the arm assumes (hard links on
+// NTFS, kill(pid, 0) reporting ESRCH for a pid that cannot exist).
+async function asPlatform<T>(
+  platform: NodeJS.Platform,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const real = process.platform;
+  Object.defineProperty(process, "platform", {
+    value: platform,
+    configurable: true,
+  });
+  try {
+    return await fn();
+  } finally {
+    Object.defineProperty(process, "platform", {
+      value: real,
+      configurable: true,
+    });
+  }
+}
+
+test("win32 arm: basic acquire/release, lock file gone after fn returns", async () => {
+  const dir = await mkTmpDir("win-basic");
+  const target = path.join(dir, "index.json");
+  const result = await asPlatform("win32", () =>
+    withIndexLock(target, async () => {
+      await fs.access(`${target}.lock`);
+      return 42;
+    }),
+  );
+  assert.equal(result, 42);
+  await assert.rejects(fs.access(`${target}.lock`));
+});
+
+test("win32 arm: serialization — second acquire waits for the first", async () => {
+  const dir = await mkTmpDir("win-serialize");
+  const target = path.join(dir, "index.json");
+  const order: string[] = [];
+  await asPlatform("win32", async () => {
+    const first = withIndexLock(target, async () => {
+      order.push("first-enter");
+      await sleep(150);
+      order.push("first-exit");
+    });
+    await sleep(20);
+    const second = withIndexLock(target, async () => {
+      order.push("second-enter");
+    });
+    await Promise.all([first, second]);
+  });
+  assert.deepEqual(order, ["first-enter", "first-exit", "second-enter"]);
+});
+
+test("win32 arm: dead-pid lock is reclaimed (held/dead/vanished contract, #897)", async () => {
+  const dir = await mkTmpDir("win-stale");
+  const target = path.join(dir, "index.json");
+  // Not a multiple of 4, so it cannot be a Windows pid either — kill(pid, 0) must report
+  // ESRCH on both platforms for this to be classified "dead" rather than "held".
+  await fs.writeFile(`${target}.lock`, `${(1 << 22) + 7}\n`);
+  const result = await asPlatform("win32", () =>
+    withIndexLock(target, async () => "reclaimed", { timeoutMs: 2_000 }),
+  );
+  assert.equal(result, "reclaimed");
+});
+
+test("win32 arm: timeout still fires when the lock is never released", async () => {
+  const dir = await mkTmpDir("win-timeout");
+  const target = path.join(dir, "index.json");
+  await asPlatform("win32", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const holder = withIndexLock(target, () => gate);
+    await sleep(20);
+    await assert.rejects(
+      withIndexLock(target, async () => {}, { timeoutMs: 100 }),
+      /timeout/,
+    );
+    release();
+    await holder;
+  });
+});
+
+test("the lock is released even when fn throws", async () => {
+  const dir = await mkTmpDir("throwing-fn");
+  const target = path.join(dir, "index.json");
+  await assert.rejects(
+    withIndexLock(target, async () => {
+      throw new Error("boom");
+    }),
+    /boom/,
+  );
+  // A leaked lock here is worse on Windows than on POSIX: the pid in it is ours and
+  // still alive, so every later waiter reads "held" and blocks until its own timeout.
+  await assert.rejects(fs.access(`${target}.lock`));
+});
+
 test("basic acquire/release: lock file gone after fn returns", async () => {
   const dir = await mkTmpDir("basic");
   const target = path.join(dir, "index.json");
