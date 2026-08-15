@@ -66,12 +66,19 @@ DISPATCH_REGISTRY_PY="${DISPATCH_REGISTRY_PY:-$SCRIPT_DIR/dispatch-registry.py}"
 # registry_cleaned <sid> — best-effort: a cleaned session often has no dispatch
 # record at all (a hand-spawned or already-pruned one), and that must not fail
 # the cleanup.
+#
+# --all (#853): a sid carries ONE RECORD PER DISPATCH, and this is a fact about
+# the SESSION — it is gone, so every live record for it is gone. Without --all
+# the registry's singular lookup retired exactly one and left the rest in the
+# --live set permanently, polled forever and HOLDing on every reconcile tick.
+# The more a worker was talked to, the more ghosts its cleanup left behind; the
+# only way to drain them was to re-run this by hand, once per ghost.
 registry_cleaned() {
   local sid="$1"
   [ -x "$DISPATCH_REGISTRY_PY" ] || return 0
-  "$DISPATCH_REGISTRY_PY" observe --sid "$sid" --kind session_absent_observed \
+  "$DISPATCH_REGISTRY_PY" observe --sid "$sid" --kind session_absent_observed --all \
     >/dev/null 2>&1 || return 0
-  "$DISPATCH_REGISTRY_PY" set-lifecycle --sid "$sid" --state cleaned >/dev/null 2>&1 || true
+  "$DISPATCH_REGISTRY_PY" set-lifecycle --sid "$sid" --state cleaned --all >/dev/null 2>&1 || true
 }
 # shellcheck source=lib/workspace-host.sh
 . "$SCRIPT_DIR/lib/workspace-host.sh"

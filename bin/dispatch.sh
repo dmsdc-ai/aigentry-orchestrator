@@ -290,6 +290,7 @@ wait_for_ready() {
 ref_hash=""
 eff_ref=""     # the bytes actually handed to telepty; prepared BEFORE begin-delivery
 tmp_ref=""
+transport_inject_id=""  # telepty's transport id for THIS inject; "" when unreadable (#872)
 
 # --- telepty#60 Stage A registry seam --------------------------------------
 # The registry component is the single typed writer of the dispatch registry.
@@ -331,15 +332,74 @@ prepare_effective_ref() {
   eff_ref="$tmp_ref"
 }
 
+# parse_inject_id <file> — the transport id telepty printed, or nothing (#872).
+#
+# telepty 0.8.0 prints it on its own undecorated line (`   inject_id: <uuid>`;
+# cli.js:2875 local arm, :2841 remote arm) precisely so a caller can scrape it
+# without parsing the decorated success line. That is still human-facing stdout,
+# not a machine contract, so this reads conservatively: the whole line must be
+# the prefix plus the exact UUID shape crypto.randomUUID() emits
+# (daemon.js:3791), anchored at both ends.
+#
+# Anything the pattern does not match yields NO id. transport.inject_id then
+# stays null and dispatch-tracker.sh:500 fires its existing
+# `no_transport_inject_id` HOLD — which is the honest answer. A guessed or
+# partially-matched id would send the tracker to poll a DIFFERENT dispatch's
+# observation record, and a confident wrong answer is worse than a named absence.
+parse_inject_id() {
+  local hex='[0-9a-fA-F]' ids
+  ids=$(tr -d '\r' < "$1" | sed -n -E \
+    "s/^[[:space:]]*inject_id:[[:space:]]+($hex{8}-$hex{4}-$hex{4}-$hex{4}-$hex{12})[[:space:]]*\$/\1/p" \
+    | sort -u)
+  # Exactly one DISTINCT id, or none. Two different ids in one inject's output is
+  # ambiguity, not a menu; picking either would be a guess about which delivery
+  # we just made.
+  [ "$(printf '%s\n' "$ids" | grep -c .)" -eq 1 ] || return 0
+  printf '%s\n' "$ids"
+}
+
 do_inject() {
   local sid="$1"
   local -a a=(inject --ref "$eff_ref" --submit --submit-retry 2)
   [ -n "$from_id" ] && a+=(--from "$from_id")
   a+=("$sid")
-  local rc=0
-  "$TELEPTY" "${a[@]}" || rc=$?
+  local rc=0 out=""
+  # Capturing the id must never be able to FAIL a dispatch. Nothing fallible may
+  # run between begin-delivery's commit and this transport call (see the note at
+  # the call site) — so a scratch file that cannot be created degrades to "no id
+  # captured", which is the already-supported no_transport_inject_id path, rather
+  # than aborting a delivery the registry has already authorized.
+  out=$(mktemp "${TMPDIR:-/tmp}/dispatch-inject.XXXXXX" 2>/dev/null) || out=""
+  set +e
+  if [ -n "$out" ]; then
+    # tee, not capture. telepty's stdout is what the operator watches to see the
+    # inject land; swallowing it to scrape one line would trade a visible
+    # dispatch for an invisible one. PIPESTATUS[0] keeps the real exit code.
+    "$TELEPTY" "${a[@]}" | tee "$out"
+    rc=${PIPESTATUS[0]}
+  else
+    "$TELEPTY" "${a[@]}"
+    rc=$?
+  fi
+  set -e
+  if [ -n "$out" ]; then
+    transport_inject_id=$(parse_inject_id "$out")
+    rm -f "$out"
+  fi
   [ -n "$tmp_ref" ] && rm -f "$tmp_ref"
   return "$rc"  # preserve the inject's real exit code (callers gate on it)
+}
+
+# record_transport <sid> <result> — set-transport-result carrying the inject_id
+# when telepty surfaced one. Two branches rather than one conditional array:
+# expanding an empty array under `set -u` is an unbound-variable error on the
+# bash 3.2 still shipped as /bin/bash.
+record_transport() {
+  if [ -n "$transport_inject_id" ]; then
+    registry set-transport-result --sid "$1" --result "$2" --inject-id "$transport_inject_id"
+  else
+    registry set-transport-result --sid "$1" --result "$2"
+  fi
 }
 
 # Returns 0 if the inject visibly landed (placeholder cleared or payload's
@@ -675,15 +735,18 @@ esac
 if ! do_inject "$sid"; then
   echo "dispatch.sh: telepty inject failed for $sid" >&2
   # A generic nonzero return is NOT proof that no bytes landed, so the record
-  # says delivery-unknown rather than claiming a clean failure.
-  registry set-transport-result --sid "$sid" --result unknown >/dev/null 2>&1 || true
+  # says delivery-unknown rather than claiming a clean failure. The inject_id, if
+  # telepty printed one before failing, is recorded HERE too: this is exactly the
+  # dispatch whose fate nobody can otherwise answer for, and the id is the only
+  # handle the tracker has to ask the daemon what actually happened.
+  record_transport "$sid" unknown >/dev/null 2>&1 || true
   exit 3
 fi
 
 # Exit 0 requires the transport result to be durable too — a caller that cannot
 # tell "delivered and recorded" from "delivered, bookkeeping lost" will book the
 # second as a successful re-dispatch.
-if ! registry set-transport-result --sid "$sid" --result write_observed >/dev/null; then
+if ! record_transport "$sid" write_observed >/dev/null; then
   echo "dispatch.sh: DELIVERY_UNKNOWN for $sid — bytes were handed to telepty but the transport result could not be recorded" >&2
   exit 7
 fi
