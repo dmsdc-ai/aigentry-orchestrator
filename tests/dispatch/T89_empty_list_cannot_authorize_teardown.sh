@@ -44,11 +44,18 @@ ACTIONS_LOG="$T_TMP/actions.log"; export ACTIONS_LOG
 # curl stub: one argv per line into CURL_LOG, answer $STUB_HTTP. Both the /api/sessions
 # probe and the registry DELETE come through here, so the log is also the record of
 # what the script tried to destroy.
+# A faithful curl: with -w '%{http_code}' the real one prints `000` on a connect
+# failure AND exits non-zero. A stub that only ever printed the code and exited 0
+# cannot catch a caller whose `|| echo 000` then doubles it to `000000` — which is
+# exactly how the no-answer arm stayed unreachable in production while passing
+# here. The 000 case must therefore fail the way curl fails.
 cat > "$STUB_BIN/curl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$@" >> "$CURL_LOG"
 printf 'ARGV %s\n' "$*" >> "$CURL_LOG"
 echo "${STUB_HTTP:-200}"
+[ "${STUB_HTTP:-200}" = "000" ] && exit 7
+exit 0
 EOF
 chmod +x "$STUB_BIN/curl"
 

@@ -253,9 +253,13 @@ kill_parent_telepty_allow() {
 # (daemon.js:2367). 200 = removed, 404 = already gone (after parent kill).
 delete_session_registry() {
   local sid="$1" port="${TELEPTY_PORT:-3848}" http
+  # `|| true`, not `|| echo "000"`: with -w '%{http_code}' curl prints `000` on a
+  # connect failure and ALSO exits non-zero, so the echo idiom appended a second
+  # copy and produced `000000` — matching no arm and reaching the catch-all. That
+  # is why the no-answer case never had a voice here even after it was given one.
   http=$(curl -s -o /dev/null -w '%{http_code}' \
     -H "x-telepty-token: $(telepty_auth_token)" \
-    -X DELETE "http://127.0.0.1:${port}/api/sessions/${sid}" 2>/dev/null || echo "000")
+    -X DELETE "http://127.0.0.1:${port}/api/sessions/${sid}" 2>/dev/null || true)
   case "$http" in
     200) log "DELETE /api/sessions/$sid → 200 (removed from registry)";;
     404) log "DELETE /api/sessions/$sid → 404 (already gone — parent kill propagated)";;

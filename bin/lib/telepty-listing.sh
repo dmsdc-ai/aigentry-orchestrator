@@ -48,11 +48,15 @@ _TELEPTY_LISTING_SH_SOURCED=1
 # $CURL is the same test seam bin/dispatch-tracker.sh:41 uses — the reconciler and
 # ask.sh both harden PATH with /usr/bin ahead of anything a test can prepend, so a
 # stub on PATH cannot reach this call.
+# NOT `|| echo "000"`: with -w '%{http_code}' curl prints `000` on a connect
+# failure and ALSO exits non-zero, so that idiom yields `000000` — which matches
+# no arm and lands in the catch-all, reporting an outage as "broken". `|| true`
+# leaves curl's own code as the single source of truth.
 telepty_listing_verdict() {
   local port="${TELEPTY_PORT:-3848}" http
   http=$("${CURL:-curl}" -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 \
     -H "x-telepty-token: $(telepty_auth_token)" \
-    "http://127.0.0.1:${port}/api/sessions" 2>/dev/null || echo "000")
+    "http://127.0.0.1:${port}/api/sessions" 2>/dev/null || true)
   case "$http" in
     200)     printf 'ok' ;;
     401|403) printf 'unauthorized' ;;
