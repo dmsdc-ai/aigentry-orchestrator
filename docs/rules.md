@@ -402,8 +402,9 @@ Memory: `feedback_session_cleanup_protocol.md`.
 | MCP tool permission prompt (`brain_search` 등) | 자동 "allow for this session". |
 | cmux main panel blank | `telepty read-screen <id>`로 progress 직접 inspect. 사용자에 사이드바 클릭 요청 X. |
 | Session stuck > 5 min | (1) read-screen 진단 → (2) prompt면 자동 응답 / (3) deadlock이면 kill+respawn. |
-| `TASK_COMPLETE` 5-15s post-inject | 100% false-positive (inject latency). 무시 — 사용자 surface X. |
-| `TASK_COMPLETE` 30s+ post-inject | 실제 idle. REPORT 검토. |
+| `TASK_COMPLETE` (telepty < 0.8.0에서만 존재) | **완료 신호로 취급 금지.** 이 신호가 측정한 것은 "PTY가 조용해졌다"이지 "작업이 끝났다"가 아니다 — 그래서 telepty 0.8.0(#60 Stage A)이 제거했다. 여전히 보인다면 그건 **데몬이 구버전이라는 사실의 관측**이지 작업 상태 관측이 아니다. 실제 상태는 세션 REPORT 내용 / `read-screen` / git으로 확인. |
+| `HOLD … reason=no_transport_inject_id — no completion fact observed; outcome unknown, still polling` | **0.8.0의 정상 동작.** 부재를 부재로 방출한 것(불변식 A2)이지 에러가 아니다. 재dispatch 금지 — 계속 폴링됨. 급하면 REPORT 내용·git·read-screen으로 직접 지상 검증. |
+| `task_completion_unknown` / `session_activity_observation` | 0.8.0 어휘. activity(움직임) ≠ outcome(결과). 어느 쪽도 완료를 주장하지 않으므로 완료 판정에 쓰지 않는다. |
 | Stale 세션 (DONE 후) | Rule 28 따라 즉시 `cmux close-workspace` + `telepty delete` (사용자 승인 X). |
 | Disk artifact 검증 | 직접 `ls`/`cat`/`read-screen` 실행. 사용자에 read 요청 X. |
 | Background progress polling | 사용자 명시 X면 self-poll (~5-10min interval). 매 인터벌 "어떻게 할까요?" 금지. |
