@@ -42,11 +42,17 @@ reset_logs() {
 }
 
 # seed_wt <sid> <cwd> <worktree> — check-eligible open dispatch, optional worktree.
+#
+# #900 — the ${extra[@]+...} form is bash 3.2 compatibility, not style. Under `set -u`,
+# bash 3.2 treats "${extra[@]}" on an EMPTY array as an unbound variable and aborts;
+# 4.4+ expands it to nothing. macos-latest ships bash 3.2 as /bin/bash, so the first
+# time this guard ran anywhere but a box with a modern bash first on PATH, it died at
+# this line — case A calls seed_wt with no worktree.
 seed_wt() {
   local -a extra=()
   [ -n "${3:-}" ] && extra=(worktree="$3")
   t_seed_dispatch "$1" cwd="$2" transport.inject_id="uuid-$1" \
-    expected_report_by="2026-05-12T11:30:00Z" "${extra[@]}"
+    expected_report_by="2026-05-12T11:30:00Z" ${extra[@]+"${extra[@]}"}
 }
 
 # ── A) cwd on main, no worktree → sha OMITTED (never cite the orchestrator's HEAD) ──

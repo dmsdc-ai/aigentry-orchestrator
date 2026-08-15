@@ -15,6 +15,17 @@
 # The set_status path escapes the PATH-based stub (open-session prepends the real cmux),
 # so this also regression-locks the CMUX seam on _wh_cmux_set_status: the pill MUST hit
 # the injected stub, never the live daemon.
+#
+# #900 — AIGENTRY_WORKSPACE_HOST=cmux below is load-bearing, and its absence is why this
+# guard failed the first time it ever ran on a clean runner. open-session.sh env-forces
+# the adapter only for its wh_open subshell; the later wh_set_status call falls through
+# to _wh_adapter auto-detect, whose cmux arm is _wh_host_available -> `command -v cmux`.
+# That probe does not read the $CMUX seam, so on any host WITHOUT a real cmux binary the
+# adapter resolves to headless and _wh_headless_set_status is a correct no-op — no pill,
+# no stub line, part B fails. The guard was therefore asserting cmux behaviour only on
+# machines that happened to have cmux installed, and silently measuring nothing anywhere
+# else. Forcing the adapter states which one is under test instead of inheriting it from
+# the host. (The force does not disturb part A: wh_open sets its own value for its call.)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
@@ -56,6 +67,7 @@ OUT=$(
   CTX_ROUTER_PATH=/nonexistent \
   CMUX_WORKSPACE_ID=test-t56 \
   CMUX="$STUB" \
+  AIGENTRY_WORKSPACE_HOST=cmux \
   CMUX_STUB_REF="$REF" CMUX_STUB_CNT="$T_TMP/poll.cnt" CMUX_STUB_LOG="$STUBLOG" \
   CMUX_READY_TIMEOUT_MS=2000 CMUX_READY_INTERVAL_MS=10 \
   "$OPEN_SESSION" --track t56 --name pill --cwd "$T_TMP/cwd" --cli claude 2>"$errf"

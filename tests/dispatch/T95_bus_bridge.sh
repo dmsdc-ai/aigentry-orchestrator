@@ -28,7 +28,19 @@ HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
 
 # BEFORE t_setup puts a stub telepty on PATH — part E needs the real CLI.
-REAL_TELEPTY="$(command -v telepty 2>/dev/null || true)"
+#
+# #900 — part E used to gate on nothing but this lookup, which made whether it ran a
+# property of the machine's PATH rather than a declared choice: absent on a CI runner
+# (npm puts the dep's `telepty` bin in node_modules/.bin, which a `run:` step does not
+# have on PATH), present on any maintainer box. A skip nobody declared is the defect
+# class #900 exists to close, and part E boots a real daemon and binds a socket — that
+# is a live-integration test by the same definition T16 and T48 already use. So it takes
+# the same gate. Parts A–D stay hermetic and always run.
+if [ "${AIGENTRY_RUN_LIVE_TESTS:-0}" = "1" ]; then
+  REAL_TELEPTY="$(command -v telepty 2>/dev/null || true)"
+else
+  REAL_TELEPTY=""
+fi
 
 t_setup
 DAEMON_PID=""; BRIDGE_PIDS=""
@@ -143,10 +155,20 @@ CLEANUP_STUB="$STUB_BIN/cleanup-noop.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$CLEANUP_STUB"; chmod +x "$CLEANUP_STUB"
 printf '%s' '[]' > "$STUB_LIST_FILE"     # no sessions -> the sweep has nothing to do
 
+# #900 — CURL is the same reachability seam part A sets above, and its absence here is
+# why this guard failed the first time it ever ran on a clean runner. Part C seeds an
+# EMPTY telepty listing, and an empty listing is the one case lib/telepty-listing.sh
+# refuses to trust without corroboration: it probes 127.0.0.1:3848 and, getting no
+# answer, the reconciler logs "a refusal is not an absence" and aborts the sweep before
+# any consumer runs. On a maintainer box the PRODUCTION daemon answers that probe, so the
+# guard passed — by reaching out of its own sandbox to the live daemon it is documented as
+# never touching. Pointing CURL at the 200 stub makes part C measure the bridged-event
+# handoff it is about, on any host.
 run_reconciler() {
   RUN_LOG="$T_TMP/recon.log"
   AIGENTRY_BUS_BRIDGE=0 \
   RECONCILER_NOW="2026-08-15T12:00:00Z" \
+  CURL="$STUB_BIN/curl-200" \
   TELEPTY="$STUB_BIN/telepty" \
   SCHEDULER_SH="$SCHED_STUB" \
   CLEANUP_SH="$CLEANUP_STUB" \
@@ -198,7 +220,7 @@ BRIDGE_PIDS=""
 # E) live subscribe against a real daemon we own
 # ===========================================================================
 if [ -z "$REAL_TELEPTY" ]; then
-  echo "T95: SKIP part E — no telepty CLI on PATH (transport untested here)" >&2
+  echo "T95: SKIP part E — live-integration (set AIGENTRY_RUN_LIVE_TESTS=1, needs a real telepty CLI on PATH); transport untested here" >&2
 else
   D_HOME="$T_TMP/dhome"
   mkdir -p "$D_HOME/.telepty"
