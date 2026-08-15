@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Task Queue v2 — global status overview
 set -euo pipefail
-TQ="${TQ:-$HOME/projects/aigentry-orchestrator/state/task-queue.json}"
+TQ="${TQ:-$(cd "$(dirname "$0")/.." && pwd)/state/task-queue.json}"
 [ -f "$TQ" ] || { echo "ERR task queue not found: $TQ" >&2; exit 1; }
 
 jq -r '

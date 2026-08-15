@@ -10,12 +10,12 @@ regardless of role. Source citations are tracked in
 - **Article 1 경량 (Lightweight).** Each component does only its own role.
   No over-engineering. Question framework/library adoption with "can we
   build this without it?". No unnecessary abstraction layers. Source:
-  `~/projects/aigentry/docs/CONSTITUTION.md` §제1조.
+  `{{CONSTITUTION_PATH}}` §제1조.
 - **Article 17 무의존 (Zero External Dependency).** Aigentry runs without
   external plugins/libraries. Public users install aigentry alone and get
   all core features. No editor/IDE/terminal/CLI lock-in. When external
   dependencies are unavoidable, ship a fallback path. Source:
-  `~/projects/aigentry/docs/CONSTITUTION.md` §제17조.
+  `{{CONSTITUTION_PATH}}` §제17조.
 - **Rule 29 외과적 변경 (Surgical edits — HARD RULE).** Every changed line
   must be traceable to the request. No drive-by reformatting, unrelated
   refactor, or adjacent-style harmonization. Pre-existing dead code is

@@ -47,7 +47,7 @@ set -euo pipefail
 # `require_deps` is the gate — it fails loudly if telepty/jq are missing
 # from the inherited PATH.
 
-PROTECTED_SID="orchestrator"
+PROTECTED_SID="${ORCHESTRATOR_SID:-orchestrator}"
 
 # Test seams (#606, mirrors orchestrator-boot.sh:40-42): override the process
 # lister + killer + self pid so the self/ancestor guard is exercisable with NO

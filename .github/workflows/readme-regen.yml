@@ -1,6 +1,7 @@
 name: readme-regen
 
-# orchestrator is internal infra (not npm-published). This keeps README.md's ecosystem
+# orchestrator IS npm-published (@dmsdc-ai/aigentry-orchestrator, 0.1.0 on 2026-08-15;
+# release.yml owns the publish from a v* tag). This keeps README.md's ecosystem
 # section synced when its inputs change. The `paths` filter deliberately EXCLUDES
 # README.md, so the bot's own README push never retriggers this workflow (anti-loop,
 # independent of GITHUB_TOKEN's no-retrigger behavior).
