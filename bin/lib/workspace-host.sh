@@ -117,11 +117,15 @@ _wh_cmux_alive() {
   #
   # (b) Silence is not an answer. Relying on the empty-stdout fallback meant a cmux
   #     that crashed, hung, or was off PATH manufactured a "gone" verdict for every
-  #     session. "Gone" is a CORROBORATING signal for a teardown
-  #     (session-reconciler.sh INV-17), so an unanswered probe was supplying half
-  #     the evidence for closing a live worker. The warp adapter already gets this
-  #     right — _wh_warp_alive maps "cannot probe" and "Warp is down" to
-  #     INDETERMINATE→alive (#486). cmux now matches: only a real answer says gone.
+  #     session it was asked about. That verdict cannot authorize a teardown on its
+  #     own — policy.py refuses surface_gone as a single signal (INV-17) and still
+  #     requires a pid or aged-disconnect signal — but it is a fabricated entry in
+  #     a corroboration set, it lands in the sweep's reasons string and its
+  #     telemetry as though it had been observed, and it pulls a session that would
+  #     otherwise have been skipped outright into the policy path. The warp adapter
+  #     already gets this right — _wh_warp_alive maps "cannot probe" and "Warp is
+  #     down" to INDETERMINATE→alive (#486). cmux now matches: only a real answer
+  #     says gone.
   local host_id="$1" out rc=0
   [ -z "$host_id" ] && return 1
   if ! command -v cmux >/dev/null 2>&1; then
