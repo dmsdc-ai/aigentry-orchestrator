@@ -4,7 +4,8 @@
 #
 # #824 has two daemon call sites (the tracker's observation poll — src/tracker/cli.ts
 # since #899 tranche 1b ported it out of bin/dispatch-tracker.sh, which is now an exec
-# shim — and bin/session-cleanup.sh's registry DELETE). The failure mode this test exists to
+# shim — and the cleanup's registry DELETE, in src/cleanup/cli.ts since tranche 2a for
+# the same reason). The failure mode this test exists to
 # prevent is not a missing header — the per-site tests (T84, T86) cover that — it is
 # TWO copies of credential resolution drifting apart, which is how the two ends stop
 # agreeing about who is calling. The single-definition assertion is structural
@@ -107,10 +108,13 @@ defs=$(grep -rlE '^[[:space:]]*(function[[:space:]]+)?telepty_auth_token[[:space
        fail "telepty_auth_token must be defined once, in $LIB"; }
 
 # ── both call sites route through the shared resolver ───────────────────────
-# The tracker's poll lives in src/tracker/cli.ts (#899 tranche 1b): it invokes
-# telepty_auth_token as the shell function it is rather than re-reading the config,
-# which is what keeps assertion (5) above — one authToken reader — literally true.
-for caller in src/tracker/cli.ts bin/session-cleanup.sh; do
+# The tracker's poll lives in src/tracker/cli.ts (#899 tranche 1b) and the cleanup
+# DELETE in src/cleanup/cli.ts (#899 tranche 2a) — bin/dispatch-tracker.sh and
+# bin/session-cleanup.sh are exec shims now, so the file that resolves the
+# credential is the one asserted. Both invoke telepty_auth_token as the shell
+# function it is rather than re-reading the config, which is what keeps assertion
+# (5) above — one authToken reader under bin/ — literally true.
+for caller in src/tracker/cli.ts src/cleanup/cli.ts; do
   grep -q 'telepty_auth_token' "$REPO_ROOT/$caller" \
     || fail "$caller does not use the shared resolver"
   grep -q 'lib/telepty-auth.sh' "$REPO_ROOT/$caller" \
