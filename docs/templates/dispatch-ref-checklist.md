@@ -33,6 +33,7 @@ If `dispatch_kind: re-dispatch`:
 - [ ] **Dedicated `## HOLD inject protocol` section present** with exact format `HOLD: <tag> | phase: <N>/<total> awaiting | reason: ... | needs: ...`
 - [ ] **HOLD is specified as a real `telepty inject` shell call** (NOT inline markdown in receiver's reply)
 - [ ] **Every phase boundary in §Workflow ends with explicit "HOLD inject (format below)" instruction** (not just "Stop")
+- [ ] **Phase-boundary commit contract present**: §Workflow states "commit (WIP allowed) at every phase boundary; a sleep/API cut then loses at most one phase" (#909 — three worker turns cut by `API Error: Your computer went to sleep mid-response` on 2026-08-16; the uncommitted one lost 1h7m)
 - [ ] **"Silent waiting = §13 violation" reminder present** in HOLD protocol section
 
 ## D. SAWP & rule compliance
@@ -94,4 +95,5 @@ If you cannot answer YES to all 8 below, do NOT inject:
 | D — Snyk missing | First-party code committed without scan → CLAUDE.md global rule violation | (preventive) |
 | G — wrong target sid | `telepty inject` exits 1 with "session not found" → dispatch fails silently | (preventive) |
 | 9 — enumeration shipped as fact | Orchestrator handed workers "4 PTY write doors"; source had 6 recorded + 3 unrecorded. `mailbox` was not a door, `submit-all` was a fifth CR door. Two docs then claimed coverage that was never measured | #843/#844 |
+| C — no phase-boundary commit | Host slept mid-response; three worker turns cut. The two that committed per phase lost at most a phase; the third lost 1h7m of uncommitted work | #909 |
 | 9 — counted the wrong thing | "nothing runs them" approved deleting 26 files; the question was *citation* — 16 were cited by name from two files that ship to npm, including a test's fixture provenance | #846 |

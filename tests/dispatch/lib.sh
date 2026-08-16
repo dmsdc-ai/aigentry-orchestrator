@@ -25,6 +25,11 @@ t_setup() {
   # means no test leaves one of those behind, so the harness ticks with the bridge
   # off; T95 turns it back on explicitly for the one test that exercises it.
   export AIGENTRY_BUS_BRIDGE=0
+  # #909: open-session.sh holds a per-worker `caffeinate` assertion after a spawn.
+  # Hermetic means no test asserts against the real host's power state, so the
+  # harness spawns with the guard off; T100 turns it back on against a recorder
+  # binary, which is the only place a hold_awake call is ever observed.
+  export AIGENTRY_SLEEP_GUARD=0
   export DISPATCH_STATE_DIR="$T_TMP/state"
   mkdir -p "$DISPATCH_STATE_DIR"
   # telepty#60 Stage A: the registry is a versioned envelope, not a root array.

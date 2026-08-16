@@ -165,6 +165,17 @@ def decide(status: str, state: dict[str, Any]) -> dict[str, str]:
         return action("RESPAWN", "thinking-block / invalid request requires respawn", "respawn_requested")
     if surface in {"raw_shell", "crash"}:
         return action("REDISPATCH", f"{surface} means wrapped CLI exited or crashed", "re_dispatched")
+    if surface == "sleep_cut":
+        # #909: the host slept mid-response and cut the turn. Unlike every other
+        # API-error surface there is nothing for an operator to classify — the
+        # remedy is known and is one inject — so this row is an autonomous RESUME
+        # rather than the AWAIT_USER gate below. Rule 30 bounds it at the actuator:
+        # session-reconciler.sh latches one RESUME per occurrence and caps the rate
+        # per sid per hour, so a session that does not come back cannot be looped.
+        # The status is deliberately unchanged: a resumable cut is not a lifecycle
+        # transition, and stamping stuck_error here would drop the record out of the
+        # --live set the next tick needs to see it in.
+        return action("RESUME", "host slept mid-response; turn is resumable", status)
     if surface == "error":
         # ADR 2026-07-26-hitl-gate-primitive §1: the one row that is a human decision, not an
         # ambiguity default. Every other ESCALATE here stays log-only. Consumer arm lands in W2;

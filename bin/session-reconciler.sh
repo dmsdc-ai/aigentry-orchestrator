@@ -73,6 +73,9 @@ SHADOW_LOG="${RECONCILE_SHADOW_LOG:-$STATE_DIR/reconcile-shadow.jsonl}"
 ESCALATION_LOG="$STATE_DIR/verify-escalations.jsonl"
 ALERTS_LOG="$STATE_DIR/alerts.log"
 PROTECTED_SIDS=(orchestrator)
+# Hoisted from step 2a (#909): the RESUME actuator in the registry loop sends as the
+# orchestrator, and that loop runs long before step 2a used to define this.
+ORCH_SID="${ORCHESTRATOR_SID:-orchestrator}"
 AGE_FLOOR_SECONDS="${RECONCILER_AGE_FLOOR:-300}"
 DISCONNECT_FLOOR_SECONDS="${RECONCILER_DISCONNECT_FLOOR:-240}"
 BACKOFF_INITIAL="${RECONCILER_BACKOFF_INITIAL:-5}"
@@ -94,7 +97,17 @@ SURFACE_ORPHANED_SRC="${AIGENTRY_SURFACE_ORPHANED_SOURCE:-$STATE_DIR/surface-orp
 # Event contract (one JSONL object per line):
 #   {sid, backend, cmuxWorkspaceId, expectedPtyPid, observedSurface, mismatchSeconds}
 SURFACE_MISMATCHED_SRC="${AIGENTRY_SURFACE_MISMATCHED_SOURCE:-$STATE_DIR/surface-mismatched.jsonl}"
+# #909 auto-RESUME ledger: per-sid latch + hourly send log for sleep-cut turns.
+RESUME_MARKER="${AIGENTRY_SLEEP_RESUME_MARKER:-$STATE_DIR/sleep-resume.json}"
+RESUME_MAX_PER_HOUR="${RECONCILER_RESUME_MAX_PER_HOUR:-3}"
+# #909 item (d): telemetry withheld while the host slept (written by
+# dispatch-tracker.sh), and the latch that keeps the lid page to one per episode.
+SLEEP_QUEUE="${AIGENTRY_SLEEP_TELEMETRY_QUEUE:-$STATE_DIR/sleep-telemetry-queue.log}"
+LID_LATCH="$STATE_DIR/lid-closed.latch"
+SLEEP_DIGEST_MAX_LINES="${RECONCILER_SLEEP_DIGEST_MAX_LINES:-10}"
 
+# shellcheck source=lib/platform.sh
+. "$SCRIPT_DIR/lib/platform.sh"
 # shellcheck source=lib/workspace-host.sh
 . "$SCRIPT_DIR/lib/workspace-host.sh"
 # #835 — an empty `telepty list --json` is also what a REFUSED list request looks
@@ -319,6 +332,125 @@ maybe_redispatch() {
   esac
 }
 
+# --- #909 item (c): auto-RESUME a turn the host's sleep cut -------------------
+#
+# On 2026-08-16 three worker turns died to `API Error: Your computer went to sleep
+# mid-response`, and each recovery was a human noticing telemetry silence and
+# injecting RESUME by hand — 33m, 1h7m and 31m of work stalled behind that notice.
+# The remedy needs no operator judgement, so this loop does it. Rule 30 bounds the
+# autonomy at the actuator rather than trusting the classifier:
+#
+#   * LATCH — one RESUME per OCCURRENCE, not per tick. The latch is set before the
+#     inject and cleared only by a later tick observing this sid on some OTHER
+#     surface, i.e. by evidence the cut is over. A screen-hash was the obvious key
+#     and is the wrong one: the RESUME text itself lands on the screen, so the hash
+#     changes on the very next tick and the "dedupe" would wave every repeat through.
+#   * RATE CAP — at most N per sid per rolling hour (default 3) even across distinct
+#     occurrences. A session that never comes back cannot be looped by this tick.
+#
+# The inject is `--from $ORCH_SID` deliberately: this is the orchestrator's own
+# safety net actuating on a subject session, exactly as hitl.sh's resume=reinject
+# does. A reconciler-named sender would be a non-orch↔non-orch peer inject, which
+# session-comms-auditor.sh classifies out-of-policy and HOLDs to the orchestrator —
+# one operator page per recovery, which is the cost this exists to remove.
+
+# resume_ledger <sid> <op> — op=claim prints SEND/SKIP_*, op=clear releases a latch.
+resume_ledger() {
+  local sid="$1" op="$2"
+  SID="$sid" OP="$op" NOW="$(now_iso)" MARKER="$RESUME_MARKER" CAP="$RESUME_MAX_PER_HOUR" \
+    python3 - <<'PY'
+import datetime, json, os
+
+path, sid, op = os.environ["MARKER"], os.environ["SID"], os.environ["OP"]
+now_iso = os.environ["NOW"]
+try:
+    now = datetime.datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+except Exception:
+    now = datetime.datetime.now(datetime.timezone.utc)
+try:
+    cap = int(os.environ.get("CAP") or 0)
+except Exception:
+    cap = 0
+try:
+    data = json.load(open(path, encoding="utf-8"))
+    if not isinstance(data, dict):
+        data = {}
+except Exception:
+    data = {}
+rec = data.get(sid)
+rec = rec if isinstance(rec, dict) else {}
+
+def fresh(stamps):
+    out = []
+    for ts in stamps if isinstance(stamps, list) else []:
+        try:
+            age = (now - datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))).total_seconds()
+        except Exception:
+            continue
+        if 0 <= age < 3600:
+            out.append(ts)
+    return out
+
+def save():
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False, sort_keys=True)
+    os.replace(tmp, path)
+
+sent = fresh(rec.get("sent"))
+if op == "clear":
+    # Only the latch is released. The hourly send log survives, or "resumed once,
+    # cut again, resumed again…" would reset the cap on every bounce and the cap
+    # would bound nothing.
+    if rec.get("latched") or sent != rec.get("sent"):
+        data[sid] = {"latched": False, "sent": sent}
+        save()
+    print("CLEARED")
+elif rec.get("latched"):
+    print("SKIP_LATCHED")
+elif cap > 0 and len(sent) >= cap:
+    print("SKIP_RATE_CAP %d" % len(sent))
+else:
+    sent.append(now_iso)
+    data[sid] = {"latched": True, "sent": sent}
+    save()
+    print("SEND %d" % len(sent))
+PY
+}
+
+# resume_latch_clear <sid> — cheap no-op unless this sid has a ledger entry.
+resume_latch_clear() {
+  local sid="$1"
+  [ -f "$RESUME_MARKER" ] || return 0
+  grep -q "\"$sid\"" "$RESUME_MARKER" 2>/dev/null || return 0
+  resume_ledger "$sid" clear >/dev/null
+}
+
+resume_worker() {
+  local sid="$1" verdict msg
+  verdict=$(resume_ledger "$sid" claim)
+  case "$verdict" in
+    SEND*)
+      msg="RESUME: your last turn was cut mid-response by host sleep (\`API Error: Your computer went to sleep mid-response\`) — nothing is wrong with the task. Re-read your dispatch ref, check what you already committed, and continue from there. Commit at every phase boundary so the next cut costs at most one phase."
+      if ! command -v "$TELEPTY" >/dev/null 2>&1 || \
+         ! "$TELEPTY" inject --submit-force --from "$ORCH_SID" "$sid" "$msg" >/dev/null 2>&1; then
+        emit_alert "SLEEP_RESUME_FAILED sid=$sid — inject did not go through; the worker is still holding a cut turn"
+        return 0
+      fi
+      emit_alert "SLEEP_RESUME sid=$sid — host slept mid-response; one RESUME sent (${verdict#SEND } in the last hour, cap $RESUME_MAX_PER_HOUR)"
+      ;;
+    SKIP_LATCHED)
+      log "SLEEP_RESUME skip sid=$sid — RESUME already sent for this occurrence (latched until the surface changes)"
+      ;;
+    SKIP_RATE_CAP*)
+      emit_alert "SLEEP_RESUME_CAPPED sid=$sid — ${verdict#SKIP_RATE_CAP } RESUME(s) in the last hour reached the cap of $RESUME_MAX_PER_HOUR; not resending. The session is not coming back from a RESUME and needs a human."
+      ;;
+    *)
+      emit_alert "SLEEP_RESUME_LEDGER_FAILED sid=$sid verdict=${verdict:-<empty>} — no RESUME sent"
+      ;;
+  esac
+}
+
 apply_action() {
   local sid="$1" status="$2" ref_path="$3" rdc="$4" action_json="$5"
   local act key next_status
@@ -341,6 +473,9 @@ apply_action() {
       ;;
     REDISPATCH)
       maybe_redispatch "$sid" "$ref_path" "$rdc"
+      ;;
+    RESUME)
+      resume_worker "$sid"
       ;;
     AWAIT_USER)
       # ADR 2026-07-26-hitl-gate-primitive producer (b): policy.py returns this for
@@ -375,6 +510,70 @@ apply_action() {
   esac
 }
 
+# --- #909 item (d): sleep-aware telemetry gate + closed-lid page ---------------
+#
+# The gate itself lives in dispatch-tracker.sh, which is the only orchestrator-side
+# forwarder of idle-worker telemetry. This half is the two things only a
+# level-triggered tick can do: notice the host woke up and hand over what was
+# withheld, and notice that the lid is shut with workers still running.
+#
+# Measured 2026-08-16: ~70 orchestrator turns across one 7.5h sleep, each an
+# idle-worker note delivered inside a DarkWake window, and each waking a session
+# that could do nothing — the workers were stalled by the same sleep.
+
+# host_power_state — memoised for this tick, then exported so the tracker child
+# inherits it instead of paying for a second ~1.2s pmset.
+host_power_state() {
+  [ -n "${_HOST_POWER_STATE:-}" ] || _HOST_POWER_STATE=$(platform::host_power_state)
+  printf '%s' "$_HOST_POWER_STATE"
+}
+
+# deliver_sleep_digest — ONE inject for everything withheld while asleep, on the
+# first tick that sees the host awake. Delivery is the point: the tracker's
+# seen-ledger records a note as raised before it is sent, so a withheld note is
+# never re-raised and this digest is its only chance to reach a human.
+deliver_sleep_digest() {
+  [ -s "$SLEEP_QUEUE" ] || return 0
+  [ "$(host_power_state)" = "asleep" ] && return 0
+  local total first last body msg
+  total=$(wc -l < "$SLEEP_QUEUE" | tr -d ' ')
+  first=$(head -1 "$SLEEP_QUEUE" | cut -f1)
+  last=$(tail -1 "$SLEEP_QUEUE" | cut -f1)
+  # One line: an inject is one line, and a queued note may not smuggle a newline
+  # into the orchestrator's turn.
+  body=$(cut -f2- "$SLEEP_QUEUE" | head -"$SLEEP_DIGEST_MAX_LINES" | paste -sd'|' -)
+  [ "$total" -gt "$SLEEP_DIGEST_MAX_LINES" ] \
+    && body="$body | …and $((total - SLEEP_DIGEST_MAX_LINES)) more (full list: $SLEEP_QUEUE)"
+  msg="SLEEP_DIGEST: $total idle-worker telemetry note(s) were withheld while this host was asleep ($first → $last) and are delivered here as one turn instead of $total. $body"
+  if command -v "$TELEPTY" >/dev/null 2>&1 && \
+     "$TELEPTY" inject --submit-force --from "$ORCH_SID" "$ORCH_SID" "$msg" >/dev/null 2>&1; then
+    rm -f "$SLEEP_QUEUE"
+    log "SLEEP_DIGEST delivered notes=$total"
+  else
+    # The queue is NOT drained on a failed delivery — an undelivered digest is the
+    # only remaining record of notes the tracker has already marked as raised.
+    emit_alert "SLEEP_DIGEST_UNDELIVERED notes=$total — $SLEEP_QUEUE still holds them; the tracker will not re-raise these"
+  fi
+}
+
+# check_lid — page ONCE per closed-lid episode while workers are live. Not an
+# actuator: a closed lid is the one sleep cause no userspace assertion overrides
+# (item (a)'s `caffeinate -i` included), so an operator opening the lid or plugging
+# in an external display is the only fix, and the alert says exactly that.
+check_lid() {
+  local live="${1:-0}" rc=0
+  platform::lid_closed || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # Open or unknown: the episode is over (or was never established).
+    [ -f "$LID_LATCH" ] && { rm -f "$LID_LATCH"; log "LID_OPEN — closed-lid page re-armed"; }
+    return 0
+  fi
+  [ "$live" -gt 0 ] || return 0
+  [ -f "$LID_LATCH" ] && return 0
+  : > "$LID_LATCH"
+  emit_alert "LID_CLOSED — the lid is shut with $live live worker(s); they will stall on the next sleep and NO sleep assertion can prevent it (clamshell sleep beats caffeinate -i without an external display). Remedy: open the lid, or attach an external display + keyboard."
+}
+
 run_registry_loop() {
   local act="$1" snap processed sid status ref_path rdc state_json action_json
   snap=$(mktemp)
@@ -390,11 +589,19 @@ run_registry_loop() {
     action_json=$(policy_decide "$status" "$state_json")
     append_shadow_record "$sid" "$status" "$state_json" "$action_json"
     if [ "$act" = "1" ] && [ "$DRY_RUN" -eq 0 ]; then
+      # #909: the RESUME latch is level-triggered — a tick that sees this sid on
+      # any other surface is the evidence its sleep-cut occurrence ended, and the
+      # next cut is then a new occurrence rather than a deduplicated repeat.
+      [ "$(json_get "$action_json" action)" = "RESUME" ] || resume_latch_clear "$sid"
       apply_action "$sid" "$status" "$ref_path" "$rdc" "$action_json"
     fi
     processed=$((processed + 1))
   done < "$snap"
   rm -f "$snap"
+  # #909: how many dispatches this tick is holding open — the "workers are live"
+  # input to the closed-lid page, taken from the pass that already counted them
+  # rather than from a second registry call.
+  LIVE_DISPATCHES=$processed
   log "registry tick: processed=$processed act=$act dry_run=$DRY_RUN"
 }
 
@@ -447,10 +654,11 @@ pid_alive() {
 }
 
 # parent_pid_for_sid <sid> — print the parent telepty-allow PID or "".
+# The ps/awk body moved to platform::session_pid (#909) so open-session.sh's sleep
+# assertion resolves the same pid this sweep judges liveness by, rather than the two
+# scripts keeping copies that can drift apart. Single-shot, as before.
 parent_pid_for_sid() {
-  local sid="$1"
-  ps -eo pid,command 2>/dev/null \
-    | awk -v s="$sid" '$0 ~ ("telepty allow --id " s " ") {print $1; exit}' || true
+  platform::session_pid "$1"
 }
 
 # seconds_since_iso <iso> — int seconds (current - iso).
@@ -690,6 +898,18 @@ done <<< "$hitl_gates"
 # --- step 0: Dispatch Registry observe→decide→act loop ---
 run_registry_loop 1
 
+# --- step 0a2: host power (#909 item d) ---
+# Before the tracker runs, because the tracker is the forwarder being gated: it
+# inherits this tick's reading through the environment rather than paying for a
+# second ~1.2s pmset, and the digest of what the LAST sleep withheld goes out ahead
+# of anything this tick raises. Act-only — an operator's --dry-run injects nothing.
+# Best-effort: neither the digest nor the lid page may abort a tick.
+if [ "$DRY_RUN" -eq 0 ]; then
+  export AIGENTRY_HOST_POWER_STATE="$(host_power_state)"
+  deliver_sleep_digest || log "ERR sleep digest non-zero (continuing)"
+  check_lid "${LIVE_DISPATCHES:-0}" || log "ERR lid check non-zero (continuing)"
+fi
+
 # --- step 0b: tracker scan (#517) — the tracker polls every dispatch whose
 # expected_report_by elapsed and records what it measured. telepty#60 Stage A: it
 # emits HOLDs and evidence snapshots, never a completion.
@@ -770,7 +990,6 @@ keep_alive=$(keep_alive_sids | sort -u | tr '\n' ',' | sed 's/,$//')
 # emit_alert, which also tees to this tick's stderr and thus into reconciler.log under
 # launchd. That is where a human looks after noticing their injects bouncing, and it is
 # the same channel every other operator-actionable finding here already uses.
-ORCH_SID="${ORCHESTRATOR_SID:-orchestrator}"
 ORCH_STALE_ALERT_MIN="${ORCH_STALE_ALERT_MIN:-5}"
 orch_rec=$(printf '%s' "$listing" | jq -c --arg s "$ORCH_SID" '.[] | select(.id == $s)' 2>/dev/null | head -1)
 if [ -n "$orch_rec" ]; then

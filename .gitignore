@@ -19,7 +19,7 @@ AGENTS.md.pre-slim.*.bak
 *.key
 
 # node
-node_modules/
+node_modules
 dist/
 *.log
 
