@@ -747,6 +747,48 @@ listing=$(telepty_list_json) || { log "abort sweep — bad telepty list"; exit 0
 gc_root=$(compute_gc_root | sort -u | tr '\n' ',' | sed 's/,$//')
 keep_alive=$(keep_alive_sids | sort -u | tr '\n' ',' | sed 's/,$//')
 
+# --- step 2a: is the ORCHESTRATOR ITSELF down? (#905) ---
+#
+# On 2026-08-16 the orchestrator's session sat OWNER_DISCONNECTED_STALE for 3h20m while
+# this tick ran every 60 seconds beside it and said nothing. The reason is one line
+# below in the sweep: the orchestrator sid is in PROTECTED_SIDS, so it is in gc_root, and
+# the candidate loop skips gc_root before it examines anything. Being exempt from being
+# SWEPT had quietly also meant being exempt from being LOOKED AT. This is the difference
+# between those two, and it is deliberately the ONLY thing that changes about gc_root —
+# the sid stays unsweepable.
+#
+# Placed here rather than beside the other 0d-style belts because it needs the very
+# listing that step 2 has just fetched and had corroborated (#835). A second query would
+# be a second HTTP call and a second failure mode for an answer already in hand; and if
+# the listing were untrustworthy the tick has already aborted above, which is correct —
+# an unreachable daemon is not evidence that the orchestrator is down.
+#
+# WARN-ONLY, permanently: orchestrator lifecycle is user-actuated (#606). No kill, no
+# DELETE, no inject. The alert cannot be an inject precisely BECAUSE of what it reports —
+# the orchestrator is the thing that is down, and a STALE session is exactly the one that
+# bounces `[STALE] Session is stale and awaiting cleanup`. So it goes to alerts.log via
+# emit_alert, which also tees to this tick's stderr and thus into reconciler.log under
+# launchd. That is where a human looks after noticing their injects bouncing, and it is
+# the same channel every other operator-actionable finding here already uses.
+ORCH_SID="${ORCHESTRATOR_SID:-orchestrator}"
+ORCH_STALE_ALERT_MIN="${ORCH_STALE_ALERT_MIN:-5}"
+orch_rec=$(printf '%s' "$listing" | jq -c --arg s "$ORCH_SID" '.[] | select(.id == $s)' 2>/dev/null | head -1)
+if [ -n "$orch_rec" ]; then
+  orch_health=$(printf '%s' "$orch_rec" | jq -r '.healthStatus // .status // ""' 2>/dev/null)
+  case "$orch_health" in
+    STALE|DISCONNECTED)
+      orch_last=$(printf '%s' "$orch_rec" | jq -r '.lastSeenAt // .last_seen // .disconnectedAt // ""' 2>/dev/null)
+      orch_age=$(seconds_since_iso "$orch_last")
+      # No timestamp → seconds_since_iso yields 0 → below any positive threshold → no
+      # alert. Silence on a missing field is the right way round: this fires an operator
+      # page, and crying wolf on an unparseable record would teach them to ignore it.
+      if [ "$orch_age" -ge $((ORCH_STALE_ALERT_MIN * 60)) ]; then
+        emit_alert "ORCHESTRATOR_STALE sid=$ORCH_SID health=$orch_health for ${orch_age}s (>= ${ORCH_STALE_ALERT_MIN}m) — worker reports are bouncing '[STALE] Session is stale and awaiting cleanup' and nothing is reading them. Remedy: run bin/orchestrator-boot.sh (it reconciles the stale registry record, then re-claims the id). WARN-ONLY: this tick will not touch the orchestrator."
+      fi
+      ;;
+  esac
+fi
+
 # event-driven surface_orphaned consumer (dormant until a bus→file bridge exists)
 consume_surface_orphaned
 # event-driven surface_mismatched consumer — re-focus stray surfaces (#507, dormant)
