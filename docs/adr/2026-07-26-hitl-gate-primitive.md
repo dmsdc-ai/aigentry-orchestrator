@@ -4,6 +4,7 @@ date: 2026-07-26
 track: a740h
 task: #740
 supersedes_partial: none — extends ADR 2026-06-06-session-reconcile-loop (`ESCALATE` = "the single human surface") with the missing blocking/notify/resume half
+amended: 2026-08-16 (#925) — implementation language freed; see "Amendment (2026-08-16, #925)"
 ---
 
 # HITL Gate — one common human-in-the-loop primitive for the reconciler loop and worker loops
@@ -213,7 +214,15 @@ must exist before the first automated destructive producer does, not after.
   `inject-handler.sh:157`. **Not** `src/`'s TS `atomicWrite()` (#114): the gate path must work on
   a fresh checkout with no `tsc` build (Art.17 fallback), and shell is this repo's actuation layer.
 
+> Superseded by Amendment 2026-08-16 (#925). Atomicity is still the invariant; `mktemp`+`mv`
+> is no longer the mandated mechanism, and `src/`'s `atomicWrite()` is no longer excluded.
+> Note the two distinct primitives the Amendment separates — file *write* vs decide *claim*.
+
 ### CLI surface — `bin/hitl.sh` (bash + python3 stdlib, no new deps)
+
+> Superseded by Amendment 2026-08-16 (#925). The CLI contract below — verbs, flags, exit
+> codes, the `bin/hitl.sh` path itself — is language-independent and unchanged; the
+> "bash + python3 stdlib" implementation note no longer binds.
 
 | command | behaviour |
 |---|---|
@@ -310,6 +319,11 @@ Remaining checklist items are unaffected and Pass: 제2조 (bash + python3 stdli
 cross-OS profile as every other `bin/` script), 제10조/제11조 (one command, no new workflow
 imposed), 제15조 (M5 registers `HITL Gate` + `AWAIT_USER` in `CONTEXT.md`).
 
+> Superseded by Amendment 2026-08-16 (#925) — the 제2조 row only. "Same cross-OS profile as
+> every other `bin/` script" was a *relative* pass that has since gone stale: #899 moved the
+> peer scripts to `dist/`, so bash + python3 is now the outlier, not the profile. Re-reviewed
+> in the Amendment's 위헌 재심사. 제10조/제11조/제15조 are untouched.
+
 **Verdict: PASS.** No constitutional conflict; no orchestrator waiver required.
 
 ## Rule 4-A — execution mode for the implementation phase
@@ -361,5 +375,158 @@ enforces `--task`).
 - **A TS gate module reusing `src/`'s `atomicWrite()` (#114)** — puts a `tsc` build on the gate
   path (Art.17 fallback broken) and adds a fourth `dist/` seam to a `src/` that is already ~50%
   production-dormant. Shell `mktemp`+`mv` is the established actuation-layer pattern.
+
+  > Superseded by Amendment 2026-08-16 (#925). Both premises were re-measured and both have
+  > expired: the gate path already requires `dist/` through its own producers, and `src/` is
+  > the actuation layer now rather than a dormant one. This alternative is accepted.
 - **Expiry / auto-approve after N hours, and push/desktop notification** — excluded by
   user-confirmed policy (2026-07-26).
+
+---
+
+## Amendment (2026-08-16, #925) — the CLI contract is language-independent
+
+**Decision (user, 2026-08-16):** *"amend the ADR then port — that is the permanent fix."*
+`bin/hitl.sh` MAY be reimplemented in TypeScript under `src/`, with `bin/hitl.sh` retained as
+an exec shim over `bin/lib/node-shim.sh`, exactly as `bin/dispatch.sh` (#899 T1) and
+`bin/dispatch-tracker.sh` (#899 T1b) already are. Unblocks **#899 T2d**.
+
+**Nothing about gate behaviour changes.** The file format, the gate-id derivation, the
+directory index, the CLI argv and the env surface are the contract. The implementation
+language was never the contract — the 2026-07-26 text made it one by accident, as a
+side-effect of two premises that have since expired.
+
+### Why the original reasoning no longer holds (re-measured at `c83ebc4`, 2026-08-16)
+
+**1. The build-free gate path is already gone — its own producers require `dist/`.**
+`bin/hitl.sh` has exactly two callers, and nothing else in or outside the repo invokes it:
+
+| caller | state at `c83ebc4` |
+|---|---|
+| `bin/session-reconciler.sh:68,274,884` (`HITL_SH`, `hitl_open`, `remind`) | bash today, **being ported to TS in #899 T2c** |
+| `src/tracker/cli.ts:61,456` (`HITL_SH`, `runQuiet`) | **already TS**; `bin/dispatch-tracker.sh` is an exec shim |
+
+Once T2c lands, *both* producers need `dist/` before they can call the gate at all. A gate that
+runs without a build protects nothing, because nothing can reach it without one. The premise
+"the gate path must work on a fresh checkout with no `tsc` build" describes a path that no
+longer exists.
+
+CI already encodes this ordering: `.github/workflows/ci.yml:66-70` and
+`.github/workflows/release.yml:110-114` run `npm test` (which is `tsc -p . && …`) **before**
+`bash tests/dispatch/run-all.sh`, with the comment *"several guards gate on dist/ being built,
+and `npm test` is what builds it"* (#900). The shell guard suite has not been build-free since
+that landed.
+
+**2. Article 17 is satisfied by the package, not by the language.** `package.json` `files[]`
+ships `dist/src`, and `prepack` runs `npm run build` — so a public user who installs
+`@dmsdc-ai/aigentry-orchestrator` alone receives compiled JS and needs no toolchain (제17조 ①).
+`bin/lib/node-shim.sh` resolves `dist/` in both real layouts — package/repo sibling, or the
+control workspace via the package's own CLI on `PATH` — and **fails loud with exit 2** when
+neither resolves, rather than degrading silently (제17조 ④: the fallback is a stated failure,
+not a hidden one; pinned by T99/T100 and `tests/packaging/smoke-init.sh`). That shim *is* this
+repo's Article 17 story now; the ADR predates it.
+
+Node is not a new dependency either: `bin/init/cli.mjs` is the package's only `bin` entry and
+`engines.node >= 20`, so node is a hard prerequisite of installing the orchestrator at all.
+python3 is the *additional* one — and it is not guaranteed on either macOS (Command Line Tools)
+or Windows.
+
+**3. `src/` is no longer "~50% production-dormant".** #899 moved the actuation layer into it —
+T1 dispatch (`dc766db`), T1b tracker (`d7a2777`), pre-T2 `wh-cli` (`c83ebc4`), T2a cleanup in
+flight. The rejected alternative's second premise fails on the same measurement as its first.
+
+**4. `atomicWrite()` is now the *stronger* primitive, not the weaker one.** `#901` gave
+`src/session/persistence/atomic-write.ts` win32 arms: write → `fsync` → rename with a bounded
+retry over the transient `EPERM`/`EACCES`/`EBUSY` window, plus a documented (not faked)
+limitation on the parent-directory fsync. `mktemp`+`mv` in bash has none of that and does not
+execute natively on Windows at all.
+
+### Invariants — the actual contract, unchanged by the port
+
+The port is a **behaviour-preserving** rewrite. Guards `T61`, `T62`, `T63`, `T64`, `T65` and
+`T74` pin these and must stay green **without being edited**; a guard that needs editing to
+pass is evidence the port broke the contract, not evidence the guard was wrong.
+
+1. **Layout & lifecycle.** `state/hitl/pending/<id>.json` → `state/hitl/decided/<id>.json`.
+   The directory *is* the index; `ls pending/` answers "is anything pending?" without parsing.
+2. **Record schema** exactly as §File formats — same keys, same names, same types, including
+   `notified_at: null` as the "notify failed, retry next tick" signal.
+3. **Deterministic id.** `id = <kind>-<source>-<dedupe_key>`,
+   `dedupe_key = sha256("<source>|<kind>|<question>")[0:12]`, lowercase hex. Node's
+   `crypto.createHash("sha256")` must reproduce ids **byte-identically**, or in-flight gates
+   written by the bash version stop resolving and idempotency silently breaks.
+4. **Enums.** `kind ∈ destructive | decision | info`; `resume ∈ reinject |
+   registry-clear-redispatch | none`.
+5. **Two distinct atomicity primitives — do not collapse them into one call.**
+   - *Gate-file write* (`hitl.sh:67-77`, `168-196`): `mktemp`+`mv` ≡ `atomicWrite()`. Gate ids
+     contain no path separator, so they are legal `sessionId` values for it.
+   - *Decide claim* (`hitl.sh:286-287`): `mv pending/<id>.json → decided/.<id>.claim.XXXXXX`
+     is a **mutex, not a write** — the first mover wins the record and the loser must get
+     `ENOENT` and exit non-zero `"already decided"` (T64). `atomicWrite()` cannot express
+     this; use a bare `rename` plus an `ENOENT` branch. On win32 the transient
+     `EPERM`/`EACCES`/`EBUSY` set may be retried; **`ENOENT` must never be** — it is the
+     loser's answer, not a fault.
+6. **Level-triggered blocking.** A pending `destructive` gate ⇒ `DRY_RUN=1` for the tick;
+   an unparseable gate file is treated as `destructive` (fail-safe). Recomputed each tick, so
+   a restart mid-gate still needs no recovery logic.
+7. **Reminder cadence.** `notified_at == null` ⇒ retry immediately on the next tick;
+   otherwise re-notify when `last_reminded_at` is ≥ `HITL_REMIND_INTERVAL` (default 24h).
+8. **Env surface, preserved verbatim** — `HITL_STATE_DIR`, `DISPATCH_STATE_DIR`,
+   `DISPATCH_REGISTRY_PY`, `TELEPTY`, `ORCHESTRATOR_SID`, `RECONCILER_NOW`,
+   `HITL_REMIND_INTERVAL`. The guards drive the implementation entirely through these:
+   `HITL_STATE_DIR` at 25 sites and `RECONCILER_NOW` at 19 across T61–T65/T74.
+9. **`bin/hitl.sh` must remain an executable file at that path.** Both callers gate on it —
+   `session-reconciler.sh:270` (`[ -x "$HITL_SH" ]` ⇒ `HITL_GATE_UNAVAILABLE`) and
+   `src/tracker/cli.ts:452` (`executable(HITL_SH)`) — and it is a literal entry in
+   `bin/init/manifest.mjs`, which `tests/packaging/T96_ship_set_agreement.sh` holds against
+   both the real tarball and `git ls-files`. Replacing the file with a `src/`-only module
+   would take the gate offline in every control workspace and fail T96. The shim is not
+   ceremony; it is the contract.
+10. **No sourceable-library mode is owed.** Measured: none of the six guards sources
+    `bin/hitl.sh` or reaches into its functions — all drive it as a subprocess CLI. The port
+    therefore needs **no** `__probe` subcommands, unlike `bin/dispatch.sh`, whose 12 guards
+    depended on `DISPATCH_SH_NO_MAIN` (#899 T1). This is the cheapest port of the tranche.
+
+Out of scope: `T66_policy_await_user.sh` pins `bin/policy.py`'s `AWAIT_USER` row, not the gate
+CLI. `bin/policy.py` is untouched by T2d.
+
+### What the port does NOT fix (Rule 38 — stated, not glossed)
+
+The registry status write still shells to `bin/dispatch-registry.py` (`hitl.sh:101`
+`registry()`), so **python3 remains on the gate path after T2d**. That is not a regression and
+not an oversight: the already-ported CLIs do exactly the same — `src/tracker/cli.ts:160` and
+`src/dispatch/cli.ts:243` keep `dispatch-registry.py` as a subprocess with identical argv, by
+design (`src/tracker/cli.ts:10`).
+
+So the accurate claim is narrow: T2d removes python3 from **hitl's own logic** — the eight
+heredocs at `hitl.sh:48,53,68,85,150,171,221,347` (timestamps, sha256, JSON read/modify/write,
+options parsing, listing, remind arithmetic) — and leaves the one shared python3 seam that
+every ported peer already carries. "The port closes the Windows hole in the safety gate" would
+be an overstatement and should not be written into T2d's PR.
+
+Windows support is *declared absent* today: `package.json` `os: ["darwin","linux"]`, and
+`npm ci` refuses on win32 with `EBADPLATFORM` (U23, asserted in `ci.yml`). The Windows CI leg
+is a debt-tracking job whose own comment reads *"the honest reading of a green W1 is 'the code
+runs on win32 when you force it past the refusal', never 'Windows is supported'"*. What the
+port actually buys is narrower and still worth having: it moves the gate's logic out of a tier
+that **can never be exercised** on win32 (bash guards cannot run there at all) into the tier
+that the W1 job does exercise, with a tracked failure count. Unmeasurable surface → measured
+debt.
+
+### Sequence
+
+**T2c** (`bin/session-reconciler.sh` → TS) → **this amendment** → **T2d** (`bin/hitl.sh` → exec
+shim + `src/hitl/`). The amendment lands first so T2d's PR cites a recorded decision instead of
+re-litigating one inside a code review, and so the two superseded passages above never contradict
+merged code.
+
+### 위헌 재심사 (delta only — the rows this amendment moves)
+
+| # | Question | Verdict |
+|---|---|---|
+| 제1조 경량 | Is a language port over-engineering? | **Pass.** No new dependency, no new module boundary, no new state. It removes one runtime (python3) from hitl's own logic and reuses two primitives that already exist and already have tests: `node-shim.sh` and `atomicWrite()`. Deletion test unchanged — remove the gate and blocking/notify/resume scatter back into conversational convention. |
+| 제2조 크로스 | Cross-OS. | **Pass, upgraded.** The 2026-07-26 pass was relative ("same profile as every other `bin/` script") and went stale when #899 moved the peers to `dist/`. bash + python3 is now the outlier. The port does not deliver Windows support — see the section above — but it stops the safety gate from being the one component that cannot even be measured there. |
+| 제17조 무의존 | Zero external dependency. | **Pass.** Article 17 is served by the published package (`files[]` ships `dist/src`; `prepack` builds it), not by avoiding a compiler. `node-shim.sh` supplies the required fallback path as a loud exit 2, and node is already the orchestrator's install-time prerequisite. |
+| 제14조 안전 가드 | Safety gate. | **Unchanged.** Fail-safe on corrupt files, compare-and-set status restore, `awaiting_user` in `gc_root`, idempotent ids, first-mover-wins claim — all five are invariants 1-7 above and are pinned by T61-T65/T74, which the port may not edit. |
+
+**Verdict: PASS.** No constitutional conflict; no orchestrator waiver required.
