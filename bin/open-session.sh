@@ -271,4 +271,18 @@ log_file="$HOME/.aigentry/open-session.log"
 mkdir -p "$(dirname "$log_file")"
 echo "$(date -u +%FT%TZ) term=$(detect_terminal) ref=$ref sid=$sid title=$title cwd=$cwd cli=$cli flags=$extra_flags" >> "$log_file"
 
+# Per-worker sleep assertion (#909). On 2026-08-16 three worker turns on this host
+# were cut mid-response by `API Error: Your computer went to sleep mid-response`
+# (33m, 1h7m and 31m of work; the 1h7m was uncommitted). The assertion is bound to
+# THIS worker's `telepty allow` pid, so it is released the moment the worker exits —
+# never a global or indefinite caffeinate. Best-effort and never gating: an
+# unresolved pid or an absent primitive announces itself on stderr and the spawn
+# proceeds unchanged. AIGENTRY_SLEEP_GUARD=0 is the kill switch (the dispatch guard
+# suite sets it, so no test can assert on the real host's power state).
+if [ "${AIGENTRY_SLEEP_GUARD:-1}" != "0" ]; then
+  platform::hold_awake \
+    "$(platform::session_pid "$sid" "${AIGENTRY_SLEEP_GUARD_PID_TIMEOUT_MS:-3000}")" \
+    "aigentry worker $sid" || true
+fi
+
 echo "$ref"
