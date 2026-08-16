@@ -1131,7 +1131,10 @@ function hitlPauseGates(): string[] {
     return [];
   }
   const out: string[] = [];
-  for (const p of names.filter((n) => n.endsWith(".json")).map((n) => path.join(HITL_PENDING_DIR, n)).sort()) {
+  // `glob.glob("*.json")` never matches a leading dot, and readdir does — a dotfile
+  // must not be read as a gate (an unparseable one PAUSES the tick, fail-safe).
+  const globbed = names.filter((n) => n.endsWith(".json") && !n.startsWith("."));
+  for (const p of globbed.map((n) => path.join(HITL_PENDING_DIR, n)).sort()) {
     let gate: unknown;
     try {
       gate = JSON.parse(fs.readFileSync(p, "utf8"));
