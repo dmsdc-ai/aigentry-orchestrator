@@ -12,6 +12,29 @@ async function mkTmpDir(label: string): Promise<string> {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+// #905 — wait until the holder ACTUALLY holds the lock.
+//
+// Every staggered test below used `await sleep(20)` for this, and a fixed sleep is not a
+// synchronisation primitive. acquire() writes a staging file, fsyncs it, and only then
+// links it into place; on a loaded runner that can take longer than any constant chosen
+// here, and when it does the second acquirer gets the lock FIRST and the test asserts the
+// opposite of what happened. Observed on windows-latest under full-suite load: "timeout:
+// acquire fails when lock never released" failed in the full run while passing in the
+// persistence-only run of the very same job — the ratchet in ci.yml caught it as a
+// 33→34 move. Polling the real post-condition removes the race instead of widening it.
+async function awaitHeld(target: string): Promise<void> {
+  const lockPath = `${target}.lock`;
+  for (let i = 0; i < 600; i++) {
+    try {
+      await fs.access(lockPath);
+      return;
+    } catch {
+      await sleep(5);
+    }
+  }
+  throw new Error(`lock ${lockPath} was never taken — the holder failed to acquire`);
+}
+
 // #901 — see the same helper in atomic-write.test.ts for why this exists and what it does
 // NOT prove. Short version: it makes the win32 arm reachable from every CI leg; the W1
 // leg in ci.yml proves the platform itself behaves as the arm assumes (hard links on
@@ -58,7 +81,7 @@ test("win32 arm: serialization — second acquire waits for the first", async ()
       await sleep(150);
       order.push("first-exit");
     });
-    await sleep(20);
+    await awaitHeld(target);
     const second = withIndexLock(target, async () => {
       order.push("second-enter");
     });
@@ -88,7 +111,7 @@ test("win32 arm: timeout still fires when the lock is never released", async () 
       release = r;
     });
     const holder = withIndexLock(target, () => gate);
-    await sleep(20);
+    await awaitHeld(target);
     await assert.rejects(
       withIndexLock(target, async () => {}, { timeoutMs: 100 }),
       /timeout/,
@@ -135,7 +158,7 @@ test("serialization: second acquire waits until first releases", async () => {
   });
 
   // Stagger so second is guaranteed to attempt acquisition after first holds it.
-  await sleep(20);
+  await awaitHeld(target);
 
   const second = withIndexLock(target, async () => {
     order.push("second-enter");
@@ -162,7 +185,7 @@ test("timeout: acquire fails when lock never released", async () => {
   const holder = withIndexLock(target, async () => {
     await holdGate;
   });
-  await sleep(20);
+  await awaitHeld(target);
   await assert.rejects(
     withIndexLock(target, async () => {}, { timeoutMs: 100 }),
     /timeout/,
