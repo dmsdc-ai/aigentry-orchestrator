@@ -94,7 +94,11 @@ printf '200'
 EOF
 chmod +x "$STUB_BIN/curl-200"
 
-# ioreg seam: AppleClamshellState is whatever $T_TMP/lid holds.
+# ioreg seam: AppleClamshellState is whatever $T_TMP/lid holds. The tick runs with
+# PLATFORM_OVERRIDE=macos so this ONE stub answers the clamshell probe on both CI
+# legs — otherwise the Linux leg would take platform::lid_closed's /proc/acpi arm,
+# find nothing in a container, and report `unknown` for every lid assertion below,
+# i.e. pass by measuring nothing.
 cat > "$STUB_BIN/ioreg-stub" <<EOF
 #!/usr/bin/env bash
 state=\$(cat "$T_TMP/lid" 2>/dev/null || echo No)
@@ -112,6 +116,7 @@ run_tick() {   # <power-state> [extra env…]
   RECONCILER_NOW="$NOW" \
   AIGENTRY_HOST_POWER_STATE="$power" \
   AIGENTRY_IOREG="$STUB_BIN/ioreg-stub" \
+  PLATFORM_OVERRIDE=macos \
   CURL="$STUB_BIN/curl-200" \
   TELEPTY="${TICK_TELEPTY:-$STUB_BIN/telepty}" \
   SCHEDULER_SH="$STUB_BIN/sched-noop.sh" \
