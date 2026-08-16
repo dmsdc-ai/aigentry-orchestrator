@@ -97,6 +97,14 @@ telepty inject --submit --submit-force --from <session-id> {{ORCHESTRATOR_REPORT
 
 **Critical**: A HOLD printed inline in your reply is NOT a HOLD — it is a silent wait that pattern-matches §13 violation. The orchestrator only sees your `telepty inject` calls, not your inline markdown.
 
+**Durable-file-first (2026-08-16, incident dg903 + #904)**: the FILE is the report of record; the
+inject is only its notification. Every HOLD and every REPORT MUST exist as a `--ref` file (the
+shared copy is stored even when delivery bounces `[STALE]`). If the inject command itself errors,
+write the same content to `<your-worktree>/REPORT-<track>.md` AND retry the inject once on your
+next phase boundary. A bounced inject with no file = the orchestrator can never find you = the
+dg903 failure mode: diagnosis complete, orchestrator blind for hours. Delivery failure is never a
+reason to stop reporting — it is the reason the file exists.
+
 **When to HOLD**:
 - Every phase boundary (even if you think the next step is obvious) — **commit first, then HOLD** (see §Workflow)
 - Every self-correction mid-phase (about to deviate from spec)
