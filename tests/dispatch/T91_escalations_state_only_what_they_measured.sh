@@ -126,13 +126,9 @@ printf 'a line that will not appear on any screen\n' > "$ref"
 : > "$STUB_SCREEN_FILE"                       # read-screen answers with nothing
 (
   set -euo pipefail
-  export DISPATCH_SH_NO_MAIN=1
-  # shellcheck source=/dev/null
-  source "$REPO_ROOT/bin/dispatch.sh"
-  ref_file="$ref"
-  sleep() { :; }
+  export AIGENTRY_DISPATCH_VERIFY_SLEEP_MS=0
   rc=0
-  verify_delivered sid-A >/dev/null 2>&1 || rc=$?
+  "$REPO_ROOT/bin/dispatch.sh" __probe verify-delivered --ref "$ref" sid-A >/dev/null 2>&1 || rc=$?
   [ "$rc" -ne 0 ] || { echo "FAIL[T91]: an unreadable screen was reported as a verified delivery" >&2; exit 1; }
   [ "$rc" -eq 2 ] || { echo "FAIL[T91]: an unreadable screen returned $rc — it must be distinguishable from a screen that was read and showed the inject did not land" >&2; exit 1; }
 ) || exit 1
