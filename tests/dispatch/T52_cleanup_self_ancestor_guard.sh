@@ -41,16 +41,17 @@ cat "$PS_SNAP"
 EOF
 chmod +x "$PS_STUB"
 
-# Source the script (NOT execute) to call functions directly. Requires the
-# sourceable guard at the bottom of session-cleanup.sh.
-# shellcheck source=/dev/null
-CLEANUP_PS_CMD="$PS_STUB" KILL_CMD="$KILL_STUB" source "$CLEANUP"
+# #899 tranche 2a: session-cleanup.sh is an exec shim onto src/cleanup/cli.ts, so
+# there are no bash functions to source. The same two behaviours are reachable as
+# `__probe` subcommands — same seams (CLEANUP_PS_CMD / KILL_CMD /
+# CLEANUP_SELF_PID), same fixtures, same assertions — and this now measures the
+# code production runs rather than a second bash copy of it.
+probe() { CLEANUP_PS_CMD="$PS_STUB" KILL_CMD="$KILL_STUB" "$CLEANUP" __probe "$@"; }
 
 run_kill() {
-  # run_kill <self_pid> <sid> — exercise kill_parent_telepty_allow with seams.
+  # run_kill <self_pid> <sid> — exercise the parent-kill path with seams.
   : > "$KILL_LOG"
-  CLEANUP_PS_CMD="$PS_STUB" KILL_CMD="$KILL_STUB" CLEANUP_SELF_PID="$1" \
-    kill_parent_telepty_allow "$2" >/dev/null 2>&1
+  CLEANUP_SELF_PID="$1" probe kill-parent "$2" >/dev/null 2>&1
 }
 
 # ── (a) SELF: the allow PID equals the cleanup process itself → refuse kill ──
@@ -96,9 +97,8 @@ cat > "$PS_SNAP" <<'EOF'
 600 999 telepty allow --id ok-sid claude --continue
 EOF
 : > "$KILL_LOG"
-CLEANUP_PS_CMD="$PS_STUB" KILL_CMD="$KILL_STUB" CLEANUP_SELF_PID="400" \
-  ORCHESTRATOR_BRIDGE_PIDS="600" \
-  kill_parent_telepty_allow ok-sid >/dev/null 2>&1 \
+CLEANUP_SELF_PID="400" ORCHESTRATOR_BRIDGE_PIDS="600" \
+  probe kill-parent ok-sid >/dev/null 2>&1 \
   || fail "d: kill_parent_telepty_allow returned non-zero (should skip & continue)"
 [ ! -s "$KILL_LOG" ] \
   || fail "d: SIGTERM fired on env-declared bridge PID 600 — guard failed. kill log: $(cat "$KILL_LOG")"
@@ -109,11 +109,11 @@ cat > "$PS_SNAP" <<'EOF'
 200 100 claude (orchestrator)
 400 200 bash session-cleanup.sh
 EOF
-CLEANUP_PS_CMD="$PS_STUB" CLEANUP_SELF_PID="400" pid_is_self_or_ancestor 400 \
+CLEANUP_SELF_PID="400" probe pid-is-self-or-ancestor 400 \
   || fail "helper: self pid 400 not classified as self/ancestor"
-CLEANUP_PS_CMD="$PS_STUB" CLEANUP_SELF_PID="400" pid_is_self_or_ancestor 200 \
+CLEANUP_SELF_PID="400" probe pid-is-self-or-ancestor 200 \
   || fail "helper: ancestor pid 200 not classified as self/ancestor"
-if CLEANUP_PS_CMD="$PS_STUB" CLEANUP_SELF_PID="400" pid_is_self_or_ancestor 777; then
+if CLEANUP_SELF_PID="400" probe pid-is-self-or-ancestor 777; then
   fail "helper: unrelated pid 777 misclassified as self/ancestor"
 fi
 
