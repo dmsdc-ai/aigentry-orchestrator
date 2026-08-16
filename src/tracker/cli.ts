@@ -25,6 +25,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { cmdReportSweep } from "./report-sweep.js";
 import { USAGE } from "./usage.js";
 
 const env = process.env;
@@ -815,6 +816,13 @@ function main(argv: string[]): void {
       return;
     case "prune":
       cmdPrune();
+      return;
+    // #904 — the only async subcommand (atomicWrite is a promise). node keeps the
+    // loop alive until it settles, so `void` here is the return, not a discard.
+    case "report-sweep":
+      void cmdReportSweep(STATE_DIR, REPO_DIR, NOW_OVERRIDE).then((rc) => {
+        if (rc !== 0) process.exit(rc);
+      });
       return;
     case "-h":
     case "--help":

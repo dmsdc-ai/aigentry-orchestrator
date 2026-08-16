@@ -920,6 +920,20 @@ if [ -x "$TRACKER_SH" ] && [ "$DRY_RUN" -eq 0 ]; then
   "$TRACKER_SH" check >/dev/null 2>&1 || log "ERR tracker check non-zero (continuing)"
 fi
 
+# --- step 0b2: report sweep (#904 + #743) — the PULL side of worker reporting.
+# `check` watches dispatches the orchestrator handed out; this watches what came
+# back. A worker's `inject --ref` can be silently dropped when the orchestrator is
+# busy (fl850: report written 22:07, noticed 22:48), so the ref is recovered from
+# ~/.telepty/shared through a durable cursor and copied into state/dispatch/inbox.
+# The NEW lines go through log() rather than /dev/null: a delivery nobody records
+# is the defect this closes. Act-only and best-effort, as step 0b.
+# AIGENTRY_REPORT_SWEEP=0 disables the call — #899 T2c is porting this file
+# concurrently and owns it, so the wiring can be switched off without a revert.
+if [ -x "$TRACKER_SH" ] && [ "$DRY_RUN" -eq 0 ] && [ "${AIGENTRY_REPORT_SWEEP:-1}" != "0" ]; then
+  "$TRACKER_SH" report-sweep 2>&1 | while IFS= read -r line; do log "$line"; done \
+    || log "ERR report-sweep non-zero (continuing)"
+fi
+
 # --- step 0c: PEER-LANE comms auditor (#533 Phase 1) — tail telepty's peer-inject
 # log, classify each non-orch↔non-orch inject (sanctioned envelope vs out-of-policy),
 # reconcile round counters, and escalate violations via an orchestrator HOLD
