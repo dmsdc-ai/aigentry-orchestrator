@@ -8,6 +8,12 @@
 # per-OS declaration below. A guard that starts skipping fails the run; so does a
 # declared skip that stopped happening, because a stale declaration is how a silenced
 # test stays silenced.
+#
+# RUN `tsc -p .` FIRST. In a fresh worktree (no dist/) this suite reports 93 passed /
+# 4 failed / skip-set "T16 T47 T48 T95" and the skip assertion below fires as a
+# SKIP-SET MISMATCH. None of it is a code defect: T17/T18/T24/T83 need
+# dist/src/session/inject-parser.js and T47 needs dist/ to exist at all. Measured
+# 2026-08-16 (#899 tranche 1) after the trap cost one worker a false baseline.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 chmod +x "$HERE"/T*.sh "$HERE"/stubs/* 2>/dev/null || true

@@ -6,7 +6,4 @@ source "$HERE/lib.sh"
 t_setup; trap t_teardown EXIT
 
 cp "$HERE/fixtures/claude2x_welcome_idle.txt" "$STUB_SCREEN_FILE"
-export DISPATCH_SH_NO_MAIN=1
-# shellcheck source=/dev/null
-source "$REPO_ROOT/bin/dispatch.sh"
-if is_ready sid-A claude; then echo "T11 PASS"; else echo "FAIL: Claude 2.x welcome+idle prompt blocks is_ready" >&2; exit 1; fi
+if "$REPO_ROOT/bin/dispatch.sh" __probe is-ready sid-A claude; then echo "T11 PASS"; else echo "FAIL: Claude 2.x welcome+idle prompt blocks is_ready" >&2; exit 1; fi

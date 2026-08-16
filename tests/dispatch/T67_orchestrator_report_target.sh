@@ -75,14 +75,12 @@ chmod +x "$myresolver"
 ref="$T_TMP/ref.md"
 printf 'task body\ntelepty inject --from {sid} {{ORCHESTRATOR_REPORT_TARGET}} "REPORT: ..."\n' > "$ref"
 
-export DISPATCH_SH_NO_MAIN=1
 export TELEPTY="$mystub"
 export REPORT_TARGET_SH="$myresolver"
-# shellcheck source=/dev/null
-source "$REPO_ROOT/bin/dispatch.sh"
-ref_file="$ref"; from_id="orchestrator"
-prepare_effective_ref
-do_inject sid-A >/dev/null
+# #899: prepare_effective_ref + do_inject, the pair this guard used to call as
+# sourced bash functions, are the `__probe dispatch-ref` subcommand now.
+dispatch_ref() { "$REPO_ROOT/bin/dispatch.sh" __probe dispatch-ref --ref "$1" --from orchestrator sid-A; }
+dispatch_ref "$ref" >/dev/null
 
 t_assert_contains "$cap" 'orchestrator@100.72.155.21'
 if grep -qF '{{ORCHESTRATOR_REPORT_TARGET}}' "$cap"; then
@@ -96,9 +94,7 @@ fi
 : > "$cap"
 ref2="$T_TMP/ref2.md"
 printf 'plain body no placeholder\n' > "$ref2"
-ref_file="$ref2"
-prepare_effective_ref
-do_inject sid-A >/dev/null
+dispatch_ref "$ref2" >/dev/null
 t_assert_contains "$cap" 'plain body no placeholder'
 
 # ---- 5. resolver missing / failing / empty → fail closed, inject NOTHING ----
@@ -111,10 +107,10 @@ chmod +x "$failing_empty"
 
 for bad in "$T_TMP/resolver-does-not-exist" "$failing_empty"; do
   : > "$cap"; echo 0 > "$cnt"
-  ref_file="$ref"                       # the ref that DOES carry the placeholder
-  REPORT_TARGET_SH="$bad"
+  export REPORT_TARGET_SH="$bad"
   rc=0
-  if ! prepare_effective_ref >/dev/null 2>&1; then rc=1; fi
+  # "$ref" is the ref that DOES carry the placeholder.
+  if ! dispatch_ref "$ref" >/dev/null 2>&1; then rc=1; fi
   [ "$rc" -ne 0 ] || {
     echo "FAIL: prepare_effective_ref returned 0 with an unresolvable target ($bad)" >&2
     echo "      injected: [$(cat "$cap")]" >&2; exit 1; }
