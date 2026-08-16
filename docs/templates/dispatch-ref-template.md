@@ -56,6 +56,13 @@ command exits 0, REPORT contains X, etc.).>
 
 ## Workflow (Stop after each phase + HOLD inject)
 
+> **MANDATORY — commit (WIP allowed) at every phase boundary; a sleep/API cut then
+> loses at most one phase.** Not a style preference: on 2026-08-16 three worker turns
+> were cut mid-response by `API Error: Your computer went to sleep mid-response`, and
+> the one that had not committed lost 1h7m of work outright while the committed ones
+> lost nothing. `git commit -m "WIP <phase>: <what exists so far>"` is enough — an
+> uncommitted phase is work that only exists inside a process the host can kill.
+
 ### Phase 1 — <name> (no writes | writes-OK)
 1. <step>
 2. <step>
@@ -91,7 +98,7 @@ telepty inject --submit --submit-force --from <session-id> {{ORCHESTRATOR_REPORT
 **Critical**: A HOLD printed inline in your reply is NOT a HOLD — it is a silent wait that pattern-matches §13 violation. The orchestrator only sees your `telepty inject` calls, not your inline markdown.
 
 **When to HOLD**:
-- Every phase boundary (even if you think the next step is obvious)
+- Every phase boundary (even if you think the next step is obvious) — **commit first, then HOLD** (see §Workflow)
 - Every self-correction mid-phase (about to deviate from spec)
 - Every ambiguity / missing fact that blocks progress
 - Before ANY destructive action (force push, tag delete, file rm)
