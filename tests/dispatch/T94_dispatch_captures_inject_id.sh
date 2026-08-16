@@ -154,10 +154,19 @@ printf '%s' "$out" | grep -qF "Context injected successfully" \
 # ── H) capturing the id must never be able to FAIL a dispatch ──
 # dispatch.sh's standing invariant is that nothing fallible runs between
 # begin-delivery's durable commit and the transport call — a crash in that window
-# is indistinguishable from a delivery whose bytes may have landed. Scraping the
-# id needs a scratch file, so an unwritable TMPDIR must degrade to "no id"
-# (the honest no_transport_inject_id path), never abort a delivery the registry
-# has already authorized.
+# is indistinguishable from a delivery whose bytes may have landed.
+#
+# #899 tranche 1: this case used to assert inject_id == null here. That null was
+# an ACCIDENT of the bash implementation, not a contract. The shell tee'd
+# telepty's stdout through `mktemp "${TMPDIR:-/tmp}/dispatch-inject.XXXXXX"`
+# (dispatch.sh:372-388 pre-port); an unwritable TMPDIR made mktemp fail, so the
+# scrape was skipped and the id was lost as a side effect of needing a scratch
+# file. The contract is #872's — capture the inject_id telepty prints — and the
+# TS port tees through an in-memory buffer, so it satisfies that even here.
+# The invariant this case exists for is asserted below by rc == 0 and
+# transport.result: an unwritable TMPDIR must not break a delivery the registry
+# has already authorized. A scratch file is NOT to be reintroduced to reproduce
+# the old null.
 stub_inject "$OK_LINE" "   inject_id: $UUID"
 NOWRITE="$T_TMP/unwritable"
 mkdir -p "$NOWRITE"; chmod 0555 "$NOWRITE"
@@ -171,8 +180,9 @@ set -e
 chmod 0755 "$NOWRITE"
 [ "$rc" -eq 0 ] || fail "H: an unwritable TMPDIR failed the dispatch (exit $rc) — id capture must degrade, not abort"
 t_assert_v2 sid-nowrite-T94 transport.result write_observed
-# …and the degrade is the honest one: no id, so the tracker's existing
-# no_transport_inject_id HOLD fires rather than anything being invented.
-t_assert_v2 sid-nowrite-T94 transport.inject_id null
+# …and the id survives it, because capturing it no longer depends on the
+# filesystem at all. The tracker gets a real handle instead of the
+# no_transport_inject_id HOLD that an unwritable TMPDIR used to force.
+t_assert_v2 sid-nowrite-T94 transport.inject_id "$UUID"
 
 echo "T94 PASS"

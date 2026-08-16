@@ -1,19 +1,19 @@
 # ts899 (#899 tranche 1) — bin/dispatch.sh → TypeScript behind a CLI-compatible entrypoint
 
 Branch `feat/899-t1-dispatch-ts` (worktree `~/.aigentry/worktrees/ts899`, off `origin/main` a9e2385).
-Status: **port landed and building; 96/97 guards green; one HOLD open (T94 case H).**
+Status: **done — both suites at baseline numbers, Snyk clean, PR open.**
 
 ---
 
-## HOLD — T94 case H: the port removed the failure mode the assertion pins
+## Resolved HOLD — T94 case H: the port removed the failure mode the assertion pinned
 
-`bash tests/dispatch/run-all.sh` after the port: **96 passed, 1 failed** — `T94_dispatch_captures_inject_id.sh`.
+Mid-port, `run-all.sh` reported **96 passed, 1 failed** — `T94_dispatch_captures_inject_id.sh`:
 
 ```
 FAIL: sid-nowrite-T94 transport.inject_id = 3a2a0e8e-1c4d-4f2b-9a77-8b1e5d6c0f31, want null
 ```
 
-Case H (T94:154-176) makes TMPDIR unwritable and asserts three things:
+Case H (T94:154-176) makes TMPDIR unwritable and asserted three things:
 
 1. `rc == 0` — id capture must not abort a delivery the registry already authorized. **Passes.**
 2. `transport.result == write_observed`. **Passes.**
@@ -26,31 +26,27 @@ buffer (`inject()`, `src/dispatch/cli.ts`), so there is no scratch file to fail 
 normally. Assertions 1 and 2 — the invariant the case was written for, stated in its own comment
 ("capturing the id must never be able to FAIL a dispatch") — still hold.
 
-**Two readings, and I will not pick one myself:**
+**Resolution (orchestrator-approved, option B):** assertion 3 now pins the new truth — the id is captured
+despite an unwritable TMPDIR — and T94's comment records that the old `null` was a side effect of the
+`mktemp` scratch file, with the measurement. A scratch file was explicitly not reintroduced to reproduce
+the defect. The rejected alternative was to re-add it for bit-exactness, which would have ported a
+workaround forward as a requirement and left the tracker with `no_transport_inject_id` in a case where
+nothing is wrong with the id.
 
-- **(A) Bit-exact port.** Reintroduce the scratch file so an unwritable TMPDIR still suppresses the id.
-  This ports a workaround forward as a requirement: it adds a failure mode on purpose, and makes the
-  dispatch worse (the tracker gets `no_transport_inject_id` and HOLDs) in exactly the case where nothing
-  is actually wrong with the id.
-- **(B) Update assertion 3 to expect the UUID**, with a comment recording that the scratch-file
-  dependency is gone and that assertions 1+2 carry the case's stated invariant. **I recommend (B).**
-  Caveat, stated plainly: under (B) case H no longer exercises a real degrade path, because in the TS
-  there is no fallible step left to degrade — `parseInjectId` is a pure regex over a string already in
-  memory. It still measures that an unwritable TMPDIR breaks nothing.
-
-This is outside the grant I was given (that covered the **invocation lines** of the 12 sourcing guards).
-Changing an *assertion* in a guard that is part of the declared black-box spec is a scope decision.
-**Everything else is done; only this one line is blocked.**
+Caveat worth keeping visible: under (B) case H no longer exercises a real degrade path, because in the TS
+there is no fallible step left to degrade — `parseInjectId` is a pure regex over a string already in
+memory. It still measures that an unwritable TMPDIR breaks nothing (rc 0 + `write_observed`).
 
 ---
 
 ## Baselines vs after — both suites
 
-| Suite | Baseline (before any change) | After the port |
-|---|---|---|
-| `npm test` | `tests 225 / pass 225 / fail 0` | pending re-run (last section) |
-| `tests/dispatch/run-all.sh` | `guards: 97  passed: 97  failed: 0  skipped: 3` | `guards: 97  passed: 96  failed: 1  skipped: 3` |
-| skip set | `T16 T48 T95` | `T16 T48 T95` — **unchanged** |
+| Suite | Baseline (before any change) | After the port | Delta |
+|---|---|---|---|
+| `npm test` | `tests 225 / pass 225 / fail 0` | `tests 225 / pass 225 / fail 0` | none |
+| `tests/dispatch/run-all.sh` | `guards: 97  passed: 97  failed: 0  skipped: 3` | `guards: 97  passed: 97  failed: 0  skipped: 3` | none |
+| skip set | `T16 T48 T95` | `T16 T48 T95` | **unchanged** |
+| Snyk `snyk_code_scan` (`src/dispatch/`) | — | `issueCount: 0` | 0 new |
 
 `EXPECTED_GUARDS` stays 97: no guard added, none removed.
 
@@ -143,14 +139,10 @@ T67 → `dispatch-ref`) keep their fixtures, `lib.sh`, `STUB_SCREEN_FILE` and te
   string-matches the launcher body. My earlier claim that no guard asserts on launcher content was wrong
   — I had grepped only T28/T34. `shellQuote` now emits shell-safe words bare, exactly as `%q` does.
   T47 passes both legs (codex + gemini, real spawns).
-- **T94 case H** — see the HOLD above.
+- **T94 case H** — see above; resolved as a superseded assertion, not a port bug.
 
 ## What I did NOT check
 
-- `npm test` after the port — re-running now; the port adds files under `src/` that `tsc -p .` compiles,
-  and no existing test imports `src/dispatch/`, so I expect 225/225. Reported when it lands.
-- Snyk `snyk_code_scan` — not yet run.
-- PR / CI — not opened yet (blocked behind the T94 HOLD and the two runs above).
 - **Live dispatch behaviour is untested by me.** Every guard drives a stubbed `telepty`; T16/T48/T95 stay
   skipped exactly as at baseline. The first real spawn-and-dispatch through the TS will happen when
   someone merges this, and the paths only live dispatch exercises — `open-session.sh` spawning a real
