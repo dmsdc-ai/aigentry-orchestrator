@@ -19,6 +19,12 @@ export const USAGE = `# dispatch-tracker.sh — Orchestrator-side dispatch healt
 #   dispatch-tracker.sh check                    — one-shot scan; alerts to stdout + log
 #   dispatch-tracker.sh status [<sid>]
 #   dispatch-tracker.sh prune
+#   dispatch-tracker.sh report-sweep            — durable pull side of worker
+#       reporting (#904): copies every ref newly appearing under
+#       \$TELEPTY_SHARED_DIR into state/dispatch/inbox/ and advances a durable
+#       cursor, so a report is never lost to an inject a busy orchestrator
+#       dropped. Prints one NEW line per item. See
+#       docs/specs/2026-08-16-report-sweep.md.
 #   dispatch-tracker.sh --help
 #
 # Records are created by bin/dispatch.sh's begin-delivery transaction BEFORE the

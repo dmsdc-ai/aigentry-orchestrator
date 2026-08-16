@@ -1,7 +1,14 @@
 # SPEC — `report-sweep`: a durable pull-side cursor over `~/.telepty/shared` (#904 + #743)
 
-**Status**: awaiting GO. Phase 1 of sw904 (SPEC FIRST). No implementation lands until the
-orchestrator replies.
+**Status**: implemented. GO given 2026-08-16 on the version at `cf44266`.
+
+Two clauses of that version were **wrong against real data** and were changed during
+implementation, both recorded inline below with the measurement that forced them:
+
+- §4 `<sha8>` → the whole ref id. Truncating to 8 chars collided four real refs onto one
+  inbox path and lost three reports (161 refs in, 160 files out).
+- §4.1 track resolution grew from one source to three. Registry-substring alone put 48 of
+  161 refs — including this task's own dispatch — on the junk track `aigentry`.
 
 ## 1. The defect this addresses (measured, Rule 38)
 
@@ -81,14 +88,23 @@ because the path is a function of the sha.
 ## 4. Inbox layout
 
 ```
-state/dispatch/inbox/<YYYY-MM-DD>-<track>-<sha8>.md      # classified
-state/dispatch/inbox/unclassified/<YYYY-MM-DD>-<sha8>.md # everything else
+state/dispatch/inbox/<YYYY-MM-DD>-<track>-<ref-id>.md      # classified
+state/dispatch/inbox/unclassified/<YYYY-MM-DD>-<ref-id>.md # everything else
 ```
 
 - `<YYYY-MM-DD>` — **UTC date of the ref's mtime**, not of the sweep. The filename then
   says when the report was written, which is the fact an operator wants, and a re-emit
   after midnight cannot produce a second path for the same sha.
-- `<sha8>` — first 8 chars of the sha.
+- `<ref-id>` — the ref's basename, sanitised (§9). **CHANGED from this spec's `<sha8>`.**
+  The id must be injective in the basename or the inbox loses what it exists to preserve,
+  and 8 chars is not. Measured 2026-08-16 against the real shared dir: 5 of 161 refs are
+  not named for a 64-hex content sha, and four of those are `rel-874-answer-v101-tag.md`,
+  `rel-874-npm-auth-three-paths.md`, `rel-874-publish-auth-report.md`,
+  `rel-874-release-workflow-report.md` — all four truncate to `rel-874-`, one inbox path,
+  three reports silently overwritten. The sweep emitted 161 `NEW` lines and produced 160
+  files. A digest suffix is appended only when sanitisation or the 96-char cap actually
+  dropped information, so a real content sha still names its own file exactly.
+  Post-change: **161 refs in, 161 files out, 0 colliding paths.**
 - Content is a **verbatim byte copy**. No injected header: the sweep must not alter the
   evidence it is preserving.
 - The source under `~/.telepty/shared` is never moved, modified or deleted.
@@ -103,14 +119,43 @@ state/dispatch/inbox/unclassified/<YYYY-MM-DD>-<sha8>.md # everything else
 A header match and a track match are independent: a `# REPORT — wh899` gets
 `kind=REPORT` *and* `track=wh899`.
 
-### 4.1 Track resolution
+### 4.1 Track resolution — **three sources, not one**
 
-Tracks are derived from `state/dispatch/active.json`: for every `dispatches[].assigned.sid`,
-the candidate set is `{sid, sid.split("-")[0]}`, keeping only candidates of length ≥ 3 (a
-2-char prefix like `fB` matches noise). Candidates are tested longest-first as plain
-substrings of the 400-byte head; the first hit wins, so the full sid beats its own prefix.
+The GO'd version resolved the track by substring-matching the registry vocabulary alone.
+Measured 2026-08-16 over all 161 real refs, that is wrong twice over, so the rule is now
+three sources in falling order of authority:
+
+1. **`^track:\s*(…)`** — the dispatch-ref template's own field. The author stating which
+   track this is outranks any inference from prose.
+2. **the title token after the em-dash** — `# REPORT — tk899 (#899 …)`,
+   `# DISPATCH — sl909 (#909): …`. Admitted only if it carries a digit (below).
+3. **registry substring** — `state/dispatch/active.json`, for every
+   `dispatches[].assigned.sid`, candidates `{sid, sid.split("-")[0]}`, tested
+   longest-first so a full sid beats its own prefix. Still earns its place: a
+   `# SPEC — rank-based decision ledger` names its track only in the body
+   (`- **Task**: lg923 (#923)`), which nothing but a substring match will find.
+
+**The digit rule.** A sid *prefix* (source 3) or a title token (source 2) is admitted only
+if it contains a digit. Every real track id here carries one — `sw904`, `tk899`, `sl909`,
+`sp902-916`, `wh899`, `lg923`, `ci1`, `t880`; every junk token observed carries none —
+`aigentry`, `architect`, `fix`, `coder`, `acc`, `disp`, `rel`, `pub`, `diag`, `telepty`.
+Full sids are always admitted, digit or not: a full sid is specific enough that finding it
+means something. Without this rule, sids like `aigentry-…` and `architect-…` are on file
+and those words appear in every ref's repo paths, so longest-first let the junk token win:
+**48 of 161 refs came back on track `aigentry`, including this task's own dispatch**
+(`# DISPATCH — sw904 …`, filed under `aigentry`).
+
+Source 2 exists because the registry is an **incomplete** vocabulary and pretending
+otherwise mislabels live work: `tk899` and `sl909` have open worktrees and current reports,
+and neither sid is in `active.json`.
+
+Measured over the same 161 refs, one source → three: refs with no resolvable track
+**103 → 57**, refs filed unclassified **58 → 36**. The residual 36 are orchestrator→worker
+decision injects (`# DECISION:`, `# RELAY`, `# MY CALL`, `# VERIFIED`) — no track, no
+report header, and correctly unclassified rather than forced onto a track they lack.
 
 Unresolved track → the literal token **`unknown`**, in both the filename and stdout.
+
 *Deviation from the dispatch text*, which wrote `<track|?>`: `?` is not a filename-safe
 segment, and one placeholder spelled two ways is how the two stop agreeing. One token,
 both places.
@@ -152,28 +197,47 @@ disabled without a revert if the two collide.
 
 ## 8. Guards (`tests/dispatch/`, RED first — Rule 35)
 
+Renumbered T106–T108 → **T107–T109** on 2026-08-16: cl899 (PR 11) already claims T105 and
+T106 (`T106_cleanup_cli_contract.sh`).
+
 | id | asserts |
 |---|---|
-| **T106** | two refs written in the same second, one sweep → **both** copied to the inbox and both printed. This is the sibling-drop defect from §1.1 |
-| **T107** | crash between the writes, simulated by deleting the cursor after a successful sweep → a second sweep leaves **exactly one** inbox copy per sha (idempotent by sha), and the inbox file count is unchanged |
-| **T108** | a ref older than `last_mtime_ms - 5min` is **not** re-emitted; a ref inside the overlap window is scanned again but de-duped by `seen` |
+| **T107** | (a) two refs written in the same second, one sweep → **both** copied and both printed — the sibling-drop defect from §1.1. (b) two refs sharing an 8-char basename prefix → **both** survive, which is the `rel-874-*` loss in §4 |
+| **T108** | crash between the writes, simulated by deleting the cursor after a successful sweep → the second sweep re-emits (that is the contract) but leaves **exactly one** inbox copy at the **same path**, and a third sweep with a healthy cursor is silent |
+| **T109** | a ref older than `last_mtime_ms - 5min` is **not** re-emitted; a ref inside the overlap window is scanned again but de-duped by `seen`. Ends on a negative control: drop that sha from `seen` and the same file re-emits, proving the silence was the ledger's doing |
 
-`EXPECTED_GUARDS` in `tests/dispatch/run-all.sh`: **103 → 106**. cl899 is in flight with
-T105 and may land first; if it does, the number is rebased onto whatever `main` carries —
-the count follows the tree, it is not defended.
+`EXPECTED_GUARDS` in `tests/dispatch/run-all.sh`: **105 → 108**. cl899 landed first
+(`988fb69`, PR 11), taking main from 103 to 105 with T105/T106; this branch is rebased onto
+it and adds three. The count follows the tree; it is not defended.
 
 ## 9. Security
 
 Path traversal is the live hazard: both path segments come from untrusted-ish input
-(`sha8` from a filename, `track` from JSON). Both are sanitised to `[A-Za-z0-9._-]` with
-every other byte dropped, then length-capped (track 48), before any `path.join`. A segment
-that sanitises to empty becomes `unknown`. `snyk_code_scan` → 0 new findings is a gate on
-this task.
+(the ref id from a filename, `track` from JSON). Both are sanitised to `[A-Za-z0-9._-]`
+with every other byte dropped — dropped rather than escaped, because an escape leaves the
+caller reasoning about encodings and a drop leaves nothing to reason about — then
+length-capped (track 48, ref id 96) before any `path.join`. `.` and `..` survive that
+character class intact, so they are rejected by name: they *are* the traversal. A segment
+that sanitises to empty becomes `unknown`.
+
+Because sanitisation is itself lossy, a ref id that was altered by it carries an 8-hex
+SHA-256 suffix of the original name (§4) — otherwise two hostile names differing only in
+dropped bytes would map to one inbox path, which is the §4 loss with an attacker behind it.
+
+`snyk_code_scan` over `src/` → **0 issues**.
 
 ## 10. Baseline (Rule 39)
 
 Measured in this worktree before any change: `npm test` **225/225**;
 `bash tests/dispatch/run-all.sh` **103/103**, skip set `T16 T48 T95`.
+
+After, rebased onto `988fb69` (cl899's T105/T106 included): `npm test` **225/225**;
+`bash tests/dispatch/run-all.sh` **108/108**, skip set `T16 T48 T95` — unchanged, so
+nothing went quiet to make room for the new guards.
+
+End-to-end against the real `~/.telepty/shared` (read-only, throwaway state dir, forced
+full backfill): **161 refs → 161 inbox files, 0 colliding paths, exit 0, empty stderr**,
+and a second sweep prints nothing.
 
 ## 11. Explicitly NOT in scope
 
