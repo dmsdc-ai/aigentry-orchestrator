@@ -22,4 +22,22 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 # entrypoint still locates bin/ helpers (dispatch-registry.py, open-session.sh…).
 DISPATCH_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 export DISPATCH_SCRIPT_DIR
-exec node "$DISPATCH_SCRIPT_DIR/../dist/src/dispatch/cli.js" "$@"
+
+# Two layouts, both real. In the repo and in the installed package, dist/ is a
+# sibling of bin/. In a control workspace, `init` copies bin/ but ships no dist/
+# (bin/init/manifest.mjs has no dist entries), so the implementation is resolved
+# through the package's own CLI on PATH instead — the workspace's dispatch.sh has
+# to keep working, not just answer --help.
+DISPATCH_CLI_JS="$DISPATCH_SCRIPT_DIR/../dist/src/dispatch/cli.js"
+if [ ! -f "$DISPATCH_CLI_JS" ]; then
+  pkg_bin="$(command -v aigentry-orchestrator || true)"
+  if [ -n "$pkg_bin" ]; then
+    pkg_root="$(node -e 'const p=require("node:path"),f=require("node:fs");console.log(p.resolve(f.realpathSync(process.argv[1]),"..","..",".."))' "$pkg_bin" 2>/dev/null || true)"
+    [ -n "$pkg_root" ] && DISPATCH_CLI_JS="$pkg_root/dist/src/dispatch/cli.js"
+  fi
+fi
+if [ ! -f "$DISPATCH_CLI_JS" ]; then
+  echo "dispatch.sh: compiled implementation not found at $DISPATCH_CLI_JS (run \`tsc -p .\` in the repo, or install @dmsdc-ai/aigentry-orchestrator so 'aigentry-orchestrator' is on PATH)" >&2
+  exit 2
+fi
+exec node "$DISPATCH_CLI_JS" "$@"
