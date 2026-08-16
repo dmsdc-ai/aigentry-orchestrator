@@ -16,28 +16,19 @@
 #     hard-coded `sleep 5` in verify_delivered, which the guards used to skip by
 #     redefining the `sleep` builtin — an override that cannot cross a process
 #     boundary.
+#   * The two-layout dist resolution moved to bin/lib/node-shim.sh when the
+#     tracker shim needed the same logic (#899 tranche 1b). One copy, two shims;
+#     tests/dispatch/T99 still pins the workspace layout for this one.
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 # Resolved exactly as the shell script's SCRIPT_DIR was, so a symlinked
 # entrypoint still locates bin/ helpers (dispatch-registry.py, open-session.sh…).
-DISPATCH_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+AIGENTRY_SHIM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+export AIGENTRY_SHIM_SCRIPT_DIR
+DISPATCH_SCRIPT_DIR="$AIGENTRY_SHIM_SCRIPT_DIR"
 export DISPATCH_SCRIPT_DIR
 
-# Two layouts, both real. In the repo and in the installed package, dist/ is a
-# sibling of bin/. In a control workspace, `init` copies bin/ but ships no dist/
-# (bin/init/manifest.mjs has no dist entries), so the implementation is resolved
-# through the package's own CLI on PATH instead — the workspace's dispatch.sh has
-# to keep working, not just answer --help.
-DISPATCH_CLI_JS="$DISPATCH_SCRIPT_DIR/../dist/src/dispatch/cli.js"
-if [ ! -f "$DISPATCH_CLI_JS" ]; then
-  pkg_bin="$(command -v aigentry-orchestrator || true)"
-  if [ -n "$pkg_bin" ]; then
-    pkg_root="$(node -e 'const p=require("node:path"),f=require("node:fs");console.log(p.resolve(f.realpathSync(process.argv[1]),"..","..",".."))' "$pkg_bin" 2>/dev/null || true)"
-    [ -n "$pkg_root" ] && DISPATCH_CLI_JS="$pkg_root/dist/src/dispatch/cli.js"
-  fi
-fi
-if [ ! -f "$DISPATCH_CLI_JS" ]; then
-  echo "dispatch.sh: compiled implementation not found at $DISPATCH_CLI_JS (run \`tsc -p .\` in the repo, or install @dmsdc-ai/aigentry-orchestrator so 'aigentry-orchestrator' is on PATH)" >&2
-  exit 2
-fi
-exec node "$DISPATCH_CLI_JS" "$@"
+# shellcheck source=lib/node-shim.sh
+. "$AIGENTRY_SHIM_SCRIPT_DIR/lib/node-shim.sh"
+aigentry_node_shim dispatch.sh dist/src/dispatch/cli.js
+exec node "$AIGENTRY_SHIM_JS" "$@"
