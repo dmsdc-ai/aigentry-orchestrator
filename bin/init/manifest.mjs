@@ -56,6 +56,10 @@ const MANIFEST = [
   "bin/tq-status.sh",
   "bin/tq-track.sh",
   "bin/trust-path.sh",
+  // Subprocess door onto lib/workspace-host.sh (#899 pre-tranche-2). It ships for the
+  // same reason the lib does: a control workspace runs the reconciler/cleanup path, and
+  // once those are TypeScript they reach the workspace host only through this file.
+  "bin/wh-cli.sh",
 
   // ---- Doctrine. Owner-confirmed 2026-08-15 (§9.2): the full set ships.
   "AGENTS.md",
