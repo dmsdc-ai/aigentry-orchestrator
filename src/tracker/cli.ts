@@ -42,6 +42,10 @@ const ALERTS_LOG = path.join(STATE_DIR, "alerts.log");
 const OBSERVATIONS_LOG = path.join(STATE_DIR, "observations.log");
 const OBSERVATIONS_SEEN = path.join(STATE_DIR, "observations.seen");
 const DISCONNECTED_LOG = path.join(STATE_DIR, "disconnected.log");
+// #909: notes withheld while the host is asleep. session-reconciler.sh drains this
+// into ONE digest inject on the first tick after Wake.
+const SLEEP_QUEUE = env.AIGENTRY_SLEEP_TELEMETRY_QUEUE || path.join(STATE_DIR, "sleep-telemetry-queue.log");
+const PLATFORM_SH = path.join(SCRIPT_DIR, "lib/platform.sh");
 
 const ORCH_SID = env.ORCHESTRATOR_SID || "orchestrator";
 const TRACKER_SID = env.TRACKER_FROM_SID || "dispatch-tracker";
@@ -286,6 +290,53 @@ function teleptyAuthToken(): string {
   return chomp(capture("bash", ["-c", '. "$1"; telepty_auth_token', "_", TELEPTY_AUTH_SH]).stdout);
 }
 
+// ── #909 item (d): sleep-aware telemetry gate ───────────────────────────────
+//
+// This file is the ONLY orchestrator-side forwarder of idle-worker telemetry:
+// both `HOLD sid=… no completion fact observed` (pollObservationsAndHold) and
+// `WORKTREE_ACTIVITY sid=…` (gitCheckAndObserve) inject to the orchestrator from
+// here. The daemon-side `TASK_COMPLETION_UNKNOWN` emission that feeds them is
+// telepty's (#914) and out of scope; this gate is the orchestrator-side half.
+//
+// Measured 2026-08-16: ~70 orchestrator turns during one 7.5h host sleep, each an
+// idle-worker note delivered inside a DarkWake maintenance window, each waking a
+// session that could do nothing — the workers were stalled by the same sleep. So
+// while the host is asleep the notes are QUEUED, never dropped, and
+// session-reconciler.sh delivers one digest on the first tick after Wake.
+let _hostPowerState = "";
+
+/**
+ * `awake` | `asleep` | `unknown`, via bin/lib/platform.sh (Rule 26 — the OS
+ * primitive lives in the platform lib, not here). Memoised: pmset costs ~1.2s,
+ * so `status`/`prune` never pay for it and a `check` pays once. The reconciler
+ * exports its own reading as AIGENTRY_HOST_POWER_STATE, so a tick that already
+ * paid does not pay twice.
+ */
+function hostPowerState(): string {
+  if (!_hostPowerState) {
+    _hostPowerState =
+      env.AIGENTRY_HOST_POWER_STATE ||
+      chomp(capture("bash", ["-c", '. "$1"; platform::host_power_state', "_", PLATFORM_SH]).stdout) ||
+      "unknown";
+  }
+  return _hostPowerState;
+}
+
+/**
+ * The single door for orchestrator-bound telemetry. `unknown` FORWARDS: nothing
+ * may be withheld on a power state we did not measure, which is also every tick
+ * on a Linux host.
+ */
+function forwardToOrch(note: string): void {
+  if (hostPowerState() === "asleep") {
+    fs.appendFileSync(SLEEP_QUEUE, `${nowIso()}\t${note}\n`);
+    return;
+  }
+  if (commandExists(TELEPTY)) {
+    runQuiet(TELEPTY, ["inject", "--from", TRACKER_SID, ORCH_SID, note]);
+  }
+}
+
 // ── git evidence helpers ────────────────────────────────────────────────────
 /** A new commit in <cwd> since <since> that is attributable to the worker. */
 function hasNewCommits(cwd: string, since: string): boolean {
@@ -527,9 +578,7 @@ function gitCheckAndObserve(sid: string, cwd: string, dispatchedAt: string, scre
     `WORKTREE_ACTIVITY sid=${sid} sha=${headSha || "omitted"} files=${files} +${added}/-${removed}` +
     ` test_result_scraped=${testResult} — evidence only, no completion fact, review required`;
   emitAlert(note);
-  if (commandExists(TELEPTY)) {
-    runQuiet(TELEPTY, ["inject", "--from", TRACKER_SID, ORCH_SID, note]);
-  }
+  forwardToOrch(note);
 }
 
 /**
@@ -616,9 +665,7 @@ function pollObservationsAndHold(sid: string, dispatchId: string, injectId: stri
   fs.appendFileSync(OBSERVATIONS_SEEN, seenKey + "\n");
   const note = `HOLD sid=${sid} reason=${reason} — no completion fact observed; outcome unknown, still polling`;
   emitAlert(note);
-  if (commandExists(TELEPTY)) {
-    runQuiet(TELEPTY, ["inject", "--from", TRACKER_SID, ORCH_SID, note]);
-  }
+  forwardToOrch(note);
   return true;
 }
 

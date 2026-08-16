@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# T100 — the per-worker sleep assertion (#909 item a).
+# T101 — the per-worker sleep assertion (#909 item a).
 #
 # On 2026-08-16 three worker turns on this host were cut mid-response by
 # `API Error: Your computer went to sleep mid-response` (33m, 1h7m and 31m of work;
@@ -32,7 +32,7 @@ HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
 t_setup; trap t_teardown EXIT
 
-fail() { echo "FAIL[T100]: $*" >&2; exit 1; }
+fail() { echo "FAIL[T101]: $*" >&2; exit 1; }
 
 PLATFORM_SH="$REPO_ROOT/bin/lib/platform.sh"
 [ -f "$PLATFORM_SH" ] || fail "bin/lib/platform.sh missing"
@@ -146,4 +146,4 @@ grep -qE 'caffeinate.*-w' "$REPO_ROOT/bin/lib/platform-unix.sh" \
 grep -qE 'caffeinate[^\n]*-w[[:space:]]+"?\$\$' "$REPO_ROOT/bin/lib/platform-unix.sh" \
   && fail "F: the assertion follows the spawner pid, not the worker"
 
-echo "T100 PASS assertion=pid-scoped release=on-exit noop=announced"
+echo "T101 PASS assertion=pid-scoped release=on-exit noop=announced"

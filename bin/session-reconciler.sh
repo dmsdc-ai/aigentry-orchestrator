@@ -100,6 +100,11 @@ SURFACE_MISMATCHED_SRC="${AIGENTRY_SURFACE_MISMATCHED_SOURCE:-$STATE_DIR/surface
 # #909 auto-RESUME ledger: per-sid latch + hourly send log for sleep-cut turns.
 RESUME_MARKER="${AIGENTRY_SLEEP_RESUME_MARKER:-$STATE_DIR/sleep-resume.json}"
 RESUME_MAX_PER_HOUR="${RECONCILER_RESUME_MAX_PER_HOUR:-3}"
+# #909 item (d): telemetry withheld while the host slept (written by
+# dispatch-tracker.sh), and the latch that keeps the lid page to one per episode.
+SLEEP_QUEUE="${AIGENTRY_SLEEP_TELEMETRY_QUEUE:-$STATE_DIR/sleep-telemetry-queue.log}"
+LID_LATCH="$STATE_DIR/lid-closed.latch"
+SLEEP_DIGEST_MAX_LINES="${RECONCILER_SLEEP_DIGEST_MAX_LINES:-10}"
 
 # shellcheck source=lib/platform.sh
 . "$SCRIPT_DIR/lib/platform.sh"
@@ -505,6 +510,70 @@ apply_action() {
   esac
 }
 
+# --- #909 item (d): sleep-aware telemetry gate + closed-lid page ---------------
+#
+# The gate itself lives in dispatch-tracker.sh, which is the only orchestrator-side
+# forwarder of idle-worker telemetry. This half is the two things only a
+# level-triggered tick can do: notice the host woke up and hand over what was
+# withheld, and notice that the lid is shut with workers still running.
+#
+# Measured 2026-08-16: ~70 orchestrator turns across one 7.5h sleep, each an
+# idle-worker note delivered inside a DarkWake window, and each waking a session
+# that could do nothing — the workers were stalled by the same sleep.
+
+# host_power_state — memoised for this tick, then exported so the tracker child
+# inherits it instead of paying for a second ~1.2s pmset.
+host_power_state() {
+  [ -n "${_HOST_POWER_STATE:-}" ] || _HOST_POWER_STATE=$(platform::host_power_state)
+  printf '%s' "$_HOST_POWER_STATE"
+}
+
+# deliver_sleep_digest — ONE inject for everything withheld while asleep, on the
+# first tick that sees the host awake. Delivery is the point: the tracker's
+# seen-ledger records a note as raised before it is sent, so a withheld note is
+# never re-raised and this digest is its only chance to reach a human.
+deliver_sleep_digest() {
+  [ -s "$SLEEP_QUEUE" ] || return 0
+  [ "$(host_power_state)" = "asleep" ] && return 0
+  local total first last body msg
+  total=$(wc -l < "$SLEEP_QUEUE" | tr -d ' ')
+  first=$(head -1 "$SLEEP_QUEUE" | cut -f1)
+  last=$(tail -1 "$SLEEP_QUEUE" | cut -f1)
+  # One line: an inject is one line, and a queued note may not smuggle a newline
+  # into the orchestrator's turn.
+  body=$(cut -f2- "$SLEEP_QUEUE" | head -"$SLEEP_DIGEST_MAX_LINES" | paste -sd'|' -)
+  [ "$total" -gt "$SLEEP_DIGEST_MAX_LINES" ] \
+    && body="$body | …and $((total - SLEEP_DIGEST_MAX_LINES)) more (full list: $SLEEP_QUEUE)"
+  msg="SLEEP_DIGEST: $total idle-worker telemetry note(s) were withheld while this host was asleep ($first → $last) and are delivered here as one turn instead of $total. $body"
+  if command -v "$TELEPTY" >/dev/null 2>&1 && \
+     "$TELEPTY" inject --submit-force --from "$ORCH_SID" "$ORCH_SID" "$msg" >/dev/null 2>&1; then
+    rm -f "$SLEEP_QUEUE"
+    log "SLEEP_DIGEST delivered notes=$total"
+  else
+    # The queue is NOT drained on a failed delivery — an undelivered digest is the
+    # only remaining record of notes the tracker has already marked as raised.
+    emit_alert "SLEEP_DIGEST_UNDELIVERED notes=$total — $SLEEP_QUEUE still holds them; the tracker will not re-raise these"
+  fi
+}
+
+# check_lid — page ONCE per closed-lid episode while workers are live. Not an
+# actuator: a closed lid is the one sleep cause no userspace assertion overrides
+# (item (a)'s `caffeinate -i` included), so an operator opening the lid or plugging
+# in an external display is the only fix, and the alert says exactly that.
+check_lid() {
+  local live="${1:-0}" rc=0
+  platform::lid_closed || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # Open or unknown: the episode is over (or was never established).
+    [ -f "$LID_LATCH" ] && { rm -f "$LID_LATCH"; log "LID_OPEN — closed-lid page re-armed"; }
+    return 0
+  fi
+  [ "$live" -gt 0 ] || return 0
+  [ -f "$LID_LATCH" ] && return 0
+  : > "$LID_LATCH"
+  emit_alert "LID_CLOSED — the lid is shut with $live live worker(s); they will stall on the next sleep and NO sleep assertion can prevent it (clamshell sleep beats caffeinate -i without an external display). Remedy: open the lid, or attach an external display + keyboard."
+}
+
 run_registry_loop() {
   local act="$1" snap processed sid status ref_path rdc state_json action_json
   snap=$(mktemp)
@@ -529,6 +598,10 @@ run_registry_loop() {
     processed=$((processed + 1))
   done < "$snap"
   rm -f "$snap"
+  # #909: how many dispatches this tick is holding open — the "workers are live"
+  # input to the closed-lid page, taken from the pass that already counted them
+  # rather than from a second registry call.
+  LIVE_DISPATCHES=$processed
   log "registry tick: processed=$processed act=$act dry_run=$DRY_RUN"
 }
 
@@ -824,6 +897,18 @@ done <<< "$hitl_gates"
 
 # --- step 0: Dispatch Registry observe→decide→act loop ---
 run_registry_loop 1
+
+# --- step 0a2: host power (#909 item d) ---
+# Before the tracker runs, because the tracker is the forwarder being gated: it
+# inherits this tick's reading through the environment rather than paying for a
+# second ~1.2s pmset, and the digest of what the LAST sleep withheld goes out ahead
+# of anything this tick raises. Act-only — an operator's --dry-run injects nothing.
+# Best-effort: neither the digest nor the lid page may abort a tick.
+if [ "$DRY_RUN" -eq 0 ]; then
+  export AIGENTRY_HOST_POWER_STATE="$(host_power_state)"
+  deliver_sleep_digest || log "ERR sleep digest non-zero (continuing)"
+  check_lid "${LIVE_DISPATCHES:-0}" || log "ERR lid check non-zero (continuing)"
+fi
 
 # --- step 0b: tracker scan (#517) — the tracker polls every dispatch whose
 # expected_report_by elapsed and records what it measured. telepty#60 Stage A: it

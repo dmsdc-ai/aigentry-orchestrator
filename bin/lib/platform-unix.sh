@@ -111,3 +111,87 @@ platform::hold_awake() {
   esac
   return 0
 }
+
+# platform::host_power_state — print `awake`, `asleep` or `unknown`.
+#
+# "asleep" includes DarkWake, and that is the whole point: a DarkWake window is
+# precisely when this host runs a cron tick, notices an idle worker, and pages the
+# orchestrator about a session nobody is watching. Measured 2026-08-16 — ~70
+# orchestrator turns burned across a 7.5h sleep, every one of them in one of these
+# windows.
+#
+# macOS: the last power event in `pmset -g log`. The event name is the column
+# between the timestamp and the TAB, which is why this parses on the tab rather
+# than on whitespace — "Wake Requests" and "WakeDetails" are different events that
+# both begin with the word Wake, and a whitespace split cannot tell them from a
+# real "Wake". Costs ~1.2s (measured; pmset emits the whole log), so callers
+# resolve it ONCE per tick and pass it down via AIGENTRY_HOST_POWER_STATE.
+# Linux: no cheap equivalent — `unknown`, which every consumer treats as awake.
+# UNKNOWN IS ALWAYS FAIL-OPEN: nothing may be suppressed on a state we do not know.
+platform::host_power_state() {
+  if [[ -n "${AIGENTRY_HOST_POWER_STATE:-}" ]]; then
+    printf '%s\n' "$AIGENTRY_HOST_POWER_STATE"
+    return 0
+  fi
+  local bin last
+  case "$(platform::os_type)" in
+    macos)
+      bin="${AIGENTRY_PMSET:-pmset}"
+      command -v "$bin" >/dev/null 2>&1 || { printf 'unknown\n'; return 0; }
+      last=$("$bin" -g log 2>/dev/null | awk -F'\t' '
+        $1 ~ /^[0-9][0-9][0-9][0-9]-/ {
+          n = $1
+          sub(/^[^ ]+ [^ ]+ [^ ]+ +/, "", n)
+          gsub(/[ \t]+$/, "", n)
+          if (n == "Sleep" || n == "DarkWake" || n == "Wake") last = n
+        }
+        END { print last }')
+      case "$last" in
+        Sleep|DarkWake) printf 'asleep\n' ;;
+        Wake)           printf 'awake\n' ;;
+        *)              printf 'unknown\n' ;;
+      esac
+      ;;
+    *)
+      printf 'unknown\n'
+      ;;
+  esac
+}
+
+# platform::lid_closed — 0 closed, 1 open, 2 unknown.
+#
+# A closed lid is the one sleep cause NO userspace assertion overrides: without an
+# external display attached, clamshell sleep is an SMC path `caffeinate -i` loses to.
+# So this is not an actuator, it is a page — the operator is the only fix.
+#
+# macOS: ioreg AppleClamshellState (~14ms measured, cheap enough per tick).
+# Linux: /proc/acpi/button/lid/*/state where the kernel exposes it, else unknown.
+# NOT MEASURED on Linux — no Linux host was available for #909; the path is the
+# documented one and degrades to `unknown` (which never pages) when absent.
+platform::lid_closed() {
+  local bin state
+  case "$(platform::os_type)" in
+    macos)
+      bin="${AIGENTRY_IOREG:-ioreg}"
+      command -v "$bin" >/dev/null 2>&1 || return 2
+      state=$("$bin" -r -k AppleClamshellState -d 4 2>/dev/null \
+        | awk -F'= *' '/"AppleClamshellState"/ {print $2; exit}' | tr -d ' "')
+      case "$state" in
+        Yes) return 0 ;;
+        No)  return 1 ;;
+        *)   return 2 ;;
+      esac
+      ;;
+    linux)
+      state=$(cat /proc/acpi/button/lid/*/state 2>/dev/null | head -1)
+      case "$state" in
+        *closed) return 0 ;;
+        *open)   return 1 ;;
+        *)       return 2 ;;
+      esac
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+}

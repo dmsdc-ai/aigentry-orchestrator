@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# T101 — a turn cut by host sleep is RESUMED once, autonomously (#909 item c).
+# T102 — a turn cut by host sleep is RESUMED once, autonomously (#909 item c).
 #
 # Measured 2026-08-16: three worker turns showed, verbatim,
 #   "API Error: Your computer went to sleep mid-response. The response above may be
@@ -33,7 +33,7 @@ HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
 t_setup; trap t_teardown EXIT
 
-fail() { echo "FAIL[T101]: $*" >&2; exit 1; }
+fail() { echo "FAIL[T102]: $*" >&2; exit 1; }
 
 RECONCILER="$REPO_ROOT/bin/session-reconciler.sh"
 PROBE="$REPO_ROOT/bin/session-probe.py"
@@ -176,4 +176,4 @@ TICK_NOW="2026-08-16T13:30:00Z" run_tick RECONCILER_RESUME_MAX_PER_HOUR=2
   || fail "F: the cap never expires — it is supposed to be a rolling hour, not a permanent ban:
 $(cat "$RUN_LOG")"
 
-echo "T101 PASS resume=1-per-occurrence cap=rolling-hour gate=not-opened"
+echo "T102 PASS resume=1-per-occurrence cap=rolling-hour gate=not-opened"
