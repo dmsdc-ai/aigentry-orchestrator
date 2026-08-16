@@ -31,6 +31,15 @@ CODEX_MCP_BOOT = r"Starting MCP servers?\s*\(\d+/\d+\)"
 TRUST_MODAL = r"trust this folder|do you trust|Yes, (proceed|I trust)|Press Enter to continue"
 SANDBOX_PROMPT = r"Allow command\?|sandbox.*approv|approve this command|Do you want to (run|allow)"
 API_ERROR = r"API Error|api error|status 400|overloaded_error|rate.?limit|529|ECONNREFUSED|ETIMEDOUT"
+# #909: the one API-error surface with a KNOWN, self-healing remedy. Measured
+# verbatim from three cut turns on 2026-08-16: "API Error: Your computer went to
+# sleep mid-response. The response above may be incomplete." It is matched (and
+# classified) BEFORE API_ERROR, which would otherwise swallow it into the generic
+# `error` surface whose policy is "ask an operator" — the wrong answer for a cut
+# nobody needs to classify. Anchored on the sentence, not the "API Error" prefix,
+# so a CLI that rewords its banner degrades to the generic error surface rather
+# than to a false RESUME.
+SLEEP_CUT = r"computer went to sleep mid-response"
 THINKING_BLOCK = r"thinking.*block|invalid_request_error"
 CRASH = r"panic:|Traceback \(most recent|Segmentation fault|core dumped"
 UNSUBMITTED = r"\[context-ref\]|/shared/[0-9a-f]{6,}\.md"
@@ -199,6 +208,8 @@ def classify_surface(cli: str, screen: str) -> tuple[str, str]:
         return "modal", "trust-folder or continue modal"
     if re.search(CRASH, tail20, re.I):
         return "crash", "crash / traceback"
+    if re.search(SLEEP_CUT, tail20, re.I):
+        return "sleep_cut", "host slept mid-response (resumable)"
     if re.search(API_ERROR, tail20, re.I):
         return "error", "API/transport error banner"
     if re.search(r"(\$|%|\u279c)\s*$", tail20) and not re.search(
@@ -238,6 +249,8 @@ def verification_problems(
         problems.append("codex sandbox approval prompt - answer it")
     elif surface == "error":
         problems.append("API/transport error banner")
+    elif surface == "sleep_cut":
+        problems.append("host slept mid-response - turn cut, resumable")
     elif surface == "thinking_block":
         problems.append("thinking-block / invalid request")
     elif surface == "crash":
