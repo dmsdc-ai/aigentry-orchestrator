@@ -1,126 +1,160 @@
-# HOLD — ts899 (#899 tranche 1): the exec-shim shape and the 30-guard black-box spec are in direct conflict
+# ts899 (#899 tranche 1) — bin/dispatch.sh → TypeScript behind a CLI-compatible entrypoint
 
-Status: **HOLD on scope boundary**. Baselines measured, contract enumerated, port NOT yet started
-on the disputed surface. Work that is identical under both readings continues while this HOLD is open.
+Branch `feat/899-t1-dispatch-ts` (worktree `~/.aigentry/worktrees/ts899`, off `origin/main` a9e2385).
+Status: **port landed and building; 96/97 guards green; one HOLD open (T94 case H).**
 
 ---
 
-## 1. Baselines (re-measured, worktree `~/.aigentry/worktrees/ts899`, branch `feat/899-t1-dispatch-ts` off `origin/main` a9e2385)
+## HOLD — T94 case H: the port removed the failure mode the assertion pins
 
-| Suite | Ref claimed | Measured | Delta |
-|---|---|---|---|
-| `npm test` | 225+ | `tests 225 / pass 225 / fail 0` | **matches** |
-| `bash tests/dispatch/run-all.sh` | `guards: 97 passed: 97 failed: 0 skipped: 3` | `guards: 97  passed: 97  failed: 0  skipped: 3 (3 announcement(s))`, skip set `T16 T48 T95` | **matches** |
+`bash tests/dispatch/run-all.sh` after the port: **96 passed, 1 failed** — `T94_dispatch_captures_inject_id.sh`.
 
-One trap worth recording for the next tranche: a **fresh worktree measures 93/97 with skip set
-`T16 T47 T48 T95`** until `npx tsc -p .` has been run. T17/T18/T24/T83 fail and T47 skips purely on
-`dist/src/session/inject-parser.js` being absent. The skip-set assertion fires as
-`SKIP-SET MISMATCH on darwin` and reads like a real regression. Build first; that is not a code defect.
-(`EXPECTED_GUARDS=97`, `tests/dispatch/run-all.sh:19`.)
-
-## 2. The conflict
-
-The ref specifies two things that cannot both hold:
-
-- **Shape**: "a thin `bin/dispatch.sh` that becomes a 3-line exec shim onto `node dist/src/dispatch/cli.js "$@"`"
-- **Spec**: "**Those 30 guards are the black-box spec** … must be green with the SAME skip set before and after"
-
-Measured: **12 of the 30 guards do not treat `dispatch.sh` as a black box at all.** They `source` it as a
-**bash library** under `DISPATCH_SH_NO_MAIN=1` (dispatch.sh:600 `return 0 2>/dev/null || exit 0`), assign
-its shell variables directly, override `sleep` in scope, and call its internal functions:
-
-| Sourced function | Guards (8+3+1 = 12) |
-|---|---|
-| `is_ready <sid> <cli>` | T4 T5 T11 T12 T13 T14 T15 T50 |
-| `verify_delivered <sid>` | T6 T7 T91 |
-| `prepare_effective_ref`, `do_inject` | T67 |
-
-Example (T11:9-12):
 ```
-export DISPATCH_SH_NO_MAIN=1
-source "$REPO_ROOT/bin/dispatch.sh"
-if is_ready sid-A claude; then echo "T11 PASS"; ...
+FAIL: sid-nowrite-T94 transport.inject_id = 3a2a0e8e-1c4d-4f2b-9a77-8b1e5d6c0f31, want null
 ```
-T6:14-17 additionally sets `ref_file="$ref"` and defines `sleep() { :; }; export -f sleep` to skip the 5s
-wait inside `verify_delivered`. T67:83 sets `ref_file` and `from_id` before calling `prepare_effective_ref`.
 
-A 3-line `exec node …` shim exports no shell functions and holds no shell variables. **All 12 break.**
-The `DISPATCH_SH_NO_MAIN=1` sourceable-library mode is itself part of the measured contract
-(dispatch.sh:62, :181, :600) and the ref's flag list did not cover it.
+Case H (T94:154-176) makes TMPDIR unwritable and asserts three things:
 
-## 3. The two readings (Rule 37)
+1. `rc == 0` — id capture must not abort a delivery the registry already authorized. **Passes.**
+2. `transport.result == write_observed`. **Passes.**
+3. `transport.inject_id == null`. **Fails — the port captures the id.**
 
-- **(A) Guard files stay byte-identical.** "Same 30 guards green" means the files are untouched. To honour
-  it, `bin/dispatch.sh` must retain working bash `is_ready` / `verify_delivered` / `prepare_effective_ref` /
-  `do_inject` for the sourced path, while the main path execs the TS. Those four then exist **twice**.
-- **(B) Guard files are re-pointed at the TS.** "Same 30 guards green" means the same 30 assertions still
-  pass against live code; 12 invocation lines change to call a TS probe surface instead of sourcing bash.
+Why: the shell tee'd telepty's stdout through `mktemp "${TMPDIR:-/tmp}/dispatch-inject.XXXXXX"`
+(dispatch.sh:372-388). An unwritable TMPDIR made `mktemp` fail, `out=""`, and the scrape was skipped —
+so "no id" was a *consequence of the scratch file*, not a decision. The TS tees through an in-memory
+buffer (`inject()`, `src/dispatch/cli.ts`), so there is no scratch file to fail and the id is read
+normally. Assertions 1 and 2 — the invariant the case was written for, stated in its own comment
+("capturing the id must never be able to FAIL a dispatch") — still hold.
 
-## 4. Recommendation — (B), and I would not ship (A)
+**Two readings, and I will not pick one myself:**
 
-(A) produces **12 green guards measuring dead code**: the bash `is_ready` they exercise is no longer the
-`is_ready` production runs, and the two copies drift silently. That is precisely the silent-measurement
-defect class `#900` and `run-all.sh`'s whole skip-set assertion exist to catch, re-entering through the
-front door wearing a passing test as a disguise. The ref's own Rule 29 framing ("dispatch.sh only + its
-shim, **+ tests**") already puts tests in scope.
+- **(A) Bit-exact port.** Reintroduce the scratch file so an unwritable TMPDIR still suppresses the id.
+  This ports a workaround forward as a requirement: it adds a failure mode on purpose, and makes the
+  dispatch worse (the tracker gets `no_transport_inject_id` and HOLDs) in exactly the case where nothing
+  is actually wrong with the id.
+- **(B) Update assertion 3 to expect the UUID**, with a comment recording that the scratch-file
+  dependency is gone and that assertions 1+2 carry the case's stated invariant. **I recommend (B).**
+  Caveat, stated plainly: under (B) case H no longer exercises a real degrade path, because in the TS
+  there is no fallible step left to degrade — `parseInjectId` is a pure regex over a string already in
+  memory. It still measures that an unwritable TMPDIR breaks nothing.
 
-Proposed (B), keeping the ref's exec-shim shape exactly as written:
+This is outside the grant I was given (that covered the **invocation lines** of the 12 sourcing guards).
+Changing an *assertion* in a guard that is part of the declared black-box spec is a scope decision.
+**Everything else is done; only this one line is blocked.**
 
-- `bin/dispatch.sh` = the prescribed 3-line exec shim. PATH entrypoint, `bin/init/manifest.mjs`, T96
-  ship-set and every caller untouched — as the ref intends.
-- The TS CLI gains a hidden `__probe` subcommand exposing the same four behaviours as exit codes, which is
-  what the guards actually assert on:
-  - `dispatch.sh __probe is-ready <sid> <cli>` → exit 0/1 (replaces 8 guards' `if is_ready …`)
-  - `dispatch.sh __probe verify-delivered --ref <f> <sid>` → exit 0/1/2 (the existing three-way #835 result)
-  - `dispatch.sh __probe prepare-ref --ref <f>` → prints the effective ref path (T67)
-- Diff per guard: **one line** (`source …` + call → one `__probe` call). Fixtures, `STUB_SCREEN_FILE`,
-  `TELEPTY` stub, `lib.sh` all unchanged — the guards keep measuring the same fixtures through the same stub.
-- One new knob needed: `verify_delivered`'s hard-coded `sleep 5` (dispatch.sh:418) is currently stubbed by
-  redefining the `sleep` builtin, which is impossible across a process boundary. Proposal:
-  `AIGENTRY_DISPATCH_VERIFY_SLEEP_MS` (default 5000), set to 0 by T6/T7/T91. This is a new env var, hence
-  part of what I am holding on.
-- `EXPECTED_GUARDS` stays 97 (no guard added or removed, so the #900 manifest assertion is untouched).
+---
 
-## 5. What I need decided
+## Baselines vs after — both suites
 
-1. **(A) or (B)?** I recommend (B).
-2. If (B): confirm that editing 12 guard invocation lines is within the ref's "same 30 guards green"
-   success criterion, and that `AIGENTRY_DISPATCH_VERIFY_SLEEP_MS` is an acceptable new knob.
-3. Confirm `DISPATCH_SH_NO_MAIN=1` sourceable-library mode may be **dropped** from the shim under (B).
-   Nothing outside `tests/dispatch/` references it (measured: `grep -rn DISPATCH_SH_NO_MAIN` hits only
-   `bin/dispatch.sh` and the 12 guards), but it is an undocumented public-ish surface and dropping it is a
-   contract deletion, not a port.
+| Suite | Baseline (before any change) | After the port |
+|---|---|---|
+| `npm test` | `tests 225 / pass 225 / fail 0` | pending re-run (last section) |
+| `tests/dispatch/run-all.sh` | `guards: 97  passed: 97  failed: 0  skipped: 3` | `guards: 97  passed: 96  failed: 1  skipped: 3` |
+| skip set | `T16 T48 T95` | `T16 T48 T95` — **unchanged** |
 
-## 6. Contract enumerated so far (port is being written against this)
+`EXPECTED_GUARDS` stays 97: no guard added, none removed.
 
-Flags (dispatch.sh:158-179) — re-measured, matches the ref's list exactly, 15 flags plus `-h|--help`:
+**Baseline trap, now documented in `tests/dispatch/run-all.sh`:** a fresh worktree measures
+**93 passed / 4 failed, skip set `T16 T47 T48 T95`** and fires `SKIP-SET MISMATCH on darwin` until
+`tsc -p .` has run. T17/T18/T24/T83 need `dist/src/session/inject-parser.js`; T47 needs `dist/`. None of
+it is a code defect. It cost me one false baseline, hence the note the orchestrator asked for.
+
+## The enumerated contract → what pins it
+
+**Flags** (re-measured at dispatch.sh:158-179): the ref's list is exact — 15 flags plus `-h|--help`.
 `--target --ref --from --timeout-ms --spawn-and-dispatch --track --name --cwd --worktree --cli --role
 --task --no-task --verify-delivered --no-verify-started --keep-alive`.
-Defaults: `timeout_ms=30000`, `cli=claude`, `verify_started=1`, all others empty/0.
+Defaults preserved: `timeout_ms=30000`, `cli=claude`, `verify_started=1`, rest empty/0.
 
-Exit codes (`grep -nE 'exit [0-9]+'`, 20 live sites):
+**Exit codes** (20 live `exit` sites → 10 distinct codes):
 
-| Code | Meaning | Sites | Pinned by |
-|---|---|---|---|
-| 0 | dispatched + recorded | :176 (--help), :600, :792 | T4, T60, T94 |
-| 1 | REPL-ready timeout | via `wait_for_ready` :711 | T60 |
-| 2 | spawn failed | :672, :687, :698 | T49 |
-| 3 | inject failed / ref-prep failed | :712, :743 | T51 |
-| 4 | usage | :177, :182, :183, :497, :504, :510, :608, :615 | T59 (task-gate), T49 |
-| 5 | DELIVERY_FAILED (--verify-delivered) | :766 | T7 |
-| 6 | never registered (#727) | `wait_for_ready` → `exit $?` :711 | T60 |
-| 7 | DELIVERY_UNKNOWN / RETRY_HELD | :729, :751, :764 | T78, T79, T91 |
-| 8 | DEDUPLICATED_NO_NEW_DELIVERY | :726 | T74 |
-| 9 | DISPATCH_NOT_RECORDED | :634, :732 | T70, T78 |
+| Code | Meaning | Guard that pins it |
+|---|---|---|
+| 0 | dispatched AND recorded (+ `--help`) | T4, T60, T94 |
+| 1 | REPL-ready timeout | T60 |
+| 2 | spawn failed (`open-session.sh`, git guard) | T49 |
+| 3 | inject failed / ref-prep failed closed | T51, T67 |
+| 4 | usage (unknown arg, missing `--ref`, task-gate hard reject) | T59, T60 |
+| 5 | `DELIVERY_FAILED` under `--verify-delivered` | T7 |
+| 6 | session never registered (#727) | T60 |
+| 7 | `DELIVERY_UNKNOWN` / `RETRY_HELD` | T78, T79, T91 |
+| 8 | `DEDUPLICATED_NO_NEW_DELIVERY` | T74 |
+| 9 | `DISPATCH_NOT_RECORDED` | T70, T78 |
 
-Only stdout contract line: `OK dispatched to $sid` (:774). Everything else is stderr, all prefixed
-`dispatch.sh: `. Full stderr line inventory + guard mapping lands in the final report.
+**Output lines.** One stdout contract line: `OK dispatched to <sid>` — plus telepty's own inject stdout,
+which is tee'd through rather than swallowed (T94 case G pins that it still reaches stdout). Every other
+line is stderr, all `dispatch.sh: `-prefixed, ported verbatim including the `⚠️ Rule 33` line.
+`--help` is byte-identical to the pre-port `sed -n '2,41p'` output — diffed against a saved baseline,
+zero differences, and T60 re-asserts `AIGENTRY_DISPATCH_REGISTER_TIMEOUT_MS` + `180000` appear in it.
 
-Subprocesses kept as subprocesses with identical argv (not absorbed): `open-session.sh`,
-`boot-prepare.mjs`, `dispatch-registry.py`, `dispatch-verify.sh`, `session-probe.py`,
-`orchestrator-report-target.sh`, `emit-telemetry.mjs`, `telepty`.
+**Subprocesses — kept as subprocesses, same argv, none absorbed:** `open-session.sh`, `boot-prepare.mjs`,
+`dispatch-registry.py`, `dispatch-verify.sh`, `session-probe.py`, `orchestrator-report-target.sh`,
+`emit-telemetry.mjs`, `telepty`, `git`, `ps`. The REPL-ready probe still delegates to `session-probe.py`
+and only reads its verdict — its documented false-negatives are untouched.
 
-## 7. Not yet checked
+**State files** (`state/dispatch/active.json` etc.) — still written only by `dispatch-registry.py`.
 
-`process.platform` branch inventory, Snyk, PR/CI. No production daemon, `orchestrator` session,
-launchctl, or main-tree file was touched; all work is confined to the worktree.
+Only the inline `python3 -c` blocks became TS (sha256, `now_ms`, `telepty list` parsing, the
+verify-delivered screen analysis, the task-gate queue read, the task-ledger write). Those were the
+shell-dialect fragility this tranche targets, not components. The ledger writer keeps python's
+`json.dumps(..., ensure_ascii=False, indent=1)` shape via `JSON.stringify(data, null, 1)` plus the same
+same-dir-temp + fsync + rename, so `state/task-queue.json` diffs stay reviewable.
+
+## Entrypoint shape
+
+`bin/dispatch.sh` is the exec shim the ref specified, plus two lines that are load-bearing rather than
+decorative:
+
+```bash
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"   # was dispatch.sh:63
+DISPATCH_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"; export DISPATCH_SCRIPT_DIR
+exec node "$DISPATCH_SCRIPT_DIR/../dist/src/dispatch/cli.js" "$@"
+```
+
+`SCRIPT_DIR` is exported rather than derived from `import.meta.url` so a symlinked entrypoint resolves
+`bin/` helpers exactly as bash did. `bin/init/manifest.mjs`, the T96 ship-set agreement and every caller
+are untouched.
+
+## `process.platform` branches
+
+**Zero.** Measured: `grep -n "process.platform\|os.platform" src/dispatch/*.ts` → no matches. The shell
+had no OS-specific arm to mirror (no `uname` branch, no BSD/GNU fork) — the bash-3.2 accommodations it
+carried, like the two-branch `record_transport` that avoided expanding an empty array under `set -u`,
+are exactly the fragility that disappears rather than becoming a platform check.
+
+## Contract deletions and additions (Rule 38)
+
+1. **Deleted: `DISPATCH_SH_NO_MAIN=1` sourceable-library mode.** Measured before removing:
+   `grep -rn DISPATCH_SH_NO_MAIN` matched only `bin/dispatch.sh` itself and 12 guards under
+   `tests/dispatch/`. No caller, no other script, nothing in `bin/`. Recorded in the shim header.
+2. **Added: `AIGENTRY_DISPATCH_VERIFY_SLEEP_MS`** (default 5000), replacing the hard-coded `sleep 5` in
+   `verify_delivered`. The guards used to skip that wait by redefining the `sleep` builtin, which cannot
+   cross a process boundary. Recorded in the shim header.
+3. **Added: the internal `__probe` subcommand** — `is-ready`, `verify-delivered`, `dispatch-ref`. Not a
+   flag, not in `--help`, no caller outside `tests/dispatch/`.
+
+The 12 re-pointed guards (T4 T5 T11 T12 T13 T14 T15 T50 → `is-ready`; T6 T7 T91 → `verify-delivered`;
+T67 → `dispatch-ref`) keep their fixtures, `lib.sh`, `STUB_SCREEN_FILE` and telepty stub unchanged. All
+12 pass against the TS.
+
+## Bugs the guards caught in my port (both fixed)
+
+- **T47** — I emitted `exec -a 'codex'` where bash `printf '%q'` emits `exec -a codex`; T47
+  string-matches the launcher body. My earlier claim that no guard asserts on launcher content was wrong
+  — I had grepped only T28/T34. `shellQuote` now emits shell-safe words bare, exactly as `%q` does.
+  T47 passes both legs (codex + gemini, real spawns).
+- **T94 case H** — see the HOLD above.
+
+## What I did NOT check
+
+- `npm test` after the port — re-running now; the port adds files under `src/` that `tsc -p .` compiles,
+  and no existing test imports `src/dispatch/`, so I expect 225/225. Reported when it lands.
+- Snyk `snyk_code_scan` — not yet run.
+- PR / CI — not opened yet (blocked behind the T94 HOLD and the two runs above).
+- **Live dispatch behaviour is untested by me.** Every guard drives a stubbed `telepty`; T16/T48/T95 stay
+  skipped exactly as at baseline. The first real spawn-and-dispatch through the TS will happen when
+  someone merges this, and the paths only live dispatch exercises — `open-session.sh` spawning a real
+  workspace, `boot-prepare.mjs` role wiring end to end, the registration wait against a real daemon —
+  have no non-live coverage.
+- I did not touch the production daemon on :3848, the `orchestrator` session, launchctl, or any file in
+  the main tree; no process I did not spawn was signalled. All work is confined to the worktree.
