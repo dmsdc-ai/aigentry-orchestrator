@@ -31,6 +31,7 @@ const MANIFEST = [
   "bin/inject-handler.sh",
   "bin/install-instructions.sh",
   "bin/install-launchd.sh",
+  "bin/lib/node-shim.sh",
   "bin/lib/platform-unix.sh",
   "bin/lib/platform-windows.sh",
   "bin/lib/platform.sh",
