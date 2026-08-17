@@ -128,8 +128,13 @@ ORCH_BOOT_ARGV_RAW="$(node "$AIGENTRY_SHIM_JS" "$@")"
 # bash 3.2 (macOS CI) has no `mapfile`/`readarray`, and a here-string read loop runs in
 # THIS shell, so the array survives to the exec below.
 ORCH_EXEC_ARGV=()
+# `if` rather than `[ … ] && …`: under `set -e` a failing AND-list as the last command of
+# the loop body would abort the shim, so empty output would exit 1 in silence instead of
+# reaching the diagnostic below.
 while IFS= read -r _orch_boot_arg; do
-  [ -n "$_orch_boot_arg" ] && ORCH_EXEC_ARGV+=("$_orch_boot_arg")
+  if [ -n "$_orch_boot_arg" ]; then
+    ORCH_EXEC_ARGV+=("$_orch_boot_arg")
+  fi
 done <<< "$ORCH_BOOT_ARGV_RAW"
 
 if [ "${#ORCH_EXEC_ARGV[@]}" -eq 0 ]; then
