@@ -63,6 +63,7 @@ summary by block:
 | J | 15, 16, 26, 27 | `--help` / `-h` / `bogus` are all ignored and the pass runs; uncreatable state dir ⇒ rc 1 + stderr; the fail-OPEN counter reset (reproduced) | yes |
 | **K** | **31** | **D1** — a slashed `thread_id`, three ticks | **no — this is the fix** |
 | **L** | **34** | **D1** — a non-object JSON line, three ticks | **no — this is the fix** |
+| **N** | — | **D1** — a non-string `from`/`to` (a third poison shape, found while reviewing the port; see §6) | **no — this is the fix** |
 | M | 13 | **D2** — the garbled HOLD, verbatim (reproduced) | yes |
 
 **Parity is re-runnable, not claimed.** Verified in all four directions:
@@ -118,8 +119,9 @@ T1/T1b/T2a/T2c/T3a and both sibling T4s.
 
 ### D1 — FIXED on the orchestrator's GO
 
-One untrusted peer-inject line permanently disabled the guardrail. Two poison
-shapes, both reachable without authentication:
+One untrusted peer-inject line permanently disabled the guardrail. **Three** poison
+shapes, all reachable without authentication — the disposition found two, and the
+third turned up while reviewing the port:
 
 * a line that is valid JSON but **not an object** — `json.loads` succeeds, so the
   `try/except` written to skip bad lines never fires, and `rec.get` raises one line
@@ -127,7 +129,13 @@ shapes, both reachable without authentication:
 * an envelope whose **`thread_id` contains `/`** — the state path was built from it
   unvalidated (`bash :135`), which is also a path-traversal vector into
   `state/session-comms`. `bin/ask.sh:179` builds the same path from an unvalidated
-  `--thread`, so a human typing `899/t4` was enough.
+  `--thread`, so a human typing `899/t4` was enough;
+* a **non-string `from` or `to`** — `"__".join(sorted([rec_from, rec_to]))`
+  (`bash :179`) raised `TypeError: '<' not supported between instances of 'str' and
+  'int'` on `{"from":123,…}`. Neither the record read nor the state path: the
+  pairkey build. Found late, which is itself the argument for the fix over a
+  reproduce — three shapes in one 226-line file means the enumeration was never
+  going to be complete, and the fault isolation covers the ones nobody found.
 
 Under `set -e` the traceback killed the pass **before the cursor was written**.
 Measured over three consecutive ticks:
@@ -149,9 +157,11 @@ re-injected the same HOLD into the orchestrator inbox once a minute forever, wit
 emits `peer_audit_record_skipped` and the pass continues — the **cursor still
 advances**, and `inPolicy()` refuses a `thread_id` containing `/` (or equal to
 `.`/`..`) as the malformed envelope it is, so it is escalated *and* the state path
-can no longer name a file outside `SESSION_COMMS_DIR`. Rows 1-30 and 32-36 are
-byte-unchanged; rows 31 and 34 become rc 0 plus a HOLD / a recorded skip.
-T122 blocks K and L, three ticks each, from both sides.
+can no longer name a file outside `SESSION_COMMS_DIR`. A non-string sid reads as `""`
+rather than crashing (which then meets D2's reproduced field collapse, consistently
+with block M). Rows 1-30 and 32-36 are byte-unchanged; rows 31 and 34 become rc 0
+plus a HOLD / a recorded skip. T122 blocks K, L and N — three ticks each for K and
+L — asserting each side's behaviour under `COMMS_PARITY_ORIGINAL`.
 
 ### D2 — REPRODUCED
 
