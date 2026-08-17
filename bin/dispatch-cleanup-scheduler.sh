@@ -1,231 +1,63 @@
 #!/usr/bin/env bash
-# dispatch-cleanup-scheduler.sh — Layer D timeout fallback (ADR 2026-05-20).
+# dispatch-cleanup-scheduler.sh — CLI-compatible exec shim onto the TypeScript
+#                                 implementation (#899 tranche 4). Verbs, flags,
+#                                 exit codes (0/1/4), stdout/stderr lines and
+#                                 subprocess argv are unchanged; `--help` still
+#                                 prints the Layer-D documentation, which now lives
+#                                 in src/cleanup-scheduler/usage.ts — all 37 lines
+#                                 of it, `set -euo pipefail` and the PATH line
+#                                 included, because `sed -n '2,38p'` printed those
+#                                 too and that is what operators have been reading.
 #
-# Maintains state/dispatch/cleanup-pending.json — an array of records:
+# Contract changes recorded here (Rule 38 — what was measured):
+#   * SOURCEABILITY WAS NEVER USED, so nothing was removed for it and there is NO
+#     `__probe` surface. Measured before the port:
+#     `grep -n '^\s*\(\.\|source\)\s.*dispatch-cleanup-scheduler.sh' tests/` matches
+#     nothing — all six guards (T17 T19 T20 T21 T22 T76) invoke it as a subprocess,
+#     as do bin/inject-handler.sh and src/reconciler/cli.ts:1318.
+#   * THIS SCRIPT SOURCED NO LIBS (zero `.`/`source` lines), so unlike tranches 2a/2c
+#     there is no `bash -c '. lib; fn'` door and no bin/wh-cli.sh verb here. Its two
+#     children stay children with identical argv: bin/dispatch-registry.py
+#     (`get --sid <sid> --pointer keep_alive`, both fail-CLOSED arms intact) and
+#     bin/session-cleanup.sh (`<sid>`, behind the same `[ -x ]` gate) — the latter is
+#     a TS shim itself now (tranche 2a), and calling it in-process would fork the
+#     Rule 28 protected-sid refusal.
+#   * TWO PRE-EXISTING DEFECTS ARE FIXED RATHER THAN REPRODUCED, on the
+#     orchestrator's decision (docs/reports/2026-08-17-899-t4-scheduler-disposition.md
+#     §7 has the measurements; both are Fail-Fast-over-literal-parity calls):
+#       D1 A non-numeric `--grace-seconds`/`--minutes` used to truncate
+#          state/dispatch/cleanup-pending.json to ZERO BYTES — the whole fleet's
+#          pending Layer-D queue, silently, reachable from an unauthenticated inject
+#          payload via bin/inject-handler.sh:130-134. The integer is now validated
+#          before the file is touched: same exit 1, same empty stdout, one stderr
+#          line naming the flag, and the queue byte-unchanged (tests/dispatch/T120
+#          block I). Validating that payload at the trust boundary is
+#          inject-handler's own ticket.
+#       D2 `list` had never run on any CPython (a backslash inside an f-string
+#          expression is a compile-time SyntaxError), so the verb was dead from
+#          b7829ec onward with zero callers. It now prints the format the code
+#          intended and exits 0 (T120 block J pins it).
+#   * The two-layout dist resolution is bin/lib/node-shim.sh's, shared with
+#     dispatch.sh, dispatch-tracker.sh, session-cleanup.sh, session-reconciler.sh,
+#     hitl.sh and open-session.sh; tests/dispatch/T121 pins the workspace layout for
+#     this one.
 #
-#   {
-#     "sid": "<session-id>",
-#     "report_time": "<iso8601>",
-#     "scheduled_cleanup_time": "<iso8601>",
-#     "source": "layer-d-timeout" | "reconciler" | "explicit-request",
-#     "preempt_reason": "<optional, set when EXTEND_LIFETIME deferred>"
-#   }
-#
-# Atomic writes via tmpfile+mv (avoids partial state on crash — pattern #114).
-#
-# Commands:
-#   dispatch-cleanup-scheduler.sh schedule <sid> [--grace-seconds N] [--source S] [--reason TEXT]
-#       Append a pending record. Default grace 60s. Default source layer-d-timeout.
-#       Idempotent on sid: replaces existing pending record for the same sid.
-#       Skips if the dispatch record has keep_alive=true.
-#
-#   dispatch-cleanup-scheduler.sh cancel <sid>
-#       Remove any pending record for sid. Used when EXTEND_LIFETIME arrives.
-#
-#   dispatch-cleanup-scheduler.sh defer <sid> --minutes N [--reason TEXT]
-#       Push scheduled_cleanup_time by N minutes. Creates record if absent.
-#
-#   dispatch-cleanup-scheduler.sh tick
-#       For each pending record past scheduled_cleanup_time, invoke
-#       bin/session-cleanup.sh <sid> and drop the record.
-#
-#   dispatch-cleanup-scheduler.sh list
-#       Pretty-print current pending records.
-#
-# Exit codes: 0 OK, 4 usage.
-
+# THE PATH HARDENING STAYS HERE, IN BASH, and byte-identical. It is what puts
+# `python3` on PATH for bin/dispatch-registry.py's shebang and `node` on PATH for the
+# bin/session-cleanup.sh child — both are launched by the node process, so a copy
+# inside TS would leave one process generation running with the caller's PATH. This
+# script is also reached from launchd via `src/reconciler/cli.ts` every 60s, where
+# the inherited PATH is minimal. (Unlike session-cleanup.sh, which must NOT harden
+# PATH — see task #400 in its header — this script never runs `telepty`, so the
+# stale-homebrew-CLI hazard that argument is about cannot apply here.)
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+# Resolved exactly as the shell script's SCRIPT_DIR was, so a symlinked entrypoint
+# still locates bin/ helpers (dispatch-registry.py, session-cleanup.sh).
+AIGENTRY_SHIM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+export AIGENTRY_SHIM_SCRIPT_DIR
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
-STATE_DIR="${DISPATCH_STATE_DIR:-$REPO_DIR/state/dispatch}"
-PENDING_JSON="$STATE_DIR/cleanup-pending.json"
-DISPATCH_REGISTRY_PY="${DISPATCH_REGISTRY_PY:-$SCRIPT_DIR/dispatch-registry.py}"
-SESSION_CLEANUP_SH="${SESSION_CLEANUP_SH:-$SCRIPT_DIR/session-cleanup.sh}"
-NOW_OVERRIDE="${SCHEDULER_NOW:-}"
-
-mkdir -p "$STATE_DIR"
-[ -f "$PENDING_JSON" ] || printf '[]\n' > "$PENDING_JSON"
-
-usage() { sed -n '2,38p' "$0"; exit "${1:-0}"; }
-
-now_iso() {
-  if [ -n "$NOW_OVERRIDE" ]; then printf '%s' "$NOW_OVERRIDE"; return; fi
-  python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00","Z"))'
-}
-
-# atomic_write_json <path> — read stdin as the new content; write tmp + mv.
-atomic_write_json() {
-  local path="$1" tmp
-  tmp=$(mktemp "${path}.tmp.XXXXXX")
-  cat > "$tmp"
-  mv "$tmp" "$path"
-}
-
-# is_keep_alive <sid> — 0 when the dispatch opted out of automatic cleanup.
-# telepty#60 Stage A: read through the schema-validating registry component and
-# fail CLOSED. A corrupt or unavailable registry used to read as "not keep-alive",
-# i.e. as permission to clean up a session it could not actually see.
-is_keep_alive() {
-  local sid="$1" out
-  [ -x "$DISPATCH_REGISTRY_PY" ] || return 0
-  if ! out=$("$DISPATCH_REGISTRY_PY" get --sid "$sid" --pointer keep_alive 2>/dev/null); then
-    return 0
-  fi
-  [ "$out" = "true" ]
-}
-
-cmd_schedule() {
-  local sid="" grace=60 source="layer-d-timeout" reason="" report_time
-  [ "${1:-}" = "" ] && { echo "schedule: <sid> required" >&2; exit 4; }
-  sid="$1"; shift
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --grace-seconds) grace="$2"; shift 2;;
-      --source) source="$2"; shift 2;;
-      --reason) reason="$2"; shift 2;;
-      *) echo "schedule: unknown $1" >&2; exit 4;;
-    esac
-  done
-  if is_keep_alive "$sid"; then
-    echo "[scheduler] keep_alive=true for $sid — skipping Layer D schedule"
-    return 0
-  fi
-  report_time=$(now_iso)
-  SID="$sid" REPORT_TIME="$report_time" GRACE="$grace" SRC="$source" REASON="$reason" \
-    PENDING_JSON="$PENDING_JSON" python3 - <<'PY' | atomic_write_json "$PENDING_JSON"
-import json, os, datetime
-path = os.environ["PENDING_JSON"]
-try: pending = json.load(open(path))
-except Exception: pending = []
-sid = os.environ["SID"]
-rt  = os.environ["REPORT_TIME"]
-g   = int(os.environ["GRACE"])
-src = os.environ["SRC"]
-reason = os.environ["REASON"]
-dt = datetime.datetime.fromisoformat(rt.replace("Z","+00:00"))
-sched = (dt + datetime.timedelta(seconds=g)).isoformat(timespec="seconds").replace("+00:00","Z")
-pending = [p for p in pending if p.get("sid") != sid]
-rec = {"sid": sid, "report_time": rt, "scheduled_cleanup_time": sched, "source": src}
-if reason: rec["preempt_reason"] = reason
-pending.append(rec)
-print(json.dumps(pending, indent=2, ensure_ascii=False))
-PY
-  echo "[scheduler] scheduled cleanup sid=$sid in ${grace}s (source=$source)"
-}
-
-cmd_cancel() {
-  local sid="${1:-}"
-  [ -z "$sid" ] && { echo "cancel: <sid> required" >&2; exit 4; }
-  SID="$sid" PENDING_JSON="$PENDING_JSON" python3 - <<'PY' | atomic_write_json "$PENDING_JSON"
-import json, os
-try: pending = json.load(open(os.environ["PENDING_JSON"]))
-except Exception: pending = []
-sid = os.environ["SID"]
-pending = [p for p in pending if p.get("sid") != sid]
-print(json.dumps(pending, indent=2, ensure_ascii=False))
-PY
-  echo "[scheduler] cancelled pending cleanup for $sid"
-}
-
-cmd_defer() {
-  local sid="${1:-}" minutes="" reason=""
-  [ -z "$sid" ] && { echo "defer: <sid> required" >&2; exit 4; }
-  shift
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --minutes) minutes="$2"; shift 2;;
-      --reason) reason="$2"; shift 2;;
-      *) echo "defer: unknown $1" >&2; exit 4;;
-    esac
-  done
-  [ -z "$minutes" ] && { echo "defer: --minutes required" >&2; exit 4; }
-  local now; now=$(now_iso)
-  SID="$sid" MIN="$minutes" REASON="$reason" NOW="$now" PENDING_JSON="$PENDING_JSON" \
-    python3 - <<'PY' | atomic_write_json "$PENDING_JSON"
-import json, os, datetime
-path = os.environ["PENDING_JSON"]
-try: pending = json.load(open(path))
-except Exception: pending = []
-sid = os.environ["SID"]
-mins = int(os.environ["MIN"])
-now = os.environ["NOW"]
-reason = os.environ["REASON"]
-existing = next((p for p in pending if p.get("sid") == sid), None)
-ndt = datetime.datetime.fromisoformat(now.replace("Z","+00:00"))
-new_sched = (ndt + datetime.timedelta(minutes=mins)).isoformat(timespec="seconds").replace("+00:00","Z")
-if existing:
-    existing["scheduled_cleanup_time"] = new_sched
-    existing["source"] = "explicit-request"
-    if reason: existing["preempt_reason"] = reason
-else:
-    rec = {"sid": sid, "report_time": now, "scheduled_cleanup_time": new_sched, "source": "explicit-request"}
-    if reason: rec["preempt_reason"] = reason
-    pending.append(rec)
-print(json.dumps(pending, indent=2, ensure_ascii=False))
-PY
-  echo "[scheduler] deferred cleanup for $sid by ${minutes}m"
-}
-
-cmd_tick() {
-  local now; now=$(now_iso)
-  local fired=0
-  local snap; snap=$(mktemp)
-  PENDING_JSON="$PENDING_JSON" NOW="$now" python3 - > "$snap" <<'PY'
-import json, os, datetime, sys
-try: pending = json.load(open(os.environ["PENDING_JSON"]))
-except Exception: pending = []
-now = os.environ["NOW"]
-ndt = datetime.datetime.fromisoformat(now.replace("Z","+00:00"))
-for p in pending:
-    sched = p.get("scheduled_cleanup_time","")
-    try:
-        sdt = datetime.datetime.fromisoformat(sched.replace("Z","+00:00"))
-    except Exception:
-        continue
-    if ndt >= sdt:
-        print(p["sid"])
-PY
-  while IFS= read -r sid; do
-    [ -z "$sid" ] && continue
-    if [ -x "$SESSION_CLEANUP_SH" ]; then
-      "$SESSION_CLEANUP_SH" "$sid" || echo "[scheduler] cleanup non-zero for $sid"
-    else
-      echo "[scheduler] session-cleanup.sh not executable at $SESSION_CLEANUP_SH" >&2
-    fi
-    cmd_cancel "$sid" >/dev/null
-    fired=$((fired + 1))
-  done < "$snap"
-  rm -f "$snap"
-  echo "[scheduler] tick fired=$fired"
-}
-
-cmd_list() {
-  python3 -c '
-import json,sys
-try: pending = json.load(open(sys.argv[1]))
-except Exception: pending = []
-for p in pending:
-    src = p.get("source","?")
-    pr  = p.get("preempt_reason","")
-    extra = f" reason={pr}" if pr else ""
-    print(f"{p.get(\"sid\",\"?\"):40s} scheduled={p.get(\"scheduled_cleanup_time\",\"?\")} src={src}{extra}")
-' "$PENDING_JSON"
-}
-
-main() {
-  [ $# -eq 0 ] && usage 4
-  local cmd="$1"; shift
-  case "$cmd" in
-    schedule)   cmd_schedule "$@";;
-    cancel)     cmd_cancel "$@";;
-    defer)      cmd_defer "$@";;
-    tick)       cmd_tick "$@";;
-    list)       cmd_list "$@";;
-    -h|--help)  usage 0;;
-    *) echo "unknown: $cmd" >&2; usage 4;;
-  esac
-}
-
-main "$@"
+# shellcheck source=lib/node-shim.sh
+. "$AIGENTRY_SHIM_SCRIPT_DIR/lib/node-shim.sh"
+aigentry_node_shim dispatch-cleanup-scheduler.sh dist/src/cleanup-scheduler/cli.js
+exec node "$AIGENTRY_SHIM_JS" "$@"
