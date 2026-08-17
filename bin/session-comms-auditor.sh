@@ -1,226 +1,86 @@
 #!/usr/bin/env bash
-# session-comms-auditor.sh — orchestrator-side PEER-LANE auditor (#533 Phase 1).
-#
-# ADR/spec: docs/adr/2026-06-07-session-comms-guardrail.md
-#           docs/superpowers/specs/2026-06-07-session-comms-guardrail.md §4
-#
-# Runs on the existing reconcile tick (wired from session-reconciler.sh — no new
-# daemon, §1 경량). Tails telepty's peer-inject log and classifies each
-# non-orchestrator↔non-orchestrator inject with the structural envelope predicate
-# (§2.3 — whitelist, NOT NLP):
-#   • orchestrator-lane injects (from/to == orchestrator) → IGNORED.
-#   • in-policy ask-request/ask-reply emitted via raw inject → RECONCILE the round
-#     counter (so the cap still holds) + telemetry peer_ask_reconciled.
-#   • out-of-policy (no envelope / malformed / work-order shape) → telemetry
-#     peer_inject_out_of_policy + a HOLD pushed to the orchestrator inbox naming
-#     {from,to,excerpt} (Phase 1 is warn-only — detect/count/escalate, NEVER
-#     hard-block in-band; the inject already happened. Daemon hard-block = Phase 2,
-#     telepty#18).
-#
-# The peer-inject log is NEVER consumed/cleared (warn-mode). A byte-offset cursor
-# avoids re-flagging already-audited injects on subsequent ticks.
-#
-# Article 17 (무의존): pure bash + python3 stdlib + telepty. No npm runtime deps.
+# session-comms-auditor.sh — CLI-compatible exec shim onto the TypeScript
+#                            implementation (#899 tranche 4). It takes no arguments
+#                            and never did; exit codes (0 pass complete, 5 one or
+#                            more HOLD escalations could not be delivered), stderr
+#                            lines, telemetry bytes, state-file bytes, the byte
+#                            cursor and the `telepty inject` argv are unchanged.
 #
 # Usage: session-comms-auditor.sh   # one audit pass over new peer-inject log lines
-# Exit codes: 0 pass complete, 5 one or more HOLD escalations could not be delivered.
+#
+# Contract changes recorded here (Rule 38 — what was measured). The reproductions
+# are in docs/reports/2026-08-17-899-t4-comms-auditor-disposition.md §7:
+#
+#   * SOURCEABILITY WAS NEVER USED, so nothing was removed for it and there is NO
+#     `__probe` surface. Measured before the port:
+#     `grep -rn '^\s*\(\.\|source\)\s.*session-comms-auditor\.sh' tests/` matches
+#     nothing — both guards (T45, T91) invoke it as a subprocess, as does
+#     src/reconciler/cli.ts:1292-1293 (tick step 0c, `TELEPTY` in the child env, no
+#     argv). Nothing under bin/ invokes it at all.
+#   * THIS SCRIPT SOURCED NO LIBS (zero `.`/`source` lines), so unlike tranches
+#     2a/2c there is no `bash -c '. lib; fn'` door and no bin/wh-cli.sh verb. Its
+#     one child stays a child with identical argv: `"$TELEPTY" inject --submit
+#     <orch-sid> "<one text argument>"` — the HOLD text stays ONE argv element, so
+#     an attacker-controlled excerpt can never become a flag or a word split.
+#   * THERE IS NO usage.ts AND NO `--help`, unlike every sibling shim. Measured:
+#     the shell script read no argv whatsoever
+#     (`grep -nE '\$[1-9]|\$@|\$\*|\$#|getopts|case "\$'` matched nothing), and
+#     `--help` and `bogus --x` each ran a full audit pass. There was no --help
+#     surface to move into a usage.ts, and inventing one would be a contract change
+#     Rule 29 does not license. Every sibling has a usage.ts because every sibling
+#     had a `usage()`; this one did not.
+#   * ONE PRE-EXISTING DEFECT IS FIXED rather than reproduced, on the
+#     orchestrator's decision (disposition §7 D1 has the 3-tick reproduction):
+#       D1 One untrusted peer-inject line PERMANENTLY disabled this guardrail. A
+#          line that is valid JSON but not an object, or an envelope whose
+#          `thread_id` contained `/`, killed the python pass with a traceback
+#          BEFORE the byte cursor was written — so every later peer inject went
+#          unaudited forever, the pre-poison violation re-injected the SAME HOLD
+#          into the orchestrator inbox every 60s, and src/reconciler/cli.ts:1293
+#          folded it into one `ERR comms-auditor non-zero (continuing)` line. One
+#          inject bought an unaudited peer lane. Each record now classifies inside
+#          its own try/catch (an unexpected throw emits
+#          `peer_audit_record_skipped`), the cursor still advances, and a
+#          `thread_id` containing `/` — a path-traversal vector into
+#          state/session-comms — is refused as the malformed envelope it is and
+#          escalated. tests/dispatch/T122 blocks K and L.
+#   * TWO DEFECTS ARE REPRODUCED, NOT FIXED (Rule 29), both named in
+#     src/comms-auditor/cli.ts's header with their measurements: D2, an empty
+#     `from`/`to` collapses the tab-delimited HOLD fields so the HOLD names the
+#     excerpt as the sender (T122 block M pins the garbled text); and the
+#     fail-OPEN that silently replaces an unparseable `<pairkey>__<thread>.json`
+#     with a fresh `rounds: 1` record.
+#   * TWO DEVIATIONS ARE NAMED, NOT SILENT: D3, the bash `fcntl.flock` is not
+#     reproduced because it was measured DECORATIVE (3/3 runs: it waits 1.53s and
+#     still loses the update, since `os.replace` swaps the inode the lock is held
+#     on — `rounds: 1`, not 2). The two-writer fix spans bin/ask.sh, which is not
+#     this task's Rule 29 surface, and is the orchestrator's own ticket. D4, the
+#     excerpt of a non-string body renders JSON-style rather than python's
+#     `str(dict)`, because JSON.parse cannot tell `1.0` from `1`.
+#   * The two-layout dist resolution is bin/lib/node-shim.sh's, shared with
+#     dispatch.sh, dispatch-tracker.sh, session-cleanup.sh, session-reconciler.sh,
+#     hitl.sh, open-session.sh and dispatch-cleanup-scheduler.sh;
+#     tests/dispatch/T123 pins the workspace layout for this one.
+#
+# THE PATH HARDENING STAYS HERE, IN BASH, and byte-identical. It is what resolves
+# the default literal `telepty` for the node process's child, and this script is
+# reached from launchd via src/reconciler/cli.ts every 60s, where the inherited PATH
+# is minimal. NAMED TENSION, pre-existing, mentioned not changed (Rule 29):
+# bin/session-cleanup.sh:34-41 records that a hardcoded `/opt/homebrew/bin` prefix
+# is exactly what made task #400 pick a stale homebrew telepty against an older
+# daemon. This script has carried that prefix since #533 and does run `telepty`, so
+# the same hazard applies to it; removing the prefix is a separate call with its own
+# blast radius. Both guards are immune either way because tests/dispatch/lib.sh:45
+# exports an absolute `TELEPTY`, which wins over PATH.
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+# Resolved exactly as the shell script's SCRIPT_DIR was, so a symlinked entrypoint
+# still resolves — and so a control workspace audits its OWN state/session-comms
+# and state/dispatch rather than the installed package's (T123).
+AIGENTRY_SHIM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+export AIGENTRY_SHIM_SCRIPT_DIR
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
-TELEPTY="${TELEPTY:-telepty}"
-SESSION_COMMS_DIR="${SESSION_COMMS_DIR:-$REPO_DIR/state/session-comms}"
-TELE="$SESSION_COMMS_DIR/telemetry.jsonl"
-CURSOR="$SESSION_COMMS_DIR/.audit-cursor"
-PEER_INJECT_LOG="${AIGENTRY_PEER_INJECT_LOG:-$REPO_DIR/state/dispatch/peer-injects.jsonl}"
-ROUND_CAP="${PEER_ROUND_CAP:-3}"
-ORCH_SIDS="${AIGENTRY_ORCHESTRATOR_SIDS:-orchestrator aigentry-orchestrator-claude}"
-
-now_iso() {
-  if [ -n "${AUDITOR_NOW:-}" ]; then printf '%s' "$AUDITOR_NOW"; return; fi
-  python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00","Z"))'
-}
-
-# Dormant when there is nothing to tail — the always-safe no-op (cf. the
-# reconciler's surface_* consumers).
-[ -f "$PEER_INJECT_LOG" ] || exit 0
-mkdir -p "$SESSION_COMMS_DIR"
-
-# Classify + reconcile in one python pass. Writes telemetry directly; reconciles
-# in-policy round counters (flock-atomic, matching ask.sh); prints one
-# "HOLD\t<from>\t<to>\t<excerpt>" line per out-of-policy inject for the shell to
-# route upward. Advances the byte cursor so re-ticks don't re-flag.
-holds=$(SESSION_COMMS_DIR="$SESSION_COMMS_DIR" TELE="$TELE" CURSOR="$CURSOR" \
-  PEER_INJECT_LOG="$PEER_INJECT_LOG" CAP="$ROUND_CAP" ORCH_SIDS="$ORCH_SIDS" \
-  NOW="$(now_iso)" python3 - <<'PY'
-import fcntl, json, os, re
-
-log_path = os.environ["PEER_INJECT_LOG"]
-cursor_path = os.environ["CURSOR"]
-tele_path = os.environ["TELE"]
-comms_dir = os.environ["SESSION_COMMS_DIR"]
-cap = int(os.environ["CAP"])
-now = os.environ["NOW"]
-orch = set(os.environ["ORCH_SIDS"].split())
-
-# byte-offset cursor (reset if the log shrank/rotated)
-size = os.path.getsize(log_path)
-start = 0
-try:
-    start = int(open(cursor_path).read().strip() or "0")
-except Exception:
-    start = 0
-if start > size:
-    start = 0
-
-FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
-MD_REQ = re.compile(r"^ASK_REQUEST:\s*(?P<to>\S+)\s*\|\s*from:\s*(?P<from>\S+)\s*\|\s*thread:\s*(?P<thread>\S+)\s*\|\s*round:\s*(?P<round>\d+)\s*\|\s*q:\s*(?P<body>.*)$")
-MD_REP = re.compile(r"^ASK_REPLY:\s*(?P<to>\S+)\s*\|\s*from:\s*(?P<from>\S+)\s*\|\s*thread:\s*(?P<thread>\S+)\s*\|\s*round:\s*(?P<round>\d+)\s*\|\s*a:\s*(?P<body>.*)$")
-
-
-def extract_envelope(body):
-    """Return a dict envelope from the inject body, or None. Fenced JSON first,
-    then raw JSON, then the markdown ASK_REQUEST/ASK_REPLY fallback (§2)."""
-    if not isinstance(body, str):
-        return None
-    m = FENCE.search(body)
-    candidate = m.group(1) if m else body.strip()
-    try:
-        obj = json.loads(candidate)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-    for line in body.splitlines():
-        line = line.strip()
-        mr = MD_REQ.match(line) or MD_REP.match(line)
-        if mr:
-            kind = "ask-request" if line.startswith("ASK_REQUEST") else "ask-reply"
-            d = mr.groupdict()
-            env = {"kind": kind, "from": d["from"], "to": d["to"],
-                   "thread_id": d["thread"], "round": int(d["round"])}
-            env["question" if kind == "ask-request" else "answer"] = d["body"]
-            return env
-    return None
-
-
-def in_policy(env, rec_from, rec_to):
-    """§2.3 validity predicate — structural whitelist, not semantic."""
-    if not isinstance(env, dict):
-        return False
-    if env.get("kind") not in ("ask-request", "ask-reply"):
-        return False
-    if env.get("from") != rec_from or env.get("to") != rec_to:
-        return False
-    if not env.get("thread_id"):
-        return False
-    rnd = env.get("round")
-    if not isinstance(rnd, int) or rnd < 1 or rnd > cap:
-        return False
-    return True
-
-
-def emit_tele(reason, rec_from, rec_to, thread, pairkey, excerpt=""):
-    with open(tele_path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps({
-            "ts": now, "event": "peer_comms_audit", "reason": reason,
-            "from": rec_from, "to": rec_to, "thread": thread,
-            "pairkey": pairkey, "excerpt": excerpt[:120],
-        }, ensure_ascii=False) + "\n")
-
-
-def reconcile(env, pairkey, thread):
-    """Reconcile a raw-inject in-policy envelope into the round counter (flock)."""
-    path = os.path.join(comms_dir, "%s__%s.json" % (pairkey, thread))
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
-    with os.fdopen(fd, "r+") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        try:
-            st = json.load(fh)
-        except Exception:
-            st = {}
-        st.setdefault("pairkey", pairkey)
-        st.setdefault("thread_id", thread)
-        st.setdefault("rounds", 0)
-        st.setdefault("parties", sorted([env["from"], env["to"]]))
-        st.setdefault("status", "open")
-        st.setdefault("escalated", False)
-        if env["kind"] == "ask-request" and st["rounds"] < cap:
-            st["rounds"] += 1
-        st["last_kind"] = env["kind"] + "(reconciled)"
-        st["last_round_at"] = now
-        tmp = path + ".tmp.%d" % os.getpid()
-        with open(tmp, "w", encoding="utf-8") as out:
-            json.dump(st, out, indent=2, ensure_ascii=False)
-            out.write("\n")
-        os.replace(tmp, path)
-
-
-holds = []
-with open(log_path, encoding="utf-8") as fh:
-    fh.seek(start)
-    for raw in fh:
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            rec = json.loads(raw)
-        except Exception:
-            continue
-        rec_from = rec.get("from", "")
-        rec_to = rec.get("to", "")
-        body = rec.get("body", "")
-        # ORCH LANE → out of scope (untouched; never classified/logged).
-        if rec_from in orch or rec_to in orch:
-            continue
-        env = extract_envelope(body)
-        if in_policy(env, rec_from, rec_to):
-            pairkey = "__".join(sorted([rec_from, rec_to]))
-            thread = env["thread_id"]
-            reconcile(env, pairkey, thread)
-            emit_tele("peer_ask_reconciled", rec_from, rec_to, thread, pairkey)
-        else:
-            pairkey = "__".join(sorted([rec_from, rec_to])) if rec_from and rec_to else ""
-            excerpt = " ".join(str(body).split())[:120]
-            emit_tele("peer_inject_out_of_policy", rec_from, rec_to, "", pairkey, excerpt)
-            holds.append("\t".join(["HOLD", rec_from, rec_to, excerpt]))
-
-with open(cursor_path, "w") as cf:
-    cf.write(str(size))
-
-for h in holds:
-    print(h)
-PY
-)
-
-# Route each out-of-policy inject upward: a HOLD into the orchestrator inbox so the
-# orchestrator (HITL) can correct the worker. Phase 1 cannot block in-band; it
-# detects + escalates.
-#
-# #835 — this used to end in `|| true`, and the byte cursor was ALREADY advanced by
-# the pass above. A refused inject therefore lost the escalation permanently: the
-# line is never re-read, so no later tick re-raises it, and the auditor still exited
-# 0. "Telemetry already recorded it" is not a substitute — telemetry is a file
-# nobody is watching; the HOLD is the part that reaches a human. The failure is
-# counted and carried into a non-zero exit, which is the only channel that survives
-# the reconciler's `>/dev/null 2>&1` on this call.
-orch_sid="${ORCH_SIDS%% *}"
-undelivered=0
-if [ -n "$holds" ]; then
-  while IFS=$'\t' read -r _tag h_from h_to h_excerpt; do
-    [ "$_tag" = "HOLD" ] || continue
-    if ! "$TELEPTY" inject --submit "$orch_sid" \
-      "HOLD: peer-lane out-of-policy inject | from: $h_from | to: $h_to | excerpt: $h_excerpt" \
-      >/dev/null 2>&1; then
-      undelivered=$((undelivered + 1))
-      echo "session-comms-auditor: HOLD UNDELIVERED to '$orch_sid' (from=$h_from to=$h_to) — telepty inject exited non-zero and the audit cursor has already advanced, so this violation will not be re-raised" >&2
-    fi
-  done <<< "$holds"
-fi
-
-if [ "$undelivered" -gt 0 ]; then
-  echo "session-comms-auditor: $undelivered escalation(s) undelivered" >&2
-  exit 5
-fi
-exit 0
+# shellcheck source=lib/node-shim.sh
+. "$AIGENTRY_SHIM_SCRIPT_DIR/lib/node-shim.sh"
+aigentry_node_shim session-comms-auditor.sh dist/src/comms-auditor/cli.js
+exec node "$AIGENTRY_SHIM_JS" "$@"
