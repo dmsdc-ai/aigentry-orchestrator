@@ -160,6 +160,16 @@ chmod +x "$CURL_STUB"
 
 printf '200' > "$CURL_CODE"
 
+# A daemon listing that holds no record for OUR sid, for the blocks whose subject is the
+# guard or the exec rather than the reconcile: the pre-flight then takes its "nothing to
+# reconcile" arm and issues no DELETE. A record for an unrelated worker rather than an
+# empty array, both because it is the more realistic shape and because tests/dispatch/T69
+# §8.7 forbids seeding a bare root array anywhere in this subtree.
+no_orch_listing() {
+  printf '[{"id":"some-worker","command":"claude","healthStatus":"CONNECTED","active_clients":1}]' \
+    > "$LIST_JSON"
+}
+
 export SINGLETON_PS_CMD="$PS_STUB" KILL_CMD="$KILL_STUB"
 export TELEPTY="$TELEPTY_STUB" CURL="$CURL_STUB"
 export ORCHESTRATOR_SID="$SID"
@@ -232,7 +242,7 @@ boot_with_exec() {
 }
 
 reset; : > "$EXEC_LOG"; : > "$EXEC_PID"
-printf '[]' > "$LIST_JSON"
+no_orch_listing
 N_ERR="$T_TMP/n.err"
 SINGLETON_PS_CMD="$PS_ANCESTRY_STUB" PATH="$EXEC_DIR:$PATH" boot_with_exec 2>"$N_ERR" >/dev/null \
   || fail "N: the boot exited non-zero: $(cat "$N_ERR")"
@@ -300,7 +310,7 @@ grep -qE -- '["'"'"']-9["'"'"']|kill.*-9|-9 ' "$P_SRC" || fail "P: no SIGKILL (-
 #    the SAME process.
 # ===========================================================================
 reset; : > "$EXEC_LOG"; : > "$EXEC_PID"
-printf '[]' > "$LIST_JSON"
+no_orch_listing
 : > "$PS_TABLE"
 SINGLETON_SELF_PID=9999 PATH="$EXEC_DIR:$PATH" boot_with_exec >/dev/null 2>&1
 runner="$(cat "$RUNNER_PID")"
@@ -327,13 +337,13 @@ fi
 # ===========================================================================
 if [ "$ORIGINAL" = "1" ]; then
   reset; : > "$EXEC_LOG"
-  : > "$PS_TABLE"; printf '[]' > "$LIST_JSON"
+  : > "$PS_TABLE"; no_orch_listing
   R_OUT="$T_TMP/r.out"
   SINGLETON_SELF_PID=9999 PATH="$EXEC_DIR:$PATH" bash "$BOOT" >"$R_OUT" 2>/dev/null
   [ -s "$R_OUT" ] && fail "R: the original wrote to stdout: $(cat "$R_OUT")"
 else
   reset
-  : > "$PS_TABLE"; printf '[]' > "$LIST_JSON"
+  : > "$PS_TABLE"; no_orch_listing
   R_OUT="$T_TMP/r.out"
   SINGLETON_SELF_PID=9999 node "$REPO_ROOT/dist/src/orchestrator-boot/cli.js" >"$R_OUT" 2>/dev/null
   want="$(printf 'telepty\nallow\n--id\n%s\n--auto-restart\nclaude\n--dangerously-skip-permissions\n--continue\n' "$SID")"
@@ -346,7 +356,7 @@ fi
 # ===========================================================================
 CTRL_SID="$(printf 'orch\nboot')"
 reset; : > "$EXEC_LOG"
-: > "$PS_TABLE"; printf '[]' > "$LIST_JSON"
+: > "$PS_TABLE"; no_orch_listing
 S_ERR="$T_TMP/s.err"
 set +e
 ORCHESTRATOR_SID="$CTRL_SID" SINGLETON_SELF_PID=9999 PATH="$EXEC_DIR:$PATH" \
