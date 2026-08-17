@@ -1,15 +1,25 @@
 #!/usr/bin/env bash
 # T40 — bin/orchestrator-boot.sh singleton guard (#539).
-# HERMETIC: the guard is sourced (main NOT exec'd) and driven with a STUBBED
-# process lister (SINGLETON_PS_CMD → fixture table), a STUBBED killer (KILL_CMD →
-# call recorder) and an overridable SINGLETON_SELF_PID. NO real process is ever
-# listed or killed. Asserts:
+# HERMETIC: the guard is driven through `__probe` (main is NEVER reached, so nothing
+# is ever exec'd) with a STUBBED process lister (SINGLETON_PS_CMD → fixture table), a
+# STUBBED killer (KILL_CMD → call recorder) and an overridable SINGLETON_SELF_PID.
+# NO real process is ever listed or killed. Asserts:
 #   A) two bridges (one self-ancestor + one stale) → ONLY the non-self one is
 #      kill -9'd; ancestor bridge (grandparent) survives (kill-self belt).
 #   B) zero bridges → no-op.
 #   C) one bridge == self → no-op.
 #   D) ORCH_SID configurable (ORCHESTRATOR_SID) → only the matching sid killed.
 #   E) signal is ALWAYS -9, NEVER -TERM/-15.
+#
+# #899 tranche 5 — this file used to `source` bin/orchestrator-boot.sh and call
+# orchestrator_singleton_guard / orchestrator_registry_reconcile as bash functions and
+# read ORCH_EXEC_ARGV as a bash array. That script is a shim onto
+# src/orchestrator-boot/cli.ts now and an exec shim exports no shell functions, so the
+# same behaviours are reached through the `__probe` subcommands built for exactly this
+# (`singleton-guard`, `registry-reconcile`, `exec-argv` — the T52 shape from tranche
+# 2a). Same seams, same fixtures, same assertions, now measuring the code production
+# actually runs. The shim routes `__probe` straight to node, so no probe can reach the
+# exec.
 #
 # #905 — the guard above kills PROCESSES; it never reconciled the daemon's REGISTRY
 # record, and on 2026-08-16 that made an orchestrator restart structurally impossible:
@@ -52,16 +62,16 @@ exit 0
 EOF
 chmod +x "$KILL_STUB"
 
-# Source the guard once (main does NOT run when sourced).
-SINGLETON_PS_CMD="$PS_STUB"
-KILL_CMD="$KILL_STUB"
-# shellcheck disable=SC1090
-source "$BOOT"
-# Re-pin the seams to our stubs (the script set them from env at source time).
-SINGLETON_PS_CMD="$PS_STUB"
-KILL_CMD="$KILL_STUB"
-
-run_guard() { : > "$KILL_LOG"; orchestrator_singleton_guard; }
+# ORCH_SID / SINGLETON_SELF_PID are set by each block below and read from the env by
+# the probe, where the sourced script used to read them from this shell.
+ORCH_SID="orchestrator"
+SINGLETON_SELF_PID="9999"
+run_guard() {
+  : > "$KILL_LOG"
+  ORCHESTRATOR_SID="$ORCH_SID" SINGLETON_SELF_PID="$SINGLETON_SELF_PID" \
+    SINGLETON_PS_CMD="$PS_STUB" KILL_CMD="$KILL_STUB" \
+    "$BOOT" __probe singleton-guard >/dev/null 2>&1
+}
 
 B="node telepty allow --id orchestrator claude --dangerously-skip-permissions --continue"
 
@@ -130,8 +140,8 @@ grep -qE -- '-TERM|-15|-SIGTERM' "$KILL_LOG" && fail "E: SIGTERM used (cascades 
 grep -q -- '-9' "$KILL_LOG" || fail "E: SIGKILL (-9) not used; log: $(cat "$KILL_LOG")"
 
 # ===========================================================================
-# #905 — pre-exec registry reconcile. Seams: TELEPTY_CMD (the listing query) and
-# CURL_CMD (the DELETE). Both are recorders; nothing real is contacted.
+# #905 — pre-exec registry reconcile. Seams: TELEPTY (the listing query) and
+# CURL (the DELETE). Both are recorders; nothing real is contacted.
 # ===========================================================================
 LIST_JSON="$T_TMP/list.json"
 LIST_MODE="$T_TMP/list-mode.txt"       # ok | fail | garbage
@@ -162,20 +172,21 @@ exit 0
 EOF
 chmod +x "$CURL_STUB"
 
-TELEPTY_CMD="$TELEPTY_STUB"
-CURL_CMD="$CURL_STUB"
-
 # rec <health> <clients> — one orchestrator record with the daemon's real field
 # names (daemon.js:2205-2214 — healthStatus + active_clients; cli.js:1334 prints
 # exactly this pair as "<STATUS> ... - Clients: <n>").
 rec() { printf '[{"id":"orchestrator","command":"claude","healthStatus":"%s","active_clients":%s}]' "$1" "$2"; }
 
+reconcile() {
+  ORCHESTRATOR_SID="orchestrator" TELEPTY="$TELEPTY_STUB" CURL="$CURL_STUB" \
+    "$BOOT" __probe registry-reconcile >/dev/null 2>&1
+}
+
 run_reconcile() {
   : > "$CURL_LOG"
   printf 'ok'  > "$LIST_MODE"
   printf '200' > "$CURL_CODE"
-  ORCH_SID="orchestrator"
-  orchestrator_registry_reconcile
+  reconcile
 }
 
 # --- F) STALE + 0 clients → DELETE ----------------------------------------------
@@ -208,14 +219,14 @@ run_reconcile
 [ -s "$CURL_LOG" ] && fail "I: DELETE issued with no orchestrator record present; calls: $(cat "$CURL_LOG")"
 
 # --- J) daemon unreachable → announced, no DELETE, boot proceeds ----------------
-: > "$CURL_LOG"; printf 'fail' > "$LIST_MODE"; ORCH_SID="orchestrator"
-orchestrator_registry_reconcile \
+: > "$CURL_LOG"; printf 'fail' > "$LIST_MODE"
+reconcile \
   || fail "J: reconcile returned non-zero when the daemon was unreachable — that would block the boot it exists to enable"
 [ -s "$CURL_LOG" ] && fail "J: DELETE issued despite no answer from the daemon; calls: $(cat "$CURL_LOG")"
 
 # A non-JSON answer is the same class of unknown and must not authorise a delete.
 : > "$CURL_LOG"; printf 'garbage' > "$LIST_MODE"
-orchestrator_registry_reconcile || fail "J: reconcile returned non-zero on a non-JSON listing"
+reconcile || fail "J: reconcile returned non-zero on a non-JSON listing"
 [ -s "$CURL_LOG" ] && fail "J: DELETE issued on an unparseable listing; calls: $(cat "$CURL_LOG")"
 
 # --- K) STALE but someone is attached → no DELETE -------------------------------
@@ -231,7 +242,13 @@ run_reconcile
 # --- L) the exec argv carries --auto-restart, before the command word -----------
 # Measured in cli.js: --auto-restart is extracted by indexOf over the args AFTER
 # `allow`, then spliced out before `command = allowArgs[0]` (cli.js:1837-1846) — so
-# it has to sit ahead of the command, exactly where the workers carry it.
+# it has to sit ahead of the command, exactly where the workers carry it. The array
+# `__probe exec-argv` prints one element per line is the SAME array the shim execs.
+ARGV_OUT="$T_TMP/exec-argv.txt"
+"$BOOT" __probe exec-argv > "$ARGV_OUT" 2>/dev/null \
+  || fail "L: __probe exec-argv exited non-zero"
+ORCH_EXEC_ARGV=()
+while IFS= read -r a; do ORCH_EXEC_ARGV+=("$a"); done < "$ARGV_OUT"
 argv="${ORCH_EXEC_ARGV[*]}"
 case "$argv" in
   *--auto-restart*) ;;
