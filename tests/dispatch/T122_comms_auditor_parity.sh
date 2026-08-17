@@ -53,6 +53,9 @@
 #        re-escalated the SAME HOLD into the orchestrator inbox on every tick. Both
 #        blocks tick THREE times to measure exactly that, from both sides.
 #
+# BLOCK N IS A THIRD D1 POISON SHAPE — a non-string `from`/`to`, which raised a
+# TypeError inside `sorted()` and died the same way. Same flag split as K/L.
+#
 # BLOCK M IS A REPRODUCED DEFECT (D2), so it is green against both: an empty `from`
 # or `to` makes the tab-delimited HOLD fields collapse — tab is IFS whitespace — and
 # the HOLD names the excerpt as the sender. It is pinned verbatim so the port cannot
@@ -405,6 +408,25 @@ else
   [ "$(count 'AFTER the poison' "$TELE")" = "1" ] || fail "L: the post-poison violation was never audited"
   [ "$(count HOLD "$STUB_DISPATCH_LOG")" = "2" ] \
     || fail "L: expected 2 HOLDs total across three ticks, got $(count HOLD "$STUB_DISPATCH_LOG")"
+fi
+
+# ── N. D1 — a THIRD poison shape: a non-string `from`/`to` ──────────────────
+# `"__".join(sorted([rec_from, rec_to]))` raised `TypeError: '<' not supported
+# between instances of 'str' and 'int'` on a numeric sid, killing the pass with the
+# cursor unwritten — the same permanent death as K and L, from a third direction.
+# Found while reviewing the port, not from the disposition, so it is pinned here
+# rather than left as a story. The port coerces a non-string sid to "" (which then
+# meets D2's field collapse, consistently with block M).
+fresh N; printf '%s\n' '{"from":123,"to":"peer-B","body":"a numeric sid"}' > "$LOG"
+aud
+if [ "$ORIGINAL" = "1" ]; then
+  [ "$RC" -ne 0 ] || fail "N[original]: a numeric sid was expected to abort the pass"
+  [ "$(cursor)" = "ABSENT" ] || fail "N[original]: the cursor was expected never to be written"
+else
+  [ "$RC" -eq 0 ] || fail "N: a numeric sid must not fail the pass, got $RC ($ERRTXT)"
+  [ "$(cursor)" = "$(logsize)" ] || fail "N: the cursor must advance past a numeric sid"
+  grep -qF '"from": "", "to": "peer-B"' "$TELE" \
+    || fail "N: a non-string sid must read as empty, not crash: $(cat "$TELE" 2>/dev/null)"
 fi
 
 # ── M. D2 — an empty from/to garbles the HOLD's own fields (REPRODUCED) ─────
