@@ -68,7 +68,14 @@ jobs:
       # `npm test` is what builds it.
       - name: Dispatch guard suite
         run: bash tests/dispatch/run-all.sh
-        timeout-minutes: 4
+        # 4 was inside the runner's own variance, not above it. Measured on
+        # macos-latest for the SAME commit: 2m44s vs 4m11s — 87s of spread — against a
+        # main baseline of 3m07s, so the headroom was 53s < variance and the cap fired
+        # on a suite that had already printed `guards: 118 passed: 118 failed: 0`
+        # (one manual re-run needed). A timeout that trips on a PASSING suite teaches
+        # people to re-run red CI, which is the opposite of what it is for. 8 leaves
+        # ~5m of headroom and still catches a real hang.
+        timeout-minutes: 8
       - name: Ship-set agreement against the real tarball
         run: bash tests/packaging/T96_ship_set_agreement.sh
       # Announces its own skip when the upstream repo is absent, which it always is here.
