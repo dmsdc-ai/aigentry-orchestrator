@@ -20,7 +20,7 @@ that the guard REFUSES to kill them.
 | `tests/dispatch/T40_…` | re-pointed from `source` onto `__probe`; blocks A–L unchanged |
 | `tests/dispatch/T131_…parity.sh` | **new**, 14 blocks, re-runnable against the original |
 | `tests/dispatch/T132_…workspace_shim.sh` | **new**, 5 blocks |
-| `tests/dispatch/run-all.sh` | `EXPECTED_GUARDS` 126 → 128 |
+| `tests/dispatch/run-all.sh` | `EXPECTED_GUARDS` 128 → 130 (see §9 — this is the SECOND of the pair) |
 
 `bin/init/manifest.mjs` untouched — no bin file was added. `bin/lib/workspace-host.sh`
 untouched. `tests/dispatch/T87` untouched and still passing (§2).
@@ -183,13 +183,15 @@ in #400.
 
 ## 7. Rule 35 / 39
 
-| | before (b300875) | after |
-|---|---|---|
-| `npm test` | 225/225 pass | 225/225 pass |
-| `bash tests/dispatch/run-all.sh` | guards 126, passed 126, failed 0, skipped 3 (`T16 T48 T95`) | guards 128, passed 128, failed 0, skipped 3 (`T16 T48 T95`) |
-| `npx tsc -p .` | clean | clean |
-| Snyk `snyk_code_scan` (`src/orchestrator-boot`) | — | `issueCount: 0` |
-| `tests/packaging/` T96 / T97 / smoke-init | — | pass (manifest 65, tarball 234; 10/10) |
+Two baselines, because this branch was rebased mid-flight — see §9.
+
+| | before (b300875) | before (8804354, rebase) | after |
+|---|---|---|---|
+| `npm test` | 225/225 pass | 225/225 pass | 225/225 pass |
+| `bash tests/dispatch/run-all.sh` | guards 126, passed 126, failed 0, skipped 3 (`T16 T48 T95`) | guards 128, passed 128, failed 0, skipped 3 | guards 130, passed 130, failed 0, skipped 3 (`T16 T48 T95`) |
+| `npx tsc -p .` | clean | clean | clean |
+| Snyk `snyk_code_scan` (`src/orchestrator-boot`) | — | — | `issueCount: 0` |
+| `tests/packaging/` T96 / T97 / smoke-init | — | — | pass (manifest 65, tarball 234; 10/10) |
 
 Both new guards were also run under `/bin/bash` **3.2.57** explicitly, not just the
 `env bash` on PATH.
@@ -216,5 +218,22 @@ for this sid" arm on the way past. Fixed in `2cfcc59`; `T69` passes.
 * **The exec's failure code.** `exec`'s own 127 when `telepty` is missing from PATH is
   unchanged and unasserted; constructing it needs a controlled PATH that a host with a
   real `telepty` cannot be trusted to provide.
-* **The parallel worker's script** in this tranche pair, and therefore the final guard
-  count if that one lands second.
+* **The parallel worker's script** in this tranche pair. That question is now answered
+  in §9, not open.
+
+## 9. Which of the pair landed first
+
+**rt899 landed first.** `bin/orchestrator-report-target.sh` merged as
+`8804354` (PR #24) with `T129`/`T130` and `EXPECTED_GUARDS=128`. This branch was
+therefore rebased off b300875 onto **8804354** and took the **counted total**.
+
+The rebase applied cleanly with no textual conflict — and that is precisely the hazard
+worth naming, because both sides had edited the same line to the same bytes
+(`EXPECTED_GUARDS=126` → `=128`), so git kept one copy and the number silently stopped
+matching the 130 files on disk. `run-all.sh`'s manifest assertion exists for exactly
+this: it would have failed the run with `MANIFEST MISMATCH: found 130 guard file(s), the
+manifest declares 128`. Set to **130** deliberately after counting the files, not by
+taking the merge's word for it.
+
+Nothing else in the two ports overlaps: disjoint shims, disjoint `src/` directories,
+disjoint guards. The only shared file was the counted manifest.
