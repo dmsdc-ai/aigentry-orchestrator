@@ -39,8 +39,15 @@ source "$HERE/lib.sh"
 
 t_setup
 BRIDGE_PIDS=""
+WS_STATE=""
+# The pidfile is read back at teardown as well as tracked inline: a bridge started by
+# a path that then FAILS an assertion is never recorded in BRIDGE_PIDS, and a guard
+# that leaks a long-lived process is not hermetic whatever it asserts. Same reasoning
+# as T118's trap.
 cleanup() {
   local p
+  [ -n "$WS_STATE" ] && [ -f "$WS_STATE/bus-bridge.pid" ] \
+    && BRIDGE_PIDS="$BRIDGE_PIDS $(cat "$WS_STATE/bus-bridge.pid" 2>/dev/null || true)"
   for p in $BRIDGE_PIDS; do kill "$p" 2>/dev/null || true; done
   t_teardown
 }

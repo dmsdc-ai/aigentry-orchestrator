@@ -18,9 +18,10 @@
 # faithful port ANSWERED "no bridge running" FOR A BRIDGE THAT WAS ALIVE. Measured
 # against the first cut of src/bus-bridge/cli.ts, this block reported:
 #
-#   FAIL[T118]: B: --ensure started a SECOND bridge (pid 41234 -> 41251) — the pidfile
+#   FAIL[T118]: B: --ensure started a SECOND bridge (pid 66864 -> 66909) — the pidfile
 #   corroboration no longer recognises the running bridge, so every reconciler tick
-#   doubles the writers (#539/#618)
+#   doubles the writers (#539/#618).
+#   argv of the first: …/node …/dist/src/bus-bridge/cli.js --run
 #
 # In production src/reconciler/cli.ts:1309 runs `--ensure` on EVERY tick, so that is
 # one new bus subscriber and one new spool writer every 60 seconds, forever. The fix
@@ -67,8 +68,17 @@ source "$HERE/lib.sh"
 
 t_setup
 BRIDGE_PIDS=""
+# The pidfile is read back at teardown as well as tracked inline, because a bridge
+# started by a path that then FAILS an assertion is never recorded in BRIDGE_PIDS —
+# and part B deliberately provokes exactly that (a duplicate bridge overwriting the
+# pidfile) when the corroboration is wrong. Measured: without this, a red run of part
+# B left two bridges alive against a temp state dir that teardown had already
+# removed. A guard that leaks a long-lived process is not hermetic, whatever it
+# asserts.
 cleanup() {
   local p
+  [ -f "$DISPATCH_STATE_DIR/bus-bridge.pid" ] \
+    && BRIDGE_PIDS="$BRIDGE_PIDS $(cat "$DISPATCH_STATE_DIR/bus-bridge.pid" 2>/dev/null || true)"
   for p in $BRIDGE_PIDS; do kill "$p" 2>/dev/null || true; done
   t_teardown
 }
@@ -129,6 +139,7 @@ export STUB_LISTEN_LINES="$T_TMP/listen-lines"
 # bridge <args…> — the script under test with every seam pointed at the sandbox.
 OUT="$T_TMP/out"; ERR="$T_TMP/err"; RC=0
 bridge() {
+  local verb="${1:-}"
   set +e
   env TELEPTY="$STUB_BIN/telepty-listen" \
       CURL="$STUB_BIN/curl-200" \
@@ -138,8 +149,25 @@ bridge() {
       "$BRIDGE" "$@" > "$OUT" 2> "$ERR"
   RC=$?
   set -e
+  [ "$verb" = "--ensure" ] && track_started_bridge
+  return 0
 }
 EXTRA_ENV=()
+
+# track_started_bridge — collect whatever pid the pidfile carries over a short
+# settle, so the trap can end it later. --ensure returns as soon as the detached
+# child is SPAWNED; the child writes the pidfile a moment afterwards, so a single
+# read at teardown races it and a run that fails in between leaks a long-lived
+# process against a temp state dir teardown has already removed. Measured on a red
+# run of part B, which provokes exactly that by design. Sampling repeatedly also
+# catches the case where one pid replaces another inside the window.
+track_started_bridge() {
+  local i
+  for i in 1 2 3 4 5 6; do
+    [ -s "$PIDFILE" ] && BRIDGE_PIDS="$BRIDGE_PIDS $(cat "$PIDFILE" 2>/dev/null || true)"
+    sleep 0.2
+  done
+}
 
 # ===========================================================================
 # A) the argument matrix — usage text, exit codes, which stream each lands on
