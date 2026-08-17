@@ -165,17 +165,25 @@ now validated. Same call, for the same reason, as the comms-auditor port's D4.
 
 ## 6. Guard count
 
-**124.** Counted, not assumed: `ls tests/dispatch/T*.sh | wc -l` was **122** on
-`c95fb34` and `EXPECTED_GUARDS` said 122; two guards were added (T124, T125) and
-`EXPECTED_GUARDS` is now **124**. The highest pre-existing number was T123, so 124/125
-were free. If a parallel worker lands first, these renumber to the next free pair.
+**126, and I landed SECOND.** The parallel worker (`ba899`,
+`bin/orchestrator-bridge-auditor.sh`) merged first as PR #21, taking **T127/T128** and
+moving `EXPECTED_GUARDS` 122 → 124 for its own two files. This branch was rebased onto
+`2b46c99`; **T124/T125 were still free**, so my numbers are unchanged, and
+`EXPECTED_GUARDS` is now **126** — counted, not derived:
+`ls tests/dispatch/T*.sh | wc -l` = 126 after the rebase (124 on main + T124 + T125).
+The two branches were disjoint in every other file.
 
-Baselines, both taken on this worktree:
+Baselines. The "before" column is `c95fb34`, this branch's original base, measured on
+this worktree before any edit; the "after" column is post-rebase onto `2b46c99`, so its
+guard total includes ba899's two:
 
-| | before (`c95fb34`) | after |
+| | before (`c95fb34`) | after (rebased onto `2b46c99`) |
 |---|---|---|
 | `npm test` | 225 pass / 0 fail | 225 pass / 0 fail |
-| `tests/dispatch/run-all.sh` | 122 passed / 0 failed / 3 skipped (T16 T48 T95) | 124 passed / 0 failed / 3 skipped (T16 T48 T95) |
+| `tests/dispatch/run-all.sh` | 122 passed / 0 failed / 3 skipped (T16 T48 T95) | 126 passed / 0 failed / 3 skipped (T16 T48 T95) |
+
+The pre-rebase run on `c95fb34` + my two guards was 124/124/0 with the same three
+skips — i.e. both increments are accounted for, mine and ba899's.
 
 One existing guard caught this port en route and was right to: **T69**
 (`registry_single_writer_invariant`) greps `bin/` for the registry filename and refuses
