@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# orchestrator-report-target.sh — resolve the worker→orchestrator REPORT/HOLD
-# target for #690 (Rule 16: no hardcoded session id / IP). Prints ONE line: the
-# address a dispatched worker should `telepty inject` its REPORT/HOLD to.
+# orchestrator-report-target.sh — CLI-compatible exec shim onto the TypeScript
+#                     implementation (#899 tranche 5). It resolves the worker→
+#                     orchestrator REPORT/HOLD target for #690 (Rule 16: no
+#                     hardcoded session id / IP) and prints ONE line on stdout:
 #
 #   <sid>@<tailnet-ip>   when a Tailscale CGNAT (100.64.0.0/10) address is found
 #                        AND the daemon actually answers there — resolves from
@@ -9,129 +10,82 @@
 #   <sid>                bare fallback (single-machine / no tailnet / nothing
 #                        listening on the tailnet address) — resolves locally.
 #
-# Consumed by bin/dispatch.sh, which substitutes {{ORCHESTRATOR_REPORT_TARGET}}
-# in each dispatch ref at inject time so refs never carry a phantom sid. It reads
-# STDOUT only, so the notes this script writes to stderr never reach a ref.
+# Every arm, both output streams, the exit code (always 0), all five env seams
+# (AIGENTRY_ORCHESTRATOR_SID, AIGENTRY_ORCHESTRATOR_HOST, TELEPTY_PORT, CURL,
+# REPORT_TARGET_IFACE_CMD), the curl argv, the interface-scan argv and the CGNAT
+# regex are unchanged. src/report-target/cli.ts carries the design rationale that
+# used to live in this header — why the probe exists at all (#835: reachability was
+# INFERRED from an interface having an address, so every worker was handed a target
+# that answered nothing), why an explicit host is honoured loudly, why cannot-probe
+# is not unreachable, the one-probe cost ceiling, and the cross-machine gap the bare
+# fallback leaves.
 #
-# WHY THE PROBE (#835 family, found the hard way): this used to return the
-# `<sid>@<ip>` form whenever an interface *had* a CGNAT address. That infers
-# REACHABILITY from the presence of an address — a fact it never measured. When
-# the daemon stopped listening on the tailnet, the interface kept its address, so
-# the resolver kept handing every dispatched worker an address that answers
-# nothing, and each worker's REPORT went nowhere. The address existing and the
-# daemon answering there are two different claims; only the second one is the one
-# callers need, so only the second one may be asserted.
+# THERE IS NO --help AND NO ARGV HANDLING, and that is the contract, not an omission.
+# Measured before the port: `orchestrator-report-target.sh --help --nonsense foo`
+# resolved the target and exited 0. So there is no flag parser to reproduce, no
+# `sed -n` header slice, and NO src/report-target/usage.ts — unlike the siblings in
+# this tranche that did read argv. tests/dispatch/T129 block H pins it.
 #
-# The probe cannot lean on `telepty inject`'s exit code to notice the failure —
-# that path exits 0 while printing a failure (telepty #840, not ours, sibling
-# mid-change). It measures the endpoint directly instead.
+# Contract changes recorded here (Rule 38 — what was measured). The reproductions are
+# in docs/reports/2026-08-18-899-t5-report-target-disposition.md §7:
 #
-# Reachability is NOT authorization: ANY HTTP answer, 401 included, proves the
-# daemon is listening there. A credential problem would hit the bare local form
-# identically, so it is not a reason to prefer one address over the other.
+#   * NO BEHAVIOUR CHANGED AT ALL. This is the only port in the tranche with an empty
+#     deviation list, so tests/dispatch/T129 passes against BOTH the original bash at
+#     b300875 and the port, and carries no `*_PARITY_ORIGINAL` flag — there is
+#     nothing for one to select. Re-run it against the original with:
+#       git show b300875:bin/orchestrator-report-target.sh > /tmp/rt-orig.sh
+#       chmod +x /tmp/rt-orig.sh
+#       REPORT_TARGET_UNDER_TEST=/tmp/rt-orig.sh bash tests/dispatch/T129_report_target_parity.sh
+#   * SOURCEABILITY WAS NEVER USED, so nothing was removed for it and there is NO
+#     `__probe` surface. Measured:
+#     `grep -rnE '^[[:space:]]*(\.|source)[[:space:]].*orchestrator-report-target' .`
+#     matches nothing repo-wide. Both guards that drive it (T67, T92) invoke it as a
+#     subprocess, and so does its one production caller, src/dispatch/cli.ts:595-597.
+#   * THIS SCRIPT SOURCED NO LIBS (zero `.`/`source` lines), so there is no
+#     `bash -c '. lib; fn'` door and no bin/wh-cli.sh verb. Its children stay children
+#     with identical argv: `$CURL` (`-s -o /dev/null -w %{http_code} --connect-timeout
+#     1 --max-time 2 http://<h>:<port>/api/meta`), and the interface scan — the
+#     REPORT_TARGET_IFACE_CMD seam with NO arguments, or `ifconfig` plus
+#     `ip -o -4 addr show` when it is unset, both run unconditionally and in that
+#     order. `grep -Eo`, `head -n1` and `command -v` are node-internal now; they were
+#     how bash reached a regex and a PATH lookup, never a contract.
+#   * `os.networkInterfaces()` IS NOT USED even though it is less code, because
+#     REPORT_TARGET_IFACE_CMD must keep accepting an arbitrary executable whose STDOUT
+#     IS PARSED. A native lister on the default path plus a text parser on the seam
+#     path would be two selection algorithms, and every guard would exercise the one
+#     production never runs. Named because it is the choice a reviewer would query.
+#   * FOUR LATENT DEFECTS ARE REPRODUCED, NOT FIXED, on the orchestrator's GO —
+#     the unanchored CGNAT regex (a scan line `inet6 fe80::9100.72.1.1234` yields the
+#     nonexistent `100.72.1.123`), multi-line stdout from a newline in either
+#     override (operator-only vars — nothing in the tree sets them — so not a trust
+#     boundary), the interface seam's inability to carry arguments (correct by
+#     construction: adding argv splitting would ADD an injection surface), and the
+#     fact that the stderr notes below are DISCARDED by the only production caller
+#     (src/dispatch/cli.ts:54 `capture()` pipes stderr and never reads it), so the
+#     degraded-cross-machine warning reaches nobody. That last one is filed as a
+#     ticket with its exact two-line diff in the report §6; the fix belongs in
+#     src/dispatch/cli.ts, outside this task's Rule 29 scope.
 #
-# AN EXPLICIT HOST IS HONOURED, LOUDLY. The defect is inferring an unmeasured
-# fact, not overriding a measured one: `AIGENTRY_ORCHESTRATOR_HOST` is an
-# operator stating the fact, and it stays the escape hatch for a misfiring
-# auto-detect (a probe can be wrong too — a firewall that blocks us but not the
-# worker, a listener coming back up in a minute, refs substituted now and used
-# later). So an unreachable explicit host is still returned on stdout, with a
-# note on stderr — the operator's choice stands, but it stops being invisible.
-# Auto-detection gets no such deference, because nobody asserted it.
+# THE PATH HARDENING STAYS HERE, IN BASH, and byte-identical. It is what puts `curl`
+# and the interface listers on PATH for the probe and the scan — both are launched by
+# the node process, so a copy inside TS would leave one process generation running
+# with the caller's PATH. NAMED TENSION, pre-existing, mentioned not changed
+# (Rule 29): bin/session-cleanup.sh:34-41 records that a hardcoded `/opt/homebrew/bin`
+# prefix is what made task #400 pick a stale homebrew telepty. This script never runs
+# `telepty`, so that particular hazard does not apply here.
 #
-# CANNOT-PROBE IS NOT UNREACHABLE. With no curl there is no measurement, and an
-# absent measurement must not be read as a negative result — that is the same
-# mistake one turn down. The auto-detected form is kept and the inability to
-# check is noted.
-#
-# Overrides (both optional; auto-detect is the default):
-#   AIGENTRY_ORCHESTRATOR_SID    orchestrator session id (default: orchestrator)
-#   AIGENTRY_ORCHESTRATOR_HOST   tailnet host/IP (default: auto-detected)
-#
-# COST: this runs on every dispatch, so it is one probe with a 1s connect ceiling
-# and no retry. A closed port on a reachable host refuses instantly; only a
-# black-holed address pays the full second.
-#
-# LIMIT: when the tailnet address does not answer, the bare form is the best
-# available target, not a universal one — it resolves to the *local* daemon, so a
-# genuinely cross-machine worker has no working report target in that window.
-# That is a real gap, and the stderr note is where it surfaces rather than being
-# hidden behind an address that silently drops reports.
-#
-# ponytail: tailnet IP via an ifconfig/ip interface scan for the 100.64/10 range;
-# if that ever misfires (multiple tailnets, unusual iface naming), set
-# AIGENTRY_ORCHESTRATOR_HOST explicitly — that's the upgrade path, no code change.
+# ⚠️ THIS FILE MUST STAY EXECUTABLE. src/dispatch/cli.ts:595 gates the whole resolve
+# on `isExecutable(REPORT_TARGET_SH)`, so a lost mode bit does not degrade the answer,
+# it fails the dispatch closed — the resolver is simply skipped and dispatch refuses
+# to inject a ref with an unresolved {{ORCHESTRATOR_REPORT_TARGET}}.
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+# Resolved exactly as the shell script's SCRIPT_DIR was, so a symlinked entrypoint
+# still resolves.
+AIGENTRY_SHIM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+export AIGENTRY_SHIM_SCRIPT_DIR
 
-# $CURL is the seam bin/dispatch-tracker.sh:41 uses. REPORT_TARGET_IFACE_CMD is
-# the interface-scan seam: it is the one input a test cannot pin through the
-# public overrides, because setting AIGENTRY_ORCHESTRATOR_HOST also selects the
-# explicit branch. (Precedent: session-cleanup.sh's CLEANUP_PS_CMD.)
-CURL="${CURL:-curl}"
-IFACE_CMD="${REPORT_TARGET_IFACE_CMD:-}"
-
-note() { echo "orchestrator-report-target: $*" >&2; }
-
-# probe_host <host> → answered | silent | unknown
-#   answered — the daemon responded there (any HTTP status)
-#   silent   — the exchange completed without a response: nothing is listening
-#   unknown  — we could not measure at all; NOT a negative result
-#
-# NOTE the missing `|| echo 000`. With -w '%{http_code}' curl prints `000` on a
-# connect failure AND exits non-zero, so the usual `$(curl … || echo 000)` idiom
-# concatenates both into `000000` — which matches no arm and falls through to the
-# catch-all as if the host had answered. Caught by running this against the real
-# unreachable address instead of trusting the stub, which only ever emitted one
-# value. `|| true` keeps curl's own code as the only source of truth.
-probe_host() {
-  local h="$1" port="${TELEPTY_PORT:-3848}" http
-  command -v "$CURL" >/dev/null 2>&1 || { printf 'unknown'; return 0; }
-  http=$("$CURL" -s -o /dev/null -w '%{http_code}' \
-    --connect-timeout 1 --max-time 2 \
-    "http://${h}:${port}/api/meta" 2>/dev/null || true)
-  case "$http" in
-    ''|000) printf 'silent' ;;
-    *)      printf 'answered' ;;
-  esac
-}
-
-sid="${AIGENTRY_ORCHESTRATOR_SID:-orchestrator}"
-
-host="${AIGENTRY_ORCHESTRATOR_HOST:-}"
-explicit=1
-if [ -z "$host" ]; then
-  explicit=0
-  # CGNAT 100.64.0.0/10 → second octet 64-127. Scan both ifconfig (macOS/BSD) and
-  # `ip` (Linux); whichever exists produces output, the other is silently empty.
-  scan="$( { if [ -n "$IFACE_CMD" ]; then "$IFACE_CMD" 2>/dev/null; \
-             else ifconfig 2>/dev/null; ip -o -4 addr show 2>/dev/null; fi; } || true)"
-  host="$(printf '%s\n' "$scan" \
-    | grep -Eo '100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}' \
-    | head -n1 || true)"
-fi
-
-# No candidate at all — single-machine. Nothing to measure, nothing to claim.
-if [ -z "$host" ]; then
-  printf '%s\n' "$sid"
-  exit 0
-fi
-
-case "$(probe_host "$host")" in
-  answered)
-    printf '%s@%s\n' "$sid" "$host"
-    ;;
-  silent)
-    if [ "$explicit" -eq 1 ]; then
-      note "AIGENTRY_ORCHESTRATOR_HOST=$host does not answer on port ${TELEPTY_PORT:-3848}; honouring it because you set it explicitly, but reports sent there will go nowhere until the daemon listens on it."
-      printf '%s@%s\n' "$sid" "$host"
-    else
-      note "auto-detected tailnet address $host does not answer on port ${TELEPTY_PORT:-3848} — falling back to the bare '$sid', which resolves locally. Cross-machine workers have no working report target while that listener is down."
-      printf '%s\n' "$sid"
-    fi
-    ;;
-  unknown)
-    note "cannot probe $host (no '$CURL' available) — keeping the tailnet form unverified; an absent measurement is not a negative one."
-    printf '%s@%s\n' "$sid" "$host"
-    ;;
-esac
+# shellcheck source=lib/node-shim.sh
+. "$AIGENTRY_SHIM_SCRIPT_DIR/lib/node-shim.sh"
+aigentry_node_shim orchestrator-report-target.sh dist/src/report-target/cli.js
+exec node "$AIGENTRY_SHIM_JS" "$@"
