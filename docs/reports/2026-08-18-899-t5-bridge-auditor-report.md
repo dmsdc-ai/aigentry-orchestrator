@@ -406,8 +406,8 @@ not this task's surface).
 | check | before (`c95fb34`) | after |
 |---|---|---|
 | `npx tsc -p .` | clean | clean |
-| `npm test` | **225/225 pass, 0 fail** | *see below* |
-| `bash tests/dispatch/run-all.sh` | **guards 122, passed 122, failed 0, skipped 3 (T16 T48 T95)** | *see below* |
+| `npm test` | **225/225 pass, 0 fail** | **225/225 pass, 0 fail** |
+| `bash tests/dispatch/run-all.sh` | **guards 122, passed 122, failed 0, skipped 3 (T16 T48 T95)** | **guards 124, passed 124, failed 0, skipped 3 (T16 T48 T95)** — same skip set, +T127/T128 |
 | `snyk_code_scan` | 12 Low | 12 Low, **0 new** |
 | T57 | PASS | PASS (unchanged file) |
 | T127 / T128 | — | PASS (+ both proven non-vacuous, §3/§7/§8) |
