@@ -189,6 +189,18 @@ in #400.
 | `bash tests/dispatch/run-all.sh` | guards 126, passed 126, failed 0, skipped 3 (`T16 T48 T95`) | guards 128, passed 128, failed 0, skipped 3 (`T16 T48 T95`) |
 | `npx tsc -p .` | clean | clean |
 | Snyk `snyk_code_scan` (`src/orchestrator-boot`) | — | `issueCount: 0` |
+| `tests/packaging/` T96 / T97 / smoke-init | — | pass (manifest 65, tarball 234; 10/10) |
+
+Both new guards were also run under `/bin/bash` **3.2.57** explicitly, not just the
+`env bash` on PATH.
+
+**One thing CI caught that local ordering had not yet reached: `T69` §8.7** forbids
+seeding the legacy registry root array anywhere in `tests/dispatch/`, and its scanner
+matches the literal `printf '[]'`. T131 used that five times as a *telepty*
+`list --json` fixture — a different registry entirely, but the scanner cannot tell them
+apart and is right not to try. Those five sites now seed a listing holding an unrelated
+worker record, which is the more realistic shape and exercises the reconcile's "no record
+for this sid" arm on the way past. Fixed in `2cfcc59`; `T69` passes.
 
 ## 8. NOT checked (Rule 38)
 
