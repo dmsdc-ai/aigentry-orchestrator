@@ -182,6 +182,7 @@ Highest number is now T130.
 | `npm test` | **225 pass / 0 fail** | **225 pass / 0 fail** |
 | `tests/dispatch/run-all.sh` | **126/126 pass, 0 fail**, skipped `T16 T48 T95` | **128/128 pass, 0 fail**, skipped `T16 T48 T95` |
 | Snyk `snyk_code_scan` | 2 Low Path-Traversal in `src/hitl/cli.ts` (pre-existing) | **`src/report-target` = 0 issues**; the same 2 pre-existing in `src/hitl/cli.ts`, untouched by this change → **0 new** |
+| CI (PR #24) | — | **4/4 green** — Full suite × {ubuntu-latest, macos-latest}, Windows W0, Windows W1 |
 
 ## 9. Scope (Rule 29)
 
@@ -207,15 +208,23 @@ no real pid, no `kill` anywhere in this change — the guards use recorder seams
   answering endpoint is read as answering. That was already true of T92 and is the correct
   hermetic boundary, but it means the endpoint URL is pinned as a *string*, never
   exercised.
-* **Linux.** Both guards ran on macOS/bash 3.2 only. Block G's lister stubs are reachable
-  because no `ifconfig`/`ip` sits in the resolver's hardcoded PATH prefix on this host;
-  on an image where one does (homebrew's iproute2mac installs `/opt/homebrew/bin/ip`),
-  **block G does not assert** and prints a NOTE to stderr saying so. It is announced, not
-  silent, but it is a real coverage hole on such a host.
-* **`bash 3.2` was assumed from the shell, not from a second interpreter.** No arrays,
-  `mapfile`, `${x^^}` or `$'…'` in argv positions are used in either guard, and both run
-  under the system `/bin/bash` (3.2) here, but I did not run them under a *different*
-  bash to differential-test.
+* **Block G asserts on macOS only — confirmed, not hypothesised.** CI runs the suite on
+  both `ubuntu-latest` and `macos-latest`, and the ubuntu job printed:
+
+  > `T129 NOTE: block G not asserted — a real ifconfig/ip lives in the resolver's
+  > hardcoded PATH prefix on this host, so the lister stubs are unreachable.`
+
+  So on Linux the dual-lister scan (`ifconfig` then `ip -o -4 addr show`, both run, one
+  failing not stopping the other) is **not** covered — which is the platform where the
+  `ip` arm is the one that actually matters. The block cannot be made to assert there
+  without either editing the resolver's hardcoded `export PATH` (out of scope, and it is
+  load-bearing for finding `curl`) or invoking the compiled JS directly, which would stop
+  the block from being re-runnable against the original bash. The guard says what it did
+  not assert, on stderr and in its own PASS line, rather than passing silently. **Anyone
+  strengthening this should start here.**
+* **A second bash.** Both guards use no arrays, `mapfile`, `${x^^}` or `$'…'` in argv
+  positions, and run under the system `/bin/bash` (3.2) on macOS and bash 5 on the ubuntu
+  runner — so both majors are exercised by CI, but I did not differential-test locally.
 * **The `explicit + answers` and `explicit + cannot probe` arms with a HOSTNAME rather
   than an IP.** Everything uses dotted quads. A hostname would exercise the same code, but
   I did not measure it.

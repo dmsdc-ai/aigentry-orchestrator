@@ -355,4 +355,11 @@ out=$(run 200 "$IFACE_WITH; touch $CANARY" AIGENTRY_ORCHESTRATOR_SID=orch-i2)
   || fail "I: the interface seam was interpreted by a shell — REPORT_TARGET_IFACE_CMD now executes arbitrary commands, which the bash it replaces never did"
 [ "$out" = "orch-i2" ] || fail "I: a metacharacter-bearing seam value resolved to '$out'"
 
-echo "T129 PASS resolver=$RESOLVER blocks=A-I"
+# The PASS line names what actually ran, not what the file contains — a summary that
+# says A-I while the NOTE two lines up says G did not assert is the kind of small lie
+# that gets read instead of the note.
+if [ "$G_OK" = "1" ]; then
+  echo "T129 PASS resolver=$RESOLVER blocks=A-I"
+else
+  echo "T129 PASS resolver=$RESOLVER blocks=A-F,H,I (G not asserted on this host)"
+fi
