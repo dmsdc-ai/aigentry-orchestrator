@@ -212,9 +212,15 @@ $(cat "$STUBLOG")"
 # and the workspace was closed. A caller that cannot tell those apart cannot tell
 # "no surface" from "a surface that was torn down", and neither must ever be
 # smoothed to 1 — a generic failure — by the port.
+#
+# `AIGENTRY_WH_LEGACY_SPAWN=` (empty) is the wh arm rather than an empty array
+# expansion: `"${arr[@]}"` on an empty array is an unbound-variable fatal under
+# `set -u` in the bash 3.2 that ships as /bin/bash on the macos-latest runner, and
+# the value is only ever compared against the literal "1".
 for arm in wh legacy; do
-  extra=(); [ "$arm" = legacy ] && extra=(AIGENTRY_WH_LEGACY_SPAWN=1)
-  run_open "noref-$arm" AIGENTRY_WORKSPACE_HOST=cmux STUB_NO_REF=1 "${extra[@]}"
+  legacy_env="AIGENTRY_WH_LEGACY_SPAWN="
+  [ "$arm" = legacy ] && legacy_env="AIGENTRY_WH_LEGACY_SPAWN=1"
+  run_open "noref-$arm" AIGENTRY_WORKSPACE_HOST=cmux STUB_NO_REF=1 "$legacy_env"
   [ "$RC" -eq 2 ] || fail "D/$arm: a spawn that produced no ref exited $RC, want 2 (err: $ERRTXT)"
   [ -z "$OUT" ] || fail "D/$arm: emitted '$OUT' for a workspace that was never created"
   grep -qF 'ERR cmux new-workspace failed:' <<<"$ERRTXT" \
@@ -222,7 +228,7 @@ for arm in wh legacy; do
 $ERRTXT"
   [ ! -f "$OSLOG" ] || fail "D/$arm: logged a spawn that failed: $(cat "$OSLOG")"
 
-  run_open "timeout-$arm" AIGENTRY_WORKSPACE_HOST=cmux STUB_NEVER_READY=1 "${extra[@]}"
+  run_open "timeout-$arm" AIGENTRY_WORKSPACE_HOST=cmux STUB_NEVER_READY=1 "$legacy_env"
   [ "$RC" -eq 3 ] || fail "D/$arm: a ready-gate timeout exited $RC, want 3 (err: $ERRTXT)"
   [ -z "$OUT" ] || fail "D/$arm: emitted '$OUT' for a pane that never came up"
   grep -qF 'pane not ready after 120ms' <<<"$ERRTXT" \
