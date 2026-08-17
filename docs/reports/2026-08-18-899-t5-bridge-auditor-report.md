@@ -399,7 +399,11 @@ not this task's surface).
   is pre-existing and out of scope; mentioned, not touched.
 * **No live `--dry-run` audit against the production tick** was run; step 0d's
   wiring is asserted by reading the call site, not by ticking the real reconciler.
-* **Windows** is not considered anywhere; the repo targets macOS + Linux.
+* **Windows was not considered**, and does not need to be for this surface. The repo
+  declares `os: ["darwin","linux"]` and CI's two Windows jobs cover the package
+  refusal (W0) and the persistence suite + `.mjs` bin shim (W1) — neither runs
+  `tests/dispatch/run-all.sh`, so T127/T128 are never exercised on win32 and this
+  port's `ps`/`telepty` assumptions are out of their scope.
 
 ## 13. Baseline / after (Rule 35)
 
