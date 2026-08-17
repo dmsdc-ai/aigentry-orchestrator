@@ -25,8 +25,9 @@
 #   D) a missing primitive ⇒ announced no-op, exit 0 (never gates a spawn).
 #   E) platform::session_pid finds the `telepty allow --id <sid>` pid and returns
 #      empty (not an error) for an unknown sid.
-#   F) open-session.sh wires the two together after a spawn, and AIGENTRY_SLEEP_GUARD=0
-#      is a real kill switch.
+#   F) the spawn path wires the two together after a spawn, and AIGENTRY_SLEEP_GUARD=0
+#      is a real kill switch. (#899 tranche 3a: that path is
+#      src/session/open-session/cli.ts now, bin/open-session.sh being its exec shim.)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
@@ -133,12 +134,18 @@ miss=$(bash -c ". '$PLATFORM_SH'; platform::session_pid \"\$1\"" _ "t100-no-such
   || fail "E: session_pid errored on an unknown sid (callers treat that as fatal)"
 [ -z "$miss" ] || fail "E: session_pid invented a pid for an unknown sid: '$miss'"
 
-# --- F) open-session.sh wires it, and the kill switch works --------------------------
-OPEN="$REPO_ROOT/bin/open-session.sh"
+# --- F) open-session wires it, and the kill switch works -----------------------------
+# RETARGETED BY #899 TRANCHE 3a. This block grepped bin/open-session.sh, which is an
+# exec shim onto src/session/open-session/cli.ts now: the wiring it asserts moved with
+# the implementation, and a grep still pointed at the shim would pass on the header
+# prose while measuring nothing. Same two assertions, same reason — only the file the
+# spawn path's sleep assertion actually lives in changed.
+OPEN="$REPO_ROOT/src/session/open-session/cli.ts"
+[ -f "$OPEN" ] || fail "F: $OPEN missing — the spawn path's implementation moved again"
 grep -q 'platform::hold_awake' "$OPEN" \
-  || fail "F: open-session.sh does not hold a sleep assertion after spawning a worker"
+  || fail "F: the spawn path does not hold a sleep assertion after spawning a worker"
 grep -q 'AIGENTRY_SLEEP_GUARD' "$OPEN" \
-  || fail "F: open-session.sh has no AIGENTRY_SLEEP_GUARD kill switch"
+  || fail "F: the spawn path has no AIGENTRY_SLEEP_GUARD kill switch"
 # The assertion must follow the worker, not the spawner: a `caffeinate` with no -w,
 # or one following $$, keeps the host awake after open-session.sh exits.
 grep -qE 'caffeinate.*-w' "$REPO_ROOT/bin/lib/platform-unix.sh" \
