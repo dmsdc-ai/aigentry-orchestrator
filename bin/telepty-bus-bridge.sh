@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
-# telepty-bus-bridge.sh — the bus→file bridge the surface-event consumers wait for
-# (#847). telepty 0.8.0 signals, this repo actuates: the daemon broadcasts
-# `surface_orphaned` / `surface_mismatched` on ws://127.0.0.1:3848/api/bus and
-# stops there (BOUNDARY: telepty signals, the orchestrator acts). The reconciler's
+# telepty-bus-bridge.sh — CLI-compatible exec shim onto the TypeScript
+#           implementation (#899 tranche 4). Flags (--ensure | --run | -h/--help),
+#           exit codes, every `BUS_BRIDGE …` line in reconciler.log, the
+#           bus-bridge-health.json key set and byte shape, the state-dir paths
+#           (bus-bridge.pid, bus-bridge-health.json, bus-bridge.err, <src>.spool)
+#           and the env surface are unchanged; --help still prints lines 9-13 of
+#           the old header, which now live verbatim in src/bus-bridge/usage.ts.
+#
+# WHAT THE BRIDGE IS — kept here, because this is the file an operator opens.
+#
+# The bus→file bridge the surface-event consumers wait for (#847). telepty 0.8.0
+# signals, this repo actuates: the daemon broadcasts `surface_orphaned` /
+# `surface_mismatched` on ws://127.0.0.1:3848/api/bus and stops there (BOUNDARY:
+# telepty signals, the orchestrator acts). The reconciler's
 # consume_surface_orphaned / consume_surface_mismatched read JSONL files nobody
 # wrote, so both were dormant. This subscribes to the bus and writes exactly those
 # two event kinds, one JSON object per line, into exactly those files.
-#
-# Usage:
-#   telepty-bus-bridge.sh --ensure  # start it if it is not running (reconciler tick)
-#   telepty-bus-bridge.sh --run     # the bridge itself; foreground, long-lived
-#   telepty-bus-bridge.sh --help
 #
 # WHAT IT DOES NOT DO, deliberately:
 #
@@ -38,8 +43,7 @@
 #
 #   bridge  → appends ONLY to <src>.spool, and is the ONLY writer of it (singleton).
 #   bridge  → installs the spool as <src> by rename(2), and ONLY when <src> is absent.
-#   consumer→ reads <src>, then REMOVES it (rm, not truncate — see the reconciler
-#             change that accompanies this file). It is the only remover.
+#   consumer→ reads <src>, then REMOVES it (rm, not truncate).
 #
 # <src> exists for the whole of the consumer's read (the rm comes after), so the
 # bridge's "absent?" test cannot pass mid-read, so the rename cannot land under a
@@ -52,315 +56,94 @@
 # pending waits in the spool for at most one reconcile tick. The consumers are
 # tick-driven anyway (60s), so this adds no latency the actuation path can feel.
 #
-# Article 17: shell + jq + curl + the telepty CLI. No npm runtime deps, no WS client
-# of our own — `telepty listen` (cli.js) already is one, and it resolves the daemon
-# token internally, so this script never reads, holds, or passes a credential on a
-# command line (ps-visible). The one token read in this repo stays in
-# bin/lib/telepty-auth.sh, which lib/telepty-listing.sh sources for the reachability
-# probe (T87 asserts there is exactly one).
-
+# Contract changes recorded here (Rule 38 — what was measured):
+#
+#   * NO test SOURCES this script. Measured before the port:
+#     `grep -n '^\s*\(\.\|source\)\s.*telepty-bus-bridge.sh' tests/ bin/ src/` → zero
+#     hits, so — as in tranches 2d and 3a, and unlike bin/dispatch.sh (1) and
+#     bin/session-cleanup.sh (2a) — there is no sourced-library seam to replace and
+#     no `__probe` subcommand is owed. Of the eight guards that name it, T95 drives
+#     it end-to-end (parts A–D hermetic, E live-gated) and passes unedited; the other
+#     seven touch only the RECONCILER's seams (`AIGENTRY_BUS_BRIDGE=0` in
+#     tests/dispatch/lib.sh:27, T98, T102, T103; `BUS_BRIDGE_SH=$NOOP` in T110, T111,
+#     T112) and are untouched by construction. T118 adds the CLI/contract parity
+#     lines none of them covered, T119 the workspace layout.
+#
+#   * THE PID CORROBORATION SUBSTRING WIDENED, and it is the only contract change.
+#     bridge_pid() cross-checked the pidfile against `ps -p <pid> -o command=` for
+#     the literal `telepty-bus-bridge` — its own argv. A ported bridge runs as
+#     `node …/dist/src/bus-bridge/cli.js --run` and carries no such literal, so an
+#     unchanged check would answer "no bridge running" for a bridge that is alive,
+#     and the reconciler's per-tick --ensure would start a second one every 60s —
+#     the duplicate-writer scar (#539/#618) the singleton exists to prevent. TWO
+#     literals are now accepted, `telepty-bus-bridge` and `bus-bridge/cli.js`, and
+#     only those two: a bare `bus-bridge` would corroborate any recycled pid that
+#     happened to carry those characters in its cwd or arguments, which is exactly
+#     what the ps cross-check refuses. Keeping the first literal is what lets
+#     tests/dispatch/T118 run against the ORIGINAL bash at e2c3a36 as well.
+#
+#   * THE FIFO IS GONE, and with it `$STATE_DIR/bus-bridge.fifo`. The shell needed
+#     `mkfifo` + `exec 3<>` because a bash PIPELINE leaves the listener orphaned
+#     holding a bus socket and hands back no pid to end deterministically, and
+#     because a write-only open would block. child_process.spawn has all three
+#     properties natively. Measured before removing it: `bus-bridge.fifo` is
+#     referenced NOWHERE outside this script — not in T95, not in
+#     src/reconciler/cli.ts, not in bin/init/manifest.mjs. The one log line that
+#     went with it ("BUS_BRIDGE cannot create <fifo> — not subscribing") no longer
+#     has a way to fire and is not reproduced. The read discipline it existed to
+#     support is unchanged: liveness is still decided on the TIMEOUT path only,
+#     never straight after a read, so a listener that emitted three events and then
+#     died still has all three drained first.
+#
+#   * python3 IS OFF THIS PATH ENTIRELY. The two heredocs at the old :121-142 and
+#     :146-154 (the bus-bridge-health.json read/merge/atomic-write and the single
+#     field read) were this script's OWN logic and are TypeScript now — the same
+#     removal tranche 2d did to hitl's eight heredocs. There is no shared registry
+#     writer on this path to keep as a subprocess, unlike hitl. The health file's
+#     BYTE SHAPE is preserved deliberately: python's `json.dump(sort_keys=True)`
+#     default separators are ", " and ": " WITH the space, and
+#     tests/dispatch/T95:253 greps `'"state": "connected"'` with it.
+#
+#   * jq IS OFF THIS SCRIPT'S OWN PATH. The one `jq -rc` filter (old :225) is
+#     JSON.parse plus an ordered projection now, reproducing jq's `tostring`
+#     compaction, the field ORDER written in the filter, and jq's `{sid}`-on-a-
+#     missing-key answer of `null`. jq is NOT off the bridge's dependency set: it is
+#     still used by bin/lib/telepty-listing.sh, which this script reaches through a
+#     `bash -c '. lib; telepty_listing_verdict'` subprocess door and does not
+#     reimplement — that lib and the lib/telepty-auth.sh it sources are the ONE
+#     token read in this repo (T87).
+#
+#   * The two-layout dist resolution is bin/lib/node-shim.sh's, shared with
+#     dispatch.sh, dispatch-tracker.sh, session-cleanup.sh, session-reconciler.sh,
+#     hitl.sh and open-session.sh; tests/dispatch/T119 pins the workspace layout for
+#     this one.
+#
+# PATH HARDENING AND THE HOME RECOVERY STAY HERE, IN BASH, and they are observable.
+# The old :63 exported this exact PATH and the old :67 recovered HOME: this script
+# can be spawned from a reconciler tick that launchd started with NO HOME, and the
+# telepty token resolver in bin/lib/telepty-auth.sh builds its path from $HOME. Both
+# must apply to this process AND to every child it spawns — the `bash -c` door onto
+# telepty-listing.sh, the `telepty listen` subscriber, and the detached `--run`
+# child that `--ensure` starts. The shim is what those inherit from.
+#
+# Article 17: node + the bash libs under bin/lib/ that every ported peer also keeps.
+# macOS + Linux; no OS-specific primitive in this file or in the port (the shell had
+# no OS arm, so the port has no `process.platform` branch — enumerated in
+# src/bus-bridge/cli.ts's header).
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
-# Same launchd recovery the reconciler does (session-reconciler.sh:40-45): this can
-# be spawned from a reconciler tick that launchd started with no HOME, and the token
-# resolver builds its path from $HOME.
+# Same launchd recovery the reconciler does: this can be spawned from a reconciler
+# tick that launchd started with no HOME, and the token resolver builds its path
+# from $HOME.
 : "${HOME:=$(cd ~ 2>/dev/null && pwd -P)}"
 export HOME
 
-SCRIPT_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
-SCRIPT_DIR="$(dirname "$SCRIPT_SELF")"
-REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
-STATE_DIR="${DISPATCH_STATE_DIR:-$REPO_DIR/state/dispatch}"
-# The SAME two env names the reconciler resolves its sources with, so a test that
-# redirects one end redirects both (session-reconciler.sh:84,93).
-SURFACE_ORPHANED_SRC="${AIGENTRY_SURFACE_ORPHANED_SOURCE:-$STATE_DIR/surface-orphaned.jsonl}"
-SURFACE_MISMATCHED_SRC="${AIGENTRY_SURFACE_MISMATCHED_SOURCE:-$STATE_DIR/surface-mismatched.jsonl}"
-PIDFILE="$STATE_DIR/bus-bridge.pid"
-HEALTH="$STATE_DIR/bus-bridge-health.json"
-FIFO="$STATE_DIR/bus-bridge.fifo"
-ERRLOG="$STATE_DIR/bus-bridge.err"
-LOG="$STATE_DIR/reconciler.log"   # the log an operator already reads
-TELEPTY="${TELEPTY:-telepty}"
-READ_TIMEOUT="${BUS_BRIDGE_READ_TIMEOUT:-15}"
-HEARTBEAT_SECONDS="${BUS_BRIDGE_HEARTBEAT_SECONDS:-60}"
-BACKOFF_INITIAL="${BUS_BRIDGE_BACKOFF_INITIAL:-5}"
-BACKOFF_MAX="${BUS_BRIDGE_BACKOFF_MAX:-300}"
-SPOOL_MAX="${BUS_BRIDGE_SPOOL_MAX:-1000}"
-ERRLOG_MAX_BYTES="${BUS_BRIDGE_ERRLOG_MAX:-65536}"
+# Resolved exactly as the shell script's SCRIPT_DIR was, so a symlinked entrypoint
+# still locates bin/ helpers (lib/telepty-listing.sh).
+AIGENTRY_SHIM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+export AIGENTRY_SHIM_SCRIPT_DIR
 
-# The reachability probe + the one credential resolver it sources (#824).
-# shellcheck source=lib/telepty-listing.sh
-. "$SCRIPT_DIR/lib/telepty-listing.sh"
-
-# The whole filter, and the whole projection. Two kinds pass; each is cut down to
-# the field set the consumer documents, plus the daemon's own timestamp so a reader
-# can tell a fresh event from one that waited out a drain. `extra` is spread at the
-# top level of a bus event (daemon.js buildSessionEvent), so these are top-level
-# reads, not a nested payload. Output is "<kind><TAB><compact json>".
-BRIDGE_FILTER='
-  select(.type == "surface_orphaned" or .type == "surface_mismatched")
-  | .type + "\t" + (
-      if .type == "surface_orphaned" then
-        {sid, backend, cmuxWorkspaceId, surfaceGoneSeconds, livenessVerdict, timestamp}
-      else
-        {sid, backend, cmuxWorkspaceId, expectedPtyPid, observedSurface, mismatchSeconds, timestamp}
-      end | tostring)
-'
-
-usage() { sed -n '9,13p' "$0"; exit "${1:-0}"; }
-
-now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-
-log() { printf '%s %s\n' "$(now_iso)" "$*" | tee -a "$LOG" >&2; }
-
-# health_update <set-json> [inc-json] — merge into bus-bridge-health.json. One
-# object, rewritten atomically: a status file, never a ledger.
-health_update() {
-  local inc="${2:-}"
-  [ -n "$inc" ] || inc='{}'
-  HB_SET="$1" HB_INC="$inc" HB_PATH="$HEALTH" python3 - <<'PY' 2>/dev/null || true
-import json, os, tempfile
-path = os.environ["HB_PATH"]
-try:
-    with open(path, encoding="utf-8") as fh:
-        cur = json.load(fh)
-    if not isinstance(cur, dict):
-        cur = {}
-except Exception:
-    cur = {}
-cur.update(json.loads(os.environ["HB_SET"]))
-for key, delta in json.loads(os.environ["HB_INC"]).items():
-    try:
-        cur[key] = (cur.get(key) or 0) + delta
-    except TypeError:
-        cur[key] = delta
-fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
-with os.fdopen(fd, "w", encoding="utf-8") as fh:
-    json.dump(cur, fh, ensure_ascii=False, sort_keys=True)
-    fh.write("\n")
-os.replace(tmp, path)
-PY
-}
-
-health_field() {  # health_field <key> — print it, or nothing
-  HB_PATH="$HEALTH" HB_KEY="$1" python3 - <<'PY' 2>/dev/null || true
-import json, os
-try:
-    with open(os.environ["HB_PATH"], encoding="utf-8") as fh:
-        val = json.load(fh).get(os.environ["HB_KEY"])
-except Exception:
-    val = None
-print("" if val is None else val)
-PY
-}
-
-# bridge_pid — the pid of a LIVE bridge, or nothing. The pid is corroborated
-# against the process's own command line: a recycled pid is how a stale pidfile
-# convinces every future instance that a bridge it cannot see is running.
-bridge_pid() {
-  local pid
-  [ -f "$PIDFILE" ] || return 0
-  pid=$(cat "$PIDFILE" 2>/dev/null || true)
-  case "$pid" in ''|*[!0-9]*) return 0;; esac
-  kill -0 "$pid" 2>/dev/null || return 0
-  ps -p "$pid" -o command= 2>/dev/null | grep -q 'telepty-bus-bridge' || return 0
-  printf '%s' "$pid"
-}
-
-# acquire_singleton — #539/#618: two bridges writing one spool is the duplicate-
-# writer scar this ecosystem already wears. The second instance says so and exits 0;
-# a losing instance is a normal outcome, not a failure.
-acquire_singleton() {
-  local other
-  other=$(bridge_pid)
-  if [ -n "$other" ]; then
-    log "BUS_BRIDGE already running pid=$other — this instance exits (single-writer, #539/#618)"
-    return 1
-  fi
-  rm -f "$PIDFILE"
-  set -C
-  if ! : > "$PIDFILE" 2>/dev/null; then
-    set +C
-    log "BUS_BRIDGE lost the pidfile race — this instance exits (single-writer, #539/#618)"
-    return 1
-  fi
-  set +C
-  printf '%s\n' "$$" > "$PIDFILE"
-  return 0
-}
-
-# install_spool <src> — publish the spooled batch as <src> by rename, but only when
-# the consumer has drained the previous one. See the drain-race note in the header:
-# the "absent" test is what makes the rename safe, so it is not an optimisation.
-install_spool() {
-  local src="$1" spool="$1.spool"
-  [ -s "$spool" ] || return 0
-  [ -e "$src" ] && return 0
-  mv "$spool" "$src" 2>/dev/null || true
-}
-
-# spool_append <src> <json> — the only write path. Capped: if the reconciler stops
-# draining, this must not grow without bound, and a drop must be counted rather
-# than absorbed.
-spool_append() {
-  local src="$1" json="$2" spool="$1.spool" lines drops
-  printf '%s\n' "$json" >> "$spool"
-  lines=$(wc -l < "$spool" 2>/dev/null | tr -d ' ')
-  if [ "${lines:-0}" -gt "$SPOOL_MAX" ]; then
-    drops=$((lines - SPOOL_MAX))
-    if tail -n "$SPOOL_MAX" "$spool" > "$spool.trim" 2>/dev/null; then
-      mv "$spool.trim" "$spool"
-      health_update '{}' "{\"events_dropped\": $drops}"
-      log "BUS_BRIDGE spool cap ($SPOOL_MAX) hit for $(basename "$src") — dropped $drops oldest event(s); nothing is draining $(basename "$src")"
-    fi
-  fi
-  install_spool "$src"
-  health_update "{\"last_event_at\": \"$(now_iso)\"}" '{"events_bridged": 1}'
-}
-
-# bridge_line <raw> — one line off the bus.
-bridge_line() {
-  local line="$1" out kind payload
-  case "$line" in '{'*) ;; *) return 0;; esac   # the CLI's own banner, colour codes
-  out=$(printf '%s' "$line" | jq -rc "$BRIDGE_FILTER" 2>/dev/null || true)
-  [ -z "$out" ] && return 0
-  kind=${out%%$'\t'*}
-  payload=${out#*$'\t'}
-  case "$kind" in
-    surface_orphaned)   spool_append "$SURFACE_ORPHANED_SRC" "$payload" ;;
-    surface_mismatched) spool_append "$SURFACE_MISMATCHED_SRC" "$payload" ;;
-  esac
-}
-
-# bridge_tick — run after EVERY read, event or timeout, and paced by wall clock
-# (bash's own $SECONDS, so no fork per bus line). Two jobs:
-#   * retry the install — a batch spooled behind an undrained file would otherwise
-#     wait for the next event, which may never come;
-#   * heartbeat, so "connected and silent" and "wedged" do not look alike.
-# Measured, not assumed: an earlier version ticked only on the read TIMEOUT, and a
-# 90s subscription to the real bus never ticked once — session_activity_observation
-# arrives faster than the timeout, so the busiest bus was the one that never
-# heartbeated. install_spool is two `[ -s ]` tests, cheap enough for every line.
-LAST_BEAT=0
-bridge_tick() {
-  install_spool "$SURFACE_ORPHANED_SRC"
-  install_spool "$SURFACE_MISMATCHED_SRC"
-  if [ $(( SECONDS - LAST_BEAT )) -ge "$HEARTBEAT_SECONDS" ]; then
-    LAST_BEAT=$SECONDS
-    health_update "{\"heartbeat_at\": \"$(now_iso)\"}"
-  fi
-}
-
-# subscribe — one connected lifetime. Returns when the listener dies; the caller
-# owns the reconnect. A FIFO rather than a pipeline so the listener has a pid we
-# can end deterministically (a pipeline leaves it orphaned holding a bus socket),
-# opened read-write so the open never blocks and liveness is decided by kill -0
-# rather than by an EOF this end would also have to wait for.
-LISTEN_PID=""
-subscribe() {
-  local listen_pid rc line
-  rm -f "$FIFO"
-  mkfifo "$FIFO" 2>/dev/null || { log "BUS_BRIDGE cannot create $FIFO — not subscribing"; return 1; }
-  if [ -f "$ERRLOG" ] && [ "$(wc -c < "$ERRLOG" | tr -d ' ')" -gt "$ERRLOG_MAX_BYTES" ]; then
-    : > "$ERRLOG"
-  fi
-  "$TELEPTY" listen > "$FIFO" 2>> "$ERRLOG" &
-  listen_pid=$!
-  LISTEN_PID="$listen_pid"
-  exec 3<> "$FIFO"
-  health_update "{\"state\": \"connected\", \"connected_at\": \"$(now_iso)\", \"listen_pid\": $listen_pid, \"note\": \"\"}"
-  # Liveness is checked on the TIMEOUT path only, never straight after a read: a
-  # listener that emitted three events and then died must have all three drained
-  # out of the pipe first. Timeout means the pipe is empty, and only then does the
-  # listener being gone mean there is nothing left to lose.
-  while :; do
-    rc=0
-    IFS= read -r -t "$READ_TIMEOUT" line <&3 || rc=$?
-    if [ "$rc" -eq 0 ]; then bridge_line "$line"; bridge_tick; continue; fi
-    if [ "$rc" -le 128 ]; then break; fi     # not a timeout: the fifo is gone
-    kill -0 "$listen_pid" 2>/dev/null || break
-    bridge_tick
-  done
-  exec 3<&-
-  kill "$listen_pid" 2>/dev/null || true
-  wait "$listen_pid" 2>/dev/null || true
-  LISTEN_PID=""
-  rm -f "$FIFO"
-  return 0
-}
-
-# bridge_cleanup — the listener is OUR child and holds a bus socket; a bridge that
-# is signalled away without ending it leaves a subscriber nobody supervises, which
-# the next --ensure would then double.
-bridge_cleanup() {
-  [ -n "$LISTEN_PID" ] && kill "$LISTEN_PID" 2>/dev/null
-  rm -f "$PIDFILE" "$FIFO"
-  return 0
-}
-
-run_bridge() {
-  mkdir -p "$STATE_DIR"
-  acquire_singleton || exit 0
-  trap bridge_cleanup EXIT
-  trap 'trap - EXIT; bridge_cleanup; exit 0' INT TERM
-  local backoff="$BACKOFF_INITIAL" verdict gap down_at="" up_at=""
-  LAST_BEAT=$SECONDS
-  health_update "{\"pid\": $$, \"started_at\": \"$(now_iso)\", \"state\": \"starting\"}"
-  log "BUS_BRIDGE started pid=$$ src=$(basename "$SURFACE_ORPHANED_SRC"),$(basename "$SURFACE_MISMATCHED_SRC")"
-  while :; do
-    # A vanished state dir means the tree this bridge was writing into is gone
-    # (hermetic test teardown, or a wiped state). Exit rather than recreate it.
-    [ -d "$STATE_DIR" ] || exit 0
-    verdict=$(telepty_listing_verdict)
-    if [ "$verdict" != "ok" ]; then
-      health_update "{\"state\": \"degraded\", \"note\": \"daemon $verdict\", \"checked_at\": \"$(now_iso)\"}"
-      sleep "$backoff"
-      backoff=$(( backoff * 2 )); [ "$backoff" -gt "$BACKOFF_MAX" ] && backoff="$BACKOFF_MAX"
-      continue
-    fi
-    if [ -n "$down_at" ]; then
-      gap=$(( $(date +%s) - down_at ))
-      health_update "{\"last_gap_seconds\": $gap, \"reconnected_at\": \"$(now_iso)\"}" \
-                    "{\"gap_seconds_total\": $gap}"
-      log "BUS_BRIDGE reconnected after ${gap}s — surface events emitted in that window are LOST and are not replayed; the wh_alive sweep is what covers them"
-      down_at=""
-    fi
-    up_at=$(date +%s)
-    subscribe || true
-    down_at=$(date +%s)
-    health_update "{\"state\": \"disconnected\", \"disconnected_at\": \"$(now_iso)\"}" '{"disconnects": 1}'
-    # A listener that did not even stay up for one read window is failing, not
-    # flapping — respawning it every BACKOFF_INITIAL would be a tight loop against
-    # whatever is refusing (a rotated token, a CLI that cannot run). Back off on
-    # that; reset only after a subscription that actually lived.
-    if [ $(( down_at - up_at )) -lt "$READ_TIMEOUT" ]; then
-      sleep "$backoff"
-      backoff=$(( backoff * 2 )); [ "$backoff" -gt "$BACKOFF_MAX" ] && backoff="$BACKOFF_MAX"
-    else
-      sleep "$BACKOFF_INITIAL"
-      backoff="$BACKOFF_INITIAL"
-    fi
-  done
-}
-
-# ensure_bridge — the supervision step, idempotent, cheap, and silent when the
-# bridge is already up. Called once per reconcile tick, so a bridge that died is
-# back within one tick and the dead window is named in reconciler.log.
-ensure_bridge() {
-  local other last
-  other=$(bridge_pid)
-  [ -n "$other" ] && return 0
-  mkdir -p "$STATE_DIR"
-  last=$(health_field heartbeat_at)
-  [ -n "$last" ] || last=$(health_field started_at)
-  nohup "$SCRIPT_SELF" --run >> "$ERRLOG" 2>&1 &
-  log "BUS_BRIDGE not running — started (last seen alive: ${last:-never}; surface events since then were never bridged)"
-  return 0
-}
-
-case "${1:---help}" in
-  --ensure) ensure_bridge ;;
-  --run)    run_bridge ;;
-  -h|--help) usage 0 ;;
-  *) printf 'unknown argument: %s\n' "$1" >&2; usage 2 ;;
-esac
+# shellcheck source=lib/node-shim.sh
+. "$AIGENTRY_SHIM_SCRIPT_DIR/lib/node-shim.sh"
+aigentry_node_shim telepty-bus-bridge.sh dist/src/bus-bridge/cli.js
+exec node "$AIGENTRY_SHIM_JS" "$@"
