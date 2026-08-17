@@ -127,6 +127,26 @@ run() {
 
 body() { local f="$T_TMP/body-$1.txt"; shift; printf '%s\n' "$@" > "$f"; printf '%s' "$f"; }
 
+# fenced <name> <payload-json-line> — a body carrying an envelope-in-PTY fence; echoes
+# the path.
+#
+# KEEP THE `$( … )` CALL SITES BORING — this is a runner constraint, not style. CI's
+# macOS job runs bash 3.2, and the first cut built each fenced body inline:
+#   run --body-file "$(body "seg-$i" '```…' "{\"session_id\":\"$bad\",…}" '```')"
+# Under bash 3.2 that call reached `run` as TWELVE positional parameters (the same path
+# repeated eleven times, measured); under bash 5 it was the two it reads as. So the
+# guard passed locally and failed on the runner for a reason with nothing to do with
+# the inject path. Neither the backticks nor the `\"` escapes reproduce it alone in a
+# minimal case — the exact 3.2 parse was not isolated — so the fix is structural rather
+# than a workaround for a named bug: the fence lives in this function, and any payload
+# needing interpolation is assembled into a variable BEFORE the substitution (see the
+# M-block loop). Nothing inside a `$( … )` here is more than a bare word or "$var".
+fenced() {
+  local f="$T_TMP/body-$1.txt"
+  { printf '%s\n' '```json aigentry-envelope/v1'; printf '%s\n' "$2"; printf '%s\n' '```'; } > "$f"
+  printf '%s' "$f"
+}
+
 want_rc()   { [ "$RC" = "$1" ] || fail "$2: rc=$RC (want $1) out=<$OUT> err=<$ERRTXT>"; }
 want_out()  { [ "$OUT" = "$1" ] || fail "$2: stdout=<$OUT> want=<$1>"; }
 want_err()  { case "$ERRTXT" in *"$1"*) ;; *) fail "$2: stderr=<$ERRTXT> want substring <$1>";; esac; }
@@ -229,9 +249,8 @@ PY
 [ "$(wc -l < "$HOLDS" | tr -d ' ')" = 1 ] || fail "H: holds.log is not append-one-line-per-hold"
 
 # ── I. test-report: path, bytes, and the --sid override ──
-FENCED=$(body treport '```json aigentry-envelope/v1' \
-  '{"schema_version":"1","kind":"test-report","payload":{"schema_version":"1","session_id":"tester-9","suite":"vitest/계약","totals":{"total":3,"passed":3,"failed":0,"skipped":0},"finished_at":"2026-05-23T13:50:00Z","duration_ms":7}}' \
-  '```')
+FENCED=$(fenced treport \
+  '{"schema_version":"1","kind":"test-report","payload":{"schema_version":"1","session_id":"tester-9","suite":"vitest/계약","totals":{"total":3,"passed":3,"failed":0,"skipped":0},"finished_at":"2026-05-23T13:50:00Z","duration_ms":7}}')
 run --body-file "$FENCED"
 want_rc 0 "I test-report"
 DATE_DIR=$(date -u +%Y-%m-%d)
@@ -257,9 +276,8 @@ want_rc 0 "I --sid override"
   || fail "I: --sid did not override the payload session_id for the filename"
 
 # ── J. DEVIATION D1 (type) — a non-integer grace_seconds ──
-BAD_TYPE=$(body badtype '```json aigentry-envelope/v1' \
-  '{"schema_version":"1","kind":"cleanup-request","payload":{"target":"victim-1","tier":"immediate","reason":"done","grace_seconds":"soon"}}' \
-  '```')
+BAD_TYPE=$(fenced badtype \
+  '{"schema_version":"1","kind":"cleanup-request","payload":{"target":"victim-1","tier":"immediate","reason":"done","grace_seconds":"soon"}}')
 run --body-file "$BAD_TYPE"
 if [ "$ORIGINAL" = "1" ]; then
   want_rc 0 "J original"
@@ -279,7 +297,7 @@ fi
 # ── K. DEVIATION D1 (bounds) — in-range integers only ──
 bounds_case() { # <label> <fenced-json> <field> <kind> <target> <sched-substring>
   local label="$1" json="$2" field="$3" kind="$4" target="$5" sched="$6"
-  run --body-file "$(body "bounds-$label" '```json aigentry-envelope/v1' "$json" '```')"
+  run --body-file "$(fenced "bounds-$label" "$json")"
   if [ "$ORIGINAL" = "1" ]; then
     want_rc 0 "K/$label original"
     want_sched "$sched" "K/$label original: the bash passed the out-of-range value through"
@@ -303,12 +321,12 @@ bounds_case defer-huge \
   '{"schema_version":"1","kind":"extend-lifetime","payload":{"target":"victim-5","defer_minutes":1441}}' \
   defer_minutes extend-lifetime victim-5 "defer victim-5 --minutes 1441"
 # …and the edges of the accepted range still go through, in both implementations.
-run --body-file "$(body bounds-edge '```json aigentry-envelope/v1' \
-  '{"schema_version":"1","kind":"cleanup-request","payload":{"target":"ok-1","tier":"immediate","grace_seconds":86400}}' '```')"
+run --body-file "$(fenced bounds-edge \
+  '{"schema_version":"1","kind":"cleanup-request","payload":{"target":"ok-1","tier":"immediate","grace_seconds":86400}}')"
 want_rc 0 "K edge 86400"
 want_sched "schedule ok-1 --source explicit-request --grace-seconds 86400" "K: the upper edge must stay accepted"
-run --body-file "$(body bounds-zero '```json aigentry-envelope/v1' \
-  '{"schema_version":"1","kind":"extend-lifetime","payload":{"target":"ok-2","defer_minutes":0}}' '```')"
+run --body-file "$(fenced bounds-zero \
+  '{"schema_version":"1","kind":"extend-lifetime","payload":{"target":"ok-2","defer_minutes":0}}')"
 want_rc 0 "K edge 0"
 # defer_minutes 0 is falsy in bash's `[ -n "$defer" ]` sense only if it were empty; "0" is not.
 want_sched "defer ok-2 --minutes 0" "K: defer_minutes 0 must stay a defer, not a cancel"
@@ -343,9 +361,8 @@ fi
 # `../../../pwned` lands from `$TEST_REPORTS_DIR/<date>/`.
 CANARY_DIR="$T_TMP/canary"; mkdir -p "$CANARY_DIR"
 printf 'do-not-touch\n' > "$CANARY_DIR/precious.json"
-TRAVERSAL=$(body traversal '```json aigentry-envelope/v1' \
-  '{"schema_version":"1","kind":"test-report","payload":{"schema_version":"1","session_id":"../../canary/precious","suite":"s","totals":{"total":1,"passed":1,"failed":0,"skipped":0},"finished_at":"2026-05-23T13:50:00Z","duration_ms":1}}' \
-  '```')
+TRAVERSAL=$(fenced traversal \
+  '{"schema_version":"1","kind":"test-report","payload":{"schema_version":"1","session_id":"../../canary/precious","suite":"s","totals":{"total":1,"passed":1,"failed":0,"skipped":0},"finished_at":"2026-05-23T13:50:00Z","duration_ms":1}}')
 run --body-file "$TRAVERSAL"
 if [ "$ORIGINAL" = "1" ]; then
   want_rc 0 "M original"
@@ -369,14 +386,17 @@ if [ "$ORIGINAL" != "1" ]; then
   LONG_SID=$(python3 -c 'print("a"*300)')
   for bad in ".." "." "a/b" "" 'a\\b' "$LONG_SID"; do
     seg_i=$((seg_i + 1))
-    run --body-file "$(body "seg-$seg_i" '```json aigentry-envelope/v1' \
-      "{\"schema_version\":\"1\",\"kind\":\"test-report\",\"payload\":{\"schema_version\":\"1\",\"session_id\":\"$bad\",\"suite\":\"s\",\"totals\":{\"total\":1,\"passed\":1,\"failed\":0,\"skipped\":0},\"finished_at\":\"2026-05-23T13:50:00Z\",\"duration_ms\":1}}" \
-      '```')"
+    # Assembled into a variable FIRST, by single-quote concatenation rather than `\"`
+    # escapes, so the `$( … )` below contains nothing but "$var". See fenced()'s header
+    # for the bash 3.2 failure this shape avoids.
+    seg_json='{"schema_version":"1","kind":"test-report","payload":{"schema_version":"1","session_id":"'"$bad"'","suite":"s","totals":{"total":1,"passed":1,"failed":0,"skipped":0},"finished_at":"2026-05-23T13:50:00Z","duration_ms":1}}'
+    seg_body=$(fenced "seg-$seg_i" "$seg_json")
+    run --body-file "$seg_body"
     want_rc 1 "M port: session_id <$bad> was accepted as a path segment"
   done
   # …while an ordinary sid still writes, so the refusal is narrow.
-  run --body-file "$(body seg-ok '```json aigentry-envelope/v1' \
-    '{"schema_version":"1","kind":"test-report","payload":{"schema_version":"1","session_id":"ih899-coder.v2","suite":"s","totals":{"total":1,"passed":1,"failed":0,"skipped":0},"finished_at":"2026-05-23T13:50:00Z","duration_ms":1}}' '```')"
+  run --body-file "$(fenced seg-ok \
+    '{"schema_version":"1","kind":"test-report","payload":{"schema_version":"1","session_id":"ih899-coder.v2","suite":"s","totals":{"total":1,"passed":1,"failed":0,"skipped":0},"finished_at":"2026-05-23T13:50:00Z","duration_ms":1}}')"
   want_rc 0 "M port: a normal session_id must still write"
   [ -f "$TEST_REPORTS_DIR/$DATE_DIR/ih899-coder.v2.json" ] || fail "M port: the narrow refusal blocked a legitimate sid"
 fi

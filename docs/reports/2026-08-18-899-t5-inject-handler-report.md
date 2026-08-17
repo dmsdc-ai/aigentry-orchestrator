@@ -193,6 +193,21 @@ example of what D2 could overwrite — prose, not code, but the invariant does n
 should not care. The header now says "the dispatch registry"; the literal paths live in
 `src/inject-handler/cli.ts`'s header, which is outside T69's scan by design.
 
+**CI caught a second one that local runs could not.** The first push was green on
+ubuntu and both Windows jobs and red on macOS: `T124` block M failed there with
+`rc=4 … unknown <path>`. It was the guard, not the port. CI's macOS job runs **bash
+3.2**, and the inline fenced-body construct
+`run --body-file "$(body "seg-$i" '…' "{\"session_id\":\"$bad\",…}" '…')"` reached the
+function as **twelve** positional parameters under 3.2 (the same path repeated eleven
+times, measured) and as the two it reads as under bash 5. Neither the backticks nor the
+`\"` escapes reproduce it alone in a minimal case, so the fix is structural rather than
+a workaround for a named bug: fences moved into a `fenced()` helper, interpolated
+payloads assembled into a variable before the substitution, and nothing left inside any
+`$( … )` but a bare word or `"$var"`. **Both guards now run green under `/bin/bash`
+3.2.57 and bash 5**, in both parity directions — that pair is now part of the local
+check, since "passes on my shell" demonstrably was not the same claim as "passes on the
+runner".
+
 RED-first, re-runnable: T124 passes against the original bash with
 `INJECT_PARITY_ORIGINAL=1` and **fails** against it without the flag
 (`FAIL[T124]: J port: rc=0 (want 1)`), so it is non-vacuous. T125 fails against the
