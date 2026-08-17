@@ -57,9 +57,13 @@
 #       D2 `payload.session_id` was pasted into the test-report filename after a
 #          `typeof === "string"` check and nothing else, then `mv`'d into place — so
 #          `"../../../pwned"` wrote a `.json` file of ATTACKER-CHOSEN CONTENT anywhere
-#          the orchestrator user can write, overwriting whatever was there
-#          (state/dispatch/active.json, ~/.telepty/config.json). Reproduced end to end
-#          before the fix. A session_id must now be a single safe path segment;
+#          the orchestrator user can write, overwriting whatever was there — the
+#          dispatch registry, the Layer-D pending queue, the telepty daemon config.
+#          (Those files are named explicitly in src/inject-handler/cli.ts's header, not
+#          here: T69's single-writer invariant scans bin/ for the registry filename and
+#          is right to, since a path in a bin/ file is a second entrance by
+#          construction.) Reproduced end to end before the fix. A session_id must now
+#          be a single safe path segment;
 #          T124 block M keeps a canary outside TEST_REPORTS_DIR to prove it.
 #   * `--help` TEXT IS VERBATIM, including the two lines the port makes only partly
 #     true (it names `src/session/inject-parser.js`, and says a recognized envelope
