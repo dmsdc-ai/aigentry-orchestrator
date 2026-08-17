@@ -145,13 +145,18 @@ bridge() {
       CURL="$STUB_BIN/curl-200" \
       DISPATCH_STATE_DIR="$DISPATCH_STATE_DIR" \
       BUS_BRIDGE_READ_TIMEOUT=1 \
-      "${EXTRA_ENV[@]}" \
+      ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} \
       "$BRIDGE" "$@" > "$OUT" 2> "$ERR"
   RC=$?
   set -e
   [ "$verb" = "--ensure" ] && track_started_bridge
   return 0
 }
+# EXTRA_ENV is expanded as ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} above, not the plain
+# "${EXTRA_ENV[@]}": macOS ships bash 3.2, where an EMPTY array expanded under
+# `set -u` is an unbound variable, and the CI runner's /bin/bash is that one. Caught
+# by the macOS CI leg (ubuntu's bash 5 accepts the plain form, which is why a local
+# run on a homebrew bash proves nothing here).
 EXTRA_ENV=()
 
 # track_started_bridge — collect whatever pid the pidfile carries over a short
@@ -262,6 +267,9 @@ $(grep 'BUS_BRIDGE' "$DISPATCH_STATE_DIR/reconciler.log")"
 # must not corroborate, or a recycled pid resurrects a dead bridge's pidfile forever.
 sleep 60 &
 IMPOSTOR=$!
+# disowned so the trap's kill does not make bash 3.2 (macOS CI's /bin/bash) print a
+# "Terminated: 15" job notice, which reads like a failure in a CI log and is not one.
+disown "$IMPOSTOR" 2>/dev/null || true
 BRIDGE_PIDS="$BRIDGE_PIDS $IMPOSTOR"
 SAVED_PID="$FIRST_PID"
 kill "$FIRST_PID" 2>/dev/null || true
