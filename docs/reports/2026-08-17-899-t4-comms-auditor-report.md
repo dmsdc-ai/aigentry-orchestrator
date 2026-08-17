@@ -266,6 +266,19 @@ on a passing suite teaches people to re-run red CI, which is the opposite of wha
 is for. 8 leaves ~5 min of headroom and still catches a real hang. Cited in the
 commit message and in the file.
 
+**Confirmed on this PR's own green run** (32041253545, 122 guards), which is a second
+independent datapoint for the same claim rather than a re-quote of sc899's:
+
+| runner | guard-suite step | headroom under the new cap |
+|---|---|---|
+| macos-latest | **2m43s** | 5m17s |
+| ubuntu-latest | **1m53s** | 6m07s |
+
+macos at 2m43s against the 4m11s sc899 measured for essentially this suite is the
+87 s of spread, seen again — the fast end this time. That spread is the whole reason
+4 was the wrong number: it sat inside the variance, so which side of it a run landed
+on decided whether a passing suite was reported as a timeout.
+
 ## 11. NOT checked / NOT done (Rule 38)
 
 * **`bin/ask.sh` is untouched.** It holds the other half of D3's two-writer race and
