@@ -1,193 +1,100 @@
 #!/usr/bin/env bash
-# inject-handler.sh — Orchestrator-side dispatcher for incoming inject envelopes.
+# inject-handler.sh — CLI-compatible exec shim onto the TypeScript implementation
+#                     (#899 tranche 5). Flags (`--body-file`, `--sid`, `-h`/`--help`),
+#                     the stdin form, exit codes (0/1/2/4), every stdout and stderr
+#                     line, the holds.log record shape, the test-report bytes and all
+#                     three children's argv are unchanged; `--help` still prints the
+#                     19 lines `sed -n '2,20p'` printed, which now live in
+#                     src/inject-handler/usage.ts.
 #
-# Reads an inject body from stdin (or --body-file), parses it via the compiled
-# src/session/inject-parser.js, then takes the per-kind action:
+# Contract changes recorded here (Rule 38 — what was measured). The reproductions are
+# in docs/reports/2026-08-18-899-t5-inject-handler-disposition.md §7:
 #
-#   report          → nonterminal observation + Layer-D cleanup schedule.
-#                     telepty#60 Stage A: 0.8.0 has NO outcome protocol, so a
-#                     textual REPORT is an ordinary message. It cannot settle a
-#                     dispatch; it is recorded as evidence and named as such.
-#   cleanup-request → dispatch-cleanup-scheduler.sh schedule <target>
-#   extend-lifetime → dispatch-cleanup-scheduler.sh cancel or defer (per defer_minutes)
-#   hold            → emit to state/dispatch/holds.log (audit only — orch reads this)
-#   test-report     → write state/test-reports/<YYYY-MM-DD>/<session_id>.json (R5a)
+#   * SOURCEABILITY WAS NEVER USED, so nothing was removed for it and there is NO
+#     `__probe` surface. Measured before the port:
+#     `grep -rnE '^[[:space:]]*(\.|source)[[:space:]].*inject-handler\.sh' .` matches
+#     nothing repo-wide — all four guards that drive it (T17, T18, T24, T83) invoke it
+#     as a subprocess. It has no production caller at all: nothing in bin/, src/,
+#     package.json or launchd reaches it, as docs/adr/2026-07-26-hitl-gate-primitive.md
+#     §Context recorded and this port re-measured.
+#   * THIS SCRIPT SOURCED NO LIBS (zero `.`/`source` lines), so as in tranches 4 there
+#     is no `bash -c '. lib; fn'` door and no bin/wh-cli.sh verb. Its three children
+#     stay children with identical argv: bin/dispatch-registry.py (`observe …` ×2),
+#     bin/dispatch-cleanup-scheduler.sh (`schedule`/`defer`/`cancel`, 4 call shapes —
+#     itself a TS shim since tranche 4, so calling it in-process would fork its
+#     fail-CLOSED keep_alive gate) and bin/emit-telemetry.mjs (5 emissions).
+#   * THE INLINE `node -e` PARSER BRIDGE AND ALL TEN `python3 -c` FIELD READS ARE GONE,
+#     absorbed in-process — they were how bash reached a JSON parser, never a contract.
+#     With them goes the `INJECT_PARSER_JS` env seam and its `exit 2 — compiled parser
+#     not found` arm: src/session/inject-parser is a compile-time import now, so there
+#     is no path left to point at, and a runtime `import()` of an env-supplied JS file
+#     would be a NEW code-execution seam. Measured first — `INJECT_PARSER_JS` appeared
+#     exactly once in the whole tree, on its own defaulting line, with no override
+#     anywhere. The missing-implementation exit 2 is now bin/lib/node-shim.sh's, with
+#     its wording; no guard asserted the old text.
+#   * TWO PRE-EXISTING DEFECTS ARE FIXED RATHER THAN REPRODUCED, on the orchestrator's
+#     decision. src/inject-handler/cli.ts's header carries the full measurements, and
+#     tests/dispatch/T124 blocks J-M assert BOTH sides — the bash's behaviour under
+#     INJECT_PARITY_ORIGINAL=1 and the port's without it:
+#       D1 (task #928) `payload.grace_seconds` and `payload.defer_minutes` reached
+#          bin/dispatch-cleanup-scheduler.sh from an UNAUTHENTICATED envelope with no
+#          validation, behind `>/dev/null 2>&1 || true`. A non-integer grace used to
+#          truncate the fleet's cleanup-pending.json to zero bytes and now makes the
+#          scheduler refuse (rc 1) — which `|| true` ate, so the envelope's cleanup was
+#          never armed, the ordinary success line still printed, the exit code was
+#          still 0, and NOTHING said so. A negative grace wrote a
+#          scheduled_cleanup_time in the PAST (an inject that retires a live session
+#          immediately); a negative defer pulled a cleanup EARLIER. Both fields are now
+#          integers in range (0..86400s, 0..1440m) at the trust boundary, and a
+#          scheduler call that fails for any other reason is no longer silent either.
+#          Split deliberately: a REJECTED FIELD is a malformed payload — stderr line
+#          naming the field, `INJECT_PAYLOAD_REJECTED` in state/dispatch/alerts.log,
+#          exit 1, no scheduler call (T24 already required non-zero for a malformed
+#          payload); a SCHEDULER rc≠0 on a recognized envelope keeps EXIT 0 and the
+#          ordinary stdout line and adds a stderr line plus
+#          `CLEANUP_SCHEDULE_FAILED`, because "exits 0 on any recognized envelope" is
+#          the contract `--help` prints.
+#       D2 `payload.session_id` was pasted into the test-report filename after a
+#          `typeof === "string"` check and nothing else, then `mv`'d into place — so
+#          `"../../../pwned"` wrote a `.json` file of ATTACKER-CHOSEN CONTENT anywhere
+#          the orchestrator user can write, overwriting whatever was there — the
+#          dispatch registry, the Layer-D pending queue, the telepty daemon config.
+#          (Those files are named explicitly in src/inject-handler/cli.ts's header, not
+#          here: T69's single-writer invariant scans bin/ for the registry filename and
+#          is right to, since a path in a bin/ file is a second entrance by
+#          construction.) Reproduced end to end before the fix. A session_id must now
+#          be a single safe path segment;
+#          T124 block M keeps a canary outside TEST_REPORTS_DIR to prove it.
+#   * `--help` TEXT IS VERBATIM, including the two lines the port makes only partly
+#     true (it names `src/session/inject-parser.js`, and says a recognized envelope
+#     exits 0 — which an out-of-bounds field no longer does). Rewriting operator-visible
+#     bytes on top of the behaviour change would make T124 block A untestable against
+#     the original bash, which is how the parity is measured at all; the deviations are
+#     named here instead, which is the surface Rule 38 asks for.
+#   * NAMED FOR A TICKET, not fixed (Rule 29 — out of this task's decided scope):
+#     src/session/inject-parser.ts's validateTestReport still accepts any string as
+#     session_id, so the segment rule benefits this consumer only; the telemetry
+#     `--payload-json` is still string-interpolated, so a `"` in a reason still emits
+#     invalid JSON (reproduced byte for byte); a failing dispatch-registry.py observe
+#     is still swallowed.
 #
-# The handler exits 0 on any recognized envelope (action taken or logged).
-# Unrecognized bodies exit 1 with the parser's error on stderr.
-#
-# Usage:
-#   inject-handler.sh < body.txt
-#   inject-handler.sh --body-file body.txt
-#   inject-handler.sh --sid <override-sid> < body.txt   # for sid-less envelopes (REPORT)
-
+# THE PATH HARDENING STAYS HERE, IN BASH, and byte-identical. It is what puts `python3`
+# on PATH for bin/dispatch-registry.py's shebang and `node` on PATH for the
+# bin/dispatch-cleanup-scheduler.sh child — both are launched by the node process, so a
+# copy inside TS would leave one process generation running with the caller's PATH.
+# NAMED TENSION, pre-existing, mentioned not changed (Rule 29): bin/session-cleanup.sh
+# :34-41 records that a hardcoded `/opt/homebrew/bin` prefix is what made task #400 pick
+# a stale homebrew telepty. This script never runs `telepty` itself, so that particular
+# hazard does not apply here.
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+# Resolved exactly as the shell script's SCRIPT_DIR was, so a symlinked entrypoint still
+# resolves — and so a control workspace arms ITS OWN state/dispatch and writes ITS OWN
+# state/test-reports rather than the installed package's (T125).
+AIGENTRY_SHIM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+export AIGENTRY_SHIM_SCRIPT_DIR
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
-STATE_DIR="${DISPATCH_STATE_DIR:-$REPO_DIR/state/dispatch}"
-TEST_REPORTS_DIR="${TEST_REPORTS_DIR:-$REPO_DIR/state/test-reports}"
-HOLDS_LOG="$STATE_DIR/holds.log"
-PARSER_JS="${INJECT_PARSER_JS:-$REPO_DIR/dist/src/session/inject-parser.js}"
-DISPATCH_REGISTRY_PY="${DISPATCH_REGISTRY_PY:-$SCRIPT_DIR/dispatch-registry.py}"
-SCHEDULER_SH="${SCHEDULER_SH:-$SCRIPT_DIR/dispatch-cleanup-scheduler.sh}"
-EMIT_TELEMETRY_MJS="${EMIT_TELEMETRY_MJS:-$SCRIPT_DIR/emit-telemetry.mjs}"
-
-# §9 독립: telemetry failure must NEVER block the inject-handler primary path.
-# The shim itself swallows transport errors; we additionally `|| true` here so
-# even a hard exec failure (missing node, etc.) is non-fatal.
-emit_telemetry() {
-  if [ -x "$EMIT_TELEMETRY_MJS" ]; then
-    "$EMIT_TELEMETRY_MJS" "$@" >/dev/null 2>&1 || true
-  fi
-}
-
-mkdir -p "$STATE_DIR"
-
-usage() { sed -n '2,20p' "$0"; exit "${1:-0}"; }
-
-body_file=""
-sid_override=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --body-file) body_file="$2"; shift 2;;
-    --sid) sid_override="$2"; shift 2;;
-    -h|--help) usage 0;;
-    *) echo "inject-handler: unknown $1" >&2; exit 4;;
-  esac
-done
-
-if [ -z "$body_file" ]; then
-  body_file=$(mktemp)
-  trap 'rm -f "$body_file"' EXIT
-  cat > "$body_file"
-fi
-
-if [ ! -f "$PARSER_JS" ]; then
-  echo "inject-handler: compiled parser not found at $PARSER_JS (run \`tsc -p .\`)" >&2
-  exit 2
-fi
-
-# Parse via small inline node script. Outputs JSON: {ok, kind?, payload?, transport?, error?}.
-parsed=$(BODY_FILE="$body_file" PARSER_JS="$PARSER_JS" node --input-type=module -e '
-import { readFile } from "node:fs/promises";
-import { pathToFileURL } from "node:url";
-const body = await readFile(process.env.BODY_FILE, "utf8");
-const mod = await import(pathToFileURL(process.env.PARSER_JS).href);
-const r = mod.parseInject(body);
-if (r.ok) {
-  const { kind, payload, transport } = r.envelope;
-  process.stdout.write(JSON.stringify({ ok: true, kind, transport, payload }));
-} else {
-  process.stdout.write(JSON.stringify({ ok: false, error: r.error }));
-}
-')
-
-ok=$(printf '%s' "$parsed" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("ok"))')
-if [ "$ok" != "True" ]; then
-  err=$(printf '%s' "$parsed" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("error",""))')
-  echo "inject-handler: parse failed: $err" >&2
-  exit 1
-fi
-
-kind=$(printf '%s' "$parsed" | python3 -c 'import json,sys;print(json.load(sys.stdin)["kind"])')
-transport=$(printf '%s' "$parsed" | python3 -c 'import json,sys;print(json.load(sys.stdin)["transport"])')
-
-case "$kind" in
-  report)
-    sid="${sid_override:-}"
-    if [ -z "$sid" ]; then
-      echo "inject-handler: --sid required for REPORT envelopes (markdown subject doesn't carry sid)" >&2
-      exit 1
-    fi
-    # The envelope is unauthenticated and uncorrelated: nothing binds these bytes
-    # to the dispatch they claim to be reporting. It is recorded, not believed.
-    if [ -x "$DISPATCH_REGISTRY_PY" ]; then
-      "$DISPATCH_REGISTRY_PY" observe --sid "$sid" --kind legacy_report_envelope_observed \
-        --field "transport=$transport" --field outcome_protocol=unavailable \
-        --field reason=stage_b_deferred_to_0.9.0 >/dev/null 2>&1 || true
-      # Layer-D cleanup still arms off this envelope: dropping it would end
-      # automatic worker retirement fleet-wide. It IS an inference, so it is
-      # written down with its basis — when #816/#817 land and Stage B replaces
-      # this path, whoever does that work can see exactly what was inferred.
-      "$DISPATCH_REGISTRY_PY" observe --sid "$sid" \
-        --kind cleanup_scheduled_from_legacy_report_envelope \
-        --field basis=legacy_report_envelope >/dev/null 2>&1 || true
-    fi
-    if [ -x "$SCHEDULER_SH" ]; then
-      "$SCHEDULER_SH" schedule "$sid" --grace-seconds 60 --source legacy-report-envelope \
-        >/dev/null 2>&1 || true
-    fi
-    emit_telemetry --helper report --subtype report \
-      --payload-json "$(printf '{"target_sid":"%s","transport":"%s"}' "$sid" "$transport")" \
-      --correlation-id "$sid"
-    echo "[inject-handler] report kind=report sid=$sid transport=$transport — recorded as an observation; outcome_protocol_unavailable (0.8.0 has no terminal outcome); scheduler armed"
-    ;;
-  cleanup-request)
-    target=$(printf '%s' "$parsed" | python3 -c 'import json,sys;print(json.load(sys.stdin)["payload"]["target"])')
-    reason=$(printf '%s' "$parsed" | python3 -c 'import json,sys;p=json.load(sys.stdin)["payload"];print(p.get("reason",""))')
-    grace=$(printf '%s' "$parsed" | python3 -c 'import json,sys;p=json.load(sys.stdin)["payload"];print(p.get("grace_seconds",""))')
-    args=(schedule "$target" --source explicit-request)
-    [ -n "$reason" ] && args+=(--reason "$reason")
-    [ -n "$grace" ] && args+=(--grace-seconds "$grace")
-    if [ -x "$SCHEDULER_SH" ]; then "$SCHEDULER_SH" "${args[@]}" >/dev/null 2>&1 || true; fi
-    emit_telemetry --helper lifecycle --subtype cleanup \
-      --payload-json "$(printf '{"target":"%s","reason":"%s","grace_seconds":"%s","transport":"%s"}' "$target" "$reason" "$grace" "$transport")" \
-      --correlation-id "$target"
-    echo "[inject-handler] cleanup-request target=$target transport=$transport"
-    ;;
-  extend-lifetime)
-    target=$(printf '%s' "$parsed" | python3 -c 'import json,sys;print(json.load(sys.stdin)["payload"]["target"])')
-    defer=$(printf '%s' "$parsed" | python3 -c 'import json,sys;p=json.load(sys.stdin)["payload"];print(p.get("defer_minutes",""))')
-    reason=$(printf '%s' "$parsed" | python3 -c 'import json,sys;p=json.load(sys.stdin)["payload"];print(p.get("reason",""))')
-    if [ -n "$defer" ]; then
-      args=(defer "$target" --minutes "$defer")
-      [ -n "$reason" ] && args+=(--reason "$reason")
-      if [ -x "$SCHEDULER_SH" ]; then "$SCHEDULER_SH" "${args[@]}" >/dev/null 2>&1 || true; fi
-      emit_telemetry --helper lifecycle --subtype extend \
-        --payload-json "$(printf '{"target":"%s","defer_minutes":"%s","reason":"%s","transport":"%s"}' "$target" "$defer" "$reason" "$transport")" \
-        --correlation-id "$target"
-      echo "[inject-handler] extend-lifetime target=$target defer=${defer}m transport=$transport"
-    else
-      if [ -x "$SCHEDULER_SH" ]; then "$SCHEDULER_SH" cancel "$target" >/dev/null 2>&1 || true; fi
-      emit_telemetry --helper lifecycle --subtype extend \
-        --payload-json "$(printf '{"target":"%s","cancel":true,"transport":"%s"}' "$target" "$transport")" \
-        --correlation-id "$target"
-      echo "[inject-handler] extend-lifetime target=$target cancel-pending transport=$transport"
-    fi
-    ;;
-  hold)
-    # Audit log only — orchestrator session reads this when deciding next phase.
-    printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$parsed" >> "$HOLDS_LOG"
-    emit_telemetry --helper report --subtype hold \
-      --payload-json "$(printf '{"transport":"%s"}' "$transport")"
-    echo "[inject-handler] hold logged transport=$transport"
-    ;;
-  test-report)
-    sid_payload=$(printf '%s' "$parsed" | python3 -c 'import json,sys;print(json.load(sys.stdin)["payload"]["session_id"])')
-    sid="${sid_override:-$sid_payload}"
-    date_dir=$(date -u +%Y-%m-%d)
-    target_dir="$TEST_REPORTS_DIR/$date_dir"
-    mkdir -p "$target_dir"
-    target_file="$target_dir/${sid}.json"
-    # Atomic write: tmp + mv.
-    tmp=$(mktemp "${target_file}.tmp.XXXXXX")
-    printf '%s' "$parsed" | python3 -c '
-import json,sys
-data = json.load(sys.stdin)
-out = data["payload"]
-out["_transport"] = data["transport"]
-print(json.dumps(out, indent=2, ensure_ascii=False))
-' > "$tmp"
-    mv "$tmp" "$target_file"
-    emit_telemetry --helper report --subtype test_report \
-      --payload-json "$(printf '{"target_sid":"%s","path":"%s","transport":"%s"}' "$sid" "$target_file" "$transport")" \
-      --correlation-id "$sid"
-    echo "[inject-handler] test-report written sid=$sid path=$target_file transport=$transport"
-    ;;
-  *)
-    echo "inject-handler: unrecognized kind=$kind" >&2
-    exit 1
-    ;;
-esac
+# shellcheck source=lib/node-shim.sh
+. "$AIGENTRY_SHIM_SCRIPT_DIR/lib/node-shim.sh"
+aigentry_node_shim inject-handler.sh dist/src/inject-handler/cli.js
+exec node "$AIGENTRY_SHIM_JS" "$@"
