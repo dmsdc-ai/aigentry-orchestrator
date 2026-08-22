@@ -81,7 +81,22 @@ run_open aterm
 printf '%s\n' "$OUT" | grep -qx "$SID" || fail "aterm: stdout='$OUT' want '$SID'"
 grep -q 'new-session' "$ATERM_LOG"     || fail "aterm: new-session not issued. log:
 $(cat "$ATERM_LOG")"
-grep -qF "telepty allow --id $SID" "$ATERM_LOG" || fail "aterm: spawn did not wrap telepty allow"
+# #926 moved cwd and sid off the --cmd string and ONTO argv, so the sid is no longer
+# spelled inline here — it is the last argv element, `--id "$2"`. Its second pass then
+# reached the remaining adapters, and they did NOT all land on one shape, so this file
+# deliberately pins TWO. Which one an adapter gets is decided by its spawn API:
+#   argv shape  (`--id "$2"` + sid as the last argv element) — aterm, wezterm: their
+#     CLIs exec argv directly, so the value never needs quoting at all.
+#   %q shape    (`--id <printf %q of sid>`)                  — tmux, iterm: their 3rd
+#     argument IS shell text (tmux runs it through a shell; iTerm types it), so there
+#     is no argv channel to move the sid onto and %q is the guarantee instead.
+# A blanket re-pin to one string would have erased that distinction, which is exactly
+# the thing a reader of this guard needs to see. What each assertion measures is
+# unchanged: the spawn wraps `telepty allow` for THIS sid.
+grep -qF 'telepty allow --id "$2"' "$ATERM_LOG" || fail "aterm: spawn did not wrap telepty allow. log:
+$(cat "$ATERM_LOG")"
+grep -qE -- "' _ .* $SID\$" "$ATERM_LOG" || fail "aterm: the sid is not the last argv element. log:
+$(cat "$ATERM_LOG")"
 rm -f "$STUB_BIN/aterm"
 
 # B-aterm: aterm CLI ABSENT → fallback daemon (telepty spawn), still emits sid.
@@ -96,7 +111,12 @@ run_open tmux
 printf '%s\n' "$OUT" | grep -qx "$SID" || fail "tmux: stdout='$OUT' want '$SID'"
 grep -q 'new-window' "$TMUX_LOG"       || fail "tmux: new-window not issued. log:
 $(cat "$TMUX_LOG")"
-grep -qF "telepty allow --id '$SID'" "$TMUX_LOG" || fail "tmux: spawn did not wrap telepty allow. log:
+# #926: `--id '$SID'` -> `--id $(printf %q)`. Computed, not hardcoded, so this stays
+# an assertion about the SHAPE (sid is %q-quoted) rather than about one sid's bytes.
+# For a payload-free sid like this one %q is a no-op, which is what makes the old
+# hand-quoted form distinguishable: it contained `--id 'SID'`, this contains `--id SID`.
+printf -v T55_Q_SID '%q' "$SID"
+grep -qF "telepty allow --id $T55_Q_SID" "$TMUX_LOG" || fail "tmux: spawn did not wrap telepty allow (%q sid shape). log:
 $(cat "$TMUX_LOG")"
 rm -f "$STUB_BIN/tmux"
 
@@ -107,7 +127,12 @@ run_open wezterm
 printf '%s\n' "$OUT" | grep -qx "$SID" || fail "wezterm: stdout='$OUT' want '$SID'"
 grep -q 'cli spawn' "$WEZ_LOG"         || fail "wezterm: 'cli spawn' not issued. log:
 $(cat "$WEZ_LOG")"
-grep -qF "telepty allow --id $SID" "$WEZ_LOG" || fail "wezterm: spawn did not wrap telepty allow"
+# #926: wezterm `cli spawn -- ...` execs argv, so cwd and sid moved onto it — the sid
+# is no longer spelled inline, it is the last argv element. Same shape as aterm above.
+grep -qF 'telepty allow --id "$2"' "$WEZ_LOG" || fail "wezterm: spawn did not wrap telepty allow. log:
+$(cat "$WEZ_LOG")"
+grep -qE -- " $SID\$" "$WEZ_LOG" || fail "wezterm: the sid is not the last argv element. log:
+$(cat "$WEZ_LOG")"
 rm -f "$STUB_BIN/wezterm"
 
 # B-wezterm: wezterm absent → fallback, still emits sid.

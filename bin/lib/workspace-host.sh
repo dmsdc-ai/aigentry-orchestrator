@@ -328,9 +328,15 @@ _wh_cmux_open() {
   # cmux --command sends text+Enter; telepty allow runs as the workspace's foreground process.
   # bash -c 'cd ... && exec ...' wrapper: cmux --cwd only affects workspace shell, not the
   # telepty-allow-wrapped CLI. Explicit cd inside wrapper guarantees claude inherits cwd (#311).
+  # #926: cwd and sid go on ARGV and are read as "$1"/"$2" inside the single-quoted
+  # script — never interpolated into it. They are ALSO %q-quoted, because --command is
+  # TYPED INTO the workspace shell (text+Enter, above), so a bare append would still
+  # word-split a cwd containing a space. cli_cmd stays unquoted deliberately: it is a
+  # COMMAND LINE (`claude --model … --effort …`), not a value, and must word-split.
   local CMUX_BIN="${CMUX:-cmux}"
-  local out ref
-  out=$("$CMUX_BIN" new-workspace --cwd "$cwd" --command "bash -c 'cd $cwd && exec telepty allow --id $sid --auto-restart $cli_cmd'" 2>&1)
+  local out ref q_cwd q_sid
+  printf -v q_cwd '%q' "$cwd"; printf -v q_sid '%q' "$sid"
+  out=$("$CMUX_BIN" new-workspace --cwd "$cwd" --command "bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd' _ $q_cwd $q_sid" 2>&1)
   ref=$(echo "$out" | grep -oE 'workspace:[0-9]+' | head -1)
   [ -z "$ref" ] && { echo "ERR cmux new-workspace failed: $out" >&2; return 2; }
   # title == sid (open-session.sh SID convention); rename to the stable handle.
@@ -676,7 +682,19 @@ _wh_warp_open() {
   # In-surface wrapper (ADR §5 D5 step 2): cd, write the sentinel (G6 fix — gives
   # alive/list_ids the writer they lacked), then exec telepty allow. NO `--on-ready`
   # (BC1: no V1 code path ships — readiness is proven by the ready-gate, not a hook).
-  local wrapper="cd $cwd && touch $sentinel && exec telepty allow --id $sid --auto-restart $cli_cmd"
+  #
+  # #926: %q-quoted, not raw. Unlike cmux/aterm there is NO argv channel here — Warp
+  # is handed one shell command LINE via the tab_config's `command =`, so the values
+  # have to be safe inside that line itself. %q also renders a newline as $'\n', so a
+  # crafted cwd cannot break out of the TOML string and add a key. cli_cmd stays
+  # unquoted for the same reason as _wh_cmux_open: it is a command line, not a value.
+  # ponytail: a cwd containing an apostrophe still breaks the TOML *literal* string
+  # (`command = '…'` admits no escape) — a parse failure, not an execution, and the
+  # neighbouring `cwd = '%s'` line has had the same limitation since #608. Fixing it
+  # means moving the writer to TOML basic strings; separate ticket, not this one.
+  local q_cwd q_sid q_sentinel
+  printf -v q_cwd '%q' "$cwd"; printf -v q_sid '%q' "$sid"; printf -v q_sentinel '%q' "$sentinel"
+  local wrapper="cd $q_cwd && touch $q_sentinel && exec telepty allow --id $q_sid --auto-restart $cli_cmd"
 
   if ! _wh_warp_write_tab_config "$toml" "$marker" "$cwd" "$wrapper"; then
     echo "[workspace-host] warp wh_open: failed to write tab_config $toml" >&2
@@ -734,11 +752,22 @@ _wh_warp_open() {
 # branch natively. Caller must have sourced platform.sh (open-session.sh does).
 _wh_fallback_spawn() {
   local _sid="$1" _cwd="$2" _cli_cmd="$3"
+  # #926: this function is the reason the fix could not stop at cmux/warp/aterm —
+  # it is where EVERY other adapter lands when its terminal CLI is missing, so the
+  # hole here survives a fix everywhere else by the user simply not having cmux.
+  local _q_sid; printf -v _q_sid '%q' "$_sid"
   if command -v tmux >/dev/null 2>&1 && platform::has_tmux_session; then
-    platform::spawn_tmux_window "$_sid" "$_cwd" "telepty allow --id '$_sid' --auto-restart $_cli_cmd"
+    # cwd is NOT in this string: platform::spawn_tmux_window takes it as its own
+    # argument and hands it to `tmux new-window -c "$cwd"` — argv, never shell text.
+    # The sid IS in it, because tmux runs the 3rd argument through a shell and the
+    # signature offers no argv channel for it; `%q` is that guarantee here (a real
+    # shell parses it, so there is no second parser to fight — unlike iTerm).
+    platform::spawn_tmux_window "$_sid" "$_cwd" "telepty allow --id $_q_sid --auto-restart $_cli_cmd"
     echo "$_sid"
   else
-    telepty spawn --id "$_sid" -- bash -c "cd '$_cwd' && exec $_cli_cmd" >/dev/null
+    # `telepty spawn -- …` execs its argv directly, so this takes the true argv
+    # shape and needs no quoting pass at all.
+    telepty spawn --id "$_sid" -- bash -c "cd \"\$1\" && exec $_cli_cmd" _ "$_cwd" >/dev/null
     echo "⚠️  Session spawned as daemon (no visible terminal). Attach: telepty attach $_sid" >&2
     echo "$_sid"
   fi
@@ -748,8 +777,12 @@ _wh_fallback_spawn() {
 # bash -c wrapper for cwd propagation into claude (#311).
 _wh_aterm_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
+  # #926: same shape as _wh_cmux_open — --cmd is shell text, so cwd and sid go on
+  # argv, %q-quoted; cli_cmd stays unquoted because it is a command line.
+  local q_cwd q_sid
+  printf -v q_cwd '%q' "$cwd"; printf -v q_sid '%q' "$sid"
   if command -v aterm >/dev/null 2>&1 \
-    && aterm new-session --cwd "$cwd" --cmd "bash -c 'cd $cwd && exec telepty allow --id $sid --auto-restart $cli_cmd'" 2>/dev/null; then
+    && aterm new-session --cwd "$cwd" --cmd "bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd' _ $q_cwd $q_sid" 2>/dev/null; then
     echo "$sid"
   else
     _wh_fallback_spawn "$sid" "$cwd" "$cli_cmd"
@@ -760,7 +793,10 @@ _wh_aterm_open() {
 # `tmux new-window -c` propagates cwd correctly. (Legacy used $title == $sid.)
 _wh_tmux_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
-  platform::spawn_tmux_window "$sid" "$cwd" "telepty allow --id '$sid' --auto-restart $cli_cmd"
+  # #926: see _wh_fallback_spawn's tmux branch — cwd never enters this string, the
+  # sid is %q-quoted because spawn_tmux_window's 3rd argument is shell text.
+  local q_sid; printf -v q_sid '%q' "$sid"
+  platform::spawn_tmux_window "$sid" "$cwd" "telepty allow --id $q_sid --auto-restart $cli_cmd"
   echo "$sid"
 }
 
@@ -769,7 +805,9 @@ _wh_tmux_open() {
 _wh_wezterm_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
   if command -v wezterm >/dev/null 2>&1; then
-    wezterm cli spawn --cwd "$cwd" -- bash -c "cd '$cwd' && exec telepty allow --id $sid --auto-restart $cli_cmd" >/dev/null
+    # #926: `wezterm cli spawn -- …` execs its argv directly (no shell re-parse),
+    # so cwd and sid go on argv as-is — no %q pass needed.
+    wezterm cli spawn --cwd "$cwd" -- bash -c "cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd" _ "$cwd" "$sid" >/dev/null
     echo "$sid"
   else
     _wh_fallback_spawn "$sid" "$cwd" "$cli_cmd"
@@ -780,7 +818,19 @@ _wh_wezterm_open() {
 # Legacy contract: spawn failure → exit 2 (here: return 2, no handle).
 _wh_iterm_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
-  platform::spawn_iterm_tab "$cwd" "telepty allow --id $sid --auto-restart $cli_cmd" \
+  # #926: the fix for this arm is in platform::spawn_iterm_tab, NOT here, and that is
+  # the point. cwd/cmd used to be interpolated into an AppleScript literal that iTerm
+  # then typed into a shell — TWO parsers — so no amount of quoting at THIS call site
+  # could be right for both grammars (measured: `printf %q` makes osascript reject an
+  # ordinary path with a space, and its `\"` still unescapes into a live payload).
+  # Rule 26: the OS primitive owns its own quoting, so platform-unix.sh takes both
+  # values on argv and applies `quoted form of` to the cwd there.
+  #
+  # What is left here is the ordinary thing every other adapter does: %q the SID,
+  # because it is a value inside a command LINE, while cli_cmd stays unquoted because
+  # it IS the command line and must word-split.
+  local q_sid; printf -v q_sid '%q' "$sid"
+  platform::spawn_iterm_tab "$cwd" "telepty allow --id $q_sid --auto-restart $cli_cmd" \
     || { echo "ERR iTerm spawn failed" >&2; return 2; }
   echo "$sid"
 }
@@ -800,7 +850,8 @@ _wh_iterm_ready_attestation()   { printf 'none'; }
 # fallback, ADR §7 Phase 3 "generic→headless adapter"). No visible UI surface.
 _wh_headless_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
-  telepty spawn --id "$sid" -- bash -c "cd '$cwd' && exec $cli_cmd" >/dev/null
+  # #926: argv shape — `telepty spawn -- …` execs its argv directly.
+  telepty spawn --id "$sid" -- bash -c "cd \"\$1\" && exec $cli_cmd" _ "$cwd" >/dev/null
   echo "⚠️  Session spawned as daemon (headless: no spawn-tab CLI)." >&2
   echo "    Attach via: telepty attach $sid" >&2
   echo "$sid"

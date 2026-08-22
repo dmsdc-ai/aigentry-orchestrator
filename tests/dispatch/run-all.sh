@@ -22,7 +22,7 @@ chmod +x "$HERE"/T*.sh "$HERE"/stubs/* 2>/dev/null || true
 # Two prose sources in this repo disagreed on the guard count (96 vs 99), which is why
 # this is asserted against a count of the files rather than read from a comment. Bump it
 # when you add a guard; a DROP is a deleted test, and catching that is the point.
-EXPECTED_GUARDS=131
+EXPECTED_GUARDS=132
 
 # ── the expected-skip declaration ───────────────────────────────────────────────────
 # Per entry, why it is here. A skip with no recorded reason is a silent skip with extra
@@ -40,8 +40,15 @@ EXPECTED_GUARDS=131
 #   T48 — live-integration, same gate as T16 (a real codex/gemini auth round-trip).
 #   T95 — part E boots a real telepty daemon on an ephemeral port. Gated on
 #         AIGENTRY_RUN_LIVE_TESTS=1 as of #900; parts A–D always run.
+#   T133 — part H drives the iTerm spawn arm, which is AppleScript, i.e. macOS-only. It
+#         gates on `[ -x /usr/bin/osascript ]` and announces when absent. Linux-only
+#         entry, same shape as T43. Parts A–G always run, so the other ten spawn sites
+#         stay measured here; what a Linux run does NOT evidence is the iTerm arm, and
+#         the announcement is there so that gap is visible rather than assumed covered.
+#         NOT modelled as a capability like T47: osascript ships with macOS, so there is
+#         no dev box where the OS-keyed form goes stale and mutes the signal.
 EXPECTED_SKIPS_DARWIN="T16 T47 T48 T95"
-EXPECTED_SKIPS_LINUX="T16 T43 T47 T48 T95"
+EXPECTED_SKIPS_LINUX="T16 T43 T47 T48 T95 T133"
 
 # The three live-gated entries are exactly the ones that stop skipping when a maintainer
 # opts in, so the declaration follows the opt-in rather than going stale against it.

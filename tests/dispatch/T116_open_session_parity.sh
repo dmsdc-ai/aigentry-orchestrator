@@ -203,8 +203,19 @@ grep -qF "set-status aigentry working" "$STUBLOG" || fail "C: the #616 working p
 grep -q 'select-workspace' "$STUBLOG" && fail "C: FOCUS THEFT — select-workspace issued on spawn"
 # The default claude flags reached cmux verbatim: the wrapped command is what the
 # worker actually starts as, and #909's sleep assertion finds the pid by matching it.
-grep -qF -- "exec telepty allow --id t116-ok --auto-restart claude --model " "$STUBLOG" \
+#
+# #926 MOVED THE cwd AND THE sid OFF THE COMMAND STRING AND ONTO ARGV, so this block
+# and block E's twin were re-pinned to the new shape. Nothing else in T116 changed:
+# the eval this guard was believed to pin was never exercised here (no block ever
+# passed a cwd holding a metacharacter), so the port's `eval cwd="$cwd"` could be
+# deleted without touching a line. Only the sid's `--id "$2"` moved bytes. What the
+# assertion still measures is unchanged — the wrapper is `telepty allow` with the
+# default claude flags verbatim — plus, now, that the sid arrives as DATA on argv.
+grep -qF -- "exec telepty allow --id \"\$2\" --auto-restart claude --model " "$STUBLOG" \
   || fail "C: the telepty-allow wrapper argv changed. stub log:
+$(cat "$STUBLOG")"
+grep -qE -- "' _ .* t116-ok\$" "$STUBLOG" \
+  || fail "C: the sid is no longer the last argv element handed to the wrapper. stub log:
 $(cat "$STUBLOG")"
 
 # --- D) the adapter's failure codes arrive verbatim, on BOTH spawn paths -----------
@@ -264,8 +275,14 @@ do
   grep -qF -- "$want" "$STUBLOG" || fail "E: the inline arm no longer issues '$want'. stub log:
 $(cat "$STUBLOG")"
 done
-grep -qF -- "exec telepty allow --id t116-legacy --auto-restart claude " "$STUBLOG" \
+# Re-pinned by #926 alongside block C — the inline arm carries its OWN copy of the
+# wrapper (legacy-spawn.ts), so it got the same cwd+sid-onto-argv fix and the same
+# re-pin. A lever that still shipped the injectable wrapper would not be a rollback.
+grep -qF -- "exec telepty allow --id \"\$2\" --auto-restart claude " "$STUBLOG" \
   || fail "E: the inline arm's telepty-allow wrapper changed. stub log:
+$(cat "$STUBLOG")"
+grep -qE -- "' _ .* t116-legacy\$" "$STUBLOG" \
+  || fail "E: the inline arm no longer hands the sid on argv. stub log:
 $(cat "$STUBLOG")"
 # The control: the SAME invocation without the lever DOES take the seam. Without
 # this line block E would pass just as happily against an implementation that never
