@@ -81,7 +81,15 @@ run_open aterm
 printf '%s\n' "$OUT" | grep -qx "$SID" || fail "aterm: stdout='$OUT' want '$SID'"
 grep -q 'new-session' "$ATERM_LOG"     || fail "aterm: new-session not issued. log:
 $(cat "$ATERM_LOG")"
-grep -qF "telepty allow --id $SID" "$ATERM_LOG" || fail "aterm: spawn did not wrap telepty allow"
+# #926 moved cwd and sid off the --cmd string and ONTO argv, so the sid is no longer
+# spelled inline here — it is the last argv element, `--id "$2"`. The three adapters
+# below still spell it inline because none of them was rewritten by that ticket; a
+# blanket re-pin would have hidden that difference. What this measures is unchanged:
+# the aterm spawn wraps `telepty allow` for THIS sid.
+grep -qF 'telepty allow --id "$2"' "$ATERM_LOG" || fail "aterm: spawn did not wrap telepty allow. log:
+$(cat "$ATERM_LOG")"
+grep -qE -- "' _ .* $SID\$" "$ATERM_LOG" || fail "aterm: the sid is not the last argv element. log:
+$(cat "$ATERM_LOG")"
 rm -f "$STUB_BIN/aterm"
 
 # B-aterm: aterm CLI ABSENT → fallback daemon (telepty spawn), still emits sid.
