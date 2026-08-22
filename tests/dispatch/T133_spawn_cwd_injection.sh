@@ -353,6 +353,101 @@ passing by spawning nothing. log:
 $(cat "$T_TMP/g.log")"
 done
 
+# --- H) the iTerm arm — the one that needed platform-unix.sh, not a call-site fix ---
+# _wh_iterm_open hands its two values to platform::spawn_iterm_tab, which used to
+# interpolate BOTH into an AppleScript string literal that iTerm then TYPES into the
+# tab's shell. Two parsers, so quoting at the call site is quoting for the wrong
+# grammar: `printf %q` (right for the shell) makes osascript reject an ordinary path
+# containing a space (`\ ` is not an AppleScript escape), while its `\"` IS one and
+# unescapes straight back to a bare `"`. #926 moved both values onto `on run argv`
+# and applied `quoted form of` inside the AppleScript instead.
+#
+# HERMETIC, and deliberately only iTerm is faked: the stub feeds the script to the
+# REAL osascript, so AppleScript's own parser and its real `quoted form of` are what
+# get measured — not a reimplementation of them in this file. What the stub removes
+# is the iTerm verbs, turning `write text X` into `return X`, so the text iTerm WOULD
+# type is captured rather than typed. NO real tab is ever created. That text is then
+# run through a real shell, because running it is exactly what iTerm does with it.
+if [ -x /usr/bin/osascript ]; then
+  OSA_BIN="$T_TMP/osabin"; mkdir -p "$OSA_BIN"
+  cat > "$OSA_BIN/osascript" <<'EOF'
+#!/usr/bin/env bash
+script=$(cat)
+echo "osascript $*" >> "${H_LOG:?}"
+# Drop only the iTerm-specific verbs (and the `end tell`s closing them — this script
+# has no other tell block), and capture `write text` instead of performing it.
+transformed=$(printf '%s\n' "$script" \
+  | grep -vE '^[[:space:]]*(tell application "iTerm"|tell current window|create tab with default profile|tell current session|end tell)[[:space:]]*$' \
+  | sed -E 's/^([[:space:]]*)write text /\1return /')
+# "$@" ALREADY carries the leading `-` when the caller passes one; adding a second
+# would shift argv by one and land the cwd in the cmd slot. With no args at all
+# (the pre-fix shape) osascript reads the script from stdin anyway, so this one
+# form is correct for both and is what makes the RED run measure the real defect.
+typed=$(printf '%s\n' "$transformed" | /usr/bin/osascript "$@" 2>>"$H_LOG") || exit 1
+printf 'TYPED %s\n' "$typed" >> "$H_LOG"
+# iTerm types it into the tab's shell. So does this — a stub that only logged the
+# string would pass against the vulnerable code, which is the whole point.
+( PATH="$T133_PROBE_DIR:$PATH"; bash -c "$typed" >>"$H_LOG" 2>&1 || true )
+exit 0
+EOF
+  chmod +x "$OSA_BIN/osascript"
+
+  h_open() {
+    : > "$T_TMP/h.log"
+    env HOME="$T_TMP/home-h" \
+        AIGENTRY_WORKSPACE_HOST=iterm \
+        PLATFORM_OVERRIDE=macos \
+        H_LOG="$T_TMP/h.log" T133_PROBE_DIR="$PROBE_DIR" \
+        PATH="$OSA_BIN:$PROBE_DIR:/usr/bin:/bin" \
+        bash -c '. "$1"; . "$2"; wh_open "$3" "$4" "claude --x"' _ "$PLATFORM" "$LIB" t133-h "$1" \
+        >/dev/null 2>&1 || true
+  }
+
+  # H1 — the four shell forms. RED against the pre-fix platform-unix.sh: semi/dollar/
+  # tick each created their marker, because `cd ${cwd}` sat unquoted in the typed text.
+  for form in semi dollar tick quote; do
+    eval "cwd=\$payload_$form"
+    h_open "$cwd"
+    assert_clean "H1 ($form, _wh_iterm_open via platform::spawn_iterm_tab)"
+  done
+
+  # H2 — the form this arm specifically has to survive, all four hostile characters in
+  # ONE cwd: a double quote (breaks the AppleScript literal), a single quote (breaks
+  # every `cd '$cwd'` in the sibling adapters), a space (breaks a bare `cd $cwd`, and
+  # is the one %q would have made osascript REFUSE), and a semicolon (the payload).
+  payload_iterm="$T_TMP/target dq\" sq' sp ; touch $MARK-iterm"
+  h_open "$payload_iterm"
+  assert_clean "H2 (all four hostile forms in one cwd, _wh_iterm_open)"
+
+  # H3 — the hostile SID. It rides inside the `cmd` string, which stays unquoted
+  # because it is a command LINE; the sid inside it is %q'd by _wh_iterm_open.
+  : > "$T_TMP/h.log"
+  env HOME="$T_TMP/home-h" AIGENTRY_WORKSPACE_HOST=iterm PLATFORM_OVERRIDE=macos \
+      H_LOG="$T_TMP/h.log" T133_PROBE_DIR="$PROBE_DIR" \
+      PATH="$OSA_BIN:$PROBE_DIR:/usr/bin:/bin" \
+      bash -c '. "$1"; . "$2"; wh_open "$3" "$4" "claude --x"' _ "$PLATFORM" "$LIB" \
+      "t133h'\''; touch $MARK-sid; :'\''" "$T_TMP/target" >/dev/null 2>&1 || true
+  assert_clean "H3 (hostile sid, _wh_iterm_open)"
+
+  # H4 — the control. Without it H1-H3 would pass against a spawn_iterm_tab that
+  # refuses everything: a legitimate cwd WITH A SPACE (the case %q would have broken)
+  # must still reach the shell as one intact directory and actually start telepty.
+  HCWD="$T_TMP/h plain"; mkdir -p "$HCWD"
+  h_open "$HCWD"
+  grep -qF "TYPED cd '$HCWD' && telepty allow --id t133-h" "$T_TMP/h.log" \
+    || fail "H4: a legitimate cwd with a space did not survive as one quoted argument. log:
+$(cat "$T_TMP/h.log")"
+  grep -qF "pwd=$HCWD" "$T_TMP/h.log" "$T133_TELEPTY_LOG" 2>/dev/null \
+    || fail "H4: the iTerm arm never started in the requested cwd — H1-H3 may be
+passing by spawning nothing. log:
+$(cat "$T_TMP/h.log")"
+  H_NOTE="iterm"
+else
+  # Announced, not silent: no osascript (Linux CI) means the H arm did not run here.
+  echo "T133: SKIP part H — /usr/bin/osascript absent (macOS-only arm); the iTerm spawn path was NOT measured on this host" >&2
+  H_NOTE="iterm-SKIPPED"
+fi
+
 # --- F) the happy path still spawns, with the cwd intact --------------------------
 # Without this the whole guard would pass against an implementation that refuses
 # every cwd — "nothing executed" is trivially true when nothing runs at all.
@@ -372,4 +467,4 @@ grep -qF -- "_ $(printf '%q' "$OKCWD") t133-ok" "$T_TMP/ok.cmux.log" \
   || fail "F: the cwd was not %q-quoted onto argv. log:
 $(cat "$T_TMP/ok.cmux.log")"
 
-echo "T133 PASS sites=10 forms=semi/dollar/tick/quote+hostile-sid arms=wh/legacy/warp/aterm/tmux/wezterm/headless/fallback-x2 happy=cwd-with-space"
+echo "T133 PASS sites=11 forms=semi/dollar/tick/quote+all-four-in-one+hostile-sid arms=wh/legacy/warp/aterm/tmux/wezterm/headless/fallback-x2/$H_NOTE happy=cwd-with-space"

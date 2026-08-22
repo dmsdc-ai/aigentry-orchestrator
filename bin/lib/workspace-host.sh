@@ -818,24 +818,19 @@ _wh_wezterm_open() {
 # Legacy contract: spawn failure → exit 2 (here: return 2, no handle).
 _wh_iterm_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
-  # #926 — THE ONE SPAWN SITE IN THIS FILE THAT THE ARGV SHAPE CANNOT REACH, left
-  # deliberately unchanged and reported rather than half-fixed. Awaiting a decision.
+  # #926: the fix for this arm is in platform::spawn_iterm_tab, NOT here, and that is
+  # the point. cwd/cmd used to be interpolated into an AppleScript literal that iTerm
+  # then typed into a shell — TWO parsers — so no amount of quoting at THIS call site
+  # could be right for both grammars (measured: `printf %q` makes osascript reject an
+  # ordinary path with a space, and its `\"` still unescapes into a live payload).
+  # Rule 26: the OS primitive owns its own quoting, so platform-unix.sh takes both
+  # values on argv and applies `quoted form of` to the cwd there.
   #
-  # platform::spawn_iterm_tab <cwd> <cmd> does NOT run these; it interpolates BOTH
-  # into an AppleScript literal — platform-unix.sh:32, `write text "cd ${cwd} &&
-  # ${cmd}"` — which iTerm then types into the tab's shell. Two parsers, so there is
-  # no argv channel to move a value onto from here.
-  #
-  # `%q` at this call site does not fix it either, and MEASURED is why: AppleScript
-  # rejects an unknown escape instead of stripping it, so a %q'd payload aborts
-  # osascript with a syntax error (fail-closed, no execution) while a %q'd LEGITIMATE
-  # path containing a space aborts identically — it would trade a live hole for a
-  # loud refusal of ordinary paths, and `\"` survives AppleScript into the shell.
-  #
-  # The fix belongs in platform-unix.sh, passing cwd and cmd via `on run argv` — the
-  # idiom this repo already uses three times over at _wh_warp_raise_window,
-  # _wh_warp_send_cmd_key and _wh_warp_read_screen ("marker via argv → injection-safe").
-  platform::spawn_iterm_tab "$cwd" "telepty allow --id $sid --auto-restart $cli_cmd" \
+  # What is left here is the ordinary thing every other adapter does: %q the SID,
+  # because it is a value inside a command LINE, while cli_cmd stays unquoted because
+  # it IS the command line and must word-split.
+  local q_sid; printf -v q_sid '%q' "$sid"
+  platform::spawn_iterm_tab "$cwd" "telepty allow --id $q_sid --auto-restart $cli_cmd" \
     || { echo "ERR iTerm spawn failed" >&2; return 2; }
   echo "$sid"
 }

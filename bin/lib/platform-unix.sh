@@ -21,19 +21,40 @@ platform::spawn_tmux_window() {
 }
 
 # platform::spawn_iterm_tab <cwd> <cmd>  (macOS-only, via AppleScript)
+#
+# #926: cwd and cmd arrive as `on run argv` and are NEVER interpolated into the script
+# text. This site needed it more than any other spawn adapter, because the value here
+# crosses TWO parsers: the AppleScript string literal, and then the shell that iTerm
+# types the resulting text into. Quoting at the CALL SITE can only ever be correct for
+# one grammar, and `printf %q` -- correct for the shell -- measures as wrong for this
+# one in BOTH directions: `\ ` and `\;` are unknown AppleScript escapes that abort
+# osascript with a syntax error (so an ordinary path containing a space is refused),
+# while `\"` IS a valid AppleScript escape that unescapes back to a bare `"` and hands
+# the payload to the shell intact. The quoted heredoc deletes the first parser;
+# `quoted form of` (Standard Additions POSIX single-quote quoting) handles the second.
+# Same `on run argv` idiom the three Warp AX helpers in workspace-host.sh already use.
+#
+# cmd stays UNQUOTED, for the same reason it does on every other spawn adapter: it is
+# a command LINE (`telepty allow --id S --auto-restart claude --model ...`) that must
+# word-split. Values carried inside it are the caller's to quote -- _wh_iterm_open %q's
+# the sid before building it.
 platform::spawn_iterm_tab() {
   local cwd="${1:-}" cmd="${2:-}"
   [[ -z "$cwd" || -z "$cmd" ]] && { echo "spawn_iterm_tab: 2 args" >&2; return 2; }
   [[ "$(platform::os_type)" == "macos" ]] || { echo "iTerm requires macOS" >&2; return 4; }
-  osascript >/dev/null 2>&1 <<APPLESCRIPT
-tell application "iTerm"
-  tell current window
-    create tab with default profile
-    tell current session
-      write text "cd ${cwd} && ${cmd}"
+  osascript - "$cwd" "$cmd" >/dev/null 2>&1 <<'APPLESCRIPT'
+on run argv
+  set theCwd to item 1 of argv
+  set theCmd to item 2 of argv
+  tell application "iTerm"
+    tell current window
+      create tab with default profile
+      tell current session
+        write text "cd " & quoted form of theCwd & " && " & theCmd
+      end tell
     end tell
   end tell
-end tell
+end run
 APPLESCRIPT
 }
 
