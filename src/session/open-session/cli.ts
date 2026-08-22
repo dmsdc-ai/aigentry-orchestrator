@@ -43,9 +43,15 @@
 // ticket the port promised). `eval cwd="$cwd"` (the shell's :118) is expandCwd
 // below — no shell at all; the unquoted `bash -c 'cd $cwd && …'` in the legacy arm
 // (./legacy-spawn.ts) puts the value on argv. Both were [MEDIUM] G in
-// docs/reports/2026-07-02-ecosystem-deep-analysis.md:87. The parity guard T116 was
-// NOT touched: it never passed a cwd holding a metacharacter, so it never pinned the
-// eval's bytes. T133 is the guard that does.
+// docs/reports/2026-07-02-ecosystem-deep-analysis.md:87, together with the three
+// more the same `--cwd` reaches in bin/lib/workspace-host.sh (cmux, warp, aterm) —
+// one ticket, because which adapter runs is detect_terminal's answer and a fix that
+// covers one arm covers nothing. T133 is the guard.
+//
+// WHAT MOVED IN T116, precisely: nothing on account of the eval. That guard never
+// passed a cwd holding a metacharacter, so it never pinned the eval's bytes and the
+// eval could be deleted without touching a line. Its blocks C and E moved because
+// the SID also came off the command string — see below.
 //
 // DELIBERATE DEVIATIONS (Rule 38 — everything measured, nothing else changed):
 //   * A flag with no value (`--track` as the last argv) was `"$2"` under `set -u`:
