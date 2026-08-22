@@ -54,6 +54,11 @@ REF="workspace:926"
 payload_semi="$T_TMP/target; touch $MARK-semi"
 payload_dollar="$T_TMP/target\$(touch $MARK-dollar)"
 payload_tick="$T_TMP/target\`touch $MARK-tick\`"
+# The FOURTH form, and the one the first pass missed. Several arms wrap the value in
+# SINGLE QUOTES (`cd '$cwd'`), which makes `;`, `$( )` and backticks inert — those
+# three prove nothing there. An apostrophe closes the quote and every one of them
+# opens. Any guard for this defect that omits it measures only the easy half.
+payload_quote="$T_TMP/target'; touch $MARK-quote; :'"
 mkdir -p "$T_TMP/target"
 
 # A glob loop, not `ls | tr`: lib.sh runs under `pipefail`, and a no-match `ls`
@@ -108,6 +113,13 @@ chmod +x "$CMUX_STUB"
 # `telepty` inside the wrapper must be the probe, not the suite's registry stub.
 PROBE_DIR="$T_TMP/probe"; mkdir -p "$PROBE_DIR"
 cp "$STUB_BIN/telepty-allow-probe" "$PROBE_DIR/telepty"
+# The headless and fallback-daemon arms exec $cli_cmd DIRECTLY — they never wrap
+# `telepty allow` — so the cli itself has to be probeable or G5 cannot see their pwd.
+cat > "$PROBE_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "claude $* pwd=$PWD" >> "${T133_TELEPTY_LOG:-/dev/null}"
+EOF
+chmod +x "$PROBE_DIR/claude"
 export T133_PROBE_DIR="$PROBE_DIR"
 export T133_TELEPTY_LOG="$T_TMP/telepty.log"
 
@@ -137,7 +149,7 @@ run_open() {
 # --- A + B) the default arm: evalCwd, then _wh_cmux_open ---------------------------
 # RED on origin/main: form `semi` created the marker TWICE over — once in the eval
 # (before a wrapper was even built) and once in the wrapper cmux typed into a shell.
-for form in semi dollar tick; do
+for form in semi dollar tick quote; do
   eval "cwd=\$payload_$form"
   run_open "wh-$form" "$cwd" AIGENTRY_WH_LEGACY_SPAWN=
   assert_clean "A/B ($form, default wh_open arm, rc=$RC)"
@@ -153,7 +165,7 @@ $(cat "$T_TMP/wh-semi.cmux.log")"
 # The lever exists to bypass wh_open, so it carries its OWN copy of the wrapper
 # (legacy-spawn.ts) and its own copy of the hole. Fixing one arm and not the other
 # leaves the vector reachable by an `export`.
-for form in semi dollar tick; do
+for form in semi dollar tick quote; do
   eval "cwd=\$payload_$form"
   run_open "legacy-$form" "$cwd" AIGENTRY_WH_LEGACY_SPAWN=1
   assert_clean "C ($form, AIGENTRY_WH_LEGACY_SPAWN=1 inline arm, rc=$RC)"
@@ -182,7 +194,7 @@ EOF
 cp "$WARP_OPENER/open" "$WARP_OPENER/xdg-open"
 chmod +x "$WARP_OPENER/open" "$WARP_OPENER/xdg-open"
 
-for form in semi dollar tick; do
+for form in semi dollar tick quote; do
   eval "cwd=\$payload_$form"
   rm -rf "$WARP_TC"; mkdir -p "$WARP_TC"
   KEEP="$T_TMP/warp-$form.toml"; : > "$KEEP"
@@ -213,7 +225,7 @@ while [ $# -gt 0 ]; do case "$1" in --cmd) cmd="$2"; shift 2;; *) shift;; esac; 
 exit 0
 EOF
 chmod +x "$ATERM_STUB/aterm"
-for form in semi dollar tick; do
+for form in semi dollar tick quote; do
   eval "cwd=\$payload_$form"
   env HOME="$T_TMP/home-aterm" \
       AIGENTRY_WORKSPACE_HOST=aterm \
@@ -223,6 +235,122 @@ for form in semi dollar tick; do
       bash -c '. "$1"; wh_open "$2" "$3" "claude --x"' _ "$LIB" t133-aterm "$cwd" \
       >/dev/null 2>&1 || true
   assert_clean "E ($form, _wh_aterm_open --cmd)"
+done
+
+# --- G) the four remaining spawn arms in workspace-host.sh -------------------------
+# ADDED after the first pass shipped with five sites: the enumeration was short.
+# _wh_fallback_spawn is the reason it mattered — it is where EVERY other adapter
+# lands when its terminal CLI is missing, so a fix that stopped at cmux/warp/aterm
+# was bypassable by not having cmux installed.
+#
+# Each arm is driven through the REAL wh_open with its terminal CLI stubbed by an
+# executor — the stub runs what it is handed, exactly as tmux/wezterm/telepty do,
+# because a stub that only logged would pass against the vulnerable code.
+EXEC_BIN="$T_TMP/execbin"; mkdir -p "$EXEC_BIN"
+
+# tmux: `tmux new-window -c <cwd> -n <name> <cmd>` runs <cmd> through a shell.
+cat > "$EXEC_BIN/tmux" <<'EOF'
+#!/usr/bin/env bash
+echo "tmux $*" >> "${G_LOG:?}"
+# Real tmux STARTS the command in -c's directory; so does this stub, or G5 would
+# measure the harness instead of the adapter.
+cmd=""; start=""
+while [ $# -gt 0 ]; do case "$1" in -c) start="$2"; shift 2;; -n) shift 2;; new-window) shift;; *) cmd="$1"; shift;; esac; done
+( cd "$start" 2>/dev/null || true; PATH="$T133_PROBE_DIR:$PATH"; bash -c "$cmd" >>"$G_LOG" 2>&1 || true )
+exit 0
+EOF
+# wezterm: `wezterm cli spawn --cwd C -- prog args…` EXECS argv, no shell.
+cat > "$EXEC_BIN/wezterm" <<'EOF'
+#!/usr/bin/env bash
+echo "wezterm $*" >> "${G_LOG:?}"
+while [ $# -gt 0 ]; do [ "$1" = "--" ] && { shift; break; }; shift; done
+[ $# -gt 0 ] && ( PATH="$T133_PROBE_DIR:$PATH"; "$@" >>"$G_LOG" 2>&1 || true )
+exit 0
+EOF
+# telepty spawn --id S -- prog args… — also EXECS argv (the daemon-PTY arm).
+cat > "$EXEC_BIN/telepty" <<'EOF'
+#!/usr/bin/env bash
+echo "telepty $*" >> "${G_LOG:?}"
+if [ "${1:-}" = "spawn" ]; then
+  while [ $# -gt 0 ]; do [ "$1" = "--" ] && { shift; break; }; shift; done
+  [ $# -gt 0 ] && ( PATH="$T133_PROBE_DIR:$PATH"; "$@" >>"$G_LOG" 2>&1 || true )
+fi
+exit 0
+EOF
+chmod +x "$EXEC_BIN"/tmux "$EXEC_BIN"/wezterm "$EXEC_BIN"/telepty
+PLATFORM="$REPO_ROOT/bin/lib/platform.sh"
+
+# g_open <adapter> <cwd> [extra env…] — wh_open through the real lib + platform.sh.
+g_open() {
+  local adapter="$1" cwd="$2"; shift 2
+  : > "$T_TMP/g.log"
+  env HOME="$T_TMP/home-g" \
+      AIGENTRY_WORKSPACE_HOST="$adapter" \
+      PLATFORM_OVERRIDE=macos \
+      G_LOG="$T_TMP/g.log" T133_PROBE_DIR="$PROBE_DIR" \
+      PATH="$EXEC_BIN:$PROBE_DIR:/usr/bin:/bin" \
+      "$@" \
+      bash -c '. "$1"; . "$2"; wh_open "$3" "$4" "claude --x"' _ "$PLATFORM" "$LIB" t133-g "$cwd" \
+      >/dev/null 2>&1 || true
+}
+
+for form in semi dollar tick quote; do
+  eval "cwd=\$payload_$form"
+
+  # G1 — _wh_tmux_open (Tier 1, tmux present).
+  g_open tmux "$cwd" TMUX=/tmp/fake-tmux-socket
+  assert_clean "G1 ($form, _wh_tmux_open)"
+
+  # G2 — _wh_wezterm_open (Tier 1, wezterm present).
+  g_open wezterm "$cwd"
+  assert_clean "G2 ($form, _wh_wezterm_open)"
+
+  # G3 — _wh_headless_open (Tier 2, the daemon-PTY arm).
+  g_open headless "$cwd"
+  assert_clean "G3 ($form, _wh_headless_open)"
+
+  # G4 — _wh_fallback_spawn, BOTH branches. This is the arm every other adapter
+  # falls back to, so it is reached the way a user reaches it: ask for an adapter
+  # whose CLI is absent. aterm is gone from PATH here, so wh_open lands in the
+  # fallback — tmux branch when TMUX is set, daemon branch when it is not.
+  rm -f "$EXEC_BIN/aterm" 2>/dev/null || true
+  g_open aterm "$cwd" TMUX=/tmp/fake-tmux-socket
+  assert_clean "G4-tmux ($form, _wh_fallback_spawn tmux branch)"
+  g_open aterm "$cwd"
+  assert_clean "G4-daemon ($form, _wh_fallback_spawn daemon branch)"
+done
+
+# G6 — the tmux arms take a hostile SID, not a hostile cwd.
+# Measured, not assumed: platform::spawn_tmux_window takes cwd as its OWN argument
+# and hands it to `tmux new-window -c "$cwd"` — argv, never shell text — so no cwd
+# payload of any form can reach a shell through _wh_tmux_open or the fallback's tmux
+# branch. What DOES reach one is the sid, which those lines wrapped in single quotes
+# (`--id '$sid'`); an apostrophe in it opens the same hole. sid is `<track>-<name>`
+# from the same dispatch argv as --cwd, so it is exactly as caller-controlled.
+HOSTILE_SID="t133'; touch $MARK-sid; :'"
+for adapter_env in "tmux" "aterm"; do   # _wh_tmux_open, then the fallback's tmux branch
+  [ "$adapter_env" = aterm ] && rm -f "$EXEC_BIN/aterm" 2>/dev/null
+  : > "$T_TMP/g.log"
+  env HOME="$T_TMP/home-g" AIGENTRY_WORKSPACE_HOST="$adapter_env" PLATFORM_OVERRIDE=macos \
+      TMUX=/tmp/fake-tmux-socket \
+      G_LOG="$T_TMP/g.log" T133_PROBE_DIR="$PROBE_DIR" \
+      PATH="$EXEC_BIN:$PROBE_DIR:/usr/bin:/bin" \
+      bash -c '. "$1"; . "$2"; wh_open "$3" "$4" "claude --x"' _ "$PLATFORM" "$LIB" \
+      "$HOSTILE_SID" "$T_TMP/target" >/dev/null 2>&1 || true
+  assert_clean "G6 (hostile sid, $adapter_env tmux branch)"
+done
+
+# G5 — the control: these arms really DID spawn, so G1-G4 are not passing by
+# reaching nothing. A legitimate cwd with a space lands as the process's real pwd.
+GCWD="$T_TMP/g plain"; mkdir -p "$GCWD"
+for adapter in tmux wezterm headless; do
+  extra=(); [ "$adapter" = tmux ] && extra=(TMUX=/tmp/fake-tmux-socket)
+  : > "$T133_TELEPTY_LOG"
+  g_open "$adapter" "$GCWD" "${extra[@]+"${extra[@]}"}"
+  grep -qF "pwd=$GCWD" "$T_TMP/g.log" "$T133_TELEPTY_LOG" 2>/dev/null \
+    || fail "G5/$adapter: the arm did not start in the requested cwd — G1-G4 may be
+passing by spawning nothing. log:
+$(cat "$T_TMP/g.log")"
 done
 
 # --- F) the happy path still spawns, with the cwd intact --------------------------
@@ -244,4 +372,4 @@ grep -qF -- "_ $(printf '%q' "$OKCWD") t133-ok" "$T_TMP/ok.cmux.log" \
   || fail "F: the cwd was not %q-quoted onto argv. log:
 $(cat "$T_TMP/ok.cmux.log")"
 
-echo "T133 PASS sites=5 forms=semi/dollar/tick arms=wh/legacy/warp/aterm happy=cwd-with-space"
+echo "T133 PASS sites=10 forms=semi/dollar/tick/quote+hostile-sid arms=wh/legacy/warp/aterm/tmux/wezterm/headless/fallback-x2 happy=cwd-with-space"
