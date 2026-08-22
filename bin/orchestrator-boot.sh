@@ -3,8 +3,15 @@
 #                        (#899 tranche 5). Every `[orchestrator-boot] …` stderr line,
 #                        the reconcile/guard order, the DELETE arms, the SIGKILL-only
 #                        rule, the self/ancestor refusal and the exec argv are
-#                        unchanged. There is no `--help` and never was; argv is
-#                        ignored on the boot path, exactly as `main "$@"` ignored it.
+#                        unchanged.
+#
+# #934 ADDED THE ONLY ARGV THIS SCRIPT HAS EVER READ ON A NON-BOOT PATH. Until then
+# there was no `--help` and argv was ignored entirely, exactly as `main "$@"` ignored
+# it — so `bin/orchestrator-boot.sh --help | head -2`, run as a smoke check on
+# 2026-08-18, ran the REAL boot and died on SIGPIPE from `head`. Nothing was harmed and
+# the original bash did the same, so the port was faithful; the footgun was the design.
+# `--help` and `--dry-run` are non-booting modes, and the gate below makes the exec
+# reachable only with an EMPTY argv.
 #
 # ⚠️ THIS SHIM IS NOT THE USUAL `exec node …` ONE, and the difference is the point.
 # The last thing this script does must be a REAL process replacement, so that the
@@ -96,7 +103,14 @@
 # same `telepty` the user's shell resolves.
 #
 # Usage:
-#   bin/orchestrator-boot.sh        # reconcile stale record, guard bridges, then boot
+#   bin/orchestrator-boot.sh            # reconcile stale record, guard bridges, then boot
+#   bin/orchestrator-boot.sh --help     # usage on stdout, exit 0; nothing is acted on
+#   bin/orchestrator-boot.sh --dry-run  # the read-only half: what it WOULD kill, delete
+#                                       # and exec. No DELETE, no kill, no exec.
+# The one text is src/orchestrator-boot/usage.ts, not this header — an exec shim has no
+# header for a `sed -n` arm to slice (src/bridge-auditor/usage.ts records what that cost
+# there). Keep the two in step; T134 block B pins the real one against the seams the
+# implementation reads.
 #
 # Env:
 #   ORCHESTRATOR_SID   orchestrator session id (default: orchestrator) — same source
@@ -116,8 +130,23 @@ export AIGENTRY_SHIM_SCRIPT_DIR
 . "$AIGENTRY_SHIM_SCRIPT_DIR/lib/node-shim.sh"
 aigentry_node_shim orchestrator-boot.sh dist/src/orchestrator-boot/cli.js
 
-# The test seam never boots.
-if [ "${1:-}" = "__probe" ]; then
+# BOOTING REQUIRES AN EMPTY ARGV (#934). Any argument at all — `__probe`, `--help`,
+# `--dry-run`, or a typo — REPLACES this shell with node, which owns stdout, stderr and
+# the exit code from there and has no execve to boot with. The command substitution
+# below and the `exec` at the end of this file are then never reached at all.
+#
+# That is the shape rather than a list of known flags on purpose. Before #934 argv was
+# ignored entirely, so `bin/orchestrator-boot.sh --help | head -2` ran the real boot —
+# reconcile, SIGKILL guard, exec (2026-08-18; the exec then died on SIGPIPE from
+# `head`). A no-exec mode that returned through the command substitution instead would
+# be one stray stdout byte away from exec'ing again. With this gate, reaching the exec
+# requires having no argv, which no mode has, so a mode added later cannot regress into
+# a boot.
+#
+# A BARE INVOCATION FALLS THROUGH UNCHANGED — same order, same stderr, same argv on
+# stdout, same exit codes. #934 only ADDS non-booting modes. T131 block Q pins that the
+# exec recorder stays empty for every argv shape; T134 owns the rest.
+if [ "$#" -gt 0 ]; then
   exec node "$AIGENTRY_SHIM_JS" "$@"
 fi
 

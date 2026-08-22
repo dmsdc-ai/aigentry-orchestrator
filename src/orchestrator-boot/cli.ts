@@ -142,8 +142,52 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { USAGE } from "./usage.js";
 
 const env = process.env;
+
+// ── the modes (#934) ────────────────────────────────────────────────────────
+// THE INCIDENT: on 2026-08-18 the orchestrator ran `bin/orchestrator-boot.sh --help |
+// head -2` as a smoke check and got the REAL boot — reconcile, SIGKILL guard, exec —
+// because argv was not read on the boot path at all. Nothing was harmed that day and
+// the original bash behaved identically, so the port was faithful; the footgun is the
+// design. A script that SIGKILLs processes and DELETEs a registry record had no way to
+// be LOOKED AT without acting.
+//
+// The fix is a shape, not a flag list. bin/orchestrator-boot.sh now execs node for ANY
+// non-empty argv, so the boot path — the command substitution that reads the exec argv
+// and the `exec` that runs it — is reachable only when argv is EMPTY. Adding a mode
+// here therefore cannot regress into an accidental boot: falling through to the exec
+// requires having no argv at all, which no mode has.
+//
+// `__probe` (below) keeps its own door for the same reason it always had one.
+//
+// Measured on 1088ad7 before this landed, with ps/kill/telepty/curl recorders:
+// `--help`, `-h`, `--dry-run` and `--bogus-flag` all ran the reconcile, SIGKILLed the
+// fixture bridge and exec'd, each exiting 0. There was no unknown-flag arm to preserve.
+type Mode = "boot" | "probe" | "help" | "dry-run" | "unknown";
+const CLI_ARGV = process.argv.slice(2);
+// argv[0] alone, and only when it is the ONLY token: `--dry-run --help` is a refusal
+// rather than a guess at which mode was meant. Nothing may be smuggled in behind a
+// recognised flag on a script whose bare form SIGKILLs processes.
+//
+// `probe` is listed FIRST and keeps every boot-path behaviour but the exec: T40, T131
+// and T132 drive the reconcile and the guard through it and read their stderr lines
+// and their stdout argv, so it must not be swept into the no-exec stream change below.
+const MODE: Mode =
+  CLI_ARGV.length === 0
+    ? "boot"
+    : CLI_ARGV[0] === "__probe"
+      ? "probe"
+      : CLI_ARGV.length === 1 && (CLI_ARGV[0] === "--help" || CLI_ARGV[0] === "-h")
+        ? "help"
+        : CLI_ARGV.length === 1 && CLI_ARGV[0] === "--dry-run"
+          ? "dry-run"
+          : "unknown";
+const DRY_RUN = MODE === "dry-run";
+// Every mode but `boot` and `__probe`. Used for the stream choice and the EPIPE arm
+// below, both of which must leave the boot path byte-identical.
+const NO_EXEC = MODE === "help" || MODE === "dry-run" || MODE === "unknown";
 
 // SCRIPT_DIR was `cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P` (bash :61). The shim
 // exports it so a symlinked entrypoint still locates bin/lib/telepty-auth.sh; the
@@ -176,7 +220,42 @@ const TELEPTY_PORT = env.TELEPTY_PORT || "3848";
 // on its way to the shim's command substitution. Both streams use it so ordering
 // between them is the ordering of the calls.
 function log(msg: string): void {
-  fs.writeSync(2, `[orchestrator-boot] ${msg}\n`);
+  writeOut(LOG_FD, `[orchestrator-boot] ${LOG_TAG}${msg}\n`);
+}
+
+// ── where a no-exec mode's output goes (#934) ───────────────────────────────
+// On the boot path (and through `__probe`) this is fd 2 with no tag, byte for byte
+// what it always was: stdout there is the exec-argv contract channel and a stray byte
+// on it would be exec'd.
+//
+// In a no-exec mode stdout is NOT a contract channel — the shim exec'd node and reads
+// nothing back — so the whole report goes to fd 1 in one ordered stream, which is what
+// makes `--dry-run > report.txt` capture all of it.
+//
+// The `[dry-run] ` tag is why no message below needed a conditional rewrite: the
+// reconcile's existing "Deleting it so this boot can claim the id." line is a verdict,
+// and the tag is what keeps it honest when nothing is actually deleted.
+const LOG_FD = NO_EXEC ? 1 : 2;
+const LOG_TAG = DRY_RUN ? "[dry-run] " : "";
+
+/**
+ * fs.writeSync with ONE arm added: an EPIPE in a no-exec mode is not an error.
+ *
+ * `bin/orchestrator-boot.sh --help | head -2` is the literal command line from the
+ * 2026-08-18 incident, and a usage that answers it with an uncaught EPIPE and a stack
+ * trace has not really been made safe to look at.
+ *
+ * DELIBERATELY NOT ON THE BOOT PATH. `bin/orchestrator-boot.sh 2>&1 | head -1` today
+ * kills node on the stderr EPIPE, `set -e` aborts the shim, and NOTHING is exec'd.
+ * Swallowing it there would let the run continue, print the argv and boot — turning a
+ * non-boot into a boot, which is this ticket's failure mode with the sign flipped.
+ */
+function writeOut(fd: number, s: string): void {
+  try {
+    fs.writeSync(fd, s);
+  } catch (e) {
+    if (!NO_EXEC || (e as NodeJS.ErrnoException)?.code !== "EPIPE") throw e;
+  }
 }
 
 /** `$(...)`: strip ALL trailing newlines, as command substitution does. */
@@ -199,9 +278,13 @@ function hasControlChar(s: string): boolean {
   }
   return false;
 }
-if (hasControlChar(ORCH_SID)) {
-  fs.writeSync(
-    2,
+// `--help` is exempt (#934) and nothing else is. It is what an operator runs when
+// already confused, and refusing to PRINT TEXT because of an unrelated env var is the
+// same family of footgun this refusal belongs to. `--dry-run` keeps it: it prints the
+// sid and the would-exec argv, which is exactly the round trip D1 protects.
+if (MODE !== "help" && hasControlChar(ORCH_SID)) {
+  writeOut(
+    LOG_FD,
     `[orchestrator-boot] ORCHESTRATOR_SID contains a control character — refusing to boot (the exec argv is handed back to the shim as text, and a sid that cannot survive that round trip cannot be exec'd correctly)\n`,
   );
   process.exit(2);
@@ -278,6 +361,18 @@ function selfAncestry(rows: Row[]): Set<string> {
  * `orchestrator` (T57 block D, T40 block D).
  */
 const INTERPRETERS = new Set(["node", "nodejs"]);
+
+/**
+ * A NEAR MISS, for --dry-run's skip lines only (#934) — never a kill criterion.
+ *
+ * This is deliberately the ORIGINAL bash's hazard, rebuilt as a reporting filter: any
+ * row that mentions `telepty` anywhere in its argv is a row the pre-D4 substring
+ * marker could have SIGKILLed, so it is exactly the row an operator wants to see
+ * explained. Nothing downstream of this decides a signal.
+ */
+function mentionsTelepty(cmd: string[]): boolean {
+  return cmd.some((t) => t.includes("telepty"));
+}
 function isOrchestratorBridge(cmd: string[]): boolean {
   if (cmd.length === 0) return false;
   let i = 0;
@@ -304,9 +399,33 @@ function orchestratorSingletonGuard(): void {
   const ancestry = selfAncestry(rows);
   let killed = 0;
   for (const r of rows) {
-    if (!isOrchestratorBridge(r.cmd)) continue;
+    if (!isOrchestratorBridge(r.cmd)) {
+      // Silent on every path but --dry-run, where the near misses ARE the report: a
+      // human reads a dry run to find out why the thing that looks like a bridge is
+      // not one. Only rows that MENTION telepty get a line — those are exactly the
+      // rows the original substring marker (D4) would have SIGKILLed, and a line per
+      // row of the whole process table would be hundreds of lines of other programs'
+      // argv, which is a new leak rather than a diagnostic.
+      if (DRY_RUN && mentionsTelepty(r.cmd)) {
+        log(
+          `skip pid=${r.pid} — not a bridge: its argv is not '[node] telepty allow --id ${ORCH_SID}' (${r.cmd.join(" ")})`,
+        );
+      }
+      continue;
+    }
     if (ancestry.has(r.pid)) {
       log(`skip self/ancestor bridge pid=${r.pid} (${ORCH_SID})`);
+      continue;
+    }
+    if (DRY_RUN) {
+      // The guard is PROVEN, not bypassed: this row got here through the same shape
+      // test and the same ancestry set a real run uses, and the two skips above have
+      // already been printed by the same code. tests/dispatch/T134 block D drives the
+      // dry run and a real run through ONE ps fixture and diffs the two pid sets.
+      log(
+        `would SIGKILL stale orchestrator bridge pid=${r.pid} (${ORCH_SID}) — argv matches 'telepty allow --id ${ORCH_SID}' and the pid is neither self nor an ancestor`,
+      );
+      killed += 1;
       continue;
     }
     // invariant 2: "-9" is the ONLY signal argument in this file.
@@ -318,7 +437,15 @@ function orchestratorSingletonGuard(): void {
       log(`kill -9 pid=${r.pid} failed (already gone?)`);
     }
   }
-  log(`singleton guard done: killed=${killed} stale bridge(s) for ${ORCH_SID}`);
+  // The ONE message that changes word in a dry run. The `[dry-run] ` tag is enough for
+  // every other line, but this is the summary a human skims, and a summary reading
+  // `killed=1` on a run that killed nothing is the wrong thing to be ambiguous about
+  // on a SIGKILL path. The boot path's bytes are untouched.
+  log(
+    DRY_RUN
+      ? `singleton guard done: would_kill=${killed} stale bridge(s) for ${ORCH_SID}`
+      : `singleton guard done: killed=${killed} stale bridge(s) for ${ORCH_SID}`,
+  );
 }
 
 // ── the registry reconcile (#905) ───────────────────────────────────────────
@@ -439,6 +566,15 @@ function orchestratorRegistryReconcile(): void {
   log(
     `registry reconcile: '${ORCH_SID}' is STALE with 0 clients — a record whose owner is gone and whose owner token no new bridge can present (#815). Deleting it so this boot can claim the id.`,
   );
+  if (DRY_RUN) {
+    // The one arm that acts, reported and not taken. The verdict line above already
+    // said WHY; this says what would go on the wire and that nothing did. The token is
+    // not resolved here at all, let alone printed (invariant 4).
+    log(
+      `would DELETE http://127.0.0.1:${TELEPTY_PORT}/api/sessions/${ORCH_SID} — nothing was sent`,
+    );
+    return;
+  }
   const c = spawnSync(
     CURL_CMD,
     [
@@ -504,7 +640,7 @@ const ORCH_EXEC_ARGV = [
  * SHELL exec it. This process must be gone before the bridge exists.
  */
 function emitExecArgv(): void {
-  fs.writeSync(1, `${ORCH_EXEC_ARGV.join("\n")}\n`);
+  writeOut(1, `${ORCH_EXEC_ARGV.join("\n")}\n`);
 }
 
 function main(): never {
@@ -513,6 +649,45 @@ function main(): never {
   log(`exec ${ORCH_EXEC_ARGV.join(" ")}`);
   emitExecArgv();
   process.exit(0);
+}
+
+// ── the no-exec modes (#934) ────────────────────────────────────────────────
+
+function help(): never {
+  writeOut(1, `${USAGE}\n`);
+  process.exit(0);
+}
+
+/**
+ * `--dry-run` — the read-only half of main(), in main()'s order, through main()'s
+ * code. The two effect sites (the `curl -X DELETE`, the `kill -9`) are the ONLY
+ * things replaced, each by the line that says what it would have done, which is what
+ * makes "the dry run names what a real run kills" true by construction rather than by
+ * a second implementation that can drift from this one.
+ *
+ * The exec argv comes last and every element is prefixed. On this path the shim has
+ * exec'd node and reads nothing back, so there is no command substitution left to
+ * confuse — the prefix is for the human and for any script that grew up reading this
+ * output, neither of whom should ever find a bare `telepty` alone on a line here.
+ */
+function dryRun(): never {
+  orchestratorRegistryReconcile();
+  orchestratorSingletonGuard();
+  log(`would exec ${ORCH_EXEC_ARGV.join(" ")} (one element per line below)`);
+  for (const a of ORCH_EXEC_ARGV) writeOut(1, `[would-exec] ${a}\n`);
+  process.exit(0);
+}
+
+function unknownFlag(): never {
+  // Before #934 this arm did not exist: `orchestrator-boot.sh --bogus-flag` ran the
+  // full boot and exited 0. Exit 2 is the code this file already uses for "refusing
+  // to boot" (D1 above, and the shim's own empty-argv refusal).
+  // stderr for both, unlike --help/--dry-run: this is a diagnostic about a failed
+  // invocation, not the output the caller asked for, so `… --bogus > out` must leave
+  // `out` empty rather than looking like it produced something.
+  writeOut(2, `orchestrator-boot.sh: unknown argument: ${CLI_ARGV.join(" ")}\n`);
+  writeOut(2, `${USAGE}\n`);
+  process.exit(2);
 }
 
 // ── __probe: the test seam that replaced `source orchestrator-boot.sh` ──────
@@ -542,11 +717,24 @@ function probe(argv: string[]): never {
   process.exit(4);
 }
 
-const cliArgv = process.argv.slice(2);
-if (cliArgv[0] === "__probe") {
-  probe(cliArgv.slice(1));
-} else {
-  // The boot path takes no argument and never has: bash's `main "$@"` used no
-  // positional parameter, so `orchestrator-boot.sh anything` booted. It still does.
-  main();
+// The boot path takes no argument and never has: bash's `main "$@"` used no positional
+// parameter, so `orchestrator-boot.sh anything` booted. #934 ENDS THAT — booting now
+// requires an EMPTY argv, and every other shape lands somewhere that cannot exec. The
+// shim enforces the same rule one layer up (it execs node for any non-empty argv), so
+// the two halves agree even if this file is run directly.
+switch (MODE) {
+  case "probe":
+    probe(CLI_ARGV.slice(1));
+    break;
+  case "help":
+    help();
+    break;
+  case "dry-run":
+    dryRun();
+    break;
+  case "unknown":
+    unknownFlag();
+    break;
+  default:
+    main();
 }

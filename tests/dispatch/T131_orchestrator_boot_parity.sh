@@ -327,6 +327,54 @@ if [ "$ORIGINAL" != "1" ]; then
   PATH="$EXEC_DIR:$PATH" "$BOOT" __probe exec-argv >/dev/null 2>&1 \
     || fail "Q: __probe exec-argv exited non-zero"
   [ -s "$EXEC_LOG" ] && fail "Q: __probe reached the exec — a test seam booted the orchestrator"
+
+  # #934: BOOTING REQUIRES AN EMPTY ARGV. `__probe` was the only argv that could not
+  # reach the exec; now NO argv can. The shim execs node for any non-empty argv, so
+  # the command substitution and the `exec` below it are never reached — which is what
+  # makes a mode added later unable to regress into a boot. Before #934 every row here
+  # ran the full boot and exited 0 (measured on 1088ad7).
+  #
+  # T134 owns what each mode DOES; this block owns the one property that belongs to
+  # the exec: it does not happen.
+  : > "$PS_TABLE"; no_orch_listing
+  for argv in --help -h --dry-run --bogus-flag "--dry-run --help" anything; do
+    : > "$EXEC_LOG"
+    set +e
+    # Unquoted on purpose: the two-token row must arrive as two arguments.
+    # shellcheck disable=SC2086
+    SINGLETON_SELF_PID=9999 PATH="$EXEC_DIR:$PATH" bash "$BOOT" $argv >/dev/null 2>&1
+    q_rc=$?
+    set -e
+    [ -s "$EXEC_LOG" ] \
+      && fail "Q: 'orchestrator-boot.sh $argv' REACHED THE EXEC — looking at the control tower booted it (#934): $(cat "$EXEC_LOG")"
+    # The recorder above only fires when the accidental exec happens to target
+    # `telepty`. MEASURED with the gate reverted to its pre-#934 `__probe`-only form:
+    # the shim captured the usage text through its command substitution, split it into
+    # an array and exec'd its FIRST WORD, exiting 127 — an exec of the wrong thing,
+    # invisible to the recorder. 126/127 are the shell's two "tried to exec something
+    # unrunnable" codes and neither is a code any mode here may legitimately return.
+    case "$q_rc" in
+      126 | 127)
+        fail "Q: 'orchestrator-boot.sh $argv' exited $q_rc — the shim exec'd something. A no-exec mode's output reached the exec argv channel (#934)."
+        ;;
+    esac
+  done
+
+  # One EMPTY argument is still a non-empty argv, and it is the shape a caller with an
+  # unset variable produces (`bin/orchestrator-boot.sh "$FLAG"`). It must refuse, not
+  # boot — quoted separately because the loop above word-splits deliberately.
+  : > "$EXEC_LOG"
+  SINGLETON_SELF_PID=9999 PATH="$EXEC_DIR:$PATH" bash "$BOOT" "" >/dev/null 2>&1 || true
+  [ -s "$EXEC_LOG" ] \
+    && fail "Q: one empty argument reached the exec — the gate is counting tokens it can see, not argv: $(cat "$EXEC_LOG")"
+
+  # And the other direction, so the gate cannot be satisfied by refusing everything:
+  # an EMPTY argv still boots. Block N and the top of this block already exec, but
+  # they do it through boot_with_exec; this pins the plain form the operator types.
+  : > "$EXEC_LOG"
+  SINGLETON_SELF_PID=9999 PATH="$EXEC_DIR:$PATH" bash "$BOOT" >/dev/null 2>&1 || true
+  [ -s "$EXEC_LOG" ] \
+    || fail "Q: a BARE invocation no longer execs — #934 only adds non-booting modes, it does not change the boot"
 fi
 
 # ===========================================================================
@@ -349,6 +397,30 @@ else
   want="$(printf 'telepty\nallow\n--id\n%s\n--auto-restart\nclaude\n--dangerously-skip-permissions\n--continue\n' "$SID")"
   [ "$(cat "$R_OUT")" = "$want" ] \
     || fail "R: stdout is not EXACTLY the exec argv, one element per line. got: $(cat "$R_OUT")"
+
+  # #934: THE CHANNEL STAYS UNAMBIGUOUS IN THE OTHER MODES. `--dry-run` also reports
+  # an exec argv, and it also writes to stdout — but every element is PREFIXED, so no
+  # line it produces is a bare argv element. If the shim's `$(...)` reader ever saw
+  # this output it could not mistake one line of it for the contract channel.
+  reset
+  : > "$PS_TABLE"; no_orch_listing
+  R2_OUT="$T_TMP/r2.out"
+  SINGLETON_SELF_PID=9999 "$BOOT" --dry-run >"$R2_OUT" 2>/dev/null
+  while IFS= read -r line; do
+    case "$line" in
+      telepty|allow|--id|"$SID"|--auto-restart|claude|--dangerously-skip-permissions|--continue)
+        fail "R: --dry-run put the bare exec-argv element '$line' alone on a stdout line — indistinguishable from the boot path's contract channel"
+        ;;
+    esac
+  done < "$R2_OUT"
+  grep -q '^\[would-exec\] telepty$' "$R2_OUT" \
+    || fail "R: --dry-run did not report its exec argv prefixed, one element per line: $(cat "$R2_OUT")"
+
+  # --help is not an argv channel at all: nothing it prints may be a bare element.
+  R3_OUT="$T_TMP/r3.out"
+  "$BOOT" --help >"$R3_OUT" 2>/dev/null
+  grep -qx -- 'telepty' "$R3_OUT" \
+    && fail "R: --help put a bare 'telepty' alone on a stdout line: $(cat "$R3_OUT")"
 fi
 
 # ===========================================================================
