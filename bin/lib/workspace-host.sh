@@ -328,9 +328,15 @@ _wh_cmux_open() {
   # cmux --command sends text+Enter; telepty allow runs as the workspace's foreground process.
   # bash -c 'cd ... && exec ...' wrapper: cmux --cwd only affects workspace shell, not the
   # telepty-allow-wrapped CLI. Explicit cd inside wrapper guarantees claude inherits cwd (#311).
+  # #926: cwd and sid go on ARGV and are read as "$1"/"$2" inside the single-quoted
+  # script — never interpolated into it. They are ALSO %q-quoted, because --command is
+  # TYPED INTO the workspace shell (text+Enter, above), so a bare append would still
+  # word-split a cwd containing a space. cli_cmd stays unquoted deliberately: it is a
+  # COMMAND LINE (`claude --model … --effort …`), not a value, and must word-split.
   local CMUX_BIN="${CMUX:-cmux}"
-  local out ref
-  out=$("$CMUX_BIN" new-workspace --cwd "$cwd" --command "bash -c 'cd $cwd && exec telepty allow --id $sid --auto-restart $cli_cmd'" 2>&1)
+  local out ref q_cwd q_sid
+  printf -v q_cwd '%q' "$cwd"; printf -v q_sid '%q' "$sid"
+  out=$("$CMUX_BIN" new-workspace --cwd "$cwd" --command "bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd' _ $q_cwd $q_sid" 2>&1)
   ref=$(echo "$out" | grep -oE 'workspace:[0-9]+' | head -1)
   [ -z "$ref" ] && { echo "ERR cmux new-workspace failed: $out" >&2; return 2; }
   # title == sid (open-session.sh SID convention); rename to the stable handle.
@@ -676,7 +682,19 @@ _wh_warp_open() {
   # In-surface wrapper (ADR §5 D5 step 2): cd, write the sentinel (G6 fix — gives
   # alive/list_ids the writer they lacked), then exec telepty allow. NO `--on-ready`
   # (BC1: no V1 code path ships — readiness is proven by the ready-gate, not a hook).
-  local wrapper="cd $cwd && touch $sentinel && exec telepty allow --id $sid --auto-restart $cli_cmd"
+  #
+  # #926: %q-quoted, not raw. Unlike cmux/aterm there is NO argv channel here — Warp
+  # is handed one shell command LINE via the tab_config's `command =`, so the values
+  # have to be safe inside that line itself. %q also renders a newline as $'\n', so a
+  # crafted cwd cannot break out of the TOML string and add a key. cli_cmd stays
+  # unquoted for the same reason as _wh_cmux_open: it is a command line, not a value.
+  # ponytail: a cwd containing an apostrophe still breaks the TOML *literal* string
+  # (`command = '…'` admits no escape) — a parse failure, not an execution, and the
+  # neighbouring `cwd = '%s'` line has had the same limitation since #608. Fixing it
+  # means moving the writer to TOML basic strings; separate ticket, not this one.
+  local q_cwd q_sid q_sentinel
+  printf -v q_cwd '%q' "$cwd"; printf -v q_sid '%q' "$sid"; printf -v q_sentinel '%q' "$sentinel"
+  local wrapper="cd $q_cwd && touch $q_sentinel && exec telepty allow --id $q_sid --auto-restart $cli_cmd"
 
   if ! _wh_warp_write_tab_config "$toml" "$marker" "$cwd" "$wrapper"; then
     echo "[workspace-host] warp wh_open: failed to write tab_config $toml" >&2
@@ -748,8 +766,12 @@ _wh_fallback_spawn() {
 # bash -c wrapper for cwd propagation into claude (#311).
 _wh_aterm_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
+  # #926: same shape as _wh_cmux_open — --cmd is shell text, so cwd and sid go on
+  # argv, %q-quoted; cli_cmd stays unquoted because it is a command line.
+  local q_cwd q_sid
+  printf -v q_cwd '%q' "$cwd"; printf -v q_sid '%q' "$sid"
   if command -v aterm >/dev/null 2>&1 \
-    && aterm new-session --cwd "$cwd" --cmd "bash -c 'cd $cwd && exec telepty allow --id $sid --auto-restart $cli_cmd'" 2>/dev/null; then
+    && aterm new-session --cwd "$cwd" --cmd "bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd' _ $q_cwd $q_sid" 2>/dev/null; then
     echo "$sid"
   else
     _wh_fallback_spawn "$sid" "$cwd" "$cli_cmd"

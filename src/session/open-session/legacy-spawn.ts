@@ -15,10 +15,21 @@
 // under pipefail decides what an unmatched ref does), same `$cwd`/`$sid`/`$cli_cmd`/
 // `$title` values, same stdout (the ref), same exit codes 2 and 3.
 //
-// THE UNQUOTED `bash -c 'cd $cwd && …'` BELOW IS A PRE-EXISTING INJECTION SITE
-// ([MEDIUM] G, docs/reports/2026-07-02-ecosystem-deep-analysis.md:87) and is
-// REPRODUCED, not fixed: a port whose bytes differ cannot be proven at parity, and
-// the fix is a separate ticket. See cli.ts's header for the second site.
+// THE ONE LINE THAT IS NO LONGER THE DEVKIT ORIGINAL, and why (#926). The arm's
+// `bash -c 'cd $cwd && …'` interpolated $cwd into shell TEXT — [MEDIUM] G,
+// docs/reports/2026-07-02-ecosystem-deep-analysis.md:87, and a live hole: a `--cwd`
+// of `/tmp/x; touch /tmp/pwned` ran the touch. The value now goes on argv and is
+// read as "$1" inside the single-quoted script. cmux --command is TYPED INTO the
+// workspace shell (not exec'd), so the argv element itself is shell-quoted with
+// bash's own `printf %q` — without that a cwd containing a space would word-split
+// and `cd` would land somewhere else. T133 part C is the guard.
+//
+// This is a DELIBERATE divergence from the byte-for-byte rule above, and it is the
+// narrow one: the rollback lever exists to bypass wh_open, so it carries its own
+// copy of the wrapper and therefore its own copy of the hole. Fixing
+// workspace-host.sh and not this would leave the vector reachable by an `export`.
+// Everything else in the arm — the readiness gate, the exit codes 2 and 3, the
+// `$( )` calling context — is untouched.
 //
 // Lines 165-189 and 205-224 of the original, one array element per line so a
 // reviewer can diff them against it:
@@ -73,7 +84,12 @@ const ARM: string =
     "    # process. The bash -c 'cd ... && exec ...' wrapper guarantees claude inherits cwd",
     "    # (#311): cmux --cwd only affects the workspace shell, not the wrapped CLI.",
     "    local CMUX_BIN=\"${CMUX:-cmux}\"",
-    "    out=$(\"$CMUX_BIN\" new-workspace --cwd \"$cwd\" --command \"bash -c 'cd $cwd && exec telepty allow --id $sid --auto-restart $cli_cmd'\" 2>&1)",
+    "    # #926: cwd and sid on argv, %q-quoted for the shell cmux types this into.",
+    "    # cli_cmd stays unquoted BECAUSE IT IS A COMMAND LINE, not a value — it",
+    "    # arrives as `claude --model … --effort …` and must word-split to run.",
+    "    local q_cwd q_sid",
+    "    printf -v q_cwd '%q' \"$cwd\"; printf -v q_sid '%q' \"$sid\"",
+    "    out=$(\"$CMUX_BIN\" new-workspace --cwd \"$cwd\" --command \"bash -c 'cd \\\"\\$1\\\" && exec telepty allow --id \\\"\\$2\\\" --auto-restart $cli_cmd' _ $q_cwd $q_sid\" 2>&1)",
     "    ref=$(echo \"$out\" | grep -oE 'workspace:[0-9]+' | head -1)",
     "    [ -z \"$ref\" ] && { echo \"ERR cmux new-workspace failed: $out\" >&2; exit 2; }",
     "    \"$CMUX_BIN\" rename-workspace --workspace \"$ref\" \"$title\" >/dev/null 2>&1 || true",

@@ -56,7 +56,13 @@ payload_dollar="$T_TMP/target\$(touch $MARK-dollar)"
 payload_tick="$T_TMP/target\`touch $MARK-tick\`"
 mkdir -p "$T_TMP/target"
 
-markers_found() { ls "$MARK"-* 2>/dev/null | tr '\n' ' '; }
+# A glob loop, not `ls | tr`: lib.sh runs under `pipefail`, and a no-match `ls`
+# would abort the whole guard on its FIRST clean arm — passing by dying.
+markers_found() {
+  local f out=""
+  for f in "$MARK"-*; do [ -e "$f" ] && out="$out$f "; done
+  printf '%s' "$out"
+}
 assert_clean() {
   local where="$1" found; found=$(markers_found)
   [ -z "$found" ] && return 0
@@ -230,8 +236,12 @@ run_open ok "$OKCWD" AIGENTRY_WH_LEGACY_SPAWN=
 grep -qF "pwd=$OKCWD" "$T133_TELEPTY_LOG" \
   || fail "F: telepty allow did not start in the requested cwd. log:
 $(cat "$T133_TELEPTY_LOG")"
-grep -qF -- "exec telepty allow --id t133-ok --auto-restart claude " "$T_TMP/ok.cmux.log" \
+grep -qF -- "exec telepty allow --id \"\$2\" --auto-restart claude " "$T_TMP/ok.cmux.log" \
   || fail "F: the telepty-allow wrapper argv changed. log:
+$(cat "$T_TMP/ok.cmux.log")"
+# The space in $OKCWD survived as ONE argv element — %q-quoted, not word-split.
+grep -qF -- "_ $(printf '%q' "$OKCWD") t133-ok" "$T_TMP/ok.cmux.log" \
+  || fail "F: the cwd was not %q-quoted onto argv. log:
 $(cat "$T_TMP/ok.cmux.log")"
 
 echo "T133 PASS sites=5 forms=semi/dollar/tick arms=wh/legacy/warp/aterm happy=cwd-with-space"

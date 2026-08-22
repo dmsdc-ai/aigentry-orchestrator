@@ -39,12 +39,13 @@
 // :37-49, which exists because the entrypoint has been a symlink and `cd + pwd`
 // alone does not follow one). See bin/open-session.sh's header.
 //
-// TWO PRE-EXISTING INJECTION SITES ARE REPRODUCED, NOT FIXED. `eval cwd="$cwd"`
-// (the shell's :118, evalCwd below) and the unquoted `bash -c 'cd $cwd && …'` in
-// the legacy arm (:212, ./legacy-spawn.ts) are recorded as [MEDIUM] G in
-// docs/reports/2026-07-02-ecosystem-deep-analysis.md:87. This is a port, not a fix:
-// the parity guard's whole job is proving old and new produce identical bytes, and
-// a fix inside the port makes that unprovable. Separate ticket; see the REPORT.
+// THE TWO INJECTION SITES THIS PORT REPRODUCED ARE NOW FIXED (#926, the separate
+// ticket the port promised). `eval cwd="$cwd"` (the shell's :118) is expandCwd
+// below — no shell at all; the unquoted `bash -c 'cd $cwd && …'` in the legacy arm
+// (./legacy-spawn.ts) puts the value on argv. Both were [MEDIUM] G in
+// docs/reports/2026-07-02-ecosystem-deep-analysis.md:87. The parity guard T116 was
+// NOT touched: it never passed a cwd holding a metacharacter, so it never pinned the
+// eval's bytes. T133 is the guard that does.
 //
 // DELIBERATE DEVIATIONS (Rule 38 — everything measured, nothing else changed):
 //   * A flag with no value (`--track` as the last argv) was `"$2"` under `set -u`:
@@ -260,29 +261,37 @@ if (!cwd) {
 }
 
 /**
- * `eval cwd="$cwd"` — homedir shortcut expansion (the shell's :118).
+ * The homedir shortcut the shell's :118 provided (#926 — this WAS `eval cwd="$cwd"`,
+ * run through bash; [MEDIUM] G in docs/reports/2026-07-02-ecosystem-deep-analysis.md
+ * :87). No shell, no `eval`: `--cwd` is a VALUE and never becomes code again.
  *
- * A PRE-EXISTING INJECTION SITE, REPRODUCED RATHER THAN FIXED (see this file's
- * header). It runs in bash because that is the only way to reproduce it: the
- * expansion set is bash's own (tilde, parameter, command substitution, quote
- * removal), and so is the failure mode. fd 3 carries the resolved value back so an
- * injected command's own stdout still lands on THIS process's stdout, exactly where
- * the shell put it, instead of being swallowed into the variable.
+ * What the eval expanded and what survives, measured rather than guessed:
+ *   * `~` and `~/rest` — KEPT. This is the only expansion a caller can actually
+ *     depend on: the config arm (roles.<role>.path, :247) reads JSON, which no shell
+ *     ever touches, so a `~` there arrived here literal.
+ *   * `$VAR`, `$(…)`, backticks — DROPPED, and that is the fix. Measured before
+ *     deciding: no caller in the repo passes a `$` form (the two `--cwd ~…` in
+ *     usage.ts:30 and docs/specs/aterm.md:162 are shell command lines the CALLER's
+ *     shell expands first), the live ~/.aigentry/config.json has 9 roles all
+ *     absolute, and ~/.aigentry/open-session.log's 763 recorded production spawns
+ *     contain zero cwd fields that are non-absolute or that hold `$` or `~`.
+ *   * `~user` — REFUSED loudly instead of silently resolving another account's home.
+ *     bash resolved it via getpwnam and left it literal for an unknown user; both
+ *     outcomes are worse than saying so, and nothing measured uses the form.
+ *   * quote removal and word splitting — DROPPED. `eval` also DESTROYED any cwd
+ *     containing a space (`cwd: command not found`, then `mkdir ''`), so paths with
+ *     spaces spawn correctly for the first time; T133 part F pins that.
  */
-function evalCwd(raw: string): string {
-  const r = spawnSync("bash", ["-c", 'eval cwd="$1"; printf "%s" "$cwd" >&3', "_", raw], {
-    encoding: "utf8",
-    stdio: ["ignore", "inherit", "inherit", "pipe"],
-  });
-  if (r.error) {
-    process.stderr.write(`open-session.sh: cannot resolve cwd: ${String(r.error)}\n`);
+function expandCwd(raw: string): string {
+  if (raw === "~") return HOME;
+  if (raw.startsWith("~/")) return HOME + raw.slice(1);
+  if (raw.startsWith("~")) {
+    process.stderr.write(`ERR --cwd: ~user is not expanded — pass ${JSON.stringify(raw)} as an absolute path\n`);
     process.exit(1);
   }
-  // `set -e`: a failing eval aborted the script with the eval's status.
-  if (r.status !== 0) process.exit(r.status ?? 1);
-  return (r.output[3] as unknown as string) ?? "";
+  return raw;
 }
-cwd = evalCwd(cwd);
+cwd = expandCwd(cwd);
 
 if (!(fs.existsSync(cwd) && fs.statSync(cwd).isDirectory())) {
   try {
