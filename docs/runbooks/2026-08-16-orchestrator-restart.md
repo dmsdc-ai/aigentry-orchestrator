@@ -35,6 +35,12 @@ their reports simply land nowhere. Since #905 the reconciler raises an
 bin/orchestrator-boot.sh
 ```
 
+> **Look before you boot:** the bare command above acts immediately — it `DELETE`s a
+> registry record and `SIGKILL`s processes. To see what it *would* do without doing any
+> of it, run [`bin/orchestrator-boot.sh --dry-run`](#inspecting-a-boot-without-performing-one)
+> first. Do not reach for `--help` as a way to peek at this script unless you have read
+> that section — it did not exist until #934, and before that it booted.
+
 Since #905 that is sufficient on its own. It now does three things in order:
 
 1. **Reconciles the registry record.** If the daemon's record for the orchestrator sid is
@@ -51,6 +57,37 @@ Verify:
 ```bash
 telepty list | grep orchestrator     # expect CONNECTED, Clients: 1+
 ```
+
+### Inspecting a boot without performing one
+
+```bash
+bin/orchestrator-boot.sh --dry-run   # reports; changes nothing
+bin/orchestrator-boot.sh --help      # usage only
+```
+
+`--dry-run` (#934) walks the same reconcile and the same singleton scan and prints what
+each step *would* do — which registry record it would `DELETE`, which pids it would
+`SIGKILL` and why each one is or is not a bridge — then exits without deleting,
+signalling or exec'ing anything. Use it whenever you want to know the current state, or
+before a restart you are not yet sure you want.
+
+**Why this warning is in the runbook.** Until #934 this script read no argv at all on
+the boot path, so *every* invocation booted regardless of what you typed after it. On
+2026-08-18 the orchestrator ran `bin/orchestrator-boot.sh --help | head -2` as a smoke
+check and got the real thing: reconcile, `SIGKILL` guard, exec. Nothing was harmed, and
+the original bash behaved identically, so nothing was "broken" — the footgun was the
+design. A script that kills processes and deletes a registry record had no way to be
+looked at without acting.
+
+That is now structurally impossible rather than patched flag by flag:
+`bin/orchestrator-boot.sh` execs node for **any** non-empty argv, so the boot path is
+reachable only when argv is *empty*. A typo cannot boot you — an unrecognised flag is
+refused with exit 2, and so is any combination (`--dry-run --help` is a refusal, not a
+guess at which you meant).
+
+One consequence worth knowing at 3am: **the safe form is the one with a flag, and the
+dangerous form is the one with none.** That is the opposite of the usual convention, so
+do not "simplify" a `--dry-run` out of a command you are copying from here.
 
 ---
 
