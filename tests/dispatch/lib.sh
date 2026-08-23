@@ -1,5 +1,64 @@
 #!/usr/bin/env bash
 # Shared harness for tests/dispatch/*. Provides tmp-state, stub PATH, JSON helpers.
+#
+# ══════════════════════════════════════════════════════════════════════════════════
+# THE RULE: A GUARD MUST NOT BE ABLE TO REACH THE LIVE WORKSPACE.
+#
+# Read this before you write a guard that needs a real binary, a lister seam, or a
+# PATH of its own. It is here rather than in a report because this is the file you
+# are already sourcing.
+#
+# The harness gives you the safe posture for free. t_setup exports an absolute
+# TELEPTY pointing at a stub, puts $STUB_BIN first on PATH, redirects
+# DISPATCH_STATE_DIR and AIGENTRY_ROLE_SANDBOX_DIR into $T_TMP, and switches the bus
+# bridge and sleep guard off. An absolute TELEPTY beats PATH, so as long as you leave
+# it alone you cannot reach the operator's daemon. THREE THINGS TAKE IT AWAY:
+#
+#   1. unsetting or clearing TELEPTY          (`env -u TELEPTY`)
+#   2. replacing PATH wholesale               (`PATH=/usr/bin:/bin`)
+#   3. not calling t_setup at all
+#
+# If you do ANY of them, you are responsible for the reach yourself. What to do:
+#
+#   * USE A FIXTURE SID. This is the rule, not the belt. A guard that drives
+#     ORCHESTRATOR_SID=<something-that-is-not-`orchestrator`> cannot disturb the live
+#     session even when it does resolve a real binary — it removes the REACH rather
+#     than the resolution, and resolution is the thing this repo cannot prevent (the
+#     shims append /opt/homebrew/bin themselves; see #930 and bin/session-cleanup.sh
+#     :34-41). Every other defence is downstream of a binary being found.
+#   * ADD A TRIPWIRE. Point TELEPTY at a recorder that FAILS your guard if invoked,
+#     then assert its log is empty. That converts "this test does not touch
+#     production" from a promise into an assertion. tests/dispatch/T137 does both.
+#   * KEEP THE FIXTURE INERT. If your stub lister reports two bridges, the code under
+#     test will try to act on two bridges. Prefer a fixture that stops short of the
+#     acting path when the acting path is not what you are measuring.
+#   * IF YOU GENUINELY NEED THE REAL CLI, gate it: `AIGENTRY_RUN_LIVE_TESTS=1`, and
+#     declare the skip in run-all.sh's EXPECTED_SKIPS_* with a reason. T95 is the
+#     model — real daemon, but under a temp HOME on an ephemeral port bound to
+#     127.0.0.1, never :3848. T16 and T48 are the same shape.
+#
+# WHY THIS IS WRITTEN DOWN. On 2026-08-23 T137 — the guard added to prove that a
+# hardcoded /opt/homebrew/bin PATH prefix is dangerous — reached the production daemon
+# THROUGH that prefix. It unset TELEPTY to prove a shim can still find `node` under
+# launchd, and the shim duly resolved a real `telepty` off the appended homebrew path.
+# It sent four genuine duplicate-bridge HOLDs into the operator's live session naming
+# fixture pids that do not exist, and cost a human an investigation into a phantom.
+# The auditor was blameless: it faithfully reported what its stubbed lister said.
+#
+# AND THE PART THAT IS EASIER TO FORGET, so it is recorded next to the incident: the
+# audit that followed found the class had EXACTLY ONE member, and that no guard in
+# this suite can reach anything DESTRUCTIVE. `pkill` appears nowhere. Every kill site
+# routes through a stubbed KILL_CMD seam (T40, T131) or targets the guard's own parent
+# to simulate a crash (T79), and T127 block K and T57 block E assert a kill recorder
+# stays EMPTY. The one historical near-miss — a reconcile tick that closed SEVEN REAL
+# cmux workspaces — is why t_setup redirects AIGENTRY_ROLE_SANDBOX_DIR (see :17-22).
+# So: the posture is sound, and it is sound because of these redirections rather than
+# by luck. Do not read the incident as "the suite is unsafe"; read it as "the safety
+# is in t_setup, and stepping outside t_setup is stepping outside the safety".
+#
+# run-all.sh installs a backstop tripwire `telepty` on PATH when AIGENTRY_RUN_LIVE_TESTS
+# is not 1. It does NOT cover case 2 above, and says so where it is defined.
+# ══════════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
 TEST_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
