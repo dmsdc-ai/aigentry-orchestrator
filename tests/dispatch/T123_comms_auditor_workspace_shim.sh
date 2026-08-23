@@ -124,19 +124,52 @@ grep -q UNDELIVERED "$T_TMP/c.err" || fail "the workspace layout did not name th
 cp "$HERE/stubs/telepty" "$STUB_BIN/telepty"; chmod +x "$STUB_BIN/telepty"
 
 # ── (D) neither layout is a fluke: the REPO tree (sibling dist/) still works ──
-# Exercises bin/lib/node-shim.sh's sibling-dist path, which A-C never reach. Both
-# env seams are set here so the repo's own state/ is never written.
+# Exercises bin/lib/node-shim.sh's sibling-dist path, which A-C never reach. Both env
+# seams are set here so the repo's own state/ is never written — and THAT is what the
+# last assertion checks, by looking for THIS FIXTURE'S OWN writes rather than at the
+# directory's existence.
+#
+# WHY IT IS SHAPED THAT WAY. This used to assert `[ ! -e "$REPO_ROOT/state/session-comms" ]`
+# — that the directory does not EXIST. That is a PROXY for "a test wrote here", and the
+# two came apart the moment the repo tree held any real peer traffic: the guard went RED
+# for correct behaviour on the operator's own checkout while still passing in a fresh
+# worktree, where state/ simply does not exist yet. That is why it survived so long
+# unnoticed — the suite is usually run from a worktree.
+#
+# Measured 2026-08-23 on the merged main tree: the pass wrote NOTHING — every file
+# checksum AND every mtime identical across the run — and the guard failed anyway, on a
+# directory holding sanctioned bin/ask.sh peer traffic plus one file dating from
+# 2026-07-12. So it had been red on that tree for six weeks, for correct behaviour.
+# A guard that reddens for correct behaviour is one the third person to meet it disables,
+# which costs more than the assertion was ever worth.
+#
+# The fixture now signs its own writes. Real peer traffic lands in this very directory
+# WHILE the suite runs, so anything keyed on the directory's state — existence, entry
+# count, a pre/post delta — is a race by construction. Only the fixture's own sids can
+# distinguish "the shim ignored SESSION_COMMS_DIR" from "a peer sent a message".
 : > "$STUB_DISPATCH_LOG"
+D_FROM="t123-fixture-peer-A"
+D_TO="t123-fixture-peer-B"
+D_VIOLATION='{"ts":"2026-08-17T11:59:00Z","from":"'"$D_FROM"'","to":"'"$D_TO"'","body":"go implement X and push"}'
 REPO_TELE="$T_TMP/repo-run/session-comms/telemetry.jsonl"
 mkdir -p "$T_TMP/repo-run"
-printf '%s\n' "$VIOLATION" > "$T_TMP/repo-run/peer-injects.jsonl"
+printf '%s\n' "$D_VIOLATION" > "$T_TMP/repo-run/peer-injects.jsonl"
 SESSION_COMMS_DIR="$T_TMP/repo-run/session-comms" \
   AIGENTRY_PEER_INJECT_LOG="$T_TMP/repo-run/peer-injects.jsonl" \
   bash "$REPO_ROOT/bin/session-comms-auditor.sh" >/dev/null 2>&1 \
   || fail "the repo-tree layout (sibling dist/) stopped working"
 grep -q 'peer_inject_out_of_policy' "$REPO_TELE" \
   || fail "the repo-tree pass classified nothing: $(cat "$REPO_TELE" 2>/dev/null)"
-[ ! -e "$REPO_ROOT/state/session-comms" ] \
-  || fail "a test wrote into the repo's own state/session-comms — this suite must never touch it"
+# The seams were honoured => the fixture's traffic went to $T_TMP and left no trace of
+# ITSELF in the repo's state/. Both halves checked: a filename carrying the fixture sids
+# (the pairkey form) and file CONTENT mentioning them.
+if [ -d "$REPO_ROOT/state/session-comms" ]; then
+  leaked=$(ls -A "$REPO_ROOT/state/session-comms" 2>/dev/null | grep -F "t123-fixture-peer-" || true)
+  [ -z "$leaked" ] \
+    || fail "a test wrote into the repo's own state/session-comms — this suite must never touch it. Leaked entries: $leaked"
+  leaked=$(grep -rlF "t123-fixture-peer-" "$REPO_ROOT/state/session-comms" 2>/dev/null || true)
+  [ -z "$leaked" ] \
+    || fail "a test's traffic reached the repo's own state/session-comms — SESSION_COMMS_DIR was not honoured. Files: $leaked"
+fi
 
 echo "T123 PASS layouts=workspace+repo defaults=SESSION_COMMS_DIR/AIGENTRY_PEER_INJECT_LOG"

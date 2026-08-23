@@ -39,6 +39,14 @@
 # fails loudly (exit 2) if telepty/jq are missing from the inherited PATH — and
 # tests/dispatch/T27 stubs telepty/cmux/curl on PATH precisely because this script
 # does not override it.
+#
+# THE TENSION THIS HEADER NAMED IS NOW DECIDED (#930, 2026-08-23). The other shims
+# carried the prefix byte-identical for four ports because nobody was allowed to
+# decide; they now APPEND homebrew instead — a fallback for node/python3 under
+# launchd, never an override of the caller's PATH — and resolve telepty explicitly.
+# This script still overrides nothing and needs no fallback, so it is unchanged.
+# docs/adr/2026-08-23-930-homebrew-path-fallback.md records the decision, what was
+# measured, and the symptoms that would mean it was wrong.
 set -euo pipefail
 # Resolved exactly as the shell script's SCRIPT_DIR was, so a symlinked entrypoint
 # still locates bin/ helpers (dispatch-registry.py, wh-cli.sh, lib/*.sh).

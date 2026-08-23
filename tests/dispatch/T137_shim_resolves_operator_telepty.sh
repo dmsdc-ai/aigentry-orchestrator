@@ -18,6 +18,11 @@
 # either side is upgraded — at which point every shim silently follows homebrew's while
 # the operator, and the daemon they started, are on the other one.
 #
+# THE DECISION AND ITS FAILURE SIGNAL live in
+# docs/adr/2026-08-23-930-homebrew-path-fallback.md — including what symptom would
+# mean homebrew-as-fallback broke something homebrew-as-override was holding up.
+# If you are here because one of those symptoms fired, read that before reverting.
+#
 # WHY A GUARD AND NOT A COMMENT. The prefix survived four ports as a copied line. A
 # note saying "do not prepend homebrew" is exactly what was already there, in
 # session-cleanup.sh, and it did not stop the next shim from carrying the prefix. This
