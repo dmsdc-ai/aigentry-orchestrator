@@ -56,15 +56,16 @@
 #          non-zero into one `ERR bridge-auditor non-zero (continuing)` line. The
 #          append is now best-effort like the mkdir already was and the pass
 #          continues to the inject. T127 block J measures it from both sides.
-#   * TWO ARE REPRODUCED, NOT FIXED (Rule 29), both named in cli.ts with their
-#     measurements: D3, the marker is tested against the whole `command` column so a
-#     process that merely MENTIONS `telepty allow --id <sid> ` counts as a bridge
-#     (measured in the wild — a grep for the marker returned 3 hits where a clean
-#     snapshot returned 1, the extras being the measuring shell's own argv);
-#     tightening it is a detection-policy change across the three sites that share
-#     this marker (bin/orchestrator-boot.sh:88, bin/session-reconciler.sh:415, here)
-#     and needs its own ticket. And `emit_alert` still runs its mkdir per call.
-#     T127 block H pins D3 so it cannot be lost.
+#   * D3 IS NOW FIXED (#931), and `emit_alert` still runs its mkdir per call. D3 was:
+#     the marker is tested against the whole `command` column so a process that merely
+#     MENTIONS `telepty allow --id <sid> ` counts as a bridge (measured in the wild — a
+#     grep for the marker returned 3 hits where a clean snapshot returned 1, the extras
+#     being the measuring shell's own argv). Because likely-stale=oldest then selects
+#     the oldest of that set, the HOLD named the LIVE long-lived bridge as the one to
+#     kill. It is an argv-SHAPE match now, the same matcher the kill site in
+#     src/orchestrator-boot/cli.ts already used. T127 block H asserts the decision,
+#     with an ORIGINAL arm still recording the bash's behaviour; H2/H3 cover the
+#     measured hazard and the real-duplicate case. Still warn-only (#606).
 #   * ONE DEVIATION IS NAMED, NOT SILENT: D4, ORCHESTRATOR_SID is matched LITERALLY
 #     here and was a DYNAMIC REGEX in bash (`awk -v s=…` then `$0 ~ ("… --id " s
 #     " ")`). Measured on the original: `orch.tor` counted three unrelated sids and
