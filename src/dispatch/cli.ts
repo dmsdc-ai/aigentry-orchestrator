@@ -593,7 +593,7 @@ function prepareEffectiveRef(o: Opts, d: Delivery): boolean {
   // Fail CLOSED. No fallback default: guessing the target is the bug being removed.
   let targetAddr = "";
   if (isExecutable(REPORT_TARGET_SH)) {
-    const r = capture(REPORT_TARGET_SH, []);
+    const r = captureOut(REPORT_TARGET_SH, []);
     if (r.status === 0) targetAddr = r.stdout.replace(/\n+$/, "");
   }
   if (!targetAddr) {

@@ -66,20 +66,36 @@
 #     ticket with its exact two-line diff in the report §6; the fix belongs in
 #     src/dispatch/cli.ts, outside this task's Rule 29 scope.
 #
-# THE PATH HARDENING STAYS HERE, IN BASH, and byte-identical. It is what puts `curl`
-# and the interface listers on PATH for the probe and the scan — both are launched by
-# the node process, so a copy inside TS would leave one process generation running
-# with the caller's PATH. NAMED TENSION, pre-existing, mentioned not changed
-# (Rule 29): bin/session-cleanup.sh:34-41 records that a hardcoded `/opt/homebrew/bin`
-# prefix is what made task #400 pick a stale homebrew telepty. This script never runs
-# `telepty`, so that particular hazard does not apply here.
+# THE PATH HARDENING STAYS HERE, IN BASH — no longer byte-identical: #930 demoted the
+# homebrew entry from a PREFIX to a FALLBACK (see the block above `set -euo pipefail`).
+# It is what puts `curl` and the interface listers on PATH for the probe and the
+# scan — both are launched by the node process, so a copy inside TS would leave one
+# process generation running with the caller's PATH. This script never runs
+# `telepty`, so #400's hazard never applied here; #930 changed the line anyway for
+# uniformity.
+# ONE CONSEQUENCE WORTH NAMING: tests/dispatch/T129 block G could not assert on a
+# host whose /usr/bin holds a real ifconfig/ip, because the PREFIX outranked the
+# block's lister stubs. Appending removes that obstruction. Block G's own
+# precondition still keys on the four prefix dirs and so still declines there; it is
+# reported, not changed, because it is a Linux-only path this branch cannot measure.
 #
 # ⚠️ THIS FILE MUST STAY EXECUTABLE. src/dispatch/cli.ts:595 gates the whole resolve
 # on `isExecutable(REPORT_TARGET_SH)`, so a lost mode bit does not degrade the answer,
 # it fails the dispatch closed — the resolver is simply skipped and dispatch refuses
 # to inject a ref with an unresolved {{ORCHESTRATOR_REPORT_TARGET}}.
 set -euo pipefail
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+# #930 — homebrew APPENDED: a fallback for `node`/`python3` under launchd, never an
+# override of the caller's PATH. It was a prefix, which is #400's mechanism
+# (bin/session-cleanup.sh:34-41). Identical in every shim on purpose — a policy that
+# differed per shim is how the prefix survived four ports. tests/dispatch/T137 measures
+# it and carries the host measurement behind the decision.
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+# `telepty` resolved EXPLICITLY into the seam the implementation reads, never left to a
+# spawn-time PATH lookup; after the append, so the operator's wins where there is one
+# and launchd still finds homebrew's. An already-set TELEPTY is never overridden.
+: "${TELEPTY:=$(command -v telepty 2>/dev/null || true)}"
+[ -n "$TELEPTY" ] || TELEPTY=telepty
+export TELEPTY
 # Resolved exactly as the shell script's SCRIPT_DIR was, so a symlinked entrypoint
 # still resolves.
 AIGENTRY_SHIM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"

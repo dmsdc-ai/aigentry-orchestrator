@@ -22,7 +22,7 @@ chmod +x "$HERE"/T*.sh "$HERE"/stubs/* 2>/dev/null || true
 # Two prose sources in this repo disagreed on the guard count (96 vs 99), which is why
 # this is asserted against a count of the files rather than read from a comment. Bump it
 # when you add a guard; a DROP is a deleted test, and catching that is the point.
-EXPECTED_GUARDS=132
+EXPECTED_GUARDS=135
 
 # ── the expected-skip declaration ───────────────────────────────────────────────────
 # Per entry, why it is here. A skip with no recorded reason is a silent skip with extra
@@ -82,6 +82,39 @@ SKIP_RE='^T[0-9]+[: ].*SKIP'
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
+
+# ── the production-transport tripwire ───────────────────────────────────────────────
+# MEASURED, not anticipated. tests/dispatch/T137 resolved the REAL telepty and sent four
+# genuine duplicate-bridge HOLDs to the LIVE orchestrator session, naming fixture pids
+# that do not exist; a human spent an investigation on a phantom before it was traced
+# back to a stub table. The mechanism deserves recording: the guard written to prove the
+# `/opt/homebrew/bin` PATH prefix is dangerous reached production THROUGH that prefix —
+# it unset TELEPTY to prove a shim can still find `node` under launchd, and the shim
+# duly resolved a real `telepty` off the appended homebrew path.
+#
+# lib.sh's t_setup already exports a stub TELEPTY and puts $STUB_BIN first on PATH, so
+# the default posture is safe. This closes the residual shape: a guard that drops
+# TELEPTY but keeps the inherited PATH now finds a tripwire rather than the real CLI.
+#
+# WHAT THIS DOES NOT CATCH, stated so it is not mistaken for a seal: a guard that
+# REPLACES PATH wholesale (`PATH=/usr/bin:/bin`) escapes it, because the shims append
+# /opt/homebrew/bin themselves and nothing here can shadow that. That is exactly the
+# T137 shape, and it is why T137 also drives a FIXTURE sid — a guard that cannot
+# address `orchestrator` cannot disturb it even when it does resolve a real binary.
+# Treat the fixture-sid convention as the primary defence and this as the backstop.
+#
+# Only when live tests are OFF: with AIGENTRY_RUN_LIVE_TESTS=1 the three declared
+# live-integration guards (T16, T48, T95) legitimately need the real CLI.
+if [ "${AIGENTRY_RUN_LIVE_TESTS:-0}" != "1" ]; then
+  TRIPWIRE_BIN="$TMP/tripwire-bin"; mkdir -p "$TRIPWIRE_BIN"
+  cat > "$TRIPWIRE_BIN/telepty" <<'TRIP'
+#!/usr/bin/env bash
+echo "SUITE TRIPWIRE: a guard resolved a REAL telepty by PATH lookup. Guards must use the stub that lib.sh's t_setup exports, or a recorder of their own — a guard that can reach the live daemon can inject into the operator's session. argv: $*" >&2
+exit 97
+TRIP
+  chmod +x "$TRIPWIRE_BIN/telepty"
+  export PATH="$TRIPWIRE_BIN:$PATH"
+fi
 
 guards=0; pass=0; fail=0; skipped_guards=0; announcements=0
 failed=""; skipped=""

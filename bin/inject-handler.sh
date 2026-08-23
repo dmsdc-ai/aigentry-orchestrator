@@ -72,22 +72,37 @@
 #     the original bash, which is how the parity is measured at all; the deviations are
 #     named here instead, which is the surface Rule 38 asks for.
 #   * NAMED FOR A TICKET, not fixed (Rule 29 — out of this task's decided scope):
-#     src/session/inject-parser.ts's validateTestReport still accepts any string as
-#     session_id, so the segment rule benefits this consumer only; the telemetry
-#     `--payload-json` is still string-interpolated, so a `"` in a reason still emits
-#     invalid JSON (reproduced byte for byte); a failing dispatch-registry.py observe
-#     is still swallowed.
+#     the telemetry `--payload-json` is still string-interpolated, so a `"` in a reason
+#     still emits invalid JSON (reproduced byte for byte); a failing
+#     dispatch-registry.py observe is still swallowed.
+#   * CLOSED SINCE (#932): the entry that used to head this list — validateTestReport
+#     accepting any string as session_id, leaving the segment rule a benefit to this
+#     consumer only — is fixed. src/session/inject-parser.ts enforces the rule for
+#     EVERY consumer, and src/inject-handler/cli.ts keeps naming the field anyway; see
+#     that file's D2 block for why the naming did not have to be traded away.
 #
-# THE PATH HARDENING STAYS HERE, IN BASH, and byte-identical. It is what puts `python3`
-# on PATH for bin/dispatch-registry.py's shebang and `node` on PATH for the
-# bin/dispatch-cleanup-scheduler.sh child — both are launched by the node process, so a
-# copy inside TS would leave one process generation running with the caller's PATH.
-# NAMED TENSION, pre-existing, mentioned not changed (Rule 29): bin/session-cleanup.sh
-# :34-41 records that a hardcoded `/opt/homebrew/bin` prefix is what made task #400 pick
-# a stale homebrew telepty. This script never runs `telepty` itself, so that particular
-# hazard does not apply here.
+# THE PATH HARDENING STAYS HERE, IN BASH — no longer byte-identical: #930 demoted the
+# homebrew entry from a PREFIX to a FALLBACK (see the block above `set -euo pipefail`).
+# It is what puts `python3` on PATH for bin/dispatch-registry.py's shebang and `node`
+# on PATH for the bin/dispatch-cleanup-scheduler.sh child — both are launched by the
+# node process, so a copy inside TS would leave one process generation running with
+# the caller's PATH. This script never runs `telepty` itself, so #400's hazard never
+# applied here; the line changed anyway because #930 decided the policy UNIFORMLY —
+# a prefix that is correct only where nobody spawns telepty is the shape that got
+# copied into the shims where somebody does.
 set -euo pipefail
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+# #930 — homebrew APPENDED: a fallback for `node`/`python3` under launchd, never an
+# override of the caller's PATH. It was a prefix, which is #400's mechanism
+# (bin/session-cleanup.sh:34-41). Identical in every shim on purpose — a policy that
+# differed per shim is how the prefix survived four ports. tests/dispatch/T137 measures
+# it and carries the host measurement behind the decision.
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+# `telepty` resolved EXPLICITLY into the seam the implementation reads, never left to a
+# spawn-time PATH lookup; after the append, so the operator's wins where there is one
+# and launchd still finds homebrew's. An already-set TELEPTY is never overridden.
+: "${TELEPTY:=$(command -v telepty 2>/dev/null || true)}"
+[ -n "$TELEPTY" ] || TELEPTY=telepty
+export TELEPTY
 # Resolved exactly as the shell script's SCRIPT_DIR was, so a symlinked entrypoint still
 # resolves — and so a control workspace arms ITS OWN state/dispatch and writes ITS OWN
 # state/test-reports rather than the installed package's (T125).

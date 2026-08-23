@@ -78,14 +78,18 @@
 #   K2 the static half of the no-kill assertion reads the COMPILED port, so it has
 #      nothing to read when the original bash is under test.
 #
-# BLOCK H IS A REPRODUCED DEFECT (D3), so it is green against both: the marker is
-# tested against the whole `command` column, so a process that merely MENTIONS
-# `telepty allow --id <sid> ` is counted as a bridge and can be named
-# `likely-stale=oldest=` in a HOLD that tells the operator to `kill -9` it. Pinned so
-# the port cannot quietly change what counts as a bridge, and so the defect cannot be
-# lost before the ticket that decides it. Measured in the wild, not only here: on the
-# port host a grep for the marker returned 3 hits where a clean snapshot returned 1,
-# the extras being the measuring shell's own argv.
+# BLOCK H WAS A REPRODUCED DEFECT (D3) AND IS NOW A DECIDED ONE (#931), which makes it
+# the fourth block with two arms. D3: the marker was tested against the whole `command`
+# column, so a process that merely MENTIONED `telepty allow --id <sid> ` counted as a
+# bridge and could be named `likely-stale=oldest=` in a HOLD telling the operator to
+# `kill -9` it. This block used to PIN that false positive, with a failure message
+# saying the behaviour must not change without its own ticket; #931 is that ticket, so
+# the pin became an assertion of the decision and the ORIGINAL arm still records the
+# bash. H2 carries the measured hazard — the wild 3-hits-for-1-bridge snapshot, plus the
+# orchestrator's accidental hand reproduction of the same count on 2026-08-23 — and the
+# live-bridge misidentification that follows from oldest-wins. H3 is the other
+# direction: a REAL duplicate must still be caught, including a bridge with no `node`
+# token and an absolute telepty path, because missing one is the failure #618 is about.
 #
 # Deliberately NOT pinned: the BYTES of the D1 stderr line in block J's original arm.
 # bash printed `tee`'s own `Not a directory`, which is locale-dependent; the exit code
@@ -357,8 +361,11 @@ grep -qF 'dry_run=0' "$T_TMP/err.txt" \
   || fail "G: an env DRY_RUN=1 SUPPRESSED the #618 HOLD. The reconciler passes its whole env to step 0d and takes its own DRY_RUN from argv alone (src/reconciler/cli.ts:1154,1166), so this would silently disable the belt on any host with DRY_RUN exported."
 
 # ===========================================================================
-# H) D3 REPRODUCED — a process that merely MENTIONS the marker is a bridge.
-#    Green against both implementations, on purpose. See the header.
+# H) D3 DECIDED (#931) — a substring match is not a process identity.
+#    This block USED to pin the false positive as a reproduced defect, with a failure
+#    message saying the behaviour must not change without its own ticket. #931 is that
+#    ticket, so the pin is retired here rather than edited away: the block now asserts
+#    the DECISION, and keeps the original arm so the bash's behaviour is still recorded.
 # ===========================================================================
 cat > "$PS_TABLE" <<EOF
 50349 00:05:23 $B
@@ -366,9 +373,72 @@ cat > "$PS_TABLE" <<EOF
 EOF
 run H --
 [ "$RC" -eq 0 ] || fail "H: rc=$RC"
+if [ "$ORIGINAL" = "1" ]; then
+  grep -qF 'count=2' "$T_TMP/err.txt" \
+    || fail "H[original]: the bash tests the marker against the whole command column, so the grep that merely MENTIONS it must still count as a bridge: $(cat "$ERR")"
+  grep -qF '77777' "$T_TMP/err.txt" || fail "H[original]: the non-bridge pid is no longer named: $(cat "$ERR")"
+else
+  [ ! -s "$ERR" ] \
+    || fail "H[port]: one real bridge plus one process that merely MENTIONS the marker is ONE bridge, so the pass must be silent. A substring match is not a process identity (#931): $(cat "$ERR")"
+  no_inject "H[port]"
+fi
+
+# H2) THE MEASURED HAZARD, in the shape it was measured in.
+#     On the port host a marker grep returned 3 hits where a clean snapshot returned 1;
+#     the extras were two `zsh -c` measurement wrappers — real, live, short-lived
+#     processes whose only sin was naming the marker in their own argv. With those
+#     counted, N=3 fires a duplicate HOLD, and `likely-stale=oldest` resolves to the
+#     OLDEST of the set: the genuine two-day-old bridge. The single line an operator
+#     acts on would have named the live bridge as the one to `kill -9`.
+#     REPRODUCED BY HAND, 2026-08-23, by the orchestrator while investigating an
+#     unrelated alert — accidental, which is what makes it worth recording. With
+#     exactly ONE matching process live (`node …/telepty allow --id orchestrator claude`):
+#       $ ps -eo command | grep -c 'telepty allow.*--id orchestrator'
+#       3
+#     The extra two hits were the `grep` itself and its `zsh -c` wrapper, each carrying
+#     the pattern in its own argv. Someone measuring the defect triggered the defect.
+#
+#     ONE PRECISION, because conflating these two is easy and this block should not.
+#     That command's OWN `.*` pattern is what matched its OWN argv — it does not contain
+#     the auditor's LITERAL marker (`telepty allow --id <sid> `, spaces and all), so that
+#     exact process would NOT have fooled the auditor. Measured: with that row in the
+#     table the original bash counts 3, not 4. The hazard is the same shape but the
+#     matcher is not, so the row below is a literal-marker grep — the form that DOES
+#     reach the auditor. The `.*` variant is recorded here as prose rather than pinned
+#     as a fixture that would quietly assert something untrue.
+cat > "$PS_TABLE" <<EOF
+50349 2-04:11:07 $B
+88880 00:00:01 grep -c telepty allow --id orchestrator  /tmp/snap.txt
+88881 00:00:02 /bin/zsh -c ps -eo pid,etime,command | grep -F "telepty allow --id orchestrator "
+88882 00:00:03 /bin/zsh -c awk '\$0 ~ ("telepty allow --id orchestrator ")' /tmp/snap.txt
+EOF
+run H2 --
+[ "$RC" -eq 0 ] || fail "H2: rc=$RC"
+if [ "$ORIGINAL" = "1" ]; then
+  grep -qF 'count=4' "$T_TMP/err.txt" \
+    || fail "H2[original]: one real bridge plus three argv mentions must all count under a substring match — that is the hazard (measured in the wild as 3-for-1, and reproduced by hand as 3-for-1 with a grep and its wrapper); if the fixture does not reproduce it, it is not testing the same thing: $(cat "$ERR")"
+  grep -qF 'likely_stale=50349' "$T_TMP/err.txt" \
+    || fail "H2[original]: the reproduction is wrong — the whole point is that oldest-wins selected the LIVE bridge: $(cat "$ERR")"
+else
+  [ ! -s "$ERR" ] \
+    || fail "H2[port]: two measurement wrappers that mention the marker are not bridges. Counting them fires a spurious #618 HOLD whose likely-stale=oldest names the LIVE two-day-old bridge — the exact pid the operator must not kill (#931): $(cat "$ERR")"
+  no_inject "H2[port]"
+fi
+no_kill "H2"
+
+# H3) …and the narrowing must not cost a real duplicate. Two genuine bridges, one of
+#     them invoked WITHOUT the `node` interpreter token (a packaged binary) and via an
+#     absolute path, still both count — that is the case #618 exists for.
+cat > "$PS_TABLE" <<EOF
+50349 2-04:11:07 $B
+50350 00:00:31 /opt/homebrew/bin/telepty allow --id orchestrator claude
+EOF
+run H3 --
+[ "$RC" -eq 0 ] || fail "H3: rc=$RC"
 grep -qF 'count=2' "$T_TMP/err.txt" \
-  || fail "H: the mention-is-a-bridge behaviour changed. That may be an IMPROVEMENT, but it is a detection-policy change across the three sites that share this marker (bin/orchestrator-boot.sh:88, bin/session-reconciler.sh:415, here) — it needs its own ticket, not a port. Alert: $(cat "$ERR")"
-grep -qF '77777' "$T_TMP/err.txt" || fail "H: the non-bridge pid is no longer named: $(cat "$ERR")"
+  || fail "H3: the argv-shape match dropped a REAL duplicate — an absolute telepty path and a missing 'node' token are both ordinary bridge shapes, and missing a duplicate is the failure #618 is about: $(cat "$ERR")"
+grep -qF 'likely_stale=50349' "$T_TMP/err.txt" \
+  || fail "H3: oldest-wins broke: $(cat "$ERR")"
 
 # ===========================================================================
 # I) D4 — ORCHESTRATOR_SID: a DYNAMIC REGEX in bash, a LITERAL in the port.

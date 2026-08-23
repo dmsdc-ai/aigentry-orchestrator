@@ -59,9 +59,21 @@ export type ParsedInject =
   | { kind: "hold"; payload: Hold; transport: "json-fenced" | "markdown-fallback" }
   | { kind: "test-report"; payload: TestReport; transport: "json-fenced" | "markdown-fallback" };
 
+/**
+ * #932. The failure variant carries an OPTIONAL `field`/`kind` pair when the body was
+ * refused because one named field failed a trust-boundary rule, rather than because
+ * no envelope was recognized at all.
+ *
+ * Additive on purpose. Every existing consumer reads `ok` and `error` by name — there
+ * is exactly one in production (src/inject-handler/cli.ts:352) plus
+ * tests/session/inject-parser.test.ts — so nothing destructures positionally or
+ * spreads this object, and the two new keys are invisible to code that ignores them.
+ * What they buy: a consumer can keep naming the rejected field instead of degrading
+ * to a generic "unknown envelope kind" once the rule moves up here.
+ */
 export type ParseResult =
   | { ok: true; envelope: ParsedInject }
-  | { ok: false; error: string };
+  | { ok: false; error: string; field?: string; kind?: string; value?: unknown };
 
 /**
  * Parse an inject body. Returns the first envelope recognized.
@@ -75,6 +87,14 @@ export function parseInject(body: string): ParseResult {
   const ssot = parsePtyEnvelope(body);
   if (ssot.ok) {
     const { envelope } = ssot;
+    // #932: a test-report whose session_id is not a safe path segment is REFUSED here
+    // rather than being allowed to fall through to the markdown scans below. Falling
+    // through would let a body that carries a hostile fenced payload be re-read as
+    // some other envelope — a traversal attempt must fail closed, not be reinterpreted.
+    if (envelope.kind === "test-report") {
+      const rejected = rejectUnsafeSessionId(envelope.payload);
+      if (rejected) return rejected;
+    }
     const narrowed = narrowSsotEnvelope(envelope.kind, envelope.payload, envelope.transport);
     if (narrowed) return { ok: true, envelope: narrowed };
   }
@@ -107,6 +127,11 @@ export function parseInject(body: string): ParseResult {
 
   const testReport = parseMarkdownTestReport(body);
   if (testReport) {
+    // #932: the markdown path BUILDS a TestReport directly and never went through
+    // validateTestReport, so the rule has to be applied here too — a `TEST_REPORT:
+    // ../../x | …` line reaches exactly the same filename as the fenced form.
+    const rejected = rejectUnsafeSessionId(testReport);
+    if (rejected) return rejected;
     return {
       ok: true,
       envelope: { kind: "test-report", payload: testReport, transport: "markdown-fallback" },
@@ -186,10 +211,59 @@ function validateExtendLifetime(p: unknown): p is ExtendLifetimePayload {
   return true;
 }
 
+/** `${sid}.json.tmp.XXXXXX` has to fit in NAME_MAX (255) with room to spare. */
+const SID_MAX = 128;
+/**
+ * src/inject-handler/cli.ts:258's idiom, deliberately the same one and not a second
+ * dialect of it. Excludes `/`, NUL and every control character by construction, so a
+ * rejected value cannot forge a log line either.
+ */
+const SAFE_SEGMENT_RE = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * #932. A test-report `session_id` becomes a FILENAME at every consumer that writes
+ * one, so the parser refuses anything that is not a single safe path segment.
+ *
+ * REJECTED, never rewritten. A sanitised `../../x` would silently write to a file the
+ * sender did not name — the same defect with a quieter failure — and a tester whose
+ * sid was mangled should hear about it rather than lose the handoff into a wrong path.
+ *
+ * `.` and `..` are rejected BY NAME because they pass the character class intact: they
+ * are made only of characters the class allows, so the class alone cannot see them.
+ */
+function isSafeSessionSegment(v: unknown): boolean {
+  if (typeof v !== "string") return false;
+  if (!SAFE_SEGMENT_RE.test(v)) return false;
+  if (v === "." || v === "..") return false;
+  if (v.length > SID_MAX) return false;
+  return true;
+}
+
+/**
+ * The rejection itself, shaped so a consumer can keep naming the field. Returns null
+ * when the session_id is acceptable, so callers read as `const r = …; if (r) return r`.
+ */
+function rejectUnsafeSessionId(payload: unknown): ParseResult | null {
+  const sid = isRecord(payload) ? payload.session_id : undefined;
+  if (isSafeSessionSegment(sid)) return null;
+  return {
+    ok: false,
+    error:
+      "a session_id becomes a filename, so it must be one path segment matching " +
+      `[A-Za-z0-9._-]+, at most ${SID_MAX} characters, and never '.' or '..'`,
+    field: "session_id",
+    kind: "test-report",
+    value: sid,
+  };
+}
+
 function validateTestReport(p: unknown): p is TestReport {
   if (!isRecord(p)) return false;
   if (p.schema_version !== "1") return false;
-  if (typeof p.session_id !== "string") return false;
+  // Defence in depth (#932): src/inject-handler/cli.ts:266 refuses this too, but only
+  // the consumer that remembered to. Enforcing it here means every consumer inherits
+  // it — see the trade-off recorded at src/inject-handler/cli.ts:64-67.
+  if (!isSafeSessionSegment(p.session_id)) return false;
   if (typeof p.suite !== "string") return false;
   if (!isRecord(p.totals)) return false;
   const t = p.totals as Record<string, unknown>;

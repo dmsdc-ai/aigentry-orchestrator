@@ -56,7 +56,18 @@
 # Article 17: the implementation is Node + the same shell/Python helpers this script
 # always shelled out to. macOS (launchd) + Linux (systemd); no OS branch here.
 set -euo pipefail
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+# #930 — homebrew APPENDED: a fallback for `node`/`python3` under launchd, never an
+# override of the caller's PATH. It was a prefix, which is #400's mechanism
+# (bin/session-cleanup.sh:34-41). Identical in every shim on purpose — a policy that
+# differed per shim is how the prefix survived four ports. tests/dispatch/T137 measures
+# it and carries the host measurement behind the decision.
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+# `telepty` resolved EXPLICITLY into the seam the implementation reads, never left to a
+# spawn-time PATH lookup; after the append, so the operator's wins where there is one
+# and launchd still finds homebrew's. An already-set TELEPTY is never overridden.
+: "${TELEPTY:=$(command -v telepty 2>/dev/null || true)}"
+[ -n "$TELEPTY" ] || TELEPTY=telepty
+export TELEPTY
 # launchd does NOT propagate HOME to this daemon (verified: `launchctl print
 # gui/<uid>/com.aigentry.reconciler` env has PATH but no HOME). With HOME empty,
 # the cmux-prune ownership gate (workspace-host.sh: sandbox=$HOME/.aigentry/

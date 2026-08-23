@@ -51,22 +51,36 @@
 //      hardcoded line range carries (it opens on a dangling sentence fragment and
 //      ends one line early, hiding the `TELEPTY` seam). See usage.ts.
 //
-//   D3 REPRODUCED, named for a ticket — the marker is tested against the WHOLE
-//      `command` column, so a process that merely MENTIONS
-//      `telepty allow --id <sid> ` is counted as a bridge, printed as one, and can
-//      be named `likely-stale=oldest=` in a HOLD that tells the operator to
+//   D3 FIXED BY #931 (was: REPRODUCED, named for a ticket). The marker was tested
+//      against the WHOLE `command` column, so a process that merely MENTIONS
+//      `telepty allow --id <sid> ` was counted as a bridge, printed as one, and
+//      could be named `likely-stale=oldest=` in a HOLD that tells the operator to
 //      `kill -9` it. Measured in the wild, not only in a fixture: on the port host,
 //      `ps -eo pid,etime,command` piped into a grep for the marker returned 3 hits
 //      where a clean snapshot returned 1 — the two extras were the measuring shell
 //      itself (`/bin/zsh -c '… awk '\''$0 ~ ("telepty allow --id orchestrator ")…'`),
 //      real live processes whose only sin was naming the marker in their own argv.
-//      The snapshot-then-parse split (bash :74-79, kept below) prevents this
-//      process from matching ITSELF, and nothing else. Tightening it means
-//      requiring the match to begin at a telepty executable path — a detection
-//      policy change across three sites that share this marker
-//      (bin/orchestrator-boot.sh:88, bin/session-reconciler.sh:415 and here), with
-//      its own blast radius on #618. Not a port's call. T127 block H pins the
-//      false positive so it cannot be lost, and cannot be "fixed" by accident.
+//      The snapshot-then-parse split (bash :74-79, kept below) prevented this
+//      process from matching ITSELF, and nothing else.
+//
+//      Why it mattered more than a miscount: with those extras counted the pass
+//      fires a duplicate HOLD, and `likely-stale=oldest` then resolves to the OLDEST
+//      member of the set — the genuine long-lived bridge, because the false
+//      positives are short-lived wrappers. The one line an operator acts on named
+//      the LIVE bridge as the one to kill.
+//
+//      The fix is an argv-SHAPE match (see isOrchestratorBridge below), adopted from
+//      src/orchestrator-boot/cli.ts where the same matcher already guards the KILL
+//      site. Of the three sites D3 named, bin/session-reconciler.sh:415 no longer
+//      carries the marker at all (the reconciler port left only a descriptive
+//      comment at src/reconciler/cli.ts:1297), so the two that still decide anything
+//      now share one definition of "is this a bridge". T127 block H asserts the
+//      decision and keeps an ORIGINAL arm recording what the bash did; H2 reproduces
+//      the wild 3-hits-for-1-bridge measurement and the live-bridge misidentification
+//      it caused; H3 pins that a REAL duplicate is still caught, including a bridge
+//      with no `node` token and an absolute telepty path.
+//
+//      STILL WARN-ONLY (#606). #931 narrowed detection and added no kill path.
 //
 //   D4 DEVIATION — `ORCHESTRATOR_SID` IS MATCHED LITERALLY HERE, and the bash
 //      matched it AS A REGEX. `awk -v s="$ORCH_SID"` then `$0 ~ ("telepty allow
@@ -246,16 +260,60 @@ const ps = spawnSync(SINGLETON_PS_CMD, ["-eo", "pid,etime,command"], {
 });
 const snapshot = ps.stdout || "";
 
-// The trailing space in the marker is what keeps an `orchestrator-2 ` bridge from
-// counting as `orchestrator` — the same marker as bin/orchestrator-boot.sh:88 and
-// bin/session-reconciler.sh:415 (T57 block D). Literal, not a regex: D4.
-const MARKER = `telepty allow --id ${ORCH_SID} `;
+/**
+ * #931 — is this row's ARGV a `telepty allow --id <ORCH_SID>` invocation?
+ *
+ * This USED to be `line.includes("telepty allow --id <sid> ")`, i.e. a substring test
+ * against the whole `command` column, which made any process that merely MENTIONS the
+ * marker a bridge (D3). Measured in the wild on this host: two `zsh -c` measurement
+ * wrappers were counted alongside the real bridge, and since the HOLD names
+ * `likely-stale=oldest=` and an operator's `ps` snapshot outlives a short-lived
+ * wrapper, the oldest of that set was the LIVE two-day-old bridge — the one line in
+ * the alert an operator acts on pointed at the process they must not kill.
+ *
+ * A substring match is not a process identity. This asks whether the process IS the
+ * bridge:
+ *
+ *   [node] <…/>telepty allow … --id <sid> …
+ *    ^opt   ^executable token   ^whole-token sid
+ *
+ * Adopted VERBATIM from src/orchestrator-boot/cli.ts:376's isOrchestratorBridge — the
+ * same matcher that already landed at the KILL site, which is the one place where
+ * getting this wrong is fatal. Two detectors of "is this a bridge" that disagree is
+ * the actual hazard; this is the third site named in D3
+ * (bin/orchestrator-boot.sh:88, bin/session-reconciler.sh:415, here).
+ *
+ * The whole-token sid comparison is what the marker's trailing space was for
+ * (`orchestrator-2` is not `orchestrator`, T57 block D), and it keeps D4's literal
+ * semantics: no regex, so `orch.tor` still matches only `orch.tor` (T127 block I).
+ *
+ * WARN-ONLY IS UNCHANGED (#606). This narrows what is DETECTED; it adds no kill path,
+ * and the confirm-live-pid hedge in the HOLD text stays exactly as it was.
+ */
+const INTERPRETERS = new Set(["node", "nodejs"]);
+function isOrchestratorBridge(cmd: string[]): boolean {
+  if (cmd.length === 0) return false;
+  let i = 0;
+  if (INTERPRETERS.has(path.basename(cmd[0]))) i = 1;
+  if (i >= cmd.length) return false;
+  if (path.basename(cmd[i]) !== "telepty") return false;
+  if (cmd[i + 1] !== "allow") return false;
+  for (let j = i + 2; j + 1 < cmd.length; j++) {
+    if (cmd[j] === "--id" && cmd[j + 1] === ORCH_SID) return true;
+  }
+  return false;
+}
+
 const bridges: { pid: string; etime: string; secs: number }[] = [];
 for (const line of snapshot.split("\n")) {
-  if (!line.includes(MARKER)) continue;
   if (line.includes("<defunct>")) continue; // skip zombies
   const f = line.trim().split(/\s+/); // awk's default FS: runs of whitespace
   if (/[^0-9]/.test(f[0])) continue; // numeric pids only — drops the ps header row
+  // `ps` has already flattened argv into one column, so the tokens are recovered by
+  // the same whitespace split — lossy for an argument containing a space, but every
+  // token this matcher looks at (the executable, `allow`, `--id`, the sid) is one
+  // shell word by construction.
+  if (!isOrchestratorBridge(f.slice(2))) continue;
   bridges.push({ pid: f[0], etime: f[1], secs: etimeSecs(f[1]) });
 }
 
