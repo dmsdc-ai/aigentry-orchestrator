@@ -30,7 +30,18 @@
 # Exit codes: 0 OK (sent / closed), 4 usage / lane-refusal, 7 cap tripped (refused),
 #             8 conflict escalation (refused).
 set -euo pipefail
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+# #930 — homebrew APPENDED: a fallback for `node`/`python3` under launchd, never an
+# override of the caller's PATH. It was a prefix, which is #400's mechanism
+# (bin/session-cleanup.sh:34-41). Identical in every shim on purpose — a policy that
+# differed per shim is how the prefix survived four ports. tests/dispatch/T137 measures
+# it and carries the host measurement behind the decision.
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+# `telepty` resolved EXPLICITLY into the seam the implementation reads, never left to a
+# spawn-time PATH lookup; after the append, so the operator's wins where there is one
+# and launchd still finds homebrew's. An already-set TELEPTY is never overridden.
+: "${TELEPTY:=$(command -v telepty 2>/dev/null || true)}"
+[ -n "$TELEPTY" ] || TELEPTY=telepty
+export TELEPTY
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"

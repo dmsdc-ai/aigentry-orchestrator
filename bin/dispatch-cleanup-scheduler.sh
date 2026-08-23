@@ -42,16 +42,28 @@
 #     hitl.sh and open-session.sh; tests/dispatch/T121 pins the workspace layout for
 #     this one.
 #
-# THE PATH HARDENING STAYS HERE, IN BASH, and byte-identical. It is what puts
-# `python3` on PATH for bin/dispatch-registry.py's shebang and `node` on PATH for the
-# bin/session-cleanup.sh child — both are launched by the node process, so a copy
-# inside TS would leave one process generation running with the caller's PATH. This
-# script is also reached from launchd via `src/reconciler/cli.ts` every 60s, where
-# the inherited PATH is minimal. (Unlike session-cleanup.sh, which must NOT harden
-# PATH — see task #400 in its header — this script never runs `telepty`, so the
-# stale-homebrew-CLI hazard that argument is about cannot apply here.)
+# THE PATH HARDENING STAYS HERE, IN BASH — no longer byte-identical: #930 demoted the
+# homebrew entry from a PREFIX to a FALLBACK (see the block above `set -euo pipefail`).
+# It is what puts `python3` on PATH for bin/dispatch-registry.py's shebang and `node`
+# on PATH for the bin/session-cleanup.sh child — both are launched by the node
+# process, so a copy inside TS would leave one process generation running with the
+# caller's PATH. This script is also reached from launchd via src/reconciler/cli.ts
+# every 60s, where the inherited PATH is minimal — which is why the homebrew entry is
+# appended rather than deleted. It never runs `telepty`, so #400's hazard never
+# applied here; #930 changed the line anyway so one policy holds across every shim.
 set -euo pipefail
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+# #930 — homebrew APPENDED: a fallback for `node`/`python3` under launchd, never an
+# override of the caller's PATH. It was a prefix, which is #400's mechanism
+# (bin/session-cleanup.sh:34-41). Identical in every shim on purpose — a policy that
+# differed per shim is how the prefix survived four ports. tests/dispatch/T137 measures
+# it and carries the host measurement behind the decision.
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+# `telepty` resolved EXPLICITLY into the seam the implementation reads, never left to a
+# spawn-time PATH lookup; after the append, so the operator's wins where there is one
+# and launchd still finds homebrew's. An already-set TELEPTY is never overridden.
+: "${TELEPTY:=$(command -v telepty 2>/dev/null || true)}"
+[ -n "$TELEPTY" ] || TELEPTY=telepty
+export TELEPTY
 # Resolved exactly as the shell script's SCRIPT_DIR was, so a symlinked entrypoint
 # still locates bin/ helpers (dispatch-registry.py, session-cleanup.sh).
 AIGENTRY_SHIM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"

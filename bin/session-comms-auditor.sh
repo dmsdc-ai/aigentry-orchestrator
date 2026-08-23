@@ -62,18 +62,27 @@
 #     hitl.sh, open-session.sh and dispatch-cleanup-scheduler.sh;
 #     tests/dispatch/T123 pins the workspace layout for this one.
 #
-# THE PATH HARDENING STAYS HERE, IN BASH, and byte-identical. It is what resolves
-# the default literal `telepty` for the node process's child, and this script is
+# THE PATH HARDENING STAYS HERE, IN BASH — no longer byte-identical: #930 demoted the
+# homebrew entry from a PREFIX to a FALLBACK (see the block above `set -euo pipefail`).
+# It is what resolves `telepty` for the node process's child, and this script is
 # reached from launchd via src/reconciler/cli.ts every 60s, where the inherited PATH
-# is minimal. NAMED TENSION, pre-existing, mentioned not changed (Rule 29):
-# bin/session-cleanup.sh:34-41 records that a hardcoded `/opt/homebrew/bin` prefix
-# is exactly what made task #400 pick a stale homebrew telepty against an older
-# daemon. This script has carried that prefix since #533 and does run `telepty`, so
-# the same hazard applies to it; removing the prefix is a separate call with its own
-# blast radius. Both guards are immune either way because tests/dispatch/lib.sh:45
-# exports an absolute `TELEPTY`, which wins over PATH.
+# is minimal — hence appended, not deleted.
+# THE SEPARATE CALL THIS HEADER ASKED FOR IS #930, AND IT WAS MADE. This script has
+# carried the prefix since #533 and does run `telepty`, so #400's hazard applied to
+# it directly — that is exactly why the decision could not stay deferred.
 set -euo pipefail
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+# #930 — homebrew APPENDED: a fallback for `node`/`python3` under launchd, never an
+# override of the caller's PATH. It was a prefix, which is #400's mechanism
+# (bin/session-cleanup.sh:34-41). Identical in every shim on purpose — a policy that
+# differed per shim is how the prefix survived four ports. tests/dispatch/T137 measures
+# it and carries the host measurement behind the decision.
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+# `telepty` resolved EXPLICITLY into the seam the implementation reads, never left to a
+# spawn-time PATH lookup; after the append, so the operator's wins where there is one
+# and launchd still finds homebrew's. An already-set TELEPTY is never overridden.
+: "${TELEPTY:=$(command -v telepty 2>/dev/null || true)}"
+[ -n "$TELEPTY" ] || TELEPTY=telepty
+export TELEPTY
 # Resolved exactly as the shell script's SCRIPT_DIR was, so a symlinked entrypoint
 # still resolves — and so a control workspace audits its OWN state/session-comms
 # and state/dispatch rather than the installed package's (T123).
