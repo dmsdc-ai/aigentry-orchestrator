@@ -72,11 +72,14 @@
 #     the original bash, which is how the parity is measured at all; the deviations are
 #     named here instead, which is the surface Rule 38 asks for.
 #   * NAMED FOR A TICKET, not fixed (Rule 29 — out of this task's decided scope):
-#     src/session/inject-parser.ts's validateTestReport still accepts any string as
-#     session_id, so the segment rule benefits this consumer only; the telemetry
-#     `--payload-json` is still string-interpolated, so a `"` in a reason still emits
-#     invalid JSON (reproduced byte for byte); a failing dispatch-registry.py observe
-#     is still swallowed.
+#     the telemetry `--payload-json` is still string-interpolated, so a `"` in a reason
+#     still emits invalid JSON (reproduced byte for byte); a failing
+#     dispatch-registry.py observe is still swallowed.
+#   * CLOSED SINCE (#932): the entry that used to head this list — validateTestReport
+#     accepting any string as session_id, leaving the segment rule a benefit to this
+#     consumer only — is fixed. src/session/inject-parser.ts enforces the rule for
+#     EVERY consumer, and src/inject-handler/cli.ts keeps naming the field anyway; see
+#     that file's D2 block for why the naming did not have to be traded away.
 #
 # THE PATH HARDENING STAYS HERE, IN BASH, and byte-identical. It is what puts `python3`
 # on PATH for bin/dispatch-registry.py's shebang and `node` on PATH for the

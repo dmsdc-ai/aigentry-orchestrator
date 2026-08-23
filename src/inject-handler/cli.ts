@@ -59,12 +59,22 @@
 //      character class cannot express. Same shape as the comms-auditor thread_id
 //      traversal fixed in tranche 4.
 //
+//      SINCE RESOLVED (#932). This block used to carry a NOT-FIXED entry saying the
+//      parser's own validateTestReport still accepted any string, and that moving the
+//      rule up there would trade a refusal that NAMES the field for a generic
+//      `parse failed: unknown envelope kind`. The rule now lives in
+//      src/session/inject-parser.ts as well, and that trade was not taken: the
+//      parser's failure result carries an optional `field`/`kind`/`value`, and :360
+//      routes a field-shaped rejection back into rejectField() below — so the stderr
+//      line and the INJECT_PAYLOAD_REJECTED record are unchanged. The entry is
+//      rewritten rather than deleted because the tension was real and a later reader
+//      will otherwise re-derive it; what is gone is the defect, not the reasoning.
+//      T124 block M passes UNTOUCHED, which is the proof the naming survived the
+//      move, and tests/dispatch/T136 pins the alerts.log half on its own so the
+//      routing cannot be refactored away in silence.
+//
 // NOT FIXED, and named so the next reader does not mistake silence for absence —
 // each is out of this task's decided scope (Rule 29) and wants its own ticket:
-//   * The parser's own validateTestReport still accepts any string as session_id.
-//     Moving the segment rule INTO src/session/inject-parser.ts would benefit every
-//     consumer, but it turns a refusal that names the field into a generic
-//     `parse failed: unknown envelope kind`, and the parser is not this task's surface.
 //   * The telemetry `--payload-json` is still assembled by string interpolation, so a
 //     `"` in a reason or target still emits invalid JSON (measured: `reason: a"b` →
 //     `{"target":"t3","reason":"a"b",…}`). It is REPRODUCED here byte for byte, `|| true`
@@ -349,6 +359,17 @@ function main(): void {
   }
 
   const parsed = parseInject(body);
+  // #932: the parser now enforces the session_id path-segment rule itself, so a
+  // traversal is refused BEFORE the per-kind arms run and armTestReport's own
+  // requireSafeSegment never sees it. Routing a field-shaped rejection back into
+  // rejectField keeps the two things that refusal is worth — the stderr line that
+  // NAMES the field and the INJECT_PAYLOAD_REJECTED line in alerts.log — instead of
+  // degrading them to a generic `parse failed`. T124 block M measures both, and
+  // T136 measures the alerts.log half specifically so a later refactor cannot take
+  // it away in silence.
+  if (!parsed.ok && parsed.field) {
+    rejectField(parsed.field, parsed.kind ?? "unknown", null, parsed.value ?? null, parsed.error);
+  }
   if (!parsed.ok) die(`inject-handler: parse failed: ${parsed.error}`, 1);
 
   const { kind, payload, transport } = parsed.envelope;
