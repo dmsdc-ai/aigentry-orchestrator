@@ -69,6 +69,24 @@ delegation checklist + `docs/rules.md` Rule 4 (capability-gated spawn).
   to close the cmux workspace + telepty session (Rule 28). SPEC FIRST reuse
   is the only exception.
 
+## Context capture — a delta is written before the next task (Rule 40)
+
+When context arrives that **differs from what is already recorded** — a correction, a
+re-measurement, a "this shipped unverified", a worker's self-report — append it to the
+**existing task that owns it** before moving to the next task:
+
+- Append to `state/task-queue.json` on that task's `note` as a dated `|| <date>: ...`
+  segment. A new task only when no existing task owns the context.
+- Say what was measured and what was **not** (Rule 38). A delta that names only the
+  conclusion is the thing this rule exists to prevent.
+- Applies to closing messages and record-only reports, which are exactly the ones that
+  otherwise live only in chat and do not survive a compact.
+
+> **If skipped:** the finding exists solely in the transcript. Verified cost
+> (2026-08-26/27 wave): a feature shipped unverified, a delivery check's two failure
+> modes, and a mis-attribution all arrived in closing messages with no task holding
+> them. The turn is not finished while a delta is unwritten.
+
 ## Parallel work
 
 ### Track A — parallel recommendation (default), confirm before fire

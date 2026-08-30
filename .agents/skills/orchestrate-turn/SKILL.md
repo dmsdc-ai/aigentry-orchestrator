@@ -118,6 +118,25 @@ This runs parent-PID SIGTERM + telepty session DELETE + the cmux/terminal `close
 
 ---
 
+## Step 4-A — Write the context delta into its task (Rule 40)
+
+Before step 5, any context from this turn that **differs from what the task already
+records** goes onto that task, not into chat only:
+
+```bash
+# append a dated segment to the OWNING task's note in state/task-queue.json
+# new task only when no existing task owns the context
+```
+
+Name what was measured and what was not (Rule 38). Closing messages and record-only
+reports count — they are the ones that otherwise survive nowhere.
+
+> **If skipped:** the turn's best finding lives only in the transcript and dies at the
+> next compact. Measured 2026-08-26/27: a shipped-unverified feature, a delivery check's
+> two failure modes, and a wrong attribution all arrived this way. tq#1068.
+
+---
+
 ## Step 5 — Propose the next task
 
 Once cleanup is confirmed, invoke the `propose-next-task` skill (picks the next task from `state/task-queue.json` on an idle/blocked/awaiting turn) and propose from queue / stored context:
