@@ -50,6 +50,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { keepNodeOptionsShimAlive } from "./node-options-shim.js";
 import { USAGE } from "./usage.js";
 
 const env = process.env;
@@ -1310,6 +1311,23 @@ function main(argv: string[]): void {
     if (runQuiet(BUS_BRIDGE_SH, ["--ensure"], { ...env, TELEPTY }) !== 0) {
       log("ERR bus-bridge ensure non-zero (continuing)");
     }
+  }
+
+  // --- step 0f: cmux NODE_OPTIONS shim keep-alive (#1075) — every claude that cmux
+  // launches carries NODE_OPTIONS='--require=$TMPDIR/cmux-claude-node-options/
+  // restore-node-options.cjs …', and macOS purges that file after 3 idle days while
+  // the session lives on; from then on every node child of the session dies at
+  // preload (stop hooks, npm test, telepty). Touch it each tick so the purge's clock
+  // never reaches 3 days, and put it back if it is already gone. RUNS REGARDLESS OF
+  // DRY_RUN, unlike every belt above: touching or recreating the shim is not a
+  // session action, and a long HITL pause is exactly the window this closes
+  // (orchestrator decision 2026-09-05); the log line goes through log() like the
+  // others. Best-effort. The ps -E read is macOS's /proc-less environment read and
+  // lives in platform.sh (Rule 26); linux prints nothing → nothing to do. ---
+  try {
+    keepNodeOptionsShimAlive(readLines(platform("platform::node_options_shim_refs").stdout), log);
+  } catch {
+    log("ERR node-options-shim non-zero (continuing)");
   }
 
   // --- step 1: scheduler tick (Layer D fires due) ---
