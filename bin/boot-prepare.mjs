@@ -84,7 +84,7 @@ function die(msg, code = 1) {
 
 function usage() {
   process.stdout.write(
-    "Usage: boot-prepare.mjs --role R --cwd C --sid S [--cli claude|codex|gemini]\n" +
+    "Usage: boot-prepare.mjs --role R --cwd C --sid S [--cli claude|codex|gemini|grok]\n" +
       "  Emits a JSON object on stdout with {spawn_cli, extra_flags, spawn_cwd, env}.\n" +
       "  Exits non-zero on any error.\n",
   );
@@ -456,7 +456,7 @@ async function main() {
   // #532: gate lifted from claude-only to claude|codex|gemini. Unknown CLIs are
   // still rejected here (and again by getBootAdapter's registry) with a non-zero
   // exit + clear stderr — never a silent broken contract.
-  const SUPPORTED_CLIS = ["claude", "codex", "gemini"];
+  const SUPPORTED_CLIS = ["claude", "codex", "gemini", "grok"];
   if (!SUPPORTED_CLIS.includes(args.cli)) {
     die(
       `unsupported --cli ${JSON.stringify(args.cli)}; supported: ${SUPPORTED_CLIS.join(", ")}`,
@@ -481,7 +481,7 @@ async function main() {
   const { resolveInstructions } = await import(
     join(REPO_ROOT, "dist/src/session/resolve-instructions.js")
   );
-  const { getBootAdapter, nodeBootFs, nodeSpawner } = await import(
+  const { getBootAdapter, geminiBinary, nodeBootFs, nodeSpawner } = await import(
     join(REPO_ROOT, "dist/src/session/boot-adapter/index.js")
   );
   const { isRole } = await import(
@@ -534,7 +534,7 @@ async function main() {
     created_at: new Date().toISOString(),
   };
 
-  const adapter = getBootAdapter(args.cli);
+  const adapter = getBootAdapter(args.cli, geminiBinary());
   const cmd = await adapter.buildBootCommand(ctx, resolved, {
     staging_dir: stagingDir,
     fs,
@@ -610,6 +610,10 @@ async function main() {
     args.cli === "claude"
       ? [...cmd.argv.slice(1), "--model", claudeModel, "--effort", claudeEffort, "--permission-mode", "bypassPermissions"]
       : [...cmd.argv.slice(1)];
+  // #1083: these CLIs expose prompt flags, not Gemini CLI's context/shadow-home contract.
+  if (args.cli === "grok" || cmd.argv[0] === "agy") {
+    flagsArgv.push(args.cli === "grok" ? "--rules" : "--prompt-interactive", await readFile(cmd.prompt_file, "utf8"));
+  }
   const flagsLine = flagsArgv.map(shellQuote).join(" ");
 
   // Per-session launcher.sh — exports env (AIGENTRY_TARGET_CWD always; the CLI
@@ -637,7 +641,7 @@ async function main() {
     `# staged cwd context file (AGENTS.md / GEMINI.md) + config-home shadow home.\n` +
     `export AIGENTRY_TARGET_CWD=${shellQuote(args.cwd)}\n` +
     homeExportLines +
-    `exec -a ${shellQuote(execName)} ${shellQuote(execName)} ${flagsLine} "$@"\n`;
+    `exec -a ${shellQuote(args.cli)} ${shellQuote(execName)} ${flagsLine} "$@"\n`;
   // writeFile with mode atomically sets +x — avoids a separate chmodSync call
   // (CWE-23 Snyk avoidance: single FS op on the validated path).
   await writeFile(launcherPath, launcherBody, { mode: 0o755 });

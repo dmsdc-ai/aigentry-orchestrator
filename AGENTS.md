@@ -143,6 +143,8 @@ telepty list
 | codex | 포팅, 구현, 리팩터링 | 코드 생성, 테스트 |
 | gemini | 웹 검색, 문서화 | upstream 조사, API 문서 |
 
+새 `--spawn-and-dispatch`는 `--cli auto`가 기본이며 `docs/model-profiles/model-routing-profile.md`와 태스크 ref로 CLI·모델을 선택한다. 명시적 `--cli`는 라우터를 우회하고, `--target`은 기존 워커를 유지한다. `AIGENTRY_ROUTER_PROFILE`·`AIGENTRY_ROUTER_CLASSIFIER`로 프로필·분류 실행 파일을 바꿀 수 있고, 선택 모델은 해당 자식의 `AIGENTRY_CLAUDE_MODEL` / `AIGENTRY_CODEX_MODEL` / `AIGENTRY_GROK_MODEL` / `AIGENTRY_GEMINI_MODEL`에만 적용된다. `gemini`는 설치된 `agy`를 우선 사용하며 `AIGENTRY_GEMINI_BINARY=agy|gemini`로 지정한다. 분류 실패는 역할 기본표, 프로필 부재는 Fable로 대체된다.
+
 ## 전담 세션 역할
 
 CLI는 설정에 따라 변경될 수 있음. 역할 기준으로 위임, 세션 ID는 `telepty list`로 확인.

@@ -28,7 +28,8 @@ export const USAGE = `# dispatch.sh — Wraps \`telepty inject\` with REPL-ready
 #   AIGENTRY_TASK_GATE=hard|warn|off (default hard) — warn audits+proceeds, off = legacy.
 #   AIGENTRY_TASK_QUEUE=<path> overrides the queue (default <repo>/state/task-queue.json).
 #
-# --role (cli=claude|codex|gemini, #431 / #532): wires boot-prepare.mjs so the
+# --cli defaults to auto (profile + LLM, then role table); explicit CLI bypasses routing.
+# --role (cli=claude|codex|gemini|grok, #431 / #532 / #1083): wires boot-prepare.mjs so the
 #   wrapped CLI skips project context-file auto-discovery (the cwd→role
 #   contamination exposed by the 2026-05-23 incident). claude uses
 #   \`--append-system-prompt-file\`; codex/gemini use the additive path (staged cwd

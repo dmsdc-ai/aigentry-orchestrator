@@ -4,9 +4,9 @@ import type { SessionContext } from "../types.js";
 import type { BootFS } from "./boot-fs.js";
 import type { Spawner } from "./spawner.js";
 
-export type CliKind = "claude" | "codex" | "gemini";
+export type CliKind = "claude" | "codex" | "gemini" | "grok";
 export const CLI_KINDS: readonly CliKind[] = Object.freeze([
-  "claude", "codex", "gemini",
+  "claude", "codex", "gemini", "grok",
 ]) as readonly CliKind[];
 
 export function isCliKind(v: unknown): v is CliKind {

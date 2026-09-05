@@ -46,7 +46,7 @@ test("4. codex argv = real default flags; additive descriptor (AGENTS.md / CODEX
     staging_dir: STAGING, fs, spawner: mockSpawner(ALL()),
   });
   assert.deepEqual([...cmd.argv], [
-    "codex", "-c", "check_for_update_on_startup=false",
+    "codex", "-m", "gpt-6-astra", "-c", "check_for_update_on_startup=false",
     "--dangerously-bypass-approvals-and-sandbox",
   ]);
   assert.equal(cmd.cwd, "/work/myproj");

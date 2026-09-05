@@ -31,6 +31,7 @@
     ".claude/settings.json",
     ".claude/hooks",
     "docs/rules.md",
+    "docs/model-profiles/model-routing-profile.md",
     "docs/templates",
     "git-hooks",
     "AGENTS.md",
