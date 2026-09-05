@@ -127,3 +127,32 @@ Tests T138–T141 compile from `tests/dispatch/*.test.ts` into `dist/tests` for
 the unchanged test runner. They exercise failure paths, label mappings,
 classifier call counts, audit records, child environment, deduplication, and
 generated role/plain launchers. They do not execute workers.
+
+## Addendum 2026-09-05 — per-CLI live cap and effort knobs (#1084)
+
+Three `gpt-6-astra` workers spawned together at `xhigh` exhausted the codex
+5-hour window in about ten minutes, twice in one afternoon. Dispatch now
+consults a per-CLI live cap before a fresh `--spawn-and-dispatch` commits to
+a routed CLI: `AIGENTRY_CLI_CAP_<CLI>` (codex default 2, others unlimited,
+0 = never auto-route there). Live means what `telepty list --json` shows at
+that moment; a worker's `command` is its guard launcher, and the
+`exec -a <cli>` line in it is the kind dispatch wrote. The dispatch registry
+has no `cli` field, so it cannot serve. An unreadable list caps nothing
+(fail-open: the counter never blocks a dispatch).
+
+At cap, the routed decision falls to the first candidate whose CLI is under
+cap: the role's `default_table` pick, then the profile in order, then
+`fable-5.1`. The router emits that order as `candidates` only when called
+with `--candidates 1`, so there is still exactly one profile parser. The task
+ledger and `dispatch_start` telemetry record `by=llm-capped` (or
+`table-capped`) plus `capped_cli=<cli>`. An explicit `--cli` is never
+blocked; it warns once on stderr and proceeds.
+
+Effort reaches the child only. Codex has no effort flag, so both launchers
+pass `-c model_reasoning_effort=$AIGENTRY_CODEX_EFFORT` (default `high`;
+measured on codex 0.153.4, `codex debug models` lists gpt-6-astra levels
+low/medium/high/xhigh/max/ultra with default low). `AIGENTRY_GROK_EFFORT`
+(`--reasoning-effort`) and `AIGENTRY_GEMINI_EFFORT` (agy `--effort`) are
+emitted only when set; Gemini CLI has no effort flag. Not measured: which
+values grok/agy accept, and the cap against a live codex quota (tests stub
+`telepty list`).
