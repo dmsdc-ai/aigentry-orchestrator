@@ -37,7 +37,7 @@ else if (process.argv[2] === '--help') console.log('--model --dangerously-skip-p
 else { console.error('TEST TRIPWIRE: attempted real CLI launch'); process.exit(99); }
 `);
   const telepty = script("telepty", `
-if (process.argv[2] === 'list') console.log(JSON.stringify([{id: 'router-fixture', command: process.env.OBSERVED_CLI || 'codex'}]));
+if (process.argv[2] === 'list') console.log(process.env.LIVE_SESSIONS || JSON.stringify([{id: 'router-fixture', command: process.env.OBSERVED_CLI || 'codex'}]));
 else if (process.argv[2] === 'inject') {
   require('node:fs').writeFileSync(process.env.PARENT_MODEL_LOG, process.env.AIGENTRY_CODEX_MODEL || '');
   console.log('stub inject OK');
@@ -69,7 +69,9 @@ require('node:fs').writeFileSync(process.env.OPEN_LOG, JSON.stringify({args: pro
   const dispatch = (args: string[] = [], overrides: NodeJS.ProcessEnv = {}) => spawnSync(process.execPath,
     [join(REPO, "dist/src/dispatch/cli.js"), "--ref", ref, "--task", "1083", "--no-verify-started", "--timeout-ms", "500", ...args],
     { cwd: REPO, env: { ...env, ...overrides }, encoding: "utf8", timeout: 22000 });
-  return { root, bin, aig, ref, queue, env, script, router, dispatch,
+  // #1084: a live worker shows up in `telepty list` as its guard launcher; the CLI kind is its `exec -a` line.
+  const liveLauncher = (cli: string) => { const file = join(root, `live-${cli}-launcher.sh`); writeFileSync(file, `#!/usr/bin/env bash\nexec -a ${cli} ${cli} "$@"\n`); return file; };
+  return { root, bin, aig, ref, queue, env, script, router, dispatch, liveLauncher,
     spawnArgs: ["--spawn-and-dispatch", "--track", "router", "--name", "fixture", "--cwd", join(root, "project")],
     calls: () => { try { return readFileSync(env.COUNTER!, "utf8").trim().split("\n").length; } catch { return 0; } },
     cleanup: () => rmSync(root, { recursive: true, force: true }) };

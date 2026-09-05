@@ -310,6 +310,8 @@ export function screenShowsDelivery(post: string, firstLine: string): boolean {
 }
 
 // ── CLI state ───────────────────────────────────────────────────────────────
+interface RouteCandidate { cli: string; model: string; label: string }
+
 interface Opts {
   target: string;
   refFile: string;
@@ -321,7 +323,7 @@ interface Opts {
   name: string;
   cwd: string;
   cli: string;
-  route?: { label: string; model: string; decided_by: string; reason: string };
+  route?: { label: string; model: string; decided_by: string; reason: string; candidates?: RouteCandidate[]; capped_cli?: string };
   worktree: string;
   verifyDelivered: boolean;
   verifyStarted: boolean;
@@ -415,21 +417,73 @@ function resolveRoute(o: Opts, sid: string, skipPreparation: boolean): void {
   }
   try {
     const result = spawnSync(process.execPath, [path.join(SCRIPT_DIR, "model-router.mjs"),
-      "--role", o.role, "--ref", o.refFile], {
+      "--role", o.role, "--ref", o.refFile, "--candidates", "1"], {
       encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], timeout: 16000, killSignal: "SIGKILL",
     });
     if (result.error || result.status !== 0) throw new Error("router unavailable");
     const route = JSON.parse(result.stdout);
     if (!["claude", "codex", "grok", "gemini"].includes(route.cli) ||
       !["llm", "table"].includes(route.decided_by) || typeof route.model !== "string" ||
-      typeof route.label !== "string" || typeof route.reason !== "string") throw new Error("invalid router result");
+      typeof route.label !== "string" || typeof route.reason !== "string" ||
+      !Array.isArray(route.candidates)) throw new Error("invalid router result");
     o.cli = route.cli;
     o.route = route;
   } catch {
     process.stderr.write("dispatch.sh: model router unavailable; using emergency table default\n");
-    o.cli = "claude";
-    o.route = { label: "fable-5.1", model: "claude-fable-5-1[1m]", decided_by: "table", reason: "router unavailable" };
+    o.cli = EMERGENCY_ROUTE.cli;
+    o.route = { label: EMERGENCY_ROUTE.label, model: EMERGENCY_ROUTE.model, decided_by: "table", reason: "router unavailable" };
   }
+}
+
+// ── #1084 per-CLI live cap ──────────────────────────────────────────────────
+// Three Astra workers at xhigh drained the codex 5-hour window in ~10 min
+// (2026-09-05). Live = what telepty lists right now: a worker's `command` is its
+// guard launcher, whose `exec -a <cli>` line is the kind writeWorkerLauncher
+// wrote; the orchestrator's own row is the bare CLI. The dispatch registry has
+// no cli field, so it cannot serve here. Fail-open: an unreadable list caps
+// nothing (§9 — a counter must never block dispatch).
+const EMERGENCY_ROUTE: RouteCandidate = { cli: "claude", label: "fable-5.1", model: "claude-fable-5-1[1m]" };
+
+function cliKindOf(command: string): string {
+  const base = path.basename(command);
+  if (["claude", "codex", "grok", "gemini"].includes(base)) return base;
+  if (base === "agy") return "gemini";
+  try { return /^exec -a (\S+)/m.exec(fs.readFileSync(command, "utf8"))?.[1] || ""; } catch { return ""; }
+}
+
+function liveCliCounts(): Record<string, number> {
+  const counts: Record<string, number> = {};
+  try {
+    for (const s of JSON.parse(capture(TELEPTY, ["list", "--json"]).stdout)) {
+      const kind = cliKindOf(String((s && s.command) || ""));
+      if (kind) counts[kind] = (counts[kind] || 0) + 1;
+    }
+  } catch { /* fail-open */ }
+  return counts;
+}
+
+/** AIGENTRY_CLI_CAP_<CLI>: a number (0 = never auto-route there); default codex 2, others unlimited. */
+function cliCap(cli: string): number {
+  const knob = Number(env[`AIGENTRY_CLI_CAP_${cli.toUpperCase()}`] || NaN);
+  return Number.isFinite(knob) ? knob : cli === "codex" ? 2 : Infinity;
+}
+
+/** Fresh spawn only: a routed CLI at cap falls to the next candidate; an explicit --cli warns and proceeds. */
+function applyCliCap(o: Opts): void {
+  if (!o.route || o.route.decided_by === "existing") return;
+  const live = liveCliCounts();
+  const atCap = (cli: string): boolean => (live[cli] || 0) >= cliCap(cli);
+  if (!atCap(o.cli)) return;
+  const status = `${o.cli} at cap (${live[o.cli] || 0} live, AIGENTRY_CLI_CAP_${o.cli.toUpperCase()}=${cliCap(o.cli)})`;
+  if (o.route.decided_by === "explicit") {
+    process.stderr.write(`dispatch.sh: WARNING ${status}; explicit --cli ${o.cli} spawns anyway\n`);
+    return;
+  }
+  const pick = (o.route.candidates || []).find((c) => !atCap(c.cli)) || EMERGENCY_ROUTE;
+  process.stderr.write(`dispatch.sh: ${status}; ${o.route.label} -> ${pick.label} (${pick.cli})\n`);
+  o.route = { label: pick.label, model: pick.model, decided_by: `${o.route.decided_by}-capped`,
+    reason: `${status}; router chose ${o.route.label}: ${o.route.reason}`, capped_cli: o.cli };
+  o.cli = pick.cli;
 }
 
 // ── Rule 34 task-gate (#736) ────────────────────────────────────────────────
@@ -581,7 +635,8 @@ function taskLedgerUpdate(o: Opts, sid: string): void {
     if (task.status === "pending" || task.status === "queued") task.status = "delegated";
     task.updated_at = utcDate(now);
     const stamp = ` | dispatched ${isoSeconds(now)} sid=${sid} ref=${path.basename(o.refFile)} track=${o.track || "-"}` +
-      ` cli=${o.cli}/${o.route?.model || "unknown"} by=${o.route?.decided_by || "explicit"}`;
+      ` cli=${o.cli}/${o.route?.model || "unknown"} by=${o.route?.decided_by || "explicit"}` +
+      (o.route?.capped_cli ? ` capped_cli=${o.route.capped_cli}` : "");
     const note = (task.note as string) || "";
     task.note = note ? note + stamp : stamp.replace(/^[ |]+/, "");
     // Atomic: same-dir temp + rename, so a crash can never truncate the live queue.
@@ -823,7 +878,7 @@ async function waitForReady(o: Opts, sid: string): Promise<number> {
 
 // ── the spawn arm (#431 / #532) ─────────────────────────────────────────────
 function spawnWorkspace(o: Opts, sid: string): void {
-  const spawnEnv: NodeJS.ProcessEnv = o.route?.decided_by === "llm" || o.route?.decided_by === "table"
+  const spawnEnv: NodeJS.ProcessEnv = o.route && /^(llm|table)(-capped)?$/.test(o.route.decided_by)
     ? { [`AIGENTRY_${o.cli.toUpperCase()}_MODEL`]: o.route.model } : {};
   const childEnv = { ...env, ...spawnEnv };
   // #431 (ADR 2026-05-12 enforcement) — hybrid (b-2)+(c) boot wiring.
@@ -936,7 +991,7 @@ async function main(argv: string[]): Promise<never> {
   }
 
   resolveRoute(o, sid, skipPreparation);
-  if (!skipPreparation && o.spawn) spawnWorkspace(o, sid);
+  if (!skipPreparation && o.spawn) { applyCliCap(o); spawnWorkspace(o, sid); }
 
   emitTelemetry([
     "--helper", "dispatch",
@@ -947,7 +1002,7 @@ async function main(argv: string[]): Promise<never> {
       mode: o.spawn ? "spawn-and-dispatch" : "target",
       cli: o.cli,
       role: o.role,
-      route: o.route && { label: o.route.label, decided_by: o.route.decided_by, reason: o.route.reason },
+      route: o.route && { label: o.route.label, decided_by: o.route.decided_by, reason: o.route.reason, capped_cli: o.route.capped_cli },
     }),
     "--correlation-id", sid,
   ]);
