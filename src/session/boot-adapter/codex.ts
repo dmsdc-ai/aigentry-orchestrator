@@ -38,6 +38,8 @@ export function codexAdapter() {
     buildArgvEnv: () => ({
       argv: [
         "codex",
+        "-m",
+        process.env.AIGENTRY_CODEX_MODEL || "gpt-6-astra",
         "-c",
         "check_for_update_on_startup=false",
         "--dangerously-bypass-approvals-and-sandbox",
