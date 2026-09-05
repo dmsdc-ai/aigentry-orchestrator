@@ -34,8 +34,10 @@ for r in "${ROLES[@]}"; do
     fail "$r.md contains placeholder sentinel"
   fi
 
-  # Byte-identical to the canonical source.
-  cmp -s "$f" "$SRC_ROLES/$r.md" || fail "$r.md does not byte-match source $SRC_ROLES/$r.md"
+  # Byte-identical to the canonical source, modulo the init token the installer now
+  # substitutes itself (#1069): {{CONTROL_WORKSPACE}} → the checkout that owns bin/.
+  cmp -s <(sed "s|{{CONTROL_WORKSPACE}}|$REPO_ROOT|g" "$SRC_ROLES/$r.md") "$f" \
+    || fail "$r.md does not match source $SRC_ROLES/$r.md (modulo {{CONTROL_WORKSPACE}})"
 done
 
 echo "PASS: T1 — 9 real role contracts installed (0 placeholders)"
