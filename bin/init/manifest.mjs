@@ -38,6 +38,7 @@ const MANIFEST = [
   "bin/lib/telepty-auth.sh",
   "bin/lib/telepty-listing.sh",
   "bin/lib/workspace-host.sh",
+  "bin/model-router.mjs",
   "bin/open-session.sh",
   "bin/orchestrator-boot.sh",
   "bin/orchestrator-bridge-auditor.sh",
@@ -65,6 +66,7 @@ const MANIFEST = [
   "AGENTS.md",
   "CLAUDE.md",
   "docs/rules.md",
+  "docs/model-profiles/model-routing-profile.md",
   "docs/templates/dispatch-ref-checklist.md",
   "docs/templates/dispatch-ref-template.md",
 
@@ -108,6 +110,7 @@ const SCAFFOLD_PREFIX = "tooling/instructions/";
  *  nothing ships into the governance surface without init placing it. */
 const GOVERNANCE_ROOTS = [
   "bin/",
+  "docs/model-profiles/",
   "docs/rules.md",
   "docs/templates/",
   ".agents/",
