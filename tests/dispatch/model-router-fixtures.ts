@@ -26,7 +26,8 @@ export function fixture() {
 const fs = require('node:fs');
 fs.appendFileSync(process.env.COUNTER, 'call\\n');
 fs.writeFileSync(process.env.PROMPT_LOG, fs.readFileSync(0, 'utf8'));
-fs.writeFileSync(process.env.CLASSIFIER_ARGS, JSON.stringify(process.argv.slice(2)));
+fs.writeFileSync(process.env.CLASSIFIER_ARGS, JSON.stringify({ argv: process.argv.slice(2),
+  env: { MAX_THINKING_TOKENS: process.env.MAX_THINKING_TOKENS, CLAUDE_EFFORT: process.env.CLAUDE_EFFORT } }));
 if (process.env.CLASSIFIER_HANG === '1') setInterval(() => {}, 1000);
 else { process.stdout.write(process.env.CLASSIFIER_REPLY || 'invalid'); process.exit(Number(process.env.CLASSIFIER_EXIT || 0)); }
 `);

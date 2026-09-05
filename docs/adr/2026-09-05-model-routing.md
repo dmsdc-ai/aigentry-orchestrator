@@ -10,8 +10,18 @@ selects one `(cli, model)` using the profile body, a fixed rubric, the role,
 and the first 4096 bytes of the task ref. The only default classifier call is:
 
 ```sh
-claude -p --model claude-haiku-4-5-20251001 --output-format json --max-turns 1
+claude -p --model claude-haiku-4-5-20251001 --output-format json --max-turns 1 \
+  --system-prompt "You are a model router. Reply with exactly one JSON object and nothing else: no prose, no markdown fence." \
+  --tools "" --strict-mcp-config --mcp-config '{"mcpServers":{}}'
 ```
+
+with `MAX_THINKING_TOKENS=0` and no `CLAUDE_EFFORT` in that child's environment
+only. Measured 2026-09-05 with the real profile and a 5.6 KB ref: the bare
+agent-mode call took 18.2 s (about 1.5k output tokens of thinking and reason
+that carry no routing signal) and tripped the 15 s ceiling on every dispatch;
+thinking off alone made Haiku answer in prose; the slim call above took
+6.0–9.2 s wall with 3/3 valid JSON. Raising the ceiling was rejected because it
+would make every auto dispatch pay that latency at the source.
 
 The prompt is supplied on stdin. Direct JSON and Claude's JSON `result`
 envelope are accepted. A label must appear in the profile's `models` list;
@@ -104,8 +114,9 @@ the fallback. A per-task two-model pipeline increases cost and coordination
 without evidence that every dispatch needs a second call. A YAML dependency
 or configuration framework would exceed the limited front-matter contract.
 
-The expected classifier cost is one call and roughly 1–3 seconds, not a
-measured latency guarantee. The hard classifier ceiling is 15 seconds.
+The classifier cost is one call, measured at 6–9 seconds wall on this host
+(print-mode startup plus Haiku), not a latency guarantee. The hard classifier
+ceiling is 15 seconds.
 Classification accuracy, production-profile behavior, actual Haiku response
 latency, interactive Grok/agy readiness and role receipt, remote terminals,
 and fallback account/model availability were not measured here. Only the

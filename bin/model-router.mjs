@@ -66,9 +66,16 @@ if (!failure && args["--ref"]) {
       `Role: ${JSON.stringify(args["--role"] || "")}\nTask excerpt (first 4KB): ${JSON.stringify(ref)}\n`;
     // Env-only seam (no argv form): an argv value reaching spawnSync is Snyk CWE-78 MEDIUM.
     const classifier = process.env.AIGENTRY_ROUTER_CLASSIFIER;
+    // Slim call (measured 2026-09-05): under Claude Code's agent system prompt Haiku thinks and writes
+    // ~1.5k output tokens of no routing signal → 18 s, over the ceiling; a JSON-only system prompt,
+    // no tools/MCP and no thinking → 6–9 s. Thinking/effort are overridden in this child's env only.
+    const childEnv = { ...process.env, MAX_THINKING_TOKENS: "0" };
+    delete childEnv.CLAUDE_EFFORT;
     const result = spawnSync(classifier || "claude", classifier ? [] : [
       "-p", "--model", "claude-haiku-4-5-20251001", "--output-format", "json", "--max-turns", "1",
-    ], { input: prompt, encoding: "utf8", timeout: 15000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024 });
+      "--system-prompt", "You are a model router. Reply with exactly one JSON object and nothing else: no prose, no markdown fence.",
+      "--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+    ], { input: prompt, encoding: "utf8", timeout: 15000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024, env: childEnv });
     if (result.error || result.status !== 0) throw new Error("classifier failed or timed out");
     let reply = JSON.parse(result.stdout);
     if (reply.is_error) throw new Error("classifier returned an error");
