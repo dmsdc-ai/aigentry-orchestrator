@@ -7,7 +7,8 @@ export function grokAdapter() {
     name: "grok",
     min_version: "0.2.93",
     buildArgvEnv: () => ({
-      argv: ["grok", "--always-approve", "-m", process.env.AIGENTRY_GROK_MODEL || "grok-4.6"],
+      argv: ["grok", "--always-approve", "-m", process.env.AIGENTRY_GROK_MODEL || "grok-4.6",
+        ...(process.env.AIGENTRY_GROK_EFFORT ? ["--reasoning-effort", process.env.AIGENTRY_GROK_EFFORT] : [])], // #1084 opt-in
       env: {},
     }),
   });

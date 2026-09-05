@@ -48,7 +48,8 @@ export function geminiAdapter(binary: "agy" | "gemini" = "gemini") {
     min_version: "0.0.0", // no numeric version claim; capability-gated below
     capabilityProbe: { executable: "agy", flags: ["--model", "--dangerously-skip-permissions", "--prompt-interactive"] },
     buildArgvEnv: () => ({ argv: ["agy", "--model", process.env.AIGENTRY_GEMINI_MODEL || "gemini-3.8-flash-high",
-      "--dangerously-skip-permissions"], env: {} }),
+      "--dangerously-skip-permissions",
+      ...(process.env.AIGENTRY_GEMINI_EFFORT ? ["--effort", process.env.AIGENTRY_GEMINI_EFFORT] : [])], env: {} }), // #1084 opt-in
   });
   return makeAdapter({
     name: "gemini",

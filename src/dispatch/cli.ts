@@ -120,17 +120,21 @@ function shellQuote(s: string): string {
   return "'" + s.replace(/'/g, `'\\''`) + "'";
 }
 
+/** #1084: grok/agy effort is opt-in (no default), so unset = the CLI's own default. */
+const optFlag = (flag: string, value: string | undefined): string => (value ? ` ${flag} ${shellQuote(value)}` : "");
+
 function defaultCliFlags(cli: string, childEnv: NodeJS.ProcessEnv): string {
   switch (cli) {
     case "claude":
       return `--model ${shellQuote(childEnv.AIGENTRY_CLAUDE_MODEL || "claude-opus-5")} --effort "${env.AIGENTRY_CLAUDE_EFFORT || "xhigh"}" --permission-mode bypassPermissions`;
     case "codex":
-      return `-m ${shellQuote(childEnv.AIGENTRY_CODEX_MODEL || "gpt-6-astra")} -c check_for_update_on_startup=false --dangerously-bypass-approvals-and-sandbox`;
+      // #1084: codex has no effort flag; `-c model_reasoning_effort=` is its config override (measured 0.153.4).
+      return `-m ${shellQuote(childEnv.AIGENTRY_CODEX_MODEL || "gpt-6-astra")} -c model_reasoning_effort=${shellQuote(env.AIGENTRY_CODEX_EFFORT || "high")} -c check_for_update_on_startup=false --dangerously-bypass-approvals-and-sandbox`;
     case "grok":
-      return `--always-approve -m ${shellQuote(childEnv.AIGENTRY_GROK_MODEL || "grok-4.6")}`;
+      return `--always-approve -m ${shellQuote(childEnv.AIGENTRY_GROK_MODEL || "grok-4.6")}${optFlag("--reasoning-effort", env.AIGENTRY_GROK_EFFORT)}`;
     case "gemini":
       return geminiBinary(childEnv) === "agy"
-        ? `--model ${shellQuote(childEnv.AIGENTRY_GEMINI_MODEL || "gemini-3.8-flash-high")} --dangerously-skip-permissions`
+        ? `--model ${shellQuote(childEnv.AIGENTRY_GEMINI_MODEL || "gemini-3.8-flash-high")} --dangerously-skip-permissions${optFlag("--effort", env.AIGENTRY_GEMINI_EFFORT)}`
         : `-m ${shellQuote(childEnv.AIGENTRY_GEMINI_MODEL || "gemini-2.5-flash")} --approval-mode yolo`;
     default:
       return "";
