@@ -335,6 +335,8 @@ interface Opts {
   taskId: string;
   noTask: boolean;
   noTaskReason: string;
+  /** #1092: operator reason for retrying a delivery_state_unknown row; "" = no override. */
+  retryUnknown: string;
 }
 
 function parseArgs(argv: string[]): Opts {
@@ -358,6 +360,7 @@ function parseArgs(argv: string[]): Opts {
     taskId: "",
     noTask: false,
     noTaskReason: "",
+    retryUnknown: "",
   };
   let i = 0;
   // `shift 2` on a value flag reads $2 even when absent; bash's `set -u` makes
@@ -390,6 +393,13 @@ function parseArgs(argv: string[]): Opts {
       case "--verify-delivered": o.verifyDelivered = true; i += 1; break;
       case "--no-verify-started": o.verifyStarted = false; i += 1; break;
       case "--keep-alive": o.keepAlive = true; i += 1; break;
+      case "--retry-unknown":
+        o.retryUnknown = val(a); i += 2;
+        if (!o.retryUnknown.trim()) {
+          process.stderr.write("dispatch.sh: --retry-unknown needs a non-empty reason\n");
+          process.exit(4);
+        }
+        break;
       case "-h":
       case "--help":
         process.stdout.write(USAGE + "\n");
@@ -783,6 +793,21 @@ async function verifyDelivered(o: Opts, sid: string): Promise<number> {
 }
 
 /**
+ * #1092: --retry-unknown was given but the registry's answer for this sid+ref is
+ * not a held unknown attempt. Name what the row says (both axes) so the operator
+ * sees why the override does not apply; the registry JSON is check-dedup's or
+ * begin-delivery's.
+ */
+function retryRefused(sid: string, registryJson: string): string {
+  let prior: { dispatch_id?: string; prior_lifecycle?: string; prior_transport?: string } = {};
+  try { prior = JSON.parse(registryJson); } catch { /* not JSON: name only the absence */ }
+  const what = prior.dispatch_id
+    ? `prior ${prior.dispatch_id} is lifecycle=${prior.prior_lifecycle} transport=${prior.prior_transport}`
+    : "no prior attempt for this sid+ref is held";
+  return `dispatch.sh: DISPATCH_RETRY_REFUSED for ${sid} — --retry-unknown applies only to a delivery_state_unknown row; ${what}`;
+}
+
+/**
  * The authoritative write-before-delivery transaction. It re-runs the dedup
  * check atomically and, only for a new attempt, commits the durable unknown
  * record. Its `proceed` result is what authorizes the inject.
@@ -807,6 +832,7 @@ function beginDelivery(o: Opts, d: Delivery, sid: string): { status: number; std
   ];
   if (o.worktree) a.push("--worktree", o.worktree);
   if (o.keepAlive) a.push("--keep-alive");
+  if (o.retryUnknown) a.push("--retry-unknown", o.retryUnknown);
   return registryOut(a);
 }
 
@@ -992,9 +1018,19 @@ async function main(argv: string[]): Promise<never> {
     if (dedup.output) process.stderr.write(dedup.output.replace(/\n?$/, "\n"));
     die(`dispatch.sh: DISPATCH_NOT_RECORDED — dedup query failed (rc=${dedup.status})`, 9);
   }
+  if (o.retryUnknown) {
+    // #1092: the override applies to a held unknown attempt and nothing else.
+    // Refuse here, before any spawn or wait, so a misapplied flag has no side
+    // effect; begin-delivery re-checks under the lock. A retry re-checks
+    // readiness and re-prepares the ref like a first delivery, but the row it
+    // supersedes proves the worker was spawned and ready, so it never opens a
+    // second workspace and takes the existing worker's route.
+    if (dedup.status !== 7) { process.stdout.write(dedup.output); die(retryRefused(sid, dedup.output), 4); }
+    skipPreparation = false;
+  }
 
-  resolveRoute(o, sid, skipPreparation);
-  if (!skipPreparation && o.spawn) { applyCliCap(o); spawnWorkspace(o, sid); }
+  resolveRoute(o, sid, skipPreparation || o.retryUnknown !== "");
+  if (!skipPreparation && o.spawn && !o.retryUnknown) { applyCliCap(o); spawnWorkspace(o, sid); }
 
   emitTelemetry([
     "--helper", "dispatch",
@@ -1022,6 +1058,10 @@ async function main(argv: string[]): Promise<never> {
   // Nothing fallible may run between this commit and the inject: a crash in
   // that window is conservatively delivery-unknown.
   const begin = beginDelivery(o, d, sid);
+  if (begin.status === 4 && begin.stdout.includes('"DISPATCH_RETRY_REFUSED"')) {
+    process.stdout.write(begin.stdout);
+    die(retryRefused(sid, begin.stdout), 4);
+  }
   switch (begin.status) {
     case 0:
       break;
