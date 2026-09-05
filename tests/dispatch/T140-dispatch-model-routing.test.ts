@@ -165,3 +165,24 @@ test("T140: explicit --cli codex at cap still spawns codex and warns once", () =
     assert.match(readFileSync(join(f.aig, "sessions/router-fixture/boot/launcher.sh"), "utf8"), /exec -a codex codex -m gpt-6-astra/);
   } finally { f.cleanup(); }
 });
+
+// #1084: two codex workers timed out at 30 s today with the prompt on screen — cliOf() handed the
+// launcher PATH to session-probe.py and to the `cliKind === "codex"` 90 s branch.
+test("T140: readiness probe and --target audit receive the CLI kind for a worker-launcher row", () => {
+  const f = fixture();
+  try {
+    const probe = f.script("probe-log", "require('node:fs').writeFileSync(process.env.PROBE_ARGS, JSON.stringify(process.argv.slice(2))); console.log('{\"ready\":true}')");
+    const row = { LIVE_SESSIONS: JSON.stringify([{ id: "router-fixture", command: f.liveLauncher("codex") }]) };
+    const r = f.dispatch([...f.spawnArgs, "--cli", "codex"], { ...row, SESSION_PROBE_PY: probe, PROBE_ARGS: join(f.root, "probe-args") });
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(join(f.root, "probe-args"), "utf8")), ["--sid", "router-fixture", "--cli", "codex"]);
+  } finally { f.cleanup(); }
+  const g = fixture();
+  try {
+    const r = g.dispatch(["--target", "router-fixture"], { LIVE_SESSIONS: JSON.stringify([{ id: "router-fixture", command: g.liveLauncher("codex") }]) });
+    assert.equal(r.status, 0, r.stderr);
+    const { payload, note } = audit(g);
+    assert.equal(payload.cli, "codex");
+    assert.match(note, /cli=codex\/unknown by=existing/);
+  } finally { g.cleanup(); }
+});

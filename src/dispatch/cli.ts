@@ -214,7 +214,10 @@ function cliOf(sid: string): string {
     const list = JSON.parse(stdout);
     if (!Array.isArray(list)) return "";
     for (const s of list) {
-      if (s && s.id === sid) return String(s.command || "");
+      // #1084: a worker's command is its guard launcher; resolve the CLI kind so the
+      // readiness probe and the codex ready-timeout see "codex", not a path. Unknown
+      // commands still return raw (registration must stay truthy for them).
+      if (s && s.id === sid) { const cmd = String(s.command || ""); return cliKindOf(cmd) || cmd; }
     }
   } catch {
     /* the python arm swallowed every parse error too */
