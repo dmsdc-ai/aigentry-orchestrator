@@ -31,14 +31,19 @@ try {
     fileURLToPath(new URL("../docs/model-profiles/model-routing-profile.md", import.meta.url)), "utf8");
   const front = profile.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)([\s\S]*)$/);
   if (!front) throw new Error("profile front matter missing");
-  let inModels = false;
+  let section = "";
   const parsedModels = [];
   let parsedTable = {};
-  for (const line of front[1].split(/\r?\n/)) {
-    if (/^models:\s*$/.test(line)) { inModels = true; continue; }
-    if (/^\s*-\s*\{/.test(line) && inModels) parsedModels.push(flatMap(line.replace(/^\s*-\s*/, "")));
-    else if (/^default_table:/.test(line)) { parsedTable = flatMap(line.slice(line.indexOf(":") + 1)); inModels = false; }
-    else if (line.trim() && !/^measured_at:\s*\S/.test(line)) throw new Error("unsupported profile syntax");
+  for (const raw of front[1].split(/\r?\n/)) {
+    const line = raw.replace(/(^|\s)#.*$/, "").trimEnd(); // YAML comments: '#' at line start or after whitespace
+    const entry = line.match(/^\s+([\w-]+)\s*:\s*(.+)$/); // block-form `  role: label`
+    if (!line) continue;
+    if (/^models:$/.test(line)) { section = "models"; continue; }
+    if (/^default_table:$/.test(line)) { section = "table"; continue; }
+    if (/^\s*-\s*\{/.test(line) && section === "models") parsedModels.push(flatMap(line.replace(/^\s*-\s*/, "")));
+    else if (/^default_table:/.test(line)) { parsedTable = flatMap(line.slice(line.indexOf(":") + 1)); section = ""; }
+    else if (entry && section === "table") parsedTable[entry[1]] = scalar(entry[2]);
+    else if (!/^measured_at:\s*\S/.test(line)) throw new Error("unsupported profile syntax");
   }
   if (!parsedModels.length || parsedModels.some((m) => !m.label || !m.model ||
     !["claude", "codex", "grok", "gemini"].includes(m.cli)) ||
@@ -61,9 +66,16 @@ if (!failure && args["--ref"]) {
       `Role: ${JSON.stringify(args["--role"] || "")}\nTask excerpt (first 4KB): ${JSON.stringify(ref)}\n`;
     // Env-only seam (no argv form): an argv value reaching spawnSync is Snyk CWE-78 MEDIUM.
     const classifier = process.env.AIGENTRY_ROUTER_CLASSIFIER;
+    // Slim call (measured 2026-09-05): under Claude Code's agent system prompt Haiku thinks and writes
+    // ~1.5k output tokens of no routing signal → 18 s, over the ceiling; a JSON-only system prompt,
+    // no tools/MCP and no thinking → 6–9 s. Thinking/effort are overridden in this child's env only.
+    const childEnv = { ...process.env, MAX_THINKING_TOKENS: "0" };
+    delete childEnv.CLAUDE_EFFORT;
     const result = spawnSync(classifier || "claude", classifier ? [] : [
       "-p", "--model", "claude-haiku-4-5-20251001", "--output-format", "json", "--max-turns", "1",
-    ], { input: prompt, encoding: "utf8", timeout: 15000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024 });
+      "--system-prompt", "You are a model router. Reply with exactly one JSON object and nothing else: no prose, no markdown fence.",
+      "--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+    ], { input: prompt, encoding: "utf8", timeout: 15000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024, env: childEnv });
     if (result.error || result.status !== 0) throw new Error("classifier failed or timed out");
     let reply = JSON.parse(result.stdout);
     if (reply.is_error) throw new Error("classifier returned an error");
