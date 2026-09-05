@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fixture } from "./model-router-fixtures.js";
 
@@ -76,4 +76,113 @@ test("T140: deduplicated fresh dispatch does not classify or spawn again", () =>
     assert.equal(r.status, 8, r.stderr);
     assert.equal(f.calls(), 1);
   } finally { f.cleanup(); }
+});
+
+// #1084 per-CLI live cap. Two live codex sessions = the default cap: the fixture's own row
+// (router-fixture, bare `codex`) plus one guard launcher, so the `exec -a` resolution is covered.
+function twoCodex(f: ReturnType<typeof fixture>): NodeJS.ProcessEnv {
+  return { LIVE_SESSIONS: JSON.stringify([{ id: "router-fixture", command: "codex" }, { id: "live-1", command: f.liveLauncher("codex") }]) };
+}
+
+test("T140: codex at cap, role table is another CLI -> falls to it, by=llm-capped + capped_cli", () => {
+  const f = fixture();
+  try {
+    writeFileSync(join(f.aig, "instructions/roles/researcher.md"), "# RESEARCHER\nFIXTURE-ROLE\n");
+    const r = f.dispatch([...f.spawnArgs, "--role", "researcher"], twoCodex(f));
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(f.calls(), 1);
+    assert.match(r.stderr, /codex at cap \(2 live, AIGENTRY_CLI_CAP_CODEX=2\); gpt-6-astra -> gemini \(gemini\)/);
+    const { payload, note } = audit(f);
+    assert.equal(payload.cli, "gemini");
+    assert.deepEqual([payload.route.label, payload.route.decided_by, payload.route.capped_cli], ["gemini", "llm-capped", "codex"]);
+    assert.match(payload.route.reason, /^codex at cap .*; router chose gpt-6-astra: implementation$/);
+    assert.match(note, /cli=gemini\/gemini-3.8-flash-high by=llm-capped capped_cli=codex/);
+    assert.match(readFileSync(join(f.aig, "sessions/router-fixture/guard/worker-launcher.sh"), "utf8"), /export AIGENTRY_GEMINI_MODEL=gemini-3.8-flash-high/);
+    assert.match(readFileSync(join(f.aig, "sessions/router-fixture/boot/launcher.sh"), "utf8"), /exec -a gemini agy --model gemini-3.8-flash-high/);
+  } finally { f.cleanup(); }
+});
+
+test("T140: codex at cap, role table is codex too -> first under-cap profile model (fable)", () => {
+  const f = fixture();
+  try {
+    const r = f.dispatch([...f.spawnArgs, "--role", "coder"], twoCodex(f));
+    assert.equal(r.status, 0, r.stderr);
+    const { payload, note } = audit(f);
+    assert.deepEqual([payload.cli, payload.route.label, payload.route.decided_by, payload.route.capped_cli], ["claude", "fable-5.1", "llm-capped", "codex"]);
+    assert.match(note, /cli=claude\/claude-fable-5-1\[1m\] by=llm-capped capped_cli=codex/);
+    assert.match(readFileSync(join(f.aig, "sessions/router-fixture/guard/worker-launcher.sh"), "utf8"), /export AIGENTRY_CLAUDE_MODEL='claude-fable-5-1\[1m\]'/);
+  } finally { f.cleanup(); }
+});
+
+test("T140: table fallback at cap records by=table-capped", () => {
+  const f = fixture();
+  try {
+    const r = f.dispatch([...f.spawnArgs, "--role", "coder"], { ...twoCodex(f), CLASSIFIER_REPLY: "broken" });
+    assert.equal(r.status, 0, r.stderr);
+    const { payload, note } = audit(f);
+    assert.deepEqual([payload.cli, payload.route.decided_by, payload.route.capped_cli], ["claude", "table-capped", "codex"]);
+    assert.match(note, /cli=claude\/claude-fable-5-1\[1m\] by=table-capped capped_cli=codex/);
+  } finally { f.cleanup(); }
+});
+
+test("T140: under cap is unchanged: raised knob, or a live row whose launcher cannot be read", () => {
+  for (const overrides of [{ AIGENTRY_CLI_CAP_CODEX: "3" },
+    { LIVE_SESSIONS: JSON.stringify([{ id: "router-fixture", command: "codex" }, { id: "live-1", command: "/missing/launcher.sh" }]) }]) {
+    const f = fixture();
+    try {
+      const r = f.dispatch([...f.spawnArgs, "--role", "coder"], { ...twoCodex(f), ...overrides });
+      assert.equal(r.status, 0, r.stderr);
+      assert.doesNotMatch(r.stderr, /at cap/);
+      const { payload, note } = audit(f);
+      assert.deepEqual(payload.route, { label: "gpt-6-astra", decided_by: "llm", reason: "implementation" });
+      assert.match(note, /cli=codex\/gpt-6-astra by=llm$/);
+    } finally { f.cleanup(); }
+  }
+});
+
+test("T140: AIGENTRY_CLI_CAP_CODEX=1 caps at one live codex; 0 never auto-routes there", () => {
+  for (const cap of ["1", "0"]) {
+    const f = fixture();
+    try {
+      const r = f.dispatch([...f.spawnArgs, "--role", "coder"], { AIGENTRY_CLI_CAP_CODEX: cap });
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.stderr, new RegExp(`codex at cap \\(1 live, AIGENTRY_CLI_CAP_CODEX=${cap}\\)`));
+      assert.equal(audit(f).payload.route.decided_by, "llm-capped");
+    } finally { f.cleanup(); }
+  }
+});
+
+test("T140: explicit --cli codex at cap still spawns codex and warns once", () => {
+  const f = fixture();
+  try {
+    const r = f.dispatch([...f.spawnArgs, "--cli", "codex", "--role", "coder"], twoCodex(f));
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(f.calls(), 0);
+    assert.equal(r.stderr.match(/WARNING codex at cap \(2 live, AIGENTRY_CLI_CAP_CODEX=2\); explicit --cli codex spawns anyway/g)?.length, 1);
+    const { payload, note } = audit(f);
+    assert.deepEqual([payload.cli, payload.route.decided_by, payload.route.capped_cli], ["codex", "explicit", undefined]);
+    assert.match(note, /cli=codex\/gpt-6-astra by=explicit$/);
+    assert.match(readFileSync(join(f.aig, "sessions/router-fixture/boot/launcher.sh"), "utf8"), /exec -a codex codex -m gpt-6-astra/);
+  } finally { f.cleanup(); }
+});
+
+// #1084: two codex workers timed out at 30 s today with the prompt on screen — cliOf() handed the
+// launcher PATH to session-probe.py and to the `cliKind === "codex"` 90 s branch.
+test("T140: readiness probe and --target audit receive the CLI kind for a worker-launcher row", () => {
+  const f = fixture();
+  try {
+    const probe = f.script("probe-log", "require('node:fs').writeFileSync(process.env.PROBE_ARGS, JSON.stringify(process.argv.slice(2))); console.log('{\"ready\":true}')");
+    const row = { LIVE_SESSIONS: JSON.stringify([{ id: "router-fixture", command: f.liveLauncher("codex") }]) };
+    const r = f.dispatch([...f.spawnArgs, "--cli", "codex"], { ...row, SESSION_PROBE_PY: probe, PROBE_ARGS: join(f.root, "probe-args") });
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(join(f.root, "probe-args"), "utf8")), ["--sid", "router-fixture", "--cli", "codex"]);
+  } finally { f.cleanup(); }
+  const g = fixture();
+  try {
+    const r = g.dispatch(["--target", "router-fixture"], { LIVE_SESSIONS: JSON.stringify([{ id: "router-fixture", command: g.liveLauncher("codex") }]) });
+    assert.equal(r.status, 0, r.stderr);
+    const { payload, note } = audit(g);
+    assert.equal(payload.cli, "codex");
+    assert.match(note, /cli=codex\/unknown by=existing/);
+  } finally { g.cleanup(); }
 });

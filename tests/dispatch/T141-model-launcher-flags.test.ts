@@ -13,12 +13,14 @@ for (const cli of ["codex", "grok", "gemini"]) for (const withRole of [false, tr
       assert.equal(r.status, 0, r.stderr);
       assert.doesNotMatch(r.stderr, /boot-prepare.mjs failed|legacy path active/);
       const launcher = readFileSync(join(f.aig, `sessions/router-fixture/${withRole ? "boot/launcher.sh" : "guard/worker-launcher.sh"}`), "utf8");
-      if (cli === "codex") assert.match(launcher, /exec -a codex codex -m gpt-6-astra /);
+      if (cli === "codex") assert.match(launcher, /exec -a codex codex -m gpt-6-astra -c model_reasoning_effort=high -c check_for_update_on_startup=false /);
       if (cli === "grok") assert.match(launcher, /exec -a grok grok --always-approve -m grok-4.6/);
       if (cli === "gemini") {
         assert.match(launcher, /exec -a gemini agy --model gemini-3.8-flash-high --dangerously-skip-permissions/);
         assert.doesNotMatch(launcher, /--approval-mode|--skip-trust|export GEMINI_CLI_HOME/);
       }
+      // #1084: grok/agy effort is opt-in — nothing emitted while the knob is unset.
+      assert.doesNotMatch(launcher, /--reasoning-effort| --effort /);
       if (withRole && cli !== "codex") {
         assert.match(launcher, cli === "grok" ? /--rules / : /--prompt-interactive /);
         assert.match(launcher, /FIXTURE-ROLE/);
@@ -49,5 +51,21 @@ test("T141: routed Grok model is shell-quoted and preserved in role launcher", (
     assert.equal(r.status, 0, r.stderr);
     assert.match(readFileSync(join(f.aig, "sessions/router-fixture/boot/launcher.sh"), "utf8"),
       /--always-approve -m 'grok-4.6; touch SHOULD-NOT-EXECUTE'/);
+  } finally { f.cleanup(); }
+});
+
+// #1084 effort knobs reach both the plain launcher (defaultCliFlags) and the role launcher (boot adapter argv).
+for (const withRole of [false, true]) for (const [cli, env, expect] of [
+  ["codex", { AIGENTRY_CODEX_EFFORT: "xhigh" }, /-m gpt-6-astra -c model_reasoning_effort=xhigh -c check_for_update_on_startup=false/],
+  ["codex", { AIGENTRY_CODEX_EFFORT: "high; touch SHOULD-NOT-EXECUTE" }, /'(model_reasoning_effort=)?high; touch SHOULD-NOT-EXECUTE'/],
+  ["grok", { AIGENTRY_GROK_EFFORT: "xhigh" }, /--always-approve -m grok-4.6 --reasoning-effort xhigh/],
+  ["gemini", { AIGENTRY_GEMINI_EFFORT: "high" }, /--model gemini-3.8-flash-high --dangerously-skip-permissions --effort high/],
+] as const) test(`T141: ${cli} ${withRole ? "role" : "plain"} launcher carries ${Object.keys(env)[0]}`, () => {
+  const f = fixture();
+  try {
+    const r = f.dispatch([...f.spawnArgs, "--cli", cli, ...(withRole ? ["--role", "coder"] : [])], env);
+    assert.equal(r.status, 0, r.stderr);
+    assert.doesNotMatch(r.stderr, /boot-prepare.mjs failed|legacy path active/);
+    assert.match(readFileSync(join(f.aig, `sessions/router-fixture/${withRole ? "boot/launcher.sh" : "guard/worker-launcher.sh"}`), "utf8"), expect);
   } finally { f.cleanup(); }
 });

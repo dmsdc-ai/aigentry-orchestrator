@@ -20,3 +20,18 @@ for (const [name, overrides] of [
     assert.equal(f.calls(), 1);
   } finally { f.cleanup(); }
 });
+
+// #1084: dispatch's cap fallback order comes from the router (the only profile parser), on request only.
+test("T138: --candidates 1 lists the role table pick then profile order; default shape unchanged", () => {
+  const f = fixture();
+  try {
+    const labels = (r: ReturnType<typeof f.router>) => JSON.parse(r.stdout).candidates.map((c: { label: string }) => c.label);
+    const r = f.router(["--candidates", "1"]);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(labels(r), ["gpt-6-astra", "fable-5.1", "grok-4.6", "gemini"]);
+    assert.deepEqual(JSON.parse(r.stdout).candidates[1], { cli: "claude", model: "claude-fable-5-1[1m]", label: "fable-5.1" });
+    assert.deepEqual(labels(f.router(["--role", "nobody", "--candidates", "1"])), ["fable-5.1", "gpt-6-astra", "grok-4.6", "gemini"]);
+    assert.equal("candidates" in JSON.parse(f.router().stdout), false);
+    assert.equal(f.calls(), 0);
+  } finally { f.cleanup(); }
+});

@@ -95,4 +95,11 @@ if (!decision) {
     reason: failure || "no task ref; role default", confidence: 0 };
   if (failure) process.stderr.write(`model-router: ${failure.replace(/[\r\n]+/g, " ")}; using table\n`);
 }
+// #1084: dispatch's cap fallback order — the role's table pick, then profile order. Emitted only on
+// request so the plain decision shape is unchanged; the profile is parsed here and nowhere else.
+if (args["--candidates"]) {
+  const first = models.find((m) => m.label === table[args["--role"]]);
+  decision.candidates = [first, ...models.filter((m) => m !== first)].filter(Boolean)
+    .map(({ cli, model, label }) => ({ cli, model, label }));
+}
 process.stdout.write(JSON.stringify(decision) + "\n");
