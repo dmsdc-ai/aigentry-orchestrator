@@ -130,7 +130,7 @@ jobs:
       # THE #901 GATE. The persistence layer is what this ticket gave win32 arms, so it is
       # the part held to a hard green: every test in it must pass, and none may skip.
       #
-      # This is also the resolution of U28. scripts/run-tests.mjs:30 normalises enumerated
+      # This is also the resolution of U28. scripts/run-tests.mjs:31 normalises enumerated
       # paths with .split(sep).join('/') before handing them to `node --test` — a
       # Windows-shaped line that had never once run on Windows. The debt step below runs
       # through that enumerator, so a sane test count there is the proof it works.
@@ -188,7 +188,7 @@ jobs:
           [ -n "${TESTS}" ] && [ -n "${FAIL}" ] && [ -n "${SKIP}" ] \
             || { echo "::error::could not parse the TAP summary; refusing to report a vacuous pass."; exit 1; }
           echo "win32 full suite: tests=${TESTS} fail=${FAIL} skipped=${SKIP} (declared debt ${EXPECTED_WIN32_FAILURES})"
-          [ "${TESTS}" -gt 200 ] || { echo "::error::only ${TESTS} tests were enumerated. scripts/run-tests.mjs:30 normalises Windows separators for node --test; a low count means that enumeration is broken (U28)."; exit 1; }
+          [ "${TESTS}" -gt 200 ] || { echo "::error::only ${TESTS} tests were enumerated. scripts/run-tests.mjs:31 normalises Windows separators for node --test; a low count means that enumeration is broken (U28)."; exit 1; }
           [ "${SKIP}" = "0" ] || { echo "::error::${SKIP} test(s) skipped on win32. Skips are not an accepted currency here — see tests/dispatch/run-all.sh."; exit 1; }
           if [ "${FAIL}" != "${EXPECTED_WIN32_FAILURES}" ]; then
             echo "--- failures this run ---"
