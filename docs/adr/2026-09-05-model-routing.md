@@ -22,7 +22,8 @@ No new package dependencies, cache, or second-model review are introduced.
 
 The profile is `docs/model-profiles/model-routing-profile.md`. The supported
 front matter is deliberately narrow: `measured_at`, a list of inline flat
-model maps, and one inline `default_table` map. The production profile is not
+model maps, and one `default_table` map in either inline (`{ role: label, … }`)
+or block (indented `role: label` lines) form; `#` comments are ignored. The production profile is not
 created by this task; tests use `tests/dispatch/fixtures/model-routing-profile.md`.
 
 ## Fallback and overrides

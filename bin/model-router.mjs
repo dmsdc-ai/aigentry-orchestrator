@@ -31,14 +31,19 @@ try {
     fileURLToPath(new URL("../docs/model-profiles/model-routing-profile.md", import.meta.url)), "utf8");
   const front = profile.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)([\s\S]*)$/);
   if (!front) throw new Error("profile front matter missing");
-  let inModels = false;
+  let section = "";
   const parsedModels = [];
   let parsedTable = {};
-  for (const line of front[1].split(/\r?\n/)) {
-    if (/^models:\s*$/.test(line)) { inModels = true; continue; }
-    if (/^\s*-\s*\{/.test(line) && inModels) parsedModels.push(flatMap(line.replace(/^\s*-\s*/, "")));
-    else if (/^default_table:/.test(line)) { parsedTable = flatMap(line.slice(line.indexOf(":") + 1)); inModels = false; }
-    else if (line.trim() && !/^measured_at:\s*\S/.test(line)) throw new Error("unsupported profile syntax");
+  for (const raw of front[1].split(/\r?\n/)) {
+    const line = raw.replace(/(^|\s)#.*$/, "").trimEnd(); // YAML comments: '#' at line start or after whitespace
+    const entry = line.match(/^\s+([\w-]+)\s*:\s*(.+)$/); // block-form `  role: label`
+    if (!line) continue;
+    if (/^models:$/.test(line)) { section = "models"; continue; }
+    if (/^default_table:$/.test(line)) { section = "table"; continue; }
+    if (/^\s*-\s*\{/.test(line) && section === "models") parsedModels.push(flatMap(line.replace(/^\s*-\s*/, "")));
+    else if (/^default_table:/.test(line)) { parsedTable = flatMap(line.slice(line.indexOf(":") + 1)); section = ""; }
+    else if (entry && section === "table") parsedTable[entry[1]] = scalar(entry[2]);
+    else if (!/^measured_at:\s*\S/.test(line)) throw new Error("unsupported profile syntax");
   }
   if (!parsedModels.length || parsedModels.some((m) => !m.label || !m.model ||
     !["claude", "codex", "grok", "gemini"].includes(m.cli)) ||
