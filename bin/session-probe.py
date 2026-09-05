@@ -18,9 +18,16 @@ BRAILLE = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
 BANNERS = {
     "claude": r"Welcome back|Tips for getting started|Trust this folder|Do you want to enable|Press Enter to continue",
     "codex": r"Welcome to .*Codex|OpenAI Codex CLI|Loading\u2026|Initializing",
-    "gemini": r"Welcome to Gemini|Loading model|Initializing|Authenticating",
+    # #1090: the `gemini` kind is also agy (Antigravity CLI, geminiBinary()). Its
+    # welcome header is "Antigravity CLI 1.1.27" (transiently "Welcome to the
+    # Antigravity CLI"), its boot shows "Accessing workspace: <cwd>", and its
+    # folder-trust modal asks "Do you trust the contents of this project?".
+    "gemini": r"Welcome to Gemini|Loading model|Initializing|Authenticating|Antigravity CLI|Accessing workspace|Do you trust the contents of this project",
 }
-PROMPTS = {"claude": r"\u276f", "codex": r"\u203a", "gemini": r"\u203a|\u2502 >"}
+# #1090: agy's idle prompt is a bare `>` line framed by two horizontal rules
+# (measured live, 1.1.27): "────…\n>\n────…". Anchor on rule+`>` so a quoted
+# `> text` inside a reply never reads as the prompt.
+PROMPTS = {"claude": r"\u276f", "codex": r"\u203a", "gemini": r"\u203a|\u2502 >|\u2500{8,}\n>"}
 HARD_NEG = r"Working\.\.\.|Thinking|esc to interrupt|Press Enter to continue|Do you trust"
 # #557: codex's `\u203a` REPL is interactive WHILE its MCP servers boot, but the
 # "Starting MCP servers (n/6) \u2026 (esc to interrupt)" status line trips HARD_NEG via
@@ -131,7 +138,7 @@ def cli_from_info_or_screen(info: dict[str, Any], screen: str, override: str = "
         return "claude"
     if re.search(r"OpenAI Codex CLI|Welcome to .*Codex", screen, re.I):
         return "codex"
-    if re.search(r"Welcome to Gemini", screen, re.I):
+    if re.search(r"Welcome to Gemini|Antigravity CLI", screen, re.I):
         return "gemini"
     return "claude"
 
