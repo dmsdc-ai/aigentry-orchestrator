@@ -1,5 +1,5 @@
 // ADR-MF #13 — per-adapter argv / env / cwd shape contracts.
-import { test } from "node:test";
+import { afterEach, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 import * as path from "node:path";
 import {
@@ -11,6 +11,24 @@ import { sha256Hex } from "../../../src/session/persistence/canonical-bytes.js";
 import {
   EFFECTIVE_PROMPT, EXPECTED_DIGEST, makeCtx, makeResolved, readyScript,
 } from "./_fixtures.js";
+
+// Adapters read process.env directly; isolate this test process and restore after each case.
+let operatorKnobs: NodeJS.ProcessEnv;
+beforeEach(() => {
+  operatorKnobs = {};
+  for (const key of Object.keys(process.env)) {
+    if (/^AIGENTRY_.*_(EFFORT|MODEL)$/.test(key)) {
+      operatorKnobs[key] = process.env[key];
+      delete process.env[key];
+    }
+  }
+});
+afterEach(() => {
+  for (const key of Object.keys(process.env)) {
+    if (/^AIGENTRY_.*_(EFFORT|MODEL)$/.test(key)) delete process.env[key];
+  }
+  Object.assign(process.env, operatorKnobs);
+});
 
 const STAGING = "/tmp/sess-A";
 const ALL = () => ({ claude: readyScript(), codex: readyScript(), gemini: readyScript() });
