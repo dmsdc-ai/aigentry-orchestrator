@@ -3,16 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { geminiBinary } from "../../src/session/boot-adapter/gemini.js";
-import { fixture as routingFixture } from "./model-router-fixtures.js";
-
-// Default assertions must not inherit the operator's model/effort preferences.
-function fixture() {
-  const f = routingFixture();
-  for (const key of Object.keys(f.env)) {
-    if (/^AIGENTRY_.*_(EFFORT|MODEL)$/.test(key)) delete f.env[key];
-  }
-  return f;
-}
+import { fixture } from "./model-router-fixtures.js";
 
 for (const cli of ["codex", "grok", "gemini"]) for (const withRole of [false, true]) {
   test(`T141: ${cli} ${withRole ? "role" : "plain"} launcher preserves binary/model flags`, () => {
