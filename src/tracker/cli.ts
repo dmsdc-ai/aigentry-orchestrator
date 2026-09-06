@@ -241,7 +241,19 @@ function readScreen(sid: string, lines = 60): string {
   return chomp(capture(TELEPTY, ["read-screen", sid, "--lines", String(lines)]).stdout);
 }
 
-function sessionDisconnected(sid: string): string {
+/** Walked the whole listing and the sid was not in it (#1105). */
+const ABSENT = "ABSENT";
+
+/**
+ * What `telepty list` says about this sid: its health string, `ABSENT`, or "".
+ *
+ * #1105: the listing has THREE answers, not two. A sid walked for and not found in a
+ * PARSED array is `ABSENT` — a fact about the world. A listing that could not be parsed
+ * stays "", because a refusal is not an absence (#820/#823): calling a session gone on
+ * the strength of a 401 is the same overclaim-beyond-the-measurement defect telepty#60
+ * exists to remove.
+ */
+function sessionPresence(sid: string): string {
   const listing = chomp(capture(TELEPTY, ["list", "--json"]).stdout);
   const parsed = (() => {
     try {
@@ -254,7 +266,7 @@ function sessionDisconnected(sid: string): string {
   for (const s of parsed) {
     if (s && s.id === sid) return String(s.healthStatus || s.status || "");
   }
-  return "";
+  return ABSENT;
 }
 
 const PROBE_FALLBACK =
@@ -441,8 +453,54 @@ export function scrapeTestResult(screen: string): string {
 }
 
 // ── the check loop's branches ───────────────────────────────────────────────
+const SESSION_ABSENT = "session_absent";
+const SESSION_GONE = "session_gone";
+
 function recordClassification(sid: string, cls: string): void {
   registryOrDie(["observe", "--sid", sid, "--kind", "screen_class_observed", "--field", `class=${cls}`, "--now", nowIso()]);
+}
+
+/**
+ * #1105 — a live row whose session is ABSENT from `telepty list`.
+ *
+ * Measured 2026-09-06: row `mr1091-agy-proof` went delivery_state_unknown, its session
+ * then died by parent-kill propagation, and bin/session-cleanup.sh — the ONLY writer of
+ * lifecycle=cleaned — never ran for that sid. So the tick kept classifying a screen that
+ * no longer existed and kept re-emitting the same HOLD for 32 minutes, and `prune` could
+ * not help: an unknown outcome is never pruned (cmdPrune). A human ended it by hand.
+ *
+ * Stage A discipline: this RECORDS the absence and NAMES the remedy. It settles nothing —
+ * the lifecycle is untouched, because cleanup is still session-cleanup.sh's to write.
+ *
+ * "Two consecutive ticks" survives the process boundary because the first miss lives in
+ * the ROW, as its last observation, never in memory: a tick that finds the session
+ * present writes screen_class_observed over it, and that displacement IS the reset.
+ * Another component appending an observation between two absent ticks re-arms the first
+ * miss, which can only delay this HOLD by a tick — never duplicate it.
+ */
+function observeSessionGone(sid: string, dispatchId: string, lastKind: string): void {
+  if (lastKind === SESSION_GONE) return; // already concluded — the repeat is the defect
+  if (lastKind !== SESSION_ABSENT) {
+    // One miss is also what a restarting session looks like. Evidence, no alarm.
+    registryOrDie([
+      "observe", "--sid", sid, "--kind", SESSION_ABSENT,
+      "--field", "basis=telepty_list_absent", "--now", nowIso(),
+    ]);
+    return;
+  }
+  registryOrDie([
+    "observe", "--sid", sid, "--kind", SESSION_GONE,
+    "--field", "basis=telepty_list_absent_two_ticks", "--field", "actuation=none",
+    "--field", "remedy=session_cleanup_sh", "--now", nowIso(),
+  ]);
+  // Same one-HOLD-per-(dispatch, reason) ledger the observation poll uses: a
+  // level-triggered loop keeps looking, a human is told once.
+  const seenKey = `${sid}\tHOLD\t${dispatchId}\t${SESSION_GONE}`;
+  if (seenContains(seenKey)) return;
+  fs.appendFileSync(OBSERVATIONS_SEEN, seenKey + "\n");
+  const note = `HOLD sid=${sid} reason=${SESSION_GONE} — session gone (2 ticks): run bin/session-cleanup.sh ${sid}`;
+  emitAlert(note);
+  forwardToOrch(note);
 }
 
 function bumpExpected(sid: string): void {
@@ -678,7 +736,10 @@ function cmdCheck(): void {
   // any actuation — fail-closed by construction.
   const listed = registryCapture([
     "list", "--live", "--due-before", now,
-    "--fields", "assigned.sid,cwd,ref_path,dispatched_at,re_dispatch_count,transport.inject_id,dispatch_id",
+    // #1105: last_observation.kind rides the listing the tick already makes — the
+    // first-miss evidence for the session-gone arm, at no extra registry call.
+    "--fields",
+    "assigned.sid,cwd,ref_path,dispatched_at,re_dispatch_count,transport.inject_id,dispatch_id,last_observation.kind",
   ]);
   if (listed.status !== 0) process.exit(listed.status);
 
@@ -694,9 +755,12 @@ function cmdCheck(): void {
     const rdc = !f[4] || f[4] === "null" ? "0" : f[4];
     const injectId = f[5] ?? "";
     const dispatchId = f[6] ?? "";
+    const lastObsKind = f[7] === "null" ? "" : f[7] ?? "";
     processed += 1;
 
-    if (sessionDisconnected(sid) === "DISCONNECTED") {
+    // ONE listing, three answers (#1105).
+    const presence = sessionPresence(sid);
+    if (presence === "DISCONNECTED") {
       fs.appendFileSync(DISCONNECTED_LOG, `${nowIso()} DISCONNECTED ${sid} skip\n`);
       // Connectivity, not outcome: a session that went away has said nothing
       // about whether the assigned work finished. Every operational actuation
@@ -707,6 +771,14 @@ function cmdCheck(): void {
         "--now", nowIso(),
       ]);
       registryOrDie(["set-lifecycle", "--sid", sid, "--state", "disconnected", "--now", nowIso()]);
+      continue;
+    }
+
+    // #1105: the session is not in the listing at all. It has no screen to classify and
+    // no observation endpoint to poll, and reaching for either is exactly the repeat this
+    // arm removes — so it `continue`s, as the disconnect arm above does.
+    if (presence === ABSENT) {
+      observeSessionGone(sid, dispatchId, lastObsKind);
       continue;
     }
 
