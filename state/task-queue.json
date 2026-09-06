@@ -12604,12 +12604,12 @@
     },
     {
       "id": 1101,
-      "status": "pending",
+      "status": "delegated",
       "track": "animal-hospital",
       "priority": "P2",
       "updated_at": "2026-09-06",
       "desc": "[animal-hospital] BuildStampCheck.IsSceneWriter (#1078 literal predicate SaveScene|MarkSceneDirty) does not see builders that change the scene through helpers: ArtP2c.cs, ArtP4Dress.cs, Clearance.cs changed colliders/placement in #1097 and none carries either literal → the judge reads FRESH after a scene-affecting change. Widen the predicate to the transitive writer set (files called from the 10 writers, or files under Assets/Editor that the chain invokes) with a test that plants a helper edit and expects STALE.",
-      "note": "Found by ah1097 (2026-09-06). Also relevant: #1095 added MirrorBuild.cs (called from M5Build) — check whether it is inside the manifest."
+      "note": "Found by ah1097 (2026-09-06). Also relevant: #1095 added MirrorBuild.cs (called from M5Build) — check whether it is inside the manifest. | dispatched 2026-09-06T00:54:58Z sid=ah1101-ah1101-stamp-predicate ref=2026-09-06-ah1101-stamp-predicate.md track=ah1101 cli=claude/claude-opus-5[1m] by=llm-capped capped_cli=codex"
     },
     {
       "id": 1102,
@@ -12622,12 +12622,12 @@
     },
     {
       "id": 1103,
-      "status": "pending",
+      "status": "delegated",
       "track": "animal-hospital",
       "priority": "P2",
       "updated_at": "2026-09-06",
       "desc": "[animal-hospital] JumpTest.ScalesFor parses ArtP2c.cs SOURCE TEXT with a regex that requires the scale literal to be the last Place(...) argument; #1097 appended solid: true → three kinds return zero scales and §2 THE BUDGET prints green over a denominator built from crates only (measurement-integrity failure, not a gameplay one). Fix: JumpTest reads the same instrument the census prints (solid tops from the SCENE colliders), or at least a shared helper both use — never source-text parsing.",
-      "note": "Found by ah1102 (build #2) 2026-09-06: 49/52 RED on the first scene that held #1096 and #1097 together; the census independently proved the invariant (lowest solid top 0.50 m; desk 0.81 / cabinet 0.90 / bookcase 1.94). Build proceeded under (A)."
+      "note": "Found by ah1102 (build #2) 2026-09-06: 49/52 RED on the first scene that held #1096 and #1097 together; the census independently proved the invariant (lowest solid top 0.50 m; desk 0.81 / cabinet 0.90 / bookcase 1.94). Build proceeded under (A). | dispatched 2026-09-06T00:54:36Z sid=ah1103-ah1103-jumptest ref=2026-09-06-ah1103-jumptest-no-source-parse.md track=ah1103 cli=codex/gpt-6-astra by=llm"
     },
     {
       "id": 1104,
@@ -12649,12 +12649,21 @@
     },
     {
       "id": 1106,
-      "status": "pending",
+      "status": "delegated",
       "track": "animal-hospital",
       "priority": "P0",
       "updated_at": "2026-09-06",
       "desc": "[animal-hospital] Make HotbarProbe hermetic (#1104 finding: the 3/10 was the instrument, not the hotbar). Three changes in Assets/_Project/Scripts/QA/HotbarProbe.cs: (1) inject on an OWNED device — InputSystem.AddDevice<Keyboard>(\"hb983Keyboard\") instead of GetDevice<Keyboard>() (:116), the Px628PressDriver.cs:58 idiom; (2) lift InputSystem.settings.backgroundBehavior to IgnoreFocus for the run and restore it (Px628PressDriver.cs:51-56,151-152 idiom); (3) kill the vacuous free pass — press key 1 from a known non-zero selection or assert before != after. Compile via unity-run (edit-mode), Snyk, commit; builder cuts build #3 afterwards.",
-      "note": "From ah1104 HOLD (shared/810760ff…). Mechanism evidence: builder's failing log had zero press [1036] lines → InputAction.performed never fired."
+      "note": "From ah1104 HOLD (shared/810760ff…). Mechanism evidence: builder's failing log had zero press [1036] lines → InputAction.performed never fired. | dispatched 2026-09-06T00:53:57Z sid=ah1106-ah1106-hotbar-probe ref=2026-09-06-ah1106-hotbar-probe-hermetic.md track=ah1106 cli=codex/gpt-6-astra by=llm"
+    },
+    {
+      "id": 1107,
+      "status": "pending",
+      "track": "animal-hospital",
+      "priority": "P0",
+      "updated_at": "2026-09-06",
+      "desc": "[animal-hospital] BUILD #3 from main after #1106 (hermetic HotbarProbe) + #1103 (JumpTest reads scene) + #1101 (stamp writer set) merge: BuildStampCheck FRESH proof on the merged tree (no regen expected — none of the three touches the scene; if STALE, regen + commit first), BuildM5Mac → BootGate → probe-sweep 7/7 (HotbarProbe 10/10 with the owned device) → START-HERE round-trip with save byte-identical → new app in place, .prev-0906 rollback parked. Ship-to-her is a USER decision at the end (the launcher path already points at Builds/mac/AnimalHospital.app, so 'in place' = shipped; builder parks the new app as .new-1107 and the orchestrator swaps only after user OK).",
+      "note": "Successor of #1102 (blocked; its .new-1102 artifact measures 7/7 but carries the non-hermetic probe). Depends on #1106/#1103/#1101 merges (sequential by data dependency, Rule 36 reason recorded)."
     }
   ],
   "completed": [
