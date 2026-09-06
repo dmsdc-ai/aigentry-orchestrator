@@ -13044,21 +13044,21 @@
     },
     {
       "id": 1115,
-      "status": "pending",
+      "status": "delegated",
       "track": "animal-hospital",
       "priority": "P0",
       "updated_at": "2026-09-06",
       "desc": "[animal-hospital] Four dead colliders steal the reticle from the check-in desk (#1076 finding 1): LobbyBuild.cs:58 ReceptionTop, :59 Clipboard, :60 DeskPC, :271 Polaroid are Box()=CreatePrimitive(Cube) with the default BoxCollider and no IInteractable; the top 40% of the desk resolves to nothing, silently. Fix: Strip(Box(...)) on those four lines (PropShapes.cs:42-43 idiom, repo's own), regenerate Clinic (commit), EKey1076Test (analysis/1076-ekey 606f6f1 — cherry-pick/merge it first, it is red 15/17 by design) → 17/17, and widen PropShapesTest to catch SIBLING dead colliders under Lobby (not only hardcoded child names). Suites to run before believing it: PropShapesTest, AmbientNpcTest, RoomsTest, WalkThroughCensus/Clearance, LobbyCheckinTest.",
-      "note": "From ah1076 REPORT 2026-09-06. Risk stated low: the counter's own 1.0 m box is unchanged; the four strays rest on it. Build #4 follows with #1116."
+      "note": "From ah1076 REPORT 2026-09-06. Risk stated low: the counter's own 1.0 m box is unchanged; the four strays rest on it. Build #4 follows with #1116. | dispatched 2026-09-06T10:21:29Z sid=ah1115-ah1115-dead-colliders ref=2026-09-06-ah1115-dead-colliders.md track=ah1115 cli=claude/claude-opus-5[1m] by=explicit"
     },
     {
       "id": 1116,
-      "status": "pending",
+      "status": "delegated",
       "track": "animal-hospital",
       "priority": "P1",
       "updated_at": "2026-09-06",
       "desc": "[animal-hospital] PlayerInteractor.cs:412 `if (_hover == null) return;` is a silent refusal (#1076 finding 2 — the bigger half): 18/31 of her E presses exited there with no sound, word, or reticle change; 12 were aimed at air (an 11-press mash burst). #975's own header calls the belt gate 'the one thing a player cannot skip' — this is the same shape one gesture over. Fix: on that path raise the existing 3.5 s status strip (GameEvents.RaiseStatusReadout, HUD.cs:182-187, Korean keys in LocalizationTable) with a readout that distinguishes 'nothing in reach' from 'that is not something you can use' (aim=CLEAR vs aim=BLOCKED, the interactor already computes both); rate-limit so a mash burst prints once; edit-mode test with a negative control (a press on a real IInteractable must NOT print the refusal).",
-      "note": "From ah1076 REPORT 2026-09-06. Disjoint from #1115 (PlayerInteractor.cs + HUD/Localization vs LobbyBuild.cs + scene) → parallel."
+      "note": "From ah1076 REPORT 2026-09-06. Disjoint from #1115 (PlayerInteractor.cs + HUD/Localization vs LobbyBuild.cs + scene) → parallel. | dispatched 2026-09-06T10:21:45Z sid=ah1116-ah1116-silent-refusal ref=2026-09-06-ah1116-silent-refusal.md track=ah1116 cli=claude/claude-opus-5[1m] by=explicit"
     },
     {
       "id": 1117,
