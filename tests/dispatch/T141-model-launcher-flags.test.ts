@@ -21,11 +21,14 @@ for (const cli of ["codex", "grok", "gemini"]) for (const withRole of [false, tr
       }
       // #1084: grok/agy effort is opt-in — nothing emitted while the knob is unset.
       assert.doesNotMatch(launcher, /--reasoning-effort| --effort /);
-      if (withRole && cli !== "codex") {
-        assert.match(launcher, cli === "grok" ? /--rules / : /--prompt-interactive /);
+      // grok has no context-file contract: its contract rides --rules on the launcher.
+      // codex/gemini(agy) take the additive staged cwd file instead (T146 pins agy's).
+      if (withRole && cli === "grok") {
+        assert.match(launcher, /--rules /);
         assert.match(launcher, /FIXTURE-ROLE/);
         assert.match(launcher, /Session boot contract/);
       }
+      if (withRole && cli !== "grok") assert.doesNotMatch(launcher, /--prompt-interactive|FIXTURE-ROLE|Session boot contract/);
     } finally { f.cleanup(); }
   });
 }

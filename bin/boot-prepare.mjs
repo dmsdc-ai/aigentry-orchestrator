@@ -674,9 +674,17 @@ async function main() {
     args.cli === "claude"
       ? [...cmd.argv.slice(1), "--model", claudeModel, "--effort", claudeEffort, "--permission-mode", "bypassPermissions"]
       : [...cmd.argv.slice(1)];
-  // #1083: these CLIs expose prompt flags, not Gemini CLI's context/shadow-home contract.
-  if (args.cli === "grok" || cmd.argv[0] === "agy") {
-    flagsArgv.push(args.cli === "grok" ? "--rules" : "--prompt-interactive", await readFile(cmd.prompt_file, "utf8"));
+  // #1083: grok exposes no context-file contract, but its --rules IS additive
+  // system instruction ("Extra rules to append to the system prompt"), so the
+  // staged contract rides that flag.
+  // #1093: agy left this arm. It took the contract via --prompt-interactive, and
+  // an interactive first prompt reads as a task, not as instruction — the #1090
+  // agy probe ran ps/read-screen/cat before any task ref arrived. agy auto-reads
+  // cwd GEMINI.md as an always-on rule, so it now uses the same additive
+  // contextFile path as Gemini CLI (adapter descriptor) and boots to an idle
+  // prompt with nothing to act on.
+  if (args.cli === "grok") {
+    flagsArgv.push("--rules", await readFile(cmd.prompt_file, "utf8"));
   }
   const flagsLine = flagsArgv.map(shellQuote).join(" ");
 
