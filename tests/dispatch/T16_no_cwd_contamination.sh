@@ -22,6 +22,18 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd -P)"
 
+# #1112 (the #1113 class, live side): this guard SPAWNS a real worker through
+# dispatch.sh, and the launcher's flag string is built from the operator's
+# AIGENTRY_*_(MODEL|EFFORT) (src/dispatch/cli.ts:129, bin/boot-prepare.mjs:671) —
+# knobs every worker session exports, so a guard run from inside one probes on the
+# operator's model rather than the default its fixture assumes. Measured 2026-09-06:
+# AIGENTRY_CLAUDE_MODEL=bogus AIGENTRY_CLAUDE_EFFORT=low puts `--model bogus --effort
+# low` in launcher.sh where the clean env puts `--model claude-opus-5 --effort xhigh`.
+# CLI-keyed rather than T117's blanket AIGENTRY_[A-Z0-9_]*_(MODEL|EFFORT): that form
+# also eats T48's own AIGENTRY_T48_GEMINI_MODEL. `sed -E` — BSD sed's BRE has no `\|`
+# and the alternation would silently match nothing.
+for k in $(env | sed -nE 's/^(AIGENTRY_(CLAUDE|CODEX|GEMINI|GROK)_(MODEL|EFFORT))=.*/\1/p'); do unset "$k"; done
+
 # Live-integration gate (#525): this test spawns a REAL telepty/cmux session via
 # dispatch.sh, which pollutes the live session graph + active.json registry and
 # leaks orphans when teardown races. Keep it OUT of the default hermetic unit run;
