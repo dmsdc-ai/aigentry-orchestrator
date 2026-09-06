@@ -29,7 +29,7 @@ jq -r --arg t "$track" --argjson show_completed "$show_completed" '
     "=== Tasks ===",
     (
       [.tasks[] | select(.track == $t)] as $ts |
-      if $show_completed == 1 then $ts else [$ts[] | select(.status != "completed")] end |
+      if $show_completed == 1 then $ts else [$ts[] | select(.status != "done")] end |
       sort_by(.id) |
       map(
         "  #\(.id) \(.status) [\(.priority)] \(.desc | .[0:100])",
