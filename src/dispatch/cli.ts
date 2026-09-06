@@ -455,7 +455,8 @@ function resolveRoute(o: Opts, sid: string, skipPreparation: boolean): void {
 // wrote; the orchestrator's own row is the bare CLI. The dispatch registry has
 // no cli field, so it cannot serve here. Fail-open: an unreadable list caps
 // nothing (§9 — a counter must never block dispatch).
-const EMERGENCY_ROUTE: RouteCandidate = { cli: "claude", label: "fable-5.1", model: "claude-fable-5-1[1m]" };
+// Keep in sync with emergency in bin/model-router.mjs.
+const EMERGENCY_ROUTE: RouteCandidate = { cli: "claude", label: "opus-5", model: "claude-opus-5[1m]" };
 
 function cliKindOf(command: string): string {
   const base = path.basename(command);
@@ -475,10 +476,11 @@ function liveCliCounts(): Record<string, number> {
   return counts;
 }
 
-/** AIGENTRY_CLI_CAP_<CLI>: a number (0 = never auto-route there); default codex 2, others unlimited. */
+/** AIGENTRY_CLI_CAP_<CLI>: a number (0 = never auto-route there); defaults codex 2, claude 4, others unlimited. */
 function cliCap(cli: string): number {
   const knob = Number(env[`AIGENTRY_CLI_CAP_${cli.toUpperCase()}`] || NaN);
-  return Number.isFinite(knob) ? knob : cli === "codex" ? 2 : Infinity;
+  const defaults: Record<string, number> = { codex: 2, claude: 4 };
+  return Number.isFinite(knob) ? knob : defaults[cli] ?? Infinity;
 }
 
 /** Fresh spawn only: a routed CLI at cap falls to the next candidate; an explicit --cli warns and proceeds. */

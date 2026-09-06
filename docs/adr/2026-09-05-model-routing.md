@@ -163,3 +163,7 @@ low/medium/high/xhigh/max/ultra with default low). `AIGENTRY_GROK_EFFORT`
 emitted only when set; Gemini CLI has no effort flag. Not measured: which
 values grok/agy accept, and the cap against a live codex quota (tests stub
 `telepty list`).
+
+## Addendum 2026-09-06 — Opus worker fallback and Claude cap (#1098)
+Emergency routing and fallback label lookup now use `opus-5 / claude / claude-opus-5[1m]`; Fable remains the orchestrator model.
+`AIGENTRY_CLI_CAP_CLAUDE` defaults to 4 (codex stays 2); the existing candidate fallback and `by=llm-capped capped_cli=claude` audit apply, with env overrides unchanged.
