@@ -14,6 +14,7 @@ printf 'aaa1111\tclaude-bot@example.com\tinitial commit\n\x1e' > "$STUB_GIT_LOG_
 printf ' 3 files changed, 120 insertions(+), 10 deletions(-)\n' > "$STUB_GIT_SHORTSTAT_FILE"
 
 t_stub_v2_observations
+t_list_sessions sid-A sid-S   # both rows below belong to sessions that EXIST (#1105)
 t_seed_dispatch sid-A cwd="$T_TMP" transport.inject_id=uuid-1 \
   expected_report_by="2026-05-12T11:30:00Z"
 # cwd doesn't need to be a real repo because the git stub responds.

@@ -198,6 +198,20 @@ t_init_v2() {
     > "$DISPATCH_STATE_DIR/active.json"
 }
 
+# t_list_sessions <sid>... — replace what `telepty list --json` reports with exactly
+# these CONNECTED sessions. #1105: the tracker now distinguishes "the sid is not in the
+# listing at all" from "listed with an empty health", and the first takes a session-gone
+# arm that skips the screen/git path entirely. A guard that seeds a row for any sid but
+# the default sid-A must therefore SAY the session exists, or it measures the gone arm
+# instead of the path it means to measure.
+t_list_sessions() {
+  local out="" sid
+  for sid in "$@"; do
+    out="$out${out:+,}{\"id\":\"$sid\",\"command\":\"claude\",\"healthStatus\":\"CONNECTED\"}"
+  done
+  printf '[%s]' "$out" > "$STUB_LIST_FILE"
+}
+
 # t_seed_dispatch <sid> [dotted.path=value ...] — a complete, schema-valid v2
 # record. Values are parsed as JSON when possible, else kept as a string, so
 # `re_dispatch_count=2`, `keep_alive=true` and `transport.inject_id=null` all
