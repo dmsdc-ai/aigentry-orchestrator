@@ -331,7 +331,10 @@ if (!extraFlags && cliFlagsFromConfig) {
 switch (cli) {
   case "claude":
     if (!extraFlags) {
-      extraFlags = `--model ${env.AIGENTRY_CLAUDE_MODEL || "claude-opus-4-8"} --effort ${
+      // #1113: the same literal src/dispatch/cli.ts's defaultCliFlags uses. The two
+      // spawn paths default the SAME session, so a disagreement here is a session
+      // that gets a different model depending on which door opened it.
+      extraFlags = `--model ${env.AIGENTRY_CLAUDE_MODEL || "claude-opus-5"} --effort ${
         env.AIGENTRY_CLAUDE_EFFORT || "xhigh"
       } --permission-mode bypassPermissions`;
     }
