@@ -12981,12 +12981,12 @@
     },
     {
       "id": 1108,
-      "status": "delegated",
+      "status": "done",
       "track": "orchestrator",
       "priority": "P2",
       "updated_at": "2026-09-06",
       "desc": "[task-queue hygiene] state/task-queue.json has 694 non-done rows across 40+ status vocabularies (pending 271, completed 247, closed 48, in_progress 16, queued 15, delegated 14, done-pushed 10, …) and 32 rows stuck in delegated/in_progress since before 2026-09-01 whose work is merged (#1048, #999, #998 …). tq-status/tq-focus therefore misreport. Analyst: (1) propose a closed status vocabulary (≤8 values) with a mapping table for every existing value; (2) for each of the 32 stale active rows, find the evidence (merge commit / REPORT / note segment) and propose done|pending|cancelled with the citation; (3) HOLD with the spec BEFORE any write; after approval apply as ONE commit, with a before/after Counter and zero desc/note text changes (status + updated_at only).",
-      "note": "Measured 2026-09-06 10:3x by the orchestrator (Counter over status). Rule 34 log integrity: notes are never rewritten; only status normalizes. | dispatched 2026-09-06T03:24:30Z sid=mr1108-mr1108-tq-hygiene ref=2026-09-06-mr1108-tq-hygiene.md track=mr1108 cli=codex/gpt-6-astra by=llm || 2026-09-06 10:5x: codex (gpt-6-astra) worker hit the 5h usage limit at Phase 0 (worktree add only, no writes; screen: 'You've hit your usage limit', '2 usage limit resets available'). Reaped + worktree/branch removed; Opus 5 takeover spawned as <track>b with the same ref (sid-substituted). AIGENTRY_CLI_CAP_CODEX=0 set in ~/.env until the user resets codex (router: codex not a candidate). | dispatched 2026-09-06T03:44:08Z sid=mr1108b-mr1108b-tq-hygiene ref=2026-09-06-mr1108b-tq-hygiene.md track=mr1108b cli=claude/claude-opus-5[1m] by=explicit || HOLD 2026-09-06 (mr1108b, shared/4adb30b6…): re-measured 1108 rows / 691 non-done / exactly 40 status strings; stale active rows 57 (31 unstamped), 15 settled done with main-merge/REPORT citations, #618 cancelled (inference, approved), 41 could-not-settle listed; vocabulary 8 = pending|delegated|in_progress|blocked|blocked-by-observation|awaiting-user|done|cancelled (every value already understood by cli.ts:515-516/:650, tq-status:27, tq-focus:36, T59); tq-track.sh:32 filters on 'completed' (already broken: shows 417 done rows) → one-word fix approved in-commit; 8 rows carry facts only in the status string → status-was note segment + commit-body archive; duplicate ids → #1110; separators → #1111. Live bugs surfaced in could-not-settle: #527 schema-drift path (check-schema-drift.mjs:13), #534 cleanup grandchild leak (src/cleanup/cli.ts:364), #1000 objective line never landed (hb1000 merge was the game-over panel)."
+      "note": "Measured 2026-09-06 10:3x by the orchestrator (Counter over status). Rule 34 log integrity: notes are never rewritten; only status normalizes. | dispatched 2026-09-06T03:24:30Z sid=mr1108-mr1108-tq-hygiene ref=2026-09-06-mr1108-tq-hygiene.md track=mr1108 cli=codex/gpt-6-astra by=llm || 2026-09-06 10:5x: codex (gpt-6-astra) worker hit the 5h usage limit at Phase 0 (worktree add only, no writes; screen: 'You've hit your usage limit', '2 usage limit resets available'). Reaped + worktree/branch removed; Opus 5 takeover spawned as <track>b with the same ref (sid-substituted). AIGENTRY_CLI_CAP_CODEX=0 set in ~/.env until the user resets codex (router: codex not a candidate). | dispatched 2026-09-06T03:44:08Z sid=mr1108b-mr1108b-tq-hygiene ref=2026-09-06-mr1108b-tq-hygiene.md track=mr1108b cli=claude/claude-opus-5[1m] by=explicit || HOLD 2026-09-06 (mr1108b, shared/4adb30b6…): re-measured 1108 rows / 691 non-done / exactly 40 status strings; stale active rows 57 (31 unstamped), 15 settled done with main-merge/REPORT citations, #618 cancelled (inference, approved), 41 could-not-settle listed; vocabulary 8 = pending|delegated|in_progress|blocked|blocked-by-observation|awaiting-user|done|cancelled (every value already understood by cli.ts:515-516/:650, tq-status:27, tq-focus:36, T59); tq-track.sh:32 filters on 'completed' (already broken: shows 417 done rows) → one-word fix approved in-commit; 8 rows carry facts only in the status string → status-was note segment + commit-body archive; duplicate ids → #1110; separators → #1111. Live bugs surfaced in could-not-settle: #527 schema-drift path (check-schema-drift.mjs:13), #534 cleanup grandchild leak (src/cleanup/cli.ts:364), #1000 objective line never landed (hb1000 merge was the game-over panel). || REPORT 2026-09-06 (mr1108b, shared/2c0699e9…): commit 6edee06 on base 2819219, merged ff. 40→8 values, 384 rows; orchestrator re-counted the diff: status ±384, updated_at -71/+384, note -4/+5 (the 5 status-was rows #298 #430 #600 #601 #616; #432/#440/#610 dropped — facts already in sibling keys), desc 0. Settled 17: 15 done with main citations, #618 cancelled, #1000 pending (measured: objective line absent, HotbarPanel still built/asserted, hb1000 merge = game-over panel). 40 left open (still-live: #527 #534 #503 #506; partial: #608 #795 #766). tq-track.sh one-word fix in-commit. docs/task-queue-status.md added. NEW DEFECT (pre-existing, verified at HEAD~1 and by the orchestrator after merge): bin/tq-status.sh aborts — .tracks['F-animal-hospital'] is a string, siblings are objects → jq 'Cannot index string with string \"name\"' under set -e; fixed by the orchestrator in the next commit (data, own file). .tracks has its own uncontrolled status vocabulary (not covered). Session reaped."
     },
     {
       "id": 1109,
@@ -13286,7 +13286,17 @@
         297
       ]
     },
-    "F-animal-hospital": "Animal Hospital (변칙성) — Unity game gift for daughter",
+    "F-animal-hospital": {
+      "name": "Animal Hospital (변칙성)",
+      "desc": "Animal Hospital (변칙성) — Unity game gift for daughter",
+      "status": "in_progress",
+      "priority": "high",
+      "resume_ref": "docs/design/2026-08-26-user-design-brief.md (in ~/projects/animal-hospital)",
+      "blocks": [],
+      "blocked_by": [],
+      "started_at": "2026-08-2x",
+      "note": "2026-09-06: was a bare string since 6bb7129 (first tracked commit) → tq-status.sh aborted on .value.name (found by mr1108b #1108); converted to the sibling object shape."
+    },
     "G-side-ideas": {
       "name": "Side product ideas (non-aigentry)",
       "desc": "사용자 발의 standalone 제품 아이디어 — 리서치/feasibility 선행",
