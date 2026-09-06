@@ -12672,7 +12672,7 @@
       "priority": "P2",
       "updated_at": "2026-09-06",
       "desc": "[task-queue hygiene] state/task-queue.json has 694 non-done rows across 40+ status vocabularies (pending 271, completed 247, closed 48, in_progress 16, queued 15, delegated 14, done-pushed 10, …) and 32 rows stuck in delegated/in_progress since before 2026-09-01 whose work is merged (#1048, #999, #998 …). tq-status/tq-focus therefore misreport. Analyst: (1) propose a closed status vocabulary (≤8 values) with a mapping table for every existing value; (2) for each of the 32 stale active rows, find the evidence (merge commit / REPORT / note segment) and propose done|pending|cancelled with the citation; (3) HOLD with the spec BEFORE any write; after approval apply as ONE commit, with a before/after Counter and zero desc/note text changes (status + updated_at only).",
-      "note": "Measured 2026-09-06 10:3x by the orchestrator (Counter over status). Rule 34 log integrity: notes are never rewritten; only status normalizes. | dispatched 2026-09-06T03:24:30Z sid=mr1108-mr1108-tq-hygiene ref=2026-09-06-mr1108-tq-hygiene.md track=mr1108 cli=codex/gpt-6-astra by=llm || 2026-09-06 10:5x: codex (gpt-6-astra) worker hit the 5h usage limit at Phase 0 (worktree add only, no writes; screen: 'You've hit your usage limit', '2 usage limit resets available'). Reaped + worktree/branch removed; Opus 5 takeover spawned as <track>b with the same ref (sid-substituted). AIGENTRY_CLI_CAP_CODEX=0 set in ~/.env until the user resets codex (router: codex not a candidate). | dispatched 2026-09-06T03:44:08Z sid=mr1108b-mr1108b-tq-hygiene ref=2026-09-06-mr1108b-tq-hygiene.md track=mr1108b cli=claude/claude-opus-5[1m] by=explicit"
+      "note": "Measured 2026-09-06 10:3x by the orchestrator (Counter over status). Rule 34 log integrity: notes are never rewritten; only status normalizes. | dispatched 2026-09-06T03:24:30Z sid=mr1108-mr1108-tq-hygiene ref=2026-09-06-mr1108-tq-hygiene.md track=mr1108 cli=codex/gpt-6-astra by=llm || 2026-09-06 10:5x: codex (gpt-6-astra) worker hit the 5h usage limit at Phase 0 (worktree add only, no writes; screen: 'You've hit your usage limit', '2 usage limit resets available'). Reaped + worktree/branch removed; Opus 5 takeover spawned as <track>b with the same ref (sid-substituted). AIGENTRY_CLI_CAP_CODEX=0 set in ~/.env until the user resets codex (router: codex not a candidate). | dispatched 2026-09-06T03:44:08Z sid=mr1108b-mr1108b-tq-hygiene ref=2026-09-06-mr1108b-tq-hygiene.md track=mr1108b cli=claude/claude-opus-5[1m] by=explicit || HOLD 2026-09-06 (mr1108b, shared/4adb30b6…): re-measured 1108 rows / 691 non-done / exactly 40 status strings; stale active rows 57 (31 unstamped), 15 settled done with main-merge/REPORT citations, #618 cancelled (inference, approved), 41 could-not-settle listed; vocabulary 8 = pending|delegated|in_progress|blocked|blocked-by-observation|awaiting-user|done|cancelled (every value already understood by cli.ts:515-516/:650, tq-status:27, tq-focus:36, T59); tq-track.sh:32 filters on 'completed' (already broken: shows 417 done rows) → one-word fix approved in-commit; 8 rows carry facts only in the status string → status-was note segment + commit-body archive; duplicate ids → #1110; separators → #1111. Live bugs surfaced in could-not-settle: #527 schema-drift path (check-schema-drift.mjs:13), #534 cleanup grandchild leak (src/cleanup/cli.ts:364), #1000 objective line never landed (hb1000 merge was the game-over panel)."
     },
     {
       "id": 1109,
@@ -12682,6 +12682,24 @@
       "updated_at": "2026-09-06",
       "desc": "[tests] T140 model-routing cap tests read the ambient AIGENTRY_CLI_CAP_CODEX (and by construction any AIGENTRY_CLI_CAP_<CLI>): with AIGENTRY_CLI_CAP_CODEX=0 in ~/.env (set 2026-09-06 during the codex limit) 6 of 318 fail at main a01760a ('+ claude - codex'). #1098 made AIGENTRY_CODEX_EFFORT hermetic; do the same for every AIGENTRY_CLI_CAP_* in tests/dispatch/T140-*.test.ts (and any sibling reading cliCap): clear/pin the env inside the test, assert the default table, and add one case for the 0 = 'not a candidate' knob.",
       "note": "Found by mr1105b at Phase 1 (2026-09-06, HOLD shared/a01617ae…). Not fixed there (Rule 29). Dispatch when no other test-file coder is live in this repo."
+    },
+    {
+      "id": 1110,
+      "status": "pending",
+      "track": "orchestrator",
+      "priority": "P2",
+      "updated_at": "2026-09-06",
+      "desc": "[task-queue] 8 duplicated task ids (#115 #515 #516 #517 #522 #524 #528 #529 — 16 rows with unrelated bodies of work). src/dispatch/cli.ts:576 resolves a task with tasks.find(...) = first match wins, so the dispatch gate reads a different row than a human does (for #515/#517 the first match is a desc-less queued row while the real row is done). Fix: (1) rename the second occurrence of each to <id>b (or a fresh id) with a note segment pointing both ways; (2) make the gate refuse an ambiguous id (count > 1 → rc 5 with both indices) so it cannot recur; (3) test.",
+      "note": "Found by mr1108b (#1108 spec, 2026-09-06). #1108's script keys rows by index, never by id, so its write is safe; this task is the permanent fix."
+    },
+    {
+      "id": 1111,
+      "status": "pending",
+      "track": "orchestrator",
+      "priority": "P3",
+      "updated_at": "2026-09-06",
+      "desc": "[task-queue] Separator normalisation of the status vocabulary after #1108: in_progress (underscore) vs blocked-by-observation / awaiting-user (hyphen). Needs src/dispatch/cli.ts ALLOWED_STATUS/TERMINAL_STATUS (:515-516, :650), bin/tq-status.sh:27, bin/tq-focus.sh:36, bin/tq-track.sh:32, tests/dispatch/T59 and a one-shot data migration. Pick one separator, keep a read-side alias for one release.",
+      "note": "Deferred from #1108 by design (its commit is data-only + one-word tq-track fix)."
     }
   ],
   "completed": [
