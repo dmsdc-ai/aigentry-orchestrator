@@ -697,9 +697,11 @@ function taskLedgerUpdate(o: Opts, sid: string): void {
     const tmp = path.join(dir, `.task-queue.${process.pid}.${randomBytes(3).toString("hex")}`);
     const fd = fs.openSync(tmp, "w");
     try {
-      // json.dumps(data, ensure_ascii=False, indent=1) — same shape as the
-      // retired python arm, so the queue file's diff stays reviewable.
-      fs.writeFileSync(fd, JSON.stringify(data, null, 1));
+      // The shape the file is COMMITTED in — json.dumps(..., ensure_ascii=False, indent=2)
+      // plus the trailing newline — so a dispatch touches only the row it ledgers. This
+      // was indent=1 and newline-less while the orchestrator wrote indent=2: every other
+      // commit re-serialised all 26k lines and buried the real change (#1110).
+      fs.writeFileSync(fd, JSON.stringify(data, null, 2) + "\n");
       fs.fsyncSync(fd);
       fs.closeSync(fd);
       fs.renameSync(tmp, TASK_QUEUE);
