@@ -108,7 +108,7 @@
       "status": "done",
       "updated_at": "2026-09-06",
       "session": "aterm-codex",
-      "note": "이미 구현+등록됨. devkit bootstrap.js line 43-87. ~/.claude/.mcp.json에 aigentry-brain 존재."
+      "note": "이미 구현+등록됨. devkit bootstrap.js line 43-87. ~/.claude/.mcp.json에 aigentry-brain 존재. || 2026-09-06 id-collision: this row shared id 115 with row idx 112 (\"brain MCP 자동 등록 복구 — v0.1.55에서 brain 직접 \"); renamed that row to 115b, this row keeps 115"
     },
     {
       "id": 2,
@@ -960,13 +960,13 @@
       "note": "이미 구현됨. autoScrollTimer + 15ms interval + 5px edge threshold. Alacritty 패턴."
     },
     {
-      "id": 115,
+      "id": "115b",
       "desc": "brain MCP 자동 등록 복구 — v0.1.55에서 brain 직접 의존 제거 후 brain postinstall(MCP 등록) 안 됨. devkit이 brain setup 대신 수행하거나 aterm postinstall에서 brain setup 호출",
       "priority": "P1",
       "status": "done",
       "updated_at": "2026-09-06",
       "session": null,
-      "note": "이미 구현+등록됨. devkit bootstrap.js line 43-87. ~/.claude/.mcp.json에 aigentry-brain 존재."
+      "note": "이미 구현+등록됨. devkit bootstrap.js line 43-87. ~/.claude/.mcp.json에 aigentry-brain 존재. || 2026-09-06 id-collision: this row shared id 115 with row idx 11 (\"aterm 타이핑 딜레이 — 18ms 달성 (adaptive shapin\"); renamed this row to 115b"
     },
     {
       "id": 116,
@@ -6015,7 +6015,7 @@
       "kind": "environment-fix",
       "priority": "high",
       "project": "shell-config",
-      "note": "cmux-sidebar 워커 upstream-first 조사(2026-06-06): --cwd가 target 아닌 home(~)으로 열리는 세션 내내의 이슈 = cmux/ghostty defect 아님. ROOT CAUSE: ~/.zshrc:120 'cd /Users/duckyoungkim'(# Set default directory)가 모든 interactive login zsh에서 무조건 실행 → OSC-7이 $HOME 보고 → sidebar/cwd가 ~. PROOF: isolated DEV cmux instrument으로 cmux가 resolved cwd를 ghostty에 전달+ghostty가 거기서 shell launch 확인, 그 후 zshrc가 cd로 떠남. ghostty inherit-working-directory 3종 disable해도 무관(zshrc가 cd). cmux 소스 pristine(변경0). REMEDY(shell-config, cmux 밖): ~/.zshrc:120을 guard — '[[ -z $CMUX_SURFACE_ID ]] && cd ~' (cmux surface면 target cwd 보존, 일반 터미널은 ~ 유지). IMPACT: 이거 고치면 AGENTS.md의 'cwd 명시 default HARD RULE' 등 wrong-location 대응 다수가 불필요해질 수 있음. DECISION: 사용자 개인 dotfile이라 적용 승인 필요. spec: ~/projects/cmux/docs/specs/2026-06-06-sidebar-session-info.md",
+      "note": "cmux-sidebar 워커 upstream-first 조사(2026-06-06): --cwd가 target 아닌 home(~)으로 열리는 세션 내내의 이슈 = cmux/ghostty defect 아님. ROOT CAUSE: ~/.zshrc:120 'cd /Users/duckyoungkim'(# Set default directory)가 모든 interactive login zsh에서 무조건 실행 → OSC-7이 $HOME 보고 → sidebar/cwd가 ~. PROOF: isolated DEV cmux instrument으로 cmux가 resolved cwd를 ghostty에 전달+ghostty가 거기서 shell launch 확인, 그 후 zshrc가 cd로 떠남. ghostty inherit-working-directory 3종 disable해도 무관(zshrc가 cd). cmux 소스 pristine(변경0). REMEDY(shell-config, cmux 밖): ~/.zshrc:120을 guard — '[[ -z $CMUX_SURFACE_ID ]] && cd ~' (cmux surface면 target cwd 보존, 일반 터미널은 ~ 유지). IMPACT: 이거 고치면 AGENTS.md의 'cwd 명시 default HARD RULE' 등 wrong-location 대응 다수가 불필요해질 수 있음. DECISION: 사용자 개인 dotfile이라 적용 승인 필요. spec: ~/projects/cmux/docs/specs/2026-06-06-sidebar-session-info.md || 2026-09-06 id-collision: this row shared id 515 with row idx 495 (\"com.aigentry.brain-sync launchd agent ex\"); renamed that row to 515b, this row keeps 515",
       "created": "2026-06-06"
     },
     {
@@ -6025,7 +6025,7 @@
       "kind": "orchestration-infra",
       "priority": "low",
       "project": "aigentry-orchestrator/devkit",
-      "note": "cmux-adaptor SPEC HOLD(2026-06-06, spec: docs/specs/2026-06-06-cmux-adaptor-prune-status.md). PRUNE gate=title-diff(cmux title==sid)+owned(cwd~/.aigentry/role-sandbox)+seen-twice debounce+protected orch. STATUS push=wh_set_status maps healthStatus→cmux set-status key 'aigentry'(claude_code pill과 구분) working/idle/disconnected@reconciler tick. 신규 wh_prune_orphans/wh_set_status/wh_clear_status, generic seam(headless/warp no-op §2/§17). DEFERRED: §1 경량 — reconciler가 이미 orphan GC, status-push는 nice-to-have. 사용자가 orchestration visibility 원할 때 재개."
+      "note": "cmux-adaptor SPEC HOLD(2026-06-06, spec: docs/specs/2026-06-06-cmux-adaptor-prune-status.md). PRUNE gate=title-diff(cmux title==sid)+owned(cwd~/.aigentry/role-sandbox)+seen-twice debounce+protected orch. STATUS push=wh_set_status maps healthStatus→cmux set-status key 'aigentry'(claude_code pill과 구분) working/idle/disconnected@reconciler tick. 신규 wh_prune_orphans/wh_set_status/wh_clear_status, generic seam(headless/warp no-op §2/§17). DEFERRED: §1 경량 — reconciler가 이미 orphan GC, status-push는 nice-to-have. 사용자가 orchestration visibility 원할 때 재개. || 2026-09-06 id-collision: this row shared id 516 with row idx 496 (\"No working outside-cmux spawn host: open\"); renamed that row to 516b, this row keeps 516"
     },
     {
       "id": 517,
@@ -6035,10 +6035,10 @@
       "kind": "bug",
       "priority": "medium",
       "project": "aigentry-orchestrator/devkit",
-      "note": "cmux-adaptor 발견(2026-06-06): _wh_cmux_alive/_wh_cmux_list_ids가 'list-workspaces --json|jq .[].id' 사용 — 3가지 broken: (1)--json은 GLOBAL pre-cmd여야 함 (2)shape는 .workspaces[].ref (3)UUID는 listing에 안 나옴 → wh_alive 항상 'gone'(현재 masked). FIX: UUID-liveness를 'sidebar-state'로(missing tab에도 exit0 → stdout 'Error:' parse). dispatch_trigger: surface-liveness 신뢰성 필요 시 또는 cmux-adaptor 재개 시."
+      "note": "cmux-adaptor 발견(2026-06-06): _wh_cmux_alive/_wh_cmux_list_ids가 'list-workspaces --json|jq .[].id' 사용 — 3가지 broken: (1)--json은 GLOBAL pre-cmd여야 함 (2)shape는 .workspaces[].ref (3)UUID는 listing에 안 나옴 → wh_alive 항상 'gone'(현재 masked). FIX: UUID-liveness를 'sidebar-state'로(missing tab에도 exit0 → stdout 'Error:' parse). dispatch_trigger: surface-liveness 신뢰성 필요 시 또는 cmux-adaptor 재개 시. || 2026-09-06 id-collision: this row shared id 517 with row idx 497 (\"Recurring 또-엔터-안눌렸어 on worker→orchestrat\"); renamed that row to 517b, this row keeps 517"
     },
     {
-      "id": 515,
+      "id": "515b",
       "priority": "P3",
       "status": "done",
       "session": "unassigned",
@@ -6048,10 +6048,10 @@
       "rule_32a_track": "B (register, defer) — separate from #reconciler-dormant. Fix: absolute node path in plist OR EnvironmentVariables PATH OR a wrapper that sources nvm.",
       "created": "2026-06-06",
       "updated_at": "2026-07-26",
-      "note": "[triage 2026-07-26 #769-follow] ALREADY-DONE: ~/.zshrc:120 remedy applied verbatim: '[[ -z $CMUX_SURFACE_ID && -z $AIGENTRY_TARGET_CWD ]] && cd /Users/duckyoungkim'. Verified file."
+      "note": "[triage 2026-07-26 #769-follow] ALREADY-DONE: ~/.zshrc:120 remedy applied verbatim: '[[ -z $CMUX_SURFACE_ID && -z $AIGENTRY_TARGET_CWD ]] && cd /Users/duckyoungkim'. Verified file. || 2026-09-06 id-collision: this row shared id 515 with row idx 492 (\"\"); renamed this row to 515b"
     },
     {
-      "id": 516,
+      "id": "516b",
       "priority": "P2",
       "status": "done",
       "updated_at": "2026-09-06",
@@ -6061,10 +6061,10 @@
       "root_cause": "open-session.sh references platform:: helpers that do not exist in lib/platform.sh; only the cmux branch is functional. Cross-terminal (Constitution §2) hosting is effectively cmux-only.",
       "rule_32a_track": "B (register, defer) — implement a real non-cmux host (e.g. platform::spawn_tmux_window so workers run in tmux panes = real PTY, attachable, outside cmux). Enables reflexivity-safe terminal-app dev + true §2 cross-terminal.",
       "created": "2026-06-06",
-      "note": "VERIFIED FUNCTIONAL 2026-06-07 (t553-impl): live tmux 3.6a smoke — spawn_tmux_window rc=0, window opened, cmd rendered (TMUX_SMOKE_OK); code-trace detect_terminal:140→branch 246-250 calls platform::spawn_tmux_window (3 args match platform-unix.sh:143), no undefined-fn/arg-mismatch. Non-cmux tmux spawn WORKS. \"done\" label was correct; primitives exist (platform-unix.sh). No fix needed."
+      "note": "VERIFIED FUNCTIONAL 2026-06-07 (t553-impl): live tmux 3.6a smoke — spawn_tmux_window rc=0, window opened, cmd rendered (TMUX_SMOKE_OK); code-trace detect_terminal:140→branch 246-250 calls platform::spawn_tmux_window (3 args match platform-unix.sh:143), no undefined-fn/arg-mismatch. Non-cmux tmux spawn WORKS. \"done\" label was correct; primitives exist (platform-unix.sh). No fix needed. || 2026-09-06 id-collision: this row shared id 516 with row idx 493 (\"\"); renamed this row to 516b"
     },
     {
-      "id": 517,
+      "id": "517b",
       "priority": "P1",
       "status": "done",
       "session": "unassigned",
@@ -6075,7 +6075,7 @@
       "dispatch_trigger": "Next reconcile-loop work; the KeepAlive reconciler (#reconciler-dormant, landed b57125e) is the engine — wire tracker AUTO_REPORT into its tick.",
       "created": "2026-06-06",
       "updated_at": "2026-07-26",
-      "note": "[triage 2026-07-26 #769-follow] ALREADY-DONE: Landed as #617 hold-and-redeliver: src/submit-gate.js:566 + test/inject-redeliver.test.js explicitly re-fires a parked REPORT CR when busy recipient goes idle; plus #528 AUTO_HOLD poll. Residual losses tracked in #743."
+      "note": "[triage 2026-07-26 #769-follow] ALREADY-DONE: Landed as #617 hold-and-redeliver: src/submit-gate.js:566 + test/inject-redeliver.test.js explicitly re-fires a parked REPORT CR when busy recipient goes idle; plus #528 AUTO_HOLD poll. Residual losses tracked in #743. || 2026-09-06 id-collision: this row shared id 517 with row idx 494 (\"\"); renamed this row to 517b"
     },
     {
       "id": 518,
@@ -6142,11 +6142,11 @@
       "kind": "orchestration-infra",
       "priority": "low",
       "project": "aigentry-orchestrator",
-      "note": "#525 coder finding: T28_protected_push_guard dies at REPL-ready timeout (L203) — that IS the #522 red — BEFORE tracker_register (L374). #525 pre-empted the latent active.json leak via DISPATCH_STATE_DIR=temp redirect (acd0a9c). So when #522 fixes T28's REPL-ready expectation, the dispatch-state leak is already neutralized. T26 = reconciler INV-17 single-signal expectation vs current tick log; T23 = workspace_host_adapter. All 3 red since cmux-adaptor/reconcile merge (b57125e/cc95d87), pre-existing.",
+      "note": "#525 coder finding: T28_protected_push_guard dies at REPL-ready timeout (L203) — that IS the #522 red — BEFORE tracker_register (L374). #525 pre-empted the latent active.json leak via DISPATCH_STATE_DIR=temp redirect (acd0a9c). So when #522 fixes T28's REPL-ready expectation, the dispatch-state leak is already neutralized. T26 = reconciler INV-17 single-signal expectation vs current tick log; T23 = workspace_host_adapter. All 3 red since cmux-adaptor/reconcile merge (b57125e/cc95d87), pre-existing. || 2026-09-06 id-collision: this row shared id 522 with row idx 503 (\"Pre-existing test failures (NOT this ses\"); renamed that row to 522b, this row keeps 522",
       "created": "2026-06-06"
     },
     {
-      "id": 522,
+      "id": "522b",
       "priority": "P2",
       "status": "done",
       "session": "unassigned",
@@ -6156,7 +6156,7 @@
       "rule_32a_track": "B",
       "dispatch_trigger": "delegate to tester/coder; not blocking #518. Verify whether T26 reflects intended INV-17 behavior or stale expectation.",
       "created": "2026-06-06",
-      "note": "#525 coder finding: T28_protected_push_guard dies at REPL-ready timeout (L203) — that IS the #522 red — BEFORE tracker_register (L374). #525 pre-empted the latent active.json leak via DISPATCH_STATE_DIR=temp redirect (acd0a9c). So when #522 fixes T28's REPL-ready expectation, the dispatch-state leak is already neutralized. T26 = reconciler INV-17 single-signal expectation vs current tick log; T23 = workspace_host_adapter. All 3 red since cmux-adaptor/reconcile merge (b57125e/cc95d87), pre-existing. | [triage 2026-07-26 #769-follow] OBSOLETE: (deferred row) Interplay note resolved: #525 landed (acd0a9c) and commit 3293240 fixed T23/T26/T28 → suite green. Record-keeping row, nothing left.",
+      "note": "#525 coder finding: T28_protected_push_guard dies at REPL-ready timeout (L203) — that IS the #522 red — BEFORE tracker_register (L374). #525 pre-empted the latent active.json leak via DISPATCH_STATE_DIR=temp redirect (acd0a9c). So when #522 fixes T28's REPL-ready expectation, the dispatch-state leak is already neutralized. T26 = reconciler INV-17 single-signal expectation vs current tick log; T23 = workspace_host_adapter. All 3 red since cmux-adaptor/reconcile merge (b57125e/cc95d87), pre-existing. | [triage 2026-07-26 #769-follow] OBSOLETE: (deferred row) Interplay note resolved: #525 landed (acd0a9c) and commit 3293240 fixed T23/T26/T28 → suite green. Record-keeping row, nothing left. || 2026-09-06 id-collision: this row shared id 522 with row idx 502 (\"\"); renamed this row to 522b",
       "updated_at": "2026-09-06"
     },
     {
@@ -6181,11 +6181,11 @@
       "kind": "orchestration-bug",
       "priority": "high",
       "project": "aigentry-orchestrator",
-      "note": "2026-06-06: reconciler launchd 에이전트가 매 tick(60s)마다 leftover t16-contam 테스트 세션을 재등록(active.json)/재spawn → compact 후 ~20턴 phantom-session 추격 trap의 진짜 소스. orch-code-gaps Chunk3의 'register subcmd + check wired into reconciler tick'(commit 9eb1683, main unpushed) 또는 tests/dispatch fixture leftover가 원인. RESOLUTION: launchctl bootout gui/UID/com.aigentry.reconciler → 90s settle로 재출현 0 확정. reconciler 현재 OFF(GC 안전망 없음 — orchestrator 수동 cleanup으로 충분). 재활성 조건: register/check 와이어링 버그 fix + t16 fixture 정리 후에만. 그 전까지 OFF 유지. 관련 #522(gap program defer).",
+      "note": "2026-06-06: reconciler launchd 에이전트가 매 tick(60s)마다 leftover t16-contam 테스트 세션을 재등록(active.json)/재spawn → compact 후 ~20턴 phantom-session 추격 trap의 진짜 소스. orch-code-gaps Chunk3의 'register subcmd + check wired into reconciler tick'(commit 9eb1683, main unpushed) 또는 tests/dispatch fixture leftover가 원인. RESOLUTION: launchctl bootout gui/UID/com.aigentry.reconciler → 90s settle로 재출현 0 확정. reconciler 현재 OFF(GC 안전망 없음 — orchestrator 수동 cleanup으로 충분). 재활성 조건: register/check 와이어링 버그 fix + t16 fixture 정리 후에만. 그 전까지 OFF 유지. 관련 #522(gap program defer). || 2026-09-06 id-collision: this row shared id 524 with row idx 506 (\"Defense-in-Depth: session-cleanup.sh has\"); renamed that row to 524b, this row keeps 524",
       "created": "2026-06-06"
     },
     {
-      "id": 524,
+      "id": "524b",
       "priority": "P1",
       "status": "done",
       "session": "unassigned",
@@ -6196,7 +6196,7 @@
       "dispatch_trigger": "BUNDLE with #523 (same file session-cleanup.sh hardening) — one coder: (a) #523 wh_lookup cmux-title fallback for orphan close, (b) #524 worker-guard fail-fast. Both small, same domain.",
       "created": "2026-06-06",
       "updated_at": "2026-09-06",
-      "note": "[triage 2026-07-26 #769-follow] OBSOLETE: (deferred row, reconciler OFF hold) Superseded: reconciler rebuilt per ADR 2026-06-06-session-reconcile-loop.md and live again (bin/session-reconciler.sh with HITL gates; real gate firing 2026-07-26 per #796 note)."
+      "note": "[triage 2026-07-26 #769-follow] OBSOLETE: (deferred row, reconciler OFF hold) Superseded: reconciler rebuilt per ADR 2026-06-06-session-reconcile-loop.md and live again (bin/session-reconciler.sh with HITL gates; real gate firing 2026-07-26 per #796 note). || 2026-09-06 id-collision: this row shared id 524 with row idx 505 (\"\"); renamed this row to 524b"
     },
     {
       "id": 525,
@@ -6247,11 +6247,11 @@
       "kind": "orchestration-infra",
       "priority": "low",
       "project": "aigentry-orchestrator/devkit",
-      "note": "gap-program SPEC HOLD(2026-06-06): docs/specs/2026-06-06-profile-orchestrator.md. component+adapter(git-clone)+install.sh phase-8+plist/systemd 템플릿+config gen+hooks deep-merge+doctor. §1 위헌심사 통과 주장(기존 파이프라인 재사용). NOT implemented(spec only). DEFERRED per hard-stop — 사용자가 orchestrator 배포 원할 때만 재개. 관련 #522.",
+      "note": "gap-program SPEC HOLD(2026-06-06): docs/specs/2026-06-06-profile-orchestrator.md. component+adapter(git-clone)+install.sh phase-8+plist/systemd 템플릿+config gen+hooks deep-merge+doctor. §1 위헌심사 통과 주장(기존 파이프라인 재사용). NOT implemented(spec only). DEFERRED per hard-stop — 사용자가 orchestrator 배포 원할 때만 재개. 관련 #522. || 2026-09-06 id-collision: this row shared id 528 with row idx 511 (\"#517 RESIDUAL: pull-AUTO_REPORT covers C\"); renamed that row to 528b, this row keeps 528",
       "created": "2026-06-06"
     },
     {
-      "id": 528,
+      "id": "528b",
       "priority": "P1",
       "status": "done",
       "session": "unassigned",
@@ -6262,7 +6262,7 @@
       "dispatch_trigger": "analyst/architect: wire orchestrator to telepty's TASK_IDLE_NO_REPORT/TASK_BLOCKED bus events (deliberation enforce-spec 0.2.0). High-value — every mid-task HOLD currently risks silent loss.",
       "created": "2026-06-06",
       "updated_at": "2026-07-26",
-      "note": "[triage 2026-07-26 #769-follow] ALREADY-DONE: Implemented: bin/dispatch-tracker.sh ~570 _poll_pending_and_autohold (comment-tagged '#528') polls telepty /api/pendingReports/:sid and surfaces AUTO_HOLD for idle-after-inject-no-REPORT sessions."
+      "note": "[triage 2026-07-26 #769-follow] ALREADY-DONE: Implemented: bin/dispatch-tracker.sh ~570 _poll_pending_and_autohold (comment-tagged '#528') polls telepty /api/pendingReports/:sid and surfaces AUTO_HOLD for idle-after-inject-no-REPORT sessions. || 2026-09-06 id-collision: this row shared id 528 with row idx 510 (\"\"); renamed this row to 528b"
     },
     {
       "id": 529,
@@ -6272,11 +6272,11 @@
       "kind": "orchestration-infra",
       "priority": "low",
       "project": "aigentry-orchestrator",
-      "note": "gap-program SPEC(2026-06-06): docs/specs/2026-06-06-bus-event-consumer.md. telepty daemon bus(port3848) poll→dispatch-tracker check Step0b→TASK_IDLE_NO_REPORT->AUTO_HOLD 등. NOT implemented. DEFERRED per hard-stop. 관련 #517/#522/#524(reconciler OFF이라 어차피 미가동).",
+      "note": "gap-program SPEC(2026-06-06): docs/specs/2026-06-06-bus-event-consumer.md. telepty daemon bus(port3848) poll→dispatch-tracker check Step0b→TASK_IDLE_NO_REPORT->AUTO_HOLD 등. NOT implemented. DEFERRED per hard-stop. 관련 #517/#522/#524(reconciler OFF이라 어차피 미가동). || 2026-09-06 id-collision: this row shared id 529 with row idx 513 (\"devkit has a LARGE uncommitted install-f\"); renamed that row to 529b, this row keeps 529",
       "created": "2026-06-06"
     },
     {
-      "id": 529,
+      "id": "529b",
       "priority": "P2",
       "status": "done",
       "session": "unassigned",
@@ -6287,7 +6287,7 @@
       "dispatch_trigger": "devkit session: assess docs/brain-install-fallback-spec.md vs the dirty diff → commit/finish/revert + clean untracked junk. NOT blocking #518 (which commits surgically around it).",
       "created": "2026-06-07",
       "updated_at": "2026-09-06",
-      "note": "[triage 2026-07-26 #769-follow] OBSOLETE: [deferred/bus-consumer] The gap it targeted (TASK_IDLE_NO_REPORT→AUTO_HOLD) landed via dispatch-tracker _poll_pending_and_autohold (#528, pull not bus). Full bus-consumer spec superseded unless a new need appears."
+      "note": "[triage 2026-07-26 #769-follow] OBSOLETE: [deferred/bus-consumer] The gap it targeted (TASK_IDLE_NO_REPORT→AUTO_HOLD) landed via dispatch-tracker _poll_pending_and_autohold (#528, pull not bus). Full bus-consumer spec superseded unless a new need appears. || 2026-09-06 id-collision: this row shared id 529 with row idx 512 (\"\"); renamed this row to 529b"
     },
     {
       "id": 530,

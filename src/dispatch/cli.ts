@@ -564,6 +564,35 @@ function taskGateReject(o: Opts, msg: string): void {
   die(`dispatch.sh: ${msg}`, 4);
 }
 
+/** Every row whose id matches. The COUNT is the point: two rows is an id nobody can resolve. */
+function findTaskRows(rows: unknown[], taskId: string): number[] {
+  const hits: number[] = [];
+  rows.forEach((t, i) => {
+    if (t && String((t as { id?: unknown }).id) === taskId) hits.push(i);
+  });
+  return hits;
+}
+
+/**
+ * #1110: both find sites word it the same way. `tasks.find(...)` answered with the first
+ * match, so `--task 522` read a desc-less `pending` row while the row a human meant sat
+ * two rows down, `done` — a gate answering a different question than the one asked.
+ *
+ * The two sites act on it differently, because they sit on opposite sides of the inject:
+ * the GATE refuses (rc 5, in warn and off too — AIGENTRY_TASK_GATE chooses how strict the
+ * gate is about a KNOWN row, it cannot choose WHICH of two rows was meant); the LEDGER
+ * only warns, because by then the dispatch has already landed.
+ */
+function ambiguousTaskIdMessage(rows: unknown[], hits: number[], taskId: string): string {
+  const where = hits
+    .map((i) => `idx ${i} ("${String((rows[i] as { desc?: unknown } | undefined)?.desc ?? "").slice(0, 40)}")`)
+    .join(" and ");
+  return (
+    `Rule 34 task-gate: task id '${taskId}' matches ${hits.length} rows in ${TASK_QUEUE} — ${where}. ` +
+    `Ambiguous task id — not a gate mode decision. Rename one row (e.g. '${taskId}b') and dispatch the id you mean.`
+  );
+}
+
 /** The queue lookup — rc mirrors the retired python block's exit codes. */
 function taskQueueStatus(taskId: string): { rc: number; status: string } {
   let data: { tasks?: unknown[]; completed?: unknown[] };
@@ -573,9 +602,10 @@ function taskQueueStatus(taskId: string): { rc: number; status: string } {
     return { rc: 2, status: "" };
   }
   const tasks = Array.isArray(data.tasks) ? data.tasks : [];
-  const task = tasks.find((t) => t && String((t as { id?: unknown }).id) === taskId) as
-    | { status?: unknown }
-    | undefined;
+  const hits = findTaskRows(tasks, taskId);
+  // rc 5 — distinct from the gate's rc 4, so a caller can tell a collision from a bad status.
+  if (hits.length > 1) die(`dispatch.sh: ${ambiguousTaskIdMessage(tasks, hits, taskId)}`, 5);
+  const task = (hits.length === 1 ? tasks[hits[0]!] : undefined) as { status?: unknown } | undefined;
   if (task === undefined) {
     // completed[] is the archive tail — a hit there is a stale id, not an unknown one.
     const completed = Array.isArray(data.completed) ? data.completed : [];
@@ -641,9 +671,17 @@ function taskLedgerUpdate(o: Opts, sid: string): void {
   try {
     const data = JSON.parse(fs.readFileSync(TASK_QUEUE, "utf8")) as { tasks?: unknown[] };
     const tasks = Array.isArray(data.tasks) ? data.tasks : [];
-    const task = tasks.find((t) => t && String((t as { id?: unknown }).id) === o.taskId) as
-      | Record<string, unknown>
-      | undefined;
+    const hits = findTaskRows(tasks, o.taskId);
+    if (hits.length > 1) {
+      // Unreachable while the gate stands (it refuses first, in every mode) — kept because
+      // a first-match ledger WRITE is the worse half of #1110. Warns and skips instead of
+      // refusing: the inject already landed, so this site must never fail the dispatch.
+      const msg = ambiguousTaskIdMessage(tasks, hits, o.taskId);
+      process.stderr.write(`dispatch.sh: WARNING ${msg} (ledger write skipped; dispatch already landed)\n`);
+      noTaskTelemetry(o, `task-ledger-ambiguous: ${msg}`);
+      return;
+    }
+    const task = (hits.length === 1 ? tasks[hits[0]!] : undefined) as Record<string, unknown> | undefined;
     if (task === undefined) throw new Error("task row vanished");
     const now = utcNow();
     // Only promote from a not-yet-started state; in_progress must never regress.
