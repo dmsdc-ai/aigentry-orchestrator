@@ -46,7 +46,18 @@ export function geminiAdapter(binary: "agy" | "gemini" = "gemini") {
   if (binary === "agy") return makeAdapter({
     name: "gemini",
     min_version: "0.0.0", // no numeric version claim; capability-gated below
-    capabilityProbe: { executable: "agy", flags: ["--model", "--dangerously-skip-permissions", "--prompt-interactive"] },
+    capabilityProbe: { executable: "agy", flags: ["--model", "--dangerously-skip-permissions"] },
+    // #1093: agy takes the role contract as a cwd rule file, NOT as a first prompt.
+    // agy 1.1.27 has no --rules / system-prompt flag, so #1083 delivered it via
+    // --prompt-interactive — and an interactive first prompt reads as "do this
+    // now": the #1090 probe ran ps/read-screen/cat with no task ref delivered.
+    // agy auto-discovers cwd GEMINI.md/AGENTS.md as always-on rules (measured
+    // interactively, agy 1.1.27: a bare cwd GEMINI.md steered the reply with and
+    // without a git root; --print ignores it, workers are interactive), so the
+    // #532 additive contextFile path carries it at rule level instead.
+    contextFile: GEMINI_CONTEXT_FILE,
+    // No homeEnv: agy honors only $HOME (#1090) — it gets no shadow home, so its
+    // global-doc surface (~/.gemini/config/) is untouched here, as before.
     buildArgvEnv: () => ({ argv: ["agy", "--model", process.env.AIGENTRY_GEMINI_MODEL || "gemini-3.8-flash-high",
       "--dangerously-skip-permissions",
       ...(process.env.AIGENTRY_GEMINI_EFFORT ? ["--effort", process.env.AIGENTRY_GEMINI_EFFORT] : [])], env: {} }), // #1084 opt-in

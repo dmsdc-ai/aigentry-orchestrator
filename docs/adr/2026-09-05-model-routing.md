@@ -90,10 +90,17 @@ the complete staged role and session contract through `--rules`.
 The `gemini` kind chooses `agy` when present on PATH, otherwise `gemini`.
 `AIGENTRY_GEMINI_BINARY=agy|gemini` overrides selection. No new CLI kind is
 needed, and Gemini CLI remains the fallback when Antigravity is absent.
-`agy --help` exposes `--model`, `--dangerously-skip-permissions`, and
-`--prompt-interactive`. Its adapter uses those flags and passes the staged
-role/session contract as the initial interactive prompt. It does not claim
-Gemini CLI's `GEMINI.md` or `GEMINI_CLI_HOME` isolation behavior.
+`agy --help` exposes `--model` and `--dangerously-skip-permissions`, and its
+adapter uses those flags. It has no `--rules` or system-prompt flag.
+
+The staged role/session contract first shipped as agy's initial interactive
+prompt (`--prompt-interactive`). #1093 replaced that: an interactive first
+prompt reads as a task, and the #1090 agy probe acted on the contract before
+any task ref reached it. agy auto-discovers a cwd `GEMINI.md` as an always-on
+rule (measured interactively against 1.1.27), so its adapter now declares the
+same additive `contextFile` as Gemini CLI and the launcher passes no prompt.
+agy still claims no `GEMINI_CLI_HOME` isolation: it honors only `$HOME`, so it
+gets no shadow home and its global surface (`~/.gemini/config/`) is untouched.
 
 `agy version` is unsupported; its adapter checks required `--help` capabilities
 with a five-second timeout instead of inventing a numeric version.
