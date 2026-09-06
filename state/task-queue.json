@@ -7003,7 +7003,7 @@
       "note": "2026-06-13 보고누락 디버깅 중 발견. #539 orchestrator-boot.sh singleton이 중복 제거했어야 하는데 2개 존재. 같은 --id 중복=feedback_telepty_duplicate_id_shared_fate(한쪽 DELETE가 형제 cascade). + 둘다 #615(0.6.4) 이전 구버전→fix 반쪽적용 원인. ⚠️ self/조상 확인 필수(orchestrator cleanup은 사용자 전용)—잘못 kill시 이 세션 종료. 처리: #617 land 후 orchestrator 세션 재시작(사용자)으로 bridge 갱신+중복해소. 사용자 결정 필요."
     },
     {
-      "id": "619",
+      "id": 619,
       "priority": "P0",
       "status": "done",
       "desc": "TASK_IDLE_UNCONFIRMED false-negative on long Claude TUI completions — consumption evidence decays by idle-time (telepty#54). NOT #48/#52 regression (those=early/codex; this=late/Claude long-turn). Fix: capture consumption-evidence at consumption-time + persist, idle-gate reads stored fact not decayed screen.",
@@ -7019,7 +7019,7 @@
       "updated_at": "2026-06-13"
     },
     {
-      "id": "620",
+      "id": 620,
       "priority": "P1",
       "status": "done",
       "desc": "재발방지: orchestrator 재시작이 bin/orchestrator-boot.sh(#539 singleton-at-boot, stale bridge kill-9 후 exec)를 강제로 경유하게. 이번 #618은 boot 경로 안 거친 raw 재시작이라 stale --id orchestrator 중복 잔존→보고 0건.",
@@ -7035,7 +7035,7 @@
       "track": "t620"
     },
     {
-      "id": "621",
+      "id": 621,
       "priority": "P1",
       "status": "pending",
       "desc": "#619 잔여 cry-wolf 갭 조사: 0.6.5 데몬(98164, #619 코드 확인)에서도 worker-launcher 세션 t620이 238.8s real-idle에 TASK_IDLE_UNCONFIRMED 발화(false-negative — inject는 소비됨). #619가 worker-launcher/real-idle 경로 또는 consumption-at-consumption-time positive 미관측 케이스를 완전 억제 못함.",
@@ -7053,7 +7053,7 @@
       "updated_at": "2026-06-14"
     },
     {
-      "id": "622",
+      "id": 622,
       "priority": "P1",
       "status": "done",
       "desc": "공개 위생 점검 — orchestrator repo PUBLIC 전환(2026-06-13) 후속. tracked 콘텐츠에서 (a) 개인 절대경로 /Users/duckyoungkim/... + username + 머신명(duckyoungkimui-MacBookPro.local), (b) sibling-repo 참조(aigentry 헌법/aigentry-aterm 등 — 비공개 여부 확인 + 비공개면 깨진링크/정보누출), (c) state/task-queue.json 593 태스크 내부노트 공개 적정성 — 점검 후 정리/리다이렉트/스크럽.",
@@ -7069,7 +7069,7 @@
       "track": "t622"
     },
     {
-      "id": "623",
+      "id": 623,
       "priority": "P1",
       "status": "pending",
       "desc": "Loop-engineering 하네스: 워커 role이 실수/오작업 시 교정이 그 role로 루프백되어 다음 세션이 반복 안 하도록 학습. 검증가능 목표=동일 실수 클래스가 동일 role의 후속 dispatch에서 재발 시 자동 차단/경고되는 결정적 테스트 + 실제 재현(예: analyst의 tracked/untracked 오판).",
@@ -7087,7 +7087,7 @@
       "updated_at": "2026-06-13"
     },
     {
-      "id": "624",
+      "id": 624,
       "priority": "P1",
       "status": "done",
       "desc": "telepty#57 — inject turn-firing 비결정성(no --submit) + busy-session buffer overwrite 무음유실. SPEC 승인완료(Option A gated-firing + src/inject-queue.js FIFO wrap holdAndRedeliver + cap32 explicit-overflow). 코더(tp57) API-disconnect로 92분뒤 사망, 커밋 0 = 작업 전부 유실. 재dispatch 필요.",
@@ -7106,7 +7106,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "625",
+      "id": 625,
       "priority": "P1",
       "status": "pending",
       "desc": "telepty CLI 명령 스킬 일괄 작성 — 사용자 LLM이 ~42개 telepty 명령 용도를 모름. 스킬 10개뿐, 갭=32개(broker/kill/send-key/read-screen/multicast/spawn/status/monitor/dashboard/tui/connect*/peers/clean/handoff/reply/enter/init 등). write-a-skill 스킬로 일괄, skills/<cmd>/SKILL.md.",
@@ -7122,7 +7122,7 @@
       "updated_at": "2026-06-22"
     },
     {
-      "id": "626",
+      "id": 626,
       "priority": "P1",
       "status": "pending",
       "desc": "spawn 인프라 불안정 — rapid same-sid cleanup+respawn churn이 telepty bridge를 죽이고 cmux workspace+claude를 orphan으로 남김(2026-06-22 delibagy 반복 사망). + wh_close가 bare id(249) 받으면 no-op, ref(workspace:249) 필요한 footgun.",
@@ -7139,7 +7139,7 @@
       "updated_at": "2026-06-22"
     },
     {
-      "id": "627",
+      "id": 627,
       "priority": "P1",
       "status": "done",
       "desc": "deliberation grok/agy 런타임 통합 버그 — grok 턴이 ok(26s)지만 캡처 내용 빈칸(standalone grok -p는 639b 정상=deliberation 출력캡처/파싱 버그), agy는 300s timeout(Antigravity headless 느림/멈춤). 인식·spawn은 landed(0.0.47), 캡처/타임아웃 튜닝 필요.",
@@ -7961,7 +7961,7 @@
       "completed": "2026-07-05"
     },
     {
-      "id": "650",
+      "id": 650,
       "priority": "P1",
       "status": "done",
       "desc": "에코시스템 심층 분석 (Fable 5) — 7/2 베이스라인 대비 델타 + 신규 개선점 (구조/보안/사용성/사업성)",
@@ -7988,7 +7988,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "649",
+      "id": 649,
       "priority": "P1",
       "status": "done",
       "desc": "[Stage 3 prereq] 프론트도어 실제 배포 fix — devkit 0.0.22 bump + brain/devkit 재배포 준비 + hub re-pin + orchestrator/amplify/dustcraw MIT LICENSE",
@@ -7997,7 +7997,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "651",
+      "id": 651,
       "priority": "P1",
       "category": "security",
       "status": "done",
@@ -8007,7 +8007,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "652",
+      "id": 652,
       "priority": "P2",
       "category": "security",
       "status": "pending",
@@ -8017,7 +8017,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "653",
+      "id": 653,
       "priority": "P2",
       "category": "security",
       "status": "pending",
@@ -8027,7 +8027,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "654",
+      "id": 654,
       "priority": "P2",
       "category": "security",
       "status": "done",
@@ -8037,7 +8037,7 @@
       "updated_at": "2026-09-06"
     },
     {
-      "id": "655",
+      "id": 655,
       "priority": "P1",
       "category": "tech-debt",
       "status": "pending",
@@ -8047,7 +8047,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "656",
+      "id": 656,
       "priority": "P2",
       "category": "tech-debt",
       "status": "pending",
@@ -8057,7 +8057,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "657",
+      "id": 657,
       "priority": "P2",
       "category": "tech-debt",
       "status": "pending",
@@ -8067,7 +8067,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "658",
+      "id": 658,
       "priority": "P2",
       "category": "tech-debt",
       "status": "pending",
@@ -8077,7 +8077,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "659",
+      "id": 659,
       "priority": "P2",
       "category": "audit-cut",
       "status": "pending",
@@ -8087,7 +8087,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "660",
+      "id": 660,
       "priority": "P2",
       "category": "audit-cut",
       "status": "pending",
@@ -8097,7 +8097,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "661",
+      "id": 661,
       "priority": "P3",
       "category": "audit-cut",
       "status": "pending",
@@ -8107,7 +8107,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "662",
+      "id": 662,
       "priority": "P3",
       "category": "audit-cut",
       "status": "pending",
@@ -8117,7 +8117,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "663",
+      "id": 663,
       "priority": "P1",
       "category": "usability-crossos",
       "status": "pending",
@@ -8127,7 +8127,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "664",
+      "id": 664,
       "priority": "P2",
       "category": "usability-crossos",
       "status": "pending",
@@ -8137,7 +8137,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "665",
+      "id": 665,
       "priority": "P1",
       "category": "business",
       "status": "pending",
@@ -8147,7 +8147,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "666",
+      "id": 666,
       "priority": "P1",
       "category": "governance",
       "status": "done",
@@ -8157,7 +8157,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "667",
+      "id": 667,
       "priority": "P2",
       "category": "governance",
       "status": "pending",
@@ -8167,7 +8167,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "668",
+      "id": 668,
       "priority": "P1",
       "category": "audit-cut",
       "status": "pending",
@@ -8177,7 +8177,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "669",
+      "id": 669,
       "priority": "P2",
       "category": "audit-cut",
       "status": "pending",
@@ -8187,7 +8187,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "670",
+      "id": 670,
       "priority": "P2",
       "category": "audit-cut",
       "status": "pending",
@@ -8197,7 +8197,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "671",
+      "id": 671,
       "priority": "P2",
       "category": "audit-cut",
       "status": "pending",
@@ -8207,7 +8207,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "672",
+      "id": 672,
       "priority": "P1",
       "category": "infra-crossmachine",
       "track": "infra-crossmachine",
@@ -8221,7 +8221,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "673",
+      "id": 673,
       "priority": "P2",
       "category": "tech-debt",
       "track": "tech-debt",
@@ -8231,7 +8231,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "674",
+      "id": 674,
       "priority": "P1",
       "category": "usability-crossos",
       "track": "telepty-seamless-crossmachine",
@@ -8241,7 +8241,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "675",
+      "id": 675,
       "priority": "P1",
       "category": "governance",
       "track": "terminal-abstraction",
@@ -8251,7 +8251,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "676",
+      "id": 676,
       "priority": "P1",
       "category": "governance",
       "track": "orchestrator-boot-autowire",
@@ -8261,7 +8261,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "677",
+      "id": 677,
       "priority": "P1",
       "category": "architecture",
       "track": "telepty-independence",
@@ -8271,7 +8271,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "678",
+      "id": 678,
       "priority": "P1",
       "category": "telepty-bug",
       "track": "telepty-crossmachine-submit",
@@ -8281,7 +8281,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "679",
+      "id": 679,
       "priority": "P1",
       "category": "telepty-bug",
       "track": "telepty-windows-inject",
@@ -8291,7 +8291,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "680",
+      "id": 680,
       "priority": "P1",
       "category": "architecture",
       "track": "crossmachine-timestamps",
@@ -8301,7 +8301,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "681",
+      "id": 681,
       "priority": "P1",
       "category": "telepty-feature",
       "track": "telepty-send-key-nav",
@@ -8311,7 +8311,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "682",
+      "id": 682,
       "priority": "P1",
       "category": "governance",
       "track": "repo-access-control",
@@ -8321,7 +8321,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "683",
+      "id": 683,
       "priority": "P1",
       "category": "governance",
       "track": "repo-cleanup",
@@ -8331,7 +8331,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "684",
+      "id": 684,
       "priority": "P2",
       "category": "governance",
       "track": "repo-cleanup",
@@ -8341,7 +8341,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "685",
+      "id": 685,
       "priority": "P1",
       "category": "docs",
       "track": "public-readme-improve",
@@ -8351,7 +8351,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "686",
+      "id": 686,
       "priority": "P2",
       "category": "research",
       "track": "testcov-research",
@@ -8361,7 +8361,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "687",
+      "id": 687,
       "priority": "P1",
       "category": "game",
       "track": "ah-character",
@@ -8371,7 +8371,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "688",
+      "id": 688,
       "priority": "P3",
       "category": "telepty-known-limitation",
       "track": "busy-target-submit",
@@ -8583,7 +8583,7 @@
       "note": "사용자 2026-07-05. 위험: 기본 tarball에 docs/business+reports+state+.agents 495 confidential 파일. 안전조치: package.json files=[dist/src,README,LICENSE] 화이트리스트+scope @dmsdc-ai+0.1.0+unprivate+exports(gate,session/persistence,boot-adapter). npm pack dry-run 검증=confidential 0. published 0.1.0 (100 files 53.9kB). deps logger0.2.0/ssot1.0.0 published. 후속: ecosystem.json에 orchestrator published 0.1.0 반영(현재 unpublished 표기)—다음 readme-regen."
     },
     {
-      "id": "709",
+      "id": 709,
       "priority": "P1",
       "status": "pending",
       "desc": "[deliberation UX] tmux 전광판(모니터 터미널)이 사용자에게 안 뜸 — deliberation_start가 grouped tmux 세션(deliberation-N)만 만들고 visible 터미널 surface로 안 띄움",
@@ -8597,7 +8597,7 @@
       "updated_at": "2026-07-05"
     },
     {
-      "id": "710",
+      "id": 710,
       "priority": "P1",
       "status": "done",
       "desc": "[GeekNews #643 게이트] telepty 실측 2개 확보 — (A) busy 세션 gated inject→접수 확정 지연 (B) 3-OS 크로스머신 전달 왕복 실측. v11 초안 [실측 1~2] 교체용",
@@ -8611,7 +8611,7 @@
       "updated_at": "2026-07-06"
     },
     {
-      "id": "711",
+      "id": 711,
       "priority": "P2",
       "status": "pending",
       "desc": "[telepty hardening] session-state.js:187 poll setInterval .unref() — #645 hang 재발 클래스 방어(defense-in-depth)",
@@ -8624,7 +8624,7 @@
       "updated_at": "2026-07-06"
     },
     {
-      "id": "712",
+      "id": 712,
       "priority": "P1",
       "status": "done",
       "desc": "[GeekNews #643 게이트] telepty 데모 GIF 제작 + README 최상단 삽입 (README.tmpl.md 경유 regen)",
@@ -8638,7 +8638,7 @@
       "updated_at": "2026-07-06"
     },
     {
-      "id": "713",
+      "id": 713,
       "priority": "P1",
       "status": "blocked-by-observation",
       "desc": "[telepty bug] Claude Code v2.1.198 fresh-spawn 세션 inject 블랙홀 — 신버전 TUI의 터미널 capability 네고(DECRQM 2026/DA)에 bridge PTY 미응답 의심",
@@ -8652,7 +8652,7 @@
       "updated_at": "2026-07-07"
     },
     {
-      "id": "714",
+      "id": 714,
       "priority": "P1",
       "status": "done",
       "desc": "[GeekNews #643] 크로스머신·크로스플랫폼 데모 GIF — Mac→Linux(codex)+Mac→Windows(claude) 원격 inject/read-screen 왕복 녹화, README demo.gif 교체",
@@ -8666,7 +8666,7 @@
       "updated_at": "2026-07-07"
     },
     {
-      "id": "715",
+      "id": 715,
       "priority": "P1",
       "status": "done",
       "desc": "[telepty bug] read-screen이 codex TUI를 0q 노이즈로 렌더 — synchronized-output(DECRQM 2026)/DA 협상 시퀀스를 문자로 흘림. tmux capture-pane은 깨끗",
@@ -8681,7 +8681,7 @@
       "updated_at": "2026-07-07"
     },
     {
-      "id": "716",
+      "id": 716,
       "priority": "P1",
       "status": "done",
       "desc": "[telepty bug C7] inject/send-key가 codex TUI composer에 submit 미등록 — 텍스트는 착지하나 pty_cr Enter가 안 먹힘(paste-detection delay). tmux send-keys(텍스트+Enter 분리 호출)로만 제출됨",
@@ -8696,7 +8696,7 @@
       "updated_at": "2026-07-07"
     },
     {
-      "id": "717",
+      "id": 717,
       "priority": "P2",
       "status": "pending",
       "desc": "[telepty] /screen 리드로우-프레임 누적 — ring-concat 방식이라 TUI 리드로우가 반복 텍스트로 쌓임(Booting MC…ooting MCP…). 터미널 그리드 에뮬레이션 또는 프레임 dedup 필요",
@@ -8710,7 +8710,7 @@
       "updated_at": "2026-07-07"
     },
     {
-      "id": "718",
+      "id": 718,
       "priority": "P2",
       "status": "done",
       "desc": "[dispatch-tracker bug] pull-fallback AUTO_REPORT가 워커 브랜치가 아닌 main HEAD 커밋을 워커 작업으로 오귀속 — worktree/브랜치 미인식",
@@ -8723,7 +8723,7 @@
       "updated_at": "2026-07-12"
     },
     {
-      "id": "719",
+      "id": 719,
       "priority": "P1",
       "status": "done",
       "desc": "[telepty bug] codex 매처 stale — Step2가 fast 토큰 요구(0.142.5 non-fast footer 불일치) + Step3 선행공백 필수 → promptReady 영구 false → bridge mailbox 파킹 (#714 데모 블로커)",
@@ -8737,7 +8737,7 @@
       "updated_at": "2026-07-07"
     },
     {
-      "id": "720",
+      "id": 720,
       "priority": "P1",
       "status": "done",
       "desc": "[telepty] bridge mailbox stale-inject dedup/expiry — 게이트 장기 폐쇄 중 파킹된 주입들이 게이트 재개방 시 한꺼번에 중복 flush (동일 질문 3x 전달 라이브 관측)",
@@ -8751,7 +8751,7 @@
       "updated_at": "2026-07-12"
     },
     {
-      "id": "721",
+      "id": 721,
       "priority": "P2",
       "status": "done",
       "desc": "[telepty] TASK_IDLE_UNCONFIRMED false-negative — 턴이 실제 완료됐는데 ~14s 시점 idle-unconfirmed 발신 (2연속 라이브 관측, codex 타겟)",
@@ -8764,7 +8764,7 @@
       "updated_at": "2026-07-25"
     },
     {
-      "id": "722",
+      "id": 722,
       "priority": "P1",
       "status": "done",
       "desc": "[telepty bug] codex 매처 재파손 — 모델명 접미 변형(gpt-5.6-sol)에 gpt-[0-9.]+\\s 가정 불일치 → promptReady 재폐쇄 (#719 후속, 시그니처 매칭 취약성 3번째 실증)",
@@ -8778,7 +8778,7 @@
       "updated_at": "2026-07-12"
     },
     {
-      "id": "723",
+      "id": 723,
       "priority": "P1",
       "status": "blocked-by-observation",
       "desc": "[orchestrator ops] 오케스트레이터 claude 프로세스 돌연 종료 — 재발 시 transcript jsonl + macOS Console 로그로 근본원인 추적",
@@ -8792,7 +8792,7 @@
       "updated_at": "2026-07-12"
     },
     {
-      "id": "724",
+      "id": 724,
       "priority": "P1",
       "status": "done",
       "desc": "[telepty bug] telepty attach 크로스호스트 실패 — WS Unexpected server response 200 (원격 daemon WS upgrade 미프록시). 로컬 attach는 정상",
@@ -8807,7 +8807,7 @@
       "updated_at": "2026-07-12"
     },
     {
-      "id": "725",
+      "id": 725,
       "updated_at": "2026-07-12",
       "priority": "P1",
       "status": "done",
@@ -8824,7 +8824,7 @@
       ]
     },
     {
-      "id": "726",
+      "id": 726,
       "updated_at": "2026-07-12",
       "priority": "P2",
       "status": "blocked-by-observation",
@@ -8838,7 +8838,7 @@
       ]
     },
     {
-      "id": "727",
+      "id": 727,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "done",
@@ -8852,7 +8852,7 @@
       ]
     },
     {
-      "id": "728",
+      "id": 728,
       "updated_at": "2026-07-25",
       "priority": "P1",
       "status": "awaiting-user",
@@ -8866,7 +8866,7 @@
       ]
     },
     {
-      "id": "729",
+      "id": 729,
       "updated_at": "2026-07-26",
       "priority": "P0",
       "status": "done",
@@ -8884,7 +8884,7 @@
       ]
     },
     {
-      "id": "730",
+      "id": 730,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "done",
@@ -8898,7 +8898,7 @@
       ]
     },
     {
-      "id": "731",
+      "id": 731,
       "updated_at": "2026-07-12",
       "priority": "P2",
       "status": "pending",
@@ -8912,7 +8912,7 @@
       ]
     },
     {
-      "id": "732",
+      "id": 732,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "done",
@@ -8927,7 +8927,7 @@
       ]
     },
     {
-      "id": "733",
+      "id": 733,
       "updated_at": "2026-07-25",
       "priority": "P1",
       "status": "done",
@@ -8942,7 +8942,7 @@
       ]
     },
     {
-      "id": "734",
+      "id": 734,
       "updated_at": "2026-07-25",
       "priority": "P1",
       "status": "done",
@@ -8956,7 +8956,7 @@
       ]
     },
     {
-      "id": "735",
+      "id": 735,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "blocked-by-observation",
@@ -8970,7 +8970,7 @@
       ]
     },
     {
-      "id": "736",
+      "id": 736,
       "updated_at": "2026-07-25",
       "priority": "P0",
       "status": "done",
@@ -8988,7 +8988,7 @@
       ]
     },
     {
-      "id": "737",
+      "id": 737,
       "updated_at": "2026-07-26",
       "priority": "P2",
       "status": "done",
@@ -9003,7 +9003,7 @@
       ]
     },
     {
-      "id": "738",
+      "id": 738,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "done",
@@ -9018,7 +9018,7 @@
       ]
     },
     {
-      "id": "739",
+      "id": 739,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "done",
@@ -9032,7 +9032,7 @@
       ]
     },
     {
-      "id": "740",
+      "id": 740,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "done",
@@ -9046,7 +9046,7 @@
       ]
     },
     {
-      "id": "741",
+      "id": 741,
       "updated_at": "2026-07-26",
       "priority": "P2",
       "status": "pending",
@@ -9059,7 +9059,7 @@
       ]
     },
     {
-      "id": "742",
+      "id": 742,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "pending",
@@ -9073,7 +9073,7 @@
       ]
     },
     {
-      "id": "743",
+      "id": 743,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "pending",
@@ -9087,7 +9087,7 @@
       ]
     },
     {
-      "id": "744",
+      "id": 744,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "done",
@@ -9100,7 +9100,7 @@
       ]
     },
     {
-      "id": "745",
+      "id": 745,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "done",
@@ -9113,7 +9113,7 @@
       ]
     },
     {
-      "id": "746",
+      "id": 746,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "done",
@@ -9126,7 +9126,7 @@
       ]
     },
     {
-      "id": "747",
+      "id": 747,
       "updated_at": "2026-07-26",
       "priority": "P2",
       "status": "pending",
@@ -9140,7 +9140,7 @@
       ]
     },
     {
-      "id": "748",
+      "id": 748,
       "updated_at": "2026-07-26",
       "priority": "P2",
       "status": "pending",
@@ -9153,7 +9153,7 @@
       ]
     },
     {
-      "id": "749",
+      "id": 749,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "done",
@@ -9167,7 +9167,7 @@
       ]
     },
     {
-      "id": "750",
+      "id": 750,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "done",
@@ -9181,7 +9181,7 @@
       ]
     },
     {
-      "id": "751",
+      "id": 751,
       "updated_at": "2026-07-26",
       "priority": "P2",
       "status": "done",
@@ -9194,7 +9194,7 @@
       ]
     },
     {
-      "id": "752",
+      "id": 752,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "done",
@@ -9209,7 +9209,7 @@
       ]
     },
     {
-      "id": "753",
+      "id": 753,
       "updated_at": "2026-07-26",
       "priority": "P2",
       "status": "pending",
@@ -9222,7 +9222,7 @@
       ]
     },
     {
-      "id": "754",
+      "id": 754,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "done",
@@ -9236,7 +9236,7 @@
       ]
     },
     {
-      "id": "755",
+      "id": 755,
       "updated_at": "2026-07-26",
       "priority": "P2",
       "status": "pending",
@@ -9249,7 +9249,7 @@
       ]
     },
     {
-      "id": "756",
+      "id": 756,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "done",
@@ -9262,7 +9262,7 @@
       ]
     },
     {
-      "id": "757",
+      "id": 757,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "done",
@@ -9276,7 +9276,7 @@
       ]
     },
     {
-      "id": "758",
+      "id": 758,
       "updated_at": "2026-07-26",
       "priority": "P2",
       "status": "pending",
@@ -9289,7 +9289,7 @@
       ]
     },
     {
-      "id": "759",
+      "id": 759,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "done",
@@ -9303,7 +9303,7 @@
       ]
     },
     {
-      "id": "760",
+      "id": 760,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "done",
@@ -9318,7 +9318,7 @@
       ]
     },
     {
-      "id": "761",
+      "id": 761,
       "updated_at": "2026-07-26",
       "priority": "P2",
       "status": "pending",
@@ -9331,7 +9331,7 @@
       ]
     },
     {
-      "id": "762",
+      "id": 762,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "done",
@@ -9343,7 +9343,7 @@
       ]
     },
     {
-      "id": "763",
+      "id": 763,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "done",
@@ -9355,7 +9355,7 @@
       ]
     },
     {
-      "id": "764",
+      "id": 764,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "done",
@@ -9367,7 +9367,7 @@
       ]
     },
     {
-      "id": "765",
+      "id": 765,
       "updated_at": "2026-07-26",
       "priority": "P2",
       "status": "pending",
@@ -9380,7 +9380,7 @@
       ]
     },
     {
-      "id": "766",
+      "id": 766,
       "updated_at": "2026-07-26",
       "priority": "P1",
       "status": "in_progress",
@@ -9394,7 +9394,7 @@
       ]
     },
     {
-      "id": "767",
+      "id": 767,
       "updated_at": "2026-07-26",
       "priority": "P2",
       "status": "pending",
@@ -9407,7 +9407,7 @@
       ]
     },
     {
-      "id": "768",
+      "id": 768,
       "status": "done",
       "priority": "P2",
       "desc": "telepty test-infra: (a) bridge-output-pipe-732 flaky under full-suite load (2/4 runs, 10s first-output starvation; isolated 3/3 pass) (b) npm test never exits (daemon-require quirk) — decide --test-force-exit in package.json test scripts (CI-workflow decision, flagged by c760 worker)",
@@ -9415,7 +9415,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "769",
+      "id": 769,
       "status": "done",
       "priority": "P1",
       "desc": "에코시스템 전반 over-engineering 정리 — 9클러스터 Workflow 감사(audit+adversarial verify) → 컷리스트 사용자 승인 → repo별 fix waves",
@@ -9423,7 +9423,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "770",
+      "id": 770,
       "status": "pending",
       "priority": "P1",
       "desc": "[telepty] launcher 세션 identity-blind — command가 worker-launcher.sh라 isKnownAiCli false → #730 paste envelope/#737 codex hold/#760 claude park가 모든 프로덕션 launcher 워커에서 OFF",
@@ -9431,7 +9431,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "771",
+      "id": 771,
       "status": "done",
       "priority": "P1",
       "desc": "[#769 Phase C] telepty 승인 컷 적용 — confirmed 즉시 + unverified 재검증-후-컷",
@@ -9439,7 +9439,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "772",
+      "id": 772,
       "status": "done",
       "priority": "P1",
       "desc": "[#769 Phase C] brain 승인 컷 적용 — confirmed 즉시 + unverified 재검증-후-컷",
@@ -9447,7 +9447,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "773",
+      "id": 773,
       "status": "done",
       "priority": "P1",
       "desc": "[#769 Phase C] devkit 승인 컷 적용 — confirmed 즉시 + unverified 재검증-후-컷",
@@ -9455,7 +9455,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "774",
+      "id": 774,
       "status": "done",
       "priority": "P1",
       "desc": "[#769 Phase C] aterm 승인 컷 적용 — confirmed 즉시 + unverified 재검증-후-컷",
@@ -9463,7 +9463,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "775",
+      "id": 775,
       "status": "done",
       "priority": "P1",
       "desc": "[#769 Phase C] orchestrator 승인 컷 적용 — confirmed 즉시 + unverified 재검증-후-컷",
@@ -9471,7 +9471,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "776",
+      "id": 776,
       "status": "done",
       "priority": "P1",
       "desc": "[#769 Phase C] dustcraw 승인 컷 적용 — confirmed 즉시 + unverified 재검증-후-컷",
@@ -9479,7 +9479,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "777",
+      "id": 777,
       "status": "done",
       "priority": "P1",
       "desc": "[#769 Phase C] deliberation 승인 컷 적용 — confirmed 즉시 + unverified 재검증-후-컷",
@@ -9487,7 +9487,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "778",
+      "id": 778,
       "status": "done",
       "priority": "P1",
       "desc": "[#769 Phase C] small-trio 승인 컷 적용 — confirmed 즉시 + unverified 재검증-후-컷",
@@ -9495,7 +9495,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "779",
+      "id": 779,
       "status": "done",
       "priority": "P1",
       "desc": "[#769 Phase C] registry-ssot 승인 컷 적용 — confirmed 즉시 + unverified 재검증-후-컷",
@@ -9503,7 +9503,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "780",
+      "id": 780,
       "status": "pending",
       "priority": "P3",
       "desc": "[registry] README MCP 섹션 재지정 + mcp_server.py 스텁 제거 — 현재 README가 스텁을 Claude Desktop에 배선하라고 안내(진짜 엔트리는 aigentry-mcp = services.mcp_server.__main__)",
@@ -9511,7 +9511,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "781",
+      "id": 781,
       "status": "pending",
       "priority": "P2",
       "desc": "[deliberation] 테스트 hermeticity — vitest run이 mock 없이 라이브 GUI auto-surfacing(transport.js tmux+Terminal.app 창 생성)을 실구동, 사용자 데스크톱에 창 폭주",
@@ -9519,7 +9519,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "782",
+      "id": 782,
       "status": "pending",
       "priority": "P2",
       "desc": "[aterm] 브랜치 표류 해소 — 실질 메인라인 phase1/cleanup-2026-05-06(2.5개월분)을 main으로 승격/병합, origin/main은 stale(63be495)",
@@ -9527,7 +9527,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "783",
+      "id": 783,
       "status": "pending",
       "priority": "P3",
       "desc": "[ssot] 컷 wave 후 contracts 동기화 — (1) dustcraw-amplify.yaml retire/재플래그 (2) mcp/deliberation-tools.yaml에서 제거된 9툴 반영(0.0.39 pin도 stale)",
@@ -9535,7 +9535,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "784",
+      "id": 784,
       "status": "pending",
       "priority": "P3",
       "desc": "[dustcraw] EntityExtractionEngine.extractRegex greedy 병합 — 문장 경계 넘어 대문자 시퀀스 병합(title+summary가 한 entity로)",
@@ -9543,7 +9543,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "785",
+      "id": 785,
       "status": "pending",
       "priority": "P2",
       "desc": "[ssot] pkg/package.json prepare 훅 부재 — dist/ gitignored인데 publish가 디스크 상태 그대로 출하",
@@ -9551,7 +9551,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "786",
+      "id": 786,
       "status": "pending",
       "priority": "P3",
       "desc": "[registry] helm/ vs k8s/ 이중 배포 스택 결정 — k8s는 테스트 대상, helm은 README 문서-only. 하나 은퇴",
@@ -9559,7 +9559,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "787",
+      "id": 787,
       "status": "pending",
       "priority": "P3",
       "desc": "[registry] mypy가 pyproject dev extras에 없어 로컬에서 CI 게이트(ci.yml:36) 재현 불가",
@@ -9567,7 +9567,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "788",
+      "id": 788,
       "status": "pending",
       "priority": "P2",
       "desc": "[deliberation] 브라우저 모델명 stale — grok-3/GPT-4.5/Claude-3.5-Opus가 실제 드롭다운 선택을 구동(정합성 버그). 프로바이더별 live-UI 검증 후 갱신",
@@ -9575,7 +9575,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "789",
+      "id": 789,
       "status": "awaiting-user",
       "priority": "P2",
       "desc": "[brain] 0.3.0 릴리스 스텝 — (1) rm -rf dist && build (stale dist가 죽은 agent/experiments JS 출하 방지) (2) signaling-server Cloudflare deploy (wrangler migration v3 deleted_classes=[SyncRoom], 상태·클라이언트 0 확인됨)",
@@ -9583,7 +9583,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "790",
+      "id": 790,
       "status": "pending",
       "priority": "P2",
       "desc": "[context] git remote 부재 — aigentry-context에 GitHub remote 생성+push (컷 merge eb23360 포함 전 히스토리가 로컬-only, 백업 0)",
@@ -9591,7 +9591,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "791",
+      "id": 791,
       "status": "pending",
       "priority": "P3",
       "desc": "[orchestrator] 컷 후속 슬라이스 — Spawner.run/RunResult 무호출(~35 LOC), ERR_BOOT_ADAPTER_UNSUPPORTED thrower 상실 enum, docs/research .../raw/ tracked 실험로그, bin/trust-path.sh 사망 의심(미검증)",
@@ -9599,7 +9599,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "792",
+      "id": 792,
       "status": "pending",
       "priority": "P2",
       "desc": "untracked 잡파일 지식화 후 삭제 — brain 회의록 4건(~3k LOC 유일본)+스크래치, orchestrator agy/grok .err·.out+pre-slim 백업+telepty-vs-tmux-posi-* 디렉토리",
@@ -9607,7 +9607,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "793",
+      "id": 793,
       "status": "done",
       "priority": "P3",
       "desc": "ecosystem.json 전파 — telepty 사본만 2026-07-26 갱신(0.6.19/0.1.14), 형제 repo 벤더 사본들 stale. devkit scripts/sync-readme-tooling.mjs로 동기화+각 repo README regen",
@@ -9615,7 +9615,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "794",
+      "id": 794,
       "status": "done",
       "priority": "P1",
       "desc": "[brain] 데이터 미축적 root cause — profiles/local 5/6 이후 빈 채 정지, brain-sync launchd exit 127, last-boot-error.json 0바이트 분단위 churn, sync-status는 synced 거짓 신호",
@@ -9623,7 +9623,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "795",
+      "id": 795,
       "status": "delegated",
       "priority": "P1",
       "desc": "[brain] 구조 개선 설계 — 캡처→축적→sync 파이프라인 재설계 (silent-failure 불가 구조, 거짓 synced 신호 제거). #794 진단 의존",
@@ -9631,7 +9631,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "796",
+      "id": 796,
       "status": "pending",
       "priority": "P2",
       "desc": "[orchestrator] reconciler HITL error-gate에 resume 액션 기본값 부재 — approve가 resume=none이라 세션이 에러 프롬프트에 방치, 수동 continue 필요",
@@ -9639,7 +9639,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "797",
+      "id": 797,
       "status": "done",
       "priority": "P1",
       "desc": "[brain] EPIPE 자기재귀 crash-handler fix — cli.ts:28-40 재진입 latch + stdio EPIPE/EBADF=transport 사망→종료 (bootstrap 실패의 never-exit과 구분). 0.3.1 후보",
@@ -9647,7 +9647,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "798",
+      "id": 798,
       "status": "done",
       "priority": "P1",
       "desc": "[#795 W1a] setup.ts 3-client 등록 via client CLI + per-client read-back(disconnected 포함) + McpConfigIO fail-closed",
@@ -9655,7 +9655,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "799",
+      "id": 799,
       "status": "done",
       "priority": "P1",
       "desc": "[#795 W1b] Config.ts 동의 진리표 10행(env는 revoke만, grant 금지) + legacy 1회 materialise + status.json 거짓 fallback 제거",
@@ -9663,7 +9663,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "800",
+      "id": 800,
       "status": "done",
       "priority": "P1",
       "desc": "[#795 W1c] AutoCaptureEngine substantive() 공유 술어 + 내부 freshness 계산(공개 노출 금지)",
@@ -9671,7 +9671,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "801",
+      "id": 801,
       "status": "done",
       "priority": "P1",
       "desc": "[telepty] 에러 사망을 TASK_COMPLETE로 오보 — API 529/400으로 죽은 세션이 \"idle after processing inject\"로 완료 신호 발화(오늘 6건). 완료 vs 에러 분류 필요",
@@ -9679,7 +9679,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "802",
+      "id": 802,
       "status": "done",
       "priority": "P1",
       "desc": "[#795 W2] doctor 2체크(등록 read-back+경로드리프트 가드 / 신선도 무조건 숫자) + Manifest 등록기록·드리프트 확장 + removeLegacyTimer(기존설치 타이머 실제 제거) + 제15조 게이트 내부준비만",
@@ -9687,7 +9687,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "803",
+      "id": 803,
       "status": "pending",
       "priority": "P3",
       "desc": "[telepty] #801 후속 — gemini 에러 마커 행 미측정(표에 없음) + CLI 리스타일 시 마커 무효화 감지 수단 부재. 재캡처 스크립트(scratchpad/capture-801-api-error.js)로 주기 검증 or 마커 self-test",
@@ -9695,7 +9695,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "804",
+      "id": 804,
       "status": "done",
       "priority": "P0",
       "desc": "[telepty] 브릿지가 WS 핸드셰이크 이전 PTY 출력을 영구 유실 — allow 직후 read-screen이 빈 화면(Linux는 거의 항상). GeekNews 런치 첫인상 직격",
@@ -9703,7 +9703,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "805",
+      "id": 805,
       "status": "done",
       "priority": "P0",
       "desc": "README 런치 하드닝 — 감사 지적 10건(Quick Start 셸 블로킹, 미존재 clean --shared, Windows BETA 미표기, Tailnet 자동탐지 허위, kitty P1 잔재, inject 행 오해, Limitations 내구성 누락, MCP/에이전트 대비 부재, read-screen 기대 갭, GIF 5.2MB 폴드 위)",
@@ -9711,7 +9711,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "806",
+      "id": 806,
       "status": "done",
       "priority": "P0",
       "desc": "[telepty SECURITY P0] loopback 무조건 신뢰 + Origin 검사 부재 → 임의 웹사이트가 사용자 AI CLI 세션에 inject 가능(drive-by). README의 auth-gated 주장도 허위. + package.json engines 누락 + 스킬 4종이 제거된 명령(tui/session start/layout) 교육",
@@ -9719,7 +9719,7 @@
       "updated_at": "2026-07-26"
     },
     {
-      "id": "807",
+      "id": 807,
       "status": "done",
       "priority": "P1",
       "desc": "[telepty#60] ready-signal 거짓 완료 → 원류 fix로 전환: session-state 분류기가 근거 없는 상태를 방출",
@@ -9727,7 +9727,7 @@
       "updated_at": "2026-09-06"
     },
     {
-      "id": "808",
+      "id": 808,
       "status": "done",
       "priority": "P3",
       "desc": "[hygiene] 죽은 워커 잔여 git worktree 12개 정리 (telepty 7 + brain 3 + orchestrator 2)",
@@ -9735,7 +9735,7 @@
       "updated_at": "2026-07-29"
     },
     {
-      "id": "809",
+      "id": 809,
       "status": "pending",
       "priority": "P3",
       "desc": "[orchestrator] session-cleanup.sh가 죽은 워커의 role-sandbox/worktree를 회수하지 않음 — 잔여물 무한 누적 (Rule 32 영구 fix)",
@@ -9743,7 +9743,7 @@
       "updated_at": "2026-07-29"
     },
     {
-      "id": "810",
+      "id": 810,
       "status": "done",
       "priority": "P1",
       "desc": "[orchestrator] dispatch-tracker AUTO_REPORT의 tests= 신호가 구조적 오탐 — node --test와 자체 run-all.sh 둘 다 못 잡음",
@@ -9751,7 +9751,7 @@
       "updated_at": "2026-07-30"
     },
     {
-      "id": "811",
+      "id": 811,
       "status": "pending",
       "priority": "P3",
       "desc": "[dispatch] verify_delivered()가 치환 전 원본 ref의 head -n1을 화면과 비교 — #690 치환 도입으로 생긴 논리적 불일치",
@@ -9759,7 +9759,7 @@
       "updated_at": "2026-07-29"
     },
     {
-      "id": "812",
+      "id": 812,
       "status": "pending",
       "priority": "P3",
       "desc": "[tests] 신규 워크트리에서 dispatch suite 3건이 조용히 실패 — gitignored dist/ 미빌드 (베이스라인 오판 함정)",
@@ -9767,7 +9767,7 @@
       "updated_at": "2026-07-29"
     },
     {
-      "id": "813",
+      "id": 813,
       "status": "pending",
       "priority": "P2",
       "desc": "[telepty] PTY 픽스처 캡처 방법론이 OSC 9 채널에 맹목 — tmux pipe-pane이 스트립, 기존 #760/#801 픽스처 전부 영향",
@@ -9775,7 +9775,7 @@
       "updated_at": "2026-07-29"
     },
     {
-      "id": "814",
+      "id": 814,
       "status": "pending",
       "priority": "P2",
       "desc": "[telepty] OSC_133_RE가 실트래픽에서 한 번도 발화한 적 없음 → #545 idleEvidenceReliable 게이트가 프로덕션 dead code",
@@ -9783,7 +9783,7 @@
       "updated_at": "2026-07-29"
     },
     {
-      "id": "815",
+      "id": 815,
       "status": "done",
       "priority": "P0",
       "desc": "[telepty SECURITY 0.7.1] 임의 로컬 프로세스가 아무 세션의 verified-sender 토큰을 탈취 가능 — /api/sessions/register가 재등록 시 토큰을 무인증 반환",
@@ -9791,7 +9791,7 @@
       "updated_at": "2026-07-30"
     },
     {
-      "id": "816",
+      "id": 816,
       "status": "pending",
       "priority": "P1",
       "desc": "[telepty] per-dispatch 자격증명을 실행 중인 워커에 전달할 소유자-인증 제어 채널 부재 — #807 Stage B의 A1 증명이 이것에 의존",
@@ -9799,7 +9799,7 @@
       "updated_at": "2026-07-29"
     },
     {
-      "id": "817",
+      "id": 817,
       "status": "pending",
       "priority": "P1",
       "desc": "[telepty] 크로스머신 inject에 발신자 신원이 없음 — --from이 SSH로 평문 전달되고 수신 데몬이 origin:trusted-local 스탬프",
@@ -9807,7 +9807,7 @@
       "updated_at": "2026-07-29"
     },
     {
-      "id": "818",
+      "id": 818,
       "status": "pending",
       "priority": "P2",
       "desc": "[telepty] #815 잔여 — 미자격 세션의 최초 owner claim 레이스(런처 보유 사전 비밀 필요)",
@@ -9815,7 +9815,7 @@
       "updated_at": "2026-07-29"
     },
     {
-      "id": "819",
+      "id": 819,
       "status": "pending",
       "priority": "P3",
       "desc": "[orchestrator] session-reconciler.sh:353 ESCALATE 분기의 [ ] && [ ] && cmd 체인 errexit 위험 — :315 NOOP 분기에서 이미 고친 것과 동일 결함",
@@ -9823,7 +9823,7 @@
       "updated_at": "2026-07-30"
     },
     {
-      "id": "820",
+      "id": 820,
       "status": "done",
       "priority": "P0",
       "desc": "[telepty SECURITY] 무인증 로컬 프로세스가 아무 세션의 PTY 스트림을 읽고 쓸 수 있음 — viewer WS 경로는 #815/#806가 닫지 않음",
@@ -9831,7 +9831,7 @@
       "updated_at": "2026-08-15"
     },
     {
-      "id": "821",
+      "id": 821,
       "status": "pending",
       "priority": "P2",
       "desc": "[telepty] bearer가 자식 env에 spawn-time으로 주입돼 same-uid 프로세스에 노출 — macOS도 노출됨(이전 판단 정정)",
@@ -9839,7 +9839,7 @@
       "updated_at": "2026-07-30"
     },
     {
-      "id": "822",
+      "id": 822,
       "status": "pending",
       "priority": "P2",
       "desc": "[telepty] npm run test:ci가 로컬에서 종료 불가 — daemon.js를 require하는 모든 테스트 파일이 리스너/인터벌을 상속해 never-exit",
@@ -9847,7 +9847,7 @@
       "updated_at": "2026-08-01"
     },
     {
-      "id": "823",
+      "id": 823,
       "status": "done",
       "priority": "P0",
       "desc": "[telepty SECURITY 라이브] tailnet의 모든 기기가 무인증으로 이 데몬을 조작 가능 — 빈 peer allowlist가 fail-open",
@@ -9855,7 +9855,7 @@
       "updated_at": "2026-08-15"
     },
     {
-      "id": "824",
+      "id": 824,
       "status": "done",
       "priority": "P0",
       "desc": "[orchestrator] telepty 데몬 호출 3곳이 토큰 미전송 — #820 Stage 1 랜딩 시 401. 특히 dispatch-tracker가 401을 endpoint_absent로 조용히 오분류",
@@ -9863,7 +9863,7 @@
       "updated_at": "2026-08-15"
     },
     {
-      "id": "825",
+      "id": 825,
       "status": "done",
       "priority": "P0",
       "desc": "[aterm] telepty 호출 3파일 전부 토큰 0개 — #820 Stage 1에 GUI 세션목록·register·bus 이벤트스트림 동시 사망",
@@ -9871,7 +9871,7 @@
       "updated_at": "2026-07-30"
     },
     {
-      "id": "826",
+      "id": 826,
       "status": "done",
       "priority": "P1",
       "desc": "[telepty] WS viewer input→inject가 auditAppend와 #533 peer-lane 하드블록을 우회 — #820 수정이 '거짓 확신'을 만드는 구조",
@@ -9879,7 +9879,7 @@
       "updated_at": "2026-08-15"
     },
     {
-      "id": "827",
+      "id": 827,
       "status": "pending",
       "priority": "P2",
       "desc": "[orchestrator] 기존 스위트 실패 9~10건 — boot-adapter self-test 8건이 존재하지 않는 함수(verifyBootSelfTest)를 호출",
@@ -9887,7 +9887,7 @@
       "updated_at": "2026-08-01"
     },
     {
-      "id": "828",
+      "id": 828,
       "status": "pending",
       "priority": "P1",
       "desc": "[telepty/프로세스] --test-force-exit가 테스트 카운트를 조용히 절단 — 'fail 0'인데 일부 테스트가 아예 실행 안 됨",
@@ -9898,7 +9898,7 @@
       "updated_at": "2026-08-01"
     },
     {
-      "id": "829",
+      "id": 829,
       "status": "done",
       "priority": "P2",
       "desc": "[telepty] submit-busy-dispatch-694 arm (b)가 95ee69b에서 pre-existing red, 소유자 없음",
@@ -9906,7 +9906,7 @@
       "updated_at": "2026-08-01"
     },
     {
-      "id": "830",
+      "id": 830,
       "status": "done",
       "priority": "P2",
       "desc": "[telepty] bridge-preconnect-output-768이 부하 스윕에서 22회 중 1회 실패 — 원인 미귀속",
@@ -9914,7 +9914,7 @@
       "updated_at": "2026-08-01"
     },
     {
-      "id": "831",
+      "id": 831,
       "status": "done",
       "priority": "P1",
       "desc": "[telepty] 오퍼레이터가 죽인 세션(DELETE)의 죽음이 완전히 무음 — §A2 위반, Stage A 헤드라인 속성이 거짓이 되는 경로",
@@ -9922,7 +9922,7 @@
       "updated_at": "2026-08-01"
     },
     {
-      "id": "832",
+      "id": 832,
       "status": "done",
       "priority": "P1",
       "desc": "[telepty] #801 error marker가 계산된 뒤 조용히 버려짐 — Stage A가 '측정된 사실'까지 지워 관측 레인 하나가 소실",
@@ -9930,7 +9930,7 @@
       "updated_at": "2026-08-01"
     },
     {
-      "id": "833",
+      "id": 833,
       "status": "done",
       "priority": "P0",
       "desc": "[telepty] test-support/setup-env.js가 HOME을 격리하지 않아 유닛 테스트가 실제 ~/.telepty 세션을 복원·감독함 (프로덕션 안전 위험)",
@@ -9938,7 +9938,7 @@
       "updated_at": "2026-08-01"
     },
     {
-      "id": "834",
+      "id": 834,
       "status": "pending",
       "priority": "P2",
       "desc": "[telepty] flagless로도 결과가 유실되는 두번째 starvation 기전 — 이벤트 루프 포화로 리포터가 flush 못함",
@@ -9946,7 +9946,7 @@
       "updated_at": "2026-08-01"
     },
     {
-      "id": "835",
+      "id": 835,
       "status": "done",
       "priority": "P0",
       "desc": "[telepty+orchestrator] 인증 실패가 라이브 세션을 철거하고 성공을 보고하는 연쇄 — #820/#823 출하 차단",
@@ -9954,7 +9954,7 @@
       "updated_at": "2026-08-15"
     },
     {
-      "id": "836",
+      "id": 836,
       "status": "pending",
       "priority": "P2",
       "desc": "[orchestrator] 존재하지 않는 세션에 대해 게이트/에스컬레이션이 열림 — ask.sh CONFLICT + reconciler HITL 게이트 2종",
@@ -9962,7 +9962,7 @@
       "updated_at": "2026-08-02"
     },
     {
-      "id": "837",
+      "id": 837,
       "status": "done",
       "priority": "P1",
       "desc": "[telepty] 도달 불가 peer 1개가 로컬 데몬에 대한 모든 쓰기 명령을 죽임 — 'fetch failed'가 로컬 데몬 다운과 구분 불가",
@@ -9971,7 +9971,7 @@
       "track": "tp1"
     },
     {
-      "id": "838",
+      "id": 838,
       "status": "done",
       "priority": "P1",
       "desc": "[orchestrator] Rule 38 코드화 — 작업에 관한 기록도 측정 범위를 넘어 주장하지 않는다",
@@ -9979,7 +9979,7 @@
       "updated_at": "2026-08-15"
     },
     {
-      "id": "839",
+      "id": 839,
       "status": "done",
       "priority": "P1",
       "desc": "[telepty] auth.js 첫 실행 config 쓰기가 비원자적 — 부분 기록을 읽은 동시 프로세스가 fail-closed로 크래시",
@@ -9987,7 +9987,7 @@
       "updated_at": "2026-08-15"
     },
     {
-      "id": "840",
+      "id": 840,
       "status": "done",
       "priority": "P1",
       "desc": "[telepty] telepty inject가 전달 실패에도 exit 0 — 종료코드로 성공/실패 구분 불가",
@@ -9996,7 +9996,7 @@
       "track": "tp1"
     },
     {
-      "id": "841",
+      "id": 841,
       "status": "pending",
       "priority": "P2",
       "kind": "runtime-addition",
@@ -10007,7 +10007,7 @@
       "updated_at": "2026-08-15"
     },
     {
-      "id": "842",
+      "id": 842,
       "status": "done",
       "priority": "P0",
       "desc": "[telepty 0.8.0] 릴리스 전 다중 리뷰 — 5렌즈 적대(claude) + 설계자 자기검증(s820) + 교차모델 독립(codex gpt-5.6-sol)",
@@ -10015,7 +10015,7 @@
       "updated_at": "2026-08-15"
     },
     {
-      "id": "843",
+      "id": 843,
       "status": "done",
       "priority": "P0",
       "desc": "[telepty 0.8.0 BLOCKER A+B+C] 라이프사이클 어휘가 측정 이상 주장 + spawned viewer 쓰기가 #826 우회 + 데몬 부팅이 env 토큰보다 먼저 죽음",
@@ -10023,7 +10023,7 @@
       "updated_at": "2026-08-15"
     },
     {
-      "id": "844",
+      "id": 844,
       "status": "done",
       "priority": "P0",
       "desc": "[telepty 0.8.0 BLOCKER D + s820 F1/F3] 릴리스 아티팩트가 0.7.1로 자기식별 + resolveTargetToken이 마스터 토큰 평문 유출 + CHANGELOG 누락",
@@ -10031,7 +10031,7 @@
       "updated_at": "2026-08-15"
     },
     {
-      "id": "845",
+      "id": 845,
       "status": "pending",
       "priority": "P2",
       "desc": "[telepty] tracked-injection ledger가 무한 성장 — 레코드 수 축이 무경계, 관측마다 전체 파일 재작성 + 이중 fsync",
@@ -12008,7 +12008,7 @@
       "note": "[2026-08-24T22:32:32+09:00] Found by ps981 and PROVEN rather than suspected: they re-rendered at ef0d422 with ZERO changes and reproduced the IDENTICAL diffs (nurse 16.5209, doctor 11.4569, secret_agent 5.0932). That is a GLOBAL shading/saturation shift, so somebody changed lighting or materials and never re-ran BuildPortraits. The lighting rework (#939) is the obvious candidate but was not confirmed as the cause. CONSEQUENCE: the job board renders pre-rework art while the world renders post-rework, so the portraits and the game no longer agree about what these characters look like. Note cv985's new 261px preview is a LIVE CAMERA ON THE PREFAB and is therefore correct; it is the 29px board row, which uses the committed PNGs, that is stale - so the two surfaces showing the same role currently disagree. ps981 REVERTED the re-renders out of their commits under Rule 29 and reported instead of fixing, which is right: a twelve-portrait re-render is a visible art change that should land deliberately and be looked at, not arrive inside a skin ticket. WHOEVER TAKES IT: BuildPortraits renders to a RenderTexture and MUST run with a graphics device - it was once run under -nographics and committed twelve flat blanks over good ones, which the whole suite passed because nothing asserted an image has pixels. #940's non-blank assertion now catches that, but the graphics-device requirement stands. || [2026-08-26T19:03:11] Delegated to cv985, parallel wave off main 190c3fd. Standing rule for the wave: workers do NOT commit Clinic.unity or any regenerated scene - regenerate locally to MEASURE and discard. That removes the conflict class that forced --ours twice in #990. || REPORT 2026-08-26T19:34:45 (cv985, fix/989-stale-portraits @ main a266440). MY CANDIDATE WAS DISCONFIRMED, NOT MERELY UNCONFIRMED, AND THAT IS THE MORE USEFUL RESULT. I said \"#939 lighting rework is the obvious candidate\". Right ticket, WRONG COMMIT AND WRONG MECHANISM. The ambient change 38726b7 cannot be it: RenderPortrait never sets ambient, RenderSettings.ambientLight is PER-SCENE, and BuildPortraits never opens a scene. Probed at the moment of render: scene= ambientMode=Skybox ambient=(0.212,0.227,0.259) lum=0.226 = Unity default; AmbientBlue has been 0.550 -> 0.132 -> 0.445 in its life and NONE of them is 0.226. A disconfirmed candidate with a mechanism stops the next person re-testing it; an unconfirmed one does not. || ACTUAL CAUSE: SSAO - c78dca1, the OTHER #939 commit, which put ScreenSpaceAmbientOcclusion on PC_Renderer.asset at Intensity 8. One flipped bit, everything else identical: committed-vs-rerender with SSAO ON = MAE 28.356 / dLum -24.39; with SSAO OFF = MAE 8.050 / dLum +4.00. Chronology agrees (portraits rendered b2a0687 03:49, SSAO landed c78dca1 12:30). THE STRONGEST ARGUMENT IS A CONTROL THAT FLIPS THE OTHER WAY: role-secret_agent_limited, the one image rendered on the current tree with SSAO already on, agrees with SSAO-ON (6.8) and breaks with SSAO-OFF (30.7) - the exact inverse of the other twelve. A lurking third variable does not produce both directions from one run. MY TICKET WORDING ALSO WRONG: I called it a \"shading/saturation shift\"; measured dSat +0.04 FLAT - it is LUMINANCE (dLum -11.1..-37.8). || THIRTEEN STALE, NOT TWELVE, WITH TWO CAUSES: the twelve are stale by SSAO + #982 geometry; role-secret_agent_limited is stale by GEOMETRY ALONE (rendered at 5cb1485, prefab rebuilt at 51cdef7 after). Separated by an alpha-coverage argument - SSAO shades, it does not change silhouette - and the geometry component is a 0.8-3.4% silhouette difference, exactly the MAE 4-9 residual left when SSAO is off. Nobody had noticed the thirteenth. || SHIP DECISION: SSAO-ON, judged at 29 px rather than at 256, because it matches the shipping renderer and the 29px board row now AGREES with the 261px live preview (#985) - those two surfaces disagreeing WAS the ticket. Mean luminance 150.8->127.5, mean internal contrast 75.0->72.7 (-3%), every role still identifiable. Two lose real contrast (psychologist 62.5->50.5, security 67.1->48.2); neither fails to read, so the portrait rig lights were deliberately NOT retuned - that is an art decision and should arrive as one. || GUARD: PortraitStamp + PortraitStaleTest, runs under -nographics (a guard needing a GPU would sit outside the sweep and would not have caught this either). Verified in BOTH DIRECTIONS on both input classes - clean 26/26 exit 0; SSAO flipped off -> exit 1 naming PC_Renderer.asset; a prefab touched -> exit 1 naming RoleAvatar_Nurse.prefab - AND THEN ON THE REAL THING: applied #982 incoming role prefabs, got exit 1, 25/26, 13 STALE lines naming every prefab, restored. It worked on its first genuine occasion, not only on synthetic negatives. CEILING NAMED IN THE FILE: covers every RoleAvatar_*.prefab (discovered not enumerated) + the URP renderer asset; does NOT cover material edits, shader edits, colour space, or RenderPortrait own constants. Hashing ArtP6Roles.cs would cover the constants but flag a COMMENT EDIT as stale art, training reflexive stamp regeneration - and a guard nobody believes is worse than none. || ORDERING RULED 2026-08-26T19:34:45: #982 merges FIRST, then cv985 rebases, re-renders (one command: Unity -batchmode -executeMethod ArtP6Roles.BuildPortraitsMenu WITH graphics per #940, which rewrites the stamp itself) and merges. main never carries knowingly-stale art, and the guard has already been exercised on its genuine first occasion so it does not need main to go red to prove it. Snyk flagged cv985 own MD5 (CWE-916) in their first draft; they switched to SHA-256 and rescanned clean. SIDE EFFECT: #985 Tab browse control, listed as never-executed in that report, is now LIVE and exercised because secret_agent has two appearances - SkinViewTest 69 -> 71. || RE-RENDER RESULT 2026-08-26T19:49:43: ZERO PIXELS CHANGED. Rebased onto b436629, re-rendered with a graphics device, guard went red on real main exactly as predicted (exit 1, 25/26, 13 STALE lines) - and the re-render then produced art BYTE-IDENTICAL to what was already committed (MAE 0.000, dLum +0.00, alpha same 100.00% across all 13). Commit 35f0372 therefore contains NO PNG AT ALL, only the stamp whose recorded prefab hashes moved. WHY: #982 fixed the ANKLE and RenderPortrait frames a head-and-shoulders bust (focus y+0.60, 36 deg at 1.25 m) - THE FEET ARE OUT OF FRAME, and an ankle fix cannot change a portrait that does not show ankles. THE GUARD OVER-REPORTED BY DESIGN, NOT BY DEFECT, and cv985 framed the trade correctly: it fingerprints INPUTS, so it cannot know whether an input change reaches the output without rendering - so it asks. Cost of a conservative miss: one render. Cost of the opposite bias: #989 itself, which sat green for three days. First concrete instance of it choosing the safe direction. Double-run per #940: r2 and r3 byte-identical across all 13; r1 differed on ONE image by 2 pixels of 65536, max channel delta 1 - the cold-shader-cache artefact, measured rather than assumed, sub-perceptual. Zero blank-guard fires. || MERGED 2026-08-26T19:55:37 at fe849cd, orchestrator-verified: 21 files, scene delta EMPTY against the diff per #1007. cv985 also established a check worth reusing: main had moved 66db679 -> 3a6660e under their measurement, and THAT DELTA WAS EXACTLY tools/unity-run.sh, a shell script Unity cannot see - so their 42-suite 2846/2846 stood without a re-run. A measurement surviving a main move BECAUSE OF WHAT MOVED is a different claim from one that was simply not re-checked, and only the first is worth anything."
     },
     {
-      "id": "990",
+      "id": 990,
       "priority": "P0",
       "status": "done",
       "track": "ah-merge-990",
@@ -12017,7 +12017,7 @@
       "updated_at": "2026-08-26T14:18:48"
     },
     {
-      "id": "991",
+      "id": 991,
       "priority": "P0",
       "status": "done",
       "track": "ah-regen-991",
@@ -12026,7 +12026,7 @@
       "updated_at": "2026-08-26T19:05:25"
     },
     {
-      "id": "992",
+      "id": 992,
       "priority": "P1",
       "status": "pending",
       "track": "telepty-registry",
@@ -12035,7 +12035,7 @@
       "updated_at": "2026-08-26T14:03:47"
     },
     {
-      "id": "993",
+      "id": 993,
       "priority": "P1",
       "status": "pending",
       "track": "ah-suite-hygiene",
@@ -12044,7 +12044,7 @@
       "updated_at": "2026-09-05"
     },
     {
-      "id": "994",
+      "id": 994,
       "priority": "P1",
       "status": "done",
       "track": "ah-build-chain",
@@ -12053,7 +12053,7 @@
       "updated_at": "2026-09-05"
     },
     {
-      "id": "995",
+      "id": 995,
       "priority": "P2",
       "status": "pending",
       "track": "ah-build-chain",
@@ -12062,7 +12062,7 @@
       "updated_at": "2026-09-05"
     },
     {
-      "id": "996",
+      "id": 996,
       "priority": "P1",
       "status": "pending",
       "track": "telepty-daemon",
@@ -12071,7 +12071,7 @@
       "updated_at": "2026-08-26T19:03:11"
     },
     {
-      "id": "997",
+      "id": 997,
       "priority": "P0",
       "status": "done",
       "track": "ah-build-997",
@@ -12080,7 +12080,7 @@
       "updated_at": "2026-08-26T19:27:41"
     },
     {
-      "id": "998",
+      "id": 998,
       "priority": "P0",
       "status": "done",
       "track": "ah-cctv-998",
@@ -12089,7 +12089,7 @@
       "updated_at": "2026-09-06"
     },
     {
-      "id": "999",
+      "id": 999,
       "priority": "P0",
       "status": "done",
       "track": "ah-photo-999",
@@ -12098,7 +12098,7 @@
       "updated_at": "2026-09-06"
     },
     {
-      "id": "1000",
+      "id": 1000,
       "priority": "P1",
       "status": "pending",
       "track": "ah-hud-parity",
@@ -12107,7 +12107,7 @@
       "updated_at": "2026-09-06"
     },
     {
-      "id": "1001",
+      "id": 1001,
       "priority": "P1",
       "status": "done",
       "track": "ah-playtest-handoff",
@@ -12116,7 +12116,7 @@
       "updated_at": "2026-08-26T19:14:40"
     },
     {
-      "id": "1002",
+      "id": 1002,
       "priority": "P1",
       "status": "done",
       "track": "ah-rooms-1002",
@@ -12125,7 +12125,7 @@
       "updated_at": "2026-08-26T20:24:30"
     },
     {
-      "id": "1003",
+      "id": 1003,
       "priority": "P1",
       "status": "done",
       "track": "ah-instruments",
@@ -12134,7 +12134,7 @@
       "updated_at": "2026-09-06"
     },
     {
-      "id": "1004",
+      "id": 1004,
       "priority": "P1",
       "status": "done",
       "track": "ah-instruments",
@@ -12143,7 +12143,7 @@
       "updated_at": "2026-08-26T20:14:19"
     },
     {
-      "id": "1005",
+      "id": 1005,
       "priority": "P3",
       "status": "pending",
       "track": "ah-cleanup",
@@ -12152,7 +12152,7 @@
       "updated_at": "2026-08-26T19:31:31"
     },
     {
-      "id": "1006",
+      "id": 1006,
       "priority": "P2",
       "status": "done",
       "track": "ah-art-seams",
@@ -12161,7 +12161,7 @@
       "updated_at": "2026-09-06"
     },
     {
-      "id": "1007",
+      "id": 1007,
       "priority": "P1",
       "status": "done",
       "track": "ah-wave-rules",
@@ -12170,7 +12170,7 @@
       "updated_at": "2026-08-26T19:38:22"
     },
     {
-      "id": "1008",
+      "id": 1008,
       "priority": "P1",
       "status": "done",
       "track": "ah-empty-hand",
@@ -12179,7 +12179,7 @@
       "updated_at": "2026-09-06"
     },
     {
-      "id": "1009",
+      "id": 1009,
       "priority": "P1",
       "status": "pending",
       "track": "ah-test-discipline",
@@ -12188,7 +12188,7 @@
       "updated_at": "2026-08-26T19:39:52"
     },
     {
-      "id": "1010",
+      "id": 1010,
       "priority": "P1",
       "status": "done",
       "track": "ah-build-infra",
@@ -12197,7 +12197,7 @@
       "updated_at": "2026-08-26T19:52:54"
     },
     {
-      "id": "1011",
+      "id": 1011,
       "priority": "P1",
       "status": "done",
       "track": "ah-design-ruling",
@@ -12206,7 +12206,7 @@
       "updated_at": "2026-09-06"
     },
     {
-      "id": "1012",
+      "id": 1012,
       "priority": "P2",
       "status": "done",
       "track": "ah-rooms-1012",
@@ -12215,7 +12215,7 @@
       "updated_at": "2026-08-26T20:24:30"
     },
     {
-      "id": "1013",
+      "id": 1013,
       "priority": "P1",
       "status": "done",
       "track": "ah-test-discipline",
@@ -12224,7 +12224,7 @@
       "updated_at": "2026-08-26T19:46:36"
     },
     {
-      "id": "1014",
+      "id": 1014,
       "priority": "P1",
       "status": "done",
       "track": "ah-test-discipline",
@@ -12233,7 +12233,7 @@
       "updated_at": "2026-08-26T19:49:43"
     },
     {
-      "id": "1015",
+      "id": 1015,
       "priority": "P2",
       "status": "done",
       "track": "ah-test-discipline",
@@ -12242,7 +12242,7 @@
       "updated_at": "2026-08-26T19:52:54"
     },
     {
-      "id": "1016",
+      "id": 1016,
       "priority": "P1",
       "status": "done",
       "track": "ah-build-infra",
@@ -12251,7 +12251,7 @@
       "updated_at": "2026-08-26T20:07:39"
     },
     {
-      "id": "1017",
+      "id": 1017,
       "priority": "P1",
       "status": "done",
       "track": "ah-test-discipline",
@@ -12260,7 +12260,7 @@
       "updated_at": "2026-08-26T20:07:39"
     },
     {
-      "id": "1019",
+      "id": 1019,
       "priority": "P1",
       "status": "delegated",
       "track": "ah-build-infra",
@@ -12269,7 +12269,7 @@
       "updated_at": "2026-09-05"
     },
     {
-      "id": "1018",
+      "id": 1018,
       "priority": "P0",
       "status": "done",
       "track": "ah-checkin",
@@ -12278,7 +12278,7 @@
       "updated_at": "2026-08-26T21:09:07"
     },
     {
-      "id": "1021",
+      "id": 1021,
       "priority": "P0",
       "status": "done",
       "track": "ah-playtest-handoff",
@@ -12287,7 +12287,7 @@
       "updated_at": "2026-08-26T21:09:07"
     },
     {
-      "id": "1020",
+      "id": 1020,
       "priority": "P1",
       "status": "done",
       "track": "ah-test-discipline",
@@ -12296,7 +12296,7 @@
       "updated_at": "2026-08-26T20:10:07"
     },
     {
-      "id": "1022",
+      "id": 1022,
       "priority": "P1",
       "status": "done",
       "track": "ah-test-discipline",
@@ -12305,7 +12305,7 @@
       "updated_at": "2026-08-26T20:11:26"
     },
     {
-      "id": "1023",
+      "id": 1023,
       "priority": "P0",
       "status": "done",
       "track": "ah-checkin",
@@ -12314,7 +12314,7 @@
       "updated_at": "2026-08-26T21:20:41"
     },
     {
-      "id": "1024",
+      "id": 1024,
       "priority": "P2",
       "status": "done",
       "track": "ah-rooms-props",
@@ -12323,7 +12323,7 @@
       "updated_at": "2026-08-26T21:20:41"
     },
     {
-      "id": "1025",
+      "id": 1025,
       "priority": "P2",
       "status": "done",
       "track": "ah-game-feel",
@@ -12332,7 +12332,7 @@
       "updated_at": "2026-08-30"
     },
     {
-      "id": "1026",
+      "id": 1026,
       "priority": "P1",
       "status": "done",
       "track": "ah-test-discipline",
@@ -12341,7 +12341,7 @@
       "updated_at": "2026-08-26T20:34:59"
     },
     {
-      "id": "1027",
+      "id": 1027,
       "priority": "P1",
       "status": "done",
       "track": "ah-test-discipline",
@@ -12350,7 +12350,7 @@
       "updated_at": "2026-08-26T21:06:46"
     },
     {
-      "id": "1031",
+      "id": 1031,
       "priority": "P2",
       "status": "done",
       "track": "ah-input",
@@ -12359,7 +12359,7 @@
       "updated_at": "2026-09-06"
     },
     {
-      "id": "1030",
+      "id": 1030,
       "priority": "P1",
       "status": "done",
       "track": "ah-wave-rules",
@@ -12368,7 +12368,7 @@
       "updated_at": "2026-08-26T21:16:18"
     },
     {
-      "id": "1032",
+      "id": 1032,
       "priority": "P1",
       "status": "done",
       "track": "ah-test-discipline",
@@ -12377,7 +12377,7 @@
       "updated_at": "2026-08-26T21:20:41"
     },
     {
-      "id": "1033",
+      "id": 1033,
       "priority": "P1",
       "status": "done",
       "track": "ah-ambient-npc",
@@ -12386,7 +12386,7 @@
       "updated_at": "2026-08-30"
     },
     {
-      "id": "1034",
+      "id": 1034,
       "priority": "P2",
       "status": "done",
       "track": "ah-build-infra",
@@ -12395,7 +12395,7 @@
       "updated_at": "2026-09-05"
     },
     {
-      "id": "1036",
+      "id": 1036,
       "priority": "P0",
       "status": "done",
       "track": "ah-viewmodel",
@@ -12404,7 +12404,7 @@
       "updated_at": "2026-08-30"
     },
     {
-      "id": "1037",
+      "id": 1037,
       "priority": "P2",
       "status": "done",
       "track": "ah-instruments",
@@ -12413,7 +12413,7 @@
       "updated_at": "2026-09-06"
     },
     {
-      "id": "1038",
+      "id": 1038,
       "priority": "P1",
       "status": "done",
       "track": "ah-test-discipline",
@@ -12422,7 +12422,7 @@
       "updated_at": "2026-08-26T21:50:28"
     },
     {
-      "id": "1039",
+      "id": 1039,
       "priority": "P1",
       "status": "done",
       "track": "ah-test-discipline",
@@ -12431,7 +12431,7 @@
       "updated_at": "2026-08-26T21:51:43"
     },
     {
-      "id": "1040",
+      "id": 1040,
       "priority": "P0",
       "status": "done",
       "track": "ah-save",
@@ -12440,7 +12440,7 @@
       "updated_at": "2026-08-26T22:04:57"
     },
     {
-      "id": "1041",
+      "id": 1041,
       "priority": "P1",
       "status": "done",
       "track": "ah-test-discipline",
@@ -12449,7 +12449,7 @@
       "updated_at": "2026-08-26T21:55:56"
     },
     {
-      "id": "1042",
+      "id": 1042,
       "priority": "P1",
       "status": "done",
       "track": "ah-test-discipline",
@@ -12458,7 +12458,7 @@
       "updated_at": "2026-08-26T22:02:09"
     },
     {
-      "id": "1043",
+      "id": 1043,
       "priority": "P2",
       "status": "done",
       "track": "ah-test-discipline",
@@ -12467,7 +12467,7 @@
       "updated_at": "2026-08-26T22:04:57"
     },
     {
-      "id": "1044",
+      "id": 1044,
       "priority": "P2",
       "status": "done",
       "track": "ah-test-discipline",
@@ -12476,7 +12476,7 @@
       "updated_at": "2026-08-26T22:06:30"
     },
     {
-      "id": "1045",
+      "id": 1045,
       "priority": "P1",
       "status": "done",
       "track": "ah-test-discipline",
@@ -12485,7 +12485,7 @@
       "updated_at": "2026-08-26T22:05:33"
     },
     {
-      "id": "1046",
+      "id": 1046,
       "priority": "P2",
       "status": "done",
       "track": "ah-rooms-props",
@@ -12494,7 +12494,7 @@
       "updated_at": "2026-09-06"
     },
     {
-      "id": "1048",
+      "id": 1048,
       "priority": "P0",
       "status": "done",
       "track": "ah-menu-safety",
@@ -12503,7 +12503,7 @@
       "updated_at": "2026-09-06"
     },
     {
-      "id": "1049",
+      "id": 1049,
       "priority": "P1",
       "status": "done",
       "track": "ah-test-discipline",
@@ -12512,7 +12512,7 @@
       "updated_at": "2026-08-27T01:43:18"
     },
     {
-      "id": "1050",
+      "id": 1050,
       "priority": "P1",
       "status": "done",
       "track": "ah-test-discipline",
@@ -12521,7 +12521,7 @@
       "updated_at": "2026-08-27T01:46:50"
     },
     {
-      "id": "1051",
+      "id": 1051,
       "priority": "P1",
       "status": "done",
       "track": "ah-test-discipline",
@@ -12530,7 +12530,7 @@
       "updated_at": "2026-09-05"
     },
     {
-      "id": "1052",
+      "id": 1052,
       "priority": "P1",
       "status": "done",
       "track": "ah-test-discipline",
