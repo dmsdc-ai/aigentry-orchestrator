@@ -13017,12 +13017,12 @@
     },
     {
       "id": 1112,
-      "status": "delegated",
+      "status": "done",
       "track": "orchestrator",
       "priority": "P3",
       "updated_at": "2026-09-06",
       "desc": "[tests/dispatch] Fixture hygiene after #1105: guards that seed sids outside lib.sh's default `telepty list` stub (T62, T63, T84, T90, T103 … — measure the full set with grep) may now be exercising the session-gone arm instead of the path they name and still pass. Audit each: assert which arm ran (observation kind) and add t_list_sessions where the guard means 'listed'. Also decide whether the session_gone HOLD should be written to state/dispatch/observations.log.",
-      "note": "From mr1105b REPORT (unmeasured list). Do not chase T47/T117 here — that is #1113. || 2026-09-06 (mr1113): T16_no_cwd_contamination.sh and T48_codex_gemini_role_receipt_live.sh assert model/effort defaults and inherit the operator's AIGENTRY_*_(MODEL|EFFORT) — both live-gated, would fail the way T117 did once the live gate is on; apply the T117 sed -E scrub. | dispatched 2026-09-06T08:33:29Z sid=mr1112-mr1112-fixture-hygiene ref=2026-09-06-mr1112-fixture-hygiene.md track=mr1112 cli=claude/claude-opus-5[1m] by=explicit"
+      "note": "From mr1105b REPORT (unmeasured list). Do not chase T47/T117 here — that is #1113. || 2026-09-06 (mr1113): T16_no_cwd_contamination.sh and T48_codex_gemini_role_receipt_live.sh assert model/effort defaults and inherit the operator's AIGENTRY_*_(MODEL|EFFORT) — both live-gated, would fail the way T117 did once the live gate is on; apply the T117 sed -E scrub. | dispatched 2026-09-06T08:33:29Z sid=mr1112-mr1112-fixture-hygiene ref=2026-09-06-mr1112-fixture-hygiene.md track=mr1112 cli=claude/claude-opus-5[1m] by=explicit || REPORT 2026-09-06 (mr1112, shared/1b248082…): b4597bc merged --no-ff. (1) 135/135 guards swept under a DISPATCH_REGISTRY_PY logging shim in run-all posture: 24 reach the tracker check loop, taken arm == intended arm for all 24, ZERO session_absent/session_gone; positive control sid-Z (2 ticks) fires both → the zero is a measurement. mr1105b's suspects each clean (T62/T63 never tick, T84 rewrites STUB_LIST_FILE per arm, T90 is reconciler, T103 w-1 never due); the 15 'session_absent_observed' hits are cleanup/cli.ts:471, a different kind. FIX SET EMPTY. Shim artifact: T105/T111/T114/T121/T125 fail under the shim by design, pass without. (2) T16+T48 scrubbed with CLI-keyed AIGENTRY_(CLAUDE|CODEX|GEMINI|GROK)_(MODEL|EFFORT); T16 proof: boot-prepare writes '--model bogus --effort low' vs clean '--model claude-opus-5 --effort xhigh'; blanket regex would eat AIGENTRY_T48_GEMINI_MODEL. T117 untouched. (3) observations.log: no writer (guards-only reader; alerts.log+inject carry the HOLD). (4) run-all 135/135 (3 skips), npm test 326/326, Snyk 15 LOW / 0 MED. UNMEASURED: live gate, real gone session, live reconciler tick, cleanup's absent-observed mechanism. Session reaped."
     },
     {
       "id": 1113,
