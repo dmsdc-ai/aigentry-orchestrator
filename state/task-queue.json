@@ -12990,12 +12990,12 @@
     },
     {
       "id": 1109,
-      "status": "delegated",
+      "status": "done",
       "track": "orchestrator",
       "priority": "P2",
       "updated_at": "2026-09-06",
       "desc": "[tests] T140 model-routing cap tests read the ambient AIGENTRY_CLI_CAP_CODEX (and by construction any AIGENTRY_CLI_CAP_<CLI>): with AIGENTRY_CLI_CAP_CODEX=0 in ~/.env (set 2026-09-06 during the codex limit) 6 of 318 fail at main a01760a ('+ claude - codex'). #1098 made AIGENTRY_CODEX_EFFORT hermetic; do the same for every AIGENTRY_CLI_CAP_* in tests/dispatch/T140-*.test.ts (and any sibling reading cliCap): clear/pin the env inside the test, assert the default table, and add one case for the 0 = 'not a candidate' knob.",
-      "note": "Found by mr1105b at Phase 1 (2026-09-06, HOLD shared/a01617ae…). Not fixed there (Rule 29). Dispatch when no other test-file coder is live in this repo. | dispatched 2026-09-06T05:47:06Z sid=mr1109-mr1109-t140-hermetic ref=2026-09-06-mr1109-t140-hermetic.md track=mr1109 cli=claude/claude-opus-5[1m] by=explicit || HOLD 2026-09-06 (mr1109, shared/e02680a0…): strip point fixtures.ts:53 (...process.env spread); broad strip of all AIGENTRY_* approved (59 knobs read by src/+bin/); claude cap=0 case already exists (T140:191) → count stays 321; baseline 321/315/6 confirmed."
+      "note": "Found by mr1105b at Phase 1 (2026-09-06, HOLD shared/a01617ae…). Not fixed there (Rule 29). Dispatch when no other test-file coder is live in this repo. | dispatched 2026-09-06T05:47:06Z sid=mr1109-mr1109-t140-hermetic ref=2026-09-06-mr1109-t140-hermetic.md track=mr1109 cli=claude/claude-opus-5[1m] by=explicit || HOLD 2026-09-06 (mr1109, shared/e02680a0…): strip point fixtures.ts:53 (...process.env spread); broad strip of all AIGENTRY_* approved (59 knobs read by src/+bin/); claude cap=0 case already exists (T140:191) → count stays 321; baseline 321/315/6 confirmed. || REPORT 2026-09-06 (mr1109, shared/3caf2b9d…): commit 6e77b05 merged --no-ff. model-router-fixtures.ts:53 spreads process.env filtered of every AIGENTRY_* (+3/-1); T141's local #1098 wrapper deleted as dead (-10; negative control: strip reverted → T141 2 fail on ambient CODEX_EFFORT, restored → 16/16). 321/315/6 → 321/321/0 under four env shapes (cap 0 / cap 7 + claude 0 / cap unset / effort medium + bogus workspace host). Snyk 15 LOW / 0 MED identical. UNMEASURED: adversarial shapes for T138/139/144-146's own knobs (fixture sets them explicitly), tests reading process.env in the TEST process. Session reaped."
     },
     {
       "id": 1110,
