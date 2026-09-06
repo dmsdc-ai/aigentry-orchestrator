@@ -102,15 +102,15 @@ test("T140: codex at cap, role table is another CLI -> falls to it, by=llm-cappe
   } finally { f.cleanup(); }
 });
 
-test("T140: codex at cap, role table is codex too -> first under-cap profile model (fable)", () => {
+test("T140: codex at cap, role table is codex too -> first under-cap profile model (opus)", () => {
   const f = fixture();
   try {
     const r = f.dispatch([...f.spawnArgs, "--role", "coder"], twoCodex(f));
     assert.equal(r.status, 0, r.stderr);
     const { payload, note } = audit(f);
-    assert.deepEqual([payload.cli, payload.route.label, payload.route.decided_by, payload.route.capped_cli], ["claude", "fable-5.1", "llm-capped", "codex"]);
-    assert.match(note, /cli=claude\/claude-fable-5-1\[1m\] by=llm-capped capped_cli=codex/);
-    assert.match(readFileSync(join(f.aig, "sessions/router-fixture/guard/worker-launcher.sh"), "utf8"), /export AIGENTRY_CLAUDE_MODEL='claude-fable-5-1\[1m\]'/);
+    assert.deepEqual([payload.cli, payload.route.label, payload.route.decided_by, payload.route.capped_cli], ["claude", "opus-5", "llm-capped", "codex"]);
+    assert.match(note, /cli=claude\/claude-opus-5\[1m\] by=llm-capped capped_cli=codex/);
+    assert.match(readFileSync(join(f.aig, "sessions/router-fixture/guard/worker-launcher.sh"), "utf8"), /export AIGENTRY_CLAUDE_MODEL='claude-opus-5\[1m\]'/);
   } finally { f.cleanup(); }
 });
 
@@ -121,7 +121,7 @@ test("T140: table fallback at cap records by=table-capped", () => {
     assert.equal(r.status, 0, r.stderr);
     const { payload, note } = audit(f);
     assert.deepEqual([payload.cli, payload.route.decided_by, payload.route.capped_cli], ["claude", "table-capped", "codex"]);
-    assert.match(note, /cli=claude\/claude-fable-5-1\[1m\] by=table-capped capped_cli=codex/);
+    assert.match(note, /cli=claude\/claude-opus-5\[1m\] by=table-capped capped_cli=codex/);
   } finally { f.cleanup(); }
 });
 
@@ -185,4 +185,42 @@ test("T140: readiness probe and --target audit receive the CLI kind for a worker
     assert.equal(payload.cli, "codex");
     assert.match(note, /cli=codex\/unknown by=existing/);
   } finally { g.cleanup(); }
+});
+
+// #1098: count Claude guard launchers as well as the orchestrator's bare CLI.
+for (const [live, cap, capped] of [[3, "", false], [4, "", true], [4, "5", false], [1, "1", true], [1, "0", true]] as const) {
+  test(`T140: Claude live=${live}, cap=${cap || "default 4"} routes ${capped ? "next candidate" : "Opus"}`, () => {
+    const f = fixture();
+    try {
+      const r = f.dispatch([...f.spawnArgs, "--role", "coder"], {
+        AIGENTRY_CLI_CAP_CLAUDE: cap, AIGENTRY_CLI_CAP_CODEX: "",
+        CLASSIFIER_REPLY: '{"label":"opus-5","reason":"judgment","confidence":0.9}',
+        LIVE_SESSIONS: JSON.stringify(Array.from({ length: live }, (_, i) => ({
+          id: i === 0 ? "router-fixture" : `live-${i}`, command: i === 0 ? "claude" : f.liveLauncher("claude"),
+        }))),
+      });
+      assert.equal(r.status, 0, r.stderr);
+      assert.equal(f.calls(), 1);
+      const { payload, note } = audit(f);
+      assert.deepEqual([payload.cli, payload.route.label, payload.route.decided_by, payload.route.capped_cli],
+        capped ? ["codex", "gpt-6-astra", "llm-capped", "claude"] : ["claude", "opus-5", "llm", undefined]);
+      if (capped) {
+        assert.ok(r.stderr.includes(`claude at cap (${live} live, AIGENTRY_CLI_CAP_CLAUDE=${cap || "4"})`));
+        assert.match(note, /cli=codex\/gpt-6-astra by=llm-capped capped_cli=claude/);
+      } else assert.doesNotMatch(r.stderr, /at cap/);
+    } finally { f.cleanup(); }
+  });
+}
+
+test("T140: unavailable router uses emergency Opus in audit and child launcher", () => {
+  const f = fixture();
+  try {
+    const r = f.dispatch(f.spawnArgs, { DISPATCH_SCRIPT_DIR: f.bin, AIGENTRY_CLI_CAP_CLAUDE: "" });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(f.calls(), 0);
+    const { payload, note } = audit(f);
+    assert.deepEqual(payload.route, { label: "opus-5", decided_by: "table", reason: "router unavailable" });
+    assert.match(note, /cli=claude\/claude-opus-5\[1m\] by=table/);
+    assert.match(readFileSync(join(f.aig, "sessions/router-fixture/guard/worker-launcher.sh"), "utf8"), /export AIGENTRY_CLAUDE_MODEL='claude-opus-5\[1m\]'/);
+  } finally { f.cleanup(); }
 });

@@ -7,7 +7,7 @@ import { REPO, fixture } from "./model-router-fixtures.js";
 test("T139: valid classifier JSON maps each allowlisted label exactly", () => {
   const f = fixture();
   try {
-    for (const [label, cli, model] of [["fable-5.1", "claude", "claude-fable-5-1[1m]"],
+    for (const [label, cli, model] of [["opus-5", "claude", "claude-opus-5[1m]"],
       ["gpt-6-astra", "codex", "gpt-6-astra"], ["grok-4.6", "grok", "grok-4.6"], ["gemini", "gemini", "gemini-3.8-flash-high"]]) {
       const r = f.router(["--ref", f.ref],
         { CLASSIFIER_REPLY: JSON.stringify({ label, reason: "fixture mapping", confidence: 0.8 }) });
@@ -18,7 +18,7 @@ test("T139: valid classifier JSON maps each allowlisted label exactly", () => {
   } finally { f.cleanup(); }
 });
 
-test("T139: missing/malformed profile uses emergency Fable without classifier", () => {
+test("T139: missing/malformed profile uses emergency Opus without classifier", () => {
   const f = fixture();
   try {
     const invalid = join(f.root, "invalid.md");
@@ -27,24 +27,37 @@ test("T139: missing/malformed profile uses emergency Fable without classifier", 
       const r = f.router(["--profile", profile, "--ref", f.ref]);
       assert.equal(r.status, 0, r.stderr);
       const route = JSON.parse(r.stdout);
-      assert.deepEqual([route.decided_by, route.label, route.cli, route.model], ["table", "fable-5.1", "claude", "claude-fable-5-1[1m]"]);
+      assert.deepEqual([route.decided_by, route.label, route.cli, route.model], ["table", "opus-5", "claude", "claude-opus-5[1m]"]);
       assert.equal(r.stderr.trim().split("\n").length, 1);
     }
     assert.equal(f.calls(), 0);
   } finally { f.cleanup(); }
 });
 
-test("T139: no ref uses role table; unknown role uses Fable", () => {
+test("T139: no ref uses role table; unknown role uses Opus", () => {
   const f = fixture();
   try {
-    for (const [role, label] of [["architect", "fable-5.1"], ["analyst", "fable-5.1"], ["researcher", "gemini"],
-      ["coder", "gpt-6-astra"], ["tester", "gpt-6-astra"], ["builder", "gpt-6-astra"], ["logger", "grok-4.6"], ["unknown", "fable-5.1"]]) {
+    for (const [role, label] of [["architect", "opus-5"], ["analyst", "opus-5"], ["researcher", "gemini"],
+      ["coder", "gpt-6-astra"], ["tester", "gpt-6-astra"], ["builder", "gpt-6-astra"], ["logger", "grok-4.6"], ["unknown", "opus-5"]]) {
       const r = f.router(["--role", role!]);
       assert.equal(r.status, 0, r.stderr);
       assert.equal(JSON.parse(r.stdout).label, label);
       assert.equal(JSON.parse(r.stdout).decided_by, "table");
       assert.equal(r.stderr, "");
     }
+    assert.equal(f.calls(), 0);
+  } finally { f.cleanup(); }
+});
+
+test("T139: unknown role resolves the profile's Opus candidate before the emergency constant", () => {
+  const f = fixture();
+  try {
+    const profile = join(f.root, "custom-opus.md");
+    writeFileSync(profile, readFileSync(f.env.AIGENTRY_ROUTER_PROFILE!, "utf8").replace("claude-opus-5[1m]", "profile-opus-model"));
+    const r = f.router(["--role", "unknown", "--profile", profile]);
+    assert.equal(r.status, 0, r.stderr);
+    const route = JSON.parse(r.stdout);
+    assert.deepEqual([route.label, route.cli, route.model], ["opus-5", "claude", "profile-opus-model"]);
     assert.equal(f.calls(), 0);
   } finally { f.cleanup(); }
 });

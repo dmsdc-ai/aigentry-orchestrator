@@ -4,7 +4,8 @@ import { spawnSync } from "node:child_process";
 import { closeSync, openSync, readFileSync, readSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const emergency = { cli: "claude", model: "claude-fable-5-1[1m]", label: "fable-5.1" };
+// Keep in sync with EMERGENCY_ROUTE in src/dispatch/cli.ts.
+const emergency = { cli: "claude", model: "claude-opus-5[1m]", label: "opus-5" };
 const args = Object.fromEntries(process.argv.slice(2).reduce((pairs, key, i, all) => {
   if (i % 2 === 0) pairs.push([key, all[i + 1]]);
   return pairs;
@@ -90,7 +91,7 @@ if (!failure && args["--ref"]) {
 }
 if (!decision) {
   const selected = models.find((m) => m.label === table[args["--role"]]) ||
-    models.find((m) => m.label === "fable-5.1") || emergency;
+    models.find((m) => m.label === "opus-5") || emergency;
   decision = { cli: selected.cli, model: selected.model, label: selected.label, decided_by: "table",
     reason: failure || "no task ref; role default", confidence: 0 };
   if (failure) process.stderr.write(`model-router: ${failure.replace(/[\r\n]+/g, " ")}; using table\n`);

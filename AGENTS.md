@@ -143,7 +143,7 @@ telepty list
 | codex | 포팅, 구현, 리팩터링 | 코드 생성, 테스트 |
 | gemini | 웹 검색, 문서화 | upstream 조사, API 문서 |
 
-새 `--spawn-and-dispatch`는 `--cli auto`가 기본이며 `docs/model-profiles/model-routing-profile.md`와 태스크 ref로 CLI·모델을 선택한다. 명시적 `--cli`는 라우터를 우회하고, `--target`은 기존 워커를 유지한다. `AIGENTRY_ROUTER_PROFILE`·`AIGENTRY_ROUTER_CLASSIFIER`로 프로필·분류 실행 파일을 바꿀 수 있고, 선택 모델은 해당 자식의 `AIGENTRY_CLAUDE_MODEL` / `AIGENTRY_CODEX_MODEL` / `AIGENTRY_GROK_MODEL` / `AIGENTRY_GEMINI_MODEL`에만 적용된다. `gemini`는 설치된 `agy`를 우선 사용하며 `AIGENTRY_GEMINI_BINARY=agy|gemini`로 지정한다. 분류 실패는 역할 기본표, 프로필 부재는 Fable로 대체된다. 라우팅된 CLI의 라이브 세션 수(`telepty list`)가 `AIGENTRY_CLI_CAP_<CLI>`(codex 기본 2, 나머지 무제한, 0=자동 라우팅 금지)에 도달하면 다음 후보(역할 기본표 → 프로필 순서 → Fable)로 내려가며 원장·텔레메트리에 `by=llm-capped capped_cli=codex`로 남고 명시적 `--cli`는 경고만 하고 진행하며, 추론 강도는 `AIGENTRY_CODEX_EFFORT`(기본 high)와 설정 시에만 붙는 `AIGENTRY_GROK_EFFORT`/`AIGENTRY_GEMINI_EFFORT`로 자식 세션에만 적용된다 (#1084).
+새 `--spawn-and-dispatch`는 `--cli auto`가 기본이며 `docs/model-profiles/model-routing-profile.md`와 태스크 ref로 CLI·모델을 선택한다. 명시적 `--cli`는 라우터를 우회하고, `--target`은 기존 워커를 유지한다. `AIGENTRY_ROUTER_PROFILE`·`AIGENTRY_ROUTER_CLASSIFIER`로 프로필·분류 실행 파일을 바꿀 수 있고, 선택 모델은 해당 자식의 `AIGENTRY_CLAUDE_MODEL` / `AIGENTRY_CODEX_MODEL` / `AIGENTRY_GROK_MODEL` / `AIGENTRY_GEMINI_MODEL`에만 적용된다. `gemini`는 설치된 `agy`를 우선 사용하며 `AIGENTRY_GEMINI_BINARY=agy|gemini`로 지정한다. 분류 실패는 역할 기본표, 프로필 부재는 Opus 5로 대체된다. 라우팅된 CLI의 라이브 세션 수(`telepty list`)가 `AIGENTRY_CLI_CAP_<CLI>`(codex 기본 2, claude 기본 4, 나머지 무제한, 0=자동 라우팅 금지)에 도달하면 다음 후보(역할 기본표 → 프로필 순서 → Opus 5)로 내려가며 원장·텔레메트리에 `by=llm-capped capped_cli=codex`로 남고 명시적 `--cli`는 경고만 하고 진행하며, 추론 강도는 `AIGENTRY_CODEX_EFFORT`(기본 high)와 설정 시에만 붙는 `AIGENTRY_GROK_EFFORT`/`AIGENTRY_GEMINI_EFFORT`로 자식 세션에만 적용된다 (#1084).
 
 ## 전담 세션 역할
 
