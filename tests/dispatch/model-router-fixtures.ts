@@ -50,7 +50,10 @@ require('node:fs').writeFileSync(process.env.OPEN_LOG, JSON.stringify({args: pro
 `);
   const probe = script("probe", "console.log('{\"ready\":true}')");
   const telemetry = script("telemetry", "require('node:fs').appendFileSync(process.env.TELEMETRY_LOG, JSON.stringify(process.argv.slice(2)) + '\\n')");
-  const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, AIGENTRY_HOME: aig,
+  // #1109: hermetic — the operator's ambient AIGENTRY_* knobs (CLI_CAP_*, *_MODEL, *_EFFORT, WORKSPACE_HOST, ...)
+  // must never reach the child; everything the fixture needs is declared below, and `overrides` still win.
+  const ambient = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("AIGENTRY_")));
+  const env: NodeJS.ProcessEnv = { ...ambient, HOME: home, AIGENTRY_HOME: aig,
     PATH: `${bin}:${process.env.PATH}`, TELEPTY: telepty, OPEN_SESSION_SH: open, SESSION_PROBE_PY: probe,
     EMIT_TELEMETRY_MJS: telemetry, AIGENTRY_TASK_QUEUE: queue, AIGENTRY_TASK_GATE: "hard",
     AIGENTRY_SESSIONS_ROOT: join(aig, "sessions"), DISPATCH_STATE_DIR: join(root, "state"),
