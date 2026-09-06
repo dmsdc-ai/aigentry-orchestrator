@@ -28,6 +28,16 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd -P)"
 
+# #1112, same scrub as T16: this guard is live-gated, so it runs from a session that
+# exports the operator's AIGENTRY_*_(MODEL|EFFORT) knobs. Nothing asserted below reads
+# them today — the round-trips are this guard's own `codex exec` / `gemini -m` and never
+# the launcher — so this is the latent T117 closed before it bites, not a fix for an
+# observed failure. Keyed to the four CLI names on purpose: T117's blanket
+# AIGENTRY_[A-Z0-9_]*_(MODEL|EFFORT) also matches AIGENTRY_T48_GEMINI_MODEL, this
+# guard's OWN determinism knob (see the header note and GEM_MODEL below), and unsetting
+# it would silence the very thing it was added to pin down.
+for k in $(env | sed -nE 's/^(AIGENTRY_(CLAUDE|CODEX|GEMINI|GROK)_(MODEL|EFFORT))=.*/\1/p'); do unset "$k"; done
+
 if [ "${AIGENTRY_RUN_LIVE_TESTS:-0}" != "1" ]; then
   echo "T48 SKIP — live-integration test (set AIGENTRY_RUN_LIVE_TESTS=1 to run)"
   exit 0
