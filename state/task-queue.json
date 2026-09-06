@@ -12954,12 +12954,12 @@
     },
     {
       "id": 1105,
-      "status": "delegated",
+      "status": "done",
       "track": "orchestrator",
       "priority": "P2",
       "updated_at": "2026-09-06",
       "desc": "[reconciler/tracker] A dispatch row whose telepty session is GONE (not in `telepty list`, DELETE → 404) but that never went through session-cleanup.sh stays non-terminal forever and is HOLD-polled every tick (mr1091-agy-proof, 2026-09-06 00:09→00:41Z). tracker `prune` cannot touch it by design (unknown is never pruned, cli.ts:792). Add an observation kind `session_gone` in the tracker check (sid absent from telepty list for ≥2 ticks) that stops the HOLD repeat and points the orchestrator at session-cleanup.sh — observation, not settlement (telepty#60 Stage A). Test: a registry row with a sid not in the stubbed list → one HOLD then silence + a `session_gone` observation.",
-      "note": "Root cause: probe sessions killed by cascade (parent-kill propagation) bypass the only 'cleaned' writer (session-cleanup.sh). Workaround applied 2026-09-06: run session-cleanup.sh on the absent sid (it tolerates 'not in telepty list' and still writes the row). | dispatched 2026-09-06T03:24:08Z sid=mr1105-mr1105-session-gone ref=2026-09-06-mr1105-session-gone.md track=mr1105 cli=codex/gpt-6-astra by=llm || 2026-09-06 10:5x: codex (gpt-6-astra) worker hit the 5h usage limit at Phase 0 (worktree add only, no writes; screen: 'You've hit your usage limit', '2 usage limit resets available'). Reaped + worktree/branch removed; Opus 5 takeover spawned as <track>b with the same ref (sid-substituted). AIGENTRY_CLI_CAP_CODEX=0 set in ~/.env until the user resets codex (router: codex not a candidate). | dispatched 2026-09-06T03:43:52Z sid=mr1105b-mr1105b-session-gone ref=2026-09-06-mr1105b-session-gone.md track=mr1105b cli=claude/claude-opus-5[1m] by=explicit || HOLD 2026-09-06 (mr1105b, shared/a01617ae…): reuse sessionDisconnected (cli.ts:242-257, called from cmdCheck :697) → 'ABSENT' from a parsed array only; op_observe (dispatch-registry.py:502) has no kind whitelist → kinds session_absent/session_gone without editing the registry; first-miss evidence = last_observation.kind (8th column of the existing list --fields); tick arm after DISCONNECTED with continue; one HOLD via seen-ledger key sid\\tHOLD\\tdispatch_id\\tsession_gone; T148. Baseline correction: 318/312/6 at a01760a (T140 vs ambient codex cap 0 → #1109). GO."
+      "note": "Root cause: probe sessions killed by cascade (parent-kill propagation) bypass the only 'cleaned' writer (session-cleanup.sh). Workaround applied 2026-09-06: run session-cleanup.sh on the absent sid (it tolerates 'not in telepty list' and still writes the row). | dispatched 2026-09-06T03:24:08Z sid=mr1105-mr1105-session-gone ref=2026-09-06-mr1105-session-gone.md track=mr1105 cli=codex/gpt-6-astra by=llm || 2026-09-06 10:5x: codex (gpt-6-astra) worker hit the 5h usage limit at Phase 0 (worktree add only, no writes; screen: 'You've hit your usage limit', '2 usage limit resets available'). Reaped + worktree/branch removed; Opus 5 takeover spawned as <track>b with the same ref (sid-substituted). AIGENTRY_CLI_CAP_CODEX=0 set in ~/.env until the user resets codex (router: codex not a candidate). | dispatched 2026-09-06T03:43:52Z sid=mr1105b-mr1105b-session-gone ref=2026-09-06-mr1105b-session-gone.md track=mr1105b cli=claude/claude-opus-5[1m] by=explicit || HOLD 2026-09-06 (mr1105b, shared/a01617ae…): reuse sessionDisconnected (cli.ts:242-257, called from cmdCheck :697) → 'ABSENT' from a parsed array only; op_observe (dispatch-registry.py:502) has no kind whitelist → kinds session_absent/session_gone without editing the registry; first-miss evidence = last_observation.kind (8th column of the existing list --fields); tick arm after DISCONNECTED with continue; one HOLD via seen-ledger key sid\\tHOLD\\tdispatch_id\\tsession_gone; T148. Baseline correction: 318/312/6 at a01760a (T140 vs ambient codex cap 0 → #1109). GO. || REPORT 2026-09-06 (mr1105b, shared/9e3f3a24…): commit 5cc631e merged --no-ff. sessionDisconnected→sessionPresence (ABSENT only from a parsed array; 401 = refusal, T148c), observeSessionGone(), tick arm continues like DISCONNECTED; first-miss = last_observation.kind on the existing list --fields (foreign writer between ticks delays by one tick, never duplicates); HOLD 'session gone (2 ticks): run bin/session-cleanup.sh <sid>' once per (sid,dispatch_id) via seen-ledger; lifecycle untouched; registry NOT edited (op_observe has no kind whitelist). T148 a/b/c red→green. npm test 318/312/6 → 321/315/6 (6 = #1109). run-all.sh 135 guards: 133 pass / 2 fail (T47, T117 fail at baseline too — NOT #1109; unchased) / 3 skipped; collateral: T8/T58 seeded sids outside the stub listing → new t_list_sessions helper in lib.sh. Snyk 15 LOW / 0 MED, zero new. UNMEASURED: live reconciler tick, a real gone session (stubbed list only), other guards possibly now exercising the session-gone arm (→ #1112), observations.log not carrying the HOLD. Session reaped."
     },
     {
       "id": 1106,
@@ -13014,6 +13014,24 @@
       "updated_at": "2026-09-06",
       "desc": "[task-queue] Separator normalisation of the status vocabulary after #1108: in_progress (underscore) vs blocked-by-observation / awaiting-user (hyphen). Needs src/dispatch/cli.ts ALLOWED_STATUS/TERMINAL_STATUS (:515-516, :650), bin/tq-status.sh:27, bin/tq-focus.sh:36, bin/tq-track.sh:32, tests/dispatch/T59 and a one-shot data migration. Pick one separator, keep a read-side alias for one release.",
       "note": "Deferred from #1108 by design (its commit is data-only + one-word tq-track fix)."
+    },
+    {
+      "id": 1112,
+      "status": "pending",
+      "track": "orchestrator",
+      "priority": "P3",
+      "updated_at": "2026-09-06",
+      "desc": "[tests/dispatch] Fixture hygiene after #1105: guards that seed sids outside lib.sh's default `telepty list` stub (T62, T63, T84, T90, T103 … — measure the full set with grep) may now be exercising the session-gone arm instead of the path they name and still pass. Audit each: assert which arm ran (observation kind) and add t_list_sessions where the guard means 'listed'. Also decide whether the session_gone HOLD should be written to state/dispatch/observations.log.",
+      "note": "From mr1105b REPORT (unmeasured list). Do not chase T47/T117 here — that is #1113."
+    },
+    {
+      "id": 1113,
+      "status": "pending",
+      "track": "orchestrator",
+      "priority": "P2",
+      "updated_at": "2026-09-06",
+      "desc": "[tests/dispatch] Two guards fail on main at baseline (measured by mr1105b 2026-09-06 with its change stashed, dist rebuilt, AIGENTRY_CLI_CAP_CODEX unset): T47_dispatch_role_codex_gemini.sh (gemini/agy launcher leg) and T117_open_session_workspace_shim.sh. Reproduce, name the commit that broke each (git bisect over dist-rebuilt main; candidates: #1090 agy trust, #1091 probe/cli_kind_of, #1093 GEMINI.md contract, #1075 workspace shim), fix or re-pin with a reason.",
+      "note": "Not #1109 (T47 still fails with the cap env unset). run-all.sh is not part of npm test, so CI is green while these are red — Rule 38: the runner list and the test list differ."
     }
   ],
   "completed": [
