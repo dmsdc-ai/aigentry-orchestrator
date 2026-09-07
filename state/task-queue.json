@@ -13095,6 +13095,24 @@
       "updated_at": "2026-09-07",
       "desc": "[animal-hospital] USER-FACING, needs the user's UX call: her 2026-09-07 session pressed New Game 4 times (intervals 0.92 / 0.88 / 0.58 s) and the #1047/#1073 confirm gate HELD every time ('too soon; need 1.5s' — the second press must come ≥1.5 s after arming), so she could not start a New Game and pressed Continue instead. The burst protection that saved her save in #1073 now rejects a child's natural double-press cadence. Options: (a) accept the confirm press in a WINDOW (e.g. 0.3–5 s after arming) instead of only after 1.5 s; (b) explicit two-button confirm dialog; (c) keep. Decide, then coder + MenuSafety test.",
       "note": "Measured from press-session-2026-09-07-2130-daughter-build4.log [M6][1047] lines. Not a regression — the gate did what #1073 asked; the threshold is the question. | dispatched 2026-09-07T12:50:02Z sid=ah1120-ah1120-newgame-confirm ref=2026-09-07-ah1120-newgame-confirm-window.md track=ah1120 cli=claude/claude-opus-5[1m] by=explicit || USER DECISION 2026-09-07: (a) confirm window lo≈0.3 s (≥3× the measured burst interval) .. hi 5 s + an arming readout '저장이 지워져요. 한 번 더 누르면 새로 시작'. Loc key routed to ah1119's generator edit (M1Build is its file)."
+    },
+    {
+      "id": 1121,
+      "status": "awaiting-user",
+      "track": "telepty",
+      "priority": "P0",
+      "updated_at": "2026-09-07",
+      "desc": "[telepty gh#82 (A)(B)(C)(E)] `telepty list` can kill a healthy daemon: ensureDaemonRunning probes only /api/meta + /api/sessions with AbortSignal.timeout(1500) (cli.js:372/:855/:944); both timing out → decideDaemonAction 'start'/'daemon-unreachable' (:1043) → restartDaemonGraceful (:573) → cleanup/stopDaemon (:611) → cleanupDaemonProcesses kills the state-file pid + the port owner (daemon-control.js:396/:416/:197). A verdict of 'nothing answered' begins by killing whatever is on the port; harmless only when the verdict was right. Fix set: (A) re-confirm liveness (GET /api/health, which exists at daemon.js:386) immediately before any stop, and never stop on a 'start' verdict without it; (B) use /api/health as the liveness probe; (C) make the 1500 ms probe timeout configurable/backoff; (E) write a log line per failed restart attempt (~/.telepty/logs was empty). Plus the PORT vs TELEPTY_PORT split (daemon.js:393 binds $PORT, cli.js:152 dials $TELEPTY_PORT) — the state-file pid can be a daemon on another port the probe never contacted. #902 narrowed the blast radius to the addressed port; #567/#835 protect the abort path; this is the remaining half. USER OK required (telepty policy: no structural changes) — proposed as a probe/guard change, not a restructure.",
+      "note": "Filed 2026-09-07 11:56Z by duckyoungkim-oss. Env A = Linux reporter (0.8.1, no supervisor), env B = macOS M4 Pro launchd (NOT this machine: here PORT/TELEPTY_PORT/TELEPTY_HOST unset, daemon pid 41729 healthy at 22:xx KST). Reproduction sketch (kill -STOP the daemon briefly, run telepty list) is unverified by the reporter — Rule 35: worker reproduces first."
+    },
+    {
+      "id": 1122,
+      "status": "awaiting-user",
+      "track": "telepty",
+      "priority": "P1",
+      "updated_at": "2026-09-07",
+      "desc": "[telepty gh#82 (D)(F)] (D) `telepty allow` wrappers never re-register after a daemon restart: session stays STALE (OWNER_DISCONNECTED_STALE) with ownerPid/ptyPid alive, inject rejected '[STALE]' — env B measured 10 h 36 min, five worker REPORTs lost; `telepty list` cannot distinguish that from a dead leftover (kill would terminate live work). Fix: reconnect loop in the wrapper and/or `telepty reconnect <id>`, and a list column that shows owner/pty liveness. (F) TASK_COMPLETION_UNKNOWN fires on essentially every inject to a Claude Code worker (pty_quiet ~5 s is normal thinking; spinner frames read as repeated_error_pattern) because src/completion-observation.js:29-30 hardcodes outcome_protocol 'unavailable' (Stage B deferred to 0.9.0) — gate the notification behind outcome_protocol !== 'unavailable' or make it opt-in. USER OK required.",
+      "note": "(F) matches this orchestrator's whole-day experience 2026-09-06/07 (Rule 44 exists because of it). (D) matches the #905/#1105 bridge-age findings."
     }
   ],
   "completed": [
