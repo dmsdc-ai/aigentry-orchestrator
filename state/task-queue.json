@@ -13089,12 +13089,12 @@
     },
     {
       "id": 1120,
-      "status": "pending",
+      "status": "delegated",
       "track": "animal-hospital",
       "priority": "P1",
       "updated_at": "2026-09-07",
       "desc": "[animal-hospital] USER-FACING, needs the user's UX call: her 2026-09-07 session pressed New Game 4 times (intervals 0.92 / 0.88 / 0.58 s) and the #1047/#1073 confirm gate HELD every time ('too soon; need 1.5s' — the second press must come ≥1.5 s after arming), so she could not start a New Game and pressed Continue instead. The burst protection that saved her save in #1073 now rejects a child's natural double-press cadence. Options: (a) accept the confirm press in a WINDOW (e.g. 0.3–5 s after arming) instead of only after 1.5 s; (b) explicit two-button confirm dialog; (c) keep. Decide, then coder + MenuSafety test.",
-      "note": "Measured from press-session-2026-09-07-2130-daughter-build4.log [M6][1047] lines. Not a regression — the gate did what #1073 asked; the threshold is the question."
+      "note": "Measured from press-session-2026-09-07-2130-daughter-build4.log [M6][1047] lines. Not a regression — the gate did what #1073 asked; the threshold is the question. | dispatched 2026-09-07T12:50:02Z sid=ah1120-ah1120-newgame-confirm ref=2026-09-07-ah1120-newgame-confirm-window.md track=ah1120 cli=claude/claude-opus-5[1m] by=explicit || USER DECISION 2026-09-07: (a) confirm window lo≈0.3 s (≥3× the measured burst interval) .. hi 5 s + an arming readout '저장이 지워져요. 한 번 더 누르면 새로 시작'. Loc key routed to ah1119's generator edit (M1Build is its file)."
     }
   ],
   "completed": [
