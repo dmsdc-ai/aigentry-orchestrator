@@ -13140,6 +13140,15 @@
       "updated_at": "2026-09-07",
       "desc": "[telepty] restartDaemonGraceful's final telepty#44 survivor message calls findPortOwnerPid(3848) regardless of the addressed port — read-only, no kill hazard, but it advised a test addressing port 51821 to `kill <pid of the real 3848 daemon>`. #902's defect class surviving in advice text. Use the addressed port; one test row.",
       "note": "Found by tp1121 2026-09-07 (Rule 29: mentioned, not fixed)."
+    },
+    {
+      "id": 1126,
+      "status": "delegated",
+      "track": "telepty",
+      "priority": "P1",
+      "updated_at": "2026-09-07",
+      "desc": "[telepty] RELEASE 0.8.2 (USER decision 2026-09-07): main b08e244 carries gh#82 A/B/C/E (#1121, c5f2219) + D/F (#1122, 78fe664 + 1689d55); npm test 1207/1206/0 fail/1 skip. Steps: version bump package.json + package-lock (0.8.1→0.8.2), CHANGELOG.md entry in the house style (0.8.1's shape: what a user sees, which fixes need a daemon restart (F gate lives in daemon.js) and which need bridge respawn (D reconnect lives in the `telepty allow` wrapper) — say it plainly: NOT a protocol release but the two fixes do not take effect on running processes until restarted), release commit `chore(release): 0.8.2 — …`, tag v0.8.2, push main + tag (release.yml is tag-triggered, concurrency-grouped, CI publishes), verify `npm view @dmsdc-ai/aigentry-telepty version` = 0.8.2 and the workflow run green, then comment on gh#82 (not close) with the shas, the per-item fix summary, the reproduction (T7 + wrapper-reregister-82 rows A/B), and the two follow-ups (#1124 bind precedence, #1125 hardcoded 3848 advice) as open items. No daemon restart on this machine (orchestrator bridge policy).",
+      "note": "Release mechanics measured by the orchestrator: .github/workflows/release.yml on tags v*, workflow_dispatch with an existing tag; last release commit 2d8ff98 'chore(release): 0.8.1 — patch, fixes only, not protocol-affecting'. 5 local commits on main are unpushed (the two merges + tp merges). | dispatched 2026-09-07T13:28:11Z sid=tp1126-tp1126-release-0.8.2 ref=2026-09-07-tp1126-release-0.8.2.md track=tp1126 cli=claude/claude-opus-5[1m] by=explicit"
     }
   ],
   "completed": [
