@@ -12900,12 +12900,12 @@
     },
     {
       "id": 1099,
-      "status": "pending",
+      "status": "delegated",
       "track": "telepty",
       "priority": "P1",
-      "updated_at": "2026-09-06",
+      "updated_at": "2026-09-07",
       "desc": "[telepty] read-screen returns (empty screen) for grok permanently once the output ring holds only post-APC bytes: grok emits kitty-graphics APC frames (ESC _ Ga=d,d=i,i=1,q=2 ESC \\\\ — 1215 in 40 s, none while idle) and no newlines; src/screen-ansi.js strips DCS/PM/APC with a GREEDY /\\x1b[P^_][^]*\\\\/g that wipes from the first APC to the LAST ESC \\\\ in the 200 KB ring (measured: window from byte 0 → 11750 chars; from byte 100000 → 2 chars → trim → empty). One-line fix: lazy quantifier + require the ESC-terminated form. Not structural (memory: telepty structural changes need user OK) — regex-level; still confirm with the user before dispatching into the telepty repo.",
-      "note": "Measured by mr1091 (#1091 HOLD, 2026-09-06). grok delivery itself WORKS (bracketed paste or plain + CR, all three screen modes) — only observation is broken. || Verbatim repro + one-line fix proposal in mr1091 REPORT §2 (~/.telepty/shared/622f4829….md). Awaiting user OK to dispatch into aigentry-telepty (regex-level, not structural)."
+      "note": "Measured by mr1091 (#1091 HOLD, 2026-09-06). grok delivery itself WORKS (bracketed paste or plain + CR, all three screen modes) — only observation is broken. || Verbatim repro + one-line fix proposal in mr1091 REPORT §2 (~/.telepty/shared/622f4829….md). Awaiting user OK to dispatch into aigentry-telepty (regex-level, not structural). | dispatched 2026-09-07T23:00:15Z sid=tp1099-tp1099-screen-apc ref=2026-09-08-tp1099-screen-apc.md track=tp1099 cli=claude/claude-opus-5[1m] by=explicit"
     },
     {
       "id": 1100,
@@ -13062,12 +13062,12 @@
     },
     {
       "id": 1117,
-      "status": "pending",
+      "status": "delegated",
       "track": "animal-hospital",
       "priority": "P2",
-      "updated_at": "2026-09-06",
+      "updated_at": "2026-09-07",
       "desc": "[animal-hospital] #1076 phase 3 instrument: PhantomProbe's heartbeat (PhantomProbe.cs:236-251) decodes keys and logs gate + aim at 1 Hz but cannot say whether a press ACTED or where it stopped. Add per-press lines: (1) Interact.performed callback (not sampled), (2) the line OnInteract returned at (:412/:414/:419/:420/acted), (3) player world position + facing in the heartbeat (the only reason 'did she stand at the job board' was unanswerable), (4) held tool at press time. Keep the log volume bounded (her 10-min session = 1844 lines today).",
-      "note": "From ah1076 REPORT 2026-09-06 §7. Not urgent for the fix; urgent for the NEXT playtest's answerability."
+      "note": "From ah1076 REPORT 2026-09-06 §7. Not urgent for the fix; urgent for the NEXT playtest's answerability. | dispatched 2026-09-07T23:01:04Z sid=ah1117-ah1117-phase3-instrument ref=2026-09-08-ah1117-phase3-instrument.md track=ah1117 cli=claude/claude-opus-5[1m] by=explicit"
     },
     {
       "id": 1118,
@@ -13134,12 +13134,12 @@
     },
     {
       "id": 1125,
-      "status": "pending",
+      "status": "delegated",
       "track": "telepty",
       "priority": "P2",
       "updated_at": "2026-09-07",
       "desc": "[telepty] restartDaemonGraceful's final telepty#44 survivor message calls findPortOwnerPid(3848) regardless of the addressed port — read-only, no kill hazard, but it advised a test addressing port 51821 to `kill <pid of the real 3848 daemon>`. #902's defect class surviving in advice text. Use the addressed port; one test row.",
-      "note": "Found by tp1121 2026-09-07 (Rule 29: mentioned, not fixed)."
+      "note": "Found by tp1121 2026-09-07 (Rule 29: mentioned, not fixed). | dispatched 2026-09-07T23:00:31Z sid=tp1125-tp1125-survivor-port ref=2026-09-08-tp1125-survivor-port.md track=tp1125 cli=claude/claude-opus-5[1m] by=explicit"
     },
     {
       "id": 1126,
@@ -13152,12 +13152,12 @@
     },
     {
       "id": 1127,
-      "status": "pending",
+      "status": "delegated",
       "track": "telepty",
       "priority": "P2",
       "updated_at": "2026-09-07",
       "desc": "[telepty release.yml] step 8 'the registry must serve the bytes we packed' waits 6 × 10 s = 60 s, but npm's asynchronous processing after `npm publish` took ~8 min for 0.8.2 (published 13:34 KST, readable 13:42Z per the packument) → the run went RED after a SUCCESSFUL publish, steps 9-10 (clean-install check, GitHub Release) skipped, and a by-hand finish was needed (#1126). Fix: wait up to ~15 min with backoff (npm's own notice says 'may take a few minutes'), poll the packument (not the npm cache), and on timeout say 'publish accepted, not yet readable' as a distinct outcome from 'publish failed' (Rule 38 wording) — never re-publish. Re-run steps 9-10 as a separate job that can be dispatched for an existing tag.",
-      "note": "From the 0.8.2 release (run 34128154793). Related history in release.yml's header: v0.8.1 green while npm served 0.8.0 — the opposite failure; the verification gate itself is right, its budget is wrong."
+      "note": "From the 0.8.2 release (run 34128154793). Related history in release.yml's header: v0.8.1 green while npm served 0.8.0 — the opposite failure; the verification gate itself is right, its budget is wrong. | dispatched 2026-09-07T23:00:47Z sid=tp1127-tp1127-release-verify-wait ref=2026-09-08-tp1127-release-verify-wait.md track=tp1127 cli=claude/claude-opus-5[1m] by=explicit"
     }
   ],
   "completed": [
