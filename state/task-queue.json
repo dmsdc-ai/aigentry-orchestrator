@@ -13125,12 +13125,12 @@
     },
     {
       "id": 1124,
-      "status": "pending",
+      "status": "delegated",
       "track": "telepty",
       "priority": "P2",
-      "updated_at": "2026-09-07",
+      "updated_at": "2026-09-08",
       "desc": "[telepty gh#82 item 4 first option] daemon.js:393 binds process.env.PORT || 3848 while the CLI dials TELEPTY_PORT (cli.js:152). Post-#902 the mismatch is not destructive, only 'cannot find my daemon'. Add a pure resolveBindPort(env) (TELEPTY_PORT → PORT → 3848) mirroring the exported resolveBindHost(env), tested in daemon-bind-default.test.js. Changes bind behaviour for anyone setting both variables differently on purpose → USER OK + release note.",
-      "note": "Held back from #1121 per orchestrator decision (b)."
+      "note": "Held back from #1121 per orchestrator decision (b). | dispatched 2026-09-08T09:42:35Z sid=tp1124-tp1124-bind-port ref=2026-09-08-tp1124-bind-port.md track=tp1124 cli=codex/gpt-6-astra by=llm || USER 2026-09-08: approved (behaviour change, CHANGELOG Unreleased). gh#82 stays OPEN (user). codex reset → AIGENTRY_CLI_CAP_CODEX=2 restored."
     },
     {
       "id": 1125,
