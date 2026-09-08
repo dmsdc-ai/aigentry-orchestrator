@@ -200,6 +200,7 @@ const TELEPTY_AUTH_SH = path.join(SCRIPT_DIR, "lib/telepty-auth.sh");
 // Configurable orchestrator sid — same source as bin/dispatch-tracker.sh (Rule 16, no
 // hardcode). `:-` semantics: an EMPTY value falls back to the default, as in bash.
 const ORCH_SID = env.ORCHESTRATOR_SID || "orchestrator";
+const ORCH_CLI = env.ORCHESTRATOR_CLI || "claude";
 
 // Test seams (hermetic T40/T131): the process lister, the killer and the self pid, so
 // the guard can be exercised with NO real process touched.
@@ -287,6 +288,13 @@ if (MODE !== "help" && hasControlChar(ORCH_SID)) {
     LOG_FD,
     `[orchestrator-boot] ORCHESTRATOR_SID contains a control character — refusing to boot (the exec argv is handed back to the shim as text, and a sid that cannot survive that round trip cannot be exec'd correctly)\n`,
   );
+  process.exit(2);
+}
+
+// Validate before any reconcile/guard reads or effects; help remains available.
+if (MODE !== "help" && ORCH_CLI !== "claude" && ORCH_CLI !== "codex") {
+  writeOut(2, "orchestrator-boot.sh: unknown ORCHESTRATOR_CLI (expected claude or codex)\n");
+  writeOut(2, `${USAGE}\n`);
   process.exit(2);
 }
 
@@ -630,9 +638,16 @@ const ORCH_EXEC_ARGV = [
   "--id",
   ORCH_SID,
   "--auto-restart",
-  "claude",
-  "--dangerously-skip-permissions",
-  "--continue",
+  ...(ORCH_CLI === "codex"
+    ? [
+        "codex",
+        "resume",
+        "--last",
+        // Mirror src/dispatch/cli.ts defaultCliFlags("codex")'s bypass literal:
+        // that private helper's module runs dispatch at import time.
+        "--dangerously-bypass-approvals-and-sandbox",
+      ]
+    : ["claude", "--dangerously-skip-permissions", "--continue"]),
 ];
 
 /**
