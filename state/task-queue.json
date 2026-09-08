@@ -13152,12 +13152,12 @@
     },
     {
       "id": 1127,
-      "status": "delegated",
+      "status": "done",
       "track": "telepty",
       "priority": "P2",
-      "updated_at": "2026-09-07",
+      "updated_at": "2026-09-08",
       "desc": "[telepty release.yml] step 8 'the registry must serve the bytes we packed' waits 6 × 10 s = 60 s, but npm's asynchronous processing after `npm publish` took ~8 min for 0.8.2 (published 13:34 KST, readable 13:42Z per the packument) → the run went RED after a SUCCESSFUL publish, steps 9-10 (clean-install check, GitHub Release) skipped, and a by-hand finish was needed (#1126). Fix: wait up to ~15 min with backoff (npm's own notice says 'may take a few minutes'), poll the packument (not the npm cache), and on timeout say 'publish accepted, not yet readable' as a distinct outcome from 'publish failed' (Rule 38 wording) — never re-publish. Re-run steps 9-10 as a separate job that can be dispatched for an existing tag.",
-      "note": "From the 0.8.2 release (run 34128154793). Related history in release.yml's header: v0.8.1 green while npm served 0.8.0 — the opposite failure; the verification gate itself is right, its budget is wrong. | dispatched 2026-09-07T23:00:47Z sid=tp1127-tp1127-release-verify-wait ref=2026-09-08-tp1127-release-verify-wait.md track=tp1127 cli=claude/claude-opus-5[1m] by=explicit"
+      "note": "From the 0.8.2 release (run 34128154793). Related history in release.yml's header: v0.8.1 green while npm served 0.8.0 — the opposite failure; the verification gate itself is right, its budget is wrong. | dispatched 2026-09-07T23:00:47Z sid=tp1127-tp1127-release-verify-wait ref=2026-09-08-tp1127-release-verify-wait.md track=tp1127 cli=claude/claude-opus-5[1m] by=explicit || REPORT 2026-09-08 (tp1127, shared/b0e1ba82…): 92784b1 merged --no-ff → telepty main 499dd57. Step 8: curl packument (no-cache), readFileSync not require (cache trap), 25 attempts / 900 s (immediate, 10 s×6, 30 s×8, 60 s×10); outcomes PUBLISHED_AND_READABLE / PUBLISHED_NOT_YET_READABLE (exit 1, names the existing-tag re-run as the remedy, forbids re-publish/retag) / PUBLISH_FAILED (new step, if failure() && steps.publish.outcome == 'failure'); shasum mismatch branch verbatim; steps 8-10 carry no if: (re-run path measured on run 34129124454, pinned in a comment). Validated with PyYAML (no deps added). Session reaped."
     },
     {
       "id": 1128,
@@ -13176,6 +13176,15 @@
       "updated_at": "2026-09-08",
       "desc": "[telepty] Re-open the grok read-screen symptom with EVIDENCE: spawn one grok worker, run one turn, dump the raw outputRing (raw=1) to a file under state/dispatch/inbox/ (mr1091's 133 KB capture was never stored), then decide: (a) an OSC-BEL span (fixed by #1099) — verify read-screen is readable on the stored ring with the #1099 strip; (b) genuine ring saturation by content-free frames (1215 APC deletes/turn, no newlines) → a structural answer (screen emulation, or not ringing content-free frames) → HOLD per policy. Rule 35: no fix without the stored reproduction.",
       "note": "From tp1099's HOLD (#1099 root cause falsified). The orchestrator reaps the grok probe."
+    },
+    {
+      "id": 1130,
+      "status": "delegated",
+      "track": "telepty",
+      "priority": "P1",
+      "updated_at": "2026-09-08",
+      "desc": "[telepty] RELEASE 0.8.3 (USER decision 2026-09-08): main 499dd57 = 0.8.2 + #1124 (bind port TELEPTY_PORT→PORT→3848, descriptors set both; behaviour change), #1125 (survivor advice names the addressed port), #1099 (read-screen OSC-BEL arm bounded), #1127 (release.yml proof budget + named outcomes — this release is the first to run it). Steps as #1126: re-measure npm test; npm version patch --no-git-tag-version + gen-readme; CHANGELOG: rename '## Unreleased' → '## 0.8.3 — 2026-09-08' and add the three other entries in the 0.8.2 shape (what a 0.8.2 user sees; which process must restart: #1124 daemon (+ descriptors regenerate on install), #1125/#1099 CLI next invocation, #1127 CI only); release commit + annotated tag v0.8.3; HOLD before the push (orchestrator lands — worker pre-push hook); watch release.yml (expect the new step-8 outcome strings); npm view = 0.8.3 + shasum match; GitHub Release; gh#82 comment one paragraph (0.8.3 carries the follow-ups #1124/#1125 + #1099; issue stays open).",
+      "note": "Successor of #1126. 4 unpushed merges on telepty main at dispatch time. | dispatched 2026-09-08T10:49:02Z sid=tp1130-tp1130-release-0.8.3 ref=2026-09-08-tp1130-release-0.8.3.md track=tp1130 cli=claude/claude-opus-5[1m] by=explicit"
     }
   ],
   "completed": [
