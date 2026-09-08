@@ -13125,12 +13125,12 @@
     },
     {
       "id": 1124,
-      "status": "delegated",
+      "status": "done",
       "track": "telepty",
       "priority": "P2",
       "updated_at": "2026-09-08",
       "desc": "[telepty gh#82 item 4 first option] daemon.js:393 binds process.env.PORT || 3848 while the CLI dials TELEPTY_PORT (cli.js:152). Post-#902 the mismatch is not destructive, only 'cannot find my daemon'. Add a pure resolveBindPort(env) (TELEPTY_PORT → PORT → 3848) mirroring the exported resolveBindHost(env), tested in daemon-bind-default.test.js. Changes bind behaviour for anyone setting both variables differently on purpose → USER OK + release note.",
-      "note": "Held back from #1121 per orchestrator decision (b). | dispatched 2026-09-08T09:42:35Z sid=tp1124-tp1124-bind-port ref=2026-09-08-tp1124-bind-port.md track=tp1124 cli=codex/gpt-6-astra by=llm || USER 2026-09-08: approved (behaviour change, CHANGELOG Unreleased). gh#82 stays OPEN (user). codex reset → AIGENTRY_CLI_CAP_CODEX=2 restored."
+      "note": "Held back from #1121 per orchestrator decision (b). | dispatched 2026-09-08T09:42:35Z sid=tp1124-tp1124-bind-port ref=2026-09-08-tp1124-bind-port.md track=tp1124 cli=codex/gpt-6-astra by=llm || USER 2026-09-08: approved (behaviour change, CHANGELOG Unreleased). gh#82 stays OPEN (user). codex reset → AIGENTRY_CLI_CAP_CODEX=2 restored. || REPORT 2026-09-08 (tp1124 codex/Astra, shared/20150fc8…): 6221254 merged --no-ff to telepty main. resolveBindPort(env) in NEW src/bind-port.js (13 lines, pure — chosen so install.js does not import daemon side effects; a new module, accepted as the smaller diff) used by daemon.js:393 and by install.js descriptors (explicit port → both PORT and TELEPTY_PORT; default portless unchanged); 0 allowed (OS ephemeral), invalid → 3848 + stderr. Tests +26: 1207 → 1233/1232/0/1 (red 23/34 → green); release-version-invariant now skips a leading '## Unreleased' and asserts the first released heading (+ regression row); CHANGELOG '## Unreleased / ### Changed'. Snyk shell helper: 15 = 15 baseline (changed-file copies), zero new. Live daemon untouched (0.8.2). Session reaped."
     },
     {
       "id": 1125,
