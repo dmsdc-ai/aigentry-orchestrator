@@ -13134,12 +13134,12 @@
     },
     {
       "id": 1125,
-      "status": "delegated",
+      "status": "done",
       "track": "telepty",
       "priority": "P2",
-      "updated_at": "2026-09-07",
+      "updated_at": "2026-09-08",
       "desc": "[telepty] restartDaemonGraceful's final telepty#44 survivor message calls findPortOwnerPid(3848) regardless of the addressed port — read-only, no kill hazard, but it advised a test addressing port 51821 to `kill <pid of the real 3848 daemon>`. #902's defect class surviving in advice text. Use the addressed port; one test row.",
-      "note": "Found by tp1121 2026-09-07 (Rule 29: mentioned, not fixed). | dispatched 2026-09-07T23:00:31Z sid=tp1125-tp1125-survivor-port ref=2026-09-08-tp1125-survivor-port.md track=tp1125 cli=claude/claude-opus-5[1m] by=explicit"
+      "note": "Found by tp1121 2026-09-07 (Rule 29: mentioned, not fixed). | dispatched 2026-09-07T23:00:31Z sid=tp1125-tp1125-survivor-port ref=2026-09-08-tp1125-survivor-port.md track=tp1125 cli=claude/claude-opus-5[1m] by=explicit || REPORT 2026-09-08 (tp1125, shared/1ad2d426…): d462141 merged --no-ff to telepty main. cli.js:810-821 survivor advice → portOwner(addressedPort) via the existing seam; local renamed survivingPid (shadowing hazard named); R6 (addressing 51821 → advice names 99001, never 3848's pid; red on unmodified cli.js) + R6b (addressing 3848 unchanged) in sweep-scoping-902 (+71); package.json untouched. Remaining 3848 literals = defaults/prose (:153 :631 :1090 :4628), kept. Item 4 (:771 etc. use module-level PORT) skipped per user — follow-up candidate. Session reaped."
     },
     {
       "id": 1126,
