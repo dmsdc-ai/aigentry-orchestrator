@@ -13226,6 +13226,18 @@
       "note": "2026-09-08 registered before analyst dispatch. Execution D, fresh analyst, one report file. Parallel-safe read-only audit with router architect revision and game tester. Hypotheses to verify, not findings: unnecessary user approval repeats, final acknowledgments without actuation, delayed follow-on work, cleanup-after-spawn cap displacement, duplicated report/HOLD messages, unbounded spec/dispatch payloads, completed phases left delegated. Use current transcript/ledger/source timings, quantify only recorded intervals and state missing observations. No workflow implementation or policy changes authorized by this analysis request. | dispatched 2026-09-08T12:49:13Z sid=wf1135-analyst ref=2026-09-08-wf1135-analysis.md track=wf1135 cli=claude/claude-opus-5[1m] by=llm"
     },
     {
+      "id": 1136,
+      "status": "pending",
+      "track": "process",
+      "priority": "P1",
+      "kind": "runtime-addition",
+      "§1.2_question": "Can workflow efficiency enforcement reuse current dispatch, task ledger, report handling and cleanup primitives without a new framework?",
+      "§1.2_answer": "pending: decide from #1135 evidence and scoped architecture review",
+      "updated_at": "2026-09-08",
+      "desc": "[workflow-production] USER explicitly authorized productionizing workflow efficiency improvements: preserve approved action scope, avoid repeat approval within scope, perform authorized actuation in same turn, verify/preserve/reap completed workers before successor spawn, deduplicate completion/approval reporting, and keep specifications focused. Implement evidence-backed changes through existing orchestration infrastructure with tests and reversible rollout; preserve save/deployment/destructive-action gates.",
+      "note": "2026-09-08 USER: '그리고 해당 내용 프로덕션화 해줄 수 있어?' treated as action authorization following approved workflow fixes. Permanent-fix track B pending active #1135 diagnosis, not another user authorization request. Trigger: when #1135 report arrives, verify findings then dispatch one architect for minimal implementation contract; freeze interface/file ownership then coder/tester/builder execution. Root-cause candidates only: repeated approvals, non-actuating acknowledgments, cleanup after successor spawn, REPORT+HOLD duplication, overlong specs. Workaround: orchestrator applies approved-scope decisions, file-first reporting and cleanup-before-successor immediately; enforceable machinery still unimplemented. Sequence is intrinsic evidence dependency (#1135 output -> spec), not serializing independent tasks. Coordinate dispatch/cli ownership with #1133 router changes; isolated worktrees and contract review required before concurrent edits. Acceptance: retained approval survives context reload without scope widening; completed artifact verified/preserved before cleanup; protected orchestrator/ancestor never reaped; duplicate reports do not cause duplicate GO; phase status vs overall task state accurate; tests actually included in runner; compare measured approval repeats, phase wait latency and duplicate notifications. No live activation claimed; rollout must preserve existing critical approval boundaries and have rollback."
+    },
+    {
       "id": 1131,
       "status": "done",
       "track": "orchestrator",
