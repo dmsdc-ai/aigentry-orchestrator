@@ -2,557 +2,573 @@
 
 - 태스크: #1141 (umbrella #526의 현재 소스 리프레시). #1140 architecture assessor와 병렬.
 - 역할: analyst (read-only). 코드 수정·빌드·테스트·설치·네트워크/레지스트리 조회 없음.
-- 측정 시각: **2026-09-08T13:36:15Z ~ 13:56Z (UTC)**
-- 작업 워크트리: `/Users/duckyoungkim/.aigentry/worktrees/ec1141`, 브랜치 `docs/1141-ecosystem-operations`, HEAD `76a3713`
-- 비교 기준 main: `aigentry-orchestrator` HEAD `ca93cb6` (dirty=10), 로컬 dirty 상태는 부록 A에 기록
+- **측정 창: 2026-09-08T13:36:15Z(첫 명령, 로그됨) ~ 13:47:09Z(1차 커밋 `066558b`).**
+  2차 정정 판독은 13:48Z~13:52Z. (초판이 적었던 "13:56Z"는 로그에 없는 미래 시각이었다 — 철회.)
+- 작업 워크트리: `/Users/duckyoungkim/.aigentry/worktrees/ec1141`, 브랜치 `docs/1141-ecosystem-operations`
 - 산출물: 본 파일 1개만 커밋
 
 ---
 
-## 0. 측정 범위와 측정하지 않은 것 (먼저 읽을 것)
+## 0. 이 보고서가 무엇을 근거로 삼는가 (먼저 읽을 것)
 
-**센 것(counted universe).** `/Users/duckyoungkim/projects/` 하위 디렉터리 **54개**를 직접 열거했다.
-그중 aigentry 계열은 **23개**(`aigentry` + `aigentry-*` 22개). 나머지 31개는 터미널 업스트림
-(ghostty/kitty/wezterm/zellij/alacritty/rio/contour/winit), claude-code 참조 포크, 제품 프로젝트
-(animal-hospital, nexaforge, shipfast 등)로 이번 감사 범위 밖 — 부록 A에 사유와 함께 명시.
-`ecosystem.json`은 **표시용 매니페스트**이며 6개 모듈만 담고 있어 열거의 근거로 쓰지 않았다.
-중첩 패키지 디렉터리 3개(`aigentry-ssot/pkg`, `aigentry-registry/frontend`, `aigentry-registry/bridge`)를
-별도로 찾아 처분을 부여했다. `.aigentry/repo`는 메모리 프로파일 데이터일 뿐 저장소가 아니다.
-워크트리 77개는 오케스트레이터 작업 공간이므로 저장소로 세지 않았다.
+### 0.1 커밋된 내용 vs 작업 트리 — 초판의 가장 큰 결함
 
-**측정하지 않은 것 — 아래 결론에 절대 포함되지 않음.**
-- **npm 레지스트리 실조회 없음.** "현재 npm에 있는 버전"은 한 줄도 주장하지 않는다. 버전 비교는
-  전부 *로컬 package.json ↔ 로컬 package.json / 로컬 manifest* 사이의 비교다. 레지스트리 존재
-  증거로 인용한 것은 로컬 `package-lock.json`의 `resolved`+`integrity` 기록뿐이며, 이는 락파일이
-  쓰인 시점의 사실이지 현재 레지스트리 상태가 아니다.
-- **설치/업그레이드/언인스톨을 실제로 실행하지 않았다.** 설치 스크립트는 소스로만 읽었다.
-  "fresh HOME에서 이렇게 된다"는 서술은 전부 코드 경로 추론이며, 각 항목의 재현 게이트에
-  실행 방법을 적어 두었다.
-- **실행 중 데몬/서비스에 접속하지 않았다.** telepty 데몬, brain, deliberation 런타임의 실제
-  동작·로그·성능은 측정 대상이 아니었다.
-- **보안 스캔·인증 프로브·익스플로잇 없음.** Snyk 미실행(docs-only). 인증/CORS/spawn 경로는
-  소스 읽기만 했고 자격증명 값은 열지 않았다(변수명만 확인).
-- **원격(GitHub Actions 실행 이력, 태그, 릴리스) 미조회.** 워크플로 YAML 파일 내용만 읽었다.
-- 상속받은 수치(과거 감사의 저장소 수, 휴면율, 보안 결론)는 **하나도 헤드라인으로 승격하지 않았다.**
-  본 보고서의 모든 수치는 위 시각에 재측정한 값이다.
+초판은 각 발견에 저장소 HEAD SHA를 붙여 마치 그것이 인용 내용의 출처인 것처럼 적었다. **틀렸다.**
+감사 대상 저장소는 전부 dirty였고, 특히 `aigentry-devkit`(HEAD `bb7876b`, dirty=51)은 인용한
+파일 중 상당수가 HEAD와 다르다. 이번 판에서는 `git show HEAD:<path>`로 blob을 직접 비교해
+**모든 인용에 [HEAD 확인] / [작업트리 전용] / [미추적] 태그를 붙였다.**
+
+| 인용 파일 | HEAD 상태 | 작업 트리 | 이 보고서의 취급 |
+|---|---|---|---|
+| `devkit/package.json` | 동일(clean) | 동일 | **[HEAD 확인]** |
+| `devkit/config/installer-manifest.json` | 동일(clean) | 동일 | **[HEAD 확인]** |
+| `devkit/.github/workflows/*` | 동일(clean) | 동일 | **[HEAD 확인]** |
+| `devkit/install.sh` | 951줄 | **1013줄 (M)** | 라인번호 병기, 사실별로 HEAD 재확인 |
+| `devkit/install.ps1` | 453줄 | **506줄 (M)** | 동일 |
+| `devkit/config/modules/*.adapter.json` | 7개 전부 (M) | — | **[작업트리 전용]** |
+| `devkit/lib/install-fallback.js` | **HEAD에 없음** (`git cat-file -e` 실패) | 존재 | **[미추적]** |
+| `ecosystem.json` (6사본) | clean | 동일 | **[HEAD 확인]** |
+
+이 표 자체가 하나의 관찰이다 — **devkit의 설치 경로 리팩터가 커밋되지 않은 채 진행 중이고,
+그 핵심 파일(`lib/install-fallback.js`)은 git에 아예 없는데 `package.json`의 `files`는
+`lib/**`를 게시 대상에 포함한다.** 초판은 이 미추적 파일의 동작을 저장소의 동작인 양 서술했다.
+
+### 0.2 센 것(counted universe)과 열거 정정
+
+`/Users/duckyoungkim/projects/` 하위 **54개** 디렉터리를 직접 열거했다. aigentry 계열 **23개**.
+`ecosystem.json`은 표시용 매니페스트(6개 모듈)이므로 열거 근거로 쓰지 않았다.
+
+초판의 중첩 패키지 열거는 `-maxdepth 2`로 수행되어 **틀렸다**("3개"). depth 4 재열거 결과
+루트 외 중첩 매니페스트는 **9개**(빌드 산출물 `.next/` 3개 별도):
+
+```
+aigentry-aterm/npm/aterm/package.json            ← 초판이 "package.json 없음"이라 한 바로 그것
+aigentry-aterm/npm/aterm-darwin-arm64/package.json
+aigentry-amplify/packages/core, packages/channels
+aigentry-brain/packages/signaling-server
+aigentry-registry/bridge, frontend
+aigentry-ssot/pkg
+```
+Rust/Python: `aigentry-aterm/Cargo.toml` + 크레이트 3개, `aigentry-registry/pyproject.toml`.
+
+**`@dmsdc-ai/aterm`는 존재한다.** `aigentry-aterm/npm/aterm/package.json` = name
+`@dmsdc-ai/aterm`, version **0.2.13**, license **MIT**,
+`optionalDependencies: {@dmsdc-ai/aterm-darwin-arm64: 0.2.13}`,
+`peerDependencies: {@dmsdc-ai/aigentry: ">=0.1.0"}`,
+`dependencies: {@dmsdc-ai/aigentry-devkit: ">=0.0.19", @dmsdc-ai/aigentry-telepty: ">=0.1.88"}`.
+
+**`NOGIT` ≠ 소스 이용 불가.** 초판은 5개 디렉터리를 "소스 이용 불가"로 처분했는데 전부 읽을 수
+있는 파일을 갖고 있다 — architect 26개, design 14개, tester 59개, sandbox 75개, builder 4개.
+올바른 처분은 **"미열람(not-inspected) / 버전 프로버넌스 없음"**이다.
+
+**cmux와 WTM은 설치/릴리스 경로 밖이 아니다.** WTM은 설치기가 `$HOME/.local/lib/wtm`로 복사하고
+PATH에 심링크한다(`install.sh:405-491` [작업트리], HEAD에도 동일 블록 존재 `:360-446`).
+cmux는 `install.sh`에 등장하지 않지만 세션 spawn 표면의 살아있는 의존이다(#544에서 submit 경로만
+바뀌었을 뿐 spawn 표면은 유지). 둘 다 **"심층 감사 범위 밖의 인접 의존"**으로 재분류한다.
+
+**패키지 그래프가 완전하다고 주장하지 않는다.** 위 열거는 파일시스템 walk의 결과이고,
+workspace 선언·private 링크·게시 여부를 교차 검증하지 않았다.
+
+### 0.3 측정하지 않은 것 — 아래 결론에 절대 포함되지 않음
+
+- **npm 레지스트리 요청을 한 건도 실행하지 않았다.** 게시 버전·게시 여부·태그 존재를 주장하지 않는다.
+  로컬 `package-lock.json`의 `resolved`/`integrity`는 **락파일 작성 시점의 기록**일 뿐이다.
+  **로컬 package.json 버전이 서로 같거나 다르다는 사실은 호환성 판정도, 레지스트리 신탁도 아니다.**
+- **설치/업그레이드/언인스톨을 실행하지 않았다.** 파일 모드·ACL·실제 노출을 측정하지 않았다.
+  확인한 것은 **소스가 어떤 스키마로 무엇을 쓰는가**뿐이다.
+- **GitHub Actions 실행 이력을 조회하지 않았다.** 워크플로 YAML이 *무엇을 호출하도록 정의되어
+  있는가*만 읽었다. **"테스트가 실행된 적 없다"는 주장은 할 수 없고, 하지 않는다.**
+- **실행 중 데몬/서비스에 접속하지 않았다.** 보안 스캔·인증 프로브·익스플로잇 없음(Snyk N/A).
+- 상속받은 과거 수치는 하나도 헤드라인으로 승격하지 않았다.
 
 ---
 
-## 1. 총평 (executive verdict)
+## 1. 총평
 
 ### 1.1 지켜야 할 강점
 
-**(a) telepty의 보안·수명주기 규율은 이 생태계에서 가장 성숙하다.** `daemon.js`의 인증 계층은
-사고 이력을 코드 주석에 근거로 박아 두고 고쳤다 — #815(토큰 발급이 이름 기준·멱등이라 재등록만
-하면 남의 토큰을 받던 결함, 지금은 최초 등록 1회 발급 + 모든 destroy 경로에서 폐기),
-#47 P4(provenance nonce가 동일 결함을 공유했고 같은 수명주기로 통합), #45(fan-out blast-radius
-상한), #43(inject 감사 스파인, 실패해도 전달을 막지 않음). 브라우저 origin 허용목록은 **기본 비어
-있음 = 전면 거부**이고(`daemon.js:255-258`), `createAuthMiddleware`가 `app.use`로 전역
-등록(`daemon.js:391`)되어 그 앞에 놓인 라우트는 `/api/health` 하나뿐이며 그마저
-`{status, version}`만 반환한다(`daemon.js:386-388`). `app.use(cors())`(`daemon.js:248`)가
-느슨해 보이지만 origin 거부는 인증 미들웨어가 담당하는 계층 분리 설계로, **이번 읽기에서 결함으로
-볼 근거를 찾지 못했다.**
+**(a) telepty의 인증 계층은 사고 이력을 근거로 고쳐져 있다.** `daemon.js` 주석이 #815(토큰이
+이름 기준·멱등 발급이라 재등록만으로 남의 토큰을 받던 결함 → 최초 등록 1회 발급 + destroy 시
+폐기), #47 P4(provenance nonce 동일 결함 통합), #45(fan-out 상한), #43(감사 스파인)을 명시한다.
+브라우저 origin 허용목록 기본값은 비어 있고(= 전면 거부, `daemon.js:255-258`),
+`createAuthMiddleware`가 `app.use` 전역 등록(`:391`)이며 그 앞 라우트는 `/api/health` 하나로
+`{status, version}`만 반환한다(`:386-388`). **이 읽기 범위에서 결함 근거를 찾지 못했다** —
+없다고 증명한 것은 아니다.
 
-**(b) telepty 테스트 목록에 드리프트가 없다.** `package.json`의 `test` 스크립트가 테스트 파일을
-수작업 열거하는 구조라 누락을 의심했으나, 실측 결과 **열거 124개 / 디스크 124개, 누락 0, 유령 0**.
-"테스트 러너 실제 포함" 항목에서 telepty는 결함이 아니다.
+**(b) telepty 테스트 열거에 드리프트가 없다.** `package.json` `test`가 열거한 124개 =
+디스크 124개, 누락 0, 유령 0. "테스트 러너 실제 포함"에서 telepty는 결함이 아니다.
 
-**(c) orchestrator와 telepty의 릴리스 게이트는 모범 사례다.**
-`aigentry-orchestrator/.github/workflows/release.yml:3-15`는 왜 이렇게 생겼는지를 사고 이력으로
-적어 두었다 — "런북이 태그가 퍼블리시했다고 주장했지만 실제로는 3개 버전이 태그 없이 손으로
-올라갔다". 그 결과 태그↔package.json 버전 일치 게이트(`:48-59`), 시크릿 부재 = 실패(no-op 아님),
-레지스트리에서 되읽어 증명하는 단계, 동시 실행 큐잉(`:26-28`)이 들어 있다.
+**(c) orchestrator/telepty release.yml은 참조할 만한 패턴이다.** orchestrator
+`release.yml:3-15`가 사고 이력("런북이 태그가 퍼블리시했다고 주장했지만 3개 버전이 태그 없이
+손으로 올라갔다")을 적고, 태그↔package.json 일치 게이트(`:48-59`), 시크릿 부재=실패,
+레지스트리 되읽기, 동시 실행 큐잉(`:26-28`)을 둔다. **이 파일들이 실제로 그렇게 동작했는지는
+실행 이력을 안 봤으므로 모른다.**
 
-**(d) 설치기의 실패 정책이 데이터로 선언되어 있다.** `config/installer-manifest.json`의
-component별 `failure_policy: hard|soft`와 `config/modules/*.adapter.json`의 fallback 체인
-(npm-global → stub → skip)은 하드코딩이 아니라 데이터다. 에러 분류(network/auth/permission/
-disk/timeout)별 재시도·halt 정책도 `lib/install-fallback.js:50-61`에 표로 있다.
+**(d) 설치기 실패 정책이 데이터로 선언되어 있다.** `installer-manifest.json`의
+`failure_policy: hard|soft`, 어댑터 fallback 체인, 에러 분류별 재시도/halt 표.
 
-**(e) 시크릿 취급 습관 자체는 존재한다.** `install.sh`의 env fan-out은 `printf %q`로 인용하고
-`chmod 600`을 건다(`install.sh:263-270`). 문제는 이 습관이 **한 파일에만** 적용됐다는 것(F2).
+**(e) 시크릿 인용·보호 습관이 존재한다.** env fan-out은 `printf %q` 인용 후
+`chmod 600`(`install.sh:265,269` — **[HEAD 확인]**, HEAD에서도 같은 라인). 문제는 이 습관이
+같은 값의 다른 기록 지점에는 적용되지 않았다는 것(F2).
 
 ### 1.2 가장 영향이 큰 계통적 약점
 
-한 문장으로: **품질 기준이 저장소마다 각자 발명되고, 폭발 반경이 가장 큰 저장소(devkit = 설치기)에
-가장 낮은 기준이 걸려 있다.** orchestrator/telepty가 릴리스 게이트를 만들어 놓았지만 devkit·brain·
-deliberation으로 전파되지 않았고(F4/F7), 설치기 자체는 CI에서 `--help`만 돌린다. 그리고 설치
-경로가 **세 갈래로 갈라져** 서로 다른 버전·다른 컴포넌트를 설치한다 — 메타 패키지(F1), 모듈별
-직접 설치(README), devkit 프로파일(F3/F5). 어느 것이 정본인지 코드가 말해주지 않는다.
+한 문장: **품질 규율이 저장소별로 각자 발명되고, 폭발 반경이 큰 곳(설치기)에 가장 낮은 기준이
+선언되어 있으며, 설치 경로 자체가 커밋되지 않은 리팩터 한가운데 있다.**
 
-두 번째 축은 **매니페스트 다중화**다. `ecosystem.json`(표시용, 6개 저장소에 바이트 동일 복제),
-`installer-manifest.json`(프로파일/호환성), `config/modules/*.adapter.json`(실제 설치)이
-공존하는데 셋이 서로 어긋나 있고(F5/F6), 어긋난 값이 **사용자 화면에 출력된다**.
+- **경로 분기**: 메타 패키지 / 모듈별 README 명령 / devkit 프로파일 — 셋이 서로 다른 버전 제약을
+  선언한다(F1, F5). 어느 것이 정본인지 소스가 말하지 않는다.
+- **매니페스트 다중화**: `ecosystem.json`(표시용, 6사본), `installer-manifest.json`(프로파일/
+  호환성), `config/modules/*.adapter.json`(작업트리에서만 채워진 설치 체인)이 공존하고 값이 어긋난다(F5, F6).
+- **선언된 게이트의 얕음**: devkit CI/release가 호출하도록 정의한 것은 `--help` 한 줄이다(F4).
 
-### 1.3 최소 개선안 — 지금 / 다음 / 보류
+### 1.3 최소 개선안
 
-**지금(now, 각 1~10줄 수준의 외과적 변경).**
-1. `install-state.json`에서 `api_key` 필드 제거 (F2). 값이 필요한 곳은 이미 `env.sh`(0600)다.
-2. `@dmsdc-ai/aigentry` 5개 의존성 range를 현재 로컬 버전에 맞게 올림 (F1).
-3. Windows 설치기에서 `orchestrator-role`이 선택됐는데 미지원이면 **경고 후 status를
-   `unsupported`로 기록** (F3). 구현 이식이 아니라 침묵 제거가 목표.
-4. `install.sh`의 `info "Installing $TELEPTY_SPEC …"` 를 adapter 체인이 실제로 쓸 spec으로
-   교체하거나 삭제 (F5).
+**지금(외과적).**
+1. `install-state.json` 스키마에서 `api_key` 값 필드 제거 (F2). — 단, 스키마 소비자 확인이 선행.
+2. `@dmsdc-ai/aigentry` 의존성 range 재산정 (F1) — 단, 목표 버전은 레지스트리 확인 후 결정.
+3. Windows 설치기의 `orchestrator-role` 침묵 제거 (F3) → **#663의 "명시적 미지원 문서화" 선택지**.
+4. devkit `lib/install-fallback.js`와 어댑터 변경분의 커밋 여부 결정 (F5의 선행 조건).
 
-**다음(next, 1개 PR 규모).**
-5. devkit `npm test`가 이미 존재하는 4개 스위트를 실제로 돌리게 하고 ci.yml/release.yml에 연결 (F4).
-6. `ecosystem.json` 재생성 스크립트가 표만이 아니라 **메타 패키지 dependencies도 검증**하도록
-   확장하거나, 최소한 불일치 시 실패하는 체크 추가 (F6, F1의 재발 방지).
-7. `install.sh`에 phase 경계 롤백/`trap` 도입 — 최소한 실패 시 "무엇이 남았는지"를
-   state에 기록하고 사용자에게 되돌리는 명령을 출력 (F8).
+**다음.**
+5. devkit `npm test` 진입점이 기존 4스위트를 호출하도록 연결 (F4) — baseline 확보 후.
+6. `ecosystem.json` 재생성 시 dependencies range·게시 상태 모순을 검증 (F6, F1 재발 방지).
+7. 설치 실패 시 진행 상태 저널링 (F8) — 단순 `trap` 1줄이 아니라 멱등성 테스트 포함.
 
-**보류(defer, 지금 하면 손해).**
-- `installer-manifest.json` ↔ `adapter.json` **통합**. 둘 다 소비자가 있고(프로파일 해석 vs
-  fallback 체인) 통합은 설치기 전체 재작성이다. F5는 "출력이 거짓말한다"만 고치면 충분하다.
-- ssot/registry의 **중첩 패키지 구조 평탄화**. 릴리스 자동화(F7)가 먼저다. 구조 이동은
-  의존성/마이그레이션 증거 없이 quick win으로 다룰 일이 아니다.
-- 저장소 통폐합·프레임워크 교체 류. 이번 감사에서 그런 판단을 뒷받침할 증거를 수집하지 않았다.
+**보류.**
+- `installer-manifest.json` ↔ adapter 통합 — 설치기 재작성급. F5는 커밋 상태 정리로 충분.
+- ssot/registry 중첩 구조 평탄화 — 릴리스 프로버넌스가 먼저. 의존성/마이그레이션 증거 없음.
+- 저장소 통폐합·프레임워크 교체 — 이번 감사에 근거 없음.
 
-### 1.4 도입하지 말아야 할 아이디어와 이유
+### 1.4 도입하지 말아야 할 것
 
-- **"모든 저장소에 CI 템플릿 일괄 살포".** logger/ssot/hooks/context/bridge/dustcraw/amplify는
-  성숙도와 공개 여부가 제각각이다. F7이 요구하는 건 *퍼블리시되는 것*에 대한 증명이지 전 저장소
-  CI가 아니다. 7개 저장소에 도는 워크플로를 만들면 유지 비용만 늘고 아무도 안 본다.
-- **telepty 테스트 목록을 glob으로 바꾸기.** 드리프트 0이 실측됐다. 지금 바꾸면 실행 순서와
-  격리 전제가 깨질 위험만 새로 생긴다.
-- **메타 패키지에 버전 자동 범프 봇.** F1의 원인은 자동화 부재가 아니라 "표만 갱신하고 의존성은
-  안 봤다"는 것이다. 재생성 스크립트에 검증 한 줄 추가가 봇보다 싸다.
-- **설치기 전면 재작성(예: Node 단일 구현으로 통일).** bash 1013줄 / ps1 506줄의 차이는 F3
-  하나로 요약되고, 그건 20줄이면 막는다. 재작성은 §1(경량)과 Rule 29에 정면으로 어긋난다.
+- **전 저장소 CI 템플릿 살포.** 성숙도·공개 여부가 제각각이다. 필요한 건 *게시되는 것*의 증명.
+- **telepty 테스트 목록을 glob으로 변경.** 드리프트 0 실측. 실행 순서/격리 전제만 깨진다.
+- **메타 패키지 버전 자동 범프 봇.** 원인은 자동화 부재가 아니라 검증 부재다.
+- **설치기 전면 재작성.** §1(경량)·Rule 29 위반. F3은 수 줄로 막힌다.
+- **초판이 제안했던 "F2+F8 한 PR", "F4+F7 한 태스크" 묶음.** 파일이 같다는 이유로 시크릿 보호와
+  설치 롤백을 묶으면 수용 기준이 섞인다. 테스트 진입점 누락과 6개 저장소 릴리스 자동화도
+  소유자와 수용 기준이 다르다. **분리한다** (§3 표 참조).
 
 ---
 
 ## 2. 발견 사항 (8건)
 
-각 행: 심각도와 확신도는 **분리해서** 적었다. "현재 영향"은 지금 일어나는 일, "가정된 위험"은
-조건이 붙어야 일어나는 일이다.
-
 ---
 
-### F1 — 메타 패키지 `@dmsdc-ai/aigentry`의 의존성 range가 생태계를 구세대에 고정
+### F1 — 메타 패키지 `@dmsdc-ai/aigentry`의 의존성 range가 같은 디스크의 소스 버전보다 낮다 (재발)
 
-- **심각도 High / 확신도 High(로컬 매니페스트 대조로 확정)**
-- **증거**: `/Users/duckyoungkim/projects/aigentry/package.json` (repo HEAD `f959b29`, dirty=4)
+- **심각도 High / 확신도 High(로컬 매니페스트 대조에 한해) / 신규성 낮음 — 재발 증거**
+- **증거** [HEAD 확인] `aigentry/package.json`:
 
-  | 메타가 요구 | semver 해석 | 같은 디스크의 로컬 소스 버전 |
+  | 메타 range | semver 해석 | 같은 디스크 로컬 소스 |
   |---|---|---|
-  | `@dmsdc-ai/aigentry-devkit: ^0.0.22` | `>=0.0.22 <0.0.23` (사실상 정확히 0.0.22) | **0.1.14** |
-  | `@dmsdc-ai/aigentry-brain: ^0.2.8` | `>=0.2.8 <0.3.0` | **0.3.1** |
-  | `@dmsdc-ai/aigentry-telepty: ^0.6.6` | `>=0.6.6 <0.7.0` | **0.8.3** |
-  | `@dmsdc-ai/aigentry-deliberation: ^0.0.47` | 정확히 0.0.47 | 0.0.47 (일치) |
-  | `@dmsdc-ai/aterm: ^0.2.14` | `>=0.2.14 <0.3.0` | 로컬 package.json 없음(Cargo) |
+  | `aigentry-devkit ^0.0.22` | `>=0.0.22 <0.0.23` | 0.1.14 |
+  | `aigentry-brain ^0.2.8` | `>=0.2.8 <0.3.0` | 0.3.1 |
+  | `aigentry-telepty ^0.6.6` | `>=0.6.6 <0.7.0` | 0.8.3 |
+  | `aigentry-deliberation ^0.0.47` | 정확히 0.0.47 | 0.0.47 |
+  | `@dmsdc-ai/aterm ^0.2.14` | `>=0.2.14 <0.3.0` | **0.2.13** (`npm/aterm/package.json`) |
 
-  `README.md:20`이 `npm i -g @dmsdc-ai/aigentry`를 **1순위 설치 명령**으로 제시한다. 반면
-  `README.md:86/105/118/129`의 모듈별 설치는 range 없이 최신을 받는다.
-  `bin/aigentry.js:56`은 모듈이 빠졌을 때 `npm i -g @dmsdc-ai/aigentry` 재실행을 안내하는데,
-  range가 막고 있으므로 재실행해도 상위 버전으로 올라가지 못한다.
-- **현재 영향**: 메타 경로 설치자와 모듈별 경로 설치자가 **서로 다른 telepty 메이저 세대**를 쓴다.
-  telepty 0.6.x는 0.8.x가 닫은 인증/제출/수명주기 수정(#815/#820/#826/#844/#860/#916 계열 —
-  테스트 파일명으로 확인) 이전이다. devkit은 0.0.22 ↔ 0.1.14로 fallback 체인·프로파일·
-  orchestrator-role 자체가 존재하지 않던 시대에 고정된다.
-- **가정된 위험**: 레지스트리 실제 상태는 측정하지 않았으므로, 게시된 버전이 로컬과 다르면
-  체감 격차는 달라질 수 있다. 단 range 상한이 로컬 소스보다 낮다는 사실은 그와 무관하게 성립한다.
-- **근본 원인**: `ecosystem.json` 표 재생성(`scripts/gen-readme.mjs`, git log `f959b29`/`c15c8df`/
-  `afa9449`/`fb15731`/`7b97bd1` — 5회 연속 "표 갱신" 커밋)은 있는데, 같은 저장소의
-  `dependencies`를 함께 보는 단계가 어디에도 없다.
-- **최소 수정**: `package.json`의 4개 range를 현재 값으로 상향(1커밋). 재발 방지는 F6과 묶어
-  `gen-readme.mjs`에 "표의 버전과 dependencies range가 모순이면 exit 1" 한 블록 추가.
-- **수정 전 재현/수용 게이트**: 격리된 HOME에서 `npm ls -g --depth=0` 또는
-  `npm i -g @dmsdc-ai/aigentry --dry-run` 결과의 devkit/brain/telepty 버전이 각 모듈 저장소의
-  로컬 `package.json` 버전보다 낮음을 보인다. 수정 후 같은 명령에서 셋이 로컬 버전 이상.
-- **소유**: `aigentry` (메타 패키지 저장소) / release 역할
-- **의존·롤아웃·롤백**: 독립. 메타 패키지 patch 릴리스 1회. 롤백 = 이전 range 복원(무해).
-- **태스크 매핑**: **NEW 후보**. #884(npm 토큰 회전)는 자격증명 문제로 무관, #534/#895는
-  런타임 수명주기라 무관. 기존 큐 1138행에서 메타 패키지 의존성 range를 다루는 행을 찾지 못했다.
+  `README.md:20`이 `npm i -g @dmsdc-ai/aigentry`를 1순위 명령으로 제시한다.
+  `bin/aigentry.js:56`은 모듈 누락 시 같은 명령 재실행을 안내한다.
+  aterm 쪽은 반대 방향 제약을 건다 — `peerDependencies: {@dmsdc-ai/aigentry: ">=0.1.0"}`,
+  `dependencies: {devkit ">=0.0.19", telepty ">=0.1.88"}` (하한만, 상한 없음).
+- **현재 영향(주장 범위 한정)**: 메타 range의 상한이 로컬 소스 버전보다 낮다는 **정적 사실**.
+  실제로 어떤 버전이 설치되는지는 레지스트리 상태에 달렸고 **측정하지 않았다.** 따라서
+  "메타 설치자는 telepty 0.6.x를 쓴다"는 초판 서술은 **철회**한다. 말할 수 있는 것은
+  "선언된 상한이 로컬 소스보다 낮다"까지다. 또한 로컬 aterm 0.2.13은 메타가 요구하는
+  `^0.2.14`를 **만족하지 못한다** — 로컬끼리도 자기모순이다.
+- **근본 원인**: 표 재생성(`scripts/gen-readme.mjs`; git log `f959b29`/`c15c8df`/`afa9449`/
+  `fb15731`/`7b97bd1` — 5회 연속 "표 갱신")과 `dependencies` 점검이 연결되어 있지 않다.
+- **최소 수정**: range 재산정 + `gen-readme.mjs`에 "표 버전과 range가 모순이면 exit 1" 검증.
+  **목표 버전은 레지스트리 확인 후 결정** — 이 보고서는 목표값을 지정하지 않는다.
+- **수용/재현(수정 전)**: 순수 로컬 검증 — `aigentry/package.json`의 각 range와 대응 저장소
+  로컬 `package.json` version을 semver로 대조해 불만족 항목이 ≥1임을 출력. 수정 후 0.
+  (설치 실행·레지스트리 조회는 이 게이트에 포함하지 않는다.)
+- **소유**: `aigentry` / release
+- **롤아웃/롤백**: 메타 patch 릴리스 1회. 롤백 = range 복원.
+- **태스크 매핑 — dedup 근거**:
+  - **`ux-public-front-door` (done)** 이 이미 같은 결함을 기록했다: *"meta pkg stale pins
+    (telepty ^0.1.83 vs 0.6.6)"*. 오늘 측정치는 `^0.6.6 vs 0.8.3` — **핀이 한 번 갱신됐다가 다시
+    낡았다.** 즉 본 건은 신규 발견이 아니라 **날짜가 찍힌 재발**이다.
+  - **#62 (done)** 은 메타 패키지 생성 자체(NOTE: `v0.1.0 aigentry meta`),
+    **#64 (done)** 은 aterm→메타 의존 전환(NOTE: `v0.1.55 meta dep`) — 위 aterm 역방향 제약이
+    이 스코프다.
+  - **#1136 (delegated)** 은 스펙에 npm/install/README+ecosystem 생성 소스를 **명시적으로 포함**한다.
+  - **권고: NEW를 만들지 말 것.** ①`ux-public-front-door`/#62/#64에 **2026-09-08 재발 증거**를
+    날짜와 함께 부기, ②재발 방지(생성 스크립트 검증)는 **#1136의 확장**으로 처리.
+    별도 태스크는 #1136과 수용 기준이 겹쳐 중복이 된다.
 
 ---
 
-### F2 — 레지스트리 API 키가 `install-state.json`에 평문·기본 퍼미션으로 기록 (양 OS 공통)
+### F2 — 설치기가 레지스트리 API 키를 state 파일에 평문 필드로 기록하는 스키마 (양 OS)
 
-- **심각도 High / 확신도 High(양쪽 구현 모두 직접 확인)**
-- **증거**: `aigentry-devkit` HEAD `bb7876b` (dirty=51)
-  - bash: `install.sh:184-215` `write_installer_state()` — `REGISTRY_API_KEY`를 env로 넘겨
-    `state.registry.api_key`로 JSON에 기록. 기록 후 `chmod` **없음**.
-  - ps1: `install.ps1:161` `api_key = $RegistryApiKey`, `install.ps1:172`
-    `Set-Content -Path $DevkitStateFile`. ACL 설정 **없음**.
-  - 대조군: env fan-out은 제대로 되어 있다 — `install.sh:263-270`에서 `printf %q` 인용 후
-    `chmod 600 "$DEVKIT_ENV_FILE"`.
-  - `install.sh` 전체 `chmod` 호출은 3곳뿐: `:269`(env 파일 0600), `:447`(HUD +x),
-    `:488`(WTM +x). state 파일은 그 어디에도 없다.
-  - `install.ps1` 전체에서 `Acl|icacls|Protect|SetAccessControl` **0건**.
-  - 파일 위치: `${XDG_CONFIG_HOME:-$HOME/.config}/aigentry-devkit/install-state.json`
-    (`install.sh:24-25`), 설치 완료 배너가 경로를 그대로 출력(`install.sh:1005`).
-- **현재 영향**: `registry-wiring`을 선택하고 API 키를 입력한 설치에서, 키가 **두 곳**에 남는데
-  한 곳만 보호된다. 일반 umask 022에서 state 파일은 0644로 생성된다. 다중 사용자 머신·백업·
-  dotfiles 동기화·로그 수집기가 그대로 가져간다.
-- **가정된 위험**: 단독 사용자 개인 머신이면 실질 노출은 제한적이다. 심각도를 High로 둔 이유는
-  "같은 값을 같은 설치기가 한 파일에선 보호하고 다른 파일에선 안 한다"는 **일관성 결손**이 원인
-  진단을 어렵게 만들기 때문이다.
-- **부수 관찰(같은 뿌리, 별건 아님)**: PowerShell 쪽 env fan-out은 `'$RegistryApiKey'` 단일 인용
-  보간이라(`install.ps1:180`) 값에 `'`가 들어가면 파일이 깨진다. bash는 `printf %q`로 안전.
-  또한 bash는 `{ … } > "$FILE"` 후 `chmod` 순서라 파일 생성~chmod 사이 짧은 창이 존재
-  (`umask 077` 선행이면 사라진다).
-- **근본 원인**: state 파일이 "관측용 메타데이터"로 설계됐는데 값 전달용 필드(api_key)가 섞여
-  들어갔고, 보호는 값 전달용으로 설계된 env 파일에만 붙었다.
-- **최소 수정**: `install.sh:210` 블록과 `install.ps1:161`에서 `api_key` 필드를 제거하고,
-  state에는 `api_key_present: true/false`만 남긴다. (필요하다면 추가로 state 파일에도 0600.)
-- **수정 전 재현/수용 게이트**: 임시 HOME + `AIGENTRY_API_KEY=<더미>`로
-  `AIGENTRY_INSTALL_PROFILE=autoresearch-public bash install.sh --force` 후
-  `grep -c api_key ~/.config/aigentry-devkit/install-state.json` → 현재 1, 수정 후 0.
-  `stat -f %Lp` 로 퍼미션도 함께 기록.
+- **심각도 High / 확신도: 스키마 High, 실제 노출 미측정**
+- **증거**
+  - bash [**HEAD 확인** — `git show HEAD:install.sh` 에서도 동일 라인]:
+    `install.sh:245` `api_key: omitEmpty(env.REGISTRY_API_KEY || "")`,
+    값 전달 `:205`, heredoc 시작 `:210`, 파일 기록 `:255`
+    (`fs.writeFileSync(targetPath, JSON.stringify(state, null, 2))`).
+  - ps1 [작업트리; HEAD 453줄본 미대조]: `install.ps1:161` `api_key = $RegistryApiKey`,
+    `:172` `Set-Content -Path $DevkitStateFile`.
+  - 대조군: env fan-out은 `printf %q` + `chmod 600`(`install.sh:265,269` [HEAD 확인]).
+  - `install.sh` 전체 `chmod` 3곳(`:269` env, `:447` HUD, `:488` WTM) — state 파일 없음.
+    `install.ps1` 전체 `Acl|icacls|SetAccessControl` 0건.
+  - 경로: `${XDG_CONFIG_HOME:-$HOME/.config}/aigentry-devkit/install-state.json`(`:24-25`),
+    완료 배너가 경로 출력(`:1005`).
+- **현재 영향(주장 범위 한정)**: **소스가 선언하는 스키마상** 같은 시크릿이 두 파일에 기록되는데
+  보호 코드는 한쪽에만 있다. **실제 파일 모드·ACL·노출 여부는 설치를 실행하지 않았으므로
+  측정하지 않았다.** 초판의 "umask 022에서 0644로 생성된다"는 **추론이었고 철회**한다.
+- **근본 원인**: state 파일이 관측용 메타데이터로 설계됐는데 값 전달용 필드가 섞였고, 보호는
+  값 전달용 파일에만 붙었다.
+- **최소 수정**: `install.sh:245` / `install.ps1:161`의 값 필드를 **존재 여부 불리언**으로 대체.
+  단순 필드 삭제는 스키마 소비자를 깨뜨릴 수 있다 — `install.sh:982`가 같은 파일에 orchestrator
+  status를 **병합**하므로 소비자가 최소 1곳 존재한다.
+- **수용/재현(수정 전) — 실환경 금지**:
+  - 격리 HOME + **더미 자격증명** + 의존 스텁(실제 전역 npm 설치·데몬 기동 없이 phase 7만
+    도달하는 하니스)에서 state 파일을 생성.
+  - 판정은 **JSON 파싱으로**: `state.registry.api_key` 필드가 존재하고 그 값이 주입한 더미
+    문자열과 일치하는가. **`grep api_key`를 쓰지 말 것** — 대체 필드명 `api_key_present`가
+    같은 부분문자열을 포함해 위양성이 난다.
+  - 수정 후: 금지 필드 부재 + 더미 문자열이 파일 어디에도 없음 + 기존 소비자(`:982` 병합) 통과.
+  - 파일 모드/ACL 측정은 **별도 항목**으로 분리(이번 감사 미측정).
+- **롤백 주의**: **노출 필드를 되살리는 것을 롤백 경로로 쓰지 말 것.** 롤백은 소비자 호환을
+  유지한 채 필드를 되돌리는 마이그레이션이어야 하며, 리댁션 로직에는 테스트가 필요하다.
 - **소유**: `aigentry-devkit` / coder
-- **의존·롤아웃·롤백**: 독립. state 스키마의 소비자를 먼저 확인해야 함(`install.sh:982`가
-  orchestrator status를 같은 파일에 병합하므로 스키마 소비자가 최소 1곳 존재).
-  롤백 = 필드 복원.
-- **태스크 매핑**: **NEW 후보**. `sec-wire-enforce-spawn`은 spawn 검증 축이라 다르고, #884는
-  npm 토큰이라 다르다. 기존 큐에서 devkit state 파일 시크릿을 다루는 행을 찾지 못했다.
+- **태스크 매핑**: **NEW 후보(단독)**. **#884와 중복 아님** — #884는 *공용 npm 토큰의 90일 만료
+  추적*(자격증명 수명)이고, 본 건은 *설치기가 다른 자격증명을 기록하는 스키마*다. 소유 저장소,
+  자격증명 종류, 수용 기준이 모두 다르다. **F8과 묶지 않는다** — 같은 파일을 건드린다는 것은
+  묶을 이유가 아니며 수용 기준(리댁션 vs 저널링 멱등성)이 다르다.
 
 ---
 
-### F3 — Windows 설치기에 `orchestrator-role`이 아예 존재하지 않는데 프로파일은 선택 가능하고 "완료"로 끝난다
+### F3 — Windows 설치기에 `orchestrator-role` 처리가 없고 프로파일은 선택 가능하다
 
-- **심각도 High / 확신도 High(문자열 카운트로 확정)**
-- **증거**: `aigentry-devkit` HEAD `bb7876b`
-  - `grep -c "orchestrator" install.ps1` → **0**. 경고 문구조차 없다.
-  - `install.sh:791` `header "Phase 8. Orchestrator Role"` — clone/build/bin_link/state 기록까지
-    약 200줄(`install.sh:791~1000`).
-  - `install.ps1:483` `Write-Header "Phase 8. Cross-platform Notes"` — 같은 phase 번호에
-    안내문 3줄. 게다가 `Should-RunPhase 8` 가드 없이 **무조건** 출력된다.
-  - `installer-manifest.json`의 프로파일 `orchestrator`와 `ecosystem-full`은 components에
-    `orchestrator-role`을 포함한다. ps1의 `Test-ComponentSelected`는 이 이름을 조회하는 곳이 없다.
-  - `install.ps1:489-501` 완료 배너는 skills/HUD/telepty/deliberation/brain/dustcraw/registry/WTM
-    을 나열하고 orchestrator는 언급하지 않는다 → "빠졌다"는 신호가 사용자에게 도달하지 않는다.
-- **현재 영향**: Windows에서 `AIGENTRY_INSTALL_PROFILE=orchestrator`로 설치하면 **조용히
-  불완전한 설치**가 "Installation Complete!"로 끝난다. `dispatch.sh`/`session-reconciler.sh`
-  bin link도, `~/.aigentry/instructions` 트리도 생기지 않는다
-  (`orchestrator-role.adapter.json`의 healthcheck가 정확히 그 둘을 본다).
-- **가정된 위험**: orchestrator-role의 `failure_policy`는 `soft`이므로 "지원 안 함"이 설계 의도일
-  수 있다. 그렇더라도 **선택 가능한데 아무 말이 없는 것**은 의도로 볼 수 없다.
-- **근본 원인**: 두 설치기가 phase 번호는 공유하되 phase **내용**의 일치를 검증하는 장치가 없다.
-  ps1의 phase 8이 다른 의미로 재사용된 것이 그 증상이다.
-- **최소 수정**: `install.ps1`에 `if (Test-ComponentSelected "orchestrator-role") { Write-Warn
-  "orchestrator-role is not supported by the Windows installer — install manually" }` 와
-  state에 `orchestrator = @{ status = "unsupported" }` 기록. 약 6줄. **기능 이식이 아니다.**
-- **수정 전 재현/수용 게이트**: Windows(또는 pwsh)에서
-  `$env:AIGENTRY_INSTALL_PROFILE="orchestrator"; ./install.ps1` 실행 후
-  `install-state.json`에 orchestrator 키가 없고 stderr에 경고가 없음을 보인다.
-  수정 후 경고 1줄 + `status: unsupported` 기록.
+- **심각도 High / 확신도 High(HEAD·작업트리 양쪽 확인)**
+- **증거**
+  - `grep -c orchestrator install.ps1` → **0**. **HEAD 453줄본에서도 0** (`git show` 확인).
+  - `install.sh:791` `header "Phase 8. Orchestrator Role"` [작업트리] / HEAD `:729` 동일 헤더.
+  - `install.ps1:483` `Write-Header "Phase 8. Cross-platform Notes"` — 같은 phase 번호가 다른
+    의미로 쓰이고, `Should-RunPhase 8` 가드 없이 무조건 출력.
+  - `installer-manifest.json` [HEAD 확인]의 `orchestrator` / `ecosystem-full` 프로파일은
+    components에 `orchestrator-role`을 포함. ps1의 `Test-ComponentSelected`가 이 이름을
+    조회하는 지점이 없다.
+  - `install.ps1:489-501` 완료 배너에 orchestrator 항목 없음.
+- **현재 영향(주장 범위 한정)**: **소스 동작상** Windows에서 해당 프로파일을 선택해도 ps1에
+  대응 처리가 없고 경고 경로도 없다. 실제 Windows 실행은 하지 않았다.
+- **근본 원인**: 두 설치기가 phase 번호만 공유하고 phase 내용 일치를 검증하는 장치가 없다.
+- **최소 수정**: **#663이 제시한 두 선택지 중 "명시적 미지원 문서화"**가 최소 경로 —
+  `Test-ComponentSelected "orchestrator-role"` 시 경고 + state에 `status: unsupported` 기록.
+  포팅은 별도 결정 사항.
+- **수용/재현(수정 전)**: pwsh에서 `$env:AIGENTRY_INSTALL_PROFILE="orchestrator"` 로 실행 시
+  경고 없음 + state에 orchestrator 키 없음. 수정 후 경고 1줄 + `unsupported` 기록.
 - **소유**: `aigentry-devkit` / coder
-- **의존·롤아웃·롤백**: 독립, 순수 가산. 롤백 = 블록 제거.
-- **태스크 매핑**: **NEW 후보**. #895(aterm daemon ownership), #534(cleanup)와 무관.
-  기존 큐에서 Windows 설치기 프로파일 갭 행을 찾지 못했다.
+- **태스크 매핑**: **#663을 UPDATE — NEW 금지.** #663(pending, P1, 2026-07-05)의 본문이
+  *"install.ps1 parity — Windows orchestrator 프로파일 포팅 or 명시적 미지원 문서화"*로
+  **정확히 이 건**이며, NOTE에 *"orchestrator install.sh 27회 vs ps1 0회"*까지 기록되어 있다.
+  본 감사의 기여는 **2026-09-08 재확인 + HEAD/작업트리 양쪽에서 0건 + 완료 배너가 누락을 숨긴다는
+  추가 증거**다. 초판이 이를 NEW로 제안한 것은 오류이며 철회한다.
 
 ---
 
-### F4 — 폭발 반경이 가장 큰 devkit의 CI/릴리스 게이트가 `--help` 한 줄이고, 이미 있는 테스트 4스위트는 한 번도 실행되지 않는다
+### F4 — devkit의 CI/release 워크플로가 호출하도록 **정의한** 것은 `--help` 한 줄이다
 
-- **심각도 High / 확신도 High**
-- **증거**: `aigentry-devkit` HEAD `bb7876b`
-  - `.github/workflows/ci.yml:30-31` — 3 OS × Node 3버전 = **9개 잡이 전부**
-    `node bin/aigentry-devkit.js --help` 만 실행.
-  - `.github/workflows/release.yml:21` — 퍼블리시 전 validate 잡도 동일하게 `--help`.
-    태그↔package.json 일치 게이트 없음, 레지스트리 되읽기 없음.
-    `release.yml:35-37` README 재생성은 `continue-on-error: true`.
-  - `package.json` scripts: `test` = `node bin/aigentry-devkit.js --help`.
-    실제 스위트는 별도 이름으로만 존재 — `test:scaffold-project`, `test:scaffold-install-hooks`,
-    `test:logger-emit`, `test:skills-drift`. **어느 워크플로도 이 4개를 호출하지 않는다.**
-  - 존재하는 테스트 실체: `tests/scaffold-project/v1/` 9개 spec(fresh, reapply, uninstall,
-    dry-run-no-writes, malformed-settings, sentinel-drift, template-override, non-interactive,
-    unknown-cli-flag), `tests/scaffold-install-hooks/v1/` 5개 test, `tests/logger-emit/v1/` 1개,
-    `tests/skills-drift/v1/` 1개 — 총 16개 파일, `test(`/`it(` 매칭 **43건**.
-  - 대조군: `aigentry-orchestrator/.github/workflows/ci.yml`은 `npm test`(=`tsc -p . &&
-    scripts/run-tests.mjs`) + `tests/dispatch/run-all.sh` + packaging 테스트 3종을 돌린다.
-- **현재 영향**: 설치기 회귀가 CI를 통과한다. 특히 `uninstall.spec.js`, `dry-run-no-writes.spec.js`,
-  `malformed-settings.spec.js`, `sentinel-drift.spec.js`, `skills-drift.test.js` — 즉 **데이터
-  보존·비파괴·설정 손상 내성·스킬 드리프트**를 검증하려고 쓴 테스트가 정확히 그 위험이 가장 큰
-  저장소에서 잠들어 있다. F2·F3 같은 결함이 CI에 잡히지 않은 이유가 여기에 있다.
-- **가정된 위험**: 워크플로 실행 이력을 조회하지 않았으므로 "CI가 실제로 그린이었다"는 주장은
-  하지 않는다. YAML이 정의한 커버리지만 근거다.
-- **근본 원인**: `test`가 "CLI가 죽지 않는지" 스모크로 먼저 자리를 잡았고, 나중에 추가된 진짜
-  스위트들이 별도 스크립트명으로 붙으면서 진입점을 갱신하지 않았다.
-- **최소 수정**: `"test": "npm run test:scaffold-project && npm run test:scaffold-install-hooks
-  && npm run test:logger-emit && npm run test:skills-drift"` 로 교체하고 ci.yml의 마지막
-  스텝을 `npm test`로 변경. release.yml validate도 동일. (약 6줄)
-- **수정 전 재현/수용 게이트**: 로컬에서 `npm run test:scaffold-project` 등 4개를 개별 실행해
-  현재 통과/실패 baseline을 먼저 기록한다(실패가 남아 있다면 그 자체가 별도 태스크).
-  수정 후 `npm test`가 43건을 실행하고 ci.yml 로그에 나타난다.
+- **심각도 High / 확신도: 워크플로 정의 High, 실행 이력 미확인**
+- **증거** [모두 HEAD 확인 — 워크플로·package.json은 clean]
+  - `ci.yml:30-31` — 3 OS × Node 3버전 = 9잡, 스텝은 `node bin/aigentry-devkit.js --help` 하나.
+  - `release.yml:21` — publish 앞 validate 잡도 동일. 태그↔package.json 일치 게이트 없음,
+    레지스트리 되읽기 없음. `release.yml:35-37` README 재생성은 `continue-on-error: true`.
+  - `package.json` `test` = `node bin/aigentry-devkit.js --help`. 실제 스위트는 별도 스크립트명:
+    `test:scaffold-project`, `test:scaffold-install-hooks`, `test:logger-emit`, `test:skills-drift`.
+    **두 워크플로 어디에도 이 네 스크립트를 호출하는 스텝이 없다.**
+  - 스위트 실체: `tests/scaffold-project/v1/` 9 spec, `tests/scaffold-install-hooks/v1/` 5,
+    `tests/logger-emit/v1/` 1, `tests/skills-drift/v1/` 1 = 16파일.
+    `test(`/`it(` **grep 매칭 43건** — 이는 **정적 문자열 매칭 수이지 실행된 케이스 수가 아니다**
+    (초판의 "43 cases" 표현 철회). 실제 케이스 수는 실행해야 알 수 있고, 실행하지 않았다.
+  - `tests/install-fallback.test.js`와 `tests/exec-mode/`는 **미추적(`??`)**이다.
+- **현재 영향(주장 범위 한정)**: **워크플로 정의상** 해당 스위트를 실행하는 경로가 없다.
+  **"한 번도 실행된 적 없다"는 주장은 하지 않는다** — Actions 실행 이력을 조회하지 않았고,
+  로컬/수동 실행 여부도 모른다. 다만 uninstall / dry-run-no-writes / malformed-settings /
+  sentinel-drift / skills-drift 같은 **비파괴·데이터 보존 검증**이 자동 게이트에 걸려 있지 않다.
+- **근본 원인**: `test`가 스모크로 자리를 잡은 뒤 추가된 스위트가 진입점을 갱신하지 않았다.
+- **최소 수정**: `test`를 4스위트 체인으로 교체하고 ci.yml/release.yml 스텝을 `npm test`로 변경.
+- **수용/재현(수정 전)**: `grep -n "test:" .github/workflows/*.yml` 이 0건임을 보인다.
+  **선행 조건**: 4스위트의 현재 통과/실패 baseline을 먼저 로컬에서 확보해야 한다 — 붉으면
+  CI가 즉시 막힌다. baseline이 붉으면 그 자체가 별도 태스크다.
 - **소유**: `aigentry-devkit` / coder + tester
-- **의존·롤아웃·롤백**: **선행 조건 있음** — 4개 스위트가 현재 통과하는지 먼저 확인해야 한다.
-  붉으면 CI가 즉시 막힌다. 롤백 = `test` 스크립트 원복.
-- **태스크 매핑**: **NEW 후보**(F7과 묶어 하나의 "릴리스 게이트 전파" 태스크로 등록 가능).
-  #1136(workflow production)은 오케스트레이터 워크플로 축이라 다르고, #1133(model-router)과 무관.
+- **태스크 매핑**: **NEW 후보(단독)**. **F7과 묶지 않는다** — 본 건은 *한 저장소의 테스트 진입점*
+  (소유: devkit, 수용: `npm test`가 스위트를 호출)이고 F7은 *여러 저장소의 릴리스 프로버넌스*
+  (소유: 각 저장소, 수용: 태그 게이트 존재)다. 초판의 묶음 제안은 철회한다.
+  #1136과는 스코프가 다르다(#1136은 오케스트레이터 워크플로 생산화 + npm/install/README 생성).
 
 ---
 
-### F5 — 설치기가 실제로 설치하지 않는 버전을 화면에 출력하고, 호환성 게이트는 7세대 낡은 값을 본다
+### F5 — 커밋되지 않은 설치 경로 리팩터로 로그 문자열과 실행 인자가 어긋난다 (작업트리 한정)
 
-- **심각도 Medium / 확신도 High(두 경로 모두 코드로 확정)**
-- **증거**: `aigentry-devkit` HEAD `bb7876b`
-  - `install.sh:506` `TELEPTY_VERSION="$(manifest_eval "manifest.components.telepty.install.version")"`
-    → `installer-manifest.json`이 주는 값은 **`0.1.45`**.
-  - `install.sh:509` `info "Installing $TELEPTY_SPEC via install_with_fallback"` — 사용자는
-    `@dmsdc-ai/aigentry-telepty@0.1.45` 를 본다.
-  - `install.sh:510`이 실제로 호출하는 건 `run_install_fallback "telepty"` →
-    `lib/install-fallback.js` → `readAdapterFallback()`(`lib/install-fallback.js:67-81`)이
-    읽는 파일은 `config/modules/telepty.adapter.json`이고 그 체인은
-    `[{kind:"npm-global", package:"@dmsdc-ai/aigentry-telepty", version:"latest"}]`.
-    최종 실행 명령은 `lib/install-fallback.js:342` `npm install -g ${pkg}@${version}` = **`@latest`**.
-  - 즉 `TELEPTY_SPEC`은 **로그 문자열 외에 아무 데도 쓰이지 않는다**. `DUSTCRAW_SPEC`도 동일
-    구조(`install.sh:647,655`, adapter는 `latest`, manifest는 `0.3.1`).
-  - 호환성 게이트: `install.sh:517-531`이 `manifest.compatibility.telepty.target`(=`0.1.45`)와
-    설치된 버전을 `sort -V`로 비교한다. 로컬 telepty 소스는 **0.8.3**이므로 이 게이트는
-    구조적으로 **항상 통과**한다 — 즉 아무것도 막지 못하는 게이트다.
-- **현재 영향**: (1) 설치 로그가 사실이 아니다 — 사고 조사 때 "0.1.45가 설치됐다"는 잘못된
-  단서를 준다. (2) 최소 버전 게이트가 존재하는 척만 한다. **설치 결과 자체는 `latest`라 정상**이며,
-  따라서 이건 설치 실패가 아니라 **관측성/신뢰 결함**이다.
-- **가정된 위험**: 누군가 `installer-manifest.json`의 version을 "고치면 설치가 바뀐다"고 믿고
-  수정하면 아무 효과가 없다. 반대로 adapter를 고치면 로그와 더 어긋난다.
-- **근본 원인**: 설치 소스가 manifest → adapter로 이동했는데, manifest 쪽의 죽은 필드와 그것을
-  읽는 로그/게이트가 함께 제거되지 않았다.
-- **최소 수정**: `install.sh:506-509`, `:647-655`의 spec 계산·출력을 삭제하거나
-  adapter 체인에서 읽도록 바꾸고, `compatibility.telepty.target`을 실제 최소 지원 버전으로
-  갱신하거나 게이트를 제거. (약 10줄)
-- **수정 전 재현/수용 게이트**: `node lib/install-fallback.js telepty --dry-run` 출력
-  (`version=latest`)과 `install.sh:509`가 출력할 문자열(`@0.1.45`)이 불일치함을 나란히 보인다.
-  수정 후 두 값이 동일.
+- **심각도 Medium / 확신도: 파일 상태 High, 런타임 결과 미측정**
+- **초판에서 철회하는 두 주장**:
+  1. ~~"어댑터가 `latest`를 쓰므로 설치 결과 자체는 정상"~~ — **철회.** `latest` 해석 실패,
+     미지 버전, CLI 출력 형식 차이, OS별 `sort` 동작 등 실패 경로가 있고 어느 것도 측정하지 않았다.
+  2. ~~"호환성 게이트는 구조적으로 항상 통과한다"~~ — **철회.** 근거로 삼은 것은 *로컬 소스
+     버전 간 비교*였고, 그것은 호환성·레지스트리 신탁이 아니다. 설치된 버전을 관측한 적이 없다.
+- **성립하는 유일한 주장**: **작업 트리 상태에서 로그가 출력하는 spec과 실행 경로가 전달할
+  인자가 다르다.**
+- **증거**
+  - **HEAD `bb7876b`** [git show]: `install.sh:462-465` —
+    `TELEPTY_SPEC="${TELEPTY_PACKAGE}@${TELEPTY_VERSION}"` → `info "Installing $TELEPTY_SPEC"` →
+    **`npm install -g "$TELEPTY_SPEC"`**. 즉 **HEAD에서는 로그와 실행 인자가 일치**하며,
+    값은 `installer-manifest.json`의 `0.1.45`다.
+  - **작업 트리**: `install.sh:506-510` 이 `TELEPTY_SPEC`을 계산·출력한 뒤
+    `run_install_fallback "telepty"`를 호출한다. 그 구현
+    `lib/install-fallback.js`는 **HEAD에 없는 미추적 파일**이고,
+    `readAdapterFallback()`(`:67-81`)이 읽는 `config/modules/telepty.adapter.json`은
+    **HEAD에서 fallback 체인이 `[]`(빈 배열)**, 작업 트리에서만
+    `[{kind:"npm-global", package:"@dmsdc-ai/aigentry-telepty", version:"latest"}]`이다.
+    최종 실행문은 `lib/install-fallback.js:342` `npm install -g ${pkg}@${version}`.
+  - 즉 **작업 트리에서 `TELEPTY_SPEC`은 로그 외에 쓰이지 않는다.** `DUSTCRAW_SPEC`도 같은 구조
+    (`install.sh:647,655`).
+  - 어댑터 7개 전부 (M), `lib/install-fallback.js`·`tests/install-fallback.test.js` 미추적.
+- **현재 영향**: 사고 조사 시 설치 로그가 실행된 인자를 대변하지 못한다(작업 트리 기준).
+  더 중요한 사실은 **설치 경로의 핵심 구현이 버전 관리 밖에 있다**는 것이다 — `package.json`의
+  `files`가 `lib/**`를 게시 대상에 포함하므로 로컬 트리에서 게시하면 git에 없는 코드가 나간다.
+- **근본 원인**: 설치 소스를 manifest→adapter로 옮기는 리팩터가 진행 중이며 커밋되지 않았다.
+- **최소 수정**: **코드 수정 이전에 커밋 상태 결정이 먼저다.** 리팩터를 커밋하든 되돌리든 한 뒤,
+  spec 계산·출력을 실제 실행 경로와 일치시킨다.
+- **수용/재현(수정 전)**: `git status --porcelain lib/ config/modules/` 가 미추적/수정을 보이고,
+  `git show HEAD:config/modules/telepty.adapter.json` 의 체인이 작업 트리와 다름을 보인다.
+  런타임 대조는 격리 하니스가 필요하므로 이 게이트에 넣지 않는다.
 - **소유**: `aigentry-devkit` / coder
-- **의존·롤아웃·롤백**: 독립. 로그 문자열 변경이므로 롤백 위험 없음.
-- **태스크 매핑**: **NEW 후보**. F6과 원인이 같아(매니페스트 다중화) 하나로 묶어도 무방.
+- **태스크 매핑**: **NEW 후보(단독)**, 성격은 "미커밋 설치 경로 정리". F1/F6과 원인이 다르다
+  (저것은 문서 생성, 이것은 버전 관리 상태).
 
 ---
 
-### F6 — 표시용 `ecosystem.json`이 6개 저장소에 바이트 동일하게 복제된 채 로컬 소스와 어긋나 있다
+### F6 — 표시용 `ecosystem.json`이 6개 저장소에 바이트 동일 복제된 채 로컬 소스와 어긋난다
 
-- **심각도 Medium / 확신도 High**
-- **증거**: 6개 사본 전부 sha256 `722f3d5d9844…`, 55줄, 파일 mtime 2026-07-26 — 위치는
-  `aigentry`, `aigentry-telepty`, `aigentry-devkit`, `aigentry-brain`, `aigentry-deliberation`,
-  `aigentry-orchestrator`. 매니페스트 주석 스스로 "각 저장소에 바이트 동일하게 vendored,
-  버전 변경 시 `aigentry-devkit/scripts/sync-readme-tooling.mjs`로 갱신"이라고 선언한다.
-  로컬 소스와의 대조(모두 같은 디스크의 package.json끼리 비교):
+- **심각도 Medium / 확신도: 로컬 대조 High, 게시 상태 미측정**
+- **증거** [HEAD 확인 — 6사본 모두 clean]: sha256 `722f3d5d9844…`, 55줄, mtime 2026-07-26.
+  위치 `aigentry`, `-telepty`, `-devkit`, `-brain`, `-deliberation`, `-orchestrator`.
+  매니페스트 주석이 스스로 "바이트 동일 vendored, 변경 시
+  `aigentry-devkit/scripts/sync-readme-tooling.mjs`로 갱신"이라 선언한다.
 
-  | ecosystem.json 기재 | 로컬 소스 실제 |
+  | ecosystem.json | 로컬 소스 |
   |---|---|
-  | telepty `0.7.1` | `aigentry-telepty/package.json` = **0.8.3** |
-  | orchestrator package `aigentry-orchestrator`, version `—`, `published: false` | `aigentry-orchestrator/package.json` name = **`@dmsdc-ai/aigentry-orchestrator`**, version **0.2.0**, `release.yml`(태그 푸시 시 npm publish) 보유 |
-  | brain `0.3.1`, deliberation `0.0.47`, devkit `0.1.14` | 일치 |
+  | telepty `0.7.1` | `aigentry-telepty/package.json` 0.8.3 |
+  | orchestrator package `aigentry-orchestrator`, version `—`, `published: false` | name `@dmsdc-ai/aigentry-orchestrator`, version 0.2.0, 태그 푸시 시 publish하는 release.yml 보유 |
+  | aterm `@dmsdc-ai/aterm` 0.2.14 UNLICENSED (주석: 게시본은 UNLICENSED, 로컬 HEAD는 MIT 0.2.13 의도) | `npm/aterm/package.json` 0.2.13 **MIT** — **매니페스트 주석이 이 차이를 이미 정확히 기록하고 있다** |
+  | brain 0.3.1 / deliberation 0.0.47 / devkit 0.1.14 | 일치 |
 
-  같은 계열 결함이 어댑터에도 있다: `config/modules/bridge.adapter.json` 이전 단계인
-  `installer-manifest.json`의 bridge 항목은 `package: "@aigentry/bridge"`인데
-  `aigentry-bridge/package.json`의 실제 이름은 **`@dmsdc-ai/aigentry-bridge`** — 스코프가 다르다.
-  오늘 무해한 이유는 adapter 체인이 `{kind:"skip"}` 플레이스홀더라서 그 이름이 쓰이지 않기 때문이다.
-- **현재 영향**: README 생태계 표가 telepty를 실제보다 낮게 표시하고, orchestrator를
-  "미게시"로 표시한다. 사용자가 보는 공개 문서와 저장소 현실이 어긋난다.
-- **가정된 위험**: 레지스트리 실제 게시 버전은 측정하지 않았다. 위 표는 **로컬 대 로컬** 비교다.
-  bridge 스코프 오기는 adapter를 npm-global로 바꾸는 순간 404가 된다(현재는 도달 불가 경로).
-- **근본 원인**: 표 갱신이 사람 트리거(`sync-readme-tooling.mjs` 수동 실행)이고, 버전이 바뀌는
-  릴리스 파이프라인과 연결되어 있지 않다. telepty 0.7.1→0.8.3 릴리스가 표를 끌고 오지 않았다.
-- **최소 수정**: telepty/brain/deliberation/devkit/orchestrator의 release.yml에
-  "표와 dependencies가 이 태그의 버전과 모순이면 실패" 체크 1스텝 추가, 또는 최소한
-  `sync-readme-tooling.mjs`를 릴리스 후 스텝으로 연결. F1의 range 검증도 같은 자리에 넣는다.
-- **수정 전 재현/수용 게이트**: `node -e` 한 줄로 6개 사본의 telepty version과
-  `aigentry-telepty/package.json`의 version이 다름을 출력 → 수정 후 동일.
-- **소유**: `aigentry-devkit`(생성 스크립트 소유) + 각 릴리스 저장소 / release 역할
-- **의존·롤아웃·롤백**: F1과 같은 스크립트를 건드린다 → **묶어서 처리 권장**. 문서 생성 경로라
-  롤백 위험 낮음.
-- **태스크 매핑**: **NEW 후보**, F1과 dedup 하여 한 태스크로 등록 가능(원인 동일: 재생성
-  스크립트가 표만 보고 dependencies/게시 상태를 안 본다). #1128/#1133/#1136과 무관.
+  인접 결함: `installer-manifest.json`의 bridge 항목은 `package: "@aigentry/bridge"`인데
+  `aigentry-bridge/package.json` 실제 이름은 `@dmsdc-ai/aigentry-bridge` — 스코프 불일치.
+  작업 트리 어댑터가 `{kind:"skip"}`이라 현재 도달하지 않는 경로다(HEAD 어댑터는 빈 체인).
+- **현재 영향(주장 범위 한정)**: 공개 README 표가 로컬 소스와 다른 값을 표시한다.
+  **게시된 실제 버전·라이선스는 조회하지 않았다.** 위 대조는 전부 로컬 대 로컬이다.
+  aterm 행은 매니페스트가 이미 불일치를 주석으로 인정하고 있으므로 "발견"이 아니라 "미해소 기록"이다.
+- **근본 원인**: 표 갱신이 수동 트리거이고 릴리스 파이프라인과 연결되어 있지 않다.
+- **최소 수정**: 재생성 스크립트에 range·게시 상태 모순 검증 추가(F1 재발 방지와 같은 자리).
+- **수용/재현(수정 전)**: 6사본의 telepty version과 `aigentry-telepty/package.json` version이
+  다름을 출력 → 수정 후 동일.
+- **소유**: `aigentry-devkit`(생성 스크립트) + 각 릴리스 저장소 / release
+- **태스크 매핑**: **#1136의 확장으로 처리 권고 — NEW 금지.** #1136 스펙이 npm/install/README
+  +ecosystem 생성 소스를 명시적으로 포함하므로, 별도 태스크는 수용 기준이 겹친다.
+  F1과 같은 스크립트를 건드리므로 **F1의 재발 방지 항목과 한 단위**로 다룬다.
 
 ---
 
-### F7 — 오케스트레이터가 런타임 의존하는 패키지들의 저장소에 릴리스 자동화가 전혀 없다
+### F7 — 게시 경로에 있는 저장소 다수에 릴리스 워크플로 **파일이 없다**
 
-- **심각도 Medium-High / 확신도 High(워크플로 파일 유무는 확정, 레지스트리 상태는 미측정)**
-- **증거**: 13개 aigentry 계열 저장소의 `.github/workflows` 실측
+- **심각도 Medium-High / 확신도: 파일 유무 High, 게시·프로버넌스 실태 미측정**
+- **증거** [워크플로 디렉터리 실측]
 
-  | 저장소 | 워크플로 | 태그↔버전 게이트 | 레지스트리 되읽기 | NPM_TOKEN |
+  | 저장소 | 워크플로 파일 | 태그↔버전 게이트 | 레지스트리 되읽기 | NPM_TOKEN 참조 |
   |---|---|---|---|---|
   | aigentry-telepty | readme-regen, release, test-install | ✅ | ✅ | ✅ |
   | aigentry-orchestrator | ci, readme-regen, release | ✅ | ✅ | ✅ |
   | aigentry-devkit | ci, release | ❌ | ❌ | ✅ |
   | aigentry-brain | ci, release | ❌ | ❌ | ✅ |
   | aigentry-deliberation | ci, release | ❌ | ❌ | ✅ |
-  | aigentry | readme-regen **만** | ❌ | ❌ | ❌ |
-  | aigentry-logger / -ssot / -hooks / -context / -bridge / -dustcraw / -amplify | **없음** | — | — | — |
+  | aigentry | readme-regen 만 | ❌ | ❌ | ❌ |
+  | -logger / -ssot / -hooks / -context / -bridge / -dustcraw / -amplify | **파일 없음** | — | — | — |
 
-  그런데 `aigentry-orchestrator/package.json`은 `@dmsdc-ai/aigentry-logger ^0.2.0`,
-  `@dmsdc-ai/aigentry-ssot ^1.0.0`을 런타임 의존성으로 선언하고,
-  `aigentry-orchestrator/package-lock.json`은 두 패키지를 `registry.npmjs.org` tarball URL로
-  resolve한 기록을 갖고 있다(락파일 작성 시점의 사실). 즉 **CI도 릴리스 워크플로도 없는 저장소의
-  산출물이 오케스트레이터 런타임에 들어간다.** `aigentry-ssot`는 패키지 소스가 중첩
-  디렉터리 `pkg/`에 있어 저장소 루트에 package.json조차 없다.
-  설치기는 여기에 더해 `dustcraw`/`amplify`를 `npm-global @latest`로 설치한다
-  (`config/modules/*.adapter.json`) — 두 저장소 모두 워크플로 0개.
-  `aigentry` 메타 패키지 자체도 release.yml이 없어 손으로 퍼블리시된다(F1의 range가 방치된
-  이유와 같은 뿌리).
-- **현재 영향**: 게시된 산출물을 특정 커밋에 귀속시킬 로컬 증거가 없다. orchestrator release.yml
-  주석이 기록한 사고("태그 없이 손으로 3개 버전이 올라갔다")가 **여전히 가능한 저장소가 8개** 남아 있다.
-- **가정된 위험**: 이 저장소들의 게시 여부·현재 버전은 레지스트리를 조회하지 않아 확인할 수 없다.
-  logger/ssot는 락파일 증거가 있고 나머지는 어댑터가 이름을 가리킬 뿐이다.
-- **근본 원인**: 릴리스 품질 기준이 telepty에서 사고로 학습되어 orchestrator로 한 번 복사됐지만,
-  전파 메커니즘(공유 워크플로/템플릿/체크리스트)이 없어 거기서 멈췄다.
-- **최소 수정**: **전 저장소 살포가 아니라** "npm에 실제로 올라가는 것"으로 범위를 한정 —
-  logger, ssot, devkit, brain, deliberation, aigentry(메타) 6개에 orchestrator의 release.yml
-  guard 잡(태그↔package.json 일치 + 시크릿 부재=실패)만 이식. 되읽기 증명은 2단계로 미룬다.
-- **수정 전 재현/수용 게이트**: 각 저장소에서 `ls .github/workflows` 와 `grep -l TAG_VERSION`
-  결과가 위 표와 같음을 보인다. 수정 후 6개 저장소에서 guard 잡이 존재.
-- **소유**: 각 저장소 / release 역할. 조정 소유는 `aigentry-orchestrator`(패턴 원본 보유).
-- **의존·롤아웃·롤백**: 저장소별 독립. 태그 규약이 없는 저장소는 첫 태그부터 시작해야 하므로
-  logger/ssot는 준비 작업이 더 든다. 롤백 = 워크플로 파일 삭제.
-- **태스크 매핑**: **#884를 UPDATE 하는 것이 아니라 NEW**. #884는 "공용 npm 토큰 90일 만료 추적"
-  으로 자격증명 수명 문제이고, 본 건은 게시 증명 부재다. 다만 **둘은 같은 5개 파이프라인을
-  공유한다**(NPM_TOKEN 사용 저장소 = telepty/orchestrator/devkit/brain/deliberation) — #884에
-  "영향 범위 = 이 5개 저장소" 사실을 증거로 덧붙일 것을 권장.
+  `aigentry-orchestrator/package.json`은 `@dmsdc-ai/aigentry-logger ^0.2.0`,
+  `@dmsdc-ai/aigentry-ssot ^1.0.0`을 런타임 의존으로 선언하고, 그 `package-lock.json`은 두
+  패키지를 registry tarball URL로 resolve한 기록을 갖는다(락파일 작성 시점 기록).
+  `aigentry-ssot`는 패키지 본체가 `pkg/`에 있어 루트에 package.json이 없다.
+- **주장 범위 한정 — 초판에서 좁히는 것**:
+  - **"워크플로가 없다 = 릴리스/프로버넌스 증거가 전혀 없다"가 아니다.** 태그, 서명, CHANGELOG,
+    수동 런북, npm provenance 등 다른 증거원을 조회하지 않았다. 확인한 것은 **`.github/workflows`
+    디렉터리에 파일이 있느냐**뿐이다.
+  - **"게시되었다"고 단정하지 않는다.** logger/ssot는 락파일 기록이 있고, dustcraw/amplify는
+    어댑터가 이름을 가리킬 뿐이다.
+  - **NPM_TOKEN 5개는 *워크플로 파일에서 관찰된 참조 수*이며, 계정 토큰의 실제 폭발 반경 증명이
+    아니다.** 토큰이 하나인지 여럿인지, 스코프가 무엇인지 확인하지 않았다(초판 표현 철회).
+- **현재 영향**: 게시 산출물을 커밋에 귀속시키는 **자동화된** 증거가 위 표의 ❌ 칸에 없다.
+- **근본 원인**: 릴리스 규율이 telepty→orchestrator로 한 번 복사됐을 뿐 전파 메커니즘이 없다.
+- **최소 수정**: 전 저장소 살포가 아니라 **npm 게시 경로에 있는 것으로 한정** — 우선 guard 잡
+  (태그↔package.json 일치 + 시크릿 부재=실패)만 이식. 되읽기 증명은 2단계.
+- **수용/재현(수정 전)**: 저장소별 `ls .github/workflows`와 `grep -l TAG_VERSION` 결과가 위 표와
+  일치함을 보인다. 수정 후 대상 저장소에 guard 잡 존재.
+- **소유**: 각 저장소 / release. 패턴 원본은 `aigentry-orchestrator`.
+- **태스크 매핑**: **NEW 후보(단독)**. **#884와 중복 아님, 확장도 아님** — #884는 토큰 만료 추적,
+  본 건은 워크플로 게이트 부재. 다만 #884에 **"NPM_TOKEN을 참조하는 워크플로 파일이 5개
+  저장소에 있다"(2026-09-08 관찰)**를 사실로만 부기할 것을 권고한다(폭발 반경 결론은 금지).
+  **F4와 묶지 않는다**(§F4 참조).
 
 ---
 
-### F8 — 1013줄 설치기에 롤백 경로가 0개이고, 하드 실패는 부분 설치를 남긴 채 종료한다
+### F8 — 설치기에 되돌림 경로가 없고, 실패 시점의 진행 상태가 기록되지 않는다
 
-- **심각도 Medium / 확신도 High**
-- **증거**: `aigentry-devkit` HEAD `bb7876b`
-  - `install.sh` `trap` 등록 **0건**(`grep -c '^[[:space:]]*trap ' install.sh` → 0).
-    `backup`/`restore`/`rollback` 식별자도 0건. 대조적으로 `install.ps1`은 5건의
-    `trap|finally` 매칭을 갖는다 — 즉 **정리 규율이 OS 간에도 비대칭**이다.
-  - `install.sh:2` `set -euo pipefail` → 예기치 못한 오류에서 즉시 종료, 정리 없음.
-  - `die` 호출 5곳(`:329, :511, :514, :545, :557`). 그중 `:511/:514/:545`는 **phase 2 이후**,
-    즉 phase 1에서 이미 스킬·훅·HUD·WTM을 `$HOME/.claude` 하위에 쓴 뒤다.
-    `:545`는 `npm install -g`로 전역 설치까지 끝난 뒤 데몬 헬스체크 실패로 죽는다.
-  - 복구 수단은 **전진 재개뿐**: `AIGENTRY_INSTALL_RESUME`(`install.sh:22, :318-329, :344`)은
-    시작 phase를 앞당길 뿐 되돌리지 않는다. `uninstall` 경로는 `install.sh` 안에 없다.
-  - 참고 대조: `aigentry-telepty/scripts/preuninstall.js:4-15`는 정확히 반대 규율을 보여준다 —
-    무엇을 정리하고 무엇을 남기는지, 왜 절대 실패하면 안 되는지를 명시하고 상태 디렉터리는
-    명시적 `telepty uninstall [--purge]`에 위임한다.
-- **현재 영향**: 설치가 중간에 죽으면 사용자 홈에 스킬/훅/MCP 설정/전역 npm 패키지/state 파일이
-  섞여 남고, 어디까지 갔는지 알려주는 것은 state 파일 하나뿐인데 그 파일은 phase 7에서야
-  기록된다(`install.sh:779-782`). 즉 **phase 2~6에서 죽으면 state 파일조차 없다.**
-- **가정된 위험**: 실제 설치를 실행하지 않았으므로 "이 조건에서 반드시 이렇게 깨진다"고는
-  말하지 않는다. 위 서술은 코드 경로에서 도출한 것이다.
-- **근본 원인**: 설치기가 phase별 전진 재개를 데이터로 잘 설계했지만(`failure_policy`, fallback
-  체인, resume), **역방향 상태 전이**를 설계 대상에 넣지 않았다.
-- **최소 수정**: 전체 롤백 구현이 아니라 **가시성 먼저** — `trap 'write_installer_state' EXIT`
-  한 줄과 `die()`에 "지금까지 완료된 phase / 되돌리는 방법" 출력 추가. phase 1 직후에도 state를
-  한 번 쓰게 한다. (약 8줄)
-- **수정 전 재현/수용 게이트**: 임시 HOME에서 `AIGENTRY_TELEPTY_URL=http://127.0.0.1:1`
-  같은 값으로 phase 2 헬스체크를 강제 실패시킨 뒤
-  `test -f ~/.config/aigentry-devkit/install-state.json` → 현재 실패(파일 없음),
-  수정 후 성공하고 파일에 완료 phase가 기록됨.
+- **심각도 Medium / 확신도: 소스 구조 High, 실패 실태 미측정**
+- **증거**
+  - `install.sh` `trap` 등록 **0건**(작업트리 1013줄, HEAD 951줄 양쪽). `backup`/`restore`/
+    `rollback` 식별자 0건. 대조적으로 `install.ps1`은 `trap|finally` 5건 — **정리 규율이 OS 간
+    비대칭**이다.
+  - `install.sh:2` `set -euo pipefail`.
+  - `die` 5곳(`:329, :511, :514, :545, :557` [작업트리]). `:511/:514/:545`는 phase 1이 이미
+    `$HOME/.claude` 하위와 `$HOME/.local/lib/wtm`에 쓴 뒤, 그리고 전역 설치 시도 뒤에 발화한다.
+  - 복구 수단은 전진 재개뿐 — `AIGENTRY_INSTALL_RESUME`(`:22, :318-329, :344`)은 시작 phase를
+    앞당길 뿐 되돌리지 않는다. `install.sh` 안에 uninstall 경로 없음.
+  - state 기록은 phase 7(`:779-782`)에서 처음 일어난다 → **소스 흐름상 phase 2~6 실패 시
+    state 파일이 생성되지 않는다.**
+  - 대조 규율: `telepty/scripts/preuninstall.js:4-15`는 무엇을 정리하고 무엇을 남기는지,
+    왜 절대 실패하면 안 되는지를 명시하고 상태 디렉터리는 명시적 `telepty uninstall`에 위임한다.
+- **현재 영향(주장 범위 한정)**: **소스 흐름상** 중도 실패가 되돌려지지 않고 진행 지점이 남지
+  않는다. 실제 실패를 재현하지 않았으므로 "이 조건에서 반드시 이렇게 깨진다"고 말하지 않는다.
+- **근본 원인**: 전진 재개는 데이터로 설계됐지만 역방향 상태 전이가 설계 대상이 아니었다.
+- **최소 수정 — 초판의 "trap 1줄" 제안은 철회**: `trap ... EXIT` 한 줄은 **안전이 입증되지 않았다.**
+  `set -e` 하에서 EXIT 트랩이 부분 초기화 변수로 state를 쓰면 기존 state를 손상시킬 수 있고,
+  `:982`의 병합 소비자와 충돌할 수 있다. 필요한 것은 **멱등적 실패 저널링**이며 최소 셋은:
+  ① 부분 상태 기록이 기존 파일을 파괴하지 않음(멱등성 테스트), ② 스키마 소비자(`:982`) 호환,
+  ③ F2의 리댁션 규칙과 충돌 없음. 즉 **테스트가 딸린 변경**이지 한 줄 패치가 아니다.
+- **수용/재현(수정 전) — 실환경 금지**: 격리 HOME + 스텁 의존으로 phase 2를 강제 실패시킨 뒤
+  state 파일 부재를 보인다. 수정 후 파일 존재 + 완료 phase 기록 + **재실행 시 손상 없음**.
 - **소유**: `aigentry-devkit` / coder
-- **의존·롤아웃·롤백**: F2(state 스키마)와 같은 파일을 건드린다 → **F2와 같은 PR로 처리 권장**.
-- **태스크 매핑**: **NEW 후보**. #534(session-cleanup 고아 프로세스)는 세션 수명주기라 다르고,
-  #895(aterm 데몬 재시작)와도 다르다. 기존 큐에서 설치기 롤백 행을 찾지 못했다.
+- **태스크 매핑**: **NEW 후보(단독)**. **F2와 묶지 않는다** — 같은 파일을 건드린다는 것은 묶을
+  이유가 아니고, 수용 기준(리댁션 vs 저널링 멱등성)과 위험 프로파일이 다르다. 초판의 묶음 철회.
+  #534(session-cleanup 고아 프로세스), #895(aterm 데몬 재시작)와 무관.
 
 ---
 
-## 3. 기존 태스크와의 관계 — 무엇을 새로 만들지 않았는가
+## 3. 태스크 매핑 — 신규 후보 5건, 확장·부기 4건
 
-- **#1128 (inbound HOLD 유실)** — 이미 delegated 상태이고 진단이 진행 중이다. 본 감사에서
-  전달 경로를 재진단하지 않았고, 발견도 없다. 중복 등록하지 않음.
-- **#1133 (model-router 제품화)**, **#1136 (workflow 제품화)** — 두 스펙 모두 main에 있으나
-  구현 승인 전이다. 본 감사는 두 축을 건드리지 않았다.
-- **#1137/#1138 (포트폴리오 triage)** — 완료됨. 그 후속은 #1139 소유. 본 감사에서 task-queue의
-  행 단위 상태를 재triage하지 않았다. (관찰 1건만 기록: `state/task-queue.json`의 최상위
-  `updated_at`이 `2026-07-30`인데 개별 행은 `2026-09-08`까지 갱신되어 있다. 포트폴리오
-  소유 범위이므로 finding으로 승격하지 않고 #1139에 참고로 넘긴다.)
-- **#526 (에코시스템 대개조 EPIC)** — 본 보고서가 그 트리거의 현재 소스 리프레시다.
-  새 EPIC을 만들지 않았고, F1~F8은 전부 국소·실행가능 델타로 잘랐다.
-- **#534 / #895 / #884** — 셋 다 현재 유효성을 재검증하지 않았으므로 "현재도 발생 중"이라고
-  주장하지 않는다. #884에 대해서만 F7이 영향 범위 증거(NPM_TOKEN 사용 저장소 5개)를 더한다.
-- **`sec-wire-enforce-spawn` / `struct-injection-and-drift`** — 본 감사의 읽기 범위(auth
-  미들웨어 등록 순서, origin guard 기본 거부, 감사 로그)에서 이 트랙들이 주장하는 결함의 현재
-  증거를 찾지 못했다. **없다고 단정하지 않는다** — spawn 검증 본문과 injection 인용 경로를
-  라인 단위로 다 읽지는 않았다. 미측정으로 분류한다.
+**확장/부기로 처리(신규 만들지 않음).**
 
-**신규 등록 후보 요약(태스크 ID는 오케스트레이터가 부여; 본 보고서는 ID를 만들지 않는다).**
+| 발견 | 처리 | 근거 |
+|---|---|---|
+| F1 | `ux-public-front-door`(done)·#62(done)·#64(done)에 **2026-09-08 재발 증거 부기** + 재발 방지는 **#1136 확장** | front-door가 동일 결함(`telepty ^0.1.83 vs 0.6.6`)을 이미 기록. 오늘은 `^0.6.6 vs 0.8.3` — 갱신 후 재악화. #1136이 npm/install/README+ecosystem 생성 소스를 명시 포함 |
+| F3 | **#663 UPDATE** | #663 본문이 "install.ps1 parity — Windows orchestrator 포팅 or 명시적 미지원 문서화"로 정확히 동일. NOTE에 "install.sh 27회 vs ps1 0회" 기록됨. 기여는 2026-09-08 재확인 + HEAD/작업트리 양쪽 0건 + 완료 배너가 누락을 숨김 |
+| F6 | **#1136 확장**(F1 재발 방지와 한 단위) | 같은 생성 스크립트, 같은 수용 기준 |
+| — | #884에 사실 1줄 부기 | "NPM_TOKEN 참조 워크플로 파일 5개"(관찰). 폭발 반경 결론은 붙이지 않음 |
 
-| # | 제목 | 소유 저장소 | 권장 묶음 |
-|---|---|---|---|
-| F1+F6 | 메타 패키지 의존성 range와 ecosystem 표가 소스와 어긋남 — 재생성 시 검증 추가 | aigentry / aigentry-devkit | 1태스크 |
-| F2+F8 | devkit install-state.json 시크릿 평문 기록 + 실패 시 상태 미기록 | aigentry-devkit | 1태스크 |
-| F3 | Windows 설치기 orchestrator-role 침묵 누락 | aigentry-devkit | 단독 |
-| F4+F7 | 릴리스/CI 게이트 전파 — devkit 테스트 진입점 + 게시 저장소 guard 잡 | aigentry-devkit 외 5 | 1태스크(단계 분리) |
-| F5 | 설치 로그가 실제 설치 spec과 불일치 + 무효 호환성 게이트 | aigentry-devkit | 단독(F1+F6에 합류 가능) |
+**신규 후보 5건 — 각각 소유자·수용 기준이 달라 분리한다.**
+
+| 발견 | 제목 | 소유 | 수용 기준 축 | 왜 기존 것의 확장이 아닌가 |
+|---|---|---|---|---|
+| F2 | 설치기 state 파일 시크릿 필드 리댁션 | aigentry-devkit / coder | JSON 금지 필드 부재 + 소비자 호환 + 리댁션 테스트 | #884는 토큰 *수명*, 본 건은 설치기가 기록하는 *다른 자격증명의 스키마* |
+| F4 | devkit 테스트 진입점이 기존 4스위트를 호출 | aigentry-devkit / coder+tester | `npm test`가 스위트를 호출 + baseline 확보 | #1136은 오케스트레이터 워크플로 생산화. 저장소·산출물이 다름 |
+| F5 | 미커밋 설치 경로 리팩터 정리(로그·실행 인자 일치) | aigentry-devkit / coder | 커밋 상태 결정 + spec↔실행 인자 일치 | F1/F6은 문서 생성, 본 건은 버전 관리 상태 |
+| F7 | npm 게시 경로 저장소에 릴리스 guard 잡 이식 | 각 저장소 / release (조정: orchestrator) | 대상 저장소에 태그↔버전 게이트 존재 | F4는 한 저장소의 테스트 진입점. 소유자 수·수용 기준이 다름 |
+| F8 | 설치 실패 시 멱등적 진행 저널링 | aigentry-devkit / coder | 부분 기록이 기존 state 비파괴 + 재실행 안전 | F2와 파일만 같고 수용 기준·위험이 다름 |
+
+> F5는 "미커밋 상태 정리"라 태스크 등록 여부 자체가
+> 오케스트레이터 판단 사항이다. **태스크 ID는 만들지 않았다.**
+
+**건드리지 않은 기존 스코프.** #1128(inbound HOLD 유실, delegated) — 전달 경로 재진단 없음.
+#1133(model-router) — 무관. #1137/#1138(포트폴리오 triage, done) — 행 단위 재triage 없음
+(`state/task-queue.json` 최상위 `updated_at=2026-07-30` vs 행 `2026-09-08` 관찰만 #1139에 이관).
+#526 — 본 보고서가 그 트리거의 현재 소스 리프레시이며 새 EPIC을 만들지 않았다.
+#534/#895 — 현재 유효성 재검증 안 함, "현재도 발생 중"이라 주장하지 않는다.
+`sec-wire-enforce-spawn` / `struct-injection-and-drift` — 읽기 범위에서 현재 증거를 찾지 못했으나
+**없다고 단정하지 않는다**(spawn 검증 본문·injection 인용 경로 전체를 읽지 않음). 미측정.
 
 ---
 
-## 부록 A. 저장소 인벤토리와 처분
+## 부록 A. 저장소 인벤토리와 처분 (정정판)
 
-측정 기준: 2026-09-08T13:36Z, `/Users/duckyoungkim/projects/` 직접 열거(54개 디렉터리).
+측정: 2026-09-08T13:36Z 직접 열거, 54개 디렉터리.
 
-### A.1 aigentry 계열 23개 — 전수 처분
+### A.1 aigentry 계열 23개
 
 | 저장소 | git | HEAD | dirty | 매니페스트 | 처분 |
 |---|---|---|---|---|---|
-| aigentry | ✅ main | f959b29 | 4 | `@dmsdc-ai/aigentry` 0.1.1 | **심층** (F1, F6) |
-| aigentry-devkit | ✅ main | bb7876b | 51 | `@dmsdc-ai/aigentry-devkit` 0.1.14 | **심층** (F2~F5, F7, F8) |
-| aigentry-telepty | ✅ main | 997ea7c | 13 | `@dmsdc-ai/aigentry-telepty` 0.8.3 | **심층** (강점 근거, F6, F7) |
-| aigentry-orchestrator | ✅ main | ca93cb6 | 10 | `@dmsdc-ai/aigentry-orchestrator` 0.2.0 | **심층** (릴리스 대조군, F6, F7) |
-| aigentry-brain | ✅ main | 0ffa6ee | 6 | `@dmsdc-ai/aigentry-brain` 0.3.1 | 매니페스트+워크플로 (F1, F7) |
-| aigentry-deliberation | ✅ main | b009549 | 3 | `@dmsdc-ai/aigentry-deliberation` 0.0.47 | 매니페스트+워크플로 (F7) |
-| aigentry-logger | ✅ main | f4f62e3 | 1 | `@dmsdc-ai/aigentry-logger` 0.2.0 | 매니페스트만 — 워크플로 0 (F7) |
-| aigentry-ssot | ✅ main | 42afae4 | 3 | 루트 없음 / `pkg/` = `@dmsdc-ai/aigentry-ssot` 1.0.0 | 매니페스트만, 중첩 패키지 (F7) |
-| aigentry-bridge | ✅ main | 5eabef0 | 11 | `@dmsdc-ai/aigentry-bridge` 0.1.0 | 매니페스트만 — 어댑터 이름 불일치 (F6) |
-| aigentry-dustcraw | ✅ main | c0af3c9 | 14 | `@dmsdc-ai/aigentry-dustcraw` 0.4.0 | 매니페스트만 (F5, F7) |
-| aigentry-amplify | ✅ main | b555848 | 7 | `@dmsdc-ai/aigentry-amplify` 0.0.1 | 매니페스트만 (F7) |
-| aigentry-hooks | ✅ main | 507393e | 7 | `@dmsdc-ai/aigentry-hooks` 0.0.2 | 매니페스트만 — 워크플로 0 |
-| aigentry-context | ✅ main | eb23360 | 3 | `@dmsdc-ai/aigentry-context` 0.0.1 | 매니페스트만 — 워크플로 0 |
-| aigentry-analyst | ✅ main | 8a45a84 | 3 | `aigentry-analyst` 1.0.0 (스코프 없음) | 매니페스트만 — 최종 커밋 2026-04-09 |
-| aigentry-registry | ✅ main | ac221cd | 3 | 루트 pyproject / 중첩 `frontend`,`bridge` package.json | 매니페스트만 — 중첩 2개 |
-| aigentry-aterm | ✅ main | 9b4cec5 | 8 | Cargo (package.json 없음) | 매니페스트만 — ecosystem.json이 `@dmsdc-ai/aterm` 0.2.14 UNLICENSED로 기록 |
-| aigentry-starter | ✅ main | c310f28 | 4 | 없음 | 소스 미열람 — 매니페스트 부재 |
-| aigentry-forum | ✅ main | f1fc896 | 1 | 없음 | 소스 미열람 — 최종 커밋 2026-03-01 |
-| aigentry-architect | ❌ NOGIT | — | — | 없음 | **소스 이용 불가**(git 없음, 매니페스트 없음) |
-| aigentry-builder | ❌ NOGIT | — | — | 없음 | **소스 이용 불가** |
-| aigentry-design | ❌ NOGIT | — | — | 없음 | **소스 이용 불가** |
-| aigentry-sandbox | ❌ NOGIT | — | — | 없음 | **소스 이용 불가** |
-| aigentry-tester | ❌ NOGIT | — | — | 없음 | **소스 이용 불가** |
+| aigentry | ✅ | f959b29 | 4 | `@dmsdc-ai/aigentry` 0.1.1 | **심층** (F1, F6) |
+| aigentry-devkit | ✅ | bb7876b | 51 | `@dmsdc-ai/aigentry-devkit` 0.1.14 | **심층** (F2~F5, F7, F8) — HEAD/작업트리 blob 대조 수행 |
+| aigentry-telepty | ✅ | 997ea7c | 13 | 0.8.3 | **심층** (강점 근거, F6, F7) |
+| aigentry-orchestrator | ✅ | ca93cb6 | 10 | 0.2.0 | **심층** (릴리스 대조군, F6, F7) |
+| aigentry-brain | ✅ | 0ffa6ee | 6 | 0.3.1 (+ `packages/signaling-server`) | 매니페스트+워크플로 |
+| aigentry-deliberation | ✅ | b009549 | 3 | 0.0.47 | 매니페스트+워크플로 |
+| aigentry-aterm | ✅ | 9b4cec5 | 8 | **`npm/aterm` = `@dmsdc-ai/aterm` 0.2.13 MIT** (+ `npm/aterm-darwin-arm64`, Cargo 워크스페이스 4) | 매니페스트 — **초판 "package.json 없음" 정정** |
+| aigentry-logger | ✅ | f4f62e3 | 1 | 0.2.0 | 매니페스트만 — 워크플로 파일 0 (F7) |
+| aigentry-ssot | ✅ | 42afae4 | 3 | 루트 없음 / `pkg/` = 1.0.0 | 매니페스트만, 중첩 (F7) |
+| aigentry-bridge | ✅ | 5eabef0 | 11 | `@dmsdc-ai/aigentry-bridge` 0.1.0 | 매니페스트만 — 어댑터 이름 불일치 (F6) |
+| aigentry-dustcraw | ✅ | c0af3c9 | 14 | 0.4.0 | 매니페스트만 (F7) |
+| aigentry-amplify | ✅ | b555848 | 7 | 0.0.1 (+ `packages/core`, `packages/channels`) | 매니페스트만 (F7) |
+| aigentry-hooks | ✅ | 507393e | 7 | 0.0.2 | 매니페스트만 — 워크플로 파일 0 |
+| aigentry-context | ✅ | eb23360 | 3 | 0.0.1 | 매니페스트만 — 워크플로 파일 0 |
+| aigentry-analyst | ✅ | 8a45a84 | 3 | `aigentry-analyst` 1.0.0 (스코프 없음) | 매니페스트만 — 최종 커밋 2026-04-09 |
+| aigentry-registry | ✅ | ac221cd | 3 | `pyproject.toml` + `bridge`, `frontend` | 매니페스트만 — 중첩 2 (+`.next/` 산출물 3 제외) |
+| aigentry-starter | ✅ | c310f28 | 4 | 없음 | 미열람 — 매니페스트 없음 |
+| aigentry-forum | ✅ | f1fc896 | 1 | 없음 | 미열람 — 최종 커밋 2026-03-01 |
+| aigentry-architect | ❌ NOGIT | — | — | 없음 | **미열람 / 버전 프로버넌스 없음** (읽을 수 있는 파일 26개 존재) |
+| aigentry-design | ❌ NOGIT | — | — | 없음 | **미열람 / 프로버넌스 없음** (14개) |
+| aigentry-tester | ❌ NOGIT | — | — | 없음 | **미열람 / 프로버넌스 없음** (59개) |
+| aigentry-sandbox | ❌ NOGIT | — | — | 없음 | **미열람 / 프로버넌스 없음** (75개) |
+| aigentry-builder | ❌ NOGIT | — | — | 없음 | **미열람 / 프로버넌스 없음** (4개) |
 
-> NOGIT 5개(architect/builder/design/sandbox/tester)는 역할 이름과 같지만 git 저장소도
-> 매니페스트도 없다. 이번 감사에서는 **"소스 이용 불가"**로만 처분했고, 폐기 대상인지
-> 미초기화 상태인지는 판단하지 않았다(증거 없음). #534 정리 태스크의 인접 사안일 수 있다.
+> NOGIT 5개는 **읽을 수 있는 파일을 갖고 있다.** 초판의 "소스 이용 불가" 처분은 오류이며
+> 정정한다. 폐기 대상인지 미초기화인지는 판단하지 않았다(증거 없음).
 
-### A.2 범위 제외 31개 — 사유
+### A.2 인접 의존 — "설치/릴리스 경로 밖"이 아님
 
-- 터미널 업스트림 포크/참조 8개: `alacritty, contour, ghostty, kitty, rio, wezterm, winit, zellij`
-  — 서드파티 업스트림. aigentry 릴리스/설치 경로에 포함되지 않음.
-- claude-code 참조 4개: `claude-code-fork, claude-code-murraytom, claude-code-sourcemap,
-  claude-code-system-prompts` — 읽기용 참조.
-- 도구/스킬 5개: `cmux, superpowers, claude-workspace-skills, wtm, testbed` — 생태계 인접이나
-  install/release 경로 밖. `cmux`는 F 대상 아님(#544에서 이미 제출 경로에서 제거됨).
-- 제품/실험 14개: `aases, animal-hospital, benchmarks, cambrian-spore, claurst, common-ai,
-  constitution, n8n-video, nexaforge, ppt-maker, shipfast, syc-ai, voicecode, youtube-scraper`
-  — 소비자 프로젝트. 본 감사의 질문(설치/릴리스/관측성/설정전파/수명주기 경계)에 해당 없음.
+- **WTM** (`aigentry-devkit/tools/wtm`) — 설치기가 `$HOME/.local/lib/wtm`로 복사하고 PATH에
+  심링크(`install.sh:405-491` [작업트리] / HEAD `:360-446`). **설치 경로 안**, 심층 감사만 안 함.
+- **cmux** — `install.sh`에 등장하지 않으나 세션 spawn 표면의 살아있는 의존(#544는 submit 경로만
+  변경). **인접 의존**, 심층 감사 범위 밖.
+- **superpowers / claude-workspace-skills** — 스킬 공급 인접. 심층 감사 밖.
 
-### A.3 엣지 케이스
+### A.3 범위 제외 (사유 명시)
 
-- **중첩 패키지 3개**: `aigentry-ssot/pkg`(= 게시 패키지 본체), `aigentry-registry/frontend`,
-  `aigentry-registry/bridge`. 루트 매니페스트만 보는 도구는 전부 놓친다 — `ecosystem.json`이
-  ssot를 아예 담고 있지 않은 것과 같은 뿌리.
-- **`ecosystem.json`은 6/23만 담는다.** 표시용 매니페스트이며 열거 근거로 쓰지 않았다(§0).
-- **워크트리 77개**(`/Users/duckyoungkim/.aigentry/worktrees/`) — 오케스트레이터 작업 공간.
-  저장소로 세지 않음.
-- **`/Users/duckyoungkim/.aigentry/repo/`** — 메모리 프로파일 3개 파일뿐. 저장소 아님.
-- **dirty 상태**: 감사 대상 18개 git 저장소 전부 dirty(1~51 파일). 어떤 파일도 되돌리지 않았고
-  열지 않았다. devkit의 dirty=51은 별도 확인이 필요할 수 있으나 본 감사 범위 밖.
+- 터미널 업스트림 8: alacritty, contour, ghostty, kitty, rio, wezterm, winit, zellij — 서드파티.
+- claude-code 참조 4: fork, murraytom, sourcemap, system-prompts — 읽기용.
+- 제품/실험 14: aases, animal-hospital, benchmarks, cambrian-spore, claurst, common-ai,
+  constitution, n8n-video, nexaforge, ppt-maker, shipfast, syc-ai, voicecode, youtube-scraper.
+- 기타: testbed, wtm(위 A.2에서 별도 처분).
+
+### A.4 엣지 케이스
+
+- **중첩 매니페스트 9개**(§0.2) + `.next/` 빌드 산출물 3개(제외). 루트만 보는 도구는 전부 놓친다.
+- **`ecosystem.json`은 6/23만 담는다** — 표시용, 열거 근거 아님.
+- **워크트리 77개**(`~/.aigentry/worktrees/`) — 작업 공간, 저장소로 세지 않음.
+- **`~/.aigentry/repo/`** — 메모리 프로파일 3파일. 저장소 아님.
+- **dirty**: 감사 대상 git 저장소 18개 전부 dirty. 어떤 파일도 되돌리거나 수정하지 않았다.
+- **패키지 그래프 완전성 주장 없음**(§0.2).
 
 ---
 
-## 부록 B. 증거 재현 명령 (전부 읽기 전용)
+## 부록 B. 재현 명령 (전부 읽기 전용)
 
 ```bash
+# 0.1 커밋 vs 작업트리 (모든 devkit 인용의 전제)
+cd ~/projects/aigentry-devkit
+git status --porcelain | grep -E 'install\.(sh|ps1)|config/modules|lib/'
+git cat-file -e HEAD:lib/install-fallback.js || echo "NOT IN HEAD"
+git show HEAD:install.sh | grep -n 'api_key: omitEmpty\|npm install -g\|chmod '
+git show HEAD:config/modules/telepty.adapter.json
 # F1
-python3 -c "import json;print(json.load(open('~/projects/aigentry/package.json'.replace('~','$HOME')))['dependencies'])"
-# F2
-grep -n chmod ~/projects/aigentry-devkit/install.sh
-grep -cn 'Acl\|icacls\|SetAccessControl' ~/projects/aigentry-devkit/install.ps1
+python3 -c "import json;print(json.load(open('$HOME/projects/aigentry/package.json'))['dependencies'])"
+python3 -c "import json;print(json.load(open('$HOME/projects/aigentry-aterm/npm/aterm/package.json')))"
+# F2  (grep api_key 금지 — api_key_present 위양성)
+python3 -c "import json,sys;s=json.load(open(sys.argv[1]));print('api_key' in s.get('registry',{}))" <state.json>
 # F3
-grep -c orchestrator ~/projects/aigentry-devkit/install.ps1   # -> 0
+grep -c orchestrator install.ps1;  git show HEAD:install.ps1 | grep -c orchestrator
 # F4
-python3 -c "import json;print(json.load(open('$HOME/projects/aigentry-devkit/package.json'))['scripts'])"
-# F5
-node ~/projects/aigentry-devkit/lib/install-fallback.js telepty --dry-run
-sed -n '506,531p' ~/projects/aigentry-devkit/install.sh
+grep -n 'test:' .github/workflows/*.yml   # -> 0건
 # F6
 for f in ~/projects/aigentry*/ecosystem.json; do shasum -a 256 "$f"; done
 # F7
 for r in ~/projects/aigentry ~/projects/aigentry-*; do echo "$r: $(ls "$r/.github/workflows" 2>/dev/null | tr '\n' ' ')"; done
 # F8
-grep -c '^[[:space:]]*trap ' ~/projects/aigentry-devkit/install.sh   # -> 0
+grep -c '^[[:space:]]*trap ' install.sh   # -> 0
+# 0.2 중첩 매니페스트 (초판의 -maxdepth 2 오류 정정)
+find ~/projects/aigentry ~/projects/aigentry-* -maxdepth 4 -name package.json -not -path '*/node_modules/*'
 ```
