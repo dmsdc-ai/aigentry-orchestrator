@@ -1,10 +1,11 @@
 # aigentry 에코시스템 아키텍처 현황 감사 (#1140)
 
-- 측정 시각 (실측, 추정 없음): 1차 열거 **2026-09-08T13:36:16Z** (`date -u` 기록) → 1차 커밋 `6bd5d78` **13:45:42Z** (`git log %cI`) → 정정 재측정 **13:47Z–13:50Z**
+- 측정 시각 (실측, 추정 없음): 1차 열거 **2026-09-08T13:36:16Z** (`date -u` 기록) → 1차 커밋 `6bd5d78` **13:45:42Z** (`git log %cI`) → rev2 정정 재측정 **13:47Z–13:50Z** → rev3 파일 수 재실측 **13:52Z**
 - 세션: `ec1140-architect` / role `architect` / worktree `/Users/duckyoungkim/.aigentry/worktrees/ec1140` / branch `docs/1140-ecosystem-architecture`
 - 성격: **#526 EPIC 의 current-source refresh**. 신규 overhaul epic 아님. #1141 operations analyst 와 병렬.
 - 권한: 읽기 전용 분석. 코드/설정/task-queue 변경 없음. 본 리포트 1개 파일만 커밋.
-- **개정 이력**: rev1 `6bd5d78` → rev2(본 문서). 오케스트레이터 사실 검토에서 지적된 7개 항목을 재측정하여 정정. 정정 내역은 §0.2 에 전부 명시하며 **조용한 수정은 하지 않았다**.
+- **개정 이력**: rev1 `6bd5d78` → rev2 `8e8c6f9` → **rev3(본 문서)**. rev2 는 오케스트레이터 사실 검토 7개 항목을, rev3 은 #1141 analyst 와의 파일 수 불일치(술어 차이) 및 미승인 제안 표기를 정정. 정정 내역은 §0.2 에 전부 명시하며 **조용한 수정은 하지 않았다**.
+- **제안의 지위**: 본 리포트의 모든 신규 티켓 후보(C-1/C-2), 기존 티켓 범위 확대(#790), 수용 기준은 **architect 의 미승인 제안**이다. 등록·승인·범위 확정은 orchestrator 권한이며, 승인 전까지 기존 티켓 범위는 변경되지 않는다.
 
 ---
 
@@ -33,6 +34,7 @@
 | 4 | "최소 수정 = 3줄", "`--verbose` 로 dry 확인", "롤백 = 재퍼블리시" | 3줄 근거 없음(soft-policy·optional 모듈·warn/die 미조사). `--verbose` 는 dry 아님 — **`--dry-run` 이 실재**(`install-fallback.js:679,704-716`, 체인 출력 후 `process.exit(0)`, exec 이전 단락). npm 은 기존 버전 재게시 불가 | 수정 규모 주장 철회, `--dry-run` 로 교체, 롤백을 "이전 지원 버전 고지 + 보존 아티팩트" 로 교체 |
 | 5 | "dedup 정규식 0건 → NEW" ×4 | **거짓.** #62(메타 패키지 생성), #64(aterm→aigentry 의존), `ux-public-front-door`(**메타 stale pin 명시 기록**), #526(**@aigentry 스코프 전략 dimension 9**), #1136(npm/README/매니페스트 정합성 범위 보유) | 문자열 정규식 → 의미 기반 소유자 비교로 재수행. **신규 후보 4 → 2(+선택 1)**, 나머지 기존 ID 매핑 |
 | 6 | "archive/삭제 권고"(context/bridge), "sandbox 삭제 근거 무효" | 매니페스트 소비자만으로 archive 수용 불가. brain 중복은 **기능 동등 미증명**. 원격 부재 ≠ 백업 부재. 게이트 importer 0 은 **완전 호출경로 증명 아님** | 모든 archive/삭제 권고 철회 → "소비자 조사 미완, 판단 보류". sandbox **보존**. #655 warn-first 정책 보존, B/C 삭제 제안 철회 |
+| 8 | 파일 수 sandbox 71 / design 13 | **집계 술어 미명시.** 실측: `-type f` = sandbox **75**, design **14**; `.DS_Store` 각 4·1건. rev1/rev2 는 `! -name '.DS_Store'` 를 적용하고도 **그 사실을 표기하지 않았다**. #1141 analyst 의 75/14 는 `-type f` 기준으로 **정확**하며 불일치는 술어 차이 전부 | 부록 A 에 술어 명시 + 양쪽 수치 병기, 심볼릭 링크 별도 표기 |
 | 7 | `aigentry-devkit@bb7876b <file>:<line>` 로 일괄 인용 | **혼입.** `installer-manifest.json` 은 HEAD 클린이나, 4개 어댑터·`install.sh` 는 **dirty**, `lib/install-fallback.js` 는 **untracked** — HEAD 에 존재조차 하지 않음 | 모든 증거에 `[HEAD]` / `[WT-dirty]` / `[WT-untracked]` 출처 태그 부착 |
 
 ---
@@ -70,8 +72,8 @@ telepty 좌표만 세 곳에 있다 — `installer-manifest.json`(0.1.45, HEAD �
 
 - **통합 모노레포 / 새 install orchestration 계층** — `install-fallback.js` 가 이미 필요한 일을 한다. 문제는 계층 부재가 아니라 좌표 권위의 모호함.
 - **ecosystem.json 을 23개로 확대** — 등재 확대는 또 하나의 stale SSOT 를 만든다. 게이트가 등재보다 싸다.
-- **`latest` 또는 "로컬 버전과 정확히 동일" 을 호환성 보장으로 채택** — 둘 다 보장이 아니다. `latest` 는 미래 breaking 을 자동 수용하고, 로컬 동일은 레지스트리 상태를 확인하지 않은 추정이다. 정답은 **검증된 하한 range + 게이트**이며, 하한 값 확정에는 레지스트리 조회(본 세션 범위 밖)가 선행한다.
-- **aigentry-sandbox 삭제** — 71 파일/15M 의 격리 npm-test 환경이다. #662 의 "0파일" 은 오류이며 **보존**이 정답.
+- **`latest` 또는 "로컬 버전과 정확히 동일" 을 호환성 보장으로 채택** — 둘 다 보장이 아니다. `latest` 는 미래 breaking 을 자동 수용하고, **로컬 버전 동일성(local-version equality)은 레지스트리 상태를 확인하지 않은 추정이므로 호환성 기준이 될 수 없다**. 하한 range 값 확정에는 레지스트리 조회(본 세션 범위 밖)가 선행한다. 아래 C-2 가 제안하는 `--check` 는 **드리프트 탐지 신호**일 뿐 **호환성 판정 기준이 아니며**, 제안 상태이지 승인된 기준이 아니다.
+- **aigentry-sandbox 삭제** — 격리 npm-test 환경이다(`-type f` **75**, 15M — 부록 A 술어 참조). #662 의 "0파일" 은 오류이며 **보존**이 정답.
 - **spawn 게이트 class-B/C 삭제** — rev1 제안 철회. importer 0 은 완전 호출경로 증명이 아니다.
 - **context/bridge 즉시 archive** — rev1 제안 철회. 소비자 조사가 매니페스트 수준에서 멈춰 있다.
 
@@ -157,7 +159,7 @@ telepty 좌표만 세 곳에 있다 — `installer-manifest.json`(0.1.45, HEAD �
 - **근본원인**: #793 이 **sync 를 1회 수행**했으나 **check 를 남기지 않았다.** telepty 두 릴리스가 지나는 동안 아무것도 실패하지 않았다.
 - **최소 수정**: `sync-readme-tooling.mjs` 에 `--check` 모드(모듈 행 version ↔ 해당 repo 매니페스트 대조, 불일치 시 non-zero) + telepty/orchestrator 행 값 정정 + `_comment` 의 "Source of truth" 를 실제 범위("README 표 생성용 published-module 목록")로 정정. **커버리지 확대는 하지 않는다.**
 - **#1136 과의 경계 (명시 요구 대응)**: #1136 production spec 의 「npm, installation and README scope」가 **orchestrator 패키지 자신의** `README.tmpl.md` ↔ 생성 README 정합, aspirational claim 금지, install/init/upgrade/uninstall 및 릴리스 게이트를 **이미 소유**한다. 본 finding 이 추가하는 것은 그 범위 밖의 **cross-repo 축**뿐이다 — 6개 벤더 사본 + 5개 형제 repo 의 모듈 버전 표. 즉 **#1136 을 대체하지 않고 additive** 이며, #1136 이 정의할 in-repo 게이트와 **동일 스크립트를 공유하도록 설계**하는 것이 중복을 피하는 길이다.
-- **수정 전 재현**: `ecosystem.json` telepty 행(0.7.1) vs `aigentry-telepty/package.json`(0.8.3) 대조 = 재현. **수용 기준**: `--check` 가 현재 트리에서 non-zero, 값 정정 후 0.
+- **수정 전 재현**: `ecosystem.json` telepty 행(0.7.1) vs `aigentry-telepty/package.json`(0.8.3) 대조 = 재현. **수용 기준(제안)**: `--check` 가 현재 트리에서 non-zero, 값 정정 후 0. **단서** — 이 대조가 검증하는 것은 "표시된 값이 로컬 소스와 일치하는가" 즉 **문서 정합성**이며, **호환성이나 설치 가능성을 판정하지 않는다**(레지스트리 미측정). 로컬 버전 동일성을 호환성 기준으로 승격해서는 안 된다. 본 수용 기준은 **미승인 제안**이다.
 - **소유**: `aigentry-devkit`(스크립트) + 6개 벤더 사본 / coder
 - **의존/롤아웃/롤백**: #1136 의 in-repo 게이트 설계와 조율. 롤아웃 = #793 과 동일한 검증된 재생성 절차. 롤백 = 사본 revert.
 - **task 매핑**: **#1136 에 cross-repo 경계를 명시**(위 문단) + 신규 후보 **C-2**(드리프트 게이트, ECO-1140-03 과 통합). #793 은 done 이며 **재개하지 않는다** — evidence delta 는 본 리포트에 기록되어 있고, 필요한 산출물이 sync 가 아니라 gate 라서 원 티켓 범위와 다르다.
@@ -216,7 +218,7 @@ telepty 좌표만 세 곳에 있다 — `installer-manifest.json`(0.1.45, HEAD �
 - **수정 전 재현**: 해당 없음(수정 제안 없음). **조사 수용 기준**: 직접 소비자 목록과 brain 대비 고유 동작 표가 #662 에 첨부될 것.
 - **소유**: `aigentry-context` / architect(조사)
 - **의존/롤아웃/롤백**: 해당 없음.
-- **task 매핑**: **#662 UPDATE** + **#790 UPDATE**(원격 생성은 archive 와 무관하게 그 자체로 유효). **#662 의 stale 헤드라인 정정**: "sandbox(0파일) 삭제" 는 **오류** — `aigentry-sandbox` 는 **71 파일 / 15M**(npm-test pack·install, telepty 격리 데이터, osc133 evidence 로그)이며 격리 설치 테스트 환경이다. **보존이 정답이고 삭제 근거는 무효.**
+- **task 매핑**: **#662 UPDATE** + **#790**(원격 생성은 archive 와 무관하게 그 자체로 유효 — 단 아래 ECO-08 의 #790 범위 확대는 **미승인 제안**이다). **#662 의 stale 헤드라인 정정**: "sandbox(0파일) 삭제" 는 **오류** — `aigentry-sandbox` 는 **`-type f` 75 파일 / 15M**(npm-test pack·install, telepty 격리 데이터, osc133 evidence 로그)이며 격리 설치 테스트 환경이다. **보존이 정답이고 삭제 근거는 무효.**
 
 ---
 
@@ -234,7 +236,7 @@ telepty 좌표만 세 곳에 있다 — `installer-manifest.json`(0.1.45, HEAD �
 - **수정 전 재현**: `git -C aigentry-bridge remote -v` 무출력 + `git log --oneline` 1줄. **수용 기준**: 원격 설정 후 origin/main 이 로컬 HEAD 와 일치.
 - **소유**: `aigentry-bridge` / architect(분류) → builder(원격)
 - **의존/롤아웃/롤백**: #526 스코프 전략과 조율. 롤백 = 원격 제거.
-- **task 매핑**: **#279 UPDATE**(Track E14 Phase A 설문이 bridge 포함 10개 분류를 이미 소유) + **#790 의 범위를 "원격 미설정 repo 전부(context + bridge)" 로 확대**. 신규 티켓 불필요.
+- **task 매핑**: **#279 UPDATE**(Track E14 Phase A 설문이 bridge 포함 10개 분류를 이미 소유). #790 에 대해서는 **"범위를 원격 미설정 repo 전부(context + bridge)로 확대" 를 제안한다 — 이는 architect 의 미승인 제안이며 확정된 범위가 아니다.** 확대 여부는 orchestrator 판단이고, 승인 전까지 #790 의 범위는 기존대로 context 단독이다. 신규 티켓 불필요.
 
 ---
 
@@ -253,19 +255,31 @@ telepty 좌표만 세 곳에 있다 — `installer-manifest.json`(0.1.45, HEAD �
 
 깊이: **D**=deep(소스 라인 확인) / **M**=manifest+구조 / **S**=표면(존재·크기·git)
 
+**파일 수 집계 술어 (rev3 명시)**: 아래 "파일" 수치는 **`find <dir> -type f`** — 일반 파일만, 도트파일 포함, **심볼릭 링크 제외**(`-type l` 별도 표기), **`.DS_Store` 포함**. rev1/rev2 는 `.DS_Store` 를 제외하고도 표기하지 않아 #1141 analyst 수치와 어긋났다. 아래는 술어를 통일한 재실측이며, 참고로 `.DS_Store` 제외값을 괄호로 병기한다. git 미초기화 5개 디렉터리 실측(2026-09-08T13:52Z):
+
+| dir | `-type f` | `.DS_Store` 제외 | `.DS_Store` | `-type l` | dirs | du -sh |
+|---|---:|---:|---:|---:|---:|---:|
+| aigentry-sandbox | **75** | 71 | 4 | 2 | 33 | 15M |
+| aigentry-tester | **59** | 59 | 0 | 0 | 7 | 25M |
+| aigentry-architect | **26** | 26 | 0 | 3 | 6 | 364K |
+| aigentry-design | **14** | 13 | 1 | 0 | 9 | 224K |
+| aigentry-builder | **4** | 4 | 0 | 0 | 2 | 28K |
+
+**#1141 analyst 와의 대조**: analyst 의 sandbox **75** / design **14** 는 `-type f` 기준으로 **정확하다**. 본 리포트의 71 / 13 은 `.DS_Store` 를 뺀 값이었고 그 사실을 적지 않은 것이 불일치의 전부다 — 측정 대상이 아니라 **술어 차이**이며, 분석 결론에는 영향이 없다. 이하 표는 `-type f` 값을 채택한다.
+
 | # | repo | HEAD | branch | dirty | remote | manifest / 언어 | 역할 | 깊이 | disposition |
 |---|---|---|---|---|---|---|---|:-:|---|
 | 1 | aigentry | f959b29 (07-26) | main | 4 | ✅ | `@dmsdc-ai/aigentry` 0.1.1 / JS | 메타 설치 패키지 | D | ECO-03 |
 | 2 | aigentry-amplify | b555848 (07-26) | main | 7 | ✅ | 0.0.1 `private:true` / TS 워크스페이스 | 콘텐츠 | M | ECO-02(설치 좌표) |
 | 3 | aigentry-analyst | 8a45a84 (**04-09**) | main | 3 | ✅ | `aigentry-analyst` 1.0.0 / JS+MCP | analyst role MCP | M | 외부 소비자 미발견(전수 아님), 5개월 무변경 — #279 |
-| 4 | aigentry-architect | **NO GIT** | — | — | ❌ | 없음 (26 파일) | architect role artifact | D | **ECO-05** |
+| 4 | aigentry-architect | **NO GIT** | — | — | ❌ | 없음 (26 파일, `-type f`; +심볼릭 3) | architect role artifact | D | **ECO-05** |
 | 5 | aigentry-aterm | 9b4cec5 (08-15) | main | 8 | ✅ (aterm.git) | **`npm/aterm/package.json` `@dmsdc-ai/aterm` 0.2.13 MIT** + Cargo workspace 3 crates(0.1.0) + Swift | 터미널 런처 | M | rev1 "npm 매니페스트 없음" **정정**. #782 브랜치 표류 |
 | 6 | aigentry-brain | 0ffa6ee (08-16) | main | 6 | ✅ | 0.3.1 / TS+MCP | 영속 메모리 | D | 활성. `src/context/` 관심영역 중복(ECO-07, 동등성 미증명) |
 | 7 | aigentry-bridge | 5eabef0 (**04-01, init 유일**) | main | 11 | ❌ | `@dmsdc-ai/aigentry-bridge` 0.1.0 / JS | CLI 원격제어 SDK | D | **ECO-08** |
-| 8 | aigentry-builder | **NO GIT** | — | — | ❌ | 없음 (4 파일) | builder role artifact | S | **ECO-05** |
+| 8 | aigentry-builder | **NO GIT** | — | — | ❌ | 없음 (4 파일, `-type f`) | builder role artifact | S | **ECO-05** |
 | 9 | aigentry-context | eb23360 (07-26) | main | 3 | ❌ | 0.0.1 / JS+MCP, 1,436 LOC | 컨텍스트 압축/투영 | D | **ECO-07** (조사 필요, archive 권고 없음) |
 | 10 | aigentry-deliberation | b009549 (07-26) | main | 3 | ✅ | 0.0.47 / JS+MCP | 다중 AI 토론 | M | 활성. `demo/forum/` 자체 벤더 |
-| 11 | aigentry-design | **NO GIT** | — | — | ❌ | 없음 (13 파일) | design role artifact | S | **ECO-05** |
+| 11 | aigentry-design | **NO GIT** | — | — | ❌ | 없음 (**14** 파일, `-type f`; .DS_Store 제외 13) | design role artifact | S | **ECO-05** |
 | 12 | aigentry-devkit | bb7876b (07-26) | main | **51** | ✅ | 0.1.14 / JS | 설치/스캐폴드 + **templates SSOT** | D | **ECO-01/02/04/05** + #593 |
 | 13 | aigentry-dustcraw | c0af3c9 (07-26) | main | 14 | ✅ | 0.4.0 / TS | 외부 리서치 | M | ECO-02(어댑터 latest 로 이미 정정됨) |
 | 14 | aigentry-forum | f1fc896 (**03-01**) | main | 1 | ✅ | 없음 (index.html + assets) | 토론 시각화 | M | 외부 소비자 미발견. deliberation 이 `demo/forum/` 벤더링(README:55,58) — #279 분류 대상 |
@@ -273,11 +287,11 @@ telepty 좌표만 세 곳에 있다 — `installer-manifest.json`(0.1.45, HEAD �
 | 16 | aigentry-logger | f4f62e3 (06-06) | main | 1 | ✅ | 0.2.0 / JS | 텔레메트리 | M | **실사용**: orchestrator `src/telemetry/logger-emit.ts:18-19`, brain, deliberation, devkit. #527/#671 |
 | 17 | aigentry-orchestrator | ca93cb6 (**09-08**) | main | 10 | ✅ | 0.2.0 / TS+shell | 컨트롤 타워 | D | **ECO-05/06**. 최활성 |
 | 18 | aigentry-registry | ac221cd (07-26) | main | 3 | ✅ | pyproject `aigentry` 0.2.0 / **Python** + 내부 TS bridge | 레지스트리 | M | 유일 Python 축. 내부 `bridge/` 가 ECO-08 의 실사용 구현 |
-| 19 | aigentry-sandbox | **NO GIT** | — | — | ❌ | 없음 (**71 파일, 15M**) | 격리 테스트 환경 | D | **보존.** #662 "0파일" 정정 |
+| 19 | aigentry-sandbox | **NO GIT** | — | — | ❌ | 없음 (**75 파일, 15M**, `-type f`; .DS_Store 제외 71, +심볼릭 2) | 격리 테스트 환경 | D | **보존.** #662 "0파일" 정정 |
 | 20 | aigentry-ssot | 42afae4 (07-26) | main | 3 | ✅ | `pkg/package.json` `@dmsdc-ai/aigentry-ssot` 1.0.0 / TS | 계약 스키마 | M | **실사용**: orchestrator `src/session/inject-parser.ts:27`, logger. #783/#785 |
 | 21 | aigentry-starter | c310f28 (**04-01**) | main | 4 | ✅ | 없음 (템플릿 트리) | 프로젝트 시드 | S | 5개월 무변경 — #279 |
 | 22 | aigentry-telepty | 997ea7c (**09-08**) | main | 13 | ✅ | 0.8.3 / JS | PTY 전송 | D | 활성 |
-| 23 | **aigentry-tester** | **NO GIT** | — | — | ❌ | 없음 (**59 파일, 25M**) | tester role artifact | S | **rev1 누락분.** ECO-05 |
+| 23 | **aigentry-tester** | **NO GIT** | — | — | ❌ | 없음 (**59 파일, 25M**, `-type f`) | tester role artifact | S | **rev1 누락분.** ECO-05 |
 
 **요약**: git 없음 **5**(architect, builder, design, sandbox, tester) / 원격 미설정 2(bridge, context) / 5개월+ 무변경 4(analyst, bridge, forum, starter; git 없는 4곳은 판정 불가) / 당일 변경 2(orchestrator, telepty).
 
@@ -328,17 +342,20 @@ telepty 좌표만 세 곳에 있다 — `installer-manifest.json`(0.1.45, HEAD �
 | ECO-05 role SSOT | **#292** | UPDATE | Layer1=devkit templates 소유 확인 + Layer2→3 단절 실증 |
 | ECO-06 spawn 게이트 | **#655**, `sec-wire-enforce-spawn` | UPDATE | 현행 LOC + "결정 전 조사 선행" 조건. **warn-first 정책 보존** |
 | ECO-07 context | **#662**, **#790** | UPDATE | archive 권고 철회, 조사 조건 추가, **sandbox "0파일" 정정** |
-| ECO-08 bridge repo | **#279**, **#790** | UPDATE | #790 범위를 "원격 미설정 repo 전부" 로 확대 |
+| ECO-08 bridge repo | **#279** | UPDATE | #790 범위 확대("원격 미설정 repo 전부")는 **미승인 제안** — 승인 전까지 #790 은 context 단독 |
 
-### 5.2 신규 후보 (2건, 상한 3 이내)
+### 5.2 신규 후보 (2건, 상한 3 이내) — 전부 **미승인 제안**
+
+> 아래 C-1/C-2 는 architect 의 제안이며 승인된 범위가 아니다. 등록·승인은 orchestrator 권한이다.
 
 - **C-1 — 설치 좌표 권위 단일화 (devkit)**
   범위: `installer-manifest.json` 의 컴포넌트 버전 필드, 어댑터 `attach.install_command`, 어댑터 `install.fallback` 셋 중 **권위 필드를 스키마에서 확정**하고 나머지를 비활성/제거. 소유 repo: `aigentry-devkit`.
   dedup 근거: #593 은 "WIP 을 커밋하라" 이지 "어느 필드가 권위인가" 를 정하지 않는다. #526 은 스코프 이름 전략이지 필드 권위가 아니다. #1136 은 orchestrator 패키지 범위다. **세 티켓 어디에도 이 결정이 없다.**
   선행: #593.
 
-- **C-2 — 버전 좌표 드리프트 게이트 (cross-repo)**
+- **C-2 — 버전 좌표 드리프트 게이트 (cross-repo)** — **미승인 제안**
   범위: `ecosystem.json` 모듈 행 ↔ 각 repo 매니페스트, 메타 패키지 range ↔ 하위 패키지 버전을 **비네트워크로 대조하는 `--check`** 를 CI 에 배선. ECO-03 과 ECO-04 를 하나로 묶는다(둘 다 "1회 sync 후 재드리프트" 라는 동일 결함 계열).
+  **경계(중요)**: 이 게이트는 **로컬 소스 간 표시값 정합성**만 검사한다. **로컬 버전 동일성은 호환성 기준이 아니며**, 이 `--check` 의 통과가 설치 가능·호환을 뜻하지 않는다(레지스트리 미측정). 호환성 판정 기준으로 승격하는 것은 본 리포트의 권고가 아니다.
   dedup 근거: #793 과 `ux-public-front-door` 는 **둘 다 1회성 수정으로 done 처리**되었고 둘 다 재발했다 — 재발이 곧 "게이트가 없다" 는 증거이며, 게이트는 두 티켓 어느 쪽의 범위도 아니었다. **재발 티켓 신설의 명시적 근거는 이것이다.** #1136 과의 경계: #1136 은 orchestrator 패키지 **내부** README/매니페스트 정합을 소유하며, C-2 는 **cross-repo 축만** 추가하고 동일 스크립트를 공유하도록 설계한다.
   선행: 메타 range 실값 확정에는 레지스트리 조회 필요(본 세션 범위 밖).
 
