@@ -591,9 +591,17 @@ for r in ~/projects/aigentry ~/projects/aigentry-*; do echo "$r: $(ls "$r/.githu
 # F8
 grep -c '^[[:space:]]*trap ' install.sh   # -> 0
 # 0.2 중첩 매니페스트 (초판의 -maxdepth 2 오류 정정)
+# 분류는 경로 깊이가 아니라 '검색 루트 기준 상대 경로에 / 가 남는가'로 판정한다.
+# awk -F/ NF==2 는 절대 경로에서 항상 거짓이 되어 ROOT=0 을 낸다 — 쓰지 말 것.
 find ~/projects/aigentry ~/projects/aigentry-* -maxdepth 4 -name package.json -not -path '*/node_modules/*' \
-  | awk -F/ '{if(NF==2)r++; else if($0~/\/\.next\//)b++; else n++} END{print "ROOT="r" NESTED="n" BUILD="b}'
-# -> ROOT=13 NESTED=8 BUILD=3   (rev2 headline said 9; that was an aggregation error)
+  | awk '{ d=$0; sub(/\/package\.json$/,"",d); sub(/.*\/projects\//,"",d)
+           if (d !~ /\//)            r++      # 저장소 루트: 상대 경로에 / 없음
+           else if ($0 ~ /\/\.next\//) b++   # 빌드 산출물
+           else                       n++ }
+     END { print "ROOT="r+0" NESTED="n+0" BUILD="b+0 }'
+# -> ROOT=13 NESTED=8 BUILD=3   (절대/상대 어느 쪽으로 호출해도 동일)
+# rev3까지 이 자리에 실려 있던 awk -F/ NF==2 판은 ROOT=0 NESTED=21 BUILD=3 을 냈다 —
+# 합계 24는 맞지만 분류가 전부 NESTED로 쏠린 형태였고, 본문 13/8/3 은 위 술어로 재확인했다.
 # A.1 NOGIT file counts — state the predicate, the two differ only by .DS_Store
 for d in aigentry-architect aigentry-design aigentry-tester aigentry-sandbox aigentry-builder; do
   echo "$d all=$(find ~/projects/$d -type f|wc -l) noDS=$(find ~/projects/$d -type f -not -name .DS_Store|wc -l)"
