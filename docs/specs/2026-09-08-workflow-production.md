@@ -1,159 +1,192 @@
 # SPEC — #1136 workflow productionization: approval, notification, reap, ledger, release
 
-**Status** design contract, no code written. **Source** `docs/reports/2026-09-08-workflow-efficiency-analysis.md` at `0541a29` (corrected revision; the pre-revision `55dc27d` claims are NOT used). **Tree** `5baeecf` = `main` at authoring time. **Owner** architect only; every file below is unwritten.
+**Status** design contract, revision 2 after review of `7422cdb` (ISSUES, not approval). **Source** `docs/reports/2026-09-08-workflow-efficiency-analysis.md` at `0541a29`; the pre-revision `55dc27d` claims are not used. **Tree** `main` `5baeecf` at authoring time. **Owner** architect; no file below is written.
 
-Findings addressed: F1 (approval retention), F3 (duplicate completion notice), F2+F5 (reap order and assignment state), F6 (ledger append). F4 (router ref header) is **#1133's**, not restated here.
+Findings addressed: F1 approval retention, F3 duplicate completion notice, F2+F5 reap order and assignment state, F6 ledger append. F4 (router ref header) is #1133's.
 
-## 0. Boundary against #1133 and #1128
+## 0. What revision 2 withdraws
 
-**Owned here:** the `bin/` ledger writer, one `session-cleanup.sh` selector, `report-sweep` grouping, template policy, README/ship-set truth. **Owned elsewhere:** `src/dispatch/cli.ts`, `bin/model-router.mjs` and the `active.json` schema — including **all cap/quota counting** — are #1133's; inject delivery loss and modal capture are #1128's.
-
-**No file in this spec is also in #1133's split** (`docs/specs/2026-09-08-model-router-production.md` §13: F1 profile, F2 router, F3 `src/dispatch/cli.ts`, F5/F6 fixtures+tests, F7 docs). #1133 §8.2 decides worker-vs-orchestrator cap accounting; **this spec changes no counting and sets no cap-demotion target** — a demotion when capacity is genuinely full is the cap working. Reserved exit codes: #1133 takes **10**; this spec takes **11** if a gate is ever added (§3, deferred). One registry writer stays `bin/dispatch-registry.py`.
-
-## 1. The framework-reuse question, answered
-
-**No new service, daemon, framework or dependency. One new file.** Every mechanism below is an added subcommand/flag on a primitive that already exists and is already on the release path:
-
-| Need | Existing primitive | Why it fits |
+| Withdrawn from `7422cdb` | Measured reason | Now |
 |---|---|---|
-| durable approval + task state | `state/task-queue.json` (1.72 MB, 1136 rows, indent-2, UTF-8 literal, trailing `\n`) | already reloaded every session; already the Rule 34 gate input (`src/dispatch/cli.ts` `TASK_QUEUE`) |
-| locked atomic JSON write | `bin/dispatch-registry.py` (lock ctx `:168`, same-dir temp + fsync + rename `:255`) | idiom exists; copy it, do not invent one |
-| inbound report capture + dedup | `dispatch-tracker.sh report-sweep`, `state/dispatch/report-cursor.json`, `state/dispatch/inbox/` (spec `2026-08-16-report-sweep.md`) | durable pull-side cursor already survives restart and already parses kind+track |
-| session reaping with protections | `bin/session-cleanup.sh` → `src/cleanup/cli.ts` (protected sid `:45`, self/ancestor guard `:344`, `--keep` `:622`) | reuse guards verbatim; add a selector, not a policy |
-| release proof | `.github/workflows/release.yml`, `tests/packaging/{T96,smoke-init.sh}` | already packs, publishes, reads back from the registry |
+| "ZERO shared files with #1133" | `src/dispatch/cli.ts:668-716` is a live queue writer; wiring the transaction path **needs that file**, which is #1133 F3's | §1, §10 |
+| lock only in the new helper ⇒ "no lost updates" | atomic rename is not lost-update prevention; two unlocked read-modify-write writers exist today | §1 |
+| reap gated on terminal `lifecycle.state` | **circular**: `src/cleanup/cli.ts:474` is itself the writer of `cleaned`, and no other value means success | §5 |
+| track-matched inbox presence = retention | a track match is not identity, and a REPORT can end a phase that continues | §5 |
+| `^phase:` regex and the `<track>/-` fallback | measured refs carry `\| task: #N \|` **inline** and **no `phase:` at all**; `<track>/-` conflates unrelated events | §4 |
+| "one notice per completion event" | a HOLD and REPORT split across two polls give EVENT + AMENDED = two notices | §4 |
+| append-only approvals that flip an old record's status | self-contradictory | §3 |
+| `[K]` substring in note prose as the idempotence key | arbitrary prose can contain `[K]` | §6 |
+| "`tests/packaging/*.sh` run only in `release.yml`" | **false** — `.github/workflows/ci.yml:80,83,85` runs T96, T97 and `smoke-init.sh` on every push/PR, both OS legs | §7 |
 
-The **one** new file is `bin/tq-write.py` (§6): the three existing `bin/tq-*.sh` are read-only, so there is no writer to extend, and approvals/status/owners/notes all need the same lock + atomic rename. One writer, one lock — three scripts would be three lock implementations (Art. 1).
+## 1. Queue writers and the shared transaction path
 
-## 2. Measured current contracts
+**Every live writer of `state/task-queue.json`, measured:**
+
+| # | Writer | Mechanism today | Locked? |
+|---|---|---|---|
+| W1 | `src/dispatch/cli.ts:668-716` `taskLedgerUpdate()` | read → mutate `status`/`updated_at` → **append to `note`** → same-dir temp + `fsync` + rename; `JSON.stringify(data,null,2)+"\n"` (indent 2 pinned by #1110) | **no** |
+| W2 | `bin/tq-focus.sh:18-20` | `jq '.active_focus=$t' > $(mktemp)` then `mv` — **cross-filesystem `mv`, not an atomic same-dir rename** | **no** |
+| W3 | the orchestrator LLM's own `apply_patch`/Edit | whole-file replace | **no** |
+| W4 | `bin/init/cli.mjs:301-307` | creates the file on a fresh workspace only; preserves an existing one | n/a |
+
+W1 and the proposed `note-append` write **the same field**. Locking only the new helper would leave exactly that race unfixed, so:
+
+- **One transaction path.** `bin/tq-write.py` becomes the only process that opens the queue for write. W1 is **rewired** to call it as a subprocess (`tq-write.py dispatch-stamp --task … --sid … --ref … --track … --cli … --by … [--capped-cli …]`), emitting byte-identical stamp text and keeping today's semantics exactly: promote `pending|queued → delegated` only, never regress `in_progress`, and **best-effort — warn, never fail the dispatch** (the inject has already landed). `src/dispatch/cli.ts:257-269` already shells to `bin/dispatch-registry.py` (`DISPATCH_REGISTRY_PY`, `:34`), so this is the established idiom, not a new one.
+- W2 is rewired to `tq-write.py focus <track>`, which also removes the cross-filesystem `mv`.
+- **W3 cannot be locked.** Honest limit: the transaction path covers *program* writers. A hand edit that read the file before the lock-holder committed can still lose an update. The deliverable against W3 is that the orchestrator calls the helper instead — **instruction-only** (§8), and the reason C4 exists at all.
+- Lock: `fcntl.flock` on `<resolved queue path>.lock`, created on demand 0600, blocking with a bounded wait; commit is same-dir temp + `fsync` + `os.replace`, copying `bin/dispatch-registry.py:168` (lock ctx) and `:255` (commit). **The lock is the new part; the rename was never the guarantee.**
+
+**Ownership consequence:** `src/dispatch/cli.ts` **is** shared with #1133 F3. Integration P7 is **serialized after #1133 F3 lands**, is confined to the body of `taskLedgerUpdate()` plus one drain call, and is owned by one coder (§10). No parallel edit of that file is proposed.
+
+## 2. Other measured contracts
 
 | Fact | Where |
 |---|---|
-| ledger is indent-2, non-ASCII **unescaped**, one trailing newline; notes are one string joined by ` \| ` / ` \|\| ` | `state/task-queue.json` |
-| `note` append today re-emits the whole prior note through model output (#1132 note reached 3,465 B in 3 appends) | report F6 |
-| statuses in use: pending 298, done 775, in_progress 21, blocked 10, blocked-by-observation 10, awaiting-user 9, delegated 10, cancelled 3 | ledger snapshot 2026-09-08 |
-| 80/80 dispatch records carry `outcome.state="unknown"`, `capability.outcome_protocol="unavailable"` (`stage_b_deferred_to_0.9.0`) — **no completion-signal path exists**; records key on `assigned.sid`, never a task id | `state/dispatch/active.json` |
-| template requires a HOLD at *every* phase boundary (`:109`) and a REPORT at the last (`:75-76`) → both fire on a final approval-needing phase | `docs/templates/dispatch-ref-template.md` |
-| sweep dedups by ref content sha only; a HOLD and a REPORT for one event are two shas | report-sweep spec §3 |
-| `bin/**` is enumerated file-by-file in `bin/init/manifest.mjs`; T96 assertion 4 fails unless that count equals `git ls-files bin` | `tests/packaging/T96_ship_set_agreement.sh:81-85` |
-| `README.md` is **generated** from `README.tmpl.md` + `ecosystem.json`; `gen-readme.mjs --check` exists and is wired to no test | `scripts/gen-readme.mjs`, `.github/workflows/readme-regen.yml` |
+| queue is indent-2, non-ASCII unescaped, one trailing newline; `note` is one string joined by ` \| ` / ` \|\| ` | `state/task-queue.json`, and W1's own serializer |
+| `RETIRED_LIFECYCLES = {cleaned, cutover_retired, delivery_failed, not_delivered, superseded}`, with the file's own comment: "**None of them says anything about the TASK**" | `bin/dispatch-registry.py:50-54` |
+| lifecycle writers: registry `delivery_attempt_started` `:462`, `superseded` `:489`, `not_delivered` `:602`, `delivery_state_unknown` `:605`; tracker `re_dispatched`/`disconnected`/`stuck_error`/`stuck_welcome` `:549,773,809,817`; reconciler `:376,524`; hitl `:277`; **cleanup `cleaned` `:474`** | measured 2026-09-08 |
+| 80/80 dispatch records carry `outcome.state="unknown"`, `outcome_protocol="unavailable"` (`stage_b_deferred_to_0.9.0`); records key on `assigned.sid` + `dispatch_id`, never a task id | `state/dispatch/active.json` |
+| `report-sweep` has **no production caller** — invoked only by T107/T108/T109 and a logging snippet inside its own spec | `grep -rn report-sweep` |
+| measured ref heads: `REPORT: … \| task: #1136 \| …` (inline, no `# REPORT` heading); dispatch refs carry front-matter `task: 1136`; **no ref carries `phase:`** | `~/.telepty/shared`, 4 most recent |
+| `bin/**` is enumerated file-by-file in `bin/init/manifest.mjs`; T96 assertion 4 requires that count to equal `git ls-files bin` | `tests/packaging/T96_ship_set_agreement.sh:81-85` |
+| `README.md` is generated from `README.tmpl.md` + `ecosystem.json`; `gen-readme.mjs --check` exists and is wired to **no** test or CI job | `scripts/gen-readme.mjs`, `.github/workflows/readme-regen.yml` |
 
-## 3. C1 — approval scope that survives reload
+## 3. C1 — approval as an immutable event history
 
-Append-only `approvals` array on the owning task row. Written **only** by `tq-write.py approve|revoke`.
+`approvals` is an **append-only event list**. No element is ever edited or removed; status is **derived**.
 
 ```json
-{"id":"ap1136-3f9c21a8","scope":"<one line, the granted action>","phases":["spec","impl"],
- "granted_at":"2026-09-08T13:04:11Z","provenance":{"source":"user","quote":"<verbatim>","ref":"<ref-id|transcript ts>"},
- "status":"active","supersedes":null,"revoked_at":null}
+{"ev":"grant","id":"ap1136-3f9c21a8","at":"2026-09-08T13:04:11Z","scope":"<one line>","phases":["spec"],
+ "supersedes":null,"provenance":{"source":"user","quote":"<verbatim>","ref":"<ref-id|transcript ts>"}}
+{"ev":"revoke","id":"rv1136-0c41","at":"…","target":"ap1136-3f9c21a8","provenance":{…}}
 ```
 
-- `--scope` and `--quote` are **required**; missing either ⇒ exit 2, nothing written. There is no keyword/prose path that mints a grant — the helper never reads free text and infers one.
-- **Never widened.** `approve` on a row that already has an `active` record writes a *new* record with `supersedes:<old id>` and flips the old to `superseded`. An existing record is never edited in place.
-- `revoke <approval-id> --quote` ⇒ `status:"revoked"`. `revoked`/`superseded` never return to `active`.
-- **Legacy** rows have no `approvals` key. Absent ≠ denied and ≠ granted; it is **unrecorded**, and every existing path behaves exactly as today. No status value changes meaning.
-- Read path: `tq-write.py approvals <task>` prints active records; `bin/tq-status.sh` gains one line per task with an active approval. This is what makes re-asking unnecessary after a reload.
+- **Derivation** a `grant` is *active* unless a later event `revoke`s it or a later `grant` names it in `supersedes`. Nothing else. `tq-write.py approvals <task>` prints the derived view; the history is the record.
+- **Independent scopes coexist.** `supersedes` is explicit and single-target: a new grant never implicitly displaces unrelated active scopes.
+- `--scope`, `--phases` and `--quote` are required on `grant`; `--target` and `--quote` on `revoke`. Missing any ⇒ exit 2, nothing written. The helper never reads free text and infers a grant — there is no prose or keyword path to approval.
+- **Legacy** rows carry no `approvals` key: *unrecorded*, which is neither granted nor denied. Every existing path behaves exactly as today; no status value changes meaning.
+- **Not built:** a dispatch-side approval gate. Nothing measured shows a dispatch made without approval; the measured defect is a turn that acknowledged and did not actuate, which no tool gate can force (§8). If one is ever wanted it is ~10 lines in `src/dispatch/cli.ts`, exit **11** (#1133 holds **10**), serialized behind P7.
 
-**Deliberately NOT built:** a dispatch-side `--approval` gate. Nothing measured shows a dispatch made without approval — the measured defect is a *turn* that acknowledged and did not actuate, which no tool gate can force (§8). Adopt the gate only if a dispatch-without-active-approval is ever observed; it would be ~10 lines in `src/dispatch/cli.ts`, **serialized after #1133 F3**, exit 11.
+## 4. C2 — notification grouping, and exactly what it can guarantee
 
-## 4. C2 — one notification per completion event
+**Identity is emitted by the producer, never inferred by the consumer.** The template gains one machine-readable line inside the first 400 bytes of every HOLD and REPORT: `event: <task>/<phase>/<attempt>` (e.g. `event: 1136/spec-revision/1`). This is required because measured refs carry `task:` inline after a pipe and carry **no** `phase:` at all — the `7422cdb` `^phase:` rule matched nothing, and its `<track>/-` fallback would have merged a track's unrelated events.
 
-Grouping in `src/tracker/report-sweep.ts`; cursor gains an `events` map beside `seen`, pruned on the same window. No new store, no change to what is copied.
+- **No `event:` line ⇒ no grouping.** The ref is notified individually, exactly as today. Absence of identity never produces a guess; legacy and third-party refs are unaffected. Ambiguity fails toward *more* notices, never fewer.
+- **Same poll**, N refs sharing an `event:` ⇒ **one** `EVENT <id> — REPORT <ref-a> + HOLD <ref-b>` line. That is the measured F3 pair, whose refs are 1–22 s apart.
+- **Later poll**, a further ref on a known id ⇒ one `AMENDED <id> — <ref-id> (<kind>)` line. **The guarantee is "at most one line per (event, poll)", not "one line per event ever":** a sweep cannot retract a line it already printed, and suppressing the later one would discard evidence. A HOLD and REPORT straddling a poll boundary therefore yield 2 lines, and that is correct behaviour, not a defect.
+- **Duplicate vs correction** is decided on the copied bytes, not on kind: same `event:` + identical body sha ⇒ `DUP` (a redelivery); same `event:` + different body ⇒ `AMENDED`. Neither ever suppresses a file — **every ref is still copied verbatim to the inbox unconditionally**, and re-emit-never-loss (report-sweep §3) is untouched.
+- State: an `events` map in `state/dispatch/report-cursor.json` beside `seen`, pruned on the same overlap window. A cursor loss is a cold start: identities are re-learned and lines re-emit — never lose, may repeat.
+- **Consumer, honestly.** `report-sweep` writes to **stdout and nothing else** — measured: it has no production caller. This phase guarantees the *shape of that output*, not that an orchestrator turn ever sees it. Making a sweep result reach the turn is #1128's delivery repair and is **explicitly out of scope**; this spec proposes no daemon, injector or delivery change.
 
-- **Event key** `<task>/<phase>` (`<track>/<phase>` when no task; `-` for a missing phase). Parsed from the same head-400 window the sweep already reads: `#(\d+)` after `task:` and `^phase:\s*(\S+)`. **`kind` is recorded, never part of the key** — a HOLD and a REPORT for the same phase are one event, which is exactly the measured F3 pair. Identity is never text equality.
-- **First sight of a key** ⇒ one line naming every ref in the group with its kind: `EVENT ah1132/#1132/build — REPORT <ref-a> + HOLD <ref-b>`.
-- **A later ref on a known key** ⇒ `AMENDED <key> — <ref-id> (<kind>)`, one line. Never silent, never merged into the old line: corrections and changed evidence always surface.
-- **Every ref is still copied verbatim to the inbox, unconditionally.** Grouping changes the notification only. At-least-once delivery stays permitted; re-emit-never-loss (report-sweep §3) is unchanged.
-- Template policy (`docs/templates/dispatch-ref-template.md`): final phase sends **one** REPORT carrying `needs:`; HOLD stays intermediate-only; both lines must carry `task: #N` and `phase: <name>` so the key is computable. Instruction-only (§8) — the grouping above is what holds when a worker sends both anyway.
+## 5. C3 — reap on a reviewed settlement, not an inferred one
 
-## 5. C3 — reap before the successor spawns
+The `7422cdb` predicate was circular: `src/cleanup/cli.ts:474` is itself what writes `cleaned`, and every other `RETIRED_LIFECYCLES` value is a failure or supersession — the registry's own comment says none of them says anything about the task. **No lifecycle value means "this worker finished."** Settlement is therefore an orchestrator decision that is **recorded, then verified**; cleanup actuates it and never infers it.
 
-New selector `bin/session-cleanup.sh --reap-settled [--task <id>] [--keep <sid>]`. All existing protections apply unchanged: protected `orchestrator` sid, self/ancestor SIGTERM refusal, `--keep`, worker-session refusal.
+Sidecar, keyed by an id `active.json` already carries, so its schema stays frozen for #1133 F4 — this is the alternative that keeps identity safe without a schema bump: `state/dispatch/settlements/<dispatch_id>.json`
 
-A sid is **settled** only if both hold:
+```json
+{"dispatch_id":"2818c54c…","sid":"wf1136-architect","task":"1136","phase":"spec","event":"1136/spec/1",
+ "artifact":{"inbox":"state/dispatch/inbox/<file>.md","sha256":"…","ref_mtime_ms":1788872351298},
+ "continuation":"none","reviewed_by":"orchestrator","reviewed_at":"…Z"}
+```
 
-- **R (retention)** ≥1 inbox file resolves to this sid's track and the newest is `kind=REPORT` — the report of record is on disk before the session dies.
-- **Q (quiescence)** the sid's `active.json` `lifecycle.state` is terminal. The implementer must enumerate the actual value set from `bin/dispatch-registry.py op_set_lifecycle` — **do not guess it**.
+`bin/session-cleanup.sh --reap-reviewed [--task <id>] [--keep <sid>]` re-verifies **immediately before any side effect**:
 
-Not settled ⇒ **not killed**, one line saying which of R/Q failed, **exit 0** — so the command is safe to run unconditionally before every spawn, which is the whole ordering fix. Non-zero only on real error. An unrelated active worker can never be selected: it fails R or Q.
+- **V1 identity** `dispatch_id` is still the sid's current non-superseded record and its `assigned.sid` equals `sid` — a reused sid or a re-dispatch invalidates the settlement instead of inheriting it. Track substrings are not identity and are not used.
+- **V2 artifact** the named inbox file exists and its sha256 matches — a stale or replaced report fails.
+- **V3 continuation exclusion** no ref newer than `ref_mtime_ms` resolves to this sid, and `continuation` is `"none"`. A next-phase HOLD arriving after review therefore blocks the reap. Ambiguous resolution counts as failure.
+- **V4 protections, unchanged** protected `orchestrator` sid (`cli.ts:45`), self/ancestor SIGTERM refusal (`:344`), `--keep`, worker-session refusal (`:642`).
+- **Fail closed:** missing, stale or ambiguous ⇒ **exit 6, no kill, reason named**. Silence would hide a rejected reviewed decision. A sid with **no** settlement file is simply not a candidate — exit 0, nothing done — so a drain pass stays safe to run unconditionally.
+- **Partial cleanup and races:** the three removal steps are already idempotent; a re-run re-verifies from scratch, and a settlement consumed by a completed reap is stamped `consumed_at` under the same lock, so a second pass is a no-op rather than a second kill.
+- The three existing callers (`src/cleanup-scheduler/cli.ts:89`, `src/reconciler/cli.ts:77`, `src/session/open-session/cli.ts:384`) pass a bare `<sid>` and are **untouched** (Rule 29).
 
-**R+Q prove the assignment ended and the evidence was retained. They do not prove the task is finished** — 80/80 records carry no outcome, so nothing here may infer completion. Accordingly, on a successful reap: `tq-write.py owner-remove <task> <sid>`; when `owners` empties and status is `delegated` ⇒ **`in_progress`**. **Never `done`.** Rows with no recorded `owners` (all rows today) are left untouched with an `UNOWNED` line. Owners are recorded by `tq-write.py owner-add` at dispatch time — in the ledger, **not** in `active.json`, whose schema #1133 F4 freezes.
+**Settlement ≠ completion.** V1–V3 establish that this *assignment* ended and its evidence is retained. On a verified reap: `tq-write.py owner-remove <task> <sid>`; when `owners` empties and status is `delegated` ⇒ **`in_progress`**, **never `done`**. Rows with no recorded `owners` are left untouched with an `UNOWNED` line. `owners` are written by the same `dispatch-stamp` call as W1 (§1) — in the ledger, not in `active.json`. Historical `delegated` counts are snapshots, and an absent dispatch record (#20, #28) means the history is missing, **not** that the task was never dispatched.
 
-> On the ledger snapshot: "no retained dispatch record" (#20, #28) means the history is absent, **not** that
-> the task was never dispatched. Historical `delegated` counts are snapshots, not a target to drive to zero.
+**Ordering, at its real strength.** Enforced: `--spawn-and-dispatch` drains verified settlements before it spawns and records `reap_before_spawn=ok|failed|none` in the existing no-task telemetry sink, so A3 is measurable. A drain failure **warns and proceeds** — the measured harm of a late reap is a routing demotion, not corruption, and refusing a dispatch over it is disproportionate. Instruction-only, named as such: *recording* the settlement is the orchestrator's reviewed act, and nothing can compel it. This drain also lives in `src/dispatch/cli.ts`, i.e. inside P7 (§1, §10).
 
 ## 6. C4 — `bin/tq-write.py`
 
-Python 3 stdlib only (Art. 17; python3 is already a hard dep of `bin/`). Subcommands: `note-append <id> --text S [--key K]` · `status <id> <value> --if-current <value>` · `owner-add|owner-remove <id> <sid>` · `approve|revoke|approvals` (§3).
+Python 3 stdlib only (Art. 17; python3 is already a hard dep of `bin/`). Subcommands: `note-append` · `status` · `owner-add|owner-remove` · `grant|revoke|approvals` (§3) · `dispatch-stamp` (§1) · `focus`.
 
-- **Lock** `fcntl.flock` on `<queue>.lock`, copying `bin/dispatch-registry.py:168`. **Atomic** same-directory temp + `fsync` + `os.replace`, copying `:255`. A concurrent writer waits; no update is lost.
-- **Format** `json.dump(indent=2, ensure_ascii=False)` + trailing `\n`. Pinned by an acceptance case, not by assumption (the tree contains one pre-escaped `\u` sequence — the load→dump round-trip test finds it).
-- **Never rewrites old note text.** The prior note is read from disk; the caller supplies only the new segment. Appends as ` || <segment>`, matching today's separator.
-- **Idempotent append** `--key K` prefixes the segment `[K]` and no-ops (exit 0) if `[K]` is already present in the note. No schema change, and the key stays human-visible.
-- **Refusals** unknown task id ⇒ exit 3; malformed queue JSON ⇒ exit 4, **no write**; `status` without a matching `--if-current` ⇒ exit 5, no write.
-- **Ship set**: adding this file **requires** the matching `bin/init/manifest.mjs` entry or T96 assertion 4 fails and the release is blocked. Non-optional.
+- **Operation identity is structured, not textual.** `--op-id <k>` is recorded in a dedicated `note_op_ids` array on the row; idempotence is exact membership in that array. Note prose is never scanned, so a `[K]` occurring inside old text can never be mistaken for an executed append.
+- **Same id, different payload ⇒ exit 6, nothing written.** That is a caller bug, not a retry; a genuine second append needs its own id.
+- **A no-op writes nothing at all** — the file is not reopened, re-serialised or re-timestamped, and exit is 0. Semantic preservation is asserted separately from byte-identical serialisation: `note-append` reads the prior note from disk and concatenates ` || <segment>`, so the caller's argv carries only the new segment and prior text is never re-emitted through model output.
+- **Refusals** unknown task id ⇒ 3; malformed queue JSON ⇒ 4, no write; `status` without a matching `--if-current` ⇒ 5, no write.
+- **Serialisation** `json.dump(indent=2, ensure_ascii=False)` + trailing `\n`, identical to W1's serializer. Pinned by a round-trip case run against a **copy** of the real queue in a temp dir — no test mutates the live file.
+- **Ship set** adding this file **requires** its `bin/init/manifest.mjs` entry, or T96 assertion 4 fails and both `ci.yml` and `release.yml` go red. Non-optional.
 
 ## 7. C5 — npm, install and README truth
 
-**Unverified here:** the registry contents. This spec asserts nothing about what is published; the builder phase runs `npm view @dmsdc-ai/aigentry-orchestrator versions --json` and reports the actual answer.
+**CI correction (this spec's own earlier error).** `tests/packaging/T96`, `T97` and `smoke-init.sh` run in **`.github/workflows/ci.yml:80,83,85` on every push/PR (ubuntu + macos) and again in `release.yml`**. They are not part of the local default `npm test` (`tsc -p . && scripts/run-tests.mjs`, which collects `dist/tests/**/*.test.js`). The `7422cdb` claim "only `release.yml`" is withdrawn.
 
-Measured conflict: `README.tmpl.md:5,19` and `ecosystem.json` (`package:"aigentry-orchestrator"` — missing the `@dmsdc-ai/` scope, `version:"—"`, `published:false`) say unpublished, while `release.yml` publishes on a `v*` tag and `.github/workflows/readme-regen.yml`'s own header states the package IS published.
+**Unverified here:** registry contents. This spec asserts nothing about what is published; the builder phase runs `npm view @dmsdc-ai/aigentry-orchestrator versions --json` and reports the measured answer.
 
-- **N1** Fix `README.tmpl.md` + `ecosystem.json`; **never** `README.md`, which is generated. Wire `node scripts/gen-readme.mjs --check` into the test path so drift fails loudly.
-- **N2** Every install/upgrade/uninstall claim names the exact command and the test that exercises it. An untested claim is deleted, not softened. `bin/init/cli.mjs` has `init [--workspace|--yes|--dry-run|--force|--upgrade]` and `--version` — **there is no `uninstall` verb**, so no README may imply one.
-- **N3** Release gates. Existing and kept: T96 ship-set agreement, `smoke-init.sh` (real tarball, throwaway npm prefix + throwaway `HOME`, so a repo-relative or author-home assumption fails there), the registry shasum read-back and the clean `npx --version` check in `release.yml`. **Added to `smoke-init.sh`**: (a) upgrade preservation — seed a workspace, write a sentinel under `state/`, run `init --upgrade`, sentinel intact (`cli.mjs:295-297` claims this; assert it); (b) uninstall preservation — `npm uninstall -g` from the throwaway prefix leaves the workspace and its `state/` intact.
-- **N4** `tests/packaging/*.sh` run **only** in `release.yml`, never in `npm test`. Say so; do not let anyone expect a local `npm test` to catch (a) or (b).
-- **N5** Publication is the builder's, after tests, under the standing authorization — no repeat generic permission prompt, and **no automated restart of the live orchestrator**. A missing credential is a factual HOLD naming the secret by name only; its value is never printed (`release.yml` already tests emptiness only).
+Measured conflict: `README.tmpl.md:5,19` and `ecosystem.json` (`package:"aigentry-orchestrator"` — missing the `@dmsdc-ai/` scope — `version:"—"`, `published:false`) say unpublished, while `release.yml` publishes on a `v*` tag and `readme-regen.yml`'s own header states the package IS published.
+
+- **N1** Edit `README.tmpl.md` + `ecosystem.json`. `README.md` is **regenerated** by `node scripts/gen-readme.mjs`, never hand-edited — and the regenerated `README.md` is a committed, **owned** change in the same PR (§10 P5), not a side effect left to the bot.
+- **N2** Every install/upgrade/uninstall claim names the exact command and the test exercising it; an untested claim is deleted, not softened. `bin/init/cli.mjs` offers `init [--workspace|--yes|--dry-run|--force|--upgrade]` and `--version` — **no `uninstall` verb** — so no README may imply one.
+- **N3** Added to `smoke-init.sh` (already hermetic: real tarball, throwaway npm prefix, throwaway `HOME`, so a repo-relative or author-home assumption fails there): (a) the installed CLI **executes real work**, not only `--version` — `init --dry-run` then a real `init` into the throwaway workspace, asserting the created tree and a shipped helper resolving from the installed location; (b) upgrade preservation — sentinel under `state/`, `init --upgrade`, sentinel intact (`cli.mjs:295-297` claims it; assert it); (c) uninstall preservation — `npm uninstall -g` leaves the workspace and `state/` intact.
+- **N4** Wire `node scripts/gen-readme.mjs --check` into `ci.yml`'s test job (owner P5), so template/ecosystem drift fails a PR instead of being silently regenerated on main.
+- **N5** Publication is the builder's, after tests, under the standing authorization — no repeat generic permission prompt and **no automated restart of the live orchestrator**. A missing credential is a factual HOLD naming the secret by name only; its value is never printed (`release.yml` tests emptiness only).
 
 ## 8. Enforceable vs instruction-only
 
-A runtime cannot make an LLM emit a tool call. The split is stated so nobody claims otherwise:
+A runtime cannot make an LLM emit a tool call, and this spec claims no such power.
 
-| Enforceable (a tool refuses, or the data cannot express the bad state) | Instruction-only (guidance; measured by A1/A2/A3) |
+| Enforceable — a tool refuses, or the data cannot express the bad state | Instruction-only — guidance, measured after the fact |
 |---|---|
-| grant requires `--scope`+`--quote`; scope never widened in place; revoked never reactivates | act in the turn that received approval |
-| `--reap-settled` cannot kill a non-settled or protected session | run `--reap-settled` before the successor spawn |
-| reap never sets `done`; `owners`-empty only reaches `in_progress` | do not re-ask inside an active recorded scope |
-| locked atomic ledger writes; `--key` idempotence; malformed input writes nothing | final phase sends one REPORT with `needs:` |
-| sweep emits one line per event key and copies every ref regardless | — |
+| one locked transaction path for every *program* queue writer (W1, W2, helper) | the orchestrator uses the helper instead of hand-editing the queue (W3) |
+| `grant` requires scope+phases+quote; history immutable; status derived, never patched | act in the turn that received approval (A1/A2) |
+| `--reap-reviewed` fails closed on missing/stale/ambiguous settlement; protections unchanged | recording a settlement is the orchestrator's reviewed judgement |
+| reap never writes `done`; `owners`-empty reaches `in_progress` only | final phase sends one REPORT with `needs:` and an `event:` line |
+| `--op-id` membership idempotence; same-id-different-payload refused; no-op writes nothing | — |
+| sweep prints ≤1 line per (event, poll) and copies every ref regardless | — |
 
 ## 9. Acceptance cases
 
-Each reproduces the recorded case **before** the fix, from fixtures — no live daemon, no live ledger.
+Each reproduces the recorded case **before** the fix, from fixtures or a **copy** of the real queue. No live daemon, no live queue mutation, no live session.
 
-| # | Case | Before | After |
-|---|---|---|---|
-| K1 | the four measured HOLD/REPORT pairs as fixture refs (ah1132 21:25:32+21:25:46, in1128 21:32:31+21:32:45, ah1132 21:35:36+21:35:37, mr1133 21:46:22+21:46:44) | 8 `NEW` lines | 4 `EVENT` lines, 8 inbox files |
-| K2 | a 5th ref on an already-notified key; and a ref with no `task:`/`phase:` | — | 1 `AMENDED` line, file copied, first line untouched; missing fields fall back to `<track>/-`, never dropped |
-| K3 | reap a sid whose newest inbox ref is a HOLD (R fails) / whose lifecycle is non-terminal (Q fails) | — | no kill, reason printed, exit 0 |
-| K4 | `--reap-settled` with the protected `orchestrator` sid live, and with an unrelated active worker live | — | neither selected |
-| K5 | reap the last owner of a `delegated` task | — | `in_progress`; a second run is a no-op; `done` never written |
-| K6 | reap when `owners` absent (every row today) | — | status untouched, `UNOWNED` line |
-| K7 | append 40 B to #1132's 3,465 B note | caller supplies the whole prior note | caller supplies only the segment; note grows by exactly the segment |
-| K8 | same `--key` twice; two concurrent `note-append` on one row; two on different rows | — | one segment; both segments; both rows — no lost update |
-| K9 | load→dump the real queue with no edit | — | byte-identical (pins indent-2 / newline / non-ASCII) |
-| K10 | malformed queue JSON; unknown task id; `status` with a stale `--if-current` | — | exit 4/3/5, **file unchanged** |
-| K11 | `approve` without `--quote`; `approve` twice with different scopes; `revoke` then read | — | exit 2 nothing written; second supersedes, first not widened; revoked never active |
-| K12 | reload: read `approvals` from a fresh process | — | scope, phases and provenance intact |
-| K13 | `gen-readme.mjs --check` against a tree whose `ecosystem.json` changed | — | non-zero |
-| K14 | `init --upgrade` over a seeded workspace; `npm uninstall -g` after it | — | `state/` sentinel intact in both |
+| # | Case | Expected |
+|---|---|---|
+| K1 | W1's ledger write and `note-append` run **concurrently** on the same row; and on different rows | both segments present, both rows updated, no lost update, file parses |
+| K2 | the `tq-focus` path write concurrent with `note-append` | both survive; no cross-filesystem `mv` remains |
+| K3 | the four measured HOLD/REPORT pairs, all refs in **one** poll | 4 `EVENT` lines, 8 inbox files |
+| K4 | the same pair split across **two** polls | `EVENT` then `AMENDED` — 2 lines, asserted as correct |
+| K5 | identical body redelivered on a known event; different body on a known event | `DUP`; `AMENDED` — neither drops a file |
+| K6 | ref with no `event:` line (every ref on disk today) | notified individually, never grouped, never merged with another track |
+| K7 | cursor deleted, sweep re-run | cold start re-emits; no ref lost |
+| K8 | settlement whose `dispatch_id` was superseded, or whose sid was reused | exit 6, no kill (V1) |
+| K9 | settlement whose artifact sha no longer matches, or whose file is gone | exit 6, no kill (V2) |
+| K10 | a newer ref for the sid arrives after review (next-phase HOLD); `continuation:"next-phase"` | exit 6, no kill (V3) |
+| K11 | protected `orchestrator` sid; a sid in the cleanup's own ancestry; an unrelated live worker with no settlement | none selected, no SIGTERM (V4) |
+| K12 | reap interrupted after the kill then re-run; and two reaps racing one settlement | idempotent; the second is a no-op, not a second kill |
+| K13 | verified reap of the last owner of a `delegated` task; and of a row with no `owners` | `in_progress`, `done` never written; `UNOWNED`, status untouched |
+| K14 | same `--op-id` twice; same id with a different payload; an `[K]`-looking string inside old prose | no-op exit 0 and **no write**; exit 6; not treated as executed |
+| K15 | malformed queue JSON; unknown task id; stale `--if-current` | exit 4/3/5, file unchanged |
+| K16 | load→dump a **copy** of the real queue with no edit | byte-identical (pins indent-2 / newline / non-ASCII) |
+| K17 | `grant` without `--quote`; two independent grants; `grant --supersedes`; `revoke`; re-read in a fresh process | exit 2 nothing written; both active; only the named one displaced; derived status correct after reload |
+| K18 | `gen-readme.mjs --check` against a tree whose `ecosystem.json` changed | non-zero |
+| K19 | installed-from-tarball CLI runs `init --dry-run` and a real `init`; then `--upgrade`; then `npm uninstall -g` | workspace created from the installed location; `state/` sentinel intact after both |
 
-## 10. File split, ownership, edges
+## 10. File split, ownership, dependency edges
 
-| ID | File | Change | Role | Depends on |
+| ID | Files | Change | Owner | Depends on |
 |---|---|---|---|---|
-| P1 | `bin/tq-write.py` **(new)** + `bin/init/manifest.mjs` (one entry) | §6 §3 | coder-A | — |
-| P2 | `src/tracker/report-sweep.ts`, `src/tracker/usage.ts` | §4 grouping + `events` in the cursor | coder-B | — |
-| P3 | `src/cleanup/cli.ts`, `src/cleanup/usage.ts` | `--reap-settled` (§5); calls P1 as a subprocess | coder-C | P1 |
-| P4 | `docs/templates/dispatch-ref-template.md`, `docs/templates/dispatch-ref-checklist.md` | §4 policy lines | coder-B | — |
-| P5 | `README.tmpl.md`, `ecosystem.json`, `tests/packaging/smoke-init.sh` | §7 N1–N4 | coder-D | — |
-| P6 | new tests under `tests/dispatch/` + `tests/packaging/` | K1–K14 | tester | P1–P5 |
+| P1 | `bin/tq-write.py` **(new)**, `bin/init/manifest.mjs` | §6 §3 §1 helper + ship-set entry | coder-A | — |
+| P2 | `src/tracker/report-sweep.ts`, `src/tracker/usage.ts` | §4 `event:` parse, grouping, `events` in the cursor | coder-B | — |
+| P3 | `src/cleanup/cli.ts`, `src/cleanup/usage.ts` | §5 `--reap-reviewed`, V1–V4, settlement sidecar | coder-C | P1 |
+| P4 | `docs/templates/dispatch-ref-template.md`, `docs/templates/dispatch-ref-checklist.md` | §4 `event:` line + one-final-REPORT rule | coder-B | — |
+| P5 | `README.tmpl.md`, `ecosystem.json`, **`README.md` (regenerated)**, `tests/packaging/smoke-init.sh`, `.github/workflows/ci.yml` | §7 N1–N4 | coder-D | — |
+| P6 | `bin/tq-focus.sh`, `bin/tq-status.sh` | route W2 through P1; surface derived approvals | coder-A | P1 |
+| P7 | `src/dispatch/cli.ts` | §1 `taskLedgerUpdate()` → `dispatch-stamp`; §5 settlement drain before spawn | coder-B | P1, **#1133 F3** |
+| P8 | new tests under `tests/dispatch/` + `tests/packaging/` | K1–K19 | tester | P1–P7 |
 
-**Parallel-safe:** P1 ∥ P2 ∥ P4 ∥ P5 (disjoint files). **Serialized:** P3 after P1 (subprocess contract); P6 after all. **No file here is touched by #1133** (§0). P2 and P3 are TypeScript: `tsc -p .` must run before any guard, and `npm test` refuses a stale `dist/` (`scripts/run-tests.mjs:37-47`).
+**Edges** `P1 → {P3, P6, P7}`; `#1133 F3 → P7` (same file — **serialized, never parallel**); `{P1…P7} → P8`. **Parallel-safe** P1 ∥ P2 ∥ P4 ∥ P5. P2, P3 and P7 are TypeScript: `tsc -p .` must run before any guard, and `npm test` refuses a stale `dist/` (`scripts/run-tests.mjs:37-47`). No file is edited by two owners, and no file is touched outside this table.
 
-**Runner inclusion — verified, not assumed.** `npm test` auto-collects `dist/tests/**/*.test.js`, so a new `.test.ts` needs no registration. A new **shell** guard under `tests/dispatch/` is globbed by `T*.sh` but `tests/dispatch/run-all.sh:52` pins `EXPECTED_GUARDS=135` — **the count must be bumped in the same commit or the suite fails**. `tests/packaging/*.sh` are invoked only by `release.yml`. Highest existing id is **T150**; **the orchestrator reserves the new ids — this session does not.**
+**Runner inclusion, verified.** `npm test` auto-collects `dist/tests/**/*.test.js` — a new `.test.ts` needs no registration. A new **shell** guard under `tests/dispatch/` is globbed by `T*.sh` but `tests/dispatch/run-all.sh:52` pins `EXPECTED_GUARDS=135`, which **must be bumped in the same commit**. `tests/packaging/*.sh` run in `ci.yml` and `release.yml`, not in local `npm test`. **Discovered id set:** the highest existing guard is `T150`, so `T151+` appears free — **reported as a discovery for the orchestrator to reserve; this session reserves nothing** (#1133 draws from the same range).
 
 ## 11. Rollout, rollback, unknowns
 
-Stage 1 P1 (additive; nothing reads the new fields yet) → 2 P2+P4 (notification only) → 3 P3 (reaping) → 4 P5 (release truth) → 5 publication by the builder after tests. Each stage lands behind K-cases and is independently revertable: P1/P2/P4/P5 are additive, and P3 is one selector — reverting it restores today's manual order. No migration: `approvals`/`owners` are absent everywhere until first written.
+Stage 1 P1 (additive; nothing reads the new fields) → 2 P6 (writers converge on the transaction path) → 3 P2+P4 (notification) → 4 P3 (reaping) → 5 P7 **after #1133 F3** → 6 P5 (release truth) → 7 tests, build, pack and publication as **delegated phases after this spec is reviewed**. Each stage lands behind its K-cases and is independently revertable; P7 reverts to today's inline `taskLedgerUpdate()`. No migration: `approvals`, `owners`, `note_op_ids` and the settlements directory are absent until first written.
 
-**Unmeasured, and to be measured by the implementer, not guessed:** the terminal `lifecycle.state` set (§5 Q); the registry contents (§7); whether every historical ref carries a parseable `task:`/`phase:` (§4 falls back to `-` when not). **Not claimed anywhere in this document:** token or cost figures, worker idle-vs-busy ratios, LOC, and timing targets — the corrected report withdrew those inferences and this spec does not reintroduce them. **Open for the orchestrator:** the reserved test-id block (§10), and whether `owner-add` is added to the orchestrator's dispatch routine now or when P3 lands.
+**Unknowns, to be measured by the implementer rather than assumed:** whether any non-orchestrator producer emits refs that would need an `event:` line; how the settlement sidecar interacts with registry `prune` (`bin/dispatch-registry.py:659`) once dispatch records age out; registry contents (§7). **Not claimed anywhere:** token or cost figures, idle-vs-busy ratios, LOC, timing targets, or any cap-demotion target — capacity limits remain legitimate and this spec changes no counting. **Future coders:** run `snyk_code_scan` (or `bin/snyk-scan.sh`) on changed first-party code, then fix and rescan before DONE; this doc-only phase is N/A. **Open for the orchestrator:** reserving the test-id block, and whether `owner-add` enters the dispatch routine at P1 or waits for P7.
