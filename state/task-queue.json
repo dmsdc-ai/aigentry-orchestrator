@@ -12905,7 +12905,7 @@
       "priority": "P1",
       "updated_at": "2026-09-07",
       "desc": "[telepty] read-screen returns (empty screen) for grok permanently once the output ring holds only post-APC bytes: grok emits kitty-graphics APC frames (ESC _ Ga=d,d=i,i=1,q=2 ESC \\\\ — 1215 in 40 s, none while idle) and no newlines; src/screen-ansi.js strips DCS/PM/APC with a GREEDY /\\x1b[P^_][^]*\\\\/g that wipes from the first APC to the LAST ESC \\\\ in the 200 KB ring (measured: window from byte 0 → 11750 chars; from byte 100000 → 2 chars → trim → empty). One-line fix: lazy quantifier + require the ESC-terminated form. Not structural (memory: telepty structural changes need user OK) — regex-level; still confirm with the user before dispatching into the telepty repo.",
-      "note": "Measured by mr1091 (#1091 HOLD, 2026-09-06). grok delivery itself WORKS (bracketed paste or plain + CR, all three screen modes) — only observation is broken. || Verbatim repro + one-line fix proposal in mr1091 REPORT §2 (~/.telepty/shared/622f4829….md). Awaiting user OK to dispatch into aigentry-telepty (regex-level, not structural). | dispatched 2026-09-07T23:00:15Z sid=tp1099-tp1099-screen-apc ref=2026-09-08-tp1099-screen-apc.md track=tp1099 cli=claude/claude-opus-5[1m] by=explicit"
+      "note": "Measured by mr1091 (#1091 HOLD, 2026-09-06). grok delivery itself WORKS (bracketed paste or plain + CR, all three screen modes) — only observation is broken. || Verbatim repro + one-line fix proposal in mr1091 REPORT §2 (~/.telepty/shared/622f4829….md). Awaiting user OK to dispatch into aigentry-telepty (regex-level, not structural). | dispatched 2026-09-07T23:00:15Z sid=tp1099-tp1099-screen-apc ref=2026-09-08-tp1099-screen-apc.md track=tp1099 cli=claude/claude-opus-5[1m] by=explicit || HOLD 2026-09-08 08:05 (tp1099, shared/aa546177…; read 18:5x after the inject loss #1128): DISPATCH ROOT CAUSE FALSIFIED — src/screen-ansi.js:27 stores literal ESC bytes; od -c shows the APC arm is /\\x1b[P^_][^\\x1b]*\\x1b\\\\/ (negated ESC, bounded), NOT [^]*; the prescribed repro passes unmodified (240 KB survives). The arm that eats the whole ring is the OSC-BEL arm :20 /\\x1b\\][^\\x07]*\\x07/ (payload excludes only BEL → spans ESC/newlines to any later BEL): measured 198 KB → '' and a ring-truncated OSC → 'tail'. Whether grok emits ESC ] + distant BEL is unproven (mr1091's capture not on disk). Plan §5 approved (B): both arms → [^\\x1b\\x07]* + required terminator, ring-boundary = terminator required (2-byte opener leaks as text, bounded), 5 rows, timing. Grok symptom → #1129 with a stored capture."
     },
     {
       "id": 1100,
@@ -13167,6 +13167,15 @@
       "updated_at": "2026-09-08",
       "desc": "[orchestrator inbound] Four worker HOLD injects (tp1099 08:05, tp1125 08:03, tp1127 08:02, ah1117 08:04 KST 2026-09-08, all via `telepty inject --ref`) never reached the orchestrator session; the workers waited ~11 h until the user noticed ('워커들 다 멈춰있는데'). tp1124's HOLD/REPORT at 18:43/18:50 DID arrive. The shared refs were on disk the whole time. (1) Root-cause the loss (daemon self-restart to 0.8.2 at 13:31Z on 09-07 + the orchestrator bridge running pre-#1122 code? inject audit log / mailbox for those four inject ids; #1079 class). (2) Permanent guard in the orchestrator: on EVERY idle turn and before every 'waiting for HOLD' statement, sweep ~/.telepty/shared for refs newer than the last handled one (the memory rule feedback_report_loss_sweep_shared_refs exists and was not applied) — make bin/dispatch-tracker.sh report-sweep run in the reconcile tick and inject a digest to the orchestrator when NEW refs appear (#904's durable pull side).",
       "note": "Workaround applied 2026-09-08 18:5x: HOLDs read from ~/.telepty/shared directly; GO sent. The user had typed answers into the worker prompt boxes (spaces dropped) — submitted with send-key enter, then the orchestrator's GO injects."
+    },
+    {
+      "id": 1129,
+      "status": "pending",
+      "track": "telepty",
+      "priority": "P2",
+      "updated_at": "2026-09-08",
+      "desc": "[telepty] Re-open the grok read-screen symptom with EVIDENCE: spawn one grok worker, run one turn, dump the raw outputRing (raw=1) to a file under state/dispatch/inbox/ (mr1091's 133 KB capture was never stored), then decide: (a) an OSC-BEL span (fixed by #1099) — verify read-screen is readable on the stored ring with the #1099 strip; (b) genuine ring saturation by content-free frames (1215 APC deletes/turn, no newlines) → a structural answer (screen emulation, or not ringing content-free frames) → HOLD per policy. Rule 35: no fix without the stored reproduction.",
+      "note": "From tp1099's HOLD (#1099 root cause falsified). The orchestrator reaps the grok probe."
     }
   ],
   "completed": [
