@@ -13188,12 +13188,12 @@
     },
     {
       "id": 1131,
-      "status": "delegated",
+      "status": "done",
       "track": "orchestrator",
       "priority": "P1",
       "updated_at": "2026-09-08",
       "desc": "[orchestrator-boot] The user will restart the orchestrator on codex gpt-6-astra, but bin/orchestrator-boot.sh execs a hardcoded `telepty allow --id orchestrator --auto-restart claude --dangerously-skip-permissions --continue` (src/orchestrator-boot/cli.ts:633-634). Add ORCHESTRATOR_CLI=claude|codex (default claude, unchanged argv) mapping codex to its measured equivalents (bypass approvals/sandbox flag + resume-last flag — measure `codex --help`, do not guess; if codex has no exact `--continue` equivalent, say so and pick the closest with a comment). Same singleton/reconcile/SIGKILL guards; the argv still crosses to the shim as text (control-char refusal stays). Tests: the existing orchestrator-boot test file gains rows for both CLIs + an unknown value → exit 2. `--dry-run` must show the codex argv. Also: codex reads AGENTS.md in the cwd — confirm the exec cwd is this repo (it is for claude) and document in usage.ts.",
-      "note": "Registered 2026-09-08 by the outgoing Fable orchestrator for the user's stated restart plan. Bare `telepty allow` for the orchestrator stays forbidden (#539). | dispatched 2026-09-08T10:58:33Z sid=mr1131-mr1131-boot-codex ref=2026-09-08-mr1131-boot-codex.md track=mr1131 cli=codex/gpt-6-astra by=llm"
+      "note": "Registered 2026-09-08 by the outgoing Fable orchestrator for the user's stated restart plan. Bare `telepty allow` for the orchestrator stays forbidden (#539). | dispatched 2026-09-08T10:58:33Z sid=mr1131-mr1131-boot-codex ref=2026-09-08-mr1131-boot-codex.md track=mr1131 cli=codex/gpt-6-astra by=llm || REPORT 2026-09-08 (mr1131 codex/Astra, shared/0ac5b48a…): 8120836 merged --no-ff to orchestrator main; orchestrator rebuilt dist and verified: default dry-run = today's claude argv; ORCHESTRATOR_CLI=codex → 'telepty allow --id orchestrator --auto-restart codex resume --last --dangerously-bypass-approvals-and-sandbox' (both flag orders parse; first pinned); bogus → exit 2; npm test 326/326; shell guard T134 A-G → A-I (T40/T131/T132 pass). Snyk 15 LOW = exact tuple match with baseline. cwd documented (exec inherits caller cwd; run from the repo root; codex reads AGENTS.md). UNMEASURED: a real codex boot, fresh-install (no prior session → resume --last behaviour), runtime role loading — the user's restart is the test. Session reaped."
     }
   ],
   "completed": [
