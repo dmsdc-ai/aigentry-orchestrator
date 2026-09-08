@@ -40,7 +40,16 @@ Usage:
 Booting requires an EMPTY argv. Any argument at all — a flag, a typo, anything —
 takes a non-booting path, so inspecting this script cannot start a control tower.
 
+Run from this repo root: exec inherits cwd; Codex reads AGENTS.md here (CLAUDE.md is a stub).
+
 Env:
+  ORCHESTRATOR_CLI          claude (default, also when empty) or codex; unknown values
+                            are refused with exit 2 and usage (except --help).
+                            claude uses --dangerously-skip-permissions --continue.
+                            codex uses resume --last --dangerously-bypass-approvals-and-sandbox.
+                            This order is accepted by Codex's resume --help parser.
+                            resume --last continues the most recent session, without
+                            the picker, using cwd filtering; Codex has no --continue flag.
   ORCHESTRATOR_SID          orchestrator session id (default: orchestrator) — same
                             source as bin/dispatch-tracker.sh (Rule 16, no hardcode).
                             A control character in it is refused (exit 2) on every
