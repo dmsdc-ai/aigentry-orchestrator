@@ -13062,12 +13062,12 @@
     },
     {
       "id": 1117,
-      "status": "delegated",
+      "status": "done",
       "track": "animal-hospital",
       "priority": "P2",
-      "updated_at": "2026-09-07",
+      "updated_at": "2026-09-08",
       "desc": "[animal-hospital] #1076 phase 3 instrument: PhantomProbe's heartbeat (PhantomProbe.cs:236-251) decodes keys and logs gate + aim at 1 Hz but cannot say whether a press ACTED or where it stopped. Add per-press lines: (1) Interact.performed callback (not sampled), (2) the line OnInteract returned at (:412/:414/:419/:420/acted), (3) player world position + facing in the heartbeat (the only reason 'did she stand at the job board' was unanswerable), (4) held tool at press time. Keep the log volume bounded (her 10-min session = 1844 lines today).",
-      "note": "From ah1076 REPORT 2026-09-06 §7. Not urgent for the fix; urgent for the NEXT playtest's answerability. | dispatched 2026-09-07T23:01:04Z sid=ah1117-ah1117-phase3-instrument ref=2026-09-08-ah1117-phase3-instrument.md track=ah1117 cli=claude/claude-opus-5[1m] by=explicit"
+      "note": "From ah1076 REPORT 2026-09-06 §7. Not urgent for the fix; urgent for the NEXT playtest's answerability. | dispatched 2026-09-07T23:01:04Z sid=ah1117-ah1117-phase3-instrument ref=2026-09-08-ah1117-phase3-instrument.md track=ah1117 cli=claude/claude-opus-5[1m] by=explicit || REPORT 2026-09-08 (ah1117, shared/71417822…): 6ee7867 merged --no-ff to game main. Hook: RefusalKey called exactly ONCE, its answer feeds Refuse() and GameEvents.RaiseInteractPress(PressOutcome(...)) (pure, renames facts; test D4 pins the single call); player transform = FirstPersonController.transform (CharacterController + yaw at :248; pitch on cameraPivot); unmeasured pos prints NaN not (0,0,0). Press line: '[PX628] t= f= press tool= aim= hover= pos=(x,y,z) yaw= -> outcome=refused:<key>|hold:<mode>|acted:<Type>'; heartbeat +pos/yaw/tool at 1 Hz; raw events → per-second counters unless -phantomprobe-raw; volume on her 09-07 trace 3856 → ~1250 (-68%). Press1117Test 46 rows (kinds, negative controls, formatting, wiring anchors, vacuous-predicate controls). NOT built: build #6 comes before her next playtest (probe-sweep must stay 8/8). Session reaped."
     },
     {
       "id": 1118,
