@@ -4,9 +4,9 @@
 
 Findings addressed: F1 approval retention, F3 duplicate completion notice, F2+F5 reap order and assignment state, F6 ledger append. F4 (router ref header) is #1133's.
 
-## 0. What revision 2 withdraws
+## 0. What later revisions withdraw
 
-| Withdrawn from `7422cdb` | Measured reason | Now |
+| Withdrawn claim | Measured reason | Now |
 |---|---|---|
 | "ZERO shared files with #1133" | `src/dispatch/cli.ts:668-716` is a live queue writer; wiring the transaction path **needs that file**, which is #1133 F3's | §1, §10 |
 | lock only in the new helper ⇒ "no lost updates" | atomic rename is not lost-update prevention; two unlocked read-modify-write writers exist today | §1 |
@@ -17,6 +17,7 @@ Findings addressed: F1 approval retention, F3 duplicate completion notice, F2+F5
 | append-only approvals that flip an old record's status | self-contradictory | §3 |
 | `[K]` substring in note prose as the idempotence key | arbitrary prose can contain `[K]` | §6 |
 | "`tests/packaging/*.sh` run only in `release.yml`" | **false** — `.github/workflows/ci.yml:80,83,85` runs T96, T97 and `smoke-init.sh` on every push/PR, both OS legs | §7 |
+| r2: "`report-sweep` has no production caller" | **false** — `src/reconciler/cli.ts:1280-1288` runs it every tick and logs every line. The true, narrower claim is that no sweep result is **delivered into an orchestrator turn** | §2, §4 |
 
 ## 1. Queue writers and the shared transaction path
 
@@ -46,7 +47,7 @@ W1 and the proposed `note-append` write **the same field**. Locking only the new
 | `RETIRED_LIFECYCLES = {cleaned, cutover_retired, delivery_failed, not_delivered, superseded}`, with the file's own comment: "**None of them says anything about the TASK**" | `bin/dispatch-registry.py:50-54` |
 | lifecycle writers: registry `delivery_attempt_started` `:462`, `superseded` `:489`, `not_delivered` `:602`, `delivery_state_unknown` `:605`; tracker `re_dispatched`/`disconnected`/`stuck_error`/`stuck_welcome` `:549,773,809,817`; reconciler `:376,524`; hitl `:277`; **cleanup `cleaned` `:474`** | measured 2026-09-08 |
 | 80/80 dispatch records carry `outcome.state="unknown"`, `outcome_protocol="unavailable"` (`stage_b_deferred_to_0.9.0`); records key on `assigned.sid` + `dispatch_id`, never a task id | `state/dispatch/active.json` |
-| `report-sweep` has **no production caller** — invoked only by T107/T108/T109 and a logging snippet inside its own spec | `grep -rn report-sweep` |
+| `report-sweep` **has a production caller**: `src/reconciler/cli.ts:1280-1288` (step 0b) runs it every tick and tees **every stdout+stderr line** to `state/dispatch/reconciler.log` via `log()` (`:311`); gated by `AIGENTRY_REPORT_SWEEP` (default on), skipped under `DRY_RUN`. The loop is the launchd agent `com.aigentry.reconciler` (`--loop`, `KeepAlive`), `RECONCILER_LOOP_INTERVAL` default **60 s** (`:1195`) | measured 2026-09-08 |
 | measured ref heads: `REPORT: … \| task: #1136 \| …` (inline, no `# REPORT` heading); dispatch refs carry front-matter `task: 1136`; **no ref carries `phase:`** | `~/.telepty/shared`, 4 most recent |
 | `bin/**` is enumerated file-by-file in `bin/init/manifest.mjs`; T96 assertion 4 requires that count to equal `git ls-files bin` | `tests/packaging/T96_ship_set_agreement.sh:81-85` |
 | `README.md` is generated from `README.tmpl.md` + `ecosystem.json`; `gen-readme.mjs --check` exists and is wired to **no** test or CI job | `scripts/gen-readme.mjs`, `.github/workflows/readme-regen.yml` |
@@ -73,10 +74,10 @@ W1 and the proposed `note-append` write **the same field**. Locking only the new
 
 - **No `event:` line ⇒ no grouping.** The ref is notified individually, exactly as today. Absence of identity never produces a guess; legacy and third-party refs are unaffected. Ambiguity fails toward *more* notices, never fewer.
 - **Same poll**, N refs sharing an `event:` ⇒ **one** `EVENT <id> — REPORT <ref-a> + HOLD <ref-b>` line. That is the measured F3 pair, whose refs are 1–22 s apart.
-- **Later poll**, a further ref on a known id ⇒ one `AMENDED <id> — <ref-id> (<kind>)` line. **The guarantee is "at most one line per (event, poll)", not "one line per event ever":** a sweep cannot retract a line it already printed, and suppressing the later one would discard evidence. A HOLD and REPORT straddling a poll boundary therefore yield 2 lines, and that is correct behaviour, not a defect.
+- **Later poll**, a further ref on a known id ⇒ one `AMENDED <id> — <ref-id> (<kind>)` line. **The guarantee is "at most one line per (event, poll)", not "one line per event ever":** a sweep cannot retract a line it already printed, and suppressing the later one would discard evidence. A HOLD and REPORT straddling a tick therefore yield 2 lines, and that is correct behaviour, not a defect. Cadence makes this concrete rather than theoretical: the poll is ~60 s (§2) and the four measured F3 pairs are 1–22 s apart, so pairs usually fall inside one tick — but the contract is stated at the weaker guarantee, not at the common case.
 - **Duplicate vs correction** is decided on the copied bytes, not on kind: same `event:` + identical body sha ⇒ `DUP` (a redelivery); same `event:` + different body ⇒ `AMENDED`. Neither ever suppresses a file — **every ref is still copied verbatim to the inbox unconditionally**, and re-emit-never-loss (report-sweep §3) is untouched.
 - State: an `events` map in `state/dispatch/report-cursor.json` beside `seen`, pruned on the same overlap window. A cursor loss is a cold start: identities are re-learned and lines re-emit — never lose, may repeat.
-- **Consumer, honestly.** `report-sweep` writes to **stdout and nothing else** — measured: it has no production caller. This phase guarantees the *shape of that output*, not that an orchestrator turn ever sees it. Making a sweep result reach the turn is #1128's delivery repair and is **explicitly out of scope**; this spec proposes no daemon, injector or delivery change.
+- **Consumer, precisely.** The sweep's lines **do** reach a durable artifact: the reconciler runs it each tick and tees every line to `state/dispatch/reconciler.log` (§2). So grouping has a real, inspectable effect today. What is absent is a **delivered turn notification** — nothing injects a sweep result into the orchestrator's turn, which is why the log existed and the 09-08 refs still waited for a human. Those are two different claims and this phase makes only the first: the *shape and durability* of the output. Turn delivery is #1128's repair and is **explicitly out of scope**; this spec proposes no daemon, injector or delivery change.
 
 ## 5. C3 — reap on a reviewed settlement, not an inferred one
 
