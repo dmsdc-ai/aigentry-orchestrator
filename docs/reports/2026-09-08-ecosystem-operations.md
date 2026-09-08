@@ -38,16 +38,19 @@
 `/Users/duckyoungkim/projects/` 하위 **54개** 디렉터리를 직접 열거했다. aigentry 계열 **23개**.
 `ecosystem.json`은 표시용 매니페스트(6개 모듈)이므로 열거 근거로 쓰지 않았다.
 
-초판의 중첩 패키지 열거는 `-maxdepth 2`로 수행되어 **틀렸다**("3개"). depth 4 재열거 결과
-루트 외 중첩 매니페스트는 **9개**(빌드 산출물 `.next/` 3개 별도):
+초판의 중첩 패키지 열거는 `-maxdepth 2`로 수행되어 **틀렸다**("3개"). 술어를 명시해 재열거하면 — `find aigentry aigentry-* -maxdepth 4 -name package.json -not -path "*/node_modules/*"` → **총 24개 = 루트 13 + 중첩 8 + 빌드 산출물(`.next/`) 3**.
+루트 외 중첩 매니페스트는 **8개**다 (rev2 본문이 8줄을 나열해 놓고 머리말에 9라 적은 것은
+집계 오류이며 정정한다. 아래 목록이 정본):
 
 ```
-aigentry-aterm/npm/aterm/package.json            ← 초판이 "package.json 없음"이라 한 바로 그것
-aigentry-aterm/npm/aterm-darwin-arm64/package.json
-aigentry-amplify/packages/core, packages/channels
-aigentry-brain/packages/signaling-server
-aigentry-registry/bridge, frontend
-aigentry-ssot/pkg
+1  aigentry-aterm/npm/aterm/package.json               ← 초판이 "package.json 없음"이라 한 바로 그것
+2  aigentry-aterm/npm/aterm-darwin-arm64/package.json
+3  aigentry-amplify/packages/core/package.json
+4  aigentry-amplify/packages/channels/package.json
+5  aigentry-brain/packages/signaling-server/package.json
+6  aigentry-registry/bridge/package.json
+7  aigentry-registry/frontend/package.json
+8  aigentry-ssot/pkg/package.json
 ```
 Rust/Python: `aigentry-aterm/Cargo.toml` + 크레이트 3개, `aigentry-registry/pyproject.toml`.
 
@@ -58,7 +61,23 @@ Rust/Python: `aigentry-aterm/Cargo.toml` + 크레이트 3개, `aigentry-registry
 `dependencies: {@dmsdc-ai/aigentry-devkit: ">=0.0.19", @dmsdc-ai/aigentry-telepty: ">=0.1.88"}`.
 
 **`NOGIT` ≠ 소스 이용 불가.** 초판은 5개 디렉터리를 "소스 이용 불가"로 처분했는데 전부 읽을 수
-있는 파일을 갖고 있다 — architect 26개, design 14개, tester 59개, sandbox 75개, builder 4개.
+있는 파일을 갖고 있다. **파일 수는 술어에 따라 달라지므로 둘 다 적는다** — rev2가 쓴 술어는
+`find <dir> -type f`(숨김 파일 포함)였고, 리뷰가 제시한 값은 `.DS_Store` 제외 술어의 결과다.
+두 술어의 차이는 전부 `.DS_Store` 개수로 설명되며 **불일치가 아니다**:
+
+| 디렉터리 | `-type f` 전체 | `.DS_Store` 제외 | 숨김 파일 전체 제외 | `.DS_Store` 수 |
+|---|---|---|---|---|
+| aigentry-architect | 26 | 26 | 25 | 0 |
+| aigentry-design | 14 | **13** | 12 | 1 |
+| aigentry-tester | 59 | 59 | 59 | 0 |
+| aigentry-sandbox | 75 | **71** | 62 | 4 |
+| aigentry-builder | 4 | 4 | 4 | 0 |
+
+리뷰의 design 13 / sandbox 71은 `.DS_Store` 제외 술어와 정확히 일치한다. 어느 술어를 쓰든
+**"읽을 수 있는 파일이 존재한다"는 결론은 바뀌지 않는다** — 그것이 이 수치의 유일한 용도다.
+덧붙여 sandbox의 숨김 파일 13개 중 다수는 `data/shell-integration/zsh/` 아래 셸 통합 픽스처
+(`.zshrc`, `.zsh_history`, `.zcompdump*`)다. **파일명만 열거했고 내용은 열지 않았다.**
+저장소 운영과 무관한 사용자 콘텐츠일 수 있으므로 이 수치를 "활성 저장소" 근거로 쓰지 말 것.
 올바른 처분은 **"미열람(not-inspected) / 버전 프로버넌스 없음"**이다.
 
 **cmux와 WTM은 설치/릴리스 경로 밖이 아니다.** WTM은 설치기가 `$HOME/.local/lib/wtm`로 복사하고
@@ -509,11 +528,11 @@ workspace 선언·private 링크·게시 여부를 교차 검증하지 않았다
 | aigentry-registry | ✅ | ac221cd | 3 | `pyproject.toml` + `bridge`, `frontend` | 매니페스트만 — 중첩 2 (+`.next/` 산출물 3 제외) |
 | aigentry-starter | ✅ | c310f28 | 4 | 없음 | 미열람 — 매니페스트 없음 |
 | aigentry-forum | ✅ | f1fc896 | 1 | 없음 | 미열람 — 최종 커밋 2026-03-01 |
-| aigentry-architect | ❌ NOGIT | — | — | 없음 | **미열람 / 버전 프로버넌스 없음** (읽을 수 있는 파일 26개 존재) |
-| aigentry-design | ❌ NOGIT | — | — | 없음 | **미열람 / 프로버넌스 없음** (14개) |
-| aigentry-tester | ❌ NOGIT | — | — | 없음 | **미열람 / 프로버넌스 없음** (59개) |
-| aigentry-sandbox | ❌ NOGIT | — | — | 없음 | **미열람 / 프로버넌스 없음** (75개) |
-| aigentry-builder | ❌ NOGIT | — | — | 없음 | **미열람 / 프로버넌스 없음** (4개) |
+| aigentry-architect | ❌ NOGIT | — | — | 없음 | **미열람 / 버전 프로버넌스 없음** (파일 26 / `.DS_Store` 제외 26) |
+| aigentry-design | ❌ NOGIT | — | — | 없음 | **미열람 / 프로버넌스 없음** (파일 14 / 제외 13) |
+| aigentry-tester | ❌ NOGIT | — | — | 없음 | **미열람 / 프로버넌스 없음** (파일 59 / 제외 59) |
+| aigentry-sandbox | ❌ NOGIT | — | — | 없음 | **미열람 / 프로버넌스 없음** (파일 75 / 제외 71) |
+| aigentry-builder | ❌ NOGIT | — | — | 없음 | **미열람 / 프로버넌스 없음** (파일 4 / 제외 4) |
 
 > NOGIT 5개는 **읽을 수 있는 파일을 갖고 있다.** 초판의 "소스 이용 불가" 처분은 오류이며
 > 정정한다. 폐기 대상인지 미초기화인지는 판단하지 않았다(증거 없음).
@@ -536,7 +555,9 @@ workspace 선언·private 링크·게시 여부를 교차 검증하지 않았다
 
 ### A.4 엣지 케이스
 
-- **중첩 매니페스트 9개**(§0.2) + `.next/` 빌드 산출물 3개(제외). 루트만 보는 도구는 전부 놓친다.
+- **중첩 매니페스트 8개**(§0.2, 술어 명시) + `.next/` 빌드 산출물 3개(제외).
+  루트 매니페스트는 13개뿐이라 aigentry 계열 23개 중 10개는 루트 package.json이 없다
+  (aterm/ssot/registry/starter/forum + NOGIT 5). 루트만 보는 도구는 이들을 전부 놓친다.
 - **`ecosystem.json`은 6/23만 담는다** — 표시용, 열거 근거 아님.
 - **워크트리 77개**(`~/.aigentry/worktrees/`) — 작업 공간, 저장소로 세지 않음.
 - **`~/.aigentry/repo/`** — 메모리 프로파일 3파일. 저장소 아님.
@@ -570,5 +591,11 @@ for r in ~/projects/aigentry ~/projects/aigentry-*; do echo "$r: $(ls "$r/.githu
 # F8
 grep -c '^[[:space:]]*trap ' install.sh   # -> 0
 # 0.2 중첩 매니페스트 (초판의 -maxdepth 2 오류 정정)
-find ~/projects/aigentry ~/projects/aigentry-* -maxdepth 4 -name package.json -not -path '*/node_modules/*'
+find ~/projects/aigentry ~/projects/aigentry-* -maxdepth 4 -name package.json -not -path '*/node_modules/*' \
+  | awk -F/ '{if(NF==2)r++; else if($0~/\/\.next\//)b++; else n++} END{print "ROOT="r" NESTED="n" BUILD="b}'
+# -> ROOT=13 NESTED=8 BUILD=3   (rev2 headline said 9; that was an aggregation error)
+# A.1 NOGIT file counts — state the predicate, the two differ only by .DS_Store
+for d in aigentry-architect aigentry-design aigentry-tester aigentry-sandbox aigentry-builder; do
+  echo "$d all=$(find ~/projects/$d -type f|wc -l) noDS=$(find ~/projects/$d -type f -not -name .DS_Store|wc -l)"
+done
 ```
