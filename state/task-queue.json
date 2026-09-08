@@ -13158,6 +13158,15 @@
       "updated_at": "2026-09-07",
       "desc": "[telepty release.yml] step 8 'the registry must serve the bytes we packed' waits 6 × 10 s = 60 s, but npm's asynchronous processing after `npm publish` took ~8 min for 0.8.2 (published 13:34 KST, readable 13:42Z per the packument) → the run went RED after a SUCCESSFUL publish, steps 9-10 (clean-install check, GitHub Release) skipped, and a by-hand finish was needed (#1126). Fix: wait up to ~15 min with backoff (npm's own notice says 'may take a few minutes'), poll the packument (not the npm cache), and on timeout say 'publish accepted, not yet readable' as a distinct outcome from 'publish failed' (Rule 38 wording) — never re-publish. Re-run steps 9-10 as a separate job that can be dispatched for an existing tag.",
       "note": "From the 0.8.2 release (run 34128154793). Related history in release.yml's header: v0.8.1 green while npm served 0.8.0 — the opposite failure; the verification gate itself is right, its budget is wrong. | dispatched 2026-09-07T23:00:47Z sid=tp1127-tp1127-release-verify-wait ref=2026-09-08-tp1127-release-verify-wait.md track=tp1127 cli=claude/claude-opus-5[1m] by=explicit"
+    },
+    {
+      "id": 1128,
+      "status": "pending",
+      "track": "process",
+      "priority": "P1",
+      "updated_at": "2026-09-08",
+      "desc": "[orchestrator inbound] Four worker HOLD injects (tp1099 08:05, tp1125 08:03, tp1127 08:02, ah1117 08:04 KST 2026-09-08, all via `telepty inject --ref`) never reached the orchestrator session; the workers waited ~11 h until the user noticed ('워커들 다 멈춰있는데'). tp1124's HOLD/REPORT at 18:43/18:50 DID arrive. The shared refs were on disk the whole time. (1) Root-cause the loss (daemon self-restart to 0.8.2 at 13:31Z on 09-07 + the orchestrator bridge running pre-#1122 code? inject audit log / mailbox for those four inject ids; #1079 class). (2) Permanent guard in the orchestrator: on EVERY idle turn and before every 'waiting for HOLD' statement, sweep ~/.telepty/shared for refs newer than the last handled one (the memory rule feedback_report_loss_sweep_shared_refs exists and was not applied) — make bin/dispatch-tracker.sh report-sweep run in the reconcile tick and inject a digest to the orchestrator when NEW refs appear (#904's durable pull side).",
+      "note": "Workaround applied 2026-09-08 18:5x: HOLDs read from ~/.telepty/shared directly; GO sent. The user had typed answers into the worker prompt boxes (spaces dropped) — submitted with send-key enter, then the orchestrator's GO injects."
     }
   ],
   "completed": [
