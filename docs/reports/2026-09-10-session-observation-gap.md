@@ -183,3 +183,9 @@ Validation: source/data comparisons and report diff only. No code, build, tests,
 model calls, new runtime fault, daemon/session restart or worker injection.
 Snyk N/A: report-only. Outstanding: isolated reproductions, incident-time capture
 provenance, original qc input loss stage and B restart initiator. Parent incomplete.
+
+Owner update (O): qc1136b HITL `decision-reconciler-cacbc1b80d9d` was approved
+with resume=none; current cmux shows new tool work/no API error and current
+read-screen has zero API_ERROR matches. Original trigger snapshot is unavailable;
+the decision file retains those measured limits. No restart/reinject occurred.
+This does not establish the earlier trigger's root cause or make qc1136b a fixture.
