@@ -1,6 +1,6 @@
 # SPEC — #1136 workflow productionization: approval, notification, reap, ledger, release
 
-**Status** design contract, **revision 3** — r2 answered "stop re-approving and re-reporting"; the user has since asked for a loop that *keeps granted work moving with no further message from them*. r2's §3/§4/§8 exclusions cannot satisfy that, so this revision overrides them (§0) and adds §12. **Source** `main` `a3c97c2` (2026-09-09), re-measured for this revision; worktree `docs/1136-autonomous-loop` `069f6b5`, whose `src/` and `bin/` are byte-identical to `a3c97c2` (`git diff --stat main -- src/ bin/` = empty). r2's tree was `5baeecf`; every line/count below was re-checked, not inherited. **Owner** architect; no file below is written.
+**Status** design contract, **revision 3** — r2 answered "stop re-approving and re-reporting"; the user has since asked for a loop that *keeps granted work moving with no further message from them*. r2's §3/§4/§8 exclusions cannot satisfy that, so this revision overrides them (§0) and adds §12. **Source** `main` `a3c97c2` (2026-09-09), re-measured for this revision; worktree `docs/1136-autonomous-loop` `069f6b5`, whose `src/` and `bin/` are byte-identical to `a3c97c2` (`git diff --stat main -- src/ bin/` = empty). r2's tree was `5baeecf`; every line/count below was re-checked, not inherited. **r3.1** corrects six source-review findings against r3 `54ea30a`; the six policy directions and bounded defaults are unchanged. **Owner** architect; no file below is written. **Nothing here is implemented** — every "gate", "verb" and "check" below is specified text until P1–P11 land.
 
 Findings addressed: F1 approval retention, F3 duplicate completion notice, F2+F5 reap order and assignment state, F6 ledger append. F4 (router ref header) is #1133's. r3 adds L1–L8 (§12).
 
@@ -24,6 +24,9 @@ Findings addressed: F1 approval retention, F3 duplicate completion notice, F2+F5
 | r2 §5 V2 hashes the **inbox copy of the report** | a report is untrusted evidence *about* an artifact; retention must name the artifact (repo/commit/path/digest), which a report's own bytes never establish | §12.5 |
 | r2 §5 V3 orders on `ref_mtime_ms` | file mtime is not an ordering authority (copies, clock skew, re-emit). Assignment identity and content shas are | §12.5 |
 | r2 §5 "a drain failure **warns and proceeds**" | acceptable for a human-paced turn, wrong for a loop: one task's failed reap must block **that task's successor**, never every task | §12.5 |
+| **r3** "no registry record ⇒ not sent ⇒ re-dispatch": treated as proof no worker exists | **wrong, and the more dangerous half.** Measured order in `main()`: `taskGateCheck` `:1033` → `resolveRoute` `:1074` → `applyCliCap`+**`spawnWorkspace` `:1075`** → `waitForReady` `:1095` → `prepareEffectiveRef` `:1097` → `beginDelivery` `:1102` → `inject` `:1126`. The workspace is created **~4.5 min before** the first registry write (`REGISTER_TIMEOUT_MS_DEFAULT` 180 000 ms `:42` + codex ready 90 000 ms `:935`). Registry absence means *no recorded inject attempt* and nothing else | §12.2 |
+| **r3** revoke "re-read at the actuation boundary" (singular) | there are **three** boundaries, minutes apart, and the entry gate at `:1033` fences none of the later ones. An admitted, handed-off effect cannot be cancelled | §12.2 |
+| **r3** "resource-local blocking" written as **task-local** | two tasks can share one worktree, branch or terminal sid; blocking by task id alone both under- and over-blocks | §12.3 |
 | r2 §6 `note_op_ids` as a bare **array** of ids | §6 also requires "same id, different payload ⇒ exit 6". A list of ids cannot compare payloads; the check was unimplementable as written | §6 |
 
 ## 1. Queue writers and the shared transaction path
@@ -78,7 +81,7 @@ W1 and the proposed `note-append` write **the same field**. Locking only the new
 - **Independent scopes coexist.** `supersedes` is explicit and single-target: a new grant never implicitly displaces unrelated active scopes.
 - `--scope`, `--phases` and `--quote` are required on `grant`; `--target` and `--quote` on `revoke`. Missing any ⇒ exit 2, nothing written. The helper never reads free text and infers a grant — there is no prose or keyword path to approval.
 - **Legacy** rows carry no `approvals` key: *unrecorded*, which is neither granted nor denied. Every existing path behaves exactly as today; no status value changes meaning.
-- **Built in r3 (r2 deferred it).** The gate is ~10 lines inside the existing `taskGateCheck()` (`src/dispatch/cli.ts:623-661`), which already resolves the task row and already has the reject path: one more case, exit **11** (#1133 holds **10**). It fires **only** when `--loop-claim <id>` is present, so every human-initiated dispatch behaves exactly as today and no existing caller changes (Rule 29). Serialized behind P7 (§10).
+- **Specified in r3 (r2 deferred it); not implemented.** The gate is ~10 lines inside the existing `taskGateCheck()` (`src/dispatch/cli.ts:623-661`), which already resolves the task row and already has the reject path: one more case, exit **11** (#1133 holds **10**). It fires **only** when `--loop-claim <id>` is present, so every human-initiated dispatch behaves exactly as today and no existing caller changes (Rule 29). Serialized behind P7 (§10).
 
 ## 4. C2 — notification grouping, and exactly what it can guarantee
 
@@ -111,7 +114,7 @@ Sidecar, keyed by an id `active.json` already carries, so its schema stays froze
 `bin/session-cleanup.sh --reap-reviewed [--task <id>] [--keep <sid>]` re-verifies **immediately before any side effect**:
 
 - **V1 identity** `dispatch_id` is still the sid's current non-superseded record and its `assigned.sid` equals `sid` — a reused sid or a re-dispatch invalidates the settlement instead of inheriting it. Track substrings are not identity and are not used.
-- **V2 artifact** the named inbox file exists and its sha256 matches — a stale or replaced report fails.
+- **V2 artifact, corrected in r3.1.** r3 rewrote the prose and left this predicate reading on the inbox copy. The predicate is now the **artifact**: `artifact.commit` resolves in `artifact.repo`, `artifact.path` at that commit digests to `artifact.sha256`, **and the commit is still reachable from a retained ref** (`git merge-base --is-ancestor <commit> <branch>`, or the branch/tag named in the settlement) — an unreferenced object is garbage, not preservation. The inbox copy is checked separately as `evidence.sha256` and is never a substitute. **Refusals, each named in the exit-6 reason:** artifact fields absent (`ARTIFACT_UNRECORDED`); commit or path missing (`ARTIFACT_MISSING`); digest mismatch (`ARTIFACT_STALE`); commit unreachable from any retained ref (`ARTIFACT_UNREFERENCED`); evidence file gone or re-hashed (`EVIDENCE_STALE`); `decision` absent (`UNREVIEWED`). A phase whose product is not a committed file (a review verdict, a measurement) records `artifact:{"kind":"none"}` and is settled on `decision` + `evidence` alone — **no phase is given a fabricated artifact path**.
 - **V3 continuation exclusion, ordered by assignment not by clock (r3).** r2 compared `ref_mtime_ms`; mtime is a copy artifact, not an ordering authority. Instead: (a) the registry holds **no non-superseded record for this sid whose `dispatch_id` differs from the settled one** — a re-dispatch is a new assignment and voids the settlement; (b) `re_dispatch_count` is unchanged since review; (c) the sweep cursor's `seen` ledger holds **no inbox file for this `(task, phase)` whose sha is neither the settled `evidence.sha256` nor already-settled** — content-addressed, so an out-of-order or replayed ref is compared, not raced; (d) `continuation` is `"none"`. Ambiguous resolution counts as failure.
 - **V4 protections, unchanged** protected `orchestrator` sid (`cli.ts:45`), self/ancestor SIGTERM refusal (`:344`), `--keep`, worker-session refusal (`:642`).
 - **Fail closed:** missing, stale or ambiguous ⇒ **exit 6, no kill, reason named**. Silence would hide a rejected reviewed decision. A sid with **no** settlement file is simply not a candidate — exit 0, nothing done — so a drain pass stays safe to run unconditionally.
@@ -162,7 +165,7 @@ A runtime cannot make an LLM emit a tool call, and this spec claims no such powe
 | **r3:** claim CAS + `attempt` fence — a stale owner's write is refused, two ticks never claim one task | **r3:** that the woken turn *reviews* rather than rubber-stamps |
 | **r3:** grant fields (`tasks`/`phases`/`repos`/`actions`/`spec_rev`/`expires_at`/`limits`) compared at the actuation boundary; exit 11 refuses an ungranted loop dispatch | **r3:** that the orchestrator authors the next ref at all — the loop can only wake it finitely, then `PAUSED` |
 | **r3:** progress = a committed **receipt**, never a submitted inject; no receipt ⇒ finite re-wake ⇒ `PAUSED` with one durable reason | **r3:** that a `telepty inject` reaches a turn (unprovable here; #1128's ground) |
-| **r3:** UNKNOWN transport is `DISPATCH_RETRY_HELD`, gated, never auto-retried; replay distinguishes not-sent from possibly-sent | — |
+| **r3.1:** spawn intent and inject intent are separate durable states; replay reconciles the worker against **session identity**, never against a registry absence | **r3.1:** cancelling an inject that already landed — after hand-off only the *next* phase is withheld |
 | **r3:** a reap failure blocks that task's successor only; the orchestrator's sid and ancestry are never signalled | — |
 
 ## 9. Acceptance cases
@@ -201,15 +204,22 @@ Each reproduces the recorded case **before** the fix, from fixtures or a **copy*
 | K23 | a corrected report arriving after review; a next-phase HOLD after review | reap blocked (V3 c/d), successor claim refused, one alert |
 | K24 | refs whose mtimes are out of order vs. their assignment order | ordering taken from assignment identity + sha, not mtime; no misattribution |
 | K25 | two ticks racing one task; a lease expired and its old owner writing late | one claim wins; loser exits 6 with no dispatch; the stale write is fenced off by `attempt` |
-| K26 | crash after `claim`, before `dispatch.sh` | replay finds no registry record for `(sid, ref_hash)` ⇒ **not sent** ⇒ re-dispatch under a new attempt; exactly one worker |
+| K26a | crash **after admission, before `spawnWorkspace`** (`:1075`); no telepty row, no launcher file | `spawn:"intended"` reconciles to *not spawned*; one worker after replay |
+| K26b | crash **after `spawnWorkspace`, before `beginDelivery`** (`:1075`→`:1102`, the ~4.5 min window) — a live session and a launcher exist, the registry is empty | `spawn` reconciles to `observed` from the telepty row + `session_epoch`; the inject half re-runs with `--target <sid>`; **no second workspace is opened, and no test asserts "not spawned" from registry absence** |
+| K26c | same as K26b but the sid was reused by an unrelated later session (different `startedAt`) | `session_epoch` mismatch ⇒ `spawn:"unknown"` ⇒ `PAUSED`, nothing respawned, nothing injected |
+| K26d | claim older than the prune cutoff with its record gone | `HISTORY_UNAVAILABLE` ⇒ `PAUSED`; absence is never read as a negative |
 | K27 | crash after `begin-delivery`, before and after the inject | `transport.result:"unknown"` ⇒ `DISPATCH_RETRY_HELD`, one `decision` gate, **no second spawn, no auto-retry** |
 | K28 | wake inject exits 0 but no receipt before the deadline | finite re-wake with backoff, then `PAUSED` with one durable reason; no third prompt, no "continue" in any recorded argv |
 | K29 | `TELEPTY` absent; and `ORCHESTRATOR_STALE` already latched | intent persisted, loop paused with that reason; **zero** restart/kill/bridge argv recorded |
-| K30 | `revoke` (higher `gen`) lands between claim and dispatch; and grant expiry / `spec_rev` change mid-chain | claim released, exit 11, nothing dispatched; one `decision` gate, **not** a per-phase question |
+| K30 | `revoke` (higher `gen`) arriving before each of B1/B2/B3 in turn; and grant expiry / `spec_rev` change mid-chain | refused at that boundary, claim released, nothing dispatched; one `decision` gate, **not** a per-phase question |
+| K30b | `revoke` arriving **after** `inject`, and one arriving between B3 and `inject` | recorded, next phase not admitted, running worker reaped via §5; **no test asserts the handed-off effect was cancelled** |
+| K30c | lease expired with `spawn:"intended"`; and expired with `spawn:"observed"` on a dead session | first is **not** stealable (reconcile first); second is reclaimed by a CAS that bumps `attempt`, and the old owner's late write then fails closed |
+| K30d | delayed ready: `waitForReady` times out at `:1095` after a successful spawn | `spawn:"observed"`, `inject:"not_attempted"`, `PAUSED`; the session is left alone, not killed and not re-spawned |
 | K31 | attempts-per-phase, dispatches-per-grant, per-tick and CLI caps each exhausted in turn | selection stops, the exhausted limit is named, no busy spin; **no test asserts a token or dollar figure** |
 | K32 | every task ineligible (deps, leases, pause); and a dependency phase that fails | one line, no dispatch, no alert storm; the failed dependency's successor is blocked while unrelated tasks still advance |
-| K33 | reap fails V1/V2/V3 for task X while task Y is eligible | `BLOCKED_LOCAL task=X`; Y dispatches; no protected-sid or ancestor signal (V4) |
-| K34 | artifact commit/path/digest missing or changed at reap time | exit 6, no kill — settlement rejected on the artifact, not on the report |
+| K33 | reap fails V1/V2/V3 for task X; task Y **shares X's worktree/branch/sid**; task Z is unrelated | Y is blocked by the **resource** key, Z dispatches in the same tick, no global stall; no protected-sid or ancestor signal (V4) |
+| K33b | an `ack` receipt arrives for every wake and no `review` ever does | phase never advances, breaker trips, `PAUSED`; an ack alone is never counted as progress |
+| K34 | artifact absent / commit missing / digest changed / **commit unreachable from any retained ref** / evidence re-hashed / `decision` absent | exit 6 with the matching named reason (`ARTIFACT_UNRECORDED\|MISSING\|STALE\|UNREFERENCED`, `EVIDENCE_STALE`, `UNREVIEWED`), no kill; and an `artifact:{"kind":"none"}` phase settles on decision + evidence |
 | K35 | tick killed mid-cycle then restarted, at each of the six state transitions | recovery is idempotent; no duplicate spawn, no double receipt, no lost settlement |
 | K36 | **installed E2E**: tarball CLI drives a finite fake chain under a throwaway `HOME`/prefix | helpers resolve from the install; queue + grants + claims survive `init --upgrade`; no repo- or author-HOME path in any resolved argv |
 
@@ -217,7 +227,8 @@ Each reproduces the recorded case **before** the fix, from fixtures or a **copy*
 
 | ID | Files | Change | Owner | Depends on |
 |---|---|---|---|---|
-| P1 | `bin/tq-write.py` **(new)**, `bin/init/manifest.mjs` | §6 §3 §1 helper + ship-set entry; **r3:** `claim`/`release`/`receipt` verbs, `attempt` fence, r3 grant fields, `note_op_ids` as a digest map | coder-A | — |
+| P1 | `bin/tq-write.py` **(new)** | §6 §3 §1 helper; **r3:** `claim`/`release`/`receipt`/`action-add` verbs, `attempt` fence, r3 grant fields, `note_op_ids` as a digest map; **r3.1:** §12.8 structs, `spawn`/`inject` split | coder-A | — |
+| P11 | `bin/init/manifest.mjs` | ship-set entry for P1 — **r3.1:** a separate file and a separate owner, but it must ride in **P1's PR**, or T96 assertion 4 fails the moment the new `bin/` file lands | coder-F | P1 |
 | P2 | `src/tracker/report-sweep.ts`, `src/tracker/usage.ts` | §4 `event:` parse, grouping, `events` in the cursor | coder-B | — |
 | P3 | `src/cleanup/cli.ts`, `src/cleanup/usage.ts` | §5 `--reap-reviewed`, V1–V4, settlement sidecar | coder-C | P1 |
 | P4 | `docs/templates/dispatch-ref-template.md`, `docs/templates/dispatch-ref-checklist.md` | §4 `event:` line + one-final-REPORT rule | coder-B | — |
@@ -228,7 +239,7 @@ Each reproduces the recorded case **before** the fix, from fixtures or a **copy*
 | P8 | new tests under `tests/dispatch/` + `tests/packaging/` | K1–K19 | tester | P1–P7 |
 | P10 | more tests under `tests/dispatch/` + `tests/packaging/` | **r3:** K20–K36 | tester | P9 |
 
-**Edges** `P1 → {P3, P6, P7}`; `#1133 F3 → P7` (same file — **serialized, never parallel**); `{P1…P7} → P8`; **r3:** `{P1, P3, P7} → P9 → P10`. **Parallel-safe** P1 ∥ P2 ∥ P4 ∥ P5. P2, P3 and P7 are TypeScript: `tsc -p .` must run before any guard, and `npm test` refuses a stale `dist/` (`scripts/run-tests.mjs:37-47`). No file is edited by two owners, and no file is touched outside this table.
+**Edges** `P1 → {P3, P6, P7, P11}`; `{P1…P7} → P8`; **r3:** `{P1, P3, P7} → P9 → P10`. **r3.1 — `#1133 F3 → P7` is a *serialization reservation*, not a content dependency.** P7 needs `src/dispatch/cli.ts` free of a concurrent editor; it needs nothing #1133 F3 produces. Which of the two goes first is the **orchestrator's reservation to make**, and if #1133 F3 is not ready, P7 may take the file first — the loop is not blocked on it. Recorded so the edge is not read as an inherent prerequisite. **Parallel-safe** P1 ∥ P2 ∥ P4 ∥ P5. P2, P3 and P7 are TypeScript: `tsc -p .` must run before any guard, and `npm test` refuses a stale `dist/` (`scripts/run-tests.mjs:37-47`). No file is edited by two owners, and no file is touched outside this table.
 
 **Runner inclusion, verified.** `npm test` auto-collects `dist/tests/**/*.test.js` — a new `.test.ts` needs no registration. A new **shell** guard under `tests/dispatch/` is globbed by `T*.sh` but `tests/dispatch/run-all.sh:52` pins `EXPECTED_GUARDS=135`, which **must be bumped in the same commit**. `tests/packaging/*.sh` run in `ci.yml` and `release.yml`, not in local `npm test`. **Discovered id set:** re-measured at `a3c97c2` — `EXPECTED_GUARDS=135` (`tests/dispatch/run-all.sh:52`) and the highest existing guard is still `T150`, so `T151+` appears free — **reported as a discovery for the orchestrator to reserve; this session reserves nothing** (#1133 draws from the same range).
 
@@ -252,7 +263,7 @@ Stage 1 P1 (additive; nothing reads the new fields) → 2 P6 (writers converge o
 |---|---|---|
 | **L1** select next eligible granted task | tick | task rows + `blocked_by`/`priority` (both already in the schema), §3 grant |
 | **L2** claim: CAS + fence, **before any side effect** | tick → `tq-write.py claim` | §1 single transaction path (`fcntl.flock`, `bin/dispatch-registry.py:163-192`) |
-| **L3** dispatch the authored ref | tick → `bin/dispatch.sh` | registry `begin-delivery` writes a durable record **before** the inject (`bin/dispatch-registry.py:457-497`; `src/dispatch/cli.ts:1102` then `:1126`) |
+| **L3** dispatch the authored ref | tick → `bin/dispatch.sh` | registry `begin-delivery` writes a durable record before the **inject** (`bin/dispatch-registry.py:457-497`; `:1102` then `:1126`) — but **after** `spawnWorkspace` `:1075`, which is why §12.2 records spawn and inject as two intents |
 | **L4** report collection | tick → `report-sweep` | `src/reconciler/cli.ts:1281-1287`, already running every tick |
 | **L5** **review the report; author the next ref** | **orchestrator LLM**, woken by L4 | §12.4 |
 | **L6** persist decision, phase/task update, settlement | orchestrator → `tq-write.py` | §3, §5, §6 |
@@ -261,33 +272,40 @@ Stage 1 P1 (additive; nothing reads the new fields) → 2 P6 (writers converge o
 
 L5 is irreducible and deliberately kept: a report is untrusted evidence and the reviewer's decision must be persisted (§5). **The loop never manufactures it.** Everything else is deterministic, and none of it needs a person — which is exactly the delta the user asked for. The loop is one new step in an existing tick (`step 0b3`, between the sweep at `:1287` and the comms auditor at `:1290`), not a new daemon, service or queue.
 
-### 12.2 Claim before side effect, fencing, and replay that tells not-sent from possibly-sent
+### 12.2 Two intents (spawn, inject), serialized admission, fencing, and replay
 
-r2 treated the ledger `dispatch-stamp` as the dispatch record. It is written at `src/dispatch/cli.ts:1162` — **after** `inject()` at `:1126` — and is best-effort by design, so an absent stamp proves nothing. The claim is therefore a separate, earlier write, and lives on the task row itself so there is still exactly one store and one writer (§1):
+r2 treated the ledger `dispatch-stamp` as the dispatch record; it is written at `src/dispatch/cli.ts:1162`, **after** `inject()` at `:1126`, and is best-effort, so an absent stamp proves nothing. **r3.1 corrects the larger error**: r3 then treated *registry* absence as proof that nothing happened. The measured order (`main()`, `a3c97c2`) is `taskGateCheck` `:1033` → `resolveRoute` `:1074` → `applyCliCap` + **`spawnWorkspace` `:1075`** → `waitForReady` `:1095` → `prepareEffectiveRef` `:1097` → `beginDelivery` `:1102` → `inject` `:1126`. `spawnWorkspace` runs `bin/open-session.sh` — a real terminal session, a real CLI process — and `beginDelivery` is the **first** registry write, up to ~4.5 min later (`REGISTER_TIMEOUT_MS_DEFAULT` 180 000 ms at `:42`, codex ready 90 000 ms at `:935`). So **a registry absence is evidence about the inject only; it is never an external negative about a worker.** Two intents, recorded separately:
 
 ```json
-"claim": {"attempt": 3, "sid": "lp1136-coder", "phase": "code", "state": "claimed",
-          "grant": {"id": "ap1136-3f9c21a8", "gen": 4}, "spec_rev": "r3",
-          "ref_sha256": "…", "dispatch_id": null,
+"claim": {"attempt": 3, "phase": "code", "sid": "lp1136-coder",
+          "grant": {"id": "ap1136-3f9c21a8", "gen": 4}, "spec_rev": "r3.1",
+          "resource": {"repo": "aigentry", "worktree": "…/worktrees/lp1136", "branch": "docs/1136-…"},
+          "action_digest": "<sha256 of the frozen action struct>", "ref_sha256": "…",
+          "spawn":  {"state": "intended|observed|unknown", "session_epoch": null, "at": "…Z"},
+          "inject": {"state": "not_attempted|unknown|recorded", "dispatch_id": null, "at": "…Z"},
           "leased_at": "…Z", "lease_expires_at": "…Z"}
 ```
 
-- **CAS + fence.** `tq-write.py claim --task N --phase P --if-attempt <k>` writes only if the row's current attempt is `k` and any existing claim is expired; it commits `attempt = k+1` under the §1 lock. `attempt` is the **fencing token**: every later write for this task (`release`, `receipt`, settlement, `dispatch-stamp`) carries it and is refused if the row has moved on, so an expired owner that wakes up late cannot act. Two racing ticks: one wins the CAS, the loser exits 6 having dispatched nothing.
-- **Ordering.** claim (`state:"claimed"`) → mark `state:"dispatching"` → run `dispatch.sh` → record the returned `dispatch_id` and `state:"dispatched"`. Every transition is a committed write before the next side effect.
-- **Replay after a crash is decidable without guessing**, because the registry's pre-inject record is the discriminator: **no claim** ⇒ never attempted. **claim `dispatching`, and `check-dedup --sid --ref-hash` finds no record** ⇒ **not sent** — nothing fallible runs between `begin-delivery`'s commit and the inject — so re-dispatch under a **new attempt**. **claim + record with `transport.result:"unknown"`** ⇒ **possibly sent**: the registry already refuses this with exit 7 `DISPATCH_RETRY_HELD`, the loop honours it, opens one `hitl --kind decision` gate and **never auto-retries**. **`transport.result:"write_observed"`** ⇒ sent.
-- **No exactly-once claim is made anywhere.** Delivery is at-least-once with durable dedup keyed on `(sid, ref_hash)` — the registry's existing `dedup.key` — and UNKNOWN is a first-class state that reconciles to a human decision, not to a retry.
-- **Revoke is re-read at the actuation boundary**, immediately before `dispatch.sh` is spawned and again inside it (§3's exit 11): a `revoke` whose `gen` exceeds the claim's ⇒ release the claim, dispatch nothing.
+- **Admission is serialized, once.** One `tq-write.py claim --if-attempt <k>` under the §1 lock is the single admission point; it commits `attempt = k+1` and `spawn.state:"intended"` **before** `dispatch.sh` is spawned. Only the holder of the current `attempt` may write, so two ticks cannot both be admitted. Everything after admission is that attempt's, and `attempt` is carried on every later write (`release`, `receipt`, settlement, `dispatch-stamp`) and refused if the row has moved on.
+- **Spawn outcome, measured not assumed.** After `dispatch.sh` returns, the loop records `spawn.state:"observed"` together with `session_epoch` — the `startedAt` of the sid's row in `telepty list`, bound into the registry's **existing, currently-always-null** `assigned.session_epoch` field (`bin/dispatch-registry.py:459,724`), so a later *reused* sid is a different session and not ours. If `dispatch.sh` died or the sid is absent from the listing, `spawn.state:"unknown"` is persisted and **nothing respawns**.
+- **Replay, per state, with no negative inferred from an absence:** `spawn:"intended"` ⇒ a workspace may exist; reconcile against **session identity** (`telepty list` row for the sid, its `startedAt`, and the sid-keyed launcher `~/.aigentry/sessions/<sid>/guard/worker-launcher.sh` that `writeWorkerLauncher()` wrote before the spawn) — a matching live session becomes `observed`, its absence becomes `unknown`, never "not spawned". `spawn:"observed"` + `inject:"not_attempted"` (no registry record for `(sid, ref_hash)`) ⇒ the worker exists and was **not** told anything: re-run the inject half **against the existing session** (`--target <sid>`, not `--spawn-and-dispatch`), so no second worker is possible. `inject:"unknown"` ⇒ possibly delivered: the registry already refuses it with exit 7 `DISPATCH_RETRY_HELD`; one `hitl --kind decision` gate, never an auto-retry. Any `unknown` ⇒ `PAUSED` with the state named.
+- **Pruned history is not a negative either.** `op_prune` (`bin/dispatch-registry.py:659-680`, default cutoff 86 400 s) removes only records already in `RETIRED_LIFECYCLES`, so it cannot touch a live `delivery_attempt_started` row inside a replay window — but the loop still treats a *missing* record as `HISTORY_UNAVAILABLE` when the claim is older than the cutoff, and pauses rather than concluding.
+- **Three boundaries, and what revoke can and cannot do.** `taskGateCheck` at `:1033` runs before route, spawn and readiness, so an entry check fences none of them. Revoke/pause (`gen` greater than the claim's) is re-read at **B1** immediately before admission, **B2** immediately before `spawn`, and **B3** immediately before `beginDelivery` — the last point at which nothing has been handed off. Refusal at any of them releases the claim and dispatches nothing. **After `inject` there is no cancellation**: the bytes are in someone else's session, and this spec promises only that the *next* phase is not admitted and that the running worker is reaped through §5. A revoke arriving between B3 and `inject` is a race this design does not pretend to win; it is recorded, not claimed.
+- **A lease is not stealable merely by expiring.** `expired` + `spawn:"intended"|"unknown"` ⇒ **not stealable** — take-over requires a reconciled spawn state first. Only `expired` + (`spawn:"observed"` with a dead/absent session, or `spawn` never intended) is reclaimable, by a CAS that bumps `attempt`, which is what makes the old owner's late write fail closed.
+- **No exactly-once claim anywhere.** Delivery is at-least-once with durable dedup on `(sid, ref_hash)` — the registry's existing `dedup.key` — and every uncertainty resolves to a persisted state and a human decision, never to a retry.
 
 ### 12.3 Eligibility, deterministically
 
-`eligible(T)` ⇔ an active grant covers `(T, phase, repo, action=dispatch)` and is unexpired, un-revoked and `spec_rev`-current (§3) **and** every `blocked_by` id is `done` **and** no live claim/lease **and** no unsettled predecessor phase for `T` **and** limits unexhausted (§12.6). Order: `priority` (P0<P1<P2), then `blocked_by` depth, then ascending task id — total and stable, no heuristic, no scoring. The user's sentence authorizes **building** this loop; it grants nothing to run. Every task the loop touches needs its own §3 grant, so an ungranted backlog item is not merely deprioritized — it is not selectable.
+`eligible(T)` ⇔ an active grant covers `(T, phase, repo, action=dispatch)` and is unexpired, un-revoked and `spec_rev`-current (§3) **and** every `blocked_by` id is `done` **and** no live claim/lease **and** no unsettled predecessor phase for `T` **and** **no live claim holds a conflicting resource** **and** limits unexhausted (§12.6).
+
+**Resource identity (r3.1) — blocking is resource-local, which is not task-local.** Two different tasks can own one worktree, branch or terminal sid, and r3 wrote "that task's successor" as if task id were the unit. The minimum key is the tuple the dispatch record already carries: `(repo, worktree, branch, sid)` — `cwd`/`worktree`/`branch`/`assigned.sid` all exist on the record today (`bin/dispatch-registry.py:457-497`). Claims conflict when any component matches a live claim's, and the same comparison is used at **selection**, at **reap** and when admitting a **next action**: X and Y sharing a worktree serialize; Z elsewhere advances in the same tick. A failed reap blocks the successors of everything holding its resource — not one task id, and not the fleet. Order: `priority` (P0<P1<P2), then `blocked_by` depth, then ascending task id — total and stable, no heuristic, no scoring. The user's sentence authorizes **building** this loop; it grants nothing to run. Every task the loop touches needs its own §3 grant, so an ungranted backlog item is not merely deprioritized — it is not selectable.
 
 ### 12.4 The wake: a real turn, and progress measured by receipt
 
 The ingress is not new and is not a logfile: `src/reconciler/cli.ts:787` already injects into `ORCH_SID` with `telepty inject --submit-force --from <orch> <orch> <msg>` every tick when it has something to deliver (`deliverSleepDigest`), and `:660` does the same to a worker sid under a latch and an hourly cap (`RESUME_MAX_PER_HOUR`, default 3). The loop reuses that exact argv and that exact ledger shape.
 
 - The wake is **level-triggered on state**, not edge-triggered on an inject — which is why it also covers **S1**: a REPORT whose inject was dropped is still an unreviewed inbox file, and the next tick wakes on the file.
-- It carries the decision, not a nudge: `LOOP: task 1136 phase spec settled (dispatch 2818c54c, artifact <commit>:<path> sha <…>); grant ap1136-3f9c21a8 gen 4 covers phase code; review the artifact, then record your decision and the next ref with tq-write.py receipt --task 1136 --attempt 4 …. The loop dispatches it; do not dispatch by hand.` No "continue" is ever sent, and no wake repeats the previous one's text.
+- **A wake carries unreviewed evidence, never a settlement** (r3.1 — r3's sample said "settled" *before* review, which misstates the evidence it is handing over): `LOOP: task 1136 phase spec REPORTED, unreviewed (dispatch 2818c54c, evidence state/dispatch/inbox/<f>.md sha <…>, claimed artifact <commit>:<path> — unverified); grant ap1136-3f9c21a8 gen 4 covers phase code; review it, then tq-write.py receipt --task 1136 --attempt 4 --decision <accept|reject|revise> …. The loop dispatches what you author; do not dispatch by hand.` No "continue" is ever sent, and no wake repeats the previous one's text.
 - **A submitted inject is not progress.** Progress is a **receipt**: a committed `tq-write.py receipt` carrying the wake's id and the current `attempt`, which is what moves the row. Delivery is unprovable from this side (that is #1128's ground), so the loop asserts nothing about it and reads only the receipt.
 - **No receipt by the deadline** ⇒ finite re-wake (default 2, exponential backoff off the same hourly ledger) ⇒ then **`PAUSED`** on that task with one durable reason in the row and one `alerts.log` line. Not a third prompt, not a loop. Ingress unavailable (`telepty` absent, or `ORCHESTRATOR_STALE` already detected at `src/reconciler/cli.ts:1367-1382`) ⇒ the intent is persisted and the loop pauses with that reason. It never restarts, kills or re-bridges the orchestrator — `#606` keeps that user-only, and `src/reconciler/cli.ts` already declines it in the same situation.
 
@@ -315,12 +333,35 @@ Six knobs, five of them grant-scoped rather than global. The tick already runs e
 
 Gates use the existing `bin/hitl.sh open --kind destructive|decision|info` (`src/hitl/cli.ts:334`), which the tick already reads. **Gate:** new architecture or business scope; destructive actions; grant expiry, revocation or `spec_rev` invalidation; a possibly-sent UNKNOWN; release with no standing `action:"release"`. **Do not gate:** each approved phase inside a live grant, an operational retry inside the limits, or a routine reap. The loop asks once per *scope*, not once per *phase* — asking every phase is the behaviour this task exists to remove.
 
-## 13. First handoff (r3)
+### 12.8 `action`, `claim`, `receipt` — the structs P1 must not invent at coding time
 
-Approve this document once, and the first coder starts on **P1 alone** — `bin/tq-write.py` plus its `bin/init/manifest.mjs` entry. It is the only unblocked file on the r3 critical path, it is new (so it collides with nobody, #1133 included), and every other loop piece depends on it. Its r3 delta over r2 is four verbs (`claim`, `release`, `receipt`, plus grant fields) and one shape fix (`note_op_ids` as a digest map, §6).
+**`action`** is what gets dispatched, authored by the orchestrator and **frozen at admission**; `action_digest` = sha256 over its canonical form (sorted keys, no whitespace), and any change to it or to the ref bytes is a **new action**, never an edit:
 
-**Order after that:** P1 → P3 → P7 (behind #1133 F3) → **P9** → P10. P2/P4/P5/P6 stay parallel-safe and unchanged from r2.
+```json
+{"task":"1136","phase":"code","repo":"aigentry","worktree":"…","branch":"…",
+ "sid":"lp1136-coder","role":"coder","cli":null,"action":"dispatch",
+ "ref_path":"…","ref_sha256":"…","authored_by":"orchestrator","authored_at":"…Z"}
+```
 
-**Blockers, as measured facts rather than open questions:** none for P1. P7 is blocked on **#1133 F3** landing in `src/dispatch/cli.ts` (same file, serialized). P9 is blocked on P7 because the loop's dispatch path is the exit-11 gate. #1128 owns whether an inject reaches a turn — r3 does **not** depend on that being fixed, because progress is measured by receipt, but its resolution is what would let the wake retry count drop.
+The **first** action of a chain is authored by the orchestrator in the turn that requests the loop (`tq-write.py action-add`); every later one arrives on a `review` receipt. **The daemon authors none.** An action becomes *eligible* only when its predecessor phase is settled (§5), its grant covers `(task, phase, repo, action)` and its resource is free (§12.3).
+
+**`receipt` has two kinds, and only one advances anything.**
+
+| kind | required | effect | does **not** |
+|---|---|---|---|
+| `ack` | `--task --attempt --wake-id --op-id` | records that a turn consumed that wake; suppresses a duplicate wake for that `wake_id` | advance the phase, settle, clear the no-progress breaker, or count as review |
+| `review` | `ack`'s fields + `--decision accept\|reject\|revise --evidence-sha256 …` + `--artifact repo:commit:path:sha256\|none` + optional `--next-action <file>` | persists the reviewer's decision, writes the settlement (§5), and admits `next_action` for later selection | itself dispatch anything |
+
+- **An ack is not progress.** The no-progress breaker (§12.6) counts ticks without a **`review`**, so an endless ack loop still trips it. A phase advances on a persisted decision or not at all.
+- **Idempotency is by digest, not by arrival.** Every receipt carries `--op-id` and its payload's sha256 lands in `note_op_ids` (§6): replay of the identical payload is a no-op exit 0; the same id with a different payload is exit 6, nothing written. Wrong `--attempt` ⇒ exit 6 (fenced, §12.2).
+- **Results are exact:** exit 0 + the row's new `(attempt, phase, claim.state)` on stdout; 3 unknown task; 4 malformed queue; 5 stale `--if-*`; 6 fenced/duplicate-conflict; 2 missing required field. Nothing partial is ever written.
+
+## 13. First handoff (r3, corrected in r3.1)
+
+Approve this document once, and the first coder starts on **exactly one file: `bin/tq-write.py` (P1)** — r3 said "P1 alone" while listing two files, which r3.1 splits: `bin/init/manifest.mjs` is **P11**, a different file with a different owner that rides in the same PR (T96 goes red the moment a `bin/` file lands unlisted). P1 is new, so it collides with nobody including #1133, and every other loop piece depends on it. Its delta over r2: the §12.8 verbs and structs, the `spawn`/`inject` split, and the `note_op_ids` digest-map fix (§6).
+
+**Order after that:** P1 (+P11) → P3 → P7 → **P9** → P10. P2/P4/P5/P6 stay parallel-safe and unchanged from r2.
+
+**Blockers, as measured facts rather than open questions:** none for P1. P7 needs `src/dispatch/cli.ts` **free of a concurrent editor** — a scheduling reservation for the orchestrator, not a content dependency on #1133 F3 (§10). P9 needs P7 because the loop's dispatch path is the exit-11 gate. #1128 owns whether an inject reaches a turn — this design does **not** depend on that being fixed, because progress is measured by a `review` receipt, but its resolution is what would let the wake retry count drop.
 
 **Bounded defaults chosen here so no further approval round is needed** (change any by saying so, none needs a question): loop off by default; 1 dispatch/tick; 2 attempts/phase; 12 dispatches/grant; 30-minute phase deadline (the registry's existing value); 2 re-wakes then `PAUSED`; grants scoped **per chain**, not one standing loop grant. **This document creates no automation** — it is a design contract, and every behaviour above exists only once P1–P10 are written, tested and merged.
