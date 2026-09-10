@@ -80,3 +80,115 @@ One exact compiled JS execution only; no deterministic-failure rerun, npm test, 
 Builder's separate report at base 16358f3 records build exit 0 on Node 25.2.1/npm 11.6.2/TS 5.9.3 in 1074.23 ms; this tester did not build. Its shared dependency tree had missing declared telepty and extraneous packages, so no clean-install claim. Historical 29/29 old JS and 22/27 direct Python results remain separate runs; current execution is the new JS's 51/56.
 
 Snyk N/A: report-only tracked change and exact copy of already compiled JS, no authored first-party code changes. Prior tester zero-issue scan covers only `tests/dispatch/workflow-task-writer.test.ts`; helper's separate 2 LOW findings remain unresolved. No inherited waiver, same-file disagreement, new scan or security acceptance claim.
+
+## Separate test-only correction counterpart — 2026-09-10
+
+This section is a new comparison, not a revision of the original 51/56 execution above. **Candidate: 56/56 compiled tests pass; separate focused controls: 2/2 pass. Security gate unmet: isolated candidate scan still reports two findings.** No permanent helper change or security/code DONE claim.
+
+Comparison HEAD was report commit `616da2c99a7429a93d1d3bd4ce3b68ca5ece7c14`; new report commit is the containing commit. Main initially `91534a1ba8baa4c33db4b6bdaec52a4877b87696`, post-comparison sample `2956816046c6a282aca5a20cef8db4d52bd52347`. At the latter sample helper/test remain absent from main and package/lock/config/runner match HEAD. No fetch/main writes. Original helper/TS/current dist JS/baseline TAP hashes rechecked unchanged before and after comparison; original run was reused, not rerun.
+
+Preserved ignored comparison root `C=/Users/duckyoungkim/.aigentry/worktrees/qt1136b/dist/queue-boundary-counterpart`. Fresh `C/original` and `C/candidate` each contain regular-file copies of helper, compiled JS and package.json. Both JS copies retain SHA-256 `d3ed307c55796d45fb28052ae40df152b6f78188214be46b0dd3b22d60e0029f`; both package copies retain `2b56fef3f0924d72bdef42c7e50a4a122ade11173bb979dfc087d63fe9d3465a`. Three-parent REPO resolution was checked for both respective synthetic trees. Original helper retains `7e6e6dd1ebe210d1a772e382234be4d31d4939e62db5512b3a70a4304a4de417`; candidate helper after patch/scan is **`12bce41dc9a5901c08e134235d3ce1008d1aa1a7ed8a34ab82ad8332abfccdca`**.
+
+Only the four proposed transformations were applied via apply_patch to the candidate copy. Complete diff follows; unchanged finite-float canonicalization, bool handling, ambiguity detection, stored rows, locking and OS error branches remain in the copied implementation.
+
+```diff
+--- original/bin/tq-write.py
++++ candidate/bin/tq-write.py
+@@ -138,4 +138,11 @@
+ 
+ 
++def _finite_float(text):
++    value = float(text)
++    if not math.isfinite(value):
++        raise ValueError("non-finite JSON number %s" % text)
++    return value
++
++
+ def load(path):
+     """Read and shape-check the queue under the held lock. A malformed queue is
+@@ -147,5 +154,6 @@
+         raise Refusal(7, "QUEUE_UNAVAILABLE", "cannot read queue %s: %s" % (path, exc))
+     try:
+-        doc = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
++        doc = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant,
++                         parse_float=_finite_float)
+     except (UnicodeDecodeError, ValueError) as exc:
+         raise Refusal(4, "MALFORMED_QUEUE", "unparseable queue: %s" % exc)
+@@ -177,5 +185,5 @@
+     try:
+         with os.fdopen(fd, "w", encoding="utf-8") as fh:
+-            json.dump(doc, fh, indent=2, ensure_ascii=False)
++            json.dump(doc, fh, indent=2, ensure_ascii=False, allow_nan=False)
+             fh.write("\n")
+             fh.flush()
+@@ -183,4 +191,7 @@
+         os.chmod(tmp, mode)  # mkstemp is 0600; the queue keeps the mode it had
+         os.replace(tmp, path)
++    except (UnicodeError, ValueError) as exc:
++        _unlink(tmp)
++        raise Refusal(4, "MALFORMED_QUEUE", "unrepresentable queue: %s" % exc)
+     except OSError as exc:
+         _unlink(tmp)  # only ever our own temp; the queue is never truncated or unlinked
+@@ -245,8 +256,8 @@
+         return value
+     if isinstance(value, int):
+-        # ponytail: exact for every id JS can represent (|n| <= 2^53); a larger
+-        # integer literal would differ from JS's rounded text, so widen here if
+-        # ids ever exceed that.
+-        return str(value)
++        try:
++            value = float(value)  # Match JS text without changing the stored row.
++        except OverflowError:
++            raise Refusal(4, "MALFORMED_QUEUE", "tasks[%d].id exceeds binary64 range" % index)
+     if isinstance(value, float):
+         if not math.isfinite(value):
+@@ -322,12 +333,7 @@
+         raise Refusal(6, "OP_ID_CONFLICT", "op-id %r already recorded a different payload on "
+                       "this row" % args.op_id)
+-    prior = row.get("note")
+-    # JSON null is "no note yet" -- the live queue stores 161 of 1148 rows that
+-    # way -- and is treated exactly like an absent key. Any other non-string
+-    # note is malformed. HOLD: if null must instead be exit 4, this branch is
+-    # the single line to flip.
+-    if prior is None:
+-        prior = ""
+-    elif not isinstance(prior, str):
++    # Only an absent note defaults to empty; present values must be strings.
++    prior = row.get("note", "")
++    if not isinstance(prior, str):
+         raise Refusal(4, "MALFORMED_QUEUE", "note is %s, want string" % _kind(prior))
+     # Empty prior text yields the segment alone; a leading separator would be
+```
+
+### Candidate execution and direct controls
+
+Exact argv: `/Users/duckyoungkim/.nvm/versions/node/v20.20.0/bin/node --test dist/tests/dispatch/workflow-task-writer.test.js`; cwd `C/candidate`. Measured version `v20.20.0`; Python helper executable `/opt/homebrew/bin/python3`. Started `2026-09-10T11:17:19.527037+00:00`, exit 0, outer `14898.745584 ms`, TAP `14876.64575 ms`, outer timeout 90 seconds did not fire. One attempt only. Actual TAP plan `1..56`, 56 ok result lines, zero not-ok lines; pass 56, fail/skipped/cancelled/todo 0, suites 0.
+
+Complete outer env: PATH `/usr/bin:/bin`, HOME `C/evidence/home`, TMPDIR `C/evidence/tmp`, PYTHONDONTWRITEBYTECODE `1` (C expanded to the absolute path). Existing compiled fixtures replace child env with their own synthetic TQ/HOME/TMPDIR/AIGENTRY roots. Candidate subprocesses were joined and process-group disappearance checked; no timeout/setup failure. Compiled TS/JS assertions were unchanged. All five formerly failing named tests now pass, including surrogate exit4/MALFORMED_QUEUE/unchanged/no-own-temp assertions. All prior passing controls remain green, including OS precommit7, postreplace8 with visible ledger/replay0, concurrency, mode0640 and foreign-temp preservation.
+
+Separate focused controls in `C/harness/compare.py` use Node `JSON.parse(raw).tasks.map(row => String(row.id))` on exactly the raw JSON written for the candidate helper. Node oracle bounded at 10s, helper CLI at 15s; separate synthetic env per case; children joined and process groups absent. These two results are NOT added to the compiled total:
+- Two distinct integer literals `9007199254740992` and `9007199254740993` both yield JS text `9007199254740992`; request refuses 2 AMBIGUOUS_TASK, byte/inode/mtime/ctime snapshot unchanged; helper elapsed `41.9765 ms`.
+- Integer literal `1` followed by 400 zeros yields JS text `Infinity`; request refuses 4 MALFORMED_QUEUE (`tasks[0].id exceeds binary64 range`), snapshot unchanged; helper elapsed `41.7355 ms`.
+Both also preserve mode0640/foreign sentinel with zero own-temp leaks. Exact raw fixtures, oracle argv/output and helper stdout/stderr/status/timing are retained in controls.json.
+
+### Actual isolated Snyk scans
+
+Normal authenticated CLI `/Users/duckyoungkim/.nvm/versions/node/v20.20.0/bin/snyk code test <absolute-scope> --json`, cwd equal to scope. Two separate scopes were verified to contain only the named Python file; no auth/config/root-policy/ignore/waiver changes. Both scans completed and were joined.
+- Scope `C/candidate/bin`, file `tq-write.py`: exit 1, two `python/PT` Path Traversal/CWE-23 findings, SARIF level `note` (LOW): environment input to `open` at candidate line151 and `os.replace` at line192. These concern the unchanged TQ-path flow and correspond to the previously reported two LOW categories; no fresh original scan/fingerprint equivalence claim. Security gate remains unmet; containment policy was not expanded to chase zero.
+- Scope `C/harness`, file `compare.py`: exit 0, zero SnykCode results. This is the separately authored fixture harness scan, not the report or production helper scan.
+
+### Preserved comparison evidence
+
+All paths below are relative to C; original/candidate trees, direct synthetic cases and raw evidence remain available for orchestrator preservation review.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `candidate.diff` | `52b5ecb03f3531512e6cc294742cc92e37026f643e7f28b88803f2b276390cf1` |
+| `harness/compare.py` | `c5937757e6d29dce18788df5827ad9054c935651e7f7d62f0ac4449d7c4a412b` |
+| `evidence/candidate-stdout.tap` | `9899449f79452044f4eacfcf4c110bebbfa96d62b7d6dbaadb2b6662ff190f43` |
+| `evidence/candidate-run.json` (full capture/argv/env/exit/timing) | `2a281e24bdd2a9e335b573fa574a63286f2b76380ae52472c7bb578a2860db70` |
+| `evidence/controls.json` | `80d0d53e6022ee238c380118ef0637cae3dc18dda0f77653d727e69e40d7aa76` |
+| `candidate-snyk.stdout.json` | `84c24fee34046cceb01a786a2480551e621e6bcff8b4a0be930db5d36a3c0c64` |
+| `harness-snyk.stdout.json` | `d281816c1bed2bb392dc5590e83ae26468d0bd4a2784c2b3da1c3af5a90e238b` |
+
+Candidate outer stderr and both Snyk stderr files are empty; scan argv/cwd/exit metadata retained as `candidate-snyk-meta.json` and `harness-snyk-meta.json`. Only this report is tracked; no permanent source/test/package/config edit, build, dependency install, other suite, live queue/caller/daemon/model execution or remote push. This confirms the exact copied strategy under these fixtures only: no universal finite-double formatting proof, arbitrary-input completeness, live/race integration, security approval or power-loss guarantee. HOLD for orchestrator permanent-fix authorization and unresolved security gate; parent task remains incomplete.
