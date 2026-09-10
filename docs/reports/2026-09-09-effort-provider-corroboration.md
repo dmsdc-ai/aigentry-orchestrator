@@ -106,8 +106,8 @@ Inaccessible/redirect notes: `developers.openai.com/codex/config-basic` and `…
 
 - Provider application of a parsed token to the declared model (any tuple).
 - This account’s live `agy models` / `grok models` catalogs.
-- Exact Codex **0.153.4** public config schema vs current S8 (max/ultra), and whether `model_reasoning_effort=ultra` is **accepted** for `gpt-6-astra`.
-- CLI-to-API effort translation (Codex `ultra`↔API `max`; Grok shipped tokens↔API band; agy `--effort`/slug↔`thinking_level`).
+- Exact Codex **0.153.4** public config schema vs current S8 (max/ultra), and whether `model_reasoning_effort=ultra` is **accepted** for `gpt-6-astra` (parser/config acceptance only).
+- CLI-to-API effort translation (Codex `ultra`↔API `max`; Grok shipped tokens↔API band; agy `--effort`/slug↔`thinking_level`). Parser/CLI dry validation does **not** measure this.
 - Gemini 0.53.0 complete CLI flag inventory (README not exhaustive; help/adapter remain the local negative observation).
 - Claude 2.1.266 exact-version application of `claude-opus-5` effort (docs floor v2.1.219+ is not that proof).
 - Effective `AIGENTRY_*` env vs declared defaults.
@@ -115,4 +115,4 @@ Inaccessible/redirect notes: `developers.openai.com/codex/config-basic` and `…
 
 ## 6. Next validation suggestion (information only; not executed)
 
-One bounded #1148 follow-up: on the **same captured Codex 0.153.4** binary, obtain a non-inference, version-pinned **CLI-layer** acceptance signal for `-c model_reasoning_effort=ultra` with `gpt-6-astra` (config schema, config-key help, or a dry validator the binary already exposes). That would turn the current UNKNOWN CLI↔API translation into a same-layer CLI fact. Not permission to change capability metadata or defaults.
+One bounded #1148 follow-up: on the **same captured Codex 0.153.4** binary, obtain a non-inference, version-pinned **CLI-layer** acceptance signal for `-c model_reasoning_effort=ultra` with `gpt-6-astra` (config schema, config-key help, or a dry validator the binary already exposes). That proves **parser/config acceptance only** — a same-layer CLI fact. It does **not** establish CLI-to-API translation (`ultra`↔API `max` or any wire mapping). Review qualification 2026-09-10: keep that distinction on follow-up. Not permission to change capability metadata or defaults.
