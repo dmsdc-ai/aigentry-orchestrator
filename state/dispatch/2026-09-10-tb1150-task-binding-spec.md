@@ -7,9 +7,9 @@ task: 1150
 > THIS FILE IS THE COMPLETE SELF-CONTAINED SPEC. State/docs/bin paths are orchestrator metadata unless explicitly designated read-only context or owned output. Role-sandbox is not your worktree; no prior chat needed.
 
 ## Role
-You are tb1150-architect, architect. Worktree /Users/duckyoungkim/.aigentry/worktrees/tb1150, branch docs/1150-task-binding, base996efd1.
-Only tracked output docs/specs/2026-09-10-task-binding-enforcement.md, <=220lines. Source/runtime read-only; no code/config/taskqueue changes, tests, builds, scripts/app execution, installs, daemon/worker restart, extra workers/subagents or main writes.
-One independent1149 architect owns public-install proposal in another worktree. Different docs, no shared productionfile writes. UniversalD external_dispatch auto architect, visible samecmux.
+You are tb1150-architect, architect. Worktree /Users/duckyoungkim/.aigentry/worktrees/tb1150, branch docs/1150-task-binding, base5a3adfc.
+Only tracked output docs/specs/2026-09-10-task-binding-enforcement.md, target <=220lines. Do not repeat reflow/regex passes merely to hit a line count; report any small length deviation. Source/runtime read-only; no code/config/taskqueue changes, tests, builds, scripts/app execution, installs, daemon/worker restart, extra workers/subagents or main writes.
+Prior1149 public proposal is preserved in main docs/proposals/2026-09-10-public-install-onboarding.md (design only); worker reaped. Prior751 diagnostic/spec workers also reaped, with evidence and an UNAPPROVED recovery sketch retained. Only this design lane runs now;751 implementation waits user-visible exit-code approval and race-safe contract/reproduction. UniversalD external_dispatch auto architect, visible samecmux. No shared productionfile writes.
 
 ## User requirement
 USER: all work must be task-bound by enforcement, not convention, and productionized. All changes should be made with production in mind.
@@ -41,7 +41,7 @@ List genuine userpolicy decisions only if technical reading leaves competing int
 
 ## Workflow
 Single bounded spec phase: source/callsite review -> minimal contract/gaps/test plan -> diff/linecap review -> commit -> real REPORT/HOLD. No implementation, broader audit, remote/model/provider research or runtime execution.
-MANDATORY: commit (WIP allowed) at every phase boundary; a sleep/API cut then loses at most one phase. Third failed attempt=>STUCK exacterror; never silentidle. HOLD immediately if scope must widen.
+MANDATORY: commit (WIP allowed) at every phase boundary; a sleep/API cut then loses at most one phase. Third failed attempt=>STUCK exacterror; never silentidle. HOLD immediately if scope must widen. Use precise Edit/apply_patch, not repeated whole-file regex/reflow passes; a bounded unresolved design draft is preferable to unsupported safety claims or formatting-only loops. No new daemon probes: notification only at completion, durable report fallback if transport fails.
 Counts above are starting categories, not a measured completecallgraph. Recount actualsources. No rootcause claim from filenames/grepabsence alone: enumerate searchedscope, dynamic/unmeasured boundaries and relevant callers.
 
 ## HOLD inject protocol
@@ -105,4 +105,3 @@ N/A docs-only. No authored executable first-party code; no claim that a spec cle
 
 ## Full capability and boundary
 Use all relevant skills, tools, MCP servers and workflows fully within scope. Read/rg/Bash/git/structured JSON/Edit/apply_patch authorized; no plugin is mandatory. No plan mode, spawning additionalagents, executing repositoryentrypoints/tests, livequeuewrites, credentials, daemonconfig changes, publication or destructiveactions.
-
