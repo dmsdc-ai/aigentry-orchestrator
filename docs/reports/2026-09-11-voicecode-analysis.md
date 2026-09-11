@@ -36,7 +36,7 @@ Labels:
 | Target dirty state (after) | identical (re-checked before commit) |
 | Working tree vs committed | every analyzed source file is committed and unmodified; the two dirty paths are tooling state, not source |
 | Area recency | `android/` last touched 2026-05-12 (14 commits); `bridge/` 2026-03-01 (11); `scripts/` and `CLAUDE.md` 2026-03-01; `README.md` 2026-03-02 |
-| Report worktree | HEAD `0e04c6b6a2bb07e8554780aaea2d543651daf640` = local `main`; `origin/main` `a536cd8` is an ancestor (local `main` 274 ahead, 0 behind) |
+| Report worktree | Base `0e04c6b6a2bb07e8554780aaea2d543651daf640` = local `main` at start; `origin/main` `a536cd8` is an ancestor (local `main` 274 ahead, 0 behind). During the task, local `main` advanced to `d584034` (3 orchestrator doc commits: `9b688ef`, `74f3e03`, `d584034`); `0e04c6b` is its ancestor, none of the 3 touch this file, and `git merge-tree` reports a clean merge |
 
 ## 2. Inventory (measured, not README counts) (S)
 
