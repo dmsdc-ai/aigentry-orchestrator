@@ -75,3 +75,28 @@ Documentation only; no production/helper code, builds, tests, installations, con
 
 Commit this report before sending READY and HOLD to the orchestrator. Phase 2 requires the separate controlled dispatch.
 
+## Sample 01 — captured, pending independent tester review
+
+Controlled dispatch reference: `~/.telepty/shared/566e816cc82cfcbb6eb48728c455bc26151fcceb22728a0432d81aa12eccc725.md`. Setup commit: `3de4454`. Synthetic label inside that reference: `IB1151-SAMPLE-01-20260911`; no assertion that this inner label was present in the initial PTY payload. The tester must correlate the outer context-reference message and actual inject ID; no inject ID was inferred here.
+
+Actual order on the controlled turn:
+
+1. Assistant commentary announced capture before reading the reference; no tool had run on this turn.
+2. First tool: `functions.exec` wrapping exactly one `tools.exec_command`, with `login: false`, executing the exact prepared command above. Exit code 0; output reported the snapshot path, SHA-256 and 275461 bytes.
+3. Second tool: `functions.exec` wrapping `exec_command` to read the controlled dispatch reference.
+4. Subsequent inspection read only the output metadata, hashed its bytes, inspected artifact permissions/size, and checked Git status/ignore rules. No snapshot message contents were inspected after capture.
+
+No ordering or command deviation observed; one capture, no retries. Entry timestamps are inside Python after importing `time`, within the first tool, as specified in setup. They are not exact shell entry, pre-tool visibility, or crash-durability measurements.
+
+| Recorded timestamp | Monotonic ns | Unix wall-clock ns |
+| --- | --- | --- |
+| Entry | 1673992744969625 | 1789088958200376000 |
+| Read start | 1673992754478041 | 1789088958209884000 |
+| Read end | 1673992754552791 | 1789088958209959000 |
+
+- Snapshot: `dist/evidence/ib1151/tool-entry-rollout.jsonl`, 275461 bytes; SHA-256 recorded from the captured bytes: `b9f64d832e320d67a2c082d5a47d2e8193953a10783c261ddeb653ccb45e13b5`.
+- Metadata: `dist/evidence/ib1151/tool-entry-metadata.json`, 2993 bytes; SHA-256 of saved metadata: `78b7a8bdb85e526b9beacd6ce46f964271abc7d7066d6a7b6aa1ee51233ff6e4`.
+- Known thread remained `01a08e00-2b54-7f73-a1d7-8dd3695f569a`; capture checked the environment binding and snapshot session metadata.
+- Both artifacts have mode 0600; their directory has mode 0700. Git reports both paths ignored; raw rollout and metadata remain local, uncommitted evidence.
+
+No builds or tests run; Snyk N/A (documentation only). No runtime outcome assertion, tester verdict, or loop activation. Phase 2 execution complete; HOLD for independent tester review.
