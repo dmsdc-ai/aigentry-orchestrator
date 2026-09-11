@@ -4,6 +4,28 @@
   ],
   "tasks": [
     {
+      "id": 1153,
+      "desc": "Current open-source STT research for Korean Voice Code: accuracy, streaming, mobile/server deployment and licensing.",
+      "status": "pending",
+      "priority": "P1",
+      "track": "process",
+      "parent_task": 1152,
+      "repository": "voicecode",
+      "updated_at": "2026-09-11",
+      "note": "2026-09-11 user prioritizes STT/TTS and explicitly requests current best-performing open-source research. Research-only st1153-dustcraw owns one STT report; paired independent research wave with tt1154-dustcraw TTS (2 speakers, separate files/worktrees). Existing #1151/#1152 analyses are different waves. Mode D external_dispatch, fresh auto-routed research role. Official source retrieval mandatory, retrieval and release dates explicit; no universal best claim or cross-benchmark comparisons without methodology. Korean code-switching, short commands, endpoint latency and commercial model-weight license prioritized. No download/install/test/implementation."
+    },
+    {
+      "id": 1154,
+      "desc": "Current open-source TTS research for Korean Voice Code: naturalness, first-audio latency, interruption, mobile/server deployment and licensing.",
+      "status": "pending",
+      "priority": "P1",
+      "track": "process",
+      "parent_task": 1152,
+      "repository": "voicecode",
+      "updated_at": "2026-09-11",
+      "note": "2026-09-11 user prioritizes STT/TTS and explicitly requests current best-performing open-source research. Research-only tt1154-dustcraw owns one TTS report, parallel-safe with #1153. Mode D external_dispatch. Re-fetch official repositories/model cards/papers, distinguish code license from weight restrictions and self-reported benchmarks from comparable evidence. Korean naturalness, technical text normalization, streaming first audio and barge-in suitability prioritized. No voice cloning without consent, no model downloads/install/runtime tests, no implementation."
+    },
+    {
       "id": 1152,
       "desc": "Analyze local Voice Code app: architecture, voice-to-command flow, session transport, authentication, production gaps and reuse for aigentry mobile remote loop control.",
       "status": "delegated",
