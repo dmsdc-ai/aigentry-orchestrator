@@ -7,6 +7,35 @@ extracts the matching section as the GitHub Release notes, so a publish fails
 without one. Unreleased harness work is still grouped under a dated
 `## [<YYYY-MM-DD>]` section beneath the ongoing `## [Unreleased]` working set.
 
+## [0.2.1] - 2026-09-12
+
+Maintenance publication of the already-merged source through
+`a536cd8b303f6781ccccc9f4817aa8a6c0416845`. This release does not include the
+uncommitted or unmerged September worker implementations.
+
+### Changed
+
+- Publish the TypeScript orchestration CLI ports behind their existing shell
+  entrypoints, including dispatch, tracking, cleanup, reconciliation and HITL.
+- Include the shared-directory report sweep with its durable cursor and inbox
+  (#904), host-sleep handling (#909), and the merged spawn argument quoting
+  (#926), boot argument validation (#934), and follow-up fixes (#930-935).
+- Include the existing dispatch/packaging regression guards and context-delta
+  recording instructions. Release CI reruns its gates before publication.
+
+### Known Limitations
+
+- This is not the completed Task Loop, Task Advisor or Voice Code release.
+- Automatic session model/effort display, the new full-process worker sandbox,
+  noninteractive worker transition and confined custom-outbox collection are
+  not included. Existing role/cwd separation is not a hard security sandbox.
+- Native Windows installation remains unsupported. Existing Windows-specific
+  tests do not establish support for the complete orchestrator.
+- Registry byte identity and clean-install version checks do not prove every
+  live workflow or reported issue is resolved. Installed behavior verification
+  and migration of a running control workspace are separate acceptance steps;
+  do not replace a live daemon or orchestrator as an installation side effect.
+
 ## [0.2.0] — 2026-08-15
 
 `npm i -g @dmsdc-ai/aigentry-orchestrator && aigentry-orchestrator init` now reproduces the

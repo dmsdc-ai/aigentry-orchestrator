@@ -1,6 +1,6 @@
 {
   "name": "@dmsdc-ai/aigentry-orchestrator",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Aigentry orchestrator session/persistence library (ADR §6 #14 et al.)",
   "license": "MIT",
