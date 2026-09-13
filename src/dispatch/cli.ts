@@ -251,22 +251,32 @@ function registryMissing(): boolean {
   return true;
 }
 
+/** Native Windows needs an interpreter; keep the script path and argv unmodified. */
+export function registryInvocation(script: string, args: string[], platform: NodeJS.Platform): { cmd: string; args: string[] } {
+  return platform === "win32"
+    ? { cmd: "python", args: [script, ...args] }
+    : { cmd: script, args };
+}
+
 /** `registry "$@"` with stdout+stderr captured (the check-dedup call site). */
 function registryBoth(args: string[]): { status: number; output: string } {
   if (registryMissing()) return { status: 9, output: "" };
-  return captureBoth(DISPATCH_REGISTRY_PY, args);
+  const invocation = registryInvocation(DISPATCH_REGISTRY_PY, args, process.platform);
+  return captureBoth(invocation.cmd, invocation.args);
 }
 
 /** `registry "$@"` with stdout captured, stderr passed through. */
 function registryOut(args: string[]): { status: number; stdout: string } {
   if (registryMissing()) return { status: 9, stdout: "" };
-  return captureOut(DISPATCH_REGISTRY_PY, args);
+  const invocation = registryInvocation(DISPATCH_REGISTRY_PY, args, process.platform);
+  return captureOut(invocation.cmd, invocation.args);
 }
 
 /** `registry "$@" >/dev/null` — status only. */
 function registryQuiet(args: string[]): number {
   if (registryMissing()) return 9;
-  const r = spawnSync(DISPATCH_REGISTRY_PY, args, { stdio: ["ignore", "ignore", "inherit"] });
+  const invocation = registryInvocation(DISPATCH_REGISTRY_PY, args, process.platform);
+  const r = spawnSync(invocation.cmd, invocation.args, { stdio: ["ignore", "ignore", "inherit"] });
   if (r.error) return 127;
   return r.status ?? 1;
 }
