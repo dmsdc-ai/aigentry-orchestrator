@@ -28,6 +28,7 @@ const MANIFEST = [
   "bin/hitl.sh",
   "bin/init/cli.mjs",
   "bin/init/manifest.mjs",
+  "bin/init/preservation.mjs",
   "bin/inject-handler.sh",
   "bin/install-instructions.sh",
   "bin/install-launchd.sh",

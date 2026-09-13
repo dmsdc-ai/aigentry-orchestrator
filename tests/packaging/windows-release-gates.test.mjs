@@ -445,7 +445,7 @@ acceptance('portable default evidence stays inside the private OS temporary dire
 const callerSource = readFileSync(join(root, 'scripts/run-tests.mjs'), 'utf8');
 const staleGuardSource = readFileSync(join(root, 'scripts/stale-dist-guard.mjs'), 'utf8');
 const harnessRelative = 'tests/packaging/windows-release-gates.test.mjs';
-function callerFixture(mode) {
+function callerFixture(mode, symlinked = false) {
   const directory = mkdtempSync(join(admin, 'caller fixture '));
   const put = (path, source) => {
     mkdirSync(dirname(join(directory, path)), { recursive: true });
@@ -465,8 +465,15 @@ function callerFixture(mode) {
   if (mode === 'stale-helper') put('dist/tests/orphan.js', '// synthetic stale helper\n');
   if (mode !== 'missing-harness') put(harnessRelative, checks + `console.log('CALLER_SOURCE_SENTINEL');\nprocess.exit(${mode === 'sentinel-fail' ? 9 : 0});\n`);
   put('tests/packaging/unselected.test.mjs', "console.log('CALLER_UNSELECTED_MJS'); process.exit(99);\n");
+  if (symlinked) {
+    const alias = `${directory} symlink`;
+    symlinkSync(realpathSync(directory), alias);
+    assert.notEqual(alias, realpathSync(alias), 'regression must exercise a distinct symlink spelling');
+    return alias;
+  }
   return directory;
 }
+for (const symlinked of [false, true]) {
 for (const [mode, expected, compiled, sentinel, diagnostic] of [
   ['pass', 0, true, true],
   ['sentinel-fail', 1, true, true, /POSIX control harness failed with exit status: 1/],
@@ -476,13 +483,14 @@ for (const [mode, expected, compiled, sentinel, diagnostic] of [
   ['missing-dist', 1, false, false, /Failed to enumerate compiled tests/],
   ['stale-test', 1, false, false, /stale compiled test: dist\/tests\/control.test.js/],
   ['stale-helper', 1, false, false, /stale compiled helper: dist\/tests\/orphan.js/],
-]) acceptance(`caller actual subprocess: ${mode}`, 'caller-actual', () => {
-  const directory = callerFixture(mode);
+]) acceptance(`caller actual subprocess: ${mode}${symlinked ? ' through symlink' : ''}`, 'caller-actual', () => {
+  const directory = callerFixture(mode, symlinked);
   const argv = ['scripts/run-tests.mjs'];
   const env = { PATH: '', TMPDIR: directory, CALLER_ENV: 'inherited',
-    CALLER_EXPECTED_CWD: directory, CALLER_EXPECTED_NODE: process.execPath };
+    // Node resolves the runner's ESM root and cwd through symlinked temporary paths.
+    CALLER_EXPECTED_CWD: realpathSync(directory), CALLER_EXPECTED_NODE: process.execPath };
   const result = spawnSync(process.execPath, argv, { cwd: directory, env, encoding: 'utf8', timeout });
-  invocations.push({ kind: 'caller-actual', label: mode, executable: process.execPath, argv,
+  invocations.push({ kind: 'caller-actual', label: mode, symlinked, executable: process.execPath, argv,
     cwd: directory, env, timeout, exit: result.status, signal: result.signal,
     error: result.error?.message, stdout: result.stdout, stderr: result.stderr, runnerSha256: sha(callerSource) });
   assert.ifError(result.error);
@@ -494,6 +502,7 @@ for (const [mode, expected, compiled, sentinel, diagnostic] of [
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_COMPILED_CONTROL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (diagnostic) assert.match(result.stderr, diagnostic);
 });
+}
 
 // The test-only subprocess links exact, unmodified runner ESM to builtin mocks.
 // No source rewriting and no claim that a mocked platform ran natively.
