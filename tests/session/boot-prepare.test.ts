@@ -102,6 +102,7 @@ function hermeticEnv(home: string): Record<string, string> {
   const root = dirname(home);
   return {
     AIGENTRY_HOME: home,
+    AIGENTRY_GEMINI_BINARY: "gemini", // pins the original Gemini CLI shadow-home tests
     HOME: join(root, "fakehome"),
     PATH: `${join(root, "shimbin")}:${process.env["PATH"] ?? ""}`,
   };

@@ -348,4 +348,44 @@ grep -qF -- "/api/sessions/$SID" "$G_OUT" \
 grep -q 'x-telepty-token' "$G_OUT" \
   && fail "G: --dry-run printed the credential header: $(cat "$G_OUT")"
 
-echo "T134 PASS blocks=A-G modes=--help/-h/--dry-run/unknown kills=0 deletes=0 execs=0"
+# H) #1131: CLI selection crosses the shim unchanged; dry-run stays inert.
+for cli in default claude codex; do
+  reset; loaded_ps_table; stale_listing
+  H_OUT="$T_TMP/h.out"
+  if [ "$cli" = default ]; then
+    (unset ORCHESTRATOR_CLI; PATH="$EXEC_DIR:$PATH" bash "$BOOT" --dry-run) >"$H_OUT"
+  else
+    ORCHESTRATOR_CLI="$cli" PATH="$EXEC_DIR:$PATH" bash "$BOOT" --dry-run >"$H_OUT"
+  fi
+  expected="$T_TMP/expected"
+  printf '[would-exec] %s\n' telepty allow --id "$SID" --auto-restart >"$expected"
+  if [ "$cli" = codex ]; then
+    printf '[would-exec] %s\n' codex resume --last --dangerously-bypass-approvals-and-sandbox >>"$expected"
+  else
+    printf '[would-exec] %s\n' claude --dangerously-skip-permissions --continue >>"$expected"
+  fi
+  grep '^\[would-exec\]' "$H_OUT" >"$T_TMP/actual"
+  diff -u "$expected" "$T_TMP/actual" || fail "H/$cli: argv mismatch"
+  assert_no_side_effects "H/$cli"
+  echo "T134 H/$cli PASS"
+done
+
+# I) Invalid selectors refuse before even reading the daemon/process table.
+for cli in unknown "$(printf 'codex\nextra')"; do
+  reset; loaded_ps_table; stale_listing
+  i_rc=0
+  ORCHESTRATOR_CLI="$cli" PATH="$EXEC_DIR:$PATH" bash "$BOOT" --dry-run >"$T_TMP/i.out" 2>"$T_TMP/i.err" || i_rc=$?
+  [ "$i_rc" = 2 ] || fail "I: invalid CLI must exit 2, got $i_rc"
+  [ ! -s "$T_TMP/i.out" ] || fail "I: refusal emitted stdout"
+  grep -qF 'ORCHESTRATOR_CLI' "$T_TMP/i.err" || fail "I: missing selector diagnostic"
+  grep -qF 'Usage:' "$T_TMP/i.err" || fail "I: missing usage"
+  [ "$(lines "$PS_ARGV")" = 0 ] || fail "I: refusal read processes"
+  [ "$(lines "$TELEPTY_ARGV")" = 0 ] || fail "I: refusal read registry"
+  assert_no_side_effects "I"
+done
+ORCHESTRATOR_CLI=codex bash "$BOOT" --help >"$T_TMP/cli-help"
+grep -qF 'ORCHESTRATOR_CLI' "$T_TMP/cli-help" || fail "I: help omits CLI selector"
+grep -qF 'inherits cwd' "$T_TMP/cli-help" || fail "I: help omits cwd contract"
+echo "T134 I PASS"
+
+echo "T134 PASS blocks=A-I modes=--help/-h/--dry-run/unknown kills=0 deletes=0 execs=0"

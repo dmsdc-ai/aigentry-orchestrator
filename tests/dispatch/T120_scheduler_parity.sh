@@ -270,8 +270,8 @@ assert r["source"] == "explicit-request", r
 PY
 
 # --- E) tick: the four arms, and what happens to the record in each ----------------
-# The record is dropped when the cleanup child FAILS as well as when it succeeds — the
-# scheduler is a fallback, and a retry loop here would be a second policy engine.
+# A successful cleanup removes its obligation; a failed cleanup retains it for a
+# subsequent tick to retry (task974 failure-retention policy).
 : > "$CLEANUP_LOG"
 export SCHEDULER_NOW="2026-05-23T12:00:30Z"
 run tick
@@ -289,7 +289,7 @@ cleanup sid-4" ] || fail "E: cleanup child argv/order changed:
 $(cat "$CLEANUP_LOG")"
 [ "$(python3 -c "import json;print(len(json.load(open('$PENDING'))))")" = 0 ] \
   || fail "E: the queue was not drained: $(cat "$PENDING")"
-# A cleanup that exits non-zero: announced on STDOUT, counted as fired, record gone.
+# A cleanup that exits non-zero: announced on STDOUT, counted as fired, record retained.
 : > "$CLEANUP_LOG"
 export SCHEDULER_NOW="2026-05-23T13:00:00Z"
 run schedule sid-F1 --grace-seconds 0
@@ -298,15 +298,15 @@ FAKE_RC=9 run tick
 printf '%s\n' "$OUT" | grep -qxF '[scheduler] cleanup non-zero for sid-F1' \
   || fail "E: a failing cleanup was not announced: '$OUT'"
 printf '%s\n' "$OUT" | grep -qxF '[scheduler] tick fired=1' || fail "E: a failing cleanup was not counted"
-[ "$(python3 -c "import json;print(len(json.load(open('$PENDING'))))")" = 0 ] \
-  || fail "E: a failing cleanup left the record pending — the fallback would retry forever"
-# The child missing entirely: STDERR, still counted, record still dropped.
+[ "$(python3 -c "import json;print(len(json.load(open('$PENDING'))))")" = 1 ] \
+  || fail "E: a failing cleanup did not retain its pending obligation"
+# The child missing entirely: STDERR; retained sid-F1 and new sid-F2 both count.
 run schedule sid-F2 --grace-seconds 0
 SESSION_CLEANUP_SH="$T_TMP/does-not-exist" run tick
 [ "$RC" -eq 0 ] || fail "E: a missing cleanup child made the tick exit $RC, want 0"
 printf '%s\n' "$ERRTXT" | grep -qF "[scheduler] session-cleanup.sh not executable at $T_TMP/does-not-exist" \
   || fail "E: the missing-child diagnostic changed (and it must be on stderr): '$ERRTXT'"
-printf '%s\n' "$OUT" | grep -qxF '[scheduler] tick fired=1' || fail "E: a missing child was not counted as fired"
+printf '%s\n' "$OUT" | grep -qxF '[scheduler] tick fired=2' || fail "E: a missing child was not counted as fired"
 # An unparseable scheduled_cleanup_time is SKIPPED and the record KEPT (python's
 # `except Exception: continue`) — a record that cannot be judged is never fired.
 printf '%s\n' '[{"sid":"sid-BAD","report_time":"x","scheduled_cleanup_time":"not-a-time","source":"s"}]' > "$PENDING"

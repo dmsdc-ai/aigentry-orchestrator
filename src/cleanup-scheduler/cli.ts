@@ -70,6 +70,7 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 
 import { USAGE } from "./usage.js";
 
@@ -307,36 +308,63 @@ function cmdTick(): void {
   const now = nowIso();
   const ndt = parseStamp(now);
   if (!ndt) die(`tick: cannot parse now '${now}'`, 1);
-  // The due set is a SNAPSHOT taken before the first cleanup runs, as the shell's
-  // tmpfile was; each fired sid is then dropped by its own read-modify-write, so a
-  // crash mid-tick leaves the already-cleaned sids dropped and the rest pending.
-  const due: string[] = [];
-  readPending("tick").forEach((p, i) => {
-    const sdt = parseStamp(typeof p.scheduled_cleanup_time === "string" ? p.scheduled_cleanup_time : "");
-    if (!sdt) return; // python's `except Exception: continue` — the record is kept
-    if (ndt.ms < sdt.ms) return;
-    // `print(p["sid"])` was a KeyError here: a due record with no sid aborted the
-    // tick and touched nothing. Kept loud rather than skipped silently — a queue
-    // this file did not write is state corruption, and a tick that quietly steps
-    // over it would hide that forever.
-    if (typeof p.sid !== "string") {
-      die(`tick: ${PENDING_JSON} record ${i} is due and has no sid — refusing to run`, 1);
+  // Tick refuses the entire corrupt queue, including records that are not due.
+  // Other verbs retain their existing readPending compatibility behavior.
+  const readQueue = (): (Rec & { sid: string })[] => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(fs.readFileSync(PENDING_JSON, "utf8"));
+    } catch {
+      die(`tick: cannot read valid JSON from ${PENDING_JSON} — refusing to run`, 1);
     }
-    due.push(p.sid);
-  });
+    if (!Array.isArray(parsed)) {
+      die(`tick: ${PENDING_JSON} is not a JSON array — refusing to run`, 1);
+    }
+    const seen = new Set<string>();
+    for (const [i, p] of parsed.entries()) {
+      if (p === null || typeof p !== "object" || Array.isArray(p) ||
+          typeof p.sid !== "string" || p.sid.length === 0 || seen.has(p.sid)) {
+        die(`tick: ${PENDING_JSON} record ${i} is invalid or has a duplicate sid — refusing to run`, 1);
+      }
+      seen.add(p.sid);
+    }
+    return parsed as (Rec & { sid: string })[];
+  };
+  const isDue = (p: Rec): boolean => {
+    const sdt = parseStamp(typeof p.scheduled_cleanup_time === "string" ? p.scheduled_cleanup_time : "");
+    return sdt !== null && ndt.ms >= sdt.ms;
+  };
+  const due = readQueue().filter(isDue);
   let fired = 0;
-  for (const sid of due) {
-    if (sid === "") continue;
+  for (const obligation of due) {
+    const { sid } = obligation;
+    const current = readQueue().find((p) => p.sid === sid);
+    if (!current || !isDeepStrictEqual(current, obligation) || !isDue(current)) continue;
+    if (isKeepAlive(sid)) {
+      console.log(`[scheduler] keep_alive=true for ${sid} — skipping Layer D cleanup`);
+      continue;
+    }
+    fired += 1;
     if (executable(SESSION_CLEANUP_SH)) {
       const r = spawnSync(SESSION_CLEANUP_SH, [sid], { stdio: "inherit" });
-      if (r.error || (r.status ?? 1) !== 0) console.log(`[scheduler] cleanup non-zero for ${sid}`);
+      if (r.error || r.signal || r.status !== 0) {
+        console.log(`[scheduler] cleanup non-zero for ${sid}`);
+        console.error(`[scheduler] retaining cleanup for ${sid} for retry (error=${r.error?.message ?? "none"}, signal=${r.signal ?? "none"}, status=${r.status})`);
+        continue;
+      }
     } else {
       console.error(`[scheduler] session-cleanup.sh not executable at ${SESSION_CLEANUP_SH}`);
+      console.error(`[scheduler] retaining cleanup for ${sid} for retry`);
+      continue;
     }
-    // `cmd_cancel "$sid" >/dev/null`: re-read, drop, rewrite — one write per fired
-    // sid, and the record goes even when the cleanup did not.
-    writePending(readPending("tick").filter((p) => p.sid !== sid));
-    fired += 1;
+    // A successful helper retires only its unchanged obligation. This comparison
+    // does not fence identical replacements or concurrent independent writers.
+    const pending = readQueue();
+    const index = pending.findIndex((p) => isDeepStrictEqual(p, obligation));
+    if (index !== -1) {
+      pending.splice(index, 1);
+      writePending(pending);
+    }
   }
   console.log(`[scheduler] tick fired=${fired}`);
 }

@@ -177,17 +177,7 @@ jobs:
           RC=$?
           set -e
           cat "${RUNNER_TEMP}/persistence.log"
-          read_count() {
-            awk -v key="$1" '
-              { sub(/\r$/, "") }
-              $0 ~ ("^# " key "([[:space:]]|$)") {
-                records++
-                if ($0 !~ ("^# " key " [0-9]+$")) malformed = 1
-                else count = $3
-              }
-              END { if (records == 1 && !malformed) print count }
-            ' "${RUNNER_TEMP}/persistence.log"
-          }
+          read_count() { grep -E "^# $1 " "${RUNNER_TEMP}/persistence.log" | tail -1 | awk '{print $3}'; }
           PASS="$(read_count pass)"; FAIL="$(read_count fail)"; SKIP="$(read_count skipped)"
           # Refuse to assert on numbers we could not read — an empty string compares equal
           # to nothing and would let this pass vacuously.
