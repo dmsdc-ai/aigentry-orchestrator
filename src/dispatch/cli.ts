@@ -13,6 +13,7 @@
 // `python3 -c` computations (hashing, clock, JSON shaping) became TS: they were
 // the shell-dialect fragility this tranche exists to remove, not a component.
 import { spawn, spawnSync } from "node:child_process";
+import crossSpawn from "cross-spawn";
 import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -53,7 +54,7 @@ function isExecutable(p: string): boolean {
 
 /** stdout+status, stderr swallowed — the shell's `$(cmd 2>/dev/null || true)`. */
 function capture(cmd: string, args: string[], extraEnv?: NodeJS.ProcessEnv): { status: number; stdout: string } {
-  const r = spawnSync(cmd, args, {
+  const r = (process.platform === "win32" ? crossSpawn.sync : spawnSync)(cmd, args, {
     encoding: "utf8",
     env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
   });
@@ -63,21 +64,21 @@ function capture(cmd: string, args: string[], extraEnv?: NodeJS.ProcessEnv): { s
 
 /** stdout captured, stderr inherited — the shell's plain `out=$(cmd)`. */
 function captureOut(cmd: string, args: string[], extraEnv?: NodeJS.ProcessEnv): { status: number; stdout: string } {
-  const r = spawnSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], env: { ...env, ...extraEnv } });
+  const r = (process.platform === "win32" ? crossSpawn.sync : spawnSync)(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], env: { ...env, ...extraEnv } });
   if (r.error) return { status: 127, stdout: "" };
   return { status: r.status ?? 1, stdout: r.stdout ?? "" };
 }
 
 /** stdout+stderr both captured — the shell's `out=$(cmd 2>&1)`. */
 function captureBoth(cmd: string, args: string[]): { status: number; output: string } {
-  const r = spawnSync(cmd, args, { encoding: "utf8" });
+  const r = (process.platform === "win32" ? crossSpawn.sync : spawnSync)(cmd, args, { encoding: "utf8" });
   if (r.error) return { status: 127, output: String(r.error.message ?? "") };
   return { status: r.status ?? 1, output: (r.stdout ?? "") + (r.stderr ?? "") };
 }
 
 /** Fully inherited stdio — the shell's bare `cmd`. */
 function run(cmd: string, args: string[], extraEnv?: NodeJS.ProcessEnv): number {
-  const r = spawnSync(cmd, args, {
+  const r = (process.platform === "win32" ? crossSpawn.sync : spawnSync)(cmd, args, {
     stdio: "inherit",
     env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
   });
@@ -102,7 +103,7 @@ function nowMs(): number {
 function emitTelemetry(args: string[]): void {
   if (!isExecutable(EMIT_TELEMETRY_MJS)) return;
   try {
-    spawnSync(EMIT_TELEMETRY_MJS, args, { stdio: "ignore" });
+    (process.platform === "win32" ? crossSpawn.sync : spawnSync)(EMIT_TELEMETRY_MJS, args, { stdio: "ignore" });
   } catch {
     /* swallowed, exactly as `|| true` did */
   }
@@ -740,8 +741,8 @@ function inject(o: Opts, d: Delivery, sid: string): Promise<number> {
   a.push(sid);
   return new Promise((resolve) => {
     let out = "";
-    const child = spawn(TELEPTY, a, { stdio: ["inherit", "pipe", "inherit"] });
-    child.stdout.on("data", (chunk: Buffer) => {
+    const child = (process.platform === "win32" ? crossSpawn : spawn)(TELEPTY, a, { stdio: ["inherit", "pipe", "inherit"] });
+    child.stdout!.on("data", (chunk: Buffer) => {
       out += chunk.toString();
       process.stdout.write(chunk);
     });
@@ -955,7 +956,7 @@ function spawnWorkspace(o: Opts, sid: string): void {
   }
   // Empty --extra-flags so open-session.sh's claude-default flags do NOT apply
   // (we control the full argv via the launcher).
-  const r = spawnSync(
+  const r = (process.platform === "win32" ? crossSpawn.sync : spawnSync)(
     OPEN_SESSION_SH,
     ["--track", o.track, "--name", o.name, "--cwd", spawnCwd, "--cli", launcher, "--extra-flags", " "],
     { stdio: ["inherit", "ignore", "inherit"], env: childEnv },
