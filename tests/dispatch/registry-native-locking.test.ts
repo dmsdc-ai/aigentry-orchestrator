@@ -195,7 +195,14 @@ test('native holder enforces the 10 second acquisition deadline', async t => {
   assert.match(JSON.parse(result.stdout).detail, /lock timeout after 10(?:\.0)?s/);
   assert.ok(elapsed >= 9800 && elapsed < 14500, `deadline elapsed ${elapsed}ms`);
   assert.equal(held.child.exitCode, null);
+  assert.equal(held.child.signalCode, null);
+  assert.equal(held.child.killed, false);
+  process.kill(held.child.pid!, 0);
   t.diagnostic(`native contention elapsed_ms=${elapsed.toFixed(0)}`);
+  held.child.stdin.end('release\n');
+  const released = await held.done;
+  assert.equal(released.status, 0, released.stderr);
+  assert.equal(released.signal, null);
   stable(f, Buffer.alloc(0), ino, before);
 });
 
