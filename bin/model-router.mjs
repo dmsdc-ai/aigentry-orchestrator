@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // ponytail: one classifier call, no cache; expected ~1–3 s per dispatch, 15 s ceiling.
 import { spawnSync } from "node:child_process";
+import crossSpawn from "cross-spawn";
 import { closeSync, openSync, readFileSync, readSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -72,7 +73,8 @@ if (!failure && args["--ref"]) {
     // no tools/MCP and no thinking → 6–9 s. Thinking/effort are overridden in this child's env only.
     const childEnv = { ...process.env, MAX_THINKING_TOKENS: "0" };
     delete childEnv.CLAUDE_EFFORT;
-    const result = spawnSync(classifier || "claude", classifier ? [] : [
+    const classifierSpawnSync = process.platform === "win32" ? crossSpawn.sync : spawnSync;
+    const result = classifierSpawnSync(classifier || "claude", classifier ? [] : [
       "-p", "--model", "claude-haiku-4-5-20251001", "--output-format", "json", "--max-turns", "1",
       "--system-prompt", "You are a model router. Reply with exactly one JSON object and nothing else: no prose, no markdown fence.",
       "--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',

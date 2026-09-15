@@ -17,9 +17,11 @@
   "dependencies": {
     "@dmsdc-ai/aigentry-logger": "^0.2.0",
     "@dmsdc-ai/aigentry-ssot": "^1.0.0",
-    "@dmsdc-ai/aigentry-telepty": "^0.8.0"
+    "@dmsdc-ai/aigentry-telepty": "^0.8.0",
+    "cross-spawn": "7.0.6"
   },
   "devDependencies": {
+    "@types/cross-spawn": "6.0.6",
     "@types/node": "^20.11.0",
     "typescript": "^5.4.0"
   },

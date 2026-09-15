@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 
 export const REPO = resolve(import.meta.dirname, "../../..");
 export const PROFILE = join(REPO, "tests/dispatch/fixtures/model-routing-profile.md");
@@ -53,8 +53,18 @@ require('node:fs').writeFileSync(process.env.OPEN_LOG, JSON.stringify({args: pro
   // #1109: hermetic — the operator's ambient AIGENTRY_* knobs (CLI_CAP_*, *_MODEL, *_EFFORT, WORKSPACE_HOST, ...)
   // must never reach the child; everything the fixture needs is declared below, and `overrides` still win.
   const ambient = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("AIGENTRY_")));
+  let fixturePath = `${bin}:${process.env.PATH}`;
+  if (process.platform === "win32") {
+    const inheritedPath = Object.entries(ambient).find(([key]) => key.toUpperCase() === "PATH")?.[1];
+    const inheritedPathExt = Object.entries(ambient).find(([key]) => key.toUpperCase() === "PATHEXT")?.[1];
+    for (const key of Object.keys(ambient)) {
+      if (key.toUpperCase() === "PATH" || key.toUpperCase() === "PATHEXT") delete ambient[key];
+    }
+    fixturePath = [bin, dirname(process.execPath), inheritedPath ?? ""].join(delimiter);
+    ambient.PATHEXT = `;${inheritedPathExt || ".EXE;.CMD;.BAT;.COM"}`;
+  }
   const env: NodeJS.ProcessEnv = { ...ambient, HOME: home, AIGENTRY_HOME: aig,
-    PATH: `${bin}:${process.env.PATH}`, TELEPTY: telepty, OPEN_SESSION_SH: open, SESSION_PROBE_PY: probe,
+    PATH: fixturePath, TELEPTY: telepty, OPEN_SESSION_SH: open, SESSION_PROBE_PY: probe,
     EMIT_TELEMETRY_MJS: telemetry, AIGENTRY_TASK_QUEUE: queue, AIGENTRY_TASK_GATE: "hard",
     AIGENTRY_SESSIONS_ROOT: join(aig, "sessions"), DISPATCH_STATE_DIR: join(root, "state"),
     AIGENTRY_GIT_HOOKS_DIR: join(root, "hooks"), AIGENTRY_GIT_HOOK_SOURCE_DIR: join(REPO, "git-hooks"),
