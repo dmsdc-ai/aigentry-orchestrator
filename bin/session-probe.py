@@ -18,9 +18,16 @@ BRAILLE = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
 BANNERS = {
     "claude": r"Welcome back|Tips for getting started|Trust this folder|Do you want to enable|Press Enter to continue",
     "codex": r"Welcome to .*Codex|OpenAI Codex CLI|Loading\u2026|Initializing",
-    "gemini": r"Welcome to Gemini|Loading model|Initializing|Authenticating",
+    # #1090: the `gemini` kind is also agy (Antigravity CLI, geminiBinary()). Its
+    # welcome header is "Antigravity CLI 1.1.27" (transiently "Welcome to the
+    # Antigravity CLI"), its boot shows "Accessing workspace: <cwd>", and its
+    # folder-trust modal asks "Do you trust the contents of this project?".
+    "gemini": r"Welcome to Gemini|Loading model|Initializing|Authenticating|Antigravity CLI|Accessing workspace|Do you trust the contents of this project",
 }
-PROMPTS = {"claude": r"\u276f", "codex": r"\u203a", "gemini": r"\u203a|\u2502 >"}
+# #1090: agy's idle prompt is a bare `>` line framed by two horizontal rules
+# (measured live, 1.1.27): "────…\n>\n────…". Anchor on rule+`>` so a quoted
+# `> text` inside a reply never reads as the prompt.
+PROMPTS = {"claude": r"\u276f", "codex": r"\u203a", "gemini": r"\u203a|\u2502 >|\u2500{8,}\n>"}
 HARD_NEG = r"Working\.\.\.|Thinking|esc to interrupt|Press Enter to continue|Do you trust"
 # #557: codex's `\u203a` REPL is interactive WHILE its MCP servers boot, but the
 # "Starting MCP servers (n/6) \u2026 (esc to interrupt)" status line trips HARD_NEG via
@@ -29,8 +36,26 @@ HARD_NEG = r"Working\.\.\.|Thinking|esc to interrupt|Press Enter to continue|Do 
 CODEX_MCP_BOOT = r"Starting MCP servers?\s*\(\d+/\d+\)"
 
 TRUST_MODAL = r"trust this folder|do you trust|Yes, (proceed|I trust)|Press Enter to continue"
-SANDBOX_PROMPT = r"Allow command\?|sandbox.*approv|approve this command|Do you want to (run|allow)"
-API_ERROR = r"API Error|api error|status 400|overloaded_error|rate.?limit|529|ECONNREFUSED|ETIMEDOUT"
+# #1091: `sandbox.*approv` was BOTH too loose and too narrow, measured today.
+# Too loose: telepty renders grok's TUI as ONE line, so the role-sandbox cwd header and
+# the "always-approve" footer of an IDLE grok sat on the same line and matched -> the
+# reconciler answered a sandbox prompt that was not there (policy SEND_KEY enter).
+# Too narrow: the REAL codex 0.153.4 approval modal (captured live into
+# tests/dispatch/fixtures/codex_sandbox_prompt.txt) contains no "sandbox…approv" text at
+# all -- it asks "Would you like to run the following command?" over a numbered option
+# list -- so the arm that existed for codex never actually matched codex. Both arms are
+# now the strings codex prints; the pre-existing legacy alternatives are untouched.
+SANDBOX_PROMPT = (
+    r"Allow command\?|approve this command|Do you want to (run|allow)"
+    r"|Would you like to run the following command\?"
+    r"|Yes, and don't ask again for commands that start with"
+)
+ERROR_PREFIX = r"^(?:[✖✘×⚠!]\ufe0f?[ \t]*)?"
+API_DIAGNOSTIC = ERROR_PREFIX + r"API Error:[ \t]*\S"
+API_ERROR = (
+    rf"(?:{API_DIAGNOSTIC}|"
+    rf"{ERROR_PREFIX}Connection failed:[ \t]*(?:ECONNREFUSED|ETIMEDOUT)\b)"
+)
 # #909: the one API-error surface with a KNOWN, self-healing remedy. Measured
 # verbatim from three cut turns on 2026-08-16: "API Error: Your computer went to
 # sleep mid-response. The response above may be incomplete." It is matched (and
@@ -44,7 +69,28 @@ THINKING_BLOCK = r"thinking.*block|invalid_request_error"
 CRASH = r"panic:|Traceback \(most recent|Segmentation fault|core dumped"
 UNSUBMITTED = r"\[context-ref\]|/shared/[0-9a-f]{6,}\.md"
 WORKING = r"esc to interrupt|Working\s*\(|Working\.\.\.|[\u2722\u2733\u2736\u273b\u273d]|\u23fa|\u27f3|Thinking|Compacting|Esc to interrupt"
-TRACKER_ERR = r"error:|traceback|panic:|command not found|killed:|exited [0-9]+"
+# #1091: the ten BRAILLE cells above are the dots-spinner FRAMES, but a bare membership
+# test (`any(ch in tail for ch in BRAILLE)`) also matched grok's braille LOGO ART -- its
+# welcome box draws the xAI mark in braille, and with grok's whole TUI on one line the art
+# never scrolls out of the tail. An IDLE grok therefore read as surface=working /
+# tracker_class=active (verify_started false). A spinner is ONE isolated cell used as a
+# leading glyph before text; logo art is runs of ADJACENT cells. Measured against
+# grok_idle_settled.txt (art only -> no match) and active.txt / postinject_ok.txt /
+# codex-init-spinner.screen (real frames -> match).
+SPINNER = re.compile(rf"(?<![\u2800-\u28ff])[{BRAILLE}](?![\u2800-\u28ff])\s+\S")
+
+
+def has_spinner(text: str) -> bool:
+    """One shared reader for the braille spinner: classify_surface and tracker_class
+    disagreeing about what a spinner is was how the same screen read both idle and
+    active."""
+    return SPINNER.search(text) is not None
+
+
+TRACKER_ERR = (
+    rf"(?:{API_DIAGNOSTIC}|"
+    r"^(?:error:|traceback|panic:|command not found|killed:|exited [0-9]+))"
+)
 TRACKER_WELCOME = r"Welcome back|Tips for getting started|Trust this folder|Press Enter to continue"
 TRACKER_ACTIVE_TEXT = r"\(esc to interrupt\)|thinking with xhigh effort|\u23f5\s*\d+s"
 SAFE_SID = re.compile(r"^[A-Za-z0-9_.:@-]{1,160}$")
@@ -111,9 +157,76 @@ def tail(lines: list[str], count: int) -> str:
     return "\n".join(lines[-count:])
 
 
+def error_banner_lines(screen: str) -> list[str]:
+    """Share eligible error lines between the API and legacy tracker readers.
+
+    Text alone cannot authenticate an unmarked copy of a provider banner.
+    Keep fence context from the whole capture, but match only its current tail.
+    """
+    plain = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", screen)
+    plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", plain)
+    lines = nonempty_lines(plain)
+    fence = ""
+    eligible = []
+    for index, line in enumerate(lines):
+        stripped = line.lstrip(" \t")
+        marker = re.match(r"(`{3,}|~{3,})", stripped)
+        if fence:
+            if marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence):
+                if not stripped[len(marker[1]):].strip():
+                    fence = ""
+            continue
+        if marker:
+            fence = marker[1]
+            continue
+        # Indented code is ineligible; readers anchor their recognized prefixes.
+        if line.expandtabs(4).startswith("    "):
+            continue
+        if index >= len(lines) - 20:
+            eligible.append(stripped)
+    return eligible
+
+
+def has_api_error(screen: str) -> bool:
+    return any(re.match(API_ERROR, line, re.I) for line in error_banner_lines(screen))
+
+
+def cli_kind_of(command: str) -> str:
+    """The kind behind a guard-launcher path, mirroring cliKindOf in src/dispatch/cli.ts.
+
+    #1091: dispatch passes --cli (since #1084) but dispatch-verify.sh and the reconciler do
+    not, and `info.command` for a worker is the guard launcher's PATH -- which names no CLI,
+    so every worker read as claude once its welcome header scrolled off. The launcher's own
+    `exec -a <kind>` line is the answer and is written by bin/boot-prepare.mjs. This is the
+    one-line read, not a port of the module.
+    """
+    base = os.path.basename(command)
+    if base in ("claude", "codex", "grok", "gemini"):
+        return base
+    if base == "agy":
+        return "gemini"
+    # Only ever a launcher script, and only its head: this path comes from the daemon, so it
+    # is read as data with a bounded size and never executed.
+    if not command.endswith(".sh") or not os.path.isfile(command):
+        return ""
+    try:
+        with open(command, encoding="utf-8", errors="replace") as handle:
+            head = handle.read(4096)
+    except OSError:
+        return ""
+    match = re.search(r"^exec -a (\S+)", head, re.M)
+    kind = match.group(1) if match else ""
+    return "gemini" if kind == "agy" else kind
+
+
 def cli_from_info_or_screen(info: dict[str, Any], screen: str, override: str = "") -> str:
     if override:
         return override
+    # The launcher read comes FIRST: a sid can carry a CLI name (this task's own session is
+    # "mr1091-mr1091-grok-agy"), and that sid is inside info.command's path.
+    launcher_kind = cli_kind_of(str(info.get("command") or ""))
+    if launcher_kind:
+        return launcher_kind
     raw = " ".join(
         str(v or "")
         for v in (
@@ -131,7 +244,7 @@ def cli_from_info_or_screen(info: dict[str, Any], screen: str, override: str = "
         return "claude"
     if re.search(r"OpenAI Codex CLI|Welcome to .*Codex", screen, re.I):
         return "codex"
-    if re.search(r"Welcome to Gemini", screen, re.I):
+    if re.search(r"Welcome to Gemini|Antigravity CLI", screen, re.I):
         return "gemini"
     return "claude"
 
@@ -142,7 +255,7 @@ def tracker_class(screen: str) -> str:
         return "blank"
     tail20 = tail(lines, 20)
     last3 = tail(lines, 3)
-    if re.search(TRACKER_ERR, tail20, re.I):
+    if any(re.match(TRACKER_ERR, line, re.I) for line in error_banner_lines(screen)):
         return "error"
     welcome_in_tail = re.search(TRACKER_WELCOME, tail20, re.I)
     prompt_in_last3 = (
@@ -153,7 +266,7 @@ def tracker_class(screen: str) -> str:
     placeholder = re.search(r'[\u276f\u203a]\s+Try "[^"]+"', last3)
     if welcome_in_tail and (placeholder or prompt_in_last3):
         return "welcome"
-    if any(ch in tail20 for ch in BRAILLE) or re.search(TRACKER_ACTIVE_TEXT, tail20, re.I):
+    if has_spinner(tail20) or re.search(TRACKER_ACTIVE_TEXT, tail20, re.I):
         return "active"
     if prompt_in_last3:
         # telepty#60 Stage A: a prompt-like surface is an OBSERVATION. The old
@@ -210,7 +323,7 @@ def classify_surface(cli: str, screen: str) -> tuple[str, str]:
         return "crash", "crash / traceback"
     if re.search(SLEEP_CUT, tail20, re.I):
         return "sleep_cut", "host slept mid-response (resumable)"
-    if re.search(API_ERROR, tail20, re.I):
+    if has_api_error(screen):
         return "error", "API/transport error banner"
     if re.search(r"(\$|%|\u279c)\s*$", tail20) and not re.search(
         r"esc to interrupt|Working|\u276f|\u203a|\u273b|Esc to", tail20, re.I
@@ -218,7 +331,7 @@ def classify_surface(cli: str, screen: str) -> tuple[str, str]:
         return "raw_shell", "raw shell prompt at tail"
     if re.search(UNSUBMITTED, last4):
         return "unsubmitted", "context-ref still at live prompt"
-    if re.search(WORKING, tail20, re.I) or any(ch in tail20 for ch in BRAILLE):
+    if re.search(WORKING, tail20, re.I) or has_spinner(tail20):
         return "working", "working token"
 
     banner = BANNERS.get(cli, r"Welcome|Initializing|Loading|Tips for getting started")
