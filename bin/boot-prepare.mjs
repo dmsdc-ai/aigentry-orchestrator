@@ -71,8 +71,8 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname, join, posix, resolve, sep, win32 } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, "..");
@@ -296,9 +296,8 @@ async function buildShadowHome(homeReal, homeShadow, exclude) {
   }
 }
 
-// TOML basic-string quoting for a `[projects."<path>"]` key. Paths are absolute
-// POSIX (assertCwdSafe-validated) so backslash/quote are not expected, but escape
-// the two basic-string metachars defensively to keep emitted TOML valid.
+// TOML basic-string quoting for a `[projects."<path>"]` key. Escape backslashes
+// and quotes in native absolute paths to keep emitted TOML valid.
 function tomlBasicString(s) {
   return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
@@ -440,8 +439,18 @@ function assertSidSafe(sid) {
 }
 
 function assertCwdSafe(cwd) {
-  // Allow only absolute POSIX paths. Rejects `..`, relative paths, NUL.
-  if (cwd.length === 0 || cwd[0] !== "/" || cwd.includes("\0") || /(^|\/)\.\.(\/|$)/.test(cwd)) {
+  // Classify native absolute paths without normalizing away raw traversal.
+  const windows = process.platform === "win32";
+  const path = windows ? win32 : posix;
+  const classified = windows ? cwd.replace(/\//g, "\\") : cwd;
+  const root = path.parse(classified).root;
+  const namespace = windows && /^\\{1,2}(?:\?{1,2}|\.)\\/.test(classified);
+  const completeRoot = windows
+    ? /^[A-Za-z]:\\$/.test(root) || /^\\\\[^\\]+\\[^\\]+\\?$/.test(root)
+    : root === "/";
+  const traversal = windows ? /(^|[\\/])\.\.([\\/]|$)/ : /(^|\/)\.\.(\/|$)/;
+  if (cwd.length === 0 || cwd.includes("\0") || traversal.test(cwd) ||
+      namespace || !path.isAbsolute(classified) || !completeRoot) {
     die(`--cwd must be an absolute path without '..' segments: ${JSON.stringify(cwd)}`, 4);
   }
 }
@@ -479,13 +488,13 @@ async function main() {
   }
 
   const { resolveInstructions } = await import(
-    join(REPO_ROOT, "dist/src/session/resolve-instructions.js")
+    pathToFileURL(join(REPO_ROOT, "dist/src/session/resolve-instructions.js")).href
   );
   const { getBootAdapter, geminiBinary, nodeBootFs, nodeSpawner } = await import(
-    join(REPO_ROOT, "dist/src/session/boot-adapter/index.js")
+    pathToFileURL(join(REPO_ROOT, "dist/src/session/boot-adapter/index.js")).href
   );
   const { isRole } = await import(
-    join(REPO_ROOT, "dist/src/session/types.js")
+    pathToFileURL(join(REPO_ROOT, "dist/src/session/types.js")).href
   );
 
   if (!isRole(args.role)) die(`unknown role: ${args.role}`, 4);
