@@ -116,7 +116,7 @@ export async function startServer(config: Readonly<ServerConfig>) {
       server.removeListener('error', reject);
       const address = server.address();
       if (!address || typeof address === 'string') { reject(new Error('listen_failed')); return; }
-      origin = `${secure ? 'https' : 'http'}://localhost:${address.port}`;
+      origin = new URL(`${secure ? 'https' : 'http'}://localhost:${address.port}`).origin;
       authority = new URL(origin).host;
       resolve();
     });

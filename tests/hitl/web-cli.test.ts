@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,7 +28,7 @@ async function snapshot(dir: string): Promise<unknown[]> {
   return entries;
 }
 async function fixture() {
-  const dir = await mkdtemp(join(tmpdir(), 'cli-fixture-'));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'cli-fixture-')));
   await chmod(dir, 0o700);
   return { dir, root: join(dir, 'auth'), invitation: join(dir, 'invitation') };
 }

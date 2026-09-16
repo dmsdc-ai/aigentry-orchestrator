@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { IncomingMessage, ServerResponse } from 'node:http';
@@ -95,7 +95,7 @@ function virtualAuthenticator() {
   };
 }
 async function fixture() {
-  const dir = await mkdtemp(join(tmpdir(), 'fixture-'));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'fixture-')));
   await chmod(dir, 0o700);
   let time = 1_800_000_000_000;
   const config = { origin, rpId, stateDir: dir, tlsReady: true };
