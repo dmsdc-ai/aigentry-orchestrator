@@ -18,9 +18,9 @@ import {
   existsSync,
   statSync,
   lstatSync,
-  realpathSync,
   copyFileSync,
 } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 
@@ -224,7 +224,7 @@ test("431-G — spawn_cwd is under role-sandbox, exists, has no CLAUDE.md", () =
     const r = runBootPrepare(home, ["--role", "coder", "--cwd", targetCwd, "--sid", "test-431-G"]);
     assert.equal(r.code, 0, `exit ${r.code} stderr=${r.stderr}`);
     const j = parseJson(r.stdout);
-    assert.match(j.spawn_cwd, /\/role-sandbox\/coder-test-431-G$/);
+    assert.equal(j.spawn_cwd, join(home, "role-sandbox", "coder-test-431-G"));
     assert.ok(existsSync(j.spawn_cwd));
     assert.equal(
       existsSync(join(j.spawn_cwd, "CLAUDE.md")),
@@ -490,7 +490,7 @@ for (const m of CLI_MATRIX) {
 // trusted project (codex's own on-disk schema) so codex skips its blocking
 // folder-trust modal at boot, while the real ~/.codex/config.toml stays untouched
 // (credential/config boundary — we de-symlink, never write through the link).
-test("552-codex-E — shadow config.toml pre-trusts the sandbox cwd; real config untouched", () => {
+test("552-codex-E — shadow config.toml pre-trusts the sandbox cwd; real config untouched", async () => {
   const { home, targetCwd, cleanup } = setupTempHome();
   try {
     const codex = CLI_MATRIX.find((m) => m.cli === "codex")!;
@@ -507,12 +507,20 @@ test("552-codex-E — shadow config.toml pre-trusts the sandbox cwd; real config
     // Trust entry for the CANONICAL sandbox cwd (codex keys trust on getcwd(),
     // symlinks collapsed — e.g. macOS tmp /var → /private/var), in codex's
     // `[projects."<abspath>"]` + trust_level = "trusted" on-disk schema.
-    const canonicalCwd = realpathSync(j.spawn_cwd);
-    assert.ok(
-      shadowText.includes(`[projects."${canonicalCwd}"]`),
-      `shadow config must declare [projects."${canonicalCwd}"]; got:\n${shadowText}`,
+    const expectedCwd = join(home, "role-sandbox", "coder-t552-codex-E");
+    assert.equal(j.spawn_cwd, expectedCwd);
+    // Native realpath expands Windows short names; realpathSync can retain them.
+    const canonicalCwd = await realpath(expectedCwd);
+    // JSON quoting supplies TOML-compatible escapes for this native path.
+    const tableKey = `[projects.${JSON.stringify(canonicalCwd)}]`;
+    const tables = shadowText.split(/(?=^\s*\[)/m);
+    const sandboxTables = tables.filter((table) => table.trimStart().split(/\r?\n/, 1)[0] === tableKey);
+    assert.equal(
+      sandboxTables.length, 1,
+      `shadow config must declare exactly one ${tableKey}; got:\n${shadowText}`,
     );
-    assert.match(shadowText, /trust_level\s*=\s*"trusted"/, "must set trust_level = trusted");
+    assert.match(sandboxTables[0], /^trust_level\s*=\s*"trusted"\s*$/m,
+      "must set trust_level = trusted in the exact sandbox project table");
     // Real config contents preserved in the shadow copy (settings not dropped).
     assert.match(shadowText, /fake codex settings/, "shadow must preserve real config contents");
     // Shadow config is a REAL file, not a symlink into the real home — else the
