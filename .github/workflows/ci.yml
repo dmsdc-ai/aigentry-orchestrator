@@ -42,6 +42,51 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  browser-tls:
+    name: Browser and TLS acceptance
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      BROWSER_TLS_RECEIPT: ${{ runner.temp }}/browser-tls-receipt.json
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.0'
+      - name: Require disposable non-root Linux runner and TLS tools
+        run: |
+          set -euo pipefail
+          test "$(id -u)" -ne 0
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          sudo apt-get update
+          sudo apt-get install -y openssl libnss3-tools
+      - name: Fresh locked install and build
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+      - name: Install pinned Chromium with sandbox dependencies
+        run: |
+          set -euo pipefail
+          node -e "const p=require('playwright/package.json');const b=JSON.parse(require('node:fs').readFileSync(require('node:path').join(require('node:path').dirname(require.resolve('playwright-core/package.json')),'browsers.json'))).browsers.find(x=>x.name==='chromium');if(p.version!=='1.58.2'||b.revision!=='1208'||b.browserVersion!=='145.0.7632.6')process.exit(1)"
+          npx --no-install playwright install --with-deps chromium
+      - name: Actual browser, WebAuthn and TLS controls
+        run: npm run test:browser-tls
+        timeout-minutes: 10
+      - name: Validate complete receipt against this checkout
+        run: npm run test:browser-tls -- --validate-receipt
+      - name: Upload sanitized receipt only
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-tls-receipt
+          path: ${{ env.BROWSER_TLS_RECEIPT }}
+          if-no-files-found: error
+          retention-days: 7
+
   test:
     name: Full suite
     strategy:
