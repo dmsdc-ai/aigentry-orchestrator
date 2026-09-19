@@ -271,10 +271,25 @@ test('nonancestor base fails with exact matching tag and commit', t => {
   f.git('tag', '-f', 'v1.0.0', f.manifest.base_commit); f.save(); rejects(f);
 });
 
-test('workflow runs independent tests and admission in guard before credentials and publish', () => {
-  const source = readFileSync(workflow, 'utf8').split('\n').filter(line => !/^\s*#/.test(line)).join('\n');
-  const guard = source.match(/^  guard:\n([\s\S]*?)(?=^  [a-zA-Z][\w-]*:)/m)?.[1];
-  assert.ok(guard, 'guard job exists');
+// These anchors enforce the checked-in workflow's literal layout, not general YAML.
+function workflowJob(source, name) {
+  const job = source.match(new RegExp(`^  ${name}:\\n[\\s\\S]*?(?=^  [a-zA-Z][\\w-]*:|(?![\\s\\S]))`, 'm'))?.[0];
+  assert.ok(job, `${name} job exists`);
+  return job;
+}
+
+function assertWorkflowContract(text) {
+  const source = text.replace(/\r\n/g, '\n').split('\n').filter(line => !/^\s*#/.test(line)).join('\n');
+  const guard = workflowJob(source, 'guard');
+  const publish = workflowJob(source, 'publish');
+  const browser = workflowJob(source, 'browser-tls');
+  assert.match(guard, /^    needs: \[browser-tls\]$/m, 'guard requires browser-tls');
+  assert.match(publish, /^    needs: \[browser-tls, guard, test, windows-declared-unsupported, windows-persistence, windows-refuses\]$/m,
+    'publish requires browser-tls and all five original dependencies');
+  for (const job of [browser, guard, publish]) {
+    assert.doesNotMatch(job, /^    (?:if:|continue-on-error:\s*true\b)/m, 'jobs cannot bypass the browser gate');
+  }
+  assert.doesNotMatch(browser, /continue-on-error:\s*true|\|\|\s*true|^\s*if:|\bexit\s+0\b/m, 'browser gate cannot skip or swallow failure');
   const steps = guard.split(/^      - /m).slice(1);
   const identity = steps.findIndex(s => /id: identity\b/.test(s));
   const tests = steps.findIndex(s => /run:\s*(?:\|\s*)?node --test tests\/packaging\/release-admission\.test\.mjs\b/.test(s));
@@ -287,9 +302,58 @@ test('workflow runs independent tests and admission in guard before credentials 
   assert.match(steps[admission], /RELEASE_SECURITY_POLICY_SHA256: UNREVIEWED\s/);
   assert.match(steps[admission], /RELEASE_SECURITY_COMMIT: \$\{\{ github\.sha \}\}/);
   assert.doesNotMatch(steps[admission], /sha256sum|shasum|hashFiles|SKIP|BYPASS/);
-  assert.match(source, /^  publish:\n[\s\S]*?needs:\s*\[[^\]\n]*\bguard\b/m);
-  assert.match(source, /needs: \[guard, test, windows-declared-unsupported, windows-persistence, windows-refuses\]/);
+}
+
+test('workflow runs independent tests and admission in guard before credentials and publish', () => {
+  assertWorkflowContract(readFileSync(workflow, 'utf8'));
 });
+
+for (const [ending, newline] of [['LF', '\n'], ['CRLF', '\r\n']]) {
+  const source = () => readFileSync(workflow, 'utf8').replace(/\r\n/g, '\n');
+  const encode = text => text.replace(/\n/g, newline);
+  test(`workflow contract accepts ${ending}`, () => {
+    assert.doesNotThrow(() => assertWorkflowContract(encode(source())));
+  });
+  for (const dependency of ['browser-tls', 'guard', 'test', 'windows-declared-unsupported', 'windows-persistence', 'windows-refuses']) {
+    test(`workflow contract rejects ${ending} publish without ${dependency}`, () => {
+      const original = source();
+      const publish = workflowJob(original, 'publish');
+      const changed = publish.replace(/^    needs: \[([^\]\n]+)\]$/m, (_, needs) =>
+        `    needs: [${needs.split(', ').filter(name => name !== dependency).join(', ')}]`);
+      assert.notEqual(changed, publish, 'mutation must remove the intended dependency');
+      assert.throws(() => assertWorkflowContract(encode(original.replace(publish, changed))),
+        { code: 'ERR_ASSERTION', message: /publish requires/ });
+    });
+  }
+  const bypasses = [
+    ['guard missing browser dependency', 'guard', job => job.replace(/^    needs: \[browser-tls\]\n/m, ''), /guard requires/],
+    ['guard needs on unrelated job', 'guard', job => job.replace(/^    needs: \[browser-tls\]\n/m, '') +
+      '  unrelated:\n    needs: [browser-tls]\n    runs-on: ubuntu-latest\n', /guard requires/],
+    ['publish needs on unrelated job', 'publish', job => {
+      const needs = job.match(/^    needs: .*\n/m)?.[0];
+      assert.ok(needs, 'publish dependency line exists for mutation');
+      return job.replace(needs, '') + `\n  unrelated:\n${needs}    runs-on: ubuntu-latest\n`;
+    }, /publish requires/],
+    ...['browser-tls', 'guard', 'publish'].map(name => [`${name} conditional bypass`, name,
+      job => job.replace(`  ${name}:\n`, `  ${name}:\n    if: always()\n`), /jobs cannot bypass/]),
+    ['browser job swallows failure', 'browser-tls', job => job.replace('  browser-tls:\n',
+      '  browser-tls:\n    continue-on-error: true\n'), /jobs cannot bypass/],
+    ['browser step skips', 'browser-tls', job => job.replace('        run: npm run test:browser-tls\n',
+      '        if: false\n        run: npm run test:browser-tls\n'), /browser gate cannot skip/],
+    ['browser step swallows failure', 'browser-tls', job => job.replace('        run: npm run test:browser-tls\n',
+      '        run: npm run test:browser-tls || true\n'), /browser gate cannot skip/],
+  ];
+  for (const [label, name, mutate, diagnostic] of bypasses) {
+    test(`workflow contract rejects ${ending} ${label}`, () => {
+      const original = source();
+      const job = workflowJob(original, name);
+      const changed = mutate(job);
+      assert.notEqual(changed, job, 'mutation must change the intended job');
+      assert.throws(() => assertWorkflowContract(encode(original.replace(job, changed))),
+        { code: 'ERR_ASSERTION', message: diagnostic });
+    });
+  }
+}
 
 function securityRefuses(f, env = {}, diagnostic) {
   const result = f.run(undefined, env);
