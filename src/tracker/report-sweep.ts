@@ -27,6 +27,7 @@
 // This module is READ-ONLY with respect to ~/.telepty/shared. Nothing under it is
 // moved, modified or deleted — it is the evidence, and a sweep that consumed its
 // own evidence would be the same defect wearing a cursor.
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -178,16 +179,32 @@ function readCursor(file: string, nowMs: number): Cursor {
  *
  * Longest-first so a full sid beats its own prefix.
  */
-function loadTracks(activeJson: string): string[] {
+export function loadRegistryTracks(stateDir: string, registryScript: string): string[] {
   let doc: unknown;
   try {
-    doc = JSON.parse(fs.readFileSync(activeJson, "utf8"));
+    const windows = process.platform === "win32";
+    const result = spawnSync(windows ? "python" : registryScript,
+      windows ? [registryScript, "snapshot"] : ["snapshot"], {
+        shell: false,
+        env: { ...process.env, DISPATCH_STATE_DIR: stateDir },
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 10_000,
+        killSignal: "SIGKILL",
+        maxBuffer: 8 * 1024 * 1024,
+      });
+    if (result.error || result.status !== 0) return [];
+    doc = JSON.parse(result.stdout);
   } catch {
     return []; // no registry = no track vocabulary; refs still classify by header
   }
-  const list = (doc as { dispatches?: unknown })?.dispatches;
+  if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return [];
+  const envelope = doc as { schema_version?: unknown; generation?: unknown; dispatches?: unknown };
+  if (envelope.schema_version !== 2 || !Number.isInteger(envelope.generation) ||
+      !Array.isArray(envelope.dispatches)) return [];
+  const list = envelope.dispatches;
   const out = new Set<string>();
-  for (const d of Array.isArray(list) ? list : []) {
+  for (const d of list) {
     const sid = (d as { assigned?: { sid?: unknown } })?.assigned?.sid;
     if (typeof sid !== "string") continue;
     if (sid.length >= 3) out.add(sid);
@@ -219,7 +236,7 @@ const TITLE_TRACK_RE = /^#[ \t]+[^\n]*?—[ \t]*([A-Za-z0-9._-]+)/m;
  * A track id in this ecosystem always carries a digit (sw904, tk899, sl909,
  * sp902-916, ci1, t880). A title token that does not is prose, not a track —
  * `# Memory harness gap analysis — Sakana "long-horizon agent memory" talk`
- * would otherwise be filed on track `Sakana`. Same discriminator as loadTracks'
+ * would otherwise be filed on track `Sakana`. Same discriminator as loadRegistryTracks'
  * prefix rule, for the same reason.
  */
 function looksLikeTrack(token: string): boolean {
@@ -264,6 +281,7 @@ export interface SweepDeps {
   sharedDir: string;
   nowMs: number;
   repoDir: string;
+  registryScript?: string;
   stdout: (line: string) => void;
   stderr: (line: string) => void;
 }
@@ -357,7 +375,8 @@ async function sweepLocked(deps: SweepDeps, cursorFile: string): Promise<number>
   }
   if (discoveryIncomplete) maxMtime = cursor.last_mtime_ms;
   const retries = cursor.retries.slice(pendingIndex);
-  const tracks = selected.length ? loadTracks(path.join(stateDir, "active.json")) : [];
+  const tracks = selected.length ? loadRegistryTracks(stateDir,
+    deps.registryScript || process.env.DISPATCH_REGISTRY_PY || path.join(repoDir, "bin", "dispatch-registry.py")) : [];
   const lines: string[] = [];
 
   // ── step 1: exact inbox copies; failed attempts become durable obligations ──
@@ -418,13 +437,15 @@ async function sweepLocked(deps: SweepDeps, cursorFile: string): Promise<number>
 }
 
 /** The subcommand entrypoint. `stateDir`/`nowIso` are the tracker CLI's own. */
-export async function cmdReportSweep(stateDir: string, repoDir: string, nowIso: string): Promise<number> {
+export async function cmdReportSweep(stateDir: string, repoDir: string, nowIso: string,
+  registryScript?: string): Promise<number> {
   const parsed = nowIso ? Date.parse(nowIso) : NaN;
   return sweep({
     stateDir,
     sharedDir: process.env.TELEPTY_SHARED_DIR || path.join(os.homedir(), ".telepty", "shared"),
     nowMs: Number.isFinite(parsed) ? parsed : Date.now(),
     repoDir,
+    registryScript: registryScript || process.env.DISPATCH_REGISTRY_PY || path.join(repoDir, "bin", "dispatch-registry.py"),
     stdout: (l) => process.stdout.write(l + "\n"),
     stderr: (l) => process.stderr.write(l + "\n"),
   });

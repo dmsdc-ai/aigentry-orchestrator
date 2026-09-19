@@ -820,7 +820,7 @@ function main(argv: string[]): void {
     // #904 — the only async subcommand (atomicWrite is a promise). node keeps the
     // loop alive until it settles, so `void` here is the return, not a discard.
     case "report-sweep":
-      void cmdReportSweep(STATE_DIR, REPO_DIR, NOW_OVERRIDE).then((rc) => {
+      void cmdReportSweep(STATE_DIR, REPO_DIR, NOW_OVERRIDE, DISPATCH_REGISTRY_PY).then((rc) => {
         if (rc !== 0) process.exit(rc);
       });
       return;
