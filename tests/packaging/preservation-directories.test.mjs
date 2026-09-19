@@ -162,6 +162,7 @@ acceptance('directories only; existing undeclared parent is retained', () => {
 acceptance('existing original backup and synthetic custom replacement validator', () => {
   const f = fixture(); f.input.entries.unshift(f.entry('old'));
   fs.writeFileSync(f.target(f.input.entries[0]), 'custom original', { mode: 0o640 });
+  fs.chmodSync(f.target(f.input.entries[0]), 0o640);
   const p = plan(f.input), e = p.entries[0]; let calls = 0;
   const d = { operationId: p.operationId, planId: p.planId, root: e.root, path: e.path, beforeHash: e.before.hash, desiredHash: e.desiredHash };
   noMutation(f, () => apply(p, options(f.input)), 'CONFLICT');
