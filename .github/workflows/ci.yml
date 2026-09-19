@@ -48,8 +48,6 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
-    env:
-      BROWSER_TLS_RECEIPT: ${{ runner.temp }}/browser-tls-receipt.json
     steps:
       - uses: actions/checkout@v4
         with:
@@ -75,15 +73,19 @@ jobs:
           node -e "const p=require('playwright/package.json');const b=JSON.parse(require('node:fs').readFileSync(require('node:path').join(require('node:path').dirname(require.resolve('playwright-core/package.json')),'browsers.json'))).browsers.find(x=>x.name==='chromium');if(p.version!=='1.58.2'||b.revision!=='1208'||b.browserVersion!=='145.0.7632.6')process.exit(1)"
           npx --no-install playwright install --with-deps chromium
       - name: Actual browser, WebAuthn and TLS controls
+        env:
+          BROWSER_TLS_RECEIPT: ${{ runner.temp }}/browser-tls-receipt.json
         run: npm run test:browser-tls
         timeout-minutes: 10
       - name: Validate complete receipt against this checkout
+        env:
+          BROWSER_TLS_RECEIPT: ${{ runner.temp }}/browser-tls-receipt.json
         run: npm run test:browser-tls -- --validate-receipt
       - name: Upload sanitized receipt only
         uses: actions/upload-artifact@v4
         with:
           name: browser-tls-receipt
-          path: ${{ env.BROWSER_TLS_RECEIPT }}
+          path: ${{ runner.temp }}/browser-tls-receipt.json
           if-no-files-found: error
           retention-days: 7
 
