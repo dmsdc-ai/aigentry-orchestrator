@@ -135,7 +135,14 @@ function validate(workflow) {
   assert.deepEqual(top, oldTop, 'unchanged trigger, permissions and concurrency');
   assert.deepEqual(workflow.on, { push: { tags: ['v*'] } });
   assert.deepEqual(Object.keys(workflow.jobs).sort(), [...Object.keys(original.jobs), ...ids].sort());
-  for (const id of ['guard', 'test', 'windows-declared-unsupported']) {
+  const guard = structuredClone(workflow.jobs.guard);
+  const securityEnv = named(guard, 'Release planning and changed-file admission').env;
+  assert.equal(securityEnv.RELEASE_SECURITY_POLICY_SHA256, 'UNREVIEWED');
+  assert.equal(securityEnv.RELEASE_SECURITY_COMMIT, '${{ github.sha }}');
+  delete securityEnv.RELEASE_SECURITY_POLICY_SHA256;
+  delete securityEnv.RELEASE_SECURITY_COMMIT;
+  assert.deepEqual(guard, original.jobs.guard, 'guard changes only the required security trust inputs');
+  for (const id of ['test', 'windows-declared-unsupported']) {
     assert.deepEqual(workflow.jobs[id], original.jobs[id], `unchanged ${id}`);
   }
   const guardSteps = workflow.jobs.guard.steps;
@@ -197,6 +204,9 @@ acceptance('baseline has zero actual Windows gates and omits both publish depend
 acceptance('frozen final workflow preserves old behavior and requires W0 plus W1', 'structure', () => validate(final));
 acceptance('corrected reader is the only parsed workflow change from rejected source', 'reader-structure', () => {
   const copy = structuredClone(final);
+  const env = named(copy.jobs.guard, 'Release planning and changed-file admission').env;
+  delete env.RELEASE_SECURITY_POLICY_SHA256;
+  delete env.RELEASE_SECURITY_COMMIT;
   named(copy.jobs[ids[0]], 'Persistence suite must be fully green on win32').run = rejectedPersistence;
   assert.deepEqual(copy, rejected);
 });
@@ -446,6 +456,8 @@ const callerSource = readFileSync(join(root, 'scripts/run-tests.mjs'), 'utf8');
 const staleGuardSource = readFileSync(join(root, 'scripts/stale-dist-guard.mjs'), 'utf8');
 const harnessRelative = 'tests/packaging/windows-release-gates.test.mjs';
 const securityRelative = 'tests/hitl/snyk-boundaries.test.mjs';
+const admissionRelative = 'tests/packaging/release-admission.test.mjs';
+const nativeRelative = 'tests/packaging/native-capture.test.mjs';
 function callerFixture(mode, symlinked = false) {
   const directory = mkdtempSync(join(admin, 'caller fixture '));
   const put = (path, source) => {
@@ -465,6 +477,8 @@ function callerFixture(mode, symlinked = false) {
   }
   if (mode === 'stale-helper') put('dist/tests/orphan.js', '// synthetic stale helper\n');
   if (mode !== 'missing-security') put(securityRelative, checks + `assert.equal(new URL(import.meta.url).pathname.endsWith('/${securityRelative}'), true);\nconsole.log('CALLER_SECURITY_SENTINEL');\nprocess.exit(${mode === 'failing-security' ? 8 : 0});\n`);
+  if (mode !== 'missing-admission') put(admissionRelative, checks + `console.log('CALLER_ADMISSION_SENTINEL');\nprocess.exit(${mode === 'failing-admission' ? 8 : 0});\n`);
+  if (mode !== 'missing-native') put(nativeRelative, checks + `console.log('CALLER_NATIVE_SENTINEL');\nprocess.exit(${mode === 'failing-native' ? 8 : 0});\n`);
   if (mode !== 'missing-harness') put(harnessRelative, checks + `console.log('CALLER_SOURCE_SENTINEL');\nprocess.exit(${mode === 'sentinel-fail' ? 9 : 0});\n`);
   put('tests/packaging/unselected.test.mjs', "console.log('CALLER_UNSELECTED_MJS'); process.exit(99);\n");
   if (symlinked) {
@@ -482,6 +496,10 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic] of [
   ['compiled-fail', 1, true, true, false],
   ['missing-security', 1, false, false, false, /tests[\\/]hitl[\\/]snyk-boundaries\.test\.mjs/],
   ['failing-security', 1, true, true, false],
+  ['missing-admission', 1, false, false, false, /tests[\\/]packaging[\\/]release-admission\.test\.mjs/],
+  ['failing-admission', 1, true, true, false],
+  ['missing-native', 1, false, false, false, /tests[\\/]packaging[\\/]native-capture\.test\.mjs/],
+  ['failing-native', 1, true, true, false],
   ['missing-harness', 1, true, true, false, /POSIX control harness failed with exit status: 1/],
   ['empty', 1, false, false, false, /No compiled test files found/],
   ['missing-dist', 1, false, false, false, /Failed to enumerate compiled tests/],
@@ -503,9 +521,12 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic] of [
   assert.equal(result.stdout.includes('CALLER_COMPILED_CONTROL'), compiled);
   assert.equal(result.stdout.includes('CALLER_SECURITY_SENTINEL'), security);
   assert.equal(result.stdout.includes('CALLER_SOURCE_SENTINEL'), sentinel);
+  assert.equal(result.stdout.includes('CALLER_ADMISSION_SENTINEL'), compiled);
+  assert.equal(result.stdout.includes('CALLER_NATIVE_SENTINEL'), compiled);
   assert.ok(!result.stdout.includes('CALLER_UNSELECTED_MJS'), 'no automatic source .mjs discovery');
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_COMPILED_CONTROL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (security && sentinel) assert.ok(result.stdout.indexOf('CALLER_SECURITY_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
+  if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_NATIVE_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (diagnostic) assert.match(result.stderr, diagnostic);
 });
 }
@@ -577,7 +598,7 @@ const startupError = { status: null, signal: null, error: 'synthetic ENOENT', co
 const timedOut = { status: null, signal: 'SIGKILL', error: 'synthetic ETIMEDOUT', code: 'ETIMEDOUT' };
 const vmCases = [];
 for (const platform of ['linux', 'darwin']) {
-  vmCases.push({ name: `${platform} compiled-success then exact harness invocation`, platform, results: [success, success], status: 0, calls: 2 });
+  vmCases.push({ name: `${platform} compiled/security/admission/native success then exact harness invocation`, platform, results: [success, success], status: 0, calls: 2 });
   for (const [name, result, diagnostic] of [
     ['nonzero', failed, /exit status: 7/], ['startup error', startupError, /POSIX control harness failed: synthetic ENOENT/],
     ['signal', signaled, /terminated by signal: SIGTERM/], ['timeout', timedOut, /POSIX control harness failed: synthetic ETIMEDOUT/],
@@ -585,7 +606,7 @@ for (const platform of ['linux', 'darwin']) {
 }
 for (const platform of ['linux', 'darwin', 'win32']) {
   for (const [name, result, status] of [['nonzero', failed, 7], ['startup error', startupError, 1], ['signal', signaled, 1]]) {
-    vmCases.push({ name: `${platform} compiled ${name} prevents harness`, platform, results: [result], status, calls: 1 });
+    vmCases.push({ name: `${platform} initial test composition ${name} prevents harness`, platform, results: [result], status, calls: 1 });
   }
 }
 vmCases.push({ name: 'win32 success preserves compiled result and prints non-TAP notice', platform: 'win32', results: [success], status: 0, calls: 1 });
@@ -613,7 +634,8 @@ for (const item of vmCases) acceptance(`caller VM: ${item.name}`, 'caller-vm', (
   assert.equal(actual.status, item.status);
   assert.equal(actual.calls.length, item.calls);
   if (item.calls > 0) assert.deepEqual(actual.calls[0], { executable: process.execPath,
-    argv: ['--test', 'dist/tests/a.test.js', 'dist/tests/nested/b.test.js', 'dist/tests/z.test.js', securityRelative],
+    argv: ['--test', 'dist/tests/a.test.js', 'dist/tests/nested/b.test.js', 'dist/tests/z.test.js', securityRelative, admissionRelative,
+      ...(['linux', 'darwin'].includes(item.platform) ? [nativeRelative] : [])],
     options: { cwd: actual.root, stdio: 'inherit' } });
   if (item.calls === 2) assert.deepEqual(actual.calls[1], { executable: process.execPath,
     argv: ['--test', harnessRelative], options: { cwd: actual.root, stdio: 'inherit', timeout: 180000, killSignal: 'SIGKILL' } });

@@ -141,7 +141,9 @@
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import * as os from "node:os";
+import { createHash } from "node:crypto";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { USAGE } from "./usage.js";
 
 const env = process.env;
@@ -171,9 +173,8 @@ const CLI_ARGV = process.argv.slice(2);
 // rather than a guess at which mode was meant. Nothing may be smuggled in behind a
 // recognised flag on a script whose bare form SIGKILLs processes.
 //
-// `probe` is listed FIRST and keeps every boot-path behaviour but the exec: T40, T131
-// and T132 drive the reconcile and the guard through it and read their stderr lines
-// and their stdout argv, so it must not be swept into the no-exec stream change below.
+// Probes retain their stdout argv/stderr diagnostics, but suppress every mutation
+// through the same effect gate as dry-run. Inspection must never DELETE or signal.
 const MODE: Mode =
   CLI_ARGV.length === 0
     ? "boot"
@@ -184,7 +185,7 @@ const MODE: Mode =
         : CLI_ARGV.length === 1 && CLI_ARGV[0] === "--dry-run"
           ? "dry-run"
           : "unknown";
-const DRY_RUN = MODE === "dry-run";
+const DRY_RUN = MODE === "dry-run" || MODE === "probe";
 // Every mode but `boot` and `__probe`. Used for the stream choice and the EPIPE arm
 // below, both of which must leave the boot path byte-identical.
 const NO_EXEC = MODE === "help" || MODE === "dry-run" || MODE === "unknown";
@@ -658,7 +659,62 @@ function emitExecArgv(): void {
   writeOut(1, `${ORCH_EXEC_ARGV.join("\n")}\n`);
 }
 
-function main(): never {
+async function validateCapture(): Promise<void> {
+  if (ORCH_CLI !== "codex") return;
+  try {
+    const workspace = path.resolve(SCRIPT_DIR, "..");
+    const home = env.AIGENTRY_HOME || path.join(os.homedir(), ".aigentry");
+    for (const file of [path.join(workspace, ".aigentry-native-capture.lock"),
+      path.join(workspace, ".aigentry-preservation.lock"), path.join(home, ".aigentry-preservation.lock")]) {
+      try { fs.lstatSync(file); throw new Error("pending operation"); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
+    const stampPath = path.join(workspace, ".aigentry-init.json");
+    let stampBytes: Buffer;
+    try {
+      const st = fs.lstatSync(stampPath);
+      if (!st.isFile() || st.isSymbolicLink() || st.nlink !== 1) throw new Error("unsafe stamp");
+      stampBytes = fs.readFileSync(stampPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    const stamp = JSON.parse(stampBytes.toString("utf8")) as {
+      nativeCapture?: { outputs?: Record<string, { hash: string; mode: number; uid: number; gid: number }> };
+    };
+    if (!stamp.nativeCapture) return;
+    if (fs.realpathSync.native(workspace) !== workspace || fs.realpathSync.native(process.cwd()) !== workspace)
+      throw new Error("wrong control workspace");
+    // Verify both modules BEFORE import: validation cannot safely execute a changed adapter.
+    for (const rel of ["bin/init/native-capture.mjs", "bin/init/preservation.mjs"]) {
+      const file = path.join(workspace, rel), expected = stamp.nativeCapture.outputs?.[rel];
+      if (!expected || fs.realpathSync.native(file) !== file) throw new Error("missing adapter identity");
+      const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      try {
+        const st = fs.fstatSync(fd);
+        if (!st.isFile() || st.nlink !== 1 || (st.mode & 0o777) !== expected.mode ||
+          st.uid !== expected.uid || st.gid !== expected.gid ||
+          createHash("sha256").update(fs.readFileSync(fd)).digest("hex") !== expected.hash)
+          throw new Error("adapter changed");
+      } finally { fs.closeSync(fd); }
+    }
+    const adapter = await import(pathToFileURL(path.join(workspace, "bin/init/native-capture.mjs")).href) as {
+      validateNativeBoot: (request: { workspace: string; home: string }) =>
+        { status: string; source: string; definitionHash: string } | null;
+    };
+    const status = adapter.validateNativeBoot({ workspace, home });
+    if (!status) throw new Error("missing native registration");
+    writeOut(2, `[orchestrator-boot] Native capture installed/pending-review: ${status.source}\n` +
+      `[orchestrator-boot] UserPromptSubmit SHA-256 ${status.definitionHash}; open /hooks to review. ` +
+      "Effective enabled/trust state is unverified; launch does not establish capture readiness.\n");
+  } catch {
+    writeOut(2, "[orchestrator-boot] Native capture static validation failed; inspect installation/operation before boot.\n");
+    process.exit(2);
+  }
+}
+
+async function main(): Promise<never> {
+  await validateCapture();
   orchestratorRegistryReconcile();
   orchestratorSingletonGuard();
   log(`exec ${ORCH_EXEC_ARGV.join(" ")}`);
@@ -685,7 +741,8 @@ function help(): never {
  * confuse — the prefix is for the human and for any script that grew up reading this
  * output, neither of whom should ever find a bare `telepty` alone on a line here.
  */
-function dryRun(): never {
+async function dryRun(): Promise<never> {
+  await validateCapture();
   orchestratorRegistryReconcile();
   orchestratorSingletonGuard();
   log(`would exec ${ORCH_EXEC_ARGV.join(" ")} (one element per line below)`);
@@ -714,7 +771,8 @@ function unknownFlag(): never {
 // the code production actually runs. Internal surface: not a flag, not documented,
 // no caller outside tests/dispatch/. The shim routes `__probe` straight to node so a
 // probe can never reach the exec.
-function probe(argv: string[]): never {
+async function probe(argv: string[]): Promise<never> {
+  await validateCapture();
   const sub = argv[0];
   if (sub === "singleton-guard") {
     orchestratorSingletonGuard();
@@ -739,17 +797,17 @@ function probe(argv: string[]): never {
 // the two halves agree even if this file is run directly.
 switch (MODE) {
   case "probe":
-    probe(CLI_ARGV.slice(1));
+    await probe(CLI_ARGV.slice(1));
     break;
   case "help":
     help();
     break;
   case "dry-run":
-    dryRun();
+    await dryRun();
     break;
   case "unknown":
     unknownFlag();
     break;
   default:
-    main();
+    await main();
 }

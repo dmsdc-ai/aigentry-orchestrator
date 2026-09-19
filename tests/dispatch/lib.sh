@@ -65,13 +65,29 @@ TEST_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$TEST_LIB_DIR/../.." && pwd -P)"
 
 t_setup() {
+  local setup_tmp tmp_root
+  # An explicit TMPDIR must never fall back to the host temporary directory.
+  if [ "${TMPDIR+x}" = x ]; then
+    if [ -z "$TMPDIR" ]; then
+      printf '%s\n' 't_setup: TMPDIR must not be empty' >&2
+      return 1
+    fi
+    tmp_root="$TMPDIR"
+    case "$tmp_root" in
+      /*) ;;
+      *) tmp_root="$PWD/$tmp_root" ;;
+    esac
+    setup_tmp=$(mktemp -d "${tmp_root%/}/tmp.XXXXXXXXXX") || return $?
+  else
+    setup_tmp=$(mktemp -d) || return $?
+  fi
   # Env hygiene: the suite may be run FROM a worker session (which exports
   # AIGENTRY_WORKER_SESSION=1, dispatch.sh:97). The orchestrator-only guard in
   # session-cleanup.sh (#524) would then refuse on every orchestrator-path test.
   # Tests that exercise the worker guard (T28/T34) set this marker inline per
   # invocation, so clearing the inherited value here is safe and deterministic.
   unset AIGENTRY_WORKER_SESSION
-  T_TMP=$(mktemp -d)
+  T_TMP="$setup_tmp"
   export T_TMP
   # A reconciler tick under test runs wh_prune_orphans, whose ONLY ownership gate
   # is "workspace cwd under $AIGENTRY_ROLE_SANDBOX_DIR" (workspace-host.sh:182).

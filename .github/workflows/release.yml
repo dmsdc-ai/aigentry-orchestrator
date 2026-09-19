@@ -70,6 +70,9 @@ jobs:
       - name: Release planning and changed-file admission
         env:
           RELEASE_VERSION: ${{ steps.identity.outputs.version }}
+          # Replace only after maintainer review of exact portable policy bytes and exception rationale.
+          RELEASE_SECURITY_POLICY_SHA256: UNREVIEWED
+          RELEASE_SECURITY_COMMIT: ${{ github.sha }}
         run: node scripts/release-admission.mjs --root "$GITHUB_WORKSPACE" --version "$RELEASE_VERSION"
 
       # A workflow that silently no-ops when the secret is absent is green-without-publishing,

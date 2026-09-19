@@ -29,6 +29,7 @@ const MANIFEST = [
   "bin/hook-prompt-submit.mjs",
   "bin/init/cli.mjs",
   "bin/init/manifest.mjs",
+  "bin/init/native-capture.mjs",
   "bin/init/preservation.mjs",
   "bin/inject-handler.sh",
   "bin/install-instructions.sh",

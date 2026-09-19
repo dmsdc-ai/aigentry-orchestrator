@@ -58,7 +58,26 @@ HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
 t_setup; trap 't_teardown' EXIT
 REPO_ROOT="$(cd "$HERE/../.." && pwd -P)"
-BOOT="${ORCH_BOOT_UNDER_TEST:-$REPO_ROOT/bin/orchestrator-boot.sh}"
+BOOT_SOURCE="${ORCH_BOOT_UNDER_TEST:-$REPO_ROOT/bin/orchestrator-boot.sh}"
+# Keep shim behavior under test, but execute only private unchanged copies with a
+# synthetic auth resolver. The actuation control invokes the compiled CLI directly.
+BOOT_FIXTURE="$T_TMP/boot-fixture"
+mkdir -p "$BOOT_FIXTURE/bin/lib" "$BOOT_FIXTURE/dist/src/orchestrator-boot" "$BOOT_FIXTURE/home"
+cp "$BOOT_SOURCE" "$BOOT_FIXTURE/bin/orchestrator-boot.sh"
+cp "$REPO_ROOT/bin/lib/node-shim.sh" "$BOOT_FIXTURE/bin/lib/node-shim.sh"
+cp "$REPO_ROOT/dist/src/orchestrator-boot/cli.js" "$REPO_ROOT/dist/src/orchestrator-boot/usage.js" \
+  "$BOOT_FIXTURE/dist/src/orchestrator-boot/"
+printf '{"type":"module"}\n' > "$BOOT_FIXTURE/package.json"
+AUTH_LOG="$T_TMP/auth.log"
+printf 'telepty_auth_token() { printf "auth\\n" >> "%s"; printf "fixture-token-T134"; }\n' "$AUTH_LOG" \
+  > "$BOOT_FIXTURE/bin/lib/telepty-auth.sh"
+BOOT="$BOOT_FIXTURE/bin/orchestrator-boot.sh"
+BOOT_CLI="$BOOT_FIXTURE/dist/src/orchestrator-boot/cli.js"
+chmod +x "$BOOT"
+export AIGENTRY_SHIM_SCRIPT_DIR="$BOOT_FIXTURE/bin" AIGENTRY_HOME="$BOOT_FIXTURE/home"
+export ORCHESTRATOR_CLI=claude SINGLETON_SELF_PID=9999 TELEPTY_PORT=3848
+unset _NODE_SHIM_SH_SOURCED
+cd "$BOOT_FIXTURE"
 
 fail() { echo "FAIL[T134]: $*" >&2; exit 1; }
 
@@ -121,7 +140,7 @@ export ORCHESTRATOR_SID="$SID"
 
 BRIDGE="node /Users/x/.nvm/versions/node/v20.20.0/bin/telepty allow --id $SID --auto-restart claude --dangerously-skip-permissions --continue"
 
-reset() { : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$PS_ARGV"; : > "$TELEPTY_ARGV"; : > "$EXEC_LOG"; }
+reset() { : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$PS_ARGV"; : > "$TELEPTY_ARGV"; : > "$EXEC_LOG"; : > "$AUTH_LOG"; }
 # `grep -c .` prints the count and exits 1 on zero, so the status is swallowed rather
 # than answered with a second line (T131's idiom).
 lines() { grep -c . "$1" 2>/dev/null || true; }
@@ -148,6 +167,7 @@ assert_no_side_effects() { # assert_no_side_effects <label>
     || fail "$1: a registry request was issued by a mode that must not DELETE; calls: $(cat "$CURL_LOG")"
   [ "$(lines "$EXEC_LOG")" = "0" ] \
     || fail "$1: THE MODE BOOTED THE ORCHESTRATOR — the exec recorder fired: $(cat "$EXEC_LOG")"
+  [ "$(lines "$AUTH_LOG")" = "0" ] || fail "$1: inspection resolved auth"
 }
 
 # ===========================================================================
@@ -260,13 +280,34 @@ cat > "$PS_TABLE" <<EOF
 8888 1 /bin/zsh -c pgrep -fl telepty allow --id $SID --auto-restart claude
 EOF
 
-# The real kill set, through the probe (which is the code the boot path runs).
-reset
-SINGLETON_SELF_PID=3333 "$BOOT" __probe singleton-guard >/dev/null 2>&1
+# Actuate through zero-argv compiled boot: same implementation, prints argv without
+# exec. Every effect reaches a recorder, including the synthetic auth door.
+reset; stale_listing
+SINGLETON_SELF_PID=3333 node "$BOOT_CLI" >"$T_TMP/normal.out" 2>"$T_TMP/normal.err"
+grep -q -- '-X DELETE' "$CURL_LOG" || fail "D: normal boot did not DELETE the stale fixture"
+grep -q 'x-telepty-token: fixture-token-T134' "$CURL_LOG" || fail "D: synthetic auth missing"
+grep -q 'fixture-token-T134' "$T_TMP/normal.out" "$T_TMP/normal.err" && fail "D: token leaked"
+[ ! -s "$EXEC_LOG" ] || fail "D: compiled CLI exec'd a bridge"
+printf '%s\n' telepty allow --id "$SID" --auto-restart claude --dangerously-skip-permissions --continue \
+  > "$T_TMP/normal.expected"
+cmp "$T_TMP/normal.expected" "$T_TMP/normal.out" || fail "D: normal boot stdout is not exact argv"
 REAL_KILLS="$T_TMP/real-kills.txt"
 sed 's/^-9 //' "$KILL_LOG" | sort -u > "$REAL_KILLS"
 [ "$(cat "$REAL_KILLS")" = "7777" ] \
   || fail "D: the real run's kill set is not exactly 7777 (the fixture changed under this guard): $(cat "$REAL_KILLS")"
+
+# Probe inspection uses the identical actionable fixtures, separately from control.
+for probe in singleton-guard registry-reconcile exec-argv; do
+  reset
+  SINGLETON_SELF_PID=3333 PATH="$EXEC_DIR:$PATH" bash "$BOOT" __probe "$probe" \
+    >"$T_TMP/probe.out" 2>"$T_TMP/probe.err"
+  assert_no_side_effects "D/probe/$probe"
+  case "$probe" in
+    singleton-guard) grep -q 'would SIGKILL.*pid=7777' "$T_TMP/probe.err" || fail "D: missing probe kill verdict" ;;
+    registry-reconcile) grep -q 'would DELETE' "$T_TMP/probe.err" || fail "D: missing probe DELETE verdict" ;;
+    exec-argv) cmp "$T_TMP/normal.expected" "$T_TMP/probe.out" || fail "D: probe argv changed" ;;
+  esac
+done
 
 # The dry run's would-kill set, from its own report.
 reset; stale_listing
@@ -388,4 +429,4 @@ grep -qF 'ORCHESTRATOR_CLI' "$T_TMP/cli-help" || fail "I: help omits CLI selecto
 grep -qF 'inherits cwd' "$T_TMP/cli-help" || fail "I: help omits cwd contract"
 echo "T134 I PASS"
 
-echo "T134 PASS blocks=A-I modes=--help/-h/--dry-run/unknown kills=0 deletes=0 execs=0"
+echo "T134 PASS blocks=A-I inspection=read-only normal-control=recorded-kill-and-DELETE execs=0"

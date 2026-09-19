@@ -6,7 +6,11 @@ import { findStaleCompiled } from './stale-dist-guard.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const testsRoot = join(repoRoot, 'dist', 'tests');
-const sourceTestFiles = ['tests/hitl/snyk-boundaries.test.mjs'];
+const sourceTestFiles = ['tests/hitl/snyk-boundaries.test.mjs', 'tests/packaging/release-admission.test.mjs'];
+// Native capture fixtures require POSIX ownership/modes; Windows support is still absent.
+if (process.platform === 'darwin' || process.platform === 'linux') {
+  sourceTestFiles.push('tests/packaging/native-capture.test.mjs');
+}
 
 function collectTestFiles(dir) {
   const files = [];
