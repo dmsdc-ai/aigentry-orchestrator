@@ -28,7 +28,8 @@ BANNERS = {
 # (measured live, 1.1.27): "────…\n>\n────…". Anchor on rule+`>` so a quoted
 # `> text` inside a reply never reads as the prompt.
 PROMPTS = {"claude": r"\u276f", "codex": r"\u203a", "gemini": r"\u203a|\u2502 >|\u2500{8,}\n>"}
-HARD_NEG = r"Working\.\.\.|Thinking|esc to interrupt|Press Enter to continue|Do you trust"
+THINKING_ACTIVITY = r"(?m:^[ \t]*Thinking(?:\.{3}|…|[ \t]*\())"
+HARD_NEG = rf"Working\.\.\.|{THINKING_ACTIVITY}|esc to interrupt|Press Enter to continue|Do you trust"
 # #557: codex's `\u203a` REPL is interactive WHILE its MCP servers boot, but the
 # "Starting MCP servers (n/6) \u2026 (esc to interrupt)" status line trips HARD_NEG via
 # the "esc to interrupt" affordance. This pattern marks that boot status so the
@@ -68,7 +69,7 @@ SLEEP_CUT = r"computer went to sleep mid-response"
 THINKING_BLOCK = r"thinking.*block|invalid_request_error"
 CRASH = r"panic:|Traceback \(most recent|Segmentation fault|core dumped"
 UNSUBMITTED = r"\[context-ref\]|/shared/[0-9a-f]{6,}\.md"
-WORKING = r"esc to interrupt|Working\s*\(|Working\.\.\.|[\u2722\u2733\u2736\u273b\u273d]|\u23fa|\u27f3|Thinking|Compacting|Esc to interrupt"
+WORKING = rf"esc to interrupt|Working\s*\(|Working\.\.\.|[\u2722\u2733\u2736\u273b\u273d]|\u23fa|\u27f3|{THINKING_ACTIVITY}|Compacting|Esc to interrupt"
 # #1091: the ten BRAILLE cells above are the dots-spinner FRAMES, but a bare membership
 # test (`any(ch in tail for ch in BRAILLE)`) also matched grok's braille LOGO ART -- its
 # welcome box draws the xAI mark in braille, and with grok's whole TUI on one line the art
@@ -157,8 +158,8 @@ def tail(lines: list[str], count: int) -> str:
     return "\n".join(lines[-count:])
 
 
-def error_banner_lines(screen: str) -> list[str]:
-    """Share eligible error lines between the API and legacy tracker readers.
+def error_banner_lines(screen: str, count: int = 20) -> list[str]:
+    """Share eligible lines between the diagnostic and prompt readers.
 
     Text alone cannot authenticate an unmarked copy of a provider banner.
     Keep fence context from the whole capture, but match only its current tail.
@@ -182,13 +183,42 @@ def error_banner_lines(screen: str) -> list[str]:
         # Indented code is ineligible; readers anchor their recognized prefixes.
         if line.expandtabs(4).startswith("    "):
             continue
-        if index >= len(lines) - 20:
+        if index >= len(lines) - count:
             eligible.append(stripped)
     return eligible
 
 
 def has_api_error(screen: str) -> bool:
     return any(re.match(API_ERROR, line, re.I) for line in error_banner_lines(screen))
+
+
+def has_thinking_block(screen: str) -> bool:
+    lines = error_banner_lines(screen)
+    for index, line in enumerate(lines):
+        if not re.match(API_DIAGNOSTIC, line, re.I):
+            continue
+        if re.search(THINKING_BLOCK, line, re.I):
+            return True
+        # Provider diagnostics can wrap immediately after the API status line.
+        if index + 1 < len(lines) and re.match(
+            r"(?:invalid_request_error\b|thinking\b.*block)", lines[index + 1], re.I
+        ):
+            return True
+    return False
+
+
+def has_prompt(cli: str, screen: str, count: int = 20) -> bool:
+    prompt = PROMPTS.get(cli, r"\u276f|\u203a")
+    eligible = "\n".join(error_banner_lines(screen, count))
+    final_line = "\n".join(error_banner_lines(screen, 1))
+    # Collapsed captures can retain a final prompt without a line boundary.
+    # Its position is observable; text alone cannot authenticate its recency.
+    return (
+        re.search(rf"^[ \t]*(?:{prompt})", eligible, re.M) is not None
+        or re.search(rf"(?<!\S)(?:{prompt})[ \t]*\Z", final_line) is not None
+        # A bare final prompt remains observable after an unmatched output fence.
+        or re.fullmatch(rf"[ \t]*(?:{prompt})[ \t]*", tail(nonempty_lines(screen), 1)) is not None
+    )
 
 
 def cli_kind_of(command: str) -> str:
@@ -254,17 +284,11 @@ def tracker_class(screen: str) -> str:
     if not lines:
         return "blank"
     tail20 = tail(lines, 20)
-    last3 = tail(lines, 3)
     if any(re.match(TRACKER_ERR, line, re.I) for line in error_banner_lines(screen)):
         return "error"
     welcome_in_tail = re.search(TRACKER_WELCOME, tail20, re.I)
-    prompt_in_last3 = (
-        re.search(r"^[\u276f\u203a]", last3, flags=re.MULTILINE) is not None
-        or "\u276f" in last3
-        or "\u203a" in last3
-    )
-    placeholder = re.search(r'[\u276f\u203a]\s+Try "[^"]+"', last3)
-    if welcome_in_tail and (placeholder or prompt_in_last3):
+    prompt_in_last3 = has_prompt("", screen, 3)
+    if welcome_in_tail and prompt_in_last3:
         return "welcome"
     if has_spinner(tail20) or re.search(TRACKER_ACTIVE_TEXT, tail20, re.I):
         return "active"
@@ -284,8 +308,10 @@ def ready_by_screen(cli: str, screen: str) -> tuple[bool, str]:
     tail20 = tail(lines, 20)
     last3 = tail(lines, 3)
     banner = BANNERS.get(cli, r"Welcome|Initializing|Loading|Tips for getting started")
-    prompt = PROMPTS.get(cli, r"\u276f|\u203a")
+    prompt_observed = has_prompt(cli, screen)
 
+    if has_thinking_block(screen):
+        return False, "provider-rejection"
     if re.search(HARD_NEG, last3, re.I):
         # #557: a codex session mid MCP-server boot shows its interactive `›` REPL
         # alongside "Starting MCP servers (n/6) … (esc to interrupt)". That status
@@ -294,12 +320,12 @@ def ready_by_screen(cli: str, screen: str) -> tuple[bool, str]:
         codex_mcp_boot = (
             cli == "codex"
             and re.search(CODEX_MCP_BOOT, tail20, re.I)
-            and not re.search(r"Working|Thinking|Compacting", last3, re.I)
-            and re.search(prompt, tail20)
+            and not re.search(rf"Working|{THINKING_ACTIVITY}|Compacting", last3, re.I)
+            and prompt_observed
         )
         if not codex_mcp_boot:
             return False, "hard-negative"
-    if re.search(rf'(?m){prompt}\s+Try "[^"]+"', tail20) or re.search(prompt, tail20):
+    if prompt_observed:
         return True, "prompt"
     if re.search(banner, tail20, re.I):
         return False, "banner"
@@ -313,7 +339,7 @@ def classify_surface(cli: str, screen: str) -> tuple[str, str]:
     tail20 = tail(lines, 20)
     last4 = tail(lines, 4)
 
-    if re.search(THINKING_BLOCK, tail20, re.I):
+    if has_thinking_block(screen):
         return "thinking_block", "thinking-block / invalid request"
     if re.search(SANDBOX_PROMPT, tail20, re.I):
         return "sandbox_prompt", "sandbox approval prompt"
@@ -335,10 +361,9 @@ def classify_surface(cli: str, screen: str) -> tuple[str, str]:
         return "working", "working token"
 
     banner = BANNERS.get(cli, r"Welcome|Initializing|Loading|Tips for getting started")
-    prompt = PROMPTS.get(cli, r"\u276f|\u203a")
     if re.search(banner, tail20, re.I):
         return "welcome", "welcome/bootstrap banner"
-    if re.search(prompt, tail20):
+    if has_prompt(cli, screen):
         return "idle", "idle prompt"
     return SURFACE_UNKNOWN, "no known surface signal"
 

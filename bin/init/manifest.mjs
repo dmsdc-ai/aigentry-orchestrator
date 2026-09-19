@@ -26,6 +26,7 @@ const MANIFEST = [
   "bin/dispatch.sh",
   "bin/emit-telemetry.mjs",
   "bin/hitl.sh",
+  "bin/hook-prompt-submit.mjs",
   "bin/init/cli.mjs",
   "bin/init/manifest.mjs",
   "bin/init/preservation.mjs",

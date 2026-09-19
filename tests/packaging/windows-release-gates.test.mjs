@@ -441,10 +441,11 @@ acceptance('portable default evidence stays inside the private OS temporary dire
 });
 
 // Actual runner discovery/chaining regressions. Every copied runner sees only
-// synthetic compiled files and a sentinel at the explicit source-harness path.
+// synthetic compiled files and sentinels at the explicit security and harness paths.
 const callerSource = readFileSync(join(root, 'scripts/run-tests.mjs'), 'utf8');
 const staleGuardSource = readFileSync(join(root, 'scripts/stale-dist-guard.mjs'), 'utf8');
 const harnessRelative = 'tests/packaging/windows-release-gates.test.mjs';
+const securityRelative = 'tests/hitl/snyk-boundaries.test.mjs';
 function callerFixture(mode, symlinked = false) {
   const directory = mkdtempSync(join(admin, 'caller fixture '));
   const put = (path, source) => {
@@ -463,6 +464,7 @@ function callerFixture(mode, symlinked = false) {
     if (mode !== 'stale-test') put('tests/control.test.ts', compiled);
   }
   if (mode === 'stale-helper') put('dist/tests/orphan.js', '// synthetic stale helper\n');
+  if (mode !== 'missing-security') put(securityRelative, checks + `assert.equal(new URL(import.meta.url).pathname.endsWith('/${securityRelative}'), true);\nconsole.log('CALLER_SECURITY_SENTINEL');\nprocess.exit(${mode === 'failing-security' ? 8 : 0});\n`);
   if (mode !== 'missing-harness') put(harnessRelative, checks + `console.log('CALLER_SOURCE_SENTINEL');\nprocess.exit(${mode === 'sentinel-fail' ? 9 : 0});\n`);
   put('tests/packaging/unselected.test.mjs', "console.log('CALLER_UNSELECTED_MJS'); process.exit(99);\n");
   if (symlinked) {
@@ -474,15 +476,17 @@ function callerFixture(mode, symlinked = false) {
   return directory;
 }
 for (const symlinked of [false, true]) {
-for (const [mode, expected, compiled, sentinel, diagnostic] of [
-  ['pass', 0, true, true],
-  ['sentinel-fail', 1, true, true, /POSIX control harness failed with exit status: 1/],
-  ['compiled-fail', 1, true, false],
-  ['missing-harness', 1, true, false, /POSIX control harness failed with exit status: 1/],
-  ['empty', 1, false, false, /No compiled test files found/],
-  ['missing-dist', 1, false, false, /Failed to enumerate compiled tests/],
-  ['stale-test', 1, false, false, /stale compiled test: dist\/tests\/control.test.js/],
-  ['stale-helper', 1, false, false, /stale compiled helper: dist\/tests\/orphan.js/],
+for (const [mode, expected, compiled, security, sentinel, diagnostic] of [
+  ['pass', 0, true, true, true],
+  ['sentinel-fail', 1, true, true, true, /POSIX control harness failed with exit status: 1/],
+  ['compiled-fail', 1, true, true, false],
+  ['missing-security', 1, false, false, false, /tests[\\/]hitl[\\/]snyk-boundaries\.test\.mjs/],
+  ['failing-security', 1, true, true, false],
+  ['missing-harness', 1, true, true, false, /POSIX control harness failed with exit status: 1/],
+  ['empty', 1, false, false, false, /No compiled test files found/],
+  ['missing-dist', 1, false, false, false, /Failed to enumerate compiled tests/],
+  ['stale-test', 1, false, false, false, /stale compiled test: dist\/tests\/control.test.js/],
+  ['stale-helper', 1, false, false, false, /stale compiled helper: dist\/tests\/orphan.js/],
 ]) acceptance(`caller actual subprocess: ${mode}${symlinked ? ' through symlink' : ''}`, 'caller-actual', () => {
   const directory = callerFixture(mode, symlinked);
   const argv = ['scripts/run-tests.mjs'];
@@ -497,9 +501,11 @@ for (const [mode, expected, compiled, sentinel, diagnostic] of [
   assert.equal(result.signal, null);
   assert.equal(result.status, expected);
   assert.equal(result.stdout.includes('CALLER_COMPILED_CONTROL'), compiled);
+  assert.equal(result.stdout.includes('CALLER_SECURITY_SENTINEL'), security);
   assert.equal(result.stdout.includes('CALLER_SOURCE_SENTINEL'), sentinel);
   assert.ok(!result.stdout.includes('CALLER_UNSELECTED_MJS'), 'no automatic source .mjs discovery');
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_COMPILED_CONTROL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
+  if (security && sentinel) assert.ok(result.stdout.indexOf('CALLER_SECURITY_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (diagnostic) assert.match(result.stderr, diagnostic);
 });
 }
@@ -607,7 +613,7 @@ for (const item of vmCases) acceptance(`caller VM: ${item.name}`, 'caller-vm', (
   assert.equal(actual.status, item.status);
   assert.equal(actual.calls.length, item.calls);
   if (item.calls > 0) assert.deepEqual(actual.calls[0], { executable: process.execPath,
-    argv: ['--test', 'dist/tests/a.test.js', 'dist/tests/nested/b.test.js', 'dist/tests/z.test.js'],
+    argv: ['--test', 'dist/tests/a.test.js', 'dist/tests/nested/b.test.js', 'dist/tests/z.test.js', securityRelative],
     options: { cwd: actual.root, stdio: 'inherit' } });
   if (item.calls === 2) assert.deepEqual(actual.calls[1], { executable: process.execPath,
     argv: ['--test', harnessRelative], options: { cwd: actual.root, stdio: 'inherit', timeout: 180000, killSignal: 'SIGKILL' } });

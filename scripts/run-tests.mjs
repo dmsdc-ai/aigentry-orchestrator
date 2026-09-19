@@ -6,6 +6,7 @@ import { findStaleCompiled } from './stale-dist-guard.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const testsRoot = join(repoRoot, 'dist', 'tests');
+const sourceTestFiles = ['tests/hitl/snyk-boundaries.test.mjs'];
 
 function collectTestFiles(dir) {
   const files = [];
@@ -52,7 +53,7 @@ if (testFiles.length === 0) {
   process.exit(1);
 }
 
-const result = spawnSync(process.execPath, ['--test', ...testFiles], {
+const result = spawnSync(process.execPath, ['--test', ...testFiles, ...sourceTestFiles], {
   cwd: repoRoot,
   stdio: 'inherit',
 });
