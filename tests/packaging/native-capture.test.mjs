@@ -14,6 +14,45 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 
+const sha = bytes => createHash('sha256').update(bytes).digest('hex');
+function identity(s) {
+  return { dev: String(s.dev), ino: String(s.ino), uid: Number(s.uid), gid: Number(s.gid),
+    mode: Number(s.mode) & 0o7777, nlink: String(s.nlink), size: String(s.size),
+    mtimeNs: String(s.mtimeNs), ctimeNs: String(s.ctimeNs) };
+}
+function ancestry(file) {
+  const entries = [];
+  for (let current = file; ; current = path.dirname(current)) {
+    try {
+      const s = fs.lstatSync(current, { bigint: true });
+      entries.push({ path: current, ...identity(s), directory: s.isDirectory(),
+        regular: s.isFile(), symlink: s.isSymbolicLink() });
+    } catch (error) { entries.push({ path: current, error: error.code }); }
+    if (current === path.dirname(current)) return entries;
+  }
+}
+function executableImage(file) {
+  const s = fs.lstatSync(file, { bigint: true });
+  assert.ok(s.isFile() && !s.isSymbolicLink(), file);
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    assert.deepEqual(identity(fs.fstatSync(fd, { bigint: true })), identity(s));
+    const hash = sha(fs.readFileSync(fd));
+    assert.deepEqual(identity(fs.fstatSync(fd, { bigint: true })), identity(s));
+    assert.deepEqual(identity(fs.lstatSync(file, { bigint: true })), identity(s));
+    return { path: file, ...identity(s), hash };
+  } finally { fs.closeSync(fd); }
+}
+const originalNode = fs.realpathSync(process.execPath);
+// Capture and serialize host facts before fixture setup; persist them once the private root exists.
+const originalNodeBefore = executableImage(originalNode);
+const originalEvidence = JSON.stringify({ execPath: process.execPath, canonicalExecPath: originalNode,
+  platform: process.platform, arch: process.arch, version: process.version,
+  executable: originalNodeBefore, ancestors: ancestry(originalNode) }, null, 2);
+const testFile = fileURLToPath(import.meta.url);
+const testHashBefore = sha(fs.readFileSync(testFile));
+const manifestHashBefore = process.env.NATIVE_TEST_MANIFEST
+  ? sha(fs.readFileSync(process.env.NATIVE_TEST_MANIFEST)) : null;
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const source = fs.realpathSync(process.env.NATIVE_TEST_PACKAGE || repo);
 assert.ok(['darwin', 'linux'].includes(process.platform), 'native Windows capture remains unsupported');
@@ -39,12 +78,39 @@ fs.chmodSync(run, 0o700);
 assert.equal(fs.realpathSync(run), run);
 assert.equal(fs.statSync(run).mode & 0o777, 0o700);
 console.error(`Evidence retained: ${run}`);
-const NODE = fs.realpathSync(process.execPath);
-const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 const read = file => fs.readFileSync(file, 'utf8');
 const json = file => JSON.parse(read(file));
 const write = (file, bytes) => fs.writeFileSync(file, bytes, { mode: 0o600 });
 const mkdir = dir => fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+write(path.join(run, 'original-node-before.json'), originalEvidence);
+const runtimes = [];
+function privateRuntime(label, parentMode = 0o700) {
+  const dir = fs.mkdtempSync(path.join(run, `${label}-`));
+  fs.chmodSync(dir, 0o700);
+  assert.equal(fs.realpathSync(dir), dir);
+  assert.equal(fs.lstatSync(dir).uid, process.getuid());
+  assert.equal(fs.lstatSync(dir).mode & 0o7777, 0o700);
+  const file = path.join(dir, 'node');
+  assert.deepEqual(executableImage(originalNode), originalNodeBefore);
+  fs.copyFileSync(originalNode, file, fs.constants.COPYFILE_EXCL);
+  fs.chmodSync(file, 0o700);
+  const copied = executableImage(file);
+  assert.equal(fs.realpathSync(file), file);
+  assert.equal(copied.hash, originalNodeBefore.hash);
+  assert.equal(copied.uid, process.getuid());
+  assert.equal(copied.mode, 0o700);
+  assert.equal(copied.nlink, '1');
+  assert.ok(copied.dev !== originalNodeBefore.dev || copied.ino !== originalNodeBefore.ino);
+  assert.deepEqual(executableImage(originalNode), originalNodeBefore);
+  // Only the negative regression's newly created, test-owned parent becomes writable.
+  fs.chmodSync(dir, parentMode);
+  assert.equal(fs.lstatSync(dir).mode & 0o7777, parentMode);
+  const parent = fs.lstatSync(dir, { bigint: true });
+  runtimes.push({ executable: copied, parent: { path: dir, ...identity(parent) }, ancestors: ancestry(file) });
+  write(path.join(run, 'runtime-before.json'), JSON.stringify(runtimes, null, 2));
+  return file;
+}
+const NODE = privateRuntime('runtime');
 const nativeLeaves = ['bin/hook-prompt-submit.mjs', 'bin/init/native-capture.mjs', 'bin/init/preservation.mjs'];
 const commands = [];
 function snapshot(dir) {
@@ -115,17 +181,17 @@ function fixture() {
     KILL_CMD: path.join(f.ports, 'kill'), CURL: path.join(f.ports, 'curl') });
   return f;
 }
-function record(f, label, args, result) {
+function record(f, label, executable, args, result) {
   const id = `${commands.length}-${label}`;
   write(path.join(run, `${id}.stdout`), result.stdout || '');
   write(path.join(run, `${id}.stderr`), result.stderr || '');
-  commands.push({ id, command: NODE, args, cwd: f.workspace, status: result.status,
+  commands.push({ id, command: executable, args, cwd: f.workspace, status: result.status,
     signal: result.signal, error: result.error?.message, fixture: f.base });
   write(path.join(run, 'commands.json'), JSON.stringify(commands, null, 2));
   return result;
 }
-function invoke(f, label, args, env = {}) {
-  return record(f, label, args, spawnSync(NODE, args, { cwd: f.workspace,
+function invoke(f, label, args, env = {}, executable = NODE) {
+  return record(f, label, executable, args, spawnSync(executable, args, { cwd: f.workspace,
     env: { ...f.env, ...env }, encoding: 'utf8', timeout: 20000 }));
 }
 const initArgs = (f, extras = [], native = true) => [path.join(f.pkg, 'bin/init/cli.mjs'), 'init',
@@ -155,6 +221,23 @@ function blockedBoot(f) {
   }
   for (const flag of ['--help', '-h']) { const r = boot(f, [flag]); ok(r); assert.deepEqual(r.calls, []); }
 }
+
+test('actual native init accepts private executable ancestry and refuses a writable executable parent', () => {
+  const safe = fixture();
+  ok(init(safe));
+  assert.equal(stamp(safe).nativeCapture.node, NODE);
+  const insecureNode = privateRuntime('writable-runtime', 0o770);
+  assert.equal(executableImage(insecureNode).hash, executableImage(NODE).hash);
+  const unsafe = fixture();
+  const before = snapshot(unsafe.base);
+  const result = invoke(unsafe, 'writable-runtime-preflight', initArgs(unsafe), {}, insecureNode);
+  refused(result);
+  assert.match(result.stderr, /Native capture refused: missing, symlinked or writable ancestor/);
+  assert.deepEqual(snapshot(unsafe.base), before);
+  assert.equal(fs.existsSync(path.join(unsafe.workspace, '.codex/hooks.json')), false);
+  assert.equal(fs.existsSync(path.join(unsafe.workspace, '.aigentry-init.json')), false);
+  assert.equal(fs.existsSync(path.join(unsafe.workspace, '.aigentry-native-capture.lock')), false);
+});
 
 test('legacy actual init baseline, help and dry run stay read-only', () => {
   const f = fixture(), before = snapshot(f.workspace);
@@ -316,7 +399,7 @@ function concurrentInit(f, native) {
   return new Promise((resolve, reject) => {
     const child = spawn(NODE, args, { cwd: f.workspace, env: f.env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = ''; child.stdout.on('data', b => { stdout += b; }); child.stderr.on('data', b => { stderr += b; });
-    child.once('error', reject); child.once('close', (status, signal) => resolve(record(f, 'competing-init', args, { status, signal, stdout, stderr })));
+    child.once('error', reject); child.once('close', (status, signal) => resolve(record(f, 'competing-init', NODE, args, { status, signal, stdout, stderr })));
   });
 }
 test('three cross-process native-versus-legacy init competitions admit at most one writer', async () => {
@@ -343,10 +426,27 @@ test('probe contracts suppress actuation while real boot retains literal SIGKILL
 });
 
 test.after(() => {
+  const originalNodeAfter = executableImage(originalNode);
+  write(path.join(run, 'original-node-after.json'), JSON.stringify({ executable: originalNodeAfter,
+    ancestors: ancestry(originalNode) }, null, 2));
+  const runtimeAfter = runtimes.map(({ executable, parent }) => ({
+    executable: executableImage(executable.path),
+    parent: { path: parent.path, ...identity(fs.lstatSync(parent.path, { bigint: true })) },
+    ancestors: ancestry(executable.path),
+  }));
+  write(path.join(run, 'runtime-after.json'), JSON.stringify(runtimeAfter, null, 2));
+  assert.deepEqual(originalNodeAfter, originalNodeBefore);
+  for (let i = 0; i < runtimes.length; i++) {
+    assert.deepEqual(runtimeAfter[i].executable, runtimes[i].executable);
+    assert.deepEqual(runtimeAfter[i].parent, runtimes[i].parent);
+  }
+  assert.equal(sha(fs.readFileSync(testFile)), testHashBefore);
+  assert.equal(process.env.NATIVE_TEST_MANIFEST ? sha(fs.readFileSync(process.env.NATIVE_TEST_MANIFEST)) : null,
+    manifestHashBefore);
   verifyManifest(source); assert.deepEqual(sourceSnapshot(), frozenBefore);
   write(path.join(run, 'source-after.json'), JSON.stringify(sourceSnapshot(), null, 2));
   write(path.join(run, 'currentness.json'), JSON.stringify({ source, manifestFiles: manifest?.files.length,
     manifestHash: process.env.NATIVE_TEST_MANIFEST ? sha(fs.readFileSync(process.env.NATIVE_TEST_MANIFEST)) : null,
-    testHash: sha(fs.readFileSync(fileURLToPath(import.meta.url))), node: NODE, version: process.version,
+    testHash: testHashBefore, node: NODE, originalNode, runtimeUnchanged: true, version: process.version,
     sourceUnchanged: true, commands: commands.length, kind: manifest?.kind || 'local source' }, null, 2));
 });
