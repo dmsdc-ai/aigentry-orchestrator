@@ -20,6 +20,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { registryAvailable, registryEnvironment, registryInvocation } from "./registry-command.js";
+export { registryInvocation } from "./registry-command.js";
+
 import { USAGE } from "./usage.js";
 import { geminiBinary } from "../session/boot-adapter/gemini.js";
 
@@ -70,8 +73,8 @@ function captureOut(cmd: string, args: string[], extraEnv?: NodeJS.ProcessEnv): 
 }
 
 /** stdout+stderr both captured — the shell's `out=$(cmd 2>&1)`. */
-function captureBoth(cmd: string, args: string[]): { status: number; output: string } {
-  const r = (process.platform === "win32" ? crossSpawn.sync : spawnSync)(cmd, args, { encoding: "utf8" });
+function captureBoth(cmd: string, args: string[], childEnv?: NodeJS.ProcessEnv): { status: number; output: string } {
+  const r = spawnSync(cmd, args, { encoding: "utf8", shell: false, ...(childEnv ? { env: childEnv } : {}) });
   if (r.error) return { status: 127, output: String(r.error.message ?? "") };
   return { status: r.status ?? 1, output: (r.stdout ?? "") + (r.stderr ?? "") };
 }
@@ -245,39 +248,36 @@ function isReady(sid: string, cliKind: string): boolean {
 // The registry component is the single typed writer of the dispatch registry.
 // Its failure is the dispatch's failure.
 function registryMissing(): boolean {
-  if (isExecutable(DISPATCH_REGISTRY_PY)) return false;
+  if (registryAvailable(DISPATCH_REGISTRY_PY)) return false;
   process.stderr.write(
     `dispatch.sh: DISPATCH_NOT_RECORDED — registry component missing at ${DISPATCH_REGISTRY_PY}\n`,
   );
   return true;
 }
 
-/** Native Windows needs an interpreter; keep the script path and argv unmodified. */
-export function registryInvocation(script: string, args: string[], platform: NodeJS.Platform): { cmd: string; args: string[] } {
-  return platform === "win32"
-    ? { cmd: "python", args: [script, ...args] }
-    : { cmd: script, args };
-}
-
 /** `registry "$@"` with stdout+stderr captured (the check-dedup call site). */
 function registryBoth(args: string[]): { status: number; output: string } {
   if (registryMissing()) return { status: 9, output: "" };
   const invocation = registryInvocation(DISPATCH_REGISTRY_PY, args, process.platform);
-  return captureBoth(invocation.cmd, invocation.args);
+  return captureBoth(invocation.cmd, invocation.args, registryEnvironment());
 }
 
 /** `registry "$@"` with stdout captured, stderr passed through. */
 function registryOut(args: string[]): { status: number; stdout: string } {
   if (registryMissing()) return { status: 9, stdout: "" };
   const invocation = registryInvocation(DISPATCH_REGISTRY_PY, args, process.platform);
-  return captureOut(invocation.cmd, invocation.args);
+  const r = spawnSync(invocation.cmd, invocation.args, {
+    encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], shell: false, env: registryEnvironment(),
+  });
+  if (r.error) return { status: 127, stdout: "" };
+  return { status: r.status ?? 1, stdout: r.stdout ?? "" };
 }
 
 /** `registry "$@" >/dev/null` — status only. */
 function registryQuiet(args: string[]): number {
   if (registryMissing()) return 9;
   const invocation = registryInvocation(DISPATCH_REGISTRY_PY, args, process.platform);
-  const r = spawnSync(invocation.cmd, invocation.args, { stdio: ["ignore", "ignore", "inherit"] });
+  const r = spawnSync(invocation.cmd, invocation.args, { stdio: ["ignore", "ignore", "inherit"], shell: false, env: registryEnvironment() });
   if (r.error) return 127;
   return r.status ?? 1;
 }

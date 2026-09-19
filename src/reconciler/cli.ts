@@ -50,6 +50,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { registryEnvironment, registryInvocation } from "../dispatch/registry-command.js";
+
 import { USAGE } from "./usage.js";
 
 const env = process.env;
@@ -137,6 +139,7 @@ function run(cmd: string, args: string[], opts: RunOpts = {}): { status: number;
   const stdin = opts.stdin === undefined ? "ignore" : "pipe";
   const r = spawnSync(cmd, args, {
     encoding: "utf8",
+    shell: false,
     input: opts.stdin,
     stdio: [stdin, opts.out ?? "pipe", opts.err ?? "inherit"],
     env: opts.env ?? env,
@@ -367,7 +370,8 @@ function listingTrusted(raw: string): { trusted: boolean; verdict: string } {
 
 // ── registry (telepty#60 Stage A: every access is a typed call) ─────────────
 function registry(args: string[], opts: RunOpts = {}): { status: number; stdout: string } {
-  return run(DISPATCH_REGISTRY_PY, args, opts);
+  const invocation = registryInvocation(DISPATCH_REGISTRY_PY, args, process.platform);
+  return run(invocation.cmd, invocation.args, { ...opts, env: registryEnvironment(opts.env ?? env) });
 }
 
 function registrySetLifecycle(sid: string, state: string): void {

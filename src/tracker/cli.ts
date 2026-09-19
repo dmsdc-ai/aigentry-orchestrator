@@ -17,13 +17,14 @@
 // scrape, the commit-attribution filter — became TS: they were the
 // shell-dialect fragility this tranche exists to remove, not a component.
 //
-// No process.platform branch exists here because the shell had no OS arm: it was
-// already "shell + Python stdlib only, macOS + Linux" (Article 17).
+// Registry subprocesses use the shared native Python invocation seam.
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { registryEnvironment, registryInvocation } from "../dispatch/registry-command.js";
 
 import { cmdReportSweep } from "./report-sweep.js";
 import { USAGE } from "./usage.js";
@@ -82,6 +83,7 @@ interface RunOpts {
 function capture(cmd: string, args: string[], opts: RunOpts = {}): { status: number; stdout: string } {
   const r = spawnSync(cmd, args, {
     encoding: "utf8",
+    shell: false,
     ...(opts.env ? { env: { ...process.env, ...opts.env } } : {}),
     ...(opts.input === undefined ? {} : { input: opts.input }),
     stdio: [opts.input === undefined ? "ignore" : "pipe", "pipe", opts.stderr === "inherit" ? "inherit" : "ignore"],
@@ -98,8 +100,8 @@ function runQuiet(cmd: string, args: string[]): number {
 }
 
 /** Fully inherited stdio — a bare `cmd`. */
-function runInherit(cmd: string, args: string[]): number {
-  const r = spawnSync(cmd, args, { stdio: "inherit" });
+function runInherit(cmd: string, args: string[], childEnv?: NodeJS.ProcessEnv): number {
+  const r = spawnSync(cmd, args, { stdio: "inherit", shell: false, ...(childEnv ? { env: childEnv } : {}) });
   if (r.error) return 127;
   return r.status ?? 1;
 }
@@ -158,7 +160,8 @@ function nowIso(): string {
 // There is no local read/write path, so there is nothing here to fail open on a
 // corrupt registry: the component fails closed and this file inherits that.
 function registryCapture(args: string[]): { status: number; stdout: string } {
-  return capture(DISPATCH_REGISTRY_PY, args, { stderr: "inherit" });
+  const invocation = registryInvocation(DISPATCH_REGISTRY_PY, args, process.platform);
+  return capture(invocation.cmd, invocation.args, { stderr: "inherit", env: registryEnvironment() });
 }
 
 /**
@@ -167,7 +170,7 @@ function registryCapture(args: string[]): { status: number; stdout: string } {
  * rather than silently continuing past a registry that just refused a mutation.
  */
 function registryOrDie(args: string[]): void {
-  const rc = runInherit(DISPATCH_REGISTRY_PY, args);
+  const rc = registryRun(args);
   if (rc !== 0) process.exit(rc);
 }
 
@@ -177,7 +180,8 @@ function registryOrDie(args: string[]): void {
  * Same rule here: status observed, not fatal.
  */
 function registryRun(args: string[]): number {
-  return runInherit(DISPATCH_REGISTRY_PY, args);
+  const invocation = registryInvocation(DISPATCH_REGISTRY_PY, args, process.platform);
+  return runInherit(invocation.cmd, invocation.args, registryEnvironment());
 }
 
 // ── JSON field reads (the retired `json_get` / `_json_sub` python blocks) ────
@@ -793,7 +797,7 @@ function cmdStatus(sid: string): void {
  * out at all, and 0.8.0 has no way to learn it finished.
  */
 function cmdPrune(): void {
-  process.exit(runInherit(DISPATCH_REGISTRY_PY, ["prune", "--older-than-seconds", "86400"]));
+  process.exit(registryRun(["prune", "--older-than-seconds", "86400"]));
 }
 
 function usage(stream: NodeJS.WriteStream): void {

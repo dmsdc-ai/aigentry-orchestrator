@@ -72,6 +72,8 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
+import { registryAvailable, registryEnvironment, registryInvocation } from "../dispatch/registry-command.js";
+
 import { USAGE } from "./usage.js";
 
 const env = process.env;
@@ -202,8 +204,11 @@ function value(verb: string, args: string[], i: number): string {
 // ── the registry door ───────────────────────────────────────────────────────
 /** `is_keep_alive <sid>` — true when the dispatch opted out of automatic cleanup, AND on every failure. */
 function isKeepAlive(sid: string): boolean {
-  if (!executable(DISPATCH_REGISTRY_PY)) return true;
-  const r = spawnSync(DISPATCH_REGISTRY_PY, ["get", "--sid", sid, "--pointer", "keep_alive"], {
+  if (!registryAvailable(DISPATCH_REGISTRY_PY)) return true;
+  const invocation = registryInvocation(DISPATCH_REGISTRY_PY, ["get", "--sid", sid, "--pointer", "keep_alive"], process.platform);
+  const r = spawnSync(invocation.cmd, invocation.args, {
+    shell: false,
+    env: registryEnvironment(),
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],
   });

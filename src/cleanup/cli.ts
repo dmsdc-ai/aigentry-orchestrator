@@ -38,6 +38,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { registryAvailable, registryEnvironment, registryInvocation } from "../dispatch/registry-command.js";
+
 import { USAGE } from "./usage.js";
 
 const env = process.env;
@@ -83,8 +85,8 @@ function capture(cmd: string, args: string[]): { status: number; stdout: string 
 }
 
 /** `cmd >/dev/null 2>&1` — status only. */
-function runQuiet(cmd: string, args: string[]): number {
-  const r = spawnSync(cmd, args, { stdio: ["ignore", "ignore", "ignore"] });
+function runQuiet(cmd: string, args: string[], childEnv?: NodeJS.ProcessEnv): number {
+  const r = spawnSync(cmd, args, { stdio: ["ignore", "ignore", "ignore"], shell: false, ...(childEnv ? { env: childEnv } : {}) });
   if (r.error) return 127;
   return r.status ?? 1;
 }
@@ -467,11 +469,13 @@ function deleteSessionRegistry(sid: string): void {
  * drain them was to re-run this by hand, once per ghost.
  */
 function registryCleaned(sid: string): void {
-  if (!executable(DISPATCH_REGISTRY_PY)) return;
-  if (runQuiet(DISPATCH_REGISTRY_PY, ["observe", "--sid", sid, "--kind", "session_absent_observed", "--all"]) !== 0) {
+  if (!registryAvailable(DISPATCH_REGISTRY_PY)) return;
+  const observe = registryInvocation(DISPATCH_REGISTRY_PY, ["observe", "--sid", sid, "--kind", "session_absent_observed", "--all"], process.platform);
+  if (runQuiet(observe.cmd, observe.args, registryEnvironment()) !== 0) {
     return;
   }
-  runQuiet(DISPATCH_REGISTRY_PY, ["set-lifecycle", "--sid", sid, "--state", "cleaned", "--all"]);
+  const lifecycle = registryInvocation(DISPATCH_REGISTRY_PY, ["set-lifecycle", "--sid", sid, "--state", "cleaned", "--all"], process.platform);
+  runQuiet(lifecycle.cmd, lifecycle.args, registryEnvironment());
 }
 
 /** 0 on success (including the idempotent no-op), 1 on the Rule 28 protected refusal. */
