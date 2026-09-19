@@ -6,6 +6,7 @@ on:
       - tests/dispatch/windows-publication-probe.py
       - tests/dispatch/windows-publication-restricted.py
       - tests/dispatch/windows-publication-startup.py
+      - tests/dispatch/windows-publication-startup-debug.py
       - .github/workflows/windows-publication-probe.yml
   workflow_dispatch:
 
@@ -192,5 +193,50 @@ jobs:
         with:
           name: windows-publication-startup-receipt
           path: ${{ runner.temp }}/windows-publication-startup-*/windows-publication-startup-receipt.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Capture bounded owned-child startup debug events
+        if: always()
+        timeout-minutes: 5
+        shell: python
+        env:
+          PROBE_RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import uuid
+
+          # Same pinned interpreter, inherited environment and parent attestation.
+          parent = Path(os.environ['PROBE_RUNNER_TEMP']).resolve(strict=True)
+          diagnostic = Path('tests/dispatch/windows-publication-startup-debug.py').resolve(strict=True)
+          probe = Path('tests/dispatch/windows-publication-probe.py').resolve(strict=True)
+          root = parent / ('windows-startup-debug-' + uuid.uuid4().hex)
+          root.mkdir()
+          artifact = root / 'windows-startup-debug-receipt.json'
+          sys.exit(subprocess.call([
+              sys.executable, '-I', str(diagnostic), '--probe', str(probe),
+              '--parent', str(parent), '--artifact', str(artifact),
+              '--attest-local-unsynced-disposable-parent'], timeout=270))
+      - name: Preserve startup debug diagnostic when the collector could not start
+        if: always()
+        shell: pwsh
+        env:
+          PROBE_RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          $receiptPattern = Join-Path $env:PROBE_RUNNER_TEMP 'windows-startup-debug-*/windows-startup-debug-receipt.json'
+          if (-not (Test-Path -Path $receiptPattern)) {
+            $root = Join-Path $env:PROBE_RUNNER_TEMP ('windows-startup-debug-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+            $receiptPath = Join-Path $root 'windows-startup-debug-receipt.json'
+            '{"schema":"windows-startup-debug-v1","probe":"windows-startup-debug","status":"startup_diagnostic_only","outcome":"harness_did_not_emit_receipt","startupObservation":"not_observed","markerMatched":null,"debug":{"complete":false},"powerLossProven":false,"activationAuthorized":false,"ordinaryUserEvidence":"unresolved","obligations":{"O1":"unresolved","O2":"unresolved","O3":"unresolved","O4":"unresolved","O5":"unresolved"}}' | Set-Content -LiteralPath $receiptPath -Encoding utf8
+          }
+      - name: Upload sanitized startup debug diagnostic only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-startup-debug-receipt
+          path: ${{ runner.temp }}/windows-startup-debug-*/windows-startup-debug-receipt.json
           if-no-files-found: error
           retention-days: 7
