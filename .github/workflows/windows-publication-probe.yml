@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - tests/dispatch/windows-publication-probe.py
+      - tests/dispatch/windows-publication-restricted.py
       - .github/workflows/windows-publication-probe.yml
   workflow_dispatch:
 
@@ -95,5 +96,55 @@ jobs:
         with:
           name: windows-publication-receipt
           path: ${{ runner.temp }}/windows-publication-receipt.json
+          if-no-files-found: error
+          retention-days: 7
+
+  restricted-publication-probe:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.10'
+      - name: Measure separately attested restricted own-token capabilities
+        shell: python
+        env:
+          PROBE_RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          # This hosted runner's temp parent is attested local, unsynchronized and
+          # disposable. The supervisor and unchanged child also check fixed NTFS.
+          # Self-hosted runners require a new attestation; never repair ACLs here.
+          parent = Path(os.environ['PROBE_RUNNER_TEMP']).resolve(strict=True)
+          supervisor = Path('tests/dispatch/windows-publication-restricted.py').resolve(strict=True)
+          probe = Path('tests/dispatch/windows-publication-probe.py').resolve(strict=True)
+          artifact = parent / 'windows-publication-restricted-receipt.json'
+          sys.exit(subprocess.call([
+              sys.executable, '-I', str(supervisor), '--probe', str(probe),
+              '--parent', str(parent), '--artifact', str(artifact),
+              '--attest-local-unsynced-disposable-parent']))
+      - name: Preserve restricted diagnostic when the supervisor could not start
+        if: always()
+        shell: pwsh
+        env:
+          PROBE_RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          $receiptPath = Join-Path $env:PROBE_RUNNER_TEMP 'windows-publication-restricted-receipt.json'
+          if (-not (Test-Path -LiteralPath $receiptPath)) {
+            '{"schema":1,"probe":"windows-publication-restricted","status":"harness_did_not_emit_receipt","powerLossProven":false,"activationAuthorized":false,"ordinaryUserEvidence":"unresolved","obligations":{"O1":"unresolved","O2":"unresolved","O3":"unresolved","O4":"unresolved","O5":"unresolved"}}' | Set-Content -LiteralPath $receiptPath -Encoding utf8
+          }
+      - name: Upload sanitized restricted receipt only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-publication-restricted-receipt
+          path: ${{ runner.temp }}/windows-publication-restricted-receipt.json
           if-no-files-found: error
           retention-days: 7
