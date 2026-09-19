@@ -25,6 +25,7 @@ export { registryInvocation } from "./registry-command.js";
 
 import { USAGE } from "./usage.js";
 import { geminiBinary } from "../session/boot-adapter/gemini.js";
+import { loadWorkerScope, prepareWorkerSandbox, assertConfinedTarget, stageWorkerRef } from "../session/worker-sandbox.js";
 
 // ── environment seams (identical names/defaults to the shell) ────────────────
 // SCRIPT_DIR was `cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P` — the repo's
@@ -122,27 +123,6 @@ function emitTelemetry(args: string[]): void {
 function shellQuote(s: string): string {
   if (s !== "" && /^[A-Za-z0-9_@%+=:,./-]+$/.test(s)) return s;
   return "'" + s.replace(/'/g, `'\\''`) + "'";
-}
-
-/** #1084: grok/agy effort is opt-in (no default), so unset = the CLI's own default. */
-const optFlag = (flag: string, value: string | undefined): string => (value ? ` ${flag} ${shellQuote(value)}` : "");
-
-function defaultCliFlags(cli: string, childEnv: NodeJS.ProcessEnv): string {
-  switch (cli) {
-    case "claude":
-      return `--model ${shellQuote(childEnv.AIGENTRY_CLAUDE_MODEL || "claude-opus-5")} --effort "${env.AIGENTRY_CLAUDE_EFFORT || "xhigh"}" --permission-mode bypassPermissions`;
-    case "codex":
-      // #1084: codex has no effort flag; `-c model_reasoning_effort=` is its config override (measured 0.153.4).
-      return `-m ${shellQuote(childEnv.AIGENTRY_CODEX_MODEL || "gpt-6-astra")} -c model_reasoning_effort=${shellQuote(env.AIGENTRY_CODEX_EFFORT || "high")} -c check_for_update_on_startup=false --dangerously-bypass-approvals-and-sandbox`;
-    case "grok":
-      return `--always-approve -m ${shellQuote(childEnv.AIGENTRY_GROK_MODEL || "grok-4.6")}${optFlag("--reasoning-effort", env.AIGENTRY_GROK_EFFORT)}`;
-    case "gemini":
-      return geminiBinary(childEnv) === "agy"
-        ? `--model ${shellQuote(childEnv.AIGENTRY_GEMINI_MODEL || "gemini-3.8-flash-high")} --dangerously-skip-permissions${optFlag("--effort", env.AIGENTRY_GEMINI_EFFORT)}`
-        : `-m ${shellQuote(childEnv.AIGENTRY_GEMINI_MODEL || "gemini-2.5-flash")} --approval-mode yolo`;
-    default:
-      return "";
-  }
 }
 
 /** `tr -c 'A-Za-z0-9_.-' '_'` */
@@ -894,21 +874,25 @@ async function waitForReady(o: Opts, sid: string): Promise<number> {
 
 // ── the spawn arm (#431 / #532) ─────────────────────────────────────────────
 function spawnWorkspace(o: Opts, sid: string): void {
+  const scope = loadWorkerScope(env.AIGENTRY_WORKER_SCOPE, o.taskId, sid);
+  if (!o.role || !["claude", "codex"].includes(o.cli)) die(`dispatch.sh: SANDBOX_CLI_UNSUPPORTED: ${o.cli}; no unrestricted fallback`, 78);
   const spawnEnv: NodeJS.ProcessEnv = o.route && /^(llm|table)(-capped)?$/.test(o.route.decided_by)
     ? { [`AIGENTRY_${o.cli.toUpperCase()}_MODEL`]: o.route.model } : {};
   const childEnv = { ...env, ...spawnEnv };
   // #431 (ADR 2026-05-12 enforcement) — hybrid (b-2)+(c) boot wiring.
-  // boot-prepare.mjs failure = stderr WARNING + legacy spawn (not silent fail).
+  // A failed role boot must never fall back to an unrestricted CLI.
   let bootSpawnCli = "";
   let bootSpawnCwd = "";
+  let bootArgv: string[] = [];
   // #532: boot-prepare role wiring covers claude (flag-based) + codex/gemini
   // (additive cwd context file + config-home shadow).
   const bootEligible = o.cli === "claude" || o.cli === "codex" || o.cli === "gemini" || o.cli === "grok";
   if (bootEligible && o.role) {
-    const bootPrepare = path.join(SCRIPT_DIR, "boot-prepare.mjs");
+    // Resolve boot from this installed package, even when SCRIPT_DIR is a copied control workspace.
+    const bootPrepare = fileURLToPath(new URL("../../../bin/boot-prepare.mjs", import.meta.url));
     if (isExecutable(bootPrepare)) {
-      const r = captureOut("node", [bootPrepare, "--role", o.role, "--cwd", o.cwd, "--sid", sid, "--cli", o.cli], spawnEnv);
-      let parsed: { spawn_cli?: unknown; spawn_cwd?: unknown } | null = null;
+      const r = captureOut("node", [bootPrepare, "--role", o.role, "--cwd", o.cwd, "--sid", sid, "--cli", o.cli, "--confined"], spawnEnv);
+      let parsed: { spawn_cli?: unknown; spawn_cwd?: unknown; argv?: unknown } | null = null;
       if (r.status === 0 && r.stdout) {
         try {
           parsed = JSON.parse(r.stdout);
@@ -916,21 +900,19 @@ function spawnWorkspace(o: Opts, sid: string): void {
           parsed = null;
         }
       }
-      if (parsed && parsed.spawn_cli !== undefined && parsed.spawn_cwd !== undefined) {
+      if (parsed && parsed.spawn_cli !== undefined && parsed.spawn_cwd !== undefined &&
+          Array.isArray(parsed.argv) && parsed.argv.every(a => typeof a === "string")) {
         bootSpawnCli = String(parsed.spawn_cli);
         bootSpawnCwd = String(parsed.spawn_cwd);
+        bootArgv = parsed.argv;
       } else {
         process.stderr.write(
           `dispatch.sh: WARNING boot-prepare.mjs failed (exit ${r.status}) for sid=${sid} role=${o.role}\n`,
         );
-        process.stderr.write(
-          "dispatch.sh: WARNING falling back to legacy open-session.sh path; cwd CLAUDE.md auto-load risk active (#431)\n",
-        );
+        die("dispatch.sh: SANDBOX_BOOT_FAILED: unrestricted fallback refused", 78);
       }
     } else {
-      process.stderr.write(
-        `dispatch.sh: WARNING boot-prepare.mjs not executable at ${SCRIPT_DIR}; legacy path active (#431)\n`,
-      );
+      die(`dispatch.sh: SANDBOX_BOOT_MISSING: ${bootPrepare}`, 78);
     }
   }
   const workerHooksDir = installWorkerGitGuard();
@@ -945,14 +927,12 @@ function spawnWorkspace(o: Opts, sid: string): void {
     // dispatch-owned layer so worker push protection is not dependent on
     // boot-prepare (#509). display_cli = o.cli (#532) so the guard wrapper's
     // `exec -a <cli>` and telepty visibility match the actual CLI.
-    launcher = writeWorkerLauncher(sid, o.cli, bootSpawnCli, "", workerHooksDir, spawnEnv);
+    const protectedRoot = path.join(env.AIGENTRY_SESSIONS_ROOT || path.join(os.homedir(), ".aigentry", "sessions"), sid);
+    const sandbox = prepareWorkerSandbox(scope, o.cli, bootSpawnCwd, bootArgv, protectedRoot, o.cwd, workerHooksDir);
+    launcher = writeWorkerLauncher(sid, o.cli, sandbox.launcher, "", workerHooksDir, spawnEnv);
     spawnCwd = bootSpawnCwd;
   } else {
-    // The dispatch-owned launcher is the CLI so codex/claude/gemini all receive
-    // AIGENTRY_WORKER_SESSION + Git env-config without editing open-session.sh.
-    launcher = writeWorkerLauncher(sid, o.cli, o.cli === "gemini" ? geminiBinary(childEnv) : o.cli,
-      defaultCliFlags(o.cli, childEnv), workerHooksDir, spawnEnv);
-    spawnCwd = o.cwd;
+    die("dispatch.sh: SANDBOX_BOOT_REQUIRED", 78);
   }
   // Empty --extra-flags so open-session.sh's claude-default flags do NOT apply
   // (we control the full argv via the launcher).
@@ -985,6 +965,11 @@ async function main(argv: string[]): Promise<never> {
     sid = `${o.track}-${o.name}`;
   } else if (o.target) {
     sid = o.target;
+    try {
+      assertConfinedTarget(path.join(env.AIGENTRY_SESSIONS_ROOT || path.join(os.homedir(), ".aigentry", "sessions"), sid), sid, o.taskId);
+    } catch (e) {
+      die(`dispatch.sh: SANDBOX_TARGET_UNVERIFIED: ${String(e)}; preserve artifacts and respawn`, 78);
+    }
   } else {
     die("dispatch.sh: --target or --spawn-and-dispatch required", 4);
   }
@@ -1030,6 +1015,11 @@ async function main(argv: string[]): Promise<never> {
     const rc = await waitForReady(o, sid);
     if (rc !== 0) process.exit(rc);
     if (!prepareEffectiveRef(o, d)) process.exit(3);
+    try {
+      stageWorkerRef(path.join(env.AIGENTRY_SESSIONS_ROOT || path.join(os.homedir(), ".aigentry", "sessions"), sid), sid, o.taskId, d.effRef);
+    } catch (e) {
+      die(`dispatch.sh: SANDBOX_REF_REFUSED: ${String(e)}`, 78);
+    }
   }
 
   // Nothing fallible may run between this commit and the inject: a crash in

@@ -91,7 +91,7 @@ function usage() {
 }
 
 function parseArgs(argv) {
-  const out = { role: "", cwd: "", sid: "", cli: "claude" };
+  const out = { role: "", cwd: "", sid: "", cli: "claude", confined: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     switch (a) {
@@ -99,6 +99,7 @@ function parseArgs(argv) {
       case "--cwd": out.cwd = argv[++i] ?? ""; break;
       case "--sid": out.sid = argv[++i] ?? ""; break;
       case "--cli": out.cli = argv[++i] ?? ""; break;
+      case "--confined": out.confined = true; break;
       case "-h":
       case "--help":
         usage();
@@ -510,7 +511,7 @@ async function main() {
   // claude-only: pre-accept the fresh sandbox in ~/.claude.json (skips claude's
   // trust modal). gemini uses --skip-trust (§3.3); codex relies on
   // --dangerously-bypass-approvals-and-sandbox (folder-trust verified live, §5).
-  if (args.cli === "claude") {
+  if (args.cli === "claude" && !args.confined) {
     await ensureSandboxTrusted(sandboxCwd);
   }
 
@@ -578,7 +579,7 @@ async function main() {
   if (adapter.contextFile) {
     await copyFile(cmd.prompt_file, join(sandboxCwd, adapter.contextFile));
   }
-  if (adapter.homeEnv) {
+  if (adapter.homeEnv && !args.confined) {
     const homeRealEnv = process.env[adapter.homeEnv];
     const homeReal =
       homeRealEnv && homeRealEnv.length > 0
@@ -653,9 +654,12 @@ async function main() {
     `exec -a ${shellQuote(args.cli)} ${shellQuote(execName)} ${flagsLine} "$@"\n`;
   // writeFile with mode atomically sets +x — avoids a separate chmodSync call
   // (CWE-23 Snyk avoidance: single FS op on the validated path).
-  await writeFile(launcherPath, launcherBody, { mode: 0o755 });
+  await writeFile(launcherPath, args.confined
+    ? '#!/usr/bin/env bash\necho "Confined launch requires the dispatch sandbox supervisor" >&2\nexit 78\n'
+    : launcherBody, { mode: 0o755 });
 
   const out = {
+    argv: [execName, ...flagsArgv],
     spawn_cli: launcherPath,
     extra_flags: "",
     spawn_cwd: sandboxCwd,
