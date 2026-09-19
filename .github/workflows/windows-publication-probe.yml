@@ -5,6 +5,7 @@ on:
     paths:
       - tests/dispatch/windows-publication-probe.py
       - tests/dispatch/windows-publication-restricted.py
+      - tests/dispatch/windows-publication-startup.py
       - .github/workflows/windows-publication-probe.yml
   workflow_dispatch:
 
@@ -146,5 +147,50 @@ jobs:
         with:
           name: windows-publication-restricted-receipt
           path: ${{ runner.temp }}/windows-publication-restricted-receipt.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Diagnose restricted Python startup with a fixed marker
+        if: always()
+        timeout-minutes: 5
+        shell: python
+        env:
+          PROBE_RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import uuid
+
+          # Same hosted-runner temp-parent attestation and interpreter as above.
+          parent = Path(os.environ['PROBE_RUNNER_TEMP']).resolve(strict=True)
+          diagnostic = Path('tests/dispatch/windows-publication-startup.py').resolve(strict=True)
+          probe = Path('tests/dispatch/windows-publication-probe.py').resolve(strict=True)
+          root = parent / ('windows-publication-startup-' + uuid.uuid4().hex)
+          root.mkdir()
+          artifact = root / 'windows-publication-startup-receipt.json'
+          sys.exit(subprocess.call([
+              sys.executable, '-I', str(diagnostic), '--probe', str(probe),
+              '--parent', str(parent), '--artifact', str(artifact),
+              '--attest-local-unsynced-disposable-parent'], timeout=270))
+      - name: Preserve startup diagnostic when the diagnostic could not start
+        if: always()
+        shell: pwsh
+        env:
+          PROBE_RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          $receiptPattern = Join-Path $env:PROBE_RUNNER_TEMP 'windows-publication-startup-*/windows-publication-startup-receipt.json'
+          if (-not (Test-Path -Path $receiptPattern)) {
+            $root = Join-Path $env:PROBE_RUNNER_TEMP ('windows-publication-startup-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+            $receiptPath = Join-Path $root 'windows-publication-startup-receipt.json'
+            '{"schema":"windows-publication-startup-v1","probe":"windows-publication-startup","status":"startup_diagnostic_only","outcome":"harness_did_not_emit_receipt","startupObservation":"not_observed","markerMatched":null,"powerLossProven":false,"activationAuthorized":false,"ordinaryUserEvidence":"unresolved","obligations":{"O1":"unresolved","O2":"unresolved","O3":"unresolved","O4":"unresolved","O5":"unresolved"}}' | Set-Content -LiteralPath $receiptPath -Encoding utf8
+          }
+      - name: Upload sanitized startup diagnostic only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-publication-startup-receipt
+          path: ${{ runner.temp }}/windows-publication-startup-*/windows-publication-startup-receipt.json
           if-no-files-found: error
           retention-days: 7
