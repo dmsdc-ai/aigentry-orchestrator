@@ -150,11 +150,52 @@ class WinAPI:
 
     def rename(self, handle, target, replace=False):
         name = str(target).encode("utf-16-le")
-        size = max(ctypes.sizeof(RenameInfo), RenameInfo.name.offset + len(name))
+        pointer_bytes = ctypes.sizeof(W.HANDLE)
+        offsets = [getattr(RenameInfo, field).offset
+                   for field in ("replace", "root", "length", "name")]
+        layout = {"pointerBytes": pointer_bytes, "booleanBytes": ctypes.sizeof(W.BOOLEAN),
+                  "dwordBytes": ctypes.sizeof(W.DWORD), "wcharBytes": ctypes.sizeof(W.WCHAR),
+                  "structBytes": ctypes.sizeof(RenameInfo),
+                  "structAlignment": ctypes.alignment(RenameInfo), "fieldOffsets": offsets}
+        evidence = {"check": "FILE_RENAME_INFO_buffer", "layout": layout,
+                    "filenameBytes": len(name), "filenameSha256": digest(name)}
+        self.events.append(evidence)
+        # FileRenameInfo uses BOOLEAN ReplaceIfExists, with native HANDLE alignment.
+        layout_valid = (pointer_bytes in (4, 8) and layout["booleanBytes"] == 1
+                        and layout["dwordBytes"] == 4 and layout["wcharBytes"] == 2
+                        and offsets == [0, pointer_bytes, 2 * pointer_bytes,
+                                        2 * pointer_bytes + 4]
+                        and layout["structBytes"] == (24 if pointer_bytes == 8 else 16)
+                        and layout["structAlignment"] == pointer_bytes)
+        evidence["layoutValid"] = layout_valid
+        check(layout_valid, "rename_buffer_layout")
+        check(name and len(name) % 2 == 0 and "\0" not in str(target), "rename_filename_encoding")
+        # FileNameLength excludes the NUL; FileName still gets an explicit WCHAR NUL.
+        terminated_name = name + b"\0\0"
+        size = max(ctypes.sizeof(RenameInfo), RenameInfo.name.offset + len(terminated_name))
+        check(size <= 0xFFFFFFFF, "rename_buffer_dword_size")
         buffer = ctypes.create_string_buffer(size)
+        # This view and its owning buffer remain alive through the synchronous call.
         info = RenameInfo.from_buffer(buffer)
         info.replace, info.root, info.length = replace, None, len(name)
-        ctypes.memmove(ctypes.addressof(buffer) + RenameInfo.name.offset, name, len(name))
+        ctypes.memmove(ctypes.addressof(buffer) + RenameInfo.name.offset,
+                       terminated_name, len(terminated_name))
+        name_end = RenameInfo.name.offset + len(name)
+        raw = buffer.raw
+        invariants = {
+            "allocationExact": len(raw) == size,
+            "terminatedNameFits": name_end + 2 <= size,
+            "filenameBytesMatch": raw[RenameInfo.name.offset:name_end] == name,
+            "nulTerminated": raw[name_end:name_end + 2] == b"\0\0",
+            "lengthExcludesNul": info.length == len(name),
+            "headerPreserved": info.replace == replace and info.root is None,
+            "viewSharesBuffer": ctypes.addressof(info) == ctypes.addressof(buffer),
+            "bufferAligned": ctypes.addressof(buffer) % ctypes.alignment(RenameInfo) == 0,
+        }
+        evidence.update(bufferBytes=size, filenameLength=info.length,
+                        terminatorOffset=name_end, terminatorHex=raw[name_end:name_end + 2].hex(),
+                        invariants=invariants)
+        check(all(invariants.values()), "rename_buffer_invariants")
         self.call("SetFileInformationByHandle", handle, 3, buffer, size,
                   infoClass="FileRenameInfo", replaceIfExists=replace,
                   filenameBytes=len(name), bufferBytes=size, target=target.name,
