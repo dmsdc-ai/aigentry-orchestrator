@@ -73,6 +73,7 @@ import { fileURLToPath } from "node:url";
 
 import { LEGACY_CMUX_SPAWN } from "./legacy-spawn.js";
 import { USAGE } from "./usage.js";
+import { geminiBinary } from "../boot-adapter/gemini.js";
 
 const env = process.env;
 
@@ -95,6 +96,10 @@ const CONFIG_FILE = env.AIGENTRY_CONFIG || path.join(HOME, ".aigentry/config.jso
 /** bash `$(cmd)`: command substitution strips every trailing newline. */
 function chomp(s: string): string {
   return s.replace(/\n+$/, "");
+}
+
+function shellQuote(s: string): string {
+  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(s) ? s : "'" + s.replace(/'/g, "'\\''") + "'";
 }
 
 interface RunOpts {
@@ -333,13 +338,19 @@ switch (cli) {
     break;
   case "codex":
     if (!extraFlags) {
-      extraFlags = "-c check_for_update_on_startup=false --dangerously-bypass-approvals-and-sandbox";
+      extraFlags = `-m ${shellQuote(env.AIGENTRY_CODEX_MODEL || "gpt-6-astra")} -c check_for_update_on_startup=false --dangerously-bypass-approvals-and-sandbox`;
     }
     break;
   case "gemini":
     if (!extraFlags) {
-      extraFlags = `-m ${env.AIGENTRY_GEMINI_MODEL || "gemini-2.5-flash"} --approval-mode yolo`;
+      extraFlags = geminiBinary(env) === "agy"
+        ? `--model ${shellQuote(env.AIGENTRY_GEMINI_MODEL || "gemini-3.8-flash-high")} --dangerously-skip-permissions`
+        : `-m ${shellQuote(env.AIGENTRY_GEMINI_MODEL || "gemini-2.5-flash")} --approval-mode yolo`;
     }
+    cli = geminiBinary(env);
+    break;
+  case "grok":
+    if (!extraFlags) extraFlags = `--always-approve -m ${shellQuote(env.AIGENTRY_GROK_MODEL || "grok-4.6")}`;
     break;
   default:
     break;

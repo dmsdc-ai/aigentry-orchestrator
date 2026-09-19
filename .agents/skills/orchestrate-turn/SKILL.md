@@ -48,7 +48,7 @@ Parallel is not a preference — it is the required default (**Rule 36**, 2026-0
 > **If skipped:** an undecomposed monolith goes to one session and independent work serializes into pure wall-clock waiting (Rule 36 violation), or a sequential wave leaves no recorded reason to audit. Two sessions edit the same file → merge corruption / lost work. Shared `--track` → shared-fate cascade-kill. ≥3 parallel without deliberation → no conflict detection, silent divergence.
 
 ### 1-3 Match the CLI to the task
-Pick `--cli` by strength: claude (architecture, integration, MCP, debugging), codex (impl, porting, tests), gemini (web search, docs). Pass `--role` so the worker boots in its role-sandbox (Rule 4 cwd→role boundary).
+Fresh dispatches use the model router by default; explicit `--cli` overrides it. Pass `--role` so the worker boots in its role-sandbox (Rule 4 cwd→role boundary).
 
 > **If skipped:** `--role` omitted → worker auto-discovers cwd CLAUDE.md and self-IDs as orchestrator (#431 regression). Wrong CLI → low-quality output you re-delegate anyway.
 

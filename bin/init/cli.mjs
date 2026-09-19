@@ -13,6 +13,10 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import readline from "node:readline/promises";
+import {
+  NATIVE_FILES, assertNoNativeOperation, prepareNativeCapture, beginNativeCapture,
+  commitNativeCapture, inspectNativeOperation, restoreNativeOperation, beginLegacyInit,
+} from "./native-capture.mjs";
 
 import {
   MANIFEST,
@@ -25,7 +29,7 @@ import {
   FOREIGN_CONFIG_KEYS,
 } from "./manifest.mjs";
 
-const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const PKG_ROOT = path.resolve(path.dirname(fs.realpathSync.native(fileURLToPath(import.meta.url))), "..", "..");
 const PKG = JSON.parse(fs.readFileSync(path.join(PKG_ROOT, "package.json"), "utf8"));
 const AIGENTRY_HOME = process.env.AIGENTRY_HOME || path.join(os.homedir(), ".aigentry");
 
@@ -37,6 +41,17 @@ const USAGE = `aigentry-orchestrator init [--workspace PATH] [--yes] [--dry-run]
   --dry-run         run the checks, print every path that would be touched, write nothing
   --force           overwrite an already-initialised workspace
   --upgrade         re-copy the manifest into an existing workspace; state/ is never touched
+  --capture-root ABS       existing canonical private capture root (mode 0700)
+  --preservation-root ABS  existing canonical private backup root (mode 0700)
+                          supply both to install native capture; roots must be disjoint
+                          from workspace, AIGENTRY_HOME and cleanup roots
+  --inspect-native UUID   read-only native operation inspection; supply both roots
+  --restore-native UUID   explicitly restore unchanged owned outputs; supply both roots
+                          retains capture evidence, receipts and backups
+
+Native setup requires preexisting workspace and AIGENTRY_HOME roots. It preserves
+unowned/shared .codex/hooks.json even under --force/--yes. Installation requires
+interactive /hooks review; it does not establish capture readiness or trust.
 `;
 
 const summary = { written: [], preserved: [], skipped: [], warned: [] };
@@ -66,7 +81,8 @@ function binFilesUsing(tool) {
 }
 
 function parseArgs(argv) {
-  const opts = { workspace: null, yes: false, dryRun: false, force: false, upgrade: false };
+  const opts = { workspace: null, yes: false, dryRun: false, force: false, upgrade: false,
+    captureRoot: null, preservationRoot: null, inspectNative: null, restoreNative: null };
   const rest = [...argv];
   const cmd = rest.shift();
   while (rest.length) {
@@ -76,11 +92,24 @@ function parseArgs(argv) {
     else if (a === "--dry-run") opts.dryRun = true;
     else if (a === "--force") opts.force = true;
     else if (a === "--upgrade") opts.upgrade = true;
+    else if (["--capture-root", "--preservation-root", "--inspect-native", "--restore-native"].includes(a)) {
+      const value = rest.shift();
+      if (!value || value.startsWith("--")) die(1, `${a} requires a value`);
+      const key = { "--capture-root": "captureRoot", "--preservation-root": "preservationRoot",
+        "--inspect-native": "inspectNative", "--restore-native": "restoreNative" }[a];
+      if (opts[key] !== null) die(1, `${a} may be supplied only once`);
+      opts[key] = value;
+    }
     else {
       console.error(`unknown argument: ${a}\n\n${USAGE}`);
       process.exit(1);
     }
   }
+  if (Boolean(opts.captureRoot) !== Boolean(opts.preservationRoot))
+    die(1, "--capture-root and --preservation-root must be supplied together");
+  if ((opts.inspectNative || opts.restoreNative) && !opts.captureRoot)
+    die(1, "native inspect/restore requires both explicit roots");
+  if (opts.inspectNative && opts.restoreNative) die(1, "choose one native operation");
   return { cmd, opts };
 }
 
@@ -252,6 +281,7 @@ function copyManifest(ws, opts) {
   step("Step 3 — governance layer");
   const changed = [];
   for (const rel of MANIFEST) {
+    if (opts.captureRoot && NATIVE_FILES.includes(rel)) continue; // Preservation is the sole writer.
     const src = path.join(PKG_ROOT, rel);
     const dest = path.join(ws, rel);
     const existed = fs.existsSync(dest);
@@ -470,18 +500,11 @@ ${notInstalled}
   console.log(text);
 }
 
-function stamp(ws, subs) {
+function stampValue(ws, subs) {
   const h = createHash("sha256");
   for (const rel of MANIFEST)
     h.update(rel).update("\0").update(createHash("sha256").update(fs.readFileSync(path.join(PKG_ROOT, rel))).digest());
-  fs.writeFileSync(
-    path.join(ws, ".aigentry-init.json"),
-    JSON.stringify(
-      { version: PKG.version, installedAt: subs["{{CREATED_AT}}"], manifestDigest: h.digest("hex"), workspace: ws },
-      null,
-      2,
-    ) + "\n",
-  );
+  return { version: PKG.version, installedAt: subs["{{CREATED_AT}}"], manifestDigest: h.digest("hex"), workspace: ws };
 }
 
 function dryRun(ws) {
@@ -502,6 +525,11 @@ function dryRun(ws) {
 // ------------------------------------------------------------------------------- main
 
 async function main() {
+  // Help must return before parsing or invoking dependency/probe subprocesses.
+  if (process.argv.slice(2).some((arg) => arg === "--help" || arg === "-h")) {
+    console.log(USAGE);
+    return;
+  }
   const { cmd, opts } = parseArgs(process.argv.slice(2));
   if (cmd === "--help" || cmd === "-h" || cmd === undefined) {
     console.log(USAGE);
@@ -518,10 +546,29 @@ async function main() {
 
   console.log(`aigentry-orchestrator ${PKG.version} — init`);
   platformGate();
+  if (opts.inspectNative || opts.restoreNative) {
+    const ws = opts.workspace || process.env.AIGENTRY_CONTROL_WORKSPACE;
+    if (!ws || !path.isAbsolute(ws)) die(4, "native inspect/restore requires an explicit absolute workspace");
+    const request = { workspace: ws, home: AIGENTRY_HOME, captureRoot: opts.captureRoot,
+      preservationRoot: opts.preservationRoot };
+    const id = opts.inspectNative || opts.restoreNative;
+    const result = opts.inspectNative || opts.dryRun
+      ? inspectNativeOperation(request, id) : restoreNativeOperation(request, id);
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
   dependencyChecks();
   const { ws } = await resolveWorkspace(opts);
+  assertNoNativeOperation(ws, AIGENTRY_HOME);
+  const existingStamp = path.join(ws, ".aigentry-init.json");
+  if (!opts.captureRoot && fs.existsSync(existingStamp) &&
+    JSON.parse(fs.readFileSync(existingStamp, "utf8")).nativeCapture)
+    die(4, "capture-configured workspace: supply both explicit capture/preservation roots before re-init");
+  const native = opts.captureRoot ? prepareNativeCapture({ workspace: ws, home: AIGENTRY_HOME,
+    captureRoot: opts.captureRoot, preservationRoot: opts.preservationRoot, packageRoot: PKG_ROOT }) : null;
 
   if (opts.dryRun) {
+    if (native) info(`would register synchronous UserPromptSubmit at ${path.join(ws, ".codex/hooks.json")}; pending /hooks review`);
     dryRun(ws);
     process.exit(0);
   }
@@ -534,14 +581,28 @@ async function main() {
   };
 
   verifyPackageComplete();
+  if (!native) fs.mkdirSync(ws, { recursive: true });
+  const finishLegacy = native ? null : beginLegacyInit(ws, AIGENTRY_HOME);
+  if (!native && fs.existsSync(existingStamp) &&
+    JSON.parse(fs.readFileSync(existingStamp, "utf8")).nativeCapture)
+    die(4, "workspace became capture-configured; explicit native setup required");
+  const nativeTx = native ? beginNativeCapture(native) : null;
   copyManifest(ws, opts);
   createState(ws, opts);
   const scaffoldWritten = await scaffold(ws, opts, subs);
   substituteAll(ws, scaffoldWritten, subs);
-  stamp(ws, subs);
+  const stamp = stampValue(ws, subs);
+  if (nativeTx) {
+    const installed = commitNativeCapture(nativeTx, stamp);
+    console.error(`Native capture installed/pending-review: ${path.join(ws, ".codex/hooks.json")}\n` +
+      `UserPromptSubmit definition SHA-256: ${installed.definitionHash}\n` +
+      "Open /hooks in this workspace to review. Effective trust/enabled state is unverified.\n" +
+      `Native preservation operation: ${installed.operationId}`);
+  } else fs.writeFileSync(path.join(ws, ".aigentry-init.json"), JSON.stringify(stamp, null, 2) + "\n");
 
   const scaffoldCount = MANIFEST.filter((p) => p.startsWith(SCAFFOLD_PREFIX)).length;
   guidance(ws, { governance: MANIFEST.length - scaffoldCount, scaffold: scaffoldCount });
+  if (finishLegacy) finishLegacy();
 
   step("Step 8 — summary");
   console.log(

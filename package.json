@@ -1,25 +1,33 @@
 {
   "name": "@dmsdc-ai/aigentry-orchestrator",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Aigentry orchestrator session/persistence library (ADR §6 #14 et al.)",
   "license": "MIT",
   "engines": {
-    "node": ">=20"
+    "node": ">=20.11.0"
   },
   "scripts": {
     "build": "tsc -p .",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "prepack": "npm run build",
     "test": "tsc -p . && node scripts/run-tests.mjs",
+    "test:browser-tls": "node tests/hitl/browser-tls.acceptance.mjs",
     "test:adr-mf": "tsc -p . && node --test dist/tests/session/deep-hierarchy.test.js dist/tests/session/no-implicit-inheritance.test.js dist/tests/session/digest-reproducibility.test.js dist/tests/session/boot-adapter-conformance.test.js dist/tests/session/persistence-protocol.test.js dist/tests/session/warn-mode-telemetry.test.js dist/tests/session/cycle-detection.test.js"
   },
   "dependencies": {
+    "@anthropic-ai/sandbox-runtime": "0.0.76",
     "@dmsdc-ai/aigentry-logger": "^0.2.0",
     "@dmsdc-ai/aigentry-ssot": "^1.0.0",
-    "@dmsdc-ai/aigentry-telepty": "^0.8.0"
+    "@dmsdc-ai/aigentry-telepty": "^0.8.0",
+    "@simplewebauthn/server": "14.0.2",
+    "cross-spawn": "7.0.6"
   },
   "devDependencies": {
+    "@levischuck/tiny-cbor": "0.2.11",
+    "@types/cross-spawn": "6.0.6",
     "@types/node": "^20.11.0",
+    "playwright": "1.58.2",
     "typescript": "^5.4.0"
   },
   "files": [
@@ -31,6 +39,7 @@
     ".claude/settings.json",
     ".claude/hooks",
     "docs/rules.md",
+    "docs/model-profiles/model-routing-profile.md",
     "docs/templates",
     "git-hooks",
     "AGENTS.md",

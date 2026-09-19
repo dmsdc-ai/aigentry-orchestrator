@@ -34,6 +34,8 @@ export function semverGte(installed: string, minimum: string): boolean {
 export interface AdapterConfig {
   name: CliKind;
   min_version: string;
+  // agy has no --version; verify its required flags through --help instead.
+  capabilityProbe?: { executable: string; flags: readonly string[] };
   // #532 additive role-injection descriptor (see BootAdapter in types.ts).
   // Defaulted for claude (flag-based), set for codex/gemini.
   contextFile?: string | null;
@@ -83,7 +85,16 @@ export function makeAdapter(cfg: AdapterConfig): BootAdapter {
       resolved: ResolvedInstructions,
       opts: BuildOptions,
     ): Promise<BootCommand> {
-      await versionGate(opts.spawner);
+      if (cfg.capabilityProbe) {
+        const { executable, flags } = cfg.capabilityProbe;
+        const help = await opts.spawner.run({ argv: [executable, "--help"], env: {},
+          cwd: ctx.cwd, prompt_file: "", expected_digest: "" }, "", 5000);
+        if (help.exit_code !== 0 || flags.some((f) => !(help.stdout + help.stderr).includes(f))) {
+          throw new BootAdapterError("CLI_VERSION_DRIFT", `${executable}: required flags missing`);
+        }
+      } else {
+        await versionGate(opts.spawner);
+      }
       await opts.fs.mkdirP(opts.staging_dir);
       const prompt_file = path.join(opts.staging_dir, "effective_prompt.md");
       await opts.fs.writeFile(prompt_file, canonicalBytes(resolved.effective_prompt));

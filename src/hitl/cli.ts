@@ -70,6 +70,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { registryEnvironment, registryInvocation } from "../dispatch/registry-command.js";
+
 import { atomicWrite } from "../session/persistence/atomic-write.js";
 import { USAGE } from "./usage.js";
 
@@ -120,8 +122,8 @@ function chomp(s: string): string {
 }
 
 /** `cmd >/dev/null 2>&1` — status only. 127 for an unrunnable command, as bash. */
-function runQuiet(cmd: string, args: string[]): number {
-  const r = spawnSync(cmd, args, { stdio: ["ignore", "ignore", "ignore"] });
+function runQuiet(cmd: string, args: string[], childEnv?: NodeJS.ProcessEnv): number {
+  const r = spawnSync(cmd, args, { stdio: ["ignore", "ignore", "ignore"], shell: false, ...(childEnv ? { env: childEnv } : {}) });
   if (r.error) return 127;
   return r.status ?? 1;
 }
@@ -251,12 +253,16 @@ function notifyGate(file: string): boolean {
 // never overwrites the lifecycle — it sets gate.state and clears it again, with the
 // lifecycle preserved underneath by the registry.
 function registryQuiet(args: string[]): number {
-  return runQuiet(DISPATCH_REGISTRY_PY, args);
+  const invocation = registryInvocation(DISPATCH_REGISTRY_PY, args, process.platform);
+  return runQuiet(invocation.cmd, invocation.args, registryEnvironment());
 }
 
 /** `registry_lifecycle <sid>` — current lifecycle state ("" when absent). */
 function registryLifecycle(sid: string): string {
-  const r = spawnSync(DISPATCH_REGISTRY_PY, ["get", "--sid", sid, "--pointer", "lifecycle.state"], {
+  const invocation = registryInvocation(DISPATCH_REGISTRY_PY, ["get", "--sid", sid, "--pointer", "lifecycle.state"], process.platform);
+  const r = spawnSync(invocation.cmd, invocation.args, {
+    shell: false,
+    env: registryEnvironment(),
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],
   });

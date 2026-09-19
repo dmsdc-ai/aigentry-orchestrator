@@ -36,11 +36,30 @@ Usage:
                                         pids it WOULD SIGKILL (and why each other row
                                         was skipped), and the argv it WOULD exec.
                                         exit 0. No DELETE, no kill, no exec.
+  bin/orchestrator-boot.sh __probe ...  internal read-only inspection: guard and
+                                        reconcile probes never DELETE or signal.
 
 Booting requires an EMPTY argv. Any argument at all — a flag, a typo, anything —
 takes a non-booting path, so inspecting this script cannot start a control tower.
 
+Run from this repo root: exec inherits cwd; Codex reads AGENTS.md here (CLAUDE.md is a stub).
+
+Capture-configured Codex boot validates installed package measurements, private roots,
+registration and operation state before reconciliation or bridge cleanup. Failure exits
+2 without executable argv. Dry-run and probes perform the same read-only validation.
+After static checks, normal interactive launch remains available for /hooks review.
+Capture is installed/pending-review; current enabled/trust state remains unverified.
+File hashes and old receipts do not establish readiness or authenticated release origin.
+Native Windows, other caller paths and timeout/kill admission guarantees remain open.
+
 Env:
+  ORCHESTRATOR_CLI          claude (default, also when empty) or codex; unknown values
+                            are refused with exit 2 and usage (except --help).
+                            claude uses --dangerously-skip-permissions --continue.
+                            codex uses resume --last --dangerously-bypass-approvals-and-sandbox.
+                            This order is accepted by Codex's resume --help parser.
+                            resume --last continues the most recent session, without
+                            the picker, using cwd filtering; Codex has no --continue flag.
   ORCHESTRATOR_SID          orchestrator session id (default: orchestrator) — same
                             source as bin/dispatch-tracker.sh (Rule 16, no hardcode).
                             A control character in it is refused (exit 2) on every
@@ -56,6 +75,9 @@ Env:
                             this process). Never kills itself or any ancestor (#539).
   AIGENTRY_SHIM_SCRIPT_DIR  bin/ directory, exported by the shim so a symlinked
                             entrypoint still locates bin/lib/telepty-auth.sh.
+  AIGENTRY_HOME             capture installation's home root (default: ~/.aigentry).
+  DISPATCH_STATE_DIR        optional cleanup scheduler state root; capture and backup
+                            roots must remain disjoint from it.
 
 Boot the orchestrator via THIS script, not a bare 'telepty allow'. Worker sessions
 boot via bin/session-start.sh. See AGENTS.md.`;

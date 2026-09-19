@@ -71,8 +71,8 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname, join, posix, resolve, sep, win32 } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, "..");
@@ -84,14 +84,14 @@ function die(msg, code = 1) {
 
 function usage() {
   process.stdout.write(
-    "Usage: boot-prepare.mjs --role R --cwd C --sid S [--cli claude|codex|gemini]\n" +
+    "Usage: boot-prepare.mjs --role R --cwd C --sid S [--cli claude|codex|gemini|grok]\n" +
       "  Emits a JSON object on stdout with {spawn_cli, extra_flags, spawn_cwd, env}.\n" +
       "  Exits non-zero on any error.\n",
   );
 }
 
 function parseArgs(argv) {
-  const out = { role: "", cwd: "", sid: "", cli: "claude" };
+  const out = { role: "", cwd: "", sid: "", cli: "claude", confined: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     switch (a) {
@@ -99,6 +99,7 @@ function parseArgs(argv) {
       case "--cwd": out.cwd = argv[++i] ?? ""; break;
       case "--sid": out.sid = argv[++i] ?? ""; break;
       case "--cli": out.cli = argv[++i] ?? ""; break;
+      case "--confined": out.confined = true; break;
       case "-h":
       case "--help":
         usage();
@@ -296,9 +297,8 @@ async function buildShadowHome(homeReal, homeShadow, exclude) {
   }
 }
 
-// TOML basic-string quoting for a `[projects."<path>"]` key. Paths are absolute
-// POSIX (assertCwdSafe-validated) so backslash/quote are not expected, but escape
-// the two basic-string metachars defensively to keep emitted TOML valid.
+// TOML basic-string quoting for a `[projects."<path>"]` key. Escape backslashes
+// and quotes in native absolute paths to keep emitted TOML valid.
 function tomlBasicString(s) {
   return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
@@ -440,8 +440,18 @@ function assertSidSafe(sid) {
 }
 
 function assertCwdSafe(cwd) {
-  // Allow only absolute POSIX paths. Rejects `..`, relative paths, NUL.
-  if (cwd.length === 0 || cwd[0] !== "/" || cwd.includes("\0") || /(^|\/)\.\.(\/|$)/.test(cwd)) {
+  // Classify native absolute paths without normalizing away raw traversal.
+  const windows = process.platform === "win32";
+  const path = windows ? win32 : posix;
+  const classified = windows ? cwd.replace(/\//g, "\\") : cwd;
+  const root = path.parse(classified).root;
+  const namespace = windows && /^\\{1,2}(?:\?{1,2}|\.)\\/.test(classified);
+  const completeRoot = windows
+    ? /^[A-Za-z]:\\$/.test(root) || /^\\\\[^\\]+\\[^\\]+\\?$/.test(root)
+    : root === "/";
+  const traversal = windows ? /(^|[\\/])\.\.([\\/]|$)/ : /(^|\/)\.\.(\/|$)/;
+  if (cwd.length === 0 || cwd.includes("\0") || traversal.test(cwd) ||
+      namespace || !path.isAbsolute(classified) || !completeRoot) {
     die(`--cwd must be an absolute path without '..' segments: ${JSON.stringify(cwd)}`, 4);
   }
 }
@@ -456,7 +466,7 @@ async function main() {
   // #532: gate lifted from claude-only to claude|codex|gemini. Unknown CLIs are
   // still rejected here (and again by getBootAdapter's registry) with a non-zero
   // exit + clear stderr — never a silent broken contract.
-  const SUPPORTED_CLIS = ["claude", "codex", "gemini"];
+  const SUPPORTED_CLIS = ["claude", "codex", "gemini", "grok"];
   if (!SUPPORTED_CLIS.includes(args.cli)) {
     die(
       `unsupported --cli ${JSON.stringify(args.cli)}; supported: ${SUPPORTED_CLIS.join(", ")}`,
@@ -479,13 +489,13 @@ async function main() {
   }
 
   const { resolveInstructions } = await import(
-    join(REPO_ROOT, "dist/src/session/resolve-instructions.js")
+    pathToFileURL(join(REPO_ROOT, "dist/src/session/resolve-instructions.js")).href
   );
-  const { getBootAdapter, nodeBootFs, nodeSpawner } = await import(
-    join(REPO_ROOT, "dist/src/session/boot-adapter/index.js")
+  const { getBootAdapter, geminiBinary, nodeBootFs, nodeSpawner } = await import(
+    pathToFileURL(join(REPO_ROOT, "dist/src/session/boot-adapter/index.js")).href
   );
   const { isRole } = await import(
-    join(REPO_ROOT, "dist/src/session/types.js")
+    pathToFileURL(join(REPO_ROOT, "dist/src/session/types.js")).href
   );
 
   if (!isRole(args.role)) die(`unknown role: ${args.role}`, 4);
@@ -501,7 +511,7 @@ async function main() {
   // claude-only: pre-accept the fresh sandbox in ~/.claude.json (skips claude's
   // trust modal). gemini uses --skip-trust (§3.3); codex relies on
   // --dangerously-bypass-approvals-and-sandbox (folder-trust verified live, §5).
-  if (args.cli === "claude") {
+  if (args.cli === "claude" && !args.confined) {
     await ensureSandboxTrusted(sandboxCwd);
   }
 
@@ -534,7 +544,7 @@ async function main() {
     created_at: new Date().toISOString(),
   };
 
-  const adapter = getBootAdapter(args.cli);
+  const adapter = getBootAdapter(args.cli, geminiBinary());
   const cmd = await adapter.buildBootCommand(ctx, resolved, {
     staging_dir: stagingDir,
     fs,
@@ -569,7 +579,7 @@ async function main() {
   if (adapter.contextFile) {
     await copyFile(cmd.prompt_file, join(sandboxCwd, adapter.contextFile));
   }
-  if (adapter.homeEnv) {
+  if (adapter.homeEnv && !args.confined) {
     const homeRealEnv = process.env[adapter.homeEnv];
     const homeReal =
       homeRealEnv && homeRealEnv.length > 0
@@ -610,6 +620,10 @@ async function main() {
     args.cli === "claude"
       ? [...cmd.argv.slice(1), "--model", claudeModel, "--effort", claudeEffort, "--permission-mode", "bypassPermissions"]
       : [...cmd.argv.slice(1)];
+  // #1083: these CLIs expose prompt flags, not Gemini CLI's context/shadow-home contract.
+  if (args.cli === "grok" || cmd.argv[0] === "agy") {
+    flagsArgv.push(args.cli === "grok" ? "--rules" : "--prompt-interactive", await readFile(cmd.prompt_file, "utf8"));
+  }
   const flagsLine = flagsArgv.map(shellQuote).join(" ");
 
   // Per-session launcher.sh — exports env (AIGENTRY_TARGET_CWD always; the CLI
@@ -637,12 +651,15 @@ async function main() {
     `# staged cwd context file (AGENTS.md / GEMINI.md) + config-home shadow home.\n` +
     `export AIGENTRY_TARGET_CWD=${shellQuote(args.cwd)}\n` +
     homeExportLines +
-    `exec -a ${shellQuote(execName)} ${shellQuote(execName)} ${flagsLine} "$@"\n`;
+    `exec -a ${shellQuote(args.cli)} ${shellQuote(execName)} ${flagsLine} "$@"\n`;
   // writeFile with mode atomically sets +x — avoids a separate chmodSync call
   // (CWE-23 Snyk avoidance: single FS op on the validated path).
-  await writeFile(launcherPath, launcherBody, { mode: 0o755 });
+  await writeFile(launcherPath, args.confined
+    ? '#!/usr/bin/env bash\necho "Confined launch requires the dispatch sandbox supervisor" >&2\nexit 78\n'
+    : launcherBody, { mode: 0o755 });
 
   const out = {
+    argv: [execName, ...flagsArgv],
     spawn_cli: launcherPath,
     extra_flags: "",
     spawn_cwd: sandboxCwd,
