@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { registryAvailable, registryEnvironment, registryInvocation } from '../../src/dispatch/registry-command.js';
+import { fixture as routingFixture } from './model-router-fixtures.js';
 
 const commandModule = new URL('../../src/dispatch/registry-command.js', import.meta.url).href;
 const sid = 'worker 한글 with spaces';
@@ -29,7 +30,10 @@ print(os.environ.get('NATIVE_STDERR', '오류 한글'), end='', file=sys.stderr)
 sys.exit(int(os.environ.get('NATIVE_STATUS', '0')))
 `);
   chmodSync(script, 0o755);
-  const env: NodeJS.ProcessEnv = { ...process.env, HOME: root, USERPROFILE: root,
+  const ambient = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+    ['PATH', 'PATHEXT', 'SYSTEMROOT', 'WINDIR', 'COMSPEC'].includes(key.toUpperCase())));
+  const env: NodeJS.ProcessEnv = { ...ambient, HOME: root, USERPROFILE: root,
+    CODEX_HOME: join(root, 'codex-home'), CLAUDE_CONFIG_DIR: join(root, 'claude-home'), GEMINI_CLI_HOME: join(root, 'gemini-home'),
     DISPATCH_STATE_DIR: state, HITL_STATE_DIR: join(root, 'hitl'),
     TEST_REPORTS_DIR: join(root, 'test-reports'), DISPATCH_SCRIPT_DIR: bin,
     AIGENTRY_SHIM_SCRIPT_DIR: bin, DISPATCH_REGISTRY_PY: script,
@@ -287,6 +291,11 @@ test('native Python termination retains signal/null-status failure handling', t 
 
 test('actual CLI wiring reaches native Python and retains failure/protection policies', t => {
   const f = fixture(t);
+  const target = routingFixture();
+  t.after(() => target.cleanup());
+  // Admission uses a bound synthetic receipt and our own harmless child, not a host PID or OS proof.
+  target.prepareTarget(sid, 'native-fixture');
+  f.env.AIGENTRY_SESSIONS_ROOT = target.env.AIGENTRY_SESSIONS_ROOT;
   const ref = join(f.root, 'ref.md');
   writeFileSync(ref, 'Synthetic registry caller fixture.\n');
   writeFileSync(f.env.AIGENTRY_TASK_QUEUE!, JSON.stringify({

@@ -1,14 +1,20 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fixture } from "./model-router-fixtures.js";
 
 function audit(f: ReturnType<typeof fixture>) {
   const events = readFileSync(f.env.TELEMETRY_LOG!, "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[]);
   const event = events.find((e) => e[e.indexOf("--subtype") + 1] === "dispatch_start")!;
-  return { payload: JSON.parse(event[event.indexOf("--payload-json") + 1]!),
+  const result = { payload: JSON.parse(event[event.indexOf("--payload-json") + 1]!),
     note: JSON.parse(readFileSync(f.queue, "utf8")).tasks[0].note as string };
+  if (existsSync(f.env.OPEN_LOG!)) {
+    const m = f.manifest(), flag = m.cli === "codex" ? "-m" : "--model";
+    assert.equal(m.cli, result.payload.cli);
+    assert.ok(result.note.includes(`cli=${m.cli}/${m.command[m.command.indexOf(flag) + 1]} `));
+  }
+  return result;
 }
 
 for (const flags of [[], ["--cli", "auto"]]) test(`T140: ${flags.length ? "explicit auto" : "omitted CLI"} routes once and audits applied child model`, () => {
@@ -23,8 +29,8 @@ for (const flags of [[], ["--cli", "auto"]]) test(`T140: ${flags.length ? "expli
     assert.deepEqual(payload.route, { label: "gpt-6-astra", decided_by: "llm", reason: "implementation" });
     assert.match(note, /seed \| dispatched .* sid=router-fixture ref=ref.md track=router cli=codex\/gpt-6-astra by=llm/);
     assert.equal(JSON.parse(readFileSync(f.env.OPEN_LOG!, "utf8")).model, "gpt-6-astra");
-    assert.match(readFileSync(join(f.aig, "sessions/router-fixture/guard/worker-launcher.sh"), "utf8"), /export AIGENTRY_CODEX_MODEL=gpt-6-astra/);
-    assert.match(readFileSync(join(f.aig, "sessions/router-fixture/boot/launcher.sh"), "utf8"), /-m gpt-6-astra/);
+    assert.deepEqual(f.manifest().command.slice(1, 3), ["-m", "gpt-6-astra"]);
+    assert.equal(f.manifest().cli, "codex");
     // inject/telemetry inherit the parent environment, never the selected model.
     assert.equal(readFileSync(f.env.PARENT_MODEL_LOG!, "utf8"), "parent-model");
   } finally { f.cleanup(); }
@@ -33,13 +39,14 @@ for (const flags of [[], ["--cli", "auto"]]) test(`T140: ${flags.length ? "expli
 test("T140: explicit CLI bypasses classifier and profile and records by=explicit", () => {
   const f = fixture();
   try {
-    const r = f.dispatch([...f.spawnArgs, "--cli", "claude"], { AIGENTRY_ROUTER_PROFILE: "/missing/profile.md", AIGENTRY_CLAUDE_MODEL: "chosen-by-operator" });
+    const r = f.dispatch([...f.spawnArgs, "--cli", "claude", "--role", "coder"], { AIGENTRY_ROUTER_PROFILE: "/missing/profile.md", AIGENTRY_CLAUDE_MODEL: "chosen-by-operator" });
     assert.equal(r.status, 0, r.stderr);
     assert.equal(f.calls(), 0);
     assert.doesNotMatch(r.stderr, /model-router/);
     const { payload, note } = audit(f);
     assert.equal(payload.route.decided_by, "explicit");
     assert.match(note, /cli=claude\/chosen-by-operator by=explicit/);
+    assert.ok(f.manifest().command.includes("chosen-by-operator"));
   } finally { f.cleanup(); }
 });
 
@@ -58,6 +65,7 @@ test("T140: classifier failure still spawns and audits role-table fallback", () 
 test("T140: --target never classifies; audit identifies observed worker and unknown model", () => {
   const f = fixture();
   try {
+    f.prepareTarget();
     const r = f.dispatch(["--target", "router-fixture"], { OBSERVED_CLI: "grok" });
     assert.equal(r.status, 0, r.stderr);
     assert.equal(f.calls(), 0);
@@ -71,10 +79,11 @@ test("T140: --target never classifies; audit identifies observed worker and unkn
 test("T140: deduplicated fresh dispatch does not classify or spawn again", () => {
   const f = fixture();
   try {
-    assert.equal(f.dispatch(f.spawnArgs).status, 0);
-    const r = f.dispatch(f.spawnArgs);
+    assert.equal(f.dispatch([...f.spawnArgs, "--role", "coder"]).status, 0);
+    const r = f.dispatch([...f.spawnArgs, "--role", "coder"]);
     assert.equal(r.status, 8, r.stderr);
     assert.equal(f.calls(), 1);
+    assert.equal(readFileSync(f.env.OPEN_LOG! + ".calls", "utf8"), "open\n");
   } finally { f.cleanup(); }
 });
 
@@ -87,18 +96,17 @@ function twoCodex(f: ReturnType<typeof fixture>): NodeJS.ProcessEnv {
 test("T140: codex at cap, role table is another CLI -> falls to it, by=llm-capped + capped_cli", () => {
   const f = fixture();
   try {
-    writeFileSync(join(f.aig, "instructions/roles/researcher.md"), "# RESEARCHER\nFIXTURE-ROLE\n");
-    const r = f.dispatch([...f.spawnArgs, "--role", "researcher"], twoCodex(f));
+    writeFileSync(join(f.aig, "instructions/roles/architect.md"), "# ARCHITECT\nFIXTURE-ROLE\n");
+    const r = f.dispatch([...f.spawnArgs, "--role", "architect"], twoCodex(f));
     assert.equal(r.status, 0, r.stderr);
     assert.equal(f.calls(), 1);
-    assert.match(r.stderr, /codex at cap \(2 live, AIGENTRY_CLI_CAP_CODEX=2\); gpt-6-astra -> gemini \(gemini\)/);
+    assert.match(r.stderr, /codex at cap \(2 live, AIGENTRY_CLI_CAP_CODEX=2\); gpt-6-astra -> opus-5 \(claude\)/);
     const { payload, note } = audit(f);
-    assert.equal(payload.cli, "gemini");
-    assert.deepEqual([payload.route.label, payload.route.decided_by, payload.route.capped_cli], ["gemini", "llm-capped", "codex"]);
+    assert.equal(payload.cli, "claude");
+    assert.deepEqual([payload.route.label, payload.route.decided_by, payload.route.capped_cli], ["opus-5", "llm-capped", "codex"]);
     assert.match(payload.route.reason, /^codex at cap .*; router chose gpt-6-astra: implementation$/);
-    assert.match(note, /cli=gemini\/gemini-3.8-flash-high by=llm-capped capped_cli=codex/);
-    assert.match(readFileSync(join(f.aig, "sessions/router-fixture/guard/worker-launcher.sh"), "utf8"), /export AIGENTRY_GEMINI_MODEL=gemini-3.8-flash-high/);
-    assert.match(readFileSync(join(f.aig, "sessions/router-fixture/boot/launcher.sh"), "utf8"), /exec -a gemini agy --model gemini-3.8-flash-high/);
+    assert.match(note, /cli=claude\/claude-opus-5\[1m\] by=llm-capped capped_cli=codex/);
+    assert.ok(f.manifest().command.includes("claude-opus-5[1m]"));
   } finally { f.cleanup(); }
 });
 
@@ -110,7 +118,7 @@ test("T140: codex at cap, role table is codex too -> first under-cap profile mod
     const { payload, note } = audit(f);
     assert.deepEqual([payload.cli, payload.route.label, payload.route.decided_by, payload.route.capped_cli], ["claude", "opus-5", "llm-capped", "codex"]);
     assert.match(note, /cli=claude\/claude-opus-5\[1m\] by=llm-capped capped_cli=codex/);
-    assert.match(readFileSync(join(f.aig, "sessions/router-fixture/guard/worker-launcher.sh"), "utf8"), /export AIGENTRY_CLAUDE_MODEL='claude-opus-5\[1m\]'/);
+    assert.ok(f.manifest().command.includes("claude-opus-5[1m]"));
   } finally { f.cleanup(); }
 });
 
@@ -162,7 +170,7 @@ test("T140: explicit --cli codex at cap still spawns codex and warns once", () =
     const { payload, note } = audit(f);
     assert.deepEqual([payload.cli, payload.route.decided_by, payload.route.capped_cli], ["codex", "explicit", undefined]);
     assert.match(note, /cli=codex\/gpt-6-astra by=explicit$/);
-    assert.match(readFileSync(join(f.aig, "sessions/router-fixture/boot/launcher.sh"), "utf8"), /exec -a codex codex -m gpt-6-astra/);
+    assert.deepEqual(f.manifest().command.slice(1, 3), ["-m", "gpt-6-astra"]);
   } finally { f.cleanup(); }
 });
 
@@ -173,12 +181,13 @@ test("T140: readiness probe and --target audit receive the CLI kind for a worker
   try {
     const probe = f.script("probe-log", "require('node:fs').writeFileSync(process.env.PROBE_ARGS, JSON.stringify(process.argv.slice(2))); console.log('{\"ready\":true}')");
     const row = { LIVE_SESSIONS: JSON.stringify([{ id: "router-fixture", command: f.liveLauncher("codex") }]) };
-    const r = f.dispatch([...f.spawnArgs, "--cli", "codex"], { ...row, SESSION_PROBE_PY: probe, PROBE_ARGS: join(f.root, "probe-args") });
+    const r = f.dispatch([...f.spawnArgs, "--cli", "codex", "--role", "coder"], { ...row, SESSION_PROBE_PY: probe, PROBE_ARGS: join(f.root, "probe-args") });
     assert.equal(r.status, 0, r.stderr);
     assert.deepEqual(JSON.parse(readFileSync(join(f.root, "probe-args"), "utf8")), ["--sid", "router-fixture", "--cli", "codex"]);
   } finally { f.cleanup(); }
   const g = fixture();
   try {
+    g.prepareTarget();
     const r = g.dispatch(["--target", "router-fixture"], { LIVE_SESSIONS: JSON.stringify([{ id: "router-fixture", command: g.liveLauncher("codex") }]) });
     assert.equal(r.status, 0, r.stderr);
     const { payload, note } = audit(g);
@@ -215,12 +224,12 @@ for (const [live, cap, capped] of [[3, "", false], [4, "", true], [4, "5", false
 test("T140: unavailable router uses emergency Opus in audit and child launcher", () => {
   const f = fixture();
   try {
-    const r = f.dispatch(f.spawnArgs, { DISPATCH_SCRIPT_DIR: f.bin, AIGENTRY_CLI_CAP_CLAUDE: "" });
+    const r = f.dispatch([...f.spawnArgs, "--role", "coder"], { DISPATCH_SCRIPT_DIR: f.bin, AIGENTRY_CLI_CAP_CLAUDE: "" });
     assert.equal(r.status, 0, r.stderr);
     assert.equal(f.calls(), 0);
     const { payload, note } = audit(f);
     assert.deepEqual(payload.route, { label: "opus-5", decided_by: "table", reason: "router unavailable" });
     assert.match(note, /cli=claude\/claude-opus-5\[1m\] by=table/);
-    assert.match(readFileSync(join(f.aig, "sessions/router-fixture/guard/worker-launcher.sh"), "utf8"), /export AIGENTRY_CLAUDE_MODEL='claude-opus-5\[1m\]'/);
+    assert.ok(f.manifest().command.includes("claude-opus-5[1m]"));
   } finally { f.cleanup(); }
 });
