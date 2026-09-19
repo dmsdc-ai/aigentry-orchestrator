@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -77,6 +78,93 @@ test('actual Python snapshot preserves v2 authority and full SID/digit-prefix vo
   unchanged(f);
   assert.deepEqual(readdirSync(f.state), ['active.json']);
 });
+
+for (const parentEncoding of [undefined, 'cp1252', 'ascii']) {
+  for (const payload of ['unicode', 'ascii'] as const) {
+    test(`actual helper UTF-8 transport: ${payload} payload, ${parentEncoding ?? 'default'} parent encoding`, t => {
+      const prefix = payload === 'unicode' ? '한글1167' : 'ascii1167';
+      const f = fixture(t, ['rd1167-worker', 'rd1167-worker', 'rd1167', 'architect-worker',
+        'ab', 'a1-x', `${prefix}-worker`, 'tab1167\tworker']);
+      const expected = ['rd1167-worker', 'rd1167', 'architect-worker', 'a1-x',
+        `${prefix}-worker`, prefix, 'tab1167\tworker']
+        .sort((a, b) => b.length - a.length || a.localeCompare(b));
+      const script = join(repository(), 'bin', 'dispatch-registry.py');
+      const helperBefore = readFileSync(script);
+      const parentBefore = { ...process.env };
+      const env: NodeJS.ProcessEnv = { ...process.env, DISPATCH_STATE_DIR: f.state };
+      if (parentEncoding === undefined) delete env.PYTHONIOENCODING;
+      else env.PYTHONIOENCODING = parentEncoding;
+      const python = process.platform === 'win32' ? 'python' : 'python3';
+      const command = process.platform === 'win32' ? python : script;
+      const args = process.platform === 'win32' ? [script, 'snapshot'] : ['snapshot'];
+      t.diagnostic(JSON.stringify({ platform: process.platform, node: process.version,
+        payload, parentEncoding: parentEncoding ?? 'default',
+        helperSha256: createHash('sha256').update(helperBefore).digest('hex') }));
+
+      // Only synthetic fixture output and selected interpreter metadata enter CI logs.
+      function run(label: string, executable: string, argv: string[], childEnv: NodeJS.ProcessEnv) {
+        const started = Date.now();
+        const result = spawnSync(executable, argv, { env: childEnv, shell: false,
+          stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000, maxBuffer: 8 * 1024 * 1024 });
+        const stdout = result.stdout?.toString('utf8') ?? '';
+        const stderr = result.stderr?.toString('utf8') ?? '';
+        const detail = JSON.stringify({ label, executable, argv, status: result.status,
+          signal: result.signal, error: result.error?.message, elapsedMs: Date.now() - started,
+          stdout, stderr, stdoutBase64: result.stdout?.toString('base64'),
+          stderrBase64: result.stderr?.toString('base64') });
+        t.diagnostic(detail);
+        assert.ifError(result.error);
+        assert.equal(result.signal, null, detail);
+        unchanged(f);
+        assert.deepEqual(readdirSync(f.state), ['active.json']);
+        return { status: result.status, stdout, stderr, detail };
+      }
+
+      const metadataCode = `import json, sys
+print(json.dumps(dict(executable=sys.executable, version=sys.version,
+    argv=sys.argv, stdout_encoding=sys.stdout.encoding, stdout_errors=sys.stdout.errors,
+    stderr_encoding=sys.stderr.encoding, utf8_mode=sys.flags.utf8_mode), ensure_ascii=True))`;
+      const metadata = run('inherited-encoding metadata', python, ['-c', metadataCode, script, 'snapshot'], env);
+      assert.equal(metadata.status, 0, metadata.detail);
+      if (parentEncoding !== undefined) {
+        assert.equal(JSON.parse(metadata.stdout).stdout_encoding, parentEncoding, metadata.detail);
+      }
+      // The source helper runs unchanged through the adapter's native command path.
+      const direct = run('inherited-encoding direct helper', command, args, env);
+      if (payload === 'unicode' && parentEncoding !== undefined) {
+        assert.equal(direct.status, 1, direct.detail);
+        assert.match(direct.stderr, /UnicodeEncodeError/, direct.detail);
+        assert.equal(direct.stdout, '', direct.detail);
+      } else if (payload === 'ascii') {
+        assert.equal(direct.status, 0, direct.detail);
+        assert.deepEqual(JSON.parse(direct.stdout), JSON.parse(f.before.toString('utf8')));
+      }
+      // Default Unicode output is diagnostic: its encoding depends on the native OS.
+      const utf8Env = { ...env, PYTHONIOENCODING: 'utf-8' };
+      const utf8Metadata = run('UTF-8 metadata', python, ['-c', metadataCode, script, 'snapshot'], utf8Env);
+      assert.equal(utf8Metadata.status, 0, utf8Metadata.detail);
+      assert.equal(JSON.parse(utf8Metadata.stdout).stdout_encoding, 'utf-8', utf8Metadata.detail);
+      const utf8 = run('UTF-8 direct helper', command, args, utf8Env);
+      assert.equal(utf8.status, 0, utf8.detail);
+      assert.deepEqual(JSON.parse(utf8.stdout), JSON.parse(f.before.toString('utf8')));
+
+      // Isolate the encoded parent; import the compiled adapter used by this suite.
+      const adapterCode = `import assert from 'node:assert/strict';
+import { loadRegistryTracks } from ${JSON.stringify(new URL('../../src/tracker/report-sweep.js', import.meta.url).href)};
+const before = { ...process.env };
+const tracks = loadRegistryTracks(process.argv[1], process.argv[2]);
+assert.deepEqual({ ...process.env }, before, 'adapter changed parent environment');
+console.log(JSON.stringify({ tracks, parentEncoding: process.env.PYTHONIOENCODING ?? null }));`;
+      const adapted = run('compiled adapter', process.execPath,
+        ['--input-type=module', '-e', adapterCode, f.state, script], env);
+      assert.equal(adapted.status, 0, adapted.detail);
+      assert.deepEqual(JSON.parse(adapted.stdout), { tracks: expected, parentEncoding: parentEncoding ?? null },
+        adapted.detail);
+      assert.deepEqual({ ...process.env }, parentBefore, 'regression changed test parent environment');
+      assert.deepEqual(readFileSync(script), helperBefore, 'regression changed the source helper');
+    });
+  }
+}
 
 test('helper override receives snapshot, inherited configuration and explicit Unicode/space state root', t => {
   const f = fixture(t);

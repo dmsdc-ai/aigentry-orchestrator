@@ -186,7 +186,7 @@ export function loadRegistryTracks(stateDir: string, registryScript: string): st
     const result = spawnSync(windows ? "python" : registryScript,
       windows ? [registryScript, "snapshot"] : ["snapshot"], {
         shell: false,
-        env: { ...process.env, DISPATCH_STATE_DIR: stateDir },
+        env: { ...process.env, DISPATCH_STATE_DIR: stateDir, PYTHONIOENCODING: "utf-8" },
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
         timeout: 10_000,
