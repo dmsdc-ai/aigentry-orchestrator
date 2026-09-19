@@ -137,7 +137,67 @@ t_setup() {
 }
 
 t_teardown() {
+  if [ -n "${T_FIXTURE_CHILD_PID:-}" ]; then
+    local child
+    for child in $(jobs -pr); do
+      [ "$child" != "$T_FIXTURE_CHILD_PID" ] || kill "$child" 2>/dev/null || true
+    done
+    wait "$T_FIXTURE_CHILD_PID" 2>/dev/null || true
+    unset T_FIXTURE_CHILD_PID
+  fi
+  if [ -n "${T_FIXTURE_HELPER:-}" ] && [ -s "${T_TMP:-}/forbidden.log" ]; then
+    cat "$T_TMP/forbidden.log" >&2
+    rm -rf "$T_TMP"
+    return 1
+  fi
   [ -n "${T_TMP:-}" ] && rm -rf "$T_TMP"
+}
+
+# Opt-in for the confined dispatch fixtures. Keep unrelated guards unchanged.
+# Start the owned child in the test shell, never inside $(run_dispatch ...), so
+# the EXIT trap can always kill AND reap it, including after a dispatch crash.
+t_confined_setup() {
+  local name
+  while IFS= read -r name; do
+    case "$name" in
+      PATH|TMPDIR|LANG|LC_*|TERM|SHELL|T_TMP|STUB_*|DISPATCH_STATE_DIR|TELEPTY|GIT|DISPATCH_SH|REPO_ROOT|TEST_LIB_DIR|HERE) ;;
+      *) unset "$name" 2>/dev/null || true ;;
+    esac
+  done < <(compgen -e)
+  export AIGENTRY_DISPATCH_CALLER=confined-dispatch-fixture
+  T_TMP="$(cd "$T_TMP" && pwd -P)"
+  export T_TMP HOME="$T_TMP/home" USERPROFILE="$T_TMP/home"
+  export XDG_CONFIG_HOME="$T_TMP/home/.config" XDG_CACHE_HOME="$T_TMP/home/.cache"
+  export CODEX_HOME="$T_TMP/codex-home" CLAUDE_CONFIG_DIR="$T_TMP/home/.claude"
+  export GEMINI_CLI_HOME="$T_TMP/gemini-home" PYTHONDONTWRITEBYTECODE=1
+  export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+  export AIGENTRY_HOME="$T_TMP/home/.aigentry" AIGENTRY_SESSIONS_ROOT="$T_TMP/sessions"
+  export AIGENTRY_ROLE_SANDBOX_DIR="$T_TMP/role-sandbox"
+  export AIGENTRY_BUS_BRIDGE=0 AIGENTRY_SLEEP_GUARD=0
+  export AIGENTRY_TASK_QUEUE="$T_TMP/fixture-queue.json" AIGENTRY_TASK_GATE=hard
+  export AIGENTRY_GIT_HOOKS_DIR="$T_TMP/hooks" AIGENTRY_GIT_HOOK_SOURCE_DIR="$REPO_ROOT/git-hooks"
+  export AIGENTRY_WORKER_SCOPE="$T_TMP/scope.json"
+  export T_FIXTURE_HELPER="$TEST_LIB_DIR/confined-fixture.mjs"
+  export T_FIXTURE_NODE="$(command -v node)"
+  # Canonical, private temp path also avoids the production macOS /var/folders
+  # short-socket fallback to host /tmp. Never grant access to the host tmp root.
+  mkdir -p "$T_TMP/tmp"
+  export TMPDIR="$T_TMP/tmp" TMP="$T_TMP/tmp" TEMP="$T_TMP/tmp"
+  "$T_FIXTURE_NODE" "$T_FIXTURE_HELPER" init
+  export SESSION_PROBE_PY="$STUB_BIN/fixture-probe"
+  export OPEN_SESSION_SH="$STUB_BIN/fixture-deny"
+  export EMIT_TELEMETRY_MJS="$STUB_BIN/fixture-noop" REPORT_TARGET_SH="$STUB_BIN/fixture-report"
+  "$T_FIXTURE_NODE" -e 'setTimeout(() => {}, 120000)' </dev/null >/dev/null 2>&1 &
+  T_FIXTURE_CHILD_PID=$!
+  export T_FIXTURE_CHILD_PID
+}
+
+t_confined_target() {
+  "$T_FIXTURE_NODE" "$T_FIXTURE_HELPER" target "$1" "${2:-}"
+}
+
+t_confined_scope() {
+  "$T_FIXTURE_NODE" "$T_FIXTURE_HELPER" scope "$1" "$2" "$3"
 }
 
 t_assert_contains() {
