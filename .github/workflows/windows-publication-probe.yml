@@ -1,0 +1,99 @@
+name: Windows publication capability probe
+
+on:
+  pull_request:
+    paths:
+      - tests/dispatch/windows-publication-probe.py
+      - .github/workflows/windows-publication-probe.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publication-probe:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.10'
+      - name: Measure disposable NTFS publication capabilities
+        shell: python
+        env:
+          PROBE_RUNNER_TEMP: ${{ runner.temp }}
+          PROBE_COMMIT: ${{ github.sha }}
+        run: |
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import uuid
+
+          parent = Path(os.environ['PROBE_RUNNER_TEMP'])
+          root = parent / ('windows-publication-' + uuid.uuid4().hex)
+          artifact = parent / 'windows-publication-receipt.json'
+          receipt = {'schema': 1, 'probe': 'windows-publication',
+                     'status': 'harness_failure', 'powerLossProven': False,
+                     'activationAuthorized': False,
+                     'obligations': {key: 'unresolved' for key in ('O1', 'O2', 'O3', 'O4', 'O5')}}
+          identity = {'checkoutCommit': os.environ['PROBE_COMMIT'], 'files': {}}
+          receipt['supervisorSourceIdentity'] = identity
+          artifact.write_text(json.dumps(receipt), encoding='utf-8')
+          code = 1
+          try:
+              for name in ('tests/dispatch/windows-publication-probe.py',
+                           '.github/workflows/windows-publication-probe.yml'):
+                  identity['files'][name] = hashlib.sha256(Path(name).read_bytes()).hexdigest()
+              child = subprocess.run(
+                  [sys.executable, '-I', 'tests/dispatch/windows-publication-probe.py',
+                   '--root', str(root), '--receipt', str(root / 'receipt.json'),
+                   '--attest-local-unsynced-disposable-parent'],
+                  capture_output=True, text=True, encoding='utf-8', timeout=240, check=False)
+              # Child emits a path-free JSON receipt. Never export raw stderr or env.
+              receipt = json.loads(child.stdout)
+              if receipt.get('probe') != 'windows-publication' or receipt.get('powerLossProven') is not False:
+                  raise ValueError('invalid_receipt')
+              receipt['childExitCode'] = child.returncode
+              code = child.returncode
+          except subprocess.TimeoutExpired:
+              receipt['status'] = 'child_timeout'
+              receipt['timeoutSeconds'] = 240
+          except Exception as error:
+              receipt['status'] = 'harness_failure'
+              receipt['supervisorError'] = type(error).__name__
+          finally:
+              receipt['supervisorSourceIdentity'] = identity
+              receipt['powerLossProven'] = False
+              receipt['activationAuthorized'] = False
+              receipt.setdefault('processToken', {'ordinaryUserEvidence': 'unresolved',
+                                 'evidenceClass': 'token_unknown_api_compatibility_only'})
+              artifact.write_text(json.dumps(receipt, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          print('Publication probe: ' + receipt['status'] + '; powerLossProven=false; O1-O5 unresolved')
+          print('Token evidence: ' + receipt['processToken']['evidenceClass'])
+          if receipt['status'] == 'unresolved_capability':
+              print('::warning::Publication capability refused; inspect receipt. Activation remains refused.')
+          sys.exit(code)
+      - name: Preserve diagnostic when the probe could not start
+        if: always()
+        shell: pwsh
+        env:
+          PROBE_RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          $receiptPath = Join-Path $env:PROBE_RUNNER_TEMP 'windows-publication-receipt.json'
+          if (-not (Test-Path -LiteralPath $receiptPath)) {
+            '{"schema":1,"probe":"windows-publication","status":"harness_did_not_emit_receipt","powerLossProven":false,"activationAuthorized":false,"ordinaryUserEvidence":"unresolved","obligations":{"O1":"unresolved","O2":"unresolved","O3":"unresolved","O4":"unresolved","O5":"unresolved"}}' | Set-Content -LiteralPath $receiptPath -Encoding utf8
+          }
+      - name: Upload sanitized receipt only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-publication-receipt
+          path: ${{ runner.temp }}/windows-publication-receipt.json
+          if-no-files-found: error
+          retention-days: 7
