@@ -74,11 +74,11 @@ for (const [path, hash] of Object.entries(frozen)) assert.equal(before[path], ha
 
 // Psych safe_load provides structured parsing; YAML 1.1 turns the key "on"
 // into boolean true, which JSON encodes as "true". Normalize that key only.
-const parser = 'require "yaml"; require "json"; d = YAML.safe_load(File.read(ARGV.fetch(0)), permitted_classes: [], permitted_symbols: [], aliases: false); d["on"] = d.delete(true) if d.key?(true); puts JSON.generate(d)';
-function parse(path) {
+const parser = 'require "yaml"; require "json"; d = YAML.safe_load(ARGV.fetch(0) == "-" ? STDIN.read : File.read(ARGV.fetch(0)), permitted_classes: [], permitted_symbols: [], aliases: false); d["on"] = d.delete(true) if d.key?(true); puts JSON.generate(d)';
+function parse(path, source) {
   // Use standard-library Psych without RubyGems startup hooks or PATH helpers.
-  const argv = ['--disable-gems', '-e', parser, join(root, path)];
-  const result = spawnSync(ruby, argv, { encoding: 'utf8', timeout, env: { PATH: '' } });
+  const argv = ['--disable-gems', '-e', parser, source === undefined ? join(root, path) : '-'];
+  const result = spawnSync(ruby, argv, { input: source, encoding: 'utf8', timeout, env: { PATH: '' } });
   invocations.push({ kind: 'yaml-parser', executable: ruby, argv, timeout, exit: result.status, stderr: result.stderr });
   assert.ifError(result.error);
   assert.equal(result.status, 0, `Ruby/Psych prerequisite or YAML parsing failure: ${result.stderr}`);
@@ -90,6 +90,75 @@ const ci = parse('.github/workflows/ci.yml');
 const ciBefore = parse(`${fixtureRoot}/ci.before-parity.yml`);
 const rejected = parse(`${fixtureRoot}/rejected-release.yml`);
 const ids = ['windows-persistence', 'windows-refuses'];
+const lf = source => source.replace(/\r\n/g, '\n');
+// Independent approved contract, never derived from either workflow under test.
+// Keep the exact block too: CI's historical byte comparison may remove only this.
+const browserAddition = `  browser-tls:
+    name: Browser and TLS acceptance
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.0'
+      - name: Require disposable non-root Linux runner and TLS tools
+        run: |
+          set -euo pipefail
+          test "$(id -u)" -ne 0
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          sudo apt-get update
+          sudo apt-get install -y openssl libnss3-tools
+      - name: Fresh locked install and build
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+      - name: Install pinned Chromium with sandbox dependencies
+        run: |
+          set -euo pipefail
+          node -e "const p=require('playwright/package.json');const b=JSON.parse(require('node:fs').readFileSync(require('node:path').join(require('node:path').dirname(require.resolve('playwright-core/package.json')),'browsers.json'))).browsers.find(x=>x.name==='chromium');if(p.version!=='1.58.2'||b.revision!=='1208'||b.browserVersion!=='145.0.7632.6')process.exit(1)"
+          npx --no-install playwright install --with-deps chromium
+      - name: Actual browser, WebAuthn and TLS controls
+        env:
+          BROWSER_TLS_RECEIPT: \${{ runner.temp }}/browser-tls-receipt.json
+        run: npm run test:browser-tls
+        timeout-minutes: 10
+      - name: Validate complete receipt against this checkout
+        env:
+          BROWSER_TLS_RECEIPT: \${{ runner.temp }}/browser-tls-receipt.json
+        run: npm run test:browser-tls -- --validate-receipt
+      - name: Upload sanitized receipt only
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-tls-receipt
+          path: \${{ runner.temp }}/browser-tls-receipt.json
+          if-no-files-found: error
+          retention-days: 7
+
+`;
+const approvedBrowser = parse('approved-browser-contract', `jobs:\n${browserAddition}`).jobs['browser-tls'];
+function withoutBrowser(workflow, release) {
+  assert.deepEqual(workflow.jobs['browser-tls'], approvedBrowser, 'complete approved browser/TLS job, ordered steps and no bypasses');
+  const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+  assert.equal(pkg.scripts['test:browser-tls'], 'node tests/hitl/browser-tls.acceptance.mjs', 'actual browser caller');
+  assert.equal(pkg.devDependencies.playwright, '1.58.2', 'locked browser dependency');
+  if (release) {
+    assert.deepEqual(workflow.jobs.guard.needs, ['browser-tls'], 'guard requires browser success');
+    assert.deepEqual(workflow.jobs.publish.needs, ['browser-tls', ...original.jobs.publish.needs, ...ids], 'all original, Windows and browser publish dependencies');
+  }
+  const copy = structuredClone(workflow);
+  delete copy.jobs['browser-tls'];
+  if (release) {
+    delete copy.jobs.guard.needs;
+    copy.jobs.publish.needs = copy.jobs.publish.needs.slice(1);
+  }
+  return copy;
+}
 const runSteps = job => job.steps.filter(step => typeof step.run === 'string');
 function named(job, name) {
   const matches = job.steps.filter(step => step.name === name);
@@ -128,6 +197,7 @@ for (const [key, command] of Object.entries(commands)) {
 }
 
 function validate(workflow) {
+  workflow = withoutBrowser(workflow, true);
   const top = structuredClone(workflow);
   delete top.jobs;
   const oldTop = structuredClone(original);
@@ -202,27 +272,35 @@ acceptance('baseline has zero actual Windows gates and omits both publish depend
   assert.throws(() => validate(original));
 });
 acceptance('frozen final workflow preserves old behavior and requires W0 plus W1', 'structure', () => validate(final));
-acceptance('corrected reader is the only parsed workflow change from rejected source', 'reader-structure', () => {
-  const copy = structuredClone(final);
+function validateReleaseHistory(workflow) {
+  validate(workflow);
+  const copy = withoutBrowser(workflow, true);
   const env = named(copy.jobs.guard, 'Release planning and changed-file admission').env;
   delete env.RELEASE_SECURITY_POLICY_SHA256;
   delete env.RELEASE_SECURITY_COMMIT;
   named(copy.jobs[ids[0]], 'Persistence suite must be fully green on win32').run = rejectedPersistence;
   assert.deepEqual(copy, rejected);
-});
-acceptance('CI W1 matches release and every other CI byte remains unchanged', 'ci-parity', () => {
-  assert.equal(commands.ciPersistence, commands.persistence);
-  assert.equal(sha(commands.ciPersistence), '50b8b702d34566ab8ef1b3ec310770ee5c32af62950d8d7ddb0996e234df6850');
-  const copy = structuredClone(ci);
+}
+acceptance('corrected reader is the only parsed workflow change from rejected source', 'reader-structure', () => validateReleaseHistory(final));
+function validateCIHistory(source, historicalSource = readFileSync(join(root, fixtureRoot, 'ci.before-parity.yml'), 'utf8')) {
+  const workflow = parse('CI historical comparison', source);
+  const persistence = named(workflow.jobs[ids[0]], 'Persistence suite must be fully green on win32').run;
+  assert.equal(persistence, commands.persistence);
+  assert.equal(sha(persistence), '50b8b702d34566ab8ef1b3ec310770ee5c32af62950d8d7ddb0996e234df6850');
+  const copy = withoutBrowser(workflow, false);
   named(copy.jobs[ids[0]], 'Persistence suite must be fully green on win32').run = rejectedPersistence;
   assert.deepEqual(copy, ciBefore);
   const indentReader = reader => reader.split('\n').map(line => line ? '          ' + line : '').join('\n');
   const fixedBytes = indentReader(fixedReader);
   const oldBytes = indentReader(readerParts(rejectedPersistence).reader);
-  const currentBytes = readFileSync(join(root, '.github/workflows/ci.yml'), 'utf8');
+  const bytes = lf(source);
+  const addition = `jobs:\n${browserAddition}`;
+  assert.equal(bytes.split(addition).length, 2, 'exactly one approved browser block at the jobs boundary');
+  const currentBytes = bytes.replace(addition, 'jobs:\n');
   assert.equal(currentBytes.split(fixedBytes).length, 2, 'exactly one corrected reader in CI YAML');
-  assert.equal(currentBytes.replace(fixedBytes, oldBytes), readFileSync(join(root, fixtureRoot, 'ci.before-parity.yml'), 'utf8'), 'inverse reader replacement preserves every other CI byte, including full-suite debt');
-});
+  assert.equal(currentBytes.replace(fixedBytes, oldBytes), lf(historicalSource), 'inverse reader replacement preserves every other CI byte, including full-suite debt');
+}
+acceptance('CI W1 matches release and every other CI byte remains unchanged', 'ci-parity', () => validateCIHistory(readFileSync(join(root, '.github/workflows/ci.yml'), 'utf8')));
 
 const mutants = [];
 for (const id of ids) {
@@ -645,6 +723,82 @@ for (const item of vmCases) acceptance(`caller VM: ${item.name}`, 'caller-vm', (
   } else assert.deepEqual(actual.logs, []);
   if (item.diagnostic) assert.match(actual.errors.join('\n'), item.diagnostic);
 });
+
+// Exercise the same historical validators with private YAML strings. Exact needle
+// checks are outside assert.throws so a stale/no-op mutation cannot pass a negative.
+function replaceOnce(source, needle, replacement) {
+  assert.equal(source.split(needle).length, 2, `unique mutation target: ${needle}`);
+  assert.notEqual(needle, replacement, 'mutation must change bytes');
+  return source.replace(needle, () => replacement);
+}
+const browserMutations = [
+  ['missing browser job', browserAddition, ''],
+  ['browser skip', '  browser-tls:\n', '  browser-tls:\n    if: false\n'],
+  ['browser always', '  browser-tls:\n', '  browser-tls:\n    if: always()\n'],
+  ['browser continue-on-error', '  browser-tls:\n', '  browser-tls:\n    continue-on-error: true\n'],
+  ['caller skip', '        run: npm run test:browser-tls\n', '        if: false\n        run: npm run test:browser-tls\n'],
+  ['caller always', '        run: npm run test:browser-tls\n', '        if: always()\n        run: npm run test:browser-tls\n'],
+  ['caller continue-on-error', '        run: npm run test:browser-tls\n', '        continue-on-error: true\n        run: npm run test:browser-tls\n'],
+  ['caller swallowed failure', '        run: npm run test:browser-tls\n', '        run: npm run test:browser-tls || true\n'],
+  ['caller no-op', '        run: npm run test:browser-tls\n', '        run: echo green\n'],
+  ['receipt validation missing', '        run: npm run test:browser-tls -- --validate-receipt\n', '        run: echo green\n'],
+  ['receipt validation swallowed failure', '        run: npm run test:browser-tls -- --validate-receipt\n', '        run: npm run test:browser-tls -- --validate-receipt || true\n'],
+  ['receipt upload widened', '          path: ${{ runner.temp }}/browser-tls-receipt.json\n', '          path: ${{ runner.temp }}\n'],
+  ['missing receipt accepted', '          if-no-files-found: error\n', '          if-no-files-found: ignore\n'],
+  ['wrong browser runner', '    runs-on: ubuntu-22.04\n', '    runs-on: windows-latest\n'],
+  ['root permitted', '          test "$(id -u)" -ne 0\n', '          true\n'],
+  ['hosted runner check missing', '          test "$RUNNER_ENVIRONMENT" = github-hosted\n', '          true\n'],
+  ['unlocked install', '          npm ci\n', '          npm install\n'],
+  ['unpinned Node', "          node-version: '20.20.0'\n", "          node-version: '20'\n"],
+  ['changed Playwright pin', "p.version!=='1.58.2'", "p.version!=='1.58.1'"],
+  ['changed Chromium revision', "b.revision!=='1208'", "b.revision!=='1207'"],
+  ['changed Chromium version', "b.browserVersion!=='145.0.7632.6'", "b.browserVersion!=='145.0.7632.5'"],
+  ['browser install may resolve packages', 'npx --no-install playwright install --with-deps chromium', 'npx playwright install --with-deps chromium'],
+  ['checkout credentials retained', '          persist-credentials: false\n', '          persist-credentials: true\n'],
+  ['unapproved browser environment', '  browser-tls:\n', '  browser-tls:\n    env:\n      NODE_TLS_REJECT_UNAUTHORIZED: "0"\n'],
+  ['unrelated job command', '        run: npm test\n', '        run: echo green\n'],
+  ['Windows command changed', 'node --test dist/tests/session/persistence/*.test.js', 'node --test dist/tests/*.test.js'],
+  ['Windows threshold changed', '[ "${PASS}" -gt 20 ]', '[ "${PASS}" -gt 0 ]'],
+];
+const publishDependencies = ['browser-tls', ...original.jobs.publish.needs, ...ids];
+const publishNeeds = `    needs: [${publishDependencies.join(', ')}]\n`;
+const releaseBrowserMutations = [
+  ['missing guard browser dependency', '    needs: [browser-tls]\n', ''],
+  ['extra guard dependency', '    needs: [browser-tls]\n', '    needs: [browser-tls, test]\n'],
+  ...publishDependencies.map(id => [`missing publish ${id}`, publishNeeds, `    needs: [${publishDependencies.filter(value => value !== id).join(', ')}]\n`]),
+  ['extra publish dependency', publishNeeds, `    needs: [${[...publishDependencies, 'unapproved'].join(', ')}]\n`],
+  ['guard skip', '  guard:\n', '  guard:\n    if: false\n'],
+  ['guard always', '  guard:\n', '  guard:\n    if: always()\n'],
+  ['guard continue-on-error', '  guard:\n', '  guard:\n    continue-on-error: true\n'],
+  ['publish skip', '  publish:\n', '  publish:\n    if: false\n'],
+  ['policy trust input missing', '          RELEASE_SECURITY_POLICY_SHA256: UNREVIEWED\n', ''],
+  ['policy trust input changed', '          RELEASE_SECURITY_POLICY_SHA256: UNREVIEWED\n', '          RELEASE_SECURITY_POLICY_SHA256: approved\n'],
+  ['commit trust input missing', '          RELEASE_SECURITY_COMMIT: ${{ github.sha }}\n', ''],
+  ['commit trust input changed', '          RELEASE_SECURITY_COMMIT: ${{ github.sha }}\n', '          RELEASE_SECURITY_COMMIT: main\n'],
+  ['original release version input changed', '          RELEASE_VERSION: ${{ steps.identity.outputs.version }}\n', '          RELEASE_VERSION: arbitrary\n'],
+  ['publish authentication changed', '          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n', '          NODE_AUTH_TOKEN: arbitrary\n'],
+];
+for (const [workflowName, path] of [['CI', '.github/workflows/ci.yml'], ['release', '.github/workflows/release.yml']]) {
+  const source = lf(readFileSync(join(root, path), 'utf8'));
+  for (const [ending, newline] of [['LF', '\n'], ['CRLF', '\r\n']]) {
+    const encode = value => lf(value).replaceAll('\n', newline);
+    const check = value => workflowName === 'CI'
+      ? validateCIHistory(value, encode(readFileSync(join(root, fixtureRoot, 'ci.before-parity.yml'), 'utf8')))
+      : validateReleaseHistory(parse(`${workflowName} ${ending} variant`, value));
+    acceptance(`browser projection accepts ${workflowName} ${ending}`, 'browser-projection', () => check(encode(source)));
+    const mutations = workflowName === 'CI' ? [
+      ...browserMutations,
+      ['unrelated comment byte changed', '# #894.', '# #894 changed.'],
+      ['Windows debt threshold changed', "EXPECTED_WIN32_FAILURES: '33'", "EXPECTED_WIN32_FAILURES: '32'"],
+    ] : [...browserMutations, ...releaseBrowserMutations];
+    for (const [name, needle, replacement] of mutations) {
+      acceptance(`browser projection rejects ${workflowName} ${ending}: ${name}`, 'browser-projection-mutant', () => {
+        const changed = encode(replaceOnce(source, needle, replacement));
+        assert.throws(() => check(changed), assert.AssertionError);
+      });
+    }
+  }
+}
 
 after(() => {
   const afterHashes = snapshot();
