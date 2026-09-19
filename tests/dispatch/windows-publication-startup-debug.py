@@ -733,6 +733,251 @@ class DebugCapture:
         raise Failure("debug_cleanup_timeout")
 
 
+METADATA_BUFFER_LIMIT = 64 * 1024
+METADATA_ACE_LIMIT = 128
+METADATA_RECEIPT_LIMIT = 16 * 1024
+
+
+class DesktopMetadata:
+    """One parent-side observation; handles are borrowed, never owned or closed."""
+
+    def __init__(self, api, deadline):
+        self.api, self.deadline = api, deadline
+        self.salt = None
+        self.state = {
+            "phase": "actual_token_validated_before_resume", "known": False,
+            "childWindowStation": "UNKNOWN", "effectiveAccess": "UNKNOWN",
+            "cause": "UNKNOWN", "priorChildBehaviorEquivalent": "UNKNOWN",
+            "parentUser32Load": {"attempted": False, "result": "UNKNOWN",
+                                 "perturbation": "parent_USER32_load_and_queries"},
+            "objects": [], "nameEqualities": []}
+
+    def before_call(self):
+        require(time.monotonic() < self.deadline, "metadata_deadline")
+
+    def invoke(self, obj, name, *args, phase="query", **fields):
+        self.before_call()
+        record = {"api": name, "phase": phase, "result": "UNKNOWN", **fields}
+        obj["calls"].append(record)
+        C.set_last_error(0)
+        try:
+            result = getattr(self.api, name)(*args)
+        except Exception as error:
+            record.update(reason="call_exception", winError=getattr(error, "winerror", None))
+            raise Failure("metadata_call_exception") from None
+        error = C.get_last_error()
+        record.update(result=bool(result), winError=error if not result else None)
+        return result, error
+
+    def query(self, obj, handle, kind):
+        security = kind == "dacl"
+        name = "GetUserObjectSecurity" if security else "GetUserObjectInformationW"
+        requested = W.DWORD(4)  # DACL_SECURITY_INFORMATION only.
+        selector = C.byref(requested) if security else {"name": 2, "type": 3}[kind]
+        size = W.DWORD()
+        ok, error = self.invoke(obj, name, handle, selector, None, 0, C.byref(size),
+                                phase="sizing", query=kind, requestedBytes=0)
+        obj["calls"][-1]["returnedBytes"] = size.value
+        require(not ok and error == 122, "metadata_sizing_refused")
+        require(0 < size.value <= METADATA_BUFFER_LIMIT, "metadata_size_limit")
+        capacity = size.value
+        buffer = C.create_string_buffer(capacity)
+        require(C.addressof(buffer) % 4 == 0, "metadata_buffer_alignment")
+        size.value = 0
+        ok, error = self.invoke(obj, name, handle, selector, buffer, capacity,
+                                C.byref(size), phase="data", query=kind,
+                                requestedBytes=capacity)
+        obj["calls"][-1]["returnedBytes"] = size.value
+        require(bool(ok), "metadata_data_refused")
+        require(0 < size.value <= capacity, "metadata_returned_size")
+        # Read only our allocation, never any unvalidated API-returned pointer.
+        raw = C.string_at(C.addressof(buffer), size.value)
+        if security:
+            return self.dacl(obj, buffer, raw)
+        require(len(raw) >= 2 and len(raw) % 2 == 0 and raw[-2:] == b"\0\0",
+                "metadata_string_bounds")
+        value = raw[:-2].decode("utf-16-le", errors="strict")
+        require("\0" not in value, "metadata_embedded_nul")
+        if kind == "name":
+            require(bool(value), "metadata_empty_name")
+            return {"known": True, "saltedSha256": digest(self.salt + b"name\0" + raw[:-2])}
+        # Do not emit arbitrary object strings, even for an unexpected type.
+        return {"known": value in ("Desktop", "WindowStation"),
+                "value": value if value in ("Desktop", "WindowStation") else "UNKNOWN"}
+
+    def dacl(self, obj, buffer, raw):
+        require(20 <= len(raw) <= min(C.sizeof(buffer), METADATA_BUFFER_LIMIT)
+                and C.addressof(buffer) % 4 == 0, "metadata_descriptor_buffer")
+
+        def span(offset, length, end):
+            require(type(offset) is int and 0 <= offset <= end
+                    and 0 <= length <= end - offset, "metadata_bounds")
+
+        def number(offset, length):
+            span(offset, length, len(raw))
+            return int.from_bytes(raw[offset:offset + length], "little")
+
+        def sid_size(offset, end):
+            span(offset, 8, end)
+            require(raw[offset] == 1 and raw[offset + 1] <= 15, "metadata_sid_header")
+            length = 8 + 4 * raw[offset + 1]
+            span(offset, length, end)
+            return length
+
+        span(0, 20, len(raw))  # SECURITY_DESCRIPTOR_RELATIVE, fixed Windows layout.
+        control = number(2, 2)
+        require(raw[0] == 1 and control & 0x8000, "metadata_descriptor_header")
+        require(raw[1] == 0 or control & 0x4000, "metadata_descriptor_reserved")
+        # SACL was not requested; unexpected SACL bytes are not inspected.
+        require(number(12, 4) == 0, "metadata_unrequested_sacl")
+        ranges = [(0, 20)]
+        for field in (4, 8):  # Validate any owner/group offsets without emitting SIDs.
+            offset = number(field, 4)
+            if offset:
+                require(offset >= 20 and offset % 4 == 0, "metadata_sid_offset")
+                ranges.append((offset, offset + sid_size(offset, len(raw))))
+        offset = number(16, 4)
+        has_dacl = bool(control & 4)
+        require(has_dacl or offset == 0, "metadata_absent_dacl_offset")
+        entries = []
+        if offset:
+            require(offset >= 20 and offset % 4 == 0, "metadata_acl_offset")
+            span(offset, 8, len(raw))
+            require(raw[offset] in (2, 4) and raw[offset + 1] == 0
+                    and number(offset + 6, 2) == 0, "metadata_acl_header")
+            acl_size, count = number(offset + 2, 2), number(offset + 4, 2)
+            require(acl_size >= 8 and acl_size % 4 == 0, "metadata_acl_size")
+            span(offset, acl_size, len(raw))
+            require(count <= METADATA_ACE_LIMIT, "metadata_ace_limit")
+            end = offset + acl_size
+            ranges.append((offset, end))
+            cursor = offset + 8
+            # Validate the entire ACL before GetAce can walk it.
+            for index in range(count):
+                self.before_call()
+                span(cursor, 4, end)
+                length = number(cursor + 2, 2)
+                require(length >= 4 and length % 4 == 0, "metadata_ace_size")
+                span(cursor, length, end)
+                kind, flags = raw[cursor], raw[cursor + 1]
+                ace = {"index": index, "type": kind, "flags": flags,
+                       "known": False}
+                if kind in (0, 1, 2, 3):  # Standard allow/deny/audit/alarm SID ACEs.
+                    span(cursor, 16, cursor + length)
+                    sid_length = sid_size(cursor + 8, cursor + length)
+                    require(8 + sid_length == length, "metadata_ace_sid_size")
+                    ace.update(known=True, mask=number(cursor + 4, 4),
+                               sidSaltedSha256=digest(self.salt + b"sid\0"
+                                                     + raw[cursor + 8:cursor + length]))
+                else:
+                    ace["reason"] = "unsupported_ace"
+                entries.append((cursor, ace))
+                cursor += length
+        ranges.sort()
+        require(all(left[1] <= right[0] for left, right in zip(ranges, ranges[1:])),
+                "metadata_descriptor_overlap")
+        present, defaulted, pointer = W.BOOL(), W.BOOL(), W.LPVOID()
+        ok, _ = self.invoke(obj, "GetSecurityDescriptorDacl", buffer, C.byref(present),
+                            C.byref(pointer), C.byref(defaulted), query="dacl")
+        require(bool(ok), "metadata_dacl_refused")
+        require(bool(present.value) == has_dacl, "metadata_dacl_presence_mismatch")
+        if not has_dacl:
+            return {"known": True, "state": "absent"}
+        expected = C.addressof(buffer) + offset if offset else None
+        require(pointer.value == expected, "metadata_dacl_pointer_bounds")
+        require(bool(defaulted.value) == bool(control & 8), "metadata_dacl_defaulted_mismatch")
+        result = {"known": True, "state": "null" if not offset else
+                  ("empty" if not entries else "present"), "defaulted": bool(defaulted.value)}
+        if not offset:
+            return result
+        result.update(aceCount=len(entries), aces=[], aceApi="GetAce")
+        for index, (cursor, ace) in enumerate(entries):
+            ace_pointer = W.LPVOID()
+            ok, _ = self.invoke(obj, "GetAce", pointer, index, C.byref(ace_pointer),
+                                query="dacl", aceIndex=index)
+            require(bool(ok), "metadata_ace_refused")
+            # Exact membership in the validated ACL also bounds the SID and mask.
+            require(ace_pointer.value == C.addressof(buffer) + cursor,
+                    "metadata_ace_pointer_bounds")
+            # Successful per-ACE calls are retained compactly with the ordered ACE.
+            obj["calls"].pop()
+            ace["result"] = True
+            result["aces"].append(ace)
+        return result
+
+    def capture(self, child_tid, creator_tid):
+        objects = self.state["objects"]
+        for role, api_name in (("owned_primary_desktop", "GetThreadDesktop"),
+                               ("creator_desktop", "GetThreadDesktop"),
+                               ("parent_window_station", "GetProcessWindowStation")):
+            objects.append({"role": role, "api": api_name, "result": "UNKNOWN",
+                            "borrowed": True, "calls": [],
+                            "name": {"known": False}, "type": {"known": False},
+                            "dacl": {"known": False, "state": "UNKNOWN"}})
+        try:
+            self.before_call()
+            self.salt = os.urandom(32)  # Never serialized, including on failure.
+            self.api.bind_desktop_metadata(self.state["parentUser32Load"])
+            for obj, tid in zip(objects, (child_tid, creator_tid, None)):
+                try:
+                    args = () if tid is None else (tid,)
+                    handle, _ = self.invoke(obj, obj["api"], *args)
+                    obj["result"] = bool(handle)
+                    require(bool(handle), "metadata_association_unavailable")
+                    # Borrowed handles intentionally never enter api.handles.
+                    for kind in ("name", "type", "dacl"):
+                        try:
+                            obj[kind] = self.query(obj, handle, kind)
+                        except Exception as error:
+                            obj[kind] = {"known": False, "state": "UNKNOWN",
+                                         "reason": error.reason if isinstance(error, Failure)
+                                         else "metadata_decode_error"}
+                except Exception as error:
+                    obj["reason"] = (error.reason if isinstance(error, Failure)
+                                     else "metadata_observation_error")
+            self.state["known"] = all(obj["result"] is True and all(
+                obj[key].get("known") is True for key in ("name", "type", "dacl"))
+                and all(ace["known"] for ace in obj["dacl"].get("aces", []))
+                for obj in objects)
+        except Exception as error:
+            self.state["reason"] = (error.reason if isinstance(error, Failure)
+                                    else "metadata_observation_error")
+        finally:
+            self.salt = None
+        for first, second in ((0, 1), (0, 2), (1, 2)):
+            left, right = objects[first], objects[second]
+            known = left["name"]["known"] and right["name"]["known"]
+            self.state["nameEqualities"].append({"roles": [left["role"], right["role"]],
+                "known": known, "equal": left["name"].get("saltedSha256") ==
+                right["name"].get("saltedSha256") if known else None})
+        # Preserve every API refusal, but omit bulk ACE detail if it cannot fit.
+        def size():
+            return len(json.dumps({"desktopMetadata": self.state},
+                                  separators=(",", ":"), ensure_ascii=True).encode()) + 1
+        if size() > METADATA_RECEIPT_LIMIT:
+            self.state.update(known=False, reason="metadata_receipt_limit")
+            for obj in objects:
+                dacl = obj["dacl"]
+                if dacl.get("aces"):
+                    dacl.update(known=False, state="UNKNOWN", reason="metadata_receipt_limit",
+                                omittedAceRecords=len(dacl["aces"]))
+                    dacl["aces"] = []
+        require(size() <= METADATA_RECEIPT_LIMIT, "metadata_receipt_limit")
+        return self.state
+
+
+def desktop_metadata_snapshot(api, child_tid, creator_tid, deadline):
+    # Optional metadata must never replace startup/cleanup failures or acceptance.
+    try:
+        return DesktopMetadata(api, deadline).capture(child_tid, creator_tid)
+    except Exception:
+        return {"phase": "actual_token_validated_before_resume", "known": False,
+                "reason": "metadata_recording_failed", "childWindowStation": "UNKNOWN",
+                "effectiveAccess": "UNKNOWN", "cause": "UNKNOWN",
+                "parentUser32Load": {"result": "UNKNOWN", "perturbationPossible": True},
+                "priorChildBehaviorEquivalent": "UNKNOWN"}
+
+
 class Native:
     def __init__(self):
         self.handles = []
@@ -748,6 +993,7 @@ class Native:
         check_debug_abi()
         kernel = C.WinDLL("kernel32", use_last_error=True)
         security = C.WinDLL("advapi32", use_last_error=True)
+        self.metadata_security = security
         p = C.POINTER
         signatures = {
             "GetCurrentProcess": (kernel, W.HANDLE, []),
@@ -784,6 +1030,36 @@ class Native:
             function = getattr(dll, name)
             function.restype, function.argtypes = result, arguments
             setattr(self, name, function)
+
+    def bind_desktop_metadata(self, observation):
+        observation.update(attempted=True, api="LoadLibraryExW", library="user32")
+        try:
+            user = C.WinDLL("user32", use_last_error=True)
+        except OSError as error:
+            observation.update(result=False, winError=error.winerror)
+            raise Failure("metadata_user32_unavailable") from None
+        observation.update(result=True, winError=None)
+        p = C.POINTER
+        signatures = {
+            "GetThreadDesktop": (user, W.HANDLE, [W.DWORD]),
+            "GetProcessWindowStation": (user, W.HANDLE, []),
+            "GetUserObjectInformationW": (user, W.BOOL,
+                [W.HANDLE, C.c_int, W.LPVOID, W.DWORD, p(W.DWORD)]),
+            "GetUserObjectSecurity": (user, W.BOOL,
+                [W.HANDLE, p(W.DWORD), W.LPVOID, W.DWORD, p(W.DWORD)]),
+            "GetSecurityDescriptorDacl": (self.metadata_security, W.BOOL,
+                [W.LPVOID, p(W.BOOL), p(W.LPVOID), p(W.BOOL)]),
+            "GetAce": (self.metadata_security, W.BOOL, [W.LPVOID, W.DWORD, p(W.LPVOID)]),
+        }
+        for name, (dll, result, arguments) in signatures.items():
+            try:
+                function = getattr(dll, name)
+                function.restype, function.argtypes = result, arguments
+                setattr(self, name, function)
+            except Exception as error:
+                observation["bindingFailure"] = {"api": name, "result": False,
+                                                  "winError": getattr(error, "winerror", None)}
+                raise Failure("metadata_binding_unavailable") from None
 
     def call(self, name, *args, invalid=0):
         C.set_last_error(0)
@@ -1082,6 +1358,9 @@ def execute(args, receipt):
             raise Failure("child_timeout")
         require(time.monotonic() < debug.deadline, "child_timeout")
         receipt["launch"]["actualTokenValidatedBeforeResume"] = True
+        receipt["desktopMetadata"] = desktop_metadata_snapshot(
+            api, info.threadId, debug.creator, debug.deadline)
+        require(time.monotonic() < debug.deadline, "child_timeout")
         require(api.call("ResumeThread", info.thread, invalid=0xFFFFFFFF) == 1,
                 "unexpected_suspend_count")
         receipt["launch"]["resumed"] = True
