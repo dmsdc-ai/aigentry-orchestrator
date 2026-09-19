@@ -333,13 +333,15 @@ class Native:
             self.token_queries["recordingFailed"] = True
 
     def info(self, token, kind):
-        size = W.DWORD()
+        # TokenElevation (20) returns TOKEN_ELEVATION: one DWORD.
+        size = W.DWORD(C.sizeof(W.DWORD) if kind == 20 else 0)
         C.set_last_error(0)
-        result = self.GetTokenInformation(token, kind, None, 0, C.byref(size))
-        error = C.get_last_error()
-        self.record_token_query(kind, "sizing", 0, size.value, result, error)
-        if result or error != 122:
-            raise Failure("unknown_token_evidence", api="GetTokenInformation", error=error)
+        if kind != 20:
+            result = self.GetTokenInformation(token, kind, None, 0, C.byref(size))
+            error = C.get_last_error()
+            self.record_token_query(kind, "sizing", 0, size.value, result, error)
+            if result or error != 122:
+                raise Failure("unknown_token_evidence", api="GetTokenInformation", error=error)
         require(4 <= size.value <= 1024 * 1024, "token_size")
         buffer = C.create_string_buffer(size.value)
         result = self.GetTokenInformation(token, kind, buffer, len(buffer), C.byref(size))
