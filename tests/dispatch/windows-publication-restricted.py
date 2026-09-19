@@ -244,6 +244,9 @@ class ProcessInfo(C.Structure):
 class Native:
     def __init__(self):
         self.handles = []
+        self.token_query_stage = "unknown"
+        self.token_queries = {"records": [], "limit": 64, "truncated": False,
+                              "recordingFailed": False}
         pointer = C.sizeof(W.HANDLE)
         require(pointer in (4, 8) and C.sizeof(W.DWORD) == 4 and C.sizeof(W.WCHAR) == 2
                 and C.sizeof(Luid) == 8 and C.sizeof(Privilege) == 12
@@ -305,18 +308,46 @@ class Native:
         self.call("OpenProcessToken", process, rights, C.byref(handle))
         return self.own(handle)
 
+    def record_token_query(self, kind, phase, requested, returned, result, error):
+        # Only allowlisted labels and bounded scalars; never inspect token memory.
+        # Diagnostics must not replace an API/validation failure with their own.
+        try:
+            if (self.token_query_stage not in ("unknown", "parent", "restricted", "actual_child")
+                    or phase not in ("sizing", "data")
+                    or any(type(value) is not int or not 0 <= value <= 0xFFFFFFFF
+                           for value in (kind, requested, returned, error))):
+                self.token_queries["recordingFailed"] = True
+                return
+            record = {"stage": self.token_query_stage, "informationClass": kind,
+                      "phase": phase, "requestedBytes": requested, "returnedBytes": returned,
+                      "result": bool(result), "lastError": error,
+                      "lastErrorMeaningful": not bool(result)}
+            records = self.token_queries["records"]
+            if len(records) < self.token_queries["limit"]:
+                records.append(record)
+            else:
+                # Retain the first 63 records and the latest (possibly failing) query.
+                self.token_queries["truncated"] = True
+                records[-1] = record
+        except Exception:
+            self.token_queries["recordingFailed"] = True
+
     def info(self, token, kind):
         size = W.DWORD()
         C.set_last_error(0)
         result = self.GetTokenInformation(token, kind, None, 0, C.byref(size))
         error = C.get_last_error()
+        self.record_token_query(kind, "sizing", 0, size.value, result, error)
         if result or error != 122:
             raise Failure("unknown_token_evidence", api="GetTokenInformation", error=error)
         require(4 <= size.value <= 1024 * 1024, "token_size")
         buffer = C.create_string_buffer(size.value)
-        if not self.GetTokenInformation(token, kind, buffer, len(buffer), C.byref(size)):
+        result = self.GetTokenInformation(token, kind, buffer, len(buffer), C.byref(size))
+        error = C.get_last_error()
+        self.record_token_query(kind, "data", len(buffer), size.value, result, error)
+        if not result:
             raise Failure("unknown_token_evidence", api="GetTokenInformation",
-                          error=C.get_last_error())
+                          error=error)
         require(size.value == len(buffer), "token_return_size")
         return buffer
 
@@ -440,6 +471,8 @@ def execute(args, receipt):
         check_hash("0" * 64, source["probe"])
     check_hash(source["probe"], source["probe"])
     api = Native()
+    # Share the live bounded evidence so exceptions and cleanup cannot discard it.
+    receipt["tokenQueryDiagnostics"] = api.token_queries
     process = None
     attributes = None
     attribute_ready = False
@@ -453,6 +486,7 @@ def execute(args, receipt):
                                    "increaseQuotaAvailable": False}
         own_token = api.token(api.GetCurrentProcess(), 0x008F)
         receipt["parentRights"]["requiredTokenRightsAvailable"] = True
+        api.token_query_stage = "parent"
         parent_token = api.summary(own_token)
         receipt["parentTokenSummary"] = parent_token
         require(parent_token["tokenType"] == 1, "parent_not_primary")
@@ -471,6 +505,7 @@ def execute(args, receipt):
         label = SidAttributes(C.addressof(medium), 0x20)
         api.call("SetTokenInformation", token, 25, C.byref(label),
                  C.sizeof(label) + len(MEDIUM_SID))
+        api.token_query_stage = "restricted"
         restricted_summary = api.summary(token)
         receipt["restrictedTokenSummary"] = restricted_summary
         validate_token(restricted_summary, parent_token)
@@ -520,6 +555,7 @@ def execute(args, receipt):
             child_token = api.token(process, 0x8)
         except Failure as error:
             raise Failure("unknown_actual_child_token", api=error.api, error=error.error) from None
+        api.token_query_stage = "actual_child"
         actual = api.summary(child_token)
         receipt["actualChildTokenSummary"] = actual
         candidate = dict(actual)
