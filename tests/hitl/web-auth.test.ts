@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import { Socket } from 'node:net';
@@ -454,7 +455,7 @@ for (const mode of ['missing', 'incompatible']) {
       const script = `const {createAuth} = await import(${JSON.stringify(moduleURL)});
         const auth = await createAuth(${JSON.stringify(f.config)}, () => 1800000000000);
         console.log(JSON.stringify(auth.status())); await auth.close();`;
-      const result = spawnSync(process.execPath, ['--no-warnings', '--loader', loader, '--input-type=module', '-e', script], { encoding: 'utf8' });
+      const result = spawnSync(process.execPath, ['--no-warnings', '--loader', pathToFileURL(loader).href, '--input-type=module', '-e', script], { encoding: 'utf8' });
       assert.equal(result.status, 0, result.stderr);
       assert.deepEqual(JSON.parse(result.stdout), { state: 'dependency_unverified', reason: mode === 'missing' ? 'dependency_unverified' : 'dependency_incompatible' });
     } finally { await f.cleanup(); }
