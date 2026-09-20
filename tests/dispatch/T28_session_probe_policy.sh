@@ -29,7 +29,9 @@ def run_json(argv, stdin=None):
 
 def assert_subset(name, got, want):
     for key, expected in want.items():
-        actual = got.get(key)
+        if key not in got:
+            raise AssertionError(f"{name}: {key} missing from result")
+        actual = got[key]
         if actual != expected:
             raise AssertionError(f"{name}: {key}={actual!r}, want {expected!r}")
 
@@ -59,6 +61,11 @@ for case in cases:
         [policy, "--status", "verify_started", "--state", "-"],
         stdin=json.dumps(state),
     )
+    if "expect_verify_action" in case:
+        expected = case["expect_verify_action"]
+        if not isinstance(expected, dict) or not expected:
+            raise AssertionError(f"{case['name']}: expect_verify_action must be a non-empty object")
+        assert_subset(f"{case['name']} verify", verify_action, expected)
     if case["name"] in {"codex-init-spinner", "working-spinner"}:
         assert_subset(f"{case['name']} verify", verify_action, {"action": "NOOP", "status": "verified"})
     elif case["name"] == "unsubmitted-context-ref":
@@ -72,6 +79,11 @@ for case in cases:
         [policy, "--status", "tracker_check", "--state", "-"],
         stdin=json.dumps(state),
     )
+    if "expect_tracker_action" in case:
+        expected = case["expect_tracker_action"]
+        if not isinstance(expected, dict) or not expected:
+            raise AssertionError(f"{case['name']}: expect_tracker_action must be a non-empty object")
+        assert_subset(f"{case['name']} tracker", tracker_action, expected)
     cls = state["detail"]["tracker_class"]
     if cls == "welcome":
         assert_subset(f"{case['name']} tracker", tracker_action, {"action": "REDISPATCH", "status": "stuck_welcome"})

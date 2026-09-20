@@ -377,7 +377,7 @@ def verification_problems(
     screen: str,
 ) -> list[str]:
     problems: list[str] = []
-    if health and "CONNECTED" not in health.upper():
+    if health.upper() != "CONNECTED":
         problems.append(f"transport {health} (not CONNECTED)")
     if not transport_ready or not bootstrap_ready:
         problems.append("not ready / bootstrap not ready")
@@ -429,11 +429,12 @@ def observe(args: argparse.Namespace) -> dict[str, Any]:
             probe_error = (err or "read-screen unavailable").strip()
 
     cli = cli_from_info_or_screen(info, screen, args.cli or "")
-    health = str(field(info, "healthStatus") or field(info, "transport", "health_status") or "")
+    health = field(info, "healthStatus") or field(info, "transport", "health_status") or ""
+    health = health if isinstance(health, str) else ""
     transport_ready = bool(field(info, "ready")) or bool(field(info, "transport", "ready"))
     raw_bootstrap = field(info, "transport", "bootstrap", "ready")
     bootstrap_ready = True if raw_bootstrap is None else bool(raw_bootstrap)
-    alive = bool(info) and (not health or "CONNECTED" in health.upper())
+    alive = bool(info) and health.upper() == "CONNECTED"
 
     surface, surface_detail = classify_surface(cli, screen)
     unsubmitted = surface == "unsubmitted"
