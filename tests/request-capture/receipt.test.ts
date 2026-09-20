@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { fork, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { promises as fs } from 'node:fs';
+import { constants, promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test, type TestContext } from 'node:test';
@@ -180,9 +180,37 @@ for (const [name, operation] of [['writeFile', 'write'], ['appendFile', 'write']
 }
 const promises = fs.promises;
 const promiseOpen = promises.open;
+let handleSequence = 0;
+const reuseProbe = mode.startsWith('reuse:');
+const [, faultKind, faultOperation, faultCode] = mode.split(':');
+function reuseKind(value) {
+  const relative = path.relative(root, String(value));
+  if (relative === 'store.json') return 'marker';
+  if (relative === path.join('raw', require('node:crypto').createHash('sha256')
+    .update(Buffer.from(process.argv[4], 'base64')).digest('hex') + '.bin')) return 'blob';
+  return 'other';
+}
+function reuseFault(kind, operation) {
+  if (reuseProbe && kind === faultKind && operation === faultOperation) {
+    send({ type: 'reuse-fault', kind, operation, code: faultCode });
+    const error = new Error('REUSE_FAULT_SECRET');
+    error.code = faultCode;
+    throw error;
+  }
+}
 promises.open = async function(value, flags, ...rest) {
+  const kind = reuseProbe ? reuseKind(value) : 'other';
+  const id = ++handleSequence;
+  if (reuseProbe) send({ type: 'reuse-operation', kind, id, operation: 'open', flags, phase: 'start' });
+  reuseFault(kind, 'open');
   if (typeof flags === 'string' && /[wa+]/.test(flags)) check('open', value);
-  const handle = await promiseOpen.call(this, value, flags, ...rest);
+  let handle;
+  try { handle = await promiseOpen.call(this, value, flags, ...rest); }
+  catch (error) {
+    if (reuseProbe) send({ type: 'reuse-operation', kind, id, operation: 'open', flags, phase: 'error', code: error.code });
+    throw error;
+  }
+  if (reuseProbe) send({ type: 'reuse-operation', kind, id, operation: 'open', flags, phase: 'done' });
   descriptors.set(handle.fd, value);
   for (const name of ['sync', 'datasync', 'write', 'writeFile']) {
     const original = handle[name];
@@ -190,6 +218,23 @@ promises.open = async function(value, flags, ...rest) {
       check(name === 'sync' || name === 'datasync' ? 'sync' : 'write', value, handle.fd);
       return original.apply(this, args);
     };
+  }
+  if (reuseProbe) {
+    for (const operation of ['stat', 'readFile', 'sync', 'datasync', 'write', 'writeFile', 'writev', 'appendFile', 'truncate', 'chmod', 'chown', 'close']) {
+      const original = handle[operation];
+      handle[operation] = async function(...args) {
+        send({ type: 'reuse-operation', kind, id, operation, phase: 'start' });
+        reuseFault(kind, operation);
+        try {
+          const result = await original.apply(this, args);
+          send({ type: 'reuse-operation', kind, id, operation, phase: 'done' });
+          return result;
+        } catch (error) {
+          send({ type: 'reuse-operation', kind, id, operation, phase: 'error', code: error.code });
+          throw error;
+        }
+      };
+    }
   }
   return handle;
 };
@@ -225,6 +270,7 @@ process.disconnect();
 `;
 
 type Message = { type: string; ok?: boolean; receipt?: Receipt; error?: string; operation?: string;
+  kind?: string; id?: number; flags?: number | string; phase?: string; code?: string;
   section?: string; renamed?: string[]; blobs?: { name: string; bytes: string }[] };
 type Run = {
   child: ChildProcess; messages: Message[];
@@ -344,6 +390,118 @@ test('same bytes and Codex turn retain distinct request identities', async t => 
   assert.equal((await accepted(root)).length, 2);
   await sentinels(base, root);
 });
+
+async function reuseSnapshot(root: string, prior: Receipt): Promise<Map<string, Buffer>> {
+  const names = ['store.json', prior.original_ref,
+    ...(await accepted(root)).map(name => `receipts/${name}`)];
+  return new Map(await Promise.all(names.map(async name => [name, await fs.readFile(path.join(root, name))] as const)));
+}
+
+async function checkReusePreserved(root: string, snapshot: Map<string, Buffer>, run: Run): Promise<void> {
+  for (const [name, bytes] of snapshot) assert.deepEqual(await fs.readFile(path.join(root, name)), bytes, name);
+  await assert.rejects(fs.lstat(path.join(root, 'store.json.lock')), { code: 'ENOENT' });
+  const operations = run.messages.filter(message => message.type === 'reuse-operation');
+  const opened = operations.filter(message => message.operation === 'open' && message.phase === 'done');
+  const closed = operations.filter(message => message.operation === 'close' && message.phase === 'done');
+  assert.deepEqual(closed.map(message => message.id).sort(), opened.map(message => message.id).sort(), 'all opened handles closed');
+  for (const kind of ['marker', 'blob']) {
+    const events = operations.filter(message => message.kind === kind);
+    assert.equal(events.some(message => ['write', 'writeFile', 'writev', 'appendFile', 'truncate', 'chmod', 'chown'].includes(message.operation!)), false);
+    for (const event of events.filter(message => message.operation === 'open')) {
+      assert.equal(event.flags, process.platform === 'win32' ? constants.O_RDWR : constants.O_RDONLY | constants.O_NOFOLLOW);
+    }
+  }
+}
+
+test('existing marker and reused blob flush through the same checked handle without mutation', async t => {
+  const capture = await product();
+  const { base, root } = await fixture(t);
+  const raw = Buffer.from('reused binary evidence\0\xff\r\n');
+  const prior = await capture(raw, { root });
+  const snapshot = await reuseSnapshot(root, prior);
+  const ids = new Set([prior.capture_id]);
+  for (let repeat = 0; repeat < 2; repeat++) {
+    const run = await childRun(t, base, root, raw, 'reuse:observe');
+    const result = await run.waitFor('result');
+    const exit = await run.done;
+    assert.equal(exit.code, 0, JSON.stringify({ exit, messages: run.messages }));
+    assert.equal(result.ok, true);
+    for (const kind of ['marker', 'blob']) {
+      const events = run.messages.filter(message => message.type === 'reuse-operation' && message.kind === kind);
+      assert.deepEqual(events.filter(message => message.phase === 'done').map(message => message.operation),
+        ['open', 'stat', 'readFile', 'sync', 'close']);
+      assert.equal(new Set(events.map(message => message.id)).size, 1, 'must not reopen');
+    }
+    await checkReusePreserved(root, snapshot, run);
+    assert.equal(ids.has(result.receipt!.capture_id), false);
+    ids.add(result.receipt!.capture_id);
+    await checkReceipt(root, raw, result.receipt!);
+    snapshot.set(`receipts/${result.receipt!.capture_id}.json`,
+      await fs.readFile(path.join(root, 'receipts', `${result.receipt!.capture_id}.json`)));
+  }
+  assert.deepEqual(await accepted(root), [...ids].map(id => `${id}.json`).sort());
+});
+
+for (const kind of ['marker', 'blob']) {
+  for (const operation of ['open', 'sync']) {
+    for (const code of ['EPERM', 'EIO']) {
+      test(`existing ${kind} ${operation} ${code} fails closed and preserves evidence`, async t => {
+        const capture = await product();
+        const { base, root } = await fixture(t);
+        const raw = Buffer.from('REUSE_RAW_SECRET\0\r\n');
+        const prior = await capture(raw, { root });
+        const snapshot = await reuseSnapshot(root, prior);
+        const run = await childRun(t, base, root, raw, `reuse:${kind}:${operation}:${code}`);
+        const result = await run.waitFor('result');
+        const exit = await run.done;
+        assert.deepEqual(run.messages.filter(message => message.type === 'reuse-fault'),
+          [{ type: 'reuse-fault', kind, operation, code }], 'required boundary reached exactly once');
+        assert.equal(exit.code, 23, JSON.stringify(exit));
+        assert.equal(result.ok, false);
+        assert.equal(result.error, 'Error: capture: failed to persist submitted prompt');
+        assert.equal(exit.stdout + exit.stderr, '');
+        await checkReusePreserved(root, snapshot, run);
+        assert.deepEqual(await accepted(root), [`${prior.capture_id}.json`]);
+      });
+    }
+  }
+
+  test(`native read-only ${kind} fails closed without permission repair`, async t => {
+    const capture = await product();
+    const { base, root } = await fixture(t);
+    const raw = Buffer.from('read-only original evidence\0\r\n');
+    const prior = await capture(raw, { root });
+    const snapshot = await reuseSnapshot(root, prior);
+    const target = path.join(root, kind === 'marker' ? 'store.json' : prior.original_ref);
+    // On Windows chmod clears the writable attribute; on POSIX 0400 exercises
+    // the earlier private-mode guard. Only native Windows tests the open denial.
+    await fs.chmod(target, 0o400);
+    try {
+      const before = await fs.stat(target);
+      assert.equal(before.mode & 0o200, 0, 'read-only fixture must be effective');
+      const run = await childRun(t, base, root, raw, 'reuse:readonly');
+      const result = await run.waitFor('result');
+      const exit = await run.done;
+      assert.equal(exit.code, 23, JSON.stringify({ exit, messages: run.messages }));
+      assert.equal(result.ok, false);
+      assert.equal(result.error, 'Error: capture: failed to persist submitted prompt');
+      assert.equal(exit.stdout + exit.stderr, '');
+      assert.equal((await fs.stat(target)).mode, before.mode);
+      if (process.platform === 'win32') {
+        assert.equal(run.messages.some(message => message.type === 'reuse-operation' && message.kind === kind
+          && ['open', 'sync'].includes(message.operation!) && message.phase === 'error'), true,
+        'native read-only boundary must reject');
+      } else {
+        t.diagnostic('POSIX private-mode rejection only; Windows read-only open/flush denial requires native Windows execution');
+      }
+      await checkReusePreserved(root, snapshot, run);
+      assert.deepEqual(await accepted(root), [`${prior.capture_id}.json`]);
+    } finally {
+      // Restore only this owned fixture after assertions so teardown can remove it.
+      await fs.chmod(target, 0o600);
+    }
+  });
+}
 
 test('independent concurrent child writers retain every receipt and exact blob', async t => {
   await product();

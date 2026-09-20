@@ -74,7 +74,8 @@ async function readPrivateFile(target: string): Promise<Buffer> {
   requirePrivate(stat.mode, 0o600);
   const handle = await fs.open(
     target,
-    constants.O_RDONLY | (process.platform === "win32" ? 0 : constants.O_NOFOLLOW),
+    // Windows FlushFileBuffers requires write access; never create or truncate here.
+    process.platform === "win32" ? constants.O_RDWR : constants.O_RDONLY | constants.O_NOFOLLOW,
   );
   try {
     const opened = await handle.stat();
