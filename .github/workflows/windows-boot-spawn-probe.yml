@@ -1,15 +1,6 @@
 name: Windows boot spawn observation
 
 on:
-  pull_request:
-    paths:
-      - tests/dispatch/windows-boot-spawn-probe.mjs
-      - .github/workflows/windows-boot-spawn-probe.yml
-      - src/session/boot-adapter/spawner.ts
-      - src/session/boot-adapter/types.ts
-      - src/session/boot-adapter/common.ts
-      - package.json
-      - package-lock.json
   workflow_dispatch:
 
 permissions:
