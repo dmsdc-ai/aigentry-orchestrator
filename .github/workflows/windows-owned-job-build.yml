@@ -1,0 +1,185 @@
+name: Windows owned-job compile only
+
+on:
+  push:
+    branches: [test/1167-wb1167l-20260923]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    if: github.ref == 'refs/heads/test/1167-wb1167l-20260923'
+    runs-on: windows-2022
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      DIAG: ${{ runner.temp }}\owned-job-diagnostics
+      BUNDLE: ${{ runner.temp }}\owned-job-artifact
+    steps:
+      - name: Initialize evidence
+        run: |
+          New-Item -ItemType Directory -Force $env:DIAG, $env:BUNDLE | Out-Null
+          [ordered]@{
+            task = '1167'; release = '1171'; operation = 'wb1167l-v1'
+            authorSession = 'wb1167l-builder'
+            authorAttempt = 'e2002dab-2cd5-4e76-8c66-f0c08513f3e7'
+            sha = '${{ github.sha }}'; ref = '${{ github.ref }}'
+            runId = '${{ github.run_id }}'; runAttempt = '${{ github.run_attempt }}'
+            imageOS = $env:ImageOS; imageVersion = $env:ImageVersion
+            os = [Runtime.InteropServices.RuntimeInformation]::OSDescription
+            architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          } | ConvertTo-Json | Set-Content "$env:DIAG\identity.json"
+      - name: Preserve source bytes on disposable runner
+        run: |
+          git config --global core.autocrlf false
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to disable checkout line-ending conversion' }
+          $autocrlf = git config --global --get core.autocrlf
+          if ($LASTEXITCODE -ne 0 -or $autocrlf -ne 'false') { throw 'Unexpected core.autocrlf setting' }
+          "core.autocrlf=$autocrlf" | Set-Content "$env:DIAG\checkout-config.txt"
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            bin/windows-owned-broker.mjs
+            native/windows-owned-job/binding.gyp
+            native/windows-owned-job/owned-job.cc
+            native/windows-owned-job/owned-process.mjs
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.2'
+          architecture: x64
+          check-latest: false
+      - name: Verify frozen sources and identify toolchain
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Start-Transcript -Path "$env:DIAG\preflight.log"
+          try {
+            $expected = [ordered]@{
+              'bin/windows-owned-broker.mjs' = 'd648a002e408bd675cb1398e960c18df020001aae55fc9ac461c6f7ae671aadd'
+              'native/windows-owned-job/binding.gyp' = '0e640ded58e7dc72f3ab598b253f51fc430c6dc2dc4ebee3cf805ef596e0737b'
+              'native/windows-owned-job/owned-job.cc' = '04584b4de63337b56778f3e78d3f19ff557bd32b36fe30b7362e3b86cc5480a9'
+              'native/windows-owned-job/owned-process.mjs' = '8168d3f7f6fc30cb74eb4b3f59fb05fd4a389ce6a4afc8a84b890e9c4bd72d97'
+            }
+            $expected | ConvertTo-Json | Set-Content "$env:DIAG\expected-sources.json"
+            $actual = [ordered]@{}
+            foreach ($path in $expected.Keys) {
+              $actual[$path] = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+              if ($actual[$path] -ne $expected[$path]) { throw "Frozen source mismatch: $path" }
+            }
+            $actual | ConvertTo-Json | Set-Content "$env:DIAG\sources.sha256.json"
+            if (Test-Path 'native/windows-owned-job/build') { throw 'Pre-existing build directory refused' }
+            $node = (Get-Command node.exe).Source
+            $nodeRoot = Split-Path $node
+            $npm = Join-Path $nodeRoot 'node_modules/npm/bin/npm-cli.js'
+            $gypRoot = Join-Path $nodeRoot 'node_modules/npm/node_modules/node-gyp'
+            $gyp = Join-Path $gypRoot 'bin/node-gyp.js'
+            foreach ($file in @($npm, $gyp, "$gypRoot/package.json")) {
+              if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw "Bundled tooling missing; no fallback: $file" }
+            }
+            $runtime = & $node -p 'JSON.stringify({version:process.version,arch:process.arch,platform:process.platform,versions:process.versions})'
+            if ($LASTEXITCODE -ne 0) { throw 'Node identity failed' }
+            $runtime | Set-Content "$env:DIAG\node.json"
+            $r = $runtime | ConvertFrom-Json
+            if ($r.version -ne 'v20.20.2' -or $r.arch -ne 'x64' -or $r.platform -ne 'win32') { throw 'Unexpected runtime' }
+            $npmVersion = & $node $npm --version
+            if ($LASTEXITCODE -ne 0) { throw 'npm identity failed' }
+            [ordered]@{
+              nodePath = $node; nodeSHA256 = (Get-FileHash $node).Hash
+              npmVersion = $npmVersion; npmCLI_SHA256 = (Get-FileHash $npm).Hash
+              nodeGypPath = $gyp
+              nodeGypVersion = (Get-Content "$gypRoot/package.json" -Raw | ConvertFrom-Json).version
+              nodeGypCLI_SHA256 = (Get-FileHash $gyp).Hash
+              nodeGypPackageSHA256 = (Get-FileHash "$gypRoot/package.json").Hash
+            } | ConvertTo-Json | Set-Content "$env:DIAG\node-toolchain.json"
+            Get-ChildItem $gypRoot -Recurse -File | Sort-Object FullName | ForEach-Object {
+              '{0}  {1}' -f (Get-FileHash $_.FullName).Hash, ([IO.Path]::GetRelativePath($gypRoot, $_.FullName))
+            } | Set-Content "$env:DIAG\node-gyp-tree.sha256"
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            $vsJSON = & $vswhere -latest -version '[17.0,18.0)' -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json
+            if ($LASTEXITCODE -ne 0) { throw 'MSVC discovery failed' }
+            $vsJSON | Set-Content "$env:DIAG\visual-studio.json"
+            $vs = @($vsJSON | ConvertFrom-Json)[0]
+            if (!$vs.installationPath) { throw 'MSVC2022 unavailable' }
+            Import-Module (Join-Path $vs.installationPath 'Common7/Tools/Microsoft.VisualStudio.DevShell.dll')
+            Enter-VsDevShell -VsInstallPath $vs.installationPath -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+            if ($env:WindowsSDKVersion -notlike '10.*') { throw 'SDK10 unavailable' }
+            $cl = (Get-Command cl.exe).Source
+            [ordered]@{
+              compiler = $cl; fileVersion = (Get-Item $cl).VersionInfo.FileVersion
+              compilerSHA256 = (Get-FileHash $cl).Hash
+              vcToolsVersion = $env:VCToolsVersion
+              sdkDirectory = $env:WindowsSdkDir; sdkVersion = $env:WindowsSDKVersion
+              targetArchitecture = $env:VSCMD_ARG_TGT_ARCH
+            } | ConvertTo-Json | Set-Content "$env:DIAG\msvc-sdk.json"
+            "BUILD_NODE=$node" >> $env:GITHUB_ENV
+            "BUILD_GYP=$gyp" >> $env:GITHUB_ENV
+          } finally { Stop-Transcript }
+      - name: Compile supplied binding.gyp
+        id: compile
+        timeout-minutes: 5
+        working-directory: native/windows-owned-job
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $devdir = Join-Path $env:RUNNER_TEMP 'owned-job-node-headers'
+          if (Test-Path $devdir) { throw 'Pre-existing header cache refused' }
+          $arguments = @(
+            ('"{0}"' -f $env:BUILD_GYP), 'configure', 'build', '--verbose',
+            '--target=20.20.2', '--arch=x64', '--msvs_version=2022',
+            '--dist-url=https://nodejs.org/download/release',
+            ('--devdir="{0}"' -f $devdir)
+          )
+          $arguments | Set-Content "$env:DIAG\compile-arguments.txt"
+          $process = Start-Process -FilePath $env:BUILD_NODE -ArgumentList $arguments -NoNewWindow -Wait -PassThru -RedirectStandardOutput "$env:DIAG\compiler.stdout.log" -RedirectStandardError "$env:DIAG\compiler.stderr.log"
+          $code = $process.ExitCode
+          $code | Set-Content "$env:DIAG\compiler.exit-code.txt"
+          Get-Content "$env:DIAG\compiler.stdout.log"
+          Get-Content "$env:DIAG\compiler.stderr.log"
+          if ($code -ne 0) { exit $code }
+          $binary = Get-Item -LiteralPath 'build/Release/owned_job.node' -ErrorAction Stop
+          if ($binary.Length -le 0) { throw 'Zero exit without a nonempty addon' }
+          $expected = Get-Content "$env:DIAG\sources.sha256.json" -Raw | ConvertFrom-Json -AsHashtable
+          foreach ($path in $expected.Keys) {
+            if ((Get-FileHash (Join-Path $env:GITHUB_WORKSPACE $path)).Hash.ToLowerInvariant() -ne $expected[$path]) { throw "Source changed during build: $path" }
+          }
+          [ordered]@{
+            sha256 = (Get-FileHash $binary.FullName).Hash.ToLowerInvariant()
+            size = $binary.Length; compilerExit = $code
+            path = 'native/windows-owned-job/build/Release/owned_job.node'
+          } | ConvertTo-Json | Set-Content "$env:DIAG\binary.json"
+          Copy-Item $binary.FullName "$env:BUNDLE\owned_job.node"
+          Copy-Item "$env:DIAG\*" $env:BUNDLE
+      - name: Preserve actual generated toolchain configuration
+        if: always()
+        run: |
+          if (Test-Path 'native/windows-owned-job/build') {
+            Get-ChildItem 'native/windows-owned-job/build' -Recurse -File |
+              Where-Object { $_.Extension -in '.gypi', '.vcxproj', '.sln', '.props', '.targets', '.tlog', '.log' } |
+              ForEach-Object {
+                $relative = [IO.Path]::GetRelativePath((Join-Path $env:GITHUB_WORKSPACE 'native/windows-owned-job/build'), $_.FullName)
+                $target = Join-Path "$env:DIAG\generated-build" $relative
+                New-Item -ItemType Directory -Force (Split-Path $target) | Out-Null
+                Copy-Item $_.FullName $target
+              }
+          }
+          if (Test-Path "$env:BUNDLE\owned_job.node") {
+            Copy-Item "$env:DIAG\*" $env:BUNDLE -Recurse -Force
+          }
+      - name: Upload diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: owned-job-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.DIAG }}
+          if-no-files-found: error
+      - name: Upload addon and bound provenance
+        if: success() && steps.compile.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: owned-job-win32-x64-node20.20.2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.BUNDLE }}
+          if-no-files-found: error
