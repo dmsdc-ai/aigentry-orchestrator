@@ -607,6 +607,84 @@ try {
     $measurementReceipt['interpreter'] = [ordered]@{ path = $python; pinnedBy = 'actions/setup-python' }
     $script:Interpreter = $python
 
+    # Inert launch-only comparison; never substitutes for the U1 assertions.
+    # Frozen Process.cs: space-join arguments, quote trimmed executable, append
+    # one space and arguments, then pass that builder to CreateProcessWithLogonW.
+    # Microsoft documents 1024 characters, without explicit NUL accounting.
+    # These are derived UTF-16 lengths, NOT captured native buffers or bytes.
+    $measurementReceipt['launchBoundary'] = [ordered]@{
+        sourceUrl = 'https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createprocesswithlogonw'
+        sourceBodySha256 = '4c50e61e72139b852b6f4de845b73e2eff56d5d900e24ed9b79202135ca75755'
+        documentedMaximumCharacters = 1024; documentedNulAccounting = 'unspecified'
+        units = 'utf16_code_units'; nativeBufferObserved = $false
+        diagnosticFailure = $false; cases = @()
+    }
+    foreach ($targetLength in @(900, 1024, 1134)) {
+        $case = [ordered]@{
+            targetLengthExcludingNul = $targetLength
+            derivedActualLengthExcludingNul = $null
+            derivedLengthWithOneTerminator = $null
+            status = 'unknown'; codeCandidates = @()
+            candidateSetExhaustive = $false; childIndex = $null
+        }
+        $measurementReceipt['launchBoundary'].cases += , $case
+        $childIndex = $measurementReceipt.children.Count
+        try {
+            $executable = $python.Trim()
+            $quotedLength = $executable.Length
+            if (-not ($executable.StartsWith('"') -and $executable.EndsWith('"'))) {
+                $quotedLength += 2
+            }
+            # Fixed arguments '-c', 'pass', and ONE inert ASCII filler argument:
+            # joined length = 2 + 4 + filler + 2 separating spaces.
+            $fillerLength = $targetLength - $quotedLength - 1 - 8
+            if ($fillerLength -lt 1 -or $fillerLength -gt 1134) {
+                throw 'boundary_length_unavailable'
+            }
+            $remaining = $OverallTimeoutSeconds - [int]$clock.Elapsed.TotalSeconds
+            $null = Invoke-ProbeAsPrincipal -Account $owner -WorkingDirectory $stage `
+                -StdOut (Join-Path $receipts ("boundary-$targetLength-stdout.txt")) `
+                -StdErr (Join-Path $receipts ("boundary-$targetLength-stderr.txt")) `
+                -TimeoutSeconds ([Math]::Min(5, $remaining)) `
+                -Arguments @($python, '-c', 'pass', ('x' * $fillerLength))
+        }
+        catch {
+            # Recover only from the bounded child record below, never messages.
+            # An exception with no complete structural evidence stays unknown.
+        }
+        finally { Stop-OwnedProcesses }
+        try {
+            if ($measurementReceipt.children.Count -ne $childIndex + 1) {
+                throw 'boundary_child_record_unavailable'
+            }
+            $case['childIndex'] = $childIndex
+            $boundaryChild = $measurementReceipt.children[$childIndex]
+            if (-not $boundaryChild.launchStructure.complete) {
+                throw 'boundary_structure_unknown'
+            }
+            $actualLength = $boundaryChild.launchStructure.commandLineLengthExcludingNul
+            $case['derivedActualLengthExcludingNul'] = $actualLength
+            $case['derivedLengthWithOneTerminator'] = $actualLength + 1
+            if ($actualLength -ne $targetLength) { throw 'boundary_length_mismatch' }
+            if ($boundaryChild.launched -and -not $boundaryChild.timedOut -and
+                $boundaryChild.exitCode -eq 0) {
+                $case['status'] = 'exited_zero'
+            }
+            elseif (-not $boundaryChild.launched -and
+                $boundaryChild.launchDiagnostic.complete -and
+                $boundaryChild.launchDiagnostic.upstreamDiscriminator.complete) {
+                $case['status'] = 'launch_failed'
+                $case['codeCandidates'] = @(
+                    $boundaryChild.launchDiagnostic.upstreamDiscriminator.win32CodeCandidates)
+            }
+        }
+        catch { $case['status'] = 'unknown'; $case['codeCandidates'] = @() }
+        if ($case['status'] -eq 'unknown' -or
+            ($targetLength -eq 900 -and $case['status'] -ne 'exited_zero')) {
+            $measurementReceipt['launchBoundary'].diagnosticFailure = $true
+        }
+    }
+
     $ownerReceiptPath = Join-Path $receipts 'owner-receipt.json'
     $remaining = $OverallTimeoutSeconds - [int]$clock.Elapsed.TotalSeconds
     $ownerChild = Invoke-ProbeAsPrincipal -Account $owner -WorkingDirectory $stage `
@@ -755,6 +833,12 @@ finally {
     }
     $measurementReceipt['powerLossProven'] = $false
     $measurementReceipt['activationAuthorized'] = $false
+    # Diagnostic failure cannot masquerade as a full functional pass. Existing
+    # cleanup, private ACL and ordinary-principal verdicts remain independent.
+    if ($measurementReceipt.Contains('launchBoundary') -and
+        $measurementReceipt['launchBoundary'].diagnosticFailure -and $exitCode -eq 0) {
+        $exitCode = 2
+    }
     try {
         $json = $measurementReceipt | ConvertTo-Json -Depth 12
         Set-Content -LiteralPath $Receipt -Value $json -Encoding utf8
