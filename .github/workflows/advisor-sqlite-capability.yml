@@ -1,0 +1,39 @@
+name: Advisor SQLite candidate capability
+
+on:
+  push:
+    branches:
+      - test/1161-sq1161s-20260923
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capability:
+    if: github.ref == 'refs/heads/test/1161-sq1161s-20260923'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.21.0'
+          check-latest: false
+      - name: Synthetic API substrate fixture (not product qualification)
+        timeout-minutes: 2
+        shell: bash
+        run: node tests/task-advisor/sqlite-capability-probe.mjs > sqlite-capability.json
+      - name: Preserve actual result, including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sqlite-capability-${{ matrix.os }}-24.21.0
+          path: sqlite-capability.json
+          if-no-files-found: error
