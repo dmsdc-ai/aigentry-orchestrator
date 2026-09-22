@@ -41,7 +41,7 @@ $script:AdminGroupSid = [System.Security.Principal.SecurityIdentifier]'S-1-5-32-
 $script:SystemSid = [System.Security.Principal.SecurityIdentifier]'S-1-5-18'
 $script:StartupFailureExit = 3221225794  # 0xC0000142, the prior launcher failure
 
-$receipt = [ordered]@{
+$measurementReceipt = [ordered]@{
     schema                = 1
     probe                 = 'windows-private-auth-runner'
     status                = 'harness_failure'
@@ -69,7 +69,7 @@ function Add-Control {
           [hashtable]$Detail = @{})
     $entry = [ordered]@{ control = $Name; state = $State }
     foreach ($key in ($Detail.Keys | Sort-Object)) { $entry[$key] = $Detail[$key] }
-    $script:receipt.controls += , $entry
+    $script:measurementReceipt.controls += , $entry
 }
 
 function New-JobLocalPassword {
@@ -160,7 +160,7 @@ function Invoke-ProbeAsPrincipal {
         processId = $null; exitCode = $null; timedOut = $false
         stoppedByHarness = $false; timeoutSeconds = $TimeoutSeconds
     }
-    $script:receipt.children += , $record
+    $script:measurementReceipt.children += , $record
     if ($TimeoutSeconds -le 0) {
         $record['launchFailure'] = 'overall_measurement_budget_exhausted'
         throw 'overall_measurement_budget_exhausted'
@@ -246,13 +246,13 @@ try {
     }
     if (-not (Test-Path -LiteralPath $Probe -PathType Leaf)) { throw 'probe_not_found' }
     $probeItem = Get-Item -LiteralPath $Probe
-    $receipt['sourceHashes'] = [ordered]@{
+    $measurementReceipt['sourceHashes'] = [ordered]@{
         probe = (Get-FileHash -LiteralPath $Probe -Algorithm SHA256).Hash.ToLowerInvariant()
         runner = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
     }
     $runId = -join ((1..4 | ForEach-Object {
         '{0:x2}' -f [System.Security.Cryptography.RandomNumberGenerator]::GetInt32(256) }))
-    $receipt['runId'] = $runId
+    $measurementReceipt['runId'] = $runId
 
     $stage = Join-Path $WorkRoot 'stage'
     $receipts = Join-Path $WorkRoot 'receipts'
@@ -268,7 +268,7 @@ try {
     $script:OwnedAccounts += , $owner
     $other = New-DisposableAccount -Name ("$script:AccountPrefix$runId" + 'x') -Role 'other'
     $script:OwnedAccounts += , $other
-    $receipt['accounts'] = @($script:OwnedAccounts | ForEach-Object {
+    $measurementReceipt['accounts'] = @($script:OwnedAccounts | ForEach-Object {
             [ordered]@{ role = $_.Role; name = $_.Name; sid = $_.Sid
                         groups = @('Users'); inAdministrators = $false
                         privilegesGranted = @() } })
@@ -284,11 +284,11 @@ try {
     $stagedProbe = Join-Path $stage $probeItem.Name
     Copy-Item -LiteralPath $Probe -Destination $stagedProbe
     $stagedHash = (Get-FileHash -LiteralPath $stagedProbe -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($stagedHash -ne $receipt['sourceHashes'].probe) { throw 'staged_probe_hash_mismatch' }
+    if ($stagedHash -ne $measurementReceipt['sourceHashes'].probe) { throw 'staged_probe_hash_mismatch' }
 
     $python = (Get-Command -Name 'python' -CommandType Application |
         Select-Object -First 1).Source
-    $receipt['interpreter'] = [ordered]@{ path = $python; pinnedBy = 'actions/setup-python' }
+    $measurementReceipt['interpreter'] = [ordered]@{ path = $python; pinnedBy = 'actions/setup-python' }
 
     $ownerReceiptPath = Join-Path $receipts 'owner-receipt.json'
     $remaining = $OverallTimeoutSeconds - [int]$clock.Elapsed.TotalSeconds
@@ -302,7 +302,7 @@ try {
                      '--attest-local-unsynced-disposable-parent')
     $ownerReceipt = Read-ChildReceipt -Path $ownerReceiptPath -ExpectedSid $owner.Sid `
         -ExpectedRole 'owner'
-    $receipt['ownerReceipt'] = $ownerReceipt
+    $measurementReceipt['ownerReceipt'] = $ownerReceipt
     if ($ownerChild.exitCode -ne 0 -or $ownerReceipt.status -ne 'owner_private_api_observed_only') {
         throw 'owner_private_creation_unresolved'
     }
@@ -319,7 +319,7 @@ try {
                      '--attest-local-unsynced-disposable-parent')
     $otherReceipt = Read-ChildReceipt -Path $otherReceiptPath -ExpectedSid $other.Sid `
         -ExpectedRole 'other'
-    $receipt['otherReceipt'] = $otherReceipt
+    $measurementReceipt['otherReceipt'] = $otherReceipt
     if ($otherReceipt.identity.userSid -eq $ownerReceipt.identity.userSid) {
         throw 'two_distinct_principals_required'
     }
@@ -337,13 +337,13 @@ try {
     Add-Control -Name 'namespace_durability_barrier' -State 'open' -Detail @{
         note = 'unchanged by this harness; no crash, restart or power-loss evidence' }
 
-    $receipt['ordinaryUserEvidence'] = 'two_verified_ordinary_token_sids_observed'
+    $measurementReceipt['ordinaryUserEvidence'] = 'two_verified_ordinary_token_sids_observed'
     if ($denied) {
-        $receipt['status'] = 'owner_allowed_other_denied_api_observed_only'
+        $measurementReceipt['status'] = 'owner_allowed_other_denied_api_observed_only'
         $exitCode = 0
     }
     else {
-        $receipt['status'] = 'other_principal_denial_unresolved'
+        $measurementReceipt['status'] = 'other_principal_denial_unresolved'
         $exitCode = 2
     }
 }
@@ -351,9 +351,9 @@ catch {
     # The original failure is captured here and re-reported after cleanup runs,
     # so a cleanup error can never hide or replace it.
     $failure = $_
-    $receipt['status'] = 'harness_failure'
-    $receipt['reason'] = "$($_.Exception.Message)"
-    $receipt['failureType'] = $_.Exception.GetType().Name
+    $measurementReceipt['status'] = 'harness_failure'
+    $measurementReceipt['reason'] = "$($_.Exception.Message)"
+    $measurementReceipt['failureType'] = $_.Exception.GetType().Name
     $exitCode = if ("$($_.Exception.Message)" -in @(
             'ordinary_principal_launch_unavailable', 'child_timeout',
             'child_startup_failed_before_measurement',
@@ -361,8 +361,8 @@ catch {
             'owner_private_creation_unresolved')) { 2 } else { 1 }
 }
 finally {
-    $receipt['cleanup'].attempted = $true
-    $receipt['elapsedSeconds'] = [Math]::Round($clock.Elapsed.TotalSeconds, 3)
+    $measurementReceipt['cleanup'].attempted = $true
+    $measurementReceipt['elapsedSeconds'] = [Math]::Round($clock.Elapsed.TotalSeconds, 3)
     # Stop ONLY processes this script started, matched on the exact recorded
     # identity. Never by image name and never by enumerating the process table.
     foreach ($owned in $script:OwnedProcesses) {
@@ -374,7 +374,7 @@ finally {
                 $owned.Record['stoppedByHarness'] = $true
             }
         }
-        catch { $receipt['cleanup'].errors += , "child_stop:$($_.Exception.GetType().Name)" }
+        catch { $measurementReceipt['cleanup'].errors += , "child_stop:$($_.Exception.GetType().Name)" }
         finally { $owned.Process.Dispose() }
     }
     # Remove only the fixture tree this run created, by exact path.
@@ -382,10 +382,10 @@ finally {
         if ($null -ne $path -and (Test-Path -LiteralPath $path)) {
             try {
                 Remove-Item -LiteralPath $path -Recurse -Force
-                $receipt['cleanup'].fixtureRemoved = $true
+                $measurementReceipt['cleanup'].fixtureRemoved = $true
             }
             catch {
-                $receipt['cleanup'].errors += , "fixture_remove:$($_.Exception.GetType().Name)"
+                $measurementReceipt['cleanup'].errors += , "fixture_remove:$($_.Exception.GetType().Name)"
             }
         }
     }
@@ -397,37 +397,37 @@ finally {
                 Where-Object { $_.SID -eq $account.Sid }
             if ($null -ne $profileEntry) {
                 Remove-CimInstance -InputObject $profileEntry
-                $receipt['cleanup'].profilesRemoved += , $account.Sid
+                $measurementReceipt['cleanup'].profilesRemoved += , $account.Sid
             }
         }
-        catch { $receipt['cleanup'].errors += , "profile_remove:$($_.Exception.GetType().Name)" }
+        catch { $measurementReceipt['cleanup'].errors += , "profile_remove:$($_.Exception.GetType().Name)" }
         try {
             Remove-LocalUser -SID $account.Sid
-            $receipt['cleanup'].accountsRemoved += , $account.Sid
+            $measurementReceipt['cleanup'].accountsRemoved += , $account.Sid
         }
-        catch { $receipt['cleanup'].errors += , "account_remove:$($_.Exception.GetType().Name)" }
+        catch { $measurementReceipt['cleanup'].errors += , "account_remove:$($_.Exception.GetType().Name)" }
     }
-    if ($script:OwnedAccounts.Count -ne $receipt['cleanup'].accountsRemoved.Count) {
-        $receipt['cleanup'].errors += , 'not_every_recorded_account_was_removed'
+    if ($script:OwnedAccounts.Count -ne $measurementReceipt['cleanup'].accountsRemoved.Count) {
+        $measurementReceipt['cleanup'].errors += , 'not_every_recorded_account_was_removed'
     }
-    $receipt['powerLossProven'] = $false
-    $receipt['activationAuthorized'] = $false
+    $measurementReceipt['powerLossProven'] = $false
+    $measurementReceipt['activationAuthorized'] = $false
     try {
-        $json = $receipt | ConvertTo-Json -Depth 12
+        $json = $measurementReceipt | ConvertTo-Json -Depth 12
         Set-Content -LiteralPath $Receipt -Value $json -Encoding utf8
     }
     catch {
         Write-Output "Private auth runner: receipt_write_failed; $($_.Exception.GetType().Name)"
         $exitCode = 1
     }
-    Write-Output ("Private auth runner: " + $receipt['status'] +
+    Write-Output ("Private auth runner: " + $measurementReceipt['status'] +
                   "; powerLossProven=false; activationAuthorized=false; O1-O5 unresolved")
-    if ($receipt['cleanup'].errors.Count -gt 0) {
+    if ($measurementReceipt['cleanup'].errors.Count -gt 0) {
         Write-Output ("::warning::Cleanup reported " +
-                      $receipt['cleanup'].errors.Count + " error(s); original outcome retained.")
+                      $measurementReceipt['cleanup'].errors.Count + " error(s); original outcome retained.")
     }
     if ($null -ne $failure) {
-        Write-Output ("Private auth runner: original failure retained; " + $receipt['reason'])
+        Write-Output ("Private auth runner: original failure retained; " + $measurementReceipt['reason'])
     }
 }
 
