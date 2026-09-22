@@ -191,6 +191,81 @@ function Invoke-ProbeAsPrincipal {
         $record['launchFailure'] = 'overall_measurement_budget_exhausted'
         throw 'overall_measurement_budget_exhausted'
     }
+    # Derived UTF-16 code-unit lengths, not observed native bytes. Mirror the
+    # supplied v7.6.5 space join and BuildCommandLine quoting, using the input
+    # executable (command discovery may resolve a different executable path).
+    $structure = [ordered]@{
+        complete = $false; units = 'utf16_code_units'; source = 'derived_v7_6_5_input'
+        argumentCount = $Arguments.Count - 1; argumentLengths = @()
+        argumentsTruncated = ($Arguments.Count -gt 65)
+        joinedArgumentLength = $null; commandLineLengthExcludingNul = $null
+        executableLength = $null; maxInspectedArgumentLength = 0
+    }
+    $record['launchStructure'] = $structure
+    try {
+        $structure['executableLength'] = $Arguments[0].Length
+        $sum = [long]0
+        for ($i = 1; $i -lt [Math]::Min($Arguments.Count, 65); $i++) {
+            $length = if ($null -eq $Arguments[$i]) { 0 } else { $Arguments[$i].Length }
+            $structure['argumentLengths'] += , $length
+            $sum += $length
+            $structure['maxInspectedArgumentLength'] =
+                [Math]::Max($structure['maxInspectedArgumentLength'], $length)
+        }
+        if (-not $structure['argumentsTruncated'] -and $Arguments.Count -ge 2) {
+            $joinedLength = $sum + $Arguments.Count - 2
+            $structure['joinedArgumentLength'] = $joinedLength
+            # Bound the only value transformation; oversized input stays unknown.
+            if ($Arguments[0].Length -le 32768) {
+                $executable = $Arguments[0].Trim()
+                $quotedLength = [long]$executable.Length
+                if (-not ($executable.StartsWith('"') -and $executable.EndsWith('"'))) {
+                    $quotedLength += 2
+                }
+                $structure['commandLineLengthExcludingNul'] = $quotedLength +
+                    $(if ($joinedLength -gt 0) { 1 + $joinedLength } else { 0 })
+                $structure['complete'] = $true
+            }
+        }
+    }
+    catch { $structure['complete'] = $false }
+    # Read the resolved cmdlet identity without launching anything. Unexpected
+    # metadata or capture failure leaves template comparisons disabled.
+    $runtime = [ordered]@{ complete = $false; supportedTemplateAndCulture = $false }
+    $record['launchRuntime'] = $runtime
+    try {
+        $command = Get-Command -Name 'Start-Process' -ErrorAction Stop
+        $assembly = $command.ImplementingType.Assembly
+        $assemblyInfo = $assembly.GetCustomAttributes(
+            [System.Reflection.AssemblyInformationalVersionAttribute], $false)
+        $metadata = [ordered]@{
+            psVersion = $PSVersionTable.PSVersion.ToString()
+            framework = [System.Runtime.InteropServices.RuntimeInformation]::FrameworkDescription
+            osArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+            processArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
+            cmdletType = $command.ImplementingType.FullName
+            cmdletAssemblyIdentity = $assembly.FullName
+            cmdletAssemblyVersion = $assembly.GetName().Version.ToString()
+            cmdletInformationalVersion = $assemblyInfo[0].InformationalVersion
+            currentUICulture = [System.Globalization.CultureInfo]::CurrentUICulture.Name
+        }
+        foreach ($key in $metadata.Keys) {
+            $value = $metadata[$key]
+            if ($null -eq $value -or $value.Length -gt 256 -or
+                $value -cmatch '[\r\n]') { throw 'runtime_metadata_unavailable' }
+            $runtime[$key] = $value
+        }
+        # Only the supplied release's English-US template is supported. This is
+        # an explicit compatibility gate, not proof of runtime binary provenance.
+        $runtime['supportedTemplateAndCulture'] = (
+            $runtime['psVersion'] -ceq '7.6.5' -and
+            $runtime['cmdletType'] -ceq 'Microsoft.PowerShell.Commands.StartProcessCommand' -and
+            $assembly.GetName().Name -ceq 'Microsoft.PowerShell.Commands.Management' -and
+            $runtime['cmdletInformationalVersion'] -cmatch '\A7\.6\.5(?:\+[0-9A-Za-z.-]+| SHA: [0-9a-fA-F]{40})?\z' -and
+            $runtime['currentUICulture'] -ceq 'en-US')
+        $runtime['complete'] = $true
+    }
+    catch { $runtime['supportedTemplateAndCulture'] = $false }
     $process = $null
     try {
         $process = Start-Process -FilePath $Arguments[0] `
@@ -273,6 +348,51 @@ function Invoke-ProbeAsPrincipal {
         catch {
             $diagnostic['captureFailureType'] = $_.Exception.GetType().FullName
             $diagnostic['captureFailureHResult'] = $_.Exception.HResult
+        }
+        # Upstream discards Win32Exception when formatting InvalidStartProcess.
+        # Compare entire formatted strings ordinally; never persist the text,
+        # any fragment/hash, or argument values. A candidate is not a cause.
+        $discriminator = [ordered]@{
+            complete = $false; state = 'unknown'; win32CodeCandidates = @()
+            candidateSetExhaustive = $false; invalidApplicationTemplate = $null
+            templateSupport = 'powershell_7_6_5_en_US_only'
+        }
+        $diagnostic['upstreamDiscriminator'] = $discriminator
+        try {
+            if ($runtime['supportedTemplateAndCulture'] -and
+                $launchError.Exception.GetType() -eq [System.InvalidOperationException] -and
+                $launchError.FullyQualifiedErrorId -ceq
+                    'InvalidOperationException,Microsoft.PowerShell.Commands.StartProcessCommand') {
+                $codeCandidates = @()
+                foreach ($code in @(3, 5, 87, 193, 206, 267, 740, 1060, 1062,
+                                    1314, 1326, 1327, 1331, 1385, 1450)) {
+                    $expected = [string]::Format(
+                        [System.Globalization.CultureInfo]::CurrentCulture,
+                        'This command cannot be run due to the error: {0}',
+                        [System.ComponentModel.Win32Exception]::new($code).Message)
+                    if ([string]::Equals($launchError.Exception.Message, $expected,
+                            [System.StringComparison]::Ordinal)) { $codeCandidates += , $code }
+                }
+                $discriminator['win32CodeCandidates'] = $codeCandidates
+                $discriminator['state'] = if ($codeCandidates.Count -eq 0) { 'unmatched' }
+                    elseif ($codeCandidates.Count -eq 1) { 'single_candidate' } else { 'ambiguous' }
+                # Separate branch: this boolean never validates the generic map.
+                if ($Arguments[0].Length -le 32768) {
+                    $expectedApplication = [string]::Format(
+                        [System.Globalization.CultureInfo]::CurrentCulture,
+                        'This command cannot be run because the input "{0}" is not a valid Application.  Give a valid application and run your command again.',
+                        $Arguments[0])
+                    $discriminator['invalidApplicationTemplate'] = [string]::Equals(
+                        $launchError.Exception.Message, $expectedApplication,
+                        [System.StringComparison]::Ordinal)
+                }
+                $discriminator['complete'] = $true
+            }
+        }
+        catch {
+            $discriminator['state'] = 'unknown'
+            $discriminator['win32CodeCandidates'] = @()
+            $discriminator['invalidApplicationTemplate'] = $null
         }
         throw 'ordinary_principal_launch_unavailable'
     }
