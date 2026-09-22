@@ -16,13 +16,14 @@ jobs:
     defaults:
       run:
         shell: pwsh
-    env:
-      DIAG: ${{ runner.temp }}\owned-job-diagnostics
-      BUNDLE: ${{ runner.temp }}\owned-job-artifact
     steps:
       - name: Initialize evidence
         run: |
-          New-Item -ItemType Directory -Force $env:DIAG, $env:BUNDLE | Out-Null
+          $diag = Join-Path $env:RUNNER_TEMP 'owned-job-diagnostics'
+          $bundle = Join-Path $env:RUNNER_TEMP 'owned-job-artifact'
+          New-Item -ItemType Directory -Force $diag, $bundle | Out-Null
+          "DIAG=$diag" >> $env:GITHUB_ENV
+          "BUNDLE=$bundle" >> $env:GITHUB_ENV
           [ordered]@{
             task = '1167'; release = '1171'; operation = 'wb1167l-v1'
             authorSession = 'wb1167l-builder'
@@ -32,7 +33,7 @@ jobs:
             imageOS = $env:ImageOS; imageVersion = $env:ImageVersion
             os = [Runtime.InteropServices.RuntimeInformation]::OSDescription
             architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
-          } | ConvertTo-Json | Set-Content "$env:DIAG\identity.json"
+          } | ConvertTo-Json | Set-Content "$diag\identity.json"
       - name: Preserve source bytes on disposable runner
         run: |
           git config --global core.autocrlf false
