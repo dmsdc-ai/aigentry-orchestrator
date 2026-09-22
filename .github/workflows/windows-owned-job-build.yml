@@ -25,9 +25,9 @@ jobs:
           "DIAG=$diag" >> $env:GITHUB_ENV
           "BUNDLE=$bundle" >> $env:GITHUB_ENV
           [ordered]@{
-            task = '1167'; release = '1171'; operation = 'wb1167l-v1'
-            authorSession = 'wb1167l-builder'
-            authorAttempt = 'e2002dab-2cd5-4e76-8c66-f0c08513f3e7'
+            task = '1167'; release = '1171'; operation = 'wb1167q-v1'
+            authorSession = 'wb1167q-builder'
+            authorAttempt = 'e08c018b-7a79-41b6-bf44-d269d556af87'
             sha = '${{ github.sha }}'; ref = '${{ github.ref }}'
             runId = '${{ github.run_id }}'; runAttempt = '${{ github.run_attempt }}'
             imageOS = $env:ImageOS; imageVersion = $env:ImageVersion
@@ -126,8 +126,14 @@ jobs:
         working-directory: native/windows-owned-job
         run: |
           $ErrorActionPreference = 'Stop'
+          # Run 35749868562 could not be attributed to a PowerShell build because the
+          # host version was never recorded; capture it so the wait semantics in use
+          # are established by this run rather than assumed.
+          $PSVersionTable | ConvertTo-Json -Depth 3 | Set-Content "$env:DIAG\pwsh.json"
           $devdir = Join-Path $env:RUNNER_TEMP 'owned-job-node-headers'
           if (Test-Path $devdir) { throw 'Pre-existing header cache refused' }
+          $stdoutLog = "$env:DIAG\compiler.stdout.log"
+          $stderrLog = "$env:DIAG\compiler.stderr.log"
           $arguments = @(
             ('"{0}"' -f $env:BUILD_GYP), 'configure', 'build', '--verbose',
             '--target=20.20.2', '--arch=x64', '--msvs_version=2022',
@@ -135,11 +141,43 @@ jobs:
             ('--devdir="{0}"' -f $devdir)
           )
           $arguments | Set-Content "$env:DIAG\compile-arguments.txt"
-          $process = Start-Process -FilePath $env:BUILD_NODE -ArgumentList $arguments -NoNewWindow -Wait -PassThru -RedirectStandardOutput "$env:DIAG\compiler.stdout.log" -RedirectStandardError "$env:DIAG\compiler.stderr.log"
+          # Measured in run 35749868562: node-gyp printed 'gyp info ok' and MSBuild
+          # reported 0 errors in 17.04s, the step was nevertheless killed at 300s with
+          # no exit code recorded, and the runner then reported a still-live orphan
+          # vctip.exe. INFERENCE, not measurement: in the supplied PowerShell 7.6.5
+          # source the -Wait path assigns the child to a job object and waits on that
+          # job rather than on the started process, which would keep the step blocked
+          # while any descendant survives. The job-wait body is not in the supplied
+          # source and the prior run's actual pwsh version was never recorded, so that
+          # explanation is unverified for the runtime that produced the hang.
+          # Wait on the exact root process handle instead, under an explicit budget
+          # that stays inside the unchanged 5-minute step limit. This is correct under
+          # either explanation and distinguishes them: a hung root now yields
+          # compiler.wait-timeout.txt naming the pid.
+          $waitBudgetSeconds = 240
+          $process = Start-Process -FilePath $env:BUILD_NODE -ArgumentList $arguments -NoNewWindow -PassThru -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
+          $process.Id | Set-Content "$env:DIAG\compiler.pid.txt"
+          if (-not $process.WaitForExit($waitBudgetSeconds * 1000)) {
+            "root pid $($process.Id) still running after $waitBudgetSeconds s" | Set-Content "$env:DIAG\compiler.wait-timeout.txt"
+            try { $process.Kill() } catch { ($_ | Out-String) | Add-Content "$env:DIAG\compiler.wait-timeout.txt" }
+            $process.WaitForExit(15000) | Out-Null
+            throw "node-gyp root process did not exit within $waitBudgetSeconds s"
+          }
+          # The exit status must be measured off the root handle, never inferred. A
+          # null or non-integer ExitCode would otherwise coerce to 0 through
+          # 'exit $code' and present an unknown status as success.
           $code = $process.ExitCode
+          if ($null -eq $code -or -not ($code -is [int])) {
+            "root pid $($process.Id) exit code unmeasured; type=$(if ($null -eq $code) { 'null' } else { $code.GetType().FullName })" | Set-Content "$env:DIAG\compiler.exit-code.unknown.txt"
+            throw 'Root process exit code was not measured; refusing to infer an exit status'
+          }
           $code | Set-Content "$env:DIAG\compiler.exit-code.txt"
-          Get-Content "$env:DIAG\compiler.stdout.log"
-          Get-Content "$env:DIAG\compiler.stderr.log"
+          # Descendants that outlive the root still hold inherited handles on these
+          # redirect targets, so read them with a sharing mode that tolerates that.
+          foreach ($log in @($stdoutLog, $stderrLog)) {
+            $stream = [IO.File]::Open($log, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            try { (New-Object IO.StreamReader($stream)).ReadToEnd() } finally { $stream.Dispose() }
+          }
           if ($code -ne 0) { exit $code }
           $binary = Get-Item -LiteralPath 'build/Release/owned_job.node' -ErrorAction Stop
           if ($binary.Length -le 0) { throw 'Zero exit without a nonempty addon' }
