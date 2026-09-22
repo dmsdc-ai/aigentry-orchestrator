@@ -1,0 +1,68 @@
+name: Windows private auth DAC probe
+
+# Only this fixture's own three coupled files trigger automatic execution, so an
+# ordinary docs or source commit never reruns disposable account creation.
+on:
+  pull_request:
+    paths:
+      - tests/dispatch/windows-private-auth-probe.py
+      - tests/dispatch/windows-private-auth-runner.ps1
+      - .github/workflows/windows-private-auth-probe.yml
+  push:
+    paths:
+      - tests/dispatch/windows-private-auth-probe.py
+      - tests/dispatch/windows-private-auth-runner.ps1
+      - .github/workflows/windows-private-auth-probe.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  private-auth-probe:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.10'
+      # Python 3.12.10 matches the existing dispatch measurement baseline. It is
+      # not a new production support floor and not a product runtime dependency.
+      - name: Measure ordinary-principal private access and other-user denial
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          PROBE_RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          # This hosted runner's temp parent is attested local, unsynchronized and
+          # disposable. A self-hosted runner requires a new attestation; no ACL is
+          # ever repaired here and no secret is supplied to this job.
+          $work = Join-Path $env:PROBE_RUNNER_TEMP ('windows-private-auth-' + [guid]::NewGuid().ToString('N'))
+          $receipt = Join-Path $env:PROBE_RUNNER_TEMP 'windows-private-auth-receipt.json'
+          $runner = Resolve-Path -LiteralPath 'tests/dispatch/windows-private-auth-runner.ps1'
+          $probe = Resolve-Path -LiteralPath 'tests/dispatch/windows-private-auth-probe.py'
+          & $runner.Path -WorkRoot $work -Probe $probe.Path -Receipt $receipt
+          exit $LASTEXITCODE
+      - name: Preserve diagnostic when the runner could not start
+        if: always()
+        shell: pwsh
+        env:
+          PROBE_RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          $receiptPath = Join-Path $env:PROBE_RUNNER_TEMP 'windows-private-auth-receipt.json'
+          if (-not (Test-Path -LiteralPath $receiptPath)) {
+            '{"schema":1,"probe":"windows-private-auth-runner","status":"harness_did_not_emit_receipt","powerLossProven":false,"activationAuthorized":false,"ordinaryUserEvidence":"unresolved","obligations":{"O1":"unresolved","O2":"unresolved","O3":"unresolved","O4":"unresolved","O5":"unresolved"}}' | Set-Content -LiteralPath $receiptPath -Encoding utf8
+          }
+      # The receipt carries SIDs, API numbers, hashes and fixture-local paths
+      # only. Account passwords are never materialised, written or uploaded.
+      - name: Upload sanitized receipt only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-private-auth-receipt
+          path: ${{ runner.temp }}/windows-private-auth-receipt.json
+          if-no-files-found: error
+          retention-days: 7
