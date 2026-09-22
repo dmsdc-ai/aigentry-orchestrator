@@ -7,6 +7,17 @@ Native use (CPython 3.12.10) under ONE ordinary disposable test principal:
   python -I tests/dispatch/windows-private-auth-probe.py --role other \
     --root ABS_ROOT_RECORDED_BY_THE_OWNER_RUN --receipt ABS_RECEIPT \
     --attest-local-unsynced-disposable-parent
+  python -I tests/dispatch/windows-private-auth-probe.py --role cleanup \
+    --root ABS_ROOT --run-id HEX --expect-sid OWNER_SID --receipt ABS_RECEIPT \
+    --object ABS_RECORDED_OBJECT ... --attest-local-unsynced-disposable-parent
+
+The owner-only protected DACL that makes the owner role meaningful also means no
+other context can enumerate the tree, so the cleanup role removes it under the
+same ordinary principal that created it. It unlinks exactly the objects named on
+its command line, each of which must lie under the exact recorded run root; it
+never enumerates a directory, expands a pattern, follows a reparse point, or
+changes an ACL, owner or privilege to obtain a removal. A retained object is
+reported as retained, never forced.
 
 The caller must attest that the parent is local, unsynchronized and disposable;
 DRIVE_FIXED alone cannot establish that. This probe verifies its OWN token SID,
@@ -41,6 +52,7 @@ import time
 READ, WRITE, DELETE = 0x80000000, 0x40000000, 0x00010000
 READ_CONTROL, WRITE_DAC = 0x00020000, 0x00040000
 LIST_DIRECTORY, FILE_ALL_ACCESS = 0x0001, 0x1F01FF
+FILE_READ_ATTRIBUTES = 0x0080
 SHARE, CREATE_NEW, OPEN_EXISTING = 7, 1, 3
 NORMAL, WRITE_THROUGH, BACKUP = 0x80, 0x80000000, 0x02000000
 REPARSE, DIRECTORY = 0x400, 0x10
@@ -51,6 +63,7 @@ SE_DACL_PRESENT, SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED = 0x0004, 0x0400, 0x1
 ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, INHERITED_ACE = 0, 1, 0x10
 ACCESS_DENIED, MORE_DATA_EXPECTED = 5, 122
 COLLISION_ERRORS = (80, 183)
+ABSENT_ERRORS = (2, 3)  # ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
 MEDIUM_SID_PREFIX = bytes.fromhex("010100000000001000200000")[:8]
 ADMIN_SID = bytes.fromhex("01020000000000052000000020020000")
 MEDIUM_INTEGRITY_RID = 8192
@@ -195,6 +208,9 @@ class WinAPI:
             "CreateHardLinkW": (kernel, W.BOOL, [W.LPCWSTR, W.LPCWSTR, attributes]),
             "CreateSymbolicLinkW": (kernel, W.BOOLEAN, [W.LPCWSTR, W.LPCWSTR, W.DWORD]),
             "DeleteFileW": (kernel, W.BOOL, [W.LPCWSTR]),
+            # Unlinks the named directory entry itself; on a reparse point it
+            # removes the link and never the target it points at.
+            "RemoveDirectoryW": (kernel, W.BOOL, [W.LPCWSTR]),
             "GetFileAttributesW": (kernel, W.DWORD, [W.LPCWSTR]),
             "GetVolumePathNameW": (kernel, W.BOOL, [W.LPCWSTR, W.LPWSTR, W.DWORD]),
             "GetDriveTypeW": (kernel, W.UINT, [W.LPCWSTR]),
@@ -780,6 +796,97 @@ def other_run(api, args, receipt, clock):
     return 0 if all(denied) else 2
 
 
+def unlink_recorded(api, path, is_root, receipt, sid):
+    """Unlink ONE exactly-recorded object by name. Never follows, never repairs.
+
+    The run root is additionally re-verified through a real handle as the same
+    owner-only protected directory this run created, so a substituted root is
+    preserved and refused rather than deleted.
+    """
+    label = "cleanup_root" if is_root else "cleanup_object"
+    outcome = {"path": str(path), "isRoot": is_root}
+    granted, error = api.attempt("GetFileAttributesW", str(path), invalid=0xFFFFFFFF,
+                                 pathType="leaf", object=label)
+    if not granted:
+        # Already gone is a clean outcome; anything else is reported, not forced.
+        outcome.update(state="absent" if error in ABSENT_ERRORS else "unreadable",
+                       getLastError=error)
+        return outcome
+    attributes = api.events[-1]["result"]
+    outcome.update(attributes=attributes, isReparse=bool(attributes & REPARSE),
+                   isDirectory=bool(attributes & DIRECTORY))
+    if is_root:
+        if attributes & UNSAFE_ATTRIBUTES:
+            raise Refusal("cleanup_root_is_not_a_plain_directory")
+        handle = api.open_handle(path, READ_CONTROL | FILE_READ_ATTRIBUTES,
+                                 directory=True, label=label)
+        try:
+            # Ownership and DACL are verified here, never repaired: a root that
+            # is no longer the private object we created is not ours to delete.
+            inspect_private(api, handle, label, sid, receipt)
+            identity = api.identity(handle, label)
+        finally:
+            api.call("CloseHandle", handle, object=label)
+        if not identity["isDirectory"] or identity["isReparse"]:
+            raise Refusal("cleanup_root_is_not_a_plain_directory")
+    remove = "RemoveDirectoryW" if attributes & DIRECTORY else "DeleteFileW"
+    granted, error = api.attempt(remove, str(path), object=label)
+    if granted:
+        outcome["state"] = "removed"
+    else:
+        outcome.update(state="absent" if error in ABSENT_ERRORS else "retained",
+                       removeLastError=error)
+    return outcome
+
+
+def cleanup_run(api, args, receipt, clock):
+    """Remove the owner-created fixture tree inside the principal that owns it.
+
+    The root is supplied by the harness that composed it, not by a child
+    receipt, and every object offered for deletion must lie under that exact
+    root for this exact run id. The whole set is validated before anything is
+    unlinked, so one out-of-root entry can never be partially acted on. Nothing
+    is enumerated and no prefix or wildcard is expanded: an object the owner
+    never recorded is left in place and reported as residue.
+    """
+    if not args.expect_sid:
+        raise Refusal("cleanup_requires_expected_owner_sid")
+    if receipt["identity"]["userSid"] != args.expect_sid:
+        # The deletion must happen as the recorded owner or not at all.
+        raise Refusal("cleanup_principal_is_not_the_recording_owner")
+    root = Path(args.root)
+    if not safe_path(root) or not args.run_id or root.name != ROOT_PREFIX + args.run_id:
+        raise Refusal("cleanup_root_is_not_this_run_root")
+    ordered = []
+    for text in dict.fromkeys([str(root), *(args.object or ())]):
+        path = Path(text)
+        if not safe_path(path) or (path != root and root not in path.parents):
+            raise Refusal("cleanup_object_outside_run_root")
+        ordered.append(path)
+    # Deepest first, so the run root is unlinked only after its recorded contents.
+    ordered.sort(key=lambda entry: len(entry.parts), reverse=True)
+    outcomes = []
+    for path in ordered:
+        clock.check("cleanup_unlink")
+        outcomes.append(unlink_recorded(api, path, path == root, receipt,
+                                        args.expect_sid))
+    cleared = [entry for entry in outcomes if entry["state"] in ("removed", "absent")]
+    # any(), not all(): an absent root entry must read as not cleared.
+    root_cleared = any(entry["isRoot"] and entry["state"] in ("removed", "absent")
+                       for entry in outcomes)
+    receipt["cleanup"] = {"root": str(root), "runId": args.run_id,
+                          "recordedCount": len(ordered),
+                          "clearedCount": len(cleared),
+                          "rootCleared": root_cleared, "objects": outcomes}
+    complete = len(cleared) == len(ordered) and root_cleared
+    control(receipt, "owner_context_fixture_removed",
+            "passed" if complete else "open",
+            recordedCount=len(ordered), clearedCount=len(cleared))
+    receipt["status"] = ("owner_fixture_cleanup_complete" if complete
+                         else "owner_fixture_cleanup_incomplete")
+    return 0 if complete else 2
+
+
 def persist(path, receipt):
     path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n",
                     encoding="utf-8")
@@ -787,11 +894,17 @@ def persist(path, receipt):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--role", required=True, choices=("owner", "other"))
+    parser.add_argument("--role", required=True,
+                        choices=("owner", "other", "cleanup"))
     parser.add_argument("--receipt", required=True)
     parser.add_argument("--parent")
     parser.add_argument("--root")
     parser.add_argument("--run-id", default="")
+    # Cleanup only: the exact owner SID to run as, and the exact objects the
+    # owner run recorded. Both are refused if they do not match this token and
+    # this run's root; neither can widen the deletion set beyond that root.
+    parser.add_argument("--expect-sid", default="")
+    parser.add_argument("--object", action="append", default=[])
     parser.add_argument("--target-name", default="published.json")
     parser.add_argument("--deadline-seconds", type=int, default=DEADLINE_SECONDS)
     parser.add_argument("--attest-local-unsynced-disposable-parent", action="store_true")
@@ -838,10 +951,14 @@ def main():
             if not args.parent or not args.run_id:
                 raise Refusal("owner_role_requires_parent_and_run_id")
             code = owner_run(api, args, receipt, clock)
-        else:
+        elif args.role == "other":
             if not args.root:
                 raise Refusal("other_role_requires_root")
             code = other_run(api, args, receipt, clock)
+        else:
+            if not args.root:
+                raise Refusal("cleanup_role_requires_root")
+            code = cleanup_run(api, args, receipt, clock)
     except Refusal as refusal:
         code = 2
         receipt.update(status="capability_refusal", reason=str(refusal))

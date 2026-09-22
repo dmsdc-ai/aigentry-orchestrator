@@ -10,6 +10,15 @@
   real ordinary token, and removes exactly those recorded accounts, profiles and
   fixture paths at job end even when an assertion or a child process fails.
 
+  The probe's fixture carries an owner-only protected DACL, so this job's own
+  context deliberately holds no rights on it. It is therefore removed by one
+  further bounded probe run under the owning principal's own credential, before
+  that account and profile are removed, and never by adding an Administrators or
+  SYSTEM ACE, taking ownership, repairing an ACL or enabling a privilege.
+  Cleanup completeness is decided by this script's own observation of the exact
+  paths it composed. It never rewrites the measured status, and an incomplete
+  cleanup raises the exit code so the job cannot report a full success.
+
   Passwords are random job-local synthetic secrets held only as SecureString.
   They are never printed, artifacted, written or passed as command-line
   arguments. No real account, credential or auth token is used or read.
@@ -29,7 +38,10 @@ param(
     [Parameter(Mandatory = $true)][string]$Probe,
     [Parameter(Mandatory = $true)][string]$Receipt,
     [int]$OverallTimeoutSeconds = 120,
-    [int]$ChildTimeoutSeconds = 60
+    [int]$ChildTimeoutSeconds = 60,
+    # Cleanup has its own bounded budget because it must still run after the
+    # measurement budget is exhausted; the job and step timeouts still cap it.
+    [int]$CleanupTimeoutSeconds = 45
 )
 
 Set-StrictMode -Version 3.0
@@ -40,6 +52,7 @@ $script:UsersGroupSid = [System.Security.Principal.SecurityIdentifier]'S-1-5-32-
 $script:AdminGroupSid = [System.Security.Principal.SecurityIdentifier]'S-1-5-32-544'
 $script:SystemSid = [System.Security.Principal.SecurityIdentifier]'S-1-5-18'
 $script:StartupFailureExit = 3221225794  # 0xC0000142, the prior launcher failure
+$script:RootPrefix = 'windows-private-auth-'  # ROOT_PREFIX in the pinned probe
 
 $measurementReceipt = [ordered]@{
     schema                = 1
@@ -55,6 +68,7 @@ $measurementReceipt = [ordered]@{
     controls              = @()
     cleanup               = [ordered]@{ attempted = $false; accountsRemoved = @()
                                         profilesRemoved = @(); fixtureRemoved = $false
+                                        complete = $false; ownerContext = $null
                                         errors = @() }
     limits                = @(
         'Discretionary access-check observations only; not Windows auth support',
@@ -202,7 +216,7 @@ function Invoke-ProbeAsPrincipal {
     $record['launched'] = $true
     $record['processId'] = $process.Id
     $script:OwnedProcesses += , ([pscustomobject]@{
-            Record = $record; Process = $process
+            Record = $record; Process = $process; Handled = $false
             Id = $process.Id; StartTime = $process.StartTime })
     if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
         $record['timedOut'] = $true
@@ -245,9 +259,112 @@ function Read-ChildReceipt {
     return $child
 }
 
+function Stop-OwnedProcesses {
+    <#  Stop ONLY processes this script started, matched on the exact recorded
+        identity. Never by image name and never by enumerating the process table.
+        Each tracked process is handled and disposed exactly once, so this is
+        safe to call again after a later child is launched. #>
+    foreach ($owned in $script:OwnedProcesses) {
+        if ($owned.Handled) { continue }
+        $owned.Handled = $true
+        try {
+            if (-not $owned.Process.HasExited -and $owned.Process.Id -eq $owned.Id -and
+                $owned.Process.StartTime -eq $owned.StartTime) {
+                $owned.Process.Kill()
+                [void]$owned.Process.WaitForExit(5000)
+                $owned.Record['stoppedByHarness'] = $true
+            }
+        }
+        catch { $script:measurementReceipt['cleanup'].errors += , "child_stop:$($_.Exception.GetType().Name)" }
+        finally { $owned.Process.Dispose() }
+    }
+}
+
+function Invoke-OwnerFixtureCleanup {
+    <#  Removes the probe-created fixture tree inside the ordinary principal that
+        owns it, BEFORE that account and profile are removed below.
+
+        That tree carries an owner-only protected DACL by design, so this job's
+        own context cannot enumerate it. The answer is to ask the owner, never to
+        add an Administrators or SYSTEM ACE, take ownership, repair an ACL or
+        enable a privilege: none of those happens anywhere in this script.
+
+        The root is the one THIS script composed from WorkRoot and runId, not a
+        path taken from a child receipt. The object list is what the owner child
+        recorded, captured before the other child could write to the shared
+        receipts directory, and the probe refuses the entire set if any member
+        falls outside that exact root. #>
+    param([Parameter(Mandatory = $true)][int]$TimeoutSeconds)
+    $record = [ordered]@{ attempted = $false }
+    $script:measurementReceipt['cleanup'].ownerContext = $record
+    if ($null -eq $script:OwnerPrincipal -or $null -eq $script:FixtureRoot -or
+        $null -eq $script:StagedProbe -or $null -eq $script:Interpreter) {
+        # Partial setup: there is no owner context to clean in, and no deletion
+        # target is invented to compensate for the missing one.
+        $record['skipped'] = 'owner_context_unavailable'
+        return
+    }
+    if (-not (Test-Path -LiteralPath $script:FixtureRoot)) {
+        $record['skipped'] = 'no_owner_fixture_root_present'
+        return
+    }
+    $record['attempted'] = $true
+    $record['root'] = $script:FixtureRoot
+    $record['recordedObjects'] = $script:OwnerCreatedObjects.Count
+    $arguments = @($script:Interpreter, '-I', $script:StagedProbe,
+                   '--role', 'cleanup', '--root', $script:FixtureRoot,
+                   '--run-id', $script:RunId,
+                   '--expect-sid', $script:OwnerPrincipal.Sid,
+                   '--receipt', $script:CleanupReceiptPath,
+                   '--attest-local-unsynced-disposable-parent')
+    foreach ($object in $script:OwnerCreatedObjects) {
+        $arguments += @('--object', $object)
+    }
+    # Same credential, same pinned staged probe, same bounded launch path as the
+    # measurement children; only the role differs.
+    $principal = [pscustomobject]@{
+        Role = 'owner_cleanup'; Name = $script:OwnerPrincipal.Name
+        Sid = $script:OwnerPrincipal.Sid; Credential = $script:OwnerPrincipal.Credential }
+    try {
+        $child = Invoke-ProbeAsPrincipal -Account $principal `
+            -WorkingDirectory $script:StagePath `
+            -StdOut (Join-Path $script:ReceiptsPath 'cleanup-stdout.txt') `
+            -StdErr (Join-Path $script:ReceiptsPath 'cleanup-stderr.txt') `
+            -TimeoutSeconds $TimeoutSeconds -Arguments $arguments
+        $record['childExitCode'] = $child.exitCode
+    }
+    catch {
+        $script:measurementReceipt['cleanup'].errors += , "owner_cleanup_child:$($_.Exception.Message)"
+    }
+    finally { Stop-OwnedProcesses }
+    # The child's receipt is evidence only. The verdict is this script's own
+    # Test-Path on the exact root it composed, so a forged or missing cleanup
+    # receipt can never turn an incomplete removal into a reported success.
+    if (Test-Path -LiteralPath $script:CleanupReceiptPath) {
+        try {
+            $record['receipt'] = Get-Content -LiteralPath $script:CleanupReceiptPath `
+                -Raw -Encoding utf8 | ConvertFrom-Json
+        }
+        catch {
+            $script:measurementReceipt['cleanup'].errors += , "owner_cleanup_receipt:$($_.Exception.GetType().Name)"
+        }
+    }
+    else {
+        $script:measurementReceipt['cleanup'].errors += , 'owner_cleanup_receipt_missing'
+    }
+}
+
 $script:OwnedProcesses = @()
 $script:OwnedAccounts = @()
 $script:FixtureRoot = $null
+$script:OwnerPrincipal = $null
+$script:OwnerCreatedObjects = @()
+$script:StagedProbe = $null
+$script:StagePath = $null
+$script:ReceiptsPath = $null
+$script:CleanupReceiptPath = $null
+$script:Interpreter = $null
+$script:RunId = $null
 $failure = $null
 $exitCode = 1
 $clock = [System.Diagnostics.Stopwatch]::StartNew()
@@ -265,6 +382,7 @@ try {
     $runId = -join ((1..4 | ForEach-Object {
         '{0:x2}' -f [System.Security.Cryptography.RandomNumberGenerator]::GetInt32(256) }))
     $measurementReceipt['runId'] = $runId
+    $script:RunId = $runId
 
     $stage = Join-Path $WorkRoot 'stage'
     $receipts = Join-Path $WorkRoot 'receipts'
@@ -274,9 +392,16 @@ try {
             [void](New-Item -ItemType Directory -Path $directory)
         }
     }
-    $script:FixtureRoot = $fixture
+    $script:StagePath = $stage
+    $script:ReceiptsPath = $receipts
+    $script:CleanupReceiptPath = Join-Path $receipts 'cleanup-receipt.json'
+    # The exact root the pinned probe will compose from this parent and run id.
+    # Deriving it here, rather than reading it back from a child receipt, is what
+    # binds cleanup to a path no child can influence.
+    $script:FixtureRoot = Join-Path $fixture ($script:RootPrefix + $runId)
 
     $owner = New-DisposableAccount -Name ("$script:AccountPrefix$runId" + 'o') -Role 'owner'
+    $script:OwnerPrincipal = $owner
     $other = New-DisposableAccount -Name ("$script:AccountPrefix$runId" + 'x') -Role 'other'
 
     # Exact, protected, run-owned DACLs. The other principal deliberately has no
@@ -291,10 +416,12 @@ try {
     Copy-Item -LiteralPath $Probe -Destination $stagedProbe
     $stagedHash = (Get-FileHash -LiteralPath $stagedProbe -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($stagedHash -ne $measurementReceipt['sourceHashes'].probe) { throw 'staged_probe_hash_mismatch' }
+    $script:StagedProbe = $stagedProbe
 
     $python = (Get-Command -Name 'python' -CommandType Application |
         Select-Object -First 1).Source
     $measurementReceipt['interpreter'] = [ordered]@{ path = $python; pinnedBy = 'actions/setup-python' }
+    $script:Interpreter = $python
 
     $ownerReceiptPath = Join-Path $receipts 'owner-receipt.json'
     $remaining = $OverallTimeoutSeconds - [int]$clock.Elapsed.TotalSeconds
@@ -309,10 +436,15 @@ try {
     $ownerReceipt = Read-ChildReceipt -Path $ownerReceiptPath -ExpectedSid $owner.Sid `
         -ExpectedRole 'owner'
     $measurementReceipt['ownerReceipt'] = $ownerReceipt
+    # Capture the owner's exact created-object list NOW: before the status check
+    # below can throw and abandon a partially created tree, and before the other
+    # child is launched with write access to the shared receipts directory.
+    if ($ownerReceipt.PSObject.Properties.Name -contains 'createdObjects') {
+        $script:OwnerCreatedObjects = @($ownerReceipt.createdObjects)
+    }
     if ($ownerChild.exitCode -ne 0 -or $ownerReceipt.status -ne 'owner_private_api_observed_only') {
         throw 'owner_private_creation_unresolved'
     }
-    $script:FixtureRoot = $ownerReceipt.fixtureRoot
 
     $otherReceiptPath = Join-Path $receipts 'other-receipt.json'
     $remaining = $OverallTimeoutSeconds - [int]$clock.Elapsed.TotalSeconds
@@ -369,31 +501,41 @@ catch {
 finally {
     $measurementReceipt['cleanup'].attempted = $true
     $measurementReceipt['elapsedSeconds'] = [Math]::Round($clock.Elapsed.TotalSeconds, 3)
-    # Stop ONLY processes this script started, matched on the exact recorded
-    # identity. Never by image name and never by enumerating the process table.
-    foreach ($owned in $script:OwnedProcesses) {
-        try {
-            if (-not $owned.Process.HasExited -and $owned.Process.Id -eq $owned.Id -and
-                $owned.Process.StartTime -eq $owned.StartTime) {
-                $owned.Process.Kill()
-                [void]$owned.Process.WaitForExit(5000)
-                $owned.Record['stoppedByHarness'] = $true
-            }
-        }
-        catch { $measurementReceipt['cleanup'].errors += , "child_stop:$($_.Exception.GetType().Name)" }
-        finally { $owned.Process.Dispose() }
+    Stop-OwnedProcesses
+    # The probe-created tree is owner-only by construction, so this context
+    # cannot enumerate it. It is removed inside its owning ordinary principal
+    # here, BEFORE that account and profile are removed below.
+    try { Invoke-OwnerFixtureCleanup -TimeoutSeconds $CleanupTimeoutSeconds }
+    catch {
+        # Cleanup must never abort the rest of this block: the accounts below and
+        # the receipt at the end are removed and written on every path.
+        $measurementReceipt['cleanup'].errors += , "owner_cleanup:$($_.Exception.GetType().Name)"
     }
-    # Remove only the fixture tree this run created, by exact path.
+    # Remove only the directories this script itself created, by exact path.
     foreach ($path in @($script:FixtureRoot, $WorkRoot)) {
         if ($null -ne $path -and (Test-Path -LiteralPath $path)) {
             try {
                 Remove-Item -LiteralPath $path -Recurse -Force
-                $measurementReceipt['cleanup'].fixtureRemoved = $true
             }
             catch {
                 $measurementReceipt['cleanup'].errors += , "fixture_remove:$($_.Exception.GetType().Name)"
             }
         }
+    }
+    # fixtureRemoved is decided by this script's own observation of the exact
+    # recorded paths, never by the absence of an exception and never by a child
+    # receipt, so a swallowed error cannot present a leak as a removal.
+    try {
+        $stillPresent = @(@($script:FixtureRoot, $WorkRoot) | Where-Object {
+            $null -ne $_ -and (Test-Path -LiteralPath $_) })
+        $measurementReceipt['cleanup'].fixtureRemoved = ($stillPresent.Count -eq 0)
+        if ($stillPresent.Count -ne 0) {
+            $measurementReceipt['cleanup'].errors += , 'recorded_fixture_paths_still_present'
+        }
+    }
+    catch {
+        # Unobservable is not removed; the receipt below is still written.
+        $measurementReceipt['cleanup'].errors += , "fixture_verify:$($_.Exception.GetType().Name)"
     }
     # Remove only recorded accounts, including partial setup, and profiles by SID.
     # There is no wildcard, prefix sweep or name pattern removal anywhere here.
@@ -416,6 +558,17 @@ finally {
     if ($script:OwnedAccounts.Count -ne $measurementReceipt['cleanup'].accountsRemoved.Count) {
         $measurementReceipt['cleanup'].errors += , 'not_every_recorded_account_was_removed'
     }
+    $measurementReceipt['cleanup'].complete = (
+        $measurementReceipt['cleanup'].fixtureRemoved -and
+        $measurementReceipt['cleanup'].errors.Count -eq 0)
+    # The measured status is never rewritten by cleanup: the original outcome and
+    # any original failure stay exactly as measured, and no success predicate is
+    # relaxed. Only the exit code is raised, so a job whose measurement succeeded
+    # but whose required cleanup did not is never reported as a full success.
+    if (-not $measurementReceipt['cleanup'].complete -and $exitCode -eq 0) {
+        $exitCode = 2
+        $measurementReceipt['cleanupShortfall'] = 'measurement_observed_but_cleanup_incomplete'
+    }
     $measurementReceipt['powerLossProven'] = $false
     $measurementReceipt['activationAuthorized'] = $false
     try {
@@ -431,6 +584,11 @@ finally {
     if ($measurementReceipt['cleanup'].errors.Count -gt 0) {
         Write-Output ("::warning::Cleanup reported " +
                       $measurementReceipt['cleanup'].errors.Count + " error(s); original outcome retained.")
+    }
+    if (-not $measurementReceipt['cleanup'].complete) {
+        Write-Output ("::error::Fixture cleanup incomplete; measured outcome '" +
+                      $measurementReceipt['status'] + "' is retained as-is, but this " +
+                      "job is not a full success.")
     }
     if ($null -ne $failure) {
         Write-Output ("Private auth runner: original failure retained; " + $measurementReceipt['reason'])
