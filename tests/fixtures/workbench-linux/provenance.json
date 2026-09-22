@@ -1,0 +1,45 @@
+{
+  "base": "2c941f841f89113390846513933e60beb3b9cc44",
+  "entries": [
+    {
+      "path": "input/CONTRACT.md",
+      "sha256": "5705264ac4e1d4b68b831bb5e0a6ee1503af0f092c218882f1b7fbdf83dfc72f",
+      "bytes": 22878
+    },
+    {
+      "path": "input/DISPATCH.md",
+      "sha256": "4a2c2ad520cbd7b9e29b7c14302efd34d88b5554a320e6d644527b699000f650",
+      "bytes": 3508
+    },
+    {
+      "path": "input/PRIOR-LINUX-NOTRUN.test.js",
+      "sha256": "4edc77b3e5ac7a6077e272ad333c5a559685ef75a34a72a24eedc0c8c4815732",
+      "bytes": 8141
+    },
+    {
+      "path": "input/PRIOR-REPORT.md",
+      "sha256": "d50fde1dffe100e94428bf259e4646af76b84fbe18d620fc41026420fc920263",
+      "bytes": 17495
+    },
+    {
+      "path": "input/compiled/workbench-contract.js",
+      "sha256": "48490f514da10661329b84ae9ce1886def444bb89b919fe39238699843c3c227",
+      "bytes": 5745
+    },
+    {
+      "path": "input/compiled/workbench-files.js",
+      "sha256": "3a918fa4492ce7d755607e7210af86b477ce7ab9d706bca635edb02d0be54155",
+      "bytes": 6408
+    },
+    {
+      "path": "input/source/workbench-contract.ts",
+      "sha256": "2680ddd776ba7aae2f4d223cd9ed2f8767d5b08b5a7992aaebd722bee49f8f72",
+      "bytes": 7208
+    },
+    {
+      "path": "input/source/workbench-files.ts",
+      "sha256": "3931c42018c60e7eb7f560eab09ab7bf7af25137155b15a16d22f221733bb5c6",
+      "bytes": 6237
+    }
+  ]
+}

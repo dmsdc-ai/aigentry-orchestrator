@@ -1,0 +1,160 @@
+# wl1165i-tester / task1165 / release1171 / operation wl1165i-v1
+# attempt 8a3cd5d3-f9df-41e3-a067-5f8c50e39c69
+#
+# Independent Linux qualification run for tests/knowledge/workbench-linux-probe.test.mjs.
+#
+# This workflow executes a verification harness ONLY. It builds nothing, installs
+# no dependencies, starts no service, touches no vault and reaches no network
+# beyond checkout and the pinned Node runtime provisioning. It has read-only
+# repository permissions, no secrets and no persisted git credentials.
+#
+# It expects the controller to have staged, on the isolated CI branch, exactly:
+#   tests/fixtures/workbench-linux/workbench-contract.js
+#   tests/fixtures/workbench-linux/workbench-files.js
+# These are the ACTUAL emitted modules. They are never an alternate production
+# implementation written for the test. Their SHA256 provenance is recorded in
+# output/REPORT.md and re-emitted as job evidence below.
+#
+# A nonzero test exit is preserved and fails the job. TAP output and runtime/
+# hash evidence are uploaded on every outcome, including failure.
+
+name: workbench-linux-probe
+
+on:
+  push:
+    branches:
+      - test/1165-wl1165i-20260923
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  probe:
+    name: Linux filesystem qualification probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout (no persisted credentials)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up pinned Node 20.20.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.20.0
+
+      - name: Assert runtime, platform and staged fixtures
+        run: |
+          set -euo pipefail
+          actual="$(node --version)"
+          echo "node=${actual}"
+          if [ "${actual}" != "v20.20.0" ]; then
+            echo "FAIL: expected v20.20.0, got ${actual}" >&2
+            exit 1
+          fi
+          if [ "$(node -p 'process.platform')" != "linux" ]; then
+            echo "FAIL: this probe qualifies Linux only" >&2
+            exit 1
+          fi
+          if [ "$(id -u)" = "0" ]; then
+            echo "FAIL: running as uid 0 would bypass the directory-permission" >&2
+            echo "      fixture in PROBE-15; run as a non-root user." >&2
+            exit 1
+          fi
+          for f in \
+            tests/fixtures/workbench-linux/workbench-contract.js \
+            tests/fixtures/workbench-linux/workbench-files.js \
+            tests/knowledge/workbench-linux-probe.test.mjs ; do
+            if [ ! -f "$f" ]; then
+              echo "FAIL: missing staged file: $f" >&2
+              exit 1
+            fi
+          done
+
+      - name: Collect runtime and hash evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p probe-evidence
+          {
+            echo "# workbench-linux-probe evidence"
+            echo
+            echo "utc:        $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "repository: ${GITHUB_REPOSITORY}"
+            echo "ref:        ${GITHUB_REF}"
+            echo "sha:        ${GITHUB_SHA}"
+            echo "run:        ${GITHUB_RUN_ID} attempt ${GITHUB_RUN_ATTEMPT}"
+            echo "runner:     ${RUNNER_OS} ${RUNNER_ARCH} / $(uname -srmo)"
+            echo "node:       $(node --version)"
+            echo "uid:        $(id -u)"
+            echo "tmpfs:      $(df -PT /tmp | tail -n 1)"
+            echo
+            echo "## sha256 of the exact bytes under test"
+            # Tolerant: if a file is missing the preceding gate already failed,
+            # and the evidence file must still be uploadable.
+            sha256sum \
+              tests/fixtures/workbench-linux/workbench-contract.js \
+              tests/fixtures/workbench-linux/workbench-files.js \
+              tests/knowledge/workbench-linux-probe.test.mjs \
+              .github/workflows/workbench-linux-probe.yml 2>&1 || true
+          } | tee probe-evidence/runtime-and-hashes.txt
+
+      - name: Run probe (bounded, raw TAP retained)
+        id: probe
+        run: |
+          set -uo pipefail
+          mkdir -p probe-evidence
+          set +e
+          # Whole-suite bound is 60s (16 cases x 3s per-case = 48s worst case).
+          timeout --signal=KILL 60s \
+            node --test \
+                 --test-reporter=tap \
+                 --test-timeout=3000 \
+                 tests/knowledge/workbench-linux-probe.test.mjs \
+            > probe-evidence/probe.tap 2> probe-evidence/probe.stderr
+          code=$?
+          set -e
+          echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
+          echo "probe exited ${code}"
+          cat probe-evidence/probe.tap
+          if [ -s probe-evidence/probe.stderr ]; then
+            echo "--- stderr ---"
+            cat probe-evidence/probe.stderr
+          fi
+
+      - name: Upload TAP and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workbench-linux-probe-evidence
+          path: probe-evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Preserve the probe exit status
+        if: always()
+        run: |
+          set -euo pipefail
+          code="${{ steps.probe.outputs.exit_code }}"
+          if [ -z "${code}" ]; then
+            echo "FAIL: the probe step did not report an exit code" >&2
+            exit 1
+          fi
+          if [ "${code}" = "124" ] || [ "${code}" = "137" ]; then
+            echo "FAIL: the probe exceeded its 60s whole-suite bound (exit ${code})" >&2
+            exit 1
+          fi
+          if [ "${code}" != "0" ]; then
+            echo "FAIL: the probe reported real test failures (exit ${code})." >&2
+            echo "      Read probe-evidence/probe.tap. Do not weaken assertions;" >&2
+            echo "      report the actual errors to the implementing coder." >&2
+            exit "${code}"
+          fi
+          echo "probe passed on Linux"
