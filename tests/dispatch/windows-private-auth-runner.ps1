@@ -261,7 +261,7 @@ function Invoke-ProbeAsPrincipal {
             $runtime['psVersion'] -ceq '7.6.5' -and
             $runtime['cmdletType'] -ceq 'Microsoft.PowerShell.Commands.StartProcessCommand' -and
             $assembly.GetName().Name -ceq 'Microsoft.PowerShell.Commands.Management' -and
-            $runtime['cmdletInformationalVersion'] -cmatch '\A7\.6\.5(?:\+[0-9A-Za-z.-]+| SHA: [0-9a-fA-F]{40})?\z' -and
+            $runtime['cmdletInformationalVersion'] -cmatch '\A7\.6\.5(?:\+[0-9A-Za-z.-]+| SHA: [0-9a-fA-F]{40}(?:\+[0-9a-fA-F]{40})?)?\z' -and
             $runtime['currentUICulture'] -ceq 'en-US')
         $runtime['complete'] = $true
     }
