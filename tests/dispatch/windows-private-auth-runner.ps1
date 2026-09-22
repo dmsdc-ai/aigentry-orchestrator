@@ -210,6 +210,70 @@ function Invoke-ProbeAsPrincipal {
         $record['launchFailure'] = 'ordinary_principal_launch_unavailable'
         $record['exceptionType'] = $_.Exception.GetType().Name
         if ($null -ne $inner) { $record['nativeErrorCode'] = $inner.NativeErrorCode }
+        # Capture only bounded metadata from the original ErrorRecord. Never
+        # serialize messages, targets, invocation details, argument values or
+        # credentials. Diagnostic failure must not replace the launch failure.
+        $launchError = $_
+        $diagnostic = [ordered]@{
+            schema = 1; complete = $false; exceptionChain = @()
+        }
+        $record['launchDiagnostic'] = $diagnostic
+        try {
+            # Built-in error identifiers only; omit unexpected free-form text.
+            foreach ($field in @('fullyQualifiedErrorId', 'categoryReason')) {
+                $value = if ($field -eq 'fullyQualifiedErrorId') {
+                    $launchError.FullyQualifiedErrorId
+                } else { $launchError.CategoryInfo.Reason }
+                $allowed = ($null -ne $value -and $value.Length -le 256 -and
+                    $value -cmatch '\A[A-Za-z0-9_.,+-]*\z')
+                $diagnostic[$field] = if ($allowed) { $value } else { $null }
+                $diagnostic[$field + 'Omitted'] = -not $allowed
+            }
+            $diagnostic['category'] = $launchError.CategoryInfo.Category.ToString()
+            $exception = $launchError.Exception
+            for ($depth = 0; $null -ne $exception -and $depth -lt 8; $depth++) {
+                $entry = [ordered]@{
+                    type = $exception.GetType().FullName
+                    hResult = $exception.HResult
+                    parameterBinding = ($exception -is
+                        [System.Management.Automation.ParameterBindingException])
+                    objectDisposed = ($exception -is [System.ObjectDisposedException])
+                }
+                if ($exception -is [System.ComponentModel.Win32Exception]) {
+                    $entry['nativeErrorCode'] = $exception.NativeErrorCode
+                }
+                $diagnostic['exceptionChain'] += , $entry
+                $exception = $exception.InnerException
+            }
+            $diagnostic['exceptionChainTruncated'] = ($null -ne $exception)
+            # These observations are after the failed call, in the harness
+            # context. Exists=false is not proof of absence or child access.
+            $diagnostic['callerRole'] = if ($Account.Role -in
+                @('owner', 'other', 'owner_cleanup')) { $Account.Role } else { 'unknown' }
+            $diagnostic['argumentArrayType'] = $Arguments.GetType().FullName
+            $diagnostic['argumentCountIncludingExecutable'] = $Arguments.Count
+            $inspected = [Math]::Min($Arguments.Count, 64)
+            $nonempty = 0
+            $types = @()
+            for ($index = 0; $index -lt $inspected; $index++) {
+                if (-not [string]::IsNullOrEmpty($Arguments[$index])) { $nonempty++ }
+                $type = if ($null -eq $Arguments[$index]) { 'null' } else {
+                    $Arguments[$index].GetType().FullName }
+                if ($types -notcontains $type) { $types += $type }
+            }
+            $diagnostic['argumentsInspected'] = $inspected
+            $diagnostic['argumentsTruncated'] = ($Arguments.Count -gt $inspected)
+            $diagnostic['nonemptyInspectedArguments'] = $nonempty
+            $diagnostic['inspectedArgumentTypes'] = $types
+            $diagnostic['executableExistsInHarness'] = [System.IO.File]::Exists($Arguments[0])
+            $diagnostic['workingDirectoryExistsInHarness'] =
+                [System.IO.Directory]::Exists($WorkingDirectory)
+            $diagnostic['complete'] = $true
+        }
+        catch {
+            $diagnostic['captureFailureType'] = $_.Exception.GetType().FullName
+            $diagnostic['captureFailureHResult'] = $_.Exception.HResult
+        }
         throw 'ordinary_principal_launch_unavailable'
     }
     # The process object itself is the lifetime handle; no name or table lookup.
