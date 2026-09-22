@@ -105,7 +105,7 @@ function New-DisposableAccount {
     $password = New-JobLocalPassword
     $user = New-LocalUser -Name $Name -Password $password -AccountNeverExpires `
         -PasswordNeverExpires -UserMayNotChangePassword `
-        -Description 'Disposable U1 CI test principal; removed at job end'
+        -Description 'U1 CI test principal; removed at job end'
     # Ordinary baseline membership only. Administrators is never joined and no
     # privilege, right assignment or policy is granted anywhere in this script.
     Add-LocalGroupMember -SID $script:UsersGroupSid -Member $user.SID
