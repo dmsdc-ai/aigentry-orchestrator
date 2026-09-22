@@ -106,16 +106,28 @@ function New-DisposableAccount {
     $user = New-LocalUser -Name $Name -Password $password -AccountNeverExpires `
         -PasswordNeverExpires -UserMayNotChangePassword `
         -Description 'U1 CI test principal; removed at job end'
+    # Own the created SID before any later setup can fail, including membership.
+    $script:OwnedAccounts += , ([pscustomobject]@{
+        Role = $Role; Name = $user.Name; Sid = $user.SID.Value })
+    $accountRecord = [ordered]@{
+        role = $Role; name = $user.Name; sid = $user.SID.Value
+        groups = @(); inAdministrators = $null; privilegesGranted = @()
+        setupComplete = $false
+    }
+    $script:measurementReceipt.accounts += , $accountRecord
     # Ordinary baseline membership only. Administrators is never joined and no
     # privilege, right assignment or policy is granted anywhere in this script.
-    Add-LocalGroupMember -SID $script:UsersGroupSid -Member $user.SID
+    Add-LocalGroupMember -SID $script:UsersGroupSid -Member $user
+    $accountRecord['groups'] = @('Users')
     $administrators = @(Get-LocalGroupMember -SID $script:AdminGroupSid |
         Where-Object { $_.SID.Value -eq $user.SID.Value })
+    $accountRecord['inAdministrators'] = ($administrators.Count -ne 0)
     if ($administrators.Count -ne 0) {
         throw "disposable_account_unexpectedly_in_administrators"
     }
     $credential = [System.Management.Automation.PSCredential]::new(
         ".\$Name", $password)
+    $accountRecord['setupComplete'] = $true
     return [pscustomobject]@{
         Role       = $Role
         Name       = $Name
@@ -265,13 +277,7 @@ try {
     $script:FixtureRoot = $fixture
 
     $owner = New-DisposableAccount -Name ("$script:AccountPrefix$runId" + 'o') -Role 'owner'
-    $script:OwnedAccounts += , $owner
     $other = New-DisposableAccount -Name ("$script:AccountPrefix$runId" + 'x') -Role 'other'
-    $script:OwnedAccounts += , $other
-    $measurementReceipt['accounts'] = @($script:OwnedAccounts | ForEach-Object {
-            [ordered]@{ role = $_.Role; name = $_.Name; sid = $_.Sid
-                        groups = @('Users'); inAdministrators = $false
-                        privilegesGranted = @() } })
 
     # Exact, protected, run-owned DACLs. The other principal deliberately has no
     # rights on the fixture parent, so the leaf access check is what is measured.
@@ -389,7 +395,7 @@ finally {
             }
         }
     }
-    # Remove exactly the two recorded accounts and their profiles, keyed on SID.
+    # Remove only recorded accounts, including partial setup, and profiles by SID.
     # There is no wildcard, prefix sweep or name pattern removal anywhere here.
     foreach ($account in $script:OwnedAccounts) {
         try {
