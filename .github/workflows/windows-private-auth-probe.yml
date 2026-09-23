@@ -1,16 +1,18 @@
 name: Windows private auth DAC probe
 
-# Only this fixture's own three coupled files trigger automatic execution, so an
+# Only this fixture's own four coupled files trigger automatic execution, so an
 # ordinary docs or source commit never reruns disposable account creation.
 on:
   pull_request:
     paths:
       - tests/dispatch/windows-private-auth-probe.py
+      - tests/dispatch/windows-cleanup-context-test.py
       - tests/dispatch/windows-private-auth-runner.ps1
       - .github/workflows/windows-private-auth-probe.yml
   push:
     paths:
       - tests/dispatch/windows-private-auth-probe.py
+      - tests/dispatch/windows-cleanup-context-test.py
       - tests/dispatch/windows-private-auth-runner.ps1
       - .github/workflows/windows-private-auth-probe.yml
   workflow_dispatch:
@@ -31,6 +33,12 @@ jobs:
           python-version: '3.12.10'
       # Python 3.12.10 matches the existing dispatch measurement baseline. It is
       # not a new production support floor and not a product runtime dependency.
+      - name: Validate cleanup context before account creation
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          python -I tests/dispatch/windows-cleanup-context-test.py
+          exit $LASTEXITCODE
       - name: Measure ordinary-principal private access and other-user denial
         timeout-minutes: 5
         shell: pwsh
