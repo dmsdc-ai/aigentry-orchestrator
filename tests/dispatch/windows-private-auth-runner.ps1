@@ -495,15 +495,44 @@ function Invoke-OwnerFixtureCleanup {
     $record['attempted'] = $true
     $record['root'] = $script:FixtureRoot
     $record['recordedObjects'] = $script:OwnerCreatedObjects.Count
-    $arguments = @($script:Interpreter, '-I', $script:StagedProbe,
-                   '--role', 'cleanup', '--root', $script:FixtureRoot,
-                   '--run-id', $script:RunId,
-                   '--expect-sid', $script:OwnerPrincipal.Sid,
-                   '--receipt', $script:CleanupReceiptPath,
-                   '--attest-local-unsynced-disposable-parent')
-    foreach ($object in $script:OwnerCreatedObjects) {
-        $arguments += @('--object', $object)
+    # Freeze the captured list in the existing stage, whose protected DACL gives
+    # both children ReadAndExecute only. Never load cleanup paths from receipts
+    # again after the other child has run. The probe validates the entire schema
+    # and exact fixture bindings before any unlink.
+    $context = [ordered]@{
+        schema = 1; root = $script:FixtureRoot; runId = $script:RunId
+        expectSid = $script:OwnerPrincipal.Sid; receipt = $script:CleanupReceiptPath
+        objects = @($script:OwnerCreatedObjects)
     }
+    if ($context.objects.Count -gt 7) { throw 'cleanup_context_object_bound' }
+    $contextBytes = [System.Text.Encoding]::UTF8.GetBytes(
+        ($context | ConvertTo-Json -Depth 3 -Compress))
+    if ($contextBytes.Length -gt 16384) { throw 'cleanup_context_size_bound' }
+    $contextPath = Join-Path $script:StagePath 'cleanup-context.json'
+    $stream = [System.IO.File]::Open($contextPath, [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try { $stream.Write($contextBytes, 0, $contextBytes.Length) }
+    finally { $stream.Dispose() }
+    # WorkingDirectory is already the immutable stage. Transport neither full
+    # object paths nor a child-selectable manifest path through credentialed argv.
+    $probeArgument = '"' + [System.IO.Path]::GetFileName($script:StagedProbe) + '"'
+    $arguments = @($script:Interpreter, '-I', $probeArgument,
+                   '--role', 'cleanup', '--cleanup-context',
+                   '--attest-local-unsynced-disposable-parent')
+    $executable = $script:Interpreter.Trim()
+    $quotedLength = $executable.Length
+    if (-not ($executable.StartsWith('"') -and $executable.EndsWith('"'))) {
+        $quotedLength += 2
+    }
+    $commandLength = $quotedLength + 1 +
+        ([string]::Join(' ', $arguments[1..($arguments.Count - 1)])).Length
+    $record['transport'] = [ordered]@{
+        kind = 'staged_exact_schema'; contextBytes = $contextBytes.Length
+        derivedCommandLineLengthExcludingNul = $commandLength
+        nativeBufferObserved = $false
+    }
+    # Reserve one UTF-16 code unit for a terminator; do not claim native capture.
+    if ($commandLength -ge 1024) { throw 'cleanup_command_line_bound' }
     # Same credential, same pinned staged probe, same bounded launch path as the
     # measurement children; only the role differs.
     $principal = [pscustomobject]@{
@@ -516,6 +545,9 @@ function Invoke-OwnerFixtureCleanup {
             -StdErr (Join-Path $script:ReceiptsPath 'cleanup-stderr.txt') `
             -TimeoutSeconds $TimeoutSeconds -Arguments $arguments
         $record['childExitCode'] = $child.exitCode
+        if ($child.exitCode -ne 0) {
+            $script:measurementReceipt['cleanup'].errors += , 'owner_cleanup_child_nonzero'
+        }
     }
     catch {
         $script:measurementReceipt['cleanup'].errors += , "owner_cleanup_child:$($_.Exception.Message)"

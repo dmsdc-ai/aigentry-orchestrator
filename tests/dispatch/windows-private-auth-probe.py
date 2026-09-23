@@ -10,11 +10,13 @@ Native use (CPython 3.12.10) under ONE ordinary disposable test principal:
   python -I tests/dispatch/windows-private-auth-probe.py --role cleanup \
     --root ABS_ROOT --run-id HEX --expect-sid OWNER_SID --receipt ABS_RECEIPT \
     --object ABS_RECORDED_OBJECT ... --attest-local-unsynced-disposable-parent
+  Harness cleanup from the read-only stage uses --role cleanup --cleanup-context
+    --attest-local-unsynced-disposable-parent (fixed cleanup-context.json beside probe).
 
 The owner-only protected DACL that makes the owner role meaningful also means no
 other context can enumerate the tree, so the cleanup role removes it under the
 same ordinary principal that created it. It unlinks exactly the objects named on
-its command line, each of which must lie under the exact recorded run root; it
+its command line or immutable staged context, each under the exact run root; it
 never enumerates a directory, expands a pattern, follows a reparse point, or
 changes an ACL, owner or privilege to obtain a removal. A retained object is
 reported as retained, never forced.
@@ -839,6 +841,55 @@ def unlink_recorded(api, path, is_root, receipt, sid):
     return outcome
 
 
+def load_cleanup_context(api, args, target):
+    """Read only the controller's fixed, bounded JSON in the read-only stage."""
+    stage = Path(__file__).absolute().parent
+    context_path = stage / "cleanup-context.json"
+    if not safe_path(context_path):
+        raise Refusal("unsafe_cleanup_context_path")
+    if api.safe_existing(context_path, "cleanup_context") & DIRECTORY:
+        raise Refusal("cleanup_context_is_directory")
+
+    def unique_fields(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise Refusal("cleanup_context_duplicate_field")
+            result[key] = value
+        return result
+
+    with context_path.open("rb") as stream:
+        data = stream.read(16385)
+    if len(data) > 16384:
+        raise Refusal("cleanup_context_size_bound")
+    context = json.loads(data.decode("utf-8"), object_pairs_hook=unique_fields)
+    if (not isinstance(context, dict)
+            or set(context) != {"schema", "root", "runId", "expectSid", "receipt", "objects"}
+            or type(context["schema"]) is not int or context["schema"] != 1
+            or any(not isinstance(context[key], str) or not context[key]
+                   or len(context[key]) > 200 or "\0" in context[key]
+                   for key in ("root", "runId", "expectSid", "receipt"))
+            or not isinstance(context["objects"], list) or len(context["objects"]) > 7):
+        raise Refusal("cleanup_context_schema")
+    run_id = context["runId"]
+    if len(run_id) != 8 or any(char not in "0123456789abcdef" for char in run_id):
+        raise Refusal("cleanup_context_run_id")
+    root = stage.parent / "fixture" / (ROOT_PREFIX + run_id)
+    if (stage.name != "stage" or context["root"] != str(root)
+            or context["receipt"] != str(target)):
+        raise Refusal("cleanup_context_binding")
+    # Only exact names produced by this pinned owner role, never arbitrary
+    # descendants from a child receipt (including paths through child links).
+    allowed = {str(root), *(str(root / name) for name in (
+        "auth-metadata.json", "linkcheck.bin", "linkcheck.link", "reparse.link",
+        "publish.tmp", "published.json"))}
+    if any(not isinstance(text, str) or text not in allowed
+           for text in context["objects"]):
+        raise Refusal("cleanup_context_object_binding")
+    args.root, args.run_id = context["root"], run_id
+    args.expect_sid, args.object = context["expectSid"], context["objects"]
+
+
 def cleanup_run(api, args, receipt, clock):
     """Remove the owner-created fixture tree inside the principal that owns it.
 
@@ -896,7 +947,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--role", required=True,
                         choices=("owner", "other", "cleanup"))
-    parser.add_argument("--receipt", required=True)
+    parser.add_argument("--receipt")
+    parser.add_argument("--cleanup-context", action="store_true")
     parser.add_argument("--parent")
     parser.add_argument("--root")
     parser.add_argument("--run-id", default="")
@@ -909,6 +961,15 @@ def main():
     parser.add_argument("--deadline-seconds", type=int, default=DEADLINE_SECONDS)
     parser.add_argument("--attest-local-unsynced-disposable-parent", action="store_true")
     args = parser.parse_args()
+    if args.cleanup_context:
+        if (args.role != "cleanup" or args.receipt is not None or args.parent is not None
+                or args.root is not None or args.run_id or args.expect_sid or args.object
+                or args.target_name != "published.json"):
+            parser.error("cleanup context cannot be combined with path or identity overrides")
+        args.receipt = str(Path(__file__).absolute().parent.parent
+                           / "receipts" / "cleanup-receipt.json")
+    elif args.receipt is None:
+        parser.error("--receipt is required without --cleanup-context")
     receipt = {"schema": 1, "probe": "windows-private-auth", "role": args.role,
                "status": "preflight_refusal", "powerLossProven": False,
                "activationAuthorized": False, "obligations": dict(OBLIGATIONS),
@@ -956,6 +1017,8 @@ def main():
                 raise Refusal("other_role_requires_root")
             code = other_run(api, args, receipt, clock)
         else:
+            if args.cleanup_context:
+                load_cleanup_context(api, args, target)
             if not args.root:
                 raise Refusal("cleanup_role_requires_root")
             code = cleanup_run(api, args, receipt, clock)
