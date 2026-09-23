@@ -2,7 +2,7 @@
 
 Run with the existing pinned Windows Python before the account-creating probe.
 The production module is copied byte-for-byte to an isolated stage and imported.
-Only token identity and deletion boundaries are injected: these are binding
+Token identity, deletion, Win32 attributes/errors and time are injected: these are binding
 tests, NOT ordinary-token or protected-stage ACL evidence. Real Win32 attribute
 walks inspect real temporary files. Optional NTFS symlinks use existing rights;
 unavailable link creation is explicitly skipped, never reported as coverage.
@@ -296,6 +296,91 @@ class CleanupContextTests(unittest.TestCase):
         self.refused(reason="cleanup_root_is_not_a_plain_directory", real_unlink=True)
         self.assertEqual((original / "published.json").read_bytes(),
                          b"preserve at instrumented boundary")
+
+    def test_preflight_absent_root_preserves_per_object_accounting(self):
+        # Synthetic Win32 absence/errors, NOT native absence or ACL evidence.
+        # Keep every real fixture byte intact and exercise real unlink_recorded.
+        objects = [str(self.root), *(str(self.root / n) for n in self.NAMES)]
+        self.write_document(dict(self.document, objects=objects))
+        original = self.api.functions["GetFileAttributesW"]
+        for absent_error in (2, 3):
+            for child_error in (absent_error, 5):
+                with self.subTest(absent_error=absent_error, child_error=child_error):
+                    def attributes(path):
+                        if str(path) in objects:
+                            error = child_error if str(path) == str(self.leaf) else absent_error
+                            self.probe.C.set_last_error(error)
+                            return 0xFFFFFFFF
+                        return original(path)
+
+                    with mock.patch.dict(self.api.functions, GetFileAttributesW=attributes):
+                        code, receipt = self.invoke(real_unlink=True)
+                    complete = child_error == absent_error
+                    self.assertEqual(code, 0 if complete else 2, receipt)
+                    self.assertEqual(receipt["status"], "owner_fixture_cleanup_complete"
+                                     if complete else "owner_fixture_cleanup_incomplete")
+                    cleanup = receipt["cleanup"]
+                    self.assertEqual(cleanup["recordedCount"], 7)
+                    self.assertEqual(cleanup["clearedCount"], 7 if complete else 6)
+                    self.assertTrue(cleanup["rootCleared"])
+                    self.assertEqual(cleanup["root"], str(self.root))
+                    self.assertEqual(cleanup["runId"], self.RUN)
+                    expected = [dict(path=path, isRoot=path == str(self.root),
+                                     state="unreadable" if path == str(self.leaf)
+                                     and not complete else "absent",
+                                     getLastError=child_error if path == str(self.leaf)
+                                     else absent_error)
+                                for path in [*objects[1:], objects[0]]]
+                    self.assertEqual(cleanup["objects"], expected)
+                    self.assertEqual(self.native_deletes, [])
+                    self.assertEqual(self.leaf.read_bytes(), b"preserve at instrumented boundary")
+
+    def test_preflight_non_directory_refused_before_child_unlink(self):
+        # Synthetic regular-file attributes, not a native substitution claim.
+        original = self.api.functions["GetFileAttributesW"]
+
+        def attributes(path):
+            return self.probe.NORMAL if str(path) == str(self.root) else original(path)
+
+        with mock.patch.dict(self.api.functions, GetFileAttributesW=attributes):
+            for real_unlink in (False, True):
+                with self.subTest(real_unlink=real_unlink):
+                    self.refused(reason="cleanup_root_is_not_a_plain_directory",
+                                 real_unlink=real_unlink)
+        self.assertEqual(self.leaf.read_bytes(), b"preserve at instrumented boundary")
+
+    def test_preflight_attribute_error_preserves_classification(self):
+        # Inject last-error at the Win32 boundary; this is NOT a native denial.
+        original = self.api.functions["GetFileAttributesW"]
+
+        def attributes(path):
+            if str(path) == str(self.root):
+                self.probe.C.set_last_error(5)  # ERROR_ACCESS_DENIED
+                return 0xFFFFFFFF
+            return original(path)
+
+        with mock.patch.dict(self.api.functions, GetFileAttributesW=attributes):
+            for real_unlink in (False, True):
+                with self.subTest(real_unlink=real_unlink):
+                    code, receipt = self.invoke(real_unlink=real_unlink)
+                    self.assertEqual(code, 1, receipt)
+                    self.assertEqual(receipt["status"], "harness_failure")
+                    self.assertEqual(receipt["failedApi"], "GetFileAttributesW")
+                    self.assertEqual(receipt["getLastError"], 5)
+                    self.assertNotIn("cleanup", receipt)
+                    self.assertEqual(self.unlinks, [])
+                    self.assertEqual(self.native_deletes, [])
+        self.assertEqual(self.leaf.read_bytes(), b"preserve at instrumented boundary")
+
+    def test_preflight_deadline_refused_before_child_unlink(self):
+        # Real Deadline.check with only its monotonic clock injected.
+        for real_unlink in (False, True):
+            with self.subTest(real_unlink=real_unlink):
+                with mock.patch.object(self.probe.time, "monotonic",
+                                       side_effect=(0.0, 121.0, 121.0)):
+                    self.refused(reason="measurement_deadline_exceeded_at_cleanup_root_preflight",
+                                 real_unlink=real_unlink)
+        self.assertEqual(self.leaf.read_bytes(), b"preserve at instrumented boundary")
 
     def test_root_reparse_ordering_with_injected_attributes(self):
         # Deterministic ordering regression even without symlink privileges.
