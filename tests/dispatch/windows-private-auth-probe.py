@@ -914,6 +914,20 @@ def cleanup_run(api, args, receipt, clock):
         if not safe_path(path) or (path != root and root not in path.parents):
             raise Refusal("cleanup_object_outside_run_root")
         ordered.append(path)
+    # Refuse a substituted root before any recorded child can be unlinked.
+    # This path-attribute check is not atomic against concurrent replacement;
+    # retain the handle-based owner/DACL checks when unlinking the root below.
+    clock.check("cleanup_root_preflight")
+    try:
+        attributes = api.call("GetFileAttributesW", str(root), invalid=0xFFFFFFFF,
+                              pathType="leaf", object="cleanup_root")
+    except ApiFailure as failure:
+        if failure.error not in ABSENT_ERRORS:
+            raise
+        # Keep the existing per-object outcomes for an already-absent root.
+    else:
+        if attributes & UNSAFE_ATTRIBUTES or not attributes & DIRECTORY:
+            raise Refusal("cleanup_root_is_not_a_plain_directory")
     # Deepest first, so the run root is unlinked only after its recorded contents.
     ordered.sort(key=lambda entry: len(entry.parts), reverse=True)
     outcomes = []
