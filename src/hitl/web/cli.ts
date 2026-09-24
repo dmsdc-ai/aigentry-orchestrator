@@ -59,7 +59,9 @@ export async function main(args: readonly string[]): Promise<void> {
     await config.auth.close().catch(() => undefined);
     throw error;
   });
-  process.stdout.write(`Task Console / approval inbox: ${service.origin} (authentication ${config.auth.status().state}; login required for private reads; decisions disabled)\n`);
+  // Only a configured Console names itself; legacy serve keeps its original startup line.
+  const surface = config.console ? 'Task Console / approval inbox' : 'Approval inbox';
+  process.stdout.write(`${surface}: ${service.origin} (authentication ${config.auth.status().state}; login required for private reads; decisions disabled)\n`);
   const shutdown = (): void => {
     process.removeListener('SIGINT', shutdown);
     process.removeListener('SIGTERM', shutdown);

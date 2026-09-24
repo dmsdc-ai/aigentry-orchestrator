@@ -55,22 +55,26 @@ function field(name, value) {
 function renderDetail(row, legacy) {
   el('fields').replaceChildren();
   if (legacy) {
-    for (const [name, value] of [['Request', row.id], ['Question', row.question], ['State', row.state], ['Worker', row.subjectSid], ['Created', row.createdAt], ['Binding', 'legacy_unbound'], ['Task / scope / purpose', null], ['Decisions', 'Disabled']]) field(name, value);
+    // Legacy field order and positions are part of the approval-inbox contract.
+    for (const [name, value] of [['Request', row.id], ['Question', row.question], ['Worker', row.subjectSid], ['Task', row.task], ['Purpose', row.purpose], ['Scope', row.scope], ['State', row.state], ['Created', row.createdAt], ['Decision', row.decision], ['Binding', row.binding], ['Decisions', 'Disabled']]) field(name, value);
   } else {
     for (const [name, value] of [['Task', row.taskId], ['Title', 'Redacted summary unavailable'], ['Recorded status', row.recordedStatus], ['Archive membership', row.archive ? 'Yes; acceptance unknown' : 'No'], ['Lifecycle evidence', row.lifecycle], ['Source updated', row.updatedAt], ['Execution observed', row.observedAt], ['Phase', row.phase], ['SID / attempt / operation', null], ['Requested model / effort', null], ['Observed model / effort', null], ['Blocker / resume owner', null], ['Release / acceptance', null], ['Obligations / artifacts', null], ['Revision', row.revision], ['Coverage reasons', row.reasons.join(', ')]]) field(name, value);
   }
   el('detail').hidden = false;
   if (focusDetail) { el('detail-title').focus(); focusDetail = false; }
 }
-function renderRows(data, legacy, current) {
-  el('requests').replaceChildren();
+function renderRows(data, legacy, current, append) {
+  if (!append) el('requests').replaceChildren();
   for (const row of data.items) {
     const li = document.createElement('li'), button = document.createElement('button');
-    const title = document.createElement('strong'), state = document.createElement('span'), observation = document.createElement('small');
-    title.textContent = legacy ? row.id : 'Task ' + row.taskId;
-    state.textContent = legacy ? row.state + ' · legacy_unbound' : row.recordedStatus + ' · execution unknown';
-    observation.textContent = legacy ? row.createdAt : 'Source updated: ' + (row.updatedAt || 'unknown');
-    button.append(title, state, observation);
+    if (legacy) button.textContent = row.id + ' — ' + row.question;
+    else {
+      const title = document.createElement('strong'), state = document.createElement('span'), observation = document.createElement('small');
+      title.textContent = 'Task ' + row.taskId;
+      state.textContent = row.recordedStatus + ' · execution unknown';
+      observation.textContent = 'Source updated: ' + (row.updatedAt || 'unknown');
+      button.append(title, state, observation);
+    }
     button.addEventListener('click', () => { focusDetail = true; lastSelected = legacy ? row.id : row.taskId; navigate(current.view, lastSelected); });
     li.append(button); el('requests').append(li);
     if (restoreFocus && lastSelected === (legacy ? row.id : row.taskId)) button.focus();
@@ -81,7 +85,8 @@ function renderRows(data, legacy, current) {
 }
 function schedule() {
   clearTimeout(timer);
-  if (document.hidden || !loggedIn) return;
+  // Legacy approvals never polled in the background; keep that list stable.
+  if (document.hidden || !loggedIn || !configured) return;
   const seconds = Math.max(retryDelay || 0, Math.min(60, 15 * Math.pow(2, failures)));
   timer = setTimeout(() => load(), seconds * 1000 + Math.random() * 1500);
 }
@@ -110,7 +115,8 @@ async function load(more = false, legacyId = null) {
     for (const button of document.querySelectorAll('[data-view]')) button.setAttribute('aria-pressed', String(button.dataset.view === current.view));
     el('filters').hidden = legacy || current.view !== 'tasks';
     const params = new URLSearchParams(legacy ? { view: legacyView, limit: '25' } : { project: current.project, limit: '25', status: el('state').value, q: el('query').value });
-    const requestedCursor = more ? next : pageCursor;
+    // Legacy pagination is cumulative from the live cursor; configured views page in place.
+    const requestedCursor = more ? next : legacy ? null : pageCursor;
     if (requestedCursor) params.set('cursor', requestedCursor);
     const id = legacy ? legacyId : current.id;
     if (id) { params.delete('limit'); params.delete('cursor'); params.delete('status'); params.delete('q'); }
@@ -119,7 +125,7 @@ async function load(more = false, legacyId = null) {
     if (token !== location.hash || queued) { queued = true; return; }
     failures = 0; retryDelay = null; lastFetch = data.fetchedAt || new Date().toISOString();
     if (id && (legacy || data.items.length)) renderDetail(legacy ? data : data.items[0], legacy);
-    else { pageCursor = requestedCursor; renderRows(data, legacy, current); el('detail').hidden = true; }
+    else { pageCursor = requestedCursor; const append = legacy && more; renderRows(data, legacy, current, append); if (!append) el('detail').hidden = true; }
     if (legacy) {
       el('coverage').textContent = 'Legacy approvals only · Project coverage unavailable';
       status(data.warnings && data.warnings.length ? 'Partial: some approval records unavailable.' : 'Read-only legacy approvals · Decisions disabled.', data.warnings && data.warnings.length ? 'partial' : 'ready');
@@ -197,9 +203,16 @@ async function init() {
   busy = true;
   try {
     capability = await request('/api/capabilities');
+    configured = !!(capability.console && capability.console.state === 'configured');
     if (capability.auth.state === 'dependency_unverified') { status('Authentication dependency unavailable.', 'unavailable'); return; }
-    if (capability.auth.state !== 'ready') { status('Setup required: trusted localhost TLS and owner enrollment.', 'unavailable'); return; }
+    if (capability.auth.state !== 'ready') {
+      status(configured ? 'Setup required: trusted localhost TLS and owner enrollment.'
+        : 'Setup unavailable: ' + capability.auth.reason + '. A verified authentication adapter and trusted localhost TLS are required.', 'unavailable');
+      return;
+    }
     status('Sign in with your passkey.', 'authentication');
+    // Legacy approvals reopen straight from an existing session, as before the Console.
+    if (!configured) await openWorkspace();
   } catch (error) { showFailure(error); }
   finally { busy = false; queued = false; if (loggedIn) load(); }
 }
