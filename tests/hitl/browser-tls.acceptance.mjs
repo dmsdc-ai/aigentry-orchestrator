@@ -10,8 +10,8 @@ import https from 'node:https';
 import {
   CONSOLE_IDS, CONSOLE_OPS, CONSOLE_PORT, CONSOLE_STAGES, LOGIN_SUBSTAGES, artifactsDir, consoleAcceptance,
   consoleCallerPath, consoleFixtures, consoleOp, consoleStage, invalidConfigRefusal, loginBoundarySnapshot,
-  loginSubstage, prepareArtifacts, renderLoginBoundary, renderReloadDeepLink, setConsoleStage,
-  unconfiguredRefusal, validateConsoleArtifacts,
+  loginSubstage, prepareArtifacts, renderLifecycleVisibility, renderLoginBoundary,
+  renderReloadDeepLink, setConsoleStage, unconfiguredRefusal, validateConsoleArtifacts,
 } from './console-ui.acceptance.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -265,6 +265,43 @@ async function discoverBrowser(owner) {
   }
   throw new Error('browser_ownership');
 }
+// Diagnostics only, for the one hypothesis the prior report could not prove: whether the
+// binary the verified owner actually exec-ed is full Chrome or the `headless_shell` build,
+// and which `--headless` argument form Playwright gave it. Both names are derived ONLY from
+// the command line `browser()` already reads from that owner /proc entry and already asserts
+// against `chromium.executablePath()`: no new process is discovered, no path, argument,
+// version or error text is read again, and none is ever printed. The derivation is pure over
+// a string array already in hand, so it adds no wait, request, retry, sleep or deadline
+// change, and only a name from these two CLOSED enums leaves it. No check anywhere reads one.
+const BINARY_KINDS = ['unobserved', 'chrome', 'headless-shell', 'unknown'];
+// Argument SPELLING only. A bare `--headless` carries no value, so it is reported as `bare`
+// and never as a runtime mode: which mode it selects is a property of the build, not of the
+// flag, and this phase proves nothing about that. Only the explicit spellings are named.
+const HEADLESS_ARG_KINDS = ['unobserved', 'new', 'old', 'bare', 'absent', 'unknown'];
+// Exact recognized basenames only; anything else renders `unknown` rather than a guess.
+const BINARY_BASENAMES = new Map([['chrome', 'chrome'],
+  ['headless_shell', 'headless-shell'], ['chrome-headless-shell', 'headless-shell']]);
+let binaryKind = 'unobserved', headlessArgKind = 'unobserved';
+/** Pure and total, so the printed pair can be re-derived by hand: the exact recognized
+ *  basename of argv[0] and the exact recognized `--headless` form, every other input
+ *  collapsing to `unknown`, or to `absent` when the argument is not present at all. */
+function deriveLaunchShape(args) {
+  const list = Array.isArray(args) ? args.filter(arg => typeof arg === 'string' && arg.length > 0) : [];
+  const executable = list.length > 0 ? list[0] : '';
+  const basename = executable.slice(executable.lastIndexOf('/') + 1);
+  const binary = list.length > 0 ? (BINARY_BASENAMES.get(basename) ?? 'unknown') : 'unknown';
+  const flag = list.slice(1).find(arg => arg === '--headless' || arg.startsWith('--headless='));
+  const headless = flag === undefined ? 'absent'
+    : flag === '--headless' ? 'bare'
+    : flag === '--headless=old' ? 'old'
+    : flag === '--headless=new' ? 'new' : 'unknown';
+  return { binary, headless };
+}
+/** Static, clamped a second time here exactly like `renderTransfer`. No check reads it. */
+function renderLaunchShape() {
+  return `binary=${BINARY_KINDS.includes(binaryKind) ? binaryKind : 'unknown'}`
+    + ` headless-arg=${HEADLESS_ARG_KINDS.includes(headlessArgKind) ? headlessArgKind : 'unknown'}`;
+}
 async function browser(chromium, certs, trusted) {
   const home = await mkdtemp(join(temporary, 'home-'));
   await privateDir(join(home, '.pki'));
@@ -304,6 +341,11 @@ async function browser(chromium, certs, trusted) {
   check(sameProcess(owner.identity, await liveIdentity(owner.identity.pid)));
   // Observe the exec'd Chromium command line without waiting for a CDP response.
   const args = (await readFile(`/proc/${owner.identity.pid}/cmdline`, 'utf8')).split('\0');
+  // Latch the two launch-shape names from that same owned argv, before the assertions below,
+  // so a failing check still leaves them for the failure handler. Pure derivation, guarded so
+  // a fault records `unknown` and can never replace the original error.
+  try { const shape = deriveLaunchShape(args); binaryKind = shape.binary; headlessArgKind = shape.headless; }
+  catch { binaryKind = 'unknown'; headlessArgKind = 'unknown'; }
   check(args[0] === chromium.executablePath());
   check(!args.some(arg => /^--(?:no-sandbox|disable-setuid-sandbox|ignore-certificate-errors|allow-insecure-localhost)/.test(arg)));
   return context;
@@ -1136,5 +1178,21 @@ await entry().catch(() => {
   let reload = 'nav=-1 workspace-hidden=u';
   try { reload = renderReloadDeepLink(); } catch { reload = 'nav=-1 workspace-hidden=u'; }
   process.stderr.write(`browser-tls acceptance: reload-deep-link (${reload})\n`);
+  // Fifth static line, same discipline, for the hypothesis the prior report left UNPROVEN:
+  // which binary the verified owner exec-ed and which headless argument form it was given,
+  // both from the /proc command line this run already read and already asserted. Two
+  // closed-enum names only, re-clamped by the renderer; stderr only; no check reads it and a
+  // renderer fault cannot disturb this handler exit.
+  let launch = 'binary=unknown headless-arg=unknown';
+  try { launch = renderLaunchShape(); } catch { launch = 'binary=unknown headless-arg=unknown'; }
+  process.stderr.write(`browser-tls acceptance: launch-shape (${launch})\n`);
+  // Sixth static line, for the wait actual CI now stops in: the real document.visibilityState
+  // of the two owned console tabs either side of the bringToFront that must hide the first.
+  // Closed-enum names only, re-clamped by the renderer; stderr only; no check reads it and a
+  // renderer fault cannot disturb this handler exit.
+  const unknownVisibility = 'before=page:unavailable,other:unavailable after=page:unavailable,other:unavailable';
+  let visibility = unknownVisibility;
+  try { visibility = renderLifecycleVisibility(); } catch { visibility = unknownVisibility; }
+  process.stderr.write(`browser-tls acceptance: lifecycle-visibility (${visibility})\n`);
   process.exitCode = 1;
 });

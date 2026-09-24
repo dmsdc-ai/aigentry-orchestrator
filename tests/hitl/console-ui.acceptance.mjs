@@ -247,6 +247,41 @@ export function renderLoginBoundary(value) {
     + ` hidden=w${flagOf(dom.workspaceHidden)}/a${flagOf(dom.authHidden)}/o${flagOf(dom.logoutHidden)}`
     + ` rows=${countOf(dom.rows)} options=${countOf(dom.projectOptions)} routes=${tally}`;
 }
+// Diagnostics only, for the wait actual CI run 36063943048 stops in (`lw-hidden-wait`): the
+// real `document.visibilityState` of BOTH owned tabs either side of the `bringToFront` that
+// is supposed to hide the first one. The states come from the product's own pages: no event
+// is dispatched, no state is forged, no CDP session is opened, no clock is moved and no
+// navigator or visibility API is patched or mocked. Each reading is collapsed to a CLOSED
+// enum inside the page, so no URL, title, markup, attribute or error text can reach the
+// line, and it is clamped again by the renderer. No check anywhere reads any of it, and
+// nothing here relaxes, skips, retries or lengthens the wait that follows.
+export const VISIBILITY_STATES = ['not-captured', 'visible', 'hidden', 'unavailable'];
+const VISIBILITY_PROBE = () => {
+  const state = document.visibilityState;
+  return state === 'visible' || state === 'hidden' ? state : 'unavailable';
+};
+const visibilityOf = value => (VISIBILITY_STATES.includes(value) ? value : 'unavailable');
+let visibilityBefore = { page: 'not-captured', other: 'not-captured' };
+let visibilityAfter = { page: 'not-captured', other: 'not-captured' };
+/** Total: never throws, never checks, never marks and returns nothing the caller acts on, so
+ *  a diagnostic fault can never replace the original rejection. An unobservable tab records
+ *  `unavailable`, never a state it did not see. Bounded by the caller's own `bounded` and the
+ *  existing PROBE_MS; it adds no retry, no sleep and no timeout or deadline increase. */
+async function captureVisibility(deps, page, other) {
+  const read = async target => {
+    try { return visibilityOf(await deps.bounded(target.evaluate(VISIBILITY_PROBE), PROBE_MS)); }
+    catch { return 'unavailable'; }
+  };
+  try { return { page: await read(page), other: await read(other) }; }
+  catch { return { page: 'unavailable', other: 'unavailable' }; }
+}
+/** Serialized only after the rejection, to stderr only, exactly like `renderLoginBoundary`. */
+export function renderLifecycleVisibility() {
+  const pair = value => (value && typeof value === 'object' ? value : {});
+  const before = pair(visibilityBefore), after = pair(visibilityAfter);
+  return `before=page:${visibilityOf(before.page)},other:${visibilityOf(before.other)}`
+    + ` after=page:${visibilityOf(after.page)},other:${visibilityOf(after.other)}`;
+}
 const digest = value => createHash('sha256').update(value).digest('hex');
 const outcomes = new Map();
 const mark = (deps, id) => { deps.check(CONSOLE_IDS.includes(id) && !outcomes.has(id)); outcomes.set(id, 'pass'); deps.done(id); };
@@ -827,7 +862,10 @@ async function lifecycleWindow(deps, fixtures, alphaCursor) {
   setConsoleOp('lw-other-page');
   const other = await context.newPage();
   try {
+    // Real states either side of the front-change, from the two owned tabs themselves.
+    visibilityBefore = await captureVisibility(deps, page, other);
     await other.bringToFront();
+    visibilityAfter = await captureVisibility(deps, page, other);
     setConsoleOp('lw-hidden-wait');
     await page.waitForFunction(() => document.hidden === true);
     page.on('request', count);
