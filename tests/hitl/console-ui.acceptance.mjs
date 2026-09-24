@@ -354,6 +354,78 @@ export function renderLifecycleWindows() {
     + ` before=page:${windowStateOf(before.page)},other:${windowStateOf(before.other)}`
     + ` after=page:${windowStateOf(after.page)},other:${windowStateOf(after.other)}`;
 }
+// Real-browser focus, taken at the same point as the two diagnostics above and for the same
+// wait, but unlike them this is actuation, not observation. The actual CI run 36072566236 is
+// headed, real Chrome; it records both owned tabs reading `visible` after `bringToFront`, and
+// `lw-hidden-wait` then never settles. WHY is not established. That observation is compatible
+// with more than one arrangement of the two tabs and of the browser's focus, and nothing here
+// asserts which one holds. One candidate contributor is readable in the locked dependency:
+// playwright-core 1.58.2 sends `Emulation.setFocusEmulationEnabled` {enabled:true} to every
+// main frame as it initialises a page (`crPage.js` line 412). Reading that source is not a
+// browser pass and does not make it the cause; only an independent actual CI run over this
+// candidate can settle that. What follows turns that harness override off on the two owned
+// tabs for the duration of the window, so that whatever the browser's own occlusion does is
+// what `document.hidden` reports; the existing `bringToFront` and the real visibility polling
+// below are left exactly as they are, and if the tabs still do not hide, the stage still fails.
+// It is a harness setting, not a product one: no DOM property is patched, no visibility event
+// is synthesized, no product polling is intercepted, no control is skipped and no deadline,
+// budget or wait moves. No target is discovered globally and no third tab is addressed - the
+// two page handles this fixture already owns are the only ones touched.
+// Because the run depends on this having happened, no failure here is swallowed: a suspension
+// that does not complete fails the stage before the wait runs, and a release that does not
+// complete fails an otherwise-successful run. Neither may reach `mark`.
+const FOCUS_EMULATION = 'Emulation.setFocusEmulationEnabled';
+/** Propagates. A tab that cannot be reached, or an override that cannot be written, fails the
+ *  stage rather than letting the wait below run against an unknown focus state and be reported
+ *  as an acceptance result. Every session is recorded in `holds` the moment it exists - before
+ *  the override is touched - so a `send` the bounded wait abandons is treated as possibly
+ *  applied and is still written back by the release, which the caller runs on the throwing
+ *  path too. An acquisition that arrives only after the bounded wait gave up is detached by
+ *  the self-cleaning handler, the same second route `captureWindows` uses, so no attachment
+ *  outlives this fixture on any path. Bounded by the caller's own `bounded` and the existing
+ *  PROBE_MS; it adds no retry, no sleep and no timeout or deadline increase. Faults are
+ *  re-raised as CLOSED reasons, so no target id, URL, title or driver text can reach the
+ *  output. */
+async function suspendFocusEmulation(deps, targets, holds) {
+  for (const target of targets) {
+    let acquisition = null, session = null;
+    try {
+      acquisition = deps.context.newCDPSession(target);
+      session = await deps.bounded(acquisition, PROBE_MS);
+    } catch {
+      if (acquisition) void acquisition.then(late => late.detach().catch(() => {}), () => {});
+      throw new Error('focus_suspend_failed');
+    }
+    holds.push({ target, session });
+    try { await deps.bounded(session.send(FOCUS_EMULATION, { enabled: false }), PROBE_MS); }
+    catch { throw new Error('focus_suspend_failed'); }
+  }
+}
+/** The counterpart, and equally not optional. It writes back the one state playwright-core
+ *  itself set - `enabled:true` - on every tab still alive, then detaches every session it was
+ *  handed, each inside the same PROBE_MS budget. Detaching is never taken for a restore: a live
+ *  target is always written back explicitly first. Every hold is attempted even after an
+ *  earlier one fails, so a single bad tab cannot strand the other tab's override or session;
+ *  the first CLOSED reason is kept and raised once the sweep is complete. A detach that fails
+ *  on a target that is already gone is not a fault - the attachment died with the target and
+ *  cannot leak - but an unreadable liveness check is, because it costs a restore. `holds` is
+ *  emptied so a second release can neither re-send nor double detach. No retry, no sleep and
+ *  no timeout or deadline increase. */
+async function releaseFocusEmulation(deps, holds) {
+  let fault = null;
+  for (const hold of holds) {
+    let alive = false;
+    try { alive = !hold.target.isClosed(); } catch { fault = fault || 'focus_restore_failed'; }
+    if (alive) {
+      try { await deps.bounded(hold.session.send(FOCUS_EMULATION, { enabled: true }), PROBE_MS); }
+      catch { fault = fault || 'focus_restore_failed'; }
+    }
+    try { await deps.bounded(hold.session.detach(), PROBE_MS); }
+    catch { if (alive) fault = fault || 'focus_detach_failed'; }
+  }
+  holds.length = 0;
+  if (fault) throw new Error(fault);
+}
 const digest = value => createHash('sha256').update(value).digest('hex');
 const outcomes = new Map();
 const mark = (deps, id) => { deps.check(CONSOLE_IDS.includes(id) && !outcomes.has(id)); outcomes.set(id, 'pass'); deps.done(id); };
@@ -933,7 +1005,17 @@ async function lifecycleWindow(deps, fixtures, alphaCursor) {
   const count = request => { try { if (new URL(request.url()).pathname.startsWith('/api/console/')) polls++; } catch {} };
   setConsoleOp('lw-other-page');
   const other = await context.newPage();
+  // Every session acquired below is released, and the second tab closed, on every path out of
+  // the window - including the path where the suspension itself throws, which is why the holds
+  // are declared out here. A cleanup that does not complete is held rather than thrown from the
+  // `finally`, so it can never displace the rejection the stage is actually failing for; it is
+  // raised afterwards, before `mark`, and so fails an otherwise-successful run.
+  const focusHolds = [];
+  let cleanupFault = null;
   try {
+    // Hand the two owned tabs back to whatever focus the browser itself gives them, for this
+    // window only. Required actuation: a failure here fails the stage before the wait runs.
+    await suspendFocusEmulation(deps, [page, other], focusHolds);
     // Real states either side of the front-change, from the two owned tabs themselves.
     visibilityBefore = await captureVisibility(deps, page, other);
     // Same two points, same discipline: which window owns each tab, and each window state.
@@ -964,7 +1046,15 @@ async function lifecycleWindow(deps, fixtures, alphaCursor) {
     await page.waitForFunction(() => document.querySelectorAll('#requests li').length === 6);
     setConsoleOp('lw-resumed-settled');
     await settled(page);
-  } finally { await other.close(); }
+  } finally {
+    // Both steps are always attempted, and neither throws out of the `finally`.
+    try { await releaseFocusEmulation(deps, focusHolds); }
+    catch (error) { cleanupFault = cleanupFault || error; }
+    try { await other.close(); }
+    catch (error) { cleanupFault = cleanupFault || error; }
+  }
+  // Reached only when the body itself succeeded: an original failure has already propagated.
+  if (cleanupFault) throw cleanupFault;
   mark(deps, 'console-hidden-pause');
   setConsoleOp('lw-cursor-expired');
   const expired = await fetchPage(page, `/api/console/v1/tasks?project=churn&limit=2&cursor=${encodeURIComponent(before.json.nextCursor)}`);

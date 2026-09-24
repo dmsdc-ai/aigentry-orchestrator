@@ -557,6 +557,18 @@ test('workflow runs independent tests and admission in guard before credentials 
   assertWorkflowContract(readFileSync(workflow, 'utf8'));
 });
 
+// The acceptance step runs headed Chromium under xvfb-run, so its command lives inside a block
+// scalar and is no longer a one-line `run:`. These anchors name that step literally and
+// exactly once, so a mutation can never silently no-op against a needle the workflow dropped.
+const browserStepName = '      - name: Actual browser, WebAuthn and TLS controls\n';
+const browserStepRun = '          xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp" npm run test:browser-tls\n';
+function onlyOccurrence(job, needle) {
+  const first = job.indexOf(needle);
+  assert.ok(first >= 0, `mutation anchor is present: ${needle.trim()}`);
+  assert.equal(job.indexOf(needle, first + 1), -1, `mutation anchor is unique: ${needle.trim()}`);
+  return needle;
+}
+
 for (const [ending, newline] of [['LF', '\n'], ['CRLF', '\r\n']]) {
   const source = () => readFileSync(workflow, 'utf8').replace(/\r\n/g, '\n');
   const encode = text => text.replace(/\n/g, newline);
@@ -587,10 +599,10 @@ for (const [ending, newline] of [['LF', '\n'], ['CRLF', '\r\n']]) {
       job => job.replace(`  ${name}:\n`, `  ${name}:\n    if: always()\n`), /jobs cannot bypass/]),
     ['browser job swallows failure', 'browser-tls', job => job.replace('  browser-tls:\n',
       '  browser-tls:\n    continue-on-error: true\n'), /jobs cannot bypass/],
-    ['browser step skips', 'browser-tls', job => job.replace('        run: npm run test:browser-tls\n',
-      '        if: false\n        run: npm run test:browser-tls\n'), /browser gate cannot skip/],
-    ['browser step swallows failure', 'browser-tls', job => job.replace('        run: npm run test:browser-tls\n',
-      '        run: npm run test:browser-tls || true\n'), /browser gate cannot skip/],
+    ['browser step skips', 'browser-tls', job => job.replace(onlyOccurrence(job, browserStepName),
+      `${browserStepName}        if: false\n`), /browser gate cannot skip/],
+    ['browser step swallows failure', 'browser-tls', job => job.replace(onlyOccurrence(job, browserStepRun),
+      browserStepRun.replace(/\n$/, ' || true\n')), /browser gate cannot skip/],
   ];
   for (const [label, name, mutate, diagnostic] of bypasses) {
     test(`workflow contract rejects ${ending} ${label}`, () => {
