@@ -593,6 +593,192 @@ async function nodeTLSRefusal(certs, name) {
   check(name === 'wrong-san' ? code === 'ERR_TLS_CERT_ALTNAME_INVALID'
     : ['UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY', 'SELF_SIGNED_CERT_IN_CHAIN'].includes(code));
 }
+// --- Console credential counterfactual (candidate fixture correction, task #1177) -------
+// Run 36055762030 localized the Console failure to substage `workspace-rows`, boundary
+// `signin-pending`: `/auth/preauth` and `/auth/login/options` each answered 200 on the
+// Console page, `/auth/login/verify` was never requested at all, and the status stayed
+// `signing-in`/`loading`. The ceremony never settled inside the page; the server side is
+// not implicated by that evidence.
+//
+// The one structural asymmetry against every previously green ceremony is the target it
+// runs in: `WebAuthn.enable` + `addVirtualAuthenticator` are sent over a CDP session bound
+// to the legacy `page` (below, at the `enroll` stage), while the Console ceremony runs in a
+// separate `context.newPage()`. Whether Chromium 1208 scopes a virtual authenticator to the
+// page target is NOT established here and is asserted nowhere; this block MEASURES it on
+// real CI as a negative followed by a positive over the same context, RP, server and the
+// single already-enrolled disposable test credential.
+//
+// Nothing here mocks `navigator`, patches a product handler, ignores an assertion, retries
+// until green, copies a cookie as authentication or substitutes a cached session.
+const TRANSFER_STEPS = [
+  'not-started', 'legacy-precondition', 'negative-navigate', 'negative-options',
+  'negative-ceremony', 'negative-boundary', 'attach-cdp', 'add-authenticator',
+  'add-credential', 'confirm-transfer', 'positive-verify', 'positive-logout', 'complete', 'disposed',
+];
+const NEGATIVE_OUTCOMES = ['not-run', 'unsettled-cancelled', 'rejected', 'settled-credential', 'settled-empty'];
+// Closed list, matched inside the page. Any other name renders `other`, so no error text,
+// message, argument or URL from a rejected ceremony can reach the diagnostic line.
+const CEREMONY_ERRORS = ['AbortError', 'NotAllowedError', 'SecurityError', 'InvalidStateError',
+  'NotSupportedError', 'TimeoutError', 'UnknownError', 'ConstraintError', 'TypeError'];
+const NEGATIVE_MS = 6000;
+let transferStep = 'not-started', negativeOutcome = 'not-run', negativeError = 'none';
+let negativeOptionsCode = 0, negativeVerifySeen = -1, positiveVerifyCode = 0;
+let counterPreserved = 'u', sessionCleared = 'u', disposeClean = 'u';
+/** Static, clamped a second time here exactly like `renderLoginBoundary`: closed-enum
+ *  names, bounded counts, bounded status codes and y/n/u flags only. No check reads it. */
+function renderTransfer() {
+  const countT = value => (Number.isSafeInteger(value) && value >= -1 && value <= 999 ? value : -1);
+  const codeT = value => (Number.isSafeInteger(value) && value >= 100 && value <= 599 ? value : 0);
+  const flagT = value => (['y', 'n', 'u'].includes(value) ? value : 'u');
+  return `step=${TRANSFER_STEPS.includes(transferStep) ? transferStep : 'unknown'}`
+    + ` negative=${NEGATIVE_OUTCOMES.includes(negativeOutcome) ? negativeOutcome : 'unknown'}`
+    + ` error=${negativeError === 'none' || negativeError === 'other' || CEREMONY_ERRORS.includes(negativeError) ? negativeError : 'unknown'}`
+    + ` neg-options=${codeT(negativeOptionsCode)} neg-verify-seen=${countT(negativeVerifySeen)}`
+    + ` pos-verify=${codeT(positiveVerifyCode)} counter=${flagT(counterPreserved)}`
+    + ` session=${flagT(sessionCleared)} disposed=${flagT(disposeClean)}`;
+}
+// Counts already-delivered responses for one exact pathname on the caller's own observer.
+// Used for the verify boundary, so the negative is a measured absence of that request and
+// not an inference from a timer.
+function routeSeen(state, pathname) {
+  let seen = 0;
+  for (const response of state.responses) {
+    let candidate = null;
+    try { candidate = new URL(response.url()).pathname; } catch { continue; }
+    if (candidate === pathname) seen++;
+  }
+  return seen;
+}
+/** Cleanup only. It never checks, marks or rethrows *here*, so it cannot turn a failure into
+ *  a pass and the caller's original rejection always survives it. The owned authenticator and
+ *  CDP session are dropped either way, and a dirty teardown is latched into `disposeClean`,
+ *  which the run-wide `cleanup()` folds into its own `clean` verdict — so a cleanup fault
+ *  still fails an otherwise-passing run, just never in place of an earlier failure. */
+async function disposeCounterfactual(owned) {
+  if (!owned) return;
+  let clean = true;
+  if (owned.cdp && owned.authenticatorId) {
+    try { await bounded(owned.cdp.send('WebAuthn.removeVirtualAuthenticator', { authenticatorId: owned.authenticatorId }), 5000); }
+    catch { clean = false; }
+  }
+  if (owned.cdp) { try { await bounded(owned.cdp.detach(), 5000); } catch { clean = false; } }
+  owned.cdp = null; owned.authenticatorId = null;
+  disposeClean = clean ? 'y' : 'n';
+  transferStep = 'disposed';
+}
+async function consoleCounterfactual({ context, cdp, authenticatorId, page, state, origin }) {
+  const owned = { cdp: null, authenticatorId: null };
+  try {
+    // 1. Precondition, on the LEGACY page's authenticator: the enrolled resident test
+    //    credential really is present there. Without this the negative below proves nothing.
+    transferStep = 'legacy-precondition';
+    const legacy = await bounded(cdp.send('WebAuthn.getCredentials', { authenticatorId }));
+    const source = (legacy.credentials ?? []).filter(item => item.rpId === 'localhost' && item.isResidentCredential === true);
+    check(source.length === 1);
+    const record = source[0];
+    check(typeof record.credentialId === 'string' && record.credentialId.length > 0
+      && typeof record.privateKey === 'string' && record.privateKey.length > 0
+      && Number.isSafeInteger(record.signCount) && record.signCount >= 0);
+    // Private key, credential id and user handle stay in memory and are registered with the
+    // existing private-log leak guard, so a child process that ever echoed one fails
+    // `private-logs`. None of them is printed, written, hashed into evidence or derived from.
+    remember(record.credentialId); remember(record.privateKey);
+    if (typeof record.userHandle === 'string') remember(record.userHandle);
+    // 2. NEGATIVE, on the fresh Console page, with NO authenticator attached to it yet.
+    transferStep = 'negative-navigate';
+    await page.goto(origin);
+    transferStep = 'negative-options';
+    const negativeCsrf = await preauth(page);
+    const negativeOptions = await options(page, negativeCsrf, false);
+    // `options()` has already asserted 200 and the localhost/required RP shape.
+    negativeOptionsCode = 200;
+    const verifyBefore = routeSeen(state, '/auth/login/verify');
+    transferStep = 'negative-ceremony';
+    // The real product ceremony, driven with the real server challenge. Cancellation is
+    // explicit rather than ambient, and `evaluate` resolves only once the in-page promise
+    // has settled, so no ceremony is left outstanding for a later stage to trip over.
+    const probe = await bounded(page.evaluate(async ({ value, ms, names }) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(new DOMException('counterfactual_negative', 'AbortError')), ms);
+      try {
+        const result = await navigator.credentials.get({
+          publicKey: PublicKeyCredential.parseRequestOptionsFromJSON(value), signal: controller.signal });
+        return { outcome: result ? 'settled-credential' : 'settled-empty', error: 'none' };
+      } catch (error) {
+        const name = error && typeof error.name === 'string' ? error.name : 'unknown';
+        return { outcome: 'rejected', error: names.includes(name) ? name : 'other' };
+      } finally { clearTimeout(timer); }
+    }, { value: negativeOptions, ms: NEGATIVE_MS, names: CEREMONY_ERRORS }), NEGATIVE_MS + 6000);
+    negativeError = probe.error;
+    negativeOutcome = probe.outcome === 'rejected'
+      ? (probe.error === 'AbortError' ? 'unsettled-cancelled' : 'rejected')
+      : probe.outcome;
+    transferStep = 'negative-boundary';
+    // The ceremony is joined; let its response events drain before reading the boundary.
+    await delay(250);
+    negativeVerifySeen = routeSeen(state, '/auth/login/verify') - verifyBefore;
+    // Measured boundary, not a timeout: options answered 200 on THIS page and no assertion
+    // was produced, so no verify could be attempted.
+    check(negativeVerifySeen === 0);
+    // An unexpected SUCCESS falsifies the page-scoping reading outright. It is surfaced as a
+    // finding and fails the run: applying a fixture correction for a cause that did not
+    // reproduce would relabel the evidence rather than correct anything.
+    if (probe.outcome !== 'rejected') {
+      process.stderr.write(`browser-tls acceptance: finding (negative-ceremony-succeeded ${renderTransfer()})\n`);
+      check(false);
+    }
+    // 3. POSITIVE. Give THIS page its own authenticator and move across only the one owned
+    //    credential, counter intact, through the documented CDP commands.
+    transferStep = 'attach-cdp';
+    owned.cdp = await context.newCDPSession(page);
+    await owned.cdp.send('WebAuthn.enable');
+    transferStep = 'add-authenticator';
+    const added = await owned.cdp.send('WebAuthn.addVirtualAuthenticator', { options: {
+      protocol: 'ctap2', transport: 'internal', hasResidentKey: true, hasUserVerification: true,
+      isUserVerified: true, automaticPresenceSimulation: true,
+    } });
+    owned.authenticatorId = added.authenticatorId;
+    check(typeof owned.authenticatorId === 'string' && owned.authenticatorId.length > 0);
+    transferStep = 'add-credential';
+    // Exactly one credential, and no new secret: the counter is carried over unchanged so the
+    // server's stored signature counter cannot regress on the next assertion.
+    await bounded(owned.cdp.send('WebAuthn.addCredential', { authenticatorId: owned.authenticatorId, credential: {
+      credentialId: record.credentialId, isResidentCredential: true, rpId: 'localhost',
+      privateKey: record.privateKey, signCount: record.signCount,
+      ...(typeof record.userHandle === 'string' ? { userHandle: record.userHandle } : {}),
+    } }));
+    transferStep = 'confirm-transfer';
+    const moved = await bounded(owned.cdp.send('WebAuthn.getCredentials', { authenticatorId: owned.authenticatorId }));
+    const copies = (moved.credentials ?? []).filter(item => item.credentialId === record.credentialId);
+    check(copies.length === 1 && (moved.credentials ?? []).length === 1);
+    check(copies[0].isResidentCredential === true && copies[0].rpId === 'localhost');
+    counterPreserved = copies[0].signCount === record.signCount ? 'y' : 'n';
+    check(counterPreserved === 'y');
+    transferStep = 'positive-verify';
+    // Symmetric to the negative: same page, same RP, same server, same credential, and this
+    // time `/auth/login/verify` must actually answer 200. `login()` asserts that itself.
+    const positive = await login(page);
+    positiveVerifyCode = 200;
+    check(typeof positive.csrf === 'string' && positive.csrf.length > 0);
+    transferStep = 'positive-logout';
+    // The positive proved the CREDENTIAL; the session it minted must not survive into the
+    // unchanged Console acceptance, or a cached authentication could stand in for the very
+    // ceremony `loginUI` exists to exercise. `loginUI` therefore starts with no session at
+    // all — strictly harder than the original run, which carried the `cli-login` cookie in,
+    // so this can only expose a failure, never manufacture a pass.
+    const signedOut = await fetchPage(page, '/auth/logout', {}, positive.csrf);
+    check(signedOut.status === 200);
+    check(!(await context.cookies()).some(item => item.name === '__Host-inbox'));
+    const revoked = await fetchPage(page, '/api/console/v1/tasks?project=alpha');
+    check(revoked.status === 401 && revoked.body === '{"error":"authentication_required"}');
+    sessionCleared = 'y';
+    transferStep = 'complete';
+  } catch (error) {
+    await disposeCounterfactual(owned);
+    throw error;
+  }
+  return owned;
+}
 async function main() {
   current = 'runner';
   check(process.platform === 'linux' && process.getuid() !== 0 && process.version.startsWith('v20.'));
@@ -752,7 +938,15 @@ async function main() {
       runtime: { node: process.version, hashes: await toolHashes(), image: process.env.ImageOS, imageVersion: process.env.ImageVersion,
         run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, job: 'browser-tls' },
       browser: { playwright: '1.58.2', version: VERSION, revision: '1208', executableHash } } });
-  const consoleEvidence = await consoleAcceptance(consoleDeps);
+  // Negative first, then the bounded correction, then the ORIGINAL Console acceptance runs
+  // unchanged on top of it. The owned authenticator has to outlive `loginUI`, so it is
+  // disposed only once `consoleAcceptance` has settled — including when it rejects, where
+  // the rejection is preserved and rethrown past the cleanup.
+  const counterfactual = await consoleCounterfactual({ context, cdp, authenticatorId,
+    page: consolePage, state: consoleState, origin: consoleDeps.origin });
+  let consoleEvidence;
+  try { consoleEvidence = await consoleAcceptance(consoleDeps); }
+  finally { await disposeCounterfactual(counterfactual); }
   await cleanDOM(consolePage, consoleState);
   await consolePage.close(); await terminate(consoleProc);
   current = 'cli';
@@ -772,8 +966,15 @@ async function cleanup() {
   const results = await Promise.allSettled([
     ...[...browsers].map(closeOwnedBrowser), ...[...children].map(terminate), ...[...services].map(closeService),
   ]);
+  // `disposeClean` is latched by `disposeCounterfactual`: `n` means the owned Console
+  // authenticator or its CDP session could not be released. Folding it in here — rather than
+  // throwing at the dispose site — is what keeps a teardown fault from masking anything:
+  // `entry()` has already latched `failure` for any earlier rejection before `cleanup()` runs,
+  // so this can only turn an otherwise-PASSING run red, never replace an existing failure.
+  // `u` (never disposed, e.g. a refusal before the authenticator was attached) is not dirty.
   let clean = results.every(result => result.status === 'fulfilled') && workSettled
-    && browsers.size === 0 && contexts.size === 0 && children.size === 0 && services.size === 0;
+    && browsers.size === 0 && contexts.size === 0 && children.size === 0 && services.size === 0
+    && disposeClean !== 'n';
   for (const log of logs) {
     const text = Buffer.concat(log.chunks).toString('utf8');
     if (log.overflow || [...secrets].some(secret => text.includes(secret))) clean = false;
@@ -913,5 +1114,13 @@ await entry().catch(() => {
   let boundary = 'boundary=unavailable captured=u';
   try { boundary = renderLoginBoundary(loginBoundarySnapshot()); } catch { boundary = 'boundary=unavailable captured=u'; }
   process.stderr.write(`browser-tls acceptance: login-boundary (${boundary})\n`);
+  // Third static line, same discipline: how far the credential counterfactual got, the
+  // closed-enum outcome of the pre-correction negative, and the measured options/verify
+  // boundaries either side of the transfer. Enums, clamped counts, bounded status codes and
+  // y/n/u flags only; stderr only; no check reads it and a renderer fault cannot disturb
+  // this handler's exit.
+  let transfer = 'step=unknown negative=unknown';
+  try { transfer = renderTransfer(); } catch { transfer = 'step=unknown negative=unknown'; }
+  process.stderr.write(`browser-tls acceptance: credential-transfer (${transfer})\n`);
   process.exitCode = 1;
 });
