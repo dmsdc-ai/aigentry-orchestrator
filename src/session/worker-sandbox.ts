@@ -216,8 +216,15 @@ export function assertConfinedTarget(stagingRoot: string, sid: string, task: str
   process.kill(r.childPid, 0);
 }
 
-/** Match telepty's content-addressed ref without exposing other sessions' refs. */
-export function stageWorkerRef(stagingRoot: string, sid: string, task: string, refFile: string): void {
+/**
+ * Match telepty's content-addressed ref without exposing other sessions' refs.
+ *
+ * Returns the recipient-absolute path of the staged copy. The recipient's own
+ * `~` resolves against the HOST home, which the whole-process sandbox denies
+ * reading, so a tilde-rooted descriptor names a file the worker can never open.
+ * The caller needs this absolute path to address the bytes it just staged.
+ */
+export function stageWorkerRef(stagingRoot: string, sid: string, task: string, refFile: string): string {
   assertConfinedTarget(stagingRoot, sid, task);
   const current = JSON.parse(fs.readFileSync(path.join(stagingRoot, "sandbox-current.json"), "utf8"));
   const raw = fs.readFileSync(current.manifest, "utf8");
@@ -226,10 +233,17 @@ export function stageWorkerRef(stagingRoot: string, sid: string, task: string, r
   if (m.sid !== sid || m.task !== task) throw new Error("SANDBOX_REF_BINDING");
   const body = fs.readFileSync(refFile, "utf8");
   if (!body.trim()) throw new Error("SANDBOX_REF_EMPTY");
-  const file = path.join(m.env.HOME!, ".telepty", "shared", `${digest(body)}.md`);
+  // Address the ref inside the recipient's sealed HOME only. There is no host
+  // fallback: an unusable HOME is a refusal, never a path the worker cannot read.
+  const recipientHome = m.env.HOME;
+  if (typeof recipientHome !== "string" || !recipientHome || !path.isAbsolute(recipientHome)) {
+    throw new Error("SANDBOX_REF_HOME: manifest env.HOME is not an absolute path");
+  }
+  const file = path.join(recipientHome, ".telepty", "shared", `${digest(body)}.md`);
   if (fs.existsSync(file)) {
     if (fs.readFileSync(file, "utf8") !== body) throw new Error("SANDBOX_REF_CHANGED");
   } else {
     writePrivate(file, body);
   }
+  return file;
 }

@@ -326,6 +326,8 @@ interface Opts {
   taskId: string;
   noTask: boolean;
   noTaskReason: string;
+  /** #1092: operator reason for retrying a delivery_state_unknown row; "" = no override. */
+  retryUnknown: string;
 }
 
 function parseArgs(argv: string[]): Opts {
@@ -349,6 +351,7 @@ function parseArgs(argv: string[]): Opts {
     taskId: "",
     noTask: false,
     noTaskReason: "",
+    retryUnknown: "",
   };
   let i = 0;
   // `shift 2` on a value flag reads $2 even when absent; bash's `set -u` makes
@@ -381,6 +384,13 @@ function parseArgs(argv: string[]): Opts {
       case "--verify-delivered": o.verifyDelivered = true; i += 1; break;
       case "--no-verify-started": o.verifyStarted = false; i += 1; break;
       case "--keep-alive": o.keepAlive = true; i += 1; break;
+      case "--retry-unknown":
+        o.retryUnknown = val(a); i += 2;
+        if (!o.retryUnknown.trim()) {
+          process.stderr.write("dispatch.sh: --retry-unknown needs a non-empty reason\n");
+          process.exit(4);
+        }
+        break;
       case "-h":
       case "--help":
         process.stdout.write(USAGE + "\n");
@@ -457,11 +467,39 @@ function liveCliCounts(): Record<string, number> {
   return counts;
 }
 
-/** AIGENTRY_CLI_CAP_<CLI>: a number (0 = never auto-route there); defaults codex 2, claude 4, others unlimited. */
+/**
+ * AIGENTRY_CLI_CAP_<CLI>: an opt-in count quota, and the ONLY source of one (#1148).
+ *
+ * Absent or empty (whitespace-only included) means no implicit ceiling, for every
+ * CLI — the built-in `codex 2 / claude 4` table is gone. A host that never set the
+ * knob used to hit a manufactured claude cap of 4 and get auto-routed to another
+ * provider on the 5th live session; it no longer does.
+ *
+ * `unlimited` (case-insensitive) is the explicit literal that lifts a cap an
+ * inherited environment still sets, without having to unset the variable.
+ *
+ * A finite number keeps its old meaning exactly, 0 (= never auto-route there)
+ * included. Anything else is malformed and yields no ceiling, warned once per
+ * knob rather than silently manufacturing a count (§9 — a counter must never
+ * block dispatch, and a typo must never become a cap). The warning names the
+ * knob but never echoes its value: an env value is untrusted bytes, and this
+ * stream is an operator terminal and a log, so terminal escapes and anything
+ * sensitive that was mis-set into the variable must not be replayed there.
+ */
+const CAP_UNLIMITED = "unlimited";
+const warnedCapKnobs = new Set<string>();
+
 function cliCap(cli: string): number {
-  const knob = Number(env[`AIGENTRY_CLI_CAP_${cli.toUpperCase()}`] || NaN);
-  const defaults: Record<string, number> = { codex: 2, claude: 4 };
-  return Number.isFinite(knob) ? knob : defaults[cli] ?? Infinity;
+  const knobName = `AIGENTRY_CLI_CAP_${cli.toUpperCase()}`;
+  const raw = (env[knobName] || "").trim();
+  if (!raw || raw.toLowerCase() === CAP_UNLIMITED) return Infinity;
+  const knob = Number(raw);
+  if (Number.isFinite(knob)) return knob;
+  if (!warnedCapKnobs.has(knobName)) {
+    warnedCapKnobs.add(knobName);
+    process.stderr.write(`dispatch.sh: WARNING ${knobName} is set to an invalid value (not a count, not '${CAP_UNLIMITED}'); ignored, no cap applied\n`);
+  }
+  return Infinity;
 }
 
 /** Fresh spawn only: a routed CLI at cap falls to the next candidate; an explicit --cli warns and proceeds. */
@@ -664,6 +702,22 @@ interface Delivery {
   effRef: string;
   tmpRef: string;
   transportInjectId: string;
+  /**
+   * The recipient-absolute `[context-ref]` message for a confined worker, set
+   * once staging has verified where the bytes actually landed. Empty means the
+   * delivery was never staged — see the refusal in main().
+   */
+  refPrompt: string;
+}
+
+/**
+ * telepty's own wording (shared-context.cjs buildSharedContextPrompt), built
+ * here from the recipient-absolute staged path instead of the descriptor,
+ * whose default promptPath is tilde-rooted against the HOST home.
+ * The private staged file remains the content source; only its address travels.
+ */
+function buildContextRefPrompt(stagedPath: string): string {
+  return `[context-ref] Read ${stagedPath} and use it as the source of truth for this task.`;
 }
 
 function computeRefHash(refFile: string): string {
@@ -716,9 +770,16 @@ function prepareEffectiveRef(o: Opts, d: Delivery): boolean {
  * has already authorized.
  */
 function inject(o: Opts, d: Delivery, sid: string): Promise<number> {
-  const a = ["inject", "--ref", d.effRef, "--submit", "--submit-retry", "2"];
+  // Production (confined) delivery carries the staged absolute path as an inline
+  // message: `telepty inject [flags] <session_id> "<prompt>"`. `--ref` is kept for
+  // the unconfined __probe seam, where telepty derives its own tilde descriptor.
+  const a = d.refPrompt
+    ? ["inject", "--submit", "--submit-retry", "2"]
+    : ["inject", "--ref", d.effRef, "--submit", "--submit-retry", "2"];
   if (o.fromId) a.push("--from", o.fromId);
   a.push(sid);
+  // argv element, never a shell string: telepty joins args.slice(2) verbatim.
+  if (d.refPrompt) a.push(d.refPrompt);
   return new Promise((resolve) => {
     let out = "";
     const child = (process.platform === "win32" ? crossSpawn : spawn)(TELEPTY, a, { stdio: ["inherit", "pipe", "inherit"] });
@@ -776,6 +837,21 @@ async function verifyDelivered(o: Opts, sid: string): Promise<number> {
 }
 
 /**
+ * #1092: --retry-unknown was given but the registry's answer for this sid+ref is
+ * not a held unknown attempt. Name what the row says (both axes) so the operator
+ * sees why the override does not apply; the registry JSON is check-dedup's or
+ * begin-delivery's.
+ */
+function retryRefused(sid: string, registryJson: string): string {
+  let prior: { dispatch_id?: string; prior_lifecycle?: string; prior_transport?: string } = {};
+  try { prior = JSON.parse(registryJson); } catch { /* not JSON: name only the absence */ }
+  const what = prior.dispatch_id
+    ? `prior ${prior.dispatch_id} is lifecycle=${prior.prior_lifecycle} transport=${prior.prior_transport}`
+    : "no prior attempt for this sid+ref is held";
+  return `dispatch.sh: DISPATCH_RETRY_REFUSED for ${sid} — --retry-unknown applies only to a delivery_state_unknown row; ${what}`;
+}
+
+/**
  * The authoritative write-before-delivery transaction. It re-runs the dedup
  * check atomically and, only for a new attempt, commits the durable unknown
  * record. Its `proceed` result is what authorizes the inject.
@@ -800,6 +876,7 @@ function beginDelivery(o: Opts, d: Delivery, sid: string): { status: number; std
   ];
   if (o.worktree) a.push("--worktree", o.worktree);
   if (o.keepAlive) a.push("--keep-alive");
+  if (o.retryUnknown) a.push("--retry-unknown", o.retryUnknown);
   return registryOut(a);
 }
 
@@ -974,7 +1051,7 @@ async function main(argv: string[]): Promise<never> {
     die("dispatch.sh: --target or --spawn-and-dispatch required", 4);
   }
 
-  const d: Delivery = { refHash: "", effRef: "", tmpRef: "", transportInjectId: "" };
+  const d: Delivery = { refHash: "", effRef: "", tmpRef: "", transportInjectId: "", refPrompt: "" };
 
   // telepty#60 Stage A: the read-only dedup query runs BEFORE any side effect,
   // so a duplicate never spawns a workspace or waits for readiness. It creates
@@ -990,9 +1067,24 @@ async function main(argv: string[]): Promise<never> {
     if (dedup.output) process.stderr.write(dedup.output.replace(/\n?$/, "\n"));
     die(`dispatch.sh: DISPATCH_NOT_RECORDED — dedup query failed (rc=${dedup.status})`, 9);
   }
+  if (o.retryUnknown) {
+    // #1092: the override applies to a held unknown attempt and nothing else.
+    // Refuse here, before any spawn or wait, so a misapplied flag has no side
+    // effect; begin-delivery re-checks under the lock. A retry re-checks
+    // readiness and re-prepares the ref like a first delivery, but the row it
+    // supersedes proves the worker was spawned and ready, so it never opens a
+    // second workspace and takes the existing worker's route.
+    let prior: { prior_lifecycle?: string; prior_transport?: string } = {};
+    try { prior = JSON.parse(dedup.output); } catch { /* malformed proof cannot authorize retry */ }
+    if (dedup.status !== 7 || prior.prior_lifecycle !== "delivery_state_unknown" || prior.prior_transport !== "unknown") {
+      process.stdout.write(dedup.output);
+      die(retryRefused(sid, dedup.output), 4);
+    }
+    skipPreparation = false;
+  }
 
-  resolveRoute(o, sid, skipPreparation);
-  if (!skipPreparation && o.spawn) { applyCliCap(o); spawnWorkspace(o, sid); }
+  resolveRoute(o, sid, skipPreparation || o.retryUnknown !== "");
+  if (!skipPreparation && o.spawn && !o.retryUnknown) { applyCliCap(o); spawnWorkspace(o, sid); }
 
   emitTelemetry([
     "--helper", "dispatch",
@@ -1016,7 +1108,11 @@ async function main(argv: string[]): Promise<never> {
     if (rc !== 0) process.exit(rc);
     if (!prepareEffectiveRef(o, d)) process.exit(3);
     try {
-      stageWorkerRef(path.join(env.AIGENTRY_SESSIONS_ROOT || path.join(os.homedir(), ".aigentry", "sessions"), sid), sid, o.taskId, d.effRef);
+      // Stage A, like prepareEffectiveRef: the message is built from the verified
+      // staged path HERE, before the durable commit, so the transport call itself
+      // stays infallible.
+      const staged = stageWorkerRef(path.join(env.AIGENTRY_SESSIONS_ROOT || path.join(os.homedir(), ".aigentry", "sessions"), sid), sid, o.taskId, d.effRef);
+      d.refPrompt = buildContextRefPrompt(staged);
     } catch (e) {
       die(`dispatch.sh: SANDBOX_REF_REFUSED: ${String(e)}`, 78);
     }
@@ -1025,6 +1121,10 @@ async function main(argv: string[]): Promise<never> {
   // Nothing fallible may run between this commit and the inject: a crash in
   // that window is conservatively delivery-unknown.
   const begin = beginDelivery(o, d, sid);
+  if (begin.status === 4 && begin.stdout.includes('"DISPATCH_RETRY_REFUSED"')) {
+    process.stdout.write(begin.stdout);
+    die(retryRefused(sid, begin.stdout), 4);
+  }
   switch (begin.status) {
     case 0:
       break;
@@ -1042,6 +1142,18 @@ async function main(argv: string[]): Promise<never> {
     default:
       if (begin.stdout) process.stderr.write(begin.stdout);
       die(`dispatch.sh: DISPATCH_NOT_RECORDED for ${sid} — no delivery attempted`, 9);
+  }
+
+  // A success path must never fall back to telepty's tilde descriptor: that names
+  // the HOST home, which the recipient's sandbox denies reading. Reachable only
+  // when preparation was skipped as a duplicate yet the atomic recheck still said
+  // proceed — so it must sit AFTER that recheck, or a genuine duplicate/held-unknown
+  // would lose its authoritative 8/7 answer. The check itself is pure (no I/O, no
+  // allocation), so it does not reintroduce a fallible step before the transport;
+  // it refuses outright, and the committed row stays conservatively unknown because
+  // nothing was handed to telepty.
+  if (!d.refPrompt) {
+    die(`dispatch.sh: SANDBOX_REF_UNSTAGED for ${sid} — no confined ref was staged; refusing a host-rooted ref. Nothing was transported`, 78);
   }
 
   if ((await inject(o, d, sid)) !== 0) {
@@ -1134,7 +1246,9 @@ async function probe(argv: string[]): Promise<never> {
     // __probe dispatch-ref --ref <file> [--from <id>] <sid>
     // prepare_effective_ref + do_inject, the pair T67 calls back to back.
     const o = parseArgs(argv.slice(1, argv.length - 1));
-    const d: Delivery = { refHash: "", effRef: "", tmpRef: "", transportInjectId: "" };
+    // Unconfined probe: no staging, so refPrompt stays empty and inject keeps the
+    // legacy `--ref` argv the 12 guards measure. Not the production path.
+    const d: Delivery = { refHash: "", effRef: "", tmpRef: "", transportInjectId: "", refPrompt: "" };
     if (!prepareEffectiveRef(o, d)) process.exit(3);
     process.exit(await inject(o, d, argv[argv.length - 1] ?? ""));
   }

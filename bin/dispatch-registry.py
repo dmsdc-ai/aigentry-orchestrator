@@ -11,7 +11,7 @@ value. It is now four independent axes:
                  measurement in 0.8.0 that could license one. The authenticated
                  correlated report protocol is Stage B (#816 / #817).
     lifecycle    where the dispatch is in ITS OWN process (attempt started,
-                 delivery unknown, re-dispatched, cleaned, quarantined…).
+                 delivery unknown, re-dispatched, superseded, cleaned, quarantined…).
     gate         whether a human is holding it (HITL).
     observations everything that was measured, each explicitly nonterminal.
 
@@ -54,7 +54,8 @@ LOCK_TIMEOUT_S = 10.0
 
 # Lifecycles that are finished with: pruning may reclaim them and the pollers
 # skip them. None of them says anything about the TASK.
-RETIRED_LIFECYCLES = {"cleaned", "cutover_retired", "delivery_failed", "not_delivered"}
+RETIRED_LIFECYCLES = {"cleaned", "cutover_retired", "delivery_failed", "not_delivered",
+                      "superseded"}
 
 CAPABILITY = {
     "turn_boundary": "unavailable",
@@ -434,7 +435,8 @@ def append_observation(rec: dict, kind: str, at: str, **fields) -> None:
 
 
 def dedup_verdict(doc: dict, key: str) -> tuple[str, dict | None]:
-    matches = [r for r in doc["dispatches"] if r["dedup"]["key"] == key]
+    matches = [r for r in doc["dispatches"] if r["dedup"]["key"] == key
+               and r["lifecycle"]["state"] != "superseded"]
     for rec in matches:
         if rec.get("transport", {}).get("result") == "write_observed":
             return "deduplicated", rec
@@ -470,6 +472,8 @@ def op_check_dedup(args: dict) -> int:
     verdict, rec = dedup_verdict(doc, dedup_key(args["sid"], args["ref-hash"]))
     emit({"result": verdict,
           "dispatch_id": rec["dispatch_id"] if rec else None,
+          "prior_lifecycle": rec["lifecycle"]["state"] if rec else None,
+          "prior_transport": rec.get("transport", {}).get("result") if rec else None,
           "completion_fact": None})
     return {"proceed": OK, "retry_held": RETRY_HELD, "deduplicated": DEDUPLICATED}[verdict]
 
@@ -480,10 +484,18 @@ def op_begin_delivery(args: dict) -> int:
     at = now_iso(args.get("now"))
     sid, ref_hash = args["sid"], args["ref-hash"]
     key = dedup_key(sid, ref_hash)
+    retry_requested = "retry-unknown" in args
+    retry_reason = (args.get("retry-unknown") or "").strip()
     with _Lock():
         doc = load()
         verdict, prior = dedup_verdict(doc, key)
-        if verdict != "proceed":
+        retry_refused = retry_requested and (
+            not retry_reason or verdict != "retry_held"
+            or prior["lifecycle"]["state"] != "delivery_state_unknown"
+            or prior.get("transport", {}).get("result") != "unknown")
+        if retry_refused:
+            pass  # Refusal is read-only; emit after releasing the native lock.
+        elif verdict != "proceed" and not retry_requested:
             kind = "dedup_suppressed" if verdict == "deduplicated" else "dedup_retry_held"
             append_observation(prior, kind, at, ref_hash=ref_hash)
             commit(doc)
@@ -515,9 +527,23 @@ def op_begin_delivery(args: dict) -> int:
             if args.get("worktree"):
                 record["worktree"] = args["worktree"]
             append_observation(record, "dispatch_tracking_started", at)
+            if retry_requested:
+                # Supersede and append in one commit; no old transport/completion fact changes.
+                prior["lifecycle"] = {"state": "superseded", "at": at}
+                append_observation(prior, "superseded_by_retry", at,
+                                   superseded_by=record["dispatch_id"], reason=retry_reason)
+                append_observation(record, "retry_of_unknown", at,
+                                   retry_of=prior["dispatch_id"], reason=retry_reason)
             doc["dispatches"].append(record)
             commit(doc)
-    if verdict != "proceed":
+    if retry_refused:
+        emit({"result": "DISPATCH_RETRY_REFUSED",
+              "dispatch_id": prior["dispatch_id"] if prior else None,
+              "prior_lifecycle": prior["lifecycle"]["state"] if prior else None,
+              "prior_transport": prior.get("transport", {}).get("result") if prior else None,
+              "new_delivery": False, "outcome": "unknown", "completion_fact": None})
+        return USAGE
+    if verdict != "proceed" and not retry_requested:
         emit({"result": ("DISPATCH_DEDUPLICATED" if verdict == "deduplicated"
                          else "DISPATCH_RETRY_HELD"),
               "dispatch_id": prior["dispatch_id"],
@@ -527,7 +553,8 @@ def op_begin_delivery(args: dict) -> int:
               "completion_fact": None})
         return DEDUPLICATED if verdict == "deduplicated" else RETRY_HELD
     emit({"result": "proceed", "dispatch_id": record["dispatch_id"],
-          "new_delivery": True, "outcome": "unknown", "completion_fact": None})
+          "new_delivery": True, "outcome": "unknown", "completion_fact": None,
+          "retry_of": prior["dispatch_id"] if retry_requested else None})
     return OK
 
 
@@ -832,7 +859,7 @@ OPS = {
 FLAGS = {
     "archive-sidecars": {"dir"},
     "begin-delivery": {"sid", "ref-hash", "ref-path", "cwd", "from", "track", "role",
-                       "branch", "worktree", "keep-alive", "now"},
+                       "branch", "worktree", "keep-alive", "now", "retry-unknown"},
     "check-dedup": {"sid", "ref-hash"},
     "get": {"sid", "pointer"},
     "list": {"fields", "live", "not-retired", "keep-alive", "due-before"},

@@ -40,6 +40,7 @@
     ".claude/hooks",
     "docs/rules.md",
     "docs/model-profiles/model-routing-profile.md",
+    "docs/setup/dispatch-capacity.md",
     "docs/templates",
     "git-hooks",
     "AGENTS.md",

@@ -87,10 +87,17 @@ test("T140: deduplicated fresh dispatch does not classify or spawn again", () =>
   } finally { f.cleanup(); }
 });
 
-// #1084 per-CLI live cap. Two live codex sessions = the default cap: the fixture's own row
+// #1084 per-CLI live cap. Two live codex sessions: the fixture's own row
 // (router-fixture, bare `codex`) plus one guard launcher, so the `exec -a` resolution is covered.
+// #1148: the quota is stated EXPLICITLY here. It used to be inherited from the built-in
+// `codex 2` default, which no longer exists — an unset knob now means no ceiling at all, so
+// leaving it unset would silently turn these into uncapped runs and stop measuring the cap
+// path. The number (2) and every assertion below are unchanged; only its source is.
 function twoCodex(f: ReturnType<typeof fixture>): NodeJS.ProcessEnv {
-  return { LIVE_SESSIONS: JSON.stringify([{ id: "router-fixture", command: "codex" }, { id: "live-1", command: f.liveLauncher("codex") }]) };
+  return {
+    AIGENTRY_CLI_CAP_CODEX: "2",
+    LIVE_SESSIONS: JSON.stringify([{ id: "router-fixture", command: "codex" }, { id: "live-1", command: f.liveLauncher("codex") }]),
+  };
 }
 
 test("T140: codex at cap, role table is another CLI -> falls to it, by=llm-capped + capped_cli", () => {
@@ -197,8 +204,12 @@ test("T140: readiness probe and --target audit receive the CLI kind for a worker
 });
 
 // #1098: count Claude guard launchers as well as the orchestrator's bare CLI.
-for (const [live, cap, capped] of [[3, "", false], [4, "", true], [4, "5", false], [1, "1", true], [1, "0", true]] as const) {
-  test(`T140: Claude live=${live}, cap=${cap || "default 4"} routes ${capped ? "next candidate" : "Opus"}`, () => {
+// #1148: the `live=4, cap=""` row used to be capped by the built-in `claude 4` default. That
+// default is gone, so the finite-cap case now states quota 4 explicitly (same live count, same
+// capped outcome, same assertions), and a new blank-knob row at the SAME live count asserts the
+// contract that replaced it: an unset knob is no ceiling, not a manufactured 4.
+for (const [live, cap, capped] of [[3, "", false], [4, "4", true], [4, "", false], [4, "5", false], [1, "1", true], [1, "0", true]] as const) {
+  test(`T140: Claude live=${live}, cap=${cap || "unset"} routes ${capped ? "next candidate" : "Opus"}`, () => {
     const f = fixture();
     try {
       const r = f.dispatch([...f.spawnArgs, "--role", "coder"], {
@@ -214,7 +225,8 @@ for (const [live, cap, capped] of [[3, "", false], [4, "", true], [4, "5", false
       assert.deepEqual([payload.cli, payload.route.label, payload.route.decided_by, payload.route.capped_cli],
         capped ? ["codex", "gpt-6-astra", "llm-capped", "claude"] : ["claude", "opus-5", "llm", undefined]);
       if (capped) {
-        assert.ok(r.stderr.includes(`claude at cap (${live} live, AIGENTRY_CLI_CAP_CLAUDE=${cap || "4"})`));
+        // Every capped row now carries an explicit quota, so the status line echoes `cap` itself.
+        assert.ok(r.stderr.includes(`claude at cap (${live} live, AIGENTRY_CLI_CAP_CLAUDE=${cap})`));
         assert.match(note, /cli=codex\/gpt-6-astra by=llm-capped capped_cli=claude/);
       } else assert.doesNotMatch(r.stderr, /at cap/);
     } finally { f.cleanup(); }
