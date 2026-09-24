@@ -720,6 +720,9 @@ async function reloadDeepLink(deps, alpha) {
   // null response means the browser satisfied the navigation without a document response.
   const navigation = await page.goto(`${deps.origin}/#/projects/alpha/tasks/${archived.taskId}`);
   reloadNav = navigation ? navigation.status() : 0;
+  // A fragment-only goto is a same-document navigation, so the module scope that holds
+  // loggedIn is never re-parsed and the guest state this stage asserts cannot appear.
+  await page.reload();
   setConsoleOp('rdl-guest-status-wait');
   await page.waitForFunction(() => document.querySelector('#status').textContent === 'Sign in with your passkey.');
   setConsoleOp('rdl-guest-visibility');
