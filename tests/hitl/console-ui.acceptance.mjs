@@ -37,6 +37,21 @@ export function setConsoleStage(name) {
   // A drifting stage name must fail loudly rather than mislabel a future failure.
   if (!CONSOLE_STAGES.includes(name)) throw new Error('acceptance_failed');
   currentStage = name;
+  currentLoginSubstage = 'not-started';
+}
+// The same closed-enum discipline, one level finer, and only inside `login-ui`. The stage
+// alone cannot separate a failed guest precondition (the status and visibility waits before
+// the click) from a failed credential ceremony (the workspace wait after it): both report
+// `login-ui`. These names are static, no check reads one, and nothing here is an assertion.
+export const LOGIN_SUBSTAGES = ['not-started', 'navigate', 'guest-status', 'guest-visibility',
+  'credential-ceremony', 'workspace-rows', 'settled', 'route-hash', 'project-options',
+  'chrome-visibility', 'filters-visibility', 'operation-text', 'coverage-text', 'status-text',
+  'status-state', 'clean-dom', 'mark'];
+let currentLoginSubstage = 'not-started';
+export const loginSubstage = () => currentLoginSubstage;
+export function setLoginSubstage(name) {
+  if (!LOGIN_SUBSTAGES.includes(name)) throw new Error('acceptance_failed');
+  currentLoginSubstage = name;
 }
 const digest = value => createHash('sha256').update(value).digest('hex');
 const outcomes = new Map();
@@ -367,22 +382,38 @@ const settled = page => page.waitForFunction(() => !document.querySelector('#ref
 export async function loginUI(deps) {
   setConsoleStage('login-ui');
   const { check, page, cleanDOM, state } = deps;
+  setLoginSubstage('navigate');
   await page.goto(deps.origin);
+  setLoginSubstage('guest-status');
   await page.waitForFunction(() => document.querySelector('#status').textContent === 'Sign in with your passkey.');
+  setLoginSubstage('guest-visibility');
   check(await page.locator('#workspace').isHidden() && await page.locator('#auth').isVisible());
+  setLoginSubstage('credential-ceremony');
   await page.locator('#login').click();
+  setLoginSubstage('workspace-rows');
   await page.waitForFunction(() => !document.querySelector('#workspace').hidden && document.querySelectorAll('#requests li').length === 25);
+  setLoginSubstage('settled');
   await settled(page);
+  setLoginSubstage('route-hash');
   check(await page.evaluate(() => location.hash) === '#/projects/alpha/tasks');
+  setLoginSubstage('project-options');
   check(JSON.stringify(await page.$$eval('#project option', nodes => nodes.map(node => node.value))) === JSON.stringify(GRANTED));
+  setLoginSubstage('chrome-visibility');
   check(await page.locator('#legacy').isHidden() && await page.locator('nav').isVisible());
+  setLoginSubstage('filters-visibility');
   check(await page.locator('#filters').isVisible() && await page.locator('#logout').isVisible());
+  setLoginSubstage('operation-text');
   check(await page.locator('#operation').textContent() === 'Advisor: default on · Observation unknown · Loop: activation unverified');
+  setLoginSubstage('coverage-text');
   const coverage = await page.locator('#coverage').textContent();
   check(coverage.startsWith('Coverage: complete · Source observation: unknown · Source fetched: ') && coverage.endsWith(' · 30 matching recorded tasks'));
+  setLoginSubstage('status-text');
   check(await page.locator('#status').textContent() === 'Recorded queue status · Execution and acceptance unknown.');
+  setLoginSubstage('status-state');
   check(await page.locator('#status').getAttribute('data-state') === 'ready');
+  setLoginSubstage('clean-dom');
   await cleanDOM(page, state);
+  setLoginSubstage('mark');
   mark(deps, 'console-login-ui');
 }
 

@@ -8,8 +8,8 @@ import { spawn } from 'node:child_process';
 import http from 'node:http';
 import https from 'node:https';
 import {
-  CONSOLE_IDS, CONSOLE_PORT, CONSOLE_STAGES, artifactsDir, consoleAcceptance, consoleCallerPath, consoleFixtures,
-  consoleStage, invalidConfigRefusal, prepareArtifacts, setConsoleStage, unconfiguredRefusal,
+  CONSOLE_IDS, CONSOLE_PORT, CONSOLE_STAGES, LOGIN_SUBSTAGES, artifactsDir, consoleAcceptance, consoleCallerPath,
+  consoleFixtures, consoleStage, invalidConfigRefusal, loginSubstage, prepareArtifacts, setConsoleStage, unconfiguredRefusal,
   validateConsoleArtifacts,
 } from './console-ui.acceptance.mjs';
 
@@ -897,7 +897,11 @@ await entry().catch(() => {
   // closed enum plus an integer: neither can carry an observed value, path, argument,
   // markup, header, cookie, token, private log line or error text. No check reads it.
   const stage = consoleStage();
+  // Within `login-ui` the substage separates the guest precondition from the credential
+  // ceremony; outside it the substage is `not-started` and carries no claim.
+  const substage = loginSubstage();
   const seen = Number.isSafeInteger(assertions) && assertions >= 0 ? assertions : -1;
-  process.stderr.write(`browser-tls acceptance: observed (stage=${CONSOLE_STAGES.includes(stage) ? stage : 'unknown'} checks-seen=${seen})\n`);
+  process.stderr.write(`browser-tls acceptance: observed (stage=${CONSOLE_STAGES.includes(stage) ? stage : 'unknown'}`
+    + ` substage=${LOGIN_SUBSTAGES.includes(substage) ? substage : 'unknown'} checks-seen=${seen})\n`);
   process.exitCode = 1;
 });
