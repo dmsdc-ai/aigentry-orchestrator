@@ -1,0 +1,417 @@
+name: Windows owned-process acceptance
+
+# Task1167 / release1171, operation nt1167z-v1, authored by session nt1167z-tester.
+#
+# This workflow is the compile-only caller proven in Windows CI 35751978922 at
+# c5089d72, extended with a real acceptance invocation. Every hash, runtime,
+# line-ending, exit-code and wait-semantics check from that caller is carried over
+# unchanged; nothing is relaxed to make the new steps pass. The compile step keeps
+# its own 5-minute limit; only the job budget grows to cover the added test run.
+#
+# The acceptance run is expected to be RED on the frozen sources: the
+# `hypothesis/*` tests assert the safe invariant that H1 and H2 say is violated.
+# A green run here would mean the reproduction did not reproduce, which is why the
+# verdict gate fails on a missing or inconclusive verdict as well as on a
+# reproduced one, and never on the absence of evidence alone.
+#
+# The controller submits this file; the authoring session did not access GitHub or
+# trigger any run.
+
+on:
+  push:
+    branches: [test/1167-nt1167z-20260924]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance:
+    if: github.ref == 'refs/heads/test/1167-nt1167z-20260924'
+    runs-on: windows-2022
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Initialize evidence
+        run: |
+          $diag = Join-Path $env:RUNNER_TEMP 'owned-job-diagnostics'
+          $bundle = Join-Path $env:RUNNER_TEMP 'owned-job-artifact'
+          New-Item -ItemType Directory -Force $diag, $bundle | Out-Null
+          "DIAG=$diag" >> $env:GITHUB_ENV
+          "BUNDLE=$bundle" >> $env:GITHUB_ENV
+          [ordered]@{
+            task = '1167'; release = '1171'; operation = 'nt1167z-v1'
+            authorSession = 'nt1167z-tester'
+            authorAttempt = '0a5397dd-5d37-44a2-acfc-27cfd81002b5'
+            phase = 'windows-owned-process-acceptance'
+            reusedCompileCaller = 'Windows CI 35751978922 @ c5089d72 (compile only)'
+            sha = '${{ github.sha }}'; ref = '${{ github.ref }}'
+            runId = '${{ github.run_id }}'; runAttempt = '${{ github.run_attempt }}'
+            imageOS = $env:ImageOS; imageVersion = $env:ImageVersion
+            os = [Runtime.InteropServices.RuntimeInformation]::OSDescription
+            architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          } | ConvertTo-Json | Set-Content "$diag\identity.json"
+      - name: Preserve source bytes on disposable runner
+        run: |
+          git config --global core.autocrlf false
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to disable checkout line-ending conversion' }
+          $autocrlf = git config --global --get core.autocrlf
+          if ($LASTEXITCODE -ne 0 -or $autocrlf -ne 'false') { throw 'Unexpected core.autocrlf setting' }
+          "core.autocrlf=$autocrlf" | Set-Content "$env:DIAG\checkout-config.txt"
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            bin/windows-owned-broker.mjs
+            native/windows-owned-job/binding.gyp
+            native/windows-owned-job/owned-job.cc
+            native/windows-owned-job/owned-process.mjs
+            tests/dispatch/windows-owned-process-acceptance.test.mjs
+            tests/fixtures/windows-owned-peer.mjs
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.2'
+          architecture: x64
+          check-latest: false
+      - name: Verify frozen sources and identify toolchain
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Start-Transcript -Path "$env:DIAG\preflight.log"
+          try {
+            $expected = [ordered]@{
+              'bin/windows-owned-broker.mjs' = 'd648a002e408bd675cb1398e960c18df020001aae55fc9ac461c6f7ae671aadd'
+              'native/windows-owned-job/binding.gyp' = '0e640ded58e7dc72f3ab598b253f51fc430c6dc2dc4ebee3cf805ef596e0737b'
+              'native/windows-owned-job/owned-job.cc' = '04584b4de63337b56778f3e78d3f19ff557bd32b36fe30b7362e3b86cc5480a9'
+              'native/windows-owned-job/owned-process.mjs' = '8168d3f7f6fc30cb74eb4b3f59fb05fd4a389ce6a4afc8a84b890e9c4bd72d97'
+            }
+            $expected | ConvertTo-Json | Set-Content "$env:DIAG\expected-sources.json"
+            $actual = [ordered]@{}
+            foreach ($path in $expected.Keys) {
+              $actual[$path] = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+              if ($actual[$path] -ne $expected[$path]) { throw "Frozen source mismatch: $path" }
+            }
+            $actual | ConvertTo-Json | Set-Content "$env:DIAG\sources.sha256.json"
+            # The acceptance bundle is hashed separately from the product leaves so
+            # that the compile step's own source re-verification keeps operating on
+            # exactly the four product files it operated on before.
+            $expectedTests = [ordered]@{
+              'tests/dispatch/windows-owned-process-acceptance.test.mjs' = '1b4efe99384269185186896923216c50a1ef290fdbe5b9f569059fde4d615207'
+              'tests/fixtures/windows-owned-peer.mjs' = 'e0ac8f337f9176a82bd72d3b38356d3d6d967920c08ff75d86617a19a915243b'
+            }
+            $expectedTests | ConvertTo-Json | Set-Content "$env:DIAG\expected-tests.json"
+            $actualTests = [ordered]@{}
+            foreach ($path in $expectedTests.Keys) {
+              $actualTests[$path] = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+              if ($actualTests[$path] -ne $expectedTests[$path]) { throw "Acceptance test bundle mismatch: $path" }
+            }
+            $actualTests | ConvertTo-Json | Set-Content "$env:DIAG\tests.sha256.json"
+            if (Test-Path 'native/windows-owned-job/build') { throw 'Pre-existing build directory refused' }
+            $node = (Get-Command node.exe).Source
+            $nodeRoot = Split-Path $node
+            $npm = Join-Path $nodeRoot 'node_modules/npm/bin/npm-cli.js'
+            $gypRoot = Join-Path $nodeRoot 'node_modules/npm/node_modules/node-gyp'
+            $gyp = Join-Path $gypRoot 'bin/node-gyp.js'
+            foreach ($file in @($npm, $gyp, "$gypRoot/package.json")) {
+              if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw "Bundled tooling missing; no fallback: $file" }
+            }
+            $runtime = & $node -p 'JSON.stringify({version:process.version,arch:process.arch,platform:process.platform,versions:process.versions})'
+            if ($LASTEXITCODE -ne 0) { throw 'Node identity failed' }
+            $runtime | Set-Content "$env:DIAG\node.json"
+            $r = $runtime | ConvertFrom-Json
+            if ($r.version -ne 'v20.20.2' -or $r.arch -ne 'x64' -or $r.platform -ne 'win32') { throw 'Unexpected runtime' }
+            $npmVersion = & $node $npm --version
+            if ($LASTEXITCODE -ne 0) { throw 'npm identity failed' }
+            [ordered]@{
+              nodePath = $node; nodeSHA256 = (Get-FileHash $node).Hash
+              npmVersion = $npmVersion; npmCLI_SHA256 = (Get-FileHash $npm).Hash
+              nodeGypPath = $gyp
+              nodeGypVersion = (Get-Content "$gypRoot/package.json" -Raw | ConvertFrom-Json).version
+              nodeGypCLI_SHA256 = (Get-FileHash $gyp).Hash
+              nodeGypPackageSHA256 = (Get-FileHash "$gypRoot/package.json").Hash
+            } | ConvertTo-Json | Set-Content "$env:DIAG\node-toolchain.json"
+            Get-ChildItem $gypRoot -Recurse -File | Sort-Object FullName | ForEach-Object {
+              '{0}  {1}' -f (Get-FileHash $_.FullName).Hash, ([IO.Path]::GetRelativePath($gypRoot, $_.FullName))
+            } | Set-Content "$env:DIAG\node-gyp-tree.sha256"
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            $vsJSON = & $vswhere -latest -version '[17.0,18.0)' -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json
+            if ($LASTEXITCODE -ne 0) { throw 'MSVC discovery failed' }
+            $vsJSON | Set-Content "$env:DIAG\visual-studio.json"
+            $vs = @($vsJSON | ConvertFrom-Json)[0]
+            if (!$vs.installationPath) { throw 'MSVC2022 unavailable' }
+            Import-Module (Join-Path $vs.installationPath 'Common7/Tools/Microsoft.VisualStudio.DevShell.dll')
+            Enter-VsDevShell -VsInstallPath $vs.installationPath -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+            if ($env:WindowsSDKVersion -notlike '10.*') { throw 'SDK10 unavailable' }
+            $cl = (Get-Command cl.exe).Source
+            [ordered]@{
+              compiler = $cl; fileVersion = (Get-Item $cl).VersionInfo.FileVersion
+              compilerSHA256 = (Get-FileHash $cl).Hash
+              vcToolsVersion = $env:VCToolsVersion
+              sdkDirectory = $env:WindowsSdkDir; sdkVersion = $env:WindowsSDKVersion
+              targetArchitecture = $env:VSCMD_ARG_TGT_ARCH
+            } | ConvertTo-Json | Set-Content "$env:DIAG\msvc-sdk.json"
+            "BUILD_NODE=$node" >> $env:GITHUB_ENV
+            "BUILD_GYP=$gyp" >> $env:GITHUB_ENV
+          } finally { Stop-Transcript }
+      - name: Compile supplied binding.gyp
+        id: compile
+        timeout-minutes: 5
+        working-directory: native/windows-owned-job
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Run 35749868562 could not be attributed to a PowerShell build because the
+          # host version was never recorded; capture it so the wait semantics in use
+          # are established by this run rather than assumed.
+          $PSVersionTable | ConvertTo-Json -Depth 3 | Set-Content "$env:DIAG\pwsh.json"
+          $devdir = Join-Path $env:RUNNER_TEMP 'owned-job-node-headers'
+          if (Test-Path $devdir) { throw 'Pre-existing header cache refused' }
+          $stdoutLog = "$env:DIAG\compiler.stdout.log"
+          $stderrLog = "$env:DIAG\compiler.stderr.log"
+          $arguments = @(
+            ('"{0}"' -f $env:BUILD_GYP), 'configure', 'build', '--verbose',
+            '--target=20.20.2', '--arch=x64', '--msvs_version=2022',
+            '--dist-url=https://nodejs.org/download/release',
+            ('--devdir="{0}"' -f $devdir)
+          )
+          $arguments | Set-Content "$env:DIAG\compile-arguments.txt"
+          # Measured in run 35749868562: node-gyp printed 'gyp info ok' and MSBuild
+          # reported 0 errors in 17.04s, the step was nevertheless killed at 300s with
+          # no exit code recorded, and the runner then reported a still-live orphan
+          # vctip.exe. INFERENCE, not measurement: in the supplied PowerShell 7.6.5
+          # source the -Wait path assigns the child to a job object and waits on that
+          # job rather than on the started process, which would keep the step blocked
+          # while any descendant survives. The job-wait body is not in the supplied
+          # source and the prior run's actual pwsh version was never recorded, so that
+          # explanation is unverified for the runtime that produced the hang.
+          # Wait on the exact root process handle instead, under an explicit budget
+          # that stays inside the unchanged 5-minute step limit. This is correct under
+          # either explanation and distinguishes them: a hung root now yields
+          # compiler.wait-timeout.txt naming the pid.
+          $waitBudgetSeconds = 240
+          $process = Start-Process -FilePath $env:BUILD_NODE -ArgumentList $arguments -NoNewWindow -PassThru -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
+          $process.Id | Set-Content "$env:DIAG\compiler.pid.txt"
+          if (-not $process.WaitForExit($waitBudgetSeconds * 1000)) {
+            "root pid $($process.Id) still running after $waitBudgetSeconds s" | Set-Content "$env:DIAG\compiler.wait-timeout.txt"
+            try { $process.Kill() } catch { ($_ | Out-String) | Add-Content "$env:DIAG\compiler.wait-timeout.txt" }
+            $process.WaitForExit(15000) | Out-Null
+            throw "node-gyp root process did not exit within $waitBudgetSeconds s"
+          }
+          # The exit status must be measured off the root handle, never inferred. A
+          # null or non-integer ExitCode would otherwise coerce to 0 through
+          # 'exit $code' and present an unknown status as success.
+          $code = $process.ExitCode
+          if ($null -eq $code -or -not ($code -is [int])) {
+            "root pid $($process.Id) exit code unmeasured; type=$(if ($null -eq $code) { 'null' } else { $code.GetType().FullName })" | Set-Content "$env:DIAG\compiler.exit-code.unknown.txt"
+            throw 'Root process exit code was not measured; refusing to infer an exit status'
+          }
+          $code | Set-Content "$env:DIAG\compiler.exit-code.txt"
+          # Descendants that outlive the root still hold inherited handles on these
+          # redirect targets, so read them with a sharing mode that tolerates that.
+          foreach ($log in @($stdoutLog, $stderrLog)) {
+            $stream = [IO.File]::Open($log, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            try { (New-Object IO.StreamReader($stream)).ReadToEnd() } finally { $stream.Dispose() }
+          }
+          if ($code -ne 0) { exit $code }
+          $binary = Get-Item -LiteralPath 'build/Release/owned_job.node' -ErrorAction Stop
+          if ($binary.Length -le 0) { throw 'Zero exit without a nonempty addon' }
+          $expected = Get-Content "$env:DIAG\sources.sha256.json" -Raw | ConvertFrom-Json -AsHashtable
+          foreach ($path in $expected.Keys) {
+            if ((Get-FileHash (Join-Path $env:GITHUB_WORKSPACE $path)).Hash.ToLowerInvariant() -ne $expected[$path]) { throw "Source changed during build: $path" }
+          }
+          [ordered]@{
+            sha256 = (Get-FileHash $binary.FullName).Hash.ToLowerInvariant()
+            size = $binary.Length; compilerExit = $code
+            path = 'native/windows-owned-job/build/Release/owned_job.node'
+          } | ConvertTo-Json | Set-Content "$env:DIAG\binary.json"
+          Copy-Item $binary.FullName "$env:BUNDLE\owned_job.node"
+          Copy-Item "$env:DIAG\*" $env:BUNDLE
+      - name: Syntax-check the acceptance bundle on the runner
+        if: steps.compile.outcome == 'success'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $checks = [ordered]@{}
+          foreach ($file in @('tests/dispatch/windows-owned-process-acceptance.test.mjs', 'tests/fixtures/windows-owned-peer.mjs')) {
+            & $env:BUILD_NODE --check $file
+            $checks[$file] = $LASTEXITCODE
+            if ($LASTEXITCODE -ne 0) { throw "node --check failed for $file" }
+          }
+          $checks | ConvertTo-Json | Set-Content "$env:DIAG\test-syntax-check.json"
+      - name: Run baseline controls
+        id: baseline
+        if: steps.compile.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 6
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $diag = Join-Path $env:DIAG 'acceptance-baseline'
+          New-Item -ItemType Directory -Force $diag | Out-Null
+          $env:OWNED_ACC_DIAG_DIR = $diag
+          $arguments = @(
+            '--test', '--test-reporter=spec',
+            '--test-name-pattern=^baseline/',
+            'tests/dispatch/windows-owned-process-acceptance.test.mjs'
+          )
+          $arguments | Set-Content "$diag\command.txt"
+          # Same wait discipline as the compile step, and for a sharper reason here:
+          # this run deliberately creates job objects with live descendants, so the
+          # status must be measured off the exact root handle rather than inferred
+          # from a wait that could be satisfied or blocked by a job.
+          $process = Start-Process -FilePath $env:BUILD_NODE -ArgumentList $arguments -NoNewWindow -PassThru `
+            -RedirectStandardOutput "$diag\stdout.log" -RedirectStandardError "$diag\stderr.log"
+          $process.Id | Set-Content "$diag\pid.txt"
+          if (-not $process.WaitForExit(300000)) {
+            "root pid $($process.Id) still running after 300 s" | Set-Content "$diag\wait-timeout.txt"
+            try { $process.Kill() } catch { ($_ | Out-String) | Add-Content "$diag\wait-timeout.txt" }
+            $process.WaitForExit(15000) | Out-Null
+            'timeout' | Set-Content "$diag\exit-code.txt"
+            throw 'Baseline controls did not exit within 300 s'
+          }
+          $code = $process.ExitCode
+          if ($null -eq $code -or -not ($code -is [int])) {
+            'unmeasured' | Set-Content "$diag\exit-code.txt"
+            throw 'Baseline exit code was not measured; refusing to infer an exit status'
+          }
+          $code | Set-Content "$diag\exit-code.txt"
+          foreach ($log in @("$diag\stdout.log", "$diag\stderr.log")) {
+            $stream = [IO.File]::Open($log, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            try { (New-Object IO.StreamReader($stream)).ReadToEnd() } finally { $stream.Dispose() }
+          }
+          exit $code
+      - name: Run H1/H2 reproductions
+        id: hypothesis
+        if: steps.compile.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 6
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $diag = Join-Path $env:DIAG 'acceptance-hypothesis'
+          New-Item -ItemType Directory -Force $diag | Out-Null
+          $env:OWNED_ACC_DIAG_DIR = $diag
+          $arguments = @(
+            '--test', '--test-reporter=spec',
+            '--test-name-pattern=^hypothesis/',
+            'tests/dispatch/windows-owned-process-acceptance.test.mjs'
+          )
+          $arguments | Set-Content "$diag\command.txt"
+          $process = Start-Process -FilePath $env:BUILD_NODE -ArgumentList $arguments -NoNewWindow -PassThru `
+            -RedirectStandardOutput "$diag\stdout.log" -RedirectStandardError "$diag\stderr.log"
+          $process.Id | Set-Content "$diag\pid.txt"
+          if (-not $process.WaitForExit(300000)) {
+            "root pid $($process.Id) still running after 300 s" | Set-Content "$diag\wait-timeout.txt"
+            try { $process.Kill() } catch { ($_ | Out-String) | Add-Content "$diag\wait-timeout.txt" }
+            $process.WaitForExit(15000) | Out-Null
+            'timeout' | Set-Content "$diag\exit-code.txt"
+            throw 'H1/H2 reproductions did not exit within 300 s'
+          }
+          $code = $process.ExitCode
+          if ($null -eq $code -or -not ($code -is [int])) {
+            'unmeasured' | Set-Content "$diag\exit-code.txt"
+            throw 'Reproduction exit code was not measured; refusing to infer an exit status'
+          }
+          $code | Set-Content "$diag\exit-code.txt"
+          foreach ($log in @("$diag\stdout.log", "$diag\stderr.log")) {
+            $stream = [IO.File]::Open($log, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            try { (New-Object IO.StreamReader($stream)).ReadToEnd() } finally { $stream.Dispose() }
+          }
+          exit $code
+      - name: Acceptance verdict gate
+        if: always() && steps.compile.outcome == 'success'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # No attestation is synthesised here. Everything below is read back off
+          # disk from the runs that actually happened; a missing file is a failure,
+          # never a default.
+          function Read-Exit([string]$file) {
+            if (!(Test-Path -LiteralPath $file)) { return 'missing' }
+            return (Get-Content -LiteralPath $file -Raw).Trim()
+          }
+          $baselineDir = Join-Path $env:DIAG 'acceptance-baseline'
+          $hypothesisDir = Join-Path $env:DIAG 'acceptance-hypothesis'
+          $baselineExit = Read-Exit (Join-Path $baselineDir 'exit-code.txt')
+          $hypothesisExit = Read-Exit (Join-Path $hypothesisDir 'exit-code.txt')
+
+          $verdicts = @()
+          foreach ($dir in @($baselineDir, $hypothesisDir)) {
+            $journal = Join-Path $dir 'acceptance-journal.jsonl'
+            if (!(Test-Path -LiteralPath $journal)) { continue }
+            foreach ($line in Get-Content -LiteralPath $journal) {
+              if ([string]::IsNullOrWhiteSpace($line)) { continue }
+              $entry = $line | ConvertFrom-Json
+              if ($entry.event -ne 'case-result' -or -not $entry.hypothesis) { continue }
+              $verdicts += [ordered]@{
+                hypothesis = $entry.hypothesis; case = $entry.case; verdict = $entry.verdict
+                ok = $entry.ok; stopReason = $entry.stopReason
+                cleanupState = $entry.cleanup.state; cleanupReason = $entry.cleanup.reason
+                barrierObserved = $entry.job.barrierObserved
+                spawnedBrokerPid = $entry.spawnedBrokerPid
+                observedPipeClientPid = $entry.broker.observedPid
+                peerIdentReceived = $entry.peerReport.identReceived
+                peerPayloadReceived = $entry.peerReport.payloadReceived
+                peerMarkerValueMatched = $entry.peerReport.markerValueMatched
+              }
+            }
+          }
+
+          $problems = @()
+          if ($baselineExit -ne '0') { $problems += "baseline controls exited $baselineExit" }
+          if ($hypothesisExit -ne '0') { $problems += "H1/H2 safe-invariant assertions exited $hypothesisExit" }
+          foreach ($h in @('H1', 'H2')) {
+            $found = @($verdicts | Where-Object { $_.hypothesis -eq $h })
+            if ($found.Count -eq 0) { $problems += "$h produced no recorded verdict"; continue }
+            foreach ($v in $found) {
+              if ($v.verdict -ne 'safe') { $problems += "$h verdict=$($v.verdict)" }
+            }
+          }
+
+          $conclusion = if ($problems.Count -eq 0) { 'all-safe' } else { 'not-safe-or-inconclusive' }
+          [ordered]@{
+            task = '1167'; operation = 'nt1167z-v1'
+            runId = '${{ github.run_id }}'; runAttempt = '${{ github.run_attempt }}'
+            sha = '${{ github.sha }}'
+            compileOutcome = '${{ steps.compile.outcome }}'
+            baselineOutcome = '${{ steps.baseline.outcome }}'; baselineExit = $baselineExit
+            hypothesisOutcome = '${{ steps.hypothesis.outcome }}'; hypothesisExit = $hypothesisExit
+            sourceHashes = (Get-Content "$env:DIAG\sources.sha256.json" -Raw | ConvertFrom-Json)
+            testHashes = (Get-Content "$env:DIAG\tests.sha256.json" -Raw | ConvertFrom-Json)
+            addon = (Get-Content "$env:DIAG\binary.json" -Raw | ConvertFrom-Json)
+            hypothesisVerdicts = $verdicts
+            problems = $problems
+            conclusion = $conclusion
+          } | ConvertTo-Json -Depth 6 | Set-Content "$env:DIAG\verdict.json"
+          Get-Content "$env:DIAG\verdict.json"
+
+          if ($problems.Count -gt 0) {
+            throw ("Acceptance did not conclude all-safe: " + ($problems -join '; '))
+          }
+      - name: Preserve actual generated toolchain configuration
+        if: always()
+        run: |
+          if (Test-Path 'native/windows-owned-job/build') {
+            Get-ChildItem 'native/windows-owned-job/build' -Recurse -File |
+              Where-Object { $_.Extension -in '.gypi', '.vcxproj', '.sln', '.props', '.targets', '.tlog', '.log' } |
+              ForEach-Object {
+                $relative = [IO.Path]::GetRelativePath((Join-Path $env:GITHUB_WORKSPACE 'native/windows-owned-job/build'), $_.FullName)
+                $target = Join-Path "$env:DIAG\generated-build" $relative
+                New-Item -ItemType Directory -Force (Split-Path $target) | Out-Null
+                Copy-Item $_.FullName $target
+              }
+          }
+          if (Test-Path "$env:BUNDLE\owned_job.node") {
+            Copy-Item "$env:DIAG\*" $env:BUNDLE -Recurse -Force
+          }
+      - name: Upload diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: owned-process-acceptance-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.DIAG }}
+          if-no-files-found: error
+      - name: Upload addon and bound provenance
+        if: success() && steps.compile.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: owned-job-win32-x64-node20.20.2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.BUNDLE }}
+          if-no-files-found: error
