@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -12,10 +12,36 @@ const workflow = path.resolve(process.env.AIGENTRY_RELEASE_ADMISSION_WORKFLOW ||
 const manifestPath = 'release/1.1.0.json';
 const securityPrefix = 'release/security/1.1.0/';
 const policyPath = `${securityPrefix}policy.json`;
+// The public task projection replaces the private queue as admission's ID-membership oracle.
+const projectionPath = 'release/tasks.json';
+// The private queue is never read by admission. It is named here only so the tests can pin
+// that it stays excluded from the security inventory and scope, and that it is never echoed.
+const queuePath = 'state/task-queue.json';
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 
+// Shape A, as decided by the controller: exact top-level keys schema_version | release_group
+// | tasks, and exact per-entry keys id | release_component. No status, ownership, session,
+// path or approval field exists in this schema, and exact() refuses any that are introduced.
+const defaultProjection = () => ({
+  schema_version: 1,
+  release_group: 'fixture-group',
+  tasks: [
+    { id: 1171, release_component: 'fixture-shipping' },
+    { id: 1172, release_component: 'fixture-research' },
+  ],
+});
+
 // Every Git mutation is confined to a newly created synthetic repository.
-function fixture(t) {
+//
+// privateState selects how the fixture models the real repository's private state:
+//   'ignored'   — DEFAULT and the shape a public checkout actually has: `.gitignore`
+//                 excludes `state`, so a synthetic state/task-queue.json exists on disk but
+//                 is untracked. Its bytes are never read by these tests.
+//   'absent'    — state/ is never created at all.
+//   'committed' — the historical shape. Retained ONLY so the boundary pins that keep the
+//                 queue out of the security inventory and scope have a tracked path to aim
+//                 at; admission must still never read it.
+function fixture(t, { privateState = 'ignored', projection = defaultProjection() } = {}) {
   const fixtureParent = process.env.TMPDIR || path.join(repo, '.aigentry-report-rv1171', 'tmp');
   mkdirSync(fixtureParent, { recursive: true });
   const root = realpathSync(mkdtempSync(path.join(fixtureParent, 'release-admission-')));
@@ -42,14 +68,30 @@ function fixture(t) {
   let head;
   let pin;
   const commit = () => { git('add', '--all'); git('-c', 'core.hooksPath=/dev/null', 'commit', '--no-gpg-sign', '-m', 'synthetic fixture'); head = git('rev-parse', 'HEAD'); };
+  // Deliberately synthetic private state. Two invented IDs; no real queue is consulted,
+  // copied or published anywhere in this file.
   const queue = { tasks: [{ id: 1171, status: 'in_progress' }, { id: 1172, status: 'pending' }] };
   git('init', '--quiet');
   write('package.json', { name: '@fixture/release', version: '1.0.0' });
-  write('state/task-queue.json', queue);
+  if (privateState === 'committed') {
+    write(queuePath, queue);
+  } else {
+    // Line 1 of the real repository's .gitignore is exactly `state`; the trailing
+    // re-includes cannot take effect because the parent directory is excluded.
+    write('.gitignore', 'state\n!state/draft/\n!state/migration/\n');
+    if (privateState === 'ignored') write(queuePath, queue);
+    else assert.equal(privateState, 'absent', `unknown privateState ${privateState}`);
+  }
+  // Committed BEFORE the base commit, so the projection is unchanged in the release diff and
+  // needs no manifest ownership — the treatment the queue fixture previously had.
+  if (projection !== false) write(projectionPath, projection);
   write('evidence/report.txt', 'Synthetic planning evidence; no completion claim.\n');
   write('src/deleted.txt', 'deleted later\n');
   write('src/old-name.txt', 'renamed later\n');
   commit();
+  if (privateState !== 'committed') {
+    assert.equal(git('ls-files', '--', queuePath), '', 'the fixture must model a public checkout: queue untracked');
+  }
   const base = git('rev-parse', 'HEAD');
   git('tag', 'v1.0.0');
   write('package.json', { name: '@fixture/release', version: '1.1.0' });
@@ -116,19 +158,34 @@ function fixture(t) {
     commit();
   };
   save();
+  // The private queue's identity is sampled with lstat only. Its bytes are never read here,
+  // so no test in this file can publish private state even by accident.
+  const privateIdentity = () => {
+    const absolute = path.join(root, queuePath);
+    if (!existsSync(absolute)) return null;
+    const stat = lstatSync(absolute);
+    return `${stat.size}:${stat.mtimeMs}:${stat.ino}`;
+  };
   const run = (args = ['--root', root, '--version', '1.1.0'], extraEnv = {}) => {
     assert.ok(existsSync(script), `candidate CLI absent: ${script}`);
-    const before = readFileSync(path.join(root, 'state/task-queue.json'));
+    const projectionAbsolute = path.join(root, projectionPath);
+    const before = existsSync(projectionAbsolute) ? readFileSync(projectionAbsolute) : null;
+    const privateBefore = privateIdentity();
     const result = spawnSync(process.execPath, [script, ...args], { cwd: root,
       env: { ...env, RELEASE_SECURITY_POLICY_SHA256: pin, RELEASE_SECURITY_COMMIT: head, ...extraEnv },
       encoding: 'utf8', timeout: 10000, maxBuffer: 256 * 1024 });
     assert.ifError(result.error);
     assert.equal(result.signal, null);
-    assert.deepEqual(readFileSync(path.join(root, 'state/task-queue.json')), before, 'CLI must not mutate queue');
+    assert.deepEqual(existsSync(projectionAbsolute) ? readFileSync(projectionAbsolute) : null, before,
+      'CLI must not mutate the projection');
+    assert.equal(privateIdentity(), privateBefore, 'CLI must not create or mutate private state');
+    // Admission must never echo the private queue's path or any of its contents.
+    assert.doesNotMatch(result.stdout + result.stderr, /task-queue|in_progress/,
+      'diagnostics must not name or quote private state');
     assert.ok((result.stdout + result.stderr).length < 32768, 'bounded diagnostics');
     return result;
   };
-  return { root, git, write, commit, queue, manifest, save, run, policy, sarif, receipt, scope };
+  return { root, git, write, commit, projection, queue, manifest, save, run, policy, sarif, receipt, scope };
 }
 
 function rejects(f, args, env) {
@@ -138,6 +195,8 @@ function rejects(f, args, env) {
   assert.doesNotMatch(result.stdout, /planning\/source coverage only/, 'original regression must fail during planning');
 }
 
+// §5b — a public checkout admits. These are the cases the current product cannot satisfy:
+// there is no tracked state/task-queue.json for it to read.
 test('valid partial shipping and non-shipping scope, deletion and rename, unchanged evidence', t => {
   const f = fixture(t);
   f.write('untracked-report.txt', 'unrelated admin report');
@@ -151,6 +210,48 @@ test('valid partial shipping and non-shipping scope, deletion and rename, unchan
   assert.match(result.stdout, /raw scanner: exit=1; findings=18/);
   assert.match(result.stdout, /policy: ACCEPT; eligible=18; blocked=0/);
 });
+test('public checkout admits with the private state directory absent entirely', t => {
+  const f = fixture(t, { privateState: 'absent' });
+  assert.ok(!existsSync(path.join(f.root, 'state')), 'fixture must not create state/');
+  const result = f.run();
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /planning\/source coverage only; not completion or installed verification/);
+  assert.match(result.stdout, /policy: ACCEPT; eligible=18; blocked=0/);
+});
+test('public checkout admits with ignored private state present and unread', t => {
+  const f = fixture(t, { privateState: 'ignored' });
+  assert.ok(existsSync(path.join(f.root, queuePath)), 'fixture must place ignored private state on disk');
+  assert.equal(f.git('ls-files', '--', queuePath), '', 'private state must remain untracked');
+  assert.equal(f.git('check-ignore', '--quiet', queuePath) ?? '', '', 'private state must be ignored');
+  const result = f.run();
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /planning\/source coverage only; not completion or installed verification/);
+  assert.match(result.stdout, /policy: ACCEPT; eligible=18; blocked=0/);
+});
+test('a projection carried unchanged from an earlier release needs no ownership', t => {
+  const f = fixture(t);
+  const changed = f.git('diff', '--name-only', `${f.manifest.base_commit}..HEAD`).split('\n').filter(Boolean);
+  assert.ok(!changed.includes(projectionPath), 'fixture projection must predate this release');
+  assert.equal(f.run().status, 0);
+});
+test('a projection changed in this release and owned by the release task admits', t => {
+  const f = fixture(t);
+  f.write(projectionPath, { ...defaultProjection(),
+    tasks: [{ id: 1171, release_component: 'fixture-shipping' }, { id: 1172, release_component: 'fixture-notes' }] });
+  f.manifest.tasks[0].paths.push(projectionPath);
+  f.save();
+  assert.equal(f.manifest.release_task, 1171, 'task 1171 is the release task');
+  const result = f.run();
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /planning\/source coverage only/);
+});
+for (const component of ['a', 'fixture', 'fixture-shipping', 'tool-efficiency', 'a1-b2-c3', '0', 'x'.repeat(80)]) {
+  test(`accept release_component ${JSON.stringify(component.length > 20 ? `${component.slice(0, 8)}…(${component.length})` : component)}`, t => {
+    const projection = defaultProjection();
+    projection.tasks[0].release_component = component;
+    assert.equal(fixture(t, { projection }).run().status, 0);
+  });
+}
 
 const invalidManifest = {
   'wrong version': m => { m.version = '1.2.0'; },
@@ -171,6 +272,7 @@ const invalidManifest = {
   'uncovered rename old': m => { m.tasks[0].paths = m.tasks[0].paths.filter(p => p !== 'src/old-name.txt'); },
   'uncovered rename new': m => { m.tasks[0].paths = m.tasks[0].paths.filter(p => p !== 'src/new-name.txt'); },
   'unchanged claimed path': m => { m.tasks[0].paths.push('evidence/report.txt'); },
+  'unchanged claimed projection': m => { m.tasks[0].paths.push(projectionPath); },
   'manifest wrong owner': m => { m.tasks[0].paths = m.tasks[0].paths.filter(p => p !== manifestPath); m.tasks[1].paths.push(manifestPath); },
   'empty scope': m => { m.tasks[0].scope = ''; },
   'empty paths': m => { m.tasks[0].paths = []; },
@@ -227,7 +329,9 @@ test('committed changed evidence with stale hash', t => {
 for (const staged of [false, true]) test(`dirty tracked ${staged ? 'index' : 'worktree'}`, t => {
   const f = fixture(t); f.write('src/feature.txt', 'dirty'); if (staged) f.git('add', 'src/feature.txt'); rejects(f);
 });
-for (const name of ['package.json', 'state/task-queue.json', manifestPath, 'evidence/report.txt']) {
+// The queue entry that used to sit in this loop is gone because the queue is no longer an
+// admission input; the guard class it protected is preserved and extended to the projection.
+for (const name of ['package.json', projectionPath, manifestPath, 'evidence/report.txt']) {
   test(`reject symlink input ${name}`, t => {
     const f = fixture(t); const bytes = readFileSync(path.join(f.root, name));
     f.write('link-target.txt', bytes.toString()); rmSync(path.join(f.root, name));
@@ -243,21 +347,166 @@ test('reject symlink directory component', t => {
   symlinkSync('real-evidence', path.join(f.root, 'evidence'));
   f.manifest.tasks[0].paths.push('evidence/report.txt', 'evidence', 'real-evidence/report.txt'); f.save(); rejects(f);
 });
-test('legacy root-array queue is supported', t => {
-  const f = fixture(t); f.write('state/task-queue.json', f.queue.tasks);
-  f.manifest.tasks[0].paths.push('state/task-queue.json'); f.save();
-  const result = f.run(); assert.equal(result.status, 0, result.stderr);
+
+// §5c/§5d — the projection's own schema. Each case builds the fixture with an already-bad
+// projection, so the refusal cannot be confused with a changed-path ownership failure.
+function rejectProjection(label, projection, options = {}) {
+  test(`reject projection ${label}`, t => rejects(fixture(t, { ...options, projection })));
+}
+const withTasks = tasks => ({ ...defaultProjection(), tasks });
+const withTask = mutate => { const p = defaultProjection(); mutate(p.tasks[0]); return p; };
+const withTop = mutate => { const p = defaultProjection(); mutate(p); return p; };
+
+// Identity and membership (§5c).
+rejectProjection('absent file', false);
+rejectProjection('release task absent', withTasks([{ id: 1172, release_component: 'fixture-research' }]));
+rejectProjection('manifest task absent', withTasks([{ id: 1171, release_component: 'fixture-shipping' }]));
+rejectProjection('duplicate id', withTasks([{ id: 1171, release_component: 'a' }, { id: 1171, release_component: 'b' },
+  { id: 1172, release_component: 'c' }]));
+rejectProjection('negative id', withTasks([{ id: 1171, release_component: 'a' }, { id: 1172, release_component: 'b' },
+  { id: -1, release_component: 'c' }]));
+rejectProjection('zero id', withTasks([{ id: 1171, release_component: 'a' }, { id: 1172, release_component: 'b' },
+  { id: 0, release_component: 'c' }]));
+rejectProjection('noninteger id', withTasks([{ id: 1171, release_component: 'a' }, { id: 1172, release_component: 'b' },
+  { id: 1.5, release_component: 'c' }]));
+rejectProjection('string id', withTasks([{ id: '1171', release_component: 'a' }, { id: 1172, release_component: 'b' }]));
+rejectProjection('null task', withTasks([{ id: 1171, release_component: 'a' }, null]));
+rejectProjection('empty tasks', withTasks([]));
+rejectProjection('tasks not an array', withTop(p => { p.tasks = { 1171: 'fixture-shipping' }; }));
+rejectProjection('group mismatch', withTop(p => { p.release_group = 'other'; }));
+rejectProjection('empty group', withTop(p => { p.release_group = ''; }));
+rejectProjection('schema version 2', withTop(p => { p.schema_version = 2; }));
+rejectProjection('schema version string', withTop(p => { p.schema_version = '1'; }));
+
+// Privacy allowlist (§5d): every forbidden field is pinned individually. If any of these
+// admit, private state has re-entered the public projection.
+for (const [label, mutate] of Object.entries({
+  status: p => { p.status = 'done'; },
+  notes: p => { p.notes = 'private planning note'; },
+  approved: p => { p.approved = true; },
+  approval: p => { p.approval = 'Someone said approve'; },
+  queue: p => { p.queue = []; },
+  source: p => { p.source = queuePath; },
+})) rejectProjection(`top-level ${label}`, withTop(mutate));
+for (const [label, mutate] of Object.entries({
+  status: task => { task.status = 'done'; },
+  state: task => { task.state = 'in_progress'; },
+  done: task => { task.done = true; },
+  completed_at: task => { task.completed_at = '2026-09-21T00:00:00Z'; },
+  title: task => { task.title = 'Private task title'; },
+  notes: task => { task.notes = 'private note'; },
+  prompt: task => { task.prompt = 'private dispatch prompt'; },
+  dispatch: task => { task.dispatch = 'private dispatch'; },
+  session: task => { task.session = 'rt1171az-tester'; },
+  sid: task => { task.sid = 'rt1171az-tester'; },
+  attempt: task => { task.attempt = '00000000-0000-0000-0000-000000000000'; },
+  worker: task => { task.worker = 'claude'; },
+  worker_env: task => { task.worker_env = { HOME: '/Users/someone' }; },
+  role: task => { task.role = 'tester'; },
+  owner: task => { task.owner = 'someone'; },
+  path: task => { task.path = '/Users/someone/private'; },
+  approval_token: task => { task.approval_token = 'token'; },
+})) rejectProjection(`task field ${label}`, withTask(mutate));
+rejectProjection('missing release_component', withTask(task => { delete task.release_component; }));
+rejectProjection('missing id', withTask(task => { delete task.id; }));
+// The component is a neutral slug. Bounded-nonempty is NOT sufficient: path-like and
+// free-form text must be refused outright.
+for (const [label, component] of Object.entries({
+  empty: '',
+  whitespace: ' ',
+  'trailing space': 'fixture-shipping ',
+  'internal space': 'fixture shipping',
+  uppercase: 'Fixture-Shipping',
+  underscore: 'fixture_shipping',
+  'leading hyphen': '-fixture',
+  'trailing hyphen': 'fixture-',
+  'double hyphen': 'fixture--shipping',
+  dot: 'fixture.shipping',
+  'relative path': 'fixture/shipping',
+  'absolute path': '/Users/someone/private',
+  'parent path': '../outside',
+  'windows path': 'C:\\Users\\someone',
+  url: 'https://example.invalid/task',
+  'free-form sentence': 'Ship the private LifeContext notes',
+  'control character': 'fixture\u0001shipping',
+  newline: 'fixture\nshipping',
+  nul: 'fixture\u0000shipping',
+  'delete character': 'fixture\u007fshipping',
+  'C1 control': 'fixture\u009fshipping',
+  'non-ASCII': '한글-슬러그',
+  'over 80 chars': 'x'.repeat(81),
+  'long path-like': `${'a'.repeat(40)}/${'b'.repeat(40)}`,
+  number: 1171,
+  null: null,
+  boolean: true,
+  array: [],
+  object: {},
+})) rejectProjection(`release_component ${label}`, withTask(task => { task.release_component = component; }));
+// The permissive array-or-{tasks} dual shape is gone: a bare array is now refused, where the
+// queue reader used to accept it. This replaces the old `legacy root-array queue is
+// supported` acceptance rather than simply dropping it.
+rejectProjection('legacy root array', [{ id: 1171 }, { id: 1172 }]);
+rejectProjection('legacy root array with components',
+  [{ id: 1171, release_component: 'a' }, { id: 1172, release_component: 'b' }]);
+rejectProjection('ambiguous dual shape', { ...defaultProjection(), id: 1171 });
+rejectProjection('root string', '"release-1171"');
+rejectProjection('root number', '1171');
+rejectProjection('root null', 'null');
+
+// §5e — path and byte safety, inherited from read()/json() and pinned so it cannot regress.
+rejectProjection('malformed JSON', '{');
+rejectProjection('duplicate key', '{"schema_version":1,"schema_version":1,"release_group":"fixture-group","tasks":[{"id":1171,"release_component":"a"}]}');
+rejectProjection('invalid UTF-8', Buffer.from([0x7b, 0xff, 0x7d]));
+rejectProjection('oversized', `${' '.repeat(16 * 1024 * 1024 + 1)}${JSON.stringify(defaultProjection())}`);
+test('reject untracked projection', t => {
+  const f = fixture(t); f.git('rm', '--cached', projectionPath);
+  f.git('commit', '--no-gpg-sign', '-m', 'untrack projection');
+  assert.equal(f.git('ls-files', '--', projectionPath), '', 'projection must be untracked at CLI assertion');
+  assert.ok(existsSync(path.join(f.root, projectionPath)), 'untracked projection still exists');
+  rejects(f);
 });
-for (const [name, queue] of Object.entries({
-  duplicate: [{ id: 1171 }, { id: 1171 }, { id: 1172 }],
-  invalid: [{ id: 1171 }, { id: 1172 }, { id: -1 }],
-  unknown: [{ id: 1171 }],
-  malformed: 'not JSON',
-  ambiguous: { tasks: [], queue: [{ id: 1171 }, { id: 1172 }] },
-})) test(`reject ${name} queue`, t => {
-  const f = fixture(t); f.write('state/task-queue.json', queue);
-  f.manifest.tasks[0].paths.push('state/task-queue.json'); f.save(); rejects(f);
+test('reject projection hidden behind assume-unchanged', t => {
+  const f = fixture(t);
+  f.git('update-index', '--assume-unchanged', projectionPath);
+  f.write(projectionPath, { ...defaultProjection(), tasks: [{ id: 9999, release_component: 'forged' }] });
+  const result = f.run();
+  assert.notEqual(result.status, 0, 'committed-byte drift must refuse');
+  assert.match(result.stderr, /Index flags prevent complete tracked-source validation|differs from committed bytes/);
+  assert.doesNotMatch(result.stdout, /planning\/source coverage only/);
 });
+test('reject case-aliased projection', t => {
+  const f = fixture(t);
+  const blob = f.git('rev-parse', `HEAD:${projectionPath}`);
+  f.git('update-index', '--add', '--cacheinfo', `100644,${blob},release/Tasks.json`);
+  f.git('-c', 'core.hooksPath=/dev/null', 'commit', '--no-gpg-sign', '-m', 'case alias');
+  const tracked = f.git('ls-files', '--', 'release/').split('\n');
+  assert.ok(tracked.includes(projectionPath) && tracked.includes('release/Tasks.json'),
+    'both spellings must be tracked for this pin to mean anything');
+  rejects(f);
+});
+test('reject symlinked projection parent directory', t => {
+  // release/ also holds the manifest and the security records, so this pins the whole
+  // planning directory rather than the projection alone.
+  const f = fixture(t);
+  renameSync(path.join(f.root, 'release'), path.join(f.root, 'real-release'));
+  symlinkSync('real-release', path.join(f.root, 'release'));
+  f.commit(); rejects(f);
+});
+test('reject projection changed but uncovered by the manifest', t => {
+  const f = fixture(t);
+  f.write(projectionPath, { ...defaultProjection(),
+    tasks: [{ id: 1171, release_component: 'fixture-shipping' }, { id: 1172, release_component: 'fixture-notes' }] });
+  f.save(); rejects(f);
+});
+test('reject projection changed but owned by a non-release task', t => {
+  const f = fixture(t);
+  f.write(projectionPath, { ...defaultProjection(),
+    tasks: [{ id: 1171, release_component: 'fixture-shipping' }, { id: 1172, release_component: 'fixture-notes' }] });
+  f.manifest.tasks[1].paths.push(projectionPath);
+  assert.notEqual(f.manifest.tasks[1].task_id, f.manifest.release_task, 'task 1172 is not the release task');
+  f.save(); rejects(f);
+});
+
 test('wrong root subdirectory', t => { const f = fixture(t); rejects(f, ['--root', path.join(f.root, 'src'), '--version', '1.1.0']); });
 test('non-Git root', t => { const f = fixture(t); rmSync(path.join(f.root, '.git'), { recursive: true }); rejects(f); });
 for (const args of [ ['--unknown'], ['--version', '1.1.0', '--version', '1.1.0'], ['--root'],
@@ -378,6 +627,52 @@ function replaceBlob(f, policy, id, bytes) {
   policy.release.planning_manifest_sha256 = digest(readFileSync(path.join(f.root, manifestPath)));
 }
 
+// §5f — the security boundary. The projection must be excluded from the scanner inventory
+// and from the scan scope, exactly as the private queue already is; neither exclusion may be
+// traded for the other.
+test('security inventory cannot name the projection', t => {
+  const f = fixture(t);
+  f.save(policy => {
+    const bytes = readFileSync(path.join(f.root, projectionPath));
+    policy.files.push({ id: 'projection', kind: 'source', path: projectionPath, bytes: bytes.length, sha256: digest(bytes) });
+    policy.candidate.source_ids.push('projection');
+  });
+  securityRefuses(f, {}, /Invalid or duplicate inventory path/);
+});
+test('security scope cannot name the projection', t => {
+  const f = fixture(t); f.scope.roots.push(projectionPath); f.save();
+  securityRefuses(f, {}, /Scope includes planning or security records/);
+});
+test('security scope cannot name the projection as a leaf', t => {
+  const f = fixture(t); f.scope.leaves.push(projectionPath); f.save();
+  securityRefuses(f, {}, /Scope includes planning or security records/);
+});
+// The private queue's exclusion is additive, not replaced. These use the committed-queue
+// fixture so the refusal cannot come from the path merely being untracked.
+test('security inventory cannot name the private queue', t => {
+  const f = fixture(t, { privateState: 'committed' });
+  assert.notEqual(f.git('ls-files', '--', queuePath), '', 'queue must be tracked for this pin to discriminate');
+  f.save(policy => {
+    const bytes = readFileSync(path.join(f.root, queuePath));
+    policy.files.push({ id: 'queue', kind: 'source', path: queuePath, bytes: bytes.length, sha256: digest(bytes) });
+    policy.candidate.source_ids.push('queue');
+  });
+  securityRefuses(f, {}, /Invalid or duplicate inventory path/);
+});
+test('security scope cannot name the private queue', t => {
+  const f = fixture(t, { privateState: 'committed' });
+  assert.notEqual(f.git('ls-files', '--', queuePath), '', 'queue must be tracked for this pin to discriminate');
+  f.scope.roots.push(queuePath); f.save();
+  securityRefuses(f, {}, /Scope includes planning or security records/);
+});
+test('a tracked private queue does not change admission', t => {
+  // Admission must not read the queue even when one happens to be present.
+  const f = fixture(t, { privateState: 'committed' });
+  const result = f.run();
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /policy: ACCEPT; eligible=18; blocked=0/);
+});
+
 test('complete zero-result record accepts only raw exit zero', t => {
   const f = fixture(t);
   f.sarif.runs[0].results = []; f.policy.findings = [];
@@ -452,6 +747,7 @@ const invalidPolicy = {
   'evidence supplied path': p => { p.files.find(file => file.id === 'proof').path = 'evidence/report.txt'; },
   'security self inventory': p => { p.files[0].path = policyPath; },
   'planning self inventory': p => { p.files[0].path = manifestPath; },
+  'projection self inventory': p => { p.files[0].path = projectionPath; },
 };
 for (const coordinate of ['startLine', 'startColumn', 'endLine', 'endColumn']) {
   test(`security rejects exact ${coordinate} join`, t => {

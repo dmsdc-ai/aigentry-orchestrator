@@ -10,6 +10,11 @@ const MAX_FILE = 16 * 1024 * 1024;
 const MAX_QUEUE = 64 * 1024 * 1024;
 const MAX_ENTRIES = 100000;
 const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+// Public component slug syntax: lowercase alphanumeric segments joined by single
+// hyphens. This bounds the form only — it refuses paths, whitespace and control
+// characters, but a syntactically valid slug can still carry private meaning, so
+// what a slug discloses remains a maintainer review question, not a check here.
+const COMPONENT = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 class AdmissionError extends Error {}
 function requireThat(condition, message) {
   if (!condition) throw new AdmissionError(message);
@@ -220,12 +225,19 @@ function main() {
   requireThat(base === manifest.base_commit && base !== git('rev-parse', '--verify', 'HEAD').toString().trim(),
     'Base commit mismatch or base equals HEAD');
   git('merge-base', '--is-ancestor', base, 'HEAD');
-  const queue = json('state/task-queue.json', MAX_QUEUE);
-  requireThat(Array.isArray(queue) || (object(queue) && Array.isArray(queue.tasks) && !Object.hasOwn(queue, 'id')),
-    'Invalid or ambiguous task queue shape');
+  // Committed public projection of the release group's task IDs; the private queue
+  // stays the sole task authority and is never read, copied or published here.
+  const projectionPath = 'release/tasks.json';
+  const projection = json(projectionPath);
+  exact(projection, ['schema_version', 'release_group', 'tasks']);
+  requireThat(projection.schema_version === 1 && projection.release_group === manifest.release_group,
+    'Projection schema or release group mismatch');
   const ids = new Set();
-  for (const task of list(Array.isArray(queue) ? queue : queue.tasks)) {
-    requireThat(object(task) && positiveId(task.id) && !ids.has(task.id), 'Invalid or duplicate queue task ID');
+  for (const task of list(projection.tasks)) {
+    exact(task, ['id', 'release_component']);
+    requireThat(positiveId(task.id) && !ids.has(task.id) &&
+      typeof task.release_component === 'string' && task.release_component.length <= 80 &&
+      COMPONENT.test(task.release_component), 'Invalid or duplicate projected task');
     ids.add(task.id);
   }
   requireThat(ids.has(manifest.release_task), 'Unknown release task');
@@ -262,6 +274,9 @@ function main() {
   }
   requireThat(owners.size === changed.size, 'Changed paths are uncovered');
   requireThat(owners.get(manifestPath) === manifest.release_task, 'Manifest must be changed and owned by release task');
+  // A projection carried over unchanged from an earlier release needs no ownership.
+  requireThat(!changed.has(projectionPath) || owners.get(projectionPath) === manifest.release_task,
+    'Projection must be owned by the release task');
   console.log(`Release admission ${version}; group=${JSON.stringify(manifest.release_group)}; tasks=${taskIds.size}; paths=${changed.size}; planning/source coverage only; not completion or installed verification`);
   security({ read, git, pkg, version, manifest, manifestPath, planningEvidence });
 }
@@ -287,7 +302,8 @@ function security({ read, git, pkg, version, manifest, manifestPath, planningEvi
   }
   const prefix = `release/security/${version}/`;
   const planningOrSecurity = name => name === 'release/security' || name.startsWith('release/security/') ||
-    /^release\/\d+\.\d+\.\d+\.json$/.test(name) || name === 'state/task-queue.json' || planningEvidence.has(name);
+    /^release\/\d+\.\d+\.\d+\.json$/.test(name) || name === 'state/task-queue.json' ||
+    name === 'release/tasks.json' || planningEvidence.has(name);
   const policyBytes = input(`${prefix}policy.json`);
   requireThat(sha(policyBytes) === pin, 'Security policy trust pin mismatch');
   const policy = parse(policyBytes);

@@ -26,6 +26,13 @@ concurrency.
 See [docs/setup/dispatch-capacity.md](docs/setup/dispatch-capacity.md) for the
 knob's semantics and how to measure a value for your own host.
 
+## Release task projection
+
+Release admission reads the committed public task-ID projection
+`release/tasks.json`, not the private task queue. See
+[release/PROJECTION.md](release/PROJECTION.md) for its schema, provenance, and what
+it does and does not prove.
+
 ## Scope
 
 Orchestration infra for the aigentry ecosystem — not a standalone tool, and intentionally minimal here. Session transport is [telepty](https://github.com/dmsdc-ai/aigentry-telepty); multi-AI debate is [deliberation](https://github.com/dmsdc-ai/aigentry-deliberation); developer tooling is [devkit](https://github.com/dmsdc-ai/aigentry-devkit).
