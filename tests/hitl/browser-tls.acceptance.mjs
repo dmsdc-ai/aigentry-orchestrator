@@ -78,6 +78,15 @@ function childEnv(home) {
   return { PATH: process.env.PATH, HOME: home, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8',
     TMPDIR: temporary, XDG_CONFIG_HOME: join(home, '.config'), XDG_CACHE_HOME: join(home, '.cache') };
 }
+// Headed Chromium needs an X display, so exactly two further names are propagated, and only
+// to the browser: the display `xvfb-run` started and the cookie file it owns. `childEnv` stays
+// display-free, so the HITL services, the CLI children and `--validate-receipt` keep the
+// environment they already had; none of these values is ever printed, remembered or recorded.
+let displayName = null, cookieFile = null;
+function browserEnv(home) {
+  check(typeof displayName === 'string' && typeof cookieFile === 'string');
+  return { ...childEnv(home), DISPLAY: displayName, XAUTHORITY: cookieFile };
+}
 function child(command, args, home = temporary) {
   check(!stopping);
   const proc = spawn(command, args, { cwd: ROOT, env: childEnv(home), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
@@ -318,11 +327,14 @@ async function browser(chromium, certs, trusted) {
   const owner = { record, members: new Map(), context: null, settled: false };
   browsers.add(owner);
   const launch = chromium.launchPersistentContext(join(home, 'profile'), {
-    channel: 'chromium', headless: true, chromiumSandbox: true, ignoreHTTPSErrors: false,
+    // Headed on the Xvfb display. The lifecycle controls observe real tab visibility, which
+    // the measured headless run of this exact fixture did not produce. Sandbox, channel and
+    // certificate handling are unchanged; only the display mode differs.
+    channel: 'chromium', headless: false, chromiumSandbox: true, ignoreHTTPSErrors: false,
     // The caller handles both signals through verified cleanup and receipt invalidation.
     // Playwright's own SIGINT handler exits the process before that work completes.
     handleSIGINT: false, handleSIGTERM: false,
-    executablePath: executable, env: childEnv(home), timeout: 20000,
+    executablePath: executable, env: browserEnv(home), timeout: 20000,
   }).then(context => {
     owner.context = context; contexts.set(context, owner); return context;
   }).finally(() => { owner.settled = true; });
@@ -830,6 +842,22 @@ async function main() {
   check(/^[a-f0-9]{40}$/.test(process.env.GITHUB_SHA ?? '') && process.env.RUNNER_ENVIRONMENT === 'github-hosted');
   check(!process.env.NODE_TLS_REJECT_UNAUTHORIZED && !process.env.NODE_EXTRA_CA_CERTS && !process.env.NODE_OPTIONS);
   check(/^ubuntu\d+$/.test(process.env.ImageOS ?? '') && /^[\d.]+$/.test(process.env.ImageVersion ?? ''));
+  // Headed prerequisite, proven inside the `runner` control before any launch, so a missing
+  // or unsafe display fails here as a named control instead of as an unexplained browser
+  // timeout. `xvfb-run` exports both names; a bare `:N` display is local to this runner and
+  // never listens on tcp, and the cookie must be a real file this same uid alone can read.
+  displayName = process.env.DISPLAY ?? '';
+  cookieFile = process.env.XAUTHORITY ?? '';
+  check(/^:\d+(?:\.\d+)?$/.test(displayName) && cookieFile.startsWith('/'));
+  await safeAncestors(dirname(cookieFile));
+  // The cookie is the display credential, so its directory must be this uid alone: with the
+  // directory closed no other account can reach the file at all, which holds whichever way
+  // the wrapper created it. The file itself is then only required to be an owned regular
+  // file no other account may write. Both are names and bits, never contents or a path.
+  const cookieDir = await lstat(dirname(cookieFile));
+  check(cookieDir.isDirectory() && cookieDir.uid === process.getuid() && (cookieDir.mode & 0o077) === 0);
+  const cookie = await lstat(cookieFile);
+  check(cookie.isFile() && !cookie.isSymbolicLink() && cookie.uid === process.getuid() && (cookie.mode & 0o022) === 0);
   await safeAncestors(process.env.RUNNER_TEMP);
   temporary = await mkdtemp(join(process.env.RUNNER_TEMP, 'browser-tls-private-'));
   process.umask(0o077);

@@ -72,11 +72,31 @@ jobs:
           set -euo pipefail
           node -e "const p=require('playwright/package.json');const b=JSON.parse(require('node:fs').readFileSync(require('node:path').join(require('node:path').dirname(require.resolve('playwright-core/package.json')),'browsers.json'))).browsers.find(x=>x.name==='chromium');if(p.version!=='1.58.2'||b.revision!=='1208'||b.browserVersion!=='145.0.7632.6')process.exit(1)"
           npx --no-install playwright install --with-deps chromium
+      # No new dependency: the step above already pulled Xvfb and xauth in as Chromium's
+      # documented headed prerequisites. This only proves they are present before the
+      # acceptance run, so a missing tool fails as a named preflight rather than as a
+      # ten-minute browser timeout. Nothing is installed, downloaded or version-pinned here.
+      - name: Preflight virtual display tools for headed Chromium
+        run: |
+          set -euo pipefail
+          command -v Xvfb
+          command -v xvfb-run
+          command -v xauth
       - name: Actual browser, WebAuthn and TLS controls
         env:
           BROWSER_TLS_RECEIPT: ${{ runner.temp }}/browser-tls-receipt.json
           CONSOLE_UI_ARTIFACTS: ${{ runner.temp }}/console-ui-artifacts
-        run: npm run test:browser-tls
+        # Headed Chromium on a private virtual display owned by this non-root ephemeral
+        # runner. `-a` picks a free server number; `-nolisten tcp` keeps the display off the
+        # network entirely; `xvfb-run` creates the X authority cookie under the runner's own
+        # uid and exports only DISPLAY and XAUTHORITY, which is all the acceptance forwards
+        # to the browser. X authentication stays on and no sandbox or TLS flag changes.
+        # `umask 077` first so the authority cookie the wrapper creates is owner-only by
+        # construction rather than by whatever default the image happens to carry.
+        run: |
+          set -euo pipefail
+          umask 077
+          xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp" npm run test:browser-tls
         timeout-minutes: 10
       - name: Validate complete receipt against this checkout
         env:
