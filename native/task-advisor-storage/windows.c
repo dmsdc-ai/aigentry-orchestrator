@@ -37,6 +37,8 @@
 #include <windows.h>
 #include <winioctl.h>
 
+#include <fcntl.h>
+#include <io.h>
 #include <stdio.h>
 #include <wchar.h>
 
@@ -76,6 +78,10 @@ static BOOL device_path(const wchar_t *volume_path, wchar_t *out, DWORD out_char
 }
 
 int wmain(int argc, wchar_t **argv) {
+  /* The protocol line is byte-exact; text mode would emit CRLF. Must precede
+   * every emission below, including the wrong-arity refusal. */
+  if (_setmode(_fileno(stdout), _O_BINARY) == -1) return 1;
+
   if (argc != 2) return refuse("error");
 
   wchar_t full[MAX_PATH];
