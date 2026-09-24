@@ -4,6 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { unavailableAuth } from './auth-port.js';
 import { createAuth, provisionOwner } from './auth.js';
 import { startServer, type ServerConfig } from './server.js';
+import { readConsoleConfig } from './console-read-model.js';
 
 async function tlsFile(path: string): Promise<Buffer> {
   if (!isAbsolute(path)) throw new Error('invalid_tls_path');
@@ -15,7 +16,7 @@ export async function main(args: readonly string[]): Promise<void> {
   const command = args[0];
   if (command !== 'serve' && command !== 'provision-owner') throw new Error('invalid_command');
   const allowed = command === 'serve'
-    ? ['--hitl-root', '--port', '--tls-key', '--tls-cert', '--auth-root']
+    ? ['--hitl-root', '--port', '--tls-key', '--tls-cert', '--auth-root', '--console-config']
     : ['--auth-root', '--invitation-path'];
   const flags = new Map<string, string>();
   for (let i = 1; i < args.length; i += 2) {
@@ -40,6 +41,11 @@ export async function main(args: readonly string[]): Promise<void> {
   if (!!key !== !!cert) throw new Error('invalid_tls_config');
   if ((key && !isAbsolute(key)) || (cert && !isAbsolute(cert))) throw new Error('invalid_tls_path');
   const config: ServerConfig = { host: '127.0.0.1', port: Number(port), hitlRoot: root, auth: unavailableAuth() };
+  const consolePath = flags.get('--console-config');
+  if (consolePath) {
+    if (!key || !cert || !authRoot) throw new Error('console_requires_tls_and_auth');
+    config.console = await readConsoleConfig(consolePath);
+  }
   if (key && cert) config.tls = { key: await tlsFile(key), cert: await tlsFile(cert) };
   if (authRoot) {
     config.auth = await createAuth(Object.freeze({
@@ -53,7 +59,7 @@ export async function main(args: readonly string[]): Promise<void> {
     await config.auth.close().catch(() => undefined);
     throw error;
   });
-  process.stdout.write(`Approval inbox: ${service.origin} (authentication ${config.auth.status().state}; login required for private reads; decisions disabled)\n`);
+  process.stdout.write(`Task Console / approval inbox: ${service.origin} (authentication ${config.auth.status().state}; login required for private reads; decisions disabled)\n`);
   const shutdown = (): void => {
     process.removeListener('SIGINT', shutdown);
     process.removeListener('SIGTERM', shutdown);
@@ -65,7 +71,7 @@ export async function main(args: readonly string[]): Promise<void> {
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   void main(process.argv.slice(2)).catch(() => {
-    process.stderr.write('Inbox unavailable: invalid command/configuration, provisioning or listener failure. Use serve --hitl-root <absolute-path> [--port <1-65535>] [--auth-root <absolute-path>] [--tls-key <absolute-path> --tls-cert <absolute-path>], or provision-owner --auth-root <absolute-path> --invitation-path <absolute-path>.\n');
+    process.stderr.write('Inbox unavailable: invalid command/configuration, provisioning or listener failure. Use serve --hitl-root <absolute-path> [--port <1-65535>] [--auth-root <absolute-path>] [--tls-key <absolute-path> --tls-cert <absolute-path>] [--console-config <absolute-path>], or provision-owner --auth-root <absolute-path> --invitation-path <absolute-path>. Console requires TLS and auth.\n');
     process.exitCode = 1;
   });
 }

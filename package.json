@@ -41,6 +41,7 @@
     "docs/rules.md",
     "docs/model-profiles/model-routing-profile.md",
     "docs/setup/dispatch-capacity.md",
+    "docs/setup/task-console.md",
     "docs/templates",
     "git-hooks",
     "AGENTS.md",

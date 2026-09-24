@@ -4,10 +4,13 @@ import { isAbsolute } from 'node:path';
 import type { AuthPort } from './auth-port.js';
 import { html, css, js } from './assets.js';
 import { readRequests, validId, type View } from './read-model.js';
+import { createConsoleReader, ConsoleError } from './console-read-model.js';
+import type { ConsoleConfig, ConsoleView } from './console-contracts.js';
 
 export interface ServerConfig {
   host: '127.0.0.1'; port: number; hitlRoot: string; auth: AuthPort;
   tls?: Readonly<{ key: Buffer; cert: Buffer }>;
+  console?: ConsoleConfig;
 }
 const authRoutes = new Set(['/auth/preauth', '/auth/enroll/options', '/auth/enroll/verify', '/auth/login/options', '/auth/login/verify', '/auth/logout']);
 function json(res: ServerResponse, status: number, value: unknown): void {
@@ -29,6 +32,7 @@ export async function startServer(config: Readonly<ServerConfig>) {
   const auth = config.auth;
   const root = config.hitlRoot;
   const secure = !!config.tls;
+  const consoleReader = config.console ? createConsoleReader(config.console) : null;
   let origin = '';
   let authority = '';
   let windowStart = Date.now(), requests = 0, active = 0;
@@ -36,7 +40,7 @@ export async function startServer(config: Readonly<ServerConfig>) {
     headers(res);
     const now = Date.now();
     if (now - windowStart >= 60000) { windowStart = now; requests = 0; }
-    if (++requests > 300 || active >= 16) { json(res, 429, { error: 'rate_limited' }); return; }
+    if (++requests > 300 || active >= 16) { res.setHeader('Retry-After', '15'); json(res, 429, { error: 'rate_limited' }); return; }
     active++;
     try {
       const hosts = req.rawHeaders.filter((_, index) => index % 2 === 0 && req.rawHeaders[index]?.toLowerCase() === 'host');
@@ -61,7 +65,7 @@ export async function startServer(config: Readonly<ServerConfig>) {
         if (asset) { res.writeHead(200, { 'Content-Type': `${asset[1]}; charset=utf-8` }); res.end(asset[0]); return; }
         if (url.pathname === '/api/capabilities') {
           const authState = secure ? state.state : 'setup_required';
-          json(res, 200, { auth: { state: authState, reason: authState === 'ready' ? null : authState }, binding: { state: 'unavailable', reason: 'legacy_unbound' }, decision: { state: 'unavailable', reason: 'binding_unavailable' }, relay: { state: 'unavailable', reason: 'not_integrated' }, ACK: { state: 'unavailable', reason: 'not_integrated' }, mobile: { state: 'unavailable', reason: 'loopback_only' } }); return;
+          json(res, 200, { auth: { state: authState, reason: authState === 'ready' ? null : authState }, console: { state: consoleReader ? 'configured' : 'unavailable', reason: consoleReader ? null : 'not_configured' }, binding: { state: 'unavailable', reason: 'legacy_unbound' }, decision: { state: 'unavailable', reason: 'binding_unavailable' }, relay: { state: 'unavailable', reason: 'not_integrated' }, ACK: { state: 'unavailable', reason: 'not_integrated' }, mobile: { state: 'unavailable', reason: 'loopback_only' } }); return;
         }
       }
       if (authRoutes.has(url.pathname)) {
@@ -74,6 +78,27 @@ export async function startServer(config: Readonly<ServerConfig>) {
       if (!ready) { json(res, 503, { error: 'auth_unavailable' }); return; }
       const principal = await auth.authenticate(req);
       if (!principal || !principal.id || !principal.credentialId || !principal.sessionId || !Number.isFinite(principal.expiresAt) || principal.expiresAt <= Date.now() || auth.status().state !== 'ready') { json(res, 401, { error: 'authentication_required' }); return; }
+      if (url.pathname.startsWith('/api/console/')) {
+        if (req.method !== 'GET') { res.setHeader('Allow', 'GET'); json(res, 405, { error: 'method_refused' }); return; }
+        if (!consoleReader) { json(res, 503, { error: 'console_unavailable' }); return; }
+        if (url.pathname === '/api/console/v1/projects' && !url.search) {
+          json(res, 200, { items: consoleReader.projects(principal.id), advisor: { configuredDefault: true, observation: 'unknown' }, loop: { state: 'unavailable', reason: 'activation_not_verified' } }); return;
+        }
+        const route = /^\/api\/console\/v1\/(tasks|requests|releases|approvals|evidence)(?:\/([A-Za-z0-9_-]+))?$/.exec(url.pathname);
+        if (!route) { json(res, 404, { error: 'not_found' }); return; }
+        try {
+          const data = await consoleReader.read(principal.id, url.searchParams.get('project') ?? '', route[1] as ConsoleView, url.searchParams, route[2]);
+          // Source I/O may outlive a session: never send a private result after expiry/revocation.
+          const current = await auth.authenticate(req);
+          if (!current || current.id !== principal.id || current.sessionId !== principal.sessionId || current.expiresAt <= Date.now() || auth.status().state !== 'ready') { json(res, 401, { error: 'authentication_required' }); return; }
+          json(res, data.coverage === 'unavailable' ? 503 : 200, data);
+        } catch (error) {
+          if (!(error instanceof ConsoleError)) throw error;
+          if (error.status === 429) res.setHeader('Retry-After', '15');
+          json(res, error.status, { error: error.message });
+        }
+        return;
+      }
       if (req.method === 'POST') { json(res, 503, { error: 'decisions_disabled' }); return; }
       const match = /^\/api\/requests(?:\/([^/]+))?$/.exec(url.pathname);
       if (!match) { json(res, 404, { error: 'not_found' }); return; }
