@@ -9,8 +9,8 @@ import http from 'node:http';
 import https from 'node:https';
 import {
   CONSOLE_IDS, CONSOLE_PORT, CONSOLE_STAGES, LOGIN_SUBSTAGES, artifactsDir, consoleAcceptance, consoleCallerPath,
-  consoleFixtures, consoleStage, invalidConfigRefusal, loginSubstage, prepareArtifacts, setConsoleStage, unconfiguredRefusal,
-  validateConsoleArtifacts,
+  consoleFixtures, consoleStage, invalidConfigRefusal, loginBoundarySnapshot, loginSubstage, prepareArtifacts,
+  renderLoginBoundary, setConsoleStage, unconfiguredRefusal, validateConsoleArtifacts,
 } from './console-ui.acceptance.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -903,5 +903,15 @@ await entry().catch(() => {
   const seen = Number.isSafeInteger(assertions) && assertions >= 0 ? assertions : -1;
   process.stderr.write(`browser-tls acceptance: observed (stage=${CONSOLE_STAGES.includes(stage) ? stage : 'unknown'}`
     + ` substage=${LOGIN_SUBSTAGES.includes(substage) ? substage : 'unknown'} checks-seen=${seen})\n`);
+  // The substage names WHICH wait never satisfied; this line names the boundary it was
+  // blocked behind: sign-in still pending, credential failure, server authentication
+  // refusal, projects/list refusal, or a workspace that opened with the wrong row set.
+  // Every field is a closed-enum name, a y/n/u flag, a bounded count or a bounded HTTP
+  // status code, clamped again by the renderer, so no observed value can reach it. No
+  // check reads it and it goes to stderr only: the receipt and its observations are
+  // untouched, and a renderer fault cannot disturb this handler's exit.
+  let boundary = 'boundary=unavailable captured=u';
+  try { boundary = renderLoginBoundary(loginBoundarySnapshot()); } catch { boundary = 'boundary=unavailable captured=u'; }
+  process.stderr.write(`browser-tls acceptance: login-boundary (${boundary})\n`);
   process.exitCode = 1;
 });

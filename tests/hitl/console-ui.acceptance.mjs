@@ -53,6 +53,152 @@ export function setLoginSubstage(name) {
   if (!LOGIN_SUBSTAGES.includes(name)) throw new Error('acceptance_failed');
   currentLoginSubstage = name;
 }
+// Diagnostics only, one level below the substage and only for the post-click wait that
+// actual CI now reports (`login-ui` / `workspace-rows`). The substage names WHICH wait
+// never satisfied; it cannot name WHY. These are the boundaries that one wait can be
+// blocked behind, as a CLOSED enum. Nothing here is an assertion, no check reads one,
+// and nothing here relaxes, skips, retries or lengthens any existing wait.
+export const LOGIN_BOUNDARIES = ['not-captured', 'unavailable', 'ceremony-not-started',
+  'signin-pending', 'credential-failure', 'auth-server-refusal', 'projects-refusal',
+  'workspace-not-opened', 'workspace-rows-mismatch', 'indeterminate'];
+// Route CLASSES only. The allowlist below is static test data; an observed URL is
+// classified in memory and discarded on the same line. No URL, path, query, header,
+// body, cookie, token or error string is ever retained or printed.
+export const ROUTE_CLASSES = ['auth-preauth', 'auth-login-options', 'auth-login-verify',
+  'capabilities', 'projects', 'tasks', 'other'];
+const EXACT_ROUTES = new Map([['/auth/preauth', 'auth-preauth'],
+  ['/auth/login/options', 'auth-login-options'], ['/auth/login/verify', 'auth-login-verify'],
+  ['/api/capabilities', 'capabilities'], ['/api/console/v1/projects', 'projects']]);
+const TASKS_ROUTE = '/api/console/v1/tasks';
+export function classifyRoute(pathname) {
+  if (typeof pathname !== 'string') return 'other';
+  const exact = EXACT_ROUTES.get(pathname);
+  if (exact) return exact;
+  return pathname === TASKS_ROUTE || pathname.startsWith(`${TASKS_ROUTE}/`) ? 'tasks' : 'other';
+}
+// The product renders a fixed set of literal status messages. The live text is compared
+// against this exact allowlist INSIDE the page and only the class is returned, so the raw
+// text never crosses back into Node and never enters a retained diagnostic object.
+const STATUS_TEXTS = [
+  ['Sign in with your passkey.', 'guest-prompt'],
+  ['Signing in…', 'signing-in'],
+  ['Creating passkey…', 'creating-passkey'],
+  ['Loading…', 'loading'],
+  ['Sign-in or enrollment failed. Retry with a supported passkey and valid invitation.', 'ceremony-failed'],
+  ['Sign in required.', 'signin-required'],
+  ['Forbidden: no access to this project.', 'forbidden-project'],
+  ['Forbidden: no project grants configured.', 'forbidden-no-grants'],
+  ['Source or service unavailable.', 'service-unavailable'],
+  ['Recorded queue status · Execution and acceptance unknown.', 'ready-recorded'],
+];
+export const STATUS_CLASSES = ['absent', 'other', ...STATUS_TEXTS.map(pair => pair[1])];
+export const STATUS_STATES = ['absent', 'unknown', 'authentication', 'loading', 'error',
+  'forbidden', 'stale', 'offline', 'unavailable', 'ready', 'partial', 'complete'];
+const OBSERVER_LIMIT = 200, PROBE_MS = 4000;
+const emptyRoutes = () => Object.fromEntries(ROUTE_CLASSES.map(name =>
+  [name, { seen: 0, ok: 0, refused: 0, failed: 0, code: 0 }]));
+let routeTally = emptyRoutes(), observedPage = null, onResponse = null, onRequestFailed = null;
+// Side-effect-free: the listeners only increment integers on a private tally. No Response,
+// Request, URL or error object is retained; nothing is aborted, fulfilled, mutated or
+// answered; no navigator API, product handler or credential path is patched. The tally is
+// bounded by OBSERVER_LIMIT and never touches the caller's own response budget.
+function startLoginObserver(page) {
+  stopLoginObserver();
+  routeTally = emptyRoutes();
+  let total = 0;
+  const bucket = value => {
+    if (total >= OBSERVER_LIMIT) return null;
+    total++;
+    let pathname = null;
+    try { pathname = new URL(value.url()).pathname; } catch { return null; }
+    return routeTally[classifyRoute(pathname)];
+  };
+  onResponse = response => {
+    const entry = bucket(response);
+    if (!entry) return;
+    entry.seen++;
+    const code = response.status();
+    if (!Number.isSafeInteger(code) || code < 100 || code > 599) return;
+    entry.code = code;
+    if (code < 400) entry.ok++; else entry.refused++;
+  };
+  onRequestFailed = request => { const entry = bucket(request); if (entry) entry.failed++; };
+  observedPage = page;
+  page.on('response', onResponse);
+  page.on('requestfailed', onRequestFailed);
+}
+// Removed with the page it was attached to: both listeners come off before `loginUI`
+// returns or rethrows, so nothing survives into a later stage or the caller's cleanup.
+function stopLoginObserver() {
+  if (observedPage) {
+    try { if (onResponse) observedPage.off('response', onResponse); } catch {}
+    try { if (onRequestFailed) observedPage.off('requestfailed', onRequestFailed); } catch {}
+  }
+  observedPage = null; onResponse = null; onRequestFailed = null;
+}
+// Read-only DOM probe. It classifies in the page and returns closed-enum names, booleans
+// and bounded counts only: no text, markup, attribute value, URL or error text escapes.
+const PROBE = input => {
+  const node = document.querySelector('#status');
+  const pair = node ? input.texts.find(entry => entry[0] === node.textContent) : null;
+  const state = node ? node.getAttribute('data-state') : null;
+  const hidden = selector => { const found = document.querySelector(selector); return found ? found.hidden === true : null; };
+  const count = selector => { const size = document.querySelectorAll(selector).length; return Number.isSafeInteger(size) && size >= 0 && size <= 999 ? size : -1; };
+  return {
+    statusClass: node ? (pair ? pair[1] : 'other') : 'absent',
+    statusState: node ? (input.states.includes(state) ? state : 'unknown') : 'absent',
+    workspaceHidden: hidden('#workspace'), authHidden: hidden('#auth'), logoutHidden: hidden('#logout'),
+    rows: count('#requests li'), projectOptions: count('#project option'),
+  };
+};
+// Pure and total, so the printed line can be re-derived by hand. Precedence follows the
+// product's own order: the workspace either opened (then only the row set can be wrong),
+// or the sign-in stopped at the server, at the projects grant, or at the ceremony itself.
+export function deriveLoginBoundary(dom, routes) {
+  if (!dom || typeof dom !== 'object') return 'unavailable';
+  const tally = name => (routes && typeof routes === 'object' && routes[name]) || { seen: 0, ok: 0, refused: 0, failed: 0, code: 0 };
+  const auth = ['auth-preauth', 'auth-login-options', 'auth-login-verify'];
+  if (dom.workspaceHidden === false) return dom.rows === 25 ? 'indeterminate' : 'workspace-rows-mismatch';
+  if (auth.some(name => tally(name).refused > 0 || tally(name).failed > 0)) return 'auth-server-refusal';
+  if (tally('projects').refused > 0 || tally('projects').failed > 0
+    || dom.statusClass === 'forbidden-no-grants') return 'projects-refusal';
+  if (tally('auth-login-verify').ok > 0 || dom.logoutHidden === false) return 'workspace-not-opened';
+  if (!auth.some(name => tally(name).seen > 0)) return 'ceremony-not-started';
+  if (dom.statusClass === 'ceremony-failed' || dom.statusState === 'error') return 'credential-failure';
+  if (dom.statusState === 'loading' || dom.statusClass === 'signing-in') return 'signin-pending';
+  return 'indeterminate';
+}
+let boundarySnapshot = { captured: false, boundary: 'not-captured', dom: null, routes: emptyRoutes() };
+export const loginBoundarySnapshot = () => boundarySnapshot;
+/** Runs inside the failing stage, on the still-live owned page, BEFORE the caller closes
+ *  that page or its context. It never throws, never checks, never marks and returns nothing
+ *  the caller acts on: an unobservable page records `unavailable`, never success. */
+export async function captureLoginBoundary(deps) {
+  let dom = null;
+  try { dom = await deps.bounded(deps.page.evaluate(PROBE, { texts: STATUS_TEXTS, states: STATUS_STATES }), PROBE_MS); }
+  catch { dom = null; }
+  try { boundarySnapshot = { captured: dom !== null && typeof dom === 'object', boundary: deriveLoginBoundary(dom, routeTally), dom, routes: routeTally }; }
+  catch { boundarySnapshot = { captured: false, boundary: 'unavailable', dom: null, routes: emptyRoutes() }; }
+}
+const enumOf = (list, value) => (list.includes(value) ? value : 'unknown');
+const countOf = value => (Number.isSafeInteger(value) && value >= 0 && value <= 999 ? value : -1);
+const codeOf = value => (Number.isSafeInteger(value) && value >= 100 && value <= 599 ? value : 0);
+const flagOf = value => (value === true ? 'y' : value === false ? 'n' : 'u');
+/** Serialized only after the rejection, to stderr only. Every field is clamped here a
+ *  second time, so an unexpected value renders `unknown` / `-1` / `0` rather than leaking. */
+export function renderLoginBoundary(value) {
+  const snapshot = value && typeof value === 'object' ? value : {};
+  const dom = snapshot.dom && typeof snapshot.dom === 'object' ? snapshot.dom : {};
+  const routes = snapshot.routes && typeof snapshot.routes === 'object' ? snapshot.routes : {};
+  const tally = ROUTE_CLASSES.filter(name => name !== 'tasks' && name !== 'other').map(name => {
+    const entry = routes[name] && typeof routes[name] === 'object' ? routes[name] : {};
+    return `${name}:${countOf(entry.seen)}.${countOf(entry.ok)}.${countOf(entry.refused)}.${countOf(entry.failed)}.${codeOf(entry.code)}`;
+  }).join(',');
+  return `boundary=${enumOf(LOGIN_BOUNDARIES, snapshot.boundary)} captured=${flagOf(snapshot.captured)}`
+    + ` status=${enumOf(STATUS_CLASSES, dom.statusClass)}/${enumOf(STATUS_STATES, dom.statusState)}`
+    + ` hidden=w${flagOf(dom.workspaceHidden)}/a${flagOf(dom.authHidden)}/o${flagOf(dom.logoutHidden)}`
+    + ` rows=${countOf(dom.rows)} options=${countOf(dom.projectOptions)} routes=${tally}`;
+}
 const digest = value => createHash('sha256').update(value).digest('hex');
 const outcomes = new Map();
 const mark = (deps, id) => { deps.check(CONSOLE_IDS.includes(id) && !outcomes.has(id)); outcomes.set(id, 'pass'); deps.done(id); };
@@ -379,7 +525,8 @@ const rowTexts = page => page.$$eval('#requests li button', nodes => nodes.map(n
 const settled = page => page.waitForFunction(() => !document.querySelector('#refresh').disabled
   && !document.querySelector('#status').textContent.startsWith('Loading'));
 
-export async function loginUI(deps) {
+/** The step sequence, unchanged: same waits, same checks, same substages, same order. */
+async function loginUISteps(deps) {
   setConsoleStage('login-ui');
   const { check, page, cleanDOM, state } = deps;
   setLoginSubstage('navigate');
@@ -415,6 +562,21 @@ export async function loginUI(deps) {
   await cleanDOM(page, state);
   setLoginSubstage('mark');
   mark(deps, 'console-login-ui');
+}
+/** Unchanged behaviour plus one bounded, removable observation. The original rejection is
+ *  always rethrown unchanged, the snapshot is taken before the caller's page/context
+ *  cleanup, and it is serialized only after that rejection — so neither a failed probe nor
+ *  a failed listener can turn a failure into a pass, or a pass into a failure. */
+export async function loginUI(deps) {
+  try { startLoginObserver(deps.page); } catch { stopLoginObserver(); }
+  try {
+    await loginUISteps(deps);
+  } catch (error) {
+    await captureLoginBoundary(deps);
+    throw error;
+  } finally {
+    stopLoginObserver();
+  }
 }
 
 async function uiControls(deps, alpha) {

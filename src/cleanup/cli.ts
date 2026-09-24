@@ -581,8 +581,22 @@ function cleanupOne(sid: string, force: boolean): number {
     // here, so close BY SID (close-for-sid) — closeWorkspaceFor(sid, "") would
     // silent-no-op. DELETE backup still runs to drop any registry residue.
     log(`session not in telepty list: ${sid} (already cleaned or never registered); closing terminal surface by sid`);
-    wh(["close-for-sid", sid]);
+    // #1162: this arm DID attempt a close, so bind its status exactly as the
+    // normal arm binds the closeWorkspaceFor result — discarding it reported a
+    // success the adapter never gave. captureBoth rather than wh because the
+    // category token is on fd 2; the stream itself is still never relayed, only
+    // the closed vocabulary that whCloseCategory owns. The no-mapping case is
+    // unaffected: the adapter returns 0 when the lookup found no host id, so
+    // there is no close and no failure to propagate.
+    const closed = captureBoth(WH_CLI, ["close-for-sid", sid]);
+    const closeOk = closed.status === 0;
+    if (!closeOk) {
+      const category = whCloseCategory(closed.stderr);
+      log(`workspace host close failed for ${sid} (by sid): release UNCONFIRMED — neither release nor retention was observed [${category}]`);
+      err(`workspace host close-for-sid non-zero for ${sid} [${category}]`);
+    }
     deleteSessionRegistry(sid);
+    if (!closeOk) return 1;
     // #540 — take the cleaned session out of the pollers' way. telepty#60 Stage A:
     // this is LIFECYCLE only. A session disappearing is not a task completing, so
     // the outcome stays unknown and the record keeps its history.
