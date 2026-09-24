@@ -11,8 +11,17 @@ if [ -z "$REAL_GIT" ]; then
   exit 0
 fi
 
-TMP_ROOT=$(mktemp -d)
-trap 'rm -rf "$TMP_ROOT"' EXIT
+source "$HERE/lib.sh"
+t_setup; trap t_teardown EXIT
+t_confined_setup
+TMP_ROOT="$T_TMP"
+# This guard alone needs real git, exclusively against its local fixture repos.
+export REAL_GIT
+cat > "$STUB_BIN/git" <<'SH'
+#!/usr/bin/env bash
+exec "$REAL_GIT" "$@"
+SH
+chmod +x "$STUB_BIN/git"
 
 HOOK_SRC="$REPO_ROOT/git-hooks/pre-push"
 [ -f "$HOOK_SRC" ] || { echo "FAIL: hook missing at $HOOK_SRC" >&2; exit 1; }
@@ -119,6 +128,7 @@ FAKE_BIN="$TMP_ROOT/fakebin"
 mkdir -p "$FAKE_BIN"
 cat > "$FAKE_BIN/codex" <<'SH'
 #!/usr/bin/env bash
+if [ "$#" -eq 1 ] && [ "$1" = --version ]; then echo 9.9.9; exit 0; fi
 cd "$LAUNCHER_WORK"
 git push origin HEAD:refs/heads/main >"$LAUNCHER_OUT" 2>"$LAUNCHER_ERR"
 SH
@@ -142,7 +152,9 @@ done
 [ -n "$cli" ] || { echo "fake-open-session: --cli missing" >&2; exit 2; }
 [ -n "$cwd" ] || { echo "fake-open-session: --cwd missing" >&2; exit 2; }
 set +e
-PATH="$FAKE_BIN:$PATH" LAUNCHER_WORK="$cwd" "$cli"
+# The actual guard exports run, but its terminal exec is intercepted before
+# the native sandbox runner. Only our local git-push payload is executed.
+"$T_FIXTURE_NODE" "$T_FIXTURE_HELPER" guard t28-dispatch-main "$cli"
 echo "$?" > "$FAKE_OPEN_STATUS"
 set -e
 exit 0
@@ -162,13 +174,10 @@ chmod 0755 "$FAKE_BIN/telepty"
 
 REF_FILE="$TMP_ROOT/ref.md"
 printf '%s\n' "T28 dispatch propagation ref" > "$REF_FILE"
-# dispatch.sh's pre-inject wait_for_ready ALWAYS runs — it is NOT gated by
-# --no-verify-started (that flag only skips the post-inject Rule-33 START check).
-# The fake codex launcher attempts its push then exits, so this throwaway session
-# never reaches REPL-ready and dispatch times out by design (--timeout-ms 1000).
-# The push-guard assertions below depend only on the launcher's side effects
-# (FAKE_OPEN_STATUS + dispatch-launcher.err), which are written during
-# open-session BEFORE the wait — so the expected non-zero timeout exit is tolerated.
+# Spawn admission now needs task/sid scope and a role before producing a guard.
+# The fake open writes a synthetic receipt and the private probe reports ready;
+# neither the generated native runner nor a real model/terminal is launched.
+t_confined_scope t28-dispatch-main 28 "$WORK"
 HOME="$TMP_ROOT/home" \
 AIGENTRY_SESSIONS_ROOT="$TMP_ROOT/sessions" \
 DISPATCH_STATE_DIR="$TMP_ROOT/state" \
@@ -177,14 +186,20 @@ FAKE_BIN="$FAKE_BIN" \
 FAKE_OPEN_STATUS="$FAKE_OPEN_STATUS" \
 LAUNCHER_OUT="$TMP_ROOT/dispatch-launcher.out" \
 LAUNCHER_ERR="$TMP_ROOT/dispatch-launcher.err" \
+LAUNCHER_WORK="$WORK" \
 PATH="$FAKE_BIN:$PATH" \
 TELEPTY="$FAKE_BIN/telepty" \
   "$REPO_ROOT/bin/dispatch.sh" --spawn-and-dispatch \
     --track t28 --name dispatch-main --cwd "$WORK" --cli codex \
     --from t28-test --ref "$REF_FILE" --timeout-ms 1000 --no-verify-started \
-    --no-task "test-fixture T28" \
-    >/dev/null 2>&1 || true
+    --task 28 --role coder \
+    >"$TMP_ROOT/dispatch.out" 2>"$TMP_ROOT/dispatch.err" || {
+      cat "$TMP_ROOT/dispatch.err" >&2
+      echo "FAIL: fixture dispatch did not reach the generated guard" >&2
+      exit 1
+    }
 
+[ -s "$FAKE_OPEN_STATUS" ] || { echo "FAIL: generated guard status missing" >&2; exit 1; }
 if [ "$(cat "$FAKE_OPEN_STATUS")" -eq 0 ]; then
   echo "FAIL: dispatch-generated worker launcher did not block protected push" >&2
   exit 1

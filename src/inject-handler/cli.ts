@@ -99,6 +99,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { registryAvailable, registryEnvironment, registryInvocation } from "../dispatch/registry-command.js";
+
 import { parseInject, type ParsedInject } from "../session/inject-parser.js";
 import { USAGE } from "./usage.js";
 
@@ -176,9 +178,10 @@ function emitTelemetry(args: string[]): void {
 
 /** `"$DISPATCH_REGISTRY_PY" … >/dev/null 2>&1 || true`, `[ -x ]`-gated. */
 function registryObserve(args: string[]): void {
-  if (!isExecutable(DISPATCH_REGISTRY_PY)) return;
+  if (!registryAvailable(DISPATCH_REGISTRY_PY)) return;
   try {
-    spawnSync(DISPATCH_REGISTRY_PY, args, { stdio: "ignore" });
+    const invocation = registryInvocation(DISPATCH_REGISTRY_PY, args, process.platform);
+    spawnSync(invocation.cmd, invocation.args, { stdio: "ignore", shell: false, env: registryEnvironment() });
   } catch {
     /* swallowed, exactly as `|| true` did */
   }

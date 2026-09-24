@@ -2,6 +2,7 @@
 import { claudeAdapter } from "./claude.js";
 import { codexAdapter } from "./codex.js";
 import { geminiAdapter } from "./gemini.js";
+import { grokAdapter } from "./grok.js";
 import {
   BootAdapterError,
   CLI_KINDS,
@@ -14,16 +15,17 @@ const FACTORIES: Readonly<Record<CliKind, () => BootAdapter>> = Object.freeze({
   claude: claudeAdapter,
   codex: codexAdapter,
   gemini: geminiAdapter,
+  grok: grokAdapter,
 });
 
-export function getBootAdapter(cli: string): BootAdapter {
+export function getBootAdapter(cli: string, geminiExecutable: "agy" | "gemini" = "gemini"): BootAdapter {
   if (!isCliKind(cli)) {
     throw new BootAdapterError(
       "UNSUPPORTED_CLI",
       `unknown CLI ${JSON.stringify(cli)}; supported: ${CLI_KINDS.join(", ")}`,
     );
   }
-  return FACTORIES[cli]();
+  return cli === "gemini" ? geminiAdapter(geminiExecutable) : FACTORIES[cli]();
 }
 
 export { CLI_KINDS, isCliKind, BootAdapterError };
@@ -38,11 +40,12 @@ export {
 } from "./spawner.js";
 export { semverGte } from "./common.js";
 export { claudeAdapter, CLAUDE_MIN_VERSION } from "./claude.js";
+export { grokAdapter } from "./grok.js";
 export {
   codexAdapter, CODEX_MIN_VERSION, CODEX_CONTEXT_FILE,
   CODEX_HOME_ENV, CODEX_HOME_EXCLUDE,
 } from "./codex.js";
 export {
-  geminiAdapter, GEMINI_MIN_VERSION, GEMINI_CONTEXT_FILE,
+  geminiAdapter, geminiBinary, GEMINI_MIN_VERSION, GEMINI_CONTEXT_FILE,
   GEMINI_HOME_ENV, GEMINI_HOME_EXCLUDE,
 } from "./gemini.js";

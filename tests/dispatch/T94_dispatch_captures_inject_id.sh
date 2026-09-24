@@ -21,6 +21,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
 t_setup; trap t_teardown EXIT
+t_confined_setup
 
 fail() { echo "FAIL[T94]: $*" >&2; exit 1; }
 
@@ -49,6 +50,7 @@ EOF
 # run_case <sid> — one full dispatch against the current stub; must exit 0.
 run_case() {
   local sid="$1" ref="$T_TMP/ref-$1.md" rc=0
+  t_confined_target "$sid"
   printf 'payload for %s\n' "$sid" > "$ref"
   printf '%s' "[{\"id\":\"$sid\",\"command\":\"claude\",\"healthStatus\":\"CONNECTED\"}]" > "$STUB_LIST_FILE"
   set +e
@@ -128,6 +130,7 @@ esac
 EOF
 chmod +x "$STUB_BIN/telepty"
 SID_F=sid-injectfail-T94
+t_confined_target "$SID_F"
 printf 'payload\n' > "$T_TMP/ref-$SID_F.md"
 printf '%s' "[{\"id\":\"$SID_F\",\"command\":\"claude\",\"healthStatus\":\"CONNECTED\"}]" > "$STUB_LIST_FILE"
 set +e
@@ -145,6 +148,7 @@ t_assert_outcome_unknown "$SID_F"
 # the "✅ Context injected" line the operator relies on.
 stub_inject "$OK_LINE" "   inject_id: $UUID"
 printf 'payload\n' > "$T_TMP/ref-vis.md"
+t_confined_target sid-visible-T94
 printf '%s' '[{"id":"sid-visible-T94","command":"claude","healthStatus":"CONNECTED"}]' > "$STUB_LIST_FILE"
 out=$(t_run_dispatch --target sid-visible-T94 --ref "$T_TMP/ref-vis.md" --from orchestrator \
         --no-verify-started --no-task "test-fixture T94" 2>/dev/null) || fail "G: dispatch failed"
@@ -169,6 +173,7 @@ printf '%s' "$out" | grep -qF "Context injected successfully" \
 # the old null.
 stub_inject "$OK_LINE" "   inject_id: $UUID"
 NOWRITE="$T_TMP/unwritable"
+t_confined_target sid-nowrite-T94
 mkdir -p "$NOWRITE"; chmod 0555 "$NOWRITE"
 printf 'payload\n' > "$T_TMP/ref-nowrite.md"
 printf '%s' '[{"id":"sid-nowrite-T94","command":"claude","healthStatus":"CONNECTED"}]' > "$STUB_LIST_FILE"

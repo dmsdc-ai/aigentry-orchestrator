@@ -11,9 +11,8 @@
 #     asserted that the boot ends in a PROCESS REPLACEMENT, which is the whole reason
 #     this script exists as a wrapper: the shell the user's terminal launched has to
 #     BECOME the bridge (block Q).
-#   * the self/ancestor belt against REAL pids. T40's ancestry is a fixture table, so
-#     it proves the walk, not that the walk covers whatever process is actually
-#     running the boot — the #539 invariant (block N).
+#   * the self/ancestor belt starting at the boot's default self pid, through a
+#     synthetic ancestry table — the #539 invariant (block N).
 #   * every `[orchestrator-boot] …` line's BYTES, and that they all go to stderr
 #     (blocks R, W, X).
 #   * that the reconcile runs BEFORE the process guard (block O).
@@ -30,8 +29,8 @@
 #
 # NOTHING IN THIS FILE TOUCHES A REAL PROCESS OR A REAL DAEMON. `ps`, `kill`,
 # `telepty` and `curl` are recorder stubs throughout; the only real pids that appear
-# are READ from `ps -o ppid=` to build block N's ancestry fixture, and the guard's
-# verdict on them is asserted to be "skip".
+# are the recorder's parent and the private runner pid used in block N's synthetic
+# ancestry table; no host process table is read and all signals go to recorders.
 #
 # PARITY IS RE-RUNNABLE, not asserted from memory. The script under test is
 # $ORCH_BOOT_UNDER_TEST, defaulting to bin/orchestrator-boot.sh. Every block below
@@ -47,7 +46,8 @@
 # nothing to do with orchestrator bridges.
 #
 # The original has no `__probe` — it was SOURCEABLE, which is what T40 used and what
-# the port replaced. `guard` and `reconcile` below dispatch on
+# the port replaced. `guard` and `reconcile` below use normal compiled boot for
+# actuation (probes are read-only now) and dispatch on
 # ORCH_BOOT_PARITY_ORIGINAL so both implementations are driven through the same seams
 # (all of which the original reads from the environment at source time).
 #
@@ -88,8 +88,27 @@ HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
 t_setup; trap 't_teardown' EXIT
 REPO_ROOT="$(cd "$HERE/../.." && pwd -P)"
-BOOT="${ORCH_BOOT_UNDER_TEST:-$REPO_ROOT/bin/orchestrator-boot.sh}"
+BOOT_SOURCE="${ORCH_BOOT_UNDER_TEST:-$REPO_ROOT/bin/orchestrator-boot.sh}"
 ORIGINAL="${ORCH_BOOT_PARITY_ORIGINAL:-0}"
+# Execute a private copy of the unchanged shim and compiled boot, with a synthetic
+# auth resolver. No normal boot invocation can enter the repository's live layout.
+BOOT_FIXTURE="$T_TMP/boot-fixture"
+mkdir -p "$BOOT_FIXTURE/bin/lib" "$BOOT_FIXTURE/dist/src/orchestrator-boot" "$BOOT_FIXTURE/home"
+cp "$BOOT_SOURCE" "$BOOT_FIXTURE/bin/orchestrator-boot.sh"
+cp "$REPO_ROOT/bin/lib/node-shim.sh" "$BOOT_FIXTURE/bin/lib/node-shim.sh"
+cp "$REPO_ROOT/dist/src/orchestrator-boot/cli.js" "$REPO_ROOT/dist/src/orchestrator-boot/usage.js" \
+  "$BOOT_FIXTURE/dist/src/orchestrator-boot/"
+printf '{"type":"module"}\n' > "$BOOT_FIXTURE/package.json"
+AUTH_LOG="$T_TMP/auth.log"
+printf 'telepty_auth_token() { printf "auth\\n" >> "%s"; printf "fixture-token-T131"; }\n' "$AUTH_LOG" \
+  > "$BOOT_FIXTURE/bin/lib/telepty-auth.sh"
+BOOT="$BOOT_FIXTURE/bin/orchestrator-boot.sh"
+BOOT_CLI="$BOOT_FIXTURE/dist/src/orchestrator-boot/cli.js"
+chmod +x "$BOOT"
+export AIGENTRY_SHIM_SCRIPT_DIR="$BOOT_FIXTURE/bin" AIGENTRY_HOME="$BOOT_FIXTURE/home"
+export ORCHESTRATOR_CLI=claude SINGLETON_SELF_PID=9999 TELEPTY_PORT=3848
+unset _NODE_SHIM_SH_SOURCED
+cd "$BOOT_FIXTURE"
 
 fail() { echo "FAIL[T131]: $*" >&2; exit 1; }
 
@@ -97,20 +116,20 @@ SID="orchestrator"
 
 # ── the two entry points, one per implementation ────────────────────────────
 # The original is SOURCEABLE and reads every seam from the environment at source
-# time; the port exposes the same two behaviours as `__probe` subcommands. Callers
+# time; the port's normal zero-argv CLI actuates and prints argv without exec. Callers
 # export the seams and then call these.
 guard() {
   if [ "$ORIGINAL" = "1" ]; then
     bash -c 'set -uo pipefail; . "$1"; orchestrator_singleton_guard' _ "$BOOT"
   else
-    "$BOOT" __probe singleton-guard
+    node "$BOOT_CLI"
   fi
 }
 reconcile() {
   if [ "$ORIGINAL" = "1" ]; then
     bash -c 'set -uo pipefail; . "$1"; orchestrator_registry_reconcile' _ "$BOOT"
   else
-    "$BOOT" __probe registry-reconcile
+    node "$BOOT_CLI"
   fi
 }
 
@@ -182,14 +201,12 @@ reset() { : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$ORDER_LOG"; : > "$PS_ARGV"; : 
 kills() { grep -c . "$KILL_LOG" 2>/dev/null || true; }
 
 # ===========================================================================
-# N) THE #539 INVARIANT AGAINST REAL PIDS — never kill self or any ancestor.
+# N) THE #539 INVARIANT FROM THE DEFAULT SELF PID — never kill self or any ancestor.
 #
 # T40 proves the ppid walk on a fixture. This proves the walk covers whatever process
-# is ACTUALLY running the boot, which is the property #539 is about: the `ps` stub
-# below builds its rows from its OWN real ancestry and dresses every pid from its
-# GRANDPARENT up as an orchestrator bridge. Whichever implementation is under test,
-# the process running it is on that chain. One synthetic non-ancestor bridge (424242)
-# is the only pid that may be killed.
+# is running the boot: the ps recorder uses its parent (Node on the port) and the
+# private runner pid as the start of a synthetic chain ending at bridge 1111.
+# No host ps is called. One synthetic non-ancestor bridge (424242) may be killed.
 #
 # The full BOOT path is used, not the probe, so the exec is part of the measurement:
 # the wrapper records the pid of the shell that runs the script, that shell execs the
@@ -199,22 +216,13 @@ kills() { grep -c . "$KILL_LOG" 2>/dev/null || true; }
 PS_ANCESTRY_STUB="$STUB_BIN/ps-ancestry.sh"
 cat > "$PS_ANCESTRY_STUB" <<EOF
 #!/usr/bin/env bash
-# Rows for this stub's own real ancestry. hop 0 is the stub, hop 1 its parent; from
-# hop 2 up every pid is dressed as an orchestrator bridge and every one of them is a
-# genuine ancestor of whatever is running the guard.
-pid=\$\$
-hop=0
-while [ -n "\$pid" ] && [ "\$pid" -gt 1 ] 2>/dev/null; do
-  ppid="\$(/bin/ps -o ppid= -p "\$pid" 2>/dev/null | tr -d ' ')"
-  [ -z "\$ppid" ] && break
-  if [ "\$hop" -ge 2 ]; then
-    printf '%s %s node /usr/local/bin/telepty allow --id %s --auto-restart claude\n' "\$pid" "\$ppid" "$SID"
-  else
-    printf '%s %s bash t131-harness-hop-%s\n' "\$pid" "\$ppid" "\$hop"
-  fi
-  pid="\$ppid"
-  hop=\$((hop + 1))
-done
+# PPID is supplied by this private child shell; no process lister is invoked.
+runner="\$(cat "$T_TMP/runner-pid.txt")"
+if [ "\$PPID" != "\$runner" ]; then
+  printf '%s %s node boot-fixture\n' "\$PPID" "\$runner"
+fi
+printf '%s 1111 node /usr/local/bin/telepty allow --id %s --auto-restart claude\n' "\$runner" "$SID"
+printf '1111 1 node /usr/local/bin/telepty allow --id %s --auto-restart claude\n' "$SID"
 printf '424242 1 node /usr/local/bin/telepty allow --id %s --auto-restart claude\n' "$SID"
 EOF
 chmod +x "$PS_ANCESTRY_STUB"
@@ -244,7 +252,7 @@ boot_with_exec() {
 reset; : > "$EXEC_LOG"; : > "$EXEC_PID"
 no_orch_listing
 N_ERR="$T_TMP/n.err"
-SINGLETON_PS_CMD="$PS_ANCESTRY_STUB" PATH="$EXEC_DIR:$PATH" boot_with_exec 2>"$N_ERR" >/dev/null \
+(unset SINGLETON_SELF_PID; SINGLETON_PS_CMD="$PS_ANCESTRY_STUB" PATH="$EXEC_DIR:$PATH" boot_with_exec) 2>"$N_ERR" >/dev/null \
   || fail "N: the boot exited non-zero: $(cat "$N_ERR")"
 
 runner="$(cat "$RUNNER_PID")"
@@ -255,6 +263,7 @@ grep -qw 424242 "$KILL_LOG" \
 [ "$(kills)" = "1" ] || fail "N: expected exactly 1 kill (424242); kills: $(cat "$KILL_LOG")"
 grep -qw "$runner" "$KILL_LOG" \
   && fail "N: THE PROCESS RUNNING THE BOOT WAS KILLED — #539. kills: $(cat "$KILL_LOG")"
+grep -q 'skip self/ancestor bridge pid=1111' "$N_ERR" || fail "N: synthetic ancestor was not skipped"
 [ -s "$EXEC_LOG" ] || fail "N: the boot never reached the exec"
 
 # ===========================================================================
@@ -393,7 +402,7 @@ else
   reset
   : > "$PS_TABLE"; no_orch_listing
   R_OUT="$T_TMP/r.out"
-  SINGLETON_SELF_PID=9999 node "$REPO_ROOT/dist/src/orchestrator-boot/cli.js" >"$R_OUT" 2>/dev/null
+  SINGLETON_SELF_PID=9999 node "$BOOT_CLI" >"$R_OUT" 2>/dev/null
   want="$(printf 'telepty\nallow\n--id\n%s\n--auto-restart\nclaude\n--dangerously-skip-permissions\n--continue\n' "$SID")"
   [ "$(cat "$R_OUT")" = "$want" ] \
     || fail "R: stdout is not EXACTLY the exec argv, one element per line. got: $(cat "$R_OUT")"
@@ -473,7 +482,7 @@ if [ "$ORIGINAL" = "1" ]; then
   grep -q 'the listing was not JSON' "$T_ERR" \
     || fail "T: the original's jq-less arm changed; stderr: $(cat "$T_ERR")"
 else
-  PATH="$NOJQ" "$BOOT" __probe registry-reconcile 2>"$T_ERR" >/dev/null
+  PATH="$NOJQ" node "$BOOT_CLI" 2>"$T_ERR" >/dev/null
   grep -q -- '-X DELETE' "$CURL_LOG" \
     || fail "T: the port did NOT reconcile without jq — #905 stays unfixable on a jq-less host. stderr: $(cat "$T_ERR")"
 fi
@@ -565,6 +574,8 @@ reset
 printf '[{"id":"%s","healthStatus":"STALE","active_clients":0}]' "$SID" > "$LIST_JSON"
 W_ERR="$T_TMP/w2.err"
 reconcile >/dev/null 2>"$W_ERR"
+grep -q 'x-telepty-token: fixture-token-T131' "$CURL_LOG" || fail "W: synthetic token did not reach curl"
+grep -q 'fixture-token-T131' "$W_ERR" && fail "W: token value appears in log output"
 grep -q 'x-telepty-token' "$W_ERR" \
   && fail "W: the credential header appears in the log output: $(cat "$W_ERR")"
 
@@ -641,5 +652,21 @@ printf '[{"id":"%s","healthStatus":"STALE","active_clients":0}]' "$SID" > "$LIST
 TELEPTY_PORT=4999 reconcile >/dev/null 2>&1
 grep -qF -- "http://127.0.0.1:4999/api/sessions/$SID" "$CURL_LOG" \
   || fail "Y: TELEPTY_PORT is not honoured: $(cat "$CURL_LOG")"
+
+# Z) Probes inspect actionable fixtures without DELETE, signal, auth or exec.
+if [ "$ORIGINAL" != "1" ]; then
+  for probe in singleton-guard registry-reconcile exec-argv; do
+    reset; : > "$EXEC_LOG"; : > "$AUTH_LOG"
+    SINGLETON_SELF_PID=9999 PATH="$EXEC_DIR:$PATH" "$BOOT" __probe "$probe" \
+      >"$T_TMP/probe.out" 2>"$T_TMP/probe.err"
+    [ ! -s "$KILL_LOG" ] && [ ! -s "$CURL_LOG" ] && [ ! -s "$AUTH_LOG" ] && [ ! -s "$EXEC_LOG" ] \
+      || fail "Z/$probe: probe acted, resolved auth or exec'd"
+    case "$probe" in
+      singleton-guard) grep -q 'would SIGKILL.*pid=7777' "$T_TMP/probe.err" || fail "Z: missing kill verdict" ;;
+      registry-reconcile) grep -q 'would DELETE' "$T_TMP/probe.err" || fail "Z: missing DELETE verdict" ;;
+      exec-argv) cmp "$R_OUT" "$T_TMP/probe.out" || fail "Z: probe argv differs from boot stdout" ;;
+    esac
+  done
+fi
 
 echo "T131 PASS"

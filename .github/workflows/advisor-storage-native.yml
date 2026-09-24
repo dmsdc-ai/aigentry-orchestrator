@@ -1,0 +1,377 @@
+# Actual-OS compile and protocol gate for the package-owned storage-provenance
+# helpers.
+#
+# What this workflow establishes:
+#   - native/task-advisor-storage/{darwin,windows}.c compile warning-clean on a
+#     real macOS and a real Windows runner, through the package's OWN build
+#     paths: scripts/build-advisor-storage.mjs and CMakeLists.txt. Both carry
+#     strict warning flags (-Wall -Wextra -Werror, /W4 /WX) and neither is
+#     relaxed here. A compiler warning is a job failure.
+#   - The binary each path produces speaks `advisor-storage-provenance-v1`
+#     exactly, and refuses safely on missing, non-directory, over-long and
+#     wrong-arity arguments, against a directory the test made with mkdtemp.
+#
+# What this workflow does NOT establish, and must never be read as:
+#   - It is NOT a device qualification. CI runners are virtual disks; the honest
+#     answer there is `class=unknown`, the test records it and asserts no fixed
+#     classification. A safe refusal (`status=unsupported|denied|error` with
+#     `class=unknown dev=u`, still exit 0) is an accepted protocol result too --
+#     production turns it into a refusal, which qualifies nothing. The
+#     qualification catalog stays empty and production writes still refuse.
+#   - The internal / USB / network / controller-attached hardware matrix is
+#     UNRUN. No hosted runner can provide that media.
+#   - Windows volume-identity binding stays UNVERIFIED: the helper reports
+#     `dev=u` by design. See native/task-advisor-storage/README.md open gates.
+#
+# Deliberate constraints:
+#   - Read-only `contents`. No secrets, no credentials, no package publish, no
+#     release artifact. `persist-credentials: false` on every checkout.
+#   - NO `npm install` / `npm ci`. package.json declares `os: [darwin, linux]`,
+#     and the existing CI installs on Windows with `--force` to get past that
+#     refusal. Nothing here does: the helpers are dependency-free C and the
+#     protocol test is dependency-free Node, so a forced install would be an OS
+#     gate bypass implying a support level this package does not claim.
+#   - No third-party actions. MSVC is entered through the runner's own installed
+#     Visual Studio via vswhere + VsDevCmd, in the SAME command scope as the
+#     build, because `cl` only exists inside an initialised developer shell.
+#   - No `continue-on-error` anywhere. A compiler failure fails the job, and the
+#     raw log is preserved by a separate always() upload that does not mask it.
+#   - Only synthetic CI diagnostics are uploaded: compiler logs, tool versions
+#     and the protocol test's JSON record. The compiled binary is never
+#     uploaded, and the diagnostics carry no file content, device serial or
+#     volume label.
+
+name: Advisor storage native compile and protocol gate
+
+on:
+  pull_request:
+    paths:
+      - native/task-advisor-storage/**
+      - scripts/build-advisor-storage.mjs
+      - src/task-advisor/storage-provenance.ts
+      - tests/task-advisor/native-storage-protocol.test.mjs
+      - .github/workflows/advisor-storage-native.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  NODE_VERSION: '20.20.0'
+  # The exact relative path both build paths must produce and the test resolves.
+  HELPER_DIR: native/task-advisor-storage/bin
+
+jobs:
+  darwin:
+    name: macOS ${{ matrix.runner }} — compile and protocol
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      # Both architectures are gated independently; one must not hide the other.
+      fail-fast: false
+      matrix:
+        include:
+          # Runner labels per the official GitHub-hosted runners table
+          # (docs.github.com/en/actions/reference/runners/github-hosted-runners,
+          # fetched 2026-09-24). macos-13 is RETIRED and must not be used. Intel
+          # macOS is now only reachable through an explicit `-intel` label; the
+          # unsuffixed `macos-15` label is arm64. The `arch` value here is not
+          # documentation: the step below asserts Node agrees with it, so a label
+          # that silently changes architecture fails instead of relabelling
+          # whatever it happened to build.
+          - runner: macos-15         # arm64
+            arch: arm64
+          - runner: macos-15-intel   # x86_64
+            arch: x64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Record toolchain and architecture evidence
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/advisor-storage-diagnostics"
+          {
+            echo "=== uname -a ==="; uname -a
+            echo "=== sw_vers ==="; sw_vers
+            echo "=== arch ==="; arch; echo "node arch: $(node -p process.arch)"
+            echo "=== cc --version ==="; cc --version
+            echo "=== xcrun --show-sdk-version ==="; xcrun --show-sdk-version || echo "xcrun unavailable (recorded, not repaired)"
+            echo "=== cmake --version ==="; cmake --version
+            echo "=== node --version ==="; node --version
+            echo "=== source sha256 ==="
+            shasum -a 256 native/task-advisor-storage/darwin.c \
+                          native/task-advisor-storage/CMakeLists.txt \
+                          scripts/build-advisor-storage.mjs \
+                          tests/task-advisor/native-storage-protocol.test.mjs
+          } 2>&1 | tee "${RUNNER_TEMP}/advisor-storage-diagnostics/toolchain-${{ matrix.arch }}.log"
+
+      # The helper filename is derived from `node -p process.arch`, so without this
+      # check a runner label that changed architecture would still build and test
+      # green -- under the other architecture's name. Asserting the actual runtime
+      # arch against the matrix keeps each row a claim about the arch it names.
+      - name: Assert the runner architecture is the one this matrix row claims
+        run: |
+          set -euo pipefail
+          actual="$(node -p process.arch)"
+          expected='${{ matrix.arch }}'
+          if [ "${actual}" != "${expected}" ]; then
+            echo "::error::runner '${{ matrix.runner }}' reports node arch '${actual}', matrix claims '${expected}'"
+            exit 1
+          fi
+          echo "node arch ${actual} matches matrix row ${expected} on ${{ matrix.runner }}"
+
+      # ---------------- Path 1: the package's own build script ----------------
+
+      - name: Build via scripts/build-advisor-storage.mjs (strict warnings)
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          # No npm install: this script is dependency-free by design.
+          node scripts/build-advisor-storage.mjs \
+            2>&1 | tee "${RUNNER_TEMP}/advisor-storage-diagnostics/build-script-${{ matrix.arch }}.log"
+
+      - name: Confirm the build script produced the exact expected artifact
+        run: |
+          set -euo pipefail
+          helper="${HELPER_DIR}/advisor-storage-provenance-darwin-$(node -p process.arch)"
+          test -f "${helper}" || { echo "::error::build script did not produce ${helper}"; exit 1; }
+          shasum -a 256 "${helper}" | tee -a "${RUNNER_TEMP}/advisor-storage-diagnostics/binary-sha-${{ matrix.arch }}.log"
+          file "${helper}" | tee -a "${RUNNER_TEMP}/advisor-storage-diagnostics/binary-sha-${{ matrix.arch }}.log"
+
+      - name: Protocol conformance against the build-script binary
+        timeout-minutes: 5
+        env:
+          ADVISOR_STORAGE_DIAGNOSTICS: ${{ runner.temp }}/advisor-storage-diagnostics/protocol-build-script-${{ matrix.arch }}.json
+        run: |
+          set -euo pipefail
+          node --test tests/task-advisor/native-storage-protocol.test.mjs \
+            2>&1 | tee "${RUNNER_TEMP}/advisor-storage-diagnostics/protocol-build-script-${{ matrix.arch }}.log"
+
+      # ---------------- Path 2: the independent CMake builder ----------------
+      #
+      # Removing the artifact first is not tidiness: without it a failed CMake
+      # build would leave the build-script binary in place and the second
+      # protocol run would silently re-test the first binary and pass.
+
+      - name: Remove the artifact so the CMake build cannot inherit it
+        run: |
+          set -euo pipefail
+          rm -rf "${HELPER_DIR}"
+          helper="${HELPER_DIR}/advisor-storage-provenance-darwin-$(node -p process.arch)"
+          test ! -e "${helper}" || { echo "::error::stale artifact survived removal"; exit 1; }
+
+      - name: Build via CMakeLists.txt (strict warnings)
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          {
+            cmake -S native/task-advisor-storage -B "${RUNNER_TEMP}/cmake-advisor-storage" \
+                  -DCMAKE_BUILD_TYPE=Release
+            cmake --build "${RUNNER_TEMP}/cmake-advisor-storage" --config Release
+          } 2>&1 | tee "${RUNNER_TEMP}/advisor-storage-diagnostics/build-cmake-${{ matrix.arch }}.log"
+
+      - name: Confirm the CMake build produced the exact expected artifact
+        run: |
+          set -euo pipefail
+          helper="${HELPER_DIR}/advisor-storage-provenance-darwin-$(node -p process.arch)"
+          test -f "${helper}" || { echo "::error::CMake did not produce ${helper}"; exit 1; }
+          shasum -a 256 "${helper}" | tee -a "${RUNNER_TEMP}/advisor-storage-diagnostics/binary-sha-${{ matrix.arch }}.log"
+
+      - name: Protocol conformance against the CMake binary
+        timeout-minutes: 5
+        env:
+          ADVISOR_STORAGE_DIAGNOSTICS: ${{ runner.temp }}/advisor-storage-diagnostics/protocol-cmake-${{ matrix.arch }}.json
+        run: |
+          set -euo pipefail
+          node --test tests/task-advisor/native-storage-protocol.test.mjs \
+            2>&1 | tee "${RUNNER_TEMP}/advisor-storage-diagnostics/protocol-cmake-${{ matrix.arch }}.log"
+
+      - name: State what a green run does and does not mean
+        run: |
+          echo "Protocol conformance only. Classification is recorded, never asserted."
+          echo "Hardware matrix (internal/USB/network/controller) is UNRUN on hosted runners."
+          echo "Qualification catalog remains EMPTY; production writes still refuse."
+
+      # always() preserves evidence for a FAILED job. It does not mask the
+      # failure: no step here carries continue-on-error.
+      - name: Upload synthetic CI diagnostics (no binaries)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: advisor-storage-native-darwin-${{ matrix.arch }}-diagnostics
+          path: ${{ runner.temp }}/advisor-storage-diagnostics/
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    name: Windows x64 — compile and protocol
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Record toolchain and architecture evidence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:RUNNER_TEMP 'advisor-storage-diagnostics'
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          $log = Join-Path $out 'toolchain-x64.log'
+          & {
+            '=== OS ==='; Get-CimInstance Win32_OperatingSystem |
+              Select-Object Caption, Version, OSArchitecture | Format-List
+            '=== processor architecture ==='; $env:PROCESSOR_ARCHITECTURE
+            '=== node ==='; node --version; 'node arch: ' + (node -p process.arch)
+            '=== cmake ==='; cmake --version
+            '=== source sha256 ==='
+            Get-FileHash -Algorithm SHA256 `
+              native/task-advisor-storage/windows.c, `
+              native/task-advisor-storage/CMakeLists.txt, `
+              scripts/build-advisor-storage.mjs, `
+              tests/task-advisor/native-storage-protocol.test.mjs |
+              Format-List Algorithm, Hash, Path
+          } 2>&1 | Tee-Object -FilePath $log
+
+      # Same reason as the macOS row: every artifact and log name here hard-codes
+      # x64, while the helper filename comes from `node -p process.arch`. If this
+      # label ever resolves to another architecture, fail rather than publish x64-
+      # named evidence for a different build.
+      - name: Assert the runner architecture is x64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actual = node -p process.arch
+          if ($actual -ne 'x64') {
+            Write-Output "::error::windows-latest reports node arch '$actual', this job is declared x64"
+            exit 1
+          }
+          Write-Output "node arch $actual matches the declared x64 job"
+
+      # ---------------- Path 1: the package's own build script ----------------
+      #
+      # `cl` exists only inside an initialised developer shell, so VsDevCmd must
+      # run in the SAME command scope as the build. vswhere ships with the
+      # runner's Visual Studio installer; no third-party action is introduced.
+
+      - name: Build via scripts/build-advisor-storage.mjs (MSVC /W4 /WX)
+        timeout-minutes: 10
+        shell: cmd
+        run: |
+          @echo off
+          set "LOGFILE=%RUNNER_TEMP%\advisor-storage-diagnostics\build-script-x64.log"
+          set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+          if not exist "%VSWHERE%" ( echo ::error::vswhere not found; no installed Visual Studio to discover & exit /b 1 )
+          set "VSPATH="
+          for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
+          if not defined VSPATH ( echo ::error::no Visual Studio with the x64 C toolset is installed & exit /b 1 )
+          call "%VSPATH%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64 || exit /b 1
+          where cl >> "%LOGFILE%" 2>&1
+          cl >> "%LOGFILE%" 2>&1
+          rem No npm install: package.json declares os:[darwin,linux] and this
+          rem gate must not force past that refusal. The C is dependency-free.
+          node scripts\build-advisor-storage.mjs >> "%LOGFILE%" 2>&1
+          set "RC=%ERRORLEVEL%"
+          type "%LOGFILE%"
+          exit /b %RC%
+
+      - name: Confirm the build script produced the exact expected artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $helper = Join-Path $env:HELPER_DIR ('advisor-storage-provenance-win32-' + (node -p process.arch) + '.exe')
+          if (-not (Test-Path -LiteralPath $helper)) {
+            Write-Output "::error::build script did not produce $helper"; exit 1
+          }
+          $log = Join-Path $env:RUNNER_TEMP 'advisor-storage-diagnostics\binary-sha-x64.log'
+          Get-FileHash -Algorithm SHA256 $helper | Format-List | Tee-Object -FilePath $log -Append
+
+      - name: Protocol conformance against the build-script binary
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          ADVISOR_STORAGE_DIAGNOSTICS: ${{ runner.temp }}/advisor-storage-diagnostics/protocol-build-script-x64.json
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $log = Join-Path $env:RUNNER_TEMP 'advisor-storage-diagnostics\protocol-build-script-x64.log'
+          node --test tests/task-advisor/native-storage-protocol.test.mjs 2>&1 | Tee-Object -FilePath $log
+          exit $LASTEXITCODE
+
+      # ---------------- Path 2: the independent CMake builder ----------------
+
+      - name: Remove the artifact so the CMake build cannot inherit it
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Remove-Item -LiteralPath $env:HELPER_DIR -Recurse -Force -ErrorAction SilentlyContinue
+          $helper = Join-Path $env:HELPER_DIR ('advisor-storage-provenance-win32-' + (node -p process.arch) + '.exe')
+          if (Test-Path -LiteralPath $helper) { Write-Output '::error::stale artifact survived removal'; exit 1 }
+
+      - name: Build via CMakeLists.txt (MSVC /W4 /WX)
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $log = Join-Path $env:RUNNER_TEMP 'advisor-storage-diagnostics\build-cmake-x64.log'
+          # The Visual Studio generator locates MSVC itself; no DevCmd needed here.
+          # Each command tees its own log and is checked immediately, so a failure
+          # stops the step with its compiler output already preserved.
+          cmake -S native/task-advisor-storage -B "$env:RUNNER_TEMP/cmake-advisor-storage" -A x64 2>&1 |
+            Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build "$env:RUNNER_TEMP/cmake-advisor-storage" --config Release 2>&1 |
+            Tee-Object -FilePath $log -Append
+          exit $LASTEXITCODE
+
+      - name: Confirm the CMake build produced the exact expected artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $helper = Join-Path $env:HELPER_DIR ('advisor-storage-provenance-win32-' + (node -p process.arch) + '.exe')
+          if (-not (Test-Path -LiteralPath $helper)) {
+            Write-Output "::error::CMake did not produce $helper"; exit 1
+          }
+          $log = Join-Path $env:RUNNER_TEMP 'advisor-storage-diagnostics\binary-sha-x64.log'
+          Get-FileHash -Algorithm SHA256 $helper | Format-List | Tee-Object -FilePath $log -Append
+
+      - name: Protocol conformance against the CMake binary
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          ADVISOR_STORAGE_DIAGNOSTICS: ${{ runner.temp }}/advisor-storage-diagnostics/protocol-cmake-x64.json
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $log = Join-Path $env:RUNNER_TEMP 'advisor-storage-diagnostics\protocol-cmake-x64.log'
+          node --test tests/task-advisor/native-storage-protocol.test.mjs 2>&1 | Tee-Object -FilePath $log
+          exit $LASTEXITCODE
+
+      - name: State what a green run does and does not mean
+        run: |
+          echo "Protocol conformance only. Classification is recorded, never asserted."
+          echo "Windows volume-identity binding remains UNVERIFIED; the helper reports dev=u by design."
+          echo "Hardware matrix (internal/USB/network/controller) is UNRUN on hosted runners."
+          echo "Qualification catalog remains EMPTY; production writes still refuse."
+
+      - name: Upload synthetic CI diagnostics (no binaries)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: advisor-storage-native-windows-x64-diagnostics
+          path: ${{ runner.temp }}/advisor-storage-diagnostics/
+          if-no-files-found: error
+          retention-days: 7

@@ -11,14 +11,16 @@ value. It is now four independent axes:
                  measurement in 0.8.0 that could license one. The authenticated
                  correlated report protocol is Stage B (#816 / #817).
     lifecycle    where the dispatch is in ITS OWN process (attempt started,
-                 delivery unknown, re-dispatched, cleaned, quarantined…).
+                 delivery unknown, re-dispatched, superseded, cleaned, quarantined…).
     gate         whether a human is holding it (HITL).
     observations everything that was measured, each explicitly nonterminal.
 
-Every operation is one transaction: exclusive flock on a STABLE sibling
-lockfile (never the active.json inode, which an atomic rename replaces), full
-schema validation, same-directory temp file, fsync(temp), atomic rename,
-fsync(directory). Corruption is fail-closed: bytes are preserved, a health line
+Registry mutations hold an exclusive native lock on a STABLE sibling lockfile
+(never the active.json inode, which an atomic rename replaces). Read-only
+check-dedup/get/list/snapshot remain unlocked. POSIX writes use full schema
+validation, same-directory temp file, fsync(temp), atomic rename, fsync(directory).
+Native Windows locks are supported, but durable registry writes are refused.
+Corruption is fail-closed: bytes are preserved, a health line
 is written OUTSIDE the corrupt file, and nothing is delivered, pruned or
 restored. There is no `r+ → truncate → json.dump` path anywhere.
 
@@ -32,7 +34,6 @@ from __future__ import annotations
 
 import datetime
 import errno
-import fcntl
 import hashlib
 import json
 import os
@@ -41,6 +42,11 @@ import sys
 import time
 import uuid
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 OK, USAGE, RETRY_HELD, DEDUPLICATED, REGISTRY_ERROR = 0, 4, 7, 8, 9
 
 SCHEMA_VERSION = 2
@@ -48,7 +54,8 @@ LOCK_TIMEOUT_S = 10.0
 
 # Lifecycles that are finished with: pruning may reclaim them and the pollers
 # skip them. None of them says anything about the TASK.
-RETIRED_LIFECYCLES = {"cleaned", "cutover_retired", "delivery_failed", "not_delivered"}
+RETIRED_LIFECYCLES = {"cleaned", "cutover_retired", "delivery_failed", "not_delivered",
+                      "superseded"}
 
 CAPABILITY = {
     "turn_boundary": "unavailable",
@@ -166,29 +173,78 @@ class _Lock:
     def __init__(self) -> None:
         self.path = registry_path() + ".lock"
         self.fh = None
+        self.acquired = False
 
     def __enter__(self):
         if fault("lock"):
             raise RegistryError("registry_unavailable", "lock acquisition faulted (test seam)")
-        os.makedirs(state_dir(), exist_ok=True)
-        self.fh = open(self.path, "a+")
-        deadline = time.monotonic() + LOCK_TIMEOUT_S
-        while True:
-            try:
-                fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return self
-            except OSError as exc:
-                if exc.errno not in (errno.EAGAIN, errno.EACCES):
-                    raise RegistryError("registry_unavailable", f"lock failed: {exc}")
+        try:
+            os.makedirs(state_dir(), exist_ok=True)
+            self.fh = open(self.path, "a+b", buffering=0)
+            deadline = time.monotonic() + LOCK_TIMEOUT_S
+            while True:
+                if os.name == "nt":
+                    # Append-open may start beyond zero. Lock [0, 1), even at EOF.
+                    self.fh.seek(0, os.SEEK_SET)
                 if time.monotonic() >= deadline:
                     raise RegistryError("registry_unavailable",
                                         f"lock timeout after {LOCK_TIMEOUT_S}s")
-                time.sleep(0.05)
+                try:
+                    if os.name == "nt":
+                        msvcrt.locking(self.fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as exc:
+                    if os.name == "nt":
+                        contended = (exc.errno == errno.EACCES
+                                     and getattr(exc, "winerror", None) in (None, 33))
+                    else:
+                        contended = exc.errno in (errno.EAGAIN, errno.EACCES)
+                    if not contended:
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RegistryError("registry_unavailable",
+                                            f"lock timeout after {LOCK_TIMEOUT_S}s")
+                    time.sleep(min(0.05, remaining))
+                else:
+                    self.acquired = True
+                    return self
+        except BaseException as exc:
+            self.__exit__(*sys.exc_info())
+            if isinstance(exc, OSError):
+                raise RegistryError("registry_unavailable", f"lock failed: {exc}") from exc
+            raise
 
     def __exit__(self, *exc_info):
+        cleanup_error = None
         if self.fh is not None:
-            fcntl.flock(self.fh, fcntl.LOCK_UN)
-            self.fh.close()
+            try:
+                if self.acquired:
+                    if os.name == "nt":
+                        self.fh.seek(0, os.SEEK_SET)
+                        msvcrt.locking(self.fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(self.fh, fcntl.LOCK_UN)
+            except OSError as exc:
+                cleanup_error = exc
+            finally:
+                self.acquired = False
+                try:
+                    self.fh.close()
+                except OSError as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+                    else:
+                        health("registry_unavailable", f"lock close failed: {exc}")
+                finally:
+                    self.fh = None
+        if cleanup_error is not None:
+            detail = f"lock cleanup failed: {cleanup_error}"
+            if exc_info[0] is not None:
+                health("registry_unavailable", detail)
+            else:
+                raise RegistryError("registry_unavailable", detail) from cleanup_error
         return False
 
 
@@ -250,9 +306,16 @@ def load(required: bool = True) -> dict:
     return validate(raw)
 
 
+def require_durable_writes() -> None:
+    if os.name == "nt":
+        raise RegistryError("registry_write_failed",
+                            "native Windows directory durability unavailable; registry write refused")
+
+
 def commit(doc: dict) -> None:
     """temp → fsync(temp) → rename → fsync(dir). Recovery sees one complete
     generation or the other, never a half-written file."""
+    require_durable_writes()
     doc["generation"] = int(doc.get("generation", 0)) + 1
     validate(doc)
     path = registry_path()
@@ -372,7 +435,8 @@ def append_observation(rec: dict, kind: str, at: str, **fields) -> None:
 
 
 def dedup_verdict(doc: dict, key: str) -> tuple[str, dict | None]:
-    matches = [r for r in doc["dispatches"] if r["dedup"]["key"] == key]
+    matches = [r for r in doc["dispatches"] if r["dedup"]["key"] == key
+               and r["lifecycle"]["state"] != "superseded"]
     for rec in matches:
         if rec.get("transport", {}).get("result") == "write_observed":
             return "deduplicated", rec
@@ -408,6 +472,8 @@ def op_check_dedup(args: dict) -> int:
     verdict, rec = dedup_verdict(doc, dedup_key(args["sid"], args["ref-hash"]))
     emit({"result": verdict,
           "dispatch_id": rec["dispatch_id"] if rec else None,
+          "prior_lifecycle": rec["lifecycle"]["state"] if rec else None,
+          "prior_transport": rec.get("transport", {}).get("result") if rec else None,
           "completion_fact": None})
     return {"proceed": OK, "retry_held": RETRY_HELD, "deduplicated": DEDUPLICATED}[verdict]
 
@@ -418,53 +484,77 @@ def op_begin_delivery(args: dict) -> int:
     at = now_iso(args.get("now"))
     sid, ref_hash = args["sid"], args["ref-hash"]
     key = dedup_key(sid, ref_hash)
+    retry_requested = "retry-unknown" in args
+    retry_reason = (args.get("retry-unknown") or "").strip()
     with _Lock():
         doc = load()
         verdict, prior = dedup_verdict(doc, key)
-        if verdict != "proceed":
+        retry_refused = retry_requested and (
+            not retry_reason or verdict != "retry_held"
+            or prior["lifecycle"]["state"] != "delivery_state_unknown"
+            or prior.get("transport", {}).get("result") != "unknown")
+        if retry_refused:
+            pass  # Refusal is read-only; emit after releasing the native lock.
+        elif verdict != "proceed" and not retry_requested:
             kind = "dedup_suppressed" if verdict == "deduplicated" else "dedup_retry_held"
             append_observation(prior, kind, at, ref_hash=ref_hash)
             commit(doc)
-            emit({"result": ("DISPATCH_DEDUPLICATED" if verdict == "deduplicated"
-                             else "DISPATCH_RETRY_HELD"),
-                  "dispatch_id": prior["dispatch_id"],
-                  "new_delivery": False,
-                  "prior_transport": ("write_observed" if verdict == "deduplicated" else "unknown"),
-                  "outcome": "unknown",
-                  "completion_fact": None})
-            return DEDUPLICATED if verdict == "deduplicated" else RETRY_HELD
-
-        record = {
-            "dispatch_id": uuid.uuid4().hex,
-            "assigned": {"sid": sid, "session_epoch": None},
-            "dedup": {"key": key, "ref_hash": ref_hash},
-            "outcome": {"state": "unknown", "reported_value": None, "basis": None},
-            "lifecycle": {"state": "delivery_attempt_started", "at": at},
-            "transport": {"result": "unknown", "inject_id": None, "at": None},
-            "gate": {"state": None, "prev_lifecycle": None},
-            "capability": dict(CAPABILITY),
-            "observations": [],
-            "last_observation": None,
-            "ref_path": args.get("ref-path", ""),
-            "dispatched_at": at,
-            "expected_report_by": plus_minutes(at, 30),
-            "last_seen_at": at,
-            "cwd": args.get("cwd", ""),
-            "from_sid": args.get("from", ""),
-            "re_dispatch_count": 0,
-            "keep_alive": bool(args.get("keep-alive")),
-            "track": args.get("track", ""),
-            "role": args.get("role", ""),
-            "branch": args.get("branch", ""),
-            "started_at": at,
-        }
-        if args.get("worktree"):
-            record["worktree"] = args["worktree"]
-        append_observation(record, "dispatch_tracking_started", at)
-        doc["dispatches"].append(record)
-        commit(doc)
+        else:
+            record = {
+                "dispatch_id": uuid.uuid4().hex,
+                "assigned": {"sid": sid, "session_epoch": None},
+                "dedup": {"key": key, "ref_hash": ref_hash},
+                "outcome": {"state": "unknown", "reported_value": None, "basis": None},
+                "lifecycle": {"state": "delivery_attempt_started", "at": at},
+                "transport": {"result": "unknown", "inject_id": None, "at": None},
+                "gate": {"state": None, "prev_lifecycle": None},
+                "capability": dict(CAPABILITY),
+                "observations": [],
+                "last_observation": None,
+                "ref_path": args.get("ref-path", ""),
+                "dispatched_at": at,
+                "expected_report_by": plus_minutes(at, 30),
+                "last_seen_at": at,
+                "cwd": args.get("cwd", ""),
+                "from_sid": args.get("from", ""),
+                "re_dispatch_count": 0,
+                "keep_alive": bool(args.get("keep-alive")),
+                "track": args.get("track", ""),
+                "role": args.get("role", ""),
+                "branch": args.get("branch", ""),
+                "started_at": at,
+            }
+            if args.get("worktree"):
+                record["worktree"] = args["worktree"]
+            append_observation(record, "dispatch_tracking_started", at)
+            if retry_requested:
+                # Supersede and append in one commit; no old transport/completion fact changes.
+                prior["lifecycle"] = {"state": "superseded", "at": at}
+                append_observation(prior, "superseded_by_retry", at,
+                                   superseded_by=record["dispatch_id"], reason=retry_reason)
+                append_observation(record, "retry_of_unknown", at,
+                                   retry_of=prior["dispatch_id"], reason=retry_reason)
+            doc["dispatches"].append(record)
+            commit(doc)
+    if retry_refused:
+        emit({"result": "DISPATCH_RETRY_REFUSED",
+              "dispatch_id": prior["dispatch_id"] if prior else None,
+              "prior_lifecycle": prior["lifecycle"]["state"] if prior else None,
+              "prior_transport": prior.get("transport", {}).get("result") if prior else None,
+              "new_delivery": False, "outcome": "unknown", "completion_fact": None})
+        return USAGE
+    if verdict != "proceed" and not retry_requested:
+        emit({"result": ("DISPATCH_DEDUPLICATED" if verdict == "deduplicated"
+                         else "DISPATCH_RETRY_HELD"),
+              "dispatch_id": prior["dispatch_id"],
+              "new_delivery": False,
+              "prior_transport": ("write_observed" if verdict == "deduplicated" else "unknown"),
+              "outcome": "unknown",
+              "completion_fact": None})
+        return DEDUPLICATED if verdict == "deduplicated" else RETRY_HELD
     emit({"result": "proceed", "dispatch_id": record["dispatch_id"],
-          "new_delivery": True, "outcome": "unknown", "completion_fact": None})
+          "new_delivery": True, "outcome": "unknown", "completion_fact": None,
+          "retry_of": prior["dispatch_id"] if retry_requested else None})
     return OK
 
 
@@ -673,6 +763,7 @@ def op_migrate(args: dict) -> int:
         if not isinstance(legacy, list):
             raise RegistryError("registry_corrupt", "legacy registry is neither array nor envelope")
 
+        require_durable_writes()
         backup = path + ".legacy-v1.bak"
         with open(backup, "wb") as fh:
             fh.write(raw_bytes)
@@ -768,7 +859,7 @@ OPS = {
 FLAGS = {
     "archive-sidecars": {"dir"},
     "begin-delivery": {"sid", "ref-hash", "ref-path", "cwd", "from", "track", "role",
-                       "branch", "worktree", "keep-alive", "now"},
+                       "branch", "worktree", "keep-alive", "now", "retry-unknown"},
     "check-dedup": {"sid", "ref-hash"},
     "get": {"sid", "pointer"},
     "list": {"fields", "live", "not-retired", "keep-alive", "due-before"},

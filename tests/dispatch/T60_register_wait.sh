@@ -12,6 +12,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
 t_setup; trap t_teardown EXIT
+t_confined_setup
 
 PROBE="$T_TMP/session-probe"
 cat > "$PROBE" <<'SH'
@@ -25,7 +26,7 @@ FAKE_OPEN_SESSION="$T_TMP/fake-open-session.sh"
 cat > "$FAKE_OPEN_SESSION" <<SH
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$OPEN_LOG"
-exit 0
+exec "\$T_FIXTURE_NODE" "\$T_FIXTURE_HELPER" receipt "\$T60_SID"
 SH
 chmod +x "$FAKE_OPEN_SESSION"
 
@@ -62,6 +63,12 @@ printf 'T60 dispatch ref\n' > "$REF"
 # Spawns <track>-<name>; absent_calls list misses precede registration.
 run_spawn() {
   local name="$1" absent="$2" knob="$3"; shift 3
+  local task="" previous="" arg
+  for arg in "$@"; do
+    [ "$previous" != --task ] || task="$arg"
+    previous="$arg"
+  done
+  t_confined_scope "t60-$name" "$task" "$T_TMP/cwd"
   printf '%s' "[{\"id\":\"t60-$name\",\"command\":\"claude\",\"healthStatus\":\"CONNECTED\"}]" > "$STUB_LIST_FILE"
   printf '0' > "$T60_COUNT"; : > "$STUB_DISPATCH_LOG"
   set +e
@@ -70,11 +77,12 @@ run_spawn() {
   AIGENTRY_TASK_QUEUE="$QUEUE" \
   AIGENTRY_DISPATCH_REGISTER_TIMEOUT_MS="$knob" \
   T60_ABSENT_CALLS="$absent" \
+  T60_SID="t60-$name" \
   OPEN_SESSION_SH="$FAKE_OPEN_SESSION" \
   SESSION_PROBE_PY="$PROBE" \
   TELEPTY="$LATE_TELEPTY" \
     "$REPO_ROOT/bin/dispatch.sh" --spawn-and-dispatch \
-      --track t60 --name "$name" --cwd "$T_TMP/cwd" --cli claude \
+      --track t60 --name "$name" --cwd "$T_TMP/cwd" --cli claude --role coder \
       --from t60-test --ref "$REF" --timeout-ms 800 --no-verify-started "$@" \
       >/dev/null 2>"$ERR"
   local rc=$?
@@ -120,6 +128,7 @@ rc=$(run_spawn dead 0 1500 --task 201)
 t_assert_contains "$STUB_DISPATCH_LOG" "telepty inject"
 
 # --- (d) --target keeps the historical fail-fast (only a spawn earns patience) ---
+t_confined_target t60-ghost
 start=$SECONDS
 set +e
 HOME="$T_TMP/home" TELEPTY="$STUB_BIN/telepty" \

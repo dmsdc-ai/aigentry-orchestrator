@@ -4,6 +4,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
 t_setup; trap t_teardown EXIT
+t_confined_setup
 
 OPEN_LOG="$T_TMP/open-session.log"
 PROBE="$T_TMP/session-probe"
@@ -30,6 +31,7 @@ while [ \$# -gt 0 ]; do
 done
 [ -n "\$track" ] && [ -n "\$name" ] || { echo "fake-open-session: missing track/name" >&2; exit 2; }
 printf 'track=%s name=%s alias=%s-%s cwd=%s cli=%s\n' "\$track" "\$name" "\$track" "\$name" "\$cwd" "\$cli" >> "$OPEN_LOG"
+"\$T_FIXTURE_NODE" "\$T_FIXTURE_HELPER" receipt "\$track-\$name"
 exit 0
 SH
 chmod +x "$FAKE_OPEN_SESSION"
@@ -37,6 +39,7 @@ chmod +x "$FAKE_OPEN_SESSION"
 printf '%s' '[{"id":"t49-one","command":"codex"},{"id":"t49-two","command":"codex"}]' > "$STUB_LIST_FILE"
 
 for name in one two; do
+  t_confined_scope "t49-$name" 49 "$T_TMP/cwd-$name"
   ref="$T_TMP/ref-$name.md"
   printf 'T49 %s dispatch ref\n' "$name" > "$ref"
   HOME="$T_TMP/home" \
@@ -47,7 +50,7 @@ for name in one two; do
     "$REPO_ROOT/bin/dispatch.sh" --spawn-and-dispatch \
       --track t49 --name "$name" --cwd "$T_TMP/cwd-$name" --cli codex \
       --from t49-test --ref "$ref" --timeout-ms 800 --no-verify-started \
-      --no-task "test-fixture T49" \
+      --task 49 --role coder \
       >/dev/null
 done
 
