@@ -38,6 +38,7 @@ export function setConsoleStage(name) {
   if (!CONSOLE_STAGES.includes(name)) throw new Error('acceptance_failed');
   currentStage = name;
   currentLoginSubstage = 'not-started';
+  currentOp = 'not-started';
 }
 // The same closed-enum discipline, one level finer, and only inside `login-ui`. The stage
 // alone cannot separate a failed guest precondition (the status and visibility waits before
@@ -52,6 +53,53 @@ export const loginSubstage = () => currentLoginSubstage;
 export function setLoginSubstage(name) {
   if (!LOGIN_SUBSTAGES.includes(name)) throw new Error('acceptance_failed');
   currentLoginSubstage = name;
+}
+// Third level, same closed-enum discipline, for the stages that run AFTER `login-ui` and
+// carry no substage at all: CI run 36058831812 reported stage `reload-deep-link` with
+// substage `not-started`, which localizes the failure to a whole stage and to no wait
+// inside it. These names mark the actual awaited/assertion boundaries of that stage and of
+// the four remaining stages behind it, so one CI cycle names the operation rather than the
+// stage. Static names only; nothing here is an assertion and no check anywhere reads one.
+export const CONSOLE_OPS = ['not-started',
+  'rdl-select-archived', 'rdl-goto', 'rdl-guest-status-wait', 'rdl-guest-visibility',
+  'rdl-guest-hash', 'rdl-login-click', 'rdl-detail-wait', 'rdl-settled', 'rdl-detail-values',
+  'rdl-back-click', 'rdl-back-rows-wait', 'rdl-back-settled', 'rdl-clean-dom', 'rdl-mark',
+  'sf-refresh-click', 'sf-view-burst', 'sf-filters-submit', 'sf-view-final', 'sf-rows-wait',
+  'sf-settled', 'sf-flight-check',
+  'lw-stage-file', 'lw-churn-navigate', 'lw-churn-rows', 'lw-churn-settled', 'lw-cursor-before',
+  'lw-rename', 'lw-other-page', 'lw-hidden-wait', 'lw-hidden-window', 'lw-polls-check',
+  'lw-resume-front', 'lw-visible-wait', 'lw-resumed-response', 'lw-resumed-rows',
+  'lw-resumed-settled', 'lw-cursor-expired', 'lw-restarted', 'lw-changed-detail',
+  'lw-alpha-return', 'lw-alpha-rows', 'lw-alpha-settled',
+  'rv-viewport', 'rv-root-font', 'rv-rows-wait', 'rv-layout', 'rv-clean-dom', 'rv-text-leak',
+  'rv-screenshot', 'rv-png-size', 'rv-secret-scan', 'rv-write', 'rv-reset', 'rv-names', 'rv-mark',
+  'sc-open-detail', 'sc-detail-wait', 'sc-settled', 'sc-logout-click', 'sc-signed-out-wait',
+  'sc-workspace-hidden', 'sc-rows-cleared', 'sc-fields-cleared', 'sc-logout-hidden',
+  'sc-revoked-tasks', 'sc-revoked-projects', 'sc-clean-dom', 'sc-mark'];
+let currentOp = 'not-started';
+export const consoleOp = () => currentOp;
+export function setConsoleOp(name) {
+  // Same loud failure as the stage setter: a drifting name must not mislabel a future run.
+  if (!CONSOLE_OPS.includes(name)) throw new Error('acceptance_failed');
+  currentOp = name;
+}
+// Privacy-safe state for the one stage CI actually stops in. `nav` is the status code of the
+// document response the deep-link navigation already returned, and 0 when it returned no
+// response at all - which is exactly how a same-document fragment navigation differs from a
+// real reload. The rest are y/n/u flags and bounded counts latched from values the existing
+// checks already compute; no hash, id, title, status text, markup, header or error text ever
+// enters one, and no page operation, wait, request or timeout is added to obtain any of them.
+let reloadNav = -1, reloadWorkspaceHidden = 'u', reloadGuestRows = -1, reloadHashMatch = 'u';
+let reloadFields = -1, reloadArchiveMatch = 'u', reloadLifecycleMatch = 'u', reloadStatusMatch = 'u';
+/** Static, clamped here a second time exactly like `renderLoginBoundary`. No check reads it. */
+export function renderReloadDeepLink() {
+  const countT = value => (Number.isSafeInteger(value) && value >= -1 && value <= 999 ? value : -1);
+  const codeT = value => (Number.isSafeInteger(value) && value >= 0 && value <= 599 ? value : -1);
+  const flagT = value => (['y', 'n', 'u'].includes(value) ? value : 'u');
+  return 'nav=' + codeT(reloadNav) + ' workspace-hidden=' + flagT(reloadWorkspaceHidden)
+    + ' guest-rows=' + countT(reloadGuestRows) + ' hash=' + flagT(reloadHashMatch)
+    + ' fields=' + countT(reloadFields) + ' archive=' + flagT(reloadArchiveMatch)
+    + ' lifecycle=' + flagT(reloadLifecycleMatch) + ' recorded-status=' + flagT(reloadStatusMatch);
 }
 // Diagnostics only, one level below the substage and only for the post-click wait that
 // actual CI now reports (`login-ui` / `workspace-rows`). The substage names WHICH wait
@@ -664,20 +712,55 @@ async function uiControls(deps, alpha) {
 async function reloadDeepLink(deps, alpha) {
   setConsoleStage('reload-deep-link');
   const { check, page, cleanDOM, state } = deps;
+  setConsoleOp('rdl-select-archived');
   const archived = alpha.find(row => row.archive);
-  await page.goto(`${deps.origin}/#/projects/alpha/tasks/${archived.taskId}`);
+  setConsoleOp('rdl-goto');
+  // The response object below is produced by the navigation this stage already performs;
+  // reading its status adds no request, no wait, no listener and no page interaction. A
+  // null response means the browser satisfied the navigation without a document response.
+  const navigation = await page.goto(`${deps.origin}/#/projects/alpha/tasks/${archived.taskId}`);
+  reloadNav = navigation ? navigation.status() : 0;
+  setConsoleOp('rdl-guest-status-wait');
   await page.waitForFunction(() => document.querySelector('#status').textContent === 'Sign in with your passkey.');
-  check(await page.locator('#workspace').isHidden() && await page.locator('#requests li').count() === 0);
-  check(await page.evaluate(() => location.hash) === `#/projects/alpha/tasks/${archived.taskId}`);
+  setConsoleOp('rdl-guest-visibility');
+  const workspaceHidden = await page.locator('#workspace').isHidden();
+  reloadWorkspaceHidden = workspaceHidden ? 'y' : 'n';
+  // The original expression short-circuits, so the row count is queried exactly when it was
+  // queried before: this latches state without adding one page operation on either path.
+  const guestRows = workspaceHidden ? await page.locator('#requests li').count() : -1;
+  reloadGuestRows = guestRows;
+  check(workspaceHidden && guestRows === 0);
+  setConsoleOp('rdl-guest-hash');
+  // Compared in place and discarded on the same line; only the boolean survives.
+  const hashMatch = await page.evaluate(() => location.hash) === `#/projects/alpha/tasks/${archived.taskId}`;
+  reloadHashMatch = hashMatch ? 'y' : 'n';
+  check(hashMatch);
+  setConsoleOp('rdl-login-click');
   await page.locator('#login').click();
+  setConsoleOp('rdl-detail-wait');
   await page.waitForFunction(id => !document.querySelector('#detail').hidden && document.querySelector('#fields dd')?.textContent === id, archived.taskId);
+  setConsoleOp('rdl-settled');
   await settled(page);
+  setConsoleOp('rdl-detail-values');
   const values = await page.locator('#fields dd').allTextContents();
-  check(values[3] === 'Yes; acceptance unknown' && values[4] === 'unknown' && values[2] === archived.recordedStatus);
+  reloadFields = values.length;
+  // Three booleans over the same three comparisons; no rendered text is retained or printed.
+  const archiveMatch = values[3] === 'Yes; acceptance unknown';
+  const lifecycleMatch = values[4] === 'unknown';
+  const statusMatch = values[2] === archived.recordedStatus;
+  reloadArchiveMatch = archiveMatch ? 'y' : 'n';
+  reloadLifecycleMatch = lifecycleMatch ? 'y' : 'n';
+  reloadStatusMatch = statusMatch ? 'y' : 'n';
+  check(archiveMatch && lifecycleMatch && statusMatch);
+  setConsoleOp('rdl-back-click');
   await page.locator('#back').click();
+  setConsoleOp('rdl-back-rows-wait');
   await page.waitForFunction(() => document.querySelectorAll('#requests li').length === 25);
+  setConsoleOp('rdl-back-settled');
   await settled(page);
+  setConsoleOp('rdl-clean-dom');
   await cleanDOM(page, state);
+  setConsoleOp('rdl-mark');
   mark(deps, 'console-reload-deep-link');
 }
 
@@ -693,12 +776,19 @@ async function singleFlight(deps) {
   try {
     // Real, never-disabled controls: #refresh gates itself, but the view buttons and the filter
     // form call load() unconditionally, so this is a genuine burst rather than a serialized one.
+    setConsoleOp('sf-refresh-click');
     await page.locator('#refresh').click();
+    setConsoleOp('sf-view-burst');
     for (let i = 0; i < 4; i++) await page.locator('nav button[data-view=tasks]').click();
+    setConsoleOp('sf-filters-submit');
     await page.locator('#filters button[type=submit]').click();
+    setConsoleOp('sf-view-final');
     await page.locator('nav button[data-view=tasks]').click();
+    setConsoleOp('sf-rows-wait');
     await page.waitForFunction(() => document.querySelectorAll('#requests li').length === 25);
+    setConsoleOp('sf-settled');
     await settled(page);
+    setConsoleOp('sf-flight-check');
     check(flight.total >= 2 && flight.max === 1 && flight.active === 0);
   } finally { page.off('request', opened); page.off('requestfinished', closed); page.off('requestfailed', closed); }
   return flight;
@@ -714,43 +804,64 @@ async function lifecycleWindow(deps, fixtures, alphaCursor) {
   const { check, page, context, delay, privateFile, fetchPage } = deps;
   const queue = join(fixtures.dir, 'churn-queue.json'), staged = join(fixtures.dir, 'churn-queue.next');
   const mutated = fixtures.spec.churn.tasks.map((row, index) => index === 2 ? { ...row, status: 'done' } : row);
+  setConsoleOp('lw-stage-file');
   await privateFile(staged, JSON.stringify({ tasks: mutated, completed: [] }));
+  setConsoleOp('lw-churn-navigate');
   await page.evaluate(() => { location.hash = '/projects/churn/tasks'; });
+  setConsoleOp('lw-churn-rows');
   await page.waitForFunction(() => document.querySelectorAll('#requests li').length === 6);
+  setConsoleOp('lw-churn-settled');
   await settled(page);
+  setConsoleOp('lw-cursor-before');
   const before = await fetchPage(page, '/api/console/v1/tasks?project=churn&limit=2');
   check(before.status === 200 && typeof before.json.nextCursor === 'string' && before.json.total === 6);
   check(before.json.nextCursor !== alphaCursor);
   // Source owners publish by atomic rename; the reader must notice the new revision.
+  setConsoleOp('lw-rename');
   await rename(staged, queue);
   let polls = 0;
   const count = request => { try { if (new URL(request.url()).pathname.startsWith('/api/console/')) polls++; } catch {} };
+  setConsoleOp('lw-other-page');
   const other = await context.newPage();
   try {
     await other.bringToFront();
+    setConsoleOp('lw-hidden-wait');
     await page.waitForFunction(() => document.hidden === true);
     page.on('request', count);
+    setConsoleOp('lw-hidden-window');
     await delay(HIDDEN_WINDOW_MS);
     page.off('request', count);
+    setConsoleOp('lw-polls-check');
     check(polls === 0);
     const resumed = page.waitForResponse(response => new URL(response.url()).pathname === '/api/console/v1/tasks', { timeout: 10000 });
+    setConsoleOp('lw-resume-front');
     await page.bringToFront();
+    setConsoleOp('lw-visible-wait');
     await page.waitForFunction(() => document.hidden === false);
+    setConsoleOp('lw-resumed-response');
     await resumed;
+    setConsoleOp('lw-resumed-rows');
     await page.waitForFunction(() => document.querySelectorAll('#requests li').length === 6);
+    setConsoleOp('lw-resumed-settled');
     await settled(page);
   } finally { await other.close(); }
   mark(deps, 'console-hidden-pause');
+  setConsoleOp('lw-cursor-expired');
   const expired = await fetchPage(page, `/api/console/v1/tasks?project=churn&limit=2&cursor=${encodeURIComponent(before.json.nextCursor)}`);
   check(expired.status === 409 && expired.body === '{"error":"cursor_expired"}');
+  setConsoleOp('lw-restarted');
   const restarted = await fetchPage(page, '/api/console/v1/tasks?project=churn&limit=2');
   check(restarted.status === 200 && restarted.json.projectionRevision !== before.json.projectionRevision);
   check(restarted.json.items[0].taskId === 'C001' && restarted.json.total === 6);
+  setConsoleOp('lw-changed-detail');
   const changed = await fetchPage(page, '/api/console/v1/tasks/C003?project=churn');
   check(changed.json.items[0].recordedStatus === 'done' && changed.json.items[0].lifecycle === 'unknown');
   mark(deps, 'console-cursor-expired');
+  setConsoleOp('lw-alpha-return');
   await page.evaluate(() => { location.hash = '/projects/alpha/tasks'; });
+  setConsoleOp('lw-alpha-rows');
   await page.waitForFunction(() => document.querySelectorAll('#requests li').length === 25);
+  setConsoleOp('lw-alpha-settled');
   await settled(page);
 }
 
@@ -802,27 +913,40 @@ async function responsive(deps, fixtures, artifacts) {
   const { check, page, cleanDOM, state, privateFile } = deps;
   const screenshots = {};
   for (const [name, width, height, rootFontPx] of VIEWPORTS) {
+    setConsoleOp('rv-viewport');
     await page.setViewportSize({ width, height });
+    setConsoleOp('rv-root-font');
     await page.evaluate(size => { document.documentElement.style.fontSize = `${size}px`; }, rootFontPx);
+    setConsoleOp('rv-rows-wait');
     await page.waitForFunction(() => document.querySelectorAll('#requests li').length === 25 && !document.querySelector('#refresh').disabled);
+    setConsoleOp('rv-layout');
     const layout = await page.evaluate(LAYOUT);
     check(layout.width === width && layout.rows === 25 && layout.rootFontPx === rootFontPx);
     check(layout.scrollWidth <= width + 1 && layout.bodyScroll <= width + 1);
     check(layout.overflowing.length === 0 && layout.overlaps.length === 0 && layout.small.length === 0);
+    setConsoleOp('rv-clean-dom');
     await cleanDOM(page, state);
+    setConsoleOp('rv-text-leak');
     const text = await page.evaluate(() => document.body.innerText);
     check([...fixtures.secrets, ...PAYLOADS].every(value => !text.includes(value)));
+    setConsoleOp('rv-screenshot');
     const buffer = await page.screenshot({ fullPage: false, type: 'png', animations: 'disabled', caret: 'hide' });
+    setConsoleOp('rv-png-size');
     const size = pngSize(deps, buffer);
     check(size.width === width && size.height === height);
+    setConsoleOp('rv-secret-scan');
     check(fixtures.secrets.every(secret => !buffer.includes(Buffer.from(secret, 'utf8'))));
+    setConsoleOp('rv-write');
     await privateFile(join(artifacts.dir, name), buffer);
     screenshots[name] = { sha256: digest(buffer), bytes: buffer.length, cssWidth: width, cssHeight: height, rootFontPx,
       mode: name === 'console-zoom.png' ? 'text_scale_200_percent_and_halved_css_viewport' : 'css_viewport' };
   }
+  setConsoleOp('rv-reset');
   await page.evaluate(() => { document.documentElement.style.fontSize = ''; });
   await page.setViewportSize({ width: 1280, height: 800 });
+  setConsoleOp('rv-names');
   check(JSON.stringify(Object.keys(screenshots)) === JSON.stringify(SCREENSHOTS));
+  setConsoleOp('rv-mark');
   mark(deps, 'console-responsive');
   return screenshots;
 }
@@ -831,19 +955,32 @@ async function responsive(deps, fixtures, artifacts) {
 async function stateCleared(deps) {
   setConsoleStage('state-cleared');
   const { check, page, fetchPage, cleanDOM, state } = deps;
+  setConsoleOp('sc-open-detail');
   await page.locator('#requests li button').first().click();
+  setConsoleOp('sc-detail-wait');
   await page.waitForFunction(() => !document.querySelector('#detail').hidden);
+  setConsoleOp('sc-settled');
   await settled(page);
+  setConsoleOp('sc-logout-click');
   await page.locator('#logout').click();
+  setConsoleOp('sc-signed-out-wait');
   await page.waitForFunction(() => document.querySelector('#status').textContent === 'Signed out.');
+  setConsoleOp('sc-workspace-hidden');
   check(await page.locator('#workspace').isHidden() && await page.locator('#auth').isVisible());
+  setConsoleOp('sc-rows-cleared');
   check(await page.locator('#requests li').count() === 0 && await page.locator('#detail').isHidden());
+  setConsoleOp('sc-fields-cleared');
   check(await page.locator('#fields dd').count() === 0 && await page.locator('#coverage').textContent() === '');
+  setConsoleOp('sc-logout-hidden');
   check(await page.locator('#logout').isHidden());
+  setConsoleOp('sc-revoked-tasks');
   const revoked = await fetchPage(page, '/api/console/v1/tasks?project=alpha');
   check(revoked.status === 401 && revoked.body === '{"error":"authentication_required"}');
+  setConsoleOp('sc-revoked-projects');
   check((await fetchPage(page, '/api/console/v1/projects')).status === 401);
+  setConsoleOp('sc-clean-dom');
   await cleanDOM(page, state);
+  setConsoleOp('sc-mark');
   mark(deps, 'console-state-cleared');
 }
 

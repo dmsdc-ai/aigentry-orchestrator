@@ -8,9 +8,10 @@ import { spawn } from 'node:child_process';
 import http from 'node:http';
 import https from 'node:https';
 import {
-  CONSOLE_IDS, CONSOLE_PORT, CONSOLE_STAGES, LOGIN_SUBSTAGES, artifactsDir, consoleAcceptance, consoleCallerPath,
-  consoleFixtures, consoleStage, invalidConfigRefusal, loginBoundarySnapshot, loginSubstage, prepareArtifacts,
-  renderLoginBoundary, setConsoleStage, unconfiguredRefusal, validateConsoleArtifacts,
+  CONSOLE_IDS, CONSOLE_OPS, CONSOLE_PORT, CONSOLE_STAGES, LOGIN_SUBSTAGES, artifactsDir, consoleAcceptance,
+  consoleCallerPath, consoleFixtures, consoleOp, consoleStage, invalidConfigRefusal, loginBoundarySnapshot,
+  loginSubstage, prepareArtifacts, renderLoginBoundary, renderReloadDeepLink, setConsoleStage,
+  unconfiguredRefusal, validateConsoleArtifacts,
 } from './console-ui.acceptance.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -1101,9 +1102,13 @@ await entry().catch(() => {
   // Within `login-ui` the substage separates the guest precondition from the credential
   // ceremony; outside it the substage is `not-started` and carries no claim.
   const substage = loginSubstage();
+  // One level finer again, and for the stages that have no substage: which awaited or asserted
+  // operation inside the stage was current. Closed enum, checked against it before printing.
+  const op = consoleOp();
   const seen = Number.isSafeInteger(assertions) && assertions >= 0 ? assertions : -1;
   process.stderr.write(`browser-tls acceptance: observed (stage=${CONSOLE_STAGES.includes(stage) ? stage : 'unknown'}`
-    + ` substage=${LOGIN_SUBSTAGES.includes(substage) ? substage : 'unknown'} checks-seen=${seen})\n`);
+    + ` substage=${LOGIN_SUBSTAGES.includes(substage) ? substage : 'unknown'}`
+    + ` op=${CONSOLE_OPS.includes(op) ? op : 'unknown'} checks-seen=${seen})\n`);
   // The substage names WHICH wait never satisfied; this line names the boundary it was
   // blocked behind: sign-in still pending, credential failure, server authentication
   // refusal, projects/list refusal, or a workspace that opened with the wrong row set.
@@ -1122,5 +1127,14 @@ await entry().catch(() => {
   let transfer = 'step=unknown negative=unknown';
   try { transfer = renderTransfer(); } catch { transfer = 'step=unknown negative=unknown'; }
   process.stderr.write(`browser-tls acceptance: credential-transfer (${transfer})\n`);
+  // Fourth static line, same discipline, for the stage CI currently stops in: the status code
+  // of the document response the deep-link navigation returned (0 when it returned none, which
+  // is how a same-document fragment navigation reads), plus y/n/u flags and bounded counts for
+  // each guest-precondition and detail-field comparison that stage makes. Enums, flags, counts
+  // and bounded status codes only; stderr only; no check reads it and a renderer fault cannot
+  // disturb this handler's exit.
+  let reload = 'nav=-1 workspace-hidden=u';
+  try { reload = renderReloadDeepLink(); } catch { reload = 'nav=-1 workspace-hidden=u'; }
+  process.stderr.write(`browser-tls acceptance: reload-deep-link (${reload})\n`);
   process.exitCode = 1;
 });
