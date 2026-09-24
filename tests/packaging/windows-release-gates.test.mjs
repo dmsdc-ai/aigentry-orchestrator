@@ -126,17 +126,39 @@ const browserAddition = `  browser-tls:
       - name: Actual browser, WebAuthn and TLS controls
         env:
           BROWSER_TLS_RECEIPT: \${{ runner.temp }}/browser-tls-receipt.json
+          CONSOLE_UI_ARTIFACTS: \${{ runner.temp }}/console-ui-artifacts
         run: npm run test:browser-tls
         timeout-minutes: 10
       - name: Validate complete receipt against this checkout
         env:
           BROWSER_TLS_RECEIPT: \${{ runner.temp }}/browser-tls-receipt.json
+          CONSOLE_UI_ARTIFACTS: \${{ runner.temp }}/console-ui-artifacts
         run: npm run test:browser-tls -- --validate-receipt
       - name: Upload sanitized receipt only
         uses: actions/upload-artifact@v4
         with:
           name: browser-tls-receipt
           path: \${{ runner.temp }}/browser-tls-receipt.json
+          if-no-files-found: error
+          retention-days: 7
+      # The six files are enumerated one per line rather than globbed. The run asserts that
+      # this directory holds exactly this set, so a wildcard would upload whatever a later
+      # step happened to leave behind instead of failing on it. Only these six are written
+      # there — no invitation, QR, passkey, cookie, session token, auth directory or private
+      # log — and TEMP at large is never uploaded. Success-only by default, so a failed run
+      # cannot publish a partial or unvalidated evidence set; it runs after the complete
+      # receipt validation above for the same reason.
+      - name: Upload Console UI evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: console-ui-evidence
+          path: |
+            \${{ runner.temp }}/console-ui-artifacts/console-320.png
+            \${{ runner.temp }}/console-ui-artifacts/console-390.png
+            \${{ runner.temp }}/console-ui-artifacts/console-768.png
+            \${{ runner.temp }}/console-ui-artifacts/console-1440.png
+            \${{ runner.temp }}/console-ui-artifacts/console-zoom.png
+            \${{ runner.temp }}/console-ui-artifacts/console-ui-receipt.json
           if-no-files-found: error
           retention-days: 7
 
@@ -731,6 +753,37 @@ function replaceOnce(source, needle, replacement) {
   assert.notEqual(needle, replacement, 'mutation must change bytes');
   return source.replace(needle, () => replacement);
 }
+// Whole-step slices of the independent approved contract, so the ordering negatives can
+// move a step without restating its bytes. Sliced from the contract, never from a
+// workflow under test, and each boundary is asserted present and unique.
+const browserBlockMarkers = {
+  validate: '      - name: Validate complete receipt against this checkout\n',
+  receiptUpload: '      - name: Upload sanitized receipt only\n',
+  consoleUpload: '      # The six files are enumerated one per line rather than globbed.',
+};
+function browserBlock(start, end) {
+  const from = browserAddition.indexOf(start);
+  assert.ok(from >= 0, `approved contract block start: ${start}`);
+  assert.equal(browserAddition.indexOf(start, from + 1), -1, `unique contract block start: ${start}`);
+  const to = end === undefined ? browserAddition.length : browserAddition.indexOf(end, from);
+  assert.ok(to > from, `approved contract block end: ${end}`);
+  return browserAddition.slice(from, to);
+}
+const validateBlock = browserBlock(browserBlockMarkers.validate, browserBlockMarkers.receiptUpload);
+const receiptUploadBlock = browserBlock(browserBlockMarkers.receiptUpload, browserBlockMarkers.consoleUpload);
+// Drops only the blank line that separates the approved job from the next one.
+const consoleUploadBlock = browserBlock(browserBlockMarkers.consoleUpload).replace(/\n$/, '');
+const consoleEnv = '          CONSOLE_UI_ARTIFACTS: ${{ runner.temp }}/console-ui-artifacts\n';
+// The key is identical on both steps, so each negative is anchored to the run line below it.
+const consoleEnvSites = [
+  ['browser step', '        run: npm run test:browser-tls\n'],
+  ['receipt validation step', '        run: npm run test:browser-tls -- --validate-receipt\n'],
+];
+const consolePaths = ['console-320.png', 'console-390.png', 'console-768.png',
+  'console-1440.png', 'console-zoom.png', 'console-ui-receipt.json'];
+const consoleReceiptPath = `            \${{ runner.temp }}/console-ui-artifacts/console-ui-receipt.json\n`;
+const consoleFirstPath = `            \${{ runner.temp }}/console-ui-artifacts/console-320.png\n`;
+const consoleUploadName = '      - name: Upload Console UI evidence\n';
 const browserMutations = [
   ['missing browser job', browserAddition, ''],
   ['browser skip', '  browser-tls:\n', '  browser-tls:\n    if: false\n'],
@@ -744,7 +797,11 @@ const browserMutations = [
   ['receipt validation missing', '        run: npm run test:browser-tls -- --validate-receipt\n', '        run: echo green\n'],
   ['receipt validation swallowed failure', '        run: npm run test:browser-tls -- --validate-receipt\n', '        run: npm run test:browser-tls -- --validate-receipt || true\n'],
   ['receipt upload widened', '          path: ${{ runner.temp }}/browser-tls-receipt.json\n', '          path: ${{ runner.temp }}\n'],
-  ['missing receipt accepted', '          if-no-files-found: error\n', '          if-no-files-found: ignore\n'],
+  // Both uploads now carry `if-no-files-found: error`, so this negative is anchored to the
+  // receipt path above it and still lands exactly one mutation.
+  ['missing receipt accepted',
+    '          path: ${{ runner.temp }}/browser-tls-receipt.json\n          if-no-files-found: error\n',
+    '          path: ${{ runner.temp }}/browser-tls-receipt.json\n          if-no-files-found: ignore\n'],
   ['wrong browser runner', '    runs-on: ubuntu-22.04\n', '    runs-on: windows-latest\n'],
   ['root permitted', '          test "$(id -u)" -ne 0\n', '          true\n'],
   ['hosted runner check missing', '          test "$RUNNER_ENVIRONMENT" = github-hosted\n', '          true\n'],
@@ -759,6 +816,28 @@ const browserMutations = [
   ['unrelated job command', '        run: npm test\n', '        run: echo green\n'],
   ['Windows command changed', 'node --test dist/tests/session/persistence/*.test.js', 'node --test dist/tests/*.test.js'],
   ['Windows threshold changed', '[ "${PASS}" -gt 20 ]', '[ "${PASS}" -gt 0 ]'],
+  // Console UI evidence: the artifacts directory must be declared to both steps that write
+  // or re-check it, and the upload must stay an exact six-path, success-only publication.
+  ...consoleEnvSites.flatMap(([site, anchor]) => [
+    [`Console artifacts directory missing on ${site}`, consoleEnv + anchor, anchor],
+    [`Console artifacts directory changed on ${site}`, consoleEnv + anchor,
+      '          CONSOLE_UI_ARTIFACTS: ${{ runner.temp }}\n' + anchor],
+  ]),
+  ...consolePaths.map(file => [`Console upload missing ${file}`,
+    `            \${{ runner.temp }}/console-ui-artifacts/${file}\n`, '']),
+  ['Console upload widened to a wildcard', consoleFirstPath, `            \${{ runner.temp }}/console-ui-artifacts/*\n`],
+  ['Console upload widened to the artifacts directory', consoleFirstPath, `            \${{ runner.temp }}/console-ui-artifacts\n`],
+  ['Console upload widened to TEMP', consoleFirstPath, `            \${{ runner.temp }}\n`],
+  ['missing Console evidence ignored', consoleReceiptPath + '          if-no-files-found: error\n',
+    consoleReceiptPath + '          if-no-files-found: ignore\n'],
+  ['missing Console evidence merely warned', consoleReceiptPath + '          if-no-files-found: error\n',
+    consoleReceiptPath + '          if-no-files-found: warn\n'],
+  ['Console upload on failure', consoleUploadName, `${consoleUploadName}        if: always()\n`],
+  ['Console upload continue-on-error', consoleUploadName, `${consoleUploadName}        continue-on-error: true\n`],
+  ['Console upload before receipt upload', receiptUploadBlock + consoleUploadBlock,
+    consoleUploadBlock + receiptUploadBlock],
+  ['Console upload before receipt validation', validateBlock + receiptUploadBlock + consoleUploadBlock,
+    consoleUploadBlock + validateBlock + receiptUploadBlock],
 ];
 const publishDependencies = ['browser-tls', ...original.jobs.publish.needs, ...ids];
 const publishNeeds = `    needs: [${publishDependencies.join(', ')}]\n`;

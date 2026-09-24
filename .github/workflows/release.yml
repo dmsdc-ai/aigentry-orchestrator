@@ -61,17 +61,39 @@ jobs:
       - name: Actual browser, WebAuthn and TLS controls
         env:
           BROWSER_TLS_RECEIPT: ${{ runner.temp }}/browser-tls-receipt.json
+          CONSOLE_UI_ARTIFACTS: ${{ runner.temp }}/console-ui-artifacts
         run: npm run test:browser-tls
         timeout-minutes: 10
       - name: Validate complete receipt against this checkout
         env:
           BROWSER_TLS_RECEIPT: ${{ runner.temp }}/browser-tls-receipt.json
+          CONSOLE_UI_ARTIFACTS: ${{ runner.temp }}/console-ui-artifacts
         run: npm run test:browser-tls -- --validate-receipt
       - name: Upload sanitized receipt only
         uses: actions/upload-artifact@v4
         with:
           name: browser-tls-receipt
           path: ${{ runner.temp }}/browser-tls-receipt.json
+          if-no-files-found: error
+          retention-days: 7
+      # The six files are enumerated one per line rather than globbed. The run asserts that
+      # this directory holds exactly this set, so a wildcard would upload whatever a later
+      # step happened to leave behind instead of failing on it. Only these six are written
+      # there — no invitation, QR, passkey, cookie, session token, auth directory or private
+      # log — and TEMP at large is never uploaded. Success-only by default, so a failed run
+      # cannot publish a partial or unvalidated evidence set; it runs after the complete
+      # receipt validation above for the same reason.
+      - name: Upload Console UI evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: console-ui-evidence
+          path: |
+            ${{ runner.temp }}/console-ui-artifacts/console-320.png
+            ${{ runner.temp }}/console-ui-artifacts/console-390.png
+            ${{ runner.temp }}/console-ui-artifacts/console-768.png
+            ${{ runner.temp }}/console-ui-artifacts/console-1440.png
+            ${{ runner.temp }}/console-ui-artifacts/console-zoom.png
+            ${{ runner.temp }}/console-ui-artifacts/console-ui-receipt.json
           if-no-files-found: error
           retention-days: 7
 

@@ -14,6 +14,12 @@
 # SKIP-SET MISMATCH. None of it is a code defect: T17/T18/T24/T83 need
 # dist/src/session/inject-parser.js and T47 needs dist/ to exist at all. Measured
 # 2026-08-16 (#899 tranche 1) after the trap cost one worker a false baseline.
+#
+# T160/T161 (#1162 cleanup-close port) add TWO more no-dist failures to that
+# tally, and no new skip: they measure the compiled cleanup CLI through its bin/
+# shim, so cleanup-close-lib.sh's build gate exits 2 with a single MISSING BUILD
+# diagnostic rather than announcing a skip. Measured 2026-09-25; the 93/4 figures
+# above are the older #899 measurement and are left as recorded.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 chmod +x "$HERE"/T*.sh "$HERE"/stubs/* 2>/dev/null || true
@@ -22,7 +28,7 @@ chmod +x "$HERE"/T*.sh "$HERE"/stubs/* 2>/dev/null || true
 # Two prose sources in this repo disagreed on the guard count (96 vs 99), which is why
 # this is asserted against a count of the files rather than read from a comment. Bump it
 # when you add a guard; a DROP is a deleted test, and catching that is the point.
-EXPECTED_GUARDS=135
+EXPECTED_GUARDS=137
 
 # ── the expected-skip declaration ───────────────────────────────────────────────────
 # Per entry, why it is here. A skip with no recorded reason is a silent skip with extra

@@ -66,6 +66,24 @@ WORKSPACE_HOST_SH_LOADED=1
 # tees its own `log`; the adapter only emits to stderr so it never blocks a sweep.
 _wh_log() { echo "[workspace-host] $*" >&2; }
 
+# _wh_fail_category <text> — map a host tool's failure output to ONE generated
+# token from a CLOSED vocabulary. #1162: a diagnostic must never carry an excerpt
+# of host output (arbitrary terminal text: pane content, credentials, control
+# sequences), but "why the close did not happen" is still what an operator needs.
+# So the text is read here and never reproduced; unrecognised shapes are generic.
+_wh_fail_category() {
+  local t
+  t=$(printf '%s' "${1-}" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -d '\000-\037\177')
+  case "$t" in
+    "") printf 'no-output' ;;
+    *"connection refused"*|*"failed to connect"*|*"connection reset"*|*"broken pipe"*|*daemon*|*"no such file or directory"*)
+        printf 'host-unreachable' ;;
+    *"timed out"*|*timeout*) printf 'host-timeout' ;;
+    *refused*|*veto*|*busy*|*denied*|*"not permitted"*|*unsaved*) printf 'close-refused' ;;
+    *) printf 'unknown-failure' ;;
+  esac
+}
+
 # -----------------------------------------------------------------------------
 # cmux adapter
 # -----------------------------------------------------------------------------
@@ -84,18 +102,29 @@ _wh_cmux_lookup() {
 }
 
 _wh_cmux_close() {
-  local host_id="$1"
+  local host_id="$1" out fcat
   [ -z "$host_id" ] && return 0
   if ! command -v cmux >/dev/null 2>&1; then
     return 0 # cmux not installed — treat as already-gone (no-op)
   fi
-  if cmux close-workspace --workspace "$host_id" >/dev/null 2>&1; then
+  # #1162: the attempt's own output is captured to CLASSIFY it, never to republish
+  # it. Still exactly one close call and one re-probe.
+  if out=$(cmux close-workspace --workspace "$host_id" 2>&1); then
     return 0
   fi
   # Re-probe: "close failed" often means "already closed" — confirm via alive.
   if ! _wh_cmux_alive "$host_id"; then
     return 0
   fi
+  fcat=$(_wh_fail_category "$out")
+  # #1162: the alive re-probe is an ACTUATION GUARD ("may I treat this as gone?"),
+  # not an observation of what the failed close did. A conservative PRESENT and an
+  # unanswerable probe are equally silent about whether anything was released —
+  # a close can fail partway — so neither licenses "nothing was released". One
+  # verdict: the close failed and the surface was not proven gone, therefore the
+  # release is UNCONFIRMED. The category is a generated hint about the FAILURE,
+  # never evidence of host state.
+  _wh_log "close-workspace failed for $host_id and the surface was not proven gone — release UNCONFIRMED: neither release nor retention was observed (wh_close_status=unconfirmed wh_close_category=$fcat)"
   return 1
 }
 
@@ -126,16 +155,46 @@ _wh_cmux_alive() {
   #     already gets this right — _wh_warp_alive maps "cannot probe" and "Warp is
   #     down" to INDETERMINATE→alive (#486). cmux now matches: only a real answer
   #     says gone.
+  #
+  # #1162, (c): "an Error: line somewhere in the capture" was still not an ANSWER.
+  #     cmux reports a refused daemon socket in the same `Error:` shape, and a
+  #     successful multiline state reply can carry the missing-handle text as one
+  #     of its lines; both were read as absence, and _wh_cmux_close turned that
+  #     into a successful close of a surface still on screen. So the answer must
+  #     BE the reply: a FAILED probe whose entire output is exactly the measured
+  #     text `Error: ERROR: Tab not found` (cmux 0.64.20). Everything else —
+  #     transport refusal, timeout, silence, malformed, mixed or conflicting
+  #     output, an unknown message from a future cmux — is a probe without an
+  #     answer and stays INDETERMINATE→alive. That is the fail-safe direction:
+  #     claiming PRESENT costs a non-zero close the operator can see, claiming
+  #     GONE loses the workspace silently. That makes this boolean an ACTUATION
+  #     GUARD, not an observation: PRESENT only ever means "do not treat as
+  #     gone", so no caller may restate it as evidence about what a close did or
+  #     did not release. (_WH_CMUX_PROBE_KIND still records which of the three
+  #     the probe was; it has no consumer now that the close verdict has stopped
+  #     branching on it.)
   local host_id="$1" out rc=0
+  _WH_CMUX_PROBE_KIND=indeterminate
   [ -z "$host_id" ] && return 1
   if ! command -v cmux >/dev/null 2>&1; then
     return 0 # cannot probe → INDETERMINATE→alive (INV-17), never a close signal
   fi
   out=$(cmux sidebar-state --workspace "$host_id" 2>&1) || rc=$?
-  if printf '%s\n' "$out" | grep -q '^Error:'; then
+  # $(...) already stripped the trailing newline. A trailing CR is NOT accepted: a
+  # CRLF-framed reply has never been measured against cmux, so it stays
+  # indeterminate rather than becoming a new compatibility claim.
+  if [ "$rc" -ne 0 ] && [ "$out" = "Error: ERROR: Tab not found" ]; then
+    _WH_CMUX_PROBE_KIND=gone
     return 1                  # cmux answered: no such workspace → genuinely gone
   fi
-  [ -n "$out" ] && return 0   # cmux answered with state → alive
+  if [ "$rc" -ne 0 ]; then
+    _wh_log "sidebar-state failed for $host_id (rc=$rc) — not cmux's missing-handle answer, so the probe is INDETERMINATE and the surface stays PRESENT (wh_probe_category=$(_wh_fail_category "$out"))"
+    return 0
+  fi
+  if [ -n "$out" ]; then
+    _WH_CMUX_PROBE_KIND=present
+    return 0                  # cmux answered with state → alive
+  fi
   _wh_log "sidebar-state said nothing for $host_id (rc=$rc) — treating the surface as PRESENT; an unanswered probe is not evidence that a surface is gone"
   return 0
 }

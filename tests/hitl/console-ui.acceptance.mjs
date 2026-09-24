@@ -24,6 +24,20 @@ export const CONSOLE_IDS = [
 ];
 const MAX_PNG = 2 * 1024 * 1024, MAX_RECEIPT = 64 * 1024, MAX_ARTIFACTS = 8 * 1024 * 1024;
 const HIDDEN_WINDOW_MS = 18000;
+// Diagnostics only. The CI log reports a phase label but no assertion identity, so the
+// console phase publishes which stage it is in. This is a CLOSED enum of static names:
+// no observed value, path, argument, markup, header, cookie, token or error text is ever
+// derived from it, and no check anywhere reads it. Nothing below relaxes an assertion.
+export const CONSOLE_STAGES = ['not-started', 'prepare-artifacts', 'fixtures', 'unconfigured',
+  'invalid-config', 'service-ready', 'login-ui', 'api', 'leak', 'ui', 'reload-deep-link',
+  'single-flight', 'lifecycle-window', 'responsive', 'state-cleared', 'artifacts', 'receipt'];
+let currentStage = 'not-started';
+export const consoleStage = () => currentStage;
+export function setConsoleStage(name) {
+  // A drifting stage name must fail loudly rather than mislabel a future failure.
+  if (!CONSOLE_STAGES.includes(name)) throw new Error('acceptance_failed');
+  currentStage = name;
+}
 const digest = value => createHash('sha256').update(value).digest('hex');
 const outcomes = new Map();
 const mark = (deps, id) => { deps.check(CONSOLE_IDS.includes(id) && !outcomes.has(id)); outcomes.set(id, 'pass'); deps.done(id); };
@@ -59,6 +73,7 @@ export function artifactsDir(runnerTemp) { return join(runnerTemp ?? '', 'consol
 
 /** Exactly one owned directory, under the already validated disposable runner root. */
 export async function prepareArtifacts(deps) {
+  setConsoleStage('prepare-artifacts');
   const { check, safeAncestors } = deps;
   const dir = artifactsDir(process.env.RUNNER_TEMP);
   check(process.env.CONSOLE_UI_ARTIFACTS === dir);
@@ -80,6 +95,7 @@ function queueRow(id, status, updated, index, secret) {
 
 /** Synthetic queues and an operator-owned config. No real user or host data is involved. */
 export async function consoleFixtures(deps, root) {
+  setConsoleStage('fixtures');
   const { check, privateDir, privateFile, remember } = deps;
   const dir = await privateDir(root);
   const secrets = [], spec = {};
@@ -130,6 +146,7 @@ export async function consoleFixtures(deps, root) {
 
 /** An unconfigured service must say so, and must never synthesize a Console surface. */
 export async function unconfiguredRefusal(deps, page, port) {
+  setConsoleStage('unconfigured');
   const { check, fetchPage, request, certs } = deps;
   const capabilities = await fetchPage(page, '/api/capabilities');
   check(capabilities.json.console.state === 'unavailable' && capabilities.json.console.reason === 'not_configured');
@@ -144,6 +161,7 @@ export async function unconfiguredRefusal(deps, page, port) {
 
 /** An invalid or under-privileged console configuration must refuse to open a listener. */
 export async function invalidConfigRefusal(deps, fixtures, args) {
+  setConsoleStage('invalid-config');
   const { check, child, terminate, request, bounded, certs } = deps;
   for (const [configPath, tls] of [[fixtures.relativeQueue, true], [fixtures.noTls, false]]) {
     const { proc, log } = child(process.execPath, [...args.base, '--port', String(REFUSAL_PORT),
@@ -187,6 +205,7 @@ const alphaExpected = fixtures => [...fixtures.spec.alpha.tasks.map(row => expec
   ...fixtures.spec.alpha.completed.map(row => expectRow(row, 'alpha', true))].sort((a, b) => a.taskId < b.taskId ? -1 : 1);
 
 async function apiControls(deps, fixtures) {
+  setConsoleStage('api');
   const { check, fetchPage, request, headers, certs, page, context, sessionCookie } = deps;
   const alpha = alphaExpected(fixtures);
   const projects = await fetchPage(page, '/api/console/v1/projects');
@@ -321,6 +340,7 @@ async function apiControls(deps, fixtures) {
 
 /** Nothing outside the projected fields may appear in any response, refusal or rendered page. */
 async function leakControls(deps, fixtures) {
+  setConsoleStage('leak');
   const { check, fetchPage, page } = deps;
   const forbidden = [...fixtures.secrets, ...PAYLOADS, 'should-never-be-exposed', 'original prompt',
     fixtures.queues.alpha.path, fixtures.dir, fixtures.configPath];
@@ -345,6 +365,7 @@ const settled = page => page.waitForFunction(() => !document.querySelector('#ref
   && !document.querySelector('#status').textContent.startsWith('Loading'));
 
 export async function loginUI(deps) {
+  setConsoleStage('login-ui');
   const { check, page, cleanDOM, state } = deps;
   await page.goto(deps.origin);
   await page.waitForFunction(() => document.querySelector('#status').textContent === 'Sign in with your passkey.');
@@ -366,6 +387,7 @@ export async function loginUI(deps) {
 }
 
 async function uiControls(deps, alpha) {
+  setConsoleStage('ui');
   const { check, page, cleanDOM, state } = deps;
   const rows = await rowTexts(page);
   check(rows.length === 25 && rows.every((row, index) => row.title === `Task ${alpha[index].taskId}`
@@ -447,6 +469,7 @@ async function uiControls(deps, alpha) {
 
 /** A reload really does require signing in again; only then is the deep link restored. */
 async function reloadDeepLink(deps, alpha) {
+  setConsoleStage('reload-deep-link');
   const { check, page, cleanDOM, state } = deps;
   const archived = alpha.find(row => row.archive);
   await page.goto(`${deps.origin}/#/projects/alpha/tasks/${archived.taskId}`);
@@ -467,6 +490,7 @@ async function reloadDeepLink(deps, alpha) {
 
 /** One outstanding request per client, observed in the real browser rather than asserted. */
 async function singleFlight(deps) {
+  setConsoleStage('single-flight');
   const { check, page } = deps;
   const flight = { active: 0, max: 0, total: 0 };
   const isConsole = url => { try { return new URL(url).pathname.startsWith('/api/console/'); } catch { return false; } };
@@ -493,6 +517,7 @@ async function singleFlight(deps) {
  * not a faked event or an injected clock; the 15 s poll and 15 s snapshot TTL are the product's.
  */
 async function lifecycleWindow(deps, fixtures, alphaCursor) {
+  setConsoleStage('lifecycle-window');
   const { check, page, context, delay, privateFile, fetchPage } = deps;
   const queue = join(fixtures.dir, 'churn-queue.json'), staged = join(fixtures.dir, 'churn-queue.next');
   const mutated = fixtures.spec.churn.tasks.map((row, index) => index === 2 ? { ...row, status: 'done' } : row);
@@ -580,6 +605,7 @@ const VIEWPORTS = [['console-320.png', 320, 640, 16], ['console-390.png', 390, 8
  * text, labelled as exactly that in the receipt.
  */
 async function responsive(deps, fixtures, artifacts) {
+  setConsoleStage('responsive');
   const { check, page, cleanDOM, state, privateFile } = deps;
   const screenshots = {};
   for (const [name, width, height, rootFontPx] of VIEWPORTS) {
@@ -610,6 +636,7 @@ async function responsive(deps, fixtures, artifacts) {
 
 /** Sign-out and an expired session must erase every private row before they report anything. */
 async function stateCleared(deps) {
+  setConsoleStage('state-cleared');
   const { check, page, fetchPage, cleanDOM, state } = deps;
   await page.locator('#requests li button').first().click();
   await page.waitForFunction(() => !document.querySelector('#detail').hidden);
@@ -660,11 +687,13 @@ export async function consoleAcceptance(deps) {
   mark(deps, 'console-single-flight');
   const screenshots = await responsive(deps, fixtures, artifacts);
   await stateCleared(deps);
+  setConsoleStage('artifacts');
   // The artifact control is earned before the receipt is built, because the receipt must already
   // record every control as a pass. At this point the owned directory must hold exactly the five
   // emitted screenshots and nothing else; the receipt itself is re-verified below.
   await artifactInventory(deps, artifacts, false);
   mark(deps, 'console-artifacts');
+  setConsoleStage('receipt');
   const receipt = {
     schemaVersion: 1, status: 'pass', skipped: 0, started: binding.started, finished: new Date().toISOString(),
     candidate: binding.candidate, source: binding.source, product: binding.product, tests: binding.tests,

@@ -8,8 +8,9 @@ import { spawn } from 'node:child_process';
 import http from 'node:http';
 import https from 'node:https';
 import {
-  CONSOLE_IDS, CONSOLE_PORT, artifactsDir, consoleAcceptance, consoleCallerPath, consoleFixtures,
-  invalidConfigRefusal, prepareArtifacts, unconfiguredRefusal, validateConsoleArtifacts,
+  CONSOLE_IDS, CONSOLE_PORT, CONSOLE_STAGES, artifactsDir, consoleAcceptance, consoleCallerPath, consoleFixtures,
+  consoleStage, invalidConfigRefusal, prepareArtifacts, setConsoleStage, unconfiguredRefusal,
+  validateConsoleArtifacts,
 } from './console-ui.acceptance.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -738,6 +739,7 @@ async function main() {
   await invalidConfigRefusal(consoleDeps, consoleFix, { base: consoleBase });
   const consoleProc = child(process.execPath, [...consoleBase, '--port', String(CONSOLE_PORT),
     '--tls-key', certs.trusted.keyPath, '--tls-cert', certs.trusted.certPath, '--console-config', consoleFix.configPath]).proc;
+  setConsoleStage('service-ready');
   await waitReady(consoleProc, CONSOLE_PORT, certs);
   await nodeTLS(CONSOLE_PORT, certs, certs.trusted);
   // A dedicated page keeps the console phase inside its own bounded response budget.
@@ -889,5 +891,13 @@ await entry().catch(() => {
   clearTimeout(globalTimer);
   invalidateReceipt();
   process.stderr.write(`browser-tls acceptance: fail (${/^[a-z-]+$/.test(current) ? current : 'control'})\n`);
+  // Static diagnostic for the next run: the last console stage entered, and how many checks
+  // had been seen when this handler ran. cleanup() runs further checks after the failure, so
+  // the counter is an UPPER BOUND on the failing assertion, not its index. A name from a
+  // closed enum plus an integer: neither can carry an observed value, path, argument,
+  // markup, header, cookie, token, private log line or error text. No check reads it.
+  const stage = consoleStage();
+  const seen = Number.isSafeInteger(assertions) && assertions >= 0 ? assertions : -1;
+  process.stderr.write(`browser-tls acceptance: observed (stage=${CONSOLE_STAGES.includes(stage) ? stage : 'unknown'} checks-seen=${seen})\n`);
   process.exitCode = 1;
 });
