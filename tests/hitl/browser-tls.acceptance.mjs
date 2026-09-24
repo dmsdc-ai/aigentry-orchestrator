@@ -7,6 +7,10 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
 import http from 'node:http';
 import https from 'node:https';
+import {
+  CONSOLE_IDS, CONSOLE_PORT, artifactsDir, consoleAcceptance, consoleCallerPath, consoleFixtures,
+  invalidConfigRefusal, prepareArtifacts, unconfiguredRefusal, validateConsoleArtifacts,
+} from './console-ui.acceptance.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const CONTRACT = '997c94212339070d54442dae7187f8f955d016bfc2dc93877794d7895843fd57';
@@ -23,6 +27,7 @@ const IDS = [
   'http-auth', 'http-browser', 'cli-ready', 'cli-login', 'cli-tls', 'cli-ui',
   'cli-query', 'cli-cookie', 'cli-headers', 'cli-json-navigation', 'no-execution',
   'private-logs', 'cleanup',
+  ...CONSOLE_IDS,
 ];
 const outcomes = new Map();
 const observations = [];
@@ -33,7 +38,7 @@ const browsers = new Set();
 const services = new Set();
 const logs = [];
 let assertions = 0, temporary, stopping = false, current = 'runner';
-let globalTimer, abortRun, cancellation, receiptTarget, deadline;
+let globalTimer, abortRun, cancellation, receiptTarget, consoleReceiptTarget, deadline;
 let workSettled = false;
 const started = new Date().toISOString();
 const digest = value => createHash('sha256').update(value).digest('hex');
@@ -46,6 +51,11 @@ function invalidateReceipt() {
   if (!receiptTarget) return;
   try { rmSync(receiptTarget, { force: true }); }
   catch { try { writeFileSync(receiptTarget, '{"status":"fail"}\n', { mode: 0o600 }); } catch {} }
+  // An emitted screenshot set without its validated receipt is not evidence either.
+  if (consoleReceiptTarget) {
+    try { rmSync(consoleReceiptTarget, { force: true }); }
+    catch { try { writeFileSync(consoleReceiptTarget, '{"status":"fail"}\n', { mode: 0o600 }); } catch {} }
+  }
 }
 async function bounded(promise, ms = 15000) {
   let timer;
@@ -148,7 +158,7 @@ async function identity() {
   return { source: await treeHash('src'), compiled: await treeHash('dist/src'),
     lock: await fileHash(join(ROOT, 'package-lock.json')), manifest: await fileHash(join(ROOT, 'package.json')),
     caller: await fileHash(fileURLToPath(import.meta.url)), cli: await fileHash(join(ROOT, 'dist/src/hitl/web/cli.js')),
-    contract: CONTRACT };
+    consoleCaller: await fileHash(consoleCallerPath), contract: CONTRACT };
 }
 async function toolHashes() {
   return { node: await fileHash(process.execPath), openssl: await fileHash('/usr/bin/openssl'),
@@ -340,6 +350,19 @@ async function start(startServer, auth, hitlRoot, port, tls) {
   return service;
 }
 async function closeService(service) { await bounded(service.close()); services.delete(service); }
+async function waitReady(proc, port, certs) {
+  for (let i = 0; i < 40; i++) {
+    check(proc.exitCode === null && proc.signalCode === null);
+    try {
+      const result = await request(port, '/api/capabilities', { ca: certs.ca });
+      check(result.status === 200 && JSON.parse(result.body).auth.state === 'ready');
+      observations.push({ phase: current, port, transport: 'https' });
+      return;
+    } catch (error) { if (error.code !== 'ECONNREFUSED') throw error; }
+    await delay(100);
+  }
+  throw new Error('listener_timeout');
+}
 async function fixtures(root) {
   const pending = [], history = [];
   const payloads = [
@@ -692,31 +715,55 @@ async function main() {
   current = 'cli';
   const { proc } = child(process.execPath, [join(ROOT, 'dist/src/hitl/web/cli.js'), 'serve', '--hitl-root', hitlRoot,
     '--auth-root', authRoot, '--port', '18789', '--tls-key', certs.trusted.keyPath, '--tls-cert', certs.trusted.certPath]);
-  let ready = false;
-  for (let i = 0; i < 40; i++) {
-    check(proc.exitCode === null && proc.signalCode === null);
-    try {
-      const result = await request(18789, '/api/capabilities', { ca: certs.ca });
-      check(result.status === 200 && JSON.parse(result.body).auth.state === 'ready'); ready = true; break;
-    } catch (error) { if (error.code !== 'ECONNREFUSED') throw error; }
-    await delay(100);
-  }
-  check(ready); observations.push({ phase: 'cli', port: 18789, transport: 'https' }); done('cli-ready');
+  await waitReady(proc, 18789, certs); done('cli-ready');
   const cliOrigin = 'https://localhost:18789';
   await page.goto(cliOrigin);
   await login(page); await sessionCookie(context, page, state); done('cli-login');
   await nodeTLS(18789, certs, certs.trusted); done('cli-tls');
   await surface('cli', context, page, cliOrigin, rows, state);
+  // The configured Console is a separate service on its own port, so every legacy control
+  // above keeps running against the unchanged legacy composition it was written for.
+  const consoleDeps = { check, done, exactKeys, bounded, delay, remember, request, fetchPage, headers,
+    cleanDOM, sessionCookie, privateDir, privateFile, safeAncestors, fileHash, identity, toolHashes,
+    child, terminate, chromium, certs, context, VERSION, origin: `https://localhost:${CONSOLE_PORT}`,
+    page: null, state: null, fixtures: null, artifacts: null, binding: null };
+  await unconfiguredRefusal(consoleDeps, page, 18789);
+  // One CLI at a time over the shared auth root; the legacy listener is retired first.
+  await terminate(proc);
+  current = 'console-cli';
+  const consoleArtifacts = await prepareArtifacts(consoleDeps);
+  consoleReceiptTarget = consoleArtifacts.receipt;
+  const consoleFix = await consoleFixtures(consoleDeps, join(temporary, 'console'));
+  const consoleBase = [join(ROOT, 'dist/src/hitl/web/cli.js'), 'serve', '--hitl-root', hitlRoot, '--auth-root', authRoot];
+  await invalidConfigRefusal(consoleDeps, consoleFix, { base: consoleBase });
+  const consoleProc = child(process.execPath, [...consoleBase, '--port', String(CONSOLE_PORT),
+    '--tls-key', certs.trusted.keyPath, '--tls-cert', certs.trusted.certPath, '--console-config', consoleFix.configPath]).proc;
+  await waitReady(consoleProc, CONSOLE_PORT, certs);
+  await nodeTLS(CONSOLE_PORT, certs, certs.trusted);
+  // A dedicated page keeps the console phase inside its own bounded response budget.
+  const consolePage = await context.newPage(), consoleState = observe(consolePage);
+  Object.assign(consoleDeps, { page: consolePage, state: consoleState, fixtures: consoleFix, artifacts: consoleArtifacts,
+    binding: { started, candidate: head,
+      source: { source: hashes.source, lock: hashes.lock, manifest: hashes.manifest, contract: hashes.contract },
+      product: { compiled: hashes.compiled, cli: hashes.cli },
+      tests: { browserTlsCaller: hashes.caller, consoleCaller: hashes.consoleCaller },
+      runtime: { node: process.version, hashes: await toolHashes(), image: process.env.ImageOS, imageVersion: process.env.ImageVersion,
+        run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, job: 'browser-tls' },
+      browser: { playwright: '1.58.2', version: VERSION, revision: '1208', executableHash } } });
+  const consoleEvidence = await consoleAcceptance(consoleDeps);
+  await cleanDOM(consolePage, consoleState);
+  await consolePage.close(); await terminate(consoleProc);
+  current = 'cli';
   await cleanDOM(page, state); done('no-execution');
   await cdp.send('WebAuthn.removeVirtualAuthenticator', { authenticatorId });
-  await closeBrowser(context); await terminate(proc);
+  await closeBrowser(context);
   // The evidence digest includes only bounded observations, never raw browser data.
   return { schemaVersion: 1, status: 'pass', skipped: 0, started, finished: '', assertions: 0,
     candidate: head, hashes, runner: { node: process.version, openssl, nss, hashes: await toolHashes(), image: process.env.ImageOS, imageVersion: process.env.ImageVersion,
       run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, job: 'browser-tls' },
     browser: { playwright: '1.58.2', version: VERSION, revision: '1208', executableHash },
     certificates: Object.fromEntries(['trusted', 'untrusted', 'wrong-san'].map(name => [name, certs[name].fingerprint])),
-    controls: {}, observations, evidenceDigest: '' };
+    console: consoleEvidence, controls: {}, observations, evidenceDigest: '' };
 }
 async function cleanup() {
   stopping = true;
@@ -738,8 +785,8 @@ async function cleanup() {
 }
 function exactKeys(value, keys) { check(value && JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort())); }
 async function validate(receipt) {
-  exactKeys(receipt, ['schemaVersion', 'status', 'skipped', 'started', 'finished', 'assertions', 'candidate', 'hashes', 'runner', 'browser', 'certificates', 'controls', 'observations', 'evidenceDigest']);
-  check(receipt.schemaVersion === 1 && receipt.status === 'pass' && receipt.skipped === 0 && Number.isInteger(receipt.assertions) && receipt.assertions > 200);
+  exactKeys(receipt, ['schemaVersion', 'status', 'skipped', 'started', 'finished', 'assertions', 'candidate', 'hashes', 'runner', 'browser', 'certificates', 'console', 'controls', 'observations', 'evidenceDigest']);
+  check(receipt.schemaVersion === 1 && receipt.status === 'pass' && receipt.skipped === 0 && Number.isInteger(receipt.assertions) && receipt.assertions > 400);
   check(typeof receipt.started === 'string' && typeof receipt.finished === 'string'
     && Number.isFinite(Date.parse(receipt.started)) && Date.parse(receipt.finished) >= Date.parse(receipt.started)
     && Date.parse(receipt.finished) - Date.parse(receipt.started) < 600000);
@@ -762,21 +809,26 @@ async function validate(receipt) {
   exactKeys(receipt.certificates, ['trusted', 'untrusted', 'wrong-san']);
   check(Object.values(receipt.certificates).every(value => /^(?:[A-F0-9]{2}:){31}[A-F0-9]{2}$/.test(value)));
   check(new Set(Object.values(receipt.certificates)).size === 3);
-  check(Array.isArray(receipt.observations) && receipt.observations.length === 8);
-  const phases = ['tls-untrusted', 'tls-wrong-san', 'direct-https', 'direct-https', 'http-ready-adapter', 'http-browser', 'cli', 'cli'];
+  check(Array.isArray(receipt.observations) && receipt.observations.length === 10);
+  const phases = ['tls-untrusted', 'tls-wrong-san', 'direct-https', 'direct-https', 'http-ready-adapter', 'http-browser', 'cli', 'cli', 'console-cli', 'console-cli'];
   receipt.observations.forEach((item, index) => {
-    const tls = index === 3 || index === 7, browserHTTP = index === 5;
+    const tls = index === 3 || index === 7 || index === 9, browserHTTP = index === 5;
     exactKeys(item, ['phase', 'port', 'transport', ...(tls ? ['fingerprint', 'protocol'] : []), ...(browserHTTP ? ['sessionCookieSent'] : [])]);
-    check(item.phase === phases[index] && item.port === (index < 4 ? 18787 : index < 6 ? 18788 : 18789)
+    check(item.phase === phases[index] && item.port === (index < 4 ? 18787 : index < 6 ? 18788 : index < 8 ? 18789 : CONSOLE_PORT)
       && item.transport === (index === 4 || index === 5 ? 'http' : 'https'));
     if (tls) check(item.fingerprint === receipt.certificates.trusted && ['TLSv1.2', 'TLSv1.3'].includes(item.protocol));
     if (browserHTTP) check(typeof item.sessionCookieSent === 'boolean');
   });
-  check(receipt.evidenceDigest === digest(JSON.stringify({ controls: receipt.controls, observations: receipt.observations })));
+  // The Console artifact set carries its own strict receipt; both digests are bound here.
+  exactKeys(receipt.console, ['receipt', 'artifacts', 'evidenceDigest']);
+  check(/^[a-f0-9]{64}$/.test(receipt.console.receipt) && /^[a-f0-9]{64}$/.test(receipt.console.evidenceDigest));
+  await validateConsoleArtifacts({ check, exactKeys, identity, toolHashes, fileHash, chromium, VERSION }, receipt.console);
+  check(receipt.evidenceDigest === digest(JSON.stringify({ controls: receipt.controls, observations: receipt.observations, console: receipt.console })));
 }
 async function entry() {
   const receiptPath = process.env.BROWSER_TLS_RECEIPT;
   check(receiptPath === join(process.env.RUNNER_TEMP ?? '', 'browser-tls-receipt.json'));
+  check(process.env.CONSOLE_UI_ARTIFACTS === artifactsDir(process.env.RUNNER_TEMP));
   receiptTarget = receiptPath;
   const aborted = new Promise((_, reject) => {
     abortRun = error => {
@@ -822,7 +874,7 @@ async function entry() {
   active();
   if (failure) throw new Error('acceptance_failed');
   receipt.controls = Object.fromEntries(outcomes); receipt.finished = new Date().toISOString(); receipt.assertions = assertions;
-  receipt.evidenceDigest = digest(JSON.stringify({ controls: receipt.controls, observations: receipt.observations }));
+  receipt.evidenceDigest = digest(JSON.stringify({ controls: receipt.controls, observations: receipt.observations, console: receipt.console }));
   await Promise.race([validate(receipt), aborted]);
   // A synchronous write cannot finish after a cancellation has removed its receipt.
   await new Promise(resolveImmediate => setImmediate(resolveImmediate));
