@@ -9,6 +9,7 @@
   },
   "scripts": {
     "build": "tsc -p .",
+    "build:advisor-storage": "node scripts/build-advisor-storage.mjs",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "prepack": "npm run build",
     "test": "tsc -p . && node scripts/run-tests.mjs",
@@ -33,6 +34,8 @@
   "files": [
     "dist/src",
     "bin",
+    "native/task-advisor-storage",
+    "scripts/build-advisor-storage.mjs",
     "tooling/instructions",
     "tooling/dispatch-prelude",
     ".agents/skills",
@@ -40,8 +43,6 @@
     ".claude/hooks",
     "docs/rules.md",
     "docs/model-profiles/model-routing-profile.md",
-    "docs/setup/dispatch-capacity.md",
-    "docs/setup/task-console.md",
     "docs/templates",
     "git-hooks",
     "AGENTS.md",
