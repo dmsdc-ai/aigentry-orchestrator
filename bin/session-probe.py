@@ -35,6 +35,22 @@ HARD_NEG = rf"Working\.\.\.|{THINKING_ACTIVITY}|esc to interrupt|Press Enter to 
 # the "esc to interrupt" affordance. This pattern marks that boot status so the
 # ready probe can treat the prompt as ready during MCP boot (NOT a working spinner).
 CODEX_MCP_BOOT = r"Starting MCP servers?\s*\(\d+/\d+\)"
+# #1136: telepty renders the whole Claude 2.1.281 TUI as ONE physical line, so the idle
+# prompt sits mid-line inside its input box and no positional arm in has_prompt reaches
+# it. The qualifier is the COMPLETE measured viewport, header to footer -- never a bare
+# glyph, and never just a pair of rules with whitespace between them: the "Claude Code
+# v<version>" header identity, then the top rule, the prompt glyph with its EMPTY input
+# row, then the bottom rule, then the known mode-hint footer chrome. Measured live on
+# 2.1.281. Prose that quotes the box in passing carries the chrome WITHOUT the header and
+# WITHOUT the footer, so narrative, blockquote and historical text keep reading unknown,
+# and any shape this does not recognize stays unknown rather than being guessed at.
+# This FRAMES the glyph, it does not authenticate it: a verbatim copy of a whole viewport
+# is indistinguishable from the viewport, a limit inherent to reading text.
+CLAUDE_HEADER_ID = r"Claude Code\s*v\d[\w.]*"
+CLAUDE_FOOTER_CHROME = r"shift\+tab to cycle|\? for shortcuts"
+CLAUDE_COLLAPSED_IDLE = (
+    rf"{CLAUDE_HEADER_ID}.*─{{8,}}❯[^\S\n]+─{{8,}}.*(?:{CLAUDE_FOOTER_CHROME})"
+)
 
 TRUST_MODAL = r"trust this folder|do you trust|Yes, (proceed|I trust)|Press Enter to continue"
 # #1091: `sandbox.*approv` was BOTH too loose and too narrow, measured today.
@@ -218,6 +234,13 @@ def has_prompt(cli: str, screen: str, count: int = 20) -> bool:
         or re.search(rf"(?<!\S)(?:{prompt})[ \t]*\Z", final_line) is not None
         # A bare final prompt remains observable after an unmatched output fence.
         or re.fullmatch(rf"[ \t]*(?:{prompt})[ \t]*", tail(nonempty_lines(screen), 1)) is not None
+        # #1136: the collapsed one-line Claude viewport -- the glyph is mid-line inside
+        # its input box on the final eligible line. Claude only, and only the complete
+        # header-to-footer shape: no other CLI kind, no bare or half-framed glyph, and no
+        # quoted box without the surrounding header and footer chrome takes this arm.
+        # Fence, indent and final-line eligibility stay exactly the ones the other arms
+        # use. Position is still all this observes; it never dates or authenticates.
+        or (cli == "claude" and re.search(CLAUDE_COLLAPSED_IDLE, final_line) is not None)
     )
 
 
