@@ -10,8 +10,9 @@ import https from 'node:https';
 import {
   CONSOLE_IDS, CONSOLE_OPS, CONSOLE_PORT, CONSOLE_STAGES, LOGIN_SUBSTAGES, artifactsDir, consoleAcceptance,
   consoleCallerPath, consoleFixtures, consoleOp, consoleStage, invalidConfigRefusal, loginBoundarySnapshot,
-  loginSubstage, prepareArtifacts, renderLifecycleVisibility, renderLoginBoundary,
-  renderReloadDeepLink, setConsoleStage, unconfiguredRefusal, validateConsoleArtifacts,
+  loginSubstage, prepareArtifacts, renderLifecycleVisibility, renderLifecycleWindows,
+  renderLoginBoundary, renderReloadDeepLink, setConsoleStage, unconfiguredRefusal,
+  validateConsoleArtifacts,
 } from './console-ui.acceptance.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -1222,5 +1223,16 @@ await entry().catch(() => {
   let visibility = unknownVisibility;
   try { visibility = renderLifecycleVisibility(); } catch { visibility = unknownVisibility; }
   process.stderr.write(`browser-tls acceptance: lifecycle-visibility (${visibility})\n`);
+  // Seventh static line, for the reading the visibility pair above cannot settle: whether the
+  // two owned console tabs share one top-level browser window or hold two, and the window
+  // state of each, either side of that same bringToFront. Ownership is derived only from
+  // equality of the two window ids, which never leave the helper that compares them. Closed-
+  // enum names only, re-clamped by the renderer; stderr only; no check reads it and a
+  // renderer fault cannot disturb this handler exit.
+  const unknownWindows = 'ownership=unavailable before=page:unavailable,other:unavailable'
+    + ' after=page:unavailable,other:unavailable';
+  let windows = unknownWindows;
+  try { windows = renderLifecycleWindows(); } catch { windows = unknownWindows; }
+  process.stderr.write(`browser-tls acceptance: lifecycle-windows (${windows})\n`);
   process.exitCode = 1;
 });

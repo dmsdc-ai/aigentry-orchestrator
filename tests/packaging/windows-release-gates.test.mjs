@@ -123,11 +123,31 @@ const browserAddition = `  browser-tls:
           set -euo pipefail
           node -e "const p=require('playwright/package.json');const b=JSON.parse(require('node:fs').readFileSync(require('node:path').join(require('node:path').dirname(require.resolve('playwright-core/package.json')),'browsers.json'))).browsers.find(x=>x.name==='chromium');if(p.version!=='1.58.2'||b.revision!=='1208'||b.browserVersion!=='145.0.7632.6')process.exit(1)"
           npx --no-install playwright install --with-deps chromium
+      # No new dependency: the step above already pulled Xvfb and xauth in as Chromium's
+      # documented headed prerequisites. This only proves they are present before the
+      # acceptance run, so a missing tool fails as a named preflight rather than as a
+      # ten-minute browser timeout. Nothing is installed, downloaded or version-pinned here.
+      - name: Preflight virtual display tools for headed Chromium
+        run: |
+          set -euo pipefail
+          command -v Xvfb
+          command -v xvfb-run
+          command -v xauth
       - name: Actual browser, WebAuthn and TLS controls
         env:
           BROWSER_TLS_RECEIPT: \${{ runner.temp }}/browser-tls-receipt.json
           CONSOLE_UI_ARTIFACTS: \${{ runner.temp }}/console-ui-artifacts
-        run: npm run test:browser-tls
+        # Headed Chromium on a private virtual display owned by this non-root ephemeral
+        # runner. \`-a\` picks a free server number; \`-nolisten tcp\` keeps the display off the
+        # network entirely; \`xvfb-run\` creates the X authority cookie under the runner's own
+        # uid and exports only DISPLAY and XAUTHORITY, which is all the acceptance forwards
+        # to the browser. X authentication stays on and no sandbox or TLS flag changes.
+        # \`umask 077\` first so the authority cookie the wrapper creates is owner-only by
+        # construction rather than by whatever default the image happens to carry.
+        run: |
+          set -euo pipefail
+          umask 077
+          xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp" npm run test:browser-tls
         timeout-minutes: 10
       - name: Validate complete receipt against this checkout
         env:
@@ -757,6 +777,10 @@ function replaceOnce(source, needle, replacement) {
 // move a step without restating its bytes. Sliced from the contract, never from a
 // workflow under test, and each boundary is asserted present and unique.
 const browserBlockMarkers = {
+  preflight: "      # No new dependency: the step above already pulled Xvfb and xauth in as Chromium's\n",
+  caller: '      - name: Actual browser, WebAuthn and TLS controls\n',
+  headedRun: '        run: |\n          set -euo pipefail\n          umask 077\n',
+  callerTimeout: '        timeout-minutes: 10\n',
   validate: '      - name: Validate complete receipt against this checkout\n',
   receiptUpload: '      - name: Upload sanitized receipt only\n',
   consoleUpload: '      # The six files are enumerated one per line rather than globbed.',
@@ -773,10 +797,20 @@ const validateBlock = browserBlock(browserBlockMarkers.validate, browserBlockMar
 const receiptUploadBlock = browserBlock(browserBlockMarkers.receiptUpload, browserBlockMarkers.consoleUpload);
 // Drops only the blank line that separates the approved job from the next one.
 const consoleUploadBlock = browserBlock(browserBlockMarkers.consoleUpload).replace(/\n$/, '');
+// The whole preflight step with its rationale comment, so the negative can delete the tool
+// presence check outright instead of restating it.
+const preflightBlock = browserBlock(browserBlockMarkers.preflight, browserBlockMarkers.caller);
+// The approved headed caller as one indivisible block scalar: safe wrapper, owner-only
+// authority cookie and a display that never listens on TCP.
+const headedCaller = browserBlock(browserBlockMarkers.headedRun, browserBlockMarkers.callerTimeout);
+const umaskLine = '          umask 077\n';
+const xvfbLine = '          xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp" npm run test:browser-tls\n';
+assert.equal(headedCaller, `${browserBlockMarkers.headedRun}${xvfbLine}`, 'approved headed caller is exactly the wrapped npm caller');
 const consoleEnv = '          CONSOLE_UI_ARTIFACTS: ${{ runner.temp }}/console-ui-artifacts\n';
-// The key is identical on both steps, so each negative is anchored to the run line below it.
+// The key is identical on both steps, so each negative is anchored to the unique bytes that
+// follow it: the headed caller's rationale comment on one, the plain run line on the other.
 const consoleEnvSites = [
-  ['browser step', '        run: npm run test:browser-tls\n'],
+  ['browser step', '        # Headed Chromium on a private virtual display owned by this non-root ephemeral\n'],
   ['receipt validation step', '        run: npm run test:browser-tls -- --validate-receipt\n'],
 ];
 const consolePaths = ['console-320.png', 'console-390.png', 'console-768.png',
@@ -789,11 +823,28 @@ const browserMutations = [
   ['browser skip', '  browser-tls:\n', '  browser-tls:\n    if: false\n'],
   ['browser always', '  browser-tls:\n', '  browser-tls:\n    if: always()\n'],
   ['browser continue-on-error', '  browser-tls:\n', '  browser-tls:\n    continue-on-error: true\n'],
-  ['caller skip', '        run: npm run test:browser-tls\n', '        if: false\n        run: npm run test:browser-tls\n'],
-  ['caller always', '        run: npm run test:browser-tls\n', '        if: always()\n        run: npm run test:browser-tls\n'],
-  ['caller continue-on-error', '        run: npm run test:browser-tls\n', '        continue-on-error: true\n        run: npm run test:browser-tls\n'],
-  ['caller swallowed failure', '        run: npm run test:browser-tls\n', '        run: npm run test:browser-tls || true\n'],
-  ['caller no-op', '        run: npm run test:browser-tls\n', '        run: echo green\n'],
+  ['caller skip', headedCaller, `        if: false\n${headedCaller}`],
+  ['caller always', headedCaller, `        if: always()\n${headedCaller}`],
+  ['caller continue-on-error', headedCaller, `        continue-on-error: true\n${headedCaller}`],
+  ['caller swallowed failure', xvfbLine,
+    '          xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp" npm run test:browser-tls || true\n'],
+  ['caller no-op', headedCaller, '        run: echo green\n'],
+  // Headed display controls. The wrapper, its owner-only authority cookie, the disabled X
+  // TCP socket and the named preflight are each load-bearing, so each removal or weakening
+  // is its own negative rather than being folded into one "caller changed" case.
+  ['headed wrapper removed', xvfbLine, '          npm run test:browser-tls\n'],
+  ['headed wrapper replaced by bare display export', xvfbLine, '          DISPLAY=:99 npm run test:browser-tls\n'],
+  ['private cookie umask removed', umaskLine, ''],
+  ['private cookie umask widened', umaskLine, '          umask 022\n'],
+  ['X authentication disabled', xvfbLine,
+    '          xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp -ac" npm run test:browser-tls\n'],
+  ['X authority cookie shared', xvfbLine,
+    '          xvfb-run -a -f /tmp/xauth --server-args="-screen 0 1280x1024x24 -nolisten tcp" npm run test:browser-tls\n'],
+  ['display listening on TCP', xvfbLine,
+    '          xvfb-run -a --server-args="-screen 0 1280x1024x24" npm run test:browser-tls\n'],
+  ['preflight display tools missing', preflightBlock, ''],
+  ['preflight wrapper unchecked', '          command -v xvfb-run\n', ''],
+  ['preflight X authority tool unchecked', '          command -v xauth\n', ''],
   ['receipt validation missing', '        run: npm run test:browser-tls -- --validate-receipt\n', '        run: echo green\n'],
   ['receipt validation swallowed failure', '        run: npm run test:browser-tls -- --validate-receipt\n', '        run: npm run test:browser-tls -- --validate-receipt || true\n'],
   ['receipt upload widened', '          path: ${{ runner.temp }}/browser-tls-receipt.json\n', '          path: ${{ runner.temp }}\n'],

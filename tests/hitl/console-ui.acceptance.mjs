@@ -282,6 +282,78 @@ export function renderLifecycleVisibility() {
   return `before=page:${visibilityOf(before.page)},other:${visibilityOf(before.other)}`
     + ` after=page:${visibilityOf(after.page)},other:${visibilityOf(after.other)}`;
 }
+// Diagnostics only, one level below the visibility pair above and for the same wait. The
+// states there are a fact; WHY they hold is not, and the two surviving readings differ only
+// in whether the second tab got its own top-level browser window. This reads that ownership
+// from the browser itself, through `context.newCDPSession` - the real-browser control
+// surface this fixture already sanctions - and `Browser.getWindowForTarget`. It is browser
+// state introspection, not document spoofing: no visibility API is patched, no event is
+// dispatched and no product polling is intercepted. The two window ids are compared for
+// equality inside the helper and discarded there, so neither id, nor any target id, URL,
+// title, path, argument or error text, can reach the line. Every field is a CLOSED enum,
+// clamped again by the renderer. No check anywhere reads any of it, and nothing here
+// relaxes, skips, retries or lengthens the wait that follows.
+export const WINDOW_OWNERSHIPS = ['not-captured', 'same-window', 'distinct-window', 'unavailable'];
+export const WINDOW_STATES = ['not-captured', 'normal', 'minimized', 'maximized', 'fullscreen', 'unavailable'];
+const OBSERVED_WINDOW_STATES = ['normal', 'minimized', 'maximized', 'fullscreen'];
+const ownershipOf = value => (WINDOW_OWNERSHIPS.includes(value) ? value : 'unavailable');
+const windowStateOf = value => (WINDOW_STATES.includes(value) ? value : 'unavailable');
+let windowOwnership = 'not-captured';
+let windowsBefore = { page: 'not-captured', other: 'not-captured' };
+let windowsAfter = { page: 'not-captured', other: 'not-captured' };
+/** Total, exactly like `captureVisibility`: never throws, never checks, never marks and
+ *  returns nothing the caller acts on, so a diagnostic fault can never replace the original
+ *  rejection. An unobservable tab records `unavailable`, never a window it did not see. No CDP
+ *  attachment outlives the observation, by two distinct routes: a session handed over in time
+ *  is detached in `finally` inside the same PROBE_MS budget, and one that arrives only after
+ *  the bounded wait already gave up is detached by the self-cleaning acquisition below -
+ *  `finally` cannot reach that one, because it only ever sees `session` still null. Bounded by
+ *  the caller's own `bounded` and the existing PROBE_MS; it adds no retry, no sleep and no
+ *  timeout or deadline increase. */
+async function captureWindows(deps, page, other) {
+  const read = async target => {
+    let session = null;
+    // Held separately from the bounded wait below. That wait abandons this promise when it
+    // times out, but the promise itself stays live and can still resolve with a real session
+    // afterwards. Both of its settlements are observed here: a late session is detached, and
+    // a late failure is swallowed, so an abandoned acquisition can never surface as an
+    // unhandled rejection and take down the run that is already failing for its own reason.
+    const acquisition = deps.context.newCDPSession(target);
+    try {
+      session = await deps.bounded(acquisition, PROBE_MS);
+      const info = await deps.bounded(session.send('Browser.getWindowForTarget'), PROBE_MS);
+      const id = info && Number.isSafeInteger(info.windowId) ? info.windowId : null;
+      const observed = info && info.bounds ? info.bounds.windowState : null;
+      return { id, state: OBSERVED_WINDOW_STATES.includes(observed) ? observed : 'unavailable' };
+    } catch { return { id: null, state: 'unavailable' }; }
+    finally {
+      // Exactly one branch runs, and `session` is non-null only when the bounded wait itself
+      // returned it, so the two can never both detach the same session. The sweep is
+      // registered, never awaited: it adds nothing to this stage or to the deadline, and the
+      // browser settles the still-pending acquisition on its own - at context close at the
+      // latest - at which point the handler detaches whatever it receives.
+      if (session) { try { await deps.bounded(session.detach(), PROBE_MS); } catch {} }
+      else void acquisition.then(late => late.detach().catch(() => {}), () => {});
+    }
+  };
+  try {
+    const own = await read(page), second = await read(other);
+    const ownership = own.id === null || second.id === null ? 'unavailable'
+      : (own.id === second.id ? 'same-window' : 'distinct-window');
+    return { ownership, states: { page: own.state, other: second.state } };
+  } catch { return { ownership: 'unavailable', states: { page: 'unavailable', other: 'unavailable' } }; }
+}
+/** Serialized only after the rejection, to stderr only, exactly like `renderLoginBoundary`.
+ *  Ownership is a property of the two tabs, not of the front-change between the observations,
+ *  so it is latched from the first and falls back to the second only when the first could not
+ *  be made at all. */
+export function renderLifecycleWindows() {
+  const pair = value => (value && typeof value === 'object' ? value : {});
+  const before = pair(windowsBefore), after = pair(windowsAfter);
+  return `ownership=${ownershipOf(windowOwnership)}`
+    + ` before=page:${windowStateOf(before.page)},other:${windowStateOf(before.other)}`
+    + ` after=page:${windowStateOf(after.page)},other:${windowStateOf(after.other)}`;
+}
 const digest = value => createHash('sha256').update(value).digest('hex');
 const outcomes = new Map();
 const mark = (deps, id) => { deps.check(CONSOLE_IDS.includes(id) && !outcomes.has(id)); outcomes.set(id, 'pass'); deps.done(id); };
@@ -864,8 +936,15 @@ async function lifecycleWindow(deps, fixtures, alphaCursor) {
   try {
     // Real states either side of the front-change, from the two owned tabs themselves.
     visibilityBefore = await captureVisibility(deps, page, other);
+    // Same two points, same discipline: which window owns each tab, and each window state.
+    const windowsAtStart = await captureWindows(deps, page, other);
+    windowOwnership = windowsAtStart.ownership;
+    windowsBefore = windowsAtStart.states;
     await other.bringToFront();
     visibilityAfter = await captureVisibility(deps, page, other);
+    const windowsAtEnd = await captureWindows(deps, page, other);
+    if (windowOwnership === 'unavailable') windowOwnership = windowsAtEnd.ownership;
+    windowsAfter = windowsAtEnd.states;
     setConsoleOp('lw-hidden-wait');
     await page.waitForFunction(() => document.hidden === true);
     page.on('request', count);
