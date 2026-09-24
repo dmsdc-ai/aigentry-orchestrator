@@ -31,12 +31,20 @@
 # behave exactly as before. A15..A19 in particular is what makes A10's "no
 # cleaned mark" a MEASURED absence rather than a vacuous one.
 #
-# KNOWN BOUNDARY, reported not fixed (G1). On the telepty-orphan arm (sid absent
-# from the telepty list) the close status is still discarded: exit 0, no
-# UNCONFIRMED, and registryCleaned(sid) is called unconditionally, so the sid is
-# marked cleaned after a close that was never observed to succeed. That sits
-# inside the separately-OPEN missing-lookup/orphan area and is NOT asserted as
-# accepted here. A20..A23 measure only the GENUINE known-gone arm.
+# FORMER BOUNDARY G1 — now measured, corrected and guarded by T162. This header
+# used to record G1 as reported-not-fixed: on the telepty-orphan arm (sid absent
+# from the telepty list) the close status was discarded — exit 0, no UNCONFIRMED,
+# and registryCleaned(sid) called unconditionally, so the sid was marked cleaned
+# after a close that was never observed to succeed. That reservation is stale.
+# The orphan arm is now driven with a GENUINELY DISCOVERABLE owned mapping (which
+# is what the old refuse-everything fixture could not do), the discarded status
+# was confirmed as a defect rather than a bounded gap, and the correction ships.
+# T162_cleanup_orphan_close.sh is the standing regression for it and is where the
+# orphan-arm oracles live; nothing in THIS file's scope changed, and A20..A23
+# still measure only the GENUINE known-gone arm.
+#
+# STILL OPEN, and deliberately NOT redesigned by either guard: missing-mapping
+# semantics (exit 0 when no host id maps at all) and DELETE-status semantics.
 #
 # NO PRODUCT EDITS. Synthetic sids only, kill tripwire armed on every case, no
 # network. One addition over T160's posture: the dispatch registry gets an
