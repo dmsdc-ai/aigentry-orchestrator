@@ -209,7 +209,7 @@ def cli_from_info_or_screen(info: dict[str, Any], screen: str, override: str = "
     return "claude"
 
 
-def tracker_class(screen: str) -> str:
+def tracker_class(screen: str, *, current: bool = False) -> str:
     lines = nonempty_lines(screen)
     if not lines:
         return "blank"
@@ -217,7 +217,8 @@ def tracker_class(screen: str) -> str:
     last3 = tail(lines, 3)
     if re.search(TRACKER_ERR, tail20, re.I):
         return "error"
-    welcome_in_tail = re.search(TRACKER_WELCOME, tail20, re.I)
+    welcome_in_tail = (current_prompt_control(TRACKER_WELCOME, tail20) if current else
+                       re.search(TRACKER_WELCOME, tail20, re.I))
     prompt_in_last3 = (
         re.search(r"^[\u276f\u203a]", last3, flags=re.MULTILINE) is not None
         or "\u276f" in last3
@@ -295,7 +296,7 @@ def current_busy_signal(screen: str) -> bool:
 def current_prompt_control(pattern: str, screen: str) -> bool:
     # Allow terminal borders, prompt/selection glyphs and numbered choices,
     # but not a control phrase embedded in a reply sentence.
-    prefix = r"^\s*[\u2502\u2503\u276f\u203a\u25cf\u2022>]*\s*(?:\d+[.)]\s*)?"
+    prefix = r"^[^\w\n]*(?:\d+[.)][^\w\n]*)?"
     return re.search(prefix + "(?:" + pattern + ")", screen, re.I | re.M) is not None
 
 
@@ -350,7 +351,8 @@ def classify_surface(cli: str, screen: str, *, current: bool = False) -> tuple[s
 
     banner = BANNERS.get(cli, r"Welcome|Initializing|Loading|Tips for getting started")
     prompt = PROMPTS.get(cli, r"\u276f|\u203a")
-    if re.search(banner, tail20, re.I):
+    if (current_prompt_control(banner, tail20) if current else
+            re.search(banner, tail20, re.I)):
         return "welcome", "welcome/bootstrap banner"
     if re.search(prompt, tail20):
         return "idle", "idle prompt"
@@ -455,7 +457,7 @@ def observe(args: argparse.Namespace) -> dict[str, Any]:
         "ready_reason": ready_reason,
         "screen_source": screen_source,
         "surface_detail": surface_detail,
-        "tracker_class": tracker_class(controls),
+        "tracker_class": tracker_class(controls, current=not args.screen_file),
         "verify_started": verified_started,
         "verify_problems": problems,
     }
