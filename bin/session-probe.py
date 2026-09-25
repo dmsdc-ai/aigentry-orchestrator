@@ -271,10 +271,25 @@ def current_controls(cli: str, screen: str) -> str:
     if cli != "claude":
         return screen
     duration_footer = re.compile(
-        r"^\s*[\u2722\u2733\u2736\u273b\u273d]\s+[A-Za-z]+ for "
-        r"(?:\d+[hms]\s*)+\s*\u00b7\s*done(?:\s+[^\n]*)?$", re.I)
+        r"^\s*[\u2722\u2733\u2736\u273b\u273d]\s*[^\W\d_]+(?:-[^\W\d_]+)* for "
+        r"(?:\d+[hms]\s*)+\s*\u00b7\s*done"
+        r"(?:\s+\(\d+ tool uses?\))?"
+        r"(?:\s+(?:(?:AM|PM|\uc624\uc804|\uc624\ud6c4)\s*)?"
+        r"\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?)?\s*$", re.I)
     return "\n".join(line for line in screen.splitlines()
                      if not duration_footer.fullmatch(line))
+
+
+def current_busy_signal(screen: str) -> bool:
+    # Inline prose quoting a control is not a status row. A standalone quoted
+    # control remains ambiguous and blocks regardless of distance from the prompt.
+    pattern = (
+        r"^\s*(?:[\u2722\u2733\u2736\u273b\u273d]\s*\S"
+        r"|[\u23f5\u25b6].*esc to interrupt"
+        r"|(?:[\u25a0\u2022]\s*)?(?:Working|Thinking|Compacting)\b"
+        r"|(?:Esc to interrupt|Press Enter to continue|Do you trust)\b)"
+    )
+    return bool(re.search(pattern, screen, re.I | re.M) or has_spinner(screen))
 
 
 def ready_by_current_screen(cli: str, screen: str, surface: str) -> tuple[bool, str]:
@@ -288,14 +303,14 @@ def ready_by_current_screen(cli: str, screen: str, surface: str) -> tuple[bool, 
                      tail(lines, 5)):
         return False, "no-empty-current-prompt"
     controls = current_controls(cli, screen)
-    if re.search(HARD_NEG + r"|Compacting", tail(nonempty_lines(controls), 8), re.I):
+    if current_busy_signal(controls):
         return False, "current-busy-or-modal"
     if surface == "working":
         return False, "current-working"
     return ready_by_screen(cli, controls)
 
 
-def classify_surface(cli: str, screen: str) -> tuple[str, str]:
+def classify_surface(cli: str, screen: str, *, current: bool = False) -> tuple[str, str]:
     lines = nonempty_lines(screen)
     if not lines:
         return SURFACE_UNKNOWN, "blank screen"
@@ -320,7 +335,8 @@ def classify_surface(cli: str, screen: str) -> tuple[str, str]:
         return "raw_shell", "raw shell prompt at tail"
     if re.search(UNSUBMITTED, last4):
         return "unsubmitted", "context-ref still at live prompt"
-    if re.search(WORKING, tail20, re.I) or has_spinner(tail20):
+    if (current_busy_signal(screen) if current else
+            re.search(WORKING, tail20, re.I) or has_spinner(tail20)):
         return "working", "working token"
 
     banner = BANNERS.get(cli, r"Welcome|Initializing|Loading|Tips for getting started")
@@ -407,9 +423,9 @@ def observe(args: argparse.Namespace) -> dict[str, Any]:
     alive = bool(info) and (not health or health.upper() == "CONNECTED")
 
     controls = current_controls(cli, screen) if not args.screen_file else screen
-    surface, surface_detail = classify_surface(cli, screen)
+    surface, surface_detail = classify_surface(cli, screen, current=not args.screen_file)
     if not args.screen_file and surface in ("working", "idle", "welcome", SURFACE_UNKNOWN):
-        surface, surface_detail = classify_surface(cli, controls)
+        surface, surface_detail = classify_surface(cli, controls, current=True)
     unsubmitted = surface == "unsubmitted"
     working_token = surface == "working"
     activity = "moving" if working_token and not unsubmitted else "static"
