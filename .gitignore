@@ -1,4 +1,4 @@
-state
+state/*
 
 # AGENTS.md slim backup (2026-04-20)
 AGENTS.md.pre-slim.*.bak
@@ -31,3 +31,4 @@ __pycache__/
 *.bak
 !state/draft/
 !state/migration/
+!state/task-queue.json

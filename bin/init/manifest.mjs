@@ -14,11 +14,15 @@
 //   tooling/instructions/**  12, as specified.
 //   Governance layer 51 (spec said 48; delta is exactly the bin/** delta above).
 
+import os from "node:os";
+import path from "node:path";
+
 /** Set A. Every path init promises the installed package contains, and copies. */
 const MANIFEST = [
   // ---- bin/** — `git ls-files bin`, complete. T96 assertion 4 pins this to the tree.
   "bin/ask.sh",
   "bin/boot-prepare.mjs",
+  "bin/current_screen.py",
   "bin/dispatch-cleanup-scheduler.sh",
   "bin/dispatch-registry.py",
   "bin/dispatch-tracker.sh",
@@ -38,6 +42,7 @@ const MANIFEST = [
   "bin/lib/telepty-auth.sh",
   "bin/lib/telepty-listing.sh",
   "bin/lib/workspace-host.sh",
+  "bin/model-router.mjs",
   "bin/open-session.sh",
   "bin/orchestrator-boot.sh",
   "bin/orchestrator-bridge-auditor.sh",
@@ -65,6 +70,7 @@ const MANIFEST = [
   "AGENTS.md",
   "CLAUDE.md",
   "docs/rules.md",
+  "docs/model-profiles/model-routing-profile.md",
   "docs/templates/dispatch-ref-checklist.md",
   "docs/templates/dispatch-ref-template.md",
 
@@ -108,6 +114,7 @@ const SCAFFOLD_PREFIX = "tooling/instructions/";
  *  nothing ships into the governance surface without init placing it. */
 const GOVERNANCE_ROOTS = [
   "bin/",
+  "docs/model-profiles/",
   "docs/rules.md",
   "docs/templates/",
   ".agents/",
@@ -129,6 +136,20 @@ const TARBALL_EXEMPT = ["package.json", "README.md", "README.tmpl.md", "LICENSE"
  *  at inject time, #690) and tooling/dispatch-prelude/template.md's {{SESSION_ID}} et al.
  *  Measured: 9 files carry such tokens. Grepping for "{{" would make init always exit 7. */
 const TEMPLATE_TOKENS = ["{{CONSTITUTION_PATH}}", "{{CONTROL_WORKSPACE}}", "{{DEVICE_ID}}", "{{CREATED_AT}}"];
+
+/** The values for TEMPLATE_TOKENS — computed in ONE place. `init` (bin/init/cli.mjs) and
+ *  bin/install-instructions.sh both consume this. The installer used to be a bare `cp` with
+ *  substitution living only on the init path, so a --force re-install from a git checkout
+ *  restored raw tokens over an init'd ~/.aigentry/instructions (#1069). */
+const templateSubs = (ws, aigentryHome) => ({
+  "{{CONSTITUTION_PATH}}": path.join(aigentryHome, "CONSTITUTION.md"),
+  "{{CONTROL_WORKSPACE}}": ws,
+  "{{DEVICE_ID}}": `device-${os.hostname()}`,
+  "{{CREATED_AT}}": new Date().toISOString(),
+});
+
+const substitute = (text, subs) =>
+  Object.entries(subs).reduce((acc, [token, value]) => acc.split(token).join(value), text);
 
 /** Files whose token literals ARE their content, not placeholders in it. Substituting them
  *  corrupts the mechanism: bin/init/** is the substitution engine (this list lives in it),
@@ -171,6 +192,8 @@ export {
   GOVERNANCE_ROOTS,
   TARBALL_EXEMPT,
   TEMPLATE_TOKENS,
+  templateSubs,
+  substitute,
   isSubstitutionExempt,
   isExecutable,
   STATE_DIRS,

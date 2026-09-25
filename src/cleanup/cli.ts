@@ -474,6 +474,51 @@ function registryCleaned(sid: string): void {
   runQuiet(DISPATCH_REGISTRY_PY, ["set-lifecycle", "--sid", sid, "--state", "cleaned", "--all"]);
 }
 
+/**
+ * #1091 — boot-prepare's agy arm appends the canonical role-sandbox path to
+ * `trustedWorkspaces` in agy's settings.json on EVERY spawn (bin/boot-prepare.mjs
+ * ensureAgyTrust) and nothing ever removed one: three dead sandboxes had already
+ * accumulated by the time this was written, and agy itself never prunes. Reaping the
+ * session is the moment its sandbox stops existing, so the removal belongs here — the
+ * mirror of the write, on the same key, with the same tmp+rename and the same 0600.
+ *
+ * It only ever removes THIS sid's own entry: a path under a `role-sandbox` directory
+ * whose leaf is `<role>-<sid>`. A workspace a human trusted (or another live worker's
+ * sandbox) matches neither test. A missing or unparseable file is a no-op, exactly as
+ * ensureAgyTrust refuses to invent agy's tree — cleanup must not fail on it either.
+ */
+function pruneAgyTrust(sid: string): void {
+  if (!sid) return;
+  const home = env.HOME || "";
+  if (!home) return;
+  const settings = path.join(home, ".gemini", "antigravity-cli", "settings.json");
+  let cfg: Record<string, unknown>;
+  try {
+    cfg = JSON.parse(fs.readFileSync(settings, "utf8")) as Record<string, unknown>;
+  } catch {
+    return; // no file, or not JSON — agy's tree is never invented or repaired here
+  }
+  if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) return;
+  const prior = cfg.trustedWorkspaces;
+  if (!Array.isArray(prior)) return;
+  const isThisSession = (entry: unknown): boolean =>
+    typeof entry === "string" &&
+    entry.split(path.sep).includes("role-sandbox") &&
+    path.basename(entry).endsWith(`-${sid}`);
+  const kept = prior.filter((entry) => !isThisSession(entry));
+  if (kept.length === prior.length) return;
+  cfg.trustedWorkspaces = kept;
+  const tmp = `${settings}.session-cleanup.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, settings);
+    log(`agy trust: pruned ${prior.length - kept.length} trustedWorkspaces entry/entries for ${sid}`);
+  } catch (e) {
+    err(`agy trust prune failed for ${sid} (${(e as Error)?.message ?? e}); the entry STAYS in ${settings}`);
+    try { fs.unlinkSync(tmp); } catch { /* nothing to clean */ }
+  }
+}
+
 /** 0 on success (including the idempotent no-op), 1 on the Rule 28 protected refusal. */
 function cleanupOne(sid: string, force: boolean): number {
   if (sid === PROTECTED_SID && !force) {
@@ -494,6 +539,7 @@ function cleanupOne(sid: string, force: boolean): number {
     // this is LIFECYCLE only. A session disappearing is not a task completing, so
     // the outcome stays unknown and the record keeps its history.
     registryCleaned(sid);
+    pruneAgyTrust(sid);
     return 0;
   }
   // Step 1 — kill parent (load-bearing; auto-deregisters most cases)
@@ -506,6 +552,8 @@ function cleanupOne(sid: string, force: boolean): number {
   deleteSessionRegistry(sid);
   // #540 — same lifecycle-only mark on the normal kill+close+DELETE path.
   registryCleaned(sid);
+  // #1091 — and drop this sandbox from agy's trust store on the same path.
+  pruneAgyTrust(sid);
   return 0;
 }
 

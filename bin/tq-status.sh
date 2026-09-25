@@ -33,7 +33,7 @@ jq -r '
   "=== Top 5 Recent Activity (by id desc) ===",
   (
     [.tasks[] | select((.updated_at // "") != "" or .id >= 240)] |
-    sort_by(-.id)[0:5] |
+    sort_by(-(.id|tonumber? // 0))[0:5] |
     map("  #\(.id) [\(.track // "legacy")] \(.status) — \(.desc | .[0:80])") |
     join("\n")
   )

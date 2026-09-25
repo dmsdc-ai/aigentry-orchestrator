@@ -11,6 +11,8 @@ import subprocess
 import sys
 from typing import Any, TextIO
 
+from current_screen import ScreenUnavailable, capture_object, read_current_screen
+
 
 SURFACE_UNKNOWN = "unknown"
 BRAILLE = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
@@ -18,9 +20,16 @@ BRAILLE = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
 BANNERS = {
     "claude": r"Welcome back|Tips for getting started|Trust this folder|Do you want to enable|Press Enter to continue",
     "codex": r"Welcome to .*Codex|OpenAI Codex CLI|Loading\u2026|Initializing",
-    "gemini": r"Welcome to Gemini|Loading model|Initializing|Authenticating",
+    # #1090: the `gemini` kind is also agy (Antigravity CLI, geminiBinary()). Its
+    # welcome header is "Antigravity CLI 1.1.27" (transiently "Welcome to the
+    # Antigravity CLI"), its boot shows "Accessing workspace: <cwd>", and its
+    # folder-trust modal asks "Do you trust the contents of this project?".
+    "gemini": r"Welcome to Gemini|Loading model|Initializing|Authenticating|Antigravity CLI|Accessing workspace|Do you trust the contents of this project",
 }
-PROMPTS = {"claude": r"\u276f", "codex": r"\u203a", "gemini": r"\u203a|\u2502 >"}
+# #1090: agy's idle prompt is a bare `>` line framed by two horizontal rules
+# (measured live, 1.1.27): "────…\n>\n────…". Anchor on rule+`>` so a quoted
+# `> text` inside a reply never reads as the prompt.
+PROMPTS = {"claude": r"\u276f", "codex": r"\u203a", "gemini": r"\u203a|\u2502 >|\u2500{8,}\n>"}
 HARD_NEG = r"Working\.\.\.|Thinking|esc to interrupt|Press Enter to continue|Do you trust"
 # #557: codex's `\u203a` REPL is interactive WHILE its MCP servers boot, but the
 # "Starting MCP servers (n/6) \u2026 (esc to interrupt)" status line trips HARD_NEG via
@@ -29,7 +38,20 @@ HARD_NEG = r"Working\.\.\.|Thinking|esc to interrupt|Press Enter to continue|Do 
 CODEX_MCP_BOOT = r"Starting MCP servers?\s*\(\d+/\d+\)"
 
 TRUST_MODAL = r"trust this folder|do you trust|Yes, (proceed|I trust)|Press Enter to continue"
-SANDBOX_PROMPT = r"Allow command\?|sandbox.*approv|approve this command|Do you want to (run|allow)"
+# #1091: `sandbox.*approv` was BOTH too loose and too narrow, measured today.
+# Too loose: telepty renders grok's TUI as ONE line, so the role-sandbox cwd header and
+# the "always-approve" footer of an IDLE grok sat on the same line and matched -> the
+# reconciler answered a sandbox prompt that was not there (policy SEND_KEY enter).
+# Too narrow: the REAL codex 0.153.4 approval modal (captured live into
+# tests/dispatch/fixtures/codex_sandbox_prompt.txt) contains no "sandbox…approv" text at
+# all -- it asks "Would you like to run the following command?" over a numbered option
+# list -- so the arm that existed for codex never actually matched codex. Both arms are
+# now the strings codex prints; the pre-existing legacy alternatives are untouched.
+SANDBOX_PROMPT = (
+    r"Allow command\?|approve this command|Do you want to (run|allow)"
+    r"|Would you like to run the following command\?"
+    r"|Yes, and don't ask again for commands that start with"
+)
 API_ERROR = r"API Error|api error|status 400|overloaded_error|rate.?limit|529|ECONNREFUSED|ETIMEDOUT"
 # #909: the one API-error surface with a KNOWN, self-healing remedy. Measured
 # verbatim from three cut turns on 2026-08-16: "API Error: Your computer went to
@@ -44,6 +66,24 @@ THINKING_BLOCK = r"thinking.*block|invalid_request_error"
 CRASH = r"panic:|Traceback \(most recent|Segmentation fault|core dumped"
 UNSUBMITTED = r"\[context-ref\]|/shared/[0-9a-f]{6,}\.md"
 WORKING = r"esc to interrupt|Working\s*\(|Working\.\.\.|[\u2722\u2733\u2736\u273b\u273d]|\u23fa|\u27f3|Thinking|Compacting|Esc to interrupt"
+# #1091: the ten BRAILLE cells above are the dots-spinner FRAMES, but a bare membership
+# test (`any(ch in tail for ch in BRAILLE)`) also matched grok's braille LOGO ART -- its
+# welcome box draws the xAI mark in braille, and with grok's whole TUI on one line the art
+# never scrolls out of the tail. An IDLE grok therefore read as surface=working /
+# tracker_class=active (verify_started false). A spinner is ONE isolated cell used as a
+# leading glyph before text; logo art is runs of ADJACENT cells. Measured against
+# grok_idle_settled.txt (art only -> no match) and active.txt / postinject_ok.txt /
+# codex-init-spinner.screen (real frames -> match).
+SPINNER = re.compile(rf"(?<![\u2800-\u28ff])[{BRAILLE}](?![\u2800-\u28ff])\s+\S")
+
+
+def has_spinner(text: str) -> bool:
+    """One shared reader for the braille spinner: classify_surface and tracker_class
+    disagreeing about what a spinner is was how the same screen read both idle and
+    active."""
+    return SPINNER.search(text) is not None
+
+
 TRACKER_ERR = r"error:|traceback|panic:|command not found|killed:|exited [0-9]+"
 TRACKER_WELCOME = r"Welcome back|Tips for getting started|Trust this folder|Press Enter to continue"
 TRACKER_ACTIVE_TEXT = r"\(esc to interrupt\)|thinking with xhigh effort|\u23f5\s*\d+s"
@@ -111,9 +151,42 @@ def tail(lines: list[str], count: int) -> str:
     return "\n".join(lines[-count:])
 
 
+def cli_kind_of(command: str) -> str:
+    """The kind behind a guard-launcher path, mirroring cliKindOf in src/dispatch/cli.ts.
+
+    #1091: dispatch passes --cli (since #1084) but dispatch-verify.sh and the reconciler do
+    not, and `info.command` for a worker is the guard launcher's PATH -- which names no CLI,
+    so every worker read as claude once its welcome header scrolled off. The launcher's own
+    `exec -a <kind>` line is the answer and is written by bin/boot-prepare.mjs. This is the
+    one-line read, not a port of the module.
+    """
+    base = os.path.basename(command)
+    if base in ("claude", "codex", "grok", "gemini"):
+        return base
+    if base == "agy":
+        return "gemini"
+    # Only ever a launcher script, and only its head: this path comes from the daemon, so it
+    # is read as data with a bounded size and never executed.
+    if not command.endswith(".sh") or not os.path.isfile(command):
+        return ""
+    try:
+        with open(command, encoding="utf-8", errors="replace") as handle:
+            head = handle.read(4096)
+    except OSError:
+        return ""
+    match = re.search(r"^exec -a (\S+)", head, re.M)
+    kind = match.group(1) if match else ""
+    return "gemini" if kind == "agy" else kind
+
+
 def cli_from_info_or_screen(info: dict[str, Any], screen: str, override: str = "") -> str:
     if override:
         return override
+    # The launcher read comes FIRST: a sid can carry a CLI name (this task's own session is
+    # "mr1091-mr1091-grok-agy"), and that sid is inside info.command's path.
+    launcher_kind = cli_kind_of(str(info.get("command") or ""))
+    if launcher_kind:
+        return launcher_kind
     raw = " ".join(
         str(v or "")
         for v in (
@@ -131,12 +204,12 @@ def cli_from_info_or_screen(info: dict[str, Any], screen: str, override: str = "
         return "claude"
     if re.search(r"OpenAI Codex CLI|Welcome to .*Codex", screen, re.I):
         return "codex"
-    if re.search(r"Welcome to Gemini", screen, re.I):
+    if re.search(r"Welcome to Gemini|Antigravity CLI", screen, re.I):
         return "gemini"
     return "claude"
 
 
-def tracker_class(screen: str) -> str:
+def tracker_class(screen: str, *, current: bool = False) -> str:
     lines = nonempty_lines(screen)
     if not lines:
         return "blank"
@@ -144,7 +217,8 @@ def tracker_class(screen: str) -> str:
     last3 = tail(lines, 3)
     if re.search(TRACKER_ERR, tail20, re.I):
         return "error"
-    welcome_in_tail = re.search(TRACKER_WELCOME, tail20, re.I)
+    welcome_in_tail = (current_prompt_control(TRACKER_WELCOME, tail20) if current else
+                       re.search(TRACKER_WELCOME, tail20, re.I))
     prompt_in_last3 = (
         re.search(r"^[\u276f\u203a]", last3, flags=re.MULTILINE) is not None
         or "\u276f" in last3
@@ -153,7 +227,7 @@ def tracker_class(screen: str) -> str:
     placeholder = re.search(r'[\u276f\u203a]\s+Try "[^"]+"', last3)
     if welcome_in_tail and (placeholder or prompt_in_last3):
         return "welcome"
-    if any(ch in tail20 for ch in BRAILLE) or re.search(TRACKER_ACTIVE_TEXT, tail20, re.I):
+    if has_spinner(tail20) or re.search(TRACKER_ACTIVE_TEXT, tail20, re.I):
         return "active"
     if prompt_in_last3:
         # telepty#60 Stage A: a prompt-like surface is an OBSERVATION. The old
@@ -193,7 +267,58 @@ def ready_by_screen(cli: str, screen: str) -> tuple[bool, str]:
     return False, "no-prompt"
 
 
-def classify_surface(cli: str, screen: str) -> tuple[str, str]:
+def current_controls(cli: str, screen: str) -> str:
+    """Ignore only an explicit rendered turn-duration footer, never live controls."""
+    if cli != "claude":
+        return screen
+    duration_footer = re.compile(
+        r"^\s*[\u2722\u2733\u2736\u273b\u273d]\s*[^\W\d_]+(?:-[^\W\d_]+)* for "
+        r"(?:\d+[hms]\s*)+\s*\u00b7\s*done"
+        r"(?:\s+\(\d+ tool uses?\))?"
+        r"(?:\s+(?:(?:AM|PM|\uc624\uc804|\uc624\ud6c4)\s*)?"
+        r"\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?)?\s*$", re.I)
+    return "\n".join(line for line in screen.splitlines()
+                     if not duration_footer.fullmatch(line))
+
+
+def current_busy_signal(screen: str) -> bool:
+    # Inline prose quoting a control is not a status row. A standalone quoted
+    # control remains ambiguous and blocks regardless of distance from the prompt.
+    pattern = (
+        r"^\s*(?:[\u2722\u2733\u2736\u273b\u273d]\s*\S"
+        r"|[\u23f5\u25b6].*esc to interrupt"
+        r"|(?:[\u25a0\u2022]\s*)?(?:Working|Thinking|Compacting)\b"
+        r"|(?:Esc to interrupt|Press Enter to continue|Do you trust)\b)"
+    )
+    return bool(re.search(pattern, screen, re.I | re.M) or has_spinner(screen))
+
+
+def current_prompt_control(pattern: str, screen: str) -> bool:
+    # Allow terminal borders, prompt/selection glyphs and numbered choices,
+    # but not a control phrase embedded in a reply sentence.
+    prefix = r"^[^\w\n]*(?:\d+[.)][^\w\n]*)?"
+    return re.search(prefix + "(?:" + pattern + ")", screen, re.I | re.M) is not None
+
+
+def ready_by_current_screen(cli: str, screen: str, surface: str) -> tuple[bool, str]:
+    if surface not in ("idle", "welcome", "working"):
+        return False, "current-surface-not-ready"
+    lines = nonempty_lines(screen)
+    prompt = PROMPTS.get(cli, r"\u276f|\u203a")
+    # A quoted prompt in the reply or a populated composer is not ready to accept
+    # another task. Historical fixture semantics are deliberately separate.
+    if not re.search(rf"(?m)^\s*(?:{prompt})(?:\s*|\s+Try \"[^\"]+\"|\s+Ask Codex to do anything)\s*$",
+                     tail(lines, 5)):
+        return False, "no-empty-current-prompt"
+    controls = current_controls(cli, screen)
+    if current_busy_signal(controls):
+        return False, "current-busy-or-modal"
+    if surface == "working":
+        return False, "current-working"
+    return True, "prompt"
+
+
+def classify_surface(cli: str, screen: str, *, current: bool = False) -> tuple[str, str]:
     lines = nonempty_lines(screen)
     if not lines:
         return SURFACE_UNKNOWN, "blank screen"
@@ -202,9 +327,11 @@ def classify_surface(cli: str, screen: str) -> tuple[str, str]:
 
     if re.search(THINKING_BLOCK, tail20, re.I):
         return "thinking_block", "thinking-block / invalid request"
-    if re.search(SANDBOX_PROMPT, tail20, re.I):
+    if (current_prompt_control(SANDBOX_PROMPT, screen) if current else
+            re.search(SANDBOX_PROMPT, tail20, re.I)):
         return "sandbox_prompt", "sandbox approval prompt"
-    if re.search(TRUST_MODAL, tail20, re.I):
+    if (current_prompt_control(TRUST_MODAL, screen) if current else
+            re.search(TRUST_MODAL, tail20, re.I)):
         return "modal", "trust-folder or continue modal"
     if re.search(CRASH, tail20, re.I):
         return "crash", "crash / traceback"
@@ -218,12 +345,21 @@ def classify_surface(cli: str, screen: str) -> tuple[str, str]:
         return "raw_shell", "raw shell prompt at tail"
     if re.search(UNSUBMITTED, last4):
         return "unsubmitted", "context-ref still at live prompt"
-    if re.search(WORKING, tail20, re.I) or any(ch in tail20 for ch in BRAILLE):
+    if current and re.search(
+        r"^\s*[\u2722\u2733\u2736\u273b\u273d][^\n]*\bfor\s+"
+        r"(?:\d+[hms]\s*)+\s*\u00b7\s*done\b", screen, re.I | re.M
+    ):
+        # Recognized completed rows are removed on the controls pass. A remaining
+        # duration row is ambiguous, not evidence that work has started.
+        return SURFACE_UNKNOWN, "unrecognized completed duration row"
+    if (current_busy_signal(screen) if current else
+            re.search(WORKING, tail20, re.I) or has_spinner(tail20)):
         return "working", "working token"
 
     banner = BANNERS.get(cli, r"Welcome|Initializing|Loading|Tips for getting started")
     prompt = PROMPTS.get(cli, r"\u276f|\u203a")
-    if re.search(banner, tail20, re.I):
+    if (current_prompt_control(banner, tail20) if current else
+            re.search(banner, tail20, re.I)):
         return "welcome", "welcome/bootstrap banner"
     if re.search(prompt, tail20):
         return "idle", "idle prompt"
@@ -239,7 +375,7 @@ def verification_problems(
     screen: str,
 ) -> list[str]:
     problems: list[str] = []
-    if health and "CONNECTED" not in health.upper():
+    if health and health.upper() != "CONNECTED":
         problems.append(f"transport {health} (not CONNECTED)")
     if not transport_ready or not bootstrap_ready:
         problems.append("not ready / bootstrap not ready")
@@ -271,50 +407,64 @@ def observe(args: argparse.Namespace) -> dict[str, Any]:
     probe_error = ""
     sid = safe_token(args.sid, SAFE_SID, "sid")
     telepty = safe_token(args.telepty, SAFE_CLI, "telepty executable")
+    def live_info() -> dict[str, Any]:
+        return capture_object([telepty, "session", "info", sid, "--json"])
+
     if args.info_file:
         info_text = read_text(args.info_file)
         info = load_json_text(info_text)
     else:
-        rc, out, err = run_capture([telepty, "session", "info", sid, "--json"])
-        info = load_json_text(out)
-        if rc != 0 or not out.strip():
-            probe_error = (err or "session info unavailable").strip()
+        try:
+            info = live_info()
+        except ScreenUnavailable as exc:
+            info = {}
+            probe_error = str(exc)
 
+    screen_source = "fixture"
     if args.screen_file:
         screen = read_text(args.screen_file)
     else:
-        rc, out, err = run_capture(
-            [telepty, "read-screen", sid, "--lines", str(args.screen_lines)]
-        )
-        screen = out
-        if rc != 0 and not probe_error:
-            probe_error = (err or "read-screen unavailable").strip()
+        screen = ""
+        screen_source = "unavailable"
+        try:
+            if args.info_file:
+                raise ScreenUnavailable("live screen requires live session info")
+            screen, screen_source = read_current_screen(sid, info, live_info)
+        except ScreenUnavailable as exc:
+            probe_error = probe_error or str(exc)
 
     cli = cli_from_info_or_screen(info, screen, args.cli or "")
     health = str(field(info, "healthStatus") or field(info, "transport", "health_status") or "")
     transport_ready = bool(field(info, "ready")) or bool(field(info, "transport", "ready"))
     raw_bootstrap = field(info, "transport", "bootstrap", "ready")
     bootstrap_ready = True if raw_bootstrap is None else bool(raw_bootstrap)
-    alive = bool(info) and (not health or "CONNECTED" in health.upper())
+    alive = bool(info) and (not health or health.upper() == "CONNECTED")
 
-    surface, surface_detail = classify_surface(cli, screen)
+    controls = current_controls(cli, screen) if not args.screen_file else screen
+    surface, surface_detail = classify_surface(cli, screen, current=not args.screen_file)
+    if not args.screen_file and surface in ("working", "idle", "welcome", SURFACE_UNKNOWN):
+        surface, surface_detail = classify_surface(cli, controls, current=True)
     unsubmitted = surface == "unsubmitted"
     working_token = surface == "working"
     activity = "moving" if working_token and not unsubmitted else "static"
-    screen_ready, ready_reason = ready_by_screen(cli, screen)
-    ready = bool(alive and transport_ready and bootstrap_ready and screen_ready)
+    screen_ready, ready_reason = (ready_by_screen(cli, screen) if args.screen_file
+                                 else ready_by_current_screen(cli, screen, surface))
+    ready = bool(not probe_error and alive and transport_ready and bootstrap_ready and screen_ready)
     problems = verification_problems(
         health, transport_ready, bootstrap_ready, surface, activity, screen
     )
-    verified_started = bool(alive and transport_ready and bootstrap_ready and not problems)
+    if probe_error:
+        problems.append("current-screen observation unavailable")
+    verified_started = bool(not probe_error and alive and transport_ready and bootstrap_ready and not problems)
 
     detail: dict[str, Any] = {
         "health": health,
         "transport_ready": transport_ready,
         "bootstrap_ready": bootstrap_ready,
         "ready_reason": ready_reason,
+        "screen_source": screen_source,
         "surface_detail": surface_detail,
-        "tracker_class": tracker_class(screen),
+        "tracker_class": tracker_class(controls, current=not args.screen_file),
         "verify_started": verified_started,
         "verify_problems": problems,
     }

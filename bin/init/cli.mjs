@@ -18,6 +18,8 @@ import {
   MANIFEST,
   SCAFFOLD_PREFIX,
   TEMPLATE_TOKENS,
+  templateSubs,
+  substitute,
   isSubstitutionExempt,
   isExecutable,
   STATE_DIRS,
@@ -405,9 +407,6 @@ async function scaffold(ws, opts, subs) {
 
 // ------------------------------------------------------------- step 6: substitution
 
-const substitute = (text, subs) =>
-  Object.entries(subs).reduce((acc, [token, value]) => acc.split(token).join(value), text);
-
 function substituteAll(ws, scaffoldWritten, subs) {
   step("Step 6 — template substitution");
   const targets = [
@@ -526,12 +525,7 @@ async function main() {
     process.exit(0);
   }
 
-  const subs = {
-    "{{CONSTITUTION_PATH}}": path.join(AIGENTRY_HOME, "CONSTITUTION.md"),
-    "{{CONTROL_WORKSPACE}}": ws,
-    "{{DEVICE_ID}}": `device-${os.hostname()}`,
-    "{{CREATED_AT}}": new Date().toISOString(),
-  };
+  const subs = templateSubs(ws, AIGENTRY_HOME);
 
   verifyPackageComplete();
   copyManifest(ws, opts);

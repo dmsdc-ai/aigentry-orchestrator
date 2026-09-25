@@ -76,6 +76,7 @@ run_one() {
   AIGENTRY_SESSIONS_ROOT="$TMP_ROOT/sessions" \
   DISPATCH_STATE_DIR="$TMP_ROOT/state" \
   OPEN_SESSION_SH="$FAKE_OPEN_SESSION" \
+  AIGENTRY_DISPATCH_REGISTER_TIMEOUT_MS=0 \
   PATH="$FAKE_BIN:$PATH" \
   TELEPTY="$FAKE_BIN/telepty" \
     env "$home_env=$fake_real" \
@@ -105,12 +106,28 @@ run_one() {
   grep -qF "exec -a $cli" "$open_cli" || {
     echo "FAIL ($cli): worker-launcher does not exec -a $cli (display_cli not parameterized)" >&2
     cat "$open_cli" >&2; exit 1; }
-  # Boot launcher exists and exports the shadow config-home env.
+  # Boot launcher exists, and carries the shadow config-home export IF the selected
+  # adapter declares a homeEnv. An empty want_shadow says it must NOT: #1083 gave the
+  # gemini kind an `agy` binary whose adapter deliberately has no homeEnv, because agy
+  # honors only $HOME (src/session/boot-adapter/gemini.ts:59-60, #1090). Asserting the
+  # export unconditionally pinned the pre-agy shape, which is what failed here.
   local boot_launcher="$AIG_HOME/sessions/t47-$cli/boot/launcher.sh"
   [ -f "$boot_launcher" ] || { echo "FAIL ($cli): boot launcher missing at $boot_launcher" >&2; exit 1; }
-  grep -qF "export $want_shadow=" "$boot_launcher" || {
-    echo "FAIL ($cli): boot launcher missing shadow-home export $want_shadow" >&2
-    cat "$boot_launcher" >&2; exit 1; }
+  if [ -n "$want_shadow" ]; then
+    grep -qF "export $want_shadow=" "$boot_launcher" || {
+      echo "FAIL ($cli): boot launcher missing shadow-home export $want_shadow" >&2
+      cat "$boot_launcher" >&2; exit 1; }
+  else
+    # No shadow home to assert, so assert the launch shape instead — this leg must
+    # still measure something rather than degrade into "the file exists".
+    grep -qE "^exec -a $cli agy( |\$)" "$boot_launcher" || {
+      echo "FAIL ($cli): boot launcher does not exec -a $cli agy" >&2
+      cat "$boot_launcher" >&2; exit 1; }
+    if grep -qE '^export (GEMINI_CLI_HOME|CODEX_HOME)=' "$boot_launcher"; then
+      echo "FAIL ($cli): boot launcher exports a shadow config-home the agy adapter does not declare" >&2
+      cat "$boot_launcher" >&2; exit 1
+    fi
+  fi
   echo "T47 $cli OK"
 }
 
@@ -119,10 +136,23 @@ if command -v codex >/dev/null 2>&1; then
 else
   echo "T47 codex SKIP — codex not installed"
 fi
-if command -v gemini >/dev/null 2>&1; then
-  run_one gemini GEMINI_CLI_HOME GEMINI_CLI_HOME
+# Mirror src/session/boot-adapter/gemini.ts's geminiBinary(): AIGENTRY_GEMINI_BINARY
+# wins, else `agy` on PATH wins, else `gemini`. The two binaries have different
+# adapters, so the leg must assert the one that will actually be launched.
+GEM_BINARY=gemini
+case "${AIGENTRY_GEMINI_BINARY:-}" in
+  agy)    GEM_BINARY=agy ;;
+  gemini) ;;
+  *)      if command -v agy >/dev/null 2>&1; then GEM_BINARY=agy; fi ;;
+esac
+if command -v gemini >/dev/null 2>&1 || command -v agy >/dev/null 2>&1; then
+  if [ "$GEM_BINARY" = agy ]; then
+    run_one gemini GEMINI_CLI_HOME ""              # agy: no homeEnv by design
+  else
+    run_one gemini GEMINI_CLI_HOME GEMINI_CLI_HOME
+  fi
 else
-  echo "T47 gemini SKIP — gemini not installed"
+  echo "T47 gemini SKIP — neither gemini nor agy installed"
 fi
 
 echo "T47 PASS"

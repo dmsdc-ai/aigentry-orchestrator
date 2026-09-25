@@ -14,9 +14,36 @@
 # SKIP-SET MISMATCH. None of it is a code defect: T17/T18/T24/T83 need
 # dist/src/session/inject-parser.js and T47 needs dist/ to exist at all. Measured
 # 2026-08-16 (#899 tranche 1) after the trap cost one worker a false baseline.
+#
+# #1114 — CI runs THIS suite (ci.yml:70, timeout-minutes 8), on a clean runner that has no
+# operator AIGENTRY_* env; a development box has plenty. The scrub below closes that gap, so
+# a local run now equals the CI run except for TOOL PRESENCE (agy/codex) — which the T47
+# capability probe below already branches on. T47 and T117 (#1113) were red here and green
+# in CI for days on exactly this difference.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 chmod +x "$HERE"/T*.sh "$HERE"/stubs/* 2>/dev/null || true
+
+# ── the ambient-env scrub (#1114) ───────────────────────────────────────────────────
+# The defect class #1109 closed for the router fixture (model-router-fixtures.ts:53): a
+# test that reads the machine is not a test. Every worker session is launched with the
+# operator's model/effort knobs exported into its env (bin/boot-prepare.mjs:671), so a
+# guard run from inside one measured the operator's preference instead of the default it
+# names. Scrubbed HERE rather than per guard: guards are children of this process, so one
+# unset covers all 135 at zero per-guard cost, it needs no threading through the four
+# guard_run variants below, and it covers this file's own reads too. Deliberately plain —
+# no arrays, no `env -u` — because macOS ships bash 3.2.
+#
+# The allowlist is exhaustive, and both entries are inputs to the RUNNER, not to a guard.
+# Anything a guard needs it must set itself; an inherited knob is a hidden input. Measured
+# across all 135: exactly one, T47's AIGENTRY_GEMINI_BINARY (:143, mirroring geminiBinary()).
+# It is scrubbed rather than allowlisted — unset, it takes the agy-if-present arm, which is
+# what a clean runner computes. T117's own sed -E scrub (#1113) is now redundant and stays:
+# a guard that is hermetic on its own is still hermetic when someone runs it by hand.
+KEEP_ENV="AIGENTRY_GUARD_TIMEOUT_S AIGENTRY_RUN_LIVE_TESTS"
+for k in $(env | sed -nE 's/^(AIGENTRY_[A-Z0-9_]+)=.*/\1/p'); do
+  case " $KEEP_ENV " in *" $k "*) ;; *) unset "$k" ;; esac
+done
 
 # ── the counted manifest ────────────────────────────────────────────────────────────
 # Two prose sources in this repo disagreed on the guard count (96 vs 99), which is why
@@ -70,7 +97,12 @@ fi
 # CLIs installed, a flat per-OS declaration reports a mismatch on every single run, which
 # is precisely how a real signal gets muted. Both present => T47 runs both legs and is
 # expected NOT to skip; either absent => it announces and stays declared.
-if command -v codex >/dev/null 2>&1 && command -v gemini >/dev/null 2>&1; then
+# #1113: `agy` counts as the gemini capability. #1083 made it the binary the gemini
+# kind actually launches (geminiBinary() prefers it when present), and T47's gemini leg
+# follows the same rule — so a box with agy but no `gemini` runs the leg, and declaring
+# a skip for it would be the stale declaration this block exists to avoid.
+if command -v codex >/dev/null 2>&1 \
+   && { command -v gemini >/dev/null 2>&1 || command -v agy >/dev/null 2>&1; }; then
   expected=$(printf '%s\n' $expected | { grep -vx T47 || true; } | tr '\n' ' ')
 fi
 
@@ -116,6 +148,32 @@ TRIP
   export PATH="$TRIPWIRE_BIN:$PATH"
 fi
 
+# ── the per-guard wall clock (#1113) ────────────────────────────────────────────────
+# Before this the loop ran each guard bare, so a guard that never returns stalled the
+# WHOLE suite instead of failing one entry. Measured: T47 sat for six minutes (180 s x
+# two legs) waiting on a session registration its own fixture can never satisfy, and an
+# operator killed the run by hand rather than reading a failure. A stall is indis-
+# tinguishable from slow work, which is how it survives; a limit makes it a verdict.
+#
+# There is no single portable timeout: `timeout` is GNU coreutils and is NOT on macOS
+# (measured on this box — neither `timeout` nor homebrew's `gtimeout` was present), and
+# perl's alarm is the floor that survives both, because alarm(2) is preserved across
+# exec and SIGALRM's default disposition is to terminate. If a box has none of the
+# three the loop runs bare, exactly as before — a missing wrapper must not fail a run.
+# Ceiling, stated: all three kill the guard's own shell, not its process group, so a
+# subprocess it left running is orphaned rather than reaped. That is enough to turn a
+# stall into a verdict, which is what this is for; reaping needs a process group.
+GUARD_TIMEOUT_S=${AIGENTRY_GUARD_TIMEOUT_S:-300}
+if command -v timeout >/dev/null 2>&1; then
+  guard_run() { timeout -s KILL "$GUARD_TIMEOUT_S" bash "$1"; }
+elif command -v gtimeout >/dev/null 2>&1; then
+  guard_run() { gtimeout -s KILL "$GUARD_TIMEOUT_S" bash "$1"; }
+elif command -v perl >/dev/null 2>&1; then
+  guard_run() { perl -e 'alarm shift; exec @ARGV' "$GUARD_TIMEOUT_S" bash "$1"; }
+else
+  guard_run() { bash "$1"; }
+fi
+
 guards=0; pass=0; fail=0; skipped_guards=0; announcements=0
 failed=""; skipped=""
 
@@ -124,8 +182,13 @@ for t in "$HERE"/T*.sh; do
   id=${name%%_*}
   guards=$((guards + 1))
   out="$TMP/$name.out"
-  if bash "$t" > "$out" 2>&1; then rc=0; else rc=$?; fi
+  if guard_run "$t" > "$out" 2>&1; then rc=0; else rc=$?; fi
   cat "$out"
+  # 124 = timeout(1), 137 = its -s KILL, 142 = perl's SIGALRM. Named, because a bare
+  # "failed: T47" after five silent minutes reads as a flake rather than a hang.
+  case "$rc" in
+    124|137|142) echo "TIMEOUT: $name exceeded ${GUARD_TIMEOUT_S}s (rc=$rc) — counted as a failure, not a stall." >&2 ;;
+  esac
   if [ "$rc" = "0" ]; then pass=$((pass + 1)); else fail=$((fail + 1)); failed="$failed $name"; fi
   n=$(grep -cE "$SKIP_RE" "$out" || true)
   if [ "$n" -gt 0 ]; then

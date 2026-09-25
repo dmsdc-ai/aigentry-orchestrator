@@ -84,7 +84,7 @@ function die(msg, code = 1) {
 
 function usage() {
   process.stdout.write(
-    "Usage: boot-prepare.mjs --role R --cwd C --sid S [--cli claude|codex|gemini]\n" +
+    "Usage: boot-prepare.mjs --role R --cwd C --sid S [--cli claude|codex|gemini|grok]\n" +
       "  Emits a JSON object on stdout with {spawn_cli, extra_flags, spawn_cwd, env}.\n" +
       "  Exits non-zero on any error.\n",
   );
@@ -219,6 +219,66 @@ async function ensureSandboxTrusted(sandboxCwd) {
     process.stderr.write(
       `boot-prepare: WARNING write ${claudeJson} failed (${e?.message ?? e}); skipping auto-trust\n`,
     );
+  }
+}
+
+// #1090: agy (Antigravity CLI) shows a folder-trust modal ("Do you trust the
+// contents of this project?") on a fresh role-sandbox cwd, blocking its REPL so
+// dispatch.sh's ready-probe times out before inject. `--dangerously-skip-
+// permissions` does NOT cover it and agy has no `--skip-trust` (measured, 1.1.27).
+// agy records an accepted answer in `~/.gemini/antigravity-cli/settings.json` as
+// `"trustedWorkspaces": ["<canonical abs path>", …]` (Go tag
+// json:"trustedWorkspaces,omitempty"; it stores /private/tmp/… for a /tmp/… cwd).
+// agy honors only $HOME (no GEMINI_CLI_HOME/XDG override), the adapter gives it no
+// shadow home, and its login lives in ~/.gemini/config + keychain, so — exactly
+// like claude's ~/.claude.json idiom above — the one entry is written into the
+// REAL file. Never creates agy's tree: a missing file means agy has never run
+// here and the (visible) modal is the honest outcome. Graceful degradation
+// mirrors ensureSandboxTrusted: any FS/parse failure → stderr WARNING + continue.
+async function ensureAgyTrust(sandboxCwd) {
+  const settingsPath = join(homedir(), ".gemini", "antigravity-cli", "settings.json");
+  if (!existsSync(settingsPath)) {
+    process.stderr.write(
+      `boot-prepare: WARNING ${settingsPath} not found; sandbox ${sandboxCwd} will show agy trust modal\n`,
+    );
+    return;
+  }
+  let cfg;
+  try {
+    cfg = JSON.parse(await readFile(settingsPath, "utf8"));
+  } catch (e) {
+    process.stderr.write(
+      `boot-prepare: WARNING read/parse ${settingsPath} failed (${e?.message ?? e}); skipping agy auto-trust\n`,
+    );
+    return;
+  }
+  if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) {
+    process.stderr.write(
+      `boot-prepare: WARNING ${settingsPath} is not a JSON object; skipping agy auto-trust\n`,
+    );
+    return;
+  }
+  // agy keys trust on its getcwd() (symlinks collapsed) — same canonical-path rule
+  // as ensureCodexTrust; fall back to the literal path if resolution fails.
+  let canonicalCwd = sandboxCwd;
+  try {
+    canonicalCwd = await realpath(sandboxCwd);
+  } catch {
+    // keep sandboxCwd
+  }
+  const prior = Array.isArray(cfg.trustedWorkspaces) ? cfg.trustedWorkspaces : [];
+  if (prior.includes(canonicalCwd)) return; // idempotent
+  cfg.trustedWorkspaces = [...prior, canonicalCwd];
+  // Atomic-ish tmp+rename (as ensureSandboxTrusted); agy keeps the file 0600.
+  const tmp = `${settingsPath}.boot-prepare.${process.pid}.tmp`;
+  try {
+    await writeFile(tmp, JSON.stringify(cfg, null, 2) + "\n", { mode: 0o600 });
+    await rename(tmp, settingsPath);
+  } catch (e) {
+    process.stderr.write(
+      `boot-prepare: WARNING write ${settingsPath} failed (${e?.message ?? e}); skipping agy auto-trust\n`,
+    );
+    try { await unlink(tmp); } catch { /* nothing to clean */ }
   }
 }
 
@@ -456,7 +516,7 @@ async function main() {
   // #532: gate lifted from claude-only to claude|codex|gemini. Unknown CLIs are
   // still rejected here (and again by getBootAdapter's registry) with a non-zero
   // exit + clear stderr — never a silent broken contract.
-  const SUPPORTED_CLIS = ["claude", "codex", "gemini"];
+  const SUPPORTED_CLIS = ["claude", "codex", "gemini", "grok"];
   if (!SUPPORTED_CLIS.includes(args.cli)) {
     die(
       `unsupported --cli ${JSON.stringify(args.cli)}; supported: ${SUPPORTED_CLIS.join(", ")}`,
@@ -481,7 +541,7 @@ async function main() {
   const { resolveInstructions } = await import(
     join(REPO_ROOT, "dist/src/session/resolve-instructions.js")
   );
-  const { getBootAdapter, nodeBootFs, nodeSpawner } = await import(
+  const { getBootAdapter, geminiBinary, nodeBootFs, nodeSpawner } = await import(
     join(REPO_ROOT, "dist/src/session/boot-adapter/index.js")
   );
   const { isRole } = await import(
@@ -499,10 +559,14 @@ async function main() {
   );
   await mkdir(sandboxCwd, { recursive: true });
   // claude-only: pre-accept the fresh sandbox in ~/.claude.json (skips claude's
-  // trust modal). gemini uses --skip-trust (§3.3); codex relies on
-  // --dangerously-bypass-approvals-and-sandbox (folder-trust verified live, §5).
+  // trust modal). Gemini CLI uses --skip-trust (§3.3); codex seeds its shadow
+  // config.toml (#552, below); agy seeds its real settings.json (#1090, next).
   if (args.cli === "claude") {
     await ensureSandboxTrusted(sandboxCwd);
+  }
+  // #1090: agy-only — same idiom, agy's real settings.json (see ensureAgyTrust).
+  if (args.cli === "gemini" && geminiBinary() === "agy") {
+    await ensureAgyTrust(sandboxCwd);
   }
 
   const fs = nodeBootFs();
@@ -534,7 +598,7 @@ async function main() {
     created_at: new Date().toISOString(),
   };
 
-  const adapter = getBootAdapter(args.cli);
+  const adapter = getBootAdapter(args.cli, geminiBinary());
   const cmd = await adapter.buildBootCommand(ctx, resolved, {
     staging_dir: stagingDir,
     fs,
@@ -610,6 +674,18 @@ async function main() {
     args.cli === "claude"
       ? [...cmd.argv.slice(1), "--model", claudeModel, "--effort", claudeEffort, "--permission-mode", "bypassPermissions"]
       : [...cmd.argv.slice(1)];
+  // #1083: grok exposes no context-file contract, but its --rules IS additive
+  // system instruction ("Extra rules to append to the system prompt"), so the
+  // staged contract rides that flag.
+  // #1093: agy left this arm. It took the contract via --prompt-interactive, and
+  // an interactive first prompt reads as a task, not as instruction — the #1090
+  // agy probe ran ps/read-screen/cat before any task ref arrived. agy auto-reads
+  // cwd GEMINI.md as an always-on rule, so it now uses the same additive
+  // contextFile path as Gemini CLI (adapter descriptor) and boots to an idle
+  // prompt with nothing to act on.
+  if (args.cli === "grok") {
+    flagsArgv.push("--rules", await readFile(cmd.prompt_file, "utf8"));
+  }
   const flagsLine = flagsArgv.map(shellQuote).join(" ");
 
   // Per-session launcher.sh — exports env (AIGENTRY_TARGET_CWD always; the CLI
@@ -637,7 +713,7 @@ async function main() {
     `# staged cwd context file (AGENTS.md / GEMINI.md) + config-home shadow home.\n` +
     `export AIGENTRY_TARGET_CWD=${shellQuote(args.cwd)}\n` +
     homeExportLines +
-    `exec -a ${shellQuote(execName)} ${shellQuote(execName)} ${flagsLine} "$@"\n`;
+    `exec -a ${shellQuote(args.cli)} ${shellQuote(execName)} ${flagsLine} "$@"\n`;
   // writeFile with mode atomically sets +x — avoids a separate chmodSync call
   // (CWE-23 Snyk avoidance: single FS op on the validated path).
   await writeFile(launcherPath, launcherBody, { mode: 0o755 });
