@@ -366,8 +366,8 @@ _wh_cmux_wait_ready() {
 
 # _wh_cmux_open <sid> <cwd> <cli_cmd> — spawn a visible cmux workspace wrapping
 # `telepty allow --id <sid>`, BLOCK until the ready-gate passes, then emit the
-# workspace ref (workspace:N) as the host_id (ADR §3 D1 contract). Moved byte-for-byte
-# from open-session.sh:open_in_terminal()'s cmux branch (#608 Phase 1, ADR §7).
+# workspace ref (workspace:N) as the host_id (ADR §3 D1 contract). The #608 move
+# preserved readiness; #751 replaces only the worker bridge command construction.
 # Exit contract (handle emitted ⇒ pane ready; no half-spawned surface on failure):
 #   0  → ref printed on stdout (surface can accept send-key).
 #   2  → new-workspace produced no ref (spawn failed); nothing to clean up.
@@ -772,8 +772,8 @@ _wh_warp_open() {
 
 # -----------------------------------------------------------------------------
 # legacy terminal spawn adapters — aterm / tmux / wezterm / iterm (#608 Phase 3).
-# Each _wh_<term>_open is the inline open-session.sh:open_in_terminal() spawn branch
-# moved 1:1 (byte-equivalent — current behavior preserved, Rule 29). These are
+# Each _wh_<term>_open originated in open-session.sh:open_in_terminal(); #751
+# shares explicit CLI selection and external lifecycle across these branches. These are
 # SPAWN-only adapters: the orchestrator runs inside cmux, so lifecycle verbs
 # (lookup/close/alive/...) keep routing through the cmux adapter — only `open`
 # dispatches to the host the user is actually in. They consume platform.sh

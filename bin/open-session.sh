@@ -17,12 +17,13 @@
 # `bash -c '. platform.sh; fn'` door already in production at
 # src/reconciler/cli.ts:340. Nothing under bin/lib/ is touched by this tranche.
 #
-# AIGENTRY_WH_LEGACY_SPAWN=1 IS STILL THE REVERT, AND IT IS STILL SHELL. The inline
-# cmux arm and its _cmux_wait_ready gate are preserved verbatim in
-# src/session/open-session/legacy-spawn.ts and exec'd as bash — same text, same
-# `set -euo pipefail`, same exit codes 2 and 3. It is the only rollback lever on
-# this path that needs no rebuild, which is exactly why it was not "cleaned up"
-# into TypeScript. The other lever is `git revert` + `tsc -p .`.
+# #751: this entrypoint now refuses AIGENTRY_WH_LEGACY_SPAWN=1. That inline
+# rollback path cannot propagate the selected CLI and external daemon lifecycle.
+# The historical implementation remains in src/session/open-session/legacy-spawn.ts;
+# invoking compiled internals directly is not this guarded entrypoint.
+# Worker bootstrap selection belongs to bin/lib/workspace-host.sh. Unsupported
+# installed telepty versions fail closed; selecting a candidate does not install
+# it or authorize a daemon restart. Installed/cross-OS acceptance is still required.
 #
 # Contract changes recorded here (Rule 38 — what was measured):
 #   * NONE to the CLI. Measured before the port: no test SOURCES this script
