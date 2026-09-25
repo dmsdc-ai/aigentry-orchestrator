@@ -22,6 +22,7 @@ const MANIFEST = [
   // ---- bin/** — `git ls-files bin`, complete. T96 assertion 4 pins this to the tree.
   "bin/ask.sh",
   "bin/boot-prepare.mjs",
+  "bin/current_screen.py",
   "bin/dispatch-cleanup-scheduler.sh",
   "bin/dispatch-registry.py",
   "bin/dispatch-tracker.sh",

@@ -11,6 +11,8 @@ import subprocess
 import sys
 from typing import Any, TextIO
 
+from current_screen import ScreenUnavailable, capture_object, read_current_screen
+
 
 SURFACE_UNKNOWN = "unknown"
 BRAILLE = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
@@ -264,6 +266,41 @@ def ready_by_screen(cli: str, screen: str) -> tuple[bool, str]:
     return False, "no-prompt"
 
 
+def current_controls(cli: str, screen: str) -> str:
+    """Claude's framed composer separates live controls from completed output."""
+    if cli != "claude":
+        return screen
+    lines = nonempty_lines(screen)
+    prompts = [i for i, line in enumerate(lines) if re.fullmatch(r"\s*\u276f\s*", line)]
+    if not prompts:
+        return screen
+    index = prompts[-1]
+    rule = r"\s*[\u2500\u2501]{8,}\s*"
+    if (index > 0 and index + 1 < len(lines) and len(lines) - index <= 5
+            and re.fullmatch(rule, lines[index - 1])
+            and re.fullmatch(rule, lines[index + 1])):
+        return "\n".join(lines[index - 1:])
+    return screen
+
+
+def ready_by_current_screen(cli: str, screen: str, surface: str) -> tuple[bool, str]:
+    if surface not in ("idle", "welcome", "working"):
+        return False, "current-surface-not-ready"
+    lines = nonempty_lines(screen)
+    prompt = PROMPTS.get(cli, r"\u276f|\u203a")
+    # A quoted prompt in the reply or a populated composer is not ready to accept
+    # another task. Historical fixture semantics are deliberately separate.
+    if not re.search(rf"(?m)^\s*(?:{prompt})(?:\s*|\s+Try \"[^\"]+\"|\s+Ask Codex to do anything)\s*$",
+                     tail(lines, 5)):
+        return False, "no-empty-current-prompt"
+    controls = current_controls(cli, screen)
+    if re.search(HARD_NEG + r"|Compacting", tail(nonempty_lines(controls), 8), re.I):
+        return False, "current-busy-or-modal"
+    if surface == "working":
+        return False, "current-working"
+    return ready_by_screen(cli, controls)
+
+
 def classify_surface(cli: str, screen: str) -> tuple[str, str]:
     lines = nonempty_lines(screen)
     if not lines:
@@ -310,7 +347,7 @@ def verification_problems(
     screen: str,
 ) -> list[str]:
     problems: list[str] = []
-    if health and "CONNECTED" not in health.upper():
+    if health and health.upper() != "CONNECTED":
         problems.append(f"transport {health} (not CONNECTED)")
     if not transport_ready or not bootstrap_ready:
         problems.append("not ready / bootstrap not ready")
@@ -342,50 +379,64 @@ def observe(args: argparse.Namespace) -> dict[str, Any]:
     probe_error = ""
     sid = safe_token(args.sid, SAFE_SID, "sid")
     telepty = safe_token(args.telepty, SAFE_CLI, "telepty executable")
+    def live_info() -> dict[str, Any]:
+        return capture_object([telepty, "session", "info", sid, "--json"])
+
     if args.info_file:
         info_text = read_text(args.info_file)
         info = load_json_text(info_text)
     else:
-        rc, out, err = run_capture([telepty, "session", "info", sid, "--json"])
-        info = load_json_text(out)
-        if rc != 0 or not out.strip():
-            probe_error = (err or "session info unavailable").strip()
+        try:
+            info = live_info()
+        except ScreenUnavailable as exc:
+            info = {}
+            probe_error = str(exc)
 
+    screen_source = "fixture"
     if args.screen_file:
         screen = read_text(args.screen_file)
     else:
-        rc, out, err = run_capture(
-            [telepty, "read-screen", sid, "--lines", str(args.screen_lines)]
-        )
-        screen = out
-        if rc != 0 and not probe_error:
-            probe_error = (err or "read-screen unavailable").strip()
+        screen = ""
+        screen_source = "unavailable"
+        try:
+            if args.info_file:
+                raise ScreenUnavailable("live screen requires live session info")
+            screen, screen_source = read_current_screen(sid, info, live_info)
+        except ScreenUnavailable as exc:
+            probe_error = probe_error or str(exc)
 
     cli = cli_from_info_or_screen(info, screen, args.cli or "")
     health = str(field(info, "healthStatus") or field(info, "transport", "health_status") or "")
     transport_ready = bool(field(info, "ready")) or bool(field(info, "transport", "ready"))
     raw_bootstrap = field(info, "transport", "bootstrap", "ready")
     bootstrap_ready = True if raw_bootstrap is None else bool(raw_bootstrap)
-    alive = bool(info) and (not health or "CONNECTED" in health.upper())
+    alive = bool(info) and (not health or health.upper() == "CONNECTED")
 
+    controls = current_controls(cli, screen) if not args.screen_file else screen
     surface, surface_detail = classify_surface(cli, screen)
+    if not args.screen_file and surface in ("working", "idle", "welcome", SURFACE_UNKNOWN):
+        surface, surface_detail = classify_surface(cli, controls)
     unsubmitted = surface == "unsubmitted"
     working_token = surface == "working"
     activity = "moving" if working_token and not unsubmitted else "static"
-    screen_ready, ready_reason = ready_by_screen(cli, screen)
-    ready = bool(alive and transport_ready and bootstrap_ready and screen_ready)
+    screen_ready, ready_reason = (ready_by_screen(cli, screen) if args.screen_file
+                                 else ready_by_current_screen(cli, screen, surface))
+    ready = bool(not probe_error and alive and transport_ready and bootstrap_ready and screen_ready)
     problems = verification_problems(
         health, transport_ready, bootstrap_ready, surface, activity, screen
     )
-    verified_started = bool(alive and transport_ready and bootstrap_ready and not problems)
+    if probe_error:
+        problems.append("current-screen observation unavailable")
+    verified_started = bool(not probe_error and alive and transport_ready and bootstrap_ready and not problems)
 
     detail: dict[str, Any] = {
         "health": health,
         "transport_ready": transport_ready,
         "bootstrap_ready": bootstrap_ready,
         "ready_reason": ready_reason,
+        "screen_source": screen_source,
         "surface_detail": surface_detail,
-        "tracker_class": tracker_class(screen),
+        "tracker_class": tracker_class(controls),
         "verify_started": verified_started,
         "verify_problems": problems,
     }
