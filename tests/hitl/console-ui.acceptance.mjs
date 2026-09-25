@@ -366,13 +366,114 @@ async function captureWindows(deps, page, other) {
 /** Serialized only after the rejection, to stderr only, exactly like `renderLoginBoundary`.
  *  Ownership is a property of the two tabs, not of the front-change between the observations,
  *  so it is latched from the first and falls back to the second only when the first could not
- *  be made at all. */
+ *  be made at all. The last two fields carry the minimize experiment below on this same
+ *  already-consumed line; the three fields before them are unchanged. */
 export function renderLifecycleWindows() {
   const pair = value => (value && typeof value === 'object' ? value : {});
   const before = pair(windowsBefore), after = pair(windowsAfter);
+  const minimized = pair(minimizeVisibility);
+  const seen = value => visibilityOf(pair(value).visibility);
   return `ownership=${ownershipOf(windowOwnership)}`
     + ` before=page:${windowStateOf(before.page)},other:${windowStateOf(before.other)}`
-    + ` after=page:${windowStateOf(after.page)},other:${windowStateOf(after.other)}`;
+    + ` after=page:${windowStateOf(after.page)},other:${windowStateOf(after.other)}`
+    + ` minimize=${minimizeOutcomeOf(minimizeOutcome)}`
+    + ` minimized-visibility=page:${seen(minimized.page)},other:${seen(minimized.other)}`;
+}
+// Window state, the one lever the three diagnostics above leave untested, actuated and undone
+// at the same point and for the same wait - undone before `lw-hidden-wait` runs, so a stage
+// that was failing cannot be made to pass here. `minimized` with both tabs still `visible`
+// says window state is not the lever and some forced-visible path is active; it identifies no
+// owner, because any capturer or unread override looks identical from here. `minimized` with
+// `page:hidden` makes minimize a candidate correction, nothing more. `readback-normal` (no
+// window manager on the CI display is the known candidate) and `unknown` mean the experiment
+// did not run: never a success, never acceptance proof.
+// The window is addressed the way `captureWindows` already addresses it - one
+// `context.newCDPSession` per owned page handle, then `Browser.getWindowForTarget` - so no
+// target or window is discovered and the ids are compared and discarded in here. Nothing is
+// patched, synthesized, intercepted or skipped; every step is the caller's own `bounded` at
+// the existing PROBE_MS, adding no retry, sleep, deadline or budget.
+// Actuation and restore are required, not observed: a fault fails the stage as a CLOSED reason
+// and can never reach `mark`. Readings are latched as they are taken, so the failure path
+// still reports whatever was seen.
+export const MINIMIZE_OUTCOMES = ['not-captured', 'minimized', 'readback-normal', 'unknown'];
+const minimizeOutcomeOf = value => (MINIMIZE_OUTCOMES.includes(value) ? value : 'unknown');
+let minimizeOutcome = 'not-captured';
+let minimizeVisibility = { page: notCaptured(), other: notCaptured() };
+async function probeMinimizedWindow(deps, page, other) {
+  const holds = [];
+  let windowId = null, original = null, fault = null;
+  // One bounded read of the session's own window. Throws; every caller below guards it.
+  const windowOf = async session => {
+    const info = await deps.bounded(session.send('Browser.getWindowForTarget'), PROBE_MS);
+    const bounds = info && info.bounds && typeof info.bounds === 'object' ? info.bounds : null;
+    return {
+      id: info && Number.isSafeInteger(info.windowId) ? info.windowId : null,
+      state: bounds && OBSERVED_WINDOW_STATES.includes(bounds.windowState) ? bounds.windowState : null,
+    };
+  };
+  try {
+    for (const target of [page, other]) {
+      let acquisition = null;
+      try {
+        acquisition = deps.context.newCDPSession(target);
+        holds.push(await deps.bounded(acquisition, PROBE_MS));
+      } catch {
+        // An acquisition that arrives only after the bounded wait gave up is detached by the
+        // same self-cleaning handler `captureWindows` uses, so none outlives this fixture.
+        if (acquisition) void acquisition.then(late => late.detach().catch(() => {}), () => {});
+        fault = 'window_minimize_failed';
+        break;
+      }
+    }
+    // Nothing is actuated until BOTH supplied handles still resolve to one readable window:
+    // equality of the two ids is the ownership check this fixture already uses. A window whose
+    // state cannot be read is a window that cannot be put back, so it is left untouched.
+    if (!fault) {
+      try {
+        const own = await windowOf(holds[0]), second = await windowOf(holds[1]);
+        if (own.id !== null && own.state !== null && second.id !== null && own.id === second.id) {
+          windowId = own.id;
+          original = own.state;
+        }
+      } catch {}
+      if (original === null) fault = 'window_minimize_failed';
+    }
+    if (!fault) {
+      // `original` is latched BEFORE the send, so the restore in `finally` runs even when the
+      // bounded wait abandons this send and the browser applies it anyway. Only the state is
+      // sent: the bounds read above are left exactly as read, never recomputed.
+      try { await deps.bounded(holds[0].send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } }), PROBE_MS); }
+      catch { fault = 'window_minimize_failed'; }
+    }
+    if (!fault) {
+      let observed = null;
+      try { observed = (await windowOf(holds[0])).state; } catch {}
+      minimizeOutcome = observed === 'minimized' ? 'minimized' : observed === 'normal' ? 'readback-normal' : 'unknown';
+      // Observation, not actuation, and therefore total: an unobservable tab records
+      // `unavailable`, never a state it did not see, and never fails the stage on its own.
+      minimizeVisibility = await captureVisibility(deps, page, other);
+    }
+  } finally {
+    // Every path, faults included: the window goes back to the state it was read in and the
+    // restoration is CONFIRMED by reading the state back - a send acknowledgment is not taken
+    // for a restored window, and a mismatched or unreadable readback is a fault. Every session
+    // opened here is detached. Nothing throws from the sweep; the first CLOSED reason is
+    // raised once it is complete, exactly like `releaseFocusEmulation`.
+    if (original !== null) {
+      try { await deps.bounded(holds[0].send('Browser.setWindowBounds', { windowId, bounds: { windowState: original } }), PROBE_MS); }
+      catch { fault = fault || 'window_restore_failed'; }
+      let restored = null;
+      try { restored = (await windowOf(holds[0])).state; } catch {}
+      if (restored !== original) fault = fault || 'window_restore_failed';
+    }
+    let alive = false;
+    try { alive = !page.isClosed(); } catch { fault = fault || 'window_restore_failed'; }
+    for (const session of holds) {
+      try { await deps.bounded(session.detach(), PROBE_MS); }
+      catch { if (alive) fault = fault || 'window_detach_failed'; }
+    }
+  }
+  if (fault) throw new Error(fault);
 }
 // Real-browser focus, taken at the same point as the two diagnostics above and for the same
 // wait, but unlike them this is actuation, not observation. The actual CI run 36072566236 is
@@ -1047,6 +1148,10 @@ async function lifecycleWindow(deps, fixtures, alphaCursor) {
     const windowsAtEnd = await captureWindows(deps, page, other);
     if (windowOwnership === 'unavailable') windowOwnership = windowsAtEnd.ownership;
     windowsAfter = windowsAtEnd.states;
+    // Window state, the lever the three readings above leave untested, actuated and undone
+    // before the wait below runs. Required: an actuation or restore that does not complete
+    // fails the stage rather than letting the wait run against a window nobody put back.
+    await probeMinimizedWindow(deps, page, other);
     setConsoleOp('lw-hidden-wait');
     await page.waitForFunction(() => document.hidden === true);
     page.on('request', count);
