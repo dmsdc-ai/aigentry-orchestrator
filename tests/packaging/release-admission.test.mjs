@@ -54,10 +54,40 @@ function fixture(t, { privateState = 'ignored', projection = defaultProjection()
     if (key.startsWith('GIT_') && !['GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_COUNT',
       'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'].includes(key)) delete env[key];
   }
+  // Evidence capture only, for an already-failed fixture Git call. It samples nothing but the
+  // kind of four paths this fixture itself owns, with lstat, so a symlink is reported and never
+  // traversed; a descendant is only sampled when its parent was observed to be a directory, so
+  // no link is followed into other storage. No directory walk, no read, no write, no cause claim.
+  const observedKind = target => {
+    if (typeof target !== 'string' || target === '') return 'unavailable';
+    try {
+      const stat = lstatSync(target);
+      return stat.isSymbolicLink() ? 'symlink' : stat.isDirectory() ? 'directory' : stat.isFile() ? 'file' : 'other';
+    } catch (error) {
+      return error && error.code === 'ENOENT' ? 'absent' : 'unavailable';
+    }
+  };
+  const observeFixturePaths = () => {
+    try {
+      const rootKind = observedKind(root);
+      const dotGit = path.join(root, '.git');
+      const dotGitKind = rootKind === 'directory' ? observedKind(dotGit) : 'unavailable';
+      const objectsKind = dotGitKind === 'directory' ? observedKind(path.join(dotGit, 'objects')) : 'unavailable';
+      return `observed root=${rootKind} .git=${dotGitKind} .git/objects=${objectsKind} TMPDIR=${observedKind(env.TMPDIR)}`;
+    } catch {
+      return 'observed unavailable';
+    }
+  };
   const git = (...args) => {
     const result = spawnSync('git', ['-C', root, '-c', 'core.hooksPath=/dev/null', ...args], { env, encoding: 'utf8', timeout: 10000 });
-    assert.ifError(result.error);
-    assert.equal(result.status, 0, `fixture git ${args[0]}: ${result.stderr}`);
+    if (result.error || result.status !== 0) {
+      // The original failure, its exit status and its stderr are preserved; the observations are
+      // only appended to the message that the unchanged assertions below already raise.
+      const observed = observeFixturePaths();
+      if (result.error) { try { result.error.message = `${result.error.message} (${observed})`; } catch {} }
+      assert.ifError(result.error);
+      assert.equal(result.status, 0, `fixture git ${args[0]}: ${result.stderr} (${observed})`);
+    }
     return result.stdout.trim();
   };
   const write = (name, data) => {

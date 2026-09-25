@@ -65,12 +65,33 @@ test('pagination cursor is signed, scoped, snapshot-bound, and bounded', async t
   const second = await readTasks(f.reader, 'alice', 'p1', `limit=2&cursor=${encodeURIComponent(first.nextCursor!)}`);
   assert.deepEqual(second.items.map(x => x.taskId), ['c', 'd']);
   const [payload, signature] = first.nextCursor!.split('.');
-  const flip = `${payload}.${signature!.slice(0, -1)}${signature!.endsWith('A') ? 'B' : 'A'}`;
+  // Mutate signature BYTES, not its spelling: the final base64url character of a 32-byte HMAC
+  // carries two padding bits, so editing it can leave the decoded signature identical.
+  const raw = Buffer.from(signature!, 'base64url');
+  assert.equal(raw.length, 32);
+  raw[0]! ^= 1;
+  const flip = `${payload}.${raw.toString('base64url')}`;
   await error(readTasks(f.reader, 'alice', 'p1', `limit=2&cursor=${encodeURIComponent(flip)}`), 400, 'invalid_cursor');
   await error(readTasks(f.reader, 'alice', 'p1', `limit=1&cursor=${encodeURIComponent(first.nextCursor!)}`), 400, 'invalid_cursor');
   await error(readTasks(f.reader, 'alice', 'p1', `status=done&limit=2&cursor=${encodeURIComponent(first.nextCursor!)}`), 400, 'invalid_cursor');
   await error(readTasks(f.reader, 'alice', 'p1', 'limit=0'), 400, 'invalid_query');
   await error(readTasks(f.reader, 'alice', 'p1', 'limit=101'), 400, 'invalid_query');
+  // Control: for every canonical 43-char spelling (final char index a multiple of 4), the byte
+  // mutation above always changes the decoded 32 bytes and stays canonical base64url.
+  const tails = [...'AEIMQUYcgkosw048'];
+  assert.equal(new Set(tails).size, 16);
+  for (const tail of tails) {
+    const bytes = Buffer.from(`${'A'.repeat(42)}${tail}`, 'base64url');
+    assert.equal(bytes.length, 32);
+    const mutated = Buffer.from(bytes);
+    mutated[0]! ^= 1;
+    const spelling = mutated.toString('base64url');
+    assert.equal(spelling.length, 43);
+    assert.equal(spelling.at(-1), tail);
+    assert.notEqual(Buffer.compare(Buffer.from(spelling, 'base64url'), bytes), 0);
+  }
+  // Witness for the old text flip: 'A' and 'B' in the final position are base64url aliases.
+  assert.equal(Buffer.compare(Buffer.from('A'.repeat(43), 'base64url'), Buffer.from(`${'A'.repeat(42)}B`, 'base64url')), 0);
 });
 
 test('malformed, oversize, and unavailable sources are deterministic and non-leaking', async t => {

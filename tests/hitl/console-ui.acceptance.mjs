@@ -255,32 +255,52 @@ export function renderLoginBoundary(value) {
 // enum inside the page, so no URL, title, markup, attribute or error text can reach the
 // line, and it is clamped again by the renderer. No check anywhere reads any of it, and
 // nothing here relaxes, skips, retries or lengthens the wait that follows.
+// The same two readings also carry the tab's real `document.hasFocus()`, taken in the same
+// bounded evaluate and collapsed to its own CLOSED enum in the page. This only narrows the
+// evidence: `focused` is NOT proof that the focus emulation above caused the states beside
+// it, and `unfocused` is NOT proof that suspending it changed them. No verdict, skip or
+// check reads either field, and no wait, probe call, session or event is added to obtain it.
 export const VISIBILITY_STATES = ['not-captured', 'visible', 'hidden', 'unavailable'];
+export const FOCUS_STATES = ['not-captured', 'focused', 'unfocused', 'unavailable'];
 const VISIBILITY_PROBE = () => {
   const state = document.visibilityState;
-  return state === 'visible' || state === 'hidden' ? state : 'unavailable';
+  // Guarded separately so an unreadable focus cannot cost the visibility reading beside it.
+  let focus = 'unavailable';
+  try { const held = document.hasFocus(); if (held === true || held === false) focus = held ? 'focused' : 'unfocused'; } catch {}
+  return { visibility: state === 'visible' || state === 'hidden' ? state : 'unavailable', focus };
 };
 const visibilityOf = value => (VISIBILITY_STATES.includes(value) ? value : 'unavailable');
-let visibilityBefore = { page: 'not-captured', other: 'not-captured' };
-let visibilityAfter = { page: 'not-captured', other: 'not-captured' };
+const focusOf = value => (FOCUS_STATES.includes(value) ? value : 'unavailable');
+const notCaptured = () => ({ visibility: 'not-captured', focus: 'not-captured' });
+const unreadable = () => ({ visibility: 'unavailable', focus: 'unavailable' });
+let visibilityBefore = { page: notCaptured(), other: notCaptured() };
+let visibilityAfter = { page: notCaptured(), other: notCaptured() };
 /** Total: never throws, never checks, never marks and returns nothing the caller acts on, so
  *  a diagnostic fault can never replace the original rejection. An unobservable tab records
  *  `unavailable`, never a state it did not see. Bounded by the caller's own `bounded` and the
  *  existing PROBE_MS; it adds no retry, no sleep and no timeout or deadline increase. */
 async function captureVisibility(deps, page, other) {
   const read = async target => {
-    try { return visibilityOf(await deps.bounded(target.evaluate(VISIBILITY_PROBE), PROBE_MS)); }
-    catch { return 'unavailable'; }
+    try {
+      const seen = await deps.bounded(target.evaluate(VISIBILITY_PROBE), PROBE_MS);
+      const reading = seen && typeof seen === 'object' ? seen : {};
+      return { visibility: visibilityOf(reading.visibility), focus: focusOf(reading.focus) };
+    }
+    catch { return unreadable(); }
   };
   try { return { page: await read(page), other: await read(other) }; }
-  catch { return { page: 'unavailable', other: 'unavailable' }; }
+  catch { return { page: unreadable(), other: unreadable() }; }
 }
 /** Serialized only after the rejection, to stderr only, exactly like `renderLoginBoundary`. */
 export function renderLifecycleVisibility() {
   const pair = value => (value && typeof value === 'object' ? value : {});
   const before = pair(visibilityBefore), after = pair(visibilityAfter);
-  return `before=page:${visibilityOf(before.page)},other:${visibilityOf(before.other)}`
-    + ` after=page:${visibilityOf(after.page)},other:${visibilityOf(after.other)}`;
+  const seen = value => visibilityOf(pair(value).visibility);
+  const held = value => focusOf(pair(value).focus);
+  return `before=page:${seen(before.page)},other:${seen(before.other)}`
+    + ` after=page:${seen(after.page)},other:${seen(after.other)}`
+    + ` focus-before=page:${held(before.page)},other:${held(before.other)}`
+    + ` focus-after=page:${held(after.page)},other:${held(after.other)}`;
 }
 // Diagnostics only, one level below the visibility pair above and for the same wait. The
 // states there are a fact; WHY they hold is not, and the two surviving readings differ only
