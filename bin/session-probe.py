@@ -345,6 +345,13 @@ def classify_surface(cli: str, screen: str, *, current: bool = False) -> tuple[s
         return "raw_shell", "raw shell prompt at tail"
     if re.search(UNSUBMITTED, last4):
         return "unsubmitted", "context-ref still at live prompt"
+    if current and re.search(
+        r"^\s*[\u2722\u2733\u2736\u273b\u273d][^\n]*\bfor\s+"
+        r"(?:\d+[hms]\s*)+\s*\u00b7\s*done\b", screen, re.I | re.M
+    ):
+        # Recognized completed rows are removed on the controls pass. A remaining
+        # duration row is ambiguous, not evidence that work has started.
+        return SURFACE_UNKNOWN, "unrecognized completed duration row"
     if (current_busy_signal(screen) if current else
             re.search(WORKING, tail20, re.I) or has_spinner(tail20)):
         return "working", "working token"

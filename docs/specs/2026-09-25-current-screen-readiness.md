@@ -47,6 +47,8 @@ No dispatch, cleanup, daemon, permissions or transport actuation changes.
   `Crunched for 8m 55s` row with `done` and a Korean PM timestamp. The tester's
   token-count suffix was synthetic, not a field measurement; it is not silently
   added to the recognized grammar. Preserve that negative result separately.
+  An unrecognized explicit numeric-duration/done row stays unknown/static and
+  cannot verify started work. It never becomes ready merely because it says done.
 - This is a sampled observation, not an atomic read-and-inject guarantee. No claim
   of cryptographic session authentication or full cross-terminal acceptance.
 
