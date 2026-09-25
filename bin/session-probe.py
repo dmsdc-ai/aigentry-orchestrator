@@ -315,7 +315,7 @@ def ready_by_current_screen(cli: str, screen: str, surface: str) -> tuple[bool, 
         return False, "current-busy-or-modal"
     if surface == "working":
         return False, "current-working"
-    return True, "current-empty-prompt"
+    return True, "prompt"
 
 
 def classify_surface(cli: str, screen: str, *, current: bool = False) -> tuple[str, str]:
