@@ -267,20 +267,14 @@ def ready_by_screen(cli: str, screen: str) -> tuple[bool, str]:
 
 
 def current_controls(cli: str, screen: str) -> str:
-    """Claude's framed composer separates live controls from completed output."""
+    """Ignore only an explicit rendered turn-duration footer, never live controls."""
     if cli != "claude":
         return screen
-    lines = nonempty_lines(screen)
-    prompts = [i for i, line in enumerate(lines) if re.fullmatch(r"\s*\u276f\s*", line)]
-    if not prompts:
-        return screen
-    index = prompts[-1]
-    rule = r"\s*[\u2500\u2501]{8,}\s*"
-    if (index > 0 and index + 1 < len(lines) and len(lines) - index <= 5
-            and re.fullmatch(rule, lines[index - 1])
-            and re.fullmatch(rule, lines[index + 1])):
-        return "\n".join(lines[index - 1:])
-    return screen
+    duration_footer = re.compile(
+        r"^\s*[\u2722\u2733\u2736\u273b\u273d]\s+[A-Za-z]+ for "
+        r"(?:\d+[hms]\s*)+\s*\u00b7\s*done(?:\s+[^\n]*)?$", re.I)
+    return "\n".join(line for line in screen.splitlines()
+                     if not duration_footer.fullmatch(line))
 
 
 def ready_by_current_screen(cli: str, screen: str, surface: str) -> tuple[bool, str]:

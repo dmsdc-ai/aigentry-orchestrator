@@ -54,6 +54,10 @@ def session_binding(info: dict[str, Any], sid: str) -> tuple[Any, ...]:
             or transport.get("health_status") != "CONNECTED"
             or transport.get("ready") is not True):
         raise ScreenUnavailable("session is not locally connected and ready")
+    bootstrap = transport.get("bootstrap")
+    if bootstrap is not None and (not isinstance(bootstrap, dict)
+                                  or bootstrap.get("ready") is not True):
+        raise ScreenUnavailable("session bootstrap not ready")
     owner = info.get("ownerPid")
     pty = info.get("ptyPid")
     if type(owner) is not int or owner <= 1 or type(pty) is not int or pty <= 1:
@@ -61,7 +65,7 @@ def session_binding(info: dict[str, Any], sid: str) -> tuple[Any, ...]:
     for key in ("createdAt", "lastConnectedAt"):
         if not isinstance(info.get(key), str) or not info[key]:
             raise ScreenUnavailable("session incarnation unavailable")
-    return tuple(info.get(key) for key in (
+    return (bootstrap.get("ready") if isinstance(bootstrap, dict) else None,) + tuple(info.get(key) for key in (
         "id", "host", "backend", "ownerPid", "ptyPid", "createdAt", "lastConnectedAt",
         "cmuxWorkspaceId", "cmuxSurfaceId"))
 

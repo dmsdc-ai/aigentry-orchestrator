@@ -32,10 +32,12 @@ No dispatch, cleanup, daemon, permissions or transport actuation changes.
 - Preserve capture-file fixtures as explicit offline observations. Existing
   historical classifiers remain available for fixture regression, not live input.
 - Current readiness requires a prompt at the live footer; modal/error/unsubmitted
-  states cannot become ready. Claude's framed composer bounds its live controls so
-  historical spinner glyphs above the composer do not mean it is currently busy.
-  Working/interrupt controls at the footer still block dispatch. Unrecognized
-  controls fail closed; the detector never answers an approval.
+  states cannot become ready. A busy control anywhere in the inspected current
+  viewport remains blocking, even above a framed composer. Position alone cannot
+  distinguish stale and active controls (rr751co A1 reproduction). Only the
+  measured Claude duration footer containing explicit `for <duration> ... done`
+  loses its spinner classification; this is not task completion authority.
+  Unrecognized controls fail closed; the detector never answers an approval.
 - This is a sampled observation, not an atomic read-and-inject guarantee. No claim
   of cryptographic session authentication or full cross-terminal acceptance.
 
