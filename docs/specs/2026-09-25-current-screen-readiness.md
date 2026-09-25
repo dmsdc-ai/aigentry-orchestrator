@@ -38,6 +38,15 @@ No dispatch, cleanup, daemon, permissions or transport actuation changes.
   measured Claude duration footer containing explicit `for <duration> ... done`
   loses its spinner classification; this is not task completion authority.
   Unrecognized controls fail closed; the detector never answers an approval.
+- Current trust/command-approval controls are line anchored, including terminal
+  borders, selector glyphs and numbered choices. Inline reply prose quoting those
+  phrases is not a modal. The explicit empty-prompt/current-control gates are not
+  followed by the legacy historical substring check. Error/banner classifiers
+  remain conservative; this correction does not establish universal UI parsing.
+- A 2026-09-25 current-viewport capture of rr751co-tester measured the completed
+  `Crunched for 8m 55s` row with `done` and a Korean PM timestamp. The tester's
+  token-count suffix was synthetic, not a field measurement; it is not silently
+  added to the recognized grammar. Preserve that negative result separately.
 - This is a sampled observation, not an atomic read-and-inject guarantee. No claim
   of cryptographic session authentication or full cross-terminal acceptance.
 

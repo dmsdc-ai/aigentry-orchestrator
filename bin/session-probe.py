@@ -292,6 +292,13 @@ def current_busy_signal(screen: str) -> bool:
     return bool(re.search(pattern, screen, re.I | re.M) or has_spinner(screen))
 
 
+def current_prompt_control(pattern: str, screen: str) -> bool:
+    # Allow terminal borders, prompt/selection glyphs and numbered choices,
+    # but not a control phrase embedded in a reply sentence.
+    prefix = r"^\s*[\u2502\u2503\u276f\u203a\u25cf\u2022>]*\s*(?:\d+[.)]\s*)?"
+    return re.search(prefix + "(?:" + pattern + ")", screen, re.I | re.M) is not None
+
+
 def ready_by_current_screen(cli: str, screen: str, surface: str) -> tuple[bool, str]:
     if surface not in ("idle", "welcome", "working"):
         return False, "current-surface-not-ready"
@@ -307,7 +314,7 @@ def ready_by_current_screen(cli: str, screen: str, surface: str) -> tuple[bool, 
         return False, "current-busy-or-modal"
     if surface == "working":
         return False, "current-working"
-    return ready_by_screen(cli, controls)
+    return True, "current-empty-prompt"
 
 
 def classify_surface(cli: str, screen: str, *, current: bool = False) -> tuple[str, str]:
@@ -319,9 +326,11 @@ def classify_surface(cli: str, screen: str, *, current: bool = False) -> tuple[s
 
     if re.search(THINKING_BLOCK, tail20, re.I):
         return "thinking_block", "thinking-block / invalid request"
-    if re.search(SANDBOX_PROMPT, tail20, re.I):
+    if (current_prompt_control(SANDBOX_PROMPT, screen) if current else
+            re.search(SANDBOX_PROMPT, tail20, re.I)):
         return "sandbox_prompt", "sandbox approval prompt"
-    if re.search(TRUST_MODAL, tail20, re.I):
+    if (current_prompt_control(TRUST_MODAL, screen) if current else
+            re.search(TRUST_MODAL, tail20, re.I)):
         return "modal", "trust-folder or continue modal"
     if re.search(CRASH, tail20, re.I):
         return "crash", "crash / traceback"
