@@ -66,6 +66,57 @@ WORKSPACE_HOST_SH_LOADED=1
 # tees its own `log`; the adapter only emits to stderr so it never blocks a sweep.
 _wh_log() { echo "[workspace-host] $*" >&2; }
 
+# Worker bridges never own daemon lifecycle. Resolve in the controller, then
+# serialize the selection into the terminal command (terminal shells do not
+# inherit the controller environment). An old CLI ignoring the flag is unsafe.
+# Operators may select AIGENTRY_WORKER_TELEPTY_CLI / AIGENTRY_WORKER_NODE and pin
+# the CLI with AIGENTRY_WORKER_TELEPTY_SHA256; defaults honor TELEPTY and PATH.
+_wh_worker_bridge_prefix() {
+  local cli node_bin
+  cli="${AIGENTRY_WORKER_TELEPTY_CLI:-${TELEPTY:-telepty}}"
+  node_bin="${AIGENTRY_WORKER_NODE:-node}"
+  cli=$(command -v "$cli") && node_bin=$(command -v "$node_bin") || {
+    _wh_log "worker bootstrap: selected telepty or Node is unavailable; no spawn"
+    return 2
+  }
+  TELEPTY_DAEMON_LIFECYCLE=external "$node_bin" -e '
+    try {
+      const fs = require("node:fs"), crypto = require("node:crypto");
+      const cli = fs.realpathSync(process.argv[1]), node = process.execPath;
+      if (!fs.statSync(cli).isFile() || /[\x00-\x1f\x7f]/.test(cli + node)) throw Error();
+      const pin = process.env.AIGENTRY_WORKER_TELEPTY_SHA256;
+      if (pin !== undefined && (!/^[a-f0-9]{64}$/.test(pin) ||
+          crypto.createHash("sha256").update(fs.readFileSync(cli)).digest("hex") !== pin)) throw Error();
+      const api = require(cli);
+      if (typeof api.ensureDaemonRunning !== "function" ||
+          typeof api.resolveDaemonLifecycleMode !== "function" ||
+          api.resolveDaemonLifecycleMode({ TELEPTY_DAEMON_LIFECYCLE: "external" }).mode !== "external") throw Error();
+      const host = (process.env.TELEPTY_HOST || "127.0.0.1")
+        .replace(/^(https?:\/\/)?localhost(?=[:/]|$)/i, (_, scheme = "") => scheme + "127.0.0.1");
+      const quote = value => "\u0027" + value.replace(/\u0027/g, "\u0027\u0022\u0027\u0022\u0027") + "\u0027";
+      const port = process.env.TELEPTY_PORT;
+      process.stdout.write(["env", "-u", "TELEPTY_PORT", "TELEPTY_DAEMON_LIFECYCLE=external",
+        "TELEPTY_SUBMIT_FORCE_DEFAULT=0", "TELEPTY_HOST=" + host,
+        ...(port === undefined ? [] : ["TELEPTY_PORT=" + port]), node, cli].map(quote).join(" "));
+    } catch {
+      process.stderr.write("[workspace-host] worker bootstrap: incompatible or unverified telepty CLI; select an external-lifecycle-capable CLI; no spawn\n");
+      process.exitCode = 2;
+    }
+  ' "$cli"
+}
+
+# Quote the complete inner script as one argument, including CLI paths and the
+# already-prepared confined worker command. No second PATH lookup for telepty.
+_wh_worker_allow_command() {
+  local prefix script q_script q_cwd q_sid
+  prefix=$(_wh_worker_bridge_prefix) || return 2
+  script="cd \"\$1\" && exec $prefix allow --id \"\$2\" --auto-restart $3"
+  printf -v q_script '%q' "$script"
+  printf -v q_cwd '%q' "$2"
+  printf -v q_sid '%q' "$1"
+  printf 'bash -c %s _ %s %s' "$q_script" "$q_cwd" "$q_sid"
+}
+
 # -----------------------------------------------------------------------------
 # cmux adapter
 # -----------------------------------------------------------------------------
@@ -326,17 +377,12 @@ _wh_cmux_wait_ready() {
 _wh_cmux_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
   # cmux --command sends text+Enter; telepty allow runs as the workspace's foreground process.
-  # bash -c 'cd ... && exec ...' wrapper: cmux --cwd only affects workspace shell, not the
-  # telepty-allow-wrapped CLI. Explicit cd inside wrapper guarantees claude inherits cwd (#311).
-  # #926: cwd and sid go on ARGV and are read as "$1"/"$2" inside the single-quoted
-  # script — never interpolated into it. They are ALSO %q-quoted, because --command is
-  # TYPED INTO the workspace shell (text+Enter, above), so a bare append would still
-  # word-split a cwd containing a space. cli_cmd stays unquoted deliberately: it is a
-  # COMMAND LINE (`claude --model … --effort …`), not a value, and must word-split.
+  # The common wrapper carries cwd/sid as argv, quotes the complete inner script,
+  # and preserves cli_cmd as the prepared command line, not a single executable.
   local CMUX_BIN="${CMUX:-cmux}"
-  local out ref q_cwd q_sid
-  printf -v q_cwd '%q' "$cwd"; printf -v q_sid '%q' "$sid"
-  out=$("$CMUX_BIN" new-workspace --cwd "$cwd" --command "bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd' _ $q_cwd $q_sid" 2>&1)
+  local out ref command
+  command=$(_wh_worker_allow_command "$sid" "$cwd" "$cli_cmd") || return 2
+  out=$("$CMUX_BIN" new-workspace --cwd "$cwd" --command "$command" 2>&1)
   ref=$(echo "$out" | grep -oE 'workspace:[0-9]+' | head -1)
   [ -z "$ref" ] && { echo "ERR cmux new-workspace failed: $out" >&2; return 2; }
   # title == sid (open-session.sh SID convention); rename to the stable handle.
@@ -553,18 +599,16 @@ _wh_warp_ready_attestation() {
 # _wh_warp_write_tab_config <toml> <marker> <cwd> <wrapper> — write the Warp
 # tab_config (ADR §5 D5 step 1): one tab whose window title is the find-handle
 # marker "telepty::<sid>" and whose command is the sentinel-writing wrapper. This
-# is the missing dual of _wh_warp_rm_tab_config. The wrapper has no single quotes
-# (TOML literal strings cannot contain one), so a literal string is injection-safe.
+# is the missing dual of _wh_warp_rm_tab_config. JSON string escaping is also
+# valid for these TOML basic strings; the shell wrapper contains quotes.
 _wh_warp_write_tab_config() {
-  local toml="$1" marker="$2" cwd="$3" wrapper="$4"
+  local toml="$1" marker="$2" cwd="$3" wrapper="$4" payload
+  payload=$(jq -nr --arg marker "$marker" --arg cwd "$cwd" --arg wrapper "$wrapper" \
+    '"name = \($marker|tojson)\n\n[[tabs]]\ntitle = \($marker|tojson)\ncwd = \($cwd|tojson)\ncommand = \($wrapper|tojson)"') || return 1
   mkdir -p "$(dirname "$toml")" 2>/dev/null || return 1
   {
     printf '# aigentry warp tab_config — generated by _wh_warp_open (#608 Phase 2, ADR §5 D5)\n'
-    printf "name = '%s'\n\n" "$marker"
-    printf '[[tabs]]\n'
-    printf "title = '%s'\n" "$marker"
-    printf "cwd = '%s'\n" "$cwd"
-    printf "command = '%s'\n" "$wrapper"
+    printf '%s\n' "$payload"
   } > "$toml" 2>/dev/null || return 1
   return 0
 }
@@ -669,6 +713,8 @@ _wh_warp_wait_ready() {
 #   3  → ready-gate timed out; tab_config + sentinel GC'd, NO marker emitted.
 _wh_warp_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
+  local command
+  command=$(_wh_worker_allow_command "$sid" "$cwd" "$cli_cmd") || return 2
   local marker="telepty::$sid"
   local sentinel="$AIGENTRY_WARP_SURFACE_DIR/$sid.live"
   local tcdir toml
@@ -688,13 +734,10 @@ _wh_warp_open() {
   # have to be safe inside that line itself. %q also renders a newline as $'\n', so a
   # crafted cwd cannot break out of the TOML string and add a key. cli_cmd stays
   # unquoted for the same reason as _wh_cmux_open: it is a command line, not a value.
-  # ponytail: a cwd containing an apostrophe still breaks the TOML *literal* string
-  # (`command = '…'` admits no escape) — a parse failure, not an execution, and the
-  # neighbouring `cwd = '%s'` line has had the same limitation since #608. Fixing it
-  # means moving the writer to TOML basic strings; separate ticket, not this one.
+  # The tab-config writer escapes the full shell command as a TOML basic string.
   local q_cwd q_sid q_sentinel
   printf -v q_cwd '%q' "$cwd"; printf -v q_sid '%q' "$sid"; printf -v q_sentinel '%q' "$sentinel"
-  local wrapper="cd $q_cwd && touch $q_sentinel && exec telepty allow --id $q_sid --auto-restart $cli_cmd"
+  local wrapper="cd $q_cwd && touch $q_sentinel && exec $command"
 
   if ! _wh_warp_write_tab_config "$toml" "$marker" "$cwd" "$wrapper"; then
     echo "[workspace-host] warp wh_open: failed to write tab_config $toml" >&2
@@ -752,6 +795,8 @@ _wh_warp_open() {
 # branch natively. Caller must have sourced platform.sh (open-session.sh does).
 _wh_fallback_spawn() {
   local _sid="$1" _cwd="$2" _cli_cmd="$3"
+  local command prefix q_script
+  command=$(_wh_worker_allow_command "$_sid" "$_cwd" "$_cli_cmd") || return 2
   # #926: this function is the reason the fix could not stop at cmux/warp/aterm —
   # it is where EVERY other adapter lands when its terminal CLI is missing, so the
   # hole here survives a fix everywhere else by the user simply not having cmux.
@@ -762,12 +807,14 @@ _wh_fallback_spawn() {
     # The sid IS in it, because tmux runs the 3rd argument through a shell and the
     # signature offers no argv channel for it; `%q` is that guarantee here (a real
     # shell parses it, so there is no second parser to fight — unlike iTerm).
-    platform::spawn_tmux_window "$_sid" "$_cwd" "telepty allow --id $_q_sid --auto-restart $_cli_cmd"
+    platform::spawn_tmux_window "$_sid" "$_cwd" "$command"
     echo "$_sid"
   else
     # `telepty spawn -- …` execs its argv directly, so this takes the true argv
     # shape and needs no quoting pass at all.
-    telepty spawn --id "$_sid" -- bash -c "cd \"\$1\" && exec $_cli_cmd" _ "$_cwd" >/dev/null
+    prefix=$(_wh_worker_bridge_prefix) || return 2
+    printf -v q_script '%q' "cd \"\$1\" && exec $_cli_cmd"
+    bash -c "exec $prefix spawn --id \"\$1\" -- bash -c $q_script _ \"\$2\"" _ "$_sid" "$_cwd" >/dev/null || return $?
     echo "⚠️  Session spawned as daemon (no visible terminal). Attach: telepty attach $_sid" >&2
     echo "$_sid"
   fi
@@ -777,12 +824,14 @@ _wh_fallback_spawn() {
 # bash -c wrapper for cwd propagation into claude (#311).
 _wh_aterm_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
+  local command
+  command=$(_wh_worker_allow_command "$sid" "$cwd" "$cli_cmd") || return 2
   # #926: same shape as _wh_cmux_open — --cmd is shell text, so cwd and sid go on
   # argv, %q-quoted; cli_cmd stays unquoted because it is a command line.
   local q_cwd q_sid
   printf -v q_cwd '%q' "$cwd"; printf -v q_sid '%q' "$sid"
   if command -v aterm >/dev/null 2>&1 \
-    && aterm new-session --cwd "$cwd" --cmd "bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd' _ $q_cwd $q_sid" 2>/dev/null; then
+    && aterm new-session --cwd "$cwd" --cmd "$command" 2>/dev/null; then
     echo "$sid"
   else
     _wh_fallback_spawn "$sid" "$cwd" "$cli_cmd"
@@ -793,10 +842,12 @@ _wh_aterm_open() {
 # `tmux new-window -c` propagates cwd correctly. (Legacy used $title == $sid.)
 _wh_tmux_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
+  local command
+  command=$(_wh_worker_allow_command "$sid" "$cwd" "$cli_cmd") || return 2
   # #926: see _wh_fallback_spawn's tmux branch — cwd never enters this string, the
   # sid is %q-quoted because spawn_tmux_window's 3rd argument is shell text.
   local q_sid; printf -v q_sid '%q' "$sid"
-  platform::spawn_tmux_window "$sid" "$cwd" "telepty allow --id $q_sid --auto-restart $cli_cmd"
+  platform::spawn_tmux_window "$sid" "$cwd" "$command"
   echo "$sid"
 }
 
@@ -804,10 +855,12 @@ _wh_tmux_open() {
 # Explicit cd inside bash -c guarantees cwd propagation into claude (#311).
 _wh_wezterm_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
+  local command
+  command=$(_wh_worker_allow_command "$sid" "$cwd" "$cli_cmd") || return 2
   if command -v wezterm >/dev/null 2>&1; then
     # #926: `wezterm cli spawn -- …` execs its argv directly (no shell re-parse),
     # so cwd and sid go on argv as-is — no %q pass needed.
-    wezterm cli spawn --cwd "$cwd" -- bash -c "cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd" _ "$cwd" "$sid" >/dev/null
+    wezterm cli spawn --cwd "$cwd" -- bash -c "$command" >/dev/null
     echo "$sid"
   else
     _wh_fallback_spawn "$sid" "$cwd" "$cli_cmd"
@@ -818,6 +871,8 @@ _wh_wezterm_open() {
 # Legacy contract: spawn failure → exit 2 (here: return 2, no handle).
 _wh_iterm_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
+  local command
+  command=$(_wh_worker_allow_command "$sid" "$cwd" "$cli_cmd") || return 2
   # #926: the fix for this arm is in platform::spawn_iterm_tab, NOT here, and that is
   # the point. cwd/cmd used to be interpolated into an AppleScript literal that iTerm
   # then typed into a shell — TWO parsers — so no amount of quoting at THIS call site
@@ -830,7 +885,7 @@ _wh_iterm_open() {
   # because it is a value inside a command LINE, while cli_cmd stays unquoted because
   # it IS the command line and must word-split.
   local q_sid; printf -v q_sid '%q' "$sid"
-  platform::spawn_iterm_tab "$cwd" "telepty allow --id $q_sid --auto-restart $cli_cmd" \
+  platform::spawn_iterm_tab "$cwd" "$command" \
     || { echo "ERR iTerm spawn failed" >&2; return 2; }
   echo "$sid"
 }
@@ -850,8 +905,11 @@ _wh_iterm_ready_attestation()   { printf 'none'; }
 # fallback, ADR §7 Phase 3 "generic→headless adapter"). No visible UI surface.
 _wh_headless_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
+  local prefix q_script
+  prefix=$(_wh_worker_bridge_prefix) || return 2
+  printf -v q_script '%q' "cd \"\$1\" && exec $cli_cmd"
   # #926: argv shape — `telepty spawn -- …` execs its argv directly.
-  telepty spawn --id "$sid" -- bash -c "cd \"\$1\" && exec $cli_cmd" _ "$cwd" >/dev/null
+  bash -c "exec $prefix spawn --id \"\$1\" -- bash -c $q_script _ \"\$2\"" _ "$sid" "$cwd" >/dev/null || return $?
   echo "⚠️  Session spawned as daemon (headless: no spawn-tab CLI)." >&2
   echo "    Attach via: telepty attach $sid" >&2
   echo "$sid"

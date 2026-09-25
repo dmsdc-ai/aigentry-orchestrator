@@ -76,6 +76,13 @@ export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 [ -n "$TELEPTY" ] || TELEPTY=telepty
 export TELEPTY
 
+# The legacy inline bridge re-resolves telepty and cannot carry the external
+# lifecycle contract. Refuse the bypass before creating any terminal surface.
+if [ "${AIGENTRY_WH_LEGACY_SPAWN:-0}" = "1" ]; then
+  echo "open-session.sh: legacy spawn cannot enforce external daemon lifecycle; unset AIGENTRY_WH_LEGACY_SPAWN" >&2
+  exit 2
+fi
+
 # Resolve symlinks to find the real script directory (POSIX-portable), verbatim
 # from the shell implementation.
 _resolve_src() {
