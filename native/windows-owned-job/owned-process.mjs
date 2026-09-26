@@ -1,8 +1,18 @@
 // Task1167 / release1171 — Windows owned-process facade (operation wn1167a-v1).
 //
 // The caller-side half of the owned-job prototype: it holds the job handle for the
-// whole invocation, arms the native control thread BEFORE spawning anything, and
+// whole invocation, arms the native control thread BEFORE starting anything, and
 // launches exactly one fixed trusted broker with a clean bootstrap environment.
+//
+// The broker is created by the addon (native.startBroker -> CreateProcessW), not
+// by child_process. That is the producer/consumer binding the control channel
+// authenticates against: the expected broker identity is a creation result plus
+// an owned process handle, which exists before the channel is serviced and is
+// therefore available to runSync, whose JavaScript is blocked for the whole call
+// and can never hand a spawn result to the control thread mid-flight. The broker's
+// stdio is pumped into bounded native buffers, so caller-facing stdout/stderr, the
+// output cap and the ordering oracle are identical on both entry points.
+// run() and runSync() keep their existing public contracts and result shape.
 //
 // This .mjs hosts the testable async+sync core so the prototype needs no new TS
 // toolchain. Later approved production callers (spawner.ts, bin/model-router.mjs)
@@ -17,7 +27,6 @@
 //   * cleanup.state is "complete" only when an assignment barrier was observed
 //     AND the job was seen empty AND the broker handle was seen exited. An empty
 //     job that never had a member reports "unknown", never success.
-import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -48,7 +57,8 @@ export const BROKER_FAULT_STAGES = Object.freeze({
   20: "payload-decode", 21: "payload-validate", 22: "spawn-threw", 23: "broker-internal",
   101: "caller-connect", 102: "caller-hello", 103: "caller-ident-write", 104: "caller-owned",
   105: "caller-payload-write", 106: "caller-launch", 107: "caller-execution",
-  108: "caller-protocol",
+  108: "caller-protocol", 109: "caller-broker-identity", 110: "caller-barrier",
+  111: "caller-broker-create",
 });
 export const LAUNCH_ERRNO_TAGS = Object.freeze({
   1: "ENOENT", 2: "EACCES", 3: "EPERM", 4: "EINVAL", 5: "E2BIG", 6: "UNKNOWN",
@@ -68,8 +78,13 @@ function loadAddon() {
   for (const candidate of ADDON_CANDIDATES) {
     try {
       const native = require(candidate);
-      if (typeof native?.createInvocation !== "function") {
-        lastError = new Error("addon is missing createInvocation");
+      // An addon predating the owned-broker binding would load but could not
+      // authenticate the control channel. Missing exports are an explicit
+      // refusal, never a silent downgrade to the unbound path.
+      const missing = ["createInvocation", "arm", "startBroker", "finish", "waitAsync", "output",
+        "cancel", "snapshot", "dispose"].find((name) => typeof native?.[name] !== "function");
+      if (missing) {
+        lastError = new Error(`addon is missing ${missing}`);
         continue;
       }
       addonState = { native, addonPath: candidate, reason: null };
@@ -159,8 +174,10 @@ function validate(options, mode) {
   if (input !== undefined && typeof input !== "string" && !Buffer.isBuffer(input)) {
     throw new OwnedProcessError("ERR_OWNED_JOB_OPTIONS", "input must be a string, Buffer or undefined");
   }
-  // The sync path cannot express "leave stdin open": spawnSync always closes the
-  // child's stdin. Say so rather than silently changing the stdin contract.
+  // runSync's published contract has always required explicit input; the caller
+  // is blocked for the whole call and has no way to feed a stdin that is left
+  // open. Unchanged on purpose — widening it here would be a public API change,
+  // not a security correction.
   if (mode === "sync" && input === undefined) {
     throw new OwnedProcessError("ERR_OWNED_JOB_OPTIONS", "runSync requires input (use an empty string for explicit EOF)");
   }
@@ -206,6 +223,20 @@ function bootstrapEnv() {
     if (typeof value === "string") clean[key] = value;
   }
   return clean;
+}
+
+// CreateProcessW takes an environment block, so the same allowlisted map is handed
+// to the addon as KEY=VALUE strings. A NUL or a leading "=" would corrupt the block
+// and is refused here rather than truncating it silently.
+function bootstrapEnvPairs() {
+  const pairs = [];
+  for (const [key, value] of Object.entries(bootstrapEnv())) {
+    if (!isCleanString(key) || key.length === 0 || key.includes("=") || !isCleanString(value)) {
+      continue;
+    }
+    pairs.push(`${key}=${value}`);
+  }
+  return pairs;
 }
 
 function payloadFrame(opts, stdinMode) {
@@ -283,7 +314,14 @@ function primaryError(stopReason, record, overflow) {
     case "broker-fault":
     case "control-fault":
     case "handshake-timeout":
-    case "handshake-failure": {
+    case "handshake-failure":
+    // Refused before IDENT: whoever reached the control pipe was not the broker
+    // this invocation created, so nothing was disclosed.
+    case "broker-identity-mismatch":
+    case "broker-identity-unavailable":
+    // Refused before PAYLOAD: the caller could not observe its own job owning the
+    // expected broker, so the wire's OWNED claim was not accepted.
+    case "barrier-unverified": {
       const stage = BROKER_FAULT_STAGES[record?.faultStage] || `stage-${record?.faultStage ?? 0}`;
       return new OwnedProcessError(
         "ERR_OWNED_JOB_OWNERSHIP",
@@ -333,13 +371,21 @@ function buildResult({ record, stdout, stderr, stdoutTruncated, stderrTruncated,
       terminateOk: Boolean(record?.terminateOk),
       terminateWinError: record?.terminateWinError ?? null,
       brokerExitObserved: Boolean(record?.brokerExitObserved),
+      brokerTerminated: Boolean(record?.brokerTerminated),
       settled: Boolean(record?.settled),
     },
     broker: {
       pid: brokerPid ?? (record?.brokerPid || null),
       exitCode: brokerExit ?? null,
       signal: brokerSignal ?? null,
-      observedPid: record?.brokerPid || null,
+      // The identity this invocation created, and the identity that actually
+      // reached the control pipe. They are reported separately on purpose: a
+      // mismatch is the H1 defect and must stay visible rather than be collapsed.
+      expectedPid: record?.brokerPid || null,
+      observedPid: record?.observedClientPid || null,
+      identityVerified: Boolean(record?.brokerIdentityVerified),
+      created: Boolean(record?.brokerCreated),
+      createWinError: record?.brokerCreateWinError ?? null,
       faultMode: record?.brokerFaultMode ?? 0,
     },
     job: {
@@ -347,7 +393,18 @@ function buildResult({ record, stdout, stderr, stdoutTruncated, stderrTruncated,
       flagsEffective: record?.jobFlagsEffective ?? null,
       flagsEffectiveKnown: Boolean(record?.jobFlagsEffectiveKnown),
       barrierObserved: Boolean(record?.barrier),
+      // activeProcessesAtBarrier keeps its existing meaning: the count the broker
+      // REPORTED on the wire. The caller's own measurements are the two fields
+      // below, and they are what the barrier is actually gated on.
       activeProcessesAtBarrier: record?.barrier ? record.barrierActiveProcesses : null,
+      reportedActiveProcessesAtBarrier: record?.barrierReportedActiveProcesses ?? null,
+      observedActiveProcessesAtBarrier: record?.barrierObservedKnown
+        ? record.barrierObservedActiveProcesses
+        : null,
+      observedActiveProcessesKnown: Boolean(record?.barrierObservedKnown),
+      brokerInJobAtBarrier: record?.barrierBrokerInJobKnown
+        ? Boolean(record.barrierBrokerInJob)
+        : null,
       rootDrainComplete: Boolean(record?.rootDrainComplete),
       rootStdoutBytes: record?.rootStdoutBytes ?? null,
       rootStderrBytes: record?.rootStderrBytes ?? null,
@@ -366,6 +423,88 @@ function buildResult({ record, stdout, stderr, stdoutTruncated, stderrTruncated,
     addonPath: loadAddon().addonPath,
     protocol: OWNED_JOB_PROTOCOL,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Shared invocation wiring
+// ---------------------------------------------------------------------------
+// run() and runSync() build the same native invocation and the same broker
+// through these three helpers, so there is exactly one producer/consumer binding
+// to audit rather than one per entry point.
+
+function inputBuffer(input) {
+  if (input === undefined) return undefined;
+  return typeof input === "string" ? Buffer.from(input, "utf8") : input;
+}
+
+function invocationOptions(opts, stdinMode) {
+  return {
+    handshakeTimeoutMs: opts.handshakeTimeoutMs,
+    executionTimeoutMs: opts.executionTimeoutMs,
+    cleanupBudgetMs: opts.cleanupBudgetMs,
+    handoffHoldMs: opts.handoffHoldMs,
+    brokerFaultMode: opts.brokerFaultMode,
+    maxOutputBytes: opts.maxOutputBytes,
+    // Present => the broker's stdin receives exactly these bytes followed by an
+    // explicit EOF, empty input included. Absent => stdin stays open, which is
+    // the async caller's "input undefined" contract.
+    input: inputBuffer(opts.input),
+    payloadFrame: payloadFrame(opts, stdinMode),
+  };
+}
+
+function brokerOptions(opts, pipeName) {
+  return {
+    // Fixed absolute paths only: the caller's own interpreter and the in-tree
+    // broker. The addon passes nodeExe as lpApplicationName, so no PATH search
+    // and no command-line reinterpretation can select a different binary.
+    nodeExe: process.execPath,
+    script: BROKER_PATH,
+    pipeName,
+    cwd: here,
+    handshakeTimeoutMs: opts.handshakeTimeoutMs,
+    envPairs: bootstrapEnvPairs(),
+  };
+}
+
+// Slack backstop only. The native control thread owns every real deadline; this
+// just bounds the wait in case that thread itself fails. Clamped to the addon's
+// accepted range so an out-of-range value can never silently collapse to the
+// addon's much shorter default.
+const MAX_NATIVE_WAIT_MS = 5_000_000;
+function backstopMs(opts) {
+  const total = opts.handshakeTimeoutMs + opts.handoffHoldMs + opts.executionTimeoutMs +
+    opts.cleanupBudgetMs + 2_000;
+  return Math.min(total, MAX_NATIVE_WAIT_MS);
+}
+
+// startBroker throwing means no broker process exists: nothing was owned and
+// nothing was disclosed. The addon has already recorded the stage and unwound the
+// armed control thread, so this settles the record and reports a bootstrap
+// failure rather than an ownership result. The raw cause is preserved.
+function brokerStartFailure(native, invocation, opts, startedAt, error) {
+  let record = null;
+  try {
+    record = native.finish(invocation, opts.cleanupBudgetMs + 1_000);
+  } catch {
+    record = null;
+  }
+  const result = buildResult({
+    record,
+    stdout: Buffer.alloc(0),
+    stderr: Buffer.alloc(0),
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    brokerExit: null,
+    brokerSignal: null,
+    brokerPid: null,
+    overflow: false,
+    totalMs: Date.now() - startedAt,
+    firstOutputAtMs: null,
+    fallbackStop: "broker-spawn-error",
+  });
+  if (result.error && error) result.error.cause = error;
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -388,28 +527,23 @@ export async function run(options) {
   const native = state.native;
   const startedAt = Date.now();
 
-  const created = native.createInvocation({
-    handshakeTimeoutMs: opts.handshakeTimeoutMs,
-    executionTimeoutMs: opts.executionTimeoutMs,
-    cleanupBudgetMs: opts.cleanupBudgetMs,
-    handoffHoldMs: opts.handoffHoldMs,
-    brokerFaultMode: opts.brokerFaultMode,
-    payloadFrame: payloadFrame(opts, opts.input === undefined ? "open" : "bytes"),
-  });
+  const created = native.createInvocation(invocationOptions(opts, opts.input === undefined ? "open" : "bytes"));
   const invocation = created.invocation;
 
   let abortListener = null;
   try {
-    // Armed BEFORE the spawn: every deadline from here on is enforced by the
-    // native control thread, never by a JavaScript timer.
+    // Armed BEFORE the broker exists: every deadline from here on is enforced by
+    // the native control thread, never by a JavaScript timer.
     native.arm(invocation);
 
-    const child = spawn(process.execPath, [BROKER_PATH, created.pipeName, String(opts.handshakeTimeoutMs)], {
-      cwd: here,
-      env: bootstrapEnv(),
-      shell: false,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    let broker = null;
+    try {
+      broker = native.startBroker(invocation, brokerOptions(opts, created.pipeName));
+    } catch (error) {
+      // The control thread has already been unwound natively; settle the record
+      // rather than leaving an armed invocation behind.
+      return brokerStartFailure(native, invocation, opts, startedAt, error);
+    }
 
     if (opts.signal) {
       if (opts.signal.aborted) native.cancel(invocation, 1);
@@ -418,68 +552,35 @@ export async function run(options) {
     }
     if (opts.onStarted) {
       opts.onStarted({
-        brokerPid: child.pid ?? null,
+        brokerPid: broker.pid,
         pipeName: created.pipeName,
         snapshot: () => native.snapshot(invocation),
         cancel: () => native.cancel(invocation, 1),
       });
     }
 
-    const chunks = { stdout: [], stderr: [] };
-    const sizes = { stdout: 0, stderr: 0 };
-    const truncated = { stdout: false, stderr: false };
-    let overflow = false;
-    let firstOutputAtMs = null;
-
-    const collect = (stream, key) => {
-      stream?.on("data", (chunk) => {
-        if (firstOutputAtMs === null) firstOutputAtMs = Date.now() - startedAt;
-        if (truncated[key]) return;
-        if (sizes[key] + chunk.length > opts.maxOutputBytes) {
-          truncated[key] = true;
-          overflow = true;
-          // Stop the invocation through the native path; a JS-side kill would only
-          // reach the broker, not the owned tree.
-          native.cancel(invocation, 2);
-          return;
-        }
-        sizes[key] += chunk.length;
-        chunks[key].push(chunk);
-      });
-      stream?.on("error", () => { /* pipe teardown races job termination */ });
-    };
-    collect(child.stdout, "stdout");
-    collect(child.stderr, "stderr");
-
-    if (opts.input !== undefined) {
-      child.stdin?.on("error", () => { /* EPIPE if the broker died first */ });
-      child.stdin?.end(typeof opts.input === "string" ? Buffer.from(opts.input, "utf8") : opts.input);
-    }
-
-    const closed = await new Promise((resolve) => {
-      let done = false;
-      const settle = (value) => { if (!done) { done = true; resolve(value); } };
-      child.on("error", (error) => settle({ spawnError: error, code: null, signal: null }));
-      child.on("close", (code, signal) => settle({ spawnError: null, code, signal }));
-    });
-
-    // Bounded: the control thread has already run its own cleanup budget by the
-    // time the broker's pipes closed, so this normally returns immediately.
-    const record = closed.spawnError ? null : native.finish(invocation, opts.cleanupBudgetMs + 1_000);
+    // Off the event loop, on a libuv thread; the deadline being honoured is still
+    // the native control thread's. The budget is the same slack backstop the sync
+    // path uses and is never the mechanism that bounds execution.
+    await native.waitAsync(invocation, backstopMs(opts));
+    const record = native.finish(invocation, opts.cleanupBudgetMs + 1_000);
+    const io = native.output(invocation, opts.drainBudgetMs + 1_000);
 
     return buildResult({
       record,
-      stdout: Buffer.concat(chunks.stdout, sizes.stdout),
-      stderr: Buffer.concat(chunks.stderr, sizes.stderr),
-      stdoutTruncated: truncated.stdout,
-      stderrTruncated: truncated.stderr,
-      brokerExit: closed.code,
-      brokerSignal: closed.signal,
-      brokerPid: child.pid ?? null,
-      overflow,
+      stdout: io.stdout,
+      stderr: io.stderr,
+      stdoutTruncated: io.stdoutTruncated,
+      stderrTruncated: io.stderrTruncated,
+      brokerExit: record?.brokerExitObserved ? record.brokerExitCode : null,
+      brokerSignal: null,
+      brokerPid: broker.pid,
+      overflow: io.stdoutTruncated || io.stderrTruncated,
       totalMs: Date.now() - startedAt,
-      firstOutputAtMs,
-      fallbackStop: closed.spawnError ? "broker-spawn-error" : null,
+      // The inert ordering oracle, now measured natively at the first byte that
+      // crossed the broker's stdout/stderr rather than at a JS "data" event.
+      firstOutputAtMs: io.firstOutputAtMs,
+      fallbackStop: null,
     });
   } finally {
     if (abortListener && opts.signal) opts.signal.removeEventListener("abort", abortListener);
@@ -504,58 +605,49 @@ export function runSync(options) {
   const native = state.native;
   const startedAt = Date.now();
 
-  const created = native.createInvocation({
-    handshakeTimeoutMs: opts.handshakeTimeoutMs,
-    executionTimeoutMs: opts.executionTimeoutMs,
-    cleanupBudgetMs: opts.cleanupBudgetMs,
-    handoffHoldMs: opts.handoffHoldMs,
-    brokerFaultMode: opts.brokerFaultMode,
-    payloadFrame: payloadFrame(opts, "bytes"),
-  });
+  const created = native.createInvocation(invocationOptions(opts, "bytes"));
   const invocation = created.invocation;
 
   try {
     native.arm(invocation);
-    if (opts.onStarted) {
-      // Sync callers are blocked from here until the child closes, so this hook can
-      // only record intent; it cannot observe or cancel mid-flight.
-      opts.onStarted({ brokerPid: null, pipeName: created.pipeName, snapshot: null, cancel: null });
+
+    let broker = null;
+    try {
+      broker = native.startBroker(invocation, brokerOptions(opts, created.pipeName));
+    } catch (error) {
+      return brokerStartFailure(native, invocation, opts, startedAt, error);
     }
 
-    // No JS timer participates in this call. `timeout` below is Node's sync-loop
-    // backstop (implemented in the spawnSync C++ loop, not on the JS event loop)
-    // and is deliberately slack: it exists only in case the native control thread
-    // itself fails, and it is never the mechanism that bounds execution.
-    const backstopMs = opts.handshakeTimeoutMs + opts.handoffHoldMs + opts.executionTimeoutMs +
-      opts.cleanupBudgetMs + 2_000;
-    const res = spawnSync(process.execPath, [BROKER_PATH, created.pipeName, String(opts.handshakeTimeoutMs)], {
-      cwd: here,
-      env: bootstrapEnv(),
-      shell: false,
-      input: typeof opts.input === "string" ? Buffer.from(opts.input, "utf8") : opts.input,
-      maxBuffer: opts.maxOutputBytes,
-      timeout: backstopMs,
-      killSignal: "SIGKILL",
-    });
+    if (opts.onStarted) {
+      // Sync callers are blocked from here until the invocation settles, so this
+      // hook can still only record intent — but the broker PID it records is now
+      // the real one, because the addon created the process rather than waiting
+      // for a spawnSync result that arrives only after completion.
+      opts.onStarted({ brokerPid: broker.pid, pipeName: created.pipeName, snapshot: null, cancel: null });
+    }
 
-    const overflow = res.error?.code === "ENOBUFS";
-    const record = native.finish(invocation, opts.cleanupBudgetMs + 1_000);
+    // No JS timer participates in this call, and nothing here waits on the event
+    // loop: finish() blocks on the native control thread's own completion event.
+    // The budget is deliberately slack — it exists only in case that thread
+    // itself fails, and it is never the mechanism that bounds execution.
+    const record = native.finish(invocation, backstopMs(opts));
+    const io = native.output(invocation, opts.drainBudgetMs + 1_000);
 
     return buildResult({
       record,
-      stdout: Buffer.isBuffer(res.stdout) ? res.stdout : Buffer.alloc(0),
-      stderr: Buffer.isBuffer(res.stderr) ? res.stderr : Buffer.alloc(0),
-      stdoutTruncated: overflow,
-      stderrTruncated: false,
-      brokerExit: res.status,
-      brokerSignal: res.signal,
-      brokerPid: res.pid ?? null,
-      overflow,
+      stdout: io.stdout,
+      stderr: io.stderr,
+      stdoutTruncated: io.stdoutTruncated,
+      stderrTruncated: io.stderrTruncated,
+      brokerExit: record?.brokerExitObserved ? record.brokerExitCode : null,
+      brokerSignal: null,
+      brokerPid: broker.pid,
+      overflow: io.stdoutTruncated || io.stderrTruncated,
       totalMs: Date.now() - startedAt,
-      // spawnSync buffers everything, so per-chunk arrival times do not exist on
-      // this path; the barrier ordering oracle here is the native record alone.
-      firstOutputAtMs: null,
-      fallbackStop: res.error && !overflow ? "broker-spawn-error" : null,
+      // Both paths now share one capture, so the ordering oracle is measured here
+      // too instead of being unavailable on the synchronous path.
+      firstOutputAtMs: io.firstOutputAtMs,
+      fallbackStop: null,
     });
   } finally {
     native.dispose(invocation);
@@ -568,6 +660,10 @@ export const __testing = Object.freeze({
   ADDON_CANDIDATES,
   BOOTSTRAP_ALLOWLIST,
   bootstrapEnv,
+  bootstrapEnvPairs,
+  brokerOptions,
+  invocationOptions,
+  backstopMs,
   payloadFrame,
   validate,
   ROOT_EXIT_UNAVAILABLE,

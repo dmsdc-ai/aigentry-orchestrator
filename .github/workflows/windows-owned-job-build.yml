@@ -2,7 +2,7 @@ name: Windows owned-job compile only
 
 on:
   push:
-    branches: [test/1167-wb1167l-20260923]
+    branches: [test/1167-wb1167gv-20260927]
   workflow_dispatch:
 
 permissions:
@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   compile:
-    if: github.ref == 'refs/heads/test/1167-wb1167l-20260923'
+    if: github.ref == 'refs/heads/test/1167-wb1167gv-20260927'
     runs-on: windows-2022
     timeout-minutes: 10
     defaults:
@@ -25,9 +25,9 @@ jobs:
           "DIAG=$diag" >> $env:GITHUB_ENV
           "BUNDLE=$bundle" >> $env:GITHUB_ENV
           [ordered]@{
-            task = '1167'; release = '1171'; operation = 'wb1167q-v1'
-            authorSession = 'wb1167q-builder'
-            authorAttempt = 'e08c018b-7a79-41b6-bf44-d269d556af87'
+            task = '1167'; release = '1171'; operation = 'wb1167gv-v1'
+            authorSession = 'wb1167gv-builder'
+            authorAttempt = '4aa3e670-3fe6-4ed9-b38d-a74063cd9dae'
             sha = '${{ github.sha }}'; ref = '${{ github.ref }}'
             runId = '${{ github.run_id }}'; runAttempt = '${{ github.run_attempt }}'
             imageOS = $env:ImageOS; imageVersion = $env:ImageVersion
@@ -63,8 +63,8 @@ jobs:
             $expected = [ordered]@{
               'bin/windows-owned-broker.mjs' = 'd648a002e408bd675cb1398e960c18df020001aae55fc9ac461c6f7ae671aadd'
               'native/windows-owned-job/binding.gyp' = '0e640ded58e7dc72f3ab598b253f51fc430c6dc2dc4ebee3cf805ef596e0737b'
-              'native/windows-owned-job/owned-job.cc' = '04584b4de63337b56778f3e78d3f19ff557bd32b36fe30b7362e3b86cc5480a9'
-              'native/windows-owned-job/owned-process.mjs' = '8168d3f7f6fc30cb74eb4b3f59fb05fd4a389ce6a4afc8a84b890e9c4bd72d97'
+              'native/windows-owned-job/owned-job.cc' = 'afcdeb3adc74707289610610c0ee00a36f62ff5cc21dbfd88301dc4073227b76'
+              'native/windows-owned-job/owned-process.mjs' = '614694486c6bfb9e7acc7e39074cbc92517edc26dde18c2ee235ed5e66a3f47e'
             }
             $expected | ConvertTo-Json | Set-Content "$env:DIAG\expected-sources.json"
             $actual = [ordered]@{}
