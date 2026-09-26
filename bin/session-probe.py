@@ -11,6 +11,12 @@ import subprocess
 import sys
 from typing import Any, TextIO
 
+# #751: the read-only current-viewport adapters. Sibling module, resolved from this file's
+# own bin/ (sys.path[0] when run as a script). It owns every target/currentness check and
+# fails closed with a content-free reason; this file stays a classifier and never reaches a
+# terminal itself.
+from current_screen import ScreenUnavailable, capture_object, read_current_screen
+
 
 SURFACE_UNKNOWN = "unknown"
 BRAILLE = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
@@ -302,14 +308,18 @@ def cli_from_info_or_screen(info: dict[str, Any], screen: str, override: str = "
     return "claude"
 
 
-def tracker_class(screen: str) -> str:
+def tracker_class(screen: str, *, current: bool = False) -> str:
     lines = nonempty_lines(screen)
     if not lines:
         return "blank"
     tail20 = tail(lines, 20)
     if any(re.match(TRACKER_ERR, line, re.I) for line in error_banner_lines(screen)):
         return "error"
-    welcome_in_tail = re.search(TRACKER_WELCOME, tail20, re.I)
+    # #751: on a current viewport the welcome banner must be line anchored — reply prose
+    # quoting "Welcome back" is not a boot banner. The error and prompt readers stay the
+    # anchored release ones for BOTH modes.
+    welcome_in_tail = (current_prompt_control(TRACKER_WELCOME, tail20) if current
+                       else re.search(TRACKER_WELCOME, tail20, re.I))
     prompt_in_last3 = has_prompt("", screen, 3)
     if welcome_in_tail and prompt_in_last3:
         return "welcome"
@@ -355,18 +365,90 @@ def ready_by_screen(cli: str, screen: str) -> tuple[bool, str]:
     return False, "no-prompt"
 
 
-def classify_surface(cli: str, screen: str) -> tuple[str, str]:
+def current_controls(cli: str, screen: str) -> str:
+    """Ignore only a rendered turn-duration footer, never live controls.
+
+    #1136: the `\u00b7 done` tail is OPTIONAL, measured. The actual current viewports of
+    two settled Claude sessions (input/idle-cv.screen, input/idle-st.screen) render the
+    completed row BARE -- "\u273b Brewed for 4m 40s" / "\u273b Cooked for 7m 37s" -- with an empty
+    composer and no interrupt affordance. Requiring `done` left that row in the controls
+    pass, where the generic leading-glyph busy test read it as a live status row and both
+    controller probes returned ready=false / current-busy-or-modal on genuinely idle
+    sessions. Only the tail is relaxed: the row must still be a single glyph, one
+    (optionally hyphenated) word, ` for `, and a numeric h/m/s duration, ending there or
+    at the already-recognized tool-use / clock tails. Anything else on the line -- an
+    ellipsis, `(esc to interrupt)`, a token-count suffix, a bare trailing `\u00b7` -- fails to
+    match, so the row stays and keeps blocking. Removal drops a spinner claim only; it
+    is not task-completion or approval authority.
+    """
+    if cli != "claude":
+        return screen
+    duration_footer = re.compile(
+        r"^\s*[\u2722\u2733\u2736\u273b\u273d]\s*[^\W\d_]+(?:-[^\W\d_]+)* for "
+        r"(?:\d+[hms]\s*)+(?:\s*\u00b7\s*done)?"
+        r"(?:\s+\(\d+ tool uses?\))?"
+        r"(?:\s+(?:(?:AM|PM|\uc624\uc804|\uc624\ud6c4)\s*)?"
+        r"\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?)?\s*$", re.I)
+    return "\n".join(line for line in screen.splitlines()
+                     if not duration_footer.fullmatch(line))
+
+
+def current_busy_signal(screen: str) -> bool:
+    # Inline prose quoting a control is not a status row. A standalone quoted
+    # control remains ambiguous and blocks regardless of distance from the prompt.
+    pattern = (
+        r"^\s*(?:[\u2722\u2733\u2736\u273b\u273d]\s*\S"
+        r"|[\u23f5\u25b6].*esc to interrupt"
+        r"|(?:[\u25a0\u2022]\s*)?(?:Working|Thinking|Compacting)\b"
+        r"|(?:Esc to interrupt|Press Enter to continue|Do you trust)\b)"
+    )
+    return bool(re.search(pattern, screen, re.I | re.M) or has_spinner(screen))
+
+
+def current_prompt_control(pattern: str, screen: str) -> bool:
+    # Allow terminal borders, prompt/selection glyphs and numbered choices,
+    # but not a control phrase embedded in a reply sentence.
+    prefix = r"^[^\w\n]*(?:\d+[.)][^\w\n]*)?"
+    return re.search(prefix + "(?:" + pattern + ")", screen, re.I | re.M) is not None
+
+
+def ready_by_current_screen(cli: str, screen: str, surface: str) -> tuple[bool, str]:
+    if surface not in ("idle", "welcome", "working"):
+        return False, "current-surface-not-ready"
+    lines = nonempty_lines(screen)
+    prompt = PROMPTS.get(cli, r"\u276f|\u203a")
+    # A quoted prompt in the reply or a populated composer is not ready to accept
+    # another task. Historical fixture semantics are deliberately separate.
+    if not re.search(rf"(?m)^\s*(?:{prompt})(?:\s*|\s+Try \"[^\"]+\"|\s+Ask Codex to do anything)\s*$",
+                     tail(lines, 5)):
+        return False, "no-empty-current-prompt"
+    controls = current_controls(cli, screen)
+    if current_busy_signal(controls):
+        return False, "current-busy-or-modal"
+    if surface == "working":
+        return False, "current-working"
+    return True, "prompt"
+
+
+def classify_surface(cli: str, screen: str, *, current: bool = False) -> tuple[str, str]:
     lines = nonempty_lines(screen)
     if not lines:
         return SURFACE_UNKNOWN, "blank screen"
     tail20 = tail(lines, 20)
     last4 = tail(lines, 4)
 
+    # The diagnostic readers are the anchored, fence-aware release ones in BOTH modes:
+    # has_thinking_block / has_api_error never degrade to an arbitrary substring search.
+    # Only the two approval/trust readers gain a current, line-anchored form, because a
+    # live viewport carries the modal's own borders, selector glyphs and numbered choices
+    # while a reply can merely quote the phrase.
     if has_thinking_block(screen):
         return "thinking_block", "thinking-block / invalid request"
-    if re.search(SANDBOX_PROMPT, tail20, re.I):
+    if (current_prompt_control(SANDBOX_PROMPT, screen) if current else
+            re.search(SANDBOX_PROMPT, tail20, re.I)):
         return "sandbox_prompt", "sandbox approval prompt"
-    if re.search(TRUST_MODAL, tail20, re.I):
+    if (current_prompt_control(TRUST_MODAL, screen) if current else
+            re.search(TRUST_MODAL, tail20, re.I)):
         return "modal", "trust-folder or continue modal"
     if re.search(CRASH, tail20, re.I):
         return "crash", "crash / traceback"
@@ -380,12 +462,24 @@ def classify_surface(cli: str, screen: str) -> tuple[str, str]:
         return "raw_shell", "raw shell prompt at tail"
     if re.search(UNSUBMITTED, last4):
         return "unsubmitted", "context-ref still at live prompt"
-    if re.search(WORKING, tail20, re.I) or has_spinner(tail20):
+    if current and re.search(
+        r"^\s*[\u2722\u2733\u2736\u273b\u273d][^\n]*\bfor\s+"
+        r"(?:\d+[hms]\s*)+\s*\u00b7\s*done\b", screen, re.I | re.M
+    ):
+        # Recognized completed rows are removed on the controls pass. A remaining
+        # duration row is ambiguous, not evidence that work has started.
+        return SURFACE_UNKNOWN, "unrecognized completed duration row"
+    if (current_busy_signal(screen) if current else
+            re.search(WORKING, tail20, re.I) or has_spinner(tail20)):
         return "working", "working token"
 
     banner = BANNERS.get(cli, r"Welcome|Initializing|Loading|Tips for getting started")
-    if re.search(banner, tail20, re.I):
+    if (current_prompt_control(banner, tail20) if current else
+            re.search(banner, tail20, re.I)):
         return "welcome", "welcome/bootstrap banner"
+    # Both modes read the prompt through has_prompt: fence/indent eligibility, the final
+    # eligible line and the #1136 collapsed-viewport qualifier are release guards and are
+    # not relaxed for a current viewport.
     if has_prompt(cli, screen):
         return "idle", "idle prompt"
     return SURFACE_UNKNOWN, "no known surface signal"
@@ -432,24 +526,39 @@ def observe(args: argparse.Namespace) -> dict[str, Any]:
     probe_error = ""
     sid = safe_token(args.sid, SAFE_SID, "sid")
     telepty = safe_token(args.telepty, SAFE_CLI, "telepty executable")
+
+    def live_info() -> dict[str, Any]:
+        return capture_object([telepty, "session", "info", sid, "--json"])
+
     if args.info_file:
         info_text = read_text(args.info_file)
         info = load_json_text(info_text)
     else:
-        rc, out, err = run_capture([telepty, "session", "info", sid, "--json"])
-        info = load_json_text(out)
-        if rc != 0 or not out.strip():
-            probe_error = (err or "session info unavailable").strip()
+        # #751: one bounded, fail-closed live info reader, shared with the adapter's
+        # post-read re-check. Its reason is content-free -- command stderr is never
+        # forwarded into probe_error.
+        try:
+            info = live_info()
+        except ScreenUnavailable as exc:
+            info = {}
+            probe_error = str(exc)
 
+    # #751: live readiness consumes a CURRENT viewport. The historical `read-screen`
+    # ring is gone from this path entirely -- there is no fallback to it, because the
+    # observed bug was exactly a stale ring reading as live evidence. `--screen-file`
+    # remains the offline fixture path and keeps the legacy classifiers below.
+    screen_source = "fixture"
     if args.screen_file:
         screen = read_text(args.screen_file)
     else:
-        rc, out, err = run_capture(
-            [telepty, "read-screen", sid, "--lines", str(args.screen_lines)]
-        )
-        screen = out
-        if rc != 0 and not probe_error:
-            probe_error = (err or "read-screen unavailable").strip()
+        screen = ""
+        screen_source = "unavailable"
+        try:
+            if args.info_file:
+                raise ScreenUnavailable("live screen requires live session info")
+            screen, screen_source = read_current_screen(sid, info, live_info)
+        except ScreenUnavailable as exc:
+            probe_error = probe_error or str(exc)
 
     cli = cli_from_info_or_screen(info, screen, args.cli or "")
     health = field(info, "healthStatus") or field(info, "transport", "health_status") or ""
@@ -459,24 +568,36 @@ def observe(args: argparse.Namespace) -> dict[str, Any]:
     bootstrap_ready = True if raw_bootstrap is None else bool(raw_bootstrap)
     alive = bool(info) and health.upper() == "CONNECTED"
 
-    surface, surface_detail = classify_surface(cli, screen)
+    current = not args.screen_file
+    controls = current_controls(cli, screen) if current else screen
+    surface, surface_detail = classify_surface(cli, screen, current=current)
+    if current and surface in ("working", "idle", "welcome", SURFACE_UNKNOWN):
+        surface, surface_detail = classify_surface(cli, controls, current=True)
     unsubmitted = surface == "unsubmitted"
     working_token = surface == "working"
     activity = "moving" if working_token and not unsubmitted else "static"
-    screen_ready, ready_reason = ready_by_screen(cli, screen)
-    ready = bool(alive and transport_ready and bootstrap_ready and screen_ready)
+    screen_ready, ready_reason = (ready_by_current_screen(cli, screen, surface) if current
+                                  else ready_by_screen(cli, screen))
+    # Unavailable, blank, malformed, oversized or timed-out evidence leaves probe_error
+    # set, and cannot establish ready or verified-started.
+    ready = bool(not probe_error and alive and transport_ready and bootstrap_ready and screen_ready)
     problems = verification_problems(
         health, transport_ready, bootstrap_ready, surface, activity, screen
     )
-    verified_started = bool(alive and transport_ready and bootstrap_ready and not problems)
+    if probe_error:
+        problems.append("current-screen observation unavailable")
+    verified_started = bool(
+        not probe_error and alive and transport_ready and bootstrap_ready and not problems
+    )
 
     detail: dict[str, Any] = {
         "health": health,
         "transport_ready": transport_ready,
         "bootstrap_ready": bootstrap_ready,
         "ready_reason": ready_reason,
+        "screen_source": screen_source,
         "surface_detail": surface_detail,
-        "tracker_class": tracker_class(screen),
+        "tracker_class": tracker_class(controls, current=current),
         "verify_started": verified_started,
         "verify_problems": problems,
     }

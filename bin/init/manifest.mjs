@@ -19,6 +19,10 @@ const MANIFEST = [
   // ---- bin/** — `git ls-files bin`, complete. T96 assertion 4 pins this to the tree.
   "bin/ask.sh",
   "bin/boot-prepare.mjs",
+  // #751: bin/session-probe.py's read-only current-viewport adapter module. It is imported
+  // as a SIBLING from the probe's own directory, so a workspace that holds the probe
+  // without this file holds a probe that cannot import. One coupled change, one entry.
+  "bin/current_screen.py",
   "bin/dispatch-cleanup-scheduler.sh",
   "bin/dispatch-registry.py",
   "bin/dispatch-tracker.sh",
