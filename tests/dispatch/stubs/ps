@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Stub `ps` for tests/dispatch. DETERMINISTIC FAKE DATA ONLY — it never execs or falls
+# back to the real ps, so no guard can read the host's process table through it.
+# It answers exactly ONE query: the `-p <pid> -o pid=,tty=,lstart=` that
+# bin/current_screen.py:process_identity issues for the bound owner pid. Anything else
+# (notably the reconciler's `ps -eo pid,command` walk) is refused non-zero with EMPTY
+# stdout — which is byte-identical to what that walk already observed for a fixture sid,
+# because no `telepty allow --id sid-…` process exists in a hermetic run.
+# Installed by lib.sh's t_current_view, never by t_setup.
+#
+# Driven by env exported from lib.sh:
+#   STUB_PS_PID     — the ONE pid this stub will answer for (the fixture's ownerPid)
+#   STUB_CMUX_TTY   — the tty reported, deliberately the same token stubs/cmux reports
+#   STUB_PS_LSTART  — frozen fake start time (incarnation identity)
+#   STUB_PS_LOG     — invocation record (tripwire / positive control)
+set -u
+
+if [ -n "${STUB_PS_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$STUB_PS_LOG"
+fi
+
+pid="" fmt=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) pid="${2:-}"; shift 2;;
+    -o) fmt="${2:-}"; shift 2;;
+    *)  shift;;
+  esac
+done
+
+[ "$fmt" = "pid=,tty=,lstart=" ] || exit 3
+[ -n "$pid" ] && [ "$pid" = "${STUB_PS_PID:-}" ] || exit 4
+
+printf '%s %s %s\n' "$pid" "${STUB_CMUX_TTY:?}" "${STUB_PS_LSTART:-Sun Aug 16 11:00:00 2026}"

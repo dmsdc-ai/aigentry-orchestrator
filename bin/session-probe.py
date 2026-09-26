@@ -41,6 +41,18 @@ HARD_NEG = rf"Working\.\.\.|{THINKING_ACTIVITY}|esc to interrupt|Press Enter to 
 # the "esc to interrupt" affordance. This pattern marks that boot status so the
 # ready probe can treat the prompt as ready during MCP boot (NOT a working spinner).
 CODEX_MCP_BOOT = r"Starting MCP servers?\s*\(\d+/\d+\)"
+# #1136: the CURRENT-viewport half of #557's contract. codex 0.133.x renders its EMPTY
+# composer with a fixed hint sitting ON the prompt row; it is recorded verbatim in
+# tests/dispatch/fixtures/codex_mcp_boot.txt as ` › Use /skills to list available skills`.
+# That row is codex's OWN placeholder chrome -- the same category as claude's `Try "…"` and
+# codex's `Ask Codex to do anything`, both of which the current-mode grammar below already
+# admits -- so the composer is empty and the `›` REPL accepts input while the servers boot.
+# It is admitted as ONE anchored literal, for the codex kind only. A generic `Use …` / `Ask
+# …` sentence, a typed command, or ANY text trailing the literal keeps reading as a
+# POPULATED composer. The arm says nothing beyond "the composer is empty": the surface,
+# busy/modal and binding gates each still have to pass on their own, so a promptless MCP
+# startup, active work, a trust/approval modal or an unbound viewport stay not-ready.
+CODEX_EMPTY_COMPOSER_HINT = r"Use /skills to list available skills"
 # #1136: telepty renders the whole Claude 2.1.281 TUI as ONE physical line, so the idle
 # prompt sits mid-line inside its input box and no positional arm in has_prompt reaches
 # it. The qualifier is the COMPLETE measured viewport, header to footer -- never a bare
@@ -396,10 +408,22 @@ def current_controls(cli: str, screen: str) -> str:
 def current_busy_signal(screen: str) -> bool:
     # Inline prose quoting a control is not a status row. A standalone quoted
     # control remains ambiguous and blocks regardless of distance from the prompt.
+    # #1136: the LEADING-GLYPH set of the Working/Thinking/Compacting arm also carries
+    # \u23fa and \u27f3, the two status glyphs the legacy WORKING pattern has always
+    # recognized. Measured: the claude working row in
+    # tests/fixtures/session-state/working-spinner.screen and
+    # tests/dispatch/fixtures/working_active.txt is "\u23fa Working... (5s \u00b7 esc to
+    # interrupt)" -- \u23fa is in neither the asterisk-spinner class above nor
+    # [\u25a0\u2022], and "esc to interrupt" sits mid-line rather than at line start, so a
+    # genuinely BUSY current viewport read as surface=unknown while the legacy path read it
+    # as working. The glyph is admitted ONLY in this arm, where the literal
+    # Working/Thinking/Compacting word must still follow: \u23fa is also claude's bullet for
+    # ordinary transcript rows ("\u23fa Read(file.ts)"), and widening the bare-glyph arm to
+    # cover it would make every settled transcript read busy.
     pattern = (
         r"^\s*(?:[\u2722\u2733\u2736\u273b\u273d]\s*\S"
         r"|[\u23f5\u25b6].*esc to interrupt"
-        r"|(?:[\u25a0\u2022]\s*)?(?:Working|Thinking|Compacting)\b"
+        r"|(?:[\u25a0\u2022\u23fa\u27f3]\s*)?(?:Working|Thinking|Compacting)\b"
         r"|(?:Esc to interrupt|Press Enter to continue|Do you trust)\b)"
     )
     return bool(re.search(pattern, screen, re.I | re.M) or has_spinner(screen))
@@ -419,7 +443,11 @@ def ready_by_current_screen(cli: str, screen: str, surface: str) -> tuple[bool, 
     prompt = PROMPTS.get(cli, r"\u276f|\u203a")
     # A quoted prompt in the reply or a populated composer is not ready to accept
     # another task. Historical fixture semantics are deliberately separate.
-    if not re.search(rf"(?m)^\s*(?:{prompt})(?:\s*|\s+Try \"[^\"]+\"|\s+Ask Codex to do anything)\s*$",
+    # #1136: codex's own empty-composer placeholder joins the recognized list for the codex
+    # kind only (see CODEX_EMPTY_COMPOSER_HINT). Case-sensitive and closed on both sides by
+    # the surrounding anchors, so nothing may precede or follow it on the prompt row.
+    hint = rf"|\s+{CODEX_EMPTY_COMPOSER_HINT}" if cli == "codex" else ""
+    if not re.search(rf"(?m)^\s*(?:{prompt})(?:\s*|\s+Try \"[^\"]+\"|\s+Ask Codex to do anything{hint})\s*$",
                      tail(lines, 5)):
         return False, "no-empty-current-prompt"
     controls = current_controls(cli, screen)

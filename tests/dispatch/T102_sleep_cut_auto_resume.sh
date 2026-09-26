@@ -44,6 +44,14 @@ SID="sid-A"
 # The measured banner, verbatim.
 CUT_LINE='API Error: Your computer went to sleep mid-response. The response above may be incomplete.'
 
+# #751: blocks A and B drive the probe OFFLINE (--screen-file/--info-file, the legacy
+# classifiers). The reconciler ticks in C-F do not: they read the CURRENT viewport via
+# bin/current_screen.py, which t_setup's minimal info cannot bind — the tick saw
+# surface=unknown and sent no RESUME. Bind the viewport once here; write_screen below
+# still writes the ONE file both transports read, so every screen and every bound,
+# latch, cap and gate assertion in this guard is unchanged.
+t_current_view "$SID" claude
+
 write_screen() { printf '%s\n' "$@" > "$STUB_SCREEN_FILE"; }
 cut_screen()   { write_screen '● Edited bin/thing.sh' '' "$CUT_LINE" '' '❯'; }
 idle_screen()  { write_screen '● Edited bin/thing.sh' '' '❯ Try "fix the failing test"'; }
@@ -132,6 +140,9 @@ t_assert_contains "$STUB_DISPATCH_LOG" "--submit-force"
 grep -qF -- "--from session-reconciler" "$STUB_DISPATCH_LOG" \
   && fail "C: the RESUME was sent on the peer lane — session-comms-auditor.sh HOLDs on those, one operator page per recovery"
 grep -q 'SLEEP_RESUME ' "$ALERTS" || fail "C: the RESUME was not recorded in alerts.log: $(cat "$ALERTS")"
+# Positive control: the RESUME must rest on the BOUND viewport read, not on a probe that
+# never reached a screen. Without this a bound-fixture regression reads as a pass.
+t_assert_current_view_read T102/C
 
 # --- G) and no operator gate was opened ---------------------------------------------
 grep -q 'open' "$HITL_LOG" 2>/dev/null \
