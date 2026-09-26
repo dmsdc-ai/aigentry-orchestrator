@@ -1,0 +1,229 @@
+{
+  "version": 1,
+  "track": "dm1161hi",
+  "createdAt": "2026-09-26T19:55:17.081Z",
+  "files": [
+    {
+      "path": "input/package/src/task-advisor/analyze.ts",
+      "bytes": 9385,
+      "sha256": "cee28e0b3b32ca030d69018a7814e9d683cb7e9c6a2079d146a943d9265b97d7",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/src/task-advisor/cli.ts",
+      "bytes": 19135,
+      "sha256": "1661f8e8e2f95deca9952640367e5a7ac31cce801dd1fdbe54ef68824e8fcb20",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/src/task-advisor/contracts.ts",
+      "bytes": 42166,
+      "sha256": "be10506869c5af43aac9f9ee1bfa753477c145717f5725a1b3689d0ed71b30c6",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/src/task-advisor/host.ts",
+      "bytes": 8355,
+      "sha256": "49dae6f63cfdc315b289eda432829a09bf2842244be242a511425b5346b60bc0",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/src/task-advisor/qualification-catalog.ts",
+      "bytes": 2818,
+      "sha256": "e336f134904314bb241365a020432e05906052b2bb16e415ede5e25d3d1be3df",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/src/task-advisor/qualification.ts",
+      "bytes": 26989,
+      "sha256": "5fb8a1f5c37925898ea3cc943875d3d9a1b86313ea5a1d6f44fcfccd4347fcca",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/src/task-advisor/storage-provenance.ts",
+      "bytes": 29314,
+      "sha256": "18d991a103ee846f36876dbc6c5758a883d12dadc2a6a84604933a6742c69d39",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/src/task-advisor/store.ts",
+      "bytes": 48793,
+      "sha256": "7fad181e8ee2022d3f8f05cf9a3c6c1dce858773ddc49d8a3ae7b867ceb593ca",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/analyze.d.ts",
+      "bytes": 549,
+      "sha256": "851c8d2f9ca48a69e87696f703b7101a8f0162b02605612e380b9d49467113de",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/analyze.js",
+      "bytes": 9637,
+      "sha256": "2801ec31c0b5aac3c7f941b9dcf0392d684aad4ea19257c13833951bde7bae9c",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/analyze.js.map",
+      "bytes": 9914,
+      "sha256": "0738ffc800a83c9f0c0fac593e428f3f8e1dfed382dc255d1e936e045b902da8",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/cli.d.ts",
+      "bytes": 149,
+      "sha256": "28210d7713bec4b4467180acdd7df4bc9a17d788a9bc67153e01303a59f4f5f6",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/cli.js",
+      "bytes": 19813,
+      "sha256": "e9d4ae8c4b7878196c0da98dec304aa86f5172dd0611208bf98379d65e636444",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/cli.js.map",
+      "bytes": 21242,
+      "sha256": "9dd27f7a06c492b46f9df51e059e472c0a8643a1924a4a2989352be6064a0e53",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/contracts.d.ts",
+      "bytes": 18233,
+      "sha256": "2fe418c0f26221f676130b0b02e1368ed0dcf1498cd6ba3e1be0d94615791a52",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/contracts.js",
+      "bytes": 38930,
+      "sha256": "9168c0816666bfb2e5314d0d789271e016a563ffd9c94b000e9282369afba2d3",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/contracts.js.map",
+      "bytes": 41562,
+      "sha256": "78359f9c8700678d85fdc50c04c1135dd8a43111d04a656ca8cc54017e5fb2a3",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/host.d.ts",
+      "bytes": 927,
+      "sha256": "e3bbca114ad9b8986d0a05bc98a74cd60a96bce06c3c5a999fa6bde7b8f14516",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/host.js",
+      "bytes": 8773,
+      "sha256": "719f4551b2ab6fc2424f39686668ebe104681c0c0b1e5df8a5ffd638437b692a",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/host.js.map",
+      "bytes": 9491,
+      "sha256": "9e7577d4ba9aaa2cc2d355ae4d7a944818dea787de12815dbae6341fe05707ca",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/qualification-catalog.d.ts",
+      "bytes": 2812,
+      "sha256": "de94da6f55963a6272ea6689795f380cda85f80fc2319bc7d52228abf6dc82f8",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/qualification-catalog.js",
+      "bytes": 2779,
+      "sha256": "827a4070beed5cde068904c276f4ff42e43d80713c2d2072b243c15060a64031",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/qualification-catalog.js.map",
+      "bytes": 335,
+      "sha256": "75b3ff1875c42cfa2b5304580ac4554f1996e784e64a2b4f72535f17388fccc9",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/qualification.d.ts",
+      "bytes": 10736,
+      "sha256": "f37395d38fe06ee95a99460af97d479db9757e613ef4ee587c4088757dbd5334",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/qualification.js",
+      "bytes": 20562,
+      "sha256": "23fbe409fa69829d0f4afc2fc9123a227a791cdb7af6774025c256f30f30e742",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/qualification.js.map",
+      "bytes": 14122,
+      "sha256": "326606e4db13cfece8afc14e5a10077b9dfe5ef1efa3488949a0f26416c8d4a8",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/storage-provenance.d.ts",
+      "bytes": 5822,
+      "sha256": "9a7c3a6705cf583ee2356a463a186dd2c60f4fa87fdaa2863efc7323d5c34bdb",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/storage-provenance.js",
+      "bytes": 27247,
+      "sha256": "65a7570a5eb857c82865a24c3b2eb6e014c73219ccfd377b58cb6c8ab4e4de6e",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/storage-provenance.js.map",
+      "bytes": 19619,
+      "sha256": "91e4ed547602119832d8e3f6dbed2f712bf1924e8c0b4de43c3634d9fe502980",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/store.d.ts",
+      "bytes": 5920,
+      "sha256": "d10f58b8d86dc3aa22d5b75a2b78db39b3ec646ab7ee41ec6302c11d229a876d",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/store.js",
+      "bytes": 49373,
+      "sha256": "70aa589d3a6a4a8c4c6c6935c793a414d3731858fb5014b22c70a0bafb1ee819",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/dist/src/task-advisor/store.js.map",
+      "bytes": 46823,
+      "sha256": "c2704c7a9653704ff08594ab72006f3795f1de40f06856154ca84a20fe243002",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/native/task-advisor-storage/darwin.c",
+      "bytes": 6271,
+      "sha256": "d05617491b984c7106173c9586f801874cbb77e2819780001cea0deeacfd6f2a",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/scripts/build-advisor-storage.mjs",
+      "bytes": 4461,
+      "sha256": "34e0af340cdb20b6cf799a9a87dd18fb098e45557fa5fbbdf790341de6cd2198",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/package/package.json",
+      "bytes": 2453,
+      "sha256": "148b6456386a4e26fb3ec3869a196c2624683e1c9434ba4a5713325199f95e13",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/darwin-real.test.mjs",
+      "bytes": 5991,
+      "sha256": "14b038cca02296155321f812745f938016eb516f1d2fcdfaac682a84d5129c29",
+      "sourceMode": 292
+    },
+    {
+      "path": "input/prior-native-build.md",
+      "bytes": 13353,
+      "sha256": "e5c0dfc15bc23d6f509013a93de72cffb8bd78b69f52dc4955dc0aa3e8467e52",
+      "sourceMode": 292
+    }
+  ]
+}

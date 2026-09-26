@@ -1,0 +1,130 @@
+# Task 1161 / dm1161hi — disposable macOS observation of the Advisor storage
+# provenance candidate.
+#
+# This workflow is the CALLER half of a coupled pair. Its acceptance/evidence
+# half is `tests/task-advisor/darwin-ci-observation.mjs`; neither is useful
+# alone. It exists because `dr1161as` observed only `unsupported` / `unknown` /
+# unbound-volume on a confined host, mapping to `DASessionCreate` returning NULL
+# (native/task-advisor-storage/darwin.c:106). THE CAUSE IS UNKNOWN — it was not
+# established as a sandbox or Mach-service denial — so the same measurement is
+# re-taken here on an ordinary runner and the two are compared as data.
+#
+# Scope, deliberately narrow:
+#   - read-only volume METADATA for ONE new CI-owned directory under RUNNER_TEMP;
+#   - no administrator, no device enumeration or mount, no user files, no host
+#     credentials, no service, no catalog promotion, no permissions bypass, no
+#     mutation of any installed product;
+#   - no secrets, no privileged context, read-only repository permissions;
+#   - no network or npm dependency beyond checkout / setup-node / upload-artifact.
+#
+# A green run means THE OBSERVATION WAS TAKEN. It is not a qualification, not a
+# security sign-off and not a release gate. An `unsupported` or `unknown` outcome
+# is recorded evidence. An absent compiler or a failed build FAILS the job and is
+# recorded as BLOCKED; it is never skipped-as-pass and never triggers an install.
+
+# EXPECTED TRIGGER
+# ----------------
+# The trigger that is expected to fire is the `push` below, on the isolated
+# branch `test/1161-dm1161hi-20260927` and nowhere else. `workflow_dispatch` is
+# declared as a convenience only: GitHub exposes a manual dispatch from the
+# repository's DEFAULT branch copy of a workflow file, and this file is staged
+# only on the isolated branch, so manual dispatch is NOT expected to be available
+# and is NOT this job's evidence that the branch can be triggered. Adding a
+# default-branch commit to make dispatch work is out of scope and must not be done.
+# If no run appears after the controller's push, read that as a trigger/staging
+# problem, never as an observation result.
+
+name: advisor-darwin-observation
+
+on:
+  workflow_dispatch:
+  push:
+    # Own isolated branch only, character-exact. The controller stages the
+    # immutable fixture bundle there; this never runs on a default or release
+    # branch and this workflow changes no default-branch state.
+    branches:
+      - 'test/1161-dm1161hi-20260927'
+
+# No write scope anywhere. Nothing this job does needs one.
+permissions:
+  contents: read
+
+concurrency:
+  group: advisor-darwin-observation-${{ github.ref }}
+  # A measurement in flight is not cancelled. This is a CHOICE to let a running
+  # observation finish and reach its evidence sink; it is not a measured claim
+  # about how `if: always()` steps behave under cancellation, which this job has
+  # never exercised and does not establish.
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  observe:
+    name: Darwin storage-provenance observation (measurement only)
+    runs-on: macos-latest
+    # Hard job deadline. The harness carries its own per-command deadlines.
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out the observation branch
+        uses: actions/checkout@v4
+        timeout-minutes: 5
+        with:
+          # No credential is needed after checkout and none is left on disk.
+          persist-credentials: false
+
+      - name: Set up the pinned Node runtime
+        uses: actions/setup-node@v4
+        timeout-minutes: 5
+        with:
+          node-version: 24.21.0
+
+      - name: Confirm the staged fixture and the pinned runtime
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          node --version
+          test -d tests/fixtures/advisor-darwin/package
+          test -f tests/fixtures/advisor-darwin/manifest.json
+          # Syntax-only check of the harness before it is trusted to assert.
+          node --check tests/task-advisor/darwin-ci-observation.mjs
+
+      - name: Take the observation
+        timeout-minutes: 10
+        env:
+          # Every own path lives under RUNNER_TEMP with a stable bounded layout.
+          # The harness refuses to run without it and never falls back to a real
+          # user HOME or to os.tmpdir().
+          NODE_OPTIONS: ''
+        run: |
+          set -euo pipefail
+          node --test --test-reporter=spec tests/task-advisor/darwin-ci-observation.mjs
+
+      - name: Publish the evidence (uploaded whether the observation passed or failed)
+        # Failure evidence is the point of the run; a success-only receipt would
+        # hide exactly the outcomes this job exists to record. The artifact is
+        # observation DATA and records its own completeness; it is not a
+        # substitute for this job's step status.
+        if: always()
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 5
+        with:
+          name: advisor-darwin-observation-evidence
+          path: ${{ runner.temp }}/advisor-darwin-observation/evidence
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Render the observation summary
+        if: always()
+        timeout-minutes: 2
+        run: |
+          set -uo pipefail
+          summary="${RUNNER_TEMP}/advisor-darwin-observation/evidence/summary.md"
+          if [ -f "$summary" ]; then
+            cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No summary was produced: the harness did not reach its evidence sink." >> "$GITHUB_STEP_SUMMARY"
+          fi
