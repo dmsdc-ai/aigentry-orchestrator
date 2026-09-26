@@ -525,12 +525,38 @@ test('independent concurrent child writers retain every receipt and exact blob',
   await sentinels(base, root);
 });
 
+// Pure path control for the fixture above: no product call. Same-volume relative
+// stays relative, cross-volume "relative" is absolute, which is exactly how the
+// Windows checkout (D:) and temp root (C:) defeated the earlier relative fixture.
+test('path fixture control: only same-volume path.relative yields a relative root', () => {
+  const sameVolume = path.win32.relative('D:\\a\\project\\project', 'D:\\a\\project\\project\\tmp\\store');
+  assert.equal(sameVolume, 'tmp\\store');
+  assert.equal(path.win32.isAbsolute(sameVolume), false);
+  const crossVolume = path.win32.relative('D:\\a\\project\\project', 'C:\\Users\\runner\\AppData\\Local\\Temp\\capture\\store');
+  assert.equal(crossVolume, 'C:\\Users\\runner\\AppData\\Local\\Temp\\capture\\store');
+  assert.equal(path.win32.isAbsolute(crossVolume), true);
+  assert.equal(path.win32.isAbsolute(path.win32.join('capture-receipt-test-abc', 'store')), false);
+  assert.equal(path.posix.isAbsolute(path.posix.join('capture-receipt-test-abc', 'store')), false);
+});
+
 for (const kind of ['relative', 'missing', 'file', 'symlink'] as const) {
   test(`refuse invalid root: ${kind}`, async t => {
     const capture = await product();
     const { base, root } = await fixture(t);
     let bad = path.join(base, 'bad');
-    if (kind === 'relative') bad = path.relative(process.cwd(), root);
+    if (kind === 'relative') {
+      // path.relative(process.cwd(), root) is not relative when the checkout and
+      // the temp root live on different Windows volumes: it returns the absolute
+      // target, so this case never handed the product a relative root. Build the
+      // relative form from the fixture's own trailing names, which depends on no
+      // volume and on no current working directory.
+      bad = path.join(path.basename(base), path.basename(root));
+      // Fixture precondition: the product must receive a nonempty relative root.
+      assert.notEqual(bad, '', 'relative root fixture must be nonempty');
+      assert.equal(path.isAbsolute(bad), false, `relative root fixture must stay relative: ${bad}`);
+      assert.equal(path.win32.isAbsolute(bad), false, `relative root fixture must stay relative on win32: ${bad}`);
+      assert.equal(path.posix.isAbsolute(bad), false, `relative root fixture must stay relative on posix: ${bad}`);
+    }
     if (kind === 'file') await fs.writeFile(bad, 'existing root file');
     if (kind === 'symlink') await fs.symlink(root, bad, process.platform === 'win32' ? 'junction' : 'dir');
     await assert.rejects(capture(Buffer.from('ROOT_SECRET'), { root: bad }), error => {
