@@ -302,7 +302,15 @@ const ciDiagnosticRun = `          # The supervisor is written out here, under t
           TERM_SECONDS = 10.0    # bounded join after SIGTERM
           KILL_SECONDS = 5.0     # bounded join after SIGKILL
           POLL_SECONDS = 0.5     # cancellation poll at each wait taken before cleanup
+          EVIDENCE_BYTES = 200   # per-stream cap on what one probe record may carry
           SUPPORTING = "_NET_SUPPORTING_WM_CHECK"
+          YESNO = {True: "yes", False: "no"}
+          # Path-shaped tokens are redacted out of DIAGNOSTIC streams only. This is a BOUND on
+          # what a record may carry and not a parser: it matches the RAW capped bytes, before
+          # the printable rendering below, and redacting more than a path is always safe here
+          # while redacting less is not, so it deliberately runs to the next space rather than
+          # trying to be exact. It is a BYTES pattern because nothing here ever decodes.
+          PATHLIKE = re.compile(b"/[^ ]*")
           # The specific gap each refusal reports, so a failure names what was missing rather
           # than only that something was.
           GAP = {
@@ -350,22 +358,86 @@ const ciDiagnosticRun = `          # The supervisor is written out here, under t
               sys.stderr.flush()
 
 
-          def read(target, name, deadline):
+          def sanitize(raw, redact):
+              """One captured stream, rendered bounded, single-line and printable. The cap is
+              applied to the RAW bytes first, so what is recorded can never grow with what the
+              tool printed, and truncation is returned on its own rather than being hidden
+              inside the text. Rendering is per RAW BYTE and NEVER decodes: a byte stands for
+              itself only when it is printable ASCII and is not one of the two delimiters this
+              renders with, and every other byte becomes its own exact <hh>. So a newline or a
+              control byte can neither forge a second log line nor be mistaken for content,
+              and two bytes that differ on the wire can never render alike - an undecodable
+              byte, a non-ASCII byte and a multibyte sequence the cap split each keep their
+              own identity instead of collapsing into one replacement character. What is
+              rendered is therefore what was captured, byte for byte, within the cap: for a
+              stream recorded WITHOUT redaction the original bytes are recoverable from the
+              rendering, while a DIAGNOSTIC stream has path-shaped tokens replaced before that
+              rendering and so is bounded and redacted rather than exact."""
+              data = raw or b""
+              kept = data[:EVIDENCE_BYTES]
+              if redact:
+                  kept = PATHLIKE.sub(b"(path)", kept)
+              shown = "".join(chr(b) if 32 <= b < 127 and chr(b) not in '<"' else "<%02x>" % b
+                              for b in kept)
+              return (shown, len(data), len(data) > EVIDENCE_BYTES)
+
+
+          def record(evidence, name, status, out, err, timed_out):
+              """Append exactly one bounded probe record, or nothing at all when the caller did
+              not ask for one. The classified status, the truncation of each stream and the
+              timeout are each their OWN field: none of them can be lost inside another, and
+              none of them is ever folded into an absence. Nothing else about the run is
+              recorded - no environment, no argument vector, no process listing."""
+              if evidence is None:
+                  return
+              shown_out, out_bytes, out_cut = sanitize(out, False)
+              shown_err, err_bytes, err_cut = sanitize(err, True)
+              evidence.append('property=%s status=%s timed-out=%s stdout-bytes=%d'
+                              ' stdout-truncated=%s stdout="%s" stderr-bytes=%d'
+                              ' stderr-truncated=%s stderr="%s"'
+                              % (name, status, YESNO[timed_out], out_bytes, YESNO[out_cut],
+                                 shown_out, err_bytes, YESNO[err_cut], shown_err))
+
+
+          def read(target, name, deadline, evidence=None):
               """One bounded xprop read. Returns (state, text) with state ok, absent or
               unknown. Unknown is anything that did not come back in a recognised shape - a
               missing tool, a non-zero exit, a timeout, output this does not parse - and is
               never reported as absence. The per-call bound is clamped to what is left of the
-              shared readiness deadline, so no sequence of probes can outlive it."""
+              shared readiness deadline, so no sequence of probes can outlive it.
+              When \`evidence\` is supplied it receives exactly one bounded, sanitized record of
+              what this invocation actually did: the classified status, the property response
+              it printed rendered byte for byte, and its path-redacted diagnostic stderr, with
+              truncation and the timeout as their own fields. That record is DIAGNOSTIC
+              ONLY. \`text\` below is still the one thing any caller classifies, it is still
+              produced from stdout exactly as before, and no state returned here reads, or
+              is weakened by, what was recorded."""
               left = deadline - time.monotonic()
               if left <= 0:
+                  record(evidence, name, "not-invoked-deadline-passed", b"", b"", False)
                   return ("unknown", "")
               try:
                   done = subprocess.run(["xprop"] + target + ["-notype", name],
                                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                        stderr=subprocess.DEVNULL,
+                                        stderr=subprocess.PIPE,
                                         timeout=min(PROBE_SECONDS, left))
-              except (subprocess.TimeoutExpired, OSError):
+              except subprocess.TimeoutExpired as expired:
+                  # The bound expired. Whatever the tool had already printed is kept, and the
+                  # timeout is its own recorded field rather than an empty reading that would
+                  # look the same as a tool which printed nothing.
+                  record(evidence, name, "timed-out", expired.stdout, expired.stderr, True)
                   return ("unknown", "")
+              except OSError as failure:
+                  # The tool could not be run at all. Only the numeric errno is recorded: the
+                  # message can carry a path and nothing here needs one.
+                  record(evidence, name, "not-invoked-errno-%s" % failure.errno,
+                         b"", b"", False)
+                  return ("unknown", "")
+              # Recorded BEFORE the classification below, so a non-zero exit and an output
+              # shape this does not parse are each distinguishable afterwards instead of
+              # collapsing into the same bare "unknown".
+              record(evidence, name, "exit-%d" % done.returncode, done.stdout, done.stderr,
+                     False)
               if done.returncode != 0:
                   return ("unknown", "")
               text = done.stdout.decode("utf-8", "replace").strip()
@@ -374,9 +446,9 @@ const ciDiagnosticRun = `          # The supervisor is written out here, under t
               return ("ok", text)
 
 
-          def supporting(target, deadline):
+          def supporting(target, deadline, evidence=None):
               """The EWMH supporting window that \`target\` points at, as an int."""
-              state, text = read(target, SUPPORTING, deadline)
+              state, text = read(target, SUPPORTING, deadline, evidence)
               if state != "ok":
                   return (state, None)
               found = re.match("^" + SUPPORTING + r": window id # (0x[0-9a-fA-F]+)$", text)
@@ -512,7 +584,21 @@ const ciDiagnosticRun = `          # The supervisor is written out here, under t
               # not start, and an initial state that could not be READ is not an absent one:
               # the absent-to-present transition is only evidence if the absence was observed.
               # Both refuse, and nothing is started.
-              state, existing = supporting(["-root"], deadline)
+              # The INITIAL read carries its own evidence, because a bare "unknown" cannot be
+              # told apart from a missing tool, an X server that refused the connection, a
+              # probe that hit its bound and a response this does not parse - and the refusal
+              # below turns exactly that distinction into a red job with nothing to act on.
+              # The record is emitted on EVERY outcome and before any verdict, so the display's
+              # initial reading is on the record whether this refuses or goes on; it goes to
+              # stderr, which survives the exit 1 below where the success-only uploads do not;
+              # and it is read by NOTHING. No branch below consults it, so it can neither
+              # relax the refusal, nor shorten the readiness proof, nor stand in for an
+              # observation that was not made. An unknown stays unknown - this reports WHY it
+              # was unknown, and changes nothing about it being fail-closed.
+              probe = []
+              state, existing = supporting(["-root"], deadline, probe)
+              for seen in probe:
+                  note("wm-baseline-probe (%s)" % seen)
               if state == "value":
                   problem("a supporting window (0x%x) already owned this display before the"
                           " experiment started, so that registration is foreign or stale."
@@ -1623,6 +1709,107 @@ const ciDiagnosticMutations = [
     '          command -v openbox\n          command -v xprop\n', ''],
   ['supervisor interpreter is no longer proved present',
     '          command -v python3\n', ''],
+
+  // #1177 THE PRESERVED INITIAL-READ EVIDENCE. The measured refusal this corrects reported
+  // only that the initial `_NET_SUPPORTING_WM_CHECK` state "came back unknown": the probe's
+  // exit status, its property response and its diagnostic stderr were all discarded at the
+  // point of reading, so a red job named the gap and carried nothing to act on. The record
+  // is bounded, sanitized, emitted on every outcome and read by NOTHING, so each half of
+  // that is its own negative - the evidence may not disappear again, and it may not start
+  // relaxing the refusal it exists to explain.
+  ['supervisor discards the initial probe stderr again',
+    '                                        stderr=subprocess.PIPE,\n',
+    '                                        stderr=subprocess.DEVNULL,\n'],
+  ['supervisor stops asking the initial read to record why it was unknown',
+    '              state, existing = supporting(["-root"], deadline, probe)\n',
+    '              state, existing = supporting(["-root"], deadline)\n'],
+  ['supervisor keeps the initial probe evidence out of the failed CI output',
+    '                  note("wm-baseline-probe (%s)" % seen)\n',
+    '                  pass\n'],
+  ['supervisor drops the record every probe outcome funnels into',
+    '              if evidence is None:\n'
+      + '                  return\n',
+    '              return\n'],
+  ['supervisor records the initial read without the xprop exit status',
+    '              record(evidence, name, "exit-%d" % done.returncode, done.stdout, done.stderr,\n'
+      + '                     False)\n',
+    '              record(evidence, name, "exit", done.stdout, done.stderr,\n'
+      + '                     False)\n'],
+  ['supervisor records the initial read only when xprop already succeeded',
+    '              record(evidence, name, "exit-%d" % done.returncode, done.stdout, done.stderr,\n'
+      + '                     False)\n'
+      + '              if done.returncode != 0:\n',
+    '              if done.returncode != 0:\n'],
+  ['supervisor stops recording a probe that could not be invoked at all',
+    '                  record(evidence, name, "not-invoked-deadline-passed", b"", b"", False)\n',
+    '                  pass\n'],
+  ['supervisor loses the spawn failure that stopped the initial read',
+    '                  record(evidence, name, "not-invoked-errno-%s" % failure.errno,\n'
+      + '                         b"", b"", False)\n',
+    '                  pass\n'],
+  ['supervisor stops recording the probe timeout as its own field',
+    '                  record(evidence, name, "timed-out", expired.stdout, expired.stderr, True)\n',
+    '                  record(evidence, name, "timed-out", expired.stdout, expired.stderr, False)\n'],
+  ['supervisor throws away what a timed-out probe had already printed',
+    '                  record(evidence, name, "timed-out", expired.stdout, expired.stderr, True)\n',
+    '                  record(evidence, name, "timed-out", b"", b"", True)\n'],
+  ['supervisor reports a truncated probe stream as a complete one',
+    '              return (shown, len(data), len(data) > EVIDENCE_BYTES)\n',
+    '              return (shown, len(data), False)\n'],
+  ['supervisor stops reporting how much the probe actually printed',
+    '              return (shown, len(data), len(data) > EVIDENCE_BYTES)\n',
+    '              return (shown, len(shown), len(data) > EVIDENCE_BYTES)\n'],
+  ['supervisor lets one probe record grow without bound',
+    '              kept = data[:EVIDENCE_BYTES]\n',
+    '              kept = data\n'],
+  ['supervisor raises the per-stream evidence cap to an unbounded dump',
+    '          EVIDENCE_BYTES = 200   # per-stream cap on what one probe record may carry\n',
+    '          EVIDENCE_BYTES = 1000000   # per-stream cap\n'],
+  ['supervisor records the diagnostic stream without redacting path-shaped tokens',
+    '              if redact:\n'
+      + '                  kept = PATHLIKE.sub(b"(path)", kept)\n',
+    '              if False:\n'
+      + '                  kept = PATHLIKE.sub(b"(path)", kept)\n'],
+  ['supervisor lets a recorded stream forge a second log line',
+    '              shown = "".join(chr(b) if 32 <= b < 127 and chr(b) not in \'<"\' else "<%02x>" % b\n'
+      + '                              for b in kept)\n',
+    '              shown = kept.decode("utf-8", "replace")\n'],
+
+  // #1177 BYTE FIDELITY OF THAT RECORD. An earlier shape of this record decoded the capped
+  // bytes with "replace" before rendering them, so every byte the display's own locale had
+  // produced - \xff, \xfe, a lone UTF-8 continuation, the tail of a character the cap split -
+  // arrived in the log as the same U+FFFD. The byte count stayed right, so the loss was
+  // silent: a record whose entire purpose is naming why a read came back unknown could not
+  // distinguish two different failures from each other. Rendering is per RAW byte for that
+  // reason, and each control below pins one line that has to stay that way - no decode
+  // before the rendering, no byte passed through unescaped because it happens to be
+  // printable in some encoding, and the cap still taken on the bytes rather than after.
+  ['supervisor decodes the probe bytes before rendering and collapses the distinct ones',
+    '              shown = "".join(chr(b) if 32 <= b < 127 and chr(b) not in \'<"\' else "<%02x>" % b\n'
+      + '                              for b in kept)\n',
+    '              shown = "".join(c if 32 <= ord(c) < 127 and c not in \'<"\' else "<%02x>" % ord(c)\n'
+      + '                              for c in kept.decode("utf-8", "replace"))\n'],
+  ['supervisor emits a non-ASCII probe byte as itself instead of an exact escape',
+    '              shown = "".join(chr(b) if 32 <= b < 127 and chr(b) not in \'<"\' else "<%02x>" % b\n',
+    '              shown = "".join(chr(b) if 32 <= b < 256 and chr(b) not in \'<"\' else "<%02x>" % b\n'],
+  ['supervisor caps the probe stream after decoding rather than on its raw bytes',
+    '              kept = data[:EVIDENCE_BYTES]\n',
+    '              kept = data.decode("utf-8", "replace")[:EVIDENCE_BYTES].encode("utf-8")\n'],
+  ['supervisor path redaction stops matching the raw probe bytes',
+    '          PATHLIKE = re.compile(b"/[^ ]*")\n',
+    '          PATHLIKE = re.compile("/[^ ]*")\n'],
+  ['supervisor redacts the exact property response the refusal has to explain',
+    '              shown_out, out_bytes, out_cut = sanitize(out, False)\n',
+    '              shown_out, out_bytes, out_cut = sanitize(out, True)\n'],
+  ['supervisor bounds the classified stdout by the diagnostic evidence cap',
+    '              text = done.stdout.decode("utf-8", "replace").strip()\n',
+    '              text = done.stdout.decode("utf-8", "replace")[:EVIDENCE_BYTES].strip()\n'],
+  ['supervisor lets the recorded evidence relax the fail-closed initial refusal',
+    '              if state != "absent":\n',
+    '              if state != "absent" and not probe:\n'],
+  ['supervisor treats a recorded probe as the absent initial state it did not observe',
+    '              if state != "absent":\n',
+    '              if state != "absent" and not probe[0].startswith("property="):\n'],
 ];
 const publishDependencies = ['browser-tls', ...original.jobs.publish.needs, ...ids];
 const publishNeeds = `    needs: [${publishDependencies.join(', ')}]\n`;
