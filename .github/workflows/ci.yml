@@ -82,6 +82,29 @@ jobs:
           command -v Xvfb
           command -v xvfb-run
           command -v xauth
+      # #1177 — the ONE bounded window-manager experiment, CI only and only here. The display
+      # the acceptance run owns has never had a window manager on it: `Browser.setWindowBounds
+      # {windowState:'minimized'}` reads back `normal`, and both owned tabs stay `visible` while
+      # focus moves. That is evidence, NOT proof that an absent WM is the cause, so this installs
+      # a real EWMH window manager and measures the SAME suite against it rather than asserting
+      # anything. Openbox is the smallest EWMH-compliant choice in the image's archive; x11-utils
+      # supplies the `xprop` the ownership check below reads, which the observation-only probe
+      # treats as optional and this experiment requires. Both are installed in this separate step
+      # so the install cost lands outside the acceptance step's unchanged 10-minute budget and
+      # outside the real browser user process entirely, and `apt-get update` already ran in the
+      # runner preflight above. `python3` is NOT installed: the supervisor below is one file of
+      # its standard library, so the interpreter the runner image already ships is proved present
+      # here instead of anything being added to get it. Nothing is installed on a host, nothing
+      # enters package.json or package-lock.json, no new privilege is taken beyond the apt-get
+      # the runner preflight above already uses, and release.yml keeps the plain caller with no
+      # window manager and no supervisor at all.
+      - name: Install the CI-only window manager for the owned display experiment
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends openbox x11-utils
+          command -v openbox
+          command -v xprop
+          command -v python3
       - name: Actual browser, WebAuthn and TLS controls
         env:
           BROWSER_TLS_RECEIPT: ${{ runner.temp }}/browser-tls-receipt.json
@@ -103,14 +126,373 @@ jobs:
         #   the absence of that registration ONLY, and is NOT proof that no window manager
         #   controls the display; `unknown` is an observation that did not happen or did not come
         #   back in the expected shape, which is never reported as absence.
-        # Nothing is installed, downloaded, started or configured, no WM is added, no root or sudo
-        # is used, no process list is scanned and the property VALUE is never printed - the exit
-        # status and the expected output shape are matched here and discarded here. Non-fatal by
-        # construction, to stderr, which survives the exit 1 the success-only uploads below do
-        # not; the acceptance run then `exec`s in place, so this step's exit status is unchanged.
+        # Those two observations still install, download and configure nothing, take no root or
+        # sudo, scan no process list and never print the property VALUE - the exit status and the
+        # expected output shape are matched there and discarded there. Non-fatal by construction,
+        # to stderr, which survives the exit 1 the success-only uploads below do not. They are
+        # taken BEFORE the experiment so the display's prior shape is on the record either way,
+        # and they authorize nothing: no check reads either one, and the supervisor below does not
+        # read `$ewmh` - it takes its own baseline, so the observation can never gate, shorten or
+        # substitute for the ownership proof.
+        # #1177 THE EXPERIMENT, and the only thing in this file that starts a process on this
+        # display: one Openbox, started by one supervisor, owned by it, stopped by it.
+        #   * Started on THIS display - inside this same `xvfb-run`, so it is the server number
+        #     the acceptance run is about to use rather than a different one a separate step
+        #     would have got from `-a`.
+        #   * ONE synchronous owner. The supervisor is a standard-library `Popen` handle per
+        #     owned child and nothing else: no concurrent reaper, no background watchdog, no
+        #     second waiter. Every signal goes through the handle, which will not signal a child
+        #     it has already reaped, so no numeric pid is ever signalled after the join and a
+        #     recycled pid cannot be hit. No `pkill`, no name match, no process scan, no process
+        #     group: the only processes signalled are the ones this supervisor started.
+        #   * Stopping is BOUNDED and escalates only while the child is still owned and unreaped:
+        #     TERM, bounded join, then KILL, then a bounded final join. SIGKILL is not claimed to
+        #     be instant - a join that still expires is reported as a named cleanup failure.
+        #   * ONE cleanup path, reached from a refusal, a red suite, a green suite and a
+        #     cancellation alike. INT and TERM are RECORDED ONLY: the handler never raises, so
+        #     no signal unwinds any path at any interpreter point and this cleanup can never be
+        #     abandoned part-way. A recorded cancellation is acted on synchronously by bounded
+        #     polls at the readiness and suite waits, both signals are ignored after the first,
+        #     and the FIRST signal recorded fixes the exit status, so repeats cannot move it.
+        #   * Suite status and cleanup errors are captured separately. The acceptance status is
+        #     re-raised verbatim, so a red suite stays red and reports its own status and cleanup
+        #     never masks it; a GREEN suite whose cleanup failed is turned red, not called a pass.
+        #   * Ownership is PROVEN, not inferred from a property being present, and the exact
+        #     `_NET_WM_PID` binding is required: see the supervisor's own readiness comment.
+        #   * The suite is byte-unchanged: the same `npm run test:browser-tls`, no fixture,
+        #     product, Playwright or sandbox change, no forced or synthesized visibility. It runs
+        #     as an owned child so a cancellation stops what this caller started; its own
+        #     descendants are NOT signalled, because reaching them would mean assuming a process
+        #     group, which is outside what this was authorized to do.
+        # This may well stay red, and a verified-ownership run that is still red would be a REAL
+        # result. It resolves exactly ONE environmental hypothesis - whether a real EWMH window
+        # manager on this display changes what the lifecycle stage observes. It is NOT a claim
+        # that an absent WM caused the failure, it closes no task-table gate, and it does not
+        # touch the live competing explanation: the harness restores the window BEFORE
+        # `lw-hidden-wait` runs, so that wait still polls a window in state `normal` whether or
+        # not a window manager is present.
         run: |
           set -euo pipefail
           umask 077
+          # The supervisor is written out here, under that same `umask 077`, so the file is
+          # owner-only by construction. It is a CI-only file in RUNNER_TEMP, run by the runner
+          # image's own `python3`: nothing is installed to produce it, it never enters the
+          # package, and release.yml has no equivalent.
+          export WM_SUPERVISOR="$RUNNER_TEMP/wm-owned-supervisor.py"
+          cat >"$WM_SUPERVISOR" <<"PY"
+          # #1177 owned-process supervisor, CI only and deliberately not a product module: it
+          # starts ONE window manager on the display this xvfb-run already owns, proves that
+          # exact process owns it, runs the unchanged acceptance suite, and stops only what it
+          # started. Standard library only, and one synchronous owner from start to finish.
+          import re
+          import signal
+          import subprocess
+          import sys
+          import time
+
+          READY_SECONDS = 30.0   # whole readiness phase, the baseline read included
+          PROBE_SECONDS = 5.0    # per-xprop bound, clamped to what is left of READY_SECONDS
+          TERM_SECONDS = 10.0    # bounded join after SIGTERM
+          KILL_SECONDS = 5.0     # bounded join after SIGKILL
+          POLL_SECONDS = 0.5     # cancellation poll at each wait taken before cleanup
+          SUPPORTING = "_NET_SUPPORTING_WM_CHECK"
+          # The specific gap each refusal reports, so a failure names what was missing rather
+          # than only that something was.
+          GAP = {
+              "exited": "the owned Openbox exited before any ownership evidence appeared",
+              "timeout": "no ownership evidence appeared inside the readiness deadline",
+              "cancelled": "the run was cancelled before ownership could be proved",
+              "not-self-consistent": "the supporting window did not point back at itself, so"
+                                     " that registration is stale",
+              "unnamed": "the supporting window published no readable _NET_WM_NAME",
+              "foreign-wm": "the supporting window belongs to a different window manager",
+              "pid-missing": "Openbox published no _NET_WM_PID on its supporting window",
+              "pid-malformed": "the _NET_WM_PID on the supporting window was not a plain number",
+              "pid-unreadable": "the _NET_WM_PID on the supporting window could not be read",
+              "pid-foreign": "the _NET_WM_PID on the supporting window is another process",
+          }
+          BINDING = {"owned": "owned", "pid-missing": "missing", "pid-foreign": "foreign",
+                     "pid-malformed": "malformed", "pid-unreadable": "unreadable"}
+          CANCELLED = []   # every INT/TERM the handler recorded, first signal first
+          CLEANING = []    # set when the one cleanup path begins: a record, not a guard
+
+
+          def cancel(number, frame):
+              # RECORD ONLY. This handler never raises, at any interpreter point, and that is
+              # what closes the cancellation race: the raise this used to do when cleanup had
+              # not yet been marked could be delivered between entering the `finally` below and
+              # setting that marker, and then unwound straight OUT of cleanup - leaving the
+              # owned window manager running and producing no named status at all. Nothing
+              # here depends on winning that window any more. Both signals are ignored from
+              # here on, so the repeats a cancelled job sends cannot re-enter this handler,
+              # and the FIRST number recorded is the one the exit status is built from. A
+              # recorded cancellation is ACTED on synchronously, by the bounded polls at the
+              # readiness and suite waits below, and never from inside this handler.
+              signal.signal(signal.SIGINT, signal.SIG_IGN)
+              signal.signal(signal.SIGTERM, signal.SIG_IGN)
+              CANCELLED.append(number)
+
+
+          def note(text):
+              sys.stderr.write("browser-tls ci: %s\n" % text)
+              sys.stderr.flush()
+
+
+          def problem(text):
+              sys.stderr.write("::error::%s\n" % text)
+              sys.stderr.flush()
+
+
+          def read(target, name, deadline):
+              """One bounded xprop read. Returns (state, text) with state ok, absent or
+              unknown. Unknown is anything that did not come back in a recognised shape - a
+              missing tool, a non-zero exit, a timeout, output this does not parse - and is
+              never reported as absence. The per-call bound is clamped to what is left of the
+              shared readiness deadline, so no sequence of probes can outlive it."""
+              left = deadline - time.monotonic()
+              if left <= 0:
+                  return ("unknown", "")
+              try:
+                  done = subprocess.run(["xprop"] + target + ["-notype", name],
+                                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL,
+                                        timeout=min(PROBE_SECONDS, left))
+              except (subprocess.TimeoutExpired, OSError):
+                  return ("unknown", "")
+              if done.returncode != 0:
+                  return ("unknown", "")
+              text = done.stdout.decode("utf-8", "replace").strip()
+              if re.match("^" + name + r":\s+not found\.$", text):
+                  return ("absent", "")
+              return ("ok", text)
+
+
+          def supporting(target, deadline):
+              """The EWMH supporting window that `target` points at, as an int."""
+              state, text = read(target, SUPPORTING, deadline)
+              if state != "ok":
+                  return (state, None)
+              found = re.match("^" + SUPPORTING + r": window id # (0x[0-9a-fA-F]+)$", text)
+              if not found:
+                  return ("unknown", None)
+              return ("value", int(found.group(1), 16))
+
+
+          def wm_name(window, deadline):
+              state, text = read(["-id", hex(window)], "_NET_WM_NAME", deadline)
+              if state != "ok":
+                  return (state, None)
+              found = re.match('^_NET_WM_NAME = "(.*)"$', text)
+              if not found:
+                  return ("unknown", None)
+              return ("value", found.group(1))
+
+
+          def wm_pid(window, deadline):
+              """The pid the supporting window claims for itself. A shape this cannot parse is
+              malformed, which refuses; it is never rounded down to absence."""
+              state, text = read(["-id", hex(window)], "_NET_WM_PID", deadline)
+              if state != "ok":
+                  return (state, None)
+              found = re.match("^_NET_WM_PID = ([0-9]+)$", text)
+              if not found:
+                  return ("malformed", None)
+              return ("value", int(found.group(1)))
+
+
+          def readiness(wm, deadline):
+              """Bounded proof that THIS child owns THIS display, or a named refusal. All of
+              these are required, in order: the root points at a supporting window W; W points
+              back at itself, which is the EWMH staleness test; W is named Openbox; W carries a
+              _NET_WM_PID that is exactly this child pid; and the child is still alive at the
+              end. A missing, malformed, unreadable or foreign _NET_WM_PID REFUSES - the
+              private display, the observed absent-to-present transition and the window name
+              are each necessary and not one of them is accepted in its place."""
+              while True:
+                  if CANCELLED:
+                      return "cancelled"
+                  if wm.poll() is not None:
+                      return "exited"
+                  if deadline - time.monotonic() <= 0:
+                      return "timeout"
+                  state, window = supporting(["-root"], deadline)
+                  if state != "value":
+                      pause(1)   # not registered yet; the deadline above ends this wait
+                      continue
+                  state, back = supporting(["-id", hex(window)], deadline)
+                  if state != "value" or back != window:
+                      return "not-self-consistent"
+                  state, name = wm_name(window, deadline)
+                  if state != "value":
+                      return "unnamed"
+                  if "Openbox" not in name:
+                      return "foreign-wm"
+                  state, claimed = wm_pid(window, deadline)
+                  if state == "absent":
+                      return "pid-missing"
+                  if state == "malformed":
+                      return "pid-malformed"
+                  if state != "value":
+                      return "pid-unreadable"
+                  if claimed != wm.pid:
+                      return "pid-foreign"
+                  if wm.poll() is not None:
+                      return "exited"
+                  return "owned"
+
+
+          def join(child, seconds):
+              """Bounded join: True when the child is reaped, False when the bound expired."""
+              try:
+                  child.wait(timeout=seconds)
+                  return True
+              except subprocess.TimeoutExpired:
+                  return False
+
+
+          def pause(seconds):
+              """A bounded sleep that also ends on a recorded cancellation, so no wait taken
+              before cleanup begins outlives the first INT/TERM by more than one poll. It is
+              a shorter sleep, never a longer one: the caller's own deadline still ends the
+              wait it is inside."""
+              end = time.monotonic() + seconds
+              while not CANCELLED:
+                  left = end - time.monotonic()
+                  if left <= 0:
+                      return
+                  time.sleep(min(POLL_SECONDS, left))
+
+
+          def await_owned(child):
+              """Wait for this owned child by BOUNDED POLL, so a cancellation the handler
+              recorded is acted on here, synchronously, instead of unwinding this wait from a
+              signal handler. Returns the child status, or None when a cancellation ended the
+              wait before the child finished. Nothing is signalled here and nothing is
+              reaped early: stopping and joining every owned child stays the one cleanup
+              path's job, which this returns into either way."""
+              while not CANCELLED:
+                  try:
+                      return child.wait(timeout=POLL_SECONDS)
+                  except subprocess.TimeoutExpired:
+                      continue
+              return None
+
+
+          def stop(child, what):
+              """Stop and join exactly this owned child, synchronously. TERM, bounded join;
+              KILL only while this child is still owned and unreaped; bounded final join. Both
+              signals go through this handle, which will not signal a child it has already
+              reaped, so no numeric pid is signalled after the join and a recycled pid cannot
+              be hit. Nothing else is signalled: no scan, no name match, no process group.
+              SIGKILL is not claimed to be instant - a final join that still expires is
+              reported. Returns None, or the cleanup failure to report."""
+              if child.poll() is not None:
+                  return None
+              child.terminate()
+              if join(child, TERM_SECONDS):
+                  return None
+              child.kill()
+              if join(child, KILL_SECONDS):
+                  return None
+              return ("the owned %s (pid %d) was still unreaped %gs after SIGKILL, so this step"
+                      " cannot claim it released the display" % (what, child.pid, KILL_SECONDS))
+
+
+          def main():
+              started = time.monotonic()
+              deadline = started + READY_SECONDS
+              # A supporting window that is ALREADY here belongs to something this caller did
+              # not start, and an initial state that could not be READ is not an absent one:
+              # the absent-to-present transition is only evidence if the absence was observed.
+              # Both refuse, and nothing is started.
+              state, existing = supporting(["-root"], deadline)
+              if state == "value":
+                  problem("a supporting window (0x%x) already owned this display before the"
+                          " experiment started, so that registration is foreign or stale."
+                          " Nothing was started and the acceptance suite was NOT run."
+                          % existing)
+                  return 1
+              if state != "absent":
+                  problem("the initial %s state of this display came back %s, and an unreadable"
+                          " initial state is not an absent one. Nothing was started and the"
+                          " acceptance suite was NOT run." % (SUPPORTING, state))
+                  return 1
+              # Armed BEFORE anything is owned, so a cancellation can never land in the window
+              # between starting the child and being able to stop it. Nothing above this line
+              # owns a process, so up to here the default disposition is the right one.
+              signal.signal(signal.SIGINT, cancel)
+              signal.signal(signal.SIGTERM, cancel)
+              # Openbox stdout goes to stderr so nothing it prints can be read as test output.
+              # This handle is the one owned window manager and the only thing ever signalled.
+              wm = subprocess.Popen(["openbox", "--sm-disable"], stdin=subprocess.DEVNULL,
+                                    stdout=sys.stderr, stderr=sys.stderr)
+              suite = None
+              suite_rc = None
+              ready = "not-reached"
+              cleanup_rc = 0
+              try:
+                  ready = readiness(wm, deadline)
+                  note("wm-owned (started=openbox readiness=%s pid-binding=%s waited=%.1fs)"
+                       % (ready, BINDING.get(ready, "unread"), time.monotonic() - started))
+                  if ready == "owned":
+                      suite = subprocess.Popen(["npm", "run", "test:browser-tls"])
+                      suite_rc = await_owned(suite)
+              finally:
+                  # THE cleanup path, and now the ONLY way out of the block above. No
+                  # cancellation can unwind out of it because the handler never raises - NOT
+                  # because this marker and these two SIG_IGNs win a race against one. CLEANING
+                  # records that cleanup has begun, and the SIG_IGNs drop the repeats a
+                  # cancelled job sends; neither has to be reached before a signal arrives for
+                  # this block to run to the end. Then each owned child is stopped and joined
+                  # exactly once, newest first, and a cancellation recorded while that is in
+                  # progress is recorded only and does not shorten it.
+                  CLEANING.append(True)
+                  signal.signal(signal.SIGINT, signal.SIG_IGN)
+                  signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                  owned = 0
+                  for child, what in ((suite, "acceptance suite"), (wm, "Openbox")):
+                      if child is None:
+                          continue
+                      owned += 1
+                      trouble = stop(child, what)
+                      if trouble is not None:
+                          problem(trouble)
+                          cleanup_rc = 1
+                  # Descendants of the suite are deliberately NOT signalled: only what this
+                  # supervisor started is owned, and reaching the rest would mean assuming a
+                  # process group. Whether any survive is not measured here.
+                  note("wm-cleanup (owned-processes=%d cleanup-errors=%d"
+                       " unowned-descendants=not-signalled)" % (owned, cleanup_rc))
+              if CANCELLED:
+                  note("wm-cancelled (signal=%d)" % CANCELLED[0])
+                  return 128 + CANCELLED[0]
+              if ready != "owned":
+                  problem("the owned Openbox never proved it owns this display (readiness=%s):"
+                          " %s. The exact _NET_WM_PID binding is REQUIRED and is not downgraded"
+                          " - the private display, the absent-to-present transition and the"
+                          " window name do not replace it - and no other window manager is"
+                          " selected instead. The acceptance suite was NOT run and nothing was"
+                          " measured." % (ready, GAP.get(ready, "no ownership evidence")))
+                  return 1
+              if suite_rc is None:
+                  problem("the acceptance suite reported no status, which cannot be read as a"
+                          " pass.")
+                  return 1
+              if suite_rc != 0:
+                  # The acceptance failure is this step status, verbatim. Cleanup trouble is
+                  # reported on its own above and never overwrites or masks it.
+                  return suite_rc if suite_rc > 0 else 128 - suite_rc
+              if cleanup_rc:
+                  problem("the acceptance suite passed but an owned process could not be"
+                          " stopped and joined, so this run is reported as a failure rather"
+                          " than as a pass.")
+                  return 1
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
           xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp" bash -c '
             set -u
             installed=none
@@ -134,7 +516,7 @@ jobs:
               fi
             fi
             printf "browser-tls ci: wm-shape (display=owned installed=%s ewmh-property=%s)\n" "$installed" "$ewmh" >&2
-            exec npm run test:browser-tls
+            exec python3 "$WM_SUPERVISOR"
           '
         timeout-minutes: 10
       - name: Validate complete receipt against this checkout
