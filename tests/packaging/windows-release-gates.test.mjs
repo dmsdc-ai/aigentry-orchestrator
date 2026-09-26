@@ -183,9 +183,82 @@ const browserAddition = `  browser-tls:
           retention-days: 7
 
 `;
+// The approved headed caller as it stands in release.yml: wrapper, owner-only authority
+// cookie, a display that never listens on TCP, and nothing else.
+const approvedHeadedCaller = `        run: |
+          set -euo pipefail
+          umask 077
+          xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp" npm run test:browser-tls
+`;
+// CI — and only CI — additionally carries an approved wm-shape diagnostic inside that same
+// caller. It is restated here as an independent literal and held to the bounds it was
+// approved under, never accepted merely because the workflow currently contains it:
+//   * Two read-only observations. `installed` is a PATH lookup over a fixed list and nothing
+//     more; `ewmh-property` is one EWMH root-window property on this display.
+//   * An observation that could not be made is `unknown`, never `absent`. Only a zero xprop
+//     exit is parsed, the status is captured on its own line rather than discarded by
+//     `|| true`, and the read is substituted rather than piped.
+//   * The observation is reported and then dropped: one stderr line, the property VALUE
+//     never printed, and no check anywhere reads it. It authorizes nothing.
+//   * No install, download, WM start, sudo/root, process scan, network, retry, TLS or
+//     sandbox change; `timeout 5` bounds the probe; `exec` hands the step's exit status to
+//     the unchanged acceptance caller, so the caller and its 10-minute budget are untouched.
+// release.yml keeps the plain caller, so the two contracts are stated separately here rather
+// than either one being inferred from the other.
+const ciCallerRationale = `        # Two independent, read-only observations, made INSIDE this same \`xvfb-run\` because \`-a\`
+        # picks a fresh server number per invocation, so a separate step would observe a different
+        # display. Neither is a window-manager verdict, and neither is read by any check:
+        #   \`installed\` - whether a binary from a fixed list exists on PATH. Nothing more: not
+        #   whether it runs, and not whether it touches this display.
+        #   \`ewmh-property\` - whether the EWMH \`_NET_SUPPORTING_WM_CHECK\` property is set on this
+        #   display's root window. \`present\` is EWMH registration, which can be stale; \`absent\` is
+        #   the absence of that registration ONLY, and is NOT proof that no window manager
+        #   controls the display; \`unknown\` is an observation that did not happen or did not come
+        #   back in the expected shape, which is never reported as absence.
+        # Nothing is installed, downloaded, started or configured, no WM is added, no root or sudo
+        # is used, no process list is scanned and the property VALUE is never printed - the exit
+        # status and the expected output shape are matched here and discarded here. Non-fatal by
+        # construction, to stderr, which survives the exit 1 the success-only uploads below do
+        # not; the acceptance run then \`exec\`s in place, so this step's exit status is unchanged.
+`;
+const ciDiagnosticRun = `          xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp" bash -c '
+            set -u
+            installed=none
+            for wm in mutter metacity marco xfwm4 openbox fluxbox i3 kwin_x11; do
+              if command -v "$wm" >/dev/null 2>&1; then installed="$wm"; break; fi
+            done
+            # An observation that could not be made is unknown, never absence: a missing tool, a
+            # nonzero or timed-out xprop and an unrecognized output shape all stay unknown. The
+            # exit status is captured on its own line rather than discarded by ||true, and the
+            # read is substituted rather than piped so no readers SIGPIPE can become the verdict.
+            ewmh=unknown
+            if command -v xprop >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+              root=$(timeout 5 xprop -root -notype _NET_SUPPORTING_WM_CHECK 2>/dev/null)
+              status=$?
+              if [ "$status" -eq 0 ]; then
+                case "$root" in
+                  "_NET_SUPPORTING_WM_CHECK: window id # 0x"*) ewmh=present ;;
+                  "_NET_SUPPORTING_WM_CHECK:"*"not found.") ewmh=absent ;;
+                  *) ewmh=unknown ;;
+                esac
+              fi
+            fi
+            printf "browser-tls ci: wm-shape (display=owned installed=%s ewmh-property=%s)\\n" "$installed" "$ewmh" >&2
+            exec npm run test:browser-tls
+          '
+`;
+const ciHeadedCaller = `${ciCallerRationale}        run: |
+          set -euo pipefail
+          umask 077
+${ciDiagnosticRun}`;
+// Built by substitution so the CI contract can differ from the release contract in exactly
+// one place — the headed caller — and in no other byte.
+const ciBrowserAddition = replaceOnce(browserAddition, approvedHeadedCaller, ciHeadedCaller);
 const approvedBrowser = parse('approved-browser-contract', `jobs:\n${browserAddition}`).jobs['browser-tls'];
+const approvedCIBrowser = parse('approved-ci-browser-contract', `jobs:\n${ciBrowserAddition}`).jobs['browser-tls'];
 function withoutBrowser(workflow, release) {
-  assert.deepEqual(workflow.jobs['browser-tls'], approvedBrowser, 'complete approved browser/TLS job, ordered steps and no bypasses');
+  assert.deepEqual(workflow.jobs['browser-tls'], release ? approvedBrowser : approvedCIBrowser,
+    'complete approved browser/TLS job, ordered steps and no bypasses');
   const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
   assert.equal(pkg.scripts['test:browser-tls'], 'node tests/hitl/browser-tls.acceptance.mjs', 'actual browser caller');
   assert.equal(pkg.devDependencies.playwright, '1.58.2', 'locked browser dependency');
@@ -336,7 +409,7 @@ function validateCIHistory(source, historicalSource = readFileSync(join(root, fi
   const fixedBytes = indentReader(fixedReader);
   const oldBytes = indentReader(readerParts(rejectedPersistence).reader);
   const bytes = lf(source);
-  const addition = `jobs:\n${browserAddition}`;
+  const addition = `jobs:\n${ciBrowserAddition}`;
   assert.equal(bytes.split(addition).length, 2, 'exactly one approved browser block at the jobs boundary');
   const currentBytes = bytes.replace(addition, 'jobs:\n');
   assert.equal(currentBytes.split(fixedBytes).length, 2, 'exactly one corrected reader in CI YAML');
@@ -806,6 +879,13 @@ const headedCaller = browserBlock(browserBlockMarkers.headedRun, browserBlockMar
 const umaskLine = '          umask 077\n';
 const xvfbLine = '          xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp" npm run test:browser-tls\n';
 assert.equal(headedCaller, `${browserBlockMarkers.headedRun}${xvfbLine}`, 'approved headed caller is exactly the wrapped npm caller');
+assert.equal(headedCaller, approvedHeadedCaller, 'one approved headed caller drives both the contract and the negatives');
+// The wrapper invocation itself is byte-identical in both contracts, so the display-control
+// negatives below anchor on it directly instead of on the per-workflow caller body.
+const xvfbInvocation = 'xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp"';
+for (const [label, block] of [['release', xvfbLine], ['CI', ciDiagnosticRun]]) {
+  assert.equal(block.split(xvfbInvocation).length, 2, `one wrapper invocation in the ${label} caller`);
+}
 const consoleEnv = '          CONSOLE_UI_ARTIFACTS: ${{ runner.temp }}/console-ui-artifacts\n';
 // The key is identical on both steps, so each negative is anchored to the unique bytes that
 // follow it: the headed caller's rationale comment on one, the plain run line on the other.
@@ -818,30 +898,32 @@ const consolePaths = ['console-320.png', 'console-390.png', 'console-768.png',
 const consoleReceiptPath = `            \${{ runner.temp }}/console-ui-artifacts/console-ui-receipt.json\n`;
 const consoleFirstPath = `            \${{ runner.temp }}/console-ui-artifacts/console-320.png\n`;
 const consoleUploadName = '      - name: Upload Console UI evidence\n';
-const browserMutations = [
-  ['missing browser job', browserAddition, ''],
+// The caller differs between the two workflows (CI carries the approved diagnostic), so the
+// caller-shaped negatives are anchored to the contract of the workflow under test. Every
+// other needle is byte-identical in both and stays a plain literal.
+const browserMutationsFor = ({ addition, caller, run }) => [
+  ['missing browser job', addition, ''],
   ['browser skip', '  browser-tls:\n', '  browser-tls:\n    if: false\n'],
   ['browser always', '  browser-tls:\n', '  browser-tls:\n    if: always()\n'],
   ['browser continue-on-error', '  browser-tls:\n', '  browser-tls:\n    continue-on-error: true\n'],
-  ['caller skip', headedCaller, `        if: false\n${headedCaller}`],
-  ['caller always', headedCaller, `        if: always()\n${headedCaller}`],
-  ['caller continue-on-error', headedCaller, `        continue-on-error: true\n${headedCaller}`],
-  ['caller swallowed failure', xvfbLine,
-    '          xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp" npm run test:browser-tls || true\n'],
-  ['caller no-op', headedCaller, '        run: echo green\n'],
+  ['caller skip', caller, `        if: false\n${caller}`],
+  ['caller always', caller, `        if: always()\n${caller}`],
+  ['caller continue-on-error', caller, `        continue-on-error: true\n${caller}`],
+  ['caller swallowed failure', run, run.replace(/\n$/, ' || true\n')],
+  ['caller no-op', caller, '        run: echo green\n'],
   // Headed display controls. The wrapper, its owner-only authority cookie, the disabled X
   // TCP socket and the named preflight are each load-bearing, so each removal or weakening
   // is its own negative rather than being folded into one "caller changed" case.
-  ['headed wrapper removed', xvfbLine, '          npm run test:browser-tls\n'],
-  ['headed wrapper replaced by bare display export', xvfbLine, '          DISPLAY=:99 npm run test:browser-tls\n'],
+  ['headed wrapper removed', run, '          npm run test:browser-tls\n'],
+  ['headed wrapper replaced by bare display export', run, '          DISPLAY=:99 npm run test:browser-tls\n'],
   ['private cookie umask removed', umaskLine, ''],
   ['private cookie umask widened', umaskLine, '          umask 022\n'],
-  ['X authentication disabled', xvfbLine,
-    '          xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp -ac" npm run test:browser-tls\n'],
-  ['X authority cookie shared', xvfbLine,
-    '          xvfb-run -a -f /tmp/xauth --server-args="-screen 0 1280x1024x24 -nolisten tcp" npm run test:browser-tls\n'],
-  ['display listening on TCP', xvfbLine,
-    '          xvfb-run -a --server-args="-screen 0 1280x1024x24" npm run test:browser-tls\n'],
+  ['X authentication disabled', xvfbInvocation,
+    'xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp -ac"'],
+  ['X authority cookie shared', xvfbInvocation,
+    'xvfb-run -a -f /tmp/xauth --server-args="-screen 0 1280x1024x24 -nolisten tcp"'],
+  ['display listening on TCP', xvfbInvocation,
+    'xvfb-run -a --server-args="-screen 0 1280x1024x24"'],
   ['preflight display tools missing', preflightBlock, ''],
   ['preflight wrapper unchecked', '          command -v xvfb-run\n', ''],
   ['preflight X authority tool unchecked', '          command -v xauth\n', ''],
@@ -890,6 +972,49 @@ const browserMutations = [
   ['Console upload before receipt validation', validateBlock + receiptUploadBlock + consoleUploadBlock,
     consoleUploadBlock + validateBlock + receiptUploadBlock],
 ];
+// CI-only. Each negative weakens exactly one of the bounds the wm-shape diagnostic was
+// approved under, so a later edit that turns the observation into a verdict, into an
+// authorization, or into a claim it cannot support is rejected by name rather than only by
+// the blanket byte comparison.
+const ciDiagnosticMutations = [
+  // An observation that did not happen must stay `unknown`. Seeding the default as `absent`
+  // would report "no window manager" for a probe that never ran.
+  ['diagnostic defaults a missing observation to absence', '            ewmh=unknown\n', '            ewmh=absent\n'],
+  // The xprop exit status is load-bearing: only a zero exit may be parsed.
+  ['diagnostic discards the xprop exit status',
+    '              status=$?\n              if [ "$status" -eq 0 ]; then\n',
+    '              status=0\n              if [ "$status" -eq 0 ]; then\n'],
+  ['diagnostic swallows the xprop failure with ||true',
+    '              root=$(timeout 5 xprop -root -notype _NET_SUPPORTING_WM_CHECK 2>/dev/null)\n',
+    '              root=$(timeout 5 xprop -root -notype _NET_SUPPORTING_WM_CHECK 2>/dev/null) || true\n'],
+  ['diagnostic pipes the read so a SIGPIPE can become the verdict',
+    '              root=$(timeout 5 xprop -root -notype _NET_SUPPORTING_WM_CHECK 2>/dev/null)\n',
+    '              root=$(xprop -root -notype _NET_SUPPORTING_WM_CHECK 2>/dev/null | head -1)\n'],
+  // The probe must stay bounded; an unbounded xprop can hang the 10-minute caller budget.
+  ['diagnostic drops the xprop timeout bound', '              root=$(timeout 5 xprop', '              root=$(xprop'],
+  // An unrecognized output shape is unknown, not a verdict.
+  ['diagnostic treats an unrecognized shape as absence',
+    '                  *) ewmh=unknown ;;\n', '                  *) ewmh=absent ;;\n'],
+  // The observation authorizes nothing and is read by no check.
+  ['diagnostic is read as a gate on the acceptance run',
+    '            exec npm run test:browser-tls\n',
+    '            [ "$ewmh" = present ] || exit 1\n            exec npm run test:browser-tls\n'],
+  // Reporting stays one stderr line; the property VALUE is never printed.
+  ['diagnostic reports on stdout where it can be mistaken for results',
+    ' "$installed" "$ewmh" >&2\n', ' "$installed" "$ewmh"\n'],
+  ['diagnostic prints the raw property value',
+    'ewmh-property=%s)\\n" "$installed" "$ewmh" >&2\n', 'ewmh-property=%s)\\n" "$installed" "$root" >&2\n'],
+  // The diagnostic observes only: it never installs, starts a WM, or takes root.
+  ['diagnostic installs a window manager',
+    '            installed=none\n', '            sudo apt-get install -y mutter\n            installed=none\n'],
+  ['diagnostic starts a window manager',
+    '            exec npm run test:browser-tls\n', '            mutter --x11 &\n            exec npm run test:browser-tls\n'],
+  // `exec` is what keeps the step's exit status the acceptance run's own.
+  ['diagnostic stops exec-ing the acceptance caller in place',
+    '            exec npm run test:browser-tls\n', '            npm run test:browser-tls\n'],
+  ['diagnostic replaces the acceptance caller',
+    '            exec npm run test:browser-tls\n', '            echo green\n'],
+];
 const publishDependencies = ['browser-tls', ...original.jobs.publish.needs, ...ids];
 const publishNeeds = `    needs: [${publishDependencies.join(', ')}]\n`;
 const releaseBrowserMutations = [
@@ -908,8 +1033,13 @@ const releaseBrowserMutations = [
   ['original release version input changed', '          RELEASE_VERSION: ${{ steps.identity.outputs.version }}\n', '          RELEASE_VERSION: arbitrary\n'],
   ['publish authentication changed', '          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n', '          NODE_AUTH_TOKEN: arbitrary\n'],
 ];
+const callerContracts = {
+  CI: { addition: ciBrowserAddition, caller: ciHeadedCaller, run: ciDiagnosticRun },
+  release: { addition: browserAddition, caller: headedCaller, run: xvfbLine },
+};
 for (const [workflowName, path] of [['CI', '.github/workflows/ci.yml'], ['release', '.github/workflows/release.yml']]) {
   const source = lf(readFileSync(join(root, path), 'utf8'));
+  const browserMutations = browserMutationsFor(callerContracts[workflowName]);
   for (const [ending, newline] of [['LF', '\n'], ['CRLF', '\r\n']]) {
     const encode = value => lf(value).replaceAll('\n', newline);
     const check = value => workflowName === 'CI'
@@ -918,6 +1048,7 @@ for (const [workflowName, path] of [['CI', '.github/workflows/ci.yml'], ['releas
     acceptance(`browser projection accepts ${workflowName} ${ending}`, 'browser-projection', () => check(encode(source)));
     const mutations = workflowName === 'CI' ? [
       ...browserMutations,
+      ...ciDiagnosticMutations,
       ['unrelated comment byte changed', '# #894.', '# #894 changed.'],
       ['Windows debt threshold changed', "EXPECTED_WIN32_FAILURES: '33'", "EXPECTED_WIN32_FAILURES: '32'"],
     ] : [...browserMutations, ...releaseBrowserMutations];
