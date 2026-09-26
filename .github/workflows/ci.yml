@@ -93,10 +93,49 @@ jobs:
         # to the browser. X authentication stays on and no sandbox or TLS flag changes.
         # `umask 077` first so the authority cookie the wrapper creates is owner-only by
         # construction rather than by whatever default the image happens to carry.
+        # Two independent, read-only observations, made INSIDE this same `xvfb-run` because `-a`
+        # picks a fresh server number per invocation, so a separate step would observe a different
+        # display. Neither is a window-manager verdict, and neither is read by any check:
+        #   `installed` - whether a binary from a fixed list exists on PATH. Nothing more: not
+        #   whether it runs, and not whether it touches this display.
+        #   `ewmh-property` - whether the EWMH `_NET_SUPPORTING_WM_CHECK` property is set on this
+        #   display's root window. `present` is EWMH registration, which can be stale; `absent` is
+        #   the absence of that registration ONLY, and is NOT proof that no window manager
+        #   controls the display; `unknown` is an observation that did not happen or did not come
+        #   back in the expected shape, which is never reported as absence.
+        # Nothing is installed, downloaded, started or configured, no WM is added, no root or sudo
+        # is used, no process list is scanned and the property VALUE is never printed - the exit
+        # status and the expected output shape are matched here and discarded here. Non-fatal by
+        # construction, to stderr, which survives the exit 1 the success-only uploads below do
+        # not; the acceptance run then `exec`s in place, so this step's exit status is unchanged.
         run: |
           set -euo pipefail
           umask 077
-          xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp" npm run test:browser-tls
+          xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp" bash -c '
+            set -u
+            installed=none
+            for wm in mutter metacity marco xfwm4 openbox fluxbox i3 kwin_x11; do
+              if command -v "$wm" >/dev/null 2>&1; then installed="$wm"; break; fi
+            done
+            # An observation that could not be made is unknown, never absence: a missing tool, a
+            # nonzero or timed-out xprop and an unrecognized output shape all stay unknown. The
+            # exit status is captured on its own line rather than discarded by ||true, and the
+            # read is substituted rather than piped so no readers SIGPIPE can become the verdict.
+            ewmh=unknown
+            if command -v xprop >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+              root=$(timeout 5 xprop -root -notype _NET_SUPPORTING_WM_CHECK 2>/dev/null)
+              status=$?
+              if [ "$status" -eq 0 ]; then
+                case "$root" in
+                  "_NET_SUPPORTING_WM_CHECK: window id # 0x"*) ewmh=present ;;
+                  "_NET_SUPPORTING_WM_CHECK:"*"not found.") ewmh=absent ;;
+                  *) ewmh=unknown ;;
+                esac
+              fi
+            fi
+            printf "browser-tls ci: wm-shape (display=owned installed=%s ewmh-property=%s)\n" "$installed" "$ewmh" >&2
+            exec npm run test:browser-tls
+          '
         timeout-minutes: 10
       - name: Validate complete receipt against this checkout
         env:

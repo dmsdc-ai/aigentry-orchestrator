@@ -297,10 +297,103 @@ export function renderLifecycleVisibility() {
   const before = pair(visibilityBefore), after = pair(visibilityAfter);
   const seen = value => visibilityOf(pair(value).visibility);
   const held = value => focusOf(pair(value).focus);
+  const events = pair(visibilityEvents);
+  const fired = value => eventCountOf(pair(value).count);
+  const at = value => eventStateOf(pair(value).state);
   return `before=page:${seen(before.page)},other:${seen(before.other)}`
     + ` after=page:${seen(after.page)},other:${seen(after.other)}`
     + ` focus-before=page:${held(before.page)},other:${held(before.other)}`
-    + ` focus-after=page:${held(after.page)},other:${held(after.other)}`;
+    + ` focus-after=page:${held(after.page)},other:${held(after.other)}`
+    + ` events=page:${fired(events.page)},other:${fired(events.other)}`
+    + ` event-state=page:${at(events.page)},other:${at(events.other)}`;
+}
+// Diagnostics only, for the one reading every probe above cannot make: whether a real
+// `visibilitychange` EVENT ever fired on either owned tab. Those probes read POLLED state, so
+// none of them separates "the event never fired" from "it fired and the state did not follow".
+// This counts the browser's own events - one passive, non-capturing listener per owned tab,
+// added after the focus suspension and removed inside the same window, incrementing an integer
+// and latching the `document.visibilityState` the browser reported at its last event. Nothing
+// is dispatched, synthesized, patched, mocked or intercepted, no CDP session is opened, and a
+// passive non-capturing listener cannot reorder, cancel or delay delivery to the product's own
+// handlers. A count is not an oracle and establishes no cause. Only a clamped integer and a
+// CLOSED enum name leave the page, both clamped again by the renderer, so no URL, title, markup
+// or error text can reach the line. No check reads any of it, and nothing here relaxes, skips,
+// retries or lengthens the wait that follows.
+export const EVENT_STATES = ['not-captured', 'visible', 'hidden', 'unavailable'];
+// Bounded in the page as well as here; `-1` is the only value meaning "not measured".
+const EVENT_LIMIT = 999;
+// One own property on the tab's own `window`, passed in as an argument so the page scripts hold
+// no reference to this module, and deleted again by the disarm below on every path out.
+const EVENT_SLOT = '__acceptanceVisibilityEventProbe';
+const eventCountOf = value => (Number.isSafeInteger(value) && value >= 0 ? Math.min(value, EVENT_LIMIT) : -1);
+const eventStateOf = value => (EVENT_STATES.includes(value) ? value : 'unavailable');
+const notCountedEvents = () => ({ count: -1, state: 'not-captured' });
+const unreadableEvents = () => ({ count: -1, state: 'unavailable' });
+let visibilityEvents = { page: notCountedEvents(), other: notCountedEvents() };
+/** Runs in the page. Idempotent: a tab already armed keeps its existing counter rather than
+ *  losing the events it has already seen. The handler reads the state the browser itself
+ *  reports and collapses it to the same CLOSED enum inside the page. */
+const ARM_EVENT_PROBE = slot => {
+  const existing = window[slot];
+  if (existing && typeof existing === 'object') return 'armed';
+  const probe = { count: 0, state: 'not-captured', handler: null };
+  probe.handler = () => {
+    if (probe.count < 1000) probe.count += 1;
+    const seen = document.visibilityState;
+    probe.state = seen === 'visible' || seen === 'hidden' ? seen : 'unavailable';
+  };
+  document.addEventListener('visibilitychange', probe.handler, { passive: true });
+  window[slot] = probe;
+  return 'armed';
+};
+/** Runs in the page. Reads only, and only the two bounded fields. */
+const READ_EVENT_PROBE = slot => {
+  const probe = window[slot];
+  if (!probe || typeof probe !== 'object') return { count: -1, state: 'unavailable' };
+  const seen = probe.state;
+  return {
+    count: Number.isSafeInteger(probe.count) && probe.count >= 0 ? probe.count : -1,
+    state: seen === 'visible' || seen === 'hidden' || seen === 'not-captured' ? seen : 'unavailable',
+  };
+};
+/** Runs in the page. Removes exactly the listener this probe added and drops the property, so
+ *  no listener and no global outlives the window on any path. */
+const DISARM_EVENT_PROBE = slot => {
+  const probe = window[slot];
+  if (probe && typeof probe === 'object' && typeof probe.handler === 'function') {
+    try { document.removeEventListener('visibilitychange', probe.handler); } catch {}
+  }
+  try { delete window[slot]; } catch {}
+};
+/** Total, exactly like `captureVisibility`: never throws, never checks, never marks, so a
+ *  diagnostic fault cannot replace the original rejection. An unarmable tab stays unmeasured and
+ *  reads `unavailable` later, never as having seen an event. Bounded by the caller's own
+ *  `bounded` at the existing PROBE_MS; no retry, sleep, timeout or deadline increase. */
+async function armVisibilityEvents(deps, targets) {
+  for (const target of targets) {
+    try { await deps.bounded(target.evaluate(ARM_EVENT_PROBE, EVENT_SLOT), PROBE_MS); } catch {}
+  }
+}
+/** Total, same discipline, and safe to call from a `finally`: an unreachable or closed tab
+ *  records `unavailable`, never a count it did not read. */
+async function captureVisibilityEvents(deps, page, other) {
+  const read = async target => {
+    try {
+      const seen = await deps.bounded(target.evaluate(READ_EVENT_PROBE, EVENT_SLOT), PROBE_MS);
+      const reading = seen && typeof seen === 'object' ? seen : {};
+      return { count: eventCountOf(reading.count), state: eventStateOf(reading.state) };
+    }
+    catch { return unreadableEvents(); }
+  };
+  try { return { page: await read(page), other: await read(other) }; }
+  catch { return { page: unreadableEvents(), other: unreadableEvents() }; }
+}
+/** Total, same discipline. Cleanup of an observation, not of an actuation: nothing was changed in
+ *  the product or the browser, so a tab already gone is not a fault and nothing is raised here. */
+async function disarmVisibilityEvents(deps, targets) {
+  for (const target of targets) {
+    try { await deps.bounded(target.evaluate(DISARM_EVENT_PROBE, EVENT_SLOT), PROBE_MS); } catch {}
+  }
 }
 // Diagnostics only, one level below the visibility pair above and for the same wait. The
 // states there are a fact; WHY they hold is not, and the two surviving readings differ only
@@ -1137,6 +1230,10 @@ async function lifecycleWindow(deps, fixtures, alphaCursor) {
     // Hand the two owned tabs back to whatever focus the browser itself gives them, for this
     // window only. Required actuation: a failure here fails the stage before the wait runs.
     await suspendFocusEmulation(deps, [page, other], focusHolds);
+    // Passive event counters on those same two owned tabs, armed BEFORE the first reading below
+    // so every real `visibilitychange` the browser delivers in this window is counted. Total: an
+    // unarmable tab stays unmeasured and can never fail the stage.
+    await armVisibilityEvents(deps, [page, other]);
     // Real states either side of the front-change, from the two owned tabs themselves.
     visibilityBefore = await captureVisibility(deps, page, other);
     // Same two points, same discipline: which window owns each tab, and each window state.
@@ -1172,6 +1269,11 @@ async function lifecycleWindow(deps, fixtures, alphaCursor) {
     setConsoleOp('lw-resumed-settled');
     await settled(page);
   } finally {
+    // Latched FIRST, before anything is released or closed and on the failing path too, so a
+    // timed-out `lw-hidden-wait` still reports what the browser delivered; then the listeners and
+    // the property are removed. Both calls are total: neither throws out of this `finally`.
+    visibilityEvents = await captureVisibilityEvents(deps, page, other);
+    await disarmVisibilityEvents(deps, [page, other]);
     // Both steps are always attempted, and neither throws out of the `finally`.
     try { await releaseFocusEmulation(deps, focusHolds); }
     catch (error) { cleanupFault = cleanupFault || error; }
