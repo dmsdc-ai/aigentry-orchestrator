@@ -7,6 +7,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
 t_setup; trap t_teardown EXIT
+t_confined_setup
+t_confined_target sid-A
 
 ref="$T_TMP/ref.md"; printf 'ambiguous payload\n' > "$ref"
 h=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$ref")

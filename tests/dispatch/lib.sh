@@ -65,13 +65,29 @@ TEST_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$TEST_LIB_DIR/../.." && pwd -P)"
 
 t_setup() {
+  local setup_tmp tmp_root
+  # An explicit TMPDIR must never fall back to the host temporary directory.
+  if [ "${TMPDIR+x}" = x ]; then
+    if [ -z "$TMPDIR" ]; then
+      printf '%s\n' 't_setup: TMPDIR must not be empty' >&2
+      return 1
+    fi
+    tmp_root="$TMPDIR"
+    case "$tmp_root" in
+      /*) ;;
+      *) tmp_root="$PWD/$tmp_root" ;;
+    esac
+    setup_tmp=$(mktemp -d "${tmp_root%/}/tmp.XXXXXXXXXX") || return $?
+  else
+    setup_tmp=$(mktemp -d) || return $?
+  fi
   # Env hygiene: the suite may be run FROM a worker session (which exports
   # AIGENTRY_WORKER_SESSION=1, dispatch.sh:97). The orchestrator-only guard in
   # session-cleanup.sh (#524) would then refuse on every orchestrator-path test.
   # Tests that exercise the worker guard (T28/T34) set this marker inline per
   # invocation, so clearing the inherited value here is safe and deterministic.
   unset AIGENTRY_WORKER_SESSION
-  T_TMP=$(mktemp -d)
+  T_TMP="$setup_tmp"
   export T_TMP
   # A reconciler tick under test runs wh_prune_orphans, whose ONLY ownership gate
   # is "workspace cwd under $AIGENTRY_ROLE_SANDBOX_DIR" (workspace-host.sh:182).
@@ -121,7 +137,210 @@ t_setup() {
 }
 
 t_teardown() {
+  if [ -n "${T_FIXTURE_CHILD_PID:-}" ]; then
+    local child
+    for child in $(jobs -pr); do
+      [ "$child" != "$T_FIXTURE_CHILD_PID" ] || kill "$child" 2>/dev/null || true
+    done
+    wait "$T_FIXTURE_CHILD_PID" 2>/dev/null || true
+    unset T_FIXTURE_CHILD_PID
+  fi
+  if [ -n "${T_FIXTURE_HELPER:-}" ] && [ -s "${T_TMP:-}/forbidden.log" ]; then
+    cat "$T_TMP/forbidden.log" >&2
+    rm -rf "$T_TMP"
+    return 1
+  fi
   [ -n "${T_TMP:-}" ] && rm -rf "$T_TMP"
+}
+
+# ── Opt-in: a BOUND current-viewport fixture (#751 / #1136) ───────────────────
+# WHY THIS EXISTS. t_setup above supplies the LEGACY evidence pair: a minimal
+# session-info object and a `telepty read-screen` ring. bin/session-probe.py no
+# longer consults that ring on its live path at all (session-probe.py:546-559) —
+# a stale ring reading as live evidence was the bug — and bin/current_screen.py
+# admits a viewport only through an EXACT binding:
+#   * locally connected and ready: id == sid, host 127.0.0.1, healthStatus and
+#     transport.health_status CONNECTED, ready and transport.ready true, and
+#     transport.bootstrap.ready true when present (session_binding)
+#   * process identity: int ownerPid/ptyPid > 1, whose `ps -p … -o pid=,tty=,lstart=`
+#     row names a tty and a start time (process_identity)
+#   * incarnation: non-empty createdAt / lastConnectedAt strings
+#   * a supported `backend`, and for cmux an exact workspace/surface UUID pair whose
+#     window/pane/tty resolve to EXACTLY ONE terminal, read twice unchanged, with the
+#     read-screen response echoing all three ids back (cmux_terminal / cmux_screen)
+# t_setup's fixture cannot establish ANY of that, so every guard on the live path
+# reads probe_error "session is not locally connected and ready" and surface
+# unknown. That is a transport gap in the fixture, not a relaxed product gate: the
+# helper below supplies the missing evidence and RELAXES NOTHING.
+#
+# t_current_view <sid> [cli] installs it. The screen text still comes from
+# $STUB_SCREEN_FILE, so a guard keeps writing its fixture exactly as it always did.
+# Identities are FIXTURE values built here — fake uuids, fixture pids, a fake tty and
+# a frozen start time — never copied from a host, a real session or a real cmux tree.
+# Both stubs answer only the bound target and refuse everything else non-zero
+# (stubs/cmux, stubs/ps), so a mis-bound read still fails closed.
+# Call it AFTER t_setup (which resets STUB_INFO_FILE) and only from a guard that means
+# to measure the live path. Unrelated guards keep the legacy contract untouched:
+# nothing above this line changed.
+t_current_view() {
+  local sid="${1:?t_current_view: sid required}" cli="${2:-claude}"
+  export STUB_CMUX_WORKSPACE="f1136001-0000-4000-8000-000000000001"
+  export STUB_CMUX_SURFACE="f1136002-0000-4000-8000-000000000002"
+  export STUB_CMUX_WINDOW="f1136003-0000-4000-8000-000000000003"
+  export STUB_CMUX_PANE="f1136004-0000-4000-8000-000000000004"
+  export STUB_CMUX_SURFACE_TYPE=terminal
+  export STUB_CMUX_TTY=ttys999
+  export STUB_PS_PID=411360
+  export STUB_PS_LSTART="Sun Aug 16 11:00:00 2026"
+  export STUB_CMUX_LOG="$T_TMP/cmux.log"
+  export STUB_PS_LOG="$T_TMP/ps.log"
+  # The bound viewport serves $STUB_SCREEN_FILE unless a guard decouples it with
+  # t_current_screen_file below. Reset here so the binding is deterministic whatever the
+  # caller's environment carried, and so EVERY other guard keeps the existing behaviour.
+  export STUB_CMUX_SCREEN_FILE=""
+  : > "$STUB_CMUX_LOG"
+  : > "$STUB_PS_LOG"
+  cp "$TEST_LIB_DIR/stubs/cmux" "$STUB_BIN/cmux"
+  cp "$TEST_LIB_DIR/stubs/ps"   "$STUB_BIN/ps"
+  chmod +x "$STUB_BIN/cmux" "$STUB_BIN/ps"
+  # The bound session info. ownerPid is the pid stubs/ps answers for; ptyPid is a
+  # DISTINCT fixture pid, because the adapter matches the bridge's terminal and not
+  # its child PTY. Both are fixture numbers: no live pid is ever looked up.
+  STUB_CURRENT_SID="$sid" STUB_CURRENT_CLI="$cli" python3 - "$STUB_INFO_FILE" <<'PY'
+import json, os, sys
+
+json.dump({
+    "id": os.environ["STUB_CURRENT_SID"],
+    "command": os.environ["STUB_CURRENT_CLI"],
+    "host": "127.0.0.1",
+    "backend": "cmux",
+    "healthStatus": "CONNECTED",
+    "ready": True,
+    "transport": {"health_status": "CONNECTED", "ready": True, "bootstrap": {"ready": True}},
+    "ownerPid": int(os.environ["STUB_PS_PID"]),
+    "ptyPid": int(os.environ["STUB_PS_PID"]) + 1,
+    "createdAt": "2026-08-16T11:00:00Z",
+    "lastConnectedAt": "2026-08-16T11:00:00Z",
+    "cmuxWorkspaceId": os.environ["STUB_CMUX_WORKSPACE"],
+    "cmuxSurfaceId": os.environ["STUB_CMUX_SURFACE"],
+}, open(sys.argv[1], "w", encoding="utf-8"), ensure_ascii=False)
+PY
+}
+
+# t_assert_current_view_read [label] — the POSITIVE CONTROL for t_current_view. Without
+# it a guard cannot tell "the bound viewport was read" from "the probe never got there
+# and something else happened to agree". Asserts the bound read-screen AND the
+# owner-pid identity row were both actually consumed.
+t_assert_current_view_read() {
+  local label="${1:-current-view}"
+  if ! grep -q 'read-screen' "${STUB_CMUX_LOG:?}" 2>/dev/null; then
+    echo "FAIL: $label — the bound cmux read-screen was never consumed; the probe did not reach the current viewport" >&2
+    echo "--- cmux.log ---" >&2; cat "$STUB_CMUX_LOG" >&2 || true
+    exit 1
+  fi
+  if ! grep -qF -- "-p ${STUB_PS_PID:?}" "${STUB_PS_LOG:?}" 2>/dev/null; then
+    echo "FAIL: $label — the bound owner-pid identity was never consumed" >&2
+    echo "--- ps.log ---" >&2; cat "$STUB_PS_LOG" >&2 || true
+    exit 1
+  fi
+}
+
+# t_current_view_reset_log — start a fresh window for the two controls above, so a guard
+# that probes SEVERAL viewports in one run measures each probe rather than the union of
+# all of them. Never changes the binding; only truncates the invocation records.
+t_current_view_reset_log() {
+  : > "${STUB_CMUX_LOG:?}"
+  : > "${STUB_PS_LOG:?}"
+  [ -z "${STUB_TELEPTY_LOG:-}" ] || : > "$STUB_TELEPTY_LOG"
+}
+
+# t_current_screen_file <path> — serve <path> as the BOUND CURRENT viewport, decoupled
+# from $STUB_SCREEN_FILE (which stays the legacy `telepty read-screen` ring). Opt-in and
+# unset by default, so every other guard's bound read keeps serving $STUB_SCREEN_FILE
+# verbatim. It exists for the one thing a single shared file cannot express: history and
+# live viewport holding DIFFERENT text at the same moment, which is exactly T5's premise.
+t_current_screen_file() {
+  export STUB_CMUX_SCREEN_FILE="${1:?t_current_screen_file: path required}"
+}
+
+# t_history_read_tripwire — make "the live path never consulted the historical ring" an
+# ASSERTION instead of a promise (#751). Wraps the existing stubs/telepty: the copy
+# t_setup installed is moved aside and still answers every verb byte-identically, so no
+# stub BEHAVIOUR changes here — the wrapper only appends the argv to a log first. Call it
+# after t_setup and before the probe; pairs with t_assert_no_history_screen_read.
+t_history_read_tripwire() {
+  export STUB_TELEPTY_LOG="$T_TMP/telepty-argv.log"
+  : > "$STUB_TELEPTY_LOG"
+  if [ ! -x "$STUB_BIN/telepty-inner" ]; then
+    mv "$STUB_BIN/telepty" "$STUB_BIN/telepty-inner"
+    cat > "$STUB_BIN/telepty" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$STUB_TELEPTY_LOG"
+exec "$STUB_BIN/telepty-inner" "\$@"
+EOF
+    chmod +x "$STUB_BIN/telepty"
+  fi
+}
+
+# t_assert_no_history_screen_read [label] — the NEGATIVE control paired with
+# t_assert_current_view_read. The live readiness path reads a bound CURRENT viewport and
+# has no fallback to the historical ring (session-probe.py:546-559); this asserts that,
+# rather than inferring it from a verdict that happened to come out right. Only
+# `read-screen` is refused — every other stub-telepty verb stays legitimate.
+t_assert_no_history_screen_read() {
+  local label="${1:-current-view}"
+  if grep -q '^read-screen' "${STUB_TELEPTY_LOG:?}" 2>/dev/null; then
+    echo "FAIL: $label — the historical telepty read-screen ring was consulted on the live path" >&2
+    echo "--- telepty-argv.log ---" >&2; cat "$STUB_TELEPTY_LOG" >&2 || true
+    exit 1
+  fi
+}
+
+# Opt-in for the confined dispatch fixtures. Keep unrelated guards unchanged.
+# Start the owned child in the test shell, never inside $(run_dispatch ...), so
+# the EXIT trap can always kill AND reap it, including after a dispatch crash.
+t_confined_setup() {
+  local name
+  while IFS= read -r name; do
+    case "$name" in
+      PATH|TMPDIR|LANG|LC_*|TERM|SHELL|T_TMP|STUB_*|DISPATCH_STATE_DIR|TELEPTY|GIT|DISPATCH_SH|REPO_ROOT|TEST_LIB_DIR|HERE) ;;
+      *) unset "$name" 2>/dev/null || true ;;
+    esac
+  done < <(compgen -e)
+  export AIGENTRY_DISPATCH_CALLER=confined-dispatch-fixture
+  T_TMP="$(cd "$T_TMP" && pwd -P)"
+  export T_TMP HOME="$T_TMP/home" USERPROFILE="$T_TMP/home"
+  export XDG_CONFIG_HOME="$T_TMP/home/.config" XDG_CACHE_HOME="$T_TMP/home/.cache"
+  export CODEX_HOME="$T_TMP/codex-home" CLAUDE_CONFIG_DIR="$T_TMP/home/.claude"
+  export GEMINI_CLI_HOME="$T_TMP/gemini-home" PYTHONDONTWRITEBYTECODE=1
+  export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+  export AIGENTRY_HOME="$T_TMP/home/.aigentry" AIGENTRY_SESSIONS_ROOT="$T_TMP/sessions"
+  export AIGENTRY_ROLE_SANDBOX_DIR="$T_TMP/role-sandbox"
+  export AIGENTRY_BUS_BRIDGE=0 AIGENTRY_SLEEP_GUARD=0
+  export AIGENTRY_TASK_QUEUE="$T_TMP/fixture-queue.json" AIGENTRY_TASK_GATE=hard
+  export AIGENTRY_GIT_HOOKS_DIR="$T_TMP/hooks" AIGENTRY_GIT_HOOK_SOURCE_DIR="$REPO_ROOT/git-hooks"
+  export AIGENTRY_WORKER_SCOPE="$T_TMP/scope.json"
+  export T_FIXTURE_HELPER="$TEST_LIB_DIR/confined-fixture.mjs"
+  export T_FIXTURE_NODE="$(command -v node)"
+  # Canonical, private temp path also avoids the production macOS /var/folders
+  # short-socket fallback to host /tmp. Never grant access to the host tmp root.
+  mkdir -p "$T_TMP/tmp"
+  export TMPDIR="$T_TMP/tmp" TMP="$T_TMP/tmp" TEMP="$T_TMP/tmp"
+  "$T_FIXTURE_NODE" "$T_FIXTURE_HELPER" init
+  export SESSION_PROBE_PY="$STUB_BIN/fixture-probe"
+  export OPEN_SESSION_SH="$STUB_BIN/fixture-deny"
+  export EMIT_TELEMETRY_MJS="$STUB_BIN/fixture-noop" REPORT_TARGET_SH="$STUB_BIN/fixture-report"
+  "$T_FIXTURE_NODE" -e 'setTimeout(() => {}, 120000)' </dev/null >/dev/null 2>&1 &
+  T_FIXTURE_CHILD_PID=$!
+  export T_FIXTURE_CHILD_PID
+}
+
+t_confined_target() {
+  "$T_FIXTURE_NODE" "$T_FIXTURE_HELPER" target "$1" "${2:-}"
+}
+
+t_confined_scope() {
+  "$T_FIXTURE_NODE" "$T_FIXTURE_HELPER" scope "$1" "$2" "$3"
 }
 
 t_assert_contains() {

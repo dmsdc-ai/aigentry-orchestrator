@@ -1,0 +1,304 @@
+name: CI
+
+# #894. This file exists because the repo had no test-running CI at all, and the first
+# execution of release.yml — a tag push, at publish time — was therefore also the first
+# time the suite had ever run anywhere but a maintainer's laptop. It failed on both OS
+# legs, on tests that depended on a `claude` binary the runner does not have. The publish
+# was correctly skipped, but the defect was found at the worst possible moment.
+#
+# So the contract here is narrow and deliberate: this job runs the SAME gates as
+# release.yml's `test` job, in the same order, on the same matrix. Not "similar" — the
+# same. A green PR is only worth something if it predicts a green release, and it can only
+# predict that if it measures the same thing. When release.yml's test job changes, this
+# changes with it; a divergence between the two is a bug in this file.
+#
+# #900 — tests/dispatch/run-all.sh now runs here, on both legs. The comment this replaces
+# said it "needs a live telepty daemon", and that was never true: tests/dispatch/lib.sh
+# puts stub telepty/git/dispatch.sh binaries on PATH for every guard, the two guards that
+# want real processes (T16, T48) are gated on AIGENTRY_RUN_LIVE_TESTS=1, and the one that
+# would boot a daemon (T95 part E) refuses the production port and is now gated the same
+# way. The suite is hermetic. The package has shipped os:["darwin","linux"] since 0.2.0
+# while its guard suite had never once run on Linux anywhere — that claim was prose, and
+# this is the measurement.
+#
+# What this still does NOT measure, stated so a green check is not read as more than it is:
+# the live-integration guards above, and anything Windows beyond the refusal asserted in
+# the windows-refuses job below.
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+# A PR that gets three pushes in a minute does not need three full matrices; the newest
+# commit is the only one whose answer matters. This is the opposite of release.yml's
+# queue-never-cancel setting, and deliberately so: cancelling a test run loses nothing,
+# whereas cancelling a publish mid-flight is how you get a half-release.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Full suite
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [20]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Install jq (a hard dependency of init, checked at step 1)
+        run: command -v jq || sudo apt-get install -y jq
+        if: matrix.os == 'ubuntu-latest'
+      - name: Run the regression suite
+        run: npm test
+      # Runs after npm test because several guards gate on dist/ being built, and
+      # `npm test` is what builds it.
+      - name: Dispatch guard suite
+        run: bash tests/dispatch/run-all.sh
+        # 4 was inside the runner's own variance, not above it. Measured on
+        # macos-latest for the SAME commit: 2m44s vs 4m11s — 87s of spread — against a
+        # main baseline of 3m07s, so the headroom was 53s < variance and the cap fired
+        # on a suite that had already printed `guards: 118 passed: 118 failed: 0`
+        # (one manual re-run needed). A timeout that trips on a PASSING suite teaches
+        # people to re-run red CI, which is the opposite of what it is for. 8 leaves
+        # ~5m of headroom and still catches a real hang.
+        timeout-minutes: 8
+      - name: Ship-set agreement against the real tarball
+        run: bash tests/packaging/T96_ship_set_agreement.sh
+      # Announces its own skip when the upstream repo is absent, which it always is here.
+      - name: Vendored constitution currency
+        run: bash tests/packaging/T97_constitution_vendor_current.sh
+      - name: Acceptance smoke — install the tarball and init into a throwaway HOME
+        run: bash tests/packaging/smoke-init.sh
+
+  # #901 (W1) — a REAL test run on windows-latest, now that the two persistence seams
+  # (atomic-write, index-lock) have win32 arms instead of throws. W0 below proves the
+  # package refuses to INSTALL on Windows; this proves the library's persistence layer
+  # WORKS there. Those are different claims and both are wanted: the refusal is the
+  # shipped product decision, and this leg is what stops the win32 arms from being
+  # asserted only by inference.
+  #
+  # WHY A SEPARATE JOB, not windows-latest added to the `test` matrix above. The test job
+  # is bound by the contract in this file's header — it must run the SAME gates in the
+  # SAME order as release.yml's test job, or a green PR stops predicting a green release.
+  # Windows cannot run four of its seven steps (the dispatch guard suite, T96, T97 and
+  # smoke-init are bash), so joining the matrix would mean per-OS `if:` guards, i.e. the
+  # steps would no longer be the same and the parity that #900 asserted would be gone.
+  # The alternative — adding windows to release.yml too — would put a Windows leg in the
+  # PUBLISH gate for a package that declares Windows unsupported. A separate job keeps
+  # both stories straight.
+  #
+  # WHY `npm ci --force`. U23, measured in W0 below: npm enforces the root manifest's own
+  # os[], so a plain `npm ci` here dies with EBADPLATFORM. --force is a CI-only bypass of
+  # exactly that check. It does NOT weaken the shipped refusal in any way — package.json
+  # os[] is untouched, and the W0 job below still asserts both the declaration and the
+  # EBADPLATFORM behaviour on this same runner, in this same workflow. The honest reading
+  # of a green W1 is "the code runs on win32 when you force it past the refusal", never
+  # "Windows is supported".
+  windows-persistence:
+    name: Windows W1 — the suite really runs
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies (CI-only --force past the os[] refusal, see above)
+        shell: bash
+        run: npm ci --force
+
+      - name: Build
+        shell: bash
+        run: npm run build
+
+      # THE #901 GATE. The persistence layer is what this ticket gave win32 arms, so it is
+      # the part held to a hard green: every test in it must pass, and none may skip.
+      #
+      # This is also the resolution of U28. scripts/run-tests.mjs:31 normalises enumerated
+      # paths with .split(sep).join('/') before handing them to `node --test` — a
+      # Windows-shaped line that had never once run on Windows. The debt step below runs
+      # through that enumerator, so a sane test count there is the proof it works.
+      - name: Persistence suite must be fully green on win32
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          node --test dist/tests/session/persistence/*.test.js > "${RUNNER_TEMP}/persistence.log" 2>&1
+          RC=$?
+          set -e
+          cat "${RUNNER_TEMP}/persistence.log"
+          read_count() { grep -E "^# $1 " "${RUNNER_TEMP}/persistence.log" | tail -1 | awk '{print $3}'; }
+          PASS="$(read_count pass)"; FAIL="$(read_count fail)"; SKIP="$(read_count skipped)"
+          # Refuse to assert on numbers we could not read — an empty string compares equal
+          # to nothing and would let this pass vacuously.
+          [ -n "${PASS}" ] && [ -n "${FAIL}" ] && [ -n "${SKIP}" ] \
+            || { echo "::error::could not parse the TAP summary; refusing to report a vacuous pass."; exit 1; }
+          echo "win32 persistence: pass=${PASS} fail=${FAIL} skipped=${SKIP}"
+          [ "${FAIL}" = "0" ] || { echo "::error::${FAIL} persistence test(s) failed on win32. This is the surface #901 delivers; it does not get a known-failure allowance."; exit 1; }
+          [ "${SKIP}" = "0" ] || { echo "::error::${SKIP} persistence test(s) skipped on win32 — a skip here is a win32 behaviour that went unmeasured."; exit 1; }
+          [ "${PASS}" -gt 20 ] || { echo "::error::only ${PASS} persistence tests ran; the file glob is probably not matching."; exit 1; }
+          [ "${RC}" = "0" ] || { echo "::error::the runner exited ${RC} despite a clean summary."; exit 1; }
+
+      # THE REST OF THE SUITE, RATCHETED — the #900 doctrine applied to win32 debt.
+      #
+      # 33 of 225 tests fail on Windows, and NONE of them is a persistence test. They were
+      # never measured before this leg existed; #901 is scoped to the two seams and is
+      # explicitly not allowed to touch the files these live in, so the honest move is to
+      # count them, name them, and make the number impossible to drift silently — not to
+      # hide the whole suite behind a narrower command.
+      #
+      # MEASURED on windows-latest, run 31892…, node 20 — four families:
+      #   21  boot-prepare launcher tests (431-*, 532-*, 552-*, 569-*, 551-*, M1/M2):
+      #       they generate and exec a launcher.SH. Bash is not the win32 spawn path.
+      #    8  resolve-instructions layer composition (1., 3., 4., 10., 11., 12., 15., 16.)
+      #    1  T7 path canonicalization — creating a symlink on Windows needs privilege
+      #    1  defaultPathConfig AIGENTRY_SESSIONS_ROOT override
+      #
+      # The assertion is EXACT in both directions on purpose. Going up is a regression.
+      # Going DOWN means someone made Windows work and must say so here — a ratchet that
+      # only tightens one way is how a stale number survives being wrong.
+      - name: Known win32 debt must not move
+        shell: bash
+        env:
+          EXPECTED_WIN32_FAILURES: '33'
+        run: |
+          set -uo pipefail
+          set +e
+          node scripts/run-tests.mjs > "${RUNNER_TEMP}/full.log" 2>&1
+          set -e
+          cat "${RUNNER_TEMP}/full.log"
+          read_count() { grep -E "^# $1 " "${RUNNER_TEMP}/full.log" | tail -1 | awk '{print $3}'; }
+          TESTS="$(read_count tests)"; FAIL="$(read_count fail)"; SKIP="$(read_count skipped)"
+          [ -n "${TESTS}" ] && [ -n "${FAIL}" ] && [ -n "${SKIP}" ] \
+            || { echo "::error::could not parse the TAP summary; refusing to report a vacuous pass."; exit 1; }
+          echo "win32 full suite: tests=${TESTS} fail=${FAIL} skipped=${SKIP} (declared debt ${EXPECTED_WIN32_FAILURES})"
+          [ "${TESTS}" -gt 200 ] || { echo "::error::only ${TESTS} tests were enumerated. scripts/run-tests.mjs:31 normalises Windows separators for node --test; a low count means that enumeration is broken (U28)."; exit 1; }
+          [ "${SKIP}" = "0" ] || { echo "::error::${SKIP} test(s) skipped on win32. Skips are not an accepted currency here — see tests/dispatch/run-all.sh."; exit 1; }
+          if [ "${FAIL}" != "${EXPECTED_WIN32_FAILURES}" ]; then
+            echo "--- failures this run ---"
+            grep '^not ok' "${RUNNER_TEMP}/full.log" || true
+            if [ "${FAIL}" -gt "${EXPECTED_WIN32_FAILURES}" ]; then
+              echo "::error::win32 failures rose to ${FAIL} from the declared ${EXPECTED_WIN32_FAILURES}. Something that used to work on Windows stopped."
+            else
+              echo "::error::win32 failures fell to ${FAIL} from the declared ${EXPECTED_WIN32_FAILURES}. Windows got better — lower EXPECTED_WIN32_FAILURES and update the family breakdown above, so the next regression is still caught."
+            fi
+            exit 1
+          fi
+
+      # U21 — a `.mjs` bin has never been installed on Windows from this package, and npm
+      # generates its shims (.cmd/.ps1) from the shebang. If cmd-shim mishandled the .mjs
+      # extension, `aigentry-orchestrator` would be installed and unrunnable — a failure
+      # that only appears at a user's first invocation, which is the worst place for it.
+      # --version is the right probe: it returns before platformGate(), so this measures
+      # the shim, not the platform refusal (which W0 measures deliberately).
+      - name: U21 — the .mjs bin gets a working Windows shim
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREFIX="${RUNNER_TEMP}/w1-prefix"
+          mkdir -p "$PREFIX"
+          TARBALL="$(npm pack --silent)"
+          npm install --force --prefix "$PREFIX" "./${TARBALL}"
+          EXPECTED="$(node -p "require('./package.json').version")"
+          REPORTED="$("$PREFIX/node_modules/.bin/aigentry-orchestrator" --version)"
+          REPORTED="$(printf '%s' "$REPORTED" | tr -d '\r')"
+          [ "$REPORTED" = "$EXPECTED" ] || { echo "::error::the installed Windows shim reports '${REPORTED}', expected '${EXPECTED}'. npm's cmd-shim does not handle this .mjs bin correctly."; exit 1; }
+          echo "the .mjs bin runs through its Windows shim and reports ${REPORTED}"
+
+  # #900 (W0) — "unsupported on Windows" was, like the Linux claim above, a sentence
+  # rather than a measurement. release.yml asserts the os[] declaration, but it does so
+  # on ubuntu, which proves the string and nothing about what a Windows user experiences.
+  # This job runs ON windows-latest and asserts the two refusals that are supposed to
+  # protect that user: npm's own EBADPLATFORM on the declaration, and the runtime gate in
+  # bin/init/cli.mjs for anyone who gets past it (a tarball copied by hand, a --force
+  # install). It deliberately does NOT try to make anything work on Windows — a green run
+  # here means the package fails early and legibly, which is the supported behavior.
+  windows-refuses:
+    name: Windows W0 — the package refuses, correctly
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Same mechanism as release.yml's windows-declared-unsupported job (an exact-string
+      # compare on the serialised array, not a substring or a length check), run on the OS
+      # the declaration is about. If these two ever disagree, one of them is wrong.
+      - name: package.json must declare Windows out
+        shell: bash
+        run: |
+          set -euo pipefail
+          OS="$(node -p "JSON.stringify(require('./package.json').os)")"
+          [ "$OS" = '["darwin","linux"]' ] || { echo "::error::package.json os is ${OS}; expected [\"darwin\",\"linux\"] so npm refuses Windows installs with EBADPLATFORM (§6.2, #663)."; exit 1; }
+          echo "os declaration is ${OS}"
+
+      # The gate is step 0 of init — before dependency checks, before any path is
+      # resolved, before a single byte is written. Nothing to clean up if it fires, and
+      # the assertion covers the message too: an exit 2 that does not say why is a refusal
+      # the user cannot act on. cli.mjs imports only node: builtins plus its sibling
+      # manifest.mjs, so this needs no install.
+      - name: bin/init/cli.mjs platform gate must exit 2 on win32
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          OUT="$(node bin/init/cli.mjs init 2>&1)"
+          RC=$?
+          set -e
+          printf '%s\n' "$OUT"
+          [ "$RC" = "2" ] || { echo "::error::init exited ${RC} on win32; platformGate() in bin/init/cli.mjs must die(2, ...). An exit that is not 2 means the gate did not fire, or fired as something else."; exit 1; }
+          case "$OUT" in
+            *"does not support Windows natively"*WSL2*) echo "platform gate refused with its documented message and exit 2" ;;
+            *) echo "::error::init exited 2 but without the documented refusal (expected the 'does not support Windows natively' / WSL2 message)."; exit 1 ;;
+          esac
+
+      # U23 — this was an open question, not an assumption: npm applies os[] to the
+      # packages it installs, but whether it also applies it to the ROOT project's own
+      # manifest is something this repo had never observed. The difference decides whether
+      # a Windows user who clones the repo gets a hard stop or a dev install that works
+      # right up until the first bin/ script.
+      #
+      # MEASURED on windows-latest, run 31890807632 (2026-08-15), npm 10 / node 20:
+      #
+      #   npm ci exit=1
+      #   npm error code EBADPLATFORM
+      #   npm error notsup Unsupported platform for @dmsdc-ai/aigentry-orchestrator@0.2.0:
+      #     wanted {"os":"darwin,linux"} (current: {"os":"win32"})
+      #
+      # npm DOES enforce the root manifest's own os[]. So the declaration is not merely
+      # advice to consumers — it stops a Windows contributor at `npm ci`, before any of
+      # the 33 bin/ scripts with no Windows interpreter can be reached. That is the
+      # behavior worth pinning, and this step now fails if it ever silently changes: an
+      # npm that started installing here would mean Windows users get a tree that looks
+      # fine and breaks later, which is strictly worse than EBADPLATFORM.
+      - name: U23 — npm ci must refuse on win32 with EBADPLATFORM
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          npm ci > "${RUNNER_TEMP}/npm-ci.log" 2>&1
+          RC=$?
+          set -e
+          echo "npm ci exit=${RC}"
+          tail -n 40 "${RUNNER_TEMP}/npm-ci.log"
+          [ "$RC" != "0" ] || { echo "::error::npm ci SUCCEEDED on win32. It refused with EBADPLATFORM when U23 was measured (2026-08-15). npm no longer enforces the root manifest's os[], so a Windows contributor now gets a dev install that works until the first bin/ script instead of a hard stop — re-decide the refusal strategy rather than relaxing this assertion."; exit 1; }
+          grep -q 'EBADPLATFORM' "${RUNNER_TEMP}/npm-ci.log" || { echo "::error::npm ci failed on win32 with exit ${RC} but not EBADPLATFORM. Something other than the os[] declaration is stopping the install; read the log above before assuming the refusal still works."; exit 1; }
+          echo "npm ci refused with EBADPLATFORM, as measured for U23"

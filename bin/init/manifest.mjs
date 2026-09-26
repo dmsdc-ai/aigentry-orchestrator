@@ -19,6 +19,10 @@ const MANIFEST = [
   // ---- bin/** — `git ls-files bin`, complete. T96 assertion 4 pins this to the tree.
   "bin/ask.sh",
   "bin/boot-prepare.mjs",
+  // #751: bin/session-probe.py's read-only current-viewport adapter module. It is imported
+  // as a SIBLING from the probe's own directory, so a workspace that holds the probe
+  // without this file holds a probe that cannot import. One coupled change, one entry.
+  "bin/current_screen.py",
   "bin/dispatch-cleanup-scheduler.sh",
   "bin/dispatch-registry.py",
   "bin/dispatch-tracker.sh",
@@ -26,8 +30,11 @@ const MANIFEST = [
   "bin/dispatch.sh",
   "bin/emit-telemetry.mjs",
   "bin/hitl.sh",
+  "bin/hook-prompt-submit.mjs",
   "bin/init/cli.mjs",
   "bin/init/manifest.mjs",
+  "bin/init/native-capture.mjs",
+  "bin/init/preservation.mjs",
   "bin/inject-handler.sh",
   "bin/install-instructions.sh",
   "bin/install-launchd.sh",
@@ -38,6 +45,7 @@ const MANIFEST = [
   "bin/lib/telepty-auth.sh",
   "bin/lib/telepty-listing.sh",
   "bin/lib/workspace-host.sh",
+  "bin/model-router.mjs",
   "bin/open-session.sh",
   "bin/orchestrator-boot.sh",
   "bin/orchestrator-bridge-auditor.sh",
@@ -65,6 +73,7 @@ const MANIFEST = [
   "AGENTS.md",
   "CLAUDE.md",
   "docs/rules.md",
+  "docs/model-profiles/model-routing-profile.md",
   "docs/templates/dispatch-ref-checklist.md",
   "docs/templates/dispatch-ref-template.md",
 
@@ -108,6 +117,7 @@ const SCAFFOLD_PREFIX = "tooling/instructions/";
  *  nothing ships into the governance surface without init placing it. */
 const GOVERNANCE_ROOTS = [
   "bin/",
+  "docs/model-profiles/",
   "docs/rules.md",
   "docs/templates/",
   ".agents/",

@@ -7,6 +7,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
 t_setup; trap t_teardown EXIT
+t_confined_setup
 
 PROBE="$T_TMP/session-probe"
 cat > "$PROBE" <<'SH'
@@ -37,6 +38,12 @@ PY
 ERR="$T_TMP/err.txt"
 run_dispatch() {
   local sid="$1"; shift
+  local task="" previous="" arg
+  for arg in "$@"; do
+    [ "$previous" != --task ] || task="$arg"
+    previous="$arg"
+  done
+  t_confined_target "$sid" "$task"
   printf '%s' "[{\"id\":\"$sid\",\"command\":\"claude\",\"healthStatus\":\"CONNECTED\"}]" > "$STUB_LIST_FILE"
   local ref="$T_TMP/ref-$sid.md"
   printf 'T59 ref for %s\n' "$sid" > "$ref"

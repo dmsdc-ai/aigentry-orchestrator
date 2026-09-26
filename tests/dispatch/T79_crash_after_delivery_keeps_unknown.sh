@@ -8,6 +8,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
 t_setup; trap t_teardown EXIT
+t_confined_setup
+t_confined_target sid-A
 t_init_v2
 
 ref="$T_TMP/ref.md"; printf 'crash payload\n' > "$ref"

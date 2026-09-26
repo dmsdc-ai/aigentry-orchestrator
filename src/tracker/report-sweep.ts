@@ -14,26 +14,27 @@
 //
 //   * a watcher that exits on the FIRST match drops the sibling ref that arrived
 //     in the same window, and the re-armed marker then post-dates it forever. So
-//     a sweep here copies EVERY new ref it finds and never stops early;
+//     a sweep here retains unselected refs in the window for the next bounded tick;
 //   * "did I already read this?" had no answer that survived a restart. So the
 //     answer is a file — a cursor with a `seen` ledger keyed by the ref's sha,
 //     which is the only stable identity a ref has.
 //
 // The durability rule is the whole design and it is one sentence: INBOX FIRST,
-// CURSOR SECOND. A crash between them re-emits (the shas are still absent from
-// `seen`, the same sha-derived paths are rewritten with the same bytes) and can
-// never lose. Re-emitting a report costs an operator one duplicate line; losing
-// one costs 41 minutes.
+// CURSOR SECOND. A crash between them permits retry (the shas are still absent
+// from `seen`, and unchanged refs use the same paths and bytes). Failed captures
+// remain in the retry queue even after the discovery window moves past them.
 //
 // This module is READ-ONLY with respect to ~/.telepty/shared. Nothing under it is
 // moved, modified or deleted — it is the evidence, and a sweep that consumed its
 // own evidence would be the same defect wearing a cursor.
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
 import { atomicWrite } from "../session/persistence/atomic-write.js";
+import { withIndexLock } from "../session/persistence/index-lock.js";
 
 /**
  * Clock-skew slack on the scan floor. Refs arriving in the same second as a sweep
@@ -54,10 +55,21 @@ const HEAD_BYTES = 400;
 const SESSION_ID = "report-sweep";
 /** Track/sha are untrusted path input; `unknown` is the one placeholder. */
 const UNKNOWN = "unknown";
+const MAX_ATTEMPTS = 128;
+
+interface Retry {
+  basename: string;
+  observed_mtime_ms: number;
+  error_code: string;
+  first_seen_at: string;
+}
 
 interface Cursor {
+  version: 2;
   last_mtime_ms: number;
   seen: Record<string, number>;
+  // Queue order is durable: attempted failures move behind unattempted retries.
+  retries: Retry[];
 }
 
 /**
@@ -100,29 +112,53 @@ function refId(rawName: string): string {
   return `${safeSegment(clean.slice(0, REF_ID_CAP - 9), REF_ID_CAP - 9)}-${digest}`;
 }
 
-/**
- * A missing OR unparseable cursor is a cold start, never a crash. Refusing to run
- * on a corrupt cursor would lose every report until a human noticed — which is
- * precisely the failure this module exists to end.
- */
+/** Only absence is a cold start; invalid state must never erase obligations. */
 function readCursor(file: string, nowMs: number): Cursor {
+  let text: string;
   try {
-    const doc: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
-    const rec = doc as Record<string, unknown>;
-    const last = Number(rec?.last_mtime_ms);
-    if (!Number.isFinite(last)) throw new Error("last_mtime_ms is not a number");
-    const seen: Record<string, number> = {};
-    const rawSeen = rec?.seen;
-    if (rawSeen && typeof rawSeen === "object" && !Array.isArray(rawSeen)) {
-      for (const [k, v] of Object.entries(rawSeen as Record<string, unknown>)) {
-        const n = Number(v);
-        if (Number.isFinite(n)) seen[k] = n;
-      }
-    }
-    return { last_mtime_ms: last, seen };
-  } catch {
-    return { last_mtime_ms: nowMs - COLD_START_MS, seen: {} };
+    text = fs.readFileSync(file, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    return { version: 2, last_mtime_ms: nowMs - COLD_START_MS, seen: Object.create(null), retries: [] };
   }
+  const isRecord = (value: unknown): value is Record<string, unknown> =>
+    value !== null && typeof value === "object" && !Array.isArray(value);
+  const isTime = (value: unknown): value is number =>
+    typeof value === "number" && Number.isFinite(value) && Math.abs(value) <= 8.64e15;
+  const rec: unknown = JSON.parse(text);
+  if (!isRecord(rec) || !isTime(rec.last_mtime_ms) || !isRecord(rec.seen)) {
+    throw new Error("invalid cursor last_mtime_ms/seen; cursor preserved");
+  }
+  if (rec.version !== undefined && rec.version !== 1 && rec.version !== 2) {
+    throw new Error(`unsupported cursor version ${JSON.stringify(rec.version)}; cursor preserved`);
+  }
+  const seen: Record<string, number> = Object.create(null);
+  for (const [key, value] of Object.entries(rec.seen)) {
+    if (!isTime(value)) throw new Error("invalid cursor seen entry; cursor preserved");
+    seen[key] = value;
+  }
+  const retries: Retry[] = [];
+  if (rec.version === 2) {
+    if (!Array.isArray(rec.retries)) throw new Error("invalid cursor retries; cursor preserved");
+    const basenames = new Set<string>();
+    for (const entry of rec.retries) {
+      if (!isRecord(entry) || typeof entry.basename !== "string" ||
+          !entry.basename.endsWith(".md") || entry.basename.includes("\0") ||
+          path.basename(entry.basename) !== entry.basename ||
+          !isTime(entry.observed_mtime_ms) || typeof entry.error_code !== "string" ||
+          !entry.error_code || typeof entry.first_seen_at !== "string" ||
+          !Number.isFinite(Date.parse(entry.first_seen_at)) || basenames.has(entry.basename) ||
+          seen[refId(entry.basename.slice(0, -3))] !== undefined) {
+        throw new Error("invalid or conflicting cursor retry entry; cursor preserved");
+      }
+      basenames.add(entry.basename);
+      retries.push({ basename: entry.basename, observed_mtime_ms: entry.observed_mtime_ms,
+        error_code: entry.error_code, first_seen_at: entry.first_seen_at });
+    }
+  } else if (rec.retries !== undefined) {
+    throw new Error("legacy cursor has unexpected retries; cursor preserved");
+  }
+  return { version: 2, last_mtime_ms: rec.last_mtime_ms, seen, retries };
 }
 
 /**
@@ -143,16 +179,32 @@ function readCursor(file: string, nowMs: number): Cursor {
  *
  * Longest-first so a full sid beats its own prefix.
  */
-function loadTracks(activeJson: string): string[] {
+export function loadRegistryTracks(stateDir: string, registryScript: string): string[] {
   let doc: unknown;
   try {
-    doc = JSON.parse(fs.readFileSync(activeJson, "utf8"));
+    const windows = process.platform === "win32";
+    const result = spawnSync(windows ? "python" : registryScript,
+      windows ? [registryScript, "snapshot"] : ["snapshot"], {
+        shell: false,
+        env: { ...process.env, DISPATCH_STATE_DIR: stateDir, PYTHONIOENCODING: "utf-8" },
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 10_000,
+        killSignal: "SIGKILL",
+        maxBuffer: 8 * 1024 * 1024,
+      });
+    if (result.error || result.status !== 0) return [];
+    doc = JSON.parse(result.stdout);
   } catch {
     return []; // no registry = no track vocabulary; refs still classify by header
   }
-  const list = (doc as { dispatches?: unknown })?.dispatches;
+  if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return [];
+  const envelope = doc as { schema_version?: unknown; generation?: unknown; dispatches?: unknown };
+  if (envelope.schema_version !== 2 || !Number.isInteger(envelope.generation) ||
+      !Array.isArray(envelope.dispatches)) return [];
+  const list = envelope.dispatches;
   const out = new Set<string>();
-  for (const d of Array.isArray(list) ? list : []) {
+  for (const d of list) {
     const sid = (d as { assigned?: { sid?: unknown } })?.assigned?.sid;
     if (typeof sid !== "string") continue;
     if (sid.length >= 3) out.add(sid);
@@ -184,7 +236,7 @@ const TITLE_TRACK_RE = /^#[ \t]+[^\n]*?—[ \t]*([A-Za-z0-9._-]+)/m;
  * A track id in this ecosystem always carries a digit (sw904, tk899, sl909,
  * sp902-916, ci1, t880). A title token that does not is prose, not a track —
  * `# Memory harness gap analysis — Sakana "long-horizon agent memory" talk`
- * would otherwise be filed on track `Sakana`. Same discriminator as loadTracks'
+ * would otherwise be filed on track `Sakana`. Same discriminator as loadRegistryTracks'
  * prefix rule, for the same reason.
  */
 function looksLikeTrack(token: string): boolean {
@@ -217,9 +269,11 @@ export function classify(head: string, tracks: string[]): { kind: string; track:
 }
 
 interface Candidate {
+  basename: string;
   sha: string;
   file: string;
   mtimeMs: number;
+  retry?: Retry;
 }
 
 export interface SweepDeps {
@@ -227,6 +281,7 @@ export interface SweepDeps {
   sharedDir: string;
   nowMs: number;
   repoDir: string;
+  registryScript?: string;
   stdout: (line: string) => void;
   stderr: (line: string) => void;
 }
@@ -234,34 +289,58 @@ export interface SweepDeps {
 /**
  * One sweep. Returns the process exit code: 0 for "swept" (including nothing new,
  * and including a shared dir that does not exist — a box without telepty is not a
- * failure), 3 for a failed inbox or cursor write.
+ * failure), 3 for failed discovery, inbox/cursor writes, validation or locking.
+ * Read failures with committed retry metadata are reported as PENDING.
  */
 export async function sweep(deps: SweepDeps): Promise<number> {
+  const cursorFile = path.join(deps.stateDir, "report-cursor.json");
+  try {
+    // The helper stages its lock beside the cursor, so the parent must exist.
+    fs.mkdirSync(deps.stateDir, { recursive: true });
+    return await withIndexLock(cursorFile, () => sweepLocked(deps, cursorFile));
+  } catch (err) {
+    deps.stderr(`report-sweep: lock/cursor error; capture unresolved: ${(err as Error).message}`);
+    return 3;
+  }
+}
+
+async function sweepLocked(deps: SweepDeps, cursorFile: string): Promise<number> {
   const { stateDir, sharedDir, nowMs, repoDir, stdout, stderr } = deps;
-  const cursorFile = path.join(stateDir, "report-cursor.json");
   const inboxDir = path.join(stateDir, "inbox");
   const unclassifiedDir = path.join(inboxDir, "unclassified");
 
   const cursor = readCursor(cursorFile, nowMs);
 
-  let names: string[];
+  let result = 0;
+  let discoveryIncomplete = false;
+  let names: string[] = [];
   try {
     names = fs.readdirSync(sharedDir);
-  } catch {
-    return 0;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      stderr(`report-sweep: PENDING discovery ${sharedDir}: ${(err as Error).message}`);
+      result = 3;
+      discoveryIncomplete = true;
+    }
   }
 
   const floor = cursor.last_mtime_ms - OVERLAP_MS;
   let maxMtime = cursor.last_mtime_ms;
   const fresh: Candidate[] = [];
+  const pendingNames = new Set(cursor.retries.map((retry) => retry.basename));
   for (const name of names) {
     if (!name.endsWith(".md")) continue;
+    if (pendingNames.has(name)) continue; // retried directly, even outside the window
     const file = path.join(sharedDir, name);
     let st: fs.Stats;
     try {
       st = fs.statSync(file);
-    } catch {
-      continue; // vanished between readdir and stat; the next sweep will see it
+    } catch (err) {
+      // No observed mtime exists yet: keep the discovery floor until re-stat.
+      discoveryIncomplete = true;
+      stderr(`report-sweep: PENDING stat ${file}: ${(err as Error).message}`);
+      result = 3;
+      continue;
     }
     if (!st.isFile()) continue;
     const mtimeMs = Math.floor(st.mtimeMs);
@@ -269,29 +348,44 @@ export async function sweep(deps: SweepDeps): Promise<number> {
     if (mtimeMs < floor) continue; // outside the scan window — bounds the sweep
     const sha = refId(name.slice(0, -3));
     if (cursor.seen[sha] !== undefined) continue; // the ledger — bounds the emit
-    fresh.push({ sha, file, mtimeMs });
+    fresh.push({ basename: name, sha, file, mtimeMs });
   }
 
-  // Oldest first, so the printed order is the order the reports were written.
+  // Fresh refs are oldest first; retained retries rotate independently below.
   fresh.sort((a, b) => a.mtimeMs - b.mtimeMs || a.sha.localeCompare(b.sha));
 
-  const tracks = fresh.length ? loadTracks(path.join(stateDir, "active.json")) : [];
+  const selected: Candidate[] = [];
+  let pendingIndex = 0;
+  let freshIndex = 0;
+  // Alternate queues; if either empties, the other can use the remaining budget.
+  while (selected.length < MAX_ATTEMPTS &&
+         (pendingIndex < cursor.retries.length || freshIndex < fresh.length)) {
+    if (pendingIndex < cursor.retries.length) {
+      const retry = cursor.retries[pendingIndex++]!;
+      selected.push({ basename: retry.basename, sha: refId(retry.basename.slice(0, -3)),
+        file: path.join(sharedDir, retry.basename), mtimeMs: retry.observed_mtime_ms, retry });
+    }
+    if (selected.length < MAX_ATTEMPTS && freshIndex < fresh.length) {
+      selected.push(fresh[freshIndex++]!);
+    }
+  }
+  // Never pass unselected discovery evidence, including equal-mtime siblings.
+  if (freshIndex < fresh.length) {
+    maxMtime = Math.max(cursor.last_mtime_ms, Math.min(maxMtime, fresh[freshIndex]!.mtimeMs));
+  }
+  if (discoveryIncomplete) maxMtime = cursor.last_mtime_ms;
+  const retries = cursor.retries.slice(pendingIndex);
+  const tracks = selected.length ? loadRegistryTracks(stateDir,
+    deps.registryScript || process.env.DISPATCH_REGISTRY_PY || path.join(repoDir, "bin", "dispatch-registry.py")) : [];
   const lines: string[] = [];
 
-  // ── step 1: every inbox copy ───────────────────────────────────────────────
-  try {
-    if (fresh.length) fs.mkdirSync(unclassifiedDir, { recursive: true });
-    for (const c of fresh) {
-      let bytes: Buffer | null = null;
-      try {
-        bytes = fs.readFileSync(c.file);
-      } catch (err) {
-        // One unreadable ref must not stop the other nine from being delivered.
-        // It is still filed — that a report arrived is itself the fact worth not
-        // losing, even when the bytes are gone.
-        stderr(`report-sweep: unreadable ref ${c.file}: ${(err as Error).message}`);
-      }
-      const head = bytes ? bytes.subarray(0, HEAD_BYTES).toString("utf8") : "";
+  // ── step 1: exact inbox copies; failed attempts become durable obligations ──
+  for (const c of selected) {
+    let phase = "read";
+    try {
+      const bytes = fs.readFileSync(c.file);
+      phase = "copy";
+      const head = bytes.subarray(0, HEAD_BYTES).toString("utf8");
       const { kind, track } = classify(head, tracks);
       // The ref's OWN mtime dates the file, not the sweep's clock: the name then
       // states when the report was written, and a re-emit after midnight cannot
@@ -301,48 +395,57 @@ export async function sweep(deps: SweepDeps): Promise<number> {
         kind === "?"
           ? path.join(unclassifiedDir, `${date}-${c.sha}.md`)
           : path.join(inboxDir, `${date}-${track}-${c.sha}.md`);
-      await atomicWrite(dest, bytes ?? Buffer.alloc(0), { sessionId: SESSION_ID });
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      await atomicWrite(dest, bytes, { sessionId: SESSION_ID });
       const shown = dest.startsWith(repoDir + path.sep) ? path.relative(repoDir, dest) : dest;
       lines.push(`NEW ${track} ${kind} ${shown}`);
       cursor.seen[c.sha] = c.mtimeMs;
+    } catch (err) {
+      const errorCode = (err as NodeJS.ErrnoException).code || "UNKNOWN";
+      retries.push({ basename: c.basename, observed_mtime_ms: c.mtimeMs,
+        error_code: errorCode, first_seen_at: c.retry?.first_seen_at ?? new Date(nowMs).toISOString() });
+      const description = phase === "read" ? "unreadable ref" : "inbox write failed for";
+      stderr(`report-sweep: PENDING ${description} ${c.file}: ${errorCode}: ${(err as Error).message}`);
+      if (phase === "copy") result = 3;
     }
-  } catch (err) {
-    stderr(`report-sweep: inbox write failed: ${(err as Error).message}`);
-    return 3; // cursor deliberately NOT advanced — the next sweep re-emits
   }
 
-  // ── step 2: announce ───────────────────────────────────────────────────────
-  for (const line of lines) stdout(line);
-
-  // ── step 3: the cursor, last ───────────────────────────────────────────────
+  // ── step 2: commit seen, retries and discovery together, after the copies ───
   // Pruned to the overlap window: an entry below it can never be re-scanned, so
   // keeping it would grow this file for the lifetime of the workspace.
   const keepFrom = maxMtime - OVERLAP_MS;
-  const seen: Record<string, number> = {};
+  const seen: Record<string, number> = Object.create(null);
   for (const [sha, m] of Object.entries(cursor.seen)) {
     if (m >= keepFrom) seen[sha] = m;
   }
   try {
     await atomicWrite(
       cursorFile,
-      Buffer.from(JSON.stringify({ last_mtime_ms: maxMtime, seen }, null, 2) + "\n"),
+      Buffer.from(JSON.stringify({ version: 2, last_mtime_ms: maxMtime, seen, retries }, null, 2) + "\n"),
       { sessionId: SESSION_ID },
     );
   } catch (err) {
-    stderr(`report-sweep: cursor write failed: ${(err as Error).message}`);
+    // atomicWrite can fail after rename (directory fsync): do not roll back or
+    // assert which cursor reached durable storage. Keep all source/inbox bytes.
+    stderr(`report-sweep: cursor write failed; capture/retry commit uncertain, copies retained: ${(err as Error).message}`);
     return 3;
   }
-  return 0;
+  // NEW is an inbox notification, never a report-acceptance ACK. No success
+  // notification is issued for a cursor commit whose durability is unresolved.
+  for (const line of lines) stdout(line);
+  return result;
 }
 
 /** The subcommand entrypoint. `stateDir`/`nowIso` are the tracker CLI's own. */
-export async function cmdReportSweep(stateDir: string, repoDir: string, nowIso: string): Promise<number> {
+export async function cmdReportSweep(stateDir: string, repoDir: string, nowIso: string,
+  registryScript?: string): Promise<number> {
   const parsed = nowIso ? Date.parse(nowIso) : NaN;
   return sweep({
     stateDir,
     sharedDir: process.env.TELEPTY_SHARED_DIR || path.join(os.homedir(), ".telepty", "shared"),
     nowMs: Number.isFinite(parsed) ? parsed : Date.now(),
     repoDir,
+    registryScript: registryScript || process.env.DISPATCH_REGISTRY_PY || path.join(repoDir, "bin", "dispatch-registry.py"),
     stdout: (l) => process.stdout.write(l + "\n"),
     stderr: (l) => process.stderr.write(l + "\n"),
   });

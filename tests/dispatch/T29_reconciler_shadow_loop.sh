@@ -7,7 +7,14 @@ t_setup; trap t_teardown EXIT
 
 FIX="$REPO_ROOT/tests/fixtures/session-state"
 cp "$FIX/working-spinner.screen" "$STUB_SCREEN_FILE"
-cp "$FIX/claude-connected.info" "$STUB_INFO_FILE"
+# #751: the reconciler's probe call carries no --screen-file, so it reads the CURRENT
+# viewport through bin/current_screen.py. claude-connected.info is the LEGACY minimal
+# info object and establishes none of the binding that path requires — the tick then
+# recorded surface=unknown, which is a fixture transport gap and not a changed
+# reconciler decision. Build the matching bound fixture deliberately (fixture sid, fake
+# uuids, fixture pids, owned stubs) rather than hand the live path a production-shaped
+# identity; the WORKING screen above and every assertion below are unchanged.
+t_current_view sid-A claude
 t_seed_dispatch sid-A dispatched_at="2026-06-06T11:00:00Z" \
   expected_report_by="2026-06-06T11:30:00Z" last_seen_at="2026-06-06T11:00:00Z"
 
@@ -64,5 +71,9 @@ if row["state"].get("surface") != "working":
 if row["action"].get("action") != "NOOP":
     raise SystemExit(f"FAIL: action={row['action'].get('action')!r}, want 'NOOP'")
 PY
+
+# Positive control: surface=working above must have come from the BOUND viewport read,
+# not from a probe that never reached a screen and happened to agree.
+t_assert_current_view_read T29
 
 echo "T29 PASS"

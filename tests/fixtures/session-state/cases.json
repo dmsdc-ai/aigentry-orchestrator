@@ -4,71 +4,2551 @@
     "screen": "codex-init-spinner.screen",
     "info": "codex-connected.info",
     "status": "in_flight",
-    "expect_state": {"surface": "working", "activity": "moving", "cli": "codex", "ready": false},
-    "expect_detail": {"tracker_class": "active"},
-    "expect_action": {"action": "NOOP", "status": "in_flight"}
+    "expect_state": {
+      "surface": "working",
+      "activity": "moving",
+      "cli": "codex",
+      "ready": false
+    },
+    "expect_detail": {
+      "tracker_class": "active"
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
   },
   {
     "name": "codex-mcp-boot-ready",
     "screen": "codex-mcp-boot.screen",
     "info": "codex-connected.info",
     "status": "in_flight",
-    "expect_state": {"surface": "working", "activity": "moving", "cli": "codex", "ready": true},
-    "expect_detail": {"ready_reason": "prompt", "tracker_class": "prompt_observed"},
-    "expect_action": {"action": "NOOP", "status": "in_flight"}
+    "expect_state": {
+      "surface": "working",
+      "activity": "moving",
+      "cli": "codex",
+      "ready": true
+    },
+    "expect_detail": {
+      "ready_reason": "prompt",
+      "tracker_class": "prompt_observed"
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
   },
   {
     "name": "unsubmitted-context-ref",
     "screen": "unsubmitted-context-ref.screen",
     "info": "codex-connected.info",
     "status": "in_flight",
-    "expect_state": {"surface": "unsubmitted", "activity": "static", "cli": "codex", "ready": false},
-    "expect_detail": {"tracker_class": "active"},
-    "expect_action": {"action": "RESUBMIT_ENTER", "status": "in_flight", "key": "enter"}
+    "expect_state": {
+      "surface": "unsubmitted",
+      "activity": "static",
+      "cli": "codex",
+      "ready": false
+    },
+    "expect_detail": {
+      "tracker_class": "active"
+    },
+    "expect_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "in_flight",
+      "key": "enter"
+    }
   },
   {
     "name": "thinking-block-400",
     "screen": "thinking-block-400.screen",
     "info": "claude-connected.info",
     "status": "in_flight",
-    "expect_state": {"surface": "thinking_block", "activity": "static", "cli": "claude", "ready": false},
-    "expect_detail": {"tracker_class": "error"},
-    "expect_action": {"action": "RESPAWN", "status": "respawn_requested"}
+    "expect_state": {
+      "surface": "thinking_block",
+      "activity": "static",
+      "cli": "claude",
+      "ready": false
+    },
+    "expect_detail": {
+      "tracker_class": "error"
+    },
+    "expect_action": {
+      "action": "RESPAWN",
+      "status": "respawn_requested"
+    }
   },
   {
     "name": "trust-modal",
     "screen": "trust-modal.screen",
     "info": "claude-connected.info",
     "status": "in_flight",
-    "expect_state": {"surface": "modal", "activity": "static", "cli": "claude", "ready": false},
-    "expect_detail": {"tracker_class": "welcome"},
-    "expect_action": {"action": "SEND_KEY", "status": "in_flight", "key": "enter"}
+    "expect_state": {
+      "surface": "modal",
+      "activity": "static",
+      "cli": "claude",
+      "ready": false
+    },
+    "expect_detail": {
+      "tracker_class": "welcome"
+    },
+    "expect_action": {
+      "action": "SEND_KEY",
+      "status": "in_flight",
+      "key": "enter"
+    }
   },
   {
     "name": "raw-shell",
     "screen": "raw-shell.screen",
     "info": "claude-connected.info",
     "status": "in_flight",
-    "expect_state": {"surface": "raw_shell", "activity": "static", "cli": "claude", "ready": false},
-    "expect_detail": {"tracker_class": "blank"},
-    "expect_action": {"action": "REDISPATCH", "status": "re_dispatched"}
+    "expect_state": {
+      "surface": "raw_shell",
+      "activity": "static",
+      "cli": "claude",
+      "ready": false
+    },
+    "expect_detail": {
+      "tracker_class": "blank"
+    },
+    "expect_action": {
+      "action": "REDISPATCH",
+      "status": "re_dispatched"
+    }
   },
   {
     "name": "working-spinner",
     "screen": "working-spinner.screen",
     "info": "claude-connected.info",
     "status": "in_flight",
-    "expect_state": {"surface": "working", "activity": "moving", "cli": "claude", "ready": false},
-    "expect_detail": {"tracker_class": "blank"},
-    "expect_action": {"action": "NOOP", "status": "in_flight"}
+    "expect_state": {
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude",
+      "ready": false
+    },
+    "expect_detail": {
+      "tracker_class": "blank"
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
   },
   {
     "name": "idle-holding",
     "screen": "idle-holding.screen",
     "info": "claude-connected.info",
     "status": "in_flight",
-    "expect_state": {"surface": "idle", "activity": "static", "cli": "claude", "ready": true},
-    "expect_detail": {"tracker_class": "prompt_observed"},
-    "expect_action": {"action": "NOOP", "status": "in_flight"}
+    "expect_state": {
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude",
+      "ready": true
+    },
+    "expect_detail": {
+      "tracker_class": "prompt_observed"
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-top-connected-active",
+    "screen": "working-spinner.screen",
+    "info": "health-top-connected.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": true,
+      "verify_problems": []
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "NOOP",
+      "status": "verified"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-top-connected-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-top-connected.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": true,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-top-case-active",
+    "screen": "working-spinner.screen",
+    "info": "health-top-case.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "cOnNeCtEd",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": true,
+      "verify_problems": []
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "NOOP",
+      "status": "verified"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-top-case-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-top-case.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": true,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "cOnNeCtEd",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-nested-connected-active",
+    "screen": "working-spinner.screen",
+    "info": "health-nested-connected.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": true,
+      "verify_problems": []
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "NOOP",
+      "status": "verified"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-nested-connected-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-nested-connected.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": true,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-nested-case-active",
+    "screen": "working-spinner.screen",
+    "info": "health-nested-case.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "connected",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": true,
+      "verify_problems": []
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "NOOP",
+      "status": "verified"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-nested-case-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-nested-case.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": true,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "connected",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-string-0-active",
+    "screen": "working-spinner.screen",
+    "info": "health-string-0.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "DISCONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport DISCONNECTED (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "REDISPATCH",
+      "status": "re_dispatched"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-string-0-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-string-0.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "DISCONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport DISCONNECTED (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "REDISPATCH",
+      "status": "re_dispatched"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-string-1-active",
+    "screen": "working-spinner.screen",
+    "info": "health-string-1.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "disconnected",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport disconnected (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "REDISPATCH",
+      "status": "re_dispatched"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-string-1-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-string-1.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "disconnected",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport disconnected (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "REDISPATCH",
+      "status": "re_dispatched"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-string-2-active",
+    "screen": "working-spinner.screen",
+    "info": "health-string-2.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "STALE",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport STALE (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-string-2-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-string-2.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "STALE",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport STALE (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-string-3-active",
+    "screen": "working-spinner.screen",
+    "info": "health-string-3.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "UPSTREAM_STALLED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport UPSTREAM_STALLED (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-string-3-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-string-3.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "UPSTREAM_STALLED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport UPSTREAM_STALLED (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-string-4-active",
+    "screen": "working-spinner.screen",
+    "info": "health-string-4.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "OWNER_CONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport OWNER_CONNECTED (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-string-4-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-string-4.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "OWNER_CONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport OWNER_CONNECTED (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-string-5-active",
+    "screen": "working-spinner.screen",
+    "info": "health-string-5.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "UNKNOWN",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport UNKNOWN (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-string-5-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-string-5.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "UNKNOWN",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport UNKNOWN (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-string-6-active",
+    "screen": "working-spinner.screen",
+    "info": "health-string-6.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED_EXTRA",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport CONNECTED_EXTRA (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-string-6-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-string-6.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED_EXTRA",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport CONNECTED_EXTRA (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-string-7-active",
+    "screen": "working-spinner.screen",
+    "info": "health-string-7.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "XCONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport XCONNECTED (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-string-7-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-string-7.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "XCONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport XCONNECTED (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-string-8-active",
+    "screen": "working-spinner.screen",
+    "info": "health-string-8.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": " CONNECTED ",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  CONNECTED  (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-string-8-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-string-8.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": " CONNECTED ",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  CONNECTED  (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-string-9-active",
+    "screen": "working-spinner.screen",
+    "info": "health-string-9.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED\n",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport CONNECTED\n (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-string-9-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-string-9.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED\n",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport CONNECTED\n (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-missing-active",
+    "screen": "working-spinner.screen",
+    "info": "health-missing.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-missing-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-missing.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-null-active",
+    "screen": "working-spinner.screen",
+    "info": "health-null.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-null-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-null.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-false-active",
+    "screen": "working-spinner.screen",
+    "info": "health-false.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-false-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-false.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-zero-active",
+    "screen": "working-spinner.screen",
+    "info": "health-zero.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-zero-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-zero.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-number-active",
+    "screen": "working-spinner.screen",
+    "info": "health-number.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-number-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-number.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-true-active",
+    "screen": "working-spinner.screen",
+    "info": "health-true.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-true-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-true.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-list-active",
+    "screen": "working-spinner.screen",
+    "info": "health-list.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-list-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-list.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-object-active",
+    "screen": "working-spinner.screen",
+    "info": "health-object.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-object-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-object.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-nested-disconnected-active",
+    "screen": "working-spinner.screen",
+    "info": "health-nested-disconnected.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "DISCONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport DISCONNECTED (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "REDISPATCH",
+      "status": "re_dispatched"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-nested-disconnected-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-nested-disconnected.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "DISCONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport DISCONNECTED (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "REDISPATCH",
+      "status": "re_dispatched"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-nested-malformed-active",
+    "screen": "working-spinner.screen",
+    "info": "health-nested-malformed.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-nested-malformed-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-nested-malformed.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-fallback-0-active",
+    "screen": "working-spinner.screen",
+    "info": "health-fallback-0.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": true,
+      "verify_problems": []
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "NOOP",
+      "status": "verified"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-fallback-0-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-fallback-0.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": true,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-fallback-1-active",
+    "screen": "working-spinner.screen",
+    "info": "health-fallback-1.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": true,
+      "verify_problems": []
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "NOOP",
+      "status": "verified"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-fallback-1-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-fallback-1.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": true,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-fallback-2-active",
+    "screen": "working-spinner.screen",
+    "info": "health-fallback-2.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": true,
+      "verify_problems": []
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "NOOP",
+      "status": "verified"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-fallback-2-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-fallback-2.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": true,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-fallback-3-active",
+    "screen": "working-spinner.screen",
+    "info": "health-fallback-3.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": true,
+      "verify_problems": []
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "NOOP",
+      "status": "verified"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-fallback-3-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-fallback-3.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": true,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-fallback-4-active",
+    "screen": "working-spinner.screen",
+    "info": "health-fallback-4.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": true,
+      "verify_problems": []
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "NOOP",
+      "status": "verified"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-fallback-4-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-fallback-4.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": true,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-fallback-5-active",
+    "screen": "working-spinner.screen",
+    "info": "health-fallback-5.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": true,
+      "verify_problems": []
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "NOOP",
+      "status": "verified"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-fallback-5-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-fallback-5.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": true,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-primary-unknown-active",
+    "screen": "working-spinner.screen",
+    "info": "health-primary-unknown.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "UNKNOWN",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport UNKNOWN (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-primary-unknown-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-primary-unknown.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "UNKNOWN",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport UNKNOWN (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-primary-malformed-active",
+    "screen": "working-spinner.screen",
+    "info": "health-primary-malformed.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  (not CONNECTED)"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-primary-malformed-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-primary-malformed.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": false,
+      "ready": false,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "transport  (not CONNECTED)",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "ESCALATE",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-primary-positive-active",
+    "screen": "working-spinner.screen",
+    "info": "health-primary-positive.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": false,
+      "surface": "working",
+      "activity": "moving",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": true,
+      "verify_problems": []
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "NOOP",
+      "status": "verified"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-primary-positive-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-primary-positive.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": true,
+      "surface": "idle",
+      "activity": "static",
+      "cli": "claude"
+    },
+    "expect_detail": {
+      "health": "CONNECTED",
+      "transport_ready": true,
+      "bootstrap_ready": true,
+      "verify_started": false,
+      "verify_problems": [
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-transport-not-ready-active",
+    "screen": "working-spinner.screen",
+    "info": "health-transport-not-ready.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": false,
+      "surface": "working"
+    },
+    "expect_detail": {
+      "verify_started": false,
+      "verify_problems": [
+        "not ready / bootstrap not ready"
+      ]
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-transport-not-ready-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-transport-not-ready.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": false,
+      "surface": "idle"
+    },
+    "expect_detail": {
+      "verify_started": false,
+      "verify_problems": [
+        "not ready / bootstrap not ready",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-bootstrap-not-ready-active",
+    "screen": "working-spinner.screen",
+    "info": "health-bootstrap-not-ready.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": false,
+      "surface": "working"
+    },
+    "expect_detail": {
+      "verify_started": false,
+      "verify_problems": [
+        "not ready / bootstrap not ready"
+      ]
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "ESCALATE",
+      "status": "verify_started"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
+  },
+  {
+    "name": "health-bootstrap-not-ready-idle",
+    "screen": "idle-holding.screen",
+    "info": "health-bootstrap-not-ready.info",
+    "status": "in_flight",
+    "expect_state": {
+      "alive": true,
+      "ready": false,
+      "surface": "idle"
+    },
+    "expect_detail": {
+      "verify_started": false,
+      "verify_problems": [
+        "not ready / bootstrap not ready",
+        "no working spinner (idle/static) [not-moving]"
+      ]
+    },
+    "expect_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    },
+    "expect_verify_action": {
+      "action": "RESUBMIT_ENTER",
+      "status": "verify_started",
+      "key": "enter"
+    },
+    "expect_tracker_action": {
+      "action": "NOOP",
+      "status": "in_flight"
+    }
   }
 ]

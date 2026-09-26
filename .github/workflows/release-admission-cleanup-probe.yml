@@ -1,0 +1,42 @@
+name: Release admission cleanup observation
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - tests/diagnostics/release-admission-cleanup-probe.mjs
+      - .github/workflows/release-admission-cleanup-probe.yml
+      - tests/packaging/release-admission.test.mjs
+      - scripts/release-admission.mjs
+
+permissions:
+  contents: read
+
+jobs:
+  observe:
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Initialize incomplete receipt
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p .release-admission-cleanup-receipt
+          printf '%s\n' '{"status":"INCOMPLETE","observation":"not started","os_fork_filesystem":"UNAVAILABLE","full_suite_acceptance":false}' > .release-admission-cleanup-receipt/receipt.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.20.2
+      - name: Observe selected cases once (60 second deadline)
+        run: node tests/diagnostics/release-admission-cleanup-probe.mjs
+      - name: Upload bounded sanitized receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-admission-cleanup-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .release-admission-cleanup-receipt/receipt.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7

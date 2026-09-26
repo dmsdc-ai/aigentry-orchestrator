@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Stub `cmux` for tests/dispatch. DETERMINISTIC FAKE DATA ONLY — it never execs, wraps
+# or falls back to a real cmux, and it answers only the two READ-ONLY verbs
+# bin/current_screen.py calls, for the ONE workspace/surface pair the fixture bound.
+# Every other target, verb or flag shape is refused non-zero with empty stdout, so a
+# mis-bound read fails CLOSED exactly as the adapter requires (see the ScreenUnavailable
+# arms in bin/current_screen.py). Installed by lib.sh's t_current_view, never by t_setup.
+#
+# Driven by env exported from lib.sh:
+#   STUB_CMUX_WORKSPACE / _SURFACE / _WINDOW / _PANE — bound fake UUIDs
+#   STUB_CMUX_TTY                                    — bound fake tty name (matches stubs/ps)
+#   STUB_CMUX_SURFACE_TYPE                           — "terminal"; override for a negative control
+#   STUB_SCREEN_FILE                                 — viewport text served by read-screen
+#   STUB_CMUX_SCREEN_FILE                            — OPTIONAL override of the line above;
+#       unset/empty keeps the existing behaviour for every guard. It exists because
+#       $STUB_SCREEN_FILE is ALSO the legacy `telepty read-screen` ring (stubs/telepty), and
+#       a guard that must show the two transports DIFFERENT text — T5's stale historical
+#       scrollback versus a genuinely idle live viewport — cannot do that while one file
+#       feeds both. Setting it decouples the bound CURRENT viewport from the history and
+#       changes nothing else: same binding, same refusals, same tripwire log.
+#   STUB_CMUX_LOG                                    — invocation record (tripwire / positive control)
+set -u
+
+if [ -n "${STUB_CMUX_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$STUB_CMUX_LOG"
+fi
+
+json=0 verb="" ws="" surface=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json)      json=1; shift;;
+    --id-format) shift 2;;
+    --workspace) ws="${2:-}"; shift 2;;
+    --surface)   surface="${2:-}"; shift 2;;
+    --*)         shift;;
+    -*)          shift;;
+    *)           [ -n "$verb" ] || verb="$1"; shift;;
+  esac
+done
+
+# The adapter always asks for JSON with uuid ids. Anything else is not a shape this
+# fixture claims to model, and a fixture that answers a shape it does not model is how a
+# stub starts inventing production behaviour.
+[ "$json" = 1 ] || exit 3
+
+case "$verb" in
+  tree)
+    [ -n "$ws" ] && [ "$ws" = "${STUB_CMUX_WORKSPACE:-}" ] || exit 4
+    printf '{"windows":[{"id":"%s","workspaces":[{"id":"%s","panes":[{"id":"%s","surfaces":[{"id":"%s","type":"%s","tty":"%s"}]}]}]}]}\n' \
+      "${STUB_CMUX_WINDOW:?}" "${STUB_CMUX_WORKSPACE:?}" "${STUB_CMUX_PANE:?}" \
+      "${STUB_CMUX_SURFACE:?}" "${STUB_CMUX_SURFACE_TYPE:-terminal}" "${STUB_CMUX_TTY:?}"
+    ;;
+  read-screen)
+    [ -n "$ws" ] && [ "$ws" = "${STUB_CMUX_WORKSPACE:-}" ] || exit 4
+    [ -n "$surface" ] && [ "$surface" = "${STUB_CMUX_SURFACE:-}" ] || exit 4
+    # python3 only to JSON-escape the fixture's own text; the ids come from the binding.
+    # No scrollback concept exists here: the bound file IS the current viewport.
+    python3 -c 'import json, os, sys
+# The bound CURRENT viewport: STUB_CMUX_SCREEN_FILE when a guard decoupled it, otherwise
+# STUB_SCREEN_FILE exactly as before. Absent/empty override == existing behaviour.
+path = os.environ.get("STUB_CMUX_SCREEN_FILE") or os.environ.get("STUB_SCREEN_FILE", "")
+text = ""
+if path:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError:
+        text = ""
+json.dump({"workspace_id": os.environ["STUB_CMUX_WORKSPACE"],
+           "surface_id": os.environ["STUB_CMUX_SURFACE"],
+           "window_id": os.environ["STUB_CMUX_WINDOW"],
+           "text": text}, sys.stdout, ensure_ascii=False)
+sys.stdout.write("\n")' || exit 6
+    ;;
+  *)
+    exit 5
+    ;;
+esac
+exit 0

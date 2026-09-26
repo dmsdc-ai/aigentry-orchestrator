@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "release_group": "release-1171",
+  "tasks": [
+    {
+      "id": 328,
+      "release_component": "context-budget"
+    },
+    {
+      "id": 404,
+      "release_component": "installed-parity"
+    },
+    {
+      "id": 526,
+      "release_component": "ecosystem-efficiency"
+    },
+    {
+      "id": 652,
+      "release_component": "worker-confinement"
+    },
+    {
+      "id": 796,
+      "release_component": "approval-resume"
+    },
+    {
+      "id": 836,
+      "release_component": "approval-lifecycle"
+    },
+    {
+      "id": 888,
+      "release_component": "approval-transport"
+    },
+    {
+      "id": 974,
+      "release_component": "session-cleaner"
+    },
+    {
+      "id": 1136,
+      "release_component": "workflow-runtime"
+    },
+    {
+      "id": 1148,
+      "release_component": "adaptive-routing"
+    },
+    {
+      "id": 1150,
+      "release_component": "task-admission"
+    },
+    {
+      "id": 1151,
+      "release_component": "task-loop"
+    },
+    {
+      "id": 1157,
+      "release_component": "voice-code-core"
+    },
+    {
+      "id": 1158,
+      "release_component": "voice-code-connectors"
+    },
+    {
+      "id": 1159,
+      "release_component": "voice-code-ui"
+    },
+    {
+      "id": 1161,
+      "release_component": "task-advisor"
+    },
+    {
+      "id": 1162,
+      "release_component": "terminal-metadata"
+    },
+    {
+      "id": 1164,
+      "release_component": "knowledge-benchmark"
+    },
+    {
+      "id": 1165,
+      "release_component": "knowledge-platform"
+    },
+    {
+      "id": 1166,
+      "release_component": "request-continuity"
+    },
+    {
+      "id": 1167,
+      "release_component": "platform-gates"
+    },
+    {
+      "id": 1169,
+      "release_component": "installed-parity"
+    },
+    {
+      "id": 1170,
+      "release_component": "scoped-telepty"
+    },
+    {
+      "id": 1171,
+      "release_component": "integrated-release"
+    },
+    {
+      "id": 1172,
+      "release_component": "tool-efficiency"
+    },
+    {
+      "id": 1173,
+      "release_component": "knowledge-session"
+    },
+    {
+      "id": 1175,
+      "release_component": "telepty-issue-triage"
+    },
+    {
+      "id": 1177,
+      "release_component": "public-interface-proposal"
+    },
+    {
+      "id": 1178,
+      "release_component": "execution-surface-routing"
+    },
+    {
+      "id": 1179,
+      "release_component": "integration-assessment"
+    }
+  ]
+}
