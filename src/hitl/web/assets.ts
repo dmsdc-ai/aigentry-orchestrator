@@ -9,11 +9,11 @@ export const html = `<!doctype html>
 <p id="operation">Advisor: default on · Observation unknown · Loop: activation unverified</p>
 <form id="filters" class="toolbar"><label for="query">Task ID</label><input id="query" maxlength="80" pattern="[A-Za-z0-9_-]*" type="search"><label for="state">Recorded status</label><select id="state"><option value="">All</option><option>pending</option><option>queued</option><option>delegated</option><option>in_progress</option><option>blocked</option><option>blocked-by-observation</option><option>done</option><option>completed</option><option>failed</option><option>cancelled</option><option>superseded</option><option>unknown</option></select><button type="submit">Apply</button></form>
 <div id="legacy" hidden><p>Legacy approvals · Unbound to project, task, and attempt · Decisions disabled</p><button id="pending" aria-pressed="true">Pending</button><button id="history" aria-pressed="false">History</button></div>
-<p id="coverage"></p><div class="content"><section aria-label="Records"><ul id="requests" aria-label="Records"></ul><button id="more" hidden>Next page</button></section>
+<p id="coverage"></p><div class="content"><section aria-label="Records"><div id="tasks-scroll" class="table-scroll" role="region" aria-labelledby="tasks-caption" tabindex="0" hidden><table id="tasks"><caption id="tasks-caption">Authorized tasks in the selected project · Recorded status only; execution and acceptance unknown</caption><thead><tr><th scope="col">Task ID</th><th scope="col">Recorded status</th><th scope="col">Execution evidence</th><th scope="col">Source updated</th></tr></thead><tbody id="task-rows"></tbody></table></div><ul id="requests" aria-label="Records"></ul><button id="more" hidden>Next page</button></section>
 <section id="detail" aria-label="Record details" hidden><button id="back">← Back to list</button><h2 tabindex="-1" id="detail-title">Details</h2><dl id="fields"></dl></section></div>
 </section></main></body></html>`;
 
-export const css = `:root{font-family:system-ui,sans-serif;color:#242a30;background:#f7f8fa;font-size:16px}*{box-sizing:border-box;min-width:0}body{margin:0}main{max-width:1440px;margin:auto;padding:20px}header{display:flex;align-items:center;flex-wrap:wrap;gap:16px;border-bottom:1px solid #ccd2d9;padding-bottom:12px}h1{font-size:1.25rem;margin:0}h2{font-size:1.1rem}header span,#operation,#coverage{color:#535d68;font-size:.875rem}header button{margin-left:auto}p,dd,li,button,summary{overflow-wrap:anywhere}button,input,select,summary{font:inherit;min-height:44px;max-width:100%}button,input,select{border:1px solid #89939f;border-radius:4px;padding:8px 12px;background:#fff;color:inherit}button{cursor:pointer}button:disabled{cursor:default;opacity:.65}button[aria-pressed=true]{background:#e7edf9;border-color:#365c9d;color:#183a70}button:hover{background:#edf1f6}button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:3px solid #365c9d;outline-offset:3px}nav,.toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:16px 0}nav{border-bottom:1px solid #ccd2d9;padding-bottom:12px}label{font-weight:600;font-size:.875rem}input{width:12rem}select{width:14rem}#auth{padding:12px 0}#auth details{margin-top:12px}summary{cursor:pointer;padding:10px 0}#auth label{display:block}#status{padding:12px;border-left:3px solid #8b681a;background:#fcf5e5}#status[data-state=forbidden],#status[data-state=error]{border-color:#a93636;background:#fbeeee}#status[data-state=ready]{border-color:#3c7055;background:#edf5ef}.content{display:grid;grid-template-columns:minmax(0,1fr);gap:24px}ul{padding:0;list-style:none;margin:0}li{border-bottom:1px solid #ccd2d9}li button{border:0;border-radius:0;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,1fr);width:100%;gap:12px;text-align:left;padding:14px 8px;background:transparent}li strong{font-weight:600}li small{color:#535d68}#detail{border-top:1px solid #ccd2d9;padding-top:12px}dl{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,2fr);gap:12px}dt{font-weight:600;overflow-wrap:anywhere}dd{margin:0;white-space:pre-wrap}#more{margin-top:16px}[hidden]{display:none!important}@media(min-width:1100px){.content:has(#detail:not([hidden])){grid-template-columns:minmax(0,3fr) minmax(0,2fr)}#detail{border-top:0;border-left:1px solid #ccd2d9;padding:0 0 0 20px}}@media(max-width:600px){main{padding:12px}nav button{flex:1 1 9rem}.toolbar{align-items:stretch}.toolbar label{flex-basis:100%}.toolbar input,.toolbar select{width:100%}li button{grid-template-columns:minmax(0,1fr)}dl{grid-template-columns:minmax(0,1fr);gap:6px}dd{margin-bottom:10px}header{gap:8px}}`;
+export const css = `:root{font-family:system-ui,sans-serif;color:#242a30;background:#f7f8fa;font-size:16px}*{box-sizing:border-box;min-width:0}body{margin:0}main{max-width:1440px;margin:auto;padding:20px}header{display:flex;align-items:center;flex-wrap:wrap;gap:16px;border-bottom:1px solid #ccd2d9;padding-bottom:12px}h1{font-size:1.25rem;margin:0}h2{font-size:1.1rem}header span,#operation,#coverage{color:#535d68;font-size:.875rem}header button{margin-left:auto}p,dd,li,button,summary{overflow-wrap:anywhere}button,input,select,summary{font:inherit;min-height:44px;max-width:100%}button,input,select{border:1px solid #89939f;border-radius:4px;padding:8px 12px;background:#fff;color:inherit}button{cursor:pointer}button:disabled{cursor:default;opacity:.65}button[aria-pressed=true]{background:#e7edf9;border-color:#365c9d;color:#183a70}button:hover{background:#edf1f6}button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:3px solid #365c9d;outline-offset:3px}nav,.toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:16px 0}nav{border-bottom:1px solid #ccd2d9;padding-bottom:12px}label{font-weight:600;font-size:.875rem}input{width:12rem}select{width:14rem}#auth{padding:12px 0}#auth details{margin-top:12px}summary{cursor:pointer;padding:10px 0}#auth label{display:block}#status{padding:12px;border-left:3px solid #8b681a;background:#fcf5e5}#status[data-state=forbidden],#status[data-state=error]{border-color:#a93636;background:#fbeeee}#status[data-state=ready]{border-color:#3c7055;background:#edf5ef}.content{display:grid;grid-template-columns:minmax(0,1fr);gap:24px}ul{padding:0;list-style:none;margin:0}li{border-bottom:1px solid #ccd2d9}li button{border:0;border-radius:0;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,1fr);width:100%;gap:12px;text-align:left;padding:14px 8px;background:transparent}li strong{font-weight:600}li small{color:#535d68}.table-scroll{overflow-x:auto}.table-scroll:focus-visible{outline:3px solid #365c9d;outline-offset:2px}table{border-collapse:collapse;table-layout:fixed;width:100%;min-width:32rem}caption{text-align:left;color:#535d68;font-size:.875rem;padding:0 8px 10px}th,td{text-align:left;vertical-align:top;padding:12px 8px;border-bottom:1px solid #ccd2d9;overflow-wrap:anywhere}thead th{color:#535d68;font-size:.875rem;font-weight:600}thead th:nth-child(1){width:24%}thead th:nth-child(2){width:20%}thead th:nth-child(3){width:22%}thead th:nth-child(4){width:34%}tbody th{padding:0;font-weight:600}tbody th button{border:0;border-radius:0;width:100%;text-align:left;padding:12px 8px;background:transparent;font-weight:inherit}#detail{border-top:1px solid #ccd2d9;padding-top:12px}dl{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,2fr);gap:12px}dt{font-weight:600;overflow-wrap:anywhere}dd{margin:0;white-space:pre-wrap}#more{margin-top:16px}[hidden]{display:none!important}@media(min-width:1100px){.content:has(#detail:not([hidden])){grid-template-columns:minmax(0,3fr) minmax(0,2fr)}#detail{border-top:0;border-left:1px solid #ccd2d9;padding:0 0 0 20px}}@media(max-width:600px){main{padding:12px}nav button{flex:1 1 9rem}.toolbar{align-items:stretch}.toolbar label{flex-basis:100%}.toolbar input,.toolbar select{width:100%}li button{grid-template-columns:minmax(0,1fr)}caption{padding:0 0 10px}th,td{padding:10px 6px}tbody th button{padding:10px 6px}dl{grid-template-columns:minmax(0,1fr);gap:6px}dd{margin-bottom:10px}header{gap:8px}}`;
 
 export const js = String.raw`'use strict';
 const el = id => document.getElementById(id);
@@ -21,7 +21,7 @@ let busy = false, queued = false, timer = null, failures = 0, next = null, pageC
 let configured = false, legacyView = 'pending', loggedIn = false, capability = null;
 let lastFetch = null, previousRoute = '', focusDetail = false, retryDelay = null, lastSelected = null, restoreFocus = false;
 function status(message, state) { el('status').textContent = message; el('status').dataset.state = state; }
-function clearPrivate() { el('requests').replaceChildren(); el('fields').replaceChildren(); el('detail').hidden = true; el('coverage').textContent = ''; el('more').hidden = true; next = null; pageCursor = null; lastFetch = null; }
+function clearPrivate() { el('task-rows').replaceChildren(); el('tasks-scroll').hidden = true; el('requests').replaceChildren(); el('fields').replaceChildren(); el('detail').hidden = true; el('coverage').textContent = ''; el('more').hidden = true; next = null; pageCursor = null; lastFetch = null; }
 function route() {
   const match = /^#\/projects\/([A-Za-z0-9_-]+)\/(tasks|requests|releases|approvals)(?:\/([A-Za-z0-9_-]+))?$/.exec(location.hash);
   return match ? { project: match[1], view: match[2], id: match[3] || null } : { project: el('project').value, view: 'tasks', id: null };
@@ -64,10 +64,13 @@ function renderDetail(row, legacy) {
   if (focusDetail) { el('detail-title').focus(); focusDetail = false; }
 }
 function renderRows(data, legacy, current, append) {
-  if (!append) el('requests').replaceChildren();
+  // Configured tasks are a semantic table; legacy approvals and the other configured views keep the list.
+  const table = !legacy && current.view === 'tasks';
+  if (!append) { el('task-rows').replaceChildren(); el('requests').replaceChildren(); }
   for (const row of data.items) {
-    const li = document.createElement('li'), button = document.createElement('button');
+    const button = document.createElement('button'), selected = legacy ? row.id : row.taskId;
     if (legacy) button.textContent = row.id + ' — ' + row.question;
+    else if (table) button.textContent = 'Task ' + row.taskId;
     else {
       const title = document.createElement('strong'), state = document.createElement('span'), observation = document.createElement('small');
       title.textContent = 'Task ' + row.taskId;
@@ -75,10 +78,19 @@ function renderRows(data, legacy, current, append) {
       observation.textContent = 'Source updated: ' + (row.updatedAt || 'unknown');
       button.append(title, state, observation);
     }
-    button.addEventListener('click', () => { focusDetail = true; lastSelected = legacy ? row.id : row.taskId; navigate(current.view, lastSelected); });
-    li.append(button); el('requests').append(li);
-    if (restoreFocus && lastSelected === (legacy ? row.id : row.taskId)) button.focus();
+    button.addEventListener('click', () => { focusDetail = true; lastSelected = selected; navigate(current.view, selected); });
+    if (table) {
+      // The row header carries the keyboard-accessible detail command; the remaining cells stay text-only.
+      const tr = document.createElement('tr'), header = document.createElement('th');
+      header.scope = 'row'; header.append(button); tr.append(header);
+      for (const value of [row.recordedStatus, row.observedAt || 'unknown until observed', row.updatedAt || 'unknown']) {
+        const cell = document.createElement('td'); cell.textContent = value; tr.append(cell);
+      }
+      el('task-rows').append(tr);
+    } else { const li = document.createElement('li'); li.append(button); el('requests').append(li); }
+    if (restoreFocus && lastSelected === selected) button.focus();
   }
+  el('tasks-scroll').hidden = !table || !el('task-rows').children.length;
   if (restoreFocus && document.activeElement === document.body) el('refresh').focus();
   restoreFocus = false;
   next = data.nextCursor; el('more').hidden = !next;

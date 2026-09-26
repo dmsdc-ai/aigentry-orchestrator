@@ -21,6 +21,11 @@ export const CONSOLE_IDS = [
   'console-views-unavailable', 'console-views-ui', 'console-detail', 'console-deep-link',
   'console-reload-deep-link', 'console-no-leak', 'console-inert-markup', 'console-state-cleared',
   'console-single-flight', 'console-hidden-pause', 'console-responsive', 'console-artifacts',
+  // Task #1177: the configured `tasks` view became a native table. The list-shaped coverage
+  // above is adapted in place rather than replaced; this id carries only what is genuinely
+  // new - table/caption/column-header semantics, row-header keyboard reach, the bounded
+  // scroller region, and the empty-table state.
+  'console-task-table',
 ];
 const MAX_PNG = 2 * 1024 * 1024, MAX_RECEIPT = 64 * 1024, MAX_ARTIFACTS = 8 * 1024 * 1024;
 const HIDDEN_WINDOW_MS = 18000;
@@ -75,7 +80,10 @@ export const CONSOLE_OPS = ['not-started',
   'rv-screenshot', 'rv-png-size', 'rv-secret-scan', 'rv-write', 'rv-reset', 'rv-names', 'rv-mark',
   'sc-open-detail', 'sc-detail-wait', 'sc-settled', 'sc-logout-click', 'sc-signed-out-wait',
   'sc-workspace-hidden', 'sc-rows-cleared', 'sc-fields-cleared', 'sc-logout-hidden',
-  'sc-revoked-tasks', 'sc-revoked-projects', 'sc-clean-dom', 'sc-mark'];
+  'sc-revoked-tasks', 'sc-revoked-projects', 'sc-clean-dom', 'sc-mark',
+  // Task #1177 table stage, same closed-enum discipline as every name above.
+  'tt-semantics', 'tt-headers', 'tt-cells', 'tt-keyboard', 'tt-region', 'tt-restore', 'tt-mark',
+  'rv-column-reach'];
 let currentOp = 'not-started';
 export const consoleOp = () => currentOp;
 export function setConsoleOp(name) {
@@ -196,7 +204,10 @@ const PROBE = input => {
     statusClass: node ? (pair ? pair[1] : 'other') : 'absent',
     statusState: node ? (input.states.includes(state) ? state : 'unknown') : 'absent',
     workspaceHidden: hidden('#workspace'), authHidden: hidden('#auth'), logoutHidden: hidden('#logout'),
-    rows: count('#requests li'), projectOptions: count('#project option'),
+    // The configured `tasks` view this probe runs in renders table rows, not list items, so
+    // the row count is read from the table body. `deriveLoginBoundary` still compares it to
+    // 25 and still reports `workspace-rows-mismatch`; only the selector follows the markup.
+    rows: count('#task-rows tr'), projectOptions: count('#project option'),
   };
 };
 // Pure and total, so the printed line can be re-derived by hand. Precedence follows the
@@ -957,12 +968,80 @@ async function leakControls(deps, fixtures) {
   }
   const dom = await page.evaluate(() => document.body.innerHTML);
   check(forbidden.every(value => !dom.includes(value)) && !dom.includes('B001'));
+  // Task #1177: the table must not carry a row, cell or node that exists but is not shown.
+  // A hidden row, an aria-hidden cell, a template or a title/note/prompt attribute would all
+  // leak the existence - or the content - of records the projection deliberately withholds.
+  const table = await page.evaluate(() => {
+    const rows = [...document.querySelectorAll('#task-rows tr')];
+    const cells = [...document.querySelectorAll('#tasks th, #tasks td')];
+    return { rows: rows.length,
+      hiddenRows: rows.filter(row => row.hidden || row.getClientRects().length === 0).length,
+      dataCells: document.querySelectorAll('#task-rows td').length,
+      rowHeaders: document.querySelectorAll('#task-rows th').length,
+      concealed: document.querySelectorAll('#tasks [hidden], #tasks [aria-hidden=true], #tasks template, #tasks script').length,
+      titled: cells.filter(cell => cell.hasAttribute('title') || cell.hasAttribute('data-title')
+        || cell.hasAttribute('data-note') || cell.hasAttribute('data-prompt')).length };
+  });
+  check(table.rows === 25 && table.hiddenRows === 0 && table.concealed === 0 && table.titled === 0);
+  // Exactly one row header and three data cells per row: no spare cell is carrying anything.
+  check(table.rowHeaders === table.rows && table.dataCells === table.rows * 3);
   mark(deps, 'console-no-leak');
 }
 
-const rowTexts = page => page.$$eval('#requests li button', nodes => nodes.map(node => ({
-  title: node.querySelector('strong')?.textContent ?? '', state: node.querySelector('span')?.textContent ?? '',
-  observation: node.querySelector('small')?.textContent ?? '' })));
+// Task #1177: the configured `tasks` view renders a native table. The legacy approval inbox
+// and the other configured views keep `#requests li`, so these selectors are deliberately
+// scoped to the table rather than applied globally.
+const TASK_ROW = '#task-rows tr';
+const TASK_BUTTON = '#task-rows tr th[scope=row] button';
+// The same three facts the list carried (id, recorded status, source observation), read from
+// the row header and the three data cells instead of strong/span/small.
+const rowTexts = page => page.$$eval(TASK_ROW, rows => rows.map(row => ({
+  header: row.querySelector('th[scope=row] button')?.textContent ?? '',
+  scope: row.querySelector('th')?.getAttribute('scope') ?? '',
+  headers: row.querySelectorAll('th').length,
+  cells: [...row.querySelectorAll('td')].map(cell => cell.textContent) })));
+// Exact native semantics, classified in the page. No title, note, prompt or row text escapes:
+// only tag names, the two fixed label strings the product itself ships, and bounded counts.
+const TABLE_SEMANTICS = () => {
+  const scroller = document.querySelector('#tasks-scroll'), table = document.querySelector('#tasks');
+  const caption = document.querySelector('#tasks-caption'), heads = [...document.querySelectorAll('#tasks thead th')];
+  return {
+    tableTag: table ? table.tagName : 'absent',
+    // A native table must not be re-roled into something else by ARIA.
+    tableRole: table ? (table.getAttribute('role') ?? 'native') : 'absent',
+    captionTag: caption ? caption.tagName : 'absent',
+    captionParent: caption && caption.parentElement ? caption.parentElement.tagName : 'absent',
+    captionFirst: table && table.firstElementChild ? table.firstElementChild.tagName : 'absent',
+    captionText: caption ? caption.textContent : '',
+    headerTags: heads.map(node => node.tagName),
+    headerScopes: heads.map(node => node.getAttribute('scope')),
+    headerTexts: heads.map(node => node.textContent),
+    theads: document.querySelectorAll('#tasks thead').length,
+    tbodies: table ? table.tBodies.length : -1,
+    tbodyId: table && table.tBodies[0] ? table.tBodies[0].id : 'absent',
+    scrollerTag: scroller ? scroller.tagName : 'absent',
+    scrollerRole: scroller ? scroller.getAttribute('role') : 'absent',
+    scrollerLabelledBy: scroller ? scroller.getAttribute('aria-labelledby') : 'absent',
+    scrollerTabIndex: scroller ? scroller.tabIndex : -99,
+    scrollerHidden: scroller ? scroller.hidden === true : null,
+    scrollerContainsTable: !!(scroller && table && scroller.contains(table)),
+  };
+};
+// Actuates the bounded scroller to its extreme and restores it, so "every column is
+// reachable" is measured rather than assumed. Returns booleans and bounded numbers only.
+const COLUMN_REACH = () => {
+  const scroller = document.querySelector('#tasks-scroll');
+  const last = document.querySelector('#tasks thead th:nth-child(4)');
+  if (!scroller || !last) return { reachable: false, restored: false, maxScroll: -1, contained: false };
+  const start = scroller.scrollLeft;
+  scroller.scrollLeft = scroller.scrollWidth;
+  const maxScroll = scroller.scrollLeft;
+  const frame = scroller.getBoundingClientRect(), box = last.getBoundingClientRect();
+  const reachable = box.right <= frame.right + 1 && box.left >= frame.left - 1 && box.width > 0;
+  scroller.scrollLeft = start;
+  return { reachable, restored: scroller.scrollLeft === start, maxScroll,
+    contained: frame.right <= document.documentElement.clientWidth + 1 && frame.left >= -1 };
+};
 const settled = page => page.waitForFunction(() => !document.querySelector('#refresh').disabled
   && !document.querySelector('#status').textContent.startsWith('Loading'));
 
@@ -979,7 +1058,7 @@ async function loginUISteps(deps) {
   setLoginSubstage('credential-ceremony');
   await page.locator('#login').click();
   setLoginSubstage('workspace-rows');
-  await page.waitForFunction(() => !document.querySelector('#workspace').hidden && document.querySelectorAll('#requests li').length === 25);
+  await page.waitForFunction(() => !document.querySelector('#workspace').hidden && document.querySelectorAll('#task-rows tr').length === 25);
   setLoginSubstage('settled');
   await settled(page);
   setLoginSubstage('route-hash');
@@ -1024,28 +1103,46 @@ async function uiControls(deps, alpha) {
   setConsoleStage('ui');
   const { check, page, cleanDOM, state } = deps;
   const rows = await rowTexts(page);
-  check(rows.length === 25 && rows.every((row, index) => row.title === `Task ${alpha[index].taskId}`
-    && row.state === `${alpha[index].recordedStatus} · execution unknown`
-    && row.observation === `Source updated: ${alpha[index].updatedAt || 'unknown'}`));
+  // The old list oracle, carried over onto the table contract: same ordering, same recorded
+  // status, same "execution unknown" claim, same source-updated fallback - now as a row
+  // header plus exactly three data cells, and no fourth cell smuggling anything else in.
+  check(rows.length === 25 && rows.every((row, index) => row.header === `Task ${alpha[index].taskId}`
+    && row.scope === 'row' && row.headers === 1 && row.cells.length === 3
+    && row.cells[0] === alpha[index].recordedStatus
+    && row.cells[1] === 'unknown until observed'
+    && row.cells[2] === (alpha[index].updatedAt || 'unknown')));
+  // The legacy list must stay empty while the configured table is the row surface.
+  check(await page.locator('#requests li').count() === 0);
   // Configured pages replace rather than append, which is what bounds browser memory.
   await page.locator('#more').click();
-  await page.waitForFunction(() => document.querySelectorAll('#requests li').length === 5);
+  await page.waitForFunction(() => document.querySelectorAll('#task-rows tr').length === 5);
   await settled(page);
   const second = await rowTexts(page);
-  check(second.every((row, index) => row.title === `Task ${alpha[25 + index].taskId}`));
+  check(second.every((row, index) => row.header === `Task ${alpha[25 + index].taskId}`
+    && row.cells[0] === alpha[25 + index].recordedStatus
+    && row.cells[1] === 'unknown until observed'
+    && row.cells[2] === (alpha[25 + index].updatedAt || 'unknown')));
   check(await page.locator('#more').isHidden());
+  // Existing filters are unchanged; the no-match case is added because an empty result must
+  // now hide the table rather than render an empty one.
   for (const [query, status, predicate] of [['A01', '', row => row.taskId.toLowerCase().includes('a01')],
-    ['', 'pending', row => row.recordedStatus === 'pending'], ['', '', () => true]]) {
+    ['', 'pending', row => row.recordedStatus === 'pending'], ['ZZZZ', '', () => false], ['', '', () => true]]) {
     await page.locator('#query').fill(query);
     await page.locator('#state').selectOption(status);
     await page.locator('#filters button[type=submit]').click();
     const expected = Math.min(25, alpha.filter(predicate).length);
-    await page.waitForFunction(count => document.querySelectorAll('#requests li').length === count, expected);
+    await page.waitForFunction(count => document.querySelectorAll('#task-rows tr').length === count, expected);
     await settled(page);
+    // An empty match shows no table at all, and says so in the existing status line.
+    check(await page.locator('#tasks-scroll').isHidden() === (expected === 0));
+    if (expected === 0) {
+      check(await page.locator('#status').textContent() === 'No matching tasks in the complete configured queue scope.');
+      check(await page.locator('#requests li').count() === 0 && await page.locator('#more').isHidden());
+    }
   }
   await cleanDOM(page, state);
   const target = alpha[0];
-  await page.locator('#requests li button').first().click();
+  await page.locator(TASK_BUTTON).first().click();
   await page.waitForFunction(id => !document.querySelector('#detail').hidden && document.querySelector('#fields dd')?.textContent === id, target.taskId);
   await settled(page);
   check(await page.evaluate(() => location.hash) === `#/projects/alpha/tasks/${target.taskId}`);
@@ -1057,8 +1154,9 @@ async function uiControls(deps, alpha) {
   check(/^[a-f0-9]{64}$/.test(values[14]) && values[15] === REASONS.join(', '));
   check(await page.evaluate(() => document.activeElement?.id) === 'detail-title');
   await page.locator('#back').click();
-  await page.waitForFunction(() => document.querySelector('#detail').hidden && document.querySelectorAll('#requests li').length === 25);
+  await page.waitForFunction(() => document.querySelector('#detail').hidden && document.querySelectorAll('#task-rows tr').length === 25);
   await settled(page);
+  // Back-focus lands on the row-header button it came from, which now lives inside the table.
   check(await page.evaluate(() => (document.activeElement?.textContent ?? '').startsWith('Task A001')
     || document.activeElement?.id === 'refresh'));
   await cleanDOM(page, state);
@@ -1070,35 +1168,102 @@ async function uiControls(deps, alpha) {
     await page.waitForFunction(text => document.querySelector('#status').textContent === text, expected);
     await settled(page);
     check(await page.locator('#filters').isHidden() && await page.locator('#requests li').count() === 0);
+    // A view change clears the table as well as the list, and shows no empty table.
+    check(await page.locator('#task-rows tr').count() === 0 && await page.locator('#tasks-scroll').isHidden());
     check(await page.locator('#coverage').textContent() === 'Coverage: unavailable · Source observation: unknown · Source fetched: unavailable · Count unknown');
     check(await page.locator(`nav button[data-view=${view}]`).getAttribute('aria-pressed') === 'true');
   }
   await page.locator('nav button[data-view=tasks]').click();
-  await page.waitForFunction(() => document.querySelectorAll('#requests li').length === 25);
+  await page.waitForFunction(() => document.querySelectorAll('#task-rows tr').length === 25);
   await settled(page);
+  check(await page.locator('#tasks-scroll').isVisible());
   mark(deps, 'console-views-ui');
   await page.locator('#project').selectOption('partialp');
   await page.waitForFunction(() => document.querySelector('#status').textContent.startsWith('Partial: '));
   await settled(page);
   check(await page.locator('#status').textContent() === 'Partial: Conflicting task records omitted; Some configured tasks are missing');
-  check(await page.locator('#requests li').count() === 2 && await page.locator('#status').getAttribute('data-state') === 'partial');
+  // A project change re-scopes the table itself, and the legacy list stays empty throughout.
+  check(await page.locator('#task-rows tr').count() === 2 && await page.locator('#requests li').count() === 0
+    && await page.locator('#status').getAttribute('data-state') === 'partial');
   await page.locator('#project').selectOption('broken');
   await page.waitForFunction(() => document.querySelector('#status').textContent === 'Unavailable: Task queue unavailable');
   await settled(page);
-  check(await page.locator('#requests li').count() === 0 && await page.locator('#status').getAttribute('data-state') === 'unavailable');
+  check(await page.locator('#task-rows tr').count() === 0 && await page.locator('#requests li').count() === 0
+    && await page.locator('#tasks-scroll').isHidden() && await page.locator('#status').getAttribute('data-state') === 'unavailable');
   await page.locator('#project').selectOption('alpha');
-  await page.waitForFunction(() => document.querySelectorAll('#requests li').length === 25);
+  await page.waitForFunction(() => document.querySelectorAll('#task-rows tr').length === 25);
   await settled(page);
   // A copied deep link into an ungranted project erases every private row before reporting.
   await page.evaluate(() => { location.hash = '/projects/beta/tasks'; });
   await page.waitForFunction(() => document.querySelector('#status').textContent === 'Forbidden: no access to this project.');
-  check(await page.locator('#requests li').count() === 0 && await page.locator('#coverage').textContent() === '');
+  // Forbidden must erase the table and the legacy list together, and leave no empty table.
+  check(await page.locator('#task-rows tr').count() === 0 && await page.locator('#requests li').count() === 0
+    && await page.locator('#tasks-scroll').isHidden() && await page.locator('#coverage').textContent() === '');
   check(await page.locator('#detail').isHidden() && await page.locator('#status').getAttribute('data-state') === 'forbidden');
   await page.evaluate(() => { location.hash = '/projects/alpha/tasks'; });
-  await page.waitForFunction(() => document.querySelectorAll('#requests li').length === 25);
+  await page.waitForFunction(() => document.querySelectorAll('#task-rows tr').length === 25);
   await settled(page);
   await cleanDOM(page, state);
   mark(deps, 'console-deep-link');
+}
+
+const CAPTION_TEXT = 'Authorized tasks in the selected project · Recorded status only; execution and acceptance unknown';
+const COLUMNS = ['Task ID', 'Recorded status', 'Execution evidence', 'Source updated'];
+
+/**
+ * Task #1177. What the list-shaped coverage above cannot state: that this is an actual native
+ * table with an actual caption and actual column headers, that the per-row detail command is
+ * reachable and operable from the keyboard through the row header, and that the deliberately
+ * bounded horizontal scroller is a real, focusable region whose every column can be reached.
+ * Runs on the alpha tasks view the previous stage restored, and leaves it exactly there.
+ */
+async function taskTable(deps, alpha) {
+  setConsoleStage('ui');
+  const { check, page, cleanDOM, state } = deps;
+  setConsoleOp('tt-semantics');
+  const dom = await page.evaluate(TABLE_SEMANTICS);
+  // Native elements, not ARIA imitations of them, and the caption is the table's first child.
+  check(dom.tableTag === 'TABLE' && dom.tableRole === 'native');
+  check(dom.captionTag === 'CAPTION' && dom.captionParent === 'TABLE' && dom.captionFirst === 'CAPTION');
+  check(dom.captionText === CAPTION_TEXT);
+  check(dom.theads === 1 && dom.tbodies === 1 && dom.tbodyId === 'task-rows');
+  setConsoleOp('tt-headers');
+  // Exactly four column headers, in order, each a real th scoped to its column.
+  check(dom.headerTags.length === 4 && dom.headerTags.every(tag => tag === 'TH'));
+  check(dom.headerScopes.every(scope => scope === 'col'));
+  check(JSON.stringify(dom.headerTexts) === JSON.stringify(COLUMNS));
+  setConsoleOp('tt-cells');
+  // One row header and three data cells per row, for every row - no ragged or padded rows.
+  const shape = await rowTexts(page);
+  check(shape.length === 25 && shape.every((row, index) => row.headers === 1 && row.scope === 'row'
+    && row.cells.length === 3 && row.header === `Task ${alpha[index].taskId}`));
+  setConsoleOp('tt-region');
+  // The scroller is a labelled, keyboard-focusable region wrapping the table.
+  check(dom.scrollerTag === 'DIV' && dom.scrollerRole === 'region' && dom.scrollerContainsTable);
+  check(dom.scrollerLabelledBy === 'tasks-caption' && dom.scrollerTabIndex === 0 && dom.scrollerHidden === false);
+  await page.locator('#tasks-scroll').focus();
+  check(await page.evaluate(() => document.activeElement?.id) === 'tasks-scroll');
+  setConsoleOp('tt-keyboard');
+  // The detail command lives in the row header and is operable by keyboard alone.
+  await page.locator(TASK_BUTTON).first().focus();
+  check(await page.evaluate(() => document.activeElement?.tagName === 'BUTTON'
+    && document.activeElement?.parentElement?.tagName === 'TH'
+    && document.activeElement?.parentElement?.getAttribute('scope') === 'row'));
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(id => !document.querySelector('#detail').hidden
+    && document.querySelector('#fields dd')?.textContent === id, alpha[0].taskId);
+  await settled(page);
+  // Same focus contract the pointer path already has: the detail heading takes focus.
+  check(await page.evaluate(() => document.activeElement?.id) === 'detail-title');
+  check(await page.evaluate(() => location.hash) === `#/projects/alpha/tasks/${alpha[0].taskId}`);
+  setConsoleOp('tt-restore');
+  await page.locator('#back').click();
+  await page.waitForFunction(() => document.querySelector('#detail').hidden
+    && document.querySelectorAll('#task-rows tr').length === 25);
+  await settled(page);
+  setConsoleOp('tt-mark');
+  await cleanDOM(page, state);
+  mark(deps, 'console-task-table');
 }
 
 /** A reload really does require signing in again; only then is the deep link restored. */
@@ -1123,7 +1288,7 @@ async function reloadDeepLink(deps, alpha) {
   reloadWorkspaceHidden = workspaceHidden ? 'y' : 'n';
   // The original expression short-circuits, so the row count is queried exactly when it was
   // queried before: this latches state without adding one page operation on either path.
-  const guestRows = workspaceHidden ? await page.locator('#requests li').count() : -1;
+  const guestRows = workspaceHidden ? await page.locator('#task-rows tr').count() : -1;
   reloadGuestRows = guestRows;
   check(workspaceHidden && guestRows === 0);
   setConsoleOp('rdl-guest-hash');
@@ -1151,7 +1316,7 @@ async function reloadDeepLink(deps, alpha) {
   setConsoleOp('rdl-back-click');
   await page.locator('#back').click();
   setConsoleOp('rdl-back-rows-wait');
-  await page.waitForFunction(() => document.querySelectorAll('#requests li').length === 25);
+  await page.waitForFunction(() => document.querySelectorAll('#task-rows tr').length === 25);
   setConsoleOp('rdl-back-settled');
   await settled(page);
   setConsoleOp('rdl-clean-dom');
@@ -1181,7 +1346,7 @@ async function singleFlight(deps) {
     setConsoleOp('sf-view-final');
     await page.locator('nav button[data-view=tasks]').click();
     setConsoleOp('sf-rows-wait');
-    await page.waitForFunction(() => document.querySelectorAll('#requests li').length === 25);
+    await page.waitForFunction(() => document.querySelectorAll('#task-rows tr').length === 25);
     setConsoleOp('sf-settled');
     await settled(page);
     setConsoleOp('sf-flight-check');
@@ -1205,7 +1370,7 @@ async function lifecycleWindow(deps, fixtures, alphaCursor) {
   setConsoleOp('lw-churn-navigate');
   await page.evaluate(() => { location.hash = '/projects/churn/tasks'; });
   setConsoleOp('lw-churn-rows');
-  await page.waitForFunction(() => document.querySelectorAll('#requests li').length === 6);
+  await page.waitForFunction(() => document.querySelectorAll('#task-rows tr').length === 6);
   setConsoleOp('lw-churn-settled');
   await settled(page);
   setConsoleOp('lw-cursor-before');
@@ -1265,7 +1430,7 @@ async function lifecycleWindow(deps, fixtures, alphaCursor) {
     setConsoleOp('lw-resumed-response');
     await resumed;
     setConsoleOp('lw-resumed-rows');
-    await page.waitForFunction(() => document.querySelectorAll('#requests li').length === 6);
+    await page.waitForFunction(() => document.querySelectorAll('#task-rows tr').length === 6);
     setConsoleOp('lw-resumed-settled');
     await settled(page);
   } finally {
@@ -1297,7 +1462,7 @@ async function lifecycleWindow(deps, fixtures, alphaCursor) {
   setConsoleOp('lw-alpha-return');
   await page.evaluate(() => { location.hash = '/projects/alpha/tasks'; });
   setConsoleOp('lw-alpha-rows');
-  await page.waitForFunction(() => document.querySelectorAll('#requests li').length === 25);
+  await page.waitForFunction(() => document.querySelectorAll('#task-rows tr').length === 25);
   setConsoleOp('lw-alpha-settled');
   await settled(page);
 }
@@ -1307,10 +1472,28 @@ const LAYOUT = () => {
   const visible = node => node.getClientRects().length > 0;
   const rect = node => node.getBoundingClientRect();
   const name = node => `${node.tagName}#${node.id || '-'}`;
-  const overflowing = [...document.querySelectorAll('main *')].filter(visible)
+  // Task #1177: the table may deliberately be wider than its own bounded scroller, so the
+  // table's own descendants are measured against that scroller (below) rather than against
+  // the viewport. The scroller itself is NOT exempt: it is still required to fit the page,
+  // and body/document overflow is still a failure. Nothing outside the scroller is exempted.
+  const scroller = document.querySelector('#tasks-scroll');
+  const scrolled = node => !!scroller && scroller.contains(node) && node !== scroller;
+  const overflowing = [...document.querySelectorAll('main *')].filter(visible).filter(node => !scrolled(node))
     .filter(node => { const box = rect(node); return box.right > width + 1 || box.left < -1; }).map(name);
+  // Inside the scroller the containment rule is the scroller's own box, not the viewport.
+  const escaping = scroller && visible(scroller)
+    ? [...scroller.querySelectorAll('*')].filter(visible).filter(node => {
+      const box = rect(node), frame = rect(scroller);
+      return box.right > frame.right + scroller.scrollWidth - scroller.clientWidth + 1 || box.left < frame.left - 1;
+    }).map(name) : [];
+  // Header, cell and button text must fit its own box rather than being clipped by it.
+  const clipped = [...document.querySelectorAll('#tasks th, #tasks td, #tasks button')].filter(visible)
+    .filter(node => node.scrollWidth > node.clientWidth + 1 || node.scrollHeight > node.clientHeight + 1).map(name);
+  const frame = scroller && visible(scroller) ? rect(scroller) : null;
   const overlaps = [];
-  for (const selector of ['header', 'nav', '#requests', '.content', '#filters', '.toolbar', '#fields']) {
+  for (const selector of ['header', 'nav', '#requests', '.content', '#filters', '.toolbar', '#fields',
+    // Cells within each row, and the rows within the body, must not overlap either.
+    '#tasks tr', '#task-rows']) {
     for (const container of document.querySelectorAll(selector)) {
       const boxes = [...container.children].filter(visible).map(node => ({ id: `${selector} ${name(node)}`, box: rect(node) }));
       for (let i = 0; i < boxes.length; i++) for (let j = i + 1; j < boxes.length; j++) {
@@ -1326,7 +1509,13 @@ const LAYOUT = () => {
   return { width, scrollWidth: document.documentElement.scrollWidth, bodyScroll: document.body.scrollWidth,
     rootFontPx: parseFloat(getComputedStyle(document.documentElement).fontSize),
     overflowing: overflowing.slice(0, 6), overlaps: overlaps.slice(0, 6), small: small.slice(0, 6),
-    rows: document.querySelectorAll('#requests li').length };
+    escaping: escaping.slice(0, 6), clipped: clipped.slice(0, 6),
+    // The scroller must itself be inside the viewport; only its own contents may exceed it,
+    // and only horizontally, through the bounded scroller the design deliberately allows.
+    tableVisible: !!frame, tableContained: frame ? frame.right <= width + 1 && frame.left >= -1 : null,
+    tableOverflowX: scroller ? scroller.scrollWidth - scroller.clientWidth : -1,
+    tableFocusable: scroller ? scroller.tabIndex === 0 : null,
+    rows: document.querySelectorAll('#task-rows tr').length };
 };
 
 function pngSize(deps, buffer) {
@@ -1355,12 +1544,23 @@ async function responsive(deps, fixtures, artifacts) {
     setConsoleOp('rv-root-font');
     await page.evaluate(size => { document.documentElement.style.fontSize = `${size}px`; }, rootFontPx);
     setConsoleOp('rv-rows-wait');
-    await page.waitForFunction(() => document.querySelectorAll('#requests li').length === 25 && !document.querySelector('#refresh').disabled);
+    await page.waitForFunction(() => document.querySelectorAll('#task-rows tr').length === 25 && !document.querySelector('#refresh').disabled);
     setConsoleOp('rv-layout');
     const layout = await page.evaluate(LAYOUT);
     check(layout.width === width && layout.rows === 25 && layout.rootFontPx === rootFontPx);
+    // Unchanged gate: the page itself must never overflow horizontally at any width or zoom.
     check(layout.scrollWidth <= width + 1 && layout.bodyScroll <= width + 1);
     check(layout.overflowing.length === 0 && layout.overlaps.length === 0 && layout.small.length === 0);
+    // Task #1177: the table's bounded scroller must fit the page and be keyboard-reachable,
+    // its contents must stay inside its scrollable extent, and no header, cell or button text
+    // may be clipped. A horizontal overflow here is allowed; a vertical one is not.
+    check(layout.tableVisible && layout.tableContained === true && layout.tableFocusable === true);
+    check(layout.escaping.length === 0 && layout.clipped.length === 0 && layout.tableOverflowX >= 0);
+    setConsoleOp('rv-column-reach');
+    // Every column must actually be reachable by scrolling that region, and the region must
+    // be left exactly where it was found.
+    const reach = await page.evaluate(COLUMN_REACH);
+    check(reach.reachable === true && reach.restored === true && reach.maxScroll === layout.tableOverflowX);
     setConsoleOp('rv-clean-dom');
     await cleanDOM(page, state);
     setConsoleOp('rv-text-leak');
@@ -1393,7 +1593,7 @@ async function stateCleared(deps) {
   setConsoleStage('state-cleared');
   const { check, page, fetchPage, cleanDOM, state } = deps;
   setConsoleOp('sc-open-detail');
-  await page.locator('#requests li button').first().click();
+  await page.locator(TASK_BUTTON).first().click();
   setConsoleOp('sc-detail-wait');
   await page.waitForFunction(() => !document.querySelector('#detail').hidden);
   setConsoleOp('sc-settled');
@@ -1405,7 +1605,9 @@ async function stateCleared(deps) {
   setConsoleOp('sc-workspace-hidden');
   check(await page.locator('#workspace').isHidden() && await page.locator('#auth').isVisible());
   setConsoleOp('sc-rows-cleared');
-  check(await page.locator('#requests li').count() === 0 && await page.locator('#detail').isHidden());
+  // Sign-out clears the configured table and the legacy list together, and hides the table.
+  check(await page.locator('#task-rows tr').count() === 0 && await page.locator('#requests li').count() === 0
+    && await page.locator('#tasks-scroll').isHidden() && await page.locator('#detail').isHidden());
   setConsoleOp('sc-fields-cleared');
   check(await page.locator('#fields dd').count() === 0 && await page.locator('#coverage').textContent() === '');
   setConsoleOp('sc-logout-hidden');
@@ -1446,6 +1648,7 @@ export async function consoleAcceptance(deps) {
   const { alpha, issued } = await apiControls(deps, fixtures);
   await leakControls(deps, fixtures);
   await uiControls(deps, alpha);
+  await taskTable(deps, alpha);
   await reloadDeepLink(deps, alpha);
   const flight = await singleFlight(deps);
   await lifecycleWindow(deps, fixtures, issued);

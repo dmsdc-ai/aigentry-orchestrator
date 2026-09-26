@@ -4,6 +4,8 @@ The Console extends the existing packaged HITL web service. It reads configured 
 
 ## Installed entrypoint and setup
 
+The Console web modules, including the task table described below, are not in the currently published `0.2.1` tarball; they reach an installed package only after this change is built and published in a later release. Until then the commands in this section apply to a locally built package, and nothing here should be read as a released capability.
+
 Use a built, installed `@dmsdc-ai/aigentry-orchestrator` package on its declared macOS/Linux platforms with Node >=20.11. The compiled CLI and embedded assets are included under `dist/src/hitl/web`; no development checkout is needed. There is no new initializer subcommand. Set `AIGENTRY_PACKAGE` below to the absolute installed package directory, not the checkout. These are operator commands, not commands executed by the Console:
 
 ```sh
@@ -73,6 +75,18 @@ Each project retains one bounded snapshot for 15 seconds. Refreshes coalesce; at
 
 The browser polls visible tabs every 15 seconds plus up to 1.5 seconds jitter, pauses hidden tabs, allows one outstanding operation, and backs off to 60 seconds plus jitter. It honors bounded `Retry-After`. Pages replace prior pages, bounding browser memory. Loading/offline/error states label any retained view; forbidden/session-expired responses erase private rows. Deep links encode only project/view/task IDs. Messages and details use text nodes, never HTML/Markdown execution, arbitrary links, external fetches or shell actions.
 
+## Task table
+
+The `tasks` view lists authorized recorded tasks as a native HTML table with a caption and column headers: **Task ID**, **Recorded status**, **Execution evidence**, and **Source updated**. Each row uses the task ID as its row header, and that header holds the button that opens the existing read-only detail panel, so the detail command is reachable by keyboard and by screen reader row context. Rows keep the existing ID ordering; there is no sort control and no new API parameter.
+
+The columns report only what the projection already supplies. **Recorded status** is the allowlisted queue status, never an execution or acceptance claim. **Execution evidence** stays `unknown until observed` because no observation contract is supplied, so `done`, `completed` and `in_progress` rows show it too. **Source updated** repeats the recorded `updated_at`, or `unknown` when the source has none. Titles, notes and prompts are still not exposed, and no field is added to the projection.
+
+Scope is the tasks configured for the selected project and granted to the signed-in principal; the caption states that scope generically. Neither the caption nor any row states or implies the existence or number of records outside it. Changing the project selector re-scopes the table. Existing `status` and task-ID `q` filters, the 25-row page size, `Next page` pagination and deep links are unchanged.
+
+The legacy approval inbox keeps its list layout and disabled decisions, and the `requests`, `releases` and `approvals` console views keep their existing empty, unavailable states rather than an empty table. Sign-out, a forbidden or session-expired response, a project change and a view change all clear the table and the legacy list together. Loading, offline, stale, error and no-match states are reported in the existing status and coverage lines; the table is not shown when there are no matching rows.
+
+The table keeps native table semantics at every width, including narrow phones. When the columns cannot fit, the table scrolls horizontally inside its own bounded, keyboard-focusable region instead of overflowing the page. No library, icon font or network asset was added. Rendered layout, zoom and physical-device behavior remain unverified here; see the gates below.
+
 ## Remaining acceptance gates
 
-The implementation requires independent source mutation/ACL/cursor checks, legacy compatibility and authentication testing, malicious-text checks, security scanning, browser screenshots at 320/390/768/1440 CSS pixels and 200% zoom, packed-install execution without checkout access, and actual device validation before those capabilities can be claimed. Compilation is not any of these gates. This file documents the repository setup; the existing package allowlist ships the compiled CLI/assets but does not include `docs/setup`.
+The implementation requires independent source mutation/ACL/cursor checks, legacy compatibility and authentication testing, malicious-text checks, security scanning, browser screenshots at 320/390/768/1440 CSS pixels and 200% zoom, packed-install execution without checkout access, and actual device validation before those capabilities can be claimed. Compilation is not any of these gates. This file documents the repository setup; the existing package allowlist declares the compiled CLI/assets and selected docs for packaging, including `docs/setup/task-console.md` itself, rather than all of `docs/setup`. That declaration is not proof of an actual packed or installed file; packed-install verification remains one of the gates above.
