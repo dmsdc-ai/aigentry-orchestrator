@@ -441,7 +441,23 @@ const ciDiagnosticRun = `          # The supervisor is written out here, under t
               if done.returncode != 0:
                   return ("unknown", "")
               text = done.stdout.decode("utf-8", "replace").strip()
+              # #1177 xprop prints TWO exit-zero absence forms, both from Show_Prop and both
+              # about the ONE property it was asked for, so both are read as absence of that
+              # property and nothing wider. Corroborated against the official X.Org source
+              # (xprop.c, Show_Prop): \`Parse_Atom(prop, True)\` is
+              # \`XInternAtom(dpy, name, only_if_exists=True)\`, which returns None when the
+              # name is not interned on this server at all - so it cannot be set on ANY
+              # window - and that path prints ":  no such atom on any window."; otherwise a
+              # property the window does not carry prints ":  not found.". Recognising only
+              # the second is the measured defect: a display whose server had never interned
+              # _NET_SUPPORTING_WM_CHECK answered with the first, and an observed absence was
+              # rejected as unknown, so nothing was started. Each form is matched ANCHORED and
+              # against THIS property name, so a response about a different property, a
+              # truncated or extended one, and any other shape all stay unknown; the non-zero
+              # exit, the timeout and the missing tool above stay unknown as well.
               if re.match("^" + name + r":\\s+not found\\.$", text):
+                  return ("absent", "")
+              if re.match("^" + name + r":\\s+no such atom on any window\\.$", text):
                   return ("absent", "")
               return ("ok", text)
 
@@ -704,6 +720,17 @@ const ciDiagnosticRun = `          # The supervisor is written out here, under t
                 case "$root" in
                   "_NET_SUPPORTING_WM_CHECK: window id # 0x"*) ewmh=present ;;
                   "_NET_SUPPORTING_WM_CHECK:"*"not found.") ewmh=absent ;;
+                  # #1177 the other exit-zero absence form xprop prints for this same one
+                  # property, aligned with the supervisor parser above and no wider. Written
+                  # as the WHOLE exact response with no wildcard, so no arbitrary text may
+                  # precede the phrase: Show_Prop prints ":  no such atom on any window."
+                  # directly after the property name with those exact two spaces, and the
+                  # command substitution has already dropped the one trailing newline. Still
+                  # classified only on a zero exit. This stays DIAGNOSTIC: no check reads
+                  # ewmh, the supervisor takes its own baseline, and what is captured here is
+                  # unchanged. NOTE no apostrophe may appear in this block, which is one
+                  # single-quoted bash -c argument.
+                  "_NET_SUPPORTING_WM_CHECK:  no such atom on any window.") ewmh=absent ;;
                   *) ewmh=unknown ;;
                 esac
               fi
@@ -1810,6 +1837,53 @@ const ciDiagnosticMutations = [
   ['supervisor treats a recorded probe as the absent initial state it did not observe',
     '              if state != "absent":\n',
     '              if state != "absent" and not probe[0].startswith("property="):\n'],
+
+  // #1177 THE TWO EXIT-ZERO ABSENCE SPELLINGS. The measured counterexample: release HEAD
+  // 2fbe671, CI 36239796578, job 108398040073 exited 0 having printed exactly the 55 bytes
+  // `_NET_SUPPORTING_WM_CHECK:  no such atom on any window.\n` and nothing else. The reader
+  // recognised only the anchored `not found.` form, so `supporting()` rejected an OBSERVED
+  // absence as unknown and no Openbox and no browser were ever launched. Both spellings come
+  // out of one function in the official X.Org source (xprop.c, `Show_Prop`): the atom-does-
+  // not-exist branch after `Parse_Atom(prop, True)` == `XInternAtom(.., only_if_exists=True)`
+  // returns None, and the property-not-on-this-window branch. Each negative below pins one
+  // half of the correction: BOTH forms are recognised, and the widening the recognition may
+  // not undergo - the property-name anchor, both end anchors, the exit-zero precondition and
+  // the unknown fallthrough - is rejected BY NAME rather than only by the byte comparison.
+  ['supervisor stops recognising the observed absent-atom spelling and refuses a real absence',
+    '              if re.match("^" + name + r":\\s+no such atom on any window\\.$", text):\n'
+      + '                  return ("absent", "")\n', ''],
+  ['supervisor stops recognising the absent-property spelling it already handled',
+    '              if re.match("^" + name + r":\\s+not found\\.$", text):\n'
+      + '                  return ("absent", "")\n', ''],
+  // Anchored and property-specific: a response ABOUT ANOTHER PROPERTY may not be read as
+  // this property being absent, which is exactly what dropping the name anchor would do.
+  ['supervisor reads an absent-atom answer about a foreign property as this one being absent',
+    '              if re.match("^" + name + r":\\s+no such atom on any window\\.$", text):\n',
+    '              if re.match("^[^:]+" + r":\\s+no such atom on any window\\.$", text):\n'],
+  // Arbitrary text before the phrase is the specific over-broad shape rejected here: it turns
+  // any output that merely CONTAINS the words into a verdict.
+  ['supervisor widens the absent-atom form to an unanchored substring search',
+    'r":\\s+no such atom on any window\\.$"', 'r".*no such atom on any window"'],
+  // A truncated or extended response is malformed, and malformed stays unknown.
+  ['supervisor drops the end anchor so an extended absent-atom response still reads as absence',
+    'r":\\s+no such atom on any window\\.$"', 'r":\\s+no such atom on any window"'],
+  // Both spellings are classified only AFTER the exit status was accepted, so a failing or
+  // erroring xprop that happened to print the phrase can never become an absence.
+  ['supervisor classifies the absence spellings without first requiring a zero xprop exit',
+    '              if done.returncode != 0:\n                  return ("unknown", "")\n', ''],
+  // Everything the two anchored forms did not match is still handed back for the caller to
+  // reject as unknown; it may not fall through into absence.
+  ['supervisor turns the unrecognised-shape fallthrough into absence',
+    '              return ("ok", text)\n', '              return ("absent", "")\n'],
+  // The shell diagnostic learns the same one spelling and no more. Written WITHOUT a wildcard
+  // on purpose: a `"PROP:"*"phrase"` pattern would admit arbitrary text between the property
+  // name and the phrase, which is wider than anything the source confirms.
+  ['diagnostic stops recognising the observed absent-atom spelling',
+    '                  "_NET_SUPPORTING_WM_CHECK:  no such atom on any window.") ewmh=absent ;;\n',
+    ''],
+  ['diagnostic widens the absent-atom case to admit arbitrary text around the phrase',
+    '                  "_NET_SUPPORTING_WM_CHECK:  no such atom on any window.") ewmh=absent ;;\n',
+    '                  *"no such atom on any window"*) ewmh=absent ;;\n'],
 ];
 const publishDependencies = ['browser-tls', ...original.jobs.publish.needs, ...ids];
 const publishNeeds = `    needs: [${publishDependencies.join(', ')}]\n`;
