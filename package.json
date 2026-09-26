@@ -47,7 +47,11 @@
     "AGENTS.md",
     "CLAUDE.md",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "!**/__pycache__",
+    "!**/__pycache__/**",
+    "!**/*.pyc",
+    "!**/*.pyo"
   ],
   "bin": {
     "aigentry-orchestrator": "bin/init/cli.mjs"
