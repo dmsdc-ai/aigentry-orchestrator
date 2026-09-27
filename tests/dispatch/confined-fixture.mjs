@@ -38,12 +38,17 @@ const receipt = (current, manifest) => {
   json(manifest.receipt, { hash: current.hash, attempt: manifest.attempt,
     state: 'running', supervisorPid: pid, childPid: pid });
 };
+// The Claude boot guard refuses a seed source carrying no OAuth material at all, so the
+// positive fixture must present the real `.credentials.json` shape. These bytes are
+// fabricated: no live token, provider call or refresh path is involved, and `fixture`
+// keeps the record self-identifying. `accessToken` alone is what the guard needs.
+const CLAUDE_AUTH = { fixture: true, claudeAiOauth: { accessToken: 'fixture-access-token-not-a-real-credential' } };
 
 if (action === 'init') {
   for (const dir of ['home/.config', 'home/.cache', 'gemini-home', 'sessions', 'role-sandbox'])
     mkdirSync(join(root, dir), { recursive: true, mode: 0o700 });
   json(join(root, 'home/.claude.json'), {});
-  json(join(root, 'home/.claude/.credentials.json'), { fixture: true });
+  json(join(root, 'home/.claude/.credentials.json'), CLAUDE_AUTH);
   json(join(root, 'codex-home/auth.json'), { fixture: true });
   write(join(root, 'home/.aigentry/instructions/common.md'), '# Fixture common\n');
   write(join(root, 'home/.aigentry/instructions/roles/coder.md'), '# Fixture coder\n');
@@ -87,7 +92,7 @@ if (action === 'init') {
   confined(manifest.env.TMPDIR);
   const auth = manifest.cli === 'codex' ? join(manifest.env.CODEX_HOME, 'auth.json')
     : join(manifest.env.CLAUDE_CONFIG_DIR, '.credentials.json');
-  assert.deepEqual(read(auth), { fixture: true });
+  assert.deepEqual(read(auth), manifest.cli === 'codex' ? { fixture: true } : CLAUDE_AUTH);
   receipt(current, manifest);
   if (action === 'guard') {
     // Execute the actual generated guard body. Intercept only its final exec,
