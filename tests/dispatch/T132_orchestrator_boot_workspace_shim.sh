@@ -30,6 +30,14 @@
 # ever issued, and the `telepty allow` at the end of every boot is a stub on PATH that
 # records its argv and exits. Everything is under $T_TMP; the repo tree's own state/ is
 # never written.
+#
+# #1181 — a bare non-TTY boot now exits 2 unless AIGENTRY_BOOT_PLAN=1 and a complete plan
+# are set (cli.ts refusePlan), so every boot below carries the SAME complete, benign,
+# explicit plan T131 uses: claude, approval=manual, history=new, nothing elevated and so no
+# AIGENTRY_BOOT_RISK_ACK. The layout, reconcile, guard, resolver and leak assertions are
+# unchanged; only the exec argv tail changed, and it is pinned as the exact line. Block N0
+# pins the refusal itself from the workspace layout: no plan → exit 2, zero effects, no exec.
+# The `ps` row still spells the old bypass argv: it is the STALE bridge being killed.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
@@ -100,6 +108,9 @@ export ORCHESTRATOR_SID="$SID" SINGLETON_SELF_PID=9999
 export ORCHESTRATOR_CLI=claude TELEPTY_PORT=3848
 export AIGENTRY_HOME="$T_TMP/home"
 mkdir -p "$AIGENTRY_HOME"
+# The complete, benign, explicit plan (#1181; see header) and the exact argv it execs.
+export AIGENTRY_BOOT_PLAN=1 AIGENTRY_BOOT_PERMISSION='approval=manual' AIGENTRY_BOOT_HISTORY=new
+PLAN_EXEC="allow --id $SID --auto-restart claude --permission-mode manual"
 
 # Every auth door is private; only B deliberately gives the two copies different tokens.
 export AUTH_LOG="$T_TMP/auth.log"
@@ -138,6 +149,33 @@ BOOT="$WS/bin/orchestrator-boot.sh"
 cd "$WS"
 
 # ===========================================================================
+# N0) no plan → the workspace boot is refused BEFORE any effect and never execs (#1181).
+#     Every read/act seam is one recorder, so a refusal that leaked past the gate would
+#     show up as a list, ps, kill or DELETE; the exec'd telepty is the owned EXEC_DIR stub.
+# ===========================================================================
+NP_LOG="$T_TMP/no-plan-effects.log"
+NP_REC="$STUB_BIN/no-plan-recorder132.sh"
+cat > "$NP_REC" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$NP_LOG"
+exit 97
+EOF
+chmod +x "$NP_REC"
+: > "$NP_LOG"; : > "$EXEC_LOG"; : > "$AUTH_LOG"
+set +e
+(unset AIGENTRY_BOOT_PLAN AIGENTRY_BOOT_PERMISSION AIGENTRY_BOOT_HISTORY
+ SINGLETON_PS_CMD="$NP_REC" KILL_CMD="$NP_REC" TELEPTY="$NP_REC" CURL="$NP_REC" \
+   PATH="$EXEC_DIR:$PKGBIN:$PATH" bash "$BOOT" >"$T_TMP/np.out" 2>"$T_TMP/np.err") </dev/null
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "N0: a no-plan workspace boot must exit 2, got $rc: $(cat "$T_TMP/np.err")"
+[ ! -s "$T_TMP/np.out" ] || fail "N0: the refusal wrote to stdout: $(cat "$T_TMP/np.out")"
+[ ! -s "$EXEC_LOG" ] || fail "N0: a no-plan workspace boot exec'd a bridge: $(cat "$EXEC_LOG")"
+[ ! -s "$NP_LOG" ] || fail "N0: the refusal listed, scanned, signalled or DELETEd: $(cat "$NP_LOG")"
+[ ! -s "$AUTH_LOG" ] || fail "N0: the refusal resolved a credential"
+grep -qF 'AIGENTRY_BOOT_PLAN' "$T_TMP/np.err" || fail "N0: the refusal does not name the opt-in"
+
+# ===========================================================================
 # A) a real boot from the workspace layout: the package's dist/ resolves, the
 #    reconcile and the guard both run, and the boot ends in the exec.
 # ===========================================================================
@@ -153,7 +191,7 @@ grep -q -- '-X DELETE' "$CURL_LOG" \
   || fail "A: the #905 reconcile did not run in the workspace layout; calls: $(cat "$CURL_LOG")"
 grep -qxF -- '-9 50349' "$KILL_LOG" \
   || fail "A: the singleton guard did not run in the workspace layout; kills: $(cat "$KILL_LOG")"
-grep -q -- "allow --id $SID --auto-restart claude --dangerously-skip-permissions --continue" "$EXEC_LOG" \
+[ "$(cat "$EXEC_LOG")" = "$PLAN_EXEC" ] \
   || fail "A: the workspace boot did not exec the bridge argv: $(cat "$EXEC_LOG")"
 [ -s "$T_TMP/a.out" ] \
   && fail "A: the workspace boot wrote to stdout — the argv channel leaked past the shim: $(cat "$T_TMP/a.out")"
@@ -178,7 +216,7 @@ PATH="$EXEC_DIR:$PKGBIN:$PATH" bash "$BOOT" >"$T_TMP/b.out" 2>"$T_TMP/b.err" \
   || fail "B: the workspace boot exited non-zero: $(cat "$T_TMP/b.err")"
 grep -q -- '-X DELETE' "$CURL_LOG" || fail "B: the workspace boot ran no reconcile"
 grep -qxF -- '-9 50349' "$KILL_LOG" || fail "B: the workspace boot ran no SIGKILL guard"
-grep -q -- "allow --id $SID --auto-restart claude --dangerously-skip-permissions --continue" "$EXEC_LOG" \
+[ "$(cat "$EXEC_LOG")" = "$PLAN_EXEC" ] \
   || fail "B: the workspace boot did not exec the bridge argv"
 [ ! -s "$T_TMP/b.out" ] || fail "B: the workspace boot wrote to stdout"
 grep -qF 'tok-FROM-WORKSPACE' "$CURL_LOG" \
@@ -260,7 +298,7 @@ PATH="$EXEC_DIR:$PATH" bash "$PKG/bin/orchestrator-boot.sh" >"$T_TMP/e.out" 2>"$
   || fail "the repo-tree layout (sibling dist/) stopped working: $(cat "$T_TMP/e.err")"
 grep -qxF -- '-9 50349' "$KILL_LOG" || fail "the repo-tree boot ran no guard; kills: $(cat "$KILL_LOG")"
 grep -q -- '-X DELETE' "$CURL_LOG" || fail "E: the sibling-dist boot ran no reconcile"
-grep -q -- "allow --id $SID --auto-restart claude --dangerously-skip-permissions --continue" "$EXEC_LOG" \
+[ "$(cat "$EXEC_LOG")" = "$PLAN_EXEC" ] \
   || fail "E: the sibling-dist boot did not exec the bridge argv"
 [ ! -s "$T_TMP/e.out" ] || fail "E: the sibling-dist boot wrote to stdout"
 grep -qF 'tok-FIXTURE-T132' "$T_TMP/e.err" \

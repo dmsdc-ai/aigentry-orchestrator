@@ -1,0 +1,130 @@
+name: Browser visibility probe (#1177, disposable)
+
+# #1177 ONE disposable two-arm diagnostic. Not an acceptance change, not a gate, not adoption of
+# any dependency change; ci.yml, the acceptance suites, package.json and package-lock.json are
+# untouched and are hash-checked before and after. Both arms run the SAME probe on the same
+# ubuntu-22.04 image, Node 20.20.0, locked playwright 1.58.2 / Chromium 145.0.7632.6 (r1208),
+# headed and sandboxed, on a private authenticated `xvfb-run -nolisten tcp` display with ONE
+# Openbox proven owned by the X server's own XRes answer - the verified ci.yml supervisor,
+# extracted by exact hash, with only its suite child swapped for this probe.
+#   Arm A: the untouched npm-ci playwright-core; the current public newCDPSession {enabled:false}.
+#   Arm B: the same, from a PRIVATE RUNNER_TEMP copy of that playwright-core whose ONE own-frame
+#          `Emulation.setFocusEmulationEnabled` is enabled:true -> enabled:false. Nothing else.
+# Expected A visible / B hidden / restore visible; the ACTUAL result is recorded and a
+# contradiction fails its step explicitly. No video, no screencast, no synthetic visibility,
+# no retry. Nothing is uploaded: results are sanitized log lines only.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/browser-visibility-probe.yml'
+      - 'scripts/ci/browser-visibility-probe.mjs'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: browser-visibility-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  visibility-probe:
+    name: Two-arm focus-emulation visibility probe
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.0'
+      - name: Require disposable non-root Linux runner
+        run: |
+          set -euo pipefail
+          test "$(id -u)" -ne 0
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          node --version
+          sudo apt-get update
+      - name: Fresh locked install
+        run: |
+          set -euo pipefail
+          npm ci
+      - name: Install pinned Chromium with sandbox dependencies
+        run: |
+          set -euo pipefail
+          node -e "const p=require('playwright/package.json');const b=JSON.parse(require('node:fs').readFileSync(require('node:path').join(require('node:path').dirname(require.resolve('playwright-core/package.json')),'browsers.json'))).browsers.find(x=>x.name==='chromium');if(p.version!=='1.58.2'||b.revision!=='1208'||b.browserVersion!=='145.0.7632.6')process.exit(1)"
+          npx --no-install playwright install --with-deps chromium
+          command -v Xvfb
+          command -v xvfb-run
+          command -v xauth
+      - name: Install the CI-only window manager and XRes build deps (same set as ci.yml)
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends \
+            openbox x11-utils libxres-dev libx11-dev
+          command -v openbox
+          command -v xprop
+          command -v python3
+          command -v cc
+          python3 --version
+          dpkg-query -W -f='${Package} ${Version}\n' openbox xvfb x11-utils libxres1 libx11-6
+      - name: Compile the CI-only XRes ownership probe (same source and command as ci.yml)
+        run: |
+          set -euo pipefail
+          umask 077
+          echo "2c93823736a103bfc44179269b276f2fb9f47e14a5d1ea327027085d06eb8c20  scripts/ci/xres-owner.c" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/xres"
+          dpkg-query -W -f='${Package} ${Version}\n' libxres1 libxres-dev libx11-dev
+          header=/usr/include/X11/extensions/XRes.h
+          test -f "$header"
+          sha256sum "$header"
+          cc -O2 -Wall -Wextra -o "$RUNNER_TEMP/xres/xres-owner" \
+            scripts/ci/xres-owner.c -lXRes -lX11
+          test -x "$RUNNER_TEMP/xres/xres-owner"
+          sha256sum scripts/ci/xres-owner.c "$RUNNER_TEMP/xres/xres-owner"
+      # Verifies pins, writes the hash-verified supervisor copy and the private arm-B library
+      # copy into RUNNER_TEMP, and records the originals' hashes BEFORE. Starts no process.
+      - name: Prepare both arms
+        id: prepare
+        run: |
+          set -euo pipefail
+          umask 077
+          node scripts/ci/browser-visibility-probe.mjs prepare
+      - name: Arm A - untouched npm-ci playwright-core
+        id: arm-a
+        timeout-minutes: 5
+        env:
+          XRES_OWNER_BIN: ${{ runner.temp }}/xres/xres-owner
+          VISIBILITY_PROBE_ARM: A
+        run: |
+          set -uo pipefail
+          umask 077
+          xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp" \
+            python3 "$RUNNER_TEMP/visibility-probe/supervisor.py"
+          status=$?
+          echo "visibility-probe: arm=A supervisor-exit=$status" >&2
+          exit "$status"
+      - name: Arm B - RUNNER_TEMP playwright-core copy, own-frame focus emulation enabled:false
+        id: arm-b
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        timeout-minutes: 5
+        env:
+          XRES_OWNER_BIN: ${{ runner.temp }}/xres/xres-owner
+          VISIBILITY_PROBE_ARM: B
+        run: |
+          set -uo pipefail
+          umask 077
+          xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp" \
+            python3 "$RUNNER_TEMP/visibility-probe/supervisor.py"
+          status=$?
+          echo "visibility-probe: arm=B supervisor-exit=$status" >&2
+          exit "$status"
+      - name: Originals unchanged after both arms, and summary
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          node scripts/ci/browser-visibility-probe.mjs verify

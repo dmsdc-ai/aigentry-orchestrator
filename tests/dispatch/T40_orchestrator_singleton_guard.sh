@@ -31,6 +31,15 @@
 #   J) daemon unreachable         → announced, no DELETE, boot still proceeds.
 #   K) STALE but clients > 0      → no DELETE (someone is attached).
 #   L) exec argv carries --auto-restart, before the command word.
+#
+# #1181 — a bare non-TTY boot is no longer a vehicle: without AIGENTRY_BOOT_PLAN=1 and a
+# complete plan the CLI exits 2 before any read (cli.ts refusePlan). Every block below now
+# boots with the SAME complete, benign, explicit plan T131 uses — claude, approval=manual,
+# history=new, no elevated value and so no AIGENTRY_BOOT_RISK_ACK — and makes exactly the
+# assertions it always made. Only the exec argv tail changed, and it is pinned exactly.
+# Block N0 pins the refusal itself: no plan → exit 2, empty stdout, zero effects.
+# The `ps` fixture rows below still spell the old bypass argv on purpose: they describe
+# STALE bridges an earlier boot left running, which is a fact about the table, not a plan.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
@@ -45,6 +54,10 @@ printf 'telepty_auth_token() { printf "auth\\n" >> "%s"; printf "fixture-token-T
   > "$BOOT_FIXTURE/bin/lib/telepty-auth.sh"
 export AIGENTRY_SHIM_SCRIPT_DIR="$BOOT_FIXTURE/bin" AIGENTRY_HOME="$BOOT_FIXTURE/home"
 export ORCHESTRATOR_CLI=claude ORCHESTRATOR_SID=orchestrator TELEPTY_PORT=3848
+# The complete, benign, explicit plan (#1181; see header). ORCHESTRATOR_SID is set per call.
+export AIGENTRY_BOOT_PLAN=1 AIGENTRY_BOOT_PERMISSION='approval=manual' AIGENTRY_BOOT_HISTORY=new
+# plan_argv <sid> — the exact exec argv that plan produces, one element per line.
+plan_argv() { printf '%s\n' telepty allow --id "$1" --auto-restart claude --permission-mode manual; }
 cd "$BOOT_FIXTURE"
 
 fail() { echo "FAIL[T40]: $*" >&2; exit 1; }
@@ -82,10 +95,41 @@ run_guard() {
   : > "$KILL_LOG"
   ORCHESTRATOR_SID="$ORCH_SID" SINGLETON_SELF_PID="$SINGLETON_SELF_PID" \
     SINGLETON_PS_CMD="$PS_STUB" KILL_CMD="$KILL_STUB" \
-    node "$BOOT_CLI" >/dev/null 2>&1
+    node "$BOOT_CLI" >"$T_TMP/guard.out" 2>"$T_TMP/guard.err" \
+    || fail "guard boot for $ORCH_SID exited non-zero: $(cat "$T_TMP/guard.err")"
+  plan_argv "$ORCH_SID" | cmp - "$T_TMP/guard.out" \
+    || fail "guard boot stdout is not the exact plan argv: $(cat "$T_TMP/guard.out")"
 }
 
 B="node telepty allow --id orchestrator claude --dangerously-skip-permissions --continue"
+
+# ===========================================================================
+# N0) no plan → refused BEFORE any effect (#1181). The fixture is actionable (a stale
+#     bridge row) and every seam is one recorder, so a refusal that leaked past the gate
+#     would show up as a list, ps, kill, DELETE or credential read.
+# ===========================================================================
+NP_LOG="$T_TMP/no-plan-effects.log"
+NP_REC="$STUB_BIN/no-plan-recorder.sh"
+cat > "$NP_REC" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$NP_LOG"
+exit 97
+EOF
+chmod +x "$NP_REC"
+printf '4444 1 %s\n' "$B" > "$PS_TABLE"
+: > "$NP_LOG"; : > "$AUTH_LOG"; : > "$KILL_LOG"
+set +e
+(unset AIGENTRY_BOOT_PLAN AIGENTRY_BOOT_PERMISSION AIGENTRY_BOOT_HISTORY
+ SINGLETON_SELF_PID=9999 SINGLETON_PS_CMD="$NP_REC" KILL_CMD="$NP_REC" TELEPTY="$NP_REC" \
+   CURL="$NP_REC" node "$BOOT_CLI" >"$T_TMP/np.out" 2>"$T_TMP/np.err") </dev/null
+np_rc=$?
+set -e
+[ "$np_rc" = "2" ] || fail "N0: a no-plan boot must exit 2, got $np_rc: $(cat "$T_TMP/np.err")"
+[ ! -s "$T_TMP/np.out" ] || fail "N0: the refusal wrote to the exec-argv channel: $(cat "$T_TMP/np.out")"
+[ ! -s "$NP_LOG" ] || fail "N0: the refusal listed, scanned, signalled or DELETEd: $(cat "$NP_LOG")"
+[ ! -s "$KILL_LOG" ] || fail "N0: the refusal reached the kill recorder: $(cat "$KILL_LOG")"
+[ ! -s "$AUTH_LOG" ] || fail "N0: the refusal resolved a credential"
+grep -qF 'AIGENTRY_BOOT_PLAN' "$T_TMP/np.err" || fail "N0: the refusal does not name the opt-in"
 
 # ===========================================================================
 # A) two bridges: 1111 is a SELF ANCESTOR (grandparent), 4444 is STALE.
@@ -262,8 +306,7 @@ run_reconcile
 ARGV_OUT="$T_TMP/exec-argv.txt"
 node "$BOOT_CLI" __probe exec-argv > "$ARGV_OUT" 2>/dev/null \
   || fail "L: __probe exec-argv exited non-zero"
-printf '%s\n' telepty allow --id orchestrator --auto-restart claude --dangerously-skip-permissions --continue \
-  > "$T_TMP/expected-argv.txt"
+plan_argv orchestrator > "$T_TMP/expected-argv.txt"
 cmp "$T_TMP/expected-argv.txt" "$ARGV_OUT" || fail "L: probe stdout is not exact argv"
 cmp "$T_TMP/expected-argv.txt" "$T_TMP/boot.out" || fail "L: normal boot stdout is not exact argv"
 ORCH_EXEC_ARGV=()
