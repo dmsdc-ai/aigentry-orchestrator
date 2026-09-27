@@ -120,7 +120,11 @@
     },
     {
       "id": 1179,
-      "release_component": "integration-assessment"
+      "release_component": "jev-decision-routing"
+    },
+    {
+      "id": 1181,
+      "release_component": "interactive-orchestrator-boot"
     }
   ]
 }
