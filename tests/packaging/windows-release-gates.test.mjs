@@ -807,13 +807,25 @@ function named(job, name) {
   assert.equal(matches.length, 1, `unique parsed step: ${name}`);
   return matches[0];
 }
+// #1171 — the CI-only full-suite debt step. `ciDebt` is what CI runs today; `ciDebtBaseline`
+// is the frozen historical body it replaced, kept so the masking it produced can be replayed
+// and demonstrated rather than asserted. Both are Bash-syntax-checked by the loop below.
+const debtStep = 'Known win32 debt must not move';
 const commands = {
   persistence: named(final.jobs[ids[0]], 'Persistence suite must be fully green on win32').run,
   declaration: named(final.jobs[ids[1]], 'package.json must declare Windows out').run,
   init: named(final.jobs[ids[1]], 'bin/init/cli.mjs platform gate must exit 2 on win32').run,
   npm: named(final.jobs[ids[1]], 'U23 — npm ci must refuse on win32 with EBADPLATFORM').run,
   ciPersistence: named(ci.jobs[ids[0]], 'Persistence suite must be fully green on win32').run,
+  ciDebt: named(ci.jobs[ids[0]], debtStep).run,
+  ciDebtBaseline: named(ciBefore.jobs[ids[0]], debtStep).run,
 };
+// The declared debt is the step's own env and is not allowed to move with this change.
+const declaredDebt = named(ci.jobs[ids[0]], debtStep).env.EXPECTED_WIN32_FAILURES;
+assert.equal(declaredDebt, '33', 'declared win32 debt is unchanged');
+assert.equal(named(ciBefore.jobs[ids[0]], debtStep).env.EXPECTED_WIN32_FAILURES, declaredDebt);
+// Block-scalar bodies sit at ten spaces inside `run: |`; used for the exact byte exceptions.
+const debtIndent = body => body.split('\n').map(line => line ? '          ' + line : '').join('\n');
 // Only the parsed Bash function may differ from the rejected/archived CI block.
 // Literal boundaries avoid treating surrounding execution/threshold checks as reader code.
 function readerParts(command) {
@@ -929,8 +941,18 @@ function validateCIHistory(source, historicalSource = readFileSync(join(root, fi
   const persistence = named(workflow.jobs[ids[0]], 'Persistence suite must be fully green on win32').run;
   assert.equal(persistence, commands.persistence);
   assert.equal(sha(persistence), '50b8b702d34566ab8ef1b3ec310770ee5c32af62950d8d7ddb0996e234df6850');
+  // #1171 — the second and only other authorized difference from the historical CI source: the
+  // full-suite debt step's diagnostic body. It is admitted by exact identity plus a pinned hash
+  // of both sides, never by relaxing the comparison, and it is undone before the deepEqual so
+  // every other parsed byte — jobs, steps, comments, thresholds — is still held exact.
+  const debt = named(workflow.jobs[ids[0]], debtStep).run;
+  assert.equal(debt, commands.ciDebt, 'only the one authorized debt diagnostic is admitted');
+  assert.equal(sha(debt), '6514354fbc3b986442902289180810df3716efe9c977d9e7d73c459e179dc6d4');
+  assert.equal(sha(commands.ciDebtBaseline), '5b9a49858084910a715febd75e8363b5093b4ed719e37a1474aeaf4adb761572');
+  assert.notEqual(debt, commands.ciDebtBaseline, 'the masking body is not the authorized body');
   const copy = withoutBrowser(workflow, false);
   named(copy.jobs[ids[0]], 'Persistence suite must be fully green on win32').run = rejectedPersistence;
+  named(copy.jobs[ids[0]], debtStep).run = commands.ciDebtBaseline;
   assert.deepEqual(copy, ciBefore);
   const indentReader = reader => reader.split('\n').map(line => line ? '          ' + line : '').join('\n');
   const fixedBytes = indentReader(fixedReader);
@@ -940,7 +962,12 @@ function validateCIHistory(source, historicalSource = readFileSync(join(root, fi
   assert.equal(bytes.split(addition).length, 2, 'exactly one approved browser block at the jobs boundary');
   const currentBytes = bytes.replace(addition, 'jobs:\n');
   assert.equal(currentBytes.split(fixedBytes).length, 2, 'exactly one corrected reader in CI YAML');
-  assert.equal(currentBytes.replace(fixedBytes, oldBytes), lf(historicalSource), 'inverse reader replacement preserves every other CI byte, including full-suite debt');
+  const fixedDebt = debtIndent(commands.ciDebt);
+  const oldDebt = debtIndent(commands.ciDebtBaseline);
+  assert.equal(currentBytes.split(fixedDebt).length, 2, 'exactly one authorized debt diagnostic in CI YAML');
+  assert.equal(currentBytes.split(oldDebt).length, 1, 'the masking debt diagnostic is absent from CI YAML');
+  assert.equal(currentBytes.replace(fixedBytes, () => oldBytes).replace(fixedDebt, () => oldDebt), lf(historicalSource),
+    'inverse reader and debt-diagnostic replacement preserves every other CI byte, including the declared debt');
 }
 acceptance('CI W1 matches release and every other CI byte remains unchanged', 'ci-parity', () => validateCIHistory(readFileSync(join(root, '.github/workflows/ci.yml'), 'utf8')));
 
@@ -980,13 +1007,19 @@ for (const [name, mutate] of mutants) acceptance(`mutant rejected: ${name}`, 'mu
 const persistenceFiles = readdirSync(join(root, 'tests/session/persistence')).filter(n => n.endsWith('.test.ts')).sort();
 assert.ok(persistenceFiles.length > 0);
 const persistenceArgv = ['--test', ...persistenceFiles.map(n => `dist/tests/session/persistence/${n.replace(/\.ts$/, '.js')}`)];
+const debtArgv = ['scripts/run-tests.mjs'];
 const argvByCommand = {
   persistence: persistenceArgv,
   ciPersistence: persistenceArgv,
   declaration: ['-p', "JSON.stringify(require('./package.json').os)"],
   init: ['bin/init/cli.mjs', 'init'],
   npm: ['ci'],
+  ciDebt: debtArgv,
+  ciDebtBaseline: debtArgv,
 };
+// Step-level `env:` from the workflow itself; the debt bodies read it under `set -u`.
+const debtCommandEnv = { EXPECTED_WIN32_FAILURES: declaredDebt };
+const commandEnv = { ciDebt: debtCommandEnv, ciDebtBaseline: debtCommandEnv };
 function execute(key, fixture, label) {
   const directory = mkdtempSync(join(admin, `${key}-`));
   const bin = join(directory, 'mock-bin');
@@ -1010,7 +1043,8 @@ function execute(key, fixture, label) {
   const result = spawnSync(bash, argv, {
     cwd: directory, encoding: 'utf8', timeout,
     env: { PATH: bin, RUNNER_TEMP: directory, TMPDIR: directory, LC_ALL: 'C',
-      FIXTURE_OUTPUT: output, FIXTURE_RECORD: record, FIXTURE_EXIT: String(fixture.exit) },
+      FIXTURE_OUTPUT: output, FIXTURE_RECORD: record, FIXTURE_EXIT: String(fixture.exit),
+      ...(commandEnv[key] ?? {}) },
   });
   const invocation = { kind: key, label, directory, executable: bash, argv,
     timeout, fixture, exit: result.status, signal: result.signal,
@@ -1109,6 +1143,142 @@ const ciReplayFixtures = [
 for (const fixture of ciReplayFixtures) acceptance(`CI W1 replay: ${fixture.name}`, 'ci-runtime', () => {
   const exit = execute('ciPersistence', fixture, fixture.name);
   assert.equal(exit === 0, fixture.accept, `CI W1 must ${fixture.accept ? 'accept' : 'reject'}; actual exit ${exit}`);
+});
+// #1171 — synthetic-log oracles for the full-suite debt step. Both bodies are driven through
+// the same test-owned fake `node`, so nothing here runs a product command or touches Windows.
+// The declared-debt run is the only accepted shape; every other fixture must stay nonzero.
+const debtFixture = (tests, fail, skip, notOk = []) =>
+  `TAP version 13\n1..${tests}\n${notOk.map(name => `not ok ${name}\n`).join('')}` +
+  `# tests ${tests}\n# pass ${tests - fail - skip}\n# fail ${fail}\n# skipped ${skip}\n`;
+// The observed reproduction: runs 36269992125 and 36271672360 both report 1298/109/5.
+const observedNotOk = ['13 - T140-dispatch-model-routing', '352 - hitl/web-auth', '634 - receipt fault boundary'];
+const observedRun = debtFixture(1298, 109, 5, observedNotOk);
+const acceptedRun = debtFixture(1298, 33, 0);
+// The runner's own exit status is deliberately ignored by both bodies, so every fixture is
+// replayed with a nonzero fake runner exit; only the parsed summary may decide the outcome.
+function runDebt(key, output, label) {
+  const exit = execute(key, { output, exit: 1 }, label);
+  const { stdout, stderr } = invocations[invocations.length - 1];
+  const out = stdout + stderr;
+  return { exit, out, annotations: out.split('\n').filter(line => line.startsWith('::error::')) };
+}
+const mentions = (result, needle) => result.annotations.some(line => line.includes(needle));
+acceptance('CI debt baseline masks the failure debt behind the skip gate', 'ci-debt', () => {
+  const result = runDebt('ciDebtBaseline', observedRun, 'baseline observed 1298/109/5');
+  assert.equal(result.exit, 1, 'the job did fail');
+  assert.deepEqual(result.annotations.length, 1, `one annotation only: ${JSON.stringify(result.annotations)}`);
+  assert.ok(mentions(result, '5 test(s) skipped on win32'), 'and it named only the skips');
+  assert.ok(!result.out.includes('--- failures this run ---'), 'the ratchet never ran');
+  assert.ok(!mentions(result, 'win32 failures'), '109 was never compared to the declared 33');
+});
+acceptance('CI debt candidate reports the skips and the failure debt together', 'ci-debt', () => {
+  const result = runDebt('ciDebt', observedRun, 'candidate observed 1298/109/5');
+  assert.equal(result.exit, 1, 'the failure is retained, not downgraded');
+  assert.ok(mentions(result, '5 test(s) skipped on win32'), 'skips still reported');
+  assert.ok(mentions(result, 'win32 failures rose to 109 from the declared 33'), 'debt now reported too');
+  assert.ok(mentions(result, '2 win32 gate violation(s) reported above'));
+  const marker = result.out.indexOf('--- failures this run ---');
+  assert.ok(marker >= 0, 'the failing test names are emitted');
+  const listed = result.out.slice(marker);
+  for (const name of observedNotOk) assert.ok(listed.includes(`not ok ${name}`), `named after the marker: ${name}`);
+  assert.ok(!mentions(result, 'tests were enumerated'), 'an enumerated count of 1298 is not a violation');
+});
+acceptance('CI debt still accepts the exact historical declared-debt run', 'ci-debt', () => {
+  for (const key of ['ciDebtBaseline', 'ciDebt']) {
+    const result = runDebt(key, acceptedRun, `${key} accepted 1298/33/0`);
+    assert.equal(result.exit, 0, `${key}: acceptance is unchanged, never relaxed or tightened here`);
+    assert.deepEqual(result.annotations, []);
+  }
+});
+acceptance('CI debt reports a low enumeration count alongside the other reasons', 'ci-debt', () => {
+  const result = runDebt('ciDebt', debtFixture(150, 109, 5, observedNotOk), 'candidate 150/109/5');
+  assert.equal(result.exit, 1);
+  assert.ok(mentions(result, 'only 150 tests were enumerated'));
+  assert.ok(mentions(result, '5 test(s) skipped on win32'));
+  assert.ok(mentions(result, 'win32 failures rose to 109 from the declared 33'));
+  assert.ok(mentions(result, '3 win32 gate violation(s) reported above'));
+});
+acceptance('CI debt keeps the minimum enumerated count above 200 exactly', 'ci-debt', () => {
+  const low = runDebt('ciDebt', debtFixture(200, 33, 0), 'candidate exactly 200 enumerated');
+  assert.equal(low.exit, 1);
+  assert.ok(mentions(low, 'only 200 tests were enumerated'));
+  assert.ok(mentions(low, '1 win32 gate violation(s) reported above'));
+  assert.equal(runDebt('ciDebt', debtFixture(201, 33, 0), 'candidate 201 enumerated').exit, 0);
+});
+// Digit-only is not the same as comparable: a count that clears the integer-shape guard can
+// still be unrepresentable by Bash's integer comparison, which makes `[` exit 2. Keeping a TRUE
+// `-gt` as the success condition is what holds that a refusal; a bare `-le` inversion would read
+// the error as "no violation" and let an otherwise 33/0 run through. Both bodies must stay
+// nonzero here. NOT EXECUTED in the authoring lane — the independent tester owns this run.
+const oversizedRun = acceptedRun.replace('# tests 1298', `# tests ${'9'.repeat(25)}`);
+acceptance('CI debt refuses an oversized digit-only enumerated count in both bodies', 'ci-debt', () => {
+  for (const key of ['ciDebtBaseline', 'ciDebt']) {
+    const result = runDebt(key, oversizedRun, `${key} oversized enumerated count`);
+    assert.notEqual(result.exit, 0, `${key}: a count it cannot compare is never a pass`);
+  }
+  const candidate = runDebt('ciDebt', oversizedRun, 'candidate oversized enumerated count reason');
+  assert.ok(mentions(candidate, 'tests were enumerated'), 'the unusable count is the reported reason');
+  assert.ok(mentions(candidate, '1 win32 gate violation(s) reported above'));
+});
+acceptance('CI debt rejects skips alone without inventing a debt mismatch', 'ci-debt', () => {
+  const result = runDebt('ciDebt', debtFixture(1298, 33, 5), 'candidate 1298/33/5');
+  assert.equal(result.exit, 1);
+  assert.ok(mentions(result, '5 test(s) skipped on win32'));
+  assert.ok(!result.out.includes('--- failures this run ---'), 'a matched debt is not a failure reason');
+  assert.ok(mentions(result, '1 win32 gate violation(s) reported above'));
+});
+for (const [label, fail, phrase] of [
+  ['upward', 34, 'win32 failures rose to 34 from the declared 33'],
+  ['downward', 20, 'win32 failures fell to 20 from the declared 33'],
+  ['fully repaired', 0, 'win32 failures fell to 0 from the declared 33'],
+]) acceptance(`CI debt rejects a ${label} debt mismatch`, 'ci-debt', () => {
+  const result = runDebt('ciDebt', debtFixture(1298, fail, 0, observedNotOk), `candidate ${label} mismatch`);
+  assert.equal(result.exit, 1, 'the ratchet is exact in both directions');
+  assert.ok(mentions(result, phrase));
+  assert.ok(mentions(result, '1 win32 gate violation(s) reported above'));
+});
+// Fail-closed parsing, unchanged by #1171 and asserted here as it actually behaves. A summary
+// record that is absent entirely makes `read_count`'s grep fail, and under the step's own
+// `set -e`/`pipefail` the assignment ends the step before any annotation is emitted. That is a
+// refusal, so it is preserved verbatim; the collect-every-reason change above deliberately
+// covers only the test-count, skip and debt violations, which are reached with counts in hand.
+for (const [label, output] of [
+  ['an empty log', ''],
+  ['a missing tests record', acceptedRun.replace('# tests 1298\n', '')],
+  ['a missing fail record', acceptedRun.replace('# fail 33\n', '')],
+  ['a missing skipped record', acceptedRun.replace('# skipped 0\n', '')],
+]) acceptance(`CI debt refuses ${label} without reporting a reason it did not read`, 'ci-debt', () => {
+  for (const key of ['ciDebtBaseline', 'ciDebt']) {
+    const result = runDebt(key, output, `${key} refuses ${label}`);
+    assert.equal(result.exit, 1, `${key}: a summary it could not read is never a pass`);
+    assert.deepEqual(result.annotations, [], `${key}: refusal shape is unchanged`);
+  }
+});
+// A record that is present but unreadable does reach the guards, and there the reason is named.
+// Both spellings refuse; neither may diagnose a count from a field it never validated.
+for (const [label, output, phrase] of [
+  ['an empty tests value', acceptedRun.replace('# tests 1298', '# tests '), 'could not parse the TAP summary'],
+  ['an empty fail value', acceptedRun.replace('# fail 33', '# fail '), 'could not parse the TAP summary'],
+  ['a non-numeric tests value', acceptedRun.replace('# tests 1298', '# tests nope'), 'are not plain integers'],
+  ['a non-numeric fail value', acceptedRun.replace('# fail 33', '# fail many'), 'are not plain integers'],
+  ['a negative skipped value', acceptedRun.replace('# skipped 0', '# skipped -1'), 'are not plain integers'],
+  ['a decimal tests value', acceptedRun.replace('# tests 1298', '# tests 1298.0'), 'are not plain integers'],
+]) acceptance(`CI debt refuses ${label}`, 'ci-debt', () => {
+  const result = runDebt('ciDebt', output, `candidate refuses ${label}`);
+  assert.equal(result.exit, 1, 'a summary it could not read is never a pass');
+  assert.ok(mentions(result, phrase), `expected "${phrase}" in ${JSON.stringify(result.annotations)}`);
+  assert.ok(!mentions(result, 'tests were enumerated'), 'no count is diagnosed from an unvalidated field');
+  assert.ok(!mentions(result, 'win32 failures'), 'no debt comparison on an unvalidated field');
+});
+acceptance('CI debt accepts an LF summary and still refuses a CRLF one', 'ci-debt', () => {
+  assert.equal(runDebt('ciDebt', acceptedRun, 'candidate LF summary').exit, 0, 'LF is the accepted encoding');
+  const crlf = acceptedRun.replaceAll('\n', '\r\n');
+  assert.equal(runDebt('ciDebtBaseline', crlf, 'baseline CRLF summary').exit, 1,
+    'the historical body already refused a CRLF summary; acceptance is not being widened');
+  const candidate = runDebt('ciDebt', crlf, 'candidate CRLF summary');
+  assert.equal(candidate.exit, 1, 'acceptance is unchanged: a CRLF summary is still refused');
+  assert.ok(mentions(candidate, 'are not plain integers'), 'now refused for the reason it actually failed');
+  assert.ok(!mentions(candidate, 'tests were enumerated'), 'and not as a count problem it never had');
 });
 for (const [key, fixture] of [
   ['declaration', { output: '["win32"]', exit: 0 }],
@@ -1903,6 +2073,33 @@ const releaseBrowserMutations = [
   ['original release version input changed', '          RELEASE_VERSION: ${{ steps.identity.outputs.version }}\n', '          RELEASE_VERSION: arbitrary\n'],
   ['publish authentication changed', '          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n', '          NODE_AUTH_TOKEN: arbitrary\n'],
 ];
+// #1171 — CI-only. The debt step's exception is granted for a diagnostic control-flow change and
+// nothing else, so each negative below relaxes exactly one bound that change may not move: the
+// declared debt, the enumeration floor, the zero-skip rule, the nonzero exit, the integer
+// validation that keeps the comparisons off unread fields, or the count of reported violations.
+// The last one restores the masking body itself, which the exception must no longer admit.
+const ciDebtMutations = [
+  ['debt threshold reinterprets the observed 109 as approved', "EXPECTED_WIN32_FAILURES: '33'", "EXPECTED_WIN32_FAILURES: '109'"],
+  ['enumerated-test floor dropped', '          if [ "${TESTS}" -gt 200 ]; then\n', '          if [ "${TESTS}" -gt 0 ]; then\n'],
+  // The correction itself: a bare `-le` inversion makes a comparison ERROR (`[` exit 2) read as
+  // "no violation", so an unrepresentable but digit-only count could leave VIOLATIONS=0.
+  ['enumeration success condition inverted so a comparison error stops being a violation',
+    '          if [ "${TESTS}" -gt 200 ]; then\n            :\n          else\n', '          if [ "${TESTS}" -le 200 ]; then\n'],
+  ['test skips become an accepted currency', '          if [ "${SKIP}" != "0" ]; then\n', '          if [ "${SKIP}" -gt 5 ]; then\n'],
+  ['collected violations no longer fail the job',
+    '          [ "${VIOLATIONS}" = "0" ] || { echo "::error::${VIOLATIONS} win32 gate violation(s) reported above; every applicable diagnostic ran before this failure."; exit 1; }\n',
+    '          echo "${VIOLATIONS} win32 gate violation(s) reported above."\n'],
+  ['failure debt is reported but not counted as a violation',
+    '            fi\n            VIOLATIONS=$((VIOLATIONS + 1))\n          fi\n', '            fi\n          fi\n'],
+  ['integer validation dropped before the comparisons',
+    '          case "${TESTS}${FAIL}${SKIP}" in\n'
+      + '            *[!0-9]*) echo "::error::the TAP summary counts are not plain integers (tests=\'${TESTS}\' fail=\'${FAIL}\' skipped=\'${SKIP}\'); refusing to compare them."; exit 1;;\n'
+      + '          esac\n', ''],
+  ['fail-closed summary parsing dropped',
+    '          [ -n "${TESTS}" ] && [ -n "${FAIL}" ] && [ -n "${SKIP}" ] \\\n'
+      + '            || { echo "::error::could not parse the TAP summary; refusing to report a vacuous pass."; exit 1; }\n', ''],
+  ['masking early-exit debt step restored', debtIndent(commands.ciDebt), debtIndent(commands.ciDebtBaseline)],
+];
 const callerContracts = {
   CI: { addition: ciBrowserAddition, caller: ciHeadedCaller, run: ciDiagnosticRun },
   release: { addition: browserAddition, caller: headedCaller, run: xvfbLine },
@@ -1919,6 +2116,7 @@ for (const [workflowName, path] of [['CI', '.github/workflows/ci.yml'], ['releas
     const mutations = workflowName === 'CI' ? [
       ...browserMutations,
       ...ciDiagnosticMutations,
+      ...ciDebtMutations,
       ['unrelated comment byte changed', '# #894.', '# #894 changed.'],
       ['Windows debt threshold changed', "EXPECTED_WIN32_FAILURES: '33'", "EXPECTED_WIN32_FAILURES: '32'"],
     ] : [...browserMutations, ...releaseBrowserMutations];

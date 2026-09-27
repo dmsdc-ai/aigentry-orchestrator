@@ -820,9 +820,35 @@ jobs:
           TESTS="$(read_count tests)"; FAIL="$(read_count fail)"; SKIP="$(read_count skipped)"
           [ -n "${TESTS}" ] && [ -n "${FAIL}" ] && [ -n "${SKIP}" ] \
             || { echo "::error::could not parse the TAP summary; refusing to report a vacuous pass."; exit 1; }
+          # The checks below compare numbers. `-n` only proves a field was present, so prove it
+          # is a plain integer before any arithmetic runs on it — a `# tests nope` or a CR-suffixed
+          # field would otherwise reach `-gt` and be reported as a count problem it is not.
+          case "${TESTS}${FAIL}${SKIP}" in
+            *[!0-9]*) echo "::error::the TAP summary counts are not plain integers (tests='${TESTS}' fail='${FAIL}' skipped='${SKIP}'); refusing to compare them."; exit 1;;
+          esac
           echo "win32 full suite: tests=${TESTS} fail=${FAIL} skipped=${SKIP} (declared debt ${EXPECTED_WIN32_FAILURES})"
-          [ "${TESTS}" -gt 200 ] || { echo "::error::only ${TESTS} tests were enumerated. scripts/run-tests.mjs:31 normalises Windows separators for node --test; a low count means that enumeration is broken (U28)."; exit 1; }
-          [ "${SKIP}" = "0" ] || { echo "::error::${SKIP} test(s) skipped on win32. Skips are not an accepted currency here — see tests/dispatch/run-all.sh."; exit 1; }
+          # DIAGNOSTIC CONTROL FLOW ONLY — nothing here is accepted that was not accepted before.
+          # Each of these used to `exit 1` where it stood, so the FIRST violation was the only one
+          # ever reported: run 36269992125 skipped 5 tests and failed 109, and the job's single
+          # annotation said "5 test(s) skipped". The 109 was printed as data and never compared to
+          # the declared debt. Collect every applicable violation, report all of them, then fail.
+          VIOLATIONS=0
+          # A TRUE `-gt` is the success condition, exactly as it was before this step learned to
+          # collect reasons. Inverting it to `-le` would be strictly weaker: `[` exits 2 when the
+          # comparison cannot be evaluated — digit-only does not prove a value is representable
+          # by Bash integer comparison — and an `if` reads that error as "no violation", so a
+          # 33/0 run could still leave VIOLATIONS=0. False AND error both fall to the violation
+          # branch here; only a comparison that succeeds and is true clears this check.
+          if [ "${TESTS}" -gt 200 ]; then
+            :
+          else
+            echo "::error::only ${TESTS} tests were enumerated. scripts/run-tests.mjs:31 normalises Windows separators for node --test; a low count means that enumeration is broken (U28)."
+            VIOLATIONS=$((VIOLATIONS + 1))
+          fi
+          if [ "${SKIP}" != "0" ]; then
+            echo "::error::${SKIP} test(s) skipped on win32. Skips are not an accepted currency here — see tests/dispatch/run-all.sh."
+            VIOLATIONS=$((VIOLATIONS + 1))
+          fi
           if [ "${FAIL}" != "${EXPECTED_WIN32_FAILURES}" ]; then
             echo "--- failures this run ---"
             grep '^not ok' "${RUNNER_TEMP}/full.log" || true
@@ -831,8 +857,9 @@ jobs:
             else
               echo "::error::win32 failures fell to ${FAIL} from the declared ${EXPECTED_WIN32_FAILURES}. Windows got better — lower EXPECTED_WIN32_FAILURES and update the family breakdown above, so the next regression is still caught."
             fi
-            exit 1
+            VIOLATIONS=$((VIOLATIONS + 1))
           fi
+          [ "${VIOLATIONS}" = "0" ] || { echo "::error::${VIOLATIONS} win32 gate violation(s) reported above; every applicable diagnostic ran before this failure."; exit 1; }
 
       # U21 — a `.mjs` bin has never been installed on Windows from this package, and npm
       # generates its shims (.cmd/.ps1) from the shebang. If cmd-shim mishandled the .mjs
