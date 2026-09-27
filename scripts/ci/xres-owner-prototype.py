@@ -100,7 +100,14 @@ RECORD = re.compile(
     r" step6=(?P<step6>ok|badwindow|-) xres-status=(?P<xres_status>success|failed|-)"
     r" num-ids=(?P<num_ids>[0-9]+|-) length=(?P<length>[0-9]+|-)"
     r" pid=(?P<pid>[0-9]+|-) owner-pid=(?P<owner_pid>[0-9]+|-)"
-    r" server-version=(?P<version>[0-9]+\.[0-9]+|-) x-error=(?P<x_error>[0-9]+/[0-9]+|-)\)$")
+    r" server-version=(?P<version>[0-9]+\.[0-9]+|-) x-error=(?P<x_error>[0-9]+/[0-9]+|-)"
+    # The three ownership diagnostics, appended by the probe AFTER x-error. `refusal` is
+    # matched as an explicit CLOSED alternation, not a character class: an unrecognised
+    # token must make the whole record unparsable rather than be carried through as an
+    # unknown string, which is the same refusal-on-unknown rule the rest of this file keeps.
+    r" ret-client=(?P<ret_client>0x[0-9a-f]+|-) ret-mask=(?P<ret_mask>0x[0-9a-f]+|-)"
+    r" refusal=(?P<refusal>xres-status|num-ids-zero|num-ids-many|ids-null"
+    r"|client-mismatch|mask-mismatch|length-range|value-null|pid-invalid|-)\)$")
 
 HELPER_READY = re.compile(
     r"^xres-owner-helper \(state=(?P<state>ready|failed)"
@@ -278,6 +285,18 @@ def artificial(fields):
         return True
     return fields["instrumented"] == "yes" or fields["mode"] != "wm" or \
         fields["grab"] != "held"
+
+
+def diagnostics(fields):
+    """The probe's three ownership diagnostics, rendered for the two O-G records that build
+    their evidence from selected fields rather than carrying the probe's raw stdout — without
+    this they are the only failing oracles whose refusal branch stays invisible. Bounded:
+    three already-parsed fields, no new parsing and no new output shape. Reports nothing but
+    what the record carried, and never influences any pass/fail decision."""
+    if fields is None:
+        return "ret-client=- ret-mask=- refusal=-"
+    return ("ret-client=%s ret-mask=%s refusal=%s"
+            % (fields["ret_client"], fields["ret_mask"], fields["refusal"]))
 
 
 # ----------------------------------------------------------------------- the helper ---
@@ -501,9 +520,9 @@ def oracle_grab_holds(helper_a, window_a):
                   % (fields["grab"], fields["existence"], fields["step6"],
                      fields["verdict"]),
                   "helper-destroy-reply-blocked-until-ungrab=%s reply=\"%s\""
-                  " in-grab-delay-ms=%s elapsed=%.2fs"
+                  " in-grab-delay-ms=%s elapsed=%.2fs %s"
                   % ("yes" if blocked else "no", reply, fields["delay_ms"],
-                     probe_exited - started))
+                     probe_exited - started, diagnostics(fields)))
 
 
 def oracle_after_ungrab(helper_a, window_a):
@@ -553,8 +572,8 @@ def oracle_no_grab(helper, window):
                   "grab=%s existence=%s step6=%s verdict=%s"
                   % (fields["grab"], fields["existence"], fields["step6"],
                      fields["verdict"]),
-                  "control-only (instrumented=%s) helper-reply=\"%s\""
-                  % (fields["instrumented"], reply))
+                  "control-only (instrumented=%s) helper-reply=\"%s\" %s"
+                  % (fields["instrumented"], reply, diagnostics(fields)))
 
 
 def oracle_owner_exit():

@@ -135,7 +135,10 @@
 #define BOGUS_TRIES  4096
 #define OUTSIDE_TRIES 512
 
-#define RECORD_MAX 512
+/* Raised from 512 when the three ownership diagnostics below were added. Widest renderable
+ * record is ~473 bytes with every field simultaneously at its maximum width; a silently
+ * truncated line would fail the caller's strict whole-line parse instead of measuring. */
+#define RECORD_MAX 768
 
 /* ------------------------------------------------------------------ record state --- */
 
@@ -160,6 +163,23 @@ static long        f_owner_pid   = -1;
 static int         f_major       = -1;
 static int         f_minor       = -1;
 
+/* Ownership diagnostics (#1177 measurement phase). PURELY ADDITIVE: nothing below is read
+ * by any verdict, comparison or exit-status decision — they only make an already-taken
+ * refusal legible. `ret-client`/`ret-mask` are the spec the SERVER returned in ids[0], and
+ * are populated ONLY after the status/count/NULL guards in query_ownership() have passed,
+ * so neither is ever produced by dereferencing an unvalidated pointer.
+ *
+ * f_refusal is a CLOSED set of nine tokens, one per existing refusal branch, and never
+ * anything else:
+ *   xres-status | num-ids-zero | num-ids-many | ids-null | client-mismatch
+ *   | mask-mismatch | length-range | value-null | pid-invalid
+ * "-" means query_ownership() either was not reached or returned NULL (no refusal). */
+static XID          f_ret_client     = 0;
+static int          f_ret_client_set = 0;
+static unsigned int f_ret_mask       = 0;   /* XResClientIdSpec.mask is unsigned int */
+static int          f_ret_mask_set   = 0;
+static const char  *f_refusal        = "-";
+
 static Display          *g_dpy      = NULL;
 static XResClientIdValue *g_ids     = NULL;
 static long               g_num_ids = 0;
@@ -180,7 +200,7 @@ static int   g_alarm_len = 0;
 static int render(char *buf, size_t cap, const char *verdict)
 {
     char window[24], probed[24], nids[24], len[24], pid[24], owner[24];
-    char version[24], xerr[24];
+    char version[24], xerr[24], retclient[24], retmask[24];
 
     if (f_window_set) snprintf(window, sizeof window, "0x%lx", (unsigned long) f_window);
     else              snprintf(window, sizeof window, "-");
@@ -199,15 +219,24 @@ static int render(char *buf, size_t cap, const char *verdict)
     if (g_errors) snprintf(xerr, sizeof xerr, "%u/%u",
                            (unsigned) g_error_code, (unsigned) g_error_request);
     else          snprintf(xerr, sizeof xerr, "-");
+    /* Set together, and only after query_ownership()'s pointer/count guards. */
+    if (f_ret_client_set) snprintf(retclient, sizeof retclient, "0x%lx",
+                                   (unsigned long) f_ret_client);
+    else                  snprintf(retclient, sizeof retclient, "-");
+    if (f_ret_mask_set) snprintf(retmask, sizeof retmask, "0x%x", f_ret_mask);
+    else                snprintf(retmask, sizeof retmask, "-");
 
+    /* The three diagnostics are APPENDED at the end of the established field order, so
+     * every pre-existing field keeps its position for the caller's strict pattern. */
     return snprintf(buf, cap,
                     "xres-owner (verdict=%s mode=%s grab=%s instrumented=%s delay-ms=%ld"
                     " window=%s probed-xid=%s existence=%s step6=%s xres-status=%s"
                     " num-ids=%s length=%s pid=%s owner-pid=%s server-version=%s"
-                    " x-error=%s)\n",
+                    " x-error=%s ret-client=%s ret-mask=%s refusal=%s)\n",
                     verdict, f_mode, f_grab, f_instrumented, f_delay_ms,
                     window, probed, f_existence, f_step6, f_xres_status,
-                    nids, len, pid, owner, version, xerr);
+                    nids, len, pid, owner, version, xerr,
+                    retclient, retmask, f_refusal);
 }
 
 /* Refresh the handler's copy. Called before the grab is taken and again after each step
@@ -399,6 +428,14 @@ static const char *query_ownership(XID w)
     spec.client = w;                              /* one non-wildcard spec; never None */
     spec.mask = XRES_CLIENT_ID_PID_MASK;
 
+    /* Reset the diagnostics on entry so this call can never publish an earlier call's
+     * values, and so "-" always means "not reached on this call". */
+    f_ret_client = 0;
+    f_ret_client_set = 0;
+    f_ret_mask = 0;
+    f_ret_mask_set = 0;
+    f_refusal = "-";
+
     clear_errors();
     status = XResQueryClientIds(g_dpy, 1, &spec, &num_ids, &ids);
     XSync(g_dpy, False);
@@ -407,22 +444,44 @@ static const char *query_ownership(XID w)
     f_num_ids = num_ids;
     f_xres_status = (status == Success) ? "success" : "failed";
 
-    if (status != Success) return "owner-refused";
-    if (num_ids == 0) return "owner-unknown";      /* NOT absence, never downgraded */
-    if (num_ids > 1) return "owner-ambiguous";
-    if (ids == NULL) return "owner-malformed";
-    if (ids[0].spec.client != w) return "owner-ambiguous";
-    if (ids[0].spec.mask != (unsigned int) XRES_CLIENT_ID_PID_MASK) return "owner-ambiguous";
+    if (status != Success) { f_refusal = "xres-status"; return "owner-refused"; }
+    /* NOT absence, never downgraded */
+    if (num_ids == 0) { f_refusal = "num-ids-zero"; return "owner-unknown"; }
+    if (num_ids > 1) { f_refusal = "num-ids-many"; return "owner-ambiguous"; }
+    if (ids == NULL) { f_refusal = "ids-null"; return "owner-malformed"; }
+
+    /* Pointer and count are now BOTH validated — ids is non-NULL and holds exactly one
+     * entry — so reading ids[0].spec here is the first safe point. Record what the SERVER
+     * actually returned before the comparisons below consume it: with only num-ids=1,
+     * existence=ok, length=- and pid=- in the record, the two `owner-ambiguous` branches
+     * that follow are indistinguishable from each other. This touches ids[0].spec ONLY;
+     * ids[0].length and ids[0].value stay behind their own existing guards. */
+    f_ret_client = ids[0].spec.client;
+    f_ret_client_set = 1;
+    f_ret_mask = ids[0].spec.mask;
+    f_ret_mask_set = 1;
+
+    if (ids[0].spec.client != w) {
+        f_refusal = "client-mismatch";
+        return "owner-ambiguous";
+    }
+    if (ids[0].spec.mask != (unsigned int) XRES_CLIENT_ID_PID_MASK) {
+        f_refusal = "mask-mismatch";
+        return "owner-ambiguous";
+    }
 
     f_length = ids[0].length;
     /* Bound BEFORE any dereference of value: the public field is a signed long, so this
      * also rejects negatives, and libXres does not sanity-bound its malloc. */
-    if (ids[0].length < LENGTH_MIN || ids[0].length > LENGTH_MAX) return "owner-malformed";
-    if (ids[0].value == NULL) return "owner-malformed";
+    if (ids[0].length < LENGTH_MIN || ids[0].length > LENGTH_MAX) {
+        f_refusal = "length-range";
+        return "owner-malformed";
+    }
+    if (ids[0].value == NULL) { f_refusal = "value-null"; return "owner-malformed"; }
 
     pid = XResGetClientPid(&ids[0]);               /* -1 when there is no pid */
     f_pid = (long) pid;
-    if (pid <= 0 || pid == (pid_t) -1) return "owner-malformed";
+    if (pid <= 0 || pid == (pid_t) -1) { f_refusal = "pid-invalid"; return "owner-malformed"; }
     return NULL;
 }
 
