@@ -20,8 +20,15 @@ name: XRes owned-window prototype (#1177, isolated, probe branch or manual)
 #     SEPARATE, later, reviewed change, and it may only be proposed after this prototype
 #     has succeeded on its own.
 #   * A run here is a MEASUREMENT of the compile and the oracles, not a pass. `O-5-capability`
-#     is still UNRUN and therefore still FAILS the harness on purpose; it is not deleted,
-#     masked or relabelled, and this lane is expected to be red until it is genuinely closed.
+#     is no longer unrun: the harness starts a SECOND Xvfb it owns, on the private display
+#     that server picks and reports over `-displayfd` (so the display provably belongs to
+#     the harness's own child, not to whatever answered a guessed number), with the
+#     X-Resource extension disabled (`-extension X-Resource`), proves that
+#     server is alive and its connection usable while the capability is absent, and requires
+#     the probe's `xres-unavailable` refusal there. It is still not deleted, masked or
+#     relabelled — any other verdict, or a server that will not start, FAILS. `xres-too-old`
+#     stays unexercised, because no server advertising < 1.2 exists in this lane. This lane
+#     is expected to stay red while any other oracle is failing.
 #
 # WHY A PROBE-BRANCH PUSH, AND WHY STILL A SEPARATE FILE
 #   `workflow_dispatch` is kept, but it cannot be used yet: GitHub only offers the manual
@@ -42,6 +49,15 @@ name: XRes owned-window prototype (#1177, isolated, probe branch or manual)
 #   The display is private: `xvfb-run -a` picks a free server number, `-nolisten tcp`
 #   keeps the server off the network entirely, and `umask 077` is set before the wrapper
 #   creates the X authority cookie so it is owner-only by construction.
+#   O-5's second server is private on the same terms and adds no privilege: the harness
+#   starts it itself with `-nolisten tcp`, its own freshly generated cookie under `-auth`
+#   in a 0700 directory it created, and stops and joins it on every path. Access control is
+#   added there, never relaxed; `-ac` is never passed; no personal display, cookie or
+#   authority is inherited. That cookie file exists BEFORE the server is exec'd, because a
+#   server whose `-auth` file has no valid entry when its first client connects enables
+#   local access instead (xserver os/auth.c:180-202) — so the ordering is not a style
+#   choice. The display number is the server's own: it is taken from `-displayfd`, not
+#   chosen by the harness and not guessed.
 #
 # WHY ubuntu-22.04 AND NOT `ubuntu-latest`
 #   CONTRACT-r2 §C is version-exact for jammy: `libxres1` there is `2:1.2.1-1`, and the
@@ -83,7 +99,9 @@ jobs:
           sudo apt-get update
           # `libxres-dev` + `libx11-dev` are the build dependency CONTRACT-r2 §C names;
           # `openbox` is the real window manager the positive oracle needs; `x11-utils`
-          # supplies the `xprop` the harness's own baseline chain reads. Nothing else.
+          # supplies both the `xprop` the harness's own baseline chain reads and the
+          # `xdpyinfo` O-5 reads its extension lists with. Nothing else, and nothing new:
+          # `xdpyinfo` ships in the `x11-utils` this lane already installed for `xprop`.
           sudo apt-get install -y --no-install-recommends \
             libxres-dev libx11-dev openbox x11-utils
           # Presence is PROVED, the way ci.yml proves openbox/xprop/python3 today, rather
@@ -94,6 +112,7 @@ jobs:
           command -v python3
           command -v openbox
           command -v xprop
+          command -v xdpyinfo
           command -v Xvfb
           command -v xvfb-run
           command -v xauth
@@ -128,9 +147,10 @@ jobs:
 
       # The whole prototype, inside ONE `xvfb-run` so every oracle sees the same private
       # server number: `-a` picks a fresh one per invocation, so a second step would be
-      # talking to a different display. The harness starts, owns and stops its own Openbox
-      # and its own helper clients; nothing foreign is signalled and no process list is
-      # scanned. A failed OR unrun oracle exits non-zero, so an oracle that did not run can
+      # talking to a different display. The harness starts, owns and stops its own Openbox,
+      # its own helper clients and — for O-5 only — its own second, XRes-less Xvfb on the
+      # display number that server itself reports back over `-displayfd`; nothing foreign is
+      # signalled, no display number is guessed and no process list is scanned. A failed OR unrun oracle exits non-zero, so an oracle that did not run can
       # never be read here as one that passed.
       - name: Exercise the r2 oracles on a private display
         env:

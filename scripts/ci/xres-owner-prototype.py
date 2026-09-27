@@ -41,9 +41,23 @@ WHAT IT MEASURES (CONTRACT-r2 §D; a failed OR unrun oracle BLOCKS)
                    is REPLACED here because Xvfb is not a process this harness owns and
                    signalling a foreign process is forbidden. The substitution is recorded
                    as a deviation, not hidden.
-  O-5-capability   NOT RUN. There is no XRes-less server, and no server advertising
-                   < 1.2, in this lane. Reported OPEN and it BLOCKS. It is never reported
-                   as passed.
+  O-5-capability   a REAL observation, no longer a waiver: a SECOND Xvfb that this
+                   harness starts, owns and stops, on a private display, with the
+                   X-Resource extension DISABLED at the server (`-extension X-Resource`,
+                   Xserver.man:174-178; the name is miinitext.c:158 / XResproto.h:11).
+                   The probe there must answer `xres-unavailable` at the capability gate.
+                   Three things make it an observation rather than an error. The display is
+                   not guessed: the server picks a free number itself and reports it over
+                   `-displayfd` on a pipe only that one owned child inherited, read under a
+                   fixed byte and time bound (Xserver.man:150-155, connection.c:195-270), so
+                   the display provably belongs to this handle's server. The server is
+                   PROVED alive and its connection PROVED usable while the capability is
+                   absent, so this is never a bad-DISPLAY or refused-connection failure
+                   wearing a capability verdict's name. And it is authenticated from its
+                   first instant, because its cookie file exists before it is exec'd — see
+                   `owned_display` for why that ordering is forced by auth.c:180-202.
+                   `xres-too-old` stays UNEXERCISED: no server advertising < 1.2 exists in
+                   this lane, and this oracle does not pretend to cover it.
 
 DISCIPLINE THE HARNESS ITSELF KEEPS
   * Every child is a `Popen` handle this harness created. The handle is the only
@@ -70,9 +84,12 @@ DISCIPLINE THE HARNESS ITSELF KEEPS
 
 import os
 import re
+import select
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 READY_SECONDS = 30.0    # whole Openbox readiness phase, the baseline read included
@@ -86,6 +103,31 @@ POLL_SECONDS = 0.5      # cancellation poll at each wait taken before cleanup
 EVIDENCE_BYTES = 400    # per-stream cap on what one record may carry
 GRAB_DELAY_MS = 3000    # O-G artificial in-grab delay
 RACE_AT_MS = 1000       # when inside that delay the competing destroy is issued
+
+# O-5 only. Bounds for the second, XRes-less server this harness starts and owns.
+CAP_READY_SECONDS = 20.0    # bounded wait for that server's first usable answer
+CAP_TOOL_SECONDS = 5.0      # per `xdpyinfo` and per `xauth` bound
+CAP_POLL_SECONDS = 0.5      # gap between readiness attempts, and per pipe wait
+# The display number is NOT chosen here and is NOT guessed. The server picks a free one
+# itself and reports it back over `-displayfd` [Xserver.man:150-155; connection.c:249-270
+# binds the socket BEFORE the number exists, connection.c:195-206 writes it]. These bound
+# how long that report may take and how much may be read from the pipe: a display number
+# is at most five digits plus the newline the server writes.
+CAP_DISPLAYFD_SECONDS = 20.0
+CAP_DISPLAYFD_BYTES = 16
+CAP_SCREEN = "640x480x24"
+# The label the SERVER's own cookie entry carries. It is never examined: the server matches
+# entries in its `-auth` file by protocol name alone and never looks at the entry's
+# family, address or display number [auth.c:104-141]. The number that matters is on the
+# CLIENT side, and that file is written only once the server has said which display it
+# bound — see `owned_display`.
+CAP_AUTH_PLACEHOLDER = ":0"
+# The extension to disable, spelled exactly as the server registers it
+# [miinitext.c:158 `{ResExtensionInit, "X-Resource", &noResExtension}`; XResproto.h:11
+# `#define XRES_NAME "X-Resource"`]. A misspelling is a NO-OP at the server
+# [miinitext.c:212-234], which leaves XRes ENABLED and makes O-5 fail — it can never fake
+# a pass.
+XRES_EXTENSION = "X-Resource"
 
 SUPPORTING = "_NET_SUPPORTING_WM_CHECK"
 
@@ -118,9 +160,20 @@ HELPER_READY = re.compile(
 # exact, because redacting more than a path is always safe here and redacting less is not.
 PATHLIKE = re.compile(b"/[^ ]*")
 
+# The extension list `xdpyinfo` prints, and nothing wider. The count it announces is
+# checked against the names actually read, so a shape this does not recognise is UNKNOWN
+# and is never reported as "the extension is absent".
+EXT_HEADER = re.compile(r"^number of extensions:\s+(?P<count>[0-9]+)$")
+EXT_NAME = re.compile(r"^[ \t]+(?P<name>\S+)$")
+
+# What the server may write on its `-displayfd` pipe, and nothing else: a display number.
+# Anything that does not match this whole pattern is malformed and REFUSES.
+DISPLAYFD = re.compile(r"^[0-9]{1,5}$")
+
 CANCELLED = []   # every INT/TERM the handler recorded, first signal first
 OWNED = []       # (handle, what) for every child this harness started, oldest first
 RESULTS = []     # one Outcome per oracle, in the order they ran
+PRIVATE = []     # directories this harness created for its OWN X authority cookies
 
 
 def cancel(number, frame):
@@ -214,8 +267,13 @@ def probe_path():
     return path
 
 
-def run_probe(argv, bound=PROBE_SECONDS):
+def run_probe(argv, bound=PROBE_SECONDS, env=None):
     """One bounded probe invocation. Returns (verdict, fields, evidence).
+
+    `env` defaults to None, which is "inherit this harness's environment" — exactly what
+    every oracle but O-5 does, unchanged. O-5 passes an environment whose `DISPLAY` and
+    `XAUTHORITY` name ITS OWN private, XRes-less server, so that probe cannot reach, and
+    cannot be confused with, the outer display.
 
     Classification, and the one place the probe's exit status is read:
       rc 0  -> the record must say `owned`
@@ -232,7 +290,7 @@ def run_probe(argv, bound=PROBE_SECONDS):
     try:
         done = subprocess.run(command, stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              timeout=bound)
+                              timeout=bound, env=env)
     except subprocess.TimeoutExpired as expired:
         return ("owner-unreadable", None,
                 "timed-out stdout=\"%s\" stderr=\"%s\""
@@ -654,14 +712,356 @@ def oracle_positive_real(wm, seen_window):
                   % (evidence, fields["version"], fields["length"], fields["num_ids"]))
 
 
-def oracle_capability_not_run():
-    """O-5. No XRes-less server and no server advertising < 1.2 exists in this lane, so
-    this was NOT RUN. It stays OPEN and it BLOCKS. It is not reported as passed, and the
-    `xres-unavailable` / `xres-too-old` code paths therefore remain UNEXERCISED."""
-    return record("O-5-capability", "not-run",
-                  "xres-unavailable / xres-too-old on a server without XRes >= 1.2",
-                  "no such server in this lane",
-                  "the capability-gate code paths are unexercised and this BLOCKS")
+def extension_list(env, what):
+    """One bounded `xdpyinfo` against exactly the display named in `env` (None inherits
+    this harness's own display). Returns (state, names, evidence).
+
+    `ok` means the connection was usable AND the list parsed with the count the server
+    itself announced. `unusable` means the display did not answer inside the bound.
+    `unknown` is any shape this does not recognise — and an unrecognised shape is NEVER
+    reported as an extension being absent, which is the same refusal-on-unknown rule
+    `xprop()` above keeps.
+    """
+    try:
+        done = subprocess.run(["xdpyinfo"], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=CAP_TOOL_SECONDS, env=env)
+    except subprocess.TimeoutExpired:
+        return ("unusable", None,
+                "%s xdpyinfo hit its %gs bound" % (what, CAP_TOOL_SECONDS))
+    except OSError as failure:
+        return ("unknown", None, "%s xdpyinfo not-invoked errno=%s" % (what, failure.errno))
+    if done.returncode != 0:
+        return ("unusable", None, "%s xdpyinfo exit-%d stderr=\"%s\""
+                % (what, done.returncode, render(done.stderr)))
+    lines = done.stdout.decode("utf-8", "replace").splitlines()
+    for index, line in enumerate(lines):
+        header = EXT_HEADER.match(line)
+        if header is None:
+            continue
+        names = []
+        for rest in lines[index + 1:]:
+            found = EXT_NAME.match(rest)
+            if found is None:
+                break
+            names.append(found.group("name"))
+        # The announced count must equal what was read, or this output was not the shape
+        # this parser understands and no conclusion about any extension follows from it.
+        if len(names) != int(header.group("count")):
+            return ("unknown", None, "%s xdpyinfo announced %s extensions and %d were read"
+                    % (what, header.group("count"), len(names)))
+        return ("ok", names, "%s extensions=%d" % (what, len(names)))
+    return ("unknown", None, "%s xdpyinfo printed no extension count" % what)
+
+
+def without_display(environ):
+    """A copy of `environ` with any inherited display and authority REMOVED. Used for the
+    one process that must not reference the outer display at all: O-5's own X server."""
+    stripped = dict(environ)
+    stripped.pop("DISPLAY", None)
+    stripped.pop("XAUTHORITY", None)
+    return stripped
+
+
+def add_cookie(authority, display, cookie):
+    """Write ONE MIT-MAGIC-COOKIE-1 entry with `xauth`, bounded. Returns None, or trouble
+    text.
+
+    The command goes in on STDIN (`xauth source -`), never on the argv, so the cookie value
+    never appears in any process's command line — the same reason Debian's `xvfb-run` feeds
+    `xauth` a heredoc. It is not logged here either; a cookie whose entry failed to be
+    written is never used for anything and dies with this run.
+    """
+    try:
+        added = subprocess.run(["xauth", "-f", authority, "source", "-"],
+                               input=("add %s . %s\n" % (display, cookie)).encode("ascii"),
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, timeout=CAP_TOOL_SECONDS)
+    except (subprocess.TimeoutExpired, OSError) as failure:
+        return ("the %s cookie entry could not be written (%s)"
+                % (display, type(failure).__name__))
+    if added.returncode != 0:
+        return ("xauth exit-%d for the %s entry stderr=\"%s\""
+                % (added.returncode, display, render(added.stderr)))
+    return None
+
+
+def read_displayfd(pipe, server):
+    """Read the display number THIS server chose, from the pipe only it inherited.
+
+    Returns (number-as-text, evidence) or (None, why-it-refused). Strict and bounded: at
+    most CAP_DISPLAYFD_BYTES bytes, within CAP_DISPLAYFD_SECONDS, terminated by the newline
+    the server writes [connection.c:195-206]. EOF, an over-long or malformed value, a
+    timeout, or a server that is not alive when the value arrives all REFUSE. There is no
+    fallback and nothing is guessed: if the pipe did not say it, this harness does not know
+    it.
+    """
+    deadline = time.monotonic() + CAP_DISPLAYFD_SECONDS
+    buffered = b""
+    while b"\n" not in buffered:
+        if CANCELLED:
+            return (None, "cancelled while waiting for the display number")
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return (None, "no display number within %gs (%d bytes read)"
+                    % (CAP_DISPLAYFD_SECONDS, len(buffered)))
+        try:
+            ready = select.select([pipe], [], [], min(CAP_POLL_SECONDS, left))[0]
+        except OSError as failure:
+            return (None, "the display pipe could not be waited on, errno=%s"
+                    % failure.errno)
+        if not ready:
+            if server.poll() is not None:
+                return (None, "the owned server exited with %d before reporting a display"
+                        % server.returncode)
+            continue
+        try:
+            chunk = os.read(pipe, CAP_DISPLAYFD_BYTES + 1 - len(buffered))
+        except OSError as failure:
+            return (None, "the display pipe could not be read, errno=%s" % failure.errno)
+        if not chunk:
+            # Only this server held the write end, so EOF means it closed or died without
+            # reporting. It is a refusal, never an invitation to pick a number.
+            return (None, "the display pipe reached EOF after %d bytes, so the owned server"
+                    " never reported a display" % len(buffered))
+        buffered += chunk
+        if b"\n" not in buffered and len(buffered) > CAP_DISPLAYFD_BYTES:
+            return (None, "the display pipe sent more than %d bytes with no newline"
+                    % CAP_DISPLAYFD_BYTES)
+    text = buffered.split(b"\n")[0].decode("ascii", "replace")
+    if not DISPLAYFD.match(text):
+        return (None, "the display pipe sent \"%s\", which is not a display number"
+                % render(buffered))
+    # The write end was inherited by THIS child alone, so a number that arrives here while
+    # that child is alive names a display THIS handle's server bound: the socket is created
+    # before the number exists [connection.c:249-270] and the number is written afterwards
+    # [connection.c:195-206]. This is the ownership binding, and it replaces guessing.
+    if server.poll() is not None:
+        return (None, "the owned server exited with %d as its display number arrived"
+                % server.returncode)
+    return (text, "displayfd=%s bytes=%d" % (text, len(buffered)))
+
+
+def owned_display():
+    """Start the ONE Xvfb O-5 owns, and let the SERVER choose and report its own display.
+
+    Returns (handle, env, names, evidence). `names` is non-None only when that server
+    answered and its extension list parsed; `handle` is None only when nothing was started
+    and so nothing needs stopping. Every handle it does create is OWNED, so the one cleanup
+    path stops and joins it even when this function gives up, and both pipe ends are closed
+    on every path.
+
+    WHY THE DISPLAY NUMBER IS NOT CHOSEN HERE
+      A guessed `:N` cannot be attributed to this handle: a foreign server may already hold
+      `N`, and mitigations around that (a fresh cookie, poll/query/poll) narrow the window
+      without proving whose server answered. So the server picks instead. `-displayfd`
+      makes it "attempt to listen on successively higher display numbers, and upon finding
+      a free one, write the display number back on this file descriptor as a
+      newline-terminated string" [Xserver.man:150-155] — the socket is bound BEFORE the
+      number is knowable [connection.c:249-270], and the write end of the pipe is inherited
+      by this ONE child and by nothing else (`pass_fds`, and Python's fds are
+      close-on-exec otherwise). No display number is passed on the argv, because an
+      explicit one would take precedence over `-displayfd` [connection.c:249].
+
+    THE AUTHENTICATION ORDERING, AND WHY IT IS THIS WAY ROUND
+      The server's `-auth` file MUST exist before the server accepts its first client:
+      `CheckAuthorization` loads it on the first connection, and if it finds no valid
+      entries it calls `EnableLocalAccess()` [auth.c:180-202] — i.e. creating the cookie
+      only after `-displayfd` reports would leave a genuine window in which any local
+      client could connect unauthenticated. So the server's cookie file is written BEFORE
+      exec and is never rewritten afterwards.
+      That is possible without knowing the display number because the server matches
+      entries in that file by protocol NAME alone and never examines the entry's family,
+      address or display number [auth.c:104-141, `LoadAuthorization`]; one valid entry is
+      also what makes it call `DisableLocalAccess()` [auth.c:197-199]. The display number
+      only matters to the CLIENT side, which looks an entry up by display — so a second
+      file, carrying the SAME cookie under the display the server actually reported, is
+      written once that number is known and before any client connects. Two files, one
+      cookie, no rewrite of the file the server reads, and no unauthenticated instant.
+      `-ac` is never passed, `-nolisten tcp` keeps the server off the network entirely
+      [Xserver.man:220-226], `-extension X-Resource` disables the named extension
+      [Xserver.man:174-178, options "all of the X servers accept" Xserver.man:70], and the
+      cookie is 128 bits from `os.urandom` inside a `mkdtemp` (0700) directory. No personal
+      display, cookie or authority is inherited or reused, and the cookie value is never
+      printed.
+    """
+    try:
+        directory = tempfile.mkdtemp(prefix="xres-o5-")
+    except OSError as failure:
+        return (None, None, None, "no private directory errno=%s" % failure.errno)
+    PRIVATE.append(directory)
+    server_auth = os.path.join(directory, "server.auth")
+    client_auth = os.path.join(directory, "client.auth")
+    cookie = os.urandom(16).hex()
+
+    # BEFORE exec, so there is no instant at which this server would enable local access.
+    trouble = add_cookie(server_auth, CAP_AUTH_PLACEHOLDER, cookie)
+    if trouble is not None:
+        return (None, None, None, trouble)
+
+    try:
+        reader, writer = os.pipe()
+    except OSError as failure:
+        return (None, None, None, "no display pipe errno=%s" % failure.errno)
+    server = None
+    try:
+        try:
+            server = subprocess.Popen(
+                ["Xvfb", "-displayfd", str(writer), "-screen", "0", CAP_SCREEN,
+                 "-nolisten", "tcp", "-extension", XRES_EXTENSION, "-auth", server_auth],
+                stdin=subprocess.DEVNULL, stdout=sys.stderr, stderr=sys.stderr,
+                # The write end, and nothing else, crosses into this ONE child. Every other
+                # child this harness starts keeps Python's default close-on-exec, so no
+                # other process can hold that end open or write to it.
+                pass_fds=(writer,),
+                # The outer display and its cookie are REMOVED rather than a new
+                # environment invented: this server is told nothing about them, and nothing
+                # else about the runner's environment is changed. It takes its display from
+                # `-displayfd` and its authority from `-auth`.
+                env=without_display(os.environ))
+        except (OSError, ValueError) as failure:
+            return (None, None, None, "Xvfb not-invoked (%s)" % type(failure).__name__)
+        OWNED.append((server, "O-5 Xvfb"))
+        # The parent's copy of the write end goes NOW: while it is open, a dead server would
+        # not show up as EOF and the read below could only end at its timeout.
+        os.close(writer)
+        writer = -1
+        number, startup = read_displayfd(reader, server)
+    finally:
+        if writer >= 0:
+            os.close(writer)
+        os.close(reader)
+    if number is None:
+        return (server, None, None, startup)
+
+    display = ":%s" % number
+    env = dict(os.environ)
+    env["DISPLAY"] = display
+    env["XAUTHORITY"] = client_auth
+    trouble = add_cookie(client_auth, display, cookie)
+    if trouble is not None:
+        return (server, env, None, "%s | %s" % (startup, trouble))
+
+    deadline = time.monotonic() + CAP_READY_SECONDS
+    last = "it never answered"
+    while True:
+        if CANCELLED:
+            return (server, env, None, "%s | cancelled while starting" % startup)
+        if server.poll() is not None:
+            return (server, env, None, "%s | the owned server exited with %d before"
+                    " answering on %s" % (startup, server.returncode, display))
+        state, names, evidence = extension_list(env, display)
+        if state == "ok":
+            return (server, env, names, "%s %s" % (startup, evidence))
+        last = evidence
+        if deadline - time.monotonic() <= 0:
+            return (server, env, None, "%s | %s not usable within %gs (%s)"
+                    % (startup, display, CAP_READY_SECONDS, last))
+        pause(CAP_POLL_SECONDS)
+
+
+def oracle_capability():
+    """O-5, as a REAL observation. This REPLACES the unrun waiver, which asserted nothing
+    and left the probe's `xres-unavailable` / `xres-too-old` branches unexercised.
+
+    The measurement is the probe against a second Xvfb this harness starts, owns and stops,
+    on a private display, with X-Resource disabled at the server. The whole difficulty of
+    this oracle is that "the capability is missing" must not be satisfied by a server that
+    is not there, and must not be satisfied by a server that is not OURS: a bad DISPLAY, a
+    refused connection or a wrong cookie all end in `XOpenDisplay` returning NULL, which the
+    probe reports as no record at all [xres-owner.c:713-719] and which would prove NOTHING
+    about the gate; and a display number this harness merely picked could belong to somebody
+    else's server, which would make any verdict about it meaningless. So six things are
+    required, and each is an observation:
+
+      0. OWNERSHIP, first, because everything below is a claim about one server: the display
+         number is not chosen or guessed here. It is read from the `-displayfd` pipe whose
+         write end was inherited by this one owned child and by nothing else, within a fixed
+         byte and time bound, and only while that child is alive — see `owned_display` and
+         `read_displayfd`. EOF, a malformed value or the bound expiring REFUSE. So the
+         display below is one THIS handle's server bound, not one that happened to answer.
+      1. CONTROL, on the outer display: `xdpyinfo` there MUST advertise X-Resource. If it
+         does not, an absence on the owned display is not evidence that `-extension` did
+         anything, and this refuses instead of passing.
+      2. PRE-CHECK, owned display: `xdpyinfo` exits zero — a real connection and a real
+         round trip, so the server is up and the cookie works — its extension list is
+         non-empty, and X-Resource is NOT in it.
+      3. LIVENESS BRACKET, the §B.2 discipline reused: `poll()` returns None immediately
+         before the probe and again immediately after it, with no cached reading, so the
+         server was alive across the probe's entire lifetime.
+      4. POST-CHECK: the same server, still usable and still without X-Resource, after the
+         measurement.
+      5. GATE-BEFORE-ANY-STEP: the record must carry `server-version=- existence=- step6=-
+         xres-status=-`, which is only reachable by refusing at the capability gate
+         [xres-owner.c:740-748] rather than at any window step.
+
+    The exit status is asserted without a new output shape: `run_probe` returns a verdict
+    other than `owner-unreadable` only for rc 0 or rc 2, and rc 0 iff `owned`, so
+    `verdict=xres-unavailable` ENTAILS rc 2 — the non-zero exit v1 §9.5 requires of a
+    capability refusal.
+
+    Anything else — another verdict, an unparsable record, a timeout, a server that will
+    not start, a failed control or a failed pre/post check — is `fail`. Never `not-run`,
+    never `pass`. `xres-too-old` is NOT covered: no server advertising < 1.2 exists in this
+    lane, and that is stated in the evidence rather than implied away.
+    """
+    expected = ("xres-unavailable from a live, usable server with %s disabled"
+                % XRES_EXTENSION)
+
+    state, names, control = extension_list(None, "outer-display")
+    if state != "ok":
+        return record("O-5-capability", "fail", expected,
+                      "the control display could not be read (%s)" % state, control)
+    if XRES_EXTENSION not in names:
+        return record("O-5-capability", "fail", expected,
+                      "the control display does not advertise %s either, so an absence on"
+                      " a private display would prove nothing" % XRES_EXTENSION, control)
+
+    # ONE attempt, on the display the owned server itself reported. There is no second
+    # candidate and no fallback: a display this harness cannot attribute to its own handle
+    # is not a display it will draw a capability conclusion from.
+    server, env, before, startup = owned_display()
+    if before is None:
+        return record("O-5-capability", "fail", expected,
+                      "no server this harness owns reported a usable display", startup)
+    if not before:
+        return record("O-5-capability", "fail", expected,
+                      "the owned server advertised no extension at all, which is not an"
+                      " extension list this may draw a conclusion from", startup)
+    if XRES_EXTENSION in before:
+        return record("O-5-capability", "fail", expected,
+                      "the owned server still advertises %s, so the extension was not"
+                      " disabled" % XRES_EXTENSION, startup)
+
+    if server.poll() is not None:                                     # t0
+        return record("O-5-capability", "fail", expected,
+                      "the owned server exited before the probe was spawned", startup)
+    # `--mode bogus --outside` is the only mode that claims neither a window XID nor an
+    # owner pid, and the capability gate runs BEFORE all mode-specific work, so this asks
+    # the gate and nothing else. Its own instrumentation flag is never even reached.
+    verdict, fields, evidence = run_probe(["--mode", "bogus", "--outside"], env=env)
+    if server.poll() is not None:                                     # t2
+        return record("O-5-capability", "fail", expected,
+                      "the owned server exited mid-bracket, so this attempt is discarded"
+                      " rather than read as a capability result", evidence)
+
+    state, after, post = extension_list(env, "owned-after")
+    if state != "ok" or not after or XRES_EXTENSION in after:
+        return record("O-5-capability", "fail", expected,
+                      "the owned server was not still usable-and-XRes-less after the"
+                      " probe (%s)" % state, "%s | %s" % (evidence, post))
+
+    gated = (fields is not None and fields["version"] == "-"
+             and fields["existence"] == "-" and fields["step6"] == "-"
+             and fields["xres_status"] == "-")
+    ok = verdict == "xres-unavailable" and gated
+    return record("O-5-capability", "pass" if ok else "fail", expected,
+                  "verdict=%s gate-before-any-step=%s"
+                  % (verdict, "yes" if gated else "no"),
+                  "%s :: control=\"%s\" owned-display=%s (%s) before=%d-extensions %s ::"
+                  " xres-too-old remains UNEXERCISED (no server advertising < 1.2 in this"
+                  " lane)"
+                  % (evidence, control, env["DISPLAY"], startup, len(before), post))
 
 
 # ---------------------------------------------------------------------------- main ----
@@ -734,7 +1134,9 @@ def main():
             oracle_bogus("O-1-openbox", ["--range-of", hex(seen)],
                          "bogus low bits inside Openbox's own live range")
 
-        oracle_capability_not_run()
+        # Last, and on its OWN private server: everything above measures the outer display,
+        # and O-5 must not disturb it.
+        oracle_capability()
     finally:
         # THE cleanup path, and the only way out of the block above. The handler never
         # raises, so no cancellation can unwind out of it; each owned child is stopped and
@@ -747,8 +1149,19 @@ def main():
             if trouble is not None:
                 note("problem (%s)" % trouble)
                 cleanup_rc = 1
-        note("cleanup (owned-processes=%d cleanup-errors=%d"
-             " unowned-descendants=not-signalled)" % (len(OWNED), cleanup_rc))
+        # The private authority directories go last, once the server that was reading one
+        # has been stopped and joined. A cookie this harness created and could not remove is
+        # treated exactly as an unstoppable child is: reported, and the run is not a pass.
+        for directory in PRIVATE:
+            try:
+                shutil.rmtree(directory)
+            except OSError as failure:
+                note("problem (a private authority directory could not be removed,"
+                     " errno=%s)" % failure.errno)
+                cleanup_rc = 1
+        note("cleanup (owned-processes=%d private-authorities=%d cleanup-errors=%d"
+             " unowned-descendants=not-signalled)"
+             % (len(OWNED), len(PRIVATE), cleanup_rc))
 
     passed = [r for r in RESULTS if r.state == "pass"]
     failed = [r for r in RESULTS if r.state == "fail"]

@@ -28,6 +28,43 @@
  *   reports the raw XRes outcome for a deliberately non-existent XID while the contract
  *   verdict it prints is still `w-absent`.
  *
+ * THE SECOND CORRECTION (#1177 xf1177jd-v1) — SAME-CLIENT IDENTITY, NOT SAME-XID
+ *   The prior contract required the reply's `spec.client` to be LITERALLY EQUAL to the XID
+ *   handed to XResQueryClientIds, reading resproto.txt:370-374's "the CLIENTIDSPEC of
+ *   request and ... reply usually match each other" as "always match". THAT READING IS
+ *   WITHDRAWN. resproto.txt:133-138 is the normative constraint on the reply spec and it
+ *   says only "the client doesn't have to be specified as the resource_base of
+ *   CLIENTXIDRANGE and can be ANY resource owned by the client" — a SAME-CLIENT
+ *   invariant, not a same-XID one.
+ *
+ *   The shipped server settles it. In xserver Xext/xres.c:458-467 the reply spec is built
+ *   unconditionally as `rep.spec.client = client->clientAsMask;` — the OWNING CLIENT's
+ *   base, never the queried resource. The very same value is what XResQueryClients reports
+ *   as `resource_base` (Xext/xres.c:254-256, paired with `RESOURCE_ID_MASK`), and libXres
+ *   copies both off the wire untransformed (XRes.c:120-127, XRes.c:232-236). So literal
+ *   equality can hold ONLY when the caller happened to pass the owner's resource_base;
+ *   demanding it of a window XID demands something this implementation never emits. The
+ *   native run in CI 36309498747 measured exactly that: queried 0xa0000e answered
+ *   ret-client=0xa00000, queried 0x200001 answered 0x200000, and every failed positive
+ *   carried refusal=client-mismatch.
+ *
+ *   The replacement is an association that is QUERIED, not computed: resproto.txt:70-84
+ *   defines "same client" as zeroing resource_mask's bits, with resource_base identifying
+ *   the client, and both values come from XResQueryClients on every run. No bit width is
+ *   written down anywhere in this file, because include/resource.h:102-114 makes the
+ *   client/resource split a RUNTIME quantity (`ResourceClientBits()`).
+ *
+ *   Step 5 therefore now requires ALL of: every reported range structurally sane (ONE bad
+ *   range refuses the whole query — xf1177jd-v2 F1, because discarding a candidate owner can
+ *   manufacture uniqueness), exactly one of those ranges containing W, and the returned
+ *   client inside THAT SAME range. `& ~mask`
+ *   retains bits above the client field where the server's own CLIENT_BITS() discards
+ *   them, so this is strictly STRONGER than the server's lookup and refuses XIDs carrying
+ *   illegal high bits (measured: bogus 0x40000001 is SERVER_BIT, resource.h:115, and
+ *   answered ret-client=0x0 — still refused here, because no live client bases at
+ *   0x40000000). Existence, the step-6 re-check and the exact owner-pid comparison are
+ *   untouched: this corrects WHICH CLIENT the reply names, nothing about absence.
+ *
  * ATOMICITY (CONTRACT-r2 §A.3) — grab premise, corroboration status
  *   Steps 1-6 run inside one XGrabServer bracket on ONE connection, because without it W
  *   can be destroyed between the existence check and the XRes query and — per §A.1 — the
@@ -135,6 +172,31 @@
 #define BOGUS_TRIES  4096
 #define OUTSIDE_TRIES 512
 
+/* xf1177jd-v2 F2. Bounds for a reported CLIENTXIDRANGE, taken from the STAGED OFFICIAL
+ * xserver include/resource.h and NOT from the 0x1fffff this lane happened to observe:
+ *
+ *   resource.h:104  #define RESOURCE_AND_CLIENT_COUNT   29  / * 29 bits for XIDs * /
+ *   resource.h:106  #define CLIENTOFFSET  (RESOURCE_AND_CLIENT_COUNT - RESOURCE_CLIENT_BITS)
+ *   resource.h:108  #define RESOURCE_ID_MASK      ((1 << CLIENTOFFSET) - 1)
+ *   resource.h:110  #define RESOURCE_CLIENT_MASK  (((1 << RESOURCE_CLIENT_BITS) - 1) << CLIENTOFFSET)
+ *
+ * So the client field and the resource field TOGETHER occupy bits [0,29), the resource mask
+ * is exactly `(1 << CLIENTOFFSET) - 1`, and a well-formed range must leave at least one bit
+ * for each field: 1 <= CLIENTOFFSET <= 28. Hence a resource mask may never exceed
+ * `(1 << 28) - 1`, and a base may never exceed `(1 << 29) - 1`.
+ *
+ * This matters because XID is 64-bit on this target (unsigned long), so a CARD32 mask of
+ * 0xffffffff arriving off the wire passes an overflow test like `(mask + 1) == 0` AND passes
+ * a low-run test like `(mask & (mask + 1)) == 0`, after which `base` can only be 0 and
+ * `x & ~mask == base` becomes true for EVERY 32-bit XID — collapsing the whole association
+ * to "client zero owns everything". The bound below is what actually rejects it; the
+ * width-agnostic shape tests alone cannot. CLIENTOFFSET itself is still never assumed — it
+ * is whatever the reported mask says, only now confined to the range the definitions above
+ * permit. */
+#define XID_RESOURCE_AND_CLIENT_BITS 29
+#define RANGE_MASK_MAX  ((((XID) 1) << (XID_RESOURCE_AND_CLIENT_BITS - 1)) - 1)
+#define RANGE_BASE_MAX  ((((XID) 1) << XID_RESOURCE_AND_CLIENT_BITS) - 1)
+
 /* Raised from 512 when the three ownership diagnostics below were added. Widest renderable
  * record is ~473 bytes with every field simultaneously at its maximum width; a silently
  * truncated line would fail the caller's strict whole-line parse instead of measuring. */
@@ -173,7 +235,15 @@ static int         f_minor       = -1;
  * anything else:
  *   xres-status | num-ids-zero | num-ids-many | ids-null | client-mismatch
  *   | mask-mismatch | length-range | value-null | pid-invalid
- * "-" means query_ownership() either was not reached or returned NULL (no refusal). */
+ * "-" means query_ownership() either was not reached or returned NULL (no refusal).
+ *
+ * The set stays at NINE, and the record keeps exactly the fields below, because the
+ * caller's parser matches `refusal` as a CLOSED alternation of these nine and anchors the
+ * whole line at `refusal=...)$`. A tenth token, or one extra field, makes every record
+ * UNPARSABLE — which the caller reads as `owner-unreadable`, i.e. strictly less legible
+ * than the refusal it was meant to explain. Widening it needs the caller changed in the
+ * same commit, and this lane changes no Python; see REPORT.md §7 for the granularity gap
+ * that leaves behind. */
 static XID          f_ret_client     = 0;
 static int          f_ret_client_set = 0;
 static unsigned int f_ret_mask       = 0;   /* XResClientIdSpec.mask is unsigned int */
@@ -416,14 +486,20 @@ static void sleep_ms(long ms)
 
 /* Step 5. Records the RAW outcome in the report fields and returns the contract verdict
  * for the ownership half, or NULL when the ownership half passed all of r2 §A.5's
- * structural conditions. It never refuses on absence — that is steps 2 and 6. */
+ * structural conditions, as corrected by xf1177jd-v1. It never refuses on absence — that is
+ * steps 2 and 6. Three parts: 5a queries the live CLIENTXIDRANGE list and finds W's owning
+ * range, 5b issues the id query behind its existing status/count/pointer guards, 5c requires
+ * the returned client to be the SAME client as 5a's uniquely matching range. */
 static const char *query_ownership(XID w)
 {
     XResClientIdSpec spec;
     long num_ids = 0;
     XResClientIdValue *ids = NULL;
-    Status status;
+    Status status, ranges_status;
     pid_t pid;
+    int num_clients = 0, i, matches = 0, malformed = 0;
+    XResClient *clients = NULL;
+    XID owner_base = 0, owner_mask = 0;
 
     spec.client = w;                              /* one non-wildcard spec; never None */
     spec.mask = XRES_CLIENT_ID_PID_MASK;
@@ -436,6 +512,83 @@ static const char *query_ownership(XID w)
     f_ret_mask_set = 0;
     f_refusal = "-";
 
+    /* 5a. THE QUERIED CLIENT ASSOCIATION (#1177 xf1177jd-v1). resproto.txt:70-84 defines
+     *     "same client" as zeroing resource_mask's bits out of a resource ID, with
+     *     resource_base naming the client itself. BOTH values are read from the server here
+     *     rather than derived: Xext/xres.c:254-256 fills them in as `clientAsMask` and
+     *     `RESOURCE_ID_MASK`, and where the boundary between the two fields falls is a
+     *     RUNTIME quantity on this server (`ResourceClientBits()`, include/resource.h:
+     *     102-114), so CLIENTOFFSET is never assumed below — it is whatever the reported mask
+     *     says. The ONE width that does appear is the 29-bit XID space that bounds both
+     *     fields, quoted from resource.h:104 at RANGE_MASK_MAX/RANGE_BASE_MAX above; per
+     *     xf1177jd-v2 F2 a bound is unavoidable, because XID is 64-bit here and the
+     *     width-agnostic shape tests alone cannot reject a CARD32 mask of 0xffffffff.
+     *
+     *     Same connection and the SAME bracket as the rest of step 5: the caller already
+     *     holds the grab, and step 6 re-checks W after this returns, so the range list, W's
+     *     existence and the reply below all name one instant. Nothing is created — the array
+     *     is client-side memory and is XFree'd on every path out.
+     *
+     *     XResQueryClients returns 1 on success and 0 otherwise, INCLUDING when the reply
+     *     carried no clients at all [XRes.c:111-140]; the two are indistinguishable at this
+     *     API and mean the same thing here — the live ranges could not be read, so no
+     *     association can be established. That is an XRes request that did not succeed, so
+     *     it refuses through the existing `xres-status` token. `num-ids` stays "-" on this
+     *     path, which is what distinguishes it from a failing XResQueryClientIds below. */
+    clear_errors();
+    ranges_status = XResQueryClients(g_dpy, &num_clients, &clients);
+    XSync(g_dpy, False);   /* before the checks, so a failure still carries its x-error */
+    if (ranges_status != 1 || clients == NULL || num_clients <= 0) {
+        if (clients != NULL) XFree(clients);
+        f_xres_status = "failed";
+        f_refusal = "xres-status";
+        return "owner-refused";
+    }
+    for (i = 0; i < num_clients; i++) {
+        XID base = clients[i].resource_base;
+        XID mask = clients[i].resource_mask;
+        /* Structurally validate the range BEFORE letting it judge anything, against the
+         * bounds derived from resource.h above:
+         *   - the resource field is a NON-EMPTY run of low bits that leaves at least one
+         *     client bit inside the 29-bit XID space (`(1 << CLIENTOFFSET) - 1`, and see
+         *     RANGE_MASK_MAX for why the upper bound, not a shape test, is what rejects a
+         *     CARD32 mask of 0xffffffff on a 64-bit XID);
+         *   - the base lies inside that same 29-bit space and carries no bits inside the
+         *     resource field (`index << CLIENTOFFSET`).
+         *
+         * xf1177jd-v2 F1: a range that fails ANY of these REJECTS THE WHOLE QUERY. It is NOT
+         * skipped. Skipping was unsound, and the reviewer's counterexample is reproduced
+         * verbatim against this code: with R1={base=0x200000,mask=0x1ffffe} (malformed —
+         * 0x1ffffe & 0x1fffff != 0) and R2={base=0,mask=0x3fffff} (well-formed), W=0x20000e
+         * reduces INTO BOTH (0x20000e & ~0x1ffffe == 0x200000; 0x20000e & ~0x3fffff == 0).
+         * Skipping R1 left `matches == 1` on R2, and a returned client of 0x200000 then
+         * reduced to 0 == R2's base and PASSED — attributing W to client 0 while the only
+         * range that actually named its owner had been discarded. Dropping a candidate owner
+         * can therefore manufacture the uniqueness this test depends on, so ambiguity must
+         * never be silently narrowed: the query refuses instead. */
+        if (mask == 0 || mask > RANGE_MASK_MAX || (mask & (mask + 1)) != 0) {
+            malformed = 1;
+            break;
+        }
+        if (base > RANGE_BASE_MAX || (base & mask) != 0) {
+            malformed = 1;
+            break;
+        }
+        if ((w & ~mask) != base) continue;
+        matches++;
+        owner_base = base;
+        owner_mask = mask;
+    }
+    XFree(clients);
+    clients = NULL;
+    /* Checked BEFORE `matches` is consulted, and independently of where in the list the bad
+     * range appeared: a well-formed range earlier in the list may already have matched. */
+    if (malformed) {
+        f_refusal = "client-mismatch";
+        return "owner-ambiguous";
+    }
+
+    /* 5b. The id query itself, unchanged, behind its existing status/count/pointer guards. */
     clear_errors();
     status = XResQueryClientIds(g_dpy, 1, &spec, &num_ids, &ids);
     XSync(g_dpy, False);
@@ -447,6 +600,13 @@ static const char *query_ownership(XID w)
     if (status != Success) { f_refusal = "xres-status"; return "owner-refused"; }
     /* NOT absence, never downgraded */
     if (num_ids == 0) { f_refusal = "num-ids-zero"; return "owner-unknown"; }
+    /* num_ids > 1 is DEFENSIVE, not expected: with one non-wildcard spec and a mask of only
+     * XRES_CLIENT_ID_PID_MASK, Xext/xres.c:469-516 appends at most one value per client —
+     * `WillConstructMask` latches `ctx->sentClientMasks[client->index]` per id type — and
+     * Xext/xres.c:549-557 resolves the spec to at most one client. So against this server
+     * the branch is unreachable, and it is retained only as the fail-closed answer if some
+     * other server ever does otherwise. It is NOT the guard that establishes "exactly one";
+     * that is the `matches != 1` requirement in 5a/5c, which counts LIVE CLIENT RANGES. */
     if (num_ids > 1) { f_refusal = "num-ids-many"; return "owner-ambiguous"; }
     if (ids == NULL) { f_refusal = "ids-null"; return "owner-malformed"; }
 
@@ -461,7 +621,31 @@ static const char *query_ownership(XID w)
     f_ret_mask = ids[0].spec.mask;
     f_ret_mask_set = 1;
 
-    if (ids[0].spec.client != w) {
+    /* 5c. The corrected identity test, REPLACING the v1 requirement that ids[0].spec.client
+     *     be LITERALLY EQUAL to w. resproto.txt:133-138 promises only that the reply names
+     *     "any resource owned by the client", and Xext/xres.c:464 unconditionally sends the
+     *     owner's `clientAsMask`, so literal equality could pass only when the caller
+     *     happened to hand in the owner's own resource_base. CI 36309498747 measured exactly
+     *     that gap: queried 0xa0000e, answered ret-client=0xa00000.
+     *
+     *     What must hold — and what is required here — is that EXACTLY ONE live client range
+     *     claimed w, and that the returned client reduces to THAT SAME range. Both halves
+     *     are needed: uniqueness alone would not stop the reply naming a different client,
+     *     and the reduction alone would be meaningless without a single owner to reduce to.
+     *
+     *     `& ~mask` also keeps the bits ABOVE the client field, where the server's own
+     *     CLIENT_BITS() discards them (include/resource.h:112,115 — bit 30 is SERVER_BIT,
+     *     an illegal XID bit). This test is therefore strictly STRONGER than the server's
+     *     own lookup: an XID carrying such bits matches no reported base and is refused.
+     *     Measured: O-4's bogus 0x40000001 was answered with ret-client=0x0, and is refused
+     *     here rather than attributed to client 0.
+     *
+     *     All FOUR failure shapes — a malformed range anywhere in the list, no range claimed
+     *     w, more than one did, or the reply named some other client — collapse into the one
+     *     existing `client-mismatch` token and are NOT separately legible in the record. That
+     *     is forced by the caller's closed nine-token alternation, which this lane may not
+     *     widen. Accepted for this slice by review; REPORT.md §7, REPORT-r2.md §4. */
+    if (matches != 1 || (ids[0].spec.client & ~owner_mask) != owner_base) {
         f_refusal = "client-mismatch";
         return "owner-ambiguous";
     }
