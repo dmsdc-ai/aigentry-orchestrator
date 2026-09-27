@@ -122,14 +122,23 @@ function snapshot(dir) {
   }));
 }
 const manifest = process.env.NATIVE_TEST_MANIFEST ? json(process.env.NATIVE_TEST_MANIFEST) : null;
+// Explicit compiled boot module set (#1181): cli.js statically imports usage/plan/wizard, and
+// plan/wizard import provider-capabilities. Every entry must exist; a new relative import fails below.
+const bootFiles = ['cli.js', 'usage.js', 'plan.js', 'wizard.js', 'provider-capabilities.js']
+  .map(name => `dist/src/orchestrator-boot/${name}`);
 // Bound repository-default reads/copies to shipped inputs; never traverse .git or dependencies.
 const sourceFiles = manifest ? manifest.files.map(f => f.path) : [...new Set([
   ...(await import(pathToFileURL(path.join(source, 'bin/init/manifest.mjs')).href)).MANIFEST,
-  'package.json', 'src/orchestrator-boot/cli.ts', 'src/orchestrator-boot/usage.ts',
-  'dist/src/orchestrator-boot/cli.js', 'dist/src/orchestrator-boot/usage.js',
+  'package.json', 'src/orchestrator-boot/cli.ts', 'src/orchestrator-boot/usage.ts', ...bootFiles,
   'dist/src/request-capture/cli.js', 'dist/src/request-capture/receipt.js',
   'dist/src/session/persistence/atomic-write.js', 'dist/src/session/persistence/index-lock.js',
 ])];
+for (const rel of bootFiles) {
+  assert.ok(sourceFiles.includes(rel), `boot dependency absent from fixture inputs: ${rel}`);
+  const imports = [...read(path.join(source, rel)).matchAll(/^import\s[^;]*?from\s+"(\.[^"]+)";/gms)]
+    .map(m => path.posix.join(path.posix.dirname(rel), m[1]));
+  for (const dep of imports) assert.ok(bootFiles.includes(dep), `${rel} imports unlisted boot module ${dep}`);
+}
 const sourceSnapshot = () => Object.fromEntries(sourceFiles.map(rel => {
   const file = path.join(source, rel), s = fs.lstatSync(file);
   assert.ok(s.isFile() && !s.isSymbolicLink(), rel);
@@ -200,11 +209,15 @@ const init = (f, extras = [], native = true) => invoke(f, 'init', initArgs(f, ex
 const ok = r => assert.equal(r.status, 0, r.stderr + r.stdout);
 const refused = r => { assert.equal(r.signal, null); assert.notEqual(r.status, null); assert.notEqual(r.status, 0, r.stdout); };
 const stamp = f => json(path.join(f.workspace, '.aigentry-init.json'));
-function boot(f, args) {
+// #1181: non-TTY boot needs an explicit complete plan. Bounded benign codex plan (most restrictive
+// measured axes, new history; installed-boot-selector reference PLANS.codex). No risk ack.
+const plan = { AIGENTRY_BOOT_PLAN: '1', AIGENTRY_BOOT_PERMISSION: 'approval=on-request;sandbox=read-only', AIGENTRY_BOOT_HISTORY: 'new' };
+const planArgv = 'telepty\nallow\n--id\nnative-fixture\n--auto-restart\ncodex\n--ask-for-approval\non-request\n--sandbox\nread-only\n';
+function boot(f, args, env = plan) {
   assert.ok(args.length && ['--help', '-h', '--dry-run', '__probe'].includes(args[0]));
   write(f.log, '');
   const before = [snapshot(f.workspace), snapshot(f.home), snapshot(f.capture), snapshot(f.backup)];
-  const r = invoke(f, 'boot', [path.join(f.pkg, 'dist/src/orchestrator-boot/cli.js'), ...args]);
+  const r = invoke(f, 'boot', [path.join(f.pkg, 'dist/src/orchestrator-boot/cli.js'), ...args], env);
   assert.deepEqual([snapshot(f.workspace), snapshot(f.home), snapshot(f.capture), snapshot(f.backup)], before);
   const calls = read(f.log).trim().split('\n').filter(Boolean).map(JSON.parse);
   assert.ok(calls.every(c => ['telepty', 'ps'].includes(c.name)), JSON.stringify(calls));
@@ -268,7 +281,7 @@ test('fresh native init registers one synchronous official hook through preserva
   assert.equal(fs.existsSync(path.join(f.workspace, '.aigentry-native-capture.lock')), false);
   for (const args of inspectionModes.slice(0, 4)) {
     const r = boot(f, args); ok(r); assert.match(r.stderr, /installed\/pending-review/);
-    if (args[1] === 'exec-argv') assert.equal(r.stdout, 'telepty\nallow\n--id\nnative-fixture\n--auto-restart\ncodex\nresume\n--last\n--dangerously-bypass-approvals-and-sandbox\n');
+    if (args[1] === 'exec-argv') assert.equal(r.stdout, planArgv);
     if (args[0] === '--dry-run') assert.ok(r.stdout.split('\n').filter(Boolean).every(line => line.startsWith('[orchestrator-boot] [dry-run] ') || line.startsWith('[would-exec] ')));
   }
 });
@@ -422,6 +435,20 @@ test('probe contracts suppress actuation while real boot retains literal SIGKILL
   for (const args of inspectionModes) {
     const r = boot(f, args); assert.equal(r.status, args.length === 1 && args[0] === '__probe' || args[1] === 'unknown' ? 4 : 0);
     if (args[0] === '__probe' && args[1] !== 'exec-argv') assert.equal(r.stdout, '');
+    if (args[1] === 'exec-argv') assert.equal(r.stdout, planArgv);
+    // No plan (ORCHESTRATOR_CLI alone) refuses before any port, argv or capture validation.
+    const none = boot(f, args, {}); assert.equal(none.status, 2, none.stderr);
+    assert.equal(none.stdout, ''); assert.deepEqual(none.calls, []);
+    assert.match(none.stderr, /AIGENTRY_BOOT_PLAN =1 is required/);
+  }
+});
+
+test('each explicit boot dependency is required: removing one refuses boot before any port', () => {
+  for (const rel of bootFiles.slice(1)) {
+    const f = fixture(); fs.unlinkSync(path.join(f.pkg, rel));
+    const r = boot(f, ['--help']); refused(r); assert.equal(r.stdout, ''); assert.deepEqual(r.calls, []);
+    assert.match(r.stderr, /ERR_MODULE_NOT_FOUND/);
+    assert.ok(r.stderr.includes(path.join(f.pkg, rel)), r.stderr);
   }
 });
 

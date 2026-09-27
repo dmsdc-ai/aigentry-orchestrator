@@ -926,6 +926,9 @@ async function dryRun(): Promise<never> {
   // non-interactive boot would. It says so rather than leaving the operator to wonder why no
   // wizard appeared.
   const resolved = resolveWithoutPrompting();
+  // Capture is validated before any report line, as in main() and probe(): a refused dry run
+  // leaves stdout empty instead of describing effects it will never reach (#1181).
+  await validateCapture(resolved.cli);
   log(`plan source: ${PLAN_ENV.enable}=1 explicit plan (validated; nothing below was acted on)`);
   for (const line of describePlan(resolved.plan)) log(`plan  ${line}`);
   for (const line of describeEffects(resolved.plan)) log(`would ${line}`);
@@ -934,7 +937,6 @@ async function dryRun(): Promise<never> {
       "this terminal WOULD get the interactive wizard on a bare 'bin/orchestrator-boot.sh'; " +
         "--dry-run deliberately does not prompt, so what it reports is the plan this environment states",
     );
-  await validateCapture(resolved.cli);
   orchestratorRegistryReconcile(resolved.sid);
   orchestratorSingletonGuard(resolved.sid);
   log(`would exec ${resolved.argv.join(" ")} (one element per line below)`);
