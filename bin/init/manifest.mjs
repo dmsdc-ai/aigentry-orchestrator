@@ -74,6 +74,8 @@ const MANIFEST = [
   "CLAUDE.md",
   "docs/rules.md",
   "docs/model-profiles/model-routing-profile.md",
+  // #1181: orchestrator-boot usage and init guidance cite this path. Exact leaf only.
+  "docs/setup/orchestrator-boot.md",
   "docs/templates/dispatch-ref-checklist.md",
   "docs/templates/dispatch-ref-template.md",
 
@@ -119,6 +121,7 @@ const GOVERNANCE_ROOTS = [
   "bin/",
   "docs/model-profiles/",
   "docs/rules.md",
+  "docs/setup/orchestrator-boot.md",
   "docs/templates/",
   ".agents/",
   ".claude/",

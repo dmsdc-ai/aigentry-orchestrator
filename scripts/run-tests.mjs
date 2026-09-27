@@ -7,9 +7,23 @@ import { findStaleCompiled } from './stale-dist-guard.mjs';
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const testsRoot = join(repoRoot, 'dist', 'tests');
 const sourceTestFiles = ['tests/hitl/snyk-boundaries.test.mjs', 'tests/packaging/release-admission.test.mjs'];
-// Native capture fixtures require POSIX ownership/modes; Windows support is still absent.
+// #1179 — JEV suites import the real tsc output under dist/src/jev (no fixture fallback) and
+// are platform-neutral, so they run on every OS, win32 included. tc-support.mjs is a helper.
+sourceTestFiles.push(
+  'tests/jev/pipeline-integration.test.mjs',
+  'tests/jev/price-table.test.mjs',
+  'tests/jev/r2-acceptance-delta.test.mjs',
+  'tests/jev/r2-before-after.test.mjs',
+  'tests/jev/refusal-path-constant.test.mjs',
+  'tests/jev/request-contract.test.mjs',
+  'tests/jev/reserve.test.mjs',
+  'tests/jev/response-contract.test.mjs',
+  'tests/jev/worker-target.test.mjs',
+);
+// Native capture fixtures require POSIX ownership/modes and the boot wizard suite drives an
+// owned POSIX PTY; Windows support is still absent for both.
 if (process.platform === 'darwin' || process.platform === 'linux') {
-  sourceTestFiles.push('tests/packaging/native-capture.test.mjs');
+  sourceTestFiles.push('tests/packaging/native-capture.test.mjs', 'tests/packaging/orchestrator-boot-wizard.test.mjs');
 }
 
 function collectTestFiles(dir) {
