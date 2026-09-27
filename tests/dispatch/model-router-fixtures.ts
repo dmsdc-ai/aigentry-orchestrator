@@ -9,6 +9,11 @@ import type { WorkerManifest } from "../../src/session/worker-sandbox.js";
 export const REPO = resolve(import.meta.dirname, "../../..");
 export const PROFILE = join(REPO, "tests/dispatch/fixtures/model-routing-profile.md");
 export const ROUTER = join(REPO, "bin/model-router.mjs");
+// The Claude boot guard refuses a seed source carrying no OAuth material at all, so the
+// positive fixture must present the real `.credentials.json` shape. These bytes are
+// fabricated: no live token, provider call or refresh path is involved, and `fixture`
+// keeps the record self-identifying. `accessToken` alone is what the guard needs.
+const CLAUDE_AUTH = { fixture: true, claudeAiOauth: { accessToken: "fixture-access-token-not-a-real-credential" } };
 export function fixture() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "model-router-1083-")));
   const bin = join(root, "bin"), home = join(root, "home"), aig = join(root, "aig");
@@ -21,7 +26,7 @@ export function fixture() {
     return file;
   };
   writeFileSync(join(home, ".claude.json"), "{}");
-  writeFileSync(join(home, ".claude/.credentials.json"), '{"fixture":true}');
+  writeFileSync(join(home, ".claude/.credentials.json"), JSON.stringify(CLAUDE_AUTH));
   writeFileSync(join(root, "codex-home/auth.json"), '{"fixture":true}');
   writeFileSync(join(root, "scope.json"), JSON.stringify({ version: 1, task: "1083", sid: "router-fixture",
     read: [join(root, "project")], write: [join(root, "project")], domains: [] }));
@@ -121,7 +126,7 @@ fs.writeFileSync(manifest.receipt, JSON.stringify({ hash: current.hash, attempt:
     assert.deepEqual(m.config.network?.allowUnixSockets, []);
     assert.equal(m.env.AIGENTRY_TARGET_CWD, join(root, "project"));
     const auth = m.cli === "codex" ? join(m.env.CODEX_HOME!, "auth.json") : join(m.env.CLAUDE_CONFIG_DIR!, ".credentials.json");
-    assert.deepEqual(JSON.parse(readFileSync(auth, "utf8")), { fixture: true });
+    assert.deepEqual(JSON.parse(readFileSync(auth, "utf8")), m.cli === "codex" ? { fixture: true } : CLAUDE_AUTH);
     assert.ok(m.config.filesystem?.allowWrite?.includes(join(root, "project")));
     assert.equal(existsSync(env.WORK_LOG!), false, "no model/work operation");
     return m;
