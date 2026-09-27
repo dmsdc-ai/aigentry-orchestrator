@@ -163,8 +163,25 @@ PATHLIKE = re.compile(b"/[^ ]*")
 # The extension list `xdpyinfo` prints, and nothing wider. The count it announces is
 # checked against the names actually read, so a shape this does not recognise is UNKNOWN
 # and is never reported as "the extension is absent".
+#
+# The shape is taken from the tool's own source, not from a sample: the header is
+# `printf("number of extensions:    %d\n", n)` [xdpyinfo.c:176], and without the
+# `-queryExtensions` flag — which this harness never passes — each name is
+# `printf("    %s\n", extlist[i])` [xdpyinfo.c:181-184], i.e. exactly four spaces, then the
+# name VERBATIM, then the newline. Nothing else is on the line.
+#
+# A NAME MAY CONTAIN SPACES, which is why the name group runs to the end of the line
+# instead of matching one whitespace-free word. `Generic Event Extension` is a registered
+# extension name [miinitext.c:105 `{GEExtensionInit, "Generic Event Extension", NULL}`], and
+# `xdpyinfo` sorts the list with plain `strcmp` [xdpyinfo.c:165-179], so on an Xvfb that
+# builds neither GLX nor DRI3 it lands sixth — which is exactly where the previous
+# single-word predicate stopped, announcing 23 and reading 5 (CI-r2.log:465). The names are
+# NOT special-cased and no row is skipped: the format simply is "four spaces, then the
+# name". If a caller ever did pass `-queryExtensions`, each line would still parse but would
+# carry the trailing `(opcode: ...)` text, so the exact `X-Resource` comparison below would
+# fail and the oracle would refuse — never silently mis-read.
 EXT_HEADER = re.compile(r"^number of extensions:\s+(?P<count>[0-9]+)$")
-EXT_NAME = re.compile(r"^[ \t]+(?P<name>\S+)$")
+EXT_NAME = re.compile(r"^ {4}(?P<name>\S.*)$")
 
 # What the server may write on its `-displayfd` pipe, and nothing else: a display number.
 # Anything that does not match this whole pattern is malformed and REFUSES.
@@ -748,8 +765,19 @@ def extension_list(env, what):
         # The announced count must equal what was read, or this output was not the shape
         # this parser understands and no conclusion about any extension follows from it.
         if len(names) != int(header.group("count")):
-            return ("unknown", None, "%s xdpyinfo announced %s extensions and %d were read"
-                    % (what, header.group("count"), len(names)))
+            # The line that stopped the parse, bounded and rendered by the same path-redacting
+            # `render` every other record uses. Without it, a count mismatch says only that
+            # the parse failed and not WHERE — which is how the previous mismatch reached CI
+            # unmeasured (CI-r2.log:465). What this may disclose is the extension-name text of
+            # a display started by this job: no environment, no cookie, no file path, and no
+            # more than one line.
+            stopped = lines[index + 1 + len(names)] if index + 1 + len(names) < len(lines) \
+                else ""
+            return ("unknown", None,
+                    "%s xdpyinfo announced %s extensions and %d were read; the first line"
+                    " that did not parse was \"%s\""
+                    % (what, header.group("count"), len(names),
+                       render(stopped.encode("utf-8", "replace"))))
         return ("ok", names, "%s extensions=%d" % (what, len(names)))
     return ("unknown", None, "%s xdpyinfo printed no extension count" % what)
 
