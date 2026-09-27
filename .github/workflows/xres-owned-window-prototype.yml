@@ -1,0 +1,158 @@
+name: XRes owned-window prototype (#1177, isolated, probe branch or manual)
+
+# #1177 — the ISOLATED prototype lane for the XRes exact-owned-window ownership proof.
+#
+# WHAT THIS IS
+#   A disposable job that compiles `scripts/ci/xres-owner.c` and runs
+#   `scripts/ci/xres-owner-prototype.py` against its OWN private Xvfb and its OWN Openbox.
+#   It runs on a push to the single probe branch named below, or on manual dispatch.
+#   That is all it does.
+#
+# WHAT THIS IS NOT, stated so a green check here cannot be overread
+#   * It is NOT browser, WebAuthn or TLS execution, and it does NOT run the acceptance
+#     suite. No product code, test, fixture, package manifest or lockfile is involved.
+#   * It is NOT installed-product acceptance and closes NO task-table gate.
+#   * It says NOTHING about Windows, and nothing about any real browser.
+#   * It does NOT fix the existing `browser-tls` failure. That job fails BEFORE acceptance
+#     because Openbox 3.6.1-10 never sets `_NET_WM_PID` on its supporting window, so
+#     `ci.yml`'s readiness proof cannot be satisfied. `ci.yml` is UNCHANGED in this lane
+#     and does not invoke anything built here. Wiring this probe into that supervisor is a
+#     SEPARATE, later, reviewed change, and it may only be proposed after this prototype
+#     has succeeded on its own.
+#   * A run here is a MEASUREMENT of the compile and the oracles, not a pass. `O-5-capability`
+#     is still UNRUN and therefore still FAILS the harness on purpose; it is not deleted,
+#     masked or relabelled, and this lane is expected to be red until it is genuinely closed.
+#
+# WHY A PROBE-BRANCH PUSH, AND WHY STILL A SEPARATE FILE
+#   `workflow_dispatch` is kept, but it cannot be used yet: GitHub only offers the manual
+#   button for a workflow that already exists on the default branch, and this file does not.
+#   So the lane is also triggered by a push to the ONE exact branch it is being developed on,
+#   `probe/xres-1177-20260927`. That is deliberately a single literal branch name — no
+#   wildcard, no `main`, no release branch and no `pull_request` trigger — so the lane still
+#   adds no time to any existing check and still cannot turn an unrelated PR red. Once the
+#   file is on the default branch the manual button starts working and the push trigger can
+#   be reconsidered as its own reviewed change. It lives in its own file so `ci.yml` stays
+#   byte-unchanged and the two lanes cannot be confused.
+#
+# PRIVILEGE AND ISOLATION
+#   `permissions: contents: read` — the least this needs to check out the source. No
+#   packages, no artifacts, no releases, no writes of any kind. Everything it installs is
+#   installed on an ephemeral GitHub-hosted runner that is destroyed with the job; NOTHING
+#   is installed on, or modified on, any personal machine, and no daemon is touched.
+#   The display is private: `xvfb-run -a` picks a free server number, `-nolisten tcp`
+#   keeps the server off the network entirely, and `umask 077` is set before the wrapper
+#   creates the X authority cookie so it is owner-only by construction.
+#
+# WHY ubuntu-22.04 AND NOT `ubuntu-latest`
+#   CONTRACT-r2 §C is version-exact for jammy: `libxres1` there is `2:1.2.1-1`, and the
+#   public `XRes.h` was retrieved at HTTP 200 from tag `libXres-1.2.1` and differs from
+#   master only in whitespace. Moving this lane to a newer image would silently invalidate
+#   that. If this runner image is retired, the correct move is to re-pin deliberately and
+#   re-establish version-exactness against the new distribution — NOT to bump the label and
+#   keep the claim. The step below prints the installed versions and the installed header's
+#   hash so the log carries the provenance rather than this comment asserting it.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - probe/xres-1177-20260927
+
+permissions:
+  contents: read
+
+jobs:
+  xres-owned-window-prototype:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # The same preflight assertions the existing lane makes: an ephemeral,
+      # GitHub-hosted, non-root runner. If either is false this is not a disposable
+      # environment and nothing here should install anything.
+      - name: Prove this is an ephemeral non-root GitHub-hosted runner
+        run: |
+          set -euo pipefail
+          test "$(id -u)" -ne 0
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+
+      - name: Install the CI-only build and display dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # `libxres-dev` + `libx11-dev` are the build dependency CONTRACT-r2 §C names;
+          # `openbox` is the real window manager the positive oracle needs; `x11-utils`
+          # supplies the `xprop` the harness's own baseline chain reads. Nothing else.
+          sudo apt-get install -y --no-install-recommends \
+            libxres-dev libx11-dev openbox x11-utils
+          # Presence is PROVED, the way ci.yml proves openbox/xprop/python3 today, rather
+          # than assumed from the install having exited zero. `cc`, `python3`, `Xvfb`,
+          # `xvfb-run` and `xauth` are the runner image's own and are deliberately NOT
+          # installed: they are proved present instead of anything being added to get them.
+          command -v cc
+          command -v python3
+          command -v openbox
+          command -v xprop
+          command -v Xvfb
+          command -v xvfb-run
+          command -v xauth
+
+      # The provenance gap XRES-OWNERSHIP-CONTRACT §7 left open, closed HERE and not by
+      # prose: the installed header is the one the probe actually compiles against, so its
+      # version and hash go in the log next to the v1.2 declarations the probe uses. No
+      # header is hand-written, no stub is substituted, and no spelling is guessed.
+      - name: Record the installed public XRes API, exactly as compiled against
+        run: |
+          set -euo pipefail
+          dpkg-query -W -f='${Package} ${Version}\n' libxres1 libxres-dev libx11-dev
+          header=/usr/include/X11/extensions/XRes.h
+          test -f "$header"
+          sha256sum "$header"
+          echo '--- the v1.2 client-identification API this probe uses, verbatim ---'
+          sed -n '/^\/\* v1\.2 \*\//,$p' "$header"
+
+      - name: Compile the bounded ownership probe
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/xres"
+          # Official library only: `-lXRes -lX11`. No hand-written X11 protocol, no private
+          # libXres internals. Warnings are shown and not suppressed; `-Werror` is
+          # deliberately NOT used, because a warning from a system header would then BLOCK
+          # this lane for something that is not a defect in the probe.
+          cc -O2 -Wall -Wextra -o "$RUNNER_TEMP/xres/xres-owner" \
+            scripts/ci/xres-owner.c -lXRes -lX11
+          test -x "$RUNNER_TEMP/xres/xres-owner"
+          sha256sum scripts/ci/xres-owner.c "$RUNNER_TEMP/xres/xres-owner"
+
+      # The whole prototype, inside ONE `xvfb-run` so every oracle sees the same private
+      # server number: `-a` picks a fresh one per invocation, so a second step would be
+      # talking to a different display. The harness starts, owns and stops its own Openbox
+      # and its own helper clients; nothing foreign is signalled and no process list is
+      # scanned. A failed OR unrun oracle exits non-zero, so an oracle that did not run can
+      # never be read here as one that passed.
+      - name: Exercise the r2 oracles on a private display
+        env:
+          XRES_OWNER_BIN: ${{ runner.temp }}/xres/xres-owner
+        run: |
+          set -euo pipefail
+          umask 077
+          xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp" \
+            python3 scripts/ci/xres-owner-prototype.py
+        timeout-minutes: 10
+
+      # Guardrail, not decoration. This lane is authorized to add exactly three new files
+      # and to change nothing else; a diff anywhere else means the lane's premise is wrong
+      # and the run should be read as such rather than as a prototype result.
+      - name: Refuse to report a result if this lane touched anything else
+        if: always()
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet HEAD --; then
+            echo "::error::the working tree was modified during this prototype run;" \
+                 "this lane changes no tracked file and its result is not trustworthy."
+            git --no-pager diff --stat HEAD --
+            exit 1
+          fi
+          echo "no tracked file was modified by this prototype run."
