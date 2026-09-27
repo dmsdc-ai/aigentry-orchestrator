@@ -88,27 +88,72 @@ jobs:
       # focus moves. That is evidence, NOT proof that an absent WM is the cause, so this installs
       # a real EWMH window manager and measures the SAME suite against it rather than asserting
       # anything. Openbox is the smallest EWMH-compliant choice in the image's archive; x11-utils
-      # supplies the `xprop` the ownership check below reads, which the observation-only probe
-      # treats as optional and this experiment requires. Both are installed in this separate step
+      # supplies the `xprop` the supervisor's own baseline chain below reads, which the
+      # observation-only probe treats as optional and this experiment requires; and `libxres-dev`
+      # plus `libx11-dev` are the build dependency the XRes ownership probe needs — the SAME two
+      # official packages, and the same `-lXRes -lX11` link line, that the isolated prototype lane
+      # compiled and exercised on this exact runner image. They are installed in this separate step
       # so the install cost lands outside the acceptance step's unchanged 10-minute budget and
       # outside the real browser user process entirely, and `apt-get update` already ran in the
-      # runner preflight above. `python3` is NOT installed: the supervisor below is one file of
-      # its standard library, so the interpreter the runner image already ships is proved present
-      # here instead of anything being added to get it. Nothing is installed on a host, nothing
-      # enters package.json or package-lock.json, no new privilege is taken beyond the apt-get
+      # runner preflight above. `python3` and `cc` are NOT installed: the supervisor below is one
+      # file of the standard library and the probe is one C file, so the interpreter and the
+      # compiler the runner image already ships are proved present here instead of anything being
+      # added to get them. Nothing is installed on a host, nothing enters package.json or
+      # package-lock.json, NO runtime npm or native dependency is created and no user of this
+      # package is ever asked for a compiler — the probe is CI-only infrastructure that is built
+      # into, and dies with, RUNNER_TEMP. No new privilege is taken beyond the apt-get
       # the runner preflight above already uses, and release.yml keeps the plain caller with no
       # window manager and no supervisor at all.
-      - name: Install the CI-only window manager for the owned display experiment
+      - name: Install the CI-only window manager and XRes build deps for the owned display experiment
         run: |
           set -euo pipefail
-          sudo apt-get install -y --no-install-recommends openbox x11-utils
+          sudo apt-get install -y --no-install-recommends \
+            openbox x11-utils libxres-dev libx11-dev
           command -v openbox
           command -v xprop
           command -v python3
+          command -v cc
+
+      # #1177 — the ownership proof the supervisor below actually uses, compiled here rather than
+      # shipped. `scripts/ci/xres-owner.c` is the byte-identical source the ISOLATED prototype lane
+      # validated on this same `ubuntu-22.04` image (12 of 12 oracles green, including the full
+      # `mode=wm grab=held instrumented=no` positive against a real Openbox), and it is compiled
+      # with the SAME command line that lane used: `cc -O2 -Wall -Wextra ... -lXRes -lX11`, the
+      # official libraries only, no hand-written X11 protocol and no private libXres internals.
+      # `-Werror` is deliberately NOT used, because a warning from a system header would then block
+      # this lane for something that is not a defect in the probe.
+      #
+      # ubuntu-22.04 is not incidental. The probe's public-API contract is version-exact for jammy
+      # (`libxres1` 2:1.2.1-1, `XRes.h` at tag libXres-1.2.1), which is why the installed package
+      # versions and the installed header's hash go in the log next to the binary's: the provenance
+      # is MEASURED here rather than asserted by this comment. If this image is ever retired the
+      # correct move is to re-pin deliberately and re-establish version-exactness, not to bump the
+      # label and keep the claim.
+      #
+      # This step installs nothing, takes no root, touches no package manifest and starts no
+      # process on any display. The binary is written under `umask 077` into a directory this step
+      # creates inside RUNNER_TEMP, so it is owner-only by construction and is destroyed with the
+      # ephemeral runner.
+      - name: Compile the CI-only XRes ownership probe
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/xres"
+          dpkg-query -W -f='${Package} ${Version}\n' libxres1 libxres-dev libx11-dev
+          header=/usr/include/X11/extensions/XRes.h
+          test -f "$header"
+          sha256sum "$header"
+          cc -O2 -Wall -Wextra -o "$RUNNER_TEMP/xres/xres-owner" \
+            scripts/ci/xres-owner.c -lXRes -lX11
+          test -x "$RUNNER_TEMP/xres/xres-owner"
+          sha256sum scripts/ci/xres-owner.c "$RUNNER_TEMP/xres/xres-owner"
       - name: Actual browser, WebAuthn and TLS controls
         env:
           BROWSER_TLS_RECEIPT: ${{ runner.temp }}/browser-tls-receipt.json
           CONSOLE_UI_ARTIFACTS: ${{ runner.temp }}/console-ui-artifacts
+          # The probe the step above compiled. A REQUIRED capability: the supervisor refuses when
+          # this is unset or not executable, and never falls back to a weaker proof.
+          XRES_OWNER_BIN: ${{ runner.temp }}/xres/xres-owner
         # Headed Chromium on a private virtual display owned by this non-root ephemeral
         # runner. `-a` picks a free server number; `-nolisten tcp` keeps the display off the
         # network entirely; `xvfb-run` creates the X authority cookie under the runner's own
@@ -157,8 +202,35 @@ jobs:
         #   * Suite status and cleanup errors are captured separately. The acceptance status is
         #     re-raised verbatim, so a red suite stays red and reports its own status and cleanup
         #     never masks it; a GREEN suite whose cleanup failed is turned red, not called a pass.
-        #   * Ownership is PROVEN, not inferred from a property being present, and the exact
-        #     `_NET_WM_PID` binding is required: see the supervisor's own readiness comment.
+        #   * Ownership is PROVEN, not inferred from a property being present. The proof is the
+        #     server's OWN answer, not the window manager's word for it: the compiled XRes probe
+        #     asks the X server which CLIENT owns the supporting window and which pid that client
+        #     registered, inside one `XGrabServer` bracket, and the answer must name the exact
+        #     process this supervisor's own `Popen` handle started. That REPLACES the
+        #     client-asserted `_NET_WM_PID` window property this readiness proof used to require —
+        #     a property Openbox 3.6.1-10 never sets, and which was only ever the window
+        #     manager's own claim about itself. It is a REPLACEMENT, never a downgrade: the
+        #     exact-owned-process requirement is strictly stronger, and every other link in the
+        #     chain (private display, observed absent-to-present transition, self-consistent
+        #     supporting window, window name) is still required and still substitutes for nothing.
+        #     See the supervisor's own readiness comment.
+        #   * The probe's answer is an ATOMIC SNAPSHOT and is never represented as continuous
+        #     ownership. It is bracketed by a `poll()` on the owner handle immediately before the
+        #     probe is spawned and immediately after it is reaped, so the instant the server
+        #     answered lies inside an interval over which that pid provably denotes one live
+        #     process; an exit mid-bracket discards the comparison rather than reinterpreting it.
+        #   * Every way the proof can fail to land is a REFUSAL, never a pass and never a
+        #     downgrade: a missing or non-executable probe, a server without the X-Resource
+        #     capability or with one older than 1.2, a non-zero or unrecognised exit status,
+        #     output this supervisor's strict whole-line parse rejects, a foreign or ambiguous
+        #     owning client, a supporting window that is absent or is not the one this supervisor
+        #     itself saw, a dead child, or a bound that expired.
+        #   * The probe is invoked in its real measuring mode ONLY — `--mode wm --owner-pid <the
+        #     handle's own pid>`, a real server grab, and nothing else. Its source also carries
+        #     reduced and instrumented modes for the isolated prototype's oracles
+        #     (`--mode xid`/`bogus`/`helper`, `--no-grab`, `--grab-delay-ms`); NONE of them is
+        #     ever passed here, and a record that reports `mode=`/`grab=`/`instrumented=`
+        #     anything other than `wm`/`held`/`no` is refused rather than read as a measurement.
         #   * The suite is byte-unchanged: the same `npm run test:browser-tls`, no fixture,
         #     product, Playwright or sandbox change, no forced or synthesized visibility. It runs
         #     as an owned child so a cancellation stops what this caller started; its own
@@ -184,6 +256,31 @@ jobs:
           # starts ONE window manager on the display this xvfb-run already owns, proves that
           # exact process owns it, runs the unchanged acceptance suite, and stops only what it
           # started. Standard library only, and one synchronous owner from start to finish.
+          #
+          # HOW OWNERSHIP IS PROVED, AND WHAT CHANGED
+          #   The exact-owned-process requirement is unchanged and is not weakened anywhere below.
+          #   What changed is WHO ANSWERS IT. This supervisor used to require the `_NET_WM_PID`
+          #   window property on the supporting window to equal this child's pid. That property is
+          #   the window manager's own CLAIM about itself — an ordinary client-settable property,
+          #   with no server-side binding to the connection that set it — and Openbox 3.6.1-10
+          #   never sets it at all, so the proof could not be satisfied on this image.
+          #
+          #   It is now answered by the X server instead, through the X-Resource extension: the
+          #   compiled `xres-owner` probe asks the server which CLIENT owns the supporting window
+          #   and which pid that client registered, inside one `XGrabServer` bracket, and the pid
+          #   must be exactly the process this supervisor's own `Popen` handle started. That is
+          #   strictly STRONGER than the property it replaces, and it is a REPLACEMENT, not a
+          #   downgrade: there is no path below on which a missing capability, an unreadable
+          #   answer or an inexact match is accepted, and every other link in the chain — the
+          #   private display, the observed absent-to-present transition, the self-consistent
+          #   supporting window, the window name — is still required and still substitutes for
+          #   nothing.
+          #
+          #   The probe's answer is an ATOMIC SNAPSHOT of one instant, not a lease: it is read
+          #   inside a `poll()` bracket on the owner handle taken immediately before the probe is
+          #   spawned and immediately after it is reaped, and an exit inside that bracket DISCARDS
+          #   the comparison. Nothing below claims ownership persisted after the snapshot.
+          import os
           import re
           import signal
           import subprocess
@@ -192,10 +289,26 @@ jobs:
 
           READY_SECONDS = 30.0   # whole readiness phase, the baseline read included
           PROBE_SECONDS = 5.0    # per-xprop bound, clamped to what is left of READY_SECONDS
+          # Bound on ONE `xres-owner` invocation, also clamped to what is left of READY_SECONDS.
+          # Larger than the sum of the probe's own two internal 5s bounds - one over the
+          # capability gate, one over the grab bracket - so contention with another client's
+          # server grab normally surfaces as the probe's legible `grab-unavailable` record rather
+          # than as this bound's opaque timeout. An expiry here is a REFUSAL, never absence.
+          # The number is 15 and not larger for a second reason: a cancellation is acted on
+          # between iterations of the readiness loop, so this is also the longest this loop can
+          # go without noticing one, and 15s is exactly the window the three 5s xprop reads
+          # already imposed. So the loop's responsiveness to INT/TERM is unchanged, and
+          # READY_SECONDS still ends the whole phase regardless.
+          OWNER_SECONDS = 15.0
           TERM_SECONDS = 10.0    # bounded join after SIGTERM
           KILL_SECONDS = 5.0     # bounded join after SIGKILL
           POLL_SECONDS = 0.5     # cancellation poll at each wait taken before cleanup
           EVIDENCE_BYTES = 200   # per-stream cap on what one probe record may carry
+          # The probe's own widest renderable record is ~473 bytes, so the xprop cap above would
+          # truncate exactly the line a failure needs read. This larger cap is used for that ONE
+          # stream and nothing else; it bounds a record whose shape is fixed by the probe, and it
+          # is diagnostic only — no verdict below reads a rendered stream.
+          OWNER_EVIDENCE_BYTES = 768
           SUPPORTING = "_NET_SUPPORTING_WM_CHECK"
           YESNO = {True: "yes", False: "no"}
           # Path-shaped tokens are redacted out of DIAGNOSTIC streams only. This is a BOUND on
@@ -204,8 +317,30 @@ jobs:
           # while redacting less is not, so it deliberately runs to the next space rather than
           # trying to be exact. It is a BYTES pattern because nothing here ever decodes.
           PATHLIKE = re.compile(b"/[^ ]*")
+          # The probe's fixed single-record protocol, in the field order it writes, reproduced
+          # from the record `xres-owner.c` renders and NOT invented here. One strict whole-line
+          # pattern: anything that does not match the whole of it is UNPARSABLE, which is
+          # `owner-unreadable`, and it is never partially salvaged. `refusal` is matched as an
+          # explicit CLOSED alternation of the nine tokens the probe emits rather than as a
+          # character class, so a tenth token would make the record unparsable — refusing — rather
+          # than be carried through as an unknown string.
+          RECORD = re.compile(
+              r"^xres-owner \(verdict=(?P<verdict>[a-z0-9-]+) mode=(?P<mode>[a-z]+)"
+              r" grab=(?P<grab>held|absent|unavailable|-) instrumented=(?P<instrumented>yes|no)"
+              r" delay-ms=(?P<delay_ms>[0-9]+) window=(?P<window>0x[0-9a-f]+|-)"
+              r" probed-xid=(?P<probed>0x[0-9a-f]+|-) existence=(?P<existence>ok|badwindow|-)"
+              r" step6=(?P<step6>ok|badwindow|-) xres-status=(?P<xres_status>success|failed|-)"
+              r" num-ids=(?P<num_ids>[0-9]+|-) length=(?P<length>[0-9]+|-)"
+              r" pid=(?P<pid>[0-9]+|-) owner-pid=(?P<owner_pid>[0-9]+|-)"
+              r" server-version=(?P<version>[0-9]+\.[0-9]+|-)"
+              r" x-error=(?P<x_error>[0-9]+/[0-9]+|-)"
+              r" ret-client=(?P<ret_client>0x[0-9a-f]+|-) ret-mask=(?P<ret_mask>0x[0-9a-f]+|-)"
+              r" refusal=(?P<refusal>xres-status|num-ids-zero|num-ids-many|ids-null"
+              r"|client-mismatch|mask-mismatch|length-range|value-null|pid-invalid|-)\)$")
           # The specific gap each refusal reports, so a failure names what was missing rather
-          # than only that something was.
+          # than only that something was. The first block is this supervisor's own; the second is
+          # the probe's closed verdict set, passed through verbatim so a refusal names the X
+          # server's answer rather than being re-spelled here.
           GAP = {
               "exited": "the owned Openbox exited before any ownership evidence appeared",
               "timeout": "no ownership evidence appeared inside the readiness deadline",
@@ -214,13 +349,40 @@ jobs:
                                      " that registration is stale",
               "unnamed": "the supporting window published no readable _NET_WM_NAME",
               "foreign-wm": "the supporting window belongs to a different window manager",
-              "pid-missing": "Openbox published no _NET_WM_PID on its supporting window",
-              "pid-malformed": "the _NET_WM_PID on the supporting window was not a plain number",
-              "pid-unreadable": "the _NET_WM_PID on the supporting window could not be read",
-              "pid-foreign": "the _NET_WM_PID on the supporting window is another process",
+              "probe-missing": "the compiled XRes ownership probe named by XRES_OWNER_BIN was"
+                               " missing or not executable, so the server could not be asked who"
+                               " owns the supporting window",
+              "probe-artificial": "the probe reported a reduced or instrumented run, which is a"
+                                  " control and is never read as a measurement",
+              "w-changed": "the probe resolved a different supporting window than this supervisor"
+                           " had just observed, so the two readings name different instants",
+              "owner-unreadable": "the probe produced no record this supervisor can read - a"
+                                  " non-zero or unrecognised exit status, an expired bound, output"
+                                  " its strict whole-line parse rejects, or a record that says"
+                                  " owned while a field it must agree with does not",
+              "xres-unavailable": "this X server does not offer the X-Resource extension, so"
+                                  " exact-owned-process ownership cannot be asked of it at all",
+              "xres-too-old": "this X server's X-Resource version is older than the 1.2 that"
+                              " reports client pids",
+              "grab-unavailable": "the probe could not complete its bracket inside its own bound,"
+                                  " which is contention with another client's server grab",
+              "w-unregistered": "the probe found no supporting window registered on the root"
+                                " inside its grab",
+              "w-absent": "the supporting window did not exist when the probe checked it",
+              "w-not-self": "the supporting window did not point back at itself inside the"
+                            " probe's grab, so that registration is stale",
+              "w-foreign-wm": "the supporting window published no readable _NET_WM_NAME naming"
+                              " Openbox inside the probe's grab",
+              "owner-refused": "an X-Resource request the ownership proof depends on did not"
+                               " succeed",
+              "owner-unknown": "the server named no owning pid for the supporting window, which"
+                               " is not an absence that may be read as a pass",
+              "owner-ambiguous": "the server did not name exactly one live client as the owner of"
+                                 " the supporting window",
+              "owner-malformed": "the owning-client reply was not in a shape the probe may read",
+              "owner-foreign": "the server named a pid other than this child as the owner of the"
+                               " supporting window",
           }
-          BINDING = {"owned": "owned", "pid-missing": "missing", "pid-foreign": "foreign",
-                     "pid-malformed": "malformed", "pid-unreadable": "unreadable"}
           CANCELLED = []   # every INT/TERM the handler recorded, first signal first
           CLEANING = []    # set when the one cleanup path begins: a record, not a guard
 
@@ -251,7 +413,7 @@ jobs:
               sys.stderr.flush()
 
 
-          def sanitize(raw, redact):
+          def sanitize(raw, redact, cap=EVIDENCE_BYTES):
               """One captured stream, rendered bounded, single-line and printable. The cap is
               applied to the RAW bytes first, so what is recorded can never grow with what the
               tool printed, and truncation is returned on its own rather than being hidden
@@ -267,28 +429,37 @@ jobs:
               rendering, while a DIAGNOSTIC stream has path-shaped tokens replaced before that
               rendering and so is bounded and redacted rather than exact."""
               data = raw or b""
-              kept = data[:EVIDENCE_BYTES]
+              kept = data[:cap]
               if redact:
                   kept = PATHLIKE.sub(b"(path)", kept)
               shown = "".join(chr(b) if 32 <= b < 127 and chr(b) not in '<"' else "<%02x>" % b
                               for b in kept)
-              return (shown, len(data), len(data) > EVIDENCE_BYTES)
+              return (shown, len(data), len(data) > cap)
 
 
-          def record(evidence, name, status, out, err, timed_out):
+          def record(evidence, name, status, out, err, timed_out, cap=EVIDENCE_BYTES,
+                     label="property"):
               """Append exactly one bounded probe record, or nothing at all when the caller did
               not ask for one. The classified status, the truncation of each stream and the
               timeout are each their OWN field: none of them can be lost inside another, and
               none of them is ever folded into an absence. Nothing else about the run is
-              recorded - no environment, no argument vector, no process listing."""
+              recorded - no environment, no argument vector, no process listing.
+              `cap` is the per-stream byte bound and defaults to the xprop one, so every existing
+              caller is unchanged; the ownership probe passes its own larger bound because its
+              record line is longer than an xprop response and truncating it would hide exactly
+              what a refusal needs read. It is still a BOUND, and still diagnostic only.
+              `label` names what `name` identifies and defaults to `property`, which is what every
+              xprop caller records. The ownership probe passes `probe` instead, because what it
+              invoked is a subprocess and not a window property - calling it one would be exactly
+              the kind of stale _NET_WM_PID-shaped claim this readiness proof no longer makes."""
               if evidence is None:
                   return
-              shown_out, out_bytes, out_cut = sanitize(out, False)
-              shown_err, err_bytes, err_cut = sanitize(err, True)
-              evidence.append('property=%s status=%s timed-out=%s stdout-bytes=%d'
+              shown_out, out_bytes, out_cut = sanitize(out, False, cap)
+              shown_err, err_bytes, err_cut = sanitize(err, True, cap)
+              evidence.append('%s=%s status=%s timed-out=%s stdout-bytes=%d'
                               ' stdout-truncated=%s stdout="%s" stderr-bytes=%d'
                               ' stderr-truncated=%s stderr="%s"'
-                              % (name, status, YESNO[timed_out], out_bytes, YESNO[out_cut],
+                              % (label, name, status, YESNO[timed_out], out_bytes, YESNO[out_cut],
                                  shown_out, err_bytes, YESNO[err_cut], shown_err))
 
 
@@ -376,26 +547,158 @@ jobs:
               return ("value", found.group(1))
 
 
-          def wm_pid(window, deadline):
-              """The pid the supporting window claims for itself. A shape this cannot parse is
-              malformed, which refuses; it is never rounded down to absence."""
-              state, text = read(["-id", hex(window)], "_NET_WM_PID", deadline)
-              if state != "ok":
-                  return (state, None)
-              found = re.match("^_NET_WM_PID = ([0-9]+)$", text)
+          def owner_binary():
+              """The compiled XRes ownership probe, or None when there is not one to invoke.
+
+              This is a REQUIRED capability, checked before anything is started. An unset, empty
+              or non-executable XRES_OWNER_BIN REFUSES in main(); it is never a licence to fall
+              back to the client-asserted _NET_WM_PID window property this replaces, and there is
+              no second, weaker proof anywhere below to fall back TO."""
+              path = os.environ.get("XRES_OWNER_BIN", "")
+              if not path or not os.path.isfile(path) or not os.access(path, os.X_OK):
+                  return None
+              return path
+
+
+          def artificial(fields):
+              """True when this record did not come from a real, full measurement.
+
+              The probe's source also supports reduced and instrumented runs for the isolated
+              prototype's oracles - other modes, an artificial in-grab delay, and a no-grab
+              negative control - and it DISCLOSES which it did in every record. This supervisor
+              passes none of those options, so a record reporting anything but
+              `mode=wm grab=held instrumented=no` is refused rather than read as a measurement of
+              this display: a control must never be able to stand in for the real thing, even if
+              some future caller or a substituted binary were to enable one."""
+              return (fields["instrumented"] != "no" or fields["mode"] != "wm"
+                      or fields["grab"] != "held")
+
+
+          def xres_owned(binary, wm, window, deadline, evidence=None):
+              """Ask the X SERVER, through the X-Resource extension, whether `window` is a live
+              window whose owning CLIENT is exactly this child, and return `owned` or a named
+              refusal. This is the link that replaces the _NET_WM_PID window property.
+
+              One bounded invocation of the probe in its real measuring mode and nothing else:
+              `--mode wm --owner-pid <this handle's own pid>`, a real server grab, no reduced mode
+              and no instrumentation. The pid comes from the `Popen` handle this supervisor
+              created, which is the only authenticated identity here - nothing is parsed out of a
+              log or a process list, and nothing foreign is ever named.
+
+              EVERY outcome that is not an exact match REFUSES, and none of them is absence:
+              a bound that expired, a probe that could not be run, an exit status outside the
+              probe's own {0 owned, 2 determinate refusal}, output the strict whole-line RECORD
+              pattern rejects, an exit status and a printed verdict that disagree, any of the
+              probe's own refusal verdicts, a reduced or instrumented run, a supporting window
+              other than the one this supervisor just observed, and a record that claims `owned`
+              while a field it must agree with does not.
+
+              ATOMICITY. The probe's answer is a snapshot taken inside its own XGrabServer
+              bracket; it is not a lease, and nothing here represents it as continuous ownership.
+              It is bracketed instead: `poll()` immediately before the spawn and again immediately
+              after the reap, with no cached reading, so the instant the server answered lies
+              inside an interval over which `wm.pid` provably denotes one live process. `poll()`
+              itself reaps, so a non-None at t2 means the child exited AND was just reaped - the
+              verdict becomes `exited` and the pid comparison is DISCARDED rather than reported.
+
+              The per-call bound is clamped to what is left of the shared readiness deadline, so
+              this cannot outlive it. `evidence` receives exactly one bounded, sanitized record of
+              what the invocation did, which is DIAGNOSTIC ONLY: no verdict returned here reads
+              it, and no branch below is relaxed by what it carried."""
+              left = deadline - time.monotonic()
+              if left <= 0:
+                  record(evidence, "xres-owner", "not-invoked-deadline-passed", b"", b"", False,
+                         OWNER_EVIDENCE_BYTES, "probe")
+                  return "timeout"
+              if wm.poll() is not None:                                       # t0
+                  return "exited"
+              try:
+                  done = subprocess.run([binary, "--mode", "wm", "--owner-pid", str(wm.pid)],
+                                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE,
+                                        timeout=min(OWNER_SECONDS, left))
+              except subprocess.TimeoutExpired as expired:
+                  # Whatever it had already printed is kept, and the timeout is its own field
+                  # rather than an empty reading that would look like a probe printing nothing.
+                  record(evidence, "xres-owner", "timed-out", expired.stdout, expired.stderr,
+                         True, OWNER_EVIDENCE_BYTES, "probe")
+                  return "owner-unreadable"
+              except OSError as failure:
+                  # Only the numeric errno: the message can carry a path and nothing needs one.
+                  record(evidence, "xres-owner", "not-invoked-errno-%s" % failure.errno,
+                         b"", b"", False, OWNER_EVIDENCE_BYTES, "probe")
+                  return "owner-unreadable"
+              # Recorded BEFORE any classification, so an exit status this does not accept and a
+              # record this cannot parse stay distinguishable afterwards.
+              record(evidence, "xres-owner", "exit-%d" % done.returncode, done.stdout,
+                     done.stderr, False, OWNER_EVIDENCE_BYTES, "probe")
+              if wm.poll() is not None:                                       # t2
+                  return "exited"
+              # The probe's own contract: 0 iff `owned`, 2 for a determinate refusal it printed,
+              # anything else is no usable record. Both halves are required to agree.
+              if done.returncode not in (0, 2):
+                  return "owner-unreadable"
+              lines = [line for line in done.stdout.decode("utf-8", "replace").splitlines()
+                       if line]
+              if len(lines) != 1:
+                  return "owner-unreadable"
+              found = RECORD.match(lines[0])
               if not found:
-                  return ("malformed", None)
-              return ("value", int(found.group(1)))
+                  return "owner-unreadable"
+              fields = found.groupdict()
+              if (done.returncode == 0) != (fields["verdict"] == "owned"):
+                  return "owner-unreadable"
+              if fields["verdict"] != "owned":
+                  # The probe's closed verdict set, passed through verbatim so the refusal names
+                  # the server's answer - a missing or too-old capability, contention, an absent,
+                  # stale or foreign supporting window, an ambiguous or foreign owning client -
+                  # rather than being flattened into one opaque token here.
+                  return fields["verdict"]
+              if artificial(fields):
+                  return "probe-artificial"
+              # The supporting window identity. This supervisor resolved W with its own xprop
+              # chain and the probe re-resolved it from the root inside its grab; if the two
+              # differ they name different instants, and the un-grabbed interval between them is
+              # refused rather than pretended away.
+              if fields["window"] == "-" or int(fields["window"], 16) != window:
+                  return "w-changed"
+              # Internal consistency of a record that claims `owned`. Each of these is ENTAILED by
+              # `owned` in the probe, so a disagreement means the record is not one this
+              # supervisor can read - not that a weaker reading of it should be accepted.
+              if (fields["probed"] != fields["window"] or fields["existence"] != "ok"
+                      or fields["step6"] != "ok" or fields["xres_status"] != "success"
+                      or fields["num_ids"] != "1" or fields["length"] == "-"
+                      or fields["refusal"] != "-" or fields["version"] == "-"):
+                  return "owner-unreadable"
+              # The exact owned live pid, re-compared here against the handle this supervisor
+              # started: the probe's own comparison is never the only check. Both the pid the
+              # server reported and the pid the probe was asked about must be this child.
+              if fields["pid"] == "-" or int(fields["pid"]) != wm.pid:
+                  return "owner-unreadable"
+              if fields["owner_pid"] == "-" or int(fields["owner_pid"]) != wm.pid:
+                  return "owner-unreadable"
+              return "owned"
 
 
-          def readiness(wm, deadline):
+          def readiness(binary, wm, deadline):
               """Bounded proof that THIS child owns THIS display, or a named refusal. All of
               these are required, in order: the root points at a supporting window W; W points
-              back at itself, which is the EWMH staleness test; W is named Openbox; W carries a
-              _NET_WM_PID that is exactly this child pid; and the child is still alive at the
-              end. A missing, malformed, unreadable or foreign _NET_WM_PID REFUSES - the
-              private display, the observed absent-to-present transition and the window name
-              are each necessary and not one of them is accepted in its place."""
+              back at itself, which is the EWMH staleness test; W is named Openbox; the X SERVER
+              names this exact child as the client that owns W; and the child is alive on both
+              sides of that answer.
+
+              The last two links come from the `xres-owner` probe and REPLACE the _NET_WM_PID
+              window property this used to read. The requirement is unchanged in strength and is
+              not downgraded anywhere: the private display, the observed absent-to-present
+              transition, the self-consistency test and the window name are each still necessary
+              and not one of them is accepted in place of the server's own answer. What changed is
+              that the answer no longer comes from a property the window manager set about itself.
+
+              The probe re-derives the whole W chain inside its own grab; neither chain substitutes
+              for the other, and the two W readings must agree. The trailing liveness check this
+              function used to make is now the probe bracket's t2 poll, which is strictly tighter:
+              it is taken immediately after the probe is reaped rather than after a further
+              round trip."""
               while True:
                   if CANCELLED:
                       return "cancelled"
@@ -415,18 +718,17 @@ jobs:
                       return "unnamed"
                   if "Openbox" not in name:
                       return "foreign-wm"
-                  state, claimed = wm_pid(window, deadline)
-                  if state == "absent":
-                      return "pid-missing"
-                  if state == "malformed":
-                      return "pid-malformed"
-                  if state != "value":
-                      return "pid-unreadable"
-                  if claimed != wm.pid:
-                      return "pid-foreign"
-                  if wm.poll() is not None:
-                      return "exited"
-                  return "owned"
+                  # The ownership answer, and the one thing that can return `owned`. Its record is
+                  # emitted on EVERY outcome and before this function returns, so what the probe
+                  # actually did is on the log whether this refuses or goes on; it goes to stderr,
+                  # which survives the exit 1 below where the success-only uploads do not; and it
+                  # is read by NOTHING - no branch consults it, so it can neither relax the
+                  # refusal, shorten the proof, nor stand in for an answer that was not given.
+                  proof = []
+                  verdict = xres_owned(binary, wm, window, deadline, proof)
+                  for seen in proof:
+                      note("wm-ownership-probe (%s)" % seen)
+                  return verdict
 
 
           def join(child, seconds):
@@ -489,6 +791,16 @@ jobs:
           def main():
               started = time.monotonic()
               deadline = started + READY_SECONDS
+              # The ownership proof is a REQUIRED capability and is checked FIRST, before the
+              # display is even read and before anything is started, so a missing probe costs
+              # nothing and cannot be discovered halfway through owning a window manager. There is
+              # deliberately no fallback: the _NET_WM_PID property this replaces is not consulted
+              # anywhere below, so an absent probe means ownership cannot be proved at all.
+              binary = owner_binary()
+              if binary is None:
+                  problem("%s. Nothing was started and the acceptance suite was NOT run."
+                          % GAP["probe-missing"])
+                  return 1
               # A supporting window that is ALREADY here belongs to something this caller did
               # not start, and an initial state that could not be READ is not an absent one:
               # the absent-to-present transition is only evidence if the absence was observed.
@@ -533,9 +845,14 @@ jobs:
               ready = "not-reached"
               cleanup_rc = 0
               try:
-                  ready = readiness(wm, deadline)
-                  note("wm-owned (started=openbox readiness=%s pid-binding=%s waited=%.1fs)"
-                       % (ready, BINDING.get(ready, "unread"), time.monotonic() - started))
+                  ready = readiness(binary, wm, deadline)
+                  # `ownership` names WHAT was established, not merely that something was: only
+                  # the server's own exact-owned-client answer earns the positive token, and every
+                  # other readiness outcome reads as unproven. There is no third value.
+                  note("wm-owned (started=openbox readiness=%s ownership=%s waited=%.1fs)"
+                       % (ready,
+                          "xres-exact-owned-client" if ready == "owned" else "unproven",
+                          time.monotonic() - started))
                   if ready == "owned":
                       suite = subprocess.Popen(["npm", "run", "test:browser-tls"])
                       suite_rc = await_owned(suite)
@@ -570,11 +887,13 @@ jobs:
                   return 128 + CANCELLED[0]
               if ready != "owned":
                   problem("the owned Openbox never proved it owns this display (readiness=%s):"
-                          " %s. The exact _NET_WM_PID binding is REQUIRED and is not downgraded"
-                          " - the private display, the absent-to-present transition and the"
-                          " window name do not replace it - and no other window manager is"
-                          " selected instead. The acceptance suite was NOT run and nothing was"
-                          " measured." % (ready, GAP.get(ready, "no ownership evidence")))
+                          " %s. The X server's own exact-owned-client answer is REQUIRED and is"
+                          " not downgraded - the private display, the absent-to-present"
+                          " transition, the self-consistency test and the window name do not"
+                          " replace it, and the _NET_WM_PID property it replaced is weaker and is"
+                          " not consulted as a fallback - and no other window manager is selected"
+                          " instead. The acceptance suite was NOT run and nothing was measured."
+                          % (ready, GAP.get(ready, "no ownership evidence")))
                   return 1
               if suite_rc is None:
                   problem("the acceptance suite reported no status, which cannot be read as a"

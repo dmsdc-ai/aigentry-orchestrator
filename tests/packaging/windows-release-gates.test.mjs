@@ -266,8 +266,35 @@ const ciCallerRationale = `        # Two independent, read-only observations, ma
         #   * Suite status and cleanup errors are captured separately. The acceptance status is
         #     re-raised verbatim, so a red suite stays red and reports its own status and cleanup
         #     never masks it; a GREEN suite whose cleanup failed is turned red, not called a pass.
-        #   * Ownership is PROVEN, not inferred from a property being present, and the exact
-        #     \`_NET_WM_PID\` binding is required: see the supervisor's own readiness comment.
+        #   * Ownership is PROVEN, not inferred from a property being present. The proof is the
+        #     server's OWN answer, not the window manager's word for it: the compiled XRes probe
+        #     asks the X server which CLIENT owns the supporting window and which pid that client
+        #     registered, inside one \`XGrabServer\` bracket, and the answer must name the exact
+        #     process this supervisor's own \`Popen\` handle started. That REPLACES the
+        #     client-asserted \`_NET_WM_PID\` window property this readiness proof used to require —
+        #     a property Openbox 3.6.1-10 never sets, and which was only ever the window
+        #     manager's own claim about itself. It is a REPLACEMENT, never a downgrade: the
+        #     exact-owned-process requirement is strictly stronger, and every other link in the
+        #     chain (private display, observed absent-to-present transition, self-consistent
+        #     supporting window, window name) is still required and still substitutes for nothing.
+        #     See the supervisor's own readiness comment.
+        #   * The probe's answer is an ATOMIC SNAPSHOT and is never represented as continuous
+        #     ownership. It is bracketed by a \`poll()\` on the owner handle immediately before the
+        #     probe is spawned and immediately after it is reaped, so the instant the server
+        #     answered lies inside an interval over which that pid provably denotes one live
+        #     process; an exit mid-bracket discards the comparison rather than reinterpreting it.
+        #   * Every way the proof can fail to land is a REFUSAL, never a pass and never a
+        #     downgrade: a missing or non-executable probe, a server without the X-Resource
+        #     capability or with one older than 1.2, a non-zero or unrecognised exit status,
+        #     output this supervisor's strict whole-line parse rejects, a foreign or ambiguous
+        #     owning client, a supporting window that is absent or is not the one this supervisor
+        #     itself saw, a dead child, or a bound that expired.
+        #   * The probe is invoked in its real measuring mode ONLY — \`--mode wm --owner-pid <the
+        #     handle's own pid>\`, a real server grab, and nothing else. Its source also carries
+        #     reduced and instrumented modes for the isolated prototype's oracles
+        #     (\`--mode xid\`/\`bogus\`/\`helper\`, \`--no-grab\`, \`--grab-delay-ms\`); NONE of them is
+        #     ever passed here, and a record that reports \`mode=\`/\`grab=\`/\`instrumented=\`
+        #     anything other than \`wm\`/\`held\`/\`no\` is refused rather than read as a measurement.
         #   * The suite is byte-unchanged: the same \`npm run test:browser-tls\`, no fixture,
         #     product, Playwright or sandbox change, no forced or synthesized visibility. It runs
         #     as an owned child so a cancellation stops what this caller started; its own
@@ -291,6 +318,31 @@ const ciDiagnosticRun = `          # The supervisor is written out here, under t
           # starts ONE window manager on the display this xvfb-run already owns, proves that
           # exact process owns it, runs the unchanged acceptance suite, and stops only what it
           # started. Standard library only, and one synchronous owner from start to finish.
+          #
+          # HOW OWNERSHIP IS PROVED, AND WHAT CHANGED
+          #   The exact-owned-process requirement is unchanged and is not weakened anywhere below.
+          #   What changed is WHO ANSWERS IT. This supervisor used to require the \`_NET_WM_PID\`
+          #   window property on the supporting window to equal this child's pid. That property is
+          #   the window manager's own CLAIM about itself — an ordinary client-settable property,
+          #   with no server-side binding to the connection that set it — and Openbox 3.6.1-10
+          #   never sets it at all, so the proof could not be satisfied on this image.
+          #
+          #   It is now answered by the X server instead, through the X-Resource extension: the
+          #   compiled \`xres-owner\` probe asks the server which CLIENT owns the supporting window
+          #   and which pid that client registered, inside one \`XGrabServer\` bracket, and the pid
+          #   must be exactly the process this supervisor's own \`Popen\` handle started. That is
+          #   strictly STRONGER than the property it replaces, and it is a REPLACEMENT, not a
+          #   downgrade: there is no path below on which a missing capability, an unreadable
+          #   answer or an inexact match is accepted, and every other link in the chain — the
+          #   private display, the observed absent-to-present transition, the self-consistent
+          #   supporting window, the window name — is still required and still substitutes for
+          #   nothing.
+          #
+          #   The probe's answer is an ATOMIC SNAPSHOT of one instant, not a lease: it is read
+          #   inside a \`poll()\` bracket on the owner handle taken immediately before the probe is
+          #   spawned and immediately after it is reaped, and an exit inside that bracket DISCARDS
+          #   the comparison. Nothing below claims ownership persisted after the snapshot.
+          import os
           import re
           import signal
           import subprocess
@@ -299,10 +351,26 @@ const ciDiagnosticRun = `          # The supervisor is written out here, under t
 
           READY_SECONDS = 30.0   # whole readiness phase, the baseline read included
           PROBE_SECONDS = 5.0    # per-xprop bound, clamped to what is left of READY_SECONDS
+          # Bound on ONE \`xres-owner\` invocation, also clamped to what is left of READY_SECONDS.
+          # Larger than the sum of the probe's own two internal 5s bounds - one over the
+          # capability gate, one over the grab bracket - so contention with another client's
+          # server grab normally surfaces as the probe's legible \`grab-unavailable\` record rather
+          # than as this bound's opaque timeout. An expiry here is a REFUSAL, never absence.
+          # The number is 15 and not larger for a second reason: a cancellation is acted on
+          # between iterations of the readiness loop, so this is also the longest this loop can
+          # go without noticing one, and 15s is exactly the window the three 5s xprop reads
+          # already imposed. So the loop's responsiveness to INT/TERM is unchanged, and
+          # READY_SECONDS still ends the whole phase regardless.
+          OWNER_SECONDS = 15.0
           TERM_SECONDS = 10.0    # bounded join after SIGTERM
           KILL_SECONDS = 5.0     # bounded join after SIGKILL
           POLL_SECONDS = 0.5     # cancellation poll at each wait taken before cleanup
           EVIDENCE_BYTES = 200   # per-stream cap on what one probe record may carry
+          # The probe's own widest renderable record is ~473 bytes, so the xprop cap above would
+          # truncate exactly the line a failure needs read. This larger cap is used for that ONE
+          # stream and nothing else; it bounds a record whose shape is fixed by the probe, and it
+          # is diagnostic only — no verdict below reads a rendered stream.
+          OWNER_EVIDENCE_BYTES = 768
           SUPPORTING = "_NET_SUPPORTING_WM_CHECK"
           YESNO = {True: "yes", False: "no"}
           # Path-shaped tokens are redacted out of DIAGNOSTIC streams only. This is a BOUND on
@@ -311,8 +379,30 @@ const ciDiagnosticRun = `          # The supervisor is written out here, under t
           # while redacting less is not, so it deliberately runs to the next space rather than
           # trying to be exact. It is a BYTES pattern because nothing here ever decodes.
           PATHLIKE = re.compile(b"/[^ ]*")
+          # The probe's fixed single-record protocol, in the field order it writes, reproduced
+          # from the record \`xres-owner.c\` renders and NOT invented here. One strict whole-line
+          # pattern: anything that does not match the whole of it is UNPARSABLE, which is
+          # \`owner-unreadable\`, and it is never partially salvaged. \`refusal\` is matched as an
+          # explicit CLOSED alternation of the nine tokens the probe emits rather than as a
+          # character class, so a tenth token would make the record unparsable — refusing — rather
+          # than be carried through as an unknown string.
+          RECORD = re.compile(
+              r"^xres-owner \\(verdict=(?P<verdict>[a-z0-9-]+) mode=(?P<mode>[a-z]+)"
+              r" grab=(?P<grab>held|absent|unavailable|-) instrumented=(?P<instrumented>yes|no)"
+              r" delay-ms=(?P<delay_ms>[0-9]+) window=(?P<window>0x[0-9a-f]+|-)"
+              r" probed-xid=(?P<probed>0x[0-9a-f]+|-) existence=(?P<existence>ok|badwindow|-)"
+              r" step6=(?P<step6>ok|badwindow|-) xres-status=(?P<xres_status>success|failed|-)"
+              r" num-ids=(?P<num_ids>[0-9]+|-) length=(?P<length>[0-9]+|-)"
+              r" pid=(?P<pid>[0-9]+|-) owner-pid=(?P<owner_pid>[0-9]+|-)"
+              r" server-version=(?P<version>[0-9]+\\.[0-9]+|-)"
+              r" x-error=(?P<x_error>[0-9]+/[0-9]+|-)"
+              r" ret-client=(?P<ret_client>0x[0-9a-f]+|-) ret-mask=(?P<ret_mask>0x[0-9a-f]+|-)"
+              r" refusal=(?P<refusal>xres-status|num-ids-zero|num-ids-many|ids-null"
+              r"|client-mismatch|mask-mismatch|length-range|value-null|pid-invalid|-)\\)$")
           # The specific gap each refusal reports, so a failure names what was missing rather
-          # than only that something was.
+          # than only that something was. The first block is this supervisor's own; the second is
+          # the probe's closed verdict set, passed through verbatim so a refusal names the X
+          # server's answer rather than being re-spelled here.
           GAP = {
               "exited": "the owned Openbox exited before any ownership evidence appeared",
               "timeout": "no ownership evidence appeared inside the readiness deadline",
@@ -321,13 +411,40 @@ const ciDiagnosticRun = `          # The supervisor is written out here, under t
                                      " that registration is stale",
               "unnamed": "the supporting window published no readable _NET_WM_NAME",
               "foreign-wm": "the supporting window belongs to a different window manager",
-              "pid-missing": "Openbox published no _NET_WM_PID on its supporting window",
-              "pid-malformed": "the _NET_WM_PID on the supporting window was not a plain number",
-              "pid-unreadable": "the _NET_WM_PID on the supporting window could not be read",
-              "pid-foreign": "the _NET_WM_PID on the supporting window is another process",
+              "probe-missing": "the compiled XRes ownership probe named by XRES_OWNER_BIN was"
+                               " missing or not executable, so the server could not be asked who"
+                               " owns the supporting window",
+              "probe-artificial": "the probe reported a reduced or instrumented run, which is a"
+                                  " control and is never read as a measurement",
+              "w-changed": "the probe resolved a different supporting window than this supervisor"
+                           " had just observed, so the two readings name different instants",
+              "owner-unreadable": "the probe produced no record this supervisor can read - a"
+                                  " non-zero or unrecognised exit status, an expired bound, output"
+                                  " its strict whole-line parse rejects, or a record that says"
+                                  " owned while a field it must agree with does not",
+              "xres-unavailable": "this X server does not offer the X-Resource extension, so"
+                                  " exact-owned-process ownership cannot be asked of it at all",
+              "xres-too-old": "this X server's X-Resource version is older than the 1.2 that"
+                              " reports client pids",
+              "grab-unavailable": "the probe could not complete its bracket inside its own bound,"
+                                  " which is contention with another client's server grab",
+              "w-unregistered": "the probe found no supporting window registered on the root"
+                                " inside its grab",
+              "w-absent": "the supporting window did not exist when the probe checked it",
+              "w-not-self": "the supporting window did not point back at itself inside the"
+                            " probe's grab, so that registration is stale",
+              "w-foreign-wm": "the supporting window published no readable _NET_WM_NAME naming"
+                              " Openbox inside the probe's grab",
+              "owner-refused": "an X-Resource request the ownership proof depends on did not"
+                               " succeed",
+              "owner-unknown": "the server named no owning pid for the supporting window, which"
+                               " is not an absence that may be read as a pass",
+              "owner-ambiguous": "the server did not name exactly one live client as the owner of"
+                                 " the supporting window",
+              "owner-malformed": "the owning-client reply was not in a shape the probe may read",
+              "owner-foreign": "the server named a pid other than this child as the owner of the"
+                               " supporting window",
           }
-          BINDING = {"owned": "owned", "pid-missing": "missing", "pid-foreign": "foreign",
-                     "pid-malformed": "malformed", "pid-unreadable": "unreadable"}
           CANCELLED = []   # every INT/TERM the handler recorded, first signal first
           CLEANING = []    # set when the one cleanup path begins: a record, not a guard
 
@@ -358,7 +475,7 @@ const ciDiagnosticRun = `          # The supervisor is written out here, under t
               sys.stderr.flush()
 
 
-          def sanitize(raw, redact):
+          def sanitize(raw, redact, cap=EVIDENCE_BYTES):
               """One captured stream, rendered bounded, single-line and printable. The cap is
               applied to the RAW bytes first, so what is recorded can never grow with what the
               tool printed, and truncation is returned on its own rather than being hidden
@@ -374,28 +491,37 @@ const ciDiagnosticRun = `          # The supervisor is written out here, under t
               rendering, while a DIAGNOSTIC stream has path-shaped tokens replaced before that
               rendering and so is bounded and redacted rather than exact."""
               data = raw or b""
-              kept = data[:EVIDENCE_BYTES]
+              kept = data[:cap]
               if redact:
                   kept = PATHLIKE.sub(b"(path)", kept)
               shown = "".join(chr(b) if 32 <= b < 127 and chr(b) not in '<"' else "<%02x>" % b
                               for b in kept)
-              return (shown, len(data), len(data) > EVIDENCE_BYTES)
+              return (shown, len(data), len(data) > cap)
 
 
-          def record(evidence, name, status, out, err, timed_out):
+          def record(evidence, name, status, out, err, timed_out, cap=EVIDENCE_BYTES,
+                     label="property"):
               """Append exactly one bounded probe record, or nothing at all when the caller did
               not ask for one. The classified status, the truncation of each stream and the
               timeout are each their OWN field: none of them can be lost inside another, and
               none of them is ever folded into an absence. Nothing else about the run is
-              recorded - no environment, no argument vector, no process listing."""
+              recorded - no environment, no argument vector, no process listing.
+              \`cap\` is the per-stream byte bound and defaults to the xprop one, so every existing
+              caller is unchanged; the ownership probe passes its own larger bound because its
+              record line is longer than an xprop response and truncating it would hide exactly
+              what a refusal needs read. It is still a BOUND, and still diagnostic only.
+              \`label\` names what \`name\` identifies and defaults to \`property\`, which is what every
+              xprop caller records. The ownership probe passes \`probe\` instead, because what it
+              invoked is a subprocess and not a window property - calling it one would be exactly
+              the kind of stale _NET_WM_PID-shaped claim this readiness proof no longer makes."""
               if evidence is None:
                   return
-              shown_out, out_bytes, out_cut = sanitize(out, False)
-              shown_err, err_bytes, err_cut = sanitize(err, True)
-              evidence.append('property=%s status=%s timed-out=%s stdout-bytes=%d'
+              shown_out, out_bytes, out_cut = sanitize(out, False, cap)
+              shown_err, err_bytes, err_cut = sanitize(err, True, cap)
+              evidence.append('%s=%s status=%s timed-out=%s stdout-bytes=%d'
                               ' stdout-truncated=%s stdout="%s" stderr-bytes=%d'
                               ' stderr-truncated=%s stderr="%s"'
-                              % (name, status, YESNO[timed_out], out_bytes, YESNO[out_cut],
+                              % (label, name, status, YESNO[timed_out], out_bytes, YESNO[out_cut],
                                  shown_out, err_bytes, YESNO[err_cut], shown_err))
 
 
@@ -483,26 +609,158 @@ const ciDiagnosticRun = `          # The supervisor is written out here, under t
               return ("value", found.group(1))
 
 
-          def wm_pid(window, deadline):
-              """The pid the supporting window claims for itself. A shape this cannot parse is
-              malformed, which refuses; it is never rounded down to absence."""
-              state, text = read(["-id", hex(window)], "_NET_WM_PID", deadline)
-              if state != "ok":
-                  return (state, None)
-              found = re.match("^_NET_WM_PID = ([0-9]+)$", text)
+          def owner_binary():
+              """The compiled XRes ownership probe, or None when there is not one to invoke.
+
+              This is a REQUIRED capability, checked before anything is started. An unset, empty
+              or non-executable XRES_OWNER_BIN REFUSES in main(); it is never a licence to fall
+              back to the client-asserted _NET_WM_PID window property this replaces, and there is
+              no second, weaker proof anywhere below to fall back TO."""
+              path = os.environ.get("XRES_OWNER_BIN", "")
+              if not path or not os.path.isfile(path) or not os.access(path, os.X_OK):
+                  return None
+              return path
+
+
+          def artificial(fields):
+              """True when this record did not come from a real, full measurement.
+
+              The probe's source also supports reduced and instrumented runs for the isolated
+              prototype's oracles - other modes, an artificial in-grab delay, and a no-grab
+              negative control - and it DISCLOSES which it did in every record. This supervisor
+              passes none of those options, so a record reporting anything but
+              \`mode=wm grab=held instrumented=no\` is refused rather than read as a measurement of
+              this display: a control must never be able to stand in for the real thing, even if
+              some future caller or a substituted binary were to enable one."""
+              return (fields["instrumented"] != "no" or fields["mode"] != "wm"
+                      or fields["grab"] != "held")
+
+
+          def xres_owned(binary, wm, window, deadline, evidence=None):
+              """Ask the X SERVER, through the X-Resource extension, whether \`window\` is a live
+              window whose owning CLIENT is exactly this child, and return \`owned\` or a named
+              refusal. This is the link that replaces the _NET_WM_PID window property.
+
+              One bounded invocation of the probe in its real measuring mode and nothing else:
+              \`--mode wm --owner-pid <this handle's own pid>\`, a real server grab, no reduced mode
+              and no instrumentation. The pid comes from the \`Popen\` handle this supervisor
+              created, which is the only authenticated identity here - nothing is parsed out of a
+              log or a process list, and nothing foreign is ever named.
+
+              EVERY outcome that is not an exact match REFUSES, and none of them is absence:
+              a bound that expired, a probe that could not be run, an exit status outside the
+              probe's own {0 owned, 2 determinate refusal}, output the strict whole-line RECORD
+              pattern rejects, an exit status and a printed verdict that disagree, any of the
+              probe's own refusal verdicts, a reduced or instrumented run, a supporting window
+              other than the one this supervisor just observed, and a record that claims \`owned\`
+              while a field it must agree with does not.
+
+              ATOMICITY. The probe's answer is a snapshot taken inside its own XGrabServer
+              bracket; it is not a lease, and nothing here represents it as continuous ownership.
+              It is bracketed instead: \`poll()\` immediately before the spawn and again immediately
+              after the reap, with no cached reading, so the instant the server answered lies
+              inside an interval over which \`wm.pid\` provably denotes one live process. \`poll()\`
+              itself reaps, so a non-None at t2 means the child exited AND was just reaped - the
+              verdict becomes \`exited\` and the pid comparison is DISCARDED rather than reported.
+
+              The per-call bound is clamped to what is left of the shared readiness deadline, so
+              this cannot outlive it. \`evidence\` receives exactly one bounded, sanitized record of
+              what the invocation did, which is DIAGNOSTIC ONLY: no verdict returned here reads
+              it, and no branch below is relaxed by what it carried."""
+              left = deadline - time.monotonic()
+              if left <= 0:
+                  record(evidence, "xres-owner", "not-invoked-deadline-passed", b"", b"", False,
+                         OWNER_EVIDENCE_BYTES, "probe")
+                  return "timeout"
+              if wm.poll() is not None:                                       # t0
+                  return "exited"
+              try:
+                  done = subprocess.run([binary, "--mode", "wm", "--owner-pid", str(wm.pid)],
+                                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE,
+                                        timeout=min(OWNER_SECONDS, left))
+              except subprocess.TimeoutExpired as expired:
+                  # Whatever it had already printed is kept, and the timeout is its own field
+                  # rather than an empty reading that would look like a probe printing nothing.
+                  record(evidence, "xres-owner", "timed-out", expired.stdout, expired.stderr,
+                         True, OWNER_EVIDENCE_BYTES, "probe")
+                  return "owner-unreadable"
+              except OSError as failure:
+                  # Only the numeric errno: the message can carry a path and nothing needs one.
+                  record(evidence, "xres-owner", "not-invoked-errno-%s" % failure.errno,
+                         b"", b"", False, OWNER_EVIDENCE_BYTES, "probe")
+                  return "owner-unreadable"
+              # Recorded BEFORE any classification, so an exit status this does not accept and a
+              # record this cannot parse stay distinguishable afterwards.
+              record(evidence, "xres-owner", "exit-%d" % done.returncode, done.stdout,
+                     done.stderr, False, OWNER_EVIDENCE_BYTES, "probe")
+              if wm.poll() is not None:                                       # t2
+                  return "exited"
+              # The probe's own contract: 0 iff \`owned\`, 2 for a determinate refusal it printed,
+              # anything else is no usable record. Both halves are required to agree.
+              if done.returncode not in (0, 2):
+                  return "owner-unreadable"
+              lines = [line for line in done.stdout.decode("utf-8", "replace").splitlines()
+                       if line]
+              if len(lines) != 1:
+                  return "owner-unreadable"
+              found = RECORD.match(lines[0])
               if not found:
-                  return ("malformed", None)
-              return ("value", int(found.group(1)))
+                  return "owner-unreadable"
+              fields = found.groupdict()
+              if (done.returncode == 0) != (fields["verdict"] == "owned"):
+                  return "owner-unreadable"
+              if fields["verdict"] != "owned":
+                  # The probe's closed verdict set, passed through verbatim so the refusal names
+                  # the server's answer - a missing or too-old capability, contention, an absent,
+                  # stale or foreign supporting window, an ambiguous or foreign owning client -
+                  # rather than being flattened into one opaque token here.
+                  return fields["verdict"]
+              if artificial(fields):
+                  return "probe-artificial"
+              # The supporting window identity. This supervisor resolved W with its own xprop
+              # chain and the probe re-resolved it from the root inside its grab; if the two
+              # differ they name different instants, and the un-grabbed interval between them is
+              # refused rather than pretended away.
+              if fields["window"] == "-" or int(fields["window"], 16) != window:
+                  return "w-changed"
+              # Internal consistency of a record that claims \`owned\`. Each of these is ENTAILED by
+              # \`owned\` in the probe, so a disagreement means the record is not one this
+              # supervisor can read - not that a weaker reading of it should be accepted.
+              if (fields["probed"] != fields["window"] or fields["existence"] != "ok"
+                      or fields["step6"] != "ok" or fields["xres_status"] != "success"
+                      or fields["num_ids"] != "1" or fields["length"] == "-"
+                      or fields["refusal"] != "-" or fields["version"] == "-"):
+                  return "owner-unreadable"
+              # The exact owned live pid, re-compared here against the handle this supervisor
+              # started: the probe's own comparison is never the only check. Both the pid the
+              # server reported and the pid the probe was asked about must be this child.
+              if fields["pid"] == "-" or int(fields["pid"]) != wm.pid:
+                  return "owner-unreadable"
+              if fields["owner_pid"] == "-" or int(fields["owner_pid"]) != wm.pid:
+                  return "owner-unreadable"
+              return "owned"
 
 
-          def readiness(wm, deadline):
+          def readiness(binary, wm, deadline):
               """Bounded proof that THIS child owns THIS display, or a named refusal. All of
               these are required, in order: the root points at a supporting window W; W points
-              back at itself, which is the EWMH staleness test; W is named Openbox; W carries a
-              _NET_WM_PID that is exactly this child pid; and the child is still alive at the
-              end. A missing, malformed, unreadable or foreign _NET_WM_PID REFUSES - the
-              private display, the observed absent-to-present transition and the window name
-              are each necessary and not one of them is accepted in its place."""
+              back at itself, which is the EWMH staleness test; W is named Openbox; the X SERVER
+              names this exact child as the client that owns W; and the child is alive on both
+              sides of that answer.
+
+              The last two links come from the \`xres-owner\` probe and REPLACE the _NET_WM_PID
+              window property this used to read. The requirement is unchanged in strength and is
+              not downgraded anywhere: the private display, the observed absent-to-present
+              transition, the self-consistency test and the window name are each still necessary
+              and not one of them is accepted in place of the server's own answer. What changed is
+              that the answer no longer comes from a property the window manager set about itself.
+
+              The probe re-derives the whole W chain inside its own grab; neither chain substitutes
+              for the other, and the two W readings must agree. The trailing liveness check this
+              function used to make is now the probe bracket's t2 poll, which is strictly tighter:
+              it is taken immediately after the probe is reaped rather than after a further
+              round trip."""
               while True:
                   if CANCELLED:
                       return "cancelled"
@@ -522,18 +780,17 @@ const ciDiagnosticRun = `          # The supervisor is written out here, under t
                       return "unnamed"
                   if "Openbox" not in name:
                       return "foreign-wm"
-                  state, claimed = wm_pid(window, deadline)
-                  if state == "absent":
-                      return "pid-missing"
-                  if state == "malformed":
-                      return "pid-malformed"
-                  if state != "value":
-                      return "pid-unreadable"
-                  if claimed != wm.pid:
-                      return "pid-foreign"
-                  if wm.poll() is not None:
-                      return "exited"
-                  return "owned"
+                  # The ownership answer, and the one thing that can return \`owned\`. Its record is
+                  # emitted on EVERY outcome and before this function returns, so what the probe
+                  # actually did is on the log whether this refuses or goes on; it goes to stderr,
+                  # which survives the exit 1 below where the success-only uploads do not; and it
+                  # is read by NOTHING - no branch consults it, so it can neither relax the
+                  # refusal, shorten the proof, nor stand in for an answer that was not given.
+                  proof = []
+                  verdict = xres_owned(binary, wm, window, deadline, proof)
+                  for seen in proof:
+                      note("wm-ownership-probe (%s)" % seen)
+                  return verdict
 
 
           def join(child, seconds):
@@ -596,6 +853,16 @@ const ciDiagnosticRun = `          # The supervisor is written out here, under t
           def main():
               started = time.monotonic()
               deadline = started + READY_SECONDS
+              # The ownership proof is a REQUIRED capability and is checked FIRST, before the
+              # display is even read and before anything is started, so a missing probe costs
+              # nothing and cannot be discovered halfway through owning a window manager. There is
+              # deliberately no fallback: the _NET_WM_PID property this replaces is not consulted
+              # anywhere below, so an absent probe means ownership cannot be proved at all.
+              binary = owner_binary()
+              if binary is None:
+                  problem("%s. Nothing was started and the acceptance suite was NOT run."
+                          % GAP["probe-missing"])
+                  return 1
               # A supporting window that is ALREADY here belongs to something this caller did
               # not start, and an initial state that could not be READ is not an absent one:
               # the absent-to-present transition is only evidence if the absence was observed.
@@ -640,9 +907,14 @@ const ciDiagnosticRun = `          # The supervisor is written out here, under t
               ready = "not-reached"
               cleanup_rc = 0
               try:
-                  ready = readiness(wm, deadline)
-                  note("wm-owned (started=openbox readiness=%s pid-binding=%s waited=%.1fs)"
-                       % (ready, BINDING.get(ready, "unread"), time.monotonic() - started))
+                  ready = readiness(binary, wm, deadline)
+                  # \`ownership\` names WHAT was established, not merely that something was: only
+                  # the server's own exact-owned-client answer earns the positive token, and every
+                  # other readiness outcome reads as unproven. There is no third value.
+                  note("wm-owned (started=openbox readiness=%s ownership=%s waited=%.1fs)"
+                       % (ready,
+                          "xres-exact-owned-client" if ready == "owned" else "unproven",
+                          time.monotonic() - started))
                   if ready == "owned":
                       suite = subprocess.Popen(["npm", "run", "test:browser-tls"])
                       suite_rc = await_owned(suite)
@@ -677,11 +949,13 @@ const ciDiagnosticRun = `          # The supervisor is written out here, under t
                   return 128 + CANCELLED[0]
               if ready != "owned":
                   problem("the owned Openbox never proved it owns this display (readiness=%s):"
-                          " %s. The exact _NET_WM_PID binding is REQUIRED and is not downgraded"
-                          " - the private display, the absent-to-present transition and the"
-                          " window name do not replace it - and no other window manager is"
-                          " selected instead. The acceptance suite was NOT run and nothing was"
-                          " measured." % (ready, GAP.get(ready, "no ownership evidence")))
+                          " %s. The X server's own exact-owned-client answer is REQUIRED and is"
+                          " not downgraded - the private display, the absent-to-present"
+                          " transition, the self-consistency test and the window name do not"
+                          " replace it, and the _NET_WM_PID property it replaced is weaker and is"
+                          " not consulted as a fallback - and no other window manager is selected"
+                          " instead. The acceptance suite was NOT run and nothing was measured."
+                          % (ready, GAP.get(ready, "no ownership evidence")))
                   return 1
               if suite_rc is None:
                   problem("the acceptance suite reported no status, which cannot be read as a"
@@ -755,32 +1029,96 @@ const ciOpenboxInstall = `      # #1177 — the ONE bounded window-manager exper
       # focus moves. That is evidence, NOT proof that an absent WM is the cause, so this installs
       # a real EWMH window manager and measures the SAME suite against it rather than asserting
       # anything. Openbox is the smallest EWMH-compliant choice in the image's archive; x11-utils
-      # supplies the \`xprop\` the ownership check below reads, which the observation-only probe
-      # treats as optional and this experiment requires. Both are installed in this separate step
+      # supplies the \`xprop\` the supervisor's own baseline chain below reads, which the
+      # observation-only probe treats as optional and this experiment requires; and \`libxres-dev\`
+      # plus \`libx11-dev\` are the build dependency the XRes ownership probe needs — the SAME two
+      # official packages, and the same \`-lXRes -lX11\` link line, that the isolated prototype lane
+      # compiled and exercised on this exact runner image. They are installed in this separate step
       # so the install cost lands outside the acceptance step's unchanged 10-minute budget and
       # outside the real browser user process entirely, and \`apt-get update\` already ran in the
-      # runner preflight above. \`python3\` is NOT installed: the supervisor below is one file of
-      # its standard library, so the interpreter the runner image already ships is proved present
-      # here instead of anything being added to get it. Nothing is installed on a host, nothing
-      # enters package.json or package-lock.json, no new privilege is taken beyond the apt-get
+      # runner preflight above. \`python3\` and \`cc\` are NOT installed: the supervisor below is one
+      # file of the standard library and the probe is one C file, so the interpreter and the
+      # compiler the runner image already ships are proved present here instead of anything being
+      # added to get them. Nothing is installed on a host, nothing enters package.json or
+      # package-lock.json, NO runtime npm or native dependency is created and no user of this
+      # package is ever asked for a compiler — the probe is CI-only infrastructure that is built
+      # into, and dies with, RUNNER_TEMP. No new privilege is taken beyond the apt-get
       # the runner preflight above already uses, and release.yml keeps the plain caller with no
       # window manager and no supervisor at all.
-      - name: Install the CI-only window manager for the owned display experiment
+      - name: Install the CI-only window manager and XRes build deps for the owned display experiment
         run: |
           set -euo pipefail
-          sudo apt-get install -y --no-install-recommends openbox x11-utils
+          sudo apt-get install -y --no-install-recommends \\
+            openbox x11-utils libxres-dev libx11-dev
           command -v openbox
           command -v xprop
           command -v python3
+          command -v cc
+
 `;
+// #1177 — the CI-only XRes ownership probe compile step, restated independently for
+// the same reason as the install and the caller: it is held to the bounds it was
+// approved under, not to what the workflow happens to carry. It compiles the frozen
+// prototype-validated C with the prototype's exact command line, measures the package
+// and header provenance instead of asserting it, and starts no process on any display.
+const ciXresCompile = `      # #1177 — the ownership proof the supervisor below actually uses, compiled here rather than
+      # shipped. \`scripts/ci/xres-owner.c\` is the byte-identical source the ISOLATED prototype lane
+      # validated on this same \`ubuntu-22.04\` image (12 of 12 oracles green, including the full
+      # \`mode=wm grab=held instrumented=no\` positive against a real Openbox), and it is compiled
+      # with the SAME command line that lane used: \`cc -O2 -Wall -Wextra ... -lXRes -lX11\`, the
+      # official libraries only, no hand-written X11 protocol and no private libXres internals.
+      # \`-Werror\` is deliberately NOT used, because a warning from a system header would then block
+      # this lane for something that is not a defect in the probe.
+      #
+      # ubuntu-22.04 is not incidental. The probe's public-API contract is version-exact for jammy
+      # (\`libxres1\` 2:1.2.1-1, \`XRes.h\` at tag libXres-1.2.1), which is why the installed package
+      # versions and the installed header's hash go in the log next to the binary's: the provenance
+      # is MEASURED here rather than asserted by this comment. If this image is ever retired the
+      # correct move is to re-pin deliberately and re-establish version-exactness, not to bump the
+      # label and keep the claim.
+      #
+      # This step installs nothing, takes no root, touches no package manifest and starts no
+      # process on any display. The binary is written under \`umask 077\` into a directory this step
+      # creates inside RUNNER_TEMP, so it is owner-only by construction and is destroyed with the
+      # ephemeral runner.
+      - name: Compile the CI-only XRes ownership probe
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/xres"
+          dpkg-query -W -f='\${Package} \${Version}\\n' libxres1 libxres-dev libx11-dev
+          header=/usr/include/X11/extensions/XRes.h
+          test -f "$header"
+          sha256sum "$header"
+          cc -O2 -Wall -Wextra -o "$RUNNER_TEMP/xres/xres-owner" \\
+            scripts/ci/xres-owner.c -lXRes -lX11
+          test -x "$RUNNER_TEMP/xres/xres-owner"
+          sha256sum scripts/ci/xres-owner.c "$RUNNER_TEMP/xres/xres-owner"
+`;
+// The acceptance step's one extra env var: the probe the compile step produced. A
+// REQUIRED capability the supervisor refuses without, never a fallback, so it is its
+// own literal and its own negative rather than part of the caller body.
+const ciXresEnv = `          # The probe the step above compiled. A REQUIRED capability: the supervisor refuses when
+          # this is unset or not executable, and never falls back to a weaker proof.
+          XRES_OWNER_BIN: \${{ runner.temp }}/xres/xres-owner
+`;
+// The `# Headed Chromium ...` rationale's first line. It is the unique bytes that follow the
+// acceptance step's own `env:` block, so it anchors both the CI-only env addition below and
+// the Console-artifacts negatives further down, which would otherwise have to restate it.
+const headedRationaleAnchor = '        # Headed Chromium on a private virtual display owned by this non-root ephemeral\n';
 // Built by substitution so the CI contract can differ from the release contract in exactly
-// two places — the headed caller, and the CI-only window-manager install step inserted
-// before it — and in no other byte. `replaceOnce` asserts each target is unique in the
-// source and that the replacement changes bytes, so neither can land twice or land
-// somewhere else.
+// three places — the headed caller, the two CI-only steps inserted before it (the window
+// manager/XRes build-dependency install and the probe compile), and the one extra env var
+// the acceptance step needs to find the compiled probe — and in no other byte. `replaceOnce`
+// asserts each target is unique in the source and that the replacement changes bytes, so
+// none of them can land twice or land somewhere else. The env addition is anchored on the
+// rationale line that follows the env block, because the `CONSOLE_UI_ARTIFACTS` key it goes
+// after is byte-identical on two steps of this job.
 const ciBrowserAddition = replaceOnce(
-  replaceOnce(browserAddition, approvedHeadedCaller, ciHeadedCaller),
-  browserCallerStep, `${ciOpenboxInstall}${browserCallerStep}`);
+  replaceOnce(
+    replaceOnce(browserAddition, approvedHeadedCaller, ciHeadedCaller),
+    browserCallerStep, `${ciOpenboxInstall}${ciXresCompile}${browserCallerStep}`),
+  headedRationaleAnchor, `${ciXresEnv}${headedRationaleAnchor}`);
 const approvedBrowser = parse('approved-browser-contract', `jobs:\n${browserAddition}`).jobs['browser-tls'];
 const approvedCIBrowser = parse('approved-ci-browser-contract', `jobs:\n${ciBrowserAddition}`).jobs['browser-tls'];
 function withoutBrowser(workflow, release) {
@@ -1348,6 +1686,17 @@ const harnessRelative = 'tests/packaging/windows-release-gates.test.mjs';
 const securityRelative = 'tests/hitl/snyk-boundaries.test.mjs';
 const admissionRelative = 'tests/packaging/release-admission.test.mjs';
 const nativeRelative = 'tests/packaging/native-capture.test.mjs';
+// #1181 boot composition: the wizard suite drives an owned POSIX PTY, so like native
+// capture it is a POSIX-only source entry and must never be placed on win32.
+const wizardRelative = 'tests/packaging/orchestrator-boot-wizard.test.mjs';
+// #1177 XRes owner supervisor fixtures: POSIX-only (owned-child signals, flock liveness),
+// appended after the wizard entry and never placed on win32.
+const supervisorRelative = 'tests/packaging/xres-owner-supervisor.test.mjs';
+// #1179 JEV suites: explicit, platform-neutral source entries on EVERY platform, win32
+// included, in this exact order and ahead of the POSIX-only entries.
+const jevRelatives = ['pipeline-integration', 'price-table', 'r2-acceptance-delta', 'r2-before-after',
+  'refusal-path-constant', 'request-contract', 'reserve', 'response-contract', 'worker-target']
+  .map(name => `tests/jev/${name}.test.mjs`);
 function callerFixture(mode, symlinked = false) {
   const directory = mkdtempSync(join(admin, 'caller fixture '));
   const put = (path, source) => {
@@ -1369,6 +1718,11 @@ function callerFixture(mode, symlinked = false) {
   if (mode !== 'missing-security') put(securityRelative, checks + `assert.equal(new URL(import.meta.url).pathname.endsWith('/${securityRelative}'), true);\nconsole.log('CALLER_SECURITY_SENTINEL');\nprocess.exit(${mode === 'failing-security' ? 8 : 0});\n`);
   if (mode !== 'missing-admission') put(admissionRelative, checks + `console.log('CALLER_ADMISSION_SENTINEL');\nprocess.exit(${mode === 'failing-admission' ? 8 : 0});\n`);
   if (mode !== 'missing-native') put(nativeRelative, checks + `console.log('CALLER_NATIVE_SENTINEL');\nprocess.exit(${mode === 'failing-native' ? 8 : 0});\n`);
+  for (const [index, path] of jevRelatives.entries()) {
+    if (mode !== 'missing-jev' || index !== jevRelatives.length - 1) put(path, checks + `console.log('CALLER_JEV_SENTINEL_${index}');\nprocess.exit(${mode === 'failing-jev' && index === 0 ? 8 : 0});\n`);
+  }
+  if (mode !== 'missing-wizard') put(wizardRelative, checks + `console.log('CALLER_WIZARD_SENTINEL');\nprocess.exit(${mode === 'failing-wizard' ? 8 : 0});\n`);
+  if (mode !== 'missing-supervisor') put(supervisorRelative, checks + `console.log('CALLER_SUPERVISOR_SENTINEL');\nprocess.exit(${mode === 'failing-supervisor' ? 8 : 0});\n`);
   if (mode !== 'missing-harness') put(harnessRelative, checks + `console.log('CALLER_SOURCE_SENTINEL');\nprocess.exit(${mode === 'sentinel-fail' ? 9 : 0});\n`);
   put('tests/packaging/unselected.test.mjs', "console.log('CALLER_UNSELECTED_MJS'); process.exit(99);\n");
   if (symlinked) {
@@ -1390,6 +1744,12 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic] of [
   ['failing-admission', 1, true, true, false],
   ['missing-native', 1, false, false, false, /tests[\\/]packaging[\\/]native-capture\.test\.mjs/],
   ['failing-native', 1, true, true, false],
+  ['missing-wizard', 1, false, false, false, /tests[\\/]packaging[\\/]orchestrator-boot-wizard\.test\.mjs/],
+  ['failing-wizard', 1, true, true, false],
+  ['missing-supervisor', 1, false, false, false, /tests[\\/]packaging[\\/]xres-owner-supervisor\.test\.mjs/],
+  ['failing-supervisor', 1, true, true, false],
+  ['missing-jev', 1, false, false, false, /tests[\\/]jev[\\/]worker-target\.test\.mjs/],
+  ['failing-jev', 1, true, true, false],
   ['missing-harness', 1, true, true, false, /POSIX control harness failed with exit status: 1/],
   ['empty', 1, false, false, false, /No compiled test files found/],
   ['missing-dist', 1, false, false, false, /Failed to enumerate compiled tests/],
@@ -1413,10 +1773,18 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic] of [
   assert.equal(result.stdout.includes('CALLER_SOURCE_SENTINEL'), sentinel);
   assert.equal(result.stdout.includes('CALLER_ADMISSION_SENTINEL'), compiled);
   assert.equal(result.stdout.includes('CALLER_NATIVE_SENTINEL'), compiled);
+  assert.equal(result.stdout.includes('CALLER_WIZARD_SENTINEL'), compiled);
+  assert.equal(result.stdout.includes('CALLER_SUPERVISOR_SENTINEL'), compiled);
+  for (const index of jevRelatives.keys()) assert.equal(result.stdout.includes(`CALLER_JEV_SENTINEL_${index}`), compiled);
   assert.ok(!result.stdout.includes('CALLER_UNSELECTED_MJS'), 'no automatic source .mjs discovery');
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_COMPILED_CONTROL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (security && sentinel) assert.ok(result.stdout.indexOf('CALLER_SECURITY_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_NATIVE_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
+  if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_WIZARD_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
+  if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_SUPERVISOR_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
+  if (compiled && sentinel) for (const index of jevRelatives.keys()) {
+    assert.ok(result.stdout.indexOf(`CALLER_JEV_SENTINEL_${index}`) < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
+  }
   if (diagnostic) assert.match(result.stderr, diagnostic);
 });
 }
@@ -1486,6 +1854,9 @@ const failed = { status: 7, signal: null };
 const signaled = { status: null, signal: 'SIGTERM' };
 const startupError = { status: null, signal: null, error: 'synthetic ENOENT', code: 'ENOENT' };
 const timedOut = { status: null, signal: 'SIGKILL', error: 'synthetic ETIMEDOUT', code: 'ETIMEDOUT' };
+const callerArgv = platform => ['--test', 'dist/tests/a.test.js', 'dist/tests/nested/b.test.js', 'dist/tests/z.test.js',
+  securityRelative, admissionRelative, ...jevRelatives,
+  ...(['linux', 'darwin'].includes(platform) ? [nativeRelative, wizardRelative, supervisorRelative] : [])];
 const vmCases = [];
 for (const platform of ['linux', 'darwin']) {
   vmCases.push({ name: `${platform} compiled/security/admission/native success then exact harness invocation`, platform, results: [success, success], status: 0, calls: 2 });
@@ -1524,9 +1895,7 @@ for (const item of vmCases) acceptance(`caller VM: ${item.name}`, 'caller-vm', (
   assert.equal(actual.status, item.status);
   assert.equal(actual.calls.length, item.calls);
   if (item.calls > 0) assert.deepEqual(actual.calls[0], { executable: process.execPath,
-    argv: ['--test', 'dist/tests/a.test.js', 'dist/tests/nested/b.test.js', 'dist/tests/z.test.js', securityRelative, admissionRelative,
-      ...(['linux', 'darwin'].includes(item.platform) ? [nativeRelative] : [])],
-    options: { cwd: actual.root, stdio: 'inherit' } });
+    argv: callerArgv(item.platform), options: { cwd: actual.root, stdio: 'inherit' } });
   if (item.calls === 2) assert.deepEqual(actual.calls[1], { executable: process.execPath,
     argv: ['--test', harnessRelative], options: { cwd: actual.root, stdio: 'inherit', timeout: 180000, killSignal: 'SIGKILL' } });
   if (item.platform === 'win32') {
@@ -1534,6 +1903,47 @@ for (const item of vmCases) acceptance(`caller VM: ${item.name}`, 'caller-vm', (
     assert.ok(actual.logs.every(line => !/^(#|ok\b|not ok\b|TAP\b|1\.\.)/.test(line)), 'notice must not impersonate TAP results');
   } else assert.deepEqual(actual.logs, []);
   if (item.diagnostic) assert.match(actual.errors.join('\n'), item.diagnostic);
+});
+// #1181 wrong-platform placement of the POSIX-only wizard entry. Each mutation is applied
+// to the exact runner bytes with unique-needle checks OUTSIDE assert.throws, the mutated
+// runner still runs to its first spawn, and the exact caller expectation must reject it.
+const wizardPosixPush = "sourceTestFiles.push('tests/packaging/native-capture.test.mjs', 'tests/packaging/orchestrator-boot-wizard.test.mjs');";
+const wizardPosixDropped = "sourceTestFiles.push('tests/packaging/native-capture.test.mjs');";
+const baseSourceList = "'tests/packaging/release-admission.test.mjs'];";
+const jevBlock = `sourceTestFiles.push(\n${jevRelatives.map(path => `  '${path}',\n`).join('')});\n`;
+const supervisorPosixPush = "  sourceTestFiles.push('tests/packaging/xres-owner-supervisor.test.mjs');\n";
+const posixBranchOpen = "if (process.platform === 'darwin' || process.platform === 'linux') {\n";
+for (const [name, mutate, platforms] of [
+  ['wizard entry placed on every platform, win32 included', source => replaceOnce(replaceOnce(source, wizardPosixPush, wizardPosixDropped),
+    baseSourceList, "'tests/packaging/release-admission.test.mjs', 'tests/packaging/orchestrator-boot-wizard.test.mjs'];"), ['win32', 'linux', 'darwin']],
+  ['wizard entry placed on win32 only', source => replaceOnce(source, wizardPosixPush,
+    `${wizardPosixDropped}\n}\nif (process.platform === 'win32') {\n  sourceTestFiles.push('tests/packaging/orchestrator-boot-wizard.test.mjs');`), ['win32', 'linux', 'darwin']],
+  ['wizard entry dropped from POSIX', source => replaceOnce(source, wizardPosixPush, wizardPosixDropped), ['linux', 'darwin']],
+  // #1179: every JEV suite is required on every platform, and the block must not be
+  // wired POSIX-only (which would silently drop all nine from win32).
+  ...jevRelatives.map(path => [`JEV suite ${path} missing`, source => replaceOnce(source, `  '${path}',\n`, ''),
+    ['win32', 'linux', 'darwin']]),
+  ['JEV suites wired POSIX-only', source => replaceOnce(replaceOnce(source, jevBlock, ''), wizardPosixPush,
+    `${wizardPosixPush}\n  ${jevBlock.trimEnd()}`), ['win32', 'linux', 'darwin']],
+  // #1177: the XRes supervisor suite is required on POSIX and must never reach win32.
+  ['XRes supervisor suite missing', source => replaceOnce(source, supervisorPosixPush, ''), ['linux', 'darwin']],
+  ['XRes supervisor suite placed on every platform, win32 included', source => replaceOnce(replaceOnce(source, supervisorPosixPush, ''),
+    posixBranchOpen, `${supervisorPosixPush.trimStart()}${posixBranchOpen}`), ['win32', 'linux', 'darwin']],
+  ['XRes supervisor suite placed on win32 only', source => replaceOnce(source, supervisorPosixPush,
+    `}\nif (process.platform === 'win32') {\n${supervisorPosixPush}`), ['win32', 'linux', 'darwin']],
+]) for (const platform of platforms) acceptance(`caller VM negative: ${name} is rejected on ${platform}`, 'caller-vm', () => {
+  const source = mutate(callerSource);
+  const config = join(admin, `caller-vm-negative-${name.replace(/[^a-z0-9]+/g, '-')}-${platform}.json`);
+  writeFileSync(config, JSON.stringify({ platform, results: [success, success], source }));
+  const argv = ['--experimental-vm-modules', driver, config];
+  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, encoding: 'utf8', timeout });
+  invocations.push({ kind: 'caller-vm-negative', label: `${name} ${platform}`, executable: process.execPath, argv, timeout,
+    exit: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr, runnerSha256: sha(source) });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+  const actual = JSON.parse(result.stdout);
+  assert.ok(actual.calls.length >= 1, 'mutated runner reached its first spawn');
+  assert.throws(() => assert.deepEqual(actual.calls[0].argv, callerArgv(platform)));
 });
 
 // Exercise the same historical validators with private YAML strings. Exact needle
@@ -1586,8 +1996,11 @@ for (const [label, block] of [['release', xvfbLine], ['CI', ciDiagnosticRun]]) {
 const consoleEnv = '          CONSOLE_UI_ARTIFACTS: ${{ runner.temp }}/console-ui-artifacts\n';
 // The key is identical on both steps, so each negative is anchored to the unique bytes that
 // follow it: the headed caller's rationale comment on one, the plain run line on the other.
-const consoleEnvSites = [
-  ['browser step', '        # Headed Chromium on a private virtual display owned by this non-root ephemeral\n'],
+// On the CI browser step the acceptance env now additionally carries the required probe path,
+// so the anchor for THAT site is contract-dependent and is supplied per workflow below; the
+// receipt validation step's anchor is byte-identical in both and stays a plain literal.
+const consoleEnvSitesFor = browserAnchor => [
+  ['browser step', browserAnchor],
   ['receipt validation step', '        run: npm run test:browser-tls -- --validate-receipt\n'],
 ];
 const consolePaths = ['console-320.png', 'console-390.png', 'console-768.png',
@@ -1598,7 +2011,7 @@ const consoleUploadName = '      - name: Upload Console UI evidence\n';
 // The caller differs between the two workflows (CI carries the approved diagnostic), so the
 // caller-shaped negatives are anchored to the contract of the workflow under test. Every
 // other needle is byte-identical in both and stays a plain literal.
-const browserMutationsFor = ({ addition, caller, run }) => [
+const browserMutationsFor = ({ addition, caller, run, consoleAnchor, umaskSite }) => [
   ['missing browser job', addition, ''],
   ['browser skip', '  browser-tls:\n', '  browser-tls:\n    if: false\n'],
   ['browser always', '  browser-tls:\n', '  browser-tls:\n    if: always()\n'],
@@ -1613,8 +2026,12 @@ const browserMutationsFor = ({ addition, caller, run }) => [
   // is its own negative rather than being folded into one "caller changed" case.
   ['headed wrapper removed', run, '          npm run test:browser-tls\n'],
   ['headed wrapper replaced by bare display export', run, '          DISPLAY=:99 npm run test:browser-tls\n'],
-  ['private cookie umask removed', umaskLine, ''],
-  ['private cookie umask widened', umaskLine, '          umask 022\n'],
+  // The owner-only authority cookie umask of the ACCEPTANCE caller. `umask 077` is a bare line
+  // that the CI-only probe compile step also carries, so this pair is anchored to the bytes that
+  // follow it in the caller under test rather than to the line alone; the compile step's own
+  // umask has its own negative further down.
+  ['private cookie umask removed', umaskSite, umaskSite.replace(umaskLine, '')],
+  ['private cookie umask widened', umaskSite, umaskSite.replace(umaskLine, '          umask 022\n')],
   ['X authentication disabled', xvfbInvocation,
     'xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp -ac"'],
   ['X authority cookie shared', xvfbInvocation,
@@ -1648,7 +2065,7 @@ const browserMutationsFor = ({ addition, caller, run }) => [
   ['Windows threshold changed', '[ "${PASS}" -gt 20 ]', '[ "${PASS}" -gt 0 ]'],
   // Console UI evidence: the artifacts directory must be declared to both steps that write
   // or re-check it, and the upload must stay an exact six-path, success-only publication.
-  ...consoleEnvSites.flatMap(([site, anchor]) => [
+  ...consoleEnvSitesFor(consoleAnchor).flatMap(([site, anchor]) => [
     [`Console artifacts directory missing on ${site}`, consoleEnv + anchor, anchor],
     [`Console artifacts directory changed on ${site}`, consoleEnv + anchor,
       '          CONSOLE_UI_ARTIFACTS: ${{ runner.temp }}\n' + anchor],
@@ -1724,22 +2141,150 @@ const ciDiagnosticMutations = [
     '          export WM_SUPERVISOR="$RUNNER_TEMP/wm-owned-supervisor.py"\n',
     '          export WM_SUPERVISOR=/tmp/wm-owned-supervisor.py\n'],
 
-  // #1177 — the owned supervisor's own bounds. -- THE EXACT PID BINDING IS REQUIRED. This is
-  // the defect the previous attempt was rejected for: a supporting window with no readable
-  // _NET_WM_PID was still accepted as owned. Missing, malformed, unreadable and foreign each
-  // get their own negative, and none of them may resolve to `owned`.
-  ['supervisor accepts a supporting window that published no _NET_WM_PID',
-    '                  if state == "absent":\n                      return "pid-missing"\n',
-    '                  if state == "absent":\n                      return "owned"\n'],
-  ['supervisor accepts a malformed _NET_WM_PID',
-    '                      return "pid-malformed"\n', '                      return "owned"\n'],
-  ['supervisor accepts an unreadable _NET_WM_PID',
-    '                      return "pid-unreadable"\n', '                      return "owned"\n'],
-  ['supervisor adopts a foreign _NET_WM_PID as the owned pid',
-    '                      return "pid-foreign"\n', '                      return "owned"\n'],
-  ['supervisor stops reading the exact pid binding at all',
-    '                  state, claimed = wm_pid(window, deadline)\n',
-    '                  claimed = wm.pid\n'],
+  // #1177 — the owned supervisor's own bounds. -- THE EXACT OWNED-PROCESS REQUIREMENT IS
+  // REQUIRED, AND NOW THE X SERVER ANSWERS IT. The previous attempt was rejected for accepting
+  // a supporting window with no readable ownership evidence as owned; the requirement is
+  // unchanged in strength and what changed is only WHO answers it, so every negative the
+  // `_NET_WM_PID` window property used to carry has a same-strength replacement here against
+  // the server-bound XRes answer. The property itself is gone, so the FIRST negative below is
+  // that it may not come back as a fallback, and the rest pin the new answer exactly:
+  //   pid-missing   -> `owner-unknown`/`owner-unreadable` may not resolve to `owned`
+  //   pid-malformed -> `owner-malformed`, and a record the strict parse rejects
+  //   pid-unreadable-> a non-zero/unrecognised exit, an expired bound, an exit/verdict
+  //                    disagreement, and a record whose entailed fields do not agree
+  //   pid-foreign   -> `owner-foreign`, and the re-comparison of BOTH reported pids against
+  //                    this supervisor's own handle
+  // plus the two bounds the property never had at all: the probe is a REQUIRED capability, and
+  // a reduced or instrumented control may never be read as a measurement.
+  ['supervisor falls back to the client-asserted _NET_WM_PID property it replaced',
+    '                  proof = []\n',
+    '                  state, text = read(["-id", hex(window)], "_NET_WM_PID", deadline)\n'
+      + '                  if state == "ok" and text.endswith(str(wm.pid)):\n'
+      + '                      return "owned"\n'
+      + '                  proof = []\n'],
+  ['supervisor treats a missing ownership probe as a licence to proceed',
+    '              if binary is None:\n', '              if False:\n'],
+  ['supervisor accepts an unset or non-executable ownership probe as one it may invoke',
+    '              if not path or not os.path.isfile(path) or not os.access(path, os.X_OK):\n'
+      + '                  return None\n',
+    '              if False:\n                  return None\n'],
+  ['supervisor reads any refusal the server answered with as ownership',
+    '              if fields["verdict"] != "owned":\n',
+    '              if False:\n'],
+  ['supervisor accepts a record whose printed verdict and exit status disagree',
+    '              if (done.returncode == 0) != (fields["verdict"] == "owned"):\n'
+      + '                  return "owner-unreadable"\n', ''],
+  ['supervisor accepts an exit status outside the probe\'s own owned/refused contract',
+    '              if done.returncode not in (0, 2):\n'
+      + '                  return "owner-unreadable"\n', ''],
+  ['supervisor salvages a record its strict whole-line parse rejected',
+    '              found = RECORD.match(lines[0])\n              if not found:\n'
+      + '                  return "owner-unreadable"\n',
+    '              found = RECORD.match(lines[0])\n              if not found:\n'
+      + '                  return "owned"\n'],
+  ['supervisor reads a multi-line or empty probe output as one record',
+    '              if len(lines) != 1:\n                  return "owner-unreadable"\n', ''],
+  ['supervisor widens the closed record pattern so an unknown refusal token is carried through',
+    '              r" refusal=(?P<refusal>xres-status|num-ids-zero|num-ids-many|ids-null"\n'
+      + '              r"|client-mismatch|mask-mismatch|length-range|value-null|pid-invalid|-)\\)$")\n',
+    '              r" refusal=(?P<refusal>[a-z0-9-]+)\\)$")\n'],
+  ['supervisor unanchors the record pattern so trailing bytes can follow the record',
+    '|client-mismatch|mask-mismatch|length-range|value-null|pid-invalid|-)\\)$")',
+    '|client-mismatch|mask-mismatch|length-range|value-null|pid-invalid|-)\\)")'],
+  ['supervisor stops requiring the entailed fields of a record that claims owned',
+    '              if (fields["probed"] != fields["window"] or fields["existence"] != "ok"\n'
+      + '                      or fields["step6"] != "ok" or fields["xres_status"] != "success"\n'
+      + '                      or fields["num_ids"] != "1" or fields["length"] == "-"\n'
+      + '                      or fields["refusal"] != "-" or fields["version"] == "-"):\n'
+      + '                  return "owner-unreadable"\n', ''],
+  ['supervisor accepts more than one reported owning client',
+    '                      or fields["num_ids"] != "1" or fields["length"] == "-"\n',
+    '                      or fields["num_ids"] == "0" or fields["length"] == "-"\n'],
+  ['supervisor stops re-comparing the server-reported pid against its own handle',
+    '              if fields["pid"] == "-" or int(fields["pid"]) != wm.pid:\n'
+      + '                  return "owner-unreadable"\n', ''],
+  ['supervisor stops re-comparing the pid the probe was asked about against its own handle',
+    '              if fields["owner_pid"] == "-" or int(fields["owner_pid"]) != wm.pid:\n'
+      + '                  return "owner-unreadable"\n', ''],
+  ['supervisor accepts an absent server-reported pid as this child',
+    '              if fields["pid"] == "-" or int(fields["pid"]) != wm.pid:\n',
+    '              if fields["pid"] != "-" and int(fields["pid"]) != wm.pid:\n'],
+  ['supervisor reads a reduced or instrumented control as a measurement',
+    '              if artificial(fields):\n                  return "probe-artificial"\n', ''],
+  ['supervisor stops requiring the probe to report a real held server grab',
+    '              return (fields["instrumented"] != "no" or fields["mode"] != "wm"\n'
+      + '                      or fields["grab"] != "held")\n',
+    '              return False\n'],
+  ['supervisor invokes the probe in a reduced mode instead of the measuring one',
+    '                  done = subprocess.run([binary, "--mode", "wm", "--owner-pid", str(wm.pid)],\n',
+    '                  done = subprocess.run([binary, "--mode", "xid", "--owner-pid", str(wm.pid)],\n'],
+  ['supervisor asks the probe to skip the server grab',
+    '                  done = subprocess.run([binary, "--mode", "wm", "--owner-pid", str(wm.pid)],\n',
+    '                  done = subprocess.run([binary, "--mode", "wm", "--owner-pid", str(wm.pid),\n'
+      + '                                         "--no-grab"],\n'],
+  ['supervisor asks the probe about a pid it did not start',
+    '                  done = subprocess.run([binary, "--mode", "wm", "--owner-pid", str(wm.pid)],\n',
+    '                  done = subprocess.run([binary, "--mode", "wm", "--owner-pid", "1"],\n'],
+  ['supervisor accepts an answer about a different supporting window',
+    '              if fields["window"] == "-" or int(fields["window"], 16) != window:\n'
+      + '                  return "w-changed"\n', ''],
+  ['supervisor drops the self-window identity check and reads the probe\'s own word for it',
+    '              if fields["window"] == "-" or int(fields["window"], 16) != window:\n',
+    '              if fields["window"] == "-":\n'],
+  // -- the snapshot is bracketed by liveness on BOTH sides, and never widened into a lease --
+  ['supervisor drops the t0 liveness check taken before the probe is spawned',
+    '              if wm.poll() is not None:                                       # t0\n'
+      + '                  return "exited"\n', ''],
+  ['supervisor drops the t2 liveness check taken immediately after the probe is reaped',
+    '              if wm.poll() is not None:                                       # t2\n'
+      + '                  return "exited"\n', ''],
+  ['supervisor reinterprets a child that exited inside the bracket instead of discarding it',
+    '              if wm.poll() is not None:                                       # t2\n'
+      + '                  return "exited"\n',
+    '              if wm.poll() is not None:                                       # t2\n'
+      + '                  return "owned"\n'],
+  ['supervisor caches one liveness reading for both ends of the bracket',
+    '              if wm.poll() is not None:                                       # t2\n',
+    '              if False:                                                       # t2\n'],
+  // -- the probe invocation stays bounded inside the one readiness deadline --
+  ['supervisor makes the ownership probe invocation unbounded',
+    '                                        timeout=min(OWNER_SECONDS, left))\n',
+    '                                        timeout=None)\n'],
+  ['supervisor lets the ownership probe outlive the readiness deadline',
+    '                                        timeout=min(OWNER_SECONDS, left))\n',
+    '                                        timeout=OWNER_SECONDS)\n'],
+  ['supervisor raises the ownership probe bound past the readiness deadline',
+    '          OWNER_SECONDS = 15.0\n', '          OWNER_SECONDS = 600.0\n'],
+  ['supervisor reads an expired ownership bound as an absence rather than a refusal',
+    '                         True, OWNER_EVIDENCE_BYTES, "probe")\n'
+      + '                  return "owner-unreadable"\n',
+    '                         True, OWNER_EVIDENCE_BYTES, "probe")\n'
+      + '                  return "owned"\n'],
+  ['supervisor reads a probe it could not spawn as ownership',
+    '                         b"", b"", False, OWNER_EVIDENCE_BYTES, "probe")\n'
+      + '                  return "owner-unreadable"\n',
+    '                         b"", b"", False, OWNER_EVIDENCE_BYTES, "probe")\n'
+      + '                  return "owned"\n'],
+  ['supervisor reads a deadline that had already passed as ownership',
+    '                         OWNER_EVIDENCE_BYTES, "probe")\n                  return "timeout"\n',
+    '                         OWNER_EVIDENCE_BYTES, "probe")\n                  return "owned"\n'],
+  // -- the ownership answer is the ONLY thing that can return `owned`, and it is named as such
+  ['supervisor returns owned without asking the server at all',
+    '                  verdict = xres_owned(binary, wm, window, deadline, proof)\n',
+    '                  verdict = "owned"\n'],
+  ['supervisor reports unproven ownership as the server-bound exact answer',
+    '                          "xres-exact-owned-client" if ready == "owned" else "unproven",\n',
+    '                          "xres-exact-owned-client",\n'],
+  ['supervisor keeps the ownership probe record out of the failed CI output',
+    '                      note("wm-ownership-probe (%s)" % seen)\n', '                      pass\n'],
+  ['supervisor stops asking the ownership probe to record what it did',
+    '                  verdict = xres_owned(binary, wm, window, deadline, proof)\n',
+    '                  verdict = xres_owned(binary, wm, window, deadline)\n'],
+  ['supervisor lets the ownership record relax the refusal it exists to explain',
+    '              if artificial(fields):\n',
+    '              if artificial(fields) and not evidence:\n'],
+  ['supervisor truncates the ownership record at the xprop cap that would hide the reason',
+    '          OWNER_EVIDENCE_BYTES = 768\n', '          OWNER_EVIDENCE_BYTES = 40\n'],
   // -- and nothing weaker is accepted in its place --
   ['supervisor accepts a supporting window that does not point back at itself',
     '                  if state != "value" or back != window:\n', '                  if False:\n'],
@@ -1754,10 +2299,11 @@ const ciDiagnosticMutations = [
     '                  if wm.poll() is not None:\n                      return "exited"\n'
       + '                  if deadline - time.monotonic() <= 0:\n',
     '                  if deadline - time.monotonic() <= 0:\n'],
-  ['supervisor stops re-checking that the owned child outlived the wait',
-    '                  if wm.poll() is not None:\n                      return "exited"\n'
-      + '                  return "owned"\n',
-    '                  return "owned"\n'],
+  // The trailing liveness re-check this used to pin is now the probe bracket's t2 poll, which
+  // is strictly tighter and has its own negatives above. What is left to pin here is the
+  // readiness loop's return itself: the ownership answer may not be discarded at the last step.
+  ['supervisor discards the ownership answer at the readiness return',
+    '                  return verdict\n', '                  return "owned"\n'],
   ['supervisor runs the suite without verified ownership',
     '                  if ready == "owned":\n', '                  if True:\n'],
   ['supervisor stops failing when ownership was never verified',
@@ -1900,12 +2446,56 @@ const ciDiagnosticMutations = [
     '        timeout-minutes: 10\n', '        timeout-minutes: 15\n'],
   ['CI-only window manager install step removed', ciOpenboxInstall, ''],
   ['window manager install pulls recommended packages',
-    '          sudo apt-get install -y --no-install-recommends openbox x11-utils\n',
-    '          sudo apt-get install -y openbox x11-utils\n'],
+    '          sudo apt-get install -y --no-install-recommends \\\n'
+      + '            openbox x11-utils libxres-dev libx11-dev\n',
+    '          sudo apt-get install -y openbox x11-utils libxres-dev libx11-dev\n'],
   ['window manager install stops proving the tools it added are present',
     '          command -v openbox\n          command -v xprop\n', ''],
   ['supervisor interpreter is no longer proved present',
     '          command -v python3\n', ''],
+  // -- and the CI-only XRes probe compile step: official libraries, measured provenance, no
+  // install, no privilege, and a binary that cannot be skipped or replaced by a checked-in one.
+  ['CI-only XRes probe compile step removed', ciXresCompile, ''],
+  ['XRes probe compiler is no longer proved present',
+    '          command -v cc\n', ''],
+  ['XRes build dependencies dropped from the CI-only install',
+    '            openbox x11-utils libxres-dev libx11-dev\n',
+    '            openbox x11-utils\n'],
+  ['XRes probe compiled against something other than the two official libraries',
+    '            scripts/ci/xres-owner.c -lXRes -lX11\n',
+    '            scripts/ci/xres-owner.c -lXRes -lX11 -lXpriv\n'],
+  ['XRes probe compiled from a source other than the frozen prototype-validated one',
+    '            scripts/ci/xres-owner.c -lXRes -lX11\n',
+    '            "$RUNNER_TEMP/xres/other.c" -lXRes -lX11\n'],
+  ['XRes probe compile stops failing on a compiler error',
+    '          cc -O2 -Wall -Wextra -o "$RUNNER_TEMP/xres/xres-owner" \\\n',
+    '          cc -O2 -Wall -Wextra -o "$RUNNER_TEMP/xres/xres-owner" || true \\\n'],
+  ['XRes probe compile stops proving it produced an executable',
+    '          test -x "$RUNNER_TEMP/xres/xres-owner"\n', ''],
+  ['XRes probe is built outside the owner-only runner temp',
+    '          mkdir -p "$RUNNER_TEMP/xres"\n', '          mkdir -p /tmp/xres\n'],
+  ['XRes probe directory is created without the owner-only umask',
+    '          set -euo pipefail\n          umask 077\n          mkdir -p "$RUNNER_TEMP/xres"\n',
+    '          set -euo pipefail\n          mkdir -p "$RUNNER_TEMP/xres"\n'],
+  ['XRes provenance is asserted instead of measured',
+    '          dpkg-query -W -f=\'${Package} ${Version}\\n\' libxres1 libxres-dev libx11-dev\n',
+    '          echo "libxres1 2:1.2.1-1"\n'],
+  ['XRes header provenance is no longer hashed',
+    '          sha256sum "$header"\n', ''],
+  ['XRes header presence is no longer required',
+    '          test -f "$header"\n', ''],
+  ['XRes source and binary hashes are no longer recorded',
+    '          sha256sum scripts/ci/xres-owner.c "$RUNNER_TEMP/xres/xres-owner"\n', ''],
+  ['XRes probe compile takes root it was never approved for',
+    '          cc -O2 -Wall -Wextra -o "$RUNNER_TEMP/xres/xres-owner" \\\n',
+    '          sudo cc -O2 -Wall -Wextra -o "$RUNNER_TEMP/xres/xres-owner" \\\n'],
+  ['XRes probe compile is charged to the acceptance step budget instead of its own step',
+    `${ciXresCompile}${browserCallerStep}`, `${browserCallerStep}${ciXresCompile}`],
+  // -- the acceptance step's required probe env var: present, exact, and never optional --
+  ['acceptance step stops naming the compiled ownership probe', ciXresEnv, ''],
+  ['acceptance step points the ownership probe env at something it did not compile',
+    '          XRES_OWNER_BIN: ${{ runner.temp }}/xres/xres-owner\n',
+    '          XRES_OWNER_BIN: /usr/local/bin/xres-owner\n'],
 
   // #1177 THE PRESERVED INITIAL-READ EVIDENCE. The measured refusal this corrects reported
   // only that the initial `_NET_SUPPORTING_WM_CHECK` state "came back unknown": the probe's
@@ -1914,9 +2504,18 @@ const ciDiagnosticMutations = [
   // is bounded, sanitized, emitted on every outcome and read by NOTHING, so each half of
   // that is its own negative - the evidence may not disappear again, and it may not start
   // relaxing the refusal it exists to explain.
+  // `stderr=subprocess.PIPE` now appears on the xprop read AND on the ownership probe, so each
+  // is anchored to the bound line that follows it and both are pinned separately.
   ['supervisor discards the initial probe stderr again',
-    '                                        stderr=subprocess.PIPE,\n',
-    '                                        stderr=subprocess.DEVNULL,\n'],
+    '                                        stderr=subprocess.PIPE,\n'
+      + '                                        timeout=min(PROBE_SECONDS, left))\n',
+    '                                        stderr=subprocess.DEVNULL,\n'
+      + '                                        timeout=min(PROBE_SECONDS, left))\n'],
+  ['supervisor discards the ownership probe stderr',
+    '                                        stderr=subprocess.PIPE,\n'
+      + '                                        timeout=min(OWNER_SECONDS, left))\n',
+    '                                        stderr=subprocess.DEVNULL,\n'
+      + '                                        timeout=min(OWNER_SECONDS, left))\n'],
   ['supervisor stops asking the initial read to record why it was unknown',
     '              state, existing = supporting(["-root"], deadline, probe)\n',
     '              state, existing = supporting(["-root"], deadline)\n'],
@@ -1950,15 +2549,33 @@ const ciDiagnosticMutations = [
   ['supervisor throws away what a timed-out probe had already printed',
     '                  record(evidence, name, "timed-out", expired.stdout, expired.stderr, True)\n',
     '                  record(evidence, name, "timed-out", b"", b"", True)\n'],
+  // `sanitize` now takes the cap as a parameter so the longer ownership record is not truncated
+  // at the xprop bound. It is still a BOUND on every caller, the truncation is still its own
+  // field, and the default is still the unchanged xprop cap - so each of those is pinned here
+  // against the parameterised lines rather than the old hard-coded constant.
   ['supervisor reports a truncated probe stream as a complete one',
-    '              return (shown, len(data), len(data) > EVIDENCE_BYTES)\n',
+    '              return (shown, len(data), len(data) > cap)\n',
     '              return (shown, len(data), False)\n'],
   ['supervisor stops reporting how much the probe actually printed',
-    '              return (shown, len(data), len(data) > EVIDENCE_BYTES)\n',
-    '              return (shown, len(shown), len(data) > EVIDENCE_BYTES)\n'],
+    '              return (shown, len(data), len(data) > cap)\n',
+    '              return (shown, len(shown), len(data) > cap)\n'],
   ['supervisor lets one probe record grow without bound',
-    '              kept = data[:EVIDENCE_BYTES]\n',
+    '              kept = data[:cap]\n',
     '              kept = data\n'],
+  ['supervisor makes the per-stream cap optional so a caller can drop the bound',
+    '              kept = data[:cap]\n',
+    '              kept = data[:cap] if cap else data\n'],
+  ['supervisor changes the default cap every existing xprop caller relies on',
+    '          def sanitize(raw, redact, cap=EVIDENCE_BYTES):\n',
+    '          def sanitize(raw, redact, cap=OWNER_EVIDENCE_BYTES):\n'],
+  ['supervisor changes the default record cap every existing xprop caller relies on',
+    '          def record(evidence, name, status, out, err, timed_out, cap=EVIDENCE_BYTES,\n',
+    '          def record(evidence, name, status, out, err, timed_out, cap=OWNER_EVIDENCE_BYTES,\n'],
+  ['supervisor mislabels the ownership subprocess as a window property',
+    '                     label="property"):\n', '                     label="probe"):\n'],
+  ['supervisor drops the label that distinguishes a subprocess record from a property one',
+    '              evidence.append(\'%s=%s status=%s timed-out=%s stdout-bytes=%d\'\n',
+    '              evidence.append(\'property=%s status=%s timed-out=%s stdout-bytes=%d\'\n'],
   ['supervisor raises the per-stream evidence cap to an unbounded dump',
     '          EVIDENCE_BYTES = 200   # per-stream cap on what one probe record may carry\n',
     '          EVIDENCE_BYTES = 1000000   # per-stream cap\n'],
@@ -1990,14 +2607,22 @@ const ciDiagnosticMutations = [
     '              shown = "".join(chr(b) if 32 <= b < 127 and chr(b) not in \'<"\' else "<%02x>" % b\n',
     '              shown = "".join(chr(b) if 32 <= b < 256 and chr(b) not in \'<"\' else "<%02x>" % b\n'],
   ['supervisor caps the probe stream after decoding rather than on its raw bytes',
-    '              kept = data[:EVIDENCE_BYTES]\n',
-    '              kept = data.decode("utf-8", "replace")[:EVIDENCE_BYTES].encode("utf-8")\n'],
+    '              kept = data[:cap]\n',
+    '              kept = data.decode("utf-8", "replace")[:cap].encode("utf-8")\n'],
   ['supervisor path redaction stops matching the raw probe bytes',
     '          PATHLIKE = re.compile(b"/[^ ]*")\n',
     '          PATHLIKE = re.compile("/[^ ]*")\n'],
   ['supervisor redacts the exact property response the refusal has to explain',
-    '              shown_out, out_bytes, out_cut = sanitize(out, False)\n',
-    '              shown_out, out_bytes, out_cut = sanitize(out, True)\n'],
+    '              shown_out, out_bytes, out_cut = sanitize(out, False, cap)\n',
+    '              shown_out, out_bytes, out_cut = sanitize(out, True, cap)\n'],
+  ['supervisor stops redacting the diagnostic stream it passes the cap to',
+    '              shown_err, err_bytes, err_cut = sanitize(err, True, cap)\n',
+    '              shown_err, err_bytes, err_cut = sanitize(err, False, cap)\n'],
+  ['supervisor ignores the cap a caller asked the record to bound its streams by',
+    '              shown_out, out_bytes, out_cut = sanitize(out, False, cap)\n'
+      + '              shown_err, err_bytes, err_cut = sanitize(err, True, cap)\n',
+    '              shown_out, out_bytes, out_cut = sanitize(out, False)\n'
+      + '              shown_err, err_bytes, err_cut = sanitize(err, True)\n'],
   ['supervisor bounds the classified stdout by the diagnostic evidence cap',
     '              text = done.stdout.decode("utf-8", "replace").strip()\n',
     '              text = done.stdout.decode("utf-8", "replace")[:EVIDENCE_BYTES].strip()\n'],
@@ -2100,9 +2725,17 @@ const ciDebtMutations = [
       + '            || { echo "::error::could not parse the TAP summary; refusing to report a vacuous pass."; exit 1; }\n', ''],
   ['masking early-exit debt step restored', debtIndent(commands.ciDebt), debtIndent(commands.ciDebtBaseline)],
 ];
+// The acceptance caller's `umask 077` plus the one line that follows it in each contract, so
+// the cookie-umask negatives land on the CALLER and not on the CI-only compile step, which
+// carries the same bare line and has its own negative.
+const ciDiagnosticFirstLine = `${ciDiagnosticRun.split('\n', 1)[0]}\n`;
+assert.ok(ciDiagnosticRun.startsWith(ciDiagnosticFirstLine), 'CI caller body first line');
 const callerContracts = {
-  CI: { addition: ciBrowserAddition, caller: ciHeadedCaller, run: ciDiagnosticRun },
-  release: { addition: browserAddition, caller: headedCaller, run: xvfbLine },
+  CI: { addition: ciBrowserAddition, caller: ciHeadedCaller, run: ciDiagnosticRun,
+    consoleAnchor: `${ciXresEnv}${headedRationaleAnchor}`,
+    umaskSite: `${umaskLine}${ciDiagnosticFirstLine}` },
+  release: { addition: browserAddition, caller: headedCaller, run: xvfbLine,
+    consoleAnchor: headedRationaleAnchor, umaskSite: `${umaskLine}${xvfbLine}` },
 };
 for (const [workflowName, path] of [['CI', '.github/workflows/ci.yml'], ['release', '.github/workflows/release.yml']]) {
   const source = lf(readFileSync(join(root, path), 'utf8'));

@@ -24,6 +24,8 @@ sourceTestFiles.push(
 // owned POSIX PTY; Windows support is still absent for both.
 if (process.platform === 'darwin' || process.platform === 'linux') {
   sourceTestFiles.push('tests/packaging/native-capture.test.mjs', 'tests/packaging/orchestrator-boot-wizard.test.mjs');
+  // #1177 the XRes owner supervisor fixtures signal owned POSIX children and observe them via flock.
+  sourceTestFiles.push('tests/packaging/xres-owner-supervisor.test.mjs');
 }
 
 function collectTestFiles(dir) {
