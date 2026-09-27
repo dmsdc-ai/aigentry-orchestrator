@@ -102,7 +102,20 @@ function seedAuth(cli: string, home: string, cwd: string): Record<string, string
     const auth = fs.existsSync(source) ? fs.readFileSync(source, "utf8") :
       execFileSync("/usr/bin/security", ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
         { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000 }).trim();
-    JSON.parse(auth);
+    // Refuse a selected source that carries no credential material at all, before
+    // any seed write. Purely syntactic: it does not ask the provider anything and
+    // does not judge freshness, so an expired access token with a refresh token
+    // still passes. Either token alone suffices; neither is a refusal. The error
+    // is a fixed string so no credential byte, path or parser detail can leak.
+    const record = (v: unknown): v is Record<string, unknown> =>
+      typeof v === "object" && v !== null && !Array.isArray(v);
+    const material = (v: unknown): boolean => typeof v === "string" && v.trim() !== "";
+    let parsed: unknown;
+    try { parsed = JSON.parse(auth); } catch { throw new Error("SANDBOX_AUTH_INVALID_SEED"); }
+    const oauth = record(parsed) ? parsed.claudeAiOauth : undefined;
+    if (!record(oauth) || !(material(oauth.accessToken) || material(oauth.refreshToken))) {
+      throw new Error("SANDBOX_AUTH_INVALID_SEED");
+    }
     writePrivate(path.join(config, ".credentials.json"), auth);
     writePrivate(path.join(config, ".claude.json"), JSON.stringify({ hasCompletedOnboarding: true,
       projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
