@@ -1693,10 +1693,12 @@ const wizardRelative = 'tests/packaging/orchestrator-boot-wizard.test.mjs';
 // appended after the wizard entry and never placed on win32.
 const supervisorRelative = 'tests/packaging/xres-owner-supervisor.test.mjs';
 // #1162 agent-metadata suites: POSIX-only (modes, FIFOs, bash), appended after the XRes
-// supervisor entry in this exact order and never placed on win32.
-const agentMetadataRelatives = ['g2b-binding', 'g2c-caps-schema-unknown-pill', 'g2c-host-contract', 'g2c-transport',
-  'g3-legacy-allowlist', 'g3-reconciler-matrix', 'g3-stage-workspace-denial', 'g3-stale-fallback']
+// supervisor entry in this exact order and never placed on win32. #1171 g2c-pinned-clear is
+// POSIX-only too and sits between g2c-host-contract and g2c-transport.
+const agentMetadataRelatives = ['g2b-binding', 'g2c-caps-schema-unknown-pill', 'g2c-host-contract', 'g2c-pinned-clear',
+  'g2c-transport', 'g3-legacy-allowlist', 'g3-reconciler-matrix', 'g3-stage-workspace-denial', 'g3-stale-fallback']
   .map(name => `tests/dispatch/agent-metadata/${name}.test.mjs`);
+const agentMetadataPinnedClear = 'tests/dispatch/agent-metadata/g2c-pinned-clear.test.mjs';
 // #1179 JEV suites: explicit, platform-neutral source entries on EVERY platform, win32
 // included, in this exact order and ahead of the POSIX-only entries.
 const jevRelatives = ['pipeline-integration', 'price-table', 'r2-acceptance-delta', 'r2-before-after',
@@ -1704,10 +1706,12 @@ const jevRelatives = ['pipeline-integration', 'price-table', 'r2-acceptance-delt
   .map(name => `tests/jev/${name}.test.mjs`);
 // #1185 task-advisor efficiency suites: explicit, platform-neutral source entries on EVERY
 // platform, win32 included, in this exact order, after JEV and ahead of the POSIX-only entries.
-const taskAdvisorRelatives = ['t1-schema', 't10-r3-state-latency', 't11-r4-numeric', 't2-decoder',
-  't3-dedup-gap-time', 't4-grants-binding', 't5-detectors', 't6-suppression-outcome', 't7-bounds',
+// #1171 t12-checkpoint-decoder is on every platform and sits directly after t11.
+const taskAdvisorRelatives = ['t1-schema', 't10-r3-state-latency', 't11-r4-numeric', 't12-checkpoint-decoder',
+  't2-decoder', 't3-dedup-gap-time', 't4-grants-binding', 't5-detectors', 't6-suppression-outcome', 't7-bounds',
   't8-r2-focused', 't9-suspicions']
   .map(name => `tests/task-advisor/efficiency/${name}.test.mjs`);
+const taskAdvisorT12 = 'tests/task-advisor/efficiency/t12-checkpoint-decoder.test.mjs';
 function callerFixture(mode, symlinked = false) {
   const directory = mkdtempSync(join(admin, 'caller fixture '));
   const put = (path, source) => {
@@ -1733,12 +1737,14 @@ function callerFixture(mode, symlinked = false) {
     if (mode !== 'missing-jev' || index !== jevRelatives.length - 1) put(path, checks + `console.log('CALLER_JEV_SENTINEL_${index}');\nprocess.exit(${mode === 'failing-jev' && index === 0 ? 8 : 0});\n`);
   }
   for (const [index, path] of taskAdvisorRelatives.entries()) {
-    if (mode !== 'missing-task-advisor' || index !== taskAdvisorRelatives.length - 1) put(path, checks + `console.log('CALLER_TASK_ADVISOR_SENTINEL_${index}');\nprocess.exit(${mode === 'failing-task-advisor' && index === 0 ? 8 : 0});\n`);
+    if (mode === 'missing-task-advisor-t12' && path === taskAdvisorT12) continue;
+    if (mode !== 'missing-task-advisor' || index !== taskAdvisorRelatives.length - 1) put(path, checks + `console.log('CALLER_TASK_ADVISOR_SENTINEL_${index}');\nprocess.exit(${(mode === 'failing-task-advisor' && index === 0) || (mode === 'failing-task-advisor-t12' && path === taskAdvisorT12) ? 8 : 0});\n`);
   }
   if (mode !== 'missing-wizard') put(wizardRelative, checks + `console.log('CALLER_WIZARD_SENTINEL');\nprocess.exit(${mode === 'failing-wizard' ? 8 : 0});\n`);
   if (mode !== 'missing-supervisor') put(supervisorRelative, checks + `console.log('CALLER_SUPERVISOR_SENTINEL');\nprocess.exit(${mode === 'failing-supervisor' ? 8 : 0});\n`);
   for (const [index, path] of agentMetadataRelatives.entries()) {
-    if (mode !== 'missing-agent-metadata' || index !== agentMetadataRelatives.length - 1) put(path, checks + `console.log('CALLER_AGENT_METADATA_SENTINEL_${index}');\nprocess.exit(${mode === 'failing-agent-metadata' && index === 0 ? 8 : 0});\n`);
+    if (mode === 'missing-agent-metadata-pinned-clear' && path === agentMetadataPinnedClear) continue;
+    if (mode !== 'missing-agent-metadata' || index !== agentMetadataRelatives.length - 1) put(path, checks + `console.log('CALLER_AGENT_METADATA_SENTINEL_${index}');\nprocess.exit(${(mode === 'failing-agent-metadata' && index === 0) || (mode === 'failing-agent-metadata-pinned-clear' && path === agentMetadataPinnedClear) ? 8 : 0});\n`);
   }
   if (mode !== 'missing-harness') put(harnessRelative, checks + `console.log('CALLER_SOURCE_SENTINEL');\nprocess.exit(${mode === 'sentinel-fail' ? 9 : 0});\n`);
   put('tests/packaging/unselected.test.mjs', "console.log('CALLER_UNSELECTED_MJS'); process.exit(99);\n");
@@ -1751,7 +1757,7 @@ function callerFixture(mode, symlinked = false) {
   return directory;
 }
 for (const symlinked of [false, true]) {
-for (const [mode, expected, compiled, security, sentinel, diagnostic] of [
+for (const [mode, expected, compiled, security, sentinel, diagnostic, onlyFailedFile] of [
   ['pass', 0, true, true, true],
   ['sentinel-fail', 1, true, true, true, /POSIX control harness failed with exit status: 1/],
   ['compiled-fail', 1, true, true, false],
@@ -1771,6 +1777,11 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic] of [
   ['failing-jev', 1, true, true, false],
   ['missing-task-advisor', 1, false, false, false, /tests[\\/]task-advisor[\\/]efficiency[\\/]t9-suspicions\.test\.mjs/],
   ['failing-task-advisor', 1, true, true, false],
+  // #1171 per-entry controls for the two newly listed suites: each one alone missing or failing.
+  ['missing-task-advisor-t12', 1, false, false, false, /Could not find '[^'\n]*tests[\\/]task-advisor[\\/]efficiency[\\/]t12-checkpoint-decoder\.test\.mjs'/],
+  ['failing-task-advisor-t12', 1, true, true, false, undefined, /tests[\\/]task-advisor[\\/]efficiency[\\/]t12-checkpoint-decoder\.test\.mjs$/],
+  ['missing-agent-metadata-pinned-clear', 1, false, false, false, /Could not find '[^'\n]*tests[\\/]dispatch[\\/]agent-metadata[\\/]g2c-pinned-clear\.test\.mjs'/],
+  ['failing-agent-metadata-pinned-clear', 1, true, true, false, undefined, /tests[\\/]dispatch[\\/]agent-metadata[\\/]g2c-pinned-clear\.test\.mjs$/],
   ['missing-harness', 1, true, true, false, /POSIX control harness failed with exit status: 1/],
   ['empty', 1, false, false, false, /No compiled test files found/],
   ['missing-dist', 1, false, false, false, /Failed to enumerate compiled tests/],
@@ -1815,6 +1826,11 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic] of [
     assert.ok(result.stdout.indexOf(`CALLER_TASK_ADVISOR_SENTINEL_${index}`) < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   }
   if (diagnostic) assert.match(result.stderr, diagnostic);
+  if (onlyFailedFile) {
+    const failures = result.stdout.split('\n').filter(line => /^not ok \d+ - /.test(line));
+    assert.equal(failures.length, 1, 'exactly one failing composed suite');
+    assert.match(failures[0], onlyFailedFile);
+  }
 });
 }
 
@@ -1933,6 +1949,32 @@ for (const item of vmCases) acceptance(`caller VM: ${item.name}`, 'caller-vm', (
   } else assert.deepEqual(actual.logs, []);
   if (item.diagnostic) assert.match(actual.errors.join('\n'), item.diagnostic);
 });
+// #1171 explicit placement of the two newly listed suites in the exact runner's first spawn,
+// measured against literal neighbours rather than inferred from the list-derived argv.
+for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #1171 t12 follows t11 and g2c-pinned-clear sits between g2c-host-contract and g2c-transport only on POSIX (${platform})`, 'caller-vm', () => {
+  const config = join(admin, `caller-vm-1171-placement-${platform}.json`);
+  writeFileSync(config, JSON.stringify({ platform, results: platform === 'win32' ? [success] : [success, success], source: callerSource }));
+  const argv = ['--experimental-vm-modules', driver, config];
+  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, encoding: 'utf8', timeout });
+  invocations.push({ kind: 'caller-vm-1171-placement', label: platform, executable: process.execPath, argv, timeout,
+    exit: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr, runnerSha256: sha(callerSource) });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+  const actual = JSON.parse(result.stdout);
+  assert.equal(actual.status, 0);
+  const spawned = actual.calls[0].argv;
+  const count = entry => spawned.filter(item => item === entry).length;
+  assert.equal(count(taskAdvisorT12), 1);
+  assert.equal(spawned.indexOf(taskAdvisorT12), spawned.indexOf('tests/task-advisor/efficiency/t11-r4-numeric.test.mjs') + 1);
+  assert.equal(spawned.indexOf('tests/task-advisor/efficiency/t2-decoder.test.mjs'), spawned.indexOf(taskAdvisorT12) + 1);
+  if (platform === 'win32') {
+    assert.equal(count(agentMetadataPinnedClear), 0);
+  } else {
+    assert.equal(count(agentMetadataPinnedClear), 1);
+    assert.equal(spawned.indexOf(agentMetadataPinnedClear), spawned.indexOf('tests/dispatch/agent-metadata/g2c-host-contract.test.mjs') + 1);
+    assert.equal(spawned.indexOf('tests/dispatch/agent-metadata/g2c-transport.test.mjs'), spawned.indexOf(agentMetadataPinnedClear) + 1);
+  }
+});
 // #1181 wrong-platform placement of the POSIX-only wizard entry. Each mutation is applied
 // to the exact runner bytes with unique-needle checks OUTSIDE assert.throws, the mutated
 // runner still runs to its first spawn, and the exact caller expectation must reject it.
@@ -1957,18 +1999,26 @@ for (const [name, mutate, platforms] of [
   ['JEV suites wired POSIX-only', source => replaceOnce(replaceOnce(source, jevBlock, ''), wizardPosixPush,
     `${wizardPosixPush}\n  ${jevBlock.trimEnd()}`), ['win32', 'linux', 'darwin']],
   // #1185: every task-advisor efficiency suite is required on every platform, and the block
-  // must not be wired POSIX-only (which would silently drop all eleven from win32).
+  // must not be wired POSIX-only (which would silently drop all twelve from win32).
   ...taskAdvisorRelatives.map(path => [`task-advisor suite ${path} missing`, source => replaceOnce(source, `  '${path}',\n`, ''),
     ['win32', 'linux', 'darwin']]),
   ['task-advisor suites wired POSIX-only', source => replaceOnce(replaceOnce(source, taskAdvisorBlock, ''), wizardPosixPush,
     `${wizardPosixPush}\n  ${taskAdvisorBlock.trimEnd()}`), ['win32', 'linux', 'darwin']],
+  // #1171: t12 alone must stay on every platform, directly after t11.
+  ['task-advisor suite t12 wired POSIX-only', source => replaceOnce(replaceOnce(source, `  '${taskAdvisorT12}',\n`, ''),
+    wizardPosixPush, `${wizardPosixPush}\n  sourceTestFiles.push('${taskAdvisorT12}');`), ['win32', 'linux', 'darwin']],
+  ['task-advisor suite t12 placed on win32 only', source => replaceOnce(replaceOnce(source, `  '${taskAdvisorT12}',\n`, ''),
+    posixBranchOpen, `if (process.platform === 'win32') sourceTestFiles.push('${taskAdvisorT12}');\n${posixBranchOpen}`), ['win32', 'linux', 'darwin']],
+  ['task-advisor suite t12 ahead of t11', source => replaceOnce(source,
+    `  'tests/task-advisor/efficiency/t11-r4-numeric.test.mjs',\n  '${taskAdvisorT12}',\n`,
+    `  '${taskAdvisorT12}',\n  'tests/task-advisor/efficiency/t11-r4-numeric.test.mjs',\n`), ['win32', 'linux', 'darwin']],
   // #1177: the XRes supervisor suite is required on POSIX and must never reach win32.
   ['XRes supervisor suite missing', source => replaceOnce(source, supervisorPosixPush, ''), ['linux', 'darwin']],
   ['XRes supervisor suite placed on every platform, win32 included', source => replaceOnce(replaceOnce(source, supervisorPosixPush, ''),
     posixBranchOpen, `${supervisorPosixPush.trimStart()}${posixBranchOpen}`), ['win32', 'linux', 'darwin']],
   ['XRes supervisor suite placed on win32 only', source => replaceOnce(source, supervisorPosixPush,
     `}\nif (process.platform === 'win32') {\n${supervisorPosixPush}`), ['win32', 'linux', 'darwin']],
-  // #1162: the eight agent-metadata suites are required on POSIX, in this exact order after
+  // #1162: the nine agent-metadata suites are required on POSIX, in this exact order after
   // the XRes supervisor entry, and must never reach win32.
   ...agentMetadataRelatives.map(path => [`agent-metadata suite ${path} missing`, source => replaceOnce(source, `    '${path}',\n`, ''),
     ['linux', 'darwin']]),
@@ -1981,6 +2031,19 @@ for (const [name, mutate, platforms] of [
     `    '${agentMetadataRelatives[1]}',\n    '${agentMetadataRelatives[0]}',\n`), ['linux', 'darwin']],
   ['agent-metadata suites ahead of the XRes supervisor entry', source => replaceOnce(replaceOnce(source, agentMetadataBlock, ''),
     supervisorPosixPush, `${agentMetadataBlock}${supervisorPosixPush}`), ['linux', 'darwin']],
+  // #1171: g2c-pinned-clear alone must stay POSIX-only, between g2c-host-contract and g2c-transport.
+  ['agent-metadata suite g2c-pinned-clear placed on every platform, win32 included', source => replaceOnce(replaceOnce(source,
+    `    '${agentMetadataPinnedClear}',\n`, ''), posixBranchOpen, `sourceTestFiles.push('${agentMetadataPinnedClear}');\n${posixBranchOpen}`),
+    ['win32', 'linux', 'darwin']],
+  ['agent-metadata suite g2c-pinned-clear placed on win32 only', source => replaceOnce(replaceOnce(source,
+    `    '${agentMetadataPinnedClear}',\n`, ''), posixBranchOpen,
+    `if (process.platform === 'win32') sourceTestFiles.push('${agentMetadataPinnedClear}');\n${posixBranchOpen}`), ['win32', 'linux', 'darwin']],
+  ['agent-metadata suite g2c-pinned-clear ahead of g2c-host-contract', source => replaceOnce(source,
+    `    'tests/dispatch/agent-metadata/g2c-host-contract.test.mjs',\n    '${agentMetadataPinnedClear}',\n`,
+    `    '${agentMetadataPinnedClear}',\n    'tests/dispatch/agent-metadata/g2c-host-contract.test.mjs',\n`), ['linux', 'darwin']],
+  ['agent-metadata suite g2c-pinned-clear after g2c-transport', source => replaceOnce(source,
+    `    '${agentMetadataPinnedClear}',\n    'tests/dispatch/agent-metadata/g2c-transport.test.mjs',\n`,
+    `    'tests/dispatch/agent-metadata/g2c-transport.test.mjs',\n    '${agentMetadataPinnedClear}',\n`), ['linux', 'darwin']],
 ]) for (const platform of platforms) acceptance(`caller VM negative: ${name} is rejected on ${platform}`, 'caller-vm', () => {
   const source = mutate(callerSource);
   const config = join(admin, `caller-vm-negative-${name.replace(/[^a-z0-9]+/g, '-')}-${platform}.json`);
