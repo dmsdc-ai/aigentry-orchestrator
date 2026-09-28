@@ -92,11 +92,14 @@ case "\${1:-}" in
   detect-terminal) echo cmux ;;
   open)            echo workspace:117 ;;
   set-status)      : ;;
+  agent-meta-caps) exit 20 ;;
   *) echo "recorder: unexpected verb '\${1:-}'" >&2; exit 70 ;;
 esac
 exit 0
 EOF
 chmod +x "$WS/bin/wh-cli.sh"
+# #1162: telepty evidence for the spawned sid (the legacy pill is connection-only).
+printf '%s' '[{"id":"t117-ws","command":"claude","healthStatus":"CONNECTED"}]' > "$STUB_LIST_FILE"
 
 HOME_WS="$T_TMP/home-ws"; mkdir -p "$HOME_WS"
 set +e
@@ -114,9 +117,17 @@ grep -qxF "detect-terminal" "$WH_LOG" \
 grep -qxF "open t117-ws $T_TMP/cwd-ws claude --model claude-opus-4-8 --effort xhigh --permission-mode bypassPermissions" "$WH_LOG" \
   || { echo "--- wh-cli calls ---" >&2; cat "$WH_LOG" >&2
        fail "the spawn's open argv changed, or did not reach the workspace's own wh-cli.sh"; }
-grep -qxF "set-status workspace:117 working" "$WH_LOG" \
+# #1162 G2c: caps (20 here) and the evidence-only connection pill both go through the
+# workspace's own wh-cli.sh; never a speculative working pill.
+grep -qxF "agent-meta-caps" "$WH_LOG" \
   || { echo "--- wh-cli calls ---" >&2; cat "$WH_LOG" >&2
-       fail "the #616 pill did not reach the workspace's own wh-cli.sh"; }
+       fail "agent-meta-caps did not reach the workspace's own wh-cli.sh"; }
+grep -qxF "set-status workspace:117 working" "$WH_LOG" \
+  && { echo "--- wh-cli calls ---" >&2; cat "$WH_LOG" >&2
+       fail "a speculative working pill was pushed (#1162 removed it)"; }
+grep -qxF "set-status workspace:117 connected" "$WH_LOG" \
+  || { echo "--- wh-cli calls ---" >&2; cat "$WH_LOG" >&2
+       fail "the connection pill did not reach the workspace's own wh-cli.sh"; }
 # The log line landed under the workspace-run's HOME, not the operator's.
 [ -f "$HOME_WS/.aigentry/open-session.log" ] \
   || fail "a workspace-layout spawn wrote no ~/.aigentry/open-session.log line"

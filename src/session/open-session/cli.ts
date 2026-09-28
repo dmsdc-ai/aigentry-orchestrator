@@ -12,10 +12,11 @@
 // declined) and the OS primitive lives in the platform lib by Rule 26:
 //
 //   lib/workspace-host.sh → bin/wh-cli.sh, the subprocess door built for exactly
-//     this (c83ebc4, pre-tranche-2). EXACTLY THREE SYMBOLS are reached, measured
+//     this (c83ebc4, pre-tranche-2). EXACTLY FOUR SYMBOLS are reached, measured
 //     rather than assumed: detect_terminal (the shell's :201 and :272) →
 //     `detect-terminal`, wh_open (:231) → `open`, wh_set_status (:239) →
-//     `set-status`. tests/dispatch/T104 pins CLI result == sourced-function result
+//     `set-status`; #1162 G2c adds wh_agent_meta_caps → `agent-meta-caps`, which
+//     gates that set-status. tests/dispatch/T104 pins CLI result == sourced-function result
 //     (exit code + stdout) for all 11 verbs, so the door cannot drift from the lib.
 //     _wh_adapter and _wh_fallback_spawn appear in the shell's COMMENTS only
 //     (:141-144) and are NOT doors — T104 part F pins that set at 11 so a 12th
@@ -418,17 +419,49 @@ function openInTerminal(): string {
   if (opened.status !== 0) cleanupOnExit(opened.status);
   const ref = chomp(opened.stdout);
 
-  // #616 (사용자확정 옵션2 = 사이드바): surface the freshly-spawned worker as a
-  // ⚡working pill in the cmux sidebar immediately — visibility WITHOUT focus theft
-  // (the orchestrator keeps its surface; NO select-workspace). `set-status` routes
-  // via _wh_adapter (cmux in the live orchestrator, where cmux is on PATH); it is a
-  // degraded-noop on non-cmux adapters (§17). Best-effort — never gates the spawn,
-  // never writes to stdout (the ref must be the sole stdout line). DELIBERATELY NOT
-  // env-forced, exactly as the shell left it: T56's header records that the
-  // auto-detect fallthrough here is what that guard is measuring.
-  wh(["set-status", ref, "working"], { out: "ignore", err: "ignore" });
+  // #616 (사용자확정 옵션2 = 사이드바): surface the freshly-spawned worker in the cmux
+  // sidebar — visibility WITHOUT focus theft (the orchestrator keeps its surface; NO
+  // select-workspace). #1162 G2c: the pill is no longer an unconditional ⚡working —
+  // a spawn is not work, and nothing here observed any. When the host carries
+  // per-surface agent metadata (agent-meta-caps == 0) this process draws nothing:
+  // the sealed dispatcher sets cli/model/effort/status after readiness, and an
+  // unsealed spawn has no sealed record, so it stays uncovered rather than guessed.
+  // Otherwise the legacy pill shows only the connection telepty actually reports for
+  // this sid; any other answer draws nothing. Best-effort — never gates the spawn,
+  // a non-zero caps answer is logged on stderr, never on stdout (the ref must be the
+  // sole stdout line). DELIBERATELY NOT env-forced, exactly as the shell left it:
+  // T56's header records that the auto-detect fallthrough here is what that guard
+  // is measuring.
+  const caps = wh(["agent-meta-caps"], { out: "ignore", err: "ignore" });
+  if (caps.status !== 0) {
+    process.stderr.write(`open-session.sh: agent-meta caps rc=${caps.status} — no per-surface metadata; legacy connection pill only\n`);
+    const connection = teleptyConnection(sid);
+    if (connection) wh(["set-status", ref, connection], { out: "ignore", err: "ignore" });
+  }
 
   return ref;
+}
+
+/**
+ * #1162: the sid's connection as telepty reports it, verbatim — CONNECTED →
+ * "connected", DISCONNECTED → "disconnected". An unreadable listing, a missing row
+ * or any other value is "" (no evidence ⇒ no pill). Never an activity.
+ */
+function teleptyConnection(forSid: string): "connected" | "disconnected" | "" {
+  const listing = run("telepty", ["list", "--json"], { err: "ignore" });
+  if (listing.status !== 0) return "";
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(listing.stdout);
+  } catch {
+    return "";
+  }
+  if (!Array.isArray(parsed)) return "";
+  const row: unknown = parsed.find((s: unknown) => typeof s === "object" && s !== null && (s as { id?: unknown }).id === forSid);
+  const health = typeof row === "object" && row !== null ? (row as { healthStatus?: unknown }).healthStatus : undefined;
+  if (health === "CONNECTED") return "connected";
+  if (health === "DISCONNECTED") return "disconnected";
+  return "";
 }
 
 // Spawn the session (the ref/sid is this process's sole stdout line)

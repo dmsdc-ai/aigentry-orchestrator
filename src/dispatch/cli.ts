@@ -25,6 +25,8 @@ export { registryInvocation } from "./registry-command.js";
 
 import { USAGE } from "./usage.js";
 import { geminiBinary } from "../session/boot-adapter/gemini.js";
+import { isCliKind, type LaunchConfig } from "../session/boot-adapter/types.js";
+import { normalizeLaunch } from "../session/boot-adapter/launch-config.js";
 import { loadWorkerScope, prepareWorkerSandbox, assertConfinedTarget, stageWorkerRef } from "../session/worker-sandbox.js";
 
 // ── environment seams (identical names/defaults to the shell) ────────────────
@@ -43,6 +45,7 @@ const SESSION_PROBE_PY = env.SESSION_PROBE_PY || path.join(SCRIPT_DIR, "session-
 const TELEPTY = env.TELEPTY || "telepty";
 const EMIT_TELEMETRY_MJS = env.EMIT_TELEMETRY_MJS || path.join(SCRIPT_DIR, "emit-telemetry.mjs");
 const REPORT_TARGET_SH = env.REPORT_TARGET_SH || path.join(SCRIPT_DIR, "orchestrator-report-target.sh");
+const WH_CLI = path.join(SCRIPT_DIR, "wh-cli.sh");
 
 const REGISTER_TIMEOUT_MS_DEFAULT = 180000;
 
@@ -222,6 +225,59 @@ function isReady(sid: string, cliKind: string): boolean {
   } catch {
     return false;
   }
+}
+
+// ── #1162 agent metadata (never gates the spawn) ────────────────────────────
+const PROBE_SURFACES = new Set(["working", "idle", "welcome", "unsubmitted", "modal", "sandbox_prompt", "error",
+  "crash", "sleep_cut", "raw_shell", "thinking_block", "unknown"]);
+
+/**
+ * The status half of the sealed worker's metadata, each field from its own
+ * evidence at read time: connection = verbatim telepty healthStatus; activity =
+ * one session-probe surface, only from a current-viewport read without
+ * probe_error; dispatch = registry live rows for this sid. Anything unmeasured
+ * is unknown. CONNECTED is never activity, and dispatch is never completion.
+ */
+function agentStatus(sid: string, cliKind: string): Record<string, string | number> {
+  let connection = "unknown";
+  try {
+    const list = JSON.parse(capture(TELEPTY, ["list", "--json"]).stdout);
+    const rows = Array.isArray(list) ? list.filter(s => s && s.id === sid) : [];
+    const health = rows.length === 1 ? rows[0].healthStatus : undefined;
+    connection = health === "CONNECTED" ? "connected" : health === "DISCONNECTED" ? "disconnected" : "unknown";
+  } catch { /* unreadable listing: unknown */ }
+  let activity = "unknown", activitySource = "unknown";
+  try {
+    const p = JSON.parse(capture(SESSION_PROBE_PY, ["--sid", sid, "--cli", cliKind], { TELEPTY }).stdout);
+    const detail = p && typeof p.detail === "object" && p.detail !== null ? p.detail : {};
+    if (detail.probe_error === undefined && typeof detail.screen_source === "string" &&
+        detail.screen_source.endsWith(":current-viewport") && PROBE_SURFACES.has(p.surface)) {
+      activity = p.surface;
+      activitySource = "probe:current-viewport";
+    }
+  } catch { /* no probe verdict: unknown */ }
+  let dispatch = "unknown";
+  const live = registryOut(["list", "--live", "--fields", "assigned.sid,lifecycle.state"]);
+  if (live.status === 0) {
+    const states = live.stdout.split("\n").map(l => l.split("\t")).filter(f => f[0] === sid).map(f => f[1] ?? "");
+    dispatch = states.length === 0 ? "none" : states.length > 1 ? "multiple"
+      : states[0] !== "null" && /^[a-z_]{1,40}$/.test(states[0]!) ? states[0]! : "unknown";
+  }
+  return { connection, activity, activity_source: activitySource, dispatch, read_at: Math.floor(Date.now() / 1000) };
+}
+
+/** One best-effort agent-meta-set through the terminal adapter; the rc is logged, never mapped to success. */
+function publishAgentMeta(sid: string, cliKind: string, stagingRoot: string): void {
+  let rc: string;
+  try {
+    const status = JSON.stringify(agentStatus(sid, cliKind));
+    const r = spawnSync(WH_CLI, ["agent-meta-set", sid, "--stage", stagingRoot, "--status-json", status],
+      { stdio: ["ignore", "ignore", "inherit"], timeout: 15000 });
+    rc = r.error ? "spawn-error" : String(r.status ?? r.signal);
+  } catch {
+    rc = "error";
+  }
+  if (rc !== "0") process.stderr.write(`dispatch.sh: WARNING agent-meta-set rc=${rc} for ${sid} (spawn not gated)\n`);
 }
 
 // ── registry seam (telepty#60 Stage A) ──────────────────────────────────────
@@ -961,6 +1017,7 @@ function spawnWorkspace(o: Opts, sid: string): void {
   let bootSpawnCli = "";
   let bootSpawnCwd = "";
   let bootArgv: string[] = [];
+  let bootLaunch: LaunchConfig | undefined;
   // #532: boot-prepare role wiring covers claude (flag-based) + codex/gemini
   // (additive cwd context file + config-home shadow).
   const bootEligible = o.cli === "claude" || o.cli === "codex" || o.cli === "gemini" || o.cli === "grok";
@@ -969,7 +1026,7 @@ function spawnWorkspace(o: Opts, sid: string): void {
     const bootPrepare = fileURLToPath(new URL("../../../bin/boot-prepare.mjs", import.meta.url));
     if (isExecutable(bootPrepare)) {
       const r = captureOut("node", [bootPrepare, "--role", o.role, "--cwd", o.cwd, "--sid", sid, "--cli", o.cli, "--confined"], spawnEnv);
-      let parsed: { spawn_cli?: unknown; spawn_cwd?: unknown; argv?: unknown } | null = null;
+      let parsed: { spawn_cli?: unknown; spawn_cwd?: unknown; argv?: unknown; launch?: unknown } | null = null;
       if (r.status === 0 && r.stdout) {
         try {
           parsed = JSON.parse(r.stdout);
@@ -982,6 +1039,14 @@ function spawnWorkspace(o: Opts, sid: string): void {
         bootSpawnCli = String(parsed.spawn_cli);
         bootSpawnCwd = String(parsed.spawn_cwd);
         bootArgv = parsed.argv;
+        // #1162: typed configured metadata only; malformed/missing is explicit
+        // unknown with a WARNING, never a spawn gate.
+        if (isCliKind(o.cli)) {
+          bootLaunch = normalizeLaunch(o.cli, parsed.launch);
+          if (JSON.stringify(bootLaunch) !== JSON.stringify(parsed.launch)) {
+            process.stderr.write(`dispatch.sh: WARNING boot-prepare launch metadata missing or invalid for sid=${sid}; model/effort unknown\n`);
+          }
+        }
       } else {
         process.stderr.write(
           `dispatch.sh: WARNING boot-prepare.mjs failed (exit ${r.status}) for sid=${sid} role=${o.role}\n`,
@@ -1005,7 +1070,7 @@ function spawnWorkspace(o: Opts, sid: string): void {
     // boot-prepare (#509). display_cli = o.cli (#532) so the guard wrapper's
     // `exec -a <cli>` and telepty visibility match the actual CLI.
     const protectedRoot = path.join(env.AIGENTRY_SESSIONS_ROOT || path.join(os.homedir(), ".aigentry", "sessions"), sid);
-    const sandbox = prepareWorkerSandbox(scope, o.cli, bootSpawnCwd, bootArgv, protectedRoot, o.cwd, workerHooksDir);
+    const sandbox = prepareWorkerSandbox(scope, o.cli, bootSpawnCwd, bootArgv, protectedRoot, o.cwd, workerHooksDir, bootLaunch);
     launcher = writeWorkerLauncher(sid, o.cli, sandbox.launcher, "", workerHooksDir, spawnEnv);
     spawnCwd = bootSpawnCwd;
   } else {
@@ -1084,7 +1149,8 @@ async function main(argv: string[]): Promise<never> {
   }
 
   resolveRoute(o, sid, skipPreparation || o.retryUnknown !== "");
-  if (!skipPreparation && o.spawn && !o.retryUnknown) { applyCliCap(o); spawnWorkspace(o, sid); }
+  const spawned = !skipPreparation && o.spawn && !o.retryUnknown;
+  if (spawned) { applyCliCap(o); spawnWorkspace(o, sid); }
 
   emitTelemetry([
     "--helper", "dispatch",
@@ -1106,6 +1172,8 @@ async function main(argv: string[]): Promise<never> {
     // retry with the same ref reaches the delivery transaction.
     const rc = await waitForReady(o, sid);
     if (rc !== 0) process.exit(rc);
+    // #1162 G2b: after readiness, publish the sealed worker's metadata once.
+    if (spawned) publishAgentMeta(sid, o.cli, path.join(env.AIGENTRY_SESSIONS_ROOT || path.join(os.homedir(), ".aigentry", "sessions"), sid));
     if (!prepareEffectiveRef(o, d)) process.exit(3);
     try {
       // Stage A, like prepareEffectiveRef: the message is built from the verified

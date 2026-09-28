@@ -47,11 +47,22 @@
 #       ownership + a seen-twice debounce ledger (SPEC §A). Prints count closed.
 #       Exit: 0 (best-effort; never blocks the sweep).
 #
-#   wh_set_status <host_id> <state>     # state ∈ {working,idle,disconnected}
+#   wh_set_status <host_id> <state>     # state ∈ {working,idle,disconnected,connected,unknown}
 #       Push session state to the host sidebar pill (SPEC §B). Exit: 0 (always).
 #
 #   wh_clear_status <host_id>
 #       Remove the aigentry status pill. Idempotent. Exit: 0 (always).
+#
+# Per-surface agent metadata (#1162 G2c, controller interface lock). Terminal-neutral
+# verbs; cmux forwards to dist/src/session/agent-metadata.js, every other adapter is
+# an explicit `unsupported` (20), never 127 and never a claimed compatibility:
+#
+#   wh_agent_meta_caps
+#   wh_agent_meta_set <sid> --stage <abs_staging_root> --status-json <json>
+#   wh_agent_meta_clear <sid> --stage <abs_staging_root>
+#       Exit: 0 applied/cleared/absent (caps: supported), 10 ownership/lifecycle
+#       refusal, 20 unsupported host/capability/binding, 30 parse/transport/invalid.
+#       Callers log non-zero and never gate a spawn on it.
 #
 # Constitution §17 (무의존): every adapter degrades gracefully when its
 # underlying tool is missing (e.g., cmux not installed → headless behavior).
@@ -233,7 +244,12 @@ _wh_cmux_set_status() {
     working)      icon=hammer;          color="#ff9500" ;;
     idle)         icon=checkmark;       color="#34c759" ;;
     disconnected) icon=exclamationmark; color="#ff3b30" ;;
-    *) return 0 ;; # unknown state — no-op (never emit a speculative pill)
+    # #1162: telepty CONNECTED is transport only — never idle, never working.
+    connected)    icon="link";          color="#8e8e93" ;;
+    # #1162 r3: legacy connection health unknown — neutral, replaces any stale
+    # working/idle pill; never implies activity or completion.
+    unknown)      icon=questionmark;    color="#8e8e93" ;;
+    *) return 0 ;; # unrecognized state — no-op (never emit a speculative pill)
   esac
   "$cmux_bin" set-status aigentry "$state" --icon "$icon" --color "$color" \
     --workspace "$host_id" >/dev/null 2>&1 || true
@@ -248,6 +264,32 @@ _wh_cmux_clear_status() {
   cmux clear-status aigentry --workspace "$host_id" >/dev/null 2>&1 || true
   return 0
 }
+
+# _wh_cmux_agent_meta <caps|set|clear> [args...] — #1162 G2c. The structured work
+# (host JSON, sealed binding, status JSON) is Node's, so no jq/eval touches it here;
+# argv is forwarded 1:1 and the exit code is returned verbatim (0/10/20/30). The
+# compiled entrypoint is resolved by lib/node-shim.sh — the same two-layout (repo
+# tree / control workspace) resolution every bin/ shim uses — in a subshell, because
+# that helper exits on a miss. A missing implementation is `unsupported` (20).
+_wh_cmux_agent_meta() {
+  local js
+  js=$(
+    AIGENTRY_SHIM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+    # shellcheck source=node-shim.sh
+    . "$AIGENTRY_SHIM_SCRIPT_DIR/lib/node-shim.sh"
+    aigentry_node_shim workspace-host.sh dist/src/session/agent-metadata.js 2>/dev/null
+    printf '%s' "$AIGENTRY_SHIM_JS"
+  ) || js=""
+  if [ -z "$js" ] || ! command -v node >/dev/null 2>&1; then
+    _wh_log "agent-meta $1: UNSUPPORTED — agent-metadata implementation not resolvable (rc=20)"
+    [ "$1" = "caps" ] && printf 'agent_meta caps=unsupported adapter=cmux reason=implementation-missing\n'
+    return 20
+  fi
+  node "$js" "$@"
+}
+_wh_cmux_agent_meta_caps()  { _wh_cmux_agent_meta caps "$@"; }
+_wh_cmux_agent_meta_set()   { _wh_cmux_agent_meta set "$@"; }
+_wh_cmux_agent_meta_clear() { _wh_cmux_agent_meta clear "$@"; }
 
 # _wh_cmux_prune_orphans <live_ids_csv> <protected_refs_csv> — close cmux
 # workspaces whose session has vanished from the live set, gated per SPEC §2:
@@ -926,6 +968,37 @@ _wh_headless_set_status()    { return 0; }
 _wh_headless_clear_status()  { return 0; }
 
 # -----------------------------------------------------------------------------
+# agent metadata on non-cmux hosts (#1162 G2c) — explicit, labelled unsupported
+# -----------------------------------------------------------------------------
+# Only cmux has a per-surface agent-metadata transport. Every other adapter answers
+# 20 with a generated line — a truthful `unsupported`, not parity and not a no-op
+# success (a 0 here would claim a pill that was never drawn).
+_wh_agent_meta_unsupported() {
+  local adapter="$1" verb="$2"
+  _wh_log "agent-meta $verb: UNSUPPORTED — adapter=$adapter has no agent-metadata transport (rc=20)"
+  [ "$verb" = "caps" ] && printf 'agent_meta caps=unsupported adapter=%s reason=not-implemented\n' "$adapter"
+  return 20
+}
+_wh_warp_agent_meta_caps()      { _wh_agent_meta_unsupported warp caps; }
+_wh_warp_agent_meta_set()       { _wh_agent_meta_unsupported warp set; }
+_wh_warp_agent_meta_clear()     { _wh_agent_meta_unsupported warp clear; }
+_wh_aterm_agent_meta_caps()     { _wh_agent_meta_unsupported aterm caps; }
+_wh_aterm_agent_meta_set()      { _wh_agent_meta_unsupported aterm set; }
+_wh_aterm_agent_meta_clear()    { _wh_agent_meta_unsupported aterm clear; }
+_wh_tmux_agent_meta_caps()      { _wh_agent_meta_unsupported tmux caps; }
+_wh_tmux_agent_meta_set()       { _wh_agent_meta_unsupported tmux set; }
+_wh_tmux_agent_meta_clear()     { _wh_agent_meta_unsupported tmux clear; }
+_wh_wezterm_agent_meta_caps()   { _wh_agent_meta_unsupported wezterm caps; }
+_wh_wezterm_agent_meta_set()    { _wh_agent_meta_unsupported wezterm set; }
+_wh_wezterm_agent_meta_clear()  { _wh_agent_meta_unsupported wezterm clear; }
+_wh_iterm_agent_meta_caps()     { _wh_agent_meta_unsupported iterm caps; }
+_wh_iterm_agent_meta_set()      { _wh_agent_meta_unsupported iterm set; }
+_wh_iterm_agent_meta_clear()    { _wh_agent_meta_unsupported iterm clear; }
+_wh_headless_agent_meta_caps()  { _wh_agent_meta_unsupported headless caps; }
+_wh_headless_agent_meta_set()   { _wh_agent_meta_unsupported headless set; }
+_wh_headless_agent_meta_clear() { _wh_agent_meta_unsupported headless clear; }
+
+# -----------------------------------------------------------------------------
 # D2 — single terminal adapter registry (ADR §D2, #608 Phase 3). Collapses the two
 # formerly-disjoint vocabularies — open-session.sh:detect_terminal() and _wh_adapter()
 # (G4) — into ONE ordered data table. Each row: NAME<TAB>AUTO_DETECTABLE<TAB>TIER.
@@ -1089,7 +1162,7 @@ wh_prune_orphans() {
 }
 
 # wh_set_status <host_id> <state> — push session state to the host sidebar
-# (SPEC §B). state ∈ {working,idle,disconnected}. Best-effort; always 0.
+# (SPEC §B). state ∈ {working,idle,disconnected,connected,unknown}. Best-effort; always 0.
 wh_set_status() {
   local adapter; adapter=$(_wh_adapter)
   "_wh_${adapter}_set_status" "$@"
@@ -1100,6 +1173,22 @@ wh_clear_status() {
   local adapter; adapter=$(_wh_adapter)
   "_wh_${adapter}_clear_status" "$@"
 }
+
+# wh_agent_meta_{caps,set,clear} — #1162 G2c per-surface agent metadata; see the
+# header. Forward 1:1 to the selected adapter; exit code returned verbatim. The
+# declare -F guard turns an adapter with no implementation into 20, never 127.
+_wh_agent_meta_dispatch() {
+  local verb="$1" adapter; shift
+  adapter=$(_wh_adapter)
+  if ! declare -F "_wh_${adapter}_agent_meta_${verb}" >/dev/null 2>&1; then
+    _wh_agent_meta_unsupported "$adapter" "$verb"
+    return 20
+  fi
+  "_wh_${adapter}_agent_meta_${verb}" "$@"
+}
+wh_agent_meta_caps()  { _wh_agent_meta_dispatch caps "$@"; }
+wh_agent_meta_set()   { _wh_agent_meta_dispatch set "$@"; }
+wh_agent_meta_clear() { _wh_agent_meta_dispatch clear "$@"; }
 
 # Convenience composite: lookup + close for a sid in one call.
 wh_close_for_sid() {

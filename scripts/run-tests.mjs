@@ -42,6 +42,19 @@ if (process.platform === 'darwin' || process.platform === 'linux') {
   sourceTestFiles.push('tests/packaging/native-capture.test.mjs', 'tests/packaging/orchestrator-boot-wizard.test.mjs');
   // #1177 the XRes owner supervisor fixtures signal owned POSIX children and observe them via flock.
   sourceTestFiles.push('tests/packaging/xres-owner-supervisor.test.mjs');
+  // #1162 agent-metadata chain (G2b binder/reader, G2c wh-cli transport, G3 reconciler push)
+  // runs the real bin/ + dist/ against fake cmux/seam recorders; needs POSIX modes, FIFOs and
+  // bash. support/ holds helpers and fakes.
+  sourceTestFiles.push(
+    'tests/dispatch/agent-metadata/g2b-binding.test.mjs',
+    'tests/dispatch/agent-metadata/g2c-caps-schema-unknown-pill.test.mjs',
+    'tests/dispatch/agent-metadata/g2c-host-contract.test.mjs',
+    'tests/dispatch/agent-metadata/g2c-transport.test.mjs',
+    'tests/dispatch/agent-metadata/g3-legacy-allowlist.test.mjs',
+    'tests/dispatch/agent-metadata/g3-reconciler-matrix.test.mjs',
+    'tests/dispatch/agent-metadata/g3-stage-workspace-denial.test.mjs',
+    'tests/dispatch/agent-metadata/g3-stale-fallback.test.mjs',
+  );
 }
 
 function collectTestFiles(dir) {

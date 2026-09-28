@@ -1692,6 +1692,11 @@ const wizardRelative = 'tests/packaging/orchestrator-boot-wizard.test.mjs';
 // #1177 XRes owner supervisor fixtures: POSIX-only (owned-child signals, flock liveness),
 // appended after the wizard entry and never placed on win32.
 const supervisorRelative = 'tests/packaging/xres-owner-supervisor.test.mjs';
+// #1162 agent-metadata suites: POSIX-only (modes, FIFOs, bash), appended after the XRes
+// supervisor entry in this exact order and never placed on win32.
+const agentMetadataRelatives = ['g2b-binding', 'g2c-caps-schema-unknown-pill', 'g2c-host-contract', 'g2c-transport',
+  'g3-legacy-allowlist', 'g3-reconciler-matrix', 'g3-stage-workspace-denial', 'g3-stale-fallback']
+  .map(name => `tests/dispatch/agent-metadata/${name}.test.mjs`);
 // #1179 JEV suites: explicit, platform-neutral source entries on EVERY platform, win32
 // included, in this exact order and ahead of the POSIX-only entries.
 const jevRelatives = ['pipeline-integration', 'price-table', 'r2-acceptance-delta', 'r2-before-after',
@@ -1732,6 +1737,9 @@ function callerFixture(mode, symlinked = false) {
   }
   if (mode !== 'missing-wizard') put(wizardRelative, checks + `console.log('CALLER_WIZARD_SENTINEL');\nprocess.exit(${mode === 'failing-wizard' ? 8 : 0});\n`);
   if (mode !== 'missing-supervisor') put(supervisorRelative, checks + `console.log('CALLER_SUPERVISOR_SENTINEL');\nprocess.exit(${mode === 'failing-supervisor' ? 8 : 0});\n`);
+  for (const [index, path] of agentMetadataRelatives.entries()) {
+    if (mode !== 'missing-agent-metadata' || index !== agentMetadataRelatives.length - 1) put(path, checks + `console.log('CALLER_AGENT_METADATA_SENTINEL_${index}');\nprocess.exit(${mode === 'failing-agent-metadata' && index === 0 ? 8 : 0});\n`);
+  }
   if (mode !== 'missing-harness') put(harnessRelative, checks + `console.log('CALLER_SOURCE_SENTINEL');\nprocess.exit(${mode === 'sentinel-fail' ? 9 : 0});\n`);
   put('tests/packaging/unselected.test.mjs', "console.log('CALLER_UNSELECTED_MJS'); process.exit(99);\n");
   if (symlinked) {
@@ -1757,6 +1765,8 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic] of [
   ['failing-wizard', 1, true, true, false],
   ['missing-supervisor', 1, false, false, false, /tests[\\/]packaging[\\/]xres-owner-supervisor\.test\.mjs/],
   ['failing-supervisor', 1, true, true, false],
+  ['missing-agent-metadata', 1, false, false, false, /tests[\\/]dispatch[\\/]agent-metadata[\\/]g3-stale-fallback\.test\.mjs/],
+  ['failing-agent-metadata', 1, true, true, false],
   ['missing-jev', 1, false, false, false, /tests[\\/]jev[\\/]worker-target\.test\.mjs/],
   ['failing-jev', 1, true, true, false],
   ['missing-task-advisor', 1, false, false, false, /tests[\\/]task-advisor[\\/]efficiency[\\/]t9-suspicions\.test\.mjs/],
@@ -1786,6 +1796,7 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic] of [
   assert.equal(result.stdout.includes('CALLER_NATIVE_SENTINEL'), compiled);
   assert.equal(result.stdout.includes('CALLER_WIZARD_SENTINEL'), compiled);
   assert.equal(result.stdout.includes('CALLER_SUPERVISOR_SENTINEL'), compiled);
+  for (const index of agentMetadataRelatives.keys()) assert.equal(result.stdout.includes(`CALLER_AGENT_METADATA_SENTINEL_${index}`), compiled);
   for (const index of jevRelatives.keys()) assert.equal(result.stdout.includes(`CALLER_JEV_SENTINEL_${index}`), compiled);
   for (const index of taskAdvisorRelatives.keys()) assert.equal(result.stdout.includes(`CALLER_TASK_ADVISOR_SENTINEL_${index}`), compiled);
   assert.ok(!result.stdout.includes('CALLER_UNSELECTED_MJS'), 'no automatic source .mjs discovery');
@@ -1794,6 +1805,9 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic] of [
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_NATIVE_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_WIZARD_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_SUPERVISOR_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
+  if (compiled && sentinel) for (const index of agentMetadataRelatives.keys()) {
+    assert.ok(result.stdout.indexOf(`CALLER_AGENT_METADATA_SENTINEL_${index}`) < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
+  }
   if (compiled && sentinel) for (const index of jevRelatives.keys()) {
     assert.ok(result.stdout.indexOf(`CALLER_JEV_SENTINEL_${index}`) < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   }
@@ -1871,7 +1885,7 @@ const startupError = { status: null, signal: null, error: 'synthetic ENOENT', co
 const timedOut = { status: null, signal: 'SIGKILL', error: 'synthetic ETIMEDOUT', code: 'ETIMEDOUT' };
 const callerArgv = platform => ['--test', 'dist/tests/a.test.js', 'dist/tests/nested/b.test.js', 'dist/tests/z.test.js',
   securityRelative, admissionRelative, ...jevRelatives, ...taskAdvisorRelatives,
-  ...(['linux', 'darwin'].includes(platform) ? [nativeRelative, wizardRelative, supervisorRelative] : [])];
+  ...(['linux', 'darwin'].includes(platform) ? [nativeRelative, wizardRelative, supervisorRelative, ...agentMetadataRelatives] : [])];
 const vmCases = [];
 for (const platform of ['linux', 'darwin']) {
   vmCases.push({ name: `${platform} compiled/security/admission/native success then exact harness invocation`, platform, results: [success, success], status: 0, calls: 2 });
@@ -1929,6 +1943,7 @@ const jevBlock = `sourceTestFiles.push(\n${jevRelatives.map(path => `  '${path}'
 const taskAdvisorBlock = `sourceTestFiles.push(\n${taskAdvisorRelatives.map(path => `  '${path}',\n`).join('')});\n`;
 const supervisorPosixPush = "  sourceTestFiles.push('tests/packaging/xres-owner-supervisor.test.mjs');\n";
 const posixBranchOpen = "if (process.platform === 'darwin' || process.platform === 'linux') {\n";
+const agentMetadataBlock = `  sourceTestFiles.push(\n${agentMetadataRelatives.map(path => `    '${path}',\n`).join('')}  );\n`;
 for (const [name, mutate, platforms] of [
   ['wizard entry placed on every platform, win32 included', source => replaceOnce(replaceOnce(source, wizardPosixPush, wizardPosixDropped),
     baseSourceList, "'tests/packaging/release-admission.test.mjs', 'tests/packaging/orchestrator-boot-wizard.test.mjs'];"), ['win32', 'linux', 'darwin']],
@@ -1953,6 +1968,19 @@ for (const [name, mutate, platforms] of [
     posixBranchOpen, `${supervisorPosixPush.trimStart()}${posixBranchOpen}`), ['win32', 'linux', 'darwin']],
   ['XRes supervisor suite placed on win32 only', source => replaceOnce(source, supervisorPosixPush,
     `}\nif (process.platform === 'win32') {\n${supervisorPosixPush}`), ['win32', 'linux', 'darwin']],
+  // #1162: the eight agent-metadata suites are required on POSIX, in this exact order after
+  // the XRes supervisor entry, and must never reach win32.
+  ...agentMetadataRelatives.map(path => [`agent-metadata suite ${path} missing`, source => replaceOnce(source, `    '${path}',\n`, ''),
+    ['linux', 'darwin']]),
+  ['agent-metadata suites placed on every platform, win32 included', source => replaceOnce(replaceOnce(source, agentMetadataBlock, ''),
+    posixBranchOpen, `${agentMetadataBlock.trimStart()}${posixBranchOpen}`), ['win32', 'linux', 'darwin']],
+  ['agent-metadata suites placed on win32 only', source => replaceOnce(source, agentMetadataBlock,
+    `}\nif (process.platform === 'win32') {\n${agentMetadataBlock}`), ['win32', 'linux', 'darwin']],
+  ['agent-metadata suites reordered', source => replaceOnce(source,
+    `    '${agentMetadataRelatives[0]}',\n    '${agentMetadataRelatives[1]}',\n`,
+    `    '${agentMetadataRelatives[1]}',\n    '${agentMetadataRelatives[0]}',\n`), ['linux', 'darwin']],
+  ['agent-metadata suites ahead of the XRes supervisor entry', source => replaceOnce(replaceOnce(source, agentMetadataBlock, ''),
+    supervisorPosixPush, `${agentMetadataBlock}${supervisorPosixPush}`), ['linux', 'darwin']],
 ]) for (const platform of platforms) acceptance(`caller VM negative: ${name} is rejected on ${platform}`, 'caller-vm', () => {
   const source = mutate(callerSource);
   const config = join(admin, `caller-vm-negative-${name.replace(/[^a-z0-9]+/g, '-')}-${platform}.json`);

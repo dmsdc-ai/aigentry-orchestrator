@@ -51,7 +51,9 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { registryEnvironment, registryInvocation } from "../dispatch/registry-command.js";
+import { defaultPathConfig } from "../session/persist-context.js";
 
+import { agentStatus, metaOutcome, SID_V1 } from "./agent-metadata.js";
 import { USAGE } from "./usage.js";
 
 const env = process.env;
@@ -825,11 +827,20 @@ function checkLid(live: number): void {
 
 // ── the observe→decide→act loop ─────────────────────────────────────────────
 let LIVE_DISPATCHES = 0;
+// #1162 G3: what the registry loop ALREADY read, kept for the agent-metadata push
+// so that push adds no registry query and no screen read. PROBE_BY_SID holds the
+// probeSession() output per sid; DISPATCH_BY_SID the lifecycle.state of each live
+// row; SNAPSHOT_READ_AT the epoch second the snapshot was read (read time, not
+// freshness).
+const PROBE_BY_SID = new Map<string, string>();
+const DISPATCH_BY_SID = new Map<string, string[]>();
+let SNAPSHOT_READ_AT = 0;
 
 function runRegistryLoop(act: number): void {
   // Open dispatches that are not waiting on a human. A corrupt/unavailable registry
   // fails the call, and `set -e` stopped the tick before any actuation — reproduced
   // here as an exit with the registry's own status.
+  SNAPSHOT_READ_AT = Math.max(0, Math.floor((parseIso(nowIso()) ?? new Date()).getTime() / 1000));
   const snap = registry(["list", "--live", "--fields", "assigned.sid,lifecycle.state,ref_path,re_dispatch_count"]);
   if (snap.status !== 0) process.exit(snap.status);
   let processed = 0;
@@ -841,6 +852,8 @@ function runRegistryLoop(act: number): void {
     const refPath = refRaw === "null" ? "" : refRaw ?? "";
     const rdc = rdcRaw === "null" ? "0" : rdcRaw ?? "";
     const stateJson = probeSession(sid);
+    PROBE_BY_SID.set(sid, stateJson);
+    DISPATCH_BY_SID.set(sid, [...(DISPATCH_BY_SID.get(sid) ?? []), status]);
     const actionJson = policyDecide(status, stateJson);
     appendShadowRecord(sid, status, stateJson, actionJson);
     if (act === 1 && DRY_RUN === 0) {
@@ -1154,6 +1167,105 @@ function hitlPauseGates(): string[] {
   return out;
 }
 
+/**
+ * #1162 G3 — the cost filter's view of a stage root: "absent" only for a TRUE
+ * absence (ENOENT of the root, or of sandbox-current.json inside a real
+ * directory), "present" for a directory holding a regular sandbox-current.json,
+ * and an `invalid-…` reason for everything else — a symlink (dangling or not), a
+ * non-directory root, a non-regular record (directory, FIFO, …) or any lstat
+ * error other than ENOENT (EACCES, ENOTDIR, …). lstat only: no link is followed,
+ * nothing is opened (a FIFO never blocks), created or chmodded.
+ */
+function inspectStage(stage: string): "absent" | "present" | string {
+  const look = (p: string): fs.Stats | "absent" | string => {
+    try {
+      return fs.lstatSync(p);
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException)?.code;
+      if (code === "ENOENT") return "absent";
+      return `invalid-${typeof code === "string" && /^[A-Z0-9_]{1,32}$/.test(code) ? code : "error"}`;
+    }
+  };
+  const root = look(stage);
+  if (typeof root === "string") return root;
+  if (!root.isDirectory()) return "invalid-stage-not-dir";
+  const current = look(path.join(stage, "sandbox-current.json"));
+  if (typeof current === "string") return current;
+  return current.isFile() ? "present" : "invalid-current-not-file";
+}
+
+/**
+ * #1162 G3 — refresh the cmux agent-metadata status of every live telepty sid
+ * that has a sealed staging root, through the shared adapter verbs
+ * (wh-cli.sh agent-meta-caps / agent-meta-set). Returns the session rows that
+ * MAY take the bounded legacy connection pill — an allowlist, never a
+ * fallthrough: an explicit 20 (caps or set), or a row that is not a metadata
+ * subject (no v1 sid, or a TRUE absence of the stage/sandbox-current.json:
+ * documented unknown/unsupported). 0 (applied), 10 (refused), 30, any other
+ * code, a signal, a spawn failure or an invalid stage never reach the legacy
+ * write, and a caps failure other than 20 leaves the allowlist empty for the
+ * whole tick. The §B loop further denies any workspace a non-allowlisted row
+ * shares.
+ *
+ * The adapter is the only reader of the sealed binding: inspectStage is a
+ * cost filter so a truly absent stage pays no subprocess, never a validation;
+ * an invalid stage is counted failed and gets no set call. Exit codes are never
+ * widened: 10 is a refusal (logged, and this
+ * tick neither clears, retries nor rebinds), 20 unsupported/missing binding,
+ * anything else an error. The result gates nothing else — no completion, cleanup
+ * or lifecycle decision reads it.
+ */
+function pushAgentMetadata(sessions: Array<Record<string, unknown>>): Set<Record<string, unknown>> {
+  const legacyOk = new Set<Record<string, unknown>>();
+  const capsRc = wh(["agent-meta-caps"], { out: "ignore" }).status;
+  if (capsRc !== 0) {
+    const unsupported = metaOutcome(capsRc) === "unsupported";
+    if (unsupported) for (const s of sessions) legacyOk.add(s);
+    log(
+      `agent-meta: caps rc=${capsRc} — no metadata push this tick (${unsupported ? "legacy connection pill" : "no legacy pill"})`,
+    );
+    return legacyOk;
+  }
+  let applied = 0;
+  const sessionsRoot = defaultPathConfig().sessionsRoot;
+  let noBinding = 0;
+  const refused: string[] = [];
+  const unsupported: string[] = [];
+  const failed: string[] = [];
+  for (const s of sessions) {
+    const sid = s?.id ? String(s.id) : "";
+    if (!SID_V1.test(sid)) {
+      legacyOk.add(s);
+      continue;
+    }
+    const stage = path.join(sessionsRoot, sid);
+    const inspected = inspectStage(stage);
+    if (inspected === "absent") {
+      noBinding += 1;
+      legacyOk.add(s);
+      continue;
+    }
+    if (inspected !== "present") {
+      failed.push(`${sid}:${inspected}`);
+      continue;
+    }
+    const status = agentStatus(s.healthStatus, PROBE_BY_SID.get(sid), DISPATCH_BY_SID.get(sid), SNAPSHOT_READ_AT);
+    const rc = wh(["agent-meta-set", sid, "--stage", stage, "--status-json", JSON.stringify(status)], { out: "ignore" })
+      .status;
+    const outcome = metaOutcome(rc);
+    if (outcome === "applied") applied += 1;
+    else if (outcome === "refused") refused.push(sid);
+    else if (outcome === "unsupported") {
+      unsupported.push(sid);
+      legacyOk.add(s);
+    } else failed.push(`${sid}:${rc}`);
+  }
+  log(
+    `agent-meta: applied=${applied} no_staging=${noBinding} refused=[${refused.join(",")}] unsupported=[${unsupported.join(",")}] failed=[${failed.join(",")}]`,
+  );
+  return legacyOk;
+}
+
 // ── argv ────────────────────────────────────────────────────────────────────
 let DRY_RUN = 0;
 let SHADOW = 0;
@@ -1465,18 +1577,35 @@ function main(argv: string[]): void {
   const pruneRes = wh(["prune-orphans", liveIds, protectedRefs], { err: "ignore" });
   const pruned = pruneRes.status === 0 ? chomp(pruneRes.stdout) : "0";
 
-  // §B status push — one sidebar pill per live telepty session. Conservative default
-  // (orchestrator decision 3): CONNECTED→idle, DISCONNECTED→disconnected; never emit
-  // a false "working" (no richer activity signal wired this phase — Article 1).
+  // §B status push — one sidebar pill per live telepty session. #1162 G3: only the
+  // rows pushAgentMetadata allowlists (explicit unsupported, or not a metadata
+  // subject) get the legacy pill; applied, refused and failed rows get none. The
+  // pill is workspace-wide, so a host id is DENIED when any row of this snapshot
+  // that writes it is not allowlisted — whatever the allowlisted row's sid. The
+  // key is the exact host id the loop would write; no ownership is inferred.
+  // The pill is the connection only: CONNECTED→connected, DISCONNECTED→disconnected,
+  // else unknown. CONNECTED is never idle, and never a false "working".
   let statusPushed = 0;
   if (DRY_RUN === 0) {
-    const rows = sessions
-      .filter((s) => s && s.cmuxWorkspaceId !== null && s.cmuxWorkspaceId !== undefined && s.cmuxWorkspaceId !== "")
-      .map((s) => `${String(s.cmuxWorkspaceId)}\t${String(s.healthStatus ?? s.status ?? "")}`);
-    for (const line of readLines(rows.join("\n") + (rows.length ? "\n" : ""))) {
-      const [hostId, health] = readTabFields(line, 2);
-      if (!hostId) continue;
-      wh(["set-status", hostId, health === "DISCONNECTED" ? "disconnected" : "idle"], { out: "inherit" });
+    let legacyOk = new Set<Record<string, unknown>>();
+    try {
+      legacyOk = pushAgentMetadata(sessions);
+    } catch (e) {
+      log(`ERR agent-meta ${e instanceof Error ? e.message : String(e)} (continuing, no legacy pill)`);
+    }
+    const targets: Array<{ hostId: string; health: string | undefined; ok: boolean }> = [];
+    for (const s of sessions) {
+      if (!s || s.cmuxWorkspaceId === null || s.cmuxWorkspaceId === undefined || s.cmuxWorkspaceId === "") continue;
+      for (const line of readLines(`${String(s.cmuxWorkspaceId)}\t${String(s.healthStatus ?? s.status ?? "")}\n`)) {
+        const [hostId, health] = readTabFields(line, 2);
+        if (hostId) targets.push({ hostId, health, ok: legacyOk.has(s) });
+      }
+    }
+    const denied = new Set(targets.filter((t) => !t.ok).map((t) => t.hostId));
+    for (const { hostId, health, ok } of targets) {
+      if (!ok || denied.has(hostId)) continue;
+      const pill = health === "CONNECTED" ? "connected" : health === "DISCONNECTED" ? "disconnected" : "unknown";
+      wh(["set-status", hostId, pill], { out: "inherit" });
       statusPushed += 1;
     }
   }

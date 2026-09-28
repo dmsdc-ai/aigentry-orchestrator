@@ -5,6 +5,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
+import { isCliKind, type LaunchConfig } from "./boot-adapter/types.js";
+import { normalizeLaunch } from "./boot-adapter/launch-config.js";
 
 export interface WorkerScope {
   version: 1;
@@ -27,6 +29,9 @@ export interface WorkerManifest {
   config: SandboxRuntimeConfig;
   probeFile: string;
   receipt: string;
+  // #1162 configured LaunchConfig v2, sealed by the manifest hash. Absent in
+  // older manifests: readers then report model/effort unknown.
+  launch?: LaunchConfig;
 }
 
 const identity = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
@@ -81,7 +86,7 @@ function executable(name: string): string {
   throw new Error(`SANDBOX_EXECUTABLE_MISSING: ${name}`);
 }
 
-function writePrivate(file: string, data: string): void {
+export function writePrivate(file: string, data: string): void {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   fs.writeFileSync(file, data, { mode: 0o600, flag: "wx" });
 }
@@ -126,7 +131,7 @@ function seedAuth(cli: string, home: string, cwd: string): Record<string, string
 
 export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: string,
   argv: string[], stagingRoot: string, targetCwd = roleCwd,
-  hooksDir?: string): { launcher: string; manifest: string; hash: string } {
+  hooksDir?: string, launch?: LaunchConfig): { launcher: string; manifest: string; hash: string } {
   if (!["darwin", "linux"].includes(process.platform)) throw new Error("SANDBOX_PLATFORM_UNSUPPORTED");
   if (!["claude", "codex"].includes(cli)) throw new Error(`SANDBOX_CLI_UNSUPPORTED: ${cli}`);
   if (!argv.length || path.basename(argv[0]!) !== cli) throw new Error("SANDBOX_COMMAND_BINDING");
@@ -151,6 +156,7 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   if (hooksDir) fs.chmodSync(path.join(hookCopy, "pre-push"), 0o700);
   const realCli = executable(argv[0]!);
   const runner = fileURLToPath(new URL("./worker-sandbox-runner.js", import.meta.url));
+  const binder = fileURLToPath(new URL("./worker-sandbox-bind.js", import.meta.url));
   const probeFile = path.join(root, "outside-canary.txt");
   writePrivate(probeFile, "sandbox boundary canary; not a user secret\n");
   const receipt = path.join(root, "receipt.json");
@@ -202,12 +208,17 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
     enableWeakerNetworkIsolation: false,
   };
   const m: WorkerManifest = { version: 1, task: scope.task, sid: scope.sid, attempt, cli, cwd,
-    command, env: childEnv, config, probeFile, receipt };
+    command, env: childEnv, config, probeFile, receipt,
+    ...(launch && isCliKind(cli) ? { launch: normalizeLaunch(cli, launch) } : {}) };
   const data = JSON.stringify(m, null, 2) + "\n";
   const manifest = path.join(root, "manifest.json"), hash = digest(data);
   writePrivate(manifest, data);
   const launcher = path.join(root, "launcher.sh");
-  writePrivate(launcher, `#!/usr/bin/env bash\nexec ${quote(process.execPath)} ${quote(runner)} ${quote(manifest)} ${quote(hash)}\n`);
+  // #1162 pane binding runs before the OS sandbox, as the same host process chain
+  // as the runner. Its failure only leaves metadata unsupported; the worker starts.
+  writePrivate(launcher, `#!/usr/bin/env bash\n${quote(process.execPath)} ${quote(binder)} ${quote(manifest)} ${quote(hash)} ||` +
+    ` echo "agent-meta: binding unavailable rc=$?" >&2\n` +
+    `exec ${quote(process.execPath)} ${quote(runner)} ${quote(manifest)} ${quote(hash)}\n`);
   fs.chmodSync(launcher, 0o700);
   const current = path.join(stagingRoot, "sandbox-current.json");
   const next = `${current}.${attempt}`;
@@ -259,4 +270,161 @@ export function stageWorkerRef(stagingRoot: string, sid: string, task: string, r
     writePrivate(file, body);
   }
   return file;
+}
+
+// ── #1162 sealed pane binding ───────────────────────────────────────────────
+export interface TerminalBinding {
+  v: 1;
+  sid: string;
+  task: string;
+  attempt: string;
+  manifest_hash: string;
+  workspace_id: string;
+  surface_id: string;
+  terminal_lifecycle_id: string;
+}
+
+/** missing = no sealed record or binding (unsupported); invalid = anything else. */
+export class AgentBindingError extends Error {
+  constructor(readonly code: "missing" | "invalid", message: string) {
+    super(message);
+  }
+}
+
+export const BINDING_FILE = "terminal-binding.json";
+export const BINDING_KEYS = ["v", "sid", "task", "attempt", "manifest_hash",
+  "workspace_id", "surface_id", "terminal_lifecycle_id"] as const;
+export const isUuid = (v: unknown): v is string =>
+  typeof v === "string" && /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/.test(v);
+const isHash = (v: unknown): v is string => typeof v === "string" && /^[0-9a-f]{64}$/.test(v);
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v);
+const exactKeys = (o: Record<string, unknown>, keys: readonly string[]): boolean =>
+  Object.keys(o).length === keys.length && keys.every(k => Object.prototype.hasOwnProperty.call(o, k));
+const euid = (): number => (process.geteuid ? process.geteuid() : -1);
+
+/** A real (non-symlink) directory owned by this user and not group/world accessible. */
+export function assertPrivateDir(dir: string): void {
+  let st: fs.Stats;
+  try { st = fs.lstatSync(dir); } catch { throw new AgentBindingError("invalid", "AGENT_BINDING_ROOT"); }
+  if (!st.isDirectory() || st.uid !== euid() || (st.mode & 0o077) !== 0 || fs.realpathSync(dir) !== dir) {
+    throw new AgentBindingError("invalid", "AGENT_BINDING_ROOT");
+  }
+}
+
+/**
+ * Read a private file without following a final symlink: regular, owned by this
+ * user, no group/world bits, at most `max` bytes. ENOENT is `missing` only when
+ * the caller says absence means unsupported.
+ */
+export function readPrivate(file: string, max: number, absentIsMissing = false): string {
+  let fd: number;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  } catch (e) {
+    const missing = absentIsMissing && (e as NodeJS.ErrnoException).code === "ENOENT";
+    throw new AgentBindingError(missing ? "missing" : "invalid", `AGENT_BINDING_FILE: ${path.basename(file)}`);
+  }
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.uid !== euid() || (st.mode & 0o077) !== 0 || st.size > max) {
+      throw new AgentBindingError("invalid", `AGENT_BINDING_FILE: ${path.basename(file)}`);
+    }
+    const buf = Buffer.alloc(max + 1);
+    let n = 0;
+    for (let r; n <= max && (r = fs.readSync(fd, buf, n, max + 1 - n, null)) > 0;) n += r;
+    if (n > max) throw new AgentBindingError("invalid", `AGENT_BINDING_FILE: ${path.basename(file)}`);
+    return buf.subarray(0, n).toString("utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function parseJson(raw: string, what: string): unknown {
+  try { return JSON.parse(raw); } catch { throw new AgentBindingError("invalid", `AGENT_BINDING_PARSE: ${what}`); }
+}
+
+/**
+ * The sealed manifest for `manifestFile`, verified against `hash` and its own
+ * canonical private root `<stage>/sandbox/<attempt>/`. The hash is integrity,
+ * not authority. Returns the manifest and the stage it belongs to.
+ */
+export function readSealedManifest(manifestFile: string, hash: unknown): { m: WorkerManifest; root: string; stage: string } {
+  if (!isHash(hash) || typeof manifestFile !== "string" || !path.isAbsolute(manifestFile) ||
+      path.basename(manifestFile) !== "manifest.json") {
+    throw new AgentBindingError("invalid", "AGENT_BINDING_MANIFEST_PATH");
+  }
+  const root = path.dirname(manifestFile);
+  if (path.normalize(manifestFile) !== manifestFile || !isUuid(path.basename(root)) ||
+      path.basename(path.dirname(root)) !== "sandbox") {
+    throw new AgentBindingError("invalid", "AGENT_BINDING_MANIFEST_PATH");
+  }
+  assertPrivateDir(root);
+  const raw = readPrivate(manifestFile, 1024 * 1024);
+  if (digest(raw) !== hash) throw new AgentBindingError("invalid", "SANDBOX_MANIFEST_CHANGED");
+  const m = parseJson(raw, "manifest");
+  if (!isRecord(m) || m.version !== 1 || typeof m.sid !== "string" || !identity.test(m.sid) ||
+      typeof m.task !== "string" || !m.task || m.attempt !== path.basename(root) ||
+      typeof m.cli !== "string" || m.receipt !== path.join(root, "receipt.json")) {
+    throw new AgentBindingError("invalid", "AGENT_BINDING_MANIFEST");
+  }
+  return { m: m as unknown as WorkerManifest, root, stage: path.dirname(path.dirname(root)) };
+}
+
+/** `<stage>/sandbox-current.json`, exact keys; absent = no sealed session (missing). */
+export function readSandboxCurrent(stage: string): { manifest: string; hash: string } {
+  const c = parseJson(readPrivate(path.join(stage, "sandbox-current.json"), 4096, true), "current");
+  if (!isRecord(c) || !exactKeys(c, ["manifest", "hash"]) || typeof c.manifest !== "string" || !isHash(c.hash)) {
+    throw new AgentBindingError("invalid", "AGENT_BINDING_CURRENT");
+  }
+  return { manifest: c.manifest, hash: c.hash };
+}
+
+/**
+ * #1162 G2b: the pane binding of the CURRENT sealed attempt for `sid`, plus its
+ * configured launch metadata. Every link is pinned: current → manifest (inside
+ * this stage, hash-verified) → running receipt → binding (same sid/task/attempt/
+ * hash). `expectedTask`, when given, must equal the sealed task; otherwise the
+ * task comes from the sealed manifest, never from caller state. Only typed
+ * fields are returned — no manifest env, auth or path.
+ */
+export function readSealedAgentBinding(stagingRoot: string, sid: string, expectedTask?: string):
+  { binding: TerminalBinding; launch: LaunchConfig } {
+  if (typeof stagingRoot !== "string" || !path.isAbsolute(stagingRoot) || !identity.test(sid) ||
+      (expectedTask !== undefined && !expectedTask)) {
+    throw new AgentBindingError("invalid", "AGENT_BINDING_ARGS");
+  }
+  let stage: string;
+  try { stage = fs.realpathSync(stagingRoot); } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") throw new AgentBindingError("missing", "AGENT_BINDING_STAGE");
+    throw new AgentBindingError("invalid", "AGENT_BINDING_STAGE");
+  }
+  const stageStat = fs.statSync(stage);
+  if (!stageStat.isDirectory() || stageStat.uid !== euid() || (stageStat.mode & 0o022) !== 0) {
+    throw new AgentBindingError("invalid", "AGENT_BINDING_STAGE");
+  }
+  const current = readSandboxCurrent(stage);
+  const { m, root, stage: owner } = readSealedManifest(current.manifest, current.hash);
+  if (owner !== stage) throw new AgentBindingError("invalid", "AGENT_BINDING_MANIFEST_PATH");
+  if (m.sid !== sid || (expectedTask !== undefined && m.task !== expectedTask)) {
+    throw new AgentBindingError("invalid", "AGENT_BINDING_IDENTITY");
+  }
+  const r = parseJson(readPrivate(m.receipt, 4096), "receipt");
+  if (!isRecord(r) || !exactKeys(r, ["state", "hash", "attempt", "supervisorPid", "childPid", "checkedAt"]) ||
+      r.state !== "running" || r.hash !== current.hash || r.attempt !== m.attempt) {
+    throw new AgentBindingError("invalid", "AGENT_BINDING_RECEIPT");
+  }
+  const b = parseJson(readPrivate(path.join(root, BINDING_FILE), 4096, true), "binding");
+  if (!isRecord(b) || !exactKeys(b, BINDING_KEYS) || b.v !== 1 || b.sid !== m.sid || b.task !== m.task ||
+      b.attempt !== m.attempt || b.manifest_hash !== current.hash ||
+      !isUuid(b.workspace_id) || !isUuid(b.surface_id) || !isUuid(b.terminal_lifecycle_id)) {
+    throw new AgentBindingError("invalid", "AGENT_BINDING_RECORD");
+  }
+  const binding: TerminalBinding = { v: 1, sid: m.sid, task: m.task, attempt: m.attempt,
+    manifest_hash: current.hash, workspace_id: b.workspace_id, surface_id: b.surface_id,
+    terminal_lifecycle_id: b.terminal_lifecycle_id };
+  const cli = isCliKind(m.cli) ? m.cli : null;
+  if (!cli) throw new AgentBindingError("invalid", "AGENT_BINDING_MANIFEST");
+  // Old manifests carry no launch: model/effort stay explicit unknown.
+  return { binding, launch: normalizeLaunch(cli, m.launch) };
 }

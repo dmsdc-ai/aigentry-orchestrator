@@ -60,6 +60,7 @@ wh_open()          { _t112 open "\$*"; return 0; }
 wh_clear_status()  { _t112 clear-status "\$*"; return 0; }
 wh_set_status()    { _t112 set-status "\$*"; return 0; }
 wh_prune_orphans() { _t112 prune-orphans "\$*"; echo 0; return 0; }
+wh_agent_meta_caps() { _t112 agent-meta-caps "\$*"; return 20; }
 detect_terminal()  { _t112 detect-terminal "\$*"; printf 'headless\n'; return 0; }
 EOF
 
@@ -135,6 +136,8 @@ esac
 # DRY_RUN inside the reconciler, not inside the adapter).
 grep -q '^set-status ' "$WH_LOG" \
   && fail "--dry-run pushed a sidebar status: $(cat "$WH_LOG")"
+grep -q '^agent-meta-' "$WH_LOG" \
+  && fail "--dry-run reached an agent-meta verb: $(cat "$WH_LOG")"
 
 # ── (2) an acting tick reaches the same function as DRY_RUN=0 ─────────────
 # The negative half: a port that hard-coded DRY_RUN=1 into the child env would pass
@@ -155,8 +158,15 @@ esac
 # ── (3) the sidebar push crosses the same boundary, with the mapped state ─
 # CONNECTED→idle, DISCONNECTED→disconnected (orchestrator decision 3: never emit a
 # false "working"). Same door, so a broken export would show up here too.
+# #1162 G3: CONNECTED is a connection, never idle. The recorder host answers
+# agent-meta-caps 20 (unsupported), so every sid keeps the bounded legacy pill, and
+# the caps probe crosses the same boundary with the acting tick's DRY_RUN=0.
+grep -q 'set-status .*args=WS-UP connected' "$WH_LOG" \
+  || fail "the CONNECTED session's pill was not pushed as connected: $(cat "$WH_LOG")"
 grep -q 'set-status .*args=WS-UP idle' "$WH_LOG" \
-  || fail "the CONNECTED session's pill was not pushed as idle: $(cat "$WH_LOG")"
+  && fail "CONNECTED was pushed as idle (#1162 forbids it): $(cat "$WH_LOG")"
+grep -q '^agent-meta-caps DRY_RUN=0 ' "$WH_LOG" \
+  || fail "agent-meta-caps did not cross the adapter boundary on the acting tick: $(cat "$WH_LOG")"
 grep -q 'set-status .*args=WS-DOWN disconnected' "$WH_LOG" \
   || fail "the DISCONNECTED session's pill was not pushed as disconnected: $(cat "$WH_LOG")"
 grep -q "status_pushed=2" "$RUN_LOG" \
