@@ -1697,6 +1697,12 @@ const supervisorRelative = 'tests/packaging/xres-owner-supervisor.test.mjs';
 const jevRelatives = ['pipeline-integration', 'price-table', 'r2-acceptance-delta', 'r2-before-after',
   'refusal-path-constant', 'request-contract', 'reserve', 'response-contract', 'worker-target']
   .map(name => `tests/jev/${name}.test.mjs`);
+// #1185 task-advisor efficiency suites: explicit, platform-neutral source entries on EVERY
+// platform, win32 included, in this exact order, after JEV and ahead of the POSIX-only entries.
+const taskAdvisorRelatives = ['t1-schema', 't10-r3-state-latency', 't11-r4-numeric', 't2-decoder',
+  't3-dedup-gap-time', 't4-grants-binding', 't5-detectors', 't6-suppression-outcome', 't7-bounds',
+  't8-r2-focused', 't9-suspicions']
+  .map(name => `tests/task-advisor/efficiency/${name}.test.mjs`);
 function callerFixture(mode, symlinked = false) {
   const directory = mkdtempSync(join(admin, 'caller fixture '));
   const put = (path, source) => {
@@ -1720,6 +1726,9 @@ function callerFixture(mode, symlinked = false) {
   if (mode !== 'missing-native') put(nativeRelative, checks + `console.log('CALLER_NATIVE_SENTINEL');\nprocess.exit(${mode === 'failing-native' ? 8 : 0});\n`);
   for (const [index, path] of jevRelatives.entries()) {
     if (mode !== 'missing-jev' || index !== jevRelatives.length - 1) put(path, checks + `console.log('CALLER_JEV_SENTINEL_${index}');\nprocess.exit(${mode === 'failing-jev' && index === 0 ? 8 : 0});\n`);
+  }
+  for (const [index, path] of taskAdvisorRelatives.entries()) {
+    if (mode !== 'missing-task-advisor' || index !== taskAdvisorRelatives.length - 1) put(path, checks + `console.log('CALLER_TASK_ADVISOR_SENTINEL_${index}');\nprocess.exit(${mode === 'failing-task-advisor' && index === 0 ? 8 : 0});\n`);
   }
   if (mode !== 'missing-wizard') put(wizardRelative, checks + `console.log('CALLER_WIZARD_SENTINEL');\nprocess.exit(${mode === 'failing-wizard' ? 8 : 0});\n`);
   if (mode !== 'missing-supervisor') put(supervisorRelative, checks + `console.log('CALLER_SUPERVISOR_SENTINEL');\nprocess.exit(${mode === 'failing-supervisor' ? 8 : 0});\n`);
@@ -1750,6 +1759,8 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic] of [
   ['failing-supervisor', 1, true, true, false],
   ['missing-jev', 1, false, false, false, /tests[\\/]jev[\\/]worker-target\.test\.mjs/],
   ['failing-jev', 1, true, true, false],
+  ['missing-task-advisor', 1, false, false, false, /tests[\\/]task-advisor[\\/]efficiency[\\/]t9-suspicions\.test\.mjs/],
+  ['failing-task-advisor', 1, true, true, false],
   ['missing-harness', 1, true, true, false, /POSIX control harness failed with exit status: 1/],
   ['empty', 1, false, false, false, /No compiled test files found/],
   ['missing-dist', 1, false, false, false, /Failed to enumerate compiled tests/],
@@ -1776,6 +1787,7 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic] of [
   assert.equal(result.stdout.includes('CALLER_WIZARD_SENTINEL'), compiled);
   assert.equal(result.stdout.includes('CALLER_SUPERVISOR_SENTINEL'), compiled);
   for (const index of jevRelatives.keys()) assert.equal(result.stdout.includes(`CALLER_JEV_SENTINEL_${index}`), compiled);
+  for (const index of taskAdvisorRelatives.keys()) assert.equal(result.stdout.includes(`CALLER_TASK_ADVISOR_SENTINEL_${index}`), compiled);
   assert.ok(!result.stdout.includes('CALLER_UNSELECTED_MJS'), 'no automatic source .mjs discovery');
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_COMPILED_CONTROL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (security && sentinel) assert.ok(result.stdout.indexOf('CALLER_SECURITY_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
@@ -1784,6 +1796,9 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic] of [
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_SUPERVISOR_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (compiled && sentinel) for (const index of jevRelatives.keys()) {
     assert.ok(result.stdout.indexOf(`CALLER_JEV_SENTINEL_${index}`) < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
+  }
+  if (compiled && sentinel) for (const index of taskAdvisorRelatives.keys()) {
+    assert.ok(result.stdout.indexOf(`CALLER_TASK_ADVISOR_SENTINEL_${index}`) < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   }
   if (diagnostic) assert.match(result.stderr, diagnostic);
 });
@@ -1855,7 +1870,7 @@ const signaled = { status: null, signal: 'SIGTERM' };
 const startupError = { status: null, signal: null, error: 'synthetic ENOENT', code: 'ENOENT' };
 const timedOut = { status: null, signal: 'SIGKILL', error: 'synthetic ETIMEDOUT', code: 'ETIMEDOUT' };
 const callerArgv = platform => ['--test', 'dist/tests/a.test.js', 'dist/tests/nested/b.test.js', 'dist/tests/z.test.js',
-  securityRelative, admissionRelative, ...jevRelatives,
+  securityRelative, admissionRelative, ...jevRelatives, ...taskAdvisorRelatives,
   ...(['linux', 'darwin'].includes(platform) ? [nativeRelative, wizardRelative, supervisorRelative] : [])];
 const vmCases = [];
 for (const platform of ['linux', 'darwin']) {
@@ -1911,6 +1926,7 @@ const wizardPosixPush = "sourceTestFiles.push('tests/packaging/native-capture.te
 const wizardPosixDropped = "sourceTestFiles.push('tests/packaging/native-capture.test.mjs');";
 const baseSourceList = "'tests/packaging/release-admission.test.mjs'];";
 const jevBlock = `sourceTestFiles.push(\n${jevRelatives.map(path => `  '${path}',\n`).join('')});\n`;
+const taskAdvisorBlock = `sourceTestFiles.push(\n${taskAdvisorRelatives.map(path => `  '${path}',\n`).join('')});\n`;
 const supervisorPosixPush = "  sourceTestFiles.push('tests/packaging/xres-owner-supervisor.test.mjs');\n";
 const posixBranchOpen = "if (process.platform === 'darwin' || process.platform === 'linux') {\n";
 for (const [name, mutate, platforms] of [
@@ -1925,6 +1941,12 @@ for (const [name, mutate, platforms] of [
     ['win32', 'linux', 'darwin']]),
   ['JEV suites wired POSIX-only', source => replaceOnce(replaceOnce(source, jevBlock, ''), wizardPosixPush,
     `${wizardPosixPush}\n  ${jevBlock.trimEnd()}`), ['win32', 'linux', 'darwin']],
+  // #1185: every task-advisor efficiency suite is required on every platform, and the block
+  // must not be wired POSIX-only (which would silently drop all eleven from win32).
+  ...taskAdvisorRelatives.map(path => [`task-advisor suite ${path} missing`, source => replaceOnce(source, `  '${path}',\n`, ''),
+    ['win32', 'linux', 'darwin']]),
+  ['task-advisor suites wired POSIX-only', source => replaceOnce(replaceOnce(source, taskAdvisorBlock, ''), wizardPosixPush,
+    `${wizardPosixPush}\n  ${taskAdvisorBlock.trimEnd()}`), ['win32', 'linux', 'darwin']],
   // #1177: the XRes supervisor suite is required on POSIX and must never reach win32.
   ['XRes supervisor suite missing', source => replaceOnce(source, supervisorPosixPush, ''), ['linux', 'darwin']],
   ['XRes supervisor suite placed on every platform, win32 included', source => replaceOnce(replaceOnce(source, supervisorPosixPush, ''),
