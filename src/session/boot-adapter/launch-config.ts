@@ -57,7 +57,7 @@ function normalizeValue(raw: unknown, re: RegExp): LaunchValue {
   if (typeof value !== "string" || typeof source !== "string") return UNKNOWN;
   if (source === "cli-default") return value === "unknown" ? Object.freeze({ value, source }) : UNKNOWN;
   if (source === "unknown") return UNKNOWN;
-  if (source !== "default" && !ENV_SOURCE_RE.test(source)) return UNKNOWN;
+  if (source !== "default" && source !== "wizard" && !ENV_SOURCE_RE.test(source)) return UNKNOWN;
   if (!re.test(value)) return UNKNOWN;
   return Object.freeze({ value, source: source as LaunchSource });
 }

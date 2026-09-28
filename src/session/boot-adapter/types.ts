@@ -15,9 +15,10 @@ export function isCliKind(v: unknown): v is CliKind {
 
 // #1162 LaunchConfig v2: the configured model/effort the adapter actually put on
 // argv. `value` is a bounded label or "unknown"; `source` names where it came
-// from (`env:<AIGENTRY_* name>`, aigentry `default`, `cli-default` = no flag so
-// the CLI decides, or `unknown`). Configured, never provider-observed.
-export type LaunchSource = `env:AIGENTRY_${string}` | "default" | "cli-default" | "unknown";
+// from (`env:<AIGENTRY_* name>`, aigentry `default`, `wizard` = chosen in the
+// controller boot wizard, `cli-default` = no flag so the CLI decides, or
+// `unknown`). Configured, never provider-observed. Adapters never emit `wizard`.
+export type LaunchSource = `env:AIGENTRY_${string}` | "default" | "wizard" | "cli-default" | "unknown";
 export interface LaunchValue {
   readonly value: string;
   readonly source: LaunchSource;

@@ -160,6 +160,8 @@ import {
   planEnvLines,
 } from "./plan.js";
 import { runWizard } from "./wizard.js";
+// #1162 — the display-only controller boot record. Written once, from main() only.
+import { type PlanSource, controllerRecordRoot, writeControllerBootRecord } from "./boot-record.js";
 
 const env = process.env;
 
@@ -749,11 +751,18 @@ function emitExecArgv(argv: readonly string[]): void {
 // ── plan resolution ─────────────────────────────────────────────────────────
 // What a resolved boot looks like to the rest of this file: the argv to hand back, the
 // SELECTED cli (what the capture validator must measure), the sid the guard and the reconcile
-// must act on, and the plan itself for the review and the dry-run report.
-type Resolution = { readonly argv: readonly string[]; readonly cli: string; readonly sid: string; readonly plan: BootPlan };
+// must act on, the plan itself for the review and the dry-run report, and which door the plan
+// came through (#1162: provenance for the display-only boot record, nothing else).
+type Resolution = {
+  readonly argv: readonly string[];
+  readonly cli: string;
+  readonly sid: string;
+  readonly plan: BootPlan;
+  readonly planSource: PlanSource;
+};
 
-function resolutionOf(plan: BootPlan): Resolution {
-  return { argv: buildExecArgv(plan), cli: plan.provider.key, sid: plan.sid, plan };
+function resolutionOf(plan: BootPlan, planSource: PlanSource): Resolution {
+  return { argv: buildExecArgv(plan), cli: plan.provider.key, sid: plan.sid, plan, planSource };
 }
 
 /**
@@ -796,7 +805,7 @@ function resolveWithoutPrompting(): Resolution {
     ]);
   const result = parseEnvPlan(env, process.cwd());
   if (!result.ok) refusePlan(result.errors);
-  return resolutionOf(result.plan);
+  return resolutionOf(result.plan, "env-plan");
 }
 
 /**
@@ -817,7 +826,7 @@ async function resolveForBoot(): Promise<Resolution> {
     // stdout is empty and the shim cannot exec.
     process.exit(1);
   }
-  return resolutionOf(outcome.plan);
+  return resolutionOf(outcome.plan, "wizard");
 }
 
 async function validateCapture(cli: string): Promise<void> {
@@ -895,6 +904,24 @@ async function main(): Promise<never> {
   // ORCHESTRATOR_SID *is* the plan's sid field.
   orchestratorRegistryReconcile(resolved.sid);
   orchestratorSingletonGuard(resolved.sid);
+  // #1162 — DISPLAY-ONLY boot record (boot-record.ts), after every guard and before the argv.
+  // Best effort and never authority: it cannot exit, never writes fd 1, makes no host or network
+  // call, and changes neither the argv nor the exit code. Its one stderr line is fixed vocabulary.
+  let bootRecord: string;
+  try {
+    const r = writeControllerBootRecord(controllerRecordRoot(env), {
+      sid: resolved.sid,
+      planSource: resolved.planSource,
+      cli: resolved.cli,
+      model: resolved.plan.model,
+      effort: resolved.plan.effort,
+      env,
+    });
+    bootRecord = `${r.outcome} relation=${r.relation}`;
+  } catch {
+    bootRecord = "skipped:error relation=none";
+  }
+  writeOut(2, `[orchestrator-boot] boot record: ${bootRecord}\n`);
   log(`exec ${resolved.argv.join(" ")}`);
   emitExecArgv(resolved.argv);
   process.exit(0);

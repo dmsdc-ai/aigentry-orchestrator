@@ -148,6 +148,13 @@ for _f in $BOOT_MODULE_FILES; do
     || { echo "FAIL[T131]: the compiled module is incomplete — $_f is missing from $REPO_ROOT/dist/src/orchestrator-boot (run tsc -p .)" >&2; exit 1; }
   cp "$REPO_ROOT/dist/src/orchestrator-boot/$_f" "$BOOT_FIXTURE/dist/src/orchestrator-boot/"
 done
+# #1162: cli.js imports ./boot-record.js, which imports two boot-adapter modules. Same loud rule.
+for _f in orchestrator-boot/boot-record.js session/boot-adapter/launch-config.js session/boot-adapter/types.js; do
+  [ -f "$REPO_ROOT/dist/src/$_f" ] \
+    || { echo "FAIL[T131]: the compiled module is incomplete — $_f is missing from $REPO_ROOT/dist/src (run tsc -p .)" >&2; exit 1; }
+  mkdir -p "$BOOT_FIXTURE/dist/src/$(dirname "$_f")"
+  cp "$REPO_ROOT/dist/src/$_f" "$BOOT_FIXTURE/dist/src/$_f"
+done
 printf '{"type":"module"}\n' > "$BOOT_FIXTURE/package.json"
 AUTH_LOG="$T_TMP/auth.log"
 printf 'telepty_auth_token() { printf "auth\\n" >> "%s"; printf "fixture-token-T131"; }\n' "$AUTH_LOG" \
@@ -338,6 +345,15 @@ grep -qw "$runner" "$KILL_LOG" \
   && fail "N: THE PROCESS RUNNING THE BOOT WAS KILLED — #539. kills: $(cat "$KILL_LOG")"
 grep -q 'skip self/ancestor bridge pid=1111' "$N_ERR" || fail "N: synthetic ancestor was not skipped"
 [ -s "$EXEC_LOG" ] || fail "N: the boot never reached the exec"
+# #1162: exactly one fixed-vocabulary boot-record line. The fixture ROOT has no sessions/,
+# so the display-only writer must skip without creating anything.
+if [ "$ORIGINAL" != "1" ]; then
+  [ "$(grep -c '^\[orchestrator-boot\] boot record: ' "$N_ERR")" = "1" ] \
+    || fail "N: expected exactly one boot-record line; stderr: $(cat "$N_ERR")"
+  grep -qx '\[orchestrator-boot\] boot record: skipped:unsafe-path relation=none' "$N_ERR" \
+    || fail "N: boot-record line is not the fixed skipped:unsafe-path record; stderr: $(cat "$N_ERR")"
+  [ ! -e "$BOOT_FIXTURE/home/sessions" ] || fail "N: the boot record created sessions/ under the fixture ROOT"
+fi
 
 # ===========================================================================
 # O) the reconcile runs BEFORE the process guard. #905's fix is a pre-flight: a

@@ -99,6 +99,13 @@ for _f in $BOOT_MODULE_FILES; do
     || { echo "FAIL[T134]: the compiled module is incomplete — $_f is missing from $REPO_ROOT/dist/src/orchestrator-boot (run tsc -p .)" >&2; exit 1; }
   cp "$REPO_ROOT/dist/src/orchestrator-boot/$_f" "$BOOT_FIXTURE/dist/src/orchestrator-boot/"
 done
+# #1162: cli.js imports ./boot-record.js, which imports two boot-adapter modules. Same loud rule.
+for _f in orchestrator-boot/boot-record.js session/boot-adapter/launch-config.js session/boot-adapter/types.js; do
+  [ -f "$REPO_ROOT/dist/src/$_f" ] \
+    || { echo "FAIL[T134]: the compiled module is incomplete — $_f is missing from $REPO_ROOT/dist/src (run tsc -p .)" >&2; exit 1; }
+  mkdir -p "$BOOT_FIXTURE/dist/src/$(dirname "$_f")"
+  cp "$REPO_ROOT/dist/src/$_f" "$BOOT_FIXTURE/dist/src/$_f"
+done
 printf '{"type":"module"}\n' > "$BOOT_FIXTURE/package.json"
 AUTH_LOG="$T_TMP/auth.log"
 printf 'telepty_auth_token() { printf "auth\\n" >> "%s"; printf "fixture-token-T134"; }\n' "$AUTH_LOG" \
@@ -345,6 +352,12 @@ grep -q 'fixture-token-T134' "$T_TMP/normal.out" "$T_TMP/normal.err" && fail "D:
 printf '%s\n' telepty allow --id "$SID" --auto-restart "${PLAN_TAIL_ARGV[@]}" \
   > "$T_TMP/normal.expected"
 cmp "$T_TMP/normal.expected" "$T_TMP/normal.out" || fail "D: normal boot stdout is not exact argv"
+# #1162: exactly one fixed-vocabulary boot-record line on the normal boot (fixture ROOT has no sessions/).
+[ "$(grep -c '^\[orchestrator-boot\] boot record: ' "$T_TMP/normal.err")" = "1" ] \
+  || fail "D: expected exactly one boot-record line; stderr: $(cat "$T_TMP/normal.err")"
+grep -qx '\[orchestrator-boot\] boot record: skipped:unsafe-path relation=none' "$T_TMP/normal.err" \
+  || fail "D: boot-record line is not the fixed skipped:unsafe-path record; stderr: $(cat "$T_TMP/normal.err")"
+[ ! -e "$BOOT_FIXTURE/home/sessions" ] || fail "D: the boot record created sessions/ under the fixture ROOT"
 REAL_KILLS="$T_TMP/real-kills.txt"
 sed 's/^-9 //' "$KILL_LOG" | sort -u > "$REAL_KILLS"
 [ "$(cat "$REAL_KILLS")" = "7777" ] \
