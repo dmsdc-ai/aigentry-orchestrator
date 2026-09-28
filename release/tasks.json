@@ -112,7 +112,7 @@
     },
     {
       "id": 1177,
-      "release_component": "public-interface-proposal"
+      "release_component": "integrated-control-center"
     },
     {
       "id": 1178,
@@ -125,6 +125,22 @@
     {
       "id": 1181,
       "release_component": "interactive-orchestrator-boot"
+    },
+    {
+      "id": 1182,
+      "release_component": "control-center-command-plane"
+    },
+    {
+      "id": 1183,
+      "release_component": "registry-archive-cutover"
+    },
+    {
+      "id": 1184,
+      "release_component": "control-center-ui"
+    },
+    {
+      "id": 1185,
+      "release_component": "workflow-efficiency-advisor"
     }
   ]
 }

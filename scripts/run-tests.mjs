@@ -20,6 +20,22 @@ sourceTestFiles.push(
   'tests/jev/response-contract.test.mjs',
   'tests/jev/worker-target.test.mjs',
 );
+// #1185 — task-advisor efficiency core suites import the real tsc output under dist/src/task-advisor
+// (no fixture fallback) and are platform-neutral, so they run on every OS, win32 included.
+// helpers.mjs, purity-child.mjs and cap-fixture-measure.mjs are helpers.
+sourceTestFiles.push(
+  'tests/task-advisor/efficiency/t1-schema.test.mjs',
+  'tests/task-advisor/efficiency/t10-r3-state-latency.test.mjs',
+  'tests/task-advisor/efficiency/t11-r4-numeric.test.mjs',
+  'tests/task-advisor/efficiency/t2-decoder.test.mjs',
+  'tests/task-advisor/efficiency/t3-dedup-gap-time.test.mjs',
+  'tests/task-advisor/efficiency/t4-grants-binding.test.mjs',
+  'tests/task-advisor/efficiency/t5-detectors.test.mjs',
+  'tests/task-advisor/efficiency/t6-suppression-outcome.test.mjs',
+  'tests/task-advisor/efficiency/t7-bounds.test.mjs',
+  'tests/task-advisor/efficiency/t8-r2-focused.test.mjs',
+  'tests/task-advisor/efficiency/t9-suspicions.test.mjs',
+);
 // Native capture fixtures require POSIX ownership/modes and the boot wizard suite drives an
 // owned POSIX PTY; Windows support is still absent for both.
 if (process.platform === 'darwin' || process.platform === 'linux') {
