@@ -4,7 +4,10 @@
 // Every stdout line, every stderr line, every exit code, the holds.log record shape,
 // the test-report bytes and all three children's argv are the shell script's,
 // preserved deliberately — see tests/dispatch/T124, which is re-runnable against the
-// ORIGINAL bash and passes there too.
+// ORIGINAL bash and passes there too. EXCEPT the report arm since #1170: it no longer
+// calls the scheduler or writes the cleanup_scheduled_from_legacy_report_envelope
+// observation, and its stdout says "observation only, no cleanup scheduled" instead of
+// "scheduler armed". See armReport().
 //
 // WHAT THIS FILE IS FOR. Five inject kinds arrive here from worker sessions over the
 // PTY channel and each one actuates something: a Layer-D cleanup is armed or deferred,
@@ -416,23 +419,18 @@ function armReport(sidOverride: string, transport: Transport): void {
     "--field", `transport=${transport}`, "--field", "outcome_protocol=unavailable",
     "--field", "reason=stage_b_deferred_to_0.9.0",
   ]);
-  // Layer-D cleanup still arms off this envelope: dropping it would end automatic
-  // worker retirement fleet-wide. It IS an inference, so it is written down with its
-  // basis — when #816/#817 land and Stage B replaces this path, whoever does that work
-  // can see exactly what was inferred.
-  registryObserve([
-    "observe", "--sid", sid,
-    "--kind", "cleanup_scheduled_from_legacy_report_envelope",
-    "--field", "basis=legacy_report_envelope",
-  ]);
-  schedulerCall(["schedule", sid, "--grace-seconds", "60", "--source", "legacy-report-envelope"]);
+  // #1170: a textual REPORT is observation only, NEVER cleanup authority — not even
+  // when the body's sid matches --sid, because nothing authenticates either one. The
+  // Layer-D schedule call and its cleanup_scheduled_from_legacy_report_envelope
+  // observation were removed: a whole unsubstituted template plus any --sid armed a
+  // 60s retirement of that sid. Cleanup stays with the controller's guarded lifecycle.
   emitTelemetry([
     "--helper", "report", "--subtype", "report",
     "--payload-json", `{"target_sid":"${sid}","transport":"${transport}"}`,
     "--correlation-id", sid,
   ]);
   console.log(
-    `[inject-handler] report kind=report sid=${sid} transport=${transport} — recorded as an observation; outcome_protocol_unavailable (0.8.0 has no terminal outcome); scheduler armed`,
+    `[inject-handler] report kind=report sid=${sid} transport=${transport} — recorded as an observation; outcome_protocol_unavailable (0.8.0 has no terminal outcome); observation only, no cleanup scheduled`,
   );
 }
 

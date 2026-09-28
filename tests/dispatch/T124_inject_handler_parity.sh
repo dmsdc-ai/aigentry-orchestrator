@@ -63,6 +63,12 @@
 #      cleanup-pending.json, ~/.telepty/config.json. Same shape as the comms-auditor
 #      D1 thread_id traversal (tranche 4). The port refuses a session_id that is not a
 #      single safe path segment.
+#   E  #1170 — the report arm is observation only: the port makes no scheduler call,
+#      writes no cleanup_scheduled_from_legacy_report_envelope observation and prints
+#      "observation only, no cleanup scheduled" instead of "scheduler armed"; its
+#      `--help` `report` line (block A) was rewritten to match. So blocks A-I minus E
+#      pass against both implementations, and E and A's report line branch on
+#      INJECT_PARITY_ORIGINAL like J-M.
 #
 # Hermetic: the temp state dir from lib.sh, recorder stubs for all three children
 # (scheduler, registry, telemetry), and a canary tree outside TEST_REPORTS_DIR that
@@ -170,6 +176,11 @@ esac
 case "$OUT" in *"#   inject-handler.sh --body-file body.txt"*)
   fail "A: --help gained the --body-file usage line — sed -n '2,20p' stopped before it";; esac
 t_assert_contains <(printf '%s' "$OUT") "#   test-report     → write state/test-reports/<YYYY-MM-DD>/<session_id>.json (R5a)"
+if [ "$ORIGINAL" = "1" ]; then
+  t_assert_contains <(printf '%s' "$OUT") "#   report          → nonterminal observation + Layer-D cleanup schedule."
+else
+  t_assert_contains <(printf '%s' "$OUT") "#   report          → nonterminal observation only; never schedules cleanup."
+fi
 run -h
 want_rc 0 "A -h"
 [ -n "$OUT" ] || fail "A: -h printed nothing"
@@ -192,15 +203,22 @@ want_rc 1 "D report without --sid"
 want_err "inject-handler: --sid required for REPORT envelopes" "D"
 no_sched "D: a sid-less report armed Layer D anyway"
 
-# ── E. the report arm: two observations, an armed cleanup, one telemetry emission ──
+# ── E. DEVIATION #1170 — the report arm: observation + telemetry; original also armed cleanup ──
 run --sid sid-A --body-file "$(body report 'REPORT: sid-A-DONE | files=bin/x.sh | build=green')"
 want_rc 0 "E report"
-want_out "[inject-handler] report kind=report sid=sid-A transport=markdown-fallback — recorded as an observation; outcome_protocol_unavailable (0.8.0 has no terminal outcome); scheduler armed" "E"
 grep -qxF "observe --sid sid-A --kind legacy_report_envelope_observed --field transport=markdown-fallback --field outcome_protocol=unavailable --field reason=stage_b_deferred_to_0.9.0" "$REG_LOG" \
   || { cat "$REG_LOG" >&2; fail "E: the nonterminal observation argv changed"; }
-grep -qxF "observe --sid sid-A --kind cleanup_scheduled_from_legacy_report_envelope --field basis=legacy_report_envelope" "$REG_LOG" \
-  || { cat "$REG_LOG" >&2; fail "E: the D1-condition basis observation argv changed"; }
-want_sched "schedule sid-A --grace-seconds 60 --source legacy-report-envelope" "E: the Layer-D arm's argv changed"
+if [ "$ORIGINAL" = "1" ]; then
+  want_out "[inject-handler] report kind=report sid=sid-A transport=markdown-fallback — recorded as an observation; outcome_protocol_unavailable (0.8.0 has no terminal outcome); scheduler armed" "E original"
+  grep -qxF "observe --sid sid-A --kind cleanup_scheduled_from_legacy_report_envelope --field basis=legacy_report_envelope" "$REG_LOG" \
+    || { cat "$REG_LOG" >&2; fail "E original: the D1-condition basis observation argv changed"; }
+  want_sched "schedule sid-A --grace-seconds 60 --source legacy-report-envelope" "E original: the Layer-D arm's argv changed"
+else
+  want_out "[inject-handler] report kind=report sid=sid-A transport=markdown-fallback — recorded as an observation; outcome_protocol_unavailable (0.8.0 has no terminal outcome); observation only, no cleanup scheduled" "E port"
+  [ "$(wc -l < "$REG_LOG" | tr -d ' ')" = 1 ] \
+    || { cat "$REG_LOG" >&2; fail "E port: the report arm wrote more than the one legacy observation"; }
+  no_sched "E port: a textual REPORT reached Layer D (#1170: observation only)"
+fi
 grep -qxF -e '--helper report --subtype report --payload-json {"target_sid":"sid-A","transport":"markdown-fallback"} --correlation-id sid-A' "$EMIT_LOG" \
   || { cat "$EMIT_LOG" >&2; fail "E: the report telemetry argv changed"; }
 
