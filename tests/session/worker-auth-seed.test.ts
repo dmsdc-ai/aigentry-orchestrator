@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import vm from "node:vm";
+import { inspect } from "node:util";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
@@ -56,6 +57,24 @@ const ERASED = ts.transpileModule(
   { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None, isolatedModules: true } },
 ).outputText;
 const PROGRAM = `${ERASED}\n;({ seedAuth, writePrivate });`;
+// `writePrivate` carries the `export` modifier in the source, so transpileModule emits the
+// CommonJS form (`exports.writePrivate = writePrivate`). The declaration bytes stay exact;
+// each evaluation instead gets its own context-owned `exports` object to receive that
+// assignment, and the tests below pin what lands there.
+const EXPECTED_EXPORTS = ["writePrivate"];
+
+interface Decls {
+  seedAuth: (cli: string, home: string, cwd: string) => Record<string, string>;
+  writePrivate: (file: string, data: string) => void;
+}
+
+/** Evaluates PROGRAM in a fresh context holding only `globals` plus its own `exports` sink. */
+function load(globals: Record<string, unknown>): Decls & { exports: Record<string, unknown> } {
+  const sink: Record<string, unknown> = {};
+  const ctx = vm.createContext({ ...globals, exports: sink });
+  const decls = vm.runInContext(PROGRAM, ctx, { filename: "extracted-worker-sandbox-decls.js" }) as Decls;
+  return { seedAuth: decls.seedAuth, writePrivate: decls.writePrivate, exports: sink };
+}
 
 // ---- fakes ---------------------------------------------------------------
 const HOST_HOME = "/fake/host-home";                 // stands in for os.homedir()
@@ -179,13 +198,10 @@ function runSeed(opts: RunOpts) {
     }
     return opts.keychain;
   };
-  const ctx = vm.createContext({
+  const { seedAuth } = load({
     fs: ffs.api, path: fakePath, os: { homedir: () => HOST_HOME },
     process: { platform: "darwin", env: opts.env ?? {} }, execFileSync,
   });
-  const { seedAuth } = vm.runInContext(PROGRAM, ctx, { filename: "extracted-worker-sandbox-decls.js" }) as {
-    seedAuth: (cli: string, home: string, cwd: string) => Record<string, string>;
-  };
   let threw: Error | null = null;
   let env: Record<string, string> | null = null;
   try { env = seedAuth(cli, home, CWD); } catch (e) { threw = e as Error; }
@@ -246,6 +262,9 @@ test("malformed JSON refuses with the stable code and never leaks the sentinel",
   assert.ok(!text.includes(SENTINEL), "synthetic credential sentinel leaked into the error");
   assert.ok(!text.includes(HOST_CRED), "source path leaked into the error");
   assert.ok(!text.includes("JSON"), "parser cause leaked into the error");
+  assert.equal(Object.prototype.hasOwnProperty.call(r.threw, "cause"), false, "the refusal must not attach a cause");
+  assert.ok(!inspect(r.threw, { depth: 10, showHidden: true }).includes(SENTINEL),
+    "synthetic credential sentinel reachable from the error object");
 });
 
 test("a keychain source with no material is refused before any write", () => {
@@ -364,4 +383,31 @@ test("the candidate declarations contain no destructive or host-directed fs call
   for (const m of ["unlinkSync", "rmSync", "rmdirSync", "truncateSync", "renameSync", "copyFileSync", "chmodSync", "openSync"]) {
     assert.ok(!new RegExp(`\\bfs\\.${m}\\b`).test(both), `unexpected destructive call fs.${m}`);
   }
+});
+
+// ---- evaluation shape ----------------------------------------------------
+test("the erased declarations need a context-owned exports object and publish exactly writePrivate", () => {
+  assert.throws(() => vm.runInContext(PROGRAM, vm.createContext({})), (e: Error) =>
+    e.name === "ReferenceError" && /\bexports is not defined\b/.test(e.message),
+    "without the sink the CommonJS export assignment must fail, not be silently absorbed");
+  const d = load({});
+  assert.deepEqual(Object.keys(d.exports), EXPECTED_EXPORTS, "export surface of the extracted declarations");
+  assert.equal(typeof d.writePrivate, "function");
+  assert.equal(typeof d.seedAuth, "function");
+  assert.equal(d.exports.writePrivate, d.writePrivate, "the export is the evaluated declaration itself");
+  assert.equal((d.exports.writePrivate as Decls["writePrivate"]).name, "writePrivate");
+  assert.equal(Object.prototype.hasOwnProperty.call(d.exports, "seedAuth"), false, "seedAuth stays module-private");
+  assert.notEqual(load({}).exports, load({}).exports, "each evaluation gets its own exports sink");
+});
+
+test("the exported writePrivate keeps 0700 recursive mkdir, 0600 wx write and no overwrite", () => {
+  const ffs = makeFakeFs({});
+  const d = load({ fs: ffs.api, path: fakePath });
+  const write = d.exports.writePrivate as Decls["writePrivate"];
+  const file = `${WORKER}/export/.claude/.credentials.json`;
+  write(file, F.both);
+  assert.deepEqual(ffs.mkdirs, [{ p: `${WORKER}/export/.claude`, mode: 0o700, recursive: true }]);
+  assert.deepEqual(ffs.writes, [{ p: file, data: F.both, mode: 0o600, flag: "wx" }]);
+  assert.throws(() => write(file, F.accessOnly), /EEXIST/);
+  assert.equal(ffs.files.get(file), F.both, "wx must leave the first bytes in place");
 });

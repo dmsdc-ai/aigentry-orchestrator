@@ -99,9 +99,20 @@ fs.writeFileSync(manifest.receipt, JSON.stringify({ hash: current.hash, attempt:
     COUNTER: join(root, "counter"), PROMPT_LOG: join(root, "prompt"), CLASSIFIER_ARGS: join(root, "classifier-args"),
     PARENT_MODEL_LOG: join(root, "parent-model"),
     CLASSIFIER_REPLY: '{"label":"gpt-6-astra","reason":"implementation","confidence":0.9}',
-    CLASSIFIER_EXIT: "0", CLASSIFIER_HANG: "0", OPEN_LOG: join(root, "open.json"), TELEMETRY_LOG: join(root, "telemetry.jsonl") };
-  for (const command of ["apply_patch", "ps", "kill", "pkill", "killall", "launchctl", "open", "osascript", "cmux", "tmux", "curl", "wget", "ssh", "npm", "npx", "srt"])
+    CLASSIFIER_EXIT: "0", CLASSIFIER_HANG: "0", OPEN_LOG: join(root, "open.json"), TELEMETRY_LOG: join(root, "telemetry.jsonl"),
+    CMUX_CAPS_LOG: join(root, "cmux-caps.log") };
+  for (const command of ["apply_patch", "ps", "kill", "pkill", "killall", "launchctl", "open", "osascript", "tmux", "curl", "wget", "ssh", "npm", "npx", "srt"])
     script(command, "require('node:fs').appendFileSync(process.env.WORK_LOG, 'forbidden\\n'); process.exit(99)");
+  // #1162: a spawned dispatch publishes agent metadata once (wh-cli agent-meta-set), and the cmux
+  // adapter first asks `cmux capabilities`. Only that exact argv is answered: recorded in
+  // CMUX_CAPS_LOG, with a valid reply that advertises no methods, so the adapter reports
+  // unsupported (rc 20) and never reaches `rpc`. Every other cmux argv still trips WORK_LOG.
+  script("cmux", `
+if (process.argv.length === 3 && process.argv[2] === 'capabilities') {
+  require('node:fs').appendFileSync(process.env.CMUX_CAPS_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');
+  console.log(JSON.stringify({ protocol: 'cmux-socket', version: 2, methods: [] }));
+} else { require('node:fs').appendFileSync(process.env.WORK_LOG, 'forbidden\\n'); process.exit(99); }
+`);
   script("git", "process.exit(1)");
   if (process.platform !== "win32") script("node", "const r = require('node:child_process').spawnSync(process.execPath, process.argv.slice(2), {stdio:'inherit'}); process.exit(r.status ?? 99)");
   env.REPORT_TARGET_SH = script("report-target", "console.log('fixture-orchestrator')");
