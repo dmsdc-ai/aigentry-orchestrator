@@ -284,9 +284,30 @@ export interface TerminalBinding {
   terminal_lifecycle_id: string;
 }
 
-/** missing = no sealed record or binding (unsupported); invalid = anything else. */
+/**
+ * The exact tuple a caller captured once and expects to still address: a stale-write
+ * guard for display metadata, never an identity or kill authority. All four fields,
+ * because a rebinding keeps attempt/hash but replaces surface/lifecycle.
+ */
+export interface BindingPin {
+  attempt: string;
+  manifest_hash: string;
+  surface_id: string;
+  terminal_lifecycle_id: string;
+}
+
+/** Process ids from the validated running receipt: snapshot corroboration only. */
+export interface BindingOwner {
+  supervisor_pid: number;
+  child_pid: number;
+}
+
+/**
+ * missing = no sealed record or binding (unsupported); drift = a valid chain that
+ * no longer matches the caller's pin; invalid = anything else.
+ */
 export class AgentBindingError extends Error {
-  constructor(readonly code: "missing" | "invalid", message: string) {
+  constructor(readonly code: "missing" | "invalid" | "drift", message: string) {
     super(message);
   }
 }
@@ -387,11 +408,19 @@ export function readSandboxCurrent(stage: string): { manifest: string; hash: str
  * hash). `expectedTask`, when given, must equal the sealed task; otherwise the
  * task comes from the sealed manifest, never from caller state. Only typed
  * fields are returned — no manifest env, auth or path.
+ *
+ * `opts.expect`: after the whole chain validates, all four pinned fields must
+ * equal it, else `drift`. `opts.withOwner`: also return the running receipt's
+ * supervisor/child pids (distinct safe integers > 1). Neither changes the default.
  */
-export function readSealedAgentBinding(stagingRoot: string, sid: string, expectedTask?: string):
-  { binding: TerminalBinding; launch: LaunchConfig } {
+export function readSealedAgentBinding(stagingRoot: string, sid: string, expectedTask?: string,
+  opts: { expect?: BindingPin; withOwner?: boolean } = {}):
+  { binding: TerminalBinding; launch: LaunchConfig; owner?: BindingOwner } {
+  const pin = opts.expect;
   if (typeof stagingRoot !== "string" || !path.isAbsolute(stagingRoot) || !identity.test(sid) ||
-      (expectedTask !== undefined && !expectedTask)) {
+      (expectedTask !== undefined && !expectedTask) ||
+      (pin !== undefined && (!isUuid(pin.attempt) || !isHash(pin.manifest_hash) ||
+        !isUuid(pin.surface_id) || !isUuid(pin.terminal_lifecycle_id)))) {
     throw new AgentBindingError("invalid", "AGENT_BINDING_ARGS");
   }
   let stage: string;
@@ -425,6 +454,16 @@ export function readSealedAgentBinding(stagingRoot: string, sid: string, expecte
     terminal_lifecycle_id: b.terminal_lifecycle_id };
   const cli = isCliKind(m.cli) ? m.cli : null;
   if (!cli) throw new AgentBindingError("invalid", "AGENT_BINDING_MANIFEST");
+  if (pin !== undefined && (pin.attempt !== binding.attempt || pin.manifest_hash !== binding.manifest_hash ||
+      pin.surface_id !== binding.surface_id || pin.terminal_lifecycle_id !== binding.terminal_lifecycle_id)) {
+    throw new AgentBindingError("drift", "AGENT_BINDING_DRIFT");
+  }
   // Old manifests carry no launch: model/effort stay explicit unknown.
-  return { binding, launch: normalizeLaunch(cli, m.launch) };
+  const launch = normalizeLaunch(cli, m.launch);
+  if (!opts.withOwner) return { binding, launch };
+  const pid = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v > 1;
+  if (!pid(r.supervisorPid) || !pid(r.childPid) || r.supervisorPid === r.childPid) {
+    throw new AgentBindingError("invalid", "AGENT_BINDING_RECEIPT");
+  }
+  return { binding, launch, owner: { supervisor_pid: r.supervisorPid, child_pid: r.childPid } };
 }

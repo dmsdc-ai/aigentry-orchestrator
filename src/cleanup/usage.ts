@@ -13,6 +13,8 @@ export const USAGE = `# session-cleanup.sh — Actually remove orchestrator-spaw
 #   2. cmux close-workspace (best-effort, harmless if cmux unavailable).
 #   3. DELETE /api/sessions/<sid> on local daemon (force-remove from registry —
 #      handles the edge case where parent kill alone did not propagate).
+#   Before step 1 (#1162, display-only): clear the pane's agent metadata, pinned to
+#      the sealed binding captured before the listing; any doubt skips it, never the teardown.
 #
 # Discovered 2026-05-17: prior version of this script only attempted cmux close +
 # advisory "telepty#17 pending" emit, which left 21 wrapped sessions accumulated

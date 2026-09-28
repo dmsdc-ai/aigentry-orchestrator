@@ -50,6 +50,7 @@ if (process.platform === 'darwin' || process.platform === 'linux') {
     'tests/dispatch/agent-metadata/g2b-binding.test.mjs',
     'tests/dispatch/agent-metadata/g2c-caps-schema-unknown-pill.test.mjs',
     'tests/dispatch/agent-metadata/g2c-host-contract.test.mjs',
+    'tests/dispatch/agent-metadata/g2c-pinned-clear.test.mjs',
     'tests/dispatch/agent-metadata/g2c-transport.test.mjs',
     'tests/dispatch/agent-metadata/g3-legacy-allowlist.test.mjs',
     'tests/dispatch/agent-metadata/g3-reconciler-matrix.test.mjs',

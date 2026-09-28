@@ -60,6 +60,9 @@
 #   wh_agent_meta_caps
 #   wh_agent_meta_set <sid> --stage <abs_staging_root> --status-json <json>
 #   wh_agent_meta_clear <sid> --stage <abs_staging_root>
+#       [--expect-attempt <uuid> --expect-hash <hex64> --expect-surface <uuid>
+#        --expect-lifecycle <uuid>]   optional exact pin, all four or none; a
+#       sealed binding that no longer matches it is 10 (binding-drift), no RPC.
 #       Exit: 0 applied/cleared/absent (caps: supported), 10 ownership/lifecycle
 #       refusal, 20 unsupported host/capability/binding, 30 parse/transport/invalid.
 #       Callers log non-zero and never gate a spawn on it.

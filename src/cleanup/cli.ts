@@ -39,6 +39,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { registryAvailable, registryEnvironment, registryInvocation } from "../dispatch/registry-command.js";
+import { defaultPathConfig } from "../session/persist-context.js";
 
 import { USAGE } from "./usage.js";
 
@@ -70,6 +71,8 @@ const DISPATCH_REGISTRY_PY = env.DISPATCH_REGISTRY_PY || path.join(SCRIPT_DIR, "
 const WH_CLI = path.join(SCRIPT_DIR, "wh-cli.sh");
 const TELEPTY_AUTH_SH = path.join(SCRIPT_DIR, "lib/telepty-auth.sh");
 const TELEPTY_LISTING_SH = path.join(SCRIPT_DIR, "lib/telepty-listing.sh");
+// #1162 G2b sealed reader, compiled next to this file (dist/src/session/).
+const AGENT_BINDING_JS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "session", "agent-binding.js");
 
 // ── small process helpers (the tracker's, unchanged) ────────────────────────
 /** bash `$(cmd)`: command substitution strips every trailing newline. */
@@ -323,12 +326,13 @@ function listing(): Array<Record<string, unknown>> {
   return Array.isArray(parsed) ? (parsed as Array<Record<string, unknown>>) : [];
 }
 
-/** session_info <sid> → the record's JSON (empty string if not in telepty list). */
-function sessionInfo(sid: string): string {
-  for (const s of listing()) {
-    if (s && s.id === sid) return JSON.stringify(s);
-  }
-  return "";
+/**
+ * Every listing row for <sid>, from ONE listing. rows[0] is exactly the legacy
+ * session_info record (JSON'd by the caller; empty when absent). #1162: the rest
+ * are kept only so a duplicate can deny the pinned metadata clear.
+ */
+function sessionRows(sid: string): Array<Record<string, unknown>> {
+  return listing().filter((s) => s && s.id === sid);
 }
 
 /** disconnected_sids → DISCONNECTED sessions, excluding PROTECTED. */
@@ -429,9 +433,14 @@ function selfAncestry(snap: string): string[] {
  * the tower.
  */
 function pidIsSelfOrAncestor(pid: string): boolean {
+  return selfOrAncestorIn(psSnapshot(), pid);
+}
+
+/** pidIsSelfOrAncestor against a snapshot the caller already holds (#1162). */
+function selfOrAncestorIn(snap: string, pid: string): boolean {
   if (!pid) return false;
   if (/[^0-9]/.test(pid)) return false; // numeric pids only
-  if (selfAncestry(psSnapshot()).includes(pid)) return true;
+  if (selfAncestry(snap).includes(pid)) return true;
   // `${bridge_pids//,/ }` then word-splitting: commas AND whitespace separate.
   for (const bp of (env.ORCHESTRATOR_BRIDGE_PIDS || "").split(/[,\s]+/)) {
     if (bp && pid === bp) return true;
@@ -555,6 +564,104 @@ function registryCleaned(sid: string): void {
   runQuiet(lifecycle.cmd, lifecycle.args, registryEnvironment());
 }
 
+// ── #1162 pinned agent-metadata clear (display-only) ────────────────────────
+// A fixed tuple captured ONCE before the listing, corroborated against the listed
+// owner in ONE ps snapshot, then handed to the adapter as an exact pin that it
+// revalidates before its RPC. It is never kill/close/DELETE authority, and no
+// outcome here changes closeOk, the DELETE, registryCleaned or the exit status.
+const SID_V1 = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+const UUID_RE = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
+const HASH_RE = /^[0-9a-f]{64}$/;
+const BINDING_KEYS = ["v", "sid", "task", "attempt", "manifest_hash", "workspace_id", "surface_id", "terminal_lifecycle_id"];
+
+interface MetaCapture {
+  stage: string;
+  attempt: string;
+  hash: string;
+  surface: string;
+  lifecycle: string;
+  supervisor: number;
+  child: number;
+}
+
+const plainObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+const exactKeys = (o: Record<string, unknown>, keys: readonly string[]): boolean =>
+  Object.keys(o).length === keys.length && keys.every((k) => Object.prototype.hasOwnProperty.call(o, k));
+const safePid = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v > 1;
+
+/** The sealed binding + running owner of <sid>, or the reason it could not be captured. Never throws. */
+function captureAgentBinding(sid: string): MetaCapture | string {
+  try {
+    if (!SID_V1.test(sid)) return "invalid-sid";
+    if (!fs.existsSync(AGENT_BINDING_JS)) return "reader-missing";
+    const stage = path.join(defaultPathConfig().sessionsRoot, sid);
+    const r = spawnSync(process.execPath, [AGENT_BINDING_JS, "--stage", stage, "--sid", sid, "--with-owner"], {
+      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10000, maxBuffer: 1 << 20,
+    });
+    if (r.error) return (r.error as NodeJS.ErrnoException).code === "ETIMEDOUT" ? "capture-timeout" : "capture-failed";
+    if (r.status === 20) return "binding-missing";
+    if (r.status !== 0) return "binding-invalid";
+    let out: unknown;
+    try { out = JSON.parse(r.stdout ?? ""); } catch { return "capture-invalid"; }
+    if (!plainObject(out) || !exactKeys(out, ["binding", "launch", "owner"])) return "capture-invalid";
+    const b = out.binding, o = out.owner;
+    if (!plainObject(b) || !exactKeys(b, BINDING_KEYS) || b.v !== 1 || b.sid !== sid ||
+        typeof b.manifest_hash !== "string" || !HASH_RE.test(b.manifest_hash) ||
+        typeof b.attempt !== "string" || !UUID_RE.test(b.attempt) ||
+        typeof b.surface_id !== "string" || !UUID_RE.test(b.surface_id) ||
+        typeof b.terminal_lifecycle_id !== "string" || !UUID_RE.test(b.terminal_lifecycle_id) ||
+        !plainObject(o) || !exactKeys(o, ["supervisor_pid", "child_pid"]) ||
+        !safePid(o.supervisor_pid) || !safePid(o.child_pid) || o.supervisor_pid === o.child_pid) {
+      return "capture-invalid";
+    }
+    return { stage, attempt: b.attempt, hash: b.manifest_hash, surface: b.surface_id,
+      lifecycle: b.terminal_lifecycle_id, supervisor: o.supervisor_pid, child: o.child_pid };
+  } catch {
+    return "capture-failed";
+  }
+}
+
+/** The one reason the pinned clear may not run, or "" when it may. */
+function metaClearVeto(rows: Array<Record<string, unknown>>, cap: MetaCapture | string): string {
+  if (rows.length > 1) return "listing-duplicate";
+  if (typeof cap === "string") return cap;
+  const owner = rows[0]?.ownerPid;
+  if (owner === undefined || owner === null) return "owner-missing";
+  if (!safePid(owner)) return "owner-malformed";
+  // ONE snapshot for every identity and for the self/ancestor guard. Rows whose
+  // first two fields are not decimal (the header, garbage) are not identities.
+  const snap = psSnapshot();
+  const ppids = new Map<number, number[]>();
+  for (const row of snap.split("\n")) {
+    const [p, pp] = fields(row);
+    if (p === undefined || pp === undefined || !/^[0-9]+$/.test(p) || !/^[0-9]+$/.test(pp)) continue;
+    ppids.set(Number(p), [...(ppids.get(Number(p)) ?? []), Number(pp)]);
+  }
+  for (const pid of [owner, cap.supervisor, cap.child]) {
+    const n = ppids.get(pid)?.length ?? 0;
+    if (n === 0) return "ps-missing";
+    if (n > 1) return "ps-duplicate";
+  }
+  if (ppids.get(cap.supervisor)![0] !== owner || ppids.get(cap.child)![0] !== cap.supervisor) return "owner-mismatch";
+  if ([owner, cap.supervisor, cap.child].some((pid) => selfOrAncestorIn(snap, String(pid)))) return "self-or-ancestor";
+  return "";
+}
+
+/** Log-only: the exact captured pin goes through the existing wh-cli door; its rc changes nothing else. */
+function clearAgentMetaPinned(sid: string, rows: Array<Record<string, unknown>>, cap: MetaCapture | string): void {
+  let veto: string;
+  try { veto = metaClearVeto(rows, cap); } catch { veto = "check-failed"; }
+  if (veto || typeof cap === "string") {
+    log(`agent-meta clear skipped: ${sid} (${veto || "capture-failed"})`);
+    return;
+  }
+  const r = wh(["agent-meta-clear", sid, "--stage", cap.stage, "--expect-attempt", cap.attempt,
+    "--expect-hash", cap.hash, "--expect-surface", cap.surface, "--expect-lifecycle", cap.lifecycle]);
+  const done = r.status === 0 ? /^agent_meta clear=(cleared|absent)\n$/.exec(r.stdout) : null;
+  if (done) log(`agent-meta clear: ${sid} (${done[1]})`);
+  else log(`agent-meta clear not applied: ${sid} rc=${r.status}`);
+}
+
 /**
  * 0 on success (including the idempotent no-op), 1 on the Rule 28 protected
  * refusal, and 1 on an observed non-zero workspace-host close (#1162).
@@ -573,7 +680,10 @@ function cleanupOne(sid: string, force: boolean): number {
     err(`refusing to clean protected session '${PROTECTED_SID}' (pass --force to override)`);
     return 1;
   }
-  const info = sessionInfo(sid);
+  // #1162: capture strictly BEFORE the one listing; its failure is only a skip reason.
+  const cap = captureAgentBinding(sid);
+  const rows = sessionRows(sid);
+  const info = rows[0] ? JSON.stringify(rows[0]) : "";
   if (!info) {
     // telepty-orphan: gone from telepty but the terminal surface may still be
     // alive (idle worker deregistered → cmux workspace lingers, #323/#340). Step 4
@@ -581,6 +691,8 @@ function cleanupOne(sid: string, force: boolean): number {
     // here, so close BY SID (close-for-sid) — closeWorkspaceFor(sid, "") would
     // silent-no-op. DELETE backup still runs to drop any registry residue.
     log(`session not in telepty list: ${sid} (already cleaned or never registered); closing terminal surface by sid`);
+    // #1162: no observed session, so no owner to corroborate — never a metadata clear.
+    log(`agent-meta clear skipped: ${sid} (no-observed-session)`);
     // #1162: this arm DID attempt a close, so bind its status exactly as the
     // normal arm binds the closeWorkspaceFor result — discarding it reported a
     // success the adapter never gave. captureBoth rather than wh because the
@@ -603,6 +715,8 @@ function cleanupOne(sid: string, force: boolean): number {
     registryCleaned(sid);
     return 0;
   }
+  // #1162 — pinned, display-only metadata clear BEFORE the legacy kill (log-only).
+  clearAgentMetaPinned(sid, rows, cap);
   // Step 1 — kill parent (load-bearing; auto-deregisters most cases)
   killParentTeleptyAllow(sid);
   // Step 2 — workspace host close via adapter seam (best-effort)

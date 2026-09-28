@@ -9,7 +9,8 @@
 // Exit contract (controller interface lock, #1162):
 //   0  applied / cleared / absent (caps: supported)
 //   10 ownership/lifecycle refusal — surface_gone, stale_lifecycle,
-//      owned_by_other_sid, stale_attempt, lifecycle_cleared
+//      owned_by_other_sid, stale_attempt, lifecycle_cleared; and binding-drift when a
+//      pinned `clear` (all four --expect-* flags) no longer matches the sealed binding
 //   20 unsupported: cmux missing, capability missing (unpatched cmux, NO V1
 //      fallback), agent binding missing
 //   30 parse/transport/invalid input, invalid_params, any unknown host answer
@@ -147,9 +148,20 @@ function rpc(method: string, params: Record<string, unknown>): Record<string, un
 interface Binding {
   readonly sid: string;
   readonly attempt: string;
+  readonly manifest_hash: string;
   readonly surface_id: string;
   readonly terminal_lifecycle_id: string;
 }
+
+/** The exact tuple a `clear` caller captured (all four --expect-* flags). */
+interface Pin {
+  readonly attempt: string;
+  readonly manifest_hash: string;
+  readonly surface_id: string;
+  readonly terminal_lifecycle_id: string;
+}
+
+const EXPECT_FLAGS = ["--expect-attempt", "--expect-hash", "--expect-surface", "--expect-lifecycle"] as const;
 
 const BINDING_KEYS = [
   "v", "sid", "task", "attempt", "manifest_hash", "workspace_id", "surface_id", "terminal_lifecycle_id",
@@ -159,10 +171,16 @@ const BINDING_KEYS = [
  * `node agent-binding.js --stage ROOT --sid SID` — task omitted, so the reader takes
  * it from the verified sealed manifest (hash, receipt and attempt checks are the
  * reader's). Its output is still re-validated here: this side trusts shape only.
+ * With a pin, the reader compares all four fields after validating the chain
+ * (rc 10 → binding-drift), and they are compared again here on the parsed output.
  */
-function readBinding(stage: string, sid: string): { binding: Binding; launch: LaunchConfig } {
+function readBinding(stage: string, sid: string, pin?: Pin): { binding: Binding; launch: LaunchConfig } {
   if (!fs.existsSync(BINDING_READER)) throw new Failure(20, "binding-reader-missing");
-  const r = spawnSync(process.execPath, [BINDING_READER, "--stage", stage, "--sid", sid], {
+  const pinArgs = pin
+    ? ["--expect-attempt", pin.attempt, "--expect-hash", pin.manifest_hash,
+      "--expect-surface", pin.surface_id, "--expect-lifecycle", pin.terminal_lifecycle_id]
+    : [];
+  const r = spawnSync(process.execPath, [BINDING_READER, "--stage", stage, "--sid", sid, ...pinArgs], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
     timeout: HOST_TIMEOUT_MS,
@@ -170,6 +188,7 @@ function readBinding(stage: string, sid: string): { binding: Binding; launch: La
   });
   if (r.error || r.status === null) throw new Failure(30, "binding-reader-failed");
   if (r.status === 20) throw new Failure(20, "binding-missing");
+  if (r.status === 10 && pin) throw new Failure(10, "binding-drift");
   if (r.status !== 0) throw new Failure(30, "binding-invalid");
   const out = parseJson(r.stdout, "binding-invalid");
   if (!isPlainObject(out) || !hasExactKeys(out, ["binding", "launch"])) throw new Failure(30, "binding-invalid");
@@ -186,10 +205,17 @@ function readBinding(stage: string, sid: string): { binding: Binding; launch: La
   }
   const raw = out.launch;
   if (!isPlainObject(raw) || !isCliKind(raw.cli)) throw new Failure(30, "binding-invalid");
+  if (
+    pin && (b.attempt !== pin.attempt || b.manifest_hash !== pin.manifest_hash ||
+      b.surface_id !== pin.surface_id || b.terminal_lifecycle_id !== pin.terminal_lifecycle_id)
+  ) {
+    throw new Failure(10, "binding-drift");
+  }
   return {
     binding: {
       sid,
       attempt: b.attempt as string,
+      manifest_hash: b.manifest_hash as string,
       surface_id: b.surface_id as string,
       terminal_lifecycle_id: b.terminal_lifecycle_id as string,
     },
@@ -231,17 +257,27 @@ function configured(v: LaunchValue): [string, "configured" | "unknown"] {
 }
 
 // ── argv ────────────────────────────────────────────────────────────────────
-function parseArgs(args: readonly string[], flags: readonly string[]): { sid: string; opts: Map<string, string> } {
+/** `group`: optional flags that must appear all together or not at all. */
+function parseArgs(
+  args: readonly string[],
+  flags: readonly string[],
+  group: readonly string[] = [],
+): { sid: string; opts: Map<string, string> } {
   const [sid, ...rest] = args;
   if (sid === undefined || !SID_RE.test(sid)) throw new Failure(30, "bad-args");
   const opts = new Map<string, string>();
   for (let i = 0; i < rest.length; i += 2) {
     const flag = rest[i] as string;
     const value = rest[i + 1];
-    if (!flags.includes(flag) || opts.has(flag) || value === undefined) throw new Failure(30, "bad-args");
+    if ((!flags.includes(flag) && !group.includes(flag)) || opts.has(flag) || value === undefined) {
+      throw new Failure(30, "bad-args");
+    }
     opts.set(flag, value);
   }
-  if (opts.size !== flags.length) throw new Failure(30, "bad-args");
+  const grouped = group.filter((f) => opts.has(f)).length;
+  if (opts.size !== flags.length + grouped || (grouped !== 0 && grouped !== group.length)) {
+    throw new Failure(30, "bad-args");
+  }
   const stage = opts.get("--stage") as string;
   if (!path.isAbsolute(stage) || stage.includes("\0") || path.normalize(stage) !== stage || stage.endsWith("/")) {
     throw new Failure(30, "bad-args");
@@ -289,9 +325,21 @@ function main(argv: readonly string[]): number {
         return 0;
       }
       case "clear": {
-        const { sid, opts } = parseArgs(args, ["--stage"]);
+        const { sid, opts } = parseArgs(args, ["--stage"], EXPECT_FLAGS);
+        // The optional pin is validated before any cmux call; malformed → 30.
+        let pin: Pin | undefined;
+        if (opts.has("--expect-attempt")) {
+          const attempt = opts.get("--expect-attempt") as string;
+          const manifestHash = opts.get("--expect-hash") as string;
+          const surface = opts.get("--expect-surface") as string;
+          const lifecycle = opts.get("--expect-lifecycle") as string;
+          if (![attempt, surface, lifecycle].every((u) => UUID_RE.test(u)) || !HASH_RE.test(manifestHash)) {
+            throw new Failure(30, "bad-args");
+          }
+          pin = { attempt, manifest_hash: manifestHash, surface_id: surface, terminal_lifecycle_id: lifecycle };
+        }
         requireCapabilities();
-        const { binding } = readBinding(opts.get("--stage") as string, sid);
+        const { binding } = readBinding(opts.get("--stage") as string, sid, pin);
         const result = rpc(CLEAR_METHOD, {
           surface_id: binding.surface_id,
           terminal_lifecycle_id: binding.terminal_lifecycle_id,

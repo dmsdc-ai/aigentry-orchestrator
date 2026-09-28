@@ -42,6 +42,8 @@
 #   agent-meta-set <sid> --stage <root>      one result line     0 applied, 10 refused,
 #     --status-json <json>                                         20 unsupported, 30 invalid/transport
 #   agent-meta-clear <sid> --stage <root>    one result line     0 cleared|absent, 10/20/30 as above
+#     [--expect-attempt <uuid> --expect-hash <hex64>                (optional pin, all four or none:
+#      --expect-surface <uuid> --expect-lifecycle <uuid>]           10 binding-drift, 30 malformed)
 #
 # The three agent-meta verbs are #1162 G2c (controller interface lock), forwarded 1:1
 # to wh_agent_meta_{caps,set,clear} like every other arm.
@@ -96,6 +98,9 @@ matching shell function with the same exit code and the same stdout.
                                           set cli/model/effort/status for the
                                           sealed binding (10=refused, 20, 30)
   agent-meta-clear <sid> --stage <root>   clear it (10=refused, 20, 30)
+    [--expect-attempt <uuid> --expect-hash <hex64> --expect-surface <uuid>
+     --expect-lifecycle <uuid>]            optional exact pin, all four or none
+                                          (10=binding drift, 30=partial/malformed)
 
 Adapter selection is unchanged: AIGENTRY_WORKSPACE_HOST forces one, else auto.
 EOF
