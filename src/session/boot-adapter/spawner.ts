@@ -48,11 +48,38 @@ export function nodeSpawner(): Spawner {
           clearTimeout(t);
           reject(Object.assign(e, { code: "ENOENT" }));
         });
-        child.on("close", (code) => {
+        // #1162: stdin pipe errors (EPIPE when the child closed its read end) must
+        // never crash the parent. A non-empty payload counts as delivered only once
+        // its write callback succeeds; a failed delivery rejects with the real error.
+        let stdinErr: Error | undefined;
+        let stdinPending = false;
+        let closed: { code: number | null } | undefined;
+        const finish = (code: number | null) => {
           clearTimeout(t);
-          resolve({ stdout: out, stderr: err, exit_code: code ?? -1, duration_ms: Date.now() - start });
+          if (stdinErr) reject(stdinErr);
+          else resolve({ stdout: out, stderr: err, exit_code: code ?? -1, duration_ms: Date.now() - start });
+        };
+        child.on("close", (code) => {
+          if (stdinPending) { closed = { code }; return; }
+          finish(code);
         });
-        if (stdin !== undefined) { child.stdin?.write(stdin); child.stdin?.end(); }
+        if (stdin !== undefined && child.stdin) {
+          const peerClosed = (e: NodeJS.ErrnoException) => e.code === "EPIPE" || e.code === "ECONNRESET";
+          child.stdin.on("error", (e: NodeJS.ErrnoException) => {
+            // Nothing left undelivered (empty payload / already flushed): EOF to a gone reader is moot.
+            if (!stdinPending && peerClosed(e)) return;
+            stdinErr ??= e;
+          });
+          if (stdin.length > 0) {
+            stdinPending = true;
+            child.stdin.write(stdin, (e) => {
+              stdinPending = false;
+              if (e) stdinErr ??= e;
+              if (closed) finish(closed.code);
+            });
+          }
+          child.stdin.end();
+        }
       });
     },
     async probeVersion(exe) {
