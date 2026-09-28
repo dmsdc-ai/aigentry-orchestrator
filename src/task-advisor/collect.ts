@@ -1,5 +1,5 @@
 import {
-  type CollectedRecordV1, type CollectorConfigV1, type Coverage, type EfficiencyResult, type SourceKind,
+  type AdvisorEventV1, type CollectedRecordV1, type CollectorConfigV1, type Coverage, type EfficiencyResult, type EscalationFieldsV1, type SourceKind,
   SOURCE_KINDS, isId, metadataId, parseIsoMs, parseUtc, validateCollectorConfigV1, validateEscalationV1, validateEventV1,
 } from './efficiency-contracts.js';
 
@@ -173,6 +173,111 @@ function decodeObject(text: string): Record<string, unknown> | null {
 }
 
 // ---------------------------------------------------------------------------
+// ONE bounded line framer + line decoder, shared by collectWindow (stateful) and decodeWindowV1 (stateless).
+// The framer's partial-line tail is a transient private copy; only collectWindow's state ever carries it out.
+type DecodedLineV1 = { type: 'event'; timeMs: number; event: AdvisorEventV1 }
+  | { type: 'escalation'; timeMs: number; fields: EscalationFieldsV1 };
+/** One complete line → whitelisted typed fields, or null after counting why it was dropped. */
+function decodeLine(bytes: Uint8Array, sourceKind: SourceKind, decoder: { decode(input: Uint8Array): string }, counters: CollectorCountersV1,
+  observedMs: number, futureSkewMs: number): DecodedLineV1 | null {
+  let end = bytes.byteLength;
+  if (end > 0 && bytes[end - 1] === 13) end--;
+  let text: string;
+  try { text = decoder.decode(bytes.subarray(0, end)); } catch { counters.malformed++; return null; }
+  if (text.trim().length === 0) { counters.emptyLines++; return null; }
+  const object = decodeObject(text);
+  if (object === null) { counters.malformed++; return null; }
+  let line: DecodedLineV1;
+  if (sourceKind === 'advisor-spool-v1') {
+    const checked = validateEventV1(object);
+    if (!checked.ok) {
+      if (checked.reason.code === 'unknown-field') counters.unknownField++;
+      else if (checked.reason.code === 'unknown-version') counters.unknownVersion++;
+      else counters.invalidValue++;
+      return null;
+    }
+    line = { type: 'event', timeMs: parseIsoMs(checked.value.at)!, event: checked.value };
+  } else {
+    const checked = validateEscalationV1(object);
+    if (!checked.ok) {
+      if (checked.reason.code === 'unknown-field') counters.unknownField++; else counters.invalidValue++;
+      return null;
+    }
+    line = { type: 'escalation', timeMs: parseUtc(checked.value.ts)!, fields: checked.value };
+  }
+  if (line.timeMs > observedMs + futureSkewMs) { counters.clockSkew++; return null; }
+  return line;
+}
+function stampTime(watermark: number | null, timeMs: number, lateToleranceMs: number, counters: CollectorCountersV1): { late: boolean; watermark: number } {
+  const late = watermark !== null && timeMs < watermark - lateToleranceMs;
+  if (late) counters.late++;
+  return { late, watermark: watermark === null ? timeMs : Math.max(watermark, timeMs) };
+}
+function recordOf(line: DecodedLineV1, sourceId: string, generation: number, lineStart: number, observedAt: string,
+  late: boolean, possibleDuplicate: boolean): CollectedRecordV1 {
+  const base = { sourceId, generation, lineStart, observedAt, provenance: 'not-established' as const };
+  if (line.type === 'event') {
+    return { type: 'event', recordId: line.event.eventId, ...base, sourceKind: 'advisor-spool-v1', timeBasis: 'producer-clock', late, event: line.event };
+  }
+  const { sid, ts, rc } = line.fields;
+  return { type: 'escalation', recordId: metadataId(['verify-escalations-v1', sourceId, generation, lineStart]),
+    ...base, sourceKind: 'verify-escalations-v1', timeBasis: 'producer-clock', late, possibleDuplicate, sid, ts, rc };
+}
+interface FrameV1 { cursor: number; tail: Uint8Array | null; tailStart: number | null; skipping: boolean }
+/** Split contiguous chunks into complete lines under the byte/record caps; `onLine` gets each complete line. */
+function frame(chunks: readonly Uint8Array[], config: CollectorConfigV1, counters: CollectorCountersV1, start: FrameV1,
+  onLine: (line: Uint8Array, lineStart: number) => void): FrameV1 & { windowBytes: number; stopped: boolean } {
+  let { cursor, tail, tailStart, skipping } = start;
+  let windowBytes = 0, stopped = false;
+  for (const chunk of chunks) {
+    if (stopped) break;
+    if (chunk.byteLength === 0) { counters.emptyChunks++; continue; }
+    const limit = Math.min(chunk.byteLength, config.maxChunkBytes, config.maxWindowBytes - windowBytes);
+    if (limit < chunk.byteLength) { stopped = true; counters.capStops++; }
+    // Newline search never looks past the capped limit.
+    const newline = (from: number): number => { const at = chunk.subarray(from, limit).indexOf(10); return at < 0 ? -1 : from + at; };
+    let pos = 0;
+    while (pos < limit) {
+      if (skipping) {
+        const nl = newline(pos);
+        if (nl < 0) { pos = limit; break; }
+        pos = nl + 1; skipping = false; counters.linesSeen++;
+        continue;
+      }
+      if (counters.linesSeen >= config.maxWindowRecords) {
+        if (!stopped) counters.capStops++;
+        stopped = true; break;
+      }
+      const nl = newline(pos);
+      const segmentEnd = nl < 0 ? limit : nl;
+      const heldBytes = tail?.byteLength ?? 0;
+      const lineStart = tailStart ?? cursor + pos;
+      if (heldBytes + (segmentEnd - pos) > config.maxLineBytes) {
+        counters.oversizeLines++;
+        tail = null; tailStart = null;
+        if (segmentEnd === nl) { counters.linesSeen++; pos = nl + 1; }
+        else { skipping = true; pos = limit; }
+        continue;
+      }
+      const segment = chunk.subarray(pos, segmentEnd);
+      let line: Uint8Array;
+      if (tail === null) line = segment;
+      else { line = new Uint8Array(heldBytes + segment.byteLength); line.set(tail, 0); line.set(segment, heldBytes); }
+      if (segmentEnd !== nl) {
+        // Partial tail: retain a private copy (bounded by maxLineBytes) and wait for its newline.
+        tail = line === segment ? segment.slice() : line; tailStart = lineStart; pos = limit;
+        break;
+      }
+      tail = null; tailStart = null; counters.linesSeen++; pos = nl + 1;
+      onLine(line, lineStart);
+    }
+    cursor += pos; windowBytes += pos;
+    if (pos < chunk.byteLength) stopped = true;
+  }
+  return { cursor, tail, tailStart, skipping, windowBytes, stopped };
+}
+
+// ---------------------------------------------------------------------------
 // Closed structural check of the caller-held state, run BEFORE any Map/Set is built from it.
 // Structural only, NOT authenticity: a different structurally valid state (other digests, other
 // consistent counters) is indistinguishable here; the future store must own state integrity.
@@ -320,31 +425,14 @@ export function collectWindow(state: CollectorStateV1, input: CollectWindowInput
   let watermark = state.watermarkMs;
   const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false });
 
-  const accept = (timeMs: number): boolean => {
-    if (timeMs > observedMs + config.futureSkewMs) { counters.clockSkew++; return false; }
-    return true;
-  };
-  const isLate = (timeMs: number): boolean => watermark !== null && timeMs < watermark - config.lateToleranceMs;
   const base = (lineStart: number) => ({ sourceId, generation, lineStart, observedAt, provenance: 'not-established' as const });
 
   const processLine = (bytes: Uint8Array, lineStart: number): void => {
-    let end = bytes.byteLength;
-    if (end > 0 && bytes[end - 1] === 13) end--;
-    let text: string;
-    try { text = decoder.decode(bytes.subarray(0, end)); } catch { counters.malformed++; return; }
-    if (text.trim().length === 0) { counters.emptyLines++; return; }
-    const object = decodeObject(text);
-    if (object === null) { counters.malformed++; return; }
-    if (sourceKind === 'advisor-spool-v1') {
-      const checked = validateEventV1(object);
-      if (!checked.ok) {
-        if (checked.reason.code === 'unknown-field') counters.unknownField++;
-        else if (checked.reason.code === 'unknown-version') counters.unknownVersion++;
-        else counters.invalidValue++;
-        return;
-      }
-      const event = checked.value, atMs = parseIsoMs(event.at)!;
-      if (!accept(atMs)) return;
+    const line = decodeLine(bytes, sourceKind, decoder, counters, observedMs, config.futureSkewMs);
+    if (line === null) return;
+    let possibleDuplicate = false;
+    if (line.type === 'event') {
+      const event = line.event;
       const body = metadataId(event), prior = ids.get(event.eventId);
       if (prior !== undefined) {
         if (prior === body) { counters.duplicates++; return; }
@@ -353,88 +441,32 @@ export function collectWindow(state: CollectorStateV1, input: CollectWindowInput
           conflicted.add(event.eventId);
           if (conflicted.size > config.dedupCapacity) conflicted.delete(conflicted.values().next().value as string);
           records.push({ type: 'event-id-conflict', recordId: metadataId(['event-id-conflict', sourceId, generation, lineStart, event.eventId]),
-            ...base(lineStart), sourceKind, eventId: event.eventId });
+            ...base(lineStart), sourceKind: 'advisor-spool-v1', eventId: event.eventId });
           counters.recordsEmitted++;
         }
         return;
       }
       ids.set(event.eventId, body);
       if (ids.size > config.dedupCapacity) { ids.delete(ids.keys().next().value as string); counters.dedupEvictions++; }
-      const late = isLate(atMs);
-      if (late) counters.late++;
-      watermark = watermark === null ? atMs : Math.max(watermark, atMs);
-      records.push({ type: 'event', recordId: event.eventId, ...base(lineStart), sourceKind, timeBasis: 'producer-clock', late, event });
-      counters.recordsEmitted++;
-      return;
+    } else {
+      const { sid, rc } = line.fields;
+      const identity = metadataId(['escalation', sid, line.timeMs, rc]);
+      possibleDuplicate = recent.has(identity);
+      if (possibleDuplicate) counters.possibleDuplicates++;
+      else {
+        recent.add(identity);
+        if (recent.size > config.recentEscalationCapacity) recent.delete(recent.values().next().value as string);
+      }
     }
-    const checked = validateEscalationV1(object);
-    if (!checked.ok) {
-      if (checked.reason.code === 'unknown-field') counters.unknownField++; else counters.invalidValue++;
-      return;
-    }
-    const { sid, ts, rc } = checked.value, tsMs = parseUtc(ts)!;
-    if (!accept(tsMs)) return;
-    const identity = metadataId(['escalation', sid, tsMs, rc]);
-    const possibleDuplicate = recent.has(identity);
-    if (possibleDuplicate) counters.possibleDuplicates++;
-    else {
-      recent.add(identity);
-      if (recent.size > config.recentEscalationCapacity) recent.delete(recent.values().next().value as string);
-    }
-    const late = isLate(tsMs);
-    if (late) counters.late++;
-    watermark = watermark === null ? tsMs : Math.max(watermark, tsMs);
-    records.push({ type: 'escalation', recordId: metadataId(['verify-escalations-v1', sourceId, generation, lineStart]),
-      ...base(lineStart), sourceKind: 'verify-escalations-v1', timeBasis: 'producer-clock', late, possibleDuplicate, sid, ts, rc });
+    const stamped = stampTime(watermark, line.timeMs, config.lateToleranceMs, counters);
+    watermark = stamped.watermark;
+    records.push(recordOf(line, sourceId, generation, lineStart, observedAt, stamped.late, possibleDuplicate));
     counters.recordsEmitted++;
   };
 
-  let windowBytes = 0, stopped = false;
-  for (const chunk of input.chunks) {
-    if (stopped) break;
-    if (chunk.byteLength === 0) { counters.emptyChunks++; continue; }
-    const limit = Math.min(chunk.byteLength, config.maxChunkBytes, config.maxWindowBytes - windowBytes);
-    if (limit < chunk.byteLength) { stopped = true; counters.capStops++; }
-    // Newline search never looks past the capped limit.
-    const newline = (from: number): number => { const at = chunk.subarray(from, limit).indexOf(10); return at < 0 ? -1 : from + at; };
-    let pos = 0;
-    while (pos < limit) {
-      if (skipping) {
-        const nl = newline(pos);
-        if (nl < 0) { pos = limit; break; }
-        pos = nl + 1; skipping = false; counters.linesSeen++;
-        continue;
-      }
-      if (counters.linesSeen >= config.maxWindowRecords) {
-        if (!stopped) counters.capStops++;
-        stopped = true; break;
-      }
-      const nl = newline(pos);
-      const segmentEnd = nl < 0 ? limit : nl;
-      const heldBytes = tail?.byteLength ?? 0;
-      const lineStart = tailStart ?? cursor + pos;
-      if (heldBytes + (segmentEnd - pos) > config.maxLineBytes) {
-        counters.oversizeLines++;
-        tail = null; tailStart = null;
-        if (segmentEnd === nl) { counters.linesSeen++; pos = nl + 1; }
-        else { skipping = true; pos = limit; }
-        continue;
-      }
-      const segment = chunk.subarray(pos, segmentEnd);
-      let line: Uint8Array;
-      if (tail === null) line = segment;
-      else { line = new Uint8Array(heldBytes + segment.byteLength); line.set(tail, 0); line.set(segment, heldBytes); }
-      if (segmentEnd !== nl) {
-        // Partial tail: retain a private copy (bounded by maxLineBytes) and wait for its newline.
-        tail = line === segment ? segment.slice() : line; tailStart = lineStart; pos = limit;
-        break;
-      }
-      tail = null; tailStart = null; counters.linesSeen++; pos = nl + 1;
-      processLine(line, lineStart);
-    }
-    cursor += pos; windowBytes += pos;
-    if (pos < chunk.byteLength) stopped = true;
-  }
+  const framed = frame(input.chunks, config, counters, { cursor, tail, tailStart, skipping }, processLine);
+  ({ cursor, tail, tailStart, skipping } = framed);
+  const { windowBytes, stopped } = framed;
   counters.bytesConsumed = windowBytes;
 
   const eventIds = [...ids.entries()].map(([key, body]) => [key, body] as const);
@@ -459,4 +491,136 @@ export function collectWindow(state: CollectorStateV1, input: CollectWindowInput
       || reasons.has('dedup-horizon') ? 'partial' : 'complete';
   return { ok: true, value: { state: next, records, gaps: newGaps, counters, coverage, reasons: [...reasons].sort(),
     consumedBytes: windowBytes, nextCursor: cursor, pendingTailBytes: tail?.byteLength ?? 0, idempotency: 'bounded-horizon' } };
+}
+
+// ---------------------------------------------------------------------------
+// C0-f (CONTRACT-r2 §3): PURE stateless checkpoint decoder. Same framer, JSON decoder, whitelist, byte/depth/key
+// bounds and time checks as collectWindow; no dedup/conflict/possible-duplicate state and no raw bytes in or out.
+//
+// Checkpoint = (startCursor, skippingOversize, watermarkMs). It is STRUCTURALLY validated only, NOT authenticated:
+// nothing here can prove that the values came from a prior result or that startCursor is a true line boundary.
+// The future store must own checkpoint integrity; this function never claims it.
+//
+// - Normal mode (skippingOversize=false): startCursor must be a line start. A trailing partial line is NOT committed:
+//   lineBoundaryCursor stays at its first byte and pendingTailBytes counts exactly the bytes the next window re-reads
+//   (0 when none). The partial bytes are dropped here; no tail is ever returned.
+// - Skip mode (skippingOversize=true): startCursor is a position INSIDE an oversize line, not a line boundary.
+//   Bytes up to the next newline are discarded without decoding. If that newline is not in this window,
+//   lineBoundaryCursor advances to the end of the bytes read and skippingOversize stays true. Skipped bytes are
+//   never re-read, so pendingTailBytes is 0. Once the newline is consumed, lineBoundaryCursor is a line start again.
+//   The oversize line is counted once, in the window that detects it.
+// - Progress: the config must satisfy maxLineBytes < maxChunkBytes and maxLineBytes < maxWindowBytes. A window
+//   stopped by any cap has then seen more than maxLineBytes bytes of its first line. So the line either completed
+//   (committed) or was detected oversize (skip mode, cursor advanced). A capped window never restarts at
+//   startCursor. The only zero-progress result is a short partial line at the end of the supplied data, which
+//   waits for its writer. Lines after a cap are never skipped; they are re-read from lineBoundaryCursor.
+//   This precondition is specific to decodeWindowV1. A config that passes the generic validateCollectorConfigV1,
+//   for example maxLineBytes == maxWindowBytes or maxLineBytes >= maxChunkBytes, does NOT necessarily satisfy it.
+//   Such a config is refused here with the typed invalid-value result at $.maxLineBytes, never thrown and never
+//   relaxed. Without a carried tail, those configs could restart at startCursor forever. The shared CollectorConfigV1
+//   schema and legacy collectWindow keep their `<=` rule and accept them, because legacy carries a transient tail.
+// - Replays: re-supplying an earlier checkpoint re-emits the same records (same recordId). They are explicit
+//   duplicate-eligible records for the store's dedup; there is no exactly-once or complete-producer claim.
+//   possibleDuplicate is always false here, meaning NOT assessed.
+// - No clock-rollback check: there is no previous observedAt input.
+export interface DecodeWindowInputV1 {
+  sourceId: string; sourceKind: SourceKind; generation: number;
+  /** A lineBoundaryCursor returned by this API (structurally checked only; see above). */
+  startCursor: number; skippingOversize: boolean; watermarkMs: number | null;
+  /** Contiguous bytes starting at startCursor. */
+  chunks: readonly Uint8Array[];
+  endOfData: boolean; observedAt: string;
+  /** CollectorConfigV1 or undefined for the defaults. */
+  config?: unknown;
+}
+export type DecodeCountersV1 = Pick<CollectorCountersV1, 'bytesConsumed' | 'linesSeen' | 'recordsEmitted' | 'emptyLines'
+  | 'emptyChunks' | 'malformed' | 'unknownField' | 'unknownVersion' | 'invalidValue' | 'oversizeLines' | 'late' | 'clockSkew' | 'capStops'>;
+export type DecodeReasonV1 = Extract<CoverageReason, 'cap-stop' | 'not-end-of-data' | 'pending-tail' | 'dropped-lines'>;
+export interface DecodeWindowResultV1 {
+  records: CollectedRecordV1[];
+  /** Next startCursor. A line start unless skippingOversize is true. */
+  lineBoundaryCursor: number;
+  /** Count of uncommitted partial-line bytes the next window re-reads (never the bytes themselves). */
+  pendingTailBytes: number;
+  skippingOversize: boolean; watermarkMs: number | null;
+  /** This window only; bytesConsumed = lineBoundaryCursor − startCursor (committed bytes). */
+  counters: DecodeCountersV1;
+  coverage: Exclude<Coverage, 'unknown' | 'gap'>; reasons: DecodeReasonV1[];
+}
+const DECODE_INPUT_KEYS = ['sourceId', 'sourceKind', 'generation', 'startCursor', 'skippingOversize', 'watermarkMs',
+  'chunks', 'endOfData', 'observedAt'] as const;
+const DECODE_COUNTER_KEYS = ['bytesConsumed', 'linesSeen', 'recordsEmitted', 'emptyLines', 'emptyChunks', 'malformed',
+  'unknownField', 'unknownVersion', 'invalidValue', 'oversizeLines', 'late', 'clockSkew', 'capStops'] as const;
+
+export function decodeWindowV1(input: DecodeWindowInputV1): EfficiencyResult<DecodeWindowResultV1> {
+  try {
+    const raw: unknown = input;
+    if (!isPlain(raw) || !DECODE_INPUT_KEYS.every(key => Object.hasOwn(raw, key))
+      || !Object.keys(raw).every(key => key === 'config' || DECODE_INPUT_KEYS.some(known => known === key))) return refused('$input');
+    const checkedConfig = validateCollectorConfigV1(raw.config);
+    if (!checkedConfig.ok) return checkedConfig;
+    const config = checkedConfig.value;
+    // No tail is carried between windows, so every cap must leave room for one maximum line plus its newline.
+    // This is stricter than validateCollectorConfigV1 (see "Progress" above); the shared schema is unchanged.
+    if (config.maxLineBytes >= config.maxWindowBytes || config.maxLineBytes >= config.maxChunkBytes) return refused('$.maxLineBytes');
+    const { sourceId, sourceKind, generation, startCursor, skippingOversize, watermarkMs, endOfData, observedAt } = raw;
+    if (!isId(sourceId)) return refused('$input.sourceId');
+    if (!SOURCE_KINDS.some(kind => kind === sourceKind)) return refused('$input.sourceKind');
+    if (!isCount(generation)) return refused('$input.generation');
+    if (!isCount(startCursor)) return refused('$input.startCursor');
+    if (typeof skippingOversize !== 'boolean') return refused('$input.skippingOversize');
+    if (watermarkMs !== null && !isEpochMs(watermarkMs)) return refused('$input.watermarkMs');
+    if (typeof endOfData !== 'boolean') return refused('$input.endOfData');
+    const observedMs = parseIsoMs(observedAt);
+    if (observedMs === null) return refused('$input.observedAt');
+    // Read `chunks` and its length exactly once: a getter or proxy cannot change what is limit-checked vs. consumed.
+    const supplied: unknown = raw.chunks;
+    if (!Array.isArray(supplied)) return refused('$input.chunks');
+    const count: unknown = supplied.length;
+    if (!isCount(count)) return refused('$input.chunks');
+    if (count > config.maxChunksPerWindow) return { ok: false, reason: { code: 'input-limit', path: '$input.chunks' } };
+    const chunks: Uint8Array[] = [];
+    for (let index = 0; index < count; index++) {
+      const chunk: unknown = supplied[index];
+      if (!(chunk instanceof Uint8Array)) return refused('$input.chunks');
+      chunks.push(chunk);
+    }
+    // Same overflow rule as collectWindow: refuse unconsumed if the cursor could leave the safe-integer range.
+    const reachable = Math.min(config.maxWindowBytes, chunks.reduce((n, chunk) => n + Math.min(chunk.byteLength, config.maxChunkBytes), 0));
+    if (startCursor > Number.MAX_SAFE_INTEGER - reachable) return { ok: false, reason: { code: 'input-limit', path: '$input.startCursor' } };
+
+    const kind = sourceKind as SourceKind, at = observedAt as string;
+    const counters = zero();
+    const records: CollectedRecordV1[] = [];
+    const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false });
+    let watermark = watermarkMs;
+    const framed = frame(chunks, config, counters, { cursor: startCursor, tail: null, tailStart: null, skipping: skippingOversize },
+      (bytes, lineStart) => {
+        const line = decodeLine(bytes, kind, decoder, counters, observedMs, config.futureSkewMs);
+        if (line === null) return;
+        const stamped = stampTime(watermark, line.timeMs, config.lateToleranceMs, counters);
+        watermark = stamped.watermark;
+        records.push(recordOf(line, sourceId, generation, lineStart, at, stamped.late, false));
+        counters.recordsEmitted++;
+      });
+    // The framer's private tail copy is dropped here: only its start and length leave this function.
+    const lineBoundaryCursor = framed.tailStart ?? framed.cursor;
+    const pendingTailBytes = framed.tail?.byteLength ?? 0;
+    counters.bytesConsumed = lineBoundaryCursor - startCursor;
+
+    const reasons = new Set<DecodeReasonV1>();
+    if (framed.stopped) reasons.add('cap-stop');
+    if (!endOfData) reasons.add('not-end-of-data');
+    if (pendingTailBytes > 0 || framed.skipping) reasons.add('pending-tail');
+    if (counters.malformed + counters.unknownField + counters.unknownVersion + counters.invalidValue
+      + counters.oversizeLines + counters.clockSkew > 0) reasons.add('dropped-lines');
+    const coverage = reasons.has('cap-stop') || reasons.has('not-end-of-data') ? 'backlog'
+      : reasons.has('pending-tail') || reasons.has('dropped-lines') ? 'partial' : 'complete';
+    const windowCounters = {} as DecodeCountersV1;
+    for (const key of DECODE_COUNTER_KEYS) windowCounters[key] = counters[key];
+    return { ok: true, value: { records, lineBoundaryCursor, pendingTailBytes, skippingOversize: framed.skipping,
+      watermarkMs: watermark, counters: windowCounters, coverage, reasons: [...reasons].sort() } };
+  } catch {
+    return refused('$input');
+  }
 }

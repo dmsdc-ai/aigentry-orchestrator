@@ -27,6 +27,7 @@ sourceTestFiles.push(
   'tests/task-advisor/efficiency/t1-schema.test.mjs',
   'tests/task-advisor/efficiency/t10-r3-state-latency.test.mjs',
   'tests/task-advisor/efficiency/t11-r4-numeric.test.mjs',
+  'tests/task-advisor/efficiency/t12-checkpoint-decoder.test.mjs',
   'tests/task-advisor/efficiency/t2-decoder.test.mjs',
   'tests/task-advisor/efficiency/t3-dedup-gap-time.test.mjs',
   'tests/task-advisor/efficiency/t4-grants-binding.test.mjs',
