@@ -122,10 +122,14 @@ function snapshot(dir) {
   }));
 }
 const manifest = process.env.NATIVE_TEST_MANIFEST ? json(process.env.NATIVE_TEST_MANIFEST) : null;
-// Explicit compiled boot module set (#1181): cli.js statically imports usage/plan/wizard, and
-// plan/wizard import provider-capabilities. Every entry must exist; a new relative import fails below.
-const bootFiles = ['cli.js', 'usage.js', 'plan.js', 'wizard.js', 'provider-capabilities.js']
-  .map(name => `dist/src/orchestrator-boot/${name}`);
+// Explicit compiled boot module set (#1181, #1162): cli.js statically imports usage/plan/wizard/
+// boot-record; plan/wizard import provider-capabilities; boot-record imports plan and
+// session/boot-adapter launch-config/types; launch-config imports types. types.ts has only
+// `import type` (erased). Every entry must exist; a new relative import fails below.
+const bootFiles = ['orchestrator-boot/cli.js', 'orchestrator-boot/usage.js', 'orchestrator-boot/plan.js',
+  'orchestrator-boot/wizard.js', 'orchestrator-boot/provider-capabilities.js', 'orchestrator-boot/boot-record.js',
+  'session/boot-adapter/launch-config.js', 'session/boot-adapter/types.js']
+  .map(name => `dist/src/${name}`);
 // Bound repository-default reads/copies to shipped inputs; never traverse .git or dependencies.
 const sourceFiles = manifest ? manifest.files.map(f => f.path) : [...new Set([
   ...(await import(pathToFileURL(path.join(source, 'bin/init/manifest.mjs')).href)).MANIFEST,
