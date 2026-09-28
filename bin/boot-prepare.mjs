@@ -31,7 +31,8 @@
 //     "spawn_cli":   "<launcher_path>",
 //     "extra_flags": "",
 //     "spawn_cwd":   "<sandbox_path>",
-//     "env":         { "AIGENTRY_TARGET_CWD": "<original_cwd>" }
+//     "env":         { "AIGENTRY_TARGET_CWD": "<original_cwd>" },
+//     "launch":      { "v": 2, "cli", "model": {value, source}, "effort": {value, source} }
 //   }
 //
 // spawn_cli points at a per-session launcher.sh that EXPORTS env vars then
@@ -497,6 +498,9 @@ async function main() {
   const { isRole } = await import(
     pathToFileURL(join(REPO_ROOT, "dist/src/session/types.js")).href
   );
+  const { normalizeLaunch } = await import(
+    pathToFileURL(join(REPO_ROOT, "dist/src/session/boot-adapter/launch-config.js")).href
+  );
 
   if (!isRole(args.role)) die(`unknown role: ${args.role}`, 4);
 
@@ -608,17 +612,15 @@ async function main() {
     homeEnvAssignments[adapter.homeEnv] = homeShadow;
   }
 
-  // claude appends --model + --effort (ultracode tier) + --permission-mode
-  // bypassPermissions to the staged flags. model/effort are per-user configurable
-  // via env (AIGENTRY_CLAUDE_MODEL / AIGENTRY_CLAUDE_EFFORT) so spawned sessions
-  // inherit the best model + reasoning tier rather than the account default (was
-  // silently 4.7). codex/gemini default flags (from the adapter) already carry
-  // their own bypass/yolo modes, so no claude-specific flag is added there.
-  const claudeModel = process.env.AIGENTRY_CLAUDE_MODEL || "claude-opus-5";
-  const claudeEffort = process.env.AIGENTRY_CLAUDE_EFFORT || "xhigh";
+  // claude appends --permission-mode bypassPermissions to the staged flags.
+  // --model/--effort (AIGENTRY_CLAUDE_MODEL / AIGENTRY_CLAUDE_EFFORT, defaults
+  // unchanged) now come from the claude adapter itself (#1162) so argv and the
+  // typed launch metadata share one resolution. codex/gemini default flags (from
+  // the adapter) already carry their own bypass/yolo modes, so no claude-specific
+  // flag is added there.
   const flagsArgv =
     args.cli === "claude"
-      ? [...cmd.argv.slice(1), "--model", claudeModel, "--effort", claudeEffort, "--permission-mode", "bypassPermissions"]
+      ? [...cmd.argv.slice(1), "--permission-mode", "bypassPermissions"]
       : [...cmd.argv.slice(1)];
   // #1083: these CLIs expose prompt flags, not Gemini CLI's context/shadow-home contract.
   if (args.cli === "grok" || cmd.argv[0] === "agy") {
@@ -664,6 +666,9 @@ async function main() {
     extra_flags: "",
     spawn_cwd: sandboxCwd,
     env: { AIGENTRY_TARGET_CWD: args.cwd, ...homeEnvAssignments },
+    // #1162 typed LaunchConfig v2 from the adapter that built argv; validated so
+    // a missing/invalid record (external adapter) is explicit unknown.
+    launch: normalizeLaunch(args.cli, cmd.launch),
   };
   process.stdout.write(JSON.stringify(out) + "\n");
 }

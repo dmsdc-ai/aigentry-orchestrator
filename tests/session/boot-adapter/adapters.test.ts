@@ -43,10 +43,18 @@ test("3. claude argv = --append-system-prompt-file <staged> (#431 hybrid pivot f
   const cmd = await getBootAdapter("claude").buildBootCommand(makeCtx(), makeResolved(), {
     staging_dir: STAGING, fs: memoryBootFs(), spawner: mockSpawner(ALL()),
   });
+  // #1162: --model/--effort (defaults; env knobs cleared by beforeEach) moved
+  // into the adapter from boot-prepare.
   assert.deepEqual([...cmd.argv], [
     "claude", "--append-system-prompt-file",
     path.join(STAGING, "effective_prompt.md"),
+    "--model", "claude-opus-5", "--effort", "xhigh",
   ]);
+  assert.deepEqual(cmd.launch, {
+    v: 2, cli: "claude",
+    model: { value: "claude-opus-5", source: "default" },
+    effort: { value: "xhigh", source: "default" },
+  });
   assert.equal(cmd.cwd, "/work/myproj");
   assert.deepEqual({ ...cmd.env }, {});
 });

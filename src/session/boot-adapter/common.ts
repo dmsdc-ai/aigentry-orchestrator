@@ -5,12 +5,14 @@ import type { ResolvedInstructions } from "../resolve-instructions.js";
 import type { SessionContext } from "../types.js";
 import { canonicalBytes } from "../persistence/canonical-bytes.js";
 import type { Spawner } from "./spawner.js";
+import { normalizeLaunch } from "./launch-config.js";
 import {
   BootAdapterError,
   type BootAdapter,
   type BootCommand,
   type BuildOptions,
   type CliKind,
+  type LaunchConfig,
 } from "./types.js";
 
 // SemVer 2 §11 minimal compare: major.minor.patch numeric; any prerelease < release.
@@ -44,10 +46,12 @@ export interface AdapterConfig {
   // #569: config subdir under homeEnv (gemini ".gemini"; null = homeEnv is the
   // config dir directly, e.g. codex). See BootAdapter.homeConfigSubdir.
   homeConfigSubdir?: string | null;
+  // #1162: `launch` is built from the same resolved settings as `argv`
+  // (launch-config.ts). Absent ⇒ BootCommand.launch is explicit unknown.
   buildArgvEnv(args: {
     ctx: SessionContext;
     prompt_file: string;
-  }): { argv: readonly string[]; env: Readonly<Record<string, string>> };
+  }): { argv: readonly string[]; env: Readonly<Record<string, string>>; launch?: LaunchConfig };
 }
 
 export function makeAdapter(cfg: AdapterConfig): BootAdapter {
@@ -98,13 +102,14 @@ export function makeAdapter(cfg: AdapterConfig): BootAdapter {
       await opts.fs.mkdirP(opts.staging_dir);
       const prompt_file = path.join(opts.staging_dir, "effective_prompt.md");
       await opts.fs.writeFile(prompt_file, canonicalBytes(resolved.effective_prompt));
-      const { argv, env } = cfg.buildArgvEnv({ ctx, prompt_file });
+      const { argv, env, launch } = cfg.buildArgvEnv({ ctx, prompt_file });
       return Object.freeze({
         argv: Object.freeze([...argv]),
         env: Object.freeze({ ...env }),
         cwd: ctx.cwd,
         prompt_file,
         expected_digest: resolved.effective_prompt_digest,
+        launch: normalizeLaunch(cfg.name, launch),
       });
     },
   };

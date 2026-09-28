@@ -13,14 +13,33 @@ export function isCliKind(v: unknown): v is CliKind {
   return typeof v === "string" && (CLI_KINDS as readonly string[]).includes(v);
 }
 
+// #1162 LaunchConfig v2: the configured model/effort the adapter actually put on
+// argv. `value` is a bounded label or "unknown"; `source` names where it came
+// from (`env:<AIGENTRY_* name>`, aigentry `default`, `cli-default` = no flag so
+// the CLI decides, or `unknown`). Configured, never provider-observed.
+export type LaunchSource = `env:AIGENTRY_${string}` | "default" | "cli-default" | "unknown";
+export interface LaunchValue {
+  readonly value: string;
+  readonly source: LaunchSource;
+}
+export interface LaunchConfig {
+  readonly v: 2;
+  readonly cli: CliKind;
+  readonly model: LaunchValue;
+  readonly effort: LaunchValue;
+}
+
 // `cwd` is the process cwd; since #532 every adapter runs additively in
 // SessionContext.cwd (no scratch control dir).
+// `launch` is optional for external/custom implementations; the maintained
+// adapters (makeAdapter) always populate it.
 export interface BootCommand {
   argv: readonly string[];
   env: Readonly<Record<string, string>>;
   cwd: string;
   prompt_file: string;
   expected_digest: string;
+  launch?: LaunchConfig;
 }
 
 export type BootErrorCode =
