@@ -1,0 +1,81 @@
+name: ps width probe (diagnostic)
+
+# #909 — DIAGNOSTIC lane. Triggers: manual dispatch, plus push to the single isolated branch
+# test/909-ps-width-20261002 (workflow_dispatch registration depends on the default branch /
+# a prior run, so the push trigger lets the probe run without touching main). The job runs
+# only when github.ref is that branch, for both triggers. It measures how the native `ps` renders the
+# argv of three probe-OWNED synthetic node children (short / long / Unicode locators) across
+# plain, -w and -ww, COLUMNS unset/80/120/256/4096, four LC_ALL values and 3 reps. It reads
+# only `ps -p <pid of a child this harness spawned>`; it never lists all processes, never
+# signals by numeric pid, and runs no telepty, daemon, install, publish or deploy.
+#
+# What a green run means: both owned runs produced complete, bound, cleaned-up evidence and
+# every -ww sample carried the full SID and locator. It does NOT mean the production
+# `ps -eo pid,command` call is safe: the selection differs, and a default-width (plain / -w)
+# failure is surfaced as a FINDING that is never waived as a pass. Windows is not in scope.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - test/909-ps-width-20261002
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Native ps width probe (${{ matrix.os }})
+    if: ${{ github.ref == 'refs/heads/test/909-ps-width-20261002' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+        node: [20]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Capture exact checkout SHA
+        id: src
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          test "$sha" = "$GITHUB_SHA"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Owned run 1
+        env:
+          SOURCE_SHA: ${{ steps.src.outputs.sha }}
+        run: node tests/platform/native-ps-width-probe.mjs --out "$RUNNER_TEMP/ps-width-probe/run1" --label run1 --source-sha "$SOURCE_SHA"
+        timeout-minutes: 3
+      # Runs even when run 1 failed, so a failure is measured twice rather than once.
+      - name: Owned run 2
+        if: ${{ !cancelled() }}
+        env:
+          SOURCE_SHA: ${{ steps.src.outputs.sha }}
+        run: node tests/platform/native-ps-width-probe.mjs --out "$RUNNER_TEMP/ps-width-probe/run2" --label run2 --source-sha "$SOURCE_SHA"
+        timeout-minutes: 3
+      - name: Validate both owned runs
+        if: ${{ !cancelled() }}
+        run: node tests/platform/native-ps-width-probe.mjs --validate "$RUNNER_TEMP/ps-width-probe/run1" "$RUNNER_TEMP/ps-width-probe/run2" --out "$RUNNER_TEMP/ps-width-probe/validation"
+        timeout-minutes: 1
+      # Raw proof is uploaded whatever happened above. Fixture scripts (fx/) are excluded; their
+      # paths, argv and source are recorded in meta.json.
+      - name: Upload raw proof
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ps-width-probe-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/ps-width-probe
+            !${{ runner.temp }}/ps-width-probe/*/fx
+          if-no-files-found: error
+          retention-days: 7
