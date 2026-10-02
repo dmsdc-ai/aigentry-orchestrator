@@ -42,6 +42,66 @@ esac
 EOF
 chmod +x "$STUB_BIN/curl"
 
+# Default process-table stub. Every cleanup that finds its sid in the listing looks
+# up the parent `telepty allow` through `${CLEANUP_PS_CMD:-ps}` (src/cleanup/cli.ts
+# psSnapshot); without this, the batch cases in (7) read the HOST's process table.
+# The stub answers exactly `-eo pid,ppid,command` from a fixed table with no
+# `telepty allow` row, so the kill path is never reached, and refuses any other
+# argv with exit 97. It never falls back to the real ps. It is both the exported
+# seam and the bare `ps` on PATH, so neither lookup can resolve past it. (8) still
+# overrides the seam with its own table.
+PS_DEFAULT_LOG="$T_TMP/ps-default.log"; : > "$PS_DEFAULT_LOG"
+PS_DEFAULT_SNAP="$T_TMP/ps-default.txt"
+printf '%s\n' '100 1 /sbin/launchd' '400 100 bash session-cleanup.sh' > "$PS_DEFAULT_SNAP"
+cat > "$STUB_BIN/ps" <<EOF
+#!/usr/bin/env bash
+if [ "\$#" -eq 2 ] && [ "\$1" = "-eo" ] && [ "\$2" = "pid,ppid,command" ]; then
+  printf '%s\n' "\$*" >> "$PS_DEFAULT_LOG"
+  cat "$PS_DEFAULT_SNAP"; exit 0
+fi
+printf 'REFUSED %s\n' "\$*" >> "$PS_DEFAULT_LOG"
+echo "T106 stub ps: unexpected argv: \$*" >&2
+exit 97
+EOF
+chmod +x "$STUB_BIN/ps"
+export CLEANUP_PS_CMD="$STUB_BIN/ps"
+[ "$(command -v ps)" = "$STUB_BIN/ps" ] || fail "ps resolves to $(command -v ps), not the stub"
+# ps_calls_are <n> <label> — exactly n default lookups so far, each the expected argv
+# and each ANSWERED (a refused call is logged as REFUSED and counts as unexpected).
+ps_calls_are() {
+  local n bad
+  n=$(wc -l < "$PS_DEFAULT_LOG" | tr -d ' ')
+  bad=$(grep -cvx -- '-eo pid,ppid,command' "$PS_DEFAULT_LOG" || true)
+  [ "$n" = "$1" ] && [ "$bad" = "0" ] \
+    || fail "$2: stub ps called $n time(s) ($bad unexpected), want $1: $(cat "$PS_DEFAULT_LOG")"
+}
+
+# Default kill recorder, fail-closed. Cases (1)-(7) never set KILL_CMD themselves, so
+# the product falls back to `env.KILL_CMD || "kill"` — a bare PATH lookup that would
+# otherwise reach /bin/kill. No SIGTERM is expected before (8)'s explicit recorder,
+# so EVERY call here is unexpected: it is logged with its argc and each argument
+# bracketed (so a malformed argv is visible, not flattened), refused with exit 97,
+# and never forwarded to a real kill. It is both the exported default and the bare
+# `kill` on PATH. The rc alone would not fail the test — the product only logs a
+# failed kill — so kill_calls_are_zero is what turns a call into a FAIL.
+KILL_DEFAULT_LOG="$T_TMP/kill-default.log"; : > "$KILL_DEFAULT_LOG"
+cat > "$STUB_BIN/kill" <<EOF
+#!/usr/bin/env bash
+line="UNEXPECTED argc=\$#"
+for a in "\$@"; do line="\$line [\$a]"; done
+printf '%s\n' "\$line" >> "$KILL_DEFAULT_LOG"
+echo "T106 stub kill: unexpected call: \$line" >&2
+exit 97
+EOF
+chmod +x "$STUB_BIN/kill"
+export KILL_CMD="$STUB_BIN/kill"
+# `command -v kill` names the shell builtin; the product spawns by PATH, so ask PATH.
+[ "$(type -P kill)" = "$STUB_BIN/kill" ] || fail "kill resolves to $(type -P kill), not the stub"
+kill_calls_are_zero() {
+  [ ! -s "$KILL_DEFAULT_LOG" ] \
+    || fail "$1: the default kill was reached ($(wc -l < "$KILL_DEFAULT_LOG" | tr -d ' ') call(s)): $(cat "$KILL_DEFAULT_LOG")"
+}
+
 # Surface-close seam (T32/T86/T89 convention: the lib's re-source guard lets an
 # exported function survive) — record, never contact a workspace host.
 wh_close_for_sid() { printf 'SURFACE_CLOSE_BY_SID %s\n' "$1" >> "$ACTIONS_LOG"; return 0; }
@@ -187,6 +247,9 @@ rc=$(rc_of "$res"); out=$(out_of "$res")
 grep -qx "SURFACE_CLOSE_BY_SID $PROT" "$ACTIONS_LOG" \
   || fail "--force exited 0 without actually cleaning: $(cat "$ACTIONS_LOG")"
 
+ps_calls_are 0 "(1)-(6)"
+kill_calls_are_zero "(1)-(6)"
+
 # ── (7) batch selection: --all-disconnected and --all-unused --keep ───────
 printf '%s' '[
   {"id":"t106-a","healthStatus":"DISCONNECTED"},
@@ -231,15 +294,25 @@ case "$(out_of "$res")" in
   *"cleaned: 2 unused sessions"*) ;;
   *) fail "the keep-list match changed shape — jq's substring 'inside' protected t106-keep: $(out_of "$res")";;
 esac
+# Checked BEFORE the ps count: a kill that escapes must fail here even when the
+# count still matches (a guard that reuses its snapshot adds no extra ps call).
+kill_calls_are_zero "(7)"
+# One parent lookup per cleaned session: 2 + 2 + 0 + 2.
+ps_calls_are 6 "(7)"
 
 # ── (8) the normal (session-present) path SIGTERMs the parent and cleans up ─
 # T52 pins the self/ancestor REFUSAL through the seams; nothing pinned the
 # end-to-end run where the kill is supposed to fire.
 KILL_LOG="$T_TMP/kill.log"; : > "$KILL_LOG"
+# Records argc and each argument bracketed; answers 0 ONLY for the one expected
+# argv, so a malformed call is logged and refused rather than faked into success.
 cat > "$STUB_BIN/kill-recorder.sh" <<EOF
 #!/usr/bin/env bash
-printf '%s\n' "\$*" >> "$KILL_LOG"
-exit 0
+line="argc=\$#"
+for a in "\$@"; do line="\$line [\$a]"; done
+printf '%s\n' "\$line" >> "$KILL_LOG"
+[ "\$#" -eq 2 ] && [ "\$1" = "-TERM" ] && [ "\$2" = "777" ] && exit 0
+exit 97
 EOF
 PS_SNAP="$T_TMP/ps.txt"
 cat > "$STUB_BIN/ps-recorder.sh" <<EOF
@@ -257,9 +330,11 @@ printf '%s' '[{"id":"t106-live","command":"claude","healthStatus":"CONNECTED"}]'
 CLEANUP_PS_CMD="$STUB_BIN/ps-recorder.sh" KILL_CMD="$STUB_BIN/kill-recorder.sh" \
   CLEANUP_SELF_PID=400 "$BASH_BIN" "$CLEANUP" t106-live >/dev/null 2>&1 \
   || fail "the normal present-session path exited non-zero"
-grep -qx -- "-TERM 777" "$KILL_LOG" \
-  || fail "the parent telepty-allow process was not SIGTERMed on the normal path: $(cat "$KILL_LOG")"
+[ "$(cat "$KILL_LOG")" = "argc=2 [-TERM] [777]" ] \
+  || fail "the parent telepty-allow process was not SIGTERMed exactly once as '-TERM 777' on the normal path: $(cat "$KILL_LOG")"
 grep -q "ARGV .*-X DELETE .*/api/sessions/t106-live" "$CURL_LOG" \
   || fail "the registry DELETE did not run on the normal path: $(cat "$CURL_LOG")"
+ps_calls_are 6 "(8)"
+kill_calls_are_zero "(8)"
 
 echo "T106 PASS"
