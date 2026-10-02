@@ -171,9 +171,11 @@ $(cat "$TOML")"
 grep -qF "touch $SENTINEL" "$TOML"       || fail "G: wrapper does not write the sentinel (G6 fix missing). TOML:
 $(cat "$TOML")"
 
-# --- H: BC2 — exactly the 9 verbs + 1 composite (no 10th public verb) --------
+# --- H: BC2 — exactly the 9 verbs + 1 composite + 3 #1162 agent-meta verbs ----
 verbs=$("$BASH_BIN" -c '. "'"$LIB"'"; declare -F | sed -n "s/^declare -f //p" | grep "^wh_" | sort | tr "\n" " "')
-want="wh_alive wh_clear_status wh_close wh_close_for_sid wh_focus wh_list_ids wh_lookup wh_open wh_prune_orphans wh_set_status "
+# #1162 G2c: the three reviewed per-surface metadata verbs, listed literally (never
+# derived from workspace-host.sh) so an added or dropped wh_ export still fails here.
+want="wh_agent_meta_caps wh_agent_meta_clear wh_agent_meta_set wh_alive wh_clear_status wh_close wh_close_for_sid wh_focus wh_list_ids wh_lookup wh_open wh_prune_orphans wh_set_status "
 [ "$verbs" = "$want" ] || fail "H: public verb set drift (BC2 9-verb boundary).
   got:  $verbs
   want: $want"

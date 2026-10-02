@@ -56,7 +56,12 @@ if (action === 'init') {
   const script = (name, body) => write(join(process.env.STUB_BIN, name), '#!/usr/bin/env bash\n' + body + '\n', 0o700);
   const deny = 'printf "forbidden: %s\\n" "$0 $*" >> "$T_TMP/forbidden.log"; exit 99';
   for (const name of ['fixture-deny', 'apply_patch', 'ps', 'pkill', 'killall', 'launchctl', 'open',
-    'osascript', 'cmux', 'tmux', 'curl', 'wget', 'ssh', 'npm', 'npx', 'srt', 'security']) script(name, deny);
+    'osascript', 'tmux', 'curl', 'wget', 'ssh', 'npm', 'npx', 'srt', 'security']) script(name, deny);
+  // #1162 G2c: dispatch's agent-meta path asks the host `cmux capabilities` (read-only).
+  // Answer ONLY that exact one-argument query, truthfully as a host WITHOUT the metadata
+  // methods, so set/clear end `unsupported` before any RPC. Every other argv is denied.
+  script('cmux', 'if [ "$#" -eq 1 ] && [ "$1" = capabilities ]; then ' +
+    'printf \'%s\\n\' \'{"protocol":"cmux-socket","version":2,"methods":[]}\'; exit 0; fi\n' + deny);
   for (const cli of ['claude', 'codex', 'gemini', 'grok', 'agy'])
     script(cli, 'if [ "$#" -eq 1 ] && [ "$1" = --version ]; then echo 9.9.9; exit 0; fi\n' + deny);
   script('fixture-probe', 'echo \'{"ready":true}\'');
