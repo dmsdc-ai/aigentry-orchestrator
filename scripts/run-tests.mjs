@@ -37,6 +37,8 @@ sourceTestFiles.push(
   'tests/task-advisor/efficiency/t8-r2-focused.test.mjs',
   'tests/task-advisor/efficiency/t9-suspicions.test.mjs',
 );
+// #1182 — control pure-core suite imports the real tsc output under dist/src/control (no fixture fallback); platform-neutral.
+sourceTestFiles.push('tests/control/core.test.mjs');
 // Native capture fixtures require POSIX ownership/modes and the boot wizard suite drives an
 // owned POSIX PTY; Windows support is still absent for both.
 if (process.platform === 'darwin' || process.platform === 'linux') {
