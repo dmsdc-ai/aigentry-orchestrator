@@ -1,0 +1,50 @@
+name: '#1167 Windows fake lookup diagnostic'
+
+# Disposable diagnostic for #1167 H1/H2 only. Runs on push to the reserved branch (a new
+# workflow off the default branch cannot be dispatched manually at first) or by manual
+# dispatch; it is not a public/production workflow and grants no release or product acceptance.
+on:
+  push:
+    branches:
+      - test/1167-native-lookup-20261004
+    paths:
+      - tests/dispatch/windows-fixture-lookup-probe.mjs
+      - .github/workflows/windows-fixture-lookup-probe.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  observe:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.2'
+          architecture: x64
+      - name: One native fake-lookup observation (stdout receipt only)
+        shell: pwsh
+        env:
+          PROBE_COMMIT: ${{ github.sha }}
+        run: |
+          $receipt = Join-Path $env:RUNNER_TEMP 'windows-fixture-lookup-receipt.json'
+          $out = & node 'tests/dispatch/windows-fixture-lookup-probe.mjs'
+          $code = $LASTEXITCODE
+          if ($null -ne $out) {
+            [System.IO.File]::WriteAllText($receipt, (($out -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
+          }
+          Write-Host "probe exit=$code"
+          exit $code
+      - name: Upload receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-fixture-lookup-receipt
+          path: ${{ runner.temp }}/windows-fixture-lookup-receipt.json
+          if-no-files-found: error
+          retention-days: 7
