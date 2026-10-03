@@ -12,8 +12,9 @@ import { fixture, REPO } from "./model-router-fixtures.js";
 
 type Fixture = ReturnType<typeof fixture>;
 
-/** Runs one fixture stub by path through this node, so the shebang form never matters. */
+/** Runs one fixture stub by path through this node, so the shebang form never matters; win32 cmux is the native bin\cmux.exe. */
 function stub(f: Fixture, name: string, argv: string[]) {
+  if (name === "cmux" && process.platform === "win32") return spawnSync(join(f.bin, "cmux.exe"), argv, { env: f.env, encoding: "utf8", timeout: 20000 });
   return spawnSync(process.execPath, [join(f.bin, name), ...argv], { env: f.env, encoding: "utf8", timeout: 20000 });
 }
 const capsLog = (f: Fixture) => existsSync(f.env.CMUX_CAPS_LOG!) ? readFileSync(f.env.CMUX_CAPS_LOG!, "utf8") : "";

@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import type { WorkerManifest } from "../../src/session/worker-sandbox.js";
+import { installFakeCmux } from "./fake-cmux-win32.js";
 
 export const REPO = resolve(import.meta.dirname, "../../..");
 export const PROFILE = join(REPO, "tests/dispatch/fixtures/model-routing-profile.md");
@@ -107,7 +108,9 @@ fs.writeFileSync(manifest.receipt, JSON.stringify({ hash: current.hash, attempt:
   // adapter first asks `cmux capabilities`. Only that exact argv is answered: recorded in
   // CMUX_CAPS_LOG, with a valid reply that advertises no methods, so the adapter reports
   // unsupported (rc 20) and never reaches `rpc`. Every other cmux argv still trips WORK_LOG.
-  script("cmux", `
+  // #1167: win32 cannot exec this shebang script via bare `cmux`, so it gets the same answers as bin\cmux.exe.
+  if (process.platform === "win32") installFakeCmux(bin);
+  else script("cmux", `
 if (process.argv.length === 3 && process.argv[2] === 'capabilities') {
   require('node:fs').appendFileSync(process.env.CMUX_CAPS_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');
   console.log(JSON.stringify({ protocol: 'cmux-socket', version: 2, methods: [] }));
