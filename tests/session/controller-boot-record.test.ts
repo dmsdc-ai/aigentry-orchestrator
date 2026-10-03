@@ -540,9 +540,23 @@ test("prior invalid: every bad prior is invalid, skipped:prior-invalid, and left
 test("errors: a throwing prerequisite is skipped:error, never a throw", () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "aigentry-boot-record-"));
   bases.push(base);
-  const p: BootRecordPlatform = { ...nodePlatform(), getuid: () => { throw new Error("boom"); } };
+  // Host-independent: a complete explicit platform, so supported() reaches getuid on every host
+  // (nodePlatform() lacks noFollow/nonBlock on win32 and would stop at skipped:platform). The
+  // numeric flags are inert placeholders and never authorise an open: getuid throws first.
+  let getuidCalls = 0;
+  const p: BootRecordPlatform = {
+    getuid: () => {
+      getuidCalls += 1;
+      throw new Error("boom");
+    },
+    noFollow: 0,
+    nonBlock: 0,
+  };
   assert.deepEqual(writeControllerBootRecord(base, input(), p), { outcome: "skipped:error", relation: "none" });
+  assert.equal(getuidCalls, 1);
   assert.equal(readControllerBootRecord(base, "orch-1162", p).status, "invalid");
+  assert.equal(getuidCalls, 2);
+  assert.deepEqual(fs.readdirSync(base), []);
 });
 
 test("errors: an unwritable controller dir is skipped:error with no temp and no target left", { skip: POSIX_ONLY || (IS_ROOT ? "root bypasses directory permissions" : false) }, () => {
