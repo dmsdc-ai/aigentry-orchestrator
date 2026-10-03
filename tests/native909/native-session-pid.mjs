@@ -541,7 +541,7 @@ async function runContrast(world, outDir) {
 function preflight(lane, world) {
   const env = { PATH: SYS_PATH };
   const fixed = (file, args, extraEnv = {}) => {
-    const r = spawnSync(file, args, { env: { ...env, ...extraEnv }, encoding: 'utf8', timeout: 15000 });
+    const r = spawnSync(file, args, { env: { ...env, ...extraEnv }, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: 15000 });
     commands.push({ kind: 'preflight', file, argv: args, env: { ...env, ...extraEnv } });
     return { status: r.status, out: (r.stdout || '').trim(), err: (r.stderr || '').trim() };
   };
