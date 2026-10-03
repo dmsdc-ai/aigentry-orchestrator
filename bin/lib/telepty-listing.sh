@@ -65,16 +65,32 @@ telepty_listing_verdict() {
   esac
 }
 
+# telepty_listing_well_formed <raw-json> — 0 only when <raw-json> is exactly ONE JSON
+# document: an array whose every row is an object with a non-empty string `id`.
+# Anything else — malformed, empty, several documents, a non-array, a bad row — is
+# not a session listing, so neither the presence nor the absence of a sid in it means
+# anything. (#974: `jq -e` exits non-zero for a false result, for no input and for a
+# parse error alike, and every one of those used to be read as trusted.) Slurp (-s)
+# counts the documents, so empty input and `[] []` both fail here.
+telepty_listing_well_formed() {
+  printf '%s' "${1:-}" | jq -se 'length == 1 and (.[0] | type == "array"
+    and all(.[]; type == "object" and (.id | type == "string" and length > 0)))' >/dev/null 2>&1
+}
+
 # telepty_listing_trusted <raw-json> — 0 when <raw-json> may be used as evidence
 # that a session is ABSENT; 1 (with the disqualifying verdict on stdout, for the
 # caller's log line) when it may not.
+#
+# A listing that is not well-formed is `broken`, with no probe: an authenticated
+# HTTP 200 on the endpoint says the daemon answered, not that this body is sound.
 #
 # A non-empty array is self-evidently authentic: the conditions that fail to report
 # sessions report none at all, so anything in the array came from a daemon that
 # answered. Only the EMPTY array is ambiguous, and only that one pays for a probe.
 telepty_listing_trusted() {
   local verdict
-  printf '%s' "${1:-}" | jq -e 'type == "array" and length == 0' >/dev/null 2>&1 || return 0
+  telepty_listing_well_formed "${1:-}" || { printf 'broken'; return 1; }
+  printf '%s' "${1:-}" | jq -e 'length == 0' >/dev/null 2>&1 || return 0
   verdict=$(telepty_listing_verdict)
   [ "$verdict" = "ok" ] && return 0
   printf '%s' "$verdict"
@@ -85,6 +101,7 @@ telepty_listing_trusted() {
 #   0 — live (present in the listing)
 #   1 — absent, and the listing that says so is trustworthy
 #   2 — UNKNOWN: the listing could not be obtained or cannot be trusted
+#       (including a listing that is not well-formed — decided without a probe)
 #
 # Callers must not collapse 2 into 1. Suppressing an action because an
 # untrustworthy listing said "no such session" is the same defect one layer up.
@@ -92,7 +109,7 @@ telepty_sid_live() {
   local sid="$1" raw
   [ -n "$sid" ] || return 2
   raw=$("${TELEPTY:-telepty}" list --json 2>/dev/null) || return 2
-  printf '%s' "$raw" | jq -e . >/dev/null 2>&1 || return 2
+  telepty_listing_well_formed "$raw" || return 2
   printf '%s' "$raw" | jq -e --arg s "$sid" 'any(.[]?; .id == $s)' >/dev/null 2>&1 && return 0
   telepty_listing_trusted "$raw" >/dev/null || return 2
   return 1
