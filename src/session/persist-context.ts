@@ -91,7 +91,7 @@ export function defaultPathConfig(): PathConfig {
   const abs = path.resolve(raw);
   let resolved = abs;
   try {
-    resolved = realpathSync(abs);
+    resolved = process.platform === "win32" ? realpathSync.native(abs) : realpathSync(abs);
   } catch {
     /* not yet created — pass through */
   }
@@ -226,7 +226,7 @@ export async function persistContext(
 
     const entry: IndexEntry = {
       id: ctx.session_id,
-      path: realpathSync(target),
+      path: process.platform === "win32" ? realpathSync.native(target) : realpathSync(target),
       parent_id: ctx.parent_id ?? null,
       created_at: ctx.created_at,
       sha256,

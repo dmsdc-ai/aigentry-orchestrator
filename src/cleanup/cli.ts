@@ -38,6 +38,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { registryAvailable, registryEnvironment, registryInvocation } from "../dispatch/registry-command.js";
+import { defaultPathConfig } from "../session/persist-context.js";
+
 import { USAGE } from "./usage.js";
 
 const env = process.env;
@@ -68,6 +71,8 @@ const DISPATCH_REGISTRY_PY = env.DISPATCH_REGISTRY_PY || path.join(SCRIPT_DIR, "
 const WH_CLI = path.join(SCRIPT_DIR, "wh-cli.sh");
 const TELEPTY_AUTH_SH = path.join(SCRIPT_DIR, "lib/telepty-auth.sh");
 const TELEPTY_LISTING_SH = path.join(SCRIPT_DIR, "lib/telepty-listing.sh");
+// #1162 G2b sealed reader, compiled next to this file (dist/src/session/).
+const AGENT_BINDING_JS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "session", "agent-binding.js");
 
 // ── small process helpers (the tracker's, unchanged) ────────────────────────
 /** bash `$(cmd)`: command substitution strips every trailing newline. */
@@ -83,8 +88,8 @@ function capture(cmd: string, args: string[]): { status: number; stdout: string 
 }
 
 /** `cmd >/dev/null 2>&1` — status only. */
-function runQuiet(cmd: string, args: string[]): number {
-  const r = spawnSync(cmd, args, { stdio: ["ignore", "ignore", "ignore"] });
+function runQuiet(cmd: string, args: string[], childEnv?: NodeJS.ProcessEnv): number {
+  const r = spawnSync(cmd, args, { stdio: ["ignore", "ignore", "ignore"], shell: false, ...(childEnv ? { env: childEnv } : {}) });
   if (r.error) return 127;
   return r.status ?? 1;
 }
@@ -143,6 +148,68 @@ function listingTrusted(raw: string): { trusted: boolean; verdict: string } {
 /** A wh-cli.sh verb: 1:1 with the shell function the script used to source. */
 function wh(args: string[]): { status: number; stdout: string } {
   return capture(WH_CLI, args);
+}
+
+/**
+ * A wh-cli.sh verb whose stderr is read as well (#1162). `capture` drops it,
+ * which is right for `lookup` — a handle is either printed or it is not — but the
+ * adapter's close outcome tokens are on fd 2, and without them this command
+ * reported a status code with no reason attached anywhere in its output.
+ */
+function captureBoth(cmd: string, args: string[]): { status: number; stdout: string; stderr: string } {
+  const r = spawnSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  if (r.error) return { status: 127, stdout: "", stderr: "" };
+  return { status: r.status ?? 1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+}
+
+/**
+ * Read the adapter's generated close tokens out of its stderr, through a CLOSED
+ * vocabulary this file owns. #1162 containment: the stream is NEVER relayed, not
+ * even bounded — this command also drives warp and headless adapters, whose
+ * stderr is arbitrary subprocess output (pane text, credentials, control
+ * sequences). An absent or unrecognised token means UNCONFIRMED with a generic
+ * category, which is the fail-safe reading.
+ */
+const WH_CLOSE_CATEGORIES = new Set([
+  "host-unreachable",
+  "host-timeout",
+  "close-refused",
+  "no-output",
+  "unknown-failure",
+]);
+/**
+ * #1162: only the CATEGORY is read. There is no status branch any more — a
+ * failed close whose surface was not proven gone is UNCONFIRMED, full stop, so
+ * no token from the host can promote the report to "nothing was released".
+ *
+ * Provenance of the boundary rule, kept straight because the two seams differed:
+ * what R5 measured was the removed STATUS read, an unanchored ALTERNATION
+ * (`wh_close_status=(unreleased|unconfirmed)`), which accepted `unreleasedXYZ`
+ * as `unreleased`. That seam is gone, not re-armed. The CATEGORY read has always
+ * been a character class and no defect in it was reproduced; the widening below
+ * is the same boundary discipline applied here PRECAUTIONARILY, not a fix for a
+ * measured category bug.
+ *
+ * The rule: a token counts only as a COMPLETE word. The class deliberately spans
+ * more than the vocabulary (letters, digits, `-`, `_`) so a token carrying a
+ * suffix is captured WHOLE and then fails the allow-list; a class limited to the
+ * vocabulary's own characters could instead stop at the suffix and hand back a
+ * valid prefix. It stops at `)` so the adapter's parenthesised diagnostic still
+ * parses. Two different category tokens in one stream are contradictory evidence
+ * and degrade to unknown-failure rather than letting first-match win.
+ *
+ * None of this makes the category authoritative: it stays an informational hint
+ * about the FAILURE, never evidence of host state, and the verdict is UNCONFIRMED
+ * regardless of what it says.
+ */
+function whCloseCategory(stderr: string): string {
+  const seen = new Set<string>();
+  for (const m of stderr.matchAll(/wh_close_category=([A-Za-z0-9_-]+)/g)) {
+    seen.add(m[1]);
+  }
+  if (seen.size !== 1) return "unknown-failure";
+  const only = [...seen][0];
+  return WH_CLOSE_CATEGORIES.has(only) ? only : "unknown-failure";
 }
 
 // ── output ──────────────────────────────────────────────────────────────────
@@ -259,12 +326,13 @@ function listing(): Array<Record<string, unknown>> {
   return Array.isArray(parsed) ? (parsed as Array<Record<string, unknown>>) : [];
 }
 
-/** session_info <sid> → the record's JSON (empty string if not in telepty list). */
-function sessionInfo(sid: string): string {
-  for (const s of listing()) {
-    if (s && s.id === sid) return JSON.stringify(s);
-  }
-  return "";
+/**
+ * Every listing row for <sid>, from ONE listing. rows[0] is exactly the legacy
+ * session_info record (JSON'd by the caller; empty when absent). #1162: the rest
+ * are kept only so a duplicate can deny the pinned metadata clear.
+ */
+function sessionRows(sid: string): Array<Record<string, unknown>> {
+  return listing().filter((s) => s && s.id === sid);
 }
 
 /** disconnected_sids → DISCONNECTED sessions, excluding PROTECTED. */
@@ -282,18 +350,33 @@ function disconnectedSids(): string[] {
  * (it probes liveness + emits surface_orphaned only). The adapter's wh_close is
  * idempotent, so a transient double-close during the telepty-side rollout is
  * harmless (re-probe → already-gone → 0).
+ *
+ * #1162: returns FALSE for an observed non-zero close and TRUE otherwise, so the
+ * failure reaches the process exit status instead of dying in a log line. "No
+ * host id mapped" stays TRUE: no close was attempted, so there is no close result
+ * to propagate — that gap is a separate open limitation, not a failure measured
+ * here.
  */
-function closeWorkspaceFor(sid: string, json: string): void {
+function closeWorkspaceFor(sid: string, json: string): boolean {
   const hostId = chomp(wh(["lookup", sid, json]).stdout);
   if (!hostId) {
     log(`no workspace host id mapped for ${sid}; skipping`);
-    return;
+    return true;
   }
-  if (wh(["close", hostId]).status === 0) {
+  const closed = captureBoth(WH_CLI, ["close", hostId]);
+  if (closed.status === 0) {
     log(`workspace host closed: ${sid} (${hostId})`);
-  } else {
-    log(`workspace host close non-zero for ${sid} (already closed?)`);
+    return true;
   }
+  // #1162: a non-zero close is not "already closed?" — that asserted an absence no
+  // adapter reported. Nor is it "nothing was released": the adapter's liveness
+  // boolean is an actuation guard, not an observation of what the close did, so
+  // the only honest verdict is UNCONFIRMED with the adapter's bounded category
+  // and none of its text.
+  const category = whCloseCategory(closed.stderr);
+  log(`workspace host close failed for ${sid} (${hostId}): release UNCONFIRMED — neither release nor retention was observed [${category}]`);
+  err(`workspace host close non-zero for ${sid} (${hostId}) [${category}]`);
+  return false;
 }
 
 /**
@@ -350,9 +433,14 @@ function selfAncestry(snap: string): string[] {
  * the tower.
  */
 function pidIsSelfOrAncestor(pid: string): boolean {
+  return selfOrAncestorIn(psSnapshot(), pid);
+}
+
+/** pidIsSelfOrAncestor against a snapshot the caller already holds (#1162). */
+function selfOrAncestorIn(snap: string, pid: string): boolean {
   if (!pid) return false;
   if (/[^0-9]/.test(pid)) return false; // numeric pids only
-  if (selfAncestry(psSnapshot()).includes(pid)) return true;
+  if (selfAncestry(snap).includes(pid)) return true;
   // `${bridge_pids//,/ }` then word-splitting: commas AND whitespace separate.
   for (const bp of (env.ORCHESTRATOR_BRIDGE_PIDS || "").split(/[,\s]+/)) {
     if (bp && pid === bp) return true;
@@ -467,20 +555,135 @@ function deleteSessionRegistry(sid: string): void {
  * drain them was to re-run this by hand, once per ghost.
  */
 function registryCleaned(sid: string): void {
-  if (!executable(DISPATCH_REGISTRY_PY)) return;
-  if (runQuiet(DISPATCH_REGISTRY_PY, ["observe", "--sid", sid, "--kind", "session_absent_observed", "--all"]) !== 0) {
+  if (!registryAvailable(DISPATCH_REGISTRY_PY)) return;
+  const observe = registryInvocation(DISPATCH_REGISTRY_PY, ["observe", "--sid", sid, "--kind", "session_absent_observed", "--all"], process.platform);
+  if (runQuiet(observe.cmd, observe.args, registryEnvironment()) !== 0) {
     return;
   }
-  runQuiet(DISPATCH_REGISTRY_PY, ["set-lifecycle", "--sid", sid, "--state", "cleaned", "--all"]);
+  const lifecycle = registryInvocation(DISPATCH_REGISTRY_PY, ["set-lifecycle", "--sid", sid, "--state", "cleaned", "--all"], process.platform);
+  runQuiet(lifecycle.cmd, lifecycle.args, registryEnvironment());
 }
 
-/** 0 on success (including the idempotent no-op), 1 on the Rule 28 protected refusal. */
+// ── #1162 pinned agent-metadata clear (display-only) ────────────────────────
+// A fixed tuple captured ONCE before the listing, corroborated against the listed
+// owner in ONE ps snapshot, then handed to the adapter as an exact pin that it
+// revalidates before its RPC. It is never kill/close/DELETE authority, and no
+// outcome here changes closeOk, the DELETE, registryCleaned or the exit status.
+const SID_V1 = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+const UUID_RE = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
+const HASH_RE = /^[0-9a-f]{64}$/;
+const BINDING_KEYS = ["v", "sid", "task", "attempt", "manifest_hash", "workspace_id", "surface_id", "terminal_lifecycle_id"];
+
+interface MetaCapture {
+  stage: string;
+  attempt: string;
+  hash: string;
+  surface: string;
+  lifecycle: string;
+  supervisor: number;
+  child: number;
+}
+
+const plainObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+const exactKeys = (o: Record<string, unknown>, keys: readonly string[]): boolean =>
+  Object.keys(o).length === keys.length && keys.every((k) => Object.prototype.hasOwnProperty.call(o, k));
+const safePid = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v > 1;
+
+/** The sealed binding + running owner of <sid>, or the reason it could not be captured. Never throws. */
+function captureAgentBinding(sid: string): MetaCapture | string {
+  try {
+    if (!SID_V1.test(sid)) return "invalid-sid";
+    if (!fs.existsSync(AGENT_BINDING_JS)) return "reader-missing";
+    const stage = path.join(defaultPathConfig().sessionsRoot, sid);
+    const r = spawnSync(process.execPath, [AGENT_BINDING_JS, "--stage", stage, "--sid", sid, "--with-owner"], {
+      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10000, maxBuffer: 1 << 20,
+    });
+    if (r.error) return (r.error as NodeJS.ErrnoException).code === "ETIMEDOUT" ? "capture-timeout" : "capture-failed";
+    if (r.status === 20) return "binding-missing";
+    if (r.status !== 0) return "binding-invalid";
+    let out: unknown;
+    try { out = JSON.parse(r.stdout ?? ""); } catch { return "capture-invalid"; }
+    if (!plainObject(out) || !exactKeys(out, ["binding", "launch", "owner"])) return "capture-invalid";
+    const b = out.binding, o = out.owner;
+    if (!plainObject(b) || !exactKeys(b, BINDING_KEYS) || b.v !== 1 || b.sid !== sid ||
+        typeof b.manifest_hash !== "string" || !HASH_RE.test(b.manifest_hash) ||
+        typeof b.attempt !== "string" || !UUID_RE.test(b.attempt) ||
+        typeof b.surface_id !== "string" || !UUID_RE.test(b.surface_id) ||
+        typeof b.terminal_lifecycle_id !== "string" || !UUID_RE.test(b.terminal_lifecycle_id) ||
+        !plainObject(o) || !exactKeys(o, ["supervisor_pid", "child_pid"]) ||
+        !safePid(o.supervisor_pid) || !safePid(o.child_pid) || o.supervisor_pid === o.child_pid) {
+      return "capture-invalid";
+    }
+    return { stage, attempt: b.attempt, hash: b.manifest_hash, surface: b.surface_id,
+      lifecycle: b.terminal_lifecycle_id, supervisor: o.supervisor_pid, child: o.child_pid };
+  } catch {
+    return "capture-failed";
+  }
+}
+
+/** The one reason the pinned clear may not run, or "" when it may. */
+function metaClearVeto(rows: Array<Record<string, unknown>>, cap: MetaCapture | string): string {
+  if (rows.length > 1) return "listing-duplicate";
+  if (typeof cap === "string") return cap;
+  const owner = rows[0]?.ownerPid;
+  if (owner === undefined || owner === null) return "owner-missing";
+  if (!safePid(owner)) return "owner-malformed";
+  // ONE snapshot for every identity and for the self/ancestor guard. Rows whose
+  // first two fields are not decimal (the header, garbage) are not identities.
+  const snap = psSnapshot();
+  const ppids = new Map<number, number[]>();
+  for (const row of snap.split("\n")) {
+    const [p, pp] = fields(row);
+    if (p === undefined || pp === undefined || !/^[0-9]+$/.test(p) || !/^[0-9]+$/.test(pp)) continue;
+    ppids.set(Number(p), [...(ppids.get(Number(p)) ?? []), Number(pp)]);
+  }
+  for (const pid of [owner, cap.supervisor, cap.child]) {
+    const n = ppids.get(pid)?.length ?? 0;
+    if (n === 0) return "ps-missing";
+    if (n > 1) return "ps-duplicate";
+  }
+  if (ppids.get(cap.supervisor)![0] !== owner || ppids.get(cap.child)![0] !== cap.supervisor) return "owner-mismatch";
+  if ([owner, cap.supervisor, cap.child].some((pid) => selfOrAncestorIn(snap, String(pid)))) return "self-or-ancestor";
+  return "";
+}
+
+/** Log-only: the exact captured pin goes through the existing wh-cli door; its rc changes nothing else. */
+function clearAgentMetaPinned(sid: string, rows: Array<Record<string, unknown>>, cap: MetaCapture | string): void {
+  let veto: string;
+  try { veto = metaClearVeto(rows, cap); } catch { veto = "check-failed"; }
+  if (veto || typeof cap === "string") {
+    log(`agent-meta clear skipped: ${sid} (${veto || "capture-failed"})`);
+    return;
+  }
+  const r = wh(["agent-meta-clear", sid, "--stage", cap.stage, "--expect-attempt", cap.attempt,
+    "--expect-hash", cap.hash, "--expect-surface", cap.surface, "--expect-lifecycle", cap.lifecycle]);
+  const done = r.status === 0 ? /^agent_meta clear=(cleared|absent)\n$/.exec(r.stdout) : null;
+  if (done) log(`agent-meta clear: ${sid} (${done[1]})`);
+  else log(`agent-meta clear not applied: ${sid} rc=${r.status}`);
+}
+
+/**
+ * 0 on success (including the idempotent no-op), 1 on the Rule 28 protected
+ * refusal, and 1 on an observed non-zero workspace-host close (#1162).
+ *
+ * A failed close does not shorten the teardown: the settle, the registry DELETE
+ * and every guard above them still run exactly as before, because the surface
+ * being in an unknown state is a reason to finish draining the session, not to
+ * abandon it half-done. What it does withhold is the CLAIM — registryCleaned is
+ * not called, so no dispatch record is marked `cleaned` on the strength of a
+ * teardown whose central step was never observed to succeed. That is the
+ * withholding of an assertion, not a rollback: nothing done here is undone, and
+ * nothing about the surface is retained or asserted to be retained.
+ */
 function cleanupOne(sid: string, force: boolean): number {
   if (sid === PROTECTED_SID && !force) {
     err(`refusing to clean protected session '${PROTECTED_SID}' (pass --force to override)`);
     return 1;
   }
-  const info = sessionInfo(sid);
+  // #1162: capture strictly BEFORE the one listing; its failure is only a skip reason.
+  const cap = captureAgentBinding(sid);
+  const rows = sessionRows(sid);
+  const info = rows[0] ? JSON.stringify(rows[0]) : "";
   if (!info) {
     // telepty-orphan: gone from telepty but the terminal surface may still be
     // alive (idle worker deregistered → cmux workspace lingers, #323/#340). Step 4
@@ -488,40 +691,69 @@ function cleanupOne(sid: string, force: boolean): number {
     // here, so close BY SID (close-for-sid) — closeWorkspaceFor(sid, "") would
     // silent-no-op. DELETE backup still runs to drop any registry residue.
     log(`session not in telepty list: ${sid} (already cleaned or never registered); closing terminal surface by sid`);
-    wh(["close-for-sid", sid]);
+    // #1162: no observed session, so no owner to corroborate — never a metadata clear.
+    log(`agent-meta clear skipped: ${sid} (no-observed-session)`);
+    // #1162: this arm DID attempt a close, so bind its status exactly as the
+    // normal arm binds the closeWorkspaceFor result — discarding it reported a
+    // success the adapter never gave. captureBoth rather than wh because the
+    // category token is on fd 2; the stream itself is still never relayed, only
+    // the closed vocabulary that whCloseCategory owns. The no-mapping case is
+    // unaffected: the adapter returns 0 when the lookup found no host id, so
+    // there is no close and no failure to propagate.
+    const closed = captureBoth(WH_CLI, ["close-for-sid", sid]);
+    const closeOk = closed.status === 0;
+    if (!closeOk) {
+      const category = whCloseCategory(closed.stderr);
+      log(`workspace host close failed for ${sid} (by sid): release UNCONFIRMED — neither release nor retention was observed [${category}]`);
+      err(`workspace host close-for-sid non-zero for ${sid} [${category}]`);
+    }
     deleteSessionRegistry(sid);
+    if (!closeOk) return 1;
     // #540 — take the cleaned session out of the pollers' way. telepty#60 Stage A:
     // this is LIFECYCLE only. A session disappearing is not a task completing, so
     // the outcome stays unknown and the record keeps its history.
     registryCleaned(sid);
     return 0;
   }
+  // #1162 — pinned, display-only metadata clear BEFORE the legacy kill (log-only).
+  clearAgentMetaPinned(sid, rows, cap);
   // Step 1 — kill parent (load-bearing; auto-deregisters most cases)
   killParentTeleptyAllow(sid);
   // Step 2 — workspace host close via adapter seam (best-effort)
-  closeWorkspaceFor(sid, info);
+  const closeOk = closeWorkspaceFor(sid, info);
   // Brief settle so daemon notices parent death
   sleepMs(500);
   // Step 3 — DELETE registry (force-remove residue)
   deleteSessionRegistry(sid);
+  if (!closeOk) return 1;
   // #540 — same lifecycle-only mark on the normal kill+close+DELETE path.
   registryCleaned(sid);
   return 0;
 }
 
-function cleanupAllDisconnected(): void {
+/**
+ * #1162: 0 when every eligible sid was cleaned, 1 when at least one was not.
+ * One failure never stops the sweep — the remaining sids are still eligible and
+ * still get their teardown — but it is no longer absorbed: `cleaned:` counts the
+ * sids that actually succeeded, and the failures reach the exit status.
+ */
+function cleanupAllDisconnected(): number {
   const sids = disconnectedSids();
   if (sids.length === 0) {
     process.stdout.write("cleaned: 0 disconnected sessions\n");
-    return;
+    return 0;
   }
   let count = 0;
+  let failed = 0;
   for (const sid of sids) {
     if (!sid) continue;
-    cleanupOne(sid, false); // `|| true`
-    count += 1;
+    // The shell's `|| true` kept the LOOP going, which still holds; what it must
+    // not keep doing is counting an unfinished teardown as a cleaned session.
+    if (cleanupOne(sid, false) === 0) count += 1;
+    else failed += 1;
   }
   process.stdout.write(`cleaned: ${count} disconnected sessions\n`);
+  return failed > 0 ? 1 : 0;
 }
 
 /**
@@ -536,23 +768,28 @@ function keptByList(id: string, keep: string[]): boolean {
   return keep.some((k) => k.includes(id));
 }
 
-/** Every session not in the keep-list and not protected. */
-function cleanupAllUnused(keepCsv: string): void {
+/**
+ * Every session not in the keep-list and not protected. #1162: same aggregation
+ * as cleanupAllDisconnected — 0 when all succeeded, 1 when any did not.
+ */
+function cleanupAllUnused(keepCsv: string): number {
   const keep = keepCsv.split(",").filter((s) => s.length > 0);
   const sids = listing()
     .filter((s) => s && s.id !== PROTECTED_SID && !keptByList(String(s.id), keep))
     .map((s) => String(s.id));
   if (sids.length === 0) {
     process.stdout.write("cleaned: 0 unused sessions\n");
-    return;
+    return 0;
   }
   let count = 0;
+  let failed = 0;
   for (const sid of sids) {
     if (!sid) continue;
-    cleanupOne(sid, false); // `|| true`
-    count += 1;
+    if (cleanupOne(sid, false) === 0) count += 1;
+    else failed += 1;
   }
   process.stdout.write(`cleaned: ${count} unused sessions\n`);
+  return failed > 0 ? 1 : 0;
 }
 
 function main(argv: string[]): void {
@@ -598,19 +835,18 @@ function main(argv: string[]): void {
 
   if (modeAllDisc) {
     if (sid) { err("--all-disconnected does not take a sid argument"); process.exit(1); }
-    cleanupAllDisconnected();
-    process.exit(0);
+    process.exit(cleanupAllDisconnected());
   }
 
   if (modeAllUnused) {
     if (sid) { err("--all-unused does not take a sid argument"); process.exit(1); }
-    cleanupAllUnused(keepList);
-    process.exit(0);
+    process.exit(cleanupAllUnused(keepList));
   }
 
   if (!sid) { err("<sid> required (or use --all-disconnected / --all-unused)"); usage(1); }
   // `set -e` on the shell's last statement: a protected refusal (1) is the
-  // script's exit status.
+  // script's exit status — and since #1162 so is an observed non-zero workspace
+  // host close, which used to be reported on both streams and then exited 0.
   process.exit(cleanupOne(sid, force));
 }
 

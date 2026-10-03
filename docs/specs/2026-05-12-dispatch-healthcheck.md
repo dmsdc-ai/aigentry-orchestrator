@@ -118,6 +118,30 @@ behavior (no extra reads, backwards compat).
 `0` OK · `1` ready-timeout · `2` spawn failed · `3` inject failed ·
 `4` usage · `5` delivery failed (new).
 
+### 3.5 `--retry-unknown "<reason>"` (#1092)
+
+A registry row at `lifecycle=delivery_state_unknown` holds every
+identical dispatch (exit `7`, `DISPATCH_RETRY_HELD`, #727/#736 lineage):
+bytes may have landed, so nothing replays it silently. The operator door
+is `--retry-unknown "<reason>"` on `--target` or `--spawn-and-dispatch`.
+The reason must be nonempty after trimming; both preflight and the atomic
+transaction require lifecycle `delivery_state_unknown` and transport `unknown`.
+If transport becomes known between those checks, exit `4` without another inject.
+An empty reason is also refused by the registry without a write.
+One `begin-delivery` transaction marks the old row `superseded`
+(observation `superseded_by_retry{superseded_by, reason}`) and creates
+the new row with observation `retry_of_unknown{retry_of, reason}` —
+`observations[]` is the slot, no parallel field. `superseded` is a
+retired lifecycle: pollers skip it, `prune` ages it out, and dedup lets
+the successor row answer for the key (the old transport stays `unknown`;
+nothing measured it). The retry then runs the normal inject → ledger →
+`dispatch_ack` leg; on the spawn path it goes to the existing worker
+and never opens a second workspace. Any other row state (transport
+observed, or no held prior attempt) refuses the flag with exit `4`
+(`DISPATCH_RETRY_REFUSED`) naming `lifecycle=… transport=…`, at
+`check-dedup` before any side effect and again inside `begin-delivery`.
+Without the flag the hold is byte-identical to before.
+
 ---
 
 ## 4. §C — `AGENTS.md` row

@@ -33,11 +33,20 @@
 #                                                                  (cmux forwards select-workspace's
 #                                                                   status — reproduced, not smoothed)
 #   prune-orphans <live_csv> <protected_csv> count closed        0 always
-#   set-status <host_id> <state>             —                   0 always (unknown state = no-op)
+#   set-status <host_id> <state>             —                   0 always (unrecognized state = no-op)
 #   clear-status <host_id>                   —                   0 always
 #   close-for-sid <sid> [session_json]       —                   0 no mapping, or closed
 #                                                                1 mapped but close failed
 #   detect-terminal                          adapter name        0 always (headless is the catch-all)
+#   agent-meta-caps                          one caps line       0 supported, 20 unsupported, 30 error
+#   agent-meta-set <sid> --stage <root>      one result line     0 applied, 10 refused,
+#     --status-json <json>                                         20 unsupported, 30 invalid/transport
+#   agent-meta-clear <sid> --stage <root>    one result line     0 cleared|absent, 10/20/30 as above
+#     [--expect-attempt <uuid> --expect-hash <hex64>                (optional pin, all four or none:
+#      --expect-surface <uuid> --expect-lifecycle <uuid>]           10 binding-drift, 30 malformed)
+#
+# The three agent-meta verbs are #1162 G2c (controller interface lock), forwarded 1:1
+# to wh_agent_meta_{caps,set,clear} like every other arm.
 #
 # The 11th verb is not an extra. detect_terminal is prose-classed "internal" but
 # open-session.sh:201 and :272 call it, and open-session.sh is a tranche-2 port
@@ -79,10 +88,19 @@ matching shell function with the same exit code and the same stdout.
   list-ids                                print every known host_id, one per line
   focus <host_id>                         raise the surface
   prune-orphans <live_csv> <protected_csv>  close vanished surfaces; prints count
-  set-status <host_id> <state>            sidebar pill: working|idle|disconnected
+  set-status <host_id> <state>            sidebar pill: working|idle|disconnected|connected|unknown
   clear-status <host_id>                  remove the aigentry pill
   close-for-sid <sid> [session_json]      lookup + close in one call
   detect-terminal                         print the host terminal adapter name
+  agent-meta-caps                         per-surface agent metadata supported?
+                                          (20=unsupported, 30=error)
+  agent-meta-set <sid> --stage <root> --status-json <json>
+                                          set cli/model/effort/status for the
+                                          sealed binding (10=refused, 20, 30)
+  agent-meta-clear <sid> --stage <root>   clear it (10=refused, 20, 30)
+    [--expect-attempt <uuid> --expect-hash <hex64> --expect-surface <uuid>
+     --expect-lifecycle <uuid>]            optional exact pin, all four or none
+                                          (10=binding drift, 30=partial/malformed)
 
 Adapter selection is unchanged: AIGENTRY_WORKSPACE_HOST forces one, else auto.
 EOF
@@ -105,6 +123,9 @@ case "$verb" in
   clear-status)    wh_clear_status "$@" ;;
   close-for-sid)   wh_close_for_sid "$@" ;;
   detect-terminal) detect_terminal "$@" ;;
+  agent-meta-caps)  wh_agent_meta_caps "$@" ;;
+  agent-meta-set)   wh_agent_meta_set "$@" ;;
+  agent-meta-clear) wh_agent_meta_clear "$@" ;;
   -h|--help|help)  usage; exit 0 ;;
   "")              usage >&2; echo "wh-cli.sh: no verb given" >&2; exit 64 ;;
   *)               usage >&2; echo "wh-cli.sh: unknown verb '$verb'" >&2; exit 64 ;;

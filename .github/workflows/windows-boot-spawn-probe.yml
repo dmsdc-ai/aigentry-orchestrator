@@ -1,0 +1,50 @@
+name: Windows boot spawn observation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  observe:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.2'
+      - name: Obtain unchanged compiled library for CI observation only
+        shell: pwsh
+        run: |
+          npm ci --force --ignore-scripts --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run build
+          exit $LASTEXITCODE
+      - name: One instrumented native measurement
+        timeout-minutes: 5
+        env:
+          PROBE_COMMIT: ${{ github.sha }}
+          PROBE_RUNNER_TEMP: ${{ runner.temp }}
+          PROBE_RECEIPT: ${{ runner.temp }}/windows-boot-spawn-receipt.json
+        run: node tests/dispatch/windows-boot-spawn-probe.mjs
+      - name: Preserve missing observation explicitly
+        if: always()
+        shell: pwsh
+        env:
+          PROBE_RECEIPT: ${{ runner.temp }}/windows-boot-spawn-receipt.json
+        run: |
+          if (-not (Test-Path -LiteralPath $env:PROBE_RECEIPT)) {
+            '{"schema":1,"operation":"bc1167c-v2","status":"diagnostic_incomplete","reason":"observation_not_started","productAcceptance":false}' | Set-Content -LiteralPath $env:PROBE_RECEIPT -Encoding utf8
+          }
+      - name: Upload bounded sanitized receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-boot-spawn-receipt
+          path: ${{ runner.temp }}/windows-boot-spawn-receipt.json
+          if-no-files-found: error
+          retention-days: 7

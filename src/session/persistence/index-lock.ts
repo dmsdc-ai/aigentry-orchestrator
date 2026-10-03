@@ -37,6 +37,7 @@ let stagingSeq = 0;
 
 export interface WithIndexLockOptions {
   timeoutMs?: number;
+  strictRelease?: boolean;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -163,16 +164,20 @@ export async function withIndexLock<T>(
   const lockPath = `${targetIndexPath}.lock`;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   await acquire(lockPath, timeoutMs);
+  let callbackSucceeded = false;
   try {
-    return await fn();
+    const result = await fn();
+    callbackSucceeded = true;
+    return result;
   } finally {
     try {
       // Retried on Windows because a dropped release is not a cosmetic leak: the pid in
       // the file is ours and still running, so inspectLock reads "held" for every later
       // waiter and each one blocks its full timeout instead of sweeping it.
       await win32Retry(() => fs.unlink(lockPath));
-    } catch {
-      /* stale-swept by another process — acceptable */
+    } catch (err) {
+      if (opts.strictRelease && callbackSucceeded) throw err;
+      /* Preserve callback failures and the default best-effort release. */
     }
   }
 }

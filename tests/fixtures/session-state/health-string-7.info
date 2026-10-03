@@ -1,0 +1,12 @@
+{
+  "id": "sid-A",
+  "command": "claude",
+  "ready": true,
+  "healthStatus": "XCONNECTED",
+  "transport": {
+    "ready": true,
+    "bootstrap": {
+      "ready": true
+    }
+  }
+}

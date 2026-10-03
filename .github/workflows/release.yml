@@ -28,16 +28,108 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Gate 1 + 2, before a single test runner spins up: the tag must agree with the tree, and
+  browser-tls:
+    name: Browser and TLS acceptance
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.0'
+      - name: Require disposable non-root Linux runner and TLS tools
+        run: |
+          set -euo pipefail
+          test "$(id -u)" -ne 0
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          sudo apt-get update
+          sudo apt-get install -y openssl libnss3-tools
+      - name: Fresh locked install and build
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+      - name: Install pinned Chromium with sandbox dependencies
+        run: |
+          set -euo pipefail
+          node -e "const p=require('playwright/package.json');const b=JSON.parse(require('node:fs').readFileSync(require('node:path').join(require('node:path').dirname(require.resolve('playwright-core/package.json')),'browsers.json'))).browsers.find(x=>x.name==='chromium');if(p.version!=='1.58.2'||b.revision!=='1208'||b.browserVersion!=='145.0.7632.6')process.exit(1)"
+          npx --no-install playwright install --with-deps chromium
+      # No new dependency: the step above already pulled Xvfb and xauth in as Chromium's
+      # documented headed prerequisites. This only proves they are present before the
+      # acceptance run, so a missing tool fails as a named preflight rather than as a
+      # ten-minute browser timeout. Nothing is installed, downloaded or version-pinned here.
+      - name: Preflight virtual display tools for headed Chromium
+        run: |
+          set -euo pipefail
+          command -v Xvfb
+          command -v xvfb-run
+          command -v xauth
+      - name: Actual browser, WebAuthn and TLS controls
+        env:
+          BROWSER_TLS_RECEIPT: ${{ runner.temp }}/browser-tls-receipt.json
+          CONSOLE_UI_ARTIFACTS: ${{ runner.temp }}/console-ui-artifacts
+        # Headed Chromium on a private virtual display owned by this non-root ephemeral
+        # runner. `-a` picks a free server number; `-nolisten tcp` keeps the display off the
+        # network entirely; `xvfb-run` creates the X authority cookie under the runner's own
+        # uid and exports only DISPLAY and XAUTHORITY, which is all the acceptance forwards
+        # to the browser. X authentication stays on and no sandbox or TLS flag changes.
+        # `umask 077` first so the authority cookie the wrapper creates is owner-only by
+        # construction rather than by whatever default the image happens to carry.
+        run: |
+          set -euo pipefail
+          umask 077
+          xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp" npm run test:browser-tls
+        timeout-minutes: 10
+      - name: Validate complete receipt against this checkout
+        env:
+          BROWSER_TLS_RECEIPT: ${{ runner.temp }}/browser-tls-receipt.json
+          CONSOLE_UI_ARTIFACTS: ${{ runner.temp }}/console-ui-artifacts
+        run: npm run test:browser-tls -- --validate-receipt
+      - name: Upload sanitized receipt only
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-tls-receipt
+          path: ${{ runner.temp }}/browser-tls-receipt.json
+          if-no-files-found: error
+          retention-days: 7
+      # The six files are enumerated one per line rather than globbed. The run asserts that
+      # this directory holds exactly this set, so a wildcard would upload whatever a later
+      # step happened to leave behind instead of failing on it. Only these six are written
+      # there — no invitation, QR, passkey, cookie, session token, auth directory or private
+      # log — and TEMP at large is never uploaded. Success-only by default, so a failed run
+      # cannot publish a partial or unvalidated evidence set; it runs after the complete
+      # receipt validation above for the same reason.
+      - name: Upload Console UI evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: console-ui-evidence
+          path: |
+            ${{ runner.temp }}/console-ui-artifacts/console-320.png
+            ${{ runner.temp }}/console-ui-artifacts/console-390.png
+            ${{ runner.temp }}/console-ui-artifacts/console-768.png
+            ${{ runner.temp }}/console-ui-artifacts/console-1440.png
+            ${{ runner.temp }}/console-ui-artifacts/console-zoom.png
+            ${{ runner.temp }}/console-ui-artifacts/console-ui-receipt.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # Gate 1 + 2, after browser/TLS acceptance: the tag must agree with the tree, and
   # the credential must exist. Both are cheap and both are unrecoverable later.
   guard:
     name: Gate
+    needs: [browser-tls]
     runs-on: ubuntu-latest
     outputs:
       package: ${{ steps.identity.outputs.package }}
       version: ${{ steps.identity.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -62,6 +154,17 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag ${TAG} agrees with package.json: ${PACKAGE}@${VERSION}"
 
+      - name: Release admission regression tests
+        run: node --test tests/packaging/release-admission.test.mjs
+
+      - name: Release planning and changed-file admission
+        env:
+          RELEASE_VERSION: ${{ steps.identity.outputs.version }}
+          # Replace only after maintainer review of exact portable policy bytes and exception rationale.
+          RELEASE_SECURITY_POLICY_SHA256: UNREVIEWED
+          RELEASE_SECURITY_COMMIT: ${{ github.sha }}
+        run: node scripts/release-admission.mjs --root "$GITHUB_WORKSPACE" --version "$RELEASE_VERSION"
+
       # A workflow that silently no-ops when the secret is absent is green-without-publishing,
       # i.e. the bug this file exists to prevent. The token's value is never printed, only its
       # emptiness is tested.
@@ -76,8 +179,8 @@ jobs:
           fi
           echo "NPM_TOKEN is present"
 
-  # Gate 3. Two OS legs and no windows leg — §6.2: the package declares itself unsupported
-  # there (os: [darwin, linux]) and 33 of its 38 bin/ scripts have no Windows interpreter.
+  # Gate 3. Full suites on the two supported OSes; bounded Windows gates below
+  # check persistence and refusal. Native Windows remains unsupported (os: [darwin, linux]).
   #
   # #900 — tests/dispatch/run-all.sh runs here now. The comment it replaces called it a
   # maintainer-machine gate that "needs a live telepty daemon"; tests/dispatch/lib.sh
@@ -135,9 +238,113 @@ jobs:
           [ "$OS" = '["darwin","linux"]' ] || { echo "::error::package.json os is ${OS}; expected [\"darwin\",\"linux\"] so npm refuses Windows installs with EBADPLATFORM (§6.2, #663)."; exit 1; }
           echo "os declaration is ${OS}"
 
+  # Bounded Windows gates reuse CI W1/W0; they do not declare native Windows support.
+  # W1 forces installation only in CI and requires >20 passes, zero failures/skips.
+  # The regular CI full-suite Windows debt remains outside this release gate.
+  windows-persistence:
+    name: Windows W1 — bounded persistence suite
+    needs: guard
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies (CI-only --force past the os[] refusal)
+        shell: bash
+        run: npm ci --force
+
+      - name: Build
+        shell: bash
+        run: npm run build
+
+      - name: Persistence suite must be fully green on win32
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          node --test dist/tests/session/persistence/*.test.js > "${RUNNER_TEMP}/persistence.log" 2>&1
+          RC=$?
+          set -e
+          cat "${RUNNER_TEMP}/persistence.log"
+          read_count() {
+            awk -v key="$1" '
+              { sub(/\r$/, "") }
+              $0 ~ ("^# " key "([[:space:]]|$)") {
+                records++
+                if ($0 !~ ("^# " key " [0-9]+$")) malformed = 1
+                else count = $3
+              }
+              END { if (records == 1 && !malformed) print count }
+            ' "${RUNNER_TEMP}/persistence.log"
+          }
+          PASS="$(read_count pass)"; FAIL="$(read_count fail)"; SKIP="$(read_count skipped)"
+          # Refuse to assert on numbers we could not read — an empty string compares equal
+          # to nothing and would let this pass vacuously.
+          [ -n "${PASS}" ] && [ -n "${FAIL}" ] && [ -n "${SKIP}" ] \
+            || { echo "::error::could not parse the TAP summary; refusing to report a vacuous pass."; exit 1; }
+          echo "win32 persistence: pass=${PASS} fail=${FAIL} skipped=${SKIP}"
+          [ "${FAIL}" = "0" ] || { echo "::error::${FAIL} persistence test(s) failed on win32. This is the surface #901 delivers; it does not get a known-failure allowance."; exit 1; }
+          [ "${SKIP}" = "0" ] || { echo "::error::${SKIP} persistence test(s) skipped on win32 — a skip here is a win32 behaviour that went unmeasured."; exit 1; }
+          [ "${PASS}" -gt 20 ] || { echo "::error::only ${PASS} persistence tests ran; the file glob is probably not matching."; exit 1; }
+          [ "${RC}" = "0" ] || { echo "::error::the runner exited ${RC} despite a clean summary."; exit 1; }
+
+  # W0 measures the declared refusal on Windows: init exits before side effects,
+  # and unforced npm ci must fail specifically with EBADPLATFORM.
+  windows-refuses:
+    name: Windows W0 — the package refuses, correctly
+    needs: guard
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: package.json must declare Windows out
+        shell: bash
+        run: |
+          set -euo pipefail
+          OS="$(node -p "JSON.stringify(require('./package.json').os)")"
+          [ "$OS" = '["darwin","linux"]' ] || { echo "::error::package.json os is ${OS}; expected [\"darwin\",\"linux\"] so npm refuses Windows installs with EBADPLATFORM (§6.2, #663)."; exit 1; }
+          echo "os declaration is ${OS}"
+
+      - name: bin/init/cli.mjs platform gate must exit 2 on win32
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          OUT="$(node bin/init/cli.mjs init 2>&1)"
+          RC=$?
+          set -e
+          printf '%s\n' "$OUT"
+          [ "$RC" = "2" ] || { echo "::error::init exited ${RC} on win32; platformGate() in bin/init/cli.mjs must die(2, ...). An exit that is not 2 means the gate did not fire, or fired as something else."; exit 1; }
+          case "$OUT" in
+            *"does not support Windows natively"*WSL2*) echo "platform gate refused with its documented message and exit 2" ;;
+            *) echo "::error::init exited 2 but without the documented refusal (expected the 'does not support Windows natively' / WSL2 message)."; exit 1 ;;
+          esac
+
+      - name: U23 — npm ci must refuse on win32 with EBADPLATFORM
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          npm ci > "${RUNNER_TEMP}/npm-ci.log" 2>&1
+          RC=$?
+          set -e
+          echo "npm ci exit=${RC}"
+          tail -n 40 "${RUNNER_TEMP}/npm-ci.log"
+          [ "$RC" != "0" ] || { echo "::error::npm ci SUCCEEDED on win32. It refused with EBADPLATFORM when U23 was measured (2026-08-15). npm no longer enforces the root manifest's os[], so a Windows contributor now gets a dev install that works until the first bin/ script instead of a hard stop — re-decide the refusal strategy rather than relaxing this assertion."; exit 1; }
+          grep -q 'EBADPLATFORM' "${RUNNER_TEMP}/npm-ci.log" || { echo "::error::npm ci failed on win32 with exit ${RC} but not EBADPLATFORM. Something other than the os[] declaration is stopping the install; read the log above before assuming the refusal still works."; exit 1; }
+          echo "npm ci refused with EBADPLATFORM, as measured for U23"
+
   publish:
     name: Publish and verify from the registry
-    needs: [guard, test, windows-declared-unsupported]
+    needs: [browser-tls, guard, test, windows-declared-unsupported, windows-persistence, windows-refuses]
     runs-on: ubuntu-latest
     permissions:
       contents: write  # gh release create

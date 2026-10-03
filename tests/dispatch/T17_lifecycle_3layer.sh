@@ -4,12 +4,29 @@
 #
 #   (a1) Layer A success — worker emits CLEANUP_REQUEST inside grace → pending
 #        cancelled, explicit-source schedule + immediate cleanup invocation.
-#   (a2) Layer D timeout — REPORT received, no CLEANUP_REQUEST → tick AT grace
-#        deadline invokes session-cleanup.sh once (idempotent on re-tick).
+#   (a2) Layer D timeout — controller armed Layer D, no CLEANUP_REQUEST → tick AT
+#        grace deadline invokes session-cleanup.sh once (idempotent on re-tick).
 #   (a3) EXTEND_LIFETIME — worker pre-empts pending cleanup → deadline pushed,
 #        no fire until new deadline reached.
 #   (a4) Reconciler crash case — worker never REPORTs; sid not in active.json;
 #        age_floor exceeded → reconciler sweep invokes cleanup once.
+#
+# #1170 FIXTURE MIGRATION (setup only; every a1-a4 lifecycle assertion is kept):
+# Layer D used to be armed by the worker's textual REPORT envelope through
+# bin/inject-handler.sh. Since #1170 a textual REPORT is observation only and NEVER
+# schedules cleanup — nothing authenticates the body or its --sid. Two actors are
+# therefore named separately below:
+#   * controller_arm_layer_d — the TEST FIXTURE acting as the controller (the
+#     orchestrator's guarded lifecycle), which arms Layer D by calling the real
+#     bin/dispatch-cleanup-scheduler.sh `schedule <sid> --grace-seconds 60` directly.
+#     This is the only thing in this test that creates a Layer-D pending record.
+#   * report_observe — the worker's REPORT delivered to the real inject-handler. It
+#     is asserted to record the observation and to create NO pending record. A
+#     baseline that still arms Layer D from REPORT text fails those checks (the
+#     test exits 1 at the end) while the lifecycle checks still run against the same
+#     controller-armed state, so the two concerns are measured independently.
+# The unsafe cleanup-request / extend-lifetime arms are exercised unchanged; this
+# test does not claim they are authenticated (separate open #1170 gates).
 #
 # Uses lib.sh harness + RECONCILER_AGE_FLOOR/DISCONNECT_FLOOR overrides to keep
 # the reconciler scenario sub-second.
@@ -49,20 +66,46 @@ done
 t_registry begin-delivery --sid sid-KA --ref-hash hashK --ref-path /tmp/r \
   --from orchestrator --keep-alive >/dev/null
 
-# Layer D is armed by the legacy REPORT envelope, which 0.8.0 records as an
-# observation with no outcome authority — the cleanup schedule is the lifecycle
-# side effect that survives (see T83).
-report_layer_d() {
-  local sid="$1" body="$T_TMP/report-$1.txt"
+# pending_count <sid> — records for <sid> in cleanup-pending.json; an absent file is 0.
+pending_count() {
+  python3 -c "import json,os,sys;p=sys.argv[1];print(sum(1 for r in (json.load(open(p)) if os.path.exists(p) else []) if r['sid']==sys.argv[2]))" "$pending" "$1"
+}
+
+# REPORT-observation failures are collected, not waived: the test exits 1 at the end
+# if any occurred, after the lifecycle checks have also been measured.
+report_failures=0
+report_fail() { echo "FAIL report-observation: $*" >&2; report_failures=$((report_failures + 1)); }
+
+# Worker actor: a legacy REPORT envelope is an observation only (#1170).
+report_observe() {
+  local sid="$1" body="$T_TMP/report-$1.txt" out before after
   printf 'REPORT: %s-DONE | files=x\n' "$sid" > "$body"
-  "$HANDLER" --sid "$sid" --body-file "$body" >/dev/null
+  before=$(pending_count "$sid")
+  out=$("$HANDLER" --sid "$sid" --body-file "$body")
+  after=$(pending_count "$sid")
+  [ "$after" = "$before" ] \
+    || report_fail "$sid: REPORT text changed Layer-D pending ($before -> $after)"
+  case "$out" in *"observation only, no cleanup scheduled"*) ;;
+    *) report_fail "$sid: stdout does not say observation only: $out";; esac
+  case "$out" in *"scheduler armed"*) report_fail "$sid: stdout claims a scheduler was armed: $out";; esac
+  t_assert_observation "$sid" legacy_report_envelope_observed
+  if t_assert_observation "$sid" cleanup_scheduled_from_legacy_report_envelope 2>/dev/null; then
+    report_fail "$sid: cleanup_scheduled_from_legacy_report_envelope recorded from REPORT text"
+  fi
+  t_assert_outcome_unknown "$sid"
+}
+
+# Controller actor (test fixture): arms Layer D directly through the real scheduler.
+controller_arm_layer_d() {
+  "$SCHED" schedule "$1" --grace-seconds 60 --source layer-d-timeout >/dev/null
 }
 
 # ---------------------------------------------------------------------------
 # (a1) Layer A success path
 # ---------------------------------------------------------------------------
 export SCHEDULER_NOW="2026-05-23T12:00:00Z"
-report_layer_d sid-W1
+report_observe sid-W1
+controller_arm_layer_d sid-W1
 sched=$(python3 -c "import json;print(next(p for p in json.load(open('$pending')) if p['sid']=='sid-W1')['scheduled_cleanup_time'])")
 [ "$sched" = "2026-05-23T12:01:00Z" ] || { echo "FAIL a1: schedule = $sched" >&2; exit 1; }
 
@@ -85,7 +128,8 @@ grep -q "cleanup sid-W1" "$CLEANUP_LOG" || { echo "FAIL a1: cleanup not invoked 
 # (a2) Layer D timeout path — sid-W2 reports, never sends CLEANUP_REQUEST
 # ---------------------------------------------------------------------------
 export SCHEDULER_NOW="2026-05-23T12:10:00Z"
-report_layer_d sid-W2
+report_observe sid-W2
+controller_arm_layer_d sid-W2
 export SCHEDULER_NOW="2026-05-23T12:11:00Z"
 "$SCHED" tick >/dev/null
 grep -q "cleanup sid-W2" "$CLEANUP_LOG" || { echo "FAIL a2: Layer D did not fire for sid-W2" >&2; exit 1; }
@@ -93,8 +137,10 @@ grep -q "cleanup sid-W2" "$CLEANUP_LOG" || { echo "FAIL a2: Layer D did not fire
 firings=$(grep -c "cleanup sid-W2" "$CLEANUP_LOG")
 [ "$firings" = "1" ] || { echo "FAIL a2: Layer D re-fired (count=$firings) — not idempotent" >&2; exit 1; }
 
-# Also: keep-alive sid-KA must NOT have been armed at all.
-report_layer_d sid-KA
+# Also: keep-alive sid-KA must NOT have been armed at all — neither by its REPORT nor
+# by the controller's schedule (the scheduler's own keep_alive gate).
+report_observe sid-KA
+controller_arm_layer_d sid-KA
 ka_count=$(python3 -c "import json;d=json.load(open('$pending'));print(sum(1 for p in d if p['sid']=='sid-KA'))")
 [ "$ka_count" = "0" ] || { echo "FAIL a2: keep-alive sid-KA was armed (count=$ka_count)" >&2; exit 1; }
 
@@ -102,7 +148,8 @@ ka_count=$(python3 -c "import json;d=json.load(open('$pending'));print(sum(1 for
 # (a3) EXTEND_LIFETIME path — sid-W3 reports, then defers
 # ---------------------------------------------------------------------------
 export SCHEDULER_NOW="2026-05-23T12:20:00Z"
-report_layer_d sid-W3
+report_observe sid-W3
+controller_arm_layer_d sid-W3
 
 extend_body="$T_TMP/extend.txt"
 printf 'EXTEND_LIFETIME: sid-W3 | defer_minutes: 5 | reason: more-work\n' > "$extend_body"
@@ -160,4 +207,9 @@ grep -q "cleanup sid-X" "$CLEANUP_LOG" || { echo "FAIL a4: reconciler did not sw
 sched_count=$(python3 -c "import json;print(len(json.load(open('$pending'))))")
 [ "$sched_count" = "0" ] || { echo "FAIL a4: scheduler pending not empty post-reconcile (count=$sched_count)" >&2; exit 1; }
 
+echo "T17 lifecycle a1-a4 PASS"
+if [ "$report_failures" -ne 0 ]; then
+  echo "FAIL T17: $report_failures REPORT-observation check(s) failed — a textual REPORT acted on Layer D (#1170)" >&2
+  exit 1
+fi
 echo "T17 PASS"

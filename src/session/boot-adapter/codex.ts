@@ -10,6 +10,7 @@
 // global doc). boot-prepare.mjs owns the cwd staging + shadow-home build; this
 // adapter only declares the REAL launch flags + the additive descriptor.
 import { makeAdapter } from "./common.js";
+import { envOrDefault, launchConfig } from "./launch-config.js";
 
 // Verified-present floor (codex 0.133.0 supports cwd AGENTS.md auto-discovery +
 // --dangerously-bypass-approvals-and-sandbox). semverGte(installed, min) gates,
@@ -35,14 +36,23 @@ export function codexAdapter() {
     contextFile: CODEX_CONTEXT_FILE,
     homeEnv: CODEX_HOME_ENV,
     homeExclude: CODEX_HOME_EXCLUDE,
-    buildArgvEnv: () => ({
-      argv: [
-        "codex",
-        "-c",
-        "check_for_update_on_startup=false",
-        "--dangerously-bypass-approvals-and-sandbox",
-      ],
-      env: {},
-    }),
+    buildArgvEnv: () => {
+      const model = envOrDefault(process.env, "AIGENTRY_CODEX_MODEL", "gpt-6-astra");
+      const effort = envOrDefault(process.env, "AIGENTRY_CODEX_EFFORT", "high");
+      return {
+        argv: [
+          "codex",
+          "-m",
+          model.arg,
+          "-c",
+          `model_reasoning_effort=${effort.arg}`, // #1084
+          "-c",
+          "check_for_update_on_startup=false",
+          "--dangerously-bypass-approvals-and-sandbox",
+        ],
+        env: {},
+        launch: launchConfig("codex", model, effort),
+      };
+    },
   });
 }

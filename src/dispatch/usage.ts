@@ -15,6 +15,7 @@ export const USAGE = `# dispatch.sh — Wraps \`telepty inject\` with REPL-ready
 #
 # Modes:
 #   dispatch.sh --target <sid> --ref <file> [--from <orch-sid>] [--timeout-ms 30000]
+#               [--retry-unknown "<reason>"]
 #   dispatch.sh --spawn-and-dispatch --track T --name N --cwd P --cli claude \\
 #               --ref <file> [--from <orch-sid>] [--role coder|architect|...] [--worktree P]
 #   dispatch.sh --help
@@ -28,7 +29,8 @@ export const USAGE = `# dispatch.sh — Wraps \`telepty inject\` with REPL-ready
 #   AIGENTRY_TASK_GATE=hard|warn|off (default hard) — warn audits+proceeds, off = legacy.
 #   AIGENTRY_TASK_QUEUE=<path> overrides the queue (default <repo>/state/task-queue.json).
 #
-# --role (cli=claude|codex|gemini, #431 / #532): wires boot-prepare.mjs so the
+# --cli defaults to auto (profile + LLM, then role table); explicit CLI bypasses routing.
+# --role (cli=claude|codex|gemini|grok, #431 / #532 / #1083): wires boot-prepare.mjs so the
 #   wrapped CLI skips project context-file auto-discovery (the cwd→role
 #   contamination exposed by the 2026-05-23 incident). claude uses
 #   \`--append-system-prompt-file\`; codex/gemini use the additive path (staged cwd
@@ -42,6 +44,18 @@ export const USAGE = `# dispatch.sh — Wraps \`telepty inject\` with REPL-ready
 #   gated path instead of being hand-recovered with a raw \`telepty inject\`
 #   (which bypasses the task-gate ledger, delivery confirm and tracker register).
 #   --target keeps the historical fail-fast; set the knob to make it wait too.
+#
+# Retry of an unknown delivery (#1092): a prior attempt left at
+#   delivery_state_unknown holds every identical dispatch (exit 7,
+#   DISPATCH_RETRY_HELD) because bytes may have landed. Once reviewed, the
+#   orchestrator lane retries with --retry-unknown "<reason>" on --target or
+#   --spawn-and-dispatch: one registry transaction marks the old row superseded
+#   and creates the new row with retry_of + the reason in observations[], then
+#   the normal inject + ledger + dispatch_ack leg runs. The spawn path retries
+#   the existing worker; it never opens a second workspace. Any other row state
+#   (transport observed, or no held attempt) refuses the flag with exit 4
+#   (DISPATCH_RETRY_REFUSED) naming lifecycle= and transport=, so the override
+#   cannot double a known delivery. Without the flag the hold is unchanged.
 #
 # Ready detection: per-CLI prompt-symbol probe of \`telepty read-screen\` plus
 # welcome/boot banner absence (claude ❯ / codex › / gemini ›|│ >).

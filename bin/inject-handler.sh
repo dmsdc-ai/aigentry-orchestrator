@@ -5,7 +5,10 @@
 #                     line, the holds.log record shape, the test-report bytes and all
 #                     three children's argv are unchanged; `--help` still prints the
 #                     19 lines `sed -n '2,20p'` printed, which now live in
-#                     src/inject-handler/usage.ts.
+#                     src/inject-handler/usage.ts. EXCEPT the report arm since #1170:
+#                     a textual REPORT is observation only — no scheduler call, no
+#                     cleanup_scheduled_from_legacy_report_envelope observation, a
+#                     changed stdout line and a changed `report` line in `--help`.
 #
 # Contract changes recorded here (Rule 38 — what was measured). The reproductions are
 # in docs/reports/2026-08-18-899-t5-inject-handler-disposition.md §7:
@@ -19,8 +22,9 @@
 #     §Context recorded and this port re-measured.
 #   * THIS SCRIPT SOURCED NO LIBS (zero `.`/`source` lines), so as in tranches 4 there
 #     is no `bash -c '. lib; fn'` door and no bin/wh-cli.sh verb. Its three children
-#     stay children with identical argv: bin/dispatch-registry.py (`observe …` ×2),
-#     bin/dispatch-cleanup-scheduler.sh (`schedule`/`defer`/`cancel`, 4 call shapes —
+#     stay children with identical argv: bin/dispatch-registry.py (`observe …`, ×1 since
+#     #1170, was ×2), bin/dispatch-cleanup-scheduler.sh (`schedule`/`defer`/`cancel`,
+#     3 call shapes since #1170 removed the report arm's `schedule` — was 4 —
 #     itself a TS shim since tranche 4, so calling it in-process would fork its
 #     fail-CLOSED keep_alive gate) and bin/emit-telemetry.mjs (5 emissions).
 #   * THE INLINE `node -e` PARSER BRIDGE AND ALL TEN `python3 -c` FIELD READS ARE GONE,
@@ -70,7 +74,9 @@
 #     exits 0 — which an out-of-bounds field no longer does). Rewriting operator-visible
 #     bytes on top of the behaviour change would make T124 block A untestable against
 #     the original bash, which is how the parity is measured at all; the deviations are
-#     named here instead, which is the surface Rule 38 asks for.
+#     named here instead, which is the surface Rule 38 asks for. The one exception is
+#     #1170's `report` line, rewritten because it promised a cleanup schedule the arm
+#     no longer makes.
 #   * NAMED FOR A TICKET, not fixed (Rule 29 — out of this task's decided scope):
 #     the telemetry `--payload-json` is still string-interpolated, so a `"` in a reason
 #     still emits invalid JSON (reproduced byte for byte); a failing

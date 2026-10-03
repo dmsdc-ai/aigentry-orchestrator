@@ -199,7 +199,11 @@ grep -qE "term=cmux ref=$REF sid=t116-ok title=t116-ok cwd=[^ ]+ cli=claude flag
   || fail "C: log line field ORDER changed: $LOGLINE"
 # The #616 pill went out and no focus was stolen (T56 owns this end-to-end; repeated
 # here because block E tells the two spawn paths apart by its presence).
-grep -qF "set-status aigentry working" "$STUBLOG" || fail "C: the #616 working pill was not pushed"
+# #1162 G2c: the unconditional working pill is gone; the seam's caller now asks the
+# host for agent-metadata capabilities instead (and draws only a connection pill from
+# real telepty evidence when caps is non-zero). Never a speculative working pill.
+grep -qF "set-status aigentry working" "$STUBLOG" && fail "C: a speculative #616 working pill was pushed (#1162 removed it)"
+grep -qx "capabilities" "$STUBLOG" || fail "C: the wh_open path did not query agent-metadata capabilities"
 grep -q 'select-workspace' "$STUBLOG" && fail "C: FOCUS THEFT — select-workspace issued on spawn"
 # The default claude flags reached cmux verbatim: the wrapped command is what the
 # worker actually starts as, and #909's sleep assertion finds the pid by matching it.
@@ -265,8 +269,10 @@ run_open legacy AIGENTRY_WORKSPACE_HOST=cmux AIGENTRY_WH_LEGACY_SPAWN=1
 [ "$OUT" = "$REF" ] || fail "E: legacy stdout='$OUT' want '$REF'"
 grep -qF '[workspace-host] open:' <<<"$ERRTXT" \
   && fail "E: AIGENTRY_WH_LEGACY_SPAWN=1 reached wh_open — the rollback lever does not bypass the seam"
-grep -qF 'set-status aigentry working' "$STUBLOG" \
-  && fail "E: AIGENTRY_WH_LEGACY_SPAWN=1 pushed the #616 pill — that is the wh_open path, not the inline arm"
+grep -qF 'set-status aigentry' "$STUBLOG" \
+  && fail "E: AIGENTRY_WH_LEGACY_SPAWN=1 pushed an aigentry pill — that is the wh_open path, not the inline arm"
+grep -qx 'capabilities' "$STUBLOG" \
+  && fail "E: AIGENTRY_WH_LEGACY_SPAWN=1 queried agent-meta capabilities — that is the wh_open path, not the inline arm"
 # …and the inline arm is still the devkit original: same new-workspace argv, same
 # rename, same three-part readiness gate against the same cmux binary.
 for want in "new-workspace --cwd" "rename-workspace --workspace $REF t116-legacy" \

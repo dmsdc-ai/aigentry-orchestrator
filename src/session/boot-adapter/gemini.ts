@@ -10,6 +10,16 @@
 // doc). boot-prepare.mjs owns the cwd staging + shadow-home build; this adapter
 // only declares the REAL launch flags + the additive descriptor.
 import { makeAdapter } from "./common.js";
+import { CLI_DEFAULT, envOrDefault, launchConfig, optInEnv } from "./launch-config.js";
+import { accessSync, constants } from "node:fs";
+import { delimiter, join } from "node:path";
+
+export function geminiBinary(env: NodeJS.ProcessEnv = process.env): "agy" | "gemini" {
+  if (env.AIGENTRY_GEMINI_BINARY === "gemini" || env.AIGENTRY_GEMINI_BINARY === "agy") return env.AIGENTRY_GEMINI_BINARY;
+  return (env.PATH || "").split(delimiter).some((dir) => {
+    try { accessSync(join(dir, "agy"), constants.X_OK); return true; } catch { return false; }
+  }) ? "agy" : "gemini";
+}
 
 // Verified-present floor (gemini 0.42.0 supports cwd GEMINI.md auto-discovery +
 // --approval-mode yolo + --skip-trust). semverGte(installed, min) gates.
@@ -33,7 +43,20 @@ export const GEMINI_HOME_EXCLUDE: readonly string[] = Object.freeze([
 // Contrast codex: CODEX_HOME IS the config dir directly (homeConfigSubdir=null).
 export const GEMINI_CONFIG_SUBDIR = ".gemini";
 
-export function geminiAdapter() {
+export function geminiAdapter(binary: "agy" | "gemini" = "gemini") {
+  if (binary === "agy") return makeAdapter({
+    name: "gemini",
+    min_version: "0.0.0", // no numeric version claim; capability-gated below
+    capabilityProbe: { executable: "agy", flags: ["--model", "--dangerously-skip-permissions", "--prompt-interactive"] },
+    buildArgvEnv: () => {
+      const model = envOrDefault(process.env, "AIGENTRY_GEMINI_MODEL", "gemini-3.8-flash-high");
+      const effort = optInEnv(process.env, "AIGENTRY_GEMINI_EFFORT"); // #1084 opt-in
+      return { argv: ["agy", "--model", model.arg,
+        "--dangerously-skip-permissions",
+        ...(effort.arg !== null ? ["--effort", effort.arg] : [])], env: {},
+        launch: launchConfig("gemini", model, effort) };
+    },
+  });
   return makeAdapter({
     name: "gemini",
     min_version: GEMINI_MIN_VERSION,
@@ -41,16 +64,21 @@ export function geminiAdapter() {
     homeEnv: GEMINI_HOME_ENV,
     homeExclude: GEMINI_HOME_EXCLUDE,
     homeConfigSubdir: GEMINI_CONFIG_SUBDIR,
-    buildArgvEnv: () => ({
-      argv: [
-        "gemini",
-        "-m",
-        process.env.AIGENTRY_GEMINI_MODEL || "gemini-2.5-flash",
-        "--approval-mode",
-        "yolo",
-        "--skip-trust",
-      ],
-      env: {},
-    }),
+    buildArgvEnv: () => {
+      const model = envOrDefault(process.env, "AIGENTRY_GEMINI_MODEL", "gemini-2.5-flash");
+      return {
+        argv: [
+          "gemini",
+          "-m",
+          model.arg,
+          "--approval-mode",
+          "yolo",
+          "--skip-trust",
+        ],
+        env: {},
+        // No effort flag exists for gemini-cli; the CLI decides.
+        launch: launchConfig("gemini", model, CLI_DEFAULT),
+      };
+    },
   });
 }

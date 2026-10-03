@@ -18,10 +18,11 @@ import {
   existsSync,
   statSync,
   lstatSync,
-  realpathSync,
+  copyFileSync,
 } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..", "..", "..");
 const BOOT_PREPARE = join(REPO_ROOT, "bin", "boot-prepare.mjs");
@@ -39,13 +40,18 @@ interface BootJson {
 // test silently skip. The shim answers the probe and nothing else: the launcher.sh
 // these tests inspect is READ, never executed, so boot-prepare's own logic
 // (launcher generation, staging, sandbox layout, shadow homes, JSON output) is
-// still what is under test. 9.9.9 clears every adapter's min_version.
-// AIGENTRY_SHIM_LOG (unset here) makes it log argv if a future test needs that.
+// still what is under test. On Windows, shell:false needs a native executable:
+// a private Node copy answers --version and clears every adapter's min_version.
+// POSIX shims answer 9.9.9; AIGENTRY_SHIM_LOG optionally logs their argv.
 const SHIM_CLIS = ["claude", "codex", "gemini"] as const;
 
 function writeCliShims(binDir: string): void {
   mkdirSync(binDir, { recursive: true });
   for (const cli of SHIM_CLIS) {
+    if (process.platform === "win32") {
+      copyFileSync(process.execPath, join(binDir, `${cli}.exe`));
+      continue;
+    }
     const p = join(binDir, cli);
     writeFileSync(
       p,
@@ -98,18 +104,33 @@ function setupTempHome(): { home: string; targetCwd: string; cleanup: () => void
 // the machine happens to have installed, and HOME pointed at the fixture so
 // auto-trust cannot reach the developer's real ~/.claude.json. Both are derived
 // from the temp root that setupTempHome built, so every call site gets them.
-function hermeticEnv(home: string): Record<string, string> {
+function hermeticEnv(home: string, extraEnv: Record<string, string> = {}): NodeJS.ProcessEnv {
   const root = dirname(home);
-  return {
+  const env = { ...process.env };
+  const overrides = {
     AIGENTRY_HOME: home,
+    AIGENTRY_GEMINI_BINARY: "gemini", // pins the original Gemini CLI shadow-home tests
     HOME: join(root, "fakehome"),
-    PATH: `${join(root, "shimbin")}:${process.env["PATH"] ?? ""}`,
+    ...(process.platform === "win32" ? { USERPROFILE: join(root, "fakehome") } : {}),
+    PATH: `${join(root, "shimbin")}${delimiter}${process.env["PATH"] ?? ""}`,
+    ...extraEnv,
   };
+  for (const [key, value] of Object.entries(overrides)) {
+    // Windows spawn uses case-insensitive keys; inherited Path must not beat
+    // fixture PATH (especially the deliberately empty missing-CLI override).
+    if (process.platform === "win32") {
+      for (const inherited of Object.keys(env)) {
+        if (inherited.toUpperCase() === key.toUpperCase()) delete env[inherited];
+      }
+    }
+    env[key] = value;
+  }
+  return env;
 }
 
 function runBootPrepare(home: string, args: string[]): { code: number; stdout: string; stderr: string } {
-  const r = spawnSync("node", [BOOT_PREPARE, ...args], {
-    env: { ...process.env, ...hermeticEnv(home) },
+  const r = spawnSync(process.execPath, [BOOT_PREPARE, ...args], {
+    env: hermeticEnv(home),
     encoding: "utf8",
   });
   return { code: r.status ?? -1, stdout: r.stdout, stderr: r.stderr };
@@ -203,7 +224,7 @@ test("431-G — spawn_cwd is under role-sandbox, exists, has no CLAUDE.md", () =
     const r = runBootPrepare(home, ["--role", "coder", "--cwd", targetCwd, "--sid", "test-431-G"]);
     assert.equal(r.code, 0, `exit ${r.code} stderr=${r.stderr}`);
     const j = parseJson(r.stdout);
-    assert.match(j.spawn_cwd, /\/role-sandbox\/coder-test-431-G$/);
+    assert.equal(j.spawn_cwd, join(home, "role-sandbox", "coder-test-431-G"));
     assert.ok(existsSync(j.spawn_cwd));
     assert.equal(
       existsSync(join(j.spawn_cwd, "CLAUDE.md")),
@@ -276,7 +297,7 @@ test("431-I — absent CLI fails non-zero with CLI_NOT_FOUND (the arm the shim s
     const r = spawnSync(
       process.execPath,
       [BOOT_PREPARE, "--role", "coder", "--cwd", targetCwd, "--sid", "test-431-I"],
-      { env: { ...process.env, ...hermeticEnv(home), PATH: empty }, encoding: "utf8" },
+      { env: hermeticEnv(home, { PATH: empty }), encoding: "utf8" },
     );
     assert.notEqual(r.status, 0, `expected non-zero, got ${r.status}; stdout=${r.stdout}`);
     assert.match(r.stderr, /CLI_NOT_FOUND/, `stderr must name the failure; got: ${r.stderr}`);
@@ -286,7 +307,7 @@ test("431-I — absent CLI fails non-zero with CLI_NOT_FOUND (the arm the shim s
 });
 
 test("431-E — missing required arg surfaces usage exit (4)", () => {
-  const r = spawnSync("node", [BOOT_PREPARE, "--role", "coder"], { encoding: "utf8" });
+  const r = spawnSync(process.execPath, [BOOT_PREPARE, "--role", "coder"], { encoding: "utf8" });
   assert.equal(r.status, 4);
   assert.match(r.stderr, /--cwd required/);
 });
@@ -355,8 +376,8 @@ function runBootPrepareEnv(
   extraEnv: Record<string, string>,
   args: string[],
 ): { code: number; stdout: string; stderr: string } {
-  const r = spawnSync("node", [BOOT_PREPARE, ...args], {
-    env: { ...process.env, ...hermeticEnv(home), ...extraEnv },
+  const r = spawnSync(process.execPath, [BOOT_PREPARE, ...args], {
+    env: hermeticEnv(home, extraEnv),
     encoding: "utf8",
   });
   return { code: r.status ?? -1, stdout: r.stdout, stderr: r.stderr };
@@ -469,7 +490,7 @@ for (const m of CLI_MATRIX) {
 // trusted project (codex's own on-disk schema) so codex skips its blocking
 // folder-trust modal at boot, while the real ~/.codex/config.toml stays untouched
 // (credential/config boundary — we de-symlink, never write through the link).
-test("552-codex-E — shadow config.toml pre-trusts the sandbox cwd; real config untouched", () => {
+test("552-codex-E — shadow config.toml pre-trusts the sandbox cwd; real config untouched", async () => {
   const { home, targetCwd, cleanup } = setupTempHome();
   try {
     const codex = CLI_MATRIX.find((m) => m.cli === "codex")!;
@@ -486,12 +507,20 @@ test("552-codex-E — shadow config.toml pre-trusts the sandbox cwd; real config
     // Trust entry for the CANONICAL sandbox cwd (codex keys trust on getcwd(),
     // symlinks collapsed — e.g. macOS tmp /var → /private/var), in codex's
     // `[projects."<abspath>"]` + trust_level = "trusted" on-disk schema.
-    const canonicalCwd = realpathSync(j.spawn_cwd);
-    assert.ok(
-      shadowText.includes(`[projects."${canonicalCwd}"]`),
-      `shadow config must declare [projects."${canonicalCwd}"]; got:\n${shadowText}`,
+    const expectedCwd = join(home, "role-sandbox", "coder-t552-codex-E");
+    assert.equal(j.spawn_cwd, expectedCwd);
+    // Native realpath expands Windows short names; realpathSync can retain them.
+    const canonicalCwd = await realpath(expectedCwd);
+    // JSON quoting supplies TOML-compatible escapes for this native path.
+    const tableKey = `[projects.${JSON.stringify(canonicalCwd)}]`;
+    const tables = shadowText.split(/(?=^\s*\[)/m);
+    const sandboxTables = tables.filter((table) => table.trimStart().split(/\r?\n/, 1)[0] === tableKey);
+    assert.equal(
+      sandboxTables.length, 1,
+      `shadow config must declare exactly one ${tableKey}; got:\n${shadowText}`,
     );
-    assert.match(shadowText, /trust_level\s*=\s*"trusted"/, "must set trust_level = trusted");
+    assert.match(sandboxTables[0], /^trust_level\s*=\s*"trusted"\s*$/m,
+      "must set trust_level = trusted in the exact sandbox project table");
     // Real config contents preserved in the shadow copy (settings not dropped).
     assert.match(shadowText, /fake codex settings/, "shadow must preserve real config contents");
     // Shadow config is a REAL file, not a symlink into the real home — else the

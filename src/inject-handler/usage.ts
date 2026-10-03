@@ -19,6 +19,12 @@
 // block A untestable against the original bash, which is how the parity is measured
 // at all.
 //
+// ONE LINE IS NO LONGER VERBATIM (#1170): the `report` line said "nonterminal
+// observation + Layer-D cleanup schedule", and the report arm no longer schedules
+// cleanup — a textual REPORT is observation only. A false safety statement is worse
+// than a parity break, so that one line was rewritten in place; the line count (19),
+// the first and last lines and the truncation are unchanged.
+//
 // bin/inject-handler.sh is now an exec shim with no header of its own to print — same
 // move as src/dispatch/usage.ts (tranche 1), src/tracker/usage.ts (1b),
 // src/cleanup/usage.ts (2a), src/reconciler/usage.ts (2c), src/hitl/usage.ts (2d) and
@@ -28,7 +34,7 @@ export const USAGE = `# inject-handler.sh — Orchestrator-side dispatcher for i
 # Reads an inject body from stdin (or --body-file), parses it via the compiled
 # src/session/inject-parser.js, then takes the per-kind action:
 #
-#   report          → nonterminal observation + Layer-D cleanup schedule.
+#   report          → nonterminal observation only; never schedules cleanup.
 #                     telepty#60 Stage A: 0.8.0 has NO outcome protocol, so a
 #                     textual REPORT is an ordinary message. It cannot settle a
 #                     dispatch; it is recorded as evidence and named as such.

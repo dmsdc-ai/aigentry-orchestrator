@@ -11,8 +11,12 @@ REPO_ROOT="$(cd "$HERE/../.." && pwd -P)"
 # the cmux CLI contract verified live in SPEC 2026-06-06-cmux-adaptor-prune-status:
 #   F2 — the global `--json` flag PRECEDES the command (`cmux --json list-workspaces`).
 #   F3 — the listing shape is `{"workspaces":[{ref,...}]}` (no top-level array / `id`).
-#   F7/F9 — per-handle liveness is `sidebar-state`, judged by STDOUT: alive iff
-#           non-empty AND not an `Error:` line (a missing tab prints `Error:`).
+#   F7/F9 — per-handle liveness is `sidebar-state`. Per #1162(c) the ONLY "gone"
+#           answer is a FAILED probe (rc!=0) whose whole reply is exactly
+#           `Error: ERROR: Tab not found`, emitted on STDERR by cmux 0.64.20.
+#           A zero-exit reply carrying that text is NOT an answer (a state dump
+#           may contain it, and a refused daemon socket wears the same shape),
+#           so the stub must fail the probe to model a genuinely absent handle.
 CMUX_CALLS="$T_TMP/cmux-calls.log"
 cat > "$STUB_BIN/cmux" <<EOF
 #!/usr/bin/env bash
@@ -22,10 +26,12 @@ if [ "\$1" = "--json" ] && [ "\$2" = "list-workspaces" ]; then
 fi
 case "\$1" in
   sidebar-state)
-    # \$2=--workspace \$3=<id>; known handles are alive, unknown => Error: (F7).
+    # \$2=--workspace \$3=<id>; known handles are alive (state on stdout, rc=0),
+    # unknown => cmux 0.64.20's missing-handle answer: the exact line on stderr
+    # AND a non-zero exit (F7, #1162c).
     case "\${3:-}" in
-      ws-alive|ws-other) echo "tab=\${3} status_count=0";;
-      *) echo "Error: ERROR: Tab not found";;
+      ws-alive|ws-other) echo "tab=\${3} status_count=0"; exit 0;;
+      *) echo "Error: ERROR: Tab not found" >&2; exit 1;;
     esac
     ;;
   close-workspace)

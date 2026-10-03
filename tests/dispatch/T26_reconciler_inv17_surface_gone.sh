@@ -23,9 +23,12 @@ DISC_SEEN="2026-05-30T11:54:00Z"    # 360s disconnect age > 240s floor
 SID="sid-orphan"
 # F7/F9 surface_gone fixture: a well-formed but ABSENT cmux workspace UUID. The
 # liveness probe is now `sidebar-state --workspace <id>` (SPEC 2026-06-06), which
-# returns `Error: Tab not found` for an unknown handle => _wh_cmux_alive reports
-# gone. A non-UUID placeholder (e.g. "ws-gone") is instead loosely resolved by a
-# real cmux to the focused workspace (alive), so it can no longer signal gone.
+# FAILS for an unknown handle and prints exactly `Error: ERROR: Tab not found` on
+# stderr => _wh_cmux_alive reports gone. Per #1162(c) both halves are required:
+# a zero-exit reply that merely CONTAINS that text is a probe without an answer
+# and stays INDETERMINATE->alive. A non-UUID placeholder (e.g. "ws-gone") is
+# instead loosely resolved by a real cmux to the focused workspace (alive), so it
+# can no longer signal gone.
 WS_GONE="00000000-DEAD-BEEF-0000-000000000000"
 
 # --- stubs (reconciler prepends /usr/bin to PATH, so use env-injected paths) ---
@@ -48,8 +51,11 @@ chmod +x "$CLEANUP_STUB"
 # cmux stub (F9 contract). Used only where cmux is ABSENT (e.g. CI); on a dev box
 # the real cmux shadows it via the reconciler's PATH hardening (line "export
 # PATH=/opt/homebrew/bin:..."), but BOTH paths agree on "gone" for $WS_GONE:
-#   * `sidebar-state` on the absent UUID prints `Error:` (F7) => _wh_cmux_alive
-#     reports gone — the surface_gone signal under test.
+#   * `sidebar-state` on the absent UUID exits non-zero with exactly
+#     `Error: ERROR: Tab not found` on stderr (F7, #1162c) => _wh_cmux_alive
+#     reports gone — the surface_gone signal under test. Emitting that text on a
+#     SUCCESSFUL probe would be indeterminate, not gone, so the exit code and the
+#     exact-whole-reply match are both load-bearing here.
 #   * `--json list-workspaces` (flag first, F2) returns an empty workspace set so
 #     the step-2b prune never finds a candidate (no real workspace is touched).
 cat > "$STUB_BIN/cmux" <<'EOF'
@@ -58,7 +64,7 @@ if [ "$1" = "--json" ] && [ "$2" = "list-workspaces" ]; then
   echo '{"workspaces":[]}'; exit 0
 fi
 case "$1" in
-  sidebar-state) echo "Error: ERROR: Tab not found";;
+  sidebar-state) echo "Error: ERROR: Tab not found" >&2; exit 1;;
   *) exit 0;;
 esac
 EOF

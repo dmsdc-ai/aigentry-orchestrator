@@ -140,6 +140,12 @@ inject_peer() {
 # #835 — and the send no longer ends in `|| true`. §6 says the channel never
 # silently drops; a swallowed non-zero from `telepty inject` (which a 401 now
 # produces) is exactly a silent drop, with the caller told it escalated.
+#
+# #974/#836 — so the outcome is RETURNED, and only 0 may be reported as escalated:
+#   0 — `telepty inject` exited 0. That is CLI delivery, not an ACK: it does not
+#       show the orchestrator received or read the HOLD.
+#   1 — stale: a party is absent; nothing was sent.
+#   2 — undelivered: the one inject attempt exited non-zero (no retry).
 escalate_orchestrator() {
   local excerpt="$1" orch party live
   for party in "$from" "$to"; do
@@ -148,14 +154,17 @@ escalate_orchestrator() {
     if [ "$live" -eq 1 ]; then
       emit_tele peer_escalation_stale
       echo "ask.sh: escalation NOT sent for ${pairkey}__${thread} — '$party' is not a live session; an escalation about parties that do not exist claims more than it measured (recorded stale)" >&2
-      return 0
+      return 1
     fi
   done
   orch="${ORCH_SIDS%% *}"
-  "$TELEPTY" inject --from "$from" --submit "$orch" \
-    "HOLD: peer-comms guardrail | from: $from | to: $to | thread: $thread | $excerpt" \
-    || { emit_tele peer_escalation_undelivered
-         echo "ask.sh: ESCALATION UNDELIVERED for ${pairkey}__${thread} — telepty inject to '$orch' exited non-zero; the HOLD did NOT reach the orchestrator. Report it by hand." >&2; }
+  if "$TELEPTY" inject --from "$from" --submit "$orch" \
+    "HOLD: peer-comms guardrail | from: $from | to: $to | thread: $thread | $excerpt"; then
+    return 0
+  fi
+  emit_tele peer_escalation_undelivered
+  echo "ask.sh: ESCALATION UNDELIVERED for ${pairkey}__${thread} — telepty inject to '$orch' exited non-zero; the HOLD did NOT reach the orchestrator. Report it by hand." >&2
+  return 2
 }
 
 from=""; to=""; thread=""; conflict=0; action=""; text=""
@@ -281,15 +290,25 @@ case "$decision" in
     ;;
   CAP_TRIP)
     emit_tele peer_cap_tripped
-    escalate_orchestrator "cap=${ROUND_CAP} tripped (round $((ROUND_CAP+1)) refused) — orchestrator decides next steps (HITL)"
-    emit_tele peer_escalated_orchestrator
-    echo "ask.sh: ${ROUND_CAP}-round cap tripped for ${pairkey}__${thread} — refused + escalated to orchestrator" >&2
+    esc=0
+    escalate_orchestrator "cap=${ROUND_CAP} tripped (round $((ROUND_CAP+1)) refused) — orchestrator decides next steps (HITL)" || esc=$?
+    if [ "$esc" -eq 0 ]; then
+      emit_tele peer_escalated_orchestrator
+      echo "ask.sh: ${ROUND_CAP}-round cap tripped for ${pairkey}__${thread} — refused + escalated to orchestrator" >&2
+    else
+      echo "ask.sh: ${ROUND_CAP}-round cap tripped for ${pairkey}__${thread} — refused; NOT escalated (see the line above)" >&2
+    fi
     exit 7
     ;;
   CONFLICT)
-    escalate_orchestrator "CONFLICT → deliberation requested (≥3 parties) for ${pairkey}__${thread}"
-    emit_tele peer_escalated_deliberation
-    echo "ask.sh: --conflict on ${pairkey}__${thread} — refused + escalated to deliberation" >&2
+    esc=0
+    escalate_orchestrator "CONFLICT → deliberation requested (≥3 parties) for ${pairkey}__${thread}" || esc=$?
+    if [ "$esc" -eq 0 ]; then
+      emit_tele peer_escalated_deliberation
+      echo "ask.sh: --conflict on ${pairkey}__${thread} — refused + escalated to deliberation" >&2
+    else
+      echo "ask.sh: --conflict on ${pairkey}__${thread} — refused; NOT escalated (see the line above)" >&2
+    fi
     exit 8
     ;;
   *)

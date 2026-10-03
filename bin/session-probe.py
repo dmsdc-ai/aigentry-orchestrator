@@ -11,6 +11,12 @@ import subprocess
 import sys
 from typing import Any, TextIO
 
+# #751: the read-only current-viewport adapters. Sibling module, resolved from this file's
+# own bin/ (sys.path[0] when run as a script). It owns every target/currentness check and
+# fails closed with a content-free reason; this file stays a classifier and never reaches a
+# terminal itself.
+from current_screen import ScreenUnavailable, capture_object, read_current_screen
+
 
 SURFACE_UNKNOWN = "unknown"
 BRAILLE = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
@@ -18,19 +24,73 @@ BRAILLE = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
 BANNERS = {
     "claude": r"Welcome back|Tips for getting started|Trust this folder|Do you want to enable|Press Enter to continue",
     "codex": r"Welcome to .*Codex|OpenAI Codex CLI|Loading\u2026|Initializing",
-    "gemini": r"Welcome to Gemini|Loading model|Initializing|Authenticating",
+    # #1090: the `gemini` kind is also agy (Antigravity CLI, geminiBinary()). Its
+    # welcome header is "Antigravity CLI 1.1.27" (transiently "Welcome to the
+    # Antigravity CLI"), its boot shows "Accessing workspace: <cwd>", and its
+    # folder-trust modal asks "Do you trust the contents of this project?".
+    "gemini": r"Welcome to Gemini|Loading model|Initializing|Authenticating|Antigravity CLI|Accessing workspace|Do you trust the contents of this project",
 }
-PROMPTS = {"claude": r"\u276f", "codex": r"\u203a", "gemini": r"\u203a|\u2502 >"}
-HARD_NEG = r"Working\.\.\.|Thinking|esc to interrupt|Press Enter to continue|Do you trust"
+# #1090: agy's idle prompt is a bare `>` line framed by two horizontal rules
+# (measured live, 1.1.27): "────…\n>\n────…". Anchor on rule+`>` so a quoted
+# `> text` inside a reply never reads as the prompt.
+PROMPTS = {"claude": r"\u276f", "codex": r"\u203a", "gemini": r"\u203a|\u2502 >|\u2500{8,}\n>"}
+THINKING_ACTIVITY = r"(?m:^[ \t]*Thinking(?:\.{3}|…|[ \t]*\())"
+HARD_NEG = rf"Working\.\.\.|{THINKING_ACTIVITY}|esc to interrupt|Press Enter to continue|Do you trust"
 # #557: codex's `\u203a` REPL is interactive WHILE its MCP servers boot, but the
 # "Starting MCP servers (n/6) \u2026 (esc to interrupt)" status line trips HARD_NEG via
 # the "esc to interrupt" affordance. This pattern marks that boot status so the
 # ready probe can treat the prompt as ready during MCP boot (NOT a working spinner).
 CODEX_MCP_BOOT = r"Starting MCP servers?\s*\(\d+/\d+\)"
+# #1136: the CURRENT-viewport half of #557's contract. codex 0.133.x renders its EMPTY
+# composer with a fixed hint sitting ON the prompt row; it is recorded verbatim in
+# tests/dispatch/fixtures/codex_mcp_boot.txt as ` › Use /skills to list available skills`.
+# That row is codex's OWN placeholder chrome -- the same category as claude's `Try "…"` and
+# codex's `Ask Codex to do anything`, both of which the current-mode grammar below already
+# admits -- so the composer is empty and the `›` REPL accepts input while the servers boot.
+# It is admitted as ONE anchored literal, for the codex kind only. A generic `Use …` / `Ask
+# …` sentence, a typed command, or ANY text trailing the literal keeps reading as a
+# POPULATED composer. The arm says nothing beyond "the composer is empty": the surface,
+# busy/modal and binding gates each still have to pass on their own, so a promptless MCP
+# startup, active work, a trust/approval modal or an unbound viewport stay not-ready.
+CODEX_EMPTY_COMPOSER_HINT = r"Use /skills to list available skills"
+# #1136: telepty renders the whole Claude 2.1.281 TUI as ONE physical line, so the idle
+# prompt sits mid-line inside its input box and no positional arm in has_prompt reaches
+# it. The qualifier is the COMPLETE measured viewport, header to footer -- never a bare
+# glyph, and never just a pair of rules with whitespace between them: the "Claude Code
+# v<version>" header identity, then the top rule, the prompt glyph with its EMPTY input
+# row, then the bottom rule, then the known mode-hint footer chrome. Measured live on
+# 2.1.281. Prose that quotes the box in passing carries the chrome WITHOUT the header and
+# WITHOUT the footer, so narrative, blockquote and historical text keep reading unknown,
+# and any shape this does not recognize stays unknown rather than being guessed at.
+# This FRAMES the glyph, it does not authenticate it: a verbatim copy of a whole viewport
+# is indistinguishable from the viewport, a limit inherent to reading text.
+CLAUDE_HEADER_ID = r"Claude Code\s*v\d[\w.]*"
+CLAUDE_FOOTER_CHROME = r"shift\+tab to cycle|\? for shortcuts"
+CLAUDE_COLLAPSED_IDLE = (
+    rf"{CLAUDE_HEADER_ID}.*─{{8,}}❯[^\S\n]+─{{8,}}.*(?:{CLAUDE_FOOTER_CHROME})"
+)
 
 TRUST_MODAL = r"trust this folder|do you trust|Yes, (proceed|I trust)|Press Enter to continue"
-SANDBOX_PROMPT = r"Allow command\?|sandbox.*approv|approve this command|Do you want to (run|allow)"
-API_ERROR = r"API Error|api error|status 400|overloaded_error|rate.?limit|529|ECONNREFUSED|ETIMEDOUT"
+# #1091: `sandbox.*approv` was BOTH too loose and too narrow, measured today.
+# Too loose: telepty renders grok's TUI as ONE line, so the role-sandbox cwd header and
+# the "always-approve" footer of an IDLE grok sat on the same line and matched -> the
+# reconciler answered a sandbox prompt that was not there (policy SEND_KEY enter).
+# Too narrow: the REAL codex 0.153.4 approval modal (captured live into
+# tests/dispatch/fixtures/codex_sandbox_prompt.txt) contains no "sandbox…approv" text at
+# all -- it asks "Would you like to run the following command?" over a numbered option
+# list -- so the arm that existed for codex never actually matched codex. Both arms are
+# now the strings codex prints; the pre-existing legacy alternatives are untouched.
+SANDBOX_PROMPT = (
+    r"Allow command\?|approve this command|Do you want to (run|allow)"
+    r"|Would you like to run the following command\?"
+    r"|Yes, and don't ask again for commands that start with"
+)
+ERROR_PREFIX = r"^(?:[✖✘×⚠!]\ufe0f?[ \t]*)?"
+API_DIAGNOSTIC = ERROR_PREFIX + r"API Error:[ \t]*\S"
+API_ERROR = (
+    rf"(?:{API_DIAGNOSTIC}|"
+    rf"{ERROR_PREFIX}Connection failed:[ \t]*(?:ECONNREFUSED|ETIMEDOUT)\b)"
+)
 # #909: the one API-error surface with a KNOWN, self-healing remedy. Measured
 # verbatim from three cut turns on 2026-08-16: "API Error: Your computer went to
 # sleep mid-response. The response above may be incomplete." It is matched (and
@@ -43,8 +103,29 @@ SLEEP_CUT = r"computer went to sleep mid-response"
 THINKING_BLOCK = r"thinking.*block|invalid_request_error"
 CRASH = r"panic:|Traceback \(most recent|Segmentation fault|core dumped"
 UNSUBMITTED = r"\[context-ref\]|/shared/[0-9a-f]{6,}\.md"
-WORKING = r"esc to interrupt|Working\s*\(|Working\.\.\.|[\u2722\u2733\u2736\u273b\u273d]|\u23fa|\u27f3|Thinking|Compacting|Esc to interrupt"
-TRACKER_ERR = r"error:|traceback|panic:|command not found|killed:|exited [0-9]+"
+WORKING = rf"esc to interrupt|Working\s*\(|Working\.\.\.|[\u2722\u2733\u2736\u273b\u273d]|\u23fa|\u27f3|{THINKING_ACTIVITY}|Compacting|Esc to interrupt"
+# #1091: the ten BRAILLE cells above are the dots-spinner FRAMES, but a bare membership
+# test (`any(ch in tail for ch in BRAILLE)`) also matched grok's braille LOGO ART -- its
+# welcome box draws the xAI mark in braille, and with grok's whole TUI on one line the art
+# never scrolls out of the tail. An IDLE grok therefore read as surface=working /
+# tracker_class=active (verify_started false). A spinner is ONE isolated cell used as a
+# leading glyph before text; logo art is runs of ADJACENT cells. Measured against
+# grok_idle_settled.txt (art only -> no match) and active.txt / postinject_ok.txt /
+# codex-init-spinner.screen (real frames -> match).
+SPINNER = re.compile(rf"(?<![\u2800-\u28ff])[{BRAILLE}](?![\u2800-\u28ff])\s+\S")
+
+
+def has_spinner(text: str) -> bool:
+    """One shared reader for the braille spinner: classify_surface and tracker_class
+    disagreeing about what a spinner is was how the same screen read both idle and
+    active."""
+    return SPINNER.search(text) is not None
+
+
+TRACKER_ERR = (
+    rf"(?:{API_DIAGNOSTIC}|"
+    r"^(?:error:|traceback|panic:|command not found|killed:|exited [0-9]+))"
+)
 TRACKER_WELCOME = r"Welcome back|Tips for getting started|Trust this folder|Press Enter to continue"
 TRACKER_ACTIVE_TEXT = r"\(esc to interrupt\)|thinking with xhigh effort|\u23f5\s*\d+s"
 SAFE_SID = re.compile(r"^[A-Za-z0-9_.:@-]{1,160}$")
@@ -111,9 +192,112 @@ def tail(lines: list[str], count: int) -> str:
     return "\n".join(lines[-count:])
 
 
+def error_banner_lines(screen: str, count: int = 20) -> list[str]:
+    """Share eligible lines between the diagnostic and prompt readers.
+
+    Text alone cannot authenticate an unmarked copy of a provider banner.
+    Keep fence context from the whole capture, but match only its current tail.
+    """
+    plain = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", screen)
+    plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", plain)
+    lines = nonempty_lines(plain)
+    fence = ""
+    eligible = []
+    for index, line in enumerate(lines):
+        stripped = line.lstrip(" \t")
+        marker = re.match(r"(`{3,}|~{3,})", stripped)
+        if fence:
+            if marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence):
+                if not stripped[len(marker[1]):].strip():
+                    fence = ""
+            continue
+        if marker:
+            fence = marker[1]
+            continue
+        # Indented code is ineligible; readers anchor their recognized prefixes.
+        if line.expandtabs(4).startswith("    "):
+            continue
+        if index >= len(lines) - count:
+            eligible.append(stripped)
+    return eligible
+
+
+def has_api_error(screen: str) -> bool:
+    return any(re.match(API_ERROR, line, re.I) for line in error_banner_lines(screen))
+
+
+def has_thinking_block(screen: str) -> bool:
+    lines = error_banner_lines(screen)
+    for index, line in enumerate(lines):
+        if not re.match(API_DIAGNOSTIC, line, re.I):
+            continue
+        if re.search(THINKING_BLOCK, line, re.I):
+            return True
+        # Provider diagnostics can wrap immediately after the API status line.
+        if index + 1 < len(lines) and re.match(
+            r"(?:invalid_request_error\b|thinking\b.*block)", lines[index + 1], re.I
+        ):
+            return True
+    return False
+
+
+def has_prompt(cli: str, screen: str, count: int = 20) -> bool:
+    prompt = PROMPTS.get(cli, r"\u276f|\u203a")
+    eligible = "\n".join(error_banner_lines(screen, count))
+    final_line = "\n".join(error_banner_lines(screen, 1))
+    # Collapsed captures can retain a final prompt without a line boundary.
+    # Its position is observable; text alone cannot authenticate its recency.
+    return (
+        re.search(rf"^[ \t]*(?:{prompt})", eligible, re.M) is not None
+        or re.search(rf"(?<!\S)(?:{prompt})[ \t]*\Z", final_line) is not None
+        # A bare final prompt remains observable after an unmatched output fence.
+        or re.fullmatch(rf"[ \t]*(?:{prompt})[ \t]*", tail(nonempty_lines(screen), 1)) is not None
+        # #1136: the collapsed one-line Claude viewport -- the glyph is mid-line inside
+        # its input box on the final eligible line. Claude only, and only the complete
+        # header-to-footer shape: no other CLI kind, no bare or half-framed glyph, and no
+        # quoted box without the surrounding header and footer chrome takes this arm.
+        # Fence, indent and final-line eligibility stay exactly the ones the other arms
+        # use. Position is still all this observes; it never dates or authenticates.
+        or (cli == "claude" and re.search(CLAUDE_COLLAPSED_IDLE, final_line) is not None)
+    )
+
+
+def cli_kind_of(command: str) -> str:
+    """The kind behind a guard-launcher path, mirroring cliKindOf in src/dispatch/cli.ts.
+
+    #1091: dispatch passes --cli (since #1084) but dispatch-verify.sh and the reconciler do
+    not, and `info.command` for a worker is the guard launcher's PATH -- which names no CLI,
+    so every worker read as claude once its welcome header scrolled off. The launcher's own
+    `exec -a <kind>` line is the answer and is written by bin/boot-prepare.mjs. This is the
+    one-line read, not a port of the module.
+    """
+    base = os.path.basename(command)
+    if base in ("claude", "codex", "grok", "gemini"):
+        return base
+    if base == "agy":
+        return "gemini"
+    # Only ever a launcher script, and only its head: this path comes from the daemon, so it
+    # is read as data with a bounded size and never executed.
+    if not command.endswith(".sh") or not os.path.isfile(command):
+        return ""
+    try:
+        with open(command, encoding="utf-8", errors="replace") as handle:
+            head = handle.read(4096)
+    except OSError:
+        return ""
+    match = re.search(r"^exec -a (\S+)", head, re.M)
+    kind = match.group(1) if match else ""
+    return "gemini" if kind == "agy" else kind
+
+
 def cli_from_info_or_screen(info: dict[str, Any], screen: str, override: str = "") -> str:
     if override:
         return override
+    # The launcher read comes FIRST: a sid can carry a CLI name (this task's own session is
+    # "mr1091-mr1091-grok-agy"), and that sid is inside info.command's path.
+    launcher_kind = cli_kind_of(str(info.get("command") or ""))
+    if launcher_kind:
+        return launcher_kind
     raw = " ".join(
         str(v or "")
         for v in (
@@ -131,29 +315,27 @@ def cli_from_info_or_screen(info: dict[str, Any], screen: str, override: str = "
         return "claude"
     if re.search(r"OpenAI Codex CLI|Welcome to .*Codex", screen, re.I):
         return "codex"
-    if re.search(r"Welcome to Gemini", screen, re.I):
+    if re.search(r"Welcome to Gemini|Antigravity CLI", screen, re.I):
         return "gemini"
     return "claude"
 
 
-def tracker_class(screen: str) -> str:
+def tracker_class(screen: str, *, current: bool = False) -> str:
     lines = nonempty_lines(screen)
     if not lines:
         return "blank"
     tail20 = tail(lines, 20)
-    last3 = tail(lines, 3)
-    if re.search(TRACKER_ERR, tail20, re.I):
+    if any(re.match(TRACKER_ERR, line, re.I) for line in error_banner_lines(screen)):
         return "error"
-    welcome_in_tail = re.search(TRACKER_WELCOME, tail20, re.I)
-    prompt_in_last3 = (
-        re.search(r"^[\u276f\u203a]", last3, flags=re.MULTILINE) is not None
-        or "\u276f" in last3
-        or "\u203a" in last3
-    )
-    placeholder = re.search(r'[\u276f\u203a]\s+Try "[^"]+"', last3)
-    if welcome_in_tail and (placeholder or prompt_in_last3):
+    # #751: on a current viewport the welcome banner must be line anchored — reply prose
+    # quoting "Welcome back" is not a boot banner. The error and prompt readers stay the
+    # anchored release ones for BOTH modes.
+    welcome_in_tail = (current_prompt_control(TRACKER_WELCOME, tail20) if current
+                       else re.search(TRACKER_WELCOME, tail20, re.I))
+    prompt_in_last3 = has_prompt("", screen, 3)
+    if welcome_in_tail and prompt_in_last3:
         return "welcome"
-    if any(ch in tail20 for ch in BRAILLE) or re.search(TRACKER_ACTIVE_TEXT, tail20, re.I):
+    if has_spinner(tail20) or re.search(TRACKER_ACTIVE_TEXT, tail20, re.I):
         return "active"
     if prompt_in_last3:
         # telepty#60 Stage A: a prompt-like surface is an OBSERVATION. The old
@@ -171,8 +353,10 @@ def ready_by_screen(cli: str, screen: str) -> tuple[bool, str]:
     tail20 = tail(lines, 20)
     last3 = tail(lines, 3)
     banner = BANNERS.get(cli, r"Welcome|Initializing|Loading|Tips for getting started")
-    prompt = PROMPTS.get(cli, r"\u276f|\u203a")
+    prompt_observed = has_prompt(cli, screen)
 
+    if has_thinking_block(screen):
+        return False, "provider-rejection"
     if re.search(HARD_NEG, last3, re.I):
         # #557: a codex session mid MCP-server boot shows its interactive `›` REPL
         # alongside "Starting MCP servers (n/6) … (esc to interrupt)". That status
@@ -181,36 +365,124 @@ def ready_by_screen(cli: str, screen: str) -> tuple[bool, str]:
         codex_mcp_boot = (
             cli == "codex"
             and re.search(CODEX_MCP_BOOT, tail20, re.I)
-            and not re.search(r"Working|Thinking|Compacting", last3, re.I)
-            and re.search(prompt, tail20)
+            and not re.search(rf"Working|{THINKING_ACTIVITY}|Compacting", last3, re.I)
+            and prompt_observed
         )
         if not codex_mcp_boot:
             return False, "hard-negative"
-    if re.search(rf'(?m){prompt}\s+Try "[^"]+"', tail20) or re.search(prompt, tail20):
+    if prompt_observed:
         return True, "prompt"
     if re.search(banner, tail20, re.I):
         return False, "banner"
     return False, "no-prompt"
 
 
-def classify_surface(cli: str, screen: str) -> tuple[str, str]:
+def current_controls(cli: str, screen: str) -> str:
+    """Ignore only a rendered turn-duration footer, never live controls.
+
+    #1136: the `\u00b7 done` tail is OPTIONAL, measured. The actual current viewports of
+    two settled Claude sessions (input/idle-cv.screen, input/idle-st.screen) render the
+    completed row BARE -- "\u273b Brewed for 4m 40s" / "\u273b Cooked for 7m 37s" -- with an empty
+    composer and no interrupt affordance. Requiring `done` left that row in the controls
+    pass, where the generic leading-glyph busy test read it as a live status row and both
+    controller probes returned ready=false / current-busy-or-modal on genuinely idle
+    sessions. Only the tail is relaxed: the row must still be a single glyph, one
+    (optionally hyphenated) word, ` for `, and a numeric h/m/s duration, ending there or
+    at the already-recognized tool-use / clock tails. Anything else on the line -- an
+    ellipsis, `(esc to interrupt)`, a token-count suffix, a bare trailing `\u00b7` -- fails to
+    match, so the row stays and keeps blocking. Removal drops a spinner claim only; it
+    is not task-completion or approval authority.
+    """
+    if cli != "claude":
+        return screen
+    duration_footer = re.compile(
+        r"^\s*[\u2722\u2733\u2736\u273b\u273d]\s*[^\W\d_]+(?:-[^\W\d_]+)* for "
+        r"(?:\d+[hms]\s*)+(?:\s*\u00b7\s*done)?"
+        r"(?:\s+\(\d+ tool uses?\))?"
+        r"(?:\s+(?:(?:AM|PM|\uc624\uc804|\uc624\ud6c4)\s*)?"
+        r"\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?)?\s*$", re.I)
+    return "\n".join(line for line in screen.splitlines()
+                     if not duration_footer.fullmatch(line))
+
+
+def current_busy_signal(screen: str) -> bool:
+    # Inline prose quoting a control is not a status row. A standalone quoted
+    # control remains ambiguous and blocks regardless of distance from the prompt.
+    # #1136: the LEADING-GLYPH set of the Working/Thinking/Compacting arm also carries
+    # \u23fa and \u27f3, the two status glyphs the legacy WORKING pattern has always
+    # recognized. Measured: the claude working row in
+    # tests/fixtures/session-state/working-spinner.screen and
+    # tests/dispatch/fixtures/working_active.txt is "\u23fa Working... (5s \u00b7 esc to
+    # interrupt)" -- \u23fa is in neither the asterisk-spinner class above nor
+    # [\u25a0\u2022], and "esc to interrupt" sits mid-line rather than at line start, so a
+    # genuinely BUSY current viewport read as surface=unknown while the legacy path read it
+    # as working. The glyph is admitted ONLY in this arm, where the literal
+    # Working/Thinking/Compacting word must still follow: \u23fa is also claude's bullet for
+    # ordinary transcript rows ("\u23fa Read(file.ts)"), and widening the bare-glyph arm to
+    # cover it would make every settled transcript read busy.
+    pattern = (
+        r"^\s*(?:[\u2722\u2733\u2736\u273b\u273d]\s*\S"
+        r"|[\u23f5\u25b6].*esc to interrupt"
+        r"|(?:[\u25a0\u2022\u23fa\u27f3]\s*)?(?:Working|Thinking|Compacting)\b"
+        r"|(?:Esc to interrupt|Press Enter to continue|Do you trust)\b)"
+    )
+    return bool(re.search(pattern, screen, re.I | re.M) or has_spinner(screen))
+
+
+def current_prompt_control(pattern: str, screen: str) -> bool:
+    # Allow terminal borders, prompt/selection glyphs and numbered choices,
+    # but not a control phrase embedded in a reply sentence.
+    prefix = r"^[^\w\n]*(?:\d+[.)][^\w\n]*)?"
+    return re.search(prefix + "(?:" + pattern + ")", screen, re.I | re.M) is not None
+
+
+def ready_by_current_screen(cli: str, screen: str, surface: str) -> tuple[bool, str]:
+    if surface not in ("idle", "welcome", "working"):
+        return False, "current-surface-not-ready"
+    lines = nonempty_lines(screen)
+    prompt = PROMPTS.get(cli, r"\u276f|\u203a")
+    # A quoted prompt in the reply or a populated composer is not ready to accept
+    # another task. Historical fixture semantics are deliberately separate.
+    # #1136: codex's own empty-composer placeholder joins the recognized list for the codex
+    # kind only (see CODEX_EMPTY_COMPOSER_HINT). Case-sensitive and closed on both sides by
+    # the surrounding anchors, so nothing may precede or follow it on the prompt row.
+    hint = rf"|\s+{CODEX_EMPTY_COMPOSER_HINT}" if cli == "codex" else ""
+    if not re.search(rf"(?m)^\s*(?:{prompt})(?:\s*|\s+Try \"[^\"]+\"|\s+Ask Codex to do anything{hint})\s*$",
+                     tail(lines, 5)):
+        return False, "no-empty-current-prompt"
+    controls = current_controls(cli, screen)
+    if current_busy_signal(controls):
+        return False, "current-busy-or-modal"
+    if surface == "working":
+        return False, "current-working"
+    return True, "prompt"
+
+
+def classify_surface(cli: str, screen: str, *, current: bool = False) -> tuple[str, str]:
     lines = nonempty_lines(screen)
     if not lines:
         return SURFACE_UNKNOWN, "blank screen"
     tail20 = tail(lines, 20)
     last4 = tail(lines, 4)
 
-    if re.search(THINKING_BLOCK, tail20, re.I):
+    # The diagnostic readers are the anchored, fence-aware release ones in BOTH modes:
+    # has_thinking_block / has_api_error never degrade to an arbitrary substring search.
+    # Only the two approval/trust readers gain a current, line-anchored form, because a
+    # live viewport carries the modal's own borders, selector glyphs and numbered choices
+    # while a reply can merely quote the phrase.
+    if has_thinking_block(screen):
         return "thinking_block", "thinking-block / invalid request"
-    if re.search(SANDBOX_PROMPT, tail20, re.I):
+    if (current_prompt_control(SANDBOX_PROMPT, screen) if current else
+            re.search(SANDBOX_PROMPT, tail20, re.I)):
         return "sandbox_prompt", "sandbox approval prompt"
-    if re.search(TRUST_MODAL, tail20, re.I):
+    if (current_prompt_control(TRUST_MODAL, screen) if current else
+            re.search(TRUST_MODAL, tail20, re.I)):
         return "modal", "trust-folder or continue modal"
     if re.search(CRASH, tail20, re.I):
         return "crash", "crash / traceback"
     if re.search(SLEEP_CUT, tail20, re.I):
         return "sleep_cut", "host slept mid-response (resumable)"
-    if re.search(API_ERROR, tail20, re.I):
+    if has_api_error(screen):
         return "error", "API/transport error banner"
     if re.search(r"(\$|%|\u279c)\s*$", tail20) and not re.search(
         r"esc to interrupt|Working|\u276f|\u203a|\u273b|Esc to", tail20, re.I
@@ -218,14 +490,25 @@ def classify_surface(cli: str, screen: str) -> tuple[str, str]:
         return "raw_shell", "raw shell prompt at tail"
     if re.search(UNSUBMITTED, last4):
         return "unsubmitted", "context-ref still at live prompt"
-    if re.search(WORKING, tail20, re.I) or any(ch in tail20 for ch in BRAILLE):
+    if current and re.search(
+        r"^\s*[\u2722\u2733\u2736\u273b\u273d][^\n]*\bfor\s+"
+        r"(?:\d+[hms]\s*)+\s*\u00b7\s*done\b", screen, re.I | re.M
+    ):
+        # Recognized completed rows are removed on the controls pass. A remaining
+        # duration row is ambiguous, not evidence that work has started.
+        return SURFACE_UNKNOWN, "unrecognized completed duration row"
+    if (current_busy_signal(screen) if current else
+            re.search(WORKING, tail20, re.I) or has_spinner(tail20)):
         return "working", "working token"
 
     banner = BANNERS.get(cli, r"Welcome|Initializing|Loading|Tips for getting started")
-    prompt = PROMPTS.get(cli, r"\u276f|\u203a")
-    if re.search(banner, tail20, re.I):
+    if (current_prompt_control(banner, tail20) if current else
+            re.search(banner, tail20, re.I)):
         return "welcome", "welcome/bootstrap banner"
-    if re.search(prompt, tail20):
+    # Both modes read the prompt through has_prompt: fence/indent eligibility, the final
+    # eligible line and the #1136 collapsed-viewport qualifier are release guards and are
+    # not relaxed for a current viewport.
+    if has_prompt(cli, screen):
         return "idle", "idle prompt"
     return SURFACE_UNKNOWN, "no known surface signal"
 
@@ -239,7 +522,7 @@ def verification_problems(
     screen: str,
 ) -> list[str]:
     problems: list[str] = []
-    if health and "CONNECTED" not in health.upper():
+    if health.upper() != "CONNECTED":
         problems.append(f"transport {health} (not CONNECTED)")
     if not transport_ready or not bootstrap_ready:
         problems.append("not ready / bootstrap not ready")
@@ -271,50 +554,78 @@ def observe(args: argparse.Namespace) -> dict[str, Any]:
     probe_error = ""
     sid = safe_token(args.sid, SAFE_SID, "sid")
     telepty = safe_token(args.telepty, SAFE_CLI, "telepty executable")
+
+    def live_info() -> dict[str, Any]:
+        return capture_object([telepty, "session", "info", sid, "--json"])
+
     if args.info_file:
         info_text = read_text(args.info_file)
         info = load_json_text(info_text)
     else:
-        rc, out, err = run_capture([telepty, "session", "info", sid, "--json"])
-        info = load_json_text(out)
-        if rc != 0 or not out.strip():
-            probe_error = (err or "session info unavailable").strip()
+        # #751: one bounded, fail-closed live info reader, shared with the adapter's
+        # post-read re-check. Its reason is content-free -- command stderr is never
+        # forwarded into probe_error.
+        try:
+            info = live_info()
+        except ScreenUnavailable as exc:
+            info = {}
+            probe_error = str(exc)
 
+    # #751: live readiness consumes a CURRENT viewport. The historical `read-screen`
+    # ring is gone from this path entirely -- there is no fallback to it, because the
+    # observed bug was exactly a stale ring reading as live evidence. `--screen-file`
+    # remains the offline fixture path and keeps the legacy classifiers below.
+    screen_source = "fixture"
     if args.screen_file:
         screen = read_text(args.screen_file)
     else:
-        rc, out, err = run_capture(
-            [telepty, "read-screen", sid, "--lines", str(args.screen_lines)]
-        )
-        screen = out
-        if rc != 0 and not probe_error:
-            probe_error = (err or "read-screen unavailable").strip()
+        screen = ""
+        screen_source = "unavailable"
+        try:
+            if args.info_file:
+                raise ScreenUnavailable("live screen requires live session info")
+            screen, screen_source = read_current_screen(sid, info, live_info)
+        except ScreenUnavailable as exc:
+            probe_error = probe_error or str(exc)
 
     cli = cli_from_info_or_screen(info, screen, args.cli or "")
-    health = str(field(info, "healthStatus") or field(info, "transport", "health_status") or "")
+    health = field(info, "healthStatus") or field(info, "transport", "health_status") or ""
+    health = health if isinstance(health, str) else ""
     transport_ready = bool(field(info, "ready")) or bool(field(info, "transport", "ready"))
     raw_bootstrap = field(info, "transport", "bootstrap", "ready")
     bootstrap_ready = True if raw_bootstrap is None else bool(raw_bootstrap)
-    alive = bool(info) and (not health or "CONNECTED" in health.upper())
+    alive = bool(info) and health.upper() == "CONNECTED"
 
-    surface, surface_detail = classify_surface(cli, screen)
+    current = not args.screen_file
+    controls = current_controls(cli, screen) if current else screen
+    surface, surface_detail = classify_surface(cli, screen, current=current)
+    if current and surface in ("working", "idle", "welcome", SURFACE_UNKNOWN):
+        surface, surface_detail = classify_surface(cli, controls, current=True)
     unsubmitted = surface == "unsubmitted"
     working_token = surface == "working"
     activity = "moving" if working_token and not unsubmitted else "static"
-    screen_ready, ready_reason = ready_by_screen(cli, screen)
-    ready = bool(alive and transport_ready and bootstrap_ready and screen_ready)
+    screen_ready, ready_reason = (ready_by_current_screen(cli, screen, surface) if current
+                                  else ready_by_screen(cli, screen))
+    # Unavailable, blank, malformed, oversized or timed-out evidence leaves probe_error
+    # set, and cannot establish ready or verified-started.
+    ready = bool(not probe_error and alive and transport_ready and bootstrap_ready and screen_ready)
     problems = verification_problems(
         health, transport_ready, bootstrap_ready, surface, activity, screen
     )
-    verified_started = bool(alive and transport_ready and bootstrap_ready and not problems)
+    if probe_error:
+        problems.append("current-screen observation unavailable")
+    verified_started = bool(
+        not probe_error and alive and transport_ready and bootstrap_ready and not problems
+    )
 
     detail: dict[str, Any] = {
         "health": health,
         "transport_ready": transport_ready,
         "bootstrap_ready": bootstrap_ready,
         "ready_reason": ready_reason,
+        "screen_source": screen_source,
         "surface_detail": surface_detail,
-        "tracker_class": tracker_class(screen),
+        "tracker_class": tracker_class(controls, current=current),
         "verify_started": verified_started,
         "verify_problems": problems,
     }

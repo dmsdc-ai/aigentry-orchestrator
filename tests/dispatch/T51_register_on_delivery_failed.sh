@@ -11,6 +11,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
 t_setup; trap t_teardown EXIT
+t_confined_setup
 
 # Screen shows the placeholder still present after inject → verify_delivered fails.
 # (postinject_fail.txt also carries the `❯ Try "..."` prompt so is_ready passes.)
@@ -35,7 +36,7 @@ chmod +x "$PROBE"
 FAKE_OPEN_SESSION="$T_TMP/fake-open-session.sh"
 cat > "$FAKE_OPEN_SESSION" <<'SH'
 #!/usr/bin/env bash
-exit 0
+exec "$T_FIXTURE_NODE" "$T_FIXTURE_HELPER" receipt t51-fn
 SH
 chmod +x "$FAKE_OPEN_SESSION"
 
@@ -43,6 +44,7 @@ printf '%s' '[{"id":"t51-fn","command":"claude","healthStatus":"CONNECTED"}]' > 
 
 ref="$T_TMP/ref.md"
 printf 'a unique-line that will NOT appear on screen\n' > "$ref"
+t_confined_scope t51-fn 51 "$T_TMP/cwd"
 
 set +e
 HOME="$T_TMP/home" \
@@ -53,7 +55,7 @@ TELEPTY="$STUB_BIN/telepty" \
   "$REPO_ROOT/bin/dispatch.sh" --spawn-and-dispatch \
     --track t51 --name fn --cwd "$T_TMP/cwd" --cli claude \
     --from t51-test --ref "$ref" --timeout-ms 800 \
-    --verify-delivered --no-verify-started --no-task "test-fixture T51" \
+    --verify-delivered --no-verify-started --task 51 --role coder \
     >/dev/null 2>&1
 rc=$?
 set -e

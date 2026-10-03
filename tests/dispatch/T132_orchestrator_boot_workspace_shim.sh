@@ -30,6 +30,14 @@
 # ever issued, and the `telepty allow` at the end of every boot is a stub on PATH that
 # records its argv and exits. Everything is under $T_TMP; the repo tree's own state/ is
 # never written.
+#
+# #1181 — a bare non-TTY boot now exits 2 unless AIGENTRY_BOOT_PLAN=1 and a complete plan
+# are set (cli.ts refusePlan), so every boot below carries the SAME complete, benign,
+# explicit plan T131 uses: claude, approval=manual, history=new, nothing elevated and so no
+# AIGENTRY_BOOT_RISK_ACK. The layout, reconcile, guard, resolver and leak assertions are
+# unchanged; only the exec argv tail changed, and it is pinned as the exact line. Block N0
+# pins the refusal itself from the workspace layout: no plan → exit 2, zero effects, no exec.
+# The `ps` row still spells the old bypass argv: it is the STALE bridge being killed.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
@@ -97,17 +105,38 @@ chmod +x "$EXEC_DIR/telepty"
 export SINGLETON_PS_CMD="$PS_STUB" KILL_CMD="$KILL_STUB"
 export TELEPTY="$LIST_STUB" CURL="$CURL_STUB"
 export ORCHESTRATOR_SID="$SID" SINGLETON_SELF_PID=9999
+export ORCHESTRATOR_CLI=claude TELEPTY_PORT=3848
+export AIGENTRY_HOME="$T_TMP/home"
+mkdir -p "$AIGENTRY_HOME"
+# The complete, benign, explicit plan (#1181; see header) and the exact argv it execs.
+export AIGENTRY_BOOT_PLAN=1 AIGENTRY_BOOT_PERMISSION='approval=manual' AIGENTRY_BOOT_HISTORY=new
+PLAN_EXEC="allow --id $SID --auto-restart claude --permission-mode manual"
+
+# Every auth door is private; only B deliberately gives the two copies different tokens.
+export AUTH_LOG="$T_TMP/auth.log"
+: > "$AUTH_LOG"
+PRIVATE_AUTH="$T_TMP/telepty-auth.sh"
+cat > "$PRIVATE_AUTH" <<'EOF'
+#!/usr/bin/env bash
+telepty_auth_token() {
+  printf 'auth\n' >> "$AUTH_LOG"
+  printf 'tok-FIXTURE-T132'
+}
+EOF
 
 # ── the workspace: bin/ without dist/ ──
 WS="$T_TMP/workspace"
 mkdir -p "$WS/state/dispatch"
 cp -R "$REPO_ROOT/bin" "$WS/bin"
+cp "$PRIVATE_AUTH" "$WS/bin/lib/telepty-auth.sh"
 [ ! -e "$WS/dist" ] || fail "fixture is wrong: the workspace must not have a dist/"
 
-# ── the installed package, reachable only via its bin on PATH ──
+# ── the installed package: PATH fallback for the workspace, sibling dist/ for E ──
 PKG="$T_TMP/pkg"
 mkdir -p "$PKG/bin/init"
 cp -R "$REPO_ROOT/bin/lib" "$PKG/bin/lib"
+cp "$PRIVATE_AUTH" "$PKG/bin/lib/telepty-auth.sh"
+cp "$REPO_ROOT/bin/orchestrator-boot.sh" "$PKG/bin/orchestrator-boot.sh"
 printf '%s\n' '#!/usr/bin/env node' > "$PKG/bin/init/cli.mjs"
 chmod +x "$PKG/bin/init/cli.mjs"
 ln -s "$REPO_ROOT/dist" "$PKG/dist"
@@ -117,6 +146,34 @@ ln -s "$PKG/bin/init/cli.mjs" "$PKGBIN/aigentry-orchestrator"
 
 BOOT="$WS/bin/orchestrator-boot.sh"
 [ -x "$BOOT" ] || fail "the workspace copy is not executable — an operator following bin/init/cli.mjs:458 runs it directly"
+cd "$WS"
+
+# ===========================================================================
+# N0) no plan → the workspace boot is refused BEFORE any effect and never execs (#1181).
+#     Every read/act seam is one recorder, so a refusal that leaked past the gate would
+#     show up as a list, ps, kill or DELETE; the exec'd telepty is the owned EXEC_DIR stub.
+# ===========================================================================
+NP_LOG="$T_TMP/no-plan-effects.log"
+NP_REC="$STUB_BIN/no-plan-recorder132.sh"
+cat > "$NP_REC" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$NP_LOG"
+exit 97
+EOF
+chmod +x "$NP_REC"
+: > "$NP_LOG"; : > "$EXEC_LOG"; : > "$AUTH_LOG"
+set +e
+(unset AIGENTRY_BOOT_PLAN AIGENTRY_BOOT_PERMISSION AIGENTRY_BOOT_HISTORY
+ SINGLETON_PS_CMD="$NP_REC" KILL_CMD="$NP_REC" TELEPTY="$NP_REC" CURL="$NP_REC" \
+   PATH="$EXEC_DIR:$PKGBIN:$PATH" bash "$BOOT" >"$T_TMP/np.out" 2>"$T_TMP/np.err") </dev/null
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "N0: a no-plan workspace boot must exit 2, got $rc: $(cat "$T_TMP/np.err")"
+[ ! -s "$T_TMP/np.out" ] || fail "N0: the refusal wrote to stdout: $(cat "$T_TMP/np.out")"
+[ ! -s "$EXEC_LOG" ] || fail "N0: a no-plan workspace boot exec'd a bridge: $(cat "$EXEC_LOG")"
+[ ! -s "$NP_LOG" ] || fail "N0: the refusal listed, scanned, signalled or DELETEd: $(cat "$NP_LOG")"
+[ ! -s "$AUTH_LOG" ] || fail "N0: the refusal resolved a credential"
+grep -qF 'AIGENTRY_BOOT_PLAN' "$T_TMP/np.err" || fail "N0: the refusal does not name the opt-in"
 
 # ===========================================================================
 # A) a real boot from the workspace layout: the package's dist/ resolves, the
@@ -132,12 +189,14 @@ set -e
 }
 grep -q -- '-X DELETE' "$CURL_LOG" \
   || fail "A: the #905 reconcile did not run in the workspace layout; calls: $(cat "$CURL_LOG")"
-grep -qw 50349 "$KILL_LOG" \
+grep -qxF -- '-9 50349' "$KILL_LOG" \
   || fail "A: the singleton guard did not run in the workspace layout; kills: $(cat "$KILL_LOG")"
-grep -q -- "allow --id $SID --auto-restart claude --dangerously-skip-permissions --continue" "$EXEC_LOG" \
+[ "$(cat "$EXEC_LOG")" = "$PLAN_EXEC" ] \
   || fail "A: the workspace boot did not exec the bridge argv: $(cat "$EXEC_LOG")"
 [ -s "$T_TMP/a.out" ] \
   && fail "A: the workspace boot wrote to stdout — the argv channel leaked past the shim: $(cat "$T_TMP/a.out")"
+grep -qF 'tok-FIXTURE-T132' "$T_TMP/a.err" \
+  && fail "A: the fixture credential leaked into the log output"
 
 # ===========================================================================
 # B) the credential resolver comes from the WORKSPACE's bin/lib, not the package's.
@@ -153,8 +212,13 @@ cat > "$PKG/bin/lib/telepty-auth.sh" <<'EOF'
 telepty_auth_token() { printf 'tok-FROM-PACKAGE'; }
 EOF
 : > "$CURL_LOG"; : > "$KILL_LOG"; : > "$EXEC_LOG"
-PATH="$EXEC_DIR:$PKGBIN:$PATH" bash "$BOOT" >/dev/null 2>"$T_TMP/b.err" \
+PATH="$EXEC_DIR:$PKGBIN:$PATH" bash "$BOOT" >"$T_TMP/b.out" 2>"$T_TMP/b.err" \
   || fail "B: the workspace boot exited non-zero: $(cat "$T_TMP/b.err")"
+grep -q -- '-X DELETE' "$CURL_LOG" || fail "B: the workspace boot ran no reconcile"
+grep -qxF -- '-9 50349' "$KILL_LOG" || fail "B: the workspace boot ran no SIGKILL guard"
+[ "$(cat "$EXEC_LOG")" = "$PLAN_EXEC" ] \
+  || fail "B: the workspace boot did not exec the bridge argv"
+[ ! -s "$T_TMP/b.out" ] || fail "B: the workspace boot wrote to stdout"
 grep -qF 'tok-FROM-WORKSPACE' "$CURL_LOG" \
   || fail "B: the DELETE did not carry the WORKSPACE's credential — AIGENTRY_SHIM_SCRIPT_DIR was not honoured, so bin/lib/telepty-auth.sh was resolved against the compiled module's location instead. calls: $(cat "$CURL_LOG")"
 grep -qF 'tok-FROM-PACKAGE' "$CURL_LOG" \
@@ -162,19 +226,36 @@ grep -qF 'tok-FROM-PACKAGE' "$CURL_LOG" \
 # Invariant 4: the token never appears in the log stream either way.
 grep -q 'tok-FROM-' "$T_TMP/b.err" \
   && fail "B: the credential leaked into the log output: $(cat "$T_TMP/b.err")"
-# Restore the real resolver for the blocks below.
-cp "$REPO_ROOT/bin/lib/telepty-auth.sh" "$WS/bin/lib/telepty-auth.sh"
-cp "$REPO_ROOT/bin/lib/telepty-auth.sh" "$PKG/bin/lib/telepty-auth.sh"
+# Restore the private resolver for the blocks below; never read host credentials.
+cp "$PRIVATE_AUTH" "$WS/bin/lib/telepty-auth.sh"
+cp "$PRIVATE_AUTH" "$PKG/bin/lib/telepty-auth.sh"
 
 # ===========================================================================
-# C) `__probe` resolves in the workspace layout too — it is the seam T40 drives, and
-#    it must never reach the exec.
+# C) `__probe` resolves and evaluates the stale bridge through the real guard,
+#    but reports a dry-run verdict without effects or persistence changes.
 # ===========================================================================
-: > "$EXEC_LOG"; : > "$KILL_LOG"
-PATH="$EXEC_DIR:$PKGBIN:$PATH" bash "$BOOT" __probe singleton-guard >/dev/null 2>"$T_TMP/c.err" \
+mkdir -p "$T_TMP/c-before"
+cp -R "$WS" "$T_TMP/c-before/workspace"
+cp -R "$DISPATCH_STATE_DIR" "$T_TMP/c-before/dispatch-state"
+cp -R "$AIGENTRY_HOME" "$T_TMP/c-before/home"
+: > "$EXEC_LOG"; : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$AUTH_LOG"
+PATH="$EXEC_DIR:$PKGBIN:$PATH" bash "$BOOT" __probe singleton-guard >"$T_TMP/c.out" 2>"$T_TMP/c.err" \
   || fail "C: __probe singleton-guard failed in the workspace layout: $(cat "$T_TMP/c.err")"
-grep -qw 50349 "$KILL_LOG" || fail "C: the workspace probe ran no guard; kills: $(cat "$KILL_LOG")"
+grep -qF "[dry-run] would SIGKILL stale orchestrator bridge pid=50349 ($SID)" "$T_TMP/c.err" \
+  || fail "C: the workspace probe did not evaluate the stale bridge fixture"
+grep -qF "[dry-run] singleton guard done: would_kill=1 stale bridge(s) for $SID" "$T_TMP/c.err" \
+  || fail "C: the workspace probe did not report its dry-run guard summary"
+[ ! -s "$KILL_LOG" ] || fail "C: the workspace probe signalled a process"
+[ ! -s "$CURL_LOG" ] || fail "C: the workspace probe called curl"
+[ ! -s "$AUTH_LOG" ] || fail "C: the workspace probe resolved credentials"
 [ -s "$EXEC_LOG" ] && fail "C: __probe booted the orchestrator from the workspace layout: $(cat "$EXEC_LOG")"
+[ ! -s "$T_TMP/c.out" ] || fail "C: the singleton probe wrote to stdout"
+diff -r "$T_TMP/c-before/workspace" "$WS" \
+  || fail "C: the workspace probe changed workspace persistence"
+diff -r "$T_TMP/c-before/dispatch-state" "$DISPATCH_STATE_DIR" \
+  || fail "C: the workspace probe changed dispatch state"
+diff -r "$T_TMP/c-before/home" "$AIGENTRY_HOME" \
+  || fail "C: the workspace probe changed private home persistence"
 
 # ===========================================================================
 # D) the shim FAILS LOUD when neither layout resolves, and it fails BEFORE the exec.
@@ -209,12 +290,18 @@ else
 fi
 
 # ===========================================================================
-# E) neither layout is a fluke: the REPO tree (sibling dist/) still works.
+# E) neither layout is a fluke: the repo/package layout (sibling dist/) still works,
+#    through the copied shim and private resolver in the package fixture.
 # ===========================================================================
 : > "$EXEC_LOG"; : > "$KILL_LOG"; : > "$CURL_LOG"
-PATH="$EXEC_DIR:$PATH" bash "$REPO_ROOT/bin/orchestrator-boot.sh" >/dev/null 2>"$T_TMP/e.err" \
+PATH="$EXEC_DIR:$PATH" bash "$PKG/bin/orchestrator-boot.sh" >"$T_TMP/e.out" 2>"$T_TMP/e.err" \
   || fail "the repo-tree layout (sibling dist/) stopped working: $(cat "$T_TMP/e.err")"
-grep -qw 50349 "$KILL_LOG" || fail "the repo-tree boot ran no guard; kills: $(cat "$KILL_LOG")"
-grep -q -- "allow --id $SID" "$EXEC_LOG" || fail "the repo-tree boot did not exec: $(cat "$EXEC_LOG")"
+grep -qxF -- '-9 50349' "$KILL_LOG" || fail "the repo-tree boot ran no guard; kills: $(cat "$KILL_LOG")"
+grep -q -- '-X DELETE' "$CURL_LOG" || fail "E: the sibling-dist boot ran no reconcile"
+[ "$(cat "$EXEC_LOG")" = "$PLAN_EXEC" ] \
+  || fail "E: the sibling-dist boot did not exec the bridge argv"
+[ ! -s "$T_TMP/e.out" ] || fail "E: the sibling-dist boot wrote to stdout"
+grep -qF 'tok-FIXTURE-T132' "$T_TMP/e.err" \
+  && fail "E: the fixture credential leaked into the log output"
 
 echo "T132 PASS layouts=workspace+repo+unresolvable resolver=workspace-lib"

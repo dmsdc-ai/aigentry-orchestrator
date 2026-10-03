@@ -60,6 +60,8 @@ exit 0
 EOF
 chmod +x "$STUB"
 
+# #1162: the legacy pill is drawn only from real telepty evidence for THIS sid.
+printf '%s' '[{"id":"t56-pill","command":"claude","healthStatus":"CONNECTED"}]' > "$STUB_LIST_FILE"
 errf="$T_TMP/err.txt"; : > "$STUBLOG"; : > "$T_TMP/poll.cnt"
 set +e
 OUT=$(
@@ -80,9 +82,17 @@ ERRTXT=$(cat "$errf" 2>/dev/null || true)
 [ "$RC" -eq 0 ]                        || fail "A: rc=$RC want 0 (err: $ERRTXT)"
 printf '%s\n' "$OUT" | grep -qx "$REF" || fail "A: stdout='$OUT' want exactly '$REF'"
 
-# B) the #616 ⚡working pill was pushed under the `aigentry` key for the new ref.
+# B) #1162 G2c: no speculative ⚡working pill. The stub host does not advertise
+# agent metadata (its `capabilities` reply is empty ⇒ caps non-zero), so the pill is
+# the connection telepty actually reports for this sid, under the `aigentry` key.
+grep -qx "capabilities" "$STUBLOG" \
+  || fail "B: agent-metadata capabilities were not queried. stub log:
+$(cat "$STUBLOG")"
 grep -qF "set-status aigentry working" "$STUBLOG" \
-  || fail "B: #616 working pill not pushed. stub log:
+  && fail "B: a speculative working pill was pushed (#1162 removed it). stub log:
+$(cat "$STUBLOG")"
+grep -qF "set-status aigentry connected" "$STUBLOG" \
+  || fail "B: the telepty-evidenced connected pill was not pushed. stub log:
 $(cat "$STUBLOG")"
 grep -qF -- "--workspace $REF" "$STUBLOG" \
   || fail "B: set-status not targeted at the spawned ref '$REF'. stub log:

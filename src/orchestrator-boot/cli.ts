@@ -141,8 +141,27 @@
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import * as os from "node:os";
+import { createHash } from "node:crypto";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { USAGE } from "./usage.js";
+// #1181 — the boot plan. `plan.ts` is PURE (it is handed the environment, it reads none),
+// `wizard.ts` owns fd 0 and fd 2 and never touches fd 1, and `provider-capabilities.ts` is a
+// frozen literal that no code path executes a provider to populate. All three are imported
+// HERE, at the top of the one module the shim runs, and the plan they produce is resolved
+// BEFORE the first effect below.
+import {
+  type BootPlan,
+  PLAN_ENV,
+  buildExecArgv,
+  describeEffects,
+  describePlan,
+  parseEnvPlan,
+  planEnvLines,
+} from "./plan.js";
+import { runWizard } from "./wizard.js";
+// #1162 — the display-only controller boot record. Written once, from main() only.
+import { type PlanSource, controllerRecordRoot, writeControllerBootRecord } from "./boot-record.js";
 
 const env = process.env;
 
@@ -165,15 +184,20 @@ const env = process.env;
 // Measured on 1088ad7 before this landed, with ps/kill/telepty/curl recorders:
 // `--help`, `-h`, `--dry-run` and `--bogus-flag` all ran the reconcile, SIGKILLed the
 // fixture bridge and exec'd, each exiting 0. There was no unknown-flag arm to preserve.
-type Mode = "boot" | "probe" | "help" | "dry-run" | "unknown";
+//
+// #1181 ADDS ONE MODE AND NO NEW BOOT DOOR. `--wizard-plan` collects a plan and PRINTS it;
+// like every other non-empty argv it can never reach the exec, because the shim execs node
+// for any argv at all. The wizard itself is therefore NOT a flag: it runs on the EMPTY-argv
+// boot path, where the shim's command substitution leaves fd 0 and fd 2 attached to the
+// operator's terminal and takes only fd 1 for the argv.
+type Mode = "boot" | "probe" | "help" | "dry-run" | "wizard-plan" | "unknown";
 const CLI_ARGV = process.argv.slice(2);
 // argv[0] alone, and only when it is the ONLY token: `--dry-run --help` is a refusal
 // rather than a guess at which mode was meant. Nothing may be smuggled in behind a
 // recognised flag on a script whose bare form SIGKILLs processes.
 //
-// `probe` is listed FIRST and keeps every boot-path behaviour but the exec: T40, T131
-// and T132 drive the reconcile and the guard through it and read their stderr lines
-// and their stdout argv, so it must not be swept into the no-exec stream change below.
+// Probes retain their stdout argv/stderr diagnostics, but suppress every mutation
+// through the same effect gate as dry-run. Inspection must never DELETE or signal.
 const MODE: Mode =
   CLI_ARGV.length === 0
     ? "boot"
@@ -183,11 +207,13 @@ const MODE: Mode =
         ? "help"
         : CLI_ARGV.length === 1 && CLI_ARGV[0] === "--dry-run"
           ? "dry-run"
-          : "unknown";
-const DRY_RUN = MODE === "dry-run";
+          : CLI_ARGV.length === 1 && CLI_ARGV[0] === "--wizard-plan"
+            ? "wizard-plan"
+            : "unknown";
+const DRY_RUN = MODE === "dry-run" || MODE === "probe";
 // Every mode but `boot` and `__probe`. Used for the stream choice and the EPIPE arm
 // below, both of which must leave the boot path byte-identical.
-const NO_EXEC = MODE === "help" || MODE === "dry-run" || MODE === "unknown";
+const NO_EXEC = MODE === "help" || MODE === "dry-run" || MODE === "wizard-plan" || MODE === "unknown";
 
 // SCRIPT_DIR was `cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P` (bash :61). The shim
 // exports it so a symlinked entrypoint still locates bin/lib/telepty-auth.sh; the
@@ -199,7 +225,16 @@ const TELEPTY_AUTH_SH = path.join(SCRIPT_DIR, "lib/telepty-auth.sh");
 
 // Configurable orchestrator sid — same source as bin/dispatch-tracker.sh (Rule 16, no
 // hardcode). `:-` semantics: an EMPTY value falls back to the default, as in bash.
+//
+// This is the sid the D1 refusal below screens and the sid the wizard SUGGESTS. It is not
+// necessarily the sid this boot ends up using: the wizard may be given another one, so the
+// guard and the reconcile take the RESOLVED sid as an argument (#1181). Passing the env
+// value to them instead would SIGKILL and DELETE against a session this boot is not about
+// to become.
 const ORCH_SID = env.ORCHESTRATOR_SID || "orchestrator";
+// ORCHESTRATOR_CLI is read in plan.ts now, as one required field of an explicit plan
+// (v2/R2). There is no module-level default here any more, because a defaulted provider was
+// how `ORCHESTRATOR_CLI` alone came to authorise a bypass-and-resume argv nobody chose.
 
 // Test seams (hermetic T40/T131): the process lister, the killer and the self pid, so
 // the guard can be exercised with NO real process touched.
@@ -235,7 +270,15 @@ function log(msg: string): void {
 // The `[dry-run] ` tag is why no message below needed a conditional rewrite: the
 // reconcile's existing "Deleting it so this boot can claim the id." line is a verdict,
 // and the tag is what keeps it honest when nothing is actually deleted.
-const LOG_FD = NO_EXEC ? 1 : 2;
+//
+// ⚠️ TWO MODES ARE EXEMPT, and both send every diagnostic to fd 2 — including the D1
+// control-character refusal below, the one message that reaches an fd through this
+// constant rather than a literal. `--wizard-plan` (#1181): stdout is a MACHINE-REUSABLE
+// ENVIRONMENT, `NAME=value` lines on success and nothing on an ordinary refusal or
+// cancellation. The unknown-flag arm: its documented contract is stderr-only, so
+// `… --bogus > out` leaves `out` empty (#1181). `--help`, `--dry-run`, `__probe` and the
+// boot path keep the fd they always had — per-mode exemptions, not a logging change.
+const LOG_FD = NO_EXEC && MODE !== "wizard-plan" && MODE !== "unknown" ? 1 : 2;
 const LOG_TAG = DRY_RUN ? "[dry-run] " : "";
 
 /**
@@ -289,6 +332,59 @@ if (MODE !== "help" && hasControlChar(ORCH_SID)) {
   );
   process.exit(2);
 }
+
+// ── the plan, and the TWO ways a boot can get one (#1181, v2) ───────────────
+//
+// WIZARD        empty argv AND a terminal on both the channel the wizard reads (fd 0) and
+//               the channel it draws on (fd 2). The shim's command substitution takes fd 1
+//               only, so this is the shape a human at a prompt actually has.
+// EXPLICIT PLAN AIGENTRY_BOOT_PLAN=1 plus a COMPLETE, validated set of fields. For a caller
+//               with no terminal this is the ONLY door, and it fails closed: a missing
+//               permission or history choice is exit 2 before any read.
+//
+// THERE IS NO THIRD WAY, and that is the correction this revision makes. Until now
+// `ORCHESTRATOR_CLI=claude|codex` alone, with no terminal, booted a hardcoded
+// `--dangerously-skip-permissions --continue` (or codex's
+// `resume --last --dangerously-bypass-approvals-and-sandbox`). That argv chose a permission
+// BYPASS and a session RESUME on the operator's behalf, from a variable that names neither,
+// which is exactly what #1181 exists to end. It is gone: an environment that has not stated
+// its permission and history choices cannot boot at all.
+//
+// WHAT THE STDOUT-ARGV CONTRACT MEANS HERE. It is the serialization channel for the FINAL
+// VALIDATED command — one element per line, for the shell to exec. It was never a promise
+// that a particular risky default would keep appearing on it. Inherited guards that assert
+// the old default argv from a bare non-TTY invocation are therefore expected to be updated,
+// deliberately, by the independent tester; the product behaviour they pin is forbidden now.
+//
+// TTY ENV VALUES ARE SUGGESTIONS. On the wizard path nothing in the environment confirms
+// anything: ORCHESTRATOR_SID pre-fills a prompt the operator still presses Enter on, and
+// ORCHESTRATOR_CLI is displayed as a hint next to a list the operator still chooses from.
+const PLAN_FIELDS = [PLAN_ENV.model, PLAN_ENV.effort, PLAN_ENV.permission, PLAN_ENV.history, PLAN_ENV.ack] as const;
+const PLAN_FLAG = env.AIGENTRY_BOOT_PLAN;
+const PLAN_FIELD_SET = PLAN_FIELDS.filter((name) => {
+  const v = env[name];
+  return v !== undefined && v !== "";
+});
+// Unknown/multiple modes refuse: the ONLY accepted value is "1". A caller that wrote
+// `AIGENTRY_BOOT_PLAN=true` must be told, not silently treated as having no plan.
+if (MODE !== "help" && PLAN_FLAG !== undefined && PLAN_FLAG !== "" && PLAN_FLAG !== "1") {
+  writeOut(2, `orchestrator-boot.sh: ${PLAN_ENV.enable} must be exactly '1' (got '${PLAN_FLAG}')\n`);
+  writeOut(2, `${USAGE}\n`);
+  process.exit(2);
+}
+const PLAN_REQUESTED = PLAN_FLAG === "1";
+// A plan field set without the opt-in is a refusal, not an ignore. Silently dropping a
+// permission axis a caller took the trouble to set is the worst outcome available here.
+if (MODE !== "help" && !PLAN_REQUESTED && PLAN_FIELD_SET.length > 0) {
+  writeOut(
+    2,
+    `orchestrator-boot.sh: ${PLAN_FIELD_SET.join(", ")} set without ${PLAN_ENV.enable}=1 — refusing to ` +
+      "ignore an explicit boot plan\n",
+  );
+  writeOut(2, `${USAGE}\n`);
+  process.exit(2);
+}
+const WIZARD_TTY = process.stdin.isTTY === true && process.stderr.isTTY === true;
 
 // ── the ps snapshot ─────────────────────────────────────────────────────────
 type Row = { pid: string; ppid: string; cmd: string[] };
@@ -345,7 +441,7 @@ function selfAncestry(rows: Row[]): Set<string> {
 }
 
 /**
- * D4 — is this row's ARGV a `telepty allow --id <ORCH_SID>` invocation?
+ * D4 — is this row's ARGV a `telepty allow --id <sid>` invocation?
  *
  * bash asked whether the row CONTAINED the string `telepty allow --id <sid> `, which
  * an operator's own `pgrep -fl telepty` satisfies. This asks whether the process IS
@@ -373,7 +469,7 @@ const INTERPRETERS = new Set(["node", "nodejs"]);
 function mentionsTelepty(cmd: string[]): boolean {
   return cmd.some((t) => t.includes("telepty"));
 }
-function isOrchestratorBridge(cmd: string[]): boolean {
+function isOrchestratorBridge(cmd: string[], sid: string): boolean {
   if (cmd.length === 0) return false;
   let i = 0;
   if (INTERPRETERS.has(path.basename(cmd[0]))) i = 1;
@@ -381,25 +477,25 @@ function isOrchestratorBridge(cmd: string[]): boolean {
   if (path.basename(cmd[i]) !== "telepty") return false;
   if (cmd[i + 1] !== "allow") return false;
   for (let j = i + 2; j + 1 < cmd.length; j++) {
-    if (cmd[j] === "--id" && cmd[j + 1] === ORCH_SID) return true;
+    if (cmd[j] === "--id" && cmd[j + 1] === sid) return true;
   }
   return false;
 }
 
 /**
  * `orchestrator_singleton_guard()` (bash :103-124) — SIGKILL every
- * `telepty allow --id $ORCH_SID` process EXCEPT self and self's ancestors. Idempotent:
+ * `telepty allow --id <sid>` process EXCEPT self and self's ancestors. Idempotent:
  * a no-op for zero bridges or a lone self bridge. MUST run BEFORE the new bridge
  * exists (temporal protection, invariant 1).
  *
  * `kill`'s stdio is fully ignored, not inherited: stdout belongs to the exec argv now.
  */
-function orchestratorSingletonGuard(): void {
+function orchestratorSingletonGuard(sid: string): void {
   const rows = parseRows(psSnapshot());
   const ancestry = selfAncestry(rows);
   let killed = 0;
   for (const r of rows) {
-    if (!isOrchestratorBridge(r.cmd)) {
+    if (!isOrchestratorBridge(r.cmd, sid)) {
       // Silent on every path but --dry-run, where the near misses ARE the report: a
       // human reads a dry run to find out why the thing that looks like a bridge is
       // not one. Only rows that MENTION telepty get a line — those are exactly the
@@ -408,13 +504,13 @@ function orchestratorSingletonGuard(): void {
       // argv, which is a new leak rather than a diagnostic.
       if (DRY_RUN && mentionsTelepty(r.cmd)) {
         log(
-          `skip pid=${r.pid} — not a bridge: its argv is not '[node] telepty allow --id ${ORCH_SID}' (${r.cmd.join(" ")})`,
+          `skip pid=${r.pid} — not a bridge: its argv is not '[node] telepty allow --id ${sid}' (${r.cmd.join(" ")})`,
         );
       }
       continue;
     }
     if (ancestry.has(r.pid)) {
-      log(`skip self/ancestor bridge pid=${r.pid} (${ORCH_SID})`);
+      log(`skip self/ancestor bridge pid=${r.pid} (${sid})`);
       continue;
     }
     if (DRY_RUN) {
@@ -423,7 +519,7 @@ function orchestratorSingletonGuard(): void {
       // already been printed by the same code. tests/dispatch/T134 block D drives the
       // dry run and a real run through ONE ps fixture and diffs the two pid sets.
       log(
-        `would SIGKILL stale orchestrator bridge pid=${r.pid} (${ORCH_SID}) — argv matches 'telepty allow --id ${ORCH_SID}' and the pid is neither self nor an ancestor`,
+        `would SIGKILL stale orchestrator bridge pid=${r.pid} (${sid}) — argv matches 'telepty allow --id ${sid}' and the pid is neither self nor an ancestor`,
       );
       killed += 1;
       continue;
@@ -431,7 +527,7 @@ function orchestratorSingletonGuard(): void {
     // invariant 2: "-9" is the ONLY signal argument in this file.
     const k = spawnSync(KILL_CMD, ["-9", r.pid], { stdio: ["ignore", "ignore", "ignore"] });
     if (k.status === 0) {
-      log(`SIGKILL stale orchestrator bridge pid=${r.pid} (${ORCH_SID})`);
+      log(`SIGKILL stale orchestrator bridge pid=${r.pid} (${sid})`);
       killed += 1;
     } else {
       log(`kill -9 pid=${r.pid} failed (already gone?)`);
@@ -443,8 +539,8 @@ function orchestratorSingletonGuard(): void {
   // on a SIGKILL path. The boot path's bytes are untouched.
   log(
     DRY_RUN
-      ? `singleton guard done: would_kill=${killed} stale bridge(s) for ${ORCH_SID}`
-      : `singleton guard done: killed=${killed} stale bridge(s) for ${ORCH_SID}`,
+      ? `singleton guard done: would_kill=${killed} stale bridge(s) for ${sid}`
+      : `singleton guard done: killed=${killed} stale bridge(s) for ${sid}`,
   );
 }
 
@@ -494,7 +590,7 @@ function teleptyAuthToken(): string {
  * place on purpose, because an unrecognised listing shape is an UNKNOWN and an unknown
  * must never authorise a DELETE aimed at the orchestrator's own id (#835).
  */
-function orchestratorRegistryReconcile(): void {
+function orchestratorRegistryReconcile(sid: string): void {
   const r = spawnSync(TELEPTY_CMD, ["list", "--json"], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],
@@ -523,11 +619,11 @@ function orchestratorRegistryReconcile(): void {
 
   const rec = Array.isArray(parsed)
     ? (parsed.find(
-        (x) => x !== null && typeof x === "object" && (x as Record<string, unknown>).id === ORCH_SID,
+        (x) => x !== null && typeof x === "object" && (x as Record<string, unknown>).id === sid,
       ) as Record<string, unknown> | undefined)
     : undefined;
   if (rec === undefined) {
-    log(`registry reconcile: no record for '${ORCH_SID}' — nothing to reconcile`);
+    log(`registry reconcile: no record for '${sid}' — nothing to reconcile`);
     return;
   }
 
@@ -546,32 +642,32 @@ function orchestratorRegistryReconcile(): void {
     // 2026-03-14), and deleting its record would race a session that is coming back.
     // STALE is the daemon saying that window has already closed.
     log(
-      `registry reconcile: record for '${ORCH_SID}' is ${health} (clients=${clients || "unknown"}) — left alone; only a STALE record with 0 clients is reconciled`,
+      `registry reconcile: record for '${sid}' is ${health} (clients=${clients || "unknown"}) — left alone; only a STALE record with 0 clients is reconciled`,
     );
     return;
   }
   if (clients === "") {
     log(
-      `registry reconcile: record for '${ORCH_SID}' is STALE but the listing reports no client count — unknown is not zero, leaving it alone`,
+      `registry reconcile: record for '${sid}' is STALE but the listing reports no client count — unknown is not zero, leaving it alone`,
     );
     return;
   }
   if (clients !== "0") {
     log(
-      `registry reconcile: record for '${ORCH_SID}' is STALE but ${clients} client(s) are attached — leaving it alone`,
+      `registry reconcile: record for '${sid}' is STALE but ${clients} client(s) are attached — leaving it alone`,
     );
     return;
   }
 
   log(
-    `registry reconcile: '${ORCH_SID}' is STALE with 0 clients — a record whose owner is gone and whose owner token no new bridge can present (#815). Deleting it so this boot can claim the id.`,
+    `registry reconcile: '${sid}' is STALE with 0 clients — a record whose owner is gone and whose owner token no new bridge can present (#815). Deleting it so this boot can claim the id.`,
   );
   if (DRY_RUN) {
     // The one arm that acts, reported and not taken. The verdict line above already
     // said WHY; this says what would go on the wire and that nothing did. The token is
     // not resolved here at all, let alone printed (invariant 4).
     log(
-      `would DELETE http://127.0.0.1:${TELEPTY_PORT}/api/sessions/${ORCH_SID} — nothing was sent`,
+      `would DELETE http://127.0.0.1:${TELEPTY_PORT}/api/sessions/${sid} — nothing was sent`,
     );
     return;
   }
@@ -587,25 +683,25 @@ function orchestratorRegistryReconcile(): void {
       `x-telepty-token: ${teleptyAuthToken()}`,
       "-X",
       "DELETE",
-      `http://127.0.0.1:${TELEPTY_PORT}/api/sessions/${ORCH_SID}`,
+      `http://127.0.0.1:${TELEPTY_PORT}/api/sessions/${sid}`,
     ],
     { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
   );
   const http = chomp(c.stdout || "");
   if (http === "200") {
-    log(`DELETE /api/sessions/${ORCH_SID} → 200 (stale record removed; the id is claimable)`);
+    log(`DELETE /api/sessions/${sid} → 200 (stale record removed; the id is claimable)`);
   } else if (http === "404") {
-    log(`DELETE /api/sessions/${ORCH_SID} → 404 (already gone — someone or something beat us to it)`);
+    log(`DELETE /api/sessions/${sid} → 404 (already gone — someone or something beat us to it)`);
   } else if (http === "401" || http === "403") {
     log(
-      `DELETE /api/sessions/${ORCH_SID} → ${http} (daemon refused the credential — the STALE record STAYS and the exec below will very likely be refused the owner claim; check that authToken in ~/.telepty/config.json is readable)`,
+      `DELETE /api/sessions/${sid} → ${http} (daemon refused the credential — the STALE record STAYS and the exec below will very likely be refused the owner claim; check that authToken in ~/.telepty/config.json is readable)`,
     );
   } else if (http === "000" || http === "") {
     log(
-      `DELETE /api/sessions/${ORCH_SID} → no answer from the daemon (the STALE record STAYS; nothing was removed)`,
+      `DELETE /api/sessions/${sid} → no answer from the daemon (the STALE record STAYS; nothing was removed)`,
     );
   } else {
-    log(`DELETE /api/sessions/${ORCH_SID} → ${http} (unexpected; the record may still be there)`);
+    log(`DELETE /api/sessions/${sid} → ${http} (unexpected; the record may still be there)`);
   }
 }
 
@@ -624,30 +720,210 @@ function orchestratorRegistryReconcile(): void {
 // saved the workers on 2026-08-16, and it would not have prevented that incident. WS
 // reconnect and re-register are unconditional and have nothing to do with this flag
 // (cli.js:2224-2256, scheduleReconnect, landed 2026-03-14).
-const ORCH_EXEC_ARGV = [
-  "telepty",
-  "allow",
-  "--id",
-  ORCH_SID,
-  "--auto-restart",
-  "claude",
-  "--dangerously-skip-permissions",
-  "--continue",
-];
+//
+// THE HARDCODED TAIL IS GONE (#1181 v2). What used to live here was
+//
+//     claude --dangerously-skip-permissions --continue
+//     codex resume --last --dangerously-bypass-approvals-and-sandbox
+//
+// selected by `ORCHESTRATOR_CLI`. Both lines chose a permission bypass AND a session resume
+// from a variable that names neither, on the process that becomes the control tower. There is
+// no code path left that can produce them unless an operator names each part and — for the
+// bypass — types an acknowledgement for it.
+//
+// WHAT SURVIVES IS THE HEAD, and it is still FIXED DATA: every plan's argv begins
+// `telepty allow --id <sid> --auto-restart` (plan.ts buildExecArgv), so `--auto-restart`'s
+// measured pre-command position, telepty's lifecycle and the singleton guard's `--id <sid>`
+// match token are identical on both remaining paths. Only the tail after `--auto-restart`
+// comes from the plan.
 
 /**
  * Invariant 3 — hand the argv back to the shim, one element per line, and let the
  * SHELL exec it. This process must be gone before the bridge exists.
+ *
+ * Called ONCE, from one place, and only after the plan is confirmed and every guard has
+ * run. A second caller would be a second boot.
  */
-function emitExecArgv(): void {
-  writeOut(1, `${ORCH_EXEC_ARGV.join("\n")}\n`);
+function emitExecArgv(argv: readonly string[]): void {
+  writeOut(1, `${argv.join("\n")}\n`);
 }
 
-function main(): never {
-  orchestratorRegistryReconcile();
-  orchestratorSingletonGuard();
-  log(`exec ${ORCH_EXEC_ARGV.join(" ")}`);
-  emitExecArgv();
+// ── plan resolution ─────────────────────────────────────────────────────────
+// What a resolved boot looks like to the rest of this file: the argv to hand back, the
+// SELECTED cli (what the capture validator must measure), the sid the guard and the reconcile
+// must act on, the plan itself for the review and the dry-run report, and which door the plan
+// came through (#1162: provenance for the display-only boot record, nothing else).
+type Resolution = {
+  readonly argv: readonly string[];
+  readonly cli: string;
+  readonly sid: string;
+  readonly plan: BootPlan;
+  readonly planSource: PlanSource;
+};
+
+function resolutionOf(plan: BootPlan, planSource: PlanSource): Resolution {
+  return { argv: buildExecArgv(plan), cli: plan.provider.key, sid: plan.sid, plan, planSource };
+}
+
+/**
+ * The ONE refusal every incomplete environment lands on. It names each offending field, prints
+ * the usage that documents the schema, and stops — before the capture validation, before the
+ * registry read, before the process scan.
+ */
+function refusePlan(errors: readonly { field: string; message: string }[]): never {
+  writeOut(2, "orchestrator-boot.sh: refusing to boot — the boot plan is not complete/valid.\n");
+  for (const e of errors) writeOut(2, `  ${e.field} ${e.message}\n`);
+  writeOut(
+    2,
+    "There is no fallback. An incomplete plan is never completed with a default permission, a\n" +
+      "silent resume, or a hardcoded bypass argv. On a terminal, run a bare " +
+      "'bin/orchestrator-boot.sh'\nand choose; to produce this environment from a reviewed " +
+      "plan, run '--wizard-plan'.\n",
+  );
+  writeOut(2, `${USAGE}\n`);
+  process.exit(2);
+}
+
+/**
+ * The non-prompting resolution, used by `--dry-run` and `__probe` — both of which must stay
+ * read-only and must never block on a terminal.
+ *
+ * A complete explicit plan is the ONLY thing it can resolve. Without one it refuses, on a
+ * terminal as much as off it: `--dry-run` has to produce the same bytes from a script, a pipe
+ * and a prompt, so it cannot be the mode that asks.
+ */
+function resolveWithoutPrompting(): Resolution {
+  if (!PLAN_REQUESTED)
+    refusePlan([
+      {
+        field: PLAN_ENV.enable,
+        message:
+          "=1 is required, with a complete plan, for any boot that is not an interactive " +
+          "wizard on a terminal. ORCHESTRATOR_CLI alone is not authority for a permission " +
+          "mode or for resuming a conversation, and there is no longer a default for either",
+      },
+    ]);
+  const result = parseEnvPlan(env, process.cwd());
+  if (!result.ok) refusePlan(result.errors);
+  return resolutionOf(result.plan, "env-plan");
+}
+
+/**
+ * The boot path's resolution. A terminal gets the wizard; everything else must have stated a
+ * complete plan.
+ *
+ * CANCELLATION EXITS NON-ZERO WITH AN EMPTY STDOUT, which is the whole of the cancel
+ * contract: the shim's `set -e` aborts at the command substitution, its "printed no exec
+ * argv" arm is the backstop under that, and no reconcile, SIGKILL, DELETE, credential read
+ * or provider invocation has happened, because the wizard runs BEFORE all of them.
+ */
+async function resolveForBoot(): Promise<Resolution> {
+  if (!WIZARD_TTY) return resolveWithoutPrompting();
+  const outcome = await runWizard({ out: process.stderr, input: process.stdin, env, cwd: process.cwd() });
+  if (outcome.kind === "cancelled") {
+    writeOut(2, `[orchestrator-boot] ${outcome.reason} — nothing was listed, deleted, signalled or exec'd.\n`);
+    // 1, not 2: this is the operator's own decision, not a refusal of bad input. Either way
+    // stdout is empty and the shim cannot exec.
+    process.exit(1);
+  }
+  return resolutionOf(outcome.plan, "wizard");
+}
+
+async function validateCapture(cli: string): Promise<void> {
+  // The SELECTED cli, not the env's: a plan that chose codex must be measured as codex, and
+  // a plan that chose anything else must not be measured as codex just because the
+  // environment still mentions it.
+  if (cli !== "codex") return;
+  try {
+    const workspace = path.resolve(SCRIPT_DIR, "..");
+    const home = env.AIGENTRY_HOME || path.join(os.homedir(), ".aigentry");
+    for (const file of [path.join(workspace, ".aigentry-native-capture.lock"),
+      path.join(workspace, ".aigentry-preservation.lock"), path.join(home, ".aigentry-preservation.lock")]) {
+      try { fs.lstatSync(file); throw new Error("pending operation"); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
+    const stampPath = path.join(workspace, ".aigentry-init.json");
+    let stampBytes: Buffer;
+    try {
+      const st = fs.lstatSync(stampPath);
+      if (!st.isFile() || st.isSymbolicLink() || st.nlink !== 1) throw new Error("unsafe stamp");
+      stampBytes = fs.readFileSync(stampPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    const stamp = JSON.parse(stampBytes.toString("utf8")) as {
+      nativeCapture?: { outputs?: Record<string, { hash: string; mode: number; uid: number; gid: number }> };
+    };
+    if (!stamp.nativeCapture) return;
+    if (fs.realpathSync.native(workspace) !== workspace || fs.realpathSync.native(process.cwd()) !== workspace)
+      throw new Error("wrong control workspace");
+    // Verify both modules BEFORE import: validation cannot safely execute a changed adapter.
+    for (const rel of ["bin/init/native-capture.mjs", "bin/init/preservation.mjs"]) {
+      const file = path.join(workspace, rel), expected = stamp.nativeCapture.outputs?.[rel];
+      if (!expected || fs.realpathSync.native(file) !== file) throw new Error("missing adapter identity");
+      const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      try {
+        const st = fs.fstatSync(fd);
+        if (!st.isFile() || st.nlink !== 1 || (st.mode & 0o777) !== expected.mode ||
+          st.uid !== expected.uid || st.gid !== expected.gid ||
+          createHash("sha256").update(fs.readFileSync(fd)).digest("hex") !== expected.hash)
+          throw new Error("adapter changed");
+      } finally { fs.closeSync(fd); }
+    }
+    const adapter = await import(pathToFileURL(path.join(workspace, "bin/init/native-capture.mjs")).href) as {
+      validateNativeBoot: (request: { workspace: string; home: string }) =>
+        { status: string; source: string; definitionHash: string } | null;
+    };
+    const status = adapter.validateNativeBoot({ workspace, home });
+    if (!status) throw new Error("missing native registration");
+    writeOut(2, `[orchestrator-boot] Native capture installed/pending-review: ${status.source}\n` +
+      `[orchestrator-boot] UserPromptSubmit SHA-256 ${status.definitionHash}; open /hooks to review. ` +
+      "Effective enabled/trust state is unverified; launch does not establish capture readiness.\n");
+  } catch {
+    writeOut(2, "[orchestrator-boot] Native capture static validation failed; inspect installation/operation before boot.\n");
+    process.exit(2);
+  }
+}
+
+/**
+ * THE ORDER IS STILL THE CONTRACT, with ONE step added in front of it (#1181).
+ *
+ * Plan resolution and the operator's confirmation run BEFORE validateCapture(), before the
+ * registry reconcile and before the singleton SIGKILL guard. That order is the point: a
+ * wizard that DELETEd a registry record and SIGKILLed bridges and then asked "are you
+ * sure?" would be a worse footgun than the one #934 closed. Everything after the plan is
+ * exactly what it was — reconcile, then guard, then hand the argv back to the shim.
+ */
+async function main(): Promise<never> {
+  const resolved = await resolveForBoot();
+  await validateCapture(resolved.cli);
+  // The RESOLVED sid, not the environment's: the wizard may have been given another one, and
+  // a DELETE or a SIGKILL aimed at the env's id would hit a session this boot is not about to
+  // become. In an explicit plan the two are the same value by construction, because
+  // ORCHESTRATOR_SID *is* the plan's sid field.
+  orchestratorRegistryReconcile(resolved.sid);
+  orchestratorSingletonGuard(resolved.sid);
+  // #1162 — DISPLAY-ONLY boot record (boot-record.ts), after every guard and before the argv.
+  // Best effort and never authority: it cannot exit, never writes fd 1, makes no host or network
+  // call, and changes neither the argv nor the exit code. Its one stderr line is fixed vocabulary.
+  let bootRecord: string;
+  try {
+    const r = writeControllerBootRecord(controllerRecordRoot(env), {
+      sid: resolved.sid,
+      planSource: resolved.planSource,
+      cli: resolved.cli,
+      model: resolved.plan.model,
+      effort: resolved.plan.effort,
+      env,
+    });
+    bootRecord = `${r.outcome} relation=${r.relation}`;
+  } catch {
+    bootRecord = "skipped:error relation=none";
+  }
+  writeOut(2, `[orchestrator-boot] boot record: ${bootRecord}\n`);
+  log(`exec ${resolved.argv.join(" ")}`);
+  emitExecArgv(resolved.argv);
   process.exit(0);
 }
 
@@ -670,11 +946,59 @@ function help(): never {
  * confuse — the prefix is for the human and for any script that grew up reading this
  * output, neither of whom should ever find a bare `telepty` alone on a line here.
  */
-function dryRun(): never {
-  orchestratorRegistryReconcile();
-  orchestratorSingletonGuard();
-  log(`would exec ${ORCH_EXEC_ARGV.join(" ")} (one element per line below)`);
-  for (const a of ORCH_EXEC_ARGV) writeOut(1, `[would-exec] ${a}\n`);
+async function dryRun(): Promise<never> {
+  // VALIDATE ONLY, and never prompt (#1181): a dry run must be runnable from a script, from a
+  // pipe and from a terminal with the same bytes, so it resolves the plan the non-interactive
+  // way even when a terminal is present — and refuses an incomplete environment exactly as a
+  // non-interactive boot would. It says so rather than leaving the operator to wonder why no
+  // wizard appeared.
+  const resolved = resolveWithoutPrompting();
+  // Capture is validated before any report line, as in main() and probe(): a refused dry run
+  // leaves stdout empty instead of describing effects it will never reach (#1181).
+  await validateCapture(resolved.cli);
+  log(`plan source: ${PLAN_ENV.enable}=1 explicit plan (validated; nothing below was acted on)`);
+  for (const line of describePlan(resolved.plan)) log(`plan  ${line}`);
+  for (const line of describeEffects(resolved.plan)) log(`would ${line}`);
+  if (WIZARD_TTY)
+    log(
+      "this terminal WOULD get the interactive wizard on a bare 'bin/orchestrator-boot.sh'; " +
+        "--dry-run deliberately does not prompt, so what it reports is the plan this environment states",
+    );
+  orchestratorRegistryReconcile(resolved.sid);
+  orchestratorSingletonGuard(resolved.sid);
+  log(`would exec ${resolved.argv.join(" ")} (one element per line below)`);
+  for (const a of resolved.argv) writeOut(1, `[would-exec] ${a}\n`);
+  process.exit(0);
+}
+
+/**
+ * `--wizard-plan` (#1181) — COLLECT A PLAN, PRINT IT, ACT ON NOTHING.
+ *
+ * This is how an automated caller gets a correct `AIGENTRY_BOOT_PLAN=1` environment without
+ * anyone hand-writing one: a human runs the wizard once, copies the lines, and the plan they
+ * reviewed is the plan the script will carry. It cannot boot — it has a non-empty argv, so
+ * the shim exec'd node and there is no command substitution left to read it — and it never
+ * reconciles, never signals and never resolves a credential.
+ */
+async function wizardPlan(): Promise<never> {
+  if (!WIZARD_TTY) {
+    writeOut(2, "orchestrator-boot.sh: --wizard-plan needs a terminal on stdin and stderr; there is nothing to collect a plan from here\n");
+    process.exit(2);
+  }
+  const outcome = await runWizard({ out: process.stderr, input: process.stdin, env, cwd: process.cwd() });
+  if (outcome.kind === "cancelled") {
+    writeOut(2, `[orchestrator-boot] ${outcome.reason} — no plan was printed and nothing was acted on.\n`);
+    process.exit(1);
+  }
+  // fd 1 here carries the PLAN, not an argv: this mode is unreachable from the boot path's
+  // command substitution, and every line is a NAME=value pair rather than a bare token.
+  //
+  // This loop is the ONLY write to fd 1 anywhere on this mode's paths, and it runs only after
+  // a confirmed plan exists. `LOG_FD` is fd 2 here (see its definition), so the note below,
+  // the no-terminal refusal, the cancellation notice and the D1 refusal all leave stdout
+  // empty. An fd-1 I/O failure inside this loop can still leave a partial capture.
+  for (const line of planEnvLines(outcome.plan)) writeOut(1, `${line}\n`);
+  log("plan printed; nothing was reconciled, signalled, deleted or exec'd. Set these in the caller's environment.");
   process.exit(0);
 }
 
@@ -699,18 +1023,22 @@ function unknownFlag(): never {
 // the code production actually runs. Internal surface: not a flag, not documented,
 // no caller outside tests/dispatch/. The shim routes `__probe` straight to node so a
 // probe can never reach the exec.
-function probe(argv: string[]): never {
+async function probe(argv: string[]): Promise<never> {
+  // The probe resolves the plan the non-prompting way, so an inspection can never block on a
+  // terminal and can never be the thing that asks a human to authorise an elevated boot.
+  const resolved = resolveWithoutPrompting();
+  await validateCapture(resolved.cli);
   const sub = argv[0];
   if (sub === "singleton-guard") {
-    orchestratorSingletonGuard();
+    orchestratorSingletonGuard(resolved.sid);
     process.exit(0);
   }
   if (sub === "registry-reconcile") {
-    orchestratorRegistryReconcile();
+    orchestratorRegistryReconcile(resolved.sid);
     process.exit(0);
   }
   if (sub === "exec-argv") {
-    emitExecArgv();
+    emitExecArgv(resolved.argv);
     process.exit(0);
   }
   fs.writeSync(2, `orchestrator-boot.sh: unknown __probe subcommand: ${String(sub)}\n`);
@@ -724,17 +1052,20 @@ function probe(argv: string[]): never {
 // the two halves agree even if this file is run directly.
 switch (MODE) {
   case "probe":
-    probe(CLI_ARGV.slice(1));
+    await probe(CLI_ARGV.slice(1));
     break;
   case "help":
     help();
     break;
   case "dry-run":
-    dryRun();
+    await dryRun();
+    break;
+  case "wizard-plan":
+    await wizardPlan();
     break;
   case "unknown":
     unknownFlag();
     break;
   default:
-    main();
+    await main();
 }

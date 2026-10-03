@@ -8,6 +8,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
 t_setup; trap t_teardown EXIT
+t_confined_setup
+t_confined_target sid-A
 t_init_v2
 
 ref="$T_TMP/ref.md"; printf 'sidecar payload\n' > "$ref"
@@ -33,6 +35,7 @@ t_assert_observation sid-A dispatch_tracking_started
 
 # and a fresh dispatch writes no sidecar at all — the file is neither read nor
 # written after activation.
+t_confined_target sid-B
 printf '%s' '[{"id":"sid-B","command":"claude","healthStatus":"CONNECTED"}]' > "$STUB_LIST_FILE"
 ref2="$T_TMP/ref2.md"; printf 'second payload\n' > "$ref2"
 t_run_dispatch --target sid-B --ref "$ref2" --no-verify-started \

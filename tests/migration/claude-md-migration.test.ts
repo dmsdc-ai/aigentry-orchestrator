@@ -28,6 +28,7 @@ async function findRepoRoot(): Promise<string> {
 }
 
 const REPO_ROOT = await findRepoRoot();
+const FIXTURE_BASE = path.parse(REPO_ROOT).root;
 const SRC_COMMON = path.join(REPO_ROOT, "tooling/instructions/common.md");
 const SRC_ORCH = path.join(REPO_ROOT, "tooling/instructions/roles/orchestrator.md");
 
@@ -38,18 +39,18 @@ async function readSrc(p: string): Promise<string> {
 test("M1. Resolver composes orchestrator effective_prompt from new layered content", async () => {
   const common = await readSrc(SRC_COMMON);
   const orchestrator = await readSrc(SRC_ORCH);
-  const ROOT = "/instr";
+  const ROOT = path.join(FIXTURE_BASE, "instr");
   const vfs = memoryFs({
-    [`${ROOT}/common.md`]: common,
-    [`${ROOT}/roles/orchestrator.md`]: orchestrator,
-    "/work/orch/.git": "",
+    [path.join(ROOT, "common.md")]: common,
+    [path.join(ROOT, "roles", "orchestrator.md")]: orchestrator,
+    [path.join(FIXTURE_BASE, "work", "orch", ".git")]: "",
   });
   const r = await resolveInstructions(
     {
       role: Role.orchestrator,
-      cwd: "/work/orch",
+      cwd: path.join(FIXTURE_BASE, "work", "orch"),
       task_prompt: "DISPATCH TASK\n",
-      task_source_path: "/dispatch/x.md",
+      task_source_path: path.join(FIXTURE_BASE, "dispatch", "x.md"),
       instructions_root: ROOT,
     },
     vfs,
@@ -71,20 +72,20 @@ test("M2. effective_prompt for orchestrator does NOT contain role-heavy CLAUDE.m
   // reading the repo cwd CLAUDE.md (which is now a stub). The resolver only
   // touches files under instructions_root + the caller-supplied task body.
   const orchestrator = await readSrc(SRC_ORCH);
-  const ROOT = "/instr";
+  const ROOT = path.join(FIXTURE_BASE, "instr");
   const vfs = memoryFs({
-    [`${ROOT}/common.md`]: "",
-    [`${ROOT}/roles/orchestrator.md`]: orchestrator,
-    "/work/orch/.git": "",
+    [path.join(ROOT, "common.md")]: "",
+    [path.join(ROOT, "roles", "orchestrator.md")]: orchestrator,
+    [path.join(FIXTURE_BASE, "work", "orch", ".git")]: "",
     // Note: deliberately do NOT seed any CLAUDE.md path here — resolver
     // must never read from cwd to compose role content.
   });
   const r = await resolveInstructions(
     {
       role: Role.orchestrator,
-      cwd: "/work/orch",
+      cwd: path.join(FIXTURE_BASE, "work", "orch"),
       task_prompt: "T\n",
-      task_source_path: "/dispatch/x.md",
+      task_source_path: path.join(FIXTURE_BASE, "dispatch", "x.md"),
       instructions_root: ROOT,
     },
     vfs,
@@ -94,24 +95,24 @@ test("M2. effective_prompt for orchestrator does NOT contain role-heavy CLAUDE.m
   // Sanity: source_path of the role layer points into instructions_root,
   // not into a CLAUDE.md path.
   const roleLayer = r.layers.find((l) => l.layer === "role")!;
-  assert.ok(roleLayer.source_path.endsWith("roles/orchestrator.md"));
+  assert.equal(roleLayer.source_path, path.join(ROOT, "roles", "orchestrator.md"));
   assert.ok(!roleLayer.source_path.includes("CLAUDE.md"));
 });
 
 test("M3. Digest deterministic across two back-to-back resolves with the new content", async () => {
   const common = await readSrc(SRC_COMMON);
   const orchestrator = await readSrc(SRC_ORCH);
-  const ROOT = "/instr";
+  const ROOT = path.join(FIXTURE_BASE, "instr");
   const seed = {
-    [`${ROOT}/common.md`]: common,
-    [`${ROOT}/roles/orchestrator.md`]: orchestrator,
-    "/work/orch/.git": "",
+    [path.join(ROOT, "common.md")]: common,
+    [path.join(ROOT, "roles", "orchestrator.md")]: orchestrator,
+    [path.join(FIXTURE_BASE, "work", "orch", ".git")]: "",
   };
   const ctx = {
     role: Role.orchestrator,
-    cwd: "/work/orch",
+    cwd: path.join(FIXTURE_BASE, "work", "orch"),
     task_prompt: "T\n",
-    task_source_path: "/dispatch/x.md",
+    task_source_path: path.join(FIXTURE_BASE, "dispatch", "x.md"),
     instructions_root: ROOT,
   } as const;
   const a = await resolveInstructions(ctx, memoryFs(seed));

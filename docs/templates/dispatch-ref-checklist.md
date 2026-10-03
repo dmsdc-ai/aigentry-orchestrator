@@ -52,9 +52,12 @@ If `dispatch_kind: re-dispatch`:
 ## F. Boundary & full capability
 
 - [ ] **§Boundary lists explicit do-nots** (no cross-repo, no extra session spawn, etc.)
+- [ ] **Coupled-file scope and independent verification**: list the exact same-task file set, coupling reason and single-writer ownership; assign independent tests/review to separate workers and parallelize independent units (Rules 9/10/36, 2026-09-19 approval). Bundling is not permission to widen scope.
 - [ ] **§Boundary lists escalation triggers** (which conditions require HOLD before destructive action)
 - [ ] **§Full capability lists allowed tools** (Read/Edit/Bash/etc.) — receiver knows what is authorized
 - [ ] **§Full capability lists allowed skills + MCP servers** (or explicit "none")
+- [ ] **Actual confinement verified before spawn/resume**: task/sid/attempt and allowed read/write/command/network/tool scope, enforcement evidence and fail-closed behavior are recorded; cwd/worktree/prompt restrictions alone do not pass (Rule 46)
+- [ ] **Production acceptance scoped**: stage result versus product completion, remaining validation/install/release owners and explicit N/A reasons are recorded (Rule 45)
 
 ## G. Orchestrator-side hygiene
 
@@ -65,9 +68,9 @@ If `dispatch_kind: re-dispatch`:
 
 ---
 
-## Quick-check (TL;DR — 8 lines)
+## Quick-check
 
-If you cannot answer YES to all 8 below, do NOT inject:
+If any applicable check below fails, do NOT inject:
 
 1. dispatch_kind front-matter set?
 2. Self-contained disclaimer at top?
@@ -81,6 +84,7 @@ If you cannot answer YES to all 8 below, do NOT inject:
    Any list, count, or file/door/caller inventory you hand a worker is *your past measurement*, not a
    fact. Say what you counted and how, and tell them to re-measure it in source before building on it.
    Measured: 3 of 3 workers who re-measured an orchestrator-supplied enumeration found an error in it.
+10. Actual confinement, production acceptance and remaining role owners recorded?
 
 ---
 

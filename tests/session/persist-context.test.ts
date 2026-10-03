@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
-import { existsSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -135,21 +135,49 @@ test("T6 concurrent same-id different-bytes: exactly one wins, no torn write", a
   } finally { await rmRoot(paths); }
 });
 
-test("T7 path canonicalization: symlink + .. → realpath in index, load via un-normalized works", async () => {
+test("T7 path canonicalization: symlink + .. → realpath in index, load via un-normalized works", async (t) => {
   const paths = await mkRoot("t7-real");
   const realRoot = await fs.realpath(paths.sessionsRoot);
   const linkParent = await fs.mkdtemp(path.join(os.tmpdir(), "aigentry-mf5-t7-link-"));
   try {
     const linkPath = path.join(linkParent, "sessions-symlink");
-    await fs.symlink(paths.sessionsRoot, linkPath);
-    const linked: PathConfig = { sessionsRoot: path.join(linkPath, "sub", "..") };
-    await persistContext(fixture({ session_id: "sess-T7" }), linked);
-    const entry = (await readIdx(linked)).sessions.find((e: { id: string }) => e.id === "sess-T7");
-    assert.ok(entry);
-    assert.ok(!entry.path.includes("/..") && !entry.path.includes("symlink"));
-    assert.equal(entry.path, await fs.realpath(entry.path));
-    assert.ok(entry.path.startsWith(realRoot));
-    assert.ok(await loadContext("sess-T7", linked));
+    await fs.mkdir(path.join(paths.sessionsRoot, "sub"));
+    await fs.symlink(paths.sessionsRoot, linkPath, "dir");
+    const linked: PathConfig = { sessionsRoot: `${linkPath}${path.sep}sub${path.sep}..` };
+    const roots = [linked, paths, { sessionsRoot: realRoot }, { sessionsRoot: linkPath }];
+    const ctx = fixture({ session_id: "sess-T7" });
+    const first = await persistContext(ctx, linked);
+    assert.equal(first.alreadyPersisted, false);
+    const target = path.join(paths.sessionsRoot, ctx.session_id, "context.json");
+    const expected = process.platform === "win32" ? await fs.realpath(target) : realpathSync(target);
+    const before = await fs.readFile(target);
+    const mtime = statSync(target).mtimeMs;
+    if (process.platform === "win32") {
+      t.diagnostic(JSON.stringify({ root: paths.sessionsRoot, generic: realpathSync(paths.sessionsRoot), native: realpathSync.native(paths.sessionsRoot), promise: realRoot }));
+    }
+    await new Promise((res) => setTimeout(res, 20));
+    for (const root of roots) {
+      const loaded = await loadContext(ctx.session_id, root);
+      assert.deepEqual(loaded, ctx);
+      assert.equal(sha256Hex(canonicalBytes(loaded)), first.sha256);
+      const retry = await persistContext(ctx, root);
+      assert.equal(retry.alreadyPersisted, true);
+      assert.equal(retry.sha256, first.sha256);
+      assert.deepEqual(await fs.readFile(target), before);
+      assert.equal(statSync(target).mtimeMs, mtime);
+      const idx = await readIdx(root);
+      assert.equal(idx.sessions.length, 1);
+      assert.equal(idx.sessions[0].id, ctx.session_id);
+      assert.equal(idx.sessions[0].path, expected);
+      assert.equal(idx.sessions[0].sha256, first.sha256);
+    }
+    await assert.rejects(
+      () => persistContext({ ...ctx, role: Role.tester }, { sessionsRoot: realRoot }),
+      isCode("MUTATION_BLOCKED"),
+    );
+    assert.deepEqual(await fs.readFile(target), before);
+    assert.equal(statSync(target).mtimeMs, mtime);
+    assert.equal((await readIdx(paths)).sessions.length, 1);
   } finally {
     await fs.rm(linkParent, { recursive: true, force: true });
     await rmRoot(paths);
@@ -245,7 +273,18 @@ test("defaultPathConfig honors AIGENTRY_SESSIONS_ROOT env override", async () =>
   const prev = process.env["AIGENTRY_SESSIONS_ROOT"];
   process.env["AIGENTRY_SESSIONS_ROOT"] = tmp;
   try {
-    assert.equal(defaultPathConfig().sessionsRoot, await fs.realpath(tmp));
+    const expected = process.platform === "win32" ? await fs.realpath(tmp) : realpathSync(tmp);
+    assert.equal(defaultPathConfig().sessionsRoot, expected);
+    const linkPath = path.join(tmp, "sessions-symlink");
+    const realRoot = path.join(tmp, "sessions");
+    await fs.mkdir(realRoot);
+    await fs.symlink(realRoot, linkPath, "dir");
+    process.env["AIGENTRY_SESSIONS_ROOT"] = linkPath;
+    assert.equal(defaultPathConfig().sessionsRoot, process.platform === "win32" ? await fs.realpath(realRoot) : realpathSync(realRoot));
+    const missing = path.join(tmp, "missing-sessions");
+    process.env["AIGENTRY_SESSIONS_ROOT"] = path.relative(process.cwd(), missing);
+    assert.equal(defaultPathConfig().sessionsRoot, path.resolve(missing));
+    assert.equal(existsSync(missing), false);
   } finally {
     if (prev === undefined) delete process.env["AIGENTRY_SESSIONS_ROOT"];
     else process.env["AIGENTRY_SESSIONS_ROOT"] = prev;
