@@ -1,0 +1,79 @@
+name: native-909-nt909sw
+
+# #909 — native process-identity check for platform::session_pid on disposable
+# GitHub-hosted macOS and Linux runners. It runs the PINNED fixture copies in
+# tests/native909/fixtures/ (the real platform.sh dispatcher plus the candidate
+# platform-unix.sh, and the prior one as a paired comparator), never bin/lib. The only
+# processes it queries are the ones the harness starts itself, through the product's
+# own ps call. No packages are installed, no credentials are kept, nothing is pushed.
+#
+# It runs only on pushes to the reserved branch below. There is no Windows lane: the
+# product refuses Windows, and that refusal is asserted elsewhere. A red result here is
+# a result: retained gaps (ELOOP, C1, NBSP, bash startup warning) are kept as
+# failing oracles and are not waived.
+
+on:
+  push:
+    branches: [ 'test/909-native-nt909sw-20261003' ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-909-nt909sw-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native:
+    name: Native session_pid (${{ matrix.os }})
+    if: github.ref == 'refs/heads/test/909-native-nt909sw-20261003'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 24
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '20.20.0'
+      - name: Positive run (owned fake processes, real ps/locale)
+        shell: bash
+        timeout-minutes: 10
+        run: >-
+          node tests/native909/native-session-pid.mjs
+          --mode=positive
+          --disposable-github-hosted-vm-owned-processes-only
+          "--out=$RUNNER_TEMP/nt909/positive"
+      # A separate run with mutated oracles. It must exit 1, with the unchanged
+      # positive check passing and every mutant failing on its expected stdout alone; the
+      # checker reads only the results file. Runs after a red positive run too, so both
+      # are on record. The step bound exceeds the harness's own 7 min run budget.
+      - name: Negative control (mutated sid / expected pid must fail)
+        if: success() || failure()
+        shell: bash
+        timeout-minutes: 9
+        run: |
+          set -u
+          rc=0
+          node tests/native909/native-session-pid.mjs \
+            --mode=negative-control \
+            --disposable-github-hosted-vm-owned-processes-only \
+            "--out=$RUNNER_TEMP/nt909/negative-control" || rc=$?
+          echo "negative-control exit=$rc (want 1)"
+          test "$rc" -eq 1
+          node tests/native909/native-session-pid.mjs \
+            "--check-negative-control=$RUNNER_TEMP/nt909/negative-control/results.json"
+      - name: Upload results
+        if: success() || failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-909-nt909sw-${{ matrix.os }}
+          path: ${{ runner.temp }}/nt909/
+          if-no-files-found: error
+          retention-days: 7
