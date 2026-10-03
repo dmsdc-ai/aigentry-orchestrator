@@ -39,6 +39,9 @@ sourceTestFiles.push(
 );
 // #1182 — control pure-core suite imports the real tsc output under dist/src/control (no fixture fallback); platform-neutral.
 sourceTestFiles.push('tests/control/core.test.mjs');
+// #1167 — fake-cmux win32 helper inert regression: transpiles the helper source into a vm with fully faked
+// fs/os/child_process/process (no compiler, native or real file IO), so it runs on every OS, win32 included.
+sourceTestFiles.push('tests/dispatch/fake-cmux-win32.inert.test.mjs');
 // Native capture fixtures require POSIX ownership/modes and the boot wizard suite drives an
 // owned POSIX PTY; Windows support is still absent for both.
 if (process.platform === 'darwin' || process.platform === 'linux') {

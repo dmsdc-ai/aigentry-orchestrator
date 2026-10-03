@@ -18,9 +18,9 @@ const SELF = fileURLToPath(import.meta.url);
 const REPO = resolve(dirname(SELF), "../..");
 const SCHEMA = "aigentry/1167-windows-fake-cmux-acceptance/v1";
 const CS_PIN = "7d14cad8a67e10064e5d81dd6c8ae8a878ac09a64780e5af80d9866e3f69d2c4";
-/** Candidate R2 sources plus the release23a5be18 baseline inputs they are composed onto. */
+/** Candidate R3 helper and R2 fixture sources plus the release23a5be18 baseline inputs they are composed onto. */
 const SOURCE_PINS = [
-  ["tests/dispatch/fake-cmux-win32.ts", "646c12f0e04e1f5c1fbe50a5aacfecc6c5de746a3ee15b1983590ca7d86c1805"],
+  ["tests/dispatch/fake-cmux-win32.ts", "77c1ebf22a7a0fc832d12268f8a22c3716c82e884784b66b51b32c1793e58e0e"],
   ["tests/dispatch/model-router-fixtures.ts", "f3e88ef3fdd0b999c1274d5d59151aee0888777f908abbcbc630e394ca86c6cf"],
   ["tests/dispatch/model-router-fixtures.test.ts", "5fa262af4a06f26e0cf37832958fdc5f1426a75fe8e8f535a6549d1e9cca74f2"],
   ["src/session/agent-metadata.ts", "4b9e73514f34dc5c58a21e40dd6894ab0b208524d2e8d3b01b1fec3b2086ce99"],

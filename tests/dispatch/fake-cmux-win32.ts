@@ -7,7 +7,7 @@
 // process, shell, network or reflection (a source property, not a measured native one).
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { closeSync, constants as fsConstants, copyFileSync, lstatSync, mkdtempSync, openSync, readFileSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants as fsConstants, copyFileSync, lstatSync, mkdtempSync, openSync, readFileSync, rmdirSync, type Stats, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, win32 } from "node:path";
 
@@ -97,7 +97,7 @@ function compile(): FakeCmuxBuild {
   const framework = win32.join(systemRoot, "Microsoft.NET", "Framework64", "v4.0.30319"), compiler = win32.join(framework, "csc.exe");
   let compilerStat;
   try { compilerStat = lstatSync(compiler); } catch { throw new Error("fake-cmux prerequisite: Framework64 v4.0.30319 csc.exe is missing rc=-1"); }
-  if (!compilerStat.isFile() || compilerStat.isSymbolicLink()) throw new Error("fake-cmux prerequisite: csc.exe is not a regular file rc=-1");
+  if (!compilerStat.isFile() || compilerStat.isSymbolicLink() || compilerStat.size === 0) throw new Error("fake-cmux prerequisite: csc.exe is not a non-empty regular file rc=-1");
   const compilerSha256 = sha256(readFileSync(compiler));
   const mscorlib = win32.join(framework, "mscorlib.dll");
   let mscorlibStat;
@@ -107,7 +107,8 @@ function compile(): FakeCmuxBuild {
 
   // Ownership is registered before anything that can fail: the exit hook removes exactly the
   // leaves this attempt created (cmux.cs, the compiler's cmux.exe) and then the private root.
-  const root = mkdtempSync(join(tmpdir(), "fake cmux 1167 \u00fc-"));
+  const scratchParent = tmpdir();
+  const root = mkdtempSync(join(scratchParent, "fake cmux 1167 \u00fc-"));
   const leaves: string[] = [];
   let pending = true;
   const release = () => {
@@ -119,7 +120,12 @@ function compile(): FakeCmuxBuild {
     process.stderr.write(`fake-cmux: scratch cleanup failed for ${failed.join(", ")}\n`);
   };
   process.once("exit", release);
-  const redact = (text: string) => text.split(root).join("<scratch>").split(systemRoot).join("<SystemRoot>");
+  // Compiler detail is redacted for these known paths only: each matched case-insensitively as an
+  // escaped literal, longest first so the scratch root wins over its tmpdir parent or SystemRoot.
+  const redactions = ([[root, "<scratch>"], [scratchParent, "<tmpdir>"], [systemRoot, "<SystemRoot>"]] as const)
+    .filter(([path]) => path !== "").sort(([a], [b]) => b.length - a.length)
+    .map(([path, label]) => [new RegExp(path.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&"), "gi"), label] as const);
+  const redact = (text: string) => redactions.reduce((acc, [pattern, label]) => acc.replace(pattern, label), text);
   const fail = (reason: string, rc: number | string, output = "") => {
     release();
     const detail = redact(output).slice(0, OUTPUT_LIMIT);
@@ -165,10 +171,33 @@ export function fakeCmuxBuild(): FakeCmuxBuild {
   return built;
 }
 
+/** Unlinks a rejected install copy only while it is still the owned regular file; else says why not. */
+function removeOwnedCopy(target: string, owned: Stats | undefined): string | undefined {
+  if (!owned) return "ownership not proven";
+  let current: Stats;
+  try { current = lstatSync(target); } catch (error) { return `re-check ${(error as NodeJS.ErrnoException).code ?? "error"}`; }
+  if (!current.isFile() || current.isSymbolicLink() || current.dev !== owned.dev || current.ino !== owned.ino) return "no longer the owned copy";
+  try { unlinkSync(target); } catch (error) { return `unlink ${(error as NodeJS.ErrnoException).code ?? "error"}`; }
+  return undefined;
+}
+
 /** Copies the compiled fake into a fixture bin as `cmux.exe` (exclusive) and rebinds it by sha256. */
 export function installFakeCmux(bin: string): string {
   const build = fakeCmuxBuild(), target = win32.join(bin, "cmux.exe");
+  // EEXIST or any copy fault propagates before ownership, so an existing/unknown target is never touched.
   copyFileSync(build.exe, target, fsConstants.COPYFILE_EXCL);
-  if (sha256(readFileSync(target)) !== build.exeSha256) throw new Error("fake-cmux: installed cmux.exe does not match the compiled sha256");
-  return target;
+  // The successful exclusive copy is this attempt's. A rejected copy is removed only while lstat still
+  // shows that same regular file (dev/ino); otherwise it is left and the failure says so. Private
+  // test-fixture data: not a race-proof guard against adversarial shared directories.
+  let owned: Stats | undefined, rejection: Error;
+  try {
+    const stat = lstatSync(target);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("fake-cmux: installed cmux.exe is not a regular file");
+    owned = stat;
+    if (sha256(readFileSync(target)) === build.exeSha256) return target;
+    rejection = new Error("fake-cmux: installed cmux.exe does not match the compiled sha256");
+  } catch (error) { rejection = error instanceof Error ? error : new Error(String(error)); }
+  const residue = removeOwnedCopy(target, owned);
+  if (residue) throw new Error(`${rejection.message}; cmux.exe left in place (${residue})`, { cause: rejection });
+  throw rejection;
 }

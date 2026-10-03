@@ -1,11 +1,13 @@
 name: Windows fake cmux native qualification (#1167, test-only)
 
-# #1167. Isolated, test-only qualification of the win32 fake cmux.exe fixture. It runs ONE driver,
-# tests/dispatch/windows-fake-cmux-acceptance.mjs, against the built candidate and uploads its
-# sanitized receipt. A green run qualifies the fake only. It is NOT product, release, install or
-# native host acceptance, and it implies no consumer Windows support: package.json os[] still
-# refuses win32 (pinned below), and `npm ci --force` is the same CI-only bypass ci.yml W1 uses.
-# The full fixture tests 85/86 and the W1 debt ratchet stay separate gates and are not run here.
+# #1167. Isolated, test-only qualification of the win32 fake cmux.exe fixture. It executes exactly
+# two things: the permanent inert suite tests/dispatch/fake-cmux-win32.inert.test.mjs (before Build,
+# TAP uploaded), and ONE native driver, tests/dispatch/windows-fake-cmux-acceptance.mjs, against the
+# built candidate (sanitized receipt uploaded). A green run qualifies the fake only. It is NOT the
+# full runner, NOT product, release, install or native host acceptance, and it implies no consumer
+# Windows support: package.json os[] still refuses win32 (pinned below), and `npm ci --force` is the
+# same CI-only bypass ci.yml W1 uses. The full fixture tests 85/86, full W1 and the W1 debt ratchet
+# stay separate gates and are not run here.
 
 on:
   push:
@@ -14,6 +16,8 @@ on:
       - .github/workflows/windows-fake-cmux-acceptance.yml
       - tests/dispatch/windows-fake-cmux-acceptance.mjs
       - tests/dispatch/fake-cmux-win32.ts
+      - tests/dispatch/fake-cmux-win32.inert.test.mjs
+      - scripts/run-tests.mjs
       - tests/dispatch/model-router-fixtures.ts
       - tests/dispatch/model-router-fixtures.test.ts
 
@@ -63,7 +67,9 @@ jobs:
             ACTUAL="$(sha256sum -b -- "$2" | cut -d" " -f1)"
             if [ "${ACTUAL}" = "$1" ]; then echo "pin ok ${ACTUAL} $2"; else echo "::error::$2 sha256 ${ACTUAL} does not match pin $1"; FAIL=1; fi
           }
-          check 646c12f0e04e1f5c1fbe50a5aacfecc6c5de746a3ee15b1983590ca7d86c1805 tests/dispatch/fake-cmux-win32.ts
+          check 77c1ebf22a7a0fc832d12268f8a22c3716c82e884784b66b51b32c1793e58e0e tests/dispatch/fake-cmux-win32.ts
+          check 8a7e65ae850fa3983c62157149c532139e0970c0db6bcb336eecb0a2798f8030 tests/dispatch/fake-cmux-win32.inert.test.mjs
+          check 248614563ea226f72c78d22e35874baffd5c43a358d074e52b10f8176200906d scripts/run-tests.mjs
           check f3e88ef3fdd0b999c1274d5d59151aee0888777f908abbcbc630e394ca86c6cf tests/dispatch/model-router-fixtures.ts
           check 5fa262af4a06f26e0cf37832958fdc5f1426a75fe8e8f535a6549d1e9cca74f2 tests/dispatch/model-router-fixtures.test.ts
           check 4b9e73514f34dc5c58a21e40dd6894ab0b208524d2e8d3b01b1fec3b2086ce99 src/session/agent-metadata.ts
@@ -76,6 +82,21 @@ jobs:
 
       - name: Install dependencies (CI-only --force past the os[] refusal; not Windows support)
         run: npm ci --force
+
+      # Permanent inert suite before Build. Plain redirection, no pipe: the node exit is the step result,
+      # unmasked; stdout and stderr both land in the TAP file uploaded below.
+      - name: Permanent inert fake cmux suite (TAP)
+        run: node --test --test-reporter=tap tests/dispatch/fake-cmux-win32.inert.test.mjs > "${RUNNER_TEMP}/fake-cmux-win32-inert.tap" 2>&1
+
+      # Always uploads, including on failure; separate from the native receipt; it changes no step result.
+      - name: Upload inert suite TAP
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fake-cmux-win32-inert-tap
+          path: ${{ runner.temp }}/fake-cmux-win32-inert.tap
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Build
         run: npm run build
