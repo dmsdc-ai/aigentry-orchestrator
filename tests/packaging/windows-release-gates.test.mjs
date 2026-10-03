@@ -1712,6 +1712,9 @@ const taskAdvisorRelatives = ['t1-schema', 't10-r3-state-latency', 't11-r4-numer
   't8-r2-focused', 't9-suspicions']
   .map(name => `tests/task-advisor/efficiency/${name}.test.mjs`);
 const taskAdvisorT12 = 'tests/task-advisor/efficiency/t12-checkpoint-decoder.test.mjs';
+// #1182 control pure-core suite: one explicit, platform-neutral source entry on EVERY platform,
+// win32 included, directly after the task-advisor entries and ahead of the POSIX-only entries.
+const controlRelative = 'tests/control/core.test.mjs';
 function callerFixture(mode, symlinked = false) {
   const directory = mkdtempSync(join(admin, 'caller fixture '));
   const put = (path, source) => {
@@ -1740,6 +1743,7 @@ function callerFixture(mode, symlinked = false) {
     if (mode === 'missing-task-advisor-t12' && path === taskAdvisorT12) continue;
     if (mode !== 'missing-task-advisor' || index !== taskAdvisorRelatives.length - 1) put(path, checks + `console.log('CALLER_TASK_ADVISOR_SENTINEL_${index}');\nprocess.exit(${(mode === 'failing-task-advisor' && index === 0) || (mode === 'failing-task-advisor-t12' && path === taskAdvisorT12) ? 8 : 0});\n`);
   }
+  if (mode !== 'missing-control') put(controlRelative, checks + `console.log('CALLER_CONTROL_SENTINEL');\nprocess.exit(${mode === 'failing-control' ? 8 : 0});\n`);
   if (mode !== 'missing-wizard') put(wizardRelative, checks + `console.log('CALLER_WIZARD_SENTINEL');\nprocess.exit(${mode === 'failing-wizard' ? 8 : 0});\n`);
   if (mode !== 'missing-supervisor') put(supervisorRelative, checks + `console.log('CALLER_SUPERVISOR_SENTINEL');\nprocess.exit(${mode === 'failing-supervisor' ? 8 : 0});\n`);
   for (const [index, path] of agentMetadataRelatives.entries()) {
@@ -1782,6 +1786,9 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic, onlyFailed
   ['failing-task-advisor-t12', 1, true, true, false, undefined, /tests[\\/]task-advisor[\\/]efficiency[\\/]t12-checkpoint-decoder\.test\.mjs$/],
   ['missing-agent-metadata-pinned-clear', 1, false, false, false, /Could not find '[^'\n]*tests[\\/]dispatch[\\/]agent-metadata[\\/]g2c-pinned-clear\.test\.mjs'/],
   ['failing-agent-metadata-pinned-clear', 1, true, true, false, undefined, /tests[\\/]dispatch[\\/]agent-metadata[\\/]g2c-pinned-clear\.test\.mjs$/],
+  // #1182 the control pure-core suite alone missing or failing, analogous to the #1171 per-entry controls.
+  ['missing-control', 1, false, false, false, /Could not find '[^'\n]*tests[\\/]control[\\/]core\.test\.mjs'/],
+  ['failing-control', 1, true, true, false, undefined, /tests[\\/]control[\\/]core\.test\.mjs$/],
   ['missing-harness', 1, true, true, false, /POSIX control harness failed with exit status: 1/],
   ['empty', 1, false, false, false, /No compiled test files found/],
   ['missing-dist', 1, false, false, false, /Failed to enumerate compiled tests/],
@@ -1810,6 +1817,7 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic, onlyFailed
   for (const index of agentMetadataRelatives.keys()) assert.equal(result.stdout.includes(`CALLER_AGENT_METADATA_SENTINEL_${index}`), compiled);
   for (const index of jevRelatives.keys()) assert.equal(result.stdout.includes(`CALLER_JEV_SENTINEL_${index}`), compiled);
   for (const index of taskAdvisorRelatives.keys()) assert.equal(result.stdout.includes(`CALLER_TASK_ADVISOR_SENTINEL_${index}`), compiled);
+  assert.equal(result.stdout.includes('CALLER_CONTROL_SENTINEL'), compiled);
   assert.ok(!result.stdout.includes('CALLER_UNSELECTED_MJS'), 'no automatic source .mjs discovery');
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_COMPILED_CONTROL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (security && sentinel) assert.ok(result.stdout.indexOf('CALLER_SECURITY_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
@@ -1825,6 +1833,7 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic, onlyFailed
   if (compiled && sentinel) for (const index of taskAdvisorRelatives.keys()) {
     assert.ok(result.stdout.indexOf(`CALLER_TASK_ADVISOR_SENTINEL_${index}`) < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   }
+  if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_CONTROL_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (diagnostic) assert.match(result.stderr, diagnostic);
   if (onlyFailedFile) {
     const failures = result.stdout.split('\n').filter(line => /^not ok \d+ - /.test(line));
@@ -1900,7 +1909,7 @@ const signaled = { status: null, signal: 'SIGTERM' };
 const startupError = { status: null, signal: null, error: 'synthetic ENOENT', code: 'ENOENT' };
 const timedOut = { status: null, signal: 'SIGKILL', error: 'synthetic ETIMEDOUT', code: 'ETIMEDOUT' };
 const callerArgv = platform => ['--test', 'dist/tests/a.test.js', 'dist/tests/nested/b.test.js', 'dist/tests/z.test.js',
-  securityRelative, admissionRelative, ...jevRelatives, ...taskAdvisorRelatives,
+  securityRelative, admissionRelative, ...jevRelatives, ...taskAdvisorRelatives, controlRelative,
   ...(['linux', 'darwin'].includes(platform) ? [nativeRelative, wizardRelative, supervisorRelative, ...agentMetadataRelatives] : [])];
 const vmCases = [];
 for (const platform of ['linux', 'darwin']) {
@@ -1975,6 +1984,26 @@ for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #117
     assert.equal(spawned.indexOf('tests/dispatch/agent-metadata/g2c-transport.test.mjs'), spawned.indexOf(agentMetadataPinnedClear) + 1);
   }
 });
+// #1182 explicit placement of the control pure-core entry in the exact runner's first spawn: exactly
+// once on every platform, directly after the last task-advisor entry, then the first POSIX-only entry
+// on POSIX and nothing after it on win32 — measured against literal neighbours, not the list-derived argv.
+for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #1182 control core follows t9-suspicions exactly once ahead of the POSIX-only entries (${platform})`, 'caller-vm', () => {
+  const config = join(admin, `caller-vm-1182-placement-${platform}.json`);
+  writeFileSync(config, JSON.stringify({ platform, results: platform === 'win32' ? [success] : [success, success], source: callerSource }));
+  const argv = ['--experimental-vm-modules', driver, config];
+  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, encoding: 'utf8', timeout });
+  invocations.push({ kind: 'caller-vm-1182-placement', label: platform, executable: process.execPath, argv, timeout,
+    exit: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr, runnerSha256: sha(callerSource) });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+  const actual = JSON.parse(result.stdout);
+  assert.equal(actual.status, 0);
+  const spawned = actual.calls[0].argv;
+  assert.equal(spawned.filter(item => item === 'tests/control/core.test.mjs').length, 1);
+  assert.equal(spawned.indexOf('tests/control/core.test.mjs'), spawned.indexOf('tests/task-advisor/efficiency/t9-suspicions.test.mjs') + 1);
+  if (platform === 'win32') assert.equal(spawned.indexOf('tests/control/core.test.mjs'), spawned.length - 1);
+  else assert.equal(spawned.indexOf('tests/packaging/native-capture.test.mjs'), spawned.indexOf('tests/control/core.test.mjs') + 1);
+});
 // #1181 wrong-platform placement of the POSIX-only wizard entry. Each mutation is applied
 // to the exact runner bytes with unique-needle checks OUTSIDE assert.throws, the mutated
 // runner still runs to its first spawn, and the exact caller expectation must reject it.
@@ -1986,6 +2015,7 @@ const taskAdvisorBlock = `sourceTestFiles.push(\n${taskAdvisorRelatives.map(path
 const supervisorPosixPush = "  sourceTestFiles.push('tests/packaging/xres-owner-supervisor.test.mjs');\n";
 const posixBranchOpen = "if (process.platform === 'darwin' || process.platform === 'linux') {\n";
 const agentMetadataBlock = `  sourceTestFiles.push(\n${agentMetadataRelatives.map(path => `    '${path}',\n`).join('')}  );\n`;
+const controlPush = "sourceTestFiles.push('tests/control/core.test.mjs');\n";
 for (const [name, mutate, platforms] of [
   ['wizard entry placed on every platform, win32 included', source => replaceOnce(replaceOnce(source, wizardPosixPush, wizardPosixDropped),
     baseSourceList, "'tests/packaging/release-admission.test.mjs', 'tests/packaging/orchestrator-boot-wizard.test.mjs'];"), ['win32', 'linux', 'darwin']],
@@ -2012,6 +2042,17 @@ for (const [name, mutate, platforms] of [
   ['task-advisor suite t12 ahead of t11', source => replaceOnce(source,
     `  'tests/task-advisor/efficiency/t11-r4-numeric.test.mjs',\n  '${taskAdvisorT12}',\n`,
     `  '${taskAdvisorT12}',\n  'tests/task-advisor/efficiency/t11-r4-numeric.test.mjs',\n`), ['win32', 'linux', 'darwin']],
+  // #1182: the control pure-core entry is required exactly once on every platform, directly after the
+  // task-advisor block and ahead of the POSIX branch. Placing it on win32 only leaves the win32 argv
+  // unchanged, so that counterfactual applies to POSIX alone.
+  ['control core suite missing', source => replaceOnce(source, controlPush, ''), ['win32', 'linux', 'darwin']],
+  ['control core suite duplicated', source => replaceOnce(source, controlPush, `${controlPush}${controlPush}`), ['win32', 'linux', 'darwin']],
+  ['control core suite wired POSIX-only', source => replaceOnce(replaceOnce(source, controlPush, ''), wizardPosixPush,
+    `${wizardPosixPush}\n  ${controlPush.trimEnd()}`), ['win32', 'linux', 'darwin']],
+  ['control core suite placed on win32 only', source => replaceOnce(source, controlPush,
+    `if (process.platform === 'win32') ${controlPush}`), ['linux', 'darwin']],
+  ['control core suite ahead of the task-advisor suites', source => replaceOnce(replaceOnce(source, controlPush, ''),
+    taskAdvisorBlock, `${controlPush}${taskAdvisorBlock}`), ['win32', 'linux', 'darwin']],
   // #1177: the XRes supervisor suite is required on POSIX and must never reach win32.
   ['XRes supervisor suite missing', source => replaceOnce(source, supervisorPosixPush, ''), ['linux', 'darwin']],
   ['XRes supervisor suite placed on every platform, win32 included', source => replaceOnce(replaceOnce(source, supervisorPosixPush, ''),
