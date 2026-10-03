@@ -45,7 +45,7 @@ const EXIT = { ok: 0, incomplete: 2, refused: 3 };
 // result: the observations would then describe some other harness or product text.
 const SOURCES = [
   ['tests/native909/diagnose-locale-paths.mjs', null],
-  ['tests/native909/native-session-pid.mjs', 'ff2f047341243c0133affe39071620dd77b0e3006ece2bf3f424a67906ee196c'],
+  ['tests/native909/native-session-pid.mjs', 'e99fbb0a139e9611619530093cd768269f6c7df961be49af595ace76270f05ce'],
   ['tests/native909/fake-telepty.cjs', '684a7544ad1a340e205896c5440201aa6feb2588a503fe07ad2de2b8bbfcf6a2'],
   ['tests/native909/fixtures/candidate/platform.sh', 'd37b262cb16b12cc02b5ccb4ed54582699c1845aba6fdcb9e6e864ffe25ff6f2'],
   ['tests/native909/fixtures/candidate/platform-unix.sh', 'b74f8b058af5a844f85f34f3c3caf82f7e5968121a9bad64d5c9586eb0c5d59b'],

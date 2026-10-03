@@ -390,7 +390,9 @@ const POSITIVE_CASES = [
   one('U01', 'contract', 'nl NL40 non-ASCII exact', S('caf\u00e9')),
   one('U02', 'contract', 'nl NL41 non-ASCII absent -> cause=sid', S('caf\u00e9'), { childSid: S('cafe'), expect: { rc: 2, out: null, err: { unknown: 'sid' } } }),
   one('U03', 'retained', 'nl NL55 NBSP exact', S('a\u00a0b'), { gap: 'NBSP' }),
-  one('U04', 'retained', 'nl NL47 C1 CSI exact', S('a\u009bb'), { gap: 'C1' }),
+  // Oracle corrected per original-contract:95 (sid with control chars -> rc 2, cause=sid; U+009B is Cc).
+  // CI 37122475262 measured rc2 cause=sid on macOS-14 and ubuntu-22.04 against the old owner oracle.
+  one('U04', 'contract', 'contract:95 C1 CSI (Cc) sid -> cause=sid', S('a\u009bb'), { expect: { rc: 2, out: null, err: { unknown: 'sid' } } }),
   one('U05', 'contract', 'nl NL48 RLO absent -> cause=sid', S('a\u202eb'), { childSid: S('ab'), expect: { rc: 2, out: null, err: { unknown: 'sid' } } }),
   {
     id: 'T01', kind: 'contract', ref: 'sp T1 owner spawned after the query started; found by the first or a later poll (polling not observed: no poll count, elapsed_ms is wall clock)', loc: 'abs',
@@ -404,7 +406,11 @@ const POSITIVE_CASES = [
     childSid: S('nobody'), timeoutMs: 750, expect: EMPTY,
   }),
   one('L01', 'contract', 'posthoc H1 32-hop locator chain', S('chain32'), { loc: 'chain32', argv1: 'canon' }),
-  one('L02', 'retained', 'sp A14 40-hop locator chain', S('chain40'), { loc: 'chain40', argv1: 'canon', gap: 'ELOOP' }),
+  // Oracle corrected per original-contract:91 (target not a regular executable -> rc 2, cause=locator).
+  // CI 37122475262 (N3): macOS-14 stat resolves at most 32 hops (chain40 ELOOP); Linux resolves 40, so owner there.
+  one('L02', 'contract', process.platform === 'darwin' ? 'contract:91 40-hop chain is ELOOP on macOS -> cause=locator' : 'sp A14 40-hop locator chain', S('chain40'), {
+    loc: 'chain40', argv1: 'canon', expect: process.platform === 'darwin' ? { rc: 2, out: null, err: { unknown: 'locator' } } : OWNER('o'),
+  }),
 ];
 
 const NC_CASES = [
