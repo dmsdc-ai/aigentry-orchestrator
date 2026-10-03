@@ -593,6 +593,8 @@ def execute(args, receipt):
         receipt["childExitCode"] = code.value
         for key, path in paths.items():
             require(digest(path.read_bytes()) == source[key], "source_changed_during_run")
+        if not output and code.value == 0xC0000142:
+            raise Failure("child_initialization_failed")
         if not output and code.value in (2, 5, 0xC0000022, 0xC0000135):
             raise Failure("child_launch_acl_mic_or_dependency_refusal", 2)
         child = json.loads(output.decode("utf-8"))
