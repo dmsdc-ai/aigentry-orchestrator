@@ -42,6 +42,24 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '20.20.0'
+      # N1/N3 observation (tests/native909/diagnose-locale-paths.mjs): how /bin/bash
+      # classifies fixed sid bytes against the product sid pattern under the inherited
+      # locale and C, and whether /bin/test accepts owned 32/33/40/41-hop chains. It records
+      # and replaces no retained red oracle. Its exit is kept here and enforced by
+      # "Diagnostic integrity" after the upload, so it cannot skip the steps below. Its
+      # results go to $RUNNER_TEMP/nt909/diagnostic, inside the existing upload path.
+      - name: Diagnostic N1/N3 (observation only, before positive checks)
+        id: diag
+        shell: bash
+        timeout-minutes: 3
+        run: |
+          set -u
+          rc=0
+          node tests/native909/diagnose-locale-paths.mjs \
+            --disposable-github-hosted-vm-diagnostic-only \
+            "--out=$RUNNER_TEMP/nt909/diagnostic" || rc=$?
+          echo "diagnostic exit=$rc (want 0; an observed classification never changes it)"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
       - name: Positive run (owned fake processes, real ps/locale)
         shell: bash
         timeout-minutes: 10
@@ -77,3 +95,11 @@ jobs:
           path: ${{ runner.temp }}/nt909/
           if-no-files-found: error
           retention-days: 7
+      - name: Diagnostic integrity (all rows recorded, no abnormal child)
+        if: success() || failure()
+        shell: bash
+        env:
+          DIAG_RC: ${{ steps.diag.outputs.rc }}
+        run: |
+          echo "diagnostic exit=${DIAG_RC:-missing} (want 0)"
+          test "${DIAG_RC:-missing}" = 0
