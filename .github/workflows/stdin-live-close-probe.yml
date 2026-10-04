@@ -1,0 +1,93 @@
+name: stdin live-close probe (#1167, disposable)
+
+# #1167 — disposable win32 boundary experiment, run once. It only runs on its own test
+# branch, by push or by hand. No secrets, no publish, no cache, no npm install, no tsc.
+# It runs tests/session/boot-adapter/_stdin-live-close-probe.mjs, with Node stdlib only.
+# The existing stdin-portability-probe.yml (its 14-case suite and its termination probe)
+# is untouched. Its triggers and job guards name only test/1167-stdin-portable-20261005,
+# so it does not run on this branch. A green run here means only "boundary candidate
+# observed on this runner". It is NOT a product PASS, NOT Windows support, and NOT fixture adoption.
+
+on:
+  push:
+    branches: [ test/1167-stdin-closed-live-20261005 ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stdin-live-close-1167-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BASE_SHA: 9dd2129024c8526a47070b4ed0b2d89bf6d1dab8
+  NODE_EXACT: v20.20.0
+  PROBE_SHA256: 090494f132cbf8353afcf2b7522000aa3bf2661583a3e2b82bd33101dbe3958c
+
+jobs:
+  live-close-probe:
+    if: github.ref == 'refs/heads/test/1167-stdin-closed-live-20261005'
+    name: live-close probe x1000 + 20 controls (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Byte-exact checkout: Windows runners default to core.autocrlf=true.
+      - name: Disable line-ending conversion
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.0'
+
+      - name: Verify Node, checkout sha, single parent, exact 2-file change set, probe hash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/ss1167-live-out"; mkdir -p "$OUT" "$RUNNER_TEMP/ss1167-live"
+          fail() { echo "::error::$*"; echo "FAIL: $*" >> "$OUT/verify.log"; exit 1; }
+          trap 'echo "FAIL: command error at line $LINENO" >> "$OUT/verify.log"' ERR
+          echo "verify start head=$GITHUB_SHA" > "$OUT/verify.log"
+          [ "$(node -p process.version)" = "$NODE_EXACT" ] || fail "node $(node -p process.version) != $NODE_EXACT"
+          [ "$(git rev-parse HEAD)" = "$GITHUB_SHA" ] || fail "checkout HEAD != GITHUB_SHA"
+          set -- $(git rev-list --parents -n 1 HEAD)
+          [ "$#" -eq 2 ] && [ "$2" = "$BASE_SHA" ] || fail "HEAD must have exactly one parent = $BASE_SHA (got: $*)"
+          CHANGED="$(git diff --name-only --no-renames "$BASE_SHA" HEAD | LC_ALL=C sort)"
+          EXPECTED="$(printf '%s\n' .github/workflows/stdin-live-close-probe.yml \
+            tests/session/boot-adapter/_stdin-live-close-probe.mjs | LC_ALL=C sort)"
+          [ "$CHANGED" = "$EXPECTED" ] || fail "unexpected changed set vs parent: $(echo $CHANGED)"
+          sha() { node -e 'process.stdout.write(require("node:crypto").createHash("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' "$1"; }
+          git cat-file blob HEAD:tests/session/boot-adapter/_stdin-live-close-probe.mjs > "$RUNNER_TEMP/ss1167-live/probe.mjs"
+          got="$(sha "$RUNNER_TEMP/ss1167-live/probe.mjs")"
+          [ "$got" = "$PROBE_SHA256" ] || fail "probe sha256 $got != $PROBE_SHA256; nothing was executed"
+          echo "verified: head=$GITHUB_SHA parent=$BASE_SHA changed=2 probe=$got" | tee -a "$OUT/verify.log"
+
+      # Exactly one probe invocation, no retry. A missing receipt or any nonzero exit fails the job.
+      - name: Run probe once (own child pids only)
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/ss1167-live-out"
+          set +e
+          node "$RUNNER_TEMP/ss1167-live/probe.mjs" "$OUT/receipt-windows-latest.json" > "$OUT/probe.stdout" 2> "$OUT/probe.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$OUT/probe.status"
+          echo "probe exit $rc"
+          head -c 4096 "$OUT/probe.stderr" || true
+          test -s "$OUT/receipt-windows-latest.json" || { echo "::error::receipt missing"; exit 1; }
+          node -e 'const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); console.log(JSON.stringify({ verdict: r.verdict, stop: r.stop, holdSignals: r.holdSignals, closed: r.closed.outcomes, open: r.open.outcomes }))' "$OUT/receipt-windows-latest.json"
+          exit "$rc"
+
+      - name: Save bounded receipt (always, including failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ss1167-live-close-windows-latest
+          path: ${{ runner.temp }}/ss1167-live-out
+          retention-days: 7
+          if-no-files-found: error
