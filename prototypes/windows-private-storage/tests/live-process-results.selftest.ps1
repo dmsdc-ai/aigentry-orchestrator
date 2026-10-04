@@ -333,7 +333,9 @@ try {
   # One real caller form over one case: classified message ids, counts, element types, pids, gate result. No flattening.
   function Invoke-Form([string]$Form, $Case) {
     $script:CimCalls = 0; $script:OwnerCalls = 0; $script:CimClassNames = @(); $script:OwnerMethods = @(); $script:MockAnomalies = 0
-    $script:Procs = @(@($Case.pids) | ForEach-Object { New-Proc $_ $Case.pidv }); $script:Owners = $Case.owners; $script:CimThrow = $Case.cimThrow
+    # pidv is optional (z-cases only): strict mode 2.0 throws on member access of an absent [ordered] key, so test presence.
+    $over = $null; if ($Case.Contains('pidv')) { $over = $Case['pidv'] }
+    $script:Procs = @(@($Case.pids) | ForEach-Object { New-Proc $_ $over }); $script:Owners = $Case.owners; $script:CimThrow = $Case.cimThrow
     $rec = [ordered]@{ escaped = $false; msg = $null; outerType = $null; count = $null; types = @(); inner = $null; pids = @(); flatOk = $null; gate = $null; passedGate = $null; joinOk = $null; cim = 0; owner = 0; anomalies = 0; classOk = $true; hostBound = $false; diag = @() }
     # Host-stream capture: a Write-Host function in THIS scope shadows the cmdlet for the caller form and the function under
     # test (dynamic scope), never for the self-test's own report lines. Preflight from a nested scope must be captured.
