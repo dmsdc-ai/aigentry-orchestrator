@@ -44,6 +44,8 @@ const SCRIPTS = {
   "bad-syntax": () => join(TRACE_DIR, "p6-diag-bad-syntax.mjs"),
 };
 const GRAND_MODES = new Set(["normal", "no-ready", "early-exit", "throw", "vanish"]);
+// Test-owned counterfactual only: absent (original, no detached key) or exactly true.
+const DETACHED = { absent: undefined, true: true };
 
 const roles = {
   // P6 parent shape: spawn the grandchild exactly like child.mjs "hold-spawn" (minus addon/lock),
@@ -51,7 +53,8 @@ const roles = {
   // "wait-ready" control, stay alive until the grandchild reports ready, exits, or waitMs passes.
   async "hold-spawn"() {
     const trace = (obj) => appendFileSync(args.parentTrace, `${JSON.stringify({ ...obj, nonce: args.nonce, pid: process.pid, t: Date.now() })}\n`);
-    if (!PARENT_MODES.has(args.parentMode) || !STDIO[args.stdio] || !SCRIPTS[args.script] || !GRAND_MODES.has(args.grandMode)) {
+    if (!PARENT_MODES.has(args.parentMode) || !STDIO[args.stdio] || !SCRIPTS[args.script] || !GRAND_MODES.has(args.grandMode)
+      || (args.detached !== DETACHED.absent && args.detached !== DETACHED.true)) {
       trace({ type: "bad-config" });
       process.exit(64);
     }
@@ -60,8 +63,11 @@ const roles = {
       : JSON.stringify({
         nonce: args.nonce, channel: args.channel, carrier: args.carrier, control: args.grandMode, selfLimitMs: args.grandLimitMs,
       });
-    trace({ type: "before-spawn", script: args.script, stdio: args.stdio, parentMode: args.parentMode });
-    const g = spawn(process.execPath, [SCRIPTS[args.script](), "grandchild", grandJson], { stdio: STDIO[args.stdio] });
+    // Original cases keep the exact original options object (no detached key). Effective options are
+    // traced verbatim; detached also changes console/process group, so it is a confound, not job proof.
+    const spawnOptions = args.detached === DETACHED.true ? { stdio: STDIO[args.stdio], detached: true } : { stdio: STDIO[args.stdio] };
+    trace({ type: "before-spawn", script: args.script, stdio: args.stdio, parentMode: args.parentMode, spawnOptions, detachedKeyPresent: "detached" in spawnOptions });
+    const g = spawn(process.execPath, [SCRIPTS[args.script](), "grandchild", grandJson], spawnOptions);
     let gExit = null;
     g.once("exit", (code, signal) => {
       gExit = { code, signal };

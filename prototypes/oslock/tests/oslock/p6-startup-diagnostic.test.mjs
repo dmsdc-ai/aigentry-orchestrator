@@ -12,6 +12,11 @@
 //   ctl-stdio-ignore   DATA-ONLY control (changes handles): grandchild stdio "ignore".
 //   neg-*              classifier checks with known outcomes; parent waits so the owned grandchild
 //                      exit code is captured.
+//   ctl-detached-*     TEST-OWNED fake-grandchild DATA-ONLY counterfactual: grandchild spawned with
+//                      detached:true (stdio inherit / ignore), original immediate-parent-exit timing.
+//                      With primary and ctl-stdio-ignore this is a 2x2 (detached x stdio). detached
+//                      also changes console/process-group/job handling: a confound, never job proof.
+//   neg-detached-vanish SEPARATE negative classifier control (neg-vanish is kept unchanged).
 // Cleanup never signals a grandchild pid: stop file, then a separate teardown file, then passive
 // pid-absence observation up to the fixture self-limit. Exit is nonzero on harness malfunction,
 // unclassified required evidence, a negative-case mismatch, the primary pass condition failing,
@@ -56,6 +61,10 @@ const CASES = {
   "neg-no-ready": { parentMode: "wait-ready", stdio: "inherit", script: "self", argvForm: "json", grandMode: "no-ready", readyMs: 1000, waitMs: 1500, expect: "main-alive-no-ready", expectExit: null },
   // ORIGINAL parent mechanics; grandchild self-terminates after ready: no owned exit is observable.
   "neg-vanish": { parentMode: "exit-immediately", stdio: "inherit", script: "self", argvForm: "json", grandMode: "vanish", readyMs: 10_000, expect: "ready-then-vanished-no-exit-record", expectExit: null },
+  // TEST-OWNED fake-grandchild counterfactual controls (detached:true); DATA-ONLY for cause discrimination.
+  "ctl-detached-inherit": { parentMode: "exit-immediately", stdio: "inherit", detached: true, script: "self", argvForm: "json", grandMode: "normal", readyMs: 10_000 },
+  "ctl-detached-ignore": { parentMode: "exit-immediately", stdio: "ignore", detached: true, script: "self", argvForm: "json", grandMode: "normal", readyMs: 10_000 },
+  "neg-detached-vanish": { label: "TEST-OWNED detached:true negative control", parentMode: "exit-immediately", stdio: "inherit", detached: true, script: "self", argvForm: "json", grandMode: "vanish", readyMs: 10_000, expect: "ready-then-vanished-no-exit-record", expectExit: null },
   // Harness-only: hold-spawn executable missing. Neither product failure nor product pass.
   "harness-missing-exec": { executable: "missing", parentMode: "exit-immediately", stdio: "inherit", script: "self", argvForm: "json", grandMode: "normal", readyMs: 10_000 },
 };
@@ -204,6 +213,7 @@ async function runCase(name) {
   const sent = {
     carrier: join(dir, "carrier"), nonce, channel, closeFirst: true, control: def.grandMode, grandLimitMs: GRAND_LIMIT_MS,
     parentTrace, parentMode: def.parentMode, stdio: def.stdio, script: def.script, argvForm: def.argvForm, grandMode: def.grandMode, waitMs: def.waitMs,
+    detached: def.detached, // undefined for original cases: JSON drops it, so no detached key is sent
   };
   const ev = { case: name, config: def, nonce };
   results.cases[name] = ev;
@@ -262,6 +272,7 @@ async function runCase(name) {
   ev.grandBoot = readJsonl(join(RUN_DIR, `boot-${g.pid}.jsonl`));
   ev.parentBoot = readJsonl(join(RUN_DIR, `boot-${h.child.pid}.jsonl`));
   ev.parentTrace = readJsonl(parentTrace, (m) => m.nonce === nonce);
+  ev.effectiveSpawnOptions = ev.parentTrace.find((m) => m.type === "before-spawn")?.spawnOptions ?? null;
   ev.holdExit = h.exit;
   ev.holdClose = h.close;
   ev.holdStdout = h.stdout.slice(0, 4000);
@@ -321,8 +332,21 @@ for (const name of ["ctl-ready-first", "ctl-stdio-ignore"]) {
   });
 }
 
+for (const name of ["ctl-detached-inherit", "ctl-detached-ignore"]) {
+  test(`P6diag ${name} (TEST-OWNED fake-grandchild DATA-ONLY control, detached:true; confound, not job proof): evidence complete and classified`, { timeout: 60_000 }, async () => {
+    const ev = await runCase(name);
+    assertEvidenceComplete(ev);
+    assert.deepEqual(ev.effectiveSpawnOptions, { stdio: CASES[name].stdio, detached: true }, "effective grandchild spawn options");
+    // Liveness may only come from beats written after the parent exit was observed, never earlier ones.
+    if (ev.class === "alive-after-parent-exit") {
+      assert.deepEqual(ev.beatAfterParentReap, [true, true], "alive requires two new beats after parent reap");
+      assert.ok(ev.beats.afterParentExit >= 2, `alive requires >=2 beats after parent exit, got ${ev.beats.afterParentExit}`);
+    }
+  });
+}
+
 for (const name of Object.keys(CASES).filter((n) => n.startsWith("neg-"))) {
-  test(`P6diag ${name}: classified as ${CASES[name].expect}`, { timeout: 60_000 }, async () => {
+  test(`P6diag ${name}${CASES[name].label ? ` (${CASES[name].label})` : ""}: classified as ${CASES[name].expect}`, { timeout: 60_000 }, async () => {
     const ev = await runCase(name);
     assertEvidenceComplete(ev);
     assert.equal(ev.class, CASES[name].expect);
@@ -349,6 +373,15 @@ test("P6diag harness: missing hold-spawn executable settles within a bound (spaw
   assert.match(ev.harnessError, /no spawned line/);
   assert.equal(ev.class, undefined, "never classified as a product outcome");
   assert.equal(ownedGrandchildren.some((g) => g.case === "harness-missing-exec"), false);
+});
+
+test("P6diag effective grandchild spawn options: original cases carry no detached key, detached controls exactly detached:true", () => {
+  for (const [name, def] of Object.entries(CASES).filter(([n]) => !n.startsWith("harness-"))) {
+    const ev = results.cases[name];
+    assert.ok(ev, `${name} did not run`);
+    const want = def.detached === true ? { stdio: def.stdio, detached: true } : { stdio: def.stdio };
+    assert.deepEqual(ev.effectiveSpawnOptions, want, `${name} effective spawn options`);
+  }
 });
 
 test("P6diag ownership accounting: every owned grandchild accounted, every hold-spawn reaped", { timeout: GRAND_LIMIT_MS + 15_000 }, async () => {
@@ -381,6 +414,13 @@ after(() => {
     primaryFails: p.primary ? p.primary.class !== "alive-after-parent-exit" : null,
     readyFirstAlive: p["ctl-ready-first"] ? p["ctl-ready-first"].class === "alive-after-parent-exit" : null,
     stdioIgnoreAlive: p["ctl-stdio-ignore"] ? p["ctl-stdio-ignore"].class === "alive-after-parent-exit" : null,
+    detachedInheritAlive: p["ctl-detached-inherit"] ? p["ctl-detached-inherit"].class === "alive-after-parent-exit" : null,
+    detachedIgnoreAlive: p["ctl-detached-ignore"] ? p["ctl-detached-ignore"].class === "alive-after-parent-exit" : null,
+    // 2x2 (detached x stdio), original immediate-parent-exit timing. detached confounds job, console and
+    // process group; a difference here discriminates candidates, it does not prove libuv job membership.
+    detachedByStdio: Object.fromEntries(["primary", "ctl-stdio-ignore", "ctl-detached-inherit", "ctl-detached-ignore"].map((k) => [k, p[k] ? {
+      detached: p[k].effectiveSpawnOptions?.detached === true, stdio: p[k].config.stdio, class: p[k].class ?? null, beatsAfterParentExit: p[k].beats?.afterParentExit ?? null,
+    } : null])),
   };
   results.finishedAt = new Date().toISOString();
   mkdirSync(LOG_DIR, { recursive: true });

@@ -33,9 +33,9 @@ const SELF = "ci/p6-startup-diagnostic.mjs";
 // tester-final bytes. The pins are CI identity only, not product or production trust.
 const STAGE = [
   ["tests/oslock/p6-startup-diagnostic.test.mjs", "output/tests/oslock/p6-startup-diagnostic.test.mjs",
-    { bytes: 21953, sha256: "0a28fccf9e3c545d51ac482913136d6ed61f8dc40aed2b10efa2d1d40389ade6" }],
+    { bytes: 25605, sha256: "25cfadf30b48673101577d44cdd12793153824cc9349dc570afb86243451cc10" }],
   ["tests/oslock/fixtures/p6-diag-child.mjs", "output/tests/oslock/fixtures/p6-diag-child.mjs",
-    { bytes: 7019, sha256: "f54d8f4c547e18b8b326171ce4c1abd80c5d7afcd99e6ffda96f03f68b9c0ed7" }],
+    { bytes: 7627, sha256: "f76b4149c9e8cdaec9f9337a14632d61afd4080330a82b01305280408547ecfa" }],
 ];
 const TEST_ENTRY = "tests/oslock/p6-startup-diagnostic.test.mjs"; // relative to scratch ROOT/output
 const TEST_ARGS = ["--expose-gc", "--test-reporter=tap", TEST_ENTRY];
