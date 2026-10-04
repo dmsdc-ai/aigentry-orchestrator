@@ -93,7 +93,43 @@ $Leaf0 = 'psp1167-trust-0123456789abcdef'
 $DomUsers = 'S-1-5-21-1643835476-1616584234-1346609752-513'   # observed primary group, CI 37226598786
 $DomUser = 'S-1-5-21-1643835476-1616584234-1346609752-1001'
 $Observed = "O:BAG:${DomUsers}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
-$OICI = [int]([System.Security.AccessControl.AceFlags]::ObjectInherit -bor [System.Security.AccessControl.AceFlags]::ContainerInherit)
+# PS 5.1 enum construction. CI 37228188094 threw InvalidCastException on the former line here:
+#   $OICI = [int]([System.Security.AccessControl.AceFlags]::ObjectInherit -bor [System.Security.AccessControl.AceFlags]::ContainerInherit)
+# AceFlags and AceType are byte-backed enums. Each former/predicate form is probed in memory and only reported (value or
+# exception, never trusted). Fixtures use .value__ for enum->int and [Enum]::ToObject for int->enum; their bit values must
+# match the ACE header bytes .NET writes for SDDL OICI, or the self-test stops before any case is built.
+$AF = [System.Security.AccessControl.AceFlags]
+$AT = [System.Security.AccessControl.AceType]
+function Probe([string]$Name, [scriptblock]$Expr) {
+  try { $v = & $Expr; Write-Output "probe $Name => $v [$(if ($null -eq $v) { 'null' } else { $v.GetType().FullName })]" }
+  catch { Write-Output "probe $Name => $($_.Exception.GetType().FullName): $($_.Exception.Message)" }
+}
+$SddlAce = [System.Security.AccessControl.RawSecurityDescriptor]::new('D:P(A;OICI;FA;;;SY)').DiscretionaryAcl[0]
+Probe 'former-selftest-96 [int](AceFlags::OI -bor AceFlags::CI)' { [int]([System.Security.AccessControl.AceFlags]::ObjectInherit -bor [System.Security.AccessControl.AceFlags]::ContainerInherit) }
+Probe 'predicate-form [int]($af::OI -bor $af::CI)' { $af = [System.Security.AccessControl.AceFlags]; [int]($af::ObjectInherit -bor $af::ContainerInherit) }
+Probe 'bor-only $AF::OI -bor $AF::CI' { $AF::ObjectInherit -bor $AF::ContainerInherit }
+Probe 'cast-only [int]$AF::OI' { [int]$AF::ObjectInherit }
+Probe 'predicate-form [int]$_.AceFlags (SDDL OICI ace)' { [int]$SddlAce.AceFlags }
+Probe 'predicate-form AceType -eq AccessAllowed' { $SddlAce.AceType -eq [System.Security.AccessControl.AceType]::AccessAllowed }
+Probe 'former-Ace-helper [AceFlags][int]3' { [System.Security.AccessControl.AceFlags]([int]3) }
+Probe 'former-N-T03 [AceType]17' { [System.Security.AccessControl.AceType]17 }
+Probe 'ControlFlags -bor (P08, predicate $need)' { [int]([System.Security.AccessControl.ControlFlags]::DiscretionaryAclPresent -bor [System.Security.AccessControl.ControlFlags]::DiscretionaryAclProtected) }
+Probe 'FileAttributes -bor (N-I04)' { [IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint }
+function AceFlagsOf([int]$Value) { [System.Enum]::ToObject($AF, [byte]$Value) }
+function HeaderOf($Ace) { $b = New-Object byte[] $Ace.BinaryLength; $Ace.GetBinaryForm($b, 0); , $b }
+$OICI = [int]$AF::ObjectInherit.value__ -bor [int]$AF::ContainerInherit.value__
+$sddlHdr = HeaderOf $SddlAce
+$builtHdr = HeaderOf ([System.Security.AccessControl.CommonAce]::new((AceFlagsOf $OICI), [System.Security.AccessControl.AceQualifier]::AccessAllowed, 0x1F01FF,
+  (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')), $false, $null))
+$customAce17 = [System.Security.AccessControl.CustomAce]::new([System.Enum]::ToObject($AT, [byte]17), (AceFlagsOf $OICI), [byte[]](1, 1, 0, 0, 0, 0, 0, 16))
+$customHdr = HeaderOf $customAce17
+if (($OICI -isnot [int]) -or ($OICI -ne 3) -or ($sddlHdr[0] -ne 0) -or ($sddlHdr[1] -ne $OICI) -or ($SddlAce.AceFlags.value__ -ne $OICI) -or
+    ($builtHdr[0] -ne 0) -or ($builtHdr[1] -ne $OICI) -or ((AceFlagsOf $OICI).value__ -ne $OICI) -or
+    ((AceFlagsOf ($OICI -bor 0x40)).value__ -ne ($OICI -bor $AF::SuccessfulAccess.value__)) -or ((AceFlagsOf ($OICI -bor 0x80)).value__ -ne ($OICI -bor $AF::FailedAccess.value__)) -or
+    ((AceFlagsOf ($OICI -bor 0x10)).value__ -ne ($OICI -bor $AF::Inherited.value__)) -or ($customHdr[0] -ne 17) -or ($customHdr[1] -ne $OICI) -or ($customAce17.AceType.value__ -ne 17)) {
+  Fatal "enum construction mismatch OICI=$OICI sddlHdr=$($sddlHdr[0]),$($sddlHdr[1]) builtHdr=$($builtHdr[0]),$($builtHdr[1]) customHdr=$($customHdr[0]),$($customHdr[1])"
+}
+Write-Output "enum ok OICI=$OICI sddlHdr=$($sddlHdr[0]),$($sddlHdr[1]) builtHdr=$($builtHdr[0]),$($builtHdr[1]) customHdr=$($customHdr[0]),$($customHdr[1])"
 $FA = 0x1F01FF
 $CF = [System.Security.AccessControl.ControlFlags]
 
@@ -109,7 +145,7 @@ function New-FakeAcl([byte[]]$Bytes, [string]$Sddl) {
 function Get-SdBytes($Rsd) { $b = New-Object byte[] $Rsd.BinaryLength; $Rsd.GetBinaryForm($b, 0); , $b }
 function SddlBytes([string]$Sddl) { Get-SdBytes ([System.Security.AccessControl.RawSecurityDescriptor]::new($Sddl)) }
 function Ace([string]$Sid, [int]$Flags = $OICI, [int]$Mask = $FA, [string]$Qualifier = 'AccessAllowed', [bool]$Callback = $false) {
-  [System.Security.AccessControl.CommonAce]::new([System.Security.AccessControl.AceFlags]$Flags, [System.Security.AccessControl.AceQualifier]$Qualifier, $Mask, (Sid $Sid), $Callback, $null)
+  [System.Security.AccessControl.CommonAce]::new((AceFlagsOf $Flags), [System.Security.AccessControl.AceQualifier]$Qualifier, $Mask, (Sid $Sid), $Callback, $null)
 }
 function PartsBytes {
   param([int]$Flags = [int]$CF::DiscretionaryAclProtected, [string]$Owner = 'S-1-5-32-544', [string]$Group = $DomUsers, [object[]]$Aces = @(), [switch]$NoDacl, [switch]$EmptySacl, [byte]$Revision = 2)
@@ -208,10 +244,10 @@ Add-Case 'N-A12 SY deny + BA allow' $false -Bytes (SddlBytes "O:BAG:${DomUsers}D
 
 # ---- 10. ACE type negatives (count 2, SIDs SY+BA; only the type is wrong) ----
 Add-Case 'N-T01 callback allow SY' $false -Bytes (PartsBytes -Aces @((Ace 'S-1-5-18' -Callback $true), (Ace 'S-1-5-32-544'))) -Sanity $Two
-$objAce = [System.Security.AccessControl.ObjectAce]::new([System.Security.AccessControl.AceFlags]$OICI, [System.Security.AccessControl.AceQualifier]::AccessAllowed, $FA, (Sid 'S-1-5-32-544'),
+$objAce = [System.Security.AccessControl.ObjectAce]::new((AceFlagsOf $OICI), [System.Security.AccessControl.AceQualifier]::AccessAllowed, $FA, (Sid 'S-1-5-32-544'),
   [System.Security.AccessControl.ObjectAceFlags]::ObjectAceTypePresent, [guid]'bf967aba-0de6-11d0-a285-00aa003049e2', [guid]::Empty, $false, $null)
 Add-Case 'N-T02 object allow BA' $false -Bytes (PartsBytes -Revision 4 -Aces @((Ace 'S-1-5-18'), $objAce)) -Sanity $Two
-$customAce = [System.Security.AccessControl.CustomAce]::new([System.Security.AccessControl.AceType]17, [System.Security.AccessControl.AceFlags]$OICI, [byte[]](1, 1, 0, 0, 0, 0, 0, 16))
+$customAce = [System.Security.AccessControl.CustomAce]::new([System.Enum]::ToObject($AT, [byte]17), (AceFlagsOf $OICI), [byte[]](1, 1, 0, 0, 0, 0, 0, 16))
 Add-Case 'N-T03 unknown ACE type 0x11 + SY' $false -Bytes (PartsBytes -Aces @((Ace 'S-1-5-18'), $customAce)) -Sanity { param($p) ($p.Owner.Value -ceq 'S-1-5-32-544') -and ($p.DiscretionaryAcl.Count -eq 2) }
 Add-Case 'N-T04 audit-type ACE SY in DACL' $false -Bytes (PartsBytes -Aces @((Ace 'S-1-5-18' -Flags ($OICI -bor 0x40) -Qualifier 'SystemAudit'), (Ace 'S-1-5-32-544'))) -Sanity $Two
 Add-Case 'N-T05 callback allow BA' $false -Bytes (PartsBytes -Aces @((Ace 'S-1-5-18'), (Ace 'S-1-5-32-544' -Callback $true))) -Sanity $Two

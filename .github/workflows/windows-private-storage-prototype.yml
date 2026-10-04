@@ -286,7 +286,7 @@ jobs:
           $env:PSModulePath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
           $f = Join-Path $env:GITHUB_WORKSPACE 'prototypes\windows-private-storage\tests\bootstrap-trust.test.ps1'
           $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLowerInvariant()
-          if ($h -cne '4c36b1651290ff329868124d3baac60588b56489b6dfc82fd89db29f168f5b4c') { Write-Output "::error::bootstrap-trust.test.ps1 sha256 $h does not match pin"; exit 1 }
+          if ($h -cne '106be506c52f7cd14745b6d002463c29bb35c539851f41b28a7c90298fc93fa4') { Write-Output "::error::bootstrap-trust.test.ps1 sha256 $h does not match pin"; exit 1 }
           & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $f -WorkflowPath (Join-Path $env:GITHUB_WORKSPACE '.github\workflows\windows-private-storage-prototype.yml')
           exit $LASTEXITCODE
 
