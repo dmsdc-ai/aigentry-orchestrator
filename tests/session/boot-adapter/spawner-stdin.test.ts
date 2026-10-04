@@ -35,6 +35,21 @@ const JS: Record<string, string> = {
   "wait-eof.cjs": `${PID}process.stdin.on("end", () => process.exit(7)); process.stdin.resume();\n`,
   "hang-noread.cjs": `${PID}setInterval(() => {}, 1000);\n`,
 };
+// #1167 win32 only: extensionless /bin/sh shims cannot be spawned there (ENOENT), so each
+// SH fixture gets a process.execPath twin with the same pid/mark/go protocol and exit code.
+// Unverified reasoning (not established from pinned source): stdlib may be unable to close
+// an inherited stdin handle early on win32, so twins never close it while alive; the read end
+// is expected to close at termination, which the driver gate waits for. LIMIT: weaker than the
+// POSIX "closed while alive" gate; needs an actual Windows experiment before adoption.
+// No twin ever touches process.stdin.
+const WIN_JS: Record<string, string> = {
+  "close-stdin-exit5.cjs": `${PID}require("node:fs").writeFileSync(process.env.MARK, ""); process.exitCode = 5;\n`,
+  "close-stdin-exit0.cjs": `${PID}process.exitCode = 0;\n`,
+  "exit6.cjs": `${PID}process.exitCode = 6;\n`,
+  "exit0.cjs": `${PID}process.exitCode = 0;\n`,
+  "wait-go-exit0.cjs": `${PID}const cell = new Int32Array(new SharedArrayBuffer(4));\nwhile (!require("node:fs").existsSync(process.env.GO)) Atomics.wait(cell, 0, 0, 2);\nprocess.exitCode = 0;\n`,
+};
+const WIN = process.platform === "win32";
 
 interface DriverOut {
   scenario: string; outcome: "resolved" | "rejected" | "unknown-scenario";
@@ -53,8 +68,11 @@ function drive(t: TestContext, scenario: string): DriverOut {
     for (const d of ["bin", "pids", "home"]) mkdirSync(join(root, d));
     for (const [n, body] of Object.entries(SH)) writeFileSync(join(root, "bin", n), `#!/bin/sh\n${body}`, { mode: 0o755 });
     for (const [n, body] of Object.entries(JS)) writeFileSync(join(root, n), body);
+    if (WIN) for (const [n, body] of Object.entries(WIN_JS)) writeFileSync(join(root, n), body);
+    const env: Record<string, string> = { PATH: join(root, "bin"), HOME: join(root, "home"), TMPDIR: tmpdir() };
+    if (WIN) Object.assign(env, { USERPROFILE: join(root, "home"), TEMP: tmpdir(), TMP: tmpdir() });
     const r = spawnSync(process.execPath, [DRIVER, scenario, root], {
-      env: { PATH: join(root, "bin"), HOME: join(root, "home"), TMPDIR: tmpdir() },
+      env,
       encoding: "utf8", timeout: 20_000, killSignal: "SIGKILL", maxBuffer: 64 * 1024 * 1024,
     });
     const leftover = readdirSync(join(root, "pids")).map(Number).filter(isAlive);

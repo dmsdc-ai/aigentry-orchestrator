@@ -1,0 +1,332 @@
+name: stdin portability probe (#1167, disposable)
+
+# #1167 — disposable validation for the spawner-stdin fixture correction. It runs only on
+# this one test branch, or by hand on that branch. No secrets, no publish, no cache.
+#
+# Job 1 (stdin-suite) runs the same 14 cases (12 test() calls in the source, and the
+#   SS10 loop adds 2) twice on each OS: once with the fixed-parent baseline 2 files, once
+#   with the candidate 2 files. Both trees use the same 8-file source closure, which is
+#   copied byte-for-byte from git objects. The real nodeSpawner is used; nothing is stubbed.
+#   Baseline on Windows is a NEGATIVE CONTROL. Its 6 known failures are checked by name
+#   and by signature, never just counted, and they are never a product PASS. A green run
+#   here is NOT Windows support for the package.
+# Job 2 (termination-probe) is the 1000-iteration win32 boundary experiment in
+#   _stdin-termination-probe.mjs. It runs on Windows only. It is never a substitute for
+#   any of the 14 suite cases, and those still run on all 3 OSes in Job 1.
+
+on:
+  push:
+    branches: [ test/1167-stdin-portable-20261005 ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stdin-portability-1167-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BASE_SHA: 7670a768b1871de1ba633a832a47cbf837d7801a
+  NODE_EXACT: v20.20.0
+
+jobs:
+  stdin-suite:
+    if: github.ref == 'refs/heads/test/1167-stdin-portable-20261005'
+    name: stdin suite baseline+candidate (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ macos-latest, ubuntu-latest, windows-latest ]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Byte-exact checkout: Windows runners default to core.autocrlf=true.
+      - name: Disable line-ending conversion
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.0'
+
+      - name: Verify exact Node, commit topology and every input hash
+        run: |
+          set -euo pipefail
+          test "$(node -p process.version)" = "$NODE_EXACT"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          set -- $(git rev-list --parents -n 1 HEAD)
+          [ "$#" -eq 2 ] && [ "$2" = "$BASE_SHA" ] || { echo "::error::HEAD must have exactly one parent = $BASE_SHA"; exit 1; }
+          CHANGED="$(git diff --name-only --no-renames "$BASE_SHA" HEAD | LC_ALL=C sort)"
+          EXPECTED="$(printf '%s\n' .github/workflows/stdin-portability-probe.yml \
+            tests/session/boot-adapter/_spawner-stdin-driver.ts \
+            tests/session/boot-adapter/_stdin-termination-probe.mjs \
+            tests/session/boot-adapter/spawner-stdin.test.ts | LC_ALL=C sort)"
+          [ "$CHANGED" = "$EXPECTED" ] || { echo "::error::unexpected changed set vs parent:"; echo "$CHANGED"; exit 1; }
+          sha() { node -e 'process.stdout.write(require("node:crypto").createHash("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' "$1"; }
+          blob="$RUNNER_TEMP/ss1167-blob"
+          fail=0
+          while read -r rev path want; do
+            [ -n "$rev" ] || continue
+            [ "$rev" = BASE ] && r="$BASE_SHA" || r=HEAD
+            git cat-file blob "$r:$path" > "$blob"
+            got="$(sha "$blob")"
+            if [ "$got" != "$want" ]; then echo "::error::$rev:$path sha256 $got != $want"; fail=1; fi
+          done <<'EOF'
+          HEAD tests/session/boot-adapter/_spawner-stdin-driver.ts 6aa92344cd4427e50d73d7773b72502b014ab6ada6095f778adc9a68e0aeefe5
+          HEAD tests/session/boot-adapter/spawner-stdin.test.ts d2dbeeae98ed0e3576aa83a722f3296f3ce71ab46554189dcbfd3571c39315f2
+          HEAD tests/session/boot-adapter/_stdin-termination-probe.mjs 0a707ca0c79d1b6795972a65b81ca61b812b2973e3f717d54cb54c9b59820765
+          BASE tests/session/boot-adapter/_spawner-stdin-driver.ts 19279d437b8d13ceb9093e87c1feee57e46a098f7489301910f72bb1d0c592e5
+          BASE tests/session/boot-adapter/spawner-stdin.test.ts 1067e04c13a7a15fda183ee179810119537453c027722ee9ad686db2115c5880
+          BASE package.json a5b293836105f2a02072e1cb4214940c61ea2798c3c899e15a3e847222a40f5d
+          BASE package-lock.json beaea7f58b8f0e802ea6d072f62ab5964ecd44776ec3c569991b58a23256d720
+          BASE tsconfig.json 7f867214418ae3ed617dba351c2d4c99064b8e7afd3b9a0d34ece8cc8a94bc97
+          BASE src/session/boot-adapter/boot-fs.ts 0cda0ba1effe33e42d1ab27a9afc3f55ad53a401a16b0ee6416ca82e2d4b7c1f
+          BASE src/session/boot-adapter/spawner.ts 1f1634043cdee74b3f8d791274893755dad0b70d4e5656055834112989204bc9
+          BASE src/session/boot-adapter/types.ts 984ce32596d76e20bbdf63a513dfddb11c80a4689af31d2169eb05e3ae955cea
+          BASE src/session/persistence/canonical-bytes.ts e598a6c8dddd1cf6dd0ce6d078625f13efcf0042364af76795911189352e7f2c
+          BASE src/session/project-id.ts 8c0ba1effe4c752470a7e8778c56f32efe110f7e1e4bf7820a5074691241c761
+          BASE src/session/resolve-instructions.ts ee12ef983b7fb7312b9314a1ecb550fbd79a4e0e44ea3c49159aca9135b214ba
+          BASE src/session/types.ts e7210345caa8e48d2a49c7023b5777676439fdc9e37ad0fb9fe1088c76503fea
+          BASE src/session/virtual-fs.ts e67ca4371170a8081fe338ae5e33f51ae03604a630e973023fedf9be070e92d4
+          HEAD package.json a5b293836105f2a02072e1cb4214940c61ea2798c3c899e15a3e847222a40f5d
+          HEAD package-lock.json beaea7f58b8f0e802ea6d072f62ab5964ecd44776ec3c569991b58a23256d720
+          HEAD src/session/boot-adapter/boot-fs.ts 0cda0ba1effe33e42d1ab27a9afc3f55ad53a401a16b0ee6416ca82e2d4b7c1f
+          HEAD src/session/boot-adapter/spawner.ts 1f1634043cdee74b3f8d791274893755dad0b70d4e5656055834112989204bc9
+          HEAD src/session/boot-adapter/types.ts 984ce32596d76e20bbdf63a513dfddb11c80a4689af31d2169eb05e3ae955cea
+          HEAD src/session/persistence/canonical-bytes.ts e598a6c8dddd1cf6dd0ce6d078625f13efcf0042364af76795911189352e7f2c
+          HEAD src/session/project-id.ts 8c0ba1effe4c752470a7e8778c56f32efe110f7e1e4bf7820a5074691241c761
+          HEAD src/session/resolve-instructions.ts ee12ef983b7fb7312b9314a1ecb550fbd79a4e0e44ea3c49159aca9135b214ba
+          HEAD src/session/types.ts e7210345caa8e48d2a49c7023b5777676439fdc9e37ad0fb9fe1088c76503fea
+          HEAD src/session/virtual-fs.ts e67ca4371170a8081fe338ae5e33f51ae03604a630e973023fedf9be070e92d4
+          EOF
+          # npm ci reads the working tree, so it must be byte-identical to the verified blobs.
+          [ "$(sha package.json)" = a5b293836105f2a02072e1cb4214940c61ea2798c3c899e15a3e847222a40f5d ] || fail=1
+          [ "$(sha package-lock.json)" = beaea7f58b8f0e802ea6d072f62ab5964ecd44776ec3c569991b58a23256d720 ] || fail=1
+          rm -f "$blob"
+          [ "$fail" = 0 ] || { echo "::error::hash verification failed; nothing was executed"; exit 1; }
+          echo "verified: parent=$BASE_SHA, candidate 2 files, baseline 2 files, 8-file closure (both revs), spawner, lock"
+
+      # Existing locked deps only, no lifecycle scripts. On win32 npm refuses the root
+      # manifest's own os[] (EBADPLATFORM). --force is a broad npm switch. It is used here
+      # only in this disposable CI, following the existing ci.yml W1 precedent. It changes
+      # neither the package.json os[] declaration nor any install support for the product.
+      - name: Install root lock (typescript + @types/node come from here, read-only)
+        run: |
+          set -euo pipefail
+          FORCE=""; [ "$RUNNER_OS" = Windows ] && FORCE="--force"
+          npm ci --ignore-scripts --no-audit --no-fund $FORCE
+          test -f node_modules/typescript/bin/tsc
+          test -f node_modules/@types/node/package.json
+
+      - name: Build private baseline and candidate trees from git objects
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP/ss1167"
+          CLOSURE="src/session/boot-adapter/boot-fs.ts src/session/boot-adapter/spawner.ts src/session/boot-adapter/types.ts
+            src/session/persistence/canonical-bytes.ts src/session/project-id.ts src/session/resolve-instructions.ts
+            src/session/types.ts src/session/virtual-fs.ts"
+          TESTS="tests/session/boot-adapter/_spawner-stdin-driver.ts tests/session/boot-adapter/spawner-stdin.test.ts"
+          for side in baseline candidate; do
+            [ "$side" = baseline ] && trev="$BASE_SHA" || trev=HEAD
+            for f in $CLOSURE; do mkdir -p "$(dirname "$T/$side/$f")"; git cat-file blob "$BASE_SHA:$f" > "$T/$side/$f"; done
+            for f in $TESTS; do mkdir -p "$(dirname "$T/$side/$f")"; git cat-file blob "$trev:$f" > "$T/$side/$f"; done
+            printf '{\n  "private": true,\n  "type": "module"\n}\n' > "$T/$side/package.json"
+            # Baseline tsconfig.json options verbatim (hash-verified above), plus read-only
+            # typeRoots into the root lock install and types:["node"].
+            node -e '
+              const fs = require("node:fs"), path = require("node:path");
+              const [dir, ws] = process.argv.slice(1);
+              const cfg = { compilerOptions: {
+                target: "ES2022", module: "ES2022", moduleResolution: "node", lib: ["ES2022"],
+                outDir: "dist", rootDir: ".", strict: true, noImplicitAny: true, noImplicitReturns: true,
+                noFallthroughCasesInSwitch: true, noUnusedLocals: true, noUnusedParameters: true,
+                exactOptionalPropertyTypes: true, esModuleInterop: true, forceConsistentCasingInFileNames: true,
+                skipLibCheck: true, declaration: true, sourceMap: true, resolveJsonModule: true,
+                typeRoots: [path.join(ws, "node_modules", "@types")], types: ["node"] },
+                include: ["src/**/*.ts", "tests/**/*.ts"], exclude: ["node_modules", "dist"] };
+              fs.writeFileSync(path.join(dir, "tsconfig.json"), JSON.stringify(cfg, null, 2) + "\n");
+            ' "$T/$side" "$GITHUB_WORKSPACE"
+          done
+
+      - name: Compile both trees (a compile failure fails the job)
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP/ss1167"; OUT="$RUNNER_TEMP/ss1167-out"; mkdir -p "$OUT"
+          node "$GITHUB_WORKSPACE/node_modules/typescript/bin/tsc" -v | tee "$OUT/tsc-version.txt"
+          for side in baseline candidate; do
+            node "$GITHUB_WORKSPACE/node_modules/typescript/bin/tsc" -p "$T/$side/tsconfig.json" 2>&1 | tee "$OUT/tsc-$side.log"
+            test -f "$T/$side/dist/tests/session/boot-adapter/spawner-stdin.test.js"
+            test -f "$T/$side/dist/tests/session/boot-adapter/_spawner-stdin-driver.js"
+          done
+
+      # GitHub runs bash steps with -e. errexit is lifted ONLY around each test invocation,
+      # so the expected Windows baseline failure cannot abort status capture or the
+      # candidate run. Every other command in this step still fails the job.
+      - name: Run the 14 cases, baseline then candidate (status recorded, judged below)
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP/ss1167"; OUT="$RUNNER_TEMP/ss1167-out"
+          for side in baseline candidate; do
+            cd "$T/$side"
+            set +e
+            node --test --test-timeout=120000 --test-reporter=tap \
+              --test-reporter-destination="$OUT/$side.tap" \
+              dist/tests/session/boot-adapter/spawner-stdin.test.js > "$OUT/$side.stdout" 2> "$OUT/$side.stderr"
+            rc=$?
+            set -e
+            echo "$rc" > "$OUT/$side.status"
+            echo "$side exit $rc"
+          done
+
+      - name: Judge by name and signature (not by count)
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ss1167-eval.mjs" <<'EOF'
+          import { createHash } from "node:crypto";
+          import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+          import os from "node:os";
+          import { join, relative } from "node:path";
+          const T = join(process.env.RUNNER_TEMP, "ss1167"), OUT = join(process.env.RUNNER_TEMP, "ss1167-out");
+          const WIN = process.platform === "win32";
+          const IDS = ["SS1", "SS2", "SS3", "SS4", "SS5", "SS6", "SS7", "SS8", "SS9", "SS10a", "SS10b", "SS10c", "SS11", "SS12"];
+          // Known baseline win32 negative control (prior run evidence): id -> required signature.
+          const WIN_BASE_FAIL = { SS1: "GATE_TIMEOUT", SS2: "ENOENT", SS3: "GATE_TIMEOUT", SS4: "ENOENT", SS8: "ENOENT", SS12: "ENOENT" };
+          const problems = [];
+          const sha = (f) => createHash("sha256").update(readFileSync(f)).digest("hex");
+          const walk = (d) => readdirSync(d).flatMap((n) => statSync(join(d, n)).isDirectory() ? walk(join(d, n)) : [join(d, n)]);
+          function recount(src) {
+            const calls = (src.match(/(^|[^\w.])test\(/gm) ?? []).length;
+            const loops = [...src.matchAll(/for \(const \[n, s\] of \[(.*?)\] as const\)/g)];
+            if (loops.length !== 1) return { calls, loopEntries: null, total: null };
+            const loopEntries = (loops[0][1].match(/\["10[a-z]"/g) ?? []).length;
+            return { calls, loopEntries, total: calls - 1 + loopEntries };
+          }
+          function parse(tap) {
+            const lines = tap.split(/\r?\n/), cases = {}, summary = {};
+            for (let i = 0; i < lines.length; i++) {
+              const m = /^(not ok|ok) \d+ - (.*?)(?: # (SKIP|TODO)\b.*)?$/.exec(lines[i]);
+              if (m) {
+                const id = /^(SS\d+[a-c]?) /.exec(m[2])?.[1] ?? `?${m[2]}`;
+                let block = "";
+                if (m[1] === "not ok") for (let j = i + 1; j < lines.length && lines[j] !== "  ..."; j++) block += lines[j] + "\n";
+                if (cases[id]) problems.push(`duplicate case ${id}`);
+                cases[id] = { ok: m[1] === "ok", directive: m[3] ?? null, title: m[2], block };
+              }
+              const s = /^# (tests|suites|pass|fail|cancelled|skipped|todo) (\d+)$/.exec(lines[i]);
+              if (s) summary[s[1]] = Number(s[2]);
+            }
+            return { cases, summary };
+          }
+          const sides = {};
+          for (const side of ["baseline", "candidate"]) {
+            const src = readFileSync(join(T, side, "tests/session/boot-adapter/spawner-stdin.test.ts"), "utf8");
+            const rc = recount(src);
+            if (rc.calls !== 12 || rc.loopEntries !== 3 || rc.total !== IDS.length) problems.push(`${side}: source recount ${JSON.stringify(rc)}`);
+            const rawStatus = readFileSync(join(OUT, `${side}.status`), "utf8").trim();
+            const status = /^\d+$/.test(rawStatus) ? Number(rawStatus) : null; // empty/garbage never reads as 0
+            if (status === null) problems.push(`${side}: unreadable runner status "${rawStatus}"`);
+            const { cases, summary } = parse(readFileSync(join(OUT, `${side}.tap`), "utf8"));
+            const got = Object.keys(cases).sort(), want = [...IDS].sort();
+            if (JSON.stringify(got) !== JSON.stringify(want)) problems.push(`${side}: case ids ${got.join(",")}`);
+            const skipped = Object.entries(cases).filter(([, c]) => c.directive).map(([id]) => id);
+            if (skipped.length) problems.push(`${side}: directives on ${skipped.join(",")}`);
+            const failed = Object.entries(cases).filter(([, c]) => !c.ok).map(([id]) => id).sort();
+            const negativeControl = side === "baseline" && WIN;
+            // Exact summary and exit: every field must be present (missing is never zero).
+            const wantSummary = negativeControl
+              ? { tests: 14, pass: 8, fail: 6, cancelled: 0, skipped: 0, todo: 0 }
+              : { tests: 14, pass: 14, fail: 0, cancelled: 0, skipped: 0, todo: 0 };
+            for (const [k, v] of Object.entries(wantSummary)) {
+              if (!(k in summary)) problems.push(`${side}: summary field ${k} missing`);
+              else if (summary[k] !== v) problems.push(`${side}: summary ${k}=${summary[k]} != ${v}`);
+            }
+            const wantStatus = negativeControl ? 1 : 0;
+            if (status !== wantStatus) problems.push(`${side}: runner exit ${status} != ${wantStatus}`);
+            if (negativeControl) {
+              const wantFail = Object.keys(WIN_BASE_FAIL).sort();
+              if (JSON.stringify(failed) !== JSON.stringify(wantFail)) problems.push(`baseline win32: failed set ${failed.join(",")} != known ${wantFail.join(",")}`);
+              for (const [id, sig] of Object.entries(WIN_BASE_FAIL)) if (cases[id] && !cases[id].ok && !cases[id].block.includes(sig)) problems.push(`baseline win32: ${id} failed without known signature ${sig}`);
+            } else if (failed.length) problems.push(`${side}: failed ${failed.join(",")}`);
+            const hashes = Object.fromEntries(walk(join(T, side)).filter((f) => !f.includes(`${join(T, side, "dist")}`))
+              .map((f) => [relative(join(T, side), f).split("\\").join("/"), sha(f)]));
+            sides[side] = { role: negativeControl ? "NEGATIVE_CONTROL (not a product PASS)" : "must-pass", status, summary, recount: rc,
+              passed: Object.entries(cases).filter(([, c]) => c.ok).map(([id]) => id), failed,
+              failures: Object.fromEntries(failed.map((id) => [id, cases[id].block.split("\n").find((l) => /error:/.test(l))?.trim() ?? ""])), sourceHashes: hashes };
+          }
+          // The suite is the same on both sides: titles must match per id.
+          const bt = parse(readFileSync(join(OUT, "baseline.tap"), "utf8")).cases, ct = parse(readFileSync(join(OUT, "candidate.tap"), "utf8")).cases;
+          for (const id of IDS) if (bt[id] && ct[id] && bt[id].title !== ct[id].title) problems.push(`title changed for ${id}`);
+          const meta = { github_sha: process.env.GITHUB_SHA, base_sha: process.env.BASE_SHA, runner_os: process.env.RUNNER_OS,
+            image_os: process.env.ImageOS ?? null, image_version: process.env.ImageVersion ?? null,
+            node: process.version, versions: { uv: process.versions.uv, v8: process.versions.v8 },
+            platform: process.platform, arch: process.arch, os_type: os.type(), os_release: os.release(),
+            tsc: readFileSync(join(OUT, "tsc-version.txt"), "utf8").trim() };
+          const verdict = problems.length ? "FAIL" : (WIN ? "PASS_CANDIDATE_14_OF_14__BASELINE_NEGATIVE_CONTROL_MATCHED" : "PASS_BASELINE_AND_CANDIDATE_14_OF_14");
+          const res = { verdict, scope: "spawner-stdin fixture suite only; not whole-Windows support", meta, sides, problems };
+          writeFileSync(join(OUT, "evaluation.json"), JSON.stringify(res, null, 2) + "\n");
+          console.log(JSON.stringify({ verdict, problems }, null, 2));
+          process.exitCode = problems.length ? 1 : 0;
+          EOF
+          node "$RUNNER_TEMP/ss1167-eval.mjs"
+
+      - name: Save TAP, stderr, metadata, evaluation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ss1167-suite-${{ matrix.os }}
+          path: ${{ runner.temp }}/ss1167-out
+          retention-days: 7
+          if-no-files-found: error
+
+  termination-probe:
+    if: github.ref == 'refs/heads/test/1167-stdin-portable-20261005'
+    # Windows only. On POSIX, the synchronous kill(pid,0) poll runs without event-loop
+    # reaping, so it would keep seeing the unreaped zombie until the 5 s gate bound. No
+    # POSIX contrast is run.
+    name: termination probe x1000 (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Disable line-ending conversion
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.0'
+      - name: Verify exact Node, parent, spawner and probe hash
+        run: |
+          set -euo pipefail
+          test "$(node -p process.version)" = "$NODE_EXACT"
+          set -- $(git rev-list --parents -n 1 HEAD)
+          [ "$#" -eq 2 ] && [ "$2" = "$BASE_SHA" ] || { echo "::error::HEAD must have exactly one parent = $BASE_SHA"; exit 1; }
+          sha() { node -e 'process.stdout.write(require("node:crypto").createHash("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' "$1"; }
+          mkdir -p "$RUNNER_TEMP/ss1167-probe"
+          git cat-file blob HEAD:src/session/boot-adapter/spawner.ts > "$RUNNER_TEMP/ss1167-probe/spawner.ts"
+          [ "$(sha "$RUNNER_TEMP/ss1167-probe/spawner.ts")" = 1f1634043cdee74b3f8d791274893755dad0b70d4e5656055834112989204bc9 ]
+          git cat-file blob HEAD:tests/session/boot-adapter/_stdin-termination-probe.mjs > "$RUNNER_TEMP/ss1167-probe/probe.mjs"
+          [ "$(sha "$RUNNER_TEMP/ss1167-probe/probe.mjs")" = 0a707ca0c79d1b6795972a65b81ca61b812b2973e3f717d54cb54c9b59820765 ]
+      - name: Run probe (1000 iterations, own child pids only)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ss1167-probe-out"
+          node "$RUNNER_TEMP/ss1167-probe/probe.mjs" "$RUNNER_TEMP/ss1167-probe-out/probe-windows-latest.json"
+      - name: Save probe aggregate
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ss1167-probe-windows-latest
+          path: ${{ runner.temp }}/ss1167-probe-out
+          retention-days: 7
+          if-no-files-found: error
