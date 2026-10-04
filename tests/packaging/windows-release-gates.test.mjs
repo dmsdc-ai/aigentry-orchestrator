@@ -1719,6 +1719,11 @@ const controlRelative = 'tests/control/core.test.mjs';
 // platform, win32 included, directly after the control entry and ahead of the POSIX-only entries.
 // The fixture only places a test-owned sentinel at this path; the real helper is never imported or run.
 const fakeCmuxInertRelative = 'tests/dispatch/fake-cmux-win32.inert.test.mjs';
+// #1166 index-lock bounded-wait suites: two explicit, platform-neutral source entries on EVERY platform,
+// win32 included, in this exact order, directly after the fake-cmux inert entry and ahead of the POSIX-only
+// entries. The fixture only places test-owned sentinels at these paths; the real suites are never run.
+const indexLockNames = ['index-lock-bounded-wait', 'index-lock-progress'];
+const indexLockRelatives = indexLockNames.map(name => `tests/session/persistence/${name}.test.mjs`);
 function callerFixture(mode, symlinked = false) {
   const directory = mkdtempSync(join(admin, 'caller fixture '));
   const put = (path, source) => {
@@ -1749,6 +1754,9 @@ function callerFixture(mode, symlinked = false) {
   }
   if (mode !== 'missing-control') put(controlRelative, checks + `console.log('CALLER_CONTROL_SENTINEL');\nprocess.exit(${mode === 'failing-control' ? 8 : 0});\n`);
   if (mode !== 'missing-fake-cmux-inert') put(fakeCmuxInertRelative, checks + `console.log('CALLER_FAKE_CMUX_INERT_SENTINEL');\nprocess.exit(${mode === 'failing-fake-cmux-inert' ? 8 : 0});\n`);
+  for (const [index, path] of indexLockRelatives.entries()) {
+    if (mode !== `missing-${indexLockNames[index]}`) put(path, checks + `console.log('CALLER_INDEX_LOCK_SENTINEL_${index}');\nprocess.exit(${mode === `failing-${indexLockNames[index]}` ? 8 : 0});\n`);
+  }
   if (mode !== 'missing-wizard') put(wizardRelative, checks + `console.log('CALLER_WIZARD_SENTINEL');\nprocess.exit(${mode === 'failing-wizard' ? 8 : 0});\n`);
   if (mode !== 'missing-supervisor') put(supervisorRelative, checks + `console.log('CALLER_SUPERVISOR_SENTINEL');\nprocess.exit(${mode === 'failing-supervisor' ? 8 : 0});\n`);
   for (const [index, path] of agentMetadataRelatives.entries()) {
@@ -1797,6 +1805,11 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic, onlyFailed
   // #1167 the fake-cmux win32 inert suite alone missing or failing, analogous to the #1182 control entries.
   ['missing-fake-cmux-inert', 1, false, false, false, /Could not find '[^'\n]*tests[\\/]dispatch[\\/]fake-cmux-win32\.inert\.test\.mjs'/],
   ['failing-fake-cmux-inert', 1, true, true, false, undefined, /tests[\\/]dispatch[\\/]fake-cmux-win32\.inert\.test\.mjs$/],
+  // #1166 each index-lock suite alone missing or failing, analogous to the #1167 fake-cmux inert entries.
+  ['missing-index-lock-bounded-wait', 1, false, false, false, /Could not find '[^'\n]*tests[\\/]session[\\/]persistence[\\/]index-lock-bounded-wait\.test\.mjs'/],
+  ['failing-index-lock-bounded-wait', 1, true, true, false, undefined, /tests[\\/]session[\\/]persistence[\\/]index-lock-bounded-wait\.test\.mjs$/],
+  ['missing-index-lock-progress', 1, false, false, false, /Could not find '[^'\n]*tests[\\/]session[\\/]persistence[\\/]index-lock-progress\.test\.mjs'/],
+  ['failing-index-lock-progress', 1, true, true, false, undefined, /tests[\\/]session[\\/]persistence[\\/]index-lock-progress\.test\.mjs$/],
   ['missing-harness', 1, true, true, false, /POSIX control harness failed with exit status: 1/],
   ['empty', 1, false, false, false, /No compiled test files found/],
   ['missing-dist', 1, false, false, false, /Failed to enumerate compiled tests/],
@@ -1827,6 +1840,7 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic, onlyFailed
   for (const index of taskAdvisorRelatives.keys()) assert.equal(result.stdout.includes(`CALLER_TASK_ADVISOR_SENTINEL_${index}`), compiled);
   assert.equal(result.stdout.includes('CALLER_CONTROL_SENTINEL'), compiled);
   assert.equal(result.stdout.includes('CALLER_FAKE_CMUX_INERT_SENTINEL'), compiled);
+  for (const index of indexLockRelatives.keys()) assert.equal(result.stdout.includes(`CALLER_INDEX_LOCK_SENTINEL_${index}`), compiled);
   assert.ok(!result.stdout.includes('CALLER_UNSELECTED_MJS'), 'no automatic source .mjs discovery');
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_COMPILED_CONTROL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (security && sentinel) assert.ok(result.stdout.indexOf('CALLER_SECURITY_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
@@ -1844,6 +1858,9 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic, onlyFailed
   }
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_CONTROL_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_FAKE_CMUX_INERT_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
+  if (compiled && sentinel) for (const index of indexLockRelatives.keys()) {
+    assert.ok(result.stdout.indexOf(`CALLER_INDEX_LOCK_SENTINEL_${index}`) < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
+  }
   if (diagnostic) assert.match(result.stderr, diagnostic);
   if (onlyFailedFile) {
     const failures = result.stdout.split('\n').filter(line => /^not ok \d+ - /.test(line));
@@ -1920,6 +1937,7 @@ const startupError = { status: null, signal: null, error: 'synthetic ENOENT', co
 const timedOut = { status: null, signal: 'SIGKILL', error: 'synthetic ETIMEDOUT', code: 'ETIMEDOUT' };
 const callerArgv = platform => ['--test', 'dist/tests/a.test.js', 'dist/tests/nested/b.test.js', 'dist/tests/z.test.js',
   securityRelative, admissionRelative, ...jevRelatives, ...taskAdvisorRelatives, controlRelative, fakeCmuxInertRelative,
+  ...indexLockRelatives,
   ...(['linux', 'darwin'].includes(platform) ? [nativeRelative, wizardRelative, supervisorRelative, ...agentMetadataRelatives] : [])];
 const vmCases = [];
 for (const platform of ['linux', 'darwin']) {
@@ -2014,8 +2032,8 @@ for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #118
   assert.equal(spawned.indexOf('tests/dispatch/fake-cmux-win32.inert.test.mjs'), spawned.indexOf('tests/control/core.test.mjs') + 1);
 });
 // #1167 explicit placement of the fake-cmux win32 inert entry in the exact runner's first spawn: exactly
-// once on every platform, directly after the control entry, then the first POSIX-only entry on POSIX and
-// nothing after it on win32 — measured against literal neighbours, not the list-derived argv.
+// once on every platform, directly after the control entry, then (#1166) the index-lock bounded-wait entry
+// on every platform — measured against literal neighbours, not the list-derived argv.
 for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #1167 fake-cmux win32 inert follows control core exactly once ahead of the POSIX-only entries (${platform})`, 'caller-vm', () => {
   const config = join(admin, `caller-vm-1167-placement-${platform}.json`);
   writeFileSync(config, JSON.stringify({ platform, results: platform === 'win32' ? [success] : [success, success], source: callerSource }));
@@ -2031,8 +2049,32 @@ for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #116
   assert.equal(spawned.filter(item => item === 'tests/dispatch/fake-cmux-win32.inert.test.mjs').length, 1);
   assert.equal(spawned.filter(item => item === 'tests/control/core.test.mjs').length, 1);
   assert.equal(spawned.indexOf('tests/dispatch/fake-cmux-win32.inert.test.mjs'), spawned.indexOf('tests/control/core.test.mjs') + 1);
-  if (platform === 'win32') assert.equal(spawned.indexOf('tests/dispatch/fake-cmux-win32.inert.test.mjs'), spawned.length - 1);
-  else assert.equal(spawned.indexOf('tests/packaging/native-capture.test.mjs'), spawned.indexOf('tests/dispatch/fake-cmux-win32.inert.test.mjs') + 1);
+  assert.equal(spawned.indexOf('tests/session/persistence/index-lock-bounded-wait.test.mjs'), spawned.indexOf('tests/dispatch/fake-cmux-win32.inert.test.mjs') + 1);
+});
+// #1166 explicit placement of the two index-lock entries in the exact runner's first spawn: each exactly
+// once on every platform, bounded-wait directly after the fake-cmux inert entry, progress directly after
+// bounded-wait, then the first POSIX-only entry on POSIX and nothing after it on win32 — measured against
+// literal neighbours, not the list-derived argv.
+for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #1166 index-lock bounded-wait then progress follow fake-cmux win32 inert exactly once ahead of the POSIX-only entries (${platform})`, 'caller-vm', () => {
+  const config = join(admin, `caller-vm-1166-placement-${platform}.json`);
+  writeFileSync(config, JSON.stringify({ platform, results: platform === 'win32' ? [success] : [success, success], source: callerSource }));
+  const argv = ['--experimental-vm-modules', driver, config];
+  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, encoding: 'utf8', timeout });
+  invocations.push({ kind: 'caller-vm-1166-placement', label: platform, executable: process.execPath, argv, timeout,
+    exit: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr, runnerSha256: sha(callerSource) });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+  const actual = JSON.parse(result.stdout);
+  assert.equal(actual.status, 0);
+  const spawned = actual.calls[0].argv;
+  const boundedWait = 'tests/session/persistence/index-lock-bounded-wait.test.mjs';
+  const progress = 'tests/session/persistence/index-lock-progress.test.mjs';
+  assert.equal(spawned.filter(item => item === boundedWait).length, 1);
+  assert.equal(spawned.filter(item => item === progress).length, 1);
+  assert.equal(spawned.indexOf(boundedWait), spawned.indexOf('tests/dispatch/fake-cmux-win32.inert.test.mjs') + 1);
+  assert.equal(spawned.indexOf(progress), spawned.indexOf(boundedWait) + 1);
+  if (platform === 'win32') assert.equal(spawned.indexOf(progress), spawned.length - 1);
+  else assert.equal(spawned.indexOf('tests/packaging/native-capture.test.mjs'), spawned.indexOf(progress) + 1);
 });
 // #1181 wrong-platform placement of the POSIX-only wizard entry. Each mutation is applied
 // to the exact runner bytes with unique-needle checks OUTSIDE assert.throws, the mutated
@@ -2047,6 +2089,7 @@ const posixBranchOpen = "if (process.platform === 'darwin' || process.platform =
 const agentMetadataBlock = `  sourceTestFiles.push(\n${agentMetadataRelatives.map(path => `    '${path}',\n`).join('')}  );\n`;
 const controlPush = "sourceTestFiles.push('tests/control/core.test.mjs');\n";
 const fakeCmuxInertPush = "sourceTestFiles.push('tests/dispatch/fake-cmux-win32.inert.test.mjs');\n";
+const indexLockBlock = `sourceTestFiles.push(\n${indexLockRelatives.map(path => `  '${path}',\n`).join('')});\n`;
 for (const [name, mutate, platforms] of [
   ['wizard entry placed on every platform, win32 included', source => replaceOnce(replaceOnce(source, wizardPosixPush, wizardPosixDropped),
     baseSourceList, "'tests/packaging/release-admission.test.mjs', 'tests/packaging/orchestrator-boot-wizard.test.mjs'];"), ['win32', 'linux', 'darwin']],
@@ -2096,6 +2139,21 @@ for (const [name, mutate, platforms] of [
     `if (process.platform === 'win32') ${fakeCmuxInertPush}`), ['linux', 'darwin']],
   ['fake-cmux win32 inert suite ahead of the control core suite', source => replaceOnce(replaceOnce(source, fakeCmuxInertPush, ''),
     controlPush, `${fakeCmuxInertPush}${controlPush}`), ['win32', 'linux', 'darwin']],
+  // #1166: each index-lock suite is required exactly once on every platform, bounded-wait then progress,
+  // directly after the fake-cmux inert entry and ahead of the POSIX branch. Placing the block on win32 only
+  // leaves the win32 argv unchanged, so that counterfactual applies to POSIX alone.
+  ...indexLockRelatives.map(path => [`index-lock suite ${path} missing`, source => replaceOnce(source, `  '${path}',\n`, ''),
+    ['win32', 'linux', 'darwin']]),
+  ...indexLockRelatives.map(path => [`index-lock suite ${path} duplicated`, source => replaceOnce(source, `  '${path}',\n`,
+    `  '${path}',\n  '${path}',\n`), ['win32', 'linux', 'darwin']]),
+  ['index-lock suites wired POSIX-only', source => replaceOnce(replaceOnce(source, indexLockBlock, ''), wizardPosixPush,
+    `${wizardPosixPush}\n  ${indexLockBlock.trimEnd()}`), ['win32', 'linux', 'darwin']],
+  ['index-lock suites placed on win32 only', source => replaceOnce(source, indexLockBlock,
+    `if (process.platform === 'win32') ${indexLockBlock}`), ['linux', 'darwin']],
+  ['index-lock suites reordered', source => replaceOnce(source, indexLockBlock,
+    `sourceTestFiles.push(\n  '${indexLockRelatives[1]}',\n  '${indexLockRelatives[0]}',\n);\n`), ['win32', 'linux', 'darwin']],
+  ['index-lock suites ahead of the fake-cmux win32 inert suite', source => replaceOnce(replaceOnce(source, indexLockBlock, ''),
+    fakeCmuxInertPush, `${indexLockBlock}${fakeCmuxInertPush}`), ['win32', 'linux', 'darwin']],
   // #1177: the XRes supervisor suite is required on POSIX and must never reach win32.
   ['XRes supervisor suite missing', source => replaceOnce(source, supervisorPosixPush, ''), ['linux', 'darwin']],
   ['XRes supervisor suite placed on every platform, win32 included', source => replaceOnce(replaceOnce(source, supervisorPosixPush, ''),
