@@ -1,6 +1,7 @@
 // ADR-MF #13 — Spawner abstraction. stdlib only.
 import { spawn } from "node:child_process";
 import type { BootCommand } from "./types.js";
+import { resolveLaunch } from "./win-launch.js";
 
 export interface RunResult {
   stdout: string;
@@ -22,7 +23,9 @@ const PROBE_MAX_BYTES = 1_048_576;
 
 function collect(exe: string, args: readonly string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    const c = spawn(exe, [...args], { shell: false });
+    // #1167: identity off win32; on win32 a resolution refusal rejects before any spawn.
+    const l = resolveLaunch(exe, args, process.env, undefined);
+    const c = spawn(l.file, l.args, { shell: false, ...(l.argv0 !== undefined ? { argv0: l.argv0 } : {}) });
     let out: string[] = [];
     let bytes = 0;
     let done = false;
@@ -62,11 +65,15 @@ export function nodeSpawner(): Spawner {
       const start = Date.now();
       const [exe, ...args] = cmd.argv;
       if (!exe) throw new Error("nodeSpawner: empty argv");
+      const env = { ...process.env, ...cmd.env };
+      // #1167: resolved against the same env/cwd the child gets; throws CLI_LAUNCH_UNSUPPORTED.
+      const l = resolveLaunch(exe, args, env, cmd.cwd);
       return await new Promise<RunResult>((resolve, reject) => {
-        const child = spawn(exe, args, {
+        const child = spawn(l.file, l.args, {
           cwd: cmd.cwd,
-          env: { ...process.env, ...cmd.env },
+          env,
           shell: false,
+          ...(l.argv0 !== undefined ? { argv0: l.argv0 } : {}),
         });
         let out = "", err = "";
         const t = setTimeout(() => {

@@ -13,9 +13,13 @@ import { makeAdapter } from "./common.js";
 import { CLI_DEFAULT, envOrDefault, launchConfig, optInEnv } from "./launch-config.js";
 import { accessSync, constants } from "node:fs";
 import { delimiter, join } from "node:path";
+import { findWindowsCommand } from "./win-launch.js";
 
 export function geminiBinary(env: NodeJS.ProcessEnv = process.env): "agy" | "gemini" {
   if (env.AIGENTRY_GEMINI_BINARY === "gemini" || env.AIGENTRY_GEMINI_BINARY === "agy") return env.AIGENTRY_GEMINI_BINARY;
+  // #1167: on win32 any first cmd-search hit (agy.cmd, agy.exe, …) is agy, even one
+  // the launcher will refuse; only a missing agy falls back to gemini.
+  if (process.platform === "win32") return findWindowsCommand("agy", env, process.cwd()) !== null ? "agy" : "gemini";
   return (env.PATH || "").split(delimiter).some((dir) => {
     try { accessSync(join(dir, "agy"), constants.X_OK); return true; } catch { return false; }
   }) ? "agy" : "gemini";

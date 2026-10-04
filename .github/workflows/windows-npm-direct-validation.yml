@@ -1,0 +1,186 @@
+# Task 1167 — DISPOSABLE Windows validation of the npm-shim direct-launch candidate (candidate-r1).
+# Destination in the isolated validation branch: .github/workflows/windows-npm-direct-validation.yml
+# Manual dispatch, or push to exactly test/1167-npm-direct-20261004 touching the pinned paths. Fake CLI only: no secrets, credentials, real CLIs, sessions, process scans or tree kills.
+# Two isolated jobs: role=candidate (validation branch checkout) and role=baseline (exact ebfc459 checkout +
+# the same test/probe files as a NEGATIVE CONTROL). Exits are real; no continue-on-error anywhere.
+# A green candidate job is NOT product acceptance (receipts keep productAcceptance:false).
+name: Windows npm direct-launch validation (1167, disposable)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ test/1167-npm-direct-20261004 ]
+    paths:
+      - .github/workflows/windows-npm-direct-validation.yml
+      - src/session/boot-adapter/win-launch.ts
+      - src/session/boot-adapter/spawner.ts
+      - src/session/boot-adapter/gemini.ts
+      - src/session/boot-adapter/types.ts
+      - tests/session/boot-adapter/win-launch.test.ts
+      - tests/session/boot-adapter/_win-launch-fixture.ts
+      - tests/dispatch/windows-npm-direct-probe.mjs
+      - tests/dispatch/win-launch-tap-check.mjs
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-npm-direct-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NODE_PIN: 'v20.20.2'
+  NPM_PIN: '10.8.2'
+  BASELINE_SHA: 'ebfc459f5e1478d401390e8f368add6889254eb2'
+  MSYS_NO_PATHCONV: '1'
+
+jobs:
+  validate:
+    name: ${{ matrix.role }}
+    runs-on: windows-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: candidate
+            expect: candidate-r1
+          - role: baseline
+            expect: baseline-ebfc459
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Disable CRLF conversion BEFORE any checkout (raw sha256 pins)
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+          echo "core.autocrlf=$(git config --global --get core.autocrlf) core.eol=$(git config --global --get core.eol)"
+
+      - name: Checkout validation branch (harness; candidate tree for role=candidate)
+        uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+
+      - name: Checkout exact baseline ebfc459 (negative control only)
+        if: matrix.role == 'baseline'
+        uses: actions/checkout@v4
+        with:
+          ref: ebfc459f5e1478d401390e8f368add6889254eb2
+          path: baseline
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Select tree under test; overlay the SAME tests onto the baseline
+        id: tree
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/wl-out" "$RUNNER_TEMP/wl-tmp" "$RUNNER_TEMP/wl-probe"
+          if [ "${{ matrix.role }}" = baseline ]; then
+            test "$(git -C baseline rev-parse HEAD)" = "$BASELINE_SHA"
+            for f in win-launch.test.ts _win-launch-fixture.ts; do
+              test ! -e "baseline/tests/session/boot-adapter/$f"   # must not pre-exist at ebfc459
+              cp "harness/tests/session/boot-adapter/$f" "baseline/tests/session/boot-adapter/$f"
+            done
+            echo "dir=baseline" >> "$GITHUB_OUTPUT"
+            echo "sha=$BASELINE_SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "dir=harness" >> "$GITHUB_OUTPUT"
+            echo "sha=$(git -C harness rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.2'
+
+      - name: Identity — node/npm pins (no update) and exact source + harness sha256 (fail closed)
+        id: identity
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "$NODE_PIN"
+          test "$(npm --version)" = "$NPM_PIN"
+          check() { got=$(sha256sum "$1" | cut -d' ' -f1); echo "$got  $1"; [ "$got" = "$2" ] || { echo "PIN MISMATCH $1 want $2"; exit 1; }; }
+          T="${{ steps.tree.outputs.dir }}/src/session/boot-adapter"
+          if [ "${{ matrix.role }}" = candidate ]; then
+            check "$T/win-launch.ts" 782fcd5442345db6c87936bbabfdea376a9830a683c6c427e40a575970f0b3cb
+            check "$T/spawner.ts"    56d6dbb811a2ad8a265bb79a144ff01900c00cbe351d20185392cfbd16660431
+            check "$T/gemini.ts"     0baa25bf1f9bffff993c071e29a75c0ee6101b3e8b5d4719a2daa7748e12f099
+            check "$T/types.ts"      940990d4a298ac400170a950824f4802d00157bf0cbe1d7fcc15328e7c5b865a
+          else
+            test ! -e "$T/win-launch.ts"
+            check "$T/spawner.ts" 1f1634043cdee74b3f8d791274893755dad0b70d4e5656055834112989204bc9
+            check "$T/gemini.ts"  a8b12f699531021d5c6e441b64d31c45b5d9e0dec1f187d844b071465539f6a4
+            check "$T/types.ts"   984ce32596d76e20bbdf63a513dfddb11c80a4689af31d2169eb05e3ae955cea
+          fi
+          check harness/tests/session/boot-adapter/win-launch.test.ts      c859cb044e4ddb6e53395d184b2751749507d8600c07df6f3d67c14b7afcc4f5
+          check harness/tests/session/boot-adapter/_win-launch-fixture.ts  5f4df850f509961adfb410542b75a48789347ceb2d1739119ab5ece7d9f8d449
+          check harness/tests/dispatch/windows-npm-direct-probe.mjs       b49a833e15862e8dadfda0383301527c419a2ad58fc5c3a3916740f58593b6e5
+          check harness/tests/dispatch/win-launch-tap-check.mjs           876a469ccaf1755cabaf2cb77e0eef5334fa0f26b7aedb02b4e6ad3731b60c00
+          git -C "${{ steps.tree.outputs.dir }}" ls-files --eol src/session/boot-adapter | tee "$RUNNER_TEMP/wl-out/eol.txt"
+          sha256sum "${{ steps.tree.outputs.dir }}"/src/session/boot-adapter/*.ts "${{ steps.tree.outputs.dir }}/package-lock.json" | tee "$RUNNER_TEMP/wl-out/sources.sha256"
+
+      - name: Install (npm ci --force --ignore-scripts) and compile
+        id: build
+        timeout-minutes: 15
+        working-directory: ${{ steps.tree.outputs.dir }}
+        run: |
+          set -euo pipefail
+          npm ci --force --ignore-scripts --no-audit --no-fund
+          node node_modules/typescript/bin/tsc --version | tee "$RUNNER_TEMP/wl-out/tsc-version.txt"
+          npm run build
+          sha256sum dist/src/session/boot-adapter/*.js | tee "$RUNNER_TEMP/wl-out/dist.sha256"
+
+      - name: Native win-launch.test.js (real exit; TAP verdict per role)
+        id: tests
+        timeout-minutes: 10
+        working-directory: ${{ steps.tree.outputs.dir }}
+        run: |
+          set -uo pipefail
+          OUT="$RUNNER_TEMP/wl-out"
+          TEMP="$RUNNER_TEMP\\wl-tmp" TMP="$RUNNER_TEMP\\wl-tmp" \
+            node --test --test-reporter=tap dist/tests/session/boot-adapter/win-launch.test.js > "$OUT/win-launch.tap" 2>&1
+          raw=$?
+          cat "$OUT/win-launch.tap"
+          echo "raw node --test exit: $raw"
+          node "$GITHUB_WORKSPACE/harness/tests/dispatch/win-launch-tap-check.mjs" "${{ matrix.role }}" "$OUT/win-launch.tap" "$raw" "$OUT/win-launch.verdict.json"
+          exit $?
+
+      - name: Diagnostic probe (same probe, role via PROBE_EXPECT; real exit)
+        id: probe
+        if: ${{ !cancelled() && steps.identity.outcome == 'success' && steps.build.outcome == 'success' }}
+        timeout-minutes: 8
+        run: |
+          set -uo pipefail
+          OUT="$RUNNER_TEMP/wl-out"
+          PROBE_CANDIDATE_DIST="$GITHUB_WORKSPACE/${{ steps.tree.outputs.dir }}" \
+          PROBE_EXPECT="${{ matrix.expect }}" \
+          PROBE_COMMIT="${{ steps.tree.outputs.sha }}" \
+          PROBE_RUNNER_TEMP="$RUNNER_TEMP/wl-probe" \
+          PROBE_RECEIPT="$OUT/npm-direct-receipt.json" \
+            node harness/tests/dispatch/windows-npm-direct-probe.mjs > "$OUT/probe.log" 2>&1
+          raw=$?
+          cat "$OUT/probe.log"
+          echo "raw probe exit: $raw"
+          exit $raw
+
+      - name: Preserve missing observation explicitly
+        if: always()
+        run: |
+          R="$RUNNER_TEMP/wl-out/npm-direct-receipt.json"
+          mkdir -p "$RUNNER_TEMP/wl-out"
+          [ -f "$R" ] || echo '{"schema":1,"operation":"p1167-npm-direct-v1","status":"diagnostic_incomplete","reason":"observation_not_started","productAcceptance":false}' > "$R"
+          cat > "$RUNNER_TEMP/wl-out/run-identity.json" <<EOF
+          {"role":"${{ matrix.role }}","expect":"${{ matrix.expect }}","treeSha":"${{ steps.tree.outputs.sha }}","workflowSha":"${{ github.sha }}",
+           "runId":"${{ github.run_id }}","attempt":"${{ github.run_attempt }}",
+           "outcomes":{"identity":"${{ steps.identity.outcome }}","build":"${{ steps.build.outcome }}","tests":"${{ steps.tests.outcome }}","probe":"${{ steps.probe.outcome }}"}}
+          EOF
+
+      - name: Upload receipts and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-npm-direct-${{ matrix.role }}
+          path: ${{ runner.temp }}/wl-out/
+          if-no-files-found: error
+          retention-days: 7

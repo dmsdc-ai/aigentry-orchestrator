@@ -47,7 +47,8 @@ export type BootErrorCode =
   | "CLI_VERSION_DRIFT"
   | "CLI_NOT_FOUND"
   | "UNSUPPORTED_CLI"
-  | "ERR_BOOT_ADAPTER_UNSUPPORTED";
+  | "ERR_BOOT_ADAPTER_UNSUPPORTED"
+  | "CLI_LAUNCH_UNSUPPORTED";
 
 export interface BootError { code: BootErrorCode; detail: string }
 
