@@ -4,7 +4,7 @@
 // The addon is loaded only through the product loader/harness (OSLOCK_NODE, OSLOCK_SHA256,
 // OSLOCK_LOADER, OSLOCK_HARNESS absolute paths supplied by the test).
 import { spawn } from "node:child_process";
-import { closeSync, openSync, readFileSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { appendFileSync, closeSync, openSync, readFileSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const [role, rawArgs] = process.argv.slice(2);
@@ -111,13 +111,18 @@ const roles = {
     process.exit(0);
   },
 
-  // P6: lock, spawn a tracked grandchild that inherits our stdio, then close (or not) and exit.
+  // P6: lock, spawn a tracked grandchild that inherits our stdio (original spawn context), then
+  // close (or not) and exit. The grandchild reports only through its nonce-bound channel file
+  // (args.channel), never through stdio, so the test does not depend on our pipes outliving
+  // this process on any platform.
   async "hold-spawn"() {
     const addon = await loadAddon();
     const h = lockNow(addon, args.carrier, 5000);
     const g = spawn(
       process.execPath,
-      [fileURLToPath(import.meta.url), "grandchild", JSON.stringify({ nonce: args.nonce, selfLimitMs: args.grandLimitMs })],
+      [fileURLToPath(import.meta.url), "grandchild", JSON.stringify({
+        nonce: args.nonce, channel: args.channel, carrier: args.carrier, control: args.control, selfLimitMs: args.grandLimitMs,
+      })],
       { stdio: "inherit" },
     );
     await new Promise((resolve, reject) => {
@@ -126,14 +131,57 @@ const roles = {
     });
     emit({ type: "spawned", gpid: g.pid, nonce: args.nonce });
     if (args.closeFirst) addon.close(h);
-    // The grandchild keeps running; the test tracks it through the inherited pipes.
+    // The grandchild keeps running; the test tracks it through its channel file.
     process.exit(0);
   },
 
+  // P6 grandchild: appends nonce-bound JSON lines to args.channel: "ready", then "beat" with an
+  // increasing seq every 50ms while alive, and "exit" once the stop file (channel + ".stop",
+  // holding the nonce) appears. A separate teardown file (channel + ".teardown") is honoured in
+  // every mode and answered with "teardown-exit"; it is cleanup only, never a normal stop.
+  // args.control selects a negative control: "no-ready" never reports ready, "ignore-stop"
+  // never honours stop, "lock" locks the carrier itself first.
   async grandchild() {
-    emit({ type: "grandchild-ready", nonce: args.nonce });
-    await waitStdinEnd();
-    emit({ type: "grandchild-exit", nonce: args.nonce });
+    const note = (obj) => appendFileSync(args.channel, `${JSON.stringify({ ...obj, nonce: args.nonce, pid: process.pid })}\n`);
+    let addon;
+    let h;
+    try {
+      if (args.control === "lock") {
+        addon = await loadAddon();
+        h = lockNow(addon, args.carrier, 5000);
+        note({ type: "locked" });
+      }
+      if (args.control !== "no-ready") note({ type: "ready" });
+      let seq = 0;
+      const how = await new Promise((resolve) => {
+        const requested = (suffix) => {
+          try {
+            return readFileSync(`${args.channel}${suffix}`, "utf8") === args.nonce;
+          } catch {
+            return false; // not requested yet
+          }
+        };
+        const beat = setInterval(() => {
+          try {
+            note({ type: "beat", seq: ++seq });
+          } catch {
+            /* a missed beat only delays the test; it never counts as liveness */
+          }
+          if (requested(".stop") && args.control !== "ignore-stop") {
+            clearInterval(beat);
+            resolve("exit");
+          } else if (requested(".teardown")) {
+            clearInterval(beat);
+            resolve("teardown-exit");
+          }
+        }, 50);
+      });
+      if (h) addon.close(h);
+      note({ type: how, seq });
+    } catch (err) {
+      note({ type: "error", ...errInfo(err) });
+      throw err;
+    }
   },
 
   // FIFO no-hang: open must reject promptly, never block.

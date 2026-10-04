@@ -211,7 +211,7 @@ function acquireDelay(carrier, boundMs) {
 
 // ---- owned child processes: tracked, watchdogged, always reaped ----
 const ownedChildren = new Set();
-const ownedGrandchildren = []; // { pid, nonce, done }
+const ownedGrandchildren = []; // { pid, nonce, channel, done, cleanup }
 
 function spawnChild(role, args, { limitMs = 20_000, env } = {}) {
   const child = spawn(process.execPath, [CHILD, role, JSON.stringify({ ...args, selfLimitMs: limitMs })], {
@@ -300,6 +300,91 @@ async function reapAllChildren() {
     }
   }
   await Promise.all(pending);
+}
+
+// ---- owned P6 grandchildren: nonce-bound channel file, no stdio pipes involved ----
+// Only complete lines carrying our nonce and the spawned pid count as evidence.
+function channelLines(g) {
+  let text;
+  try {
+    text = readFileSync(g.channel, "utf8");
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const line of text.split("\n").slice(0, -1)) {
+    try {
+      const m = JSON.parse(line);
+      if (m.nonce === g.nonce && m.pid === g.pid) out.push(m);
+    } catch {
+      /* not ours */
+    }
+  }
+  return out;
+}
+
+function maxBeat(g) {
+  return channelLines(g).reduce((s, m) => (m.type === "beat" && m.seq > s ? m.seq : s), 0);
+}
+
+async function waitChannel(g, pred, ms, what) {
+  const until = performance.now() + ms;
+  for (;;) {
+    const m = channelLines(g).find(pred);
+    if (m) return m;
+    if (performance.now() > until) throw new Error(`grandchild ${g.pid}: no ${what} within ${ms}ms`);
+    await sleep(20);
+  }
+}
+
+// A beat newer than every beat seen at call time: the grandchild was alive after the call.
+function beatAfter(g, ms = 2000) {
+  const s = maxBeat(g);
+  return waitChannel(g, (m) => m.type === "beat" && m.seq > s, ms, `beat after seq ${s}`);
+}
+
+// Bounded cooperative cleanup, never throws, never signals a pid: stop file holding the nonce,
+// then its "exit" line (the normal stop contract). Only if that is missing, a separate teardown
+// request, answered by "teardown-exit" (recorded apart, never counted as a normal stop). Past
+// that, the fixture 15s self-limit is the bound and the outcome stays unconfirmed.
+// Gone = the pid no longer exists: an observation only, never used to act on a pid.
+async function stopGrandchild(g) {
+  if (g.cleanup) return g.cleanup;
+  const out = { exitLine: false, teardownExit: false, gone: false };
+  g.cleanup = out;
+  try {
+    writeFileSync(`${g.channel}.stop`, g.nonce);
+    out.exitLine = await waitChannel(g, (m) => m.type === "exit", 5000, "exit").then(() => true, () => false);
+    if (!out.exitLine) {
+      writeFileSync(`${g.channel}.teardown`, g.nonce);
+      out.teardownExit = await waitChannel(g, (m) => m.type === "teardown-exit", 5000, "teardown-exit").then(() => true, () => false);
+    }
+    const until = performance.now() + 3000;
+    while (!out.gone && !out.probeError && performance.now() < until) {
+      try {
+        process.kill(g.pid, 0);
+        await sleep(20);
+      } catch (err) {
+        if (err.code === "ESRCH") out.gone = true;
+        else out.probeError = err.code;
+      }
+    }
+  } catch (err) {
+    out.error = String(err?.message ?? err);
+  }
+  g.done = out.gone && (out.exitLine || out.teardownExit);
+  return out;
+}
+
+// P6 parent: locks the carrier, spawns the grandchild (with args.control, if any), exits.
+async function spawnHoldSpawn(c, closeFirst, control) {
+  const nonce = randomUUID();
+  const channel = join(dirname(c), `g-${nonce}.jsonl`);
+  const a = spawnChild("hold-spawn", { carrier: c, nonce, channel, closeFirst, control, grandLimitMs: 15_000 }, { limitMs: 10_000 });
+  const spawned = await a.waitFor((m) => m.type === "spawned" && m.nonce === nonce);
+  const g = { pid: spawned.gpid, nonce, channel, done: false };
+  ownedGrandchildren.push(g);
+  return { a, g };
 }
 
 // ---- owned workers ----
@@ -417,6 +502,7 @@ after(async () => {
   for (const w of ownedWorkers) await w.terminate();
   await reapAllChildren();
   for (const g of ownedGrandchildren) {
+    await stopGrandchild(g);
     if (!g.done) record("cleanup", { grandchildUnconfirmed: g });
   }
   rmSync(FAKE_BASE, { recursive: true, force: true });
@@ -1111,48 +1197,95 @@ if (FOCUSED) {
     for (const closeFirst of [true, false]) {
       test(`P6 no inheritance: grandchild spawned during hold, parent ${closeFirst ? "closes and" : "exits without close and"} exits`, { timeout: 30_000 }, async () => {
         const c = join(fakeRoot(), "carrier");
-        const nonce = randomUUID();
-        const a = spawnChild("hold-spawn", { carrier: c, nonce, closeFirst, grandLimitMs: 15_000 }, { limitMs: 10_000 });
-        const spawned = await a.waitFor((m) => m.type === "spawned");
-        const g = { pid: spawned.gpid, nonce, done: false };
-        ownedGrandchildren.push(g);
-        await a.waitFor((m) => m.type === "grandchild-ready" && m.nonce === nonce && m.pid === g.pid);
-        const ex = await a.exited;
-        assert.equal(ex.code, 0);
-        // The grandchild must still be running: no exit line, and our exact pid answers signal 0.
-        assert.equal(a.lines.some((m) => m.type === "grandchild-exit"), false);
-        let alive = true;
+        const { a, g } = await spawnHoldSpawn(c, closeFirst);
+        let acquiredMs;
+        let renameWhileAlive;
+        let exitBeforeChecks;
         try {
-          process.kill(g.pid, 0);
-        } catch {
-          alive = false;
+          await waitChannel(g, (m) => m.type === "ready", 10_000, "ready");
+          const ex = await a.exited;
+          assert.equal(ex.code, 0);
+          // The exact nonce-bound grandchild is alive after the parent was reaped...
+          await beatAfter(g);
+          acquiredMs = acquireDelay(c, 1000);
+          // Windows: an inherited handle (no FILE_SHARE_DELETE) would deny this rename while the
+          // grandchild runs, so this is the discriminating check there. POSIX: always "ok".
+          renameWhileAlive = renameProbe(c);
+          // ...and still alive after both checks.
+          await beatAfter(g);
+          exitBeforeChecks = channelLines(g).some((m) => m.type === "exit");
+        } finally {
+          // Cleanup first (also on failure), then assert.
+          await stopGrandchild(g);
+          record(`P6-${closeFirst ? "close" : "noclose"}`, { acquiredMs, renameWhileAlive, grandchildPid: g.pid, cleanup: g.cleanup });
         }
-        assert.equal(alive, true, "grandchild still running");
-        const acquiredMs = acquireDelay(c, 1000);
-        // Windows: an inherited handle (no FILE_SHARE_DELETE) would deny this rename while the
-        // grandchild runs, so this is the discriminating check there. POSIX: always "ok".
-        const renameWhileAlive = renameProbe(c);
-        // Cleanup first, then assert.
-        a.child.stdin.end();
-        let exitSeen = false;
-        try {
-          await a.waitFor((m) => m.type === "grandchild-exit" && m.nonce === nonce, 5000);
-          exitSeen = true;
-        } catch {
-          try {
-            process.kill(g.pid, "SIGKILL");
-          } catch {
-            /* already gone */
-          }
-        }
-        await new Promise((res) => (a.child.stdout.readableEnded ? res() : a.child.stdout.once("close", res)));
-        g.done = exitSeen;
-        record(`P6-${closeFirst ? "close" : "noclose"}`, { acquiredMs, renameWhileAlive, grandchildPid: g.pid, grandchildCleanExit: exitSeen });
+        assert.equal(exitBeforeChecks, false, "grandchild still running");
         assert.notEqual(acquiredMs, null, "another process acquired while the grandchild still ran");
         assert.equal(renameWhileAlive, "ok", "no handle inherited by the grandchild");
-        assert.equal(exitSeen, true, "grandchild exited on stdin end");
+        assert.equal(g.cleanup.exitLine, true, "grandchild exited on stop");
+        assert.equal(g.cleanup.gone, true, "grandchild pid gone after stop");
       });
     }
+
+    test("P6 negative controls: missing readiness, ignored stop and a grandchild-held lock are each detected", { timeout: 60_000 }, async () => {
+      const out = {};
+      {
+        // Alive but never ready: the readiness wait must fail, not a dead fixture.
+        const { a, g } = await spawnHoldSpawn(join(fakeRoot(), "carrier"), true, "no-ready");
+        let readyErr;
+        try {
+          readyErr = await waitChannel(g, (m) => m.type === "ready", 1000, "ready").then(() => null, (e) => e);
+          await a.exited;
+          await beatAfter(g, 5000);
+        } finally {
+          await stopGrandchild(g);
+        }
+        assert.match(String(readyErr?.message), /no ready within 1000ms/, "missing readiness detected");
+        assert.equal(g.cleanup.exitLine, true);
+        assert.equal(g.cleanup.gone, true);
+        out.noReady = { readyErr: readyErr.message, cleanup: g.cleanup };
+      }
+      {
+        // Stop ignored: no exit line is detected; cleanup only via the separate teardown request.
+        const { a, g } = await spawnHoldSpawn(join(fakeRoot(), "carrier"), true, "ignore-stop");
+        try {
+          await waitChannel(g, (m) => m.type === "ready", 10_000, "ready");
+          await a.exited;
+        } finally {
+          await stopGrandchild(g);
+        }
+        assert.equal(g.cleanup.exitLine, false, "ignored stop detected");
+        assert.equal(g.cleanup.teardownExit, true, "cooperative teardown (cleanup only) confirmed");
+        assert.equal(g.cleanup.gone, true);
+        assert.equal(g.done, true);
+        out.ignoreStop = { cleanup: g.cleanup };
+      }
+      {
+        // Grandchild holds its own lock on the carrier: both post-exit checks must see it.
+        const c = join(fakeRoot(), "carrier");
+        const { a, g } = await spawnHoldSpawn(c, true, "lock");
+        let acquiredMs;
+        let renameWhileAlive;
+        try {
+          await waitChannel(g, (m) => m.type === "ready", 10_000, "ready");
+          await a.exited;
+          await beatAfter(g);
+          acquiredMs = acquireDelay(c, 1000);
+          renameWhileAlive = renameProbe(c);
+          await beatAfter(g);
+        } finally {
+          await stopGrandchild(g);
+        }
+        assert.equal(acquiredMs, null, "grandchild-held lock detected");
+        if (WIN) assert.ok(WIN_SHARE_DENIAL.includes(renameWhileAlive), `grandchild-held handle denies rename: ${renameWhileAlive}`);
+        else assert.equal(renameWhileAlive, "ok"); // POSIX rename is not a handle detector
+        assert.equal(g.cleanup.exitLine, true);
+        assert.equal(g.cleanup.gone, true);
+        assert.equal(acquireDelay(c, 1000) !== null, true, "released after the grandchild closed");
+        out.lock = { acquiredMs, renameWhileAlive, cleanup: g.cleanup };
+      }
+      record("P6-controls", out);
+    });
 
     test("P8 handle dropped while LOCKED + global.gc: lock released by finalizer", { timeout: 20_000 }, async () => {
       const c = join(fakeRoot(), "carrier");
