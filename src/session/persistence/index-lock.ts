@@ -103,6 +103,12 @@ async function acquire(lockPath: string, timeoutMs: number): Promise<void> {
     await fh.close();
   }
   try {
+    // #1166: every repeat of the loop below — held, dead or vanished — is bounded by the
+    // deadline and backs off. Only real progress (the lock vanished, or our sweep removed
+    // it) earns one immediate retry, and never two in a row; a sweep that keeps failing
+    // (e.g. persistent EACCES on unlink) used to `continue` past the deadline check with
+    // no sleep and busy-spin until killed.
+    let retriedImmediately = false;
     while (true) {
       try {
         // EEXIST is not in the transient set, so "the lock is held" still comes straight
@@ -130,15 +136,21 @@ async function acquire(lockPath: string, timeoutMs: number): Promise<void> {
         // section and collided on the shared index tmp
         // (`index.json.tmp.__index__.<pid>` → rename ENOENT), i.e. the very #561
         // symptom the empty-lock-window fix above was meant to have closed.
-        if (verdict === "vanished") continue;
+        let progressed = verdict === "vanished";
         if (verdict === "dead") {
           try {
             await fs.unlink(lockPath);
-          } catch {
-            /* another waiter may have swept it — retry */
+            progressed = true;
+          } catch (unlinkErr) {
+            // ENOENT: another waiter swept it — retry. Anything else: back off below.
+            progressed = (unlinkErr as NodeJS.ErrnoException).code === "ENOENT";
           }
+        }
+        if (progressed && !retriedImmediately) {
+          retriedImmediately = true;
           continue;
         }
+        retriedImmediately = false;
         if (Date.now() >= deadline) {
           throw new Error(
             `index-lock: timeout (${timeoutMs}ms) acquiring ${lockPath}`,

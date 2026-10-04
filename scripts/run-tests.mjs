@@ -42,6 +42,12 @@ sourceTestFiles.push('tests/control/core.test.mjs');
 // #1167 — fake-cmux win32 helper inert regression: transpiles the helper source into a vm with fully faked
 // fs/os/child_process/process (no compiler, native or real file IO), so it runs on every OS, win32 included.
 sourceTestFiles.push('tests/dispatch/fake-cmux-win32.inert.test.mjs');
+// #1166 — index-lock bounded-wait regressions fork owned children against the real tsc output
+// dist/src/session/persistence/index-lock.js (no fixture fallback); run on every OS, win32 included.
+sourceTestFiles.push(
+  'tests/session/persistence/index-lock-bounded-wait.test.mjs',
+  'tests/session/persistence/index-lock-progress.test.mjs',
+);
 // Native capture fixtures require POSIX ownership/modes and the boot wizard suite drives an
 // owned POSIX PTY; Windows support is still absent for both.
 if (process.platform === 'darwin' || process.platform === 'linux') {
