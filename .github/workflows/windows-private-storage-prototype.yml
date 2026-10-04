@@ -276,6 +276,20 @@ jobs:
           [ -n "${EXPECTED}" ] && [ "${ACTUAL}" = "${EXPECTED}" ] || { echo "::error::helper ${ACTUAL} != compile output ${EXPECTED}"; exit 1; }
           echo "helper ok ${ACTUAL}"
 
+      # Tester-owned self-test of the exact trust-root predicate in the cleanup/export steps below: in-memory .NET
+      # descriptors and a stubbed Get-Acl only (no host ACL/account/VHD state). Runs before any fake account exists;
+      # a pin mismatch, source drift or any failed positive/negative case fails the job.
+      - name: Trust-root predicate self-test (in-memory descriptors only)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PSModulePath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
+          $f = Join-Path $env:GITHUB_WORKSPACE 'prototypes\windows-private-storage\tests\bootstrap-trust.test.ps1'
+          $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLowerInvariant()
+          if ($h -cne '4c36b1651290ff329868124d3baac60588b56489b6dfc82fd89db29f168f5b4c') { Write-Output "::error::bootstrap-trust.test.ps1 sha256 $h does not match pin"; exit 1 }
+          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $f -WorkflowPath (Join-Path $env:GITHUB_WORKSPACE '.github\workflows\windows-private-storage-prototype.yml')
+          exit $LASTEXITCODE
+
       # Elevated orchestrator; the helper itself runs only as fake standard user A. Exit is unmasked.
       - name: Validation (fake users, fixtures, oracle, verdict, cleanup)
         shell: powershell
@@ -304,8 +318,26 @@ jobs:
           $p = Join-Path $env:RUNNER_TEMP $env:PSP_TRUST_LEAF
           if (-not (Test-Path -LiteralPath $p)) { Write-Output 'cleanup: bound trust root absent; nothing was created'; exit 0 }
           $t = @(Get-Item -LiteralPath $p -Force)
-          $sd = (Get-Acl -LiteralPath $t[0].FullName).Sddl
-          if ((($t[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or ($sd -cnotmatch '^O:BA(G:[^:()]+)?D:PAI?\(A;OICI;FA;;;(SY|BA)\)\(A;OICI;FA;;;(SY|BA)\)$')) { Write-Output "cleanup: refusing unverified trust root $($t[0].FullName) $sd"; exit 1 }
+          # Trust-root predicate (identical in cleanup and export), read via the structured .NET descriptor, not SDDL text:
+          # exact bound leaf, one plain directory (no reparse point), owner Administrators, protected DACL (AI optional,
+          # nothing else) holding exactly one SYSTEM and one Administrators FullControl OI+CI explicit allow ACE. The
+          # primary group is ignored (no write authority); anything unreadable or unexpected refuses.
+          $sd = $null; $ok = $false
+          try {
+            $a = Get-Acl -LiteralPath $t[0].FullName; $sd = $a.Sddl
+            $r = [System.Security.AccessControl.RawSecurityDescriptor]::new($a.GetSecurityDescriptorBinaryForm(), 0)
+            $cf = [System.Security.AccessControl.ControlFlags]; $af = [System.Security.AccessControl.AceFlags]
+            $need = [int]($cf::DiscretionaryAclPresent -bor $cf::DiscretionaryAclProtected)
+            $allowed = $need -bor [int]($cf::SelfRelative -bor $cf::DiscretionaryAclAutoInherited)
+            $aces = @(if ($null -ne $r.DiscretionaryAcl) { foreach ($e in $r.DiscretionaryAcl) { $e } })
+            $ok = ($t.Count -eq 1) -and $t[0].PSIsContainer -and ($t[0].Name -ceq $env:PSP_TRUST_LEAF) -and
+              (($t[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -and ($null -ne $r.Owner) -and ($r.Owner.Value -ceq 'S-1-5-32-544') -and
+              ($null -ne $r.DiscretionaryAcl) -and (([int]$r.ControlFlags -band $need) -eq $need) -and (([int]$r.ControlFlags -band -bnot $allowed) -eq 0) -and
+              ($aces.Count -eq 2) -and (@($aces | Where-Object { -not (($_ -is [System.Security.AccessControl.CommonAce]) -and ($_.AceType -eq [System.Security.AccessControl.AceType]::AccessAllowed) -and
+                (-not $_.IsCallback) -and ([int]$_.AceFlags -eq [int]($af::ObjectInherit -bor $af::ContainerInherit)) -and ($_.AccessMask -eq 0x1F01FF)) }).Count -eq 0) -and
+              ((@($aces | ForEach-Object { $_.SecurityIdentifier.Value } | Sort-Object) -join ',') -ceq 'S-1-5-18,S-1-5-32-544')
+          } catch { $ok = $false }
+          if (-not $ok) { Write-Output "cleanup: refusing unverified trust root $($t[0].FullName) $sd"; exit 1 }
           & (Join-Path $t[0].FullName 'src\run-validation.ps1') -CleanupOnly -TrustRoot $t[0].FullName
           exit $LASTEXITCODE
 
@@ -324,8 +356,26 @@ jobs:
           $p = Join-Path $env:RUNNER_TEMP $env:PSP_TRUST_LEAF
           if (-not (Test-Path -LiteralPath $p)) { Write-Output 'export: bound trust root absent; no evidence to upload'; exit 1 }
           $t = @(Get-Item -LiteralPath $p -Force)
-          $sd = (Get-Acl -LiteralPath $t[0].FullName).Sddl
-          if ((($t[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or ($sd -cnotmatch '^O:BA(G:[^:()]+)?D:PAI?\(A;OICI;FA;;;(SY|BA)\)\(A;OICI;FA;;;(SY|BA)\)$')) { Write-Output "export: refusing unverified trust root $($t[0].FullName) $sd"; exit 1 }
+          # Trust-root predicate (identical in cleanup and export), read via the structured .NET descriptor, not SDDL text:
+          # exact bound leaf, one plain directory (no reparse point), owner Administrators, protected DACL (AI optional,
+          # nothing else) holding exactly one SYSTEM and one Administrators FullControl OI+CI explicit allow ACE. The
+          # primary group is ignored (no write authority); anything unreadable or unexpected refuses.
+          $sd = $null; $ok = $false
+          try {
+            $a = Get-Acl -LiteralPath $t[0].FullName; $sd = $a.Sddl
+            $r = [System.Security.AccessControl.RawSecurityDescriptor]::new($a.GetSecurityDescriptorBinaryForm(), 0)
+            $cf = [System.Security.AccessControl.ControlFlags]; $af = [System.Security.AccessControl.AceFlags]
+            $need = [int]($cf::DiscretionaryAclPresent -bor $cf::DiscretionaryAclProtected)
+            $allowed = $need -bor [int]($cf::SelfRelative -bor $cf::DiscretionaryAclAutoInherited)
+            $aces = @(if ($null -ne $r.DiscretionaryAcl) { foreach ($e in $r.DiscretionaryAcl) { $e } })
+            $ok = ($t.Count -eq 1) -and $t[0].PSIsContainer -and ($t[0].Name -ceq $env:PSP_TRUST_LEAF) -and
+              (($t[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -and ($null -ne $r.Owner) -and ($r.Owner.Value -ceq 'S-1-5-32-544') -and
+              ($null -ne $r.DiscretionaryAcl) -and (([int]$r.ControlFlags -band $need) -eq $need) -and (([int]$r.ControlFlags -band -bnot $allowed) -eq 0) -and
+              ($aces.Count -eq 2) -and (@($aces | Where-Object { -not (($_ -is [System.Security.AccessControl.CommonAce]) -and ($_.AceType -eq [System.Security.AccessControl.AceType]::AccessAllowed) -and
+                (-not $_.IsCallback) -and ([int]$_.AceFlags -eq [int]($af::ObjectInherit -bor $af::ContainerInherit)) -and ($_.AccessMask -eq 0x1F01FF)) }).Count -eq 0) -and
+              ((@($aces | ForEach-Object { $_.SecurityIdentifier.Value } | Sort-Object) -join ',') -ceq 'S-1-5-18,S-1-5-32-544')
+          } catch { $ok = $false }
+          if (-not $ok) { Write-Output "export: refusing unverified trust root $($t[0].FullName) $sd"; exit 1 }
           & (Join-Path $t[0].FullName 'src\run-validation.ps1') -ExportOnly -TrustRoot $t[0].FullName
           exit $LASTEXITCODE
 
