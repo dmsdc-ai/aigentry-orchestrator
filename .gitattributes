@@ -1,0 +1,2 @@
+# #1191: preservation-directories pins the raw LF bytes of this one file; keep its checkout LF everywhere.
+/bin/init/preservation.mjs text eol=lf

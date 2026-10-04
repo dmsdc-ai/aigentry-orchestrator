@@ -1,7 +1,7 @@
 // Local gate-control acceptance only. Runner copies execute test-owned sentinels;
 // application Node/npm entrypoints are never executed.
-// Node 20; Ruby/Psych, Bash and cat/grep/tail/awk on PATH. No configuration required.
-// Optional absolute overrides: WINDOWS_GATE_RUBY, WINDOWS_GATE_BASH,
+// Node 20; Ruby/Psych, Bash, Git and cat/grep/tail/awk on PATH. No configuration required.
+// Optional absolute overrides: WINDOWS_GATE_RUBY, WINDOWS_GATE_BASH, WINDOWS_GATE_GIT,
 // WINDOWS_GATE_UTILS (cat/grep/tail/awk directory), WINDOWS_GATE_EVIDENCE.
 // See fixtures/windows-gates/README.md for prerequisites, evidence and provenance.
 import assert from 'node:assert/strict';
@@ -2072,6 +2072,95 @@ for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #119
   assert.equal(spawned.indexOf('tests/packaging/preservation-directories.test.mjs'), spawned.indexOf('tests/packaging/preservation.test.mjs') + 1);
   if (platform === 'win32') assert.equal(spawned.indexOf('tests/packaging/preservation-directories.test.mjs'), spawned.length - 1);
   else assert.equal(spawned.indexOf('tests/packaging/native-capture.test.mjs'), spawned.indexOf('tests/packaging/preservation-directories.test.mjs') + 1);
+});
+// #1191 checkout-EOL policy for the one raw-byte-pinned preservation source. Each case commits LF bytes to a
+// fresh fake repo under the private admin directory and clones it locally (no remote, no network). Git runs
+// from argv arrays with HOME, global/system config and attributes, templates and hooks redirected to empty
+// test-owned paths and a fake identity, so no user Git state is read. A missing Git fails, never skips.
+// This proves Git's checkout policy only, not Windows ACLs or an actual Windows checkout.
+const preservationPin = 'a07066a44fe959660f5e5b7b983028d8ebb300293e5b80cf1b54776d00a5b95b';
+const preservationCrlf = '7d639d53527d346fa4bdbb256efdd6e5e139acb609aebcbb227566ee4a9b4cb5';
+const eolRule = '/bin/init/preservation.mjs text eol=lf';
+const eolPinned = 'bin/init/preservation.mjs';
+const eolNeighbour = 'bin/init/cli.mjs'; // real LF sibling the exact rule must not cover
+const eolLookalikes = [eolNeighbour, 'preservation.mjs', `x/${eolPinned}`, `${eolPinned}.bak`];
+const crlf = bytes => Buffer.from(bytes.toString('latin1').replaceAll('\n', '\r\n'), 'latin1');
+let eolRepos = 0;
+function eolCheckout(label, autocrlf, attributes, pinned = readFileSync(join(root, eolPinned))) {
+  const git = resolveTool('git', 'WINDOWS_GATE_GIT');
+  const base = mkdtempSync(join(admin, `git-eol-${eolRepos++}-`));
+  const [home, hooks, template, src, dst] = ['home', 'hooks', 'template', 'src', 'dst'].map(name => join(base, name));
+  for (const directory of [home, hooks, template, join(src, 'bin/init')])mkdirSync(directory, { recursive: true, mode: 0o700 });
+  writeFileSync(join(home, 'gitconfig'), '');
+  const env = { PATH: dirname(git), HOME: home, XDG_CONFIG_HOME: home, TMPDIR: base, LANG: 'C', GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: join(home, 'gitconfig'), GIT_ATTR_NOSYSTEM: '1', GIT_TEMPLATE_DIR: template, GIT_TERMINAL_PROMPT: '0',
+    GIT_AUTHOR_NAME: 'fake', GIT_AUTHOR_EMAIL: 'fake@invalid', GIT_COMMITTER_NAME: 'fake', GIT_COMMITTER_EMAIL: 'fake@invalid' };
+  const run = (cwd, ...args) => {
+    const argv = ['-c', `core.hooksPath=${hooks}`, '-c', 'init.defaultBranch=fixture', ...args];
+    const result = spawnSync(git, argv, { cwd, env, encoding: 'utf8', timeout });
+    invocations.push({ kind: 'git-eol', label, executable: git, argv, timeout,
+      exit: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr });
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout;
+  };
+  writeFileSync(join(src, eolPinned), pinned);
+  writeFileSync(join(src, eolNeighbour), readFileSync(join(root, eolNeighbour)));
+  if (attributes !== undefined) writeFileSync(join(src, '.gitattributes'), attributes);
+  run(src, 'init', '-q');
+  run(src, '-c', 'core.autocrlf=false', 'add', '-A');
+  run(src, '-c', 'core.autocrlf=false', 'commit', '-q', '-m', 'fixture');
+  run(base, 'clone', '-q', '--no-hardlinks', '--config', `core.autocrlf=${autocrlf}`, src, dst);
+  return { pinned: readFileSync(join(dst, eolPinned)), neighbour: readFileSync(join(dst, eolNeighbour)),
+    attributes: run(dst, 'check-attr', 'text', 'eol', '--', eolPinned, ...eolLookalikes) };
+}
+// The candidate's exact policy: the pin holds, the neighbour still follows core.autocrlf and only the exact
+// path carries eol=lf.
+function assertExactEolPolicy(checkout, autocrlf) {
+  assert.equal(sha(checkout.pinned), preservationPin);
+  const neighbour = readFileSync(join(root, eolNeighbour));
+  assert.deepEqual(checkout.neighbour, autocrlf === 'true' ? crlf(neighbour) : neighbour);
+  assert.equal(checkout.attributes, [`${eolPinned}: text: set\n${eolPinned}: eol: lf\n`,
+    ...eolLookalikes.map(path => `${path}: text: unspecified\n${path}: eol: unspecified\n`)].join(''));
+}
+acceptance('Git EOL: #1191 exact rule and unchanged raw pin are the candidate inputs', 'git-eol', () => {
+  const lines = readFileSync(join(root, '.gitattributes'), 'utf8').split('\n').filter(line => line && !line.startsWith('#'));
+  assert.deepEqual(lines, [eolRule]);
+  assert.equal(sha(readFileSync(join(root, eolPinned))), preservationPin);
+  assert.ok(readFileSync(join(root, 'tests/packaging/preservation-directories.test.mjs'), 'utf8')
+    .includes(`assert.equal(sourceBefore, '${preservationPin}');\n`));
+  for (const path of [eolPinned, eolNeighbour]) {
+    const bytes = readFileSync(join(root, path));
+    assert.ok(bytes.includes(10) && !bytes.includes(13), `${path}: LF-only source`);
+  }
+  assert.equal(sha(crlf(readFileSync(join(root, eolPinned)))), preservationCrlf);
+});
+acceptance('Git EOL: #1191 control without .gitattributes reproduces the actual-Windows CRLF hash (core.autocrlf=true)', 'git-eol', () => {
+  const checkout = eolCheckout('control-true', 'true');
+  assert.equal(sha(checkout.pinned), preservationCrlf);
+  assert.notEqual(sha(checkout.pinned), preservationPin);
+});
+for (const autocrlf of ['false', 'input']) acceptance(`Git EOL: #1191 control without .gitattributes keeps the raw pin (core.autocrlf=${autocrlf})`, 'git-eol', () => {
+  assert.equal(sha(eolCheckout(`control-${autocrlf}`, autocrlf).pinned), preservationPin);
+});
+for (const autocrlf of ['true', 'false', 'input']) acceptance(`Git EOL: #1191 exact rule restores the raw pin on that path only (core.autocrlf=${autocrlf})`, 'git-eol', () => {
+  assertExactEolPolicy(eolCheckout(`fix-${autocrlf}`, autocrlf, readFileSync(join(root, '.gitattributes'))), autocrlf);
+});
+for (const autocrlf of ['true', 'false', 'input']) acceptance(`Git EOL: #1191 one-byte content tamper still fails the raw pin under the exact rule (core.autocrlf=${autocrlf})`, 'git-eol', () => {
+  const tampered = Buffer.from(readFileSync(join(root, eolPinned)));
+  tampered[0] ^= 1;
+  assert.ok(![10, 13].includes(tampered[0]));
+  const checkout = eolCheckout(`tamper-${autocrlf}`, autocrlf, readFileSync(join(root, '.gitattributes')), tampered);
+  assert.deepEqual(checkout.pinned, tampered);
+  assert.notEqual(sha(checkout.pinned), preservationPin);
+});
+for (const [name, rule] of [
+  ['global text rewrite', '* text eol=lf\n'],
+  ['unanchored basename rule', 'preservation.mjs text eol=lf\n'],
+  ['exact path without eol=lf', '/bin/init/preservation.mjs text\n'],
+]) acceptance(`Git EOL: #1191 exact policy rejects ${name} (core.autocrlf=true)`, 'git-eol-mutant', () => {
+  const checkout = eolCheckout(`mutant-${name}`, 'true', rule);
+  assert.throws(() => assertExactEolPolicy(checkout, 'true'), assert.AssertionError);
 });
 // #1181 wrong-platform placement of the POSIX-only wizard entry. Each mutation is applied
 // to the exact runner bytes with unique-needle checks OUTSIDE assert.throws, the mutated
