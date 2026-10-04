@@ -1,0 +1,282 @@
+name: Windows private-storage ACL prototype (#1167, fake-data, test-only)
+
+# #1167 isolated FEASIBILITY prototype (CONTRACT-r2 §4). Two jobs on disposable GitHub-hosted runners:
+#  1. compile: MSVC build of the coder-owned helper against pinned official Node-API inputs; binary sha256
+#     becomes a job output. A compile failure blocks the test job (needs:).
+#  2. acl-tests: run-validation.ps1 creates two fake standard local users (A owner, B other), fake fixtures
+#     under RUNNER_TEMP and owned FAT32/exFAT VHDs, runs the helper ONLY as A, B's denials as B, verdict from
+#     an independent oracle, then removes exactly what it created. Raw receipts upload on every outcome.
+# Not product, release, install, durability (G2) or security acceptance. auth.ts / package.json os[] /
+# W0/W1 / existing workflows are untouched and pinned below. No secrets, no publish, no PR trigger.
+# Node pins: official https://nodejs.org/dist/v20.20.2/ SHASUMS256.txt entries supplied by the controller
+# (supplement-node manifest f4297856...; TLS-verified, not GPG-verified). Prototype pins, not a support matrix.
+
+on:
+  push:
+    branches: [ test/1167-private-storage-20261004 ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-private-storage-prototype-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PSP_NODE_VERSION: 20.20.2
+  PSP_NODE_EXE_SHA256: 56c1520ee33b801e8bdb92fb321cf2e98529735b6d12bd4a2a6dec0ac0bab937      # win-x64/node.exe
+  PSP_NODE_HEADERS_SHA256: 6de0e836efa9f32512e61db3dfd08b3d97a015b7e828d1a5efdf281a56a692d9  # node-v20.20.2-headers.tar.gz
+  PSP_NODE_LIB_SHA256: c4a794e993d9304238523230885e9ec00ca052c73b9558471858eef14916d91f      # win-x64/node.lib
+  PSP_HELPER_BASENAME: private-storage.node
+  PSP_WRAPPER_SHA256: 3b2228432e8010ffc5c24ce1bb8f867bc7cd0a2aa71680ed30b3f65d72f06288
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  compile:
+    name: Compile helper (win32-x64, MSVC cl)
+    if: github.ref == 'refs/heads/test/1167-private-storage-20261004'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      helper_sha256: ${{ steps.hash.outputs.helper_sha256 }}
+    steps:
+      - name: Keep LF bytes and seed a FAILED placeholder build receipt
+        run: |
+          set -euo pipefail
+          git config --global core.autocrlf false
+          mkdir -p "${RUNNER_TEMP}/psp1167-build"
+          printf '%s\n' '{"schema":"aigentry/1167-psp-build/v1","task":"1167","status":"FAILED","reason":"build-not-reached","productAcceptance":false}' > "${RUNNER_TEMP}/psp1167-build/build-receipt.json"
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Pins must be resolved and match before anything from the tree executes
+        run: |
+          set -euo pipefail
+          echo "checked-out sha: ${GITHUB_SHA} ref: ${GITHUB_REF}"
+          [ "${GITHUB_REF}" = "refs/heads/test/1167-private-storage-20261004" ] || { echo "::error::unexpected ref ${GITHUB_REF}"; exit 1; }
+          FAIL=0
+          for V in PSP_NODE_VERSION PSP_NODE_EXE_SHA256 PSP_NODE_HEADERS_SHA256 PSP_NODE_LIB_SHA256 PSP_HELPER_BASENAME PSP_WRAPPER_SHA256; do
+            if [ -z "${!V}" ] || [ "${!V}" = "UNRESOLVED" ]; then echo "::error::${V} is UNRESOLVED (controller input required)"; FAIL=1; fi
+          done
+          check() {
+            if [ ! -f "$2" ]; then echo "::error::$2 is missing"; FAIL=1; return 0; fi
+            ACTUAL="$(sha256sum -b -- "$2" | cut -d" " -f1)"
+            if [ "${ACTUAL}" = "$1" ]; then echo "pin ok ${ACTUAL} $2"; else echo "::error::$2 sha256 ${ACTUAL} does not match pin $1"; FAIL=1; fi
+          }
+          # independent harness (tester-owned)
+          check 0320e07db1fd02d1c46c015d2ebc9b55b3cbdecb4c5230160f456bb48473144b prototypes/windows-private-storage/tests/acl.test.mjs
+          check f4c9b47982a2726aca7308f969198e822e5259a683cccd6b93c98ed8674673bc prototypes/windows-private-storage/tests/setup-fixtures.ps1
+          check 944dfdd13f176eed9df0340db45a81a7d83e68308667ee7bc4980b10956fb751 prototypes/windows-private-storage/tests/run-as-user.ps1
+          check 4192f8eeff6356bb428b30681fd70c286043798a6a20a033a9c2184b85c394f5 prototypes/windows-private-storage/tests/run-validation.ps1
+          # baseline that must stay byte-identical (release 148d3b67 staged inputs)
+          check 51343c903455905eb96d22f3c6111493dc24e11fa651718e66ea792dfacb5a30 src/hitl/web/auth.ts
+          check 14e8bed19324f0b23ebb0abdd4dea3248c6b5ecdeed783fe7c0414237dc37feb src/hitl/web/auth-port.ts
+          check a5b293836105f2a02072e1cb4214940c61ea2798c3c899e15a3e847222a40f5d package.json
+          check 68cbe93558dfcf1ffcc3994e1583bd63510f4f1049fe856bda90afff4a16a35e src/session/persistence/atomic-write.ts
+          check 0163aadccc743031f6e907e92d2a2058dd3838b591fc60aaac905be2d12240e4 src/session/persistence/index-lock.ts
+          check 2a711cfac1ff8786808f1e502867cae6f6dee490eb77175a72aeb0f8f0df3595 .github/workflows/windows-fake-cmux-acceptance.yml
+          # coder-owned candidate (independently authored; candidate-r1 manifest 76e661ec...)
+          check 0e91544eeadb6d426ba8ef2258fd278caae17ae4f23731a2700ddce23f5eae3c prototypes/windows-private-storage/native/private_storage.c
+          check a9c00917093b0610b03c97058396abb1db13a1565aad15d7c9f00a792133d739 prototypes/windows-private-storage/native/build.ps1
+          check ${PSP_WRAPPER_SHA256} prototypes/windows-private-storage/private-storage.mjs
+          check e2b1bfe00bb121a57857ef3fc362c3665ad1e59bffdc39922a46e3d0c8ab77fa prototypes/windows-private-storage/README.md
+          echo "recorded $(sha256sum -b -- .github/workflows/windows-private-storage-prototype.yml | cut -d" " -f1) .github/workflows/windows-private-storage-prototype.yml"
+          [ "${FAIL}" = "0" ] || exit 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.PSP_NODE_VERSION }}
+
+      - name: Node runtime must be the pinned official build
+        run: |
+          set -euo pipefail
+          [ "$(node --version)" = "v${PSP_NODE_VERSION}" ] || { echo "::error::node $(node --version) != v${PSP_NODE_VERSION}"; exit 1; }
+          NODE_EXE="$(node -p 'process.execPath')"
+          ACTUAL="$(sha256sum -b -- "${NODE_EXE}" | cut -d" " -f1)"
+          [ "${ACTUAL}" = "${PSP_NODE_EXE_SHA256}" ] || { echo "::error::node.exe sha256 ${ACTUAL} != pin"; exit 1; }
+          echo "node ok ${ACTUAL} ${NODE_EXE}"
+
+      - name: Fetch pinned official Node-API headers and import library
+        run: |
+          set -euo pipefail
+          D="${RUNNER_TEMP}/psp1167-build/node"
+          mkdir -p "${D}"
+          curl -fsSL --proto '=https' --tlsv1.2 -o "${D}/headers.tar.gz" "https://nodejs.org/dist/v${PSP_NODE_VERSION}/node-v${PSP_NODE_VERSION}-headers.tar.gz"
+          curl -fsSL --proto '=https' --tlsv1.2 -o "${D}/node.lib" "https://nodejs.org/dist/v${PSP_NODE_VERSION}/win-x64/node.lib"
+          [ "$(sha256sum -b -- "${D}/headers.tar.gz" | cut -d" " -f1)" = "${PSP_NODE_HEADERS_SHA256}" ] || { echo "::error::headers tarball hash mismatch"; exit 1; }
+          [ "$(sha256sum -b -- "${D}/node.lib" | cut -d" " -f1)" = "${PSP_NODE_LIB_SHA256}" ] || { echo "::error::node.lib hash mismatch"; exit 1; }
+          tar -xzf "${D}/headers.tar.gz" -C "${D}"
+          INC="${D}/node-v${PSP_NODE_VERSION}/include/node"
+          # The official 20.20.2 headers equal the four staged task inputs (verified offline); gate on them.
+          hdr() { A="$(sha256sum -b -- "${INC}/$2" | cut -d" " -f1)"; [ "${A}" = "$1" ] || { echo "::error::$2 ${A} != $1"; exit 1; }; echo "header ok ${A} $2"; }
+          hdr 89393f07881fcba3ed097a5989fba1746f1c2cf611f19ba4dcb17071da8a661e js_native_api.h
+          hdr 0410c31e227f81e2981363c4d543f4832ac3df785343ec64cee621742ff8a034 js_native_api_types.h
+          hdr cf2446da4783a707dc9399321cff3ea28dce86fafdf38746fc47f1b293f5a040 node_api.h
+          hdr 8d5d854088d5725fec9775510e0aeeeb790a41ad083c49bb721d950b86e6bd61 node_api_types.h
+          echo "PSP_NODE_HEADERS_DIR=$(cygpath -w "${INC}")" >> "${GITHUB_ENV}"
+          echo "PSP_NODE_LIB=$(cygpath -w "${D}/node.lib")" >> "${GITHUB_ENV}"
+          echo "PSP_HELPER_OUT=$(cygpath -w "${RUNNER_TEMP}/psp1167-build/out")" >> "${GITHUB_ENV}"
+
+      # Separate build step: the coder-owned script compiles with cl from vcvars64; this job never runs tests.
+      - name: Build helper with MSVC (coder-owned native/build.ps1)
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL exit /b 1
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          for /f "delims=" %%c in ('where cl.exe') do if not defined CLEXE set "CLEXE=%%c"
+          if not defined CLEXE exit /b 1
+          if not exist "%PSP_HELPER_OUT%" mkdir "%PSP_HELPER_OUT%"
+          cl 1> nul 2> "%RUNNER_TEMP%\psp1167-build\cl-version.txt"
+          powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%GITHUB_WORKSPACE%\prototypes\windows-private-storage\native\build.ps1" -ClExe "%CLEXE%" -NodeIncludeDir "%PSP_NODE_HEADERS_DIR%" -NodeLib "%PSP_NODE_LIB%" -OutputPath "%PSP_HELPER_OUT%\%PSP_HELPER_BASENAME%" -ExpectedNodeLibSha256 %PSP_NODE_LIB_SHA256% || exit /b 1
+
+      - name: Hash helper and write the build receipt
+        id: hash
+        run: |
+          set -euo pipefail
+          F="${RUNNER_TEMP}/psp1167-build/out/${PSP_HELPER_BASENAME}"
+          [ -f "${F}" ] || { echo "::error::build produced no ${PSP_HELPER_BASENAME}"; exit 1; }
+          SHA="$(sha256sum -b -- "${F}" | cut -d" " -f1)"
+          CL="$(head -n 1 "${RUNNER_TEMP}/psp1167-build/cl-version.txt" | tr -d '\r"\\')"
+          echo "helper_sha256=${SHA}" >> "${GITHUB_OUTPUT}"
+          printf '{"schema":"aigentry/1167-psp-build/v1","task":"1167","status":"BUILT","arch":"win32-x64","helper":"%s","sha256":"%s","cl":"%s","node":"%s","runId":"%s","sourceSha":"%s","productAcceptance":false}\n' \
+            "${PSP_HELPER_BASENAME}" "${SHA}" "${CL}" "${PSP_NODE_VERSION}" "${GITHUB_RUN_ID}" "${GITHUB_SHA}" > "${RUNNER_TEMP}/psp1167-build/build-receipt.json"
+          echo "helper ${SHA} ${PSP_HELPER_BASENAME}"
+
+      - name: Upload helper binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: psp1167-helper-win32-x64
+          path: ${{ runner.temp }}/psp1167-build/out/${{ env.PSP_HELPER_BASENAME }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: psp1167-build-receipt
+          path: |
+            ${{ runner.temp }}/psp1167-build/build-receipt.json
+            ${{ runner.temp }}/psp1167-build/cl-version.txt
+            ${{ runner.temp }}/psp1167-build/out/*.build.json
+          if-no-files-found: error
+          retention-days: 7
+
+  acl-tests:
+    name: ACL feasibility tests (fake users A/B, disposable runner)
+    needs: compile
+    if: github.ref == 'refs/heads/test/1167-private-storage-20261004'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Keep LF bytes and seed a FAILED placeholder run receipt
+        run: |
+          set -euo pipefail
+          git config --global core.autocrlf false
+          mkdir -p "${RUNNER_TEMP}/psp1167-receipts"
+          printf '%s\n' '{"schema":"aigentry/1167-psp-run/v1","task":"1167","status":"FAILED","reason":"validation-not-reached","productAcceptance":false,"feasibilityOnly":true}' > "${RUNNER_TEMP}/psp1167-receipts/run.json"
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Pins must be resolved and match before anything from the tree executes
+        run: |
+          set -euo pipefail
+          echo "checked-out sha: ${GITHUB_SHA} ref: ${GITHUB_REF}"
+          [ "${GITHUB_REF}" = "refs/heads/test/1167-private-storage-20261004" ] || { echo "::error::unexpected ref ${GITHUB_REF}"; exit 1; }
+          FAIL=0
+          for V in PSP_NODE_VERSION PSP_NODE_EXE_SHA256 PSP_NODE_HEADERS_SHA256 PSP_NODE_LIB_SHA256 PSP_HELPER_BASENAME PSP_WRAPPER_SHA256; do
+            if [ -z "${!V}" ] || [ "${!V}" = "UNRESOLVED" ]; then echo "::error::${V} is UNRESOLVED (controller input required)"; FAIL=1; fi
+          done
+          check() {
+            if [ ! -f "$2" ]; then echo "::error::$2 is missing"; FAIL=1; return 0; fi
+            ACTUAL="$(sha256sum -b -- "$2" | cut -d" " -f1)"
+            if [ "${ACTUAL}" = "$1" ]; then echo "pin ok ${ACTUAL} $2"; else echo "::error::$2 sha256 ${ACTUAL} does not match pin $1"; FAIL=1; fi
+          }
+          # independent harness (tester-owned)
+          check 0320e07db1fd02d1c46c015d2ebc9b55b3cbdecb4c5230160f456bb48473144b prototypes/windows-private-storage/tests/acl.test.mjs
+          check f4c9b47982a2726aca7308f969198e822e5259a683cccd6b93c98ed8674673bc prototypes/windows-private-storage/tests/setup-fixtures.ps1
+          check 944dfdd13f176eed9df0340db45a81a7d83e68308667ee7bc4980b10956fb751 prototypes/windows-private-storage/tests/run-as-user.ps1
+          check 4192f8eeff6356bb428b30681fd70c286043798a6a20a033a9c2184b85c394f5 prototypes/windows-private-storage/tests/run-validation.ps1
+          # baseline that must stay byte-identical (release 148d3b67 staged inputs)
+          check 51343c903455905eb96d22f3c6111493dc24e11fa651718e66ea792dfacb5a30 src/hitl/web/auth.ts
+          check 14e8bed19324f0b23ebb0abdd4dea3248c6b5ecdeed783fe7c0414237dc37feb src/hitl/web/auth-port.ts
+          check a5b293836105f2a02072e1cb4214940c61ea2798c3c899e15a3e847222a40f5d package.json
+          check 68cbe93558dfcf1ffcc3994e1583bd63510f4f1049fe856bda90afff4a16a35e src/session/persistence/atomic-write.ts
+          check 0163aadccc743031f6e907e92d2a2058dd3838b591fc60aaac905be2d12240e4 src/session/persistence/index-lock.ts
+          check 2a711cfac1ff8786808f1e502867cae6f6dee490eb77175a72aeb0f8f0df3595 .github/workflows/windows-fake-cmux-acceptance.yml
+          # coder-owned candidate (independently authored; candidate-r1 manifest 76e661ec...)
+          check 0e91544eeadb6d426ba8ef2258fd278caae17ae4f23731a2700ddce23f5eae3c prototypes/windows-private-storage/native/private_storage.c
+          check a9c00917093b0610b03c97058396abb1db13a1565aad15d7c9f00a792133d739 prototypes/windows-private-storage/native/build.ps1
+          check ${PSP_WRAPPER_SHA256} prototypes/windows-private-storage/private-storage.mjs
+          check e2b1bfe00bb121a57857ef3fc362c3665ad1e59bffdc39922a46e3d0c8ab77fa prototypes/windows-private-storage/README.md
+          echo "recorded $(sha256sum -b -- .github/workflows/windows-private-storage-prototype.yml | cut -d" " -f1) .github/workflows/windows-private-storage-prototype.yml"
+          [ "${FAIL}" = "0" ] || exit 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.PSP_NODE_VERSION }}
+
+      - name: Node runtime must be the pinned official build
+        run: |
+          set -euo pipefail
+          [ "$(node --version)" = "v${PSP_NODE_VERSION}" ] || { echo "::error::node $(node --version) != v${PSP_NODE_VERSION}"; exit 1; }
+          NODE_EXE="$(node -p 'process.execPath')"
+          ACTUAL="$(sha256sum -b -- "${NODE_EXE}" | cut -d" " -f1)"
+          [ "${ACTUAL}" = "${PSP_NODE_EXE_SHA256}" ] || { echo "::error::node.exe sha256 ${ACTUAL} != pin"; exit 1; }
+          echo "node ok ${ACTUAL} ${NODE_EXE}"
+
+      - name: Download helper binary
+        uses: actions/download-artifact@v4
+        with:
+          name: psp1167-helper-win32-x64
+          path: ${{ runner.temp }}/psp1167-helper
+
+      - name: Helper must equal the compile-job hash
+        env:
+          EXPECTED: ${{ needs.compile.outputs.helper_sha256 }}
+        run: |
+          set -euo pipefail
+          ACTUAL="$(sha256sum -b -- "${RUNNER_TEMP}/psp1167-helper/${PSP_HELPER_BASENAME}" | cut -d" " -f1)"
+          [ -n "${EXPECTED}" ] && [ "${ACTUAL}" = "${EXPECTED}" ] || { echo "::error::helper ${ACTUAL} != compile output ${EXPECTED}"; exit 1; }
+          echo "helper ok ${ACTUAL}"
+
+      # Elevated orchestrator; the helper itself runs only as fake standard user A. Exit is unmasked.
+      - name: Validation (fake users, fixtures, oracle, verdict, cleanup)
+        shell: powershell
+        env:
+          PSP_HELPER_PATH: ${{ runner.temp }}\psp1167-helper\${{ env.PSP_HELPER_BASENAME }}
+          PSP_HELPER_SHA256: ${{ needs.compile.outputs.helper_sha256 }}
+          PSP_WRAPPER_PATH: ${{ github.workspace }}\prototypes\windows-private-storage\private-storage.mjs
+        run: |
+          & "$env:GITHUB_WORKSPACE\prototypes\windows-private-storage\tests\run-validation.ps1"
+          exit $LASTEXITCODE
+
+      # Removes only identities/VHDs/root recorded in the state file, even if the step above was killed.
+      - name: Cleanup backstop (recorded resources only)
+        if: always()
+        shell: powershell
+        run: |
+          & "$env:GITHUB_WORKSPACE\prototypes\windows-private-storage\tests\run-validation.ps1" -CleanupOnly
+          exit $LASTEXITCODE
+
+      - name: Upload raw receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: psp1167-acl-receipts
+          path: ${{ runner.temp }}/psp1167-receipts
+          if-no-files-found: error
+          retention-days: 7
