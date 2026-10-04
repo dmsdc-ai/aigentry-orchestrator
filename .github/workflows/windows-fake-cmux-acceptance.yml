@@ -69,7 +69,7 @@ jobs:
           }
           check 77c1ebf22a7a0fc832d12268f8a22c3716c82e884784b66b51b32c1793e58e0e tests/dispatch/fake-cmux-win32.ts
           check 8a7e65ae850fa3983c62157149c532139e0970c0db6bcb336eecb0a2798f8030 tests/dispatch/fake-cmux-win32.inert.test.mjs
-          check 248614563ea226f72c78d22e35874baffd5c43a358d074e52b10f8176200906d scripts/run-tests.mjs
+          check 3601b0fe6b59570aff5f847fd874322cb6fe83b331c3758cbfcc0135c6615a26 scripts/run-tests.mjs
           check f3e88ef3fdd0b999c1274d5d59151aee0888777f908abbcbc630e394ca86c6cf tests/dispatch/model-router-fixtures.ts
           check 5fa262af4a06f26e0cf37832958fdc5f1426a75fe8e8f535a6549d1e9cca74f2 tests/dispatch/model-router-fixtures.test.ts
           check 4b9e73514f34dc5c58a21e40dd6894ab0b208524d2e8d3b01b1fec3b2086ce99 src/session/agent-metadata.ts
