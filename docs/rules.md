@@ -268,8 +268,12 @@ Do NOT idle or wait — report is REQUIRED before any other action.
 ## Rule 12. 구현 위임 시 컨텍스트 클리어 필수 (HARD RULE)
 구현 위임 전 반드시 대상 세션 `/clear` 후 위임. 컨텍스트 오염(이전 실패 코드/가정)이 다음 시도를 망친다.
 
+2026-10-04 사용자 승인 예외: 이전 대화를 재개하지 않은 신규 프로세스, 빈 대화, 정확한 task/sid/attempt 격리를 확인한 경우에만 새 세션의 첫 지시로 구현을 시작할 수 있다. 기존 세션 재사용에는 `/clear`를 유지한다. 신규 프로세스라는 추정이나 새 workspace 이름만으로는 충분하지 않으며, 시작 명령의 resume/continue 부재와 실제 초기 대화·격리 증거를 태스크에 기록한다. 증거가 없으면 구현하지 않는다. 이 예외는 강제 Enter, 준비 검사 생략, 권한 확대를 허용하지 않는다. 정책 반영과 배포·설치본 검증은 별개다. 승인: `call_VizItPZvikZjsD6nbES6fjX9`, 소유 태스크 #1166, 릴리즈 #1171.
+
 ### Rule 12-1. 크리티컬 버그 위임 시 컨텍스트 클리어 필수 (HARD RULE)
 P0/크리티컬 버그 위임 시 반드시 `/clear` 후 위임. 시간이 걸려도 클리어 먼저.
+
+검증된 신규 세션의 첫 지시에는 Rule 12의 2026-10-04 승인 예외와 동일한 증거 요건을 적용한다. 누적 세션에 대한 클리어 의무는 유지한다.
 
 ## Rule 13. 빌드/실행은 builder에 위임 (HARD RULE)
 오케스트레이터는 `make`, `cargo build`, `npm run build`, `open *.app`, `pkill`, `npm publish` 직접 수행 금지. 모든 빌드/실행/배포는 **builder 세션**(aigentry-builder-claude)에 위임.

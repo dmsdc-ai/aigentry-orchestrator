@@ -64,6 +64,12 @@ Fresh dispatches use the model router by default; explicit `--cli` overrides it.
 
 ## Step 2 — Spawn via the terminal adaptor + inject context
 
+Apply Rule 12/12-1 from `docs/rules.md`: clear reused implementation sessions. The
+2026-10-04 approved first-instruction exception requires evidence of a new process,
+no resumed history, an empty conversation and exact task/sid/attempt confinement.
+Record those facts; a new workspace name is not proof. Never force Enter or bypass
+readiness. Policy text alone does not establish installed/runtime enforcement.
+
 First confirm the full 위임 전 체크리스트 (approved task/scope, controller-selected target, MANDATORY report path, [SAWP] envelope, lessons, SPEC FIRST, self-contained ref). Do not repeat user approval for ordinary worker composition within that scope. Then spawn via the dispatch helper, never raw spawn (Rule 32 HARD). `--spawn-and-dispatch` carries context through a **ref file**; raw telepty is only for permitted short acknowledgements/follow-ups.
 
 ```bash
