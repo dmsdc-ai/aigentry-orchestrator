@@ -1,0 +1,84 @@
+name: oslock prototype 3OS build+test (isolated, #1166)
+
+# #1166 isolated native primitive prototype ONLY. Not a product gate, not installation
+# support, no package/runner/CI integration, no publish, no adoption. Each leg compiles the
+# four pinned sources under prototypes/oslock with the npm-bundled node-gyp of pinned Node,
+# stages input/build/oslock.node + manifest.json, then runs the tester-owned suite twice.
+# Any build or test failure fails the leg; nothing is swallowed. Hashes are isolated build
+# evidence, not production trust.
+
+on:
+  push:
+    branches: [ 'validate/1166-oslock-prototype-20261004' ]
+    paths:
+      - 'prototypes/oslock/**'
+      - '.github/workflows/oslock-prototype.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oslock-prototype-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: oslock build+test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+        working-directory: prototypes/oslock
+    steps:
+      # Windows images default to core.autocrlf=true, which would hand the build CRLF bytes
+      # instead of the committed LF bytes the pins describe. Ephemeral runner git config only;
+      # the harness still compares every source byte-exact and fails on any mismatch.
+      - name: Check out committed bytes without EOL conversion
+        working-directory: .
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.2'
+      - name: Build native addon (npm-bundled node-gyp, owned scratch)
+        id: build
+        timeout-minutes: 8
+        run: node ci/oslock-build.mjs build --expect-node v20.20.2 --out "$RUNNER_TEMP/oslock-ci"
+      - name: Test run 1 (OSLOCK_SUITE=all)
+        id: test1
+        timeout-minutes: 5
+        run: node ci/oslock-build.mjs test --run 1 --out "$RUNNER_TEMP/oslock-ci"
+      - name: Test run 2 (OSLOCK_SUITE=all)
+        id: test2
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 5
+        run: node ci/oslock-build.mjs test --run 2 --out "$RUNNER_TEMP/oslock-ci"
+      # Only these enumerated harness outputs; sources, fixtures and workspace are never uploaded.
+      - name: Upload build/test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oslock-prototype-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/oslock-ci/build-receipt.json
+            ${{ runner.temp }}/oslock-ci/build.log
+            ${{ runner.temp }}/oslock-ci/manifest.json
+            ${{ runner.temp }}/oslock-ci/run-1-receipt.json
+            ${{ runner.temp }}/oslock-ci/run-1.tap
+            ${{ runner.temp }}/oslock-ci/run-1.stderr.log
+            ${{ runner.temp }}/oslock-ci/run-1-results.json
+            ${{ runner.temp }}/oslock-ci/run-2-receipt.json
+            ${{ runner.temp }}/oslock-ci/run-2.tap
+            ${{ runner.temp }}/oslock-ci/run-2.stderr.log
+            ${{ runner.temp }}/oslock-ci/run-2-results.json
+          if-no-files-found: error
+          retention-days: 7
