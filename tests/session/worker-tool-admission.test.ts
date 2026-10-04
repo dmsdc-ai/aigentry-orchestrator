@@ -7,14 +7,22 @@
 // never executed: nothing starts a provider CLI, reads the developer HOME or touches the network.
 // These tests prove argv construction and refusal ordering only, never CLI acceptance or
 // OS confinement.
+// win32: the confined sandbox is unsupported by design. The same 4 integration tests assert the REAL
+// SANDBOX_PLATFORM_UNSUPPORTED refusal before any write (fail closed), never Windows support. The boot
+// fixture is portable exactly as in claude-worker-oauth.test.ts: PATH uses path.delimiter, and the
+// version probe (spawn shell:false resolves only .com/.exe) is answered by a copy of this node.exe.
+// The pure claudeToolPolicyViolation matrix runs on every OS: argv admission logic, not OS confinement.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
+import { CLAUDE_TOOL_POLICY_FLAGS, CLAUDE_WORKER_TOOLS, claudeToolPolicyViolation } from "../../src/session/worker-sandbox.js";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..", "..", "..");
 const BOOT = join(REPO_ROOT, "bin", "boot-prepare.mjs");
@@ -24,16 +32,51 @@ const TASK = "652";
 const TOOLS = "Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch";
 const FLAGS = ["--tools", "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",
   "--agent", "--agents", "--settings"];
+const LOOKALIKES = ["--agent-like-unknown", "--agentsx", "--toolsy", "--settings-file", "--allowedToolsX",
+  "--setting-sources=user", "-tools", "tools", "--append-system-prompt=--tools"];
+const WIN = process.platform === "win32";
+const UNSUPPORTED = "SANDBOX_PLATFORM_UNSUPPORTED";
+
+/** The 9 attack forms per flag (8 x 9 = 72), shared by the integration tests and the pure matrix. */
+function attackForms(argv: string[], flag: string, secret: string): string[][] {
+  const json = `{"permissions":{"allow":["Agent"]},"k":"${secret}"}`;
+  return [
+    [...argv, flag, secret],                                    // trailing, separate value
+    [...argv, `${flag}=${secret}`],                             // equals form
+    [argv[0] ?? "claude", flag, json, ...argv.slice(1)],        // first position, JSON payload
+    [...argv.slice(0, 3), `${flag}=${json}`, ...argv.slice(3)], // middle, equals JSON
+    [...argv, flag, "Read", "Agent", secret],                   // variadic list
+    [...argv, flag, "default", flag, secret],                   // repeated (no last-wins)
+    [...argv, "positional prompt", flag, secret],               // after a positional
+    [...argv, flag],                                            // bare flag, no value
+    [...argv, `${flag}=`],                                      // empty equals
+  ];
+}
 
 type Json = Record<string, unknown>;
 const parse = (s: string): Json | null => { try { return JSON.parse(s) as Json; } catch { return null; } };
 const read = (p: string): string => readFileSync(p, "utf8");
 const fake = (k: string): string => `FAKE-sk-ant-${k}01-${randomUUID()}-NOT-A-SECRET`;
 
-interface World { root: string; host: string; aig: string; bin: string; project: string; hostCreds: string }
+interface World {
+  root: string; host: string; aig: string; bin: string; project: string; hostCreds: string; hostCodex: string;
+  fakes: string[];
+}
 
 const roots: string[] = [];
 process.on("exit", () => { for (const r of roots) rmSync(r, { recursive: true, force: true }); });
+
+// win32 only (as in claude-worker-oauth.test.ts): the boot version probe cannot run the extensionless
+// fakes, so a copy of this node.exe on a later PATH entry answers it. It is never a worker command.
+let probeDir = "";
+function probeExeDir(): string {
+  if (probeDir) return probeDir;
+  const d = mkdtempSync(join(tmpdir(), "tool-admission-652-probe-"));
+  roots.push(d);
+  copyFileSync(process.execPath, join(d, "claude.exe"));
+  try { linkSync(join(d, "claude.exe"), join(d, "codex.exe")); } catch { copyFileSync(process.execPath, join(d, "codex.exe")); }
+  return (probeDir = d);
+}
 
 function world(): World {
   const root = mkdtempSync(join(tmpdir(), "tool-admission-652-"));
@@ -52,16 +95,22 @@ function world(): World {
   w(join(aig, "instructions", "roles", "tester.md"), "# tester\n");
   mkdirSync(join(root, "project"), { recursive: true });
   mkdirSync(join(root, "tmp"), { recursive: true });
-  const hostCreds = JSON.stringify({ claudeAiOauth: { accessToken: fake("oat"), refreshToken: fake("ort") } });
+  const fakes = [fake("oat"), fake("ort"), fake("cdx")];
+  const hostCreds = JSON.stringify({ claudeAiOauth: { accessToken: fakes[0], refreshToken: fakes[1] } });
   w(join(host, ".claude", ".credentials.json"), hostCreds, 0o600);
-  w(join(host, ".codex", "auth.json"), JSON.stringify({ fake: fake("cdx") }), 0o600);
-  return { root, host, aig, bin, project: join(root, "project"), hostCreds };
+  const hostCodex = JSON.stringify({ fake: fakes[2] });
+  w(join(host, ".codex", "auth.json"), hostCodex, 0o600);
+  return { root, host, aig, bin, project: join(root, "project"), hostCreds, hostCodex, fakes };
 }
 
 // Explicit env only: no ambient auth, developer HOME or AIGENTRY_CLAUDE_OAUTH_TOKEN reaches a child.
+// win32 adds only fake USERPROFILE (os.homedir), TEMP/TMP (os.tmpdir) and SystemRoot (Windows runtime).
 const env = (W: World): Record<string, string> => ({
-  PATH: `${W.bin}:/usr/bin:/bin`, HOME: W.host, TMPDIR: join(W.root, "tmp"), LANG: "en_US.UTF-8",
+  PATH: WIN ? [W.bin, probeExeDir()].join(delimiter) : `${W.bin}:/usr/bin:/bin`, HOME: W.host,
+  TMPDIR: join(W.root, "tmp"), LANG: "en_US.UTF-8",
   AIGENTRY_HOME: W.aig, AGENT_METADATA_DIST: DIST,
+  ...(WIN ? { USERPROFILE: W.host, TEMP: join(W.root, "tmp"), TMP: join(W.root, "tmp"),
+    ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) } : {}),
 });
 
 /** Default adapter argv from the real confined boot path (includes the --permission-mode bypass pair). */
@@ -90,12 +139,30 @@ function prepare(W: World, sid: string, cli: string, argv: string[], roleCwd: st
 
 const count = (a: string[], v: string): number => a.filter((x) => x === v).length;
 
+/** Refused before any write: exact error, no payload/fake credential echo, empty staging, host auth intact. */
+function assertRefused(W: World, p: Prep, error: string, payloads: string[] = []): void {
+  assert.notEqual(p.status, 0, p.out);
+  assert.equal(p.error, error);
+  for (const s of [...payloads, ...W.fakes]) assert.ok(!p.out.includes(s), p.error ?? "");
+  assert.deepEqual(readdirSync(p.stagingRoot), []);
+  assert.equal(existsSync(join(p.stagingRoot, "sandbox")), false);
+  assert.equal(existsSync(join(p.stagingRoot, "sandbox-current.json")), false);
+  assert.equal(read(join(W.host, ".claude", ".credentials.json")), W.hostCreds);
+  assert.equal(read(join(W.host, ".codex", "auth.json")), W.hostCodex);
+  // os.tmpdir() of the prepare child is exactly <root>/tmp on linux/win32 (macOS stages agw- under /tmp
+  // instead, so there this check is vacuous). Refusal happens before mkdtemp: no agw- dir.
+  assert.deepEqual(readdirSync(join(W.root, "tmp")).filter((n) => n.startsWith("agw-")), []);
+}
+
 test("claude: exact closed 8-tool set, one --tools and one --allowedTools, same constant, rest unchanged", () => {
   const W = world(), { argv, roleCwd } = bootArgv(W, "p1", "claude");
   // The permitted default adapter argv carries none of the refused flags.
   assert.ok(!argv.some((a) => FLAGS.some((f) => a === f || a.startsWith(`${f}=`))));
   assert.ok(argv.includes("bypassPermissions"));
+  assert.equal(claudeToolPolicyViolation(argv), undefined);
   const p = prepare(W, "p1", "claude", argv, roleCwd);
+  // win32: the confined sandbox is unsupported; the real platform gate refuses first, before any write.
+  if (WIN) return assertRefused(W, p, UNSUPPORTED);
   assert.equal(p.status, 0, p.out);
   const cmd = p.m.command as string[];
   assert.deepEqual([count(cmd, "--tools"), count(cmd, "--allowedTools")], [1, 1]);
@@ -130,6 +197,7 @@ test("codex: command unchanged, no tool flags added, claude-only gate does not a
   const W = world(), { argv, roleCwd } = bootArgv(W, "cx", "codex");
   for (const [sid, extra] of [["cx", []], ["cx2", ["--agents", "{}"]]] as const) {
     const p = prepare(W, sid, "codex", [...argv, ...extra], roleCwd);
+    if (WIN) { assertRefused(W, p, UNSUPPORTED); continue; }
     assert.equal(p.status, 0, p.out);
     const cmd = p.m.command as string[];
     assert.deepEqual(cmd.slice(1), [...argv.slice(1), ...extra].filter((a) => a !== "--dangerously-bypass-approvals-and-sandbox")
@@ -143,22 +211,16 @@ test("claude: every override flag/alias, equals form, position and variadic is r
   const hostBefore = read(join(W.host, ".claude", ".credentials.json"));
   let n = 0;
   for (const flag of FLAGS) {
-    const secret = fake("pay"), json = `{"permissions":{"allow":["Agent"]},"k":"${secret}"}`;
-    const attacks: string[][] = [
-      [...argv, flag, secret],                                    // trailing, separate value
-      [...argv, `${flag}=${secret}`],                             // equals form
-      [argv[0] ?? "claude", flag, json, ...argv.slice(1)],        // first position, JSON payload
-      [...argv.slice(0, 3), `${flag}=${json}`, ...argv.slice(3)], // middle, equals JSON
-      [...argv, flag, "Read", "Agent", secret],                   // variadic list
-      [...argv, flag, "default", flag, secret],                   // repeated (no last-wins)
-      [...argv, "positional prompt", flag, secret],               // after a positional
-      [...argv, flag],                                            // bare flag, no value
-      [...argv, `${flag}=`],                                      // empty equals
-    ];
+    const secret = fake("pay");
+    const attacks = attackForms(argv, flag, secret);
     for (const a of attacks) {
+      // The real integration result agrees with the pure helper; win32 refuses at the platform gate first.
+      assert.equal(claudeToolPolicyViolation(a), flag);
       const sid = `n${n++}`, p = prepare(W, sid, "claude", a, roleCwd);
       assert.notEqual(p.status, 0, `${flag} accepted: ${JSON.stringify(a.slice(1).map((x) => x.slice(0, 24)))}`);
-      assert.equal(p.error, `SANDBOX_TOOL_ARG: ${flag}`);
+      const expected = WIN ? UNSUPPORTED : `SANDBOX_TOOL_ARG: ${flag}`;
+      assert.equal(p.error, expected);
+      assertRefused(W, p, expected, [secret]);
       // Redaction: the flag name only, never the payload.
       assert.ok(!p.out.includes(secret) && !p.out.includes("Agent\"") && !p.out.includes("permissions"), p.error ?? "");
       // No filesystem change: staging root still empty, no sandbox dir, no current pointer, host auth untouched.
@@ -173,10 +235,47 @@ test("claude: every override flag/alias, equals form, position and variadic is r
 test("claude: lookalike flags are not overmatched (no prefix/substring refusal)", () => {
   const W = world(), { argv, roleCwd } = bootArgv(W, "o0", "claude");
   let n = 0;
-  for (const a of ["--agent-like-unknown", "--agentsx", "--toolsy", "--settings-file", "--allowedToolsX",
-    "--setting-sources=user", "-tools", "tools", "--append-system-prompt=--tools"]) {
+  for (const a of LOOKALIKES) {
+    assert.equal(claudeToolPolicyViolation([...argv, a]), undefined);
     const p = prepare(W, `o${n++}`, "claude", [...argv, a], roleCwd);
+    if (WIN) { assertRefused(W, p, UNSUPPORTED); continue; }
     assert.equal(p.status, 0, `${a}: ${p.out}`);
     assert.equal(count(p.m.command as string[], "--tools"), 1);
   }
+});
+
+test("pure claudeToolPolicyViolation (argv admission logic, not OS confinement): 72 attacks, 9 lookalikes, ordering", () => {
+  assert.deepEqual([...CLAUDE_TOOL_POLICY_FLAGS], FLAGS);
+  assert.equal(CLAUDE_WORKER_TOOLS, TOOLS);
+  const base = ["/fake/bin/claude", "--model", "opus", "--permission-mode", "bypassPermissions"];
+  assert.equal(claudeToolPolicyViolation(base), undefined);
+  let n = 0;
+  for (const flag of FLAGS) {
+    const secret = fake("pay");
+    for (const a of attackForms(base, flag, secret)) {
+      const v = claudeToolPolicyViolation(a);
+      assert.equal(v, flag, JSON.stringify(a.slice(1).map((x) => x.slice(0, 24))));
+      // Redaction: the result (and so the caller's error) carries the flag name only.
+      assert.ok(!`SANDBOX_TOOL_ARG: ${v}`.includes(secret) && !String(v).includes("permissions"));
+      n++;
+    }
+  }
+  assert.equal(n, 72);
+  for (const a of LOOKALIKES) assert.equal(claudeToolPolicyViolation([...base, a]), undefined, a);
+  assert.equal(LOOKALIKES.length, 9);
+  // First refused token in argv order wins, not the flag-list order.
+  assert.equal(claudeToolPolicyViolation(["claude", "--settings", "s.json", "--tools", "Agent"]), "--settings");
+  assert.equal(claudeToolPolicyViolation(["claude", "--agents={}", "--agent", "x"]), "--agents");
+  assert.equal(claudeToolPolicyViolation(["claude", "--allowedTools=--tools"]), "--allowedTools");
+  // Aliases are distinct exact names.
+  assert.equal(claudeToolPolicyViolation(["claude", "--allowed-tools", "Agent"]), "--allowed-tools");
+  assert.equal(claudeToolPolicyViolation(["claude", "--disallowed-tools=Bash"]), "--disallowed-tools");
+  // argv[0] is the bound command and is never scanned; a value equal to a flag is refused (fail closed).
+  assert.equal(claudeToolPolicyViolation(["--tools"]), undefined);
+  assert.equal(claudeToolPolicyViolation([]), undefined);
+  assert.equal(claudeToolPolicyViolation(["claude", "--model", "--tools"]), "--tools");
+  // Pure: the input is not mutated.
+  const frozen = Object.freeze(["claude", "--agent", "x"]);
+  assert.equal(claudeToolPolicyViolation(frozen), "--agent");
+  assert.deepEqual(frozen, ["claude", "--agent", "x"]);
 });

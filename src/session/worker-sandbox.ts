@@ -104,6 +104,14 @@ export const CLAUDE_WORKER_TOOLS = "Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebS
 // Caller tool-policy overrides, refused (never stripped/merged) as `flag` or `flag=value`.
 export const CLAUDE_TOOL_POLICY_FLAGS = ["--tools", "--allowedTools", "--allowed-tools",
   "--disallowedTools", "--disallowed-tools", "--agent", "--agents", "--settings"] as const;
+// Pure: first argv[1..] token that is exactly a refused flag or `flag=...`; returns the flag name only.
+export function claudeToolPolicyViolation(argv: readonly string[]): string | undefined {
+  for (const a of argv.slice(1)) {
+    const flag = CLAUDE_TOOL_POLICY_FLAGS.find(f => a === f || a.startsWith(f + "="));
+    if (flag) return flag;
+  }
+  return undefined;
+}
 
 function seedAuth(cli: string, home: string, cwd: string, oauthSelected = false): Record<string, string> {
   const realHome = os.homedir();
@@ -155,10 +163,8 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   if (!argv.length || path.basename(argv[0]!) !== cli) throw new Error("SANDBOX_COMMAND_BINDING");
   // #652: before any staging write or auth seeding. Names the flag only, never its value.
   if (cli === "claude") {
-    for (const a of argv.slice(1)) {
-      const flag = CLAUDE_TOOL_POLICY_FLAGS.find(f => a === f || a.startsWith(f + "="));
-      if (flag) throw new Error(`SANDBOX_TOOL_ARG: ${flag}`);
-    }
+    const flag = claudeToolPolicyViolation(argv);
+    if (flag) throw new Error(`SANDBOX_TOOL_ARG: ${flag}`);
   }
   // #652: validated before any staging write. Claude only; codex never reads it.
   const oauthToken = cli === "claude" ? selectedClaudeOAuthToken(process.env) : undefined;
