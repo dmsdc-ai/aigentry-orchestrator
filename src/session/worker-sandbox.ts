@@ -96,6 +96,15 @@ export function writePrivate(file: string, data: string): void {
   fs.writeFileSync(file, data, { mode: 0o600, flag: "wx" });
 }
 
+// #652 confined Claude worker built-in tools: one closed set, passed as both the
+// available set (--tools) and the pre-approved set (--allowedTools). Unlisted
+// built-ins (Agent, Task, Workflow, TodoWrite, ...) are not provisioned. CLI flags
+// do not prevent child processes: Bash remains, inside the same OS sandbox.
+export const CLAUDE_WORKER_TOOLS = "Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch";
+// Caller tool-policy overrides, refused (never stripped/merged) as `flag` or `flag=value`.
+export const CLAUDE_TOOL_POLICY_FLAGS = ["--tools", "--allowedTools", "--allowed-tools",
+  "--disallowedTools", "--disallowed-tools", "--agent", "--agents", "--settings"] as const;
+
 function seedAuth(cli: string, home: string, cwd: string, oauthSelected = false): Record<string, string> {
   const realHome = os.homedir();
   if (cli === "codex") {
@@ -144,6 +153,13 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   if (!["darwin", "linux"].includes(process.platform)) throw new Error("SANDBOX_PLATFORM_UNSUPPORTED");
   if (!["claude", "codex"].includes(cli)) throw new Error(`SANDBOX_CLI_UNSUPPORTED: ${cli}`);
   if (!argv.length || path.basename(argv[0]!) !== cli) throw new Error("SANDBOX_COMMAND_BINDING");
+  // #652: before any staging write or auth seeding. Names the flag only, never its value.
+  if (cli === "claude") {
+    for (const a of argv.slice(1)) {
+      const flag = CLAUDE_TOOL_POLICY_FLAGS.find(f => a === f || a.startsWith(f + "="));
+      if (flag) throw new Error(`SANDBOX_TOOL_ARG: ${flag}`);
+    }
+  }
   // #652: validated before any staging write. Claude only; codex never reads it.
   const oauthToken = cli === "claude" ? selectedClaudeOAuthToken(process.env) : undefined;
   const cwd = canonical(roleCwd);
@@ -187,7 +203,7 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   } else {
     const i = command.indexOf("--permission-mode");
     if (i >= 0) command.splice(i, 2);
-    command.push("--permission-mode", "acceptEdits", "--allowedTools", "Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch",
+    command.push("--permission-mode", "acceptEdits", "--tools", CLAUDE_WORKER_TOOLS, "--allowedTools", CLAUDE_WORKER_TOOLS,
       "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "", "--no-chrome");
     for (const p of scope.write) command.push("--add-dir", fs.existsSync(p) && fs.statSync(p).isDirectory() ? p : path.dirname(p));
   }
