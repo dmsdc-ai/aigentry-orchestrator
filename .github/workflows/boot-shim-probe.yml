@@ -1,0 +1,76 @@
+name: Boot shim probe (R1 delta, diagnostic)
+
+# #1167. DIAGNOSTIC ONLY, not a gate and not installation support. Runs
+# tests/dispatch/boot-shim-probe.mjs against the unchanged compiled boot-adapter spawner on
+# three OSes. It measures only what windows-boot-spawn-probe.yml does not: R1 (the original
+# extensionless fixture CLI by bare name on PATH), cross-spawn on that same name, and a POSIX
+# baseline. R2 (npm .cmd shims) and the wider R3 comparison stay in windows-boot-spawn-probe.yml.
+# Node is pinned to that probe's 20.20.2 so the two receipts are read on one runtime.
+#
+# A green leg means the harness kept control (controls held, observations settled and well
+# formed, no stray artifacts). Observed product failures are recorded, not failed on.
+# On windows-latest, --force is the existing CI-only bypass of package.json os[]
+# (see ci.yml windows-persistence); it is not Windows support.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ 'validate/1167-sqlite-r2-20261004' ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: boot-shim-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: Boot shim probe (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.2'
+      - name: Install (no lifecycle scripts) and build the unchanged library
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            npm ci --force --ignore-scripts --no-audit --no-fund
+          else
+            npm ci --ignore-scripts --no-audit --no-fund
+          fi
+          npm run build
+      - name: R1 delta probe
+        shell: bash
+        timeout-minutes: 5
+        run: node tests/dispatch/boot-shim-probe.mjs --out "$RUNNER_TEMP/boot-shim-probe"
+      - name: Publish summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/boot-shim-probe/summary.md" ]; then
+            cat "$RUNNER_TEMP/boot-shim-probe/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "boot-shim-probe: no summary written (precondition or harness did not complete)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      # Only the two files the probe writes; fixtures and temp dirs are never uploaded.
+      - name: Upload probe results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-shim-probe-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/boot-shim-probe/results.json
+            ${{ runner.temp }}/boot-shim-probe/summary.md
+          if-no-files-found: error
+          retention-days: 7
