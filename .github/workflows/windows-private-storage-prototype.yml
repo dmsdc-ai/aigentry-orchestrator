@@ -109,7 +109,9 @@ jobs:
       - name: Fetch pinned official Node-API headers and import library
         run: |
           set -euo pipefail
-          D="${RUNNER_TEMP}/psp1167-build/node"
+          # GNU tar -C rejects the Windows-backslash RUNNER_TEMP spelling; build D from its checked Unix form.
+          U="$(cygpath -u "${RUNNER_TEMP}")" && [ -n "${U}" ] || { echo "::error::cygpath -u RUNNER_TEMP failed"; exit 1; }
+          D="${U}/psp1167-build/node"
           mkdir -p "${D}"
           curl -fsSL --proto '=https' --tlsv1.2 -o "${D}/headers.tar.gz" "https://nodejs.org/dist/v${PSP_NODE_VERSION}/node-v${PSP_NODE_VERSION}-headers.tar.gz"
           curl -fsSL --proto '=https' --tlsv1.2 -o "${D}/node.lib" "https://nodejs.org/dist/v${PSP_NODE_VERSION}/win-x64/node.lib"
