@@ -114,11 +114,11 @@ jobs:
             check "$T/gemini.ts"  a8b12f699531021d5c6e441b64d31c45b5d9e0dec1f187d844b071465539f6a4
             check "$T/types.ts"   984ce32596d76e20bbdf63a513dfddb11c80a4689af31d2169eb05e3ae955cea
           fi
-          check harness/tests/session/boot-adapter/win-launch.test.ts      c859cb044e4ddb6e53395d184b2751749507d8600c07df6f3d67c14b7afcc4f5
+          check harness/tests/session/boot-adapter/win-launch.test.ts      2e03a66121fd9a65e3e796b80e8f56973a748807f5cd6c3c8f07f493e4112c11
           check harness/tests/session/boot-adapter/_win-launch-fixture.ts  288230fa7c92967fb962d795101fbdcc40295d3ebbddb6ba868be7c06b3c9b86
-          check harness/tests/dispatch/windows-npm-direct-probe.mjs       b30b0e343ad26ea6810ed127de24a6dfc8bfb9f658e27ebe19470e7d373e6738
+          check harness/tests/dispatch/windows-npm-direct-probe.mjs       a5387dca79286ac821f4fd7357d5698e18c608a81c33c1c8c7c610e7129b50d2
           check harness/tests/dispatch/win-launch-tap-check.mjs           2b9643ca465a87f3809a8a580706db86ccd50d5ce937eea540a192e89c31e375
-          check harness/tests/dispatch/win-launch-tap-check.test.mjs      74a06da36bacc962f244e5ac244915bce62708f50b844544ce707b3cd5b7cd9b
+          check harness/tests/dispatch/win-launch-tap-check.test.mjs      e5bd1cf0e32cd78b88daea6dd1da1f2a66c142b0fafb68302185b60c7a53509e
           git -C "${{ steps.tree.outputs.dir }}" ls-files --eol src/session/boot-adapter | tee "$RUNNER_TEMP/wl-out/eol.txt"
           sha256sum "${{ steps.tree.outputs.dir }}"/src/session/boot-adapter/*.ts "${{ steps.tree.outputs.dir }}/package-lock.json" | tee "$RUNNER_TEMP/wl-out/sources.sha256"
 

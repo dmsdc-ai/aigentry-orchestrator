@@ -344,7 +344,8 @@ test("T9 [win32] non-reading child with 8 MiB stdin → no crash, no delivery cl
   const { dir, nonce } = newCase(ROOT, "t9");
   const r = await withEnv(winEnv("PATH", [lay.bin], dir, nonce, { FAKE_MODE: "noread" }), () => run(["fake"], dir, "z".repeat(8 << 20)));
   t.diagnostic(`outcome=${r.error ? `rejected ${String(r.error.code)}` : `resolved exit=${r.value!.exit_code}`}`);
-  if (r.error) assert.ok(["EPIPE", "ECONNRESET"].includes(String(r.error.code)), String(r.error.code));
+  // EOF: the closed-reader code this win32-only case actually produced on Windows CI 37214231848 (`rejected EOF`).
+  if (r.error) assert.ok(["EPIPE", "ECONNRESET", "EOF"].includes(String(r.error.code)), String(r.error.code));
   else assert.equal(parseReport(r.value!.stdout).stdin, null);
   await assertCleanup(t, dir, nonce, r.calls, 1);
 });

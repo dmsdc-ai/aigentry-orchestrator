@@ -233,7 +233,8 @@ async function cleanupProof(dir, nonce, res) {
 const report = res => { try { return res.stdout ? JSON.parse(res.stdout) : null; } catch { return null; } };
 const view = rep => rep && { self: redact(U(rep.self)), argv0: redact(U(rep.argv0)), execPath: redact(U(rep.execPath)),
   execArgv: rep.execArgv.map(x => redact(U(x))), argsB64: rep.args, argsHash: hash(JSON.stringify(rep.args)), cwd: redact(U(rep.cwd)), env: rep.env, stdin: rep.stdin };
-const newCase = label => { const nonce = crypto.randomBytes(16).toString('hex'); const dir = path.join(ROOT, 'cases', `${label}-${nonce.slice(0, 8)}`); fs.mkdirSync(dir, { recursive: true }); return { dir, nonce }; };
+const caseDir = (label, nonce) => path.join(ROOT, 'cases', `${label}-${nonce.slice(0, 8)}`);
+const newCase = label => { const nonce = crypto.randomBytes(16).toString('hex'); const dir = caseDir(label, nonce); fs.mkdirSync(dir, { recursive: true }); return { dir, nonce }; };
 
 async function differential(id, { exeToken, argvExe = exeToken, dirs, key = 'PATH', args = SAFE, expect, extra = {}, cwdSetup }) {
   const rec = { id, kind: 'differential', key };
@@ -462,7 +463,9 @@ try {
   }
   // ---- coder assumption (a): %~dp0 spelling vs candidate's resolved PATH entry (spelling fixture, safe args) ----
   const spBin = path.join(g, 'spbin');
-  const caseDepthRel = path.relative(path.join(ROOT, 'cases', 'x'), spBin);
+  // Relative to the cwd differential() actually gives both engines: caseDir(`${id}-ref|-direct`), not a guessed depth.
+  const [caseDepthRel, relFromDirect] = ['ref', 'direct'].map(e => path.relative(caseDir(`spelling/relative-${e}`, '0'.repeat(8)), spBin));
+  if (caseDepthRel !== relFromDirect) throw Object.assign(new Error('RELATIVE_FIXTURE_CWD_MISMATCH'), { code: 'RELATIVE_FIXTURE_CWD_MISMATCH' });
   for (const [vid, entry] of [['trailing-backslash', spBin + '\\'], ['lowercase', spBin.toLowerCase()], ['forward-slash', spBin.split('\\').join('/')],
     ['quoted', `"${spBin}"`], ['relative', caseDepthRel], ['dot-segment', path.join(spBin, '..', 'spbin').replace('spbin', 'spbin\\.\\.')]]) {
     receipt.cases.push(await differential(`spelling/${vid}`, { exeToken: 'fakesp', dirs: [entry], args: ['main-never-run.js', 'x'], extra: { FAKE_MODE: 'preload' },
