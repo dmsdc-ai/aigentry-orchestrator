@@ -46,7 +46,7 @@ PY
 # (2) the operation table IS the enforcement surface — pin it exactly, so adding a
 #     terminal mutation op has to change this test on purpose.
 ops=$(t_registry --list-ops | tr '\n' ' ' | sed 's/ *$//')
-want="archive-sidecars begin-delivery check-dedup get list migrate observe prune set-gate set-lifecycle set-transport-result snapshot"
+want="archive-sidecars begin-delivery check-dedup get init-store list migrate observe prune set-gate set-lifecycle set-transport-result snapshot"
 [ "$ops" = "$want" ] || { echo "FAIL: op table = [$ops], want [$want]" >&2; exit 1; }
 
 # (3) there is no outcome-mutation entrance, by any of its historical names.

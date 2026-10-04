@@ -1454,8 +1454,14 @@ test("native Windows: new init refused, fresh and JSON reads retained (6.6, corr
   if (windows) {
     featureGap(fresh);
     windowsInitRefused(fresh);
+    // Init refused above with no health log; the legacy begin refusal then appends exactly one record.
+    const before = tree(fresh.state, DIAGNOSTIC);
     assert.equal(windowsBeginRefused(fresh), true);
-    assert.deepEqual(readdirSync(fresh.state).filter(name => name !== "active.json.lock"), []);
+    assert.deepEqual(changes(before, tree(fresh.state, DIAGNOSTIC)), []);
+    assert.deepEqual(readdirSync(fresh.state).filter(name => name !== "active.json.lock"), ["registry-health.log"]);
+    const health = readFileSync(fresh.paths.H, "utf8");
+    assert.match(health, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z /, health);
+    assert.equal(health.slice(21), `registry_write_failed ${WINDOWS_WRITE_REFUSAL}\r\n`);
     return;
   }
   assert.notEqual(payloadOf(fresh.run(["init-store"]).stdout)?.result, "unsupported_platform");
