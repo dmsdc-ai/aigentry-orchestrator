@@ -2,7 +2,9 @@ name: oslock prototype 3OS build+test (isolated, #1166)
 
 # #1166 isolated native primitive prototype ONLY. Not a product gate, not installation
 # support, no package/runner/CI integration, no publish, no adoption. Each leg compiles the
-# four pinned sources under prototypes/oslock with the npm-bundled node-gyp of pinned Node,
+# four pinned sources under prototypes/oslock with the CI-only locked node-gyp of
+# prototypes/oslock/toolchain (exact pin + committed lockfile, installed on this disposable
+# runner only; never the npm-bundled node-gyp, never a runtime/published dependency),
 # stages input/build/oslock.node + manifest.json, then runs the tester-owned suite twice.
 # Any build or test failure fails the leg; nothing is swallowed. Hashes are isolated build
 # evidence, not production trust.
@@ -49,8 +51,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20.20.2'
-      - name: Build native addon (npm-bundled node-gyp, owned scratch)
+      # Lockfile-exact, no lifecycle scripts; the harness re-verifies identity before use.
+      - name: Install locked CI build tool (toolchain/package-lock.json)
+        id: toolchain
+        timeout-minutes: 3
+        working-directory: prototypes/oslock/toolchain
+        run: npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org/
+      # Never runs a possibly partial toolchain: a failed install fails the leg and stays in its step log.
+      - name: Build native addon (locked node-gyp, owned scratch)
         id: build
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         timeout-minutes: 8
         run: node ci/oslock-build.mjs build --expect-node v20.20.2 --out "$RUNNER_TEMP/oslock-ci"
       - name: Test run 1 (OSLOCK_SUITE=all)

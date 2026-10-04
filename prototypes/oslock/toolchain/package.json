@@ -1,0 +1,10 @@
+{
+  "name": "oslock-ci-toolchain",
+  "version": "0.0.0",
+  "private": true,
+  "description": "#1166 CI-only locked native build tool for prototypes/oslock (disposable runners only); not a product dependency, never installed by users, never published",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "node-gyp": "12.3.0"
+  }
+}

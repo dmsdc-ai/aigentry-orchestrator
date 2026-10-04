@@ -3,7 +3,8 @@
 // isolated build evidence only. Every command is a shell-free child_process call.
 //
 //   build  Check ROOT/input holds exactly the four pinned sources, compile scratch copies of
-//          binding.gyp + oslock.c with the npm-bundled node-gyp of the running Node, stage
+//          binding.gyp + oslock.c with the CI-only locked node-gyp of ROOT/toolchain (installed
+//          beforehand by `npm ci --ignore-scripts`; npm-bundled node-gyp is never used), stage
 //          ROOT/input/build/oslock.node, write ROOT/manifest.json ({source, files:[{path,bytes,
 //          sha256}]}: 4 sources + binary) and build-receipt.json / build.log under --out.
 //   test   Run the tester-owned entry once (cwd ROOT/output, --expose-gc, OSLOCK_SUITE=all)
@@ -49,6 +50,26 @@ const BUILD_TIMEOUT_MS = 7 * 60_000;
 const DEFAULT_TEST_TIMEOUT_MS = 240_000;
 const PROBE_TIMEOUT_MS = 15_000;
 const BINARY_MAGIC = { linux: ["7f454c46"], darwin: ["cffaedfe", "cafebabe"], win32: ["4d5a"] };
+// CI-only build tool workspace (ROOT/toolchain): exact node-gyp pin, committed npm lockfile.
+// node-gyp 12.3.0: first 12.x line with Visual Studio 2026 (18.x) support (12.1.0) whose own CI
+// still tested Node 20.x on macOS/Ubuntu/Windows; engines admit Node ^20.17.0.
+const REGISTRY = "https://registry.npmjs.org/";
+const TOOLCHAIN = {
+  dir: "toolchain",
+  packageJsonSha256: "7a4dc4f93a6aff74075068498eb8bd8434c7b5437adfd460fd1950757330b458",
+  lockfileSha256: "d82749f836a4a107b361cc1c746f2c90a23103eb38f971da0d326e1227d1baa3",
+  nodeGyp: {
+    version: "12.3.0",
+    engines: "^20.17.0 || >=22.9.0",
+    resolved: "https://registry.npmjs.org/node-gyp/-/node-gyp-12.3.0.tgz",
+    integrity: "sha512-QNcUWM+HgJplcPzBvFBZ9VXacyGZ4+VTOb80PwWR+TlVzoHbRKULNEzpRsnaoxG3Wzr7Qh7BYxGDU3CbKib2Yg==",
+  },
+};
+// TOOLCHAIN.nodeGyp.engines evaluated for a vX.Y.Z Node version.
+function nodeGypSupportsNode(v) {
+  const [major, minor] = v.slice(1).split(".").map(Number);
+  return (major === 20 && minor >= 17) || (major === 22 && minor >= 9) || major > 22;
+}
 
 class HarnessError extends Error {}
 function fail(msg) {
@@ -173,27 +194,66 @@ function readPackage(file, name) {
   return pkg;
 }
 
-// The npm installed next to the running Node (setup-node layout); no search, no fallback.
-function findNodeGyp() {
+// Identity only: the npm next to the running Node (setup-node layout) that ran `npm ci`.
+function npmIdentity() {
   const nodeExe = realpathSync(process.execPath);
   const npmDir = process.platform === "win32"
     ? join(dirname(nodeExe), "node_modules", "npm")
     : join(dirname(dirname(nodeExe)), "lib", "node_modules", "npm");
-  const npmPkg = readPackage(join(npmDir, "package.json"), "npm");
-  const range = npmPkg.dependencies?.["node-gyp"];
-  if (typeof range !== "string") fail(`npm ${npmPkg.version} does not declare node-gyp`);
-  const gypDir = join(npmDir, "node_modules", "node-gyp");
+  try {
+    return { dir: npmDir, version: readPackage(join(npmDir, "package.json"), "npm").version, usedFor: "npm ci of ROOT/toolchain only" };
+  } catch (err) {
+    return { status: "unknown", reason: err.message };
+  }
+}
+
+// The locked node-gyp of ROOT/toolchain only; no search, no bundled or global fallback.
+function findLockedNodeGyp(root) {
+  const ws = join(root, TOOLCHAIN.dir);
+  const want = TOOLCHAIN.nodeGyp;
+  const pkgM = measureFile(root, `${TOOLCHAIN.dir}/package.json`);
+  const lockM = measureFile(root, `${TOOLCHAIN.dir}/package-lock.json`);
+  if (pkgM.sha256 !== TOOLCHAIN.packageJsonSha256) fail(`${pkgM.path}: unexpected bytes (${pkgM.sha256})`);
+  if (lockM.sha256 !== TOOLCHAIN.lockfileSha256) fail(`${lockM.path}: unexpected bytes (${lockM.sha256})`);
+  const lock = JSON.parse(readFileSync(join(ws, "package-lock.json"), "utf8"));
+  if (lock.lockfileVersion !== 3 || JSON.stringify(lock.packages?.[""]?.dependencies) !== JSON.stringify({ "node-gyp": want.version })) {
+    fail(`toolchain lockfile does not pin exactly node-gyp ${want.version}`);
+  }
+  const gypEntry = lock.packages["node_modules/node-gyp"];
+  if (gypEntry?.version !== want.version || gypEntry.resolved !== want.resolved || gypEntry.integrity !== want.integrity ||
+    gypEntry.engines?.node !== want.engines) fail("toolchain lockfile node-gyp entry differs from the pinned identity");
+  if (!lstatSync(join(ws, "node_modules", ".package-lock.json"), { throwIfNoEntry: false })?.isFile()) {
+    fail(`locked toolchain not installed: run npm ci --ignore-scripts in ROOT/${TOOLCHAIN.dir} first`);
+  }
+  const entries = Object.entries(lock.packages).filter(([key]) => key !== "");
+  for (const [key, p] of entries) {
+    if (!key.startsWith("node_modules/") || p.link || p.hasInstallScript || typeof p.resolved !== "string" ||
+      !p.resolved.startsWith(REGISTRY) || !/^sha512-/.test(p.integrity ?? "")) {
+      fail(`toolchain lock entry ${key} is not a ${REGISTRY} sha512 tarball without install scripts`);
+    }
+    const name = key.slice(key.lastIndexOf("node_modules/") + "node_modules/".length);
+    if (readPackage(join(ws, ...key.split("/"), "package.json"), name).version !== p.version) fail(`installed ${key} is not ${p.version}`);
+  }
+  const gypDir = join(ws, "node_modules", "node-gyp");
   const gypPkg = readPackage(join(gypDir, "package.json"), "node-gyp");
+  if (gypPkg.version !== want.version || gypPkg.engines?.node !== want.engines) fail(`installed node-gyp is ${gypPkg.version}, not ${want.version}`);
+  if (!nodeGypSupportsNode(process.version)) fail(`node-gyp ${want.version} engines ${want.engines} exclude ${process.version}`);
   const binRel = typeof gypPkg.bin === "string" ? gypPkg.bin : gypPkg.bin?.["node-gyp"];
   if (typeof binRel !== "string") fail("node-gyp package declares no node-gyp bin");
   const bin = resolve(gypDir, binRel);
   const inside = relative(gypDir, bin);
   if (inside.startsWith("..") || isAbsolute(inside)) fail("node-gyp bin escapes its package");
   if (!lstatSync(bin, { throwIfNoEntry: false })?.isFile()) fail(`node-gyp bin missing: ${bin}`);
-  const bundled = [npmPkg.bundleDependencies, npmPkg.bundledDependencies].some((l) => Array.isArray(l) && l.includes("node-gyp"));
   return {
-    npm: { dir: npmDir, version: npmPkg.version, nodeGypRange: range },
-    nodeGyp: { dir: gypDir, version: gypPkg.version, bin, listedInNpmBundleDependencies: bundled },
+    source: `CI-only locked toolchain ROOT/${TOOLCHAIN.dir} (npm ci --ignore-scripts); npm-bundled node-gyp not used`,
+    registry: REGISTRY,
+    packageJson: pkgM,
+    lockfile: { ...lockM, lockfileVersion: lock.lockfileVersion, packages: entries.length },
+    npm: npmIdentity(),
+    nodeGyp: {
+      dir: gypDir, version: gypPkg.version, engines: gypPkg.engines.node, resolved: gypEntry.resolved,
+      integrity: gypEntry.integrity, bin,
+    },
   };
 }
 
@@ -253,7 +313,7 @@ async function build(root, out, opts, baseRedactions) {
   if (process.version !== opts["expect-node"]) fail(`node ${process.version} is not the pinned ${opts["expect-node"]}`);
   receipt.sources = verifySources(root);
   if (lstatSync(join(root, "manifest.json"), { throwIfNoEntry: false })) fail("ROOT/manifest.json already exists; refusing to overwrite");
-  const tools = findNodeGyp();
+  const tools = findLockedNodeGyp(root);
   receipt.toolchain = { ...tools };
   const scratch = mkdtempSync(join(tmpdir(), "oslock-build-"));
   setRedactions([...baseRedactions, [scratch, "<SCRATCH>"], [realpathSync(scratch), "<SCRATCH>"]]);
