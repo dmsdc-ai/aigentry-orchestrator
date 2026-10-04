@@ -1,0 +1,78 @@
+name: oslock P6 startup diagnostic 3OS (isolated, #1166)
+
+# #1166 isolated fake-process P6 startup diagnostic ONLY. Not a product gate, not a product fix,
+# no native compilation, no npm install, no publish, no adoption. Each leg runs the tester-owned
+# diagnostic twice through prototypes/oslock/ci/p6-startup-diagnostic.mjs, each run in its own
+# fresh scratch ROOT. A failing diagnostic fails the leg; evidence capture never makes it green.
+
+on:
+  push:
+    branches: [ 'validate/1166-p6-startup-20261004' ]
+    paths:
+      - 'prototypes/oslock/ci/p6-startup-diagnostic.mjs'
+      - 'prototypes/oslock/tests/oslock/p6-startup-diagnostic.test.mjs'
+      - 'prototypes/oslock/tests/oslock/fixtures/p6-diag-child.mjs'
+      - '.github/workflows/oslock-p6-startup-diagnostic.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oslock-p6-startup-diagnostic-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  diagnostic:
+    name: P6 startup diagnostic (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+        working-directory: prototypes/oslock
+    steps:
+      # Windows images default to core.autocrlf=true; the diagnostic must run the committed LF
+      # bytes. Ephemeral runner git config only; the driver records source hashes before and after.
+      - name: Check out committed bytes without EOL conversion
+        working-directory: .
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.2'
+      # Driver deadline 300 s plus 15 s close grace; the step timeout is outer defense only and is
+      # not evidence that descendants ended cleanly.
+      - name: Diagnostic run 1
+        id: run1
+        timeout-minutes: 7
+        run: node ci/p6-startup-diagnostic.mjs --run 1 --expect-node v20.20.2 --out "$RUNNER_TEMP/p6diag-ci"
+      - name: Diagnostic run 2
+        id: run2
+        if: ${{ !cancelled() }}
+        timeout-minutes: 7
+        run: node ci/p6-startup-diagnostic.mjs --run 2 --expect-node v20.20.2 --out "$RUNNER_TEMP/p6diag-ci"
+      # Only these enumerated driver outputs; sources, scratch trees, workspace and home are never uploaded.
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oslock-p6-startup-diagnostic-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/p6diag-ci/run-1-receipt.json
+            ${{ runner.temp }}/p6diag-ci/run-1.tap
+            ${{ runner.temp }}/p6diag-ci/run-1.stderr.log
+            ${{ runner.temp }}/p6diag-ci/run-1-diagnostic.json
+            ${{ runner.temp }}/p6diag-ci/run-2-receipt.json
+            ${{ runner.temp }}/p6diag-ci/run-2.tap
+            ${{ runner.temp }}/p6diag-ci/run-2.stderr.log
+            ${{ runner.temp }}/p6diag-ci/run-2-diagnostic.json
+          if-no-files-found: error
+          retention-days: 7
