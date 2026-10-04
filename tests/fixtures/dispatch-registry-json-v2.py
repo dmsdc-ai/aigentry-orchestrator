@@ -32,18 +32,14 @@ Exit codes: 0 ok · 4 usage · 7 delivery-unknown/retry-held · 8 deduplicated �
 
 from __future__ import annotations
 
-import contextlib
 import datetime
 import errno
 import hashlib
 import json
 import os
-import re
 import shutil
-import stat
 import sys
 import time
-import urllib.parse
 import uuid
 
 if os.name == "nt":
@@ -198,14 +194,10 @@ def fault(name: str) -> bool:
 class _Lock:
     """Exclusive lock on a stable sibling file. Never the registry inode: an
     atomic rename replaces that, so two writers would hold locks on different
-    inodes and both think they were exclusive.
+    inodes and both think they were exclusive."""
 
-    guard=False is reserved for backend_write()/init-store, which classify the
-    state UNDER the lock instead; every other caller keeps the artifact guard."""
-
-    def __init__(self, guard: bool = True) -> None:
+    def __init__(self) -> None:
         self.path = registry_path() + ".lock"
-        self.guard = guard
         self.fh = None
         self.acquired = False
 
@@ -244,8 +236,7 @@ class _Lock:
                 else:
                     self.acquired = True
                     # Artifacts may have appeared while this writer waited.
-                    if self.guard:
-                        refuse_transition_artifacts()
+                    refuse_transition_artifacts()
                     return self
         except BaseException as exc:
             self.__exit__(*sys.exc_info())
@@ -328,8 +319,6 @@ def validate(doc: object) -> dict:
 
 
 def load(required: bool = True) -> dict:
-    if _ACTIVE_TXN is not None:
-        return _ACTIVE_TXN.load()
     path = registry_path()
     if not os.path.exists(path):
         if required:
@@ -354,9 +343,6 @@ def require_durable_writes() -> None:
 def commit(doc: dict) -> None:
     """temp → fsync(temp) → rename → fsync(dir). Recovery sees one complete
     generation or the other, never a half-written file."""
-    if _ACTIVE_TXN is not None:
-        _ACTIVE_TXN.commit(doc)
-        return
     require_durable_writes()
     doc["generation"] = int(doc.get("generation", 0)) + 1
     validate(doc)
@@ -400,532 +386,6 @@ def _unlink(path: str) -> None:
         os.unlink(path)
     except OSError:
         pass
-
-
-# --- SQLite store prototype (#1167) ---------------------------------------
-#
-# Isolated prototype, not production activation. Only init-store creates the
-# barrier directory active.json/, and it refuses unless DISPATCH_STATE_DIR is
-# the explicitly bound AIGENTRY_REGISTRY_PROTOTYPE_ROOT. While active.json is
-# not a directory, every path below is unused and the JSON backend above runs
-# exactly as before. Nothing here deletes or adopts by filename; the only
-# unlink is init-pending at the end of a validated init.
-
-PROTOTYPE_ROOT_ENV = "AIGENTRY_REGISTRY_PROTOTYPE_ROOT"
-STORE_NAME, JOURNAL_NAME = "active.db", "active.db-journal"
-AUTHORITY_NAME, PENDING_NAME = "authority.json", "init-pending"
-# Transition artifacts that must stay absent beside a barrier (D and J may exist).
-BARRIER_FORBIDDEN = ("active.db-wal", "active.db-shm", "active.json.source",
-                     "active.json.pre-sqlite.bak", "active.json.barrier.tmp")
-MARKER_MAX_BYTES = 256
-SQLITE_MAGIC = b"SQLite format 3\x00"
-STORE_SID = re.compile(r"[0-9a-f]{32}")
-STORE_META_COLUMNS = "SELECT id, storage_schema, store_id, epoch, mode, transition FROM meta"
-STORE_DDL = (
-    "CREATE TABLE meta(id INTEGER PRIMARY KEY CHECK(id=1), "
-    "storage_schema INTEGER NOT NULL CHECK(storage_schema=1), store_id TEXT NOT NULL, "
-    "epoch INTEGER NOT NULL CHECK(epoch>=1), mode TEXT NOT NULL CHECK(mode IN "
-    "('MIGRATING','SQLITE','ROLLBACK_PREPARE','JSON')), transition TEXT)",
-    "CREATE TABLE registry(id INTEGER PRIMARY KEY CHECK(id=1), document TEXT NOT NULL)",
-)
-# 4.5/5.3: the stored sqlite_master rows (type, name, tbl_name, sql) must be
-# exactly the DDL init-store wrote. An equivalent but differently spelled or
-# constrained schema is refused, never adopted or repaired.
-STORE_OBJECTS = [("table", "meta", "meta", STORE_DDL[0]),
-                 ("table", "registry", "registry", STORE_DDL[1])]
-INITIAL_DOCUMENT = json.dumps({"schema_version": SCHEMA_VERSION, "generation": 0,
-                               "dispatches": []}, separators=(",", ":"))
-READ_OPS = {"check-dedup", "get", "list", "snapshot"}
-
-# The store transaction load()/commit() dispatch to; None on the JSON backend.
-_ACTIVE_TXN = None
-
-
-def fsync_dir(path: str) -> None:
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def _sqlite_module():
-    try:
-        import sqlite3
-    except ImportError as exc:
-        raise RegistryError("sqlite_unavailable", f"python sqlite3 unavailable: {exc}") from exc
-    return sqlite3
-
-
-def _prototype_bound() -> bool:
-    """C4: DISPATCH_STATE_DIR is explicitly set and canonically equal to the
-    explicitly set AIGENTRY_REGISTRY_PROTOTYPE_ROOT. Not production authority."""
-    root = os.environ.get(PROTOTYPE_ROOT_ENV)
-    if not os.environ.get("DISPATCH_STATE_DIR") or not root:
-        return False
-    if "\x00" in root or not os.path.isabs(root):
-        return False
-    try:
-        return state_dir() == os.path.realpath(root)
-    except RegistryError:
-        return False
-
-
-def _seam(name: str) -> None:
-    """Prototype fault/crash seams. They act only under the same explicit
-    prototype binding as init-store; the legacy AIGENTRY_REGISTRY_FAULT names
-    are unaffected. A crash ends this process only."""
-    if not _prototype_bound():
-        return
-    if os.environ.get("AIGENTRY_REGISTRY_CRASH", "") == name:
-        os._exit(137)
-    if fault(name):
-        raise RegistryError("registry_write_failed", f"{name} faulted (test seam)")
-
-
-def _lstat_mode(path: str) -> int | None:
-    try:
-        return os.lstat(path).st_mode
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise RegistryError("registry_unavailable", f"cannot inspect {path}: {exc}") from exc
-
-
-def _barrier_refusal(reason: str) -> RegistryError:
-    return RegistryError("registry_unavailable",
-                         f"barrier incomplete; explicit recovery required: {reason}")
-
-
-def _pending_refusal() -> RegistryError:
-    return RegistryError("registry_unavailable",
-                         "store initialization pending; only init-store may resume it")
-
-
-def _marker_bytes(sid: str, pending: bool) -> bytes:
-    body = ({"format": 1, "intent": "init-store", "store_id": sid} if pending
-            else {"format": 1, "store_id": sid})
-    return (json.dumps(body, separators=(",", ":")) + "\n").encode("utf-8")
-
-
-def _read_marker(path: str, *, pending: bool) -> str:
-    """B3 strict parse of authority.json or init-pending; returns the store id."""
-    try:
-        st = os.lstat(path)
-        if not stat.S_ISREG(st.st_mode) or st.st_size > MARKER_MAX_BYTES:
-            raise _barrier_refusal(f"{path} is not a regular file of at most "
-                                   f"{MARKER_MAX_BYTES} bytes")
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        try:
-            raw = os.read(fd, MARKER_MAX_BYTES + 1)
-        finally:
-            os.close(fd)
-    except OSError as exc:
-        raise _barrier_refusal(f"cannot read {path}: {exc}") from exc
-    try:
-        sid = json.loads(raw.decode("utf-8")).get("store_id")
-    except (ValueError, AttributeError):
-        sid = None
-    if not isinstance(sid, str) or not STORE_SID.fullmatch(sid) or raw != _marker_bytes(sid, pending):
-        raise _barrier_refusal(f"malformed {path}")
-    return sid
-
-
-def classify() -> str:
-    """5.1 lstat-only classification; never creates anything. Returns fresh,
-    json, init_pending or sqlite; every other state raises (exit 9)."""
-    directory = state_dir()
-    barrier = os.path.join(directory, "active.json")
-    try:
-        st = os.lstat(barrier)
-    except FileNotFoundError:
-        refuse_transition_artifacts()
-        return "fresh"
-    except OSError as exc:
-        refuse_transition_artifacts()
-        raise RegistryError("registry_unavailable", f"cannot inspect {barrier}: {exc}") from exc
-    if not stat.S_ISDIR(st.st_mode):
-        # Regular file, symlink or other: the current JSON semantics, unchanged.
-        refuse_transition_artifacts()
-        return "json"
-    if os.name == "nt":
-        raise RegistryError("unsupported_platform",
-                            "native Windows SQLite store is not qualified; registry refused")
-    for name in BARRIER_FORBIDDEN:
-        if _lstat_mode(os.path.join(directory, name)) is not None:
-            raise RegistryError("registry_unavailable",
-                                f"SQLite transition artifact present at "
-                                f"{os.path.join(directory, name)}; store refused")
-    for name in (STORE_NAME, JOURNAL_NAME):
-        mode = _lstat_mode(os.path.join(directory, name))
-        if mode is not None and not stat.S_ISREG(mode):
-            raise _barrier_refusal(f"{os.path.join(directory, name)} is not a regular file")
-    try:
-        entries = set(os.listdir(barrier))
-    except OSError as exc:
-        raise _barrier_refusal(f"cannot list {barrier}: {exc}") from exc
-    authority = os.path.join(barrier, AUTHORITY_NAME)
-    if entries == {AUTHORITY_NAME, PENDING_NAME}:
-        if _read_marker(authority, pending=False) != _read_marker(
-                os.path.join(barrier, PENDING_NAME), pending=True):
-            raise _barrier_refusal("authority and init-pending store ids differ")
-        return "init_pending"
-    if entries == {AUTHORITY_NAME}:
-        _read_marker(authority, pending=False)
-        if _lstat_mode(os.path.join(directory, STORE_NAME)) is None:
-            raise RegistryError("store_missing", f"authority present but {STORE_NAME} is missing")
-        return "sqlite"
-    raise _barrier_refusal(f"unexpected barrier entries {sorted(entries)}")
-
-
-@contextlib.contextmanager
-def _locked_classify():
-    """6.2: take L without the default artifact guard, then classify UNDER L."""
-    with _Lock(guard=False):
-        yield classify()
-
-
-@contextlib.contextmanager
-def backend_write():
-    """The single mutator dispatcher: the locked classification alone selects
-    the current JSON load/commit or the SQLite write transaction W. L is taken
-    once here; nothing below acquires it again."""
-    with _locked_classify() as state:
-        if state == "sqlite":
-            with store_txn(write=True):
-                yield state
-        elif state in ("fresh", "json"):
-            yield state
-        else:
-            raise _pending_refusal()
-
-
-def _check_bracket(appfd: int) -> None:
-    """5.4: the NAME active.db still maps to the app-checked inode. Not SQLite fd
-    identity; accidental compatible-caller model only."""
-    path = os.path.join(state_dir(), STORE_NAME)
-    try:
-        named, held = os.lstat(path), os.fstat(appfd)
-    except OSError as exc:
-        raise RegistryError("registry_unavailable", f"cannot inspect {path}: {exc}") from exc
-    if (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino) or held.st_nlink < 1:
-        raise RegistryError("registry_unavailable", f"{path} no longer maps to the checked store")
-
-
-def _open_store(*, write: bool, fresh: bool = False):
-    """5.2 existing-store open; fresh=True is the separate 4.4 open of the
-    zero-byte store created by init-store (no header to check). Never rwc."""
-    sqlite3 = _sqlite_module()
-    directory = state_dir()
-    path = os.path.join(directory, STORE_NAME)
-    try:
-        appfd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    except OSError as exc:
-        raise RegistryError("registry_unavailable", f"cannot open {path}: {exc}") from exc
-    try:
-        st = os.fstat(appfd)
-        if not stat.S_ISREG(st.st_mode):
-            raise RegistryError("registry_unavailable", f"{path} is not a regular file")
-        if fresh:
-            if st.st_size != 0:
-                raise RegistryError("registry_unavailable", f"{path} is not empty")
-        else:
-            header = os.read(appfd, 100)
-            if len(header) < 100 or header[:16] != SQLITE_MAGIC:
-                raise RegistryError("registry_unavailable", f"{path} is not a SQLite database")
-            if header[18] != 1 or header[19] != 1:
-                raise RegistryError("registry_unavailable",
-                                    f"{path} is WAL or an unknown file format; refused")
-        for name in ("active.db-wal", "active.db-shm"):
-            if _lstat_mode(os.path.join(directory, name)) is not None:
-                raise RegistryError("registry_unavailable",
-                                    f"SQLite transition artifact present at "
-                                    f"{os.path.join(directory, name)}; store refused")
-        uri = "file:" + urllib.parse.quote(path) + ("?mode=rw" if write else "?mode=ro")
-        con = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=LOCK_TIMEOUT_S)
-    except BaseException as exc:
-        os.close(appfd)
-        if isinstance(exc, (OSError, sqlite3.Error)):
-            raise RegistryError("registry_unavailable", f"cannot open store: {exc}") from exc
-        raise
-    return con, appfd
-
-
-def _close_store(con, appfd: int) -> None:
-    try:
-        if con.in_transaction:
-            try:
-                con.execute("ROLLBACK")
-            except _sqlite_module().Error:
-                pass
-        con.close()
-    finally:
-        os.close(appfd)
-
-
-def _store_error(exc: Exception, write: bool) -> RegistryError:
-    code = getattr(exc, "sqlite_errorcode", None)
-    if not write and isinstance(code, int) and code & 0xFF == 8:
-        # SQLITE_READONLY_*: a hot journal a mode=ro reader may not roll back.
-        return RegistryError("registry_unavailable",
-                             f"hot journal; writer recovery required ({exc})")
-    return RegistryError("registry_unavailable", f"store access failed: {exc}")
-
-
-def _configure_writer(con) -> None:
-    """J6: refuse WAL, assign the candidate journal policy, re-query all of it."""
-    if str(con.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
-        raise RegistryError("registry_unavailable", "store is in WAL mode; refused")
-    con.execute("PRAGMA journal_mode=TRUNCATE").fetchone()
-    con.execute("PRAGMA synchronous=3")
-    con.execute("PRAGMA cache_spill=0")
-    want = {"journal_mode": "truncate", "synchronous": "3", "cache_spill": "0",
-            "locking_mode": "normal"}
-    if sys.platform == "darwin":
-        con.execute("PRAGMA fullfsync=1")
-        want["fullfsync"] = "1"
-    got = {name: str(con.execute(f"PRAGMA {name}").fetchone()[0]).lower() for name in want}
-    if got != want:
-        raise RegistryError("registry_unavailable", f"journal policy not applied: {got}")
-
-
-def _read_schema(con) -> tuple[int, list]:
-    user_version = con.execute("PRAGMA user_version").fetchone()[0]
-    objects = sorted(tuple(row) for row in
-                     con.execute("SELECT type, name, tbl_name, sql FROM sqlite_master"))
-    return user_version, objects
-
-
-def _store_document(con, sid: str, user_version: int, objects: list) -> str | None:
-    """The validated registry text if the schema, meta row and document are
-    exactly the initialized store for sid; None otherwise."""
-    if user_version != 1 or objects != STORE_OBJECTS:
-        return None
-    meta = con.execute(STORE_META_COLUMNS).fetchall()
-    docs = con.execute("SELECT id, document FROM registry").fetchall()
-    if meta != [(1, 1, sid, 1, "SQLITE", None)] or len(docs) != 1:
-        return None
-    # The writer updates WHERE id = 1; any other row id is not this store.
-    row_id, text = docs[0]
-    if type(row_id) is not int or row_id != 1 or not isinstance(text, str):
-        return None
-    try:
-        validate(json.loads(text))
-    except ValueError as exc:
-        raise RegistryError("registry_corrupt", f"unparseable store document: {exc}") from exc
-    return text
-
-
-class _StoreTxn:
-    def __init__(self, con, appfd: int, write: bool) -> None:
-        self.con, self.appfd, self.write = con, appfd, write
-        self.document: str | None = None
-        self.dirty = False
-
-    def load(self) -> dict:
-        return validate(json.loads(self.document))
-
-    def commit(self, doc: dict) -> None:
-        if not self.write or self.dirty:
-            raise RegistryError("registry_write_failed",
-                                "store commit outside a single write transaction")
-        doc["generation"] = int(doc.get("generation", 0)) + 1
-        validate(doc)
-        text = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
-        try:
-            cur = self.con.execute("UPDATE registry SET document = ? WHERE id = 1", (text,))
-        except _sqlite_module().Error as exc:
-            raise RegistryError("registry_write_failed", f"store update failed: {exc}") from exc
-        if cur.rowcount != 1:
-            raise RegistryError("registry_write_failed", "store update did not change one row")
-        self.document = text
-        self.dirty = True
-
-
-def _validate_store(txn: _StoreTxn) -> None:
-    """5.3, inside every normal transaction. init-pending must be absent."""
-    directory = state_dir()
-    barrier = os.path.join(directory, "active.json")
-    user_version, objects = _read_schema(txn.con)
-    sid = _read_marker(os.path.join(barrier, AUTHORITY_NAME), pending=False)
-    text = _store_document(txn.con, sid, user_version, objects)
-    if text is None:
-        raise RegistryError("registry_unavailable",
-                            "store schema, meta or document does not match authority; refused")
-    if _lstat_mode(os.path.join(barrier, PENDING_NAME)) is not None:
-        raise _pending_refusal()
-    _check_bracket(txn.appfd)
-    txn.document = text
-
-
-def _publish_journal_name() -> None:
-    """J5 tail: the journal NAME must be durable before COMMIT; the directory
-    fsync result is checked. Failure rolls the transaction back."""
-    directory = state_dir()
-    path = os.path.join(directory, JOURNAL_NAME)
-    _seam("w_before_dirsync")
-    try:
-        if not stat.S_ISREG(os.lstat(path).st_mode):
-            raise RegistryError("registry_write_failed", f"{path} is not a regular file")
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        try:
-            held = os.fstat(fd)
-        finally:
-            os.close(fd)
-        if not stat.S_ISREG(held.st_mode) or held.st_dev != os.fstat(_ACTIVE_TXN.appfd).st_dev:
-            raise RegistryError("registry_write_failed", f"{path} is not beside {STORE_NAME}")
-        _seam("w_dirsync_fail")
-        fsync_dir(directory)
-    except OSError as exc:
-        raise RegistryError("registry_write_failed", f"journal name not durable: {exc}") from exc
-
-
-def _commit_store(txn: _StoreTxn) -> None:
-    _publish_journal_name()
-    try:
-        txn.con.execute("COMMIT")
-    except _sqlite_module().Error as exc:
-        # Ambiguous: SQLite owns recovery; no completion is claimed.
-        raise RegistryError("registry_write_failed",
-                            f"COMMIT failed; outcome ambiguous: {exc}") from exc
-
-
-@contextlib.contextmanager
-def store_txn(*, write: bool, exclusive: bool = False):
-    """One transaction on an initialized store. Readers hold a mode=ro
-    transaction through their output and assign no pragmas; writers (under L)
-    COMMIT only if commit() was called, otherwise ROLLBACK."""
-    global _ACTIVE_TXN
-    if _ACTIVE_TXN is not None:
-        raise RegistryError("registry_unavailable", "nested store transaction refused")
-    sqlite3 = _sqlite_module()
-    con, appfd = _open_store(write=write)
-    txn = _StoreTxn(con, appfd, write)
-    try:
-        try:
-            if write:
-                _configure_writer(con)
-            con.execute("BEGIN EXCLUSIVE" if exclusive else "BEGIN IMMEDIATE" if write else "BEGIN")
-            _validate_store(txn)
-        except sqlite3.Error as exc:
-            raise _store_error(exc, write) from exc
-        _ACTIVE_TXN = txn
-        yield txn
-        if txn.dirty:
-            _commit_store(txn)
-            _seam("w_after_commit")
-    finally:
-        _ACTIVE_TXN = None
-        _close_store(con, appfd)
-
-
-def _write_new(path: str, data: bytes) -> None:
-    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-    try:
-        view = memoryview(data)
-        while view:
-            view = view[os.write(fd, view):]
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def _create_barrier(directory: str) -> str:
-    """B1-B2: exclusive mkdir barrier, then init-pending and authority (O_EXCL),
-    each durable. A crash at any point leaves a state classify() refuses (B4)."""
-    barrier = os.path.join(directory, "active.json")
-    os.mkdir(barrier, 0o700)
-    fsync_dir(directory)
-    _seam("init_after_mkdir")
-    sid = uuid.uuid4().hex
-    _write_new(os.path.join(barrier, PENDING_NAME), _marker_bytes(sid, True))
-    _seam("init_after_pending")
-    _write_new(os.path.join(barrier, AUTHORITY_NAME), _marker_bytes(sid, False))
-    fsync_dir(barrier)
-    _seam("init_after_authority")
-    return sid
-
-
-def _init_txn(sid: str) -> None:
-    """4.4/4.6: the separate init transaction. Unlike 5.3 it permits the
-    validated init-pending and authority, and accepts only an empty schema
-    (create) or the exact committed generation-0 store (resume: DDL skipped)."""
-    global _ACTIVE_TXN
-    sqlite3 = _sqlite_module()
-    directory = state_dir()
-    barrier = os.path.join(directory, "active.json")
-    try:
-        fresh = os.lstat(os.path.join(directory, STORE_NAME)).st_size == 0
-    except OSError as exc:
-        raise RegistryError("registry_write_failed", f"cannot inspect store: {exc}") from exc
-    con, appfd = _open_store(write=True, fresh=fresh)
-    txn = _StoreTxn(con, appfd, True)
-    try:
-        try:
-            _configure_writer(con)
-            con.execute("BEGIN EXCLUSIVE")
-            user_version, objects = _read_schema(con)
-            if (_read_marker(os.path.join(barrier, AUTHORITY_NAME), pending=False) != sid
-                    or _read_marker(os.path.join(barrier, PENDING_NAME), pending=True) != sid):
-                raise _barrier_refusal("store id changed during init")
-            _check_bracket(appfd)
-            if user_version == 0 and not objects:
-                for statement in STORE_DDL:
-                    con.execute(statement)
-                con.execute("INSERT INTO meta VALUES (1, 1, ?, 1, ?, NULL)", (sid, "SQLITE"))
-                con.execute("INSERT INTO registry VALUES (1, ?)", (INITIAL_DOCUMENT,))
-                con.execute("PRAGMA user_version=1")
-                _seam("init_in_txn")
-                _ACTIVE_TXN = txn
-                _commit_store(txn)
-            elif fresh or json.loads(_store_document(con, sid, user_version, objects)
-                                     or "null") != json.loads(INITIAL_DOCUMENT):
-                raise RegistryError("registry_unavailable",
-                                    "store is neither empty nor the committed initial store; "
-                                    "no repair attempted")
-            # Otherwise committed after a crash: DDL skipped, nothing to write.
-        except sqlite3.Error as exc:
-            raise RegistryError("registry_write_failed", f"init transaction failed: {exc}") from exc
-    finally:
-        _ACTIVE_TXN = None
-        _close_store(con, appfd)
-
-
-def _init_finalize(sid: str) -> str:
-    """4.7: verify the committed store read-only, then retire init-pending.
-    Returns sqlite_source_id()."""
-    sqlite3 = _sqlite_module()
-    directory = state_dir()
-    barrier = os.path.join(directory, "active.json")
-    con, appfd = _open_store(write=False)
-    try:
-        try:
-            con.execute("BEGIN")
-            user_version, objects = _read_schema(con)
-            if _store_document(con, sid, user_version, objects) is None:
-                raise RegistryError("registry_unavailable", "initialized store failed verification")
-            if con.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
-                raise RegistryError("registry_corrupt", "integrity_check failed after init")
-            source_id = con.execute("SELECT sqlite_source_id()").fetchone()[0]
-            _check_bracket(appfd)
-        except sqlite3.Error as exc:
-            raise _store_error(exc, False) from exc
-    finally:
-        _close_store(con, appfd)
-    pending = os.path.join(barrier, PENDING_NAME)
-    try:
-        if not stat.S_ISREG(os.lstat(os.path.join(directory, JOURNAL_NAME)).st_mode):
-            raise RegistryError("registry_unavailable", f"{JOURNAL_NAME} is not a regular file")
-        fsync_dir(directory)
-        _seam("init_after_verify")
-        if (_read_marker(os.path.join(barrier, AUTHORITY_NAME), pending=False) != sid
-                or _read_marker(pending, pending=True) != sid):
-            raise _barrier_refusal("store id changed during init")
-        os.unlink(pending)
-        fsync_dir(barrier)
-    except OSError as exc:
-        raise RegistryError("registry_write_failed", f"init finalization failed: {exc}") from exc
-    return source_id
 
 
 # --- record helpers ------------------------------------------------------
@@ -1054,7 +514,7 @@ def op_begin_delivery(args: dict) -> int:
     key = dedup_key(sid, ref_hash)
     retry_requested = "retry-unknown" in args
     retry_reason = (args.get("retry-unknown") or "").strip()
-    with backend_write():
+    with _Lock():
         doc = load()
         verdict, prior = dedup_verdict(doc, key)
         retry_refused = retry_requested and (
@@ -1145,7 +605,7 @@ def op_observe(args: dict) -> int:
             extra[key] = value
     extra.pop("terminal", None)   # observations are nonterminal by construction
     extra.pop("kind", None)
-    with backend_write():
+    with _Lock():
         doc = load()
         records = target_records(doc, args)
         if not records:
@@ -1169,7 +629,7 @@ def op_set_lifecycle(args: dict) -> int:
         raise RegistryError("invalid_argument",
                             "set-lifecycle: --all cannot carry a re-dispatch count; "
                             "the counter is per-dispatch, not per-session")
-    with backend_write():
+    with _Lock():
         doc = load()
         records = target_records(doc, args)
         if not records:
@@ -1192,7 +652,7 @@ def op_set_lifecycle(args: dict) -> int:
 
 def op_set_gate(args: dict) -> int:
     at = now_iso(args.get("now"))
-    with backend_write():
+    with _Lock():
         doc = load()
         rec = require_record(doc, args["sid"])
         gate = rec.setdefault("gate", {"state": None, "prev_lifecycle": None})
@@ -1217,7 +677,7 @@ def op_set_transport_result(args: dict) -> int:
     result = args.get("result")
     if result not in ("write_observed", "not_delivered", "unknown"):
         raise RegistryError("invalid_argument", f"unknown transport result {result!r}")
-    with backend_write():
+    with _Lock():
         doc = load()
         rec = require_record(doc, args["sid"])
         rec["transport"] = {"result": result,
@@ -1290,7 +750,7 @@ def op_prune(args: dict) -> int:
     cutoff = int(args.get("older-than-seconds") or 86400)
     at = now_iso(args.get("now"))
     now_dt = datetime.datetime.fromisoformat(at.replace("Z", "+00:00"))
-    with backend_write():
+    with _Lock():
         doc = load()
         keep = []
         for rec in doc["dispatches"]:
@@ -1407,71 +867,11 @@ def op_archive_sidecars(args: dict) -> int:
     return OK
 
 
-def op_init_store(args: dict) -> int:
-    """Create the isolated prototype SQLite store (#1167), the only creator of
-    the barrier, authority, init-pending and active.db. Refuses outside the
-    explicitly bound prototype root; never migrates, adopts or repairs."""
-    if os.name == "nt":
-        raise RegistryError("unsupported_platform",
-                            "native Windows SQLite store is not qualified; init-store refused")
-    sqlite3 = _sqlite_module()
-    try:
-        probe = sqlite3.connect(":memory:")
-        try:
-            options = {row[0] for row in probe.execute("PRAGMA compile_options")}
-        finally:
-            probe.close()
-    except sqlite3.Error as exc:
-        raise RegistryError("sqlite_unavailable", f"cannot query SQLite: {exc}") from exc
-    if "NO_SYNC" in options:
-        raise RegistryError("sqlite_unavailable", "SQLite built with NO_SYNC; refused")
-    # Advisory and read-only, before the C4 gate, so the transition-artifact
-    # refusal keeps its specific result whether or not the prototype root is
-    # bound. The authoritative classification is still the one under L below.
-    classify()
-    if not _prototype_bound():
-        raise RegistryError("capability_unqualified",
-                            f"init-store requires DISPATCH_STATE_DIR to equal "
-                            f"{PROTOTYPE_ROOT_ENV}; production activation gates are unresolved")
-    directory = state_dir()
-    with _locked_classify() as state:
-        if state == "sqlite":
-            raise RegistryError("already_initialized", "store already initialized")
-        if state == "json":
-            raise RegistryError("registry_unavailable",
-                                "JSON registry present; migration unit required")
-        try:
-            if state == "fresh":
-                sid = _create_barrier(directory)
-            else:
-                sid = _read_marker(os.path.join(directory, "active.json", AUTHORITY_NAME),
-                                   pending=False)
-            store = os.path.join(directory, STORE_NAME)
-            if _lstat_mode(store) is None:
-                fd = os.open(store, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-                try:
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-                fsync_dir(directory)
-                _seam("init_after_dbcreate")
-        except OSError as exc:
-            raise RegistryError("registry_write_failed", f"init-store failed: {exc}") from exc
-        _init_txn(sid)
-        _seam("init_after_commit")
-        source_id = _init_finalize(sid)
-    emit({"result": "store_initialized", "store_id": sid, "generation": 0,
-          "sqlite_version": sqlite3.sqlite_version, "sqlite_source_id": source_id,
-          "completion_fact": None})
-    return OK
-
-
 OPS = {
     "archive-sidecars": (op_archive_sidecars, ()),
     "begin-delivery": (op_begin_delivery, ("sid", "ref-hash")),
     "check-dedup": (op_check_dedup, ("sid", "ref-hash")),
     "get": (op_get, ("sid",)),
-    "init-store": (op_init_store, ()),
     "list": (op_list, ()),
     "migrate": (op_migrate, ()),
     "observe": (op_observe, ("sid", "kind")),
@@ -1490,7 +890,6 @@ FLAGS = {
                        "branch", "worktree", "keep-alive", "now", "retry-unknown"},
     "check-dedup": {"sid", "ref-hash"},
     "get": {"sid", "pointer"},
-    "init-store": set(),
     "list": {"fields", "live", "not-retired", "keep-alive", "due-before"},
     "migrate": {"now"},
     # `all` is offered ONLY here and on set-lifecycle: these two describe the
@@ -1551,16 +950,7 @@ def parse(argv: list[str]) -> tuple[str, dict]:
 def main(argv: list[str]) -> int:
     try:
         op, args = parse(argv)
-        if op != "init-store":
-            # Advisory only: writers re-classify under L (backend_write). The
-            # transition-artifact refusal still applies whenever active.json is
-            # not a barrier directory.
-            state = classify()
-            if state == "init_pending":
-                raise _pending_refusal()
-            if state == "sqlite" and op in READ_OPS:
-                with store_txn(write=False):
-                    return OPS[op][0](args)
+        refuse_transition_artifacts()
         return OPS[op][0](args)
     except RegistryError as exc:
         if exc.result in ("registry_corrupt", "registry_unavailable", "registry_write_failed"):

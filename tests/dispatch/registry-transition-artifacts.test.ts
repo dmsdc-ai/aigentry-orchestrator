@@ -44,7 +44,7 @@ const python = pythonExecutable();
 const ARTIFACTS = ['active.db', 'active.db-journal', 'active.db-wal', 'active.db-shm',
   'active.json.source', 'active.json.pre-sqlite.bak', 'active.json.barrier.tmp'] as const;
 // Every known registry operation, in --list-ops order. A new operation must join this table.
-const OPERATIONS = ['archive-sidecars', 'begin-delivery', 'check-dedup', 'get', 'list', 'migrate',
+const OPERATIONS = ['archive-sidecars', 'begin-delivery', 'check-dedup', 'get', 'init-store', 'list', 'migrate',
   'observe', 'prune', 'set-gate', 'set-lifecycle', 'set-transport-result', 'snapshot'] as const;
 // Diagnostic siblings a refusal may touch; neither is registry data or authority.
 const DIAGNOSTIC = new Set(['state/registry-health.log', 'state/active.json.lock']);
@@ -182,6 +182,7 @@ function operationArgs(f: Fixture, op: typeof OPERATIONS[number]): string[] {
     case 'begin-delivery': return [op, '--sid', 'transition-probe', '--ref-hash', 'probe-hash', '--now', NOW];
     case 'check-dedup': return [op, '--sid', 'lock-fixture', '--ref-hash', 'fixture-hash'];
     case 'get': return [op, '--sid', 'lock-fixture'];
+    case 'init-store': return [op];
     case 'list': return [op, '--fields', 'assigned.sid,lifecycle.state'];
     case 'migrate': return [op, '--now', NOW];
     case 'observe': return [op, '--sid', 'lock-fixture', '--kind', 'transition_probe', '--now', NOW];
