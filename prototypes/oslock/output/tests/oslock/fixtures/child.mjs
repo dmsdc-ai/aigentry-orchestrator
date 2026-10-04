@@ -115,21 +115,27 @@ const roles = {
   // close (or not) and exit. The grandchild reports only through its nonce-bound channel file
   // (args.channel), never through stdio, so the test does not depend on our pipes outliving
   // this process on any platform.
+  // Windows only: detached:true keeps the grandchild out of libuv's per-parent
+  // KILL_ON_JOB_CLOSE job, which otherwise ends it when this process exits (fixture lifetime
+  // only; CreateProcessW still passes bInheritHandles=TRUE, so handle inheritance is unchanged).
+  // POSIX keeps the original options with no detached key. The exact options are reported.
   async "hold-spawn"() {
     const addon = await loadAddon();
     const h = lockNow(addon, args.carrier, 5000);
+    const spawnOptions = process.platform === "win32" ? { stdio: "inherit", detached: true } : { stdio: "inherit" };
+    const reported = { ...spawnOptions };
     const g = spawn(
       process.execPath,
       [fileURLToPath(import.meta.url), "grandchild", JSON.stringify({
         nonce: args.nonce, channel: args.channel, carrier: args.carrier, control: args.control, selfLimitMs: args.grandLimitMs,
       })],
-      { stdio: "inherit" },
+      spawnOptions,
     );
     await new Promise((resolve, reject) => {
       g.once("spawn", resolve);
       g.once("error", reject);
     });
-    emit({ type: "spawned", gpid: g.pid, nonce: args.nonce });
+    emit({ type: "spawned", gpid: g.pid, nonce: args.nonce, spawnOptions: reported });
     if (args.closeFirst) addon.close(h);
     // The grandchild keeps running; the test tracks it through its channel file.
     process.exit(0);
@@ -151,7 +157,8 @@ const roles = {
         h = lockNow(addon, args.carrier, 5000);
         note({ type: "locked" });
       }
-      if (args.control !== "no-ready") note({ type: "ready" });
+      // selfOpened: whether this grandchild opened the carrier itself (only control "lock").
+      if (args.control !== "no-ready") note({ type: "ready", selfOpened: h !== undefined });
       let seq = 0;
       const how = await new Promise((resolve) => {
         const requested = (suffix) => {

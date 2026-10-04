@@ -11,7 +11,7 @@ name: oslock prototype 3OS build+test (isolated, #1166)
 
 on:
   push:
-    branches: [ 'validate/1166-oslock-prototype-20261004' ]
+    branches: [ 'validate/1166-p6-native-20261004' ]
     paths:
       - 'prototypes/oslock/**'
       - '.github/workflows/oslock-prototype.yml'
@@ -90,5 +90,87 @@ jobs:
             ${{ runner.temp }}/oslock-ci/run-2.tap
             ${{ runner.temp }}/oslock-ci/run-2.stderr.log
             ${{ runner.temp }}/oslock-ci/run-2-results.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # Windows-only inherited-handle control. A disposable OWNED copy outside the clone gets
+  # oslock.c sa.bInheritHandle FALSE->TRUE plus only the matching oslock.c pins in its copied
+  # driver and suite (so C0 passes and P6 runs); committed inputs and the legs above are untouched.
+  # The same driver/suite runs twice in all mode with its unchanged deadlines. The mutant suite
+  # is EXPECTED to fail: run steps only record its non-zero exit (a zero exit fails the step) and
+  # the check step passes only if both runs fail P6 close and noclose on the inherited-handle
+  # assertions; any other outcome fails the job. Not a product or release gate.
+  windows-inherit-mutation:
+    name: oslock P6 inherited-handle mutation control (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+        working-directory: prototypes/oslock
+    steps:
+      - name: Check out committed bytes without EOL conversion
+        working-directory: .
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.2'
+      - name: Install locked CI build tool (toolchain/package-lock.json)
+        id: toolchain
+        timeout-minutes: 3
+        working-directory: prototypes/oslock/toolchain
+        run: npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org/
+      - name: Prepare owned mutant copy (FALSE->TRUE + oslock.c pins only)
+        id: prepare
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        timeout-minutes: 2
+        run: node ci/oslock-inheritance-control.mjs prepare --mut "$RUNNER_TEMP/oslock-mut" --out "$RUNNER_TEMP/oslock-mut-ci"
+      - name: Build mutant addon (copied driver, locked node-gyp copy, owned scratch)
+        id: build
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        timeout-minutes: 8
+        run: node "$RUNNER_TEMP/oslock-mut/ci/oslock-build.mjs" build --expect-node v20.20.2 --out "$RUNNER_TEMP/oslock-mut-ci"
+      - name: Mutant test run 1 (OSLOCK_SUITE=all, expected non-zero, recorded)
+        id: test1
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 5
+        run: node ci/oslock-inheritance-control.mjs run --run 1 --mut "$RUNNER_TEMP/oslock-mut" --out "$RUNNER_TEMP/oslock-mut-ci"
+      - name: Mutant test run 2 (OSLOCK_SUITE=all, expected non-zero, recorded)
+        id: test2
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 5
+        run: node ci/oslock-inheritance-control.mjs run --run 2 --mut "$RUNNER_TEMP/oslock-mut" --out "$RUNNER_TEMP/oslock-mut-ci"
+      - name: Check P6 inherited-handle oracle (both runs)
+        id: check
+        if: ${{ !cancelled() && steps.prepare.outcome != 'skipped' }}
+        timeout-minutes: 2
+        run: node ci/oslock-inheritance-control.mjs check --out "$RUNNER_TEMP/oslock-mut-ci"
+      # Only these enumerated control/harness outputs; sources, mutant copy and workspace are never uploaded.
+      - name: Upload mutation control evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oslock-inherit-mutation-windows-latest
+          path: |
+            ${{ runner.temp }}/oslock-mut-ci/control-prepare.json
+            ${{ runner.temp }}/oslock-mut-ci/build-receipt.json
+            ${{ runner.temp }}/oslock-mut-ci/build.log
+            ${{ runner.temp }}/oslock-mut-ci/manifest.json
+            ${{ runner.temp }}/oslock-mut-ci/control-run-1.json
+            ${{ runner.temp }}/oslock-mut-ci/run-1-receipt.json
+            ${{ runner.temp }}/oslock-mut-ci/run-1.tap
+            ${{ runner.temp }}/oslock-mut-ci/run-1.stderr.log
+            ${{ runner.temp }}/oslock-mut-ci/run-1-results.json
+            ${{ runner.temp }}/oslock-mut-ci/control-run-2.json
+            ${{ runner.temp }}/oslock-mut-ci/run-2-receipt.json
+            ${{ runner.temp }}/oslock-mut-ci/run-2.tap
+            ${{ runner.temp }}/oslock-mut-ci/run-2.stderr.log
+            ${{ runner.temp }}/oslock-mut-ci/run-2-results.json
+            ${{ runner.temp }}/oslock-mut-ci/control-verdict.json
           if-no-files-found: error
           retention-days: 7

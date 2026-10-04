@@ -377,13 +377,17 @@ async function stopGrandchild(g) {
 }
 
 // P6 parent: locks the carrier, spawns the grandchild (with args.control, if any), exits.
+// Effective grandchild spawn options are asserted exactly: Windows {stdio:"inherit",
+// detached:true} (fixture lifetime only, see child.mjs), POSIX the original {stdio:"inherit"}.
+const P6_SPAWN_OPTIONS = WIN ? { stdio: "inherit", detached: true } : { stdio: "inherit" };
 async function spawnHoldSpawn(c, closeFirst, control) {
   const nonce = randomUUID();
   const channel = join(dirname(c), `g-${nonce}.jsonl`);
   const a = spawnChild("hold-spawn", { carrier: c, nonce, channel, closeFirst, control, grandLimitMs: 15_000 }, { limitMs: 10_000 });
   const spawned = await a.waitFor((m) => m.type === "spawned" && m.nonce === nonce);
-  const g = { pid: spawned.gpid, nonce, channel, done: false };
+  const g = { pid: spawned.gpid, nonce, channel, done: false, spawnOptions: spawned.spawnOptions };
   ownedGrandchildren.push(g);
+  assert.deepStrictEqual(spawned.spawnOptions, P6_SPAWN_OPTIONS, "effective grandchild spawn options");
   return { a, g };
 }
 
@@ -1201,8 +1205,9 @@ if (FOCUSED) {
         let acquiredMs;
         let renameWhileAlive;
         let exitBeforeChecks;
+        let ready;
         try {
-          await waitChannel(g, (m) => m.type === "ready", 10_000, "ready");
+          ready = await waitChannel(g, (m) => m.type === "ready", 10_000, "ready");
           const ex = await a.exited;
           assert.equal(ex.code, 0);
           // The exact nonce-bound grandchild is alive after the parent was reaped...
@@ -1217,8 +1222,10 @@ if (FOCUSED) {
         } finally {
           // Cleanup first (also on failure), then assert.
           await stopGrandchild(g);
-          record(`P6-${closeFirst ? "close" : "noclose"}`, { acquiredMs, renameWhileAlive, grandchildPid: g.pid, cleanup: g.cleanup });
+          record(`P6-${closeFirst ? "close" : "noclose"}`, { acquiredMs, renameWhileAlive, grandchildPid: g.pid, spawnOptions: g.spawnOptions, selfOpened: ready?.selfOpened, cleanup: g.cleanup });
         }
+        // The grandchild never opened the carrier itself, so any handle it holds is inherited.
+        assert.equal(ready.selfOpened, false, "grandchild did not open the carrier itself");
         assert.equal(exitBeforeChecks, false, "grandchild still running");
         assert.notEqual(acquiredMs, null, "another process acquired while the grandchild still ran");
         assert.equal(renameWhileAlive, "ok", "no handle inherited by the grandchild");
@@ -1266,8 +1273,9 @@ if (FOCUSED) {
         const { a, g } = await spawnHoldSpawn(c, true, "lock");
         let acquiredMs;
         let renameWhileAlive;
+        let ready;
         try {
-          await waitChannel(g, (m) => m.type === "ready", 10_000, "ready");
+          ready = await waitChannel(g, (m) => m.type === "ready", 10_000, "ready");
           await a.exited;
           await beatAfter(g);
           acquiredMs = acquireDelay(c, 1000);
@@ -1276,6 +1284,7 @@ if (FOCUSED) {
         } finally {
           await stopGrandchild(g);
         }
+        assert.equal(ready.selfOpened, true, "lock control opened the carrier itself");
         assert.equal(acquiredMs, null, "grandchild-held lock detected");
         if (WIN) assert.ok(WIN_SHARE_DENIAL.includes(renameWhileAlive), `grandchild-held handle denies rename: ${renameWhileAlive}`);
         else assert.equal(renameWhileAlive, "ok"); // POSIX rename is not a handle detector
