@@ -131,6 +131,32 @@ def registry_path() -> str:
     return os.path.join(state_dir(), "active.json")
 
 
+# SQLite transition artifacts. The JSON backend must never run beside one: it
+# would read an empty registry and publish a fresh active.json next to the
+# SQLite state (#1167). Fixed literals only; nothing here is removed or opened.
+TRANSITION_ARTIFACTS = ("active.db", "active.db-journal", "active.db-wal", "active.db-shm",
+                        "active.json.source", "active.json.pre-sqlite.bak",
+                        "active.json.barrier.tmp")
+
+
+def refuse_transition_artifacts() -> None:
+    """Fail closed if any transition artifact exists, of any type. lstat never
+    follows links, so a dangling symlink counts as present; only
+    FileNotFoundError means absent, and any other OSError refuses too."""
+    directory = state_dir()
+    for name in TRANSITION_ARTIFACTS:
+        path = os.path.join(directory, name)
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise RegistryError("registry_unavailable",
+                                f"cannot inspect transition artifact {path}: {exc}") from exc
+        raise RegistryError("registry_unavailable",
+                            f"SQLite transition artifact present at {path}; JSON registry refused")
+
+
 def now_iso(explicit: str | None = None) -> str:
     if explicit:
         return explicit
@@ -209,6 +235,8 @@ class _Lock:
                     time.sleep(min(0.05, remaining))
                 else:
                     self.acquired = True
+                    # Artifacts may have appeared while this writer waited.
+                    refuse_transition_artifacts()
                     return self
         except BaseException as exc:
             self.__exit__(*sys.exc_info())
@@ -922,6 +950,7 @@ def parse(argv: list[str]) -> tuple[str, dict]:
 def main(argv: list[str]) -> int:
     try:
         op, args = parse(argv)
+        refuse_transition_artifacts()
         return OPS[op][0](args)
     except RegistryError as exc:
         if exc.result in ("registry_corrupt", "registry_unavailable", "registry_write_failed"):
