@@ -13,6 +13,9 @@
  *   - the helper architecture locator (resolved from the MEASURED
  *     `process.arch`; the prior arm64 binary is not supplied and is never
  *     assumed).
+ * at1161aaj adds two chain cases (12 -> 14): the real CLI -> store refusal chain
+ * against the EMPTY catalog, and a pure matcher probe over the CLI-measured facts
+ * with one in-memory, gate-less record that cannot qualify.
  *
  * WHY IT EXISTS
  * -------------
@@ -62,7 +65,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -100,6 +103,7 @@ const OWN_TARGET = path.join(OWN_ROOT, 'probe-target'); // the one NEW directory
 const OWN_HOME = path.join(OWN_ROOT, 'home');           // child HOME, never the user's
 const OWN_TMP = path.join(OWN_ROOT, 'tmp');             // child TMPDIR
 const OWN_EVIDENCE = path.join(OWN_ROOT, 'evidence');
+const OWN_WS = path.join(OWN_ROOT, 'ws');               // CLI-chain workspace; no queue file
 
 /**
  * The manifest addresses the bundle as `input/package/...`; CI stages it here.
@@ -128,6 +132,8 @@ const PROBE_TIMEOUT_MS = 10_000;
 const PROBE_MAX_OUTPUT_BYTES = 8 * 1024;
 const TEXT_CAP = 2_000;
 const MAX_FIXTURE_LEAVES = 4_096;
+const CLI_TIMEOUT_MS = 15_000;
+const CLI_MAX_OUTPUT_BYTES = 64 * 1024;
 
 /** The inherited ceilings, restated so this file asserts against a literal. */
 const MAX_WALL_MS = 3_000;
@@ -242,6 +248,8 @@ const evidence = {
   costObserved: null,
   contentReadLimit: null,
   discrimination: null,
+  cliChain: null,
+  matcherProbe: null,
   fixtureIntegrity: null,
   qualification: 'NOT QUALIFIED — measurement observation only, per DISPATCH.',
 };
@@ -249,6 +257,8 @@ const evidence = {
 /** Set by the staging/build tests and consumed by the observation tests. */
 let helperFile = null;
 let adapter = null;
+/** Runtime facts exactly as the real CLI `status` emitted them; consumed by the matcher probe. */
+let cliMeasured = null;
 
 /* --------------------------------------------------------------------- tests */
 
@@ -359,12 +369,20 @@ test('[CI] immutable fixture bundle matches the supplied manifest', () => {
     + 'This is a staging mismatch, not a bundle defect — check which manifest was staged.',
   );
 
-  // The four leaves this observation cannot proceed without.
+  // The leaves this observation cannot proceed without. The last seven are the
+  // real CLI -> store -> matcher chain the two chain cases below execute.
   for (const required of [
     'package.json',
     'scripts/build-advisor-storage.mjs',
     'native/task-advisor-storage/darwin.c',
     'dist/src/task-advisor/storage-provenance.js',
+    'dist/src/task-advisor/cli.js',
+    'dist/src/task-advisor/store.js',
+    'dist/src/task-advisor/qualification.js',
+    'dist/src/task-advisor/qualification-catalog.js',
+    'dist/src/task-advisor/host.js',
+    'dist/src/task-advisor/analyze.js',
+    'dist/src/task-advisor/contracts.js',
   ]) {
     assert.ok(checked.includes(required), `required bundle leaf not verified: ${required}`);
   }
@@ -761,6 +779,357 @@ test('[CI] observation is classified against the prior NULL result (no qualifica
   }
 });
 
+/* ---------------------------------------- real CLI -> store -> matcher chain */
+
+// Both cases below run against the owned COPY only, in a workspace that has a
+// `state/` directory and nothing else (no queue file). With the shipped catalog
+// EMPTY every writer must refuse at `requireQualifiedStorage` (store.js), before
+// `mkdir` of `state/task-advisor` and before any database file exists; `start`
+// probes that same writer before its detached spawn (host.js ensureHost). These
+// cases record that refusal chain as evidence. They qualify nothing.
+
+const CLI_ADVISOR_ROOT = path.join(OWN_WS, 'state', 'task-advisor');
+
+/** One owned CLI child: no shell, owned env/cwd, bounded output and time. */
+function runCli(args) {
+  const cli = path.join(OWN_PACKAGE, 'dist', 'src', 'task-advisor', 'cli.js');
+  const started = performance.now();
+  const result = spawnSync(process.execPath, [cli, ...args], {
+    cwd: OWN_TMP,
+    timeout: CLI_TIMEOUT_MS,
+    maxBuffer: CLI_MAX_OUTPUT_BYTES,
+    encoding: 'utf8',
+    shell: false,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { PATH: process.env.PATH ?? '', HOME: OWN_HOME, TMPDIR: OWN_TMP },
+  });
+  const wallMs = Math.round(performance.now() - started);
+  let json = null;
+  let parseError = null;
+  try {
+    json = JSON.parse(typeof result.stdout === 'string' ? result.stdout : '');
+  } catch (error) {
+    parseError = scrub(String(error.message));
+  }
+  return {
+    argv: args.map((arg) => scrub(arg)),
+    status: result.status,
+    signal: result.signal,
+    error: result.error ? String(result.error.message) : null,
+    wallMs,
+    json,
+    parseError,
+    stderr: scrub(typeof result.stderr === 'string' ? result.stderr.trim() : ''),
+  };
+}
+
+/** True only when nothing exists at `state/task-advisor` (no file, dir or link). */
+function advisorRootAbsent() {
+  try {
+    fs.lstatSync(CLI_ADVISOR_ROOT);
+    return false;
+  } catch (error) {
+    if (error.code === 'ENOENT') return true;
+    throw error;
+  }
+}
+
+test('[REAL] CLI chain: status reports the empty catalog; enable x2, tick and start refuse durability-unverified', async () => {
+  const qualification = await import(pathToFileURL(path.join(OWN_PACKAGE, 'dist', 'src', 'task-advisor', 'qualification.js')).href);
+  const catalog = await import(pathToFileURL(path.join(OWN_PACKAGE, 'dist', 'src', 'task-advisor', 'qualification-catalog.js')).href);
+  const stateDir = path.join(OWN_WS, 'state');
+
+  fs.rmSync(OWN_WS, { recursive: true, force: true });
+  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  assert.ok(OWN_WS.startsWith(RUNNER_TEMP), 'the CLI workspace must be owned under RUNNER_TEMP');
+  assert.equal(advisorRootAbsent(), true);
+
+  evidence.cliChain = {
+    workspace: '$RUNNER_TEMP/advisor-darwin-observation/ws',
+    queueFile: 'absent by construction',
+    commandShape: 'node <OWN_PACKAGE>/dist/src/task-advisor/cli.js <cmd> --workspace <ws> --json; shell:false, env PATH/HOME/TMPDIR owned',
+    sourceCatalog: {
+      size: catalog.QUALIFICATION_CATALOG.length,
+      revision: catalog.QUALIFICATION_CATALOG_REVISION,
+      leafSha256: sha256File(path.join(OWN_PACKAGE, 'dist', 'src', 'task-advisor', 'qualification-catalog.js')),
+    },
+    status: null,
+    refusals: [],
+    enableRepeatIdentical: null,
+    tickWallMs: null,
+    startRefusedBeforeSpawnBasis: null,
+  };
+  assert.equal(catalog.QUALIFICATION_CATALOG.length, 0, 'the shipped catalog must be EMPTY for this chain');
+  assert.equal(catalog.QUALIFICATION_CATALOG_REVISION, 0);
+
+  // 1. status — read-only; must establish the empty-catalog refusal before any writer runs.
+  const status = runCli(['status', '--workspace', OWN_WS, '--json']);
+  const s = status.json ?? {};
+  const capability = s.capability ?? {};
+  const q = capability.qualification ?? {};
+  const measured = q.measured ?? {};
+  const provenance = capability.storageProvenance ?? {};
+  const direct = evidence.measured ?? {};
+  evidence.cliChain.status = {
+    exit: status.status,
+    signal: status.signal,
+    error: status.error,
+    wallMs: status.wallMs,
+    parseError: status.parseError,
+    stderr: status.stderr,
+    revision: s.revision ?? null,
+    reason: s.reason ?? null,
+    effective: s.effective ?? null,
+    desired: s.desired ?? null,
+    storeHealth: s.storeHealth ?? null,
+    queueIssue: s.queueIssue ?? null,
+    substrate: capability.substrate ?? null,
+    durability: capability.durability ?? null,
+    catalogRevision: capability.catalogRevision ?? null,
+    qualificationStatus: q.status ?? null,
+    qualificationReason: q.reason ?? null,
+    missingGateCount: Array.isArray(q.missingGates) ? q.missingGates.length : null,
+    recordId: q.recordId === undefined ? 'ABSENT' : q.recordId,
+    catalogSize: q.catalogSize ?? null,
+    measuredRuntime: {
+      nodeVersion: measured.nodeVersion ?? null,
+      bundledSqliteVersion: measured.bundledSqliteVersion ?? null,
+      sqliteModuleAvailable: measured.sqliteModuleAvailable ?? null,
+      platform: measured.platform ?? null,
+      arch: measured.arch ?? null,
+      osRelease: measured.osRelease ?? null,
+      filesystemType: measured.filesystemType ?? null,
+      storagePathIsWsState: measured.storagePath === stateDir,
+    },
+    provenance: {
+      classification: provenance.classification ?? null,
+      reason: provenance.reason ?? null,
+      adapter: provenance.adapter ?? null,
+      volumeBinding: provenance.volumeBinding ?? null,
+      volumeIdentityDigestPrefix: provenance.volumeIdentity === undefined ? null : String(provenance.volumeIdentity).slice(0, 12),
+      targetPathIsWsState: provenance.targetPath === stateDir,
+      canonicalEqualsTarget: provenance.canonicalPath === provenance.targetPath,
+      cost: provenance.cost ?? null,
+    },
+    // Recorded, not asserted: two separate measurements of two different own directories.
+    comparedWithDirectMeasurement: {
+      classificationEqual: provenance.classification === direct.classification,
+      bindingEqual: provenance.volumeBinding === direct.volumeBinding,
+    },
+  };
+
+  assert.equal(status.error, null, 'the CLI could not be executed');
+  assert.equal(status.signal, null, 'the CLI status call was killed by a signal');
+  assert.equal(status.status, 0, 'status must exit 0 on the read-only diagnostic path');
+  assert.equal(status.parseError, null, 'status stdout must be one JSON result');
+  assert.equal(s.schemaVersion, 2);
+  assert.equal(s.revision, 0);
+  assert.equal(s.reason, 'durability-unverified');
+  assert.equal(s.effective, 'blocked');
+  assert.equal(capability.substrate, 'unavailable');
+  assert.equal(capability.durability, 'durability-unverified');
+  assert.equal(capability.catalogRevision, 0);
+  assert.equal(q.status, 'durability-unverified');
+  assert.equal(q.reason, 'no-reviewed-qualification-records');
+  assert.deepEqual(q.missingGates, [...qualification.QUALIFICATION_GATES]);
+  assert.equal(q.missingGates.length, 12);
+  assert.equal(q.recordId, null);
+  assert.equal(q.catalogSize, 0);
+  // Production-caller wiring: the facts the matcher saw are the facts reported, measured
+  // on the directory a fresh store would land on (`ws/state`, nearest existing ancestor).
+  assert.equal(measured.storagePath, stateDir, 'measured storagePath must be the owned ws/state');
+  assert.deepEqual(measured.provenance, provenance, 'capability provenance must be the matcher-measured provenance');
+  const checked = adapter.checkStorageProvenance(provenance);
+  assert.equal(checked.targetPath, stateDir, 'provenance targetPath must be the owned ws/state');
+  assert.equal(checked.adapter, 'darwin-diskarbitration');
+  assert.equal(checked.platform, 'darwin');
+  assert.equal(advisorRootAbsent(), true, 'status created state/task-advisor');
+  assert.deepEqual(fs.readdirSync(stateDir), [], 'status wrote into the owned ws/state');
+  cliMeasured = structuredClone(measured);
+
+  // 2. Writers. Reached only after status asserted the empty catalog above.
+  const requestId = randomUUID();
+  const expectRefusal = (label, args, expectedRequestId) => {
+    const run = runCli(args);
+    const absentAfter = advisorRootAbsent();
+    const stateEntries = fs.readdirSync(stateDir);
+    evidence.cliChain.refusals.push({
+      command: label,
+      exit: run.status,
+      signal: run.signal,
+      error: run.error,
+      wallMs: run.wallMs,
+      parseError: run.parseError,
+      result: run.json,
+      stderr: run.stderr,
+      taskAdvisorAbsentAfter: absentAfter,
+      stateEntriesAfter: stateEntries.length,
+    });
+    assert.equal(run.error, null, `${label}: the CLI could not be executed`);
+    assert.equal(run.signal, null, `${label}: killed by a signal`);
+    assert.equal(run.parseError, null, `${label}: stdout must be one JSON result`);
+    assert.notEqual(run.json.reason, 'tick-timeout', `${label}: tick-timeout (exit 2) is a defect, not an accepted refusal`);
+    assert.equal(run.status, 4, `${label}: must exit 4`);
+    assert.deepEqual(run.json, {
+      schemaVersion: 2, requestId: expectedRequestId, outcome: 'unavailable', revision: 0, reason: 'durability-unverified',
+    }, `${label}: must refuse unavailable/durability-unverified`);
+    assert.equal(absentAfter, true, `${label}: state/task-advisor must not exist`);
+    assert.deepEqual(stateEntries, [], `${label}: nothing may be written under ws/state`);
+    return run;
+  };
+
+  const enableArgs = ['enable', '--workspace', OWN_WS, '--if-revision', '0', '--request-id', requestId, '--json'];
+  const first = expectRefusal('enable#1', enableArgs, requestId);
+  const second = expectRefusal('enable#2 (same request-id and revision)', enableArgs, requestId);
+  evidence.cliChain.enableRepeatIdentical = first.status === second.status
+    && JSON.stringify(first.json) === JSON.stringify(second.json);
+  assert.equal(evidence.cliChain.enableRepeatIdentical, true, 'the enable refusal must repeat identically');
+
+  const tick = expectRefusal('tick --trigger manual', ['tick', '--workspace', OWN_WS, '--trigger', 'manual', '--json'], null);
+  evidence.cliChain.tickWallMs = tick.wallMs;
+
+  expectRefusal('start', ['start', '--workspace', OWN_WS, '--json'], null);
+  // No process probe is taken. The basis is source + measured result: host.js ensureHost
+  // opens the writer before spawn, and every post-spawn result has a host-* reason.
+  evidence.cliChain.startRefusedBeforeSpawnBasis =
+    'exit 4 with reason durability-unverified (writer probe at host.js ensureHost precedes the detached spawn; '
+    + 'post-spawn outcomes would carry host-running/host-start-*/host-unavailable) and state/task-advisor absent';
+});
+
+test('[REAL] matcher probe: CLI-measured facts + one in-memory gate-less record never qualify', async () => {
+  const qualification = await import(pathToFileURL(path.join(OWN_PACKAGE, 'dist', 'src', 'task-advisor', 'qualification.js')).href);
+  const contracts = await import(pathToFileURL(path.join(OWN_PACKAGE, 'dist', 'src', 'task-advisor', 'contracts.js')).href);
+  const catalog = await import(pathToFileURL(path.join(OWN_PACKAGE, 'dist', 'src', 'task-advisor', 'qualification-catalog.js')).href);
+  const catalogLeaf = path.join(OWN_PACKAGE, 'dist', 'src', 'task-advisor', 'qualification-catalog.js');
+  const catalogLeafBefore = sha256File(catalogLeaf);
+
+  evidence.matcherProbe = { factsSource: 'cli status capability.qualification.measured (unedited)', result: null };
+
+  // A missing runtime measurement is a FAIL, never a substituted value.
+  assert.notEqual(cliMeasured, null, 'no CLI-measured facts: the CLI chain did not produce a measurement');
+  const facts = cliMeasured;
+  const factsBefore = JSON.stringify(facts);
+  assert.equal(facts.nodeVersion, REQUIRED_NODE);
+  assert.equal(facts.platform, 'darwin');
+  assert.equal(facts.arch, process.arch);
+  assert.equal(facts.sqliteModuleAvailable, true, 'bundled node:sqlite must be measured available');
+  assert.ok(typeof facts.bundledSqliteVersion === 'string' && /^\d+\.\d+\.\d+(\.\d+)?$/.test(facts.bundledSqliteVersion),
+    'bundled SQLite version must be measured');
+  assert.equal(typeof facts.osRelease, 'string');
+  assert.equal(typeof facts.filesystemType, 'string');
+  const prov = adapter.checkStorageProvenance(facts.provenance);
+  // Same-call wiring facts; a contradiction here is a wiring defect, not a measured refusal.
+  assert.equal(prov.targetPath, facts.storagePath);
+  assert.equal(prov.canonicalPath, prov.targetPath);
+  assert.equal(prov.filesystemType, facts.filesystemType);
+  assert.equal(prov.platform, facts.platform);
+  assert.equal(prov.arch, facts.arch);
+  assert.equal(prov.osRelease, facts.osRelease);
+  assert.equal(prov.adapterVersion, adapter.STORAGE_PROVENANCE_ADAPTER_VERSION);
+  assert.equal(prov.adapter, 'darwin-diskarbitration');
+
+  // In memory only: never written to disk, never placed in the catalog. Mirrors the
+  // measured runtime/platform/fs and carries NO gates, so it is structurally unable to
+  // qualify. The single evidence row exists only because the record shape requires one.
+  const now = new Date().toISOString();
+  const zero = '0'.repeat(64);
+  const record = {
+    schemaVersion: 1,
+    recordId: 'SYNTHETIC-at1161aaj-in-memory-matcher-probe-never-catalogued',
+    reviewedAt: now,
+    runtime: {
+      nodeVersion: facts.nodeVersion,
+      nodeArtifactDigest: zero,
+      bundledSqliteVersion: facts.bundledSqliteVersion,
+      sqliteLibraryVersion: facts.bundledSqliteVersion,
+      sqliteCompileOptionsDigest: zero,
+    },
+    platform: { platform: facts.platform, arch: facts.arch, osReleasePrefixes: [facts.osRelease] },
+    storage: {
+      profile: 'synthetic-matcher-probe',
+      filesystemTypes: [facts.filesystemType],
+      networkOrRemovable: false,
+      provenance: 'local-fixed',
+      provenanceAdapters: ['darwin-diskarbitration'],
+    },
+    buildEnvelope: { ...contracts.BUILD_ENVELOPE, maxStoreBytes: contracts.LIMITS.storeBytes },
+    gates: {},
+    evidence: [{ id: 'synthetic-none', kind: 'measurement-report', digest: zero, observedAt: now }],
+    attests: ['NOTHING: synthetic in-memory matcher probe with no gates'],
+    doesNotAttest: ['any qualification gate, durability property or production write'],
+  };
+  qualification.checkQualificationRecord(record);
+  assert.deepEqual(Object.keys(record.gates), [], 'the probe record must carry no gates');
+
+  const result = qualification.matchQualification(facts, [record]);
+
+  // Independent expectation, derived from the measured facts by the matcher's own order.
+  const budget = adapter.storageProvenanceBudgetRefusal(prov);
+  let expectedReason;
+  let route;
+  if (budget !== null) {
+    expectedReason = budget;
+    route = 'measured-refusal:budget';
+  } else if (prov.classification !== 'local-fixed') {
+    expectedReason = prov.reason.startsWith('storage-provenance-') ? prov.reason
+      : prov.classification === 'unknown' ? 'storage-provenance-unknown' : 'storage-provenance-' + prov.classification;
+    route = 'measured-refusal:classification';
+  } else if (prov.volumeBinding === 'node-only') {
+    expectedReason = 'storage-provenance-insufficient-binding';
+    route = 'measured-refusal:binding';
+  } else if (prov.volumeBinding === 'helper-confirmed') {
+    expectedReason = 'required-gates-unproven';
+    route = 'helper-confirmed-local-fixed-within-budget';
+  } else {
+    expectedReason = null;
+    route = 'UNEXPECTED binding for a Darwin local-fixed measurement';
+  }
+
+  evidence.matcherProbe.result = {
+    path: route,
+    measuredClassification: prov.classification,
+    measuredReason: prov.reason,
+    measuredBinding: prov.volumeBinding,
+    budgetRefusal: budget,
+    status: result.status,
+    reason: result.reason,
+    expectedReason,
+    missingGateCount: result.missingGates.length,
+    recordId: result.recordId,
+    catalogSize: result.catalogSize,
+    probeRecordId: record.recordId,
+    probeRecordSha256: createHash('sha256').update(JSON.stringify(record)).digest('hex'),
+  };
+
+  assert.notEqual(result.status, 'qualified', 'a gate-less record must never qualify');
+  assert.equal(result.recordId, null);
+  assert.equal(result.status, 'durability-unverified');
+  assert.notEqual(expectedReason, null, route);
+  assert.equal(result.reason, expectedReason, 'the matcher reason must equal the source-derived expectation');
+  if (expectedReason === 'required-gates-unproven') {
+    assert.deepEqual(result.missingGates, [...qualification.QUALIFICATION_GATES]);
+  } else {
+    // Measured refusals the Darwin adapter or the matcher's own classification
+    // passthrough can emit (storage-provenance.js observeDarwin/measureStorageProvenance,
+    // qualification.js provenanceRefusal). Anything else is not an accepted outcome.
+    const MEASURED_REFUSALS = [
+      'storage-provenance-helper-absent', 'storage-provenance-helper-unusable',
+      'storage-provenance-unbound-volume', 'storage-provenance-volume-mismatch',
+      'storage-provenance-removable', 'storage-provenance-network', 'storage-provenance-undetermined',
+      'storage-provenance-target-changed', 'storage-provenance-time-limit', 'storage-provenance-byte-limit',
+      'storage-provenance-unmeasurable', 'storage-provenance-unknown', 'storage-provenance-insufficient-binding',
+    ];
+    assert.ok(MEASURED_REFUSALS.includes(result.reason), `unenumerated refusal reason: ${result.reason}`);
+    assert.equal(result.missingGates.length, 12);
+  }
+
+  // Pure: no fact edited, no catalog leaf or export changed, no store state created.
+  assert.equal(JSON.stringify(facts), factsBefore, 'the matcher must not edit the measured facts');
+  assert.equal(sha256File(catalogLeaf), catalogLeafBefore, 'the catalog leaf changed');
+  assert.equal(catalog.QUALIFICATION_CATALOG.length, 0, 'the shipped catalog must remain EMPTY');
+  assert.equal(advisorRootAbsent(), true, 'state/task-advisor must not exist after the probe');
+});
+
 test('[CI] the immutable fixture is byte-identical after the run', () => {
   assert.notEqual(evidence.fixtureIntegrity, null, 'no before-snapshot was taken');
   const after = snapshot(FIXTURE_ROOT);
@@ -791,6 +1160,7 @@ test.after(() => {
     ['stage', 'copy'], ['build', 'build'], ['api', 'api'], ['helper', 'helper'],
     ['measured', 'measure'], ['refusals', 'refusals'], ['costObserved', 'cost'],
     ['contentReadLimit', 'canary'], ['discrimination', 'discrimination'],
+    ['cliChain', 'cliChain'], ['matcherProbe', 'matcherProbe'],
   ];
   const unrecorded = STAGES.filter(([key]) => evidence[key] === null || evidence[key] === undefined).map(([, label]) => label);
   const integrity = evidence.fixtureIntegrity;
@@ -835,6 +1205,9 @@ test.after(() => {
 
   const d = evidence.discrimination;
   const c = evidence.runCompleteness;
+  const cs = evidence.cliChain ? evidence.cliChain.status : null;
+  const cr = evidence.cliChain ? evidence.cliChain.refusals : [];
+  const mp = evidence.matcherProbe ? evidence.matcherProbe.result : null;
   writeCheckedArtifact(
     path.join(OWN_EVIDENCE, 'summary.md'),
     [
@@ -859,6 +1232,9 @@ test.after(() => {
       `| positive measurement | ${d ? String(d.positiveMeasurement) : 'NOT REACHED'} |`,
       `| mixed observation | ${d ? String(d.mixedObservation) : 'NOT REACHED'} |`,
       `| discriminates prior NULL | ${d ? d.discriminatesPriorNull : 'NOT REACHED'} |`,
+      `| CLI status | ${cs ? `exit ${cs.exit} / ${cs.reason} / effective ${cs.effective} / catalogSize ${cs.catalogSize} / missing ${cs.missingGateCount}` : 'NOT REACHED'} |`,
+      `| CLI writer refusals | ${cr.length ? cr.map((r) => `${r.command}: exit ${r.exit} ${r.result ? r.result.reason : 'no-json'} (${r.wallMs} ms)`).join('; ') : 'NOT REACHED'} |`,
+      `| matcher probe | ${mp ? `${mp.status} / ${mp.reason} / missing ${mp.missingGateCount} (${mp.path})` : 'NOT REACHED'} |`,
       '',
       `**Observation data, not a job result.** ${c.caveat}`,
       '',
