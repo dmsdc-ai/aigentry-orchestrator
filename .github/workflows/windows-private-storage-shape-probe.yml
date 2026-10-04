@@ -1,0 +1,92 @@
+name: Windows private-storage return-shape probe (#1167, diagnostic only)
+
+# #1167 DIAGNOSTIC reproduction of ANALYSIS-rev2 section 4 on one disposable GitHub-hosted windows-latest runner, built-in
+# Windows PowerShell 5.1 only. tests/live-process-shape.probe.ps1 evaluates the AST-extracted, UNMODIFIED
+# Get-PspLiveSidProcesses (setup-fixtures.ps1:684-692) against script-local CIM mocks over fake objects and records
+# the observed return shape of the verbatim caller forms. No real CIM/WMI/process query, no accounts, no native build,
+# no node, no secrets, no publish, no PR trigger. The result is diagnostic evidence only: no product, release, test or
+# gate acceptance, and no waiver of any existing gate. Other workflows and all existing sources are untouched.
+
+on:
+  push:
+    branches: [ test/1167-private-shape-20261005 ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-private-storage-shape-probe-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  shape-probe:
+    name: Return-shape probe (Windows PowerShell 5.1, mocks only)
+    if: github.ref == 'refs/heads/test/1167-private-shape-20261005'
+    runs-on: windows-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Keep LF bytes and seed a FAILED placeholder probe receipt
+        run: |
+          set -euo pipefail
+          git config --global core.autocrlf false
+          mkdir -p "${RUNNER_TEMP}/psp1167-shape"
+          printf '%s\n' '{"schema":"aigentry/1167-psp-shape/v1","task":"1167","status":"FAILED","reason":"probe-not-reached","diagnosticOnly":true,"productAcceptance":false}' > "${RUNNER_TEMP}/psp1167-shape/shape-probe.json"
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Pins must match before anything from the tree executes
+        run: |
+          set -euo pipefail
+          echo "checked-out sha: ${GITHUB_SHA} ref: ${GITHUB_REF}"
+          [ "${GITHUB_REF}" = "refs/heads/test/1167-private-shape-20261005" ] || { echo "::error::unexpected ref ${GITHUB_REF}"; exit 1; }
+          FAIL=0
+          check() {
+            if [ ! -f "$2" ]; then echo "::error::$2 is missing"; FAIL=1; return 0; fi
+            ACTUAL="$(sha256sum -b < "$2" | cut -d" " -f1)"
+            if [ "${ACTUAL}" = "$1" ]; then echo "pin ok ${ACTUAL} $2"; else echo "::error::$2 sha256 ${ACTUAL} does not match pin $1"; FAIL=1; fi
+          }
+          # original sources (read only; the probe evaluates only the extracted function text)
+          check 002c2f8f4faeb0439737f0e73c926c2be266078eb28edbfed1436ff841c68de2 prototypes/windows-private-storage/tests/setup-fixtures.ps1
+          check b0de2104769f04809ad4df8cee0b802556bc48092000ef53528f383f1f0c09ee prototypes/windows-private-storage/tests/run-validation.ps1
+          # tester-owned probe
+          check 7665f7c41d23f33f973481086d712ea9babed0e930d8e0ef19111bd62fc84df2 prototypes/windows-private-storage/tests/live-process-shape.probe.ps1
+          echo "recorded $(sha256sum -b < .github/workflows/windows-private-storage-shape-probe.yml | cut -d" " -f1) .github/workflows/windows-private-storage-shape-probe.yml"
+          [ "${FAIL}" = "0" ] || exit 1
+
+      - name: Return-shape probe (in-memory mocks only)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PSModulePath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
+          $f = Join-Path $env:GITHUB_WORKSPACE 'prototypes\windows-private-storage\tests\live-process-shape.probe.ps1'
+          $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLowerInvariant()
+          if ($h -cne '7665f7c41d23f33f973481086d712ea9babed0e930d8e0ef19111bd62fc84df2') { Write-Output "::error::live-process-shape.probe.ps1 sha256 $h does not match pin"; exit 1 }
+          $dir = Join-Path $env:RUNNER_TEMP 'psp1167-shape'
+          $out = @(& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $f -OutPath (Join-Path $dir 'shape-probe.json'))
+          $code = $LASTEXITCODE
+          $text = @($out | ForEach-Object { [string]$_ }) -join "`n"
+          if ($text.Length -gt 200000) { $text = $text.Substring(0, 200000) + "`n[truncated]" }
+          [System.IO.File]::WriteAllText((Join-Path $dir 'shape-probe.stdout.txt'), $text, (New-Object System.Text.UTF8Encoding($false)))
+          Write-Output $text
+          Write-Output "probe exit code: $code (0 = full matrix ran with guards intact; the shape itself is in OUTCOME, diagnostic only)"
+          exit $code
+
+      - name: Upload probe diagnostics (owned files only)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: psp1167-shape-probe
+          path: |
+            ${{ runner.temp }}/psp1167-shape/shape-probe.json
+            ${{ runner.temp }}/psp1167-shape/shape-probe.stdout.txt
+          if-no-files-found: error
+          retention-days: 7
