@@ -17,11 +17,13 @@ import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 
 // Helper ABI taken from the independently authored candidate (wc1167abt, candidate-r1 manifest
-// 76e661ec...): README.md e2b1bfe0..., private-storage.mjs 3b222843... Load path: the wrapper's
-// loadPrivateStorage({binaryPath, sha256}) -> { status:'ok', api }; api functions are synchronous, never
-// throw, and return frozen { status, reason, win32Error, created?, volumeSerial?, fileId?, bytes? }.
+// 76e661ec...), bounded correction wc1167aca: README.md a1e1cd9f..., private-storage.mjs 76f7ab76...
+// Load path: the wrapper's loadPrivateStorage({binaryPath, sha256}) -> { status:'ok', api }; api functions
+// are synchronous, never throw, and return frozen { status, reason, win32Error, created?, volumeSerial?,
+// fileId?, bytes? }. On create results `created` is true, false or null (UNKNOWN); null never equals an
+// expected boolean below.
 export const ABI = Object.freeze({
-  confirmedBy: 'candidate-r1 README.md e2b1bfe00bb121a57857ef3fc362c3665ad1e59bffdc39922a46e3d0c8ab77fa + private-storage.mjs 3b2228432e8010ffc5c24ce1bb8f867bc7cd0a2aa71680ed30b3f65d72f06288',
+  confirmedBy: 'wc1167aca README.md a1e1cd9f957c0ed561da7e8c87ea341aafb524810e21874097ace70362c4fbcd + private-storage.mjs 76f7ab76f27e6f9d58f8df19499aab259a1cbdad8ac0d5089e01d7a05e77fc9f',
   abiTag: 'aigentry-private-storage-proto-1',
   exports: ['inspectDir', 'readPrivateFile', 'createPrivateDir', 'createPrivateFileExclusive'],
   statusField: 'status',
@@ -65,10 +67,22 @@ export function expectedHelperStatus(caseId, oracleCls) {
   return e && e.status ? e.status : oracleCls;
 }
 
+// Intended Win32 code per helper reason (README a1e1cd9f "win32Error" + C ps_set sites): predicate results
+// carry 0; not_found 2/3; already_exists 80/183; open_failed is ERROR_ACCESS_DENIED (directory leaf without
+// BACKUP_SEMANTICS, empty-DACL file). A reason without a documented code returns null => fail (HOLD).
+export const WIN32_BY_REASON = Object.freeze({ not_found: [2, 3], already_exists: [80, 183], open_failed: [5] });
+const PREDICATE_REASONS = ['ok', 'owner_mismatch', 'ace_foreign_allow', 'dacl_null', 'dacl_empty', 'dacl_not_protected', 'ace_unsupported',
+  'reparse_point', 'ancestor_reparse_point', 'not_directory', 'final_path_mismatch', 'path_grammar', 'link_count', 'acl_not_persistent'];
+export function expectedWin32(reason) {
+  if (Object.hasOwn(WIN32_BY_REASON, reason)) return WIN32_BY_REASON[reason];
+  return PREDICATE_REASONS.includes(reason) ? [0] : null;
+}
+
 const PHASE = process.env.PSP_PHASE || 'selfcheck';
 const ERROR_ACCESS_DENIED = 5;
 const DANGEROUS_PRIVILEGES = ['SeBackupPrivilege', 'SeRestorePrivilege', 'SeTakeOwnershipPrivilege', 'SeDebugPrivilege'];
 const SID_ADMINS = 'S-1-5-32-544';
+const SID_SYSTEM = 'S-1-5-18';
 
 // ------------------------------------------------------------------ independent oracle (pure)
 export const SID_ALIASES = Object.freeze({
@@ -271,6 +285,205 @@ export function normalizeResult(res) {
   };
 }
 
+// ------------------------------------------------------------------ verdict rules (pure; synthetic-tested)
+// R4: one helper result against its exact expectation, including the intended Win32 code. [] = pass.
+export function helperResultProblems(id, r, want) {
+  const e = CANDIDATE_EXPECT[id];
+  if (!e) return ['no candidate expectation'];
+  if (!r) return ['no helper result'];
+  if (r.threw) return ['helper threw'];
+  const x = r.result;
+  if (!x || !x.abiOk) return ['result outside ABI'];
+  const p = [];
+  if (x.status !== want) p.push(`status ${x.status}/${x.reason} != ${want}`);
+  if (!e.reasons.includes(x.reason)) p.push(`reason ${x.reason} not in [${e.reasons}]`);
+  const codes = expectedWin32(x.reason);
+  if (!codes) p.push(`reason ${x.reason} has no documented Win32 code (HOLD)`);
+  else if (!codes.includes(x.win32Error)) p.push(`win32Error ${x.win32Error} not in [${codes}] for ${x.reason}`);
+  if (typeof e.created === 'boolean' && x.created !== e.created) p.push(`created ${x.created} != ${e.created}`);
+  return p;
+}
+
+// R3/R5: a probe receipt comes from the expected runtime SID, ran exactly the planned operations, matched
+// every expected code, and carries its own positive controls (a child that denies everything fails).
+export function probeProblems(receipt, plan, { sid, selfIds = [], minDenials = 0 }) {
+  if (!receipt || receipt.ok !== true) return ['receipt missing or child failed'];
+  const p = [];
+  if (typeof sid !== 'string' || receipt.userSid !== sid) p.push(`runtime SID ${receipt.userSid} != ${sid}`);
+  const rs = asArray(receipt.results);
+  if (rs.length === 0) p.push('no operations recorded');
+  const want = asArray(plan).map((o) => `${o.id}:${o.expect}`).join('|');
+  if (rs.map((r) => `${r.id}:${r.expect}`).join('|') !== want) p.push('operations differ from the manifest plan');
+  for (const r of rs) if (r.code !== r.expect) p.push(`${r.id}: got ${r.code}, expected ${r.expect}`);
+  const denials = rs.filter((r) => r.expect !== 0);
+  if (denials.length < minDenials) p.push(`denial plan incomplete (${denials.length} < ${minDenials})`);
+  for (const r of denials) if (r.expect !== ERROR_ACCESS_DENIED) p.push(`${r.id}: expectation ${r.expect} is not ERROR_ACCESS_DENIED`);
+  for (const id of selfIds) if (!rs.some((r) => r.id === id && r.expect === 0 && r.code === 0)) p.push(`positive control ${id} missing or failed`);
+  return p;
+}
+
+// R5: a non-probe launch (identity, move-measure, helper node run) ran as the expected SID; node exit 0.
+export function launchProblems(receipt, sid, { node = false } = {}) {
+  if (!receipt) return ['receipt missing'];
+  const p = [];
+  if (typeof sid !== 'string' || receipt.userSid !== sid) p.push(`runtime SID ${receipt.userSid} != ${sid}`);
+  if (receipt.ok !== true) p.push('child not ok');
+  if (node && receipt.nodeExit !== 0) p.push(`nodeExit ${receipt.nodeExit} != 0`);
+  return p;
+}
+
+// R5 binding: every captured child self-report must match exactly one ADMIN-OBSERVED launch (launches.json,
+// written by the elevated launcher into the trusted receipts dir): exact tag sequence, user, mode, launched,
+// not timed out, launcher exit 0. A self-report rewritten in the outbox cannot outvote the launcher.
+export const EXPECTED_LAUNCHES = Object.freeze([['identity-A', 'A', 'identity'], ['identity-B', 'B', 'identity'], ['probe-Actl', 'A', 'probe'],
+  ['move-measure', 'A', 'move-measure'], ['probe-Atrust', 'A', 'probe'], ['probe-Btrust', 'B', 'probe'], ['probe-B1', 'B', 'probe'],
+  ['helper-run', 'A', 'node-test'], ['probe-B2', 'B', 'probe']]);
+export function launchBindingProblems(launches, users, receipts) {
+  const ls = asArray(launches);
+  const p = [];
+  const tags = ls.map((l) => (l && typeof l === 'object' ? l.tag : null));
+  if (tags.join('|') !== EXPECTED_LAUNCHES.map((e) => e[0]).join('|')) p.push(`admin-observed launch sequence [${tags}] differs from the plan`);
+  for (const [tag, who, mode] of EXPECTED_LAUNCHES) {
+    const hits = ls.filter((l) => l && l.tag === tag);
+    if (hits.length !== 1) { p.push(`${tag}: ${hits.length} admin-observed launches (exactly 1 required)`); continue; }
+    const l = hits[0];
+    const name = users && users[who] && users[who].name;
+    if (typeof name !== 'string' || l.user !== name) p.push(`${tag}: launched as ${l.user}, expected ${name}`);
+    if (l.mode !== mode) p.push(`${tag}: launch mode ${l.mode} != ${mode}`);
+    if (l.launched !== true) p.push(`${tag}: not launched`);
+    if (l.timedOut !== false) p.push(`${tag}: timedOut ${l.timedOut}`);
+    if (l.exitCode !== 0) p.push(`${tag}: launcher-observed exitCode ${l.exitCode} != 0`);
+    const r = receipts && receipts[tag];
+    if (!r || r.ok !== true) p.push(`${tag}: captured self-report missing or not ok`);
+    else if (r.mode !== mode) p.push(`${tag}: self-report mode ${r.mode} != ${mode}`);
+    else if (mode === 'node-test' && r.nodeExit !== 0) p.push(`${tag}: self-reported nodeExit ${r.nodeExit} != 0`);
+  }
+  return p;
+}
+
+// Non-empty guards: a missing or empty run/snapshot record is never a vacuous pass.
+export const REQUIRED_STAGES = Object.freeze(['environment', 'fake-users', 'fixtures', 'snapshot-S0', 'identity-A', 'identity-B', 'controls-A',
+  'move-measure-A', 'trust-probe-A', 'trust-probe-B', 'probe-B1', 'snapshot-S1', 'helper-as-A', 'snapshot-S2', 'probe-B2', 'snapshot-S3']);
+export function stageProblems(run) {
+  const st = asArray(run && run.stages);
+  if (st.length === 0) return ['no orchestration stages recorded'];
+  const p = st.filter((s) => !s || s.status !== 'ok').map((s) => `${s && s.name}=${s && s.status}:${s && s.error}`);
+  for (const n of REQUIRED_STAGES) { const k = st.filter((s) => s && s.name === n).length; if (k !== 1) p.push(`stage ${n} recorded ${k} times`); }
+  return p;
+}
+export function snapshotSetProblems(snaps) {
+  return ['S0', 'S1', 'S2', 'S3'].filter((t) => asArray(snaps && snaps[t] && snaps[t].objects).length === 0).map((t) => `snap-${t} missing or empty`);
+}
+
+// R7: measured, never whitelisted. CONTRACT-r2 §3 says B runs with no privileges enabled.
+export function enabledPrivileges(idr) {
+  return asArray(idr && idr.privileges).filter((x) => /^enabled$/i.test(String(x && x.state))).map((x) => x.name);
+}
+
+// R6: independent read-back vs the backup-handle oracle. A contradiction fails; anything not read back is
+// listed as unproved (the contract's Get-Acl/fsutil oracle is then NOT complete; never waived here).
+export function readbackFindings(objects) {
+  const contradictions = []; const unproved = [];
+  for (const o of asArray(objects)) {
+    if (!o || o.openError !== 0) continue;
+    if (typeof o.getAclSddl === 'string') {
+      if (o.getAclSddl !== o.sddl) {
+        if (o.isReparse) unproved.push(`${o.path}: Get-Acl differs on a reparse point (may resolve the target)`);
+        else contradictions.push(`${o.path}: Get-Acl ${o.getAclSddl} != oracle ${o.sddl}`);
+      }
+    } else unproved.push(`${o.path}: Get-Acl unavailable (${o.getAclError || 'not measured'})`);
+    if (!o.isDir) {
+      if (o.isReparse) unproved.push(`${o.path}: fsutil hardlink count not comparable on a reparse point`);
+      else if (o.fsutilHardlinkExit === 0) {
+        const n = asArray(o.fsutilHardlinks).length;
+        if (n !== o.nLinks) contradictions.push(`${o.path}: fsutil lists ${n} links, oracle nLinks ${o.nLinks}`);
+      } else unproved.push(`${o.path}: fsutil hardlink list exit ${o.fsutilHardlinkExit}`);
+    }
+    if (o.fsutilReparseExit === 0 && !o.isReparse) contradictions.push(`${o.path}: fsutil reports a reparse point, oracle does not`);
+    if (o.isReparse && o.fsutilReparseExit !== 0) unproved.push(`${o.path}: fsutil reparsepoint query exit ${o.fsutilReparseExit}`);
+  }
+  return { contradictions, unproved };
+}
+
+// R2 trusted objects (twin: setup-fixtures.ps1 Test-PspTrustedSddl). Owner listed; DACL present, non-NULL
+// (protected when asked); only allow/deny ACEs; every allow ACE is SYSTEM/Administrators, or a listed
+// reader with no write/append/EA/attribute/delete-child/DELETE/WRITE_DAC/WRITE_OWNER/GW/GA bit.
+const WRITE_BITS = (0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000 | 0x40000000 | 0x10000000) >>> 0;
+export function trustProblems(snap, { owners, readers = [], protectedDacl = false }) {
+  if (!snap) return ['no snapshot'];
+  if (snap.openError) return [`open-error-${snap.openError}`];
+  const p = [];
+  if (snap.isReparse) p.push('reparse');
+  if (!snap.persistentAcls) p.push('non-acl-volume');
+  const sd = parseSddl(snap.sddl);
+  if (!sd) return [...p, 'sddl-unparsed'];
+  const own = asArray(owners).map(normalizeSid);
+  if (!own.includes(normalizeSid(sd.owner))) p.push(`owner:${normalizeSid(sd.owner)}`);
+  if (!sd.dacl || sd.dacl.isNull) return [...p, 'null-or-absent-dacl'];
+  if (protectedDacl && !sd.dacl.protected) p.push('not-protected');
+  const rd = asArray(readers).map(normalizeSid);
+  let allow = 0;
+  for (const a of sd.dacl.aces) {
+    if (a.type === 'D') continue;
+    if (a.type !== 'A') { p.push(`ace-type:${a.type}`); continue; }
+    allow++;
+    if (a.sid === SID_ADMINS || a.sid === SID_SYSTEM) continue;
+    const { mask, unknown } = parseRights(a.rights);
+    if (rd.includes(a.sid) && !unknown && ((mask & WRITE_BITS) >>> 0) === 0) continue;
+    p.push(`foreign-allow:${a.sid}:${a.rights}`);
+  }
+  if (allow === 0) p.push('no-allow-ace');
+  return p;
+}
+
+// R2 cleanup state (twin: setup-fixtures.ps1 Test-PspCleanupState; same literals). Every rule must hold
+// before cleanup may act; nothing is normalised. Filesystem facts (reparse) are checked only on the PS side.
+export function validateCleanupState(st, { tempLong, runId }) {
+  if (!st || typeof st !== 'object' || Array.isArray(st)) return ['state-null'];
+  if (!/^\d+$/.test(String(runId))) return ['run-id'];
+  if (Object.keys(st).sort().join(',') !== 'root,schema,users,vdisks') return ['state-keys'];
+  const p = [];
+  if (st.schema !== 'aigentry/1167-psp-state/v1') p.push('schema');
+  let root = st.root;
+  if (root !== null) {
+    if (typeof root !== 'string') { p.push('root-type'); root = null; }
+    else {
+      const i = root.lastIndexOf('\\');
+      if (i < 0 || !new RegExp(`^psp1167-${runId}-[0-9a-f]{8}$`).test(root.slice(i + 1))) p.push('root-leaf');
+      if (i < 0 || root.slice(0, i) !== tempLong) p.push('root-parent');
+      if (/[/]|\\\\|\\\.\.?(\\|$)|\\$/.test(root) || path.win32.normalize(root) !== root) p.push('root-not-canonical');
+    }
+  }
+  const us = asArray(st.users);
+  if (!Array.isArray(st.users)) p.push('users-type');
+  if (us.length > 2) p.push('users-count');
+  let first = null;
+  for (let i = 0; i < Math.min(us.length, 2); i++) {
+    const u = us[i];
+    if (!u || typeof u !== 'object' || Object.keys(u).sort().join(',') !== 'name,sid') { p.push(`user${i}-shape`); continue; }
+    if (typeof u.name !== 'string' || !/^psp[ab][0-9a-f]{6}$/.test(u.name) || u.name.slice(0, 4) !== ['pspa', 'pspb'][i]) { p.push(`user${i}-name`); continue; }
+    if (typeof u.sid !== 'string' || !/^S-1-5-21-\d+-\d+-\d+-\d+$/.test(u.sid) || Number(u.sid.slice(u.sid.lastIndexOf('-') + 1)) < 1000) { p.push(`user${i}-sid`); continue; }
+    if (i === 0) first = u;
+    else if (first) {
+      if (u.name.slice(4) !== first.name.slice(4)) p.push('user-pair-suffix');
+      if (u.sid.slice(0, u.sid.lastIndexOf('-')) !== first.sid.slice(0, first.sid.lastIndexOf('-'))) p.push('user-pair-domain');
+      if (u.sid === first.sid) p.push('user-pair-sid');
+    }
+  }
+  const vs = asArray(st.vdisks); const seen = [];
+  if (!Array.isArray(st.vdisks)) p.push('vdisks-type');
+  if (vs.length > 2) p.push('vdisks-count');
+  for (const v of vs) {
+    if (!v || typeof v !== 'object' || Object.keys(v).sort().join(',') !== 'attached,file,fs,letter') { p.push('vdisk-shape'); continue; }
+    if (!['fat32', 'exfat'].includes(v.fs)) { p.push('vdisk-fs'); continue; }
+    if (seen.includes(v.fs)) p.push('vdisk-duplicate');
+    seen.push(v.fs);
+    if (root === null || v.file !== `${root}\\vhd-${v.fs}.vhdx`) p.push(`vdisk-file:${v.fs}`);
+    if (typeof v.letter !== 'string' || !/^[P-Y]$/.test(v.letter)) p.push('vdisk-letter');
+  }
+  return p;
+}
+
 // ------------------------------------------------------------------ phase: selfcheck
 if (PHASE === 'selfcheck') {
   const A = 'S-1-5-21-1-2-3-1001';
@@ -359,9 +572,51 @@ if (PHASE === 'selfcheck') {
       assert.ok(Array.isArray(e.reasons) && e.reasons.length > 0, id);
       if (e.status) assert.notEqual(e.status, 'ok', id);
       if (!['D_OK', 'D_NEST_OK', 'F_OK', 'C_DIR', 'C_DIR_INSPECT', 'C_FILE', 'C_FILE_READ'].includes(id)) assert.ok(!e.reasons.includes('ok'), id);
+      for (const r of e.reasons) assert.ok(Array.isArray(expectedWin32(r)), `${id}: ${r} has no intended Win32 code`);
     }
+    assert.deepEqual(expectedWin32('open_failed'), [5]);
+    assert.equal(expectedWin32('size_changed'), null);
     assert.equal(expectedHelperStatus('F_NOT_FILE', 'unsafe'), 'unavailable');
     assert.equal(expectedHelperStatus('D_OK', 'ok'), 'ok');
+  });
+
+  test('selfcheck: self-reports bind to exactly one admin-observed launch; forged, missing, duplicate, wrong, timed-out or nonzero launches fail', () => {
+    const users = { A: { name: 'pspa0a1b2c', sid: A }, B: { name: 'pspb0a1b2c', sid: B } };
+    const launches = EXPECTED_LAUNCHES.map(([tag, who, mode]) => ({ user: users[who].name, mode, launched: true, exitCode: 0, timedOut: false, tag }));
+    const receipts = Object.fromEntries(EXPECTED_LAUNCHES.map(([tag, , mode]) => [tag, { ok: true, mode, ...(mode === 'node-test' ? { nodeExit: 0 } : {}) }]));
+    assert.deepEqual(launchBindingProblems(launches, users, receipts), []);
+    const h = launches.findIndex((l) => l.tag === 'helper-run');
+    const bad = {
+      'forged self-report over launcher exit 1': [launches.map((l, i) => (i === h ? { ...l, exitCode: 1 } : l)), receipts],
+      'launcher timed out': [launches.map((l, i) => (i === h ? { ...l, timedOut: true } : l)), receipts],
+      'timedOut unrecorded': [launches.map((l, i) => (i === h ? { ...l, timedOut: undefined } : l)), receipts],
+      'exitCode null (killed)': [launches.map((l, i) => (i === h ? { ...l, exitCode: null } : l)), receipts],
+      'exitCode string': [launches.map((l, i) => (i === h ? { ...l, exitCode: '0' } : l)), receipts],
+      'launch missing': [launches.filter((l, i) => i !== h), receipts],
+      'launch duplicated': [[...launches, launches[h]], receipts],
+      'launched as B': [launches.map((l, i) => (i === h ? { ...l, user: users.B.name } : l)), receipts],
+      'wrong mode': [launches.map((l, i) => (i === h ? { ...l, mode: 'probe' } : l)), receipts],
+      'not launched': [launches.map((l, i) => (i === h ? { ...l, launched: false } : l)), receipts],
+      'reordered': [[launches[1], launches[0], ...launches.slice(2)], receipts],
+      'launches.json absent': [null, receipts],
+      'self-report nodeExit 1': [launches, { ...receipts, 'helper-run': { ok: true, mode: 'node-test', nodeExit: 1 } }],
+      'self-report missing': [launches, { ...receipts, 'helper-run': undefined }],
+      'self-report from another mode': [launches, { ...receipts, 'helper-run': { ok: true, mode: 'identity', nodeExit: 0 } }],
+    };
+    for (const [k, [l, r]] of Object.entries(bad)) assert.notDeepEqual(launchBindingProblems(l, users, r), [], k);
+    assert.notDeepEqual(launchBindingProblems(launches, null, receipts), [], 'users unrecorded');
+  });
+
+  test('selfcheck: empty or missing run stages and snapshots are never a vacuous pass', () => {
+    const ok = { stages: REQUIRED_STAGES.map((name) => ({ name, status: 'ok' })) };
+    assert.deepEqual(stageProblems(ok), []);
+    for (const r of [null, {}, { stages: [] }, { stages: ok.stages.slice(1) }, { stages: [...ok.stages, ok.stages[3]] },
+      { stages: ok.stages.map((s, i) => (i === 5 ? { ...s, status: 'blocked' } : s)) }]) assert.notDeepEqual(stageProblems(r), [], JSON.stringify(r));
+    const s = (n) => ({ objects: Array.from({ length: n }, (_, i) => ({ path: `p${i}` })) });
+    assert.deepEqual(snapshotSetProblems({ S0: s(1), S1: s(1), S2: s(1), S3: s(1) }), []);
+    assert.deepEqual(snapshotSetProblems({ S0: s(1), S1: s(0), S2: null, S3: s(1) }), ['snap-S1 missing or empty', 'snap-S2 missing or empty']);
+    assert.equal(snapshotSetProblems({}).length, 4);
+    assert.deepEqual(readbackFindings([]), { contradictions: [], unproved: [] }, 'the R6 rule alone is vacuous on nothing: the verdict gates it on snapshotSetProblems');
   });
 }
 
@@ -433,6 +688,8 @@ if (PHASE === 'helper') {
       assert.equal(r.returnedPromise, undefined, `${c.id}: README says synchronous, got a promise`);
       assert.equal(r.result.status, want, `${c.id}: helper ${r.result.status}/${r.result.reason} != expected ${want}`);
       assert.ok(e && e.reasons.includes(r.result.reason), `${c.id}: reason ${r.result.reason} not in ${e && e.reasons}`);
+      const codes = expectedWin32(r.result.reason);
+      assert.ok(codes && codes.includes(r.result.win32Error), `${c.id}: win32Error ${r.result.win32Error} not the intended code [${codes}] for ${r.result.reason}`);
       if (c.intent !== 'ok' || c.op !== 'readPrivateFile') assert.equal(r.result.bytesLength, 0, `${c.id}: bytes returned on a non-read or refused call`);
     });
   }
@@ -457,17 +714,18 @@ if (PHASE === 'verdict') {
 
   test('verdict: required receipts exist', () => {
     const required = ['run.json', 'env.json', 'manifest.json', 'snap-S0.json', 'snap-S1.json', 'snap-S2.json', 'snap-S3.json', 'identity-A.json', 'identity-B.json',
-      'probe-Actl.json', 'probe-B1.json', 'probe-B2.json', 'move-measure.json', 'helper-receipt.json'];
+      'probe-Actl.json', 'probe-B1.json', 'probe-B2.json', 'move-measure.json', 'helper-receipt.json',
+      'trust.json', 'state.json', 'probe-Atrust.json', 'probe-Btrust.json', 'helper-run.json', 'launches.json'];
     const missing = required.filter((f) => !fs.existsSync(path.join(dir, f)));
     assert.deepEqual(missing, [], `missing receipts: ${missing.join(', ')}`);
   });
 
   test('verdict: every orchestration stage before the verdict completed', () => {
-    const bad = asArray(run && run.stages).filter((s) => s.status !== 'ok').map((s) => `${s.name}=${s.status}:${s.error}`);
-    assert.deepEqual(bad, []);
+    assert.deepEqual(stageProblems(run), []);
   });
 
   test('verdict: helper ABI confirmed from the candidate and every case has an exact expectation', () => {
+    assert.ok(cases.length > 0, 'manifest lists no cases');
     assert.ok(ABI.confirmedBy, 'ABI.confirmedBy is null');
     const unmapped = cases.map((c) => c.id).filter((id) => !CANDIDATE_EXPECT[id]);
     assert.deepEqual(unmapped, []);
@@ -502,7 +760,36 @@ if (PHASE === 'verdict') {
       const held = DANGEROUS_PRIVILEGES.filter((p) => privs.includes(p));
       assert.deepEqual(held, [], `bypass privileges present: ${held.join(',')}`);
     });
+
+    // R7: the r2 wording is measured, not whitelisted. Any enabled privilege leaves the policy decision HOLD.
+    test(`verdict: CONTRACT-HOLD r2 §3 "no privileges enabled" holds for fake user ${who}`, () => {
+      const idr = load(`identity-${who}.json`);
+      assert.ok(idr && asArray(idr.privileges).length > 0, 'whoami /priv not measured');
+      const enabled = enabledPrivileges(idr);
+      assert.deepEqual(enabled, [], `CONTRACT_UNPROVED (policy HOLD, not whitelisted): enabled privileges ${enabled.join(',')}`);
+    });
   }
+
+  // R5: every launch ran as the intended runtime identity; the helper node run exited 0.
+  for (const [file, who, node] of [['probe-Actl.json', 'A', false], ['move-measure.json', 'A', false], ['helper-run.json', 'A', true],
+    ['probe-B1.json', 'B', false], ['probe-B2.json', 'B', false], ['probe-Atrust.json', 'A', false], ['probe-Btrust.json', 'B', false]]) {
+    test(`verdict: ${file} ran as fake user ${who}${node ? ' and node exited 0' : ''}`, () => {
+      assert.ok(/^S-1-5-21-/.test(String(sidA)) && /^S-1-5-21-/.test(String(sidB)) && sidA !== sidB, 'fake user SIDs not recorded');
+      assert.deepEqual(launchProblems(load(file), who === 'A' ? sidA : sidB, { node }), []);
+    });
+  }
+
+  test('verdict: every captured self-report is bound to exactly one admin-observed launch (exit 0, not timed out)', () => {
+    const receipts = Object.fromEntries(EXPECTED_LAUNCHES.map(([tag]) => [tag, load(`${tag}.json`)]));
+    assert.deepEqual(launchBindingProblems(load('launches.json'), manifest && manifest.users, receipts), []);
+  });
+
+  test('verdict: elevated node runtime equals the approved workflow pin', () => {
+    const n = env && env.node;
+    assert.ok(n && /^[0-9a-f]{64}$/.test(String(n.pinnedSha256)), 'node pin not recorded');
+    assert.equal(n.sha256, n.pinnedSha256);
+    assert.equal(n.version, n.pinnedVersion);
+  });
 
   test('verdict: every essential fixture is available (unavailable => HOLD, never skipped)', () => {
     assert.ok(manifest, 'manifest missing');
@@ -510,21 +797,19 @@ if (PHASE === 'verdict') {
     for (const c of cases) assert.ok(c.path, `${c.id} has no requested path`);
   });
 
-  const probeFile = { 'probe-Actl.json': 'A positive control', 'probe-B1.json': 'B on pre-existing A objects', 'probe-B2.json': 'B on helper-created objects' };
-  for (const [file, label] of Object.entries(probeFile)) {
-    test(`verdict: ${label}: numeric Win32 codes equal expectations`, () => {
-      const pr = load(file);
-      assert.ok(pr && pr.ok, `${file} missing or child failed`);
-      const rs = asArray(pr.results);
-      assert.ok(rs.length > 0, 'no operations recorded');
-      const wrong = rs.filter((r) => r.code !== r.expect).map((r) => `${r.id}: got ${r.code}, expected ${r.expect}`);
-      assert.deepEqual(wrong, []);
-      if (file !== 'probe-Actl.json') {
-        const denials = rs.filter((r) => r.expect !== 0);
-        assert.ok(denials.length >= 12, 'denial plan incomplete');
-        for (const r of denials) assert.equal(r.code, ERROR_ACCESS_DENIED, r.id);
-        if (file === 'probe-B1.json') assert.ok(rs.some((r) => r.id === 'Bself-create' && r.code === 0), 'B self positive control missing');
-      }
+  const pl = (k) => asArray(manifest && manifest.probes && manifest.probes[k]);
+  const selfOf = (t) => ['read', 'create', 'delete'].map((x) => `${t}-self-${x}`);
+  const ownOf = (t) => ['create', 'write', 'delete'].map((x) => `${t}-own-${x}`);
+  const probeSpec = [
+    ['probe-Actl.json', 'A positive control', () => pl('Actl'), 'A', ['A-list', 'A-create', 'A-read', 'A-write-open'], 0],
+    ['probe-B1.json', 'B on pre-existing A objects', () => [...pl('B1self'), ...pl('B1')], 'B', selfOf('B1'), 12],
+    ['probe-B2.json', 'B on helper-created objects', () => [...pl('B2self'), ...pl('B2')], 'B', selfOf('B2'), 12],
+    ['probe-Atrust.json', 'A on trusted state/oracle/sources', () => pl('Atrust'), 'A', ownOf('Atrust'), 15],
+    ['probe-Btrust.json', 'B on trusted state/oracle/sources', () => pl('Btrust'), 'B', ownOf('Btrust'), 15],
+  ];
+  for (const [file, label, plan, who, selfIds, minDenials] of probeSpec) {
+    test(`verdict: ${label}: plan, runtime SID, positive controls and numeric Win32 codes`, () => {
+      assert.deepEqual(probeProblems(load(file), plan(), { sid: who === 'A' ? sidA : sidB, selfIds, minDenials }), []);
     });
   }
 
@@ -563,15 +848,8 @@ if (PHASE === 'verdict') {
   for (const c of cases) {
     test(`verdict: helper ${c.id} ${c.op} equals oracle`, () => {
       const r = results.get(c.id);
-      assert.ok(r, 'no helper result');
-      assert.equal(r.threw, false, 'helper threw');
-      assert.ok(r.result && r.result.abiOk, 'result outside ABI');
       const o = oracleFor(c);
-      const e = CANDIDATE_EXPECT[c.id];
-      assert.ok(e, 'no candidate expectation');
-      assert.equal(r.result.status, expectedHelperStatus(c.id, o.cls), `helper ${r.result.status}/${r.result.reason} vs oracle ${o.cls}/${o.reason}`);
-      assert.ok(e.reasons.includes(r.result.reason), `reason ${r.result.reason} not in [${e.reasons}]`);
-      if (typeof e.created === 'boolean') assert.equal(r.result.created, e.created, 'created flag');
+      assert.deepEqual(helperResultProblems(c.id, r, expectedHelperStatus(c.id, o.cls)), [], `oracle ${o.cls}/${o.reason}`);
       if (r.result.status === 'ok') assert.ok(/^[0-9a-f]{16}$/.test(r.result.volumeSerial) && /^[0-9a-f]{32}$/.test(r.result.fileId), 'ok without FileIdInfo');
       if (c.op === 'readPrivateFile' && o.cls === 'ok') {
         const want = c.id === 'F_OK' ? manifest.content.F_OK : helperReceipt.createdContentSha256;
@@ -584,10 +862,11 @@ if (PHASE === 'verdict') {
     });
   }
 
-  test('verdict: pre-existing fixtures unchanged S0 -> S1 -> S2 -> S3 (sha256, SDDL, links, type)', () => {
+  test('verdict: pre-existing fixtures and trusted objects unchanged S0 -> S1 -> S2 -> S3 (sha256, SDDL, links, type)', () => {
     const mutable = new Set(asArray(manifest.mutable).map((p) => p.toLowerCase()));
     const diffs = [];
-    for (const p of asArray(manifest.snapshotObjects)) {
+    assert.ok(asArray(manifest.trustObjects).length >= 10 && asArray(manifest.binObjects).length >= 5, 'trusted object list missing');
+    for (const p of [...asArray(manifest.snapshotObjects), ...asArray(manifest.trustObjects), ...asArray(manifest.binObjects)]) {
       if (mutable.has(p.toLowerCase())) continue;
       const seq = ['S0', 'S1', 'S2', 'S3'].map((t) => get(t, p));
       if (seq.some((s) => !s)) { diffs.push(`${p}: missing snapshot`); continue; }
@@ -612,6 +891,55 @@ if (PHASE === 'verdict') {
     for (const p of asArray(manifest.mustStayAbsent)) {
       for (const t of ['S2', 'S3']) { const s = get(t, p); assert.ok(s && (s.openError === 2 || s.openError === 3), `${p} exists at ${t}`); }
     }
+  });
+
+  // R2: trusted root read back before any account existed, and every trusted/bin object stays non-writable
+  // by A/B at every snapshot. The state cleanup will trust passes the independent twin validator.
+  test('verdict: trusted root was protected and read back (oracle == Get-Acl) before fake accounts existed', () => {
+    const tr = load('trust.json');
+    assert.ok(tr && asArray(tr.readback).length >= 10, 'trust readback missing');
+    const bad = asArray(tr.readback).filter((x) => asArray(x.problems).length > 0 || x.getAclSddl !== x.sddl).map((x) => `${x.path}: ${asArray(x.problems).join(',')}`);
+    assert.deepEqual(bad, []);
+    assert.equal(tr.root, manifest.trust.root);
+    assert.equal(asArray(run && run.stages).map((s) => s.name)[0], 'environment', 'trust.json is written before the first stage');
+    assert.ok(tr.runnerTemp && (typeof tr.runnerTemp.sddl === 'string' || tr.runnerTemp.icacls), 'parent RUNNER_TEMP ACL not recorded');
+  });
+
+  test('verdict: trusted and bin objects are not writable by A/B at S0..S3', () => {
+    const t = manifest.trust;
+    const owners = [SID_ADMINS, SID_SYSTEM, t.adminSid];
+    const bad = [];
+    for (const tag of ['S0', 'S1', 'S2', 'S3']) {
+      for (const p of asArray(manifest.trustObjects)) {
+        const isRoot = p.toLowerCase() === String(t.root).toLowerCase();
+        const pr = trustProblems(get(tag, p), { owners: isRoot ? [SID_ADMINS] : owners, protectedDacl: isRoot });
+        if (pr.length) bad.push(`${tag} ${p}: ${pr.join(',')}`);
+      }
+      for (const p of asArray(manifest.binObjects)) {
+        const pr = trustProblems(get(tag, p), { owners, readers: [sidA, sidB] });
+        if (pr.length) bad.push(`${tag} ${p}: ${pr.join(',')}`);
+      }
+    }
+    assert.deepEqual(bad, []);
+  });
+
+  test('verdict: recorded cleanup state passes the independent validator (no tamper, exact owned names)', () => {
+    const st = load('state.json');
+    assert.deepEqual(validateCleanupState(st, { tempLong: process.env.PSP_TEMP_LONG, runId: process.env.PSP_RUN_ID }), []);
+    assert.equal(st.root, manifest.root);
+    assert.deepEqual(asArray(st.users).map((u) => u.sid), [sidA, sidB]);
+  });
+
+  // R6: Get-Acl / fsutil read-back. Contradictions fail; anything not read back is CONTRACT_UNPROVED.
+  const allSnapObjects = () => ['S0', 'S1', 'S2', 'S3'].flatMap((t) => asArray(snaps[t] && snaps[t].objects));
+  test('verdict: independent read-back never contradicts the backup-handle oracle', () => {
+    assert.deepEqual(snapshotSetProblems(snaps), []);
+    assert.deepEqual(readbackFindings(allSnapObjects()).contradictions, []);
+  });
+  test('verdict: CONTRACT-HOLD r2 §4 Get-Acl/fsutil read-back available for every gated object', () => {
+    assert.deepEqual(snapshotSetProblems(snaps), [], 'CONTRACT_UNPROVED: no read-back evidence at all');
+    const { unproved } = readbackFindings(allSnapObjects());
+    assert.deepEqual(unproved, [], `CONTRACT_UNPROVED (not waived, oracle not replaced): ${unproved.length} read-backs unavailable`);
   });
 
   test('verdict: feasibility measurements recorded (values reported, not judged)', () => {

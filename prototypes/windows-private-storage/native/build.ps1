@@ -29,6 +29,20 @@ function Assert-ExplicitPath([string]$Name, [string]$Value) {
   if ($Value -notmatch '^[A-Za-z]:\\') { throw "$Name must be an absolute drive-letter path" }
   if ($Value.IndexOfAny([char[]]'"*?<>|') -ge 0) { throw "$Name contains a refused character" }
   if ($Value.Contains('\..\') -or $Value.EndsWith('\..')) { throw "$Name must not contain '..'" }
+  # A trailing '\' before the closing quote PowerShell adds around an argument with
+  # spaces is read by cl's argv parser as an escaped quote (\"), merging arguments.
+  # Unsupported form: refused rather than re-quoted, so the meaning never depends on
+  # the PowerShell version's native argument-passing mode.
+  if ($Value.EndsWith('\') -or $Value.EndsWith('/')) { throw "$Name must not end with a path separator" }
+}
+
+function Get-ToolInfo([string]$Path) {
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+  return [ordered]@{
+    path = $Path
+    fileVersion = (Get-Item -LiteralPath $Path).VersionInfo.FileVersion
+    sha256 = Get-Sha256 $Path
+  }
 }
 
 function Get-Sha256([string]$Path) {
@@ -106,6 +120,16 @@ $receipt = [ordered]@{
   nodeHeaderSha256 = $headerHashes
   nodeLib = $NodeLib
   nodeLibSha256 = $nodeLibSha
+  # Provenance only (paths/versions, no credentials). Which link.exe cl actually
+  # ran is not observed here; the sibling of ClExe is recorded as the expected one.
+  linkExeSibling = Get-ToolInfo (Join-Path (Split-Path -Parent $ClExe) 'link.exe')
+  envInclude = $env:INCLUDE
+  envLib = $env:LIB
+  vcToolsVersion = $env:VCToolsVersion
+  windowsSdkVersion = $env:WindowsSDKVersion
+  vsCmdVersion = $env:VSCMD_VER
+  psVersion = $PSVersionTable.PSVersion.ToString()
+  psNativeCommandArgumentPassing = [string](Get-Variable -Name PSNativeCommandArgumentPassing -ValueOnly -ErrorAction SilentlyContinue)
   outputPath = $OutputPath
   outputSha256 = Get-Sha256 $OutputPath
 }

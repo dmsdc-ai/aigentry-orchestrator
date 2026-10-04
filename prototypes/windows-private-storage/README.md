@@ -71,8 +71,28 @@ input bytes, file bytes (except `bytes` on `ok`), or native/engine error text.
 `volumeSerial` (16 hex) and `fileId` (32 hex) come from `FileIdInfo` on the
 verified handle. They are oracle aids and not secret.
 
-`created: true` means the object was created by this call, even if a later step
-failed. The prototype never deletes or repairs anything. Cleanup is the caller's
+`created` on create results (every status, including wrapper failures) is
+exactly one of:
+
+| value | meaning | when |
+|---|---|---|
+| `false` | not created by this call | the native call never ran (`invalid_argument` in the wrapper), or native reported `false` |
+| `true` | created by this call, even if a later step failed | native reported `true` |
+| `null` | **UNKNOWN**: the object may or may not exist | native threw (`native_threw`), or returned a non-object or a non-boolean `created` (`native_result_invalid`) |
+
+If native returned a valid boolean `created` but any other field is malformed,
+the result is `unavailable` / `native_result_invalid` with that boolean kept.
+The wrapper never reports `false` after an unknown side effect, and it never
+retries or deletes. After `null`, the caller has to inspect the target, for
+example with `inspectDir`/`readPrivateFile` or by listing it, before reusing it.
+`inspectDir` and `readPrivateFile` results have no `created` field.
+
+The wrapper reads each raw native property once, inside an exception boundary.
+`status`, `reason` (which must be one of the native reason strings below),
+`win32Error`, `volumeSerial`, `fileId` and `bytes` are type-checked. Nothing
+else from the raw object is forwarded.
+
+The prototype never deletes or repairs anything. Cleanup is the caller's
 policy (auth.ts :1229 analogue). A create that fails verification has written no
 bytes. A failure during the write can leave a partly written file that already
 passed verification.
@@ -152,8 +172,13 @@ Per function:
   - one handle `FILE_READ_DATA|READ_CONTROL|FILE_READ_ATTRIBUTES`, share READ
     only, then P-FILE
   - size check: `EndOfFile > max` is `unsafe` / `size_limit`
-  - reads on the same handle into an `EndOfFile+1` buffer; growth is
-    `size_limit`, a short read is `size_changed`
+  - reads on the same handle into an `EndOfFile+1` buffer (source:
+    `ps_read_all`). After the read:
+    - more than `max` bytes read is `unsafe` / `size_limit`. Growth hits this
+      only when the queried `EndOfFile == max`.
+    - otherwise any count other than `EndOfFile` is `unavailable` /
+      `size_changed`. That covers a short read, and growth when
+      `EndOfFile < max`.
   - the native buffer is zeroed (`SecureZeroMemory`) and freed on every path
   - a directory at the leaf fails the open (`unavailable` / `open_failed`,
     usually 5)
@@ -229,11 +254,24 @@ pwsh -NoProfile -File native\build.ps1 `
   - compile: `/LD /MT /O2 /W4 /sdl /GS /guard:cf`
   - link: `/NXCOMPAT /DYNAMICBASE /HIGHENTROPYVA /GUARD:CF`
   - libraries: node.lib, kernel32.lib, advapi32.lib
+- Paths must be absolute `X:\...` with no `"*?<>|`, no `..`, and **no trailing
+  `\` or `/`**. The trailing form is refused, not re-quoted: PowerShell quotes an
+  argument that contains spaces, and a final `\` would turn the closing quote
+  into `\"` under cl's argv parsing. Spaces and other characters stay literal
+  argument text because nothing is shell-evaluated. Windows runtime quoting is
+  not reproduced here (Darwin); the tester owns that check.
 - The script refuses to overwrite the output and does not download anything.
 - It writes `<OutputPath>.build.json` with:
   - cl path, file version, sha256 and arguments
   - source, header and node.lib sha256
   - output sha256
+  - provenance (no credentials):
+    - path, version and sha256 of the `link.exe` next to `cl.exe`. Expected only;
+      which linker cl actually ran is not observed.
+    - `INCLUDE`, `LIB`, `VCToolsVersion`, `WindowsSDKVersion`, `VSCMD_VER`
+    - PowerShell version and `PSNativeCommandArgumentPassing`
+  - Header and node.lib hashes are recorded, not compared against a pin, except
+    the optional `-ExpectedNodeLibSha256`. The CI job compares them.
 
 Compile status at hand-off: **COMPILE_PENDING**. The source was written on a
 Darwin host with no Windows SDK/MSVC, so the CI builder is the first compiler.

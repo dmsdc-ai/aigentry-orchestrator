@@ -11,9 +11,9 @@ param(
   [string]$HelperSha256 = $env:PSP_HELPER_SHA256,
   [string]$WrapperPath = $env:PSP_WRAPPER_PATH,
   [string]$WrapperSha256 = $env:PSP_WRAPPER_SHA256,
-  [string]$ReceiptsDir = $(if ($env:RUNNER_TEMP) { Join-Path $env:RUNNER_TEMP 'psp1167-receipts' } else { $null }),
-  [string]$StatePath = $(if ($env:RUNNER_TEMP) { Join-Path $env:RUNNER_TEMP 'psp1167-state.json' } else { $null }),
-  [switch]$CleanupOnly
+  [string]$TrustRoot,
+  [switch]$CleanupOnly,
+  [switch]$ExportOnly
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
@@ -25,33 +25,113 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hoste
 $admin = (New-Object System.Security.Principal.WindowsPrincipal([System.Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $admin) { Write-Output 'refusing: setup/cleanup needs the elevated runner token'; exit 3 }
 
+# Elevated native tools and modules resolve only from SystemRoot: tool-cache PATH entries may be writable
+# by the fake users. node.exe is resolved once here, before any fake account exists.
+$nodeSrc = $null
+if (-not $CleanupOnly -and -not $ExportOnly) { $nodeSrc = (Get-Command node.exe -ErrorAction Stop).Source }
+$env:PATH = (Join-Path $env:SystemRoot 'System32') + ';' + $env:SystemRoot + ';' + (Join-Path $env:SystemRoot 'System32\Wbem') + ';' + (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0')
+$env:PSModulePath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
+
 . (Join-Path $PSScriptRoot 'setup-fixtures.ps1')
 . (Join-Path $PSScriptRoot 'run-as-user.ps1')
 
-[void](New-Item -ItemType Directory -Force -Path $ReceiptsDir)
-$scratch = Join-Path $ReceiptsDir 'scratch'
-[void](New-Item -ItemType Directory -Force -Path $scratch)
+$tempLong = Get-PspTempLong
+$adminSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 
 function Write-PspJson { param($Obj, [string]$Name) ($Obj | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath (Join-Path $ReceiptsDir $Name) -Encoding UTF8 }
 
 function Invoke-PspCleanup { param($State)
-  $c = [ordered]@{ vdisks = $null; root = $null; users = $null }
-  $c.vdisks = @(Remove-PspVhds -State $State -ScratchDir $scratch)
-  if ($State.root) { $c.root = Remove-PspFixtureRoot -Root $State.root }
+  $c = [ordered]@{ stateProblems = @(Test-PspCleanupState -State $State -TempLong $tempLong -RunId $env:GITHUB_RUN_ID); vdisks = $null; root = $null; users = $null; ok = $false }
+  if ($c.stateProblems.Count -gt 0) { return $c }   # tampered/unknown state: no destructive action at all
+  $c.vdisks = @(Remove-PspVhds -State $State -ScratchDir $scratch -Root $State.root)
+  if ($State.root) { $c.root = Remove-PspFixtureRoot -Root $State.root -TempLong $tempLong -RunId $env:GITHUB_RUN_ID -WriterSids @(@($State.users) | ForEach-Object { $_.sid }) }
   $c.users = @(Remove-PspFakeUsers -State $State)
   $c.ok = (@($c.vdisks | Where-Object { $_.error }).Count -eq 0) -and (($null -eq $c.root) -or $c.root.removed) -and (@($c.users | Where-Object { $_.error -and $_.error -ne 'not-present' }).Count -eq 0)
   return $c
 }
 
+# The bound trust root: exactly RUNNER_TEMP\<PSP_TRUST_LEAF>, the name the workflow bound before any fake
+# account existed; canonical, and the root this trusted copy runs from. Never a root found by globbing.
+function Test-PspBoundTrustRoot { param([string]$TrustRoot)
+  $i = $TrustRoot.LastIndexOf('\')
+  return -not (($i -lt 0) -or ($TrustRoot.Substring(0, $i) -cne $tempLong) -or ($TrustRoot.Substring($i + 1) -cnotmatch '^psp1167-trust-[0-9a-f]{16}$') -or
+    ($TrustRoot.Substring($i + 1) -cne $env:PSP_TRUST_LEAF) -or ([System.IO.Path]::GetFullPath($TrustRoot) -cne $TrustRoot) -or ((Split-Path -Parent $PSScriptRoot) -ne $TrustRoot))
+}
+
+# Upload source. Copies the bound root's receipts (plain single-link files only, Oracle.Capture) into a NEW
+# protected export dir, only while no fake-user process is alive and trust.json binds the root to this run.
+# Any problem => exit 1 and the workflow uploads nothing (no fallback path).
+function Export-PspEvidence { param($Trust)
+  $x = [ordered]@{ schema = 'aigentry/1167-psp-export/v1'; task = '1167'; trustRoot = $Trust.root; runId = $env:GITHUB_RUN_ID; attempt = $env:GITHUB_RUN_ATTEMPT; liveWriters = @(); files = @(); problems = @() }
+  $tj = Join-Path $Trust.receipts 'trust.json'
+  $bound = $null; if (Test-Path -LiteralPath $tj) { $bound = Get-Content -LiteralPath $tj -Raw | ConvertFrom-Json }
+  if (($null -eq $bound) -or ($bound.root -cne $Trust.root) -or ($bound.runId -cne $env:GITHUB_RUN_ID) -or ($bound.runAttempt -cne $env:GITHUB_RUN_ATTEMPT)) { $x.problems += 'trust.json does not bind this root to this run' }
+  $sids = @()
+  if (Test-Path -LiteralPath $Trust.statePath) {
+    $st = Get-Content -LiteralPath $Trust.statePath -Raw | ConvertFrom-Json
+    $sp = @(Test-PspCleanupState -State $st -TempLong $tempLong -RunId $env:GITHUB_RUN_ID)
+    if ($sp.Count -gt 0) { $x.problems += ('state: ' + ($sp -join ',')) } else { $sids = @(@($st.users) | ForEach-Object { $_.sid }) }
+  }
+  $x.liveWriters = @(Get-PspLiveSidProcesses $sids)
+  if ($x.liveWriters.Count -gt 0) { $x.problems += 'fake-user processes alive' }
+  $out = Join-Path $Trust.root 'export'
+  if ($x.problems.Count -eq 0) {
+    $e = [Psp1167.Oracle]::CreateProtectedDir($out, $script:PspTrustSddl)
+    if ($e -ne 0) { $x.problems += "export dir not created (Win32 $e)" }
+    else {
+      foreach ($f in @(Get-ChildItem -LiteralPath $Trust.receipts -Force)) {
+        if ($f.PSIsContainer -or (($f.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) { $x.problems += "not a plain file: $($f.Name)"; continue }
+        $d = Join-Path $out $f.Name
+        $c = [Psp1167.Oracle]::Capture($f.FullName, $d, 16MB)
+        if ($c -ne 0) { $x.problems += "capture of $($f.Name) refused ($c)"; continue }
+        $x.files += ,([ordered]@{ name = $f.Name; bytes = (Get-Item -LiteralPath $d -Force).Length; sha256 = (Get-FileHash -LiteralPath $d -Algorithm SHA256).Hash.ToLowerInvariant() })
+      }
+      foreach ($need in @('trust.json', 'run.json')) { if (@($x.files | Where-Object { $_.name -ceq $need }).Count -ne 1) { $x.problems += "required evidence $need missing" } }
+      $rb = Test-PspTrustedObject $out @($script:PspSidAdmins) -Protected
+      if ($rb.problems.Count -gt 0) { $x.problems += ('export dir readback: ' + ($rb.problems -join ',')) }
+      ($x | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath (Join-Path $out 'export-manifest.json') -Encoding UTF8
+    }
+  }
+  Write-Host ('export: files={0} problems={1}' -f @($x.files).Count, ($x.problems -join '; '))   # host stream: the return value stays the exit code
+  if ($x.problems.Count -eq 0) { return 0 } else { return 1 }
+}
+
+if ($ExportOnly) {
+  if (-not $TrustRoot -or -not (Test-PspBoundTrustRoot $TrustRoot)) { Write-Output "export: refusing trust root '$TrustRoot' (not the bound, canonical root of this script)"; exit 1 }
+  $trust = Get-PspTrustLayout $TrustRoot
+  $bad = @(Get-PspTrustReadback $trust $adminSid | Where-Object { $_.problems.Count -gt 0 } | ForEach-Object { "$($_.path)=$($_.problems -join ',')" })
+  if ($bad.Count -gt 0) { Write-Output ('export: refusing, trust readback failed: ' + ($bad -join '; ')); exit 1 }
+  exit (Export-PspEvidence $trust)
+}
+
 if ($CleanupOnly) {
-  if (-not (Test-Path -LiteralPath $StatePath)) { Write-Output 'cleanup: no state file; nothing was created'; exit 0 }
-  $st = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
-  $st = [ordered]@{ root = $st.root; users = @($st.users); vdisks = @($st.vdisks) }
-  if ($st.root) { Register-PspOwnedRoot $st.root }
-  $c = Invoke-PspCleanup $st
-  Write-PspJson $c 'cleanup-backstop.json'
+  # The workflow bootstrap passes the exact bound trust root; this copy must run from inside it.
+  if (-not $TrustRoot) { Write-Output 'cleanup: no trust root; nothing was created'; exit 0 }
+  if (-not (Test-PspBoundTrustRoot $TrustRoot)) {
+    Write-Output "cleanup: refusing trust root $TrustRoot (not the bound name, not canonical, not under RUNNER_TEMP, or not this script's root)"; exit 1
+  }
+  $trust = Get-PspTrustLayout $TrustRoot
+  $bad = @(Get-PspTrustReadback $trust $adminSid | Where-Object { $_.problems.Count -gt 0 } | ForEach-Object { "$($_.path)=$($_.problems -join ',')" })
+  if ($bad.Count -gt 0) { Write-Output ('cleanup: refusing, trust readback failed: ' + ($bad -join '; ')); exit 1 }
+  $ReceiptsDir = $trust.receipts; $scratch = $trust.scratch
+  if (-not (Test-Path -LiteralPath $trust.statePath)) { Write-Output 'cleanup: refusing, trust root has no state file'; exit 1 }
+  $c = Invoke-PspCleanup (Get-Content -LiteralPath $trust.statePath -Raw | ConvertFrom-Json)
+  Write-PspJson $c ('cleanup-backstop-' + [guid]::NewGuid().ToString('N') + '.json')
+  Write-Output ('cleanup: ok={0} stateProblems={1}' -f $c.ok, ($c.stateProblems -join ','))
   if ($c.ok) { exit 0 } else { exit 1 }
 }
+
+# Trusted root BEFORE any account or lower-privileged process; a failure here creates nothing else.
+$trust = Initialize-PspTrustRoot -TempLong $tempLong -SourceDir $PSScriptRoot -AdminSid $adminSid -Leaf $env:PSP_TRUST_LEAF
+$ReceiptsDir = $trust.receipts; $scratch = $trust.scratch; $StatePath = $trust.statePath
+$tempAcl = [Psp1167.Oracle]::Take($tempLong, $null)
+$trust.runnerTemp = [ordered]@{ path = $tempLong; sddl = $tempAcl.sddl; sddlError = $tempAcl.sddlError; icacls = (Invoke-PspNative 'icacls-runner-temp' 'icacls.exe' @($tempLong) -AllowFail).output }
+$trust.adminSid = $adminSid
+$trust.runId = $env:GITHUB_RUN_ID; $trust.runAttempt = $env:GITHUB_RUN_ATTEMPT
+Write-PspJson $trust 'trust.json'
+# The earlier wrapper-test TAP sits in a RUNNER_TEMP dir with inherited ACLs: captured now, while no fake user exists.
+$wrapperTap = Join-Path $env:RUNNER_TEMP 'psp1167-receipts\wrapper-test.tap'
+if (Test-Path -LiteralPath $wrapperTap) { Copy-PspCapture $wrapperTap (Join-Path $ReceiptsDir 'wrapper-test.tap') }
 
 $S = @{ }   # shared mutable stage state (reference type: stage scriptblocks mutate it)
 $run = [ordered]@{ schema = 'aigentry/1167-psp-run/v1'; task = '1167'; status = 'FAILED'; feasibilityOnly = $true; productAcceptance = $false
@@ -79,7 +159,9 @@ $S.launches = New-Object System.Collections.ArrayList
 function Invoke-PspChild { param([string]$Who, [string]$Mode, $Request, [string]$Tag, [int]$TimeoutSec = 900)
   $u = $S.users[$Who]; $work = $S.manifest.dirs["work$Who"]
   $reqPath = Join-Path $work "$Tag-request.json"; $recPath = Join-Path $work "$Tag-receipt.json"
-  ($Request | ConvertTo-Json -Depth 10) | Set-Content -LiteralPath $reqPath -Encoding UTF8
+  # CreateNew: a name pre-planted in the fake user's outbox (file, link or junction) is refused, never followed.
+  $fs = [System.IO.File]::Open($reqPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+  try { $bytes = [System.Text.Encoding]::UTF8.GetBytes(($Request | ConvertTo-Json -Depth 10)); $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Dispose() }
   $extra = $null; if ($Who -eq 'A') { $extra = $S.manifest.dirs.bin }
   $l = Invoke-PspAsUser -UserName $u.name -Password $S.passwords[$Who] -Mode $Mode -Request $reqPath -Receipt $recPath `
     -WorkDir $work -TempDir (Join-Path $work 'tmp') -ScriptPath (Join-Path $S.manifest.dirs.bin 'run-as-user.ps1') -ExtraPath $extra -TimeoutSec $TimeoutSec
@@ -88,14 +170,15 @@ function Invoke-PspChild { param([string]$Who, [string]$Mode, $Request, [string]
   Write-PspJson $S.launches 'launches.json'
   if (-not $l.launched) { throw "credentialed launch as $Who blocked: $($l.prerequisite) (Win32 $($l.launchError))" }
   if (-not (Test-Path -LiteralPath $recPath)) { throw "child $Tag wrote no receipt (exit $($l.exitCode)) $($l.prerequisite)" }
-  Copy-Item -LiteralPath $recPath -Destination (Join-Path $ReceiptsDir "$Tag.json") -Force
-  $rec = Get-Content -LiteralPath $recPath -Raw -Encoding UTF8 | ConvertFrom-Json
+  # Stable capture into the trusted receipts dir; only the captured copy is parsed.
+  Copy-PspCapture $recPath (Join-Path $ReceiptsDir "$Tag.json") 4MB
+  $rec = Get-Content -LiteralPath (Join-Path $ReceiptsDir "$Tag.json") -Raw -Encoding UTF8 | ConvertFrom-Json
   if ($l.exitCode -ne 0 -and $Mode -ne 'node-test') { throw "child $Tag exit $($l.exitCode): $($rec.error)" }
   return $rec
 }
 
 function Invoke-PspSnapshotStage { param([string]$Tag, [string[]]$Extra = @())
-  $paths = @($S.manifest.snapshotObjects) + @($S.manifest.cases | Where-Object { $_.snapshot -and $_.path } | ForEach-Object { $_.path }) + $Extra
+  $paths = @($S.manifest.snapshotObjects) + @($S.manifest.cases | Where-Object { $_.snapshot -and $_.path } | ForEach-Object { $_.path }) + @($S.manifest.trustObjects) + @($S.manifest.binObjects) + $Extra
   $snap = Get-PspSnapshot -Paths @($paths | Select-Object -Unique) -AncestorFloor $S.manifest.root -WithFsutil
   Write-PspJson ([ordered]@{ tag = $Tag; takenUtc = (Get-Date).ToUniversalTime().ToString('o'); objects = $snap }) "snap-$Tag.json"
 }
@@ -122,9 +205,18 @@ try {
     $envr.elevatedDefaultOwnerSddl = ([Psp1167.Oracle]::Take($probe, $null)).sddl
     $wp = Invoke-PspNative 'whoami-admin-priv' 'whoami.exe' @('/priv', '/fo', 'csv', '/nh') -AllowFail
     $envr.adminWhoamiPriv = $wp.output
-    $node = (Get-Command node.exe -ErrorAction Stop).Source
-    $envr.node = [ordered]@{ path = $node; sha256 = (Get-PspSha256 $node); version = (& $node --version); O_NOFOLLOW_admin = (& $node -p "String(require('fs').constants.O_NOFOLLOW)") }
-    $S.nodeSrc = $node
+    $node = $nodeSrc
+    $envr.node = [ordered]@{ path = $node; sha256 = (Get-PspSha256 $node); version = (& $node --version); O_NOFOLLOW_admin = (& $node -p "String(require('fs').constants.O_NOFOLLOW)")
+      pinnedSha256 = $env:PSP_NODE_EXE_SHA256; pinnedVersion = "v$env:PSP_NODE_VERSION" }
+    # In-script pin: the elevated runtime is the same approved build the workflow pin step checked.
+    if (($envr.node.pinnedSha256 -cnotmatch '^[0-9a-f]{64}$') -or ($envr.node.sha256 -cne $envr.node.pinnedSha256) -or ($envr.node.version -cne $envr.node.pinnedVersion)) {
+      throw "runner node $($envr.node.sha256) $($envr.node.version) != pin $($envr.node.pinnedSha256) $($envr.node.pinnedVersion)"
+    }
+    $envr.adminSid = $adminSid
+    # Every later elevated or fake-user node run uses this trusted copy, never the tool-cache file.
+    $S.nodeTrusted = Join-Path $trust.src 'node.exe'
+    Copy-Item -LiteralPath $node -Destination $S.nodeTrusted
+    if ((Get-PspSha256 $S.nodeTrusted) -ne $envr.node.sha256) { throw 'trusted node.exe copy differs from the runner node' }
     $envr.helper = [ordered]@{ path = $HelperPath; expectedSha256 = $HelperSha256; present = $false; sha256 = $null; matches = $false }
     if ($HelperPath -and (Test-Path -LiteralPath $HelperPath)) {
       $envr.helper.present = $true; $envr.helper.sha256 = Get-PspSha256 $HelperPath
@@ -153,20 +245,21 @@ try {
 
   Invoke-PspStage 'fixtures' {
     $b = New-Object byte[] 4; $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create(); $rng.GetBytes($b); $rng.Dispose()
-    $tempLong = [Psp1167.Oracle]::LongPath([System.IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\'))
-    if (-not $tempLong) { throw 'cannot resolve the long form of RUNNER_TEMP' }
     $root = Join-Path $tempLong ('psp1167-' + $env:GITHUB_RUN_ID + '-' + ([BitConverter]::ToString($b) -replace '-', '').ToLowerInvariant())
     if (Test-Path -LiteralPath $root) { throw "refusing: fixture root $root already exists" }
     Register-PspOwnedRoot $root
     $state.root = $root; Save-PspState $state $StatePath
     [void](New-Item -ItemType Directory -Path $root)
-    $m = New-PspFixtures -Root $root -SidA $S.users.A.sid -SidB $S.users.B.sid -State $state -StatePath $StatePath -ScratchDir $scratch
+    $m = New-PspFixtures -Root $root -SidA $S.users.A.sid -SidB $S.users.B.sid -State $state -StatePath $StatePath -ScratchDir $scratch -Trust $trust
     Add-PspVhdFixtures -Manifest $m -State $state -StatePath $StatePath -ScratchDir $scratch -SidA $S.users.A.sid
     $m.users = [ordered]@{ A = $S.users.A; B = $S.users.B }
     $bin = $m.dirs.bin
-    Copy-Item -LiteralPath $S.nodeSrc -Destination (Join-Path $bin 'node.exe')
+    Copy-Item -LiteralPath $S.nodeTrusted -Destination (Join-Path $bin 'node.exe')
     if ((Get-PspSha256 (Join-Path $bin 'node.exe')) -ne $S.env.node.sha256) { throw 'copied node.exe hash differs from the pinned runner node' }
-    foreach ($f in @('acl.test.mjs', 'run-as-user.ps1')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $f) -Destination (Join-Path $bin $f) }
+    foreach ($f in @('acl.test.mjs', 'run-as-user.ps1')) {
+      Copy-Item -LiteralPath (Join-Path $trust.src $f) -Destination (Join-Path $bin $f)
+      if ((Get-PspSha256 (Join-Path $bin $f)) -ne $trust.srcSha256[$f]) { throw "bin copy of $f differs from the trusted source" }
+    }
     $m.helperInBin = $null
     $m.wrapperInBin = $null
     if ($S.env.helper.present -and $S.env.helper.matches -and $S.env.wrapper.present -and $S.env.wrapper.matches) {
@@ -175,6 +268,10 @@ try {
       $m.wrapperInBin = Join-Path $bin 'private-storage.mjs'
       Copy-Item -LiteralPath $WrapperPath -Destination $m.wrapperInBin
     }
+    # Trusted objects the oracle snapshots S0..S3: A/B must never be able to alter them (verdict trustProblems).
+    $m.trust = [ordered]@{ root = $trust.root; statePath = $trust.statePath; adminSid = $adminSid }
+    $m.trustObjects = @(Get-PspTrustObjects $trust)
+    $m.binObjects = @($bin) + @(@('node.exe', 'acl.test.mjs', 'run-as-user.ps1', 'manifest.json') | ForEach-Object { Join-Path $bin $_ }) + @(@($m.helperInBin, $m.wrapperInBin) | Where-Object { $_ })
     $S.manifest = $m
     ($m | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath (Join-Path $bin 'manifest.json') -Encoding UTF8
     Write-PspJson $m 'manifest.json'
@@ -189,7 +286,9 @@ try {
     Invoke-PspStage 'identity-B' { [void](Invoke-PspChild 'B' 'identity' ([ordered]@{ tempDir = (Join-Path $S.manifest.dirs.workB 'tmp'); node = (Join-Path $S.manifest.dirs.bin 'node.exe') }) 'identity-B') } -Needs @('snapshot-S0')
     Invoke-PspStage 'controls-A' { [void](Invoke-PspChild 'A' 'probe' ([ordered]@{ tempDir = (Join-Path $S.manifest.dirs.workA 'tmp'); ops = @($S.manifest.probes.Actl) }) 'probe-Actl') } -Needs @('identity-A')
     Invoke-PspStage 'move-measure-A' { [void](Invoke-PspChild 'A' 'move-measure' ([ordered]@{ tempDir = (Join-Path $S.manifest.dirs.workA 'tmp'); srcDir = $S.manifest.moveMeasure.srcDir; dstDir = $S.manifest.moveMeasure.dstDir }) 'move-measure') } -Needs @('identity-A')
-    Invoke-PspStage 'probe-B1' { [void](Invoke-PspChild 'B' 'probe' ([ordered]@{ tempDir = (Join-Path $S.manifest.dirs.workB 'tmp'); ops = @($S.manifest.probes.Bself) + @($S.manifest.probes.B1) }) 'probe-B1') } -Needs @('identity-B')
+    Invoke-PspStage 'trust-probe-A' { [void](Invoke-PspChild 'A' 'probe' ([ordered]@{ tempDir = (Join-Path $S.manifest.dirs.workA 'tmp'); ops = @($S.manifest.probes.Atrust) }) 'probe-Atrust') } -Needs @('identity-A')
+    Invoke-PspStage 'trust-probe-B' { [void](Invoke-PspChild 'B' 'probe' ([ordered]@{ tempDir = (Join-Path $S.manifest.dirs.workB 'tmp'); ops = @($S.manifest.probes.Btrust) }) 'probe-Btrust') } -Needs @('identity-B')
+    Invoke-PspStage 'probe-B1' { [void](Invoke-PspChild 'B' 'probe' ([ordered]@{ tempDir = (Join-Path $S.manifest.dirs.workB 'tmp'); ops = @($S.manifest.probes.B1self) + @($S.manifest.probes.B1) }) 'probe-B1') } -Needs @('identity-B')
     Invoke-PspStage 'snapshot-S1' { Invoke-PspSnapshotStage 'S1' }
     Invoke-PspStage 'helper-as-A' {
       if (-not $S.manifest.helperInBin) { throw 'helper/wrapper not supplied or sha256 mismatch: helper phase not executed (blocker, not a pass)' }
@@ -202,21 +301,25 @@ try {
       $rec = $null
       try { $rec = Invoke-PspChild 'A' 'node-test' $rq 'helper-run' -TimeoutSec 1200 }
       finally {
-        foreach ($f in @('helper.tap', 'helper.stderr.txt', 'helper-receipt.json')) { $p = Join-Path $wa $f; if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination (Join-Path $ReceiptsDir $f) -Force } }
+        foreach ($f in @('helper.tap', 'helper.stderr.txt', 'helper-receipt.json')) { $p = Join-Path $wa $f; if (Test-Path -LiteralPath $p) { Copy-PspCapture $p (Join-Path $ReceiptsDir $f) } }
       }
       if (-not (Test-Path -LiteralPath (Join-Path $ReceiptsDir 'helper-receipt.json'))) { throw "helper phase wrote no receipt (node exit $($rec.nodeExit))" }
       # A non-zero helper-phase TAP is reported by the verdict from the receipt; it is not masked here.
     } -Needs @('identity-A', 'snapshot-S1')
     Invoke-PspStage 'snapshot-S2' { Invoke-PspSnapshotStage 'S2' (@($S.manifest.mustStayAbsent) + @($S.manifest.measuredOnly) + @($S.manifest.cases | Where-Object { $_.phase -eq 'create' -and $_.object } | ForEach-Object { $_.object })) }
-    Invoke-PspStage 'probe-B2' { [void](Invoke-PspChild 'B' 'probe' ([ordered]@{ tempDir = (Join-Path $S.manifest.dirs.workB 'tmp'); ops = @($S.manifest.probes.B2) }) 'probe-B2') } -Needs @('identity-B', 'helper-as-A')
+    Invoke-PspStage 'probe-B2' { [void](Invoke-PspChild 'B' 'probe' ([ordered]@{ tempDir = (Join-Path $S.manifest.dirs.workB 'tmp'); ops = @($S.manifest.probes.B2self) + @($S.manifest.probes.B2) }) 'probe-B2') } -Needs @('identity-B', 'helper-as-A')
     Invoke-PspStage 'snapshot-S3' { Invoke-PspSnapshotStage 'S3' (@($S.manifest.mustStayAbsent) + @($S.manifest.cases | Where-Object { $_.phase -eq 'create' -and $_.object } | ForEach-Object { $_.object })) }
   }
 
   Invoke-PspStage 'verdict' {
     Write-PspJson $run 'run.json'
     $vt = Join-Path $ReceiptsDir 'verdict.tap'; $ve = Join-Path $ReceiptsDir 'verdict.stderr.txt'
-    $env:PSP_PHASE = 'verdict'; $env:PSP_RECEIPTS_DIR = $ReceiptsDir
-    $np = Start-Process -FilePath $S.nodeSrc -ArgumentList @('--test', '--test-reporter=tap', (Join-Path $PSScriptRoot 'acl.test.mjs')) -NoNewWindow -Wait -PassThru -RedirectStandardOutput $vt -RedirectStandardError $ve
+    Copy-Item -LiteralPath $StatePath -Destination (Join-Path $ReceiptsDir 'state.json') -Force
+    # Elevated verdict runs only trusted copies, re-hashed immediately before use.
+    $vtest = Join-Path $trust.src 'acl.test.mjs'
+    if ((Get-PspSha256 $vtest) -ne $trust.srcSha256['acl.test.mjs'] -or (Get-PspSha256 $S.nodeTrusted) -ne $S.env.node.sha256) { throw 'trusted verdict runtime changed' }
+    $env:PSP_PHASE = 'verdict'; $env:PSP_RECEIPTS_DIR = $ReceiptsDir; $env:PSP_RUN_ID = $env:GITHUB_RUN_ID; $env:PSP_TEMP_LONG = $tempLong
+    $np = Start-Process -FilePath $S.nodeTrusted -ArgumentList @('--test', '--test-reporter=tap', $vtest) -NoNewWindow -Wait -PassThru -RedirectStandardOutput $vt -RedirectStandardError $ve
     $S.verdictExit = $np.ExitCode
     if ($np.ExitCode -ne 0) { throw "verdict failed (node exit $($np.ExitCode)); see verdict.tap" }
   }

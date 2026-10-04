@@ -5,7 +5,8 @@ name: Windows private-storage ACL prototype (#1167, fake-data, test-only)
 #     becomes a job output. A compile failure blocks the test job (needs:).
 #  2. acl-tests: run-validation.ps1 creates two fake standard local users (A owner, B other), fake fixtures
 #     under RUNNER_TEMP and owned FAT32/exFAT VHDs, runs the helper ONLY as A, B's denials as B, verdict from
-#     an independent oracle, then removes exactly what it created. Raw receipts upload on every outcome.
+#     an independent oracle, then removes exactly what it created. Receipts upload only from the admin-verified
+#     export of the trust root bound before any fake account existed.
 # Not product, release, install, durability (G2) or security acceptance. auth.ts / package.json os[] /
 # W0/W1 / existing workflows are untouched and pinned below. No secrets, no publish, no PR trigger.
 # Node pins: official https://nodejs.org/dist/v20.20.2/ SHASUMS256.txt entries supplied by the controller
@@ -29,7 +30,7 @@ env:
   PSP_NODE_HEADERS_SHA256: 6de0e836efa9f32512e61db3dfd08b3d97a015b7e828d1a5efdf281a56a692d9  # node-v20.20.2-headers.tar.gz
   PSP_NODE_LIB_SHA256: c4a794e993d9304238523230885e9ec00ca052c73b9558471858eef14916d91f      # win-x64/node.lib
   PSP_HELPER_BASENAME: private-storage.node
-  PSP_WRAPPER_SHA256: 3b2228432e8010ffc5c24ce1bb8f867bc7cd0a2aa71680ed30b3f65d72f06288
+  PSP_WRAPPER_SHA256: 76f7ab76f27e6f9d58f8df19499aab259a1cbdad8ac0d5089e01d7a05e77fc9f
 
 defaults:
   run:
@@ -68,14 +69,15 @@ jobs:
           done
           check() {
             if [ ! -f "$2" ]; then echo "::error::$2 is missing"; FAIL=1; return 0; fi
-            ACTUAL="$(sha256sum -b -- "$2" | cut -d" " -f1)"
+            ACTUAL="$(sha256sum -b < "$2" | cut -d" " -f1)"
             if [ "${ACTUAL}" = "$1" ]; then echo "pin ok ${ACTUAL} $2"; else echo "::error::$2 sha256 ${ACTUAL} does not match pin $1"; FAIL=1; fi
           }
           # independent harness (tester-owned)
-          check 0320e07db1fd02d1c46c015d2ebc9b55b3cbdecb4c5230160f456bb48473144b prototypes/windows-private-storage/tests/acl.test.mjs
-          check f4c9b47982a2726aca7308f969198e822e5259a683cccd6b93c98ed8674673bc prototypes/windows-private-storage/tests/setup-fixtures.ps1
+          check 6b24c09b9af54424bfd5347402c3af7a691688c2d4e24d4e73373d0e643ef1f0 prototypes/windows-private-storage/tests/acl.test.mjs
+          check e08a0373bf33f0f10052dd76977055287e8c88b573219a338e64f2b71fc99dd1 prototypes/windows-private-storage/tests/wrapper.test.mjs
+          check 002c2f8f4faeb0439737f0e73c926c2be266078eb28edbfed1436ff841c68de2 prototypes/windows-private-storage/tests/setup-fixtures.ps1
           check 944dfdd13f176eed9df0340db45a81a7d83e68308667ee7bc4980b10956fb751 prototypes/windows-private-storage/tests/run-as-user.ps1
-          check 4192f8eeff6356bb428b30681fd70c286043798a6a20a033a9c2184b85c394f5 prototypes/windows-private-storage/tests/run-validation.ps1
+          check b0de2104769f04809ad4df8cee0b802556bc48092000ef53528f383f1f0c09ee prototypes/windows-private-storage/tests/run-validation.ps1
           # baseline that must stay byte-identical (release 148d3b67 staged inputs)
           check 51343c903455905eb96d22f3c6111493dc24e11fa651718e66ea792dfacb5a30 src/hitl/web/auth.ts
           check 14e8bed19324f0b23ebb0abdd4dea3248c6b5ecdeed783fe7c0414237dc37feb src/hitl/web/auth-port.ts
@@ -83,12 +85,12 @@ jobs:
           check 68cbe93558dfcf1ffcc3994e1583bd63510f4f1049fe856bda90afff4a16a35e src/session/persistence/atomic-write.ts
           check 0163aadccc743031f6e907e92d2a2058dd3838b591fc60aaac905be2d12240e4 src/session/persistence/index-lock.ts
           check 2a711cfac1ff8786808f1e502867cae6f6dee490eb77175a72aeb0f8f0df3595 .github/workflows/windows-fake-cmux-acceptance.yml
-          # coder-owned candidate (independently authored; candidate-r1 manifest 76e661ec...)
+          # coder-owned candidate (independently authored; candidate-r1 manifest 76e661ec..., wc1167aca correction: C unchanged)
           check 0e91544eeadb6d426ba8ef2258fd278caae17ae4f23731a2700ddce23f5eae3c prototypes/windows-private-storage/native/private_storage.c
-          check a9c00917093b0610b03c97058396abb1db13a1565aad15d7c9f00a792133d739 prototypes/windows-private-storage/native/build.ps1
+          check c9f6af2a1da16746b2383a317fa5b958d4a018220e63ff2df93ce7fda1900f19 prototypes/windows-private-storage/native/build.ps1
           check ${PSP_WRAPPER_SHA256} prototypes/windows-private-storage/private-storage.mjs
-          check e2b1bfe00bb121a57857ef3fc362c3665ad1e59bffdc39922a46e3d0c8ab77fa prototypes/windows-private-storage/README.md
-          echo "recorded $(sha256sum -b -- .github/workflows/windows-private-storage-prototype.yml | cut -d" " -f1) .github/workflows/windows-private-storage-prototype.yml"
+          check a1e1cd9f957c0ed561da7e8c87ea341aafb524810e21874097ace70362c4fbcd prototypes/windows-private-storage/README.md
+          echo "recorded $(sha256sum -b < .github/workflows/windows-private-storage-prototype.yml | cut -d" " -f1) .github/workflows/windows-private-storage-prototype.yml"
           [ "${FAIL}" = "0" ] || exit 1
 
       - uses: actions/setup-node@v4
@@ -100,7 +102,7 @@ jobs:
           set -euo pipefail
           [ "$(node --version)" = "v${PSP_NODE_VERSION}" ] || { echo "::error::node $(node --version) != v${PSP_NODE_VERSION}"; exit 1; }
           NODE_EXE="$(node -p 'process.execPath')"
-          ACTUAL="$(sha256sum -b -- "${NODE_EXE}" | cut -d" " -f1)"
+          ACTUAL="$(sha256sum -b < "${NODE_EXE}" | cut -d" " -f1)"
           [ "${ACTUAL}" = "${PSP_NODE_EXE_SHA256}" ] || { echo "::error::node.exe sha256 ${ACTUAL} != pin"; exit 1; }
           echo "node ok ${ACTUAL} ${NODE_EXE}"
 
@@ -111,12 +113,12 @@ jobs:
           mkdir -p "${D}"
           curl -fsSL --proto '=https' --tlsv1.2 -o "${D}/headers.tar.gz" "https://nodejs.org/dist/v${PSP_NODE_VERSION}/node-v${PSP_NODE_VERSION}-headers.tar.gz"
           curl -fsSL --proto '=https' --tlsv1.2 -o "${D}/node.lib" "https://nodejs.org/dist/v${PSP_NODE_VERSION}/win-x64/node.lib"
-          [ "$(sha256sum -b -- "${D}/headers.tar.gz" | cut -d" " -f1)" = "${PSP_NODE_HEADERS_SHA256}" ] || { echo "::error::headers tarball hash mismatch"; exit 1; }
-          [ "$(sha256sum -b -- "${D}/node.lib" | cut -d" " -f1)" = "${PSP_NODE_LIB_SHA256}" ] || { echo "::error::node.lib hash mismatch"; exit 1; }
+          [ "$(sha256sum -b < "${D}/headers.tar.gz" | cut -d" " -f1)" = "${PSP_NODE_HEADERS_SHA256}" ] || { echo "::error::headers tarball hash mismatch"; exit 1; }
+          [ "$(sha256sum -b < "${D}/node.lib" | cut -d" " -f1)" = "${PSP_NODE_LIB_SHA256}" ] || { echo "::error::node.lib hash mismatch"; exit 1; }
           tar -xzf "${D}/headers.tar.gz" -C "${D}"
           INC="${D}/node-v${PSP_NODE_VERSION}/include/node"
           # The official 20.20.2 headers equal the four staged task inputs (verified offline); gate on them.
-          hdr() { A="$(sha256sum -b -- "${INC}/$2" | cut -d" " -f1)"; [ "${A}" = "$1" ] || { echo "::error::$2 ${A} != $1"; exit 1; }; echo "header ok ${A} $2"; }
+          hdr() { A="$(sha256sum -b < "${INC}/$2" | cut -d" " -f1)"; [ "${A}" = "$1" ] || { echo "::error::$2 ${A} != $1"; exit 1; }; echo "header ok ${A} $2"; }
           hdr 89393f07881fcba3ed097a5989fba1746f1c2cf611f19ba4dcb17071da8a661e js_native_api.h
           hdr 0410c31e227f81e2981363c4d543f4832ac3df785343ec64cee621742ff8a034 js_native_api_types.h
           hdr cf2446da4783a707dc9399321cff3ea28dce86fafdf38746fc47f1b293f5a040 node_api.h
@@ -144,7 +146,7 @@ jobs:
           set -euo pipefail
           F="${RUNNER_TEMP}/psp1167-build/out/${PSP_HELPER_BASENAME}"
           [ -f "${F}" ] || { echo "::error::build produced no ${PSP_HELPER_BASENAME}"; exit 1; }
-          SHA="$(sha256sum -b -- "${F}" | cut -d" " -f1)"
+          SHA="$(sha256sum -b < "${F}" | cut -d" " -f1)"
           CL="$(head -n 1 "${RUNNER_TEMP}/psp1167-build/cl-version.txt" | tr -d '\r"\\')"
           echo "helper_sha256=${SHA}" >> "${GITHUB_OUTPUT}"
           printf '{"schema":"aigentry/1167-psp-build/v1","task":"1167","status":"BUILT","arch":"win32-x64","helper":"%s","sha256":"%s","cl":"%s","node":"%s","runId":"%s","sourceSha":"%s","productAcceptance":false}\n' \
@@ -187,6 +189,17 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/psp1167-receipts"
           printf '%s\n' '{"schema":"aigentry/1167-psp-run/v1","task":"1167","status":"FAILED","reason":"validation-not-reached","productAcceptance":false,"feasibilityOnly":true}' > "${RUNNER_TEMP}/psp1167-receipts/run.json"
 
+      # Binds this run's trust-root name before any fake account or lower-privileged process exists (the runner
+      # keeps the output in its own context). Later steps use only this exact name: no RUNNER_TEMP glob.
+      - name: Bind the trust-root name for this run
+        id: bind
+        run: |
+          set -euo pipefail
+          LEAF="psp1167-trust-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+          [[ "${LEAF}" =~ ^psp1167-trust-[0-9a-f]{16}$ ]] || { echo "::error::trust-root name not generated"; exit 1; }
+          echo "trust_leaf=${LEAF}" >> "${GITHUB_OUTPUT}"
+          echo "trust root name ${LEAF}"
+
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -202,14 +215,15 @@ jobs:
           done
           check() {
             if [ ! -f "$2" ]; then echo "::error::$2 is missing"; FAIL=1; return 0; fi
-            ACTUAL="$(sha256sum -b -- "$2" | cut -d" " -f1)"
+            ACTUAL="$(sha256sum -b < "$2" | cut -d" " -f1)"
             if [ "${ACTUAL}" = "$1" ]; then echo "pin ok ${ACTUAL} $2"; else echo "::error::$2 sha256 ${ACTUAL} does not match pin $1"; FAIL=1; fi
           }
           # independent harness (tester-owned)
-          check 0320e07db1fd02d1c46c015d2ebc9b55b3cbdecb4c5230160f456bb48473144b prototypes/windows-private-storage/tests/acl.test.mjs
-          check f4c9b47982a2726aca7308f969198e822e5259a683cccd6b93c98ed8674673bc prototypes/windows-private-storage/tests/setup-fixtures.ps1
+          check 6b24c09b9af54424bfd5347402c3af7a691688c2d4e24d4e73373d0e643ef1f0 prototypes/windows-private-storage/tests/acl.test.mjs
+          check e08a0373bf33f0f10052dd76977055287e8c88b573219a338e64f2b71fc99dd1 prototypes/windows-private-storage/tests/wrapper.test.mjs
+          check 002c2f8f4faeb0439737f0e73c926c2be266078eb28edbfed1436ff841c68de2 prototypes/windows-private-storage/tests/setup-fixtures.ps1
           check 944dfdd13f176eed9df0340db45a81a7d83e68308667ee7bc4980b10956fb751 prototypes/windows-private-storage/tests/run-as-user.ps1
-          check 4192f8eeff6356bb428b30681fd70c286043798a6a20a033a9c2184b85c394f5 prototypes/windows-private-storage/tests/run-validation.ps1
+          check b0de2104769f04809ad4df8cee0b802556bc48092000ef53528f383f1f0c09ee prototypes/windows-private-storage/tests/run-validation.ps1
           # baseline that must stay byte-identical (release 148d3b67 staged inputs)
           check 51343c903455905eb96d22f3c6111493dc24e11fa651718e66ea792dfacb5a30 src/hitl/web/auth.ts
           check 14e8bed19324f0b23ebb0abdd4dea3248c6b5ecdeed783fe7c0414237dc37feb src/hitl/web/auth-port.ts
@@ -217,12 +231,12 @@ jobs:
           check 68cbe93558dfcf1ffcc3994e1583bd63510f4f1049fe856bda90afff4a16a35e src/session/persistence/atomic-write.ts
           check 0163aadccc743031f6e907e92d2a2058dd3838b591fc60aaac905be2d12240e4 src/session/persistence/index-lock.ts
           check 2a711cfac1ff8786808f1e502867cae6f6dee490eb77175a72aeb0f8f0df3595 .github/workflows/windows-fake-cmux-acceptance.yml
-          # coder-owned candidate (independently authored; candidate-r1 manifest 76e661ec...)
+          # coder-owned candidate (independently authored; candidate-r1 manifest 76e661ec..., wc1167aca correction: C unchanged)
           check 0e91544eeadb6d426ba8ef2258fd278caae17ae4f23731a2700ddce23f5eae3c prototypes/windows-private-storage/native/private_storage.c
-          check a9c00917093b0610b03c97058396abb1db13a1565aad15d7c9f00a792133d739 prototypes/windows-private-storage/native/build.ps1
+          check c9f6af2a1da16746b2383a317fa5b958d4a018220e63ff2df93ce7fda1900f19 prototypes/windows-private-storage/native/build.ps1
           check ${PSP_WRAPPER_SHA256} prototypes/windows-private-storage/private-storage.mjs
-          check e2b1bfe00bb121a57857ef3fc362c3665ad1e59bffdc39922a46e3d0c8ab77fa prototypes/windows-private-storage/README.md
-          echo "recorded $(sha256sum -b -- .github/workflows/windows-private-storage-prototype.yml | cut -d" " -f1) .github/workflows/windows-private-storage-prototype.yml"
+          check a1e1cd9f957c0ed561da7e8c87ea341aafb524810e21874097ace70362c4fbcd prototypes/windows-private-storage/README.md
+          echo "recorded $(sha256sum -b < .github/workflows/windows-private-storage-prototype.yml | cut -d" " -f1) .github/workflows/windows-private-storage-prototype.yml"
           [ "${FAIL}" = "0" ] || exit 1
 
       - uses: actions/setup-node@v4
@@ -234,9 +248,16 @@ jobs:
           set -euo pipefail
           [ "$(node --version)" = "v${PSP_NODE_VERSION}" ] || { echo "::error::node $(node --version) != v${PSP_NODE_VERSION}"; exit 1; }
           NODE_EXE="$(node -p 'process.execPath')"
-          ACTUAL="$(sha256sum -b -- "${NODE_EXE}" | cut -d" " -f1)"
+          ACTUAL="$(sha256sum -b < "${NODE_EXE}" | cut -d" " -f1)"
           [ "${ACTUAL}" = "${PSP_NODE_EXE_SHA256}" ] || { echo "::error::node.exe sha256 ${ACTUAL} != pin"; exit 1; }
           echo "node ok ${ACTUAL} ${NODE_EXE}"
+
+      # Wrapper regression against a STUB native (fake process.dlopen, fake bytes). Runs before the helper is
+      # downloaded: the real helper is never loaded here; it loads only as fake user A in the validation step.
+      - name: Wrapper regression tests (stub native only)
+        run: |
+          set -euo pipefail
+          PSP_WRAPPER_UNDER_TEST_SHA256="${PSP_WRAPPER_SHA256}" node --test --test-reporter=tap prototypes/windows-private-storage/tests/wrapper.test.mjs | tee "${RUNNER_TEMP}/psp1167-receipts/wrapper-test.tap"
 
       - name: Download helper binary
         uses: actions/download-artifact@v4
@@ -249,7 +270,7 @@ jobs:
           EXPECTED: ${{ needs.compile.outputs.helper_sha256 }}
         run: |
           set -euo pipefail
-          ACTUAL="$(sha256sum -b -- "${RUNNER_TEMP}/psp1167-helper/${PSP_HELPER_BASENAME}" | cut -d" " -f1)"
+          ACTUAL="$(sha256sum -b < "${RUNNER_TEMP}/psp1167-helper/${PSP_HELPER_BASENAME}" | cut -d" " -f1)"
           [ -n "${EXPECTED}" ] && [ "${ACTUAL}" = "${EXPECTED}" ] || { echo "::error::helper ${ACTUAL} != compile output ${EXPECTED}"; exit 1; }
           echo "helper ok ${ACTUAL}"
 
@@ -260,23 +281,57 @@ jobs:
           PSP_HELPER_PATH: ${{ runner.temp }}\psp1167-helper\${{ env.PSP_HELPER_BASENAME }}
           PSP_HELPER_SHA256: ${{ needs.compile.outputs.helper_sha256 }}
           PSP_WRAPPER_PATH: ${{ github.workspace }}\prototypes\windows-private-storage\private-storage.mjs
+          PSP_TRUST_LEAF: ${{ steps.bind.outputs.trust_leaf }}
         run: |
           & "$env:GITHUB_WORKSPACE\prototypes\windows-private-storage\tests\run-validation.ps1"
           exit $LASTEXITCODE
 
-      # Removes only identities/VHDs/root recorded in the state file, even if the step above was killed.
+      # Removes only identities/VHDs/root recorded in the trusted state file, even if the step above was killed.
+      # Runs the trusted copy inside the exact trust root bound before any fake account existed (never the
+      # workspace copy, never a look-alike root found by name); any other shape refuses before anything executes.
       - name: Cleanup backstop (recorded resources only)
         if: always()
         shell: powershell
+        env:
+          PSP_TRUST_LEAF: ${{ steps.bind.outputs.trust_leaf }}
         run: |
-          & "$env:GITHUB_WORKSPACE\prototypes\windows-private-storage\tests\run-validation.ps1" -CleanupOnly
+          $ErrorActionPreference = 'Stop'
+          $env:PSModulePath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
+          if (-not $env:PSP_TRUST_LEAF) { Write-Output 'cleanup: no trust-root binding; validation never ran'; exit 0 }
+          if ($env:PSP_TRUST_LEAF -cnotmatch '^psp1167-trust-[0-9a-f]{16}$') { Write-Output 'cleanup: refusing malformed trust-root binding'; exit 1 }
+          $p = Join-Path $env:RUNNER_TEMP $env:PSP_TRUST_LEAF
+          if (-not (Test-Path -LiteralPath $p)) { Write-Output 'cleanup: bound trust root absent; nothing was created'; exit 0 }
+          $t = @(Get-Item -LiteralPath $p -Force)
+          $sd = (Get-Acl -LiteralPath $t[0].FullName).Sddl
+          if ((($t[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or ($sd -cnotmatch '^O:BA(G:[^:()]+)?D:PAI?\(A;OICI;FA;;;(SY|BA)\)\(A;OICI;FA;;;(SY|BA)\)$')) { Write-Output "cleanup: refusing unverified trust root $($t[0].FullName) $sd"; exit 1 }
+          & (Join-Path $t[0].FullName 'src\run-validation.ps1') -CleanupOnly -TrustRoot $t[0].FullName
+          exit $LASTEXITCODE
+
+      # The only upload source: the trusted copy captures this run's receipts from the exact bound trust root into a
+      # new protected export dir (plain single-link files, no fake-user process alive). Refusal => nothing uploads.
+      - name: Export verified receipts
+        id: export
+        if: always()
+        shell: powershell
+        env:
+          PSP_TRUST_LEAF: ${{ steps.bind.outputs.trust_leaf }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PSModulePath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
+          if ($env:PSP_TRUST_LEAF -cnotmatch '^psp1167-trust-[0-9a-f]{16}$') { Write-Output 'export: refusing, no trust-root binding for this run'; exit 1 }
+          $p = Join-Path $env:RUNNER_TEMP $env:PSP_TRUST_LEAF
+          if (-not (Test-Path -LiteralPath $p)) { Write-Output 'export: bound trust root absent; no evidence to upload'; exit 1 }
+          $t = @(Get-Item -LiteralPath $p -Force)
+          $sd = (Get-Acl -LiteralPath $t[0].FullName).Sddl
+          if ((($t[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or ($sd -cnotmatch '^O:BA(G:[^:()]+)?D:PAI?\(A;OICI;FA;;;(SY|BA)\)\(A;OICI;FA;;;(SY|BA)\)$')) { Write-Output "export: refusing unverified trust root $($t[0].FullName) $sd"; exit 1 }
+          & (Join-Path $t[0].FullName 'src\run-validation.ps1') -ExportOnly -TrustRoot $t[0].FullName
           exit $LASTEXITCODE
 
       - name: Upload raw receipts
-        if: always()
+        if: always() && steps.export.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: psp1167-acl-receipts
-          path: ${{ runner.temp }}/psp1167-receipts
+          path: ${{ runner.temp }}/${{ steps.bind.outputs.trust_leaf }}/export
           if-no-files-found: error
           retention-days: 7

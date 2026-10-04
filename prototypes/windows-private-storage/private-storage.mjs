@@ -23,37 +23,70 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
 const HEX16 = /^[0-9a-f]{16}$/;
 const HEX32 = /^[0-9a-f]{32}$/;
 
+// Reason strings the native module may emit (private_storage.c). Any other
+// string is treated as a malformed result so arbitrary text is never forwarded.
+const NATIVE_REASONS = new Set([
+  'ok', 'path_grammar', 'invalid_argument', 'not_found', 'already_exists',
+  'ancestor_open_failed', 'ancestor_query_failed', 'ancestor_reparse_point',
+  'ancestor_not_directory', 'open_failed', 'create_failed', 'type_query_failed',
+  'attributes_query_failed', 'reparse_point', 'not_directory', 'not_regular_file',
+  'link_count', 'volume_query_failed', 'acl_not_persistent',
+  'final_path_query_failed', 'final_path_unrecognized', 'final_path_mismatch',
+  'final_path_compare_failed', 'security_query_failed', 'owner_mismatch',
+  'dacl_absent', 'dacl_null', 'dacl_not_protected', 'dacl_invalid', 'dacl_empty',
+  'ace_unsupported', 'ace_foreign_allow', 'owner_ace_missing',
+  'identity_query_failed', 'size_query_failed', 'size_limit', 'size_changed',
+  'read_failed', 'write_failed', 'short_write', 'flush_failed', 'close_failed',
+  'token_open_failed', 'token_query_failed', 'token_sid_invalid',
+  'descriptor_build_failed', 'alloc_failed', 'internal_error',
+]);
+
 function unavailable(reason) {
   return Object.freeze({ status: 'unavailable', reason, win32Error: 0 });
+}
+
+// Create results always carry `created`: false (native never ran), the native
+// boolean when one survived, or null (UNKNOWN: the side effect may have happened).
+function createFailure(reason, created) {
+  return Object.freeze({ status: 'unavailable', reason, win32Error: 0, created });
 }
 
 /**
  * Rebuilds a native result into a fixed shape. Anything unexpected fails closed.
  * `bytes` is kept only for readPrivateFile with status 'ok'.
+ * Each raw property is read exactly once; callers run this inside try/catch so a
+ * throwing getter/proxy cannot escape. `created` is the value already read by invoke.
  */
-function normalize(raw, { withBytes, withCreated }) {
-  if (raw === null || typeof raw !== 'object') return unavailable('native_result_invalid');
-  const { status, reason, win32Error } = raw;
-  if (!STATUSES.includes(status) || typeof reason !== 'string') {
-    return unavailable('native_result_invalid');
-  }
+function normalize(raw, { withBytes, withCreated }, created) {
+  const invalid = () =>
+    withCreated ? createFailure('native_result_invalid', created) : unavailable('native_result_invalid');
+  if (raw === null || typeof raw !== 'object') return invalid();
+  const status = raw.status;
+  const reason = raw.reason;
+  const win32Error = raw.win32Error;
+  if (typeof status !== 'string' || !STATUSES.includes(status)) return invalid();
+  if (typeof reason !== 'string' || !NATIVE_REASONS.has(reason)) return invalid();
   if (!Number.isInteger(win32Error) || win32Error < 0 || win32Error > 0xffffffff) {
-    return unavailable('native_result_invalid');
+    return invalid();
   }
   const out = { status, reason, win32Error };
   if (withCreated) {
-    if (typeof raw.created !== 'boolean') return unavailable('native_result_invalid');
-    out.created = raw.created;
+    if (created === null) return invalid();
+    out.created = created;
   }
   if (status === 'ok') {
-    if (!HEX16.test(raw.volumeSerial) || !HEX32.test(raw.fileId)) {
-      return unavailable('native_result_invalid');
+    const volumeSerial = raw.volumeSerial;
+    const fileId = raw.fileId;
+    if (typeof volumeSerial !== 'string' || !HEX16.test(volumeSerial) ||
+        typeof fileId !== 'string' || !HEX32.test(fileId)) {
+      return invalid();
     }
-    out.volumeSerial = raw.volumeSerial;
-    out.fileId = raw.fileId;
+    out.volumeSerial = volumeSerial;
+    out.fileId = fileId;
     if (withBytes) {
-      if (!Buffer.isBuffer(raw.bytes)) return unavailable('native_result_invalid');
-      out.bytes = raw.bytes;
+      const bytes = raw.bytes;
+      if (!Buffer.isBuffer(bytes)) return invalid();
+      out.bytes = bytes;
     }
   }
   return Object.freeze(out);
@@ -65,9 +98,22 @@ function invoke(fn, args, shape) {
     raw = fn(...args);
   } catch {
     // Never forward native/engine error text: it is not part of the contract.
-    return unavailable('native_threw');
+    // For create calls the side effect is UNKNOWN: never claim false, never retry.
+    return shape.withCreated ? createFailure('native_threw', null) : unavailable('native_threw');
   }
-  return normalize(raw, shape);
+  let created = null;
+  try {
+    if (shape.withCreated && raw !== null && typeof raw === 'object') {
+      // Read first and alone, so a valid native boolean survives later shape errors.
+      const value = raw.created;
+      if (typeof value === 'boolean') created = value;
+    }
+    return normalize(raw, shape, created);
+  } catch {
+    return shape.withCreated
+      ? createFailure('native_result_invalid', created)
+      : unavailable('native_result_invalid');
+  }
 }
 
 function validPath(path) {
@@ -93,13 +139,17 @@ function bind(native) {
       return invoke(native.readPrivateFile, [path, max], { withBytes: true, withCreated: false });
     },
     createPrivateDir(path) {
-      if (!validPath(path)) return Object.freeze({ ...unavailable('invalid_argument'), created: false });
+      if (!validPath(path)) return createFailure('invalid_argument', false);
       return invoke(native.createPrivateDir, [path], { withBytes: false, withCreated: true });
     },
     createPrivateFileExclusive(path, bytes) {
-      if (!validPath(path) || !validBytes(bytes)) {
-        return Object.freeze({ ...unavailable('invalid_argument'), created: false });
+      let valid;
+      try {
+        valid = validPath(path) && validBytes(bytes);
+      } catch {
+        valid = false; // e.g. a proxy/subclass whose prototype or byteLength access throws
       }
+      if (!valid) return createFailure('invalid_argument', false);
       return invoke(native.createPrivateFileExclusive, [path, bytes], {
         withBytes: false,
         withCreated: true,

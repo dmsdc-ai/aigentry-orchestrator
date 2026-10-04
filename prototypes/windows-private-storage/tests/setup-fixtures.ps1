@@ -11,6 +11,7 @@ Set-StrictMode -Version 2.0
 
 $script:PspOracleSource = @'
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -25,6 +26,10 @@ namespace Psp1167 {
     public string sha256; public int readError; public bool ancestorReparse; public string ancestorReparsePath;
   }
 
+  public class Removal {
+    public int files; public int dirs; public int links; public int entries; public List<string> problems = new List<string>();
+  }
+
   public static class Oracle {
     const uint READ_CONTROL = 0x00020000, FILE_READ_DATA = 0x1, FILE_READ_ATTRIBUTES = 0x80;
     const uint SHARE_ALL = 0x7, OPEN_EXISTING = 3;
@@ -36,9 +41,13 @@ namespace Psp1167 {
     struct BHFI { public uint attrs; public uint c1, c2, a1, a2, w1, w2; public uint volSerial, sizeHigh, sizeLow, nLinks, idxHigh, idxLow; }
     [StructLayout(LayoutKind.Sequential, Pack = 4)]
     struct TokPriv { public uint count; public long luid; public uint attrs; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct SecAttr { public int len; public IntPtr sd; public bool inherit; }
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     static extern IntPtr CreateFileW(string p, uint access, uint share, IntPtr sa, uint disp, uint flags, IntPtr tmpl);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool CreateDirectoryW(string p, ref SecAttr sa);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr h);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetFileInformationByHandle(IntPtr h, out BHFI info);
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
@@ -72,6 +81,11 @@ namespace Psp1167 {
     [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr p, uint acc, out IntPtr t);
     [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool LookupPrivilegeValueW(string sys, string name, out long luid);
     [DllImport("advapi32.dll", SetLastError = true)] static extern bool AdjustTokenPrivileges(IntPtr t, bool disableAll, ref TokPriv n, int len, IntPtr prev, IntPtr ret);
+    [StructLayout(LayoutKind.Sequential)]
+    struct Disposition { public byte delete; }
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetFileInformationByHandleEx(IntPtr h, int cls, IntPtr buf, uint size);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetFileInformationByHandle(IntPtr h, int cls, ref Disposition info, uint size);
+    const uint DELETE_ACCESS = 0x00010000, SYNCHRONIZE = 0x00100000;
 
     // Returns 0 when enabled; 1300 (ERROR_NOT_ALL_ASSIGNED) when the token does not hold it.
     public static int EnablePrivilege(string name) {
@@ -112,6 +126,143 @@ namespace Psp1167 {
       if (!ConvertStringSidToSidW(sidString, out sid)) return Marshal.GetLastWin32Error();
       try { return (int)SetNamedSecurityInfoW(path, 1, 0x1, sid, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero); }
       finally { LocalFree(sid); }
+    }
+
+    // Creates a NEW directory with its final descriptor applied at creation (no inherited window).
+    // ERROR_ALREADY_EXISTS (183) when the name exists: an existing object is never adopted.
+    public static int CreateProtectedDir(string path, string sddl) {
+      IntPtr sd; uint len;
+      if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, out sd, out len)) return Marshal.GetLastWin32Error();
+      try {
+        SecAttr sa = new SecAttr(); sa.len = Marshal.SizeOf(typeof(SecAttr)); sa.sd = sd; sa.inherit = false;
+        return CreateDirectoryW(path, ref sa) ? 0 : Marshal.GetLastWin32Error();
+      } finally { LocalFree(sd); }
+    }
+
+    // Stable capture of an untrusted outbox file into a NEW trusted file: the leaf is not followed, share READ
+    // only (a live writer => 32), and the bytes come from that one handle. -2 dir/reparse/nLinks!=1,
+    // -3 larger than max, -4 size changed during the read, -5 destination exists or cannot be written.
+    public static int Capture(string src, string dst, long max) {
+      IntPtr h = CreateFileW(src, FILE_READ_DATA | FILE_READ_ATTRIBUTES, 0x1, IntPtr.Zero, OPEN_EXISTING, FLAG_OPEN_REPARSE, IntPtr.Zero);
+      if (h == INVALID) return Marshal.GetLastWin32Error();
+      try {
+        BHFI fi;
+        if (!GetFileInformationByHandle(h, out fi)) return Marshal.GetLastWin32Error();
+        if ((fi.attrs & (ATTR_DIR | ATTR_REPARSE)) != 0 || fi.nLinks != 1) return -2;
+        long size = ((long)fi.sizeHigh << 32) | fi.sizeLow;
+        if (size > max) return -3;
+        using (MemoryStream ms = new MemoryStream()) {
+          byte[] b = new byte[65536]; int r;
+          while (true) {
+            if (!ReadFile(h, b, b.Length, out r, IntPtr.Zero)) return Marshal.GetLastWin32Error();
+            if (r == 0) break;
+            ms.Write(b, 0, r);
+            if (ms.Length > max) return -3;
+          }
+          if (ms.Length != size) return -4;
+          using (FileStream fs = new FileStream(dst, FileMode.CreateNew, FileAccess.Write, FileShare.None)) { ms.WriteTo(fs); }
+        }
+        return 0;
+      } catch (IOException) { return -5; } finally { CloseHandle(h); }
+    }
+
+    // ---- cleanup deletion: no owner/DACL change, no link following, handle-bound identity ----
+    // Backup semantics (SeBackup/SeRestore enabled by the caller) grant list/DELETE without touching any ACL.
+    // No FILE_SHARE_DELETE: a held entry cannot be renamed or replaced underneath the walk.
+    static IntPtr OpenForRemoval(string p, uint share) {
+      return CreateFileW(p, DELETE_ACCESS | FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE, share, IntPtr.Zero, OPEN_EXISTING, FLAG_BACKUP | FLAG_OPEN_REPARSE, IntPtr.Zero);
+    }
+    static int MarkDelete(IntPtr h) {
+      Disposition d = new Disposition(); d.delete = 1;
+      return SetFileInformationByHandle(h, 4, ref d, 1) ? 0 : Marshal.GetLastWin32Error();
+    }
+    // Names of one directory, read through its already-verified handle (FileFullDirectoryInfo); never a path re-walk.
+    static List<string> ListNames(IntPtr dir, out int err) {
+      List<string> names = new List<string>(); err = 0;
+      IntPtr buf = Marshal.AllocHGlobal(65536);
+      try {
+        int cls = 15;
+        while (true) {
+          if (!GetFileInformationByHandleEx(dir, cls, buf, 65536)) { int e = Marshal.GetLastWin32Error(); if (e != 18) err = e; break; }
+          cls = 14;
+          int off = 0;
+          while (true) {
+            IntPtr ent = IntPtr.Add(buf, off);
+            int next = Marshal.ReadInt32(ent, 0), len = Marshal.ReadInt32(ent, 60);
+            string n = Marshal.PtrToStringUni(IntPtr.Add(ent, 68), len / 2);
+            if (n != "." && n != "..") names.Add(n);
+            if (next == 0) break;
+            off += next;
+          }
+        }
+      } finally { Marshal.FreeHGlobal(buf); }
+      return names;
+    }
+
+    // The one deliberate hardlink fixture: both names must still be the same file (volume + file index) with
+    // exactly these two links before the first name goes, and the survivor must be that file with one link.
+    // null = removed or both absent; a single remaining name is left to RemoveTree (which refuses nLinks != 1).
+    public static string RemoveLinkPair(string a, string b) {
+      IntPtr ha = OpenForRemoval(a, SHARE_ALL); int ea = (ha == INVALID) ? Marshal.GetLastWin32Error() : 0;
+      IntPtr hb = OpenForRemoval(b, SHARE_ALL); int eb = (hb == INVALID) ? Marshal.GetLastWin32Error() : 0;
+      try {
+        if ((ea != 0 && ea != 2) || (eb != 0 && eb != 2)) return "link pair open " + ea + "/" + eb;
+        if (ea == 2 || eb == 2) return null;
+        BHFI fa, fb;
+        if (!GetFileInformationByHandle(ha, out fa) || !GetFileInformationByHandle(hb, out fb)) return "link pair info " + Marshal.GetLastWin32Error();
+        if (((fa.attrs | fb.attrs) & (ATTR_DIR | ATTR_REPARSE)) != 0 || fa.volSerial != fb.volSerial || fa.idxHigh != fb.idxHigh || fa.idxLow != fb.idxLow || fa.nLinks != 2 || fb.nLinks != 2)
+          return "link pair identity changed (left in place)";
+        CloseHandle(hb); hb = INVALID;
+        int e = MarkDelete(ha); CloseHandle(ha); ha = INVALID;
+        if (e != 0) return "delete " + a + ": " + e;
+        hb = OpenForRemoval(b, SHARE_ALL);
+        if (hb == INVALID) return "reopen " + b + ": " + Marshal.GetLastWin32Error();
+        BHFI f2;
+        if (!GetFileInformationByHandle(hb, out f2) || f2.volSerial != fa.volSerial || f2.idxHigh != fa.idxHigh || f2.idxLow != fa.idxLow || f2.nLinks != 1 || (f2.attrs & (ATTR_DIR | ATTR_REPARSE)) != 0)
+          return "link pair survivor identity changed (left in place)";
+        e = MarkDelete(hb);
+        return (e != 0) ? "delete " + b + ": " + e : null;
+      } finally { if (ha != INVALID) CloseHandle(ha); if (hb != INVALID) CloseHandle(hb); }
+    }
+
+    // Deletes one owned directory tree. Reparse points are deleted as links and never entered; other volumes and
+    // multi-link files are refused and left in place; a directory goes only once empty. Any problem leaves the
+    // root in place (explicit cleanup failure, never claimed clean).
+    public static Removal RemoveTree(string root, int maxDepth, int maxEntries) {
+      Removal r = new Removal();
+      IntPtr h = OpenForRemoval(root, 0x3);
+      if (h == INVALID) { r.problems.Add("open " + root + ": " + Marshal.GetLastWin32Error()); return r; }
+      try {
+        BHFI fi;
+        if (!GetFileInformationByHandle(h, out fi)) { r.problems.Add("info " + root + ": " + Marshal.GetLastWin32Error()); return r; }
+        if ((fi.attrs & ATTR_REPARSE) != 0 || (fi.attrs & ATTR_DIR) == 0) { r.problems.Add("root is not a plain directory"); return r; }
+        Walk(h, root, fi.volSerial, 0, maxDepth, maxEntries, r);
+        if (r.problems.Count == 0) { int e = MarkDelete(h); if (e != 0) r.problems.Add("delete " + root + ": " + e); else r.dirs++; }
+      } finally { CloseHandle(h); }
+      return r;
+    }
+
+    static void Walk(IntPtr dir, string path, uint vol, int depth, int maxDepth, int maxEntries, Removal r) {
+      if (depth >= maxDepth) { r.problems.Add("depth cap at " + path); return; }
+      int err; List<string> names = ListNames(dir, out err);
+      if (err != 0) { r.problems.Add("list " + path + ": " + err); return; }
+      foreach (string n in names) {
+        if (++r.entries > maxEntries) { r.problems.Add("entry cap at " + path); return; }
+        string p = path + "\\" + n;
+        IntPtr h = OpenForRemoval(p, 0x3);
+        if (h == INVALID) { r.problems.Add("open " + p + ": " + Marshal.GetLastWin32Error()); continue; }
+        try {
+          BHFI fi;
+          if (!GetFileInformationByHandle(h, out fi)) { r.problems.Add("info " + p + ": " + Marshal.GetLastWin32Error()); continue; }
+          if (fi.volSerial != vol) { r.problems.Add("other volume (left in place) " + p); continue; }
+          bool reparse = (fi.attrs & ATTR_REPARSE) != 0, isDir = (fi.attrs & ATTR_DIR) != 0;
+          if (!reparse && isDir) { int before = r.problems.Count; Walk(h, p, vol, depth + 1, maxDepth, maxEntries, r); if (r.problems.Count != before) continue; }
+          else if (!reparse && fi.nLinks != 1) { r.problems.Add("multi-link file (left in place, nLinks " + fi.nLinks + ") " + p); continue; }
+          int e = MarkDelete(h);
+          if (e != 0) r.problems.Add("delete " + p + ": " + e);
+          else if (reparse) r.links++; else if (isDir) r.dirs++; else r.files++;
+        } finally { CloseHandle(h); }
+      }
     }
 
     // One backup-semantics handle, leaf not followed; every fact below is read on that handle.
@@ -199,6 +350,182 @@ function Save-PspState { param($State, [string]$StatePath)
   ($State | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $StatePath -Encoding UTF8
 }
 
+function Get-PspTempLong {
+  $t = [Psp1167.Oracle]::LongPath([System.IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\'))
+  if (-not $t) { throw 'cannot resolve the long form of RUNNER_TEMP' }
+  return $t
+}
+
+# ---- trusted root (state, oracle receipts, scratch, elevated harness copies) ----
+# Created NEW with its final protected SYSTEM+Administrators-only descriptor and read back BEFORE any fake
+# account or lower-privileged process exists. A/B inputs/outputs stay in their own work dirs (outboxes);
+# the admin side captures them into the trusted root. Twin rule: acl.test.mjs trustProblems.
+$script:PspTrustSddl = 'O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)'
+$script:PspTrustFiles = @('acl.test.mjs', 'setup-fixtures.ps1', 'run-as-user.ps1', 'run-validation.ps1')
+$script:PspRightBits = @{ GA = 0x10000000; GR = 2147483648; GW = 0x40000000; GX = 0x20000000; FA = 0x1F01FF; FR = 0x120089; FW = 0x120116; FX = 0x1200A0
+  RC = 0x20000; SD = 0x10000; WD = 0x40000; WO = 0x80000; CC = 0x1; DC = 0x2; LC = 0x4; SW = 0x8; RP = 0x10; WP = 0x20; DT = 0x40; LO = 0x80; CR = 0x100 }
+# write data/append/EA/attributes, delete child, DELETE, WRITE_DAC, WRITE_OWNER, GENERIC_WRITE, GENERIC_ALL
+$script:PspWriteBits = [long](0x2 -bor 0x4 -bor 0x10 -bor 0x40 -bor 0x100 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x40000000 -bor 0x10000000)
+
+function ConvertTo-PspSid { param([string]$S)
+  switch -CaseSensitive ($S) { 'BA' { return 'S-1-5-32-544' } 'SY' { return 'S-1-5-18' } default { return $S } }
+}
+
+function Test-PspReadOnlyRights { param([string]$Rights)
+  [long]$mask = 0
+  if ($Rights -cmatch '^0x[0-9a-fA-F]+$') { $mask = [Convert]::ToInt64($Rights.Substring(2), 16) }
+  elseif ($Rights -cmatch '^([A-Z]{2})+$') {
+    for ($i = 0; $i -lt $Rights.Length; $i += 2) {
+      $t = $Rights.Substring($i, 2)
+      if (-not $script:PspRightBits.ContainsKey($t)) { return $false }
+      $mask = $mask -bor [long]$script:PspRightBits[$t]
+    }
+  } else { return $false }
+  return (($mask -band $script:PspWriteBits) -eq 0)
+}
+
+# Problems (empty = trusted): owner listed; DACL present and non-NULL (protected when asked); only allow/deny
+# ACEs; every allow ACE is SYSTEM/Administrators or a listed reader without any write/delete/DAC/owner bit.
+function Test-PspTrustedSddl { param([string]$Sddl, [string[]]$Owners, [string[]]$Readers = @(), [switch]$Protected)
+  if ([string]::IsNullOrEmpty($Sddl) -or -not ($Sddl -cmatch '^O:([^:()]+?)(G:[^:()]+?)?D:([A-Z_]*)((\([^()]*\))*)$')) { return @('sddl-unparsed') }
+  $owner = ConvertTo-PspSid $Matches[1]; $flags = $Matches[3]; $aceText = $Matches[4]
+  $p = @()
+  if ($Owners -cnotcontains $owner) { $p += "owner:$owner" }
+  if ($flags -cmatch 'NO_ACCESS_CONTROL') { $p += 'null-dacl' }
+  if ($Protected -and ($flags -cnotmatch '^P')) { $p += 'not-protected' }
+  $allow = 0
+  foreach ($m in [regex]::Matches($aceText, '\(([^()]*)\)')) {
+    $f = $m.Groups[1].Value.Split(';')
+    if ($f.Count -ne 6) { $p += "ace-shape:$($m.Value)"; continue }
+    if ($f[0] -ceq 'D') { continue }
+    if ($f[0] -cne 'A') { $p += "ace-type:$($f[0])"; continue }
+    $allow++
+    $sid = ConvertTo-PspSid $f[5]
+    if (@($script:PspSidAdmins, $script:PspSidSystem) -ccontains $sid) { continue }
+    if (($Readers -ccontains $sid) -and (Test-PspReadOnlyRights $f[2])) { continue }
+    $p += "foreign-allow:${sid}:$($f[2])"
+  }
+  if ($allow -eq 0) { $p += 'no-allow-ace' }
+  return $p
+}
+
+# Readback of one trusted object: the backup-handle oracle and Get-Acl must agree, and both pass the rule.
+function Test-PspTrustedObject { param([string]$Path, [string[]]$Owners, [string[]]$Readers = @(), [switch]$Protected)
+  $s = [Psp1167.Oracle]::Take($Path, $null)
+  $g = $null; try { $g = (Get-Acl -LiteralPath $Path -ErrorAction Stop).Sddl } catch { $g = $null }
+  $p = @()
+  if ($s.openError -ne 0) { $p += "open-error:$($s.openError)" }
+  if ($s.isReparse) { $p += 'reparse' }
+  if (-not $s.persistentAcls) { $p += 'non-acl-volume' }
+  $p += @(Test-PspTrustedSddl $s.sddl $Owners $Readers -Protected:$Protected)
+  if ($null -eq $g) { $p += 'getacl-unavailable' } elseif ($g -cne $s.sddl) { $p += 'readback-contradiction' }
+  return [ordered]@{ path = $Path; sddl = $s.sddl; getAclSddl = $g; problems = @($p) }
+}
+
+function Get-PspTrustObjects { param($T)
+  $o = @($T.root, $T.state, $T.receipts, $T.scratch, $T.src, $T.canary) + @($script:PspTrustFiles | ForEach-Object { Join-Path $T.src $_ })
+  foreach ($x in @($T.statePath, (Join-Path $T.src 'node.exe'))) { if (Test-Path -LiteralPath $x) { $o += $x } }
+  return $o
+}
+
+function Get-PspTrustReadback { param($T, [string]$AdminSid)
+  foreach ($p in Get-PspTrustObjects $T) {
+    if ($p -ceq $T.root) { Test-PspTrustedObject $p @($script:PspSidAdmins) -Protected }
+    else { Test-PspTrustedObject $p @($script:PspSidAdmins, $script:PspSidSystem, $AdminSid) }
+  }
+}
+
+function Get-PspTrustLayout { param([string]$Root)
+  return [ordered]@{ root = $Root; state = (Join-Path $Root 'state'); statePath = (Join-Path $Root 'state\state.json'); receipts = (Join-Path $Root 'receipts')
+    canary = (Join-Path $Root 'receipts\trust-canary.json'); scratch = (Join-Path $Root 'scratch'); src = (Join-Path $Root 'src') }
+}
+
+# $Leaf is the name the workflow bound before any fake account existed; later steps use only that name.
+function Initialize-PspTrustRoot { param([string]$TempLong, [string]$SourceDir, [string]$AdminSid, [string]$Leaf)
+  if ($Leaf -cnotmatch '^psp1167-trust-[0-9a-f]{16}$') { throw "trust root name not bound by the workflow: '$Leaf'" }
+  $root = Join-Path $TempLong $Leaf
+  $e = [Psp1167.Oracle]::CreateProtectedDir($root, $script:PspTrustSddl)
+  if ($e -ne 0) { throw "trust root $root not created (Win32 $e)" }
+  Register-PspOwnedRoot $root
+  $t = Get-PspTrustLayout $root
+  foreach ($d in @($t.state, $t.receipts, $t.scratch, $t.src)) { [void](New-PspDir $d) }
+  $t.srcSha256 = [ordered]@{}
+  foreach ($f in $script:PspTrustFiles) {
+    $to = Join-Path $t.src $f
+    Copy-Item -LiteralPath (Join-Path $SourceDir $f) -Destination $to
+    $h = (Get-FileHash -LiteralPath (Join-Path $SourceDir $f) -Algorithm SHA256).Hash.ToLowerInvariant()
+    $t.srcSha256[$f] = (Get-FileHash -LiteralPath $to -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($t.srcSha256[$f] -ne $h) { throw "trusted copy of $f differs from the pinned source" }
+  }
+  [System.IO.File]::WriteAllText($t.canary, 'psp1167 trust canary: fake-user write probes target this file')
+  $t.readback = @(Get-PspTrustReadback $t $AdminSid)
+  $bad = @($t.readback | Where-Object { $_.problems.Count -gt 0 } | ForEach-Object { "$($_.path)=$($_.problems -join ',')" })
+  if ($bad.Count -gt 0) { throw ('trust root readback failed: ' + ($bad -join '; ')) }
+  return $t
+}
+
+# Copies one untrusted outbox file into the trusted receipts dir (see Oracle.Capture); throws on refusal.
+function Copy-PspCapture { param([string]$Source, [string]$Dest, [long]$Max = 16MB)
+  $e = [Psp1167.Oracle]::Capture($Source, $Dest, $Max)
+  if ($e -ne 0) { throw "capture of $Source refused ($e)" }
+}
+
+# ---- cleanup state validation ----
+# Every rule holds BEFORE any destructive action; one violation refuses the whole cleanup (no normalisation,
+# no partial delete). Twin: acl.test.mjs validateCleanupState (same literals; coupling checked offline).
+function Get-PspKeys { param($O)
+  if ($O -is [System.Collections.IDictionary]) { return @($O.Keys) }
+  return @($O.PSObject.Properties | ForEach-Object { $_.Name })
+}
+
+function Test-PspCleanupState { param($State, [string]$TempLong, [string]$RunId)
+  if ($null -eq $State) { return @('state-null') }
+  if ($RunId -cnotmatch '^\d+$') { return @('run-id') }
+  if (((@(Get-PspKeys $State) | Sort-Object) -join ',') -cne 'root,schema,users,vdisks') { return @('state-keys') }
+  $p = @()
+  if ($State.schema -cne 'aigentry/1167-psp-state/v1') { $p += 'schema' }
+  $root = $State.root
+  if ($null -ne $root) {
+    if (-not ($root -is [string])) { $p += 'root-type'; $root = $null }
+    else {
+      $i = $root.LastIndexOf('\')
+      if ($i -lt 0 -or $root.Substring($i + 1) -cnotmatch "^psp1167-$RunId-[0-9a-f]{8}$") { $p += 'root-leaf' }
+      if ($i -lt 0 -or $root.Substring(0, $i) -cne $TempLong) { $p += 'root-parent' }
+      $full = $null; try { $full = [System.IO.Path]::GetFullPath($root) } catch { $full = $null }
+      if ($full -cne $root) { $p += 'root-not-canonical' }
+      if (($p.Count -eq 0) -and (Test-Path -LiteralPath $root) -and (((Get-Item -LiteralPath $root -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) { $p += 'root-reparse' }
+    }
+  }
+  $us = @($State.users)
+  if (-not ($State.users -is [array])) { $p += 'users-type' }
+  if ($us.Count -gt 2) { $p += 'users-count' }
+  $first = $null
+  for ($i = 0; $i -lt [Math]::Min($us.Count, 2); $i++) {
+    $u = $us[$i]
+    if (($null -eq $u) -or (((@(Get-PspKeys $u) | Sort-Object) -join ',') -cne 'name,sid')) { $p += "user$i-shape"; continue }
+    if (-not ($u.name -is [string]) -or ($u.name -cnotmatch '^psp[ab][0-9a-f]{6}$') -or ($u.name.Substring(0, 4) -cne @('pspa', 'pspb')[$i])) { $p += "user$i-name"; continue }
+    if (-not ($u.sid -is [string]) -or ($u.sid -cnotmatch '^S-1-5-21-\d+-\d+-\d+-\d+$') -or ([long]$u.sid.Substring($u.sid.LastIndexOf('-') + 1) -lt 1000)) { $p += "user$i-sid"; continue }
+    if ($i -eq 0) { $first = $u }
+    elseif ($null -ne $first) {
+      if ($u.name.Substring(4) -cne $first.name.Substring(4)) { $p += 'user-pair-suffix' }
+      if ($u.sid.Substring(0, $u.sid.LastIndexOf('-')) -cne $first.sid.Substring(0, $first.sid.LastIndexOf('-'))) { $p += 'user-pair-domain' }
+      if ($u.sid -ceq $first.sid) { $p += 'user-pair-sid' }
+    }
+  }
+  $vs = @($State.vdisks); $seen = @()
+  if (-not ($State.vdisks -is [array])) { $p += 'vdisks-type' }
+  if ($vs.Count -gt 2) { $p += 'vdisks-count' }
+  foreach ($v in $vs) {
+    if (($null -eq $v) -or (((@(Get-PspKeys $v) | Sort-Object) -join ',') -cne 'attached,file,fs,letter')) { $p += 'vdisk-shape'; continue }
+    if (@('fat32', 'exfat') -cnotcontains $v.fs) { $p += 'vdisk-fs'; continue }
+    if ($seen -ccontains $v.fs) { $p += 'vdisk-duplicate' }
+    $seen += $v.fs
+    if (($null -eq $root) -or ($v.file -cne ($root + '\vhd-' + $v.fs + '.vhdx'))) { $p += "vdisk-file:$($v.fs)" }
+    if (-not ($v.letter -is [string]) -or ($v.letter -cnotmatch '^[P-Y]$')) { $p += 'vdisk-letter' }
+  }
+  return $p
+}
+
 # 28 chars from a CSPRNG plus one of each class. Returned only as a read-only SecureString.
 function New-PspPassword {
   $sets = @('ABCDEFGHJKLMNPQRSTUVWXYZ', 'abcdefghijkmnopqrstuvwxyz', '23456789', '!#%+=?-_')
@@ -232,12 +559,16 @@ function Remove-PspFakeUsers { param($State)
   foreach ($u in @($State.users)) {
     $r = [ordered]@{ name = $u.name; sid = $u.sid; removed = $false; profileRemoved = $null; error = $null }
     try {
+      if (($u.name -cnotmatch '^psp[ab][0-9a-f]{6}$') -or ($u.sid -cnotmatch '^S-1-5-21-\d+-\d+-\d+-\d+$')) { throw "refusing unowned account $($u.name) $($u.sid)" }
       $live = Get-LocalUser -SID $u.sid -ErrorAction SilentlyContinue
       if ($null -eq $live) { $r.error = 'not-present' }
-      elseif ($live.Name -ne $u.name) { $r.error = "sid-name-mismatch:$($live.Name)"; }
+      elseif ($live.Name -cne $u.name) { $r.error = "sid-name-mismatch:$($live.Name)"; }
+      elseif ($live.Description -cne 'psp1167 disposable CI fake user') { $r.error = 'description-mismatch' }
       else { Remove-LocalUser -SID $u.sid -ErrorAction Stop; $r.removed = $true }
-      $prof = Get-CimInstance -ClassName Win32_UserProfile -Filter ("SID='{0}'" -f $u.sid) -ErrorAction SilentlyContinue
-      if ($prof) { $prof | Remove-CimInstance -ErrorAction Stop; $r.profileRemoved = $true } else { $r.profileRemoved = $false }
+      if (($null -eq $r.error) -or ($r.error -eq 'not-present')) {
+        $prof = Get-CimInstance -ClassName Win32_UserProfile -Filter ("SID='{0}'" -f $u.sid) -ErrorAction SilentlyContinue
+        if ($prof) { $prof | Remove-CimInstance -ErrorAction Stop; $r.profileRemoved = $true } else { $r.profileRemoved = $false }
+      }
     } catch { $r.error = $_.Exception.Message }
     $results += ,$r
   }
@@ -327,13 +658,14 @@ function New-PspVhd { param([string]$VhdPath, [string]$FileSystem, [string]$Labe
   return [ordered]@{ letter = $letter; root = "${letter}:\psp1167"; volumeFlags = $flags; persistentAcls = (($flags -ne [uint32]::MaxValue) -and (($flags -band 0x8) -ne 0)); fsutil = $fsinfo }
 }
 
-function Remove-PspVhds { param($State, [string]$ScratchDir)
+function Remove-PspVhds { param($State, [string]$ScratchDir, [string]$Root)
   $ErrorActionPreference = 'Continue'
   $results = @()
   foreach ($v in @($State.vdisks)) {
     $r = [ordered]@{ file = $v.file; detached = $false; deleted = $false; error = $null }
     try {
-      if (-not ($v.file -like '*\psp1167-*')) { throw "refusing unowned vdisk path $($v.file)" }
+      if ((-not $Root) -or (@('fat32', 'exfat') -cnotcontains $v.fs) -or ($v.file -cne ($Root + '\vhd-' + $v.fs + '.vhdx'))) { throw "refusing unowned vdisk path $($v.file)" }
+      if ((Test-Path -LiteralPath $v.file) -and (((Get-Item -LiteralPath $v.file -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) { throw "refusing reparse vdisk path $($v.file)" }
       if (Test-Path -LiteralPath $v.file) {
         $script = Join-Path $ScratchDir ('diskpart-detach-{0}.txt' -f [guid]::NewGuid().ToString('N'))
         @("select vdisk file=`"$($v.file)`"", 'detach vdisk') | Set-Content -LiteralPath $script -Encoding ASCII
@@ -348,20 +680,39 @@ function Remove-PspVhds { param($State, [string]$ScratchDir)
   return $results
 }
 
-# Restores admin control over the owned fixture root and deletes it without following links
-# (icacls /L acts on links themselves; rmdir /s removes junctions as links).
-function Remove-PspFixtureRoot { param([string]$Root)
+# Live processes owned by the given SIDs (fake users): any hit is a concurrent writer and refuses cleanup/export.
+function Get-PspLiveSidProcesses { param([string[]]$Sids = @())
+  $hits = @()
+  if (@($Sids).Count -eq 0) { return ,$hits }
+  foreach ($p in @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)) {
+    $o = $null; try { $o = Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid -ErrorAction Stop } catch { $o = $null }
+    if ($o -and ($o.ReturnValue -eq 0) -and ($Sids -ccontains $o.Sid)) { $hits += ,("$($p.ProcessId):$($p.Name):$($o.Sid)") }
+  }
+  return ,$hits
+}
+
+# Deletes the owned fixture root without changing any owner or ACL and without following links (no icacls,
+# no rmdir /s): refused while any fake-user process is alive (no concurrent writer); the deliberate hardlink
+# pair goes only after identity verification; everything else through Oracle.RemoveTree. Anything it cannot
+# remove safely leaves the root in place and is reported (removed=false); VM teardown is not cleanup success.
+function Remove-PspFixtureRoot { param([string]$Root, [string]$TempLong, [string]$RunId, [string[]]$WriterSids = @())
   $ErrorActionPreference = 'Continue'
-  $r = [ordered]@{ root = $Root; removed = $false; error = $null }
+  $r = [ordered]@{ root = $Root; removed = $false; error = $null; liveWriters = @(); walk = $null }
   try {
-    if (-not ((Split-Path -Leaf $Root) -like 'psp1167-*')) { throw "refusing unowned root $Root" }
-    if (-not $Root.StartsWith(([System.IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'), [StringComparison]::OrdinalIgnoreCase)) { throw "refusing root outside RUNNER_TEMP: $Root" }
+    $i = $Root.LastIndexOf('\')
+    if (($RunId -cnotmatch '^\d+$') -or ($i -lt 0) -or ($Root.Substring($i + 1) -cnotmatch "^psp1167-$RunId-[0-9a-f]{8}$")) { throw "refusing unowned root $Root" }
+    if (($Root.Substring(0, $i) -cne $TempLong) -or ([System.IO.Path]::GetFullPath($Root) -cne $Root)) { throw "refusing non-canonical root or root outside RUNNER_TEMP: $Root" }
+    if ((Test-Path -LiteralPath $Root) -and (((Get-Item -LiteralPath $Root -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) { throw "refusing reparse-point root $Root" }
     if (Test-Path -LiteralPath $Root) {
-      [void][Psp1167.Oracle]::EnablePrivilege('SeRestorePrivilege'); [void][Psp1167.Oracle]::EnablePrivilege('SeTakeOwnershipPrivilege')
-      & icacls.exe $Root /setowner "*$script:PspSidAdmins" /T /C /L /Q 2>&1 | Out-Null
-      & icacls.exe $Root /grant "*${script:PspSidAdmins}:(F)" /T /C /L /Q 2>&1 | Out-Null
-      & cmd.exe /d /c rmdir /s /q "$Root" 2>&1 | Out-Null
-      $r.removed = -not (Test-Path -LiteralPath $Root)
+      foreach ($priv in @('SeBackupPrivilege', 'SeRestorePrivilege')) { $e = [Psp1167.Oracle]::EnablePrivilege($priv); if ($e -ne 0) { throw "cannot enable $priv ($e)" } }
+      $r.liveWriters = @(Get-PspLiveSidProcesses $WriterSids)
+      if ($r.liveWriters.Count -gt 0) { throw ('refusing: fake-user processes still alive: ' + ($r.liveWriters -join ', ')) }
+      $pair = [Psp1167.Oracle]::RemoveLinkPair((Join-Path $Root 'fx\files\file-nlink2.bin'), (Join-Path $Root 'fx\files\file-nlink2.link.bin'))
+      if ($null -ne $pair) { throw "refusing: $pair" }
+      $w = [Psp1167.Oracle]::RemoveTree($Root, 32, 20000)
+      $r.walk = [ordered]@{ files = $w.files; dirs = $w.dirs; links = $w.links; entries = $w.entries; problems = @($w.problems) }
+      $r.removed = ($w.problems.Count -eq 0) -and -not (Test-Path -LiteralPath $Root)
+      if (-not $r.removed) { $r.error = 'fixture root not fully removed (explicit cleanup failure)' }
     } else { $r.removed = $true }
   } catch { $r.error = $_.Exception.Message }
   return $r
@@ -393,7 +744,7 @@ function Get-PspSnapshot { param([string[]]$Paths, [string]$AncestorFloor, [swit
 
 # Builds every fixture. Order: create tree and links while admin still has inherited access, then
 # owners, then file DACLs, then directory DACLs leaf-to-root (icacls propagates to inheriting children).
-function New-PspFixtures { param([string]$Root, [string]$SidA, [string]$SidB, $State, [string]$StatePath, [string]$ScratchDir)
+function New-PspFixtures { param([string]$Root, [string]$SidA, [string]$SidB, $State, [string]$StatePath, [string]$ScratchDir, $Trust)
   foreach ($priv in @('SeRestorePrivilege', 'SeBackupPrivilege', 'SeTakeOwnershipPrivilege')) {
     $e = [Psp1167.Oracle]::EnablePrivilege($priv); Add-PspLog 'enable-privilege' $priv $e
     if ($e -ne 0) { throw "admin token cannot enable $priv ($e)" }
@@ -557,10 +908,15 @@ function New-PspFixtures { param([string]$Root, [string]$SidA, [string]$SidB, $S
   # ---- probe plans (OS operations only; independent of the helper) ----
   $m.probes['B1'] = @(New-PspDenialPlan 'B1' $dOk $fileNames.F_OK $wb)
   $m.probes['B2'] = @(New-PspDenialPlan 'B2' "$ha\created-dir" "$ha\created-dir\created-file.bin" $wb)
-  $m.probes['Bself'] = @(
-    [ordered]@{ id = 'Bself-read'; op = 'read'; path = "$wb\b-own.bin"; expect = 0 },
-    [ordered]@{ id = 'Bself-create'; op = 'create'; path = "$wb\b-self-probe.tmp"; expect = 0 },
-    [ordered]@{ id = 'Bself-delete'; op = 'delete'; path = "$wb\b-self-probe.tmp"; expect = 0 })
+  # B's own-file positive control precedes BOTH denial plans: a child that denies everything cannot pass.
+  foreach ($t in @('B1', 'B2')) {
+    $m.probes["${t}self"] = @(
+      [ordered]@{ id = "$t-self-read"; op = 'read'; path = "$wb\b-own.bin"; expect = 0 },
+      [ordered]@{ id = "$t-self-create"; op = 'create'; path = "$wb\b-self-$t.tmp"; expect = 0 },
+      [ordered]@{ id = "$t-self-delete"; op = 'delete'; path = "$wb\b-self-$t.tmp"; expect = 0 })
+  }
+  $m.probes['Atrust'] = @(New-PspTrustPlan 'Atrust' $Trust $bin $wa)
+  $m.probes['Btrust'] = @(New-PspTrustPlan 'Btrust' $Trust $bin $wb)
   $m.probes['Actl'] = @(
     [ordered]@{ id = 'A-list'; op = 'list'; path = $ctl; expect = 0 },
     [ordered]@{ id = 'A-create'; op = 'create'; path = "$ctl\a-probe.tmp"; expect = 0 },
@@ -602,6 +958,30 @@ function New-PspDenialPlan { param([string]$Tag, [string]$Dir, [string]$File, [s
     [ordered]@{ id = "$Tag-rename-file-out"; op = 'rename'; path = $File; path2 = "$WorkB\b-stolen.bin"; expect = 5 },
     [ordered]@{ id = "$Tag-hardlink-out-of-file"; op = 'hardlink'; path = "$WorkB\b-link-out.bin"; path2 = $File; expect = 5 },
     [ordered]@{ id = "$Tag-delete-file"; op = 'delete'; path = $File; expect = 5 })
+}
+
+# A or B attempts to read/overwrite/rename the trusted state, oracle receipts, elevated sources and the
+# read-execute bin, each expected ERROR_ACCESS_DENIED; own-work-dir create/write/delete are the positive control.
+function New-PspTrustPlan { param([string]$Tag, $Trust, [string]$Bin, [string]$Work)
+  return @(
+    [ordered]@{ id = "$Tag-own-create"; op = 'create'; path = "$Work\$Tag-own.tmp"; expect = 0 },
+    [ordered]@{ id = "$Tag-own-write"; op = 'write-open'; path = "$Work\$Tag-own.tmp"; expect = 0 },
+    [ordered]@{ id = "$Tag-own-delete"; op = 'delete'; path = "$Work\$Tag-own.tmp"; expect = 0 },
+    [ordered]@{ id = "$Tag-list-trust"; op = 'list'; path = $Trust.root; expect = 5 },
+    [ordered]@{ id = "$Tag-create-in-trust"; op = 'create'; path = "$($Trust.root)\$Tag.tmp"; expect = 5 },
+    [ordered]@{ id = "$Tag-rename-trust"; op = 'rename'; path = $Trust.root; path2 = "$($Trust.root)-$Tag"; expect = 5 },
+    [ordered]@{ id = "$Tag-read-state"; op = 'read'; path = $Trust.statePath; expect = 5 },
+    [ordered]@{ id = "$Tag-write-state"; op = 'write-open'; path = $Trust.statePath; expect = 5 },
+    [ordered]@{ id = "$Tag-rename-state"; op = 'rename'; path = $Trust.statePath; path2 = "$($Trust.state)\$Tag.json"; expect = 5 },
+    [ordered]@{ id = "$Tag-create-in-state"; op = 'create'; path = "$($Trust.state)\$Tag.json"; expect = 5 },
+    [ordered]@{ id = "$Tag-write-oracle"; op = 'write-open'; path = $Trust.canary; expect = 5 },
+    [ordered]@{ id = "$Tag-create-in-oracle"; op = 'create'; path = "$($Trust.receipts)\snap-$Tag.json"; expect = 5 },
+    [ordered]@{ id = "$Tag-write-src"; op = 'write-open'; path = "$($Trust.src)\run-validation.ps1"; expect = 5 },
+    [ordered]@{ id = "$Tag-create-in-src"; op = 'create'; path = "$($Trust.src)\$Tag.ps1"; expect = 5 },
+    [ordered]@{ id = "$Tag-write-bin-script"; op = 'write-open'; path = "$Bin\run-as-user.ps1"; expect = 5 },
+    [ordered]@{ id = "$Tag-write-bin-node"; op = 'write-open'; path = "$Bin\node.exe"; expect = 5 },
+    [ordered]@{ id = "$Tag-create-in-bin"; op = 'create'; path = "$Bin\$Tag.tmp"; expect = 5 },
+    [ordered]@{ id = "$Tag-rename-bin"; op = 'rename'; path = $Bin; path2 = "$Bin-$Tag"; expect = 5 })
 }
 
 # FAT32 / exFAT fixtures on owned VHDs; appended to the manifest. Unavailable => recorded, never skipped.
