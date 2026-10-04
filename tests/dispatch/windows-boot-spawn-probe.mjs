@@ -280,6 +280,28 @@ function crossRun(crossSpawn, cmd, stdin, timeout, record) {
     child.stdin.end(stdin);
   });
 }
+// Diagnostic only: cross-spawn's private _parse is evidence, not a production contract (7.0.6 pinned above).
+const cmdMetaChars = /([()\][%!^"`<>&|;, *?])/g;
+function redactParse(text) {
+  const once = root.replace(cmdMetaChars, '^$1');
+  return text.split(root).join('<ROOT>').split(once.replace(cmdMetaChars, '^$1')).join('<ROOT>')
+    .split(once).join('<ROOT>').split(systemRoot).join('<SYSTEMROOT>');
+}
+function crossParseEvidence(crossSpawn, cmd) {
+  try {
+    if (typeof crossSpawn._parse !== 'function') return { error: 'PARSE_UNAVAILABLE' };
+    // Same cwd/env/options as crossRun; cloned so execution argv/options are never mutated.
+    const parsed = crossSpawn._parse(cmd.argv[0], cmd.argv.slice(1), { cwd: cmd.cwd, env: { ...cmd.env }, shell: false });
+    const verbatim = parsed?.options?.windowsVerbatimArguments;
+    const text = value => typeof value === 'string' && value.length <= 8192;
+    if (!text(parsed?.command) || !Array.isArray(parsed.args) || parsed.args.length > 64 || !parsed.args.every(text) ||
+      !(parsed.file === undefined || text(parsed.file)) || !['boolean', 'undefined'].includes(typeof verbatim)) return { error: 'PARSE_SHAPE_INVALID' };
+    const evidence = { command: redactParse(parsed.command), args: parsed.args.map(redactParse),
+      file: parsed.file === undefined ? null : redactParse(parsed.file), windowsVerbatimArguments: verbatim ?? null };
+    if (/[A-Za-z]:[\\/]/.test([evidence.command, evidence.file, ...evidence.args].join('\n'))) return { error: 'PARSE_UNREDACTED_PATH' };
+    return evidence;
+  } catch (error) { return { error: 'PARSE_THROW', code: errorCode(error) }; }
+}
 function hashTree(directory, label) {
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
     if (entry.name === 'node_modules') continue;
@@ -429,7 +451,10 @@ try {
     const literal = ['', 'two words', '한글 😀', 'a"b', 'tail\\', '(parentheses)', '&', '|', '<', '>', '^', '%', '!', ';', 'line1\nline2',
       '%PROBE_EXPANSION%', '!PROBE_EXPANSION!', '& echo owned>injection-sentinel', '| echo owned>injection-sentinel',
       '\n echo owned>injection-sentinel', 'x" & echo owned>injection-sentinel & rem "'];
-    const args = mode === 'echo' ? literal : mode === 'nonzero' ? ['--nonzero', ...literal] :
+    // Nonzero only: LF elements move to the tail (same multiset) so hostile args precede the cmd.exe LF cut.
+    const nonzeroLiteral = [...literal.filter(arg => !arg.includes('\n')), ...literal.filter(arg => arg.includes('\n'))];
+    const hostile = literal.filter(arg => !arg.includes('\n') && /PROBE_EXPANSION|injection-sentinel/.test(arg));
+    const args = mode === 'echo' ? literal : mode === 'nonzero' ? ['--nonzero', ...nonzeroLiteral] :
       mode.includes('version') ? ['--version'] : mode.includes('help') ? ['--help'] :
         mode === 'forbidden' ? ['--forbidden'] : [];
     const caseEnv = childEnv(target.bin, casing, caseDir, caseNonce, mode);
@@ -438,7 +463,10 @@ try {
     const timeout = mode === 'timeout' ? 600 : 1500;
     const record = { id, entrypoint: 'run', mode, fixtureSlot, nonce: caseNonce, begin_ms: elapsed(), timeoutLimit_ms: timeout,
       parentPathKeys: Object.keys(process.env).filter(key => key.toLowerCase() === 'path'),
-      events: [], expected: { argvHash: hash(JSON.stringify(args)), stdinHash: hash(input) } };
+      events: [], expected: { argv: args, argvHash: hash(JSON.stringify(args)), stdinHash: hash(input) } };
+    if (engine === 'cross-spawn' && !target.prefix && target.name !== 'extensionless-shebang' && mode !== 'missing') {
+      record.crossSpawnParse = crossParseEvidence(crossSpawn, command);
+    }
     receipt.cases.push(record);
     active = record;
     try {
@@ -450,7 +478,9 @@ try {
           const echo = JSON.parse(result.stdout);
           record.argvBytesEqual = Buffer.from(JSON.stringify(echo.argv)).equals(Buffer.from(JSON.stringify(args)));
           record.stdinBytesEqual = typeof echo.stdin === 'string' && Buffer.from(echo.stdin, 'base64').equals(Buffer.from(input));
-        } catch { record.argvBytesEqual = false; record.stdinBytesEqual = false; }
+          // No security pass unless every hostile element actually reached the payload.
+          record.hostileArgsReached = Array.isArray(echo.argv) && hostile.every(arg => echo.argv.includes(arg));
+        } catch { record.argvBytesEqual = false; record.stdinBytesEqual = false; record.hostileArgsReached = false; }
       }
       if (mode.includes('version')) record.versionMatchesExpected = /\b7\.8\.9\b/.test(result.stdout);
       if (mode.includes('help')) record.helpFlagsPresent = ['--model', '--prompt', '--cwd', '--non-interactive'].every(flag => result.stdout.includes(flag));
