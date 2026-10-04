@@ -37,6 +37,35 @@ it does and does not prove.
 
 Orchestration infra for the aigentry ecosystem — not a standalone tool, and intentionally minimal here. Session transport is [telepty](https://github.com/dmsdc-ai/aigentry-telepty); multi-AI debate is [deliberation](https://github.com/dmsdc-ai/aigentry-deliberation); developer tooling is [devkit](https://github.com/dmsdc-ai/aigentry-devkit).
 
+## Optional: long-lived Claude token for workers (#652)
+
+Status: opt-in **code path only**. It is compile-checked, and an independent tester owns the fake-fixture regression. It is not configured or adopted anywhere yet, and longitudinal stability (fewer forced re-logins) is **not verified**. Treat it as a temporary mitigation, not a guarantee.
+
+By default each Claude worker gets a copy of the host Claude login (access + refresh token). With this opt-in, Claude workers instead use a long-lived `claude setup-token` token, and the host login is never read or copied for them.
+
+- **Selector:** `AIGENTRY_CLAUDE_OAUTH_TOKEN` in the **controller** environment (the process running dispatch / `bin/boot-prepare.mjs`). Nonempty selects it for **Claude workers only**. Codex/Gemini/Grok are unaffected.
+- **Unset or empty:** the old behavior, unchanged (including any inherited `CLAUDE_CODE_OAUTH_TOKEN` on the legacy path).
+- **Set but invalid** (must be one line of printable ASCII, at most 4096 bytes): the launch is refused with a fixed error. There is **no fallback** to host credentials.
+- The worker receives it as `CLAUDE_CODE_OAUTH_TOKEN`. Per the official docs ([authentication: generate a long-lived token](https://code.claude.com/docs/en/authentication#generate-a-long-lived-token), [CLI reference](https://code.claude.com/docs/en/cli-reference)), `claude setup-token` issues a one-year subscription token that covers model requests, not Remote Control or connectors. Actual expiry behavior has not been measured here.
+
+**Setup.**
+1. In your own terminal (not a worker, not a chat), run `claude setup-token` and finish the browser flow.
+2. In the terminal that will run the controller, export the token without leaking it to shell history, logs or `set -x`. For example, run `read -rs AIGENTRY_CLAUDE_OAUTH_TOKEN && export AIGENTRY_CLAUDE_OAUTH_TOKEN`, then paste and press Enter. Never paste it into a chat or a task file. aigentry never writes it to a shell profile.
+3. From that **same** shell, start the controller with `bin/orchestrator-boot.sh` (no arguments), or restart it this way if one is already running. The script replaces that shell with the controller bridge, so the controller inherits the exported variable. Exporting it in any other terminal cannot change a controller that is already running.
+4. Dispatch **new** workers. Running workers keep their old credentials.
+
+To stop, restart the controller via `bin/orchestrator-boot.sh` from a shell where `AIGENTRY_CLAUDE_OAUTH_TOKEN` is unset, then dispatch new workers. Expiry, rotation and revocation are yours to manage. An expired or revoked token makes workers fail to authenticate, with no host-login fallback.
+
+**Where the token goes.**
+- **Confined workers** (dispatch → `prepareWorkerSandbox` → sandbox runner): the token is written once to `<sessions>/<sid>/sandbox/<attempt>/claude-oauth/token`. The directory is 0700, the file 0600, created exclusively, with content `<token>\n`. The sealed manifest stores only that path. The runner verifies owner, mode, link count, symlink, size and content, and reads the file only for the real worker spawn, never for the preflight. The sandbox HOME gets onboarding config but no `.credentials.json`.
+- **Legacy unconfined launcher** (`boot-prepare.mjs` without `--confined`): the token goes to `<sessions>/<sid>/boot/claude-oauth-<uuid>/token` with the same modes. `launcher.sh` disables xtrace, then reads the file at launch time through the same bounded Node reader, captured over an internal pipe. On any failure it exits 78; otherwise it exports `CLAUDE_CODE_OAUTH_TOKEN`. The token is never inlined into the launcher, the stdout descriptor or argv.
+
+**Known limits.**
+- **Retention:** handoff files are not deleted automatically. They stay with their session/attempt directories so a relaunch works. Delete them yourself after rotating or revoking a token.
+- **Child env visibility:** the worker and everything it spawns, including its Bash tool, can read `CLAUDE_CODE_OAUTH_TOKEN`. Same-user process inspection can show it too. Because the token is long-lived, this exposure is larger than with a short-lived access token.
+- **Launcher ancestors:** the controller passes its environment, including `AIGENTRY_CLAUDE_OAUTH_TOKEN`, to `boot-prepare.mjs`, `open-session.sh` and the processes they start. The confined launcher's pane binder also inherits it, and the sandbox runner holds it until it clears its own environment before sandbox init; the legacy launcher unsets it just before exec. This is same-user inheritance, not a new authority.
+- **Legacy path:** it keeps the real HOME, so the host Claude login stays reachable to that CLI. Only the confined path guarantees there is no host-credential copy. At launch the legacy path also needs the built `dist/` helper and the node binary that ran boot-prepare.
+
 ## Ecosystem
 
 The orchestrator is internal infrastructure that drives the aigentry ecosystem via telepty — it is not published to npm. The published, independently useful modules:

@@ -57,6 +57,7 @@
 // See docs/superpowers/specs/2026-06-07-codex-gemini-role-injection.md.
 
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
   appendFile,
@@ -504,6 +505,23 @@ async function main() {
 
   if (!isRole(args.role)) die(`unknown role: ${args.role}`, 4);
 
+  // #652 opt-in: a nonempty AIGENTRY_CLAUDE_OAUTH_TOKEN selects a private token
+  // handoff for the LEGACY claude launcher only. Unset/empty keeps the old path
+  // byte-for-byte; --confined is owned by prepareWorkerSandbox (the stub below
+  // still refuses), and codex/gemini/grok never read it. Validated before any
+  // side effect; errors are fixed strings and never carry the value.
+  let claudeOAuth = null;
+  let claudeOAuthToken;
+  const claudeOAuthModule = join(REPO_ROOT, "dist/src/session/claude-worker-oauth.js");
+  if (args.cli === "claude" && !args.confined && process.env.AIGENTRY_CLAUDE_OAUTH_TOKEN) {
+    claudeOAuth = await import(pathToFileURL(claudeOAuthModule).href);
+    try {
+      claudeOAuthToken = claudeOAuth.selectedClaudeOAuthToken(process.env);
+    } catch {
+      die("CLAUDE_OAUTH_TOKEN_INVALID: AIGENTRY_CLAUDE_OAUTH_TOKEN must be one line of printable ASCII (max 4096); refusing launch", 4);
+    }
+  }
+
   // Sandbox cwd: $HOME/.aigentry/role-sandbox/<role>-<sid>/ (hybrid (c) leg).
   // Contains no CLAUDE.md → cwd auto-discovery yields no project memory.
   const sandboxCwd = join(
@@ -644,6 +662,19 @@ async function main() {
   const homeExportLines = Object.entries(homeEnvAssignments)
     .map(([k, v]) => `export ${k}=${shellQuote(v)}\n`)
     .join("");
+  // #652: per-attempt private dir + 0600 file; the launcher reads it at launch
+  // time. Neither the token nor a digest of it enters the stdout descriptor,
+  // argv or launcher source. Retained (no auto-cleanup) so a relaunch works.
+  let oauthLines = "";
+  if (claudeOAuth) {
+    try {
+      oauthLines = claudeOAuth.claudeOAuthLauncherLines(claudeOAuth.writeClaudeOAuthHandoff(
+        join(stagingDir, `${claudeOAuth.CLAUDE_OAUTH_DIR}-${randomUUID()}`), claudeOAuthToken),
+        process.execPath, claudeOAuthModule);
+    } catch {
+      die("CLAUDE_OAUTH_HANDOFF_WRITE: could not stage the private Claude worker token handoff; refusing launch", 2);
+    }
+  }
   const launcherBody =
     `#!/usr/bin/env bash\n` +
     `# Per-session launcher (#431 hybrid + #532 codex/gemini additive path).\n` +
@@ -653,6 +684,7 @@ async function main() {
     `# staged cwd context file (AGENTS.md / GEMINI.md) + config-home shadow home.\n` +
     `export AIGENTRY_TARGET_CWD=${shellQuote(args.cwd)}\n` +
     homeExportLines +
+    oauthLines +
     `exec -a ${shellQuote(args.cli)} ${shellQuote(execName)} ${flagsLine} "$@"\n`;
   // writeFile with mode atomically sets +x — avoids a separate chmodSync call
   // (CWE-23 Snyk avoidance: single FS op on the validated path).
