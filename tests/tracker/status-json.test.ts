@@ -262,6 +262,8 @@ const registryPy = path.join(binDir, "dispatch-registry.py");
 const registryDirect = (state: string, args: string[]) => process.platform === "win32"
   ? run("python", [registryPy, ...args], state, { PYTHONIOENCODING: "utf-8" })
   : run(registryPy, args, state);
+/** Raw Python text-mode lines end with the native EOL (CRLF on win32); `list --jsonl` writes LF bytes itself. */
+const PY_EOL = process.platform === "win32" ? "\r\n" : "\n";
 /** A well-formed `list --jsonl` stream with one row, for parser discrimination. */
 function jsonlRow(over: Rec = {}): Rec {
   return { ...Object.fromEntries(WHITELIST.map(k => [k, null])), dispatch_id: "fake-1", "assigned.sid": "s", ...over };
@@ -293,12 +295,21 @@ test("S1 status --json emits the whitelisted projection in (dispatched_at, dispa
 test("S2 legacy status / status <sid> / unknown-flag-as-sid stay byte-identical to the pre-change baseline", () => {
   const state = stateDir(registry(7, BASE));
   const before = snapshot(state);
-  const pins: Array<[string[], string, number]> = [
-    [["status"], "983e42501ebaf2c5dcb1e4e75ba5cfa727e770bf6d8dd45017451933430ccdac", 578],
-    [["status", "fx-alpha"], "3ca69e73adba7a133c6b772fd25ab9df92c4ace881fa468dbf85de65ac3122b9", 117],
-    [["status", "--definitely-absent"], "09695c8dd86460309c47f2108d7d252b4df76c6756fbe934d1f90852bf196d31", 97],
+  // win32: the registry writes CRLF in text mode and the unchanged legacy formatter splits on LF and strips
+  // only LF, so a CR stays at the end of each column read (padded in place, extra byte in the last one).
+  // win32 pins: pre-change ef40fdf registry + formatter under a TextIOWrapper(newline="\r\n") simulation,
+  // "status" length 582 matching native Windows CI; exact bytes, no normalization.
+  const win32 = process.platform === "win32";
+  const pins: Array<[string[], string, number, string, number]> = [
+    [["status"], "983e42501ebaf2c5dcb1e4e75ba5cfa727e770bf6d8dd45017451933430ccdac", 578,
+      "af0166d338d02501c4b89a8ed9b813d527077af751ab40023c22c2ce55992a8d", 582],
+    [["status", "fx-alpha"], "3ca69e73adba7a133c6b772fd25ab9df92c4ace881fa468dbf85de65ac3122b9", 117,
+      "029dce13ca383739addfdb62c381811f274ffcbabb88b4c30fe1574ad5d552c9", 118],
+    [["status", "--definitely-absent"], "09695c8dd86460309c47f2108d7d252b4df76c6756fbe934d1f90852bf196d31", 97,
+      "8a6035bd91fa7c1c8f5052eb5f8056e23228a850d81d557bf28e58f90897bc20", 98],
   ];
-  for (const [args, digest, bytes] of pins) {
+  for (const [args, posixDigest, posixBytes, winDigest, winBytes] of pins) {
+    const [digest, bytes] = win32 ? [winDigest, winBytes] : [posixDigest, posixBytes];
     const r = tracker(state, args);
     assert.equal(r.code, 0, args.join(" "));
     assert.equal(r.stderr, "");
@@ -636,7 +647,7 @@ test("S26 actual registry list --jsonl: exact stream, fixed errors, legacy list 
   const fixed = (r: Run, code: number, result: string, why: string) => {
     assert.equal(r.code, code, `${why}: exit`);
     assert.equal(r.stdout, "", `${why}: stdout`);
-    assert.equal(r.stderr, `dispatch-registry: list --jsonl: ${result}\n`, `${why}: stderr`);
+    assert.equal(r.stderr, `dispatch-registry: list --jsonl: ${result}${PY_EOL}`, `${why}: stderr`);
   };
   const corrupt = stateDir("{\"schema_version\": 2, \"generation\": 7, \"dispatches\": [{\"cwd\": \"" + CANARY + "\"");
   fixed(registryDirect(corrupt, ["list", "--jsonl"]), 9, "registry_corrupt", "corrupt");
@@ -653,7 +664,7 @@ test("S26 actual registry list --jsonl: exact stream, fixed errors, legacy list 
     completion_fact: null }, "without --jsonl, the new flags stay unknown to legacy list");
   const legacyValue = registryDirect(state, ["list", "--fields", "--jsonl"]);
   assert.equal(legacyValue.code, 0);
-  assert.equal(legacyValue.stdout, "null\n".repeat(4), "--jsonl as a --fields VALUE is not the new mode");
+  assert.equal(legacyValue.stdout, `null${PY_EOL}`.repeat(4), "--jsonl as a --fields VALUE is not the new mode");
 });
 
 test("S27 a cursor over 2048 bytes (control-char identity within bounds) fails explicitly; one page still succeeds", () => {
