@@ -27,8 +27,9 @@ import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 
 const require = createRequire(import.meta.url);
+// Raw bytes as shipped in official node-v20.20.2-win-x64.zip (SHASUMS256 dc3700fd…); lib/index.js has CRLF line ends.
 const PIN = { version: '6.0.3',
-  'lib/index.js': 'ec89ec47d22e7012336aa41cea1216b497aecd36f7802b30eebf3b8e6a298b12',
+  'lib/index.js': '4e5f3fcf05a00ece29888768a5f91b52d15ef736cfefab452ca77b66aa71b234',
   'lib/to-batch-syntax.js': 'e39a03dac6e5e31c6c4bb58fab2c23e8aeeaacd53e0b8c63e742fe7f4ef476ec' };
 // Exact sources the direct engine must be built from (PROBE_EXPECT selects; mismatch → no run).
 const SOURCE_PINS = {
@@ -74,7 +75,7 @@ function loadGenerator() {
   const version = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).version;
   const got = Object.fromEntries(['lib/index.js', 'lib/to-batch-syntax.js'].map(f => [f, hash(fs.readFileSync(path.join(dir, f)))]));
   receipt.oracle.generator = { dir: redact(dir), version, hashes: got };
-  if (version !== PIN.version || Object.keys(got).some(f => got[f] !== PIN[f])) throw new Error('ORACLE_IDENTITY');
+  if (version !== PIN.version || Object.keys(got).some(f => got[f] !== PIN[f])) throw Object.assign(new Error('ORACLE_IDENTITY'), { code: 'ORACLE_IDENTITY' });
   return require(path.join(dir, 'lib', 'index.js'));
 }
 const HEADER = ['@ECHO off', 'GOTO start', ':find_dp0', 'SET dp0=%~dp0', 'EXIT /b', ':start', 'SETLOCAL', 'CALL :find_dp0'].map(l => l + '\r\n').join('');

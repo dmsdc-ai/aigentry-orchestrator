@@ -11,9 +11,10 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { createRequire } from "node:module";
 import { dirname, join, relative } from "node:path";
 
+// Raw bytes as shipped in official node-v20.20.2-win-x64.zip (SHASUMS256 dc3700fd…); lib/index.js has CRLF line ends.
 export const CMD_SHIM_PIN = Object.freeze({
   version: "6.0.3",
-  "lib/index.js": "ec89ec47d22e7012336aa41cea1216b497aecd36f7802b30eebf3b8e6a298b12",
+  "lib/index.js": "4e5f3fcf05a00ece29888768a5f91b52d15ef736cfefab452ca77b66aa71b234",
   "lib/to-batch-syntax.js": "e39a03dac6e5e31c6c4bb58fab2c23e8aeeaacd53e0b8c63e742fe7f4ef476ec",
 });
 

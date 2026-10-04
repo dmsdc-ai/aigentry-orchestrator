@@ -20,6 +20,7 @@ on:
       - tests/session/boot-adapter/_win-launch-fixture.ts
       - tests/dispatch/windows-npm-direct-probe.mjs
       - tests/dispatch/win-launch-tap-check.mjs
+      - tests/dispatch/win-launch-tap-check.test.mjs
 
 permissions:
   contents: read
@@ -114,9 +115,10 @@ jobs:
             check "$T/types.ts"   984ce32596d76e20bbdf63a513dfddb11c80a4689af31d2169eb05e3ae955cea
           fi
           check harness/tests/session/boot-adapter/win-launch.test.ts      c859cb044e4ddb6e53395d184b2751749507d8600c07df6f3d67c14b7afcc4f5
-          check harness/tests/session/boot-adapter/_win-launch-fixture.ts  5f4df850f509961adfb410542b75a48789347ceb2d1739119ab5ece7d9f8d449
-          check harness/tests/dispatch/windows-npm-direct-probe.mjs       b49a833e15862e8dadfda0383301527c419a2ad58fc5c3a3916740f58593b6e5
-          check harness/tests/dispatch/win-launch-tap-check.mjs           876a469ccaf1755cabaf2cb77e0eef5334fa0f26b7aedb02b4e6ad3731b60c00
+          check harness/tests/session/boot-adapter/_win-launch-fixture.ts  288230fa7c92967fb962d795101fbdcc40295d3ebbddb6ba868be7c06b3c9b86
+          check harness/tests/dispatch/windows-npm-direct-probe.mjs       b30b0e343ad26ea6810ed127de24a6dfc8bfb9f658e27ebe19470e7d373e6738
+          check harness/tests/dispatch/win-launch-tap-check.mjs           2b9643ca465a87f3809a8a580706db86ccd50d5ce937eea540a192e89c31e375
+          check harness/tests/dispatch/win-launch-tap-check.test.mjs      74a06da36bacc962f244e5ac244915bce62708f50b844544ce707b3cd5b7cd9b
           git -C "${{ steps.tree.outputs.dir }}" ls-files --eol src/session/boot-adapter | tee "$RUNNER_TEMP/wl-out/eol.txt"
           sha256sum "${{ steps.tree.outputs.dir }}"/src/session/boot-adapter/*.ts "${{ steps.tree.outputs.dir }}/package-lock.json" | tee "$RUNNER_TEMP/wl-out/sources.sha256"
 
@@ -138,13 +140,18 @@ jobs:
         run: |
           set -uo pipefail
           OUT="$RUNNER_TEMP/wl-out"
+          # The verdict checker's own regression must pass before it classifies anything (any nonzero exit fails the step).
+          node --test "$GITHUB_WORKSPACE/harness/tests/dispatch/win-launch-tap-check.test.mjs" || exit $?
+          # GitHub runs bash -e: capture the child's nonzero status explicitly so log + checker still run.
+          raw=0
           TEMP="$RUNNER_TEMP\\wl-tmp" TMP="$RUNNER_TEMP\\wl-tmp" \
-            node --test --test-reporter=tap dist/tests/session/boot-adapter/win-launch.test.js > "$OUT/win-launch.tap" 2>&1
-          raw=$?
+            node --test --test-reporter=tap dist/tests/session/boot-adapter/win-launch.test.js > "$OUT/win-launch.tap" 2>&1 || raw=$?
           cat "$OUT/win-launch.tap"
           echo "raw node --test exit: $raw"
-          node "$GITHUB_WORKSPACE/harness/tests/dispatch/win-launch-tap-check.mjs" "${{ matrix.role }}" "$OUT/win-launch.tap" "$raw" "$OUT/win-launch.verdict.json"
-          exit $?
+          verdict=0
+          node "$GITHUB_WORKSPACE/harness/tests/dispatch/win-launch-tap-check.mjs" "${{ matrix.role }}" "$OUT/win-launch.tap" "$raw" "$OUT/win-launch.verdict.json" || verdict=$?
+          echo "tap-check exit: $verdict"
+          exit $verdict
 
       - name: Diagnostic probe (same probe, role via PROBE_EXPECT; real exit)
         id: probe
@@ -153,13 +160,14 @@ jobs:
         run: |
           set -uo pipefail
           OUT="$RUNNER_TEMP/wl-out"
+          # GitHub runs bash -e: capture the probe's nonzero status explicitly so the log is printed, then propagate it.
+          raw=0
           PROBE_CANDIDATE_DIST="$GITHUB_WORKSPACE/${{ steps.tree.outputs.dir }}" \
           PROBE_EXPECT="${{ matrix.expect }}" \
           PROBE_COMMIT="${{ steps.tree.outputs.sha }}" \
           PROBE_RUNNER_TEMP="$RUNNER_TEMP/wl-probe" \
           PROBE_RECEIPT="$OUT/npm-direct-receipt.json" \
-            node harness/tests/dispatch/windows-npm-direct-probe.mjs > "$OUT/probe.log" 2>&1
-          raw=$?
+            node harness/tests/dispatch/windows-npm-direct-probe.mjs > "$OUT/probe.log" 2>&1 || raw=$?
           cat "$OUT/probe.log"
           echo "raw probe exit: $raw"
           exit $raw
