@@ -167,6 +167,7 @@ function Write-PspVerdictDiag { param([string]$Path, $NodeExit)
     }
   } catch { $rs = 'read-failed' }
   try { foreach ($l in @(Format-PspVerdictDiag $NodeExit $rs $text $bytes)) { Write-Host $l } } catch { Write-Host 'psp-diag verdict summary=failed' }
+  try { foreach ($l in @(Format-PspVerdictOpDiag $rs $text)) { Write-Host $l } } catch { Write-Host 'psp-diag verdict-op summary=failed' }
 }
 
 # DIAGNOSTIC only: one fixed line from an Invoke-PspCleanup result (or the in-run catch record). Pure: no command, no
@@ -214,6 +215,118 @@ function Format-PspCleanupDiag { param([string]$Phase, $C)
     }
   }
   return ($line + ' ok=' + $ok + ' exception=' + $exc + ' stateProblems=' + $sp + ' vdisks=' + $vd + ' vdiskErrors=' + $vde + ' root=' + $rt + ' rootError=' + $re + ' liveWriters=' + $lw + ' users=' + $us + ' usersRemoved=' + $ur + ' usersNotPresent=' + $un + ' userErrors=' + $ue)
+}
+
+# DIAGNOSTIC only (host stream; tainted until the trusted export; never verdict acceptance). Pure: no command, no I/O.
+# Second reader of the same in-memory verdict.tap text: only column-0 '# psp-op/1 ' comments (acl.test.mjs opDiag via
+# t.diagnostic at depth 0) whose every token matches the closed per-kind schema below are re-emitted; anything else is
+# only counted, never echoed (indented look-alikes, e.g. inside a YAML error block, count as 'indented').
+# Twin vocabulary: acl.test.mjs OP_* (same literals). Bounds: the 50000-line cap of Format-PspVerdictDiag, 1411 chars per
+# line, one line per kind/key (later duplicates counted), at most 128 listed lines (the rest counted as clipped).
+function Format-PspVerdictOpDiag { param([string]$ReadStatus, [string]$Text)
+  $rs = 'UNKNOWN'; if (@('ok', 'missing', 'unexpected-path', 'reparse', 'not-file', 'too-large', 'read-failed', 'decode-failed') -ccontains $ReadStatus) { $rs = $ReadStatus }
+  $cand = 0; $acc = 0; $clip = 0; $mal = 0; $over = 0; $dup = 0; $ind = 0; $err = 0
+  $out = @()
+  if ($rs -ceq 'ok') {
+    $lines = $Text.Split([char]10)
+    if ($lines.Count -gt 50000) { $rs = 'too-many-lines' }
+    else {
+      $voc = @{
+        bool = @('true', 'false'); pres = @('present', 'absent'); shape = @('array', 'single'); seq = @('match', 'differ'); test = @('contradict', 'unproved'); who = @('A', 'B')
+        tag = @('identity-A', 'identity-B', 'probe-Actl', 'move-measure', 'probe-Atrust', 'probe-Btrust', 'probe-B1', 'helper-run', 'probe-B2')
+        mode = @('identity', 'probe', 'move-measure', 'node-test')
+        status = @('ok', 'missing', 'unsafe', 'exists', 'unavailable')
+        cls = @('ok', 'unsafe', 'missing', 'unavailable', 'exists', 'error')
+        op = @('inspectDir', 'readPrivateFile', 'createPrivateDir', 'createPrivateFileExclusive')
+        reason = @('ok', 'path_grammar', 'invalid_argument', 'not_found', 'already_exists', 'ancestor_open_failed', 'ancestor_query_failed', 'ancestor_reparse_point',
+          'ancestor_not_directory', 'open_failed', 'create_failed', 'type_query_failed', 'attributes_query_failed', 'reparse_point', 'not_directory', 'not_regular_file',
+          'link_count', 'volume_query_failed', 'acl_not_persistent', 'final_path_query_failed', 'final_path_unrecognized', 'final_path_mismatch',
+          'final_path_compare_failed', 'security_query_failed', 'owner_mismatch', 'dacl_absent', 'dacl_null', 'dacl_not_protected', 'dacl_invalid', 'dacl_empty',
+          'ace_unsupported', 'ace_foreign_allow', 'owner_ace_missing', 'identity_query_failed', 'size_query_failed', 'size_limit', 'size_changed', 'read_failed',
+          'write_failed', 'short_write', 'flush_failed', 'close_failed', 'token_open_failed', 'token_query_failed', 'token_sid_invalid', 'descriptor_build_failed',
+          'alloc_failed', 'internal_error', 'platform_unsupported', 'binary_path_invalid', 'binary_hash_invalid', 'binary_unreadable', 'binary_hash_mismatch',
+          'load_failed', 'abi_mismatch', 'native_threw', 'native_result_invalid')
+        oreason = @('grammar:empty', 'grammar:prefix', 'grammar:not-drive-absolute', 'grammar:colon', 'grammar:empty-component', 'grammar:dot-component',
+          'grammar:trailing-dot-or-space', 'grammar:reserved-name', 'no-snapshot', 'missing', 'ancestor-reparse', 'reparse', 'non-acl-volume', 'final-path-mismatch',
+          'owner', 'dacl-absent', 'null-dacl', 'unknown-ace', 'foreign-allow', 'not-protected', 'no-owner-ace', 'empty-dacl', 'no-owner-rw-ace', 'not-dir', 'not-file',
+          'hardlink', 'fixture-unavailable', 'vhd-flags-unmeasured', 'exists', 'object-not-present', 'open-error', 'info-error', 'volume-error', 'final-path-error',
+          'sddl-error')
+        case = @('D_OK', 'D_NEST_OK', 'D_B_OWNED', 'D_B_ACE', 'D_NULL', 'D_EMPTY', 'D_NONPROT', 'D_ADMIN', 'D_UNKNOWN', 'D_JUNCTION', 'D_SYMLINK', 'D_UNDER_JUNCTION',
+          'D_NOT_DIR', 'D_MISSING', 'D_SHORTNAME', 'D_TRAILDOT', 'D_TRAILSPACE', 'D_ADS', 'D_UNC', 'D_LONGPREFIX', 'D_DEVPREFIX', 'D_RESERVED', 'F_OK', 'F_B_OWNED',
+          'F_B_ACE', 'F_NULL', 'F_EMPTY', 'F_ADMIN', 'F_UNKNOWN', 'F_INHERITED_FOREIGN', 'F_NLINK2', 'F_SYMLINK', 'F_UNDER_JUNCTION', 'F_NOT_FILE', 'F_MISSING',
+          'F_SHORTNAME', 'F_TRAILDOT', 'F_ADS', 'F_DATA_STREAM', 'F_UNC', 'F_LONGPREFIX', 'C_DIR', 'C_DIR_INSPECT', 'C_DIR_AGAIN', 'C_FILE', 'C_FILE_READ',
+          'C_FILE_AGAIN', 'C_DANGLING', 'C_DIR_TRAILDOT', 'C_FILE_ADS', 'D_FAT', 'F_FAT', 'C_DIR_FAT', 'C_FILE_FAT', 'D_EXFAT', 'F_EXFAT', 'C_DIR_EXFAT', 'C_FILE_EXFAT')
+        privs = @('SeAssignPrimaryTokenPrivilege', 'SeAuditPrivilege', 'SeBackupPrivilege', 'SeChangeNotifyPrivilege', 'SeCreateGlobalPrivilege',
+          'SeCreatePagefilePrivilege', 'SeCreatePermanentPrivilege', 'SeCreateSymbolicLinkPrivilege', 'SeCreateTokenPrivilege', 'SeDebugPrivilege',
+          'SeDelegateSessionUserImpersonatePrivilege', 'SeEnableDelegationPrivilege', 'SeImpersonatePrivilege', 'SeIncreaseBasePriorityPrivilege',
+          'SeIncreaseQuotaPrivilege', 'SeIncreaseWorkingSetPrivilege', 'SeLoadDriverPrivilege', 'SeLockMemoryPrivilege', 'SeMachineAccountPrivilege',
+          'SeManageVolumePrivilege', 'SeProfileSingleProcessPrivilege', 'SeRelabelPrivilege', 'SeRemoteShutdownPrivilege', 'SeRestorePrivilege',
+          'SeSecurityPrivilege', 'SeShutdownPrivilege', 'SeSyncAgentPrivilege', 'SeSystemEnvironmentPrivilege', 'SeSystemProfilePrivilege', 'SeSystemtimePrivilege',
+          'SeTakeOwnershipPrivilege', 'SeTcbPrivilege', 'SeTimeZonePrivilege', 'SeTrustedCredManAccessPrivilege', 'SeUndockPrivilege', 'SeUnsolicitedInputPrivilege')
+      }
+      # Field order and value class per kind, exactly as acl.test.mjs writes them.
+      $schema = @{
+        priv = 'who:who receipt:pres shape:shape whoamiExit:int entries:cnt enabled:cnt disabled:cnt otherState:cnt unknownName:cnt enabledUnknownName:cnt enabledKnown:privs'
+        launch = 'tag:tag receipt:pres sidMatch:bool ok:bool mode:mode nodeExit:int error:bool problems:cnt'
+        helperrun = 'receipt:pres loaded:bool loadStatus:status loadReason:reason loadWinErr:int loadError:bool results:cnt threw:cnt abiBad:cnt notRun:cnt promise:cnt'
+        bindseq = 'seq:seq entries:cnt problems:cnt'
+        bind = 'tag:tag hits:cnt user:bool mode:bool launched:bool timedOut:bool exit:int launchError:int prerequisite:bool self:pres selfOk:bool selfMode:bool selfNodeExit:int'
+        helper = 'case:case op:op result:pres threw:bool abiOk:bool status:status reason:reason winErr:int created:bool bytes:int volId:bool want:cls oracle:cls oracleReason:oreason oracleCode:int problems:cnt'
+        readback = 'test:test snapProblems:cnt objects:cnt skipped:cnt aclMatch:cnt aclDiffNonReparse:cnt aclDiffReparse:cnt aclUnavailNonReparse:cnt aclUnavailReparse:cnt aclErrPresent:cnt hlMatch:cnt hlDiff:cnt hlReparse:cnt hlExitNonzero:cnt rpNotOracle:cnt rpExitNonzero:cnt contradictions:cnt unproved:cnt'
+        rbdiff = 'test:test dir:cnt file:cnt owner:cnt group:cnt daclFlags:cnt aceCount:cnt aceOrder:cnt aceFlags:cnt aceSet:cnt textOnly:cnt unparsed:cnt hlExits:hist hlExitsOther:cnt rpExits:hist rpExitsOther:cnt'
+      }
+      $keyed = @('priv', 'launch', 'bind', 'helper', 'readback', 'rbdiff')
+      $seen = @{}
+      foreach ($raw in $lines) {
+        $l = $raw.TrimEnd([char]13)
+        if (-not $l.StartsWith('# psp-op/', [System.StringComparison]::Ordinal)) {
+          if ($l.TrimStart().StartsWith('# psp-op/', [System.StringComparison]::Ordinal)) { $ind++ }
+          continue
+        }
+        $cand++
+        if ($l.Length -gt 1411) { $over++; continue }
+        if (-not ($l -cmatch '^# psp-op/1 (kind=[a-z]{1,16}(?: [A-Za-z]{1,24}=[A-Za-z0-9_.,:-]{1,1400})*)\z')) { $mal++; continue }
+        $body = $Matches[1]
+        $tok = $body.Split([char]32)
+        $kind = $tok[0].Substring(5)
+        if ($kind -ceq 'error') { if ($tok.Count -eq 1) { $err++ } else { $mal++ }; continue }
+        if (-not $schema.ContainsKey($kind)) { $mal++; continue }
+        $fields = $schema[$kind].Split([char]32)
+        $bad = ($tok.Count -ne ($fields.Count + 1))
+        for ($i = 0; (-not $bad) -and ($i -lt $fields.Count); $i++) {
+          $f = $fields[$i].Split([char]58)
+          if (-not $tok[$i + 1].StartsWith($f[0] + '=', [System.StringComparison]::Ordinal)) { $bad = $true; continue }
+          $v = $tok[$i + 1].Substring($f[0].Length + 1); $cl = $f[1]
+          if ($cl -ceq 'cnt') { $bad = ($v -cnotmatch '^[0-9]{1,5}\z') }
+          elseif ($cl -ceq 'int') { $bad = ($v -cnotmatch '^(?:none|UNKNOWN|-?[0-9]{1,10})\z') }
+          elseif ($cl -ceq 'hist') {
+            if ($v -cne 'none') {
+              $hs = $v.Split([char]44)
+              if ($hs.Count -gt 4) { $bad = $true }
+              foreach ($h in $hs) { if ($h -cnotmatch '^-?[0-9]{1,10}:[0-9]{1,5}\z') { $bad = $true } }
+            }
+          }
+          elseif ($cl -ceq 'privs') {
+            if ($v -cne 'none') {
+              $ps = $v.Split([char]44); $u = @{}
+              if ($ps.Count -gt $voc['privs'].Count) { $bad = $true }
+              foreach ($p in $ps) { if (($voc['privs'] -cnotcontains $p) -or $u.ContainsKey($p)) { $bad = $true } else { $u[$p] = $true } }
+            }
+          }
+          else { $bad = -not ((@('none', 'UNKNOWN') -ccontains $v) -or ($voc[$cl] -ccontains $v)) }
+        }
+        if ($bad) { $mal++; continue }
+        $key = $kind; if ($keyed -ccontains $kind) { $key = $kind + ' ' + $tok[1] }
+        if ($seen.ContainsKey($key)) { $dup++; continue }
+        $seen[$key] = $true
+        $acc++
+        if ($out.Count -ge 128) { $clip++; continue }
+        $out += ('psp-diag verdict-op ' + $body)
+      }
+    }
+  }
+  $head = 'psp-diag verdict-op-summary tap=' + $rs + ' candidates=' + $cand + ' accepted=' + $acc + ' listed=' + $out.Count + ' clipped=' + $clip + ' malformed=' + $mal + ' oversize=' + $over + ' duplicates=' + $dup + ' indented=' + $ind + ' errors=' + $err
+  return @($head + ' trust=diagnostic-only') + $out
 }
 
 if ($ExportOnly) {

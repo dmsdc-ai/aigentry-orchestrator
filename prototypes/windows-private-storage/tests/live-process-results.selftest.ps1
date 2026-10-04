@@ -9,9 +9,10 @@
 # - Negative control: the frozen pre-fix extent (setup-fixtures.ps1 002c2f8f lines 684-692, sha256 b460bab2...) must still
 #   show the nested known-empty false positive. It is control evidence only and never counts as a product PASS.
 # - Both real caller forms are built from the pinned source lines (run-validation.ps1:75-76, setup-fixtures.ps1:742-743).
-# - The pure diagnostic formatters Format-PspVerdictDiag (run-validation.ps1 lines 103-140) and Format-PspCleanupDiag
-#   (lines 174-217) are taken the same way (pinned Extent.Text sha256, no command at all, pinned member-name set) and run
-#   over in-memory TAP text / cleanup records with injection payloads; every line must match its closed grammar exactly.
+# - The pure diagnostic formatters Format-PspVerdictDiag (run-validation.ps1 lines 103-140), Format-PspCleanupDiag
+#   (lines 175-218) and Format-PspVerdictOpDiag (lines 226-330) are taken the same way (pinned Extent.Text sha256, no command
+#   at all, pinned member-name set) and run over in-memory TAP text / cleanup records with injection payloads; every line
+#   must match its closed grammar exactly.
 # - Get-CimInstance / Invoke-CimMethod are script-scope mock functions over fake objects (numeric PIDs, mock.exe, synthetic
 #   SIDs). Binding is proven via Get-Command (CommandType Function) and fake call counters, with module autoloading off,
 #   before any function under test runs. No host process, CIM, account, ACL or file-system state is read or changed apart
@@ -28,7 +29,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0   # as setup-fixtures.ps1:10 / run-validation.ps1:19, the scope both real callers run under
 
 $ExpectedSourceSha256 = '099ad60426c00df78a3ba699c5dc888fbe32eb85f08840b3f0c0c65fbdb3cdbc'
-$ExpectedCallerSha256 = '76eb771c2b2bad678bf525660790353397e7c791cc23c0a23de4637a0d4fd27d'
+$ExpectedCallerSha256 = 'ec9ac30936957838a5744a2ba12345f7a39e2f896bbe1a970ad6b6bbdeec673f'
 $ExpectedExtentSha256 = '36704ed1da177e52608cf64f9f5cfbfb5d4c79ae5a51e465a5d7e411363b509d'
 $BaselineExtentSha256 = 'b460bab2746846988518ade81b10f3760668a9ccb18d15add29cb936c26de332'
 $FunctionName = 'Get-PspLiveSidProcesses'
@@ -40,7 +41,8 @@ $CandidateMembers = @('GetType', 'GetType')
 # Pure diagnostic formatters in run-validation.ps1: no command at all; member-name set (sorted, unique) pinned.
 $Formatters = @(
   [ordered]@{ name = 'Format-PspVerdictDiag'; start = 103; end = 140; sha = 'c4ebd70638fc576fc3dd904c77ab6b26612841b35f766988ce53174507703329'; members = @('ComputeHash', 'Create', 'Dispose', 'GetBytes', 'Split', 'ToLowerInvariant', 'ToString', 'TrimEnd') }
-  [ordered]@{ name = 'Format-PspCleanupDiag'; start = 174; end = 217; sha = '06795a7cab97e9ed3e138046c821cdf188544cda95efa4ae06b466c9bfbafe43'; members = @('StartsWith') }
+  [ordered]@{ name = 'Format-PspCleanupDiag'; start = 175; end = 218; sha = '06795a7cab97e9ed3e138046c821cdf188544cda95efa4ae06b466c9bfbafe43'; members = @('StartsWith') }
+  [ordered]@{ name = 'Format-PspVerdictOpDiag'; start = 226; end = 330; sha = '0347840672c634b31130eddee7c259eb29de38f94fcea800678a42d8d9e30c81'; members = @('ContainsKey', 'Split', 'StartsWith', 'Substring', 'TrimEnd', 'TrimStart') }
 )
 $DiagOwnerPattern = '^psp-diag owner-unknown cat=(enumeration|query|shape|rv-missing|rv-type|rv-nonzero|sid-invalid) pid=(none|[0-9]{1,10}) rv=(none|-?[0-9]{1,20})\z'
 $N9 = '(none|[0-9]{1,9})'
@@ -48,6 +50,8 @@ $DiagVerdictPattern = '^psp-diag verdict nodeExit=(none|-?[0-9]{1,10}) tap=(ok|m
 $DiagVerdictFailPattern = '^psp-diag verdict-fail n=[0-9]{1,9} depth=[0-9]{1,2} directive=[01] nameSha256=(none|[0-9a-f]{64})\z'
 $RootCats = 'none|owner-unknown-enumeration|owner-unknown-query|owner-unknown-rv|owner-unknown-sid|not-fully-removed|live-writers|unowned-root|non-canonical-root|reparse-root|privilege|link-pair|UNKNOWN'
 $DiagCleanupPattern = '^psp-diag cleanup phase=(in-run|backstop|UNKNOWN) (summary=none|ok=(true|false) exception=(true|false) stateProblems=[0-9]{1,9} vdisks=' + $N9 + ' vdiskErrors=' + $N9 + ' root=(none|removed|kept|UNKNOWN) rootError=(' + $RootCats + ') liveWriters=' + $N9 + ' users=' + $N9 + ' usersRemoved=' + $N9 + ' usersNotPresent=' + $N9 + ' userErrors=' + $N9 + ')\z'
+$DiagOpSummaryPattern = '^psp-diag verdict-op-summary tap=(ok|missing|unexpected-path|reparse|not-file|too-large|read-failed|decode-failed|too-many-lines|UNKNOWN)' + ((@('candidates', 'accepted', 'listed', 'clipped', 'malformed', 'oversize', 'duplicates', 'indented', 'errors') | ForEach-Object { " $_=[0-9]{1,9}" }) -join '') + ' trust=diagnostic-only\z'
+$DiagOpPattern = '^psp-diag verdict-op kind=[a-z]{1,16}( [A-Za-z]{1,24}=[A-Za-z0-9_.,:-]{1,1400})*\z'
 $MaxJsonChars = 65536
 $GatePrefix = 'refusing: fake-user processes still alive: '
 $Fixed = [ordered]@{
@@ -556,6 +560,58 @@ try {
       expect = "psp-diag cleanup phase=backstop ok=false exception=false stateProblems=0 vdisks=none vdiskErrors=none root=kept rootError=$($RootErrs[$i][1]) liveWriters=0 $NoneTail" })
   }
   $CForbid = @('secret', 'evil', 'mock.exe', 'S-1-', 'pspa0', 'pspb0', 'RemoveTree', 'RUNNER_TEMP')
+  # Verdict operand reader: valid '# psp-op/1' lines of every kind are re-emitted after the fixed prefix; every hostile
+  # look-alike is only counted. Expected lines are written out literally here (independent of the reader's tables).
+  function OpSum([string]$Tap, [int[]]$C) { "psp-diag verdict-op-summary tap=$Tap candidates=$($C[0]) accepted=$($C[1]) listed=$($C[2]) clipped=$($C[3]) malformed=$($C[4]) oversize=$($C[5]) duplicates=$($C[6]) indented=$($C[7]) errors=$($C[8]) trust=diagnostic-only" }
+  $AllPrivs = @('SeAssignPrimaryTokenPrivilege', 'SeAuditPrivilege', 'SeBackupPrivilege', 'SeChangeNotifyPrivilege', 'SeCreateGlobalPrivilege', 'SeCreatePagefilePrivilege',
+    'SeCreatePermanentPrivilege', 'SeCreateSymbolicLinkPrivilege', 'SeCreateTokenPrivilege', 'SeDebugPrivilege', 'SeDelegateSessionUserImpersonatePrivilege',
+    'SeEnableDelegationPrivilege', 'SeImpersonatePrivilege', 'SeIncreaseBasePriorityPrivilege', 'SeIncreaseQuotaPrivilege', 'SeIncreaseWorkingSetPrivilege',
+    'SeLoadDriverPrivilege', 'SeLockMemoryPrivilege', 'SeMachineAccountPrivilege', 'SeManageVolumePrivilege', 'SeProfileSingleProcessPrivilege', 'SeRelabelPrivilege',
+    'SeRemoteShutdownPrivilege', 'SeRestorePrivilege', 'SeSecurityPrivilege', 'SeShutdownPrivilege', 'SeSyncAgentPrivilege', 'SeSystemEnvironmentPrivilege',
+    'SeSystemProfilePrivilege', 'SeSystemtimePrivilege', 'SeTakeOwnershipPrivilege', 'SeTcbPrivilege', 'SeTimeZonePrivilege', 'SeTrustedCredManAccessPrivilege',
+    'SeUndockPrivilege', 'SeUnsolicitedInputPrivilege')
+  $OpV = @(
+    'kind=priv who=A receipt=present shape=array whoamiExit=0 entries=5 enabled=2 disabled=3 otherState=0 unknownName=1 enabledUnknownName=1 enabledKnown=SeChangeNotifyPrivilege'
+    ('kind=priv who=B receipt=present shape=array whoamiExit=0 entries=36 enabled=36 disabled=0 otherState=0 unknownName=0 enabledUnknownName=0 enabledKnown=' + ($AllPrivs -join ','))
+    'kind=launch tag=helper-run receipt=present sidMatch=true ok=false mode=node-test nodeExit=1 error=false problems=2'
+    'kind=helperrun receipt=present loaded=true loadStatus=ok loadReason=ok loadWinErr=0 loadError=false results=58 threw=0 abiBad=0 notRun=0 promise=0'
+    'kind=bindseq seq=match entries=9 problems=1'
+    'kind=bind tag=helper-run hits=1 user=true mode=true launched=true timedOut=false exit=1 launchError=none prerequisite=false self=present selfOk=false selfMode=true selfNodeExit=1'
+    'kind=helper case=D_JUNCTION op=inspectDir result=present threw=false abiOk=true status=unavailable reason=open_failed winErr=5 created=none bytes=0 volId=false want=unsafe oracle=unsafe oracleReason=reparse oracleCode=none problems=3'
+    'kind=helper case=UNKNOWN op=UNKNOWN result=absent threw=none abiOk=none status=none reason=none winErr=none created=none bytes=none volId=none want=error oracle=error oracleReason=open-error oracleCode=-2147483648 problems=1'
+    'kind=readback test=contradict snapProblems=0 objects=400 skipped=8 aclMatch=380 aclDiffNonReparse=4 aclDiffReparse=8 aclUnavailNonReparse=0 aclUnavailReparse=0 aclErrPresent=0 hlMatch=200 hlDiff=0 hlReparse=4 hlExitNonzero=0 rpNotOracle=0 rpExitNonzero=0 contradictions=4 unproved=12'
+    'kind=rbdiff test=unproved dir=3 file=1 owner=0 group=1 daclFlags=0 aceCount=0 aceOrder=0 aceFlags=2 aceSet=0 textOnly=1 unparsed=0 hlExits=1:3,-1:2 hlExitsOther=0 rpExits=none rpExitsOther=0'
+  )
+  $OpP = '# psp-op/1 '
+  $O1 = @('TAP version 13', '# Subtest: x', 'not ok 1 - x', '  ---', '  ...') + @(for ($i = 0; $i -lt $OpV.Count; $i++) { if ($i -eq 4) { $OpP + $OpV[$i] + "`r" } else { $OpP + $OpV[$i] } }) + @('1..1', '# tests 1', '# pass 0', '# fail 1')
+  $O2 = @(
+    ('    ' + $OpP + $OpV[0]), ("`t" + $OpP + $OpV[4])
+    ($OpP + $OpV[0].Replace('enabledKnown=SeChangeNotifyPrivilege', 'enabledKnown=SeEvilPrivilege'))
+    ($OpP + $OpV[2].Replace('nodeExit=1', ('nodeExit=1' + $Esc + '[31m')))
+    ($OpP + 'kind=bindseq seq=match::error::pwn entries=9 problems=0'), ($OpP + 'kind=shell cmd=pwn'), ('# psp-op/2 ' + $OpV[4])
+    ($OpP + 'kind=bindseq seq=match entries=9'), ($OpP + 'kind=bindseq entries=9 seq=match problems=0'), ($OpP + $OpV[2].Replace('nodeExit=1', 'nodeExit=99999999999'))
+    ($OpP + $OpV[4]), ($OpP + 'kind=bindseq seq=differ entries=1 problems=5'), ($OpP + 'kind=priv who=B ' + ('x' * 1400)), ($OpP + 'kind=error'), ($OpP + 'kind=error extra=1')
+    ($OpP + $OpV[1].Replace('enabledKnown=SeAssignPrimaryTokenPrivilege,', 'enabledKnown=SeChangeNotifyPrivilege,'))
+    ($OpP + $OpV[9].Replace('hlExits=1:3,-1:2', 'hlExits=1:1,2:1,3:1,4:1,5:1')), ($OpP + 'kind=PRIV who=A'), ($OpP + $OpV[4] + ' '), ($OpP + $OpV[4].Replace(' seq=', '  seq='))
+    ($OpP + $OpV[4].Replace('seq=match', 'seq=\#match')), ($OpP + $OpV[2].Replace('tag=helper-run', 'tag=S-1-5-21-1-2-3-1001'))
+    ($OpP + $OpV[0].Replace('enabledKnown=SeChangeNotifyPrivilege', 'enabledKnown=sechangenotifyprivilege')), ($OpP + $OpV[6].Replace('case=D_JUNCTION', 'case=d_junction'))
+    ($OpP + $OpV[8].Replace('objects=400', 'objects=100000')), ($OpP + $OpV[6]), ($OpP + $OpV[6].Replace('status=unavailable', 'status=ok')), ($OpP + 'kind=helper case=D_OK op=inspectDir')
+    ($OpP + $OpV[2].Replace('sidMatch=true', 'sidMatch=yes')), ($OpP + $OpV[5] + ' extra=1')
+  )
+  $OCases = @(
+    [ordered]@{ id = 'to-valid-all-kinds'; rs = 'ok'; text = ($O1 -join "`n"); forbid = @('Subtest', 'not ok', 'TAP', '#')
+      expect = @(@(OpSum 'ok' @(10, 10, 10, 0, 0, 0, 0, 0, 0)) + @($OpV | ForEach-Object { 'psp-diag verdict-op ' + $_ })) }
+    [ordered]@{ id = 'to-hostile'; rs = 'ok'; text = ($O2 -join "`n"); forbid = @('pwn', 'SeEvil', 'S-1-', 'xxxx', 'sechangenotify', 'd_junction', 'PRIV', 'shell', '[31m', 'differ', 'status=ok', '100000', '99999999999', '#', 'extra')
+      expect = @((OpSum 'ok' @(28, 2, 2, 0, 22, 1, 2, 2, 1)), ('psp-diag verdict-op ' + $OpV[4]), ('psp-diag verdict-op ' + $OpV[6])) }
+    [ordered]@{ id = 'to-too-many-lines'; rs = 'ok'; text = ($OpP + $OpV[4] + ("`n" * 50000)); forbid = @('bindseq')
+      expect = @(OpSum 'too-many-lines' @(0, 0, 0, 0, 0, 0, 0, 0, 0)) }
+    [ordered]@{ id = 'to-read-status-not-enum'; rs = "ok`n::error::pwn"; text = ($OpP + $OpV[4]); forbid = @('pwn', 'bindseq')
+      expect = @(OpSum 'UNKNOWN' @(0, 0, 0, 0, 0, 0, 0, 0, 0)) }
+    [ordered]@{ id = 'to-read-status-missing'; rs = 'missing'; text = ($OpP + $OpV[4]); forbid = @('bindseq')
+      expect = @(OpSum 'missing' @(0, 0, 0, 0, 0, 0, 0, 0, 0)) }
+    [ordered]@{ id = 'to-empty-ok'; rs = 'ok'; text = ''; forbid = @()
+      expect = @(OpSum 'ok' @(0, 0, 0, 0, 0, 0, 0, 0, 0)) }
+  )
 
   function Test-DiagLines($Out, [bool]$Thrown, [string[]]$Expect, [string[]]$Forbid, [string[]]$Patterns) {
     if ($Thrown) { 'formatter threw'; return }
@@ -570,7 +626,7 @@ try {
     }
     if (($o.Count -ne $Expect.Count) -or ((@($o | ForEach-Object { [string]$_ }) -join "`n") -cne ($Expect -join "`n"))) { "lines=$($o.Count) expected=$($Expect.Count) or text differs" }
   }
-  $fmt = @(); $fmtFail = 0; $vRun = 0; $cRun = 0
+  $fmt = @(); $fmtFail = 0; $vRun = 0; $cRun = 0; $oRun = 0
   foreach ($vc in $VCases) {
     $out = $null; $thrown = $false
     try { $out = @(Format-PspVerdictDiag $vc.ne $vc.rs $vc.text $vc.by) } catch { $thrown = $true }
@@ -589,7 +645,17 @@ try {
     $fmt += ,([ordered]@{ id = $cc.id; lines = @($out).Count; ok = ($f.Count -eq 0) })
     if ($f.Count -gt 0) { $fmtFail++; foreach ($x in $f) { $Report.failures += (Limit "formatter $($cc.id) $x") } }
   }
-  $Report.formatters = [ordered]@{ verdictCasesRun = $vRun; verdictCasesExpected = $VCases.Count; cleanupCasesRun = $cRun; cleanupCasesExpected = $CCases.Count; casesFailed = $fmtFail; cases = $fmt }
+  foreach ($oc in $OCases) {
+    $out = $null; $thrown = $false
+    try { $out = @(Format-PspVerdictOpDiag $oc.rs $oc.text) } catch { $thrown = $true }
+    $f = @(Test-DiagLines $out $thrown $oc.expect $oc.forbid @($DiagOpSummaryPattern, $DiagOpPattern))
+    $oRun++
+    Write-Host "formatter case=$($oc.id) lines=$(@($out).Count) fails=$($f.Count)"
+    $fmt += ,([ordered]@{ id = $oc.id; lines = @($out).Count; ok = ($f.Count -eq 0) })
+    if ($f.Count -gt 0) { $fmtFail++; foreach ($x in $f) { $Report.failures += (Limit "formatter $($oc.id) $x") } }
+  }
+  $Report.formatters = [ordered]@{ verdictCasesRun = $vRun; verdictCasesExpected = $VCases.Count; cleanupCasesRun = $cRun; cleanupCasesExpected = $CCases.Count
+    operandCasesRun = $oRun; operandCasesExpected = $OCases.Count; casesFailed = $fmtFail; cases = $fmt }
 
   # ---- 7. post guards: still no host CIM module, mocks still bound, matrix complete ----
   $Report.postGuards = [ordered]@{ cimCmdletsLoaded = [bool](Get-Module -Name CimCmdlets); mocksBound = $true }
@@ -598,11 +664,11 @@ try {
   if ($cand.Count -ne $Cases.Count) { $Report.failures += 'candidate matrix incomplete' }
   if (@($Report.failures).Count -gt 50) { $Report.failures = @($Report.failures[0..49]) + @('... more failures truncated') }
 
-  if (($vRun -ne $VCases.Count) -or ($cRun -ne $CCases.Count)) { $Report.failures += 'formatter matrix incomplete' }
+  if (($vRun -ne $VCases.Count) -or ($cRun -ne $CCases.Count) -or ($oRun -ne $OCases.Count)) { $Report.failures += 'formatter matrix incomplete' }
   $pass = ($Report.negativeControl.verdict -ceq 'DEFECT-REPRODUCED') -and ($candFail -eq 0) -and ($cand.Count -eq $Cases.Count) -and (-not $Report.postGuards.cimCmdletsLoaded) -and $Report.postGuards.mocksBound -and
-    ($fmtFail -eq 0) -and ($vRun -eq $VCases.Count) -and ($cRun -eq $CCases.Count)
+    ($fmtFail -eq 0) -and ($vRun -eq $VCases.Count) -and ($cRun -eq $CCases.Count) -and ($oRun -eq $OCases.Count)
   if ($pass) { $Report.status = 'PASS' } else { $Report.status = 'FAILED'; $Report.failure = 'see failures' }
-  Write-Host ("OUTCOME status=$($Report.status) control=$($Report.negativeControl.verdict) candidateCases=$($cand.Count) candidateFailed=$candFail formatterCases=$($vRun + $cRun) formatterFailed=$fmtFail failures=$(@($Report.failures).Count)")
+  Write-Host ("OUTCOME status=$($Report.status) control=$($Report.negativeControl.verdict) candidateCases=$($cand.Count) candidateFailed=$candFail formatterCases=$($vRun + $cRun) operandFormatterCases=$oRun formatterFailed=$fmtFail failures=$(@($Report.failures).Count)")
   Write-Host (Save-Report)
   if ($pass) { exit 0 } else { exit 1 }
 } catch {

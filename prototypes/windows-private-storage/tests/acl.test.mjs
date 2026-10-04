@@ -484,6 +484,213 @@ export function validateCleanupState(st, { tempLong, runId }) {
   return p;
 }
 
+// ------------------------------------------------------------------ verdict operand diagnostics (pure; DIAGNOSTIC only)
+// One closed-grammar line per observed verdict check, written with t.diagnostic BEFORE the unchanged assertions and read
+// back from verdict.tap by run-validation.ps1 Format-PspVerdictOpDiag (twin vocabulary, same literals). Untrusted until a
+// verified export; never acceptance, never a waiver. Values are fixed enums, booleans, bounded integers and counts only:
+// never a path, SID, user name, SDDL, message or raw receipt string. Anything outside a vocabulary prints UNKNOWN.
+export const OP_PREFIX = 'psp-op/1';
+// Official privilege constant names (winnt.h SE_*_NAME). Any other name is only counted.
+export const OP_PRIVILEGES = Object.freeze(['SeAssignPrimaryTokenPrivilege', 'SeAuditPrivilege', 'SeBackupPrivilege', 'SeChangeNotifyPrivilege',
+  'SeCreateGlobalPrivilege', 'SeCreatePagefilePrivilege', 'SeCreatePermanentPrivilege', 'SeCreateSymbolicLinkPrivilege', 'SeCreateTokenPrivilege',
+  'SeDebugPrivilege', 'SeDelegateSessionUserImpersonatePrivilege', 'SeEnableDelegationPrivilege', 'SeImpersonatePrivilege',
+  'SeIncreaseBasePriorityPrivilege', 'SeIncreaseQuotaPrivilege', 'SeIncreaseWorkingSetPrivilege', 'SeLoadDriverPrivilege', 'SeLockMemoryPrivilege',
+  'SeMachineAccountPrivilege', 'SeManageVolumePrivilege', 'SeProfileSingleProcessPrivilege', 'SeRelabelPrivilege', 'SeRemoteShutdownPrivilege',
+  'SeRestorePrivilege', 'SeSecurityPrivilege', 'SeShutdownPrivilege', 'SeSyncAgentPrivilege', 'SeSystemEnvironmentPrivilege',
+  'SeSystemProfilePrivilege', 'SeSystemtimePrivilege', 'SeTakeOwnershipPrivilege', 'SeTcbPrivilege', 'SeTimeZonePrivilege',
+  'SeTrustedCredManAccessPrivilege', 'SeUndockPrivilege', 'SeUnsolicitedInputPrivilege']);
+// README a1e1cd9f "Reason strings" plus the wrapper reasons.
+export const OP_HELPER_REASONS = Object.freeze(['ok', 'path_grammar', 'invalid_argument', 'not_found', 'already_exists', 'ancestor_open_failed',
+  'ancestor_query_failed', 'ancestor_reparse_point', 'ancestor_not_directory', 'open_failed', 'create_failed', 'type_query_failed',
+  'attributes_query_failed', 'reparse_point', 'not_directory', 'not_regular_file', 'link_count', 'volume_query_failed', 'acl_not_persistent',
+  'final_path_query_failed', 'final_path_unrecognized', 'final_path_mismatch', 'final_path_compare_failed', 'security_query_failed', 'owner_mismatch',
+  'dacl_absent', 'dacl_null', 'dacl_not_protected', 'dacl_invalid', 'dacl_empty', 'ace_unsupported', 'ace_foreign_allow', 'owner_ace_missing',
+  'identity_query_failed', 'size_query_failed', 'size_limit', 'size_changed', 'read_failed', 'write_failed', 'short_write', 'flush_failed',
+  'close_failed', 'token_open_failed', 'token_query_failed', 'token_sid_invalid', 'descriptor_build_failed', 'alloc_failed', 'internal_error',
+  'platform_unsupported', 'binary_path_invalid', 'binary_hash_invalid', 'binary_unreadable', 'binary_hash_mismatch', 'load_failed', 'abi_mismatch',
+  'native_threw', 'native_result_invalid']);
+export const OP_ORACLE_CLASSES = Object.freeze(['ok', 'unsafe', 'missing', 'unavailable', 'exists', 'error']);
+// Every literal oracle reason above; reasons carrying a numeric suffix print the prefix plus a bounded oracleCode.
+export const OP_ORACLE_REASONS = Object.freeze(['grammar:empty', 'grammar:prefix', 'grammar:not-drive-absolute', 'grammar:colon',
+  'grammar:empty-component', 'grammar:dot-component', 'grammar:trailing-dot-or-space', 'grammar:reserved-name', 'no-snapshot', 'missing',
+  'ancestor-reparse', 'reparse', 'non-acl-volume', 'final-path-mismatch', 'owner', 'dacl-absent', 'null-dacl', 'unknown-ace', 'foreign-allow',
+  'not-protected', 'no-owner-ace', 'empty-dacl', 'no-owner-rw-ace', 'not-dir', 'not-file', 'hardlink', 'fixture-unavailable', 'vhd-flags-unmeasured',
+  'exists', 'object-not-present']);
+export const OP_ORACLE_CODED = Object.freeze(['open-error', 'info-error', 'volume-error', 'final-path-error', 'sddl-error']);
+export const OP_LAUNCH_MODES = Object.freeze(['identity', 'probe', 'move-measure', 'node-test']);
+
+const opInt = (v) => (Number.isInteger(v) && v >= -2147483648 && v <= 4294967295 ? String(v) : (v === null || v === undefined ? 'none' : 'UNKNOWN'));
+const opBool = (v) => (v === true ? 'true' : v === false ? 'false' : (v === null || v === undefined ? 'none' : 'UNKNOWN'));
+const opEnum = (v, list) => (typeof v === 'string' && list.includes(v) ? v : (v === null || v === undefined ? 'none' : 'UNKNOWN'));
+const opCount = (n) => String(Math.min(Number.isInteger(n) && n > 0 ? n : 0, 99999));
+const OP_LINE = /^psp-op\/1 kind=[a-z]{1,16}(?: [A-Za-z]{1,24}=[A-Za-z0-9_.,:-]{1,1400})*$/;
+export function opLine(kind, pairs) {
+  const s = `${OP_PREFIX} kind=${kind}${pairs.map(([k, v]) => ` ${k}=${v}`).join('')}`;
+  return s.length <= 1409 && OP_LINE.test(s) ? s : `${OP_PREFIX} kind=error`;
+}
+
+export function privOperands(who, idr) {
+  const raw = idr && idr.privileges;
+  const list = asArray(raw);
+  const known = new Set();
+  let enabled = 0; let disabled = 0; let otherState = 0; let unknownName = 0; let enabledUnknownName = 0;
+  for (const x of list) {
+    const name = x && x.name;
+    const isKnown = typeof name === 'string' && OP_PRIVILEGES.includes(name);
+    if (!isKnown) unknownName++;
+    const st = String(x && x.state);   // the enabledPrivileges predicate
+    if (/^enabled$/i.test(st)) { enabled++; if (isKnown) known.add(name); else enabledUnknownName++; }
+    else if (/^disabled$/i.test(st)) disabled++;
+    else otherState++;
+  }
+  const w = idr && idr.whoami && idr.whoami.priv;
+  return opLine('priv', [['who', opEnum(who, ['A', 'B'])], ['receipt', idr ? 'present' : 'absent'],
+    ['shape', raw === null || raw === undefined ? 'none' : (Array.isArray(raw) ? 'array' : 'single')], ['whoamiExit', opInt(w && w.exit)],
+    ['entries', opCount(list.length)], ['enabled', opCount(enabled)], ['disabled', opCount(disabled)], ['otherState', opCount(otherState)],
+    ['unknownName', opCount(unknownName)], ['enabledUnknownName', opCount(enabledUnknownName)],
+    ['enabledKnown', known.size ? OP_PRIVILEGES.filter((p) => known.has(p)).join(',') : 'none']]);
+}
+
+export function launchOperands(tag, rec, sid, node) {
+  return opLine('launch', [['tag', opEnum(tag, EXPECTED_LAUNCHES.map((e) => e[0]))], ['receipt', rec ? 'present' : 'absent'],
+    ['sidMatch', rec ? opBool(typeof sid === 'string' && rec.userSid === sid) : 'none'], ['ok', opBool(rec && rec.ok)],
+    ['mode', opEnum(rec && rec.mode, OP_LAUNCH_MODES)], ['nodeExit', opInt(rec && rec.nodeExit)],
+    ['error', rec ? opBool(rec.error !== null && rec.error !== undefined) : 'none'], ['problems', opCount(launchProblems(rec, sid, { node }).length)]]);
+}
+
+export function helperRunOperands(hr) {
+  const rs = asArray(hr && hr.results);
+  const ls = hr && hr.loadStatus;
+  return opLine('helperrun', [['receipt', hr ? 'present' : 'absent'], ['loaded', opBool(hr && hr.loaded)],
+    ['loadStatus', opEnum(ls && ls.status, ABI.statuses)], ['loadReason', opEnum(ls && ls.reason, OP_HELPER_REASONS)],
+    ['loadWinErr', opInt(ls && ls.win32Error)], ['loadError', hr ? opBool(hr.loadError !== null && hr.loadError !== undefined) : 'none'],
+    ['results', opCount(rs.length)], ['threw', opCount(rs.filter((r) => r && r.threw === true).length)],
+    ['abiBad', opCount(rs.filter((r) => !(r && r.result && r.result.abiOk === true)).length)],
+    ['notRun', opCount(rs.filter((r) => r && r.notRun !== null && r.notRun !== undefined).length)],
+    ['promise', opCount(rs.filter((r) => r && r.returnedPromise === true).length)]]);
+}
+
+export function bindOperands(launches, users, receipts) {
+  const ls = asArray(launches);
+  const tags = ls.map((l) => (l && typeof l === 'object' ? l.tag : null));
+  const out = [opLine('bindseq', [['seq', tags.join('|') === EXPECTED_LAUNCHES.map((e) => e[0]).join('|') ? 'match' : 'differ'],
+    ['entries', opCount(ls.length)], ['problems', opCount(launchBindingProblems(launches, users, receipts).length)]])];
+  for (const [tag, who, mode] of EXPECTED_LAUNCHES) {
+    const hits = ls.filter((l) => l && l.tag === tag);
+    const l = hits.length === 1 ? hits[0] : null;
+    const name = users && users[who] && users[who].name;
+    const r = receipts && receipts[tag];
+    out.push(opLine('bind', [['tag', tag], ['hits', opCount(hits.length)], ['user', l ? opBool(typeof name === 'string' && l.user === name) : 'none'],
+      ['mode', l ? opBool(l.mode === mode) : 'none'], ['launched', opBool(l && l.launched)], ['timedOut', opBool(l && l.timedOut)],
+      ['exit', opInt(l && l.exitCode)], ['launchError', opInt(l && l.launchError)],
+      ['prerequisite', l ? opBool(l.prerequisite !== null && l.prerequisite !== undefined) : 'none'], ['self', r ? 'present' : 'absent'],
+      ['selfOk', opBool(r && r.ok)], ['selfMode', r ? opBool(r.mode === mode) : 'none'], ['selfNodeExit', opInt(r && r.nodeExit)]]));
+  }
+  return out;
+}
+
+function opOracle(o) {
+  if (!o || typeof o !== 'object') return ['UNKNOWN', 'UNKNOWN', 'none'];
+  const cls = opEnum(o.cls, OP_ORACLE_CLASSES);
+  if (o.reason === null) return [cls, 'none', 'none'];
+  if (typeof o.reason === 'string') {
+    if (OP_ORACLE_REASONS.includes(o.reason)) return [cls, o.reason, 'none'];
+    for (const k of OP_ORACLE_CODED) {
+      if (o.reason.startsWith(`${k}-`)) { const s = o.reason.slice(k.length + 1); return [cls, k, /^-?[0-9]{1,10}$/.test(s) ? opInt(Number(s)) : 'UNKNOWN']; }
+    }
+  }
+  return [cls, 'UNKNOWN', 'none'];
+}
+
+export function helperOperands(c, r, o, want) {
+  const id = c && c.id;
+  const x = r && r.result;
+  const [cls, reason, code] = opOracle(o);
+  return opLine('helper', [['case', opEnum(id, Object.keys(CANDIDATE_EXPECT))], ['op', opEnum(c && c.op, ABI.exports)], ['result', r ? 'present' : 'absent'],
+    ['threw', r ? opBool(r.threw) : 'none'], ['abiOk', opBool(x && x.abiOk)], ['status', opEnum(x && x.status, ABI.statuses)],
+    ['reason', opEnum(x && x.reason, OP_HELPER_REASONS)], ['winErr', opInt(x && x.win32Error)], ['created', opBool(x && x.created)],
+    ['bytes', opInt(x && x.bytesLength)],
+    ['volId', x ? opBool(typeof x.volumeSerial === 'string' && /^[0-9a-f]{16}$/.test(x.volumeSerial) && typeof x.fileId === 'string' && /^[0-9a-f]{32}$/.test(x.fileId)) : 'none'],
+    ['want', opEnum(want, OP_ORACLE_CLASSES)], ['oracle', cls], ['oracleReason', reason], ['oracleCode', code],
+    ['problems', opCount(helperResultProblems(id, r, want).length)]]);
+}
+
+// Which parsed parts of two differing SDDL strings differ (normalized SIDs, flags sorted, rights as masks).
+function sddlDiffKinds(a, b) {
+  const x = parseSddl(a); const y = parseSddl(b);
+  if (!x || !y) return ['unparsed'];
+  const k = [];
+  if (normalizeSid(x.owner) !== normalizeSid(y.owner)) k.push('owner');
+  if (normalizeSid(x.group) !== normalizeSid(y.group)) k.push('group');
+  if (!x.dacl || !y.dacl) { if (x.dacl !== y.dacl) k.push('daclFlags'); }
+  else {
+    if (x.dacl.isNull !== y.dacl.isNull || x.dacl.protected !== y.dacl.protected || x.dacl.autoInherited !== y.dacl.autoInherited) k.push('daclFlags');
+    const key = (a2, withFlags) => { const m = parseRights(a2.rights); return [a2.type, withFlags ? [...a2.flags].sort().join('') : '', m.mask, m.unknown, a2.sid, a2.condition].join(';'); };
+    const ax = x.dacl.aces.map((e) => key(e, true)); const ay = y.dacl.aces.map((e) => key(e, true));
+    if (ax.length !== ay.length) k.push('aceCount');
+    else if (ax.join('|') !== ay.join('|')) {
+      if ([...ax].sort().join('|') === [...ay].sort().join('|')) k.push('aceOrder');
+      else if (x.dacl.aces.map((e) => key(e, false)).sort().join('|') === y.dacl.aces.map((e) => key(e, false)).sort().join('|')) k.push('aceFlags');
+      else k.push('aceSet');
+    }
+  }
+  if (k.length === 0) k.push('textOnly');
+  return k;
+}
+
+// R6 categories, mirroring readbackFindings branch by branch; totals come from readbackFindings itself.
+export function readbackOperands(test, snaps, objects) {
+  const n = { objects: 0, skipped: 0, aclMatch: 0, aclDiffNonReparse: 0, aclDiffReparse: 0, aclUnavailNonReparse: 0, aclUnavailReparse: 0, aclErrPresent: 0,
+    hlMatch: 0, hlDiff: 0, hlReparse: 0, hlExitNonzero: 0, rpNotOracle: 0, rpExitNonzero: 0 };
+  const d = { dir: 0, file: 0, owner: 0, group: 0, daclFlags: 0, aceCount: 0, aceOrder: 0, aceFlags: 0, aceSet: 0, textOnly: 0, unparsed: 0 };
+  const hist = () => ({ m: new Map(), other: 0 });
+  const hl = hist(); const rp = hist();
+  const bump = (h, v) => {
+    if (opInt(v) !== String(v) || (!h.m.has(v) && h.m.size >= 4)) { h.other++; return; }
+    h.m.set(v, (h.m.get(v) || 0) + 1);
+  };
+  const fmt = (h) => (h.m.size ? [...h.m].map(([v, k]) => `${v}:${opCount(k)}`).join(',') : 'none');
+  for (const o of asArray(objects)) {
+    n.objects++;
+    if (!o || o.openError !== 0) { n.skipped++; continue; }
+    if (typeof o.getAclSddl === 'string') {
+      if (o.getAclSddl !== o.sddl) {
+        if (o.isReparse) n.aclDiffReparse++;
+        else {
+          n.aclDiffNonReparse++;
+          if (o.isDir) d.dir++; else d.file++;
+          for (const k of sddlDiffKinds(o.getAclSddl, o.sddl)) d[k]++;
+        }
+      } else n.aclMatch++;
+    } else {
+      if (o.isReparse) n.aclUnavailReparse++; else n.aclUnavailNonReparse++;
+      if (o.getAclError !== null && o.getAclError !== undefined) n.aclErrPresent++;
+    }
+    if (!o.isDir) {
+      if (o.isReparse) n.hlReparse++;
+      else if (o.fsutilHardlinkExit === 0) { if (asArray(o.fsutilHardlinks).length !== o.nLinks) n.hlDiff++; else n.hlMatch++; }
+      else { n.hlExitNonzero++; bump(hl, o.fsutilHardlinkExit); }
+    }
+    if (o.fsutilReparseExit === 0 && !o.isReparse) n.rpNotOracle++;
+    if (o.isReparse && o.fsutilReparseExit !== 0) { n.rpExitNonzero++; bump(rp, o.fsutilReparseExit); }
+  }
+  const f = readbackFindings(objects);
+  const t = opEnum(test, ['contradict', 'unproved']);
+  return [
+    opLine('readback', [['test', t], ['snapProblems', opCount(snapshotSetProblems(snaps).length)], ...Object.entries(n).map(([k, v]) => [k, opCount(v)]),
+      ['contradictions', opCount(f.contradictions.length)], ['unproved', opCount(f.unproved.length)]]),
+    opLine('rbdiff', [['test', t], ...Object.entries(d).map(([k, v]) => [k, opCount(v)]), ['hlExits', fmt(hl)], ['hlExitsOther', opCount(hl.other)],
+      ['rpExits', fmt(rp)], ['rpExitsOther', opCount(rp.other)]]),
+  ];
+}
+
+// The only catch here wraps the diagnostic builder, never an assertion: a builder fault prints one fixed line.
+function opDiag(t, build) {
+  let lines;
+  try { lines = asArray(build()); } catch { lines = [opLine('error', [])]; }
+  for (const l of lines) t.diagnostic(l);
+}
+
 // ------------------------------------------------------------------ phase: selfcheck
 if (PHASE === 'selfcheck') {
   const A = 'S-1-5-21-1-2-3-1001';
@@ -762,8 +969,9 @@ if (PHASE === 'verdict') {
     });
 
     // R7: the r2 wording is measured, not whitelisted. Any enabled privilege leaves the policy decision HOLD.
-    test(`verdict: CONTRACT-HOLD r2 §3 "no privileges enabled" holds for fake user ${who}`, () => {
+    test(`verdict: CONTRACT-HOLD r2 §3 "no privileges enabled" holds for fake user ${who}`, (t) => {
       const idr = load(`identity-${who}.json`);
+      opDiag(t, () => privOperands(who, idr));
       assert.ok(idr && asArray(idr.privileges).length > 0, 'whoami /priv not measured');
       const enabled = enabledPrivileges(idr);
       assert.deepEqual(enabled, [], `CONTRACT_UNPROVED (policy HOLD, not whitelisted): enabled privileges ${enabled.join(',')}`);
@@ -773,14 +981,16 @@ if (PHASE === 'verdict') {
   // R5: every launch ran as the intended runtime identity; the helper node run exited 0.
   for (const [file, who, node] of [['probe-Actl.json', 'A', false], ['move-measure.json', 'A', false], ['helper-run.json', 'A', true],
     ['probe-B1.json', 'B', false], ['probe-B2.json', 'B', false], ['probe-Atrust.json', 'A', false], ['probe-Btrust.json', 'B', false]]) {
-    test(`verdict: ${file} ran as fake user ${who}${node ? ' and node exited 0' : ''}`, () => {
+    test(`verdict: ${file} ran as fake user ${who}${node ? ' and node exited 0' : ''}`, (t) => {
+      opDiag(t, () => [launchOperands(file.slice(0, -5), load(file), who === 'A' ? sidA : sidB, node), ...(node ? [helperRunOperands(helperReceipt)] : [])]);
       assert.ok(/^S-1-5-21-/.test(String(sidA)) && /^S-1-5-21-/.test(String(sidB)) && sidA !== sidB, 'fake user SIDs not recorded');
       assert.deepEqual(launchProblems(load(file), who === 'A' ? sidA : sidB, { node }), []);
     });
   }
 
-  test('verdict: every captured self-report is bound to exactly one admin-observed launch (exit 0, not timed out)', () => {
+  test('verdict: every captured self-report is bound to exactly one admin-observed launch (exit 0, not timed out)', (t) => {
     const receipts = Object.fromEntries(EXPECTED_LAUNCHES.map(([tag]) => [tag, load(`${tag}.json`)]));
+    opDiag(t, () => bindOperands(load('launches.json'), manifest && manifest.users, receipts));
     assert.deepEqual(launchBindingProblems(load('launches.json'), manifest && manifest.users, receipts), []);
   });
 
@@ -846,9 +1056,10 @@ if (PHASE === 'verdict') {
   });
 
   for (const c of cases) {
-    test(`verdict: helper ${c.id} ${c.op} equals oracle`, () => {
+    test(`verdict: helper ${c.id} ${c.op} equals oracle`, (t) => {
       const r = results.get(c.id);
       const o = oracleFor(c);
+      opDiag(t, () => helperOperands(c, r, o, expectedHelperStatus(c.id, o.cls)));
       assert.deepEqual(helperResultProblems(c.id, r, expectedHelperStatus(c.id, o.cls)), [], `oracle ${o.cls}/${o.reason}`);
       if (r.result.status === 'ok') assert.ok(/^[0-9a-f]{16}$/.test(r.result.volumeSerial) && /^[0-9a-f]{32}$/.test(r.result.fileId), 'ok without FileIdInfo');
       if (c.op === 'readPrivateFile' && o.cls === 'ok') {
@@ -932,11 +1143,13 @@ if (PHASE === 'verdict') {
 
   // R6: Get-Acl / fsutil read-back. Contradictions fail; anything not read back is CONTRACT_UNPROVED.
   const allSnapObjects = () => ['S0', 'S1', 'S2', 'S3'].flatMap((t) => asArray(snaps[t] && snaps[t].objects));
-  test('verdict: independent read-back never contradicts the backup-handle oracle', () => {
+  test('verdict: independent read-back never contradicts the backup-handle oracle', (t) => {
+    opDiag(t, () => readbackOperands('contradict', snaps, allSnapObjects()));
     assert.deepEqual(snapshotSetProblems(snaps), []);
     assert.deepEqual(readbackFindings(allSnapObjects()).contradictions, []);
   });
-  test('verdict: CONTRACT-HOLD r2 §4 Get-Acl/fsutil read-back available for every gated object', () => {
+  test('verdict: CONTRACT-HOLD r2 §4 Get-Acl/fsutil read-back available for every gated object', (t) => {
+    opDiag(t, () => readbackOperands('unproved', snaps, allSnapObjects()));
     assert.deepEqual(snapshotSetProblems(snaps), [], 'CONTRACT_UNPROVED: no read-back evidence at all');
     const { unproved } = readbackFindings(allSnapObjects());
     assert.deepEqual(unproved, [], `CONTRACT_UNPROVED (not waived, oracle not replaced): ${unproved.length} read-backs unavailable`);
