@@ -33,7 +33,7 @@ const PIN = { version: '6.0.3',
   'lib/to-batch-syntax.js': 'e39a03dac6e5e31c6c4bb58fab2c23e8aeeaacd53e0b8c63e742fe7f4ef476ec' };
 // Exact sources the direct engine must be built from (PROBE_EXPECT selects; mismatch → no run).
 const SOURCE_PINS = {
-  'candidate-r1': { 'win-launch.ts': '782fcd5442345db6c87936bbabfdea376a9830a683c6c427e40a575970f0b3cb',
+  'candidate-r1': { 'win-launch.ts': '2c8f010244142c8404295dc61444951fc86b6263d51d6ff59f0c0abdd64fa88e',
     'spawner.ts': '56d6dbb811a2ad8a265bb79a144ff01900c00cbe351d20185392cfbd16660431',
     'gemini.ts': '0baa25bf1f9bffff993c071e29a75c0ee6101b3e8b5d4719a2daa7748e12f099',
     'types.ts': '940990d4a298ac400170a950824f4802d00157bf0cbe1d7fcc15328e7c5b865a' },
@@ -471,6 +471,26 @@ try {
     receipt.cases.push(await differential(`spelling/${vid}`, { exeToken: 'fakesp', dirs: [entry], args: ['main-never-run.js', 'x'], extra: { FAKE_MODE: 'preload' },
       expect: { execPath: redact(nodeExe), args: ['x'], stdinNull: true } }));
   }
+  // ---- final-component spelling: on-disk MiXeD.ExE (hard link to a valid node copy in an owned fresh dir) reached as
+  // V-A P=MiXeD via PATH, where the PATHEXT-built name is MiXeD.EXE. The entry is read back from the directory. ----
+  const mxSrc = path.join(g, 'mixed-src'), mx = path.join(g, 'mixed-exe');
+  fs.mkdirSync(mxSrc); fs.mkdirSync(mx);
+  fs.copyFileSync(process.execPath, path.join(mxSrc, 'node.exe'));
+  let mxLinkError = null;
+  try { fs.linkSync(path.join(mxSrc, 'node.exe'), path.join(mx, 'MiXeD.ExE')); } catch (e) { mxLinkError = code(e); }
+  const mxEntries = fs.readdirSync(mx);
+  const mxEntry = mxEntries.find(e => e.toLowerCase() === 'mixed.exe') ?? null;
+  await genShim(gen, path.join(g, 'mxpkg', 'cli'), path.join(g, 'mxbin'), 'fakemx', fakeSource('#!/usr/bin/env MiXeD'));
+  const mxCase = await differential('spelling/on-disk-MiXeD.ExE', { exeToken: 'fakemx', dirs: [path.join(g, 'mxbin'), mx], extra: { FAKE_EXIT: '9' },
+    expect: { execPath: redact(path.join(mx, mxEntry ?? 'MiXeD.ExE')) } });
+  const finalOf = p => typeof p === 'string' ? path.win32.basename(p) : null;
+  const sf = mxCase.spellingFixture = { link: mxLinkError ?? 'hardlink', entries: mxEntries, onDiskEntry: mxEntry,
+    cmdRefFinal: finalOf(mxCase.cmdRef.report?.execPath), directFinal: finalOf(mxCase.direct.report?.execPath),
+    resolvedFinal: finalOf(mxCase.resolution?.file) };
+  // Exact (no casefold): cmd-ref and direct execPath final components must both equal the entry the directory reports.
+  sf.ok = mxLinkError === null && mxEntry === 'MiXeD.ExE' && sf.cmdRefFinal === mxEntry && sf.directFinal === mxEntry;
+  mxCase.note = 'OS proof of final-component spelling; ambiguous/no-entry/readdir-refused fallback (keep the confirmed hit) is unit-tested only';
+  receipt.cases.push(mxCase);
   // ---- cwd decoy for P: cmd would run the decoy node.bat; candidate must refuse (documented divergence) ----
   receipt.cases.push({ ...(await differential('T6/cwd-node.bat-decoy', { exeToken: name, dirs: [localBin],
     cwdSetup: d => fs.writeFileSync(path.join(d, 'node.bat'), '@ECHO off\r\nexit /b 7\r\n', 'latin1'), expect: { execPath: redact(nodeExe) } })),
@@ -510,10 +530,12 @@ try {
     probeVersionViolations: cs.filter(c => c.kind === 'probeVersion' && !c.notRun && !c.ok).map(c => c.id),
     refusalViolations: cs.filter(c => c.expectRefuse && !c.notRun && (c.error !== 'CLI_LAUNCH_UNSUPPORTED' || c.spawnCount !== 0 || c.cleanup.starts !== 0)).map(c => c.id),
     shellSpawns: cs.flatMap(c => (c.spawns || c.direct?.spawns || []).filter(s => /(^|[\\/])(cmd|powershell|pwsh)(\.exe)?$/i.test(s.file) || s.verbatim).map(() => c.id)),
+    spellingFixtureViolations: cs.filter(c => c.spellingFixture && c.direct && !c.direct.notRun && c.spellingFixture.ok !== true).map(c => c.id),
   };
   const f = receipt.findings;
   const clean = f.oracleNpmEqual && !f.cleanupIncomplete.length && !f.sentinels.length && !f.differentialMismatch.length && !f.oracleMismatch.length &&
-    !f.hostileNotReached.length && !f.argvMismatch.length && !f.refusalViolations.length && !f.shellSpawns.length && !f.probeVersionViolations.length && !f.decoyViolation.length && !f.resourceRefusalOrError.length;
+    !f.hostileNotReached.length && !f.argvMismatch.length && !f.refusalViolations.length && !f.shellSpawns.length && !f.probeVersionViolations.length && !f.decoyViolation.length && !f.resourceRefusalOrError.length &&
+    !f.spellingFixtureViolations.length;
   // Harness sanity, identical in both roles: the cmd reference itself matched the oracle on every T3 V-A layout.
   receipt.referenceSane = cs.filter(c => /^T3\/(local|prefix)\//.test(c.id)).every(c => c.oracleMatch?.cmdRef === true);
   if (receipt.identity.role === 'negative-control') {

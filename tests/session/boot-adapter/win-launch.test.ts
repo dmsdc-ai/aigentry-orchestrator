@@ -17,9 +17,9 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { ChildProcess } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { nodeSpawner } from "../../../src/session/boot-adapter/spawner.js";
 import { geminiBinary } from "../../../src/session/boot-adapter/gemini.js";
 import {
@@ -236,17 +236,23 @@ test("T2 [win32] native .exe hit launched as-is; V-B native target via dp0+\\+T"
   const script = join(base, "fake-cli.cjs");
   writeFileSync(script, fakeCliSource(null));
   mkdirSync(join(base, "native"));
-  copyFileSync(process.execPath, join(base, "native", "fakeexe.exe"));
+  // Entry spelled ".ExE" while PATHEXT spells ".EXE": the source-built name and the on-disk name differ only in case.
+  copyFileSync(process.execPath, join(base, "native", "FaKeExe.ExE"));
   const vb = await makeShim(GEN.gen, join(base, "pkg"), join(base, "bin"), "fakevb", { shebang: null, targetName: "fakevb.exe", body: "" });
   copyFileSync(process.execPath, join(base, "pkg", "fakevb.exe"));
-  for (const [exe, bin, file] of [["fakeexe", join(base, "native"), join(base, "native", "fakeexe.exe")],
-    ["fakevb", join(base, "bin"), `${join(base, "bin")}\\\\${vb.T}`]] as const) {
+  for (const [exe, bin, file, entryDir] of [["fakeexe", join(base, "native"), join(base, "native", "FaKeExe.ExE"), join(base, "native")],
+    ["fakevb", join(base, "bin"), `${join(base, "bin")}\\\\${vb.T}`, join(base, "pkg")]] as const) {
     const { dir, nonce } = newCase(ROOT, exe);
     const r = await withEnv(winEnv("Path", [bin], dir, nonce), () => run([exe, script, ...LITERALS], dir));
     assert.equal(r.error, undefined, String(r.error?.code));
     assert.equal(r.calls.length, 1);
     assertNoShell(r.calls[0]!);
     assert.equal(r.calls[0]!.file.toLowerCase(), file.toLowerCase());
+    // Final component as the directory actually spells it (read back, not assumed), at spawn and in the payload's execPath.
+    const entry = readdirSync(entryDir).find((e) => e.toLowerCase() === basename(file).toLowerCase());
+    t.diagnostic(`${exe}: on-disk entry=${String(entry)} spawn=${r.calls[0]!.file} execPath=${unb64(parseReport(r.value!.stdout).execPath)}`);
+    assert.equal(basename(r.calls[0]!.file), entry, "spawn file final component == on-disk entry");
+    assert.equal(basename(unb64(parseReport(r.value!.stdout).execPath)), entry, "payload execPath final component == on-disk entry");
     assert.deepEqual(parseReport(r.value!.stdout).args.map(unb64), [...LITERALS]);
     assert.equal(existsSync(join(dir, SENTINEL)), false);
     await assertCleanup(t, dir, nonce, r.calls, 1);
@@ -360,7 +366,8 @@ test("T-miss [win32] missing bare name keeps ENOENT (not CLI_LAUNCH_UNSUPPORTED)
 // Binds to the candidate-r1 exports parseCmdShim(Buffer) / generateCmdShim(CmdShim). The expected
 // bytes always come from the pinned upstream generator (the oracle), never from generateCmdShim.
 interface Shim { form: "V-A" | "V-B"; prog: string; args: string; target: string }
-interface WinLaunchMod { parseCmdShim(b: Buffer): Shim | null; generateCmdShim(s: Shim): string }
+interface WinLaunchMod { parseCmdShim(b: Buffer): Shim | null; generateCmdShim(s: Shim): string;
+  onDiskSpelling?(dir: string, name: string, list: (d: string) => readonly string[]): string }
 const WL_URL = new URL("../../../src/session/boot-adapter/win-launch.js", import.meta.url);
 const WL: WinLaunchMod | null = existsSync(WL_URL) ? (await import(WL_URL.href)) as WinLaunchMod : null;
 const NO_WL = WL ? NO_GEN : "candidate win-launch.js absent in this tree (baseline)";
@@ -423,6 +430,27 @@ test("P4 resource characterization: parseCmdShim has no input size bound (record
     t.diagnostic(`${id}: bytes=${b.length} ms=${(performance.now() - t0).toFixed(1)} heapDeltaMiB=${((process.memoryUsage().heapUsed - h0) / 2 ** 20).toFixed(1)}`);
     assert.equal(r, null);
   }
+});
+
+// Final-component spelling after a confirmed hit, with an injected directory listing (pure; no CreateProcess or
+// filesystem claim). Expected spellings are the literal entries authored here. A missing export fails (the r1
+// source has none), so this case discriminates the source before/after the fix.
+test("P5 onDiskSpelling: exact entry, else unique case-insensitive entry, else the confirmed hit unchanged (ambiguous/none/readdir refused)", { skip: NO_WL }, () => {
+  const spell = WL!.onDiskSpelling;
+  assert.equal(typeof spell, "function", "onDiskSpelling export");
+  const dir = "D:\\a\\Owned Dir\\PROGRA~1\\bin"; // parent spelling incl. an 8.3-looking segment must survive verbatim
+  const seen: string[] = [];
+  const ls = (entries: string[]) => (d: string) => { seen.push(d); return entries; };
+  const cases: Array<[string, string, (d: string) => readonly string[], string]> = [
+    ["exact-first", "node.EXE", ls(["node.exe", "node.EXE"]), `${dir}\\node.EXE`],
+    ["unique-casefold", "node.EXE", ls(["README", "node.exe", "npm.cmd"]), `${dir}\\node.exe`],
+    ["mixed-case", "mixed.EXE", ls(["MiXeD.ExE"]), `${dir}\\MiXeD.ExE`],
+    ["ambiguous-keeps-hit", "node.EXE", ls(["node.exe", "NODE.exe"]), `${dir}\\node.EXE`],
+    ["no-entry-keeps-hit", "node.EXE", ls(["NODE~1.EXE"]), `${dir}\\node.EXE`],
+    ["readdir-refused-keeps-hit", "node.EXE", (d) => { seen.push(d); throw Object.assign(new Error("EPERM"), { code: "EPERM" }); }, `${dir}\\node.EXE`],
+  ];
+  for (const [id, name, list, want] of cases) assert.equal(spell!(dir, name, list), want, id);
+  assert.deepEqual(seen, cases.map(() => dir), "only the hit's own directory is listed (never a later PATH entry)");
 });
 
 test("T-gem [win32] geminiBinary: any first agy hit (even unsupported agy.cmd) → agy; none → gemini", { skip: NOT_WIN }, () => {

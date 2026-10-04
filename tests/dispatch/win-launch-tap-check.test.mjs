@@ -1,6 +1,6 @@
 // #1167 — regression for win-launch-tap-check.mjs (harness only; no product code is run). Fake/inert fixtures only.
-// The intended 31 names are derived independently from the pinned win-launch.test.ts (template expanded) and must
-// match the real CI TAP records; positive controls are real node --test TAP from inert same-named tests; the two
+// The intended 32 names are derived independently from the pinned win-launch.test.ts (template expanded); the 31 names
+// before P5 must match the real CI TAP records (which predate P5); positive controls are real node --test TAP from inert same-named tests; the two
 // actual previous CI TAPs (embedded, sha256-checked) must stay red; every counterfactual must be exit 1 + mismatch.
 // usage: node --test tests/dispatch/win-launch-tap-check.test.mjs   (WIN_LAUNCH_TEST_TS overrides the source path)
 import test from 'node:test';
@@ -17,7 +17,7 @@ const CHECKER = path.join(HERE, 'win-launch-tap-check.mjs');
 const SELF = fileURLToPath(import.meta.url);
 const WORKFLOW = path.join(HERE, '..', '..', '.github', 'workflows', 'windows-npm-direct-validation.yml');
 const SOURCE = process.env.WIN_LAUNCH_TEST_TS || path.join(HERE, '..', 'session', 'boot-adapter', 'win-launch.test.ts');
-const SOURCE_SHA = '2e03a66121fd9a65e3e796b80e8f56973a748807f5cd6c3c8f07f493e4112c11';
+const SOURCE_SHA = '1b79dd8682e8698836b114367a5e448ea24d339934b98aac2466e19f4e097f58';
 const ENV = { ...process.env }; delete ENV.NODE_TEST_CONTEXT; // children must be plain processes, not test-runner children
 const sha = b => crypto.createHash('sha256').update(b).digest('hex');
 const DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tapcheck-'));
@@ -47,7 +47,7 @@ const TOP = /^(not ok|ok) (\d+) - (.*?)(?: # (SKIP|TODO)\b.*)?$/;
 const topNames = tap => tap.split('\n').map(l => TOP.exec(l)).filter(Boolean).map(m => m[3]);
 // role outcome expectations (task #1167 contract), stated here independently of the checker's BASELINE table
 const candOutcome = n => /^T10 \[POSIX\] /.test(n) ? 'skip' : 'pass';
-const baseOutcome = n => /^(T10 \[POSIX\]|P[1-4]) /.test(n) ? 'skip'
+const baseOutcome = n => /^(T10 \[POSIX\]|P[1-5]) /.test(n) ? 'skip'
   : /^(O[1-5] |T-miss |evidence root )/.test(n) ? 'pass' : 'fail';
 
 // ---- the two actual previous CI TAPs (Windows, node v20.20.2; both classified mismatch) ----
@@ -441,73 +441,84 @@ function inertTap(role) {
 const L = tap => tap.split('\n');
 const setFooter = (tap, k, f) => tap.replace(new RegExp(`^# ${k} (\\d+)$`, 'm'), (_, n) => `# ${k} ${f(Number(n))}`);
 const rename = (tap, from, to) => L(tap).map(l => { const m = TOP.exec(l); return m && from.test(m[3]) ? l.replace(/ - .*$/, ` - ${to}`) : l; }).join('\n');
-function dropTop(tap, re) { // remove one top-level test block, renumber, fix plan and footer: a self-consistent 30-test TAP
+function dropTop(tap, re) { // remove one top-level test block, renumber, fix plan and footer: a self-consistent 31-test TAP
   const ls = L(tap), at = ls.findIndex(l => { const m = TOP.exec(l); return m && re.test(m[3]); });
   let start = at; while (!ls[start].startsWith('# Subtest: ')) start--;
   let end = at + 1; while (ls[end].startsWith('  ')) end++;
   const outcome = ls[at].startsWith('not ok') ? 'fail' : / # SKIP/.test(ls[at]) ? 'skipped' : 'pass';
   ls.splice(start, end - start);
   let k = 0; const out = ls.map(l => TOP.test(l) ? l.replace(/^(not ok|ok) \d+ /, (_, s) => `${s} ${++k} `) : l).join('\n');
-  return setFooter(setFooter(out.replace(/^1\.\.31$/m, '1..30'), 'tests', n => n - 1), outcome, n => n - 1);
+  return setFooter(setFooter(out.replace(/^1\.\.32$/m, '1..31'), 'tests', n => n - 1), outcome, n => n - 1);
 }
 
 const CAND = inertTap('candidate'), BASE = inertTap('baseline');
+// The CI records predate P5: their names are the source's names without P5, in source order.
+const P5 = INTENDED.find(n => n.startsWith('P5 '));
+const OLD31 = INTENDED.filter(n => n !== P5);
+// Structural problems a 31-name pre-P5 TAP must raise against the 32-name source (derived from source order here).
+const MISSING_P5 = [`top-level total 31 != 32`,
+  ...OLD31.flatMap((n, k) => n === INTENDED[k] ? [] : [`top-level test ${k + 1} is "${tapName(n)}", intended "${tapName(INTENDED[k])}"`]),
+  `intended test missing: ${tapName(P5)}`, `plan 1..31 != 1..32`];
 
-test('pinned source: 31 unique intended names (24 test() calls, one 2x2x2 template) == both real CI TAP records', () => {
+test('pinned source: 32 unique intended names (25 test() calls, one 2x2x2 template); the 31 pre-P5 names == both real CI TAP records', () => {
   assert.equal(sha(SRC), SOURCE_SHA, `win-launch.test.ts is not the pinned source: ${SOURCE}`);
-  assert.equal(CALLS, 24);
-  assert.equal(INTENDED.length, 31);
-  assert.equal(new Set(INTENDED).size, 31);
+  assert.equal(CALLS, 25);
+  assert.equal(INTENDED.length, 32);
+  assert.equal(new Set(INTENDED).size, 32);
   assert.equal(INTENDED.filter(n => n.startsWith('T1+T2 [win32] V-A ')).length, 8);
+  assert.equal(INTENDED.indexOf(P5), INTENDED.findIndex(n => n.startsWith('P4 ')) + 1, 'P5 declared right after P4');
+  assert.equal(OLD31.length, 31);
+  assert.equal(MISSING_P5.length, 5, 'P5 at 30 shifts T-gem/evidence root: 2 position problems + total + missing + plan');
   assert.ok(!/^\s*(describe|suite|it)\(|\btest\.(only|skip|todo)\(/m.test(SRC.toString('utf8')), 'source shape the derivation does not cover');
   assert.equal(sha(CI_CANDIDATE), CI_CANDIDATE_SHA);
   assert.equal(sha(CI_BASELINE), CI_BASELINE_SHA);
-  for (const tap of [CI_CANDIDATE, CI_BASELINE]) assert.deepEqual(topNames(tap), INTENDED.map(tapName));
-  assert.deepEqual(topNames(CI_CANDIDATE).map(n => n.replace(/\\(.)/g, '$1')), INTENDED); // TAP unescape round-trip
+  for (const tap of [CI_CANDIDATE, CI_BASELINE]) assert.deepEqual(topNames(tap), OLD31.map(tapName));
+  assert.deepEqual(topNames(CI_CANDIDATE).map(n => n.replace(/\\(.)/g, '$1')), OLD31); // TAP unescape round-trip
 });
 
 test('positive controls: real node --test TAP over inert same-named tests', () => {
   assert.equal(CAND.raw, '0'); assert.equal(BASE.raw, '1');
   assert.deepEqual(topNames(CAND.tap), INTENDED.map(tapName));
-  assert.ok(Number(/^# tests (\d+)$/m.exec(CAND.tap)[1]) > 31, 'footer counts nested subtests (must not be mistaken for 31)');
+  assert.ok(Number(/^# tests (\d+)$/m.exec(CAND.tap)[1]) > 32, 'footer counts nested subtests (must not be mistaken for 32)');
   green(check('candidate', CAND.tap, CAND.raw), 'candidate_tests_green_pending_review');
   green(check('baseline', BASE.tap, BASE.raw), 'negative_control_discriminates');
 });
 
-test('actual previous CI TAPs stay red on outcomes only (no structural false alarm)', () => {
+test('actual previous CI TAPs stay red: outcome problems plus exactly the missing-P5 structural problems', () => {
   for (const [mode, tap, raw, re] of [['candidate', CI_CANDIDATE, '0', /: skip \(want pass\)$/], ['baseline', CI_BASELINE, '1', /\(control expects (pass|fail)\)$/]]) {
     const r = check(mode, tap, raw);
     red(r, re);
-    assert.ok(r.j.problems.every(p => re.test(p)), JSON.stringify(r.j.problems));
+    for (const p of MISSING_P5) assert.ok(r.j.problems.includes(p), `expected structural problem absent: ${p}`);
+    assert.ok(r.j.problems.every(p => re.test(p) || MISSING_P5.includes(p)), JSON.stringify(r.j.problems));
   }
 });
 
 test('counterfactuals: exit 1 + mismatch', async (t) => {
   const c = CAND.tap, b = BASE.tap;
-  const unknown = (ok) => ['TAP version 13', ...Array.from({ length: 31 }, (_, k) => `${ok ? 'ok' : 'not ok'} ${k + 1} - bogus ${k + 1}`), '1..31',
-    '# tests 31', '# suites 0', `# pass ${ok ? 31 : 0}`, `# fail ${ok ? 0 : 31}`, '# cancelled 0', '# skipped 0', '# todo 0', '# duration_ms 1', ''].join('\n');
+  const unknown = (ok) => ['TAP version 13', ...Array.from({ length: 32 }, (_, k) => `${ok ? 'ok' : 'not ok'} ${k + 1} - bogus ${k + 1}`), '1..32',
+    '# tests 32', '# suites 0', `# pass ${ok ? 32 : 0}`, `# fail ${ok ? 0 : 32}`, '# cancelled 0', '# skipped 0', '# todo 0', '# duration_ms 1', ''].join('\n');
   const last = tap => L(tap).findLastIndex(l => TOP.test(l));
   const cases = [
     ['cand dup O1 replaces T1+T2', 'candidate', rename(c, /^T1\+T2 .*local\/bare\/PATH/, tapName(INTENDED[0])), '0', /duplicate top-level test: O1 /],
     ['cand dup O2 replaces T-gem', 'candidate', rename(c, /^T-gem /, tapName(INTENDED[1])), '0', /intended test missing: T-gem /],
     ['base dup O1 replaces evidence root', 'baseline', rename(b, /^evidence root /, tapName(INTENDED[0])), '1', /duplicate top-level test: O1 /],
     ['base dup T4 replaces T-gem', 'baseline', rename(b, /^T-gem /, tapName(INTENDED.find(n => n.startsWith('T4 ')))), '1', /intended test missing: T-gem /],
-    ['cand 31 unknown names', 'candidate', unknown(true), '0', /intended test missing: O1 /],
-    ['base 31 unknown names', 'baseline', unknown(false), '1', /intended test missing: O1 /],
+    ['cand 32 unknown names', 'candidate', unknown(true), '0', /intended test missing: O1 /],
+    ['base 32 unknown names', 'baseline', unknown(false), '1', /intended test missing: O1 /],
     ['cand repeated number 1', 'candidate', L(c).map(l => TOP.test(l) ? l.replace(/^ok \d+ /, 'ok 1 ') : l).join('\n'), '0', /result 2 is numbered 1/],
     ['base repeated number 1', 'baseline', L(b).map(l => TOP.test(l) ? l.replace(/^(not ok|ok) \d+ /, '$1 1 ') : l).join('\n'), '1', /result 2 is numbered 1/],
-    ['cand plan 1..99', 'candidate', c.replace(/^1\.\.31$/m, '1..99'), '0', /plan 1\.\.99 /],
-    ['base plan 1..5', 'baseline', b.replace(/^1\.\.31$/m, '1..5'), '1', /plan 1\.\.5 /],
-    ['cand plan missing', 'candidate', c.replace(/^1\.\.31\n/m, ''), '0', /plan missing/],
-    ['cand truncated right after 31st result', 'candidate', L(c).slice(0, last(c) + 1).join('\n'), '0', /plan missing/],
-    ['base truncated right after 31st result', 'baseline', L(b).slice(0, last(b) + 1).join('\n'), '1', /plan missing/],
-    ['cand truncated inside 31st YAML block', 'candidate', L(c).slice(0, last(c) + 3).join('\n'), '0', /unterminated YAML/],
+    ['cand plan 1..99', 'candidate', c.replace(/^1\.\.32$/m, '1..99'), '0', /plan 1\.\.99 /],
+    ['base plan 1..5', 'baseline', b.replace(/^1\.\.32$/m, '1..5'), '1', /plan 1\.\.5 /],
+    ['cand plan missing', 'candidate', c.replace(/^1\.\.32\n/m, ''), '0', /plan missing/],
+    ['cand truncated right after 32nd result', 'candidate', L(c).slice(0, last(c) + 1).join('\n'), '0', /plan missing/],
+    ['base truncated right after 32nd result', 'baseline', L(b).slice(0, last(b) + 1).join('\n'), '1', /plan missing/],
+    ['cand truncated inside 32nd YAML block', 'candidate', L(c).slice(0, last(c) + 3).join('\n'), '0', /unterminated YAML/],
     ['cand Bail out! appended', 'candidate', `${c}Bail out! crashed\n`, '0', /Bail out!/],
     ['base Bail out! appended', 'baseline', `${b}Bail out! crashed\n`, '1', /Bail out!/],
     ['cand T10 TODO instead of SKIP', 'candidate', setFooter(setFooter(c.replace(/^(ok \d+ - T10 \[POSIX\] .*) # SKIP.*$/gm, '$1 # TODO inert'), 'skipped', n => n - 4), 'todo', n => n + 4), '0', /TODO directive/],
-    ['cand missing expected name (consistent 30)', 'candidate', dropTop(c, /^T-gem /), '0', /intended test missing: T-gem /],
-    ['cand extra name (consistent 32)', 'candidate', setFooter(setFooter(c.replace(/^1\.\.31$/m, '# Subtest: extra\nok 32 - extra\n  ---\n  duration_ms: 1\n  ...\n1..32'), 'tests', n => n + 1), 'pass', n => n + 1), '0', /extra top-level test 32: extra/],
-    ['cand footer tests forced to 31 (nested ignored)', 'candidate', setFooter(c, 'tests', () => 31), '0', /summary # tests 31 != \d+/],
+    ['cand missing expected name (consistent 31)', 'candidate', dropTop(c, /^T-gem /), '0', /intended test missing: T-gem /],
+    ['cand extra name (consistent 33)', 'candidate', setFooter(setFooter(c.replace(/^1\.\.32$/m, '# Subtest: extra\nok 33 - extra\n  ---\n  duration_ms: 1\n  ...\n1..33'), 'tests', n => n + 1), 'pass', n => n + 1), '0', /extra top-level test 33: extra/],
+    ['cand footer tests forced to 32 (nested ignored)', 'candidate', setFooter(c, 'tests', () => 32), '0', /summary # tests 32 != \d+/],
     ['cand footer cancelled 1', 'candidate', setFooter(c, 'cancelled', () => 1), '0', /summary # cancelled 1 != 0/],
     ['cand footer removed', 'candidate', c.replace(/^# (tests|suites|pass|fail|cancelled|skipped|todo|duration_ms) .*\n/gm, ''), '0', /0 lines after the plan/],
     ['cand Windows escape lost (dp0\\node.exe)', 'candidate', c.replace(/^(ok \d+ - T6 \[win32\] dp0)\\\\/m, '$1\\'), '0', /intended test missing: T6 /],

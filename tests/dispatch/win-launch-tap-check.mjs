@@ -6,8 +6,8 @@
 //              failure; a crash/signal such as 3 or 137 is not the predicted control) and every top-level
 //              outcome must match BASELINE exactly; any drift means the control did not discriminate.
 // The raw node --test exit argument is always reported unchanged in the JSON and on stdout (rawNodeTestExitArg).
-// Both modes: the top-level tests must be exactly INTENDED (the 31 top-level names of the pinned win-launch.test.ts,
-// template expanded, declaration order), numbered 1..31, no TODO, no "Bail out!", one "1..31" plan after the last
+// Both modes: the top-level tests must be exactly INTENDED (the 32 top-level names of the pinned win-launch.test.ts,
+// template expanded, declaration order), numbered 1..32, no TODO, no "Bail out!", one "1..32" plan after the last
 // top-level result, then the node 20 summary footer whose counts reconcile with ALL test points (node counts nested
 // subtests too). Subset TAP reader for node 20 --test-reporter=tap output only: shapes it does not know are rejected.
 import fs from 'node:fs';
@@ -17,8 +17,8 @@ if (process.argv.length !== 6) {
   process.exit(2);
 }
 const [mode, tapFile, rawExitArg, outFile] = process.argv.slice(2);
-const EXPECTED_TOTAL = 31;
-// Top-level test() names of tests/session/boot-adapter/win-launch.test.ts (sha256 c859cb04…), in declaration order.
+const EXPECTED_TOTAL = 32;
+// Top-level test() names of tests/session/boot-adapter/win-launch.test.ts (sha256 1b79dd86…), in declaration order.
 const INTENDED = [
   'O1 generator identity: pinned cmd-shim 6.0.3 located and hash-verified',
   'O2 contract §2 transcription == generator bytes for V-A (A empty / A set) and V-B',
@@ -43,6 +43,7 @@ const INTENDED = [
   'P2 parseCmdShim rejects mutations, V-V, unknown version, non-inert/unsupported fields',
   'P3 candidate generateCmdShim(fields) == pinned upstream generator bytes (product vs oracle)',
   'P4 resource characterization: parseCmdShim has no input size bound (record only)',
+  'P5 onDiskSpelling: exact entry, else unique case-insensitive entry, else the confirmed hit unchanged (ambiguous/none/readdir refused)',
   'T-gem [win32] geminiBinary: any first agy hit (even unsupported agy.cmd) → agy; none → gemini',
   'evidence root preserved (owned, not deleted)',
 ];
@@ -50,7 +51,7 @@ const INTENDED = [
 const tapName = s => s.replace(/\\/g, '\\\\').replace(/#/g, '\\#');
 const BASELINE = [
   [/^O[1-5] /, 'pass'], [/^T-miss /, 'pass'], [/^evidence root /, 'pass'],
-  [/^T10 \[POSIX\] /, 'skip'], [/^P[1-4] /, 'skip'],
+  [/^T10 \[POSIX\] /, 'skip'], [/^P[1-5] /, 'skip'],
   [/^T1\+T2 \[win32\] /, 'fail'], [/^T2 \[win32\] native /, 'fail'], [/^T[4-9] \[win32\] /, 'fail'], [/^T-gem \[win32\] /, 'fail'],
 ];
 const rawExit = /^(0|[1-9][0-9]{0,2})$/.test(rawExitArg) ? Number(rawExitArg) : null; // canonical decimal only, else null

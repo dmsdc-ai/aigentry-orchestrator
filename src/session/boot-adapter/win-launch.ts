@@ -5,7 +5,7 @@
 // as its program + fixed prefix + target. Everything else refuses. Never runs
 // cmd.exe/PowerShell, never sets shell or windowsVerbatimArguments, never skips
 // to a later hit, never follows the interpreter's own wrappers.
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { win32 } from "node:path";
 import { BootAdapterError } from "./types.js";
 
@@ -70,10 +70,23 @@ export function findWindowsCommand(name: string, env: NodeJS.ProcessEnv, cwd: st
   for (const dir of dirs) {
     for (const n of names) {
       const p = win32.join(dir, n);
-      if (isFile(p)) return p;
+      if (isFile(p)) return onDiskSpelling(dir, n);
     }
   }
   return null;
+}
+
+// A confirmed hit, with its final component spelled as the directory entry (the
+// constructed name carries the PATHEXT spelling): the exact entry first, else the
+// unique case-insensitive entry. dir is kept as given (no realpath: junction/UNC/
+// 8.3 segments stay). Ambiguous, no entry, or readdir refused → the confirmed hit
+// unchanged (residual spelling parity unmeasured); never a different directory.
+export function onDiskSpelling(dir: string, name: string, list: (d: string) => readonly string[] = readdirSync): string {
+  let entries: readonly string[];
+  try { entries = list(dir); } catch { return win32.join(dir, name); }
+  if (entries.includes(name)) return win32.join(dir, name);
+  const folded = entries.filter((e) => e.toUpperCase() === name.toUpperCase());
+  return win32.join(dir, folded.length === 1 ? folded[0]! : name);
 }
 
 export interface CmdShim {
