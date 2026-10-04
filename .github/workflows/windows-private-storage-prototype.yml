@@ -286,7 +286,7 @@ jobs:
           $env:PSModulePath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
           $f = Join-Path $env:GITHUB_WORKSPACE 'prototypes\windows-private-storage\tests\bootstrap-trust.test.ps1'
           $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLowerInvariant()
-          if ($h -cne '106be506c52f7cd14745b6d002463c29bb35c539851f41b28a7c90298fc93fa4') { Write-Output "::error::bootstrap-trust.test.ps1 sha256 $h does not match pin"; exit 1 }
+          if ($h -cne 'e0f54ec4e6a0a371c22456b6772fdc8db8cda570f08d54db343598b0058d0ff1') { Write-Output "::error::bootstrap-trust.test.ps1 sha256 $h does not match pin"; exit 1 }
           & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $f -WorkflowPath (Join-Path $env:GITHUB_WORKSPACE '.github\workflows\windows-private-storage-prototype.yml')
           exit $LASTEXITCODE
 
@@ -334,7 +334,7 @@ jobs:
               (($t[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -and ($null -ne $r.Owner) -and ($r.Owner.Value -ceq 'S-1-5-32-544') -and
               ($null -ne $r.DiscretionaryAcl) -and (([int]$r.ControlFlags -band $need) -eq $need) -and (([int]$r.ControlFlags -band -bnot $allowed) -eq 0) -and
               ($aces.Count -eq 2) -and (@($aces | Where-Object { -not (($_ -is [System.Security.AccessControl.CommonAce]) -and ($_.AceType -eq [System.Security.AccessControl.AceType]::AccessAllowed) -and
-                (-not $_.IsCallback) -and ([int]$_.AceFlags -eq [int]($af::ObjectInherit -bor $af::ContainerInherit)) -and ($_.AccessMask -eq 0x1F01FF)) }).Count -eq 0) -and
+                (-not $_.IsCallback) -and ([int]$_.AceFlags -eq ([int]$af::ObjectInherit -bor [int]$af::ContainerInherit)) -and ($_.AccessMask -eq 0x1F01FF)) }).Count -eq 0) -and
               ((@($aces | ForEach-Object { $_.SecurityIdentifier.Value } | Sort-Object) -join ',') -ceq 'S-1-5-18,S-1-5-32-544')
           } catch { $ok = $false }
           if (-not $ok) { Write-Output "cleanup: refusing unverified trust root $($t[0].FullName) $sd"; exit 1 }
@@ -372,7 +372,7 @@ jobs:
               (($t[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -and ($null -ne $r.Owner) -and ($r.Owner.Value -ceq 'S-1-5-32-544') -and
               ($null -ne $r.DiscretionaryAcl) -and (([int]$r.ControlFlags -band $need) -eq $need) -and (([int]$r.ControlFlags -band -bnot $allowed) -eq 0) -and
               ($aces.Count -eq 2) -and (@($aces | Where-Object { -not (($_ -is [System.Security.AccessControl.CommonAce]) -and ($_.AceType -eq [System.Security.AccessControl.AceType]::AccessAllowed) -and
-                (-not $_.IsCallback) -and ([int]$_.AceFlags -eq [int]($af::ObjectInherit -bor $af::ContainerInherit)) -and ($_.AccessMask -eq 0x1F01FF)) }).Count -eq 0) -and
+                (-not $_.IsCallback) -and ([int]$_.AceFlags -eq ([int]$af::ObjectInherit -bor [int]$af::ContainerInherit)) -and ($_.AccessMask -eq 0x1F01FF)) }).Count -eq 0) -and
               ((@($aces | ForEach-Object { $_.SecurityIdentifier.Value } | Sort-Object) -join ',') -ceq 'S-1-5-18,S-1-5-32-544')
           } catch { $ok = $false }
           if (-not $ok) { Write-Output "export: refusing unverified trust root $($t[0].FullName) $sd"; exit 1 }

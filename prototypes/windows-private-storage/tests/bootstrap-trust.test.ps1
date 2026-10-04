@@ -9,7 +9,7 @@
 param([string]$WorkflowPath = (Join-Path $PSScriptRoot '..\..\..\.github\workflows\windows-private-storage-prototype.yml'))
 $ErrorActionPreference = 'Stop'
 
-$ExpectedBodySha256 = '931b2252325fdc45236e5edb78e3d78be81543cfe1548ff8dc9fa52f0dc5a923'
+$ExpectedBodySha256 = 'e924c8381b206a8362a42da1e7686016425b2d83c51ed639b314b54d5e8b0442'
 $ExpectedOccurrences = 2
 $ExpectedBodyLines = 15
 $StartMarker = '$sd = $null; $ok = $false'
@@ -106,7 +106,7 @@ function Probe([string]$Name, [scriptblock]$Expr) {
 }
 $SddlAce = [System.Security.AccessControl.RawSecurityDescriptor]::new('D:P(A;OICI;FA;;;SY)').DiscretionaryAcl[0]
 Probe 'former-selftest-96 [int](AceFlags::OI -bor AceFlags::CI)' { [int]([System.Security.AccessControl.AceFlags]::ObjectInherit -bor [System.Security.AccessControl.AceFlags]::ContainerInherit) }
-Probe 'predicate-form [int]($af::OI -bor $af::CI)' { $af = [System.Security.AccessControl.AceFlags]; [int]($af::ObjectInherit -bor $af::ContainerInherit) }
+Probe 'previous-predicate-form [int]($af::OI -bor $af::CI)' { $af = [System.Security.AccessControl.AceFlags]; [int]($af::ObjectInherit -bor $af::ContainerInherit) }
 Probe 'bor-only $AF::OI -bor $AF::CI' { $AF::ObjectInherit -bor $AF::ContainerInherit }
 Probe 'cast-only [int]$AF::OI' { [int]$AF::ObjectInherit }
 Probe 'predicate-form [int]$_.AceFlags (SDDL OICI ace)' { [int]$SddlAce.AceFlags }
