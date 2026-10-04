@@ -148,7 +148,11 @@ Same-handle leaf checks, in order (`FILE_FLAG_OPEN_REPARSE_POINT`):
    - directories: `SE_DACL_PROTECTED` (`dacl_not_protected`)
    - a valid ACL (`dacl_invalid`)
    - empty DACL: directory → `unsafe`; file → `unavailable` (`dacl_empty`).
-     Never vacuous success.
+     Never vacuous success. Measured (CI 37241273202): `inspectDir` on an
+     empty-DACL directory fails the leaf open with ACCESS_DENIED before this
+     step, so it returns `unavailable` / `open_failed` (5). The tests pin that
+     result as a fail-closed deviation. The directory `dacl_empty` branch has
+     no live coverage; this is a recorded gap that the refusal does not cover.
    - ACE types: only ACCESS_ALLOWED and ACCESS_DENIED. Deny ACEs are tolerated.
      Every other type (object, callback, conditional, unknown) is
      `ace_unsupported`.

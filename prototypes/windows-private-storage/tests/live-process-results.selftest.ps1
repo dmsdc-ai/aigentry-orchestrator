@@ -1,16 +1,17 @@
 #Requires -Version 5.1
 # live-process-results.selftest.ps1 - tester-owned self-test (#1167) of the Get-PspLiveSidProcesses result contract.
 # - Binds setup-fixtures.ps1 and run-validation.ps1 by sha256, parses setup-fixtures.ps1 with the PowerShell AST and takes
-#   the single top-level FunctionDefinitionAst Get-PspLiveSidProcesses (lines 691-726, pinned Extent.Text sha256, only the
-#   commands Get-CimInstance, Write-Host, Invoke-CimMethod, Write-Host in that order, only the member calls GetType(),
+#   the single top-level FunctionDefinitionAst Get-PspLiveSidProcesses (lines 693-739, pinned Extent.Text sha256, only the
+#   commands Get-CimInstance, Write-Host, Invoke-CimMethod, Write-Host, Write-Host in that order, only the member calls GetType(),
 #   GetType()). Only that Extent.Text is evaluated, UNMODIFIED; the file is never dot-sourced.
-# - Its first-unknown DIAGNOSTIC line (host stream) is captured by a Write-Host mock function defined in the caller-form
-#   scope and must equal the expected closed-grammar line exactly (one per refusal, none otherwise).
+# - Its DIAGNOSTIC lines (host stream) are captured by a Write-Host mock function defined in the caller-form scope and
+#   must equal the expected closed-grammar lines exactly: per refusal the first-unknown line, plus the row-count line
+#   unless enumeration failed; none otherwise.
 # - Negative control: the frozen pre-fix extent (setup-fixtures.ps1 002c2f8f lines 684-692, sha256 b460bab2...) must still
 #   show the nested known-empty false positive. It is control evidence only and never counts as a product PASS.
-# - Both real caller forms are built from the pinned source lines (run-validation.ps1:75-76, setup-fixtures.ps1:742-743).
+# - Both real caller forms are built from the pinned source lines (run-validation.ps1:75-76, setup-fixtures.ps1:755-756).
 # - The pure diagnostic formatters Format-PspVerdictDiag (run-validation.ps1 lines 103-140), Format-PspCleanupDiag
-#   (lines 175-218) and Format-PspVerdictOpDiag (lines 226-330) are taken the same way (pinned Extent.Text sha256, no command
+#   (lines 175-218) and Format-PspVerdictOpDiag (lines 226-348) are taken the same way (pinned Extent.Text sha256, no command
 #   at all, pinned member-name set) and run over in-memory TAP text / cleanup records with injection payloads; every line
 #   must match its closed grammar exactly.
 # - Get-CimInstance / Invoke-CimMethod are script-scope mock functions over fake objects (numeric PIDs, mock.exe, synthetic
@@ -28,23 +29,24 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0   # as setup-fixtures.ps1:10 / run-validation.ps1:19, the scope both real callers run under
 
-$ExpectedSourceSha256 = '099ad60426c00df78a3ba699c5dc888fbe32eb85f08840b3f0c0c65fbdb3cdbc'
-$ExpectedCallerSha256 = 'ec9ac30936957838a5744a2ba12345f7a39e2f896bbe1a970ad6b6bbdeec673f'
-$ExpectedExtentSha256 = '36704ed1da177e52608cf64f9f5cfbfb5d4c79ae5a51e465a5d7e411363b509d'
+$ExpectedSourceSha256 = 'e5c0a671fb5d0e28584d0cc86a2cfe5230f0680fc079ba9a22dbddbbbdebd777'
+$ExpectedCallerSha256 = '142aaa3afa291fb8f34889ebcd2c1dfeb1e2d123e987ac4368e97bc09614bce6'
+$ExpectedExtentSha256 = '907ebffaa853db841e02c7e3ab0fad0a805b88f8b038b57ba428bbee6cef8473'
 $BaselineExtentSha256 = 'b460bab2746846988518ade81b10f3760668a9ccb18d15add29cb936c26de332'
 $FunctionName = 'Get-PspLiveSidProcesses'
-$ExpectedStartLine = 691
-$ExpectedEndLine = 726
+$ExpectedStartLine = 693
+$ExpectedEndLine = 739
 $MockNames = @('Get-CimInstance', 'Invoke-CimMethod')
-$CandidateCommands = @('Get-CimInstance', 'Write-Host', 'Invoke-CimMethod', 'Write-Host')
+$CandidateCommands = @('Get-CimInstance', 'Write-Host', 'Invoke-CimMethod', 'Write-Host', 'Write-Host')
 $CandidateMembers = @('GetType', 'GetType')
 # Pure diagnostic formatters in run-validation.ps1: no command at all; member-name set (sorted, unique) pinned.
 $Formatters = @(
   [ordered]@{ name = 'Format-PspVerdictDiag'; start = 103; end = 140; sha = 'c4ebd70638fc576fc3dd904c77ab6b26612841b35f766988ce53174507703329'; members = @('ComputeHash', 'Create', 'Dispose', 'GetBytes', 'Split', 'ToLowerInvariant', 'ToString', 'TrimEnd') }
   [ordered]@{ name = 'Format-PspCleanupDiag'; start = 175; end = 218; sha = '06795a7cab97e9ed3e138046c821cdf188544cda95efa4ae06b466c9bfbafe43'; members = @('StartsWith') }
-  [ordered]@{ name = 'Format-PspVerdictOpDiag'; start = 226; end = 330; sha = '0347840672c634b31130eddee7c259eb29de38f94fcea800678a42d8d9e30c81'; members = @('ContainsKey', 'Split', 'StartsWith', 'Substring', 'TrimEnd', 'TrimStart') }
+  [ordered]@{ name = 'Format-PspVerdictOpDiag'; start = 226; end = 348; sha = 'f69bacde18a0e5826d76c8009850e73d6c65dfdf7c77b60c338cd660c3e11f50'; members = @('ContainsKey', 'Split', 'StartsWith', 'Substring', 'TrimEnd', 'TrimStart') }
 )
 $DiagOwnerPattern = '^psp-diag owner-unknown cat=(enumeration|query|shape|rv-missing|rv-type|rv-nonzero|sid-invalid) pid=(none|[0-9]{1,10}) rv=(none|-?[0-9]{1,20})\z'
+$DiagOwnerCountsPattern = '^psp-diag owner-unknown-counts rows=[0-9]{1,10} hits=[0-9]{1,10} query=[0-9]{1,10} shape=[0-9]{1,10} rv-missing=[0-9]{1,10} rv-type=[0-9]{1,10} rv-nonzero=[0-9]{1,10} sid-invalid=[0-9]{1,10}\z'
 $N9 = '(none|[0-9]{1,9})'
 $DiagVerdictPattern = '^psp-diag verdict nodeExit=(none|-?[0-9]{1,10}) tap=(ok|missing|unexpected-path|reparse|not-file|too-large|read-failed|decode-failed|too-many-lines|UNKNOWN) bytes=(none|[0-9]{1,19})' + ((@('lines', 'plan', 'tests', 'pass', 'fail', 'cancelled', 'skipped', 'todo', 'okLines', 'notOkLines', 'bail') | ForEach-Object { " $_=$N9" }) -join '') + ' listed=[0-9]{1,2} clipped=[0-9]{1,9} trust=diagnostic-only\z'
 $DiagVerdictFailPattern = '^psp-diag verdict-fail n=[0-9]{1,9} depth=[0-9]{1,2} directive=[01] nameSha256=(none|[0-9a-f]{64})\z'
@@ -160,8 +162,8 @@ try {
   $CallerChecks = @(
     @($caller, 75, '$x.liveWriters = @(Get-PspLiveSidProcesses $sids)'),
     @($caller, 76, 'if ($x.liveWriters.Count -gt 0) { $x.problems += ''fake-user processes alive'' }'),
-    @($src, 742, '$r.liveWriters = @(Get-PspLiveSidProcesses $WriterSids)'),
-    @($src, 743, 'if ($r.liveWriters.Count -gt 0) { throw (''refusing: fake-user processes still alive: '' + ($r.liveWriters -join '', '')) }')
+    @($src, 755, '$r.liveWriters = @(Get-PspLiveSidProcesses $WriterSids)'),
+    @($src, 756, 'if ($r.liveWriters.Count -gt 0) { throw (''refusing: fake-user processes still alive: '' + ($r.liveWriters -join '', '')) }')
   )
   $L = @()
   foreach ($chk in $CallerChecks) {
@@ -288,7 +290,13 @@ try {
   $AB = @($A, $B); $T = @{ kind = 'throw' }
   $K = @{ kind = 'known0' }
   function Hits([int[]]$Pids) { @{ kind = 'hits'; pids = $Pids } }
-  function Ref([string]$Id, [string]$Cat, [string]$P, [string]$Rv) { @{ kind = 'refuse'; msg = $Id; diag = "psp-diag owner-unknown cat=$Cat pid=$P rv=$Rv" } }
+  # Row refusals: the first-unknown line, then the count line over every enumerated row (Cnt). Enumeration: first line only.
+  function Ref([string]$Id, [string]$Cat, [string]$P, [string]$Rv, $Counts) { $d = @("psp-diag owner-unknown cat=$Cat pid=$P rv=$Rv"); if ($null -ne $Counts) { $d += $Counts }; @{ kind = 'refuse'; msg = $Id; diag = $d } }
+  function Cnt([int]$Rows, [int]$Hits, [hashtable]$C = @{}) {
+    $s = "psp-diag owner-unknown-counts rows=$Rows hits=$Hits"
+    foreach ($k in @('query', 'shape', 'rv-missing', 'rv-type', 'rv-nonzero', 'sid-invalid')) { $x = 0; if ($C.ContainsKey($k)) { $x = $C[$k] }; $s += " $k=$x" }
+    $s
+  }
   function Nest([int]$Inner) { @{ kind = 'nested'; inner = $Inner } }
   $Cases = @(
     [ordered]@{ id = 'a'; sids = @(); pids = @(); owners = @{}; cimThrow = $false; expect = $K; owner = 0; base = (Nest 0) }
@@ -297,40 +305,46 @@ try {
     [ordered]@{ id = 'c'; sids = $AB; pids = @(101, 102, 103); owners = @{ 101 = (Own ([uint32]0) $N1); 102 = (Own ([uint32]0) $N2); 103 = (Own ([uint32]0) $N3) }; cimThrow = $false; expect = $K; owner = 3; base = (Nest 0) }
     [ordered]@{ id = 'd'; sids = $AB; pids = @(201, 202); owners = @{ 201 = (Own ([uint32]0) $A); 202 = (Own ([uint32]0) $N1) }; cimThrow = $false; expect = (Hits @(201)); owner = 2; base = (Nest 1) }
     [ordered]@{ id = 'e'; sids = $AB; pids = @(301, 302, 303); owners = @{ 301 = (Own ([uint32]0) $A); 302 = (Own ([uint32]0) $B); 303 = (Own ([uint32]0) $N1) }; cimThrow = $false; expect = (Hits @(301, 302)); owner = 3; base = (Nest 2) }
-    [ordered]@{ id = 'f'; sids = $AB; pids = @(401); owners = @{ 401 = (Own ([uint32]2) $A) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-nonzero' '401' '2'); owner = 1; base = (Nest 0) }
-    [ordered]@{ id = 'g'; sids = $AB; pids = @(501, 502); owners = @{ 501 = $T; 502 = (Own ([uint32]0) $B) }; cimThrow = $false; expect = (Ref 'R_OWNER' 'query' '501' 'none'); owner = 1; base = (Nest 1) }
+    [ordered]@{ id = 'f'; sids = $AB; pids = @(401); owners = @{ 401 = (Own ([uint32]2) $A) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-nonzero' '401' '2' (Cnt 1 0 @{ 'rv-nonzero' = 1 })); owner = 1; base = (Nest 0) }
+    [ordered]@{ id = 'g'; sids = $AB; pids = @(501, 502); owners = @{ 501 = $T; 502 = (Own ([uint32]0) $B) }; cimThrow = $false; expect = (Ref 'R_OWNER' 'query' '501' 'none' (Cnt 2 1 @{ query = 1 })); owner = 2; base = (Nest 1) }
     [ordered]@{ id = 'h'; sids = $AB; pids = @(601); owners = @{ 601 = (Own ([uint32]0) 's-1-5-21-1-2-3-1001') }; cimThrow = $false; expect = $K; owner = 1; base = (Nest 0) }
     [ordered]@{ id = 'i'; sids = $AB; pids = @(901); owners = @{ 901 = (Own ([uint32]0) $A) }; cimThrow = $true; expect = (Ref 'R_ENUM' 'enumeration' 'none' 'none'); owner = 0; base = @{ kind = 'marker' } }
-    [ordered]@{ id = 'j-owner-no-result'; sids = $AB; pids = @(1001); owners = @{ 1001 = @{ kind = 'none' } }; cimThrow = $false; expect = (Ref 'R_OWNER' 'shape' '1001' 'none'); owner = 1; base = $null }
-    [ordered]@{ id = 'k-owner-null'; sids = $AB; pids = @(1101); owners = @{ 1101 = @{ kind = 'null' } }; cimThrow = $false; expect = (Ref 'R_OWNER' 'shape' '1101' 'none'); owner = 1; base = $null }
-    [ordered]@{ id = 'l-owner-multiple'; sids = $AB; pids = @(1201); owners = @{ 1201 = @{ kind = 'multi'; obj = [pscustomobject]@{ ReturnValue = [uint32]0; Sid = $A } } }; cimThrow = $false; expect = (Ref 'R_OWNER' 'shape' '1201' 'none'); owner = 1; base = $null }
-    [ordered]@{ id = 'm-rv-missing'; sids = $AB; pids = @(1301); owners = @{ 1301 = @{ kind = 'obj'; obj = [pscustomobject]@{ Sid = $A } } }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-missing' '1301' 'none'); owner = 1; base = $null }
-    [ordered]@{ id = 'n-rv-null'; sids = $AB; pids = @(1401); owners = @{ 1401 = (Own $null $A) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-missing' '1401' 'none'); owner = 1; base = $null }
-    [ordered]@{ id = 'o-rv-string0'; sids = $AB; pids = @(1501); owners = @{ 1501 = (Own '0' $A) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-type' '1501' 'none'); owner = 1; base = $null }
-    [ordered]@{ id = 'p-rv-bool'; sids = $AB; pids = @(1601); owners = @{ 1601 = (Own $false $A) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-type' '1601' 'none'); owner = 1; base = $null }
-    [ordered]@{ id = 'q-rv-double'; sids = $AB; pids = @(1701); owners = @{ 1701 = (Own ([double]0) $A) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-type' '1701' 'none'); owner = 1; base = $null }
+    [ordered]@{ id = 'j-owner-no-result'; sids = $AB; pids = @(1001); owners = @{ 1001 = @{ kind = 'none' } }; cimThrow = $false; expect = (Ref 'R_OWNER' 'shape' '1001' 'none' (Cnt 1 0 @{ shape = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'k-owner-null'; sids = $AB; pids = @(1101); owners = @{ 1101 = @{ kind = 'null' } }; cimThrow = $false; expect = (Ref 'R_OWNER' 'shape' '1101' 'none' (Cnt 1 0 @{ shape = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'l-owner-multiple'; sids = $AB; pids = @(1201); owners = @{ 1201 = @{ kind = 'multi'; obj = [pscustomobject]@{ ReturnValue = [uint32]0; Sid = $A } } }; cimThrow = $false; expect = (Ref 'R_OWNER' 'shape' '1201' 'none' (Cnt 1 0 @{ shape = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'm-rv-missing'; sids = $AB; pids = @(1301); owners = @{ 1301 = @{ kind = 'obj'; obj = [pscustomobject]@{ Sid = $A } } }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-missing' '1301' 'none' (Cnt 1 0 @{ 'rv-missing' = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'n-rv-null'; sids = $AB; pids = @(1401); owners = @{ 1401 = (Own $null $A) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-missing' '1401' 'none' (Cnt 1 0 @{ 'rv-missing' = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'o-rv-string0'; sids = $AB; pids = @(1501); owners = @{ 1501 = (Own '0' $A) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-type' '1501' 'none' (Cnt 1 0 @{ 'rv-type' = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'p-rv-bool'; sids = $AB; pids = @(1601); owners = @{ 1601 = (Own $false $A) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-type' '1601' 'none' (Cnt 1 0 @{ 'rv-type' = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'q-rv-double'; sids = $AB; pids = @(1701); owners = @{ 1701 = (Own ([double]0) $A) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-type' '1701' 'none' (Cnt 1 0 @{ 'rv-type' = 1 })); owner = 1; base = $null }
     [ordered]@{ id = 'r-rv-int32-hit'; sids = $AB; pids = @(1801, 1802); owners = @{ 1801 = (Own ([int32]0) $A); 1802 = (Own ([uint32]0) $N1) }; cimThrow = $false; expect = (Hits @(1801)); owner = 2; base = $null }
-    [ordered]@{ id = 's-sid-missing'; sids = $AB; pids = @(1901); owners = @{ 1901 = @{ kind = 'obj'; obj = [pscustomobject]@{ ReturnValue = [uint32]0 } } }; cimThrow = $false; expect = (Ref 'R_SID' 'sid-invalid' '1901' '0'); owner = 1; base = $null }
-    [ordered]@{ id = 't-sid-null'; sids = $AB; pids = @(2001); owners = @{ 2001 = (Own ([uint32]0) $null) }; cimThrow = $false; expect = (Ref 'R_SID' 'sid-invalid' '2001' '0'); owner = 1; base = $null }
-    [ordered]@{ id = 'u-sid-nonstring'; sids = $AB; pids = @(2101); owners = @{ 2101 = (Own ([uint32]0) ([int]1001)) }; cimThrow = $false; expect = (Ref 'R_SID' 'sid-invalid' '2101' '0'); owner = 1; base = $null }
-    [ordered]@{ id = 'v-sid-malformed'; sids = $AB; pids = @(2201); owners = @{ 2201 = (Own ([uint32]0) 'not-a-sid') }; cimThrow = $false; expect = (Ref 'R_SID' 'sid-invalid' '2201' '0'); owner = 1; base = $null }
-    [ordered]@{ id = 'v2-sid-trailing-lf'; sids = $AB; pids = @(2301); owners = @{ 2301 = (Own ([uint32]0) ($A + "`n")) }; cimThrow = $false; expect = (Ref 'R_SID' 'sid-invalid' '2301' '0'); owner = 1; base = $null }
-    [ordered]@{ id = 'w-hit-then-owner-throw'; sids = $AB; pids = @(2401, 2402); owners = @{ 2401 = (Own ([uint32]0) $A); 2402 = $T }; cimThrow = $false; expect = (Ref 'R_OWNER' 'query' '2402' 'none'); owner = 2; base = $null }
-    [ordered]@{ id = 'x-hit-then-rv2'; sids = $AB; pids = @(2501, 2502); owners = @{ 2501 = (Own ([uint32]0) $B); 2502 = (Own ([uint32]2) $N1) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-nonzero' '2502' '2'); owner = 2; base = $null }
-    [ordered]@{ id = 'y-hit-then-bad-sid'; sids = $AB; pids = @(2601, 2602); owners = @{ 2601 = (Own ([uint32]0) $A); 2602 = (Own ([uint32]0) 'S-1-5') }; cimThrow = $false; expect = (Ref 'R_SID' 'sid-invalid' '2602' '0'); owner = 2; base = $null }
+    [ordered]@{ id = 's-sid-missing'; sids = $AB; pids = @(1901); owners = @{ 1901 = @{ kind = 'obj'; obj = [pscustomobject]@{ ReturnValue = [uint32]0 } } }; cimThrow = $false; expect = (Ref 'R_SID' 'sid-invalid' '1901' '0' (Cnt 1 0 @{ 'sid-invalid' = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 't-sid-null'; sids = $AB; pids = @(2001); owners = @{ 2001 = (Own ([uint32]0) $null) }; cimThrow = $false; expect = (Ref 'R_SID' 'sid-invalid' '2001' '0' (Cnt 1 0 @{ 'sid-invalid' = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'u-sid-nonstring'; sids = $AB; pids = @(2101); owners = @{ 2101 = (Own ([uint32]0) ([int]1001)) }; cimThrow = $false; expect = (Ref 'R_SID' 'sid-invalid' '2101' '0' (Cnt 1 0 @{ 'sid-invalid' = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'v-sid-malformed'; sids = $AB; pids = @(2201); owners = @{ 2201 = (Own ([uint32]0) 'not-a-sid') }; cimThrow = $false; expect = (Ref 'R_SID' 'sid-invalid' '2201' '0' (Cnt 1 0 @{ 'sid-invalid' = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'v2-sid-trailing-lf'; sids = $AB; pids = @(2301); owners = @{ 2301 = (Own ([uint32]0) ($A + "`n")) }; cimThrow = $false; expect = (Ref 'R_SID' 'sid-invalid' '2301' '0' (Cnt 1 0 @{ 'sid-invalid' = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'w-hit-then-owner-throw'; sids = $AB; pids = @(2401, 2402); owners = @{ 2401 = (Own ([uint32]0) $A); 2402 = $T }; cimThrow = $false; expect = (Ref 'R_OWNER' 'query' '2402' 'none' (Cnt 2 1 @{ query = 1 })); owner = 2; base = $null }
+    [ordered]@{ id = 'x-hit-then-rv2'; sids = $AB; pids = @(2501, 2502); owners = @{ 2501 = (Own ([uint32]0) $B); 2502 = (Own ([uint32]2) $N1) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-nonzero' '2502' '2' (Cnt 2 1 @{ 'rv-nonzero' = 1 })); owner = 2; base = $null }
+    [ordered]@{ id = 'y-hit-then-bad-sid'; sids = $AB; pids = @(2601, 2602); owners = @{ 2601 = (Own ([uint32]0) $A); 2602 = (Own ([uint32]0) 'S-1-5') }; cimThrow = $false; expect = (Ref 'R_SID' 'sid-invalid' '2602' '0' (Cnt 2 1 @{ 'sid-invalid' = 1 })); owner = 2; base = $null }
     # Bounded diagnostic of the FIRST unknown: malformed / payload PID and RV values must render as 'none' or digits only.
-    [ordered]@{ id = 'z1-diag-pid-string-payload'; sids = $AB; pids = @(3101); pidv = @{ 3101 = "31`n::error::pwn" }; owners = @{ 3101 = (Own ([uint32]2) $A) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-nonzero' 'none' '2'); owner = 1; base = $null }
-    [ordered]@{ id = 'z2-diag-pid-negative'; sids = $AB; pids = @(3201); pidv = @{ 3201 = [int]-5 }; owners = @{ 3201 = $T }; cimThrow = $false; expect = (Ref 'R_OWNER' 'query' 'none' 'none'); owner = 1; base = $null }
-    [ordered]@{ id = 'z3-diag-pid-over-uint32'; sids = $AB; pids = @(3301); pidv = @{ 3301 = [long]4294967296 }; owners = @{ 3301 = (Own ([uint32]5) $N1) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-nonzero' 'none' '5'); owner = 1; base = $null }
-    [ordered]@{ id = 'z4-diag-pid-absent-sid-payload'; sids = $AB; pids = @(3401); pidv = @{ 3401 = '<absent>' }; owners = @{ 3401 = (Own ([uint32]0) '::error::pwn') }; cimThrow = $false; expect = (Ref 'R_SID' 'sid-invalid' 'none' '0'); owner = 1; base = $null }
-    [ordered]@{ id = 'z5-diag-pid-uint32-max'; sids = $AB; pids = @(3501); pidv = @{ 3501 = [uint32]::MaxValue }; owners = @{ 3501 = (Own ([uint32]3) $A) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-nonzero' '4294967295' '3'); owner = 1; base = $null }
-    [ordered]@{ id = 'z6-diag-pid-bool'; sids = $AB; pids = @(3601); pidv = @{ 3601 = $true }; owners = @{ 3601 = (Own ([uint32]0) $null) }; cimThrow = $false; expect = (Ref 'R_SID' 'sid-invalid' 'none' '0'); owner = 1; base = $null }
-    [ordered]@{ id = 'z7-diag-pid-double'; sids = $AB; pids = @(3701); pidv = @{ 3701 = [double]37 }; owners = @{ 3701 = $T }; cimThrow = $false; expect = (Ref 'R_OWNER' 'query' 'none' 'none'); owner = 1; base = $null }
-    [ordered]@{ id = 'z8-diag-rv-uint64-max'; sids = $AB; pids = @(3801); owners = @{ 3801 = (Own ([uint64]::MaxValue) $A) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-nonzero' '3801' '18446744073709551615'); owner = 1; base = $null }
-    [ordered]@{ id = 'z9-diag-rv-negative'; sids = $AB; pids = @(3901); owners = @{ 3901 = (Own ([int32]-1) $A) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-nonzero' '3901' '-1'); owner = 1; base = $null }
-    [ordered]@{ id = 'z10-diag-rv-string-payload'; sids = $AB; pids = @(4001); owners = @{ 4001 = (Own "0`r`n::set-output name=x::y" $A) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-type' '4001' 'none'); owner = 1; base = $null }
-    [ordered]@{ id = 'z11-diag-sid-control-payload'; sids = $AB; pids = @(4101); owners = @{ 4101 = (Own ([uint32]0) ($A + "`r`n::warning::pwn")) }; cimThrow = $false; expect = (Ref 'R_SID' 'sid-invalid' '4101' '0'); owner = 1; base = $null }
-    [ordered]@{ id = 'z12-diag-first-unknown-only'; sids = $AB; pids = @(4201, 4202, 4203); owners = @{ 4201 = (Own ([uint32]0) $A); 4202 = $T; 4203 = (Own ([uint32]7) $N1) }; cimThrow = $false; expect = (Ref 'R_OWNER' 'query' '4202' 'none'); owner = 2; base = $null }
+    [ordered]@{ id = 'z1-diag-pid-string-payload'; sids = $AB; pids = @(3101); pidv = @{ 3101 = "31`n::error::pwn" }; owners = @{ 3101 = (Own ([uint32]2) $A) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-nonzero' 'none' '2' (Cnt 1 0 @{ 'rv-nonzero' = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'z2-diag-pid-negative'; sids = $AB; pids = @(3201); pidv = @{ 3201 = [int]-5 }; owners = @{ 3201 = $T }; cimThrow = $false; expect = (Ref 'R_OWNER' 'query' 'none' 'none' (Cnt 1 0 @{ query = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'z3-diag-pid-over-uint32'; sids = $AB; pids = @(3301); pidv = @{ 3301 = [long]4294967296 }; owners = @{ 3301 = (Own ([uint32]5) $N1) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-nonzero' 'none' '5' (Cnt 1 0 @{ 'rv-nonzero' = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'z4-diag-pid-absent-sid-payload'; sids = $AB; pids = @(3401); pidv = @{ 3401 = '<absent>' }; owners = @{ 3401 = (Own ([uint32]0) '::error::pwn') }; cimThrow = $false; expect = (Ref 'R_SID' 'sid-invalid' 'none' '0' (Cnt 1 0 @{ 'sid-invalid' = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'z5-diag-pid-uint32-max'; sids = $AB; pids = @(3501); pidv = @{ 3501 = [uint32]::MaxValue }; owners = @{ 3501 = (Own ([uint32]3) $A) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-nonzero' '4294967295' '3' (Cnt 1 0 @{ 'rv-nonzero' = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'z6-diag-pid-bool'; sids = $AB; pids = @(3601); pidv = @{ 3601 = $true }; owners = @{ 3601 = (Own ([uint32]0) $null) }; cimThrow = $false; expect = (Ref 'R_SID' 'sid-invalid' 'none' '0' (Cnt 1 0 @{ 'sid-invalid' = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'z7-diag-pid-double'; sids = $AB; pids = @(3701); pidv = @{ 3701 = [double]37 }; owners = @{ 3701 = $T }; cimThrow = $false; expect = (Ref 'R_OWNER' 'query' 'none' 'none' (Cnt 1 0 @{ query = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'z8-diag-rv-uint64-max'; sids = $AB; pids = @(3801); owners = @{ 3801 = (Own ([uint64]::MaxValue) $A) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-nonzero' '3801' '18446744073709551615' (Cnt 1 0 @{ 'rv-nonzero' = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'z9-diag-rv-negative'; sids = $AB; pids = @(3901); owners = @{ 3901 = (Own ([int32]-1) $A) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-nonzero' '3901' '-1' (Cnt 1 0 @{ 'rv-nonzero' = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'z10-diag-rv-string-payload'; sids = $AB; pids = @(4001); owners = @{ 4001 = (Own "0`r`n::set-output name=x::y" $A) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-type' '4001' 'none' (Cnt 1 0 @{ 'rv-type' = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'z11-diag-sid-control-payload'; sids = $AB; pids = @(4101); owners = @{ 4101 = (Own ([uint32]0) ($A + "`r`n::warning::pwn")) }; cimThrow = $false; expect = (Ref 'R_SID' 'sid-invalid' '4101' '0' (Cnt 1 0 @{ 'sid-invalid' = 1 })); owner = 1; base = $null }
+    [ordered]@{ id = 'z12-diag-first-unknown-only'; sids = $AB; pids = @(4201, 4202, 4203); owners = @{ 4201 = (Own ([uint32]0) $A); 4202 = $T; 4203 = (Own ([uint32]7) $N1) }; cimThrow = $false; expect = (Ref 'R_OWNER' 'query' '4202' 'none' (Cnt 3 1 @{ query = 1; 'rv-nonzero' = 1 })); owner = 3; base = $null }
+    # Every enumerated row is classified: two unknowns are both counted, a known hit is only counted (no partial hit list),
+    # and the refusal is still the FIRST unknown's. Malformed rows never leak a payload into either line.
+    [ordered]@{ id = 'aa-hit-then-two-unknown'; sids = $AB; pids = @(5001, 5002, 5003); owners = @{ 5001 = (Own ([uint32]0) $A); 5002 = (Own ([uint32]2) $A); 5003 = $T }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-nonzero' '5002' '2' (Cnt 3 1 @{ query = 1; 'rv-nonzero' = 1 })); owner = 3; base = $null }
+    [ordered]@{ id = 'ab-two-unknown-same-cat'; sids = $AB; pids = @(5101, 5102); owners = @{ 5101 = (Own $null $A); 5102 = @{ kind = 'obj'; obj = [pscustomobject]@{ Sid = $B } } }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-missing' '5101' 'none' (Cnt 2 0 @{ 'rv-missing' = 2 })); owner = 2; base = $null }
+    [ordered]@{ id = 'ac-unknown-then-hit'; sids = $AB; pids = @(5201, 5202); owners = @{ 5201 = (Own ([uint32]0) 'not-a-sid'); 5202 = (Own ([uint32]0) $B) }; cimThrow = $false; expect = (Ref 'R_SID' 'sid-invalid' '5201' '0' (Cnt 2 1 @{ 'sid-invalid' = 1 })); owner = 2; base = $null }
+    [ordered]@{ id = 'ad-malformed-rows'; sids = $AB; pids = @(5301, 5302, 5303, 5304, 5305); pidv = @{ 5301 = "53`n::error::pwn"; 5304 = [double]1 }; owners = @{ 5301 = (Own "0`r`n::error::pwn" $A); 5302 = (Own ([uint32]0) '::error::pwn'); 5303 = @{ kind = 'multi'; obj = [pscustomobject]@{ ReturnValue = [uint32]0; Sid = $A } }; 5304 = $T; 5305 = (Own ([uint32]0) $A) }; cimThrow = $false; expect = (Ref 'R_RV' 'rv-type' 'none' 'none' (Cnt 5 1 @{ query = 1; shape = 1; 'rv-type' = 1; 'sid-invalid' = 1 })); owner = 5; base = $null }
   )
   foreach ($case in $Cases) { foreach ($id in @($case.pids)) { if (-not $case.owners.ContainsKey($id)) { Fatal "case $($case.id) has no owner spec for pid $id" } } }
 
@@ -388,10 +402,11 @@ try {
   function Test-Product($Case, [string]$Form, $Rec) {
     Test-Common $Case $Rec $Case.owner
     $e = $Case.expect
-    # Diagnostic: exactly one closed-grammar line for a refusal (the first unknown), none otherwise.
+    # Diagnostic: for a refusal the exact closed-grammar lines (first unknown, then the row counts unless enumeration
+    # failed), none otherwise.
     if ($Rec.hostBound -ne $true) { 'Write-Host capture preflight failed' }
     $dl = @($Rec.diag); $expDiag = @(); if ($e.kind -ceq 'refuse') { $expDiag = @($e.diag) }
-    foreach ($d in $dl) { if (-not (($d -is [string]) -and ($d -cmatch $DiagOwnerPattern) -and (-not $d.Contains('::')))) { "diag line outside the closed grammar (len=$(([string]$d).Length))" } }
+    foreach ($d in $dl) { if (-not (($d -is [string]) -and (($d -cmatch $DiagOwnerPattern) -or ($d -cmatch $DiagOwnerCountsPattern)) -and (-not $d.Contains('::')))) { "diag line outside the closed grammar (len=$(([string]$d).Length))" } }
     if (($dl.Count -ne $expDiag.Count) -or ((@($dl | ForEach-Object { [string]$_ }) -join '|') -cne ($expDiag -join '|'))) { "diag lines=$($dl.Count) expected=$($expDiag.Count) or text differs" }
     if ($e.kind -ceq 'refuse') {
       if ($Form -ceq 'export') { if ((-not $Rec.escaped) -or ($Rec.msg -cne $e.msg)) { "expected escape $($e.msg), got escaped=$($Rec.escaped) msg=$($Rec.msg)" } }
@@ -581,6 +596,9 @@ try {
     'kind=helper case=UNKNOWN op=UNKNOWN result=absent threw=none abiOk=none status=none reason=none winErr=none created=none bytes=none volId=none want=error oracle=error oracleReason=open-error oracleCode=-2147483648 problems=1'
     'kind=readback test=contradict snapProblems=0 objects=400 skipped=8 aclMatch=380 aclDiffNonReparse=4 aclDiffReparse=8 aclUnavailNonReparse=0 aclUnavailReparse=0 aclErrPresent=0 hlMatch=200 hlDiff=0 hlReparse=4 hlExitNonzero=0 rpNotOracle=0 rpExitNonzero=0 contradictions=4 unproved=12'
     'kind=rbdiff test=unproved dir=3 file=1 owner=0 group=1 daclFlags=0 aceCount=0 aceOrder=0 aceFlags=2 aceSet=0 textOnly=1 unparsed=0 hlExits=1:3,-1:2 hlExitsOther=0 rpExits=none rpExitsOther=0'
+    'kind=rbsplit test=contradict flagProtected=1 flagAutoInherited=2 flagIsNull=0 flagMissing=0 flagUnparsed=0 orderDenyRelChanged=1 orderDenyRelUnchanged=3 orderDenyRelUnknown=0 aclErrTypes=UnauthorizedAccessException:8,NotSupportedException:4 aclErrOther=1 aclErrAbsent=0'
+    'kind=linkacl case=D_JUNCTION need=rcra link=present reparse=true owner=admins aAllow=none missing=none aDeny=0 adminAllow=2 otherAllow=0 otherDeny=0'
+    'kind=linkacl case=F_UNDER_JUNCTION need=ra link=present reparse=true owner=adminUser aAllow=UNKNOWN missing=groupMembership aDeny=0 adminAllow=1 otherAllow=1 otherDeny=0'
   )
   $OpP = '# psp-op/1 '
   $O1 = @('TAP version 13', '# Subtest: x', 'not ok 1 - x', '  ---', '  ...') + @(for ($i = 0; $i -lt $OpV.Count; $i++) { if ($i -eq 4) { $OpP + $OpV[$i] + "`r" } else { $OpP + $OpV[$i] } }) + @('1..1', '# tests 1', '# pass 0', '# fail 1')
@@ -597,12 +615,24 @@ try {
     ($OpP + $OpV[0].Replace('enabledKnown=SeChangeNotifyPrivilege', 'enabledKnown=sechangenotifyprivilege')), ($OpP + $OpV[6].Replace('case=D_JUNCTION', 'case=d_junction'))
     ($OpP + $OpV[8].Replace('objects=400', 'objects=100000')), ($OpP + $OpV[6]), ($OpP + $OpV[6].Replace('status=unavailable', 'status=ok')), ($OpP + 'kind=helper case=D_OK op=inspectDir')
     ($OpP + $OpV[2].Replace('sidMatch=true', 'sidMatch=yes')), ($OpP + $OpV[5] + ' extra=1')
+    # rbsplit / linkacl: closed error-type histogram and closed link enums; raw SIDs, unlisted names, duplicates, lowercase,
+    # over-long counts and missing fields are malformed; an UNKNOWN case is accepted as UNKNOWN; a repeated key is a duplicate.
+    ($OpP + $OpV[10].Replace('NotSupportedException:4', 'EvilException:4'))
+    ($OpP + $OpV[10].Replace('UnauthorizedAccessException:8,NotSupportedException:4', 'UnauthorizedAccessException:1,UnauthorizedAccessException:1'))
+    ($OpP + $OpV[10].Replace('UnauthorizedAccessException:8', 'UnauthorizedAccessException:123456'))
+    ($OpP + $OpV[10].Replace('UnauthorizedAccessException:8', 'unauthorizedaccessexception:8'))
+    ($OpP + $OpV[11].Replace('owner=admins', 'owner=S-1-5-32-544')), ($OpP + $OpV[11].Replace('case=D_JUNCTION', 'case=D_OK'))
+    ($OpP + $OpV[11].Replace('aAllow=none', 'aAllow=granted')), ($OpP + $OpV[11].Replace(' otherDeny=0', ''))
+    ($OpP + 'kind=linkacl case=UNKNOWN need=UNKNOWN link=absent reparse=none owner=none aAllow=UNKNOWN missing=snapshot aDeny=0 adminAllow=0 otherAllow=0 otherDeny=0')
+    ($OpP + $OpV[11]), ($OpP + $OpV[11])
   )
   $OCases = @(
     [ordered]@{ id = 'to-valid-all-kinds'; rs = 'ok'; text = ($O1 -join "`n"); forbid = @('Subtest', 'not ok', 'TAP', '#')
-      expect = @(@(OpSum 'ok' @(10, 10, 10, 0, 0, 0, 0, 0, 0)) + @($OpV | ForEach-Object { 'psp-diag verdict-op ' + $_ })) }
-    [ordered]@{ id = 'to-hostile'; rs = 'ok'; text = ($O2 -join "`n"); forbid = @('pwn', 'SeEvil', 'S-1-', 'xxxx', 'sechangenotify', 'd_junction', 'PRIV', 'shell', '[31m', 'differ', 'status=ok', '100000', '99999999999', '#', 'extra')
-      expect = @((OpSum 'ok' @(28, 2, 2, 0, 22, 1, 2, 2, 1)), ('psp-diag verdict-op ' + $OpV[4]), ('psp-diag verdict-op ' + $OpV[6])) }
+      expect = @(@(OpSum 'ok' @(13, 13, 13, 0, 0, 0, 0, 0, 0)) + @($OpV | ForEach-Object { 'psp-diag verdict-op ' + $_ })) }
+    [ordered]@{ id = 'to-hostile'; rs = 'ok'; text = ($O2 -join "`n"); forbid = @('pwn', 'SeEvil', 'S-1-', 'xxxx', 'sechangenotify', 'd_junction', 'PRIV', 'shell', '[31m', 'differ', 'status=ok', '100000', '99999999999', '#', 'extra', 'Evil', 'unauthorized', '123456', 'D_OK', 'granted')
+      expect = @((OpSum 'ok' @(39, 4, 4, 0, 30, 1, 3, 2, 1)), ('psp-diag verdict-op ' + $OpV[4]), ('psp-diag verdict-op ' + $OpV[6]),
+        'psp-diag verdict-op kind=linkacl case=UNKNOWN need=UNKNOWN link=absent reparse=none owner=none aAllow=UNKNOWN missing=snapshot aDeny=0 adminAllow=0 otherAllow=0 otherDeny=0',
+        ('psp-diag verdict-op ' + $OpV[11])) }
     [ordered]@{ id = 'to-too-many-lines'; rs = 'ok'; text = ($OpP + $OpV[4] + ("`n" * 50000)); forbid = @('bindseq')
       expect = @(OpSum 'too-many-lines' @(0, 0, 0, 0, 0, 0, 0, 0, 0)) }
     [ordered]@{ id = 'to-read-status-not-enum'; rs = "ok`n::error::pwn"; text = ($OpP + $OpV[4]); forbid = @('pwn', 'bindseq')

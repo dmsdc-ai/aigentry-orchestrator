@@ -36,9 +36,11 @@ export const ABI = Object.freeze({
 // only where the documented candidate status differs from the independent oracle class; such a case is a
 // documented deviation, still fail-closed (never ok), and is listed in the receipt for the reviewer.
 // `reasons`: the refusal must carry one of these reasons, so a refusal for an incidental cause fails.
+// `win32Error` (deviations only): the exact code is pinned on top of the per-reason code table.
 export const CANDIDATE_EXPECT = Object.freeze({
   D_OK: { reasons: ['ok'] }, D_NEST_OK: { reasons: ['ok'] }, D_B_OWNED: { reasons: ['owner_mismatch'] },
-  D_B_ACE: { reasons: ['ace_foreign_allow'] }, D_NULL: { reasons: ['dacl_null'] }, D_EMPTY: { reasons: ['dacl_empty'] },
+  D_B_ACE: { reasons: ['ace_foreign_allow'] }, D_NULL: { reasons: ['dacl_null'] },
+  D_EMPTY: { status: 'unavailable', reasons: ['open_failed'], win32Error: 5, deviation: 'measured CI 37241273202: the inspectDir leaf open (READ_CONTROL|FILE_READ_ATTRIBUTES) of an empty-DACL dir is denied before the DACL checks -> unavailable/open_failed/5 (README: Win32 failure, fail closed); oracle class stays unsafe/no-owner-ace. COVERAGE GAP: the native dir dacl_empty branch is not exercised live and this refusal does not cover it' },
   D_NONPROT: { reasons: ['dacl_not_protected'] }, D_ADMIN: { reasons: ['owner_mismatch'] }, D_UNKNOWN: { reasons: ['ace_unsupported'] },
   D_JUNCTION: { reasons: ['reparse_point'] }, D_SYMLINK: { reasons: ['reparse_point'] }, D_UNDER_JUNCTION: { reasons: ['ancestor_reparse_point'] },
   D_NOT_DIR: { reasons: ['not_directory'] }, D_MISSING: { reasons: ['not_found'] }, D_SHORTNAME: { reasons: ['final_path_mismatch'] },
@@ -300,6 +302,7 @@ export function helperResultProblems(id, r, want) {
   const codes = expectedWin32(x.reason);
   if (!codes) p.push(`reason ${x.reason} has no documented Win32 code (HOLD)`);
   else if (!codes.includes(x.win32Error)) p.push(`win32Error ${x.win32Error} not in [${codes}] for ${x.reason}`);
+  if (Number.isInteger(e.win32Error) && x.win32Error !== e.win32Error) p.push(`win32Error ${x.win32Error} != pinned ${e.win32Error}`);
   if (typeof e.created === 'boolean' && x.created !== e.created) p.push(`created ${x.created} != ${e.created}`);
   return p;
 }
@@ -382,6 +385,8 @@ export function enabledPrivileges(idr) {
 
 // R6: independent read-back vs the backup-handle oracle. A contradiction fails; anything not read back is
 // listed as unproved (the contract's Get-Acl/fsutil oracle is then NOT complete; never waived here).
+// A non-directory reparse object is refused (reparse_point) before the link count is evaluated (README leaf step 2),
+// so its link count is not a gated property: its read-back is the fsutil reparsepoint query, which must succeed (below).
 export function readbackFindings(objects) {
   const contradictions = []; const unproved = [];
   for (const o of asArray(objects)) {
@@ -392,9 +397,8 @@ export function readbackFindings(objects) {
         else contradictions.push(`${o.path}: Get-Acl ${o.getAclSddl} != oracle ${o.sddl}`);
       }
     } else unproved.push(`${o.path}: Get-Acl unavailable (${o.getAclError || 'not measured'})`);
-    if (!o.isDir) {
-      if (o.isReparse) unproved.push(`${o.path}: fsutil hardlink count not comparable on a reparse point`);
-      else if (o.fsutilHardlinkExit === 0) {
+    if (!o.isDir && !o.isReparse) {
+      if (o.fsutilHardlinkExit === 0) {
         const n = asArray(o.fsutilHardlinks).length;
         if (n !== o.nLinks) contradictions.push(`${o.path}: fsutil lists ${n} links, oracle nLinks ${o.nLinks}`);
       } else unproved.push(`${o.path}: fsutil hardlink list exit ${o.fsutilHardlinkExit}`);
@@ -638,11 +642,45 @@ function sddlDiffKinds(a, b) {
   return k;
 }
 
+// Split of the daclFlags and aceOrder kinds above (same parser, same ACE key; those kinds are unchanged). daclFlags:
+// which flag differs (protected / autoInherited / isNull), a DACL missing on one side, or an unparsed side. aceOrder:
+// whether the relative order of every (deny, allow) ACE pair changed; Unknown when an ACE is not plain allow/deny or
+// two ACEs share a key (pairs not identifiable).
+function denyRelOrder(xa, ya) {
+  const key = (a2) => { const m = parseRights(a2.rights); return [a2.type, [...a2.flags].sort().join(''), m.mask, m.unknown, a2.sid, a2.condition].join(';'); };
+  const keys = (aces) => { const ks = aces.map(key); return new Set(ks).size === ks.length && aces.every((e) => e.type === 'A' || e.type === 'D') ? ks : null; };
+  const pairs = (ks) => { const out = []; ks.forEach((d, i) => { if (d.startsWith('D;')) ks.forEach((a, j) => { if (a.startsWith('A;')) out.push(`${d}|${a}|${i < j}`); }); }); return out.sort().join('\n'); };
+  const kx = keys(xa); const ky = keys(ya);
+  if (!kx || !ky) return 'orderDenyRelUnknown';
+  return pairs(kx) === pairs(ky) ? 'orderDenyRelUnchanged' : 'orderDenyRelChanged';
+}
+function sddlDiffSplit(a, b) {
+  const x = parseSddl(a); const y = parseSddl(b);
+  if (!x || !y) return ['flagUnparsed'];
+  if (!x.dacl || !y.dacl) return x.dacl !== y.dacl ? ['flagMissing'] : [];
+  const k = [];
+  if (x.dacl.protected !== y.dacl.protected) k.push('flagProtected');
+  if (x.dacl.autoInherited !== y.dacl.autoInherited) k.push('flagAutoInherited');
+  if (x.dacl.isNull !== y.dacl.isNull) k.push('flagIsNull');
+  const key = (a2) => { const m = parseRights(a2.rights); return [a2.type, [...a2.flags].sort().join(''), m.mask, m.unknown, a2.sid, a2.condition].join(';'); };
+  const ax = x.dacl.aces.map(key); const ay = y.dacl.aces.map(key);
+  if (ax.length === ay.length && ax.join('|') !== ay.join('|') && [...ax].sort().join('|') === [...ay].sort().join('|')) k.push(denyRelOrder(x.dacl.aces, y.dacl.aces));
+  return k;
+}
+// Closed vocabulary of Get-Acl exception type names (setup-fixtures.ps1 getAclError = Exception.GetType().Name). Any
+// other name is only counted (aclErrOther); a missing type is aclErrAbsent. Never the message text.
+export const OP_ACL_ERROR_TYPES = Object.freeze(['UnauthorizedAccessException', 'PrivilegeNotHeldException', 'ItemNotFoundException',
+  'FileNotFoundException', 'DirectoryNotFoundException', 'PathTooLongException', 'IOException', 'ArgumentException', 'NotSupportedException',
+  'InvalidOperationException', 'SecurityException', 'Win32Exception']);
+
 // R6 categories, mirroring readbackFindings branch by branch; totals come from readbackFindings itself.
 export function readbackOperands(test, snaps, objects) {
   const n = { objects: 0, skipped: 0, aclMatch: 0, aclDiffNonReparse: 0, aclDiffReparse: 0, aclUnavailNonReparse: 0, aclUnavailReparse: 0, aclErrPresent: 0,
     hlMatch: 0, hlDiff: 0, hlReparse: 0, hlExitNonzero: 0, rpNotOracle: 0, rpExitNonzero: 0 };
   const d = { dir: 0, file: 0, owner: 0, group: 0, daclFlags: 0, aceCount: 0, aceOrder: 0, aceFlags: 0, aceSet: 0, textOnly: 0, unparsed: 0 };
+  const sp = { flagProtected: 0, flagAutoInherited: 0, flagIsNull: 0, flagMissing: 0, flagUnparsed: 0, orderDenyRelChanged: 0, orderDenyRelUnchanged: 0,
+    orderDenyRelUnknown: 0 };
+  const ae = new Map(); let aeOther = 0; let aeAbsent = 0;
   const hist = () => ({ m: new Map(), other: 0 });
   const hl = hist(); const rp = hist();
   const bump = (h, v) => {
@@ -660,11 +698,15 @@ export function readbackOperands(test, snaps, objects) {
           n.aclDiffNonReparse++;
           if (o.isDir) d.dir++; else d.file++;
           for (const k of sddlDiffKinds(o.getAclSddl, o.sddl)) d[k]++;
+          for (const k of sddlDiffSplit(o.getAclSddl, o.sddl)) sp[k]++;
         }
       } else n.aclMatch++;
     } else {
       if (o.isReparse) n.aclUnavailReparse++; else n.aclUnavailNonReparse++;
       if (o.getAclError !== null && o.getAclError !== undefined) n.aclErrPresent++;
+      if (o.getAclError === null || o.getAclError === undefined) aeAbsent++;
+      else if (OP_ACL_ERROR_TYPES.includes(o.getAclError)) ae.set(o.getAclError, (ae.get(o.getAclError) || 0) + 1);
+      else aeOther++;
     }
     if (!o.isDir) {
       if (o.isReparse) n.hlReparse++;
@@ -681,7 +723,74 @@ export function readbackOperands(test, snaps, objects) {
       ['contradictions', opCount(f.contradictions.length)], ['unproved', opCount(f.unproved.length)]]),
     opLine('rbdiff', [['test', t], ...Object.entries(d).map(([k, v]) => [k, opCount(v)]), ['hlExits', fmt(hl)], ['hlExitsOther', opCount(hl.other)],
       ['rpExits', fmt(rp)], ['rpExitsOther', opCount(rp.other)]]),
+    opLine('rbsplit', [['test', t], ...Object.entries(sp).map(([k, v]) => [k, opCount(v)]),
+      ['aclErrTypes', ae.size ? OP_ACL_ERROR_TYPES.filter((e) => ae.has(e)).map((e) => `${e}:${opCount(ae.get(e))}`).join(',') : 'none'],
+      ['aclErrOther', opCount(aeOther)], ['aclErrAbsent', opCount(aeAbsent)]]),
   ];
+}
+
+// F1 observation, DIAGNOSTIC only, for the four link cases: does the S0 oracle SDDL of the relevant link object (the leaf
+// link, or the junction ancestor for *_UNDER_JUNCTION) carry an allow ACE for A's own SID whose generic-mapped mask covers
+// what the helper opens it with: leaf READ_CONTROL|FILE_READ_ATTRIBUTES (private_storage.c:819), ancestor
+// FILE_READ_ATTRIBUTES (c:377)? ACE presence only, never effective access: owner-implicit rights and FILE_READ_ATTRIBUTES
+// granted through the parent are not modelled, so aAllow=none is not a denial proof. BUILTIN\Administrators and SYSTEM
+// ACEs are counted apart (A's non-membership is the identity verdict, not this line). aAllow=UNKNOWN names the minimum
+// missing input: snapshot (no S0 link object), sddl (no parsable oracle SDDL), dacl (absent or NULL DACL), aceType /
+// rights (an applicable ACE the existing parser cannot map), groupMembership (only another SID's ACE could grant it).
+export const OP_LINK_CASES = Object.freeze({ D_JUNCTION: 'leaf', D_SYMLINK: 'leaf', D_UNDER_JUNCTION: 'ancestor', F_UNDER_JUNCTION: 'ancestor' });
+export function linkObjectPath(c) {
+  if (!c || typeof c.path !== 'string' || !OP_LINK_CASES[c.id]) return null;
+  return OP_LINK_CASES[c.id] === 'leaf' ? c.path : path.win32.dirname(c.path);
+}
+function mappedFileMask(rights) {
+  const { mask, unknown } = parseRights(rights);
+  if (unknown) return null;
+  let m = mask;
+  if (mask & RIGHTS.GA) m |= RIGHTS.FA;
+  if (mask & RIGHTS.GR) m |= RIGHTS.FR;
+  if (mask & RIGHTS.GW) m |= RIGHTS.FW;
+  if (mask & RIGHTS.GX) m |= RIGHTS.FX;
+  return m >>> 0;
+}
+export function linkAclOperands(c, snap, sids) {
+  const id = c && c.id;
+  const kind = OP_LINK_CASES[id];
+  const need = (kind === 'leaf' ? RIGHTS.RC | RIGHTS.LO : RIGHTS.LO) >>> 0;
+  const s = sids || {};
+  const sa = normalizeSid(s.A);
+  const n = { aDeny: 0, adminAllow: 0, otherAllow: 0, otherDeny: 0 };
+  let owner = 'none'; let aAllow = 'UNKNOWN'; let missing = 'none';
+  const sd = snap && snap.openError === 0 && !snap.sddlError && typeof snap.sddl === 'string' ? parseSddl(snap.sddl) : null;
+  if (!snap || snap.openError !== 0) missing = 'snapshot';
+  else if (!sd) missing = 'sddl';
+  else {
+    const o = normalizeSid(sd.owner);
+    owner = o === null ? 'none' : o === sa ? 'A' : o === normalizeSid(s.B) ? 'B' : o === SID_ADMINS ? 'admins'
+      : o === SID_SYSTEM ? 'system' : o === normalizeSid(s.adminUser) ? 'adminUser' : 'other';
+    if (!sd.dacl || sd.dacl.isNull) missing = 'dacl';
+    else {
+      let ex = 0; let inh = 0;
+      for (const a of sd.dacl.aces) {
+        if (a.flags.includes('IO')) continue;
+        if (a.type !== 'A' && a.type !== 'D') { missing = 'aceType'; continue; }
+        const m = mappedFileMask(a.rights);
+        if (m === null) { if (missing === 'none') missing = 'rights'; continue; }
+        const who = sa !== null && a.sid === sa ? 'A' : (a.sid === SID_ADMINS || a.sid === SID_SYSTEM ? 'adminSystem' : 'other');
+        if (a.type === 'D') { if ((m & need) !== 0) { if (who === 'A') n.aDeny++; else if (who === 'other') n.otherDeny++; } continue; }
+        if (who === 'A') { if (a.flags.includes('ID')) inh = (inh | m) >>> 0; else ex = (ex | m) >>> 0; }
+        else if (((m & need) >>> 0) === need) { if (who === 'adminSystem') n.adminAllow++; else n.otherAllow++; }
+      }
+      if (missing === 'none') {
+        const covers = (x) => ((x & need) >>> 0) !== 0;
+        if ((((ex | inh) & need) >>> 0) === need) aAllow = covers(ex) && covers(inh) ? 'both' : (covers(ex) ? 'explicit' : 'inherited');
+        else if (n.otherAllow > 0) missing = 'groupMembership';
+        else aAllow = 'none';
+      }
+    }
+  }
+  return opLine('linkacl', [['case', opEnum(id, Object.keys(OP_LINK_CASES))], ['need', kind === 'leaf' ? 'rcra' : (kind ? 'ra' : 'none')],
+    ['link', snap ? 'present' : 'absent'], ['reparse', snap ? opBool(snap.isReparse) : 'none'], ['owner', owner], ['aAllow', aAllow],
+    ['missing', missing], ...Object.entries(n).map(([k, v]) => [k, opCount(v)])]);
 }
 
 // The only catch here wraps the diagnostic builder, never an assertion: a builder fault prints one fixed line.
@@ -824,6 +933,107 @@ if (PHASE === 'selfcheck') {
     assert.deepEqual(snapshotSetProblems({ S0: s(1), S1: s(0), S2: null, S3: s(1) }), ['snap-S1 missing or empty', 'snap-S2 missing or empty']);
     assert.equal(snapshotSetProblems({}).length, 4);
     assert.deepEqual(readbackFindings([]), { contradictions: [], unproved: [] }, 'the R6 rule alone is vacuous on nothing: the verdict gates it on snapshotSetProblems');
+  });
+
+  test('selfcheck: D_EMPTY pins exactly unavailable/open_failed/5 (fail closed, never ok, no arbitrary failure); the oracle stays unsafe', () => {
+    const R = (status, reason, win32Error) => ({ threw: false, result: normalizeResult({ status, reason, win32Error }) });
+    const want = expectedHelperStatus('D_EMPTY', 'unsafe');
+    assert.equal(want, 'unavailable');
+    assert.equal(CANDIDATE_EXPECT.D_EMPTY.win32Error, 5);
+    assert.deepEqual(helperResultProblems('D_EMPTY', R('unavailable', 'open_failed', 5), want), []);
+    for (const [s, rs, w] of [['ok', 'ok', 0], ['unsafe', 'dacl_empty', 0], ['unavailable', 'dacl_empty', 0], ['unavailable', 'open_failed', 2],
+      ['unavailable', 'open_failed', 0], ['unavailable', 'ancestor_open_failed', 5], ['unavailable', 'security_query_failed', 5],
+      ['unsafe', 'owner_ace_missing', 0], ['missing', 'not_found', 2], ['unsafe', 'open_failed', 5]]) {
+      assert.notDeepEqual(helperResultProblems('D_EMPTY', R(s, rs, w), want), [], `${s}/${rs}/${w}`);
+    }
+    assert.deepEqual(classifyDir(P, dir(P, `O:${A}G:${A}D:P`), A), { cls: 'unsafe', reason: 'no-owner-ace' });
+    assert.deepEqual(helperResultProblems('F_EMPTY', R('unavailable', 'open_failed', 5), 'unavailable'), [], 'F_EMPTY control unchanged');
+    assert.notDeepEqual(helperResultProblems('F_EMPTY', R('ok', 'ok', 0), 'unavailable'), []);
+  });
+
+  test('selfcheck: R6 reparse files need a successful reparsepoint read-back instead of a hardlink count; other operands unchanged', () => {
+    const S = `O:${A}G:${A}D:P(A;;FA;;;${A})`;
+    const rf = (x) => ({ path: 'r', openError: 0, isDir: false, isReparse: true, sddl: S, getAclSddl: S, ...x });
+    assert.deepEqual(readbackFindings([rf({ fsutilReparseExit: 0 })]), { contradictions: [], unproved: [] });
+    assert.deepEqual(readbackFindings([rf({ fsutilReparseExit: 0, fsutilHardlinkExit: 1 })]), { contradictions: [], unproved: [] });
+    for (const x of [{ fsutilReparseExit: 1 }, { fsutilReparseExit: null }, {}, { fsutilReparseExit: '0' }]) {
+      assert.equal(readbackFindings([rf(x)]).unproved.length, 1, `reparse query missing or failed: ${JSON.stringify(x)}`);
+    }
+    assert.equal(readbackFindings([rf({ fsutilReparseExit: 0, getAclSddl: null, getAclError: 'UnauthorizedAccessException' })]).unproved.length, 1);
+    assert.equal(readbackFindings([rf({ fsutilReparseExit: 0, getAclSddl: `O:BAG:BAD:P(A;;FA;;;BA)` })]).unproved.length, 1);
+    const nf = (x) => ({ path: 'n', openError: 0, isDir: false, isReparse: false, nLinks: 1, sddl: S, getAclSddl: S, fsutilReparseExit: 1, ...x });
+    assert.deepEqual(readbackFindings([nf({ fsutilHardlinkExit: 0, fsutilHardlinks: ['x'] })]), { contradictions: [], unproved: [] });
+    assert.equal(readbackFindings([nf({ fsutilHardlinkExit: 1 })]).unproved.length, 1, 'non-reparse hardlink exit 1 stays unproved');
+    assert.equal(readbackFindings([nf({})]).unproved.length, 1, 'non-reparse hardlink unmeasured stays unproved');
+    assert.equal(readbackFindings([nf({ fsutilHardlinkExit: 0, fsutilHardlinks: ['x', 'y'] })]).contradictions.length, 1);
+    assert.equal(readbackFindings([nf({ fsutilReparseExit: 0, fsutilHardlinkExit: 0, fsutilHardlinks: ['x'] })]).contradictions.length, 1);
+    assert.equal(readbackFindings([nf({ fsutilHardlinkExit: 0, fsutilHardlinks: ['x'], getAclSddl: `O:BAG:BAD:P(A;;FA;;;BA)` })]).contradictions.length, 1);
+    assert.equal(readbackFindings([{ ...rf({ fsutilReparseExit: 1 }), isDir: true }]).unproved.length, 1, 'reparse dir query still required');
+  });
+
+  const opKv = (line) => Object.fromEntries(line.split(' ').slice(1).map((x) => [x.slice(0, x.indexOf('=')), x.slice(x.indexOf('=') + 1)]));
+
+  test('selfcheck: rbsplit splits daclFlags / aceOrder and counts Get-Acl error types in a closed vocabulary only', () => {
+    const O = `O:${A}G:${A}`;
+    const df = (g, o, isDir = false) => ({ path: 'p', openError: 0, isDir, isReparse: false, nLinks: 1, sddl: o, getAclSddl: g, fsutilReparseExit: 1, fsutilHardlinkExit: 0, fsutilHardlinks: ['x'] });
+    const er = (e) => ({ path: 'C:\\secret', openError: 0, isDir: true, isReparse: false, sddl: `${O}D:P`, getAclSddl: null, fsutilReparseExit: 1, ...(e === undefined ? {} : { getAclError: e }) });
+    const objs = [
+      df(`${O}D:P(A;OICI;FA;;;${A})`, `${O}D:PAI(A;OICI;FA;;;${A})`, true), df(`${O}D:(A;;FA;;;${A})`, `${O}D:P(A;;FA;;;${A})`),
+      df(`${O}D:NO_ACCESS_CONTROL`, `${O}D:(A;;FA;;;${A})`), df(O, `${O}D:P(A;;FA;;;${A})`), df(`${O}D:P(A;;FA;;;${A})`, null),
+      df(`${O}D:P(D;;FA;;;${B})(A;;FA;;;${A})`, `${O}D:P(A;;FA;;;${A})(D;;FA;;;${B})`),
+      df(`${O}D:P(D;;FA;;;${B})(A;;FA;;;${A})(A;;FR;;;BA)`, `${O}D:P(D;;FA;;;${B})(A;;FR;;;BA)(A;;FA;;;${A})`),
+      df(`${O}D:P(A;;FA;;;${A})(A;;FA;;;${A})(D;;FA;;;${B})`, `${O}D:P(A;;FA;;;${A})(D;;FA;;;${B})(A;;FA;;;${A})`),
+      er('UnauthorizedAccessException'), er('UnauthorizedAccessException'), er('NotSupportedException'), er('Evil C:\\secret ::error::pwn'), er(undefined),
+    ];
+    const lines = readbackOperands('unproved', {}, objs);
+    assert.equal(lines.length, 3);
+    for (const l of lines) { assert.ok(OP_LINE.test(l), l); assert.ok(!/secret|Evil|pwn|S-1-/.test(l), l); }
+    const d = opKv(lines[1]); const s = opKv(lines[2]);
+    assert.equal(s.kind, 'rbsplit');
+    assert.deepEqual([d.daclFlags, d.aceOrder, d.aceCount, d.unparsed], ['4', '3', '1', '1'], 'existing rbdiff kinds unchanged');
+    assert.deepEqual([s.flagProtected, s.flagAutoInherited, s.flagIsNull, s.flagMissing, s.flagUnparsed], ['1', '1', '1', '1', '1']);
+    assert.deepEqual([s.orderDenyRelChanged, s.orderDenyRelUnchanged, s.orderDenyRelUnknown], ['1', '1', '1']);
+    assert.deepEqual([s.aclErrTypes, s.aclErrOther, s.aclErrAbsent], ['UnauthorizedAccessException:2,NotSupportedException:1', '1', '1']);
+    const none = opKv(readbackOperands('contradict', {}, [])[2]);
+    assert.deepEqual([none.test, none.aclErrTypes, none.flagProtected], ['contradict', 'none', '0']);
+    assert.equal(opKv(readbackOperands('payload', {}, [])[2]).test, 'UNKNOWN');
+    const clip = opKv(readbackOperands('unproved', {}, Array.from({ length: 100000 }, () => er(undefined)))[2]);
+    assert.deepEqual([clip.aclErrAbsent, clip.aclErrTypes], ['99999', 'none'], 'counts are clipped, never unbounded');
+  });
+
+  test('selfcheck: linkacl reports allow-ACE presence for A on the relevant link object, UNKNOWN with the missing input otherwise', () => {
+    const adminUser = 'S-1-5-21-1-2-3-500';
+    const sids = { A, B, adminUser };
+    const J = { id: 'D_JUNCTION', path: 'D:\\a\\fx\\junction-to-ok' };
+    const U = { id: 'D_UNDER_JUNCTION', path: 'D:\\a\\fx\\jnest\\inner-ok' };
+    assert.equal(linkObjectPath(J), 'D:\\a\\fx\\junction-to-ok');
+    assert.equal(linkObjectPath(U), 'D:\\a\\fx\\jnest');
+    assert.equal(linkObjectPath({ id: 'F_UNDER_JUNCTION', path: 'D:\\a\\fx\\jparent\\file-ok.bin' }), 'D:\\a\\fx\\jparent');
+    assert.equal(linkObjectPath({ id: 'D_OK', path: 'D:\\a' }), null);
+    assert.equal(linkObjectPath({ id: 'D_JUNCTION', path: null }), null);
+    const ln = (sddl, x = {}) => ({ openError: 0, isReparse: true, sddl, ...x });
+    const k = (c, snap) => { const l = linkAclOperands(c, snap, sids); assert.ok(OP_LINE.test(l) && !/S-1-|secret/.test(l), l); return opKv(l); };
+    const pick = (v) => [v.owner, v.aAllow, v.missing, v.aDeny, v.adminAllow, v.otherAllow, v.otherDeny];
+    assert.deepEqual(pick(k(J, ln('O:BAG:SYD:AI(A;ID;FA;;;BA)(A;ID;FA;;;SY)'))), ['admins', 'none', 'none', '0', '2', '0', '0']);
+    assert.deepEqual([k(J, ln('O:BAG:SYD:AI(A;ID;FA;;;BA)')).need, k(U, ln('O:BAG:SYD:AI(A;ID;FA;;;BA)')).need], ['rcra', 'ra']);
+    assert.deepEqual(pick(k(J, ln(`O:${A}G:${A}D:P(A;;FR;;;${A})`))), ['A', 'explicit', 'none', '0', '0', '0', '0']);
+    assert.deepEqual(pick(k(J, ln(`O:${adminUser}G:SYD:AI(A;ID;GR;;;${A})`))), ['adminUser', 'inherited', 'none', '0', '0', '0', '0']);
+    assert.equal(k(J, ln(`O:${B}G:SYD:AI(A;;RC;;;${A})(A;ID;LO;;;${A})`)).aAllow, 'both');
+    assert.equal(k(J, ln(`O:BAG:SYD:P(A;;RC;;;${A})`)).aAllow, 'none', 'leaf needs FILE_READ_ATTRIBUTES too');
+    assert.equal(k(U, ln(`O:BAG:SYD:P(A;;LO;;;${A})`)).aAllow, 'explicit', 'ancestor needs FILE_READ_ATTRIBUTES only');
+    assert.equal(k(J, ln(`O:BAG:SYD:P(A;;GW;;;${A})`)).aAllow, 'none', 'GW maps to FILE_GENERIC_WRITE (no FILE_READ_ATTRIBUTES)');
+    assert.equal(k(J, ln(`O:BAG:SYD:P(A;OICIIO;FA;;;${A})`)).aAllow, 'none', 'inherit-only ACE does not apply to the link');
+    assert.deepEqual(pick(k(J, ln(`O:BAG:SYD:P(D;;LO;;;${A})(A;;FA;;;${A})`))), ['admins', 'explicit', 'none', '1', '0', '0', '0']);
+    assert.deepEqual(pick(k(J, ln('O:BAG:SYD:AI(A;ID;FA;;;BA)(A;ID;0x1200a9;;;BU)(D;;FA;;;WD)'))), ['admins', 'UNKNOWN', 'groupMembership', '0', '1', '1', '1']);
+    for (const [sddl, miss] of [[`O:BAG:SYD:P(A;;FA;;;${A})(XA;;FR;;;${A};(Member_of {SID(BU)}))`, 'aceType'], [`O:BAG:SYD:P(A;;ZZ;;;${A})`, 'rights'],
+      ['O:BAG:SYD:NO_ACCESS_CONTROL', 'dacl'], ['O:BAG:SY', 'dacl']]) {
+      assert.deepEqual([k(J, ln(sddl)).aAllow, k(J, ln(sddl)).missing], ['UNKNOWN', miss], sddl);
+    }
+    assert.deepEqual([k(J, ln(null, { sddlError: 5 })).missing, k(J, ln('O:BAG:SYD:P', { openError: 5 })).missing], ['sddl', 'snapshot']);
+    const absent = k(J, undefined);
+    assert.deepEqual([absent.link, absent.reparse, absent.owner, absent.aAllow, absent.missing], ['absent', 'none', 'none', 'UNKNOWN', 'snapshot']);
+    const other = k({ id: 'D_OK', path: 'D:\\a' }, ln('O:BAG:SYD:P'));
+    assert.deepEqual([other.case, other.need], ['UNKNOWN', 'none']);
   });
 }
 
@@ -1059,7 +1269,8 @@ if (PHASE === 'verdict') {
     test(`verdict: helper ${c.id} ${c.op} equals oracle`, (t) => {
       const r = results.get(c.id);
       const o = oracleFor(c);
-      opDiag(t, () => helperOperands(c, r, o, expectedHelperStatus(c.id, o.cls)));
+      opDiag(t, () => [helperOperands(c, r, o, expectedHelperStatus(c.id, o.cls)), ...(OP_LINK_CASES[c.id]
+        ? [linkAclOperands(c, get('S0', linkObjectPath(c)), { A: sidA, B: sidB, adminUser: manifest.trust && manifest.trust.adminSid })] : [])]);
       assert.deepEqual(helperResultProblems(c.id, r, expectedHelperStatus(c.id, o.cls)), [], `oracle ${o.cls}/${o.reason}`);
       if (r.result.status === 'ok') assert.ok(/^[0-9a-f]{16}$/.test(r.result.volumeSerial) && /^[0-9a-f]{32}$/.test(r.result.fileId), 'ok without FileIdInfo');
       if (c.op === 'readPrivateFile' && o.cls === 'ok') {

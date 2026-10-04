@@ -686,8 +686,10 @@ function Remove-PspVhds { param($State, [string]$ScratchDir, [string]$Root)
 # missing or invalid SID) throws a fixed refusal: an unknown owner is never reported as "no live writer". A successful
 # enumeration with no process is known-empty (0 hits). SID validity ignores case; matching stays exact-case.
 # DIAGNOSTIC (host stream only, never pipeline output): right before the refusal, the FIRST unknown owner is written as
-# one fixed line 'psp-diag owner-unknown cat=<closed enum> pid=<uint32|none> rv=<integer|none>'. Never a name, command
-# line, environment, SID or exception text; enumeration stops at that first unknown exactly as before.
+# one fixed line 'psp-diag owner-unknown cat=<closed enum> pid=<uint32|none> rv=<integer|none>', then one bounded count
+# line over ALL enumerated rows 'psp-diag owner-unknown-counts rows=<n> hits=<n> <cat>=<n> ...' (row categories only).
+# Never a name, command line, environment, SID or exception text. Every enumerated row is classified; the refusal is the
+# one of the FIRST unknown, and no hit list is returned once any owner is unknown.
 function Get-PspLiveSidProcesses { param([string[]]$Sids = @())
   if (@($Sids).Count -eq 0) { return }
   $hits = @()
@@ -697,7 +699,10 @@ function Get-PspLiveSidProcesses { param([string[]]$Sids = @())
     Write-Host 'psp-diag owner-unknown cat=enumeration pid=none rv=none'
     throw 'refusing: process enumeration failed (live writer state unknown)'
   }
+  $first = $null; $firstCat = $null; $rows = 0
+  $n = [ordered]@{ 'query' = 0; 'shape' = 0; 'rv-missing' = 0; 'rv-type' = 0; 'rv-nonzero' = 0; 'sid-invalid' = 0 }
   foreach ($p in $procs) {
+    $rows++
     $cat = $null; $rv = $null; $sid = $null
     $o = $null; try { $o = @(Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid -ErrorAction Stop) } catch { $o = $null }
     if ($null -eq $p) { $cat = 'shape' } elseif ($null -eq $o) { $cat = 'query' } elseif (($o.Count -ne 1) -or ($null -eq $o[0])) { $cat = 'shape' }
@@ -710,17 +715,25 @@ function Get-PspLiveSidProcesses { param([string[]]$Sids = @())
       if (($sid -isnot [string]) -or ($sid -inotmatch '^S-1-[0-9]+(-[0-9]+)+\z')) { $cat = 'sid-invalid' }
     }
     if ($null -ne $cat) {
-      $pv = $null; try { $pv = $p.ProcessId } catch { $pv = $null }
-      $dp = 'none'; if (($null -ne $pv) -and ($ints -ccontains $pv.GetType().FullName) -and ($pv -ge 0) -and ($pv -le [uint32]::MaxValue)) { $dp = [string]$pv }
-      $dr = 'none'; if (@('rv-nonzero', 'sid-invalid') -ccontains $cat) { $dr = [string]$rv }
-      if ($dp -cnotmatch '^[0-9]{1,10}\z') { $dp = 'none' }
-      if ($dr -cnotmatch '^-?[0-9]{1,20}\z') { $dr = 'none' }
-      Write-Host ('psp-diag owner-unknown cat=' + $cat + ' pid=' + $dp + ' rv=' + $dr)
-      if (@('query', 'shape') -ccontains $cat) { throw 'refusing: process owner query failed (live writer state unknown)' }
-      if ($cat -ceq 'sid-invalid') { throw 'refusing: process owner SID missing or invalid (live writer state unknown)' }
-      throw 'refusing: process owner query returned a nonzero or missing ReturnValue (live writer state unknown)'
+      $n[$cat]++
+      if ($null -eq $first) {
+        $pv = $null; try { $pv = $p.ProcessId } catch { $pv = $null }
+        $dp = 'none'; if (($null -ne $pv) -and ($ints -ccontains $pv.GetType().FullName) -and ($pv -ge 0) -and ($pv -le [uint32]::MaxValue)) { $dp = [string]$pv }
+        $dr = 'none'; if (@('rv-nonzero', 'sid-invalid') -ccontains $cat) { $dr = [string]$rv }
+        if ($dp -cnotmatch '^[0-9]{1,10}\z') { $dp = 'none' }
+        if ($dr -cnotmatch '^-?[0-9]{1,20}\z') { $dr = 'none' }
+        $first = 'psp-diag owner-unknown cat=' + $cat + ' pid=' + $dp + ' rv=' + $dr; $firstCat = $cat
+      }
+      continue
     }
     if ($Sids -ccontains $sid) { $hits += [string]("$($p.ProcessId):$($p.Name):$sid") }
+  }
+  if ($null -ne $first) {
+    Write-Host $first
+    Write-Host ('psp-diag owner-unknown-counts rows=' + $rows + ' hits=' + @($hits).Count + ' query=' + $n['query'] + ' shape=' + $n['shape'] + ' rv-missing=' + $n['rv-missing'] + ' rv-type=' + $n['rv-type'] + ' rv-nonzero=' + $n['rv-nonzero'] + ' sid-invalid=' + $n['sid-invalid'])
+    if (@('query', 'shape') -ccontains $firstCat) { throw 'refusing: process owner query failed (live writer state unknown)' }
+    if ($firstCat -ceq 'sid-invalid') { throw 'refusing: process owner SID missing or invalid (live writer state unknown)' }
+    throw 'refusing: process owner query returned a nonzero or missing ReturnValue (live writer state unknown)'
   }
   return $hits
 }

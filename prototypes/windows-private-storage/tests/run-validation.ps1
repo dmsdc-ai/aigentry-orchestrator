@@ -263,6 +263,11 @@ function Format-PspVerdictOpDiag { param([string]$ReadStatus, [string]$Text)
           'SeManageVolumePrivilege', 'SeProfileSingleProcessPrivilege', 'SeRelabelPrivilege', 'SeRemoteShutdownPrivilege', 'SeRestorePrivilege',
           'SeSecurityPrivilege', 'SeShutdownPrivilege', 'SeSyncAgentPrivilege', 'SeSystemEnvironmentPrivilege', 'SeSystemProfilePrivilege', 'SeSystemtimePrivilege',
           'SeTakeOwnershipPrivilege', 'SeTcbPrivilege', 'SeTimeZonePrivilege', 'SeTrustedCredManAccessPrivilege', 'SeUndockPrivilege', 'SeUnsolicitedInputPrivilege')
+        aclerr = @('UnauthorizedAccessException', 'PrivilegeNotHeldException', 'ItemNotFoundException', 'FileNotFoundException', 'DirectoryNotFoundException',
+          'PathTooLongException', 'IOException', 'ArgumentException', 'NotSupportedException', 'InvalidOperationException', 'SecurityException', 'Win32Exception')
+        lcase = @('D_JUNCTION', 'D_SYMLINK', 'D_UNDER_JUNCTION', 'F_UNDER_JUNCTION'); need = @('rcra', 'ra')
+        owncls = @('A', 'B', 'admins', 'system', 'adminUser', 'other'); allowk = @('explicit', 'inherited', 'both')
+        missing = @('snapshot', 'sddl', 'dacl', 'aceType', 'rights', 'groupMembership')
       }
       # Field order and value class per kind, exactly as acl.test.mjs writes them.
       $schema = @{
@@ -274,8 +279,10 @@ function Format-PspVerdictOpDiag { param([string]$ReadStatus, [string]$Text)
         helper = 'case:case op:op result:pres threw:bool abiOk:bool status:status reason:reason winErr:int created:bool bytes:int volId:bool want:cls oracle:cls oracleReason:oreason oracleCode:int problems:cnt'
         readback = 'test:test snapProblems:cnt objects:cnt skipped:cnt aclMatch:cnt aclDiffNonReparse:cnt aclDiffReparse:cnt aclUnavailNonReparse:cnt aclUnavailReparse:cnt aclErrPresent:cnt hlMatch:cnt hlDiff:cnt hlReparse:cnt hlExitNonzero:cnt rpNotOracle:cnt rpExitNonzero:cnt contradictions:cnt unproved:cnt'
         rbdiff = 'test:test dir:cnt file:cnt owner:cnt group:cnt daclFlags:cnt aceCount:cnt aceOrder:cnt aceFlags:cnt aceSet:cnt textOnly:cnt unparsed:cnt hlExits:hist hlExitsOther:cnt rpExits:hist rpExitsOther:cnt'
+        rbsplit = 'test:test flagProtected:cnt flagAutoInherited:cnt flagIsNull:cnt flagMissing:cnt flagUnparsed:cnt orderDenyRelChanged:cnt orderDenyRelUnchanged:cnt orderDenyRelUnknown:cnt aclErrTypes:ehist aclErrOther:cnt aclErrAbsent:cnt'
+        linkacl = 'case:lcase need:need link:pres reparse:bool owner:owncls aAllow:allowk missing:missing aDeny:cnt adminAllow:cnt otherAllow:cnt otherDeny:cnt'
       }
-      $keyed = @('priv', 'launch', 'bind', 'helper', 'readback', 'rbdiff')
+      $keyed = @('priv', 'launch', 'bind', 'helper', 'readback', 'rbdiff', 'rbsplit', 'linkacl')
       $seen = @{}
       foreach ($raw in $lines) {
         $l = $raw.TrimEnd([char]13)
@@ -311,6 +318,17 @@ function Format-PspVerdictOpDiag { param([string]$ReadStatus, [string]$Text)
               $ps = $v.Split([char]44); $u = @{}
               if ($ps.Count -gt $voc['privs'].Count) { $bad = $true }
               foreach ($p in $ps) { if (($voc['privs'] -cnotcontains $p) -or $u.ContainsKey($p)) { $bad = $true } else { $u[$p] = $true } }
+            }
+          }
+          elseif ($cl -ceq 'ehist') {
+            if ($v -cne 'none') {
+              $es = $v.Split([char]44); $u = @{}
+              if ($es.Count -gt $voc['aclerr'].Count) { $bad = $true }
+              foreach ($e in $es) {
+                if (-not ($e -cmatch '^([A-Za-z0-9]{1,40}):[0-9]{1,5}\z')) { $bad = $true; continue }
+                $en = $Matches[1]
+                if (($voc['aclerr'] -cnotcontains $en) -or $u.ContainsKey($en)) { $bad = $true } else { $u[$en] = $true }
+              }
             }
           }
           else { $bad = -not ((@('none', 'UNKNOWN') -ccontains $v) -or ($voc[$cl] -ccontains $v)) }
