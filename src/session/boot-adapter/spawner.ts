@@ -14,14 +14,45 @@ export interface Spawner {
   probeVersion(executable: string): Promise<string>;
 }
 
+// #1167: a probe must never hang or buffer unboundedly. Hard deadline and a
+// combined stdout+stderr byte ceiling; on either, SIGKILL the direct child and
+// reject without carrying any captured output.
+const PROBE_TIMEOUT_MS = 5_000;
+const PROBE_MAX_BYTES = 1_048_576;
+
 function collect(exe: string, args: readonly string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     const c = spawn(exe, [...args], { shell: false });
-    let out = "";
-    c.stdout?.on("data", (d) => (out += d.toString()));
-    c.stderr?.on("data", (d) => (out += d.toString()));
-    c.on("error", reject);
-    c.on("close", (code) => (code === 0 ? resolve(out) : reject(new Error("nonzero"))));
+    let out: string[] = [];
+    let bytes = 0;
+    let done = false;
+    const fail = (e: Error) => {
+      if (done) return;
+      done = true;
+      clearTimeout(t);
+      out = [];
+      c.kill("SIGKILL");
+      reject(e);
+    };
+    const t = setTimeout(() => fail(new Error("PROBE_TIMEOUT")), PROBE_TIMEOUT_MS);
+    const onData = (d: Buffer) => {
+      if (done) return;
+      bytes += d.length;
+      if (bytes > PROBE_MAX_BYTES) return fail(new Error("PROBE_OUTPUT_LIMIT"));
+      out.push(d.toString());
+    };
+    c.stdout?.on("data", onData);
+    c.stderr?.on("data", onData);
+    c.stdout?.on("error", fail);
+    c.stderr?.on("error", fail);
+    c.on("error", fail);
+    c.on("close", (code) => {
+      if (done) return;
+      done = true;
+      clearTimeout(t);
+      if (code === 0) resolve(out.join(""));
+      else reject(new Error("nonzero"));
+    });
   });
 }
 
@@ -46,7 +77,8 @@ export function nodeSpawner(): Spawner {
         child.stderr?.on("data", (d) => (err += d.toString()));
         child.on("error", (e) => {
           clearTimeout(t);
-          reject(Object.assign(e, { code: "ENOENT" }));
+          // #1167: propagate the real OS error (EACCES stays EACCES; missing exe is already ENOENT).
+          reject(e);
         });
         // #1162: stdin pipe errors (EPIPE when the child closed its read end) must
         // never crash the parent. A non-empty payload counts as delivered only once
