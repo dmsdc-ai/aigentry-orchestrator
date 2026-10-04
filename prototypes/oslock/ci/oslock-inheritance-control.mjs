@@ -103,6 +103,12 @@ const ORACLE = {
 const WIN_SHARE_DENIAL = ["EPERM", "EBUSY", "EACCES"];
 const WIN_DETACHED = { stdio: "inherit", detached: true };
 const DRIVER_TEST_ENV = { OSLOCK_SUITE: "all", OSLOCK_P1_REPS: "20", OSLOCK_P2_REPS: "20" };
+// Driver `test` mode receipt.commands contract (oslock-build.mjs identity() then runTests(); no
+// compiler probe in test mode), as recorded on win32 with ROOT=<MUT> redacted to <ROOT>.
+const COMMAND_KEYS = ["argv", "cwd", "durationMs", "exitCode", "signal", "spawnError", "stderrBytes", "stdoutBytes", "timedOut", "truncated"];
+const PROBE_CMD = { argv: ["git", "rev-parse", "HEAD"], cwd: "<ROOT>", exitCode: 128 }; // 128: <MUT> lies outside any checkout
+const SUITE_ARGS = ["--expose-gc", "--test-reporter=tap", "tests/oslock/primitive.test.mjs"];
+const SUITE_CWD = "<ROOT>\\output";
 const EXPECT_NODE = "v20.20.2";
 const ENV_KEYS = [
   "GITHUB_SHA", "GITHUB_REF", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_WORKFLOW", "GITHUB_JOB",
@@ -340,9 +346,32 @@ function judgeRun(out, n, build) {
   });
   if (!(ctl && receipt && tap !== undefined && results)) return r;
 
-  const cmd = receipt.commands?.[0];
-  cond("driverExitNonzeroNoTimeout", receipt.commands?.length === 1 && Number.isInteger(cmd?.exitCode) && cmd.exitCode !== 0 &&
-    cmd.signal === null && cmd.timedOut === false && cmd.spawnError === null && ctl.exitCode !== 0 && ctl.outcome === "nonzero-recorded-for-check",
+  // Commands are selected by exact argv/cwd identity, never by position or exit: exactly one
+  // metadata probe and one suite command (argv[0] = receipt node execPath = control node); any
+  // malformed, unexpected or duplicate record fails. The probe exit is kept, never a suite failure.
+  const nodeExe = receipt.identity?.node?.execPath;
+  const natural = (x) => Number.isInteger(x) && x >= 0;
+  const cmds = Array.isArray(receipt.commands) ? receipt.commands : [];
+  const kinds = cmds.map((c) => {
+    if (c === null || typeof c !== "object" || Array.isArray(c) || JSON.stringify(Object.keys(c).sort()) !== JSON.stringify(COMMAND_KEYS) ||
+      !Array.isArray(c.argv) || !c.argv.every((a) => typeof a === "string") || typeof c.cwd !== "string" ||
+      !natural(c.durationMs) || !natural(c.stdoutBytes) || !natural(c.stderrBytes)) return "malformed";
+    if (JSON.stringify(c.argv) === JSON.stringify(PROBE_CMD.argv) && c.cwd === PROBE_CMD.cwd) return "probe";
+    if (typeof nodeExe === "string" && JSON.stringify(c.argv) === JSON.stringify([nodeExe, ...SUITE_ARGS]) && c.cwd === SUITE_CWD) return "suite";
+    return "unexpected";
+  });
+  const pick = (k) => (kinds.filter((x) => x === k).length === 1 ? cmds[kinds.indexOf(k)] : undefined);
+  const probe = pick("probe");
+  const cmd = pick("suite");
+  const settled = (c) => Number.isInteger(c?.exitCode) && c.signal === null && c.timedOut === false && c.spawnError === null && c.truncated === false;
+  cond("receiptCommandsExact", Array.isArray(receipt.commands) && cmds.length === 2 && probe !== undefined && cmd !== undefined &&
+    settled(probe) && probe.exitCode === PROBE_CMD.exitCode && probe.stdoutBytes === 0 && receipt.identity?.commit?.head === null &&
+    settled(cmd) && nodeExe === ctl.argv?.[0] && receipt.identity?.node?.version === EXPECT_NODE && ctl.node?.version === EXPECT_NODE,
+    { kinds, probe: probe ?? null, head: receipt.identity?.commit?.head, nodeExe: nodeExe ?? null, controlNode: ctl.argv?.[0] ?? null });
+  cond("driverExitNonzeroNoTimeout", Number.isInteger(cmd?.exitCode) && cmd.exitCode !== 0 &&
+    cmd.signal === null && cmd.timedOut === false && cmd.spawnError === null &&
+    Number.isInteger(ctl.exitCode) && ctl.exitCode === cmd.exitCode && ctl.signal === null && ctl.spawnError === null &&
+    ctl.outcome === "nonzero-recorded-for-check",
     { exitCode: cmd?.exitCode, signal: cmd?.signal, timedOut: cmd?.timedOut, spawnError: cmd?.spawnError, controlExit: ctl.exitCode });
   cond("receiptIsSuiteFailureOnly", receipt.mode === "test" && receipt.status === "failed" &&
     receipt.failure === `test run ${n} failed (exit ${cmd?.exitCode}, signal null, timedOut false)` && receipt.resultsFiles?.length === 1,
