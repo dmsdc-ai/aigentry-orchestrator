@@ -685,18 +685,41 @@ function Remove-PspVhds { param($State, [string]$ScratchDir, [string]$Root)
 # whose owner cannot be established (enumeration error, owner query error, nonzero/missing/non-integer ReturnValue,
 # missing or invalid SID) throws a fixed refusal: an unknown owner is never reported as "no live writer". A successful
 # enumeration with no process is known-empty (0 hits). SID validity ignores case; matching stays exact-case.
+# DIAGNOSTIC (host stream only, never pipeline output): right before the refusal, the FIRST unknown owner is written as
+# one fixed line 'psp-diag owner-unknown cat=<closed enum> pid=<uint32|none> rv=<integer|none>'. Never a name, command
+# line, environment, SID or exception text; enumeration stops at that first unknown exactly as before.
 function Get-PspLiveSidProcesses { param([string[]]$Sids = @())
   if (@($Sids).Count -eq 0) { return }
   $hits = @()
+  $ints = @('System.Byte', 'System.SByte', 'System.Int16', 'System.UInt16', 'System.Int32', 'System.UInt32', 'System.Int64', 'System.UInt64')
   $procs = $null; try { $procs = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop) } catch { $procs = $null }
-  if ($null -eq $procs) { throw 'refusing: process enumeration failed (live writer state unknown)' }
+  if ($null -eq $procs) {
+    Write-Host 'psp-diag owner-unknown cat=enumeration pid=none rv=none'
+    throw 'refusing: process enumeration failed (live writer state unknown)'
+  }
   foreach ($p in $procs) {
+    $cat = $null; $rv = $null; $sid = $null
     $o = $null; try { $o = @(Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid -ErrorAction Stop) } catch { $o = $null }
-    if (($null -eq $p) -or ($null -eq $o) -or ($o.Count -ne 1) -or ($null -eq $o[0])) { throw 'refusing: process owner query failed (live writer state unknown)' }
-    $rv = $null; try { $rv = $o[0].ReturnValue } catch { $rv = $null }
-    if (($null -eq $rv) -or (@('System.Byte', 'System.SByte', 'System.Int16', 'System.UInt16', 'System.Int32', 'System.UInt32', 'System.Int64', 'System.UInt64') -cnotcontains $rv.GetType().FullName) -or ($rv -ne 0)) { throw 'refusing: process owner query returned a nonzero or missing ReturnValue (live writer state unknown)' }
-    $sid = $null; try { $sid = $o[0].Sid } catch { $sid = $null }
-    if (($sid -isnot [string]) -or ($sid -inotmatch '^S-1-[0-9]+(-[0-9]+)+\z')) { throw 'refusing: process owner SID missing or invalid (live writer state unknown)' }
+    if ($null -eq $p) { $cat = 'shape' } elseif ($null -eq $o) { $cat = 'query' } elseif (($o.Count -ne 1) -or ($null -eq $o[0])) { $cat = 'shape' }
+    if ($null -eq $cat) {
+      try { $rv = $o[0].ReturnValue } catch { $rv = $null }
+      if ($null -eq $rv) { $cat = 'rv-missing' } elseif ($ints -cnotcontains $rv.GetType().FullName) { $cat = 'rv-type' } elseif ($rv -ne 0) { $cat = 'rv-nonzero' }
+    }
+    if ($null -eq $cat) {
+      try { $sid = $o[0].Sid } catch { $sid = $null }
+      if (($sid -isnot [string]) -or ($sid -inotmatch '^S-1-[0-9]+(-[0-9]+)+\z')) { $cat = 'sid-invalid' }
+    }
+    if ($null -ne $cat) {
+      $pv = $null; try { $pv = $p.ProcessId } catch { $pv = $null }
+      $dp = 'none'; if (($null -ne $pv) -and ($ints -ccontains $pv.GetType().FullName) -and ($pv -ge 0) -and ($pv -le [uint32]::MaxValue)) { $dp = [string]$pv }
+      $dr = 'none'; if (@('rv-nonzero', 'sid-invalid') -ccontains $cat) { $dr = [string]$rv }
+      if ($dp -cnotmatch '^[0-9]{1,10}\z') { $dp = 'none' }
+      if ($dr -cnotmatch '^-?[0-9]{1,20}\z') { $dr = 'none' }
+      Write-Host ('psp-diag owner-unknown cat=' + $cat + ' pid=' + $dp + ' rv=' + $dr)
+      if (@('query', 'shape') -ccontains $cat) { throw 'refusing: process owner query failed (live writer state unknown)' }
+      if ($cat -ceq 'sid-invalid') { throw 'refusing: process owner SID missing or invalid (live writer state unknown)' }
+      throw 'refusing: process owner query returned a nonzero or missing ReturnValue (live writer state unknown)'
+    }
     if ($Sids -ccontains $sid) { $hits += [string]("$($p.ProcessId):$($p.Name):$sid") }
   }
   return $hits

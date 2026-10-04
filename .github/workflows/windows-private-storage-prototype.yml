@@ -75,9 +75,9 @@ jobs:
           # independent harness (tester-owned)
           check 6b24c09b9af54424bfd5347402c3af7a691688c2d4e24d4e73373d0e643ef1f0 prototypes/windows-private-storage/tests/acl.test.mjs
           check e08a0373bf33f0f10052dd76977055287e8c88b573219a338e64f2b71fc99dd1 prototypes/windows-private-storage/tests/wrapper.test.mjs
-          check bb11958d43fa28075addf3386b746431c8aac5766ac65d7b9790e8dce6015231 prototypes/windows-private-storage/tests/setup-fixtures.ps1
+          check 099ad60426c00df78a3ba699c5dc888fbe32eb85f08840b3f0c0c65fbdb3cdbc prototypes/windows-private-storage/tests/setup-fixtures.ps1
           check 944dfdd13f176eed9df0340db45a81a7d83e68308667ee7bc4980b10956fb751 prototypes/windows-private-storage/tests/run-as-user.ps1
-          check b0de2104769f04809ad4df8cee0b802556bc48092000ef53528f383f1f0c09ee prototypes/windows-private-storage/tests/run-validation.ps1
+          check 76eb771c2b2bad678bf525660790353397e7c791cc23c0a23de4637a0d4fd27d prototypes/windows-private-storage/tests/run-validation.ps1
           # baseline that must stay byte-identical (release 148d3b67 staged inputs)
           check 51343c903455905eb96d22f3c6111493dc24e11fa651718e66ea792dfacb5a30 src/hitl/web/auth.ts
           check 14e8bed19324f0b23ebb0abdd4dea3248c6b5ecdeed783fe7c0414237dc37feb src/hitl/web/auth-port.ts
@@ -223,9 +223,9 @@ jobs:
           # independent harness (tester-owned)
           check 6b24c09b9af54424bfd5347402c3af7a691688c2d4e24d4e73373d0e643ef1f0 prototypes/windows-private-storage/tests/acl.test.mjs
           check e08a0373bf33f0f10052dd76977055287e8c88b573219a338e64f2b71fc99dd1 prototypes/windows-private-storage/tests/wrapper.test.mjs
-          check bb11958d43fa28075addf3386b746431c8aac5766ac65d7b9790e8dce6015231 prototypes/windows-private-storage/tests/setup-fixtures.ps1
+          check 099ad60426c00df78a3ba699c5dc888fbe32eb85f08840b3f0c0c65fbdb3cdbc prototypes/windows-private-storage/tests/setup-fixtures.ps1
           check 944dfdd13f176eed9df0340db45a81a7d83e68308667ee7bc4980b10956fb751 prototypes/windows-private-storage/tests/run-as-user.ps1
-          check b0de2104769f04809ad4df8cee0b802556bc48092000ef53528f383f1f0c09ee prototypes/windows-private-storage/tests/run-validation.ps1
+          check 76eb771c2b2bad678bf525660790353397e7c791cc23c0a23de4637a0d4fd27d prototypes/windows-private-storage/tests/run-validation.ps1
           # baseline that must stay byte-identical (release 148d3b67 staged inputs)
           check 51343c903455905eb96d22f3c6111493dc24e11fa651718e66ea792dfacb5a30 src/hitl/web/auth.ts
           check 14e8bed19324f0b23ebb0abdd4dea3248c6b5ecdeed783fe7c0414237dc37feb src/hitl/web/auth-port.ts
@@ -300,7 +300,7 @@ jobs:
           $env:PSModulePath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
           $f = Join-Path $env:GITHUB_WORKSPACE 'prototypes\windows-private-storage\tests\live-process-results.selftest.ps1'
           $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLowerInvariant()
-          if ($h -cne 'c4b48a71d8487f754450b0b5c0f3de1513488f3ee9341a6e464139c6d1cecc9d') { Write-Output "::error::live-process-results.selftest.ps1 sha256 $h does not match pin"; exit 1 }
+          if ($h -cne '94271b898824a185ea1d17a1b44c6cf602a6665fbccb403ee5f6fc76d8835309') { Write-Output "::error::live-process-results.selftest.ps1 sha256 $h does not match pin"; exit 1 }
           & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $f
           exit $LASTEXITCODE
 

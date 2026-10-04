@@ -96,6 +96,126 @@ function Export-PspEvidence { param($Trust)
   if ($x.problems.Count -eq 0) { return 0 } else { return 1 }
 }
 
+# DIAGNOSTIC only (host stream; tainted until the trusted export; never verdict acceptance). Pure: no command, no I/O.
+# Fixed prefix plus numeric / hex / closed-enum fields only: never a test name, YAML block, stack, value, path or control
+# character. A failing test is its TAP number, depth and sha256 of the UTF-8 TAP name field (for local matching only).
+# Bounds: more than 50000 LF lines => nothing parsed (tap=too-many-lines); first 64 'not ok' listed, the rest counted.
+function Format-PspVerdictDiag { param($NodeExit, [string]$ReadStatus, [string]$Text, $Bytes)
+  $ne = 'none'; if (($NodeExit -is [int]) -and ([string]$NodeExit -cmatch '^-?[0-9]{1,10}\z')) { $ne = [string]$NodeExit }
+  $rs = 'UNKNOWN'; if (@('ok', 'missing', 'unexpected-path', 'reparse', 'not-file', 'too-large', 'read-failed', 'decode-failed') -ccontains $ReadStatus) { $rs = $ReadStatus }
+  $by = 'none'; if (($Bytes -is [long]) -and ($Bytes -ge 0)) { $by = [string]$Bytes }
+  $n = [ordered]@{ lines = 'none'; plan = 'none'; tests = 'none'; pass = 'none'; fail = 'none'; cancelled = 'none'; skipped = 'none'; todo = 'none'; okLines = 'none'; notOkLines = 'none'; bail = 'none'; listed = 0; clipped = 0 }
+  $fails = @()
+  if ($rs -ceq 'ok') {
+    $lines = $Text.Split([char]10)
+    $n.lines = [string]$lines.Count
+    if ($lines.Count -gt 50000) { $rs = 'too-many-lines' }
+    else {
+      $ok = 0; $nok = 0; $bail = 0
+      foreach ($raw in $lines) {
+        $l = $raw.TrimEnd([char]13)
+        if ($l -cmatch '^((?:    ){0,16})(not ok|ok) ([0-9]{1,9})(?: - (.*))?\z') {
+          $ind = $Matches[1]; $kind = $Matches[2]; $num = $Matches[3]; $nm = $Matches[4]
+          if ($kind -ceq 'ok') { $ok++; continue }
+          $nok++
+          if ($fails.Count -ge 64) { $n.clipped = $n.clipped + 1; continue }
+          $h = 'none'
+          if ($null -ne $nm) {
+            $s = [System.Security.Cryptography.SHA256]::Create()
+            try { $h = ([System.BitConverter]::ToString($s.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($nm))) -replace '-', '').ToLowerInvariant() } finally { $s.Dispose() }
+          }
+          $dir = 0; if (($null -ne $nm) -and ($nm -imatch '\s#\s*(TODO|SKIP)\b')) { $dir = 1 }
+          $fails += ('psp-diag verdict-fail n=' + $num + ' depth=' + [string][int]($ind.Length / 4) + ' directive=' + $dir + ' nameSha256=' + $h)
+        }
+        elseif ($l -cmatch '^# (tests|pass|fail|cancelled|skipped|todo) ([0-9]{1,9})\z') { $n[$Matches[1]] = $Matches[2] }
+        elseif ($l -cmatch '^1\.\.([0-9]{1,9})\z') { $n.plan = $Matches[1] }
+        elseif ($l -cmatch '^\s*Bail out!') { $bail++ }
+      }
+      $n.okLines = [string]$ok; $n.notOkLines = [string]$nok; $n.bail = [string]$bail; $n.listed = $fails.Count
+    }
+  }
+  $head = 'psp-diag verdict nodeExit=' + $ne + ' tap=' + $rs + ' bytes=' + $by
+  foreach ($k in @('lines', 'plan', 'tests', 'pass', 'fail', 'cancelled', 'skipped', 'todo', 'okLines', 'notOkLines', 'bail', 'listed', 'clipped')) { $head += (' ' + $k + '=' + $n[$k]) }
+  return @($head + ' trust=diagnostic-only') + $fails
+}
+
+# Reads ONLY the literal owned receipts\verdict.tap (plain file, no reparse point, at most 4MB, strict UTF-8) and writes
+# the Format-PspVerdictDiag lines to the host stream. Any refusal is a closed read status; it never throws.
+function Write-PspVerdictDiag { param([string]$Path, $NodeExit)
+  $rs = 'read-failed'; $text = ''; $bytes = $null
+  try {
+    $want = Join-Path $ReceiptsDir 'verdict.tap'
+    if (($Path -cne $want) -or ([System.IO.Path]::GetFullPath($Path) -cne $want)) { $rs = 'unexpected-path' }
+    elseif (-not ([System.IO.File]::Exists($Path) -or [System.IO.Directory]::Exists($Path))) { $rs = 'missing' }
+    else {
+      $attr = [System.IO.File]::GetAttributes($Path)
+      if (($attr -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { $rs = 'reparse' }
+      elseif (($attr -band [System.IO.FileAttributes]::Directory) -ne 0) { $rs = 'not-file' }
+      else {
+        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        try {
+          $bytes = [long]$fs.Length
+          if ($bytes -gt 4MB) { $rs = 'too-large' }
+          else {
+            $buf = New-Object byte[] ([int]$bytes)
+            $got = 0; while ($got -lt $buf.Length) { $k = $fs.Read($buf, $got, $buf.Length - $got); if ($k -le 0) { break }; $got += $k }
+            if ($got -ne $buf.Length) { $rs = 'read-failed' }
+            else { try { $text = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($buf); $rs = 'ok' } catch { $rs = 'decode-failed' } }
+          }
+        } finally { $fs.Dispose() }
+      }
+    }
+  } catch { $rs = 'read-failed' }
+  try { foreach ($l in @(Format-PspVerdictDiag $NodeExit $rs $text $bytes)) { Write-Host $l } } catch { Write-Host 'psp-diag verdict summary=failed' }
+}
+
+# DIAGNOSTIC only: one fixed line from an Invoke-PspCleanup result (or the in-run catch record). Pure: no command, no
+# I/O. Counts, booleans and closed enums only; never a raw error, path, name or SID. Unrecognised root errors are UNKNOWN.
+function Format-PspCleanupDiag { param([string]$Phase, $C)
+  $ph = 'UNKNOWN'; if (@('in-run', 'backstop') -ccontains $Phase) { $ph = $Phase }
+  $line = 'psp-diag cleanup phase=' + $ph
+  if (-not ($C -is [System.Collections.IDictionary])) { return ($line + ' summary=none') }
+  $ok = 'false'; if (($C['ok'] -is [bool]) -and $C['ok']) { $ok = 'true' }
+  $exc = 'false'; if ($null -ne $C['error']) { $exc = 'true' }
+  $sp = 0; foreach ($x in @($C['stateProblems'])) { if ($null -ne $x) { $sp++ } }
+  $vd = 'none'; $vde = 'none'
+  if ($null -ne $C['vdisks']) {
+    $vd = 0; $vde = 0
+    foreach ($v in @($C['vdisks'])) { $vd++; if ((-not ($v -is [System.Collections.IDictionary])) -or ($null -ne $v['error'])) { $vde++ } }
+  }
+  $rt = 'none'; $re = 'none'; $lw = 'none'; $r = $C['root']
+  if ($r -is [System.Collections.IDictionary]) {
+    $rt = 'kept'; if (($r['removed'] -is [bool]) -and $r['removed']) { $rt = 'removed' }
+    $lw = 0; foreach ($x in @($r['liveWriters'])) { if ($null -ne $x) { $lw++ } }
+    $e = $r['error']
+    if ($null -eq $e) { $re = 'none' }
+    elseif (-not ($e -is [string])) { $re = 'UNKNOWN' }
+    elseif ($e -ceq 'refusing: process enumeration failed (live writer state unknown)') { $re = 'owner-unknown-enumeration' }
+    elseif ($e -ceq 'refusing: process owner query failed (live writer state unknown)') { $re = 'owner-unknown-query' }
+    elseif ($e -ceq 'refusing: process owner query returned a nonzero or missing ReturnValue (live writer state unknown)') { $re = 'owner-unknown-rv' }
+    elseif ($e -ceq 'refusing: process owner SID missing or invalid (live writer state unknown)') { $re = 'owner-unknown-sid' }
+    elseif ($e -ceq 'fixture root not fully removed (explicit cleanup failure)') { $re = 'not-fully-removed' }
+    elseif ($e.StartsWith('refusing: fake-user processes still alive: ', [System.StringComparison]::Ordinal)) { $re = 'live-writers' }
+    elseif ($e.StartsWith('refusing unowned root ', [System.StringComparison]::Ordinal)) { $re = 'unowned-root' }
+    elseif ($e.StartsWith('refusing non-canonical root ', [System.StringComparison]::Ordinal)) { $re = 'non-canonical-root' }
+    elseif ($e.StartsWith('refusing reparse-point root ', [System.StringComparison]::Ordinal)) { $re = 'reparse-root' }
+    elseif ($e.StartsWith('cannot enable Se', [System.StringComparison]::Ordinal)) { $re = 'privilege' }
+    elseif ($e.StartsWith('refusing: link pair ', [System.StringComparison]::Ordinal) -or $e.StartsWith('refusing: delete ', [System.StringComparison]::Ordinal) -or $e.StartsWith('refusing: reopen ', [System.StringComparison]::Ordinal)) { $re = 'link-pair' }
+    else { $re = 'UNKNOWN' }
+  } elseif ($null -ne $r) { $rt = 'UNKNOWN'; $re = 'UNKNOWN' }
+  $us = 'none'; $ur = 'none'; $un = 'none'; $ue = 'none'
+  if ($null -ne $C['users']) {
+    $us = 0; $ur = 0; $un = 0; $ue = 0
+    foreach ($u in @($C['users'])) {
+      $us++
+      if (-not ($u -is [System.Collections.IDictionary])) { $ue++; continue }
+      if (($u['removed'] -is [bool]) -and $u['removed']) { $ur++ }
+      if ($u['error'] -ceq 'not-present') { $un++ } elseif ($null -ne $u['error']) { $ue++ }
+    }
+  }
+  return ($line + ' ok=' + $ok + ' exception=' + $exc + ' stateProblems=' + $sp + ' vdisks=' + $vd + ' vdiskErrors=' + $vde + ' root=' + $rt + ' rootError=' + $re + ' liveWriters=' + $lw + ' users=' + $us + ' usersRemoved=' + $ur + ' usersNotPresent=' + $un + ' userErrors=' + $ue)
+}
+
 if ($ExportOnly) {
   if (-not $TrustRoot -or -not (Test-PspBoundTrustRoot $TrustRoot)) { Write-Output "export: refusing trust root '$TrustRoot' (not the bound, canonical root of this script)"; exit 1 }
   $trust = Get-PspTrustLayout $TrustRoot
@@ -116,6 +236,7 @@ if ($CleanupOnly) {
   $ReceiptsDir = $trust.receipts; $scratch = $trust.scratch
   if (-not (Test-Path -LiteralPath $trust.statePath)) { Write-Output 'cleanup: refusing, trust root has no state file'; exit 1 }
   $c = Invoke-PspCleanup (Get-Content -LiteralPath $trust.statePath -Raw | ConvertFrom-Json)
+  try { Write-Host (Format-PspCleanupDiag 'backstop' $c) } catch { Write-Host 'psp-diag cleanup phase=backstop summary=failed' }
   Write-PspJson $c ('cleanup-backstop-' + [guid]::NewGuid().ToString('N') + '.json')
   Write-Output ('cleanup: ok={0} stateProblems={1}' -f $c.ok, ($c.stateProblems -join ','))
   if ($c.ok) { exit 0 } else { exit 1 }
@@ -321,11 +442,13 @@ try {
     $env:PSP_PHASE = 'verdict'; $env:PSP_RECEIPTS_DIR = $ReceiptsDir; $env:PSP_RUN_ID = $env:GITHUB_RUN_ID; $env:PSP_TEMP_LONG = $tempLong
     $np = Start-Process -FilePath $S.nodeTrusted -ArgumentList @('--test', '--test-reporter=tap', $vtest) -NoNewWindow -Wait -PassThru -RedirectStandardOutput $vt -RedirectStandardError $ve
     $S.verdictExit = $np.ExitCode
+    Write-PspVerdictDiag $vt $np.ExitCode
     if ($np.ExitCode -ne 0) { throw "verdict failed (node exit $($np.ExitCode)); see verdict.tap" }
   }
 } finally {
   $c = $null
   try { $c = Invoke-PspCleanup $state } catch { $c = [ordered]@{ ok = $false; error = $_.Exception.Message } }
+  try { Write-Host (Format-PspCleanupDiag 'in-run' $c) } catch { Write-Host 'psp-diag cleanup phase=in-run summary=failed' }
   Write-PspJson $c 'cleanup.json'
   [void]$run.stages.Add([ordered]@{ name = 'cleanup'; status = $(if ($c.ok) { 'ok' } else { 'failed' }); error = $null })
 
