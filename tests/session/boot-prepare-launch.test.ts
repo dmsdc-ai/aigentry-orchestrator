@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..", "..", "..");
 const BOOT_PREPARE = join(REPO_ROOT, "bin", "boot-prepare.mjs");
@@ -37,7 +37,7 @@ function fixture(): { root: string; home: string; target: string; env: (x?: Reco
   writeFileSync(join(home, "instructions", "common.md"), "# COMMON\n");
   writeFileSync(join(home, "instructions", "roles", "coder.md"), "# Role: coder\n");
   const env = (x: Record<string, string> = {}): NodeJS.ProcessEnv => ({
-    PATH: bin, HOME: join(root, "fakehome"), TMPDIR: tmpdir(), AIGENTRY_HOME: home,
+    PATH: bin, HOME: join(root, "fakehome"), USERPROFILE: join(root, "fakehome"), TMPDIR: tmpdir(), AIGENTRY_HOME: home,
     CODEX_HOME: join(root, "real-codex"), GEMINI_CLI_HOME: join(root, "real-gemini"), ...x,
   });
   return { root, home, target, env };
@@ -68,6 +68,27 @@ function noDup(argv: readonly string[]): void {
     assert.ok(argv.filter((a) => a === f).length <= 1, `duplicate ${f}: ${JSON.stringify(argv)}`);
   }
 }
+
+test("BP0 fixture home stays local in child process", () => {
+  const f = fixture();
+  try {
+    const fakehome = join(f.root, "fakehome");
+    const env = f.env();
+    // Checked before any child runs: dropping USERPROFILE (win32 homedir source) fails here, not via host fallback.
+    assert.equal(env.HOME, fakehome);
+    assert.equal(env.USERPROFILE, fakehome);
+    for (const k of ["CODEX_HOME", "GEMINI_CLI_HOME"]) {
+      assert.ok(env[k]?.startsWith(f.root + sep), `${k}=${env[k]} not under fixture root`);
+    }
+    const r = spawnSync(process.execPath,
+      ["-e", "process.stdout.write(JSON.stringify({ home: require(\"node:os\").homedir() }))"],
+      { env, encoding: "utf8", timeout: 10_000 });
+    assert.equal(r.status, 0, `exit ${r.status} signal=${r.signal} stderr=${r.stderr}`);
+    assert.deepEqual(JSON.parse(r.stdout), { home: fakehome });
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
 
 test("BP1 claude final argv: exact order, no duplicate flags, launch default/default", () => {
   const { out, launcher, stagingFiles } = run("claude");
