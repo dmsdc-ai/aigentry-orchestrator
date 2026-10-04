@@ -125,6 +125,49 @@ function assertCmdSafe(args) {
   for (const a of args) if (!/^[A-Za-z0-9 ._=,/+@:\\-]+$/.test(a) || a.endsWith('\\')) throw Object.assign(new Error('HOSTILE_TO_CMD'), { code: 'HOSTILE_TO_CMD' });
 }
 
+// ---------------- parent-case fixture + cmd expansion diagnostic (#1167 analysis §5; record-only) ----------------
+const SP_PARENTS = ['Long Mixed AbC dir', 'SpBn']; // non-8.3 long name, 8.3-valid name; both mixed case
+// Reads ONLY `base` and the owned parents below it. ok needs each fixed parent on disk as its exact mixed-case entry
+// (unique casefold match) AND spelled differently in the variant entry, so a case change limited to the drive or the
+// random mkdtemp suffix, or a fixed parent left unchanged, is an explicit fixture violation, never a vacuous pass.
+function parentFixture(base, parents, variantEntry, list) {
+  const reasons = [];
+  if (variantEntry.slice(0, base.length).toUpperCase() !== base.toUpperCase() || variantEntry[base.length] !== '\\') reasons.push('variant_not_under_owned_base');
+  const tail = variantEntry.slice(base.length + 1).split('\\');
+  const rows = parents.map((want, i) => {
+    let entries = [];
+    try { entries = list(path.win32.join(base, ...parents.slice(0, i))); } catch (e) { reasons.push(`parent_${i}_readdir_${code(e)}`); }
+    const folded = entries.filter(e => e.toUpperCase() === want.toUpperCase());
+    const onDisk = folded.length === 1 ? folded[0] : null;
+    const variant = tail[i] ?? null;
+    if (onDisk !== want) reasons.push(`parent_${i}_on_disk_${folded.length === 1 ? 'spelling' : folded.length ? 'ambiguous' : 'missing'}`);
+    if (variant === null || variant.toUpperCase() !== want.toUpperCase()) reasons.push(`parent_${i}_not_in_variant`);
+    else if (variant === onDisk) reasons.push(`parent_${i}_unchanged`);
+    return { want, onDiskEntry: onDisk, casefoldMatches: folded.length, variantComponent: variant, changed: onDisk !== null && variant !== null && variant !== onDisk };
+  });
+  return { parents: rows, aboveBaseChanged: variantEntry.slice(0, base.length) !== base, ok: reasons.length === 0, reasons };
+}
+// Owned, fixed bytes; no user-supplied token reaches them (cmdRef gets an empty, trusted arg list).
+const DIAG_ECHO = '@ECHO off\r\nECHO [%0] [%~dp0] [%~f0]\r\n';
+// 8.3 aliases of the two owned parents only: lists <g> (alias of 'Long Mixed AbC dir') and <Long…> (alias of 'SpBn').
+const DIAG_DIRX = '@ECHO off\r\ndir /x /a:d "%~dp0..\\..\\.."\r\ndir /x /a:d "%~dp0..\\.."\r\n';
+const DIAG_IDS = ['diag/cmd-expansion/lower-PATH-bare', 'diag/cmd-expansion/upper-PATH-bare', 'diag/cmd-expansion/lower-abs-nosearch', 'diag/cmd-dir-x/owned-parents'];
+const DIAG_STDOUT_CAP = 64 * 1024;
+const parseDiagEcho = s => { const m = /^\[([^\]\r\n]*)\] \[([^\]\r\n]*)\] \[([^\]\r\n]*)\]\r?\n?$/.exec(s ?? ''); return m ? { zero: m[1], dp0: m[2], f0: m[3] } : null; };
+// Guard for one record-only row; raw stdout is kept verbatim (base64), parsed fields are the raw substrings, no inference.
+function diagGuard(row) {
+  const r = row.cmdRef, reasons = [];
+  if (!DIAG_IDS.includes(row.id)) reasons.push('unknown_id');
+  if (r.error !== null) reasons.push(`error_${r.error}`);
+  if (r.timedOut) reasons.push('timed_out');
+  if (r.exit !== 0) reasons.push(`exit_${r.exit}`);
+  if (r.stdoutCapped) reasons.push('stdout_cap');
+  if (!r.stdoutBytes) reasons.push('stdout_empty');
+  if (!r.cleanup?.complete) reasons.push('cleanup_incomplete');
+  if (row.id.startsWith('diag/cmd-expansion/') && row.echo === null) reasons.push('echo_unparsed');
+  return { ok: reasons.length === 0, reasons };
+}
+
 // ---------------- execution ----------------
 const owned = new Set();
 const spawnLog = [];
@@ -283,6 +326,20 @@ async function directOnly(id, { argv, dirs, key = 'PATH', expectRefuse = false, 
     hostileReached: got ? HOSTILE.every(h => got.includes(h)) : null, stdin: rep?.stdin ?? null,
     sentinel: fs.existsSync(path.join(c.dir, SENT)), cleanup: await cleanupProof(c.dir, c.nonce, r) };
 }
+// cmd-ref only, owned .cmd, empty arg list through the existing bounded cmdRef transport. Raw records, never compared.
+async function cmdDiagnostic(id, { exeToken, dirs }) {
+  const c = newCase(id);
+  const r = await cmdRef(exeToken, [], caseEnv('PATH', dirs, c.dir, c.nonce), c.dir, '');
+  const raw = typeof r.stdout === 'string' ? Buffer.from(r.stdout, 'utf8') : null;
+  const capped = raw !== null && raw.length > DIAG_STDOUT_CAP;
+  const kept = raw && (capped ? raw.subarray(0, DIAG_STDOUT_CAP) : raw);
+  const row = { id, kind: 'cmd-diagnostic', recordOnly: true, exeToken, pathEntries: dirs,
+    cmdRef: { error: r.error ?? null, exit: r.exit ?? null, timedOut: r.timedOut ?? false, stdoutBytes: raw ? raw.length : null, stdoutCapped: capped,
+      stdoutB64: kept ? kept.toString('base64') : null, stderrHash: r.stderrHash ?? null, handlePid: r.handlePid ?? null, cleanup: await cleanupProof(c.dir, c.nonce, r) } };
+  if (id.startsWith('diag/cmd-expansion/')) row.echo = capped ? null : parseDiagEcho(kept ? kept.toString('utf8') : null);
+  row.guard = diagGuard(row);
+  return row;
+}
 
 // ---------------- main ----------------
 const watchdog = setTimeout(() => {
@@ -381,9 +438,12 @@ try {
   fs.copyFileSync(process.execPath, path.join(g, 'dpnbin', 'node.exe'));
   receipt.cases.push(await differential('T3+T6/dp0-node.exe', { exeToken: 'fakedpn', dirs: [path.join(g, 'dpnbin')],
     expect: { execPath: redact(path.join(g, 'dpnbin', 'node.exe')) } }));
-  const sp = await genShim(gen, path.join(g, 'sppkg', 'cli'), path.join(g, 'spbin'), 'fakesp', fakeSource('#!/usr/bin/env node --require'));
-  receipt.cases.push(await differential('T3/spelling--require', { exeToken: 'fakesp', dirs: [path.join(g, 'spbin')], args: ['main-never-run.js', 'x'],
-    extra: { FAKE_MODE: 'preload' }, expect: { execPath: redact(nodeExe), execArgv: ['--require', redact(`${path.join(g, 'spbin')}\\\\${sp.T}`)], stdinNull: true, args: ['x'] } }));
+  // spbin/sppkg sit under an owned FIXED mixed-case parent pair (non-8.3 + 8.3-valid) so the lowercase variant always
+  // changes non-final components, independent of mkdtemp's random suffix; T (..\sppkg\cli) is unchanged.
+  const spRoot = path.join(g, ...SP_PARENTS);
+  const sp = await genShim(gen, path.join(spRoot, 'sppkg', 'cli'), path.join(spRoot, 'spbin'), 'fakesp', fakeSource('#!/usr/bin/env node --require'));
+  receipt.cases.push(await differential('T3/spelling--require', { exeToken: 'fakesp', dirs: [path.join(spRoot, 'spbin')], args: ['main-never-run.js', 'x'],
+    extra: { FAKE_MODE: 'preload' }, expect: { execPath: redact(nodeExe), execArgv: ['--require', redact(`${path.join(spRoot, 'spbin')}\\\\${sp.T}`)], stdinNull: true, args: ['x'] } }));
   await genShim(gen, path.join(g, 'vvpkg', 'cli'), path.join(g, 'vvbin'), 'fakevv', fakeSource('#!/usr/bin/env -S FOO=bar node'));
   const vvRef = await differential('T3/V-V-reference-only', { exeToken: 'fakevv', dirs: [path.join(g, 'vvbin')], expect: { execPath: redact(nodeExe) } });
   vvRef.note = 'records whether FOO reaches the child via cmd; direct is expected to refuse (V-V unsupported)';
@@ -462,14 +522,18 @@ try {
       spawnCount: r.spawns.length, ok: (r.version ?? r.error) === want && (want !== 'CLI_NOT_FOUND' || r.spawns.length === 0), cleanup: await cleanupProof(c.dir, c.nonce, r) });
   }
   // ---- coder assumption (a): %~dp0 spelling vs candidate's resolved PATH entry (spelling fixture, safe args) ----
-  const spBin = path.join(g, 'spbin');
+  const spBin = path.join(spRoot, 'spbin');
   // Relative to the cwd differential() actually gives both engines: caseDir(`${id}-ref|-direct`), not a guessed depth.
   const [caseDepthRel, relFromDirect] = ['ref', 'direct'].map(e => path.relative(caseDir(`spelling/relative-${e}`, '0'.repeat(8)), spBin));
   if (caseDepthRel !== relFromDirect) throw Object.assign(new Error('RELATIVE_FIXTURE_CWD_MISMATCH'), { code: 'RELATIVE_FIXTURE_CWD_MISMATCH' });
+  // Precondition read back from the owned directories only (g and below): recorded per case, violation is a FIXTURE finding.
+  const spParentFixture = parentFixture(g, SP_PARENTS, spBin.toLowerCase(), fs.readdirSync);
   for (const [vid, entry] of [['trailing-backslash', spBin + '\\'], ['lowercase', spBin.toLowerCase()], ['forward-slash', spBin.split('\\').join('/')],
     ['quoted', `"${spBin}"`], ['relative', caseDepthRel], ['dot-segment', path.join(spBin, '..', 'spbin').replace('spbin', 'spbin\\.\\.')]]) {
-    receipt.cases.push(await differential(`spelling/${vid}`, { exeToken: 'fakesp', dirs: [entry], args: ['main-never-run.js', 'x'], extra: { FAKE_MODE: 'preload' },
-      expect: { execPath: redact(nodeExe), args: ['x'], stdinNull: true } }));
+    const c = await differential(`spelling/${vid}`, { exeToken: 'fakesp', dirs: [entry], args: ['main-never-run.js', 'x'], extra: { FAKE_MODE: 'preload' },
+      expect: { execPath: redact(nodeExe), args: ['x'], stdinNull: true } });
+    if (vid === 'lowercase') c.parentFixture = spParentFixture;
+    receipt.cases.push(c);
   }
   // ---- final-component spelling: on-disk MiXeD.ExE (hard link to a valid node copy in an owned fresh dir) reached as
   // V-A P=MiXeD via PATH, where the PATHEXT-built name is MiXeD.EXE. The entry is read back from the directory. ----
@@ -504,6 +568,15 @@ try {
   const many = Array.from({ length: 300 }, (_, i) => path.join(ROOT, 'res', `a${i}`)); // stays under the 32767-char variable limit
   receipt.cases.push({ ...(await directOnly('RES/300-absent-PATH-entries', { argv: [name, 'safe'], dirs: [...many, localBin] })),
     note: 'synchronous stat search before the run/probe timers; UNC/slow-share latency unexplored' });
+  // ---- cmd expansion of the owned parent pair (record-only; separates H1 all-parents / H2 8.3-aliased only / H3 PATH search).
+  // Written after every fakesp row ran, into the owned spbin; names cannot collide with fakesp.*.
+  fs.writeFileSync(path.join(spBin, 'dg1167.cmd'), DIAG_ECHO, 'latin1');
+  fs.writeFileSync(path.join(spBin, 'dx1167.cmd'), DIAG_DIRX, 'latin1');
+  for (const [id, exeToken, dirs] of [[DIAG_IDS[0], 'dg1167', [spBin.toLowerCase()]], [DIAG_IDS[1], 'dg1167', [spBin.toUpperCase()]],
+    [DIAG_IDS[2], `${spBin.toLowerCase()}\\dg1167.cmd`, []], [DIAG_IDS[3], path.join(spBin, 'dx1167.cmd'), []]]) {
+    receipt.cases.push(await cmdDiagnostic(id, { exeToken, dirs }));
+    save();
+  }
 
   receipt.unexplored = ['T11 real CLI packages (claude/codex/gemini/agy/grok) shim forms and argv parsers',
     'UNC / \\\\?\\ / 8.3 short-name / mapped-drive shim dirs and slow or unreachable PATH shares (stat blocking before timers)',
@@ -511,7 +584,8 @@ try {
     'non-ASCII shim dirs/targets (target refused: prototype limitation, not an approved final support removal)',
     'TOCTOU between resolution and spawn; dp0\\P.exe as a directory (coder f)', 'NoDefaultCurrentDirectoryInExePath set',
     'descendant/tree cleanup (Job Object); PID reuse', 'V-V acceptance (refusal only)', 'exact CreateProcess length boundary (32700 recorded only)'];
-  receipt.matrix = receipt.cases.map(c => ({ id: c.id, kind: c.kind, engines: c.kind === 'differential' ? ['cmd-ref', 'direct'] : [c.kind === 'probeVersion' ? 'probeVersion' : 'direct'],
+  receipt.matrix = receipt.cases.map(c => ({ id: c.id, kind: c.kind, engines: c.kind === 'differential' ? ['cmd-ref', 'direct'] : c.kind === 'cmd-diagnostic' ? ['cmd-ref']
+    : [c.kind === 'probeVersion' ? 'probeVersion' : 'direct'],
     ran: !c.notRun && !(c.direct && c.direct.notRun) }));
 
   // ---- findings (no product verdict) ----
@@ -531,11 +605,16 @@ try {
     refusalViolations: cs.filter(c => c.expectRefuse && !c.notRun && (c.error !== 'CLI_LAUNCH_UNSUPPORTED' || c.spawnCount !== 0 || c.cleanup.starts !== 0)).map(c => c.id),
     shellSpawns: cs.flatMap(c => (c.spawns || c.direct?.spawns || []).filter(s => /(^|[\\/])(cmd|powershell|pwsh)(\.exe)?$/i.test(s.file) || s.verbatim).map(() => c.id)),
     spellingFixtureViolations: cs.filter(c => c.spellingFixture && c.direct && !c.direct.notRun && c.spellingFixture.ok !== true).map(c => c.id),
+    // Engine-independent fixture precondition (both roles): the lowercase row must carry an ok parent fixture.
+    parentFixtureViolations: ['spelling/lowercase'].filter(id => cs.filter(c => c.id === id).length !== 1 || cs.find(c => c.id === id).parentFixture?.ok !== true),
+    // Record-only rows: guarded for presence/uniqueness/exit/error/cap/cleanup; their CONTENT is never a verdict.
+    diagnosticGuardViolations: [...DIAG_IDS.filter(id => cs.filter(c => c.id === id).length !== 1).map(id => `count:${id}`),
+      ...cs.filter(c => c.kind === 'cmd-diagnostic' && c.guard?.ok !== true).map(c => `${c.id}:${(c.guard?.reasons ?? ['no_guard']).join(',')}`)],
   };
   const f = receipt.findings;
   const clean = f.oracleNpmEqual && !f.cleanupIncomplete.length && !f.sentinels.length && !f.differentialMismatch.length && !f.oracleMismatch.length &&
     !f.hostileNotReached.length && !f.argvMismatch.length && !f.refusalViolations.length && !f.shellSpawns.length && !f.probeVersionViolations.length && !f.decoyViolation.length && !f.resourceRefusalOrError.length &&
-    !f.spellingFixtureViolations.length;
+    !f.spellingFixtureViolations.length && !f.parentFixtureViolations.length && !f.diagnosticGuardViolations.length;
   // Harness sanity, identical in both roles: the cmd reference itself matched the oracle on every T3 V-A layout.
   receipt.referenceSane = cs.filter(c => /^T3\/(local|prefix)\//.test(c.id)).every(c => c.oracleMatch?.cmdRef === true);
   if (receipt.identity.role === 'negative-control') {
@@ -549,9 +628,11 @@ try {
       nativeExeControlOk: exe?.argsBytesEqual === true && exe?.hostileReached === true && exe?.sentinel === false,
       referenceSane: receipt.referenceSane, oracleNpmEqual: f.oracleNpmEqual,
       cleanupComplete: !f.cleanupIncomplete.length, noSentinels: !f.sentinels.length, noShellSpawns: !f.shellSpawns.length,
+      parentFixtureOk: !f.parentFixtureViolations.length, diagnosticRowsOk: !f.diagnosticGuardViolations.length,
     };
     const d = receipt.controlDiscrimination;
     receipt.status = d.shimCasesFailed && d.nativeExeControlOk && d.referenceSane && d.oracleNpmEqual && d.cleanupComplete && d.noSentinels && d.noShellSpawns
+      && d.parentFixtureOk && d.diagnosticRowsOk
       ? 'negative_control_discriminates' : 'negative_control_not_discriminating';
   } else {
     receipt.status = !candidate ? 'baseline_only' : clean && receipt.referenceSane ? 'diagnostic_clean_pending_review' : 'diagnostic_findings';
