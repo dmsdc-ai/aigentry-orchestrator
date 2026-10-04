@@ -44,7 +44,7 @@ const python = pythonExecutable();
 const ARTIFACTS = ['active.db', 'active.db-journal', 'active.db-wal', 'active.db-shm',
   'active.json.source', 'active.json.pre-sqlite.bak', 'active.json.barrier.tmp'] as const;
 // Every known registry operation, in --list-ops order. A new operation must join this table.
-const OPERATIONS = ['archive-sidecars', 'begin-delivery', 'check-dedup', 'get', 'list', 'migrate',
+const OPERATIONS = ['archive-sidecars', 'begin-delivery', 'check-dedup', 'get', 'init-store', 'list', 'migrate',
   'observe', 'prune', 'set-gate', 'set-lifecycle', 'set-transport-result', 'snapshot'] as const;
 // Diagnostic siblings a refusal may touch; neither is registry data or authority.
 const DIAGNOSTIC = new Set(['state/registry-health.log', 'state/active.json.lock']);
@@ -162,6 +162,23 @@ function refuses(f: Fixture, args: string[]) {
   assert.deepEqual(observed, { status: 9, stderr: '', completion_fact: null, result: 'registry_unavailable',
     detail_identifies_transition: true, fixture_changes: [], lock_ok: true }, `${args.join(' ')}: ${result.stdout}`);
 }
+// Native Windows refuses init-store as unsupported_platform before any artifact classification,
+// so the whole fixture (listing and bytes, lock included) is unchanged and no health log appears.
+function windowsInitRefused(f: Fixture, args: string[]) {
+  const before = tree(f.root);
+  const result = f.run(args);
+  const payload = payloadOf(result.stdout);
+  const observed = {
+    status: result.status,
+    stderr: result.stderr,
+    completion_fact: payload && 'completion_fact' in payload ? payload.completion_fact : 'missing',
+    result: payload?.result ?? 'missing',
+    fixture_changes: changes(before, tree(f.root)),
+    health_log: present(join(f.state, 'registry-health.log')),
+  };
+  assert.deepEqual(observed, { status: 9, stderr: '', completion_fact: null, result: 'unsupported_platform',
+    fixture_changes: [], health_log: false }, `${args.join(' ')}: ${result.stdout}`);
+}
 function ok(result: ReturnType<Fixture['run']>, status: number, name: string) {
   assert.equal(result.status, status, result.stdout + result.stderr);
   assert.equal(result.stderr, '');
@@ -182,6 +199,7 @@ function operationArgs(f: Fixture, op: typeof OPERATIONS[number]): string[] {
     case 'begin-delivery': return [op, '--sid', 'transition-probe', '--ref-hash', 'probe-hash', '--now', NOW];
     case 'check-dedup': return [op, '--sid', 'lock-fixture', '--ref-hash', 'fixture-hash'];
     case 'get': return [op, '--sid', 'lock-fixture'];
+    case 'init-store': return [op];
     case 'list': return [op, '--fields', 'assigned.sid,lifecycle.state'];
     case 'migrate': return [op, '--now', NOW];
     case 'observe': return [op, '--sid', 'lock-fixture', '--kind', 'transition_probe', '--now', NOW];
@@ -392,7 +410,8 @@ for (const op of OPERATIONS) {
         const f = fixture(st, op === 'migrate' ? 'legacy-array' : 'valid');
         if (op === 'archive-sidecars') sidecarDir(f);
         plant(f, artifact);
-        refuses(f, operationArgs(f, op));
+        if (windows && op === 'init-store') windowsInitRefused(f, operationArgs(f, op));
+        else refuses(f, operationArgs(f, op));
       });
     }
   });
