@@ -9,17 +9,21 @@
 //   @anthropic-ai/sandbox-runtime. MOCK BOUNDARY: that fake applies NO OS isolation. These tests
 //   prove env routing, sealing and refusal logic, never confinement.
 // The fake CLIs record booleans only; no token value, hash or length is ever printed.
+// Windows portability (fixture only, product untouched): libuv spawn(shell:false) resolves only
+// .com/.exe, os.homedir() reads USERPROFILE (not HOME), PATH uses path.delimiter, import() needs a
+// file URL, and the launchers are bash scripts run with Git Bash only (never PowerShell/cmd/WSL).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
-  chmodSync, cpSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync,
+  chmodSync, copyFileSync, cpSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync,
   rmSync, statSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { delimiter, dirname, join, relative, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..", "..", "..");
 const BOOT = join(REPO_ROOT, "bin", "boot-prepare.mjs");
@@ -27,33 +31,67 @@ const DIST_SESSION = join(REPO_ROOT, "dist", "src", "session");
 const OPT = "AIGENTRY_CLAUDE_OAUTH_TOKEN";
 const CC = "CLAUDE_CODE_OAUTH_TOKEN";
 const TASK = "652";
+const WIN = process.platform === "win32";
+const sq = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'";
+
+// The launchers are bash scripts. win32 uses Git for Windows bash only; System32 (WSL) bash is never
+// searched. Empty = not installed: runLauncher then fails loudly instead of assuming another shell.
+const BASH = !WIN ? "/bin/bash" : [
+  ...[process.env.ProgramW6432, process.env.ProgramFiles, process.env["ProgramFiles(x86)"]]
+    .filter((d): d is string => !!d)
+    .flatMap((d) => [join(d, "Git", "usr", "bin", "bash.exe"), join(d, "Git", "bin", "bash.exe")]),
+  ...(process.env.PATH ?? "").split(delimiter).filter((d) => /[\\/]git[\\/](usr[\\/])?bin$/i.test(d))
+    .map((d) => join(d, "bash.exe")),
+].find((p) => existsSync(p)) ?? "";
 
 type Rec = { hasOAuthEnv: boolean; oauthEqualsFake: boolean; argvContainsFake?: boolean };
 type Json = Record<string, unknown>;
 
 // Fake CLI: answers --version; otherwise records booleans against $FAKE_EXPECT_FILE.
-const cliShim = (): string => `#!${process.execPath}
-const fs = require("fs"), a = process.argv.slice(2), e = process.env;
+const cliBody = `const fs = require("fs"), a = process.argv.slice(2), e = process.env;
 if (a[0] === "--version") { console.log("9.9.9 (652 fake)"); process.exit(0); }
 if (!e.FAKE_RECORD) process.exit(0);
 let x = null; try { x = fs.readFileSync(e.FAKE_EXPECT_FILE, "utf8"); } catch {}
 fs.writeFileSync(e.FAKE_RECORD, JSON.stringify({ hasOAuthEnv: "${CC}" in e,
   oauthEqualsFake: x !== null && e.${CC} === x, argvContainsFake: x !== null && a.some(v => v.includes(x)) }));
 `;
+const cliShim = (): string => `#!${process.execPath}\n${cliBody}`;
+// win32: Git Bash execs the extensionless `#!/bin/sh` wrapper (exact name wins over .exe), which runs
+// the same recorder body with this node. The boot version probe (spawn shell:false) cannot see it, so
+// it is answered by a copy of this node.exe on a later PATH entry: it prints node's own version
+// (>= every adapter floor) and is never the worker command.
+let probeDir = "";
+function probeExeDir(): string {
+  if (probeDir) return probeDir;
+  const d = mkdtempSync(join(tmpdir(), "claude-oauth-652-probe-"));
+  roots.push(d);
+  copyFileSync(process.execPath, join(d, "claude.exe"));
+  for (const c of ["codex", "gemini"]) {
+    try { linkSync(join(d, "claude.exe"), join(d, `${c}.exe`)); } catch { copyFileSync(process.execPath, join(d, `${c}.exe`)); }
+  }
+  return (probeDir = d);
+}
 
 // prepareWorkerSandbox under interception. argv[1] = JSON spec; prints one JSON line.
 const PREPARE_CHILD = `
 import { createRequire, syncBuiltinESMExports } from "node:module";
 const require = createRequire(import.meta.url);
-const cp = require("node:child_process"), fs = require("node:fs"), path = require("node:path");
+const cp = require("node:child_process"), fs = require("node:fs"), path = require("node:path"), url = require("node:url");
 const s = JSON.parse(process.argv[1]);
 const counters = { security: 0, otherExec: 0, hostClaudeRead: 0, hostCodexRead: 0 };
 cp.execFileSync = (f) => { if (f === "/usr/bin/security") { counters.security++; return s.fakeSecurity; }
   counters.otherExec++; throw new Error("FAKE_EXEC_BLOCKED"); };
 const rd = fs.readFileSync;
+// Path-form-insensitive match (string/URL/Buffer, resolved; case-folded on win32) so a host read is never undercounted.
+const key = (p) => { try {
+  const v = typeof p === "string" ? p : p instanceof URL ? url.fileURLToPath(p) : Buffer.isBuffer(p) ? p.toString() : null;
+  if (v === null) return null;
+  const r = path.resolve(v); return process.platform === "win32" ? r.toLowerCase() : r; } catch { return null; } };
+const hostClaude = key(path.join(s.host, ".claude", ".credentials.json")), hostCodex = key(path.join(s.host, ".codex", "auth.json"));
 fs.readFileSync = function (p, ...r) {
-  if (p === path.join(s.host, ".claude", ".credentials.json")) counters.hostClaudeRead++;
-  if (p === path.join(s.host, ".codex", "auth.json")) counters.hostCodexRead++;
+  const k = key(p);
+  if (k === hostClaude) counters.hostClaudeRead++;
+  if (k === hostCodex) counters.hostCodexRead++;
   return rd.call(this, p, ...r);
 };
 syncBuiltinESMExports();
@@ -70,7 +108,7 @@ process.stdout.write(JSON.stringify({ result, error, counters }) + "\\n");
 // preflight with a recorder child, runs the worker command unconfined.
 const FAKE_SRT = `import fs from "node:fs";
 const E = process.env, LOG = E.FAKE_SRT_LOG, PRE = E.FAKE_PREFLIGHT_RECORD, WREC = E.FAKE_WORKER_RECORD, EXP = E.FAKE_EXPECT_FILE;
-const PF_EXIT = E.FAKE_PREFLIGHT_EXIT || "0";
+const PF_EXIT = E.FAKE_PREFLIGHT_EXIT || "0", BASH = E.FAKE_BASH || "/bin/bash";
 const log = (o) => { if (LOG) fs.appendFileSync(LOG, JSON.stringify(o) + "\\n"); };
 const has = () => "${CC}" in process.env;
 const REC = "const fs=require(\\"fs\\");let x=null;try{x=fs.readFileSync(process.env.FAKE_EXPECT_FILE,\\"utf8\\")}catch{}" +
@@ -84,7 +122,7 @@ export const SandboxManager = {
     const pre = String(o && o.commandId).endsWith(":preflight");
     log({ ev: "wrap", pre, env: has(), cmd });
     return pre ? { argv: [process.execPath, "-e", REC, PRE], env: { FAKE_EXPECT_FILE: EXP, FAKE_PREFLIGHT_EXIT: PF_EXIT } }
-      : { argv: ["/bin/bash", "-c", cmd], env: { FAKE_RECORD: WREC, FAKE_EXPECT_FILE: EXP } };
+      : { argv: [BASH, "-c", cmd], env: { FAKE_RECORD: WREC, FAKE_EXPECT_FILE: EXP } };
   },
   reset: async () => { log({ ev: "reset", env: has() }); },
 };
@@ -113,7 +151,12 @@ function world(): World {
     writeFileSync(p, d, m === undefined ? undefined : { mode: m });
   };
   const host = join(root, "host"), aig = join(root, "aig"), bin = join(root, "bin");
-  for (const c of ["claude", "codex", "gemini"]) w(join(bin, c), cliShim(), 0o755);
+  for (const c of ["claude", "codex", "gemini"]) {
+    if (!WIN) { w(join(bin, c), cliShim(), 0o755); continue; }
+    const js = join(bin, `${c}.cjs`), unix = (p: string): string => sq(p.replace(/\\/g, "/"));
+    w(js, cliBody);
+    w(join(bin, c), `#!/bin/sh\nexec ${unix(process.execPath)} ${unix(js)} "$@"\n`, 0o755);
+  }
   w(join(bin, "apply_patch"), "#!/bin/sh\nexit 0\n", 0o755);
   w(join(aig, "instructions", "common.md"), "# common\n");
   w(join(aig, "instructions", "roles", "tester.md"), "# tester\n");
@@ -131,9 +174,16 @@ function world(): World {
     sessions: join(aig, "sessions"), expect, hostCreds, hostRefresh, token };
 }
 
-// Explicit env only: ambient auth (ANTHROPIC_*, CLAUDE_*, the developer HOME) never reaches a child.
+// Explicit env only: ambient auth (ANTHROPIC_*, CLAUDE_*, the developer HOME/USERPROFILE/APPDATA) never
+// reaches a child. win32 adds only SystemRoot (Windows runtime) and TEMP/TMP (os.tmpdir) beyond fakes.
+const sysEnv = (W: World): Record<string, string> => ({
+  PATH: WIN ? [W.bin, probeExeDir()].join(delimiter) : `${W.bin}:/usr/bin:/bin`,
+  HOME: W.host, USERPROFILE: W.host, APPDATA: join(W.host, "AppData", "Roaming"),
+  ...(WIN ? { LOCALAPPDATA: join(W.host, "AppData", "Local"), TEMP: join(W.root, "tmp"), TMP: join(W.root, "tmp"),
+    ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) } : {}),
+});
 const env = (W: World, extra: Record<string, string> = {}): Record<string, string> => ({
-  PATH: `${W.bin}:/usr/bin:/bin`, HOME: W.host, AIGENTRY_HOME: W.aig, TMPDIR: join(W.root, "tmp"),
+  ...sysEnv(W), AIGENTRY_HOME: W.aig, TMPDIR: join(W.root, "tmp"),
   AIGENTRY_GEMINI_BINARY: "gemini", LANG: "en_US.UTF-8", ...extra,
 });
 
@@ -156,7 +206,7 @@ function prepare(W: World, sid: string, extra: Record<string, string> = {}, cli 
   writeFileSync(scopeFile, JSON.stringify({ version: 1, task: TASK, sid, read: [W.project], write: [W.project],
     domains: ["api.anthropic.com:443"] }));
   mkdirSync(stagingRoot, { recursive: true });
-  const spec = { module: join(DIST_SESSION, "worker-sandbox.js"), scopeFile, task: TASK, sid, cli,
+  const spec = { module: pathToFileURL(join(DIST_SESSION, "worker-sandbox.js")).href, scopeFile, task: TASK, sid, cli,
     roleCwd: String(b.json?.spawn_cwd), argv: b.json?.argv, stagingRoot, targetCwd: W.project, hooksDir: W.hooks,
     host: W.host, fakeSecurity: JSON.stringify({ claudeAiOauth: { refreshToken: "FAKE-keychain" } }) };
   const r = spawnSync(process.execPath, ["--input-type=module", "-e", PREPARE_CHILD, JSON.stringify(spec)],
@@ -189,7 +239,7 @@ let seq = 0;
 function runRunner(W: World, manifest: string, hash: string, extra: string[] = [], extraEnv: Record<string, string> = {}): Run {
   const k = `run${seq++}`, f = (s: string): string => join(W.root, `${k}-${s}`);
   const r = spawnSync(process.execPath, [runnerCopy(), manifest, hash, ...extra], { encoding: "utf8", timeout: 30000,
-    env: { PATH: `${W.bin}:/usr/bin:/bin`, HOME: W.host, FAKE_SRT_LOG: f("srt.log"), FAKE_EXPECT_FILE: W.expect,
+    env: { ...sysEnv(W), FAKE_BASH: BASH, FAKE_SRT_LOG: f("srt.log"), FAKE_EXPECT_FILE: W.expect,
       FAKE_PREFLIGHT_RECORD: f("pre.json"), FAKE_WORKER_RECORD: f("worker.json"), ...extraEnv } });
   const srt = existsSync(f("srt.log")) ? read(f("srt.log")).trim().split("\n").map((l) => parse(l) ?? {}) : [];
   return { status: r.status, stderr: r.stderr, worker: readJson(f("worker.json")) as Rec | null,
@@ -199,8 +249,9 @@ function runRunner(W: World, manifest: string, hash: string, extra: string[] = [
 function runLauncher(W: World, launcher: string, inherit: Record<string, string> = {}, args: string[] = []):
   { status: number | null; stderr: string; rec: Rec | null } {
   const recFile = join(W.root, `rec${seq++}.json`);
-  const r = spawnSync("/bin/bash", [...args, launcher], { encoding: "utf8", timeout: 30000,
-    env: { PATH: `${W.bin}:/usr/bin:/bin`, HOME: W.host, FAKE_RECORD: recFile, FAKE_EXPECT_FILE: W.expect, ...inherit } });
+  assert.ok(BASH, "Git for Windows bash.exe not found: the launcher is a bash script; no PowerShell/cmd equivalent is assumed");
+  const r = spawnSync(BASH, [...args, launcher], { encoding: "utf8", timeout: 30000,
+    env: { ...sysEnv(W), FAKE_RECORD: recFile, FAKE_EXPECT_FILE: W.expect, ...inherit } });
   return { status: r.status, stderr: r.stderr, rec: readJson(recFile) as Rec | null };
 }
 
@@ -218,7 +269,7 @@ function leaks(W: World, streams: string[]): string[] {
   const needles = [W.token, sha(W.token), Buffer.from(W.token).toString("base64")];
   const hits: string[] = [];
   for (const f of files(W.root)) {
-    if (f === W.expect || /claude-oauth[^/]*\/token$/.test(f)) continue;
+    if (f === W.expect || /claude-oauth[^\\/]*[\\/]token$/.test(f)) continue;
     const body = read(f);
     if (needles.some((n) => body.includes(n))) hits.push(relative(W.root, f));
   }
@@ -233,7 +284,7 @@ const legacyHandoff = (launcher: string): string => {
 };
 const credsIn = (m: Json): boolean => existsSync(join(String((m.env as Json).CLAUDE_CONFIG_DIR), ".credentials.json"));
 /** Handoff artefacts under the world, matched on the path RELATIVE to the world (temp prefix excluded). */
-const handoffs = (W: World): string[] => files(W.sessions).filter((f) => /(^|\/)claude-oauth/.test(relative(W.root, f)));
+const handoffs = (W: World): string[] => files(W.sessions).filter((f) => /(^|[\\/])claude-oauth/.test(relative(W.root, f)));
 
 test("unset: legacy descriptor/launcher/child unchanged; inherited CLAUDE_CODE_OAUTH_TOKEN passes through untouched", () => {
   const W = world(), b = boot(W, "u1");
