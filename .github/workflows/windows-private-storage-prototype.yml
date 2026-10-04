@@ -75,7 +75,7 @@ jobs:
           # independent harness (tester-owned)
           check 6b24c09b9af54424bfd5347402c3af7a691688c2d4e24d4e73373d0e643ef1f0 prototypes/windows-private-storage/tests/acl.test.mjs
           check e08a0373bf33f0f10052dd76977055287e8c88b573219a338e64f2b71fc99dd1 prototypes/windows-private-storage/tests/wrapper.test.mjs
-          check 002c2f8f4faeb0439737f0e73c926c2be266078eb28edbfed1436ff841c68de2 prototypes/windows-private-storage/tests/setup-fixtures.ps1
+          check bb11958d43fa28075addf3386b746431c8aac5766ac65d7b9790e8dce6015231 prototypes/windows-private-storage/tests/setup-fixtures.ps1
           check 944dfdd13f176eed9df0340db45a81a7d83e68308667ee7bc4980b10956fb751 prototypes/windows-private-storage/tests/run-as-user.ps1
           check b0de2104769f04809ad4df8cee0b802556bc48092000ef53528f383f1f0c09ee prototypes/windows-private-storage/tests/run-validation.ps1
           # baseline that must stay byte-identical (release 148d3b67 staged inputs)
@@ -223,7 +223,7 @@ jobs:
           # independent harness (tester-owned)
           check 6b24c09b9af54424bfd5347402c3af7a691688c2d4e24d4e73373d0e643ef1f0 prototypes/windows-private-storage/tests/acl.test.mjs
           check e08a0373bf33f0f10052dd76977055287e8c88b573219a338e64f2b71fc99dd1 prototypes/windows-private-storage/tests/wrapper.test.mjs
-          check 002c2f8f4faeb0439737f0e73c926c2be266078eb28edbfed1436ff841c68de2 prototypes/windows-private-storage/tests/setup-fixtures.ps1
+          check bb11958d43fa28075addf3386b746431c8aac5766ac65d7b9790e8dce6015231 prototypes/windows-private-storage/tests/setup-fixtures.ps1
           check 944dfdd13f176eed9df0340db45a81a7d83e68308667ee7bc4980b10956fb751 prototypes/windows-private-storage/tests/run-as-user.ps1
           check b0de2104769f04809ad4df8cee0b802556bc48092000ef53528f383f1f0c09ee prototypes/windows-private-storage/tests/run-validation.ps1
           # baseline that must stay byte-identical (release 148d3b67 staged inputs)
@@ -288,6 +288,20 @@ jobs:
           $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLowerInvariant()
           if ($h -cne 'e0f54ec4e6a0a371c22456b6772fdc8db8cda570f08d54db343598b0058d0ff1') { Write-Output "::error::bootstrap-trust.test.ps1 sha256 $h does not match pin"; exit 1 }
           & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $f -WorkflowPath (Join-Path $env:GITHUB_WORKSPACE '.github\workflows\windows-private-storage-prototype.yml')
+          exit $LASTEXITCODE
+
+      # Tester-owned self-test of Get-PspLiveSidProcesses (pinned setup-fixtures.ps1 extent) through both real caller forms,
+      # with fake Get-CimInstance/Invoke-CimMethod functions only (no host CIM/process/account/ACL state); the frozen pre-fix
+      # extent is a negative control. Runs before any fake account exists; a pin mismatch or any failed case fails the job.
+      - name: Live-process result self-test (fake CIM only)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PSModulePath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
+          $f = Join-Path $env:GITHUB_WORKSPACE 'prototypes\windows-private-storage\tests\live-process-results.selftest.ps1'
+          $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLowerInvariant()
+          if ($h -cne 'c4b48a71d8487f754450b0b5c0f3de1513488f3ee9341a6e464139c6d1cecc9d') { Write-Output "::error::live-process-results.selftest.ps1 sha256 $h does not match pin"; exit 1 }
+          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $f
           exit $LASTEXITCODE
 
       # Elevated orchestrator; the helper itself runs only as fake standard user A. Exit is unmasked.

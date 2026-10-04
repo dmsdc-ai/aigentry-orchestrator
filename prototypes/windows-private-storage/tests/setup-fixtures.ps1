@@ -681,14 +681,25 @@ function Remove-PspVhds { param($State, [string]$ScratchDir, [string]$Root)
 }
 
 # Live processes owned by the given SIDs (fake users): any hit is a concurrent writer and refuses cleanup/export.
+# Emits one flat 'PID:Name:SID' string per hit and nothing when there is none (callers wrap it in @()). A process
+# whose owner cannot be established (enumeration error, owner query error, nonzero/missing/non-integer ReturnValue,
+# missing or invalid SID) throws a fixed refusal: an unknown owner is never reported as "no live writer". A successful
+# enumeration with no process is known-empty (0 hits). SID validity ignores case; matching stays exact-case.
 function Get-PspLiveSidProcesses { param([string[]]$Sids = @())
+  if (@($Sids).Count -eq 0) { return }
   $hits = @()
-  if (@($Sids).Count -eq 0) { return ,$hits }
-  foreach ($p in @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)) {
-    $o = $null; try { $o = Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid -ErrorAction Stop } catch { $o = $null }
-    if ($o -and ($o.ReturnValue -eq 0) -and ($Sids -ccontains $o.Sid)) { $hits += ,("$($p.ProcessId):$($p.Name):$($o.Sid)") }
+  $procs = $null; try { $procs = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop) } catch { $procs = $null }
+  if ($null -eq $procs) { throw 'refusing: process enumeration failed (live writer state unknown)' }
+  foreach ($p in $procs) {
+    $o = $null; try { $o = @(Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid -ErrorAction Stop) } catch { $o = $null }
+    if (($null -eq $p) -or ($null -eq $o) -or ($o.Count -ne 1) -or ($null -eq $o[0])) { throw 'refusing: process owner query failed (live writer state unknown)' }
+    $rv = $null; try { $rv = $o[0].ReturnValue } catch { $rv = $null }
+    if (($null -eq $rv) -or (@('System.Byte', 'System.SByte', 'System.Int16', 'System.UInt16', 'System.Int32', 'System.UInt32', 'System.Int64', 'System.UInt64') -cnotcontains $rv.GetType().FullName) -or ($rv -ne 0)) { throw 'refusing: process owner query returned a nonzero or missing ReturnValue (live writer state unknown)' }
+    $sid = $null; try { $sid = $o[0].Sid } catch { $sid = $null }
+    if (($sid -isnot [string]) -or ($sid -inotmatch '^S-1-[0-9]+(-[0-9]+)+\z')) { throw 'refusing: process owner SID missing or invalid (live writer state unknown)' }
+    if ($Sids -ccontains $sid) { $hits += [string]("$($p.ProcessId):$($p.Name):$sid") }
   }
-  return ,$hits
+  return $hits
 }
 
 # Deletes the owned fixture root without changing any owner or ACL and without following links (no icacls,
