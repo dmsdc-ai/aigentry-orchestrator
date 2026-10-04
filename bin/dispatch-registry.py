@@ -32,11 +32,14 @@ Exit codes: 0 ok · 4 usage · 7 delivery-unknown/retry-held · 8 deduplicated �
 
 from __future__ import annotations
 
+import base64
 import datetime
 import errno
 import hashlib
 import json
+import math
 import os
+import re
 import shutil
 import sys
 import time
@@ -318,12 +321,14 @@ def validate(doc: object) -> dict:
     return doc
 
 
-def load(required: bool = True) -> dict:
+def load(required: bool = True, limit: int | None = None) -> dict:
     path = registry_path()
     if not os.path.exists(path):
         if required:
             return {"schema_version": SCHEMA_VERSION, "generation": 0, "dispatches": []}
         raise RegistryError("registry_unavailable", f"no registry at {path}")
+    if limit is not None:
+        return validate(load_bounded(path, limit))
     try:
         with open(path, encoding="utf-8") as fh:
             raw = json.load(fh)
@@ -332,6 +337,22 @@ def load(required: bool = True) -> dict:
     except OSError as exc:
         raise RegistryError("registry_unavailable", f"cannot read registry: {exc}")
     return validate(raw)
+
+
+def load_bounded(path: str, limit: int) -> object:
+    """list --jsonl only: read at most limit+1 bytes from ONE opened file, then
+    parse. The default load() path above is unchanged."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(limit + 1)
+    except OSError as exc:
+        raise RegistryError("registry_unavailable", f"cannot read registry: {exc}")
+    if len(data) > limit:
+        raise RegistryError("registry_too_large", f"registry exceeds {limit} bytes")
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (ValueError, RecursionError) as exc:
+        raise RegistryError("registry_corrupt", f"unparseable registry: {exc}")
 
 
 def require_durable_writes() -> None:
@@ -720,6 +741,8 @@ def render_cell(value) -> str:
 
 
 def op_list(args: dict) -> int:
+    if args.get("jsonl"):
+        return op_list_jsonl(args)
     doc = load()
     fields = (args.get("fields") or "assigned.sid").split(",")
     due_before = args.get("due-before")
@@ -735,6 +758,153 @@ def op_list(args: dict) -> int:
         if due_before and str(rec.get("expected_report_by", "")) >= due_before:
             continue
         print("\t".join(render_cell(pointer(rec, f)) for f in fields))
+    return OK
+
+
+# --- list --jsonl: bounded, paged, whitelisted observation rows ---------------
+# Read-only. Rows are registry observations, never completion/ACK/authority.
+JSONL_READ_LIMIT = 32 * 1024 * 1024
+JSONL_OUTPUT_LIMIT = 1024 * 1024
+JSONL_MAX_INT = 9007199254740991
+JSONL_MAX_LIMIT = 100
+JSONL_MAX_STRING = 256
+JSONL_MAX_ID_BYTES = 256
+JSONL_MAX_AT_BYTES = 128
+JSONL_MAX_CURSOR = 2048
+JSONL_FIELDS = ("dispatch_id", "assigned.sid", "track", "role", "lifecycle.state", "lifecycle.at",
+                "gate.state", "outcome.state", "transport.result", "transport.at", "dispatched_at",
+                "expected_report_by", "last_seen_at", "re_dispatch_count", "keep_alive",
+                "last_observation.kind", "last_observation.at", "dedup.ref_hash")
+JSONL_FLAGS = {"jsonl", "limit", "after", "since-generation"}
+JSONL_EXIT = {"usage": USAGE, "unknown_operation": USAGE, "invalid_argument": USAGE,
+              "stale_cursor": 3, "identity_too_large": 3, "output_too_large": 3}
+
+
+def jsonl_requested(argv: list[str]) -> bool:
+    """True only when parse() would reach a literal `--jsonl` flag of `list`.
+    Every other argv keeps the legacy flag set and legacy error output."""
+    if not argv or argv[0] != "list":
+        return False
+    rest, i = argv[1:], 0
+    while i < len(rest):
+        name = rest[i][2:] if rest[i].startswith("--") else None
+        if name not in FLAGS["list"]:
+            return False
+        if name == "jsonl":
+            return True
+        i += 1 if name in BOOLEAN_FLAGS else 2
+    return False
+
+
+def jsonl_number(text: str | None, pattern: str) -> int:
+    if text is None or not re.fullmatch(pattern, text) or int(text) > JSONL_MAX_INT:
+        raise RegistryError("invalid_argument", "list --jsonl: invalid number")
+    return int(text)
+
+
+def jsonl_key(rec: dict) -> tuple[str, str]:
+    at = rec.get("dispatched_at")
+    return (at if isinstance(at, str) else "", rec["dispatch_id"])
+
+
+def cursor_encode(generation: int, key: tuple[str, str], live: bool) -> str:
+    text = json.dumps([generation, key[0], key[1], live], ensure_ascii=True, separators=(",", ":"))
+    return base64.urlsafe_b64encode(text.encode("ascii")).decode("ascii").rstrip("=")
+
+
+def cursor_decode(cursor: str) -> list:
+    """Opaque canonical base64url of [generation, dispatched_at, dispatch_id, live].
+    Exact types, and re-encoding must reproduce the input byte for byte."""
+    bad = RegistryError("invalid_argument", "list --jsonl: invalid cursor")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,%d}" % JSONL_MAX_CURSOR, cursor):
+        raise bad
+    try:
+        value = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)).decode("ascii"))
+    except (ValueError, RecursionError):
+        raise bad
+    if not (isinstance(value, list) and len(value) == 4 and type(value[0]) is int
+            and 0 <= value[0] <= JSONL_MAX_INT and isinstance(value[1], str)
+            and isinstance(value[2], str) and value[2] and type(value[3]) is bool):
+        raise bad
+    if cursor_encode(value[0], (value[1], value[2]), value[3]) != cursor:
+        raise bad
+    return value
+
+
+def jsonl_value(value) -> tuple[object, bool]:
+    """(projected scalar, oversize). Non-scalars and unsafe numbers are null."""
+    if value is None or isinstance(value, bool):
+        return value, False
+    if isinstance(value, int):
+        return (value if abs(value) <= JSONL_MAX_INT else None), False
+    if isinstance(value, float):
+        return (value if math.isfinite(value) else None), False
+    if isinstance(value, str):
+        return (None, True) if len(value) > JSONL_MAX_STRING else (value, False)
+    return None, False
+
+
+def op_list_jsonl(args: dict) -> int:
+    if any(name in args for name in ("fields", "not-retired", "keep-alive", "due-before")):
+        raise RegistryError("invalid_argument", "list --jsonl: unsupported flag")
+    if "after" in args and "since-generation" in args:
+        raise RegistryError("invalid_argument", "list --jsonl: --after excludes --since-generation")
+    limit = jsonl_number(args.get("limit", "50"), r"[1-9][0-9]{0,2}")
+    if limit > JSONL_MAX_LIMIT:
+        raise RegistryError("invalid_argument", "list --jsonl: --limit above 100")
+    since = (jsonl_number(args["since-generation"], r"0|[1-9][0-9]{0,15}")
+             if "since-generation" in args else None)
+    cursor = cursor_decode(args["after"]) if "after" in args else None
+    live = bool(args.get("live"))
+    doc = load(limit=JSONL_READ_LIMIT)
+    generation = doc["generation"]
+    if type(generation) is not int or not 0 <= generation <= JSONL_MAX_INT:
+        raise RegistryError("registry_corrupt", "generation out of range")
+    if cursor is not None and cursor[0] != generation:
+        raise RegistryError("stale_cursor", "registry generation changed")
+    if cursor is not None and cursor[3] != live:
+        raise RegistryError("invalid_argument", "list --jsonl: cursor filter mismatch")
+    matching = []
+    for rec in doc["dispatches"]:
+        gate = rec.get("gate")
+        if gate is not None and not isinstance(gate, dict):
+            raise RegistryError("registry_corrupt", "gate axis is not an object")
+        gated = gate is not None and gate.get("state") is not None
+        if live and (rec["lifecycle"]["state"] in RETIRED_LIFECYCLES or gated):
+            continue
+        matching.append(rec)
+    matching.sort(key=jsonl_key)
+    header = {"v": 1, "generation": generation, "unchanged": since == generation,
+              "matching": len(matching), "oversize": 0, "more": False, "next_after": None, "rows": 0}
+    lines = []
+    if since != generation:
+        if cursor is not None:
+            matching = [rec for rec in matching if jsonl_key(rec) > (cursor[1], cursor[2])]
+        page = matching[:limit]
+        for rec in page:
+            at, did = jsonl_key(rec)
+            if (len(did.encode("utf-8", "surrogatepass")) > JSONL_MAX_ID_BYTES
+                    or len(at.encode("utf-8", "surrogatepass")) > JSONL_MAX_AT_BYTES):
+                raise RegistryError("identity_too_large", "dispatch identity exceeds bound")
+            row = {}
+            for field in JSONL_FIELDS:
+                row[field], oversize = jsonl_value(pointer(rec, field))
+                header["oversize"] += oversize
+            lines.append(json.dumps(row, ensure_ascii=True, separators=(",", ":"), allow_nan=False))
+        if len(matching) > limit:
+            next_after = cursor_encode(generation, jsonl_key(page[-1]), live)
+            if len(next_after) > JSONL_MAX_CURSOR:
+                raise RegistryError("identity_too_large", "cursor exceeds bound")
+            header["more"], header["next_after"] = True, next_after
+        header["rows"] = len(lines)
+    out = "".join(line + "\n" for line in
+                  [json.dumps(header, ensure_ascii=True, separators=(",", ":"))] + lines)
+    if len(out) > JSONL_OUTPUT_LIMIT:
+        raise RegistryError("output_too_large", "projected output exceeds bound")
+    # Bytes, not text: Windows text mode would turn every "\n" into "\r\n".
+    sys.stdout.flush()
+    sys.stdout.buffer.write(out.encode("ascii"))
+    sys.stdout.buffer.flush()
     return OK
 
 
@@ -890,7 +1060,8 @@ FLAGS = {
                        "branch", "worktree", "keep-alive", "now", "retry-unknown"},
     "check-dedup": {"sid", "ref-hash"},
     "get": {"sid", "pointer"},
-    "list": {"fields", "live", "not-retired", "keep-alive", "due-before"},
+    "list": {"fields", "live", "not-retired", "keep-alive", "due-before",
+             "jsonl", "limit", "after", "since-generation"},
     "migrate": {"now"},
     # `all` is offered ONLY here and on set-lifecycle: these two describe the
     # session, and a session has as many records as it had dispatches (#853).
@@ -903,7 +1074,7 @@ FLAGS = {
     "snapshot": set(),
 }
 BOOLEAN_FLAGS = {"keep-alive", "live", "not-retired", "clear", "bump-re-dispatch-count",
-                 "all"}
+                 "all", "jsonl"}
 REPEATED_FLAGS = {"field"}
 
 
@@ -922,6 +1093,8 @@ def parse(argv: list[str]) -> tuple[str, dict]:
     if op not in OPS:
         raise RegistryError("unknown_operation", f"unknown operation {op!r}")
     allowed = FLAGS[op]
+    if op == "list" and not jsonl_requested(argv):
+        allowed = allowed - JSONL_FLAGS
     args: dict = {}
     rest = argv[1:]
     while rest:
@@ -948,6 +1121,7 @@ def parse(argv: list[str]) -> tuple[str, dict]:
 
 
 def main(argv: list[str]) -> int:
+    jsonl = jsonl_requested(argv)
     try:
         op, args = parse(argv)
         refuse_transition_artifacts()
@@ -955,9 +1129,19 @@ def main(argv: list[str]) -> int:
     except RegistryError as exc:
         if exc.result in ("registry_corrupt", "registry_unavailable", "registry_write_failed"):
             health(exc.result, exc.detail)
+        if jsonl:
+            # Fixed, nonsensitive: no detail, path, id or registry bytes; stdout empty.
+            sys.stderr.write(f"dispatch-registry: list --jsonl: {exc.result}\n")
+            return JSONL_EXIT.get(exc.result, REGISTRY_ERROR)
         emit({"result": exc.result, "detail": exc.detail, "completion_fact": None})
         if exc.result in ("usage", "unknown_operation", "invalid_argument"):
             return USAGE
+        return REGISTRY_ERROR
+    except Exception:
+        if not jsonl:
+            raise
+        # New mode never prints a traceback that could quote registry values.
+        sys.stderr.write("dispatch-registry: list --jsonl: registry_error\n")
         return REGISTRY_ERROR
 
 

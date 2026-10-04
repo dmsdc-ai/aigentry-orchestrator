@@ -18,6 +18,9 @@ export const USAGE = `# dispatch-tracker.sh — Orchestrator-side dispatch healt
 # Commands:
 #   dispatch-tracker.sh check                    — one-shot scan; alerts to stdout + log
 #   dispatch-tracker.sh status [<sid>]
+#   dispatch-tracker.sh status --json [--live] [--limit N] [--after CURSOR]
+#       [--since-generation G] — bounded, paged JSON registry observations
+#       (#1172); never completion/ACK/authority. Exit 3 bound/stale, 4 usage, 9 registry.
 #   dispatch-tracker.sh prune
 #   dispatch-tracker.sh report-sweep            — durable pull side of worker
 #       reporting (#904): copies every ref newly appearing under

@@ -791,6 +791,141 @@ function cmdStatus(sid: string): void {
   if (listed.status !== 0) process.exit(listed.status);
 }
 
+// ── status --json (#1172): opt-in, bounded, paged registry observations ─────
+// Rows are observations only: never completion, ACK, delivery receipt or
+// cleanup/redispatch authority. Child stderr is never forwarded; only a reason
+// from the fixed set below is named. Legacy `status [<sid>]` is untouched.
+const STATUS_JSON_CAP = 1024 * 1024;
+// Hard deadline for the registry child; on expiry Node SIGKILLs its own direct
+// child (the registry is a single Python process and spawns no descendants).
+const STATUS_JSON_TIMEOUT_MS = 5000;
+const STATUS_JSON_READ_BOUND = 32 * 1024 * 1024; // the registry's JSONL_READ_LIMIT
+const STATUS_JSON_CURSOR = /^[A-Za-z0-9_-]{1,2048}$/;
+const STATUS_JSON_HEADER = ["v", "generation", "unchanged", "matching", "oversize", "more", "next_after", "rows"];
+const STATUS_JSON_FIELDS = [
+  "dispatch_id", "assigned.sid", "track", "role", "lifecycle.state", "lifecycle.at", "gate.state",
+  "outcome.state", "transport.result", "transport.at", "dispatched_at", "expected_report_by",
+  "last_seen_at", "re_dispatch_count", "keep_alive", "last_observation.kind", "last_observation.at",
+  "dedup.ref_hash",
+];
+const STATUS_JSON_REASONS = new Set([
+  "invalid_argument", "stale_cursor", "identity_too_large", "output_too_large",
+  "registry_corrupt", "registry_unavailable", "registry_too_large", "registry_error",
+]);
+
+type StatusScalar = string | number | boolean | null;
+
+function statusJsonFail(code: number, reason: string): number {
+  process.stderr.write(`dispatch-tracker: status --json: ${reason}\n`);
+  return code;
+}
+
+function isCount(v: unknown): v is number {
+  return Number.isSafeInteger(v) && (v as number) >= 0;
+}
+
+function parseObjectLine(line: string): Record<string, unknown> | null {
+  try {
+    const v: unknown = JSON.parse(line);
+    return v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function hasExactKeys(obj: Record<string, unknown>, keys: string[]): boolean {
+  const own = Object.keys(obj);
+  return own.length === keys.length && keys.every((k) => Object.prototype.hasOwnProperty.call(obj, k));
+}
+
+/** Validates the whole `list --jsonl` stdout (header, rows, schema, no trailing bytes); null = malformed. */
+function parseStatusJsonl(out: Buffer, limit: number, since: number | null): Record<string, unknown> | null {
+  for (const byte of out) if (byte !== 0x0a && (byte < 0x20 || byte > 0x7e)) return null;
+  const text = out.toString("ascii");
+  if (!text.endsWith("\n")) return null;
+  const lines = text.slice(0, -1).split("\n");
+  const h = parseObjectLine(lines[0]!);
+  if (!h || !hasExactKeys(h, STATUS_JSON_HEADER)) return null;
+  const { generation, unchanged, matching, oversize, more, next_after: nextAfter, rows: count } = h;
+  if (h.v !== 1 || !isCount(generation) || typeof unchanged !== "boolean" || !isCount(matching)) return null;
+  if (!isCount(oversize) || typeof more !== "boolean" || !isCount(count)) return null;
+  if (nextAfter !== null && !(typeof nextAfter === "string" && STATUS_JSON_CURSOR.test(nextAfter))) return null;
+  if (count > limit || count > matching || lines.length !== count + 1 || more !== (nextAfter !== null)) return null;
+  if (unchanged !== (since === generation) || (unchanged && (count !== 0 || more || oversize !== 0))) return null;
+  const rows: Record<string, StatusScalar>[] = [];
+  for (const line of lines.slice(1)) {
+    const r = parseObjectLine(line);
+    if (!r || !hasExactKeys(r, STATUS_JSON_FIELDS)) return null;
+    const row: Record<string, StatusScalar> = {};
+    for (const field of STATUS_JSON_FIELDS) {
+      const v = r[field];
+      if (typeof v === "string" ? [...v].length > 256 : !(v === null || typeof v === "boolean" || Number.isFinite(v))) return null;
+      row[field] = v as StatusScalar;
+    }
+    if (typeof row["dispatch_id"] !== "string" || row["dispatch_id"] === "") return null;
+    rows.push(row);
+  }
+  return {
+    v: 1, generation, unchanged, rows, more, next_after: nextAfter, matching, oversize,
+    read_bound_bytes: STATUS_JSON_READ_BOUND, scan: "full", evidence: "registry-observation", completion_fact: null,
+  };
+}
+
+/** `status --json [--live] [--limit N] [--after CURSOR] [--since-generation G]`; returns the exit code. */
+function cmdStatusJson(flags: string[]): number {
+  const seen = new Set<string>();
+  let live = false;
+  let limit = "50";
+  let after: string | null = null;
+  let since: string | null = null;
+  for (let i = 0; i < flags.length; i++) {
+    const flag = flags[i]!;
+    if (seen.has(flag)) return statusJsonFail(4, "invalid_argument");
+    seen.add(flag);
+    if (flag === "--live") {
+      live = true;
+      continue;
+    }
+    const value = flags[++i];
+    if (value === undefined) return statusJsonFail(4, "invalid_argument");
+    if (flag === "--limit" && /^[1-9][0-9]{0,2}$/.test(value) && Number(value) <= 100) limit = value;
+    else if (flag === "--after" && STATUS_JSON_CURSOR.test(value)) after = value;
+    else if (flag === "--since-generation" && /^(0|[1-9][0-9]{0,15})$/.test(value) && Number(value) <= Number.MAX_SAFE_INTEGER) since = value;
+    else return statusJsonFail(4, "invalid_argument");
+  }
+  if (after !== null && since !== null) return statusJsonFail(4, "invalid_argument");
+  const args = ["list", "--jsonl", "--limit", limit];
+  if (live) args.push("--live");
+  if (after !== null) args.push("--after", after);
+  if (since !== null) args.push("--since-generation", since);
+  const invocation = registryInvocation(DISPATCH_REGISTRY_PY, args, process.platform);
+  const r = spawnSync(invocation.cmd, invocation.args, {
+    env: registryEnvironment(),
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+    maxBuffer: STATUS_JSON_CAP,
+    timeout: STATUS_JSON_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+  });
+  if (r.error) {
+    const overflow = (r.error as NodeJS.ErrnoException).code === "ENOBUFS";
+    return statusJsonFail(overflow ? 3 : 9, overflow ? "output_too_large" : "registry_error");
+  }
+  // Timeout (ETIMEDOUT above) or any signal death: partial stdout/stderr is ignored.
+  if (r.signal !== null) return statusJsonFail(9, "registry_error");
+  if (r.status !== 0) {
+    const m = /^dispatch-registry: list --jsonl: ([a-z_]+)\r?\n$/.exec(r.stderr.toString("latin1"));
+    const reason = m && STATUS_JSON_REASONS.has(m[1]!) ? m[1]! : "registry_error";
+    return statusJsonFail(r.status === 3 || r.status === 4 ? r.status : 9, reason);
+  }
+  const parsed = parseStatusJsonl(r.stdout, Number(limit), since === null ? null : Number(since));
+  if (!parsed) return statusJsonFail(3, "malformed_output");
+  const text = JSON.stringify(parsed) + "\n";
+  if (Buffer.byteLength(text) > STATUS_JSON_CAP) return statusJsonFail(3, "output_too_large");
+  process.stdout.write(text);
+  return 0;
+}
+
 /**
  * Retired lifecycles age out after a day. A dispatch whose outcome is still
  * unknown is never pruned: its record is the only evidence the work was handed
@@ -816,6 +951,10 @@ function main(argv: string[]): void {
       cmdCheck();
       return;
     case "status":
+      if (rest[0] === "--json") {
+        process.exitCode = cmdStatusJson(rest.slice(1));
+        return;
+      }
       cmdStatus(rest[0] ?? "");
       return;
     case "prune":
