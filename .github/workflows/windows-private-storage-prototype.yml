@@ -115,7 +115,7 @@ jobs:
           curl -fsSL --proto '=https' --tlsv1.2 -o "${D}/node.lib" "https://nodejs.org/dist/v${PSP_NODE_VERSION}/win-x64/node.lib"
           [ "$(sha256sum -b < "${D}/headers.tar.gz" | cut -d" " -f1)" = "${PSP_NODE_HEADERS_SHA256}" ] || { echo "::error::headers tarball hash mismatch"; exit 1; }
           [ "$(sha256sum -b < "${D}/node.lib" | cut -d" " -f1)" = "${PSP_NODE_LIB_SHA256}" ] || { echo "::error::node.lib hash mismatch"; exit 1; }
-          tar -xzf "${D}/headers.tar.gz" -C "${D}"
+          tar -xzf - -C "${D}" < "${D}/headers.tar.gz"
           INC="${D}/node-v${PSP_NODE_VERSION}/include/node"
           # The official 20.20.2 headers equal the four staged task inputs (verified offline); gate on them.
           hdr() { A="$(sha256sum -b < "${INC}/$2" | cut -d" " -f1)"; [ "${A}" = "$1" ] || { echo "::error::$2 ${A} != $1"; exit 1; }; echo "header ok ${A} $2"; }
