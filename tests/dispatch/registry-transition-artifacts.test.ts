@@ -22,6 +22,8 @@ const repo = repository();
 // Optional immutable subject input; ordinary discovery needs no private env.
 const registry = resolve(process.env.REGISTRY_TRANSITION_TEST_SCRIPT ?? join(repo, 'bin/dispatch-registry.py'));
 const windows = process.platform === 'win32';
+// Native text-mode stdout newline of the registry process: CRLF on win32, LF otherwise.
+const expectedNewline = windows ? '\r\n' : '\n';
 const essential: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? '', PYTHONDONTWRITEBYTECODE: '1' };
 for (const key of ['SystemRoot', 'WINDIR']) {
   if (process.env[key]) essential[key] = process.env[key];
@@ -201,7 +203,7 @@ test('receipt: subject identity, private fixture root and exact operation table'
   const f = fixture(t, 'absent');
   const result = f.run(['--list-ops']);
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(result.stdout.trim().split('\n'), [...OPERATIONS]);
+  assert.equal(result.stdout, OPERATIONS.join(expectedNewline) + expectedNewline);
 });
 
 test('baseline valid JSON read protocol: snapshot/get/list/check-dedup unchanged', t => {
@@ -212,9 +214,9 @@ test('baseline valid JSON read protocol: snapshot/get/list/check-dedup unchanged
   const get = f.run(['get', '--sid', 'lock-fixture']);
   assert.equal(get.status, 0, get.stderr);
   assert.deepEqual(JSON.parse(get.stdout), record());
-  assert.equal(f.run(['get', '--sid', 'lock-fixture', '--pointer', 'lifecycle.state']).stdout, 'cleaned\n');
+  assert.equal(f.run(['get', '--sid', 'lock-fixture', '--pointer', 'lifecycle.state']).stdout, `cleaned${expectedNewline}`);
   ok(f.run(['get', '--sid', 'absent']), 0, 'dispatch_not_found');
-  assert.equal(f.run(['list', '--fields', 'assigned.sid,lifecycle.state,gate.state']).stdout, 'lock-fixture\tcleaned\tnull\n');
+  assert.equal(f.run(['list', '--fields', 'assigned.sid,lifecycle.state,gate.state']).stdout, `lock-fixture\tcleaned\tnull${expectedNewline}`);
   assert.equal(f.run(['list', '--live']).stdout, '');
   ok(f.run(['check-dedup', '--sid', 'lock-fixture', '--ref-hash', 'fixture-hash']), 7, 'retry_held');
   ok(f.run(['check-dedup', '--sid', 'absent', '--ref-hash', 'x']), 0, 'proceed');
@@ -340,7 +342,7 @@ test('CLI usage and invalid arguments keep exit 4 with and without transition ar
       }
       const listed = f.run(['--list-ops']);
       assert.equal(listed.status, 0);
-      assert.deepEqual(listed.stdout.trim().split('\n'), [...OPERATIONS]);
+      assert.equal(listed.stdout, OPERATIONS.join(expectedNewline) + expectedNewline);
       assert.deepEqual(changes(before, tree(f.root)), [], 'usage error mutated the fixture');
     });
   }
