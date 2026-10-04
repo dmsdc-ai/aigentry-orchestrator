@@ -367,7 +367,8 @@ test("T-miss [win32] missing bare name keeps ENOENT (not CLI_LAUNCH_UNSUPPORTED)
 // bytes always come from the pinned upstream generator (the oracle), never from generateCmdShim.
 interface Shim { form: "V-A" | "V-B"; prog: string; args: string; target: string }
 interface WinLaunchMod { parseCmdShim(b: Buffer): Shim | null; generateCmdShim(s: Shim): string;
-  onDiskSpelling?(dir: string, name: string, list: (d: string) => readonly string[]): string }
+  onDiskSpelling?(dir: string, name: string, list: (d: string) => readonly string[]): string;
+  parentSpelling?(dir: string, list: (d: string) => readonly string[]): string }
 const WL_URL = new URL("../../../src/session/boot-adapter/win-launch.js", import.meta.url);
 const WL: WinLaunchMod | null = existsSync(WL_URL) ? (await import(WL_URL.href)) as WinLaunchMod : null;
 const NO_WL = WL ? NO_GEN : "candidate win-launch.js absent in this tree (baseline)";
@@ -435,7 +436,7 @@ test("P4 resource characterization: parseCmdShim has no input size bound (record
 // Final-component spelling after a confirmed hit, with an injected directory listing (pure; no CreateProcess or
 // filesystem claim). Expected spellings are the literal entries authored here. A missing export fails (the r1
 // source has none), so this case discriminates the source before/after the fix.
-test("P5 onDiskSpelling: exact entry, else unique case-insensitive entry, else the confirmed hit unchanged (ambiguous/none/readdir refused)", { skip: NO_WL }, () => {
+test("P5 onDiskSpelling: exact entry, else unique case-insensitive entry, else the confirmed hit unchanged (ambiguous/none/readdir refused)", { skip: NO_WL }, async (t) => {
   const spell = WL!.onDiskSpelling;
   assert.equal(typeof spell, "function", "onDiskSpelling export");
   const dir = "D:\\a\\Owned Dir\\PROGRA~1\\bin"; // parent spelling incl. an 8.3-looking segment must survive verbatim
@@ -451,6 +452,39 @@ test("P5 onDiskSpelling: exact entry, else unique case-insensitive entry, else t
   ];
   for (const [id, name, list, want] of cases) assert.equal(spell!(dir, name, list), want, id);
   assert.deepEqual(seen, cases.map(() => dir), "only the hit's own directory is listed (never a later PATH entry)");
+
+  // .cmd dp0 parents (Windows CI 37228963220: %dp0% re-spells every non-root parent, keeps the typed drive). Listings
+  // are keyed by the exact corrected prefix, so listing under any other spelling fails (pure; no filesystem claim).
+  const parents = WL!.parentSpelling;
+  await t.test("parentSpelling export", () => assert.equal(typeof parents, "function"));
+  const tree = (m: Record<string, string[]>, at: string[]) => (d: string): readonly string[] => {
+    at.push(d);
+    const e = m[d];
+    if (e === undefined) throw Object.assign(new Error(`EPERM ${d}`), { code: "EPERM" });
+    return e;
+  };
+  const pcases: Array<[string, string, Record<string, string[]>, string, string[]]> = [
+    ["fixed-mixed-parents-typed-drive", "d:\\x\\long mixed abc dir\\spbn\\spbin",
+      { "d:\\": ["X"], "d:\\X": ["Long Mixed AbC dir"], "d:\\X\\Long Mixed AbC dir": ["SpBn"], "d:\\X\\Long Mixed AbC dir\\SpBn": ["spbin"] },
+      "d:\\X\\Long Mixed AbC dir\\SpBn\\spbin", ["d:\\", "d:\\X", "d:\\X\\Long Mixed AbC dir", "d:\\X\\Long Mixed AbC dir\\SpBn"]],
+    ["exact-entry-wins", "D:\\spbn\\bin", { "D:\\": ["SpBn", "spbn"], "D:\\spbn": ["bin"] }, "D:\\spbn\\bin", ["D:\\", "D:\\spbn"]],
+    ["unique-casefold", "D:\\SPBN\\BIN", { "D:\\": ["README", "SpBn"], "D:\\SpBn": ["bin"] }, "D:\\SpBn\\bin", ["D:\\", "D:\\SpBn"]],
+    ["ambiguous-middle-keeps-continues", "D:\\a\\spbn\\BIN", { "D:\\": ["A"], "D:\\A": ["SpBn", "SPBN"], "D:\\A\\spbn": ["bin"] },
+      "D:\\A\\spbn\\bin", ["D:\\", "D:\\A", "D:\\A\\spbn"]],
+    ["missing-middle-keeps-continues", "D:\\a\\spbn\\BIN", { "D:\\": ["A"], "D:\\A": ["other"], "D:\\A\\spbn": ["bin"] },
+      "D:\\A\\spbn\\bin", ["D:\\", "D:\\A", "D:\\A\\spbn"]],
+    ["readthrow-middle-keeps-rest-stops", "D:\\a\\spbn\\BIN", { "D:\\": ["A"] }, "D:\\A\\spbn\\BIN", ["D:\\", "D:\\A"]],
+    ["no-8.3-expansion", "D:\\PROGRA~1\\bin", { "D:\\": ["Program Files"], "D:\\PROGRA~1": ["Bin"] }, "D:\\PROGRA~1\\Bin", ["D:\\", "D:\\PROGRA~1"]],
+    ["junction-name-kept-no-realpath", "D:\\link\\bin", { "D:\\": ["Link", "Target"], "D:\\Link": ["bin"] }, "D:\\Link\\bin", ["D:\\", "D:\\Link"]],
+    ["root-only-unlisted", "d:\\", {}, "d:\\", []],
+  ];
+  for (const [id, pdir, m, want, wantSeen] of pcases) {
+    await t.test(id, () => {
+      const at: string[] = [];
+      assert.equal(parents!(pdir, tree(m, at)), want, id);
+      assert.deepEqual(at, wantSeen, `${id}: listed prefixes`);
+    });
+  }
 });
 
 test("T-gem [win32] geminiBinary: any first agy hit (even unsupported agy.cmd) → agy; none → gemini", { skip: NOT_WIN }, () => {

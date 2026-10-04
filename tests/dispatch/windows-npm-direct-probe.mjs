@@ -33,7 +33,7 @@ const PIN = { version: '6.0.3',
   'lib/to-batch-syntax.js': 'e39a03dac6e5e31c6c4bb58fab2c23e8aeeaacd53e0b8c63e742fe7f4ef476ec' };
 // Exact sources the direct engine must be built from (PROBE_EXPECT selects; mismatch → no run).
 const SOURCE_PINS = {
-  'candidate-r1': { 'win-launch.ts': '2c8f010244142c8404295dc61444951fc86b6263d51d6ff59f0c0abdd64fa88e',
+  'candidate-r1': { 'win-launch.ts': '22cc933ce016b16b0c4582bf3443cae57d6da9bca7bc0a2c313eee2c333a2cea',
     'spawner.ts': '56d6dbb811a2ad8a265bb79a144ff01900c00cbe351d20185392cfbd16660431',
     'gemini.ts': '0baa25bf1f9bffff993c071e29a75c0ee6101b3e8b5d4719a2daa7748e12f099',
     'types.ts': '940990d4a298ac400170a950824f4802d00157bf0cbe1d7fcc15328e7c5b865a' },

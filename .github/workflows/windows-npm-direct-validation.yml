@@ -104,7 +104,7 @@ jobs:
           check() { got=$(sha256sum "$1" | cut -d' ' -f1); echo "$got  $1"; [ "$got" = "$2" ] || { echo "PIN MISMATCH $1 want $2"; exit 1; }; }
           T="${{ steps.tree.outputs.dir }}/src/session/boot-adapter"
           if [ "${{ matrix.role }}" = candidate ]; then
-            check "$T/win-launch.ts" 2c8f010244142c8404295dc61444951fc86b6263d51d6ff59f0c0abdd64fa88e
+            check "$T/win-launch.ts" 22cc933ce016b16b0c4582bf3443cae57d6da9bca7bc0a2c313eee2c333a2cea
             check "$T/spawner.ts"    56d6dbb811a2ad8a265bb79a144ff01900c00cbe351d20185392cfbd16660431
             check "$T/gemini.ts"     0baa25bf1f9bffff993c071e29a75c0ee6101b3e8b5d4719a2daa7748e12f099
             check "$T/types.ts"      940990d4a298ac400170a950824f4802d00157bf0cbe1d7fcc15328e7c5b865a
@@ -114,11 +114,11 @@ jobs:
             check "$T/gemini.ts"  a8b12f699531021d5c6e441b64d31c45b5d9e0dec1f187d844b071465539f6a4
             check "$T/types.ts"   984ce32596d76e20bbdf63a513dfddb11c80a4689af31d2169eb05e3ae955cea
           fi
-          check harness/tests/session/boot-adapter/win-launch.test.ts      1b79dd8682e8698836b114367a5e448ea24d339934b98aac2466e19f4e097f58
+          check harness/tests/session/boot-adapter/win-launch.test.ts      2380f0db11cac2db9dafc30bd4dbd84fa7cf0f5f5094ae94cc9abd62a687b0f3
           check harness/tests/session/boot-adapter/_win-launch-fixture.ts  288230fa7c92967fb962d795101fbdcc40295d3ebbddb6ba868be7c06b3c9b86
-          check harness/tests/dispatch/windows-npm-direct-probe.mjs       0a79c257505ea8abdeb68f3eb9a435aabc8be1d8e375dbc49a7567d388b9e9b5
+          check harness/tests/dispatch/windows-npm-direct-probe.mjs       24068f50b49f144f04d7ec7baf0d8effae1fb9a05e87f4d5ce0ec78078a4cf9f
           check harness/tests/dispatch/win-launch-tap-check.mjs           ab3e9f7e66746375512d774150d987d2c6e143f3e064028c9219e9b5cd5cd693
-          check harness/tests/dispatch/win-launch-tap-check.test.mjs      9f17dfd6e165c658c4bdab3d8f0d7c90aeb291b8486149ccb13d2a9fc4e22ca6
+          check harness/tests/dispatch/win-launch-tap-check.test.mjs      9f544f49fe84217e71a1bcb484a2da14ce06ebb20c4a146e65dec3fc3bfc7e3a
           git -C "${{ steps.tree.outputs.dir }}" ls-files --eol src/session/boot-adapter | tee "$RUNNER_TEMP/wl-out/eol.txt"
           sha256sum "${{ steps.tree.outputs.dir }}"/src/session/boot-adapter/*.ts "${{ steps.tree.outputs.dir }}/package-lock.json" | tee "$RUNNER_TEMP/wl-out/sources.sha256"
 

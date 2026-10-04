@@ -17,7 +17,7 @@ const CHECKER = path.join(HERE, 'win-launch-tap-check.mjs');
 const SELF = fileURLToPath(import.meta.url);
 const WORKFLOW = path.join(HERE, '..', '..', '.github', 'workflows', 'windows-npm-direct-validation.yml');
 const SOURCE = process.env.WIN_LAUNCH_TEST_TS || path.join(HERE, '..', 'session', 'boot-adapter', 'win-launch.test.ts');
-const SOURCE_SHA = '1b79dd8682e8698836b114367a5e448ea24d339934b98aac2466e19f4e097f58';
+const SOURCE_SHA = '2380f0db11cac2db9dafc30bd4dbd84fa7cf0f5f5094ae94cc9abd62a687b0f3';
 const ENV = { ...process.env }; delete ENV.NODE_TEST_CONTEXT; // children must be plain processes, not test-runner children
 const sha = b => crypto.createHash('sha256').update(b).digest('hex');
 const DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tapcheck-'));

@@ -30,7 +30,8 @@ export function resolveLaunch(
   if (isNative(hit)) return { file: hit, args: [...args], argv0 };
   if (win32.extname(hit).toLowerCase() === ".cmd") {
     const shim = readCmdShim(hit);
-    const dir = win32.dirname(hit);
+    // The shim's %dp0% spells every non-root parent as its directory entry (Windows CI 37228963220).
+    const dir = parentSpelling(win32.dirname(hit));
     if (shim && !/[%"^&|<>]/.test(dir)) {
       // %~dp0 carries a trailing backslash; the wrapper then adds another.
       const dp0 = dir.endsWith("\\") ? dir : dir + "\\";
@@ -87,6 +88,25 @@ export function onDiskSpelling(dir: string, name: string, list: (d: string) => r
   if (entries.includes(name)) return win32.join(dir, name);
   const folded = entries.filter((e) => e.toUpperCase() === name.toUpperCase());
   return win32.join(dir, folded.length === 1 ? folded[0]! : name);
+}
+
+// A confirmed shim directory with each non-root component re-spelled root to leaf by the onDiskSpelling rule.
+// The root/drive is kept as typed; no realpath (junction/UNC/8.3 segments keep their given name). Ambiguous or
+// no entry → that component as given, traversal continues; readdir refused → that component and the rest as
+// given, traversal stops. Unmeasured: UNC, junction, 8.3-enabled volumes, non-ASCII, uppercase-typed drive.
+export function parentSpelling(dir: string, list: (d: string) => readonly string[] = readdirSync): string {
+  const root = win32.parse(dir).root;
+  const parts = dir.slice(root.length).split("\\").filter((p) => p !== "");
+  let cur = root;
+  for (let i = 0; i < parts.length; i++) {
+    let refused = false;
+    const next = onDiskSpelling(cur, parts[i]!, (d) => {
+      try { return list(d); } catch (e) { refused = true; throw e; }
+    });
+    if (refused) return win32.join(cur, ...parts.slice(i));
+    cur = next;
+  }
+  return cur;
 }
 
 export interface CmdShim {
