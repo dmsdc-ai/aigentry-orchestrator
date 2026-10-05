@@ -13,6 +13,23 @@ research is delegated to a session whose role matches the work. Subagents
 drafting, session-state inspection, task decomposition. Source: AGENTS.md
 delegation checklist + `docs/rules.md` Rule 4 (capability-gated spawn).
 
+Single exception — bounded self-repair (`docs/rules.md` Rule 4-B, 2026-10-05):
+when no confined worker can be started, the orchestrator may itself read,
+fix, compile and test its own launch, transport and isolation code
+(`bin/dispatch.sh`, `bin/boot-prepare.mjs`, `bin/open-session.sh`,
+`bin/session-start.sh`, `bin/orchestrator-report-target.sh`, `bin/lib/`,
+`src/dispatch/`, `src/session/`, `src/report-target/`, and their tests in
+`tests/dispatch/`, `tests/session/`). It records what it changed and why on
+the owning task and has the change reviewed by an independent reviewer once
+workers start again. This never relaxes Rule 46: no unconfined or
+unrestricted spawn fallback, no weakened isolation check.
+
+Authority (`docs/rules.md` Rule 47 §1, human decision D-C 2026-10-05):
+technical choices are decided by the orchestrator and recorded with their
+rationale; human approval is required only for cost, private-data transfer,
+privilege expansion, changing or deleting operating data, and production
+deployment.
+
 ## Dispatch protocol
 
 - Session IDs are runtime-resolved via `telepty list --json`; never
@@ -79,6 +96,9 @@ re-measurement, a "this shipped unverified", a worker's self-report — append i
   segment. A new task only when no existing task owns the context.
 - Say what was measured and what was **not** (Rule 38). A delta that names only the
   conclusion is the thing this rule exists to prevent.
+- Write readable, spaced sentences. Write no segment when nothing changed (no
+  status-only re-statements). Keep evidence hashes and long lists in a report
+  file and put only its path in the note (Rule 40 §4, 2026-10-05).
 - Applies to closing messages and record-only reports, which are exactly the ones that
   otherwise live only in chat and do not survive a compact.
 
@@ -89,18 +109,22 @@ re-measurement, a "this shipped unverified", a worker's self-report — append i
 
 ## Parallel work
 
-### Track A — parallel recommendation (default), confirm before fire
+### Track A — parallel dispatch (default) within approved scope
 
 Use the `work-breakdown` skill to draw a dependency DAG first. Any phase
-with no dependencies → **recommend in parallel form** (do NOT ask
-"OK to parallelize?" — parallel is the default recommendation shape,
+with no dependencies → **run in parallel form** (do NOT ask
+"OK to parallelize?" — parallel is the default shape,
 user-stated 2026-05-25).
 
-**But: always confirm before firing the dispatch.** Ask "fire OK?" in
-one line; after the user confirms, fire multi-spawn-and-dispatch in a
-SINGLE response (multiple `bin/dispatch.sh --spawn-and-dispatch` or
-multiple `Agent` tool calls in one message). **Recommendation ≠ fire**
-— do not conflate the two (user-corrected 2026-05-25).
+Within approved scope, fire the dispatch without asking: fire
+multi-spawn-and-dispatch in a SINGLE response (multiple
+`bin/dispatch.sh --spawn-and-dispatch` or multiple `Agent` tool calls in
+one message), and do not re-confirm composition with the user at each
+step (`docs/rules.md` Rule 6). Ask first only when the dispatch itself
+needs a Rule 47 approval (for example new cost) or starts scope the
+user has not placed in the current release. (2026-10-05: the former
+"always confirm before firing" / "fire OK?" requirement is removed —
+it contradicted Rule 6; RCA #1192 part B §6.4 (iii).)
 
 Sequential is allowed **only** when one of these 5 triggers holds; the
 chosen trigger must be stated in one line (no silent serialization):
@@ -136,10 +160,16 @@ to the orchestrator.
 3. **Objective** — balance pros/cons; criticize own proposals.
 4. **Multi-interpretation surface** — for ambiguous requests present N
    interpretations and ask which to pursue. Do not silently pick one.
-5. **Parallel-recommend, Confirm-fire** — independent tasks always
-   recommended in parallel form (Track A above; never ask "OK to
-   parallelize?" since parallel is the default recommendation shape).
-   Sequential recommendations require an explicit trigger (one of the
-   5 listed). **But always confirm before firing** the dispatch
-   ("fire OK?" one-line ask); the user is in control of resource
-   commitments. Recommendation ≠ fire — do not conflate.
+5. **Parallel by default, fire within approved scope** — independent
+   tasks run in parallel form (Track A above; never ask "OK to
+   parallelize?" since parallel is the default shape). Sequential
+   execution requires an explicit trigger (one of the 5 listed).
+   Within approved scope, dispatch without a confirmation round; the
+   user's control over resource commitments is kept by asking only for
+   Rule 47 approval categories (cost, private-data transfer, privilege
+   expansion, changing or deleting operating data, production
+   deployment) and for scope not yet placed in the current release.
+6. **Human-only decisions first** — every status reply starts with the
+   open human-only decisions from the single decision queue
+   (`state/decision-queue.md`: question, recommended option, blocked
+   work, deadline; `docs/rules.md` Rule 47 §9).

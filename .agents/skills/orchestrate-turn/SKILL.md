@@ -7,7 +7,7 @@ description: Use every orchestration turn. The canonical 5-step delegation loop 
 
 The orchestrator's per-turn delegation contract. **Rigid checklist** — run the steps in order, every turn, carrying shared turn context (which session, which task).
 
-**This skill sequences; it does NOT actuate.** All actuation already lives at the atomic script layer (`bin/dispatch.sh`, `bin/session-cleanup.sh`, `bin/tq-*.sh`, deliberation MCP). The skill owns only the ordering, gates, and human-in-the-loop checkpoints — it never reimplements spawn, inject, cleanup, or queue mutation. The orchestrator never writes `bin/` code itself (Rule 4/13) and never spawns/delegates outside this gated path (only the orchestrator delegates/spawns — ADR-MF #8 spawn-capability gate).
+**This skill sequences; it does NOT actuate.** All actuation already lives at the atomic script layer (`bin/dispatch.sh`, `bin/session-cleanup.sh`, `bin/tq-*.sh`, deliberation MCP). The skill owns only the ordering, gates, and human-in-the-loop checkpoints — it never reimplements spawn, inject, cleanup, or queue mutation. The orchestrator never writes `bin/` code itself (Rule 4/13) — the single exception is the bounded Rule 4-B self-repair of its own launch, transport and isolation code (directories named in Rule 4-B) when no worker can be started, recorded and independently reviewed afterwards, never adding an unconfined spawn fallback — and never spawns/delegates outside this gated path (only the orchestrator delegates/spawns — ADR-MF #8 spawn-capability gate).
 
 **Operation routing.** For a repeatable operation, use the supported existing helper and inspect its documented command/output contract before writing inline code: `bin/dispatch-tracker.sh status --json --live --limit 100` (Step 2) for registry reads only, task-bound `bin/dispatch.sh` for actuation, and protected `bin/session-cleanup.sh` for lifecycle. Reuse the actual prior decisions and REPORT revisions before proposing a replacement. A missing safe helper is an explicit gap to record as a task, not permission for an ad-hoc authority path; `node -e` remains fine for a genuinely one-off transformation. This paragraph guides routing; it does not enforce anything at runtime.
 
@@ -48,7 +48,7 @@ Confirm the working context before any breakdown. Preserve earlier requests and 
 > **If skipped:** you delegate against a guessed intent. The whole wave runs on the wrong target and burns N sessions before the mistake surfaces.
 
 ### 1-1 Break down → decide # sessions
-Decompose the confirmed work into bounded task/contract units. Apply Rules 9/10 (user approval 2026-09-19): one confined implementation worker may own tightly coupled files for the same task; record the exact file set and coupling reason. Keep independent testing and review with separate workers. Bind each unit to its existing owning task; create a task only when no owner exists, not for each file or verification session. `bin/tq-track.sh` and `bin/tq-status.sh` are read-only views; `bin/tq-focus.sh` only sets `.active_focus`. Decide session count from independent work, not file count.
+Decompose the confirmed work into bounded task/contract units. Apply Rules 9/10 (user approval 2026-09-19): one confined implementation worker may own tightly coupled files for the same task; record the exact file set and coupling reason. Keep independent testing and review with separate workers; for a change of at most 20 lines or a test-only change, one coder suffices and the CI run on that change is the independent verifier (Rule 9, 2026-10-05). Bind each unit to its existing owning task; create a task only when no owner exists, not for each file or verification session. `bin/tq-track.sh` and `bin/tq-status.sh` are read-only views; `bin/tq-focus.sh` only sets `.active_focus`. Decide session count from independent work, not file count.
 
 > **If skipped:** no task-queue trail → step 5 has nothing to propose from, and reconcile cannot reconcile dispatches it never saw.
 
@@ -60,7 +60,7 @@ Do not split a coupled implementation solely by file count or merge independent 
 > **If skipped:** arbitrary count limits serialize independent work; unmeasured expansion overloads the host/provider. Untracked ownership risks conflicting writes, and shared tracks risk shared-fate cleanup. Tool availability must not replace conflict/progress tracking.
 
 ### 1-3 Match the CLI to the task
-Fresh dispatches use the model router by default; explicit `--cli` overrides it. Within an approved task, choose CLI/model/effort/role/session/parallel composition and deliberation participants autonomously using task fit, verified capability, availability, confinement and budget limits (Rule 6, 2026-09-12). Preserve valid user overrides and briefly record the rationale; do not ask the user to pick workers on every wave. Record delegated/controller selection honestly, never as a fabricated human UI click or authority proof. Pass `--role` for context isolation; separately verify actual task/sid/attempt confinement (Rule 46). New scope, purchases, private transfer, destructive actions and authority changes still require Rule 47 decisions.
+Fresh dispatches use the model router by default; explicit `--cli` overrides it. Within an approved task, choose CLI/model/effort/role/session/parallel composition and deliberation participants autonomously using task fit, verified capability, availability, confinement and budget limits (Rule 6, 2026-09-12). Preserve valid user overrides and briefly record the rationale; do not ask the user to pick workers on every wave. Record delegated/controller selection honestly, never as a fabricated human UI click or authority proof. Pass `--role` for context isolation; separately verify actual task/sid/attempt confinement (Rule 46). Cost (including purchases), private-data transfer, privilege expansion, changing or deleting operating data and production deployment still require Rule 47 decisions; new scope goes to the next release backlog unless the user places it in the current release (Rule 50).
 
 > **If skipped:** `--role` omitted → worker auto-discovers cwd CLAUDE.md and self-IDs as orchestrator (#431 regression). Wrong CLI → low-quality output you re-delegate anyway.
 
@@ -82,22 +82,26 @@ failure with the required inputs staged; do not repeat an unchanged full suite
 on a partial snapshot. This does not remove or waive full release CI.
 
 Apply Rule 12/12-1 from `docs/rules.md`: clear reused implementation sessions. The
+session unit is the task: clear when reusing a session for a different task, and keep
+the context within the same task's fix loop (2026-10-05 clarification). The
 2026-10-04 approved first-instruction exception requires evidence of a new process,
 no resumed history, an empty conversation and exact task/sid/attempt confinement.
 Record those facts; a new workspace name is not proof. Never force Enter or bypass
 readiness. Policy text alone does not establish installed/runtime enforcement.
 
-First confirm the full 위임 전 체크리스트 (approved task/scope, controller-selected target, MANDATORY report path, [SAWP] envelope, lessons, SPEC FIRST, self-contained ref). Do not repeat user approval for ordinary worker composition within that scope. Then spawn via the dispatch helper, never raw spawn (Rule 32 HARD). `--spawn-and-dispatch` carries context through a **ref file**; raw telepty is only for permitted short acknowledgements/follow-ups.
+First confirm the ten gates of the 위임 전 체크리스트 in `AGENTS.md` (task/release binding, actual confinement, foreground visible spawn, user-only orchestrator cleanup, MANDATORY report path over telepty, dispatch helper with self-contained ref and [SAWP] envelope, authority sentence and decision queue, ambiguity gate, verification sized to the change, Snyk); the rest of that list is reference, not a gate (2026-10-05). Do not repeat user approval for ordinary worker composition within that scope. Then spawn via the dispatch helper, never raw spawn (Rule 32 HARD). `--spawn-and-dispatch` carries context through a **ref file**; raw telepty is only for permitted short acknowledgements/follow-ups.
 
 Rule 24 (human revision 2026-09-21): after reviewing the spec and evidence, the
 controller may delegate bug fixes, regression tests and portability corrections
 inside an already approved release scope without another per-spec approval. Bind
 the exact files, existing approval and verification plan in the ref and explicitly
-mark implementation approved. New architecture, authority, cost, privacy or
-destructive changes still require Rule 47 approval; existing pending designs are
-not approved by this policy revision. Preserve confinement, independent validation,
-security and installed-release gates, and distinguish controller review from human
-consent. Unapproved designs remain SPEC FIRST/HOLD.
+mark implementation approved. Technical design, including new architecture and
+previously pending technical design questions, is decided by the orchestrator with its
+rationale recorded on the owning task (human decision D-C, 2026-10-05). Only cost,
+private-data transfer, privilege expansion, changing or deleting operating data and
+production deployment require Rule 47 human approval. Preserve confinement, independent
+validation, security and installed-release gates, and distinguish controller review
+from human consent. A design waiting on one of those approvals remains SPEC FIRST/HOLD.
 
 ```bash
 bin/dispatch.sh --spawn-and-dispatch --track <T> --name <N> --cwd <P> \
@@ -117,7 +121,7 @@ A worker that needs clarification injects a HOLD question back to the orchestrat
 > **If skipped (HOLD-ignored self-progress):** the worker invents an answer and builds the wrong thing — a §13 violation. Enforce explicit HOLD inject; never let a session guess past a HOLD.
 
 ### 2-2 Orchestrator → user → re-inject
-Resolve technical questions within the existing contract as the orchestrator. Ask the user only for the specific unresolved intent, architecture, destructive action, cost, privacy or authority decision (Rule 47); preserve the answer and revision in its task and hold only dependent work. Then re-inject through `bin/dispatch.sh --target <sid> --ref <file> --task <id>` for a ref payload, or `telepty inject` for a short inline ack. Do not resume an unrestricted worker just to deliver a policy update.
+Decide technical questions, including architecture, as the orchestrator and record the rationale on the owning task. Ask the user only for unresolved intent (Rule 37) or a Rule 47 approval category: cost, private-data transfer, privilege expansion, changing or deleting operating data, production deployment. Put each such question in the single decision queue (`state/decision-queue.md`) with a recommended option, the work it blocks and a deadline (Rule 47 §9); preserve the answer and revision in its task and hold only dependent work. Then re-inject through `bin/dispatch.sh --target <sid> --ref <file> --task <id>` for a ref payload, or `telepty inject` for a short inline ack. Do not resume an unrestricted worker just to deliver a policy update.
 
 Complete the round trip: preserve the explicit human decision, relay it to the exact
 worker via task-bound telepty dispatch, then verify an acknowledgement matching the
@@ -177,6 +181,8 @@ bin/session-cleanup.sh <sid>
 
 This runs parent-PID SIGTERM + telepty session DELETE + the cmux/terminal `close-workspace`. A session is not "cleaned" until both surfaces are gone — terminal surface ownership is the orchestrator adaptor, not telepty (Rule 28).
 
+For a small change (at most 20 lines or test-only, Rule 9) keep one preserved copy of the report and artifact, and show cleanup by the registry row state and the terminal listing rather than a separate written proof (2026-10-05).
+
 > **If skipped:** a telepty-orphaned-but-terminal-alive workspace can linger. This occurred on 2026-06-06 at rec-coder-reconcile-2/workspace47; that historical observation is not a claim about today's cleanup implementation. Verify BOTH surfaces regardless of prior telepty state. telepty#17 DISCONNECTED accumulation is the downstream risk.
 
 ---
@@ -192,7 +198,9 @@ records** goes onto that task, not into chat only:
 ```
 
 Name what was measured and what was not (Rule 38). Closing messages and record-only
-reports count — they are the ones that otherwise survive nowhere.
+reports count — they are the ones that otherwise survive nowhere. Write readable,
+spaced sentences; write nothing when nothing changed; keep evidence hashes and long
+lists in a report file and put only its path in the note (Rule 40 §4, 2026-10-05).
 
 > **If skipped:** the turn's best finding lives only in the transcript and dies at the
 > next compact. Measured 2026-08-26/27: a shipped-unverified feature, a delivery check's
@@ -209,7 +217,7 @@ bin/tq-status.sh    # board state
 bin/tq-focus.sh     # current focus / switch focus
 ```
 
-Recommend parallel-eligible next tasks parallel-first. Continue approved eligible work without repeat composition approval; ask before starting unapproved scope or crossing a Rule 47 boundary. Recommendations never activate Task Loop. End with a one-line task summary.
+Recommend parallel-eligible next tasks parallel-first. Continue approved eligible work without repeat composition approval; ask before starting unapproved scope or crossing a Rule 47 boundary. Recommendations never activate Task Loop. Start every status reply with the open human-only decisions from the decision queue (question, recommended option, blocked work, deadline; Rule 47 §9). End with a one-line task summary.
 
 > **If skipped:** approved work stalls or new scope runs without authority. Operational selection authority is not unlimited execution authority.
 

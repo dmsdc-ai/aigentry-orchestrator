@@ -1,7 +1,7 @@
 # Dispatch Ref Pre-flight Checklist
 
 Run this **before** sending any dispatch inject. Companion to `docs/templates/dispatch-ref-template.md`.
-Hard-gate: if any unchecked item violates, fix before injecting.
+Gate (2026-10-05, at most 10 checks): the **Quick-check** below is the gate — if any applicable Quick-check item fails, fix before injecting. Sections A–G are authoring guidance behind those checks, not separate stop conditions (RCA #1192 part B RC3: 51 per-dispatch items, each "stop if any one is violated").
 
 ---
 
@@ -52,12 +52,12 @@ If `dispatch_kind: re-dispatch`:
 ## F. Boundary & full capability
 
 - [ ] **§Boundary lists explicit do-nots** (no cross-repo, no extra session spawn, etc.)
-- [ ] **Coupled-file scope and independent verification**: list the exact same-task file set, coupling reason and single-writer ownership; assign independent tests/review to separate workers and parallelize independent units (Rules 9/10/36, 2026-09-19 approval). Bundling is not permission to widen scope.
+- [ ] **Coupled-file scope and independent verification**: list the exact same-task file set, coupling reason and single-writer ownership; assign independent tests/review to separate workers and parallelize independent units (Rules 9/10/36, 2026-09-19 approval). For a change of at most 20 lines or a test-only change, one coder suffices and the CI run on that change is the independent verifier (Rule 9, 2026-10-05). Bundling is not permission to widen scope.
 - [ ] **§Boundary lists escalation triggers** (which conditions require HOLD before destructive action)
 - [ ] **§Full capability lists allowed tools** (Read/Edit/Bash/etc.) — receiver knows what is authorized
 - [ ] **§Full capability lists allowed skills + MCP servers** (or explicit "none")
 - [ ] **Actual confinement verified before spawn/resume**: task/sid/attempt and allowed read/write/command/network/tool scope, enforcement evidence and fail-closed behavior are recorded; cwd/worktree/prompt restrictions alone do not pass (Rule 46)
-- [ ] **Production acceptance scoped**: stage result versus product completion, remaining validation/install/release owners and explicit N/A reasons are recorded (Rule 45)
+- [ ] **Production acceptance scoped**: stage result versus product completion, remaining validation/install/release owners and explicit N/A reasons are recorded (Rule 45); the task's shipping/non-shipping record is a task fact, not a precondition for publishing other verified slices (Rule 45 §7, 2026-10-05)
 
 ## G. Orchestrator-side hygiene
 
