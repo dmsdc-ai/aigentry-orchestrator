@@ -897,8 +897,11 @@ export function hardlinkProbeOperands(test, objects, manifest) {
     if (!(!o.isDir && !o.isReparse && o.fsutilHardlinkExit !== 0)) continue;
     rows++;
     const valid = o.hlProbeValid === true;
-    const plain = valid && o.hlPlainOpenValid === true && Number.isInteger(o.hlPlainOpenErr);
-    const ffn = valid && o.hlFfnValid === true && Number.isInteger(o.hlFfnErr);
+    // The C# producer records Marshal.GetLastWin32Error() as a signed int with no unsigned reinterpretation, so a measured
+    // code is a nonnegative int (0..2147483647); anything else (negative, > Int32 max, non-number) is unknown.
+    const code = (e) => Number.isInteger(e) && e >= 0 && e <= 2147483647;
+    const plain = valid && o.hlPlainOpenValid === true && code(o.hlPlainOpenErr);
+    const ffn = valid && o.hlFfnValid === true && code(o.hlFfnErr);
     if (plain) opHistBump(pe, o.hlPlainOpenErr); else plainUnknown++;
     if (ffn) opHistBump(fe, o.hlFfnErr); else ffnUnknown++;
     const out = !plain ? 'Unknown' : (o.hlPlainOpenErr !== 0 ? 'PlainErr' : (!ffn ? 'Unknown' : (o.hlFfnErr !== 0 ? 'FfnErr' : 'BothOk')));
@@ -1397,6 +1400,36 @@ if (PHASE === 'selfcheck') {
     const odd = kvSafe(hardlinkProbeOperands('unproved', [hp('C:\\fx\\plain', acl, { hlPlainOpenErr: '5' }), hp('C:\\fx\\plain', acl, { hlFfnErr: 1.5 })], man), 'hlprobe');
     assert.deepEqual([odd.otherUnknown, odd.plainUnknown, odd.ffnUnknown], ['2', '1', '1'], 'non-integer codes are unknown, never a code');
     assert.equal(kvSafe(hardlinkProbeOperands('payload', undefined, undefined), 'hlprobe').test, 'UNKNOWN');
+  });
+
+  test('selfcheck: hlprobe accepts only nonnegative C# int codes (0..2147483647); out-of-range or non-integer codes are unknown', () => {
+    const acl = { volumeError: 0, persistentAcls: true };
+    const man = { cases: [{ id: 'D_ADS', path: 'C:\\fx\\d::$INDEX_ALLOCATION' }, { id: 'F_ADS', path: 'C:\\fx\\secret.bin:alt' }, { id: 'F_DATA_STREAM', path: 'C:\\fx\\ok.bin::$DATA' }] };
+    const hp = (x = {}) => ({ path: 'C:\\fx\\plain', openError: 0, isDir: false, isReparse: false, nLinks: 1, fsutilReparseExit: 1, fsutilHardlinkExit: 1,
+      hlProbeValid: true, hlPlainOpenValid: true, hlPlainOpenErr: 0, hlFfnValid: true, hlFfnErr: 0, ...acl, ...x });
+    const run = (objs) => kvSafe(hardlinkProbeOperands('unproved', objs, man), 'hlprobe');
+    const bad = [-1, -2147483648, 2147483648, 4294967295, 4294967296, 2 ** 40, Number.MAX_SAFE_INTEGER, '5', '0', true, false, null, undefined, NaN, Infinity, -Infinity, 1.5];
+    // in-range boundaries are measured codes
+    const ok = run([hp({ hlPlainOpenErr: 2147483647 }), hp({ hlFfnErr: 2147483647 }), hp()]);
+    assert.deepEqual([ok.otherPlainErr, ok.otherFfnErr, ok.otherBothOk, ok.otherUnknown, ok.plainUnknown, ok.ffnUnknown], ['1', '1', '1', '0', '0', '0']);
+    assert.deepEqual([ok.plainErrs, ok.ffnErrs], ['2147483647:1,0:2', '0:2,2147483647:1']);
+    for (const e of bad) {
+      const tag = String(e);
+      const p = run([hp({ hlPlainOpenErr: e })]);
+      assert.deepEqual([p.otherUnknown, p.otherPlainErr, p.plainUnknown, p.plainErrsOther, p.ffnUnknown], ['1', '0', '1', '0', '0'], `plain ${tag}`);
+      assert.equal(p.plainErrs, run([]).plainErrs, `plain ${tag} never histogrammed`);
+      const f = run([hp({ hlFfnErr: e })]);
+      assert.deepEqual([f.otherUnknown, f.otherFfnErr, f.otherBothOk, f.ffnUnknown, f.ffnErrsOther, f.plainUnknown], ['1', '0', '0', '1', '0', '0'], `ffn ${tag}: valid plain 0 + invalid ffn is Unknown`);
+      const pf = run([hp({ hlPlainOpenErr: 5, hlFfnErr: e })]);
+      assert.deepEqual([pf.otherPlainErr, pf.otherUnknown, pf.ffnUnknown, pf.plainErrs], ['1', '0', '1', '5:1'], `valid plain failure stays PlainErr with ffn ${tag}, ffnUnknown counted`);
+    }
+    for (const k of ['hlPlainOpenErr', 'hlFfnErr']) {
+      const m = run([omit(hp(), k)]);
+      assert.deepEqual([m.otherUnknown, m.otherBothOk], ['1', '0'], `missing ${k}`);
+    }
+    const objs = bad.map((e) => hp({ hlPlainOpenErr: e, hlFfnErr: e }));
+    assert.deepEqual(readbackFindings(objs), readbackFindings(strip(objs)), 'readbackFindings unaffected');
+    assert.deepEqual(readbackOperands('unproved', {}, objs), readbackOperands('unproved', {}, strip(objs)), 'readbackOperands unaffected');
   });
 }
 

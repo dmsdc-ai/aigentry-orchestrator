@@ -73,7 +73,7 @@ jobs:
             if [ "${ACTUAL}" = "$1" ]; then echo "pin ok ${ACTUAL} $2"; else echo "::error::$2 sha256 ${ACTUAL} does not match pin $1"; FAIL=1; fi
           }
           # independent harness (tester-owned)
-          check 516877652bc87aac2f570ae073b63ab20f49734ad87ea892821c8960c09c9521 prototypes/windows-private-storage/tests/acl.test.mjs
+          check 839ba8894968776c4cd3661e8e702ba030e0dbf7f5a540a7197f61c428a4fb24 prototypes/windows-private-storage/tests/acl.test.mjs
           check e08a0373bf33f0f10052dd76977055287e8c88b573219a338e64f2b71fc99dd1 prototypes/windows-private-storage/tests/wrapper.test.mjs
           check 19a10f53bc681dfe41c45b8ae1c44f5fdcb75de947ec37f447fee31280aa5a86 prototypes/windows-private-storage/tests/setup-fixtures.ps1
           check 944dfdd13f176eed9df0340db45a81a7d83e68308667ee7bc4980b10956fb751 prototypes/windows-private-storage/tests/run-as-user.ps1
@@ -221,7 +221,7 @@ jobs:
             if [ "${ACTUAL}" = "$1" ]; then echo "pin ok ${ACTUAL} $2"; else echo "::error::$2 sha256 ${ACTUAL} does not match pin $1"; FAIL=1; fi
           }
           # independent harness (tester-owned)
-          check 516877652bc87aac2f570ae073b63ab20f49734ad87ea892821c8960c09c9521 prototypes/windows-private-storage/tests/acl.test.mjs
+          check 839ba8894968776c4cd3661e8e702ba030e0dbf7f5a540a7197f61c428a4fb24 prototypes/windows-private-storage/tests/acl.test.mjs
           check e08a0373bf33f0f10052dd76977055287e8c88b573219a338e64f2b71fc99dd1 prototypes/windows-private-storage/tests/wrapper.test.mjs
           check 19a10f53bc681dfe41c45b8ae1c44f5fdcb75de947ec37f447fee31280aa5a86 prototypes/windows-private-storage/tests/setup-fixtures.ps1
           check 944dfdd13f176eed9df0340db45a81a7d83e68308667ee7bc4980b10956fb751 prototypes/windows-private-storage/tests/run-as-user.ps1
@@ -253,6 +253,12 @@ jobs:
           ACTUAL="$(sha256sum -b < "${NODE_EXE}" | cut -d" " -f1)"
           [ "${ACTUAL}" = "${PSP_NODE_EXE_SHA256}" ] || { echo "::error::node.exe sha256 ${ACTUAL} != pin"; exit 1; }
           echo "node ok ${ACTUAL} ${NODE_EXE}"
+
+      # Pure-Node oracle selfcheck (synthetic inputs only; no native, no helper, no fake accounts). Fail-closed.
+      - name: Oracle selfcheck (pure Node only)
+        run: |
+          set -euo pipefail
+          env -u PSP_WRAPPER_PATH PSP_PHASE=selfcheck node --test --test-reporter=tap prototypes/windows-private-storage/tests/acl.test.mjs | tee "${RUNNER_TEMP}/psp1167-receipts/acl-selfcheck.tap"
 
       # Wrapper regression against a STUB native (fake process.dlopen, fake bytes). Runs before the helper is
       # downloaded: the real helper is never loaded here; it loads only as fake user A in the validation step.
