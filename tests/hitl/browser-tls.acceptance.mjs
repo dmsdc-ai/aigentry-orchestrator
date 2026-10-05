@@ -774,6 +774,21 @@ let counterPreserved = 'u', sessionCleared = 'u', disposeClean = 'u';
 const DISPOSE_OUTCOMES = ['not-run', 'ok', 'timeout', 'error'];
 let disposeRemove = 'not-run', disposeDetach = 'not-run';
 const disposeFault = error => (error && error.message === 'deadline' ? 'timeout' : 'error');
+// #1177 Run 935c151 printed `fail (cli)` with the Console at `stage=receipt`: everything after the
+// Console settles — its page and service teardown, the legacy page and authenticator, browser
+// close, the library gate, `cleanup()` and the receipt validation — reports as that one phase,
+// and the log could not say which step, or which part of the `cleanup()` verdict, failed. Static
+// names and y/n/u flags only, re-clamped by the renderer; no check reads them.
+const TEARDOWN_STEPS = ['not-started', 'console-clean-dom', 'console-close', 'console-terminate',
+  'legacy-clean-dom', 'legacy-authenticator', 'browser-close', 'focus-gate', 'returned', 'validate', 'write', 'complete'];
+const TEARDOWN_FLAGS = ['settled', 'owned', 'dispose', 'logs', 'temporary'];
+let teardownStep = 'not-started';
+const teardownClean = { settled: 'u', owned: 'u', dispose: 'u', logs: 'u', temporary: 'u' };
+function renderTeardown() {
+  const flagT = value => (['y', 'n', 'u'].includes(value) ? value : 'u');
+  return `step=${TEARDOWN_STEPS.includes(teardownStep) ? teardownStep : 'unknown'}`
+    + TEARDOWN_FLAGS.map(key => ` ${key}=${flagT(teardownClean[key])}`).join('');
+}
 /** Static, clamped a second time here exactly like `renderLoginBoundary`: closed-enum
  *  names, bounded counts, bounded status codes and y/n/u flags only. No check reads it. */
 function renderTransfer() {
@@ -805,9 +820,12 @@ function routeSeen(state, pathname) {
  *  a pass and the caller's original rejection always survives it. The owned authenticator and
  *  CDP session are dropped either way, and a dirty teardown is latched into `disposeClean`,
  *  which the run-wide `cleanup()` folds into its own `clean` verdict — so a cleanup fault
- *  still fails an otherwise-passing run, just never in place of an earlier failure. */
+ *  still fails an otherwise-passing run, just never in place of an earlier failure.
+ *  #1177 Runs once per authenticator: the explicit release at the end of its lifetime and the
+ *  caller's `finally` both reach it, and the second call must not overwrite the first verdict. */
 async function disposeCounterfactual(owned) {
-  if (!owned) return;
+  if (!owned || owned.disposed) return;
+  owned.disposed = true;
   let clean = true;
   if (owned.cdp && owned.authenticatorId) {
     try { await bounded(owned.cdp.send('WebAuthn.removeVirtualAuthenticator', { authenticatorId: owned.authenticatorId }), 5000); disposeRemove = 'ok'; }
@@ -1112,23 +1130,40 @@ async function main() {
         run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, job: 'browser-tls' },
       browser: { playwright: '1.58.2', version: VERSION, revision: '1208', executableHash } } });
   // Negative first, then the bounded correction, then the ORIGINAL Console acceptance runs
-  // unchanged on top of it. The owned authenticator has to outlive `loginUI`, so it is
-  // disposed only once `consoleAcceptance` has settled — including when it rejects, where
-  // the rejection is preserved and rethrown past the cleanup.
+  // unchanged on top of it. #1177 The owned authenticator has to outlive the last ceremony
+  // on this page — `loginUI` and the re-sign-in after the reload in `reload-deep-link` — and
+  // no longer: the Console calls `releaseAuthenticator` right there, before the lifecycle
+  // window attaches and detaches its own CDP sessions on this same page. Run 935c151 measured
+  // the late removal failing (`dispose-remove=error dispose-detach=ok`) after that window.
+  // The release must be clean at that point, so a fault fails the run there, by name. On a
+  // rejection before it, the `finally` still disposes and the rejection is preserved.
   const counterfactual = await consoleCounterfactual({ context, cdp, authenticatorId,
     page: consolePage, state: consoleState, origin: consoleDeps.origin });
+  consoleDeps.releaseAuthenticator = async () => {
+    await disposeCounterfactual(counterfactual);
+    check(disposeClean === 'y');
+  };
   let consoleEvidence;
   try { consoleEvidence = await consoleAcceptance(consoleDeps); }
   finally { await disposeCounterfactual(counterfactual); }
+  teardownStep = 'console-clean-dom';
   await cleanDOM(consolePage, consoleState);
-  await consolePage.close(); await terminate(consoleProc);
+  teardownStep = 'console-close';
+  await consolePage.close();
+  teardownStep = 'console-terminate';
+  await terminate(consoleProc);
   current = 'cli';
+  teardownStep = 'legacy-clean-dom';
   await cleanDOM(page, state); done('no-execution');
+  teardownStep = 'legacy-authenticator';
   await cdp.send('WebAuthn.removeVirtualAuthenticator', { authenticatorId });
+  teardownStep = 'browser-close';
   await closeBrowser(context);
   // Again after the run: the library every control above ran on is still the pinned copy.
+  teardownStep = 'focus-gate';
   focusGate();
   check(focusLibrary.source === 'runner-temp-copy');
+  teardownStep = 'returned';
   // The evidence digest includes only bounded observations, never raw browser data.
   return { schemaVersion: 1, status: 'pass', skipped: 0, started, finished: '', assertions: 0,
     candidate: head, hashes, runner: { node: process.version, openssl, nss, hashes: await toolHashes(), image: process.env.ImageOS, imageVersion: process.env.ImageVersion,
@@ -1152,14 +1187,19 @@ async function cleanup() {
   let clean = results.every(result => result.status === 'fulfilled') && workSettled
     && browsers.size === 0 && contexts.size === 0 && children.size === 0 && services.size === 0
     && disposeClean !== 'n';
+  // #1177 The same conjuncts, latched one by one for the failure handler's teardown line.
+  teardownClean.settled = results.every(result => result.status === 'fulfilled') && workSettled ? 'y' : 'n';
+  teardownClean.owned = browsers.size === 0 && contexts.size === 0 && children.size === 0 && services.size === 0 ? 'y' : 'n';
+  teardownClean.dispose = disposeClean !== 'n' ? 'y' : 'n';
+  teardownClean.logs = 'y';
   for (const log of logs) {
     const text = Buffer.concat(log.chunks).toString('utf8');
-    if (log.overflow || [...secrets].some(secret => text.includes(secret))) clean = false;
+    if (log.overflow || [...secrets].some(secret => text.includes(secret))) { clean = false; teardownClean.logs = 'n'; }
     log.chunks.length = 0;
   }
   if (temporary && clean) {
-    try { await bounded(rm(temporary, { recursive: true, force: true, maxRetries: 2 }), 10000); }
-    catch { clean = false; }
+    try { await bounded(rm(temporary, { recursive: true, force: true, maxRetries: 2 }), 10000); teardownClean.temporary = 'y'; }
+    catch { clean = false; teardownClean.temporary = 'n'; }
   }
   check(clean); done('private-logs'); done('cleanup');
 }
@@ -1263,13 +1303,16 @@ async function entry() {
   if (failure) throw new Error('acceptance_failed');
   receipt.controls = Object.fromEntries(outcomes); receipt.finished = new Date().toISOString(); receipt.assertions = assertions;
   receipt.evidenceDigest = digest(JSON.stringify({ controls: receipt.controls, observations: receipt.observations, console: receipt.console }));
+  teardownStep = 'validate';
   await Promise.race([validate(receipt), aborted]);
   // A synchronous write cannot finish after a cancellation has removed its receipt.
   await new Promise(resolveImmediate => setImmediate(resolveImmediate));
   active();
+  teardownStep = 'write';
   writeFileSync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
   await new Promise(resolveImmediate => setImmediate(resolveImmediate));
   active();
+  teardownStep = 'complete';
   writeSync(1, 'browser-tls acceptance: pass\n');
   clearTimeout(globalTimer);
 }
@@ -1356,5 +1399,12 @@ await entry().catch(() => {
   let layout = 'viewport=unavailable';
   try { layout = renderResponsiveLayout(); } catch { layout = 'viewport=unavailable'; }
   process.stderr.write(`browser-tls acceptance: responsive-layout (${layout})\n`);
+  // Ninth static line, same discipline, for the phase actual CI run 935c151 stops in (`fail (cli)`
+  // at Console `stage=receipt`): the last post-Console step entered, and one y/n/u flag per part
+  // of the `cleanup()` verdict. Static names and flags only, re-clamped by the renderer; stderr
+  // only; no check reads it and a renderer fault cannot disturb this handler exit.
+  let teardown = 'step=unavailable';
+  try { teardown = renderTeardown(); } catch { teardown = 'step=unavailable'; }
+  process.stderr.write(`browser-tls acceptance: teardown (${teardown})\n`);
   process.exitCode = 1;
 });

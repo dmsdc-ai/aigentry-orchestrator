@@ -85,7 +85,9 @@ export const CONSOLE_OPS = ['not-started',
   'tt-semantics', 'tt-headers', 'tt-cells', 'tt-keyboard', 'tt-region', 'tt-restore', 'tt-mark',
   'rv-column-reach',
   // #1177 The explicit visible-page precondition at the head of `responsive`.
-  'rv-front', 'rv-visible-wait'];
+  'rv-front', 'rv-visible-wait',
+  // #1177 The end of the caller's owned authenticator lifetime, after the last ceremony.
+  'rdl-release-authenticator'];
 let currentOp = 'not-started';
 export const consoleOp = () => currentOp;
 export function setConsoleOp(name) {
@@ -1605,6 +1607,11 @@ export async function consoleAcceptance(deps) {
   await uiControls(deps, alpha);
   await taskTable(deps, alpha);
   await reloadDeepLink(deps, alpha);
+  // #1177 The re-sign-in above is the last WebAuthn ceremony this page runs, so the caller's owned
+  // authenticator is released here, explicitly and checked by the caller, before the lifecycle
+  // window attaches and detaches CDP sessions on this same page. Nothing below signs in.
+  setConsoleOp('rdl-release-authenticator');
+  await deps.releaseAuthenticator();
   const flight = await singleFlight(deps);
   await lifecycleWindow(deps, fixtures, issued);
   await deps.cleanDOM(deps.page, deps.state);
