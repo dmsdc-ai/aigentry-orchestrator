@@ -1,8 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
-import { constants } from 'node:fs';
-import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { spawn, spawnSync } from 'node:child_process';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -252,20 +251,34 @@ if (process.platform !== 'win32') test('unreadable record produces a warning whe
   await corrupt(root);
 });
 
-if (process.platform === 'win32') test('unreadable record produces a warning while the file is exclusively locked', async t => {
+if (process.platform === 'win32') test('unreadable record produces a warning while the file is exclusively locked', { timeout: 90000 }, async t => {
   const root = await fixture(t);
   const file = await put(root, record());
-  // Context for the POSIX-only registration above: the token's backup privilege state (libuv opens
-  // with FILE_FLAG_BACKUP_SEMANTICS, which skips DACL checks when that privilege is enabled).
-  const priv = spawnSync(join(process.env.SystemRoot ?? '', 'System32', 'whoami.exe'), ['/priv', '/fo', 'csv', '/nh'], { encoding: 'utf8' });
-  t.diagnostic(/^"SeBackupPrivilege",.*$/m.exec(priv.stdout ?? '')?.[0] ?? `SeBackupPrivilege: unknown ${priv.error ?? ''}`);
-  // libuv UV_FS_O_EXLOCK (include/uv/win.h, 0x10000000): share mode 0, so every other open fails with
-  // a sharing violation (EBUSY) for every token, privileges included.
-  const lock = await open(file, constants.O_RDONLY | 0x10000000);
+  // A helper process holds the record with share mode None, so every other open fails with a sharing
+  // violation for every token (backup privilege included). .NET calls only; the path travels as base64.
+  const script = `$f=[IO.File]::Open([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(file).toString('base64')}')),'Open','Read','None');`
+    + "[Console]::Out.WriteLine('ready');[Console]::Out.Flush();[void][Console]::In.ReadLine();$f.Dispose()";
+  const helper = spawn(join(process.env.SystemRoot ?? '', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, stdio: 'pipe' });
+  let out = '', err = '';
+  helper.stdout.setEncoding('utf8').on('data', (chunk: string) => { out += chunk; });
+  helper.stderr.setEncoding('utf8').on('data', (chunk: string) => { err += chunk; });
+  const exited = new Promise<string>(resolve => { helper.once('error', e => resolve(`error ${e.message}`)); helper.once('close', (code, sig) => resolve(`exit ${code} ${sig}`)); });
+  const bounded = <T>(work: Promise<T>, ms: number, late: T) => {
+    let timer: NodeJS.Timeout | undefined;
+    return Promise.race([work, new Promise<T>(resolve => { timer = setTimeout(resolve, ms, late); })]).finally(() => clearTimeout(timer));
+  };
   try {
-    await assert.rejects(readFile(file), (error: NodeJS.ErrnoException) => error.code === 'EBUSY');
+    const ready = await bounded(Promise.race([new Promise<boolean>(resolve => helper.stdout.on('data', () => { if (out.includes('ready')) resolve(true); })), exited.then(() => out.includes('ready'))]), 30000, false);
+    assert.ok(ready, `helper did not report ready: out=${JSON.stringify(out)} err=${JSON.stringify(err)} exitCode=${helper.exitCode}`);
+    const code = await readFile(file).then(() => 'read succeeded', (error: NodeJS.ErrnoException) => error.code);
+    assert.ok(['EBUSY', 'EPERM', 'EACCES'].includes(code ?? ''), `precondition failed: readFile of the record held with share mode None did not reject (${code})`);
     await corrupt(root);
-  } finally { await lock.close(); }
+    helper.stdin.end();
+    assert.equal(await bounded(exited, 15000, 'timeout'), 'exit 0 null', `helper did not exit cleanly: err=${JSON.stringify(err)}`);
+    assert.throws(() => process.kill(helper.pid!, 0), (error: NodeJS.ErrnoException) => error.code === 'ESRCH');
+    assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), record());
+  } finally { if (helper.exitCode === null && helper.signalCode === null) { helper.kill(); await bounded(exited, 15000, 'timeout'); } }
 });
 
 test('source/evidence bytes, metadata and directory entries remain unchanged', async t => {
