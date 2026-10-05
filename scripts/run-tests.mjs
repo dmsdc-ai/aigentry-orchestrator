@@ -45,6 +45,8 @@ sourceTestFiles.push('tests/dispatch/fake-cmux-win32.inert.test.mjs');
 // #1191 — #1169 preservation suites (Node built-ins, test-owned fixture roots) are selected on every OS,
 // win32 included. Selection only: no Windows support is claimed and a Windows failure is not silenced.
 sourceTestFiles.push('tests/packaging/preservation.test.mjs', 'tests/packaging/preservation-directories.test.mjs');
+// #1172 — workflow policy regression reads staged docs/package metadata with Node built-ins only; every OS.
+sourceTestFiles.push('tests/packaging/workflow-policy.test.mjs');
 // Native capture fixtures require POSIX ownership/modes and the boot wizard suite drives an
 // owned POSIX PTY; Windows support is still absent for both.
 if (process.platform === 'darwin' || process.platform === 'linux') {

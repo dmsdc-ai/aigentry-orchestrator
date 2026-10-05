@@ -268,8 +268,12 @@ Do NOT idle or wait — report is REQUIRED before any other action.
 ## Rule 12. 구현 위임 시 컨텍스트 클리어 필수 (HARD RULE)
 구현 위임 전 반드시 대상 세션 `/clear` 후 위임. 컨텍스트 오염(이전 실패 코드/가정)이 다음 시도를 망친다.
 
+2026-10-04 사용자 승인 예외: 이전 대화를 재개하지 않은 신규 프로세스, 빈 대화, 정확한 task/sid/attempt 격리를 확인한 경우에만 새 세션의 첫 지시로 구현을 시작할 수 있다. 기존 세션 재사용에는 `/clear`를 유지한다. 신규 프로세스라는 추정이나 새 workspace 이름만으로는 충분하지 않으며, 시작 명령의 resume/continue 부재와 실제 초기 대화·격리 증거를 태스크에 기록한다. 증거가 없으면 구현하지 않는다. 이 예외는 강제 Enter, 준비 검사 생략, 권한 확대를 허용하지 않는다. 정책 반영과 배포·설치본 검증은 별개다. 승인: `call_VizItPZvikZjsD6nbES6fjX9`, 소유 태스크 #1166, 릴리즈 #1171.
+
 ### Rule 12-1. 크리티컬 버그 위임 시 컨텍스트 클리어 필수 (HARD RULE)
 P0/크리티컬 버그 위임 시 반드시 `/clear` 후 위임. 시간이 걸려도 클리어 먼저.
+
+검증된 신규 세션의 첫 지시에는 Rule 12의 2026-10-04 승인 예외와 동일한 증거 요건을 적용한다. 누적 세션에 대한 클리어 의무는 유지한다.
 
 ## Rule 13. 빌드/실행은 builder에 위임 (HARD RULE)
 오케스트레이터는 `make`, `cargo build`, `npm run build`, `open *.app`, `pkill`, `npm publish` 직접 수행 금지. 모든 빌드/실행/배포는 **builder 세션**(aigentry-builder-claude)에 위임.
@@ -321,17 +325,22 @@ aterm 빌드 테스트 시 **무조건 sandbox**:
 ## Rule 22. 가설 생성 금지 (HARD RULE)
 오케스트레이터는 가설/추측 생성 금지. 증거(로그, 스크린샷, 세션 보고)만 전달, 원인 분석과 판단은 analyst에 위임. "~로 보입니다", "~의심됩니다", "~가능성" 같은 표현 금지 — 확인된 사실만 기술.
 
-## Rule 24. 스펙 선작성 + 사용자 승인 필수 (HARD RULE)
-모든 하위 세션 작업은 **스펙 선작성 → 오케스트레이터 경유 사용자 승인 → 구현 착수** 순서로 진행.
+## Rule 24. 스펙 선작성 + 승인 범위 확인 (HARD RULE)
+모든 하위 세션 작업은 **스펙 선작성 → 승인 범위 확인 → 구현 착수** 순서로 진행.
 
-- **위임 형식**: inject에 포함:
+- **2026-09-21 사용자 승인**: 이미 승인된 릴리즈 범위 안의 버그 수정·회귀 테스트·이식성 수정은 오케스트레이터가 스펙과 근거를 검토한 뒤 자율 위임한다. 같은 범위의 수정마다 사용자 승인을 다시 요구하지 않는다.
+- **별도 사용자 승인 유지**: 새 아키텍처·권한 확대·비용·개인정보·파괴적 변경은 Rule 47에 따라 확인한다. 이미 대기 중인 해당 설계도 이 규칙 변경만으로 승인되지 않는다.
+- **범위와 증거**: 자율 위임에도 소유 태스크·릴리즈·정확한 변경 파일·기존 승인 근거·재현/검증 계획을 기록하고, 실제 격리·독립 검증·보안·설치/릴리즈 게이트를 유지한다. 오케스트레이터 판단을 새로운 사용자 승인으로 기록하지 않는다.
+
+- **미승인 설계의 위임 형식**: inject에 포함:
   ```
   [SPEC FIRST] Do NOT implement yet. Submit spec to orchestrator first.
   Spec format: Goal | Scope | Files to modify | Approach | Verification | Risks.
   After user approval, orchestrator will send [IMPLEMENT APPROVED] signal.
   ```
-- **예외**: 사소한 오타/빌드 에러 수정, 이미 승인된 스펙 내 연속 작업, 긴급 P0 fix
-- **검토 프로세스**: 세션 스펙 보고 → 오케스트레이터가 사용자에게 제시 → 사용자 승인/수정 요청 → 승인 시 `[IMPLEMENT APPROVED]` inject
+- **승인 범위 내 위임 형식**: 검토한 스펙과 기존 승인 근거를 자기완결적 ref에 포함하고 `[IMPLEMENT APPROVED]`를 명시한다. 스펙 생략, 범위 확대 또는 미검증 완료 선언을 허용하는 예외가 아니다.
+- **기존 예외 유지**: 사소한 오타/빌드 에러 수정, 이미 승인된 스펙 내 연속 작업, 긴급 P0 fix. 별도의 권한·개인정보·파괴적 변경 게이트를 우회하지 않는다.
+- **검토 프로세스**: 세션 스펙 보고 → 오케스트레이터가 승인 범위와 근거 검토 → 범위 내 수정은 자율 위임, 새 결정은 사용자 승인/수정 요청 → `[IMPLEMENT APPROVED]` inject
 - **목적**: 리워크 비용 방지, 사용자 방향성 통제 유지
 - 교훈(2026-04-11 #240): 스펙 확인 없이 implement → 재디자인 요청 발생
 
@@ -611,11 +620,18 @@ Memory: `feedback_session_cleanup_protocol.md`.
 3. **순차 허용은 2가지뿐** — (a) 같은 파일/같은 자원 충돌, (b) 본질적 데이터 의존(A의 출력 = B의 입력). 그 외 순차 dispatch 금지.
 4. **순차 결정은 사유 기록** — 순차를 택할 때마다 (a)/(b) 중 무엇인지 task note(`state/task-queue.json`) 또는 dispatch 로그에 남긴다. 미기록 순차 = 위반.
 
+#### 자원 기반 동시 실행 (2026-09-24 사용자 정정)
+- **워커 수의 고정 상한은 없다.** 2개·4개 등 임의 숫자나 deliberation 도구 오류를 스폰 상한으로 적용하지 않는다. 실행할 독립 태스크가 있고 실제 자원이 허용하면 추가 스폰한다.
+- CPU 부하, 메모리 압력·스왑 변화, 프로세스/터미널 용량, 공급자 API 동시성·rate limit, 승인된 사용량을 측정해 배치한다. 한 시점의 여유 수치만으로 무한 수용을 주장하지 않으며, 확장 후 다시 측정한다. 자원 대기에는 관측값·대기 대상·재개 조건을 기록한다.
+- deliberation은 충돌 조정 수단이지 워커 수나 인간 승인 게이트가 아니다. 도구가 위임받은 선택을 표현하지 못하면 task board/dispatch 기록으로 파일 소유권·진행·보고·미응답을 추적하며 독립 작업을 계속한다. 실제로 하지 않은 사용자 TUI 선택을 꾸미지 않는다.
+- 태스크/릴리즈 바인딩, 실제 최소 권한 격리, 파일별 단일 작성자, 독립 검증, telepty 통신, 비용·권한 등의 실제 승인 경계는 그대로 유지한다. 고정 상한 제거는 이 경계의 해제가 아니다.
+- 런타임 자원 입장 제어·회복·설치 검증과 도구 선택 출처 수정은 #1136/#1148/#1172/#1171에서 검증한다. 이 정책 문구는 자동 스케줄러 구현 완료가 아니다.
+
 #### What this rule rejects
 - 통짜 태스크를 분해 없이 1세션에 주입 ("한 세션이 다 하면 되지")
 - "같은 프로젝트니까 1세션" — 결합 근거 없는 묶음은 금지; 판단 단위는 태스크/계약, 충돌 검사는 파일/자원 (Rule 9/10)
 - 사유 없는 순차 wave — 왜 병렬이 아니었는지 사후 재구성 불가
-- 병렬 분해는 했으나 아래 Cross-references의 안전장치(worktree 격리 / 고유 `--track` / deliberation)를 빠뜨린 주입
+- 병렬 분해는 했으나 worktree 격리 / 고유 `--track` / 파일 소유권과 진행·보고 추적을 빠뜨린 주입
 
 #### 예외
 - **단일 산출물 또는 같은 태스크의 밀접한 연관 파일 집합** 작업 (Rule 9, 2026-09-19 승인). 파일 수는 필요한 세션 수의 하한이 아니다. 독립 검증 역할은 합치지 않는다.
@@ -628,7 +644,7 @@ Memory: `feedback_session_cleanup_protocol.md`.
 - Rule 34 (Task-Based Execution): 각 단위는 등록된 소유 태스크와 연결해야 dispatch task-gate(`--task <id>`)를 통과한다. 같은 태스크의 구현·독립 검증을 별도 세션에 위임한다는 이유로 중복 태스크를 만들지 않는다.
 - 같은 repo 병렬 coder는 **worktree 격리** 필요 (공유 git index race) — memory `feedback_parallel_coders_same_repo_worktree.md`.
 - 병렬 dispatch는 **task-id 기반 고유 `--track`** 필수 (track 공유 시 shared-fate cascade-kill) — memory `feedback_telepty_duplicate_id_shared_fate.md`.
-- 병렬 세션 **≥3이면 deliberation MCP 경유** — AGENTS.md "병렬 위임 시 Deliberation 경유".
+- deliberation MCP를 조정에 사용하되, 세션 수만으로 필수화하거나 도구 장애 때문에 병렬 실행을 막지 않는다. 사용 불가 시 위 자원 기반 동시 실행 절차로 조정한다.
 - Memory: `~/.claude/projects/-Users-duckyoungkim-projects-aigentry-orchestrator/memory/feedback_mandatory_parallel_breakdown_dispatch.md`
 
 ## Rule 37. 모호한 태스크는 게이트를 통과해야 한다 (HARD RULE)

@@ -9,6 +9,8 @@ The orchestrator's per-turn delegation contract. **Rigid checklist** — run the
 
 **This skill sequences; it does NOT actuate.** All actuation already lives at the atomic script layer (`bin/dispatch.sh`, `bin/session-cleanup.sh`, `bin/tq-*.sh`, deliberation MCP). The skill owns only the ordering, gates, and human-in-the-loop checkpoints — it never reimplements spawn, inject, cleanup, or queue mutation. The orchestrator never writes `bin/` code itself (Rule 4/13) and never spawns/delegates outside this gated path (only the orchestrator delegates/spawns — ADR-MF #8 spawn-capability gate).
 
+**Operation routing.** For a repeatable operation, use the supported existing helper and inspect its documented command/output contract before writing inline code: `bin/dispatch-tracker.sh status --json --live --limit 100` (Step 2) for registry reads only, task-bound `bin/dispatch.sh` for actuation, and protected `bin/session-cleanup.sh` for lifecycle. Reuse the actual prior decisions and REPORT revisions before proposing a replacement. A missing safe helper is an explicit gap to record as a task, not permission for an ad-hoc authority path; `node -e` remains fine for a genuinely one-off transformation. This paragraph guides routing; it does not enforce anything at runtime.
+
 Read each step as a failure-mode tripwire: it states **what goes wrong if you skip it**.
 
 ## Step → infrastructure map (reused, never reimplemented)
@@ -25,7 +27,7 @@ is context isolation only. Policy text is not evidence that runtime gates are wi
 |------|--------|----------------|
 | 1 | Confirm context with user | conversation; AskUserQuestion for ambiguity (multi-interpretation surface) |
 | 1-1 | Break down → decide # sessions | `work-breakdown` skill (decompose to parallelizable tasks) + register via direct `state/task-queue.json` edit (jq); `bin/tq-track.sh`/`bin/tq-status.sh` read-only views |
-| 1-2 | Parallel breakdown MANDATORY, conflict-aware | Rules 9/10/36: bundle tightly coupled same-task files; separate independent verification; parallelize independent units; same-file conflict or data dependency ⇒ sequential **with recorded reason**; ≥3 parallel ⇒ deliberation MCP |
+| 1-2 | Parallel breakdown MANDATORY, conflict-aware | Rules 9/10/36: bundle coupled files; separate independent verification; parallelize independent units within measured resources, with no fixed worker-count cap; track ownership, progress and reports even when deliberation is unavailable |
 | 1-3 | Match CLI to task | "CLI별 역할" table (claude=architecture/MCP, codex=impl/test, gemini=websearch/docs) → `--cli` / `--role` |
 | 2 | Spawn + ref/inline + adaptor | `bin/dispatch.sh --spawn-and-dispatch --cli <c> --role <r> --ref <file> --task <id>` → `bin/open-session.sh` (`detect_terminal`) → `bin/lib/workspace-host.sh` adaptor |
 | 2-1 | Session → orchestrator clarification | `telepty inject` HOLD → orchestrator |
@@ -51,9 +53,11 @@ Decompose the confirmed work into bounded task/contract units. Apply Rules 9/10 
 > **If skipped:** no task-queue trail → step 5 has nothing to propose from, and reconcile cannot reconcile dispatches it never saw.
 
 ### 1-2 Parallel breakdown is MANDATORY, conflict-aware
-Parallel is the default for independent executable units (**Rule 36**, revised 2026-09-19). Before ANY dispatch, identify tightly coupled same-task file sets and independent units; dispatch the latter **concurrently, in one wave**. Do not split a coupled implementation solely because it touches multiple files, or merge independent verification into its implementation worker. Sequential execution between units requires (a) same-file / same-resource conflict or (b) intrinsic data dependency (A's output = B's input), recorded in the task note or dispatch log. Each file has one active writer; ownership transfer requires the prior writer to stop and its artifact to be preserved. Keep **worktree isolation**, actual task/sid/attempt confinement, **task-id-based unique `--track`**, and deliberation MCP for ≥3 parallel sessions. Bundling never authorizes a worker to widen its scope. Approved-scope composition remains autonomous; new Rule 47 decisions still require user confirmation.
+Parallel is the default for independent executable units (**Rule 36**, revised 2026-09-24). Before dispatch, identify coupled file sets, independent units and actual resource availability. There is **no fixed worker-count cap**: do not turn a count threshold or deliberation failure into a two/four-worker limit. Measure CPU load, memory pressure, capacity and provider/API limits, expand eligible work, and remeasure. Record observed resource deferrals and their resume conditions.
 
-> **If skipped:** an undecomposed monolith goes to one session and independent work serializes into pure wall-clock waiting (Rule 36 violation), or a sequential wave leaves no recorded reason to audit. Two sessions edit the same file → merge corruption / lost work. Shared `--track` → shared-fate cascade-kill. ≥3 parallel without deliberation → no conflict detection, silent divergence.
+Do not split a coupled implementation solely by file count or merge independent verification into its implementation worker. Sequential execution requires a recorded file/resource conflict or intrinsic data dependency. Keep one writer per file, **worktree isolation**, actual task/sid/attempt confinement and a unique task-bound track. Use deliberation where useful; when unavailable, use the task board/dispatch records to coordinate ownership, progress, reports and nonresponse. Never fabricate a human selection to satisfy a tool. Approved-scope composition remains autonomous; actual Rule 47 decisions still require user confirmation. Policy text is not runtime admission-control or installed-release evidence.
+
+> **If skipped:** arbitrary count limits serialize independent work; unmeasured expansion overloads the host/provider. Untracked ownership risks conflicting writes, and shared tracks risk shared-fate cleanup. Tool availability must not replace conflict/progress tracking.
 
 ### 1-3 Match the CLI to the task
 Fresh dispatches use the model router by default; explicit `--cli` overrides it. Within an approved task, choose CLI/model/effort/role/session/parallel composition and deliberation participants autonomously using task fit, verified capability, availability, confinement and budget limits (Rule 6, 2026-09-12). Preserve valid user overrides and briefly record the rationale; do not ask the user to pick workers on every wave. Record delegated/controller selection honestly, never as a fabricated human UI click or authority proof. Pass `--role` for context isolation; separately verify actual task/sid/attempt confinement (Rule 46). New scope, purchases, private transfer, destructive actions and authority changes still require Rule 47 decisions.
@@ -64,7 +68,23 @@ Fresh dispatches use the model router by default; explicit `--cli` overrides it.
 
 ## Step 2 — Spawn via the terminal adaptor + inject context
 
+Apply Rule 12/12-1 from `docs/rules.md`: clear reused implementation sessions. The
+2026-10-04 approved first-instruction exception requires evidence of a new process,
+no resumed history, an empty conversation and exact task/sid/attempt confinement.
+Record those facts; a new workspace name is not proof. Never force Enter or bypass
+readiness. Policy text alone does not establish installed/runtime enforcement.
+
 First confirm the full 위임 전 체크리스트 (approved task/scope, controller-selected target, MANDATORY report path, [SAWP] envelope, lessons, SPEC FIRST, self-contained ref). Do not repeat user approval for ordinary worker composition within that scope. Then spawn via the dispatch helper, never raw spawn (Rule 32 HARD). `--spawn-and-dispatch` carries context through a **ref file**; raw telepty is only for permitted short acknowledgements/follow-ups.
+
+Rule 24 (human revision 2026-09-21): after reviewing the spec and evidence, the
+controller may delegate bug fixes, regression tests and portability corrections
+inside an already approved release scope without another per-spec approval. Bind
+the exact files, existing approval and verification plan in the ref and explicitly
+mark implementation approved. New architecture, authority, cost, privacy or
+destructive changes still require Rule 47 approval; existing pending designs are
+not approved by this policy revision. Preserve confinement, independent validation,
+security and installed-release gates, and distinguish controller review from human
+consent. Unapproved designs remain SPEC FIRST/HOLD.
 
 ```bash
 bin/dispatch.sh --spawn-and-dispatch --track <T> --name <N> --cwd <P> \
