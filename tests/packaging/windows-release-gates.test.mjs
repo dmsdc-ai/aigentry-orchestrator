@@ -1535,6 +1535,53 @@ const ciHeaderAfter = `# What this still does NOT measure, stated so a green che
 # file: it is supported except confined worker spawn and native request capture, and those two
 # limitations are asserted as clean refusals, not skipped.
 `;
+// #1171 — the one approved change to the `test` job: both workflows carry these exact Dispatch guard
+// suite bytes, restated here as an independent literal and never derived from either workflow. It
+// replaces the step each historical fixture carried (release: cap 4; CI: cap 8) and nothing else.
+const dispatchGuardName = 'Dispatch guard suite';
+const dispatchGuardHead = `      - name: ${dispatchGuardName}\n        run: bash tests/dispatch/run-all.sh\n`;
+const releaseDispatchGuardBefore = `${dispatchGuardHead}        timeout-minutes: 4\n`;
+const ciDispatchGuardBefore = `${dispatchGuardHead}        # 4 was inside the runner's own variance, not above it. Measured on
+        # macos-latest for the SAME commit: 2m44s vs 4m11s — 87s of spread — against a
+        # main baseline of 3m07s, so the headroom was 53s < variance and the cap fired
+        # on a suite that had already printed \`guards: 118 passed: 118 failed: 0\`
+        # (one manual re-run needed). A timeout that trips on a PASSING suite teaches
+        # people to re-run red CI, which is the opposite of what it is for. 8 leaves
+        # ~5m of headroom and still catches a real hang.
+        timeout-minutes: 8
+`;
+const dispatchGuardAfter = `${dispatchGuardHead}        # The cap must sit above the runner's variance, not inside it. A cap of 4 once fired
+        # on a suite that had already printed \`guards: 118 passed: 118 failed: 0\`
+        # (macos-latest, same commit: 2m44s vs 4m11s). The suite has grown since: at bb30eb3
+        # it took 6m07s and 6m13s on macos-latest and 3m12s to 3m58s on ubuntu-latest, while
+        # release.yml still carried 4, so the first v0.2.2 tag run timed out on a suite that
+        # was passing. A timeout that trips on a PASSING suite teaches people to re-run red
+        # CI, which is the opposite of what it is for. 12 is about twice the slower runner's
+        # measured time and still catches a real hang. release.yml carries the same lines.
+        timeout-minutes: 12
+`;
+// The step that follows it in both workflows, so no byte can be appended to the approved step unseen.
+const dispatchGuardNext = '      - name: Ship-set agreement against the real tarball\n';
+const parseDispatchGuard = (label, bytes) => named(parse(label, `jobs:\n  test:\n    steps:\n${bytes}`).jobs.test, dispatchGuardName);
+const dispatchGuardSteps = {
+  release: parseDispatchGuard('historical-release-dispatch-guard', releaseDispatchGuardBefore),
+  ci: parseDispatchGuard('historical-ci-dispatch-guard', ciDispatchGuardBefore),
+  approved: parseDispatchGuard('approved-dispatch-guard', dispatchGuardAfter),
+};
+for (const historical of [dispatchGuardSteps.release, dispatchGuardSteps.ci]) {
+  assert.deepEqual({ ...historical, 'timeout-minutes': 12 }, dispatchGuardSteps.approved, 'parsed, only the Dispatch guard suite cap changes');
+}
+function withApprovedDispatchGuard(job, historical) {
+  const copy = structuredClone(job);
+  const step = named(copy, dispatchGuardName);
+  assert.deepEqual(step, historical, 'historical Dispatch guard suite step');
+  copy.steps[copy.steps.indexOf(step)] = structuredClone(dispatchGuardSteps.approved);
+  return copy;
+}
+function assertDispatchGuardBytes(source, label) {
+  assert.equal(lf(source).split(`${dispatchGuardAfter}${dispatchGuardNext}`).length, 2,
+    `${label}: exactly the approved Dispatch guard suite step bytes`);
+}
 const approvedWindows = parse('approved-windows-contract', `jobs:\n${approvedWindowsRegion}`).jobs;
 assert.deepEqual(Object.keys(approvedWindows), [declared, ...ids], 'approved Windows contract names exactly the three successor jobs');
 function withoutBrowser(workflow, release) {
@@ -1658,7 +1705,8 @@ function validate(workflow, policy = currentPolicy()) {
   delete securityEnv.RELEASE_SECURITY_POLICY_SHA256;
   delete securityEnv.RELEASE_SECURITY_COMMIT;
   assert.deepEqual(guard, original.jobs.guard, 'guard changes only the required security trust inputs');
-  assert.deepEqual(workflow.jobs.test, original.jobs.test, 'unchanged test');
+  assert.deepEqual(workflow.jobs.test, withApprovedDispatchGuard(original.jobs.test, dispatchGuardSteps.release),
+    'unchanged test except the approved Dispatch guard suite step');
   const guardSteps = workflow.jobs.guard.steps;
   const admission = guardSteps.indexOf(named(workflow.jobs.guard, 'Release planning and changed-file admission'));
   const token = guardSteps.indexOf(named(workflow.jobs.guard, 'NPM_TOKEN must be present'));
@@ -1714,10 +1762,12 @@ acceptance('baseline has zero actual Windows gates and omits both publish depend
   assert.throws(() => validate(original));
 });
 acceptance('frozen final workflow preserves non-Windows behaviour and requires the three Windows successors', 'structure', () => validate(final));
-function validateReleaseHistory(workflow) {
+function validateReleaseHistory(workflow, source = readFileSync(join(root, '.github/workflows/release.yml'), 'utf8')) {
   validate(workflow);
+  assertDispatchGuardBytes(source, 'release');
   const copy = withoutBrowser(workflow, true);
   const history = structuredClone(rejected);
+  history.jobs.test = withApprovedDispatchGuard(history.jobs.test, dispatchGuardSteps.release);
   for (const item of [copy, history]) {
     const env = named(item.jobs.guard, 'Release planning and changed-file admission').env ?? {};
     delete env.RELEASE_SECURITY_POLICY_SHA256;
@@ -1758,9 +1808,11 @@ function validateCIHistory(source, historicalSource = readFileSync(join(root, fi
   }
   const history = structuredClone(ciBefore);
   for (const id of oldIds) delete history.jobs[id];
+  history.jobs.test = withApprovedDispatchGuard(history.jobs.test, dispatchGuardSteps.ci);
   assert.deepEqual(copy, history, 'CI without its browser and Windows jobs is the historical CI without its two Windows jobs');
   // Bytes: everything before the historical Windows boundary is the historical CI except the one approved
-  // header sentence, and everything from there to EOF is the approved Windows region.
+  // header sentence and the approved Dispatch guard suite step, and everything from there to EOF is the
+  // approved Windows region.
   const bytes = lf(source);
   const addition = `jobs:\n${ciBrowserAddition}`;
   assert.equal(bytes.split(addition).length, 2, 'exactly one approved browser block at the jobs boundary');
@@ -1769,8 +1821,10 @@ function validateCIHistory(source, historicalSource = readFileSync(join(root, fi
   assert.equal(historical.split(windowsBoundary).length, 2, 'one historical Windows boundary');
   const prefix = historical.slice(0, historical.indexOf(windowsBoundary));
   assert.equal(prefix.split(ciHeaderBefore).length, 2, 'one historical Windows header sentence');
-  assert.equal(currentBytes, prefix.replace(ciHeaderBefore, () => ciHeaderAfter) + approvedWindowsRegion,
-    'every CI byte outside the approved header sentence and Windows region is the historical CI');
+  assert.equal(prefix.split(`${ciDispatchGuardBefore}${dispatchGuardNext}`).length, 2, 'one historical Dispatch guard suite step');
+  assert.equal(currentBytes, prefix.replace(ciHeaderBefore, () => ciHeaderAfter)
+    .replace(ciDispatchGuardBefore, () => dispatchGuardAfter) + approvedWindowsRegion,
+    'every CI byte outside the approved header sentence, Dispatch guard suite step and Windows region is the historical CI');
 }
 acceptance('CI Windows jobs match release and every other CI byte remains unchanged', 'ci-parity', () => validateCIHistory(readFileSync(join(root, '.github/workflows/ci.yml'), 'utf8')));
 
@@ -3659,6 +3713,11 @@ const releaseBrowserMutations = [
   ['commit trust input changed', '          RELEASE_SECURITY_COMMIT: ${{ github.sha }}\n', '          RELEASE_SECURITY_COMMIT: main\n'],
   ['original release version input changed', '          RELEASE_VERSION: ${{ steps.identity.outputs.version }}\n', '          RELEASE_VERSION: arbitrary\n'],
   ['publish authentication changed', '          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n', '          NODE_AUTH_TOKEN: arbitrary\n'],
+  // #1171 — the Dispatch guard suite step must stay the approved bytes CI carries too.
+  ['Dispatch guard suite cap back to 4', 'release.yml carries the same lines.\n        timeout-minutes: 12\n',
+    'release.yml carries the same lines.\n        timeout-minutes: 4\n'],
+  ['Dispatch guard suite step differs from CI', '        # measured time and still catches a real hang. release.yml carries the same lines.\n',
+    '        # measured time and still catches a real hang.\n'],
 ];
 // #1167 — CI's copy of the approved Windows region. Each negative relaxes exactly one bound the full-suite
 // gate or its neighbours must hold; every one must be refused by the byte and parsed comparisons.
@@ -3712,7 +3771,7 @@ for (const [workflowName, path] of [['CI', '.github/workflows/ci.yml'], ['releas
     const encode = value => lf(value).replaceAll('\n', newline);
     const check = value => workflowName === 'CI'
       ? validateCIHistory(value, encode(readFileSync(join(root, fixtureRoot, 'ci.before-parity.yml'), 'utf8')))
-      : validateReleaseHistory(parse(`${workflowName} ${ending} variant`, value));
+      : validateReleaseHistory(parse(`${workflowName} ${ending} variant`, value), value);
     acceptance(`browser projection accepts ${workflowName} ${ending}`, 'browser-projection', () => check(encode(source)));
     const mutations = workflowName === 'CI' ? [
       ...browserMutations,

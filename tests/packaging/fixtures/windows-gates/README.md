@@ -75,7 +75,10 @@ ids. The release workflow must equal `rejected-release.yml` once the security
 inputs, the browser job, the retired and successor Windows jobs and the publish
 dependencies are removed from both. CI must equal `ci.before-parity.yml` byte for
 byte up to its Windows boundary, except one approved header sentence, followed by
-the approved Windows region. The retired debt ratchet is replayed from the
+the approved Windows region. The one other approved change (#1171) is the
+`Dispatch guard suite` step: both workflows carry the same independent approved
+bytes for it (cap 12), in place of the historical step (release cap 4, CI cap 8).
+The retired debt ratchet is replayed from the
 fixture only, as history. The security pin must be `UNREVIEWED` while no
 `release/security/<version>/policy.json` exists and exactly the sha256 of that
 file once it does; derived pins are refused. Current product YAML hashes are

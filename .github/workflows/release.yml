@@ -1085,7 +1085,15 @@ jobs:
       # `npm test` is what builds it.
       - name: Dispatch guard suite
         run: bash tests/dispatch/run-all.sh
-        timeout-minutes: 4
+        # The cap must sit above the runner's variance, not inside it. A cap of 4 once fired
+        # on a suite that had already printed `guards: 118 passed: 118 failed: 0`
+        # (macos-latest, same commit: 2m44s vs 4m11s). The suite has grown since: at bb30eb3
+        # it took 6m07s and 6m13s on macos-latest and 3m12s to 3m58s on ubuntu-latest, while
+        # release.yml still carried 4, so the first v0.2.2 tag run timed out on a suite that
+        # was passing. A timeout that trips on a PASSING suite teaches people to re-run red
+        # CI, which is the opposite of what it is for. 12 is about twice the slower runner's
+        # measured time and still catches a real hang. release.yml carries the same lines.
+        timeout-minutes: 12
       - name: Ship-set agreement against the real tarball
         run: bash tests/packaging/T96_ship_set_agreement.sh
       # Announces its own skip when the upstream repo is absent, which it always is here.
