@@ -99,6 +99,12 @@ async function child(config: Config): Promise<void> {
         return typeof value === "function" ? value.bind(object) : value;
       } });
     }) as typeof fsp.open,
+    rename: (async (...args: Parameters<typeof fsp.rename>) => {
+      if (config.fault === "cursor-rename" && String(args[1]) === cursor) fault("EIO", cursor);
+      await fsp.rename(...args);
+      // win32 has no directory fsync (atomic-write.ts): the cursor rename is its commit point (P3).
+      if (process.platform === "win32" && String(args[1]) === cursor) await barrier("commit-before-stdout");
+    }) as typeof fsp.rename,
   };
   const context = vm.createContext({ Buffer, process, setTimeout, clearTimeout, console });
   const modules = new Map<string, vm.Module>();
@@ -295,7 +301,8 @@ async function suite(): Promise<void> {
     assert.equal(s.cursor.retries[0]!.error_code, "ENOSPC");
     seed(f, "C", undefined, later); const recovered = stage(f, "recovered", { at: later }); exact(recovered, "A"); exact(recovered, "C");
   });
-  for (const fault of ["cursor-space", "cursor-sync", "cursor-dir-sync"]) await test(`R08-${fault}: cursor uncertainty retains copies and emits no NEW`, () => {
+  // cursor-dir-sync is not registered on win32 (no directory fsync); cursor-rename is its boundary there, on every OS.
+  for (const fault of ["cursor-space", "cursor-sync", ...(process.platform === "win32" ? [] : ["cursor-dir-sync"]), "cursor-rename"]) await test(`R08-${fault}: cursor uncertainty retains copies and emits no NEW`, () => {
     const f = fixture(run, fault); initial(f, { retries: [pending("A")] }); seed(f, "A"); seed(f, "B");
     const before = fs.readFileSync(cursorFile(f), "utf8");
     const s = stage(f, "fault", { fault });
@@ -363,10 +370,8 @@ async function suite(): Promise<void> {
 if (isChild) await child(JSON.parse(process.argv[3]!) as Config);
 else {
   try {
-    if (process.platform === "darwin" || process.platform === "linux") await suite();
-    else await test("report sweep retry: POSIX directory fsync and SIGKILL barriers", {
-      skip: `Requires macOS/Linux; ${process.platform} coverage is unmeasured`,
-    }, () => {});
+    // Every OS. On win32, kill("SIGKILL") is TerminateProcess and Node reports it as signal SIGKILL.
+    await suite();
   } finally {
     for (const { proc } of activeChildren) {
       if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");

@@ -64,7 +64,7 @@ if (cfg) {
   const err = (code, file) => { fs.appendFileSync(cfg.log, code + " " + file + "\\n");
     return Object.assign(new Error(code + ": " + cfg.token + " " + file), { code, path: file }); };
   const cursor = path.join(cfg.state, "report-cursor.json");
-  const rf = fs.readFileSync, rd = fs.readdirSync, st = fs.statSync, op = fsp.open, ln = fsp.link, ul = fsp.unlink;
+  const rf = fs.readFileSync, rd = fs.readdirSync, st = fs.statSync, op = fsp.open, ln = fsp.link, ul = fsp.unlink, rn = fsp.rename;
   fs.statSync = function (...a) { if (cfg.kind === "stat" && String(a[0]) === cfg.target) throw err("EACCES", String(a[0]));
     return Reflect.apply(st, fs, a); };
   fs.readFileSync = function (...a) { const f = String(a[0]);
@@ -82,6 +82,8 @@ if (cfg) {
     return Reflect.apply(ln, fsp, a); };
   fsp.unlink = async function (...a) { if (cfg.kind === "lock-release" && String(a[0]) === cursor + ".lock") throw err("EPERM", String(a[0]));
     return Reflect.apply(ul, fsp, a); };
+  fsp.rename = async function (...a) { if (cfg.kind === "cursor-rename" && String(a[1]) === cursor) throw err("EIO", String(a[1]));
+    return Reflect.apply(rn, fsp, a); };
   syncBuiltinESMExports();
 }
 `;
@@ -98,7 +100,10 @@ function fixture(name: string, stateOverride?: string): Fixture {
   fs.mkdirSync(path.join(root, "tmp"));
   const registryLog = path.join(root, "registry-calls.log");
   const snapshot = JSON.stringify({ schema_version: 2, generation: 1, dispatches: [{ assigned: { sid: "zz777-coder" } }] });
-  fs.writeFileSync(path.join(bin, "fake-registry.sh"), `#!/bin/sh\necho "$@" >> '${registryLog}'\nprintf '%s' '${snapshot}'\n`, { mode: 0o700 });
+  // win32: the tracker runs DISPATCH_REGISTRY_PY as `python <script>` (registry seam), so the same fake is Python there.
+  if (win) fs.writeFileSync(path.join(bin, REGISTRY), `import sys\nwith open(${JSON.stringify(registryLog)}, "a", encoding="utf-8") as fh:\n` +
+    `    fh.write(" ".join(sys.argv[1:]) + "\\n")\nsys.stdout.write(${JSON.stringify(snapshot)})\n`);
+  else fs.writeFileSync(path.join(bin, REGISTRY), `#!/bin/sh\necho "$@" >> '${registryLog}'\nprintf '%s' '${snapshot}'\n`, { mode: 0o700 });
   return { root, bin, state: stateOverride ?? path.join(root, "state"), shared, registryLog, faultLog: path.join(root, "faults.log"),
     guardLog: path.join(root, "guard.log") };
 }
@@ -120,13 +125,14 @@ function walk(dir: string, prefix = "", out: Record<string, Entry> = {}): Record
 }
 
 const win = process.platform === "win32";
+const REGISTRY = win ? "fake-registry.py" : "fake-registry.sh";
 function env(f: Fixture, fault?: Record<string, string>, guarded = false): NodeJS.ProcessEnv {
   const home = path.join(f.root, "home"), tmp = path.join(f.root, "tmp");
   return { PATH: win ? (process.env.PATH ?? "") : "/usr/bin:/bin", HOME: home, TMPDIR: tmp,
     ...(win ? { SystemRoot: process.env.SystemRoot ?? "", USERPROFILE: home, TEMP: tmp, TMP: tmp } : {}),
     AIGENTRY_SHIM_SCRIPT_DIR: f.bin, DISPATCH_STATE_DIR: f.state, TELEPTY_SHARED_DIR: f.shared,
-    DISPATCH_REGISTRY_PY: path.join(f.bin, "fake-registry.sh"), TRACKER_NOW: nowIso,
-    ...(guarded ? { RS1172_GUARD: JSON.stringify({ log: f.guardLog, watch: [f.state, f.shared, path.join(f.bin, "fake-registry.sh")] }) } : {}),
+    DISPATCH_REGISTRY_PY: path.join(f.bin, REGISTRY), TRACKER_NOW: nowIso,
+    ...(guarded ? { RS1172_GUARD: JSON.stringify({ log: f.guardLog, watch: [f.state, f.shared, path.join(f.bin, REGISTRY)] }) } : {}),
     ...(fault ? { RS1172_FAULT: JSON.stringify({ log: f.faultLog, token: TOKEN, state: f.state, shared: f.shared, ...fault }) } : {}) };
 }
 function guardHits(f: Fixture): string[] {
@@ -235,11 +241,9 @@ function plainReport(name: string, mtime: number): Seeded {
   return { name, bytes: Buffer.from(`# REPORT — rs1172: ${name} ${BODY}\r\n\u0000한글\n`), mtime, kind: "REPORT", track: "rs1172" };
 }
 
-// Genuinely POSIX-dependent cases (fake `#!/bin/sh` registry, POSIX fsync/lock/EPIPE fault paths) stay gated.
-// U00–U02 are NOT gated: argv refusal must happen before any fs/registry call on every OS, and they use only
-// node built-ins plus the platform-neutral access guard. Local runs here are darwin only; native win32 is owed.
-const posix = process.platform === "darwin" || process.platform === "linux";
-const opts = posix ? {} : { skip: `fault preload and fake /bin/sh registry need POSIX; native ${process.platform} CI owed` };
+// Every case runs on every OS: the fake registry is per platform (above) and the fault preload only patches
+// node:fs builtins. Only cursor-dir-sync is not registered on win32, which has no directory fsync
+// (atomic-write.ts); its platform-equivalent boundary, the cursor rename (P3), is cursor-rename on every OS.
 
 try {
   // Positive control: the same guard DOES see state/shared/registry access on a valid sweep, so an empty
@@ -253,7 +257,7 @@ try {
     const under = (dir: string) => hits.some((h) => h.includes(dir));
     assert.ok(under(f.state), `guard missed STATE_DIR access: ${hits.slice(0, 5).join(" | ")}`);
     assert.ok(under(f.shared), "guard missed shared access");
-    assert.ok(hits.some((h) => h.startsWith("child_process.") && h.includes("fake-registry.sh")), "guard missed registry launch");
+    assert.ok(hits.some((h) => h.startsWith("child_process.") && h.includes(REGISTRY)), "guard missed registry launch");
   });
   // ── red regression: invalid report-sweep argv must be refused BEFORE any state/shared/registry access ──
   const invalid: string[][] = [["--jsn"], ["--json", "--json"], ["--json", "extra"], ["extra"], ["--JSON"], ["--json=1"],
@@ -290,7 +294,7 @@ try {
   });
 
   // ── default text mode: byte-equivalent, independently computed ──
-  await test("U03 default no-arg text: exact NEW lines, exit 0, empty stderr, exact store", opts, () => {
+  await test("U03 default no-arg text: exact NEW lines, exit 0, empty stderr, exact store", () => {
     const f = fixture("text");
     const list = mixed();
     for (const s of list) seed(f, s);
@@ -310,7 +314,7 @@ try {
   });
 
   // ── JSON mode, valid ──
-  await test("U04 --json mixed REPORT/HOLD/REF/registry/unclassified/empty/Unicode/CRLF/NUL: exact items, same store as text", opts, () => {
+  await test("U04 --json mixed REPORT/HOLD/REF/registry/unclassified/empty/Unicode/CRLF/NUL: exact items, same store as text", () => {
     const f = fixture("json");
     const list = mixed();
     for (const s of list) seed(f, s);
@@ -328,7 +332,7 @@ try {
     const again = doc(run(f, "json-again", ["report-sweep", "--json"]), "U04 again");
     assert.deepEqual(again.items, []); assert.deepEqual(again.pending, { retained_retries: 0, unattempted_fresh: 0, discovery_incomplete: false });
   });
-  await test("U05 --json valid empty (empty shared and absent shared): exact empty document", opts, () => {
+  await test("U05 --json valid empty (empty shared and absent shared): exact empty document", () => {
     const f = fixture("empty");
     const empty = { v: 1, items: [], pending: { retained_retries: 0, unattempted_fresh: 0, discovery_incomplete: false }, exit: 0, acceptance: "none" };
     const r = run(f, "empty", ["report-sweep", "--json"]);
@@ -338,7 +342,7 @@ try {
     assert.deepEqual(doc(r2, "U05 absent"), empty); assert.equal(r2.code, 0);
     assert.equal(fs.existsSync(f.shared), false, "absent shared dir must not be created");
   });
-  await test("U06 name_matches_content: digest stem true, other hex false, upper/short/plain/unsafe null; ref_id safe", opts, () => {
+  await test("U06 name_matches_content: digest stem true, other hex false, upper/short/plain/unsafe null; ref_id safe", () => {
     const f = fixture("names");
     const body = (n: number) => Buffer.from(`# REPORT — rs1172: n${n}\n`);
     const b = [1, 2, 3, 4, 5, 6].map(body);
@@ -348,7 +352,8 @@ try {
       { name: sha(b[2]!).toUpperCase(), bytes: b[2]!, mtime: base + 3000, kind: "REPORT", track: "rs1172" },
       { name: sha(b[3]!).slice(0, 63), bytes: b[3]!, mtime: base + 4000, kind: "REPORT", track: "rs1172" },
       { name: "rel-874-plain", bytes: b[4]!, mtime: base + 5000, kind: "REPORT", track: "rs1172" },
-      { name: "we ird\"ü!", bytes: b[5]!, mtime: base + 6000, kind: "REPORT", track: "rs1172" },
+      // `"` is not a legal win32 file-name character; `'` is another unsafe one that is.
+      { name: win ? "we ird'ü!" : "we ird\"ü!", bytes: b[5]!, mtime: base + 6000, kind: "REPORT", track: "rs1172" },
     ];
     // Same digest stem cannot name two files; the mismatch case gets its own stem of a different body.
     list[1] = { ...list[1]!, name: sha(Buffer.from("other content")) };
@@ -358,7 +363,7 @@ try {
     const by = new Map(d.items.map((i) => [i.ref_id, i.name_matches_content]));
     assert.deepEqual(list.map((s) => by.get(refId(s.name))), [true, false, null, null, null, null]);
   });
-  await test("U07 128 cap: 130 fresh -> 128 items + 2 unattempted, then 2 + 0", opts, () => {
+  await test("U07 128 cap: 130 fresh -> 128 items + 2 unattempted, then 2 + 0", () => {
     const f = fixture("cap");
     const list = Array.from({ length: 130 }, (_, i) => plainReport(`n-${String(i).padStart(3, "0")}`, base + i * 1000));
     for (const s of list) seed(f, s);
@@ -369,7 +374,7 @@ try {
     assert.deepEqual(byRef(d2.items), byRef(list.slice(128).map((s) => expectedItem(f, s))));
     assert.deepEqual(d2.pending, { retained_retries: 0, unattempted_fresh: 0, discovery_incomplete: false });
   });
-  await test("U08 pending rotation: 70 retained retries + 100 fresh -> 64+64 items, 6 retained, 36 unattempted", opts, () => {
+  await test("U08 pending rotation: 70 retained retries + 100 fresh -> 64+64 items, 6 retained, 36 unattempted", () => {
     const f = fixture("rotation");
     const retries = Array.from({ length: 70 }, (_, i) => plainReport(`r-${String(i).padStart(3, "0")}`, base - 7_200_000));
     const fresh = Array.from({ length: 100 }, (_, i) => plainReport(`f-${String(i).padStart(3, "0")}`, base + i * 1000));
@@ -385,8 +390,9 @@ try {
     assert.deepEqual(byRef(d2.items), byRef([...retries.slice(64), ...fresh.slice(64)].map((s) => expectedItem(f, s))));
     assert.deepEqual(d2.pending, { retained_retries: 0, unattempted_fresh: 0, discovery_incomplete: false });
   });
-  await test("U09 absolute shown inbox path outside repo with quote/backslash/Unicode is JSON-escaped verbatim", opts, () => {
-    const outside = path.join(runDir, `outside-st"ü\\ate-${counter + 1}`);
+  await test("U09 absolute shown inbox path outside repo with quote/backslash/Unicode is JSON-escaped verbatim", () => {
+    // win32: `"` cannot be in a file name and `\` is the separator, which every absolute path there already carries.
+    const outside = path.join(runDir, win ? `outside-stü\\ate-${counter + 1}` : `outside-st"ü\\ate-${counter + 1}`);
     const f = fixture("outside", outside);
     const s = plainReport("A", base);
     seed(f, s);
@@ -396,7 +402,7 @@ try {
   });
 
   // ── JSON mode, faults ──
-  await test("U10 unreadable ref: existing exit 0, truthful pending, no item/copy for A, B committed", opts, () => {
+  await test("U10 unreadable ref: existing exit 0, truthful pending, no item/copy for A, B committed", () => {
     const f = fixture("unreadable");
     const a = plainReport("A", base + 1000), b = plainReport("B", base + 2000);
     seed(f, a); seed(f, b);
@@ -407,7 +413,7 @@ try {
     assert.deepEqual(cursorOf(f).retries.map((x) => x.basename), ["A.md"]);
     assert.match(r.stderr, /report-sweep: PENDING unreadable ref/, "default diagnostic preserved on stderr");
   });
-  await test("U11 inbox copy ENOSPC: existing exit 3, A never itemised, any items are committed ones", opts, () => {
+  await test("U11 inbox copy ENOSPC: existing exit 3, A never itemised, any items are committed ones", () => {
     const f = fixture("copy");
     const a = plainReport("A", base + 1000), b = plainReport("B", base + 2000);
     seed(f, a); seed(f, b);
@@ -418,8 +424,8 @@ try {
     assert.ok(d.pending.retained_retries === 1 || d.pending.retained_retries === null);
     assertInbox(f, [b]); assert.deepEqual(cursorOf(f).retries.map((x) => x.basename), ["A.md"]);
   });
-  for (const kind of ["cursor-space", "cursor-dir-sync", "lock-release", "lock-acquire", "cursor-read"]) {
-    await test(`U12 ${kind}: exit 3, items [], pending all null, evidence kept, sanitised stdout`, opts, () => {
+  for (const kind of ["cursor-space", ...(win ? [] : ["cursor-dir-sync"]), "cursor-rename", "lock-release", "lock-acquire", "cursor-read"]) {
+    await test(`U12 ${kind}: exit 3, items [], pending all null, evidence kept, sanitised stdout`, () => {
       const f = fixture(kind);
       fs.mkdirSync(f.state, { recursive: true });
       const cursorRaw = JSON.stringify({ version: 2, last_mtime_ms: base - 60_000, seen: {}, retries: [] }) + "\n";
@@ -437,11 +443,11 @@ try {
         assert.equal(fs.readFileSync(path.join(f.state, "report-cursor.json"), "utf8"), cursorRaw);
         assert.equal(fs.existsSync(path.join(f.state, "inbox")), false);
       } else assertInbox(f, [a, b]); // copies are evidence; never rolled back
-      if (kind === "cursor-space") assert.equal(fs.readFileSync(path.join(f.state, "report-cursor.json"), "utf8"), cursorRaw);
+      if (kind === "cursor-space" || kind === "cursor-rename") assert.equal(fs.readFileSync(path.join(f.state, "report-cursor.json"), "utf8"), cursorRaw);
       if (kind === "cursor-dir-sync") assert.ok(cursorOf(f).seen.A !== undefined, "post-rename cursor retained, not rolled back");
     });
   }
-  await test("U13 invalid cursor JSON: exit 3, items [], pending null, cursor byte-identical", opts, () => {
+  await test("U13 invalid cursor JSON: exit 3, items [], pending null, cursor byte-identical", () => {
     const f = fixture("bad-cursor");
     fs.mkdirSync(f.state, { recursive: true }); fs.writeFileSync(path.join(f.state, "report-cursor.json"), "{broken");
     seed(f, plainReport("A", base));
@@ -449,7 +455,7 @@ try {
     assert.equal(r.code, 3); assert.deepEqual(d.items, []); assert.deepEqual(d.pending, unresolved);
     assert.equal(fs.readFileSync(path.join(f.state, "report-cursor.json"), "utf8"), "{broken");
   });
-  await test("U14 discovery EACCES: exit 3, discovery_incomplete true, unattempted_fresh not invented", opts, () => {
+  await test("U14 discovery EACCES: exit 3, discovery_incomplete true, unattempted_fresh not invented", () => {
     const f = fixture("discovery");
     const a = plainReport("A", base - 7_200_000);
     seed(f, a); seed(f, plainReport("B", base));
@@ -462,7 +468,7 @@ try {
     assert.equal(d.pending.discovery_incomplete, true); assert.equal(d.pending.unattempted_fresh, null);
     assert.deepEqual(d.items, [expectedItem(f, a)], "known retry recovered and committed");
   });
-  await test("U17 single-entry stat EACCES: exit 3, B itemised, retained count committed, unattempted_fresh null, floor frozen", opts, () => {
+  await test("U17 single-entry stat EACCES: exit 3, B itemised, retained count committed, unattempted_fresh null, floor frozen", () => {
     const f = fixture("stat");
     const b = plainReport("B", base + 2000);
     seed(f, plainReport("A", base + 1000)); seed(f, b);
@@ -484,7 +490,7 @@ try {
     assert.match(r.stderr, /report-sweep: PENDING stat /, "default diagnostic preserved on stderr");
     assert.deepEqual(walk(f.shared), sharedBefore, "source unchanged");
   });
-  await test("U15 text mode lock-release failure keeps existing best-effort semantics (exit 0, NEW lines)", opts, () => {
+  await test("U15 text mode lock-release failure keeps existing best-effort semantics (exit 0, NEW lines)", () => {
     const f = fixture("text-lock-release");
     const a = plainReport("A", base);
     seed(f, a);
@@ -492,7 +498,7 @@ try {
     assert.ok(r.faults.length >= 1, "fault fired");
     assert.equal(r.code, 0); assert.equal(r.stdout, `NEW rs1172 REPORT ${shownInbox(f, a)}\n`);
   });
-  await test("U16 stdout EPIPE in JSON mode: nonzero, no unhandled rejection/error, evidence kept, source unchanged", opts, async () => {
+  await test("U16 stdout EPIPE in JSON mode: nonzero, no unhandled rejection/error, evidence kept, source unchanged", async () => {
     const f = fixture("epipe");
     const a = plainReport("A", base);
     seed(f, a);
