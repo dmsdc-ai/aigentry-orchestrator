@@ -1,17 +1,18 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import vm from "node:vm";
 
-// Private temporary root, or retained explicit output; no host paths, network, global builtin patches,
-// production edits, or transformed product sources. VM modules execute actual
-// tsc output, with filesystem faults confined to one child's module imports.
+// Private temporary root, or retained explicit output; no host paths, network, production edits, or
+// transformed product sources. Each child patches node:fs / node:fs/promises in its own process only
+// (syncBuiltinESMExports), then imports the actual tsc output normally; faults target fixture paths only.
+// win32 #1167: no node:vm module linking — that --experimental-vm-modules child crashed 0xC0000005
+// before its first phase marker, while children importing the product normally do not.
 const requestedOutput = process.env.SR1166_OUTPUT;
 if (requestedOutput !== undefined && !path.isAbsolute(requestedOutput)) throw new Error("SR1166_OUTPUT must be absolute");
 const isChild = process.argv[2] === "--child";
@@ -54,27 +55,29 @@ async function child(config: Config): Promise<void> {
       process.send!({ event: name, pid: process.pid });
     });
   };
-  const syncFs = { ...fs,
+  // The real builtins, captured before patching; every wrapper delegates to these.
+  const realFs = { ...fs }, realFsp = { ...fsp };
+  Object.assign(fs, {
     readFileSync: ((...args: Parameters<typeof fs.readFileSync>) => {
       const file = String(args[0]);
       if (privatePath(shared, file)) result.attempts.push(path.basename(file));
       if (config.fault === "read" && file === target) fault("EACCES", file);
       if (config.fault === "pending" && path.dirname(file) === shared && path.basename(file).startsWith("r-")) fault("EACCES", file);
       if (config.fault === "cursor-read" && file === cursor) fault("EACCES", file);
-      return Reflect.apply(fs.readFileSync, fs, args);
+      return Reflect.apply(realFs.readFileSync, fs, args);
     }) as typeof fs.readFileSync,
     statSync: ((...args: Parameters<typeof fs.statSync>) => {
       if (config.fault === "stat" && String(args[0]) === target) fault("EACCES", target);
-      return Reflect.apply(fs.statSync, fs, args);
+      return Reflect.apply(realFs.statSync, fs, args);
     }) as typeof fs.statSync,
     readdirSync: ((...args: Parameters<typeof fs.readdirSync>) => {
       if (config.fault === "discovery" && String(args[0]) === shared) fault("EACCES", shared);
-      return Reflect.apply(fs.readdirSync, fs, args);
+      return Reflect.apply(realFs.readdirSync, fs, args);
     }) as typeof fs.readdirSync,
-  };
-  const asyncFs = { ...fsp,
+  });
+  Object.assign(fsp, {
     link: (async (...args: Parameters<typeof fsp.link>) => {
-      try { return await fsp.link(...args); }
+      try { return await realFsp.link(...args); }
       catch (error) {
         if ((error as NodeJS.ErrnoException).code === "EEXIST") process.send?.({ event: "contended", pid: process.pid });
         throw error;
@@ -85,7 +88,7 @@ async function child(config: Config): Promise<void> {
       const isCursorTemp = file.startsWith(cursor + ".tmp.");
       if (isCursorTemp) await barrier("copy-before-cursor");
       if (config.fault === "copy" && file.includes(`${path.sep}inbox${path.sep}`) && file.includes("-A.md.tmp.")) fault("ENOSPC", file);
-      const handle = await fsp.open(...args);
+      const handle = await realFsp.open(...args);
       // Bind methods to the real handle; replace only the selected private path.
       return new Proxy(handle, { get(object, key) {
         if (key === "writeFile" && config.fault === "cursor-space" && isCursorTemp) return async () => fault("ENOSPC", file);
@@ -101,40 +104,26 @@ async function child(config: Config): Promise<void> {
     }) as typeof fsp.open,
     rename: (async (...args: Parameters<typeof fsp.rename>) => {
       if (config.fault === "cursor-rename" && String(args[1]) === cursor) fault("EIO", cursor);
-      await fsp.rename(...args);
+      await realFsp.rename(...args);
       // win32 has no directory fsync (atomic-write.ts): the cursor rename is its commit point (P3).
       if (process.platform === "win32" && String(args[1]) === cursor) await barrier("commit-before-stdout");
     }) as typeof fsp.rename,
-  };
-  const context = vm.createContext({ Buffer, process, setTimeout, clearTimeout, console });
-  const modules = new Map<string, vm.Module>();
-  const sourceReceipts: Record<string, string> = {};
-  async function load(id: string): Promise<vm.Module> {
-    const prior = modules.get(id);
-    if (prior) return prior;
-    let mod: vm.Module;
-    if (id.startsWith("node:")) {
-      const exports: Record<string, unknown> = id === "node:fs" ? syncFs : id === "node:fs/promises" ? asyncFs : await import(id) as Record<string, unknown>;
-      mod = new vm.SyntheticModule(Object.keys(exports), function () {
-        for (const [name, value] of Object.entries(exports)) this.setExport(name, value);
-      }, { context, identifier: id });
-    } else {
-      const bytes = fs.readFileSync(fileURLToPath(id));
-      sourceReceipts[id] = createHash("sha256").update(bytes).digest("hex");
-      mod = new vm.SourceTextModule(bytes.toString("utf8"), { context, identifier: id });
-    }
-    modules.set(id, mod);
-    await mod.link((specifier, parent) => load(specifier.startsWith("node:") ? specifier : new URL(specifier, parent.identifier).href));
-    return mod;
-  }
-  const module = await load(new URL("../../src/tracker/report-sweep.js", import.meta.url).href);
-  await module.evaluate();
-  save(path.join(config.root, `child-${process.pid}.source.json`), sourceReceipts);
-  const sweep = (module.namespace as { sweep: (deps: unknown) => Promise<number> }).sweep;
+  });
+  // Publish the wrappers to ESM importers (`import * as fs`, `import { open }`) before the product loads.
+  syncBuiltinESMExports();
+  // Phase markers (diagnostics only; this stderr is never asserted). On win32, stdio pipes are written
+  // synchronously, so the last marker before a native crash shows which phase it hit.
+  const mark = (phase: string) => process.stderr.write(`retry-child ${process.pid}: ${phase}\n`);
+  mark("faults installed");
+  const module = await import(new URL("../../src/tracker/report-sweep.js", import.meta.url).href);
+  mark("product evaluated");
+  const sweep = (module as { sweep: (deps: unknown) => Promise<number> }).sweep;
   result.code = await sweep({ stateDir: state, sharedDir: shared, repoDir: config.root, nowMs: config.at,
     stdout: (line: string) => result.stdout.push(line), stderr: (line: string) => result.stderr.push(line) });
   process.stdout.write(JSON.stringify(result) + "\n");
+  mark("result written");
   process.disconnect?.();
+  if (process.platform === "win32") process.once("exit", () => mark("event loop drained"));
 }
 
 function fixture(run: string, name: string): Fixture {
@@ -171,21 +160,27 @@ function noCapture(s: Stage, name: string): void {
   assert.equal(s.cursor.seen[name], undefined);
   assert.ok(!s.result.stdout.some(line => line.endsWith(`-${name}.md`)));
 }
+// Assertion-message diagnostics: exit (plus its hex/NTSTATUS form), signal, stdout size and head, full stderr.
+function childState(label: string, exit: number | null, signal: string | null, stdout: string | null, stderr: string | null): string {
+  const hex = exit === null ? "" : ` (0x${(exit >>> 0).toString(16)})`;
+  return `${label}: exit=${exit}${hex} signal=${signal} stdout=${stdout?.length ?? 0}B ${JSON.stringify((stdout ?? "").slice(0, 160))} stderr=${JSON.stringify(stderr ?? "")}`;
+}
 function runStage(f: Fixture, label: string, options: Partial<Config> = {}): Result {
   const config = { root: f.root, at: epoch, ...options };
-  const args = ["--experimental-vm-modules", self, "--child", JSON.stringify(config)];
+  const args = [self, "--child", JSON.stringify(config)];
   const startedAt = new Date().toISOString(), start = performance.now();
   const processResult = spawnSync(process.execPath, args, { cwd: f.root, encoding: "utf8", timeout: 20_000, maxBuffer: 4 * 1024 * 1024,
     env: { ...process.env, SR1166_OUTPUT: output } });
   save(path.join(f.root, `${label}.process.json`), { command: [process.execPath, ...args], startedAt, elapsedMs: performance.now() - start,
     exit: processResult.status, signal: processResult.signal, error: processResult.error?.message, stdout: processResult.stdout, stderr: processResult.stderr, inbox: inbox(f), cursorRaw: fs.existsSync(cursorFile(f)) ? fs.readFileSync(cursorFile(f), "utf8") : null });
-  assert.equal(processResult.error, undefined); assert.equal(processResult.status, 0, processResult.stderr);
+  const state = childState(label, processResult.status, processResult.signal, processResult.stdout, processResult.stderr);
+  assert.equal(processResult.error, undefined, `${processResult.error?.message}; ${state}`); assert.equal(processResult.status, 0, state);
   return JSON.parse(processResult.stdout) as Result;
 }
 function stage(f: Fixture, label: string, options: Partial<Config> = {}): Stage { return capture(f, runStage(f, label, options)); }
 
 function startChild(f: Fixture, label: string, options: Partial<Config>) {
-  const args = ["--experimental-vm-modules", self, "--child", JSON.stringify({ root: f.root, at: epoch, ...options })];
+  const args = [self, "--child", JSON.stringify({ root: f.root, at: epoch, ...options })];
   const startedAt = new Date().toISOString(), start = performance.now();
   const proc = spawn(process.execPath, args, { cwd: f.root, stdio: ["ignore", "pipe", "pipe", "ipc"],
     env: { ...process.env, SR1166_OUTPUT: output } });
@@ -196,14 +191,16 @@ function startChild(f: Fixture, label: string, options: Partial<Config>) {
   proc.on("message", message => events.push((message as { event: string }).event));
   const deadline = setTimeout(() => proc.kill("SIGKILL"), 20_000);
   let launchError: Error | undefined;
-  const done = new Promise<{ code: number | null; signal: string | null; stdout: string }>((resolve, reject) => {
+  let closed: { code: number | null; signal: string | null } | undefined;
+  const done = new Promise<{ code: number | null; signal: string | null; stdout: string; stderr: string }>((resolve, reject) => {
     proc.on("error", error => { launchError = error; });
     proc.on("close", (code, signal) => {
       clearTimeout(deadline);
+      closed = { code, signal };
       try {
         save(path.join(f.root, `${label}.process.json`), { command: [process.execPath, ...args], startedAt, elapsedMs: performance.now() - start, exit: code, signal, error: launchError?.message, stdout, stderr, events });
         if (launchError) reject(launchError);
-        else resolve({ code, signal, stdout });
+        else resolve({ code, signal, stdout, stderr });
       } catch (error) { reject(error); }
     });
   });
@@ -212,7 +209,8 @@ function startChild(f: Fixture, label: string, options: Partial<Config>) {
   activeChildren.push({ proc, done });
   const event = (name: string) => new Promise<void>((resolve, reject) => {
     if (events.includes(name)) { resolve(); return; }
-    const timeout = setTimeout(() => { proc.off("message", listener); reject(new Error(`barrier timeout: ${name}`)); }, 10_000);
+    const timeout = setTimeout(() => { proc.off("message", listener);
+      reject(new Error(`barrier timeout: ${name}; closed=${closed !== undefined} events=${JSON.stringify(events)} ${childState(label, closed?.code ?? null, closed?.signal ?? null, stdout, stderr)}`)); }, 10_000);
     const listener = (message: unknown) => {
       if ((message as { event: string }).event === name) { clearTimeout(timeout); proc.off("message", listener); resolve(); }
     };
@@ -342,7 +340,8 @@ async function suite(): Promise<void> {
       const second = startChild(f, "second", { fault: "read" }); children.push(second.proc);
       await second.event("contended"); first.proc.send("release");
       const [a, b] = await Promise.all([first.done, second.done]);
-      assert.equal(a.code, 0); assert.equal(b.code, 0);
+      assert.equal(a.code, 0, childState("first", a.code, a.signal, a.stdout, a.stderr));
+      assert.equal(b.code, 0, childState("second", b.code, b.signal, b.stdout, b.stderr));
       const ar = JSON.parse(a.stdout) as Result, br = JSON.parse(b.stdout) as Result;
       assert.equal(ar.code, 0); assert.equal(br.code, 0);
       assert.equal(ar.stdout.length + br.stdout.length, 2);
@@ -358,7 +357,8 @@ async function suite(): Promise<void> {
       await c.event(barrier);
       save(path.join(f.root, "at-barrier.json"), { cursor: fs.readFileSync(cursorFile(f), "utf8"), inbox: inbox(f) });
       c.proc.kill("SIGKILL"); const killed = await c.done;
-      assert.equal(killed.code, null); assert.equal(killed.signal, "SIGKILL"); assert.equal(killed.stdout, "");
+      const why = childState("crash", killed.code, killed.signal, killed.stdout, killed.stderr);
+      assert.equal(killed.code, null, why); assert.equal(killed.signal, "SIGKILL", why); assert.equal(killed.stdout, "", why);
       const recovered = stage(f, "restart", { at: later });
       assert.equal(recovered.result.code, 0); exact(recovered, "A"); assert.deepEqual(recovered.cursor.retries, []);
       assert.equal(recovered.result.stdout.length, barrier === "copy-before-cursor" ? 1 : 0);
