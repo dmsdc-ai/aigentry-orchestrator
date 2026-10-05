@@ -294,6 +294,11 @@ test('actual CLI wiring reaches native Python and retains failure/protection pol
   const target = routingFixture();
   t.after(() => target.cleanup());
   // Admission uses a bound synthetic receipt and our own harmless child, not a host PID or OS proof.
+  // dispatch --target admits only identity-shaped session ids; the exotic sid stays on every other caller.
+  // check-dedup carries only --sid and a content --ref-hash, so no other dispatch argument can carry
+  // spaces/Hangul to the registry; the ref still lives under the spaced, non-ASCII fixture root.
+  const targetSid = 'native-fixture-worker';
+  target.prepareTarget(targetSid, 'native-fixture');
   target.prepareTarget(sid, 'native-fixture');
   f.env.AIGENTRY_SESSIONS_ROOT = target.env.AIGENTRY_SESSIONS_ROOT;
   const ref = join(f.root, 'ref.md');
@@ -302,7 +307,7 @@ test('actual CLI wiring reaches native Python and retains failure/protection pol
     tasks: [{ id: 'native-fixture', status: 'pending' }],
   }));
   const cases: { name: Caller; args: string[]; operation: string; status: number }[] = [
-    { name: 'dispatch', args: ['--ref', ref, '--target', sid, '--task', 'native-fixture'], operation: 'check-dedup', status: 9 },
+    { name: 'dispatch', args: ['--ref', ref, '--target', targetSid, '--task', 'native-fixture'], operation: 'check-dedup', status: 9 },
     { name: 'tracker', args: ['prune'], operation: 'prune', status: 9 },
     { name: 'reconciler', args: ['--shadow'], operation: 'list', status: 9 },
     { name: 'cleanup-scheduler', args: ['schedule', sid], operation: 'get', status: 0 },
@@ -320,6 +325,15 @@ test('actual CLI wiring reaches native Python and retains failure/protection pol
     assert.equal(calls[0]?.argv[0], item.operation);
     assert.equal(calls[0]?.encoding, 'utf-8');
   }
+  // Hardening: a non-identity sid is refused before any file read or registry call, even with a prepared receipt.
+  const before = recorded(f).length;
+  const refused = spawnSync(process.execPath,
+    [fileURLToPath(new URL('../../src/dispatch/cli.js', import.meta.url)), '--ref', ref, '--target', sid, '--task', 'native-fixture'],
+    { env: f.env, encoding: 'utf8', shell: false, timeout: 10_000 });
+  assert.ifError(refused.error);
+  assert.equal(refused.status, 78, refused.stderr);
+  assert.match(refused.stderr, /SANDBOX_TARGET_SID/);
+  assert.equal(recorded(f).length, before);
   assert.deepEqual(JSON.parse(readFileSync(join(f.state, 'cleanup-pending.json'), 'utf8')), []);
 });
 
