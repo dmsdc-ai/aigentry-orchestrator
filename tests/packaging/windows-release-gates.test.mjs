@@ -123,6 +123,14 @@ const browserAddition = `  browser-tls:
           set -euo pipefail
           node -e "const p=require('playwright/package.json');const b=JSON.parse(require('node:fs').readFileSync(require('node:path').join(require('node:path').dirname(require.resolve('playwright-core/package.json')),'browsers.json'))).browsers.find(x=>x.name==='chromium');if(p.version!=='1.58.2'||b.revision!=='1208'||b.browserVersion!=='145.0.7632.6')process.exit(1)"
           npx --no-install playwright install --with-deps chromium
+      # #1177 — the private playwright-core copy the acceptance below loads, CI only. The script
+      # re-verifies the lock, playwright-core 1.58.2, Chromium r1208 / 145.0.7632.6 and the exact
+      # installed tree, then writes ONE copy into RUNNER_TEMP whose only difference is crPage.js's
+      # own-frame focus emulation enabled:false - the arm-B library probe run 36323626280 measured.
+      # package.json, package-lock.json and node_modules are not written, nothing is downloaded, and
+      # any pin mismatch, a Playwright upgrade included, fails this step by name.
+      - name: Prepare the verified private playwright-core copy
+        run: node scripts/ci/acceptance-playwright-core.mjs prepare
       # No new dependency: the step above already pulled Xvfb and xauth in as Chromium's
       # documented headed prerequisites. This only proves they are present before the
       # acceptance run, so a missing tool fails as a named preflight rather than as a
@@ -135,6 +143,8 @@ const browserAddition = `  browser-tls:
           command -v xauth
       - name: Actual browser, WebAuthn and TLS controls
         env:
+          # #1177 the one verified private copy; the acceptance refuses in CI without it.
+          BROWSER_TLS_PLAYWRIGHT_CORE: \${{ runner.temp }}/acceptance-playwright-core/node_modules/playwright-core
           BROWSER_TLS_RECEIPT: \${{ runner.temp }}/browser-tls-receipt.json
           CONSOLE_UI_ARTIFACTS: \${{ runner.temp }}/console-ui-artifacts
         # Headed Chromium on a private virtual display owned by this non-root ephemeral
@@ -151,9 +161,14 @@ const browserAddition = `  browser-tls:
         timeout-minutes: 10
       - name: Validate complete receipt against this checkout
         env:
+          BROWSER_TLS_PLAYWRIGHT_CORE: \${{ runner.temp }}/acceptance-playwright-core/node_modules/playwright-core
           BROWSER_TLS_RECEIPT: \${{ runner.temp }}/browser-tls-receipt.json
           CONSOLE_UI_ARTIFACTS: \${{ runner.temp }}/console-ui-artifacts
         run: npm run test:browser-tls -- --validate-receipt
+      # #1177 — again after the run: package.json, package-lock.json, the installed playwright-core
+      # and the private copy must all still equal what the prepare step recorded and pinned.
+      - name: Originals and private playwright-core copy unchanged after the run
+        run: node scripts/ci/acceptance-playwright-core.mjs verify
       - name: Upload sanitized receipt only
         uses: actions/upload-artifact@v4
         with:
@@ -183,8 +198,9 @@ const browserAddition = `  browser-tls:
           retention-days: 7
 
 `;
-// The approved headed caller as it stands in release.yml: wrapper, owner-only authority
-// cookie, a display that never listens on TCP, and nothing else.
+// The plain headed caller the CI contract below is derived from (#1177: release.yml no longer
+// carries it - it runs the CI job itself): wrapper, owner-only authority cookie, a display that
+// never listens on TCP, and nothing else.
 const approvedHeadedCaller = `        run: |
           set -euo pipefail
           umask 077
@@ -223,8 +239,8 @@ const approvedHeadedCaller = `        run: |
 //     place. Every xprop call is bounded and clamped to the one readiness deadline.
 //   * The 10-minute caller budget is untouched, and the install is a separate step so its cost
 //     is not charged to it.
-// release.yml keeps the plain caller and starts no window manager and no supervisor, so the two
-// contracts are stated separately here rather than either one being inferred from the other.
+// #1177: release.yml runs this same CI contract byte for byte, so a release gate runs exactly
+// what CI measured; the plain caller above is only the base the CI contract is derived from.
 const ciCallerRationale = `        # Two independent, read-only observations, made INSIDE this same \`xvfb-run\` because \`-a\`
         # picks a fresh server number per invocation, so a separate step would observe a different
         # display. Neither is a window-manager verdict, and neither is read by any check:
@@ -296,7 +312,9 @@ const ciCallerRationale = `        # Two independent, read-only observations, ma
         #     ever passed here, and a record that reports \`mode=\`/\`grab=\`/\`instrumented=\`
         #     anything other than \`wm\`/\`held\`/\`no\` is refused rather than read as a measurement.
         #   * The suite is byte-unchanged: the same \`npm run test:browser-tls\`, no fixture,
-        #     product, Playwright or sandbox change, no forced or synthesized visibility. It runs
+        #     product or sandbox change, no Playwright change of its own (#1177: the one verified
+        #     private playwright-core copy is the prepare step's), no forced or synthesized
+        #     visibility. It runs
         #     as an owned child so a cancellation stops what this caller started; its own
         #     descendants are NOT signalled, because reaching them would mean assuming a process
         #     group, which is outside what this was authorized to do.
@@ -304,14 +322,14 @@ const ciCallerRationale = `        # Two independent, read-only observations, ma
         # result. It resolves exactly ONE environmental hypothesis - whether a real EWMH window
         # manager on this display changes what the lifecycle stage observes. It is NOT a claim
         # that an absent WM caused the failure, it closes no task-table gate, and it does not
-        # touch the live competing explanation: the harness restores the window BEFORE
-        # \`lw-hidden-wait\` runs, so that wait still polls a window in state \`normal\` whether or
-        # not a window manager is present.
+        # touch the live competing explanation: the harness never minimizes the window (#1177
+        # removed that experiment), so \`lw-hidden-wait\` polls a window in state \`normal\` whether
+        # or not a window manager is present.
 `;
 const ciDiagnosticRun = `          # The supervisor is written out here, under that same \`umask 077\`, so the file is
           # owner-only by construction. It is a CI-only file in RUNNER_TEMP, run by the runner
           # image's own \`python3\`: nothing is installed to produce it, it never enters the
-          # package, and release.yml has no equivalent.
+          # package, and release.yml runs this same step.
           export WM_SUPERVISOR="$RUNNER_TEMP/wm-owned-supervisor.py"
           cat >"$WM_SUPERVISOR" <<"PY"
           # #1177 owned-process supervisor, CI only and deliberately not a product module: it
@@ -1023,7 +1041,7 @@ ${ciDiagnosticRun}`;
 const browserCallerStep = '      - name: Actual browser, WebAuthn and TLS controls\n';
 // The CI-only window-manager install, restated independently for the same reason as the
 // caller: it is held to what it was approved as, not to what the workflow happens to carry.
-const ciOpenboxInstall = `      # #1177 — the ONE bounded window-manager experiment, CI only and only here. The display
+const ciOpenboxInstall = `      # #1177 — the ONE bounded window-manager experiment, CI only and only in this job. The display
       # the acceptance run owns has never had a window manager on it: \`Browser.setWindowBounds
       # {windowState:'minimized'}\` reads back \`normal\`, and both owned tabs stay \`visible\` while
       # focus moves. That is evidence, NOT proof that an absent WM is the cause, so this installs
@@ -1043,8 +1061,8 @@ const ciOpenboxInstall = `      # #1177 — the ONE bounded window-manager exper
       # package-lock.json, NO runtime npm or native dependency is created and no user of this
       # package is ever asked for a compiler — the probe is CI-only infrastructure that is built
       # into, and dies with, RUNNER_TEMP. No new privilege is taken beyond the apt-get
-      # the runner preflight above already uses, and release.yml keeps the plain caller with no
-      # window manager and no supervisor at all.
+      # the runner preflight above already uses, and release.yml runs this same job byte for byte,
+      # so the release gate runs exactly what CI measured.
       - name: Install the CI-only window manager and XRes build deps for the owned display experiment
         run: |
           set -euo pipefail
@@ -1106,7 +1124,7 @@ const ciXresEnv = `          # The probe the step above compiled. A REQUIRED cap
 // acceptance step's own `env:` block, so it anchors both the CI-only env addition below and
 // the Console-artifacts negatives further down, which would otherwise have to restate it.
 const headedRationaleAnchor = '        # Headed Chromium on a private virtual display owned by this non-root ephemeral\n';
-// Built by substitution so the CI contract can differ from the release contract in exactly
+// Built by substitution so the CI contract can differ from the plain base contract in exactly
 // three places — the headed caller, the two CI-only steps inserted before it (the window
 // manager/XRes build-dependency install and the probe compile), and the one extra env var
 // the acceptance step needs to find the compiled probe — and in no other byte. `replaceOnce`
@@ -1119,10 +1137,10 @@ const ciBrowserAddition = replaceOnce(
     replaceOnce(browserAddition, approvedHeadedCaller, ciHeadedCaller),
     browserCallerStep, `${ciOpenboxInstall}${ciXresCompile}${browserCallerStep}`),
   headedRationaleAnchor, `${ciXresEnv}${headedRationaleAnchor}`);
-const approvedBrowser = parse('approved-browser-contract', `jobs:\n${browserAddition}`).jobs['browser-tls'];
 const approvedCIBrowser = parse('approved-ci-browser-contract', `jobs:\n${ciBrowserAddition}`).jobs['browser-tls'];
 function withoutBrowser(workflow, release) {
-  assert.deepEqual(workflow.jobs['browser-tls'], release ? approvedBrowser : approvedCIBrowser,
+  // #1177: both workflows carry the one CI contract, release included.
+  assert.deepEqual(workflow.jobs['browser-tls'], approvedCIBrowser,
     'complete approved browser/TLS job, ordered steps and no bypasses');
   const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
   assert.equal(pkg.scripts['test:browser-tls'], 'node tests/hitl/browser-tls.acceptance.mjs', 'actual browser caller');
@@ -3167,8 +3185,10 @@ const callerContracts = {
   CI: { addition: ciBrowserAddition, caller: ciHeadedCaller, run: ciDiagnosticRun,
     consoleAnchor: `${ciXresEnv}${headedRationaleAnchor}`,
     umaskSite: `${umaskLine}${ciDiagnosticFirstLine}` },
-  release: { addition: browserAddition, caller: headedCaller, run: xvfbLine,
-    consoleAnchor: headedRationaleAnchor, umaskSite: `${umaskLine}${xvfbLine}` },
+  // #1177: release.yml runs the CI job byte for byte, so its negatives are the CI contract's.
+  release: { addition: ciBrowserAddition, caller: ciHeadedCaller, run: ciDiagnosticRun,
+    consoleAnchor: `${ciXresEnv}${headedRationaleAnchor}`,
+    umaskSite: `${umaskLine}${ciDiagnosticFirstLine}` },
 };
 for (const [workflowName, path] of [['CI', '.github/workflows/ci.yml'], ['release', '.github/workflows/release.yml']]) {
   const source = lf(readFileSync(join(root, path), 'utf8'));
@@ -3185,7 +3205,7 @@ for (const [workflowName, path] of [['CI', '.github/workflows/ci.yml'], ['releas
       ...ciDebtMutations,
       ['unrelated comment byte changed', '# #894.', '# #894 changed.'],
       ['Windows debt threshold changed', "EXPECTED_WIN32_FAILURES: '33'", "EXPECTED_WIN32_FAILURES: '32'"],
-    ] : [...browserMutations, ...releaseBrowserMutations];
+    ] : [...browserMutations, ...ciDiagnosticMutations, ...releaseBrowserMutations];
     for (const [name, needle, replacement] of mutations) {
       acceptance(`browser projection rejects ${workflowName} ${ending}: ${name}`, 'browser-projection-mutant', () => {
         const changed = encode(replaceOnce(source, needle, replacement));

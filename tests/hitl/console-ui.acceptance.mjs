@@ -71,7 +71,7 @@ export const CONSOLE_OPS = ['not-started',
   'rdl-back-click', 'rdl-back-rows-wait', 'rdl-back-settled', 'rdl-clean-dom', 'rdl-mark',
   'sf-refresh-click', 'sf-view-burst', 'sf-filters-submit', 'sf-view-final', 'sf-rows-wait',
   'sf-settled', 'sf-flight-check',
-  'lw-stage-file', 'lw-churn-navigate', 'lw-churn-rows', 'lw-churn-settled', 'lw-cursor-before',
+  'lw-focus-library', 'lw-stage-file', 'lw-churn-navigate', 'lw-churn-rows', 'lw-churn-settled', 'lw-cursor-before',
   'lw-rename', 'lw-other-page', 'lw-hidden-wait', 'lw-hidden-window', 'lw-polls-check',
   'lw-resume-front', 'lw-visible-wait', 'lw-resumed-response', 'lw-resumed-rows',
   'lw-resumed-settled', 'lw-cursor-expired', 'lw-restarted', 'lw-changed-detail',
@@ -470,8 +470,8 @@ async function captureWindows(deps, page, other) {
 /** Serialized only after the rejection, to stderr only, exactly like `renderLoginBoundary`.
  *  Ownership is a property of the two tabs, not of the front-change between the observations,
  *  so it is latched from the first and falls back to the second only when the first could not
- *  be made at all. The last two fields carry the minimize experiment below on this same
- *  already-consumed line; the three fields before them are unchanged. */
+ *  be made at all. The last two fields belonged to the minimize experiment removed below and
+ *  now always read `not-captured`; the three fields before them are unchanged. */
 export function renderLifecycleWindows() {
   const pair = value => (value && typeof value === 'object' ? value : {});
   const before = pair(windowsBefore), after = pair(windowsAfter);
@@ -483,115 +483,28 @@ export function renderLifecycleWindows() {
     + ` minimize=${minimizeOutcomeOf(minimizeOutcome)}`
     + ` minimized-visibility=page:${seen(minimized.page)},other:${seen(minimized.other)}`;
 }
-// Window state, the one lever the three diagnostics above leave untested, actuated and undone
-// at the same point and for the same wait - undone before `lw-hidden-wait` runs, so a stage
-// that was failing cannot be made to pass here. `minimized` with both tabs still `visible`
-// says window state is not the lever and some forced-visible path is active; it identifies no
-// owner, because any capturer or unread override looks identical from here. `minimized` with
-// `page:hidden` makes minimize a candidate correction, nothing more. `readback-normal` (no
-// window manager on the CI display is the known candidate) and `unknown` mean the experiment
-// did not run: never a success, never acceptance proof.
-// The window is addressed the way `captureWindows` already addresses it - one
-// `context.newCDPSession` per owned page handle, then `Browser.getWindowForTarget` - so no
-// target or window is discovered and the ids are compared and discarded in here. Nothing is
-// patched, synthesized, intercepted or skipped; every step is the caller's own `bounded` at
-// the existing PROBE_MS, adding no retry, sleep, deadline or budget.
-// Actuation and restore are required, not observed: a fault fails the stage as a CLOSED reason
-// and can never reach `mark`. Readings are latched as they are taken, so the failure path
-// still reports whatever was seen.
+// #1177 The minimize experiment that used to run here is removed: fd366a3 answered its question
+// (window `minimized`, both tabs still `visible`, so window state is not the lever; the library's
+// own focus emulation is - probe run 36323626280), and its required restore check was the measured
+// fd366a3 failure. The two fields stay on the already-consumed line and now always read
+// `not-captured`: nothing in this window minimizes, restores or otherwise moves the window.
 export const MINIMIZE_OUTCOMES = ['not-captured', 'minimized', 'readback-normal', 'unknown'];
 const minimizeOutcomeOf = value => (MINIMIZE_OUTCOMES.includes(value) ? value : 'unknown');
 let minimizeOutcome = 'not-captured';
 let minimizeVisibility = { page: notCaptured(), other: notCaptured() };
-async function probeMinimizedWindow(deps, page, other) {
-  const holds = [];
-  let windowId = null, original = null, fault = null;
-  // One bounded read of the session's own window. Throws; every caller below guards it.
-  const windowOf = async session => {
-    const info = await deps.bounded(session.send('Browser.getWindowForTarget'), PROBE_MS);
-    const bounds = info && info.bounds && typeof info.bounds === 'object' ? info.bounds : null;
-    return {
-      id: info && Number.isSafeInteger(info.windowId) ? info.windowId : null,
-      state: bounds && OBSERVED_WINDOW_STATES.includes(bounds.windowState) ? bounds.windowState : null,
-    };
-  };
-  try {
-    for (const target of [page, other]) {
-      let acquisition = null;
-      try {
-        acquisition = deps.context.newCDPSession(target);
-        holds.push(await deps.bounded(acquisition, PROBE_MS));
-      } catch {
-        // An acquisition that arrives only after the bounded wait gave up is detached by the
-        // same self-cleaning handler `captureWindows` uses, so none outlives this fixture.
-        if (acquisition) void acquisition.then(late => late.detach().catch(() => {}), () => {});
-        fault = 'window_minimize_failed';
-        break;
-      }
-    }
-    // Nothing is actuated until BOTH supplied handles still resolve to one readable window:
-    // equality of the two ids is the ownership check this fixture already uses. A window whose
-    // state cannot be read is a window that cannot be put back, so it is left untouched.
-    if (!fault) {
-      try {
-        const own = await windowOf(holds[0]), second = await windowOf(holds[1]);
-        if (own.id !== null && own.state !== null && second.id !== null && own.id === second.id) {
-          windowId = own.id;
-          original = own.state;
-        }
-      } catch {}
-      if (original === null) fault = 'window_minimize_failed';
-    }
-    if (!fault) {
-      // `original` is latched BEFORE the send, so the restore in `finally` runs even when the
-      // bounded wait abandons this send and the browser applies it anyway. Only the state is
-      // sent: the bounds read above are left exactly as read, never recomputed.
-      try { await deps.bounded(holds[0].send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } }), PROBE_MS); }
-      catch { fault = 'window_minimize_failed'; }
-    }
-    if (!fault) {
-      let observed = null;
-      try { observed = (await windowOf(holds[0])).state; } catch {}
-      minimizeOutcome = observed === 'minimized' ? 'minimized' : observed === 'normal' ? 'readback-normal' : 'unknown';
-      // Observation, not actuation, and therefore total: an unobservable tab records
-      // `unavailable`, never a state it did not see, and never fails the stage on its own.
-      minimizeVisibility = await captureVisibility(deps, page, other);
-    }
-  } finally {
-    // Every path, faults included: the window goes back to the state it was read in and the
-    // restoration is CONFIRMED by reading the state back - a send acknowledgment is not taken
-    // for a restored window, and a mismatched or unreadable readback is a fault. Every session
-    // opened here is detached. Nothing throws from the sweep; the first CLOSED reason is
-    // raised once it is complete, exactly like `releaseFocusEmulation`.
-    if (original !== null) {
-      try { await deps.bounded(holds[0].send('Browser.setWindowBounds', { windowId, bounds: { windowState: original } }), PROBE_MS); }
-      catch { fault = fault || 'window_restore_failed'; }
-      let restored = null;
-      try { restored = (await windowOf(holds[0])).state; } catch {}
-      if (restored !== original) fault = fault || 'window_restore_failed';
-    }
-    let alive = false;
-    try { alive = !page.isClosed(); } catch { fault = fault || 'window_restore_failed'; }
-    for (const session of holds) {
-      try { await deps.bounded(session.detach(), PROBE_MS); }
-      catch { if (alive) fault = fault || 'window_detach_failed'; }
-    }
-  }
-  if (fault) throw new Error(fault);
-}
 // Real-browser focus, taken at the same point as the two diagnostics above and for the same
 // wait, but unlike them this is actuation, not observation. The actual CI run 36072566236 is
 // headed, real Chrome; it records both owned tabs reading `visible` after `bringToFront`, and
-// `lw-hidden-wait` then never settles. WHY is not established. That observation is compatible
-// with more than one arrangement of the two tabs and of the browser's focus, and nothing here
-// asserts which one holds. One candidate contributor is readable in the locked dependency:
-// playwright-core 1.58.2 sends `Emulation.setFocusEmulationEnabled` {enabled:true} to every
-// main frame as it initialises a page (`crPage.js` line 412). Reading that source is not a
-// browser pass and does not make it the cause; only an independent actual CI run over this
-// candidate can settle that. What follows turns that harness override off on the two owned
-// tabs for the duration of the window, so that whatever the browser's own occlusion does is
-// what `document.hidden` reports; the existing `bringToFront` and the real visibility polling
-// below are left exactly as they are, and if the tabs still do not hide, the stage still fails.
+// `lw-hidden-wait` then never settles. #1177 two-arm probe run 36323626280 settled why:
+// playwright-core 1.58.2 sends `Emulation.setFocusEmulationEnabled` {enabled:true} on its OWN
+// session to every main frame as it initialises a page (`crPage.js` line 412), and with that
+// call unchanged the switched tab stayed `visible` with no event even after the suspension
+// below; with that one call enabled:false it went `hidden` and came back `visible`, with real
+// events. A second session's {enabled:false} cannot undo the library's own, so what makes the
+// tabs hide is the caller loading the verified private copy (`focusGate`), not this step. This
+// step is kept because it is part of the exact configuration that probe measured; the existing
+// `bringToFront` and the real visibility polling below are left exactly as they are, and if the
+// tabs still do not hide, the stage still fails.
 // It is a harness setting, not a product one: no DOM property is patched, no visibility event
 // is synthesized, no product polling is intercepted, no control is skipped and no deadline,
 // budget or wait moves. No target is discovered globally and no third tab is addressed - the
@@ -626,8 +539,9 @@ async function suspendFocusEmulation(deps, targets, holds) {
     catch { throw new Error('focus_suspend_failed'); }
   }
 }
-/** The counterpart, and equally not optional. It writes back the one state playwright-core
- *  itself set - `enabled:true` - on every tab still alive, then detaches every session it was
+/** The counterpart, and equally not optional. It writes `enabled:true` back on this fixture's own
+ *  session - the state the unpatched library sets; the library's own session is not touched, and
+ *  this override ends with the detach either way - on every tab still alive, then detaches every session it was
  *  handed, each inside the same PROBE_MS budget. Detaching is never taken for a restore: a live
  *  target is always written back explicitly first. Every hold is attempted even after an
  *  earlier one fails, so a single bad tab cannot strand the other tab's override or session;
@@ -1365,6 +1279,12 @@ async function lifecycleWindow(deps, fixtures, alphaCursor) {
   const { check, page, context, delay, privateFile, fetchPage } = deps;
   const queue = join(fixtures.dir, 'churn-queue.json'), staged = join(fixtures.dir, 'churn-queue.next');
   const mutated = fixtures.spec.churn.tasks.map((row, index) => index === 2 ? { ...row, status: 'done' } : row);
+  // #1177 Required, before anything in this window runs: in CI the caller refuses here unless the
+  // browser is driven by the verified private playwright-core copy whose own-frame focus emulation
+  // is off, so no hidden/visible reading below can come from an unpatched library. Outside CI it
+  // only announces that these readings are unverified there.
+  setConsoleOp('lw-focus-library');
+  deps.focusGate();
   setConsoleOp('lw-stage-file');
   await privateFile(staged, JSON.stringify({ tasks: mutated, completed: [] }));
   setConsoleOp('lw-churn-navigate');
@@ -1410,10 +1330,6 @@ async function lifecycleWindow(deps, fixtures, alphaCursor) {
     const windowsAtEnd = await captureWindows(deps, page, other);
     if (windowOwnership === 'unavailable') windowOwnership = windowsAtEnd.ownership;
     windowsAfter = windowsAtEnd.states;
-    // Window state, the lever the three readings above leave untested, actuated and undone
-    // before the wait below runs. Required: an actuation or restore that does not complete
-    // fails the stage rather than letting the wait run against a window nobody put back.
-    await probeMinimizedWindow(deps, page, other);
     setConsoleOp('lw-hidden-wait');
     await page.waitForFunction(() => document.hidden === true);
     page.on('request', count);

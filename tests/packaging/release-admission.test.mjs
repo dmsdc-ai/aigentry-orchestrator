@@ -590,8 +590,10 @@ test('workflow runs independent tests and admission in guard before credentials 
 // The acceptance step runs headed Chromium under xvfb-run, so its command lives inside a block
 // scalar and is no longer a one-line `run:`. These anchors name that step literally and
 // exactly once, so a mutation can never silently no-op against a needle the workflow dropped.
+// #1177: release.yml runs the CI job byte for byte, whose acceptance step `exec`s the owned
+// supervisor inside `xvfb-run`; that line is the step's exit status, so it is the anchor.
 const browserStepName = '      - name: Actual browser, WebAuthn and TLS controls\n';
-const browserStepRun = '          xvfb-run -a --server-args="-screen 0 1280x1024x24 -nolisten tcp" npm run test:browser-tls\n';
+const browserStepRun = '            exec python3 "$WM_SUPERVISOR"\n';
 function onlyOccurrence(job, needle) {
   const first = job.indexOf(needle);
   assert.ok(first >= 0, `mutation anchor is present: ${needle.trim()}`);
@@ -612,7 +614,7 @@ for (const [ending, newline] of [['LF', '\n'], ['CRLF', '\r\n']]) {
       const changed = publish.replace(/^    needs: \[([^\]\n]+)\]$/m, (_, needs) =>
         `    needs: [${needs.split(', ').filter(name => name !== dependency).join(', ')}]`);
       assert.notEqual(changed, publish, 'mutation must remove the intended dependency');
-      assert.throws(() => assertWorkflowContract(encode(original.replace(publish, changed))),
+      assert.throws(() => assertWorkflowContract(encode(original.replace(publish, () => changed))),
         { code: 'ERR_ASSERTION', message: /publish requires/ });
     });
   }
@@ -632,7 +634,7 @@ for (const [ending, newline] of [['LF', '\n'], ['CRLF', '\r\n']]) {
     ['browser step skips', 'browser-tls', job => job.replace(onlyOccurrence(job, browserStepName),
       `${browserStepName}        if: false\n`), /browser gate cannot skip/],
     ['browser step swallows failure', 'browser-tls', job => job.replace(onlyOccurrence(job, browserStepRun),
-      browserStepRun.replace(/\n$/, ' || true\n')), /browser gate cannot skip/],
+      () => browserStepRun.replace(/\n$/, ' || true\n')), /browser gate cannot skip/],
   ];
   for (const [label, name, mutate, diagnostic] of bypasses) {
     test(`workflow contract rejects ${ending} ${label}`, () => {
@@ -640,7 +642,9 @@ for (const [ending, newline] of [['LF', '\n'], ['CRLF', '\r\n']]) {
       const job = workflowJob(original, name);
       const changed = mutate(job);
       assert.notEqual(changed, job, 'mutation must change the intended job');
-      assert.throws(() => assertWorkflowContract(encode(original.replace(job, changed))),
+      // #1177: a function replacement, so `$'`, `$&`, `$<n>` and dollar-backtick in the job text (the
+      // ported supervisor heredoc carries one `$'`) are spliced in literally, never expanded as patterns.
+      assert.throws(() => assertWorkflowContract(encode(original.replace(job, () => changed))),
         { code: 'ERR_ASSERTION', message: diagnostic });
     });
   }
