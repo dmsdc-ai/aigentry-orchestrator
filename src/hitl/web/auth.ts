@@ -19,13 +19,14 @@
  * this process would otherwise block for the full acquire timeout.
  */
 import { constants as fsConstants } from 'node:fs';
-import { lstat, mkdir, open, unlink } from 'node:fs/promises';
+import { lstat, mkdir, open, rmdir, unlink, type FileHandle } from 'node:fs/promises';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { dirname, isAbsolute, join, parse, relative, sep } from 'node:path';
+import { dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { atomicWrite } from '../../session/persistence/atomic-write.js';
 import { withIndexLock } from '../../session/persistence/index-lock.js';
 import { canonicalBytes } from '../../session/persistence/canonical-bytes.js';
+import { winPrivateStorage, type VerifyItem, type VerifyResult } from '../../session/private-storage.js';
 import type {
   AuthenticationResponseJSON,
   PublicKeyCredentialCreationOptionsJSON,
@@ -78,6 +79,9 @@ const ROUTES = new Set([
 
 /** Owner-only guarantees are only claimed on platforms whose modes this code checks. */
 const POSIX_PLATFORM = process.platform === 'darwin' || process.platform === 'linux';
+/** win32 (#1167): owner-only is the P2 private ACL, read back through `winPrivateStorage`. */
+const WIN32_PLATFORM = process.platform === 'win32';
+const SUPPORTED_PLATFORM = POSIX_PLATFORM || WIN32_PLATFORM;
 
 // ---------------------------------------------------------------------------
 // Private persisted document
@@ -223,16 +227,47 @@ const refuse = (res: ServerResponse, status: number, error: string, cookies: str
 // Filesystem safety and the local serialized atomic write
 // ---------------------------------------------------------------------------
 
-type PathCheck = 'ok' | 'missing' | 'unsafe';
+/** `unavailable` (win32 only): the ACL read-back itself failed, so nothing was proven either way. */
+type PathCheck = 'ok' | 'missing' | 'unsafe' | 'unavailable';
+
+/** Primitive codes meaning the environment or a tool failed, not the item (PLAN §1.6). */
+const WIN32_ENVIRONMENT: ReadonlySet<string> = new Set([
+  'unsupported_platform', 'system_root_invalid', 'tool_missing', 'tool_timeout', 'tool_failed',
+  'tool_output_invalid', 'principal_unavailable', 'read_failed',
+]);
+
+/**
+ * win32: one read-back batch (one PowerShell process). Any predicate failure is
+ * 'unsafe'; otherwise any environment failure is 'unavailable'. A private file
+ * is accepted only with its private parent directory in the same batch (R2).
+ */
+function readBack(items: readonly VerifyItem[]): { check: PathCheck; results: readonly VerifyResult[] } {
+  if (!winPrivateStorage) return { check: 'unavailable', results: [] };
+  const results = winPrivateStorage.verify(items);
+  const failed = results.filter(result => !result.ok);
+  if (!failed.length) return { check: 'ok', results };
+  const unsafe = failed.some(result => result.code === undefined || !WIN32_ENVIRONMENT.has(result.code));
+  return { check: unsafe ? 'unsafe' : 'unavailable', results };
+}
+
+/** win32: O_NOFOLLOW is a no-op, so the opened handle must be the file that was read back (P4). */
+async function sameFile(handle: FileHandle, verified: VerifyResult | undefined): Promise<boolean> {
+  if (!verified || !verified.ok || verified.dev === undefined || verified.ino === undefined) return false;
+  const opened = await handle.stat({ bigint: true });
+  return String(opened.dev) === verified.dev && String(opened.ino) === verified.ino;
+}
 
 /**
  * Walk every component: nothing may be a symlink or a non-directory, and the
  * leaf must be owned by this process. Parent directories remain a trusted-owner
  * deployment precondition; this is not a solved hostile-parent race.
+ * win32: the leaf's ACL is read back instead of uid/mode (P2 private, or P-OWNED
+ * when not owner-only); `readBackLeaf = false` leaves that to the caller's batch.
  */
-async function checkDirectory(path: string, ownerOnly: boolean): Promise<PathCheck> {
-  if (!isAbsolute(path) || !POSIX_PLATFORM || typeof process.getuid !== 'function') return 'unsafe';
-  const uid = process.getuid();
+async function checkDirectory(path: string, ownerOnly: boolean, readBackLeaf = true): Promise<PathCheck> {
+  const uid = WIN32_PLATFORM ? null
+    : POSIX_PLATFORM && typeof process.getuid === 'function' ? process.getuid() : undefined;
+  if (!isAbsolute(path) || uid === undefined) return 'unsafe';
   const root = parse(path).root;
   const parts = relative(root, path).split(sep).filter(Boolean);
   if (!parts.length) return 'unsafe';
@@ -247,6 +282,10 @@ async function checkDirectory(path: string, ownerOnly: boolean): Promise<PathChe
     }
     if (info.isSymbolicLink() || !info.isDirectory()) return 'unsafe';
     if (index === parts.length - 1) {
+      if (uid === null) {
+        if (!readBackLeaf) return 'ok';
+        return readBack([{ path: current, kind: 'directory', want: ownerOnly ? 'private' : 'owned' }]).check;
+      }
       if (info.uid !== uid) return 'unsafe';
       if (ownerOnly && (info.mode & 0o077) !== 0) return 'unsafe';
     }
@@ -254,9 +293,15 @@ async function checkDirectory(path: string, ownerOnly: boolean): Promise<PathChe
   return 'ok';
 }
 
-/** Regular, owner-owned, non-symlink, no group/other access. */
+/**
+ * Regular, owner-owned, non-symlink, no group/other access.
+ * win32: type facts only. A private file is proven only together with its
+ * parent directory in one read-back batch (Q-FILE R2), which the caller runs.
+ */
 async function checkFile(path: string): Promise<PathCheck> {
-  if (!POSIX_PLATFORM || typeof process.getuid !== 'function') return 'unsafe';
+  const uid = WIN32_PLATFORM ? null
+    : POSIX_PLATFORM && typeof process.getuid === 'function' ? process.getuid() : undefined;
+  if (uid === undefined) return 'unsafe';
   let info;
   try {
     info = await lstat(path);
@@ -264,7 +309,8 @@ async function checkFile(path: string): Promise<PathCheck> {
     return (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'unsafe';
   }
   if (info.isSymbolicLink() || !info.isFile()) return 'unsafe';
-  if (info.uid !== process.getuid()) return 'unsafe';
+  if (uid === null) return 'ok';
+  if (info.uid !== uid) return 'unsafe';
   return (info.mode & 0o077) === 0 ? 'ok' : 'unsafe';
 }
 
@@ -459,11 +505,24 @@ function parseMetadata(raw: string): Metadata | null {
 }
 
 async function readMetadata(stateDir: string): Promise<MetadataRead> {
-  const directory = await checkDirectory(stateDir, true);
+  // win32: the leaf ACL is not read here; it joins the file in the single batch below.
+  const directory = await checkDirectory(stateDir, true, false);
   if (directory === 'missing') return { status: 'missing' };
-  if (directory === 'unsafe') return { status: 'corrupt', reason: 'storage_unsafe' };
+  if (directory !== 'ok') return { status: 'corrupt', reason: 'storage_unsafe' };
   const file = join(stateDir, METADATA_FILE);
   const state = await checkFile(file);
+  // win32 (Q-FILE R2): the directory, and the document when present, verified in one batch.
+  let verified: VerifyResult | undefined;
+  if (WIN32_PLATFORM && state !== 'unsafe') {
+    const batch = readBack([
+      { path: dirname(file), kind: 'directory', want: 'private' },
+      ...(state === 'ok' ? [{ path: file, kind: 'file', want: 'private' } as const] : []),
+    ]);
+    if (batch.check !== 'ok') {
+      return { status: 'corrupt', reason: batch.check === 'unavailable' ? 'storage_unavailable' : 'storage_unsafe' };
+    }
+    verified = batch.results[1];
+  }
   if (state === 'missing') return { status: 'missing' };
   if (state === 'unsafe') return { status: 'corrupt', reason: 'storage_unsafe' };
   let raw: string;
@@ -471,6 +530,7 @@ async function readMetadata(stateDir: string): Promise<MetadataRead> {
     const handle = await open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
     try {
       const info = await handle.stat();
+      if (WIN32_PLATFORM && !(await sameFile(handle, verified))) return { status: 'corrupt', reason: 'storage_unsafe' };
       if (!info.isFile() || info.size > MAX_METADATA_BYTES) return { status: 'corrupt', reason: 'storage_corrupt' };
       raw = await handle.readFile('utf8');
     } finally {
@@ -484,7 +544,11 @@ async function readMetadata(stateDir: string): Promise<MetadataRead> {
   return parsed ? { status: 'ok', value: parsed } : { status: 'corrupt', reason: 'storage_corrupt' };
 }
 
-/** Durable write is entirely the owned helper's: 0600 temp + fsync + rename + parent fsync. */
+/**
+ * Durable write is entirely the owned helper's: 0600 temp + fsync + rename + parent fsync.
+ * win32 (Q-FILE R2): no post-commit step — the temp inherits the verified-private
+ * directory's DACL and every read verifies the document with that directory.
+ */
 async function writeMetadata(stateDir: string, value: Metadata): Promise<void> {
   await atomicWrite(join(stateDir, METADATA_FILE), canonicalBytes(value), {
     sessionId: WRITE_SESSION_ID,
@@ -595,7 +659,7 @@ export async function createAuth(
     if (!lib) return { state: 'dependency_unverified', reason: libReason ?? 'dependency_unverified' };
     if (!valid) return { state: 'setup_required', reason: 'config_invalid' };
     if (!config.tlsReady) return { state: 'setup_required', reason: 'tls_required' };
-    if (!POSIX_PLATFORM) return { state: 'setup_required', reason: 'platform_unsupported' };
+    if (!SUPPORTED_PLATFORM) return { state: 'setup_required', reason: 'platform_unsupported' };
     if (!metadata) return { state: 'setup_required', reason: 'provisioning_required' };
     if (metadata.credential) return { state: 'ready', reason: null };
     const time = now();
@@ -611,7 +675,7 @@ export async function createAuth(
       return snapshot;
     }
     const time = now();
-    if (!lib || !valid || !config.tlsReady || !POSIX_PLATFORM) {
+    if (!lib || !valid || !config.tlsReady || !SUPPORTED_PLATFORM) {
       metadata = null;
       snapshot = classify();
       return snapshot;
@@ -1150,8 +1214,8 @@ export async function provisionOwner(
   options: Readonly<ProvisionOptions>,
   clock: () => number = Date.now,
 ): Promise<ProvisionResult> {
-  // Windows ACL semantics are unverified here, so owner-only cannot be claimed.
-  if (!POSIX_PLATFORM || typeof process.getuid !== 'function') {
+  // Owner-only is claimed only where it is checked: POSIX uid/mode, or the win32 ACL read-back.
+  if (!SUPPORTED_PLATFORM || (!WIN32_PLATFORM && typeof process.getuid !== 'function')) {
     return { state: 'unavailable', reason: 'platform_unsupported' };
   }
   const authRoot = options?.authRoot;
@@ -1183,11 +1247,24 @@ export async function provisionOwner(
     } catch {
       return { state: 'unavailable', reason: 'storage_unsafe' };
     }
+    // win32: Set P2 private on the directory this call created; verified just below. When the
+    // environment failed, remove it (empty, ours) so a retry is not refused as unsafe.
+    if (WIN32_PLATFORM) {
+      const set = winPrivateStorage ? winPrivateStorage.setPrivate(resolve(authRoot), 'directory') : null;
+      if (!set || set.status !== 'ok') {
+        const environment = !set || WIN32_ENVIRONMENT.has(set.code);
+        if (environment) await rmdir(authRoot).catch(() => undefined);
+        return { state: 'unavailable', reason: environment ? 'storage_unavailable' : 'storage_unsafe' };
+      }
+    }
     rootState = await checkDirectory(authRoot, true);
   }
-  if (rootState !== 'ok') return { state: 'unavailable', reason: 'storage_unsafe' };
-  if ((await checkDirectory(dirname(invitationPath), true)) !== 'ok') {
-    return { state: 'unavailable', reason: 'storage_unsafe' };
+  if (rootState !== 'ok') {
+    return { state: 'unavailable', reason: rootState === 'unavailable' ? 'storage_unavailable' : 'storage_unsafe' };
+  }
+  const parentState = await checkDirectory(dirname(invitationPath), true);
+  if (parentState !== 'ok') {
+    return { state: 'unavailable', reason: parentState === 'unavailable' ? 'storage_unavailable' : 'storage_unsafe' };
   }
   if ((await checkFile(invitationPath)) !== 'missing') {
     return { state: 'unavailable', reason: 'provision_conflict' };
@@ -1220,6 +1297,27 @@ export async function provisionOwner(
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
         return { state: 'unavailable', reason: code === 'EEXIST' ? 'provision_conflict' : 'storage_unsafe' };
+      }
+      // win32 (Q-FILE R2): before the secret exists, prove the new file inherited a private
+      // DACL — read back with its private parent in one batch, bound to this handle.
+      if (WIN32_PLATFORM) {
+        let refused: string | null;
+        try {
+          const file = resolve(invitationPath);
+          const batch = readBack([
+            { path: dirname(file), kind: 'directory', want: 'private' },
+            { path: file, kind: 'file', want: 'private' },
+          ]);
+          refused = batch.check === 'unavailable' ? 'storage_unavailable'
+            : batch.check !== 'ok' || !(await sameFile(handle, batch.results[1])) ? 'storage_unsafe' : null;
+        } catch {
+          refused = 'storage_unavailable';
+        }
+        if (refused) {
+          await handle.close().catch(() => undefined);
+          await unlink(invitationPath).catch(() => undefined);
+          return { state: 'unavailable', reason: refused };
+        }
       }
       try {
         await handle.writeFile(`${value}\n`, 'utf8');

@@ -5,15 +5,23 @@ import { createHash } from 'node:crypto';
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+// #1167: win32 counterparts of the POSIX mode fixtures and assertions use the lane A ACL helper
+// (tests/helpers/win-acl.mjs, resolved from dist/tests/hitl); POSIX never loads it.
+interface WinAcl { makePrivate(path: string): void; grant(path: string, spec: string): void; isPrivate(path: string): boolean }
+const acl = process.platform === 'win32'
+  ? (await import(pathToFileURL(join(import.meta.dirname, '..', '..', '..', 'tests', 'helpers', 'win-acl.mjs')).href)) as WinAcl
+  : null;
 
 // Exercise provisioning and refusal paths only; never start a listener.
 const cliURL = new URL('../../src/hitl/web/cli.js', import.meta.url);
 const cli = fileURLToPath(cliURL);
 const digest = (bytes: string | Buffer): string => createHash('sha256').update(bytes).digest('hex');
 function run(cwd: string, args: string[], script?: string) {
+  // win32: a provision runs icacls plus several PowerShell read-back batches (PLAN §1.7, R4).
   const result = spawnSync(process.execPath, script === undefined ? [cli, ...args] : ['--input-type=module', '-e', script],
-    { cwd, encoding: 'utf8', timeout: 10_000, maxBuffer: 65_536 });
+    { cwd, encoding: 'utf8', timeout: acl ? 60_000 : 10_000, maxBuffer: 65_536 });
   assert.equal(result.error, undefined);
   assert.equal(result.signal, null);
   return result;
@@ -29,7 +37,7 @@ async function snapshot(dir: string): Promise<unknown[]> {
 }
 async function fixture() {
   const dir = await realpath(await mkdtemp(join(tmpdir(), 'cli-fixture-')));
-  await chmod(dir, 0o700);
+  if (acl) acl.makePrivate(dir); else await chmod(dir, 0o700);
   return { dir, root: join(dir, 'auth'), invitation: join(dir, 'invitation') };
 }
 function provision(root: string, invitation: string): string[] {
@@ -53,13 +61,19 @@ test('CLI: explicit provision prints path only; private modes, 256-bit invitatio
     assert.equal(result.status, 0);
     assert.equal(result.stdout, f.invitation + '\n');
     assert.equal(result.stderr, '');
-    assert.equal((await lstat(f.root)).mode & 0o777, 0o700);
-    assert.equal((await lstat(f.invitation)).mode & 0o777, 0o600);
+    if (acl) {
+      assert.equal(acl.isPrivate(f.root), true);
+      assert.equal(acl.isPrivate(f.invitation), true);
+    } else {
+      assert.equal((await lstat(f.root)).mode & 0o777, 0o700);
+      assert.equal((await lstat(f.invitation)).mode & 0o777, 0o600);
+    }
     const secret = (await readFile(f.invitation, 'utf8')).trim();
     assert.ok(/^[A-Za-z0-9_-]{43}$/.test(secret));
     assert.equal(Buffer.from(secret, 'base64url').length, 32);
     const path = join(f.root, 'auth-metadata.json');
-    assert.equal((await lstat(path)).mode & 0o777, 0o600);
+    if (acl) assert.equal(acl.isPrivate(path), true);
+    else assert.equal((await lstat(path)).mode & 0o777, 0o600);
     const raw = await readFile(path, 'utf8');
     assert.equal(raw.includes(secret), false);
     const metadata = JSON.parse(raw);
@@ -76,21 +90,28 @@ test('CLI: explicit provision prints path only; private modes, 256-bit invitatio
   } finally { await rm(f.dir, { recursive: true, force: true }); }
 });
 
-for (const condition of ['collision', 'corrupt', 'permissive-root', 'permissive-metadata', 'root-link', 'invitation-link', 'metadata-link']) {
+// win32 adds 'root-junction': the Windows directory link that needs no link privilege.
+for (const condition of ['collision', 'corrupt', 'permissive-root', 'permissive-metadata', 'root-link', 'invitation-link', 'metadata-link',
+  ...(acl ? ['root-junction'] : [])]) {
   test('CLI: refuses and preserves bytes for ' + condition, async () => {
     const f = await fixture();
     try {
       await mkdir(f.root, { mode: 0o700 });
+      if (acl) acl.makePrivate(f.root);
       const metadata = join(f.root, 'auth-metadata.json');
       if (condition === 'collision') await writeFile(f.invitation, 'existing-private-value', { mode: 0o600 });
-      if (condition === 'corrupt') await writeFile(metadata, '{broken', { mode: 0o600 });
-      if (condition === 'permissive-root') await chmod(f.root, 0o755);
+      if (condition === 'corrupt') {
+        await writeFile(metadata, '{broken', { mode: 0o600 });
+        if (acl) acl.makePrivate(metadata);
+      }
+      if (condition === 'permissive-root') { if (acl) acl.grant(f.root, '*S-1-1-0:(OI)(CI)(RX)'); else await chmod(f.root, 0o755); }
       if (condition === 'permissive-metadata') {
         await writeFile(metadata, '{"version":1,"generation":0,"invitation":null,"credential":null}', { mode: 0o600 });
-        await chmod(metadata, 0o644);
+        if (acl) { acl.makePrivate(metadata); acl.grant(metadata, '*S-1-1-0:(R)'); } else await chmod(metadata, 0o644);
       }
       let root = f.root;
       if (condition === 'root-link') { root = join(f.dir, 'link'); await symlink(f.root, root); }
+      if (condition === 'root-junction') { root = join(f.dir, 'junction'); await symlink(f.root, root, 'junction'); }
       if (condition === 'invitation-link' || condition === 'metadata-link') {
         const target = join(f.dir, 'target');
         await writeFile(target, 'preserve-target-bytes', { mode: 0o600 });

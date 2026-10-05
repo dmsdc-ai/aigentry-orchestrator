@@ -69,6 +69,12 @@ let now = 1800000000000;
 Date.now = () => now;
 const stateDir = join(await realpath(dir), 'auth');
 await mkdir(stateDir, { mode: 0o700 });
+// win32 (#1167): the 0o700 analogue is the P2 private ACL, Set by the shipped primitive.
+if (process.platform === 'win32') {
+  const { setPrivate } = await import(pathToFileURL(join(root, 'bin/lib/win-private-storage.mjs')).href);
+  const set = setPrivate(stateDir, 'directory');
+  assert.equal(set.status, 'ok', 'setPrivate ' + set.code);
+}
 const secure = mode !== 'http';
 const origin = (secure ? 'https' : 'http') + '://localhost:8787';
 const auth = await createAuth({ origin: 'https://localhost:8787', rpId: 'localhost', stateDir, tlsReady: secure }, () => now);
@@ -94,7 +100,8 @@ async function call(path, { method = 'POST', headers = {}, raw = '{}'} = {}) {
   res.useChunkedEncodingByDefault = false;
   res.assignSocket(socket);
   try {
-    const finished = once(res, 'finish', { signal: AbortSignal.timeout(5000) });
+    // win32: each auth refresh runs one synchronous PowerShell read-back batch (PLAN §1.7, R4).
+    const finished = once(res, 'finish', { signal: AbortSignal.timeout(process.platform === 'win32' ? 120000 : 5000) });
     state.listener(req, res);
     await finished;
     const wire = Buffer.concat(chunks).toString();
@@ -202,9 +209,12 @@ for (const mode of ['hostile', 'rate', 'active', 'errors', 'limits', 'http', 'cl
         'https-seam.mjs': "export * from 'https'; export { createServer } from './lifecycle.mjs';\n" };
       for (const [name, source] of Object.entries(sources))
         await writeFile(join(dir, name), source, { mode: 0o600 });
+      // win32: the private-storage primitive resolves its tools from SystemRoot only (P1); its
+      // read-back batches make the limits/active modes far slower than on POSIX (PLAN §1.7, R4).
+      const win32 = process.platform === 'win32';
       const result = spawnSync(process.execPath, ['--loader', pathToFileURL(join(dir, 'loader.mjs')).href,
-        join(dir, 'runner.mjs'), root, dir, mode], { cwd: dir, encoding: 'utf8', timeout: 15000,
-        maxBuffer: 262144, env: { PATH: '', TMPDIR: tmpdir(), TMPPREFIX: tmpdir() } });
+        join(dir, 'runner.mjs'), root, dir, mode], { cwd: dir, encoding: 'utf8', timeout: win32 ? 300000 : 15000,
+        maxBuffer: 262144, env: { PATH: '', TMPDIR: tmpdir(), TMPPREFIX: tmpdir(), ...(win32 ? { SystemRoot: process.env.SystemRoot } : {}) } });
       assert.equal(result.error, undefined, result.stderr);
       assert.equal(result.signal, null, result.stderr);
       assert.equal(result.status, 0, result.stderr + result.stdout);

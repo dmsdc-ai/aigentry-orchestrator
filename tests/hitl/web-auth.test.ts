@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -12,6 +12,13 @@ import { spawnSync } from 'node:child_process';
 import { encodeCBOR, type CBORType } from '@levischuck/tiny-cbor';
 import { createAuth, provisionOwner } from '../../src/hitl/web/auth.js';
 import type { AuthPort } from '../../src/hitl/web/auth-port.js';
+
+// #1167: win32 counterparts of the POSIX mode fixtures and assertions use the lane A ACL helper
+// (tests/helpers/win-acl.mjs, resolved from dist/tests/hitl); POSIX never loads it.
+interface WinAcl { makePrivate(path: string): void; grant(path: string, spec: string): void; isPrivate(path: string): boolean }
+const acl = process.platform === 'win32'
+  ? (await import(pathToFileURL(join(import.meta.dirname, '..', '..', '..', 'tests', 'helpers', 'win-acl.mjs')).href)) as WinAcl
+  : null;
 
 // Adapter tests only: no HTTP listener, real TLS, browser, hardware or owner data.
 const origin = 'https://inbox.example.test';
@@ -97,7 +104,7 @@ function virtualAuthenticator() {
 }
 async function fixture() {
   const dir = await realpath(await mkdtemp(join(tmpdir(), 'fixture-')));
-  await chmod(dir, 0o700);
+  if (acl) acl.makePrivate(dir); else await chmod(dir, 0o700);
   let time = 1_800_000_000_000;
   const config = { origin, rpId, stateDir: dir, tlsReady: true };
   const clock = () => time;
@@ -108,7 +115,8 @@ async function fixture() {
 async function enroll(f: Awaited<ReturnType<typeof fixture>>) {
   const path = join(f.dir, 'invitation');
   assert.deepEqual(await provisionOwner({ authRoot: f.dir, invitationPath: path }, f.clock), { state: 'created', path });
-  assert.equal((await stat(path)).mode & 0o777, 0o600);
+  if (acl) assert.equal(acl.isPrivate(path), true);
+  else assert.equal((await stat(path)).mode & 0o777, 0o600);
   const invitation = (await readFile(path, 'utf8')).trim();
   const p = await preauth(f.auth);
   const options = await call(f.auth, '/auth/enroll/options', { invitation }, p.cookie, p.csrf);
@@ -292,10 +300,18 @@ test('provision: path-only, collision, directory mode, symlink, expiry, no owner
     const p = await preauth(f.auth);
     assert.equal((await call(f.auth, '/auth/enroll/options', { invitation }, p.cookie, p.csrf)).status, 409);
     assert.deepEqual(await provisionOwner({ authRoot: f.dir, invitationPath: join(f.dir, 'invitation') }, f.clock), { state: 'unavailable', reason: 'provision_conflict' });
-    const unsafe = join(f.dir, 'unsafe'); await mkdir(unsafe, { mode: 0o755 }); await chmod(unsafe, 0o755);
+    const unsafe = join(f.dir, 'unsafe'); await mkdir(unsafe, { mode: 0o755 });
+    // win32: private first, so the Everyone read/list grant (the 0o755 analogue) is the only defect.
+    if (acl) { acl.makePrivate(unsafe); acl.grant(unsafe, '*S-1-1-0:(OI)(CI)(RX)'); } else await chmod(unsafe, 0o755);
     assert.deepEqual(await provisionOwner({ authRoot: unsafe, invitationPath: join(unsafe, 'invitation') }, f.clock), { state: 'unavailable', reason: 'storage_unsafe' });
     const link = join(f.dir, 'link'); await symlink(unsafe, link);
     assert.deepEqual(await provisionOwner({ authRoot: link, invitationPath: join(link, 'invitation') }, f.clock), { state: 'unavailable', reason: 'storage_unsafe' });
+    if (acl) {
+      // win32: a junction (no link privilege needed) to an otherwise acceptable private directory.
+      const target = join(f.dir, 'junction-target'); await mkdir(target); acl.makePrivate(target);
+      const junction = join(f.dir, 'junction'); await symlink(target, junction, 'junction');
+      assert.deepEqual(await provisionOwner({ authRoot: junction, invitationPath: join(junction, 'invitation') }, f.clock), { state: 'unavailable', reason: 'storage_unsafe' });
+    }
   } finally { await f.cleanup(); }
   const expired = await fixture();
   try {
@@ -338,7 +354,8 @@ for (const condition of ['corrupt', 'duplicate', 'unsafe']) {
       const path = join(f.dir, 'auth-metadata.json');
       const raw = condition === 'corrupt' ? '{broken' : '{"version":1,"generation":0,"invitation":null,"credential":null' + (condition === 'duplicate' ? ',"version":1}' : '}');
       await writeFile(path, raw, { mode: 0o600 });
-      if (condition === 'unsafe') await chmod(path, 0o644);
+      if (acl) acl.makePrivate(path);
+      if (condition === 'unsafe') { if (acl) acl.grant(path, '*S-1-1-0:(R)'); else await chmod(path, 0o644); }
       const auth = await createAuth(f.config, f.clock);
       try {
         assert.equal(await readFile(path, 'utf8'), raw);
@@ -424,7 +441,7 @@ test('storage: failed first-owner write retains invitation and creates no sessio
   } finally { await f.cleanup(); }
 });
 
-test('status: simulated non-POSIX process refuses; does not prove native Windows ACLs', async () => {
+test('status: Windows private storage unavailable fails closed (win32 process without SystemRoot)', async () => {
   const f = await fixture();
   try {
     const moduleURL = new URL('../../src/hitl/web/auth.js', import.meta.url).href;
@@ -433,11 +450,16 @@ test('status: simulated non-POSIX process refuses; does not prove native Windows
       const auth = await createAuth(${JSON.stringify(f.config)}, () => 1800000000000);
       const provision = await provisionOwner({authRoot:${JSON.stringify(f.dir)}, invitationPath:${JSON.stringify(join(f.dir, 'invitation'))}});
       console.log(JSON.stringify({status:auth.status(), provision})); await auth.close();`;
-    const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8' });
+    // Real on every OS: without SystemRoot the win32 primitive cannot resolve its tools (P1), an
+    // environment failure that must refuse as storage_unavailable and create nothing.
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'systemroot'));
+    const before = await readdir(f.dir);
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', env });
     assert.equal(result.status, 0, result.stderr);
     const parsed = JSON.parse(result.stdout);
-    assert.equal(parsed.status.reason, 'platform_unsupported');
-    assert.equal(parsed.provision.reason, 'platform_unsupported');
+    assert.deepEqual(parsed.status, { state: 'setup_required', reason: 'storage_unavailable' });
+    assert.deepEqual(parsed.provision, { state: 'unavailable', reason: 'storage_unavailable' });
+    assert.deepEqual(await readdir(f.dir), before);
   } finally { await f.cleanup(); }
 });
 
@@ -483,6 +505,7 @@ for (const [name, extra, refused] of [
       const raw = '{"version":1,"generation":0,"invitation":null,"credential":null,' + extra + '}';
       assert.doesNotThrow(() => JSON.parse(raw));
       await writeFile(path, raw, { mode: 0o600 });
+      if (acl) acl.makePrivate(path);
       const auth = await createAuth(f.config, f.clock);
       try {
         assert.equal(auth.status().reason, refused ? 'storage_corrupt' : 'provisioning_required');

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, type TestContext } from 'node:test';
@@ -172,21 +173,35 @@ test('directory-entry bound includes invalid entries; warnings are deduplicated'
   assert.deepEqual(new Set(page.warnings), new Set(['source_unavailable', 'file_limit']));
 });
 
-test('symlink files, dangling links, directories and symlink parents are refused', { skip: process.platform === 'win32' ? 'native Windows link privileges not measured' : false }, async t => {
+// win32 runs the same symlinks (windows-latest runs elevated, which holds the link privilege; a
+// missing privilege fails, never skips) and adds junctions, the privilege-free Windows directory link.
+test('symlink files, dangling links, directories and symlink parents are refused', async t => {
   const root = await fixture(t);
   const target = await put(root, record(), {}, 'history');
   await symlink(target, join(root, 'pending', `${record().id}.json`));
   await symlink(join(root, 'missing'), join(root, 'pending', `${record('dangling').id}.json`));
   await mkdir(join(root, 'pending', `${record('directory').id}.json`));
+  if (process.platform === 'win32') await symlink(join(root, 'decided'), join(root, 'pending', `${record('junction').id}.json`), 'junction');
   assert.deepEqual(await readRequests(root, 'pending', 100), { ...empty, warnings: ['source_unavailable'] });
   await symlink(root, join(root, 'alias'));
   assert.deepEqual(await readRequests(join(root, 'alias'), 'pending', 100), { ...empty, warnings: ['source_unavailable'] });
+  if (process.platform === 'win32') {
+    await symlink(root, join(root, 'alias-junction'), 'junction');
+    assert.deepEqual(await readRequests(join(root, 'alias-junction'), 'pending', 100), { ...empty, warnings: ['source_unavailable'] });
+  }
   await rm(join(root, 'pending'), { recursive: true });
   await symlink(join(root, 'decided'), join(root, 'pending'));
   assert.deepEqual(await readRequests(root, 'pending', 100), { ...empty, warnings: ['source_unavailable'] });
+  if (process.platform === 'win32') {
+    await rm(join(root, 'pending'));
+    await symlink(join(root, 'decided'), join(root, 'pending'), 'junction');
+    assert.deepEqual(await readRequests(root, 'pending', 100), { ...empty, warnings: ['source_unavailable'] });
+  }
 });
 
-test('FIFO source refusal and context_ref FIFO is never opened', { skip: process.platform === 'win32' ? 'native Windows has no POSIX mkfifo' : false, timeout: 5000 }, async t => {
+// mkfifo is POSIX-only: this test is registered on POSIX alone; its Windows-relevant part
+// (special context_ref never opened, non-regular source entry refused) is the win32 test below.
+if (process.platform !== 'win32') test('FIFO source refusal and context_ref FIFO is never opened', { timeout: 5000 }, async t => {
   const root = await fixture(t);
   const fifo = join(root, 'evidence-fifo');
   const result = spawnSync('mkfifo', [fifo], { encoding: 'utf8' });
@@ -202,9 +217,43 @@ test('FIFO source refusal and context_ref FIFO is never opened', { skip: process
   assert.equal((await lstat(fifo)).isFIFO(), true);
 });
 
-test('unreadable record produces a warning when native permissions are enforced', { skip: process.platform === 'win32' ? 'POSIX permissions unavailable on native Windows' : false }, async t => {
+if (process.platform === 'win32') test('named-pipe context_ref is never opened and a non-regular source entry is refused', { timeout: 5000 }, async t => {
+  const root = await fixture(t);
+  // The Windows special file a context_ref can name is a pipe in the \\.\pipe\ namespace; a live
+  // server counts every client open, so "never opened" is observed rather than assumed.
+  let opened = 0;
+  const server = createServer(socket => { opened++; socket.destroy(); });
+  const pipe = `\\\\.\\pipe\\hitl-read-${process.pid}-${Date.now()}`;
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(pipe, resolve); });
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const row = record();
+  await put(root, row, { context_ref: pipe });
+  assert.equal((await readRequests(root, 'pending', 100)).items.length, 1);
+  await symlink(join(root, 'decided'), join(root, 'pending', `${record('pipe').id}.json`), 'junction');
+  const page = await readRequests(root, 'pending', 100);
+  assert.equal(page.items.length, 1);
+  assert.deepEqual(page.warnings, ['source_unavailable']);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(opened, 0);
+});
+
+test('unreadable record produces a warning when native permissions are enforced', async t => {
   const root = await fixture(t);
   const file = await put(root, record());
+  if (process.platform === 'win32') {
+    // The mode-000 analogue: an explicit deny of read-data for the current user (icacls, by SID).
+    const icacls = join(process.env.SystemRoot ?? '', 'System32', 'icacls.exe');
+    const user = spawnSync(join(process.env.SystemRoot ?? '', 'System32', 'whoami.exe'), ['/user', '/fo', 'csv', '/nh'], { encoding: 'utf8' });
+    const sid = /,"(S-1-\d+(?:-\d+)+)"\s*$/.exec(user.stdout.trim())?.[1];
+    assert.ok(sid, `whoami /user: ${user.error ?? ''} ${user.stderr}`);
+    const deny = spawnSync(icacls, [file, '/deny', `*${sid}:(RD)`, '/q'], { encoding: 'utf8' });
+    assert.equal(deny.status, 0, `${deny.error ?? ''} ${deny.stdout}${deny.stderr}`);
+    t.after(() => { spawnSync(icacls, [file, '/remove:d', `*${sid}`, '/q']); });
+    // An elevated administrator does not bypass a deny ACE (no backup privilege is enabled).
+    await assert.rejects(readFile(file), (error: NodeJS.ErrnoException) => ['EPERM', 'EACCES'].includes(error.code ?? ''));
+    await corrupt(root);
+    return;
+  }
   await chmod(file, 0);
   t.after(() => chmod(file, 0o600).catch(() => {}));
   try { await readFile(file); t.skip('current identity bypasses mode-000 permissions'); return; } catch (error) {
