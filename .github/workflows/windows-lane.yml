@@ -1,0 +1,172 @@
+name: Windows lane
+
+# #1167 — a fast, honest per-push signal for the parallel Windows lanes (branches win/<lane>).
+# The full Windows job in ci.yml takes ~17 minutes; this runs only the test files listed in
+# .github/windows-lane-tests.txt, on windows-latest AND ubuntu-latest, so one push shows both
+# that the lane's Windows fix works and that POSIX behaviour did not change.
+#
+# A push event reads this workflow from the pushed branch, so each lane edits its own list.
+# What a green run here does NOT mean: the full suite is green on Windows. That is still
+# measured only by ci.yml (or by a lane pushing the single line `@full`).
+
+on:
+  push:
+    branches: ['win/**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lane:
+    name: Windows lane (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      # Same reason as the W1 job in ci.yml: npm enforces the root manifest's os[] and a plain
+      # `npm ci` dies with EBADPLATFORM on win32. --force is a CI-only bypass of that check.
+      - name: Install dependencies (CI-only --force past the os[] refusal)
+        shell: bash
+        run: npm ci --force
+
+      - name: Build
+        shell: bash
+        run: npm run build
+
+      # Validation runs after the build because dist/ entries only exist then. checkout on
+      # Windows converts the list to CRLF, so every line is stripped of a trailing CR.
+      - name: Read and validate the lane test list
+        shell: bash
+        run: |
+          set -euo pipefail
+          LIST=.github/windows-lane-tests.txt
+          OUT="${RUNNER_TEMP}/windows-lane-files.txt"
+          PATTERN='^(dist/)?tests/[A-Za-z0-9._/-]+\.test\.(js|mjs)$'
+          [ -f "${LIST}" ] || { echo "::error::${LIST} is missing."; exit 1; }
+          ENTRIES=()
+          BAD=0
+          while IFS= read -r line || [ -n "${line}" ]; do
+            line="${line%$'\r'}"
+            line="${line%%#*}"
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [ -n "${line}" ] || continue
+            ENTRIES+=("${line}")
+          done < "${LIST}"
+          [ "${#ENTRIES[@]}" -gt 0 ] || { echo "::error::${LIST} lists no test files; an empty lane is not a pass."; exit 1; }
+          if [ "${#ENTRIES[@]}" = "1" ] && [ "${ENTRIES[0]}" = "@full" ]; then
+            echo "@full" > "${OUT}"
+            echo "lane list: @full — the whole suite runs through scripts/run-tests.mjs"
+            exit 0
+          fi
+          : > "${OUT}"
+          for entry in "${ENTRIES[@]}"; do
+            if [ "${entry}" = "@full" ]; then
+              echo "::error::@full must be the only entry in ${LIST}."; BAD=$((BAD + 1)); continue
+            fi
+            if [[ "${entry}" == *..* ]] || ! [[ "${entry}" =~ ${PATTERN} ]]; then
+              echo "::error::'${entry}' is not a repo-relative test file matching ${PATTERN} (and no '..')."; BAD=$((BAD + 1)); continue
+            fi
+            if [ ! -f "${entry}" ]; then
+              echo "::error::'${entry}' does not exist after the build."; BAD=$((BAD + 1)); continue
+            fi
+            printf '%s\n' "${entry}" >> "${OUT}"
+          done
+          [ "${BAD}" = "0" ] || { echo "::error::${BAD} invalid entr(y/ies) in ${LIST}; nothing was run."; exit 1; }
+          echo "lane list (${#ENTRIES[@]} file(s)):"
+          cat "${OUT}"
+
+      # One run, never retried. Reads the TAP summary the same way the W1 job does — a count
+      # that cannot be read is a failure, never a vacuous pass. Skips are reported, not failed.
+      - name: Run the lane tests
+        shell: bash
+        run: |
+          set -uo pipefail
+          LOG="${RUNNER_TEMP}/windows-lane.log"
+          mapfile -t FILES < "${RUNNER_TEMP}/windows-lane-files.txt"
+          set +e
+          if [ "${FILES[0]}" = "@full" ]; then
+            # run-tests.mjs runs the POSIX control harness as a second `node --test` on
+            # linux/darwin, so @full may carry one summary per invocation; they are summed.
+            MODE=full
+            node scripts/run-tests.mjs 2>&1 | tee "${LOG}"
+          else
+            MODE=files
+            node --test --test-reporter=tap "${FILES[@]}" 2>&1 | tee "${LOG}"
+          fi
+          RC="${PIPESTATUS[0]}"
+          set -e
+          # Prints "<records> <sum>" for top-level `# <key> N` lines, or nothing when a record
+          # is missing or malformed.
+          read_count() {
+            awk -v key="$1" '
+              { sub(/\r$/, "") }
+              $0 ~ ("^# " key "([[:space:]]|$)") {
+                records++
+                if ($0 !~ ("^# " key " [0-9]+$")) malformed = 1
+                else sum += $3
+              }
+              END { if (records >= 1 && !malformed) print records " " sum }
+            ' "${LOG}"
+          }
+          T="$(read_count tests)"; P="$(read_count pass)"; F="$(read_count fail)"; S="$(read_count skipped)"
+          [ -n "${T}" ] && [ -n "${P}" ] && [ -n "${F}" ] && [ -n "${S}" ] \
+            || { echo "::error::could not parse the TAP summary; refusing to report a vacuous pass."; exit 1; }
+          RECORDS="${T%% *}"
+          for v in "${P}" "${F}" "${S}"; do
+            [ "${v%% *}" = "${RECORDS}" ] || { echo "::error::the TAP summary records disagree (tests='${T}' pass='${P}' fail='${F}' skipped='${S}'); refusing to compare them."; exit 1; }
+          done
+          if [ "${MODE}" = "files" ] && [ "${RECORDS}" != "1" ]; then
+            echo "::error::expected exactly one TAP summary from a single node --test run, found ${RECORDS}; refusing to guess which is real."; exit 1
+          fi
+          TESTS="${T#* }"; PASS="${P#* }"; FAIL="${F#* }"; SKIP="${S#* }"
+          echo "lane ${RUNNER_OS} (${MODE}): tests=${TESTS} pass=${PASS} fail=${FAIL} skipped=${SKIP} runner-exit=${RC}"
+          if [ "${FAIL}" != "0" ]; then
+            echo "--- failures (each 'not ok' with up to 25 lines of its diagnostic; full log is the artifact) ---"
+            awk -v max_lines=1500 '
+              { sub(/\r$/, "") }
+              /^[[:space:]]*ok / { left = 0 }
+              /^[[:space:]]*not ok / { left = 26 }
+              left > 0 {
+                if (printed >= max_lines) { truncated = 1; exit }
+                print; printed++; left--
+              }
+              END { if (truncated) print "... failure output truncated at " max_lines " lines; see the uploaded log artifact." }
+            ' "${LOG}"
+          fi
+          VIOLATIONS=0
+          if [ "${TESTS}" -gt 0 ]; then :; else
+            echo "::error::the TAP summary reports ${TESTS} tests; a run that tested nothing is not a pass."; VIOLATIONS=$((VIOLATIONS + 1))
+          fi
+          if [ "${FAIL}" != "0" ]; then
+            echo "::error::${FAIL} lane test(s) failed on ${RUNNER_OS}."; VIOLATIONS=$((VIOLATIONS + 1))
+          fi
+          if [ "${RC}" != "0" ]; then
+            echo "::error::the test runner exited ${RC}."; VIOLATIONS=$((VIOLATIONS + 1))
+          fi
+          [ "${SKIP}" = "0" ] || echo "::warning::${SKIP} lane test(s) skipped on ${RUNNER_OS} (reported, not failed here)."
+          [ "${VIOLATIONS}" = "0" ] || { echo "::error::${VIOLATIONS} lane gate violation(s) reported above."; exit 1; }
+
+      - name: Upload the full lane log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-lane-log-${{ matrix.os }}
+          path: ${{ runner.temp }}/windows-lane.log
+          if-no-files-found: warn
+          retention-days: 7
