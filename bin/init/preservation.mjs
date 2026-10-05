@@ -15,9 +15,9 @@
  * {roots, operationId, planId}; receipt paths never select roots or file paths.
  *
  * Supported: existing canonical, user-owned workspace/home roots and an existing
- * private (0700) backup root, disjoint, on local macOS/Linux filesystems. Target
+ * private (0700) backup root, disjoint, on local macOS/Linux/Windows filesystems. Target
  * parent directories must already exist unless explicitly declared below. Missing roots, config/state/
- * unknown entries, unreadable output modes, ACL/xattr fidelity, special bits, native Windows and automatic
+ * unknown entries, unreadable output modes, ACL/xattr fidelity, special bits and automatic
  * recovery of an interrupted executor are explicit unsupported gates. No root
  * bootstrap, migration, expiry, automatic rollback or metadata stamp special ordering.
  * Caller must supply an ordered inventory (e.g. stamp last) and keep boot blocked
@@ -39,6 +39,15 @@
  * mtime are untouched (reads may change atime). Receipt checksums detect damage,
  * not malicious modification by the trusted owner. Fsync is mandatory for files;
  * unsupported directory fsync is recorded in durabilityWarnings, never hidden.
+ *
+ * Windows: "private" (0700/0600) is a protected DACL whose only allow ACE is the
+ * current user, set on directories and read back; private files inherit it from a
+ * verified private directory (no per-file set). "Owned" directories grant no write
+ * to trustees other than the user, SYSTEM and Administrators. Outputs inherit the
+ * target directory's DACL; modes project onto the read-only attribute and read-only
+ * outputs, targets and baselines are refused, as are device names and <>"|?* in paths.
+ * Durability is file fsync plus the NTFS journal (directory-fsync-unsupported). Links
+ * and junctions are refused by lstat; parents must be canonical (realpath).
  *
  * API delta: optional Input.directories is an exact array of
  * {root:'workspace'|'home', path:nonemptyCanonicalRelativePath, mode:0700}.
@@ -70,12 +79,20 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 
+// Windows private storage (P2) is loaded only on win32: this file is also installed alone as a native
+// capture leaf, so POSIX must never depend on its sibling module (P9).
+const WINDOWS = process.platform === "win32";
+const winStorage = WINDOWS ? await import("../lib/win-private-storage.mjs") : null;
 const VERSION = 1;
 const PREFIX = ".aigentry-preservation";
 const HASH = /^[a-f0-9]{64}$/;
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const ROOT_NAMES = ["workspace", "home", "backup"];
 const TARGET_NAMES = ROOT_NAMES.slice(0, 2);
+// Names NTFS cannot hold as ordinary files, with or without an extension.
+const WINDOWS_DEVICE = /^(con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3]|conin\$|conout\$) *(\.|$)/i;
+const STORAGE_ENVIRONMENT = new Set(["unsupported_platform", "system_root_invalid", "tool_missing", "tool_timeout",
+  "tool_failed", "tool_output_invalid", "principal_unavailable", "read_failed"]);
 const plans = new WeakMap();
 const digest = (value) => createHash("sha256").update(value).digest("hex");
 const alias = (value) => value.normalize("NFC").toLowerCase();
@@ -129,25 +146,127 @@ function stat(file) {
   try { return fs.lstatSync(file, { bigint: true }); }
   catch (error) { if (error.code === "ENOENT") return null; throw error; }
 }
+function ownerUid() { return WINDOWS ? 0 : process.getuid(); }
+// Windows projects modes onto the read-only attribute; Node reports 0666 or 0444.
+function modeOf(value) { return WINDOWS ? (value & 0o200 ? 0o666 : 0o444) : value; }
+function writableMode(value) {
+  insist(!WINDOWS || (value & 0o200) !== 0, "UNSUPPORTED_METADATA", "Read-only modes are unsupported on Windows");
+}
+// Windows read-back session (PLAN 1.7), one per outermost public call. `created` maps dev:ino of files
+// this call wrote exclusively to whether they are private; `pending` holds private files to verify at the
+// next barrier. Nothing is cached across calls.
+let windows = null;
+function privateCall(operation, ...args) {
+  if (!WINDOWS) return operation(...args);
+  const outer = windows === null;
+  if (outer) windows = { session: winStorage.createSession(), created: new Map(), pending: new Map(), marked: false };
+  try {
+    if (outer && !storageStatus(windows.session)) throw storageUnavailable(windows.session.code);
+    const result = operation(...args);
+    flushPrivate();
+    return result;
+  } finally { if (outer) windows = null; }
+}
+function storageUnavailable(code) {
+  return new PreservationError("PRIVATE_STORAGE_UNAVAILABLE", `Windows private storage is unavailable: ${winStorage.describe(code)}`);
+}
+// True when every result verifies; environment failures throw; malformed results fail closed.
+function storageResults(results, count = results?.length) {
+  if (!Array.isArray(results) || results.length !== count) throw storageUnavailable("tool_output_invalid");
+  const failed = results.find((result) => result?.ok !== true && STORAGE_ENVIRONMENT.has(result?.code));
+  if (failed) throw storageUnavailable(failed.code);
+  return results.every((result) => result?.ok === true);
+}
+// createSession/markSet/flush answer {status:'ok'} or {status:'error', code}; environment failures throw; other shapes fail closed.
+function storageStatus(result) {
+  if (result?.status !== "ok" && result?.status !== "error") throw storageUnavailable("tool_output_invalid");
+  if (result.status === "error" && STORAGE_ENVIRONMENT.has(result.code)) throw storageUnavailable(result.code);
+  return result.status === "ok";
+}
+const identityKey = (value) => `${value.dev}:${value.ino}`;
+function directoryItems(file) {
+  return ["private", "owned"].map((want) => ({ path: file, kind: "directory", want }));
+}
+// Q-FILE R2: a private file is verified with its parent directory in the same read batch.
+function privateFileItems(file) {
+  return [{ path: path.dirname(file), kind: "directory", want: "private" }, { path: file, kind: "file", want: "private" }];
+}
+// Prefetch reads only objects whose lstat walk already shows no link, so no reparse point is followed.
+function localDirectoryItems(file) {
+  try { ancestors(file); } catch { return []; }
+  return directoryItems(file);
+}
+function prefetchItems(file) {
+  const value = stat(file);
+  return value?.isFile() && !windows.created.has(identityKey(value)) ? privateFileItems(file) : [];
+}
+// Readers re-require each item and map their own failures; this only batches the reads.
+function prefetch(items) {
+  if (WINDOWS && items.length) windows.session.require(items);
+}
+function prefetchLocks(files) {
+  if (WINDOWS) prefetch(files.flatMap((file) => { const items = localDirectoryItems(file);
+    return items.length ? [...items, ...prefetchItems(path.join(file, "owner.json"))] : []; }));
+}
+function directoryClass(file) {
+  const items = directoryItems(file), results = windows.session.require(items);
+  storageResults(results, items.length);
+  return { private: results[0].ok === true, owned: results[1].ok === true };
+}
+// POSIX: mode 0600. Windows: written by this call (verified at the next barrier) or verified now.
+function privateRecord(file, record) {
+  if (!WINDOWS) return record.meta.mode === 0o600;
+  if (windows.created.get(identityKey(record.meta)) === true) return true;
+  const items = privateFileItems(file);
+  return storageResults(windows.session.require(items), items.length);
+}
+function makePrivateDir(file) {
+  fs.mkdirSync(file, { mode: 0o700 });
+  if (!WINDOWS) return;
+  const result = winStorage.setPrivate(file, "directory");
+  if (result?.status !== "ok") throw STORAGE_ENVIRONMENT.has(result?.code) ? storageUnavailable(result.code)
+    : new PreservationError("PRIVATE_MODE", `Directory could not be made private: ${file}`);
+  insist(storageStatus(windows.session.markSet(file, "directory")), "PRIVATE_MODE", `Directory could not be made private: ${file}`);
+  windows.marked = true;
+}
+function flushDirectories() {
+  if (!windows.marked) return;
+  windows.marked = false;
+  insist(storageStatus(windows.session.flush()), "PRIVATE_MODE", "Created directory failed private verification");
+}
+// Mandatory barrier: every directory and private file created so far verifies in at most two batches.
+function flushPrivate() {
+  if (!WINDOWS) return;
+  flushDirectories();
+  // Replaced or removed entries (an older receipt, a released owner) no longer hold that identity.
+  const items = [...windows.pending].filter(([file, key]) => { const value = stat(file); return value && identityKey(value) === key; })
+    .flatMap(([file]) => privateFileItems(file));
+  windows.pending.clear();
+  insist(!items.length || storageResults(windows.session.require(items), items.length),
+    "PRIVATE_MODE", "Created file failed private verification");
+}
 function directory(file, privateMode = false) {
   const value = stat(file);
   insist(value?.isDirectory() && !value.isSymbolicLink(), "UNSAFE_PATH", `Not a regular directory: ${file}`);
-  insist(value.uid === BigInt(process.getuid()) && (Number(value.mode) & 0o022) === 0,
+  const security = WINDOWS ? directoryClass(file) : null;
+  insist(WINDOWS ? security.owned : value.uid === BigInt(ownerUid()) && (Number(value.mode) & 0o022) === 0,
     "UNTRUSTED_ROOT", `Directory must be owned and not writable by other users: ${file}`);
-  if (privateMode) insist((Number(value.mode) & 0o777) === 0o700,
+  if (privateMode) insist(WINDOWS ? security.private : (Number(value.mode) & 0o777) === 0o700,
     "PRIVATE_MODE", `Directory must have mode 0700: ${file}`);
   return { dev: String(value.dev), ino: String(value.ino) };
 }
 function absolute(file) {
   insist(typeof file === "string" && path.isAbsolute(file) && file !== "/" &&
     !/[\x00-\x1f\x7f]/.test(file) && path.normalize(file) === file &&
-    !file.endsWith(path.sep), "UNSAFE_PATH", "Expected a canonical absolute path");
+    !file.endsWith(path.sep) && (!WINDOWS || /^[A-Za-z]:\\[^<>:"|?*]+$/.test(file)),
+  "UNSAFE_PATH", "Expected a canonical absolute path");
 }
 function relative(file) {
   insist(typeof file === "string" && file.length > 0 && !file.startsWith("/") &&
-    !/[\\:\x00-\x1f\x7f]/.test(file), "UNSAFE_PATH", "Invalid root-relative path");
+    !/[\\:\x00-\x1f\x7f]/.test(file) && (!WINDOWS || !/[<>"|?*]/.test(file)), "UNSAFE_PATH", "Invalid root-relative path");
   for (const part of file.split("/")) insist(part !== "" && part !== "." && part !== ".." &&
-    !part.endsWith(".") && !part.endsWith(" ") && !alias(part).startsWith(PREFIX),
+    !part.endsWith(".") && !part.endsWith(" ") && !alias(part).startsWith(PREFIX) &&
+    (!WINDOWS || !WINDOWS_DEVICE.test(part)),
   "UNSAFE_PATH", "Traversal, ambiguous or reserved path component");
 }
 function ancestors(file) {
@@ -160,10 +279,15 @@ function ancestors(file) {
   }
 }
 function validateRoots(roots) {
-  insist(["darwin", "linux"].includes(process.platform) && typeof process.getuid === "function",
-    "UNSUPPORTED_PLATFORM", "Only macOS/Linux are supported");
+  insist(WINDOWS || ["darwin", "linux"].includes(process.platform) && typeof process.getuid === "function",
+    "UNSUPPORTED_PLATFORM", "Only macOS/Linux/Windows are supported");
   object(roots, ROOT_NAMES, "roots");
   const identities = {};
+  // One batch for the roots; only drive paths without links are read before the checks below.
+  if (WINDOWS) prefetch(ROOT_NAMES.flatMap((name) => {
+    try { absolute(roots[name]); } catch { return []; }
+    return localDirectoryItems(roots[name]);
+  }));
   for (const name of ROOT_NAMES) {
     absolute(roots[name]);
     ancestors(roots[name]);
@@ -173,7 +297,7 @@ function validateRoots(roots) {
   for (let i = 0; i < ROOT_NAMES.length; i++) for (let j = i + 1; j < ROOT_NAMES.length; j++) {
     const a = ROOT_NAMES[i], b = ROOT_NAMES[j];
     const x = alias(roots[a]), y = alias(roots[b]);
-    insist(x !== y && !x.startsWith(`${y}/`) && !y.startsWith(`${x}/`) &&
+    insist(x !== y && !x.startsWith(`${y}${path.sep}`) && !y.startsWith(`${x}${path.sep}`) &&
       !same(identities[a], identities[b]), "ROOT_OVERLAP", "Roots overlap or alias");
   }
   return identities;
@@ -184,6 +308,8 @@ function destination(roots, entry) {
   const file = path.join(roots[entry.root], entry.path);
   ancestors(path.dirname(file));
   directory(path.dirname(file));
+  // P4 containment: catches mount points, 8.3 and case aliases of the parent.
+  if (WINDOWS) insist(fs.realpathSync.native(path.dirname(file)) === path.dirname(file), "UNSAFE_PATH", "Target parent is not canonical");
   return file;
 }
 function protectedEntry(entry) {
@@ -207,14 +333,15 @@ function normalizedInput(input) {
     insist(entry.bytes instanceof Uint8Array, "SCHEMA", "Rendered bytes must be Uint8Array");
     mode(entry.mode);
     insist((entry.mode & 0o400) !== 0, "UNSUPPORTED_METADATA", "Output must remain readable by its owner for verification");
+    writableMode(entry.mode);
     if (entry.baseline !== null) {
       object(entry.baseline, ["hash", "mode"], "baseline");
-      hash(entry.baseline.hash); mode(entry.baseline.mode);
+      hash(entry.baseline.hash); mode(entry.baseline.mode); writableMode(entry.baseline.mode);
     }
     const file = destination(input.roots, entry);
     const key = alias(file);
     insist(!aliases.has(key), "DUPLICATE_ALIAS", "Duplicate destination alias");
-    for (const previous of aliases) insist(!key.startsWith(`${previous}/`) && !previous.startsWith(`${key}/`),
+    for (const previous of aliases) insist(!key.startsWith(`${previous}${path.sep}`) && !previous.startsWith(`${key}${path.sep}`),
       "DUPLICATE_ALIAS", "A destination is another destination's ancestor");
     aliases.add(key);
     const parentIdentity = directory(path.dirname(file));
@@ -238,15 +365,25 @@ function directoryIdentity(file) {
   directory(file);
   insist(fs.realpathSync.native(file) === file, "UNSAFE_PATH", "Directory path is not canonical");
   const value = stat(file);
-  insist(value?.isDirectory() && !value.isSymbolicLink() && value.uid === BigInt(process.getuid()) &&
+  if (WINDOWS) {
+    // D3: mode is the verified class (private 0700, owned 0755); acl is the order-insensitive digest.
+    insist(value?.isDirectory() && !value.isSymbolicLink(), "UNSAFE_PATH", "Unsafe directory metadata");
+    const acl = windows.session.digest(file);
+    // The digest must describe the object stat above (PLAN 1.6: a failed check keeps this site's UNSAFE_PATH).
+    insist(storageResults([acl]) && acl.dev === String(value.dev) && acl.ino === String(value.ino), "UNSAFE_PATH", "Unsafe directory metadata");
+    insist(HASH.test(acl.digest), "PRIVATE_STORAGE_UNAVAILABLE", "Directory ACL digest is unavailable");
+    return { dev: String(value.dev), ino: String(value.ino), uid: 0, mode: directoryClass(file).private ? 0o700 : 0o755, acl: acl.digest };
+  }
+  insist(value?.isDirectory() && !value.isSymbolicLink() && value.uid === BigInt(ownerUid()) &&
     (Number(value.mode) & 0o7022) === 0, "UNSAFE_PATH", "Unsafe directory metadata");
   return { dev: String(value.dev), ino: String(value.ino), uid: Number(value.uid), mode: Number(value.mode) & 0o777 };
 }
 function directoryIdentityShape(value) {
-  object(value, ["dev", "ino", "uid", "mode"], "directory identity");
+  object(value, WINDOWS ? ["dev", "ino", "uid", "mode", "acl"] : ["dev", "ino", "uid", "mode"], "directory identity");
   for (const key of ["dev", "ino"]) insist(typeof value[key] === "string" && /^\d+$/.test(value[key]), "SCHEMA", "Invalid directory identity");
+  if (WINDOWS) hash(value.acl);
   mode(value.mode);
-  insist(value.uid === process.getuid() && (value.mode & 0o022) === 0, "SCHEMA", "Unsafe directory owner/mode");
+  insist(value.uid === ownerUid() && (value.mode & 0o022) === 0, "SCHEMA", "Unsafe directory owner/mode");
 }
 function uniqueDirectoryIdentities(identities) {
   const seen = new Set();
@@ -299,7 +436,7 @@ function directoryLayout(roots, declarations, entries) {
     }
   }
   for (const [file, entry] of declared) needed.set(file, entry);
-  return { declared, needed: [...needed].sort(([a], [b]) => a.split("/").length - b.split("/").length || a.localeCompare(b)) };
+  return { declared, needed: [...needed].sort(([a], [b]) => a.split(path.sep).length - b.split(path.sep).length || a.localeCompare(b)) };
 }
 function normalizedDirectoryInput(input) {
   object(input, ["roots", "sourceHash", "entries", "directories"], "directory input");
@@ -316,13 +453,15 @@ function normalizedDirectoryInput(input) {
     insist(entry.bytes instanceof Uint8Array, "SCHEMA", "Rendered bytes must be Uint8Array");
     mode(entry.mode);
     insist((entry.mode & 0o400) !== 0, "UNSUPPORTED_METADATA", "Output must remain readable by its owner for verification");
+    writableMode(entry.mode);
     if (entry.baseline !== null) {
-      object(entry.baseline, ["hash", "mode"], "baseline"); hash(entry.baseline.hash); mode(entry.baseline.mode);
+      object(entry.baseline, ["hash", "mode"], "baseline"); hash(entry.baseline.hash); mode(entry.baseline.mode); writableMode(entry.baseline.mode);
     }
     return { root: entry.root, path: entry.path, kind: entry.kind, mode: entry.mode,
       baseline: entry.baseline && { ...entry.baseline }, bytes: Buffer.from(entry.bytes).toString("base64") };
   });
   const layout = directoryLayout(input.roots, declarations, entries), identities = new Map(), directoryParents = [];
+  if (WINDOWS) prefetch(layout.needed.flatMap(([file]) => localDirectoryItems(file)));
   for (const [file, entry] of layout.needed) {
     const identity = stat(file) ? directoryIdentity(file) : null;
     insist(identity || layout.declared.has(file), "UNSUPPORTED_PARENT", `Missing undeclared parent: ${file}`);
@@ -357,13 +496,18 @@ function precondition(value) {
   const { atimeNs, ...rest } = value;
   return rest;
 }
-function readRegular(file) {
+function readRegular(file, checkOwner = true) {
   const before = stat(file);
   if (!before) return null;
   insist(before.isFile() && before.nlink === 1n && !before.isSymbolicLink(),
     "UNSAFE_TARGET", `Refusing symlink, special or hardlinked file: ${file}`);
-  insist((Number(before.mode) & 0o7000) === 0 && before.uid === BigInt(process.getuid()),
+  insist((Number(before.mode) & 0o7000) === 0 && before.uid === BigInt(ownerUid()),
     "UNSUPPORTED_METADATA", `File ownership or special permissions unsupported: ${file}`);
+  // D2: read-only files cannot be replaced or restored. Files this call wrote are owned by construction;
+  // private files verify their owner through the private rule instead (Q-FILE R2).
+  if (WINDOWS) insist((Number(before.mode) & 0o200) !== 0 && (!checkOwner || windows.created.has(identityKey(before)) ||
+    storageResults(windows.session.require([{ path: file, kind: "file", want: "owner" }]), 1)),
+  "UNSUPPORTED_METADATA", `Read-only or foreign-owned file unsupported: ${file}`);
   const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   try {
     const opened = fs.fstatSync(fd, { bigint: true });
@@ -396,9 +540,9 @@ function allLocks(roots, entries) {
 function lockOwner(file) {
   if (!stat(file)) return null;
   directory(file, true);
-  const record = readRegular(path.join(file, "owner.json"));
+  const record = readRegular(path.join(file, "owner.json"), false);
   insist(record, "OWNERLESS_LOCK", `Unfinished ownership acquisition: ${file}`);
-  insist(record.meta.mode === 0o600, "PRIVATE_MODE", "Lock owner must have mode 0600");
+  insist(privateRecord(path.join(file, "owner.json"), record), "PRIVATE_MODE", "Lock owner must have mode 0600");
   const owner = JSON.parse(record.bytes.toString("utf8"));
   object(owner, ["schemaVersion", "operationId", "planId", "backupRoot"], "lock owner");
   insist(owner.schemaVersion === VERSION && UUID.test(owner.operationId), "SCHEMA", "Invalid lock identity");
@@ -407,10 +551,12 @@ function lockOwner(file) {
 }
 
 /** Read-only root-level pending status; owner paths are inert information. */
-export function inspectPending(request) {
+export function inspectPending(request) { return privateCall(pendingStatus, request); }
+function pendingStatus(request) {
   object(request, ["roots"], "pending request");
   const { roots } = request;
   validateRoots(roots);
+  prefetchLocks(TARGET_NAMES.map((root) => rootLock(roots, root)));
   return freeze(TARGET_NAMES.flatMap((root) => {
     const file = rootLock(roots, root);
     if (!stat(file)) return [];
@@ -420,7 +566,8 @@ export function inspectPending(request) {
 }
 
 /** @param {Input} input @returns {Plan} No destination or administrative writes. */
-export function plan(input) {
+export function plan(input) { return privateCall(planOperation, input); }
+function planOperation(input) {
   const normalized = normalizedInput(input);
   const pending = inspectPending({ roots: normalized.roots });
   insist(pending.length === 0, "PENDING_OPERATION", "A target has an unfinished operation");
@@ -431,8 +578,8 @@ export function plan(input) {
     const before = snapshot(file), desiredHash = digest(Buffer.from(bytes, "base64"));
     // Ownership kind takes precedence even if bytes happen to match.
     const action = protectedEntry(entry) ? "unsupported" : !before ? "create" :
-      before.hash === desiredHash && before.mode === entry.mode ? "unchanged" :
-      entry.baseline?.hash === before.hash && entry.baseline.mode === before.mode ? "replace-package" : "conflict";
+      before.hash === desiredHash && before.mode === modeOf(entry.mode) ? "unchanged" :
+      entry.baseline?.hash === before.hash && modeOf(entry.baseline.mode) === before.mode ? "replace-package" : "conflict";
     return { ...entry, index, before, desiredHash, action };
   });
   const body = { schemaVersion: normalized.directories ? 2 : VERSION, operationId: randomUUID(),
@@ -451,6 +598,11 @@ export function plan(input) {
 }
 
 function syncDirectory(file, warnings) {
+  // P3: Windows has no directory fsync; file fsync plus the NTFS journal is the stated level.
+  if (WINDOWS) {
+    if (!warnings.includes("directory-fsync-unsupported")) warnings.push("directory-fsync-unsupported");
+    return;
+  }
   const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   try {
     try { fs.fsyncSync(fd); }
@@ -460,19 +612,26 @@ function syncDirectory(file, warnings) {
     }
   } finally { fs.closeSync(fd); }
 }
-function writeExclusive(file, bytes, permissions = 0o600) {
+function writeExclusive(file, bytes, permissions = 0o600, privateFile = true) {
   const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT |
     fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, permissions);
   try { fs.writeFileSync(fd, bytes); fs.fchmodSync(fd, permissions); fs.fsyncSync(fd); }
   finally { fs.closeSync(fd); }
+  // Q-FILE R2: no per-file Set. A private file inherits its directory's DACL and is verified at the next barrier.
+  if (WINDOWS) {
+    const key = identityKey(stat(file));
+    windows.created.set(key, privateFile);
+    if (privateFile) windows.pending.set(file, key);
+  }
 }
 function ownerFor(planValue) {
   return { schemaVersion: VERSION, operationId: planValue.operationId,
     planId: planValue.planId, backupRoot: planValue.roots.backup };
 }
 function assertLocks(receipt) {
-  const owner = ownerFor(receipt.plan);
-  for (const file of allLocks(receipt.plan.roots, receipt.plan.entries))
+  const owner = ownerFor(receipt.plan), files = allLocks(receipt.plan.roots, receipt.plan.entries);
+  prefetchLocks(files);
+  for (const file of files)
     insist(same(lockOwner(file), owner), "CONCURRENT_OWNERSHIP", "Target lock is absent or belongs to another operation");
 }
 function operationDirectory(roots, id) {
@@ -485,11 +644,12 @@ function receiptBytes(receipt) {
 }
 function saveReceipt(dir, receipt) {
   directory(dir, true);
-  const existing = readRegular(path.join(dir, "operation.json"));
-  insist(!existing || existing.meta.mode === 0o600, "PRIVATE_MODE", "Existing receipt is not private");
+  const existing = readRegular(path.join(dir, "operation.json"), false);
+  insist(!existing || privateRecord(path.join(dir, "operation.json"), existing), "PRIVATE_MODE", "Existing receipt is not private");
   const temporary = path.join(dir, `receipt-${randomUUID()}.tmp`);
   writeExclusive(temporary, receiptBytes(receipt));
   fs.renameSync(temporary, path.join(dir, "operation.json"));
+  if (WINDOWS) { windows.pending.set(path.join(dir, "operation.json"), windows.pending.get(temporary)); windows.pending.delete(temporary); }
   syncDirectory(dir, receipt.durabilityWarnings);
 }
 function stagePath(roots, entry, id, restore = false) {
@@ -535,9 +695,10 @@ function validateStoredPlan(value, roots, id, planId) {
 function loadReceipt({ roots, operationId, planId }) {
   hash(planId); validateRoots(roots);
   const dir = operationDirectory(roots, operationId);
+  if (WINDOWS) prefetch([...localDirectoryItems(dir), ...prefetchItems(path.join(dir, "operation.json"))]);
   directory(dir, true);
-  const file = readRegular(path.join(dir, "operation.json"));
-  insist(file && file.meta.mode === 0o600, "MISSING_RECEIPT", "Missing/private-mode-invalid operation receipt");
+  const file = readRegular(path.join(dir, "operation.json"), false);
+  insist(file && privateRecord(path.join(dir, "operation.json"), file), "MISSING_RECEIPT", "Missing/private-mode-invalid operation receipt");
   const envelope = JSON.parse(file.bytes.toString("utf8"));
   object(envelope, ["checksum", "payload"], "receipt envelope");
   hash(envelope.checksum);
@@ -557,8 +718,8 @@ function loadReceipt({ roots, operationId, planId }) {
   for (const value of [...receipt.postimages, ...receipt.restoreImages]) if (value !== null) recordShape(value);
   for (const entry of receipt.plan.entries) {
     const post = receipt.postimages[entry.index], restored = receipt.restoreImages[entry.index];
-    insist(!post || (post.hash === entry.desiredHash && post.mode === entry.mode &&
-      post.uid === process.getuid() && post.dev === entry.parentIdentity.dev), "CORRUPT_RECEIPT", "Postimage does not match planned output");
+    insist(!post || (post.hash === entry.desiredHash && post.mode === modeOf(entry.mode) &&
+      post.uid === ownerUid() && post.dev === entry.parentIdentity.dev), "CORRUPT_RECEIPT", "Postimage does not match planned output");
     insist(!restored || (entry.before && restored.hash === entry.before.hash && restored.mode === entry.before.mode &&
       restored.uid === entry.before.uid && restored.gid === entry.before.gid && restored.size === entry.before.size &&
       restored.dev === entry.parentIdentity.dev && restoredMatches(restored, entry.before)),
@@ -617,8 +778,8 @@ function validateDirectoryReceipt(receipt, roots, operationId, planId) {
     const parent = planned.get(path.dirname(boundedTarget(roots, entry)));
     insist(same(entry.parentIdentity, parent ? { dev: parent.dev, ino: parent.ino } : null), "SCHEMA", "File parent snapshot mismatch");
     if (entry.before !== null) { recordShape(entry.before); insist(parent, "SCHEMA", "Original file has absent parent"); }
-    const action = !entry.before ? "create" : entry.before.hash === entry.desiredHash && entry.before.mode === entry.mode ? "unchanged" :
-      entry.baseline?.hash === entry.before.hash && entry.baseline.mode === entry.before.mode ? "replace-package" : "conflict";
+    const action = !entry.before ? "create" : entry.before.hash === entry.desiredHash && entry.before.mode === modeOf(entry.mode) ? "unchanged" :
+      entry.baseline?.hash === entry.before.hash && modeOf(entry.baseline.mode) === entry.before.mode ? "replace-package" : "conflict";
     insist(entry.action === action, "SCHEMA", "Inconsistent file action");
   });
   insist(same(value.refusals, value.entries.filter((entry) => entry.action === "conflict")
@@ -648,7 +809,7 @@ function validateDirectoryReceipt(receipt, roots, operationId, planId) {
     const parentIndex = value.directories.findIndex((item) => boundedTarget(roots, item) === parentFile);
     const parent = parentIndex >= 0 ? receipt.directoryProgress[parentIndex].identity : planned.get(parentFile);
     const post = receipt.postimages[entry.index], restored = receipt.restoreImages[entry.index];
-    insist(!post || (parent && post.hash === entry.desiredHash && post.mode === entry.mode && post.uid === process.getuid() && post.dev === parent.dev), "CORRUPT_RECEIPT", "Invalid directory file postimage");
+    insist(!post || (parent && post.hash === entry.desiredHash && post.mode === modeOf(entry.mode) && post.uid === ownerUid() && post.dev === parent.dev), "CORRUPT_RECEIPT", "Invalid directory file postimage");
     insist(!restored || (parent && entry.before && restored.dev === parent.dev && restoredMatches(restored, entry.before)), "CORRUPT_RECEIPT", "Invalid restored image");
     insist(!["staged", "written"].includes(receipt.progress[entry.index]) || post, "CORRUPT_RECEIPT", "Missing file postimage");
   }
@@ -668,6 +829,7 @@ function checkDirectories(receipt, transitioning = -1) {
     }),
   ].sort((a, b) => a.path.split("/").length - b.path.split("/").length);
   uniqueDirectoryIdentities([...Object.values(value.directoryRoots), ...inventory.map((entry) => entry.expected)]);
+  if (WINDOWS) prefetch(inventory.filter((entry) => entry.expected).flatMap((entry) => localDirectoryItems(boundedTarget(value.roots, entry))));
   for (const entry of inventory) {
     const file = boundedTarget(value.roots, entry), current = stat(file);
     insist(entry.expected ? current && same(directoryIdentity(file), entry.expected) : !current,
@@ -682,9 +844,11 @@ function directoryFileLocks(receipt) {
     .filter((file) => stat(path.dirname(file))).sort();
 }
 function assertDirectoryLocks(receipt, files = directoryRootLocks(receipt)) {
+  prefetchLocks(files);
   for (const file of files) insist(same(lockOwner(file), ownerFor(receipt.plan)), "CONCURRENT_OWNERSHIP", "Directory operation lock is absent or foreign");
 }
 function acquireDirectoryLocks(receipt, files, recovery = false) {
+  prefetchLocks(files);
   for (const [index, file] of files.entries()) {
     checkDirectories(receipt);
     assertDirectoryLocks(receipt, files.slice(0, index));
@@ -692,7 +856,7 @@ function acquireDirectoryLocks(receipt, files, recovery = false) {
     const current = lockOwner(file);
     insist(current === null || (recovery && same(current, ownerFor(receipt.plan))), "CONCURRENT_OWNERSHIP", "A target lock is already held");
     if (current) continue;
-    fs.mkdirSync(file, { mode: 0o700 });
+    makePrivateDir(file);
     writeExclusive(path.join(file, "owner.json"), canonical(ownerFor(receipt.plan)) + "\n");
     syncDirectory(file, receipt.durabilityWarnings); syncDirectory(path.dirname(file), receipt.durabilityWarnings);
   }
@@ -725,11 +889,12 @@ function applyDirectories(value, normalized) {
   insist(!stat(dir), "OPERATION_EXISTS", "Operation identity is already in use");
   let unlock, ownedDirectory = false;
   try {
-    fs.mkdirSync(dir, { mode: 0o700 }); ownedDirectory = true;
+    makePrivateDir(dir); ownedDirectory = true;
     syncDirectory(value.roots.backup, receipt.durabilityWarnings);
     unlock = executor(dir, receipt.durabilityWarnings); saveReceipt(dir, receipt);
     acquireDirectoryLocks(receipt, roots);
     acquireDirectoryLocks(receipt, initialFiles);
+    flushPrivate();
     // Complete backups even for files whose declared parents do not yet exist.
     for (const entry of value.entries) {
       checkDirectories(receipt); assertDirectoryLocks(receipt, initialLocks); assertDirectoryBefore(receipt, entry);
@@ -749,13 +914,16 @@ function applyDirectories(value, normalized) {
       receipt.directoryProgress[index] = { state: "pending", identity: null }; saveReceipt(dir, receipt);
       // A durable pending record is not ownership authority, even if mkdir succeeded.
       checkDirectories(receipt, index); assertDirectoryLocks(receipt, initialLocks);
-      fs.mkdirSync(file, { mode: 0o700 });
+      makePrivateDir(file);
+      // Barrier: the created directory's identity carries its verified ACL digest.
+      if (WINDOWS) flushDirectories();
       const identity = directoryIdentity(file);
       insist(identity.mode === 0o700, "PRIVATE_MODE", "Created directory is not mode 0700");
       syncDirectory(path.dirname(file), receipt.durabilityWarnings);
       receipt.directoryProgress[index] = { state: "created", identity };
       checkDirectories(receipt); assertDirectoryLocks(receipt, initialLocks); saveReceipt(dir, receipt);
     }
+    flushPrivate();
     checkDirectories(receipt); assertDirectoryLocks(receipt, initialLocks);
     const files = directoryFileLocks(receipt);
     acquireDirectoryLocks(receipt, files.filter((file) => !initialFiles.includes(file)));
@@ -786,8 +954,11 @@ function applyDirectories(value, normalized) {
     for (const entry of value.entries) insist(entry.action === "unchanged"
       ? same(precondition(snapshot(boundedTarget(value.roots, entry))), precondition(entry.before))
       : imageMatches(snapshot(boundedTarget(value.roots, entry)), receipt.postimages[entry.index]), "STALE_DESTINATION", "Final output verification failed");
+    flushPrivate();
     receipt.phase = "committed"; saveReceipt(dir, receipt);
     releaseDirectoryLocks(receipt, files); releaseDirectoryLocks(receipt, roots, true);
+    // Exit barrier inside the operation, so a failed check of the committed receipt is exit 9.
+    flushPrivate();
   } catch (error) {
     if (ownedDirectory) {
       if (receipt.phase !== "committed") receipt.phase = "partial";
@@ -801,14 +972,15 @@ function applyDirectories(value, normalized) {
   return publicStatus(dir, receipt);
 }
 function verifyBackup(dir, entry) {
-  const saved = readRegular(backupPath(dir, entry));
-  insist(saved?.meta.mode === 0o600, "MISSING_BACKUP", "Backup is missing or not private");
+  const saved = readRegular(backupPath(dir, entry), false);
+  insist(saved && privateRecord(backupPath(dir, entry), saved), "MISSING_BACKUP", "Backup is missing or not private");
   if (entry.before) insist(digest(saved.bytes) === entry.before.hash && String(saved.bytes.length) === entry.before.size,
     "CORRUPT_BACKUP", "Original backup bytes failed verification");
   else insist(saved.bytes.equals(Buffer.from("absent\n")), "CORRUPT_BACKUP", "Absent marker failed verification");
   return saved.bytes;
 }
 function verifyBackups(dir, receipt) {
+  if (WINDOWS) prefetch(receipt.plan.entries.filter((entry) => entry.action !== "unchanged").flatMap((entry) => prefetchItems(backupPath(dir, entry))));
   for (const entry of receipt.plan.entries) if (entry.action !== "unchanged") verifyBackup(dir, entry);
 }
 function publicStatus(dir, receipt) {
@@ -821,7 +993,8 @@ function publicStatus(dir, receipt) {
 }
 
 /** Read-only inspection; corrupt/incomplete backups explicitly refuse validation. */
-export function inspectOperation(request) {
+export function inspectOperation(request) { return privateCall(inspectReceipt, request); }
+function inspectReceipt(request) {
   object(request, ["roots", "operationId", "planId"], "operation request");
   const { dir, receipt } = loadReceipt(request);
   verifyBackups(dir, receipt);
@@ -831,7 +1004,7 @@ export function inspectOperation(request) {
 
 function executor(dir, warnings) {
   const file = path.join(dir, "executor");
-  try { fs.mkdirSync(file, { mode: 0o700 }); }
+  try { makePrivateDir(file); }
   catch (error) {
     if (error.code === "EEXIST") throw new PreservationError("EXECUTOR_BLOCKED",
       "Executor is active or interrupted; external quiescence/recovery is required");
@@ -854,7 +1027,8 @@ function checkRoots(receipt) {
   insist(same(validateRoots(receipt.plan.roots), receipt.plan.rootIdentities), "STALE_ROOT", "Root identity changed");
 }
 function stage(file, bytes, entry, restoreMode = false) {
-  writeExclusive(file, bytes);
+  // D2: outputs inherit the target directory's DACL; they are not private files.
+  writeExclusive(file, bytes, 0o600, false);
   const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW);
   try {
     if (entry.before) fs.fchownSync(fd, entry.before.uid, entry.before.gid);
@@ -865,7 +1039,7 @@ function stage(file, bytes, entry, restoreMode = false) {
     fs.fsyncSync(fd);
   } finally { fs.closeSync(fd); }
   const result = snapshot(file);
-  insist(result?.hash === digest(bytes) && result.mode === (restoreMode ? entry.before.mode : entry.mode),
+  insist(result?.hash === digest(bytes) && result.mode === modeOf(restoreMode ? entry.before.mode : entry.mode),
     "STAGING_FAILED", "Staged bytes/mode did not verify");
   if (restoreMode) insist(restoredMatches(result, entry.before), "UNSUPPORTED_METADATA", "Restored metadata exceeds 1ms precision");
   return result;
@@ -890,7 +1064,8 @@ function finishRestoredTimes(roots, entry, receipt) {
   const current = snapshot(file);
   if (same(precondition(current), precondition(entry.before))) return;
   insist(imageMatches(current, expected), "FOREIGN_EDIT", "Restored file changed before final metadata sync");
-  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  // Windows: futimes needs FILE_WRITE_ATTRIBUTES and fsync (FlushFileBuffers) needs write access.
+  const fd = fs.openSync(file, (WINDOWS ? fs.constants.O_RDWR : fs.constants.O_RDONLY) | fs.constants.O_NOFOLLOW);
   try {
     const opened = metadata(fs.fstatSync(fd, { bigint: true }));
     insist(opened.dev === expected.dev && opened.ino === expected.ino && opened.mode === expected.mode &&
@@ -915,7 +1090,8 @@ function finishRestoredTimes(roots, entry, receipt) {
  * Exceptions after ownership acquisition retain receipts/backups/locks and throw
  * exitCode 9; caller must inspect and explicitly restore, never retry blindly.
  */
-export function apply(value, options) {
+export function apply(value, options) { return privateCall(applyOperation, value, options); }
+function applyOperation(value, options) {
   const normalized = plans.get(value);
   insist(normalized, "UNTRUSTED_PLAN", "Only an unmodified process-local plan is applicable");
   object(options, ["input", "decisions", "validateReplacement"], "apply options");
@@ -948,17 +1124,19 @@ export function apply(value, options) {
     restoreImages: value.entries.map(() => null), durabilityWarnings: [] };
   let unlock, ownedDirectory = false;
   try {
-    fs.mkdirSync(dir, { mode: 0o700 });
+    makePrivateDir(dir);
     ownedDirectory = true;
     syncDirectory(value.roots.backup, receipt.durabilityWarnings);
     unlock = executor(dir, receipt.durabilityWarnings);
     saveReceipt(dir, receipt);
     for (const file of locks) {
-      fs.mkdirSync(file, { mode: 0o700 });
+      makePrivateDir(file);
       writeExclusive(path.join(file, "owner.json"), canonical(ownerFor(value)) + "\n");
       syncDirectory(file, receipt.durabilityWarnings);
       syncDirectory(path.dirname(file), receipt.durabilityWarnings);
     }
+    // Barrier before the locks are asserted, so lock owners are read under verified directories.
+    flushPrivate();
     checkRoots(receipt); assertLocks(receipt);
     for (const entry of value.entries) assertBefore(value.roots, entry);
     // Complete every original backup/absent marker before creating target stages.
@@ -970,6 +1148,7 @@ export function apply(value, options) {
     }
     syncDirectory(dir, receipt.durabilityWarnings);
     verifyBackups(dir, receipt);
+    flushPrivate();
     receipt.phase = "prepared"; saveReceipt(dir, receipt);
     for (const entry of value.entries) {
       if (entry.action === "unchanged") continue;
@@ -998,8 +1177,11 @@ export function apply(value, options) {
       ? same(precondition(snapshot(destination(value.roots, entry))), precondition(entry.before))
       : imageMatches(snapshot(destination(value.roots, entry)), receipt.postimages[entry.index]),
     "STALE_DESTINATION", "Final output verification failed");
+    flushPrivate();
     receipt.phase = "committed"; saveReceipt(dir, receipt);
     releaseLocks(receipt);
+    // Exit barrier inside the operation, so a failed check of the committed receipt is exit 9.
+    flushPrivate();
   } catch (error) {
     if (ownedDirectory) {
       if (receipt.phase !== "committed") receipt.phase = "partial";
@@ -1028,12 +1210,13 @@ function restoreState(roots, entry, receipt) {
 function acquireRecoveryLocks(receipt) {
   const owner = ownerFor(receipt.plan);
   const files = allLocks(receipt.plan.roots, receipt.plan.entries);
+  prefetchLocks(files);
   for (const file of files) {
     const current = lockOwner(file);
     insist(current === null || same(current, owner), "CONCURRENT_OWNERSHIP", "A foreign operation owns a recovery target");
   }
   for (const file of files) if (!stat(file)) {
-    fs.mkdirSync(file, { mode: 0o700 });
+    makePrivateDir(file);
     writeExclusive(path.join(file, "owner.json"), canonical(owner) + "\n");
     syncDirectory(file, receipt.durabilityWarnings);
     syncDirectory(path.dirname(file), receipt.durabilityWarnings);
@@ -1080,6 +1263,7 @@ function restoreDirectories(dir, receipt) {
     const files = directoryFileLocks(receipt);
     acquireDirectoryLocks(receipt, files, true);
     preflightDirectoryRestore(receipt, files);
+    flushPrivate();
     const all = [...roots, ...files];
     receipt.phase = "restoring"; saveReceipt(dir, receipt);
     for (const entry of value.entries) {
@@ -1131,6 +1315,7 @@ function restoreDirectories(dir, receipt) {
       item.state = "removed"; saveReceipt(dir, receipt);
     }
     checkDirectories(receipt); assertDirectoryLocks(receipt);
+    flushPrivate();
     receipt.phase = "restored"; saveReceipt(dir, receipt);
     releaseDirectoryLocks(receipt, roots, true);
   } finally { unlock(); }
@@ -1145,7 +1330,7 @@ function restoreDirectories(dir, receipt) {
  * was durable require external recovery; no unverified file is deleted or adopted.
  */
 export function restore(request) {
-  try { return restoreOperation(request); }
+  try { return privateCall(restoreOperation, request); }
   catch (error) {
     throw new PreservationError(error.code ?? "RECOVERY_REQUIRED", error.message,
       typeof request?.operationId === "string" && request.operationId ? request.operationId : "unknown");
@@ -1158,7 +1343,7 @@ function restoreOperation(request) {
   if (receipt.schemaVersion === 2) return restoreDirectories(dir, receipt);
   const unlock = executor(dir, receipt.durabilityWarnings);
   try {
-    acquireRecoveryLocks(receipt); checkRoots(receipt);
+    acquireRecoveryLocks(receipt); flushPrivate(); checkRoots(receipt);
     for (const entry of receipt.plan.entries) restoreState(request.roots, entry, receipt);
     // Validate all extant stages before any cleanup or destination mutation.
     for (const entry of receipt.plan.entries) for (const restoring of [false, true]) {
@@ -1200,6 +1385,7 @@ function restoreOperation(request) {
       checkRoots(receipt); assertLocks(receipt);
       finishRestoredTimes(request.roots, entry, receipt);
     }
+    flushPrivate();
     receipt.phase = "restored"; saveReceipt(dir, receipt);
     releaseLocks(receipt);
   } catch (error) {

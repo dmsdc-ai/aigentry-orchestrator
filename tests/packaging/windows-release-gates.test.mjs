@@ -2155,8 +2155,8 @@ for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #117
 // from argv arrays with HOME, global/system config and attributes, templates and hooks redirected to empty
 // test-owned paths and a fake identity, so no user Git state is read. A missing Git fails, never skips.
 // This proves Git's checkout policy only, not Windows ACLs or an actual Windows checkout.
-const preservationPin = 'a07066a44fe959660f5e5b7b983028d8ebb300293e5b80cf1b54776d00a5b95b';
-const preservationCrlf = '7d639d53527d346fa4bdbb256efdd6e5e139acb609aebcbb227566ee4a9b4cb5';
+const preservationPin = '5978524c38134fbba8321542fccb162ef8ff81a5b8cf426b478aed0fae4f066a';
+const preservationCrlf = '2d34b32e2c6b5e6d9162ac809b3837592da4f6e6a40c9c22da752ed7348b7b0e';
 const eolRule = '/bin/init/preservation.mjs text eol=lf';
 const eolPinned = 'bin/init/preservation.mjs';
 const eolNeighbour = 'bin/init/cli.mjs'; // real LF sibling the exact rule must not cover

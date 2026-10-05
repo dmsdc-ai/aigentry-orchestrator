@@ -13,9 +13,13 @@ const admin = path.join(repo, '.aigentry-report-dv1169');
 const source = path.join(repo, 'bin/init/preservation.mjs');
 const sha = x => createHash('sha256').update(x).digest('hex');
 const sourceBefore = sha(fs.readFileSync(source));
-assert.equal(sourceBefore, 'a07066a44fe959660f5e5b7b983028d8ebb300293e5b80cf1b54776d00a5b95b');
+assert.equal(sourceBefore, '5978524c38134fbba8321542fccb162ef8ff81a5b8cf426b478aed0fae4f066a');
 const { plan, apply, restore, inspectOperation, inspectPending, PreservationError } = await import(pathToFileURL(source));
-const mkdir = p => fs.mkdirSync(p, { mode: 0o700 });
+// win32 counterparts of mode 0700/0750 (PRINCIPLES P2/P7): product Set plus an independent icacls oracle.
+const winAcl = process.platform === 'win32' ? await import('../helpers/win-acl.mjs') : null;
+const mkdir = p => { fs.mkdirSync(p, { mode: 0o700 }); if (winAcl) winAcl.makePrivate(p); };
+// A non-write Everyone ACE keeps a directory owned but no longer private (mode 0750 analogue).
+const loosen = p => { if (winAcl) winAcl.grant(p, '*S-1-1-0:(RX)'); else fs.chmodSync(p, 0o750); };
 const options = (input, decisions = [], validateReplacement = () => false) => ({ input, decisions, validateReplacement });
 const request = p => ({ roots: p.roots, operationId: p.operationId, planId: p.planId });
 const opdir = p => path.join(p.roots.backup, p.operationId);
@@ -30,11 +34,16 @@ function refused(fn, code) {
   return actual;
 }
 function inventory(base, targetsOnly = false) {
-  const rows = [];
+  const rows = [], dacl = winAcl?.treeDacl(base);
   function visit(p) {
     const s = fs.lstatSync(p, { bigint: true });
     const rel = path.relative(base, p);
     const item = { path: rel, dev: String(s.dev), ino: String(s.ino), uid: String(s.uid), gid: String(s.gid), mode: Number(s.mode) };
+    // win32: one icacls tree read per inventory, so no-mutation proofs also cover DACLs.
+    if (dacl) {
+      item.dacl = dacl.get(rel);
+      if (!s.isSymbolicLink()) assert.equal(typeof item.dacl, 'string', `no DACL row for '${rel}'`);
+    }
     if (s.isFile()) Object.assign(item, { bytes: fs.readFileSync(p).toString('base64'), mtime: String(s.mtimeNs) });
     if (s.isSymbolicLink()) item.link = fs.readlinkSync(p);
     rows.push(item);
@@ -82,7 +91,9 @@ if (process.argv[2] === '--crash-child') {
 }
 
 fs.mkdirSync(admin, { recursive: true, mode: 0o700 });
+if (winAcl) winAcl.makePrivate(admin);
 const runRoot = fs.realpathSync(fs.mkdtempSync(path.join(admin, 'directories-')));
+if (winAcl) winAcl.makePrivate(runRoot);
 const results = [];
 let currentFixtures = [];
 function fixture() {
@@ -133,7 +144,7 @@ acceptance('omitted directories retains v1; explicit empty selects v2', () => {
   }
 });
 acceptance('nested both roots, arbitrary declaration order, unchanged existing directories, restore deepest first', () => {
-  const f = fixture(); mkdir(path.join(f.roots.workspace, 'existing')); fs.chmodSync(path.join(f.roots.workspace, 'existing'), 0o750);
+  const f = fixture(); mkdir(path.join(f.roots.workspace, 'existing')); loosen(path.join(f.roots.workspace, 'existing'));
   f.input.directories = [f.dir('new/deep'), f.dir('new'), f.dir('h/deep', 'home'), f.dir('h', 'home'), f.dir('existing')];
   f.input.entries = [f.entry('new/deep/out'), f.entry('h/deep/out', 'home'), f.entry('existing/same')];
   fs.writeFileSync(f.target(f.input.entries[2]), f.input.entries[2].bytes, { mode: 0o600 });
@@ -142,7 +153,10 @@ acceptance('nested both roots, arbitrary declaration order, unchanged existing d
   assert(Object.isFrozen(p) && Object.isFrozen(p.directories) && Object.isFrozen(p.directories[0]));
   assert.equal(apply(p, options(f.input)).phase, 'committed');
   for (const e of f.input.entries) assert.deepEqual(fs.readFileSync(f.target(e)), e.bytes);
-  for (const d of f.input.directories.filter(d => d.path !== 'existing')) assert.equal(fs.statSync(f.target(d)).mode & 0o777, 0o700);
+  for (const d of f.input.directories.filter(d => d.path !== 'existing')) {
+    if (winAcl) assert.equal(winAcl.isPrivate(f.target(d)), true);
+    else assert.equal(fs.statSync(f.target(d)).mode & 0o777, 0o700);
+  }
   assert.equal(inspectOperation(request(p)).phase, 'committed');
   const removed = [];
   patchFs('rmdirSync', (original, file, ...args) => { removed.push(file); return original(file, ...args); }, () => restore(request(p)));
@@ -171,7 +185,8 @@ acceptance('existing original backup and synthetic custom replacement validator'
   apply(p, options(f.input, [d], (actual, actualPlan) => { calls++; assert(Object.isFrozen(actual)); assert.equal(actualPlan, p); return true; }));
   assert.equal(calls, 1); assert.equal(fs.readFileSync(backup(p, 0), 'utf8'), 'custom original');
   restore(request(p)); assert.equal(fs.readFileSync(f.target(e), 'utf8'), 'custom original');
-  assert.equal(fs.statSync(f.target(e)).mode & 0o777, 0o640);
+  // win32 reports the read-only-attribute projection: 0640 is writable, so 0666.
+  assert.equal(fs.statSync(f.target(e)).mode & 0o777, winAcl ? 0o666 : 0o640);
 });
 
 const invalidSchemas = [
@@ -225,16 +240,26 @@ for (const [root, p, ds] of [['workspace', 'state/data', ['state']], ['home', 'c
 acceptance('symlink parent refuses without following outside target', () => {
   const f = fixture(); fs.symlinkSync(f.roots.home, path.join(f.roots.workspace, 'new'));
   noMutation(f, () => plan(f.input));
+  if (winAcl) {
+    // win32 junction (reparse point without symlink privilege) in place of the declared parent.
+    fs.unlinkSync(path.join(f.roots.workspace, 'new')); fs.symlinkSync(f.roots.home, path.join(f.roots.workspace, 'new'), 'junction');
+    noMutation(f, () => plan(f.input));
+  }
 });
 for (const drift of ['mode', 'identity', 'foreign directory', 'foreign file', 'owner']) acceptance(`plan/apply drift refuses ${drift}`, () => {
   const f = fixture(); const d = path.join(f.roots.workspace, 'new');
   if (!drift.startsWith('foreign')) mkdir(d);
   const p = plan(f.input);
-  if (drift === 'mode') fs.chmodSync(d, 0o750);
+  if (drift === 'mode') loosen(d);
   if (drift === 'identity') { fs.renameSync(d, path.join(f.roots.workspace, 'retired')); mkdir(d); }
   if (drift === 'foreign directory') mkdir(d);
   if (drift === 'foreign file') fs.writeFileSync(d, 'foreign', { mode: 0o600 });
-  if (drift === 'owner') {
+  if (drift === 'owner' && winAcl) {
+    // win32: a real owner change to Administrators; it needs an elevated token (windows-latest is elevated).
+    try { winAcl.setOwner(d, '*S-1-5-32-544'); }
+    catch (error) { assert.fail(`owner drift needs an elevated administrator token to set owner S-1-5-32-544: ${error.message}`); }
+    noMutation(f, () => apply(p, options(f.input)));
+  } else if (drift === 'owner') {
     // Simulate a foreign uid only for this exact fixture lstat; no privileged chown.
     patchFs('lstatSync', (original, file, ...args) => {
       const s = original(file, ...args);
@@ -293,7 +318,7 @@ acceptance('partial root acquisition remains honestly visible and retained', () 
   const f = fixture(), p = plan(f.input); let count = 0;
   const before = inventory(f.base, true);
   patchFs('mkdirSync', (original, file, ...args) => {
-    if (typeof file === 'string' && file.endsWith('/.aigentry-preservation.lock') && ++count === 2) throw injected();
+    if (typeof file === 'string' && file.endsWith(`${path.sep}.aigentry-preservation.lock`) && ++count === 2) throw injected();
     return original(file, ...args);
   }, () => refused(() => apply(p, options(f.input)), 'EIO'));
   assert.deepEqual(inventory(f.base, true), before);
@@ -433,7 +458,7 @@ for (const [name, mutate] of [
 acceptance('ownerless partial root lock is visible and never automatically removed', () => {
   const f = fixture(), p = plan(f.input), before = inventory(f.base, true); let hit = false;
   patchFs('openSync', (original, file, ...args) => {
-    if (String(file).endsWith('/.aigentry-preservation.lock/owner.json') && (args[0] & fs.constants.O_CREAT)) { hit = true; throw injected(); }
+    if (String(file).endsWith(`${path.sep}.aigentry-preservation.lock${path.sep}owner.json`) && (args[0] & fs.constants.O_CREAT)) { hit = true; throw injected(); }
     return original(file, ...args);
   }, () => refused(() => apply(p, options(f.input)), 'EIO'));
   assert(hit); assert.deepEqual(inventory(f.base, true), before);
@@ -447,7 +472,7 @@ for (const target of ['declared', 'undeclared parent', 'root']) acceptance(`rest
   f.input.directories = [f.dir('parent/new')]; f.input.entries = [f.entry('parent/new/out')];
   const p = plan(f.input); apply(p, options(f.input));
   const d = target === 'declared' ? 'parent/new' : target === 'undeclared parent' ? 'parent' : '';
-  fs.chmodSync(path.join(f.roots.workspace, d), 0o750);
+  loosen(path.join(f.roots.workspace, d));
   noMutation(f, () => restore(request(p)));
 });
 acceptance('interrupted removal remains unknown and cannot be adopted on repeated restore', () => {

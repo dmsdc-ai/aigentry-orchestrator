@@ -10,9 +10,12 @@ import { spawnSync } from 'node:child_process';
 
 const self = fileURLToPath(import.meta.url);
 const repo = path.resolve(path.dirname(self), '../..');
+// win32 counterparts of mode 0700/0600 (PRINCIPLES P2/P7): product Set plus an independent icacls oracle.
+const winAcl = process.platform === 'win32' ? await import('../helpers/win-acl.mjs') : null;
 const admin = path.join(repo, '.aigentry-report-pv1169');
 fs.mkdirSync(admin, { recursive: true, mode: 0o700 });
 fs.chmodSync(admin, 0o700);
+if (winAcl) winAcl.makePrivate(admin);
 const modulePath = path.resolve(process.env.AIGENTRY_PRESERVATION_MODULE || path.join(repo, 'bin/init/preservation.mjs'));
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 const sourceBefore = sha(fs.readFileSync(modulePath));
@@ -20,16 +23,19 @@ const core = await import(pathToFileURL(modulePath).href);
 const { plan, apply, inspectPending, inspectOperation, restore } = core;
 const runRoot = fs.realpathSync(fs.mkdtempSync(path.join(admin, 'fixtures-')));
 fs.chmodSync(runRoot, 0o700);
-const mkdir = p => fs.mkdirSync(p, { mode: 0o700 });
+if (winAcl) winAcl.makePrivate(runRoot);
+const mkdir = p => { fs.mkdirSync(p, { mode: 0o700 }); if (winAcl) winAcl.makePrivate(p); };
 function fixture() {
   const base = fs.mkdtempSync(path.join(runRoot, 'case-'));
   fs.chmodSync(base, 0o700);
+  if (winAcl) winAcl.makePrivate(base);
   const roots = Object.fromEntries(['workspace', 'home', 'backup'].map(name => {
     const p = path.join(base, name); mkdir(p); return [name, p];
   }));
   for (const p of Object.values(roots)) {
     assert.equal(fs.realpathSync(p), p);
-    assert.equal(fs.statSync(p).mode & 0o777, 0o700);
+    if (winAcl) assert.equal(winAcl.isPrivate(p), true);
+    else assert.equal(fs.statSync(p).mode & 0o777, 0o700);
   }
   const entry = (relativePath = 'output.md', root = 'workspace', extra = {}) => ({
     root, path: relativePath, kind: 'package', bytes: Buffer.from('new package\n'), mode: 0o640, baseline: null, ...extra,
@@ -51,11 +57,18 @@ function meta(p) {
   const s = fs.statSync(p, { bigint: true });
   return { hash: sha(fs.readFileSync(p)), mode: Number(s.mode) & 0o777, mtimeNs: String(s.mtimeNs), ino: String(s.ino) };
 }
-function inventory(dir) {
-  return fs.readdirSync(dir).sort().flatMap(name => {
+// win32: one icacls tree read is appended, so no-mutation proofs also cover DACLs.
+function inventory(dir, top = true) {
+  const rows = fs.readdirSync(dir).sort().flatMap(name => {
     const p = path.join(dir, name), s = fs.lstatSync(p);
-    return [[p, s.mode & 0o777, s.isFile() ? meta(p) : 'directory'], ...(s.isDirectory() ? inventory(p) : [])];
+    return [[p, s.mode & 0o777, s.isFile() ? meta(p) : 'directory'], ...(s.isDirectory() ? inventory(p, false) : [])];
   });
+  return top && winAcl ? [...rows, [...winAcl.treeDacl(dir)].sort()] : rows;
+}
+// D2 inherit model: an output carries only inherited (ID) ACEs from its target directory.
+function inheritedOnly(p) {
+  const aces = [...winAcl.daclText(p).matchAll(/\(([^)]*)\)/g)].map(match => match[1].split(';'));
+  assert(aces.length > 0 && aces.every(ace => ace[1].includes('ID')), `${p}: ${winAcl.daclText(p)}`);
 }
 const refuse = (fn, code) => assert.throws(fn, error => error instanceof core.PreservationError && error.code === code);
 const backup = (p, index = 0) => path.join(p.roots.backup, p.operationId, `${index}.${p.entries[index].before ? 'bin' : 'absent'}`);
@@ -123,7 +136,8 @@ acceptance('fresh workspace and home create, absent markers, inspect and restore
   assert.equal(apply(p, opts(f.input)).phase, 'committed');
   for (const [i, e] of f.input.entries.entries()) {
     assert.equal(sha(fs.readFileSync(f.target(e))), sha(e.bytes));
-    assert.equal(meta(f.target(e)).mode, e.mode);
+    if (winAcl) { assert.equal(meta(f.target(e)).mode, 0o666); inheritedOnly(f.target(e)); }
+    else assert.equal(meta(f.target(e)).mode, e.mode);
     assert.equal(fs.readFileSync(backup(p, i), 'utf8'), 'absent\n');
   }
   assert.equal(inspectOperation(request(p)).phase, 'committed');
@@ -142,14 +156,18 @@ acceptance('baseline upgrade backs up before target staging and restores preimag
       stages++;
       assert.equal(sha(fs.readFileSync(backup(p))), original.hash);
       assert.equal(fs.readFileSync(backup(p, 1), 'utf8'), 'absent\n');
-      for (const i of [0, 1]) assert.equal(fs.statSync(backup(p, i)).mode & 0o777, 0o600);
+      for (const i of [0, 1]) {
+        if (winAcl) assert.equal(winAcl.isPrivate(backup(p, i)), true);
+        else assert.equal(fs.statSync(backup(p, i)).mode & 0o777, 0o600);
+      }
       assert.equal(meta(f.target(f.input.entries[0])).hash, original.hash);
     }
     return open.call(fs, file, flags, ...args);
   };
   try { assert.equal(apply(p, opts(f.input)).phase, 'committed'); } finally { fs.openSync = open; }
   assert.equal(stages, 2);
-  assert.equal(fs.statSync(path.dirname(backup(p))).mode & 0o777, 0o700);
+  if (winAcl) assert.equal(winAcl.isPrivate(path.dirname(backup(p))), true);
+  else assert.equal(fs.statSync(path.dirname(backup(p))).mode & 0o777, 0o700);
   assert.equal(restore(request(p)).phase, 'restored');
   const after = meta(f.target(f.input.entries[0]));
   assert.equal(after.hash, original.hash); assert.equal(after.mode, original.mode);
@@ -224,6 +242,13 @@ acceptance('symlink ancestor and root refused', () => {
   f.input.entries[0].path = 'alias/output.md'; refuse(() => plan(f.input), 'UNSUPPORTED_PARENT');
   f.input.entries[0].path = 'output.md'; f.input.roots.home = path.join(f.roots.workspace, 'alias');
   refuse(() => plan(f.input), 'UNSUPPORTED_PARENT');
+  if (winAcl) {
+    // win32 junction (reparse point without symlink privilege), ancestor and root.
+    const home = path.join(f.base, 'home'), junction = path.join(f.roots.workspace, 'junction');
+    fs.symlinkSync(home, junction, 'junction');
+    f.input.roots.home = home; f.input.entries[0].path = 'junction/output.md'; refuse(() => plan(f.input), 'UNSUPPORTED_PARENT');
+    f.input.entries[0].path = 'output.md'; f.input.roots.home = junction; refuse(() => plan(f.input), 'UNSUPPORTED_PARENT');
+  }
 });
 acceptance('duplicate aliases and overlapping roots refused', () => {
   const f = fixture(); assert.equal(plan(f.input).entries.length, 1);
@@ -268,7 +293,10 @@ for (const corruption of ['bytes', 'missing', 'permissions']) acceptance(`restor
   assert.equal(inspectOperation(request(f.p)).phase, 'committed'); const before = meta(f.target(f.input.entries[0]));
   if (corruption === 'bytes') fs.writeFileSync(backup(f.p), 'corrupt');
   if (corruption === 'missing') fs.unlinkSync(backup(f.p));
-  if (corruption === 'permissions') fs.chmodSync(backup(f.p), 0o644);
+  if (corruption === 'permissions') {
+    if (winAcl) winAcl.grant(backup(f.p), '*S-1-1-0:(R)');
+    else fs.chmodSync(backup(f.p), 0o644);
+  }
   refuse(() => restore(request(f.p)), corruption === 'bytes' ? 'CORRUPT_BACKUP' : 'MISSING_BACKUP');
   assert.deepEqual(meta(f.target(f.input.entries[0])), before);
 });
@@ -329,7 +357,8 @@ acceptance('deterministic child crash exposes executor gate; explicit fixture-on
   fs.writeFileSync(inputFile, JSON.stringify({ ...f.input, entries: f.input.entries.map(e => ({ ...e, bytes: e.bytes.toString('base64') })) }), { mode: 0o600 });
   const child = spawnSync(process.execPath, [self, '--crash-child', inputFile], {
     cwd: f.base, encoding: 'utf8', timeout: 20000,
-    env: { PATH: path.dirname(process.execPath), HOME: f.roots.home, TMPDIR: f.base, AIGENTRY_PRESERVATION_MODULE: modulePath },
+    env: { PATH: path.dirname(process.execPath), HOME: f.roots.home, TMPDIR: f.base, AIGENTRY_PRESERVATION_MODULE: modulePath,
+      ...(winAcl ? { SystemRoot: process.env.SystemRoot } : {}) },
   });
   assert.ifError(child.error); assert.equal(child.signal, null); assert.equal(child.status, 73, child.stderr);
   const req = JSON.parse(fs.readFileSync(path.join(f.roots.backup, 'request.json'), 'utf8'));
