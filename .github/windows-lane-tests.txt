@@ -1,5 +1,10 @@
-# Test files for .github/workflows/windows-lane.yml, run on windows-latest and ubuntu-latest
-# on every push to a win/** branch. One repo-relative test file per line (dist/tests/... for
-# compiled tests, tests/... for source .mjs suites). `#` starts a comment; blank lines are
-# ignored. A single line `@full` instead runs the whole suite through scripts/run-tests.mjs.
-dist/tests/session/persistence/index-lock.test.js
+# Lane TD (dispatch tests on Windows).
+dist/tests/dispatch/T140-dispatch-model-routing.test.js
+dist/tests/dispatch/T141-model-launcher-flags.test.js
+dist/tests/dispatch/model-router-fixtures.test.js
+dist/tests/dispatch/managed-model-decision.test.js
+dist/tests/dispatch/cli-cap-regression.test.js
+dist/tests/session/boot-adapter/win-launch.test.js
+tests/dispatch/worker-inputs.test.mjs
+dist/tests/dispatch/T145-retry-unknown.test.js
+dist/tests/session/worker-tool-admission.test.js
