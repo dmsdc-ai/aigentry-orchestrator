@@ -24,6 +24,14 @@ namespace Psp1167 {
     public string volumeSerial; public string fileIndex; public string fsName; public uint volumeFlags;
     public bool persistentAcls; public int volumeError; public string finalPath; public int finalPathError;
     public string sha256; public int readError; public bool ancestorReparse; public string ancestorReparsePath;
+    // DIAGNOSTIC only (rbstate): GetSecurityDescriptorDacl on the same handle's SD. daclValid false = unknown (never false/zero);
+    // daclNull is set only when the DACL is present (the pointer is undefined otherwise).
+    public bool daclValid; public int daclError; public bool? daclPresent; public bool? daclNull; public bool? daclDefaulted;
+  }
+
+  // DIAGNOSTIC only (hlProbe): numeric OS results of one plain open and one FindFirstFileNameW; *Valid false = unknown.
+  public class LinkProbe {
+    public bool plainOpenValid; public int plainOpenErr; public bool ffnValid; public int ffnErr;
   }
 
   public class Removal {
@@ -85,6 +93,9 @@ namespace Psp1167 {
     struct Disposition { public byte delete; }
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetFileInformationByHandleEx(IntPtr h, int cls, IntPtr buf, uint size);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetFileInformationByHandle(IntPtr h, int cls, ref Disposition info, uint size);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr FindFirstFileNameW(string p, uint flags, ref uint len, StringBuilder name);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool FindClose(IntPtr h);
     const uint DELETE_ACCESS = 0x00010000, SYNCHRONIZE = 0x00100000;
 
     // Returns 0 when enabled; 1300 (ERROR_NOT_ALL_ASSIGNED) when the token does not hold it.
@@ -302,6 +313,9 @@ namespace Psp1167 {
             IntPtr str; uint len;
             if (ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1, 0x7, out str, out len)) { s.sddl = Marshal.PtrToStringUni(str); LocalFree(str); }
             else { s.sddlError = Marshal.GetLastWin32Error(); }
+            bool dp, dd; IntPtr dl;
+            if (GetSecurityDescriptorDacl(sd, out dp, out dl, out dd)) { s.daclPresent = dp; if (dp) s.daclNull = (dl == IntPtr.Zero); s.daclDefaulted = dd; s.daclValid = true; }
+            else { s.daclError = Marshal.GetLastWin32Error(); }
           } finally { LocalFree(sd); }
         }
         if (s.infoError == 0 && !s.isDir && !s.isReparse) {
@@ -317,6 +331,21 @@ namespace Psp1167 {
         }
       } finally { CloseHandle(h); }
       return s;
+    }
+
+    // DIAGNOSTIC only (hlProbe), test harness, not a runtime API: one plain open (FILE_READ_ATTRIBUTES, same share and
+    // reparse mode as Take, no backup intent) and one FindFirstFileNameW with a bounded buffer, each once, no retry. Each
+    // error is read before any close; the returned name is never kept.
+    public static LinkProbe NameProbe(string path) {
+      LinkProbe p = new LinkProbe();
+      IntPtr h = CreateFileW(path, FILE_READ_ATTRIBUTES, SHARE_ALL, IntPtr.Zero, OPEN_EXISTING, FLAG_OPEN_REPARSE, IntPtr.Zero);
+      p.plainOpenErr = (h == INVALID) ? Marshal.GetLastWin32Error() : 0; p.plainOpenValid = true;
+      if (h != INVALID) CloseHandle(h);
+      StringBuilder sb = new StringBuilder(32768); uint len = 32768;
+      IntPtr f = FindFirstFileNameW(path, 0, ref len, sb);
+      p.ffnErr = (f == INVALID) ? Marshal.GetLastWin32Error() : 0; p.ffnValid = true;
+      if (f != INVALID) FindClose(f);
+      return p;
     }
   }
 }
@@ -781,8 +810,46 @@ function Get-PspSnapshot { param([string[]]$Paths, [string]$AncestorFloor, [swit
         $hl = & fsutil.exe hardlink list $p 2>&1 | Out-String
         $o['fsutilHardlinkExit'] = $LASTEXITCODE
         $o['fsutilHardlinks'] = @($hl.Trim() -split "`r?`n" | Where-Object { $_ -ne '' })
+        # DIAGNOSTIC only (hlProbe): numeric OS results, once, for a nonzero fsutil exit; any exception leaves it unknown.
+        if ($o['fsutilHardlinkExit'] -ne 0) {
+          $o['hlProbeValid'] = $false; $o['hlProbeError'] = $null
+          try {
+            $lp = [Psp1167.Oracle]::NameProbe($p)
+            $o['hlPlainOpenValid'] = $lp.plainOpenValid; $o['hlPlainOpenErr'] = $lp.plainOpenErr; $o['hlFfnValid'] = $lp.ffnValid; $o['hlFfnErr'] = $lp.ffnErr
+            $o['hlProbeValid'] = $true
+          } catch { $o['hlProbeError'] = $_.Exception.GetType().Name }
+        }
       }
-      try { $o['getAclSddl'] = (Get-Acl -LiteralPath $p -ErrorAction Stop).Sddl } catch { $o['getAclSddl'] = $null; $o['getAclError'] = $_.Exception.GetType().Name }
+      $a = $null
+      try { $a = Get-Acl -LiteralPath $p -ErrorAction Stop; $o['getAclSddl'] = $a.Sddl } catch { $o['getAclSddl'] = $null; $o['getAclError'] = $_.Exception.GetType().Name }
+      # DIAGNOSTIC only (rbstate), separate from getAclSddl/getAclError above: binary DACL flags and the AEFA rule of the same
+      # Get-Acl object. Recorded only when every step succeeded (getAclBinValid); an exception records its type name only.
+      $o['getAclBinValid'] = $false; $o['getAclBinError'] = $null
+      if ($null -ne $a) {
+        try {
+          $raw = [System.Security.AccessControl.RawSecurityDescriptor]::new([byte[]]$a.GetSecurityDescriptorBinaryForm(), 0)
+          $dp = (($raw.ControlFlags -band [System.Security.AccessControl.ControlFlags]::DiscretionaryAclPresent) -ne 0)
+          $dn = ($null -eq $raw.DiscretionaryAcl)
+          $rules = @($a.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+          $one = $null; if ($rules.Count -eq 1) { $one = $rules[0] }
+          $aefa = ($null -ne $one) -and ($one.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow) -and ($one.IdentityReference.Value -ceq 'S-1-1-0') -and (-not $one.IsInherited)
+          $mask = $null; if ($aefa) { $mask = [int]$one.FileSystemRights }
+          $o['getAclDaclPresent'] = $dp; $o['getAclDaclNull'] = $dn; $o['getAclRuleCount'] = $rules.Count; $o['getAclAefa'] = $aefa; $o['getAclAefaMask'] = $mask
+          $o['getAclBinValid'] = $true
+        } catch { $o['getAclBinError'] = $_.Exception.GetType().Name }
+      }
+      # DIAGNOSTIC only: a second Take after Get-Acl. matching = both reads measured and volumeSerial/fileIndex/sddl/isReparse/open
+      # status equal; stale = a measured difference; unmeasured = a field missing on either read or the read threw. Endpoint
+      # equality is correlation only (it cannot exclude an intervening change) and never execution or acceptance authority.
+      $o['getAclBracket'] = 'unmeasured'; $o['getAclBracketError'] = $null
+      try {
+        $s2 = [Psp1167.Oracle]::Take($p, $AncestorFloor)
+        if ($s2.openError -ne 0) { $o['getAclBracket'] = 'stale' }
+        elseif (($s.infoError -ne 0) -or ($s2.infoError -ne 0) -or ($s.sddlError -ne 0) -or ($s2.sddlError -ne 0) -or (-not $s.volumeSerial) -or (-not $s2.volumeSerial) -or
+          (-not $s.fileIndex) -or (-not $s2.fileIndex) -or ($null -eq $s.sddl) -or ($null -eq $s2.sddl)) { $o['getAclBracket'] = 'unmeasured' }
+        elseif (($s2.volumeSerial -ceq $s.volumeSerial) -and ($s2.fileIndex -ceq $s.fileIndex) -and ($s2.sddl -ceq $s.sddl) -and ($s2.isReparse -eq $s.isReparse)) { $o['getAclBracket'] = 'matching' }
+        else { $o['getAclBracket'] = 'stale' }
+      } catch { $o['getAclBracketError'] = $_.Exception.GetType().Name }
     }
     $out += ,$o
   }

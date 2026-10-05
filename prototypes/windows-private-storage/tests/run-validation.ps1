@@ -282,8 +282,11 @@ function Format-PspVerdictOpDiag { param([string]$ReadStatus, [string]$Text)
         rbsplit = 'test:test flagProtected:cnt flagAutoInherited:cnt flagIsNull:cnt flagMissing:cnt flagUnparsed:cnt orderDenyRelChanged:cnt orderDenyRelUnchanged:cnt orderDenyRelUnknown:cnt aclErrTypes:ehist aclErrOther:cnt aclErrAbsent:cnt'
         linkacl = 'case:lcase need:need link:pres reparse:bool owner:owncls aAllow:allowk missing:missing aDeny:cnt adminAllow:cnt otherAllow:cnt otherDeny:cnt'
         rbcause = 'test:test missGetacl:cnt missOracle:cnt missSideUnknown:cnt missNonAclVolume:cnt missOracleNull:cnt missOther:cnt missUnknown:cnt errStream:cnt errNonAclVolume:cnt errOther:cnt errUnknown:cnt hlNzStream:cnt hlNzNonAclVolume:cnt hlNzOther:cnt hlNzUnknown:cnt'
+        rbstate = 'test:test bindOk:cnt bindStale:cnt bindUnmeasured:cnt nullAbsentAefa:cnt nullAbsentNoAefa:cnt nullPresent:cnt nullUnknown:cnt absentAbsentAefa:cnt absentAbsentNoAefa:cnt absentPresent:cnt absentUnknown:cnt presentAbsentAefa:cnt presentAbsentNoAefa:cnt presentPresent:cnt presentUnknown:cnt unknownAbsentAefa:cnt unknownAbsentNoAefa:cnt unknownPresent:cnt unknownUnknown:cnt aefaMasks:hist aefaMasksOther:cnt matchAefa:cnt matchUnknown:cnt'
+        streamjoin = 'test:test aclRows:cnt hlRows:cnt joinMatch:cnt joinDiff:cnt joinUnproved:cnt uManifest:cnt uStreamRow:cnt uHostRow:cnt uOpen:cnt uIdentity:cnt uSddl:cnt uBracket:cnt uReadback:cnt'
+        hlprobe = 'test:test rows:cnt streamBothOk:cnt streamFfnErr:cnt streamPlainErr:cnt streamUnknown:cnt nonAclBothOk:cnt nonAclFfnErr:cnt nonAclPlainErr:cnt nonAclUnknown:cnt otherBothOk:cnt otherFfnErr:cnt otherPlainErr:cnt otherUnknown:cnt unknownBothOk:cnt unknownFfnErr:cnt unknownPlainErr:cnt unknownUnknown:cnt plainErrs:hist plainErrsOther:cnt plainUnknown:cnt ffnErrs:hist ffnErrsOther:cnt ffnUnknown:cnt'
       }
-      $keyed = @('priv', 'launch', 'bind', 'helper', 'readback', 'rbdiff', 'rbsplit', 'linkacl', 'rbcause')
+      $keyed = @('priv', 'launch', 'bind', 'helper', 'readback', 'rbdiff', 'rbsplit', 'linkacl', 'rbcause', 'rbstate', 'streamjoin', 'hlprobe')
       $seen = @{}
       foreach ($raw in $lines) {
         $l = $raw.TrimEnd([char]13)

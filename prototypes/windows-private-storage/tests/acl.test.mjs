@@ -773,6 +773,142 @@ export function readbackCauseOperands(test, objects, manifest) {
     ...Object.entries(err).map(([k, v]) => [`err${k}`, opCount(v)]), ...Object.entries(hl).map(([k, v]) => [`hlNz${k}`, opCount(v)])]);
 }
 
+// rbstate / streamjoin / hlprobe, DIAGNOSTIC only: pure readers of the diagnostic fields Get-PspSnapshot records next to the
+// unchanged getAclSddl / getAclError / fsutil fields. Every count is an operand, never a cause, acceptance or waiver; nothing
+// here feeds readbackFindings, rbcause or any other line. A missing, non-boolean or invalid input is unknown, never a match.
+const opHist = () => ({ m: new Map(), other: 0 });
+const opHistBump = (h, v) => {
+  if (opInt(v) !== String(v) || (!h.m.has(v) && h.m.size >= 4)) { h.other++; return; }
+  h.m.set(v, (h.m.get(v) || 0) + 1);
+};
+const opHistFmt = (h) => (h.m.size ? [...h.m].map(([v, k]) => `${v}:${opCount(k)}`).join(',') : 'none');
+const isBool = (v) => v === true || v === false;
+// Oracle handle (GetSecurityDescriptorDacl on the SD Take read): null and absent stay distinct; an empty DACL is present.
+function oracleDaclState(o) {
+  if (o.daclValid !== true || !isBool(o.daclPresent)) return 'unknown';
+  if (o.daclPresent === false) return 'absent';
+  return o.daclNull === true ? 'null' : (o.daclNull === false ? 'present' : 'unknown');
+}
+// Same Get-Acl object, binary form: a DACL-present descriptor is present even with a single explicit Everyone allow rule.
+function getAclBinState(o) {
+  if (o.getAclBinValid !== true || !isBool(o.getAclDaclPresent) || !isBool(o.getAclAefa)) return 'unknown';
+  if (o.getAclDaclPresent) return 'present';
+  return o.getAclAefa ? 'absentAefa' : 'absentNoAefa';
+}
+const cap = (s) => s[0].toUpperCase() + s.slice(1);
+
+// rbstate: the rbsplit flagMissing rows (same selection as rbcause miss*), by the Get-Acl bracket (matching = ok; stale;
+// anything else unmeasured). Only bind=ok rows enter the oracle x getacl cells; aefaMasks = raw FileSystemRights of the AEFA
+// rule in those cells (bounded histogram). Control over the aclMatch rows with bind=ok: matchAefa = getacl absentAefa,
+// matchUnknown = bind not ok or getacl unknown. No pairing is a normalization: NULL vs absent is pending decision D1.
+export const OP_RB_ORACLE = Object.freeze(['null', 'absent', 'present', 'unknown']);
+export const OP_RB_GETACL = Object.freeze(['absentAefa', 'absentNoAefa', 'present', 'unknown']);
+export function readbackStateOperands(test, objects) {
+  const b = { bindOk: 0, bindStale: 0, bindUnmeasured: 0 };
+  const cell = Object.fromEntries(OP_RB_ORACLE.flatMap((x) => OP_RB_GETACL.map((g) => [`${x}${cap(g)}`, 0])));
+  const masks = opHist(); let matchAefa = 0; let matchUnknown = 0;
+  for (const o of asArray(objects)) {
+    if (!o || o.openError !== 0 || typeof o.getAclSddl !== 'string') continue;
+    const bind = o.getAclBracket === 'matching' ? 'Ok' : (o.getAclBracket === 'stale' ? 'Stale' : 'Unmeasured');
+    if (o.getAclSddl === o.sddl) {
+      const g = bind === 'Ok' ? getAclBinState(o) : 'unknown';
+      if (g === 'absentAefa') matchAefa++; else if (g === 'unknown') matchUnknown++;
+      continue;
+    }
+    if (o.isReparse || !sddlDiffSplit(o.getAclSddl, o.sddl).includes('flagMissing')) continue;
+    b[`bind${bind}`]++;
+    if (bind !== 'Ok') continue;
+    const g = getAclBinState(o);
+    cell[`${oracleDaclState(o)}${cap(g)}`]++;
+    if (g === 'absentAefa') opHistBump(masks, o.getAclAefaMask);
+  }
+  return opLine('rbstate', [['test', opEnum(test, ['contradict', 'unproved'])], ...Object.entries(b).map(([k, v]) => [k, opCount(v)]),
+    ...Object.entries(cell).map(([k, v]) => [k, opCount(v)]), ['aefaMasks', opHistFmt(masks)], ['aefaMasksOther', opCount(masks.other)],
+    ['matchAefa', opCount(matchAefa)], ['matchUnknown', opCount(matchUnknown)]]);
+}
+
+// streamjoin: per snapshot stage, per stream case (exactly one manifest case with string path and object; no colon parsing),
+// the stage row whose path is exactly case.path and, for each of its unproved read-backs (Get-Acl not a string; non-dir
+// non-reparse fsutil hardlink exit nonzero), the stage row whose path is exactly case.object. joinMatch / joinDiff need:
+// host row present once, host openError 0, both own-handle volumeSerial/fileIndex measured and equal, both oracle sddl
+// measured and equal, host getAclBracket matching, and the host's own read-back (Get-Acl string; or fsutil hardlink exit 0
+// with nLinks equal); then host Get-Acl == stream oracle sddl (or listed links == nLinks) is joinMatch, else joinDiff.
+// Anything else is joinUnproved with the first failing reason. Never wired into readbackFindings (decision D-S pending).
+export const OP_JOIN_REASONS = Object.freeze(['manifest', 'streamRow', 'hostRow', 'open', 'identity', 'sddl', 'bracket', 'readback']);
+export function streamJoinOperands(test, snaps, manifest) {
+  const n = { aclRows: 0, hlRows: 0, joinMatch: 0, joinDiff: 0, joinUnproved: 0 };
+  const u = Object.fromEntries(OP_JOIN_REASONS.map((r) => [r, 0]));
+  const unproved = (r) => { n.joinUnproved++; u[r]++; };
+  const cs = asArray(manifest && manifest.cases);
+  const idOk = (o) => typeof o.volumeSerial === 'string' && /^[0-9A-F]{8}$/.test(o.volumeSerial) && typeof o.fileIndex === 'string' && /^[0-9A-F]{16}$/.test(o.fileIndex);
+  for (const t of ['S0', 'S1', 'S2', 'S3']) {
+    const objs = asArray(snaps && snaps[t] && snaps[t].objects);
+    for (const id of OP_STREAM_CASES) {
+      const hits = cs.filter((c) => c && c.id === id);
+      const c = hits.length === 1 ? hits[0] : null;
+      if (!c || typeof c.path !== 'string' || c.path === '' || typeof c.object !== 'string' || c.object === '') { unproved('manifest'); continue; }
+      const ss = objs.filter((o) => o && o.path === c.path);
+      if (ss.length !== 1) { unproved('streamRow'); continue; }
+      const s = ss[0];
+      if (s.openError !== 0) continue;   // not a readbackFindings row
+      const sides = [];
+      if (typeof s.getAclSddl !== 'string') sides.push('acl');
+      if (!s.isDir && !s.isReparse && s.fsutilHardlinkExit !== 0) sides.push('hl');
+      const hs = objs.filter((o) => o && o.path === c.object);
+      const h = hs.length === 1 ? hs[0] : null;
+      for (const side of sides) {
+        n[`${side}Rows`]++;
+        let r = null;
+        if (!h) r = 'hostRow';
+        else if (h.openError !== 0) r = 'open';
+        else if (!idOk(s) || !idOk(h) || s.volumeSerial !== h.volumeSerial || s.fileIndex !== h.fileIndex) r = 'identity';
+        else if (s.sddlError !== 0 || h.sddlError !== 0 || typeof s.sddl !== 'string' || typeof h.sddl !== 'string' || s.sddl !== h.sddl) r = 'sddl';
+        else if (h.getAclBracket !== 'matching') r = 'bracket';
+        else if (side === 'acl' ? typeof h.getAclSddl !== 'string'
+          : (h.isDir !== false || h.isReparse !== false || h.fsutilHardlinkExit !== 0 || !Array.isArray(h.fsutilHardlinks) || !Number.isInteger(s.nLinks))) r = 'readback';
+        if (r) { unproved(r); continue; }
+        const same = side === 'acl' ? h.getAclSddl === s.sddl : (h.fsutilHardlinks.length === s.nLinks && h.nLinks === s.nLinks);
+        if (same) n.joinMatch++; else n.joinDiff++;
+      }
+    }
+  }
+  return opLine('streamjoin', [['test', opEnum(test, ['contradict', 'unproved'])], ...Object.entries(n).map(([k, v]) => [k, opCount(v)]),
+    ...Object.entries(u).map(([k, v]) => [`u${cap(k)}`, opCount(v)])]);
+}
+
+// hlprobe: the rbcause hlNz rows (non-dir, non-reparse, fsutil hardlink exit nonzero or unmeasured), by the rbcause path class
+// (stream / nonAcl / other / unknown, same rules) x outcome: bothOk (plain open 0 and FindFirstFileNameW 0), ffnErr (plain 0,
+// ffn nonzero), plainErr (plain nonzero), unknown (probe or a needed field invalid/missing). Histograms of the measured
+// numeric codes (at most 4 values plus other). Counts only: no fsutil cause is inferred.
+export function hardlinkProbeOperands(test, objects, manifest) {
+  const outs = ['BothOk', 'FfnErr', 'PlainErr', 'Unknown'];
+  const cell = Object.fromEntries(['stream', 'nonAcl', 'other', 'unknown'].flatMap((k) => outs.map((x) => [`${k}${x}`, 0])));
+  const pe = opHist(); const fe = opHist(); let rows = 0; let plainUnknown = 0; let ffnUnknown = 0;
+  const cs = asArray(manifest && manifest.cases);
+  const streams = OP_STREAM_CASES.map((id) => cs.find((c) => c && c.id === id)).map((c) => (c && typeof c.path === 'string' && c.path !== '' ? c.path : null));
+  const pathClass = (o) => {
+    if (typeof o.path === 'string' && streams.some((p) => p !== null && finalPathMatches(p, o.path))) return 'stream';
+    if (typeof o.path !== 'string' || streams.includes(null)) return 'unknown';
+    if (o.volumeError === 0 && typeof o.persistentAcls === 'boolean') return o.persistentAcls ? 'other' : 'nonAcl';
+    return 'unknown';
+  };
+  for (const o of asArray(objects)) {
+    if (!o || o.openError !== 0) continue;
+    if (!(!o.isDir && !o.isReparse && o.fsutilHardlinkExit !== 0)) continue;
+    rows++;
+    const valid = o.hlProbeValid === true;
+    const plain = valid && o.hlPlainOpenValid === true && Number.isInteger(o.hlPlainOpenErr);
+    const ffn = valid && o.hlFfnValid === true && Number.isInteger(o.hlFfnErr);
+    if (plain) opHistBump(pe, o.hlPlainOpenErr); else plainUnknown++;
+    if (ffn) opHistBump(fe, o.hlFfnErr); else ffnUnknown++;
+    const out = !plain ? 'Unknown' : (o.hlPlainOpenErr !== 0 ? 'PlainErr' : (!ffn ? 'Unknown' : (o.hlFfnErr !== 0 ? 'FfnErr' : 'BothOk')));
+    cell[`${pathClass(o)}${out}`]++;
+  }
+  return opLine('hlprobe', [['test', opEnum(test, ['contradict', 'unproved'])], ['rows', opCount(rows)], ...Object.entries(cell).map(([k, v]) => [k, opCount(v)]),
+    ['plainErrs', opHistFmt(pe)], ['plainErrsOther', opCount(pe.other)], ['plainUnknown', opCount(plainUnknown)],
+    ['ffnErrs', opHistFmt(fe)], ['ffnErrsOther', opCount(fe.other)], ['ffnUnknown', opCount(ffnUnknown)]]);
+}
+
 // F1 observation, DIAGNOSTIC only, for the four link cases: does the S0 oracle SDDL of the relevant link object (the leaf
 // link, or the junction ancestor for *_UNDER_JUNCTION) carry an allow ACE for A's own SID whose generic-mapped mask covers
 // what the helper opens it with: leaf READ_CONTROL|FILE_READ_ATTRIBUTES (private_storage.c:819), ancestor
@@ -1153,6 +1289,115 @@ if (PHASE === 'selfcheck') {
     const big = kv(readbackCauseOperands('unproved', Array.from({ length: 100001 }, () => er('C:\\fx\\plain', acl)), man));
     assert.equal(big.errOther, '99999', 'counts are clipped, never unbounded');
   });
+
+  // Diagnostic-only fields added by Get-PspSnapshot; stripping them must leave readbackFindings byte-identical.
+  const DIAG_FIELDS = ['daclValid', 'daclError', 'daclPresent', 'daclNull', 'daclDefaulted', 'getAclBinValid', 'getAclBinError', 'getAclDaclPresent',
+    'getAclDaclNull', 'getAclRuleCount', 'getAclAefa', 'getAclAefaMask', 'getAclBracket', 'getAclBracketError', 'hlProbeValid', 'hlProbeError',
+    'hlPlainOpenValid', 'hlPlainOpenErr', 'hlFfnValid', 'hlFfnErr'];
+  const strip = (objs) => objs.map((o) => Object.fromEntries(Object.entries(o).filter(([k]) => !DIAG_FIELDS.includes(k))));
+  const omit = (o, k) => { const x = { ...o }; delete x[k]; return x; };
+  const hasOwn = (o, f) => Object.prototype.hasOwnProperty.call(o, f);
+  const kvSafe = (l, kind) => {
+    assert.ok(OP_LINE.test(l), l); assert.ok(!/secret|evil|S-1-|C:|fx|DATA|INDEX|alt|NotSupported|Exception/i.test(l), l);
+    const v = opKv(l); assert.equal(v.kind, kind); return v;
+  };
+
+  test('selfcheck: rbstate keeps oracle NULL vs Get-Acl absent+AEFA a contradiction, empty != NULL, explicit Everyone present, unknown/stale excluded', () => {
+    const O = `O:${A}G:${A}`; const NULLD = `${O}D:NO_ACCESS_CONTROL`;
+    const ms = (g, o, x = {}) => ({ path: 'C:\\fx\\m', openError: 0, isDir: true, isReparse: false, sddl: o, getAclSddl: g, fsutilReparseExit: 1, getAclBracket: 'matching',
+      daclValid: true, daclPresent: true, daclNull: true, getAclBinValid: true, getAclDaclPresent: false, getAclDaclNull: true, getAclAefa: true, getAclAefaMask: 2032127, ...x });
+    const objs = [
+      ms(O, NULLD), ms(O, `${O}D:P`, { daclNull: false, getAclAefa: false, getAclAefaMask: null }), ms(O, NULLD, { getAclDaclPresent: true }),
+      ms(O, NULLD, { getAclBracket: 'stale' }), omit(ms(O, NULLD), 'getAclBracket'), ms(O, NULLD, { daclValid: false }), omit(ms(O, NULLD), 'getAclBinValid'),
+      ms(O, NULLD, { getAclBinValid: false, getAclBinError: 'NotSupportedException' }), ms(O, `${O}D:P(A;;FA;;;${A})`, { daclNull: false }), ms(O, NULLD, { daclPresent: false }),
+      ms(`${O}D:(A;;FA;;;WD)`, `${O}D:(A;;FA;;;WD)`, { daclNull: false, getAclDaclPresent: true }), ms(O, O, { daclPresent: false }), ms(O, O, { getAclBinValid: false }),
+      ms(O, NULLD, { isReparse: true }), ms(null, NULLD, { getAclError: 'NotSupportedException' }),
+    ];
+    assert.deepEqual([hasOwn(objs[4], 'getAclBracket'), objs[4].getAclBracket], [false, undefined], 'the missing-bracket fixture has no field, not the default');
+    assert.deepEqual([hasOwn(objs[6], 'getAclBinValid'), objs[6].getAclBinValid], [false, undefined], 'the missing-validity fixture has no field, not the default');
+    assert.deepEqual([hasOwn(objs[0], 'getAclBracket'), objs[0].getAclBracket, objs[0].daclNull, objs[0].getAclAefa], [true, 'matching', true, true], 'default fixture shape');
+    const v = kvSafe(readbackStateOperands('contradict', objs), 'rbstate');
+    const pick = (ks) => ks.map((q) => v[q]);
+    assert.deepEqual(pick(['bindOk', 'bindStale', 'bindUnmeasured']), ['8', '1', '1']);
+    assert.deepEqual(pick(['nullAbsentAefa', 'presentAbsentNoAefa', 'nullPresent', 'unknownAbsentAefa', 'nullUnknown', 'presentAbsentAefa', 'absentAbsentAefa']),
+      ['1', '1', '1', '1', '2', '1', '1'], 'NULL+AEFA, empty (present) vs absent, explicit present never absentAefa, unknown kept apart');
+    assert.deepEqual(pick(['nullAbsentNoAefa', 'absentAbsentNoAefa', 'absentPresent', 'presentPresent', 'unknownUnknown']), ['0', '0', '0', '0', '0']);
+    const cells = OP_RB_ORACLE.flatMap((x) => OP_RB_GETACL.map((g) => Number(v[`${x}${g[0].toUpperCase()}${g.slice(1)}`])));
+    assert.equal(cells.reduce((a2, b2) => a2 + b2, 0), 8, 'only bind=ok rows are paired');
+    assert.deepEqual(pick(['aefaMasks', 'aefaMasksOther', 'matchAefa', 'matchUnknown']), ['2032127:4', '0', '1', '1'], 'explicit Everyone with present=true is not matchAefa');
+    const r = readbackOperands('contradict', {}, objs).map(opKv);
+    assert.equal(String(Number(v.bindOk) + Number(v.bindStale) + Number(v.bindUnmeasured)), r[2].flagMissing, 'rbstate rows are exactly rbsplit flagMissing');
+    assert.equal(readbackFindings([objs[0]]).contradictions.length, 1, 'oracle NULL + Get-Acl absent/AEFA stays a contradiction in the original predicate');
+    assert.deepEqual(readbackFindings(objs), readbackFindings(strip(objs)), 'readbackFindings ignores every diagnostic field');
+    assert.deepEqual(readbackOperands('contradict', {}, objs), readbackOperands('contradict', {}, strip(objs)), 'existing operand lines unchanged');
+    const bare = kvSafe(readbackStateOperands('contradict', strip(objs)), 'rbstate');
+    assert.deepEqual([bare.bindOk, bare.bindUnmeasured, bare.matchAefa, bare.matchUnknown], ['0', '10', '0', '3'], 'no diagnostic fields: nothing measured, nothing matched');
+    assert.equal(kvSafe(readbackStateOperands('payload', undefined), 'rbstate').test, 'UNKNOWN');
+    assert.equal(kvSafe(readbackStateOperands('unproved', Array.from({ length: 100001 }, () => objs[0])), 'rbstate').nullAbsentAefa, '99999');
+  });
+
+  test('selfcheck: streamjoin binds stream rows to the exact manifest host of the same stage; missing host/stage/ID/SDDL/bracket stay unproved', () => {
+    const O = `O:${A}G:${A}`; const P = `${O}D:P(A;;FA;;;${A})`; const Q = `${O}D:P(A;;FR;;;${A})`;
+    const man = { cases: [{ id: 'D_ADS', path: 'C:\\fx\\d::$INDEX_ALLOCATION', object: 'C:\\fx\\d' }, { id: 'F_ADS', path: 'C:\\fx\\h.bin:alt', object: 'C:\\fx\\h.bin' },
+      { id: 'F_DATA_STREAM', path: 'C:\\fx\\ok.bin::$DATA', object: 'C:\\fx\\ok.bin' }] };
+    const row = (p, idx, x = {}) => ({ path: p, openError: 0, infoError: 0, sddlError: 0, isDir: false, isReparse: false, nLinks: 1, volumeSerial: '0000ABCD',
+      fileIndex: `00000000000000${idx}`, sddl: P, getAclSddl: P, fsutilReparseExit: 1, fsutilHardlinkExit: 0, fsutilHardlinks: ['x'], getAclBracket: 'matching', ...x });
+    const strm = (p, idx, x = {}) => row(p, idx, { getAclSddl: null, getAclError: 'NotSupportedException', fsutilHardlinkExit: 1, fsutilHardlinks: [], ...x });
+    const sD = (x) => strm('C:\\fx\\d::$INDEX_ALLOCATION', 'D1', { isDir: true, ...x }); const sF = () => strm('C:\\fx\\h.bin:alt', 'F2'); const sK = () => strm('C:\\fx\\ok.bin::$DATA', 'F3');
+    const hD = (x) => row('C:\\fx\\d', 'D1', { isDir: true, ...x }); const hF = (x) => row('C:\\fx\\h.bin', 'F2', x); const hK = (x) => row('C:\\fx\\ok.bin', 'F3', x);
+    const snaps = {
+      S0: { objects: [sD(), hD(), sF(), hF(), sK(), hK({ getAclSddl: Q })] },
+      S1: { objects: [sD(), sF(), sK()] },
+      S2: { objects: [sD(), hD({ fileIndex: '00000000000000D9' }), sF(), hF({ sddl: Q, getAclSddl: Q }), sK(), hK({ getAclBracket: 'stale' })] },
+      S3: { objects: [sF(), omit(hF(), 'getAclBracket'), sK(), hK({ fsutilHardlinkExit: 1, getAclSddl: null, getAclError: 'NotSupportedException' })] },
+    };
+    assert.deepEqual([hasOwn(snaps.S3.objects[1], 'getAclBracket'), hasOwn(snaps.S0.objects[1], 'getAclBracket')], [false, true], 'missing bracket is a missing field');
+    const all = () => ['S0', 'S1', 'S2', 'S3'].flatMap((t) => snaps[t].objects);
+    const before = JSON.stringify(readbackFindings(all()));
+    const v = kvSafe(streamJoinOperands('unproved', snaps, man), 'streamjoin');
+    const pick = (ks) => ks.map((q) => v[q]);
+    assert.deepEqual(pick(['aclRows', 'hlRows', 'joinMatch', 'joinDiff', 'joinUnproved']), ['11', '8', '4', '1', '15']);
+    assert.deepEqual(pick(['uManifest', 'uStreamRow', 'uHostRow', 'uOpen', 'uIdentity', 'uSddl', 'uBracket', 'uReadback']), ['0', '1', '5', '0', '1', '2', '4', '2'],
+      'host only in another stage, ID or SDDL mismatch, stale or missing bracket, host without read-back: unproved');
+    assert.equal(JSON.stringify(readbackFindings(all())), before, 'the join never changes readbackFindings');
+    assert.deepEqual(readbackFindings(all()), readbackFindings(strip(all())));
+    const f = readbackFindings(all());
+    assert.ok(f.contradictions.some((x) => x.startsWith('C:\\fx\\ok.bin:')), 'the host mismatch (joinDiff) is still the original contradiction');
+    assert.equal(f.unproved.filter((x) => x.includes(':alt') || x.includes('::$')).length, 19, 'every stream read-back stays unproved in the original predicate');
+    for (const m of [undefined, null, {}, { cases: man.cases.map((c) => omit(c, 'object')) }, { cases: [...man.cases, man.cases[0]] }]) {
+      const w = kvSafe(streamJoinOperands('unproved', snaps, m), 'streamjoin');
+      const dup = m && Array.isArray(m.cases) && m.cases.length === 4;
+      assert.deepEqual([w.joinMatch, w.joinDiff], dup ? ['3', '1'] : ['0', '0'], `no host is guessed from the stream path: ${JSON.stringify(m)}`);
+      assert.equal(w.uManifest, dup ? '4' : '12');
+    }
+    assert.equal(kvSafe(streamJoinOperands('payload', undefined, undefined), 'streamjoin').test, 'UNKNOWN');
+  });
+
+  test('selfcheck: hlprobe counts measured plain-open / FindFirstFileNameW codes by rbcause class; invalid or missing probe is unknown', () => {
+    const O = `O:${A}G:${A}`; const P = `${O}D:P(A;;FA;;;${A})`;
+    const man = { cases: [{ id: 'D_ADS', path: 'C:\\fx\\d::$INDEX_ALLOCATION' }, { id: 'F_ADS', path: 'C:\\fx\\secret.bin:alt' }, { id: 'F_DATA_STREAM', path: 'C:\\fx\\ok.bin::$DATA' }] };
+    const acl = { volumeError: 0, persistentAcls: true };
+    const hp = (p, v, x = {}) => ({ path: p, openError: 0, isDir: false, isReparse: false, nLinks: 1, sddl: P, getAclSddl: P, fsutilReparseExit: 1, fsutilHardlinkExit: 1,
+      hlProbeValid: true, hlPlainOpenValid: true, hlPlainOpenErr: 0, hlFfnValid: true, hlFfnErr: 0, ...v, ...x });
+    const objs = [
+      hp('C:\\fx\\secret.bin:alt', acl), hp('C:\\fx\\plain', acl, { hlFfnErr: 5 }), hp('C:\\fx\\plain', acl, { hlPlainOpenErr: 5, hlFfnErr: 5 }),
+      omit(hp('C:\\fx\\plain', acl), 'hlProbeValid'), hp('C:\\fx\\plain', { volumeError: 0, persistentAcls: false }, { hlFfnValid: false }), hp('C:\\fx\\plain', { volumeError: 87 }),
+      hp('C:\\fx\\plain', acl, { fsutilHardlinkExit: 0 }), hp('C:\\fx\\plain', acl, { isDir: true }), hp('C:\\fx\\plain', acl, { isReparse: true, fsutilReparseExit: 0 }),
+    ];
+    assert.deepEqual([hasOwn(objs[3], 'hlProbeValid'), objs[3].hlProbeValid], [false, undefined], 'the missing-probe fixture has no field, not the default');
+    const v = kvSafe(hardlinkProbeOperands('unproved', objs, man), 'hlprobe');
+    const pick = (ks) => ks.map((q) => v[q]);
+    assert.deepEqual(pick(['rows', 'streamBothOk', 'otherFfnErr', 'otherPlainErr', 'otherUnknown', 'nonAclUnknown', 'unknownBothOk']), ['6', '1', '1', '1', '1', '1', '1']);
+    assert.deepEqual(pick(['plainErrs', 'plainErrsOther', 'plainUnknown', 'ffnErrs', 'ffnErrsOther', 'ffnUnknown']), ['0:4,5:1', '0', '1', '0:2,5:2', '0', '2']);
+    const c = kvSafe(readbackCauseOperands('unproved', objs, man), 'rbcause');
+    assert.equal(v.rows, String(['hlNzStream', 'hlNzNonAclVolume', 'hlNzOther', 'hlNzUnknown'].reduce((a2, q) => a2 + Number(c[q]), 0)), 'rows are exactly the rbcause hlNz rows');
+    assert.deepEqual(readbackFindings(objs), readbackFindings(strip(objs)));
+    const many = kvSafe(hardlinkProbeOperands('unproved', [1, 2, 3, 4, 5, 6].map((e) => hp('C:\\fx\\plain', acl, { hlPlainOpenErr: e })), man), 'hlprobe');
+    assert.deepEqual([many.plainErrs, many.plainErrsOther, many.otherPlainErr], ['1:1,2:1,3:1,4:1', '2', '6'], 'at most four codes, the rest counted as other');
+    const odd = kvSafe(hardlinkProbeOperands('unproved', [hp('C:\\fx\\plain', acl, { hlPlainOpenErr: '5' }), hp('C:\\fx\\plain', acl, { hlFfnErr: 1.5 })], man), 'hlprobe');
+    assert.deepEqual([odd.otherUnknown, odd.plainUnknown, odd.ffnUnknown], ['2', '1', '1'], 'non-integer codes are unknown, never a code');
+    assert.equal(kvSafe(hardlinkProbeOperands('payload', undefined, undefined), 'hlprobe').test, 'UNKNOWN');
+  });
 }
 
 // ------------------------------------------------------------------ phase: helper (as fake user A)
@@ -1475,12 +1720,18 @@ if (PHASE === 'verdict') {
   test('verdict: independent read-back never contradicts the backup-handle oracle', (t) => {
     opDiag(t, () => readbackOperands('contradict', snaps, allSnapObjects()));
     opDiag(t, () => readbackCauseOperands('contradict', allSnapObjects(), manifest));
+    opDiag(t, () => readbackStateOperands('contradict', allSnapObjects()));
+    opDiag(t, () => streamJoinOperands('contradict', snaps, manifest));
+    opDiag(t, () => hardlinkProbeOperands('contradict', allSnapObjects(), manifest));
     assert.deepEqual(snapshotSetProblems(snaps), []);
     assert.deepEqual(readbackFindings(allSnapObjects()).contradictions, []);
   });
   test('verdict: CONTRACT-HOLD r2 §4 Get-Acl/fsutil read-back available for every gated object', (t) => {
     opDiag(t, () => readbackOperands('unproved', snaps, allSnapObjects()));
     opDiag(t, () => readbackCauseOperands('unproved', allSnapObjects(), manifest));
+    opDiag(t, () => readbackStateOperands('unproved', allSnapObjects()));
+    opDiag(t, () => streamJoinOperands('unproved', snaps, manifest));
+    opDiag(t, () => hardlinkProbeOperands('unproved', allSnapObjects(), manifest));
     assert.deepEqual(snapshotSetProblems(snaps), [], 'CONTRACT_UNPROVED: no read-back evidence at all');
     const { unproved } = readbackFindings(allSnapObjects());
     assert.deepEqual(unproved, [], `CONTRACT_UNPROVED (not waived, oracle not replaced): ${unproved.length} read-backs unavailable`);

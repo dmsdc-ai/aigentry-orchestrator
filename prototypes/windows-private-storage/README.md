@@ -262,6 +262,38 @@ Mapping these to auth.ts reasons (`storage_unsafe`, `storage_unavailable`,
     is missing) > nonAclVolume > unknown (no volume metadata) > other.
   - The counts are operands, not causes. Verdicts, readbackFindings and the gate
     are unchanged.
+- **rbstate / streamjoin / hlprobe** (diagnostic only, one line each per read-back
+  test). New snapshot fields are recorded next to the unchanged `getAclSddl` /
+  `getAclError` / fsutil fields. No verdict, readbackFindings count, limit, gate
+  or cleanup/export rule reads them. Missing, invalid or non-boolean input is
+  unknown, never a match.
+  - Oracle: `daclValid` / `daclPresent` / `daclNull` / `daclDefaulted` from
+    `GetSecurityDescriptorDacl` on the SD of the same Take handle. A failed call
+    leaves `daclValid=false` with `daclError` (unknown, not false).
+  - Get-Acl: from the same Get-Acl object, the binary DACL-present / NULL flags,
+    the rule count, and whether the only rule is a non-inherited `S-1-1-0` allow
+    with its raw rights (`getAclBinValid`, or `getAclBinError` = exception type).
+    The binary form cannot separate NULL from absent.
+  - Bracket: a second Take after Get-Acl. It is `matching`, `stale` or
+    `unmeasured`. It is correlation only: equal endpoints cannot exclude a change
+    in between.
+  - rbstate: the flagMissing rows by bracket. Only `matching` rows go into the
+    oracle {null, absent, present (an empty DACL is present), unknown} ×
+    getacl {absentAefa, absentNoAefa, present, unknown} cells. Also counted:
+    the AEFA masks and the aclMatch control (`matchAefa`).
+  - streamjoin: per stage, each unproved D_ADS/F_ADS/F_DATA_STREAM read-back is
+    joined to the row whose path is exactly the manifest `case.object`. A join
+    needs equal own-handle volume/file IDs and oracle SDDL, a `matching` host
+    bracket, and the host's own read-back. The result is
+    joinMatch / joinDiff / joinUnproved (with the first failing reason). It is
+    not wired into readbackFindings; that is pending decision D-S.
+  - hlprobe: for non-directory rows with a nonzero hardlink exit, one plain
+    `FILE_READ_ATTRIBUTES` open without backup intent, plus one
+    `FindFirstFileNameW` (bounded buffer, no retry). Only the numeric codes are
+    kept, by rbcause class. This is a test-harness P/Invoke, not a runtime API.
+    No fsutil cause is inferred.
+  - The selftest operand lines are synthetic vectors, not observations. Every
+    value is unmeasured until an independent fake-CI run.
 - **Status.** Actual CI 37243865183 on bff4f7a: 139 pass / 10 fail. Four link
   cases plus two cascades turning green is a FORECAST for the next CI run, not
   a result. Read-back stays unproved.
