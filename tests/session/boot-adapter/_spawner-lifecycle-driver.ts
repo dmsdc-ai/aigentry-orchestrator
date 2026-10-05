@@ -38,9 +38,12 @@ const ser = (e: NodeJS.ErrnoException) => ({ isError: e instanceof Error, code: 
   syscall: e?.syscall, message: String(e?.message).slice(0, 200) });
 
 // Raw node:child_process observation of the same executable, for errno comparison.
+// spawn() reports EACCES/EAGAIN/EMFILE/ENFILE/ENOENT via 'error' and THROWS every other
+// OS error synchronously (win32 non-PE image: "spawn UNKNOWN"); both are a failed raw spawn.
 function rawSpawn(exe: string): Promise<Record<string, unknown>> {
   return new Promise((res) => {
-    const c = spawn(exe, [], { shell: false });
+    let c: ChildProcess;
+    try { c = spawn(exe, [], { shell: false }); } catch (e) { return res({ spawned: false, thrown: true, error: ser(e as NodeJS.ErrnoException) }); }
     c.on("error", (e) => res({ spawned: false, error: ser(e) }));
     c.on("spawn", () => { c.kill("SIGKILL"); res({ spawned: true }); });
   });

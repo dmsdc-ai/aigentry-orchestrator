@@ -38,17 +38,24 @@ function gateUntil(file: string): void {
 
 // After the first non-stdio socket write has been handed to the OS (writableLength 0
 // = nothing left in Node's buffer), create <file>. Used to prove "OS accepted" only.
-function signalAfterAccepted(file: string): void {
+// win32 pipe writes complete asynchronously and a small write never emits 'drain', so
+// there the signal is that write's own completion callback; note.go records which path ran.
+function signalAfterAccepted(file: string, note: Record<string, unknown>): void {
   const proto = net.Socket.prototype as unknown as Record<string, (...a: unknown[]) => unknown>;
   const ow = proto["write"]!;
   let armed = true;
   proto["write"] = function (this: net.Socket, ...a: unknown[]) {
+    if (!armed || this === process.stdout || this === process.stderr) return ow.apply(this, a);
+    armed = false;
+    let signalled = false;
+    const done = (how: string) => { if (signalled) return; signalled = true; note["go"] = how; writeFileSync(file, ""); };
+    const cb = typeof a[a.length - 1] === "function" ? a.pop() as (e?: Error | null) => void : undefined;
+    a.push((e?: Error | null) => {
+      done(e ? `write-cb-error:${(e as NodeJS.ErrnoException).code}` : "write-cb");
+      cb?.(e);
+    });
     const r = ow.apply(this, a);
-    if (armed && this !== process.stdout && this !== process.stderr) {
-      armed = false;
-      const done = () => writeFileSync(file, "");
-      if (this.writableLength === 0) done(); else this.once("drain", done);
-    }
+    if (this.writableLength === 0) done("sync");
     return r;
   };
 }
@@ -75,7 +82,11 @@ const scenarios: Record<string, () => { cmd: ReturnType<typeof sh>; stdin: strin
   "missing-exe-empty": () => ({ cmd: sh("aigentry-missing-exe-1162"), stdin: "" }),
   "missing-exe-undefined": () => ({ cmd: sh("aigentry-missing-exe-1162"), stdin: undefined }),
   "timeout-pending-payload": () => ({ cmd: nodeChild("hang-noread.cjs"), stdin: "y".repeat(BIG), timeout: 1_000 }),
-  "os-accepted-not-read": () => { signalAfterAccepted(join(dir, "go")); return { cmd: sh("wait-go-exit0"), stdin: "abc" }; },
+  "os-accepted-not-read": () => {
+    const note: Record<string, unknown> = {};
+    signalAfterAccepted(join(dir, "go"), note);
+    return { cmd: sh("wait-go-exit0"), stdin: "abc", extra: note };
+  },
 };
 
 const make = scenarios[scenario];

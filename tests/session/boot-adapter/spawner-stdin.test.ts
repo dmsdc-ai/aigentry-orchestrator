@@ -188,5 +188,9 @@ test("SS11 timeout with 8 MiB pending: rejects ETIMEDOUT, child killed, later pi
 });
 
 test("SS12 LIMIT (labelled): OS accepted small payload but child never read it -> resolves (undetectable)", (t) => {
-  resolved(drive(t, "os-accepted-not-read"), 0);
+  const o = drive(t, "os-accepted-not-read");
+  t.diagnostic(`go: ${String(o.extra?.["go"])}`);
+  resolved(o, 0);
+  // The child was released only by a successful write: synchronous (POSIX pipes) or its completion callback (win32).
+  assert.ok(o.extra?.["go"] === "sync" || o.extra?.["go"] === "write-cb", `go signal ${String(o.extra?.["go"])}`);
 });
