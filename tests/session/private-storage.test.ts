@@ -6,7 +6,7 @@
 // POSIX: every export answers unsupported_platform, the bridge is null and the helper throws.
 // win32: real icacls / whoami / PowerShell round trips. These cases double as the PLAN §6 design
 // probes R1 (PowerShell read-back), R2 (icacls Set shape), R3 (elevation), R4 (latency, diagnostic
-// only), R5 (long and Unicode paths) and R9 (libuv reparse/nlink/ino facts); every failure message
+// + 5 s cap), R5 (long and Unicode paths) and R9 (libuv reparse/nlink/ino facts); every failure message
 // starts with the probe it falsifies. Cases are registered per platform, so neither platform skips.
 
 import { after, test } from "node:test";
@@ -466,7 +466,7 @@ if (WIN) {
     }
   });
 
-  test("win32 R4: read-batch and icacls latency (diagnostic only, not an assertion)", (t) => {
+  test("win32 R4: read-batch and icacls latency (diagnostic, plus a 5 s read-median ceiling)", (t) => {
     const dir = privDir("latency", "R4");
     const file = join(dir, "f.txt");
     writeFileSync(file, "x");
@@ -489,5 +489,10 @@ if (WIN) {
     }
     t.diagnostic(`[probe R4] powershell read batch (2 items) p50=${pct(reads, 0.5)}ms p95=${pct(reads, 0.95)}ms n=10; ` +
       `icacls p50=${pct(calls, 0.5)}ms p95=${pct(calls, 0.95)}ms n=20`);
+    // #1167 regression ceiling: a cmdlet in SCRIPT cost ~12 s per batch on windows-latest; the
+    // cmdlet-free script ~0.2 s. 5,000 ms is generous headroom for slow runners.
+    const s = [...reads].sort((x, y) => x - y);
+    const median = (s[4]! + s[5]!) / 2;
+    assert.ok(median < 5_000, P("R4", `read-batch median ${median.toFixed(0)}ms >= 5000ms (a cmdlet in SCRIPT?)`));
   });
 }

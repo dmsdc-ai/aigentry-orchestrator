@@ -39,11 +39,17 @@ const OI = 0x1, CI = 0x2, IO = 0x8;
 // MAXIMUM_ALLOWED, GENERIC_ALL, GENERIC_WRITE.
 const WRITE_CLASS = 0x520d0156;
 
-// PLAN §1.4 SCRIPT: single line, ASCII, no `"` and no `\`. One edit against the PLAN text: the
-// catch reports the innermost exception, because New-Object wraps constructor exceptions in
-// MethodInvocationException and the PLAN's `$_.Exception.GetType().Name` would never name
-// FileNotFoundException / UnauthorizedAccessException.
-const SCRIPT = "foreach($l in [Console]::In.ReadToEnd().Split([char]10)){$t=$l.Trim().Split(' ');if($t.Length -ne 3){continue};try{$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($t[2]));$c=[System.Security.AccessControl.AccessControlSections]'Owner,Access';if($t[1] -eq 'd'){$s=New-Object System.Security.AccessControl.DirectorySecurity -ArgumentList $p,$c}else{$s=New-Object System.Security.AccessControl.FileSecurity -ArgumentList $p,$c};$r=New-Object System.Security.AccessControl.RawSecurityDescriptor -ArgumentList @($s.GetSecurityDescriptorBinaryForm(),0);$w=$t[0]+' ok '+$r.Owner.Value+' '+[int]$r.ControlFlags;$a=$r.DiscretionaryAcl;if($a -eq $null){$w+=' null'}else{foreach($e in $a){if($e -is [System.Security.AccessControl.KnownAce]){$w+=' '+[int]$e.AceType+':'+[int]$e.AceFlags+':'+$e.AccessMask+':'+$e.SecurityIdentifier.Value}else{$w+=' '+[int]$e.AceType+':'+[int]$e.AceFlags+':x:x'}}};[Console]::Out.WriteLine($w)}catch{$x=$_.Exception;while($null -ne $x.InnerException){$x=$x.InnerException};[Console]::Out.WriteLine($t[0]+' err '+$x.GetType().Name+' '+$x.HResult)}}";
+// PLAN §1.4 SCRIPT: single line, ASCII, no `"` and no `\`, and no cmdlet. Edits against the PLAN text:
+// 1. No cmdlet: objects are built with the .NET `[Type]::new(...)` constructors, not `New-Object`.
+//    A cmdlet makes PowerShell run command discovery and module autoload, which in the constructed
+//    environment below has no usable module-analysis cache: on windows-latest (#1167) the New-Object
+//    script took p50=12933ms per process (first New-Object alone p50=12141ms; readSecurity
+//    p50=12185ms), this script p50=216ms (readSecurity p50=183ms), same environment, same output.
+//    Any future edit MUST keep the script free of cmdlets and of `"` and `\`.
+// 2. The catch reports the innermost exception, because PowerShell wraps constructor exceptions in
+//    MethodInvocationException and the PLAN's `$_.Exception.GetType().Name` would never name
+//    FileNotFoundException / UnauthorizedAccessException.
+const SCRIPT = "foreach($l in [Console]::In.ReadToEnd().Split([char]10)){$t=$l.Trim().Split(' ');if($t.Length -ne 3){continue};try{$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($t[2]));$c=[System.Security.AccessControl.AccessControlSections]'Owner,Access';if($t[1] -eq 'd'){$s=[System.Security.AccessControl.DirectorySecurity]::new($p,$c)}else{$s=[System.Security.AccessControl.FileSecurity]::new($p,$c)};$r=[System.Security.AccessControl.RawSecurityDescriptor]::new($s.GetSecurityDescriptorBinaryForm(),0);$w=$t[0]+' ok '+$r.Owner.Value+' '+[int]$r.ControlFlags;$a=$r.DiscretionaryAcl;if($a -eq $null){$w+=' null'}else{foreach($e in $a){if($e -is [System.Security.AccessControl.KnownAce]){$w+=' '+[int]$e.AceType+':'+[int]$e.AceFlags+':'+$e.AccessMask+':'+$e.SecurityIdentifier.Value}else{$w+=' '+[int]$e.AceType+':'+[int]$e.AceFlags+':x:x'}}};[Console]::Out.WriteLine($w)}catch{$x=$_.Exception;while($null -ne $x.InnerException){$x=$x.InnerException};[Console]::Out.WriteLine($t[0]+' err '+$x.GetType().Name+' '+$x.HResult)}}";
 
 const OK_LINE = new RegExp(`^(\\d+) ok (${SID_TOKEN}) (\\d+)((?: \\S+)*)$`);
 const ERR_LINE = /^(\d+) err ([A-Za-z_][A-Za-z0-9_.`]*) (-?\d+)$/;
