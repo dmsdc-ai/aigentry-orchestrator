@@ -1,0 +1,681 @@
+{
+  "schema_version": 1,
+  "release_group": "release-1171",
+  "release_task": 1171,
+  "package": "@dmsdc-ai/aigentry-orchestrator",
+  "version": "0.2.2",
+  "base_tag": "v0.2.1",
+  "base_commit": "67f2df8708c3a9f3bccbb1d695e3464456c1c7b4",
+  "tasks": [
+    {
+      "task_id": 652,
+      "disposition": "shipping",
+      "scope": "On macOS and Linux, dispatch and boot preparation spawn workers in a task-scoped sandbox from the installed package, with restricted Claude built-in tools, an isolated opt-in Claude OAuth handoff and refusal of empty auth seeds. Preparing a worker sandbox no longer requires apply_patch on PATH; native Windows refuses confined spawn with exit 78.",
+      "paths": [
+        "bin/boot-prepare.mjs",
+        "src/session/claude-worker-oauth.ts",
+        "src/session/worker-sandbox-runner.ts",
+        "src/session/worker-sandbox.ts",
+        "tests/dispatch/T28_protected_push_guard.sh",
+        "tests/dispatch/T51_register_on_delivery_failed.sh",
+        "tests/dispatch/T59_task_gate.sh",
+        "tests/dispatch/T60_register_wait.sh",
+        "tests/dispatch/T70_record_precedes_inject.sh",
+        "tests/dispatch/T71_registry_failure_prevents_inject.sh",
+        "tests/dispatch/T72_dedup_transport_accepted_exit8.sh",
+        "tests/dispatch/T73_dedup_ambiguous_attempt_exit7.sh",
+        "tests/dispatch/T75_legacy_sidecar_has_no_authority.sh",
+        "tests/dispatch/T76_corrupt_registry_fails_closed.sh",
+        "tests/dispatch/T78_predelivery_abort_retry_matrix.sh",
+        "tests/dispatch/T79_crash_after_delivery_keeps_unknown.sh",
+        "tests/dispatch/T80_dedup_observation_failure_is_not_success.sh",
+        "tests/dispatch/T94_dispatch_captures_inject_id.sh",
+        "tests/dispatch/confined-fixture.mjs",
+        "tests/dispatch/lib.sh",
+        "tests/session/claude-worker-oauth.test.ts",
+        "tests/session/worker-auth-seed.test.ts",
+        "tests/session/worker-tool-admission.test.ts"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.2-dispositions.md",
+          "sha256": "4e27eba7ea08261eb6a53d4b78c1ce3a1739afc38f2fd245e0cbc7ebbcd7a696"
+        }
+      ]
+    },
+    {
+      "task_id": 836,
+      "disposition": "shipping",
+      "scope": "ask.sh reports stale or undelivered escalation outcomes as such and no longer reports CAP_TRIP or CONFLICT as escalated. The reconciler HITL gate part of the task is not in this release.",
+      "paths": [
+        "bin/ask.sh"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.2-dispositions.md",
+          "sha256": "4e27eba7ea08261eb6a53d4b78c1ce3a1739afc38f2fd245e0cbc7ebbcd7a696"
+        }
+      ]
+    },
+    {
+      "task_id": 974,
+      "disposition": "non-shipping",
+      "scope": "Only validation of telepty listing evidence and its regression test are in this release. Finished idle worker sessions are not detected and reaped automatically.",
+      "paths": [
+        "bin/lib/telepty-listing.sh",
+        "tests/dispatch/T163_listing_escalation_truth.sh"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.2-dispositions.md",
+          "sha256": "4e27eba7ea08261eb6a53d4b78c1ce3a1739afc38f2fd245e0cbc7ebbcd7a696"
+        }
+      ]
+    },
+    {
+      "task_id": 1136,
+      "disposition": "shipping",
+      "scope": "Session readiness requires a positive connected health status and recognizes the current and the collapsed Claude idle viewport; the reconciler tells error banners apart from quoted task output. The task's other workflow items are not in this release.",
+      "paths": [
+        "bin/current_screen.py",
+        "bin/session-probe.py",
+        "tests/dispatch/T102_sleep_cut_auto_resume.sh",
+        "tests/dispatch/T11_is_ready_claude2x_idle.sh",
+        "tests/dispatch/T15_is_ready_codex_idle.sh",
+        "tests/dispatch/T28_session_probe_policy.sh",
+        "tests/dispatch/T29_reconciler_shadow_loop.sh",
+        "tests/dispatch/T4_dispatch_postwelcome.sh",
+        "tests/dispatch/T50_is_ready_codex_mcp_boot.sh",
+        "tests/dispatch/T5_dispatch_scrollback.sh",
+        "tests/dispatch/current-readiness-footer.test.ts",
+        "tests/dispatch/session-probe-api-errors.test.ts",
+        "tests/dispatch/stubs/cmux",
+        "tests/dispatch/stubs/ps",
+        "tests/fixtures/session-state/cases.json",
+        "tests/fixtures/session-state/health-bootstrap-not-ready.info",
+        "tests/fixtures/session-state/health-fallback-0.info",
+        "tests/fixtures/session-state/health-fallback-1.info",
+        "tests/fixtures/session-state/health-fallback-2.info",
+        "tests/fixtures/session-state/health-fallback-3.info",
+        "tests/fixtures/session-state/health-fallback-4.info",
+        "tests/fixtures/session-state/health-fallback-5.info",
+        "tests/fixtures/session-state/health-false.info",
+        "tests/fixtures/session-state/health-list.info",
+        "tests/fixtures/session-state/health-missing.info",
+        "tests/fixtures/session-state/health-nested-case.info",
+        "tests/fixtures/session-state/health-nested-connected.info",
+        "tests/fixtures/session-state/health-nested-disconnected.info",
+        "tests/fixtures/session-state/health-nested-malformed.info",
+        "tests/fixtures/session-state/health-null.info",
+        "tests/fixtures/session-state/health-number.info",
+        "tests/fixtures/session-state/health-object.info",
+        "tests/fixtures/session-state/health-primary-malformed.info",
+        "tests/fixtures/session-state/health-primary-positive.info",
+        "tests/fixtures/session-state/health-primary-unknown.info",
+        "tests/fixtures/session-state/health-string-0.info",
+        "tests/fixtures/session-state/health-string-1.info",
+        "tests/fixtures/session-state/health-string-2.info",
+        "tests/fixtures/session-state/health-string-3.info",
+        "tests/fixtures/session-state/health-string-4.info",
+        "tests/fixtures/session-state/health-string-5.info",
+        "tests/fixtures/session-state/health-string-6.info",
+        "tests/fixtures/session-state/health-string-7.info",
+        "tests/fixtures/session-state/health-string-8.info",
+        "tests/fixtures/session-state/health-string-9.info",
+        "tests/fixtures/session-state/health-top-case.info",
+        "tests/fixtures/session-state/health-top-connected.info",
+        "tests/fixtures/session-state/health-transport-not-ready.info",
+        "tests/fixtures/session-state/health-true.info",
+        "tests/fixtures/session-state/health-zero.info",
+        "tests/fixtures/session-state/trust-modal.screen"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.2-dispositions.md",
+          "sha256": "4e27eba7ea08261eb6a53d4b78c1ce3a1739afc38f2fd245e0cbc7ebbcd7a696"
+        }
+      ]
+    },
+    {
+      "task_id": 1148,
+      "disposition": "shipping",
+      "scope": "Worker dispatch resolves the model through the managed model resolver and the packaged model catalog and records the decision evidence at spawn. Re-evaluation after spawn is not in this release.",
+      "paths": [
+        "bin/model-evidence.mjs",
+        "bin/model-resolve.mjs",
+        "docs/model-profiles/model-catalog.json",
+        "src/session/boot-adapter/common.ts",
+        "src/session/model-decision.ts",
+        "tests/dispatch/managed-model-decision.test.ts",
+        "tests/session/model-evidence-managed.test.ts"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.2-dispositions.md",
+          "sha256": "4e27eba7ea08261eb6a53d4b78c1ce3a1739afc38f2fd245e0cbc7ebbcd7a696"
+        }
+      ]
+    },
+    {
+      "task_id": 1151,
+      "disposition": "non-shipping",
+      "scope": "The owned changes are the HITL web approval inbox (deny-only, passkey authentication, explicit owner provisioning, canonical server origin), which ships as a feature. No automatic selection, dispatch or recording loop is in this release.",
+      "paths": [
+        "src/hitl/web/assets.ts",
+        "src/hitl/web/auth-port.ts",
+        "src/hitl/web/auth.ts",
+        "src/hitl/web/cli.ts",
+        "src/hitl/web/read-model.ts",
+        "src/hitl/web/server.ts",
+        "tests/hitl/web-auth.test.ts",
+        "tests/hitl/web-cli.test.ts",
+        "tests/hitl/web-origin.test.ts"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.2-dispositions.md",
+          "sha256": "4e27eba7ea08261eb6a53d4b78c1ce3a1739afc38f2fd245e0cbc7ebbcd7a696"
+        }
+      ]
+    },
+    {
+      "task_id": 1162,
+      "disposition": "shipping",
+      "scope": "Spawned sessions carry typed, display-only launch metadata and sealed per-session agent metadata, and cleanup clears it bound to the captured session identity. Refresh on model change or reconnect is not in this release.",
+      "paths": [
+        "bin/lib/workspace-host.sh",
+        "bin/wh-cli.sh",
+        "src/cleanup/cli.ts",
+        "src/cleanup/usage.ts",
+        "src/orchestrator-boot/boot-record.ts",
+        "src/reconciler/agent-metadata.ts",
+        "src/reconciler/cli.ts",
+        "src/session/agent-binding.ts",
+        "src/session/agent-metadata.ts",
+        "src/session/boot-adapter/claude.ts",
+        "src/session/boot-adapter/codex.ts",
+        "src/session/boot-adapter/gemini.ts",
+        "src/session/boot-adapter/launch-config.ts",
+        "src/session/boot-adapter/spawner.ts",
+        "src/session/boot-adapter/types.ts",
+        "src/session/open-session/cli.ts",
+        "src/session/worker-sandbox-bind.ts",
+        "tests/dispatch/T106_cleanup_cli_contract.sh",
+        "tests/dispatch/T112_reconciler_exported_seams.sh",
+        "tests/dispatch/T116_open_session_parity.sh",
+        "tests/dispatch/T117_open_session_workspace_shim.sh",
+        "tests/dispatch/T160_cleanup_close_evidence.sh",
+        "tests/dispatch/T161_cleanup_close_exit_batch.sh",
+        "tests/dispatch/T162_cleanup_orphan_close.sh",
+        "tests/dispatch/T23_workspace_host_adapter.sh",
+        "tests/dispatch/T26_reconciler_inv17_surface_gone.sh",
+        "tests/dispatch/T49_dispatch_unique_spawn_alias.sh",
+        "tests/dispatch/T53_wh_cmux_open_contract.sh",
+        "tests/dispatch/T54_wh_warp_open_contract.sh",
+        "tests/dispatch/T55_wh_legacy_terminal_open_contract.sh",
+        "tests/dispatch/T56_open_session_sidebar_status.sh",
+        "tests/dispatch/T93_cleanup_retires_every_record_for_sid.sh",
+        "tests/dispatch/agent-metadata/g2b-binding.test.mjs",
+        "tests/dispatch/agent-metadata/g2c-caps-schema-unknown-pill.test.mjs",
+        "tests/dispatch/agent-metadata/g2c-host-contract.test.mjs",
+        "tests/dispatch/agent-metadata/g2c-pinned-clear.test.mjs",
+        "tests/dispatch/agent-metadata/g2c-transport.test.mjs",
+        "tests/dispatch/agent-metadata/g3-legacy-allowlist.test.mjs",
+        "tests/dispatch/agent-metadata/g3-reconciler-matrix.test.mjs",
+        "tests/dispatch/agent-metadata/g3-stage-workspace-denial.test.mjs",
+        "tests/dispatch/agent-metadata/g3-stale-fallback.test.mjs",
+        "tests/dispatch/agent-metadata/support/fake-cmux.mjs",
+        "tests/dispatch/agent-metadata/support/g3-fakes.mjs",
+        "tests/dispatch/agent-metadata/support/harness.mjs",
+        "tests/dispatch/agent-metadata/support/pinned-clear-actuators.mjs",
+        "tests/dispatch/agent-metadata/support/pinned-clear-cmux.mjs",
+        "tests/dispatch/agent-metadata/support/prepare-sandbox.mjs",
+        "tests/dispatch/agent-metadata/support/reconciler.mjs",
+        "tests/dispatch/cleanup-close-lib.sh",
+        "tests/dispatch/model-router-fixtures.test.ts",
+        "tests/dispatch/run-all.sh",
+        "tests/session/boot-adapter/_spawner-stdin-driver.ts",
+        "tests/session/boot-adapter/adapters.test.ts",
+        "tests/session/boot-adapter/launch-config.test.ts",
+        "tests/session/boot-prepare-launch.test.ts",
+        "tests/session/controller-boot-record.test.ts"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.2-dispositions.md",
+          "sha256": "4e27eba7ea08261eb6a53d4b78c1ce3a1739afc38f2fd245e0cbc7ebbcd7a696"
+        }
+      ]
+    },
+    {
+      "task_id": 1166,
+      "disposition": "shipping",
+      "scope": "On macOS and Linux, the prompt-submit hook records a verified receipt, init installs native capture, and a bounded read-only inventory lists what was captured; a stale index lock is swept only when it is still the same file. Native capture install refuses on Windows with exit 2.",
+      "paths": [
+        "bin/hook-prompt-submit.mjs",
+        "bin/init/cli.mjs",
+        "bin/init/native-capture.mjs",
+        "bin/request-capture-inventory.mjs",
+        "src/request-capture/cli.ts",
+        "src/request-capture/inventory-cli.ts",
+        "src/request-capture/inventory.ts",
+        "src/request-capture/receipt.ts",
+        "src/session/persistence/index-lock.ts",
+        "tests/dispatch/session-probe-error-context.test.ts",
+        "tests/packaging/native-capture.test.mjs",
+        "tests/request-capture/cli.test.ts",
+        "tests/request-capture/inventory.test.ts",
+        "tests/request-capture/receipt.test.ts",
+        "tests/request-capture/reuse-diagnostic.test.ts",
+        "tests/session/persistence/index-lock-strict.test.ts"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.2-dispositions.md",
+          "sha256": "4e27eba7ea08261eb6a53d4b78c1ce3a1739afc38f2fd245e0cbc7ebbcd7a696"
+        }
+      ]
+    },
+    {
+      "task_id": 1167,
+      "disposition": "shipping",
+      "scope": "Native Windows is supported for init, the installed entry points and the Git Bash shell entry points, with file fsync plus journaled rename as its durability level and two limitations: confined spawn refuses with exit 78 and native capture install refuses with exit 2. The rest of the platform matrix is not in this release.",
+      "paths": [
+        ".github/windows-lane-tests.txt",
+        ".github/workflows/windows-boot-spawn-probe.yml",
+        ".github/workflows/windows-installed-entry-probe.yml",
+        ".github/workflows/windows-lane.yml",
+        ".github/workflows/windows-publication-probe.yml",
+        "README.tmpl.md",
+        "bin/dispatch-registry.py",
+        "bin/dispatch-verify.sh",
+        "bin/lib/node-shim.sh",
+        "bin/lib/win-private-storage.mjs",
+        "src/cleanup-scheduler/cli.ts",
+        "src/dispatch/cli.ts",
+        "src/dispatch/registry-command.ts",
+        "src/hitl/cli.ts",
+        "src/session/boot-adapter/win-launch.ts",
+        "src/session/persist-context.ts",
+        "src/session/private-storage.ts",
+        "src/tracker/report-sweep.ts",
+        "tests/dispatch/fake-cmux-win32.inert.test.mjs",
+        "tests/dispatch/fake-cmux-win32.ts",
+        "tests/dispatch/registry-native-invocation.test.ts",
+        "tests/dispatch/registry-native-locking.test.ts",
+        "tests/dispatch/registry-reader-adapter.test.ts",
+        "tests/dispatch/registry-transition-artifacts.test.ts",
+        "tests/dispatch/registry-transition-lock-race.test.ts",
+        "tests/dispatch/windows-boot-spawn-probe.mjs",
+        "tests/dispatch/windows-fake-cmux-acceptance.mjs",
+        "tests/dispatch/windows-installed-entry-probe.mjs",
+        "tests/dispatch/windows-publication-probe.py",
+        "tests/dispatch/windows-publication-restricted.py",
+        "tests/dispatch/windows-publication-startup-debug.py",
+        "tests/dispatch/windows-publication-startup.py",
+        "tests/helpers/win-acl.mjs",
+        "tests/hitl/web-read-model.test.ts",
+        "tests/migration/claude-md-migration.test.ts",
+        "tests/packaging/init-platform.test.mjs",
+        "tests/packaging/installed-init-check.mjs",
+        "tests/session/boot-adapter/_spawner-lifecycle-driver.ts",
+        "tests/session/boot-adapter/_win-launch-fixture.ts",
+        "tests/session/boot-adapter/spawner-lifecycle.test.ts",
+        "tests/session/boot-adapter/spawner-stdin.test.ts",
+        "tests/session/boot-adapter/win-launch.test.ts",
+        "tests/session/boot-prepare.test.ts",
+        "tests/session/persist-context.test.ts",
+        "tests/session/private-storage.test.ts",
+        "tests/session/resolve-instructions.test.ts",
+        "tests/tracker/report-sweep-retry.test.ts"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.2-dispositions.md",
+          "sha256": "4e27eba7ea08261eb6a53d4b78c1ce3a1739afc38f2fd245e0cbc7ebbcd7a696"
+        }
+      ]
+    },
+    {
+      "task_id": 1170,
+      "disposition": "non-shipping",
+      "scope": "The owned change makes a textual report observation-only, so it no longer schedules cleanup. Task-bound telepty transport is not enforced in this release.",
+      "paths": [
+        "bin/inject-handler.sh",
+        "src/inject-handler/cli.ts",
+        "src/inject-handler/usage.ts",
+        "tests/dispatch/T124_inject_handler_parity.sh",
+        "tests/dispatch/T17_lifecycle_3layer.sh",
+        "tests/dispatch/T83_legacy_report_envelope_is_not_outcome.sh"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.2-dispositions.md",
+          "sha256": "4e27eba7ea08261eb6a53d4b78c1ce3a1739afc38f2fd245e0cbc7ebbcd7a696"
+        }
+      ]
+    },
+    {
+      "task_id": 1171,
+      "disposition": "shipping",
+      "scope": "The 0.2.2 candidate: release admission against the committed public task projection, the browser and TLS release gate, release evidence tooling, the session id shape check before sandbox target reads, and packaging fixes. Verification of the installed candidate happens after publication and is not part of this release.",
+      "paths": [
+        ".github/workflows/release-admission-cleanup-probe.yml",
+        ".github/workflows/release.yml",
+        "AGENTS.md",
+        "CHANGELOG.md",
+        "README.md",
+        "bin/init/manifest.mjs",
+        "bin/init/preservation.mjs",
+        "bin/model-router.mjs",
+        "docs/adr/2026-09-05-model-routing.md",
+        "docs/model-profiles/model-routing-profile.md",
+        "docs/rules.md",
+        "docs/setup/dispatch-capacity.md",
+        "docs/specs/2026-05-12-dispatch-healthcheck.md",
+        "docs/templates/dispatch-ref-checklist.md",
+        "package-lock.json",
+        "package.json",
+        "release/0.2.2-dispositions.md",
+        "release/0.2.2.json",
+        "release/PROJECTION.md",
+        "release/security/0.2.2/blobs/07dd33a06c5ec18ac0a2c05d9cbd3528d97550f94aba2be8fc88ae1d8aeaf1d1",
+        "release/security/0.2.2/blobs/0d743692eacaaf3d1f39457c26a1b73a74be051aa5746081757e3a57b554209a",
+        "release/security/0.2.2/blobs/101eb5adb6d15431e72a7541551f9e15b1cc564bcff4e63b3c2be5f7292ad82b",
+        "release/security/0.2.2/blobs/107ad1dd3e731477b317f5429e38bcf469d302abccccedea8d99a0d7e022e3b1",
+        "release/security/0.2.2/blobs/1200f561d69843a8f1c248ccc7f6e92110fa18039a430fafcb3cc6d9dd963c1d",
+        "release/security/0.2.2/blobs/16fbd69a48895ef5c55952dabb780d8ef0c43b0c66ede5cd0ed9a36117c5539a",
+        "release/security/0.2.2/blobs/1bf240c90e84e5d90453ecde3ce0ae77ef7f16445417988fd65bc5150d4b7c85",
+        "release/security/0.2.2/blobs/1ffa4709be622f769b198b6dfd14d57d72f96a1e677231ce9243afd9e03440e4",
+        "release/security/0.2.2/blobs/25016114da4f1c2e33de80f525b372e2a3f435080f53e2215039846c693bca5f",
+        "release/security/0.2.2/blobs/27625ec7ea63a287dfb362e493da4a32a7ba4a55291a03494eb43541a63614b9",
+        "release/security/0.2.2/blobs/2906d9ab74cb8e35fb70ddb62a4510baabec77aab89908f036d84042f1ec9016",
+        "release/security/0.2.2/blobs/2bfca67ff69cfc314ea67a9a331e8670ab18e7906b603113c2029c73d84b36b6",
+        "release/security/0.2.2/blobs/2f31867eecea3530a695c6eebf3b4356ea986af53c4e46c6fbc5ad8b46d93e57",
+        "release/security/0.2.2/blobs/2fc176162969ea0a20531885a20dda2822a0464fa52b54b0a6f00400ba68539d",
+        "release/security/0.2.2/blobs/3294957a701d2153c9bcf395cf6f0dc425c6078eacb8961b425037c44150396d",
+        "release/security/0.2.2/blobs/3484d38f15881a7a3bdbff2904331efcba3dfd209ae2a9704ca15fba615aaf19",
+        "release/security/0.2.2/blobs/34f9475e9ee84f01f4d8589f6387679fcb071930db1131079762267ace0f5da6",
+        "release/security/0.2.2/blobs/362e2009e8a638c1d7f32aa66f0ebcdb7618dae4c72fa9597bc03f5d2cad60d6",
+        "release/security/0.2.2/blobs/39bcde4882055d209d4fd7a31ebbe6de0e99197e9133afaee6867748a841f305",
+        "release/security/0.2.2/blobs/3c6c31cbc6fe72a9e5878f2d3f9bad8330379e627b5aed9fcfd1697ddd0965fe",
+        "release/security/0.2.2/blobs/49c0da0fdaf3d84895e32050aa8f4b66e8e7321d6986b603b178281b53ced2e9",
+        "release/security/0.2.2/blobs/4b12b45a9e64d268ab47eeb2236d9d8810d69757747374e2d9c0e70c148eeb79",
+        "release/security/0.2.2/blobs/4c735dc2c78283157894ed4315e2b5065fb41a9a02d4a0e32c3dce91fcd0d961",
+        "release/security/0.2.2/blobs/4da20658160f1cfea76003fc2f751c8d1161dae0fce0f4b3a5f3665ae6d2a334",
+        "release/security/0.2.2/blobs/4e7f241ffff8ed0a59fa3633fd8f04b6350f65892e51856a39d36fa3b0ca4188",
+        "release/security/0.2.2/blobs/5145975aaa060a1e63f1ff91383f3bf8e17ac5e6751f27c5a7bf109f8f1a5ea2",
+        "release/security/0.2.2/blobs/5198d0608c5860d1668179c61d5769e841229015918b302f5072e8a72562462e",
+        "release/security/0.2.2/blobs/5369058660aaf182e43297c4b273a83d7ae7689042dc12ed18f10779e88202ee",
+        "release/security/0.2.2/blobs/56b1cc531721c2a56cc3b3331ae1786595098bafa321c18d10aabf03299a5c51",
+        "release/security/0.2.2/blobs/5782bd261e53a204fe31b5e09023bf34794150d8e10b83a7cb3ffda92fef0ea2",
+        "release/security/0.2.2/blobs/5903a53426a2e3e02e8bf2cdb7c50026a9bea92f152fd9f53ed385dbb76669e8",
+        "release/security/0.2.2/blobs/5abe6719a40edfb7f94df1b424df70fa0eb9fe6dff8f15bbd7cd596446087b97",
+        "release/security/0.2.2/blobs/5bf05a5528569d566abb604c6aa4c4df2374fa200649472bb05c45e8a9604c89",
+        "release/security/0.2.2/blobs/60d8638cc3aba8016ce9d66a86258a81f9fe445a93badfc5031c15b3bc28a507",
+        "release/security/0.2.2/blobs/699a675ffcd47d4f90ba1bfd8306bf3758396e0543e6674efac1b31659fbe599",
+        "release/security/0.2.2/blobs/6a4c20f35545427c389184789f9cd8536d43e61a840f86c5bf1fb88151ff0efa",
+        "release/security/0.2.2/blobs/6c9869cb7ab9d4008f671ae8a977881ea52ca57056dc6ec03f93fbd1d8888cf6",
+        "release/security/0.2.2/blobs/70449b758591513c5b95c2a9a1470c1aaf1bf7d750451ebd272e88e6f43c33fd",
+        "release/security/0.2.2/blobs/71f3b909917452329d227e7099860a1c27ac4287bd75c421a7cadbda01a78483",
+        "release/security/0.2.2/blobs/7a6a6f1152f62eb50ffb3e244f61b93de5454d173fadb565caf3b03047902e6d",
+        "release/security/0.2.2/blobs/7de0ba88c6f3f4befab902d18569988967dc665f32e33e2dd05d12675e561d98",
+        "release/security/0.2.2/blobs/7f973e93e3a8dfaf07742f9a4b49aa9d83d168bab86a6c1d9a6338f94e809055",
+        "release/security/0.2.2/blobs/8540e947bea92a8e7506c05d71d4b05e8ff5123c483e686ca64c980ec8965e24",
+        "release/security/0.2.2/blobs/856250c5099e1485b835385db542b45dcbee4de7bc529766aa6f89eb287d64b3",
+        "release/security/0.2.2/blobs/90793eb18a607f1b9ed265a1bad99f64714c2b07e22cfce5e683785d995f42de",
+        "release/security/0.2.2/blobs/9282b05263719df9d0893051552e6a413afef9b77e038847c7116375be98185c",
+        "release/security/0.2.2/blobs/930f25c94da8f1189dbef4125c6d0590111b350fbba07138e53fbe9d04c8e2e5",
+        "release/security/0.2.2/blobs/9a4a396e96730179a5005a4f81703700186e35b7e2178aa4fb1e6b01fc376b75",
+        "release/security/0.2.2/blobs/9b333a95121dde49e37a60d1ba377e8cae29b2570302cddbaf4d04c8edebd40e",
+        "release/security/0.2.2/blobs/9d969baf688ca0f6dde5eb1c39c6b88f2cec3e311a529ca1e0d9fb852df031c5",
+        "release/security/0.2.2/blobs/a0e1a2e5dc794773bb4bb84d9fb5ee0d9fddce44cc2e1fbd17e9fdbfc16cbb39",
+        "release/security/0.2.2/blobs/a1875b813f85537916a6b49d40cab6e080098da967e3a0d4e232c92e40c55d8f",
+        "release/security/0.2.2/blobs/abbf8c063e2c32a4ffb021ec141e5b73653837f7f41754f776a5c82378b8f08e",
+        "release/security/0.2.2/blobs/afb5c1886a8e8c613e8d7a40602cf5b5fab584f35d573c003f1df231810c6b63",
+        "release/security/0.2.2/blobs/b66f0a8fe335dac3e9e60550ec775f43fd74fad34bfe2b571ba902e34b34866c",
+        "release/security/0.2.2/blobs/bdfdda3dd26e5df062cf30a3942750feae3d8c0aabbbd67f22aa55b7b98ea2a3",
+        "release/security/0.2.2/blobs/bf0e376de0065fab9ee9aea88155b3aa6b2ff0fd77a8a946a41ead54209b83b9",
+        "release/security/0.2.2/blobs/c6c7c73cea4b32ae0342323bd07788f38201050366fffb549f104a112ed06919",
+        "release/security/0.2.2/blobs/ca264a70ad0a9f7dad0b659643b7eb36fe78340d46f8ff95580d516cc2d9172c",
+        "release/security/0.2.2/blobs/d2c5ede2aad0d44084a645bf5f218603d876e8bf034d5d564466673fca6fa673",
+        "release/security/0.2.2/blobs/e08a765f57d52a2a30f3b771166927a239fc0e4d93c12b9302a7088fb868db65",
+        "release/security/0.2.2/blobs/e0cee10b1e14ec327669e523bdac1575a58522bf264b6786c90aa4f6dea9c009",
+        "release/security/0.2.2/blobs/e171f33f3accc9b3c5b33b457ad0e8ac583742d2736ff782d2932870dc5aaeda",
+        "release/security/0.2.2/blobs/e2f8d4dd69c0caa7cd95b83f39b6c3881fb47a90b02d3c92d0ece3413beb501e",
+        "release/security/0.2.2/blobs/e51575b89d702ab8fded0290b2e5e1b2d26c85a95023085979e9468099ff9ce5",
+        "release/security/0.2.2/blobs/e8f2051eff7c56109b77848b74cc551f76088f2109a32169619c7e5c1a4483cd",
+        "release/security/0.2.2/blobs/ef0335c817251b3b3c80b329624082e7ed555b1ed2d046af9fc543e665e1e707",
+        "release/security/0.2.2/blobs/f4c3cca7142e66cd3fd7d5216d69a091d1e9d2d1e906eb163aee139da71892d3",
+        "release/security/0.2.2/blobs/fdce98a752b56d59c493d44c45e64be3ba74ecd4ca018d14fff85f27f92b35cd",
+        "release/security/0.2.2/policy.json",
+        "release/tasks.json",
+        "scripts/release-admission.mjs",
+        "scripts/release-evidence.mjs",
+        "scripts/release-security-scan.mjs",
+        "scripts/run-tests.mjs",
+        "scripts/stale-dist-guard.mjs",
+        "src/dispatch/usage.ts",
+        "src/knowledge/event-identity.ts",
+        "src/session/boot-adapter/grok.ts",
+        "src/session/boot-adapter/index.ts",
+        "src/task-advisor/contracts.ts",
+        "tests/diagnostics/release-admission-cleanup-probe.mjs",
+        "tests/dispatch/T120_scheduler_parity.sh",
+        "tests/dispatch/T138-model-router-fallback.test.ts",
+        "tests/dispatch/T139-model-router-selection.test.ts",
+        "tests/dispatch/T140-dispatch-model-routing.test.ts",
+        "tests/dispatch/T141-model-launcher-flags.test.ts",
+        "tests/dispatch/T145-retry-unknown.test.ts",
+        "tests/dispatch/cli-cap-fixtures.ts",
+        "tests/dispatch/cli-cap-regression.test.ts",
+        "tests/dispatch/fixtures/model-routing-profile.md",
+        "tests/dispatch/model-router-fixtures.ts",
+        "tests/dispatch/target-sid.test.ts",
+        "tests/hitl/browser-tls.acceptance.mjs",
+        "tests/hitl/snyk-boundaries.test.mjs",
+        "tests/knowledge/event-identity.test.ts",
+        "tests/packaging/T96_ship_set_agreement.sh",
+        "tests/packaging/fixtures/windows-gates/README.md",
+        "tests/packaging/fixtures/windows-gates/ci.before-parity.yml",
+        "tests/packaging/fixtures/windows-gates/rejected-release.yml",
+        "tests/packaging/fixtures/windows-gates/release.before.yml",
+        "tests/packaging/installed-boot-selector.test.mjs",
+        "tests/packaging/installed-model-routing.test.mjs",
+        "tests/packaging/preservation-directories.test.mjs",
+        "tests/packaging/preservation.test.mjs",
+        "tests/packaging/release-admission.test.mjs",
+        "tests/packaging/release-evidence.test.mjs",
+        "tests/packaging/smoke-init.sh",
+        "tests/packaging/windows-release-gates.test.mjs",
+        "tests/scripts/stale-dist-guard.test.ts",
+        "tests/session/worker-sandbox-target-sid.test.ts",
+        "tests/task-advisor/contracts.test.mjs",
+        "tests/tracker/report-sweep-continuity.test.ts"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.2-dispositions.md",
+          "sha256": "4e27eba7ea08261eb6a53d4b78c1ce3a1739afc38f2fd245e0cbc7ebbcd7a696"
+        }
+      ]
+    },
+    {
+      "task_id": 1172,
+      "disposition": "shipping",
+      "scope": "Dispatch status queries are bounded and structured, report sweeps emit structured evidence after commit, and dispatch verifies declared worker input snapshots and bounds retest scope.",
+      "paths": [
+        ".agents/skills/orchestrate-turn/SKILL.md",
+        "bin/worker-inputs.mjs",
+        "src/tracker/cli.ts",
+        "src/tracker/usage.ts",
+        "tests/dispatch/worker-inputs.test.mjs",
+        "tests/packaging/workflow-policy.test.mjs",
+        "tests/tracker/report-sweep-json.test.ts",
+        "tests/tracker/status-json.test.ts"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.2-dispositions.md",
+          "sha256": "4e27eba7ea08261eb6a53d4b78c1ce3a1739afc38f2fd245e0cbc7ebbcd7a696"
+        }
+      ]
+    },
+    {
+      "task_id": 1177,
+      "disposition": "shipping",
+      "scope": "A read-only Task Console with an accessible task table in the locally served HITL web service; the existing inbox CLI behaviour is kept. The public console, Registry archival and production acceptance are not in this release.",
+      "paths": [
+        ".github/workflows/ci.yml",
+        "docs/setup/task-console.md",
+        "scripts/ci/acceptance-playwright-core.mjs",
+        "scripts/ci/browser-visibility-probe.mjs",
+        "scripts/ci/xres-owner.c",
+        "src/hitl/web/console-contracts.ts",
+        "src/hitl/web/console-read-model.ts",
+        "tests/hitl/console-read-model.test.ts",
+        "tests/hitl/console-ui.acceptance.mjs",
+        "tests/packaging/xres-owner-supervisor.test.mjs"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.2-dispositions.md",
+          "sha256": "4e27eba7ea08261eb6a53d4b78c1ce3a1739afc38f2fd245e0cbc7ebbcd7a696"
+        }
+      ]
+    },
+    {
+      "task_id": 1179,
+      "disposition": "non-shipping",
+      "scope": "The release contains JEV contract, price-table and reserve modules with regression tests, but no shipped entry point calls them. No decision is routed through JEV.",
+      "paths": [
+        "src/jev/contracts.ts",
+        "src/jev/price-table.ts",
+        "src/jev/reserve.ts",
+        "tests/jev/evidence/2026-09-27-jt1179ka-v1-old-build/README.md",
+        "tests/jev/evidence/2026-09-27-jt1179ka-v1-old-build/contracts.js",
+        "tests/jev/evidence/2026-09-27-jt1179ka-v1-old-build/price-table.js",
+        "tests/jev/evidence/2026-09-27-jt1179ka-v1-old-build/reserve.js",
+        "tests/jev/pipeline-integration.test.mjs",
+        "tests/jev/price-table.test.mjs",
+        "tests/jev/r2-acceptance-delta.test.mjs",
+        "tests/jev/r2-before-after.test.mjs",
+        "tests/jev/refusal-path-constant.test.mjs",
+        "tests/jev/request-contract.test.mjs",
+        "tests/jev/reserve.test.mjs",
+        "tests/jev/response-contract.test.mjs",
+        "tests/jev/tc-support.mjs",
+        "tests/jev/worker-target.test.mjs"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.2-dispositions.md",
+          "sha256": "4e27eba7ea08261eb6a53d4b78c1ce3a1739afc38f2fd245e0cbc7ebbcd7a696"
+        }
+      ]
+    },
+    {
+      "task_id": 1181,
+      "disposition": "shipping",
+      "scope": "bin/orchestrator-boot.sh composes an explicit boot plan through an interactive wizard and validates capture before any dry-run output.",
+      "paths": [
+        "docs/setup/orchestrator-boot.md",
+        "src/orchestrator-boot/cli.ts",
+        "src/orchestrator-boot/plan.ts",
+        "src/orchestrator-boot/provider-capabilities.ts",
+        "src/orchestrator-boot/usage.ts",
+        "src/orchestrator-boot/wizard.ts",
+        "tests/dispatch/T131_orchestrator_boot_parity.sh",
+        "tests/dispatch/T132_orchestrator_boot_workspace_shim.sh",
+        "tests/dispatch/T134_orchestrator_boot_noexec.sh",
+        "tests/dispatch/T40_orchestrator_singleton_guard.sh",
+        "tests/packaging/orchestrator-boot-wizard.test.mjs",
+        "tests/packaging/pty-driver.py"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.2-dispositions.md",
+          "sha256": "4e27eba7ea08261eb6a53d4b78c1ce3a1739afc38f2fd245e0cbc7ebbcd7a696"
+        }
+      ]
+    },
+    {
+      "task_id": 1182,
+      "disposition": "non-shipping",
+      "scope": "The release contains the pure command-core modules with regression tests, but no shipped entry point calls them. No command plane is delivered.",
+      "paths": [
+        "src/control/admission.ts",
+        "src/control/cards.ts",
+        "src/control/contracts.ts",
+        "tests/control/core.test.mjs",
+        "tests/control/fake.mjs",
+        "tests/control/suite.mjs"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.2-dispositions.md",
+          "sha256": "4e27eba7ea08261eb6a53d4b78c1ce3a1739afc38f2fd245e0cbc7ebbcd7a696"
+        }
+      ]
+    },
+    {
+      "task_id": 1185,
+      "disposition": "non-shipping",
+      "scope": "The release contains the advisor efficiency core and a bounded checkpoint decoder with regression tests, but no shipped entry point runs them. No diagnosis or proposal is produced.",
+      "paths": [
+        "src/task-advisor/collect.ts",
+        "src/task-advisor/efficiency-contracts.ts",
+        "src/task-advisor/efficiency.ts",
+        "tests/task-advisor/efficiency/cap-fixture-measure.mjs",
+        "tests/task-advisor/efficiency/helpers.mjs",
+        "tests/task-advisor/efficiency/purity-child.mjs",
+        "tests/task-advisor/efficiency/t1-schema.test.mjs",
+        "tests/task-advisor/efficiency/t10-r3-state-latency.test.mjs",
+        "tests/task-advisor/efficiency/t11-r4-numeric.test.mjs",
+        "tests/task-advisor/efficiency/t12-checkpoint-decoder.test.mjs",
+        "tests/task-advisor/efficiency/t2-decoder.test.mjs",
+        "tests/task-advisor/efficiency/t3-dedup-gap-time.test.mjs",
+        "tests/task-advisor/efficiency/t4-grants-binding.test.mjs",
+        "tests/task-advisor/efficiency/t5-detectors.test.mjs",
+        "tests/task-advisor/efficiency/t6-suppression-outcome.test.mjs",
+        "tests/task-advisor/efficiency/t7-bounds.test.mjs",
+        "tests/task-advisor/efficiency/t8-r2-focused.test.mjs",
+        "tests/task-advisor/efficiency/t9-suspicions.test.mjs"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.2-dispositions.md",
+          "sha256": "4e27eba7ea08261eb6a53d4b78c1ce3a1739afc38f2fd245e0cbc7ebbcd7a696"
+        }
+      ]
+    },
+    {
+      "task_id": 1191,
+      "disposition": "non-shipping",
+      "scope": "The only owned change pins source line endings to LF in .gitattributes so that byte-pinned test fixtures survive a Windows checkout. No isolated runtime is delivered.",
+      "paths": [
+        ".gitattributes"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.2-dispositions.md",
+          "sha256": "4e27eba7ea08261eb6a53d4b78c1ce3a1739afc38f2fd245e0cbc7ebbcd7a696"
+        }
+      ]
+    },
+    {
+      "task_id": 1194,
+      "disposition": "shipping",
+      "scope": "The orchestration rules are revised: a shipped slice is a valid release state, one sentence states what needs human approval, there is one decision queue, the pre-dispatch checklist has ten gates, and small or test-only changes need one coder with CI as the verifier. Installed role instructions change only after a forced reinstall.",
+      "paths": [
+        "tooling/instructions/roles/orchestrator.md"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.2-dispositions.md",
+          "sha256": "4e27eba7ea08261eb6a53d4b78c1ce3a1739afc38f2fd245e0cbc7ebbcd7a696"
+        }
+      ]
+    }
+  ]
+}
