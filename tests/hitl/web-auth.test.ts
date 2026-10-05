@@ -445,19 +445,26 @@ test('status: Windows private storage unavailable fails closed (win32 process wi
   const f = await fixture();
   try {
     const moduleURL = new URL('../../src/hitl/web/auth.js', import.meta.url).href;
-    const script = `Object.defineProperty(process, 'platform', {value: 'win32'});
+    // The child removes SystemRoot from its own environment: on win32, libuv re-adds SYSTEMROOT
+    // from the parent to any spawn env that omits it, so filtering the spawn env only works on POSIX.
+    const script = `for (const key of Object.keys(process.env)) if (key.toLowerCase() === 'systemroot') delete process.env[key];
+      Object.defineProperty(process, 'platform', {value: 'win32'});
       const {createAuth, provisionOwner} = await import(${JSON.stringify(moduleURL)});
       const auth = await createAuth(${JSON.stringify(f.config)}, () => 1800000000000);
+      const absent = await createAuth(${JSON.stringify({ ...f.config, stateDir: join(f.dir, 'absent') })}, () => 1800000000000);
       const provision = await provisionOwner({authRoot:${JSON.stringify(f.dir)}, invitationPath:${JSON.stringify(join(f.dir, 'invitation'))}});
-      console.log(JSON.stringify({status:auth.status(), provision})); await auth.close();`;
+      console.log(JSON.stringify({systemRoot:process.env.SystemRoot ?? null, status:auth.status(), absent:absent.status(), provision}));
+      await auth.close(); await absent.close();`;
     // Real on every OS: without SystemRoot the win32 primitive cannot resolve its tools (P1), an
-    // environment failure that must refuse as storage_unavailable and create nothing.
-    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'systemroot'));
+    // environment failure that must refuse as storage_unavailable and create nothing — also when
+    // the state directory does not exist yet (status must not invite provisioning).
     const before = await readdir(f.dir);
-    const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', env });
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8' });
     assert.equal(result.status, 0, result.stderr);
     const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.systemRoot, null);
     assert.deepEqual(parsed.status, { state: 'setup_required', reason: 'storage_unavailable' });
+    assert.deepEqual(parsed.absent, { state: 'setup_required', reason: 'storage_unavailable' });
     assert.deepEqual(parsed.provision, { state: 'unavailable', reason: 'storage_unavailable' });
     assert.deepEqual(await readdir(f.dir), before);
   } finally { await f.cleanup(); }
