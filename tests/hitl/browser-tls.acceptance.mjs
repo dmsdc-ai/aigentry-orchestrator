@@ -14,6 +14,7 @@ import {
   renderLoginBoundary, renderReloadDeepLink, setConsoleStage, unconfiguredRefusal,
   validateConsoleArtifacts,
 } from './console-ui.acceptance.mjs';
+import { COPY_ENV, COPY_PINS, verifyCopy, verifyLoaded } from '../../scripts/ci/acceptance-playwright-core.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const CONTRACT = '997c94212339070d54442dae7187f8f955d016bfc2dc93877794d7895843fd57';
@@ -87,6 +88,53 @@ let displayName = null, cookieFile = null;
 function browserEnv(home) {
   check(typeof displayName === 'string' && typeof cookieFile === 'string');
   return { ...childEnv(home), DISPLAY: displayName, XAUTHORITY: cookieFile };
+}
+// #1177 Which playwright-core drives the browser. Playwright's own page setup sends
+// `Emulation.setFocusEmulationEnabled {enabled:true}` to every main frame (crPage.js:412, gated by
+// no public option), which keeps a background tab `visible`; probe run 36323626280 measured that
+// and measured the one-line enabled:false copy hiding it. In CI the acceptance therefore loads ONLY
+// that copy, from the one RUNNER_TEMP path `COPY_ENV` names, after re-verifying every pin itself;
+// a missing variable or any mismatch is a named preflight refusal, never an unpatched run.
+// Outside CI, without the variable, today's npm-installed library is used and said to be unverified.
+let focusLibrary = { source: 'not-resolved', dir: null };
+const inCI = () => process.env.CI === 'true' || process.env.GITHUB_ACTIONS === 'true';
+const LOCAL_FOCUS_NOTICE = 'browser-tls acceptance: notice (focus-library=npm-installed visibility=unverified-local)'
+  + ` lifecycle-window hidden/visible checks are NOT verified outside CI: Playwright focus emulation stays on`
+  + ` and only a CI run with ${COPY_ENV} set verifies them\n`;
+/** Closed reason only: a fault reason name or `unexpected`, never a path or driver text. */
+function refuseFocusLibrary(error) {
+  const reason = typeof error === 'string' ? error : error && typeof error.reason === 'string' ? error.reason : 'unexpected';
+  process.stderr.write(`browser-tls acceptance: preflight (focus-library=refused reason=${/^[a-z-]+$/.test(reason) ? reason : 'unexpected'})\n`);
+  throw new Error('focus_library_unverified');
+}
+async function loadChromium() {
+  const dir = process.env[COPY_ENV];
+  if (!dir) {
+    if (inCI()) refuseFocusLibrary('env-unset');
+    focusLibrary = { source: 'npm-installed', dir: null };
+    return (await import('playwright')).chromium;
+  }
+  try { verifyCopy(ROOT, process.env.RUNNER_TEMP, dir); } catch (error) { refuseFocusLibrary(error); }
+  await safeAncestors(dir);
+  const { chromium } = await import(pathToFileURL(join(dir, 'index.mjs')).href);
+  // Importing the copy loads its crPage.js; nothing may have loaded another one first.
+  try { verifyLoaded(dir); } catch (error) { refuseFocusLibrary(error); }
+  focusLibrary = { source: 'runner-temp-copy', dir };
+  // Pinned constants only, already re-verified above; no path or environment value is printed.
+  process.stderr.write(`browser-tls acceptance: preflight (focus-library=runner-temp-copy tree=${COPY_PINS.copyTree}`
+    + ` crpage=${COPY_PINS.crPagePatched} own-frame-focus=enabled-false)\n`);
+  return chromium;
+}
+/** Re-read from disk at the gate and again after the run: the copy is still the pinned tree and
+ *  is still the only crPage.js this process has loaded. Refuses in CI on anything else. */
+function focusGate() {
+  if (focusLibrary.source === 'runner-temp-copy') {
+    try { verifyCopy(ROOT, process.env.RUNNER_TEMP, focusLibrary.dir); verifyLoaded(focusLibrary.dir); }
+    catch (error) { refuseFocusLibrary(error); }
+    return;
+  }
+  if (inCI()) refuseFocusLibrary('lifecycle-unverified');
+  process.stderr.write(LOCAL_FOCUS_NOTICE);
 }
 function child(command, args, home = temporary) {
   check(!stopping);
@@ -870,6 +918,8 @@ async function consoleCounterfactual({ context, cdp, authenticatorId, page, stat
 }
 async function main() {
   current = 'runner';
+  // Said first, before the runner checks below can stop a local run.
+  if (!inCI() && !process.env[COPY_ENV]) process.stderr.write(LOCAL_FOCUS_NOTICE);
   check(process.platform === 'linux' && process.getuid() !== 0 && process.version.startsWith('v20.'));
   check(process.env.CI === 'true' && process.env.GITHUB_ACTIONS === 'true');
   check(process.env.GITHUB_JOB === 'browser-tls' && /^\d+$/.test(process.env.GITHUB_RUN_ID ?? '') && /^\d+$/.test(process.env.GITHUB_RUN_ATTEMPT ?? ''));
@@ -906,7 +956,7 @@ async function main() {
   const manifest = JSON.parse(await readFile(join(ROOT, 'node_modules/playwright-core/browsers.json')));
   const pinned = manifest.browsers.find(item => item.name === 'chromium');
   check(pinned.revision === '1208' && pinned.browserVersion === VERSION);
-  const { chromium } = await import('playwright');
+  const chromium = await loadChromium();
   const executableHash = await fileHash(chromium.executablePath());
   done('runner');
   const certs = await certificates();
@@ -1017,7 +1067,7 @@ async function main() {
   // above keeps running against the unchanged legacy composition it was written for.
   const consoleDeps = { check, done, exactKeys, bounded, delay, remember, request, fetchPage, headers,
     cleanDOM, sessionCookie, privateDir, privateFile, safeAncestors, fileHash, identity, toolHashes,
-    child, terminate, chromium, certs, context, VERSION, origin: `https://localhost:${CONSOLE_PORT}`,
+    child, terminate, chromium, certs, context, VERSION, focusGate, origin: `https://localhost:${CONSOLE_PORT}`,
     page: null, state: null, fixtures: null, artifacts: null, binding: null };
   await unconfiguredRefusal(consoleDeps, page, 18789);
   // One CLI at a time over the shared auth root; the legacy listener is retired first.
@@ -1058,11 +1108,15 @@ async function main() {
   await cleanDOM(page, state); done('no-execution');
   await cdp.send('WebAuthn.removeVirtualAuthenticator', { authenticatorId });
   await closeBrowser(context);
+  // Again after the run: the library every control above ran on is still the pinned copy.
+  focusGate();
+  check(focusLibrary.source === 'runner-temp-copy');
   // The evidence digest includes only bounded observations, never raw browser data.
   return { schemaVersion: 1, status: 'pass', skipped: 0, started, finished: '', assertions: 0,
     candidate: head, hashes, runner: { node: process.version, openssl, nss, hashes: await toolHashes(), image: process.env.ImageOS, imageVersion: process.env.ImageVersion,
       run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, job: 'browser-tls' },
-    browser: { playwright: '1.58.2', version: VERSION, revision: '1208', executableHash },
+    browser: { playwright: '1.58.2', version: VERSION, revision: '1208', executableHash,
+      playwrightCore: { source: focusLibrary.source, tree: COPY_PINS.copyTree, crPage: COPY_PINS.crPagePatched } },
     certificates: Object.fromEntries(['trusted', 'untrusted', 'wrong-san'].map(name => [name, certs[name].fingerprint])),
     console: consoleEvidence, controls: {}, observations, evidenceDigest: '' };
 }
@@ -1110,8 +1164,16 @@ async function validate(receipt) {
     && /^[\d.]+[a-z]?$/.test(receipt.runner.openssl) && /^[\w.+:~-]+$/.test(receipt.runner.nss));
   const tools = await toolHashes(); exactKeys(receipt.runner.hashes, Object.keys(tools));
   check(Object.entries(tools).every(([key, value]) => receipt.runner.hashes[key] === value));
-  exactKeys(receipt.browser, ['playwright', 'version', 'revision', 'executableHash']);
+  exactKeys(receipt.browser, ['playwright', 'version', 'revision', 'executableHash', 'playwrightCore']);
   check(receipt.browser.playwright === '1.58.2' && receipt.browser.version === VERSION && receipt.browser.revision === '1208');
+  // The run drove the pinned private copy, and that copy is still on disk exactly as pinned.
+  exactKeys(receipt.browser.playwrightCore, ['source', 'tree', 'crPage']);
+  check(receipt.browser.playwrightCore.source === 'runner-temp-copy' && receipt.browser.playwrightCore.tree === COPY_PINS.copyTree
+    && receipt.browser.playwrightCore.crPage === COPY_PINS.crPagePatched);
+  let onDisk = null;
+  try { onDisk = verifyCopy(ROOT, process.env.RUNNER_TEMP, process.env[COPY_ENV]).tree; }
+  catch (error) { refuseFocusLibrary(error); }
+  check(onDisk === receipt.browser.playwrightCore.tree);
   const { chromium } = await import('playwright');
   check(receipt.browser.executableHash === await fileHash(chromium.executablePath()));
   exactKeys(receipt.certificates, ['trusted', 'untrusted', 'wrong-san']);
