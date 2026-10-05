@@ -150,7 +150,7 @@ function stable(f: Fixture, bytes: Buffer, ino: number, active: Buffer) {
 
 test('native platform receipt, real snapshot/check-dedup/absent and retired no-op observe', t => {
   t.diagnostic(`native Python ${identity.stdout.trim()}; node=${process.version}; registry=${registry}; sha256=${createHash('sha256').update(readFileSync(registry)).digest('hex')}`);
-  t.diagnostic(windows ? 'native Windows U1; durable writes must be refused' : 'native POSIX only; Windows branches require native Windows CI');
+  t.diagnostic(windows ? 'native Windows; durable writes proceed at file-fsync-only (P3)' : 'native POSIX only; Windows branches require native Windows CI');
   const f = fixture(t), before = f.bytes();
   const snapshot = f.run(['snapshot']);
   assert.equal(snapshot.status, 0, snapshot.stderr);
@@ -232,19 +232,46 @@ for (const corrupt of ['malformed', 'schema', 'duplicate'] as const) {
 }
 
 if (windows) {
-  for (const operation of ['begin', 'lifecycle', 'migrate-new-backup', 'migrate-existing-backup']) {
-    test(`native Windows ${operation} refuses before temp/generation/backup mutation`, t => {
+  // P3: file fsync + NTFS-journaled rename is the supported Windows level, so writes proceed.
+  test('native Windows mutation and dedup preserve status 0/7/8, generation and unknown outcome', t => {
+    const f = fixture(t, []);
+    resultIs(f.run(begin), 0, 'proceed');
+    const lockIno = statSync(f.lock).ino;
+    resultIs(f.run(begin), 7, 'DISPATCH_RETRY_HELD');
+    assert.equal(f.run(['set-transport-result', '--sid', 'lock-fixture', '--result', 'write_observed']).status, 0);
+    resultIs(f.run(begin), 8, 'DISPATCH_DEDUPLICATED');
+    resultIs(f.run(['check-dedup', '--sid', 'lock-fixture', '--ref-hash', 'fixture-hash']), 8, 'deduplicated');
+    assert.equal(f.doc().generation, 16);
+    assert.equal(f.doc().dispatches.length, 1);
+    assert.equal(statSync(f.lock).ino, lockIno);
+    assert.equal(statSync(f.lock).size, 0);
+    assert.deepEqual(f.doc().dispatches[0].outcome, { state: 'unknown', reported_value: null, basis: null });
+    f.noTemps();
+  });
+  for (const operation of ['migrate-new-backup', 'migrate-existing-backup']) {
+    test(`native Windows ${operation} writes the legacy backup and one new generation`, t => {
       const f = fixture(t), backup = `${f.active}.legacy-v1.bak`;
-      const migration = operation.startsWith('migrate');
-      if (migration) writeFileSync(f.active, JSON.stringify([{ sid: 'legacy-fixture' }]));
+      writeFileSync(f.active, JSON.stringify([{ sid: 'legacy-fixture' }]));
       if (operation.endsWith('existing-backup')) writeFileSync(backup, 'preserve-backup');
-      const before = f.bytes(), priorBackup = existsSync(backup) ? readFileSync(backup) : null;
-      const args = migration ? ['migrate'] : operation === 'begin' ? begin
-        : ['set-lifecycle', '--sid', 'lock-fixture', '--state', 're_dispatched'];
-      const payload = resultIs(f.run(args), 9, 'registry_write_failed');
-      assert.equal(payload.detail, 'native Windows directory durability unavailable; registry write refused');
+      const legacy = f.bytes();
+      const result = f.run(['migrate']);
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+      assert.equal(result.stderr, '');
+      assert.equal(JSON.parse(result.stdout).result, 'migrated');
+      assert.deepEqual(readFileSync(backup), legacy);
+      assert.equal(f.doc().generation, 1);
+      assert.equal(f.doc().dispatches[0].assigned.sid, 'legacy-fixture');
+      f.noTemps();
+    });
+  }
+  // dir_fsync has no Windows boundary; it moves to the rename/replace step it follows.
+  for (const fault of ['temp_write', 'fsync', 'rename', 'dir_fsync', 'lock']) {
+    const boundary = fault === 'dir_fsync' ? 'rename' : fault;
+    test(`native Windows ${fault} failure (boundary ${boundary}) retains a complete generation and no false success`, t => {
+      const f = fixture(t), before = f.bytes();
+      resultIs(f.run(['set-lifecycle', '--sid', 'lock-fixture', '--state', 're_dispatched'],
+        { AIGENTRY_REGISTRY_FAULT: boundary }), 9, boundary === 'lock' ? 'registry_unavailable' : 'registry_write_failed');
       assert.deepEqual(f.bytes(), before);
-      assert.deepEqual(existsSync(backup) ? readFileSync(backup) : null, priorBackup);
       f.noTemps();
     });
   }
@@ -316,7 +343,7 @@ else:
     r.fcntl=types.SimpleNamespace(LOCK_EX=4,LOCK_NB=8,LOCK_UN=2,
         flock=lambda f,kind: locking(f.fileno(),2 if kind == 2 else 1,1))
 if mode in ('dedup-unlock','retry-unlock','proceed-unlock'):
-    # Isolate output ordering from U1's unconditional Windows write refusal.
+    # Isolate output ordering from the real commit.
     # No durable-write acceptance is inferred from this mocked commit.
     r.commit=lambda doc: events.append(['mock_commit'])
 args=json.loads(sys.argv[3])

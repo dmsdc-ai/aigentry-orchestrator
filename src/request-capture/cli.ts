@@ -22,7 +22,11 @@ export async function runCaptureHook(args: string[]): Promise<number> {
       chunks.push(chunk);
     }
     const receipt = await captureSubmittedPrompt(Buffer.concat(chunks), { root });
-    if (receipt.durability !== "file-and-directory-fsync") {
+    // win32 has no directory fsync: file fsync plus the NTFS-journaled rename is its
+    // supported level, stated as file-fsync-only. POSIX still requires both.
+    const supported = receipt.durability === "file-and-directory-fsync"
+      || (process.platform === "win32" && receipt.durability === "file-fsync-only");
+    if (!supported) {
       reason = "Capture blocked: full file and directory durability is unavailable on this platform.";
     }
   } catch {

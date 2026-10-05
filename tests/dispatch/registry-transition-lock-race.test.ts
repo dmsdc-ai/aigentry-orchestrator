@@ -40,8 +40,6 @@ const python = pythonExecutable();
 
 const ARTIFACTS = ['active.db', 'active.db-journal', 'active.db-wal', 'active.db-shm',
   'active.json.source', 'active.json.pre-sqlite.bak', 'active.json.barrier.tmp'] as const;
-// Native Windows keeps refusing durable writes; that control is pinned, never waived.
-const WINDOWS_WRITE_REFUSAL = 'native Windows directory durability unavailable; registry write refused';
 const NOW = '2026-10-04T00:00:00Z';
 const LEGACY = [{ sid: 'live-worker', status: 'in_flight', ref_hash: 'hash-live' }];
 
@@ -233,8 +231,7 @@ function payloadOf(stdout: string): Record<string, unknown> | null {
 function raw(t: TestContext, label: string, run: Run) {
   t.diagnostic(`RAW ${JSON.stringify({ label, status: run.status, signal: run.signal, stdout: run.stdout, stderr: run.stderr })}`);
 }
-// A guard refusal must name the transition state. A generic exit 9 (e.g. the native Windows
-// durability refusal an unguarded subject already returns) is not evidence of the guard.
+// A guard refusal must name the transition state. A generic exit 9 is not evidence of the guard.
 function identifiesTransition(detail: unknown): boolean {
   return typeof detail === 'string' && (/transition/i.test(detail) || ARTIFACTS.some(name => detail.includes(name)));
 }
@@ -256,13 +253,8 @@ function refusal(run: Run, receipt: Receipt, activeBefore: string, activeAfter: 
 }
 const REFUSED = { status: 9, product_stderr: '', completion_fact: null, result: 'registry_unavailable',
   detail_identifies_transition: true, active_json_unchanged: true, state_unchanged: true, lock_released: true };
-function windowsWriteRefused(run: Run, f: Fixture, activeBefore: string) {
-  const payload = payloadOf(run.stdout);
-  assert.deepEqual({ status: run.status, result: payload?.result, detail: payload?.detail,
-    completion_fact: payload?.completion_fact, active: f.snapshot() },
-  { status: 9, result: 'registry_write_failed', detail: WINDOWS_WRITE_REFUSAL, completion_fact: null, active: activeBefore });
-}
 
+// `posix` checks hold on Windows too: writes proceed there at file-fsync-only (P3).
 interface Mutator { name: string; start: Start; args: string[]; posix: (f: Fixture, run: Run) => void }
 const MUTATORS: Mutator[] = [
   { name: 'begin-delivery (absent active.json)', start: 'absent',
@@ -326,8 +318,6 @@ for (const mutator of MUTATORS) {
       if (artifact !== null) {
         assert.deepEqual(refusal(run, receipt, activeBefore, f.snapshot(), treeBefore, stateTree(f)), REFUSED,
           `${mutator.name}: ${run.stdout}`);
-      } else if (windows) {
-        windowsWriteRefused(run, f, activeBefore);
       } else {
         assert.equal(run.status, 0, run.stdout + run.stderr);
         assert.equal(productStderr(run.stderr), '');
@@ -373,7 +363,6 @@ for (const kind of ['eacces', 'eio'] as const) {
 for (const op of FAULT_OPS.slice(0, 2)) {
   test(`instrumented control: FileNotFoundError on reserved names keeps legacy behavior: ${op.name}`, t => {
     const f = fixture(t, op.start);
-    const activeBefore = f.snapshot();
     const run = faultRun(t, f, 'fault-enoent', op.args);
     const receipt = receiptOf(run.stderr);
     t.diagnostic(`artifact_probes=${JSON.stringify(receipt.artifact_probes)}`);
@@ -382,8 +371,6 @@ for (const op of FAULT_OPS.slice(0, 2)) {
     if (op.args[0] === 'snapshot') {
       assert.equal(run.status, 0, run.stdout);
       assert.equal(JSON.parse(run.stdout).generation, 12);
-    } else if (windows) {
-      windowsWriteRefused(run, f, activeBefore);
     } else {
       assert.equal(run.status, 0, run.stdout);
       assert.equal(payloadOf(run.stdout)?.result, 'proceed');

@@ -475,7 +475,13 @@ for (const name of ['unlink', 'link', 'rename']) {
     return result;
   };
 }
-if (mode === 'weak-durability') Object.defineProperty(process, 'platform', { value: 'win32' });
+if (mode === 'weak-durability') {
+  // Only the receipt writer sees win32 (so it records file-fsync-only); the hook still
+  // decides on the real POSIX platform.
+  const real = process.platform;
+  Object.defineProperty(process, 'platform', {
+    get: () => /request-capture\/receipt\.js:/.test(new Error().stack ?? '') ? 'win32' : real });
+}
 if (mode === 'stdin-error') {
   process.stdin._read = function() {
     send('fault'); this.destroy(new Error('RAW_SECRET_1166 ' + root));
@@ -537,19 +543,20 @@ function assertClean(inventory: Inventory, code?: number | null): void {
   assert.equal(inventory.complete, !WIN32, WIN32 ? 'win32 never claims complete (ACLs unverified)' : 'clean POSIX observation is complete');
   if (code !== undefined) assert.equal(code, CLEAN_EXIT, JSON.stringify(inventory));
 }
-// The real hook as a fixture writer. POSIX: allowed. win32: per receipt.ts/cli.ts the hook blocks
-// after a durable file-fsync-only receipt (blocked yet captured).
+// The real hook as a fixture writer: allowed on every OS. win32 records file-fsync-only, its
+// supported durability level (P3).
 function captured(result: Exit): void {
-  if (!WIN32) { allowed(result); return; }
-  assert.equal(result.code, 2, JSON.stringify(result));
-  assert.equal((JSON.parse(result.stdout) as { decision: string }).decision, 'block');
+  allowed(result);
 }
 // POSIX mode negative controls: win32 does not verify modes/ACLs, so only "never complete" holds there.
 const POSIX_MODE_CONTROLS = new Set(['mode-0644', 'blob-mode-0644', 'root-mode-0755']);
 
 // ===================================================== baseline reproduction
 
-const BLOCKED_WITH_RECEIPT = ['directory-fsync', 'lock-release', 'stdout-error', 'weak-durability'] as const;
+// win32 has no post-rename directory fsync boundary, and file-fsync-only is its supported level
+// (P3), so only lock-release and stdout-error block there with a receipt left behind.
+const BLOCKED_WITH_RECEIPT = WIN32 ? ['lock-release', 'stdout-error'] as const
+  : ['directory-fsync', 'lock-release', 'stdout-error', 'weak-durability'] as const;
 
 for (const mode of BLOCKED_WITH_RECEIPT) {
   test(`baseline repro: hook blocks (${mode}) yet a durable v1 receipt exists with no outcome field`, async t => {
