@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { spawn, spawnSync } from 'node:child_process';
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -239,7 +240,7 @@ if (process.platform === 'win32') test('named-pipe context_ref is never opened a
 
 // Registered on POSIX alone: on windows-latest (elevated administrator) an applied `icacls /deny
 // <user>:(RD)` did not make readFile reject (measured), so no permission-only state is unreadable for
-// that token without privilege manipulation (P2). The win32 counterpart below locks the record instead.
+// that token without privilege manipulation (P2). The win32 counterpart below refuses the record's open instead.
 if (process.platform !== 'win32') test('unreadable record produces a warning when native permissions are enforced', async t => {
   const root = await fixture(t);
   const file = await put(root, record());
@@ -251,34 +252,33 @@ if (process.platform !== 'win32') test('unreadable record produces a warning whe
   await corrupt(root);
 });
 
-if (process.platform === 'win32') test('unreadable record produces a warning while the file is exclusively locked', { timeout: 90000 }, async t => {
+// win32: the elevated windows-latest token (backup privilege) read through both a deny ACL and a share-None lock (measured), so the open is refused at the fs boundary.
+if (process.platform === 'win32') test('unreadable record produces a warning when its open is refused', async t => {
   const root = await fixture(t);
   const file = await put(root, record());
-  // A helper process holds the record with share mode None, so every other open fails with a sharing
-  // violation for every token (backup privilege included). .NET calls only; the path travels as base64.
-  const script = `$f=[IO.File]::Open([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(file).toString('base64')}')),'Open','Read','None');`
-    + "[Console]::Out.WriteLine('ready');[Console]::Out.Flush();[void][Console]::In.ReadLine();$f.Dispose()";
-  const helper = spawn(join(process.env.SystemRoot ?? '', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
-    ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, stdio: 'pipe' });
-  let out = '', err = '';
-  helper.stdout.setEncoding('utf8').on('data', (chunk: string) => { out += chunk; });
-  helper.stderr.setEncoding('utf8').on('data', (chunk: string) => { err += chunk; });
-  const exited = new Promise<string>(resolve => { helper.once('error', e => resolve(`error ${e.message}`)); helper.once('close', (code, sig) => resolve(`exit ${code} ${sig}`)); });
-  const bounded = <T>(work: Promise<T>, ms: number, late: T) => {
-    let timer: NodeJS.Timeout | undefined;
-    return Promise.race([work, new Promise<T>(resolve => { timer = setTimeout(resolve, ms, late); })]).finally(() => clearTimeout(timer));
-  };
+  const other = record('other');
+  await put(root, other);
+  // read-model.ts imports `open` by name: patch the builtin and syncBuiltinESMExports() so that binding sees it.
+  const fsp = createRequire(import.meta.url)('node:fs/promises') as Record<string, unknown>;
+  const original = fsp['open'] as (...a: any[]) => Promise<unknown>;
+  let refused = 0;
   try {
-    const ready = await bounded(Promise.race([new Promise<boolean>(resolve => helper.stdout.on('data', () => { if (out.includes('ready')) resolve(true); })), exited.then(() => out.includes('ready'))]), 30000, false);
-    assert.ok(ready, `helper did not report ready: out=${JSON.stringify(out)} err=${JSON.stringify(err)} exitCode=${helper.exitCode}`);
-    const code = await readFile(file).then(() => 'read succeeded', (error: NodeJS.ErrnoException) => error.code);
-    assert.ok(['EBUSY', 'EPERM', 'EACCES'].includes(code ?? ''), `precondition failed: readFile of the record held with share mode None did not reject (${code})`);
-    await corrupt(root);
-    helper.stdin.end();
-    assert.equal(await bounded(exited, 15000, 'timeout'), 'exit 0 null', `helper did not exit cleanly: err=${JSON.stringify(err)}`);
-    assert.throws(() => process.kill(helper.pid!, 0), (error: NodeJS.ErrnoException) => error.code === 'ESRCH');
-    assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), record());
-  } finally { if (helper.exitCode === null && helper.signalCode === null) { helper.kill(); await bounded(exited, 15000, 'timeout'); } }
+    fsp['open'] = function (this: unknown, ...a: any[]) {
+      if (String(a[0]) !== file) return original.apply(this, a);
+      refused += 1;
+      return Promise.reject(Object.assign(new Error(`EACCES: permission denied, open '${file}'`), { code: 'EACCES' }));
+    };
+    syncBuiltinESMExports();
+    await assert.rejects(open(file), (error: NodeJS.ErrnoException) => error.code === 'EACCES');
+    const page = await readRequests(root, 'pending', 100);
+    assert.deepEqual(page.items.map(row => row.id), [other.id]);
+    assert.deepEqual(page.warnings, ['record_corrupt_or_unavailable']);
+    assert.equal(page.nextCursor, null);
+    assert.equal(refused, 2);
+  } finally {
+    fsp['open'] = original;
+    syncBuiltinESMExports();
+  }
 });
 
 test('source/evidence bytes, metadata and directory entries remain unchanged', async t => {
