@@ -25,7 +25,12 @@ export const COPY_PINS = Object.freeze({
   chromiumVersion: PINS.chromiumVersion,
   crPage: PINS.crPage,
   crPagePatched: PINS.crPagePatched,
-  packageLock: PINS.packageLock,
+  // The lock's bytes also carry package metadata (version, os), so only its two Playwright entries
+  // are pinned; its whole-file hash is recorded at prepare and must be unchanged after the run.
+  lockPlaywright: Object.freeze({ version: '1.58.2',
+    integrity: 'sha512-vA30H8Nvkq/cPBnNw4Q8TWz1EJyqgpuinBcHET0YVJVFldr8JDNiU9LaWAE1KqSkRYazuaBhTpB5ZzShOezQ6A==' }),
+  lockPlaywrightCore: Object.freeze({ version: '1.58.2',
+    integrity: 'sha512-yZkEtftgwS8CsfYo7nm0KE8jsvm6i/PTgVtB8DL726wNf6H2IMsDuxCpJj59KDaxCtSnrWan2AeDqM7JBaultg==' }),
   // Measured by the probe's `prepare` in run 36323626280 from an `npm ci` of this same lock.
   installedTree: '573107a29408eed8a6be52c0dc9f2c2455ba8240cedae8a942fa744ef75dc686',
   installedFiles: 363,
@@ -69,7 +74,12 @@ function requirePins(dir, reason) {
 
 /** The untouched npm-ci original: exact version and exact tree, so an upgrade fails here. */
 export function verifyInstalled(paths) {
-  if (sha256(readFileSync(paths.packageLock)) !== COPY_PINS.packageLock) fault('package-lock-hash');
+  let entries;
+  try { entries = JSON.parse(readFileSync(paths.packageLock, 'utf8')).packages; } catch { fault('package-lock-entry'); }
+  for (const [name, pin] of [['playwright', COPY_PINS.lockPlaywright], ['playwright-core', COPY_PINS.lockPlaywrightCore]]) {
+    const entry = (entries || {})[`node_modules/${name}`] || {};
+    if (entry.version !== pin.version || entry.integrity !== pin.integrity) fault('package-lock-entry');
+  }
   requireRealDir(paths.installed, 'installed-missing');
   requirePins(paths.installed, 'installed-version');
   const map = treeMap(paths.installed);
@@ -102,6 +112,7 @@ export function verifyLoaded(dir) {
 
 export function prepare(paths) {
   const packageJson = sha256(readFileSync(paths.packageJson));
+  const packageLock = sha256(readFileSync(paths.packageLock));
   const before = verifyInstalled(paths);
   const patched = patchCrPage(readFileSync(join(paths.installed, CRPAGE_REL), 'utf8'));
   // A pre-existing state directory belongs to somebody else: refuse it rather than reuse it.
@@ -117,11 +128,14 @@ export function prepare(paths) {
   if (treeDigest(copied) !== COPY_PINS.copyTree) fault('copy-tree-hash');
   // The installed original is re-read after the copy was written: nothing touched it.
   if (treeDigest(treeMap(paths.installed)) !== COPY_PINS.installedTree) fault('installed-changed');
-  const state = { packageJson, packageLock: COPY_PINS.packageLock, installedTree: COPY_PINS.installedTree,
+  const state = { packageJson, packageLock, installedTree: COPY_PINS.installedTree,
     copyTree: COPY_PINS.copyTree, crPage: COPY_PINS.crPage, crPagePatched: COPY_PINS.crPagePatched };
   writeFileSync(paths.stateFile, JSON.stringify(state, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
   note(`prepare (playwright-core=${COPY_PINS.playwright} chromium=${COPY_PINS.chromiumVersion}/r${COPY_PINS.chromiumRevision}`
-    + ` package-json=${packageJson} package-lock=${COPY_PINS.packageLock} installed-tree=${COPY_PINS.installedTree}`
+    + ` package-json=${packageJson} package-lock=${packageLock}`
+    + ` lock-playwright=${COPY_PINS.lockPlaywright.version}/${COPY_PINS.lockPlaywright.integrity}`
+    + ` lock-playwright-core=${COPY_PINS.lockPlaywrightCore.version}/${COPY_PINS.lockPlaywrightCore.integrity}`
+    + ` installed-tree=${COPY_PINS.installedTree}`
     + ` installed-files=${before.size} copy-tree=${COPY_PINS.copyTree} copy-diff=${CRPAGE_REL}`
     + ` crpage=${COPY_PINS.crPage} crpage-patched=${COPY_PINS.crPagePatched} notices=${LICENSE_FILES.length})`);
   return state;
