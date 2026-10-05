@@ -73,6 +73,8 @@ const MANIFEST = [
   // same reason the lib does: a control workspace runs the reconciler/cleanup path, and
   // once those are TypeScript they reach the workspace host only through this file.
   "bin/wh-cli.sh",
+  // #1172: declared worker-input stage/verify/test helper; dispatch's --input-* triple calls verify.
+  "bin/worker-inputs.mjs",
 
   // ---- Doctrine. Owner-confirmed 2026-08-15 (§9.2): the full set ships.
   "AGENTS.md",

@@ -389,6 +389,10 @@ interface Opts {
   observe: string[];
   /** #1148: the validated decision of a fresh confined claude/codex spawn. */
   decision?: SpawnDecision;
+  /** #1172: optional declared-input snapshot triple; all three or none. */
+  inputRoot: string;
+  inputManifest: string;
+  inputSha256: string;
 }
 
 function parseArgs(argv: string[]): Opts {
@@ -414,6 +418,9 @@ function parseArgs(argv: string[]): Opts {
     noTaskReason: "",
     retryUnknown: "",
     observe: [],
+    inputRoot: "",
+    inputManifest: "",
+    inputSha256: "",
   };
   let i = 0;
   // `shift 2` on a value flag reads $2 even when absent; bash's `set -u` makes
@@ -446,6 +453,9 @@ function parseArgs(argv: string[]): Opts {
       case "--verify-delivered": o.verifyDelivered = true; i += 1; break;
       case "--no-verify-started": o.verifyStarted = false; i += 1; break;
       case "--keep-alive": o.keepAlive = true; i += 1; break;
+      case "--input-root": o.inputRoot = val(a); i += 2; break;
+      case "--input-manifest": o.inputManifest = val(a); i += 2; break;
+      case "--input-sha256": o.inputSha256 = val(a); i += 2; break;
       case "--observe":
         if (o.observe.length >= 4) {
           process.stderr.write("dispatch.sh: --observe may be given at most 4 times\n");
@@ -625,6 +635,27 @@ function resolveSpawnDecision(o: Opts, sid: string): void {
   // The legacy route fields now name what the argv carries, not a literal default.
   o.route.model = o.decision.model ?? "omitted";
   if (o.route.decided_by === "explicit") o.route.label = o.route.model;
+}
+
+// ── #1172 declared worker inputs ────────────────────────────────────────────
+// Caller wiring only: the package's own bin/worker-inputs.mjs verifies the
+// snapshot before anything else in main() can have an effect. A point-in-time
+// check of declared files, not a sandbox permission or a lock.
+const WORKER_INPUTS = fileURLToPath(new URL("../../../bin/worker-inputs.mjs", import.meta.url));
+
+function verifyWorkerInputs(o: Opts): void {
+  const given = [o.inputRoot, o.inputManifest, o.inputSha256].filter((v) => v !== "").length;
+  if (given === 0) return;
+  if (given !== 3) die("dispatch.sh: --input-root, --input-manifest and --input-sha256 are all-or-none", 4);
+  const r = spawnSync(process.execPath, [WORKER_INPUTS, "verify", "--root", o.inputRoot,
+    "--manifest", o.inputManifest, "--sha256", o.inputSha256], {
+    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], shell: false, timeout: 120000, killSignal: "SIGKILL",
+    maxBuffer: 1024 * 1024,
+  });
+  if (r.error || r.status !== 0) {
+    const detail = (r.stderr || "").split("\n")[0] || `helper exit ${r.status ?? r.signal ?? "none"}`;
+    die(`dispatch.sh: WORKER_INPUTS_UNVERIFIED: ${printable(detail)}; nothing was dispatched`, 4);
+  }
 }
 
 /** requested / selected / observed, kept apart, for telemetry and the task ledger. */
@@ -1173,6 +1204,7 @@ async function main(argv: string[]): Promise<never> {
     die(`dispatch.sh: ref file not found: ${o.refFile}`, 4);
   }
 
+  verifyWorkerInputs(o);
   taskGateCheck(o);
 
   let sid: string;

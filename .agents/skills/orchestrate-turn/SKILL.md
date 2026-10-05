@@ -68,6 +68,19 @@ Fresh dispatches use the model router by default; explicit `--cli` overrides it.
 
 ## Step 2 — Spawn via the terminal adaptor + inject context
 
+For a staged source/test handoff, use `bin/worker-inputs.mjs stage` with an
+explicit file/hash/mode plan, then `verify` with the returned manifest hash
+before dispatch. See `docs/setup/dispatch-capacity.md` for the command forms.
+Check the chosen tests' fixtures, package/init assets and hooks in that plan;
+`declared-inputs-only` does not certify dependency completeness. A failed
+preflight stops that handoff: never invent replacement fixtures. With a dispatch
+version that supports it, pass the complete `--input-root`, `--input-manifest`
+and `--input-sha256` triple; otherwise run local verify explicitly before the
+existing protected dispatch helper, without replacing its security gates.
+Pin the retest file list in the ref. Expand it only for a concrete dependency or
+failure with the required inputs staged; do not repeat an unchanged full suite
+on a partial snapshot. This does not remove or waive full release CI.
+
 Apply Rule 12/12-1 from `docs/rules.md`: clear reused implementation sessions. The
 2026-10-04 approved first-instruction exception requires evidence of a new process,
 no resumed history, an empty conversation and exact task/sid/attempt confinement.
@@ -132,6 +145,11 @@ This preserves spawn-capability gating (only the orchestrator delegates/spawns; 
 ---
 
 ## Step 3 — Collect the REPORT (push-primary + pull-fallback)
+
+If no scoped report client is available, state that in the ref: preserve the
+report and mark `TRANSPORT_BLOCKED` for authenticated controller recovery.
+Do not try alternate global/dependency telepty binaries or daemon startup to
+deliver it. Evidence recovery is not worker push, delivery acceptance or ACK.
 
 Rule 49 (2026-09-12): all inter-session message delivery must use telepty. Durable
 report files preserve evidence and retry payloads; manual file reads are not

@@ -48,6 +48,14 @@ export const USAGE = `# dispatch.sh — Wraps \`telepty inject\` with REPL-ready
 #   --observe <file>  (at most 4) operator negative observation, e.g. a recorded
 #                     launch failure; read for this dispatch only, never stored.
 #
+# Declared worker inputs (#1172), optional, all three or none (else exit 4):
+#   --input-root DIR --input-manifest FILE --input-sha256 HASH
+#   runs \`bin/worker-inputs.mjs verify\` on a snapshot made by its \`stage\` command
+#   before routing, spawn, inject or any ledger/tracker write; a failed verify
+#   exits 4 (WORKER_INPUTS_UNVERIFIED) with nothing dispatched. It checks the
+#   declared files only, at that moment; it grants and restricts nothing.
+#   Omitted, dispatch behaves exactly as before. See docs/setup/dispatch-capacity.md.
+#
 # Registration wait (#727): a freshly spawned worker needs tens of seconds to
 #   appear in \`telepty list\` (workspace boot → CLI boot → bridge registration).
 #   The spawn path polls every 5s up to AIGENTRY_DISPATCH_REGISTER_TIMEOUT_MS

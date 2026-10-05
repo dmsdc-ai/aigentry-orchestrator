@@ -47,6 +47,8 @@ sourceTestFiles.push('tests/dispatch/fake-cmux-win32.inert.test.mjs');
 sourceTestFiles.push('tests/packaging/preservation.test.mjs', 'tests/packaging/preservation-directories.test.mjs');
 // #1172 — workflow policy regression reads staged docs/package metadata with Node built-ins only; every OS.
 sourceTestFiles.push('tests/packaging/workflow-policy.test.mjs');
+// #1172 — worker-inputs helper + dispatch input-preflight regression; Node built-ins, every OS (Windows proof owed to CI).
+sourceTestFiles.push('tests/dispatch/worker-inputs.test.mjs');
 // Native capture fixtures require POSIX ownership/modes and the boot wizard suite drives an
 // owned POSIX PTY; Windows support is still absent for both.
 if (process.platform === 'darwin' || process.platform === 'linux') {

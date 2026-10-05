@@ -140,3 +140,28 @@ Specifically, `AIGENTRY_CLI_CAP_<CLI>`:
 - carries **no implicit ceiling to fall back on**. If you want a limit, set
   one — unset means unlimited as far as dispatch is concerned, and the host is
   then the only thing bounding concurrency.
+
+## Declared worker inputs (#1172)
+
+`bin/worker-inputs.mjs` stages the exact files a worker or a bounded retest
+needs from an explicit plan (`{"version":1,"files":[{path,sha256,mode}],
+"tests":[...]}`), so a missing input fails at staging instead of minutes into
+a test run. Run it locally with `node`; `--help` documents the schema:
+
+```bash
+node bin/worker-inputs.mjs stage  --source REPO --plan plan.json --dest SNAP   # SNAP must not exist
+node bin/worker-inputs.mjs verify --root SNAP/repo --manifest SNAP/manifest.json --sha256 <manifestSha256>
+node bin/worker-inputs.mjs test   --root SNAP/repo --manifest SNAP/manifest.json --sha256 <manifestSha256>
+```
+
+`test` runs only the plan's listed `.test.mjs`/`.test.js` files with
+`node --test` and exits with their status — never the whole suite, never a
+retry, and nothing is compiled. Passing the same triple to dispatch as
+`--input-root/--input-manifest/--input-sha256` verifies the snapshot before any
+routing or spawn. Coverage is `declared-inputs-only`: a hand-written plan does
+not prove it lists every dependency, and a verify is a point-in-time check,
+not a lock or a permission. Symlinks are refused for the snapshot/source root
+itself and for every directory and file inside it; the root's host ancestors
+(for example macOS `/var` -> `/private/var`) resolve normally and are not
+confined by this check. On Windows the snapshot's read-only POSIX modes are
+not observable, so the mode check reports `skipped-win32`.
