@@ -62,7 +62,8 @@ const finding = (uri = 'src/feature.js') => ({ ruleId: 'javascript/HardcodedSecr
   properties: { priorityScore: 550, priorityScoreFactors: [{ label: true, type: 'hotFileSource' }], isAutofixable: false } });
 
 function fixture(t) {
-  const root = realpathSync(mkdtempSync(path.join(tmpdir(), 'release-evidence-')));
+  // .native expands win32 8.3 names (tmpdir is C:\Users\RUNNER~1\... on CI); the gate refuses a root Git spells differently.
+  const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'release-evidence-')));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const dir = path.join(root, 'repo');
   const inputs = path.join(root, 'inputs');
