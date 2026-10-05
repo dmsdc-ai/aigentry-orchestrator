@@ -78,8 +78,19 @@ function refused(r, what) {
   assert.ok(!all.includes(SECRET_ENV), `${what}: error output leaked environment`);
 }
 
-const PASS_TEST = "import test from 'node:test';\n" +
-  "test('fixture pass', () => { console.log('FIXTURE_RAN cwd=' + process.cwd()); });\n";
+// The child reports its cwd hex-encoded: reporters escape path text (TAP turns `\` into `\\`), so a
+// formatted Windows path never matches by substring. Hex of the native realpath survives any reporter
+// and is compared exactly, never as a substring.
+const CWD_PROBE = "Buffer.from(realpathSync.native(process.cwd())).toString('hex')";
+const PASS_TEST = "import test from 'node:test';\nimport { realpathSync } from 'node:fs';\n" +
+  `test('fixture pass', () => { console.log('FIXTURE_RAN cwd_hex=' + ${CWD_PROBE}); });\n`;
+
+/** Exactly one structured cwd observation from the child, equal to the native realpath of `root`. */
+function assertRanAt(output, root) {
+  const seen = [...output.matchAll(/FIXTURE_RAN cwd_hex=([0-9a-f]+)/g)].map((m) => m[1]);
+  assert.equal(seen.length, 1, `expected exactly one cwd observation, got ${seen.length}`);
+  assert.equal(Buffer.from(seen[0], 'hex').toString('utf8'), realpathSync.native(root), 'test cwd is not the snapshot root');
+}
 const OTHER_TEST = "import test from 'node:test';\n" +
   "test('undeclared', () => { console.log('UNDECLARED_RAN'); throw new Error('undeclared test must not run'); });\n";
 
@@ -515,9 +526,26 @@ describe('test', () => {
     ok(r, 'test');
     const all = r.stdout + r.stderr;
     assert.ok(all.includes('FIXTURE_RAN'), 'declared test did not run (inherited stdio expected)');
-    assert.ok(all.includes(`cwd=${realpathSync(out.root)}`) || all.includes(`cwd=${out.root}`), 'test cwd is not the snapshot root');
+    assertRanAt(all, out.root);
     assert.ok(!all.includes('UNDECLARED_RAN'), 'a listed-but-undeclared test file ran');
     assert.deepEqual(snapshotTree(dest), before, 'test mutated the snapshot');
+  });
+
+  test('the cwd observation rejects a declared test that ran away from the snapshot root', () => {
+    const wrong = "import test from 'node:test';\nimport { realpathSync } from 'node:fs';\n" +
+      `test('fixture wrong cwd', () => { process.chdir('..'); console.log('FIXTURE_RAN cwd_hex=' + ${CWD_PROBE}); });\n`;
+    const { triple, out } = staged('wrongcwd', { tests: ['tests/wrong.test.mjs'], files: {
+      'tests/wrong.test.mjs': { body: wrong, mode: 0o644 },
+    } });
+    const r = helper(['test', ...triple]);
+    ok(r, 'test');
+    const all = r.stdout + r.stderr;
+    assert.throws(() => assertRanAt(all, out.root), /test cwd is not the snapshot root/);
+    // The observation itself is exact: it names the directory the child actually moved to.
+    assertRanAt(all, dirname(out.root));
+    // Absent or repeated observations are never accepted.
+    assert.throws(() => assertRanAt(all.replaceAll('FIXTURE_RAN', 'FIXTURE_GONE'), out.root), /exactly one cwd observation/);
+    assert.throws(() => assertRanAt(all + all, dirname(out.root)), /exactly one cwd observation/);
   });
 
   test('preserves a failing test status', () => {
