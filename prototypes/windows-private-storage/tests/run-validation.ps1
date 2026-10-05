@@ -285,8 +285,10 @@ function Format-PspVerdictOpDiag { param([string]$ReadStatus, [string]$Text)
         rbstate = 'test:test bindOk:cnt bindStale:cnt bindUnmeasured:cnt nullAbsentAefa:cnt nullAbsentNoAefa:cnt nullPresent:cnt nullUnknown:cnt absentAbsentAefa:cnt absentAbsentNoAefa:cnt absentPresent:cnt absentUnknown:cnt presentAbsentAefa:cnt presentAbsentNoAefa:cnt presentPresent:cnt presentUnknown:cnt unknownAbsentAefa:cnt unknownAbsentNoAefa:cnt unknownPresent:cnt unknownUnknown:cnt aefaMasks:hist aefaMasksOther:cnt matchAefa:cnt matchUnknown:cnt'
         streamjoin = 'test:test aclRows:cnt hlRows:cnt joinMatch:cnt joinDiff:cnt joinUnproved:cnt uManifest:cnt uStreamRow:cnt uHostRow:cnt uOpen:cnt uIdentity:cnt uSddl:cnt uBracket:cnt uReadback:cnt'
         hlprobe = 'test:test rows:cnt streamBothOk:cnt streamFfnErr:cnt streamPlainErr:cnt streamUnknown:cnt nonAclBothOk:cnt nonAclFfnErr:cnt nonAclPlainErr:cnt nonAclUnknown:cnt otherBothOk:cnt otherFfnErr:cnt otherPlainErr:cnt otherUnknown:cnt unknownBothOk:cnt unknownFfnErr:cnt unknownPlainErr:cnt unknownUnknown:cnt plainErrs:hist plainErrsOther:cnt plainUnknown:cnt ffnErrs:hist ffnErrsOther:cnt ffnUnknown:cnt'
+        rbctrl = 'test:test rows:cnt uStale:cnt uUnmeasured:cnt uOracle:cnt uGetacl:cnt matched:cnt xor:cnt ctrlXor:hist ctrlXorOther:cnt'
+        aceraw = 'test:test rows:cnt bindOk:cnt bindStale:cnt bindUnmeasured:cnt eqTrue:cnt eqFalse:cnt eqUnknown:cnt neTrue:cnt neFalse:cnt neUnknown:cnt unknownTrue:cnt unknownFalse:cnt unknownUnknown:cnt neCount:cnt uNoBinary:cnt uOracleSddl:cnt uGetAclDacl:cnt uOracleDacl:cnt uEmpty:cnt uBounds:cnt uError:cnt uInvalid:cnt'
       }
-      $keyed = @('priv', 'launch', 'bind', 'helper', 'readback', 'rbdiff', 'rbsplit', 'linkacl', 'rbcause', 'rbstate', 'streamjoin', 'hlprobe')
+      $keyed = @('priv', 'launch', 'bind', 'helper', 'readback', 'rbdiff', 'rbsplit', 'linkacl', 'rbcause', 'rbstate', 'streamjoin', 'hlprobe', 'rbctrl', 'aceraw')
       $seen = @{}
       foreach ($raw in $lines) {
         $l = $raw.TrimEnd([char]13)

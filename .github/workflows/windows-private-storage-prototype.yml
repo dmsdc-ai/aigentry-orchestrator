@@ -73,11 +73,11 @@ jobs:
             if [ "${ACTUAL}" = "$1" ]; then echo "pin ok ${ACTUAL} $2"; else echo "::error::$2 sha256 ${ACTUAL} does not match pin $1"; FAIL=1; fi
           }
           # independent harness (tester-owned)
-          check 839ba8894968776c4cd3661e8e702ba030e0dbf7f5a540a7197f61c428a4fb24 prototypes/windows-private-storage/tests/acl.test.mjs
+          check 4e29cd117499a0115f6a4bb03e9b3e309f362598a8808d120953cfc186ed46f4 prototypes/windows-private-storage/tests/acl.test.mjs
           check e08a0373bf33f0f10052dd76977055287e8c88b573219a338e64f2b71fc99dd1 prototypes/windows-private-storage/tests/wrapper.test.mjs
-          check 19a10f53bc681dfe41c45b8ae1c44f5fdcb75de947ec37f447fee31280aa5a86 prototypes/windows-private-storage/tests/setup-fixtures.ps1
+          check 2811ca4174da3471ccad829d5515b60ccddc10ce53b6a534b6929eb8d2f8be14 prototypes/windows-private-storage/tests/setup-fixtures.ps1
           check 944dfdd13f176eed9df0340db45a81a7d83e68308667ee7bc4980b10956fb751 prototypes/windows-private-storage/tests/run-as-user.ps1
-          check df569559925678ef6b20e8826220f841674d5b07ab8be60337ee9e526b5eb58b prototypes/windows-private-storage/tests/run-validation.ps1
+          check bc44b257f4cd2e2212380be5ef328eccbda84f543788a569ebaae727b1bc603f prototypes/windows-private-storage/tests/run-validation.ps1
           # baseline that must stay byte-identical (release 148d3b67 staged inputs)
           check 51343c903455905eb96d22f3c6111493dc24e11fa651718e66ea792dfacb5a30 src/hitl/web/auth.ts
           check 14e8bed19324f0b23ebb0abdd4dea3248c6b5ecdeed783fe7c0414237dc37feb src/hitl/web/auth-port.ts
@@ -89,7 +89,7 @@ jobs:
           check 0e91544eeadb6d426ba8ef2258fd278caae17ae4f23731a2700ddce23f5eae3c prototypes/windows-private-storage/native/private_storage.c
           check c9f6af2a1da16746b2383a317fa5b958d4a018220e63ff2df93ce7fda1900f19 prototypes/windows-private-storage/native/build.ps1
           check ${PSP_WRAPPER_SHA256} prototypes/windows-private-storage/private-storage.mjs
-          check b6ac2c588e147e7d1f403f12bde7f83dbe84c78b86f4206a5ff3f15633aa5a17 prototypes/windows-private-storage/README.md
+          check 304f801266c6019f53705d659595f40b4356ab734ab806f164010b1a845082de prototypes/windows-private-storage/README.md
           echo "recorded $(sha256sum -b < .github/workflows/windows-private-storage-prototype.yml | cut -d" " -f1) .github/workflows/windows-private-storage-prototype.yml"
           [ "${FAIL}" = "0" ] || exit 1
 
@@ -221,11 +221,11 @@ jobs:
             if [ "${ACTUAL}" = "$1" ]; then echo "pin ok ${ACTUAL} $2"; else echo "::error::$2 sha256 ${ACTUAL} does not match pin $1"; FAIL=1; fi
           }
           # independent harness (tester-owned)
-          check 839ba8894968776c4cd3661e8e702ba030e0dbf7f5a540a7197f61c428a4fb24 prototypes/windows-private-storage/tests/acl.test.mjs
+          check 4e29cd117499a0115f6a4bb03e9b3e309f362598a8808d120953cfc186ed46f4 prototypes/windows-private-storage/tests/acl.test.mjs
           check e08a0373bf33f0f10052dd76977055287e8c88b573219a338e64f2b71fc99dd1 prototypes/windows-private-storage/tests/wrapper.test.mjs
-          check 19a10f53bc681dfe41c45b8ae1c44f5fdcb75de947ec37f447fee31280aa5a86 prototypes/windows-private-storage/tests/setup-fixtures.ps1
+          check 2811ca4174da3471ccad829d5515b60ccddc10ce53b6a534b6929eb8d2f8be14 prototypes/windows-private-storage/tests/setup-fixtures.ps1
           check 944dfdd13f176eed9df0340db45a81a7d83e68308667ee7bc4980b10956fb751 prototypes/windows-private-storage/tests/run-as-user.ps1
-          check df569559925678ef6b20e8826220f841674d5b07ab8be60337ee9e526b5eb58b prototypes/windows-private-storage/tests/run-validation.ps1
+          check bc44b257f4cd2e2212380be5ef328eccbda84f543788a569ebaae727b1bc603f prototypes/windows-private-storage/tests/run-validation.ps1
           # baseline that must stay byte-identical (release 148d3b67 staged inputs)
           check 51343c903455905eb96d22f3c6111493dc24e11fa651718e66ea792dfacb5a30 src/hitl/web/auth.ts
           check 14e8bed19324f0b23ebb0abdd4dea3248c6b5ecdeed783fe7c0414237dc37feb src/hitl/web/auth-port.ts
@@ -237,7 +237,7 @@ jobs:
           check 0e91544eeadb6d426ba8ef2258fd278caae17ae4f23731a2700ddce23f5eae3c prototypes/windows-private-storage/native/private_storage.c
           check c9f6af2a1da16746b2383a317fa5b958d4a018220e63ff2df93ce7fda1900f19 prototypes/windows-private-storage/native/build.ps1
           check ${PSP_WRAPPER_SHA256} prototypes/windows-private-storage/private-storage.mjs
-          check b6ac2c588e147e7d1f403f12bde7f83dbe84c78b86f4206a5ff3f15633aa5a17 prototypes/windows-private-storage/README.md
+          check 304f801266c6019f53705d659595f40b4356ab734ab806f164010b1a845082de prototypes/windows-private-storage/README.md
           echo "recorded $(sha256sum -b < .github/workflows/windows-private-storage-prototype.yml | cut -d" " -f1) .github/workflows/windows-private-storage-prototype.yml"
           [ "${FAIL}" = "0" ] || exit 1
 
@@ -253,6 +253,20 @@ jobs:
           ACTUAL="$(sha256sum -b < "${NODE_EXE}" | cut -d" " -f1)"
           [ "${ACTUAL}" = "${PSP_NODE_EXE_SHA256}" ] || { echo "::error::node.exe sha256 ${ACTUAL} != pin"; exit 1; }
           echo "node ok ${ACTUAL} ${NODE_EXE}"
+
+      # Tester-owned in-memory probe of the exact RawSecurityDescriptor / RawAcl.Item / GenericAce.GetBinaryForm / ControlFlags /
+      # AreAccessRulesCanonical APIs the rbctrl/aceraw diagnostics use (fake in-memory descriptors only; no path, ACL, account or
+      # privilege). Runs before any fake account exists; a pin mismatch, an unsupported API or any failed case fails the job.
+      - name: RawAcl API probe (in-memory descriptors only)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PSModulePath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
+          $f = Join-Path $env:GITHUB_WORKSPACE 'prototypes\windows-private-storage\tests\rawacl-api.selftest.ps1'
+          $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLowerInvariant()
+          if ($h -cne '8ecfe847158d8cb4a52bf163f5cb9ad797b91a608e11175c4389cefb10f18bdf') { Write-Output "::error::rawacl-api.selftest.ps1 sha256 $h does not match pin"; exit 1 }
+          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $f
+          exit $LASTEXITCODE
 
       # Pure-Node oracle selfcheck (synthetic inputs only; no native, no helper, no fake accounts). Fail-closed.
       - name: Oracle selfcheck (pure Node only)
@@ -306,7 +320,7 @@ jobs:
           $env:PSModulePath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
           $f = Join-Path $env:GITHUB_WORKSPACE 'prototypes\windows-private-storage\tests\live-process-results.selftest.ps1'
           $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLowerInvariant()
-          if ($h -cne '556d5154f5cd7a3f61fcb04a4735a2179b2931a500cfed96d4ba382bf6d39737') { Write-Output "::error::live-process-results.selftest.ps1 sha256 $h does not match pin"; exit 1 }
+          if ($h -cne '4dc18dedafb0e7fcafe0e6ddc3c7ae4256377b021b0d9ea9be65348cb79b1dc4') { Write-Output "::error::live-process-results.selftest.ps1 sha256 $h does not match pin"; exit 1 }
           & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $f
           exit $LASTEXITCODE
 

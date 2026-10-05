@@ -292,6 +292,26 @@ Mapping these to auth.ts reasons (`storage_unsafe`, `storage_unavailable`,
     `FindFirstFileNameW` (bounded buffer, no retry). Only the numeric codes are
     kept, by rbcause class. This is a test-harness P/Invoke, not a runtime API.
     No fsutil cause is inferred.
+  - rbctrl: the flagMissing rows. Oracle `sdControl` comes from
+    `GetSecurityDescriptorControl` on the same SD that Take reads, before its
+    `LocalFree`. Get-Acl `getAclCtrl` is `[int]` of `ControlFlags` on that row's
+    existing `$raw`, built from `GetSecurityDescriptorBinaryForm`. Only
+    bracket-`matching` rows with both values valid integers 0..65535 are XORed,
+    over every bit with no mask. The output is matched / xor plus a histogram of
+    the nonzero XOR values; anything else falls into the first unknown category.
+    No expected bit is assumed.
+  - aceraw: the aceOrder rows. The ordered binary forms of `$raw`'s DACL ACEs
+    are compared with those of a `RawSecurityDescriptor` parsed from the same
+    Take's oracle sddl: the count, then every byte at every index.
+    NULL/absent/empty DACLs, a missing oracle sddl, more than 64 ACEs, a DACL
+    over 65536 bytes or an exception give unknown, with a closed reason. These
+    rows are crossed with `AreAccessRulesCanonical` (true/false/unknown).
+  - Timing for both: read after `GetSecurityDescriptorBinaryForm` and
+    `GetAccessRules`, and before the bracket Take. Each value is in its own
+    try, so no old field and no gate can change. Get-Acl is never repeated.
+    This compares two renderings for ORDER only. It is not storage or semantic
+    proof, and `rawEq` alone is not proof of a rendering bug. Framework 4.x
+    canonicalization behaviour is not assumed.
   - The selftest operand lines are synthetic vectors, not observations. Every
     value is unmeasured until an independent fake-CI run.
 - **Status.** Actual CI 37243865183 on bff4f7a: 139 pass / 10 fail. Four link

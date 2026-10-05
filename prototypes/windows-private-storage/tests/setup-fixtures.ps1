@@ -27,6 +27,9 @@ namespace Psp1167 {
     // DIAGNOSTIC only (rbstate): GetSecurityDescriptorDacl on the same handle's SD. daclValid false = unknown (never false/zero);
     // daclNull is set only when the DACL is present (the pointer is undefined otherwise).
     public bool daclValid; public int daclError; public bool? daclPresent; public bool? daclNull; public bool? daclDefaulted;
+    // DIAGNOSTIC only (rbctrl): GetSecurityDescriptorControl (WORD control) on the same SD, before its LocalFree. sdControlValid
+    // false = unknown (sdControl stays null, never 0); a failure here never changes sddl, sddlError or any dacl* field.
+    public bool sdControlValid; public int sdControlError; public int? sdControl;
   }
 
   // DIAGNOSTIC only (hlProbe): numeric OS results of one plain open and one FindFirstFileNameW; *Valid false = unknown.
@@ -82,6 +85,8 @@ namespace Psp1167 {
     static extern bool ConvertStringSidToSidW(string s, out IntPtr sid);
     [DllImport("advapi32.dll", SetLastError = true)]
     static extern bool GetSecurityDescriptorDacl(IntPtr sd, out bool present, out IntPtr dacl, out bool defaulted);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool GetSecurityDescriptorControl(IntPtr sd, out ushort control, out uint revision);
     [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     static extern uint SetNamedSecurityInfoW(string name, int type, uint info, IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl);
     [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr p);
@@ -316,6 +321,9 @@ namespace Psp1167 {
             bool dp, dd; IntPtr dl;
             if (GetSecurityDescriptorDacl(sd, out dp, out dl, out dd)) { s.daclPresent = dp; if (dp) s.daclNull = (dl == IntPtr.Zero); s.daclDefaulted = dd; s.daclValid = true; }
             else { s.daclError = Marshal.GetLastWin32Error(); }
+            ushort sc; uint sr;
+            if (GetSecurityDescriptorControl(sd, out sc, out sr)) { s.sdControl = sc; s.sdControlValid = true; }
+            else { s.sdControlError = Marshal.GetLastWin32Error(); }
           } finally { LocalFree(sd); }
         }
         if (s.infoError == 0 && !s.isDir && !s.isReparse) {
@@ -825,6 +833,7 @@ function Get-PspSnapshot { param([string[]]$Paths, [string]$AncestorFloor, [swit
       # DIAGNOSTIC only (rbstate), separate from getAclSddl/getAclError above: binary DACL flags and the AEFA rule of the same
       # Get-Acl object. Recorded only when every step succeeded (getAclBinValid); an exception records its type name only.
       $o['getAclBinValid'] = $false; $o['getAclBinError'] = $null
+      $raw = $null
       if ($null -ne $a) {
         try {
           $raw = [System.Security.AccessControl.RawSecurityDescriptor]::new([byte[]]$a.GetSecurityDescriptorBinaryForm(), 0)
@@ -837,6 +846,54 @@ function Get-PspSnapshot { param([string[]]$Paths, [string]$AncestorFloor, [swit
           $o['getAclDaclPresent'] = $dp; $o['getAclDaclNull'] = $dn; $o['getAclRuleCount'] = $rules.Count; $o['getAclAefa'] = $aefa; $o['getAclAefaMask'] = $mask
           $o['getAclBinValid'] = $true
         } catch { $o['getAclBinError'] = $_.Exception.GetType().Name }
+      }
+      # DIAGNOSTIC only (rbctrl / aceraw), each in its own try, after the block above (so after GetSecurityDescriptorBinaryForm and
+      # GetAccessRules) and before the bracket Take; none of it touches getAclSddl/getAclError/getAclBin* or the gate. Sources: the
+      # same Get-Acl object $a and the $raw this row built from its binary form (reset above, so a row whose binary form failed
+      # never reuses another row's $raw); Get-Acl is not repeated and the oracle SDDL never stands in for it. getAclCtrl = numeric
+      # $raw.ControlFlags; getAclCanonical = $a.AreAccessRulesCanonical (bool or unknown). aceRaw*: the ordered binary forms of
+      # the $raw DACL ACEs vs those of a RawSecurityDescriptor parsed from this row's own Take sddl, count and every byte at every
+      # index. A NULL/absent/empty DACL on either side, a missing oracle sddl, more than 64 ACEs or a DACL over 65536 bytes, or
+      # an exception is unknown (aceRawEq null, closed aceRawUnknown reason); never clipped or vacuous equality. Counts and one
+      # boolean only: no SID or ACE text is kept. An order diagnostic of two renderings, not storage or semantic proof.
+      $o['getAclCtrlValid'] = $false; $o['getAclCtrl'] = $null; $o['getAclCtrlError'] = $null
+      if ($null -ne $raw) {
+        try { $ctl = [int]$raw.ControlFlags; $o['getAclCtrl'] = $ctl; $o['getAclCtrlValid'] = $true } catch { $o['getAclCtrlError'] = $_.Exception.GetType().Name }
+      }
+      $o['getAclCanonical'] = $null; $o['getAclCanonicalError'] = $null
+      if ($null -ne $a) {
+        try { $can = $a.AreAccessRulesCanonical; if ($can -is [bool]) { $o['getAclCanonical'] = $can } } catch { $o['getAclCanonicalError'] = $_.Exception.GetType().Name }
+      }
+      $o['aceRawEq'] = $null; $o['aceRawCountValid'] = $false; $o['aceRawGetAclCount'] = $null; $o['aceRawOracleCount'] = $null
+      $o['aceRawUnknown'] = 'noBinary'; $o['aceRawError'] = $null
+      if ($null -ne $raw) {
+        try {
+          $why = $null
+          if (($s.sddlError -ne 0) -or ($null -eq $s.sddl)) { $why = 'oracleSddl' }
+          else {
+            $ga = $raw.DiscretionaryAcl
+            $oa = ([System.Security.AccessControl.RawSecurityDescriptor]::new([string]$s.sddl)).DiscretionaryAcl
+            if ($null -eq $ga) { $why = 'getAclDacl' }
+            elseif ($null -eq $oa) { $why = 'oracleDacl' }
+            elseif (($ga.Count -gt 64) -or ($oa.Count -gt 64) -or ($ga.BinaryLength -gt 65536) -or ($oa.BinaryLength -gt 65536)) { $why = 'bounds' }
+            elseif (($ga.Count -eq 0) -or ($oa.Count -eq 0)) { $why = 'empty' }
+            else {
+              $eq = ($ga.Count -eq $oa.Count)
+              for ($i = 0; $eq -and ($i -lt $ga.Count); $i++) {
+                $ax = $ga.Item($i); $ay = $oa.Item($i)
+                if ($ax.BinaryLength -ne $ay.BinaryLength) { $eq = $false; break }
+                $bx = [byte[]]::new($ax.BinaryLength); $ax.GetBinaryForm($bx, 0)
+                $by = [byte[]]::new($ay.BinaryLength); $ay.GetBinaryForm($by, 0)
+                for ($j = 0; $j -lt $bx.Length; $j++) { if ($bx[$j] -ne $by[$j]) { $eq = $false; break } }
+              }
+              $o['aceRawGetAclCount'] = $ga.Count; $o['aceRawOracleCount'] = $oa.Count; $o['aceRawCountValid'] = $true; $o['aceRawEq'] = [bool]$eq
+            }
+          }
+          $o['aceRawUnknown'] = $why
+        } catch {
+          $o['aceRawEq'] = $null; $o['aceRawCountValid'] = $false; $o['aceRawGetAclCount'] = $null; $o['aceRawOracleCount'] = $null
+          $o['aceRawUnknown'] = 'error'; $o['aceRawError'] = $_.Exception.GetType().Name
+        }
       }
       # DIAGNOSTIC only: a second Take after Get-Acl. matching = both reads measured and volumeSerial/fileIndex/sddl/isReparse/open
       # status equal; stale = a measured difference; unmeasured = a field missing on either read or the read threw. Endpoint

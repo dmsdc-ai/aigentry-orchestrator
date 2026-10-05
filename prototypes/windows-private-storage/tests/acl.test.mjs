@@ -912,6 +912,70 @@ export function hardlinkProbeOperands(test, objects, manifest) {
     ['ffnErrs', opHistFmt(fe)], ['ffnErrsOther', opCount(fe.other)], ['ffnUnknown', opCount(ffnUnknown)]]);
 }
 
+// rbctrl / aceraw, DIAGNOSTIC only: pure readers of the fields Get-PspSnapshot records for them (sdControl* from the Take SD;
+// getAclCtrl* / getAclCanonical / aceRaw* from the same Get-Acl object). Same rules as rbstate: counts only, nothing here feeds
+// readbackFindings or any other line, and a missing, non-boolean or out-of-range input is unknown, never a match.
+// rbctrl: the rbsplit flagMissing rows (the rbstate selection); first unknown wins: bracket stale > bracket not matching
+// (unmeasured or missing) > oracle (sdControlValid not true, or sdControl not an integer 0..65535) > getacl (the same for
+// getAclCtrlValid / getAclCtrl). A measured row is matched (XOR 0) or xor (XOR over every bit nonzero, no mask); ctrlXor =
+// the nonzero XOR values (at most 4 plus other). No bit is assumed to be the expected difference.
+const ctrlWord = (valid, v) => valid === true && Number.isInteger(v) && v >= 0 && v <= 65535;
+export function readbackCtrlOperands(test, objects) {
+  const n = { rows: 0, uStale: 0, uUnmeasured: 0, uOracle: 0, uGetacl: 0, matched: 0, xor: 0 };
+  const xh = opHist();
+  for (const o of asArray(objects)) {
+    if (!o || o.openError !== 0 || typeof o.getAclSddl !== 'string' || o.getAclSddl === o.sddl || o.isReparse) continue;
+    if (!sddlDiffSplit(o.getAclSddl, o.sddl).includes('flagMissing')) continue;
+    n.rows++;
+    if (o.getAclBracket === 'stale') n.uStale++;
+    else if (o.getAclBracket !== 'matching') n.uUnmeasured++;
+    else if (!ctrlWord(o.sdControlValid, o.sdControl)) n.uOracle++;
+    else if (!ctrlWord(o.getAclCtrlValid, o.getAclCtrl)) n.uGetacl++;
+    else {
+      const x = (o.sdControl ^ o.getAclCtrl) >>> 0;
+      if (x === 0) n.matched++; else { n.xor++; opHistBump(xh, x); }
+    }
+  }
+  return opLine('rbctrl', [['test', opEnum(test, ['contradict', 'unproved'])], ...Object.entries(n).map(([k, v]) => [k, opCount(v)]),
+    ['ctrlXor', opHistFmt(xh)], ['ctrlXorOther', opCount(xh.other)]]);
+}
+
+// aceraw: the rbsplit aceOrder rows (non-reparse Get-Acl diffs whose sddlDiffSplit has an orderDenyRel* kind, the rows rbdiff
+// counts as aceOrder), by bracket (matching = ok; stale; anything else unmeasured). Only bind=ok rows enter raw {eq, ne,
+// unknown} x canonical {true, false, unknown} (getAclCanonical strictly boolean, else unknown). raw eq / ne needs aceRawEq
+// strictly boolean, aceRawCountValid true, both counts integers 1..64 and aceRawUnknown null; eq also needs equal counts.
+// neCount = the ne rows whose ACE counts differ. A raw unknown is counted by its recorded closed reason when the record is
+// consistent (aceRawEq null, aceRawCountValid false), otherwise uInvalid. rawEq alone is not proof of a rendering cause.
+export const OP_ACERAW_UNKNOWN = Object.freeze(['noBinary', 'oracleSddl', 'getAclDacl', 'oracleDacl', 'empty', 'bounds', 'error']);
+export function aceRawOperands(test, objects) {
+  const b = { rows: 0, bindOk: 0, bindStale: 0, bindUnmeasured: 0 };
+  const cell = Object.fromEntries(['eq', 'ne', 'unknown'].flatMap((r) => ['True', 'False', 'Unknown'].map((c) => [`${r}${c}`, 0])));
+  const u = Object.fromEntries([...OP_ACERAW_UNKNOWN, 'invalid'].map((k) => [`u${cap(k)}`, 0]));
+  let neCount = 0;
+  const cnt = (v) => Number.isInteger(v) && v >= 1 && v <= 64;
+  for (const o of asArray(objects)) {
+    if (!o || o.openError !== 0 || typeof o.getAclSddl !== 'string' || o.getAclSddl === o.sddl || o.isReparse) continue;
+    if (!sddlDiffSplit(o.getAclSddl, o.sddl).some((k) => k.startsWith('orderDenyRel'))) continue;
+    b.rows++;
+    const bind = o.getAclBracket === 'matching' ? 'Ok' : (o.getAclBracket === 'stale' ? 'Stale' : 'Unmeasured');
+    b[`bind${bind}`]++;
+    if (bind !== 'Ok') continue;
+    const measured = isBool(o.aceRawEq) && o.aceRawCountValid === true && cnt(o.aceRawGetAclCount) && cnt(o.aceRawOracleCount) && o.aceRawUnknown === null
+      && (o.aceRawEq === false || o.aceRawGetAclCount === o.aceRawOracleCount);
+    let r = 'unknown';
+    if (measured) {
+      r = o.aceRawEq ? 'eq' : 'ne';
+      if (r === 'ne' && o.aceRawGetAclCount !== o.aceRawOracleCount) neCount++;
+    } else {
+      const k = o.aceRawEq === null && o.aceRawCountValid === false && OP_ACERAW_UNKNOWN.includes(o.aceRawUnknown) ? o.aceRawUnknown : 'invalid';
+      u[`u${cap(k)}`]++;
+    }
+    cell[`${r}${o.getAclCanonical === true ? 'True' : (o.getAclCanonical === false ? 'False' : 'Unknown')}`]++;
+  }
+  return opLine('aceraw', [['test', opEnum(test, ['contradict', 'unproved'])], ...Object.entries(b).map(([k, v]) => [k, opCount(v)]),
+    ...Object.entries(cell).map(([k, v]) => [k, opCount(v)]), ['neCount', opCount(neCount)], ...Object.entries(u).map(([k, v]) => [k, opCount(v)])]);
+}
+
 // F1 observation, DIAGNOSTIC only, for the four link cases: does the S0 oracle SDDL of the relevant link object (the leaf
 // link, or the junction ancestor for *_UNDER_JUNCTION) carry an allow ACE for A's own SID whose generic-mapped mask covers
 // what the helper opens it with: leaf READ_CONTROL|FILE_READ_ATTRIBUTES (private_storage.c:819), ancestor
@@ -1296,7 +1360,9 @@ if (PHASE === 'selfcheck') {
   // Diagnostic-only fields added by Get-PspSnapshot; stripping them must leave readbackFindings byte-identical.
   const DIAG_FIELDS = ['daclValid', 'daclError', 'daclPresent', 'daclNull', 'daclDefaulted', 'getAclBinValid', 'getAclBinError', 'getAclDaclPresent',
     'getAclDaclNull', 'getAclRuleCount', 'getAclAefa', 'getAclAefaMask', 'getAclBracket', 'getAclBracketError', 'hlProbeValid', 'hlProbeError',
-    'hlPlainOpenValid', 'hlPlainOpenErr', 'hlFfnValid', 'hlFfnErr'];
+    'hlPlainOpenValid', 'hlPlainOpenErr', 'hlFfnValid', 'hlFfnErr', 'sdControlValid', 'sdControlError', 'sdControl', 'getAclCtrlValid', 'getAclCtrl',
+    'getAclCtrlError', 'getAclCanonical', 'getAclCanonicalError', 'aceRawEq', 'aceRawCountValid', 'aceRawGetAclCount', 'aceRawOracleCount', 'aceRawUnknown',
+    'aceRawError'];
   const strip = (objs) => objs.map((o) => Object.fromEntries(Object.entries(o).filter(([k]) => !DIAG_FIELDS.includes(k))));
   const omit = (o, k) => { const x = { ...o }; delete x[k]; return x; };
   const hasOwn = (o, f) => Object.prototype.hasOwnProperty.call(o, f);
@@ -1430,6 +1496,127 @@ if (PHASE === 'selfcheck') {
     const objs = bad.map((e) => hp({ hlPlainOpenErr: e, hlFfnErr: e }));
     assert.deepEqual(readbackFindings(objs), readbackFindings(strip(objs)), 'readbackFindings unaffected');
     assert.deepEqual(readbackOperands('unproved', {}, objs), readbackOperands('unproved', {}, strip(objs)), 'readbackOperands unaffected');
+  });
+
+  // rbctrl / aceraw fields only (a subset of DIAG_FIELDS): stripping just these must leave every pre-existing line unchanged.
+  const CTRL_ACE_FIELDS = DIAG_FIELDS.slice(DIAG_FIELDS.indexOf('sdControlValid'));
+  const stripNew = (objs) => objs.map((o) => Object.fromEntries(Object.entries(o).filter(([k]) => !CTRL_ACE_FIELDS.includes(k))));
+  const frozen = (objs) => objs.map((o) => Object.freeze({ ...o }));
+  const O6 = `O:${A}G:${A}`; const NULL6 = `${O6}D:NO_ACCESS_CONTROL`;
+  const ctl = (x = {}) => ({ path: 'C:\\fx\\secret', openError: 0, isDir: true, isReparse: false, sddl: NULL6, getAclSddl: O6, fsutilReparseExit: 1,
+    getAclBracket: 'matching', sdControlValid: true, sdControlError: 0, sdControl: 0x8014, getAclCtrlValid: true, getAclCtrl: 0x8010, getAclCtrlError: null, ...x });
+  const ORD_G = `${O6}D:P(A;;FA;;;${A})(A;;FR;;;BA)`; const ORD_O = `${O6}D:P(A;;FR;;;BA)(A;;FA;;;${A})`;
+  const ace = (x = {}) => ({ path: 'C:\\fx\\alt.bin', openError: 0, isDir: false, isReparse: false, nLinks: 1, sddl: ORD_O, getAclSddl: ORD_G, fsutilReparseExit: 1,
+    fsutilHardlinkExit: 0, fsutilHardlinks: ['x'], getAclBracket: 'matching', aceRawEq: true, aceRawCountValid: true, aceRawGetAclCount: 2, aceRawOracleCount: 2,
+    aceRawUnknown: null, aceRawError: null, getAclCanonical: true, ...x });
+  const rawU = (why, x = {}) => ace({ aceRawEq: null, aceRawCountValid: false, aceRawGetAclCount: null, aceRawOracleCount: null, aceRawUnknown: why, ...x });
+
+  test('selfcheck: rbctrl XORs every control bit of bracket-matching flagMissing rows; stale/unmeasured/invalid/out-of-range is unknown, no XOR assumed', () => {
+    const objs = frozen([
+      ctl(), ctl({ getAclCtrl: 0x8014 }), ctl({ getAclCtrl: 0x8410 }), ctl({ getAclBracket: 'stale' }), omit(ctl(), 'getAclBracket'), ctl({ getAclBracket: 'unmeasured' }),
+      ctl({ sdControlValid: false, sdControl: null, sdControlError: 87 }), omit(ctl(), 'sdControlValid'), ctl({ sdControl: '32788' }), ctl({ sdControl: 65536 }),
+      ctl({ sdControl: -1 }), ctl({ sdControlValid: 1 }), ctl({ getAclCtrlValid: 'true' }), ctl({ getAclCtrl: 1.5 }), ctl({ getAclCtrl: null }), omit(ctl(), 'getAclCtrl'),
+      ctl({ sdControlValid: false, getAclCtrlValid: false }), ctl({ getAclBracket: 'stale', sdControlValid: false }), ctl({ sdControl: 65535, getAclCtrl: 0 }),
+      // not rbctrl rows: aclMatch, reparse, open error, Get-Acl error, a flag difference that is not flagMissing
+      ctl({ getAclSddl: NULL6 }), ctl({ isReparse: true }), ctl({ openError: 5 }), ctl({ getAclSddl: null, getAclError: 'NotSupportedException' }),
+      ctl({ sddl: `${O6}D:PAI(A;;FA;;;${A})`, getAclSddl: `${O6}D:P(A;;FA;;;${A})` }),
+    ]);
+    assert.deepEqual([hasOwn(objs[7], 'sdControlValid'), hasOwn(objs[15], 'getAclCtrl'), hasOwn(objs[4], 'getAclBracket')], [false, false, false], 'missing fixtures have no field');
+    const before = JSON.stringify(objs);
+    const v = kvSafe(readbackCtrlOperands('unproved', objs), 'rbctrl');
+    const pick = (ks) => ks.map((q) => v[q]);
+    assert.deepEqual(pick(['test', 'rows', 'uStale', 'uUnmeasured', 'uOracle', 'uGetacl', 'matched', 'xor']), ['unproved', '19', '2', '2', '7', '4', '1', '3'],
+      'first unknown wins: bracket stale > not matching > oracle > getacl; strict booleans and integers 0..65535 only');
+    assert.deepEqual(pick(['ctrlXor', 'ctrlXorOther']), ['4:1,1028:1,65535:1', '0'], 'all bits XORed, nothing masked, 0x0004 not assumed');
+    assert.equal(JSON.stringify(objs), before, 'inputs not mutated');
+    const r = readbackOperands('unproved', {}, objs).map(opKv);
+    assert.equal(v.rows, r[2].flagMissing, 'rbctrl rows are exactly rbsplit flagMissing');
+    assert.equal(String(['uStale', 'uUnmeasured', 'uOracle', 'uGetacl', 'matched', 'xor'].reduce((a2, q) => a2 + Number(v[q]), 0)), v.rows, 'every row in one category');
+    const many = kvSafe(readbackCtrlOperands('contradict', [1, 2, 3, 4, 5, 6].map((x) => ctl({ sdControl: x, getAclCtrl: 0 }))), 'rbctrl');
+    assert.deepEqual([many.test, many.xor, many.ctrlXor, many.ctrlXorOther], ['contradict', '6', '1:1,2:1,3:1,4:1', '2'], 'at most four XOR values, the rest other');
+    const all0 = kvSafe(readbackCtrlOperands('unproved', objs.slice(6, 18)), 'rbctrl');
+    assert.deepEqual([all0.matched, all0.xor, all0.ctrlXor], ['0', '0', 'none'], 'an all-unknown set measures nothing');
+    const bare = kvSafe(readbackCtrlOperands('unproved', strip(objs)), 'rbctrl');
+    assert.deepEqual([bare.rows, bare.uUnmeasured, bare.matched, bare.xor], ['19', '19', '0', '0'], 'no diagnostic fields: nothing measured');
+    const noNew = kvSafe(readbackCtrlOperands('unproved', stripNew(objs)), 'rbctrl');
+    assert.deepEqual([noNew.uStale, noNew.uUnmeasured, noNew.uOracle, noNew.matched, noNew.xor], ['2', '2', '15', '0', '0'], 'no control fields: unknown, never 0 == 0');
+    assert.equal(kvSafe(readbackCtrlOperands('payload', undefined), 'rbctrl').test, 'UNKNOWN');
+    assert.equal(kvSafe(readbackCtrlOperands('unproved', Array.from({ length: 100001 }, () => objs[0])), 'rbctrl').rows, '99999');
+  });
+
+  test('selfcheck: aceraw crosses raw ACE order eq/ne/unknown with canonical true/false/unknown on bracket-matching aceOrder rows only; invalid is unknown', () => {
+    const objs = frozen([
+      ace(), ace({ getAclCanonical: false }), ace({ aceRawEq: false }), ace({ aceRawEq: false, getAclCanonical: null }),
+      ace({ aceRawEq: false, aceRawGetAclCount: 3, getAclCanonical: false }), ace({ aceRawOracleCount: 3 }),
+      rawU('bounds'), rawU('getAclDacl', { getAclCanonical: 'true' }), rawU('error', { aceRawError: 'ArgumentException', getAclCanonical: false }), rawU('empty'),
+      rawU('noBinary'), rawU('oracleSddl'), rawU('oracleDacl'), rawU('evil C:\\secret'), omit(ace(), 'aceRawEq'), ace({ aceRawEq: 'true' }), ace({ aceRawEq: 1 }),
+      ace({ aceRawCountValid: 'true' }), ace({ aceRawGetAclCount: 65, aceRawOracleCount: 65 }), ace({ aceRawGetAclCount: 0, aceRawOracleCount: 0 }),
+      ace({ aceRawUnknown: 'bounds' }), rawU('bounds', { aceRawCountValid: true }),
+      ace({ getAclBracket: 'stale' }), omit(ace(), 'getAclBracket'), ace({ getAclBracket: 'unmeasured', aceRawEq: false }),
+      // not aceraw rows: aclMatch, reparse, a flag-only difference, flagMissing, a rights (aceSet) difference, a Get-Acl error
+      ace({ getAclSddl: ORD_O }), ace({ isReparse: true }), ace({ sddl: `${O6}D:P(A;;FA;;;${A})`, getAclSddl: `${O6}D:PAI(A;;FA;;;${A})` }),
+      ace({ sddl: NULL6, getAclSddl: O6 }), ace({ sddl: `${O6}D:P(A;;FA;;;${A})(A;;FA;;;BA)` }), ace({ getAclSddl: null, getAclError: 'NotSupportedException' }),
+    ]);
+    assert.deepEqual([hasOwn(objs[14], 'aceRawEq'), hasOwn(objs[23], 'getAclBracket'), objs[6].aceRawEq], [false, false, null], 'missing vs explicit-null fixtures');
+    const before = JSON.stringify(objs);
+    const v = kvSafe(aceRawOperands('unproved', objs), 'aceraw');
+    const pick = (ks) => ks.map((q) => v[q]);
+    assert.deepEqual(pick(['test', 'rows', 'bindOk', 'bindStale', 'bindUnmeasured']), ['unproved', '25', '22', '1', '2']);
+    assert.deepEqual(pick(['eqTrue', 'eqFalse', 'eqUnknown', 'neTrue', 'neFalse', 'neUnknown', 'unknownTrue', 'unknownFalse', 'unknownUnknown', 'neCount']),
+      ['1', '1', '0', '1', '1', '1', '15', '1', '1', '1'], 'canonical false is not unknown; a count mismatch on eq is never eq');
+    assert.deepEqual(pick(['uNoBinary', 'uOracleSddl', 'uGetAclDacl', 'uOracleDacl', 'uEmpty', 'uBounds', 'uError', 'uInvalid']), ['1', '1', '1', '1', '1', '1', '1', '10'],
+      'closed reasons only when consistent; strings, 0/1, 0 or 65 ACEs, a reason on a measured row are invalid');
+    assert.equal(JSON.stringify(objs), before, 'inputs not mutated');
+    const r = readbackOperands('unproved', {}, objs).map(opKv);
+    assert.deepEqual([v.rows, v.rows], [r[1].aceOrder, String(Number(r[2].orderDenyRelChanged) + Number(r[2].orderDenyRelUnchanged) + Number(r[2].orderDenyRelUnknown))],
+      'aceraw rows are exactly the rbdiff aceOrder / rbsplit order rows');
+    const cells = ['eq', 'ne', 'unknown'].flatMap((x) => ['True', 'False', 'Unknown'].map((c) => Number(v[`${x}${c}`])));
+    assert.equal(String(cells.reduce((a2, b2) => a2 + b2, 0)), v.bindOk, 'only bind=ok rows are crossed');
+    const bare = kvSafe(aceRawOperands('unproved', strip(objs)), 'aceraw');
+    assert.deepEqual([bare.rows, bare.bindUnmeasured, bare.eqTrue, bare.neTrue, bare.unknownUnknown], ['25', '25', '0', '0', '0'], 'no diagnostic fields: nothing measured');
+    const noNew = kvSafe(aceRawOperands('unproved', stripNew(objs)), 'aceraw');
+    assert.deepEqual([noNew.bindOk, noNew.eqTrue, noNew.eqUnknown, noNew.neUnknown, noNew.unknownUnknown, noNew.uInvalid], ['22', '0', '0', '0', '22', '22'],
+      'no raw/canonical fields: unknown x unknown, never eq by absence');
+    assert.equal(kvSafe(aceRawOperands('payload', undefined), 'aceraw').test, 'UNKNOWN');
+    assert.equal(kvSafe(aceRawOperands('contradict', Array.from({ length: 100001 }, () => objs[0])), 'aceraw').eqTrue, '99999');
+  });
+
+  test('selfcheck: rbctrl / aceraw fields leave readbackFindings, readbackOperands and every existing R6 line unchanged', () => {
+    const man = { cases: [{ id: 'D_ADS', path: 'C:\\fx\\d::$INDEX_ALLOCATION', object: 'C:\\fx\\d' }, { id: 'F_ADS', path: 'C:\\fx\\h.bin:alt', object: 'C:\\fx\\h.bin' },
+      { id: 'F_DATA_STREAM', path: 'C:\\fx\\ok.bin::$DATA', object: 'C:\\fx\\ok.bin' }] };
+    const objs = frozen([ctl(), ctl({ getAclCtrl: 0x8410 }), ctl({ sdControlValid: false }), ace(), ace({ aceRawEq: false }), rawU('bounds'),
+      ace({ getAclSddl: ORD_O }), ace({ fsutilHardlinkExit: 1, fsutilHardlinks: [] }), ace({ getAclSddl: null, getAclError: 'NotSupportedException' })]);
+    const snaps = { S0: { objects: objs }, S1: { objects: [] }, S2: { objects: [] }, S3: { objects: [] } };
+    const bare = stripNew(objs);
+    const bareSnaps = { ...snaps, S0: { objects: bare } };
+    assert.ok(bare.every((o) => CTRL_ACE_FIELDS.every((k) => !hasOwn(o, k))), 'stripped of every new field');
+    assert.deepEqual(readbackFindings(objs), readbackFindings(bare), 'readbackFindings ignores rbctrl / aceraw fields');
+    assert.deepEqual(readbackOperands('contradict', snaps, objs), readbackOperands('contradict', bareSnaps, bare), 'readback / rbdiff / rbsplit unchanged');
+    assert.equal(readbackCauseOperands('unproved', objs, man), readbackCauseOperands('unproved', bare, man));
+    assert.equal(readbackStateOperands('unproved', objs), readbackStateOperands('unproved', bare));
+    assert.equal(streamJoinOperands('unproved', snaps, man), streamJoinOperands('unproved', bareSnaps, man));
+    assert.equal(hardlinkProbeOperands('unproved', objs, man), hardlinkProbeOperands('unproved', bare, man));
+    const f = readbackFindings(objs);
+    assert.equal(f.contradictions.length, 7, 'flagMissing and aceOrder rows stay contradictions whatever rbctrl / aceraw say');
+  });
+
+  test('selfcheck: rbctrl / aceraw twin literals: producer fields and reasons in setup-fixtures.ps1, field order in the run-validation.ps1 schema', () => {
+    const src = (f) => fs.readFileSync(new URL(`./${f}`, import.meta.url), 'utf8');
+    const prod = src('setup-fixtures.ps1'); const fmt = src('run-validation.ps1');
+    for (const k of CTRL_ACE_FIELDS) {
+      const cs = ['sdControlValid', 'sdControlError', 'sdControl'].includes(k);
+      assert.ok(cs ? new RegExp(`public [a-z?]+ ${k};`).test(prod) : prod.includes(`$o['${k}'] = `), `producer records ${k}`);
+    }
+    for (const w of OP_ACERAW_UNKNOWN) assert.ok(prod.includes(`$why = '${w}'`) || prod.includes(`$o['aceRawUnknown'] = '${w}'`), `producer reason ${w}`);
+    const names = (l) => l.split(' ').slice(2).map((x) => x.slice(0, x.indexOf('=')));
+    for (const [kind, line] of [['rbctrl', readbackCtrlOperands('unproved', [])], ['aceraw', aceRawOperands('unproved', [])]]) {
+      const m = fmt.match(new RegExp(`^ {8}${kind} = '([^']*)'$`, 'm'));
+      assert.ok(m, `${kind} schema present`);
+      assert.deepEqual(m[1].split(' ').map((x) => x.split(':')[0]), names(line), `${kind} field order twin`);
+      assert.ok(m[1].split(' ').every((x) => /^[A-Za-z]{1,24}:(test|cnt|hist)$/.test(x)), `${kind} closed value classes`);
+      assert.ok(line.length <= 1409 && OP_LINE.test(line), `${kind} within the line cap`);
+    }
+    assert.match(fmt, /\$keyed = @\([^)]*'rbctrl', 'aceraw'\)/, 'both kinds keyed by test (one line per test, repeats are duplicates)');
   });
 }
 
@@ -1756,6 +1943,8 @@ if (PHASE === 'verdict') {
     opDiag(t, () => readbackStateOperands('contradict', allSnapObjects()));
     opDiag(t, () => streamJoinOperands('contradict', snaps, manifest));
     opDiag(t, () => hardlinkProbeOperands('contradict', allSnapObjects(), manifest));
+    opDiag(t, () => readbackCtrlOperands('contradict', allSnapObjects()));
+    opDiag(t, () => aceRawOperands('contradict', allSnapObjects()));
     assert.deepEqual(snapshotSetProblems(snaps), []);
     assert.deepEqual(readbackFindings(allSnapObjects()).contradictions, []);
   });
@@ -1765,6 +1954,8 @@ if (PHASE === 'verdict') {
     opDiag(t, () => readbackStateOperands('unproved', allSnapObjects()));
     opDiag(t, () => streamJoinOperands('unproved', snaps, manifest));
     opDiag(t, () => hardlinkProbeOperands('unproved', allSnapObjects(), manifest));
+    opDiag(t, () => readbackCtrlOperands('unproved', allSnapObjects()));
+    opDiag(t, () => aceRawOperands('unproved', allSnapObjects()));
     assert.deepEqual(snapshotSetProblems(snaps), [], 'CONTRACT_UNPROVED: no read-back evidence at all');
     const { unproved } = readbackFindings(allSnapObjects());
     assert.deepEqual(unproved, [], `CONTRACT_UNPROVED (not waived, oracle not replaced): ${unproved.length} read-backs unavailable`);
