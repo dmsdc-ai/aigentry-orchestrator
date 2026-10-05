@@ -87,6 +87,14 @@ test("a fresh spawn asks capabilities exactly once and reports unsupported; a de
   const f = fixture();
   try {
     const r = f.dispatch([...f.spawnArgs, "--role", "coder"]);
+    if (process.platform === "win32") {
+      // #1167 P6: the confined spawn refuses before any effect, so no agent metadata is published (no cmux
+      // question); it records nothing, so the repeat is refused again, not deduplicated, and asks none either.
+      f.refused(r);
+      f.refused(f.dispatch([...f.spawnArgs, "--role", "coder"]));
+      assert.equal(capsCalls(f), 0);
+      return;
+    }
     assert.equal(r.status, 0, r.stderr);
     assert.equal(capsLog(f), '["capabilities"]\n');
     assert.match(r.stderr, /WARNING agent-meta-set rc=20 for router-fixture \(spawn not gated\)/);

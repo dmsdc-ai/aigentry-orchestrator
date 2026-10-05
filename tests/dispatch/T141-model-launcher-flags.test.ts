@@ -36,6 +36,11 @@ for (const cli of ["codex", "grok", "gemini"]) for (const withRole of [false, tr
       let argv: string[];
       if (cli === "codex" && withRole) {
         const r = f.dispatch([...f.spawnArgs, "--cli", cli, "--role", "coder"]);
+        if (process.platform === "win32") {
+          // #1167 P6: no OS sandbox runtime, so no argv is built; the refusal names the binary/model/effort the decision carries.
+          assert.deepEqual(f.refused(r), { cli: "codex", model: "gpt-6-astra", decided_by: "explicit", effort: null, executable: join(f.bin, "codex") });
+          return;
+        }
         assert.equal(r.status, 0, r.stderr);
         assert.doesNotMatch(r.stderr, /boot-prepare.mjs failed|legacy path active/);
         argv = f.manifest().command;
@@ -111,6 +116,12 @@ for (const withRole of [false, true]) for (const [cli, env, expected] of [
     let argv: readonly string[];
     if (cli === "codex" && withRole) {
       const r = f.dispatch([...f.spawnArgs, "--cli", cli, "--role", "coder"], env);
+      if (process.platform === "win32") {
+        // #1167 P6: the refusal names the effort the decision carries verbatim (one literal value, never executed).
+        assert.deepEqual(f.refused(r), { cli: "codex", model: "gpt-6-astra", decided_by: "explicit", effort: Object.values(env)[0], executable: join(f.bin, "codex") });
+        assert.equal(existsSync(join(f.root, "SHOULD-NOT-EXECUTE")), false);
+        return;
+      }
       assert.equal(r.status, 0, r.stderr);
       assert.doesNotMatch(r.stderr, /boot-prepare.mjs failed|legacy path active/);
       argv = f.manifest().command;

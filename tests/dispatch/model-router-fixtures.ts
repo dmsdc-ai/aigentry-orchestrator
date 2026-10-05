@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess, type SpawnSyncReturns } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import type { WorkerManifest } from "../../src/session/worker-sandbox.js";
@@ -16,6 +16,8 @@ export const ROUTER = join(REPO, "bin/model-router.mjs");
 // fabricated: no live token, provider call or refresh path is involved, and `fixture`
 // keeps the record self-identifying. `accessToken` alone is what the guard needs.
 const CLAUDE_AUTH = { fixture: true, claudeAiOauth: { accessToken: "fixture-access-token-not-a-real-credential" } };
+/** #1167 P6: the spawn decision a win32 SANDBOX_PLATFORM_UNSUPPORTED refusal names (effort/executable only with a resolver decision). */
+export interface Decided { cli: string; model: string | null; decided_by: string | null; capped_cli?: string; effort?: string | null; executable?: string }
 export function fixture() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "model-router-1083-")));
   const bin = join(root, "bin"), home = join(root, "home"), aig = join(root, "aig");
@@ -37,6 +39,7 @@ export function fixture() {
   writeFileSync(ref, "Implement the fixture router. TASK-FIRST-4KB\n");
   writeFileSync(queue, JSON.stringify({ tasks: [{ id: 1083, status: "pending", note: "seed" }] }));
   writeFileSync(join(root, "state/active.json"), '{"schema_version":2,"generation":0,"dispatches":[]}');
+  const seeded = [queue, join(root, "state/active.json")].map((p) => [p, readFileSync(p, "utf8")] as const);
   const classifier = script("classifier", `
 const fs = require('node:fs');
 fs.appendFileSync(process.env.COUNTER, 'call\\n');
@@ -154,6 +157,21 @@ if (process.argv.length === 3 && process.argv[2] === 'capabilities') {
     assert.equal(existsSync(env.WORK_LOG!), false, "no model/work operation");
     return m;
   };
+  // #1167 P6: the win32 counterpart of manifest(). Windows has no OS sandbox runtime, so a confined spawn
+  // refuses after the routing/spawn decision and before any effect; returns the decision the refusal names.
+  const refused = (r: SpawnSyncReturns<string>): Decided => {
+    assert.equal(r.status, 78, r.stderr);
+    const m = /^dispatch\.sh: SANDBOX_PLATFORM_UNSUPPORTED: .*; decided (\{.*\}); nothing was spawned or registered \(exit 78\)$/m.exec(r.stderr);
+    assert.ok(m, `no platform refusal line:\n${r.stderr}`);
+    for (const effect of [env.OPEN_LOG!, `${env.OPEN_LOG}.calls`, env.PARENT_MODEL_LOG!, env.TELEMETRY_LOG!, env.CMUX_CAPS_LOG!,
+      join(aig, "sessions"), join(aig, "role-sandbox"), env.AIGENTRY_GIT_HOOKS_DIR!]) {
+      assert.equal(existsSync(effect), false, `effect before the refusal: ${effect}`);
+    }
+    assert.deepEqual(readdirSync(join(root, "tmp")).filter((n) => n.startsWith("agw-")), [], "no staged sandbox temp dir");
+    for (const [file, bytes] of seeded) assert.equal(readFileSync(file, "utf8"), bytes, `no task-ledger/registry write: ${file}`);
+    assert.equal(existsSync(env.WORK_LOG!), false, "no model/work operation");
+    return JSON.parse(m[1]!) as Decided;
+  };
   const prepareTarget = (sid = "router-fixture", task = "1083") => {
     // This hand-written receipt proves PID existence only, never ownership or OS enforcement.
     const staging = join(env.AIGENTRY_SESSIONS_ROOT!, sid), workerHome = join(staging, "fixture-home");
@@ -175,7 +193,7 @@ if (process.argv.length === 3 && process.argv[2] === 'capabilities') {
     { cwd: root, env: { ...env, FIXTURE_CHILD_PID: String(childPid()), ...overrides }, encoding: "utf8", timeout: 22000 });
   // #1084: a live worker shows up in `telepty list` as its guard launcher; the CLI kind is its `exec -a` line.
   const liveLauncher = (cli: string) => { const file = join(root, `live-${cli}-launcher.sh`); writeFileSync(file, `#!/usr/bin/env bash\nexec -a ${cli} ${cli} "$@"\n`); return file; };
-  return { root, bin, aig, ref, queue, env, script, router, dispatch, liveLauncher, manifest, prepareTarget, boot,
+  return { root, bin, aig, ref, queue, env, script, router, dispatch, liveLauncher, manifest, refused, prepareTarget, boot,
     spawnArgs: ["--spawn-and-dispatch", "--track", "router", "--name", "fixture", "--cwd", join(root, "project")],
     calls: () => { try { return readFileSync(env.COUNTER!, "utf8").trim().split("\n").length; } catch { return 0; } },
     cleanup: () => {

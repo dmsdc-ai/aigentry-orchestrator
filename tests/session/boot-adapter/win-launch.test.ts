@@ -6,8 +6,10 @@
 //   O*  oracle self-checks (any OS): the pinned cmd-shim 6.0.3 generator vs the CONTRACT-R2 §2
 //       transcription, generator non-refusal of non-inert fields, mutation-set distinctness.
 //   T10 [POSIX] spawn identity: exactly one spawn per call, file === argv0 as given, args/cwd/
-//       env unchanged, shell false, no verbatim args. Baseline ebfc459 is the control.
-//   T1-T9 [win32 native] real CreateProcess via the real spawner; skipped elsewhere. On the
+//       env unchanged, shell false, no verbatim args. Baseline ebfc459 is the control. Registered
+//       only on POSIX (#1167 P7: no skip on win32, where T1-T9 cover spawn identity).
+//   T1-T9 [win32 native] real CreateProcess via the real spawner; registered only on win32 (#1167
+//       P7: POSIX reports no skip for them). On the
 //       baseline they are EXPECTED to fail (negative control: .cmd hits ENOENT/EINVAL).
 //   T4/T5/T4x [win32] PRINCIPLES P5: a .cmd/.bat that is not an exact shim runs via
 //       %SystemRoot%\System32\cmd.exe /d /s /c with strict quoting; a recognised shim never does.
@@ -33,8 +35,6 @@ import {
 } from "./_win-launch-fixture.js";
 
 const WIN = process.platform === "win32";
-const NOT_WIN = WIN ? false : "win32-native only (real CreateProcess); not provable on this OS";
-const POSIX_ONLY = WIN ? "POSIX identity control" : false;
 const GEN = locateGenerator();
 const NO_GEN = "skip" in GEN ? GEN.skip : false;
 const RUN_TIMEOUT = FAKE_LIFETIME_MS * 2; // child always self-exits before the harness timer
@@ -134,7 +134,7 @@ test("O5 negative mutation set: every mutation changes the bytes and all are dis
 });
 
 // ============================ T10: POSIX identity control ============================
-test("T10 [POSIX] run(): one spawn, argv0/args/cwd/env as given, shell false, literals byte-exact", { skip: POSIX_ONLY }, async (t) => {
+if (!WIN) test("T10 [POSIX] run(): one spawn, argv0/args/cwd/env as given, shell false, literals byte-exact", async (t) => {
   const { dir, nonce } = newCase(ROOT, "t10");
   mkdirSync(join(dir, "bin"));
   writeFileSync(join(dir, "bin", "fake-cli"), fakeCliSource(`#!${process.execPath}`), { mode: 0o755 });
@@ -156,7 +156,7 @@ test("T10 [POSIX] run(): one spawn, argv0/args/cwd/env as given, shell false, li
   await assertCleanup(t, dir, nonce, calls, 1);
 });
 
-test("T10 [POSIX] probeVersion(): one spawn [exe, --version]; missing exe → CLI_NOT_FOUND", { skip: POSIX_ONLY }, async (t) => {
+if (!WIN) test("T10 [POSIX] probeVersion(): one spawn [exe, --version]; missing exe → CLI_NOT_FOUND", async (t) => {
   const { dir, nonce } = newCase(ROOT, "t10v");
   const exe = join(dir, "fake-cli");
   writeFileSync(exe, fakeCliSource(`#!${process.execPath}`), { mode: 0o755 });
@@ -171,13 +171,13 @@ test("T10 [POSIX] probeVersion(): one spawn [exe, --version]; missing exe → CL
   assert.equal(miss.error?.message, "CLI_NOT_FOUND");
 });
 
-test("T10 [POSIX] run() missing bare exe keeps the real ENOENT", { skip: POSIX_ONLY }, async () => {
+if (!WIN) test("T10 [POSIX] run() missing bare exe keeps the real ENOENT", async () => {
   const { dir } = newCase(ROOT, "t10e");
   const r = await spySpawns(() => nodeSpawner().run({ argv: ["absent-cli-1167"], env: { PATH: dir }, cwd: dir, prompt_file: "", expected_digest: "" }, undefined, RUN_TIMEOUT));
   assert.equal(r.error?.code, "ENOENT");
 });
 
-test("T10 [POSIX] geminiBinary(): PATH X_OK agy → agy, else gemini (unchanged)", { skip: POSIX_ONLY }, () => {
+if (!WIN) test("T10 [POSIX] geminiBinary(): PATH X_OK agy → agy, else gemini (unchanged)", () => {
   const { dir } = newCase(ROOT, "t10g");
   assert.equal(geminiBinary({ PATH: dir }), "gemini");
   writeFileSync(join(dir, "agy"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
@@ -186,7 +186,6 @@ test("T10 [POSIX] geminiBinary(): PATH X_OK agy → agy, else gemini (unchanged)
 });
 
 // ============================== T1-T9: win32 native ==============================
-const WIN_SKIP = NOT_WIN || NO_GEN;
 const SYS = process.env["SystemRoot"] ?? "C:\\Windows";
 const NODE_DIR = dirname(process.execPath);
 function winEnv(pathKey: "PATH" | "Path", dirs: string[], dir: string, nonce: string, extra: Record<string, string> = {}): Record<string, string> {
@@ -213,7 +212,7 @@ async function layout(label: string): Promise<{ local: { bin: string; T: string 
 }
 
 for (const where of ["local", "prefix"] as const) for (const spelling of ["bare", "abs"] as const) for (const key of ["PATH", "Path"] as const) {
-  test(`T1+T2 [win32] V-A ${where}/${spelling}/${key}: direct node, literals byte-exact, no sentinel, stdin hash`, { skip: WIN_SKIP }, async (t) => {
+  if (WIN) test(`T1+T2 [win32] V-A ${where}/${spelling}/${key}: direct node, literals byte-exact, no sentinel, stdin hash`, { skip: NO_GEN }, async (t) => {
     const lay = (await layout(`t2-${where}-${spelling}-${key}`))[where];
     const { dir, nonce } = newCase(ROOT, "case");
     const exe = spelling === "bare" ? "fake" : join(lay.bin, "fake.cmd");
@@ -237,7 +236,7 @@ for (const where of ["local", "prefix"] as const) for (const spelling of ["bare"
   });
 }
 
-test("T2 [win32] native .exe hit launched as-is; V-B native target via dp0+\\+T", { skip: WIN_SKIP }, async (t) => {
+if (WIN) test("T2 [win32] native .exe hit launched as-is; V-B native target via dp0+\\+T", { skip: NO_GEN }, async (t) => {
   assert.ok("gen" in GEN);
   const base = newCase(ROOT, "t2x").dir;
   const script = join(base, "fake-cli.cjs");
@@ -285,7 +284,7 @@ const cmdLine = (file: string, args: string[]) => `"${[file, ...args].map((a) =>
 
 // T4 resolution only (no CreateProcess: some generator variants would hand a .js target to WSH under cmd):
 // recognition fails, so the launch is cmd.exe on that hit, never the direct node path.
-test("T4 [win32] mutations, V-V, unknown version, non-inert fields → not a shim: cmd.exe /d /s /c on the hit", { skip: WIN_SKIP }, async (t) => {
+if (WIN) test("T4 [win32] mutations, V-V, unknown version, non-inert fields → not a shim: cmd.exe /d /s /c on the hit", { skip: NO_GEN }, async (t) => {
   assert.ok("gen" in GEN);
   const base = newCase(ROOT, "t4").dir;
   const pkg = join(base, "pkg");
@@ -325,7 +324,7 @@ async function assertViaCmd(t: TestContext, dirs: string[], exe: string, hit: st
   await assertCleanup(t, dir, nonce, r.calls, null);
 }
 
-test("T5 [win32] earlier .bat / bad .cmd hit → cmd.exe on that hit, never skip to the later valid shim", { skip: WIN_SKIP }, async (t) => {
+if (WIN) test("T5 [win32] earlier .bat / bad .cmd hit → cmd.exe on that hit, never skip to the later valid shim", { skip: NO_GEN }, async (t) => {
   assert.ok("gen" in GEN);
   const base = newCase(ROOT, "t5").dir;
   const good = await makeShim(GEN.gen, join(base, "pkg"), join(base, "good"), "first", { shebang: "#!/usr/bin/env node", targetName: "cli" });
@@ -337,7 +336,7 @@ test("T5 [win32] earlier .bat / bad .cmd hit → cmd.exe on that hit, never skip
   await t.test("bad-cmd-first", (tt) => assertViaCmd(tt, [join(base, "bad"), join(base, "good")], "first", join(base, "bad", "first.cmd")));
 });
 
-test("T4x [win32] plain .cmd via cmd.exe: quoted literals byte-exact at the payload; \" % ! ^ CR LF NUL refuse before spawn", { skip: NOT_WIN }, async (t) => {
+if (WIN) test("T4x [win32] plain .cmd via cmd.exe: quoted literals byte-exact at the payload; \" % ! ^ CR LF NUL refuse before spawn", async (t) => {
   const base = newCase(ROOT, "t4x").dir;
   const script = join(base, "fake-cli.cjs");
   writeFileSync(script, fakeCliSource(null));
@@ -370,7 +369,7 @@ test("T4x [win32] plain .cmd via cmd.exe: quoted literals byte-exact at the payl
   }
 });
 
-test("T6 [win32] dp0\\node.exe present → that interpreter; node→node.cmd → refuse", { skip: WIN_SKIP }, async (t) => {
+if (WIN) test("T6 [win32] dp0\\node.exe present → that interpreter; node→node.cmd → refuse", { skip: NO_GEN }, async (t) => {
   const lay = (await layout("t6")).local;
   copyFileSync(process.execPath, join(lay.bin, "node.exe"));
   const { dir, nonce } = newCase(ROOT, "t6a");
@@ -386,14 +385,14 @@ test("T6 [win32] dp0\\node.exe present → that interpreter; node→node.cmd →
   await t.test("node-resolves-to-cmd", (tt) => assertRefused(tt, [lay2.bin, shadow], "fake"));
 });
 
-test("T7 [win32] shim dir containing & → refuse", { skip: WIN_SKIP }, async (t) => {
+if (WIN) test("T7 [win32] shim dir containing & → refuse", { skip: NO_GEN }, async (t) => {
   assert.ok("gen" in GEN);
   const base = newCase(ROOT, "t7").dir;
   await makeShim(GEN.gen, join(base, "pkg"), join(base, "bin&x"), "amp", { shebang: "#!/usr/bin/env node", targetName: "cli" });
   await assertRefused(t, [join(base, "bin&x")], "amp");
 });
 
-test("T8 [win32] >32767 command line → OS spawn error, no payload; 30000 control byte-exact", { skip: WIN_SKIP }, async (t) => {
+if (WIN) test("T8 [win32] >32767 command line → OS spawn error, no payload; 30000 control byte-exact", { skip: NO_GEN }, async (t) => {
   const lay = (await layout("t8")).local;
   for (const [n, ok] of [[30_000, true], [40_000, false]] as const) {
     const { dir, nonce } = newCase(ROOT, `t8-${n}`);
@@ -413,7 +412,7 @@ test("T8 [win32] >32767 command line → OS spawn error, no payload; 30000 contr
   }
 });
 
-test("T9 [win32] non-reading child with 8 MiB stdin → no crash, no delivery claim", { skip: WIN_SKIP }, async (t) => {
+if (WIN) test("T9 [win32] non-reading child with 8 MiB stdin → no crash, no delivery claim", { skip: NO_GEN }, async (t) => {
   const lay = (await layout("t9")).local;
   const { dir, nonce } = newCase(ROOT, "t9");
   const r = await withEnv(winEnv("PATH", [lay.bin], dir, nonce, { FAKE_MODE: "noread" }), () => run(["fake"], dir, "z".repeat(8 << 20)));
@@ -424,7 +423,7 @@ test("T9 [win32] non-reading child with 8 MiB stdin → no crash, no delivery cl
   await assertCleanup(t, dir, nonce, r.calls, 1);
 });
 
-test("T-miss [win32] missing bare name keeps ENOENT (not CLI_LAUNCH_UNSUPPORTED)", { skip: WIN_SKIP }, async () => {
+if (WIN) test("T-miss [win32] missing bare name keeps ENOENT (not CLI_LAUNCH_UNSUPPORTED)", { skip: NO_GEN }, async () => {
   const { dir, nonce } = newCase(ROOT, "miss");
   const r = await withEnv(winEnv("PATH", [dir], dir, nonce), () => run(["absent-cli-1167"], dir));
   assert.equal(r.error?.code, "ENOENT");
@@ -555,7 +554,7 @@ test("P5 onDiskSpelling: exact entry, else unique case-insensitive entry, else t
   }
 });
 
-test("T-gem [win32] geminiBinary: any first agy hit (even unsupported agy.cmd) → agy; none → gemini", { skip: NOT_WIN }, () => {
+if (WIN) test("T-gem [win32] geminiBinary: any first agy hit (even unsupported agy.cmd) → agy; none → gemini", () => {
   const { dir } = newCase(ROOT, "gem");
   assert.equal(geminiBinary({ PATH: dir, PATHEXT: ".COM;.EXE;.BAT;.CMD" }), "gemini");
   writeFileSync(join(dir, "agy.cmd"), "@echo unsupported\r\n", "latin1");

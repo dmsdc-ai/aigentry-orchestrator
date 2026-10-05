@@ -1108,6 +1108,18 @@ async function waitForReady(o: Opts, sid: string): Promise<number> {
 function spawnWorkspace(o: Opts, sid: string): void {
   const scope = loadWorkerScope(env.AIGENTRY_WORKER_SCOPE, o.taskId, sid);
   if (!o.role || !["claude", "codex"].includes(o.cli)) die(`dispatch.sh: SANDBOX_CLI_UNSUPPORTED: ${o.cli}; no unrestricted fallback`, 78);
+  // #1167 P6: no OS sandbox runtime here (win32), so the confined spawn refuses now — after the routing/spawn
+  // decision, before boot-prepare stages anything, the git guard is installed or a terminal opens. Same
+  // predicate as prepareWorkerSandbox; darwin/linux never enter. The decision is named, non-ASCII escaped.
+  if (!["darwin", "linux"].includes(process.platform)) {
+    const decided = JSON.stringify({ cli: o.cli, model: o.route?.model ?? null, decided_by: o.route?.decided_by ?? null,
+      ...(o.route?.capped_cli ? { capped_cli: o.route.capped_cli } : {}),
+      ...(o.decision ? { effort: o.decision.effort.token, executable: o.decision.executable.path } : {}) })
+      .replace(/[^\x20-\x7e]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+    die(`dispatch.sh: SANDBOX_PLATFORM_UNSUPPORTED: a confined worker needs the macOS/Linux OS sandbox and ` +
+      `${process.platform} has none (documented limitation; no unrestricted fallback); decided ${decided}; ` +
+      "nothing was spawned or registered (exit 78)", 78);
+  }
   const spawnEnv: NodeJS.ProcessEnv = o.route && /^(llm|table)(-capped)?$/.test(o.route.decided_by) && o.decision?.model !== null
     ? { [`AIGENTRY_${o.cli.toUpperCase()}_MODEL`]: o.route.model } : {};
   // #1148: boot-prepare turns this ONE decision into argv; its launcher export dies at the runner (C3).

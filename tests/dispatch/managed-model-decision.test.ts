@@ -12,7 +12,7 @@ import { accessSync, appendFileSync, constants, existsSync, mkdirSync, readFileS
   symlinkSync, writeFileSync } from "node:fs";
 import { basename, delimiter, isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { fixture, PROFILE, REPO, ROUTER } from "./model-router-fixtures.js";
+import { fixture, PROFILE, REPO, ROUTER, type Decided } from "./model-router-fixtures.js";
 
 type Fx = ReturnType<typeof fixture>;
 // Untyped JSON read back from manifests, telemetry and the ledger.
@@ -21,7 +21,10 @@ type Run = SpawnSyncReturns<string>;
 
 const SID = "router-fixture", TASK = "1083";
 const posix = process.platform === "darwin" || process.platform === "linux";
-const skip = posix ? false : "the confined sandbox is darwin/linux only";
+// #1167 P6/P7: elsewhere (win32) a confined spawn makes the SAME decision and then refuses with
+// SANDBOX_PLATFORM_UNSUPPORTED before any effect; every case asserts that instead of skipping. A case that is
+// inherently POSIX registers only there (posixTest, reason beside it) and its Windows behaviour is tested below.
+const posixTest = posix ? test : (() => undefined) as unknown as typeof test;
 
 // Host PATH minus every directory holding a claude/codex: the resolver must only ever see fakes.
 function cleanHostPath(): string {
@@ -78,6 +81,13 @@ function assertSingleFlags(cmd: string[], cli: string): void {
   assert.ok(count((a) => a.startsWith("model_reasoning_effort=")) <= 1, `effort appears more than once: ${JSON.stringify(cmd)}`);
 }
 
+/** #1167 P6: off darwin/linux the decision is made, then the platform refusal; returns what the refusal names. */
+function refusedManaged(f: Fx, r: Run): Decided {
+  const d = f.refused(r); // exit 78, SANDBOX_PLATFORM_UNSUPPORTED, no terminal/registry/ledger/staging effect
+  assertNothingSpawned(f, r);
+  return d;
+}
+
 function assertNothingSpawned(f: Fx, r: Run): void {
   assert.equal(existsSync(f.env.OPEN_LOG!), false, `refused before the terminal port\n${r.stderr}`);
   assert.equal(existsSync(join(f.aig, "sessions", SID, "sandbox-current.json")), false, "no sealed manifest");
@@ -130,10 +140,16 @@ function assertManaged(f: Fx, r: Run, cli: "claude" | "codex") {
 
 const explicit = (f: Fx, cli: string) => [...f.spawnArgs, "--cli", cli, "--role", "coder"];
 
-test("managed: fresh explicit claude binds ONE decision through boot to sealed argv, telemetry and ledger", { skip }, () => {
+test("managed: fresh explicit claude binds ONE decision through boot to sealed argv, telemetry and ledger", () => {
   const f = fixture();
   try {
     const r = f.dispatch(explicit(f, "claude"), { PATH: pathWith(f.bin), AIGENTRY_CLAUDE_MODEL: "claude-opus-5-5" });
+    if (!posix) {
+      assert.deepEqual(refusedManaged(f, r), { cli: "claude", model: "claude-opus-5-5", decided_by: "explicit", effort: "medium",
+        executable: join(f.bin, "claude") });
+      assert.equal(f.calls(), 0, "explicit never calls the classifier");
+      return;
+    }
     const { exe, audit, model, effort } = assertManaged(f, r, "claude");
     assert.equal(f.calls(), 0, "explicit never calls the classifier");
     assert.equal(exe.path, join(f.bin, "claude"));
@@ -149,9 +165,15 @@ test("managed: fresh explicit claude binds ONE decision through boot to sealed a
   } finally { f.cleanup(); }
 });
 
-test("managed: no model request → no hidden literal effort; effort is a documented default or omitted", { skip }, () => {
+test("managed: no model request → no hidden literal effort; effort is a documented default or omitted", () => {
   const f = fixture();
   try {
+    if (!posix) {
+      const d = refusedManaged(f, f.dispatch(explicit(f, "claude"), { PATH: pathWith(f.bin) }));
+      assert.equal(d.cli, "claude");
+      assert.notEqual(d.effort, "xhigh", "the boot-prepare/adapter xhigh literal is not consulted");
+      return;
+    }
     const { audit, effort } = assertManaged(f, f.dispatch(explicit(f, "claude"), { PATH: pathWith(f.bin) }), "claude");
     assert.notEqual(effort, "xhigh", "the boot-prepare/adapter xhigh literal is not consulted");
     assert.equal(audit.requested.model, undefined);
@@ -159,12 +181,17 @@ test("managed: no model request → no hidden literal effort; effort is a docume
   } finally { f.cleanup(); }
 });
 
-test("managed: unknown explicit model omits effort; an inherited effort is kept verbatim and recorded as env", { skip }, () => {
+test("managed: unknown explicit model omits effort; an inherited effort is kept verbatim and recorded as env", () => {
   for (const effortEnv of [undefined, "high"]) {
     const f = fixture();
     try {
       const env: NodeJS.ProcessEnv = { PATH: pathWith(f.bin), AIGENTRY_CLAUDE_MODEL: "chosen-by-operator" };
       if (effortEnv) env.AIGENTRY_CLAUDE_EFFORT = effortEnv;
+      if (!posix) {
+        const d = refusedManaged(f, f.dispatch(explicit(f, "claude"), env));
+        assert.deepEqual([d.model, d.effort], ["chosen-by-operator", effortEnv ?? null], "explicit model kept; effort omitted or verbatim");
+        continue;
+      }
       const { audit, model, effort } = assertManaged(f, f.dispatch(explicit(f, "claude"), env), "claude");
       assert.equal(model, "chosen-by-operator", "explicit flags never disappear");
       if (!effortEnv) {
@@ -178,9 +205,15 @@ test("managed: unknown explicit model omits effort; an inherited effort is kept 
   }
 });
 
-test("managed: auto route keeps the routed codex model; no hidden codex effort", { skip }, () => {
+test("managed: auto route keeps the routed codex model; no hidden codex effort", () => {
   const f = fixture();
   try {
+    if (!posix) {
+      const d = refusedManaged(f, f.dispatch([...f.spawnArgs, "--role", "coder"], { PATH: pathWith(f.bin) }));
+      assert.deepEqual([d.cli, d.model, d.effort], ["codex", "gpt-6-astra", null], "routed model kept; no hidden codex effort");
+      assert.match(String(d.decided_by), /^(llm|table)$/);
+      return;
+    }
     const { audit, model, effort, cmd } = assertManaged(f, f.dispatch([...f.spawnArgs, "--role", "coder"], { PATH: pathWith(f.bin) }), "codex");
     assert.equal(model, "gpt-6-astra");
     assert.equal(effort, undefined, "the codex.ts `high` literal is not consulted");
@@ -189,7 +222,7 @@ test("managed: auto route keeps the routed codex model; no hidden codex effort",
   } finally { f.cleanup(); }
 });
 
-test("managed: cap fallback re-resolves the whole tuple for the FINAL cli", { skip }, () => {
+test("managed: cap fallback re-resolves the whole tuple for the FINAL cli", () => {
   const f = fixture();
   try {
     writeFileSync(join(f.aig, "instructions/roles/architect.md"), "# ARCHITECT\nFIXTURE-ROLE\n");
@@ -197,6 +230,13 @@ test("managed: cap fallback re-resolves the whole tuple for the FINAL cli", { sk
       LIVE_SESSIONS: JSON.stringify([{ id: SID, command: "codex" }, { id: "live-1", command: f.liveLauncher("codex") }]),
       // Codex-only operator inputs must not leak into the claude tuple (an invalid one would refuse).
       AIGENTRY_CODEX_EXECUTABLE: "relative/codex", AIGENTRY_CODEX_EFFORT: "ultra", AIGENTRY_CODEX_MODEL: "gpt-5.4" });
+    if (!posix) {
+      const d = refusedManaged(f, r);
+      assert.match(r.stderr, /codex at cap/);
+      assert.deepEqual([d.cli, d.decided_by, d.capped_cli, basename(d.executable ?? "")], ["claude", "llm-capped", "codex", "claude"]);
+      assert.notEqual(d.effort, "ultra", "codex-only inputs never reach the claude tuple");
+      return;
+    }
     const { exe, audit, cmd } = assertManaged(f, r, "claude");
     assert.match(r.stderr, /codex at cap/);
     assert.equal(basename(exe.path), "claude");
@@ -206,7 +246,7 @@ test("managed: cap fallback re-resolves the whole tuple for the FINAL cli", { sk
   } finally { f.cleanup(); }
 });
 
-test("managed: --target and a deduplicated repeat never call the resolver", { skip }, () => {
+test("managed: --target and a deduplicated repeat never call the resolver", () => {
   // An invalid operator executable would make ANY resolver call refuse with exit 4.
   const poison = { AIGENTRY_CLAUDE_EXECUTABLE: "relative/claude", AIGENTRY_CODEX_EXECUTABLE: "relative/codex" };
   const f = fixture();
@@ -222,6 +262,15 @@ test("managed: --target and a deduplicated repeat never call the resolver", { sk
   } finally { f.cleanup(); }
   const g = fixture();
   try {
+    if (!posix) {
+      // A refused spawn records nothing, so the repeat is NOT deduplicated: it reaches the resolver again,
+      // which the poisoned operator executable refuses (exit 4), still before any spawn effect.
+      refusedManaged(g, g.dispatch([...g.spawnArgs, "--role", "coder"], { PATH: pathWith(g.bin) }));
+      const r = g.dispatch([...g.spawnArgs, "--role", "coder"], { ...poison, PATH: pathWith(g.bin) });
+      assert.equal(r.status, 4, r.stderr);
+      assertNothingSpawned(g, r);
+      return;
+    }
     assert.equal(g.dispatch([...g.spawnArgs, "--role", "coder"], { PATH: pathWith(g.bin) }).status, 0);
     const r = g.dispatch([...g.spawnArgs, "--role", "coder"], { ...poison, PATH: pathWith(g.bin) });
     assert.equal(r.status, 8, r.stderr);
@@ -229,7 +278,7 @@ test("managed: --target and a deduplicated repeat never call the resolver", { sk
   } finally { g.cleanup(); }
 });
 
-test("managed: resolver refusals stop BEFORE any spawn effect (exit 4 / exit 10)", { skip }, () => {
+test("managed: resolver refusals stop BEFORE any spawn effect (exit 4 / exit 10)", () => {
   const cases: Array<[string, (f: Fx) => [string[], NodeJS.ProcessEnv], number, RegExp]> = [
     ["explicit documented-retired model", (f) => [explicit(f, "codex"), { PATH: pathWith(f.bin), AIGENTRY_CODEX_MODEL: "gpt-5.4" }],
       4, /MODEL_TUPLE_INCOMPATIBLE/],
@@ -288,7 +337,7 @@ if (process.argv.includes('--resolve')) {
 
 for (const [mode, exits] of [["crash", [10]], ["malformed", [10]], ["exit4", [4]], ["exit10", [10]], ["wrong-sid", [4, 10]],
   ["wrong-task", [4, 10]], ["wrong-cli", [4, 10]], ["observed", [4, 10]], ["hang", [4, 10]]] as const) {
-  test(`managed: resolver fault '${mode}' refuses before spawn, never a legacy fallback`, { skip }, () => {
+  test(`managed: resolver fault '${mode}' refuses before spawn, never a legacy fallback`, () => {
     const f = fixture();
     try {
       const preload = join(f.root, "fault-preload.cjs"), mark = join(f.root, "fault-mark");
@@ -296,7 +345,7 @@ for (const [mode, exits] of [["crash", [10]], ["malformed", [10]], ["exit4", [4]
       const started = Date.now();
       const r = spawnSync(process.execPath, [join(REPO, "dist/src/dispatch/cli.js"), "--ref", f.ref, "--task", TASK,
         "--no-verify-started", "--timeout-ms", "500", ...explicit(f, "claude")], { cwd: f.root, encoding: "utf8", timeout: 90000,
-        env: { ...f.env, PATH: pathWith(f.bin), NODE_OPTIONS: `--require "${preload}"`, FAULT_MODE: mode, FAULT_MARK: mark } });
+        env: { ...f.env, PATH: pathWith(f.bin), NODE_OPTIONS: `--require "${preload.replace(/\\/g, "\\\\")}"`, FAULT_MODE: mode, FAULT_MARK: mark } });
       const marks = existsSync(mark) ? readFileSync(mark, "utf8") : "";
       assert.match(marks, new RegExp(`fired ${mode}`), "the fault reached a resolver subprocess");
       if (mode.startsWith("wrong-") || mode === "observed") assert.match(marks, /mutated/, "the resolver decision was mutated");
@@ -325,7 +374,8 @@ function layouts(f: Fx) {
     path: pathWith(join(f.root, "npm/bin"), join(f.root, "native/bin"), f.bin) };
 }
 
-test("managed: stale first PATH hit is skipped; native realpath bound; version never read from a file name", { skip }, () => {
+// POSIX only: npm-global and native-installer SYMLINK layouts (layouts()); win32 counterpart: "managed (no OS sandbox): PATH selection …".
+posixTest("managed: stale first PATH hit is skipped; native realpath bound; version never read from a file name", () => {
   const f = fixture();
   try {
     const l = layouts(f);
@@ -336,7 +386,8 @@ test("managed: stale first PATH hit is skipped; native realpath bound; version n
   } finally { f.cleanup(); }
 });
 
-test("managed: only incompatible executables → refused (exit 4), no fallback; a declared exe has no PATH fallback", { skip }, () => {
+// POSIX only: symlink layouts (layouts()); win32 counterpart: "managed (no OS sandbox): PATH selection …".
+posixTest("managed: only incompatible executables → refused (exit 4), no fallback; a declared exe has no PATH fallback", () => {
   for (const which of ["only-npm-on-path", "declared-npm"] as const) {
     const f = fixture();
     try {
@@ -352,7 +403,8 @@ test("managed: only incompatible executables → refused (exit 4), no fallback; 
   }
 });
 
-test("managed: declared native exe wins over the first hit; its declared version needs a matching identity", { skip }, () => {
+// POSIX only: symlink layouts and the sealed audit's version fields; win32 counterpart: "managed (no OS sandbox): PATH selection …".
+posixTest("managed: declared native exe wins over the first hit; its declared version needs a matching identity", () => {
   for (const changed of [false, true]) {
     const f = fixture();
     try {
@@ -370,7 +422,8 @@ test("managed: declared native exe wins over the first hit; its declared version
   }
 });
 
-test("managed: --observe launch-failure binds {model, min_version} only and skips the known-lower exe", { skip }, () => {
+// POSIX only: symlink layouts (layouts()); the --observe resolver input itself is platform-neutral and runs before the win32 refusal.
+posixTest("managed: --observe launch-failure binds {model, min_version} only and skips the known-lower exe", () => {
   for (const observe of [false, true]) {
     const f = fixture();
     try {
@@ -386,7 +439,32 @@ test("managed: --observe launch-failure binds {model, min_version} only and skip
   }
 });
 
-test("managed: an executable replaced after sealing refuses at the runner (SANDBOX_EXECUTABLE_CHANGED), never rebinds", { skip }, () => {
+// #1167 win32 counterpart of the four layout cases above, with plain files (no symlink): PATH selection and the
+// declared executable are resolved before the platform refusal, and an only-stale PATH refuses (exit 4).
+if (!posix) test("managed (no OS sandbox): PATH selection skips a stale npm-known hit; a declared exe wins; only-stale refuses (exit 4)", () => {
+  const f = fixture();
+  try {
+    rmSync(join(f.bin, "claude"));
+    const pkg = join(f.root, "npm/node_modules/@anthropic-ai/claude-code"), nativeBin = join(f.root, "native/bin"), otherBin = join(f.root, "other/bin");
+    for (const dir of [pkg, nativeBin, otherBin]) mkdirSync(dir, { recursive: true });
+    writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "@anthropic-ai/claude-code", version: "2.1.198", bin: { claude: "claude" } }));
+    fakeCli(join(pkg, "claude"), "npm");
+    fakeCli(join(otherBin, "claude"), "other");
+    const native = fakeCli(join(nativeBin, "claude"), "native");
+    const env = { AIGENTRY_CLAUDE_MODEL: "claude-opus-5-5" };
+    assert.equal(refusedManaged(f, f.dispatch(explicit(f, "claude"), { ...env, PATH: pathWith(pkg, nativeBin, f.bin) })).executable, native,
+      "the version-known stale first hit (2.1.198) is skipped");
+    assert.equal(refusedManaged(f, f.dispatch(explicit(f, "claude"), { ...env, PATH: pathWith(otherBin, nativeBin, f.bin),
+      AIGENTRY_CLAUDE_EXECUTABLE: native })).executable, native, "the declared executable wins over the first PATH hit");
+    const r = f.dispatch(explicit(f, "claude"), { ...env, PATH: pathWith(pkg, f.bin) });
+    assert.equal(r.status, 4, r.stderr);
+    assert.match(r.stderr, /MODEL_TUPLE_INCOMPATIBLE/);
+    assertNothingSpawned(f, r);
+  } finally { f.cleanup(); }
+});
+
+// POSIX only: needs a sealed manifest and the sandbox runner, which exist only where the OS sandbox runs; win32 seals nothing (refusedManaged).
+posixTest("managed: an executable replaced after sealing refuses at the runner (SANDBOX_EXECUTABLE_CHANGED), never rebinds", () => {
   const f = fixture();
   try {
     const { exe } = assertManaged(f, f.dispatch(explicit(f, "claude"), { PATH: pathWith(f.bin) }), "claude");
@@ -400,7 +478,7 @@ test("managed: an executable replaced after sealing refuses at the runner (SANDB
   } finally { f.cleanup(); }
 });
 
-test("legacy guard kept: a versioned native file as argv[0] still fails SANDBOX_COMMAND_BINDING", { skip }, async () => {
+test("legacy guard kept: a versioned native file as argv[0] still fails SANDBOX_COMMAND_BINDING", async () => {
   const f = fixture();
   try {
     const sandbox = await import(pathToFileURL(join(REPO, "dist/src/session/worker-sandbox.js")).href);
@@ -409,6 +487,13 @@ test("legacy guard kept: a versioned native file as argv[0] still fails SANDBOX_
     const staging = join(f.root, "staging");
     mkdirSync(staging);
     const scope = { version: 1, task: TASK, sid: SID, read: [join(f.root, "project")], write: [join(f.root, "project")], domains: [] };
+    if (!posix) {
+      // #1167 P6: the platform gate precedes the binding guard; it too refuses before any staging write.
+      assert.throws(() => sandbox.prepareWorkerSandbox(scope, "claude", join(f.root, "project"), [v, "--model", "m"], staging),
+        /SANDBOX_PLATFORM_UNSUPPORTED/);
+      assert.equal(existsSync(join(staging, "sandbox")), false, "refused before any staging write");
+      return;
+    }
     assert.throws(() => sandbox.prepareWorkerSandbox(scope, "claude", join(f.root, "project"), [v, "--model", "m"], staging),
       /SANDBOX_COMMAND_BINDING/);
     assert.equal(existsSync(join(staging, "sandbox")), false, "refused before any staging write");
@@ -427,7 +512,7 @@ function resolved(f: Fx, cli: "claude" | "codex", sid: string, env: NodeJS.Proce
 const boot = (f: Fx, cli: string, decision: unknown, env: NodeJS.ProcessEnv = {}) => f.boot(cli, { PATH: pathWith(f.bin),
   AIGENTRY_TASK_ID: TASK, AIGENTRY_SPAWN_DECISION: typeof decision === "string" ? decision : JSON.stringify(decision), ...env });
 
-test("U3: a malformed or mis-bound AIGENTRY_SPAWN_DECISION exits 2 before any boot effect", { skip }, () => {
+test("U3: a malformed or mis-bound AIGENTRY_SPAWN_DECISION exits 2 before any boot effect", () => {
   const f = fixture();
   try {
     const good = resolved(f, "claude", "adapter-fixture");
@@ -448,7 +533,7 @@ test("U3: a malformed or mis-bound AIGENTRY_SPAWN_DECISION exits 2 before any bo
   } finally { f.cleanup(); }
 });
 
-test("U3: null model / null effort omit their flags even with inherited env; argv[0] is the bound path", { skip }, () => {
+test("U3: null model / null effort omit their flags even with inherited env; argv[0] is the bound path", () => {
   for (const cli of ["claude", "codex"] as const) {
     const f = fixture();
     try {
@@ -470,7 +555,7 @@ test("U3: null model / null effort omit their flags even with inherited env; arg
   }
 });
 
-test("legacy kept: no decision → boot-prepare argv carries today's literals", { skip }, () => {
+test("legacy kept: no decision → boot-prepare argv carries today's literals", () => {
   const f = fixture();
   try {
     const r = f.boot("claude", { PATH: pathWith(f.bin) });
