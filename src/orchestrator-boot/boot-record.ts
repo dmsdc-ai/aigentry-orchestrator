@@ -17,11 +17,18 @@
 //
 // Stdlib only: no subprocess, no network, no host call. No chmod/chown — nothing is repaired
 // or widened — and an invalid prior file is never overwritten, renamed or deleted.
+//
+// WIN32 (#1167, PRINCIPLES P2/P3/P4): the uid/mode rules are read-back ACL checks through the
+// private-storage primitive (bin/lib/win-private-storage.mjs, which runs the Windows system tools
+// icacls/whoami/PowerShell — the only subprocesses, and only on win32). Only a directory this call
+// created is Set private (the `mkdir 0700` analogue); nothing pre-existing is repaired or widened.
+// File data is fsync'd; the directory entry relies on NTFS journaling (no directory fsync, P3).
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { normalizeLaunch } from "../session/boot-adapter/launch-config.js";
+import type { VerifyItem, VerifyResult, WinPrivateStorage } from "../session/private-storage.js";
 import {
   isCliKind,
   type CliKind,
@@ -44,6 +51,17 @@ const PANE_KEYS = ["host", "workspace_id", "surface_id", "terminal_lifecycle_id"
 const MODEL_ENV_SOURCE: LaunchSource = `env:${PLAN_ENV.model}`;
 const EFFORT_ENV_SOURCE: LaunchSource = `env:${PLAN_ENV.effort}`;
 const CLI_DEFAULT_VALUE: LaunchValue = Object.freeze({ value: "unknown", source: "cli-default" });
+// win32 only: the P2 primitive through its typed bridge. A conditional dynamic import, so the POSIX
+// boot module closure is unchanged (tests/packaging/native-capture.test.mjs pins it). A failed load
+// leaves it null, which is `skipped:platform` — the record never stops a boot.
+const WIN_STORAGE: WinPrivateStorage | null = process.platform === "win32"
+  ? await import("../session/private-storage.js").then((m) => m.winPrivateStorage, () => null)
+  : null;
+// Primitive codes that mean "the tools or the environment failed", not "this path is unsafe".
+const WIN_UNAVAILABLE: ReadonlySet<string> = new Set([
+  "unsupported_platform", "system_root_invalid", "tool_missing", "tool_timeout", "tool_failed", "tool_output_invalid",
+  "principal_unavailable", "read_failed",
+]);
 
 export type PlanSource = "wizard" | "env-plan";
 
@@ -98,13 +116,15 @@ export type ReadResult =
   | { readonly status: "skipped"; readonly reason: "sid" | "platform" | "unsafe-path" };
 
 /**
- * The platform prerequisites. A missing `process.getuid` or safe open flag (e.g. Windows)
- * is an explicit `skipped:platform`, never a pretend success. Injectable for tests only.
+ * The platform prerequisites. A missing `process.getuid` or safe open flag is an explicit
+ * `skipped:platform`, never a pretend success. On win32 `storage` (the P2 primitive) selects the
+ * win32 arm instead; without it win32 is `skipped:platform` too. Injectable for tests only.
  */
 export interface BootRecordPlatform {
   readonly getuid: (() => number) | undefined;
   readonly noFollow: number | undefined;
   readonly nonBlock: number | undefined;
+  readonly storage?: WinPrivateStorage | null;
 }
 
 export function nodePlatform(): BootRecordPlatform {
@@ -112,6 +132,7 @@ export function nodePlatform(): BootRecordPlatform {
     getuid: typeof process.getuid === "function" ? process.getuid.bind(process) : undefined,
     noFollow: fs.constants.O_NOFOLLOW,
     nonBlock: fs.constants.O_NONBLOCK,
+    storage: WIN_STORAGE,
   };
 }
 
@@ -332,6 +353,8 @@ export function readControllerBootRecord(
 ): ReadResult {
   if (!isSafeSid(sid)) return { status: "skipped", reason: "sid" };
   try {
+    const storage = winStorage(platform);
+    if (storage !== null) return winRead(root, sid, storage);
     const safe = supported(platform);
     if (safe === null) return { status: "skipped", reason: "platform" };
     const base = path.resolve(root);
@@ -389,6 +412,8 @@ export function writeControllerBootRecord(
   let tmp: string | null = null;
   try {
     if (!isSafeSid(input.sid)) return skip("skipped:sid");
+    const storage = winStorage(platform);
+    if (storage !== null) return winWrite(root, input, storage);
     const safe = supported(platform);
     if (safe === null) return skip("skipped:platform");
     const record = buildControllerBootRecord(input, randomUUID());
@@ -424,6 +449,190 @@ export function writeControllerBootRecord(
     // Detects only drift it observes (see the header's race limit).
     const after = chain(base, input.sid, safe.uid, false) === "ok" ? lstatOrNull(target) : null;
     if (after === null || after.dev !== written.dev || after.ino !== written.ino) return skip("skipped:raced");
+    return { outcome: "written", relation: targetRelation(prior === "absent" ? null : prior, record) };
+  } catch {
+    if (tmp !== null) {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        // Best effort, and only ever our own temp path.
+      }
+    }
+    return skip("skipped:error");
+  }
+}
+
+// ── the win32 arm (#1167; PRINCIPLES P2/P3/P4, DECISIONS-2 Q-FILE R2) ───────
+// Same outcomes and order as the POSIX arm; only the safety predicates differ:
+// - ROOT, sessions and <sid> must be P-OWNED (the `uid===euid && !(mode&022)` analogue) and the
+//   controller directory P2-private; the record is a private FILE, verified together with its
+//   private parent in ONE read batch (no file Set). Chain and record are one batch.
+// - no-follow (P4): lstat every component under ROOT and refuse reparse points (symlink,
+//   junction), plus realpath containment; the opened record handle is bound to the verified
+//   (dev, ino), because there is no O_NOFOLLOW.
+// - a tool or environment failure is `skipped:platform` (read: reason "platform").
+type WinState = DirState | "unavailable";
+
+interface WinChain {
+  readonly state: WinState;
+  readonly file?: VerifyResult;
+  readonly missingAt?: number;
+}
+
+function winStorage(p: BootRecordPlatform): WinPrivateStorage | null {
+  return process.platform === "win32" ? p.storage ?? null : null;
+}
+
+function winFailure(code: string | undefined): "unavailable" | "unsafe" {
+  return code !== undefined && WIN_UNAVAILABLE.has(code) ? "unavailable" : "unsafe";
+}
+
+/** lstat walk ROOT → controller; ONE verify batch over the existing prefix, plus the record once all four exist. */
+function winVerify(storage: WinPrivateStorage, dirs: readonly string[], file: string): WinChain {
+  const items: VerifyItem[] = [];
+  let missingAt = -1;
+  for (const [i, d] of dirs.entries()) {
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(d);
+    } catch (e) {
+      if (errCode(e) !== "ENOENT") return { state: "unsafe" };
+      missingAt = i;
+      break;
+    }
+    if (!st.isDirectory() || st.isSymbolicLink()) return { state: "unsafe" };
+    items.push({ path: d, kind: "directory", want: i === dirs.length - 1 ? "private" : "owned" });
+  }
+  if (missingAt === -1) items.push({ path: file, kind: "file", want: "private" });
+  const results = items.length === 0 ? [] : storage.verify(items);
+  const dirResults = missingAt === -1 ? results.slice(0, -1) : results;
+  const failed = dirResults.find((r) => !r.ok);
+  if (failed !== undefined) return { state: winFailure(failed.code) };
+  if (missingAt !== -1) return { state: "missing", missingAt };
+  // Containment catches a mount point or alias under ROOT that lstat does not report as a link.
+  const top = dirs[0];
+  const leaf = dirs[dirs.length - 1];
+  const want = path.join(fs.realpathSync.native(top), path.relative(top, leaf));
+  if (fs.realpathSync.native(leaf).toLowerCase() !== want.toLowerCase()) return { state: "unsafe" };
+  return { state: "ok", file: results[results.length - 1] };
+}
+
+/**
+ * The win32 `chain()`: ROOT and sessions must pre-exist. With `create`, <sid> and controller may
+ * each be made by ONE mkdir; a directory this call made is Set private, and is removed again if
+ * the Set fails (no non-private directory is left to refuse every later boot). Then re-verified.
+ */
+function winChain(storage: WinPrivateStorage, root: string, sid: string, create: boolean): WinChain {
+  const dirs = [root, path.join(root, "sessions"), path.join(root, "sessions", sid), controllerDir(root, sid)];
+  const file = path.join(controllerDir(root, sid), RECORD_FILE);
+  const first = winVerify(storage, dirs, file);
+  if (first.state !== "missing" || !create || (first.missingAt ?? 0) < 2) return first;
+  for (const d of dirs.slice(first.missingAt)) {
+    let created = true;
+    try {
+      fs.mkdirSync(d);
+    } catch (e) {
+      if (errCode(e) !== "EEXIST") return { state: "unsafe" };
+      created = false;
+    }
+    const st = lstatOrNull(d);
+    if (st === null || !st.isDirectory() || st.isSymbolicLink()) return { state: "unsafe" };
+    if (!created) continue;
+    const set = storage.setPrivate(d, "directory");
+    if (set.status !== "ok") {
+      try {
+        fs.rmdirSync(d);
+      } catch {
+        // Best effort, and only ever the empty directory this call just made.
+      }
+      return { state: winFailure(set.code) };
+    }
+  }
+  const again = winVerify(storage, dirs, file);
+  return again.state === "missing" ? { state: "unsafe" } : again;
+}
+
+/** The win32 `readRecordFile()`: `verified` is the record's result from the chain batch. */
+function winReadRecordFile(file: string, sid: string, verified: VerifyResult | undefined): "absent" | "invalid" | ControllerBootRecord {
+  if (verified === undefined || !verified.ok) return verified?.code === "missing" ? "absent" : "invalid";
+  let fd: number;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY);
+  } catch (e) {
+    return errCode(e) === "ENOENT" ? "absent" : "invalid";
+  }
+  try {
+    const st = fs.fstatSync(fd, { bigint: true });
+    if (!st.isFile() || st.nlink !== 1n || String(st.dev) !== verified.dev || String(st.ino) !== verified.ino ||
+      st.size > BigInt(RECORD_MAX_BYTES)) {
+      return "invalid";
+    }
+    const buf = Buffer.alloc(RECORD_MAX_BYTES + 1);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    if (n > RECORD_MAX_BYTES) return "invalid";
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(buf.toString("utf8", 0, n));
+    } catch {
+      return "invalid";
+    }
+    return parseControllerBootRecord(parsed, sid) ?? "invalid";
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function winRead(root: string, sid: string, storage: WinPrivateStorage): ReadResult {
+  const base = path.resolve(root);
+  const c = winChain(storage, base, sid, false);
+  if (c.state === "missing") return { status: "absent" };
+  if (c.state === "unavailable") return { status: "skipped", reason: "platform" };
+  if (c.state === "unsafe") return { status: "skipped", reason: "unsafe-path" };
+  const r = winReadRecordFile(path.join(controllerDir(base, sid), RECORD_FILE), sid, c.file);
+  if (r === "absent" || r === "invalid") return { status: r };
+  return { status: "ok", record: r };
+}
+
+function winWrite(root: string, input: BootRecordInput, storage: WinPrivateStorage): WriteResult {
+  const skip = (outcome: WriteOutcome): WriteResult => ({ outcome, relation: "none" });
+  let tmp: string | null = null;
+  try {
+    const record = buildControllerBootRecord(input, randomUUID());
+    if (record === null) return skip("skipped:cli");
+    const base = path.resolve(root);
+    const c = winChain(storage, base, input.sid, true);
+    if (c.state === "unavailable") return skip("skipped:platform");
+    if (c.state !== "ok") return skip("skipped:unsafe-path");
+    const dir = controllerDir(base, input.sid);
+    const target = path.join(dir, RECORD_FILE);
+    const prior = winReadRecordFile(target, input.sid, c.file);
+    if (prior === "invalid") return skip("skipped:prior-invalid");
+    const bytes = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
+    if (bytes.length > RECORD_MAX_BYTES) return skip("skipped:error");
+
+    // Born private: the temp inherits the verified-private controller directory's single ACE.
+    const tmpPath = path.join(dir, `.${RECORD_FILE}.${randomUUID()}`);
+    const fd = fs.openSync(tmpPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+    tmp = tmpPath;
+    let written: fs.BigIntStats;
+    try {
+      let off = 0;
+      while (off < bytes.length) off += fs.writeSync(fd, bytes, off, bytes.length - off);
+      fs.fsyncSync(fd);
+      written = fs.fstatSync(fd, { bigint: true });
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmpPath, target);
+    tmp = null;
+
+    // Chain and record read back in one batch (the record's P2 verify). Detects only drift it
+    // observes (see the header's race limit).
+    const after = winChain(storage, base, input.sid, false);
+    if (after.state !== "ok" || after.file?.ok !== true || after.file.dev !== String(written.dev) ||
+      after.file.ino !== String(written.ino)) {
+      return skip("skipped:raced");
+    }
     return { outcome: "written", relation: targetRelation(prior === "absent" ? null : prior, record) };
   } catch {
     if (tmp !== null) {

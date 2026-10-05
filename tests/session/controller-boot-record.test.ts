@@ -14,7 +14,7 @@ import * as path from "node:path";
 import vm from "node:vm";
 import { spawnSync } from "node:child_process";
 import { createRequire, syncBuiltinESMExports } from "node:module";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { normalizeLaunch } from "../../src/session/boot-adapter/launch-config.js";
 import {
   type BootRecordInput,
@@ -36,8 +36,35 @@ import {
 const require = createRequire(import.meta.url);
 
 const POSIX = typeof process.getuid === "function" && typeof fs.constants.O_NOFOLLOW === "number";
-const POSIX_ONLY: string | false = POSIX ? false : "POSIX-only fixture (modes/symlinks/uid); win32 is covered by the explicit skipped:platform tests";
+// #1167: every test runs on win32 too. Each asserts its own platform's rules: POSIX modes/uid, or on
+// win32 the P2 ACL read-back (ACL tamper via the helper instead of chmod; junctions beside symlinks).
+const WIN = process.platform === "win32";
 const IS_ROOT = POSIX && process.getuid?.() === 0;
+
+// win32 only: the #1167 ACL test helper (plain .mjs beside the sources; the compiled test sits at
+// dist/tests/session). Symlink fixtures on win32 need SeCreateSymbolicLinkPrivilege (windows-latest
+// is elevated); junctions need none.
+interface WinAcl {
+  makePrivate(path: string): void;
+  grant(path: string, spec: string): void;
+  setOwner(path: string, sidSpec: string): void;
+  daclText(path: string): string;
+  isPrivate(path: string): boolean;
+  userSid(): string;
+}
+const HELPER = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "tests", "helpers", "win-acl.mjs");
+const winAcl = WIN ? ((await import(pathToFileURL(HELPER).href)) as WinAcl) : null;
+function acl(): WinAcl {
+  if (winAcl === null) throw new Error("the win-acl helper is win32-only");
+  return winAcl;
+}
+
+/** win32: raw `icacls <args>` for what the helper does not offer (`/grant:r`); fails the test on error. */
+function icacls(args: string[]): void {
+  const exe = path.join(process.env.SystemRoot ?? "", "System32", "icacls.exe");
+  const r = spawnSync(exe, args, { shell: false, windowsHide: true, timeout: 30_000, encoding: "latin1" });
+  assert.equal(r.status, 0, `icacls ${args.join(" ")} failed: ${r.error?.message ?? ""} ${r.stdout}${r.stderr}`);
+}
 
 const WS = "0a1b2c3d-1111-4222-8333-444455556666";
 const SURF = "0a1b2c3d-7777-4888-9999-aaaabbbbcccc";
@@ -58,10 +85,14 @@ after(() => {
   }
 });
 
-/** A fresh `<base>/home` ROOT with `sessions/`, both 0700, plus an `outside/` sibling. */
+/**
+ * A fresh `<base>/home` ROOT with `sessions/`, both 0700, plus an `outside/` sibling. win32: base is
+ * Set private, so all three inherit its single user ACE (owner-only, the 0700 analogue).
+ */
 function fixture(): { base: string; root: string; sessions: string; outside: string } {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "aigentry-boot-record-"));
   bases.push(base);
+  if (WIN) acl().makePrivate(base);
   const root = path.join(base, "home");
   const sessions = path.join(root, "sessions");
   const outside = path.join(base, "outside");
@@ -96,6 +127,12 @@ function targetOf(root: string, sid = "orch-1162"): string {
   return p;
 }
 
+/** `<sid>/controller` made ahead of a write: 0700, and on win32 Set private as the writer makes it. */
+function makeController(target: string): void {
+  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+  if (WIN) acl().makePrivate(path.dirname(target));
+}
+
 function assertLine(r: WriteResult): void {
   assert.match(`${r.outcome} relation=${r.relation}`, OUTCOME_LINE);
 }
@@ -105,7 +142,7 @@ function listTree(dir: string): string[] {
   const walk = (d: string): void => {
     for (const e of fs.readdirSync(d, { withFileTypes: true })) {
       const p = path.join(d, e.name);
-      out.push(path.relative(dir, p));
+      out.push(path.relative(dir, p).split(path.sep).join("/")); // "/"-joined on every OS
       if (e.isDirectory() && !e.isSymbolicLink()) walk(p);
     }
   };
@@ -193,7 +230,7 @@ test("provenance: explicit wizard values → wizard; codex gap / gemini unsuppor
   }
 });
 
-test("provenance: opus[1m], a+b and HIGH are recorded unknown (known gap), and the boot still writes", { skip: POSIX_ONLY }, () => {
+test("provenance: opus[1m], a+b and HIGH are recorded unknown (known gap), and the boot still writes", () => {
   const unknown = { value: "unknown", source: "unknown" };
   for (const id of ["opus[1m]", "a+b"]) {
     assert.deepEqual(recordedLaunch("claude", "env-plan", { kind: "explicit", id }, { kind: "provider-default" }).model, unknown, id);
@@ -222,7 +259,7 @@ test("pane: host cmux iff a workspace UUID; lowercased; otherwise null", () => {
 });
 
 // ── schema / no leak ────────────────────────────────────────────────────────
-test("schema: exact keys, canonical values, no sensitive field or value", { skip: POSIX_ONLY }, () => {
+test("schema: exact keys, canonical values, no sensitive field or value", () => {
   const { root } = fixture();
   const r = writeControllerBootRecord(root, input());
   assert.deepEqual(r, { outcome: "written", relation: "first" });
@@ -247,7 +284,7 @@ test("schema: exact keys, canonical values, no sensitive field or value", { skip
   }
 });
 
-test("schema: key order alone is not corruption; a reordered valid record reads ok", { skip: POSIX_ONLY }, () => {
+test("schema: key order alone is not corruption; a reordered valid record reads ok", () => {
   const { root } = fixture();
   writeControllerBootRecord(root, input());
   const target = targetOf(root);
@@ -265,7 +302,7 @@ test("schema: key order alone is not corruption; a reordered valid record reads 
 });
 
 // ── absent / valid prior ────────────────────────────────────────────────────
-test("absent prior: creates <sid>/controller 0700 and a 0600 nlink-1 record, no temp left", { skip: POSIX_ONLY }, () => {
+test("absent prior: creates <sid>/controller 0700 and a 0600 nlink-1 record, no temp left", () => {
   const { root, sessions } = fixture();
   assert.equal(readControllerBootRecord(root, "orch-1162").status, "absent");
   assert.deepEqual(listTree(sessions), [], "the reader created nothing");
@@ -274,18 +311,25 @@ test("absent prior: creates <sid>/controller 0700 and a 0600 nlink-1 record, no 
   const target = targetOf(root);
   const st = fs.lstatSync(target);
   assert.ok(st.isFile());
-  assert.equal(st.mode & 0o777, 0o600);
+  if (!WIN) assert.equal(st.mode & 0o777, 0o600);
   assert.equal(st.nlink, 1);
-  assert.equal(fs.lstatSync(path.join(sessions, "orch-1162")).mode & 0o077, 0);
-  assert.equal(fs.lstatSync(path.dirname(target)).mode & 0o077, 0);
+  if (WIN) {
+    // P2 read-back (product verify AND the icacls oracle): both created directories were Set
+    // private and the record is private by inheritance (no file Set).
+    for (const p of [path.join(sessions, "orch-1162"), path.dirname(target), target]) assert.equal(acl().isPrivate(p), true, p);
+  } else {
+    assert.equal(fs.lstatSync(path.join(sessions, "orch-1162")).mode & 0o077, 0);
+    assert.equal(fs.lstatSync(path.dirname(target)).mode & 0o077, 0);
+  }
   assert.deepEqual(listTree(sessions), ["orch-1162", "orch-1162/controller", "orch-1162/controller/boot-record.json"]);
 });
 
-test("valid prior: replaced atomically (new inode, new boot_id) and relation described", { skip: POSIX_ONLY }, () => {
+test("valid prior: replaced atomically (new inode, new boot_id) and relation described", () => {
   const { root } = fixture();
   writeControllerBootRecord(root, input());
   const target = targetOf(root);
-  const before = fs.lstatSync(target);
+  // bigint: a win32 64-bit file index can exceed Number precision.
+  const before = fs.lstatSync(target, { bigint: true });
   const prior = readControllerBootRecord(root, "orch-1162");
   assert.equal(prior.status, "ok");
   const r = writeControllerBootRecord(root, input({ planSource: "wizard" }));
@@ -297,7 +341,7 @@ test("valid prior: replaced atomically (new inode, new boot_id) and relation des
     assert.equal(now.record.plan_source, "wizard");
     assert.equal(now.record.launch.model.source, "wizard");
   }
-  assert.notEqual(fs.lstatSync(target).ino, before.ino);
+  assert.notEqual(fs.lstatSync(target, { bigint: true }).ino, before.ino);
   const r2 = writeControllerBootRecord(root, input({ env: { CMUX_WORKSPACE_ID: WS } }));
   assert.deepEqual(r2, { outcome: "written", relation: "target-unknown" });
   assert.deepEqual(listTree(path.dirname(target)), ["boot-record.json"]);
@@ -339,7 +383,7 @@ test("relation gates nothing in cli.ts: one writer call, relation only interpola
 });
 
 // ── sid / cli / platform ────────────────────────────────────────────────────
-test("sid: unsafe sids are skipped:sid and nothing is created", { skip: POSIX_ONLY }, () => {
+test("sid: unsafe sids are skipped:sid and nothing is created", () => {
   const { root, sessions } = fixture();
   for (const sid of ["a/../b", "", ".hidden", "-x", "_x", "a b", "a\nb", "x".repeat(129), "../orch", "a/b"]) {
     const r = writeControllerBootRecord(root, input({ sid }));
@@ -352,21 +396,22 @@ test("sid: unsafe sids are skipped:sid and nothing is created", { skip: POSIX_ON
   assert.deepEqual(listTree(sessions).filter((p) => !p.startsWith("x".repeat(128))), []);
 });
 
-test("cli: a non-CliKind provider is skipped:cli and nothing is created", { skip: POSIX_ONLY }, () => {
+test("cli: a non-CliKind provider is skipped:cli and nothing is created", () => {
   const { root, sessions } = fixture();
   assert.deepEqual(writeControllerBootRecord(root, input({ cli: "bash" })), { outcome: "skipped:cli", relation: "none" });
   assert.deepEqual(listTree(sessions), []);
 });
 
 test("platform: missing getuid / O_NOFOLLOW / O_NONBLOCK is explicit skipped:platform (not a fake success)", () => {
-  // Runs on every OS: this is the Windows shape (no process.getuid, no O_NOFOLLOW) made explicit.
+  // Runs on every OS: a missing POSIX prerequisite without the win32 primitive (storage: null) is
+  // skipped:platform everywhere — on win32 too, whose real platform takes the primitive arm instead.
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "aigentry-boot-record-"));
   bases.push(base);
   const real = nodePlatform();
   const variants: BootRecordPlatform[] = [
-    { ...real, getuid: undefined },
-    { ...real, noFollow: undefined },
-    { ...real, nonBlock: undefined },
+    { ...real, getuid: undefined, storage: null },
+    { ...real, noFollow: undefined, storage: null },
+    { ...real, nonBlock: undefined, storage: null },
   ];
   for (const p of variants) {
     assert.deepEqual(writeControllerBootRecord(base, input(), p), { outcome: "skipped:platform", relation: "none" });
@@ -375,10 +420,35 @@ test("platform: missing getuid / O_NOFOLLOW / O_NONBLOCK is explicit skipped:pla
   assert.deepEqual(fs.readdirSync(base), []);
 });
 
-test("platform: on win32 the real platform is skipped:platform", { skip: process.platform === "win32" ? false : "win32-only assertion; the seam test above covers the same branch here" }, () => {
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), "aigentry-boot-record-"));
-  bases.push(base);
-  assert.equal(writeControllerBootRecord(base, input()).outcome, "skipped:platform");
+test("platform: on win32 the real platform is the private-storage arm; unavailable tools are skipped:platform and leave nothing", { skip: process.platform === "win32" ? false : "win32-only assertion; the seam test above covers the same branch here" }, () => {
+  const { root, sessions } = fixture();
+  assert.ok(nodePlatform().storage, "win32 nodePlatform() carries the private-storage primitive");
+  const saved = process.env.SystemRoot;
+  try {
+    delete process.env.SystemRoot; // the primitive cannot resolve its tools: system_root_invalid
+    assert.deepEqual(writeControllerBootRecord(root, input()), { outcome: "skipped:platform", relation: "none" });
+    assert.deepEqual(readControllerBootRecord(root, "orch-1162"), { status: "skipped", reason: "platform" });
+  } finally {
+    if (saved !== undefined) process.env.SystemRoot = saved;
+  }
+  assert.deepEqual(listTree(sessions), [], "nothing is created without the tools");
+  // A Set that fails on a directory this call made removes it again: no non-private <sid> is left
+  // behind to refuse every later boot. icacls is failed through the builtin module (live binding).
+  const cp = require("node:child_process") as Record<string, unknown>;
+  const spawn = cp.spawnSync as (...a: any[]) => any;
+  try {
+    cp.spawnSync = function (this: unknown, ...a: any[]) {
+      if (/icacls\.exe$/i.test(String(a[0]))) return { pid: 0, output: [null, "", ""], stdout: "", stderr: "", status: 5, signal: null };
+      return spawn.apply(this, a);
+    };
+    syncBuiltinESMExports();
+    assert.deepEqual(writeControllerBootRecord(root, input()), { outcome: "skipped:platform", relation: "none" });
+  } finally {
+    cp.spawnSync = spawn;
+    syncBuiltinESMExports();
+  }
+  assert.deepEqual(listTree(sessions), [], "the directory whose Set failed was removed");
+  assert.deepEqual(writeControllerBootRecord(root, input()), { outcome: "written", relation: "first" });
 });
 
 test("root: AIGENTRY_HOME when non-empty, else <homedir>/.aigentry (computed only, nothing touched)", () => {
@@ -388,7 +458,7 @@ test("root: AIGENTRY_HOME when non-empty, else <homedir>/.aigentry (computed onl
 });
 
 // ── the safe chain ──────────────────────────────────────────────────────────
-test("chain: symlinked/unsafe/missing ancestors are skipped:unsafe-path and nothing lands outside", { skip: POSIX_ONLY }, () => {
+test("chain: symlinked/unsafe/missing ancestors are skipped:unsafe-path and nothing lands outside", () => {
   const cases: Array<[string, (f: ReturnType<typeof fixture>) => string]> = [
     ["ROOT is a symlink", (f) => {
       const link = path.join(f.base, "root-link");
@@ -416,11 +486,14 @@ test("chain: symlinked/unsafe/missing ancestors are skipped:unsafe-path and noth
       return f.root;
     }],
     ["sessions is group-writable", (f) => {
-      fs.chmodSync(f.sessions, 0o770);
+      // win32: an icacls write ACE for BUILTIN\Users instead of chmod (P-OWNED refuses ace_foreign_write).
+      if (WIN) acl().grant(f.sessions, "*S-1-5-32-545:(W)");
+      else fs.chmodSync(f.sessions, 0o770);
       return f.root;
     }],
     ["ROOT is other-writable", (f) => {
-      fs.chmodSync(f.root, 0o702);
+      if (WIN) acl().grant(f.root, "*S-1-1-0:(W)");
+      else fs.chmodSync(f.root, 0o702);
       return f.root;
     }],
     ["ROOT is missing", (f) => path.join(f.base, "no-such-root")],
@@ -429,6 +502,42 @@ test("chain: symlinked/unsafe/missing ancestors are skipped:unsafe-path and noth
       return f.root;
     }],
   ];
+  if (WIN) {
+    cases.push(
+      // Junctions beside the symlinks above: both are reparse points, refused by lstat.
+      ["ROOT is a junction", (f) => {
+        const link = path.join(f.base, "root-junction");
+        fs.renameSync(f.root, path.join(f.outside, "home"));
+        fs.symlinkSync(path.join(f.outside, "home"), link, "junction");
+        return link;
+      }],
+      ["sessions is a junction", (f) => {
+        fs.rmdirSync(f.sessions);
+        fs.symlinkSync(f.outside, f.sessions, "junction");
+        return f.root;
+      }],
+      ["sessions/<sid> is a junction", (f) => {
+        fs.symlinkSync(f.outside, path.join(f.sessions, "orch-1162"), "junction");
+        return f.root;
+      }],
+      ["controller is a junction", (f) => {
+        fs.mkdirSync(path.join(f.sessions, "orch-1162"), { mode: 0o700 });
+        fs.symlinkSync(f.outside, path.join(f.sessions, "orch-1162", "controller"), "junction");
+        return f.root;
+      }],
+      // Owner rule (the uid check): ROOT owned by SYSTEM. /setowner needs the elevated token windows-latest has.
+      ["ROOT is owned by SYSTEM", (f) => {
+        acl().setOwner(f.root, "*S-1-5-18");
+        return f.root;
+      }],
+      // A pre-existing controller that only inherits its ACL is owned but not private, so it cannot
+      // hold a private record (R2: a private file needs a private parent); it is never repaired.
+      ["controller is not private", (f) => {
+        fs.mkdirSync(path.join(f.sessions, "orch-1162", "controller"), { recursive: true });
+        return f.root;
+      }],
+    );
+  }
   for (const [name, setup] of cases) {
     const f = fixture();
     const root = setup(f);
@@ -447,7 +556,8 @@ test("chain: symlinked/unsafe/missing ancestors are skipped:unsafe-path and noth
 });
 
 // ── invalid priors are preserved ────────────────────────────────────────────
-type Snapshot = { mode: number; ino: number; size: number; mtimeMs: number; link: string | null; bytes: string | null };
+// win32 adds the DACL (icacls oracle text), so "left identical" covers the ACL as well.
+type Snapshot = { mode: number; ino: number; size: number; mtimeMs: number; link: string | null; bytes: string | null; dacl: string | null };
 
 function snapshot(p: string, readBytes: boolean): Snapshot {
   const st = fs.lstatSync(p);
@@ -455,10 +565,11 @@ function snapshot(p: string, readBytes: boolean): Snapshot {
     mode: st.mode, ino: st.ino, size: st.size, mtimeMs: st.mtimeMs,
     link: st.isSymbolicLink() ? fs.readlinkSync(p) : null,
     bytes: readBytes && st.isFile() ? fs.readFileSync(p).toString("base64") : null,
+    dacl: WIN ? acl().daclText(p) : null,
   };
 }
 
-test("prior invalid: every bad prior is invalid, skipped:prior-invalid, and left byte/mode-identical", { skip: POSIX_ONLY }, () => {
+test("prior invalid: every bad prior is invalid, skipped:prior-invalid, and left byte/mode-identical", () => {
   const good = (): Record<string, unknown> => {
     const r = buildControllerBootRecord(input(), "0a1b2c3d-0000-4000-8000-000000000000");
     return JSON.parse(JSON.stringify(r)) as Record<string, unknown>;
@@ -469,7 +580,8 @@ test("prior invalid: every bad prior is invalid, skipped:prior-invalid, and left
     fn(o);
     return json(o);
   };
-  type Case = { name: string; read: boolean; make: (target: string, f: ReturnType<typeof fixture>) => boolean };
+  // `posixOnly`: a POSIX-only case, with the one-line reason and its win32 counterpart below.
+  type Case = { name: string; read: boolean; make: (target: string, f: ReturnType<typeof fixture>) => boolean; posixOnly?: string };
   const file = (text: string, mode = 0o600) => (t: string) => {
     fs.writeFileSync(t, text, { mode });
     fs.chmodSync(t, mode);
@@ -482,8 +594,10 @@ test("prior invalid: every bad prior is invalid, skipped:prior-invalid, and left
       fs.symlinkSync(real, t);
       return true;
     } },
-    { name: "fifo", read: false, make: (t) => spawnSync("mkfifo", ["-m", "600", t]).status === 0 },
-    { name: "mode 0644", read: true, make: file(json(good()), 0o644) },
+    { name: "fifo", read: false, make: (t) => spawnSync("mkfifo", ["-m", "600", t]).status === 0,
+      posixOnly: "NTFS has no fifo; win32 counterpart: a junction at the target" },
+    { name: "mode 0644", read: true, make: file(json(good()), 0o644),
+      posixOnly: "win32 has no mode bits; win32 counterpart: an Everyone read ACE" },
     { name: "nlink 2", read: true, make: (t, f) => {
       file(json(good()))(t);
       fs.linkSync(t, path.join(f.outside, "hardlink.json"));
@@ -517,10 +631,24 @@ test("prior invalid: every bad prior is invalid, skipped:prior-invalid, and left
     { name: "pane uppercase uuid", read: true, make: file(mutate((o) => { o.pane.surface_id = SURF.toUpperCase(); })) },
     { name: "array", read: true, make: file("[]") },
   ];
+  if (WIN) {
+    cases.push(
+      { name: "Everyone read ACE (win32 counterpart of mode 0644)", read: true, make: (t) => {
+        file(json(good()))(t);
+        acl().grant(t, "*S-1-1-0:(R)");
+        return true;
+      } },
+      { name: "junction at the target (win32 counterpart of fifo)", read: false, make: (t, f) => {
+        fs.symlinkSync(f.outside, t, "junction");
+        return true;
+      } },
+    );
+  }
   for (const c of cases) {
+    if (WIN && c.posixOnly !== undefined) continue;
     const f = fixture();
     const target = targetOf(f.root);
-    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+    makeController(target);
     if (!c.make(target, f)) {
       assert.fail(`${c.name}: fixture could not be created (mkfifo unavailable?)`);
     }
@@ -559,18 +687,22 @@ test("errors: a throwing prerequisite is skipped:error, never a throw", () => {
   assert.deepEqual(fs.readdirSync(base), []);
 });
 
-test("errors: an unwritable controller dir is skipped:error with no temp and no target left", { skip: POSIX_ONLY || (IS_ROOT ? "root bypasses directory permissions" : false) }, () => {
+test("errors: an unwritable controller dir is skipped:error with no temp and no target left", { skip: IS_ROOT ? "root bypasses directory permissions" : false }, () => {
   const f = fixture();
   const target = targetOf(f.root);
-  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-  fs.chmodSync(path.dirname(target), 0o500);
+  makeController(target);
+  // win32: icacls narrows the user's single ACE to read/execute instead of chmod 0500. The
+  // directory still verifies private (protected, user-only), so the temp creation is what fails.
+  if (WIN) icacls([path.dirname(target), "/grant:r", `*${acl().userSid()}:(OI)(CI)(RX)`, "/q"]);
+  else fs.chmodSync(path.dirname(target), 0o500);
   try {
     const r = writeControllerBootRecord(f.root, input());
     assert.deepEqual(r, { outcome: "skipped:error", relation: "none" });
     assertLine(r);
     assert.deepEqual(fs.readdirSync(path.dirname(target)), []);
   } finally {
-    fs.chmodSync(path.dirname(target), 0o700);
+    if (WIN) icacls([path.dirname(target), "/grant:r", `*${acl().userSid()}:(OI)(CI)F`, "/q"]);
+    else fs.chmodSync(path.dirname(target), 0o700);
   }
 });
 
@@ -607,7 +739,7 @@ function afterRename(act: (renameSync: (...a: any[]) => any) => void): Record<st
   };
 }
 
-test("drift: controller dir replaced right after the rename → skipped:raced, never written", { skip: POSIX_ONLY }, () => {
+test("drift: controller dir replaced right after the rename → skipped:raced, never written", () => {
   const f = fixture();
   const dir = path.dirname(targetOf(f.root));
   const r = withFsPatched(afterRename((rename) => {
@@ -618,19 +750,22 @@ test("drift: controller dir replaced right after the rename → skipped:raced, n
   assert.deepEqual(r, { outcome: "skipped:raced", relation: "none" });
 });
 
-test("drift: an ancestor turned into a symlink after the rename → skipped:raced", { skip: POSIX_ONLY }, () => {
-  const f = fixture();
-  const sidDir = path.join(f.sessions, "orch-1162");
-  const r = withFsPatched(afterRename((rename) => {
-    rename(sidDir, `${sidDir}.real`);
-    fs.symlinkSync(`${sidDir}.real`, sidDir);
-  }), () => writeControllerBootRecord(f.root, input()));
-  assert.deepEqual(r, { outcome: "skipped:raced", relation: "none" });
+test("drift: an ancestor turned into a symlink after the rename → skipped:raced", () => {
+  // win32 also swaps in a junction (the reparse point that needs no privilege).
+  for (const type of WIN ? [undefined, "junction" as const] : [undefined]) {
+    const f = fixture();
+    const sidDir = path.join(f.sessions, "orch-1162");
+    const r = withFsPatched(afterRename((rename) => {
+      rename(sidDir, `${sidDir}.real`);
+      fs.symlinkSync(`${sidDir}.real`, sidDir, type);
+    }), () => writeControllerBootRecord(f.root, input()));
+    assert.deepEqual(r, { outcome: "skipped:raced", relation: "none" }, type ?? "symlink");
+  }
   // Only OBSERVED drift is detected (§3.5). A swap that is undone before the re-check (ABA) is
   // not, and nothing here claims otherwise.
 });
 
-test("cleanup: a rename failure is skipped:error, our temp is removed, a valid prior is untouched", { skip: POSIX_ONLY }, () => {
+test("cleanup: a rename failure is skipped:error, our temp is removed, a valid prior is untouched", () => {
   const f = fixture();
   assert.equal(writeControllerBootRecord(f.root, input()).outcome, "written");
   const target = targetOf(f.root);
@@ -645,7 +780,7 @@ test("cleanup: a rename failure is skipped:error, our temp is removed, a valid p
   assert.deepEqual(snapshot(target, true), before);
 });
 
-test("cleanup: a write failure after the temp exists unlinks exactly our temp and nothing else", { skip: POSIX_ONLY }, () => {
+test("cleanup: a write failure after the temp exists unlinks exactly our temp and nothing else", () => {
   const f = fixture();
   const unlinked: string[] = [];
   const r = withFsPatched({
@@ -663,7 +798,7 @@ test("cleanup: a write failure after the temp exists unlinks exactly our temp an
   assert.match(path.basename(unlinked[0] ?? ""), /^\.boot-record\.json\.[0-9a-f-]{36}$/);
 });
 
-test("nested exact keys: an extra key in pane or in a launch value is invalid, and such a prior is preserved", { skip: POSIX_ONLY }, () => {
+test("nested exact keys: an extra key in pane or in a launch value is invalid, and such a prior is preserved", () => {
   const good = JSON.parse(JSON.stringify(buildControllerBootRecord(input(), "0a1b2c3d-0000-4000-8000-000000000000"))) as Record<string, any>;
   assert.ok(parseControllerBootRecord(good, "orch-1162"));
   assert.equal(parseControllerBootRecord({ ...good, pane: { ...good.pane, owner: "me" } }, "orch-1162"), null);
@@ -671,7 +806,7 @@ test("nested exact keys: an extra key in pane or in a launch value is invalid, a
   assert.equal(parseControllerBootRecord({ ...good, launch: { ...good.launch, effort: { ...good.launch.effort, extra: 1 } } }, "orch-1162"), null);
   const f = fixture();
   const target = targetOf(f.root);
-  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+  makeController(target);
   fs.writeFileSync(target, JSON.stringify({ ...good, pane: { ...good.pane, owner: "me" } }), { mode: 0o600 });
   const before = snapshot(target, true);
   assert.deepEqual(writeControllerBootRecord(f.root, input()), { outcome: "skipped:prior-invalid", relation: "none" });
@@ -685,15 +820,18 @@ test("nested exact keys: an extra key in pane or in a launch value is invalid, a
 const CLI_JS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "src", "orchestrator-boot", "cli.js");
 const RECORD_LINE_PREFIX = "[orchestrator-boot] boot record: ";
 const PLAN_ARGV = ["telepty", "allow", "--id", "orch-1162", "--auto-restart", "claude", "--permission-mode", "manual"];
-// An --import preload that logs every sync fs call on a `/sessions` path: "no read and no
-// write" is then a measurement. Inline (data: URL) so it needs no extra file.
+// An --import preload that logs every sync fs call on a `/sessions` path (`\sessions` on win32):
+// "no read and no write" is then a measurement. `realpathSync.native` is wrapped too, so the
+// win32 arm (and the primitive's SystemRoot check) keep it. Inline (data: URL) so it needs no extra file.
 const TRACE_SRC = [
   'import fs from "node:fs";',
   'import { syncBuiltinESMExports } from "node:module";',
   "const log = process.env.FS_TRACE_LOG; const add = fs.appendFileSync.bind(fs);",
+  'const hit = (p) => typeof p === "string" && (p.includes("/sessions") || p.includes("\\\\sessions"));',
   'for (const n of ["openSync","lstatSync","statSync","mkdirSync","renameSync","unlinkSync","readFileSync","writeFileSync","existsSync","readdirSync","chmodSync","chownSync","rmSync","rmdirSync","symlinkSync","linkSync","realpathSync","accessSync"]) {',
   '  const o = fs[n]; if (typeof o !== "function") continue;',
-  '  fs[n] = function (p, ...r) { if (typeof p === "string" && p.includes("/sessions")) add(log, n + " " + p + "\\n"); return o.call(this, p, ...r); };',
+  '  fs[n] = function (p, ...r) { if (hit(p)) add(log, n + " " + p + "\\n"); return o.call(this, p, ...r); };',
+  '  if (typeof o.native === "function") { const on = o.native; fs[n].native = function (p, ...r) { if (hit(p)) add(log, n + ".native " + p + "\\n"); return on.call(this, p, ...r); }; }',
   "}",
   "syncBuiltinESMExports();",
 ].join("\n");
@@ -736,6 +874,8 @@ function cliFixture() {
         AIGENTRY_BOOT_PLAN: "1", AIGENTRY_BOOT_PERMISSION: "approval=manual", AIGENTRY_BOOT_HISTORY: "new",
         ORCHESTRATOR_CLI: "claude", ORCHESTRATOR_SID: "orch-1162",
         TELEPTY_TOKEN: SECRETS[0], FS_TRACE_LOG: trace,
+        // win32: the primitive needs SystemRoot; TEMP/TMP and USERPROFILE are the TMPDIR/HOME analogues.
+        ...(WIN ? { SystemRoot: process.env.SystemRoot ?? "", TEMP: tmp, TMP: tmp, USERPROFILE: fakeHome } : {}),
         ...over,
       },
     });
@@ -749,7 +889,7 @@ function cliFixture() {
 const recordLines = (stderr: string) => stderr.split("\n").filter((l) => l.startsWith(RECORD_LINE_PREFIX));
 const withoutRecordLine = (stderr: string) => stderr.split("\n").filter((l) => !l.startsWith(RECORD_LINE_PREFIX)).join("\n");
 
-test("cli boot: stdout argv and exit are independent of the record outcome; one fixed stderr line after the guards", { skip: POSIX_ONLY }, () => {
+test("cli boot: stdout argv and exit are independent of the record outcome; one fixed stderr line after the guards", () => {
   const c = cliFixture();
   const expectedStdout = `${PLAN_ARGV.join("\n")}\n`;
   const runs: Array<[string, ReturnType<typeof c.run>]> = [];
@@ -757,7 +897,7 @@ test("cli boot: stdout argv and exit are independent of the record outcome; one 
   runs.push(["written relation=first", c.run([])]);
   const target = targetOf(c.root);
   const st = fs.lstatSync(target);
-  assert.ok(st.isFile() && (st.mode & 0o777) === 0o600 && st.nlink === 1);
+  assert.ok(st.isFile() && (WIN ? acl().isPrivate(target) : (st.mode & 0o777) === 0o600) && st.nlink === 1);
   const text = fs.readFileSync(target, "utf8");
   for (const s of [...SECRETS, "fixture-token-1162", "permission", "approval", "argv", "cwd"]) assert.ok(!text.includes(s), `record leaks ${s}`);
   assert.ok(runs[0]![1].traced.length > 0, "positive control: the trace sees the boot path's record access");
@@ -786,11 +926,18 @@ test("cli boot: stdout argv and exit are independent of the record outcome; one 
     assert.ok(at(RECORD_LINE_PREFIX) < at("[orchestrator-boot] exec "), `${want}: record before the argv`);
     for (const s of [...SECRETS, "fixture-token-1162"]) assert.ok(!r.stdout.includes(s) && !r.stderr.includes(s), `${want}: leaks ${s}`);
   }
-  assert.ok(fs.readFileSync(c.effects, "utf8").includes("ps "), "the guard ran through the ps recorder");
+  if (WIN) {
+    // The seams are extensionless #!/bin/sh recorders, which win32 cannot spawn (only .com/.exe are
+    // tried): the guard saw an empty table and the reconcile was skipped — no real ps/telepty ran.
+    const first = runs[0]![1].stderr;
+    assert.ok(first.includes("singleton guard done: killed=0") && first.includes("registry reconcile SKIPPED"), first);
+  } else {
+    assert.ok(fs.readFileSync(c.effects, "utf8").includes("ps "), "the guard ran through the ps recorder");
+  }
   assert.equal(fs.readFileSync(c.tripLog, "utf8"), "", "no real binary was reached");
 });
 
-test("cli no-exec modes: help/dry-run/probe/wizard-plan/unknown/refusals do NO record read and NO write", { skip: POSIX_ONLY }, () => {
+test("cli no-exec modes: help/dry-run/probe/wizard-plan/unknown/refusals do NO record read and NO write", () => {
   const c = cliFixture();
   assert.equal(c.run([]).status, 0);
   const target = targetOf(c.root);
