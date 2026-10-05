@@ -443,7 +443,10 @@ function security({ read, git, pkg, version, manifest, manifestPath, planningEvi
       count(result.ruleIndex) && rules[result.ruleIndex]?.id === result.ruleId &&
       (result.level === undefined || typeof result.level === 'string') &&
       Array.isArray(result.locations) && result.locations.length === 1, 'Invalid or duplicate SARIF result');
-    exact(result.locations[0], ['physicalLocation']);
+    // Snyk Code numbers each location: an optional non-negative integer `id` beside physicalLocation, nothing else.
+    const hasId = object(result.locations[0]) && Object.hasOwn(result.locations[0], 'id');
+    exact(result.locations[0], hasId ? ['id', 'physicalLocation'] : ['physicalLocation']);
+    requireThat(!hasId || count(result.locations[0].id), 'Invalid SARIF location id');
     const location = result.locations[0].physicalLocation;
     exact(location, ['artifactLocation', 'region']);
     requireThat(object(location.artifactLocation), 'Invalid SARIF artifact location');

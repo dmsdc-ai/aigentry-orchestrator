@@ -338,8 +338,13 @@ test('scan commit differs: the gate refuses a foreign commit and drifted sources
 test('scanner failures are recorded once, not retried or hidden, and blobs refuses them', t => {
   const f = fixture(t);
   const adjudicationsFile = f.input('adjudications.json', { findings: {} });
+  const uncounted = { high: null, medium: null, low: null, unknown: null };
   const cases = [
-    ['exit 2', () => f.scan(Buffer.from('Snyk CLI error\n'), 2), { exit: 2, sarif_valid: false, signal: null, timed_out: false, overflow: false }],
+    ['exit 2', () => f.scan(Buffer.from('Snyk CLI error\n'), 2), { exit: 2, sarif_valid: false, signal: null, timed_out: false, overflow: false,
+      findings: null, severities: uncounted }],
+    // TRIAGE O-1: the scanner ran and printed SARIF the gate refuses in shape; its findings were never counted.
+    ['SARIF refused in shape', () => f.scan(snykSarif([{ ...finding(), locations: [{ ...finding().locations[0], message: { text: 'x' } }] }]), 1),
+      { exit: 1, sarif_valid: false, findings: null, severities: uncounted }],
     ['exit 3', () => f.scan(snykSarif(), 3), { exit: 3, sarif_valid: true, findings: 0 }],
     ['exit 1 without findings', () => f.scan(snykSarif(), 1), { exit: 1, findings: 0 }],
     ['exit 0 with findings', () => f.scan(snykSarif([finding()]), 0), { exit: 0, findings: 1 }],
@@ -351,6 +356,7 @@ test('scanner failures are recorded once, not retried or hidden, and blobs refus
     const scanned = run();
     assert.equal(scanned.result.status, 1, `${label}: ${scanned.result.stdout}${scanned.result.stderr}`);
     assert.match(scanned.result.stderr, /recorded but NOT admissible/, label);
+    if (expected.findings === null) assert.match(scanned.result.stderr, /findings could not be counted/, label);
     const receipt = JSON.parse(readFileSync(scanned.file('receipt.json'), 'utf8'));
     for (const [key, value] of Object.entries(expected)) assert.deepEqual(receipt[key], value, `${label}: ${key}`);
     assert.equal(receipt.stdout_sha256, digest(readFileSync(scanned.file('sarif.json'))), `${label}: stdout kept exactly`);
@@ -437,6 +443,12 @@ test('C4 SARIF compatibility: shapes the real gate refuses, and the tools agree'
 
   // Control: help markdown at exactly 4096 bytes and extra run metadata are accepted.
   admitted(force(shape(s => { s.runs[0].tool.driver.rules[0].help.markdown = 'x'.repeat(4096); s.runs[0].automationDetails = { id: 'x' }; })));
+  // Real Snyk Code 1.1304.3 shape: every location carries `id` (a non-negative integer) beside physicalLocation.
+  for (const id of [0, 7]) {
+    const real = shape(s => { s.runs[0].results[0].locations[0] = { id, ...s.runs[0].results[0].locations[0] }; });
+    assert.equal(sarifResults(strictJSON(real), projected).length, 1, `tools accept location id ${id}`);
+    admitted(force(real));
+  }
   for (const [label, mutate, diagnostic] of [
     ['rule help markdown over 4096 bytes', s => { s.runs[0].tool.driver.rules[0].help.markdown = 'x'.repeat(4097); }, /Malformed or oversized security JSON/],
     ['message text over 4096 bytes', s => { s.runs[0].results[0].message.text = '한'.repeat(1366); }, /Malformed or oversized security JSON/],
@@ -446,6 +458,11 @@ test('C4 SARIF compatibility: shapes the real gate refuses, and the tools agree'
     ['absolute file URI', s => { s.runs[0].results[0].locations[0].physicalLocation.artifactLocation = { uri: 'file:///tmp/scan/src/feature.js' }; }, /Unsafe relative path/],
     ['line-only region', s => { s.runs[0].results[0].locations[0].physicalLocation.region = { startLine: 1 }; }, /Invalid schema keys/],
     ['logical locations beside physical', s => { s.runs[0].results[0].locations[0].logicalLocations = [{ name: 'feature' }]; }, /Invalid schema keys/],
+    ['location message beside id and physical', s => { Object.assign(s.runs[0].results[0].locations[0], { id: 0, message: { text: 'x' } }); }, /Invalid schema keys/],
+    ['negative location id', s => { s.runs[0].results[0].locations[0].id = -1; }, /Invalid SARIF location id/],
+    ['string location id', s => { s.runs[0].results[0].locations[0].id = '0'; }, /Invalid SARIF location id/],
+    ['fractional location id', s => { s.runs[0].results[0].locations[0].id = 1.5; }, /Invalid SARIF location id/],
+    ['location id without physical', s => { s.runs[0].results[0].locations[0] = { id: 0 }; }, /Invalid schema keys/],
     ['tool extensions', s => { s.runs[0].tool.extensions = [{ name: 'plugin' }]; }, /Unsupported SARIF producer or failed invocation/],
     ['failed invocation', s => { s.runs[0].invocations = [{ executionSuccessful: false }]; }, /Unsupported SARIF producer or failed invocation/],
     ['result outside the staged projection', s => { s.runs[0].results[0].locations[0].physicalLocation.artifactLocation.uri = 'src/keep.js'; }, /SARIF source outside projection/],

@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { accessSync, constants, chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync,
+import { accessSync, constants, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync,
   symlinkSync, writeFileSync } from 'node:fs';
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -89,7 +89,13 @@ const final = parse('.github/workflows/release.yml');
 const ci = parse('.github/workflows/ci.yml');
 const ciBefore = parse(`${fixtureRoot}/ci.before-parity.yml`);
 const rejected = parse(`${fixtureRoot}/rejected-release.yml`);
-const ids = ['windows-persistence', 'windows-refuses'];
+// W-D3: the Windows jobs are named for what they measure. `ids` are the two windows-latest jobs, `declared`
+// the ubuntu declaration job; `successor` maps each retired id to the job that now measures it.
+const ids = ['windows-suite', 'windows-installed'];
+const declared = 'windows-declared-supported';
+const successor = { 'windows-declared-unsupported': declared, 'windows-persistence': 'windows-suite', 'windows-refuses': 'windows-installed' };
+// The historical fixtures still carry the retired ids; they are compared, never regenerated.
+const oldIds = ['windows-persistence', 'windows-refuses'];
 const lf = source => source.replace(/\r\n/g, '\n');
 // Independent approved contract, never derived from either workflow under test.
 // Keep the exact block too: CI's historical byte comparison may remove only this.
@@ -1138,6 +1144,399 @@ const ciBrowserAddition = replaceOnce(
     browserCallerStep, `${ciOpenboxInstall}${ciXresCompile}${browserCallerStep}`),
   headedRationaleAnchor, `${ciXresEnv}${headedRationaleAnchor}`);
 const approvedCIBrowser = parse('approved-ci-browser-contract', `jobs:\n${ciBrowserAddition}`).jobs['browser-tls'];
+// #1167 independent approved Windows contract (the browserAddition pattern; never derived from a workflow under
+// test): CI's exact bytes from the first Windows comment to EOF, and the one header sentence that changed with it.
+// release.yml must carry the same three jobs, parsed, plus `needs: guard`.
+const approvedWindowsRegion = `  # Windows is supported in 0.2.2, with two documented limitations that refuse instead of
+  # running: confined worker spawn (SANDBOX_PLATFORM_UNSUPPORTED, exit 78) and native request
+  # capture (init exits 2). The three jobs below are what a green check claims for Windows.
+  # release.yml carries all three byte for byte, adding only \`needs: guard\`, so a green PR
+  # predicts the Windows half of a release the way the \`test\` job above predicts the POSIX half.
+  # They are separate jobs rather than windows-latest in the \`test\` matrix because four of that
+  # job's seven steps are POSIX shell gates, and per-OS \`if:\` guards would end the #900 parity.
+  #
+  # The declaration: package.json os[] and the lock file's root entry must both include win32,
+  # compared as one serialised string. W0 below repeats the check on the OS it is about.
+  windows-declared-supported:
+    name: Windows is declared supported
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: package.json and the lock file must declare Windows in
+        shell: bash
+        run: |
+          set -euo pipefail
+          OS="$(node -p "JSON.stringify([require('./package.json').os, require('./package-lock.json').packages[''].os])")"
+          [ "$OS" = '[["darwin","linux","win32"],["darwin","linux","win32"]]' ] || { echo "::error::package.json and package-lock.json declare os \${OS}; both must be [\\"darwin\\",\\"linux\\",\\"win32\\"] so a plain npm install admits Windows."; exit 1; }
+          echo "os declaration is \${OS}"
+
+  # #901 (W1), now the whole suite: every test on windows-latest, held to zero failures and zero
+  # skips. There is no known-failure allowance and no --force; Windows is declared in os[], so a
+  # plain \`npm ci\` must install. A POSIX-only behaviour is split by platform inside its test, with
+  # each OS asserting its own branch, never skipped.
+  #
+  # The checkout keeps LF bytes (core.autocrlf false): tests/packaging/init-platform.test.mjs runs
+  # the real init, whose scaffold step runs bin/install-instructions.sh under Git Bash, and a CRLF
+  # checkout of that script cannot run.
+  windows-suite:
+    name: Windows W1 — full suite, zero failures and zero skips
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out with LF endings, as the published tarball has them
+        shell: bash
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies (plain npm ci; Windows is declared in os[])
+        shell: bash
+        run: npm ci
+
+      - name: Build
+        shell: bash
+        run: npm run build
+
+      # THE #901 GATE, unchanged bytes (the corrected #1171 reader): the persistence layer keeps
+      # its own hard green, so a failure there is named before the full-suite step runs.
+      - name: Persistence suite must be fully green on win32
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          node --test dist/tests/session/persistence/*.test.js > "\${RUNNER_TEMP}/persistence.log" 2>&1
+          RC=$?
+          set -e
+          cat "\${RUNNER_TEMP}/persistence.log"
+          read_count() {
+            awk -v key="$1" '
+              { sub(/\\r$/, "") }
+              $0 ~ ("^# " key "([[:space:]]|$)") {
+                records++
+                if ($0 !~ ("^# " key " [0-9]+$")) malformed = 1
+                else count = $3
+              }
+              END { if (records == 1 && !malformed) print count }
+            ' "\${RUNNER_TEMP}/persistence.log"
+          }
+          PASS="$(read_count pass)"; FAIL="$(read_count fail)"; SKIP="$(read_count skipped)"
+          # Refuse to assert on numbers we could not read — an empty string compares equal
+          # to nothing and would let this pass vacuously.
+          [ -n "\${PASS}" ] && [ -n "\${FAIL}" ] && [ -n "\${SKIP}" ] \\
+            || { echo "::error::could not parse the TAP summary; refusing to report a vacuous pass."; exit 1; }
+          echo "win32 persistence: pass=\${PASS} fail=\${FAIL} skipped=\${SKIP}"
+          [ "\${FAIL}" = "0" ] || { echo "::error::\${FAIL} persistence test(s) failed on win32. This is the surface #901 delivers; it does not get a known-failure allowance."; exit 1; }
+          [ "\${SKIP}" = "0" ] || { echo "::error::\${SKIP} persistence test(s) skipped on win32 — a skip here is a win32 behaviour that went unmeasured."; exit 1; }
+          [ "\${PASS}" -gt 20 ] || { echo "::error::only \${PASS} persistence tests ran; the file glob is probably not matching."; exit 1; }
+          [ "\${RC}" = "0" ] || { echo "::error::the runner exited \${RC} despite a clean summary."; exit 1; }
+
+      # Everything else, through the same runner \`npm test\` uses. The summary is read with the same
+      # strict reader as the persistence step: each of tests, pass, fail and skipped exactly once as
+      # \`# key N\`, CR stripped, anything else refused. Every violation is reported before the step
+      # fails, so one run names all of them. The >200 floor is the U28 proof that
+      # scripts/run-tests.mjs:31 enumerates compiled tests correctly on Windows.
+      - name: Full suite must be fully green on win32
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          node scripts/run-tests.mjs > "\${RUNNER_TEMP}/full.log" 2>&1
+          RC=$?
+          set -e
+          cat "\${RUNNER_TEMP}/full.log"
+          read_count() {
+            awk -v key="$1" '
+              { sub(/\\r$/, "") }
+              $0 ~ ("^# " key "([[:space:]]|$)") {
+                records++
+                if ($0 !~ ("^# " key " [0-9]+$")) malformed = 1
+                else count = $3
+              }
+              END { if (records == 1 && !malformed) print count }
+            ' "\${RUNNER_TEMP}/full.log"
+          }
+          TESTS="$(read_count tests)"
+          PASS="$(read_count pass)"; FAIL="$(read_count fail)"; SKIP="$(read_count skipped)"
+          # Refuse to assert on numbers we could not read — an empty string compares equal
+          # to nothing and would let this pass vacuously.
+          [ -n "\${TESTS}" ] && [ -n "\${PASS}" ] && [ -n "\${FAIL}" ] && [ -n "\${SKIP}" ] \\
+            || { echo "::error::could not parse the TAP summary; refusing to report a vacuous pass."; exit 1; }
+          echo "win32 full suite: tests=\${TESTS} pass=\${PASS} fail=\${FAIL} skipped=\${SKIP} runner exit=\${RC}"
+          VIOLATIONS=0
+          # A TRUE \`-gt\` is the success condition: \`[\` exits 2 on a count it cannot compare, and
+          # that error falls to the violation branch exactly as a false comparison does.
+          if [ "\${TESTS}" -gt 200 ]; then
+            :
+          else
+            echo "::error::only \${TESTS} tests were enumerated. scripts/run-tests.mjs:31 normalises Windows separators for node --test; a low count means that enumeration is broken (U28)."
+            VIOLATIONS=$((VIOLATIONS + 1))
+          fi
+          if [ "\${SKIP}" != "0" ]; then
+            echo "::error::\${SKIP} test(s) skipped on win32. A skip is a Windows behaviour that went unmeasured; split the test by platform instead."
+            VIOLATIONS=$((VIOLATIONS + 1))
+          fi
+          if [ "\${FAIL}" != "0" ]; then
+            echo "--- failures this run ---"
+            grep '^not ok' "\${RUNNER_TEMP}/full.log" || true
+            echo "::error::\${FAIL} test(s) failed on win32. Windows is supported; there is no known-failure allowance."
+            VIOLATIONS=$((VIOLATIONS + 1))
+          fi
+          if [ "\${RC}" != "0" ]; then
+            echo "::error::the runner exited \${RC}; a cancelled test or a harness failure is not a pass."
+            VIOLATIONS=$((VIOLATIONS + 1))
+          fi
+          [ "\${VIOLATIONS}" = "0" ] || { echo "::error::\${VIOLATIONS} win32 gate violation(s) reported above; every applicable diagnostic ran before this failure."; exit 1; }
+          echo "win32 full suite is fully green"
+
+  # #900 (W0), now the installed package: what a Windows user gets from the published tarball.
+  # It packs on this runner with LF bytes (W-D4), installs the tarball into a temporary global
+  # prefix with no --force, runs the bin shim from cmd.exe, PowerShell and Git Bash, inits a
+  # workspace in a fresh home through the .cmd shim, runs workspace shell entry points under Git
+  # Bash, and asserts both documented limitations as clean refusals.
+  windows-installed:
+    name: Windows W0 — the installed package works
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out with LF endings, as the published tarball has them
+        shell: bash
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: package.json and the lock file must declare Windows in
+        shell: bash
+        run: |
+          set -euo pipefail
+          OS="$(node -p "JSON.stringify([require('./package.json').os, require('./package-lock.json').packages[''].os])")"
+          [ "$OS" = '[["darwin","linux","win32"],["darwin","linux","win32"]]' ] || { echo "::error::package.json and package-lock.json declare os \${OS}; both must be [\\"darwin\\",\\"linux\\",\\"win32\\"] so a plain npm install admits Windows."; exit 1; }
+          echo "os declaration is \${OS}"
+
+      # U23, inverted. Measured 2026-08-15 (run 31890807632): npm enforces the root manifest's own
+      # os[], so with win32 declared out \`npm ci\` died with EBADPLATFORM. Windows is declared in
+      # now, so a plain install is the assertion, and EBADPLATFORM anywhere in its log fails it.
+      - name: U23 — npm ci must succeed on win32 without --force
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          npm ci > "\${RUNNER_TEMP}/npm-ci.log" 2>&1
+          RC=$?
+          set -e
+          echo "npm ci exit=\${RC}"
+          tail -n 40 "\${RUNNER_TEMP}/npm-ci.log"
+          [ "$RC" = "0" ] || { echo "::error::npm ci failed on win32 with exit \${RC}. Windows is declared in os[]; a plain, unforced install must succeed."; exit 1; }
+          if grep -q 'EBADPLATFORM' "\${RUNNER_TEMP}/npm-ci.log"; then echo "::error::npm ci exited 0 on win32 but logged EBADPLATFORM; the os[] declaration is not what npm read."; exit 1; fi
+          echo "plain npm ci installed on win32"
+
+      # prepack builds. The scan reads the pack's own file list, so it covers exactly the shell
+      # files the tarball ships; one CR in any of them would ship a script bash cannot run.
+      - name: Pack the tarball; shipped shell files must be LF
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm pack --json > "\${RUNNER_TEMP}/pack.json"
+          node -e '
+            const fs = require("node:fs");
+            const pack = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/pack.json", "utf8"))[0];
+            const shell = pack.files.map(file => file.path.split("\\\\").join("/"))
+              .filter(path => /^(bin\\/.*\\.sh|git-hooks\\/pre-push|\\.claude\\/hooks\\/[^\\/]*\\.sh|tooling\\/dispatch-prelude\\/[^\\/]*\\.sh)$/.test(path));
+            const required = ["bin/install-instructions.sh", "git-hooks/pre-push"].filter(path => !shell.includes(path));
+            const carriageReturn = shell.filter(path => fs.readFileSync(path).includes(13));
+            console.log(\`shipped shell files: \${shell.length}; with CR: \${carriageReturn.length}\`);
+            for (const path of required) console.log(\`::error::\${path} is not in the pack file list; the scan would be vacuous.\`);
+            for (const path of carriageReturn) console.log(\`::error::\${path} has CR line endings; bash cannot run it from the tarball (W-D4).\`);
+            if (required.length || carriageReturn.length) process.exit(1);
+            fs.writeFileSync(process.env.RUNNER_TEMP + "/tarball", pack.filename);
+          '
+
+      - name: Install the tarball into a temporary global prefix without --force
+        shell: bash
+        run: |
+          set -uo pipefail
+          TARBALL="$(cat "\${RUNNER_TEMP}/tarball")"
+          PREFIX="\${RUNNER_TEMP}/w0-prefix"
+          set +e
+          npm install -g --prefix "\${PREFIX}" "./\${TARBALL}" > "\${RUNNER_TEMP}/npm-install.log" 2>&1
+          RC=$?
+          set -e
+          echo "npm install -g exit=\${RC}"
+          tail -n 40 "\${RUNNER_TEMP}/npm-install.log"
+          [ "$RC" = "0" ] || { echo "::error::installing \${TARBALL} into a global prefix failed on win32 with exit \${RC}."; exit 1; }
+          if grep -q 'EBADPLATFORM' "\${RUNNER_TEMP}/npm-install.log"; then echo "::error::the tarball install logged EBADPLATFORM; the published os[] must admit win32."; exit 1; fi
+          for SHIM in aigentry-orchestrator aigentry-orchestrator.cmd aigentry-orchestrator.ps1; do
+            [ -f "\${PREFIX}/\${SHIM}" ] || { echo "::error::npm wrote no \${SHIM} shim into the global prefix."; exit 1; }
+          done
+          echo "\${TARBALL} installed unforced; the sh, cmd and PowerShell shims exist"
+
+      # U21 — npm generates the Windows shims from the \`#!/usr/bin/env node\` shebang of a .mjs bin.
+      # --version returns before any platform or dependency check, so this measures the shims.
+      - name: U21 — the bin shim runs from cmd.exe, PowerShell and Git Bash
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $prefix = Join-Path $env:RUNNER_TEMP 'w0-prefix'
+          $expected = (Get-Content -Raw package.json | ConvertFrom-Json).version
+          # Git for Windows' own bash, found next to git.exe; never WSL's System32\\bash.exe.
+          $bash = Join-Path (Split-Path -Parent (Split-Path -Parent (Get-Command git.exe).Source)) 'bin\\bash.exe'
+          $shim = (Join-Path $prefix 'aigentry-orchestrator').Replace('\\', '/')
+          function Assert-Version([string] $label, $output) {
+            $code = $LASTEXITCODE
+            $text = (($output | Out-String) -replace "\`r", '').Trim()
+            if ($code -ne 0 -or $text -ne $expected) {
+              Write-Output "::error::the $label shim printed '$text' with exit $code; expected '$expected'."
+              exit 1
+            }
+            Write-Output "$label shim reports $text"
+          }
+          Assert-Version 'cmd.exe' (& (Join-Path $prefix 'aigentry-orchestrator.cmd') --version)
+          Assert-Version 'PowerShell' (& (Join-Path $prefix 'aigentry-orchestrator.ps1') --version)
+          Assert-Version 'Git Bash' (& $bash -c "'$shim' --version")
+
+      # The native user path: PowerShell, the .cmd shim, a fresh profile and AIGENTRY_HOME unset.
+      # installed-init-check compares the tree with the installed package's own manifest.
+      - name: init succeeds in a temporary home and produces the expected tree
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $prefix = Join-Path $env:RUNNER_TEMP 'w0-prefix'
+          $package = Join-Path $prefix 'node_modules\\@dmsdc-ai\\aigentry-orchestrator'
+          $cli = Join-Path $prefix 'aigentry-orchestrator.cmd'
+          $userHome = Join-Path $env:RUNNER_TEMP 'w0-home'
+          $ws = Join-Path $env:RUNNER_TEMP 'w0-ws'
+          New-Item -ItemType Directory -Path $userHome | Out-Null
+          $env:USERPROFILE = $userHome
+          $env:HOME = $userHome
+          Remove-Item Env:AIGENTRY_HOME -ErrorAction SilentlyContinue
+          function Assert-Exit([string] $label, [int] $want) {
+            if ($LASTEXITCODE -ne $want) {
+              Write-Output "::error::$label exited $LASTEXITCODE on win32; expected $want."
+              exit 1
+            }
+            Write-Output "$label exited $want, as required"
+          }
+          & $cli init --yes --workspace $ws
+          Assert-Exit 'init' 0
+          node tests/packaging/installed-init-check.mjs --package $package --workspace $ws --home (Join-Path $userHome '.aigentry')
+          Assert-Exit 'installed-init-check' 0
+          $queue = Join-Path $ws 'state\\task-queue.json'
+          $before = (Get-FileHash -Algorithm SHA256 -LiteralPath $queue).Hash
+          & $cli init --yes --workspace $ws
+          Assert-Exit 'a second plain init' 4
+          & $cli init --upgrade --yes --workspace $ws
+          Assert-Exit 'init --upgrade' 0
+          $after = (Get-FileHash -Algorithm SHA256 -LiteralPath $queue).Hash
+          if ($after -ne $before) {
+            Write-Output "::error::init --upgrade changed state/task-queue.json; state/ must stay untouched."
+            exit 1
+          }
+          Write-Output "state/task-queue.json is byte-identical after --upgrade"
+
+      # C10: the workspace has no dist/, so a bin/ shim resolves the installed package through the
+      # npm sh shim on PATH (a file on Windows, not a symlink) and must reach the compiled CLI.
+      - name: Workspace shell entry points run under Git Bash
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="$(cygpath -u "\${RUNNER_TEMP}")"
+          WS="\${T}/w0-ws"
+          export HOME="\${T}/w0-home"
+          export USERPROFILE="$(cygpath -w "\${HOME}")"
+          export PATH="\${T}/w0-prefix:\${PATH}"
+          OUT="$(bash "\${WS}/bin/tq-status.sh")"
+          printf '%s\\n' "\${OUT}"
+          case "\${OUT}" in
+            "=== Active Focus ==="*) echo "bin/tq-status.sh printed the status overview" ;;
+            *) echo "::error::bin/tq-status.sh did not print its status overview under Git Bash."; exit 1 ;;
+          esac
+          OUT="$(bash "\${WS}/bin/dispatch-tracker.sh" --help)"
+          case "\${OUT}" in
+            "# dispatch-tracker.sh "*"Orchestrator-side dispatch health-check"*) echo "bin/dispatch-tracker.sh reached the compiled tracker CLI of the installed package" ;;
+            *) printf '%s\\n' "\${OUT}"; echo "::error::bin/dispatch-tracker.sh --help did not print the tracker usage."; exit 1 ;;
+          esac
+
+      # Limitation 1 (P6). A dispatch reaches the confinement decision only with a dispatchable
+      # task in the workspace queue, a task-bound worker scope and a claude executable on PATH for
+      # the spawn decision, so the probe supplies exactly those; the stand-in claude never runs,
+      # because the refusal comes first. Nothing may be staged: the sessions directory is unchanged
+      # and the --cwd is never created.
+      - name: Confined dispatch is refused cleanly with exit 78
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="$(cygpath -u "\${RUNNER_TEMP}")"
+          WS="\${T}/w0-ws"
+          export HOME="\${T}/w0-home"
+          export USERPROFILE="$(cygpath -w "\${HOME}")"
+          mkdir -p "\${T}/w0-fake-bin"
+          printf '#!/bin/sh\\nexit 99\\n' > "\${T}/w0-fake-bin/claude"
+          export PATH="\${T}/w0-prefix:\${T}/w0-fake-bin:\${PATH}"
+          node -e 'const fs = require("node:fs"); const queue = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); queue.tasks.push({ id: 1, status: "pending", track: "w0", desc: "W0 confined-dispatch refusal probe" }); fs.writeFileSync(process.argv[1], JSON.stringify(queue, null, 2) + "\\n");' "$(cygpath -w "\${WS}/state/task-queue.json")"
+          printf '{"version":1,"task":"1","sid":"w0-probe","domains":[],"read":[],"write":[]}\\n' > "\${T}/w0-scope.json"
+          export AIGENTRY_WORKER_SCOPE="$(cygpath -w "\${T}/w0-scope.json")"
+          printf 'W0 confined-dispatch refusal probe\\n' > "\${T}/w0-ref.md"
+          SESSIONS="\${HOME}/.aigentry/sessions"
+          BEFORE="$(ls -A "\${SESSIONS}" 2>/dev/null || true)"
+          set +e
+          bash "\${WS}/bin/dispatch.sh" --spawn-and-dispatch --track w0 --name probe --cwd "$(cygpath -w "\${T}/target")" \\
+            --cli claude --role coder --task 1 --ref "$(cygpath -w "\${T}/w0-ref.md")" > "\${T}/dispatch.out" 2> "\${T}/dispatch.err"
+          RC=$?
+          set -e
+          cat "\${T}/dispatch.out" "\${T}/dispatch.err"
+          [ "\${RC}" = "78" ] || { echo "::error::dispatch.sh --spawn-and-dispatch exited \${RC} on win32; the confined spawn must refuse with exit 78."; exit 1; }
+          grep -q 'SANDBOX_PLATFORM_UNSUPPORTED' "\${T}/dispatch.err" || { echo "::error::exit 78 without SANDBOX_PLATFORM_UNSUPPORTED on stderr."; exit 1; }
+          AFTER="$(ls -A "\${SESSIONS}" 2>/dev/null || true)"
+          [ "\${BEFORE}" = "\${AFTER}" ] || { echo "::error::the refused dispatch changed \${SESSIONS}."; exit 1; }
+          [ ! -e "\${T}/target" ] || { echo "::error::the refused dispatch created its --cwd."; exit 1; }
+          echo "confined dispatch refused with exit 78 and SANDBOX_PLATFORM_UNSUPPORTED; nothing was staged"
+
+      # Limitation 2 (W-D2 B). init refuses the native capture options before it reads or writes
+      # anything, so the workspace and the home are byte-identical afterwards.
+      - name: Native capture refuses cleanly on win32
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="$(cygpath -u "\${RUNNER_TEMP}")"
+          WS="\${T}/w0-ws"
+          export HOME="\${T}/w0-home"
+          export USERPROFILE="$(cygpath -w "\${HOME}")"
+          export PATH="\${T}/w0-prefix:\${PATH}"
+          mkdir -p "\${T}/w0-capture" "\${T}/w0-preservation"
+          snapshot() { find "\${WS}" "\${HOME}" -type d -print -o -type f -exec sha256sum {} + | sort; }
+          BEFORE="$(snapshot)"
+          set +e
+          OUT="$(aigentry-orchestrator init --yes --workspace "$(cygpath -w "\${WS}")" --capture-root "$(cygpath -w "\${T}/w0-capture")" \\
+            --preservation-root "$(cygpath -w "\${T}/w0-preservation")" 2>&1)"
+          RC=$?
+          set -e
+          printf '%s\\n' "\${OUT}"
+          [ "\${RC}" = "2" ] || { echo "::error::init with native capture options exited \${RC} on win32; it must refuse with exit 2."; exit 1; }
+          case "\${OUT}" in
+            *"is not available on native Windows in 0.2.2. Nothing was written."*) echo "native capture refused with exit 2 and the documented message" ;;
+            *) echo "::error::init exited 2 without the documented native-capture refusal."; exit 1 ;;
+          esac
+          [ "$(snapshot)" = "\${BEFORE}" ] || { echo "::error::the refused native capture changed the workspace or the home."; exit 1; }
+`;
+const ciHeaderBefore = `# What this still does NOT measure, stated so a green check is not read as more than it is:
+# the live-integration guards above, and anything Windows beyond the refusal asserted in
+# the windows-refuses job below.
+`;
+const ciHeaderAfter = `# What this still does NOT measure, stated so a green check is not read as more than it is:
+# the live-integration guards above. Windows is measured by the three jobs at the end of this
+# file: it is supported except confined worker spawn and native request capture, and those two
+# limitations are asserted as clean refusals, not skipped.
+`;
+const approvedWindows = parse('approved-windows-contract', `jobs:\n${approvedWindowsRegion}`).jobs;
+assert.deepEqual(Object.keys(approvedWindows), [declared, ...ids], 'approved Windows contract names exactly the three successor jobs');
 function withoutBrowser(workflow, release) {
   // #1177: both workflows carry the one CI contract, release included.
   assert.deepEqual(workflow.jobs['browser-tls'], approvedCIBrowser,
@@ -1147,7 +1546,7 @@ function withoutBrowser(workflow, release) {
   assert.equal(pkg.devDependencies.playwright, '1.58.2', 'locked browser dependency');
   if (release) {
     assert.deepEqual(workflow.jobs.guard.needs, ['browser-tls'], 'guard requires browser success');
-    assert.deepEqual(workflow.jobs.publish.needs, ['browser-tls', ...original.jobs.publish.needs, ...ids], 'all original, Windows and browser publish dependencies');
+    assert.deepEqual(workflow.jobs.publish.needs, ['browser-tls', 'guard', 'test', declared, ...ids], 'browser, gate and Windows successor publish dependencies');
   }
   const copy = structuredClone(workflow);
   delete copy.jobs['browser-tls'];
@@ -1163,23 +1562,52 @@ function named(job, name) {
   assert.equal(matches.length, 1, `unique parsed step: ${name}`);
   return matches[0];
 }
-// #1171 — the CI-only full-suite debt step. `ciDebt` is what CI runs today; `ciDebtBaseline`
-// is the frozen historical body it replaced, kept so the masking it produced can be replayed
-// and demonstrated rather than asserted. Both are Bash-syntax-checked by the loop below.
+// #1167 — the replayed step bodies. `fullSuite` replaced the CI-only debt ratchet: zero failures, zero skips,
+// no allowance. `ciDebtBaseline` is the frozen historical debt body, kept only so the masking it produced
+// can still be replayed. Every body is Bash-syntax-checked by the loop below.
+const persistenceStep = 'Persistence suite must be fully green on win32';
+const fullSuiteStep = 'Full suite must be fully green on win32';
+const declarationStep = 'package.json and the lock file must declare Windows in';
+const npmStep = 'U23 — npm ci must succeed on win32 without --force';
+const initStep = 'init succeeds in a temporary home and produces the expected tree';
 const debtStep = 'Known win32 debt must not move';
 const commands = {
-  persistence: named(final.jobs[ids[0]], 'Persistence suite must be fully green on win32').run,
-  declaration: named(final.jobs[ids[1]], 'package.json must declare Windows out').run,
-  init: named(final.jobs[ids[1]], 'bin/init/cli.mjs platform gate must exit 2 on win32').run,
-  npm: named(final.jobs[ids[1]], 'U23 — npm ci must refuse on win32 with EBADPLATFORM').run,
-  ciPersistence: named(ci.jobs[ids[0]], 'Persistence suite must be fully green on win32').run,
-  ciDebt: named(ci.jobs[ids[0]], debtStep).run,
-  ciDebtBaseline: named(ciBefore.jobs[ids[0]], debtStep).run,
+  persistence: named(final.jobs[ids[0]], persistenceStep).run,
+  fullSuite: named(final.jobs[ids[0]], fullSuiteStep).run,
+  declaration: named(final.jobs[ids[1]], declarationStep).run,
+  npm: named(final.jobs[ids[1]], npmStep).run,
+  declared: named(final.jobs[declared], declarationStep).run,
+  ciPersistence: named(ci.jobs[ids[0]], persistenceStep).run,
+  ciFullSuite: named(ci.jobs[ids[0]], fullSuiteStep).run,
+  ciDebtBaseline: named(ciBefore.jobs[oldIds[0]], debtStep).run,
 };
-// The declared debt is the step's own env and is not allowed to move with this change.
-const declaredDebt = named(ci.jobs[ids[0]], debtStep).env.EXPECTED_WIN32_FAILURES;
-assert.equal(declaredDebt, '33', 'declared win32 debt is unchanged');
-assert.equal(named(ciBefore.jobs[ids[0]], debtStep).env.EXPECTED_WIN32_FAILURES, declaredDebt);
+assert.equal(commands.declared, commands.declaration, 'W0 repeats the declaration job exactly');
+// No debt number exists anymore: the fixture's '33' is read only for the historical replay.
+const historicalDebt = named(ciBefore.jobs[oldIds[0]], debtStep).env.EXPECTED_WIN32_FAILURES;
+assert.equal(historicalDebt, '33', 'historical declared win32 debt');
+function assertNoDebtEnv(workflow, label) {
+  for (const [id, job] of Object.entries(workflow.jobs)) {
+    for (const item of [job, ...(job.steps ?? [])]) {
+      assert.ok(!(item.env && 'EXPECTED_WIN32_FAILURES' in item.env), `${label} ${id}: no win32 debt allowance`);
+    }
+  }
+}
+assertNoDebtEnv(final, 'release');
+assertNoDebtEnv(ci, 'CI');
+// C1: the security pin is a reviewed literal. While no policy exists for the package version only
+// UNREVIEWED is accepted (the gate refuses it, so nothing publishes); once
+// release/security/<version>/policy.json exists only the exact lowercase sha256 of its bytes is.
+function currentPolicy() {
+  const { version } = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+  const file = join(root, 'release', 'security', version, 'policy.json');
+  return existsSync(file) ? readFileSync(file) : null;
+}
+function assertPolicyPin(pin, policy) {
+  assert.equal(typeof pin, 'string', 'security policy pin is a literal');
+  assert.ok(pin === 'UNREVIEWED' || /^[0-9a-f]{64}$/.test(pin), 'security policy pin: 64 lowercase hex or UNREVIEWED, never derived');
+  assert.equal(pin, policy === null ? 'UNREVIEWED' : sha(policy),
+    policy === null ? 'UNREVIEWED only while no policy exists for this version' : 'pin equals sha256 of the policy bytes');
+}
 // Block-scalar bodies sit at ten spaces inside `run: |`; used for the exact byte exceptions.
 const debtIndent = body => body.split('\n').map(line => line ? '          ' + line : '').join('\n');
 // Only the parsed Bash function may differ from the rejected/archived CI block.
@@ -1195,7 +1623,10 @@ function readerParts(command) {
   return { prefix: command.slice(0, start), reader: command.slice(start, end), suffix: command.slice(end) };
 }
 const fixedReader = readerParts(commands.persistence).reader;
-const rejectedPersistence = named(rejected.jobs[ids[0]], 'Persistence suite must be fully green on win32').run;
+const rejectedPersistence = named(rejected.jobs[oldIds[0]], persistenceStep).run;
+// The full-suite summary is read by the same strict reader as the persistence step, on its own log.
+assert.equal(commands.fullSuite.split(fixedReader.replaceAll('persistence.log', 'full.log')).length, 2,
+  'full suite uses the strict persistence reader exactly once');
 writeFileSync(join(evidence, 'parsed-commands.json'), JSON.stringify(commands, null, 2));
 for (const [key, command] of Object.entries(commands)) {
   const path = join(admin, `${key}.bash`);
@@ -1206,7 +1637,7 @@ for (const [key, command] of Object.entries(commands)) {
   assert.equal(result.status, 0, result.stderr);
 }
 
-function validate(workflow) {
+function validate(workflow, policy = currentPolicy()) {
   workflow = withoutBrowser(workflow, true);
   const top = structuredClone(workflow);
   delete top.jobs;
@@ -1214,55 +1645,56 @@ function validate(workflow) {
   delete oldTop.jobs;
   assert.deepEqual(top, oldTop, 'unchanged trigger, permissions and concurrency');
   assert.deepEqual(workflow.on, { push: { tags: ['v*'] } });
-  assert.deepEqual(Object.keys(workflow.jobs).sort(), [...Object.keys(original.jobs), ...ids].sort());
+  assert.deepEqual(Object.keys(workflow.jobs).sort(),
+    [...Object.keys(original.jobs).filter(id => id !== 'windows-declared-unsupported'), declared, ...ids].sort());
+  for (const [retired, next] of Object.entries(successor)) {
+    assert.ok(!(retired in workflow.jobs), `retired job ${retired} is absent`);
+    assert.ok(next in workflow.jobs, `successor job ${next} is present`);
+  }
   const guard = structuredClone(workflow.jobs.guard);
   const securityEnv = named(guard, 'Release planning and changed-file admission').env;
-  assert.equal(securityEnv.RELEASE_SECURITY_POLICY_SHA256, 'UNREVIEWED');
+  assertPolicyPin(securityEnv.RELEASE_SECURITY_POLICY_SHA256, policy);
   assert.equal(securityEnv.RELEASE_SECURITY_COMMIT, '${{ github.sha }}');
   delete securityEnv.RELEASE_SECURITY_POLICY_SHA256;
   delete securityEnv.RELEASE_SECURITY_COMMIT;
   assert.deepEqual(guard, original.jobs.guard, 'guard changes only the required security trust inputs');
-  for (const id of ['test', 'windows-declared-unsupported']) {
-    assert.deepEqual(workflow.jobs[id], original.jobs[id], `unchanged ${id}`);
-  }
+  assert.deepEqual(workflow.jobs.test, original.jobs.test, 'unchanged test');
   const guardSteps = workflow.jobs.guard.steps;
   const admission = guardSteps.indexOf(named(workflow.jobs.guard, 'Release planning and changed-file admission'));
   const token = guardSteps.indexOf(named(workflow.jobs.guard, 'NPM_TOKEN must be present'));
   assert.ok(admission >= 0 && admission < token, 'admission precedes token');
   const publish = structuredClone(workflow.jobs.publish);
-  assert.deepEqual(publish.needs, [...original.jobs.publish.needs, ...ids], 'all publish dependencies');
+  assert.deepEqual(publish.needs, ['guard', 'test', declared, ...ids], 'gate and Windows successor publish dependencies');
   publish.needs = original.jobs.publish.needs;
   assert.deepEqual(publish, original.jobs.publish, 'unchanged publish steps, secrets and permissions');
-  for (const [index, id] of ids.entries()) {
+  for (const id of [declared, ...ids]) {
     const job = workflow.jobs[id];
-    assert.equal(job['runs-on'], 'windows-latest');
-    assert.equal(job.needs, 'guard');
-    assert.equal(job['timeout-minutes'], [20, 10][index]);
-    assert.equal(job.steps[0].uses, 'actions/checkout@v4');
-    assert.equal(job.steps[1].uses, 'actions/setup-node@v4');
-    assert.equal(job.steps[1].with['node-version'], '20');
-    assert.equal(job.steps.length, 5);
-    const expected = runSteps(ci.jobs[id]).slice(0, 3);
-    const actualCommands = runSteps(job).map(s => s.run);
-    if (id === 'windows-persistence') {
-      const current = readerParts(actualCommands[2]);
-      const previous = readerParts(rejectedPersistence);
-      assert.equal(current.reader, fixedReader, 'only the frozen corrected reader is authorized');
-      assert.equal(current.prefix, previous.prefix, 'W1 pre-reader bytes unchanged');
-      assert.equal(current.suffix, previous.suffix, 'W1 post-reader bytes unchanged');
-      assert.equal(rejectedPersistence, runSteps(ciBefore.jobs[id])[2].run, 'rejected W1 remains exact archived CI source');
-    }
-    assert.deepEqual(actualCommands, expected.map(s => s.run), `${id}: exact full CI command parity`);
+    assert.equal(job.needs, 'guard', `${id}: needs guard`);
+    const withoutNeeds = structuredClone(job);
+    delete withoutNeeds.needs;
+    assert.deepEqual(withoutNeeds, ci.jobs[id], `${id}: release equals CI except needs`);
+    assert.deepEqual(withoutNeeds, approvedWindows[id], `${id}: approved Windows contract`);
     for (const item of [job, ...job.steps]) {
       for (const key of ['continue-on-error', 'if', 'strategy', 'env']) {
         assert.ok(!(key in item), `${id}: no ${key} override/bypass`);
       }
     }
-    for (const step of runSteps(job)) assert.equal(step.shell, 'bash');
+    for (const step of runSteps(job)) assert.ok(['bash', 'pwsh'].includes(step.shell), `${id}: explicit shell`);
   }
-  const forced = ids.flatMap(id => runSteps(workflow.jobs[id]).filter(s => /--force\b/.test(s.run)).map(s => [id, s.run]));
-  assert.deepEqual(forced, [['windows-persistence', 'npm ci --force']]);
-  assert.deepEqual(JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).os, ['darwin', 'linux']);
+  const current = readerParts(named(workflow.jobs[ids[0]], persistenceStep).run);
+  const previous = readerParts(rejectedPersistence);
+  assert.equal(current.reader, fixedReader, 'only the frozen corrected reader is authorized');
+  assert.equal(current.prefix, previous.prefix, 'W1 pre-reader bytes unchanged');
+  assert.equal(current.suffix, previous.suffix, 'W1 post-reader bytes unchanged');
+  assert.equal(rejectedPersistence, named(ciBefore.jobs[oldIds[0]], persistenceStep).run, 'rejected W1 remains exact archived CI source');
+  const forced = [workflow, ci].flatMap(source => [declared, ...ids].flatMap(id =>
+    runSteps(source.jobs[id]).filter(s => /--force\b/.test(s.run)).map(s => [id, s.run])));
+  assert.deepEqual(forced, [], 'no Windows job forces npm');
+  assertNoDebtEnv(workflow, 'release');
+  const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+  const lock = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8'));
+  assert.deepEqual(pkg.os, ['darwin', 'linux', 'win32']);
+  assert.deepEqual(lock.packages[''].os, pkg.os, 'lock root entry declares the same os');
 }
 
 function acceptance(name, category, run) {
@@ -1281,79 +1713,127 @@ acceptance('baseline has zero actual Windows gates and omits both publish depend
   }
   assert.throws(() => validate(original));
 });
-acceptance('frozen final workflow preserves old behavior and requires W0 plus W1', 'structure', () => validate(final));
+acceptance('frozen final workflow preserves non-Windows behaviour and requires the three Windows successors', 'structure', () => validate(final));
 function validateReleaseHistory(workflow) {
   validate(workflow);
   const copy = withoutBrowser(workflow, true);
-  const env = named(copy.jobs.guard, 'Release planning and changed-file admission').env;
-  delete env.RELEASE_SECURITY_POLICY_SHA256;
-  delete env.RELEASE_SECURITY_COMMIT;
-  named(copy.jobs[ids[0]], 'Persistence suite must be fully green on win32').run = rejectedPersistence;
-  assert.deepEqual(copy, rejected);
+  const history = structuredClone(rejected);
+  for (const item of [copy, history]) {
+    const env = named(item.jobs.guard, 'Release planning and changed-file admission').env ?? {};
+    delete env.RELEASE_SECURITY_POLICY_SHA256;
+    delete env.RELEASE_SECURITY_COMMIT;
+    for (const id of [...Object.keys(successor), declared, ...ids]) delete item.jobs[id];
+    delete item.jobs.publish.needs;
+  }
+  assert.deepEqual(copy, history, 'release differs from the rejected source only in approved regions');
 }
-acceptance('corrected reader is the only parsed workflow change from rejected source', 'reader-structure', () => validateReleaseHistory(final));
+acceptance('release differs from the rejected source only in approved regions', 'reader-structure', () => validateReleaseHistory(final));
+// C1 with a synthetic policy: once a policy exists only its exact hash is admitted, and UNREVIEWED is not.
+acceptance('C1 security pin: UNREVIEWED only without a policy, then exactly the policy hash', 'structure', () => {
+  const policy = Buffer.from('{"schema_version":1,"synthetic":"policy"}\n');
+  const withPin = pin => {
+    const copy = structuredClone(final);
+    named(copy.jobs.guard, 'Release planning and changed-file admission').env.RELEASE_SECURITY_POLICY_SHA256 = pin;
+    return copy;
+  };
+  validate(withPin('UNREVIEWED'), null);
+  validate(withPin(sha(policy)), policy);
+  const derived = [undefined, '', 0, '${{ vars.RELEASE_SECURITY_POLICY_SHA256 }}', "${{ hashFiles('release/security/**/policy.json') }}",
+    '$(sha256sum release/security/0.2.2/policy.json)', sha(policy).toUpperCase(), sha(policy).slice(1), `${sha(policy)} `];
+  for (const pin of [sha(policy), '0'.repeat(64), ...derived]) assert.throws(() => validate(withPin(pin), null), assert.AssertionError, `no policy: ${pin}`);
+  for (const pin of ['UNREVIEWED', '0'.repeat(64), sha('other policy bytes'), ...derived]) {
+    assert.throws(() => validate(withPin(pin), policy), assert.AssertionError, `policy present: ${pin}`);
+  }
+});
+const windowsBoundary = '  # #901 (W1)';
 function validateCIHistory(source, historicalSource = readFileSync(join(root, fixtureRoot, 'ci.before-parity.yml'), 'utf8')) {
   const workflow = parse('CI historical comparison', source);
-  const persistence = named(workflow.jobs[ids[0]], 'Persistence suite must be fully green on win32').run;
+  const persistence = named(workflow.jobs[ids[0]], persistenceStep).run;
   assert.equal(persistence, commands.persistence);
   assert.equal(sha(persistence), '50b8b702d34566ab8ef1b3ec310770ee5c32af62950d8d7ddb0996e234df6850');
-  // #1171 — the second and only other authorized difference from the historical CI source: the
-  // full-suite debt step's diagnostic body. It is admitted by exact identity plus a pinned hash
-  // of both sides, never by relaxing the comparison, and it is undone before the deepEqual so
-  // every other parsed byte — jobs, steps, comments, thresholds — is still held exact.
-  const debt = named(workflow.jobs[ids[0]], debtStep).run;
-  assert.equal(debt, commands.ciDebt, 'only the one authorized debt diagnostic is admitted');
-  assert.equal(sha(debt), '6514354fbc3b986442902289180810df3716efe9c977d9e7d73c459e179dc6d4');
-  assert.equal(sha(commands.ciDebtBaseline), '5b9a49858084910a715febd75e8363b5093b4ed719e37a1474aeaf4adb761572');
-  assert.notEqual(debt, commands.ciDebtBaseline, 'the masking body is not the authorized body');
   const copy = withoutBrowser(workflow, false);
-  named(copy.jobs[ids[0]], 'Persistence suite must be fully green on win32').run = rejectedPersistence;
-  named(copy.jobs[ids[0]], debtStep).run = commands.ciDebtBaseline;
-  assert.deepEqual(copy, ciBefore);
-  const indentReader = reader => reader.split('\n').map(line => line ? '          ' + line : '').join('\n');
-  const fixedBytes = indentReader(fixedReader);
-  const oldBytes = indentReader(readerParts(rejectedPersistence).reader);
+  for (const id of [declared, ...ids]) {
+    assert.deepEqual(copy.jobs[id], approvedWindows[id], `CI ${id}: approved Windows contract`);
+    delete copy.jobs[id];
+  }
+  const history = structuredClone(ciBefore);
+  for (const id of oldIds) delete history.jobs[id];
+  assert.deepEqual(copy, history, 'CI without its browser and Windows jobs is the historical CI without its two Windows jobs');
+  // Bytes: everything before the historical Windows boundary is the historical CI except the one approved
+  // header sentence, and everything from there to EOF is the approved Windows region.
   const bytes = lf(source);
   const addition = `jobs:\n${ciBrowserAddition}`;
   assert.equal(bytes.split(addition).length, 2, 'exactly one approved browser block at the jobs boundary');
   const currentBytes = bytes.replace(addition, 'jobs:\n');
-  assert.equal(currentBytes.split(fixedBytes).length, 2, 'exactly one corrected reader in CI YAML');
-  const fixedDebt = debtIndent(commands.ciDebt);
-  const oldDebt = debtIndent(commands.ciDebtBaseline);
-  assert.equal(currentBytes.split(fixedDebt).length, 2, 'exactly one authorized debt diagnostic in CI YAML');
-  assert.equal(currentBytes.split(oldDebt).length, 1, 'the masking debt diagnostic is absent from CI YAML');
-  assert.equal(currentBytes.replace(fixedBytes, () => oldBytes).replace(fixedDebt, () => oldDebt), lf(historicalSource),
-    'inverse reader and debt-diagnostic replacement preserves every other CI byte, including the declared debt');
+  const historical = lf(historicalSource);
+  assert.equal(historical.split(windowsBoundary).length, 2, 'one historical Windows boundary');
+  const prefix = historical.slice(0, historical.indexOf(windowsBoundary));
+  assert.equal(prefix.split(ciHeaderBefore).length, 2, 'one historical Windows header sentence');
+  assert.equal(currentBytes, prefix.replace(ciHeaderBefore, () => ciHeaderAfter) + approvedWindowsRegion,
+    'every CI byte outside the approved header sentence and Windows region is the historical CI');
 }
-acceptance('CI W1 matches release and every other CI byte remains unchanged', 'ci-parity', () => validateCIHistory(readFileSync(join(root, '.github/workflows/ci.yml'), 'utf8')));
+acceptance('CI Windows jobs match release and every other CI byte remains unchanged', 'ci-parity', () => validateCIHistory(readFileSync(join(root, '.github/workflows/ci.yml'), 'utf8')));
 
 const mutants = [];
-for (const id of ids) {
+// The step each job's step-level mutants land on, found by name rather than by index.
+const keyStep = { [declared]: declarationStep, [ids[0]]: fullSuiteStep, [ids[1]]: initStep };
+for (const id of [declared, ...ids]) {
   mutants.push([`remove ${id}`, w => { delete w.jobs[id]; }]);
   mutants.push([`remove publish dependency ${id}`, w => { w.jobs.publish.needs = w.jobs.publish.needs.filter(n => n !== id); }]);
   for (const [label, change] of [
-    ['wrong runner', j => { j['runs-on'] = 'ubuntu-latest'; }],
+    ['wrong runner', j => { j['runs-on'] = j['runs-on'] === 'ubuntu-latest' ? 'windows-latest' : 'ubuntu-latest'; }],
     ['missing guard dependency', j => { delete j.needs; }],
     ['missing timeout', j => { delete j['timeout-minutes']; }],
-    ['Node 22', j => { j.steps[1].with['node-version'] = '22'; }],
+    ['Node 22', j => { j.steps.find(step => step.uses === 'actions/setup-node@v4').with['node-version'] = '22'; }],
     ['continue-on-error job', j => { j['continue-on-error'] = true; }],
     ['always job', j => { j.if = '${{ always() }}'; }],
     ['skip job', j => { j.if = 'false'; }],
-    ['continue-on-error step', j => { j.steps[4]['continue-on-error'] = true; }],
-    ['always step', j => { j.steps[4].if = '${{ always() }}'; }],
-    ['missing Bash', j => { delete j.steps[4].shell; }],
-    ['no-op command', j => { j.steps[4].run = 'echo green'; }],
+    ['continue-on-error step', j => { named(j, keyStep[id])['continue-on-error'] = true; }],
+    ['always step', j => { named(j, keyStep[id]).if = '${{ always() }}'; }],
+    ['missing shell', j => { delete named(j, keyStep[id]).shell; }],
+    ['no-op command', j => { named(j, keyStep[id]).run = 'echo green'; }],
   ]) mutants.push([`${id}: ${label}`, w => change(w.jobs[id])]);
+  for (const step of runSteps(final.jobs[id]).filter(item => /\bnpm (?:ci|pack|install)\b/.test(item.run))) {
+    mutants.push([`${id}: --force inserted into "${step.name}"`, w => {
+      const target = named(w.jobs[id], step.name);
+      target.run = target.run.replace(/\bnpm (ci|pack|install)\b/, match => `${match} --force`);
+    }]);
+  }
 }
 mutants.push(['publish always bypass', w => { w.jobs.publish.if = '${{ always() }}'; }]);
 mutants.push(['publish continue-on-error', w => { w.jobs.publish['continue-on-error'] = true; }]);
-mutants.push(['W0 forced npm', w => { w.jobs[ids[1]].steps[4].run = 'npm ci --force'; }]);
+mutants.push(['old publish dependencies', w => {
+  w.jobs.publish.needs = ['browser-tls', 'guard', 'test', 'windows-declared-unsupported', 'windows-persistence', 'windows-refuses'];
+}]);
+mutants.push(['EXPECTED_WIN32_FAILURES env added', w => { named(w.jobs[ids[0]], fullSuiteStep).env = { EXPECTED_WIN32_FAILURES: historicalDebt }; }]);
+for (const id of [declared, ids[1]]) mutants.push([`${id}: declaration reverted to darwin/linux`, w => {
+  const step = named(w.jobs[id], declarationStep);
+  step.run = replaceOnce(step.run, `'[["darwin","linux","win32"],["darwin","linux","win32"]]'`, `'["darwin","linux"]'`);
+}]);
+mutants.push(['W0 U23 expecting EBADPLATFORM again', w => {
+  named(w.jobs[ids[1]], npmStep).run = named(ciBefore.jobs[oldIds[1]], 'U23 — npm ci must refuse on win32 with EBADPLATFORM').run;
+}]);
+mutants.push(['full suite accepts skips', w => {
+  const step = named(w.jobs[ids[0]], fullSuiteStep);
+  step.run = replaceOnce(step.run, 'if [ "${SKIP}" != "0" ]; then', 'if [ "${SKIP}" -gt 5 ]; then');
+}]);
+mutants.push(['full suite ignores the runner exit', w => {
+  const step = named(w.jobs[ids[0]], fullSuiteStep);
+  step.run = replaceOnce(step.run, 'if [ "${RC}" != "0" ]; then', 'if false; then');
+}]);
+mutants.push(['full suite floor -gt 0', w => {
+  const step = named(w.jobs[ids[0]], fullSuiteStep);
+  step.run = replaceOnce(step.run, 'if [ "${TESTS}" -gt 200 ]; then', 'if [ "${TESTS}" -gt 0 ]; then');
+}]);
+mutants.push(['historical debt ratchet restored in place of the full suite', w => {
+  named(w.jobs[ids[0]], fullSuiteStep).run = commands.ciDebtBaseline;
+}]);
 mutants.push(['changed trigger', w => { w.on.workflow_dispatch = null; }]);
 mutants.push(['changed permissions', w => { w.permissions.contents = 'write'; }]);
 mutants.push(['admission after token', w => { w.jobs.guard.steps.reverse(); }]);
-mutants.push(['W1 changed pass floor outside reader', w => { w.jobs[ids[0]].steps[4].run = commands.persistence.replace('-gt 20', '-gt 0'); }]);
-mutants.push(['W1 changed selected test glob outside reader', w => { w.jobs[ids[0]].steps[4].run = commands.persistence.replace('persistence/*.test.js', '*.test.js'); }]);
-mutants.push(['W1 reverted legacy reader', w => { w.jobs[ids[0]].steps[4].run = rejectedPersistence; }]);
+mutants.push(['W1 changed pass floor outside reader', w => { named(w.jobs[ids[0]], persistenceStep).run = commands.persistence.replace('-gt 20', '-gt 0'); }]);
+mutants.push(['W1 changed selected test glob outside reader', w => { named(w.jobs[ids[0]], persistenceStep).run = commands.persistence.replace('persistence/*.test.js', '*.test.js'); }]);
+mutants.push(['W1 reverted legacy reader', w => { named(w.jobs[ids[0]], persistenceStep).run = rejectedPersistence; }]);
 for (const [name, mutate] of mutants) acceptance(`mutant rejected: ${name}`, 'mutant', () => {
   const copy = structuredClone(final);
   mutate(copy);
@@ -1363,19 +1843,20 @@ for (const [name, mutate] of mutants) acceptance(`mutant rejected: ${name}`, 'mu
 const persistenceFiles = readdirSync(join(root, 'tests/session/persistence')).filter(n => n.endsWith('.test.ts')).sort();
 assert.ok(persistenceFiles.length > 0);
 const persistenceArgv = ['--test', ...persistenceFiles.map(n => `dist/tests/session/persistence/${n.replace(/\.ts$/, '.js')}`)];
-const debtArgv = ['scripts/run-tests.mjs'];
+const fullSuiteArgv = ['scripts/run-tests.mjs'];
+const declarationArgv = ['-p', "JSON.stringify([require('./package.json').os, require('./package-lock.json').packages[''].os])"];
 const argvByCommand = {
   persistence: persistenceArgv,
   ciPersistence: persistenceArgv,
-  declaration: ['-p', "JSON.stringify(require('./package.json').os)"],
-  init: ['bin/init/cli.mjs', 'init'],
+  declaration: declarationArgv,
+  declared: declarationArgv,
   npm: ['ci'],
-  ciDebt: debtArgv,
-  ciDebtBaseline: debtArgv,
+  fullSuite: fullSuiteArgv,
+  ciFullSuite: fullSuiteArgv,
+  ciDebtBaseline: fullSuiteArgv,
 };
-// Step-level `env:` from the workflow itself; the debt bodies read it under `set -u`.
-const debtCommandEnv = { EXPECTED_WIN32_FAILURES: declaredDebt };
-const commandEnv = { ciDebt: debtCommandEnv, ciDebtBaseline: debtCommandEnv };
+// The historical debt body read its fixture step's own `env:` under `set -u`; nothing current has one.
+const commandEnv = { ciDebtBaseline: { EXPECTED_WIN32_FAILURES: historicalDebt } };
 function execute(key, fixture, label) {
   const directory = mkdtempSync(join(admin, `${key}-`));
   const bin = join(directory, 'mock-bin');
@@ -1433,24 +1914,25 @@ for (const field of ['pass', 'fail', 'skipped']) {
 add('persistence', 'reject decimal passes', tap('21.5'), 0);
 add('persistence', 'reject contradictory duplicate fail summary', tap(21, 1) + '# fail 0\n', 0);
 add('persistence', 'reject contradictory duplicate skip summary', tap(21, 0, 1) + '# skipped 0\n', 0);
-add('declaration', 'accept declared unsupported OS list', '["darwin","linux"]\n', 0, true);
-for (const output of ['["darwin","linux","win32"]', '["linux","darwin"]', '[]', '', 'null']) {
-  add('declaration', `reject wrong declaration ${JSON.stringify(output)}`, output, 0);
+// #1167: the declaration is the package.json os[] and the lock root os[], serialised together; the
+// ubuntu job and W0 run the same body, so both replay the same fixtures.
+const declaredOs = '[["darwin","linux","win32"],["darwin","linux","win32"]]';
+for (const key of ['declaration', 'declared']) {
+  add(key, 'accept declared supported OS lists', `${declaredOs}\n`, 0, true);
+  for (const output of ['["darwin","linux"]', '[["darwin","linux"],["darwin","linux"]]', '[["darwin","linux","win32"],["darwin","linux"]]',
+    '[["darwin","linux"],["darwin","linux","win32"]]', '[["darwin","linux","win32"],null]', '[["linux","darwin","win32"],["linux","darwin","win32"]]',
+    '[]', '', 'null']) {
+    add(key, `reject wrong declaration ${JSON.stringify(output)}`, output, 0);
+  }
+  add(key, 'reject correct declaration with command failure', `${declaredOs}\n`, 1);
 }
-add('declaration', 'reject correct declaration with command failure', '["darwin","linux"]\n', 1);
-const refusal = 'aigentry-orchestrator does not support Windows natively. Run init inside WSL2.\n';
-add('init', 'accept documented refusal exit 2', refusal, 2, true);
-for (const exit of [0, 1, 3, 127]) add('init', `reject refusal with exit ${exit}`, refusal, exit);
-for (const [name, output] of [
-  ['empty message', ''], ['generic error', 'fatal error'],
-  ['missing WSL2', 'does not support Windows natively'], ['missing native refusal', 'use WSL2'],
-]) add('init', `reject ${name}`, output, 2);
-add('npm', 'accept EBADPLATFORM exit 1', 'npm error code EBADPLATFORM\n', 1, true);
-add('npm', 'accept EBADPLATFORM exit 2', 'npm error code EBADPLATFORM\n', 2, true);
-add('npm', 'reject success despite EBADPLATFORM text', 'npm error code EBADPLATFORM\n', 0);
-add('npm', 'reject empty successful install', '', 0);
+// U23 inverted: a plain install must succeed, and EBADPLATFORM anywhere refuses.
+add('npm', 'accept plain successful install', 'added 137 packages, and audited 138 packages in 21s\n', 0, true);
+add('npm', 'accept empty successful install', '', 0, true);
+add('npm', 'reject success that logged EBADPLATFORM', 'npm error code EBADPLATFORM\n', 0);
+for (const exit of [1, 2]) add('npm', `reject EBADPLATFORM exit ${exit}`, 'npm error code EBADPLATFORM\n', exit);
 for (const [name, output] of [['network', 'npm error code ENETUNREACH'], ['auth', 'npm error code E401'], ['generic', 'npm error failure'], ['empty failure', '']]) {
-  add('npm', `reject ${name} without EBADPLATFORM`, output, 1);
+  add('npm', `reject ${name} failure`, output, 1);
 }
 // Retest additions leave every original fixture and its expectation unchanged.
 add('persistence', 'accept CRLF summary', tap().replaceAll('\n', '\r\n'), 0, true);
@@ -1500,154 +1982,119 @@ for (const fixture of ciReplayFixtures) acceptance(`CI W1 replay: ${fixture.name
   const exit = execute('ciPersistence', fixture, fixture.name);
   assert.equal(exit === 0, fixture.accept, `CI W1 must ${fixture.accept ? 'accept' : 'reject'}; actual exit ${exit}`);
 });
-// #1171 — synthetic-log oracles for the full-suite debt step. Both bodies are driven through
-// the same test-owned fake `node`, so nothing here runs a product command or touches Windows.
-// The declared-debt run is the only accepted shape; every other fixture must stay nonzero.
-const debtFixture = (tests, fail, skip, notOk = []) =>
+// #1167 — synthetic-log oracles for the full-suite step. Every body runs through the same test-owned fake
+// `node`, so nothing here runs a product command or touches Windows. Only a fully green run is accepted.
+const suiteFixture = (tests, fail, skip, notOk = []) =>
   `TAP version 13\n1..${tests}\n${notOk.map(name => `not ok ${name}\n`).join('')}` +
   `# tests ${tests}\n# pass ${tests - fail - skip}\n# fail ${fail}\n# skipped ${skip}\n`;
 // The observed reproduction: runs 36269992125 and 36271672360 both report 1298/109/5.
 const observedNotOk = ['13 - T140-dispatch-model-routing', '352 - hitl/web-auth', '634 - receipt fault boundary'];
-const observedRun = debtFixture(1298, 109, 5, observedNotOk);
-const acceptedRun = debtFixture(1298, 33, 0);
-// The runner's own exit status is deliberately ignored by both bodies, so every fixture is
-// replayed with a nonzero fake runner exit; only the parsed summary may decide the outcome.
-function runDebt(key, output, label) {
-  const exit = execute(key, { output, exit: 1 }, label);
+const observedRun = suiteFixture(1298, 109, 5, observedNotOk);
+const greenRun = suiteFixture(1298, 0, 0);
+function runSuite(key, output, label, exit = 0) {
+  const status = execute(key, { output, exit }, label);
   const { stdout, stderr } = invocations[invocations.length - 1];
   const out = stdout + stderr;
-  return { exit, out, annotations: out.split('\n').filter(line => line.startsWith('::error::')) };
+  return { exit: status, out, annotations: out.split('\n').filter(line => line.startsWith('::error::')) };
 }
 const mentions = (result, needle) => result.annotations.some(line => line.includes(needle));
+// History only: the retired debt body still masks the failures behind its skip gate, which is why it was replaced.
 acceptance('CI debt baseline masks the failure debt behind the skip gate', 'ci-debt', () => {
-  const result = runDebt('ciDebtBaseline', observedRun, 'baseline observed 1298/109/5');
+  const result = runSuite('ciDebtBaseline', observedRun, 'baseline observed 1298/109/5', 1);
   assert.equal(result.exit, 1, 'the job did fail');
   assert.deepEqual(result.annotations.length, 1, `one annotation only: ${JSON.stringify(result.annotations)}`);
   assert.ok(mentions(result, '5 test(s) skipped on win32'), 'and it named only the skips');
   assert.ok(!result.out.includes('--- failures this run ---'), 'the ratchet never ran');
   assert.ok(!mentions(result, 'win32 failures'), '109 was never compared to the declared 33');
 });
-acceptance('CI debt candidate reports the skips and the failure debt together', 'ci-debt', () => {
-  const result = runDebt('ciDebt', observedRun, 'candidate observed 1298/109/5');
-  assert.equal(result.exit, 1, 'the failure is retained, not downgraded');
-  assert.ok(mentions(result, '5 test(s) skipped on win32'), 'skips still reported');
-  assert.ok(mentions(result, 'win32 failures rose to 109 from the declared 33'), 'debt now reported too');
-  assert.ok(mentions(result, '2 win32 gate violation(s) reported above'));
-  const marker = result.out.indexOf('--- failures this run ---');
-  assert.ok(marker >= 0, 'the failing test names are emitted');
-  const listed = result.out.slice(marker);
-  for (const name of observedNotOk) assert.ok(listed.includes(`not ok ${name}`), `named after the marker: ${name}`);
-  assert.ok(!mentions(result, 'tests were enumerated'), 'an enumerated count of 1298 is not a violation');
-});
-acceptance('CI debt still accepts the exact historical declared-debt run', 'ci-debt', () => {
-  for (const key of ['ciDebtBaseline', 'ciDebt']) {
-    const result = runDebt(key, acceptedRun, `${key} accepted 1298/33/0`);
-    assert.equal(result.exit, 0, `${key}: acceptance is unchanged, never relaxed or tightened here`);
-    assert.deepEqual(result.annotations, []);
+acceptance('full suite accepts a fully green run in the release and CI bodies', 'full-suite', () => {
+  for (const key of ['fullSuite', 'ciFullSuite']) {
+    for (const [ending, output] of [['LF', greenRun], ['CRLF', greenRun.replaceAll('\n', '\r\n')]]) {
+      const result = runSuite(key, output, `${key} green ${ending}`);
+      assert.equal(result.exit, 0, `${key} ${ending}: ${result.out}`);
+      assert.deepEqual(result.annotations, []);
+    }
   }
 });
-acceptance('CI debt reports a low enumeration count alongside the other reasons', 'ci-debt', () => {
-  const result = runDebt('ciDebt', debtFixture(150, 109, 5, observedNotOk), 'candidate 150/109/5');
-  assert.equal(result.exit, 1);
-  assert.ok(mentions(result, 'only 150 tests were enumerated'));
-  assert.ok(mentions(result, '5 test(s) skipped on win32'));
-  assert.ok(mentions(result, 'win32 failures rose to 109 from the declared 33'));
-  assert.ok(mentions(result, '3 win32 gate violation(s) reported above'));
-});
-acceptance('CI debt keeps the minimum enumerated count above 200 exactly', 'ci-debt', () => {
-  const low = runDebt('ciDebt', debtFixture(200, 33, 0), 'candidate exactly 200 enumerated');
-  assert.equal(low.exit, 1);
-  assert.ok(mentions(low, 'only 200 tests were enumerated'));
-  assert.ok(mentions(low, '1 win32 gate violation(s) reported above'));
-  assert.equal(runDebt('ciDebt', debtFixture(201, 33, 0), 'candidate 201 enumerated').exit, 0);
-});
-// Digit-only is not the same as comparable: a count that clears the integer-shape guard can
-// still be unrepresentable by Bash's integer comparison, which makes `[` exit 2. Keeping a TRUE
-// `-gt` as the success condition is what holds that a refusal; a bare `-le` inversion would read
-// the error as "no violation" and let an otherwise 33/0 run through. Both bodies must stay
-// nonzero here. NOT EXECUTED in the authoring lane — the independent tester owns this run.
-const oversizedRun = acceptedRun.replace('# tests 1298', `# tests ${'9'.repeat(25)}`);
-acceptance('CI debt refuses an oversized digit-only enumerated count in both bodies', 'ci-debt', () => {
-  for (const key of ['ciDebtBaseline', 'ciDebt']) {
-    const result = runDebt(key, oversizedRun, `${key} oversized enumerated count`);
-    assert.notEqual(result.exit, 0, `${key}: a count it cannot compare is never a pass`);
+acceptance('full suite reports the skips and the failures together', 'full-suite', () => {
+  for (const key of ['fullSuite', 'ciFullSuite']) {
+    const result = runSuite(key, observedRun, `${key} observed 1298/109/5`);
+    assert.equal(result.exit, 1);
+    assert.ok(mentions(result, '5 test(s) skipped on win32'), 'skips reported');
+    assert.ok(mentions(result, '109 test(s) failed on win32'), 'failures reported');
+    assert.ok(mentions(result, '2 win32 gate violation(s) reported above'));
+    const marker = result.out.indexOf('--- failures this run ---');
+    assert.ok(marker >= 0, 'the failing test names are emitted');
+    for (const name of observedNotOk) assert.ok(result.out.slice(marker).includes(`not ok ${name}`), `named after the marker: ${name}`);
+    assert.ok(!mentions(result, 'tests were enumerated'), 'an enumerated count of 1298 is not a violation');
   }
-  const candidate = runDebt('ciDebt', oversizedRun, 'candidate oversized enumerated count reason');
-  assert.ok(mentions(candidate, 'tests were enumerated'), 'the unusable count is the reported reason');
-  assert.ok(mentions(candidate, '1 win32 gate violation(s) reported above'));
 });
-acceptance('CI debt rejects skips alone without inventing a debt mismatch', 'ci-debt', () => {
-  const result = runDebt('ciDebt', debtFixture(1298, 33, 5), 'candidate 1298/33/5');
-  assert.equal(result.exit, 1);
-  assert.ok(mentions(result, '5 test(s) skipped on win32'));
-  assert.ok(!result.out.includes('--- failures this run ---'), 'a matched debt is not a failure reason');
-  assert.ok(mentions(result, '1 win32 gate violation(s) reported above'));
+for (const [label, output, exit, reasons] of [
+  ['a low enumeration count', suiteFixture(150, 0, 0), 0, ['only 150 tests were enumerated']],
+  ['exactly 200 enumerated tests', suiteFixture(200, 0, 0), 0, ['only 200 tests were enumerated']],
+  ['skips alone', suiteFixture(1298, 0, 5), 0, ['5 test(s) skipped on win32']],
+  ['one failure', suiteFixture(1298, 1, 0, observedNotOk.slice(0, 1)), 0, ['1 test(s) failed on win32']],
+  ['good counts with runner exit 1', greenRun, 1, ['the runner exited 1']],
+  ['good counts with runner exit 7', greenRun, 7, ['the runner exited 7']],
+  ['an oversized digit-only enumerated count', greenRun.replace('# tests 1298', `# tests ${'9'.repeat(25)}`), 0, ['tests were enumerated']],
+  ['a low count, skips, failures and a runner exit together', suiteFixture(150, 109, 5, observedNotOk), 1,
+    ['only 150 tests were enumerated', '5 test(s) skipped on win32', '109 test(s) failed on win32', 'the runner exited 1']],
+]) acceptance(`full suite refuses ${label}`, 'full-suite', () => {
+  const result = runSuite('fullSuite', output, `full suite ${label}`, exit);
+  assert.equal(result.exit, 1, 'never a pass');
+  for (const reason of reasons) assert.ok(mentions(result, reason), `expected "${reason}" in ${JSON.stringify(result.annotations)}`);
+  assert.ok(mentions(result, `${reasons.length} win32 gate violation(s) reported above`), 'every reason counted, none extra');
+  assert.equal(result.out.includes('--- failures this run ---'), reasons.some(reason => reason.includes('failed on win32')),
+    'failing test names are listed exactly when tests failed');
 });
-for (const [label, fail, phrase] of [
-  ['upward', 34, 'win32 failures rose to 34 from the declared 33'],
-  ['downward', 20, 'win32 failures fell to 20 from the declared 33'],
-  ['fully repaired', 0, 'win32 failures fell to 0 from the declared 33'],
-]) acceptance(`CI debt rejects a ${label} debt mismatch`, 'ci-debt', () => {
-  const result = runDebt('ciDebt', debtFixture(1298, fail, 0, observedNotOk), `candidate ${label} mismatch`);
-  assert.equal(result.exit, 1, 'the ratchet is exact in both directions');
-  assert.ok(mentions(result, phrase));
-  assert.ok(mentions(result, '1 win32 gate violation(s) reported above'));
+acceptance('full suite accepts 201 enumerated tests: the floor is exactly >200', 'full-suite', () => {
+  assert.equal(runSuite('fullSuite', suiteFixture(201, 0, 0), 'full suite 201 enumerated').exit, 0);
 });
-// Fail-closed parsing, unchanged by #1171 and asserted here as it actually behaves. A summary
-// record that is absent entirely makes `read_count`'s grep fail, and under the step's own
-// `set -e`/`pipefail` the assignment ends the step before any annotation is emitted. That is a
-// refusal, so it is preserved verbatim; the collect-every-reason change above deliberately
-// covers only the test-count, skip and debt violations, which are reached with counts in hand.
+// The strict reader: a summary record that is absent, empty, malformed or duplicated is never read as a count.
 for (const [label, output] of [
   ['an empty log', ''],
-  ['a missing tests record', acceptedRun.replace('# tests 1298\n', '')],
-  ['a missing fail record', acceptedRun.replace('# fail 33\n', '')],
-  ['a missing skipped record', acceptedRun.replace('# skipped 0\n', '')],
-]) acceptance(`CI debt refuses ${label} without reporting a reason it did not read`, 'ci-debt', () => {
-  for (const key of ['ciDebtBaseline', 'ciDebt']) {
-    const result = runDebt(key, output, `${key} refuses ${label}`);
-    assert.equal(result.exit, 1, `${key}: a summary it could not read is never a pass`);
-    assert.deepEqual(result.annotations, [], `${key}: refusal shape is unchanged`);
-  }
-});
-// A record that is present but unreadable does reach the guards, and there the reason is named.
-// Both spellings refuse; neither may diagnose a count from a field it never validated.
-for (const [label, output, phrase] of [
-  ['an empty tests value', acceptedRun.replace('# tests 1298', '# tests '), 'could not parse the TAP summary'],
-  ['an empty fail value', acceptedRun.replace('# fail 33', '# fail '), 'could not parse the TAP summary'],
-  ['a non-numeric tests value', acceptedRun.replace('# tests 1298', '# tests nope'), 'are not plain integers'],
-  ['a non-numeric fail value', acceptedRun.replace('# fail 33', '# fail many'), 'are not plain integers'],
-  ['a negative skipped value', acceptedRun.replace('# skipped 0', '# skipped -1'), 'are not plain integers'],
-  ['a decimal tests value', acceptedRun.replace('# tests 1298', '# tests 1298.0'), 'are not plain integers'],
-]) acceptance(`CI debt refuses ${label}`, 'ci-debt', () => {
-  const result = runDebt('ciDebt', output, `candidate refuses ${label}`);
+  ...['tests', 'pass', 'fail', 'skipped'].flatMap(field => {
+    const record = greenRun.match(new RegExp(`^# ${field} \\d+$`, 'm'))[0];
+    return [
+      [`a missing ${field} record`, greenRun.replace(`${record}\n`, '')],
+      [`an empty ${field} value`, greenRun.replace(record, `# ${field} `)],
+      [`a non-numeric ${field} value`, greenRun.replace(record, `# ${field} nope`)],
+      [`a negative ${field} value`, greenRun.replace(record, `# ${field} -1`)],
+      [`a decimal ${field} value`, greenRun.replace(record, `${record}.0`)],
+      [`a duplicated ${field} record`, `${greenRun}${record}\n`],
+    ];
+  }),
+]) acceptance(`full suite refuses ${label} without reporting a count it did not read`, 'full-suite', () => {
+  const result = runSuite('fullSuite', output, `full suite refuses ${label}`);
   assert.equal(result.exit, 1, 'a summary it could not read is never a pass');
-  assert.ok(mentions(result, phrase), `expected "${phrase}" in ${JSON.stringify(result.annotations)}`);
-  assert.ok(!mentions(result, 'tests were enumerated'), 'no count is diagnosed from an unvalidated field');
-  assert.ok(!mentions(result, 'win32 failures'), 'no debt comparison on an unvalidated field');
-});
-acceptance('CI debt accepts an LF summary and still refuses a CRLF one', 'ci-debt', () => {
-  assert.equal(runDebt('ciDebt', acceptedRun, 'candidate LF summary').exit, 0, 'LF is the accepted encoding');
-  const crlf = acceptedRun.replaceAll('\n', '\r\n');
-  assert.equal(runDebt('ciDebtBaseline', crlf, 'baseline CRLF summary').exit, 1,
-    'the historical body already refused a CRLF summary; acceptance is not being widened');
-  const candidate = runDebt('ciDebt', crlf, 'candidate CRLF summary');
-  assert.equal(candidate.exit, 1, 'acceptance is unchanged: a CRLF summary is still refused');
-  assert.ok(mentions(candidate, 'are not plain integers'), 'now refused for the reason it actually failed');
-  assert.ok(!mentions(candidate, 'tests were enumerated'), 'and not as a count problem it never had');
+  assert.ok(mentions(result, 'could not parse the TAP summary'), `expected the parse refusal in ${JSON.stringify(result.annotations)}`);
+  assert.ok(!mentions(result, 'tests were enumerated') && !mentions(result, 'failed on win32'), 'no count is diagnosed from an unread field');
 });
 for (const [key, fixture] of [
   ['declaration', { output: '["win32"]', exit: 0 }],
-  ['init', { output: 'generic error', exit: 2 }],
   ['npm', { output: 'npm error E401', exit: 1 }],
 ]) acceptance(`W0 dependent group refuses after failed ${key}`, 'dependent-group', () => {
   const executed = [];
-  for (const command of ['declaration', 'init', 'npm']) {
+  for (const command of ['declaration', 'npm']) {
     const input = command === key ? fixture : cases.find(c => c.key === command && c.accept);
     executed.push(command);
     if (execute(command, input, `dependent-group-${key}`) !== 0) break;
   }
-  assert.deepEqual(executed, ['declaration', 'init', 'npm'].slice(0, ['declaration', 'init', 'npm'].indexOf(key) + 1));
+  assert.deepEqual(executed, ['declaration', 'npm'].slice(0, ['declaration', 'npm'].indexOf(key) + 1));
+});
+// The literal-checked W0 steps (pwsh steps and the installed-package bash steps) are never replayed here,
+// but every approved Bash body must at least parse.
+acceptance('approved Windows Bash step bodies parse', 'structure', () => {
+  for (const [id, job] of Object.entries(approvedWindows)) {
+    for (const step of runSteps(job).filter(item => item.shell === 'bash')) {
+      const path = join(admin, `approved-${id}-${job.steps.indexOf(step)}.bash`);
+      writeFileSync(path, step.run);
+      const result = spawnSync(bash, ['--noprofile', '--norc', '-n', path], { encoding: 'utf8', timeout });
+      invocations.push({ kind: 'bash-syntax', executable: bash, argv: ['--noprofile', '--norc', '-n', path], timeout, exit: result.status });
+      assert.ifError(result.error);
+      assert.equal(result.status, 0, `${id} "${step.name ?? step.run}": ${result.stderr}`);
+    }
+  }
 });
 
 // Portable prerequisite regressions use only private test-owned paths.
@@ -1750,6 +2197,12 @@ const workflowPolicyRelative = 'tests/packaging/workflow-policy.test.mjs';
 // included, directly after the workflow policy entry and ahead of the POSIX-only entries. The fixture
 // only places a test-owned sentinel at this path; the real suite is never imported or run here.
 const workerInputsRelative = 'tests/dispatch/worker-inputs.test.mjs';
+// #1167 init-platform suite: one explicit source entry on EVERY platform, win32 included, directly after the
+// worker-inputs entry; each OS asserts its own init branch. #1171 release-evidence suite: one explicit source
+// entry on every platform directly after it, ahead of the POSIX-only entries. The fixture only places
+// test-owned sentinels at these paths; the real suites are never imported or run here.
+const initPlatformRelative = 'tests/packaging/init-platform.test.mjs';
+const releaseEvidenceRelative = 'tests/packaging/release-evidence.test.mjs';
 function callerFixture(mode, symlinked = false) {
   const directory = mkdtempSync(join(admin, 'caller fixture '));
   const put = (path, source) => {
@@ -1785,6 +2238,8 @@ function callerFixture(mode, symlinked = false) {
   }
   if (mode !== 'missing-workflow-policy') put(workflowPolicyRelative, checks + `console.log('CALLER_WORKFLOW_POLICY_SENTINEL');\nprocess.exit(${mode === 'failing-workflow-policy' ? 8 : 0});\n`);
   if (mode !== 'missing-worker-inputs') put(workerInputsRelative, checks + `console.log('CALLER_WORKER_INPUTS_SENTINEL');\nprocess.exit(${mode === 'failing-worker-inputs' ? 8 : 0});\n`);
+  if (mode !== 'missing-init-platform') put(initPlatformRelative, checks + `console.log('CALLER_INIT_PLATFORM_SENTINEL');\nprocess.exit(${mode === 'failing-init-platform' ? 8 : 0});\n`);
+  if (mode !== 'missing-release-evidence') put(releaseEvidenceRelative, checks + `console.log('CALLER_RELEASE_EVIDENCE_SENTINEL');\nprocess.exit(${mode === 'failing-release-evidence' ? 8 : 0});\n`);
   if (mode !== 'missing-wizard') put(wizardRelative, checks + `console.log('CALLER_WIZARD_SENTINEL');\nprocess.exit(${mode === 'failing-wizard' ? 8 : 0});\n`);
   if (mode !== 'missing-supervisor') put(supervisorRelative, checks + `console.log('CALLER_SUPERVISOR_SENTINEL');\nprocess.exit(${mode === 'failing-supervisor' ? 8 : 0});\n`);
   for (const [index, path] of agentMetadataRelatives.entries()) {
@@ -1844,6 +2299,11 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic, onlyFailed
   // #1172 the worker-inputs suite alone missing or failing, analogous to the workflow policy entries.
   ['missing-worker-inputs', 1, false, false, false, /Could not find '[^'\n]*tests[\\/]dispatch[\\/]worker-inputs\.test\.mjs'/],
   ['failing-worker-inputs', 1, true, true, false, undefined, /tests[\\/]dispatch[\\/]worker-inputs\.test\.mjs$/],
+  // #1167 the init-platform suite and #1171 the release-evidence suite, each alone missing or failing.
+  ['missing-init-platform', 1, false, false, false, /Could not find '[^'\n]*tests[\\/]packaging[\\/]init-platform\.test\.mjs'/],
+  ['failing-init-platform', 1, true, true, false, undefined, /tests[\\/]packaging[\\/]init-platform\.test\.mjs$/],
+  ['missing-release-evidence', 1, false, false, false, /Could not find '[^'\n]*tests[\\/]packaging[\\/]release-evidence\.test\.mjs'/],
+  ['failing-release-evidence', 1, true, true, false, undefined, /tests[\\/]packaging[\\/]release-evidence\.test\.mjs$/],
   ['missing-harness', 1, true, true, false, /POSIX control harness failed with exit status: 1/],
   ['empty', 1, false, false, false, /No compiled test files found/],
   ['missing-dist', 1, false, false, false, /Failed to enumerate compiled tests/],
@@ -1877,6 +2337,8 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic, onlyFailed
   for (const index of preservationRelatives.keys()) assert.equal(result.stdout.includes(`CALLER_PRESERVATION_SENTINEL_${index}`), compiled);
   assert.equal(result.stdout.includes('CALLER_WORKFLOW_POLICY_SENTINEL'), compiled);
   assert.equal(result.stdout.includes('CALLER_WORKER_INPUTS_SENTINEL'), compiled);
+  assert.equal(result.stdout.includes('CALLER_INIT_PLATFORM_SENTINEL'), compiled);
+  assert.equal(result.stdout.includes('CALLER_RELEASE_EVIDENCE_SENTINEL'), compiled);
   assert.ok(!result.stdout.includes('CALLER_UNSELECTED_MJS'), 'no automatic source .mjs discovery');
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_COMPILED_CONTROL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (security && sentinel) assert.ok(result.stdout.indexOf('CALLER_SECURITY_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
@@ -1899,6 +2361,8 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic, onlyFailed
   }
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_WORKFLOW_POLICY_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_WORKER_INPUTS_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
+  if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_INIT_PLATFORM_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
+  if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_RELEASE_EVIDENCE_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (diagnostic) assert.match(result.stderr, diagnostic);
   if (onlyFailedFile) {
     const failures = result.stdout.split('\n').filter(line => /^not ok \d+ - /.test(line));
@@ -1975,7 +2439,7 @@ const startupError = { status: null, signal: null, error: 'synthetic ENOENT', co
 const timedOut = { status: null, signal: 'SIGKILL', error: 'synthetic ETIMEDOUT', code: 'ETIMEDOUT' };
 const callerArgv = platform => ['--test', 'dist/tests/a.test.js', 'dist/tests/nested/b.test.js', 'dist/tests/z.test.js',
   securityRelative, admissionRelative, ...jevRelatives, ...taskAdvisorRelatives, controlRelative, fakeCmuxInertRelative,
-  ...preservationRelatives, workflowPolicyRelative, workerInputsRelative,
+  ...preservationRelatives, workflowPolicyRelative, workerInputsRelative, initPlatformRelative, releaseEvidenceRelative,
   ...(['linux', 'darwin'].includes(platform) ? [nativeRelative, wizardRelative, supervisorRelative, ...agentMetadataRelatives] : [])];
 const vmCases = [];
 for (const platform of ['linux', 'darwin']) {
@@ -2130,8 +2594,8 @@ for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #117
   assert.equal(spawned.indexOf('tests/dispatch/worker-inputs.test.mjs'), spawned.indexOf('tests/packaging/workflow-policy.test.mjs') + 1);
 });
 // #1172 explicit placement of the worker-inputs entry in the exact runner's first spawn: exactly once on
-// every platform, win32 included, directly after the workflow policy entry, then the first POSIX-only
-// entry on POSIX and nothing after it on win32 — literal neighbours only.
+// every platform, win32 included, directly after the workflow policy entry, then (#1167) the init-platform
+// entry on every platform — literal neighbours only.
 for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #1172 worker-inputs follows workflow policy exactly once ahead of the POSIX-only entries (${platform})`, 'caller-vm', () => {
   const config = join(admin, `caller-vm-1172-worker-inputs-placement-${platform}.json`);
   writeFileSync(config, JSON.stringify({ platform, results: platform === 'win32' ? [success] : [success, success], source: callerSource }));
@@ -2147,8 +2611,33 @@ for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #117
   assert.equal(spawned.filter(item => item === 'tests/dispatch/worker-inputs.test.mjs').length, 1);
   assert.equal(spawned.filter(item => item === 'tests/packaging/workflow-policy.test.mjs').length, 1);
   assert.equal(spawned.indexOf('tests/dispatch/worker-inputs.test.mjs'), spawned.indexOf('tests/packaging/workflow-policy.test.mjs') + 1);
-  if (platform === 'win32') assert.equal(spawned.indexOf('tests/dispatch/worker-inputs.test.mjs'), spawned.length - 1);
-  else assert.equal(spawned.indexOf('tests/packaging/native-capture.test.mjs'), spawned.indexOf('tests/dispatch/worker-inputs.test.mjs') + 1);
+  assert.equal(spawned.indexOf('tests/packaging/init-platform.test.mjs'), spawned.indexOf('tests/dispatch/worker-inputs.test.mjs') + 1);
+});
+// #1167 explicit placement of the init-platform entry: exactly once on every platform, win32 included,
+// directly after the worker-inputs entry, then (#1171) the release-evidence entry — literal neighbours only.
+// #1171 the release-evidence entry: exactly once on every platform directly after init-platform, then the
+// first POSIX-only entry on POSIX and nothing after it on win32.
+for (const [label, entry, previous] of [
+  ['#1167 init-platform follows worker-inputs', 'tests/packaging/init-platform.test.mjs', 'tests/dispatch/worker-inputs.test.mjs'],
+  ['#1171 release-evidence follows init-platform', 'tests/packaging/release-evidence.test.mjs', 'tests/packaging/init-platform.test.mjs'],
+]) for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: ${label} exactly once ahead of the POSIX-only entries (${platform})`, 'caller-vm', () => {
+  const config = join(admin, `caller-vm-${label.replace(/[^a-z0-9]+/g, '-')}-placement-${platform}.json`);
+  writeFileSync(config, JSON.stringify({ platform, results: platform === 'win32' ? [success] : [success, success], source: callerSource }));
+  const argv = ['--experimental-vm-modules', driver, config];
+  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, encoding: 'utf8', timeout });
+  invocations.push({ kind: 'caller-vm-entry-placement', label: `${label} ${platform}`, executable: process.execPath, argv, timeout,
+    exit: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr, runnerSha256: sha(callerSource) });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+  const actual = JSON.parse(result.stdout);
+  assert.equal(actual.status, 0);
+  const spawned = actual.calls[0].argv;
+  assert.equal(spawned.filter(item => item === entry).length, 1);
+  assert.equal(spawned.indexOf(entry), spawned.indexOf(previous) + 1);
+  if (entry === 'tests/packaging/init-platform.test.mjs') {
+    assert.equal(spawned.indexOf('tests/packaging/release-evidence.test.mjs'), spawned.indexOf(entry) + 1);
+  } else if (platform === 'win32') assert.equal(spawned.indexOf(entry), spawned.length - 1);
+  else assert.equal(spawned.indexOf('tests/packaging/native-capture.test.mjs'), spawned.indexOf(entry) + 1);
 });
 // #1191 checkout-EOL policy for the one raw-byte-pinned preservation source. Each case commits LF bytes to a
 // fresh fake repo under the private admin directory and clones it locally (no remote, no network). Git runs
@@ -2255,6 +2744,8 @@ const fakeCmuxInertPush = "sourceTestFiles.push('tests/dispatch/fake-cmux-win32.
 const preservationPush = "sourceTestFiles.push('tests/packaging/preservation.test.mjs', 'tests/packaging/preservation-directories.test.mjs');\n";
 const workflowPolicyPush = "sourceTestFiles.push('tests/packaging/workflow-policy.test.mjs');\n";
 const workerInputsPush = "sourceTestFiles.push('tests/dispatch/worker-inputs.test.mjs');\n";
+const initPlatformPush = "sourceTestFiles.push('tests/packaging/init-platform.test.mjs');\n";
+const releaseEvidencePush = "sourceTestFiles.push('tests/packaging/release-evidence.test.mjs');\n";
 for (const [name, mutate, platforms] of [
   ['wizard entry placed on every platform, win32 included', source => replaceOnce(replaceOnce(source, wizardPosixPush, wizardPosixDropped),
     baseSourceList, "'tests/packaging/release-admission.test.mjs', 'tests/packaging/orchestrator-boot-wizard.test.mjs'];"), ['win32', 'linux', 'darwin']],
@@ -2350,6 +2841,21 @@ for (const [name, mutate, platforms] of [
     workflowPolicyPush, `${workerInputsPush}${workflowPolicyPush}`), ['win32', 'linux', 'darwin']],
   ['worker-inputs suite after the POSIX-only entries', source => replaceOnce(replaceOnce(source, workerInputsPush, ''),
     `${agentMetadataBlock}}\n`, `${agentMetadataBlock}}\n${workerInputsPush}`), ['linux', 'darwin']],
+  // #1167 / #1171: the init-platform and release-evidence entries are required exactly once on every platform,
+  // in that order directly after worker-inputs and ahead of the POSIX branch. Placing one on win32 only or after
+  // the POSIX branch leaves the win32 argv unchanged, so those counterfactuals apply to POSIX alone.
+  ...[['init-platform', initPlatformPush, workerInputsPush], ['release-evidence', releaseEvidencePush, initPlatformPush]]
+    .flatMap(([label, push, previous]) => [
+      [`${label} suite missing`, source => replaceOnce(source, push, ''), ['win32', 'linux', 'darwin']],
+      [`${label} suite duplicated`, source => replaceOnce(source, push, `${push}${push}`), ['win32', 'linux', 'darwin']],
+      [`${label} suite wired POSIX-only`, source => replaceOnce(replaceOnce(source, push, ''), wizardPosixPush,
+        `${wizardPosixPush}\n  ${push.trimEnd()}`), ['win32', 'linux', 'darwin']],
+      [`${label} suite placed on win32 only`, source => replaceOnce(source, push, `if (process.platform === 'win32') ${push}`), ['linux', 'darwin']],
+      [`${label} suite ahead of the entry it follows`, source => replaceOnce(replaceOnce(source, push, ''), previous, `${push}${previous}`),
+        ['win32', 'linux', 'darwin']],
+      [`${label} suite after the POSIX-only entries`, source => replaceOnce(replaceOnce(source, push, ''),
+        `${agentMetadataBlock}}\n`, `${agentMetadataBlock}}\n${push}`), ['linux', 'darwin']],
+    ]),
   // #1177: the XRes supervisor suite is required on POSIX and must never reach win32.
   ['XRes supervisor suite missing', source => replaceOnce(source, supervisorPosixPush, ''), ['linux', 'darwin']],
   ['XRes supervisor suite placed on every platform, win32 included', source => replaceOnce(replaceOnce(source, supervisorPosixPush, ''),
@@ -3131,8 +3637,10 @@ const ciDiagnosticMutations = [
     '                  "_NET_SUPPORTING_WM_CHECK:  no such atom on any window.") ewmh=absent ;;\n',
     '                  *"no such atom on any window"*) ewmh=absent ;;\n'],
 ];
-const publishDependencies = ['browser-tls', ...original.jobs.publish.needs, ...ids];
+const publishDependencies = ['browser-tls', 'guard', 'test', declared, ...ids];
 const publishNeeds = `    needs: [${publishDependencies.join(', ')}]\n`;
+// The current pin line, whatever literal it holds (UNREVIEWED today, the reviewed hash later); validate() judges it.
+const policyPinLine = lf(readFileSync(join(root, '.github/workflows/release.yml'), 'utf8')).match(/^          RELEASE_SECURITY_POLICY_SHA256: [^\n]*\n/m)[0];
 const releaseBrowserMutations = [
   ['missing guard browser dependency', '    needs: [browser-tls]\n', ''],
   ['extra guard dependency', '    needs: [browser-tls]\n', '    needs: [browser-tls, test]\n'],
@@ -3142,39 +3650,46 @@ const releaseBrowserMutations = [
   ['guard always', '  guard:\n', '  guard:\n    if: always()\n'],
   ['guard continue-on-error', '  guard:\n', '  guard:\n    continue-on-error: true\n'],
   ['publish skip', '  publish:\n', '  publish:\n    if: false\n'],
-  ['policy trust input missing', '          RELEASE_SECURITY_POLICY_SHA256: UNREVIEWED\n', ''],
-  ['policy trust input changed', '          RELEASE_SECURITY_POLICY_SHA256: UNREVIEWED\n', '          RELEASE_SECURITY_POLICY_SHA256: approved\n'],
+  ['policy trust input missing', policyPinLine, ''],
+  ['policy trust input changed', policyPinLine, '          RELEASE_SECURITY_POLICY_SHA256: approved\n'],
+  ['policy trust input derived from the tree', policyPinLine, "          RELEASE_SECURITY_POLICY_SHA256: ${{ hashFiles('release/security/**/policy.json') }}\n"],
+  ['policy trust input from a repository variable', policyPinLine, '          RELEASE_SECURITY_POLICY_SHA256: ${{ vars.RELEASE_SECURITY_POLICY_SHA256 }}\n'],
+  ['policy trust input wrong hex', policyPinLine, `          RELEASE_SECURITY_POLICY_SHA256: ${'0'.repeat(64)}\n`],
   ['commit trust input missing', '          RELEASE_SECURITY_COMMIT: ${{ github.sha }}\n', ''],
   ['commit trust input changed', '          RELEASE_SECURITY_COMMIT: ${{ github.sha }}\n', '          RELEASE_SECURITY_COMMIT: main\n'],
   ['original release version input changed', '          RELEASE_VERSION: ${{ steps.identity.outputs.version }}\n', '          RELEASE_VERSION: arbitrary\n'],
   ['publish authentication changed', '          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n', '          NODE_AUTH_TOKEN: arbitrary\n'],
 ];
-// #1171 — CI-only. The debt step's exception is granted for a diagnostic control-flow change and
-// nothing else, so each negative below relaxes exactly one bound that change may not move: the
-// declared debt, the enumeration floor, the zero-skip rule, the nonzero exit, the integer
-// validation that keeps the comparisons off unread fields, or the count of reported violations.
-// The last one restores the masking body itself, which the exception must no longer admit.
-const ciDebtMutations = [
-  ['debt threshold reinterprets the observed 109 as approved', "EXPECTED_WIN32_FAILURES: '33'", "EXPECTED_WIN32_FAILURES: '109'"],
-  ['enumerated-test floor dropped', '          if [ "${TESTS}" -gt 200 ]; then\n', '          if [ "${TESTS}" -gt 0 ]; then\n'],
-  // The correction itself: a bare `-le` inversion makes a comparison ERROR (`[` exit 2) read as
-  // "no violation", so an unrepresentable but digit-only count could leave VIOLATIONS=0.
-  ['enumeration success condition inverted so a comparison error stops being a violation',
+// #1167 — CI's copy of the approved Windows region. Each negative relaxes exactly one bound the full-suite
+// gate or its neighbours must hold; every one must be refused by the byte and parsed comparisons.
+const ciFullSuiteMutations = [
+  ['full-suite enumeration floor dropped', '          if [ "${TESTS}" -gt 200 ]; then\n', '          if [ "${TESTS}" -gt 0 ]; then\n'],
+  ['full-suite enumeration success condition inverted so a comparison error stops being a violation',
     '          if [ "${TESTS}" -gt 200 ]; then\n            :\n          else\n', '          if [ "${TESTS}" -le 200 ]; then\n'],
-  ['test skips become an accepted currency', '          if [ "${SKIP}" != "0" ]; then\n', '          if [ "${SKIP}" -gt 5 ]; then\n'],
-  ['collected violations no longer fail the job',
+  ['full-suite skips become an accepted currency', '          if [ "${SKIP}" != "0" ]; then\n', '          if [ "${SKIP}" -gt 5 ]; then\n'],
+  ['full-suite failures become an allowance', '          if [ "${FAIL}" != "0" ]; then\n', '          if [ "${FAIL}" -gt 33 ]; then\n'],
+  ['full-suite runner exit ignored', '          if [ "${RC}" != "0" ]; then\n', '          if false; then\n'],
+  ['full-suite collected violations no longer fail the job',
     '          [ "${VIOLATIONS}" = "0" ] || { echo "::error::${VIOLATIONS} win32 gate violation(s) reported above; every applicable diagnostic ran before this failure."; exit 1; }\n',
     '          echo "${VIOLATIONS} win32 gate violation(s) reported above."\n'],
-  ['failure debt is reported but not counted as a violation',
-    '            fi\n            VIOLATIONS=$((VIOLATIONS + 1))\n          fi\n', '            fi\n          fi\n'],
-  ['integer validation dropped before the comparisons',
-    '          case "${TESTS}${FAIL}${SKIP}" in\n'
-      + '            *[!0-9]*) echo "::error::the TAP summary counts are not plain integers (tests=\'${TESTS}\' fail=\'${FAIL}\' skipped=\'${SKIP}\'); refusing to compare them."; exit 1;;\n'
-      + '          esac\n', ''],
-  ['fail-closed summary parsing dropped',
-    '          [ -n "${TESTS}" ] && [ -n "${FAIL}" ] && [ -n "${SKIP}" ] \\\n'
+  ['full-suite fail-closed summary parsing dropped',
+    '          [ -n "${TESTS}" ] && [ -n "${PASS}" ] && [ -n "${FAIL}" ] && [ -n "${SKIP}" ] \\\n'
       + '            || { echo "::error::could not parse the TAP summary; refusing to report a vacuous pass."; exit 1; }\n', ''],
-  ['masking early-exit debt step restored', debtIndent(commands.ciDebt), debtIndent(commands.ciDebtBaseline)],
+  ['full-suite reader accepts malformed records',
+    '                if ($0 !~ ("^# " key " [0-9]+$")) malformed = 1\n                else count = $3\n              }\n'
+      + '              END { if (records == 1 && !malformed) print count }\n            \' "${RUNNER_TEMP}/full.log"\n',
+    '                count = $3\n              }\n'
+      + '              END { if (records == 1 && !malformed) print count }\n            \' "${RUNNER_TEMP}/full.log"\n'],
+  ['full-suite debt allowance reintroduced', `      - name: ${fullSuiteStep}\n        shell: bash\n`,
+    `      - name: ${fullSuiteStep}\n        shell: bash\n        env:\n          EXPECTED_WIN32_FAILURES: '33'\n`],
+  ['W1 install forced again', '      - name: Install dependencies (plain npm ci; Windows is declared in os[])\n        shell: bash\n        run: npm ci\n',
+    '      - name: Install dependencies (plain npm ci; Windows is declared in os[])\n        shell: bash\n        run: npm ci --force\n'],
+  ['W0 U23 expects a failed install again', '          [ "$RC" = "0" ] || { echo "::error::npm ci failed on win32', '          [ "$RC" != "0" ] || { echo "::error::npm ci failed on win32'],
+  ['W0 LF checkout dropped', '    timeout-minutes: 20\n    steps:\n      - name: Check out with LF endings, as the published tarball has them\n        shell: bash\n        run: git config --global core.autocrlf false\n',
+    '    timeout-minutes: 20\n    steps:\n      - name: Check out with LF endings, as the published tarball has them\n        shell: bash\n        run: git config --global core.autocrlf true\n'],
+  ['historical debt step restored in place of the full suite', debtIndent(commands.ciFullSuite), debtIndent(commands.ciDebtBaseline)],
+  ['Windows header sentence changed', '# the live-integration guards above. Windows is measured', '# the live-integration guards above. Windows is observed'],
+  ['Windows region comment byte changed', '  # #901 (W1), now the whole suite', '  # #901 (W1), now the entire suite'],
 ];
 // The acceptance caller's `umask 077` plus the one line that follows it in each contract, so
 // the cookie-umask negatives land on the CALLER and not on the CI-only compile step, which
@@ -3202,9 +3717,8 @@ for (const [workflowName, path] of [['CI', '.github/workflows/ci.yml'], ['releas
     const mutations = workflowName === 'CI' ? [
       ...browserMutations,
       ...ciDiagnosticMutations,
-      ...ciDebtMutations,
+      ...ciFullSuiteMutations,
       ['unrelated comment byte changed', '# #894.', '# #894 changed.'],
-      ['Windows debt threshold changed', "EXPECTED_WIN32_FAILURES: '33'", "EXPECTED_WIN32_FAILURES: '32'"],
     ] : [...browserMutations, ...ciDiagnosticMutations, ...releaseBrowserMutations];
     for (const [name, needle, replacement] of mutations) {
       acceptance(`browser projection rejects ${workflowName} ${ending}: ${name}`, 'browser-projection-mutant', () => {
@@ -3227,7 +3741,7 @@ after(() => {
     callerRunnerSha256: sha(callerSource), callerStaleGuardSha256: sha(staleGuardSource),
     counts, cases: manifest, fixtures: cases, ciReplayFixtures, invocations,
     limits: ['Local fake-command control flow only; no actual Windows, GHA schema/scheduling or side-effect absence proof.',
-      'Regular-CI Windows full-suite debt is excluded; native OS declaration remains unsupported.',
+      'Windows behaviour is measured only by the windows-suite/windows-installed CI jobs; this harness checks their YAML.',
       'YAML fixtures are not product security clearance. Exact-source Snyk remains blocked by known tls652; no retry/upload.'],
   }, null, 2));
   assert.deepEqual(afterHashes, before, 'all hashed product, baseline and CI sources unchanged');

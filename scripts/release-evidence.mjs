@@ -368,7 +368,10 @@ export function sarifResults(sarif, projectedPaths) {
       `${at}: ruleId/ruleIndex mismatch`);
     need(result.level === undefined || typeof result.level === 'string', `${at}: level must be a string`);
     need(Array.isArray(result.locations) && result.locations.length === 1, `${at}: exactly one location`);
-    exactKeys(result.locations[0], ['physicalLocation'], `${at} location`);
+    // Same rule as the gate: Snyk Code's optional non-negative integer location `id`, and no other extra key.
+    const hasId = isObject(result.locations[0]) && Object.hasOwn(result.locations[0], 'id');
+    exactKeys(result.locations[0], hasId ? ['id', 'physicalLocation'] : ['physicalLocation'], `${at} location`);
+    need(!hasId || (Number.isSafeInteger(result.locations[0].id) && result.locations[0].id >= 0), `${at}: location id must be a non-negative integer`);
     const location = result.locations[0].physicalLocation;
     exactKeys(location, ['artifactLocation', 'region'], `${at} physicalLocation`);
     const artifact = location.artifactLocation;

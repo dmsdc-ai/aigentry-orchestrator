@@ -1049,8 +1049,8 @@ jobs:
           fi
           echo "NPM_TOKEN is present"
 
-  # Gate 3. Full suites on the two supported OSes; bounded Windows gates below
-  # check persistence and refusal. Native Windows remains unsupported (os: [darwin, linux]).
+  # Gate 3. Full suites on macOS and Linux; the Windows gates below hold windows-latest to
+  # the same zero. Windows is supported except confined worker spawn and native request capture.
   #
   # #900 — tests/dispatch/run-all.sh runs here now. The comment it replaces called it a
   # maintainer-machine gate that "needs a live telepty daemon"; tests/dispatch/lib.sh
@@ -1094,43 +1094,55 @@ jobs:
       - name: Acceptance smoke — install the tarball and init into a throwaway HOME
         run: bash tests/packaging/smoke-init.sh
 
-  # §7.1: not a full matrix row — one step asserting the declaration that makes npm refuse
-  # the install on Windows with its own EBADPLATFORM, rather than letting it fail at first run.
-  windows-declared-unsupported:
-    name: Windows is declared unsupported
+  # §7.1: not a full matrix row — one step asserting the declaration that lets npm install on
+  # Windows: package.json os[] and the lock file's root entry both include win32.
+  # Windows is supported except confined worker spawn and native request capture. The three
+  # Windows jobs are ci.yml's, byte for byte, plus `needs: guard` — the same parity doctrine the
+  # `test` job keeps — so a green PR predicts this half of the publish gate.
+  windows-declared-supported:
+    name: Windows is declared supported
     needs: guard
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - run: |
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: package.json and the lock file must declare Windows in
+        shell: bash
+        run: |
           set -euo pipefail
-          OS="$(node -p "JSON.stringify(require('./package.json').os)")"
-          [ "$OS" = '["darwin","linux"]' ] || { echo "::error::package.json os is ${OS}; expected [\"darwin\",\"linux\"] so npm refuses Windows installs with EBADPLATFORM (§6.2, #663)."; exit 1; }
+          OS="$(node -p "JSON.stringify([require('./package.json').os, require('./package-lock.json').packages[''].os])")"
+          [ "$OS" = '[["darwin","linux","win32"],["darwin","linux","win32"]]' ] || { echo "::error::package.json and package-lock.json declare os ${OS}; both must be [\"darwin\",\"linux\",\"win32\"] so a plain npm install admits Windows."; exit 1; }
           echo "os declaration is ${OS}"
 
-  # Bounded Windows gates reuse CI W1/W0; they do not declare native Windows support.
-  # W1 forces installation only in CI and requires >20 passes, zero failures/skips.
-  # The regular CI full-suite Windows debt remains outside this release gate.
-  windows-persistence:
-    name: Windows W1 — bounded persistence suite
+  # W1: the whole suite on windows-latest with zero failures and zero skips (parity with CI).
+  windows-suite:
+    name: Windows W1 — full suite, zero failures and zero skips
     needs: guard
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
+      - name: Check out with LF endings, as the published tarball has them
+        shell: bash
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: npm
 
-      - name: Install dependencies (CI-only --force past the os[] refusal)
+      - name: Install dependencies (plain npm ci; Windows is declared in os[])
         shell: bash
-        run: npm ci --force
+        run: npm ci
 
       - name: Build
         shell: bash
         run: npm run build
 
+      # THE #901 GATE, unchanged bytes (the corrected #1171 reader): the persistence layer keeps
+      # its own hard green, so a failure there is named before the full-suite step runs.
       - name: Persistence suite must be fully green on win32
         shell: bash
         run: |
@@ -1162,43 +1174,92 @@ jobs:
           [ "${PASS}" -gt 20 ] || { echo "::error::only ${PASS} persistence tests ran; the file glob is probably not matching."; exit 1; }
           [ "${RC}" = "0" ] || { echo "::error::the runner exited ${RC} despite a clean summary."; exit 1; }
 
-  # W0 measures the declared refusal on Windows: init exits before side effects,
-  # and unforced npm ci must fail specifically with EBADPLATFORM.
-  windows-refuses:
-    name: Windows W0 — the package refuses, correctly
+      # Everything else, through the same runner `npm test` uses. The summary is read with the same
+      # strict reader as the persistence step: each of tests, pass, fail and skipped exactly once as
+      # `# key N`, CR stripped, anything else refused. Every violation is reported before the step
+      # fails, so one run names all of them. The >200 floor is the U28 proof that
+      # scripts/run-tests.mjs:31 enumerates compiled tests correctly on Windows.
+      - name: Full suite must be fully green on win32
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          node scripts/run-tests.mjs > "${RUNNER_TEMP}/full.log" 2>&1
+          RC=$?
+          set -e
+          cat "${RUNNER_TEMP}/full.log"
+          read_count() {
+            awk -v key="$1" '
+              { sub(/\r$/, "") }
+              $0 ~ ("^# " key "([[:space:]]|$)") {
+                records++
+                if ($0 !~ ("^# " key " [0-9]+$")) malformed = 1
+                else count = $3
+              }
+              END { if (records == 1 && !malformed) print count }
+            ' "${RUNNER_TEMP}/full.log"
+          }
+          TESTS="$(read_count tests)"
+          PASS="$(read_count pass)"; FAIL="$(read_count fail)"; SKIP="$(read_count skipped)"
+          # Refuse to assert on numbers we could not read — an empty string compares equal
+          # to nothing and would let this pass vacuously.
+          [ -n "${TESTS}" ] && [ -n "${PASS}" ] && [ -n "${FAIL}" ] && [ -n "${SKIP}" ] \
+            || { echo "::error::could not parse the TAP summary; refusing to report a vacuous pass."; exit 1; }
+          echo "win32 full suite: tests=${TESTS} pass=${PASS} fail=${FAIL} skipped=${SKIP} runner exit=${RC}"
+          VIOLATIONS=0
+          # A TRUE `-gt` is the success condition: `[` exits 2 on a count it cannot compare, and
+          # that error falls to the violation branch exactly as a false comparison does.
+          if [ "${TESTS}" -gt 200 ]; then
+            :
+          else
+            echo "::error::only ${TESTS} tests were enumerated. scripts/run-tests.mjs:31 normalises Windows separators for node --test; a low count means that enumeration is broken (U28)."
+            VIOLATIONS=$((VIOLATIONS + 1))
+          fi
+          if [ "${SKIP}" != "0" ]; then
+            echo "::error::${SKIP} test(s) skipped on win32. A skip is a Windows behaviour that went unmeasured; split the test by platform instead."
+            VIOLATIONS=$((VIOLATIONS + 1))
+          fi
+          if [ "${FAIL}" != "0" ]; then
+            echo "--- failures this run ---"
+            grep '^not ok' "${RUNNER_TEMP}/full.log" || true
+            echo "::error::${FAIL} test(s) failed on win32. Windows is supported; there is no known-failure allowance."
+            VIOLATIONS=$((VIOLATIONS + 1))
+          fi
+          if [ "${RC}" != "0" ]; then
+            echo "::error::the runner exited ${RC}; a cancelled test or a harness failure is not a pass."
+            VIOLATIONS=$((VIOLATIONS + 1))
+          fi
+          [ "${VIOLATIONS}" = "0" ] || { echo "::error::${VIOLATIONS} win32 gate violation(s) reported above; every applicable diagnostic ran before this failure."; exit 1; }
+          echo "win32 full suite is fully green"
+
+  # W0: the packed tarball installs, its shims run, init works, and both documented Windows
+  # limitations refuse cleanly (exit 78 / exit 2). Same job as ci.yml.
+  windows-installed:
+    name: Windows W0 — the installed package works
     needs: guard
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
+      - name: Check out with LF endings, as the published tarball has them
+        shell: bash
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: package.json must declare Windows out
+      - name: package.json and the lock file must declare Windows in
         shell: bash
         run: |
           set -euo pipefail
-          OS="$(node -p "JSON.stringify(require('./package.json').os)")"
-          [ "$OS" = '["darwin","linux"]' ] || { echo "::error::package.json os is ${OS}; expected [\"darwin\",\"linux\"] so npm refuses Windows installs with EBADPLATFORM (§6.2, #663)."; exit 1; }
+          OS="$(node -p "JSON.stringify([require('./package.json').os, require('./package-lock.json').packages[''].os])")"
+          [ "$OS" = '[["darwin","linux","win32"],["darwin","linux","win32"]]' ] || { echo "::error::package.json and package-lock.json declare os ${OS}; both must be [\"darwin\",\"linux\",\"win32\"] so a plain npm install admits Windows."; exit 1; }
           echo "os declaration is ${OS}"
 
-      - name: bin/init/cli.mjs platform gate must exit 2 on win32
-        shell: bash
-        run: |
-          set -uo pipefail
-          set +e
-          OUT="$(node bin/init/cli.mjs init 2>&1)"
-          RC=$?
-          set -e
-          printf '%s\n' "$OUT"
-          [ "$RC" = "2" ] || { echo "::error::init exited ${RC} on win32; platformGate() in bin/init/cli.mjs must die(2, ...). An exit that is not 2 means the gate did not fire, or fired as something else."; exit 1; }
-          case "$OUT" in
-            *"does not support Windows natively"*WSL2*) echo "platform gate refused with its documented message and exit 2" ;;
-            *) echo "::error::init exited 2 but without the documented refusal (expected the 'does not support Windows natively' / WSL2 message)."; exit 1 ;;
-          esac
-
-      - name: U23 — npm ci must refuse on win32 with EBADPLATFORM
+      # U23, inverted. Measured 2026-08-15 (run 31890807632): npm enforces the root manifest's own
+      # os[], so with win32 declared out `npm ci` died with EBADPLATFORM. Windows is declared in
+      # now, so a plain install is the assertion, and EBADPLATFORM anywhere in its log fails it.
+      - name: U23 — npm ci must succeed on win32 without --force
         shell: bash
         run: |
           set -uo pipefail
@@ -1208,13 +1269,201 @@ jobs:
           set -e
           echo "npm ci exit=${RC}"
           tail -n 40 "${RUNNER_TEMP}/npm-ci.log"
-          [ "$RC" != "0" ] || { echo "::error::npm ci SUCCEEDED on win32. It refused with EBADPLATFORM when U23 was measured (2026-08-15). npm no longer enforces the root manifest's os[], so a Windows contributor now gets a dev install that works until the first bin/ script instead of a hard stop — re-decide the refusal strategy rather than relaxing this assertion."; exit 1; }
-          grep -q 'EBADPLATFORM' "${RUNNER_TEMP}/npm-ci.log" || { echo "::error::npm ci failed on win32 with exit ${RC} but not EBADPLATFORM. Something other than the os[] declaration is stopping the install; read the log above before assuming the refusal still works."; exit 1; }
-          echo "npm ci refused with EBADPLATFORM, as measured for U23"
+          [ "$RC" = "0" ] || { echo "::error::npm ci failed on win32 with exit ${RC}. Windows is declared in os[]; a plain, unforced install must succeed."; exit 1; }
+          if grep -q 'EBADPLATFORM' "${RUNNER_TEMP}/npm-ci.log"; then echo "::error::npm ci exited 0 on win32 but logged EBADPLATFORM; the os[] declaration is not what npm read."; exit 1; fi
+          echo "plain npm ci installed on win32"
+
+      # prepack builds. The scan reads the pack's own file list, so it covers exactly the shell
+      # files the tarball ships; one CR in any of them would ship a script bash cannot run.
+      - name: Pack the tarball; shipped shell files must be LF
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm pack --json > "${RUNNER_TEMP}/pack.json"
+          node -e '
+            const fs = require("node:fs");
+            const pack = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/pack.json", "utf8"))[0];
+            const shell = pack.files.map(file => file.path.split("\\").join("/"))
+              .filter(path => /^(bin\/.*\.sh|git-hooks\/pre-push|\.claude\/hooks\/[^\/]*\.sh|tooling\/dispatch-prelude\/[^\/]*\.sh)$/.test(path));
+            const required = ["bin/install-instructions.sh", "git-hooks/pre-push"].filter(path => !shell.includes(path));
+            const carriageReturn = shell.filter(path => fs.readFileSync(path).includes(13));
+            console.log(`shipped shell files: ${shell.length}; with CR: ${carriageReturn.length}`);
+            for (const path of required) console.log(`::error::${path} is not in the pack file list; the scan would be vacuous.`);
+            for (const path of carriageReturn) console.log(`::error::${path} has CR line endings; bash cannot run it from the tarball (W-D4).`);
+            if (required.length || carriageReturn.length) process.exit(1);
+            fs.writeFileSync(process.env.RUNNER_TEMP + "/tarball", pack.filename);
+          '
+
+      - name: Install the tarball into a temporary global prefix without --force
+        shell: bash
+        run: |
+          set -uo pipefail
+          TARBALL="$(cat "${RUNNER_TEMP}/tarball")"
+          PREFIX="${RUNNER_TEMP}/w0-prefix"
+          set +e
+          npm install -g --prefix "${PREFIX}" "./${TARBALL}" > "${RUNNER_TEMP}/npm-install.log" 2>&1
+          RC=$?
+          set -e
+          echo "npm install -g exit=${RC}"
+          tail -n 40 "${RUNNER_TEMP}/npm-install.log"
+          [ "$RC" = "0" ] || { echo "::error::installing ${TARBALL} into a global prefix failed on win32 with exit ${RC}."; exit 1; }
+          if grep -q 'EBADPLATFORM' "${RUNNER_TEMP}/npm-install.log"; then echo "::error::the tarball install logged EBADPLATFORM; the published os[] must admit win32."; exit 1; fi
+          for SHIM in aigentry-orchestrator aigentry-orchestrator.cmd aigentry-orchestrator.ps1; do
+            [ -f "${PREFIX}/${SHIM}" ] || { echo "::error::npm wrote no ${SHIM} shim into the global prefix."; exit 1; }
+          done
+          echo "${TARBALL} installed unforced; the sh, cmd and PowerShell shims exist"
+
+      # U21 — npm generates the Windows shims from the `#!/usr/bin/env node` shebang of a .mjs bin.
+      # --version returns before any platform or dependency check, so this measures the shims.
+      - name: U21 — the bin shim runs from cmd.exe, PowerShell and Git Bash
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $prefix = Join-Path $env:RUNNER_TEMP 'w0-prefix'
+          $expected = (Get-Content -Raw package.json | ConvertFrom-Json).version
+          # Git for Windows' own bash, found next to git.exe; never WSL's System32\bash.exe.
+          $bash = Join-Path (Split-Path -Parent (Split-Path -Parent (Get-Command git.exe).Source)) 'bin\bash.exe'
+          $shim = (Join-Path $prefix 'aigentry-orchestrator').Replace('\', '/')
+          function Assert-Version([string] $label, $output) {
+            $code = $LASTEXITCODE
+            $text = (($output | Out-String) -replace "`r", '').Trim()
+            if ($code -ne 0 -or $text -ne $expected) {
+              Write-Output "::error::the $label shim printed '$text' with exit $code; expected '$expected'."
+              exit 1
+            }
+            Write-Output "$label shim reports $text"
+          }
+          Assert-Version 'cmd.exe' (& (Join-Path $prefix 'aigentry-orchestrator.cmd') --version)
+          Assert-Version 'PowerShell' (& (Join-Path $prefix 'aigentry-orchestrator.ps1') --version)
+          Assert-Version 'Git Bash' (& $bash -c "'$shim' --version")
+
+      # The native user path: PowerShell, the .cmd shim, a fresh profile and AIGENTRY_HOME unset.
+      # installed-init-check compares the tree with the installed package's own manifest.
+      - name: init succeeds in a temporary home and produces the expected tree
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $prefix = Join-Path $env:RUNNER_TEMP 'w0-prefix'
+          $package = Join-Path $prefix 'node_modules\@dmsdc-ai\aigentry-orchestrator'
+          $cli = Join-Path $prefix 'aigentry-orchestrator.cmd'
+          $userHome = Join-Path $env:RUNNER_TEMP 'w0-home'
+          $ws = Join-Path $env:RUNNER_TEMP 'w0-ws'
+          New-Item -ItemType Directory -Path $userHome | Out-Null
+          $env:USERPROFILE = $userHome
+          $env:HOME = $userHome
+          Remove-Item Env:AIGENTRY_HOME -ErrorAction SilentlyContinue
+          function Assert-Exit([string] $label, [int] $want) {
+            if ($LASTEXITCODE -ne $want) {
+              Write-Output "::error::$label exited $LASTEXITCODE on win32; expected $want."
+              exit 1
+            }
+            Write-Output "$label exited $want, as required"
+          }
+          & $cli init --yes --workspace $ws
+          Assert-Exit 'init' 0
+          node tests/packaging/installed-init-check.mjs --package $package --workspace $ws --home (Join-Path $userHome '.aigentry')
+          Assert-Exit 'installed-init-check' 0
+          $queue = Join-Path $ws 'state\task-queue.json'
+          $before = (Get-FileHash -Algorithm SHA256 -LiteralPath $queue).Hash
+          & $cli init --yes --workspace $ws
+          Assert-Exit 'a second plain init' 4
+          & $cli init --upgrade --yes --workspace $ws
+          Assert-Exit 'init --upgrade' 0
+          $after = (Get-FileHash -Algorithm SHA256 -LiteralPath $queue).Hash
+          if ($after -ne $before) {
+            Write-Output "::error::init --upgrade changed state/task-queue.json; state/ must stay untouched."
+            exit 1
+          }
+          Write-Output "state/task-queue.json is byte-identical after --upgrade"
+
+      # C10: the workspace has no dist/, so a bin/ shim resolves the installed package through the
+      # npm sh shim on PATH (a file on Windows, not a symlink) and must reach the compiled CLI.
+      - name: Workspace shell entry points run under Git Bash
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="$(cygpath -u "${RUNNER_TEMP}")"
+          WS="${T}/w0-ws"
+          export HOME="${T}/w0-home"
+          export USERPROFILE="$(cygpath -w "${HOME}")"
+          export PATH="${T}/w0-prefix:${PATH}"
+          OUT="$(bash "${WS}/bin/tq-status.sh")"
+          printf '%s\n' "${OUT}"
+          case "${OUT}" in
+            "=== Active Focus ==="*) echo "bin/tq-status.sh printed the status overview" ;;
+            *) echo "::error::bin/tq-status.sh did not print its status overview under Git Bash."; exit 1 ;;
+          esac
+          OUT="$(bash "${WS}/bin/dispatch-tracker.sh" --help)"
+          case "${OUT}" in
+            "# dispatch-tracker.sh "*"Orchestrator-side dispatch health-check"*) echo "bin/dispatch-tracker.sh reached the compiled tracker CLI of the installed package" ;;
+            *) printf '%s\n' "${OUT}"; echo "::error::bin/dispatch-tracker.sh --help did not print the tracker usage."; exit 1 ;;
+          esac
+
+      # Limitation 1 (P6). A dispatch reaches the confinement decision only with a dispatchable
+      # task in the workspace queue, a task-bound worker scope and a claude executable on PATH for
+      # the spawn decision, so the probe supplies exactly those; the stand-in claude never runs,
+      # because the refusal comes first. Nothing may be staged: the sessions directory is unchanged
+      # and the --cwd is never created.
+      - name: Confined dispatch is refused cleanly with exit 78
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="$(cygpath -u "${RUNNER_TEMP}")"
+          WS="${T}/w0-ws"
+          export HOME="${T}/w0-home"
+          export USERPROFILE="$(cygpath -w "${HOME}")"
+          mkdir -p "${T}/w0-fake-bin"
+          printf '#!/bin/sh\nexit 99\n' > "${T}/w0-fake-bin/claude"
+          export PATH="${T}/w0-prefix:${T}/w0-fake-bin:${PATH}"
+          node -e 'const fs = require("node:fs"); const queue = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); queue.tasks.push({ id: 1, status: "pending", track: "w0", desc: "W0 confined-dispatch refusal probe" }); fs.writeFileSync(process.argv[1], JSON.stringify(queue, null, 2) + "\n");' "$(cygpath -w "${WS}/state/task-queue.json")"
+          printf '{"version":1,"task":"1","sid":"w0-probe","domains":[],"read":[],"write":[]}\n' > "${T}/w0-scope.json"
+          export AIGENTRY_WORKER_SCOPE="$(cygpath -w "${T}/w0-scope.json")"
+          printf 'W0 confined-dispatch refusal probe\n' > "${T}/w0-ref.md"
+          SESSIONS="${HOME}/.aigentry/sessions"
+          BEFORE="$(ls -A "${SESSIONS}" 2>/dev/null || true)"
+          set +e
+          bash "${WS}/bin/dispatch.sh" --spawn-and-dispatch --track w0 --name probe --cwd "$(cygpath -w "${T}/target")" \
+            --cli claude --role coder --task 1 --ref "$(cygpath -w "${T}/w0-ref.md")" > "${T}/dispatch.out" 2> "${T}/dispatch.err"
+          RC=$?
+          set -e
+          cat "${T}/dispatch.out" "${T}/dispatch.err"
+          [ "${RC}" = "78" ] || { echo "::error::dispatch.sh --spawn-and-dispatch exited ${RC} on win32; the confined spawn must refuse with exit 78."; exit 1; }
+          grep -q 'SANDBOX_PLATFORM_UNSUPPORTED' "${T}/dispatch.err" || { echo "::error::exit 78 without SANDBOX_PLATFORM_UNSUPPORTED on stderr."; exit 1; }
+          AFTER="$(ls -A "${SESSIONS}" 2>/dev/null || true)"
+          [ "${BEFORE}" = "${AFTER}" ] || { echo "::error::the refused dispatch changed ${SESSIONS}."; exit 1; }
+          [ ! -e "${T}/target" ] || { echo "::error::the refused dispatch created its --cwd."; exit 1; }
+          echo "confined dispatch refused with exit 78 and SANDBOX_PLATFORM_UNSUPPORTED; nothing was staged"
+
+      # Limitation 2 (W-D2 B). init refuses the native capture options before it reads or writes
+      # anything, so the workspace and the home are byte-identical afterwards.
+      - name: Native capture refuses cleanly on win32
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="$(cygpath -u "${RUNNER_TEMP}")"
+          WS="${T}/w0-ws"
+          export HOME="${T}/w0-home"
+          export USERPROFILE="$(cygpath -w "${HOME}")"
+          export PATH="${T}/w0-prefix:${PATH}"
+          mkdir -p "${T}/w0-capture" "${T}/w0-preservation"
+          snapshot() { find "${WS}" "${HOME}" -type d -print -o -type f -exec sha256sum {} + | sort; }
+          BEFORE="$(snapshot)"
+          set +e
+          OUT="$(aigentry-orchestrator init --yes --workspace "$(cygpath -w "${WS}")" --capture-root "$(cygpath -w "${T}/w0-capture")" \
+            --preservation-root "$(cygpath -w "${T}/w0-preservation")" 2>&1)"
+          RC=$?
+          set -e
+          printf '%s\n' "${OUT}"
+          [ "${RC}" = "2" ] || { echo "::error::init with native capture options exited ${RC} on win32; it must refuse with exit 2."; exit 1; }
+          case "${OUT}" in
+            *"is not available on native Windows in 0.2.2. Nothing was written."*) echo "native capture refused with exit 2 and the documented message" ;;
+            *) echo "::error::init exited 2 without the documented native-capture refusal."; exit 1 ;;
+          esac
+          [ "$(snapshot)" = "${BEFORE}" ] || { echo "::error::the refused native capture changed the workspace or the home."; exit 1; }
 
   publish:
     name: Publish and verify from the registry
-    needs: [browser-tls, guard, test, windows-declared-unsupported, windows-persistence, windows-refuses]
+    needs: [browser-tls, guard, test, windows-declared-supported, windows-suite, windows-installed]
     runs-on: ubuntu-latest
     permissions:
       contents: write  # gh release create

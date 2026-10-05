@@ -51,6 +51,8 @@ sourceTestFiles.push('tests/packaging/workflow-policy.test.mjs');
 sourceTestFiles.push('tests/dispatch/worker-inputs.test.mjs');
 // #1167 — real bin/init/cli.mjs init in temp homes; each OS asserts its own branch (no skips); every OS.
 sourceTestFiles.push('tests/packaging/init-platform.test.mjs');
+// #1171 — release evidence tools against the real gate (synthetic Git repository, fake scanner); Node built-ins and git; every OS.
+sourceTestFiles.push('tests/packaging/release-evidence.test.mjs');
 // Native capture fixtures require POSIX ownership/modes; on native Windows init refuses native
 // capture with exit 2 (a 0.2.2 limitation), asserted in tests/packaging/init-platform.test.mjs.
 // The boot wizard suite drives an owned POSIX PTY.

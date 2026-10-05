@@ -557,14 +557,23 @@ function workflowJob(source, name) {
   return job;
 }
 
-function assertWorkflowContract(text) {
+// C1: the security pin is a reviewed literal. While no policy exists for the package version, only
+// UNREVIEWED is accepted (the gate refuses it, so nothing publishes); once
+// release/security/<version>/policy.json exists, only the exact lowercase sha256 of its bytes is.
+function currentPolicy() {
+  const { version } = JSON.parse(readFileSync(path.join(repo, 'package.json'), 'utf8'));
+  const file = path.join(repo, 'release', 'security', version, 'policy.json');
+  return existsSync(file) ? readFileSync(file) : null;
+}
+
+function assertWorkflowContract(text, policy = currentPolicy()) {
   const source = text.replace(/\r\n/g, '\n').split('\n').filter(line => !/^\s*#/.test(line)).join('\n');
   const guard = workflowJob(source, 'guard');
   const publish = workflowJob(source, 'publish');
   const browser = workflowJob(source, 'browser-tls');
   assert.match(guard, /^    needs: \[browser-tls\]$/m, 'guard requires browser-tls');
-  assert.match(publish, /^    needs: \[browser-tls, guard, test, windows-declared-unsupported, windows-persistence, windows-refuses\]$/m,
-    'publish requires browser-tls and all five original dependencies');
+  assert.match(publish, /^    needs: \[browser-tls, guard, test, windows-declared-supported, windows-suite, windows-installed\]$/m,
+    'publish requires browser-tls and the five gate dependencies');
   for (const job of [browser, guard, publish]) {
     assert.doesNotMatch(job, /^    (?:if:|continue-on-error:\s*true\b)/m, 'jobs cannot bypass the browser gate');
   }
@@ -578,13 +587,39 @@ function assertWorkflowContract(text) {
   for (const index of [tests, admission]) {
     assert.doesNotMatch(steps[index], /continue-on-error:\s*true|\|\|\s*true|^\s*if:|\bexit\s+0\b/m, 'gate cannot skip or swallow failure');
   }
-  assert.match(steps[admission], /RELEASE_SECURITY_POLICY_SHA256: UNREVIEWED\s/);
+  const pins = steps[admission].split('\n').filter(line => line.includes('RELEASE_SECURITY_POLICY_SHA256'));
+  assert.equal(pins.length, 1, 'exactly one security policy pin');
+  const pin = /^          RELEASE_SECURITY_POLICY_SHA256: ([0-9a-f]{64}|UNREVIEWED)$/.exec(pins[0])?.[1];
+  assert.ok(pin, 'security policy pin is a literal: 64 lowercase hex or UNREVIEWED, never derived');
+  assert.equal(pin, policy === null ? 'UNREVIEWED' : digest(policy),
+    policy === null ? 'UNREVIEWED only while no policy exists for this version' : 'pin equals sha256 of the policy bytes');
   assert.match(steps[admission], /RELEASE_SECURITY_COMMIT: \$\{\{ github\.sha \}\}/);
   assert.doesNotMatch(steps[admission], /sha256sum|shasum|hashFiles|SKIP|BYPASS/);
 }
 
 test('workflow runs independent tests and admission in guard before credentials and publish', () => {
   assertWorkflowContract(readFileSync(workflow, 'utf8'));
+});
+
+test('security pin: UNREVIEWED only without a policy, then exactly the policy hash; derived pins refused', () => {
+  const pinLine = '          RELEASE_SECURITY_POLICY_SHA256: UNREVIEWED\n';
+  const source = readFileSync(workflow, 'utf8').replace(/\r\n/g, '\n');
+  const pinned = currentPolicy() === null ? source : source.replace(/^          RELEASE_SECURITY_POLICY_SHA256: [0-9a-f]{64}\n/m, pinLine);
+  onlyOccurrence(pinned, pinLine);
+  const withPin = value => pinned.replace(pinLine, () => value === undefined ? '' : `          RELEASE_SECURITY_POLICY_SHA256: ${value}\n`);
+  const policy = Buffer.from('{"schema_version":1,"synthetic":"policy"}\n');
+  const derived = [undefined, '', '${{ vars.RELEASE_SECURITY_POLICY_SHA256 }}', '${{ secrets.RELEASE_SECURITY_POLICY_SHA256 }}',
+    "${{ hashFiles('release/security/**/policy.json') }}", '$(sha256sum release/security/0.2.2/policy.json)',
+    '"$(shasum -a 256 policy.json)"', `${digest(policy)} # reviewed`, `'${digest(policy)}'`, digest(policy).toUpperCase(),
+    digest(policy).slice(1), `${digest(policy)}0`];
+  assert.doesNotThrow(() => assertWorkflowContract(withPin('UNREVIEWED'), null));
+  for (const value of [digest(policy), '0'.repeat(64), ...derived]) {
+    assert.throws(() => assertWorkflowContract(withPin(value), null), { code: 'ERR_ASSERTION' }, `no policy: ${value}`);
+  }
+  assert.doesNotThrow(() => assertWorkflowContract(withPin(digest(policy)), policy));
+  for (const value of ['UNREVIEWED', '0'.repeat(64), digest(Buffer.from('other policy bytes')), ...derived]) {
+    assert.throws(() => assertWorkflowContract(withPin(value), policy), { code: 'ERR_ASSERTION' }, `policy present: ${value}`);
+  }
 });
 
 // The acceptance step runs headed Chromium under xvfb-run, so its command lives inside a block
@@ -607,7 +642,7 @@ for (const [ending, newline] of [['LF', '\n'], ['CRLF', '\r\n']]) {
   test(`workflow contract accepts ${ending}`, () => {
     assert.doesNotThrow(() => assertWorkflowContract(encode(source())));
   });
-  for (const dependency of ['browser-tls', 'guard', 'test', 'windows-declared-unsupported', 'windows-persistence', 'windows-refuses']) {
+  for (const dependency of ['browser-tls', 'guard', 'test', 'windows-declared-supported', 'windows-suite', 'windows-installed']) {
     test(`workflow contract rejects ${ending} publish without ${dependency}`, () => {
       const original = source();
       const publish = workflowJob(original, 'publish');

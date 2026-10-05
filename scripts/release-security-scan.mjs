@@ -128,7 +128,10 @@ function scanCommand(argv) {
     sarifError = error instanceof EvidenceError ? error.message : 'SARIF is not valid UTF-8 JSON';
   }
   const sarifValid = sarifError === null && !run.timed_out && !run.overflow;
-  const severities = severityCounts(results);
+  // TRIAGE O-1: a refused SARIF was not counted, so the records say null rather than a count of 0.
+  // The gate's receipt schema has no admissible "uncounted" value; such a receipt is never admissible.
+  const findings = sarifError === null ? results.length : null;
+  const severities = sarifError === null ? severityCounts(results) : { high: null, medium: null, low: null, unknown: null };
   const stdoutSha = sha256(run.stdout);
   const original = { schema_version: 1, producer: 'scripts/release-security-scan.mjs', commit,
     scope_sha256: sha256(scopeBytes), scan_manifest_sha256: sha256(scanManifestBytes), staged_files: staged.length,
@@ -136,18 +139,18 @@ function scanCommand(argv) {
     started_at: run.started_at, finished_at: run.finished_at, duration_ms: run.duration_ms,
     exit: run.exit, signal: run.signal, timed_out: run.timed_out, overflow: run.overflow, spawn_error: run.spawn_error,
     stdout_bytes: run.stdout.length, stdout_sha256: stdoutSha, sarif_valid: sarifValid, sarif_error: sarifError,
-    findings: results.length, severities, node: process.version, platform: process.platform };
+    findings, severities, node: process.version, platform: process.platform };
   const originalBytes = serialize(original);
   const receipt = { schema_version: 1, sarif_sha256: stdoutSha, original_receipt_sha256: sha256(originalBytes),
-    stdout_sha256: stdoutSha, manifest_sha256: sha256(scanManifestBytes), exit: run.exit, findings: results.length,
+    stdout_sha256: stdoutSha, manifest_sha256: sha256(scanManifestBytes), exit: run.exit, findings,
     severities, timed_out: run.timed_out, overflow: run.overflow, signal: run.signal, sarif_valid: sarifValid,
     representation: 'stdout-exact' };
   writeFileSync(out('sarif.json'), run.stdout);
   writeFileSync(out('original-receipt.json'), originalBytes);
   writeFileSync(out('receipt.json'), serialize(receipt));
   console.log(`scanner exit=${run.exit} signal=${run.signal} timed_out=${run.timed_out} overflow=${run.overflow} ` +
-    `spawn_error=${run.spawn_error} sarif_valid=${sarifValid} findings=${results.length} ${JSON.stringify(severities)}`);
-  if (sarifError) console.error(`SARIF refused: ${sarifError}`);
+    `spawn_error=${run.spawn_error} sarif_valid=${sarifValid} findings=${findings ?? 'uncounted'} ${JSON.stringify(severities)}`);
+  if (sarifError) console.error(`SARIF refused: ${sarifError}; findings could not be counted (the receipt records findings: null)`);
   try { validateReceipt(receipt, run.stdout); }
   catch (error) {
     fail(`scanner run recorded but NOT admissible (${error.message}); the receipt is kept as evidence of the failure. ` +
