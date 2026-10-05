@@ -63,22 +63,58 @@ async function win32Retry<T>(op: () => Promise<T>): Promise<T> {
 // #897: "vanished" and "dead" used to be one boolean, and both led to unlink.
 // They must not: only a lock positively identified as dead-pid-held may be swept.
 //   held    — a live holder (or an unreadable lock we must not touch): wait.
-//   dead    — the recorded pid is gone, or the content is malformed: sweep it.
+//   dead    — the recorded pid is gone, or the content is malformed, AND the lock is
+//             still the very same file after the probe: sweep it.
 //   vanished— nothing at lockPath any more: there is nothing to sweep, just retry.
+//
+// #1166: the pid is read at one instant and probed at a later one. In between, a holder
+// can release normally (unlink), exit and be reaped, and a successor can link its own
+// lock into the same name — so "pid gone" alone would sweep the SUCCESSOR's lock. A
+// normally releasing holder unlinks before it exits, so "probe says gone AND the lock is
+// still the same file naming that pid" can only be a crashed holder. Hence "dead" is
+// returned only after a re-inspection that follows the probe finds identical content and
+// identical file identity; a re-inspection that finds a different lock is "held".
 type LockVerdict = "held" | "dead" | "vanished";
+
+interface LockSnapshot {
+  text: string;
+  dev: bigint;
+  ino: bigint;
+}
+
+// Content and identity come from one open handle, so a snapshot can never pair one
+// lock's pid with another lock's inode. bigint stat keeps 64-bit inodes exact.
+async function readLock(lockPath: string): Promise<LockSnapshot> {
+  const fh = await open(lockPath, "r");
+  try {
+    const { dev, ino } = await fh.stat({ bigint: true });
+    return { text: await fh.readFile("utf8"), dev, ino };
+  } finally {
+    await fh.close();
+  }
+}
 
 async function inspectLock(lockPath: string): Promise<LockVerdict> {
   try {
-    const text = await fs.readFile(lockPath, "utf8");
-    const pid = Number.parseInt(text.trim(), 10);
-    if (!Number.isInteger(pid) || pid <= 0) return "dead";
-    if (pid === process.pid) return "held"; // self-held — caller must wait
-    try {
-      process.kill(pid, 0);
-      return "held";
-    } catch (err) {
-      return (err as NodeJS.ErrnoException).code === "ESRCH" ? "dead" : "held";
+    const seen = await readLock(lockPath);
+    const pid = Number.parseInt(seen.text.trim(), 10);
+    if (Number.isInteger(pid) && pid > 0) {
+      if (pid === process.pid) return "held"; // self-held — caller must wait
+      try {
+        process.kill(pid, 0);
+        return "held";
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ESRCH") return "held";
+      }
     }
+    // Pid gone, or content malformed: sweepable only if it is still the same lock.
+    // ENOENT here falls to the catch below as "vanished" (retry link, never unlink).
+    const now = await readLock(lockPath);
+    // Where the platform/filesystem does not supply dev or ino it reports 0 for both
+    // snapshots, so those fields compare equal and the check degrades to content
+    // equality only.
+    const same = now.text === seen.text && now.dev === seen.dev && now.ino === seen.ino;
+    return same ? "dead" : "held";
   } catch (err) {
     // ENOENT = the holder released between our EEXIST and this read.
     return (err as NodeJS.ErrnoException).code === "ENOENT" ? "vanished" : "held";
@@ -131,7 +167,12 @@ async function acquire(lockPath: string, timeoutMs: number): Promise<void> {
         // (`index.json.tmp.__index__.<pid>` → rename ENOENT), i.e. the very #561
         // symptom the empty-lock-window fix above was meant to have closed.
         if (verdict === "vanished") continue;
+        // "held" also covers a lock that changed under the probe (#1166): wait the
+        // normal poll and inspect the new lock afresh.
         if (verdict === "dead") {
+          // Known residual (pre-existing, not addressed here): this unlink is still by
+          // name, so two waiters sweeping a genuinely crashed holder's lock at the same
+          // moment can race — the second can remove the lock the first just linked.
           try {
             await fs.unlink(lockPath);
           } catch {

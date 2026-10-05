@@ -40,6 +40,8 @@ const mode = process.env.CAPTURE_TEST_FAULT;
 const root = process.env.CAPTURE_TEST_ROOT;
 const send = value => { if (process.send) process.send(value); };
 const renamed = new Set();
+const lock = path.join(root, 'store.json.lock');
+let probed = false;
 function section(value) { return path.relative(root, String(value)).split(path.sep)[0]; }
 async function hit(op, value, handle) {
   const area = section(value);
@@ -74,9 +76,27 @@ for (const name of ['unlink', 'link', 'rename']) {
   const original = p[name];
   p[name] = async function(value, ...args) {
     await hit(name, value);
-    const result = await original.call(this, value, ...args);
+    const result = await original.call(this, value, ...args).catch(error => {
+      if (name === 'link' && probed) send('contended'); throw error;
+    });
     if (name === 'rename') renamed.add(section(args[0]));
+    if (name === 'link' && String(args[0]) === lock) {
+      send(probed ? 'locked-after-probe' : 'locked');
+      if (mode === 'hold-after-link') await new Promise(resolve => process.once('message', resolve));
+    }
     return result;
+  };
+}
+if (mode === 'stale-probe') {
+  // process.kill is synchronous in the lock's liveness probe: emulate a descheduled
+  // waiter by sleeping until the test-owned release file exists (bounded).
+  const kill = process.kill; const release = path.join(path.dirname(root), 'stale-probe-release');
+  process.kill = function(pid, signal) {
+    if (signal === 0 && !probed) {
+      probed = true; send('probe'); const cell = new Int32Array(new SharedArrayBuffer(4));
+      for (const deadline = Date.now() + 10000; !fs.existsSync(release) && Date.now() < deadline;) Atomics.wait(cell, 0, 0, 5);
+    }
+    return kill.call(this, pid, signal);
   };
 }
 if (mode === 'weak-durability') Object.defineProperty(process, 'platform', { value: 'win32' });
@@ -204,6 +224,26 @@ test('concurrent real child captures retain every receipt', async t => {
   for (const run of runs) run.child.stdin!.end(raw);
   for (const result of await Promise.all(runs.map(run => run.done))) allow(result);
   await evidence(root, raw, 8);
+});
+
+// #1166: the holder releases and exits between a waiter's lock read and its liveness
+// probe, and a successor links the lock. The stale sweep must not remove that lock.
+test('stale-lock sweep never removes a successor lock', async t => {
+  const { base, root } = await fixture(t); const raw = Buffer.from(secret);
+  const seed = await launch(t, base, root); seed.child.stdin!.end(raw); allow(await seed.done);
+  const holder = await launch(t, base, root, undefined, 'hold-after-link');
+  await holder.wait('ready'); holder.child.stdin!.end(raw); await holder.wait('locked');
+  const waiter = await launch(t, base, root, undefined, 'stale-probe');
+  await waiter.wait('ready'); waiter.child.stdin!.end(raw); await waiter.wait('probe');
+  holder.child.send('release'); allow(await holder.done);
+  const successor = await launch(t, base, root, undefined, 'hold-after-link');
+  await successor.wait('ready'); successor.child.stdin!.end(raw); await successor.wait('locked');
+  await fs.writeFile(path.join(base, 'stale-probe-release'), '');
+  const next = await Promise.race([waiter.wait('contended').then(() => 'contended'),
+    waiter.wait('locked-after-probe').then(() => 'entered')]);
+  assert.equal(next, 'contended', 'waiter entered while the successor held the lock');
+  successor.child.send('release'); allow(await successor.done); allow(await waiter.done);
+  await evidence(root, raw, 4);
 });
 
 test('no stdout before EOF or receipt commit', async t => {
