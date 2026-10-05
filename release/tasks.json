@@ -141,6 +141,14 @@
     {
       "id": 1185,
       "release_component": "workflow-efficiency-advisor"
+    },
+    {
+      "id": 1191,
+      "release_component": "isolated-runtime"
+    },
+    {
+      "id": 1194,
+      "release_component": "orchestration-rules"
     }
   ]
 }

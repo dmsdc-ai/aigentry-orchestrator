@@ -7,6 +7,141 @@ extracts the matching section as the GitHub Release notes, so a publish fails
 without one. Unreleased harness work is still grouped under a dated
 `## [<YYYY-MM-DD>]` section beneath the ongoing `## [Unreleased]` working set.
 
+## [0.2.2] - 2026-10-06
+
+Publication of the work merged since `v0.2.1`. Native Windows is a supported
+platform from this release, with the two limitations listed below.
+Each release-group task is recorded as shipping or non-shipping in
+`release/0.2.2-dispositions.md`. Publishing this release closes no task.
+
+### Added
+
+- **Native Windows support (#1167).** `init` and the installed entry points
+  work on native Windows. CLIs are resolved through `PATH`, `PATHEXT` and npm
+  cmd-shims. Configuration preservation, the worker OAuth handoff, Gemini
+  shadow credentials and the web approval auth store work on Windows, on a
+  private-storage primitive built on `icacls` and PowerShell.
+  - Prerequisites: Git for Windows (for its `bash.exe`), `jq`, and Python 3
+    run as `python`. `init` checks them and stops with exit 3, writing
+    nothing, if one is missing. The WSL launcher `bash.exe` and the Microsoft
+    Store `python` alias are not accepted.
+  - Shell entry points (`bin/*.sh`) run from Git Bash. The
+    `aigentry-orchestrator` command and the Node scripts also run from cmd or
+    PowerShell.
+  - Durability on Windows is file fsync plus a journaled rename. Persistence
+    now accepts that level instead of refusing to write.
+- **Confined workers on macOS and Linux (#652).** Dispatch and boot
+  preparation spawn workers in a task-scoped sandbox from the installed
+  package. Confined Claude workers get a restricted set of built-in tools and
+  overrides are rejected. Worker tool admission is validated the same way on
+  every platform. The opt-in Claude worker OAuth handoff is isolated, and an
+  empty Claude auth seed is refused before the worker boots.
+- **Request capture (#1166).** The prompt-submit hook records a verified
+  receipt, `init` installs native capture, and a bounded read-only inventory
+  lists what was captured.
+- **Model decisions at spawn (#1148).** Worker dispatch uses managed model
+  decisions and records their evidence.
+- **Session metadata (#1162).** Terminal displays receive typed launch
+  metadata and sealed per-session agent metadata. The configured controller
+  model is recorded as display-only metadata.
+- **Boot wizard (#1181).** `bin/orchestrator-boot.sh` composes an explicit
+  boot plan through an interactive wizard.
+- **Web approval inbox and read-only Task Console (#1151, #1177).** The HITL
+  web service has passkey authentication with explicit owner provisioning, a
+  deny-only approval inbox and a read-only Task Console with an accessible task
+  table. The existing inbox CLI behaviour is kept.
+- **Tool efficiency (#1172).** Dispatch status queries are bounded and
+  structured. Report sweeps emit structured evidence after commit. Dispatch
+  verifies declared worker input snapshots and bounds retest scope.
+- **Release evidence tooling (#1171).** Tooling that produces the evidence the
+  release admission gate checks. Admission reads the committed public task
+  projection instead of the private queue, and the release is gated on a real
+  browser and TLS acceptance run.
+
+### Changed
+
+- **Orchestration rules revised (#1194)** after the orchestrator root-cause
+  analysis.
+- Dispatch passes confined references, uses explicit capacity and retries
+  atomically. No implicit worker count cap applies; a per-CLI quota applies
+  only where `AIGENTRY_CLI_CAP_<CLI>` is set (#1171).
+- The workflow delegation policy and bounded status routing are aligned
+  (#1172).
+- CI: a push-triggered Windows lane runs selected test files, and checks the
+  tree out with LF endings (#1167).
+
+### Fixed
+
+- **Lock race:** a stale index lock is swept only when it is still the same
+  file (#1166).
+- **`apply_patch` is no longer required on `PATH`** to prepare a worker sandbox
+  (#652).
+- Session readiness requires a positive connected health status and
+  recognizes the current and the collapsed Claude idle viewport. The reconciler
+  tells error banners apart from quoted task output (#1136).
+- Textual reports no longer schedule cleanup (#1170).
+- `ask.sh` reports escalation failures truthfully, and listing evidence is
+  validated (#836, #974).
+- Cleanup enforces close failures, keeps an orphan close failure, and binds
+  metadata cleanup to the captured session identity (#1162).
+- Boot contains stdin pipe errors, rejects undelivered payloads and validates
+  capture before dry-run output (#1162, #1181). Version probes are bounded and
+  spawn errors are kept (#1167).
+- Dispatch refuses uncertain SQLite transition artifacts (#1167).
+- Windows: native paths are validated and canonicalized; the Python registry
+  is invoked explicitly with native UTF-8 invocation, locking and snapshots;
+  script arguments survive the spawn adapter; request capture keeps its flush
+  barriers (#1166, #1167).
+- Generated Python bytecode is excluded from the npm tarball (#1171).
+
+### Security
+
+- The Snyk Code scan of the candidate was triaged: no true positives and four
+  hardening findings in two items. The dispatch item is fixed: the session id
+  shape is checked before any sandbox target file is read (#1171). The sandbox
+  runner manifest item is deferred.
+- Vulnerable transitive lock entries are refreshed, including `ip-address`
+  10.7.3 (#1171).
+- `npm audit` still reports GHSA-86w9-cpqp-85rv in `node-forge`, a transitive
+  dependency of the sandbox runtime `@anthropic-ai/sandbox-runtime`. No fixed
+  `node-forge` release is offered. This package does not call `node-forge`
+  itself.
+- The web inbox canonicalizes its server origin (#1151).
+
+### Known Limitations
+
+- **Confined worker spawn is unavailable on native Windows.**
+  `dispatch.sh --spawn-and-dispatch`, `ask.sh` and `dispatch-verify.sh` refuse
+  with `SANDBOX_PLATFORM_UNSUPPORTED` (exit 78), before any side effect.
+  Dispatch to a worker target refuses with `SANDBOX_TARGET_UNVERIFIED` (exit
+  78). `bin/boot-prepare.mjs --confined` is unavailable. There is no
+  unrestricted fallback. To run confined workers, install and `init` inside
+  WSL2.
+- **Native request capture is unavailable on native Windows.** `init
+  --capture-root`, `--preservation-root`, `--inspect-native` and
+  `--restore-native` refuse with exit 2 and change nothing.
+- Node 20 is the only Node version measured on Windows. A Windows controller
+  that dispatches into WSL2 workers is not supported.
+- Not in this release, although tasks exist for them:
+  - task-loop (#1151): no automatic task selection, dispatch or recording
+    loop. Only the approval inbox ships.
+  - jev-decision-routing (#1179), control-center-command-plane (#1182) and
+    workflow-efficiency-advisor (#1185): their modules and tests are in the
+    package, but no shipped entry point calls them.
+  - integrated-control-center (#1177), control-center-ui (#1184) and
+    registry-archive-cutover (#1183): only the local read-only Task Console
+    ships, not the public console.
+  - scoped-telepty (#1170): task-bound telepty transport is not enforced.
+  - session-cleaner (#974): finished idle workers are not detected and reaped
+    automatically.
+  - isolated-runtime (#1191): only test collection and LF pinning.
+  - No change for context-budget (#328), installed-parity (#404, #1169),
+    ecosystem-efficiency (#526), approval-resume (#796), approval-transport
+    (#888), task-admission (#1150), voice-code-core, voice-code-connectors and
+    voice-code-ui (#1157-#1159), task-advisor (#1161), knowledge-benchmark
+    (#1164), knowledge-platform (#1165), knowledge-session (#1173),
+    telepty-issue-triage (#1175) and execution-surface-routing (#1178).
+
 ## [0.2.1] - 2026-09-12
 
 Maintenance publication of the already-merged source through
