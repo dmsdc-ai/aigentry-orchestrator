@@ -202,8 +202,11 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
     writeClaudeOAuthHandoff(path.join(root, CLAUDE_OAUTH_DIR), oauthToken);
   const localBin = path.join(home, "bin");
   fs.mkdirSync(localBin, { mode: 0o700 });
-  const patchBinary = executable("apply_patch");
-  fs.symlinkSync(patchBinary, path.join(localBin, "apply_patch"));
+  // #652: apply_patch is on PATH only under a Codex host. Optional helper: when absent,
+  // no symlink and no allowRead entry; the real CLI below still fails closed.
+  let patchBinary: string | undefined;
+  try { patchBinary = executable("apply_patch"); } catch { patchBinary = undefined; }
+  if (patchBinary) fs.symlinkSync(patchBinary, path.join(localBin, "apply_patch"));
   const shared = path.join(home, ".telepty", "shared");
   fs.mkdirSync(shared, { recursive: true, mode: 0o700 });
   const hookCopy = path.join(root, "git-hooks");
@@ -248,7 +251,7 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
       GIT_CONFIG_KEY_0: "core.hooksPath", GIT_CONFIG_VALUE_0: hookCopy } : {}),
     ...authEnv,
   };
-  const read = [...scope.read, ...scope.write, cwd, home, tmp, realCli, patchBinary,
+  const read = [...scope.read, ...scope.write, cwd, home, tmp, realCli, ...(patchBinary ? [patchBinary] : []),
     fs.realpathSync(process.execPath)];
   if (hooksDir) read.push(hookCopy);
   const promptIndex = argv.indexOf("--append-system-prompt-file");

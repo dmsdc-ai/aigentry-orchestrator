@@ -7,7 +7,7 @@
 // never executed: nothing starts a provider CLI, reads the developer HOME or touches the network.
 // These tests prove argv construction and refusal ordering only, never CLI acceptance or
 // OS confinement.
-// win32: the confined sandbox is unsupported by design. The same 4 integration tests assert the REAL
+// win32: the confined sandbox is unsupported by design. The same 6 integration tests assert the REAL
 // SANDBOX_PLATFORM_UNSUPPORTED refusal before any write (fail closed), never Windows support. The boot
 // fixture is portable exactly as in claude-worker-oauth.test.ts: PATH uses path.delimiter, and the
 // version probe (spawn shell:false resolves only .com/.exe) is answered by a copy of this node.exe.
@@ -18,10 +18,11 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
-  copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync,
+  copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync,
+  realpathSync, rmSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { CLAUDE_TOOL_POLICY_FLAGS, CLAUDE_WORKER_TOOLS, claudeToolPolicyViolation } from "../../src/session/worker-sandbox.js";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..", "..", "..");
@@ -124,13 +125,14 @@ function bootArgv(W: World, sid: string, cli: string): { argv: string[]; roleCwd
 }
 
 interface Prep { status: number | null; out: string; error: string | null; m: Json; stagingRoot: string }
-function prepare(W: World, sid: string, cli: string, argv: string[], roleCwd: string): Prep {
+function prepare(W: World, sid: string, cli: string, argv: string[], roleCwd: string, pathEnv?: string): Prep {
   const scopeFile = join(W.root, `scope-${sid}.json`), stagingRoot = join(W.root, "sessions", sid);
   writeFileSync(scopeFile, JSON.stringify({ version: 1, task: TASK, sid, read: [W.project], write: [W.project],
     domains: ["api.anthropic.com:443"] }));
   mkdirSync(stagingRoot, { recursive: true });
   const r = spawnSync(process.execPath, [DRIVER, JSON.stringify({ scopeFile, task: TASK, sid, cli, roleCwd, argv,
-    stagingRoot })], { encoding: "utf8", env: env(W), timeout: 30000 });
+    stagingRoot })], { encoding: "utf8", env: { ...env(W), ...(pathEnv === undefined ? {} : { PATH: pathEnv }) },
+    timeout: 30000 });
   const res = parse(r.stdout.trim());
   const line = /^Error: (.*)$/m.exec(r.stderr);
   return { status: r.status, out: r.stdout + r.stderr, error: line ? line[1] ?? null : null,
@@ -241,6 +243,47 @@ test("claude: lookalike flags are not overmatched (no prefix/substring refusal)"
     if (WIN) { assertRefused(W, p, UNSUPPORTED); continue; }
     assert.equal(p.status, 0, `${a}: ${p.out}`);
     assert.equal(count(p.m.command as string[], "--tools"), 1);
+  }
+});
+
+// #652 optional patch helper. PATH is exactly the fake bin for prepare, so no host directory can supply
+// (or hide) apply_patch: presence and absence are both deterministic.
+test("apply_patch absent from PATH: prepare succeeds, no bin/apply_patch, no allowRead patch entry", () => {
+  const W = world();
+  rmSync(join(W.bin, "apply_patch"));
+  for (const cli of ["claude", "codex"]) {
+    const sid = `nopatch-${cli}`, { argv, roleCwd } = bootArgv(W, sid, cli);
+    const p = prepare(W, sid, cli, argv, roleCwd, W.bin);
+    if (WIN) { assertRefused(W, p, UNSUPPORTED); continue; }
+    assert.equal(p.status, 0, p.out);
+    const home = (p.m.env as Record<string, string>).HOME ?? "";
+    assert.deepEqual(readdirSync(join(home, "bin")), []);
+    const allowRead = ((p.m.config as Json).filesystem as Json).allowRead as string[];
+    assert.ok(!allowRead.some((x) => basename(x) === "apply_patch"), JSON.stringify(allowRead));
+    // The real CLI entry is followed directly by node: nothing (and no dangling path) in the patch slot.
+    const i = allowRead.indexOf((p.m.command as string[])[0] ?? "");
+    assert.ok(i >= 0);
+    assert.equal(allowRead[i + 1], realpathSync(process.execPath));
+    assert.ok(!JSON.stringify(p.m).includes("apply_patch"));
+  }
+});
+
+test("apply_patch on PATH: symlinked into the private bin and in allowRead exactly as before", () => {
+  const W = world();
+  const patch = realpathSync(join(W.bin, "apply_patch"));
+  for (const cli of ["claude", "codex"]) {
+    const sid = `patch-${cli}`, { argv, roleCwd } = bootArgv(W, sid, cli);
+    const p = prepare(W, sid, cli, argv, roleCwd, W.bin);
+    if (WIN) { assertRefused(W, p, UNSUPPORTED); continue; }
+    assert.equal(p.status, 0, p.out);
+    const home = (p.m.env as Record<string, string>).HOME ?? "";
+    assert.deepEqual(readdirSync(join(home, "bin")), ["apply_patch"]);
+    assert.ok(lstatSync(join(home, "bin", "apply_patch")).isSymbolicLink());
+    assert.equal(readlinkSync(join(home, "bin", "apply_patch")), patch);
+    const allowRead = ((p.m.config as Json).filesystem as Json).allowRead as string[];
+    const i = allowRead.indexOf((p.m.command as string[])[0] ?? "");
+    assert.ok(i >= 0);
+    assert.deepEqual(allowRead.slice(i + 1, i + 3), [patch, realpathSync(process.execPath)]);
   }
 });
 
