@@ -1115,7 +1115,8 @@ test('inventory CLI: runInventory(args) emits one JSON document and returns the 
   const receipt = await addReceipt(root, Buffer.from(`direct ${SECRET}`));
   const harness = await harnessDir(t);
   const before = await snapshot(base);
-  for (const [args, expected] of [[['--root', root], 40], [['--root', root, '--limit', '0'], 42], [['--root', 'relative'], 42]] as const) {
+  // The clean direct case is offset CLEAN_EXIT (win32: partial exit 3); invalid invocations stay 42 everywhere.
+  for (const [args, expected, clean] of [[['--root', root], 40 + CLEAN_EXIT, true], [['--root', root, '--limit', '0'], 42, false], [['--root', 'relative'], 42, false]] as const) {
     const casePath = path.join(harness, `case-${expected}-${args.length}.mjs`);
     await fs.writeFile(casePath, `const m = await import(${JSON.stringify(inventoryCliUrl.href)});
 const code = await m.runInventory(${JSON.stringify(args)});
@@ -1123,9 +1124,10 @@ process.exitCode = typeof code === 'number' ? 40 + code : 99;`);
     const out = await runNode(t, casePath, [], { root });
     assert.equal(out.code, expected, JSON.stringify(out));
     sanitized(out, [root, base]);
-    if (expected === 40) {
+    if (clean) {
       assertReadOnly(out.events);
       const inventory = documentOf(out); checkInventory(inventory, [root, base, SECRET]);
+      assertClean(inventory, typeof out.code === 'number' ? out.code - 40 : out.code);
       assert.deepEqual(inventory.items.map(item => item.capture_id), [receipt.capture_id]);
     } else {
       assert.deepEqual(out.events, [], 'invalid invocation reads nothing');
