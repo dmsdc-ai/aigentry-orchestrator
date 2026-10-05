@@ -137,7 +137,7 @@ function runStage(f: Fixture, label: string, at: number, failA = false): Stage {
 }
 
 function copies(s: Stage, name: string): Capture[] {
-  return Object.entries(s.snapshot.state).filter(([file]) => file.startsWith("inbox/") && file.endsWith(`-${name}.md`)).map(([, value]) => value);
+  return Object.entries(s.snapshot.state).filter(([file]) => file.startsWith(`inbox${path.sep}`) && file.endsWith(`-${name}.md`)).map(([, value]) => value);
 }
 function exact(s: Stage, name: string, bytes: Buffer): void {
   assert.deepEqual(copies(s, name).map(c => c.base64), [bytes.toString("base64")], `${name}: one exact evidence copy required`);
@@ -197,7 +197,7 @@ async function suite(): Promise<void> {
     await test(`${s.recovery}: only private A has an observed EACCES`, () => {
       assert.equal(s.failed.result.code, 0);
       assert.equal(s.failed.result.stderr.length, 1);
-      assert.match(s.failed.result.stderr[0]!, /unreadable ref .*\/shared\/A\.md: .*EACCES/);
+      assert.match(s.failed.result.stderr[0]!, process.platform === "win32" ? /unreadable ref .*\\shared\\A\.md: .*EACCES/ : /unreadable ref .*\/shared\/A\.md: .*EACCES/);
       assert.notEqual(s.failed.result.mechanism, "none");
     });
     await test(`${s.recovery}: unreadable A must not create fake empty evidence`, () => assert.equal(copies(s.failed, "A").length, 0));
@@ -235,7 +235,7 @@ async function suite(): Promise<void> {
   await test("positive: ordinary dedup survives restart", () => assert.deepEqual(dedup.result.stdout, []));
   await test("positive: modeled missing cursor re-emits at identical paths and bytes", () => {
     assert.equal(reemit.result.stdout.length, controls.length);
-    const inbox = (s: Stage) => Object.entries(s.snapshot.state).filter(([file]) => file.startsWith("inbox/")).map(([file, value]) => [file, value.base64]);
+    const inbox = (s: Stage) => Object.entries(s.snapshot.state).filter(([file]) => file.startsWith(`inbox${path.sep}`)).map(([file, value]) => [file, value.base64]);
     assert.deepEqual(inbox(reemit), inbox(captured)); assert.deepEqual(rededup.result.stdout, []);
   });
   await test("positive: overlap floor and seen each suppress delivery", () => {
@@ -251,10 +251,8 @@ async function suite(): Promise<void> {
 if (isChild) await child();
 else {
   try {
-    if (process.platform === "darwin" || process.platform === "linux") await suite();
-    else await test("report sweep continuity: POSIX fixture metadata and directory fsync", {
-      skip: `Requires macOS/Linux; ${process.platform} coverage is unmeasured`,
-    }, () => {});
+    // Every OS. Where chmod(000) cannot deny a read (win32, root), child() injects the EACCES itself and records it.
+    await suite();
   } finally {
     if (requestedOutput === undefined) fs.rmSync(output, { recursive: true, force: true });
   }
