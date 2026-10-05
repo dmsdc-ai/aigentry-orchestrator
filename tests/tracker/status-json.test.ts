@@ -523,14 +523,27 @@ test("S19 discovery: the orchestrate-turn skill names status --json and --since-
   assert.match(skill, /--since-generation/);
 });
 
-test("S20 actual caller: bin/dispatch-tracker.sh status --json equals the direct entrypoint", {
-  skip: process.platform === "win32" ? "bash shim not measured on win32; direct entrypoint covered above" : false,
-}, () => {
+// POSIX only: bin/dispatch-tracker.sh is a bash exec shim; native win32 runs the compiled entrypoint itself (S20b).
+if (process.platform !== "win32") test("S20 actual caller: bin/dispatch-tracker.sh status --json equals the direct entrypoint", () => {
   const state = stateDir(registry(7, BASE));
   const direct = statusJson(state);
   const shim = run("bash", [path.join(binDir, "dispatch-tracker.sh"), "status", "--json"], state);
   assert.equal(envelope(shim).rows.length, 4);
   assert.equal(shim.stdout, direct.stdout);
+});
+
+test("S20b direct entrypoint without the shim's AIGENTRY_SHIM_SCRIPT_DIR resolves bin/ itself and equals the seamed run", () => {
+  const state = stateDir(registry(7, BASE));
+  const seamed = statusJson(state);
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of SEAMS) delete env[key];
+  env.DISPATCH_STATE_DIR = state;
+  const r = spawnSync(process.execPath, [cli, "status", "--json"], { env, encoding: "utf8", shell: false, timeout: WALL_MS,
+    stdio: ["ignore", "pipe", "pipe"] });
+  assert.ifError(r.error);
+  const unseamed: Run = { code: r.status, stdout: r.stdout, stderr: r.stderr };
+  assert.equal(envelope(unseamed).rows.length, 4);
+  assert.equal(unseamed.stdout, seamed.stdout);
 });
 
 // ── candidate-r1 controller resolutions (#1172 follow-up) ──────────────────
@@ -743,9 +756,8 @@ test("S29 output overflow from a backend that then stalls is cut at once: exit 3
   refused(r, 3, "overflow then stall", "output_too_large");
 });
 
-test("S30 a backend that ignores SIGTERM is still ended by the 5 s deadline (SIGKILL)", {
-  skip: process.platform === "win32" ? "POSIX signal semantics; win32 termination unmeasured" : false,
-}, t => {
+// S30/S31 run on win32 too: Python installs the SIGTERM handler there as well, and Node's SIGKILL is TerminateProcess.
+test("S30 a backend that ignores SIGTERM is still ended by the 5 s deadline (SIGKILL)", t => {
   const fake = fakeBackend({ stdout: jsonlStream(), stderr: `${CANARY}\n`, sleepSeconds: 7, ignoreTerm: true });
   const { r, elapsedMs, liveAfter } = boundedRun(fake);
   t.diagnostic(`elapsed_ms=${Math.round(elapsedMs)} exit=${r.code} live_after=${liveAfter}`);
@@ -754,9 +766,7 @@ test("S30 a backend that ignores SIGTERM is still ended by the 5 s deadline (SIG
   refused(r, 9, "SIGTERM-ignoring backend", "registry_error");
 });
 
-test("S31 output overflow from a SIGTERM-ignoring backend is killed at once (maxBuffer uses SIGKILL)", {
-  skip: process.platform === "win32" ? "POSIX signal semantics; win32 termination unmeasured" : false,
-}, t => {
+test("S31 output overflow from a SIGTERM-ignoring backend is killed at once (maxBuffer uses SIGKILL)", t => {
   const fake = fakeBackend({ stdout: ("x".repeat(1023) + "\n").repeat(2048), sleepSeconds: 7, ignoreTerm: true, survivePipe: true });
   const { r, elapsedMs, liveAfter } = boundedRun(fake);
   t.diagnostic(`elapsed_ms=${Math.round(elapsedMs)} exit=${r.code} live_after=${liveAfter}`);
