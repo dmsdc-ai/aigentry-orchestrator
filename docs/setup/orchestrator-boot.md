@@ -259,9 +259,8 @@ If the cwd is wrong: cancel, `cd`, and boot again.
 
 ## 6. Not proven here
 
-- **Windows.** The package declares `darwin` and `linux`, and this capture was macOS arm64
-  only. Nothing on this page supports a Windows claim; native Windows remains an open release
-  goal, not a delivered one.
+- **Windows.** Windows is supported (see README Platforms); this capture is macOS arm64
+  only, so nothing on this page is a Windows boot measurement.
 - **Provenance.** Hashes bind copied bytes, not signatures. No codesign/notarization or
   publisher check was performed for any of the four executables.
 - **Codex effort**, **grok effort values**, and grok's sandbox profile enum as printed by the

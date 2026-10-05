@@ -26,6 +26,65 @@ concurrency.
 See [docs/setup/dispatch-capacity.md](docs/setup/dispatch-capacity.md) for the
 knob's semantics and how to measure a value for your own host.
 
+## Platforms
+
+- **macOS and Linux.**
+- **Windows 10 1809+ or Windows Server 2019+, x64.** Node 20 is the only Node version
+  measured on Windows (GitHub's `windows-latest` runner).
+
+**Windows prerequisites.** `init` checks these and stops with exit 3 and install guidance,
+writing nothing, if one is missing:
+
+- Git for Windows, for its `bash.exe` (`winget install Git.Git`). The WSL launcher
+  `bash.exe` under `%SystemRoot%` is not accepted.
+- `jq` (`winget install jqlang.jq`).
+- Python 3, run as `python` (`winget install Python.Python.3.12`). The Microsoft Store
+  `python` alias is not accepted.
+
+**Where to run what on Windows.**
+
+- From cmd or PowerShell: the `aigentry-orchestrator` command (`--version`, `--help`,
+  `init`) and the Node scripts (`node bin\<name>.mjs`). `init` runs its own scaffold step
+  through Git Bash.
+- From Git Bash: every shell entry point (`bin/*.sh`), for example
+  `bash bin/orchestrator-boot.sh`, `bin/tq-status.sh`, `bin/dispatch-tracker.sh` and
+  `bin/hitl.sh`. Without Git Bash none of them run, and neither do the git and Claude Code
+  hooks.
+
+**Windows limitations in 0.2.2.**
+
+1. **Confined worker spawn is unavailable on native Windows.** No OS sandbox runtime exists
+   there, so `dispatch.sh --spawn-and-dispatch`, `ask.sh` and `dispatch-verify.sh` refuse
+   with `SANDBOX_PLATFORM_UNSUPPORTED` (exit 78). Dispatch to a worker target refuses with
+   `SANDBOX_TARGET_UNVERIFIED` (exit 78), because no confined worker can exist there.
+   `bin/boot-prepare.mjs --confined` is unavailable for the same reason. There is no
+   unrestricted fallback.
+2. **Native request capture is unavailable on native Windows.** `init --capture-root`,
+   `--preservation-root`, `--inspect-native` and `--restore-native` refuse with exit 2 and
+   change nothing in the workspace or home. It has not been ported to Windows in 0.2.2.
+
+**WSL2.** To run confined workers, install and `init` inside WSL2 (Ubuntu) and run the
+control workspace there. That is the Linux path, and native request capture works there as
+well. Use one environment per control workspace. A Windows-side controller that dispatches
+into WSL2 workers is not supported and has not been measured.
+
+**Not available on Windows.** `bin/session-start.sh` needs kitty and `bin/install-launchd.sh`
+needs launchd; both are macOS/Linux launchers. There is no Windows service install in
+0.2.2. The tmux/iTerm spawn helpers in `bin/lib/platform-windows.sh` are stubs that exit 3.
+
+**Unmeasured on Windows** (not claimed as supported):
+
+- orchestrator boot end to end (it needs a Claude login and a telepty daemon);
+- the telepty daemon on Windows (that is telepty's claim, not this package's);
+- `bin/trust-path.sh` project keys in `%USERPROFILE%\.claude.json`;
+- the git hook (`git-hooks/pre-push`) and the Claude Code hooks under Git Bash;
+- cmux on Windows (only the headless path exists);
+- Node 22 and 24, and arm64 Windows;
+- installing the published package from the npm registry on Windows (publish verifies on
+  Ubuntu only);
+- ACL verification in `bin/request-capture-inventory.mjs`, which is not implemented, so a
+  win32 run never reports `complete:true` (see Capture inventory below).
+
 ## Release task projection
 
 Release admission reads the committed public task-ID projection
