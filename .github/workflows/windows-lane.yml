@@ -30,6 +30,10 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest]
     steps:
+      # The npm tarball is packed on Linux with LF; a default Windows checkout gives CRLF, which Git bash cannot run.
+      - name: Check out with LF endings, as the published tarball has them
+        shell: bash
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
