@@ -284,7 +284,42 @@ export interface SweepDeps {
   registryScript?: string;
   stdout: (line: string) => void;
   stderr: (line: string) => void;
+  /**
+   * #1172 `--json`: present = JSON mode. Receives the ONE document instead of NEW
+   * lines; resolves false when stdout could not take it (EPIPE and friends).
+   */
+  jsonOut?: (doc: string) => Promise<boolean>;
 }
+
+/**
+ * One committed inbox copy. Evidence REFERENCE only: track/kind are the classifier's
+ * inference, never identity, approval or acceptance. No body text.
+ */
+export interface SweepItem {
+  track: string;
+  kind: string;
+  sha256: string;
+  bytes: number;
+  ref_id: string;
+  name_matches_content: boolean | null;
+  inbox: string;
+  mtime_ms: number;
+  acceptance: "none";
+}
+
+/** Counts for THIS sweep only — not global queue/work status. null = unresolved. */
+interface SweepPending {
+  retained_retries: number | null;
+  unattempted_fresh: number | null;
+  discovery_incomplete: boolean | null;
+}
+
+interface SweepOutcome {
+  items: SweepItem[];
+  pending: SweepPending;
+}
+
+const PENDING_UNKNOWN: SweepPending = { retained_retries: null, unattempted_fresh: null, discovery_incomplete: null };
 
 /**
  * One sweep. Returns the process exit code: 0 for "swept" (including nothing new,
@@ -294,17 +329,36 @@ export interface SweepDeps {
  */
 export async function sweep(deps: SweepDeps): Promise<number> {
   const cursorFile = path.join(deps.stateDir, "report-cursor.json");
+  // JSON mode fills this only after the cursor commit; a lock/cursor error resets it.
+  const outcome: SweepOutcome | null = deps.jsonOut ? { items: [], pending: PENDING_UNKNOWN } : null;
+  let rc: number;
   try {
     // The helper stages its lock beside the cursor, so the parent must exist.
     fs.mkdirSync(deps.stateDir, { recursive: true });
-    return await withIndexLock(cursorFile, () => sweepLocked(deps, cursorFile));
+    // JSON mode also requires the lock RELEASE to resolve before it lists any item.
+    rc = await withIndexLock(cursorFile, () => sweepLocked(deps, cursorFile, outcome),
+      outcome ? { strictRelease: true } : {});
   } catch (err) {
     deps.stderr(`report-sweep: lock/cursor error; capture unresolved: ${(err as Error).message}`);
-    return 3;
+    rc = 3;
+    if (outcome) {
+      outcome.items = [];
+      outcome.pending = PENDING_UNKNOWN;
+    }
   }
+  if (!outcome || !deps.jsonOut) return rc;
+  // Fixed schema: no exception strings, no report bodies. Diagnostics stay on stderr.
+  const doc = JSON.stringify({ v: 1, items: outcome.items, pending: outcome.pending, exit: rc,
+    acceptance: "none" }) + "\n";
+  if (!(await deps.jsonOut(doc))) {
+    // The cursor may already be committed; the inbox copies remain the evidence.
+    deps.stderr("report-sweep: --json output failed; cursor may be committed, inbox copies retained");
+    return rc === 0 ? 3 : rc;
+  }
+  return rc;
 }
 
-async function sweepLocked(deps: SweepDeps, cursorFile: string): Promise<number> {
+async function sweepLocked(deps: SweepDeps, cursorFile: string, outcome: SweepOutcome | null): Promise<number> {
   const { stateDir, sharedDir, nowMs, repoDir, stdout, stderr } = deps;
   const inboxDir = path.join(stateDir, "inbox");
   const unclassifiedDir = path.join(inboxDir, "unclassified");
@@ -378,6 +432,7 @@ async function sweepLocked(deps: SweepDeps, cursorFile: string): Promise<number>
   const tracks = selected.length ? loadRegistryTracks(stateDir,
     deps.registryScript || process.env.DISPATCH_REGISTRY_PY || path.join(repoDir, "bin", "dispatch-registry.py")) : [];
   const lines: string[] = [];
+  const items: SweepItem[] = [];
 
   // ── step 1: exact inbox copies; failed attempts become durable obligations ──
   for (const c of selected) {
@@ -399,6 +454,14 @@ async function sweepLocked(deps: SweepDeps, cursorFile: string): Promise<number>
       await atomicWrite(dest, bytes, { sessionId: SESSION_ID });
       const shown = dest.startsWith(repoDir + path.sep) ? path.relative(repoDir, dest) : dest;
       lines.push(`NEW ${track} ${kind} ${shown}`);
+      if (outcome) {
+        // Digest of the exact Buffer copied, never a re-read or the source name.
+        const sha256 = createHash("sha256").update(bytes).digest("hex");
+        const stem = c.basename.slice(0, -3);
+        items.push({ track, kind, sha256, bytes: bytes.length, ref_id: c.sha,
+          name_matches_content: /^[0-9a-f]{64}$/.test(stem) ? stem === sha256 : null,
+          inbox: shown, mtime_ms: c.mtimeMs, acceptance: "none" });
+      }
       cursor.seen[c.sha] = c.mtimeMs;
     } catch (err) {
       const errorCode = (err as NodeJS.ErrnoException).code || "UNKNOWN";
@@ -430,6 +493,14 @@ async function sweepLocked(deps: SweepDeps, cursorFile: string): Promise<number>
     stderr(`report-sweep: cursor write failed; capture/retry commit uncertain, copies retained: ${(err as Error).message}`);
     return 3;
   }
+  if (outcome) {
+    outcome.items = items;
+    // Partial discovery cannot count what it did not observe: unknown, never 0.
+    outcome.pending = { retained_retries: retries.length,
+      unattempted_fresh: discoveryIncomplete ? null : fresh.length - freshIndex,
+      discovery_incomplete: discoveryIncomplete };
+    return result;
+  }
   // NEW is an inbox notification, never a report-acceptance ACK. No success
   // notification is issued for a cursor commit whose durability is unresolved.
   for (const line of lines) stdout(line);
@@ -438,7 +509,7 @@ async function sweepLocked(deps: SweepDeps, cursorFile: string): Promise<number>
 
 /** The subcommand entrypoint. `stateDir`/`nowIso` are the tracker CLI's own. */
 export async function cmdReportSweep(stateDir: string, repoDir: string, nowIso: string,
-  registryScript?: string): Promise<number> {
+  registryScript?: string, json = false): Promise<number> {
   const parsed = nowIso ? Date.parse(nowIso) : NaN;
   return sweep({
     stateDir,
@@ -448,5 +519,18 @@ export async function cmdReportSweep(stateDir: string, repoDir: string, nowIso: 
     registryScript: registryScript || process.env.DISPATCH_REGISTRY_PY || path.join(repoDir, "bin", "dispatch-registry.py"),
     stdout: (l) => process.stdout.write(l + "\n"),
     stderr: (l) => process.stderr.write(l + "\n"),
+    ...(json ? { jsonOut: writeStdout } : {}),
+  });
+}
+
+/** Resolves once stdout took the bytes; an EPIPE is a false, never an uncaught error. */
+function writeStdout(doc: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    process.stdout.on("error", () => resolve(false));
+    try {
+      process.stdout.write(doc, (err) => resolve(!err));
+    } catch {
+      resolve(false);
+    }
   });
 }

@@ -64,6 +64,14 @@ const HITL_SH = env.HITL_SH || path.join(SCRIPT_DIR, "hitl.sh");
 const NOW_OVERRIDE = env.TRACKER_NOW || "";
 const TELEPTY_AUTH_SH = path.join(SCRIPT_DIR, "lib/telepty-auth.sh");
 
+// #1172: report-sweep accepts no argument or exactly `--json`. Anything else is a
+// usage error decided HERE, before the mkdir below or any state/shared/registry access.
+const ARGV = process.argv.slice(2);
+if (ARGV[0] === "report-sweep" && !(ARGV.length === 1 || (ARGV.length === 2 && ARGV[1] === "--json"))) {
+  process.stderr.write("dispatch-tracker: report-sweep: invalid_argument\n" + USAGE + "\n");
+  process.exit(4);
+}
+
 fs.mkdirSync(STATE_DIR, { recursive: true });
 
 // ── small process helpers ───────────────────────────────────────────────────
@@ -963,7 +971,7 @@ function main(argv: string[]): void {
     // #904 — the only async subcommand (atomicWrite is a promise). node keeps the
     // loop alive until it settles, so `void` here is the return, not a discard.
     case "report-sweep":
-      void cmdReportSweep(STATE_DIR, REPO_DIR, NOW_OVERRIDE, DISPATCH_REGISTRY_PY).then((rc) => {
+      void cmdReportSweep(STATE_DIR, REPO_DIR, NOW_OVERRIDE, DISPATCH_REGISTRY_PY, rest[0] === "--json").then((rc) => {
         if (rc !== 0) process.exit(rc);
       });
       return;

@@ -28,6 +28,15 @@ export const USAGE = `# dispatch-tracker.sh — Orchestrator-side dispatch healt
 #       cursor, so a report is never lost to an inject a busy orchestrator
 #       dropped. Prints one NEW line per item. See
 #       docs/specs/2026-08-16-report-sweep.md.
+#   dispatch-tracker.sh report-sweep --json     — same sweep; prints ONE bounded JSON
+#       document {v:1,items,pending,exit,acceptance:"none"} instead of NEW lines
+#       (#1172): sha256/bytes of each copied inbox ref (≤128), this sweep's pending
+#       counts (null = unresolved). Evidence references only — never report
+#       emission, receipt/ACK, task completion or acceptance. Exit 3: a failed copy
+#       or incomplete discovery still lists the other committed items (incomplete
+#       discovery: unattempted_fresh null); a cursor/lock error lists items [] with
+#       null pending; a stdout failure may leave inbox/cursor committed with no
+#       deliverable JSON. Exit 4 usage (any other argument; no state touched).
 #   dispatch-tracker.sh --help
 #
 # Records are created by bin/dispatch.sh's begin-delivery transaction BEFORE the
