@@ -76,6 +76,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join, posix, resolve, sep, win32 } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import * as winPrivate from "./lib/win-private-storage.mjs";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, "..");
@@ -400,7 +401,15 @@ const GEMINI_WRITABLE_CREDS = Object.freeze([
   "oauth_creds.json",
   "google_accounts.json",
 ]);
+// #1167 F6 (win32, P2 + Q-FILE R2): there is no 0600, so every item must read back private in ONE
+// batch (a file only together with its parent dir); else throws the fixed describe() sentence.
+function assertWinPrivate(items) {
+  const failed = winPrivate.verify(items).find((r) => !r.ok);
+  if (failed) throw new Error(winPrivate.describe(failed.code));
+}
 async function ensureGeminiAuth(homeReal, geminiConfigShadow) {
+  const shadowDir = { path: geminiConfigShadow, kind: "directory", want: "private" };
+  let shadowDirPrivate = false;
   for (const name of GEMINI_WRITABLE_CREDS) {
     const realFile = join(homeReal, name);
     const shadowFile = join(geminiConfigShadow, name);
@@ -417,8 +426,24 @@ async function ensureGeminiAuth(homeReal, geminiConfigShadow) {
       }
     }
     try {
-      await copyFile(realFile, shadowFile);
-      await chmod(shadowFile, 0o600);
+      if (process.platform === "win32") {
+        // The credential is copied only into a verified-private dir; a copy that does not verify
+        // together with it (or any failure after the copy started) is removed.
+        if (!shadowDirPrivate) {
+          assertWinPrivate([shadowDir]);
+          shadowDirPrivate = true;
+        }
+        try {
+          await copyFile(realFile, shadowFile);
+          assertWinPrivate([shadowDir, { path: shadowFile, kind: "file", want: "private" }]);
+        } catch (e) {
+          await unlink(shadowFile).catch(() => {});
+          throw e;
+        }
+      } else {
+        await copyFile(realFile, shadowFile);
+        await chmod(shadowFile, 0o600);
+      }
     } catch (e) {
       process.stderr.write(
         `boot-prepare: WARNING could not copy ${name} into shadow (${e?.message ?? e}); ` +
@@ -639,6 +664,14 @@ async function main() {
     const configShadow = adapter.homeConfigSubdir
       ? join(homeShadow, adapter.homeConfigSubdir)
       : homeShadow;
+    // #1167 F6: win32 — the gemini config dir that will hold the credential copies (#569) is
+    // created here, still empty, and Set private (P2) before anything is mirrored into it. A dir
+    // this call did not create is never Set. Either way ensureGeminiAuth verifies it before copying
+    // (a failed Set is refused there), so the Set result needs no separate handling.
+    if (args.cli === "gemini" && process.platform === "win32" &&
+        (await mkdir(configShadow, { recursive: true })) !== undefined) {
+      winPrivate.setPrivate(configShadow, "directory");
+    }
     await buildShadowHome(homeReal, configShadow, adapter.homeExclude);
     // #552: codex-only — pre-seed folder-trust for the sandbox cwd in the shadow
     // config.toml so codex skips its blocking trust modal at boot (no probe
