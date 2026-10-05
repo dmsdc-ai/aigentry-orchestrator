@@ -80,6 +80,8 @@ function baselineMatches(actual, expected) {
     actual.mode === expected.mode && actual.uid === expected.uid && actual.gid === expected.gid;
 }
 function sync(dir) {
+  // P3: win32 has no directory fsync; NTFS journaling is the supported directory-entry durability.
+  if (process.platform === "win32") return;
   const fd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
 }
@@ -122,7 +124,10 @@ export function assertNoNativeOperation(workspace, home) {
 }
 // Ordinary init also writes the shipped wrapper/adapter. Hold the same exclusive
 // lock so a concurrent ordinary init cannot race first-time native registration.
-export function beginLegacyInit(workspace, home) {
+// win32 callers pass the bin/lib/win-private-storage.mjs module as `storage` (this adapter does not
+// import it, so the boot-time verified adapter closure is unchanged); POSIX ignores it.
+export function beginLegacyInit(workspace, home, storage) {
+  if (process.platform === "win32") return beginLegacyInitWin32(workspace, home, storage);
   assertNoNativeOperation(workspace, home);
   const lock = path.join(workspace, LOCK);
   fs.mkdirSync(lock, { mode: 0o700 });
@@ -133,6 +138,28 @@ export function beginLegacyInit(workspace, home) {
     require(same(directory(lock, true), identity) &&
       read(path.join(lock, "owner.json"))?.bytes.equals(owner), "init lock changed");
     fs.unlinkSync(path.join(lock, "owner.json")); fs.rmdirSync(lock); sync(workspace);
+  };
+}
+// C7 (P2, Q-FILE R2): the lock directory is made private, owner.json is born inside it by
+// inheritance (no file Set), and ONE verify batch reads both back. The finisher re-checks the
+// directory identity (dev, ino) and the owner bytes without another ACL read (DECISIONS-3).
+function beginLegacyInitWin32(workspace, home, storage) {
+  assertNoNativeOperation(workspace, home);
+  const lock = path.join(workspace, LOCK), ownerFile = path.join(lock, "owner.json");
+  fs.mkdirSync(lock);
+  const set = storage.setPrivate(lock, "directory");
+  if (set.status !== "ok") fail(`init lock could not be made private: ${storage.describe(set.code)}`);
+  const owner = json({ kind: "legacy-init", operationId: randomUUID() });
+  create(ownerFile, owner);
+  const [dir, file] = storage.verify([{ path: lock, kind: "directory", want: "private" },
+    { path: ownerFile, kind: "file", want: "private" }]);
+  if (!dir.ok || !file.ok) fail(`init lock is not private: ${storage.describe(dir.ok ? file.code : dir.code)}`);
+  const identity = { dev: dir.dev, ino: dir.ino };
+  return () => {
+    const d = stat(lock), o = stat(ownerFile);
+    require(d?.isDirectory() && !d.isSymbolicLink() && same({ dev: String(d.dev), ino: String(d.ino) }, identity) &&
+      o?.isFile() && !o.isSymbolicLink() && o.nlink === 1n && fs.readFileSync(ownerFile).equals(owner), "init lock changed");
+    fs.unlinkSync(ownerFile); fs.rmdirSync(lock);
   };
 }
 function payload(packageRoot) {

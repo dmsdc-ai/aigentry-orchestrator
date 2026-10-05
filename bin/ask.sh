@@ -36,6 +36,7 @@ set -euo pipefail
 # differed per shim is how the prefix survived four ports. tests/dispatch/T137 measures
 # it and carries the host measurement behind the decision.
 export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+case "$(uname -s)" in MINGW*|MSYS*) echo "ask.sh: needs confined worker sessions, unavailable on native Windows (SANDBOX_PLATFORM_UNSUPPORTED); use WSL2" >&2; exit 78;; esac
 # `telepty` resolved EXPLICITLY into the seam the implementation reads, never left to a
 # spawn-time PATH lookup; after the append, so the operator's wins where there is one
 # and launchd still finds homebrew's. An already-set TELEPTY is never overridden.
