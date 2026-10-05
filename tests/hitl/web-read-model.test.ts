@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -237,29 +238,34 @@ if (process.platform === 'win32') test('named-pipe context_ref is never opened a
   assert.equal(opened, 0);
 });
 
-test('unreadable record produces a warning when native permissions are enforced', async t => {
+// Registered on POSIX alone: on windows-latest (elevated administrator) an applied `icacls /deny
+// <user>:(RD)` did not make readFile reject (measured), so no permission-only state is unreadable for
+// that token without privilege manipulation (P2). The win32 counterpart below locks the record instead.
+if (process.platform !== 'win32') test('unreadable record produces a warning when native permissions are enforced', async t => {
   const root = await fixture(t);
   const file = await put(root, record());
-  if (process.platform === 'win32') {
-    // The mode-000 analogue: an explicit deny of read-data for the current user (icacls, by SID).
-    const icacls = join(process.env.SystemRoot ?? '', 'System32', 'icacls.exe');
-    const user = spawnSync(join(process.env.SystemRoot ?? '', 'System32', 'whoami.exe'), ['/user', '/fo', 'csv', '/nh'], { encoding: 'utf8' });
-    const sid = /,"(S-1-\d+(?:-\d+)+)"\s*$/.exec(user.stdout.trim())?.[1];
-    assert.ok(sid, `whoami /user: ${user.error ?? ''} ${user.stderr}`);
-    const deny = spawnSync(icacls, [file, '/deny', `*${sid}:(RD)`, '/q'], { encoding: 'utf8' });
-    assert.equal(deny.status, 0, `${deny.error ?? ''} ${deny.stdout}${deny.stderr}`);
-    t.after(() => { spawnSync(icacls, [file, '/remove:d', `*${sid}`, '/q']); });
-    // An elevated administrator does not bypass a deny ACE (no backup privilege is enabled).
-    await assert.rejects(readFile(file), (error: NodeJS.ErrnoException) => ['EPERM', 'EACCES'].includes(error.code ?? ''));
-    await corrupt(root);
-    return;
-  }
   await chmod(file, 0);
   t.after(() => chmod(file, 0o600).catch(() => {}));
   try { await readFile(file); t.skip('current identity bypasses mode-000 permissions'); return; } catch (error) {
     assert.equal((error as NodeJS.ErrnoException).code, 'EACCES');
   }
   await corrupt(root);
+});
+
+if (process.platform === 'win32') test('unreadable record produces a warning while the file is exclusively locked', async t => {
+  const root = await fixture(t);
+  const file = await put(root, record());
+  // Context for the POSIX-only registration above: the token's backup privilege state (libuv opens
+  // with FILE_FLAG_BACKUP_SEMANTICS, which skips DACL checks when that privilege is enabled).
+  const priv = spawnSync(join(process.env.SystemRoot ?? '', 'System32', 'whoami.exe'), ['/priv', '/fo', 'csv', '/nh'], { encoding: 'utf8' });
+  t.diagnostic(/^"SeBackupPrivilege",.*$/m.exec(priv.stdout ?? '')?.[0] ?? `SeBackupPrivilege: unknown ${priv.error ?? ''}`);
+  // libuv UV_FS_O_EXLOCK (include/uv/win.h, 0x10000000): share mode 0, so every other open fails with
+  // a sharing violation (EBUSY) for every token, privileges included.
+  const lock = await open(file, constants.O_RDONLY | 0x10000000);
+  try {
+    await assert.rejects(readFile(file), (error: NodeJS.ErrnoException) => error.code === 'EBUSY');
+    await corrupt(root);
+  } finally { await lock.close(); }
 });
 
 test('source/evidence bytes, metadata and directory entries remain unchanged', async t => {

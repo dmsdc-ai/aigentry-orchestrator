@@ -507,7 +507,14 @@ function parseMetadata(raw: string): Metadata | null {
 async function readMetadata(stateDir: string): Promise<MetadataRead> {
   // win32: the leaf ACL is not read here; it joins the file in the single batch below.
   const directory = await checkDirectory(stateDir, true, false);
-  if (directory === 'missing') return { status: 'missing' };
+  if (directory === 'missing') {
+    // win32: an absent directory proves nothing about the environment, so the private-storage
+    // tools must resolve before provisioning is invited; otherwise fail closed as unavailable.
+    if (WIN32_PLATFORM && (!winPrivateStorage || winPrivateStorage.currentPrincipal().status !== 'ok')) {
+      return { status: 'corrupt', reason: 'storage_unavailable' };
+    }
+    return { status: 'missing' };
+  }
   if (directory !== 'ok') return { status: 'corrupt', reason: 'storage_unsafe' };
   const file = join(stateDir, METADATA_FILE);
   const state = await checkFile(file);
