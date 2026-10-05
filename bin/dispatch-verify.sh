@@ -21,6 +21,7 @@ while [ $# -gt 0 ]; do
     *) sid="$1"; shift;;
   esac
 done
+case "$(uname -s)" in MINGW*|MSYS*) echo "dispatch-verify.sh: needs confined worker sessions, unavailable on native Windows (SANDBOX_PLATFORM_UNSUPPORTED); use WSL2" >&2; exit 78;; esac
 [ -n "$sid" ] || { echo "dispatch-verify.sh: <sid> required" >&2; exit 4; }
 
 say() { [ "$quiet" -eq 1 ] || echo "$@"; }

@@ -32,6 +32,10 @@ import {
 const PKG_ROOT = path.resolve(path.dirname(fs.realpathSync.native(fileURLToPath(import.meta.url))), "..", "..");
 const PKG = JSON.parse(fs.readFileSync(path.join(PKG_ROOT, "package.json"), "utf8"));
 const AIGENTRY_HOME = process.env.AIGENTRY_HOME || path.join(os.homedir(), ".aigentry");
+// win32 only: the P2 private-storage primitive for the legacy init lock (C7). Never loaded on POSIX.
+const winStorage = process.platform === "win32" ? await import("../lib/win-private-storage.mjs") : null;
+// win32 only: the Git for Windows bash.exe resolved in step 1 (C5) and used by step 5.
+let gitBash = null;
 
 const USAGE = `aigentry-orchestrator init [--workspace PATH] [--yes] [--dry-run] [--force] [--upgrade]
 
@@ -66,7 +70,65 @@ const die = (code, msg) => {
   process.exit(code);
 };
 
-const has = (cmd) => spawnSync("/bin/sh", ["-c", `command -v ${cmd}`], { stdio: "ignore" }).status === 0;
+const has = (cmd) => process.platform === "win32" ? winWhich(cmd).length > 0
+  : spawnSync("/bin/sh", ["-c", `command -v ${cmd}`], { stdio: "ignore" }).status === 0;
+
+// win32 (C3, P5): PATH x PATHEXT with fs only, no shell. Candidates under %SystemRoot% (the WSL
+// bash.exe launcher) and %LOCALAPPDATA%\Microsoft\WindowsApps (App Execution Alias stubs such as
+// the Store python3.exe) are skipped. Returns the existing candidates in PATH order.
+function winWhich(cmd) {
+  const under = (dir, root) => typeof root === "string" && path.isAbsolute(root) &&
+    (dir.toLowerCase() === path.resolve(root).toLowerCase() ||
+      dir.toLowerCase().startsWith(`${path.resolve(root).toLowerCase()}\\`));
+  const excluded = [process.env.SystemRoot,
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Microsoft", "WindowsApps")];
+  const exts = (process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean);
+  const found = [];
+  for (const raw of (process.env.PATH || "").split(path.delimiter)) {
+    const entry = raw.replace(/^"(.*)"$/, "$1");
+    if (!path.isAbsolute(entry)) continue;
+    const dir = path.resolve(entry);
+    if (excluded.some((root) => under(dir, root))) continue;
+    for (const ext of exts) {
+      const file = path.join(dir, cmd + ext.toLowerCase());
+      try {
+        if (fs.statSync(file).isFile()) found.push(file);
+      } catch {
+        // not present in this PATH entry
+      }
+    }
+  }
+  return found;
+}
+
+// win32 (C4, P5): run a resolved tool once with a constant argv, bounded. An .exe/.com runs with
+// shell:false; a .cmd/.bat runs through %SystemRoot%\System32\cmd.exe /d /s /c with strict quoting.
+function winRun(file, args) {
+  const options = { encoding: "utf8", windowsHide: true, timeout: 10_000 };
+  if (!/\.(cmd|bat)$/i.test(file)) return spawnSync(file, args, { ...options, shell: false });
+  const sr = process.env.SystemRoot;
+  if (typeof sr !== "string" || !/^[A-Za-z]:\\/.test(sr) || /["%^&|<>!\r\n]/.test(file))
+    return { status: null, stdout: "", stderr: "" };
+  return spawnSync(path.join(sr, "System32", "cmd.exe"), ["/d", "/s", "/c", `""${file}" ${args.join(" ")}"`],
+    { ...options, windowsVerbatimArguments: true });
+}
+
+// win32 (C5): Git for Windows bash = first of (a) a PATH x PATHEXT bash.exe not excluded by C3,
+// (b) <dir of git.exe on PATH>\..\bin\bash.exe. Accepted only when `uname -s` prints MINGW*/MSYS*.
+function resolveGitBash() {
+  const direct = winWhich("bash").find((file) => /\.exe$/i.test(file));
+  const git = winWhich("git").find((file) => /\.exe$/i.test(file));
+  const derived = git ? path.join(path.dirname(git), "..", "bin", "bash.exe") : null;
+  const candidate = direct || (derived && fs.existsSync(derived) ? derived : null);
+  const hint = "Git for Windows provides the bash that every shipped bin/*.sh script and init step 5 need. " +
+    "Install it, then re-run init:\n  winget install Git.Git";
+  if (!candidate) die(3, `Git for Windows bash.exe was not found on PATH or next to git.exe. ${hint}`);
+  const r = spawnSync(candidate, ["-c", "uname -s"], { encoding: "utf8", windowsHide: true, timeout: 10_000 });
+  const uname = (r.stdout || "").trim();
+  if (r.status !== 0 || !/^(MINGW|MSYS)/.test(uname))
+    die(3, `${candidate} is not Git for Windows bash (\`uname -s\` printed "${uname}", exit ${r.status}). ${hint}`);
+  return candidate;
+}
 
 /** bin/** files that invoke `tool` — measured from the installed package, never a stale count. */
 function binFilesUsing(tool) {
@@ -131,15 +193,8 @@ async function ask(question, fallback, nonInteractive) {
 
 function platformGate() {
   const p = process.platform;
-  if (p === "darwin" || p === "linux") return;
-  const detail = p === "win32" ? "" : ` Detected platform: ${p} (${os.type()} ${os.release()}).`;
-  die(
-    2,
-    "aigentry-orchestrator does not support Windows natively. bin/lib/platform-windows.sh returns " +
-      "'not implemented' for every primitive (#305) and bin/dispatch-registry.py locks the dispatch " +
-      "registry with fcntl.flock, which does not exist on Windows Python. Run init inside WSL2, where " +
-      `the Linux path is supported. Tracked at #663.${detail}`,
-  );
+  if (p === "darwin" || p === "linux" || p === "win32") return;
+  die(2, `aigentry-orchestrator supports macOS, Linux and Windows; detected ${p} (${os.type()} ${os.release()}).`);
 }
 
 // ------------------------------------------------------- step 1: dependency checks
@@ -151,7 +206,9 @@ function dependencyChecks() {
   if (major < 20) die(3, `node >= 20 is required; this process is node ${process.version}.`);
   info(`node ${process.version}`);
 
-  for (const [tool, install] of [
+  // win32 (C4) probes its own hard-dependency list; the POSIX list below is not consulted there.
+  if (process.platform === "win32") gitBash = winHardDependencies();
+  for (const [tool, install] of process.platform === "win32" ? [] : [
     ["jq", "brew install jq  (macOS)  |  apt-get install jq  (Debian/Ubuntu)"],
     ["python3", "brew install python  (macOS)  |  apt-get install python3  (Debian/Ubuntu)"],
   ]) {
@@ -206,6 +263,30 @@ function dependencyChecks() {
     );
 
   // gh is deliberately NOT checked: measured usage in the shipping set is zero (§0).
+}
+
+// win32 (C4, W-D1): jq, Python 3 as `python` and Git for Windows bash are hard prerequisites. Each
+// is probed by running it, so a Store alias or the WSL launcher is never taken for the real tool.
+function winHardDependencies() {
+  for (const [tool, args, works, install] of [
+    ["jq", ["--version"], (r) => r.status === 0, "winget install jqlang.jq"],
+    ["python", ["--version"], (r) => /^Python 3\./.test(`${r.stdout || ""}${r.stderr || ""}`.trim()),
+      "winget install Python.Python.3.12"],
+  ]) {
+    const file = winWhich(tool)[0];
+    if (file && works(winRun(file, args))) {
+      info(`${tool} found (${file})`);
+      continue;
+    }
+    const problem = file ? `${file} did not answer \`${tool} ${args.join(" ")}\` as expected` : `${tool} is not on PATH`;
+    const users = tool === "python" ? "the dispatch registry runs under it" :
+      `${binFilesUsing(tool).length} shipped script(s) invoke it unguarded`;
+    die(3, `${problem}. ${users}, so a missing ${tool} is an opaque runtime failure rather than an ` +
+      `install-time one.\nInstall it, then re-run init:\n  ${install}`);
+  }
+  const bash = resolveGitBash();
+  info(`bash found (${bash})`);
+  return bash;
 }
 
 // -------------------------------------------- step 2: resolve and validate the workspace
@@ -344,7 +425,11 @@ async function scaffold(ws, opts, subs) {
 
   // 5.1 — delegate to the script that already owns this layer (§2.5, Article 1).
   const script = path.join(ws, "bin", "install-instructions.sh");
-  const r = spawnSync("bash", opts.force ? [script, "--force"] : [script], { encoding: "utf8" });
+  // win32 (C5): Git bash by absolute path, `/` separators so the script derives C:/… paths that Node can read.
+  const r = process.platform === "win32"
+    ? spawnSync(gitBash, opts.force ? [script.replaceAll("\\", "/"), "--force"] : [script.replaceAll("\\", "/")],
+      { encoding: "utf8", windowsHide: true, env: { ...process.env, AIGENTRY_HOME: AIGENTRY_HOME.replaceAll("\\", "/") } })
+    : spawnSync("bash", opts.force ? [script, "--force"] : [script], { encoding: "utf8" });
   if (r.stdout) process.stdout.write(r.stdout);
   if (r.status !== 0) die(6, `install-instructions.sh exited ${r.status}:\n${r.stderr || "(no stderr)"}`);
 
@@ -450,6 +535,9 @@ function substituteAll(ws, scaffoldWritten, subs) {
     try {
       text = fs.readFileSync(file, "utf8");
     } catch {
+      // win32 (C6): a path the script reports writing must be readable, or its tokens would survive unseen.
+      if (process.platform === "win32" && scaffoldWritten.includes(file))
+        die(7, `${file} was written by install-instructions.sh but cannot be read for substitution`);
       continue;
     }
     if (!TEMPLATE_TOKENS.some((t) => text.includes(t))) continue;
@@ -479,19 +567,28 @@ function guidance(ws, counts) {
   const notInstalled = summary.warned.length
     ? summary.warned.map((w) => `  - ${w}`).join("\n")
     : "  (nothing — every optional dependency was found)";
+  // win32 (C9): the boot script runs from Git Bash; the two 0.2.2 Windows limitations are named.
+  const win = process.platform === "win32";
+  const boot = win
+    ? "3. bash bin/orchestrator-boot.sh  # from Git Bash; boots the orchestrator session"
+    : "3. bin/orchestrator-boot.sh       # boots the orchestrator session";
+  const limits = win
+    ? "\nConfined worker spawn is unavailable on native Windows (SANDBOX_PLATFORM_UNSUPPORTED, exit 78); use WSL2 for confined workers.\n" +
+      "Native request capture (--capture-root/--preservation-root) is unavailable on native Windows in 0.2.2; use WSL2 for it.\n"
+    : "";
   const text = `Control workspace ready: ${ws}
   ${counts.governance} governance files, ${counts.scaffold} scaffold files, state/ initialised empty.
 
 Next:
   1. cd ${ws}
   2. telepty-install                # if the daemon is not yet running (telepty owns this)
-  3. bin/orchestrator-boot.sh       # boots the orchestrator session
+  ${boot}
 
 Do NOT boot with a bare \`claude\`. bin/orchestrator-boot.sh enforces the
 singleton-at-boot guard (#539): a bare \`telepty allow --id orchestrator\` is
 idempotent, so a second bare boot silently shares the session and a later
 SIGTERM cascades a close to the live one.
-
+${limits}
 Not installed by init:
 ${notInstalled}
 `;
@@ -546,6 +643,15 @@ async function main() {
 
   console.log(`aigentry-orchestrator ${PKG.version} — init`);
   platformGate();
+  // win32 (C8, W-D2 B): native request capture is a documented 0.2.2 Windows limitation; refuse
+  // before anything is read or written.
+  if (process.platform === "win32" && (opts.captureRoot || opts.preservationRoot || opts.inspectNative || opts.restoreNative))
+    die(
+      2,
+      "native request capture (--capture-root, --preservation-root, --inspect-native, --restore-native) is not " +
+        "available on native Windows in 0.2.2. Nothing was written. Run init without these options, or run " +
+        "init inside WSL2 to use native capture.",
+    );
   if (opts.inspectNative || opts.restoreNative) {
     const ws = opts.workspace || process.env.AIGENTRY_CONTROL_WORKSPACE;
     if (!ws || !path.isAbsolute(ws)) die(4, "native inspect/restore requires an explicit absolute workspace");
@@ -582,7 +688,7 @@ async function main() {
 
   verifyPackageComplete();
   if (!native) fs.mkdirSync(ws, { recursive: true });
-  const finishLegacy = native ? null : beginLegacyInit(ws, AIGENTRY_HOME);
+  const finishLegacy = native ? null : beginLegacyInit(ws, AIGENTRY_HOME, winStorage);
   if (!native && fs.existsSync(existingStamp) &&
     JSON.parse(fs.readFileSync(existingStamp, "utf8")).nativeCapture)
     die(4, "workspace became capture-configured; explicit native setup required");

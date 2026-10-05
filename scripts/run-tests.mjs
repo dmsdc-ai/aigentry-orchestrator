@@ -49,8 +49,11 @@ sourceTestFiles.push('tests/packaging/preservation.test.mjs', 'tests/packaging/p
 sourceTestFiles.push('tests/packaging/workflow-policy.test.mjs');
 // #1172 — worker-inputs helper + dispatch input-preflight regression; Node built-ins, every OS (Windows proof owed to CI).
 sourceTestFiles.push('tests/dispatch/worker-inputs.test.mjs');
-// Native capture fixtures require POSIX ownership/modes and the boot wizard suite drives an
-// owned POSIX PTY; Windows support is still absent for both.
+// #1167 — real bin/init/cli.mjs init in temp homes; each OS asserts its own branch (no skips); every OS.
+sourceTestFiles.push('tests/packaging/init-platform.test.mjs');
+// Native capture fixtures require POSIX ownership/modes; on native Windows init refuses native
+// capture with exit 2 (a 0.2.2 limitation), asserted in tests/packaging/init-platform.test.mjs.
+// The boot wizard suite drives an owned POSIX PTY.
 if (process.platform === 'darwin' || process.platform === 'linux') {
   sourceTestFiles.push('tests/packaging/native-capture.test.mjs', 'tests/packaging/orchestrator-boot-wizard.test.mjs');
   // #1177 the XRes owner supervisor fixtures signal owned POSIX children and observe them via flock.

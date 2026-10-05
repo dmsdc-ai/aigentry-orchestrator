@@ -60,7 +60,8 @@
   },
   "os": [
     "darwin",
-    "linux"
+    "linux",
+    "win32"
   ],
   "exports": {
     "./gate": "./dist/src/gate/index.js",

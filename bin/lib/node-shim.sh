@@ -34,7 +34,7 @@ aigentry_node_shim() {
   if [ ! -f "$AIGENTRY_SHIM_JS" ]; then
     pkg_bin="$(command -v aigentry-orchestrator || true)"
     if [ -n "$pkg_bin" ]; then
-      pkg_root="$(node -e 'const p=require("node:path"),f=require("node:fs");console.log(p.resolve(f.realpathSync(process.argv[1]),"..","..",".."))' "$pkg_bin" 2>/dev/null || true)"
+      pkg_root="$(node -e 'const p=require("node:path"),f=require("node:fs");if(process.platform==="win32"&&!f.realpathSync(process.argv[1]).endsWith(p.join("bin","init","cli.mjs"))){for(const c of[p.join(p.dirname(process.argv[1]),"node_modules","@dmsdc-ai","aigentry-orchestrator"),p.join(p.dirname(process.argv[1]),"..","@dmsdc-ai","aigentry-orchestrator")]){try{if(JSON.parse(f.readFileSync(p.join(c,"package.json"),"utf8")).name==="@dmsdc-ai/aigentry-orchestrator"){console.log(c.split(p.sep).join("/"));process.exit(0)}}catch{}}process.exit(1)}console.log(p.resolve(f.realpathSync(process.argv[1]),"..","..",".."))' "$pkg_bin" 2>/dev/null || true)"
       [ -n "$pkg_root" ] && AIGENTRY_SHIM_JS="$pkg_root/$rel"
     fi
   fi
