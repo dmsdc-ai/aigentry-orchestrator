@@ -10,8 +10,9 @@
 // with `--print "ROLE"` → "ROLE"). Defense-in-depth via sandbox cwd is contributed
 // by bin/boot-prepare.mjs (sets ctx.cwd to $HOME/.aigentry/role-sandbox/<role>-<sid>/
 // so cwd CLAUDE.md auto-discovery resolves to a clean directory).
-import { makeAdapter } from "./common.js";
+import { decisionLaunch, makeAdapter } from "./common.js";
 import { envOrDefault, launchConfig } from "./launch-config.js";
+import { decisionEffortArgv, decisionModelArgv } from "../model-decision.js";
 
 export const CLAUDE_MIN_VERSION = "1.0.0";
 
@@ -21,7 +22,17 @@ export function claudeAdapter() {
     min_version: CLAUDE_MIN_VERSION,
     // #1162: --model/--effort moved here from boot-prepare (same env names,
     // defaults and argv position) so argv and launch share one resolution.
-    buildArgvEnv: ({ prompt_file }) => {
+    buildArgvEnv: ({ prompt_file, decision }) => {
+      // #1148: a resolver decision carries the exact model/effort; null omits the flag and
+      // no env or literal default is consulted.
+      if (decision) {
+        return {
+          argv: ["claude", "--append-system-prompt-file", prompt_file,
+            ...decisionModelArgv(decision), ...decisionEffortArgv(decision)],
+          env: {},
+          launch: decisionLaunch(decision),
+        };
+      }
       const model = envOrDefault(process.env, "AIGENTRY_CLAUDE_MODEL", "claude-opus-5");
       const effort = envOrDefault(process.env, "AIGENTRY_CLAUDE_EFFORT", "xhigh");
       return {

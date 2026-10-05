@@ -4,9 +4,20 @@ import { spawnSync } from "node:child_process";
 import crossSpawn from "cross-spawn";
 import { closeSync, openSync, readFileSync, readSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { classifierRetired, resolveCommand } from "./model-evidence.mjs";
+
+// #1148: `--resolve …` is the managed spawn-decision path (pure resolver over bounded
+// public metadata; no classifier, no model call). It exits here; the label router below
+// is unchanged for its existing callers.
+if (process.argv[2] === "--resolve") {
+  const { code, out } = await resolveCommand(process.argv.slice(3), process.env);
+  await new Promise((done) => process.stdout.write(out, done));
+  process.exit(code);
+}
 
 // Keep in sync with EMERGENCY_ROUTE in src/dispatch/cli.ts.
 const emergency = { cli: "claude", model: "claude-opus-5[1m]", label: "opus-5" };
+const CLASSIFIER_MODEL = "claude-haiku-4-5-20251001";
 const args = Object.fromEntries(process.argv.slice(2).reduce((pairs, key, i, all) => {
   if (i % 2 === 0) pairs.push([key, all[i + 1]]);
   return pairs;
@@ -68,6 +79,10 @@ if (!failure && args["--ref"]) {
       `Role: ${JSON.stringify(args["--role"] || "")}\nTask excerpt (first 4KB): ${JSON.stringify(ref)}\n`;
     // Env-only seam (no argv form): an argv value reaching spawnSync is Snyk CWE-78 MEDIUM.
     const classifier = process.env.AIGENTRY_ROUTER_CLASSIFIER;
+    // #1148: the default classifier model is not called on/after the existing conservative no-call
+    // cutoff (docs/model-profiles/model-catalog.json classifier.retire_on — the model's "not sooner
+    // than" floor, not an official retirement fact); routing falls to the table. No replacement model.
+    if (!classifier && classifierRetired(CLASSIFIER_MODEL)) throw new Error("classifier no-call cutoff reached");
     // Slim call (measured 2026-09-05): under Claude Code's agent system prompt Haiku thinks and writes
     // ~1.5k output tokens of no routing signal → 18 s, over the ceiling; a JSON-only system prompt,
     // no tools/MCP and no thinking → 6–9 s. Thinking/effort are overridden in this child's env only.
@@ -75,7 +90,7 @@ if (!failure && args["--ref"]) {
     delete childEnv.CLAUDE_EFFORT;
     const classifierSpawnSync = process.platform === "win32" ? crossSpawn.sync : spawnSync;
     const result = classifierSpawnSync(classifier || "claude", classifier ? [] : [
-      "-p", "--model", "claude-haiku-4-5-20251001", "--output-format", "json", "--max-turns", "1",
+      "-p", "--model", CLASSIFIER_MODEL, "--output-format", "json", "--max-turns", "1",
       "--system-prompt", "You are a model router. Reply with exactly one JSON object and nothing else: no prose, no markdown fence.",
       "--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
     ], { input: prompt, encoding: "utf8", timeout: 15000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024, env: childEnv });

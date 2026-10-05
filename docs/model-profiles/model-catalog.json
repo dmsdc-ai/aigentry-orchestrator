@@ -1,0 +1,107 @@
+{
+  "schema": "aigentry-model-catalog/1",
+  "as_of": "2026-09-27",
+  "status": "dated bootstrap: an observation of public documentation at T, never proof of current, latest or account availability",
+  "evidence": {
+    "operation": "mc1148jg-v1",
+    "observed_window_utc": ["2026-09-27T10:55:40Z", "2026-09-27T10:58:52Z"],
+    "rules": [
+      "catalog membership, CLI surface compatibility and account availability are separate facts",
+      "rows are never ranked by source order, id text or model number",
+      "an absent fact is unknown; an unknown effort default means omit the flag",
+      "a lower per-token price is not spend authority; cost impact is unknown unless measured"
+    ]
+  },
+  "cli": {
+    "claude": {
+      "provider": "anthropic",
+      "surface": "anthropic-models",
+      "effort_channel": "argv:--effort",
+      "effort_band": ["low", "medium", "high", "xhigh", "max", "ultracode"],
+      "effort_band_source": {
+        "url": "https://code.claude.com/docs/en/model-config",
+        "fetched_utc": "2026-09-27T10:55:55Z",
+        "sha256": "15cf702e3235a64bb0adea75c3c81a5cef7612067e54141d04fd72863fbb4cf4",
+        "note": "levels accepted by the --effort launch flag; per-model support is not published without the authenticated Models API"
+      },
+      "auto_effort_never": ["max", "ultra", "ultracode"],
+      "policy_incumbent": "claude-opus-5",
+      "family_pattern": "^claude-(fable|opus|sonnet|haiku)-"
+    },
+    "codex": {
+      "provider": "openai",
+      "surface": "openai-codex-models",
+      "effort_channel": "argv:-c model_reasoning_effort",
+      "effort_band": null,
+      "effort_band_source": {
+        "url": "https://learn.chatgpt.com/docs/config-file/config-reference.md",
+        "fetched_utc": "2026-09-27T10:56:29Z",
+        "sha256": "0512de2624e4a441a4a557b810e724393bee8022682d0ec7cc4f04b21d2642f9",
+        "note": "model_reasoning_effort is typed string; the listed values are examples, so the band is unknown"
+      },
+      "auto_effort_never": ["max", "ultra", "ultracode"],
+      "policy_incumbent": "gpt-6-astra",
+      "family_pattern": null
+    }
+  },
+  "surfaces": {
+    "anthropic-models": {
+      "url": "https://platform.claude.com/docs/en/models/overview.md",
+      "fetched_utc": "2026-09-27T10:57:26Z",
+      "sha256": "404372e69b13defcb4598bb8a8cfbc359c0c31384d809daf53d75c3ca9316bc3",
+      "scope": "Anthropic-operated platforms; retirement dates are 'not sooner than' commitments, recorded as retire_not_before (a floor, never retire_on); API lifecycle is not evidence of Claude Code CLI or account support",
+      "rows": [
+        {"model": "claude-fable-5-1", "tier": "fable", "lifecycle": "current", "default_effort": "high", "retire_on": null, "retire_not_before": "2027-09-01", "labels": []},
+        {"model": "claude-opus-5-5", "tier": "opus", "lifecycle": "current", "default_effort": "medium", "retire_on": null, "retire_not_before": "2027-09-22", "labels": ["documented-default-pick"]},
+        {"model": "claude-sonnet-5", "tier": "sonnet", "lifecycle": "current", "default_effort": "high", "retire_on": null, "retire_not_before": "2027-06-30", "labels": []},
+        {"model": "claude-haiku-4-5-20251001", "tier": "haiku", "lifecycle": "current", "default_effort": "unsupported", "retire_on": null, "retire_not_before": "2026-10-15", "labels": []},
+        {"model": "claude-fable-5", "tier": "fable", "lifecycle": "legacy", "default_effort": null, "retire_on": null, "labels": []},
+        {"model": "claude-opus-5", "tier": "opus", "lifecycle": "legacy", "default_effort": "high", "retire_on": null, "labels": []},
+        {"model": "claude-opus-4-8", "tier": "opus", "lifecycle": "legacy", "default_effort": null, "retire_on": null, "labels": []},
+        {"model": "claude-opus-4-7", "tier": "opus", "lifecycle": "legacy", "default_effort": "xhigh", "retire_on": null, "labels": []},
+        {"model": "claude-opus-4-6", "tier": "opus", "lifecycle": "legacy", "default_effort": null, "retire_on": null, "labels": []},
+        {"model": "claude-opus-4-5", "tier": "opus", "lifecycle": "legacy", "default_effort": null, "retire_on": null, "labels": []},
+        {"model": "claude-sonnet-4-6", "tier": "sonnet", "lifecycle": "legacy", "default_effort": null, "retire_on": null, "labels": []},
+        {"model": "claude-sonnet-4-5", "tier": "sonnet", "lifecycle": "legacy", "default_effort": null, "retire_on": null, "labels": []}
+      ],
+      "default_effort_sources": {
+        "claude-opus-5": "code.claude.com/docs/en/model-config: 'Opus 5.5 defaults to medium, one level below Opus 5's default of high'",
+        "claude-opus-4-7": "code.claude.com/docs/en/model-config: xhigh 'The default on Opus 4.7'"
+      }
+    },
+    "openai-codex-models": {
+      "url": "https://learn.chatgpt.com/docs/models.md",
+      "fetched_utc": "2026-09-27T10:56:29Z",
+      "sha256": "0f29d677c26b6f8f5e9f4e59321e3dc9912de6453ff609886c616f2af6d8c675",
+      "scope": "Codex with ChatGPT sign-in; API-key sign-in has a different catalog and is not inferred",
+      "rows": [
+        {"model": "gpt-6-astra", "tier": "astra", "lifecycle": "current", "default_effort": null, "retire_on": null, "labels": ["recommended"]},
+        {"model": "gpt-6-sol", "tier": "sol", "lifecycle": "current", "default_effort": null, "retire_on": null, "labels": ["recommended"]},
+        {"model": "gpt-6-luna", "tier": "luna", "lifecycle": "current", "default_effort": null, "retire_on": null, "labels": ["recommended"], "effort_excluded": ["ultra"]},
+        {"model": "gpt-5.5", "tier": null, "lifecycle": "legacy", "default_effort": null, "retire_on": "2026-10-14", "labels": []},
+        {"model": "gpt-5.4", "tier": "sol", "lifecycle": "retired", "default_effort": null, "retire_on": "2026-08-31", "labels": [], "replacement": "gpt-6-sol"},
+        {"model": "gpt-5.4-mini", "tier": "luna", "lifecycle": "retired", "default_effort": null, "retire_on": "2026-08-31", "labels": [], "replacement": "gpt-6-luna"},
+        {"model": "gpt-5.2", "tier": null, "lifecycle": "deprecated", "default_effort": null, "retire_on": null, "labels": []},
+        {"model": "gpt-5.3-codex", "tier": null, "lifecycle": "deprecated", "default_effort": null, "retire_on": null, "labels": []}
+      ],
+      "notes": [
+        "GPT-5.6 Sol/Terra/Luna are 'still available during rollout' by display name only; no id is inferred",
+        "no default effort is documented on this surface; API-surface defaults are not transferred"
+      ]
+    }
+  },
+  "known_incompatibilities": [
+    {
+      "cli": "claude",
+      "model": "claude-opus-5-5",
+      "min_cli_version": "2.1.280",
+      "source": "provider rejection recorded in input/evidence/launch-failure.json (API 400 before task execution)",
+      "observed_at": "2026-09-27T11:19:29.786Z"
+    }
+  ],
+  "classifier": {
+    "model": "claude-haiku-4-5-20251001",
+    "retire_on": "2026-10-15",
+    "note": "existing conservative no-call cutoff for the legacy explicit router classifier (it is not called on or after this date); the date equals the model's 'not sooner than' retirement floor and is NOT an official retirement fact; never extended; no replacement classifier is authorised"
+  }
+}

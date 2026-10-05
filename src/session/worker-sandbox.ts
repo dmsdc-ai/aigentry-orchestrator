@@ -8,6 +8,7 @@ import type { SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import { isCliKind, type LaunchConfig } from "./boot-adapter/types.js";
 import { normalizeLaunch } from "./boot-adapter/launch-config.js";
 import { CLAUDE_OAUTH_DIR, selectedClaudeOAuthToken, writeClaudeOAuthHandoff } from "./claude-worker-oauth.js";
+import { sameFileIdentity, type ExecutableBinding } from "./model-decision.js";
 
 export interface WorkerScope {
   version: 1;
@@ -37,6 +38,19 @@ export interface WorkerManifest {
   // #1162 configured LaunchConfig v2, sealed by the manifest hash. Absent in
   // older manifests: readers then report model/effort unknown.
   launch?: LaunchConfig;
+  /** #1148: resolver-bound executable identity, sealed by the manifest hash. Absent on legacy spawns. */
+  executable?: ExecutableBinding;
+}
+
+/**
+ * #1148 U4: the bound file must still be the one the resolver chose — same realpath and
+ * the same stat identity. A stat check, not an atomic open: it narrows, it does not
+ * eliminate, a replace-between-check-and-exec window.
+ */
+export function assertExecutableIdentity(binding: ExecutableBinding, file: string): void {
+  let real: string, st: fs.Stats;
+  try { real = fs.realpathSync(file); st = fs.statSync(real); } catch { throw new Error("SANDBOX_EXECUTABLE_CHANGED"); }
+  if (real !== binding.realpath || !st.isFile() || !sameFileIdentity(binding, st)) throw new Error("SANDBOX_EXECUTABLE_CHANGED");
 }
 
 const identity = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
@@ -157,7 +171,7 @@ function seedAuth(cli: string, home: string, cwd: string, oauthSelected = false)
 
 export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: string,
   argv: string[], stagingRoot: string, targetCwd = roleCwd,
-  hooksDir?: string, launch?: LaunchConfig): { launcher: string; manifest: string; hash: string } {
+  hooksDir?: string, launch?: LaunchConfig, binding?: ExecutableBinding): { launcher: string; manifest: string; hash: string } {
   if (!["darwin", "linux"].includes(process.platform)) throw new Error("SANDBOX_PLATFORM_UNSUPPORTED");
   if (!["claude", "codex"].includes(cli)) throw new Error(`SANDBOX_CLI_UNSUPPORTED: ${cli}`);
   if (!argv.length || path.basename(argv[0]!) !== cli) throw new Error("SANDBOX_COMMAND_BINDING");
@@ -165,6 +179,11 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   if (cli === "claude") {
     const flag = claudeToolPolicyViolation(argv);
     if (flag) throw new Error(`SANDBOX_TOOL_ARG: ${flag}`);
+  }
+  // #1148 U4: a managed spawn names its executable exactly; checked before any sandbox effect.
+  if (binding) {
+    if (binding.cli !== cli || argv[0] !== binding.path || !path.isAbsolute(argv[0]!)) throw new Error("SANDBOX_COMMAND_BINDING");
+    assertExecutableIdentity(binding, binding.path);
   }
   // #652: validated before any staging write. Claude only; codex never reads it.
   const oauthToken = cli === "claude" ? selectedClaudeOAuthToken(process.env) : undefined;
@@ -246,10 +265,16 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
     allowPty: true, allowAppleEvents: false, enableWeakerNestedSandbox: false,
     enableWeakerNetworkIsolation: false,
   };
+  // #1148 U4: fresh pre-seal re-check; the identity is sealed inside the hashed manifest.
+  if (binding) {
+    if (realCli !== binding.realpath) throw new Error("SANDBOX_EXECUTABLE_CHANGED");
+    assertExecutableIdentity(binding, realCli);
+  }
   const m: WorkerManifest = { version: 1, task: scope.task, sid: scope.sid, attempt, cli, cwd,
     command, env: childEnv, config, probeFile, probeDirectory, receipt,
     ...(oauthHandoff ? { claudeOAuthHandoff: oauthHandoff } : {}),
-    ...(launch && isCliKind(cli) ? { launch: normalizeLaunch(cli, launch) } : {}) };
+    ...(launch && isCliKind(cli) ? { launch: normalizeLaunch(cli, launch) } : {}),
+    ...(binding ? { executable: binding } : {}) };
   const data = JSON.stringify(m, null, 2) + "\n";
   const manifest = path.join(root, "manifest.json"), hash = digest(data);
   writePrivate(manifest, data);

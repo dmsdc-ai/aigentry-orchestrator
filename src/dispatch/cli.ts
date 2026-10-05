@@ -28,6 +28,7 @@ import { geminiBinary } from "../session/boot-adapter/gemini.js";
 import { isCliKind, type LaunchConfig } from "../session/boot-adapter/types.js";
 import { normalizeLaunch } from "../session/boot-adapter/launch-config.js";
 import { loadWorkerScope, prepareWorkerSandbox, assertConfinedTarget, stageWorkerRef } from "../session/worker-sandbox.js";
+import { validateSpawnDecision, type SpawnDecision } from "../session/model-decision.js";
 
 // ── environment seams (identical names/defaults to the shell) ────────────────
 // SCRIPT_DIR was `cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P` — the repo's
@@ -384,6 +385,10 @@ interface Opts {
   noTaskReason: string;
   /** #1092: operator reason for retrying a delivery_state_unknown row; "" = no override. */
   retryUnknown: string;
+  /** #1148: per-call operator observation files (negative launch outcomes), read by the resolver only. */
+  observe: string[];
+  /** #1148: the validated decision of a fresh confined claude/codex spawn. */
+  decision?: SpawnDecision;
 }
 
 function parseArgs(argv: string[]): Opts {
@@ -408,6 +413,7 @@ function parseArgs(argv: string[]): Opts {
     noTask: false,
     noTaskReason: "",
     retryUnknown: "",
+    observe: [],
   };
   let i = 0;
   // `shift 2` on a value flag reads $2 even when absent; bash's `set -u` makes
@@ -440,6 +446,13 @@ function parseArgs(argv: string[]): Opts {
       case "--verify-delivered": o.verifyDelivered = true; i += 1; break;
       case "--no-verify-started": o.verifyStarted = false; i += 1; break;
       case "--keep-alive": o.keepAlive = true; i += 1; break;
+      case "--observe":
+        if (o.observe.length >= 4) {
+          process.stderr.write("dispatch.sh: --observe may be given at most 4 times\n");
+          process.exit(4);
+        }
+        o.observe.push(val(a)); i += 2;
+        break;
       case "--retry-unknown":
         o.retryUnknown = val(a); i += 2;
         if (!o.retryUnknown.trim()) {
@@ -574,6 +587,54 @@ function applyCliCap(o: Opts): void {
   o.route = { label: pick.label, model: pick.model, decided_by: `${o.route.decided_by}-capped`,
     reason: `${status}; router chose ${o.route.label}: ${o.route.reason}`, capped_cli: o.cli };
   o.cli = pick.cli;
+}
+
+// ── #1148 managed spawn decision ────────────────────────────────────────────
+// Every fresh confined claude/codex spawn — explicit --cli included — gets ONE
+// task/sid-bound decision from the package's own resolver (never a copied control
+// workspace), AFTER the cap fallback so a capped CLI re-resolves its whole tuple.
+// The resolver makes no classifier/model call; the explicit path passes no route.
+// Existing-target, dedup and retry paths never reach here. Any resolver failure
+// (crash, timeout, invalid JSON, identity mismatch) refuses before any spawn effect.
+const MODEL_ROUTER = fileURLToPath(new URL("../../../bin/model-router.mjs", import.meta.url));
+const printable = (s: string): string => s.replace(/[^\x20-\x7e]/g, "?").slice(0, 600);
+
+function resolveSpawnDecision(o: Opts, sid: string): void {
+  if (!["claude", "codex"].includes(o.cli) || !o.role || !o.taskId || !o.route) return;
+  const args = [MODEL_ROUTER, "--resolve", "--cli", o.cli, "--sid", sid, "--task", o.taskId, "--role", o.role];
+  if (o.route.decided_by !== "explicit") {
+    args.push("--route-json", JSON.stringify({ model: o.route.model, decided_by: o.route.decided_by }));
+  }
+  for (const file of o.observe) args.push("--observe", file);
+  const r = spawnSync(process.execPath, args, {
+    encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], timeout: 10000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024,
+  });
+  let out: { decision?: unknown; refusal?: { code?: unknown; reason?: unknown } } = {};
+  try { out = JSON.parse(r.stdout || "{}"); } catch { /* reported below */ }
+  if (r.error || r.status !== 0) {
+    const refused = r.status === 4 || r.status === 10;
+    const code = refused && typeof out.refusal?.code === "string" ? out.refusal.code : "MODEL_RESOLVER_FAILED";
+    const reason = refused && typeof out.refusal?.reason === "string" ? out.refusal.reason : `resolver exit ${r.status ?? "none"}`;
+    die(`dispatch.sh: ${printable(code)}: ${printable(reason)}; nothing was spawned`, r.status === 4 ? 4 : 10);
+  }
+  try {
+    o.decision = validateSpawnDecision(out.decision, { cli: o.cli, sid, task: o.taskId });
+  } catch (e) {
+    die(`dispatch.sh: MODEL_RESOLVER_FAILED: ${printable(String(e))}; nothing was spawned`, 10);
+  }
+  // The legacy route fields now name what the argv carries, not a literal default.
+  o.route.model = o.decision.model ?? "omitted";
+  if (o.route.decided_by === "explicit") o.route.label = o.route.model;
+}
+
+/** requested / selected / observed, kept apart, for telemetry and the task ledger. */
+function decisionAudit(d: SpawnDecision): Record<string, unknown> {
+  return {
+    requested: d.requested,
+    selected: { cli: d.cli, model: d.model, effort: d.effort, executable: d.executable },
+    observed: d.observed,
+    decided_by: d.decided_by, evidence_label: d.evidence_label, rationale: d.rationale,
+  };
 }
 
 // ── Rule 34 task-gate (#736) ────────────────────────────────────────────────
@@ -729,6 +790,13 @@ function taskLedgerUpdate(o: Opts, sid: string): void {
       (o.route?.capped_cli ? ` capped_cli=${o.route.capped_cli}` : "");
     const note = (task.note as string) || "";
     task.note = note ? note + stamp : stamp.replace(/^[ |]+/, "");
+    // #1148: the fresh spawn's decision, keyed by sid (requested/selected/observed apart).
+    if (o.decision) {
+      const prior = task.spawn_decisions;
+      const bySid = prior && typeof prior === "object" && !Array.isArray(prior) ? prior as Record<string, unknown> : {};
+      bySid[sid] = { at: isoSeconds(now), ...decisionAudit(o.decision) };
+      task.spawn_decisions = bySid;
+    }
     // Atomic: same-dir temp + rename, so a crash can never truncate the live queue.
     const dir = path.dirname(path.resolve(TASK_QUEUE));
     const tmp = path.join(dir, `.task-queue.${process.pid}.${randomBytes(3).toString("hex")}`);
@@ -1009,8 +1077,10 @@ async function waitForReady(o: Opts, sid: string): Promise<number> {
 function spawnWorkspace(o: Opts, sid: string): void {
   const scope = loadWorkerScope(env.AIGENTRY_WORKER_SCOPE, o.taskId, sid);
   if (!o.role || !["claude", "codex"].includes(o.cli)) die(`dispatch.sh: SANDBOX_CLI_UNSUPPORTED: ${o.cli}; no unrestricted fallback`, 78);
-  const spawnEnv: NodeJS.ProcessEnv = o.route && /^(llm|table)(-capped)?$/.test(o.route.decided_by)
+  const spawnEnv: NodeJS.ProcessEnv = o.route && /^(llm|table)(-capped)?$/.test(o.route.decided_by) && o.decision?.model !== null
     ? { [`AIGENTRY_${o.cli.toUpperCase()}_MODEL`]: o.route.model } : {};
+  // #1148: boot-prepare turns this ONE decision into argv; its launcher export dies at the runner (C3).
+  if (o.decision) spawnEnv.AIGENTRY_SPAWN_DECISION = JSON.stringify(o.decision);
   const childEnv = { ...env, ...spawnEnv };
   // #431 (ADR 2026-05-12 enforcement) — hybrid (b-2)+(c) boot wiring.
   // A failed role boot must never fall back to an unrestricted CLI.
@@ -1025,8 +1095,9 @@ function spawnWorkspace(o: Opts, sid: string): void {
     // Resolve boot from this installed package, even when SCRIPT_DIR is a copied control workspace.
     const bootPrepare = fileURLToPath(new URL("../../../bin/boot-prepare.mjs", import.meta.url));
     if (isExecutable(bootPrepare)) {
-      const r = captureOut("node", [bootPrepare, "--role", o.role, "--cwd", o.cwd, "--sid", sid, "--cli", o.cli, "--confined"], spawnEnv);
-      let parsed: { spawn_cli?: unknown; spawn_cwd?: unknown; argv?: unknown; launch?: unknown } | null = null;
+      const r = captureOut("node", [bootPrepare, "--role", o.role, "--cwd", o.cwd, "--sid", sid, "--cli", o.cli, "--confined"],
+        o.decision ? { ...spawnEnv, AIGENTRY_TASK_ID: o.taskId } : spawnEnv);
+      let parsed: { spawn_cli?: unknown; spawn_cwd?: unknown; argv?: unknown; launch?: unknown; decision?: unknown } | null = null;
       if (r.status === 0 && r.stdout) {
         try {
           parsed = JSON.parse(r.stdout);
@@ -1036,6 +1107,10 @@ function spawnWorkspace(o: Opts, sid: string): void {
       }
       if (parsed && parsed.spawn_cli !== undefined && parsed.spawn_cwd !== undefined &&
           Array.isArray(parsed.argv) && parsed.argv.every(a => typeof a === "string")) {
+        // #1148: the boot must echo exactly this decision (a boot that ignored it is refused).
+        if (o.decision && JSON.stringify(parsed.decision) !== JSON.stringify(o.decision)) {
+          die("dispatch.sh: SANDBOX_BOOT_FAILED: boot-prepare did not apply the spawn decision; unrestricted fallback refused", 78);
+        }
         bootSpawnCli = String(parsed.spawn_cli);
         bootSpawnCwd = String(parsed.spawn_cwd);
         bootArgv = parsed.argv;
@@ -1070,7 +1145,8 @@ function spawnWorkspace(o: Opts, sid: string): void {
     // boot-prepare (#509). display_cli = o.cli (#532) so the guard wrapper's
     // `exec -a <cli>` and telepty visibility match the actual CLI.
     const protectedRoot = path.join(env.AIGENTRY_SESSIONS_ROOT || path.join(os.homedir(), ".aigentry", "sessions"), sid);
-    const sandbox = prepareWorkerSandbox(scope, o.cli, bootSpawnCwd, bootArgv, protectedRoot, o.cwd, workerHooksDir, bootLaunch);
+    const sandbox = prepareWorkerSandbox(scope, o.cli, bootSpawnCwd, bootArgv, protectedRoot, o.cwd, workerHooksDir, bootLaunch,
+      o.decision?.executable);
     launcher = writeWorkerLauncher(sid, o.cli, sandbox.launcher, "", workerHooksDir, spawnEnv);
     spawnCwd = bootSpawnCwd;
   } else {
@@ -1150,7 +1226,7 @@ async function main(argv: string[]): Promise<never> {
 
   resolveRoute(o, sid, skipPreparation || o.retryUnknown !== "");
   const spawned = !skipPreparation && o.spawn && !o.retryUnknown;
-  if (spawned) { applyCliCap(o); spawnWorkspace(o, sid); }
+  if (spawned) { applyCliCap(o); resolveSpawnDecision(o, sid); spawnWorkspace(o, sid); }
 
   emitTelemetry([
     "--helper", "dispatch",
@@ -1162,6 +1238,7 @@ async function main(argv: string[]): Promise<never> {
       cli: o.cli,
       role: o.role,
       route: o.route && { label: o.route.label, decided_by: o.route.decided_by, reason: o.route.reason, capped_cli: o.route.capped_cli },
+      decision: o.decision && decisionAudit(o.decision),
     }),
     "--correlation-id", sid,
   ]);

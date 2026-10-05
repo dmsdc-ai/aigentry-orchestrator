@@ -37,6 +37,17 @@ export const USAGE = `# dispatch.sh — Wraps \`telepty inject\` with REPL-ready
 #   AGENTS.md/GEMINI.md + CODEX_HOME/GEMINI_CLI_HOME shadow home). Omit --role to
 #   use the legacy spawn (back-compat).
 #
+# Spawn decision (#1148): every fresh confined claude|codex spawn, explicit --cli
+#   included, resolves ONE model/effort/executable decision (model-router.mjs
+#   --resolve): no classifier or model call, never --version/--help; one bounded
+#   public docs GET (AIGENTRY_MODEL_METADATA=off skips it; the decision is then
+#   labelled degraded, never current). AIGENTRY_<CLI>_EFFORT, _EXECUTABLE and
+#   _EXECUTABLE_VERSION (and _MODEL with an explicit --cli) are explicit requests,
+#   never substituted. Before any spawn: exit 4 MODEL_TUPLE_INCOMPATIBLE, exit 10
+#   MODEL_NO_ELIGIBLE_TUPLE. Existing-target, dedup and retry never re-resolve.
+#   --observe <file>  (at most 4) operator negative observation, e.g. a recorded
+#                     launch failure; read for this dispatch only, never stored.
+#
 # Registration wait (#727): a freshly spawned worker needs tens of seconds to
 #   appear in \`telepty list\` (workspace boot → CLI boot → bridge registration).
 #   The spawn path polls every 5s up to AIGENTRY_DISPATCH_REGISTER_TIMEOUT_MS

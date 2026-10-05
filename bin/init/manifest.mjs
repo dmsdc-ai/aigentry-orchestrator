@@ -45,6 +45,9 @@ const MANIFEST = [
   "bin/lib/telepty-auth.sh",
   "bin/lib/telepty-listing.sh",
   "bin/lib/workspace-host.sh",
+  // #1148: the router's --resolve path imports these two siblings; one coupled change.
+  "bin/model-evidence.mjs",
+  "bin/model-resolve.mjs",
   "bin/model-router.mjs",
   "bin/open-session.sh",
   "bin/orchestrator-boot.sh",
@@ -76,6 +79,8 @@ const MANIFEST = [
   "CLAUDE.md",
   "docs/rules.md",
   "docs/model-profiles/model-routing-profile.md",
+  // #1148: dated bootstrap/policy metadata the resolver and the classifier retirement gate read.
+  "docs/model-profiles/model-catalog.json",
   // #1181: orchestrator-boot usage and init guidance cite this path. Exact leaf only.
   "docs/setup/orchestrator-boot.md",
   "docs/templates/dispatch-ref-checklist.md",

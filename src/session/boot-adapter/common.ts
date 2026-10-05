@@ -3,9 +3,10 @@
 import * as path from "node:path";
 import type { ResolvedInstructions } from "../resolve-instructions.js";
 import type { SessionContext } from "../types.js";
+import type { SpawnDecision } from "../model-decision.js";
 import { canonicalBytes } from "../persistence/canonical-bytes.js";
 import type { Spawner } from "./spawner.js";
-import { normalizeLaunch } from "./launch-config.js";
+import { CLI_DEFAULT, launchConfig, normalizeLaunch, type LaunchSetting } from "./launch-config.js";
 import {
   BootAdapterError,
   type BootAdapter,
@@ -33,6 +34,18 @@ export function semverGte(installed: string, minimum: string): boolean {
   return !apre;
 }
 
+// #1148: the LaunchConfig v2 a spawn decision implies. An adapter applying a decision
+// builds `launch` from this, so argv and metadata still share one resolution; null
+// model/effort = no flag (cli-default). An env-sourced explicit request keeps its env name.
+export function decisionLaunch(d: SpawnDecision): LaunchConfig {
+  const up = d.cli.toUpperCase();
+  const model: LaunchSetting = d.model === null ? CLI_DEFAULT : { arg: d.model,
+    source: d.decided_by === "explicit" && d.requested.model === d.model ? `env:AIGENTRY_${up}_MODEL` : "default" };
+  const effort: LaunchSetting = d.effort.token === null ? CLI_DEFAULT : { arg: d.effort.token,
+    source: d.effort.state === "explicit" || d.effort.state === "explicit-unverified" ? `env:AIGENTRY_${up}_EFFORT` : "default" };
+  return launchConfig(d.cli, model, effort);
+}
+
 export interface AdapterConfig {
   name: CliKind;
   min_version: string;
@@ -51,6 +64,8 @@ export interface AdapterConfig {
   buildArgvEnv(args: {
     ctx: SessionContext;
     prompt_file: string;
+    // #1148: present only on a resolver-managed spawn; the adapter then reads no env default.
+    decision?: SpawnDecision | undefined;
   }): { argv: readonly string[]; env: Readonly<Record<string, string>>; launch?: LaunchConfig };
 }
 
@@ -89,7 +104,18 @@ export function makeAdapter(cfg: AdapterConfig): BootAdapter {
       resolved: ResolvedInstructions,
       opts: BuildOptions,
     ): Promise<BootCommand> {
-      if (cfg.capabilityProbe) {
+      if (opts.executable || opts.decision) {
+        // #1148: no probe. A known version below the adapter floor is drift; unknown proceeds
+        // (the decision already labels it). The decision must bind the same file.
+        if (!opts.executable || opts.executable.cli !== cfg.name || (opts.decision &&
+          (opts.decision.executable.realpath !== opts.executable.realpath || opts.decision.executable.path !== opts.executable.path))) {
+          throw new BootAdapterError("UNSUPPORTED_CLI", `${cfg.name}: executable binding mismatch`);
+        }
+        if (opts.executable.version !== null && !semverGte(opts.executable.version, cfg.min_version)) {
+          throw new BootAdapterError("CLI_VERSION_DRIFT",
+            `${cfg.name} installed=${opts.executable.version} min=${cfg.min_version}`);
+        }
+      } else if (cfg.capabilityProbe) {
         const { executable, flags } = cfg.capabilityProbe;
         const help = await opts.spawner.run({ argv: [executable, "--help"], env: {},
           cwd: ctx.cwd, prompt_file: "", expected_digest: "" }, "", 5000);
@@ -102,14 +128,19 @@ export function makeAdapter(cfg: AdapterConfig): BootAdapter {
       await opts.fs.mkdirP(opts.staging_dir);
       const prompt_file = path.join(opts.staging_dir, "effective_prompt.md");
       await opts.fs.writeFile(prompt_file, canonicalBytes(resolved.effective_prompt));
-      const { argv, env, launch } = cfg.buildArgvEnv({ ctx, prompt_file });
+      const { argv, env, launch } = cfg.buildArgvEnv({ ctx, prompt_file, decision: opts.decision });
+      const normalized = normalizeLaunch(cfg.name, launch);
+      // #1148: an adapter that did not apply the decision (its metadata differs) never launches.
+      if (opts.decision && JSON.stringify(normalized) !== JSON.stringify(decisionLaunch(opts.decision))) {
+        throw new BootAdapterError("UNSUPPORTED_CLI", `${cfg.name}: adapter did not apply the spawn decision`);
+      }
       return Object.freeze({
-        argv: Object.freeze([...argv]),
+        argv: Object.freeze(opts.executable ? [opts.executable.path, ...argv.slice(1)] : [...argv]),
         env: Object.freeze({ ...env }),
         cwd: ctx.cwd,
         prompt_file,
         expected_digest: resolved.effective_prompt_digest,
-        launch: normalizeLaunch(cfg.name, launch),
+        launch: normalized,
       });
     },
   };

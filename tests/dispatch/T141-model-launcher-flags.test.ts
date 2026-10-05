@@ -49,7 +49,13 @@ for (const cli of ["codex", "grok", "gemini"]) for (const withRole of [false, tr
         argv = bootCommand(f, cli);
         assert.equal(argv[0], cli === "gemini" ? "agy" : cli);
       }
-      if (cli === "codex") assert.deepEqual(argv.slice(1, 7), ["-m", "gpt-6-astra", "-c", "model_reasoning_effort=high", "-c", "check_for_update_on_startup=false"]);
+      // #1148 (contract delta §2/§6 U3): a resolver-managed codex spawn never consults the hidden `high`
+      // literal; the Codex surface documents no default effort, so the flag is omitted. The legacy
+      // boot path (no decision) keeps its literal unchanged.
+      if (cli === "codex" && withRole) {
+        assert.deepEqual(argv.slice(1, 5), ["-m", "gpt-6-astra", "-c", "check_for_update_on_startup=false"]);
+        assert.equal(argv.some((a) => a.startsWith("model_reasoning_effort=")), false);
+      } else if (cli === "codex") assert.deepEqual(argv.slice(1, 7), ["-m", "gpt-6-astra", "-c", "model_reasoning_effort=high", "-c", "check_for_update_on_startup=false"]);
       if (cli === "grok") assert.deepEqual(argv.slice(1, 4), ["--always-approve", "-m", "grok-4.6"]);
       if (cli === "gemini") {
         assert.deepEqual(argv.slice(1, 4), ["--model", "gemini-3.8-flash-high", "--dangerously-skip-permissions"]);

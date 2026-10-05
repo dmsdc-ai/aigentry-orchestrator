@@ -1,8 +1,23 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { REPO, fixture } from "./model-router-fixtures.js";
+import { pathToFileURL } from "node:url";
+import { PROFILE, REPO, ROUTER, fixture } from "./model-router-fixtures.js";
+
+// #1148: the router reads wall time against the catalog's classifier.retire_on no-call cutoff, so every
+// default-classifier case pins the router child's clock with a test-owned `--import` preload written into
+// the fixture root. Only that child sees it; this process, the fake classifier and other tests keep real time.
+const CUTOFF = "2026-10-15T00:00:00.000Z";
+const BEFORE = "2026-10-14T23:59:59.999Z", AFTER = "2026-10-16T00:00:00.000Z";
+function routerAt(f: ReturnType<typeof fixture>, iso: string, args: string[], overrides: NodeJS.ProcessEnv = {}) {
+  const clock = join(f.root, `clock-${Date.parse(iso)}.mjs`);
+  writeFileSync(clock, `const T = ${Date.parse(iso)}, R = Date;\n` +
+    "globalThis.Date = class extends R { constructor(...a) { super(...(a.length ? a : [T])); } static now() { return T; } };\n");
+  return spawnSync(process.execPath, ["--import", pathToFileURL(clock).href, ROUTER, "--role", "coder", "--profile", PROFILE, ...args],
+    { cwd: REPO, env: { ...f.env, ...overrides }, encoding: "utf8", timeout: 20000 });
+}
 
 test("T139: valid classifier JSON maps each allowlisted label exactly", () => {
   const f = fixture();
@@ -85,7 +100,7 @@ test("T139: default Haiku argv, Claude result envelope, rubric, and 4KB ref ceil
   try {
     writeFileSync(join(f.bin, "claude"), readFileSync(f.env.AIGENTRY_ROUTER_CLASSIFIER!, "utf8"), { mode: 0o755 });
     writeFileSync(f.ref, "TASK-FIRST-4KB" + "x".repeat(4096) + "MUST-NOT-REACH-CLASSIFIER");
-    const r = f.router(["--ref", f.ref], { AIGENTRY_ROUTER_CLASSIFIER: "",
+    const r = routerAt(f, BEFORE, ["--ref", f.ref], { AIGENTRY_ROUTER_CLASSIFIER: "",
       CLASSIFIER_REPLY: JSON.stringify({ result: '{"label":"grok-4.6","reason":"small logging task","confidence":0.7}' }) });
     assert.equal(r.status, 0, r.stderr);
     assert.equal(JSON.parse(r.stdout).decided_by, "llm");
@@ -103,4 +118,24 @@ test("T139: default Haiku argv, Claude result envelope, rubric, and 4KB ref ceil
     });
     assert.equal(f.calls(), 1);
   } finally { f.cleanup(); }
+});
+
+test("T139: default classifier is called just before the UTC no-call cutoff and never on/after it", () => {
+  const catalog = JSON.parse(readFileSync(join(REPO, "docs/model-profiles/model-catalog.json"), "utf8"));
+  assert.deepEqual(catalog.classifier, { ...catalog.classifier, model: "claude-haiku-4-5-20251001", retire_on: CUTOFF.slice(0, 10) });
+  for (const [iso, calls] of [[BEFORE, 1], [CUTOFF, 0], [AFTER, 0]] as const) {
+    const f = fixture();
+    try {
+      writeFileSync(join(f.bin, "claude"), readFileSync(f.env.AIGENTRY_ROUTER_CLASSIFIER!, "utf8"), { mode: 0o755 });
+      const r = routerAt(f, iso, ["--ref", f.ref], { AIGENTRY_ROUTER_CLASSIFIER: "",
+        CLASSIFIER_REPLY: JSON.stringify({ result: '{"label":"grok-4.6","reason":"small logging task","confidence":0.7}' }) });
+      assert.equal(r.status, 0, r.stderr);
+      assert.deepEqual(JSON.parse(r.stdout), calls
+        ? { cli: "grok", model: "grok-4.6", label: "grok-4.6", decided_by: "llm", reason: "small logging task", confidence: 0.7 }
+        : { cli: "codex", model: "gpt-6-astra", label: "gpt-6-astra", decided_by: "table", reason: "classifier no-call cutoff reached", confidence: 0 }, iso);
+      assert.equal(r.stderr, calls ? "" : "model-router: classifier no-call cutoff reached; using table\n", iso);
+      assert.equal(f.calls(), calls, iso);
+      assert.equal(existsSync(f.env.PROMPT_LOG!), calls === 1, iso);
+    } finally { f.cleanup(); }
+  }
 });

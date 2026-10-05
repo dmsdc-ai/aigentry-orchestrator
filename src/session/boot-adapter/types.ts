@@ -1,4 +1,5 @@
 // ADR-MF #13 — boot-adapter shared types (ADR §4.5.1 + §4.5.1.1).
+import type { ExecutableBinding, SpawnDecision } from "../model-decision.js";
 import type { ResolvedInstructions } from "../resolve-instructions.js";
 import type { SessionContext } from "../types.js";
 import type { BootFS } from "./boot-fs.js";
@@ -64,6 +65,11 @@ export interface BuildOptions {
   staging_dir: string;
   fs: BootFS;
   spawner: Spawner;
+  // #1148 managed spawn: the resolver-bound executable replaces the `--version` /
+  // capability probe (none is run) and becomes argv[0]; the decision's model/effort
+  // are the only model flags. Both absent = legacy behaviour, unchanged.
+  executable?: ExecutableBinding;
+  decision?: SpawnDecision;
 }
 
 export interface BootAdapter {

@@ -9,8 +9,9 @@
 // redirecting CODEX_HOME to a per-session shadow home (symlink-mirror minus the
 // global doc). boot-prepare.mjs owns the cwd staging + shadow-home build; this
 // adapter only declares the REAL launch flags + the additive descriptor.
-import { makeAdapter } from "./common.js";
+import { decisionLaunch, makeAdapter } from "./common.js";
 import { envOrDefault, launchConfig } from "./launch-config.js";
+import { decisionEffortArgv, decisionModelArgv } from "../model-decision.js";
 
 // Verified-present floor (codex 0.133.0 supports cwd AGENTS.md auto-discovery +
 // --dangerously-bypass-approvals-and-sandbox). semverGte(installed, min) gates,
@@ -36,7 +37,17 @@ export function codexAdapter() {
     contextFile: CODEX_CONTEXT_FILE,
     homeEnv: CODEX_HOME_ENV,
     homeExclude: CODEX_HOME_EXCLUDE,
-    buildArgvEnv: () => {
+    buildArgvEnv: ({ decision }) => {
+      // #1148: a resolver decision carries the exact model/effort; null omits the flag and
+      // no env or literal default is consulted.
+      if (decision) {
+        return {
+          argv: ["codex", ...decisionModelArgv(decision), ...decisionEffortArgv(decision),
+            "-c", "check_for_update_on_startup=false", "--dangerously-bypass-approvals-and-sandbox"],
+          env: {},
+          launch: decisionLaunch(decision),
+        };
+      }
       const model = envOrDefault(process.env, "AIGENTRY_CODEX_MODEL", "gpt-6-astra");
       const effort = envOrDefault(process.env, "AIGENTRY_CODEX_EFFORT", "high");
       return {

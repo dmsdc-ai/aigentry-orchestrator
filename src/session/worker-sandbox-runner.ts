@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
-import { digest, quote, type WorkerManifest } from "./worker-sandbox.js";
+import { assertExecutableIdentity, digest, quote, type WorkerManifest } from "./worker-sandbox.js";
 import { CLAUDE_OAUTH_CHILD, CLAUDE_OAUTH_DIR, CLAUDE_OAUTH_FILE, readClaudeOAuthHandoff } from "./claude-worker-oauth.js";
 
 async function run(m: WorkerManifest, command: string[], capture = false,
@@ -51,6 +51,9 @@ async function main(): Promise<void> {
   if (m.claudeOAuthHandoff !== undefined && (m.cli !== "claude" || m.claudeOAuthHandoff !== handoff)) {
     throw new Error("CLAUDE_OAUTH_HANDOFF_INVALID");
   }
+  // #1148 U4: a sealed executable identity is re-checked on every start (auto-restart
+  // replays this same manifest) and again right before exec; a replaced file refuses.
+  if (m.executable) assertExecutableIdentity(m.executable, m.command[0]!);
   if (!SandboxManager.isSupportedPlatform()) throw new Error("SANDBOX_PLATFORM_UNSUPPORTED");
   // A legacy or unusable canary cannot attest the metadata boundary.
   try {
@@ -85,6 +88,7 @@ async function main(): Promise<void> {
     // Token goes to the worker child env only: not process.env, not m.env, not preflight.
     const secretEnv: Record<string, string> = m.claudeOAuthHandoff === undefined ? {} :
       { [CLAUDE_OAUTH_CHILD]: readClaudeOAuthHandoff(m.claudeOAuthHandoff, handoff) };
+    if (m.executable) assertExecutableIdentity(m.executable, m.command[0]!);
     const result = await run(m, m.command, false, secretEnv);
     fs.writeFileSync(m.receipt, JSON.stringify({ state: "exited", attempt: m.attempt, code: result.code }), { mode: 0o600 });
     process.exitCode = result.code;

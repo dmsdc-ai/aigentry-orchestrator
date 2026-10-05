@@ -32,7 +32,8 @@
 //     "extra_flags": "",
 //     "spawn_cwd":   "<sandbox_path>",
 //     "env":         { "AIGENTRY_TARGET_CWD": "<original_cwd>" },
-//     "launch":      { "v": 2, "cli", "model": {value, source}, "effort": {value, source} }
+//     "launch":      { "v": 2, "cli", "model": {value, source}, "effort": {value, source} },
+//     "decision":    <SpawnDecision>   (#1148; only when AIGENTRY_SPAWN_DECISION was given)
 //   }
 //
 // spawn_cli points at a per-session launcher.sh that EXPORTS env vars then
@@ -476,6 +477,26 @@ async function main() {
     );
   }
 
+  // #1148 U3: a resolver-managed spawn carries ONE complete decision (compact JSON). It
+  // must parse and bind --cli, --sid and AIGENTRY_TASK_ID before any boot effect; a
+  // malformed or mismatched value exits 2 with no fallback. Absent = legacy behaviour.
+  let decision = null;
+  const rawDecision = process.env.AIGENTRY_SPAWN_DECISION;
+  if (rawDecision !== undefined && rawDecision !== "") {
+    let mod;
+    try {
+      mod = await import(pathToFileURL(join(REPO_ROOT, "dist/src/session/model-decision.js")).href);
+    } catch {
+      die(`dist/ not built — run 'npm run build' in ${REPO_ROOT}`, 2);
+    }
+    try {
+      decision = mod.parseSpawnDecision(rawDecision,
+        { cli: args.cli, sid: args.sid, task: process.env.AIGENTRY_TASK_ID ?? "" });
+    } catch (e) {
+      die(`AIGENTRY_SPAWN_DECISION refused: ${String(e?.message ?? e).replace(/[^\x20-\x7e]/g, "?")}`, 2);
+    }
+  }
+
   ensureInstructionsTree();
 
   const distMarker = join(
@@ -571,6 +592,9 @@ async function main() {
     staging_dir: stagingDir,
     fs,
     spawner: nodeSpawner(),
+    // #1148: the bound executable replaces the version/capability probe and is argv[0];
+    // the adapter applies the decision's model/effort (no env/literal default).
+    ...(decision ? { executable: decision.executable, decision } : {}),
   });
 
   if (!existsSync(cmd.prompt_file)) {
@@ -701,6 +725,7 @@ async function main() {
     // #1162 typed LaunchConfig v2 from the adapter that built argv; validated so
     // a missing/invalid record (external adapter) is explicit unknown.
     launch: normalizeLaunch(args.cli, cmd.launch),
+    ...(decision ? { decision } : {}),
   };
   process.stdout.write(JSON.stringify(out) + "\n");
 }

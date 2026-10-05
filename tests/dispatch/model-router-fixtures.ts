@@ -46,6 +46,7 @@ if (process.env.CLASSIFIER_HANG === '1') setInterval(() => {}, 1000);
 else { process.stdout.write(process.env.CLASSIFIER_REPLY || 'invalid'); process.exit(Number(process.env.CLASSIFIER_EXIT || 0)); }
 `);
   for (const cli of ["claude", "codex", "gemini", "grok", "agy"]) script(cli, `
+if (process.argv.length === 3 && ['--version', '--help'].includes(process.argv[2])) require('node:fs').appendFileSync(process.env.CLI_PROBE_LOG, ${JSON.stringify(cli)} + ' ' + process.argv[2] + '\\n');
 if (process.argv.length === 3 && process.argv[2] === '--version') console.log('9.9.9');
 else if (${JSON.stringify(cli)} === 'agy' && process.argv.length === 3 && process.argv[2] === '--help') console.log('--model --dangerously-skip-permissions --prompt-interactive');
 else { require('node:fs').appendFileSync(process.env.WORK_LOG, 'model\\n'); console.error('TEST TRIPWIRE: attempted real CLI launch'); process.exit(99); }
@@ -101,7 +102,11 @@ fs.writeFileSync(manifest.receipt, JSON.stringify({ hash: current.hash, attempt:
     PARENT_MODEL_LOG: join(root, "parent-model"),
     CLASSIFIER_REPLY: '{"label":"gpt-6-astra","reason":"implementation","confidence":0.9}',
     CLASSIFIER_EXIT: "0", CLASSIFIER_HANG: "0", OPEN_LOG: join(root, "open.json"), TELEMETRY_LOG: join(root, "telemetry.jsonl"),
-    CMUX_CAPS_LOG: join(root, "cmux-caps.log") };
+    CMUX_CAPS_LOG: join(root, "cmux-caps.log"),
+    // #1148: per-spawn public model metadata is OFF in every subprocess fixture (no real network);
+    // fresh metadata is exercised only through an injected fake transport. Every `--version`/`--help`
+    // probe of a fake CLI is recorded so the managed path can assert it never probes.
+    AIGENTRY_MODEL_METADATA: "off", CLI_PROBE_LOG: join(root, "cli-probe.log") };
   for (const command of ["apply_patch", "ps", "kill", "pkill", "killall", "launchctl", "open", "osascript", "tmux", "curl", "wget", "ssh", "npm", "npx", "srt"])
     script(command, "require('node:fs').appendFileSync(process.env.WORK_LOG, 'forbidden\\n'); process.exit(99)");
   // #1162: a spawned dispatch publishes agent metadata once (wh-cli agent-meta-set), and the cmux

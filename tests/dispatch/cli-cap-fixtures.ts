@@ -236,6 +236,8 @@ process.exit(0);
     AIGENTRY_CLAUDE_MODEL: "", AIGENTRY_CODEX_MODEL: "", AIGENTRY_GROK_MODEL: "", AIGENTRY_GEMINI_MODEL: "",
     AIGENTRY_GEMINI_BINARY: "agy", AIGENTRY_DISPATCH_REGISTER_TIMEOUT_MS: "0",
     AIGENTRY_WORKER_SCOPE: scopeFile,
+    // #1148: per-spawn public model metadata is OFF here (no real network from a fixture).
+    AIGENTRY_MODEL_METADATA: "off",
     AIGENTRY_SHIM_SCRIPT_DIR: "", DISPATCH_SCRIPT_DIR: "", DISPATCH_REGISTRY_PY: registry,
     REGISTRY_LOG: join(root, "registry.log"), REGISTRY_DB: join(root, "registry.json"),
     COUNTER: join(root, "counter"), PROMPT_LOG: join(root, "prompt"),
