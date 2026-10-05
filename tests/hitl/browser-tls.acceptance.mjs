@@ -11,7 +11,7 @@ import {
   CONSOLE_IDS, CONSOLE_OPS, CONSOLE_PORT, CONSOLE_STAGES, LOGIN_SUBSTAGES, artifactsDir, consoleAcceptance,
   consoleCallerPath, consoleFixtures, consoleOp, consoleStage, invalidConfigRefusal, loginBoundarySnapshot,
   loginSubstage, prepareArtifacts, renderLifecycleVisibility, renderLifecycleWindows,
-  renderLoginBoundary, renderReloadDeepLink, setConsoleStage, unconfiguredRefusal,
+  renderLoginBoundary, renderReloadDeepLink, renderResponsiveLayout, setConsoleStage, unconfiguredRefusal,
   validateConsoleArtifacts,
 } from './console-ui.acceptance.mjs';
 import { COPY_ENV, COPY_PINS, verifyCopy, verifyLoaded } from '../../scripts/ci/acceptance-playwright-core.mjs';
@@ -406,6 +406,13 @@ async function browser(chromium, certs, trusted) {
     // Headed on the Xvfb display. The lifecycle controls observe real tab visibility, which
     // the measured headless run of this exact fixture did not produce. Sandbox, channel and
     // certificate handling are unchanged; only the display mode differs.
+    // #1177 Playwright passes `--hide-scrollbars` itself only when headless (playwright-core
+    // chromium.js:283-289), so going headed silently gave the root a classic scrollbar that takes
+    // layout width: `document.documentElement.clientWidth` then stops equalling the CSS viewport
+    // the `responsive` stage asserts (`rv-layout`). This restores exactly the headless scrollbar
+    // condition that stage was written under; it is a scrollbar setting only, not a visibility,
+    // focus or occlusion one, and no assertion changes.
+    args: ['--hide-scrollbars'],
     channel: 'chromium', headless: false, chromiumSandbox: true, ignoreHTTPSErrors: false,
     // The caller handles both signals through verified cleanup and receipt invalidation.
     // Playwright's own SIGINT handler exits the process before that work completes.
@@ -761,6 +768,12 @@ const NEGATIVE_MS = 6000;
 let transferStep = 'not-started', negativeOutcome = 'not-run', negativeError = 'none';
 let negativeOptionsCode = 0, negativeVerifySeen = -1, positiveVerifyCode = 0;
 let counterPreserved = 'u', sessionCleared = 'u', disposeClean = 'u';
+// #1177 Which of the two teardown calls behind `disposed=n` did not complete, and how: runs
+// fd366a3 and 4a4c726 both print `disposed=n`, which names neither. Closed enum only; no error
+// text is kept. `timeout` is the 5 s bound expiring, `error` is any other rejection.
+const DISPOSE_OUTCOMES = ['not-run', 'ok', 'timeout', 'error'];
+let disposeRemove = 'not-run', disposeDetach = 'not-run';
+const disposeFault = error => (error && error.message === 'deadline' ? 'timeout' : 'error');
 /** Static, clamped a second time here exactly like `renderLoginBoundary`: closed-enum
  *  names, bounded counts, bounded status codes and y/n/u flags only. No check reads it. */
 function renderTransfer() {
@@ -772,7 +785,9 @@ function renderTransfer() {
     + ` error=${negativeError === 'none' || negativeError === 'other' || CEREMONY_ERRORS.includes(negativeError) ? negativeError : 'unknown'}`
     + ` neg-options=${codeT(negativeOptionsCode)} neg-verify-seen=${countT(negativeVerifySeen)}`
     + ` pos-verify=${codeT(positiveVerifyCode)} counter=${flagT(counterPreserved)}`
-    + ` session=${flagT(sessionCleared)} disposed=${flagT(disposeClean)}`;
+    + ` session=${flagT(sessionCleared)} disposed=${flagT(disposeClean)}`
+    + ` dispose-remove=${DISPOSE_OUTCOMES.includes(disposeRemove) ? disposeRemove : 'unknown'}`
+    + ` dispose-detach=${DISPOSE_OUTCOMES.includes(disposeDetach) ? disposeDetach : 'unknown'}`;
 }
 // Counts already-delivered responses for one exact pathname on the caller's own observer.
 // Used for the verify boundary, so the negative is a measured absence of that request and
@@ -795,10 +810,13 @@ async function disposeCounterfactual(owned) {
   if (!owned) return;
   let clean = true;
   if (owned.cdp && owned.authenticatorId) {
-    try { await bounded(owned.cdp.send('WebAuthn.removeVirtualAuthenticator', { authenticatorId: owned.authenticatorId }), 5000); }
-    catch { clean = false; }
+    try { await bounded(owned.cdp.send('WebAuthn.removeVirtualAuthenticator', { authenticatorId: owned.authenticatorId }), 5000); disposeRemove = 'ok'; }
+    catch (error) { clean = false; disposeRemove = disposeFault(error); }
   }
-  if (owned.cdp) { try { await bounded(owned.cdp.detach(), 5000); } catch { clean = false; } }
+  if (owned.cdp) {
+    try { await bounded(owned.cdp.detach(), 5000); disposeDetach = 'ok'; }
+    catch (error) { clean = false; disposeDetach = disposeFault(error); }
+  }
   owned.cdp = null; owned.authenticatorId = null;
   disposeClean = clean ? 'y' : 'n';
   transferStep = 'disposed';
@@ -1331,5 +1349,12 @@ await entry().catch(() => {
   let windows = unknownWindows;
   try { windows = renderLifecycleWindows(); } catch { windows = unknownWindows; }
   process.stderr.write(`browser-tls acceptance: lifecycle-windows (${windows})\n`);
+  // Eighth static line, same discipline, for the op actual CI run 4a4c726 stops in (`rv-layout`):
+  // which viewport was measured, one y/n/u flag per quantity its checks compare, and two clamped
+  // widths. Static names, flags and integers only, re-clamped by the renderer; stderr only; no
+  // check reads it and a renderer fault cannot disturb this handler exit.
+  let layout = 'viewport=unavailable';
+  try { layout = renderResponsiveLayout(); } catch { layout = 'viewport=unavailable'; }
+  process.stderr.write(`browser-tls acceptance: responsive-layout (${layout})\n`);
   process.exitCode = 1;
 });
