@@ -296,6 +296,7 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
 }
 
 export function assertConfinedTarget(stagingRoot: string, sid: string, task: string): void {
+  if (!identity.test(sid)) throw new Error("SANDBOX_TARGET_SID");
   const current = JSON.parse(fs.readFileSync(path.join(stagingRoot, "sandbox-current.json"), "utf8"));
   const raw = fs.readFileSync(current.manifest, "utf8");
   if (digest(raw) !== current.hash) throw new Error("SANDBOX_MANIFEST_CHANGED");
