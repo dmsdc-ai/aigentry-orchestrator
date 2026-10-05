@@ -18,7 +18,9 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const HELPER = join(repoRoot, 'bin', 'worker-inputs.mjs');
 const DIST_DISPATCH = join(repoRoot, 'dist', 'src', 'dispatch', 'cli.js');
 const POSIX = process.platform !== 'win32';
-const posixOnly = POSIX ? {} : { skip: 'POSIX modes/symlinks/signals; Windows proof owed to real CI' };
+// #1167 P7: nothing is skipped on win32. A case that is inherently POSIX registers only there (reason beside it)
+// and the Windows form of its behaviour is its own win32 case; every other case runs on every OS.
+const posixTest = POSIX ? test : () => {};
 const SECRET_CONTENT = 'FIXTURE-SECRET-CONTENT-6f1d';
 const SECRET_ENV = 'FIXTURE-SECRET-ENV-VALUE-91ac';
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -399,7 +401,8 @@ describe('stage', () => {
     assert.equal(existsSync(s2.dest), false);
   });
 
-  test('refuses symlinked leaf, ancestor and source root', posixOnly, () => {
+  // POSIX only: an unprivileged file symlink (Windows needs SeCreateSymbolicLinkPrivilege); win32 form: the junction case below.
+  posixTest('refuses symlinked leaf, ancestor and source root', () => {
     const outside = fresh('outside');
     mkdirSync(outside);
     writeFileSync(join(outside, 'leak.txt'), SECRET_CONTENT);
@@ -425,6 +428,31 @@ describe('stage', () => {
     symlinkSync(real.source, linkRoot);
     const s3 = stage(linkRoot, real.plan);
     refused(s3.r, 'symlink source root');
+    assert.equal(existsSync(s3.dest), false);
+  });
+
+  // win32 form: a directory junction is the reparse point Windows creates unprivileged; as an ancestor or as
+  // the source root it is refused exactly like a symlink, before dest exists.
+  if (!POSIX) test('refuses a junction ancestor and a junction source root (win32 reparse points)', () => {
+    const outside = fresh('outside');
+    mkdirSync(outside);
+    writeFileSync(join(outside, 'leak.txt'), SECRET_CONTENT);
+
+    const anc = fixture('ancestor');
+    symlinkSync(outside, join(anc.source, 'linkdir'), 'junction');
+    const p2 = structuredClone(anc.plan);
+    p2.files.push({ path: 'linkdir/leak.txt', sha256: sha(Buffer.from(SECRET_CONTENT)), mode: 0o644 });
+    const s2 = stage(anc.source, p2);
+    refused(s2.r, 'junction ancestor');
+    assert.match(s2.r.stderr, /"SOURCE_SYMLINK_ANCESTOR"/);
+    assert.equal(existsSync(s2.dest), false);
+
+    const real = fixture('rootreal');
+    const linkRoot = fresh('rootlink');
+    symlinkSync(real.source, linkRoot, 'junction');
+    const s3 = stage(linkRoot, real.plan);
+    refused(s3.r, 'junction source root');
+    assert.match(s3.r.stderr, /"SOURCE_SYMLINK"/);
     assert.equal(existsSync(s3.dest), false);
   });
 
@@ -476,7 +504,7 @@ describe('verify', () => {
     refused(helper(['verify', '--root', out.root, '--manifest', forged, '--sha256', sha(readFileSync(forged))]), 'unknown manifest key');
   });
 
-  test('refuses changed, missing and extra files', posixOnly, () => {
+  test('refuses changed, missing and extra files', () => {
     const changed = staged('changed');
     const f1 = join(changed.out.root, 'README.md');
     makeWritable(f1);
@@ -502,7 +530,8 @@ describe('verify', () => {
     refused(helper(['verify', ...extraDeep.triple]), 'extra nested file');
   });
 
-  test('refuses widened modes and symlink substitution', posixOnly, () => {
+  // POSIX only: mode bits and an unprivileged file symlink; win32 form: the case below.
+  posixTest('refuses widened modes and symlink substitution', () => {
     const widened = staged('widened');
     chmodSync(join(widened.out.root, 'README.md'), 0o666);
     refused(helper(['verify', ...widened.triple]), 'widened file mode');
@@ -515,6 +544,28 @@ describe('verify', () => {
     rmSync(target);
     symlinkSync(copy, target);
     refused(helper(['verify', ...linked.triple]), 'symlink leaf in snapshot');
+  });
+
+  // win32 form: POSIX modes are not observable, so a widened file verifies with the mode check reported
+  // skipped (the helper's documented contract); a junction substituted for a snapshot directory is refused.
+  if (!POSIX) test('win32: widened modes are reported unchecked; a junction substitution is refused', () => {
+    const widened = staged('widened');
+    chmodSync(join(widened.out.root, 'README.md'), 0o666);
+    const w = helper(['verify', ...widened.triple]);
+    ok(w, 'verify widened file (win32)');
+    assert.equal(json(w).modeCheck, 'skipped-win32');
+
+    const linked = staged('linked');
+    const binDir = join(linked.out.root, 'bin');
+    const copy = fresh('bincopy');
+    mkdirSync(copy);
+    writeFileSync(join(copy, 'tool.sh'), readFileSync(join(binDir, 'tool.sh')));
+    makeWritable(join(binDir, 'tool.sh'));
+    rmSync(binDir, { recursive: true });
+    symlinkSync(copy, binDir, 'junction');
+    const r = helper(['verify', ...linked.triple]);
+    refused(r, 'junction directory in snapshot');
+    assert.match(r.stderr, /"SNAPSHOT_SYMLINK"/);
   });
 });
 
@@ -559,7 +610,8 @@ describe('test', () => {
     assert.ok((r.stdout + r.stderr).includes('FIXTURE_FAILED'), 'failing test did not actually run');
   });
 
-  test('a test runner killed by a signal is reported nonzero', posixOnly, () => {
+  // Every OS: on win32 the SIGKILL is TerminateProcess (exit 1, no signal); a killed runner is still nonzero.
+  test('a test runner killed by a signal is reported nonzero', () => {
     const killer = "import test from 'node:test';\ntest('kill runner', () => { process.kill(process.ppid, 'SIGKILL'); });\n";
     const { triple } = staged('signal', { tests: ['tests/kill.test.mjs'], files: {
       'tests/kill.test.mjs': { body: killer, mode: 0o644 },
@@ -579,7 +631,7 @@ describe('test', () => {
     }
   });
 
-  test('preflight verify failure runs nothing', posixOnly, () => {
+  test('preflight verify failure runs nothing', () => {
     const { triple, out } = staged('pre');
     chmodSync(out.root, 0o755);
     writeFileSync(join(out.root, 'extra.txt'), 'x');
@@ -624,10 +676,15 @@ describe('dispatch --input-* preflight (no side effects on refusal)', () => {
     return p;
   };
   const calls = () => (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
+  // win32 runs the registry as `python <file>` (registryInvocation), so its fake is Python with the same log and replies.
+  const REGISTRY_FAKE = POSIX ? 'registry.cjs' : 'registry.py';
 
   function setup() {
     mkdirSync(fakeDir, { recursive: true });
     fake('registry.cjs', "if (process.argv[2] === 'check-dedup') { process.stdout.write('{}'); process.exit(0); } process.exit(9);");
+    if (!POSIX) writeFileSync(join(fakeDir, 'registry.py'), 'import json, sys\n' +
+      `with open(${JSON.stringify(log)}, 'a', encoding='utf-8') as f: f.write(json.dumps(['registry.py', *sys.argv[1:]]) + '\\n')\n` +
+      "if sys.argv[1:2] == ['check-dedup']:\n    sys.stdout.write('{}')\n    sys.exit(0)\nsys.exit(9)\n");
     fake('telepty.cjs', 'process.exit(1);');
     fake('open-session.cjs', 'process.exit(1);');
     fake('telemetry.cjs', 'process.exit(0);');
@@ -653,7 +710,7 @@ describe('dispatch --input-* preflight (no side effects on refusal)', () => {
         AIGENTRY_SESSIONS_ROOT: join(home, 'sessions'),
         AIGENTRY_TASK_GATE: 'off', AIGENTRY_MODEL_METADATA: 'off',
         DISPATCH_SCRIPT_DIR: fakeDir,
-        DISPATCH_REGISTRY_PY: join(fakeDir, 'registry.cjs'),
+        DISPATCH_REGISTRY_PY: join(fakeDir, REGISTRY_FAKE),
         TELEPTY: join(fakeDir, 'telepty.cjs'),
         OPEN_SESSION_SH: join(fakeDir, 'open-session.cjs'),
         EMIT_TELEMETRY_MJS: join(fakeDir, 'telemetry.cjs'),
@@ -662,7 +719,7 @@ describe('dispatch --input-* preflight (no side effects on refusal)', () => {
     return { status: r.status, signal: r.signal, stderr: r.stderr ?? '', calls: calls() };
   }
 
-  const sideEffects = (cs) => cs.filter((c) => !(c[0] === 'registry.cjs' && c[1] === 'check-dedup'));
+  const sideEffects = (cs) => cs.filter((c) => !(c[0] === REGISTRY_FAKE && c[1] === 'check-dedup'));
 
   test('compiled dispatch is present (run after tsc, as scripts/run-tests.mjs does)', () => {
     assert.ok(existsSync(DIST_DISPATCH), `missing ${DIST_DISPATCH}; build with tsc first`);
@@ -674,7 +731,8 @@ describe('dispatch --input-* preflight (no side effects on refusal)', () => {
     for (const f of ['--input-root', '--input-manifest', '--input-sha256']) assert.ok(r.stdout.includes(f), `--help lacks ${f}`);
   });
 
-  test('omitted triple keeps current behaviour; valid triple behaves identically', posixOnly, () => {
+  // Every OS: on win32 the fake router's SIGKILL is TerminateProcess, identical for both runs compared here.
+  test('omitted triple keeps current behaviour; valid triple behaves identically', () => {
     const ref = setup();
     const { triple } = staged('dispatch-ok');
     const triple3 = ['--input-root', triple[1], '--input-manifest', triple[3], '--input-sha256', triple[5]];
@@ -686,7 +744,8 @@ describe('dispatch --input-* preflight (no side effects on refusal)', () => {
     assert.equal(withInputs.status, plain.status);
   });
 
-  test('invalid or partial triple aborts nonzero before router, spawn, inject, telemetry or tracker', posixOnly, () => {
+  // Every OS: on win32 a router kill carries no signal, so sideEffects (which logs the router call) is the proof.
+  test('invalid or partial triple aborts nonzero before router, spawn, inject, telemetry or tracker', () => {
     const ref = setup();
     const { triple, out } = staged('dispatch-bad');
     const cases = {

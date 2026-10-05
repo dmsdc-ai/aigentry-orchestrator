@@ -8,8 +8,8 @@
 // sole acceptance signal.
 //
 // Every group runs by default on every supported host — there is no opt-in arm
-// and nothing is skipped on darwin or linux. The single exclusion is win32, and
-// it is declared, not silently green: see PLATFORM_SKIP.
+// and nothing is skipped on any OS. win32 runs the same groups through another
+// fixture and reads the decision from the platform refusal: see WIN32.
 //
 // GROUPS: [target] existing-target semantics · [652] absolute staged ref ·
 // [spawn] the fresh-spawn cap matrix.
@@ -18,20 +18,52 @@ import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import type { SpawnSyncReturns } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { isAbsolute } from "node:path";
-import { fixture, audit, liveRows, type CapFixture, type DispatchStartPayload } from "./cli-cap-fixtures.js";
+import { isAbsolute, join } from "node:path";
+import { fixture as capFixture, audit, liveRows, type CapFixture, type DispatchStartPayload, type RoutePayload } from "./cli-cap-fixtures.js";
+import { fixture as routerFixture, type Decided } from "./model-router-fixtures.js";
 
-// Explicit platform exclusion, with the exact reason. The fixture drives the
-// product through POSIX shebang launchers (`#!/usr/bin/env node` stubs and an
-// `exec -a <cli>` bash guard launcher, which is also the shape `cliKindOf()`
-// classifies), and the worker sandbox this suite exercises is POSIX-only —
-// package.json declares `os: ["darwin", "linux"]`. Real Windows execution is
-// therefore not achievable here. It is excluded by name rather than faked or
-// silently passed; the native Windows gate remains outstanding and is tracked
-// separately from this suite, exactly as scripts/run-tests.mjs treats win32.
-const PLATFORM_SKIP: string | false = process.platform === "win32"
-  ? "excluded on win32: POSIX shebang/`exec -a` launchers and a POSIX-only worker sandbox (package.json os=[darwin,linux]); real Windows execution is unverified here and the native Windows gate is outstanding"
-  : false;
+// #1167 P6/P7: win32 runs every group, not a skip. cli-cap-fixtures is POSIX-shaped (":" PATH, a shebang
+// registry stub), so win32 drives the same product CLI through the win32-ready model-router fixture (.cmd
+// shims, real registry, fake cmux) with a recording telepty. The cap decision is made exactly as on POSIX;
+// a fresh confined spawn then refuses (SANDBOX_PLATFORM_UNSUPPORTED, exit 78) before any effect, and emits
+// no dispatch_start, so its audited decision is read from that refusal. --target runs to delivery unchanged.
+const WIN32 = process.platform === "win32";
+const SPAWN_EXIT = WIN32 ? 78 : 0;
+type Win32CapFixture = CapFixture & { refused: (r: SpawnSyncReturns<string>) => Decided };
+
+function win32Fixture(): Win32CapFixture {
+  const f = routerFixture();
+  const injectArgs = join(f.root, "inject-args.json");
+  const telepty = f.script("telepty-inject-args", `
+if (process.argv[2] === 'list') console.log(process.env.LIVE_SESSIONS || JSON.stringify([{id: 'router-fixture', command: process.env.OBSERVED_CLI || 'codex'}]));
+else if (process.argv[2] === 'inject') {
+  require('node:fs').writeFileSync(process.env.INJECT_ARGS, JSON.stringify(process.argv.slice(2)));
+  console.log('stub inject OK');
+}
+else process.exit(99);
+`);
+  return {
+    root: f.root, bin: f.bin, aig: f.aig, ref: f.ref, queue: f.queue, env: { ...f.env, TELEPTY: telepty, INJECT_ARGS: injectArgs },
+    script: f.script, liveLauncher: f.liveLauncher, spawnArgs: f.spawnArgs, calls: f.calls, refused: f.refused,
+    dispatch: (args = [], overrides = {}) => f.dispatch(args, { TELEPTY: telepty, INJECT_ARGS: injectArgs, ...overrides }),
+    makeExistingTarget: () => {
+      f.prepareTarget();
+      const stagingRoot = join(f.aig, "sessions", "router-fixture");
+      return { sid: "router-fixture", sealedHome: join(stagingRoot, "fixture-home"), stagingRoot };
+    },
+    cleanup: async () => f.cleanup(),
+  };
+}
+const fixture: () => CapFixture = WIN32 ? win32Fixture : capFixture;
+
+/** win32: the decision the refusal names, in the shape POSIX reads from dispatch_start and the ledger note. */
+function refusedAudit(f: CapFixture, r: SpawnSyncReturns<string>): { payload: DispatchStartPayload; note: string } {
+  const d = (f as Win32CapFixture).refused(r);
+  const route: RoutePayload = { decided_by: d.decided_by ?? "", ...(d.model === null ? {} : { model: d.model }),
+    ...(d.capped_cli === undefined ? {} : { capped_cli: d.capped_cli }) };
+  return { payload: { cli: d.cli, route },
+    note: `cli=${d.cli}/${d.model ?? "unknown"} by=${d.decided_by}${d.capped_cli ? ` capped_cli=${d.capped_cli}` : ""}` };
+}
 
 const OPUS = '{"label":"opus-5","reason":"judgment","confidence":0.9}';
 
@@ -49,13 +81,13 @@ async function spawnRun(
   const f = fixture();
   try {
     const r = f.dispatch([...f.spawnArgs, ...args], overrides(f));
-    return { r, ...audit(f) };
+    return { r, ...(WIN32 ? refusedAudit(f, r) : audit(f)) };
   } finally { await f.cleanup(); }
 }
 
 // ── [target] existing-target semantics ──────────────────────────────────────
 
-describe("[target] existing-target semantics are cap-exempt", { skip: PLATFORM_SKIP }, () => {
+describe("[target] existing-target semantics are cap-exempt", () => {
   for (const live of [4, 8, 16]) {
     test(`--target with ${live} live claude sessions never applies a cap`, async () => {
       const f = fixture();
@@ -91,7 +123,7 @@ describe("[target] existing-target semantics are cap-exempt", { skip: PLATFORM_S
 
 // ── [652] absolute staged-ref locator must be preserved ─────────────────────
 
-describe("[652] staged ref is delivered as an absolute path inside the sealed HOME", { skip: PLATFORM_SKIP }, () => {
+describe("[652] staged ref is delivered as an absolute path inside the sealed HOME", () => {
   test("inject argv carries an absolute [context-ref], not a tilde or relative path", async () => {
     const f = fixture();
     try {
@@ -115,7 +147,7 @@ describe("[652] staged ref is delivered as an absolute path inside the sealed HO
 
 // ── [spawn] the fresh-spawn cap matrix ──────────────────────────────────────
 
-describe("[spawn] no implicit count ceiling for missing / empty / unlimited config", { skip: PLATFORM_SKIP }, () => {
+describe("[spawn] no implicit count ceiling for missing / empty / unlimited config", () => {
   // CONTRACT: absent or empty AIGENTRY_CLI_CAP_<CLI> means NO implicit ceiling,
   // for EVERY CLI. The pre-#1148 behaviour violated this (codex 2 / claude 4).
   const knobs: [string, string | undefined][] = [["missing", undefined], ["empty", ""], ["unlimited", "unlimited"]];
@@ -130,7 +162,7 @@ describe("[spawn] no implicit count ceiling for missing / empty / unlimited conf
           ...(reply ? { CLASSIFIER_REPLY: reply } : {}),
           ...(knob === undefined ? {} : { [knobVar]: knob }),
         }));
-        assert.equal(r.status, 0, r.stderr);
+        assert.equal(r.status, SPAWN_EXIT, r.stderr);
         assert.equal(payload.cli, cli, `expected no cap, got route ${JSON.stringify(payload.route)}`);
         assert.equal(payload.route.capped_cli, undefined);
         assert.doesNotMatch(payload.route.decided_by, /-capped$/);
@@ -143,20 +175,20 @@ describe("[spawn] no implicit count ceiling for missing / empty / unlimited conf
   for (const n of [3, 5, 9]) {
     test(`claude: ${n} live with no config exceeds old default 4 without capping`, async () => {
       const { r, payload } = await spawnRun((f) => ({ LIVE_SESSIONS: liveRows(f, "claude", n), CLASSIFIER_REPLY: OPUS }));
-      assert.equal(r.status, 0, r.stderr);
+      assert.equal(r.status, SPAWN_EXIT, r.stderr);
       assert.equal(payload.cli, "claude");
       assert.equal(payload.route.capped_cli, undefined);
     });
     test(`codex: ${n} live with no config exceeds old default 2 without capping`, async () => {
       const { r, payload } = await spawnRun((f) => ({ LIVE_SESSIONS: liveRows(f, "codex", n) }));
-      assert.equal(r.status, 0, r.stderr);
+      assert.equal(r.status, SPAWN_EXIT, r.stderr);
       assert.equal(payload.cli, "codex");
       assert.equal(payload.route.capped_cli, undefined);
     });
   }
 });
 
-describe("[spawn] finite numeric opt-in quotas keep working unchanged", { skip: PLATFORM_SKIP }, () => {
+describe("[spawn] finite numeric opt-in quotas keep working unchanged", () => {
   // A numeric knob is an explicit opt-in and MUST still cap, including 0.
   const quotas: [string, number, boolean][] = [
     ["0", 0, true], ["1", 1, true], ["2", 2, true], ["3", 2, false], ["8", 3, false], ["8", 8, true],
@@ -167,7 +199,7 @@ describe("[spawn] finite numeric opt-in quotas keep working unchanged", { skip: 
       const { r, payload, note } = await spawnRun((f) => ({
         AIGENTRY_CLI_CAP_CODEX: quota, LIVE_SESSIONS: liveRows(f, "codex", live),
       }));
-      assert.equal(r.status, 0, r.stderr);
+      assert.equal(r.status, SPAWN_EXIT, r.stderr);
       if (capped) {
         assert.equal(payload.route.capped_cli, "codex");
         assert.match(payload.route.decided_by, /-capped$/);
@@ -184,13 +216,13 @@ describe("[spawn] finite numeric opt-in quotas keep working unchanged", { skip: 
     const { r, payload } = await spawnRun((f) => ({
       AIGENTRY_CLI_CAP_CODEX: "0", LIVE_SESSIONS: liveRows(f, "codex", 0),
     }));
-    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.status, SPAWN_EXIT, r.stderr);
     assert.equal(payload.route.capped_cli, "codex");
     assert.notEqual(payload.cli, "codex");
   });
 });
 
-describe("[spawn] explicit --cli stays compatible: warn and proceed", { skip: PLATFORM_SKIP }, () => {
+describe("[spawn] explicit --cli stays compatible: warn and proceed", () => {
   const explicit: [string, string, number][] = [["codex", "1", 2], ["claude", "2", 4], ["codex", "0", 0]];
 
   for (const [cli, quota, live] of explicit) {
@@ -198,7 +230,7 @@ describe("[spawn] explicit --cli stays compatible: warn and proceed", { skip: PL
       const { r, payload, note } = await spawnRun((f) => ({
         [`AIGENTRY_CLI_CAP_${cli.toUpperCase()}`]: quota, LIVE_SESSIONS: liveRows(f, cli, live),
       }), ["--cli", cli, "--role", "coder"]);
-      assert.equal(r.status, 0, r.stderr);
+      assert.equal(r.status, SPAWN_EXIT, r.stderr);
       // Explicit choice is honoured: the CLI is NOT rewritten and NOT marked capped.
       assert.equal(payload.cli, cli);
       assert.equal(payload.route.decided_by, "explicit");
@@ -213,7 +245,7 @@ describe("[spawn] explicit --cli stays compatible: warn and proceed", { skip: PL
     const { r, payload } = await spawnRun((f) => ({
       LIVE_SESSIONS: liveRows(f, "claude", 9),
     }), ["--cli", "claude", "--role", "coder"]);
-    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.status, SPAWN_EXIT, r.stderr);
     assert.equal(payload.cli, "claude");
     assert.doesNotMatch(r.stderr, /at cap/);
   });
@@ -223,13 +255,13 @@ describe("[spawn] explicit --cli stays compatible: warn and proceed", { skip: PL
 // requires these be reported explicitly rather than guessed, so this records the
 // observed decision for the contract owner instead of encoding a guess. The
 // asserted malformed contract lives in the two groups below.
-describe("[spawn] malformed knob behaviour is recorded, not guessed", { skip: PLATFORM_SKIP }, () => {
+describe("[spawn] malformed knob behaviour is recorded, not guessed", () => {
   for (const bad of ["abc", " ", "-1", "2.5", "1e1", "Infinity", "null"]) {
     test(`AIGENTRY_CLI_CAP_CODEX=${JSON.stringify(bad)} -> observed decision is recorded`, async () => {
       const { r, payload } = await spawnRun((f) => ({
         AIGENTRY_CLI_CAP_CODEX: bad, LIVE_SESSIONS: liveRows(f, "codex", 3),
       }));
-      assert.equal(r.status, 0, r.stderr);
+      assert.equal(r.status, SPAWN_EXIT, r.stderr);
       console.log(`  OBSERVED knob=${JSON.stringify(bad)} live=3 -> cli=${payload.cli} decided_by=${payload.route.decided_by} capped_cli=${payload.route.capped_cli ?? "none"}`);
       // The one thing the contract forbids outright — silently manufacturing a
       // count cap out of a malformed value — is asserted in the group below.
@@ -239,13 +271,13 @@ describe("[spawn] malformed knob behaviour is recorded, not guessed", { skip: PL
   }
 });
 
-describe("[spawn] 'unlimited' is case-insensitive and whitespace-tolerant", { skip: PLATFORM_SKIP }, () => {
+describe("[spawn] 'unlimited' is case-insensitive and whitespace-tolerant", () => {
   for (const literal of ["unlimited", "UNLIMITED", "Unlimited", "uNlImItEd", "  unlimited  "]) {
     test(`AIGENTRY_CLI_CAP_CODEX=${JSON.stringify(literal)} with 9 live -> no ceiling`, async () => {
       const { r, payload } = await spawnRun((f) => ({
         AIGENTRY_CLI_CAP_CODEX: literal, LIVE_SESSIONS: liveRows(f, "codex", 9),
       }));
-      assert.equal(r.status, 0, r.stderr);
+      assert.equal(r.status, SPAWN_EXIT, r.stderr);
       assert.equal(payload.cli, "codex", `expected no ceiling, got route ${JSON.stringify(payload.route)}`);
       assert.equal(payload.route.capped_cli, undefined);
       assert.doesNotMatch(payload.route.decided_by, /-capped$/);
@@ -259,14 +291,14 @@ describe("[spawn] 'unlimited' is case-insensitive and whitespace-tolerant", { sk
       const { r, payload } = await spawnRun((f) => ({
         AIGENTRY_CLI_CAP_CODEX: ws, LIVE_SESSIONS: liveRows(f, "codex", 3),
       }));
-      assert.equal(r.status, 0, r.stderr);
+      assert.equal(r.status, SPAWN_EXIT, r.stderr);
       assert.equal(payload.cli, "codex", `whitespace knob manufactured a cap: ${JSON.stringify(payload.route)}`);
       assert.equal(payload.route.capped_cli, undefined);
     });
   }
 });
 
-describe("[spawn] malformed knob: no ceiling + one STATIC warning per knob", { skip: PLATFORM_SKIP }, () => {
+describe("[spawn] malformed knob: no ceiling + one STATIC warning per knob", () => {
   const WARN = /dispatch\.sh: WARNING AIGENTRY_CLI_CAP_CODEX is set to an invalid value[^\n]*\n/g;
 
   for (const bad of ["abc", "null", "2.5.1", "one", "12abc"]) {
@@ -274,7 +306,7 @@ describe("[spawn] malformed knob: no ceiling + one STATIC warning per knob", { s
       const { r, payload } = await spawnRun((f) => ({
         AIGENTRY_CLI_CAP_CODEX: bad, LIVE_SESSIONS: liveRows(f, "codex", 9),
       }));
-      assert.equal(r.status, 0, r.stderr);
+      assert.equal(r.status, SPAWN_EXIT, r.stderr);
       // No manufactured ceiling: the audited decision still routes codex.
       assert.equal(payload.cli, "codex", `malformed value manufactured a cap: ${JSON.stringify(payload.route)}`);
       assert.equal(payload.route.capped_cli, undefined);
@@ -289,7 +321,7 @@ describe("[spawn] malformed knob: no ceiling + one STATIC warning per knob", { s
     const { r } = await spawnRun((f) => ({
       AIGENTRY_CLI_CAP_CODEX: `abc ${marker}`, LIVE_SESSIONS: liveRows(f, "codex", 3),
     }));
-    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.status, SPAWN_EXIT, r.stderr);
     const warnings = r.stderr.match(WARN) || [];
     assert.equal(warnings.length, 1, `warning not emitted exactly once:\n${r.stderr}`);
     // Static: byte-identical to the same warning produced by a different value.
@@ -300,7 +332,7 @@ describe("[spawn] malformed knob: no ceiling + one STATIC warning per knob", { s
   });
 });
 
-describe("[spawn] untrusted knob bytes never reach the operator stream", { skip: PLATFORM_SKIP }, () => {
+describe("[spawn] untrusted knob bytes never reach the operator stream", () => {
   // The knob is untrusted input and stderr is an operator terminal and a log.
   // A newline could forge a second log line, an ANSI escape could rewrite the
   // terminal, and a mis-set secret must not be replayed. None may appear.
@@ -317,7 +349,7 @@ describe("[spawn] untrusted knob bytes never reach the operator stream", { skip:
       const { r, payload } = await spawnRun((f) => ({
         AIGENTRY_CLI_CAP_CODEX: value, LIVE_SESSIONS: liveRows(f, "codex", 3),
       }));
-      assert.equal(r.status, 0, r.stderr);
+      assert.equal(r.status, SPAWN_EXIT, r.stderr);
       assert.ok(!r.stderr.includes(marker), `synthetic secret marker replayed to stderr:\n${r.stderr}`);
       assert.ok(!/\u001b/.test(r.stderr), `ANSI escape byte reached stderr:\n${JSON.stringify(r.stderr)}`);
       assert.ok(!r.stderr.includes("FORGED LINE"), `newline forged a log line:\n${r.stderr}`);
