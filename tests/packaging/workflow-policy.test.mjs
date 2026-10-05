@@ -119,7 +119,8 @@ function checkFreshSession(d) {
   negatedOnly(problems, 'rules Rule 12', r12, [['forced Enter', FORCE_ENTER], ['readiness bypass', READINESS_BYPASS], ['permission expansion', PERMISSION_EXPANSION]]);
   const r121 = section(d.rules, /^### Rule 12-1\./);
   need(problems, 'rules Rule 12-1', r121, /\/clear/, /신규 세션|new session/i);
-  const a12 = needSection(problems, 'AGENTS Rule 12 checklist', lineOf(d.agents, /^- \[ \].*Rule 12/));
+  // 2026-10-05: the Rule 12 row moved from the gate list to the non-gating reference list (no checkbox).
+  const a12 = needSection(problems, 'AGENTS Rule 12 checklist', lineOf(d.agents, /^- (\[ \] )?.*Rule 12/));
   need(problems, 'AGENTS Rule 12', a12, /\/clear/, /신규 프로세스|new process/i, /빈 대화|empty conversation/i, /격리|confinement|task\/sid\/attempt/i, /재사용|reuse/i);
   negatedOnly(problems, 'AGENTS Rule 12', a12, [['forced Enter', FORCE_ENTER], ['readiness bypass', READINESS_BYPASS]]);
   const s12 = needSection(problems, 'skill Rule 12 paragraph', paragraphs(d.skill).filter(p => /Rule 12\b/.test(p) && !HISTORICAL.test(p)).join('\n\n'));
@@ -277,7 +278,7 @@ const M = [
   ['rules Rule 12 drops task/sid/attempt binding', 'rules', inSection(/^## Rule 12\./, s => s.replace(/task\/sid\/attempt/g, 'task')), checkFreshSession],
   ['rules Rule 12 grants forced Enter/readiness skip', 'rules', inSection(/^## Rule 12\./, append('검증된 신규 세션은 강제 Enter로 준비 검사 생략이 허용된다.')), checkFreshSession],
   ['rules Rule 12 drops the expansion prohibition', 'rules', inSection(/^## Rule 12\./, dropSentences(/강제 Enter|준비 검사 생략|권한 확대/)), checkFreshSession],
-  ['AGENTS Rule 12 checklist drops reuse/forced-Enter limit', 'agents', t => t.split('\n').map(l => (/^- \[ \].*Rule 12/.test(l) ? dropSentences(/강제 Enter|재사용/)(l) : l)).join('\n'), checkFreshSession],
+  ['AGENTS Rule 12 checklist drops reuse/forced-Enter limit', 'agents', t => t.split('\n').map(l => (/^- (\[ \] )?.*Rule 12/.test(l) ? dropSentences(/강제 Enter|재사용/)(l) : l)).join('\n'), checkFreshSession],
   ['skill Rule 12 drops no-resumed-history binding', 'skill', t => t.replace(/no resumed history|not resumed|without resum\w*/gi, 'any history'), checkFreshSession],
   ['skill grants forced Enter for fresh sessions', 'skill', t => `${t}\nA verified fresh session may force Enter and bypass readiness.\n`, checkFreshSession],
   ['skill drops literal bounded status command', 'skill', t => t.replaceAll('bin/dispatch-tracker.sh status --json --live --limit 100', 'bin/dispatch-tracker.sh status --json'), checkStatusClauses],
@@ -332,10 +333,15 @@ test('mutation must fail: runner registration removed, duplicated or made condit
 // ======================= Rule 24 (2026-09-21 human-approved revision) =======================
 // Literal policy regression only: guards against (a) the per-spec re-approval rule returning and
 // (b) the in-scope autonomy widening into blanket auto-approval. Not a general NLP/security claim.
+// 2026-10-05 (human decision D-C, task #1194): human approval narrowed to five categories; new
+// architecture is a technical choice, so (c) guards against the old "new architecture needs approval".
 const PER_SPEC_REAPPROVAL = [/스펙 선작성 \+ 사용자 승인/, /스펙 선작성\s*→\s*(오케스트레이터 경유\s*)?사용자 승인\s*→\s*구현/,
   /오케스트레이터가 사용자에게 제시\s*→\s*사용자 승인/];
 const BLANKET = /자동 승인|auto-?approv|blanket approv|모든 (변경|작업|설계)[^.\n]{0,30}(자율|승인 없이)|all (changes|work|designs)[^.\n]{0,30}(autonomous|without (further )?approval)/i;
 const REVIEW_AS_CONSENT = /(controller|오케스트레이터)[^.\n]{0,30}(review|판단)[^.\n]{0,30}(counts as|is|으로 기록|으로 간주)[^.\n]{0,20}(human consent|user approval|사용자 승인)/i;
+const NEW_ARCH = /새 아키텍처|new architecture/i;
+const ARCH_APPROVAL = /Rule 47|사용자 승인|별도 승인|human approval|user approval|require/i;
+const ARCH_DECIDED = /오케스트레이터가[^.\n]{0,40}결정|decided by the orchestrator|삭제|removed/i;
 function checkRule24(d) {
   const problems = [];
   const r24 = needSection(problems, 'rules Rule 24', section(d.rules, /^## Rule 24\./));
@@ -350,18 +356,53 @@ function checkRule24(d) {
   for (const [label, t] of [['rules Rule 24', r24], ['AGENTS Rule 24', a24], ['skill Rule 24', s24]]) {
     for (const re of PER_SPEC_REAPPROVAL) if (re.test(flat(t))) problems.push(`${label}: per-spec re-approval rule returned: ${re}`);
   }
-  // (b) no blanket approval: separate approval, pending designs, SPEC/evidence review, honest attribution
-  want('rules Rule 24', r24, /새 아키텍처·권한 확대·비용·개인정보·파괴적 변경은 Rule 47/, /대기 중인 해당 설계도[^.]{0,30}승인되지 않/,
+  // (b) no blanket approval: the five human-approval categories (human decision D-C, 2026-10-05), the
+  // pending-design carve-out for those categories, SPEC/evidence review, honest attribution
+  want('rules Rule 24', r24, /사용자 승인은 Rule 47의 다섯 범주\(비용·개인정보 전송·권한 확대·운영 데이터 변경\/삭제·프로덕션 배포\)에만 필요하다/,
+    /그 설계 중 다섯 범주에 닿는 부분은 이 결정만으로 승인되지 않는다/,
     /오케스트레이터 판단을 새로운 사용자 승인으로 기록하지 않/, /미승인 설계/, /스펙 생략, 범위 확대 또는 미검증 완료 선언을 허용하는 예외가 아니다/);
-  want('AGENTS Rule 24', a24, /새 아키텍처·권한·비용·개인정보·파괴적 변경과 기존 대기 설계는 별도 승인/, /implement 금지, 스펙 먼저/);
-  want('skill Rule 24', s24, /New architecture, authority, cost, privacy or destructive changes still require Rule 47 approval/,
-    /existing pending designs are not approved/, /distinguish controller review from human consent/, /SPEC FIRST\/HOLD/);
+  want('AGENTS Rule 24', a24, /Rule 47의 다섯 범주\(비용·개인정보 전송·권한 확대·운영 데이터 변경\/삭제·프로덕션 배포\)만 별도 사용자 승인/, /implement 금지, 스펙 먼저/);
+  want('skill Rule 24', s24, /Only cost, private-data transfer, privilege expansion, changing or deleting operating data and production deployment require Rule 47 human approval/,
+    /distinguish controller review from human consent/, /A design waiting on one of those approvals remains SPEC FIRST\/HOLD/);
   for (const [label, t] of [['rules Rule 24', r24], ['AGENTS Rule 24', a24], ['skill Rule 24', s24]]) {
     for (const s of sentences(t)) {
       if ((BLANKET.test(s) || REVIEW_AS_CONSENT.test(s)) && !NEGATION.test(s)) problems.push(`${label}: blanket approval/consent inflation: ${s.slice(0, 160)}`);
+      // (c) D-C: new architecture is a technical choice; a sentence that puts it behind human approval must not return.
+      if (NEW_ARCH.test(s) && ARCH_APPROVAL.test(s) && !ARCH_DECIDED.test(s)) problems.push(`${label}: new architecture behind human approval returned: ${s.slice(0, 160)}`);
     }
   }
   return problems;
+}
+
+// ======================= authority sentence (human decision D-C, 2026-10-05) =======================
+// Literal regression only: Rule 47 §1 carries the one authority sentence and Rule 30's user-interaction
+// table no longer lists technical choices (RCA #1192 part B §6.4 (i)).
+const REMOVED_R30_ROWS = /^\|\s*(Architecture \/ design decision|Verdict 분기|Cross-LLM verification trigger|Commit \/ push)/;
+function checkAuthority(d) {
+  const problems = [];
+  const r47 = needSection(problems, 'rules Rule 47', section(d.rules, /^## Rule 47\./));
+  need(problems, 'rules Rule 47', r47, /기술 선택은 오케스트레이터가 결정하고 그 근거를 소유 태스크에 기록하며, 사람의 승인은 비용·개인정보 전송·권한 확대·운영 데이터 변경\/삭제·프로덕션 배포에만 필요하다/,
+    /state\/decision-queue\.md/, /침묵이나 기한 경과로 승인되지 않는다/);
+  const r30 = needSection(problems, 'rules Rule 30', section(d.rules, /^### Rule 30\./));
+  for (const l of r30.split('\n')) if (REMOVED_R30_ROWS.test(l)) problems.push(`rules Rule 30: technical-choice row returned: ${l.slice(0, 120)}`);
+  return problems;
+}
+test('authority: one sentence in Rule 47 and no technical-choice rows in Rule 30', () => {
+  assert.deepEqual(checkAuthority(docs()), []);
+});
+const MA = [
+  ['rules Rule 30 restores the architecture row', inSection(/^### Rule 30\./, s => s.replace('| 비용 (', '| Architecture / design decision | 사용자 vision + business 차원 |\n| 비용 ('))],
+  ['rules Rule 47 drops the authority sentence', inSection(/^## Rule 47\./, dropSentences(/기술 선택은 오케스트레이터가 결정하고/))],
+  ['rules Rule 47 lets silence approve a human-only item', inSection(/^## Rule 47\./, s => s.replace('침묵이나 기한 경과로 승인되지 않는다', '기한이 지나면 승인된 것으로 본다'))],
+];
+for (const [name, mutate] of MA) {
+  test(`mutation must fail: ${name}`, () => {
+    const base = docs();
+    assert.deepEqual(checkAuthority(base), [], 'unmodified staged text must pass before a mutation can discriminate');
+    const mutated = { ...base, rules: mutate(base.rules) };
+    assert.notEqual(mutated.rules, base.rules, 'mutation target not found in staged text');
+    assert.ok(checkAuthority(mutated).length > 0, 'mutant passed: check does not discriminate');
+  });
 }
 // Command-first routing guidance may prefer helpers but must not ban a legitimate one-off `node -e`.
 function checkOneOffAllowed(d) {
@@ -385,14 +426,16 @@ const M24 = [
   ['rules Rule 24 drops "no re-approval per fix"', 'rules', inSection(/^## Rule 24\./, dropSentences(/다시 요구하지 않/))],
   ['rules Rule 24 widens scope to all changes', 'rules', t => t.replace('이미 승인된 릴리즈 범위 안의 버그 수정·회귀 테스트·이식성 수정은', '모든 변경은')],
   ['rules Rule 24 drops Rule 47 separate approval', 'rules', inSection(/^## Rule 24\./, dropSentences(/Rule 47/))],
-  ['rules Rule 24 drops pending-design exclusion', 'rules', inSection(/^## Rule 24\./, dropSentences(/대기 중인/))],
+  ['rules Rule 24 drops pending-design five-category exclusion', 'rules', inSection(/^## Rule 24\./, dropSentences(/대기 중이던/))],
   ['rules Rule 24 drops controller-judgment-is-not-consent', 'rules', inSection(/^## Rule 24\./, dropSentences(/오케스트레이터 판단을/))],
   ['rules Rule 24 adds blanket auto-approval', 'rules', inSection(/^## Rule 24\./, append('- 승인 범위 밖의 새 설계도 오케스트레이터가 자동 승인한다.'))],
-  ['AGENTS Rule 24 checklist reverts to per-spec approval', 'agents', t => t.split('\n').map(l => (/^- \[ \].*Rule 24/.test(l) ? OLD_AGENTS_24 : l)).join('\n')],
-  ['AGENTS Rule 24 drops separate approval for new/pending designs', 'agents', t => t.replace('새 아키텍처·권한·비용·개인정보·파괴적 변경과 기존 대기 설계는 별도 승인하며, ', '')],
+  ['rules Rule 24 restores new-architecture user approval', 'rules', inSection(/^## Rule 24\./, append('- **별도 사용자 승인 유지**: 새 아키텍처·권한 확대·비용·개인정보·파괴적 변경은 Rule 47에 따라 확인한다.'))],
+  ['AGENTS Rule 24 checklist reverts to per-spec approval', 'agents', t => t.split('\n').map(l => (/^- (\[ \] )?.*Rule 24/.test(l) ? OLD_AGENTS_24 : l)).join('\n')],
+  ['AGENTS Rule 24 drops five-category separate approval', 'agents', t => t.replace('Rule 47의 다섯 범주(비용·개인정보 전송·권한 확대·운영 데이터 변경/삭제·프로덕션 배포)만 별도 사용자 승인을 받는가? ', '')],
   ['skill drops Rule 24 paragraph', 'skill', t => paragraphs(t).filter(p => !/Rule 24\b/.test(p)).join('\n\n')],
   ['skill restores per-spec approval', 'skill', t => t.replace(/without another per-spec approval/, 'only after a per-spec approval')],
-  ['skill drops Rule 47 caveat', 'skill', t => t.replace(/New architecture, authority, cost, privacy or\s+destructive changes still require Rule 47 approval;/, '')],
+  ['skill drops Rule 47 caveat', 'skill', t => t.replace(/Only cost,\s+private-data transfer, privilege expansion, changing or deleting operating data and\s+production deployment require Rule 47 human approval\./, '')],
+  ['skill restores new-architecture user approval', 'skill', t => t.replace(/(Rule 24 \(human revision 2026-09-21\):)/, '$1 New architecture, authority, cost, privacy or destructive changes still require Rule 47 approval.')],
   ['skill treats controller review as human consent', 'skill', t => t.replace(/(Rule 24 \(human revision 2026-09-21\):)/, '$1 Controller review counts as human consent.')],
 ];
 for (const [name, file, mutate] of M24) {
