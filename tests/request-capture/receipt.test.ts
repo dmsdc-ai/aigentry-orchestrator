@@ -653,6 +653,12 @@ test('forced receipt UUID collision refuses overwrite of an existing receipt', a
   await sentinels(base, root);
 });
 
+// win32 has no directory fsync (P3): those faults move to the rename/replace step. With a
+// prior store the first rename in the child is the blob's, as the first directory fsync is raw's.
+const WIN32 = process.platform === 'win32';
+const WIN32_BOUNDARY: Record<string, string> = {
+  'directory-fsync': 'blob-rename', 'blob-directory-fsync': 'blob-rename', 'receipt-directory-fsync': 'receipt-rename',
+};
 for (const mode of ['blob-write', 'receipt-write', 'blob-rename', 'receipt-rename', 'file-fsync', 'directory-fsync',
   'blob-file-fsync', 'receipt-file-fsync', 'blob-directory-fsync', 'receipt-directory-fsync',
   'blob-write-enospc', 'receipt-write-enospc', 'blob-write-eacces', 'receipt-write-eacces', 'lock-release']) {
@@ -662,16 +668,18 @@ for (const mode of ['blob-write', 'receipt-write', 'blob-rename', 'receipt-renam
     const oldRaw = Buffer.from('prior durable evidence');
     const prior = await capture(oldRaw, { root });
     const raw = Buffer.from('FAULT_SECRET_RAW_ONLY');
-    const run = await childRun(t, base, root, raw, mode);
+    const boundary = WIN32 ? WIN32_BOUNDARY[mode] ?? mode : mode;
+    const run = await childRun(t, base, root, raw, boundary);
     const result = await run.waitFor('result');
     const exit = await run.done;
     const faults = run.messages.filter(message => message.type === 'fault');
-    t.diagnostic(JSON.stringify({ mode, faults, returned_success: result.ok, child_exit: exit.code }));
+    t.diagnostic(JSON.stringify({ mode, boundary, faults, returned_success: result.ok, child_exit: exit.code }));
     assert.notEqual(faults.length, 0, 'required fault boundary was not reached');
     if (mode === 'blob-directory-fsync' || mode === 'receipt-directory-fsync') {
       const section = mode.startsWith('blob') ? 'raw' : 'receipts';
       assert.equal(faults[0].section, section);
-      assert.equal(faults[0].renamed!.includes(section), true, 'must fail after final rename, not during initialization');
+      if (WIN32) assert.equal(faults[0].operation, 'rename', 'win32 boundary is the final rename/replace');
+      else assert.equal(faults[0].renamed!.includes(section), true, 'must fail after final rename, not during initialization');
     }
     assert.equal(result.ok, false, JSON.stringify(result));
     assert.equal(exit.code, 23, JSON.stringify(exit));
@@ -679,7 +687,7 @@ for (const mode of ['blob-write', 'receipt-write', 'blob-rename', 'receipt-renam
     await checkReceipt(root, oldRaw, prior);
     // A failed final directory fsync can leave a receipt file as crash evidence;
     // lack of an API success is the required assertion at that boundary.
-    if (!['directory-fsync', 'receipt-directory-fsync', 'lock-release'].includes(mode)) {
+    if (!['directory-fsync', 'receipt-directory-fsync', 'lock-release'].includes(boundary)) {
       assert.deepEqual(await accepted(root), [`${prior.capture_id}.json`]);
     }
     await sentinels(base, root);

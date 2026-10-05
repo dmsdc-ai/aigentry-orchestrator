@@ -51,7 +51,8 @@ async function hit(op, value, handle) {
   let fail = mode === 'blob-write' && area === 'raw' && op === 'write'
     || mode === 'receipt-write' && area === 'receipts' && op === 'write'
     || mode === 'lock-release' && op === 'unlink' && value === path.join(root, 'store.json.lock')
-    || mode === 'lock-acquire' && op === 'link';
+    || mode === 'lock-acquire' && op === 'link'
+    || mode === 'receipt-rename' && op === 'rename' && area === 'receipts';
   if (op === 'sync') {
     const directory = (await handle.stat()).isDirectory();
     fail ||= mode === 'file-fsync' && area === 'raw' && !directory;
@@ -99,7 +100,14 @@ if (mode === 'stale-probe') {
     return kill.call(this, pid, signal);
   };
 }
-if (mode === 'weak-durability') Object.defineProperty(process, 'platform', { value: 'win32' });
+if (mode === 'weak-durability') {
+  // Only the receipt writer sees win32 (so it records file-fsync-only); the hook still
+  // decides on the real POSIX platform.
+  const real = process.platform;
+  Object.defineProperty(process, 'platform', {
+    get: () => /request-capture\/receipt\.js:/.test(new Error().stack ?? '') ? 'win32' : real });
+}
+if (mode === 'windows-host') Object.defineProperty(process, 'platform', { value: 'win32' });
 if (mode === 'stdin-error') {
   process.stdin._read = function() {
     send('fault'); this.destroy(new Error('RAW_SECRET_1166 ' + root));
@@ -298,13 +306,16 @@ for (const kind of ['corrupt-marker', 'raw-symlink', 'receipts-symlink', 'root-s
   });
 }
 
+// win32 has no directory fsync (P3): that fault moves to the receipt's rename/replace step.
+const WIN32 = process.platform === 'win32';
 for (const mode of ['blob-write', 'receipt-write', 'file-fsync', 'directory-fsync', 'lock-release', 'lock-acquire', 'stdin-error']) {
   test(`deterministic failure blocks: ${mode}`, async t => {
+    const boundary = WIN32 && mode === 'directory-fsync' ? 'receipt-rename' : mode;
     const { base, root } = await fixture(t); const raw = Buffer.from(secret);
-    const run = await launch(t, base, root, undefined, mode); run.child.stdin!.end(raw);
+    const run = await launch(t, base, root, undefined, boundary); run.child.stdin!.end(raw);
     const result = await run.done; assert.ok(run.messages.includes('fault'), 'fault boundary must be reached');
     block(result, root);
-    if (['directory-fsync', 'lock-release'].includes(mode)) await evidence(root, raw, 1);
+    if (['directory-fsync', 'lock-release'].includes(boundary)) await evidence(root, raw, 1);
     else assert.equal((await receipts(root)).length, 0);
     if (mode === 'receipt-write') assert.deepEqual(await fs.readFile(path.join(root, 'raw', `${digest(raw)}.bin`)), raw);
     if (mode === 'lock-release') assert.ok((await fs.stat(path.join(root, 'store.json.lock'))).isFile());
@@ -319,12 +330,22 @@ test('output error cannot yield successful exit', async t => {
   await evidence(root, Buffer.from(secret), 1);
 });
 
-test('simulated weaker durability visibly blocks but preserves evidence; not native Windows proof', async t => {
+if (!WIN32) test('simulated weaker durability visibly blocks but preserves evidence; not native Windows proof', async t => {
   const { base, root } = await fixture(t); const run = await launch(t, base, root, undefined, 'weak-durability');
   run.child.stdin!.end(secret); const result = await run.done; block(result, root);
   assert.match(result.stdout + result.stderr, /Windows|durability|directory|fsync/i);
   const rows = await evidence(root, Buffer.from(secret), 1); assert.equal(rows[0]!.durability, 'file-fsync-only');
 });
+
+// P3: file fsync + NTFS-journaled rename is the supported win32 level; capture proceeds and
+// the receipt states it as file-fsync-only.
+async function windowsLevelAllowed(t: TestContext, mode: string): Promise<void> {
+  const { base, root } = await fixture(t); const run = await launch(t, base, root, undefined, mode);
+  run.child.stdin!.end(secret); allow(await run.done);
+  const rows = await evidence(root, Buffer.from(secret), 1); assert.equal(rows[0]!.durability, 'file-fsync-only');
+}
+if (WIN32) test('native Windows capture is allowed and the receipt states file-fsync-only', t => windowsLevelAllowed(t, ''));
+else test('mocked Windows host allows file-fsync-only capture; not native Windows proof', t => windowsLevelAllowed(t, 'windows-host'));
 
 // Copy exact runtime leaves into a realistic package layout, never rewrite them.
 async function packageCopy(base: string, includeModule: boolean): Promise<string> {

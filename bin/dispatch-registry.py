@@ -19,7 +19,8 @@ Registry mutations hold an exclusive native lock on a STABLE sibling lockfile
 (never the active.json inode, which an atomic rename replaces). Read-only
 check-dedup/get/list/snapshot remain unlocked. POSIX writes use full schema
 validation, same-directory temp file, fsync(temp), atomic rename, fsync(directory).
-Native Windows locks are supported, but durable registry writes are refused.
+Native Windows writes use the same sequence without fsync(directory), which Windows
+does not have: NTFS journals the rename, so the level there is file-fsync-only.
 Corruption is fail-closed: bytes are preserved, a health line
 is written OUTSIDE the corrupt file, and nothing is delivered, pruned or
 restored. There is no `r+ → truncate → json.dump` path anywhere.
@@ -355,16 +356,10 @@ def load_bounded(path: str, limit: int) -> object:
         raise RegistryError("registry_corrupt", f"unparseable registry: {exc}")
 
 
-def require_durable_writes() -> None:
-    if os.name == "nt":
-        raise RegistryError("registry_write_failed",
-                            "native Windows directory durability unavailable; registry write refused")
-
-
 def commit(doc: dict) -> None:
-    """temp → fsync(temp) → rename → fsync(dir). Recovery sees one complete
-    generation or the other, never a half-written file."""
-    require_durable_writes()
+    """temp → fsync(temp) → rename → fsync(dir) (POSIX; Windows stops after the
+    journaled rename). Recovery sees one complete generation or the other, never
+    a half-written file."""
     doc["generation"] = int(doc.get("generation", 0)) + 1
     validate(doc)
     path = registry_path()
@@ -390,6 +385,9 @@ def commit(doc: dict) -> None:
     except OSError as exc:
         _unlink(tmp)
         raise RegistryError("registry_write_failed", f"durable write failed: {exc}")
+    if os.name == "nt":
+        # No directory fsync exists here; the rename above is the last boundary.
+        return
     if fault("dir_fsync"):
         # The rename already landed; the fault models a crash before the
         # directory entry was durable. Both generations are complete, which is
@@ -961,7 +959,6 @@ def op_migrate(args: dict) -> int:
         if not isinstance(legacy, list):
             raise RegistryError("registry_corrupt", "legacy registry is neither array nor envelope")
 
-        require_durable_writes()
         backup = path + ".legacy-v1.bak"
         with open(backup, "wb") as fh:
             fh.write(raw_bytes)

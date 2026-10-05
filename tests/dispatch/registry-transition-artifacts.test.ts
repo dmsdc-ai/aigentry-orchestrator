@@ -48,9 +48,7 @@ const OPERATIONS = ['archive-sidecars', 'begin-delivery', 'check-dedup', 'get', 
   'observe', 'prune', 'set-gate', 'set-lifecycle', 'set-transport-result', 'snapshot'] as const;
 // Diagnostic siblings a refusal may touch; neither is registry data or authority.
 const DIAGNOSTIC = new Set(['state/registry-health.log', 'state/active.json.lock']);
-// Native Windows keeps refusing durable writes (registry-native-locking.test.ts pins the same
-// string). Mutation controls expect this refusal there, never a durability waiver or a skip.
-const WINDOWS_WRITE_REFUSAL = 'native Windows directory durability unavailable; registry write refused';
+// Mutation controls hold on every OS: Windows writes proceed at file-fsync-only (P3).
 const LEGACY = [
   { sid: 'live-worker', status: 'in_flight', ref_hash: 'hash-live', cwd: '/tmp/live' },
   { sid: 'claimed-done', status: 'auto_reported', ref_hash: 'hash-done' },
@@ -134,8 +132,7 @@ function sidecarDir(f: Fixture) {
   writeFileSync(join(f.sidecars, 'claimed-done'), 'hash-done\n');
 }
 
-// A guard refusal must name the transition state. A generic exit 9 (e.g. the native Windows
-// durability refusal an unguarded writer already returns) is not evidence of the guard.
+// A guard refusal must name the transition state. A generic exit 9 is not evidence of the guard.
 function identifiesTransition(detail: unknown): boolean {
   return typeof detail === 'string' && (/transition/i.test(detail) || ARTIFACTS.some(name => detail.includes(name)));
 }
@@ -168,11 +165,6 @@ function ok(result: ReturnType<Fixture['run']>, status: number, name: string) {
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.result, name);
   return payload;
-}
-function windowsWriteRefused(result: ReturnType<Fixture['run']>) {
-  const payload = ok(result, 9, 'registry_write_failed');
-  assert.equal(payload.detail, WINDOWS_WRITE_REFUSAL);
-  assert.equal(payload.completion_fact, null);
 }
 
 const NOW = '2026-10-04T00:00:00Z';
@@ -226,14 +218,6 @@ test('baseline valid JSON read protocol: snapshot/get/list/check-dedup unchanged
 test('baseline valid JSON mutation protocol: 0/7/8, observe/lifecycle/gate/prune and generation', t => {
   const f = fixture(t, 'valid', []);
   const begin = ['begin-delivery', '--sid', 'lock-fixture', '--ref-hash', 'fixture-hash'];
-  if (windows) {
-    const before = readFileSync(f.active);
-    windowsWriteRefused(f.run(begin));
-    windowsWriteRefused(f.run(['prune', '--older-than-seconds', '0']));
-    assert.deepEqual(readFileSync(f.active), before);
-    assert.equal(readdirSync(f.state).filter(name => name.endsWith('.tmp')).length, 0);
-    return;
-  }
   assert.equal(ok(f.run(begin), 0, 'proceed').completion_fact, null);
   ok(f.run(begin), 7, 'DISPATCH_RETRY_HELD');
   assert.equal(f.run(['set-transport-result', '--sid', 'lock-fixture', '--result', 'write_observed']).status, 0);
@@ -265,11 +249,6 @@ test('baseline absent active.json without artifacts keeps the fresh-empty legacy
   ok(f.run(['get', '--sid', 'a']), 0, 'dispatch_not_found');
   assert.equal(f.run(['list']).stdout, '');
   assert.deepEqual(changes(before, tree(f.root)), [], 'reads created registry files');
-  if (windows) {
-    windowsWriteRefused(f.run(['begin-delivery', '--sid', 'a', '--ref-hash', 'h']));
-    assert.equal(present(f.active), false, 'refused write created active.json');
-    return;
-  }
   ok(f.run(['begin-delivery', '--sid', 'a', '--ref-hash', 'h']), 0, 'proceed');
   assert.equal(f.doc().generation, 1);
   assert.equal(f.doc().dispatches.length, 1);
@@ -285,36 +264,22 @@ for (const start of ['absent', 'valid'] as const) {
     assert.equal(snapshot.status, 0, snapshot.stdout + snapshot.stderr);
     assert.equal(JSON.parse(snapshot.stdout).generation, start === 'valid' ? 12 : 0);
     const begin = f.run(['begin-delivery', '--sid', 'transition-probe', '--ref-hash', 'probe-hash']);
-    if (windows) {
-      windowsWriteRefused(begin);
-      assert.equal(present(f.active), start === 'valid');
-      if (start === 'valid') assert.equal(f.doc().generation, 12);
-    } else {
-      ok(begin, 0, 'proceed');
-      assert.equal(f.doc().generation, start === 'valid' ? 13 : 1);
-    }
+    ok(begin, 0, 'proceed');
+    assert.equal(f.doc().generation, start === 'valid' ? 13 : 1);
     assert.equal(readFileSync(join(f.state, 'active.json.legacy-v1.bak'), 'utf8'), legacy['active.json.legacy-v1.bak']);
     assert.equal(readFileSync(join(f.state, 'active.json.lock'), 'utf8'), legacy['active.json.lock']);
   });
 }
 
-// Reviewed: migrate refuses durable writes (require_durable_writes) after parsing and BEFORE
-// writing the legacy-v1 backup, so a native Windows refusal leaves no backup behind.
 test('baseline direct legacy migrate unchanged without artifacts', t => {
   const f = fixture(t, 'legacy-array');
   const original = readFileSync(f.active);
-  if (windows) {
-    windowsWriteRefused(f.run(['migrate', '--now', NOW]));
-    assert.deepEqual(readFileSync(f.active), original);
-    assert.equal(present(`${f.active}.legacy-v1.bak`), false, 'refused migrate wrote a backup');
-  } else {
-    const migrated = ok(f.run(['migrate', '--now', NOW]), 0, 'migrated');
-    assert.equal(migrated.dispatches, 2);
-    assert.deepEqual(readFileSync(`${f.active}.legacy-v1.bak`), original);
-    assert.equal(f.doc().generation, 1);
-    const again = ok(f.run(['migrate', '--now', NOW]), 9, 'already_schema_v2');
-    assert.equal(again.completion_fact, null);
-  }
+  const migrated = ok(f.run(['migrate', '--now', NOW]), 0, 'migrated');
+  assert.equal(migrated.dispatches, 2);
+  assert.deepEqual(readFileSync(`${f.active}.legacy-v1.bak`), original);
+  assert.equal(f.doc().generation, 1);
+  const again = ok(f.run(['migrate', '--now', NOW]), 9, 'already_schema_v2');
+  assert.equal(again.completion_fact, null);
 });
 
 // Separate on purpose: archive-sidecars writes no registry, so it must keep working on every OS.
