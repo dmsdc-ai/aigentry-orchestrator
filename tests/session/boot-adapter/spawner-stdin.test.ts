@@ -2,21 +2,25 @@
 // Every scenario runs the REAL nodeSpawner inside an isolated driver subprocess
 // (_spawner-stdin-driver.js), so a regression that crashes on an unhandled stdin
 // 'error' fails the test instead of killing the runner. Hermetic: children are
-// fixture /bin/sh shims (PATH = fixture bin dir only, shell builtins only) or
+// fixture /bin/sh shims (PATH = fixture bin dir only, shell builtins only; win32: see CJS) or
 // process.execPath + fixture scripts; fake HOME; every child pid is checked dead.
 //
 // Honest labelling: "delivered" below means the OS pipe accepted the bytes. Only the
 // echo/drain scenarios prove the child application actually read them.
-import { test, type TestContext } from "node:test";
+import { after, test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, linkSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { contractBytes } from "./_win-launch-fixture.js";
 
 const DRIVER = join(import.meta.dirname, "_spawner-stdin-driver.js");
+const WIN = process.platform === "win32";
 const PEER_CLOSED = ["EPIPE", "ECONNRESET"];
+// win32 (measured): a write to a gone reader can also fail with EOF (-4095); accepted only from write().
+const PEER_CLOSED_WIN = [...PEER_CLOSED, "EOF"];
 const MULTI = "héllo-世界-\u{1F600}\n";
 
 const SH: Record<string, string> = {
@@ -35,6 +39,28 @@ const JS: Record<string, string> = {
   "wait-eof.cjs": `${PID}process.stdin.on("end", () => process.exit(7)); process.stdin.resume();\n`,
   "hang-noread.cjs": `${PID}setInterval(() => {}, 1000);\n`,
 };
+// #1167 P5 (win32): no /bin/sh. Each SH scenario is the same pid-file / MARK / GO / close / exit behaviour in
+// Node (`bin/<name>.cjs`) behind a real npm-style V-A `bin/<name>.cmd` (P=node), which the spawner launches as
+// a direct `node.exe <name>.cjs` child. The driver pins PATH to bin, so that node is the shim's `dp0\node.exe`.
+const CJS: Record<string, string> = {
+  "close-stdin-exit5": `${PID}process.stdin.destroy();\nrequire("node:fs").writeFileSync(process.env.MARK, "");\nprocess.exit(5);\n`,
+  "close-stdin-exit0": `${PID}process.stdin.destroy();\nprocess.exit(0);\n`,
+  "exit6": `${PID}process.exit(6);\n`,
+  "exit0": `${PID}process.exit(0);\n`,
+  "wait-go-exit0": `${PID}const cell = new Int32Array(new SharedArrayBuffer(4)), until = Date.now() + 15_000;\n` +
+    `while (!require("node:fs").existsSync(process.env.GO)) { if (Date.now() > until) process.exit(98); Atomics.wait(cell, 0, 0, 2); }\nprocess.exit(0);\n`,
+};
+
+// win32: one copy of this node.exe per test file; each fixture bin gets a hard link to it (a copy if linking fails).
+let nodeCopy: string | undefined;
+function stageNode(to: string): void {
+  if (nodeCopy === undefined) {
+    nodeCopy = join(mkdtempSync(join(tmpdir(), "ss-1167-node-")), "node.exe");
+    copyFileSync(process.execPath, nodeCopy);
+  }
+  try { linkSync(nodeCopy, to); } catch { copyFileSync(process.execPath, to); }
+}
+after(() => { if (nodeCopy !== undefined) rmSync(dirname(nodeCopy), { recursive: true, force: true }); });
 
 interface DriverOut {
   scenario: string; outcome: "resolved" | "rejected" | "unknown-scenario";
@@ -51,7 +77,13 @@ function drive(t: TestContext, scenario: string): DriverOut {
   const root = mkdtempSync(join(tmpdir(), "ss-1162-"));
   try {
     for (const d of ["bin", "pids", "home"]) mkdirSync(join(root, d));
-    for (const [n, body] of Object.entries(SH)) writeFileSync(join(root, "bin", n), `#!/bin/sh\n${body}`, { mode: 0o755 });
+    if (WIN) {
+      stageNode(join(root, "bin", "node.exe"));
+      for (const [n, body] of Object.entries(CJS)) {
+        writeFileSync(join(root, "bin", `${n}.cjs`), body);
+        writeFileSync(join(root, "bin", `${n}.cmd`), contractBytes("V-A", `${n}.cjs`, "node", ""), "latin1");
+      }
+    } else for (const [n, body] of Object.entries(SH)) writeFileSync(join(root, "bin", n), `#!/bin/sh\n${body}`, { mode: 0o755 });
     for (const [n, body] of Object.entries(JS)) writeFileSync(join(root, n), body);
     const r = spawnSync(process.execPath, [DRIVER, scenario, root], {
       env: { PATH: join(root, "bin"), HOME: join(root, "home"), TMPDIR: tmpdir() },
@@ -97,12 +129,23 @@ test("SS2 empty stdin, child exits immediately (natural race, BP4 shape): resolv
 });
 
 test("SS3 non-empty stdin, child closed its read end first (gated): rejects with the actual peer-closed error", (t) => {
-  const e = rejected(drive(t, "small-peer-closed"), PEER_CLOSED);
+  const o = drive(t, "small-peer-closed");
+  // win32 (SS3 decision): the deterministic rejection does not exist there (a 5-byte write to a gone reader was
+  // accepted in 14 of 1000 measured runs), so either real outcome passes; drive() already proved no crash and
+  // no leftover child.
+  if (WIN && o.outcome === "resolved") {
+    const r = resolved(o, 5);
+    assert.equal(r.stdout, ""); assert.equal(r.stderr, "");
+    return;
+  }
+  const e = rejected(o, WIN ? PEER_CLOSED_WIN : PEER_CLOSED);
+  if (WIN) assert.equal(e.syscall, "write");
   assert.notEqual(e.code, "ENOENT");
 });
 
 test("SS4 8 MiB stdin > pipe buffer, child closes stdin unread and exits 0: rejects, never false success", (t) => {
-  rejected(drive(t, "large-read-end-closed"), PEER_CLOSED);
+  const e = rejected(drive(t, "large-read-end-closed"), WIN ? PEER_CLOSED_WIN : PEER_CLOSED);
+  if (WIN) assert.equal(e.syscall, "write");
 });
 
 test("SS5 echo child: bytes (multi-byte UTF-8) read back unchanged", (t) => {

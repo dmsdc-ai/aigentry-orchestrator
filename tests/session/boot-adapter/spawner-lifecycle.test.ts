@@ -28,18 +28,20 @@
 //     probeVersion replaces every collect() error with a fresh Error("CLI_NOT_FOUND") and
 //     collect() is not exported, so no test here claims it.
 // The driver spawn spy is HARNESS INSTRUMENTATION; LV0 proves it forwards spawn unchanged.
-// Direct child only: no process-tree containment is claimed. Windows (.cmd/.exe, nested
-// children) evidence is a separate open gate; POSIX-only tests are labelled [POSIX].
+// Direct child only: no process-tree containment is claimed. On win32 the exec wrapper is a
+// real npm `.cmd` shim, which the spawner resolves to a direct node.exe child (no cmd.exe),
+// so the same direct-child evidence applies; nested-children evidence stays unclaimed.
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
+import { contractBytes } from "./_win-launch-fixture.js";
 
 const DRIVER = join(import.meta.dirname, "_spawner-lifecycle-driver.js");
-const POSIX = process.platform === "win32" ? "POSIX-only: /bin/sh exec wrapper / mode bits; Windows evidence is a separate gate" : false;
+const WIN = process.platform === "win32";
 const KiB = 1024;
 const PROBE_BOUND_MS = 5_000 + 1_000;
 const LIFETIME_MS = 6_000;      // child self-exit, measured from the child's own start
@@ -96,11 +98,16 @@ function drive(t: TestContext, scenario: string, instr = true): DriverOut {
     for (const d of ["bin", "receipts", "home", "appdata"]) mkdirSync(join(root, d));
     for (const [n, body] of Object.entries(JS)) writeFileSync(join(root, n), body);
     for (const n of WRAPPED) {
-      writeFileSync(join(root, "bin", n), `#!/bin/sh\nexec "${process.execPath}" "${join(root, `${n}.cjs`)}" "$@"\n`, { mode: 0o755 });
+      // #1167 P5 (win32): no /bin/sh; a real npm-style V-A `<n>.cmd` (P=node) targeting the same script,
+      // launched by the spawner as `node.exe ..\<n>.cjs` (node's own directory follows bin on PATH).
+      if (WIN) writeFileSync(join(root, "bin", `${n}.cmd`), contractBytes("V-A", `..\\${n}.cjs`, "node", ""), "latin1");
+      else writeFileSync(join(root, "bin", n), `#!/bin/sh\nexec "${process.execPath}" "${join(root, `${n}.cjs`)}" "$@"\n`, { mode: 0o755 });
     }
-    writeFileSync(join(root, "bin", "nonexec"), "#!/bin/sh\nexit 0\n", { mode: 0o644 });
+    // win32 has no exec mode bits: its non-executable counterpart is an `.exe` that is not a PE image.
+    if (WIN) writeFileSync(join(root, "bin", "nonexec.exe"), "not a PE image\n");
+    else writeFileSync(join(root, "bin", "nonexec"), "#!/bin/sh\nexit 0\n", { mode: 0o644 });
     const r = spawnSync(process.execPath, [DRIVER, scenario, root, String(DRIVER_DEADLINE_MS), ...(instr ? [] : ["noinstr"])], {
-      env: { PATH: join(root, "bin"), HOME: join(root, "home"), USERPROFILE: join(root, "home"),
+      env: { PATH: WIN ? [join(root, "bin"), dirname(process.execPath)].join(delimiter) : join(root, "bin"), HOME: join(root, "home"), USERPROFILE: join(root, "home"),
         APPDATA: join(root, "appdata"), RECEIPTS: rec, FIXTURE_NONCE: nonce, TMPDIR: tmpdir() },
       encoding: "utf8", timeout: WATCHDOG_MS, killSignal: "SIGKILL", maxBuffer: 1024 * 1024,
     });
@@ -151,7 +158,7 @@ function noSelfExit(o: DriverOut): void {
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 
 // ---- 1. probeVersion liveness (RED on b81f43c: collect() has no timeout) ----
-test("LV1 [POSIX] probeVersion: child ignores --version and never exits -> settles within 5s bound, direct child gone", { skip: POSIX }, (t) => {
+test("LV1 probeVersion: child ignores --version and never exits -> settles within 5s bound, direct child gone", (t) => {
   const o = drive(t, "probe-hang");
   assert.equal(o.children.length, 1, "exactly one probe child expected");
   const c = o.children[0]!;
@@ -168,7 +175,7 @@ test("LV1 [POSIX] probeVersion: child ignores --version and never exits -> settl
 });
 
 // ---- 2. actual OS error preserved (RED on b81f43c: run() forces code=ENOENT) ----
-test("LV2a [POSIX] run(): non-executable file rejects with the same code/errno node:child_process observed", { skip: POSIX }, (t) => {
+test("LV2a run(): non-executable file (POSIX: mode 0644; win32: .exe that is not a PE image) rejects with the same code/errno node:child_process observed", (t) => {
   const o = drive(t, "run-nonexec");
   assert.equal(o.raw?.spawned, false, "precondition: raw spawn of a 0644 file must fail");
   const raw = o.raw!.error!;
@@ -179,7 +186,7 @@ test("LV2a [POSIX] run(): non-executable file rejects with the same code/errno n
   assert.equal(o.error!.errno, raw.errno);
 });
 
-test("LV2b [POSIX] run(): missing executable still rejects ENOENT matching the raw OS error", { skip: POSIX }, (t) => {
+test("LV2b run(): missing executable still rejects ENOENT matching the raw OS error", (t) => {
   const o = drive(t, "run-missing");
   assert.equal(o.raw!.error!.code, "ENOENT");
   assert.equal(o.outcome, "rejected");
@@ -187,21 +194,21 @@ test("LV2b [POSIX] run(): missing executable still rejects ENOENT matching the r
   assert.equal(o.error!.errno, o.raw!.error!.errno);
 });
 
-test("LV2c [POSIX] probeVersion: non-executable keeps public CLI_NOT_FOUND", { skip: POSIX }, (t) => {
+test("LV2c probeVersion: non-executable (POSIX: mode 0644; win32: .exe that is not a PE image) keeps public CLI_NOT_FOUND", (t) => {
   const o = drive(t, "probe-nonexec");
   assert.equal(o.outcome, "rejected");
   assert.equal(o.error!.message, "CLI_NOT_FOUND");
 });
 
 // ---- 3. output ceiling ----
-test("LV3a [POSIX] probeVersion: combined stdout+stderr > 1 MiB (600+600 KiB, exit 0) rejects", { skip: POSIX }, (t) => {
+test("LV3a probeVersion: combined stdout+stderr > 1 MiB (600+600 KiB, exit 0) rejects", (t) => {
   const o = drive(t, "probe-flood-over");
   noSelfExit(o);
   assert.equal(o.outcome, "rejected", `no output ceiling: resolved ${JSON.stringify(o.value)}`);
   assert.ok(o.children[0]!.handle_exit.at <= o.settled_at! + GONE_GRACE_MS);
 });
 
-test("LV3b [POSIX] probeVersion: combined 512 KiB (under ceiling) still returns parsed version", { skip: POSIX }, (t) => {
+test("LV3b probeVersion: combined 512 KiB (under ceiling) still returns parsed version", (t) => {
   const o = drive(t, "probe-flood-under");
   noSelfExit(o);
   assert.equal(o.outcome, "resolved", JSON.stringify(o.error));
@@ -219,14 +226,14 @@ test("LV3c CHARACTERIZATION run(): 768+768 KiB output returned whole (run cap mu
 });
 
 // ---- 4. preserved behaviour ----
-test("LV4a [POSIX] probeVersion: --version success returns the parsed semver unchanged", { skip: POSIX }, (t) => {
+test("LV4a probeVersion: --version success returns the parsed semver unchanged", (t) => {
   const o = drive(t, "probe-semver");
   noSelfExit(o);
   assert.equal(o.outcome, "resolved", JSON.stringify(o.error));
   assert.equal((o.value as Sum).head, "1.2.3-beta.1");
 });
 
-test("LV4b [POSIX] probeVersion: nonzero --version exit keeps CLI_NOT_FOUND", { skip: POSIX }, (t) => {
+test("LV4b probeVersion: nonzero --version exit keeps CLI_NOT_FOUND", (t) => {
   const o = drive(t, "probe-nonzero");
   noSelfExit(o);
   assert.equal(o.outcome, "rejected");
@@ -267,27 +274,27 @@ test("LV0 HARNESS INSTRUMENTATION: spawn spy forwards actual spawn unchanged (sa
 });
 
 // ---- 5. candidate r1 discriminators ----
-test("LV5a [POSIX] probeVersion: combined output exactly 1 MiB (1048576 bytes) is allowed", { skip: POSIX }, (t) => {
+test("LV5a probeVersion: combined output exactly 1 MiB (1048576 bytes) is allowed", (t) => {
   const o = drive(t, "probe-exact-1mib");
   noSelfExit(o);
   assert.equal(o.outcome, "resolved", JSON.stringify(o.error));
   assert.equal((o.value as Sum).head, "1.2.3");
 });
 
-test("LV5b [POSIX] probeVersion: combined output 1 MiB + 1 byte rejects", { skip: POSIX }, (t) => {
+test("LV5b probeVersion: combined output 1 MiB + 1 byte rejects", (t) => {
   const o = drive(t, "probe-1mib-plus1");
   noSelfExit(o);
   assert.equal(o.outcome, "rejected", `ceiling off by one: resolved ${JSON.stringify(o.value)}`);
   assert.ok(o.children[0]!.handle_exit.at <= o.settled_at! + GONE_GRACE_MS);
 });
 
-test("LV5c [POSIX] probeVersion: ceiling counts bytes, not chars (350006 chars = 1050006 UTF-8 bytes) rejects", { skip: POSIX }, (t) => {
+test("LV5c probeVersion: ceiling counts bytes, not chars (350006 chars = 1050006 UTF-8 bytes) rejects", (t) => {
   const o = drive(t, "probe-multibyte");
   noSelfExit(o);
   assert.equal(o.outcome, "rejected", `cap counted characters: resolved ${JSON.stringify(o.value)}`);
 });
 
-test("LV5d [POSIX] probeVersion: child ignoring SIGTERM is still killed within the bound", { skip: POSIX }, (t) => {
+test("LV5d probeVersion: child ignoring SIGTERM is still killed within the bound", (t) => {
   const o = drive(t, "probe-sigterm-ignored");
   assert.equal(o.children.length, 1);
   const c = o.children[0]!;
@@ -300,7 +307,7 @@ test("LV5d [POSIX] probeVersion: child ignoring SIGTERM is still killed within t
   assert.ok(c.handle_exit.at <= o.settled_at! + GONE_GRACE_MS, `child exit observed ${c.handle_exit.at - o.settled_at!} ms after settlement`);
 });
 
-test("LV5e [POSIX] probeVersion: alternating stdout/stderr (640+640 KiB) then hang -> overflow kills child well before timeout", { skip: POSIX }, (t) => {
+test("LV5e probeVersion: alternating stdout/stderr (640+640 KiB) then hang -> overflow kills child well before timeout", (t) => {
   const o = drive(t, "probe-alternate-hang");
   assert.equal(o.children.length, 1);
   const c = o.children[0]!;
