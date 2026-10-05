@@ -59,13 +59,6 @@ function acl(): WinAcl {
   return winAcl;
 }
 
-/** win32: raw `icacls <args>` for what the helper does not offer (`/grant:r`); fails the test on error. */
-function icacls(args: string[]): void {
-  const exe = path.join(process.env.SystemRoot ?? "", "System32", "icacls.exe");
-  const r = spawnSync(exe, args, { shell: false, windowsHide: true, timeout: 30_000, encoding: "latin1" });
-  assert.equal(r.status, 0, `icacls ${args.join(" ")} failed: ${r.error?.message ?? ""} ${r.stdout}${r.stderr}`);
-}
-
 const WS = "0a1b2c3d-1111-4222-8333-444455556666";
 const SURF = "0a1b2c3d-7777-4888-9999-aaaabbbbcccc";
 const LIFE = "0a1b2c3d-dddd-4eee-afff-000011112222";
@@ -691,18 +684,25 @@ test("errors: an unwritable controller dir is skipped:error with no temp and no 
   const f = fixture();
   const target = targetOf(f.root);
   makeController(target);
-  // win32: icacls narrows the user's single ACE to read/execute instead of chmod 0500. The
-  // directory still verifies private (protected, user-only), so the temp creation is what fails.
-  if (WIN) icacls([path.dirname(target), "/grant:r", `*${acl().userSid()}:(OI)(CI)(RX)`, "/q"]);
-  else fs.chmodSync(path.dirname(target), 0o500);
+  // win32: no ACL stops the elevated windows-latest token (backup/restore privilege; measured), so the temp open fails at the fs boundary.
+  if (!WIN) fs.chmodSync(path.dirname(target), 0o500);
+  let refused = 0;
   try {
-    const r = writeControllerBootRecord(f.root, input());
+    const r = WIN
+      ? withFsPatched({
+        openSync: (orig) => function (this: unknown, ...a: any[]) {
+          if (path.dirname(String(a[0])) !== path.dirname(target)) return orig.apply(this, a);
+          refused += 1;
+          throw Object.assign(new Error(`EACCES: permission denied, open '${String(a[0])}'`), { code: "EACCES" });
+        },
+      }, () => writeControllerBootRecord(f.root, input()))
+      : writeControllerBootRecord(f.root, input());
     assert.deepEqual(r, { outcome: "skipped:error", relation: "none" });
     assertLine(r);
+    assert.equal(refused, WIN ? 1 : 0);
     assert.deepEqual(fs.readdirSync(path.dirname(target)), []);
   } finally {
-    if (WIN) icacls([path.dirname(target), "/grant:r", `*${acl().userSid()}:(OI)(CI)F`, "/q"]);
-    else fs.chmodSync(path.dirname(target), 0o700);
+    if (!WIN) fs.chmodSync(path.dirname(target), 0o700);
   }
 });
 
