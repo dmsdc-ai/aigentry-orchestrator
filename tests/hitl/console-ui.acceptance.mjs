@@ -83,7 +83,9 @@ export const CONSOLE_OPS = ['not-started',
   'sc-revoked-tasks', 'sc-revoked-projects', 'sc-clean-dom', 'sc-mark',
   // Task #1177 table stage, same closed-enum discipline as every name above.
   'tt-semantics', 'tt-headers', 'tt-cells', 'tt-keyboard', 'tt-region', 'tt-restore', 'tt-mark',
-  'rv-column-reach'];
+  'rv-column-reach',
+  // #1177 The explicit visible-page precondition at the head of `responsive`.
+  'rv-front', 'rv-visible-wait'];
 let currentOp = 'not-started';
 export const consoleOp = () => currentOp;
 export function setConsoleOp(name) {
@@ -1422,7 +1424,7 @@ const LAYOUT = () => {
   }
   const small = [...document.querySelectorAll('button, input, select, summary')].filter(visible)
     .filter(node => rect(node).height < 43.5).map(name);
-  return { width, scrollWidth: document.documentElement.scrollWidth, bodyScroll: document.body.scrollWidth,
+  return { width, innerWidth: window.innerWidth, scrollWidth: document.documentElement.scrollWidth, bodyScroll: document.body.scrollWidth,
     rootFontPx: parseFloat(getComputedStyle(document.documentElement).fontSize),
     overflowing: overflowing.slice(0, 6), overlaps: overlaps.slice(0, 6), small: small.slice(0, 6),
     escaping: escaping.slice(0, 6), clipped: clipped.slice(0, 6),
@@ -1444,6 +1446,25 @@ function pngSize(deps, buffer) {
 const VIEWPORTS = [['console-320.png', 320, 640, 16], ['console-390.png', 390, 844, 16],
   ['console-768.png', 768, 1024, 16], ['console-1440.png', 1440, 900, 16], ['console-zoom.png', 720, 450, 32]];
 
+// #1177 Diagnostics only, for the op actual CI run 4a4c726 stops in (`rv-layout`): that op spans
+// the LAYOUT evaluate and all five checks after it, and `checks-seen` cannot separate them. This
+// latches the viewport being measured and one y/n/u flag per quantity those checks compare, taken
+// from the values they already compute, plus the root's client width and the window's inner width
+// from the same evaluate (their difference is what a classic scrollbar takes). Static names, flags
+// and clamped integers only: no element name, text or markup. No check reads any of it, and
+// nothing here relaxes, skips or retries a check.
+const LAYOUT_FLAGS = ['width', 'rows', 'font', 'page', 'overflow', 'overlap', 'small', 'region', 'escape', 'clip', 'extent'];
+let layoutSeen = { name: 'not-captured' };
+/** Static, clamped here a second time exactly like `renderReloadDeepLink`. No check reads it. */
+export function renderResponsiveLayout() {
+  const seen = layoutSeen && typeof layoutSeen === 'object' ? layoutSeen : {};
+  const pxT = value => (Number.isSafeInteger(value) && value >= 0 && value <= 9999 ? value : -1);
+  const flagT = value => (value === true ? 'y' : value === false ? 'n' : 'u');
+  return `viewport=${SCREENSHOTS.includes(seen.name) ? seen.name.slice(0, -'.png'.length) : 'not-captured'}`
+    + ` client-width=${pxT(seen.clientWidth)} inner-width=${pxT(seen.innerWidth)}`
+    + LAYOUT_FLAGS.map(key => ` ${key}=${flagT(seen[key])}`).join('');
+}
+
 /**
  * Browser emulation at CSS widths, on the post-login synthetic Tasks view. This is NOT physical
  * Fold7, remote-phone or real-network acceptance, and the zoom frame is not a browser-zoom API:
@@ -1454,6 +1475,16 @@ async function responsive(deps, fixtures, artifacts) {
   setConsoleStage('responsive');
   const { check, page, cleanDOM, state, privateFile } = deps;
   const screenshots = {};
+  // #1177 Explicit precondition. With the library's own focus emulation off for the whole run
+  // (`focusGate`), a tab reads `visible` only while it really is the front tab, and the raf-polled
+  // waits and viewport screenshots here and in `state-cleared` need a visible, rendering page. The
+  // lifecycle window happens to leave this page in front; this stage now establishes that itself,
+  // as a real browser state, and fails if the browser does not report it. Focus is not waited
+  // for: no check from here to the end of the run reads it.
+  setConsoleOp('rv-front');
+  await page.bringToFront();
+  setConsoleOp('rv-visible-wait');
+  await page.waitForFunction(() => document.visibilityState === 'visible');
   for (const [name, width, height, rootFontPx] of VIEWPORTS) {
     setConsoleOp('rv-viewport');
     await page.setViewportSize({ width, height });
@@ -1462,7 +1493,15 @@ async function responsive(deps, fixtures, artifacts) {
     setConsoleOp('rv-rows-wait');
     await page.waitForFunction(() => document.querySelectorAll('#task-rows tr').length === 25 && !document.querySelector('#refresh').disabled);
     setConsoleOp('rv-layout');
+    layoutSeen = { name };
     const layout = await page.evaluate(LAYOUT);
+    // Latched before the checks, from the same comparisons, so a failing check still leaves them.
+    layoutSeen = { name, clientWidth: layout.width, innerWidth: layout.innerWidth,
+      width: layout.width === width, rows: layout.rows === 25, font: layout.rootFontPx === rootFontPx,
+      page: layout.scrollWidth <= width + 1 && layout.bodyScroll <= width + 1,
+      overflow: layout.overflowing.length === 0, overlap: layout.overlaps.length === 0, small: layout.small.length === 0,
+      region: layout.tableVisible && layout.tableContained === true && layout.tableFocusable === true,
+      escape: layout.escaping.length === 0, clip: layout.clipped.length === 0, extent: layout.tableOverflowX >= 0 };
     check(layout.width === width && layout.rows === 25 && layout.rootFontPx === rootFontPx);
     // Unchanged gate: the page itself must never overflow horizontally at any width or zoom.
     check(layout.scrollWidth <= width + 1 && layout.bodyScroll <= width + 1);
