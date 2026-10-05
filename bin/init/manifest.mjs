@@ -51,6 +51,8 @@ const MANIFEST = [
   "bin/orchestrator-bridge-auditor.sh",
   "bin/orchestrator-report-target.sh",
   "bin/policy.py",
+  // #1166 U1: read-only capture inventory wrapper; resolves dist like hook-prompt-submit.mjs.
+  "bin/request-capture-inventory.mjs",
   "bin/session-cleanup.sh",
   "bin/session-comms-auditor.sh",
   "bin/session-layout.py",

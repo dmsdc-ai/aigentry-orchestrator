@@ -33,6 +33,28 @@ Release admission reads the committed public task-ID projection
 [release/PROJECTION.md](release/PROJECTION.md) for its schema, provenance, and what
 it does and does not prove.
 
+## Capture inventory (read-only, #1166 U1)
+
+`node bin/request-capture-inventory.mjs --root ABS [--limit N]` lists the receipts of an
+existing prompt-capture store as one JSON document. Exit 0 = complete, 3 = partial or
+unavailable observation, 2 = invalid invocation, module or output failure.
+
+- **Read-only.** It never creates, locks, syncs, repairs or deletes anything. It does not
+  open or hash raw blobs, so `content_hash_verified` is always `false`: the digest is the one
+  the receipt claims.
+- **Not a queue.** A listed item means "captured, hook outcome unrecorded". The hook can
+  block a prompt after its receipt is durable, so items are never admission or execution
+  authority (`hook_outcome:"unrecorded"`, `execution_state:"unknown"`). Equal prompts stay
+  distinct receipts (`dedupe:"unavailable"`).
+- **Bounds.** `--limit` 1..1000 (default 100); at most 4096 entries per directory; receipts
+  and the marker at most 64 KiB. Any truncation, lock, residue or anomaly gives
+  `complete:false`. Order is observed `received_at` then `capture_id`, not commit order.
+- **Output privacy.** Only IDs, timestamps, sizes, digests and anomaly codes. No metadata
+  strings, paths, file names, error messages or prompt bytes.
+- **Limits.** The scan is not atomic: it detects directory drift but does not protect
+  against a hostile same-owner writer. Windows ACLs are not verified, so a win32 run never
+  reports `complete:true`. It has not been verified on installed builds on all three OSes.
+
 ## Scope
 
 Orchestration infra for the aigentry ecosystem — not a standalone tool, and intentionally minimal here. Session transport is [telepty](https://github.com/dmsdc-ai/aigentry-telepty); multi-AI debate is [deliberation](https://github.com/dmsdc-ai/aigentry-deliberation); developer tooling is [devkit](https://github.com/dmsdc-ai/aigentry-devkit).
