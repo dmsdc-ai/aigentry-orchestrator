@@ -1,6 +1,7 @@
 // ADR-MF #13 — Spawner abstraction. stdlib only.
-import { spawn } from "node:child_process";
+import { spawn, type SpawnOptions } from "node:child_process";
 import type { BootCommand } from "./types.js";
+import { resolveLaunch } from "./win-launch.js";
 
 export interface RunResult {
   stdout: string;
@@ -20,9 +21,23 @@ export interface Spawner {
 const PROBE_TIMEOUT_MS = 5_000;
 const PROBE_MAX_BYTES = 1_048_576;
 
+// #1167 D2: collect and run share one rule — the env and cwd used for the win32
+// lookup are exactly the env and cwd the child is spawned with, built once by the
+// caller (collect: process.env + the inherited cwd; run: process.env + cmd.env, cmd.cwd).
+// Identity off win32; on win32 a resolution refusal throws CLI_LAUNCH_UNSUPPORTED
+// before any spawn.
+function launch(exe: string, args: readonly string[], env: NodeJS.ProcessEnv, cwd: string | undefined) {
+  const l = resolveLaunch(exe, args, env, cwd);
+  const opts: SpawnOptions = { ...(cwd !== undefined ? { cwd } : {}), env: l.env, shell: false,
+    ...(l.argv0 !== undefined ? { argv0: l.argv0 } : {}),
+    ...(l.cmd ? { windowsVerbatimArguments: true, windowsHide: true } : {}) };
+  return { file: l.file, args: l.args, opts };
+}
+
 function collect(exe: string, args: readonly string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    const c = spawn(exe, [...args], { shell: false });
+    const l = launch(exe, args, process.env, undefined);
+    const c = spawn(l.file, l.args, l.opts);
     let out: string[] = [];
     let bytes = 0;
     let done = false;
@@ -62,12 +77,9 @@ export function nodeSpawner(): Spawner {
       const start = Date.now();
       const [exe, ...args] = cmd.argv;
       if (!exe) throw new Error("nodeSpawner: empty argv");
+      const l = launch(exe, args, { ...process.env, ...cmd.env }, cmd.cwd);
       return await new Promise<RunResult>((resolve, reject) => {
-        const child = spawn(exe, args, {
-          cwd: cmd.cwd,
-          env: { ...process.env, ...cmd.env },
-          shell: false,
-        });
+        const child = spawn(l.file, l.args, l.opts);
         let out = "", err = "";
         const t = setTimeout(() => {
           child.kill("SIGKILL");

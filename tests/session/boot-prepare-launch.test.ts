@@ -6,7 +6,8 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { delimiter, dirname, join, resolve, sep } from "node:path";
+import { writeNpmCmdShim } from "./boot-adapter/_win-launch-fixture.js";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..", "..", "..");
 const BOOT_PREPARE = join(REPO_ROOT, "bin", "boot-prepare.mjs");
@@ -26,6 +27,15 @@ function fixture(): { root: string; home: string; target: string; env: (x?: Reco
   const bin = join(root, "shimbin");
   mkdirSync(bin, { recursive: true });
   for (const cli of SHIMS) {
+    // #1167 P5: win32 cannot exec /bin/sh; the same answers and exit 0 come from a JS target behind a
+    // real npm-style `.cmd` shim (V-A, P=node).
+    if (process.platform === "win32") {
+      writeFileSync(join(bin, cli), `#!/usr/bin/env node\nconst a = process.argv[2];\n` +
+        `if (a === "--version") console.log("9.9.9 (shim)");\n` +
+        `else if (a === "--help") console.log("--model --dangerously-skip-permissions --prompt-interactive");\nprocess.exit(0);\n`);
+      writeNpmCmdShim(bin, cli);
+      continue;
+    }
     writeFileSync(join(bin, cli),
       `#!/bin/sh\ncase "$1" in --version) echo "9.9.9 (shim)" ;; --help) echo "--model --dangerously-skip-permissions --prompt-interactive" ;; esac\nexit 0\n`,
       { mode: 0o755 });
@@ -37,7 +47,8 @@ function fixture(): { root: string; home: string; target: string; env: (x?: Reco
   writeFileSync(join(home, "instructions", "common.md"), "# COMMON\n");
   writeFileSync(join(home, "instructions", "roles", "coder.md"), "# Role: coder\n");
   const env = (x: Record<string, string> = {}): NodeJS.ProcessEnv => ({
-    PATH: bin, HOME: join(root, "fakehome"), USERPROFILE: join(root, "fakehome"), TMPDIR: tmpdir(), AIGENTRY_HOME: home,
+    // win32: the shim's `node` comes from PATH, so node's own directory follows the shim dir.
+    PATH: process.platform === "win32" ? [bin, dirname(process.execPath)].join(delimiter) : bin, HOME: join(root, "fakehome"), USERPROFILE: join(root, "fakehome"), TMPDIR: tmpdir(), AIGENTRY_HOME: home,
     CODEX_HOME: join(root, "real-codex"), GEMINI_CLI_HOME: join(root, "real-gemini"), ...x,
   });
   return { root, home, target, env };
