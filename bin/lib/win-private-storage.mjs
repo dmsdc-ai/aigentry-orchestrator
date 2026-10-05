@@ -45,6 +45,17 @@ const WRITE_CLASS = 0x520d0156;
 // FileNotFoundException / UnauthorizedAccessException.
 const SCRIPT = "foreach($l in [Console]::In.ReadToEnd().Split([char]10)){$t=$l.Trim().Split(' ');if($t.Length -ne 3){continue};try{$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($t[2]));$c=[System.Security.AccessControl.AccessControlSections]'Owner,Access';if($t[1] -eq 'd'){$s=New-Object System.Security.AccessControl.DirectorySecurity -ArgumentList $p,$c}else{$s=New-Object System.Security.AccessControl.FileSecurity -ArgumentList $p,$c};$r=New-Object System.Security.AccessControl.RawSecurityDescriptor -ArgumentList @($s.GetSecurityDescriptorBinaryForm(),0);$w=$t[0]+' ok '+$r.Owner.Value+' '+[int]$r.ControlFlags;$a=$r.DiscretionaryAcl;if($a -eq $null){$w+=' null'}else{foreach($e in $a){if($e -is [System.Security.AccessControl.KnownAce]){$w+=' '+[int]$e.AceType+':'+[int]$e.AceFlags+':'+$e.AccessMask+':'+$e.SecurityIdentifier.Value}else{$w+=' '+[int]$e.AceType+':'+[int]$e.AceFlags+':x:x'}}};[Console]::Out.WriteLine($w)}catch{$x=$_.Exception;while($null -ne $x.InnerException){$x=$x.InnerException};[Console]::Out.WriteLine($t[0]+' err '+$x.GetType().Name+' '+$x.HResult)}}";
 
+// #1167 R4 latency fix CANDIDATE, OFF until a windows-latest run of
+// tests/probes/win-powershell-latency.test.mjs accepts it (its header states the criterion).
+// `New-Object` is a cmdlet (Microsoft.PowerShell.Utility), so SCRIPT makes every batch run module
+// discovery and autoload, contrary to PLAN §1.3 "the script uses no cmdlets, so nothing is
+// autoloaded"; that work depends on a module-analysis cache the constructed environment does not
+// point at. SCRIPT_NO_CMDLET is SCRIPT with the three New-Object calls replaced by the .NET
+// constructors, so no command lookup leaves the engine. Same rules (single line, ASCII, no `"`
+// and no `\`), same output grammar, same constructed environment.
+const PS_NO_CMDLET = false;
+const SCRIPT_NO_CMDLET = "foreach($l in [Console]::In.ReadToEnd().Split([char]10)){$t=$l.Trim().Split(' ');if($t.Length -ne 3){continue};try{$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($t[2]));$c=[System.Security.AccessControl.AccessControlSections]'Owner,Access';if($t[1] -eq 'd'){$s=[System.Security.AccessControl.DirectorySecurity]::new($p,$c)}else{$s=[System.Security.AccessControl.FileSecurity]::new($p,$c)};$r=[System.Security.AccessControl.RawSecurityDescriptor]::new($s.GetSecurityDescriptorBinaryForm(),0);$w=$t[0]+' ok '+$r.Owner.Value+' '+[int]$r.ControlFlags;$a=$r.DiscretionaryAcl;if($a -eq $null){$w+=' null'}else{foreach($e in $a){if($e -is [System.Security.AccessControl.KnownAce]){$w+=' '+[int]$e.AceType+':'+[int]$e.AceFlags+':'+$e.AccessMask+':'+$e.SecurityIdentifier.Value}else{$w+=' '+[int]$e.AceType+':'+[int]$e.AceFlags+':x:x'}}};[Console]::Out.WriteLine($w)}catch{$x=$_.Exception;while($null -ne $x.InnerException){$x=$x.InnerException};[Console]::Out.WriteLine($t[0]+' err '+$x.GetType().Name+' '+$x.HResult)}}";
+
 const OK_LINE = new RegExp(`^(\\d+) ok (${SID_TOKEN}) (\\d+)((?: \\S+)*)$`);
 const ERR_LINE = /^(\d+) err ([A-Za-z_][A-Za-z0-9_.`]*) (-?\d+)$/;
 const ACE_TOKEN = new RegExp(`^(\\d+):(\\d+):(-?\\d+|x):(${SID_TOKEN}|x)$`);
@@ -286,7 +297,7 @@ function readBatch(tools, items) {
   if (sent.size > 0) {
     const input = [...sent.keys()].map((i) =>
       `${i} ${items[i].kind === "directory" ? "d" : "f"} ${Buffer.from(toolPath(items[i].path), "utf8").toString("base64")}\n`).join("");
-    r = run(tools, tools.powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", SCRIPT], TIMEOUT.powershell, input);
+    r = run(tools, tools.powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", PS_NO_CMDLET ? SCRIPT_NO_CMDLET : SCRIPT], TIMEOUT.powershell, input);
     if (!r.code) parsed = parseBatch(r.stdout, sent);
   }
   return items.map((_, i) => {
