@@ -44,6 +44,7 @@ const MANIFEST = [
   "bin/lib/platform.sh",
   "bin/lib/telepty-auth.sh",
   "bin/lib/telepty-listing.sh",
+  "bin/lib/win-private-storage.mjs",
   "bin/lib/workspace-host.sh",
   // #1148: the router's --resolve path imports these two siblings; one coupled change.
   "bin/model-evidence.mjs",
