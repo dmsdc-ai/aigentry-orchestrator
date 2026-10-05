@@ -127,14 +127,24 @@ async function child(config: Config): Promise<void> {
     await mod.link((specifier, parent) => load(specifier.startsWith("node:") ? specifier : new URL(specifier, parent.identifier).href));
     return mod;
   }
+  // Phase markers (diagnostics only; this stderr is never asserted). On win32, stdio pipes are written
+  // synchronously, so the last marker before a native crash shows which phase it hit.
+  const mark = (phase: string) => process.stderr.write(`retry-child ${process.pid}: ${phase}\n`);
   const module = await load(new URL("../../src/tracker/report-sweep.js", import.meta.url).href);
   await module.evaluate();
+  mark("product evaluated");
   save(path.join(config.root, `child-${process.pid}.source.json`), sourceReceipts);
   const sweep = (module.namespace as { sweep: (deps: unknown) => Promise<number> }).sweep;
   result.code = await sweep({ stateDir: state, sharedDir: shared, repoDir: config.root, nowMs: config.at,
     stdout: (line: string) => result.stdout.push(line), stderr: (line: string) => result.stderr.push(line) });
   process.stdout.write(JSON.stringify(result) + "\n");
+  mark("result written");
   process.disconnect?.();
+  // win32 #1167: this vm-module child exited 0xC0000005 with empty stderr, while the same sweep()
+  // in report-sweep-continuity's plain-import child did not. After the event loop drains on its own
+  // (a leaked handle still holds the child open and fails the stage), leave through process.exit.
+  // That path skips environment/isolate teardown of the vm contexts and modules above.
+  if (process.platform === "win32") process.once("exit", () => { mark("event loop drained"); process.exit(); });
 }
 
 function fixture(run: string, name: string): Fixture {
@@ -171,6 +181,11 @@ function noCapture(s: Stage, name: string): void {
   assert.equal(s.cursor.seen[name], undefined);
   assert.ok(!s.result.stdout.some(line => line.endsWith(`-${name}.md`)));
 }
+// Assertion-message diagnostics: exit (plus its hex/NTSTATUS form), signal, stdout size and head, full stderr.
+function childState(label: string, exit: number | null, signal: string | null, stdout: string | null, stderr: string | null): string {
+  const hex = exit === null ? "" : ` (0x${(exit >>> 0).toString(16)})`;
+  return `${label}: exit=${exit}${hex} signal=${signal} stdout=${stdout?.length ?? 0}B ${JSON.stringify((stdout ?? "").slice(0, 160))} stderr=${JSON.stringify(stderr ?? "")}`;
+}
 function runStage(f: Fixture, label: string, options: Partial<Config> = {}): Result {
   const config = { root: f.root, at: epoch, ...options };
   const args = ["--experimental-vm-modules", self, "--child", JSON.stringify(config)];
@@ -179,7 +194,8 @@ function runStage(f: Fixture, label: string, options: Partial<Config> = {}): Res
     env: { ...process.env, SR1166_OUTPUT: output } });
   save(path.join(f.root, `${label}.process.json`), { command: [process.execPath, ...args], startedAt, elapsedMs: performance.now() - start,
     exit: processResult.status, signal: processResult.signal, error: processResult.error?.message, stdout: processResult.stdout, stderr: processResult.stderr, inbox: inbox(f), cursorRaw: fs.existsSync(cursorFile(f)) ? fs.readFileSync(cursorFile(f), "utf8") : null });
-  assert.equal(processResult.error, undefined); assert.equal(processResult.status, 0, processResult.stderr);
+  const state = childState(label, processResult.status, processResult.signal, processResult.stdout, processResult.stderr);
+  assert.equal(processResult.error, undefined, `${processResult.error?.message}; ${state}`); assert.equal(processResult.status, 0, state);
   return JSON.parse(processResult.stdout) as Result;
 }
 function stage(f: Fixture, label: string, options: Partial<Config> = {}): Stage { return capture(f, runStage(f, label, options)); }
@@ -196,14 +212,16 @@ function startChild(f: Fixture, label: string, options: Partial<Config>) {
   proc.on("message", message => events.push((message as { event: string }).event));
   const deadline = setTimeout(() => proc.kill("SIGKILL"), 20_000);
   let launchError: Error | undefined;
-  const done = new Promise<{ code: number | null; signal: string | null; stdout: string }>((resolve, reject) => {
+  let closed: { code: number | null; signal: string | null } | undefined;
+  const done = new Promise<{ code: number | null; signal: string | null; stdout: string; stderr: string }>((resolve, reject) => {
     proc.on("error", error => { launchError = error; });
     proc.on("close", (code, signal) => {
       clearTimeout(deadline);
+      closed = { code, signal };
       try {
         save(path.join(f.root, `${label}.process.json`), { command: [process.execPath, ...args], startedAt, elapsedMs: performance.now() - start, exit: code, signal, error: launchError?.message, stdout, stderr, events });
         if (launchError) reject(launchError);
-        else resolve({ code, signal, stdout });
+        else resolve({ code, signal, stdout, stderr });
       } catch (error) { reject(error); }
     });
   });
@@ -212,7 +230,8 @@ function startChild(f: Fixture, label: string, options: Partial<Config>) {
   activeChildren.push({ proc, done });
   const event = (name: string) => new Promise<void>((resolve, reject) => {
     if (events.includes(name)) { resolve(); return; }
-    const timeout = setTimeout(() => { proc.off("message", listener); reject(new Error(`barrier timeout: ${name}`)); }, 10_000);
+    const timeout = setTimeout(() => { proc.off("message", listener);
+      reject(new Error(`barrier timeout: ${name}; closed=${closed !== undefined} events=${JSON.stringify(events)} ${childState(label, closed?.code ?? null, closed?.signal ?? null, stdout, stderr)}`)); }, 10_000);
     const listener = (message: unknown) => {
       if ((message as { event: string }).event === name) { clearTimeout(timeout); proc.off("message", listener); resolve(); }
     };
@@ -342,7 +361,8 @@ async function suite(): Promise<void> {
       const second = startChild(f, "second", { fault: "read" }); children.push(second.proc);
       await second.event("contended"); first.proc.send("release");
       const [a, b] = await Promise.all([first.done, second.done]);
-      assert.equal(a.code, 0); assert.equal(b.code, 0);
+      assert.equal(a.code, 0, childState("first", a.code, a.signal, a.stdout, a.stderr));
+      assert.equal(b.code, 0, childState("second", b.code, b.signal, b.stdout, b.stderr));
       const ar = JSON.parse(a.stdout) as Result, br = JSON.parse(b.stdout) as Result;
       assert.equal(ar.code, 0); assert.equal(br.code, 0);
       assert.equal(ar.stdout.length + br.stdout.length, 2);
@@ -358,7 +378,8 @@ async function suite(): Promise<void> {
       await c.event(barrier);
       save(path.join(f.root, "at-barrier.json"), { cursor: fs.readFileSync(cursorFile(f), "utf8"), inbox: inbox(f) });
       c.proc.kill("SIGKILL"); const killed = await c.done;
-      assert.equal(killed.code, null); assert.equal(killed.signal, "SIGKILL"); assert.equal(killed.stdout, "");
+      const why = childState("crash", killed.code, killed.signal, killed.stdout, killed.stderr);
+      assert.equal(killed.code, null, why); assert.equal(killed.signal, "SIGKILL", why); assert.equal(killed.stdout, "", why);
       const recovered = stage(f, "restart", { at: later });
       assert.equal(recovered.result.code, 0); exact(recovered, "A"); assert.deepEqual(recovered.cursor.retries, []);
       assert.equal(recovered.result.stdout.length, barrier === "copy-before-cursor" ? 1 : 0);
