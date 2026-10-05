@@ -11,7 +11,7 @@
 #   show the nested known-empty false positive. It is control evidence only and never counts as a product PASS.
 # - Both real caller forms are built from the pinned source lines (run-validation.ps1:75-76, setup-fixtures.ps1:755-756).
 # - The pure diagnostic formatters Format-PspVerdictDiag (run-validation.ps1 lines 103-140), Format-PspCleanupDiag
-#   (lines 175-218) and Format-PspVerdictOpDiag (lines 226-348) are taken the same way (pinned Extent.Text sha256, no command
+#   (lines 175-218) and Format-PspVerdictOpDiag (lines 226-349) are taken the same way (pinned Extent.Text sha256, no command
 #   at all, pinned member-name set) and run over in-memory TAP text / cleanup records with injection payloads; every line
 #   must match its closed grammar exactly.
 # - Get-CimInstance / Invoke-CimMethod are script-scope mock functions over fake objects (numeric PIDs, mock.exe, synthetic
@@ -29,8 +29,8 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0   # as setup-fixtures.ps1:10 / run-validation.ps1:19, the scope both real callers run under
 
-$ExpectedSourceSha256 = 'e5c0a671fb5d0e28584d0cc86a2cfe5230f0680fc079ba9a22dbddbbbdebd777'
-$ExpectedCallerSha256 = '142aaa3afa291fb8f34889ebcd2c1dfeb1e2d123e987ac4368e97bc09614bce6'
+$ExpectedSourceSha256 = 'aef74122fef9390cec25a70813ed5414b398792c9d5f38a32b51624b52add6d9'
+$ExpectedCallerSha256 = 'b6d9cc4759f948e4b01bbc827942c4715e2ec5888278aa6e621d124297ad9e7b'
 $ExpectedExtentSha256 = '907ebffaa853db841e02c7e3ab0fad0a805b88f8b038b57ba428bbee6cef8473'
 $BaselineExtentSha256 = 'b460bab2746846988518ade81b10f3760668a9ccb18d15add29cb936c26de332'
 $FunctionName = 'Get-PspLiveSidProcesses'
@@ -43,7 +43,7 @@ $CandidateMembers = @('GetType', 'GetType')
 $Formatters = @(
   [ordered]@{ name = 'Format-PspVerdictDiag'; start = 103; end = 140; sha = 'c4ebd70638fc576fc3dd904c77ab6b26612841b35f766988ce53174507703329'; members = @('ComputeHash', 'Create', 'Dispose', 'GetBytes', 'Split', 'ToLowerInvariant', 'ToString', 'TrimEnd') }
   [ordered]@{ name = 'Format-PspCleanupDiag'; start = 175; end = 218; sha = '06795a7cab97e9ed3e138046c821cdf188544cda95efa4ae06b466c9bfbafe43'; members = @('StartsWith') }
-  [ordered]@{ name = 'Format-PspVerdictOpDiag'; start = 226; end = 348; sha = 'f69bacde18a0e5826d76c8009850e73d6c65dfdf7c77b60c338cd660c3e11f50'; members = @('ContainsKey', 'Split', 'StartsWith', 'Substring', 'TrimEnd', 'TrimStart') }
+  [ordered]@{ name = 'Format-PspVerdictOpDiag'; start = 226; end = 349; sha = 'b6dfe1131e3708ff9f53fec0792a496c505f7af8c30a4d4b1aab81c9d2943608'; members = @('ContainsKey', 'Split', 'StartsWith', 'Substring', 'TrimEnd', 'TrimStart') }
 )
 $DiagOwnerPattern = '^psp-diag owner-unknown cat=(enumeration|query|shape|rv-missing|rv-type|rv-nonzero|sid-invalid) pid=(none|[0-9]{1,10}) rv=(none|-?[0-9]{1,20})\z'
 $DiagOwnerCountsPattern = '^psp-diag owner-unknown-counts rows=[0-9]{1,10} hits=[0-9]{1,10} query=[0-9]{1,10} shape=[0-9]{1,10} rv-missing=[0-9]{1,10} rv-type=[0-9]{1,10} rv-nonzero=[0-9]{1,10} sid-invalid=[0-9]{1,10}\z'
@@ -599,6 +599,8 @@ try {
     'kind=rbsplit test=contradict flagProtected=1 flagAutoInherited=2 flagIsNull=0 flagMissing=0 flagUnparsed=0 orderDenyRelChanged=1 orderDenyRelUnchanged=3 orderDenyRelUnknown=0 aclErrTypes=UnauthorizedAccessException:8,NotSupportedException:4 aclErrOther=1 aclErrAbsent=0'
     'kind=linkacl case=D_JUNCTION need=rcra link=present reparse=true owner=admins aAllow=none missing=none aDeny=0 adminAllow=2 otherAllow=0 otherDeny=0'
     'kind=linkacl case=F_UNDER_JUNCTION need=ra link=present reparse=true owner=adminUser aAllow=UNKNOWN missing=groupMembership aDeny=0 adminAllow=1 otherAllow=1 otherDeny=0'
+    'kind=linkacl case=D_SYMLINK need=rcra link=present reparse=true owner=admins aAllow=UNKNOWN missing=sidA aDeny=0 adminAllow=2 otherAllow=0 otherDeny=0'
+    'kind=rbcause test=unproved missGetacl=24 missOracle=4 missSideUnknown=0 missNonAclVolume=16 missOracleNull=8 missOther=3 missUnknown=1 errStream=12 errNonAclVolume=0 errOther=0 errUnknown=0 hlNzStream=4 hlNzNonAclVolume=20 hlNzOther=60 hlNzUnknown=1'
   )
   $OpP = '# psp-op/1 '
   $O1 = @('TAP version 13', '# Subtest: x', 'not ok 1 - x', '  ---', '  ...') + @(for ($i = 0; $i -lt $OpV.Count; $i++) { if ($i -eq 4) { $OpP + $OpV[$i] + "`r" } else { $OpP + $OpV[$i] } }) + @('1..1', '# tests 1', '# pass 0', '# fail 1')
@@ -625,14 +627,20 @@ try {
     ($OpP + $OpV[11].Replace('aAllow=none', 'aAllow=granted')), ($OpP + $OpV[11].Replace(' otherDeny=0', ''))
     ($OpP + 'kind=linkacl case=UNKNOWN need=UNKNOWN link=absent reparse=none owner=none aAllow=UNKNOWN missing=snapshot aDeny=0 adminAllow=0 otherAllow=0 otherDeny=0')
     ($OpP + $OpV[11]), ($OpP + $OpV[11])
+    # rbcause / linkacl sidA: a valid and an UNKNOWN-test rbcause are accepted, a repeat is a duplicate; a missing or extra field,
+    # an over-long count, a raw SID or raw path value and an unlisted or lowercase missing-input name are malformed.
+    ($OpP + $OpV[14]), ($OpP + $OpV[14]), ($OpP + $OpV[14].Replace('test=unproved', 'test=UNKNOWN'))
+    ($OpP + $OpV[14].Replace(' hlNzUnknown=1', '')), ($OpP + $OpV[14] + ' hlNzExtra=1'), ($OpP + $OpV[14].Replace('hlNzOther=60', 'hlNzOther=100000'))
+    ($OpP + $OpV[14].Replace('test=unproved', 'test=S-1-5-21-1-2-3-1001')), ($OpP + $OpV[14].Replace('errStream=12', 'errStream=C:\fx\secret.bin:alt'))
+    ($OpP + $OpV[13].Replace('missing=sidA', 'missing=sida')), ($OpP + $OpV[13].Replace('missing=sidA', 'missing=sidB'))
   )
   $OCases = @(
     [ordered]@{ id = 'to-valid-all-kinds'; rs = 'ok'; text = ($O1 -join "`n"); forbid = @('Subtest', 'not ok', 'TAP', '#')
-      expect = @(@(OpSum 'ok' @(13, 13, 13, 0, 0, 0, 0, 0, 0)) + @($OpV | ForEach-Object { 'psp-diag verdict-op ' + $_ })) }
-    [ordered]@{ id = 'to-hostile'; rs = 'ok'; text = ($O2 -join "`n"); forbid = @('pwn', 'SeEvil', 'S-1-', 'xxxx', 'sechangenotify', 'd_junction', 'PRIV', 'shell', '[31m', 'differ', 'status=ok', '100000', '99999999999', '#', 'extra', 'Evil', 'unauthorized', '123456', 'D_OK', 'granted')
-      expect = @((OpSum 'ok' @(39, 4, 4, 0, 30, 1, 3, 2, 1)), ('psp-diag verdict-op ' + $OpV[4]), ('psp-diag verdict-op ' + $OpV[6]),
+      expect = @(@(OpSum 'ok' @(15, 15, 15, 0, 0, 0, 0, 0, 0)) + @($OpV | ForEach-Object { 'psp-diag verdict-op ' + $_ })) }
+    [ordered]@{ id = 'to-hostile'; rs = 'ok'; text = ($O2 -join "`n"); forbid = @('pwn', 'SeEvil', 'S-1-', 'xxxx', 'sechangenotify', 'd_junction', 'PRIV', 'shell', '[31m', 'differ', 'status=ok', '100000', '99999999999', '#', 'extra', 'Evil', 'unauthorized', '123456', 'D_OK', 'granted', 'hlNzExtra', 'secret', 'sida', 'sidB')
+      expect = @((OpSum 'ok' @(49, 6, 6, 0, 37, 1, 4, 2, 1)), ('psp-diag verdict-op ' + $OpV[4]), ('psp-diag verdict-op ' + $OpV[6]),
         'psp-diag verdict-op kind=linkacl case=UNKNOWN need=UNKNOWN link=absent reparse=none owner=none aAllow=UNKNOWN missing=snapshot aDeny=0 adminAllow=0 otherAllow=0 otherDeny=0',
-        ('psp-diag verdict-op ' + $OpV[11])) }
+        ('psp-diag verdict-op ' + $OpV[11]), ('psp-diag verdict-op ' + $OpV[14]), ('psp-diag verdict-op ' + $OpV[14].Replace('test=unproved', 'test=UNKNOWN'))) }
     [ordered]@{ id = 'to-too-many-lines'; rs = 'ok'; text = ($OpP + $OpV[4] + ("`n" * 50000)); forbid = @('bindseq')
       expect = @(OpSum 'too-many-lines' @(0, 0, 0, 0, 0, 0, 0, 0, 0)) }
     [ordered]@{ id = 'to-read-status-not-enum'; rs = "ok`n::error::pwn"; text = ($OpP + $OpV[4]); forbid = @('pwn', 'bindseq')

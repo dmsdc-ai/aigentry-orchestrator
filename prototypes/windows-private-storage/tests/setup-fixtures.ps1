@@ -807,7 +807,9 @@ function New-PspFixtures { param([string]$Root, [string]$SidA, [string]$SidB, $S
   [void](Invoke-PspNative 'grant-bin' 'icacls.exe' @($bin, '/grant', "*${SidA}:(OI)(CI)RX", "*${SidB}:(OI)(CI)RX", '/Q'))
   [void](Invoke-PspNative 'grant-work-A' 'icacls.exe' @($wa, '/grant', "*${SidA}:(OI)(CI)F", '/Q'))
   [void](Invoke-PspNative 'grant-work-B' 'icacls.exe' @($wb, '/grant', "*${SidB}:(OI)(CI)F", '/Q'))
-  [void](Invoke-PspNative 'grant-fx' 'icacls.exe' @($fx, '/grant', "*${SidA}:(RX)", "*${SidB}:(RX)", '/Q'))
+  # F1: A's fx grant is container-inherit so the four directory links mklink creates in fx below inherit A:RX at creation
+  # (nothing is written to a link or its target); every non-link fx child is re-protected by the DACL section. B unchanged.
+  [void](Invoke-PspNative 'grant-fx' 'icacls.exe' @($fx, '/grant', "*${SidA}:(CI)(RX)", "*${SidB}:(RX)", '/Q'))
   $m.content['a-own'] = New-PspFile "$wa\a-own.bin"
   $m.content['b-own'] = New-PspFile "$wb\b-own.bin"
 

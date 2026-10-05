@@ -244,6 +244,28 @@ Mapping these to auth.ts reasons (`storage_unsafe`, `storage_unavailable`,
   (host must be `node.exe`; no delay-load hook for renamed hosts).
 - Native memory safety needs independent review.
 
+## Validation fixture and diagnostics (fake-credential CI only)
+
+- **Fixture F1.** `setup-fixtures.ps1` grants A `(CI)(RX)` on `fx` (was `(RX)`),
+  so the four directory links `mklink` creates in `fx` inherit A:RX at creation.
+  Nothing is written to a link or its target. B, the root and the other grants
+  are unchanged; every non-link `fx` child is still re-protected afterwards.
+- **linkacl.** A missing or non-`S-1-...` A SID now gives `aAllow=UNKNOWN
+  missing=sidA`, never `none` (precedence snapshot > sddl > sidA > dacl). The
+  first unparseable ACE reason (`rights` or `aceType`) is kept.
+- **rbcause** (one line per read-back test). It partitions existing rows by
+  already-recorded fields only: no new collection, open, API or SDDL change.
+  - The rbsplit `flagMissing` rows, by the text that has no `D:`
+    (getacl/oracle), and by class: nonAclVolume > oracleNull > unknown > other.
+  - Rows with a Get-Acl error and non-directory/non-reparse rows with a nonzero or unmeasured hardlink exit, by
+    manifest stream case path (D_ADS/F_ADS/F_DATA_STREAM) > unknown (a case path
+    is missing) > nonAclVolume > unknown (no volume metadata) > other.
+  - The counts are operands, not causes. Verdicts, readbackFindings and the gate
+    are unchanged.
+- **Status.** Actual CI 37243865183 on bff4f7a: 139 pass / 10 fail. Four link
+  cases plus two cascades turning green is a FORECAST for the next CI run, not
+  a result. Read-back stays unproved.
+
 ## Build (CI only)
 
 ```powershell

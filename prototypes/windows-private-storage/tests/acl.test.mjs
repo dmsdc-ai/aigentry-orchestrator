@@ -729,14 +729,59 @@ export function readbackOperands(test, snaps, objects) {
   ];
 }
 
+// rbcause, DIAGNOSTIC only: partitions three existing row sets by already-recorded fields. Every count is an operand, never
+// a cause; no SDDL, verdict or readbackFindings predicate is touched, nothing new is collected or opened.
+// miss*: the rbsplit flagMissing rows. Side = which existing text has no top-level D: (getacl / oracle; sideUnknown is
+// unreachable while flagMissing holds). Class, exclusive, first match wins: (1) nonAclVolume = volumeError 0 and
+// persistentAcls false; (2) oracleNull = the oracle SDDL has D:NO_ACCESS_CONTROL (an oracle with no D: is never this);
+// (3) unknown = volume metadata not recorded (volumeError nonzero or persistentAcls not boolean); (4) other.
+// err* (rows with a recorded Get-Acl error type) and hlNz* (non-directory/non-reparse rows with a nonzero or unmeasured fsutil hardlink exit),
+// exclusive, first match wins: (1) stream = the row path equals the manifest case path of D_ADS, F_ADS or F_DATA_STREAM
+// (finalPathMatches, the existing case-insensitive Windows comparison; no colon parsing); (2) unknown = any of those three
+// case paths is not in the manifest, or the row has no path; (3) nonAclVolume as above; (4) unknown = volume metadata not
+// recorded; (5) other. No path is printed.
+export const OP_STREAM_CASES = Object.freeze(['D_ADS', 'F_ADS', 'F_DATA_STREAM']);
+export function readbackCauseOperands(test, objects, manifest) {
+  const z = () => ({ Stream: 0, NonAclVolume: 0, Other: 0, Unknown: 0 });
+  const miss = { missGetacl: 0, missOracle: 0, missSideUnknown: 0, missNonAclVolume: 0, missOracleNull: 0, missOther: 0, missUnknown: 0 };
+  const err = z(); const hl = z();
+  const cs = asArray(manifest && manifest.cases);
+  const streams = OP_STREAM_CASES.map((id) => cs.find((c) => c && c.id === id)).map((c) => (c && typeof c.path === 'string' && c.path !== '' ? c.path : null));
+  const vol = (o) => (o.volumeError === 0 && typeof o.persistentAcls === 'boolean' ? (o.persistentAcls ? 'acl' : 'nonAcl') : 'unrecorded');
+  const pathClass = (o) => {
+    if (typeof o.path === 'string' && streams.some((p) => p !== null && finalPathMatches(p, o.path))) return 'Stream';
+    if (typeof o.path !== 'string' || streams.includes(null)) return 'Unknown';
+    const v = vol(o);
+    return v === 'nonAcl' ? 'NonAclVolume' : v === 'unrecorded' ? 'Unknown' : 'Other';
+  };
+  for (const o of asArray(objects)) {
+    if (!o || o.openError !== 0) continue;
+    if (typeof o.getAclSddl === 'string') {
+      if (o.getAclSddl !== o.sddl && !o.isReparse && sddlDiffSplit(o.getAclSddl, o.sddl).includes('flagMissing')) {
+        const x = parseSddl(o.getAclSddl); const y = parseSddl(o.sddl);
+        if (!x.dacl && y.dacl) miss.missGetacl++; else if (x.dacl && !y.dacl) miss.missOracle++; else miss.missSideUnknown++;
+        const v = vol(o);
+        if (v === 'nonAcl') miss.missNonAclVolume++;
+        else if (y.dacl && y.dacl.isNull === true) miss.missOracleNull++;
+        else if (v === 'unrecorded') miss.missUnknown++;
+        else miss.missOther++;
+      }
+    } else if (o.getAclError !== null && o.getAclError !== undefined) err[pathClass(o)]++;
+    if (!o.isDir && !o.isReparse && o.fsutilHardlinkExit !== 0) hl[pathClass(o)]++;
+  }
+  return opLine('rbcause', [['test', opEnum(test, ['contradict', 'unproved'])], ...Object.entries(miss).map(([k, v]) => [k, opCount(v)]),
+    ...Object.entries(err).map(([k, v]) => [`err${k}`, opCount(v)]), ...Object.entries(hl).map(([k, v]) => [`hlNz${k}`, opCount(v)])]);
+}
+
 // F1 observation, DIAGNOSTIC only, for the four link cases: does the S0 oracle SDDL of the relevant link object (the leaf
 // link, or the junction ancestor for *_UNDER_JUNCTION) carry an allow ACE for A's own SID whose generic-mapped mask covers
 // what the helper opens it with: leaf READ_CONTROL|FILE_READ_ATTRIBUTES (private_storage.c:819), ancestor
 // FILE_READ_ATTRIBUTES (c:377)? ACE presence only, never effective access: owner-implicit rights and FILE_READ_ATTRIBUTES
 // granted through the parent are not modelled, so aAllow=none is not a denial proof. BUILTIN\Administrators and SYSTEM
 // ACEs are counted apart (A's non-membership is the identity verdict, not this line). aAllow=UNKNOWN names the minimum
-// missing input: snapshot (no S0 link object), sddl (no parsable oracle SDDL), dacl (absent or NULL DACL), aceType /
-// rights (an applicable ACE the existing parser cannot map), groupMembership (only another SID's ACE could grant it).
+// missing input: snapshot (no S0 link object), sddl (no parsable oracle SDDL), sidA (A's SID missing or not S-1-... after
+// normalizeSid), dacl (absent or NULL DACL), aceType / rights (an applicable ACE the existing parser cannot map; the first
+// one wins), groupMembership (only another SID's ACE could grant it). Precedence: snapshot > sddl > sidA > dacl.
 export const OP_LINK_CASES = Object.freeze({ D_JUNCTION: 'leaf', D_SYMLINK: 'leaf', D_UNDER_JUNCTION: 'ancestor', F_UNDER_JUNCTION: 'ancestor' });
 export function linkObjectPath(c) {
   if (!c || typeof c.path !== 'string' || !OP_LINK_CASES[c.id]) return null;
@@ -757,7 +802,8 @@ export function linkAclOperands(c, snap, sids) {
   const kind = OP_LINK_CASES[id];
   const need = (kind === 'leaf' ? RIGHTS.RC | RIGHTS.LO : RIGHTS.LO) >>> 0;
   const s = sids || {};
-  const sa = normalizeSid(s.A);
+  const saN = normalizeSid(s.A);
+  const sa = saN !== null && /^S-1(?:-\d+)+$/.test(saN) ? saN : null;
   const n = { aDeny: 0, adminAllow: 0, otherAllow: 0, otherDeny: 0 };
   let owner = 'none'; let aAllow = 'UNKNOWN'; let missing = 'none';
   const sd = snap && snap.openError === 0 && !snap.sddlError && typeof snap.sddl === 'string' ? parseSddl(snap.sddl) : null;
@@ -767,12 +813,13 @@ export function linkAclOperands(c, snap, sids) {
     const o = normalizeSid(sd.owner);
     owner = o === null ? 'none' : o === sa ? 'A' : o === normalizeSid(s.B) ? 'B' : o === SID_ADMINS ? 'admins'
       : o === SID_SYSTEM ? 'system' : o === normalizeSid(s.adminUser) ? 'adminUser' : 'other';
-    if (!sd.dacl || sd.dacl.isNull) missing = 'dacl';
+    if (sa === null) missing = 'sidA';
+    else if (!sd.dacl || sd.dacl.isNull) missing = 'dacl';
     else {
       let ex = 0; let inh = 0;
       for (const a of sd.dacl.aces) {
         if (a.flags.includes('IO')) continue;
-        if (a.type !== 'A' && a.type !== 'D') { missing = 'aceType'; continue; }
+        if (a.type !== 'A' && a.type !== 'D') { if (missing === 'none') missing = 'aceType'; continue; }
         const m = mappedFileMask(a.rights);
         if (m === null) { if (missing === 'none') missing = 'rights'; continue; }
         const who = sa !== null && a.sid === sa ? 'A' : (a.sid === SID_ADMINS || a.sid === SID_SYSTEM ? 'adminSystem' : 'other');
@@ -1034,6 +1081,77 @@ if (PHASE === 'selfcheck') {
     assert.deepEqual([absent.link, absent.reparse, absent.owner, absent.aAllow, absent.missing], ['absent', 'none', 'none', 'UNKNOWN', 'snapshot']);
     const other = k({ id: 'D_OK', path: 'D:\\a' }, ln('O:BAG:SYD:P'));
     assert.deepEqual([other.case, other.need], ['UNKNOWN', 'none']);
+  });
+
+  test('selfcheck: linkacl names sidA for a missing or invalid A SID (never aAllow=none) and keeps the first unknown ACE reason', () => {
+    const J = { id: 'D_JUNCTION', path: 'D:\\a\\fx\\junction-to-ok' };
+    const ln = (sddl, x = {}) => ({ openError: 0, isReparse: true, sddl, ...x });
+    const k = (snap, sids) => { const l = linkAclOperands(J, snap, sids); assert.ok(OP_LINE.test(l) && !/S-1-|secret|alias/i.test(l), l); return opKv(l); };
+    assert.deepEqual([k({ openError: 0, sddl: 'O:BAG:SYD:P(A;;FA;;;BA)' }, {}).aAllow, k({ openError: 0, sddl: 'O:BAG:SYD:P(A;;FA;;;BA)' }, {}).missing], ['UNKNOWN', 'sidA']);
+    for (const bad of [undefined, null, '', 'A', 'secret', 'S-', 'S-1', 'S-1x-5', 'S-1-5-21-x-2', ' S-1-5-21-1-2-3-1001', 42, {}, ['S-1-5-21-1-2-3-1001']]) {
+      const v = k(ln(`O:BAG:SYD:AI(A;ID;FA;;;BA)(A;ID;FA;;;${A})`), { A: bad, B });
+      assert.deepEqual([v.aAllow, v.missing], ['UNKNOWN', 'sidA'], JSON.stringify(bad));
+    }
+    assert.deepEqual([k(ln('O:BAG:SY'), {}).missing, k(ln('O:BAG:SYD:NO_ACCESS_CONTROL'), { A: 'x' }).missing], ['sidA', 'sidA'], 'sidA precedes dacl');
+    assert.deepEqual([k(ln(null, { sddlError: 5 }), {}).missing, k(ln('O:BAG:SY', { openError: 5 }), {}).missing, k(undefined, {}).missing], ['sddl', 'snapshot', 'snapshot'],
+      'snapshot > sddl > sidA');
+    assert.equal(k(ln(`O:${A}G:SYD:P(A;;FA;;;${A})`), { A: A.toLowerCase(), B }).aAllow, 'explicit', 'a valid SID still normalizes');
+    assert.equal(k(ln('O:BAG:SYD:P(A;;FA;;;BA)'), { A, B }).aAllow, 'none', 'a valid A SID with no A ACE stays none');
+    assert.deepEqual([k(ln(`O:BAG:SYD:P(A;;ZZ;;;${A})(XA;;FR;;;${A};(x))`), { A }).missing, k(ln(`O:BAG:SYD:P(XA;;FR;;;${A};(x))(A;;ZZ;;;${A})`), { A }).missing],
+      ['rights', 'aceType'], 'the first unknown reason is kept');
+  });
+
+  test('selfcheck: rbcause partitions flagMissing / Get-Acl-error / hardlink-nonzero rows by recorded fields only, closed and bounded', () => {
+    const O = `O:${A}G:${A}`; const P = `${O}D:P(A;;FA;;;${A})`;
+    const man = { cases: [{ id: 'D_ADS', path: 'C:\\fx\\d::$INDEX_ALLOCATION' }, { id: 'F_ADS', path: 'C:\\fx\\secret.bin:alt' }, { id: 'F_DATA_STREAM', path: 'C:\\fx\\ok.bin::$DATA' }] };
+    const acl = { volumeError: 0, persistentAcls: true }; const fat = { volumeError: 0, persistentAcls: false };
+    const ms = (g, o, v, x = {}) => ({ path: 'C:\\fx\\m', openError: 0, isDir: true, isReparse: false, sddl: o, getAclSddl: g, fsutilReparseExit: 1, ...v, ...x });
+    // An explicit undefined argument still takes the parameter default, so an absent field needs its own sentinel.
+    const MISSING = Symbol('missing');
+    const er = (p, v, e = 'NotSupportedException') => ({ path: p, openError: 0, isDir: true, isReparse: false, sddl: P, getAclSddl: null, fsutilReparseExit: 1, ...v, ...(e === MISSING ? {} : { getAclError: e }) });
+    const hl = (p, v, exit = 1) => ({ path: p, openError: 0, isDir: false, isReparse: false, nLinks: 1, sddl: P, getAclSddl: P, fsutilReparseExit: 1, ...v, ...(exit === MISSING ? {} : { fsutilHardlinkExit: exit }) });
+    const objs = [
+      ms(O, `${O}D:NO_ACCESS_CONTROL`, acl), ms(P, O, acl), ms(O, `${O}D:NO_ACCESS_CONTROL`, fat), ms(O, P, { volumeError: 5, persistentAcls: false }), ms(O, P, {}),
+      ms(O, P, acl), ms(`${O}D:(A;;FA;;;${A})`, P, acl), ms(O, P, acl, { isReparse: true }), ms(O, P, acl, { openError: 5 }), ms(O, 'garbage', acl),
+      er('c:\\FX\\SECRET.BIN:ALT', acl), er('C:\\fx\\d::$INDEX_ALLOCATION', fat), er('C:\\fx\\plain', fat), er('C:\\fx\\plain', acl), er('C:\\fx\\x:evil', acl),
+      er('C:\\fx\\plain', { volumeError: 87 }), er(undefined, acl), er('C:\\fx\\plain', acl, MISSING), er('C:\\fx\\plain', acl, null),
+      hl('C:\\fx\\ok.bin::$DATA', fat), hl('C:\\fx\\plain', fat), hl('C:\\fx\\plain', acl), hl('C:\\fx\\plain', acl, MISSING), hl('C:\\fx\\plain', {}, 1),
+      hl('C:\\fx\\plain', acl, 0), { ...hl('C:\\fx\\plain', acl), isDir: true }, { ...hl('C:\\fx\\plain', acl), isReparse: true, fsutilReparseExit: 0 },
+    ];
+    const has = (o, f) => Object.prototype.hasOwnProperty.call(o, f);
+    assert.deepEqual([has(objs[17], 'getAclError'), objs[17].getAclError], [false, undefined], 'the missing-getAclError fixture has no field, not the default');
+    assert.deepEqual([has(objs[18], 'getAclError'), objs[18].getAclError], [true, null], 'the null-getAclError fixture keeps an explicit null');
+    assert.deepEqual([has(objs[13], 'getAclError'), objs[13].getAclError], [true, 'NotSupportedException'], 'the default getAclError fixture records an error type');
+    assert.deepEqual([has(objs[22], 'fsutilHardlinkExit'), objs[22].fsutilHardlinkExit], [false, undefined], 'the missing-hardlink-exit fixture has no field, not the default');
+    assert.deepEqual([has(objs[21], 'fsutilHardlinkExit'), objs[21].fsutilHardlinkExit], [true, 1], 'the default hardlink-exit fixture records exit 1');
+    assert.deepEqual([has(objs[24], 'fsutilHardlinkExit'), objs[24].fsutilHardlinkExit], [true, 0], 'the exit-0 hardlink fixture records exit 0');
+    const kv = (l) => { assert.ok(OP_LINE.test(l), l); assert.ok(!/secret|evil|S-1-|C:|fx|DATA|INDEX|alt|alias/i.test(l), l); return opKv(l); };
+    const v = kv(readbackCauseOperands('unproved', objs, man));
+    assert.equal(v.kind, 'rbcause');
+    const pick = (x, ks) => ks.map((q) => x[q]);
+    const MS = ['missGetacl', 'missOracle', 'missSideUnknown', 'missNonAclVolume', 'missOracleNull', 'missOther', 'missUnknown'];
+    const ER = ['errStream', 'errNonAclVolume', 'errOther', 'errUnknown']; const HL = ['hlNzStream', 'hlNzNonAclVolume', 'hlNzOther', 'hlNzUnknown'];
+    assert.deepEqual(pick(v, MS), ['5', '1', '0', '1', '1', '2', '2'], 'side split; nonAclVolume > oracleNull > unknown > other; an oracle with no D: is never oracleNull');
+    assert.deepEqual(pick(v, ER), ['2', '1', '2', '2'], 'stream by manifest case path only; a colon in another path is not parsed');
+    assert.deepEqual(pick(v, HL), ['1', '1', '2', '1'], 'dirs, reparse and exit 0 are not in the hardlink-nonzero set');
+    const r = readbackOperands('unproved', {}, objs).map(opKv);
+    const sum = (x, ks) => String(ks.reduce((a2, q) => a2 + Number(x[q]), 0));
+    assert.deepEqual([sum(v, MS.slice(0, 3)), sum(v, MS.slice(3))], [r[2].flagMissing, r[2].flagMissing], 'both miss partitions sum to rbsplit flagMissing');
+    assert.deepEqual([sum(v, ER), sum(v, HL)], [r[0].aclErrPresent, r[0].hlExitNonzero], 'partitions sum to the existing readback counts');
+    assert.deepEqual(readbackFindings(objs).unproved.length, Number(r[0].aclDiffReparse) + Number(r[0].aclUnavailNonReparse) + Number(r[0].aclUnavailReparse) + Number(r[0].hlExitNonzero) + Number(r[0].rpExitNonzero),
+      'readbackFindings unchanged');
+    for (const m of [undefined, null, {}, { cases: 'x' }, { cases: man.cases.slice(1) }, { cases: [...man.cases.slice(0, 2), { id: 'F_DATA_STREAM' }] }]) {
+      const u = kv(readbackCauseOperands('unproved', objs, m));
+      assert.deepEqual(pick(u, MS), pick(v, MS), 'miss rows need no manifest');
+      const stream = m && Array.isArray(m.cases) && m.cases.length === 2 && m.cases[0].id === 'F_ADS' ? '1' : (m && Array.isArray(m.cases) && m.cases.length === 3 ? '2' : '0');
+      assert.equal(u.errStream, stream, JSON.stringify(m));
+      assert.deepEqual([u.errNonAclVolume, u.errOther, u.hlNzNonAclVolume, u.hlNzOther], ['0', '0', '0', '0'], 'a missing manifest case is unknown, never a diagnosis');
+    }
+    assert.equal(kv(readbackCauseOperands('payload', [], man)).test, 'UNKNOWN');
+    const e = kv(readbackCauseOperands('contradict', undefined, undefined));
+    assert.deepEqual([e.test, ...pick(e, [...MS, ...ER, ...HL])], ['contradict', ...Array(15).fill('0')]);
+    const big = kv(readbackCauseOperands('unproved', Array.from({ length: 100001 }, () => er('C:\\fx\\plain', acl)), man));
+    assert.equal(big.errOther, '99999', 'counts are clipped, never unbounded');
   });
 }
 
@@ -1356,11 +1474,13 @@ if (PHASE === 'verdict') {
   const allSnapObjects = () => ['S0', 'S1', 'S2', 'S3'].flatMap((t) => asArray(snaps[t] && snaps[t].objects));
   test('verdict: independent read-back never contradicts the backup-handle oracle', (t) => {
     opDiag(t, () => readbackOperands('contradict', snaps, allSnapObjects()));
+    opDiag(t, () => readbackCauseOperands('contradict', allSnapObjects(), manifest));
     assert.deepEqual(snapshotSetProblems(snaps), []);
     assert.deepEqual(readbackFindings(allSnapObjects()).contradictions, []);
   });
   test('verdict: CONTRACT-HOLD r2 §4 Get-Acl/fsutil read-back available for every gated object', (t) => {
     opDiag(t, () => readbackOperands('unproved', snaps, allSnapObjects()));
+    opDiag(t, () => readbackCauseOperands('unproved', allSnapObjects(), manifest));
     assert.deepEqual(snapshotSetProblems(snaps), [], 'CONTRACT_UNPROVED: no read-back evidence at all');
     const { unproved } = readbackFindings(allSnapObjects());
     assert.deepEqual(unproved, [], `CONTRACT_UNPROVED (not waived, oracle not replaced): ${unproved.length} read-backs unavailable`);

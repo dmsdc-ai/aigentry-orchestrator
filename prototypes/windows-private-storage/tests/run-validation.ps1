@@ -267,7 +267,7 @@ function Format-PspVerdictOpDiag { param([string]$ReadStatus, [string]$Text)
           'PathTooLongException', 'IOException', 'ArgumentException', 'NotSupportedException', 'InvalidOperationException', 'SecurityException', 'Win32Exception')
         lcase = @('D_JUNCTION', 'D_SYMLINK', 'D_UNDER_JUNCTION', 'F_UNDER_JUNCTION'); need = @('rcra', 'ra')
         owncls = @('A', 'B', 'admins', 'system', 'adminUser', 'other'); allowk = @('explicit', 'inherited', 'both')
-        missing = @('snapshot', 'sddl', 'dacl', 'aceType', 'rights', 'groupMembership')
+        missing = @('snapshot', 'sddl', 'sidA', 'dacl', 'aceType', 'rights', 'groupMembership')
       }
       # Field order and value class per kind, exactly as acl.test.mjs writes them.
       $schema = @{
@@ -281,8 +281,9 @@ function Format-PspVerdictOpDiag { param([string]$ReadStatus, [string]$Text)
         rbdiff = 'test:test dir:cnt file:cnt owner:cnt group:cnt daclFlags:cnt aceCount:cnt aceOrder:cnt aceFlags:cnt aceSet:cnt textOnly:cnt unparsed:cnt hlExits:hist hlExitsOther:cnt rpExits:hist rpExitsOther:cnt'
         rbsplit = 'test:test flagProtected:cnt flagAutoInherited:cnt flagIsNull:cnt flagMissing:cnt flagUnparsed:cnt orderDenyRelChanged:cnt orderDenyRelUnchanged:cnt orderDenyRelUnknown:cnt aclErrTypes:ehist aclErrOther:cnt aclErrAbsent:cnt'
         linkacl = 'case:lcase need:need link:pres reparse:bool owner:owncls aAllow:allowk missing:missing aDeny:cnt adminAllow:cnt otherAllow:cnt otherDeny:cnt'
+        rbcause = 'test:test missGetacl:cnt missOracle:cnt missSideUnknown:cnt missNonAclVolume:cnt missOracleNull:cnt missOther:cnt missUnknown:cnt errStream:cnt errNonAclVolume:cnt errOther:cnt errUnknown:cnt hlNzStream:cnt hlNzNonAclVolume:cnt hlNzOther:cnt hlNzUnknown:cnt'
       }
-      $keyed = @('priv', 'launch', 'bind', 'helper', 'readback', 'rbdiff', 'rbsplit', 'linkacl')
+      $keyed = @('priv', 'launch', 'bind', 'helper', 'readback', 'rbdiff', 'rbsplit', 'linkacl', 'rbcause')
       $seen = @{}
       foreach ($raw in $lines) {
         $l = $raw.TrimEnd([char]13)
