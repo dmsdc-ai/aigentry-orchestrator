@@ -32,6 +32,9 @@ const OPT = "AIGENTRY_CLAUDE_OAUTH_TOKEN";
 const CC = "CLAUDE_CODE_OAUTH_TOKEN";
 const TASK = "652";
 const WIN = process.platform === "win32";
+// #1167 F6: win32 ACL oracle + independent icacls tamper (tests/helpers/win-acl.mjs); loaded on win32 only.
+const acl = WIN ? (await import(pathToFileURL(join(REPO_ROOT, "tests", "helpers", "win-acl.mjs")).href)) as
+  { grant(path: string, spec: string): void; isPrivate(path: string): boolean } : null;
 const sq = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'";
 
 // The launchers are bash scripts. win32 uses Git for Windows bash only; System32 (WSL) bash is never
@@ -285,6 +288,14 @@ const legacyHandoff = (launcher: string): string => {
 const credsIn = (m: Json): boolean => existsSync(join(String((m.env as Json).CLAUDE_CONFIG_DIR), ".credentials.json"));
 /** Handoff artefacts under the world, matched on the path RELATIVE to the world (temp prefix excluded). */
 const handoffs = (W: World): string[] => files(W.sessions).filter((f) => /(^|[\\/])claude-oauth/.test(relative(W.root, f)));
+/** #1167 P6 counterpart: win32 has no OS sandbox, so the confined prepare refuses before any effect. */
+function refusedOnWin(W: World, p: Prep): void {
+  assert.equal(p.error, "SANDBOX_PLATFORM_UNSUPPORTED");
+  assert.equal(p.manifest, "");
+  assert.deepEqual(p.counters, { security: 0, otherExec: 0, hostClaudeRead: 0, hostCodexRead: 0 });
+  assert.deepEqual(handoffs(W), []);
+  assert.deepEqual(leaks(W, [p.stdout, p.stderr]), []);
+}
 
 test("unset: legacy descriptor/launcher/child unchanged; inherited CLAUDE_CODE_OAUTH_TOKEN passes through untouched", () => {
   const W = world(), b = boot(W, "u1");
@@ -297,13 +308,17 @@ test("unset: legacy descriptor/launcher/child unchanged; inherited CLAUDE_CODE_O
 
 test("unset/empty: confined manifest has no marker, host copy seeded as before; empty == unset byte-for-byte", () => {
   const W = world(), u = prepare(W, "u2"), e = prepare(W, "e2", { [OPT]: "" });
-  for (const p of [u, e]) {
-    assert.equal(p.error, null);
-    assert.equal(p.m.claudeOAuthHandoff, undefined);
-    assert.equal(read(join(String((p.m.env as Json).CLAUDE_CONFIG_DIR), ".credentials.json")), W.hostCreds);
-    assert.equal(p.counters.hostClaudeRead, 1);
+  if (WIN) {
+    for (const p of [u, e]) refusedOnWin(W, p);
+  } else {
+    for (const p of [u, e]) {
+      assert.equal(p.error, null);
+      assert.equal(p.m.claudeOAuthHandoff, undefined);
+      assert.equal(read(join(String((p.m.env as Json).CLAUDE_CONFIG_DIR), ".credentials.json")), W.hostCreds);
+      assert.equal(p.counters.hostClaudeRead, 1);
+    }
+    assert.deepEqual(Object.keys(e.m.env as Json).sort(), Object.keys(u.m.env as Json).sort());
   }
-  assert.deepEqual(Object.keys(e.m.env as Json).sort(), Object.keys(u.m.env as Json).sort());
   const V = world(), lu = boot(V, "same"), X = world(), le = boot(X, "same", { [OPT]: "" });
   assert.equal(read(le.launcher).split(X.root).join("<R>"), read(lu.launcher).split(V.root).join("<R>"));
 });
@@ -319,7 +334,8 @@ test("set legacy: one export, bare-env child gets EXACT token (overrides inherit
     assert.equal(r.rec?.argvContainsFake, false);
   }
   const h = legacyHandoff(b.launcher);
-  assert.deepEqual([mode(h), mode(dirname(h))], ["600", "700"]);
+  if (WIN) assert.deepEqual([acl!.isPrivate(h), acl!.isPrivate(dirname(h))], [true, true]);
+  else assert.deepEqual([mode(h), mode(dirname(h))], ["600", "700"]);
   assert.deepEqual(leaks(W, [b.stdout, b.stderr, JSON.stringify(b.json?.argv ?? [])]), []);
 });
 
@@ -339,6 +355,7 @@ test("set confined: boot creates no handoff and stub refuses; prepare reads no h
     assert.equal(runLauncher(W, b.launcher).status, 78);
     assert.deepEqual(handoffs(W), []);
     const p = prepare(W, "c1", { [OPT]: W.token }, "claude", noHostCreds);
+    if (WIN) { refusedOnWin(W, p); continue; }
     assert.equal(p.error, null);
     assert.deepEqual([p.counters.hostClaudeRead, p.counters.security], [0, 0]);
     assert.equal(credsIn(p.m), false);
@@ -351,6 +368,7 @@ test("set confined: boot creates no handoff and stub refuses; prepare reads no h
 
 test("runner (fake SRT): worker-only EXACT token; preflight, SRT-time process.env, m.env, receipt, logs carry none; relaunch", () => {
   const W = world(), p = prepare(W, "r1", { [OPT]: W.token, [CC]: fake("inh") });
+  if (WIN) return refusedOnWin(W, p);
   for (const i of [0, 1]) {
     const r = runRunner(W, p.manifest, p.hash);
     assert.equal(r.status, 0, `run ${i}: ${r.stderr}`);
@@ -366,8 +384,9 @@ test("runner (fake SRT): worker-only EXACT token; preflight, SRT-time process.en
 
 const TAMPER: Record<string, (f: string, tok: string) => void> = {
   missing: (f) => rmSync(f),
-  mode0644: (f) => chmodSync(f, 0o644),
-  dir0755: (f) => chmodSync(dirname(f), 0o755),
+  // win32 (#1167 F6): the counterpart of a group/world bit is an independent Everyone ACE.
+  mode0644: (f) => (WIN ? acl!.grant(f, "*S-1-1-0:(R)") : chmodSync(f, 0o644)),
+  dir0755: (f) => (WIN ? acl!.grant(dirname(f), "*S-1-1-0:(R)") : chmodSync(dirname(f), 0o755)),
   fileSymlink: (f, t) => { writeFileSync(`${f}.real`, `${t}\n`, { mode: 0o600 }); rmSync(f); symlinkSync(`${f}.real`, f); },
   dirSymlink: (f, t) => { const d = dirname(f); mkdirSync(`${d}.real`, { mode: 0o700 });
     writeFileSync(join(`${d}.real`, "token"), `${t}\n`, { mode: 0o600 }); rmSync(d, { recursive: true }); symlinkSync(`${d}.real`, d); },
@@ -380,24 +399,30 @@ const TAMPER: Record<string, (f: string, tok: string) => void> = {
 test("tamper: confined runner and legacy launcher refuse 78 with fixed strings, no worker, no host fallback", () => {
   for (const [name, fn] of Object.entries(TAMPER)) {
     const W = world(), p = prepare(W, `t-${name}`, { [OPT]: W.token });
-    fn(String(p.m.claudeOAuthHandoff), W.token);
-    const r = runRunner(W, p.manifest, p.hash);
-    assert.equal(r.status, 78, `runner ${name}`);
-    assert.match(r.stderr, /\[sandbox\] REFUSED: CLAUDE_OAUTH_HANDOFF_INVALID\n$/);
-    assert.equal(r.worker, null);
-    assert.equal(credsIn(p.m), false);
+    let r: Run | null = null;
+    if (WIN) {
+      refusedOnWin(W, p);
+    } else {
+      fn(String(p.m.claudeOAuthHandoff), W.token);
+      r = runRunner(W, p.manifest, p.hash);
+      assert.equal(r.status, 78, `runner ${name}`);
+      assert.match(r.stderr, /\[sandbox\] REFUSED: CLAUDE_OAUTH_HANDOFF_INVALID\n$/);
+      assert.equal(r.worker, null);
+      assert.equal(credsIn(p.m), false);
+    }
     const b = boot(W, `lt-${name}`, { [OPT]: W.token });
     fn(legacyHandoff(b.launcher), W.token);
     const l = runLauncher(W, b.launcher);
     assert.equal(l.status, 78, `legacy ${name}`);
     assert.equal(l.rec, null);
     assert.match(l.stderr, /OAuth handoff missing or malformed; refusing launch/);
-    assert.deepEqual(leaks(W, [r.stderr, l.stderr]).filter((h) => !/\.real|\.hl$/.test(h)), []);
+    assert.deepEqual(leaks(W, [r?.stderr ?? "", l.stderr]).filter((h) => !/\.real|\.hl$/.test(h)), []);
   }
 });
 
 test("marker rebind in a resealed manifest is refused before the sandbox is touched", () => {
   const W = world(), p = prepare(W, "m1", { [OPT]: W.token });
+  if (WIN) return refusedOnWin(W, p);
   const marker = String(p.m.claudeOAuthHandoff);
   for (const mut of [(m: Json) => { m.claudeOAuthHandoff = marker.replace(String(p.m.attempt), randomUUID()); },
     (m: Json) => { m.claudeOAuthHandoff = `${dirname(marker)}/../claude-oauth/token`; },
@@ -425,6 +450,7 @@ test("metadata canary missing/not-a-directory/symlink refuses before any token r
   for (const [name, brk] of Object.entries(breakers)) {
     for (const opted of [false, true]) {
       const W = world(), p = prepare(W, `cn-${name}-${String(opted)}`, opted ? { [OPT]: W.token } : {});
+      if (WIN) { refusedOnWin(W, p); continue; }
       assert.equal(typeof p.m.probeDirectory, "string", "manifest lacks the deployed probeDirectory canary");
       brk(String(p.m.probeDirectory));
       if (opted) rmSync(String(p.m.claudeOAuthHandoff));
@@ -439,6 +465,7 @@ test("metadata canary missing/not-a-directory/symlink refuses before any token r
 test("failed preflight: no worker, no receipt, token never read, nothing leaked", () => {
   for (const opted of [false, true]) {
     const W = world(), p = prepare(W, `pf-${String(opted)}`, opted ? { [OPT]: W.token } : {});
+    if (WIN) { refusedOnWin(W, p); continue; }
     if (opted) rmSync(String(p.m.claudeOAuthHandoff));
     const r = runRunner(W, p.manifest, p.hash, [], { FAKE_PREFLIGHT_EXIT: "71" });
     assert.equal(r.status, 78);
@@ -457,7 +484,8 @@ test("invalid opt-in: fixed-string refusal before any write, value never echoed,
     assert.match(b.stderr, /^boot-prepare: CLAUDE_OAUTH_TOKEN_INVALID: /);
     assert.ok(!(b.stdout + b.stderr).includes(bad));
     const p = prepare(W, "i2", { [OPT]: bad });
-    assert.equal(p.error, "CLAUDE_OAUTH_TOKEN_INVALID");
+    if (WIN) refusedOnWin(W, p);
+    else assert.equal(p.error, "CLAUDE_OAUTH_TOKEN_INVALID");
     assert.ok(!(p.stdout + p.stderr).includes(bad));
     assert.equal(files(join(W.sessions, "i2", "sandbox")).length, 0);
   }
@@ -473,6 +501,7 @@ test("codex/gemini: opt-in has no effect (descriptor keys, no handoff, codex aut
     assert.deepEqual(leaks(W, [s.stdout, s.stderr]), []);
   }
   const W = world(), p = prepare(W, "cx", { [OPT]: W.token }, "codex");
+  if (WIN) return refusedOnWin(W, p);
   assert.equal(p.error, null);
   assert.equal(p.m.claudeOAuthHandoff, undefined);
   assert.equal(p.counters.hostCodexRead, 1);

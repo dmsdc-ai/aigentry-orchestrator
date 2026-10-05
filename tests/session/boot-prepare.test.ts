@@ -23,9 +23,14 @@ import {
 import { realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..", "..", "..");
 const BOOT_PREPARE = join(REPO_ROOT, "bin", "boot-prepare.mjs");
+// #1167 F6: win32 ACL oracle (tests/helpers/win-acl.mjs); loaded on win32 only.
+const acl = process.platform === "win32"
+  ? (await import(pathToFileURL(join(REPO_ROOT, "tests", "helpers", "win-acl.mjs")).href)) as { isPrivate(path: string): boolean }
+  : null;
 
 interface BootJson {
   spawn_cli: string;
@@ -148,8 +153,15 @@ test("431-A — JSON output exposes an executable launcher.sh as spawn_cli", () 
     const j = parseJson(r.stdout);
     assert.match(j.spawn_cli, /launcher\.sh$/);
     assert.ok(existsSync(j.spawn_cli));
-    // Mode bits: owner-executable.
-    assert.equal(statSync(j.spawn_cli).mode & 0o100, 0o100);
+    if (process.platform === "win32") {
+      // #1167 F6: win32 has no exec bit — a regular non-symlink file whose first line is the shebang.
+      const st = lstatSync(j.spawn_cli);
+      assert.ok(st.isFile() && !st.isSymbolicLink(), "launcher.sh must be a regular file");
+      assert.equal(readFileSync(j.spawn_cli, "utf8").split("\n", 1)[0], "#!/usr/bin/env bash");
+    } else {
+      // Mode bits: owner-executable.
+      assert.equal(statSync(j.spawn_cli).mode & 0o100, 0o100);
+    }
     // extra_flags is empty — launcher encodes everything.
     assert.equal(j.extra_flags.trim(), "");
   } finally {
@@ -591,8 +603,9 @@ test("569-gemini-B — writable creds de-symlinked (0600 copy); real ~/.gemini b
       // write would follow the link and overwrite the real credential).
       assert.equal(lstatSync(shadowFile).isSymbolicLink(), false,
         `${credFile} must be a real copy, not a symlink into the real home`);
-      // Owner-only perms (0600) on the cred copy.
-      assert.equal(statSync(shadowFile).mode & 0o777, 0o600, `${credFile} copy must be mode 0600`);
+      // Owner-only perms (0600) on the cred copy; win32 (#1167 F6): the copy and its .gemini dir read back private.
+      if (acl) assert.equal(acl.isPrivate(shadowFile), true, `${credFile} copy must be private`);
+      else assert.equal(statSync(shadowFile).mode & 0o777, 0o600, `${credFile} copy must be mode 0600`);
     }
     // The copy carries the real credential content (so auth still works).
     assert.match(readFileSync(join(cfgShadow, "oauth_creds.json"), "utf8"), /FAKE-.*-CREDENTIAL/);
@@ -605,6 +618,34 @@ test("569-gemini-B — writable creds de-symlinked (0600 copy); real ~/.gemini b
     cleanup();
   }
 });
+
+// #1167 F6 — win32 fail-closed half of 569-gemini-B (registered on win32 only; POSIX has no
+// counterpart path). A .gemini shadow dir this run did not create is never Set private, so here it
+// keeps its inherited (non-private) ACL: the credential must not be copied into it, the symlink into
+// the real home must still be gone, and the existing WARNING is printed.
+if (process.platform === "win32") {
+  test("569-gemini-C (win32) — non-private shadow .gemini dir: no credential copy, no symlink, WARNING", () => {
+    const { home, targetCwd, cleanup } = setupTempHome();
+    try {
+      const gemini = CLI_MATRIX.find((m) => m.cli === "gemini")!;
+      const fakeReal = setupFakeCliHome(home, gemini);
+      const realOauthBefore = readFileSync(join(fakeReal, "oauth_creds.json"));
+      const cfgShadow = join(home, "role-sandbox", "coder-t569-gemini-C", gemini.shadowDir, ".gemini");
+      mkdirSync(cfgShadow, { recursive: true });
+      const r = runBootPrepareEnv(home, { GEMINI_CLI_HOME: fakeReal },
+        ["--role", "coder", "--cwd", targetCwd, "--sid", "t569-gemini-C", "--cli", "gemini"]);
+      assert.equal(r.code, 0, `exit ${r.code} stderr=${r.stderr}`);
+      assert.equal(parseJson(r.stdout).spawn_cwd, join(home, "role-sandbox", "coder-t569-gemini-C"));
+      assert.match(r.stderr, /WARNING could not copy oauth_creds\.json into shadow .*gemini auth may be unavailable/);
+      assert.throws(() => lstatSync(join(cfgShadow, "oauth_creds.json")), { code: "ENOENT" },
+        "neither a copy nor a symlink to the real credential may remain");
+      assert.deepEqual(readFileSync(join(fakeReal, "oauth_creds.json")), realOauthBefore,
+        "real oauth_creds.json must NOT be modified");
+    } finally {
+      cleanup();
+    }
+  });
+}
 
 test("551-gemini — AIGENTRY_GEMINI_MODEL overrides boot-prep launcher model", () => {
   const { home, targetCwd, cleanup } = setupTempHome();

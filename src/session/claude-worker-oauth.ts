@@ -1,5 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { winPrivateStorage } from "./private-storage.js";
+import type { VerifyItem, VerifyResult, WinPrivateStorage } from "./private-storage.js";
 
 // #652 opt-in long-lived Claude worker token (`claude setup-token`). The raw value
 // is written only to one private per-attempt handoff file and the actual worker
@@ -26,10 +28,23 @@ export function selectedClaudeOAuthToken(env: NodeJS.ProcessEnv = process.env): 
   return v;
 }
 
-/** A real (non-symlink) directory owned by this user with no group/world bits. */
+// #1167 F6 (win32, P2 + Q-FILE R2): mode bits and uid mean nothing there, so the ACL is read back.
+// Every item must verify in ONE read batch (a file only together with its private parent dir).
+function verifyWinPrivate(storage: WinPrivateStorage, items: readonly VerifyItem[], refusal: string): readonly VerifyResult[] {
+  const results = storage.verify(items);
+  if (results.length !== items.length || !results.every((r) => r.ok)) throw new Error(refusal);
+  return results;
+}
+
+/** A real (non-symlink) directory owned by this user with no group/world bits (win32: verified private). */
 function assertPrivateDir(dir: string): void {
   let st: fs.Stats;
   try { st = fs.lstatSync(dir); } catch { throw new Error("CLAUDE_OAUTH_HANDOFF_INVALID"); }
+  if (winPrivateStorage) {
+    if (!st.isDirectory()) throw new Error("CLAUDE_OAUTH_HANDOFF_INVALID");
+    verifyWinPrivate(winPrivateStorage, [{ path: dir, kind: "directory", want: "private" }], "CLAUDE_OAUTH_HANDOFF_INVALID");
+    return;
+  }
   if (!st.isDirectory() || st.uid !== euid() || (st.mode & 0o077) !== 0) {
     throw new Error("CLAUDE_OAUTH_HANDOFF_INVALID");
   }
@@ -46,6 +61,8 @@ export function writeClaudeOAuthHandoff(dir: string, token: string): string {
   try {
     fs.mkdirSync(dir, { mode: 0o700 });
     fs.chmodSync(dir, 0o700);
+    // win32: the P2 Set on the directory this call just created.
+    if (winPrivateStorage && winPrivateStorage.setPrivate(dir, "directory").status !== "ok") throw new Error();
   } catch {
     throw new Error("CLAUDE_OAUTH_HANDOFF_WRITE");
   }
@@ -57,13 +74,24 @@ export function writeClaudeOAuthHandoff(dir: string, token: string): string {
   } catch {
     throw new Error("CLAUDE_OAUTH_HANDOFF_WRITE");
   }
+  let written = false;
   try {
+    // win32 (R2): the still-empty file verifies together with its parent BEFORE the token is written.
+    if (winPrivateStorage) {
+      verifyWinPrivate(winPrivateStorage, [{ path: dir, kind: "directory", want: "private" },
+        { path: file, kind: "file", want: "private" }], "CLAUDE_OAUTH_HANDOFF_WRITE");
+    }
     fs.fchmodSync(fd, 0o600);
     fs.writeSync(fd, token + "\n");
+    written = true;
   } catch {
     throw new Error("CLAUDE_OAUTH_HANDOFF_WRITE");
   } finally {
     fs.closeSync(fd);
+    // win32: a failed handoff file never stays behind (removed once its handle is closed).
+    if (!written && winPrivateStorage) {
+      try { fs.unlinkSync(file); } catch { /* already gone */ }
+    }
   }
   return file;
 }
@@ -78,7 +106,13 @@ export function readClaudeOAuthHandoff(file: unknown, expected: string): string 
       path.basename(file) !== CLAUDE_OAUTH_FILE) {
     throw new Error("CLAUDE_OAUTH_HANDOFF_INVALID");
   }
-  assertPrivateDir(path.dirname(file));
+  // win32 (R2): the parent and the file verify private in ONE batch (lstat-bracketed, so no
+  // reparse point); the opened handle must then be that same verified file (dev, ino).
+  const verified = winPrivateStorage
+    ? verifyWinPrivate(winPrivateStorage, [{ path: path.dirname(file), kind: "directory", want: "private" },
+      { path: file, kind: "file", want: "private" }], "CLAUDE_OAUTH_HANDOFF_INVALID")[1]
+    : undefined;
+  if (!verified) assertPrivateDir(path.dirname(file));
   let fd: number;
   try {
     fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
@@ -87,7 +121,11 @@ export function readClaudeOAuthHandoff(file: unknown, expected: string): string 
   }
   try {
     const st = fs.fstatSync(fd);
-    if (!st.isFile() || st.uid !== euid() || (st.mode & 0o077) !== 0 || st.nlink !== 1 ||
+    if (verified) {
+      const h = fs.fstatSync(fd, { bigint: true });
+      if (String(h.dev) !== verified.dev || String(h.ino) !== verified.ino) throw new Error("CLAUDE_OAUTH_HANDOFF_INVALID");
+    }
+    if (!st.isFile() || (!verified && (st.uid !== euid() || (st.mode & 0o077) !== 0)) || st.nlink !== 1 ||
         st.size < 2 || st.size > CLAUDE_OAUTH_MAX + 1) {
       throw new Error("CLAUDE_OAUTH_HANDOFF_INVALID");
     }
