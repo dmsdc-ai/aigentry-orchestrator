@@ -1724,6 +1724,10 @@ const fakeCmuxInertRelative = 'tests/dispatch/fake-cmux-win32.inert.test.mjs';
 // only places test-owned sentinels at these paths; the real suites are never imported or run here.
 const preservationNames = ['preservation', 'preservation-directories'];
 const preservationRelatives = preservationNames.map(name => `tests/packaging/${name}.test.mjs`);
+// #1172 workflow policy suite: one explicit, platform-neutral source entry on EVERY platform, win32
+// included, directly after the preservation entries and ahead of the POSIX-only entries. The fixture
+// only places a test-owned sentinel at this path; the real suite is never imported or run here.
+const workflowPolicyRelative = 'tests/packaging/workflow-policy.test.mjs';
 function callerFixture(mode, symlinked = false) {
   const directory = mkdtempSync(join(admin, 'caller fixture '));
   const put = (path, source) => {
@@ -1757,6 +1761,7 @@ function callerFixture(mode, symlinked = false) {
   for (const [index, path] of preservationRelatives.entries()) {
     if (mode !== `missing-${preservationNames[index]}`) put(path, checks + `console.log('CALLER_PRESERVATION_SENTINEL_${index}');\nprocess.exit(${mode === `failing-${preservationNames[index]}` ? 8 : 0});\n`);
   }
+  if (mode !== 'missing-workflow-policy') put(workflowPolicyRelative, checks + `console.log('CALLER_WORKFLOW_POLICY_SENTINEL');\nprocess.exit(${mode === 'failing-workflow-policy' ? 8 : 0});\n`);
   if (mode !== 'missing-wizard') put(wizardRelative, checks + `console.log('CALLER_WIZARD_SENTINEL');\nprocess.exit(${mode === 'failing-wizard' ? 8 : 0});\n`);
   if (mode !== 'missing-supervisor') put(supervisorRelative, checks + `console.log('CALLER_SUPERVISOR_SENTINEL');\nprocess.exit(${mode === 'failing-supervisor' ? 8 : 0});\n`);
   for (const [index, path] of agentMetadataRelatives.entries()) {
@@ -1810,6 +1815,9 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic, onlyFailed
   ['failing-preservation', 1, true, true, false, undefined, /tests[\\/]packaging[\\/]preservation\.test\.mjs$/],
   ['missing-preservation-directories', 1, false, false, false, /Could not find '[^'\n]*tests[\\/]packaging[\\/]preservation-directories\.test\.mjs'/],
   ['failing-preservation-directories', 1, true, true, false, undefined, /tests[\\/]packaging[\\/]preservation-directories\.test\.mjs$/],
+  // #1172 the workflow policy suite alone missing or failing, analogous to the #1191 entries.
+  ['missing-workflow-policy', 1, false, false, false, /Could not find '[^'\n]*tests[\\/]packaging[\\/]workflow-policy\.test\.mjs'/],
+  ['failing-workflow-policy', 1, true, true, false, undefined, /tests[\\/]packaging[\\/]workflow-policy\.test\.mjs$/],
   ['missing-harness', 1, true, true, false, /POSIX control harness failed with exit status: 1/],
   ['empty', 1, false, false, false, /No compiled test files found/],
   ['missing-dist', 1, false, false, false, /Failed to enumerate compiled tests/],
@@ -1841,6 +1849,7 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic, onlyFailed
   assert.equal(result.stdout.includes('CALLER_CONTROL_SENTINEL'), compiled);
   assert.equal(result.stdout.includes('CALLER_FAKE_CMUX_INERT_SENTINEL'), compiled);
   for (const index of preservationRelatives.keys()) assert.equal(result.stdout.includes(`CALLER_PRESERVATION_SENTINEL_${index}`), compiled);
+  assert.equal(result.stdout.includes('CALLER_WORKFLOW_POLICY_SENTINEL'), compiled);
   assert.ok(!result.stdout.includes('CALLER_UNSELECTED_MJS'), 'no automatic source .mjs discovery');
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_COMPILED_CONTROL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (security && sentinel) assert.ok(result.stdout.indexOf('CALLER_SECURITY_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
@@ -1861,6 +1870,7 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic, onlyFailed
   if (compiled && sentinel) for (const index of preservationRelatives.keys()) {
     assert.ok(result.stdout.indexOf(`CALLER_PRESERVATION_SENTINEL_${index}`) < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   }
+  if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_WORKFLOW_POLICY_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (diagnostic) assert.match(result.stderr, diagnostic);
   if (onlyFailedFile) {
     const failures = result.stdout.split('\n').filter(line => /^not ok \d+ - /.test(line));
@@ -1937,7 +1947,7 @@ const startupError = { status: null, signal: null, error: 'synthetic ENOENT', co
 const timedOut = { status: null, signal: 'SIGKILL', error: 'synthetic ETIMEDOUT', code: 'ETIMEDOUT' };
 const callerArgv = platform => ['--test', 'dist/tests/a.test.js', 'dist/tests/nested/b.test.js', 'dist/tests/z.test.js',
   securityRelative, admissionRelative, ...jevRelatives, ...taskAdvisorRelatives, controlRelative, fakeCmuxInertRelative,
-  ...preservationRelatives,
+  ...preservationRelatives, workflowPolicyRelative,
   ...(['linux', 'darwin'].includes(platform) ? [nativeRelative, wizardRelative, supervisorRelative, ...agentMetadataRelatives] : [])];
 const vmCases = [];
 for (const platform of ['linux', 'darwin']) {
@@ -2053,7 +2063,7 @@ for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #116
 });
 // #1191 collection guard for exactly the two #1169 preservation suites in the exact runner's first spawn:
 // each exactly once on every platform, win32 included, in order directly after the fake-cmux inert entry,
-// then the first POSIX-only entry on POSIX and nothing after them on win32 — literal neighbours only.
+// then (#1172) the workflow policy entry on every platform — literal neighbours only.
 for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #1191 preservation suites follow fake-cmux win32 inert exactly once ahead of the POSIX-only entries (${platform})`, 'caller-vm', () => {
   const config = join(admin, `caller-vm-1191-placement-${platform}.json`);
   writeFileSync(config, JSON.stringify({ platform, results: platform === 'win32' ? [success] : [success, success], source: callerSource }));
@@ -2070,8 +2080,27 @@ for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #119
   assert.equal(spawned.filter(item => item === 'tests/packaging/preservation-directories.test.mjs').length, 1);
   assert.equal(spawned.indexOf('tests/packaging/preservation.test.mjs'), spawned.indexOf('tests/dispatch/fake-cmux-win32.inert.test.mjs') + 1);
   assert.equal(spawned.indexOf('tests/packaging/preservation-directories.test.mjs'), spawned.indexOf('tests/packaging/preservation.test.mjs') + 1);
-  if (platform === 'win32') assert.equal(spawned.indexOf('tests/packaging/preservation-directories.test.mjs'), spawned.length - 1);
-  else assert.equal(spawned.indexOf('tests/packaging/native-capture.test.mjs'), spawned.indexOf('tests/packaging/preservation-directories.test.mjs') + 1);
+  assert.equal(spawned.indexOf('tests/packaging/workflow-policy.test.mjs'), spawned.indexOf('tests/packaging/preservation-directories.test.mjs') + 1);
+});
+// #1172 explicit placement of the workflow policy entry in the exact runner's first spawn: exactly once on
+// every platform, win32 included, directly after the last preservation entry, then the first POSIX-only
+// entry on POSIX and nothing after it on win32 — literal neighbours only.
+for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #1172 workflow policy follows preservation-directories exactly once ahead of the POSIX-only entries (${platform})`, 'caller-vm', () => {
+  const config = join(admin, `caller-vm-1172-placement-${platform}.json`);
+  writeFileSync(config, JSON.stringify({ platform, results: platform === 'win32' ? [success] : [success, success], source: callerSource }));
+  const argv = ['--experimental-vm-modules', driver, config];
+  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, encoding: 'utf8', timeout });
+  invocations.push({ kind: 'caller-vm-1172-placement', label: platform, executable: process.execPath, argv, timeout,
+    exit: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr, runnerSha256: sha(callerSource) });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+  const actual = JSON.parse(result.stdout);
+  assert.equal(actual.status, 0);
+  const spawned = actual.calls[0].argv;
+  assert.equal(spawned.filter(item => item === 'tests/packaging/workflow-policy.test.mjs').length, 1);
+  assert.equal(spawned.indexOf('tests/packaging/workflow-policy.test.mjs'), spawned.indexOf('tests/packaging/preservation-directories.test.mjs') + 1);
+  if (platform === 'win32') assert.equal(spawned.indexOf('tests/packaging/workflow-policy.test.mjs'), spawned.length - 1);
+  else assert.equal(spawned.indexOf('tests/packaging/native-capture.test.mjs'), spawned.indexOf('tests/packaging/workflow-policy.test.mjs') + 1);
 });
 // #1191 checkout-EOL policy for the one raw-byte-pinned preservation source. Each case commits LF bytes to a
 // fresh fake repo under the private admin directory and clones it locally (no remote, no network). Git runs
@@ -2176,6 +2205,7 @@ const agentMetadataBlock = `  sourceTestFiles.push(\n${agentMetadataRelatives.ma
 const controlPush = "sourceTestFiles.push('tests/control/core.test.mjs');\n";
 const fakeCmuxInertPush = "sourceTestFiles.push('tests/dispatch/fake-cmux-win32.inert.test.mjs');\n";
 const preservationPush = "sourceTestFiles.push('tests/packaging/preservation.test.mjs', 'tests/packaging/preservation-directories.test.mjs');\n";
+const workflowPolicyPush = "sourceTestFiles.push('tests/packaging/workflow-policy.test.mjs');\n";
 for (const [name, mutate, platforms] of [
   ['wizard entry placed on every platform, win32 included', source => replaceOnce(replaceOnce(source, wizardPosixPush, wizardPosixDropped),
     baseSourceList, "'tests/packaging/release-admission.test.mjs', 'tests/packaging/orchestrator-boot-wizard.test.mjs'];"), ['win32', 'linux', 'darwin']],
@@ -2243,6 +2273,20 @@ for (const [name, mutate, platforms] of [
     `if (process.platform === 'win32') ${preservationPush}`), ['linux', 'darwin']],
   ['preservation suites ahead of the fake-cmux win32 inert suite', source => replaceOnce(replaceOnce(source, preservationPush, ''),
     fakeCmuxInertPush, `${preservationPush}${fakeCmuxInertPush}`), ['win32', 'linux', 'darwin']],
+  // #1172: the workflow policy entry is required exactly once on every platform, directly after the
+  // preservation entries and ahead of the POSIX branch. Placing it on win32 only or after the POSIX branch
+  // leaves the win32 argv unchanged, so those counterfactuals apply to POSIX alone.
+  ['workflow policy suite missing', source => replaceOnce(source, workflowPolicyPush, ''), ['win32', 'linux', 'darwin']],
+  ['workflow policy suite duplicated', source => replaceOnce(source, workflowPolicyPush, `${workflowPolicyPush}${workflowPolicyPush}`),
+    ['win32', 'linux', 'darwin']],
+  ['workflow policy suite wired POSIX-only', source => replaceOnce(replaceOnce(source, workflowPolicyPush, ''), wizardPosixPush,
+    `${wizardPosixPush}\n  ${workflowPolicyPush.trimEnd()}`), ['win32', 'linux', 'darwin']],
+  ['workflow policy suite placed on win32 only', source => replaceOnce(source, workflowPolicyPush,
+    `if (process.platform === 'win32') ${workflowPolicyPush}`), ['linux', 'darwin']],
+  ['workflow policy suite ahead of the preservation suites', source => replaceOnce(replaceOnce(source, workflowPolicyPush, ''),
+    preservationPush, `${workflowPolicyPush}${preservationPush}`), ['win32', 'linux', 'darwin']],
+  ['workflow policy suite after the POSIX-only entries', source => replaceOnce(replaceOnce(source, workflowPolicyPush, ''),
+    `${agentMetadataBlock}}\n`, `${agentMetadataBlock}}\n${workflowPolicyPush}`), ['linux', 'darwin']],
   // #1177: the XRes supervisor suite is required on POSIX and must never reach win32.
   ['XRes supervisor suite missing', source => replaceOnce(source, supervisorPosixPush, ''), ['linux', 'darwin']],
   ['XRes supervisor suite placed on every platform, win32 included', source => replaceOnce(replaceOnce(source, supervisorPosixPush, ''),
