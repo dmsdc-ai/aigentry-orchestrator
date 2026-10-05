@@ -1,0 +1,19 @@
+{
+ "fingerprint": "8c8c41d5c1e25cb056e99abf5e3c08b7657ed5529785ed744481073c6b33dabe",
+ "rule": "javascript/PT",
+ "level": "note",
+ "location": "bin/init/cli.mjs:662:47",
+ "verdict": "false-positive",
+ "evidence": [
+  "bin/init/cli.mjs:662 — source: the operator's own init argv/env (operation id, roots)",
+  "bin/init/native-capture.mjs:22,240 — the operation id must be a UUIDv4",
+  "bin/init/native-capture.mjs:35-37 — every root must be a canonical absolute path without control characters",
+  "bin/init/native-capture.mjs:39-53 — no symlinked or group/world-writable ancestors; capture/preservation roots owner-only",
+  "bin/init/native-capture.mjs:103-106 — the roots must be disjoint",
+  "bin/init/native-capture.mjs:380-385 — the journal must match the roots and directory identity",
+  "bin/init/native-capture.mjs:88-90,248 — the stage file is created O_CREAT|O_EXCL|O_NOFOLLOW with a randomUUID name",
+  "bin/init/native-capture.mjs:245,250 — sink: renameSync(stage, <validated dir>/operation.json)",
+  "bin/init/cli.mjs:648-654 — native Windows is refused before any read or write",
+  "bin/init/native-capture.mjs:100 — native capture is darwin/linux only"
+ ]
+}

@@ -1,0 +1,17 @@
+{
+ "fingerprint": "8298c4e5741f79f10bab2827569ed9d1d146aa4789ae7671af1a6be01d88733a",
+ "rule": "javascript/PT",
+ "level": "note",
+ "location": "src/session/worker-sandbox-runner.ts:16:5",
+ "verdict": "hardening",
+ "evidence": [
+  "src/session/worker-sandbox-runner.ts:42-46 — source: runner argv[2]/argv[3]; plain readFileSync, then digest(raw) === argv[3] pins the content to the caller's hash, not to a location",
+  "src/session/worker-sandbox-runner.ts:16,93 — sink: m.receipt is written as given; nothing ties it to <root>/receipt.json",
+  "src/session/worker-sandbox.ts:287-290 — the sealed launcher.sh (mode 0700) passes the same quoted manifest path and hash to the binder and to the runner",
+  "src/session/worker-sandbox.ts:238-240 — no worker write scope may overlap the sealed root, the staging root or the runner",
+  "src/session/worker-sandbox.ts:265 — the worker may write only its scope, its HOME and its TMP",
+  "src/session/worker-sandbox-bind.ts:22 — the binder, run from the same launcher line, validates through readSealedManifest",
+  "src/session/worker-sandbox.ts:442-461 — readSealedManifest: .../sandbox/<uuid>/manifest.json shape, private non-symlink canonical root, O_NOFOLLOW owner 0600 file <= 1 MiB, identity sid, receipt === root/receipt.json",
+  "src/session/worker-sandbox-runner.ts:57 — the runner refuses platforms without the OS sandbox (win32)"
+ ]
+}

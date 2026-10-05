@@ -1,0 +1,19 @@
+{
+ "fingerprint": "2320bda738a18bca14ca225f8855683b610365034bb6cc3845546e5a659931c1",
+ "rule": "javascript/PT",
+ "level": "note",
+ "location": "src/dispatch/cli.ts:1303:22",
+ "verdict": "false-positive",
+ "evidence": [
+  "src/dispatch/cli.ts:445 — source: dispatch argv --track (and --name)",
+  "src/dispatch/cli.ts:1227 — sid = `${o.track}-${o.name}`; the whole joined string is what is checked",
+  "src/dispatch/cli.ts:1272 — with --retry-unknown no workspace is spawned, so the earlier spawn-time scope check (worker-sandbox.ts:84 via cli.ts:1109) does not run on that path",
+  "src/dispatch/cli.ts:1303 — stageWorkerRef(path.join(<sessions root>, sid), sid, task, ref): same sid as path component and checked value",
+  "src/session/worker-sandbox.ts:320-321 — stageWorkerRef calls assertConfinedTarget(stagingRoot, sid, task) as its first statement",
+  "src/session/worker-sandbox.ts:56 — identity = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/: no '/', '\\\\', ':' or NUL, no leading '.', so '.' and '..' are refused; without the m flag $ admits no trailing newline",
+  "src/session/worker-sandbox.ts:298-299 — assertConfinedTarget's first statement throws SANDBOX_TARGET_SID unless identity.test(sid), before any fs call",
+  "src/session/worker-sandbox.ts:322 — flagged sink: readFileSync(<sessions root>/<sid>/sandbox-current.json), after assertConfinedTarget returned",
+  "src/dispatch/cli.ts:1305-1306 — any refusal exits 78 SANDBOX_REF_REFUSED before the delivery commit",
+  "src/session/worker-sandbox.ts:84 — on the spawn path sid is additionally checked by loadWorkerScope"
+ ]
+}

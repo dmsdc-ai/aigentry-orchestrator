@@ -1,0 +1,12 @@
+{
+ "fingerprint": "b5b14b47677dcda60d0d6dad6a1d20f908df6394a649ee337a159c767f0220fa",
+ "rule": "python/PT",
+ "level": "note",
+ "location": "bin/dispatch-registry.py:184:14",
+ "verdict": "false-positive",
+ "evidence": [
+  "bin/dispatch-registry.py:121-131 — source: env DISPATCH_STATE_DIR; refused with a NUL or a '..' segment, then realpath-resolved and required absolute",
+  "bin/dispatch-registry.py:184 — sink: open(<state dir>/registry-health.log, 'a'): fixed filename",
+  "bin/dispatch-registry.py:95-117 — documented, accepted in-code waiver for this source (it states 5 occurrences; the scan reports 6)"
+ ]
+}

@@ -1,0 +1,16 @@
+{
+ "fingerprint": "117389e4920194d322aea2b5af43803b9da4c06223ffe408590b7c0eaf2c7b19",
+ "rule": "javascript/PT",
+ "level": "note",
+ "location": "src/session/worker-sandbox-bind.ts:35:5",
+ "verdict": "false-positive",
+ "evidence": [
+  "src/session/worker-sandbox-bind.ts:44 — source: binder argv[2]/argv[3]",
+  "src/session/worker-sandbox-bind.ts:22 — root comes from readSealedManifest, not raw argv",
+  "src/session/worker-sandbox.ts:443-451 — the manifest path must be absolute, normalized, named manifest.json, with a UUID parent under 'sandbox'",
+  "src/session/worker-sandbox.ts:397-402,452 — root must be an owner-owned, non-symlink directory with no group/world bits and realpath(root) === root",
+  "src/session/worker-sandbox.ts:453-460 — O_NOFOLLOW owner 0600 manifest <= 1 MiB matching the hash; receipt === root/receipt.json",
+  "src/session/worker-sandbox-bind.ts:23-24 — the manifest must also be the one the stage's sandbox-current.json names",
+  "src/session/worker-sandbox-bind.ts:32-35 — the tmp name is a random UUID inside root; the rename target is the fixed BINDING_FILE in root"
+ ]
+}

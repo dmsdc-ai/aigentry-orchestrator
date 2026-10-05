@@ -1,0 +1,14 @@
+{
+ "fingerprint": "57e0d62b7b2a9d01d53b27df734ed581a9e629d6646465d62f87e37f0164c9b4",
+ "rule": "javascript/ImproperCodeSanitization",
+ "level": "warning",
+ "location": "bin/init/native-capture.mjs:440:31",
+ "verdict": "false-positive",
+ "evidence": [
+  "bin/init/native-capture.mjs:440 — require(same(image(...), record.configs[i].after), ...)",
+  "bin/init/native-capture.mjs:27 — the sink `require` is a local assertion helper: (condition, reason) => { if (!condition) fail(reason); }",
+  "bin/init/native-capture.mjs:4-7 — the file is an ES module (import syntax); there is no createRequire or CommonJS require",
+  "bin/init/native-capture.mjs:25 — JSON.stringify is used only by same(a, b), a boolean equality",
+  "bin/init/native-capture.mjs:26 — fail() throws an Error with a fixed prefix; nothing is loaded or evaluated"
+ ]
+}

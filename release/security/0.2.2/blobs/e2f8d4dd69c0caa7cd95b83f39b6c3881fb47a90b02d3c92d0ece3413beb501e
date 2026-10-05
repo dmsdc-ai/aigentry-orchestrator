@@ -1,0 +1,13 @@
+{
+ "fingerprint": "060187092e72cddc33f25cfc55f63f4155e8cf07fd6c6fd190f61983c6097a42",
+ "rule": "python/PT",
+ "level": "note",
+ "location": "bin/dispatch-registry.py:347:14",
+ "verdict": "false-positive",
+ "evidence": [
+  "bin/dispatch-registry.py:121-131 — source: env DISPATCH_STATE_DIR; refused with a NUL or a '..' segment, then realpath-resolved and required absolute",
+  "bin/dispatch-registry.py:135,343-352 — sink: open(active.json, 'rb') bounded to limit+1 bytes: fixed name",
+  "bin/dispatch-registry.py:1129-1132 — jsonl mode returns only a fixed result code on error",
+  "bin/dispatch-registry.py:95-117 — documented, accepted in-code waiver for this source (it states 5 occurrences; the scan reports 6)"
+ ]
+}

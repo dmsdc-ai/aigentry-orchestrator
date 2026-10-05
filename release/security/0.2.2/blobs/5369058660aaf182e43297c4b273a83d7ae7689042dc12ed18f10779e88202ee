@@ -1,0 +1,12 @@
+{
+ "fingerprint": "7213564ca7a29e03c0d859e81b64e799da70d93bdd71bfe9e24dbde7db1c045a",
+ "rule": "python/PT",
+ "level": "note",
+ "location": "bin/dispatch-registry.py:948:18",
+ "verdict": "false-positive",
+ "evidence": [
+  "bin/dispatch-registry.py:121-131 — source: env DISPATCH_STATE_DIR; refused with a NUL or a '..' segment, then realpath-resolved and required absolute",
+  "bin/dispatch-registry.py:135,945-948 — sink: open(active.json, 'rb') for the one-shot migration, under the registry lock: fixed name",
+  "bin/dispatch-registry.py:95-117 — documented, accepted in-code waiver for this source (it states 5 occurrences; the scan reports 6)"
+ ]
+}

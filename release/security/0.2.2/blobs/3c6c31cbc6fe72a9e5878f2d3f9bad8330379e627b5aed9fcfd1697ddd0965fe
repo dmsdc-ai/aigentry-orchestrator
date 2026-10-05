@@ -1,0 +1,17 @@
+{
+ "fingerprint": "b872971873f6e7ac84fb4d5700083ae270c51e28524064775eb93dcf13b0601c",
+ "rule": "javascript/NoRateLimitingForExpensiveWebOperation",
+ "level": "warning",
+ "location": "src/hitl/web/auth.ts:853:18",
+ "verdict": "false-positive",
+ "evidence": [
+  "src/hitl/web/auth.ts:537-542 — the expensive operation of all four rate-limit findings: readMetadata opens auth-metadata.json O_NOFOLLOW and reads it, capped at MAX_METADATA_BYTES (64 KiB)",
+  "src/hitl/web/auth.ts:853 — reported handler: routeEnrollOptions",
+  "src/hitl/web/auth.ts:855 — allow('invitation', MAX_INVITATION_ATTEMPTS) runs before the body read and before refresh(true)",
+  "src/hitl/web/auth.ts:861 — the only file read in this handler: refresh(true) -> readMetadata",
+  "src/hitl/web/auth.ts:57,65 — the budget is 10 per 300 s window",
+  "src/hitl/web/auth.ts:1155,1164-1165 — auth routes other than preauth/logout need exact Host/Origin/JSON, a live preauth cookie and its CSRF header",
+  "src/hitl/web/server.ts:42-43 — server-wide limit before any auth route: 300 requests per 60 s window and at most 16 in flight",
+  "src/hitl/web/auth.ts:523-527 — win32 only: each readMetadata with a present directory also runs one readBack batch"
+ ]
+}

@@ -1,0 +1,15 @@
+{
+ "fingerprint": "faa153d869d61e7a7a157a6ea3fc03fbd4868e32dbb597e10f32becf65052988",
+ "rule": "javascript/ServerLeak",
+ "level": "warning",
+ "location": "src/hitl/web/auth.ts:220:7",
+ "verdict": "false-positive",
+ "evidence": [
+  "src/hitl/web/auth.ts:223-224 — source of the flow: refuse(res, status, error: string, ...) wraps its string parameter as { error } and calls reply()",
+  "src/hitl/web/auth.ts:213-220 — sink: reply() sends application/json, Cache-Control no-store, body JSON.stringify(body)",
+  "src/hitl/web/auth.ts:1108 — the only non-literal refuse() argument is committed.error",
+  "src/hitl/web/auth.ts:1081,1083,1085,1088 — committed.error is one of the literals verification_failed, user_verification_required, credential_unknown",
+  "src/hitl/web/auth.ts:884,921,962,1007,1101 — every catch in the routes is a bare `catch {}` that drops the caught value and refuses with a literal code",
+  "src/hitl/web/auth.ts:828-1171 — every other refuse() call in the auth routes passes a string literal code"
+ ]
+}

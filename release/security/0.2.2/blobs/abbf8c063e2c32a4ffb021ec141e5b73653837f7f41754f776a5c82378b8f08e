@@ -1,0 +1,14 @@
+{
+ "fingerprint": "69377385654d0f75dc7b58e02693b645e27106e374c056b18702c2d8e38c44f5",
+ "rule": "javascript/PT",
+ "level": "note",
+ "location": "bin/model-router.mjs:71:16",
+ "verdict": "false-positive",
+ "evidence": [
+  "bin/model-router.mjs:69-71 — source and sink: openSync(args['--ref'], 'r')",
+  "src/dispatch/cli.ts:1214-1217 — dispatch requires --ref to name an existing regular file",
+  "src/dispatch/cli.ts:502-504 — dispatch passes the operator's --ref to the router, with a 16 s SIGKILL timeout",
+  "bin/model-router.mjs:72-79 — at most 4096 bytes are read and embedded as the documented task excerpt of the classifier prompt",
+  "src/session/worker-sandbox.ts:327,335-339 — dispatch already delivers the full ref body to the worker"
+ ]
+}

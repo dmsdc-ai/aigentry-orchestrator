@@ -1,0 +1,14 @@
+{
+ "fingerprint": "a800964d7a57395ac578dc3edac587663bba62232674d0243aa45c2e942d815a",
+ "rule": "javascript/PT",
+ "level": "note",
+ "location": "bin/model-router.mjs:74:35",
+ "verdict": "false-positive",
+ "evidence": [
+  "bin/model-router.mjs:71-74 — sink: readSync into a fixed 4096-byte buffer from the fd opened on --ref",
+  "src/dispatch/cli.ts:1214-1217 — dispatch requires --ref to name an existing regular file",
+  "src/dispatch/cli.ts:502-504 — dispatch passes the operator's --ref to the router, with a 16 s SIGKILL timeout",
+  "bin/model-router.mjs:72-79 — at most 4096 bytes are read and embedded as the documented task excerpt of the classifier prompt",
+  "src/session/worker-sandbox.ts:327,335-339 — dispatch already delivers the full ref body to the worker"
+ ]
+}

@@ -1,0 +1,16 @@
+{
+ "fingerprint": "bed9b2e75735f747ac21e68cecf296f54e5b0a80219321c4f8070eec7ed0ce2b",
+ "rule": "javascript/PT",
+ "level": "note",
+ "location": "src/session/worker-sandbox-runner.ts:44:15",
+ "verdict": "hardening",
+ "evidence": [
+  "src/session/worker-sandbox-runner.ts:42-44 — source and sink: argv[2] read with plain readFileSync, which follows symlinks and has no size cap",
+  "src/session/worker-sandbox-runner.ts:45-47 — the content is only hash-compared and parsed; failures print fixed codes",
+  "src/session/worker-sandbox.ts:410-431 — readPrivate (O_NOFOLLOW, owner, mode, size cap) is what the binder uses for the same file",
+  "src/session/worker-sandbox.ts:442-461 — readSealedManifest applies readPrivate and the sealed-path checks",
+  "src/session/worker-sandbox.ts:287-290 — the sealed launcher.sh (mode 0700) passes the same quoted manifest path and hash to the binder and to the runner",
+  "src/session/worker-sandbox.ts:238-240 — no worker write scope may overlap the sealed root, the staging root or the runner",
+  "src/session/worker-sandbox.ts:265 — the worker may write only its scope, its HOME and its TMP"
+ ]
+}

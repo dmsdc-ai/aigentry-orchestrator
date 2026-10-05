@@ -1,0 +1,19 @@
+{
+ "fingerprint": "816b64af041bfbe0a78ef170a67249219569a903e11d1c10fa5a547b448d6e27",
+ "rule": "javascript/reDOS",
+ "level": "error",
+ "location": "bin/model-router.mjs:13:31",
+ "verdict": "false-positive",
+ "evidence": [
+  "bin/model-router.mjs:13 — source: argv of model-router --resolve; no deps/catalogPath is passed",
+  "src/dispatch/cli.ts:614-619 — the in-repo caller passes --cli/--sid/--task/--role, optional --route-json and operator --observe files",
+  "bin/model-resolve.mjs:155 — sink: new RegExp(policy.family_pattern); the pattern comes from the catalog, not from argv or observations",
+  "bin/model-evidence.mjs:24,895 — the catalog is loadCatalog(deps.catalogPath), defaulting to the package's docs/model-profiles/model-catalog.json",
+  "bin/model-evidence.mjs:15-16,876 — catalogPath is a test seam only; no env switch",
+  "bin/model-evidence.mjs:883 — argv --cli only selects the key and must be claude or codex",
+  "docs/model-profiles/model-catalog.json:29,44 — shipped patterns: ^claude-(fable|opus|sonnet|haiku)- (anchored, no nested quantifier, linear) and null for codex",
+  "bin/model-resolve.mjs:50-52,144,146 — the subject is an isToken string of at most 200 chars",
+  "bin/model-resolve.mjs:172 — observations are only filtered by provider/surface; they never feed the pattern",
+  "src/dispatch/cli.ts:624 — dispatch fails closed on any resolver failure"
+ ]
+}

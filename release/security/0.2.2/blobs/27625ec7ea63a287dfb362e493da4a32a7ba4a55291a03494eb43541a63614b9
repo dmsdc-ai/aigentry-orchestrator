@@ -1,0 +1,13 @@
+{
+ "fingerprint": "32f0d9be3bd040327ce19f0b8373fe31bb70c996122afba229c7dc7175999f98",
+ "rule": "python/PT",
+ "level": "note",
+ "location": "bin/dispatch-registry.py:963:14",
+ "verdict": "false-positive",
+ "evidence": [
+  "bin/dispatch-registry.py:121-131 — source: env DISPATCH_STATE_DIR; refused with a NUL or a '..' segment, then realpath-resolved and required absolute",
+  "bin/dispatch-registry.py:135,962-963 — sink: open(active.json + '.legacy-v1.bak', 'wb'): fixed names",
+  "bin/dispatch-registry.py:945-946 — under the registry lock",
+  "bin/dispatch-registry.py:95-117 — documented, accepted in-code waiver for this source (it states 5 occurrences; the scan reports 6)"
+ ]
+}

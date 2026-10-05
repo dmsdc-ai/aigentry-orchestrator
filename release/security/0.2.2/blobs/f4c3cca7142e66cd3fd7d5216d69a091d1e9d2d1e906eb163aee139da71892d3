@@ -1,0 +1,17 @@
+{
+ "fingerprint": "bc3cbb3b7110e7bde3a7f5d0778ae5812952e7d3318311b7c4a087dde402bcce",
+ "rule": "javascript/NoRateLimitingForExpensiveWebOperation",
+ "level": "warning",
+ "location": "src/hitl/web/auth.ts:1020:18",
+ "verdict": "false-positive",
+ "evidence": [
+  "src/hitl/web/auth.ts:537-542 — the expensive operation of all four rate-limit findings: readMetadata opens auth-metadata.json O_NOFOLLOW and reads it, capped at MAX_METADATA_BYTES (64 KiB)",
+  "src/hitl/web/auth.ts:1020 — reported handler: routeLoginVerify",
+  "src/hitl/web/auth.ts:1028-1030 — claim() takes the single-use login challenge; without one the handler returns 410 before any file operation",
+  "src/hitl/web/auth.ts:990,1010 — login challenges are minted only by login/options, after allow('login', MAX_LOGIN_ATTEMPTS)",
+  "src/hitl/web/auth.ts:66 — the login budget is 30 per 300 s window",
+  "src/hitl/web/auth.ts:1034,1059,1105,1110 — file reads in this handler (refresh(true), locked readMetadata) happen only after a claimed challenge",
+  "src/hitl/web/auth.ts:1155,1164-1165 — auth routes other than preauth/logout need exact Host/Origin/JSON, a live preauth cookie and its CSRF header",
+  "src/hitl/web/server.ts:42-43 — server-wide limit before any auth route: 300 requests per 60 s window and at most 16 in flight"
+ ]
+}

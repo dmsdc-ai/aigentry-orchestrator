@@ -1,0 +1,17 @@
+{
+ "fingerprint": "3ffc28cd60739757dafc461dc03a6a8164eaa23cf7bba817fa7cbdad0d4b50f1",
+ "rule": "javascript/PT",
+ "level": "note",
+ "location": "src/dispatch/cli.ts:1231:7",
+ "verdict": "false-positive",
+ "evidence": [
+  "src/dispatch/cli.ts:440 — source: dispatch argv --target",
+  "src/dispatch/cli.ts:1229 — sid = o.target; sid is assigned once and not modified afterwards",
+  "src/dispatch/cli.ts:1231 — assertConfinedTarget(path.join(<sessions root>, sid), sid, task): the same sid is the path component and the checked value",
+  "src/session/worker-sandbox.ts:56 — identity = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/: no '/', '\\\\', ':' or NUL, no leading '.', so '.' and '..' are refused; without the m flag $ admits no trailing newline",
+  "src/session/worker-sandbox.ts:298-299 — assertConfinedTarget's first statement throws SANDBOX_TARGET_SID unless identity.test(sid), before any fs call",
+  "src/session/worker-sandbox.ts:300 — flagged sink: readFileSync(<sessions root>/<sid>/sandbox-current.json), reached only after line 299 passed",
+  "src/dispatch/cli.ts:1232-1233 — any refusal exits 78 SANDBOX_TARGET_UNVERIFIED before the dedup query, spawn or inject",
+  "src/session/worker-sandbox.ts:238-240 — not on this flow: the files sandbox-current.json names live in the staging root, which no worker write scope may overlap"
+ ]
+}

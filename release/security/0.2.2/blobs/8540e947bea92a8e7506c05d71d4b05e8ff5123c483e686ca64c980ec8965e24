@@ -1,0 +1,12 @@
+{
+ "fingerprint": "a1bfe4c564f12d805201c7c47f36457149a297deed9eb0b7475c6ab370b22eca",
+ "rule": "javascript/IndirectCommandInjection",
+ "level": "warning",
+ "location": "src/cleanup-scheduler/cli.ts:209:13",
+ "verdict": "false-positive",
+ "evidence": [
+  "src/cleanup-scheduler/cli.ts:209-210 — spawnSync with shell: false and an argv array",
+  "src/dispatch/registry-command.ts:4-8 — registryInvocation: fixed registry script as executable (POSIX) or 'python' with the script as argv[1] (win32); caller args stay separate argv elements",
+  "src/cleanup-scheduler/cli.ts:215 — any failure, including the registry's refusal of an option-like sid, returns keep_alive=true (fail-safe skip)"
+ ]
+}

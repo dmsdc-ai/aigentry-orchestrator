@@ -1,0 +1,13 @@
+{
+ "fingerprint": "90be7bfdcce74d606d3a4205a388bf5fbc64e4ef6136608eafc720b6775b23fd",
+ "rule": "python/PT",
+ "level": "note",
+ "location": "bin/dispatch-registry.py:334:14",
+ "verdict": "false-positive",
+ "evidence": [
+  "bin/dispatch-registry.py:121-131 — source: env DISPATCH_STATE_DIR; refused with a NUL or a '..' segment, then realpath-resolved and required absolute",
+  "bin/dispatch-registry.py:135,326,334 — sink: open(<state dir>/active.json) read: fixed name",
+  "bin/dispatch-registry.py:340 — content is schema-validated, never echoed raw",
+  "bin/dispatch-registry.py:95-117 — documented, accepted in-code waiver for this source (it states 5 occurrences; the scan reports 6)"
+ ]
+}

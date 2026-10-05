@@ -1,0 +1,17 @@
+{
+ "fingerprint": "451898a2c35d7e4a254c432892e686096914ade6d2e1f00c4594688b164b3b83",
+ "rule": "javascript/XSS",
+ "level": "error",
+ "location": "src/hitl/web/server.ts:18:7",
+ "verdict": "false-positive",
+ "evidence": [
+  "src/hitl/web/server.ts:48,106,109 — source: query parameter view of GET /api/requests",
+  "src/hitl/web/server.ts:108 — only view/cursor/limit keys, each exactly once",
+  "src/hitl/web/server.ts:112 — view must be exactly 'pending' or 'history', else 400 before line 125",
+  "src/hitl/web/server.ts:78-80 — /api/ paths require ready TLS auth and an authenticated principal",
+  "src/hitl/web/server.ts:125 — sink call: json(res, 200, await readRequests(root, view, ...))",
+  "src/hitl/web/server.ts:16-18 — json(): Content-Type application/json; charset=utf-8, body JSON.stringify(value)",
+  "src/hitl/web/server.ts:21-22,40 — every response carries CSP default-src 'none' and X-Content-Type-Options nosniff",
+  "src/hitl/web/assets.ts:51-52,72-78,87,162 — the bundled client writes response data only via textContent / option.value; assets.ts contains no innerHTML, outerHTML, insertAdjacentHTML or document.write"
+ ]
+}

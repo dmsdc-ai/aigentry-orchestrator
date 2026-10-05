@@ -1,0 +1,14 @@
+{
+ "fingerprint": "765eb36a8c16c7fc2469adb621a7a8dd7401d0b59830a971e259e56a5623318d",
+ "rule": "javascript/PT",
+ "level": "note",
+ "location": "bin/model-router.mjs:43:19",
+ "verdict": "false-positive",
+ "evidence": [
+  "bin/model-router.mjs:43 — sink: readFileSync(--profile or AIGENTRY_ROUTER_PROFILE or the packaged profile)",
+  "src/dispatch/cli.ts:502-503 — the only in-repo caller passes --role/--ref/--candidates, never --profile",
+  "bin/model-router.mjs:45-67 — contents must parse as the strict profile grammar; any failure becomes the fixed text 'profile missing or invalid'",
+  "bin/model-router.mjs:123 — output is the decision JSON only",
+  "bin/model-router.mjs:37-40 — in-code review note for this exact rule"
+ ]
+}

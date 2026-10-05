@@ -1,0 +1,21 @@
+{
+ "fingerprint": "dfea45c6260fa9f5153399685aa6aeedf3acbfa07effbb7436e1b9ec3ca98e8b",
+ "rule": "cpp/IntegerOverflow",
+ "level": "warning",
+ "location": "scripts/ci/xres-owner.c:922:44",
+ "verdict": "hardening",
+ "evidence": [
+  "scripts/ci/xres-owner.c:847 — source: the value of each option is the next command-line element argv[i + 1]",
+  "scripts/ci/xres-owner.c:864-867 — --grab-delay-ms is parsed with strtol base 10 and refused only on errno (ERANGE), trailing text or a negative value; there is no upper bound, so 0..LONG_MAX is accepted",
+  "scripts/ci/xres-owner.c:891 — delay_ms is copied into the report field f_delay_ms (flow step)",
+  "scripts/ci/xres-owner.c:921-922 — sink: alarm((unsigned)(GRAB_BOUND_SECONDS + (delay_ms + 999) / 1000)) arms the bound over the capability gate; delay_ms + 999 is signed long arithmetic: undefined behaviour for delay_ms > LONG_MAX - 999, and for large in-range values the conversion to unsigned wraps modulo 2^32 (delay_ms = 4294967291000 gives alarm(0), which cancels the bound)",
+  "scripts/ci/xres-owner.c:164 — GRAB_BOUND_SECONDS is 5",
+  "scripts/ci/xres-owner.c:980,1019 — in --mode wm the probe holds XGrabServer and then sleeps delay_ms ms inside the grab; the alarm is the only internal bound on that hold",
+  "scripts/ci/xres-owner.c:478-485 — sleep_ms(ms) sleeps ms milliseconds (no clamp)",
+  ".github/workflows/release.yml:614 — the release workflow's only invocation is [binary, --mode, wm, --owner-pid, <child pid>]; --grab-delay-ms is never passed, so delay_ms is 0 and the bound evaluates to 5 s",
+  ".github/workflows/ci.yml:629 — ci.yml uses the identical fixed invocation",
+  ".github/workflows/release.yml:18-19 — the release workflow runs only on a pushed v* tag (repository write access)",
+  ".github/workflows/release.yml:140-141 — the probe is compiled from source on the ephemeral GitHub runner",
+  "package.json:33-57 — the npm files allow-list has no scripts/ entry, so the probe is not published"
+ ]
+}

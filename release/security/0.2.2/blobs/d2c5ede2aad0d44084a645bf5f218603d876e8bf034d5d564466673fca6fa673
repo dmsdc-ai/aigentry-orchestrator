@@ -1,0 +1,16 @@
+{
+ "fingerprint": "031b958c4fb8c916d12536212c9a7bd1f788e219382c33eae283f6dd436297a5",
+ "rule": "javascript/NoRateLimitingForExpensiveWebOperation",
+ "level": "warning",
+ "location": "src/hitl/web/auth.ts:897:18",
+ "verdict": "false-positive",
+ "evidence": [
+  "src/hitl/web/auth.ts:537-542 — the expensive operation of all four rate-limit findings: readMetadata opens auth-metadata.json O_NOFOLLOW and reads it, capped at MAX_METADATA_BYTES (64 KiB)",
+  "src/hitl/web/auth.ts:897 — reported handler: routeEnrollVerify",
+  "src/hitl/web/auth.ts:905-907 — claim() takes the single-use enroll challenge; without one the handler returns 410 before any file operation",
+  "src/hitl/web/auth.ts:794-796 — claim() nulls the challenge before verification: no replay, no retry",
+  "src/hitl/web/auth.ts:855,867,887 — enroll challenges are minted only by enroll/options, under allow('invitation', 10) and only after the invitation secret matches",
+  "src/hitl/web/auth.ts:946,966,970,974 — file reads in this handler: one locked readMetadata and one refresh(true), only after a claimed challenge",
+  "src/hitl/web/server.ts:42-43 — server-wide limit before any auth route: 300 requests per 60 s window and at most 16 in flight"
+ ]
+}

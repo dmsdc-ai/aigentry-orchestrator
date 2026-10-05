@@ -1,0 +1,18 @@
+{
+ "fingerprint": "aa33873058963bc8c7e4703a95d95c940ee5e337fac3a2ce94872259ae1a1bf5",
+ "rule": "javascript/PT",
+ "level": "warning",
+ "location": "scripts/release-security-scan.mjs:144:90",
+ "verdict": "false-positive",
+ "evidence": [
+  "scripts/release-security-scan.mjs:128 — source: the message of an exception caught while parsing scanner stdout (an EvidenceError text or a fixed string) is stored in sarifError",
+  "scripts/release-security-scan.mjs:141,143 — sarifError is only the sarif_error field of the run record, which is serialized to originalBytes",
+  "scripts/release-security-scan.mjs:144 — reported location: only sha256(originalBytes), a hex digest, enters the receipt",
+  "scripts/release-security-scan.mjs:148-150 — the scan command writes only the fixed names sarif.json, original-receipt.json and receipt.json",
+  "scripts/release-security-scan.mjs:104 — out() comes from the operator's --out",
+  "scripts/release-evidence.mjs:492-496 — prepareOut requires an absolute, absent-or-empty --out and joins caller-supplied names under it",
+  "scripts/release-evidence.mjs:25 — the flow continues through the shared sha256 helper, which returns createHash(...).digest('hex')",
+  "scripts/release-evidence.mjs:643-644 — the reported sink is writeFileSync(out(`blobs/${digest}`)) where digest = sha256(evidence bytes): a 64-hex name",
+  "scripts/release-evidence.mjs:626,743 — that sink belongs to blobsCommand, a separate CLI command; no value passes from the scan command into it"
+ ]
+}

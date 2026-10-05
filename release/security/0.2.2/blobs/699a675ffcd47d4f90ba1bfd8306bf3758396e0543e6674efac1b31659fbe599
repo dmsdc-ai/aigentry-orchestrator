@@ -1,0 +1,19 @@
+{
+ "fingerprint": "1822bbe6e9651fc5a4565616f297c3041a690b24ce4b60a9b6c89744e34d2fa6",
+ "rule": "javascript/XSS",
+ "level": "error",
+ "location": "src/hitl/web/cli.ts:58:25",
+ "verdict": "false-positive",
+ "evidence": [
+  "src/hitl/web/auth.ts:196-203 — source: the Cookie header; cookie() returns only a value passing isToken, else null",
+  "src/hitl/web/auth.ts:69,170-171 — isToken: exactly TOKEN_LENGTH = 43 characters of [A-Za-z0-9_-]",
+  "src/hitl/web/auth.ts:770-773 — sessionOf hashes the token and uses the hash only as a Map key; it never reaches output",
+  "src/hitl/web/auth.ts:50,816 — principalId is the server constant OWNER_NAME = 'inbox-owner', set when a session is issued",
+  "src/hitl/web/auth.ts:1189 — authenticate() returns id: found.entry.principalId",
+  "src/hitl/web/cli.ts:51,58 — createAuth result is passed to startServer",
+  "src/hitl/web/server.ts:90,94 — consoleReader.read(principal.id, ...) result goes to json()",
+  "src/hitl/web/server.ts:16-18 — json(): Content-Type application/json; charset=utf-8, body JSON.stringify(value)",
+  "src/hitl/web/server.ts:21-22,40 — every response carries CSP default-src 'none' and X-Content-Type-Options nosniff",
+  "src/hitl/web/assets.ts:51-52,72-78,87,162 — the bundled client writes response data only via textContent / option.value; assets.ts contains no innerHTML, outerHTML, insertAdjacentHTML or document.write"
+ ]
+}

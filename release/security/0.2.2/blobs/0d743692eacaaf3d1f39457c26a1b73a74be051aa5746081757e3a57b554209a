@@ -1,0 +1,18 @@
+{
+ "fingerprint": "8c84565050868717db824f8815880ec4db676b834c9a693c50315785526a6e42",
+ "rule": "javascript/HttpToHttps",
+ "level": "warning",
+ "location": "src/hitl/web/server.ts:133:124",
+ "verdict": "false-positive",
+ "evidence": [
+  "src/hitl/web/server.ts:133 — plain HTTP only when config.tls is absent",
+  "src/hitl/web/cli.ts:40-42,49 — TLS comes from --tls-key/--tls-cert",
+  "src/hitl/web/server.ts:62 — secure=false makes ready=false",
+  "src/hitl/web/server.ts:73 — auth routes return 503 without TLS",
+  "src/hitl/web/server.ts:78 — every /api/ path after /api/capabilities returns 503 when not ready",
+  "src/hitl/web/cli.ts:46 — the Console requires TLS and auth",
+  "src/hitl/web/server.ts:30 — listener host must be 127.0.0.1",
+  "src/hitl/web/cli.ts:43 — the CLI fixes host 127.0.0.1",
+  "src/hitl/web/auth.ts:208-209 — session/preauth cookies are Secure; HttpOnly; SameSite=Strict"
+ ]
+}

@@ -1,0 +1,14 @@
+{
+ "fingerprint": "47061f40433078dc5c3cbeb841fa9b1b5fec5350ff104cd37510e44dd33e00fe",
+ "rule": "javascript/IndirectCommandInjection",
+ "level": "warning",
+ "location": "src/inject-handler/cli.ts:187:5",
+ "verdict": "false-positive",
+ "evidence": [
+  "src/inject-handler/cli.ts:187 — spawnSync with shell: false, an argv array and stdio ignored",
+  "src/dispatch/registry-command.ts:4-8 — registryInvocation: fixed registry script as executable (POSIX) or 'python' with the script as argv[1] (win32); caller args stay separate argv elements",
+  "src/inject-handler/cli.ts:418 — sid is one argv element after --sid",
+  "src/inject-handler/cli.ts:183-190 — registryObserve swallows failures: observation only",
+  "src/inject-handler/cli.ts:415-416 — the recorded envelope is observation, not authority"
+ ]
+}

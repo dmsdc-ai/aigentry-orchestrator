@@ -1,0 +1,19 @@
+{
+ "fingerprint": "4fb5d368578457485de449a5c51bd6d71100c6d3d185ec88ebb169b0a2b399d6",
+ "rule": "javascript/NoRateLimitingForExpensiveWebOperation",
+ "level": "warning",
+ "location": "src/hitl/web/auth.ts:1141:13",
+ "verdict": "hardening",
+ "evidence": [
+  "src/hitl/web/auth.ts:537-542 — the expensive operation of all four rate-limit findings: readMetadata opens auth-metadata.json O_NOFOLLOW and reads it, capped at MAX_METADATA_BYTES (64 KiB)",
+  "src/hitl/web/auth.ts:1141 — reported handler: AuthPort.handle for every /auth/* request",
+  "src/hitl/web/auth.ts:1157 — refresh(false) runs before the preauth check (1164) and before any per-route allow()",
+  "src/hitl/web/auth.ts:1155 — the only checks before it are route/method/query/config and exact Host, Origin and JSON headers, which a non-browser local client can send",
+  "src/hitl/web/auth.ts:690-694 — throttle: a re-read happens when >= 250 ms passed since refreshedAt, but refreshedAt is assigned only after the awaited read, so concurrent requests each start a read",
+  "src/hitl/web/auth.ts:1176 — authenticate() also calls refresh(false) for /api/ requests before the session is checked",
+  "src/hitl/web/auth.ts:523-527 — win32 only: each readMetadata with a present directory also runs one readBack batch",
+  "bin/lib/win-private-storage.mjs:168-170,295 — that batch is one synchronous spawnSync of PowerShell (60 s timeout)",
+  "src/hitl/web/server.ts:30 — listener is fixed to 127.0.0.1",
+  "src/hitl/web/server.ts:42-43 — server-wide limit before any auth route: 300 requests per 60 s window and at most 16 in flight"
+ ]
+}
