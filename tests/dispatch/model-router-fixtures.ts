@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import type { WorkerManifest } from "../../src/session/worker-sandbox.js";
 import { installFakeCmux } from "./fake-cmux-win32.js";
+import { writeNpmCmdShim } from "../session/boot-adapter/_win-launch-fixture.js";
 
 export const REPO = resolve(import.meta.dirname, "../../..");
 export const PROFILE = join(REPO, "tests/dispatch/fixtures/model-routing-profile.md");
@@ -51,6 +52,9 @@ if (process.argv.length === 3 && process.argv[2] === '--version') console.log('9
 else if (${JSON.stringify(cli)} === 'agy' && process.argv.length === 3 && process.argv[2] === '--help') console.log('--model --dangerously-skip-permissions --prompt-interactive');
 else { require('node:fs').appendFileSync(process.env.WORK_LOG, 'model\\n'); console.error('TEST TRIPWIRE: attempted real CLI launch'); process.exit(99); }
 `);
+  // #1167 P5: win32 reaches each fake CLI by bare name through a real npm-style `.cmd` shim next to the
+  // extensionless file (kept: direct `node <file>` stubs and POSIX use it); the shim runs it as `node <file>`.
+  if (process.platform === "win32") for (const cli of ["claude", "codex", "gemini", "grok", "agy"]) writeNpmCmdShim(bin, cli);
   const telepty = script("telepty", `
 if (process.argv[2] === 'list') console.log(process.env.LIVE_SESSIONS || JSON.stringify([{id: 'router-fixture', command: process.env.OBSERVED_CLI || 'codex'}]));
 else if (process.argv[2] === 'inject') {

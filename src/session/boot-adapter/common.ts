@@ -117,8 +117,11 @@ export function makeAdapter(cfg: AdapterConfig): BootAdapter {
         }
       } else if (cfg.capabilityProbe) {
         const { executable, flags } = cfg.capabilityProbe;
+        // #1167: a missing CLI is CLI_NOT_FOUND here too, never a raw `spawn <cli> ENOENT`.
         const help = await opts.spawner.run({ argv: [executable, "--help"], env: {},
-          cwd: ctx.cwd, prompt_file: "", expected_digest: "" }, "", 5000);
+          cwd: ctx.cwd, prompt_file: "", expected_digest: "" }, "", 5000).catch((e: unknown) => {
+          throw (e as NodeJS.ErrnoException | null)?.code === "ENOENT" ? new BootAdapterError("CLI_NOT_FOUND", executable) : e;
+        });
         if (help.exit_code !== 0 || flags.some((f) => !(help.stdout + help.stderr).includes(f))) {
           throw new BootAdapterError("CLI_VERSION_DRIFT", `${executable}: required flags missing`);
         }

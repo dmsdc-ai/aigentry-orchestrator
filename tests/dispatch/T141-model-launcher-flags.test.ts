@@ -84,6 +84,8 @@ test("T141: Gemini CLI remains available as explicit binary fallback with linked
     assert.equal(geminiAdapter("gemini").homeEnv, "GEMINI_CLI_HOME");
     assert.equal(geminiBinary({ PATH: f.bin }), "agy");
     rmSync(join(f.bin, "agy"));
+    // #1167: on win32 the fixture's agy.cmd shim is itself an agy hit, so removing agy removes it too.
+    if (process.platform === "win32") rmSync(join(f.bin, "agy.cmd"));
     assert.equal(geminiBinary({ PATH: f.bin }), "gemini");
   } finally { f.cleanup(); }
 });
