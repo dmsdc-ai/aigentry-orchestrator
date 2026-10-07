@@ -423,19 +423,45 @@ test("tamper: confined runner and legacy launcher refuse 78 with fixed strings, 
 test("marker rebind in a resealed manifest is refused before the sandbox is touched", () => {
   const W = world(), p = prepare(W, "m1", { [OPT]: W.token });
   if (WIN) return refusedOnWin(W, p);
-  const marker = String(p.m.claudeOAuthHandoff);
+  const marker = String(p.m.claudeOAuthHandoff), sealed = read(p.manifest);
   for (const mut of [(m: Json) => { m.claudeOAuthHandoff = marker.replace(String(p.m.attempt), randomUUID()); },
     (m: Json) => { m.claudeOAuthHandoff = `${dirname(marker)}/../claude-oauth/token`; },
     (m: Json) => { m.cli = "codex"; }]) {
-    const m = readJson(p.manifest) ?? {};
+    const m = parse(sealed) ?? {};
     mut(m);
-    const data = JSON.stringify(m, null, 2) + "\n", file = join(dirname(p.manifest), `rebound-${seq++}.json`);
+    // Resealed in place: the runner reads only the sealed manifest path (readSealedManifest).
+    const data = JSON.stringify(m, null, 2) + "\n", file = p.manifest;
     writeFileSync(file, data, { mode: 0o600 });
     const r = runRunner(W, file, sha(data));
     assert.equal(r.status, 78);
     assert.match(r.stderr, /CLAUDE_OAUTH_HANDOFF_INVALID/);
     assert.deepEqual([r.srt.length, r.worker], [0, null]);
   }
+});
+
+// The runner reads the manifest as the binder does (readSealedManifest): a symlinked, oversized or
+// unsealed-path manifest is refused with the fixed code even when its hash matches; no SRT, worker or receipt.
+test("runner refuses a symlinked, oversized or unsealed-path manifest with its fixed code, before the sandbox", () => {
+  const cases: Record<string, (manifest: string) => { file: string; hash: string }> = {
+    symlink: (f) => { renameSync(f, `${f}.real`); symlinkSync(`${f}.real`, f); return { file: f, hash: sha(read(f)) }; },
+    oversize: (f) => { const data = read(f) + " ".repeat(1024 * 1024); writeFileSync(f, data); return { file: f, hash: sha(data) }; },
+    unsealedPath: (f) => { const copy = join(dirname(f), "copy.json"); copyFileSync(f, copy); return { file: copy, hash: sha(read(f)) }; },
+  };
+  for (const [name, setup] of Object.entries(cases)) {
+    const W = world(), p = prepare(W, `sm-${name}`);
+    if (WIN) { refusedOnWin(W, p); continue; }
+    const { file, hash } = setup(p.manifest);
+    const r = runRunner(W, file, hash);
+    assert.equal(r.status, 78, `${name}: ${r.stderr}`);
+    assert.match(r.stderr, /\[sandbox\] REFUSED: SANDBOX_MANIFEST_INVALID\n$/, name);
+    assert.deepEqual([r.srt.length, r.worker, existsSync(join(dirname(p.manifest), "receipt.json"))], [0, null, false], name);
+  }
+  const W = world(), p = prepare(W, "sm-changed");
+  if (WIN) return refusedOnWin(W, p);
+  const r = runRunner(W, p.manifest, sha("not the sealed manifest"));
+  assert.equal(r.status, 78);
+  assert.match(r.stderr, /\[sandbox\] REFUSED: SANDBOX_MANIFEST_CHANGED\n$/);
+  assert.deepEqual([r.srt.length, r.worker], [0, null]);
 });
 
 // Deployed metadata guard (#652 must keep it): the canary is checked, and the preflight must pass,

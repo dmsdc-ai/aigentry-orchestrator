@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import { IncomingMessage, ServerResponse } from 'node:http';
@@ -577,4 +578,42 @@ test('adapter regression: two adapters commit one positive-counter winner and pe
       assert.equal(JSON.parse(await readFile(path, 'utf8')).credential.counter, 4);
     } finally { await second.close(); }
   } finally { await f.cleanup(); }
+});
+test('adapter regression: concurrent requests share one in-flight metadata read (single-flight refresh)', async () => {
+  const f = await fixture();
+  const path = join(f.dir, 'auth-metadata.json');
+  // auth.ts imports `lstat` by name: patch the builtin and syncBuiltinESMExports() so that binding sees it.
+  // Every metadata read lstats the metadata file exactly once (checkFile), so this counts reads.
+  const fsp = createRequire(import.meta.url)('node:fs/promises') as Record<string, unknown>;
+  const original = fsp['lstat'] as (...a: any[]) => Promise<unknown>;
+  let reads = 0;
+  try {
+    const invitation = join(f.dir, 'invitation');
+    assert.deepEqual(await provisionOwner({ authRoot: f.dir, invitationPath: invitation }, f.clock), { state: 'created', path: invitation });
+    fsp['lstat'] = function (this: unknown, ...a: any[]) {
+      if (String(a[0]) === path) reads += 1;
+      return original.apply(this, a);
+    };
+    syncBuiltinESMExports();
+    f.advance(250);
+    const N = 8;
+    const results = await Promise.all([
+      ...Array.from({ length: N }, () => call(f.auth, '/auth/preauth')),
+      ...Array.from({ length: N }, () => f.auth.authenticate(request())),
+    ]);
+    assert.equal(reads, 1);
+    assert.deepEqual(results.slice(0, N).map(r => (r as { status: number }).status), Array(N).fill(200));
+    assert.deepEqual(results.slice(N), Array(N).fill(null));
+    assert.equal(f.auth.status().reason, 'enrollment_required');
+    // The 250 ms re-read policy is unchanged: no read inside the window, one read after it.
+    await call(f.auth, '/auth/preauth');
+    assert.equal(reads, 1);
+    f.advance(250);
+    await Promise.all(Array.from({ length: N }, () => call(f.auth, '/auth/preauth')));
+    assert.equal(reads, 2);
+  } finally {
+    fsp['lstat'] = original;
+    syncBuiltinESMExports();
+    await f.cleanup();
+  }
 });

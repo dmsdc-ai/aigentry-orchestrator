@@ -627,6 +627,7 @@ export async function createAuth(
   let snapshot: Snapshot = { state: 'dependency_unverified', reason: libReason ?? 'dependency_unverified' };
   let metadata: Metadata | null = null;
   let refreshedAt = Number.NEGATIVE_INFINITY;
+  let reading: Promise<Snapshot> | null = null;
   let closed = false;
 
   const preauths = new Map<string, PreauthRecord>();
@@ -688,22 +689,35 @@ export async function createAuth(
       return snapshot;
     }
     if (force || !Number.isFinite(refreshedAt) || !Number.isFinite(time) || time - refreshedAt >= 250) {
-      const read = await readMetadata(valid.stateDir);
-      if (read.status === 'ok') {
-        metadata = read.value;
-        refreshedAt = Number.isFinite(time) ? time : refreshedAt;
-        snapshot = classify();
-        return snapshot;
+      // Single-flight: a non-forced caller waits for the read already in progress instead of
+      // starting its own. A forced caller still reads, since it may need to see its own write.
+      if (!force && reading) return reading;
+      const current = load(valid.stateDir, time);
+      reading = current;
+      try {
+        return await current;
+      } finally {
+        if (reading === current) reading = null;
       }
-      metadata = null;
-      refreshedAt = Number.isFinite(time) ? time : refreshedAt;
-      snapshot =
-        read.status === 'corrupt'
-          ? { state: 'setup_required', reason: read.reason }
-          : { state: 'setup_required', reason: 'provisioning_required' };
-      return snapshot;
     }
     snapshot = classify();
+    return snapshot;
+  }
+
+  async function load(stateDir: string, time: number): Promise<Snapshot> {
+    const read = await readMetadata(stateDir);
+    if (read.status === 'ok') {
+      metadata = read.value;
+      refreshedAt = Number.isFinite(time) ? time : refreshedAt;
+      snapshot = classify();
+      return snapshot;
+    }
+    metadata = null;
+    refreshedAt = Number.isFinite(time) ? time : refreshedAt;
+    snapshot =
+      read.status === 'corrupt'
+        ? { state: 'setup_required', reason: read.reason }
+        : { state: 'setup_required', reason: 'provisioning_required' };
     return snapshot;
   }
 

@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
-import { assertExecutableIdentity, digest, quote, type WorkerManifest } from "./worker-sandbox.js";
+import { assertExecutableIdentity, quote, readSealedManifest, type WorkerManifest } from "./worker-sandbox.js";
 import { CLAUDE_OAUTH_CHILD, CLAUDE_OAUTH_DIR, CLAUDE_OAUTH_FILE, readClaudeOAuthHandoff } from "./claude-worker-oauth.js";
 
 async function run(m: WorkerManifest, command: string[], capture = false,
@@ -41,9 +41,14 @@ async function run(m: WorkerManifest, command: string[], capture = false,
 async function main(): Promise<void> {
   const file = process.argv[2], expected = process.argv[3];
   if (!file || !expected) throw new Error("SANDBOX_MANIFEST_REQUIRED");
-  const raw = fs.readFileSync(file, "utf8");
-  if (digest(raw) !== expected) throw new Error("SANDBOX_MANIFEST_CHANGED");
-  const m = JSON.parse(raw) as WorkerManifest;
+  // The binder's sealed read (O_NOFOLLOW, owner-only, 1 MiB cap, sealed path and receipt);
+  // its failures map onto this runner's fixed codes.
+  let m: WorkerManifest;
+  try {
+    m = readSealedManifest(file, expected).m;
+  } catch (e) {
+    throw new Error(e instanceof Error && e.message === "SANDBOX_MANIFEST_CHANGED" ? "SANDBOX_MANIFEST_CHANGED" : "SANDBOX_MANIFEST_INVALID");
+  }
   if (m.version !== 1 || !m.command.length || !m.task || !m.attempt) throw new Error("SANDBOX_MANIFEST_INVALID");
   // #652: the sealed marker must name exactly this attempt's handoff; checked
   // before any sandbox work, read only for the actual worker below.

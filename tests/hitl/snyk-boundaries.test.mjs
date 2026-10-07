@@ -148,8 +148,9 @@ try {
   } else if (mode === 'active') {
     now += 250; state.hold = true;
     const pending = Array.from({ length: 16 }, () => call('/auth/enroll/verify'));
-    for (let i = 0; state.waiting.length < 16 && i < 1000; i++) await new Promise(resolve => setImmediate(resolve));
-    assert.equal(state.waiting.length, 16, '16 real auth calls blocked at filesystem port');
+    // Single-flight refresh: one real auth read blocks at the filesystem port; the other 15 calls wait for it.
+    for (let i = 0; i < 1000; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(state.waiting.length, 1, '16 real auth calls share one read blocked at filesystem port');
     const before = state.fsCalls;
     refusal(await call('/auth/enroll/verify'), 429, 'rate_limited');
     assert.equal(state.fsCalls, before);

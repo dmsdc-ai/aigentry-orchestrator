@@ -1,10 +1,11 @@
 /*
  * #1177 — xres-owner: bounded XRes exact-owned-window ownership probe.
  *
- * PROTOTYPE, ISOLATED LINUX CI ONLY. This file is not wired into any caller. It is
- * compiled and exercised ONLY by .github/workflows/xres-owned-window-prototype.yml,
- * under that workflow's own private Xvfb. `ci.yml` is UNCHANGED in this lane and does
- * not invoke this binary; wiring it in is a separate, later, reviewed change.
+ * LINUX CI ONLY. First validated by the isolated xres-owned-window-prototype lane, this
+ * file is compiled from source by `.github/workflows/ci.yml` and
+ * `.github/workflows/release.yml` (`cc -O2 -Wall -Wextra ... -lXRes -lX11`), whose browser
+ * supervisor runs it as `--mode wm --owner-pid N` under that job's private Xvfb. It is
+ * not part of the published npm package.
  *
  * WHAT THIS PROVES, AND WHAT IT DOES NOT
  *   It answers exactly one question about one XID on one X server: *is this XID a live
@@ -162,6 +163,10 @@
  * bound is separate and larger, so normally this fires first and keeps the verdict
  * legible instead of collapsing to `owner-unreadable`. */
 #define GRAB_BOUND_SECONDS 5
+
+/* Ceiling on --grab-delay-ms, refused at parse time, so the alarm bound below stays a small
+ * positive number of seconds and cannot overflow or wrap to alarm(0). */
+#define MAX_GRAB_DELAY_MS 60000L
 
 /* r2 §C: libXres mallocs `length` unbounded; refuse anything outside this before any
  * dereference of `value`. One CARD32 pid is 4 bytes; 64 is slack, not a parser. */
@@ -864,7 +869,8 @@ int main(int argc, char **argv)
             char *end = NULL;
             errno = 0;
             delay_ms = strtol(value, &end, 10);
-            if (errno != 0 || end == NULL || *end != '\0' || delay_ms < 0) {
+            if (errno != 0 || end == NULL || *end != '\0' || delay_ms < 0 ||
+                delay_ms > MAX_GRAB_DELAY_MS) {
                 usage(); return EXIT_NORECORD;
             }
             i++;
