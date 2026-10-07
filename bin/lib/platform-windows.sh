@@ -23,3 +23,7 @@ platform::session_pid()      { return 0; }
 platform::hold_awake()       { echo "hold_awake: Windows native has no sleep-assertion primitive yet (#305) — NO assertion held for '${2:-aigentry-worker}'" >&2; return 0; }
 platform::host_power_state() { printf 'unknown\n'; }
 platform::lid_closed()       { return 2; }
+
+# cmux NODE_OPTIONS shim refs (#1075): a QUERY like the two above. cmux is macOS-only,
+# so there is never a ref to report: print nothing, the reconciler's nothing-to-do.
+platform::node_options_shim_refs() { return 0; }

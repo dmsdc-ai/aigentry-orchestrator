@@ -216,3 +216,30 @@ platform::lid_closed() {
       ;;
   esac
 }
+
+# ---------------------------------------------------------------------------
+# cmux NODE_OPTIONS restore shim: who still --require's it (#1075)
+# ---------------------------------------------------------------------------
+
+# platform::node_options_shim_refs — every distinct path that a live process's
+# exec-time environment still `--require`s as cmux's NODE_OPTIONS restore shim
+# (…/cmux-claude-node-options/restore-node-options.cjs), one per line, or nothing.
+# The reconciler's step 0f touches each one every tick and puts a missing one back,
+# because macOS purges the file after 3 idle days while the session lives on.
+# macOS only: cmux is a macOS app, and `ps -E` is the /proc-less way to read another
+# process's environment there (own-user processes only, which is all the wrapper
+# ever launches for this user). Linux has neither cmux nor `ps -E`: it prints
+# nothing, which the caller treats as nothing-to-do (fail-open, announced here).
+# ponytail: `[^ ]*` assumes a TMPDIR without spaces — every macOS per-user
+# /var/folders/…/T/ path qualifies; a custom TMPDIR with a space is not matched.
+platform::node_options_shim_refs() {
+  case "$(platform::os_type)" in
+    macos)
+      ps -Ewww -axo command= 2>/dev/null \
+        | grep -oE -e '--require=[^ ]*/cmux-claude-node-options/restore-node-options\.cjs' \
+        | sed 's/^--require=//' | sort -u
+      return 0
+      ;;
+    *) return 0 ;;
+  esac
+}
