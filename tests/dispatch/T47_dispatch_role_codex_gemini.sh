@@ -76,6 +76,7 @@ run_one() {
   AIGENTRY_SESSIONS_ROOT="$TMP_ROOT/sessions" \
   DISPATCH_STATE_DIR="$TMP_ROOT/state" \
   OPEN_SESSION_SH="$FAKE_OPEN_SESSION" \
+  AIGENTRY_DISPATCH_REGISTER_TIMEOUT_MS=0 \
   PATH="$FAKE_BIN:$PATH" \
   TELEPTY="$FAKE_BIN/telepty" \
     env "$home_env=$fake_real" \

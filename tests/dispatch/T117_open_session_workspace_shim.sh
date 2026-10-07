@@ -44,6 +44,16 @@ t_setup; trap t_teardown EXIT
 
 fail() { echo "FAIL[T117]: $*" >&2; exit 1; }
 
+# #1113: parts B and C assert open-session's DEFAULT flag string (read at
+# src/session/open-session/cli.ts:335), and every worker session is launched with the
+# operator's model/effort knobs exported into its env (caac403). A guard run from inside
+# one therefore inherits them and measures the operator's preference instead of the
+# default it names — observed `--model claude-opus-5[1m]` where the assertion says the
+# default. b597c0e (#1098) gave the two .test.ts siblings this isolation; this guard was
+# missed because run-all.sh is not part of `npm test`. Same regex, shell side — `sed -E`,
+# because BSD sed's BRE has no `\|` and the alternation silently matches nothing.
+for k in $(env | sed -nE 's/^(AIGENTRY_[A-Z0-9_]*_(MODEL|EFFORT))=.*/\1/p'); do unset "$k"; done
+
 [ -f "$REPO_ROOT/dist/src/session/open-session/cli.js" ] \
   || fail "dist/src/session/open-session/cli.js missing — run 'tsc -p .' before this suite (see run-all.sh header)"
 

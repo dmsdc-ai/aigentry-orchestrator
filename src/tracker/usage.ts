@@ -13,6 +13,12 @@ export const USAGE = `# dispatch-tracker.sh — Orchestrator-side dispatch healt
 # The honest answer for most dispatches is "no completion fact observed", and a
 # repeating HOLD is what surfaces that to a human.
 #
+# The one case where the repeat STOPS is a row whose session has left
+# \`telepty list\` for two consecutive ticks (#1105): it records ONE session_gone
+# observation and emits ONE HOLD naming the remedy — \`bin/session-cleanup.sh <sid>\`
+# — and then says nothing more while it stays absent. The lifecycle is still not
+# touched here: session-cleanup.sh remains the only writer of \`cleaned\`.
+#
 # See docs/specs/2026-05-12-dispatch-healthcheck.md (Rule 32 영구 fix for #113).
 #
 # Commands:

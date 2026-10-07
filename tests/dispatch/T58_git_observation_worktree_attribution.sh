@@ -49,6 +49,8 @@ reset_logs() {
 # time this guard ran anywhere but a box with a modern bash first on PATH, it died at
 # this line — case A calls seed_wt with no worktree.
 seed_wt() {
+  t_list_sessions "$1"   # the worker is LIVE: a sid absent from the listing takes the
+                         # session-gone arm and never reaches the git evidence (#1105)
   local -a extra=()
   [ -n "${3:-}" ] && extra=(worktree="$3")
   t_seed_dispatch "$1" cwd="$2" transport.inject_id="uuid-$1" \
