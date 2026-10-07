@@ -120,12 +120,16 @@ t10_byte_equal() {
   local home; home=$(mktemp -d)
   AIGENTRY_HOME="$home" "$INSTALLER" >/dev/null
   local rc=0
-  cmp -s "$SRC_COMMON" "$home/instructions/common.md" || rc=1
-  cmp -s "$SRC_ORCH" "$home/instructions/roles/orchestrator.md" || rc=1
+  # Modulo the init tokens the installer substitutes itself (#1069), as in T1:
+  # {{CONSTITUTION_PATH}} → $AIGENTRY_HOME/CONSTITUTION.md, {{CONTROL_WORKSPACE}} → the checkout that owns bin/.
+  sed -e "s|{{CONSTITUTION_PATH}}|$home/CONSTITUTION.md|g" -e "s|{{CONTROL_WORKSPACE}}|$REPO_ROOT|g" "$SRC_COMMON" > "$home/expected-common.md"
+  sed -e "s|{{CONSTITUTION_PATH}}|$home/CONSTITUTION.md|g" -e "s|{{CONTROL_WORKSPACE}}|$REPO_ROOT|g" "$SRC_ORCH" > "$home/expected-orchestrator.md"
+  cmp -s "$home/expected-common.md" "$home/instructions/common.md" || rc=1
+  cmp -s "$home/expected-orchestrator.md" "$home/instructions/roles/orchestrator.md" || rc=1
   rm -rf "$home"
   return $rc
 }
-check "T10 installed files byte-equal to repo src" t10_byte_equal
+check "T10 installed files byte-equal to repo src (modulo init tokens)" t10_byte_equal
 
 printf '\nmigration tests: %d pass / %d fail\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

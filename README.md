@@ -2,13 +2,26 @@
 
 **The orchestration layer for the [aigentry](https://github.com/dmsdc-ai) ecosystem** — spawns AI CLI sessions, routes work between them, and persists session state.
 
-> ⚠️ **Internal infrastructure, not a public product.** This is the control tower that coordinates aigentry sessions. It is not published to npm and has no public install path. If you want to *use* aigentry, start with the [aigentry meta-installer](https://github.com/dmsdc-ai/aigentry) or [telepty](https://github.com/dmsdc-ai/aigentry-telepty).
+> ⚠️ **Internal infrastructure, not a public product.** This is the control tower that coordinates aigentry sessions. It is published to npm as `@dmsdc-ai/aigentry-orchestrator`; see [Install](#install). If you want to *use* aigentry, start with the [aigentry meta-installer](https://github.com/dmsdc-ai/aigentry) or [telepty](https://github.com/dmsdc-ai/aigentry-telepty).
 
 ## What it does
 
 - **Spawn** — opens AI CLI sessions (orchestrator + worker roles) across terminals
 - **Route** — dispatches tasks to sessions and collects their reports back
 - **Persist** — tracks session state and hierarchy across a run
+
+## Install
+
+```sh
+npm i -g @dmsdc-ai/aigentry-orchestrator
+aigentry-orchestrator init
+```
+
+`init` creates a control workspace (default `~/aigentry/_orchestrator`, or `--workspace PATH`)
+and scaffolds `~/.aigentry`. `aigentry-orchestrator --help` lists its options. When
+`~/.aigentry/config.json` has no `defaults` block, `init` writes
+`defaults.cli_flags: "--permission-mode bypassPermissions"` into it and prints a line saying
+so. Edit that file if you do not want this default.
 
 ## Dispatch capacity
 
@@ -149,16 +162,16 @@ To stop, restart the controller via `bin/orchestrator-boot.sh` from a shell wher
 
 ## Ecosystem
 
-The orchestrator is internal infrastructure that drives the aigentry ecosystem via telepty — it is not published to npm. The published, independently useful modules:
+The orchestrator is internal infrastructure that drives the aigentry ecosystem via telepty — it is published to npm as `@dmsdc-ai/aigentry-orchestrator`. The published, independently useful modules:
 
 | Module | Package | Version | Role | Maturity |
 | --- | --- | --- | --- | --- |
-| **telepty** | `@dmsdc-ai/aigentry-telepty` | 0.7.1 | Cross-terminal / cross-machine prompt transport (PTY daemon) | Shipping |
+| **telepty** | `@dmsdc-ai/aigentry-telepty` | 0.8.4 | Cross-terminal / cross-machine prompt transport (PTY daemon) | Shipping |
 | **brain** | `@dmsdc-ai/aigentry-brain` | 0.3.1 | Persistent cross-session memory (MCP server) | Early |
 | **deliberation** | `@dmsdc-ai/aigentry-deliberation` | 0.0.47 | Multi-AI structured debate + synthesis (MCP server) | Early |
 | **devkit** | `@dmsdc-ai/aigentry-devkit` | 0.1.14 | Installer/scaffold for the AI dev environment | Early |
 | **aterm** | `@dmsdc-ai/aterm` | 0.2.14 | Terminal launcher with native session IPC | Early |
-| **orchestrator** | *(unpublished)* | — | Control tower that drives sessions via telepty | Internal |
+| **orchestrator** | `@dmsdc-ai/aigentry-orchestrator` | 0.2.2 | Control tower that drives sessions via telepty | Internal |
 
 > Licenses: all MIT except `@dmsdc-ai/aterm` (UNLICENSED).
 

@@ -22,6 +22,8 @@ import {
   MANIFEST,
   SCAFFOLD_PREFIX,
   TEMPLATE_TOKENS,
+  templateSubs,
+  substitute,
   isSubstitutionExempt,
   isExecutable,
   STATE_DIRS,
@@ -228,9 +230,11 @@ function dependencyChecks() {
   if (has("telepty")) info("telepty found");
   else
     warn(
-      "telepty CLI not on PATH. It is a declared dependency of this package; if you installed " +
-        "globally it should be at <npm prefix>/bin/telepty. Run 'telepty-install' to set up the " +
-        "daemon. Dispatch will not function until it is reachable.",
+      "telepty CLI not on PATH. It is a declared dependency of this package, installed nested under " +
+        `it at ${path.join(PKG_ROOT, "node_modules", ".bin", "telepty")}, and npm does not link a ` +
+        "dependency's commands onto PATH. Install telepty globally with " +
+        "'npm i -g @dmsdc-ai/aigentry-telepty' to put telepty and telepty-install on PATH, then run " +
+        "'telepty-install' to set up the daemon. Dispatch will not function until it is reachable.",
     );
 
   if (has("claude")) info("claude CLI found");
@@ -392,7 +396,8 @@ function copyManifest(ws, opts) {
   fs.copyFileSync(path.join(PKG_ROOT, ".agents/skills/orchestrate-turn/SKILL.md"), skillCopy);
   summary.written.push(".claude/skills/orchestrate-turn/SKILL.md");
 
-  info(`${summary.written.length} written, ${summary.preserved.length} preserved, ${summary.skipped.length} unchanged`);
+  info(`${summary.written.length} written, ${summary.preserved.length} preserved, ${summary.skipped.length} unchanged ` +
+    `(workspace: ${MANIFEST.length} manifest files + the .claude/skills/orchestrate-turn/SKILL.md copy)`);
   if (changed.length) info(`overwritten (differed): ${changed.join(", ")}`);
   return changed;
 }
@@ -482,10 +487,13 @@ async function scaffold(ws, opts, subs) {
   // 5.3 — config.json, merged key-wise. Never touches the keys other components own (§2.5).
   const cfgPath = path.join(AIGENTRY_HOME, "config.json");
   const template = fs.readFileSync(path.join(PKG_ROOT, "tooling/instructions/config.template.json"), "utf8");
+  // The shipped defaults block carries CLI flags; say so whenever init writes it.
+  const flagsWritten = () => info(`wrote default defaults.cli_flags "${JSON.parse(template).defaults.cli_flags}" to ${cfgPath}`);
   if (!fs.existsSync(cfgPath)) {
     fs.writeFileSync(cfgPath, substitute(template, subs));
     summary.written.push(cfgPath);
     info(`wrote ${cfgPath}`);
+    flagsWritten();
   } else {
     const existing = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
     const fresh = JSON.parse(substitute(template, subs));
@@ -499,6 +507,7 @@ async function scaffold(ws, opts, subs) {
     if (added.length) {
       fs.writeFileSync(cfgPath, JSON.stringify(existing, null, 2) + "\n");
       summary.written.push(`${cfgPath} (added: ${added.join(", ")})`);
+      if (added.includes("defaults")) flagsWritten();
     }
     const declined = Object.keys(existing).filter((k) => !added.includes(k));
     info(`${cfgPath}: added ${added.length ? added.join(", ") : "nothing"}`);
@@ -519,9 +528,6 @@ async function scaffold(ws, opts, subs) {
 }
 
 // ------------------------------------------------------------- step 6: substitution
-
-const substitute = (text, subs) =>
-  Object.entries(subs).reduce((acc, [token, value]) => acc.split(token).join(value), text);
 
 function substituteAll(ws, scaffoldWritten, subs) {
   step("Step 6 — template substitution");
@@ -577,7 +583,7 @@ function guidance(ws, counts) {
       "Native request capture (--capture-root/--preservation-root) is unavailable on native Windows in 0.2.2; use WSL2 for it.\n"
     : "";
   const text = `Control workspace ready: ${ws}
-  ${counts.governance} governance files, ${counts.scaffold} scaffold files, state/ initialised empty.
+  ${counts.governance + counts.scaffold} manifest files (${counts.governance} governance + ${counts.scaffold} tooling/instructions scaffold sources), state/ initialised empty.
 
 Next:
   1. cd ${ws}
@@ -679,12 +685,7 @@ async function main() {
     process.exit(0);
   }
 
-  const subs = {
-    "{{CONSTITUTION_PATH}}": path.join(AIGENTRY_HOME, "CONSTITUTION.md"),
-    "{{CONTROL_WORKSPACE}}": ws,
-    "{{DEVICE_ID}}": `device-${os.hostname()}`,
-    "{{CREATED_AT}}": new Date().toISOString(),
-  };
+  const subs = templateSubs(ws, AIGENTRY_HOME);
 
   verifyPackageComplete();
   if (!native) fs.mkdirSync(ws, { recursive: true });
@@ -710,7 +711,7 @@ async function main() {
   guidance(ws, { governance: MANIFEST.length - scaffoldCount, scaffold: scaffoldCount });
   if (finishLegacy) finishLegacy();
 
-  step("Step 8 — summary");
+  step(`Step 8 — summary (all steps: workspace, state/ and ${AIGENTRY_HOME})`);
   console.log(
     `  written   ${summary.written.length}\n` +
       `  preserved ${summary.preserved.length}\n` +

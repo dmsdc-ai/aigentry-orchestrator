@@ -2,13 +2,26 @@
 
 **The orchestration layer for the [aigentry](https://github.com/dmsdc-ai) ecosystem** — spawns AI CLI sessions, routes work between them, and persists session state.
 
-> ⚠️ **Internal infrastructure, not a public product.** This is the control tower that coordinates aigentry sessions. It is not published to npm and has no public install path. If you want to *use* aigentry, start with the [aigentry meta-installer](https://github.com/dmsdc-ai/aigentry) or [telepty](https://github.com/dmsdc-ai/aigentry-telepty).
+> ⚠️ **Internal infrastructure, not a public product.** This is the control tower that coordinates aigentry sessions. It is published to npm as `{{name}}`; see [Install](#install). If you want to *use* aigentry, start with the [aigentry meta-installer](https://github.com/dmsdc-ai/aigentry) or [telepty](https://github.com/dmsdc-ai/aigentry-telepty).
 
 ## What it does
 
 - **Spawn** — opens AI CLI sessions (orchestrator + worker roles) across terminals
 - **Route** — dispatches tasks to sessions and collects their reports back
 - **Persist** — tracks session state and hierarchy across a run
+
+## Install
+
+```sh
+npm i -g {{name}}
+aigentry-orchestrator init
+```
+
+`init` creates a control workspace (default `~/aigentry/_orchestrator`, or `--workspace PATH`)
+and scaffolds `~/.aigentry`. `aigentry-orchestrator --help` lists its options. When
+`~/.aigentry/config.json` has no `defaults` block, `init` writes
+`defaults.cli_flags: "--permission-mode bypassPermissions"` into it and prints a line saying
+so. Edit that file if you do not want this default.
 
 ## Dispatch capacity
 
@@ -149,7 +162,7 @@ To stop, restart the controller via `bin/orchestrator-boot.sh` from a shell wher
 
 ## Ecosystem
 
-The orchestrator is internal infrastructure that drives the aigentry ecosystem via telepty — it is not published to npm. The published, independently useful modules:
+The orchestrator is internal infrastructure that drives the aigentry ecosystem via telepty — it is published to npm as `{{name}}`. The published, independently useful modules:
 
 {{ecosystem_table}}
 

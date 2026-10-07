@@ -4,7 +4,7 @@
     {
       "name": "telepty",
       "package": "@dmsdc-ai/aigentry-telepty",
-      "version": "0.7.1",
+      "version": "0.8.4",
       "role": "Cross-terminal / cross-machine prompt transport (PTY daemon)",
       "maturity": "Shipping",
       "license": "MIT"
@@ -44,12 +44,11 @@
     },
     {
       "name": "orchestrator",
-      "package": "aigentry-orchestrator",
+      "package": "@dmsdc-ai/aigentry-orchestrator",
       "version": "—",
       "role": "Control tower that drives sessions via telepty",
       "maturity": "Internal",
-      "license": "MIT",
-      "published": false
+      "license": "MIT"
     }
   ]
 }
