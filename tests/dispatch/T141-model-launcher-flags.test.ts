@@ -134,19 +134,24 @@ for (const withRole of [false, true]) for (const [cli, env, expected] of [
   } finally { f.cleanup(); }
 });
 
-test("T141: capped researcher route retains Gemini selection but refuses before terminal/model/delivery", () => {
+// C3-a: this used to pin `gpt-6-astra -> gemini (gemini)` then SANDBOX_CLI_UNSUPPORTED (exit 78): the cap fallback
+// took the fixture profile's researcher row (gemini), a CLI the confined spawn refuses. `--cli auto` now asks the
+// router for confinable CLIs only, so the fallback lands on the next confinable candidate and spawns it.
+test("T141: capped researcher route falls to a confinable CLI, never to Gemini", () => {
   const f = fixture();
   try {
     writeFileSync(join(f.aig, "instructions/roles/researcher.md"), "# RESEARCHER\nFIXTURE-ROLE\n");
     const r = f.dispatch([...f.spawnArgs, "--role", "researcher"], { AIGENTRY_CLI_CAP_CODEX: "0" });
-    assert.equal(r.status, 78, r.stderr);
-    assert.match(r.stderr, /gpt-6-astra -> gemini \(gemini\)/);
-    assert.match(r.stderr, /SANDBOX_CLI_UNSUPPORTED: gemini/);
+    assert.match(r.stderr, /gpt-6-astra -> opus-5 \(claude\)/);
+    assert.doesNotMatch(r.stderr, /SANDBOX_CLI_UNSUPPORTED/);
     assert.equal(f.calls(), 1);
-    assert.equal(existsSync(f.env.OPEN_LOG!), false);
-    assert.equal(existsSync(f.env.PARENT_MODEL_LOG!), false);
-    assert.equal(existsSync(f.env.WORK_LOG!), false);
-    assert.deepEqual(bootCommand(f, "gemini", { AIGENTRY_GEMINI_MODEL: "gemini-3.8-flash-high" }).slice(0, 4),
-      ["agy", "--model", "gemini-3.8-flash-high", "--dangerously-skip-permissions"]);
+    if (process.platform === "win32") {
+      const d = f.refused(r);
+      assert.deepEqual([d.cli, d.model, d.decided_by, d.capped_cli], ["claude", "claude-opus-5[1m]", "llm-capped", "codex"]);
+      return;
+    }
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(f.manifest().cli, "claude");
+    assert.ok(f.manifest().command.includes("claude-opus-5[1m]"));
   } finally { f.cleanup(); }
 });

@@ -1,0 +1,7 @@
+Welcome to the Antigravity CLI. You are currently not signed in.
+Accessing workspace: /Users/duckyoungkim/.aigentry/role-sandbox/logger-rt1090-rt1090-probe
+Do you trust the contents of this project?
+Antigravity CLI requires permission to read, edit, and execute files here.
+> Yes, I trust this folder
+  No, exit
+  ↑/↓ Navigate · enter Confirm                                     Gemini 3.8 Flash · high

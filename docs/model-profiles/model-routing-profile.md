@@ -8,11 +8,11 @@ models:
 default_table:            # deterministic fallback, role -> label; used when the LLM call fails
   architect: opus-5   
   analyst:   opus-5   
-  researcher: grok-4.6    # was gemini: headless web search measured working on grok, auto-denied on agy (see body)
+  researcher: gpt-6-astra # was grok-4.6 (C3-a): confined dispatch spawns claude/codex only; of those, the cheaper (rubric tie rule)
   coder:     gpt-6-astra
   tester:    gpt-6-astra
   builder:   gpt-6-astra
-  logger:    gemini       # was grok-4.6: cheapest/fastest for trivial text; workspace file writes allowed headless
+  logger:    gpt-6-astra  # was gemini (C3-a): confined dispatch spawns claude/codex only; of those, the cheaper (rubric tie rule)
 ---
 # Model routing profile (task #1082)
 

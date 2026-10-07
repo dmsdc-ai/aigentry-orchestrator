@@ -500,7 +500,7 @@ function resolveRoute(o: Opts, sid: string, skipPreparation: boolean): void {
   }
   try {
     const result = spawnSync(process.execPath, [path.join(SCRIPT_DIR, "model-router.mjs"),
-      "--role", o.role, "--ref", o.refFile, "--candidates", "1"], {
+      "--role", o.role, "--ref", o.refFile, "--candidates", "1", "--confined", "1"], {
       encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], timeout: 16000, killSignal: "SIGKILL",
     });
     if (result.error || result.status !== 0) throw new Error("router unavailable");

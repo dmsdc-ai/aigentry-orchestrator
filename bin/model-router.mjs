@@ -65,6 +65,11 @@ try {
   table = parsedTable;
   body = front[2];
 } catch { failure = "profile missing or invalid"; }
+// C3-a: a confined spawn admits only claude and codex (SANDBOX_CLI_UNSUPPORTED in src/dispatch/cli.ts
+// spawnWorkspace; keep in sync). Dispatch's `--cli auto` asks with `--confined 1`, so the classifier
+// allowlist, the role table pick and the cap candidates never name a CLI that spawn would refuse.
+// Without the flag the label router is unchanged for its other callers.
+if (args["--confined"]) models = models.filter((m) => ["claude", "codex"].includes(m.cli));
 
 if (!failure && args["--ref"]) {
   try {

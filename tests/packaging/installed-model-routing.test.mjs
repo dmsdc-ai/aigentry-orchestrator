@@ -753,20 +753,18 @@ for (const withRole of [false, true]) for (const [cli, env, expected] of [
   } finally { f.cleanup(); }
         });
 
-test("T141: capped researcher route retains Gemini selection but refuses before terminal/model/delivery", () => {
+// C3-a: mirrors tests/dispatch/T141 — the capped researcher route used to land on gemini and refuse (exit 78).
+test("T141: capped researcher route falls to a confinable CLI, never to Gemini", () => {
   const f = fixture();
   try {
     writeFileSync(join(f.aig, "instructions/roles/researcher.md"), "# RESEARCHER\nFIXTURE-ROLE\n");
     const r = f.dispatch([...f.spawnArgs, "--role", "researcher"], { AIGENTRY_CLI_CAP_CODEX: "0" });
-    assert.equal(r.status, 78, r.stderr);
-    assert.match(r.stderr, /gpt-6-astra -> gemini \(gemini\)/);
-    assert.match(r.stderr, /SANDBOX_CLI_UNSUPPORTED: gemini/);
+    assert.match(r.stderr, /gpt-6-astra -> opus-5 \(claude\)/);
+    assert.doesNotMatch(r.stderr, /SANDBOX_CLI_UNSUPPORTED/);
     assert.equal(f.calls(), 1);
-    assert.equal(existsSync(f.env.OPEN_LOG), false);
-    assert.equal(existsSync(f.env.PARENT_MODEL_LOG), false);
-    assert.equal(existsSync(f.env.WORK_LOG), false);
-    assert.deepEqual(bootCommand(f, "gemini", { AIGENTRY_GEMINI_MODEL: "gemini-3.8-flash-high" }).slice(0, 4),
-      ["agy", "--model", "gemini-3.8-flash-high", "--dangerously-skip-permissions"]);
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(f.manifest().cli, "claude");
+    assert.ok(f.manifest().command.includes("claude-opus-5[1m]"));
   } finally { f.cleanup(); }
 });
 
@@ -775,8 +773,8 @@ test('Installed-profile: implicit default resolves installed docs for every role
     const f = fixture();
     const env = { ...f.env };
     delete env.AIGENTRY_ROUTER_PROFILE;
-    for (const [role, label] of [['architect', 'opus-5'], ['analyst', 'opus-5'], ['researcher', 'grok-4.6'],
-        ['coder', 'gpt-6-astra'], ['tester', 'gpt-6-astra'], ['builder', 'gpt-6-astra'], ['logger', 'gemini'], ['unknown', 'opus-5']]) {
+    for (const [role, label] of [['architect', 'opus-5'], ['analyst', 'opus-5'], ['researcher', 'gpt-6-astra'],
+        ['coder', 'gpt-6-astra'], ['tester', 'gpt-6-astra'], ['builder', 'gpt-6-astra'], ['logger', 'gpt-6-astra'], ['unknown', 'opus-5']]) {
         const r = runProduct(f.root, [ROUTER, '--role', role], env, 20000);
         assert.equal(r.status, 0, r.stderr);
         assert.equal(r.stderr, '');
