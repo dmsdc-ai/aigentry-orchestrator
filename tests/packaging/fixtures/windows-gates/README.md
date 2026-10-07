@@ -78,6 +78,15 @@ byte up to its Windows boundary, except one approved header sentence, followed b
 the approved Windows region. The one other approved change (#1171) is the
 `Dispatch guard suite` step: both workflows carry the same independent approved
 bytes for it (cap 12), in place of the historical step (release cap 4, CI cap 8).
+#1196 approves one release-only region: in `publish`, `Publish to npm` gains
+`id: publish`, a `Name the outcome when the publish itself failed` step follows
+it, and `The registry must serve the bytes we packed` reads once and then every
+15 s for 12 minutes, printing each answer and naming the last one (404 or not)
+on exhaustion. Those bytes are held to an independent approved literal in place
+of the historical publish and read-back steps (6 x 10 s), and the literal itself
+to at least 10 minutes at 15–20 s. #1196 also compares the two workflows' `test`
+jobs with each other, parsed and byte for byte, allowing only release's
+`needs: guard`; a differing step `timeout-minutes` is refused.
 The retired debt ratchet is replayed from the
 fixture only, as history. The security pin must be `UNREVIEWED` while no
 `release/security/<version>/policy.json` exists and exactly the sha256 of that

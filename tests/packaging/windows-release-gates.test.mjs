@@ -1582,6 +1582,158 @@ function assertDispatchGuardBytes(source, label) {
   assert.equal(lf(source).split(`${dispatchGuardAfter}${dispatchGuardNext}`).length, 2,
     `${label}: exactly the approved Dispatch guard suite step bytes`);
 }
+// #1196 — the one approved change to the `publish` job: the publish step gains `id: publish`, the
+// PUBLISH_FAILED step follows it, and the registry read-back waits for npm's asynchronous processing
+// (one read, then one every 15 s for 12 minutes) and names the registry's last answer. Restated here
+// as an independent literal and never derived from either workflow. It replaces the publish and
+// read-back steps both historical fixtures carry (6 x 10 s) and nothing else.
+const publishStepName = 'Publish to npm';
+const publishReadbackBefore = `      - name: Publish to npm
+        if: steps.registry.outputs.exists != 'true'
+        env:
+          NODE_AUTH_TOKEN: \${{ secrets.NPM_TOKEN }}
+        run: npm publish "\${{ steps.pack.outputs.tarball }}" --access public
+
+      # The verification that matters. A local build agreeing with itself proves nothing about
+      # what users download. This reads the shasum back from the registry and compares it to
+      # the tarball we packed. It runs on the fresh-publish path AND the already-published
+      # path, so a green run always states the same true thing: npm serves these bytes.
+      - name: The registry must serve the bytes we packed
+        run: |
+          set -euo pipefail
+          LOCAL="\${{ steps.pack.outputs.shasum }}"
+          REMOTE=""
+          for attempt in 1 2 3 4 5 6; do
+            REMOTE="$(npm view --prefer-online "\${PACKAGE}@\${VERSION}" dist.shasum 2>/dev/null || true)"
+            [ -n "$REMOTE" ] && break
+            echo "registry has not surfaced \${VERSION} yet (attempt \${attempt}/6); waiting 10s"
+            sleep 10
+          done
+          if [ -z "$REMOTE" ]; then
+            echo "::error::\${PACKAGE}@\${VERSION} is still not readable from the registry after publishing. The publish is NOT confirmed."
+            exit 1
+          fi
+          if [ "$LOCAL" != "$REMOTE" ]; then
+            echo "::error::npm serves \${PACKAGE}@\${VERSION} with sha1 \${REMOTE}, but this tag packs to \${LOCAL}. The registry's bytes are not this tag's bytes. npm versions are immutable — republish under a new version rather than assuming this is cosmetic."
+            exit 1
+          fi
+          echo "registry sha1 \${REMOTE} matches the packed tarball"
+`;
+const publishReadbackAfter = `      # #1196: \`id\` so the step below can name PUBLISH_FAILED. Skipped is not failure, so on
+      # the already-published path every step below still runs; do not add an \`if:\` to them.
+      - name: Publish to npm
+        id: publish
+        if: steps.registry.outputs.exists != 'true'
+        env:
+          NODE_AUTH_TOKEN: \${{ secrets.NPM_TOKEN }}
+        run: npm publish "\${{ steps.pack.outputs.tarball }}" --access public
+
+      # #1196, modelled on aigentry-telepty #1127. A red run has two causes that demand opposite
+      # responses, and the badge alone cannot tell them apart. This step speaks for exactly one
+      # of them: npm REJECTED the publish, so nothing was shipped.
+      - name: Name the outcome when the publish itself failed
+        if: failure() && steps.publish.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          {
+            echo "### Registry proof — \\\`\${PACKAGE}@\${VERSION}\\\`"
+            echo
+            echo "**PUBLISH_FAILED** — \\\`npm publish\\\` was rejected, so \${VERSION} never reached the registry. Nothing was shipped; the publish step's own error says why. Fixing that cause and re-running is safe: there is no published version to collide with."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "PUBLISH_FAILED: npm publish was rejected; \${PACKAGE}@\${VERSION} was not shipped."
+
+      # The verification that matters. A local build agreeing with itself proves nothing about
+      # what users download. This reads the shasum back from the registry and compares it to
+      # the tarball we packed. It runs on the fresh-publish path AND the already-published
+      # path, so a green run always states the same true thing: npm serves these bytes.
+      #
+      # #1196 — WHY THE BUDGET IS 12 MINUTES. The 0.2.2 publish SUCCEEDED, npm replied "being
+      # processed and may take a few minutes", and this step's 6 x 10 s = 60 s ran out. The
+      # version became readable about 4 minutes after the publish, so a finished release
+      # reported failure and needed a manual re-run of this job. The gate is right; its budget
+      # was shorter than npm's own asynchronous processing. So: one read now, then one every
+      # 15 s for 12 minutes (49 reads), each read's answer printed, and on exhaustion the last
+      # answer named — a 404 (npm has not surfaced the version yet) is not the same failure as
+      # a registry that could not be read at all.
+      - name: The registry must serve the bytes we packed
+        run: |
+          set -euo pipefail
+          LOCAL="\${{ steps.pack.outputs.shasum }}"
+          ATTEMPTS=49
+          INTERVAL=15
+          REMOTE=""
+          ANSWER="no answer"
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            set +e
+            REMOTE="$(npm view --prefer-online "\${PACKAGE}@\${VERSION}" dist.shasum 2>"\${RUNNER_TEMP}/readback.err")"
+            RC=$?
+            set -e
+            [ "$RC" -eq 0 ] && [ -n "$REMOTE" ] && break
+            REMOTE=""
+            if grep -q 'E404' "\${RUNNER_TEMP}/readback.err"; then
+              ANSWER="404 (npm has not surfaced \${VERSION} yet)"
+            else
+              DETAIL="$(grep -m 1 . "\${RUNNER_TEMP}/readback.err" || true)"
+              ANSWER="not a 404 (npm view exited \${RC}: \${DETAIL:-no shasum and no error output})"
+            fi
+            if [ "$attempt" -lt "$ATTEMPTS" ]; then
+              echo "read \${attempt}/\${ATTEMPTS}: registry answered \${ANSWER}; waiting \${INTERVAL}s"
+              sleep "$INTERVAL"
+            else
+              echo "read \${attempt}/\${ATTEMPTS}: registry answered \${ANSWER}"
+            fi
+          done
+          if [ -z "$REMOTE" ]; then
+            {
+              echo "### Registry proof — \\\`\${PACKAGE}@\${VERSION}\\\`"
+              echo
+              echo "**PUBLISHED_NOT_YET_READABLE** — npm did not reject the publish, but after \${ATTEMPTS} reads over $(( (ATTEMPTS - 1) * INTERVAL / 60 )) minutes the registry's last answer was \${ANSWER}. The publish is NOT confirmed, and this red run does NOT mean nothing shipped."
+              echo
+              echo "Remedy: once npm serves \${VERSION}, re-run this job. That run finds the version already present, skips the publish, verifies the bytes, and creates the GitHub Release. NOT the remedy: publishing again, or retagging — npm versions are immutable."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::PUBLISHED_NOT_YET_READABLE: \${PACKAGE}@\${VERSION} is still not readable from the registry after \${ATTEMPTS} reads over $(( (ATTEMPTS - 1) * INTERVAL / 60 )) minutes; the last answer was \${ANSWER}. The publish is NOT confirmed. Do NOT re-publish and do NOT retag; re-run this job once npm serves \${VERSION}."
+            exit 1
+          fi
+          echo "read \${attempt}/\${ATTEMPTS}: registry serves sha1 \${REMOTE}"
+          if [ "$LOCAL" != "$REMOTE" ]; then
+            echo "::error::npm serves \${PACKAGE}@\${VERSION} with sha1 \${REMOTE}, but this tag packs to \${LOCAL}. The registry's bytes are not this tag's bytes. npm versions are immutable — republish under a new version rather than assuming this is cosmetic."
+            exit 1
+          fi
+          echo "registry sha1 \${REMOTE} matches the packed tarball"
+`;
+// The bytes on either side of it in release.yml, so nothing can be prepended or appended unseen.
+const publishReadbackPrevious = '            exit 1\n          fi\n\n';
+const publishReadbackNext = '\n      # Second, independent proof: not the metadata npm reports, but the artifact a user\n';
+const parsePublishSteps = (label, bytes) => parse(label, `jobs:\n  publish:\n    steps:\n${bytes}`).jobs.publish.steps;
+const publishReadbackSteps = {
+  historical: parsePublishSteps('historical-publish-readback', publishReadbackBefore),
+  approved: parsePublishSteps('approved-publish-readback', publishReadbackAfter),
+};
+{
+  const [historicalPublish, historicalReadback] = publishReadbackSteps.historical;
+  const [approvedPublish, outcome, approvedReadback] = publishReadbackSteps.approved;
+  assert.equal(publishReadbackSteps.historical.length, 2, 'historical publish and read-back steps');
+  assert.equal(publishReadbackSteps.approved.length, 3, 'approved publish, outcome and read-back steps');
+  assert.deepEqual(approvedPublish, { ...historicalPublish, id: 'publish' }, 'parsed, the publish step only gains its id');
+  assert.deepEqual(outcome, { name: 'Name the outcome when the publish itself failed', if: "failure() && steps.publish.outcome == 'failure'",
+    run: outcome.run }, 'the outcome step runs only when the publish step failed');
+  assert.deepEqual({ ...approvedReadback, run: historicalReadback.run }, historicalReadback, 'parsed, the read-back changes only its script');
+  // No loosening: the approved budget itself is held to the #1196 floor.
+  const attempts = Number(/^ATTEMPTS=(\d+)$/m.exec(approvedReadback.run)?.[1]);
+  const interval = Number(/^INTERVAL=(\d+)$/m.exec(approvedReadback.run)?.[1]);
+  assert.ok(interval >= 15 && interval <= 20 && (attempts - 1) * interval >= 600, 'read-back polls every 15-20 s for at least 10 minutes');
+}
+function withApprovedPublishReadback(job) {
+  const copy = structuredClone(job);
+  const start = copy.steps.indexOf(named(copy, publishStepName));
+  assert.deepEqual(copy.steps.slice(start, start + 2), publishReadbackSteps.historical, 'historical publish and read-back steps');
+  copy.steps.splice(start, 2, ...structuredClone(publishReadbackSteps.approved));
+  return copy;
+}
+function assertPublishReadbackBytes(source, label) {
+  assert.equal(lf(source).split(`${publishReadbackPrevious}${publishReadbackAfter}${publishReadbackNext}`).length, 2,
+    `${label}: exactly the approved publish and registry read-back bytes`);
+}
 const approvedWindows = parse('approved-windows-contract', `jobs:\n${approvedWindowsRegion}`).jobs;
 assert.deepEqual(Object.keys(approvedWindows), [declared, ...ids], 'approved Windows contract names exactly the three successor jobs');
 function withoutBrowser(workflow, release) {
@@ -1714,7 +1866,8 @@ function validate(workflow, policy = currentPolicy()) {
   const publish = structuredClone(workflow.jobs.publish);
   assert.deepEqual(publish.needs, ['guard', 'test', declared, ...ids], 'gate and Windows successor publish dependencies');
   publish.needs = original.jobs.publish.needs;
-  assert.deepEqual(publish, original.jobs.publish, 'unchanged publish steps, secrets and permissions');
+  assert.deepEqual(publish, withApprovedPublishReadback(original.jobs.publish),
+    'unchanged publish steps, secrets and permissions except the approved registry read-back');
   for (const id of [declared, ...ids]) {
     const job = workflow.jobs[id];
     assert.equal(job.needs, 'guard', `${id}: needs guard`);
@@ -1765,9 +1918,11 @@ acceptance('frozen final workflow preserves non-Windows behaviour and requires t
 function validateReleaseHistory(workflow, source = readFileSync(join(root, '.github/workflows/release.yml'), 'utf8')) {
   validate(workflow);
   assertDispatchGuardBytes(source, 'release');
+  assertPublishReadbackBytes(source, 'release');
   const copy = withoutBrowser(workflow, true);
   const history = structuredClone(rejected);
   history.jobs.test = withApprovedDispatchGuard(history.jobs.test, dispatchGuardSteps.release);
+  history.jobs.publish = withApprovedPublishReadback(history.jobs.publish);
   for (const item of [copy, history]) {
     const env = named(item.jobs.guard, 'Release planning and changed-file admission').env ?? {};
     delete env.RELEASE_SECURITY_POLICY_SHA256;
@@ -1827,6 +1982,58 @@ function validateCIHistory(source, historicalSource = readFileSync(join(root, fi
     'every CI byte outside the approved header sentence, Dispatch guard suite step and Windows region is the historical CI');
 }
 acceptance('CI Windows jobs match release and every other CI byte remains unchanged', 'ci-parity', () => validateCIHistory(readFileSync(join(root, '.github/workflows/ci.yml'), 'utf8')));
+// #1196 — the POSIX `test` job, compared between the two workflows themselves. Each file is frozen
+// against its own historical fixture above, which let release.yml keep a Dispatch guard suite cap
+// of 4 after CI had raised it to 8, and the first v0.2.2 tag run died on a passing suite. So the
+// doctrine the Windows jobs keep: release.yml carries CI's `test` job, parsed and byte for byte,
+// adding only `needs: guard`.
+const testJobHead = '  test:\n    name: Full suite\n';
+function testJobBytes(source, label) {
+  // From `  test:` up to the next line at job indentation (a job key or a job-level comment).
+  const matches = [...lf(source).matchAll(/^  test:\n(?:(?!  \S)[^\n]*\n)*/gm)];
+  assert.equal(matches.length, 1, `${label}: one test job`);
+  assert.ok(matches[0][0].startsWith(testJobHead), `${label}: test job header`);
+  return matches[0][0];
+}
+function validateTestParity(ciSource, releaseSource) {
+  const ciJob = parse('CI test parity', ciSource).jobs.test;
+  const releaseJob = structuredClone(parse('release test parity', releaseSource).jobs.test);
+  assert.ok(!('needs' in ciJob), 'CI test job: no needs');
+  assert.equal(releaseJob.needs, 'guard', 'release test job: needs guard');
+  delete releaseJob.needs;
+  assert.deepEqual(releaseJob, ciJob, 'parsed: release test job equals CI test job except needs: guard');
+  const ciBytes = testJobBytes(ciSource, 'CI');
+  assert.equal(testJobBytes(releaseSource, 'release'), `${testJobHead}    needs: guard\n${ciBytes.slice(testJobHead.length)}`,
+    'bytes: release test job is CI test job plus needs: guard');
+}
+const testParitySources = () => ['.github/workflows/ci.yml', '.github/workflows/release.yml'].map(path => lf(readFileSync(join(root, path), 'utf8')));
+for (const [ending, newline] of [['LF', '\n'], ['CRLF', '\r\n']]) {
+  acceptance(`CI and release test jobs match except needs: guard (${ending})`, 'test-parity', () => {
+    validateTestParity(...testParitySources().map(source => source.replaceAll('\n', newline)));
+  });
+}
+// [name, workflow mutated, needle, replacement, the comparison that must refuse it]
+const testParityMutations = [
+  ['Dispatch guard suite cap differs in release', 'release', 'release.yml carries the same lines.\n        timeout-minutes: 12\n',
+    'release.yml carries the same lines.\n        timeout-minutes: 13\n', /^parsed:/],
+  ['Dispatch guard suite cap differs in CI', 'CI', 'release.yml carries the same lines.\n        timeout-minutes: 12\n',
+    'release.yml carries the same lines.\n        timeout-minutes: 8\n', /^parsed:/],
+  ['regression suite step gains a cap in release only', 'release', '        run: npm test\n', '        run: npm test\n        timeout-minutes: 20\n', /^parsed:/],
+  ['job cap differs', 'CI', '    runs-on: ${{ matrix.os }}\n    timeout-minutes: 30\n', '    runs-on: ${{ matrix.os }}\n    timeout-minutes: 45\n', /^parsed:/],
+  ['matrix differs', 'release', '        os: [ubuntu-latest, macos-latest]\n', '        os: [ubuntu-latest]\n', /^parsed:/],
+  ['release drops needs: guard', 'release', `${testJobHead}    needs: guard\n`, testJobHead, /needs guard/],
+  ['CI gains needs: guard', 'CI', testJobHead, `${testJobHead}    needs: guard\n`, /no needs/],
+  ['comment byte differs', 'release', '      # Runs after npm test because several guards gate on dist/ being built, and\n',
+    '      # Runs after npm test because some guards gate on dist/ being built, and\n', /^bytes:/],
+];
+for (const [name, side, needle, replacement, refusal] of testParityMutations) {
+  acceptance(`test job parity rejects: ${name}`, 'test-parity-mutant', () => {
+    const [ciSource, releaseSource] = testParitySources();
+    const changed = side === 'CI' ? [replaceOnce(ciSource, needle, replacement), releaseSource]
+      : [ciSource, replaceOnce(releaseSource, needle, replacement)];
+    assert.throws(() => validateTestParity(...changed), error => error instanceof assert.AssertionError && refusal.test(error.message));
+  });
+}
 
 const mutants = [];
 // The step each job's step-level mutants land on, found by name rather than by index.
@@ -1888,6 +2095,13 @@ mutants.push(['admission after token', w => { w.jobs.guard.steps.reverse(); }]);
 mutants.push(['W1 changed pass floor outside reader', w => { named(w.jobs[ids[0]], persistenceStep).run = commands.persistence.replace('-gt 20', '-gt 0'); }]);
 mutants.push(['W1 changed selected test glob outside reader', w => { named(w.jobs[ids[0]], persistenceStep).run = commands.persistence.replace('persistence/*.test.js', '*.test.js'); }]);
 mutants.push(['W1 reverted legacy reader', w => { named(w.jobs[ids[0]], persistenceStep).run = rejectedPersistence; }]);
+mutants.push(['publish registry read-back back to 6 reads', w => {
+  const step = named(w.jobs.publish, 'The registry must serve the bytes we packed');
+  step.run = replaceOnce(step.run, 'ATTEMPTS=49\n', 'ATTEMPTS=6\n');
+}]);
+mutants.push(['publish outcome step removed', w => {
+  w.jobs.publish.steps = w.jobs.publish.steps.filter(step => step.name !== 'Name the outcome when the publish itself failed');
+}]);
 for (const [name, mutate] of mutants) acceptance(`mutant rejected: ${name}`, 'mutant', () => {
   const copy = structuredClone(final);
   mutate(copy);
@@ -3718,6 +3932,20 @@ const releaseBrowserMutations = [
     'release.yml carries the same lines.\n        timeout-minutes: 4\n'],
   ['Dispatch guard suite step differs from CI', '        # measured time and still catches a real hang. release.yml carries the same lines.\n',
     '        # measured time and still catches a real hang.\n'],
+  // #1196 — the approved publish outcome step and registry read-back, byte for byte.
+  ['registry read-back budget back to 6 reads', '          ATTEMPTS=49\n', '          ATTEMPTS=6\n'],
+  ['registry read-back interval back to 10 s', '          INTERVAL=15\n', '          INTERVAL=10\n'],
+  ['registry read-back reads every failure as a 404', '            if grep -q \'E404\' "${RUNNER_TEMP}/readback.err"; then\n', '            if true; then\n'],
+  ['registry read-back stops printing each read',
+    '              echo "read ${attempt}/${ATTEMPTS}: registry answered ${ANSWER}; waiting ${INTERVAL}s"\n', ''],
+  ['registry read-back stops naming the last answer', '; the last answer was ${ANSWER}. The publish is NOT confirmed.', '. The publish is NOT confirmed.'],
+  ['registry read-back skipped', '      - name: The registry must serve the bytes we packed\n',
+    '      - name: The registry must serve the bytes we packed\n        if: false\n'],
+  ['publish step loses its id', '        id: publish\n', ''],
+  ['publish outcome step always runs', "        if: failure() && steps.publish.outcome == 'failure'\n", '        if: always()\n'],
+  ['publish outcome step removed', publishReadbackAfter.slice(publishReadbackAfter.indexOf('      # #1196, modelled on'),
+    publishReadbackAfter.indexOf('      # The verification that matters.')), ''],
+  ['registry read-back comment byte changed', '      # #1196 — WHY THE BUDGET IS 12 MINUTES.', '      # #1196 — WHY THE BUDGET IS 15 MINUTES.'],
 ];
 // #1167 — CI's copy of the approved Windows region. Each negative relaxes exactly one bound the full-suite
 // gate or its neighbours must hold; every one must be refused by the byte and parsed comparisons.
