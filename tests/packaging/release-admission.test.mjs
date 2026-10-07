@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -45,7 +45,39 @@ function fixture(t, { privateState = 'ignored', projection = defaultProjection()
   const fixtureParent = process.env.TMPDIR || path.join(repo, '.aigentry-report-rv1171', 'tmp');
   mkdirSync(fixtureParent, { recursive: true });
   const root = realpathSync(mkdtempSync(path.join(fixtureParent, 'release-admission-')));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+  // On ENOTEMPTY only: list what was left (lstat, no content read, at most 64 entries) as one
+  // `leftover:` diagnostic block, then rethrow the original error unchanged. No retry.
+  t.after(() => {
+    try {
+      rmSync(root, { recursive: true, force: true });
+    } catch (error) {
+      if (error?.code === 'ENOTEMPTY') {
+        try {
+          const iso = time => Number.isFinite(time?.getTime?.()) ? time.toISOString() : 'unavailable';
+          const lines = [];
+          let truncated = false;
+          const visit = relative => {
+            let names;
+            try { names = readdirSync(path.join(root, relative)); } catch (e) { lines.push(`${relative || '.'} unreadable ${e?.code}`); return; }
+            for (const name of names) {
+              if (lines.length >= 64) { truncated = true; return; }
+              const rel = path.join(relative, name);
+              try {
+                const stat = lstatSync(path.join(root, rel));
+                const type = stat.isSymbolicLink() ? 'symlink' : stat.isDirectory() ? 'directory' : stat.isFile() ? 'file' : 'other';
+                lines.push(`${JSON.stringify(rel)} ${type} size=${stat.size} birthtime=${iso(stat.birthtime)} mtime=${iso(stat.mtime)}`);
+                if (type === 'directory') visit(rel);
+              } catch (e) { lines.push(`${JSON.stringify(rel)} unavailable ${e?.code}`); }
+            }
+          };
+          visit('');
+          t.diagnostic(`leftover: ${error.code} ${error.syscall} under ${JSON.stringify(root)}; ${lines.length} entries${truncated ? ' (truncated at 64)' : ''}`);
+          for (const line of lines) t.diagnostic(`leftover: ${line}`);
+        } catch {}
+      }
+      throw error;
+    }
+  });
   const env = { ...process.env, TMPDIR: root, HOME: root, XDG_CONFIG_HOME: root,
     GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_COUNT: '0',
     GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid',
@@ -79,7 +111,9 @@ function fixture(t, { privateState = 'ignored', projection = defaultProjection()
     }
   };
   const git = (...args) => {
-    const result = spawnSync('git', ['-C', root, '-c', 'core.hooksPath=/dev/null', ...args], { env, encoding: 'utf8', timeout: 10000 });
+    // No auto maintenance: `git commit` otherwise starts a detached `git maintenance run --auto`
+    // (or `gc --auto` on older Git) that can outlive this call while t.after removes the root.
+    const result = spawnSync('git', ['-C', root, '-c', 'core.hooksPath=/dev/null', '-c', 'maintenance.auto=false', '-c', 'gc.auto=0', ...args], { env, encoding: 'utf8', timeout: 10000 });
     if (result.error || result.status !== 0) {
       // The original failure, its exit status and its stderr are preserved; the observations are
       // only appended to the message that the unchanged assertions below already raise.
@@ -257,6 +291,12 @@ test('public checkout admits with ignored private state present and unread', t =
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /planning\/source coverage only; not completion or installed verification/);
   assert.match(result.stdout, /policy: ACCEPT; eligible=18; blocked=0/);
+});
+test('fixture git calls disable auto maintenance and auto gc on the command line', t => {
+  const f = fixture(t);
+  // `command line:` origin proves the value comes from the helper's own `-c` arguments.
+  assert.equal(f.git('config', '--show-origin', '--get', 'maintenance.auto'), 'command line:\tfalse');
+  assert.equal(f.git('config', '--show-origin', '--get', 'gc.auto'), 'command line:\t0');
 });
 test('a projection carried unchanged from an earlier release needs no ownership', t => {
   const f = fixture(t);
