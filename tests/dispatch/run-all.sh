@@ -56,7 +56,7 @@ done
 # Two prose sources in this repo disagreed on the guard count (96 vs 99), which is why
 # this is asserted against a count of the files rather than read from a comment. Bump it
 # when you add a guard; a DROP is a deleted test, and catching that is the point.
-EXPECTED_GUARDS=139
+EXPECTED_GUARDS=141
 
 # ── the expected-skip declaration ───────────────────────────────────────────────────
 # Per entry, why it is here. A skip with no recorded reason is a silent skip with extra
