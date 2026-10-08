@@ -1,0 +1,10 @@
+{
+ "fingerprint": "faa153d869d61e7a7a157a6ea3fc03fbd4868e32dbb597e10f32becf65052988",
+ "rule": "javascript/ServerLeak",
+ "level": "warning",
+ "location": "src/hitl/web/auth.ts:220:7",
+ "verdict": "false-positive",
+ "evidence": [
+  "see rationale"
+ ]
+}

@@ -1,0 +1,10 @@
+{
+ "fingerprint": "8298c4e5741f79f10bab2827569ed9d1d146aa4789ae7671af1a6be01d88733a",
+ "rule": "javascript/PT",
+ "level": "note",
+ "location": "src/session/worker-sandbox-runner.ts:16:5",
+ "verdict": "false-positive",
+ "evidence": [
+  "see rationale"
+ ]
+}

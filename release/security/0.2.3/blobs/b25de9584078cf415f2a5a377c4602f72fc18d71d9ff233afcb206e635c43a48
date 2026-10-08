@@ -1,0 +1,10 @@
+{
+ "fingerprint": "9c887a2befc0d1629ac9389d5cd8c537327c3c179f1222661e3d6a6da41a0fcb",
+ "rule": "cpp/IntegerOverflow",
+ "level": "warning",
+ "location": "scripts/ci/xres-owner.c:981:44",
+ "verdict": "false-positive",
+ "evidence": [
+  "see rationale"
+ ]
+}

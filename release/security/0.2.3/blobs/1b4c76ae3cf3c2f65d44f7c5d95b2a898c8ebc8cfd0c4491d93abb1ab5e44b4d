@@ -1,0 +1,10 @@
+{
+ "fingerprint": "40885912f1f30ffb8592cd6d1a099b13d0080078edb4fd15fa49824f2a4b1591",
+ "rule": "javascript/PT",
+ "level": "note",
+ "location": "bin/model-router.mjs:76:16",
+ "verdict": "false-positive",
+ "evidence": [
+  "see rationale"
+ ]
+}
