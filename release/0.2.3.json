@@ -1,0 +1,143 @@
+{
+  "schema_version": 1,
+  "release_group": "release-1199",
+  "release_task": 1199,
+  "package": "@dmsdc-ai/aigentry-orchestrator",
+  "version": "0.2.3",
+  "base_tag": "v0.2.2",
+  "base_commit": "e56952d8b941b0f49e92a23a92499c0b5a930a4c",
+  "tasks": [
+    {
+      "task_id": 1195,
+      "disposition": "shipping",
+      "scope": "The release-admission fixture disables git automatic maintenance on its git calls and lists leftovers when cleanup hits ENOTEMPTY. The ubuntu failure that motivated it was not reproduced; the Windows EBUSY cleanup failure in boot-prepare.test is not addressed in this release.",
+      "paths": [
+        "tests/packaging/release-admission.test.mjs"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.3-dispositions.md",
+          "sha256": "66e1d0bf9e4226731141a2723f0d28d43435af2fa85b03772ad4e63f19767cd7"
+        }
+      ]
+    },
+    {
+      "task_id": 1196,
+      "disposition": "shipping",
+      "scope": "release.yml waits for npm's asynchronous processing on the registry read-back and names a failed publish; the POSIX test job is compared with ci.yml by test; the four always-red observation workflows and their scripts are removed.",
+      "paths": [
+        ".github/workflows/release-admission-cleanup-probe.yml",
+        ".github/workflows/release.yml",
+        ".github/workflows/windows-boot-spawn-probe.yml",
+        ".github/workflows/windows-installed-entry-probe.yml",
+        ".github/workflows/windows-publication-probe.yml",
+        "tests/diagnostics/release-admission-cleanup-probe.mjs",
+        "tests/dispatch/windows-boot-spawn-probe.mjs",
+        "tests/dispatch/windows-installed-entry-probe.mjs",
+        "tests/dispatch/windows-publication-probe.py",
+        "tests/dispatch/windows-publication-restricted.py",
+        "tests/dispatch/windows-publication-startup-debug.py",
+        "tests/dispatch/windows-publication-startup.py",
+        "tests/packaging/fixtures/windows-gates/README.md",
+        "tests/packaging/windows-release-gates.test.mjs"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.3-dispositions.md",
+          "sha256": "66e1d0bf9e4226731141a2723f0d28d43435af2fa85b03772ad4e63f19767cd7"
+        }
+      ]
+    },
+    {
+      "task_id": 1199,
+      "disposition": "shipping",
+      "scope": "The 0.2.3 candidate: the September ports from the control workspace (task gate and ledger shape, tq tools, tracker session-gone, installer token substitution, NODE_OPTIONS shim keep-alive, dispatch guard runner hermeticity, probe regression tests), automatic routing restricted to confinable CLIs, the three hardening items from the 0.2.2 security triage, the installed-0.2.2 findings in README and init, and the release records. The switch of the control workspace to the released line happens after publication and is not part of this release.",
+      "paths": [
+        "CHANGELOG.md",
+        "README.md",
+        "README.tmpl.md",
+        "bin/init/cli.mjs",
+        "bin/init/manifest.mjs",
+        "bin/install-instructions.sh",
+        "bin/lib/platform-unix.sh",
+        "bin/lib/platform-windows.sh",
+        "bin/model-router.mjs",
+        "bin/tq-status.sh",
+        "bin/tq-track.sh",
+        "docs/model-profiles/model-routing-profile.md",
+        "ecosystem.json",
+        "package-lock.json",
+        "package.json",
+        "release/0.2.3-dispositions.md",
+        "release/0.2.3.json",
+        "release/security/0.2.3/blobs/0e0cb3cf8f2e6a42d1bb0c35debe0ae8fc173f02b90d76236d7995801a694f27",
+        "release/security/0.2.3/blobs/1366dbb4466ffa9b45ba166dcdda02e88a15e5b92c95e119957f3f984ebc480c",
+        "release/security/0.2.3/blobs/1b4c76ae3cf3c2f65d44f7c5d95b2a898c8ebc8cfd0c4491d93abb1ab5e44b4d",
+        "release/security/0.2.3/blobs/242f1ca2a931813fd33295cee2d23b30d3f55f5db934131f6ab67e139abd4996",
+        "release/security/0.2.3/blobs/2b598de504bbe7228599b0060718a9041b49d69de6b763b92e8f33c9be8580f0",
+        "release/security/0.2.3/blobs/2bfca67ff69cfc314ea67a9a331e8670ab18e7906b603113c2029c73d84b36b6",
+        "release/security/0.2.3/blobs/2d6c3c8bd400a72fd06929ad8e37cfd22ea81af77186c198ceef92a01c27c0c7",
+        "release/security/0.2.3/blobs/3845ab0f688b459459920458426d49787cc567a7397ae547f09aa07a96204b43",
+        "release/security/0.2.3/blobs/38748e33d5d02c1772c8a3076235f6089dc22e771ebeddaba139f79321366638",
+        "release/security/0.2.3/blobs/51553f9b9d6268e472ec661cd420f88931d9b1476f0ad4c6605bd297b9924ad7",
+        "release/security/0.2.3/blobs/69535a4aab6202dcbbe0da4bbd16dfe26b3a0cf059f8ad44ea23311ebdf57b97",
+        "release/security/0.2.3/blobs/77fcd93b0041b7b5a3923169360704a80d6e56961ab3f7b3a4ca5e995e5f04df",
+        "release/security/0.2.3/blobs/8ac89ca7a41d97b83fb50fc80f78d4726550f15c2f5bc89df336b3cf9b68c760",
+        "release/security/0.2.3/blobs/9a8b205c490021ae4f325f30f0a3b8b449cdad281f88278c87bc3bcb6e5d70a3",
+        "release/security/0.2.3/blobs/a13b6737d47badf453a6338511554a04d9ba86a50b9acd6a4e0e0d78447dad9d",
+        "release/security/0.2.3/blobs/b25de9584078cf415f2a5a377c4602f72fc18d71d9ff233afcb206e635c43a48",
+        "release/security/0.2.3/blobs/b644a10be80f2d554c4283fa0eeee808199189f9ad8d35e2dbf8b1de945a7d9f",
+        "release/security/0.2.3/blobs/bf0e376de0065fab9ee9aea88155b3aa6b2ff0fd77a8a946a41ead54209b83b9",
+        "release/security/0.2.3/blobs/d343a7f5127ff6b827ffcbb6ff38f94dd8fc6c5eb65f8d43241fb6344b7349a2",
+        "release/security/0.2.3/policy.json",
+        "release/tasks.json",
+        "scripts/ci/xres-owner.c",
+        "src/dispatch/cli.ts",
+        "src/hitl/web/auth.ts",
+        "src/reconciler/cli.ts",
+        "src/reconciler/node-options-shim.ts",
+        "src/session/worker-sandbox-runner.ts",
+        "src/tracker/cli.ts",
+        "src/tracker/usage.ts",
+        "tests/dispatch/T117_open_session_workspace_shim.sh",
+        "tests/dispatch/T141-model-launcher-flags.test.ts",
+        "tests/dispatch/T143-node-options-shim-keepalive.test.ts",
+        "tests/dispatch/T144-agy-trust-readiness.test.ts",
+        "tests/dispatch/T147-grok-agy-worker-hardening.test.ts",
+        "tests/dispatch/T148-tracker-session-gone.test.ts",
+        "tests/dispatch/T149-task-gate-duplicate-id.test.ts",
+        "tests/dispatch/T150-task-ledger-queue-shape.test.ts",
+        "tests/dispatch/T164_tq_status_string_ids.sh",
+        "tests/dispatch/T165_tq_track_hides_done.sh",
+        "tests/dispatch/T16_no_cwd_contamination.sh",
+        "tests/dispatch/T47_dispatch_role_codex_gemini.sh",
+        "tests/dispatch/T48_codex_gemini_role_receipt_live.sh",
+        "tests/dispatch/T58_git_observation_worktree_attribution.sh",
+        "tests/dispatch/T8_pull_git_observation.sh",
+        "tests/dispatch/fixtures/agy_idle_after_turn.txt",
+        "tests/dispatch/fixtures/agy_launcher.info",
+        "tests/dispatch/fixtures/agy_trust_modal.txt",
+        "tests/dispatch/fixtures/agy_welcome_idle.txt",
+        "tests/dispatch/fixtures/codex_sandbox_prompt.txt",
+        "tests/dispatch/fixtures/grok_idle_settled.txt",
+        "tests/dispatch/fixtures/grok_welcome_idle.txt",
+        "tests/dispatch/lib.sh",
+        "tests/dispatch/model-router-confinable.test.ts",
+        "tests/dispatch/run-all.sh",
+        "tests/hitl/snyk-boundaries.test.mjs",
+        "tests/hitl/web-auth.test.ts",
+        "tests/instructions/T142-install-force-tokens.test.ts",
+        "tests/instructions/T1_install_real_role_contracts.sh",
+        "tests/migration/run.sh",
+        "tests/packaging/installed-model-routing.test.mjs",
+        "tests/session/claude-worker-oauth.test.ts"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.3-dispositions.md",
+          "sha256": "66e1d0bf9e4226731141a2723f0d28d43435af2fa85b03772ad4e63f19767cd7"
+        }
+      ]
+    }
+  ]
+}
