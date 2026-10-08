@@ -7,6 +7,33 @@ extracts the matching section as the GitHub Release notes, so a publish fails
 without one. Unreleased harness work is still grouped under a dated
 `## [<YYYY-MM-DD>]` section beneath the ongoing `## [Unreleased]` working set.
 
+## [0.2.4] - 2026-10-08
+
+Hotfix. The published 0.2.2 and 0.2.3 cannot dispatch a confined worker on
+macOS 26: every spawn ended with `SANDBOX_PREFLIGHT_FAILED: 71`. Each
+release-group task is recorded in `release/0.2.4-dispositions.md`. Publishing
+this release closes no task.
+
+### Fixed
+
+- **Confined worker spawn on macOS 26 (#652).** The OS confinement preflight
+  required `stat`/`lstat` of the directory canary to be denied, but
+  sandbox-exec allows directory metadata (sandbox-runtime emits
+  `(allow file-read-metadata (vnode-type DIRECTORY))` whenever a read deny
+  exists), so the preflight refused every spawn on that platform. It now
+  requires listing the canary directory and `stat`/`lstat` of the file inside
+  it to be denied, which sandbox-exec does enforce. A darwin-only live test
+  runs the built runner on the real sandbox-runtime and shows the old deny set
+  failing with 71 on the same manifest. Linux is unchanged.
+
+### Known limitations
+
+- When the orchestrator runs inside cmux, dispatch may resolve `claude` to
+  cmux's shell shim, which the sandbox cannot execute (exit 127); put the real
+  `claude` binary first on `PATH` for dispatch. The resolver will refuse
+  wrappers in a later release (#652).
+- The limitations listed under 0.2.3 still apply.
+
 ## [0.2.3] - 2026-10-08
 
 Follow-up release to 0.2.2: the control workspace's September work that
