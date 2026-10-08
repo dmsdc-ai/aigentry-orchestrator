@@ -1,0 +1,10 @@
+{
+ "fingerprint": "030d0435a18425ac805cc6d147bd8beab20d77574270c302d04346ed87c9ebc4",
+ "rule": "javascript/IndirectCommandInjection",
+ "level": "warning",
+ "location": "src/session/worker-sandbox-runner.ts:12:17",
+ "verdict": "false-positive",
+ "evidence": [
+  "see rationale"
+ ]
+}
