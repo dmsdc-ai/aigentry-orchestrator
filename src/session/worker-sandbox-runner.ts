@@ -74,14 +74,19 @@ async function main(): Promise<void> {
   Object.assign(process.env, m.env);
   await SandboxManager.initialize(m.config, undefined, false);
   try {
+    // The directory canary attests the metadata boundary through what macOS sandbox-exec
+    // enforces: listing the directory and stat/lstat of a file inside it are denied. stat of
+    // the directory entry itself is allowed by sandbox-exec on macOS 26 (measured 2026-10-08:
+    // every directory under a denied path answers stat, none answers readdir), so it is not a
+    // boundary this preflight can require without refusing every spawn on that platform.
     const sentinel = path.join(m.env.TMPDIR!, "preflight.txt");
     const script = `const fs=require('fs'),net=require('net');
       const deny=f=>{try{f();process.exit(71)}catch(e){if(!['EPERM','EACCES'].includes(e.code))throw e}};
       deny(()=>fs.readFileSync(process.argv[1]));
       deny(()=>fs.writeFileSync(process.argv[1],'changed'));
-      deny(()=>fs.statSync(process.argv[3]));
-      deny(()=>fs.lstatSync(process.argv[3]));
       deny(()=>fs.readdirSync(process.argv[3]));
+      deny(()=>fs.statSync(process.argv[3]+'/synthetic.txt'));
+      deny(()=>fs.lstatSync(process.argv[3]+'/synthetic.txt'));
       fs.writeFileSync(process.argv[2],'ok'); fs.unlinkSync(process.argv[2]);
       const s=net.connect({host:'127.0.0.1',port:3848});
       s.on('connect',()=>process.exit(72)); s.on('error',e=>process.exit(['EPERM','EACCES'].includes(e.code)?0:73));
