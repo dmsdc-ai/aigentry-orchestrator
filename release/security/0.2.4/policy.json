@@ -1,0 +1,140 @@
+{
+  "schema_version": 1,
+  "release": {
+    "package": "@dmsdc-ai/aigentry-orchestrator",
+    "version": "0.2.4",
+    "group": "release-1199",
+    "task": 1199,
+    "planning_manifest_sha256": "efcd9556ab90117f0260837872c5e5ed5eaffc6611b7e9441b486c8e2cb0fd2d"
+  },
+  "candidate": {
+    "inventory_sha256": "0fea49e64293a7d3ef1160e00e7d560c157fb1eb726923f68cd36995e8c70769",
+    "source_ids": [
+      "src-00001"
+    ],
+    "dependency_ids": [
+      "dep-package-lock-json",
+      "dep-package-json"
+    ]
+  },
+  "scan": {
+    "sarif_id": "sarif",
+    "receipt_id": "receipt",
+    "projected_ids": [
+      "src-00001"
+    ],
+    "scope_id": "scope"
+  },
+  "files": [
+    {
+      "id": "dep-package-lock-json",
+      "kind": "dependency",
+      "path": "package-lock.json",
+      "bytes": 64210,
+      "sha256": "0892b2bb72ab8e788d61a0608c1357346d8d2160b14f1bf6b20534bad24e2d2b"
+    },
+    {
+      "id": "dep-package-json",
+      "kind": "dependency",
+      "path": "package.json",
+      "bytes": 2560,
+      "sha256": "bf9cca107fe9a241e6a57ca9c1a8c9983df1f118f7d746b24758912f964e4daf"
+    },
+    {
+      "id": "src-00001",
+      "kind": "source",
+      "path": "src/session/worker-sandbox-runner.ts",
+      "bytes": 6569,
+      "sha256": "cbfef9a953717494c1670b659165d30edb044ee64ad427487590fa439399ef97"
+    },
+    {
+      "id": "sarif",
+      "kind": "evidence",
+      "path": null,
+      "bytes": 18549,
+      "sha256": "4ac1e7c624eb1b1b4e791674c6f1c73fd408e8ce017bdfdac579b39ed8081737"
+    },
+    {
+      "id": "receipt",
+      "kind": "evidence",
+      "path": null,
+      "bytes": 621,
+      "sha256": "f786121cbd5f658aab01f46acaf3a5b699aea81ade4c5cc92eec066db0f6f355"
+    },
+    {
+      "id": "scope",
+      "kind": "evidence",
+      "path": null,
+      "bytes": 1063,
+      "sha256": "4b1940ade162fd51593132f860dcd7881421b4e901b2bb92062f54c2b32ff0a9"
+    },
+    {
+      "id": "ev-77fcd93b0041b7b5",
+      "kind": "evidence",
+      "path": null,
+      "bytes": 282,
+      "sha256": "77fcd93b0041b7b5a3923169360704a80d6e56961ab3f7b3a4ca5e995e5f04df"
+    },
+    {
+      "id": "ev-2bfca67ff69cfc31",
+      "kind": "evidence",
+      "path": null,
+      "bytes": 774,
+      "sha256": "2bfca67ff69cfc314ea67a9a331e8670ab18e7906b603113c2029c73d84b36b6"
+    },
+    {
+      "id": "ev-38748e33d5d02c17",
+      "kind": "evidence",
+      "path": null,
+      "bytes": 256,
+      "sha256": "38748e33d5d02c1772c8a3076235f6089dc22e771ebeddaba139f79321366638"
+    },
+    {
+      "id": "ev-2b598de504bbe722",
+      "kind": "evidence",
+      "path": null,
+      "bytes": 782,
+      "sha256": "2b598de504bbe7228599b0060718a9041b49d69de6b763b92e8f33c9be8580f0"
+    }
+  ],
+  "findings": [
+    {
+      "fingerprint": "030d0435a18425ac805cc6d147bd8beab20d77574270c302d04346ed87c9ebc4",
+      "rule": "javascript/IndirectCommandInjection",
+      "source_id": "src-00001",
+      "region": {
+        "startLine": 12,
+        "startColumn": 17,
+        "endLine": 12,
+        "endColumn": 22
+      },
+      "decision": "eligible",
+      "source_ids": [
+        "src-00001"
+      ],
+      "evidence_ids": [
+        "ev-77fcd93b0041b7b5"
+      ],
+      "rationale_id": "ev-2bfca67ff69cfc31"
+    },
+    {
+      "fingerprint": "8298c4e5741f79f10bab2827569ed9d1d146aa4789ae7671af1a6be01d88733a",
+      "rule": "javascript/PT",
+      "source_id": "src-00001",
+      "region": {
+        "startLine": 16,
+        "startColumn": 5,
+        "endLine": 16,
+        "endColumn": 21
+      },
+      "decision": "eligible",
+      "source_ids": [
+        "src-00001"
+      ],
+      "evidence_ids": [
+        "ev-38748e33d5d02c17"
+      ],
+      "rationale_id": "ev-2b598de504bbe722"
+    }
+  ]
+}
