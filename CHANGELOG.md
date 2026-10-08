@@ -7,6 +7,61 @@ extracts the matching section as the GitHub Release notes, so a publish fails
 without one. Unreleased harness work is still grouped under a dated
 `## [<YYYY-MM-DD>]` section beneath the ongoing `## [Unreleased]` working set.
 
+## [0.2.3] - 2026-10-08
+
+Follow-up release to 0.2.2: the control workspace's September work that
+0.2.2 lacked, the release workflow defects the 0.2.2 tag runs exposed, the
+three hardening items its security triage deferred, and what the installed
+0.2.2 verification found. Each release-group task is recorded as shipping or
+non-shipping in `release/0.2.3-dispositions.md`. Publishing this release
+closes no task.
+
+### Fixed
+
+- **Automatic routing never selects a CLI the confinement refuses (#1199).**
+  Dispatch asks the router with `--confined 1`; the profile's default rows for
+  `researcher` and `logger` name codex. Before, `--cli auto` for those roles
+  was routed to grok or gemini and then refused with exit 78. An explicit
+  `--cli grok|gemini` keeps its refusal.
+- **Task gate and ledger (#1110, #1108).** A task id that matches two rows is
+  refused by the gate (rc 5) instead of answering with the first match; the
+  ledger writes `state/task-queue.json` back in its committed shape (indent 2,
+  trailing newline). `tq-status` tolerates non-numeric ids and `tq-track`
+  treats `done` rows as closed.
+- **Tracker (#1105).** A dispatch row whose session is absent from the telepty
+  listing records one `session_gone` observation instead of being
+  screen-classified every tick and re-emitting the same HOLD until cleanup.
+- **Installer (#1069).** `bin/install-instructions.sh --force` substitutes the
+  constitution and workspace path tokens, as `init` already did.
+- **Reconciler (#1075).** The cmux `NODE_OPTIONS` shim file is kept alive on
+  every tick, so sessions older than macOS's temporary-file purge keep it.
+- **Hardening from the 0.2.2 security triage.** The HITL web metadata refresh
+  is single-flight (#1151); the sandbox runner reads its manifest through the
+  sealed read the binder uses (#652); the CI-only `xres-owner` probe refuses
+  `--grab-delay-ms` above 60000 (#1177).
+- **Installed 0.2.2 findings (#1171).** The README no longer claims the package
+  is unpublished and documents the npm install; the ecosystem table names the
+  real package and telepty 0.8.4; `init` names the nested telepty path, says
+  when it writes the bypass-permissions default, and labels its file counts.
+- **Release workflow (#1196).** The registry read-back after `npm publish`
+  waits up to 12 minutes for npm's asynchronous processing and names a failed
+  publish; the POSIX test job of `release.yml` is compared with `ci.yml` by
+  test; four always-red observation workflows and their scripts are removed.
+- **Admission fixture (#1195).** The fixture's git calls disable automatic
+  maintenance, and an `ENOTEMPTY` during cleanup lists the leftovers.
+- **Dispatch guard runner.** `tests/dispatch/run-all.sh` scrubs the operator's
+  `AIGENTRY_*` knobs and runs each guard under a wall clock; new regression
+  tests cover the shipped agy/grok probe code (#1090, #1091).
+
+### Known limitations
+
+- Confined workers are claude or codex only; grok and gemini workers need the
+  container execution backend (#1193), not in this release.
+- Windows: `tests/session/boot-prepare.test` has shown one `EBUSY` cleanup
+  failure on windows-latest (#1195); the Windows gates otherwise hold.
+- The `node-forge` advisories through `@anthropic-ai/sandbox-runtime` remain
+  (no fixed version available).
+
 ## [0.2.2] - 2026-10-06
 
 Publication of the work merged since `v0.2.1`. Native Windows is a supported
