@@ -8,6 +8,7 @@
 // - the runner runs from a temp copy of dist/src/session next to an inline FAKE
 //   @anthropic-ai/sandbox-runtime. MOCK BOUNDARY: that fake applies NO OS isolation. These tests
 //   prove env routing, sealing and refusal logic, never confinement.
+//   Exception: the last test (darwin only) runs the built runner on the REAL sandbox-runtime.
 // The fake CLIs record booleans only; no token value, hash or length is ever printed.
 // Windows portability (fixture only, product untouched): libuv spawn(shell:false) resolves only
 // .com/.exe, os.homedir() reads USERPROFILE (not HOME), PATH uses path.delimiter, import() needs a
@@ -544,4 +545,40 @@ test("legacy launcher with the dist helper missing refuses 78 (no inline fallbac
   writeFileSync(copy, src.split(helper).join(join(W.root, "absent", "claude-worker-oauth.js")), { mode: 0o700 });
   const r = runLauncher(W, copy);
   assert.deepEqual([r.status, r.rec], [78, null]);
+});
+
+// #652 LIVE, darwin only (registered only there; Linux and win32 collect no test, so no skip): the
+// built runner on the REAL @anthropic-ai/sandbox-runtime (sandbox-exec), no fake. The manifest is
+// staged under the denied HOME as dispatch stages under ~/.aigentry/sessions, so the canary lies
+// inside a denied region. SRT emits (allow file-read-metadata (vnode-type DIRECTORY)) whenever a
+// read deny exists, so stat/lstat of the directory canary is allowed and only readdir of it and
+// stat/lstat of the file inside it can be required. Mutation: the 2026-10-04 (ef40fdf) deny set,
+// which required stat/lstat of the directory itself, must still fail with 71 on the same manifest.
+const NEW_DENIES = /deny\(\(\)=>fs\.readdirSync\(process\.argv\[3\]\)\);\s*deny\(\(\)=>fs\.statSync\(process\.argv\[3\]\+'\/synthetic\.txt'\)\);\s*deny\(\(\)=>fs\.lstatSync\(process\.argv\[3\]\+'\/synthetic\.txt'\)\);/;
+const OLD_DENIES = "deny(()=>fs.statSync(process.argv[3]));deny(()=>fs.lstatSync(process.argv[3]));deny(()=>fs.readdirSync(process.argv[3]));";
+if (process.platform === "darwin") test("live macOS confinement preflight passes on the real SRT; the old directory-stat deny set fails 71", () => {
+  const W = world();
+  W.sessions = join(W.host, ".aigentry", "sessions");
+  const p = prepare(W, "live1");
+  assert.equal(p.error, null);
+  roots.push(String((p.m.env as Json).TMPDIR));
+  const live = (runner: string) => spawnSync(process.execPath, [runner, p.manifest, p.hash, "--preflight-only"],
+    { encoding: "utf8", timeout: 60000, env: sysEnv(W) });
+  const ok = live(join(DIST_SESSION, "worker-sandbox-runner.js"));
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.match(ok.stderr, / OS confinement preflight passed\n/);
+  // Same sealed manifest, same real SRT, a copy of the built runner with only the deny lines reverted.
+  const root = mkdtempSync(join(tmpdir(), "claude-oauth-652-live-"));
+  roots.push(root);
+  cpSync(DIST_SESSION, join(root, "dist", "src", "session"), { recursive: true });
+  symlinkSync(join(REPO_ROOT, "node_modules"), join(root, "node_modules"));
+  writeFileSync(join(root, "package.json"), JSON.stringify({ type: "module" }));
+  const mutant = join(root, "dist", "src", "session", "worker-sandbox-runner.js"), src = read(mutant);
+  assert.equal((src.match(new RegExp(NEW_DENIES.source, "g")) ?? []).length, 1, "the built runner no longer carries the repaired deny set");
+  writeFileSync(mutant, src.replace(NEW_DENIES, OLD_DENIES));
+  const old = live(mutant);
+  assert.equal(old.status, 78, old.stderr);
+  assert.match(old.stderr, /\[sandbox\] REFUSED: SANDBOX_PREFLIGHT_FAILED: 71 /);
+  // 71 is also sandbox-exec's own exit when it cannot apply a profile (nested sandbox); that is not this.
+  assert.doesNotMatch(old.stderr, /sandbox_apply/);
 });
