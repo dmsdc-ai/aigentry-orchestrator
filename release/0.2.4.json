@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "release_group": "release-1199",
+  "release_task": 1199,
+  "package": "@dmsdc-ai/aigentry-orchestrator",
+  "version": "0.2.4",
+  "base_tag": "v0.2.3",
+  "base_commit": "eb29f2b88ef775046120e0a29576a0ccab78a156",
+  "tasks": [
+    {
+      "task_id": 652,
+      "disposition": "shipping",
+      "scope": "The OS confinement preflight attests the directory canary through what macOS sandbox-exec enforces (listing of the canary directory and stat/lstat of the file inside it), so confined worker spawn works again on macOS 26; a darwin-only live test runs the built runner on the real sandbox-runtime. The rest of the task (confined codex/gemini/grok workers, the resolver refusing shell wrappers) is not in this release.",
+      "paths": [
+        "src/session/worker-sandbox-runner.ts",
+        "tests/session/claude-worker-oauth.test.ts"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.4-dispositions.md",
+          "sha256": "76c0b53ec51e3febcc7e35786c1927c49af68fca52b43932c260006a2d516192"
+        }
+      ]
+    },
+    {
+      "task_id": 1199,
+      "disposition": "shipping",
+      "scope": "The 0.2.4 hotfix release records: version, changelog, projection with task 652, and the security records.",
+      "paths": [
+        ".github/workflows/release.yml",
+        "CHANGELOG.md",
+        "package-lock.json",
+        "package.json",
+        "release/0.2.4-dispositions.md",
+        "release/0.2.4.json",
+        "release/security/0.2.4/blobs/2b598de504bbe7228599b0060718a9041b49d69de6b763b92e8f33c9be8580f0",
+        "release/security/0.2.4/blobs/2bfca67ff69cfc314ea67a9a331e8670ab18e7906b603113c2029c73d84b36b6",
+        "release/security/0.2.4/blobs/38748e33d5d02c1772c8a3076235f6089dc22e771ebeddaba139f79321366638",
+        "release/security/0.2.4/blobs/4ac1e7c624eb1b1b4e791674c6f1c73fd408e8ce017bdfdac579b39ed8081737",
+        "release/security/0.2.4/blobs/4b1940ade162fd51593132f860dcd7881421b4e901b2bb92062f54c2b32ff0a9",
+        "release/security/0.2.4/blobs/77fcd93b0041b7b5a3923169360704a80d6e56961ab3f7b3a4ca5e995e5f04df",
+        "release/security/0.2.4/blobs/f786121cbd5f658aab01f46acaf3a5b699aea81ade4c5cc92eec066db0f6f355",
+        "release/security/0.2.4/policy.json",
+        "release/tasks.json"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.4-dispositions.md",
+          "sha256": "76c0b53ec51e3febcc7e35786c1927c49af68fca52b43932c260006a2d516192"
+        }
+      ]
+    }
+  ]
+}
