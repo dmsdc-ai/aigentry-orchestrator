@@ -1031,7 +1031,7 @@ jobs:
         env:
           RELEASE_VERSION: ${{ steps.identity.outputs.version }}
           # Replace only after maintainer review of exact portable policy bytes and exception rationale.
-          RELEASE_SECURITY_POLICY_SHA256: UNREVIEWED
+          RELEASE_SECURITY_POLICY_SHA256: 0fac7d3941a49038d4a95ff335c9d651f5ba741eeb94d17eda393cd7b1de29ee
           RELEASE_SECURITY_COMMIT: ${{ github.sha }}
         run: node scripts/release-admission.mjs --root "$GITHUB_WORKSPACE" --version "$RELEASE_VERSION"
 
