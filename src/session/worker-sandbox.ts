@@ -156,6 +156,16 @@ export function claudeToolPolicyViolation(argv: readonly string[]): string | und
   return undefined;
 }
 
+// #1206: the CLIs a confined worker may run, and the provider hosts each one needs. The provider hosts are
+// sealed into allowedDomains together with the scope's domains (task extras), so a scope written before
+// `--cli auto` picks the CLI still routes to that CLI's provider and to no other provider.
+export const CONFINED_CLIS = ["claude", "codex"] as const;
+export const PROVIDER_DOMAINS: Readonly<Record<(typeof CONFINED_CLIS)[number], readonly string[]>> = {
+  claude: ["api.anthropic.com:443", "claude.ai:443", "platform.claude.com:443", "statsig.anthropic.com:443",
+    "console.anthropic.com:443"],
+  codex: ["chatgpt.com:443", "auth.openai.com:443", "api.openai.com:443"],
+};
+
 function seedAuth(cli: string, home: string, cwd: string, oauthSelected = false): Record<string, string> {
   const realHome = os.homedir();
   if (cli === "codex") {
@@ -191,18 +201,8 @@ function seedAuth(cli: string, home: string, cwd: string, oauthSelected = false)
       }
       writePrivate(path.join(config, ".credentials.json"), auth);
     }
-    // #1200: the confined override runs claude with --permission-mode bypassPermissions, and a fresh
-    // config shows the one-time "Bypass Permissions mode … Yes, I accept" dialog before the REPL;
-    // nobody can answer it inside the sandbox (telepty send-key is ready-gated), so the
-    // acknowledgement is staged with the onboarding and trust flags. Key measured in claude 2.1.283.
     writePrivate(path.join(config, ".claude.json"), JSON.stringify({ hasCompletedOnboarding: true,
-      bypassPermissionsModeAccepted: true,
       projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
-    // #1200 (measured live): the acknowledgement key alone does not suppress the dialog; the host
-    // suppresses it with settings.json `skipDangerousModePermissionPrompt`. The sealed config dir is the
-    // worker's only settings source (`--setting-sources user` below), so this one-key file is the whole
-    // user settings the worker sees — nothing of the host's settings reaches the sandbox.
-    writePrivate(path.join(config, "settings.json"), JSON.stringify({ skipDangerousModePermissionPrompt: true }));
     return { CLAUDE_CONFIG_DIR: config, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
   }
   throw new Error(`SANDBOX_AUTH_UNSUPPORTED: ${cli}; no unrestricted fallback`);
@@ -212,7 +212,7 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   argv: string[], stagingRoot: string, targetCwd = roleCwd,
   hooksDir?: string, launch?: LaunchConfig, binding?: ExecutableBinding): { launcher: string; manifest: string; hash: string } {
   if (!["darwin", "linux"].includes(process.platform)) throw new Error("SANDBOX_PLATFORM_UNSUPPORTED");
-  if (!["claude", "codex"].includes(cli)) throw new Error(`SANDBOX_CLI_UNSUPPORTED: ${cli}`);
+  if (!(CONFINED_CLIS as readonly string[]).includes(cli)) throw new Error(`SANDBOX_CLI_UNSUPPORTED: ${cli}`);
   if (!argv.length || path.basename(argv[0]!) !== cli) throw new Error("SANDBOX_COMMAND_BINDING");
   // #652: before any staging write or auth seeding. Names the flag only, never its value.
   if (cli === "claude") {
@@ -273,7 +273,7 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
     if (i >= 0) command.splice(i, 2);
     // #1200: the OS sandbox is the boundary; a confined worker has nobody to answer a permission prompt.
     command.push("--permission-mode", "bypassPermissions", "--tools", CLAUDE_WORKER_TOOLS, "--allowedTools", CLAUDE_WORKER_TOOLS,
-      "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "user", "--no-chrome");
+      "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "", "--no-chrome");
     for (const p of scope.write) command.push("--add-dir", fs.existsSync(p) && fs.statSync(p).isDirectory() ? p : path.dirname(p));
   }
   const protectedPaths = [root, stagingRoot, runner, path.dirname(runner)];
@@ -300,7 +300,8 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   // Whole-process isolation includes native file tools and every local child/MCP.
   // Local control sockets and direct non-proxy network access remain unavailable.
   const config: SandboxRuntimeConfig = {
-    network: { allowedDomains: scope.domains, deniedDomains: [], allowUnixSockets: [],
+    network: { allowedDomains: [...new Set([...scope.domains,
+      ...PROVIDER_DOMAINS[cli as (typeof CONFINED_CLIS)[number]]])], deniedDomains: [], allowUnixSockets: [],
       allowAllUnixSockets: false, allowLocalBinding: false },
     filesystem: { denyRead: [os.homedir(), "/Users", "/home", "/Volumes", "/private/tmp", "/tmp"],
       allowRead: read, allowWrite: [...scope.write, home, tmp],

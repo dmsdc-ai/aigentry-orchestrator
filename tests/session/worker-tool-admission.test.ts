@@ -179,7 +179,7 @@ test("claude: exact closed 8-tool set, one --tools and one --allowedTools, same 
   const rest = [...argv.slice(1)];
   rest.splice(rest.indexOf("--permission-mode"), 2);
   assert.deepEqual(cmd.slice(1), [...rest, "--permission-mode", "bypassPermissions", "--tools", TOOLS, "--allowedTools", TOOLS,
-    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "user", "--no-chrome",
+    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "", "--no-chrome",
     "--add-dir", cmd[cmd.length - 1]]);
   assert.ok(!cmd.includes("acceptEdits"));
   // env/config/auth unchanged.
@@ -191,7 +191,9 @@ test("claude: exact closed 8-tool set, one --tools and one --allowedTools, same 
   assert.equal(read(join(home, ".claude", ".credentials.json")), W.hostCreds);
   const fsCfg = (p.m.config as Json).filesystem as Json;
   assert.deepEqual((fsCfg.allowWrite as string[]).slice(1), [home, e.TMPDIR]);
-  assert.deepEqual(((p.m.config as Json).network as Json).allowedDomains, ["api.anthropic.com:443"]);
+  // #1206: scope extra (api.anthropic.com) kept first, then the code-owned claude provider hosts, deduplicated.
+  assert.deepEqual(((p.m.config as Json).network as Json).allowedDomains, ["api.anthropic.com:443", "claude.ai:443",
+    "platform.claude.com:443", "statsig.anthropic.com:443", "console.anthropic.com:443"]);
   assert.equal(p.m.claudeOAuthHandoff, undefined);
 });
 
