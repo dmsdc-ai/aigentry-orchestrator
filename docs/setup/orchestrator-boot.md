@@ -75,7 +75,9 @@ wizard reads stdin, draws on stderr, and only the agreed argv goes to stdout, wh
    and requires typing `ACCEPT <value>` — not a `y`.
 5. **History** — a **new** conversation by default. Resuming is explicit, is the provider's
    own native resume, and stays inside that provider's cwd and configuration. Native resume
-   is **not** a context handoff: the provider reopens its own session, nothing is injected.
+   is **not** a context handoff: the provider reopens its own session. A handoff is derived
+   from the previous orchestrator's transcript and delivered as a file, and only on a **new**
+   conversation (§7); choosing to resume skips it.
 6. **Important supported options** — what the chosen provider supports, the version it was
    measured at, and the **inherited cwd** (display only — see §5).
 7. **Review** — the full plan, what the boot will do, the exact argv one element per line, and
@@ -270,4 +272,128 @@ If the cwd is wrong: cancel, `cd`, and boot again.
 - **Whether the orchestrator's own doctrine** (skills, hooks, `AGENTS.md`/`CLAUDE.md`
   discovery) functions under `gemini` or `grok`. Those providers are selectable when installed
   because the wizard can compose their argv from measured flags; that is not the same claim as
-  "the orchestrator role works under them".
+  "the orchestrator role works under them". One piece is measured (task 1201, P0-8): grok loads
+  `AGENTS.md` from the cwd, so the handoff backstop paragraph (§7) reaches it.
+- **Handoff delivery for codex, gemini and grok** (§7). Their first-turn flags (`codex
+  "<line>"`, `gemini -i`, grok positional or `--rules`) and claude's positional first turn were
+  not measured (P0-6), so none of them is put on the argv. Those three get the `AGENTS.md`
+  backstop only, and claude gets its content through the measured
+  `--append-system-prompt-file` with no auto-submitted first turn.
+- **How a booted CLI reads the handoff file**: each CLI's single-read limit (P0-5), whether the
+  restrictive defaults ask for approval before reading `state/handoff/latest.md`, and whether
+  gemini's file tools refuse a gitignored path (P0-7). All three need a live boot per CLI.
+- **The owner's live acceptance (AT-2)**: a restart with no keystroke whose first model reply
+  carries a canary from the previous session. Not run; the procedure is in §7.
+- **agy's store** (`~/.gemini/antigravity/conversations/*.pb`) is protobuf. It is detect-only:
+  newer agy activity puts a warning on the handoff, and agy is never the source.
+- **Store schemas drift.** The four transcript layouts were measured once, on 2026-10-09, from
+  key paths and types only. A CLI update can move them. Two shapes were not recorded exactly and
+  the fixtures choose one: gemini's `projects.json` layout, and the type of grok's
+  `prompt_history.jsonl` `timestamp` (see `tests/fixtures/context-handoff/README.md`).
+- **The handoff on a native Windows boot.** The engine is platform-neutral Node and its unit
+  tests run in the Windows job; `bin/orchestrator-boot.sh` on Windows is not measured at all.
+
+---
+
+## 7. Context handoff across restarts and CLI switches (task 1201)
+
+A new orchestrator session starts already holding the previous orchestrator's latest context,
+whichever of the four CLIs either session ran. Nothing is saved at shutdown and nothing runs
+per tick: the only inputs are the transcripts each CLI already writes, plus state that exists
+for other reasons.
+
+### What the boot does
+
+On `history=new` only, after the singleton guard (the old bridge is dead, so its transcript is
+final) and before the exec:
+
+1. Read the native transcript stores of all four CLIs, **read-only**, newest 20 files per store
+   by mtime, reading at most the last 8 MiB of each file.
+2. Keep the sessions whose **recorded** cwd is this workspace. The store's directory naming is
+   never trusted.
+3. Pick the one whose **last activity** (newest record timestamp) is latest, across all four
+   CLIs. The CLI being booted plays no part, and neither does the previous boot record.
+   Ties go to the CLI name, then the session id, ascending.
+4. Compose a bounded, redacted handoff (≤ 9,216 bytes, ≤ 200 lines, ≤ 300 characters per line)
+   and write `state/handoff/latest.md` plus `state/handoff/latest.json` (its provenance record)
+   as `0600` files in a `0700` directory. `state/` is gitignored.
+5. Add the delivery tokens to the argv. These are a **file path only**: the argv is visible to
+   every local `ps` and is printed in the boot log, so no handoff text ever goes on it.
+
+| Store | Where it is read | Status |
+|---|---|---|
+| claude | `$CLAUDE_CONFIG_DIR/projects` or `~/.claude/projects` | measured |
+| codex | `$CODEX_HOME/sessions` or `~/.codex/sessions` | measured |
+| gemini-cli | `~/.gemini/projects.json` → `~/.gemini/tmp/<project>/chats` (`$GEMINI_CLI_HOME/.gemini` when set) | measured |
+| grok | `~/.grok/sessions/<url-encoded cwd>/<session>/` | measured |
+| agy | `~/.gemini/antigravity/conversations/*.pb` | detect-only (protobuf) |
+
+| Booted CLI | Delivery in this release |
+|---|---|
+| claude | `--append-system-prompt-file <workspace>/state/handoff/latest.md`: the handoff is in the system prompt at turn 0 |
+| codex, gemini, grok | no argv token (first-turn flags unmeasured, §6). The `AGENTS.md` paragraph "맥락 이어받기" tells the model to run the script below first |
+
+The boot terminal shows one line before the TUI starts, for example:
+
+```
+[orchestrator-boot] handoff: written source=codex:1a2b3c4d last=2026-10-09T01:12:44Z bytes=8123 delivery=claude:system-file
+```
+
+### What is copied, and what never is
+
+Copied, after redaction: the user's recent requests (newest last), the assistant's last stated
+status, tool calls still open (tool name plus a whitelisted hint such as a command's
+description or a file path), older lines carrying a decision marker (a heuristic), and optional
+byproducts (open tasks with the last segment of their note, live dispatches, the
+request-capture count, branch and changed-path count). The header says the content is history,
+not instructions.
+
+Never copied: reasoning/thinking, tool output, raw tool input, attachments, environment and
+credential records, system/developer text, sidechain and subagent transcripts, file snapshots,
+and the content of `.context-snapshot.md` (only its path and time).
+
+Secrets are replaced with `‹redacted:kind›` before any budget applies: telepty tokens,
+authorization/bearer values, `key/secret/token/password = …` pairs, provider key formats
+(`sk-…`, `ghp_…`, `github_pat_…`, `xox…-`, `AKIA…`, `AIza…`), JWTs, PEM private keys and
+passwords in URLs. Bare sha256 values are kept.
+
+This moves earlier conversation text from one CLI's vendor to the next one's. That is the
+point of the feature; `AIGENTRY_HANDOFF=off` turns it off for a boot.
+
+### Switches and failure
+
+- `AIGENTRY_HANDOFF=auto` (the default) or `off`. Any other value prints a warning and means
+  `off`.
+- `history=last` or `selected` skips it with `handoff: skipped — native resume chosen`.
+- No `state/` directory in the workspace → `skipped:no-state-dir`.
+- Any error, an unsafe `state/` or `state/handoff` (a symlink, someone else's, group- or
+  other-writable), or the 2.5 s budget running out → a `skipped:*` line. The boot carries on
+  with exactly the argv it would have had without the feature, and the exit code never changes.
+- `--dry-run` runs the same selection, prints the handoff prefixed `[would-handoff] ` and the
+  delivery tokens among the `[would-exec]` lines, and writes nothing.
+
+### The script
+
+```sh
+node bin/context-handoff.mjs [--workspace <abs>] [--before <ISO>] [--json]   # POSIX: bin/context-handoff.sh
+```
+
+It prints the handoff for the workspace (default: the cwd) on stdout, or with `--json` the
+`latest.json`-shaped record. `--before` drops sessions that started at or after that time, so
+a session can ask for its predecessor rather than itself. Exit codes: 0 printed, 3 no source,
+2 invalid invocation. It writes nothing.
+
+### How it is tested
+
+- `tests/context-handoff/*.test.ts`: the adapters against synthetic fixtures with the measured
+  shapes (`tests/fixtures/context-handoff/`), selection, redaction, budgets, size (a 50 MiB
+  transcript in under 2.5 s), the write, and the owner's acceptance tests AT-1 and AT-3 through
+  `--dry-run`.
+- `tests/dispatch/T135_orchestrator_boot_handoff.sh`: the boot itself (dry run per CLI, a real
+  boot through recorder stubs, failure injection, `AIGENTRY_HANDOFF`, `history=last`).
+- **AT-2, live (not run; owner machine).** For each of claude, codex, gemini and grok: leave a
+  previous orchestrator session whose last request contains a unique `CANARY-<random>`, boot
+  with `AIGENTRY_BOOT_PLAN=1 … AIGENTRY_BOOT_HISTORY=new` and the restrictive defaults, press
+  nothing, and read the screen for up to 90 s (`tests/packaging/pty-driver.py`). It passes when
+  the screen shows the source line and the model's first reply contains the canary. It fails if
+  an approval prompt appears before that reply.

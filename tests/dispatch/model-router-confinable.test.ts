@@ -4,12 +4,12 @@
 // keeps that refusal (T141); the label router without `--confined` keeps its four-CLI answers (T138/T139).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { REPO, fixture } from "./model-router-fixtures.js";
 
 const CONFINABLE = ["claude", "codex"];
-const ROLES = ["architect", "analyst", "researcher", "coder", "tester", "builder", "logger", "unknown"];
+const ROLES = ["architect", "analyst", "reviewer", "researcher", "coder", "tester", "builder", "logger", "unknown"];
 
 test("C3-a: router --confined 1 never returns or offers a non-confinable CLI, whatever the classifier or role table says", () => {
   const f = fixture();
@@ -29,21 +29,23 @@ test("C3-a: router --confined 1 never returns or offers a non-confinable CLI, wh
   } finally { f.cleanup(); }
 });
 
-test("C3-a: the REAL profile's role table names a confinable CLI for every role", () => {
+test("C3-a: the REAL profile's role table names a confinable CLI for every role and task class (#1206)", () => {
   const f = fixture();
   try {
     const real = join(REPO, "docs/model-profiles/model-routing-profile.md");
-    for (const role of ROLES) {
-      const r = f.router(["--role", role, "--profile", real]);
+    for (const role of ROLES) for (const cls of [[], ["--class", "integration"], ["--class", "docs"], ["--class", "authoring"]]) {
+      const r = f.router(["--role", role, "--profile", real, ...cls]);
       assert.equal(r.status, 0, r.stderr);
       const route = JSON.parse(r.stdout);
       assert.deepEqual([route.decided_by, route.reason], ["table", "no task ref; role default"], role);
-      assert.ok(CONFINABLE.includes(route.cli), `${role} -> ${route.label} (${route.cli})`);
+      assert.ok(CONFINABLE.includes(route.cli), `${role} ${cls.join(" ")} -> ${route.label} (${route.cli})`);
     }
     assert.equal(f.calls(), 0);
   } finally { f.cleanup(); }
 });
 
+// #1206 D7: dispatch never sends the ref, so the grok-choosing classifier below is never reached (0 calls); the
+// role row (researcher -> gemini, logger -> grok-4.6) is filtered as non-confinable and the router falls to opus-5.
 for (const role of ["researcher", "logger"]) test(`C3-a: dispatch --cli auto --role ${role} with a grok-choosing classifier spawns a confinable CLI, not exit 78`, () => {
   const f = fixture();
   try {
@@ -51,7 +53,7 @@ for (const role of ["researcher", "logger"]) test(`C3-a: dispatch --cli auto --r
     const r = f.dispatch([...f.spawnArgs, "--cli", "auto", "--role", role],
       { CLASSIFIER_REPLY: '{"label":"grok-4.6","reason":"research","confidence":0.9}' });
     assert.doesNotMatch(r.stderr, /SANDBOX_CLI_UNSUPPORTED/);
-    assert.equal(f.calls(), 1);
+    assert.equal(f.calls(), 0);
     if (process.platform === "win32") {
       const d = f.refused(r);
       assert.deepEqual([d.cli, d.model, d.decided_by], ["claude", "claude-opus-5[1m]", "table"]);
@@ -60,5 +62,9 @@ for (const role of ["researcher", "logger"]) test(`C3-a: dispatch --cli auto --r
     assert.equal(r.status, 0, r.stderr);
     assert.equal(f.manifest().cli, "claude");
     assert.ok(f.manifest().command.includes("claude-opus-5[1m]"));
+    const events = readFileSync(f.env.TELEMETRY_LOG!, "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[]);
+    const event = events.find((e) => e[e.indexOf("--subtype") + 1] === "dispatch_start")!;
+    const { route } = JSON.parse(event[event.indexOf("--payload-json") + 1]!);
+    assert.deepEqual([route.label, route.decided_by, route.reason], ["opus-5", "table", "no task ref; role default"]);
   } finally { f.cleanup(); }
 });

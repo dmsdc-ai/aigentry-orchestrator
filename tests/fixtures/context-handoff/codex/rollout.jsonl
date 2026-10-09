@@ -1,0 +1,15 @@
+{"timestamp":"2026-10-09T01:00:00.000Z","ordinal":0,"type":"session_meta","payload":{"id":"__SESSION__","timestamp":"2026-10-09T01:00:00.000Z","cwd":"__WORKSPACE__","originator":"codex_cli_rs","cli_version":"0.157.1","source":"cli","thread_source":"user","model_provider":"openai","base_instructions":{"text":"CANARY-CODEX-BASEINSTR","provenance":{"type":"default","model":"gpt-5"}},"history_mode":"full","context_window":{"window_id":"w-1"}}}
+{"timestamp":"2026-10-09T01:00:01.000Z","ordinal":1,"type":"turn_context","payload":{"turn_id":"turn-1","cwd":"__WORKSPACE__"}}
+{"timestamp":"2026-10-09T01:00:02.000Z","ordinal":2,"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"CANARY-CODEX-DEVELOPER"}]}}
+{"timestamp":"2026-10-09T01:01:00.000Z","ordinal":3,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"CH-CODEX-REQ-1 first codex request"}]}}
+{"timestamp":"2026-10-09T01:01:10.000Z","ordinal":4,"type":"response_item","payload":{"type":"reasoning","summary":[{"text":"CANARY-CODEX-REASONING"}]}}
+{"timestamp":"2026-10-09T01:01:20.000Z","ordinal":5,"type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"CANARY-CODEX-ARGS\"]}","call_id":"call_done"}}
+{"timestamp":"2026-10-09T01:01:30.000Z","ordinal":6,"type":"response_item","payload":{"type":"function_call_output","call_id":"call_done","output":"CANARY-CODEX-OUTPUT"}}
+{"timestamp":"2026-10-09T01:01:40.000Z","ordinal":7,"type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"CANARY-CODEX-CUSTOMIN","call_id":"call_custom"}}
+{"timestamp":"2026-10-09T01:01:50.000Z","ordinal":8,"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_custom","output":"CANARY-CODEX-CUSTOMOUT"}}
+{"timestamp":"2026-10-09T01:02:00.000Z","ordinal":9,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"CH-CODEX-STATUS: codex status line"}]}}
+{"timestamp":"2026-10-09T01:02:10.000Z","ordinal":10,"type":"world_state","payload":{"text":"CANARY-CODEX-WORLDSTATE"}}
+{"timestamp":"2026-10-09T01:02:20.000Z","ordinal":11,"type":"token_usage_record","payload":{"total_tokens":1}}
+{"timestamp":"2026-10-09T01:02:59.000Z","ordinal":12,"type":"turn_context","payload":{"turn_id":"turn-2","cwd":"__WORKSPACE__"}}
+{"timestamp":"2026-10-09T01:03:00.000Z","ordinal":13,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"CH-CODEX-REQ-LAST continue codex work"}]}}
+{"timestamp":"2026-10-09T01:03:30.000Z","ordinal":14,"type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"CANARY-CODEX-OPENARGS\"]}","call_id":"call_open"}}

@@ -62,8 +62,13 @@ if (action === 'init') {
   // methods, so set/clear end `unsupported` before any RPC. Every other argv is denied.
   script('cmux', 'if [ "$#" -eq 1 ] && [ "$1" = capabilities ]; then ' +
     'printf \'%s\\n\' \'{"protocol":"cmux-socket","version":2,"methods":[]}\'; exit 0; fi\n' + deny);
-  for (const cli of ['claude', 'codex', 'gemini', 'grok', 'agy'])
+  const clis = ['claude', 'codex', 'gemini', 'grok', 'agy'];
+  for (const cli of clis)
     script(cli, 'if [ "$#" -eq 1 ] && [ "$1" = --version ]; then echo 9.9.9; exit 0; fi\n' + deny);
+  // #652: the resolver never runs --version; its only version evidence is a package.json whose
+  // `bin` resolves to the bound file. Without it the #! fakes are refused as SANDBOX_CLI_WRAPPER.
+  json(join(process.env.STUB_BIN, 'package.json'), { name: 'fixture-clis', version: '9.9.9',
+    bin: Object.fromEntries(clis.map(cli => [cli, cli])) });
   script('fixture-probe', 'echo \'{"ready":true}\'');
   script('fixture-noop', 'exit 0');
   script('fixture-report', 'echo fixture-orchestrator');
@@ -88,7 +93,10 @@ if (action === 'init') {
   const manifest = JSON.parse(raw), scope = read(process.env.AIGENTRY_WORKER_SCOPE);
   assert.deepEqual([manifest.sid, manifest.task], [sid, scope.task]);
   assert.equal(scope.sid, sid);
-  assert.deepEqual(manifest.config.network.allowedDomains, []);
+  // #1206: scope domains are [], so exactly the code-owned provider hosts of the sealed CLI.
+  assert.deepEqual(manifest.config.network.allowedDomains, manifest.cli === 'codex'
+    ? ['chatgpt.com:443', 'auth.openai.com:443', 'api.openai.com:443', '*.oaiusercontent.com:443']
+    : ['api.anthropic.com:443', 'claude.ai:443', 'platform.claude.com:443', 'statsig.anthropic.com:443', 'console.anthropic.com:443']);
   assert.deepEqual(manifest.config.network.allowUnixSockets, []);
   assert.equal(manifest.config.network.allowAllUnixSockets, false);
   assert.equal(manifest.config.network.allowLocalBinding, false);

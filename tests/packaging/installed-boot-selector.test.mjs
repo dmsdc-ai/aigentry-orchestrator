@@ -78,11 +78,14 @@ const env = {};
 for (const [key, value] of Object.entries(process.env)) {
   if (/^(https?_proxy|all_proxy|no_proxy)$/i.test(key) || /^(NODE_EXTRA_CA_CERTS|SSL_CERT_FILE|SSL_CERT_DIR|REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE)$/.test(key)) env[key] = value;
 }
-for (const key of ['HOME', 'AIGENTRY_HOME', 'TMPDIR', 'TMP', 'TEMP', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_RUNTIME_DIR', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_TMPDIR', 'TELEPTY_HOME', 'npm_config_cache', 'AIGENTRY_ROLE_SANDBOX_ROOT', 'AIGENTRY_STATE_DIR']) {
+for (const key of ['HOME', 'AIGENTRY_HOME', 'TMPDIR', 'TMP', 'TEMP', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_RUNTIME_DIR', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'GEMINI_CLI_HOME', 'CLAUDE_CODE_TMPDIR', 'TELEPTY_HOME', 'npm_config_cache', 'AIGENTRY_ROLE_SANDBOX_ROOT', 'AIGENTRY_STATE_DIR']) {
   env[key] = path.join(fixture, key.toLowerCase());
   fs.mkdirSync(env[key]);
 }
 env.PATH = bin;
+// #1201: this file pins argv; the context handoff is T135's subject. Every transcript-store root
+// above (HOME, CODEX_HOME, CLAUDE_CONFIG_DIR, GEMINI_CLI_HOME) is an empty fixture dir as well.
+env.AIGENTRY_HANDOFF = 'off';
 env.AIGENTRY_CONTROL_WORKSPACE = ws;
 env.AIGENTRY_TARGET_CWD = ws;
 env.ORCHESTRATOR_SID = sid;

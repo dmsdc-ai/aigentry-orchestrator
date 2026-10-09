@@ -90,6 +90,9 @@ export interface BootRecordInput {
   readonly model: ModelChoice;
   readonly effort: EffortChoice;
   readonly env: Readonly<Record<string, string | undefined>>;
+  /** Task 1201: a pre-generated boot id the handoff record shares. A value that is not a v4
+   *  UUID is ignored (a fresh one is generated), so the written record always parses. */
+  readonly bootId?: string;
 }
 
 export type WriteOutcome =
@@ -416,7 +419,7 @@ export function writeControllerBootRecord(
     if (storage !== null) return winWrite(root, input, storage);
     const safe = supported(platform);
     if (safe === null) return skip("skipped:platform");
-    const record = buildControllerBootRecord(input, randomUUID());
+    const record = buildControllerBootRecord(input, input.bootId !== undefined && BOOT_ID_RE.test(input.bootId) ? input.bootId : randomUUID());
     if (record === null) return skip("skipped:cli");
     const base = path.resolve(root);
     if (chain(base, input.sid, safe.uid, true) !== "ok") return skip("skipped:unsafe-path");
@@ -597,7 +600,7 @@ function winWrite(root: string, input: BootRecordInput, storage: WinPrivateStora
   const skip = (outcome: WriteOutcome): WriteResult => ({ outcome, relation: "none" });
   let tmp: string | null = null;
   try {
-    const record = buildControllerBootRecord(input, randomUUID());
+    const record = buildControllerBootRecord(input, input.bootId !== undefined && BOOT_ID_RE.test(input.bootId) ? input.bootId : randomUUID());
     if (record === null) return skip("skipped:cli");
     const base = path.resolve(root);
     const c = winChain(storage, base, input.sid, true);

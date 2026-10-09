@@ -53,6 +53,9 @@ sourceTestFiles.push('tests/dispatch/worker-inputs.test.mjs');
 sourceTestFiles.push('tests/packaging/init-platform.test.mjs');
 // #1171 — release evidence tools against the real gate (synthetic Git repository, fake scanner); Node built-ins and git; every OS.
 sourceTestFiles.push('tests/packaging/release-evidence.test.mjs');
+// #1204 — bin/context-compact.sh per-CLI command + restore waiter against a fake daemon and telepty stub;
+// Node built-ins and bash (Git for Windows bash on win32); every OS, the waiter case skipped by name on win32.
+sourceTestFiles.push('tests/bin/context-compact.test.mjs');
 // Native capture fixtures require POSIX ownership/modes; on native Windows init refuses native
 // capture with exit 2 (a 0.2.2 limitation), asserted in tests/packaging/init-platform.test.mjs.
 // The boot wizard suite drives an owned POSIX PTY.

@@ -4,6 +4,7 @@ import * as os from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import type { AddressInfo } from "node:net";
 import type { SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import { isCliKind, type LaunchConfig } from "./boot-adapter/types.js";
 import { normalizeLaunch } from "./boot-adapter/launch-config.js";
@@ -51,6 +52,35 @@ export function assertExecutableIdentity(binding: ExecutableBinding, file: strin
   let real: string, st: fs.Stats;
   try { real = fs.realpathSync(file); st = fs.statSync(real); } catch { throw new Error("SANDBOX_EXECUTABLE_CHANGED"); }
   if (real !== binding.realpath || !st.isFile() || !sameFileIdentity(binding, st)) throw new Error("SANDBOX_EXECUTABLE_CHANGED");
+}
+
+/**
+ * #652: a bound file with no version evidence (versionSource "unknown") that is a text script
+ * whose `#!` interpreter (or the argument to `env`) is a shell is a wrapper (e.g. a terminal's
+ * PATH shim), not the CLI: sealed, the sandbox would exec a launcher whose target it cannot read.
+ * node/python `#!` wrappers are deliberately out of scope until the resolver can follow them.
+ * Reads the first bytes only; the script is never executed or parsed.
+ */
+const WRAPPER_SHELLS = ["sh", "bash", "zsh", "dash", "ksh", "mksh", "fish"];
+export function assertNotCliWrapper(binding: ExecutableBinding): void {
+  if (binding.versionSource !== "unknown") return;
+  const head = Buffer.alloc(512);
+  let n: number, fd: number | undefined;
+  try {
+    fd = fs.openSync(binding.realpath, "r");
+    n = fs.readSync(fd, head, 0, head.length, 0);
+  } catch {
+    throw new Error("SANDBOX_EXECUTABLE_CHANGED");
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+  const text = head.subarray(0, n);
+  const line = /^#!\s*(\S+)(?:[ \t]+(\S+))?/.exec(text.toString("latin1"));
+  const interpreter = !line ? "" : path.basename(line[1]!) === "env" ? path.basename(line[2] ?? "") : path.basename(line[1]!);
+  if (text[0] === 0x23 && text[1] === 0x21 && !text.includes(0) && WRAPPER_SHELLS.includes(interpreter)) {
+    throw new Error(`SANDBOX_CLI_WRAPPER: ${JSON.stringify(binding.path)} is a #! script wrapper, not the ${binding.cli} ` +
+      `executable; put the real ${binding.cli} binary first on PATH`);
+  }
 }
 
 const identity = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
@@ -127,6 +157,17 @@ export function claudeToolPolicyViolation(argv: readonly string[]): string | und
   return undefined;
 }
 
+// #1206: the CLIs a confined worker may run, and the provider hosts each one needs. The provider hosts are
+// sealed into allowedDomains together with the scope's domains (task extras), so a scope written before
+// `--cli auto` picks the CLI still routes to that CLI's provider and to no other provider.
+export const CONFINED_CLIS = ["claude", "codex"] as const;
+export const PROVIDER_DOMAINS: Readonly<Record<(typeof CONFINED_CLIS)[number], readonly string[]>> = {
+  claude: ["api.anthropic.com:443", "claude.ai:443", "platform.claude.com:443", "statsig.anthropic.com:443",
+    "console.anthropic.com:443"],
+  codex: ["chatgpt.com:443", "auth.openai.com:443", "api.openai.com:443",
+    "*.oaiusercontent.com:443"], // codex 0.160 TUI bootstrap "workspace routing discovery" probe (sdmntpr<region>), measured 2026-10-09
+};
+
 function seedAuth(cli: string, home: string, cwd: string, oauthSelected = false): Record<string, string> {
   const realHome = os.homedir();
   if (cli === "codex") {
@@ -162,8 +203,18 @@ function seedAuth(cli: string, home: string, cwd: string, oauthSelected = false)
       }
       writePrivate(path.join(config, ".credentials.json"), auth);
     }
+    // #1200: the confined override runs claude with --permission-mode bypassPermissions, and a fresh
+    // config shows the one-time "Bypass Permissions mode … Yes, I accept" dialog before the REPL;
+    // nobody can answer it inside the sandbox (telepty send-key is ready-gated), so the
+    // acknowledgement is staged with the onboarding and trust flags. Key measured in claude 2.1.283.
     writePrivate(path.join(config, ".claude.json"), JSON.stringify({ hasCompletedOnboarding: true,
+      bypassPermissionsModeAccepted: true,
       projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
+    // #1200 (measured live): the acknowledgement key alone does not suppress the dialog; the host
+    // suppresses it with settings.json `skipDangerousModePermissionPrompt`. The sealed config dir is the
+    // worker's only settings source (`--setting-sources user` below), so this one-key file is the whole
+    // user settings the worker sees — nothing of the host's settings reaches the sandbox.
+    writePrivate(path.join(config, "settings.json"), JSON.stringify({ skipDangerousModePermissionPrompt: true }));
     return { CLAUDE_CONFIG_DIR: config, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
   }
   throw new Error(`SANDBOX_AUTH_UNSUPPORTED: ${cli}; no unrestricted fallback`);
@@ -173,7 +224,7 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   argv: string[], stagingRoot: string, targetCwd = roleCwd,
   hooksDir?: string, launch?: LaunchConfig, binding?: ExecutableBinding): { launcher: string; manifest: string; hash: string } {
   if (!["darwin", "linux"].includes(process.platform)) throw new Error("SANDBOX_PLATFORM_UNSUPPORTED");
-  if (!["claude", "codex"].includes(cli)) throw new Error(`SANDBOX_CLI_UNSUPPORTED: ${cli}`);
+  if (!(CONFINED_CLIS as readonly string[]).includes(cli)) throw new Error(`SANDBOX_CLI_UNSUPPORTED: ${cli}`);
   if (!argv.length || path.basename(argv[0]!) !== cli) throw new Error("SANDBOX_COMMAND_BINDING");
   // #652: before any staging write or auth seeding. Names the flag only, never its value.
   if (cli === "claude") {
@@ -184,6 +235,7 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   if (binding) {
     if (binding.cli !== cli || argv[0] !== binding.path || !path.isAbsolute(argv[0]!)) throw new Error("SANDBOX_COMMAND_BINDING");
     assertExecutableIdentity(binding, binding.path);
+    assertNotCliWrapper(binding);
   }
   // #652: validated before any staging write. Claude only; codex never reads it.
   const oauthToken = cli === "claude" ? selectedClaudeOAuthToken(process.env) : undefined;
@@ -231,8 +283,9 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   } else {
     const i = command.indexOf("--permission-mode");
     if (i >= 0) command.splice(i, 2);
-    command.push("--permission-mode", "acceptEdits", "--tools", CLAUDE_WORKER_TOOLS, "--allowedTools", CLAUDE_WORKER_TOOLS,
-      "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "", "--no-chrome");
+    // #1200: the OS sandbox is the boundary; a confined worker has nobody to answer a permission prompt.
+    command.push("--permission-mode", "bypassPermissions", "--tools", CLAUDE_WORKER_TOOLS, "--allowedTools", CLAUDE_WORKER_TOOLS,
+      "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "user", "--no-chrome");
     for (const p of scope.write) command.push("--add-dir", fs.existsSync(p) && fs.statSync(p).isDirectory() ? p : path.dirname(p));
   }
   const protectedPaths = [root, stagingRoot, runner, path.dirname(runner)];
@@ -259,7 +312,8 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   // Whole-process isolation includes native file tools and every local child/MCP.
   // Local control sockets and direct non-proxy network access remain unavailable.
   const config: SandboxRuntimeConfig = {
-    network: { allowedDomains: scope.domains, deniedDomains: [], allowUnixSockets: [],
+    network: { allowedDomains: [...new Set([...scope.domains,
+      ...PROVIDER_DOMAINS[cli as (typeof CONFINED_CLIS)[number]]])], deniedDomains: [], allowUnixSockets: [],
       allowAllUnixSockets: false, allowLocalBinding: false },
     filesystem: { denyRead: [os.homedir(), "/Users", "/home", "/Volumes", "/private/tmp", "/tmp"],
       allowRead: read, allowWrite: [...scope.write, home, tmp],
@@ -293,6 +347,72 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   writePrivate(next, JSON.stringify({ manifest, hash }));
   fs.renameSync(next, current);
   return { launcher, manifest, hash };
+}
+
+/**
+ * #652 Linux: SRT's bwrap wrapper runs its own `<runtimeDir>/vendor/seccomp/<arch>/apply-seccomp` by host
+ * path from inside the sandbox and binds nothing for it, so under a denied HOME it is absent (127).
+ * Re-allow exactly that vendor directory read-only on Linux; every other platform and path is unchanged.
+ */
+export function withSeccompHelperRead(config: SandboxRuntimeConfig, platform: NodeJS.Platform,
+  runtimeDir: string): SandboxRuntimeConfig {
+  if (platform !== "linux") return config;
+  return { ...config, filesystem: { ...config.filesystem,
+    allowRead: [...(config.filesystem.allowRead ?? []), path.join(runtimeDir, "vendor", "seccomp")] } };
+}
+
+/**
+ * #652: the preflight's deny probe, as script source. sandbox-exec refuses a denied path with
+ * EPERM/EACCES; bwrap masks a denied directory with an empty tmpfs, so on Linux only, ENOENT on a
+ * canary the runner has asserted exists on the host is the denial too. bwrap hides content instead of
+ * failing the call, so on Linux only: a readFile whose content is not the host's canary `x`, a readdir
+ * whose listing lacks `x`, and a writeFile refused EROFS are denials. A Linux writeFile that succeeds
+ * lands in that tmpfs, so it is not 71 here: the runner refuses it host-side if the canary's bytes changed.
+ * Any other success exits 71 (readable); any other error is thrown, a hard failure. Either way the probe's token `t` and the
+ * outcome go to stderr first, so the preflight failure names the probe.
+ */
+export function preflightDenyProbe(platform: NodeJS.Platform): string {
+  const linux = platform === "linux";
+  const base = linux ? ["EPERM", "EACCES", "ENOENT"] : ["EPERM", "EACCES"];
+  const codes = { readFile: base, writeFile: linux ? [...base, "EROFS"] : base, readdir: base, stat: base, lstat: base };
+  // Double quotes only: the runner's shell quoting must leave this source verbatim.
+  const hidden = linux ? 't==="readFile"&&r!==x||t==="readdir"&&!r.includes(x)||t==="writeFile"' : "false";
+  return `const deny=(t,f,x)=>{let r;try{r=f()}catch(e){if(${JSON.stringify(codes)}[t].includes(e.code))return;` +
+    `fs.writeSync(2,t+":"+e.code+" ");throw e}if(${hidden})return;fs.writeSync(2,t+":readable ");process.exit(71)};`;
+}
+
+/**
+ * #652: the preflight's network leg, as script source. `connect(port)` dials the runner's own host loopback
+ * listener (the positive control) from inside the sandbox. sandbox-exec refuses with EPERM/EACCES. bwrap's
+ * --unshare-net gives the sandbox its own loopback, where the host listener's port is closed, so on Linux only
+ * ECONNREFUSED (measured, Ubuntu CI 37902011516) is the denial too. That holds only because the runner keeps a
+ * live, self-verified listener on exactly that port and refuses if any connection reaches it; never use this
+ * source without that protocol. A connect exits 72, any other error 73, a bad port 73, no answer 74, each
+ * naming its outcome on stderr first.
+ */
+export function preflightConnectProbe(platform: NodeJS.Platform): string {
+  const codes = platform === "linux" ? ["EPERM", "EACCES", "ECONNREFUSED"] : ["EPERM", "EACCES"];
+  // Double quotes only: the runner's shell quoting must leave this source verbatim.
+  return `const connect=p=>{const n=Number(p);if(!Number.isInteger(n)||n<1||n>65535){fs.writeSync(2,"connect:port ");` +
+    `process.exit(73);return}const s=net.connect({host:"127.0.0.1",port:n});` +
+    `s.on("connect",()=>{fs.writeSync(2,"connect:open ");process.exit(72)});` +
+    `s.on("error",e=>{if(${JSON.stringify(codes)}.includes(e.code)){process.exit(0);return}` +
+    `fs.writeSync(2,"connect:"+e.code+" ");process.exit(73)});` +
+    `setTimeout(()=>{fs.writeSync(2,"connect:timeout ");process.exit(74)},3000)};`;
+}
+
+/** #652: SRT's in-sandbox socat proxy ports on Linux; the preflight control listener must never hold one. */
+export const PREFLIGHT_PROXY_PORTS: readonly number[] = [3128, 1080];
+
+/**
+ * #652: the control listener's port, only if it is bound to IPv4 loopback on a port that is neither an SRT
+ * proxy port nor in `reserved` (the runtime's host proxy ports). Anything else fails closed.
+ */
+export function preflightControlPort(address: AddressInfo | string | null, reserved: readonly (number | undefined)[]): number {
+  if (!address || typeof address === "string" || address.address !== "127.0.0.1" || !Number.isInteger(address.port) ||
+    address.port < 1 || address.port > 65535 || PREFLIGHT_PROXY_PORTS.includes(address.port) ||
+    reserved.includes(address.port)) throw new Error("SANDBOX_PREFLIGHT_FAILED: listener");
+  return address.port;
 }
 
 export function assertConfinedTarget(stagingRoot: string, sid: string, task: string): void {

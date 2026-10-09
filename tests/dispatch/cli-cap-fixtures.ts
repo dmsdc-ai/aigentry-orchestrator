@@ -107,6 +107,8 @@ export function fixture() {
     JSON.stringify({ OPENAI_API_KEY: "FIXTURE-NOT-A-CREDENTIAL" }), { mode: 0o600 });
   writeFileSync(join(aig, "instructions/common.md"), "# COMMON\nFIXTURE-COMMON\n");
   writeFileSync(join(aig, "instructions/roles/coder.md"), "# CODER\nFIXTURE-ROLE\n");
+  // #1206 D7: dispatch no longer asks the classifier, so a claude route is the architect row of the profile.
+  writeFileSync(join(aig, "instructions/roles/architect.md"), "# ARCHITECT\nFIXTURE-ROLE\n");
   writeFileSync(ref, "Implement the fixture router. TASK-FIRST-4KB\n");
   writeFileSync(queue, JSON.stringify({ tasks: [{ id: 1083, status: "pending", note: "seed" }] }));
   writeFileSync(join(root, "state/active.json"), '{"schema_version":2,"generation":0,"dispatches":[]}');

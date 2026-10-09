@@ -21,6 +21,9 @@ import path from "node:path";
 const MANIFEST = [
   // ---- bin/** — `git ls-files bin`, complete. T96 assertion 4 pins this to the tree.
   "bin/ask.sh",
+  "bin/context-compact.sh",
+  "bin/context-handoff.mjs",
+  "bin/context-handoff.sh",
   "bin/boot-prepare.mjs",
   // #751: bin/session-probe.py's read-only current-viewport adapter module. It is imported
   // as a SIBLING from the probe's own directory, so a workspace that holds the probe
@@ -99,6 +102,7 @@ const MANIFEST = [
 
   ".claude/settings.json",
   ".claude/hooks/post-dispatch-verify-reminder.sh",
+  ".claude/hooks/session-start-compact.sh",
 
   "tooling/dispatch-prelude/README.md",
   "tooling/dispatch-prelude/generator.sh",
