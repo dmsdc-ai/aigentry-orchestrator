@@ -201,8 +201,18 @@ function seedAuth(cli: string, home: string, cwd: string, oauthSelected = false)
       }
       writePrivate(path.join(config, ".credentials.json"), auth);
     }
+    // #1200: the confined override runs claude with --permission-mode bypassPermissions, and a fresh
+    // config shows the one-time "Bypass Permissions mode … Yes, I accept" dialog before the REPL;
+    // nobody can answer it inside the sandbox (telepty send-key is ready-gated), so the
+    // acknowledgement is staged with the onboarding and trust flags. Key measured in claude 2.1.283.
     writePrivate(path.join(config, ".claude.json"), JSON.stringify({ hasCompletedOnboarding: true,
+      bypassPermissionsModeAccepted: true,
       projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
+    // #1200 (measured live): the acknowledgement key alone does not suppress the dialog; the host
+    // suppresses it with settings.json `skipDangerousModePermissionPrompt`. The sealed config dir is the
+    // worker's only settings source (`--setting-sources user` below), so this one-key file is the whole
+    // user settings the worker sees — nothing of the host's settings reaches the sandbox.
+    writePrivate(path.join(config, "settings.json"), JSON.stringify({ skipDangerousModePermissionPrompt: true }));
     return { CLAUDE_CONFIG_DIR: config, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
   }
   throw new Error(`SANDBOX_AUTH_UNSUPPORTED: ${cli}; no unrestricted fallback`);
@@ -273,7 +283,7 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
     if (i >= 0) command.splice(i, 2);
     // #1200: the OS sandbox is the boundary; a confined worker has nobody to answer a permission prompt.
     command.push("--permission-mode", "bypassPermissions", "--tools", CLAUDE_WORKER_TOOLS, "--allowedTools", CLAUDE_WORKER_TOOLS,
-      "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "", "--no-chrome");
+      "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "user", "--no-chrome");
     for (const p of scope.write) command.push("--add-dir", fs.existsSync(p) && fs.statSync(p).isDirectory() ? p : path.dirname(p));
   }
   const protectedPaths = [root, stagingRoot, runner, path.dirname(runner)];
@@ -335,6 +345,18 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   writePrivate(next, JSON.stringify({ manifest, hash }));
   fs.renameSync(next, current);
   return { launcher, manifest, hash };
+}
+
+/**
+ * #652 Linux: SRT's bwrap wrapper runs its own `<runtimeDir>/vendor/seccomp/<arch>/apply-seccomp` by host
+ * path from inside the sandbox and binds nothing for it, so under a denied HOME it is absent (127).
+ * Re-allow exactly that vendor directory read-only on Linux; every other platform and path is unchanged.
+ */
+export function withSeccompHelperRead(config: SandboxRuntimeConfig, platform: NodeJS.Platform,
+  runtimeDir: string): SandboxRuntimeConfig {
+  if (platform !== "linux") return config;
+  return { ...config, filesystem: { ...config.filesystem,
+    allowRead: [...(config.filesystem.allowRead ?? []), path.join(runtimeDir, "vendor", "seccomp")] } };
 }
 
 export function assertConfinedTarget(stagingRoot: string, sid: string, task: string): void {
