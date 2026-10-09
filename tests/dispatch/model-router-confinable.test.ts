@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { REPO, fixture } from "./model-router-fixtures.js";
 
 const CONFINABLE = ["claude", "codex"];
-const ROLES = ["architect", "analyst", "researcher", "coder", "tester", "builder", "logger", "unknown"];
+const ROLES = ["architect", "analyst", "reviewer", "researcher", "coder", "tester", "builder", "logger", "unknown"];
 
 test("C3-a: router --confined 1 never returns or offers a non-confinable CLI, whatever the classifier or role table says", () => {
   const f = fixture();
@@ -29,16 +29,16 @@ test("C3-a: router --confined 1 never returns or offers a non-confinable CLI, wh
   } finally { f.cleanup(); }
 });
 
-test("C3-a: the REAL profile's role table names a confinable CLI for every role", () => {
+test("C3-a: the REAL profile's role table names a confinable CLI for every role and task class (#1206)", () => {
   const f = fixture();
   try {
     const real = join(REPO, "docs/model-profiles/model-routing-profile.md");
-    for (const role of ROLES) {
-      const r = f.router(["--role", role, "--profile", real]);
+    for (const role of ROLES) for (const cls of [[], ["--class", "integration"], ["--class", "docs"], ["--class", "authoring"]]) {
+      const r = f.router(["--role", role, "--profile", real, ...cls]);
       assert.equal(r.status, 0, r.stderr);
       const route = JSON.parse(r.stdout);
       assert.deepEqual([route.decided_by, route.reason], ["table", "no task ref; role default"], role);
-      assert.ok(CONFINABLE.includes(route.cli), `${role} -> ${route.label} (${route.cli})`);
+      assert.ok(CONFINABLE.includes(route.cli), `${role} ${cls.join(" ")} -> ${route.label} (${route.cli})`);
     }
     assert.equal(f.calls(), 0);
   } finally { f.cleanup(); }
