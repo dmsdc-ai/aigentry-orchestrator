@@ -66,3 +66,12 @@ language, run `snyk_code_scan` (MCP) or `bin/snyk-scan.sh` (shell) before
 DONE-reporting. Fix findings using the Snyk result context; rescan;
 repeat until zero findings or zero newly introduced issues. Source:
 `~/.claude/CLAUDE.md` (user global).
+
+## After a compaction (Safe Compact Protocol)
+
+If the conversation you see begins with a compaction summary and
+`<workspace>/.context-snapshot.md` exists and is less than 15 minutes older
+than that summary, read it before doing anything else, then continue the work
+it describes. Never continue a compacted session without it. Before
+compacting, write that snapshot first (the `context-manage` skill has the
+template) and, as the orchestrator, run `bin/context-compact.sh`.
