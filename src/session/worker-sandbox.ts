@@ -4,6 +4,7 @@ import * as os from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import type { AddressInfo } from "node:net";
 import type { SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import { isCliKind, type LaunchConfig } from "./boot-adapter/types.js";
 import { normalizeLaunch } from "./boot-adapter/launch-config.js";
@@ -378,6 +379,40 @@ export function preflightDenyProbe(platform: NodeJS.Platform): string {
   const hidden = linux ? 't==="readFile"&&r!==x||t==="readdir"&&!r.includes(x)||t==="writeFile"' : "false";
   return `const deny=(t,f,x)=>{let r;try{r=f()}catch(e){if(${JSON.stringify(codes)}[t].includes(e.code))return;` +
     `fs.writeSync(2,t+":"+e.code+" ");throw e}if(${hidden})return;fs.writeSync(2,t+":readable ");process.exit(71)};`;
+}
+
+/**
+ * #652: the preflight's network leg, as script source. `connect(port)` dials the runner's own host loopback
+ * listener (the positive control) from inside the sandbox. sandbox-exec refuses with EPERM/EACCES. bwrap's
+ * --unshare-net gives the sandbox its own loopback, where the host listener's port is closed, so on Linux only
+ * ECONNREFUSED (measured, Ubuntu CI 37902011516) is the denial too. That holds only because the runner keeps a
+ * live, self-verified listener on exactly that port and refuses if any connection reaches it; never use this
+ * source without that protocol. A connect exits 72, any other error 73, a bad port 73, no answer 74, each
+ * naming its outcome on stderr first.
+ */
+export function preflightConnectProbe(platform: NodeJS.Platform): string {
+  const codes = platform === "linux" ? ["EPERM", "EACCES", "ECONNREFUSED"] : ["EPERM", "EACCES"];
+  // Double quotes only: the runner's shell quoting must leave this source verbatim.
+  return `const connect=p=>{const n=Number(p);if(!Number.isInteger(n)||n<1||n>65535){fs.writeSync(2,"connect:port ");` +
+    `process.exit(73);return}const s=net.connect({host:"127.0.0.1",port:n});` +
+    `s.on("connect",()=>{fs.writeSync(2,"connect:open ");process.exit(72)});` +
+    `s.on("error",e=>{if(${JSON.stringify(codes)}.includes(e.code)){process.exit(0);return}` +
+    `fs.writeSync(2,"connect:"+e.code+" ");process.exit(73)});` +
+    `setTimeout(()=>{fs.writeSync(2,"connect:timeout ");process.exit(74)},3000)};`;
+}
+
+/** #652: SRT's in-sandbox socat proxy ports on Linux; the preflight control listener must never hold one. */
+export const PREFLIGHT_PROXY_PORTS: readonly number[] = [3128, 1080];
+
+/**
+ * #652: the control listener's port, only if it is bound to IPv4 loopback on a port that is neither an SRT
+ * proxy port nor in `reserved` (the runtime's host proxy ports). Anything else fails closed.
+ */
+export function preflightControlPort(address: AddressInfo | string | null, reserved: readonly (number | undefined)[]): number {
+  if (!address || typeof address === "string" || address.address !== "127.0.0.1" || !Number.isInteger(address.port) ||
+    address.port < 1 || address.port > 65535 || PREFLIGHT_PROXY_PORTS.includes(address.port) ||
+    reserved.includes(address.port)) throw new Error("SANDBOX_PREFLIGHT_FAILED: listener");
+  return address.port;
 }
 
 export function assertConfinedTarget(stagingRoot: string, sid: string, task: string): void {

@@ -1,9 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as net from "node:net";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
-import { assertExecutableIdentity, preflightDenyProbe, quote, readSealedManifest, withSeccompHelperRead, type WorkerManifest } from "./worker-sandbox.js";
+import { assertExecutableIdentity, preflightConnectProbe, preflightControlPort, preflightDenyProbe, quote, readSealedManifest, withSeccompHelperRead, type WorkerManifest } from "./worker-sandbox.js";
 import { CLAUDE_OAUTH_CHILD, CLAUDE_OAUTH_DIR, CLAUDE_OAUTH_FILE, readClaudeOAuthHandoff } from "./claude-worker-oauth.js";
 
 async function run(m: WorkerManifest, command: string[], capture = false,
@@ -37,6 +38,53 @@ async function run(m: WorkerManifest, command: string[], capture = false,
     process.removeListener("SIGTERM", forward);
     process.removeListener("SIGINT", forward);
   }
+}
+
+// #652 positive control for the preflight's network leg: a host loopback listener on an ephemeral port that this
+// runner alone owns, proven live by one self-connection before the sandbox is asked not to reach it. Every
+// further connection it accepts is a leak; each accepted socket is destroyed at once. Bind and self-connect are
+// bounded; the caller closes it on every path.
+async function openControl(reserved: readonly (number | undefined)[]):
+  Promise<{ port: number; leaks: () => number; failure: () => string | undefined; close: () => Promise<void> }> {
+  const server = net.createServer();
+  const peers: (number | undefined)[] = [];
+  let failure: string | undefined, client: net.Socket | undefined, timer: NodeJS.Timeout | undefined;
+  server.on("connection", s => { peers.push(s.remotePort); s.on("error", () => {}); s.destroy(); });
+  server.on("error", e => { failure ??= (e as NodeJS.ErrnoException).code ?? "error"; });
+  const close = (): Promise<void> => {
+    client?.destroy();
+    return new Promise(resolve => server.close(() => resolve()));
+  };
+  let port = 0;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("SANDBOX_PREFLIGHT_FAILED: listener timeout")), 5000);
+      const fail = (e: NodeJS.ErrnoException): void => reject(new Error(`SANDBOX_PREFLIGHT_FAILED: listener ${e.code ?? "error"}`));
+      server.once("error", fail);
+      server.listen({ host: "127.0.0.1", port: 0, exclusive: true }, () => {
+        if (!server.listening) return;
+        try {
+          port = preflightControlPort(server.address(), reserved);
+        } catch (e) {
+          return reject(e);
+        }
+        const self = (): void => {
+          if (client?.localPort !== undefined && client.remoteAddress && peers.includes(client.localPort)) resolve();
+        };
+        server.on("connection", self);
+        client = net.connect({ host: "127.0.0.1", port });
+        client.on("error", fail);
+        client.once("connect", self);
+      });
+    });
+  } catch (e) {
+    await close();
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+  client?.destroy();
+  return { port, leaks: () => peers.length - 1, failure: () => failure, close };
 }
 
 async function main(): Promise<void> {
@@ -88,19 +136,30 @@ async function main(): Promise<void> {
     const sentinel = path.join(m.env.TMPDIR!, "preflight.txt");
     const script = `const fs=require('fs'),net=require('net');
       ${preflightDenyProbe(process.platform)}
+      ${preflightConnectProbe(process.platform)}
       deny('readFile',()=>fs.readFileSync(process.argv[1],'utf8'),process.argv[4]);
       deny('writeFile',()=>fs.writeFileSync(process.argv[1],'changed'));
       deny('readdir',()=>fs.readdirSync(process.argv[3]),'synthetic.txt');
       deny('stat',()=>fs.statSync(process.argv[3]+'/synthetic.txt'));
       deny('lstat',()=>fs.lstatSync(process.argv[3]+'/synthetic.txt'));
       fs.writeFileSync(process.argv[2],'ok'); fs.unlinkSync(process.argv[2]);
-      const s=net.connect({host:'127.0.0.1',port:3848});
-      s.on('connect',()=>{fs.writeSync(2,'connect:open ');process.exit(72)});
-      s.on('error',e=>{const ok=['EPERM','EACCES'].includes(e.code);if(!ok)fs.writeSync(2,'connect:'+e.code+' ');process.exit(ok?0:73)});
-      setTimeout(()=>process.exit(74),3000);`;
+      connect(process.argv[5]);`;
     // The host's canary text: on Linux a read inside the sandbox is readable only if it returns exactly this.
     const canary = fs.readFileSync(m.probeFile, "utf8");
-    const check = await run(m, [process.execPath, "-e", script, m.probeFile, sentinel, m.probeDirectory, canary], true);
+    const control = await openControl([SandboxManager.getProxyPort?.(), SandboxManager.getSocksProxyPort?.()]);
+    let check: { code: number; output: string };
+    try {
+      check = await run(m, [process.execPath, "-e", script, m.probeFile, sentinel, m.probeDirectory, canary,
+        String(control.port)], true);
+      // Accepts that became ready with the child's exit are counted before the listener closes.
+      await new Promise(r => setImmediate(r));
+      // Any connection that reached the host listener refuses, whatever the child reported.
+      if (control.leaks() > 0) throw new Error("SANDBOX_PREFLIGHT_FAILED: connect:leaked");
+      const failure = control.failure();
+      if (failure) throw new Error(`SANDBOX_PREFLIGHT_FAILED: listener ${failure}`);
+    } finally {
+      await control.close();
+    }
     if (check.code !== 0) throw new Error(`SANDBOX_PREFLIGHT_FAILED: ${check.code} ${check.output}`);
     // A Linux write the probe accepted (into bwrap's tmpfs) must not have reached the host canary.
     if (fs.readFileSync(m.probeFile, "utf8") !== canary) throw new Error("SANDBOX_PREFLIGHT_FAILED: writeFile:leaked");

@@ -27,7 +27,11 @@ import { delimiter, dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import { runInNewContext } from "node:vm";
-import { preflightDenyProbe, withSeccompHelperRead } from "../../src/session/worker-sandbox.js";
+import { EventEmitter } from "node:events";
+import type { AddressInfo } from "node:net";
+import {
+  PREFLIGHT_PROXY_PORTS, preflightConnectProbe, preflightControlPort, preflightDenyProbe, withSeccompHelperRead,
+} from "../../src/session/worker-sandbox.js";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..", "..", "..");
 const BOOT = join(REPO_ROOT, "bin", "boot-prepare.mjs");
@@ -113,9 +117,14 @@ process.stdout.write(JSON.stringify({ result, error, counters }) + "\\n");
 
 // MOCK BOUNDARY fake SRT: logs every call (config + command) for leak scans, answers the
 // preflight with a recorder child, runs the worker command unconfined.
+// FAKE_PREFLIGHT_CONNECT: host-side connect to the port at the END of the preflight command (a leak the
+// fake preflight then hides by exiting 0). FAKE_WRAP_FAIL / FAKE_SPAWN_FAIL: preflight wrap throws / argv[0]
+// does not exist. FAKE_PROXY_PORTS: expose SRT's optional proxy-port getters and log each call.
 const FAKE_SRT = `import fs from "node:fs";
+import net from "node:net";
 const E = process.env, LOG = E.FAKE_SRT_LOG, PRE = E.FAKE_PREFLIGHT_RECORD, WREC = E.FAKE_WORKER_RECORD, EXP = E.FAKE_EXPECT_FILE;
 const PF_EXIT = E.FAKE_PREFLIGHT_EXIT || "0", BASH = E.FAKE_BASH || "/bin/bash", LEAK = E.FAKE_PREFLIGHT_LEAK;
+const CONNECT = E.FAKE_PREFLIGHT_CONNECT, WRAP_FAIL = E.FAKE_WRAP_FAIL, SPAWN_FAIL = E.FAKE_SPAWN_FAIL, PROXY = E.FAKE_PROXY_PORTS;
 const log = (o) => { if (LOG) fs.appendFileSync(LOG, JSON.stringify(o) + "\\n"); };
 const has = () => "${CC}" in process.env;
 const REC = "const fs=require(\\"fs\\");let x=null;try{x=fs.readFileSync(process.env.FAKE_EXPECT_FILE,\\"utf8\\")}catch{}" +
@@ -129,10 +138,20 @@ export const SandboxManager = {
     const pre = String(o && o.commandId).endsWith(":preflight");
     log({ ev: "wrap", pre, env: has(), cmd });
     if (pre && LEAK) fs.appendFileSync(LEAK, "changed");
-    return pre ? { argv: [process.execPath, "-e", REC, PRE], env: { FAKE_EXPECT_FILE: EXP, FAKE_PREFLIGHT_EXIT: PF_EXIT } }
+    if (pre && CONNECT) {
+      const m = /'(\\d+)'$/.exec(cmd), port = m ? Number(m[1]) : 0;
+      let connected = false;
+      if (port) await new Promise((r) => { const c = net.connect({ host: "127.0.0.1", port }); c.on("error", () => {});
+        c.once("connect", () => { connected = true; r(); }); c.once("close", r); });
+      log({ ev: "fakeConnect", env: has(), port, connected });
+    }
+    if (pre && WRAP_FAIL) throw new Error("FAKE_WRAP_FAILED");
+    return pre ? { argv: [SPAWN_FAIL || process.execPath, "-e", REC, PRE], env: { FAKE_EXPECT_FILE: EXP, FAKE_PREFLIGHT_EXIT: PF_EXIT } }
       : { argv: [BASH, "-c", cmd], env: { FAKE_RECORD: WREC, FAKE_EXPECT_FILE: EXP } };
   },
   reset: async () => { log({ ev: "reset", env: has() }); },
+  ...(PROXY ? { getProxyPort: () => { log({ ev: "getProxyPort", env: has() }); return 3128; },
+    getSocksProxyPort: () => { log({ ev: "getSocksProxyPort", env: has() }); return 1080; } } : {}),
 };
 `;
 
@@ -652,6 +671,199 @@ test("runner (fake SRT): the preflight command embeds preflightDenyProbe(process
   const wrap = r.srt.filter((e) => e.ev === "wrap" && e.pre === true);
   assert.equal(wrap.length, 1);
   assert.ok(String(wrap[0]?.cmd).includes(preflightDenyProbe(process.platform)));
+});
+
+// #652 network leg classifier (pure, every OS): the exact connect source the runner embeds, evaluated per platform
+// in a vm whose process.exit, fs.writeSync, net.connect and setTimeout only record. Linux ECONNREFUSED is accepted
+// ONLY because the runner holds a live listener on that port (see the runner tests below); every other platform
+// refuses it. Classification only, never confinement.
+test("pure preflightConnectProbe: per-platform accepted errno, named refusals, open 72, timeout 74, port validation 73", () => {
+  type Sock = EventEmitter & { destroy(): void; end(): void; unref(): void; ref(): void };
+  const run = (platform: NodeJS.Platform, port: unknown, act?: (s: Sock, timers: (() => void)[]) => void) => {
+    const exits: number[] = [], err: string[] = [], opened: { host?: unknown; port?: unknown }[] = [];
+    const timers: (() => void)[] = [], ms: number[] = [];
+    const sock = Object.assign(new EventEmitter(), { destroy() {}, end() {}, unref() {}, ref() {} }) as Sock;
+    const connect = runInNewContext(`${preflightConnectProbe(platform)}connect`, {
+      process: { exit: (c: number) => { exits.push(c); } },
+      fs: { writeSync: (fd: number, s: string) => { err.push(`${fd}>${s}`); } },
+      net: { connect: (o: { host?: unknown; port?: unknown }) => { opened.push(o); return sock; } },
+      setTimeout: (f: () => void, t: number) => { timers.push(f); ms.push(t); return 0; },
+      Number,
+    }) as (port: unknown) => void;
+    connect(port);
+    if (act) act(sock, timers);
+    return { out: `${exits.join(",")} ${err.join("")}`, opened: opened.map((o) => [o.host, o.port]), ms };
+  };
+  const fail = (code?: string) => (s: Sock): void => {
+    s.emit("error", code === undefined ? new Error("no code") : Object.assign(new Error(code), { code }));
+  };
+  for (const platform of ["darwin", "linux", "win32", "freebsd"] as const) {
+    const src = preflightConnectProbe(platform);
+    assert.ok(!src.includes("'"), `${platform}: double quotes only, so the runner's single-quote shell quoting keeps it verbatim`);
+    const linux = platform === "linux";
+    // A valid port: exactly one loopback connect to that number and one 3000 ms timer.
+    for (const [port, n] of [[40000, 40000], ["40000", 40000], [1, 1], ["65535", 65535]] as const) {
+      const r = run(platform, port);
+      assert.deepEqual(r.opened, [["127.0.0.1", n]], `${platform} ${String(port)}: connect target`);
+      assert.deepEqual(r.ms, [3000], `${platform} ${String(port)}: one 3000 ms timer`);
+      assert.equal(r.out, " ", `${platform} ${String(port)}: no outcome before an event`);
+    }
+    for (const code of ["EPERM", "EACCES"]) assert.equal(run(platform, 40000, fail(code)).out, "0 ", `${platform}: ${code}`);
+    assert.equal(run(platform, 40000, fail("ECONNREFUSED")).out, linux ? "0 " : "73 2>connect:ECONNREFUSED ",
+      `${platform}: ECONNREFUSED is a denial on Linux only`);
+    for (const code of ["ENETUNREACH", "ETIMEDOUT", "EHOSTUNREACH", "ECONNRESET", "EADDRNOTAVAIL", "ENOENT", "EINVAL", "E652UNKNOWN"]) {
+      assert.equal(run(platform, 40000, fail(code)).out, `73 2>connect:${code} `, `${platform}: ${code} is refused and named`);
+    }
+    assert.equal(run(platform, 40000, fail()).out, "73 2>connect:undefined ", `${platform}: an error without a code is refused`);
+    assert.equal(run(platform, 40000, (s) => { s.emit("connect"); }).out, "72 2>connect:open ", `${platform}: reached a listener`);
+    assert.equal(run(platform, 40000, (_s, t) => { for (const f of t) f(); }).out, "74 2>connect:timeout ", `${platform}: no answer`);
+    // Not an integer port in 1..65535: refused before any socket is opened.
+    for (const port of [0, "0", 65536, "65536", -1, "-1", 1.5, "1.5", "abc", "", undefined, null, Number.NaN]) {
+      const r = run(platform, port);
+      assert.equal(r.out, "73 2>connect:port ", `${platform} ${String(port)}: invalid port`);
+      assert.deepEqual(r.opened, [], `${platform} ${String(port)}: no socket for an invalid port`);
+    }
+  }
+});
+
+// #652 control-listener address check (pure, every OS): only a 127.0.0.1 TCP port that is neither SRT's in-sandbox
+// proxy port nor a port the runtime reports as reserved.
+test("pure preflightControlPort: loopback IPv4 only; pipe, wildcard, IPv6, bad, proxy and reserved ports refuse listener", () => {
+  assert.deepEqual([...PREFLIGHT_PROXY_PORTS], [3128, 1080]);
+  const at = (address: string, port: number): AddressInfo => ({ address, family: "IPv4", port });
+  for (const port of [1, 3848, 40000, 65535]) {
+    assert.equal(preflightControlPort(at("127.0.0.1", port), []), port);
+    assert.equal(preflightControlPort(at("127.0.0.1", port), [undefined, undefined]), port);
+    assert.equal(preflightControlPort(at("127.0.0.1", port), [port + 1, undefined]), port);
+  }
+  const refuse = (address: AddressInfo | string | null, reserved: readonly (number | undefined)[], label: string): void => {
+    assert.throws(() => preflightControlPort(address, reserved), { message: "SANDBOX_PREFLIGHT_FAILED: listener" }, label);
+  };
+  refuse(null, [], "null");
+  for (const pipe of ["/tmp/652.sock", "\\\\.\\pipe\\652"]) refuse(pipe, [], `pipe ${pipe}`);
+  for (const host of ["::1", "0.0.0.0", "::", "127.0.0.2", "localhost", "::ffff:127.0.0.1", "10.0.0.1"]) {
+    refuse({ address: host, family: host.includes(":") ? "IPv6" : "IPv4", port: 40000 }, [], `address ${host}`);
+  }
+  for (const port of [0, -1, 65536, 1.5, Number.NaN]) refuse(at("127.0.0.1", port), [], `port ${port}`);
+  for (const port of [3128, 1080, ...PREFLIGHT_PROXY_PORTS]) refuse(at("127.0.0.1", port), [undefined, undefined], `proxy ${port}`);
+  refuse(at("127.0.0.1", 40000), [40000], "reserved");
+  refuse(at("127.0.0.1", 40000), [undefined, 40000], "reserved socks");
+});
+
+// Runner instrumentation for the network leg (MOCK BOUNDARY: fake SRT; the runner's own node:net is real). A
+// --require preload records every net server and socket the runner process creates (the fake's client included)
+// and whether the event loop drained by itself, i.e. no listener, socket or timer kept the runner alive and no
+// forced exit cut cleanup short. Written at process exit to FAKE_TRACE_FILE.
+const TRACE = `const net = require("node:net"), fs = require("node:fs"), { syncBuiltinESMExports } = require("node:module");
+const out = process.env.FAKE_TRACE_FILE, servers = [], sockets = [];
+const track = (s, kind) => { const r = { kind, closed: false }; sockets.push(r); s.once("close", () => { r.closed = true; }); return s; };
+const cs = net.createServer, cn = net.connect, cc = net.createConnection;
+net.createServer = function (...a) {
+  const s = cs.apply(this, a), r = { listened: false, closed: false, address: null };
+  servers.push(r);
+  s.once("listening", () => { r.listened = true; r.address = s.address(); });
+  s.once("close", () => { r.closed = true; });
+  s.on("connection", (c) => { track(c, "accepted"); });
+  return s;
+};
+net.connect = function (...a) { return track(cn.apply(this, a), "client"); };
+net.createConnection = function (...a) { return track(cc.apply(this, a), "client"); };
+syncBuiltinESMExports();
+let drained = false;
+process.once("beforeExit", () => { drained = true; });
+process.on("exit", () => { fs.writeFileSync(out, JSON.stringify({ drained, servers, sockets })); });
+`;
+interface Trace { drained: boolean; servers: { listened: boolean; closed: boolean; address: AddressInfo | null }[];
+  sockets: { kind: string; closed: boolean }[] }
+function traced(W: World, manifest: string, hash: string, extra: string[] = [], extraEnv: Record<string, string> = {}):
+  Run & { trace: Trace | null; cmd: string; port: number } {
+  const pre = join(W.root, "trace.cjs"), out = join(W.root, `trace-${randomUUID()}.json`);
+  if (!existsSync(pre)) writeFileSync(pre, TRACE);
+  const r = runRunner(W, manifest, hash, extra, { NODE_OPTIONS: `--require ${JSON.stringify(pre)}`, FAKE_TRACE_FILE: out, ...extraEnv });
+  const cmd = String(r.srt.find((e) => e.ev === "wrap" && e.pre === true)?.cmd ?? "");
+  return { ...r, trace: readJson(out) as Trace | null, cmd, port: Number(/'(\d+)'$/.exec(cmd)?.[1] ?? 0) };
+}
+/** One loopback listener on the preflight's port, closed; `accepted` sockets; every socket closed; loop drained. */
+function cleanedUp(r: ReturnType<typeof traced>, accepted: number, label: string): void {
+  const t = r.trace;
+  assert.ok(t, `${label}: no trace (runner did not exit normally): ${r.stderr}`);
+  assert.equal(t.drained, true, `${label}: event loop did not drain by itself (open handle or forced exit)`);
+  assert.equal(t.servers.length, 1, `${label}: exactly one control listener`);
+  const s = t.servers[0]!;
+  assert.deepEqual([s.listened, s.closed, s.address?.address, s.address?.port], [true, true, "127.0.0.1", r.port],
+    `${label}: listener bound to 127.0.0.1 on the preflight's port and closed`);
+  assert.equal(t.sockets.filter((k) => k.kind === "accepted").length, accepted, `${label}: accepted connections`);
+  assert.deepEqual(t.sockets.filter((k) => !k.closed), [], `${label}: every socket closed`);
+}
+
+// #652 F1: the preflight targets a LIVE host listener the runner bound itself (never the empty literal 3848), passed
+// as the last argv after the canary; the runner consults SRT's proxy-port getters when present. MOCK BOUNDARY.
+test("runner (fake SRT): preflight connects to the runner's own live 127.0.0.1 listener port, last argv, never 3848; cleaned up", () => {
+  const W = world(), p = prepare(W, "np1");
+  if (WIN) return refusedOnWin(W, p);
+  const canary = read(String(p.m.probeFile));
+  for (const proxy of [false, true]) {
+    const r = traced(W, p.manifest, p.hash, ["--preflight-only"], proxy ? { FAKE_PROXY_PORTS: "1" } : {});
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stderr, / OS confinement preflight passed\n$/);
+    assert.ok(r.cmd.includes(preflightConnectProbe(process.platform)), "embeds this platform's connect classifier");
+    assert.ok(r.cmd.includes(preflightDenyProbe(process.platform)), "still embeds this platform's deny probe");
+    assert.ok(r.cmd.includes("connect(process.argv[5])"), "connects to the passed port");
+    assert.ok(!r.cmd.includes("port:3848") && r.port !== 3848, "no fixed 3848 target");
+    assert.ok(Number.isInteger(r.port) && r.port >= 1 && r.port <= 65535, `port ${r.port}`);
+    assert.ok(![3128, 1080, ...PREFLIGHT_PROXY_PORTS].includes(r.port), `port ${r.port} is a proxy port`);
+    assert.ok(r.cmd.endsWith(`${sq(canary)} '${r.port}'`), "the port is the last argv, right after the canary");
+    cleanedUp(r, 1, `success proxy=${String(proxy)}`);
+    const getters = r.srt.filter((e) => e.ev === "getProxyPort" || e.ev === "getSocksProxyPort").map((e) => e.ev).sort();
+    assert.deepEqual(getters, proxy ? ["getProxyPort", "getSocksProxyPort"] : []);
+  }
+});
+
+// #652 F3: a fake SRT whose preflight REACHES the runner's live control port (host-side) yet exits 0 must be refused
+// connect:leaked before any worker, receipt or token read, regardless of the child's exit code or a canary leak.
+test("runner (fake SRT): a preflight that reached the live control port but exits 0 refuses connect:leaked, no worker/receipt", () => {
+  const cases: [string, boolean, string[], Record<string, string>][] = [
+    ["worker", false, [], {}], ["worker+opt-in", true, [], {}], ["preflight-only", false, ["--preflight-only"], {}],
+    ["exit71", false, [], { FAKE_PREFLIGHT_EXIT: "71" }], ["canary", false, [], { FAKE_PREFLIGHT_LEAK: "" }],
+  ];
+  for (const [name, opted, args, extraEnv] of cases) {
+    const W = world(), p = prepare(W, `nl-${name.replace(/\W/g, "")}`, opted ? { [OPT]: W.token } : {});
+    if (WIN) { refusedOnWin(W, p); continue; }
+    if (opted) rmSync(String(p.m.claudeOAuthHandoff));
+    const env2 = { FAKE_PREFLIGHT_CONNECT: "1", ...extraEnv };
+    if ("FAKE_PREFLIGHT_LEAK" in env2) env2.FAKE_PREFLIGHT_LEAK = String(p.m.probeFile);
+    const r = traced(W, p.manifest, p.hash, args, env2);
+    assert.equal(r.status, 78, `${name}: ${r.stderr}`);
+    assert.match(r.stderr, /\[sandbox\] REFUSED: SANDBOX_PREFLIGHT_FAILED: connect:leaked\n$/, name);
+    assert.doesNotMatch(r.stderr, /preflight passed/, name);
+    const fc = r.srt.filter((e) => e.ev === "fakeConnect");
+    assert.deepEqual(fc.map((e) => [e.port, e.connected]), [[r.port, true]], `${name}: the fake reached the live listener`);
+    assert.equal(r.worker, null, name);
+    assert.equal(existsSync(join(dirname(p.manifest), "receipt.json")), false, name);
+    assert.deepEqual(leaks(W, [r.stderr]), [], name);
+    cleanedUp(r, 2, name);
+  }
+});
+
+// #652 F1 cleanup: on every refusal path after bind (child exit 72/73/74, wrap error, spawn error) the listener and
+// all sockets are closed and the runner exits by itself; the existing exit-code refusal text is unchanged.
+test("runner (fake SRT): listener cleanup on failed preflight, wrap error and spawn error; no worker, no receipt", () => {
+  const W = world(), p = prepare(W, "nc1");
+  if (WIN) return refusedOnWin(W, p);
+  const cases: [string, Record<string, string>, RegExp][] = [
+    ...["72", "73", "74"].map((c): [string, Record<string, string>, RegExp] =>
+      [`exit${c}`, { FAKE_PREFLIGHT_EXIT: c }, new RegExp(`\\[sandbox\\] REFUSED: SANDBOX_PREFLIGHT_FAILED: ${c} \\n$`)]),
+    ["wrap", { FAKE_WRAP_FAIL: "1" }, /\[sandbox\] REFUSED: FAKE_WRAP_FAILED\n$/],
+    ["spawn", { FAKE_SPAWN_FAIL: join(W.root, "absent-node") }, /\[sandbox\] REFUSED: spawn .*absent-node ENOENT\n$/],
+  ];
+  for (const [name, extraEnv, msg] of cases) {
+    const r = traced(W, p.manifest, p.hash, [], extraEnv);
+    assert.equal(r.status, 78, `${name}: ${r.stderr}`);
+    assert.match(r.stderr, msg, name);
+    assert.equal(r.worker, null, name);
+    assert.equal(existsSync(join(dirname(p.manifest), "receipt.json")), false, name);
+    cleanedUp(r, 1, name);
+  }
 });
 
 // #652 LIVE, darwin only (registered only there; Linux and win32 collect no test, so no skip): the
