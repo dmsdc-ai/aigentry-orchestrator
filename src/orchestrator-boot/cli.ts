@@ -142,7 +142,7 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { USAGE } from "./usage.js";
 // #1181 — the boot plan. `plan.ts` is PURE (it is handed the environment, it reads none),
@@ -152,10 +152,15 @@ import { USAGE } from "./usage.js";
 // BEFORE the first effect below.
 import {
   type BootPlan,
+  type HandoffPreview,
   PLAN_ENV,
   buildExecArgv,
   describeEffects,
   describePlan,
+  handoffArgv,
+  handoffDeliveryLabel,
+  handoffDeliveryRecord,
+  handoffRefusal,
   parseEnvPlan,
   planEnvLines,
 } from "./plan.js";
@@ -748,6 +753,126 @@ function emitExecArgv(argv: readonly string[]): void {
   writeOut(1, `${argv.join("\n")}\n`);
 }
 
+// ── the context handoff (task 1201, SPEC §6) ────────────────────────────────
+// ONE step, after the singleton guard (the old bridge is dead, its transcript final). The
+// engine (src/context-handoff, read-only scan of the four CLIs' native transcript stores)
+// picks the newest orchestrator session of this workspace, writes
+// `<ws>/state/handoff/latest.{md,json}`, and plan.ts handoffArgv adds POINTER-ONLY tokens.
+//
+// IT NEVER BLOCKS. Every refusal, exception and timeout leaves ref=null, which makes the argv
+// byte-identical to the pre-handoff one; the exit code never changes; and the step says what
+// happened in fixed-vocabulary lines through log(), so on the boot path nothing reaches fd 1.
+//
+// The engine is a DYNAMIC import: a missing or broken engine module is `skipped:error`, not an
+// ERR_MODULE_NOT_FOUND that stops the boot, and the static boot module closure that
+// tests/packaging/native-capture.test.mjs pins is unchanged.
+type HandoffEngine = typeof import("../context-handoff/cli.js");
+type HandoffResolved = ReturnType<HandoffEngine["resolveHandoff"]>;
+const HANDOFF_BUDGET_MS = 2500;
+// `auto` (or unset) runs the step; `off` is the opt-out (D-3). Deliberately NOT a PLAN_FIELD:
+// it changes no permission, so it must not trigger the plan-field refusal.
+const HANDOFF_ENV = env.AIGENTRY_HANDOFF;
+
+interface HandoffStep {
+  /** Only a ref that passed handoffRefusal. null = no tokens, argv unchanged. */
+  readonly ref: NonNullable<HandoffResolved["ref"]> | null;
+  /** The step's stderr lines, unprefixed (log() adds the tag). */
+  readonly lines: readonly string[];
+  /** The composed handoff, only alongside a ref (dry-run prints it). */
+  readonly markdown: string | null;
+  /** Why there is no ref, for the review screen. */
+  readonly reason: string;
+}
+
+function handoffEnabled(): boolean {
+  return HANDOFF_ENV === undefined || HANDOFF_ENV === "" || HANDOFF_ENV === "auto";
+}
+
+let handoffEngine: Promise<HandoffEngine | null> | undefined;
+function loadHandoffEngine(): Promise<HandoffEngine | null> {
+  handoffEngine ??= import("../context-handoff/cli.js").then((m: HandoffEngine) => m, () => null);
+  return handoffEngine;
+}
+
+/** Control characters in an engine-supplied value must not reach the terminal as such. */
+function oneLine(s: string): string {
+  return s.replace(/[\u0000-\u001f\u007f]/g, "?");
+}
+
+function handoffSourceKey(ref: NonNullable<HandoffResolved["ref"]> | null): string {
+  return ref === null ? "none" : oneLine(`${ref.source.cli}:${ref.source.sessionId.slice(0, 8)} last=${ref.source.lastActivity}`);
+}
+
+function handoffSourceId(ref: NonNullable<HandoffResolved["ref"]> | null): string {
+  return ref === null ? "none" : `${ref.source.cli}:${ref.source.sessionId}`;
+}
+
+/** Synchronous so the wizard's review can call it; `engine` is loaded by the caller. */
+function handoffStep(engine: HandoffEngine | null, plan: BootPlan, bootId: string, write: boolean): HandoffStep {
+  const lines: string[] = [];
+  const none = (outcome: string): HandoffStep => ({ ref: null, lines: [...lines, `handoff: ${outcome}`], markdown: null, reason: outcome });
+  if (!handoffEnabled() && HANDOFF_ENV !== "off")
+    lines.push(`handoff: AIGENTRY_HANDOFF=${JSON.stringify(HANDOFF_ENV)} is not auto|off — treated as off`);
+  if (!handoffEnabled()) return none("off (AIGENTRY_HANDOFF)");
+  // D-5: resume with a first-turn prompt is unmeasured, so the handoff rides only on `new`.
+  if (plan.history.kind !== "new") return none("skipped — native resume chosen");
+  const started = Date.now();
+  // The cwd the exec inherits (plan.inheritedCwd). lstat, so a `state` symlink is refused too.
+  let workspace: string;
+  try {
+    workspace = fs.realpathSync.native(process.cwd());
+    if (!fs.lstatSync(path.join(workspace, "state")).isDirectory()) return none("skipped:no-state-dir");
+  } catch {
+    return none("skipped:no-state-dir");
+  }
+  if (engine === null) return none("skipped:error");
+  let r: HandoffResolved;
+  const deliveryRecord = handoffDeliveryRecord(plan.provider);
+  try {
+    // deadlineMs > 1e12 is an absolute epoch-ms deadline in W's contract. The engine never
+    // throws by contract; the catch is the boot's own never-block guarantee.
+    r = engine.resolveHandoff({
+      workspace,
+      env,
+      now: new Date(),
+      bootId,
+      write,
+      deadlineMs: started + HANDOFF_BUDGET_MS,
+      ...(deliveryRecord ? { delivery: deliveryRecord } : {}),
+    });
+  } catch {
+    return none("skipped:error");
+  }
+  if (Date.now() - started > HANDOFF_BUDGET_MS) return none("skipped:timeout");
+  const cap = plan.provider;
+  // §6.2: the one file a token may point at. Anything else from the engine is not delivered.
+  const expected = path.join(workspace, "state", "handoff", "latest.md");
+  const refusal = r.ref === null ? null : r.ref.file !== expected ? "the handoff file is not <ws>/state/handoff/latest.md" : handoffRefusal(r.ref);
+  const ref = refusal === null ? r.ref : null;
+  const delivery = r.ref === null ? "none" : refusal !== null ? "refused" : handoffDeliveryLabel(cap);
+  let line = `handoff: ${r.record.outcome}`;
+  if (ref !== null) line += ` source=${ref.source.cli}:${ref.source.sessionId.slice(0, 8)} last=${ref.source.lastActivity}`;
+  if (r.record.handoff?.bytes !== undefined) line += ` bytes=${r.record.handoff.bytes}`;
+  line += ` delivery=${delivery}`;
+  if (r.record.warning) line += ` warning=${r.record.warning}`;
+  lines.push(oneLine(line));
+  if (refusal !== null) lines.push(`handoff: not delivered — ${refusal}`);
+  else if (ref !== null && handoffArgv(cap, ref).length === 0) lines.push(`handoff: ${cap.key} delivery unmeasured — backstop only (AGENTS.md)`);
+  return { ref, lines, markdown: ref === null ? null : r.markdown, reason: oneLine(`${r.record.outcome}`) };
+}
+
+async function runHandoffStep(plan: BootPlan, bootId: string, write: boolean): Promise<HandoffStep> {
+  const engine = handoffEnabled() && plan.history.kind === "new" ? await loadHandoffEngine() : null;
+  return handoffStep(engine, plan, bootId, write);
+}
+
+function previewOf(step: HandoffStep): HandoffPreview {
+  return step.ref === null ? { kind: "none", reason: step.reason } : { kind: "found", ref: step.ref };
+}
+
+// The wizard's last review preview, so main() can say when the post-guard selection differs.
+let reviewedHandoff: HandoffStep | undefined;
+
 // ── plan resolution ─────────────────────────────────────────────────────────
 // What a resolved boot looks like to the rest of this file: the argv to hand back, the
 // SELECTED cli (what the capture validator must measure), the sid the guard and the reconcile
@@ -819,7 +944,14 @@ function resolveWithoutPrompting(): Resolution {
  */
 async function resolveForBoot(): Promise<Resolution> {
   if (!WIZARD_TTY) return resolveWithoutPrompting();
-  const outcome = await runWizard({ out: process.stderr, input: process.stdin, env, cwd: process.cwd() });
+  // Task 1201 §6.3: the review shows a READ-ONLY preview of the handoff source. Reading is not
+  // an effect; the post-guard run in main() is the one that writes.
+  const engine = handoffEnabled() ? await loadHandoffEngine() : null;
+  const handoffPreview = (plan: BootPlan): HandoffPreview => {
+    reviewedHandoff = handoffStep(engine, plan, randomUUID(), false);
+    return previewOf(reviewedHandoff);
+  };
+  const outcome = await runWizard({ out: process.stderr, input: process.stdin, env, cwd: process.cwd(), handoffPreview });
   if (outcome.kind === "cancelled") {
     writeOut(2, `[orchestrator-boot] ${outcome.reason} — nothing was listed, deleted, signalled or exec'd.\n`);
     // 1, not 2: this is the operator's own decision, not a refusal of bad input. Either way
@@ -894,6 +1026,7 @@ async function validateCapture(cli: string): Promise<void> {
  * wizard that DELETEd a registry record and SIGKILLed bridges and then asked "are you
  * sure?" would be a worse footgun than the one #934 closed. Everything after the plan is
  * exactly what it was — reconcile, then guard, then hand the argv back to the shim.
+ * Task 1201 adds the context handoff between the guard and the boot record; it never blocks.
  */
 async function main(): Promise<never> {
   const resolved = await resolveForBoot();
@@ -904,6 +1037,15 @@ async function main(): Promise<never> {
   // ORCHESTRATOR_SID *is* the plan's sid field.
   orchestratorRegistryReconcile(resolved.sid);
   orchestratorSingletonGuard(resolved.sid);
+  // Task 1201 — the context handoff, after the guard. One boot id is shared by the handoff
+  // record (latest.json) and the boot record below.
+  const bootId = randomUUID();
+  const handoff = await runHandoffStep(resolved.plan, bootId, true);
+  for (const line of handoff.lines) log(line);
+  // Same session = same cli and session id; its last activity may legitimately have moved.
+  if (reviewedHandoff !== undefined && handoffSourceId(reviewedHandoff.ref) !== handoffSourceId(handoff.ref))
+    log(`handoff source changed since review: ${handoffSourceKey(handoff.ref)}`);
+  const argv = buildExecArgv(resolved.plan, handoff.ref ?? undefined);
   // #1162 — DISPLAY-ONLY boot record (boot-record.ts), after every guard and before the argv.
   // Best effort and never authority: it cannot exit, never writes fd 1, makes no host or network
   // call, and changes neither the argv nor the exit code. Its one stderr line is fixed vocabulary.
@@ -916,14 +1058,15 @@ async function main(): Promise<never> {
       model: resolved.plan.model,
       effort: resolved.plan.effort,
       env,
+      bootId,
     });
     bootRecord = `${r.outcome} relation=${r.relation}`;
   } catch {
     bootRecord = "skipped:error relation=none";
   }
   writeOut(2, `[orchestrator-boot] boot record: ${bootRecord}\n`);
-  log(`exec ${resolved.argv.join(" ")}`);
-  emitExecArgv(resolved.argv);
+  log(`exec ${argv.join(" ")}`);
+  emitExecArgv(argv);
   process.exit(0);
 }
 
@@ -966,8 +1109,16 @@ async function dryRun(): Promise<never> {
     );
   orchestratorRegistryReconcile(resolved.sid);
   orchestratorSingletonGuard(resolved.sid);
-  log(`would exec ${resolved.argv.join(" ")} (one element per line below)`);
-  for (const a of resolved.argv) writeOut(1, `[would-exec] ${a}\n`);
+  // Task 1201 §6.3 — the same handoff step with write:false. Nothing is written; the composed
+  // handoff is shown under [would-handoff] and its delivery tokens are in the [would-exec] lines.
+  const handoff = await runHandoffStep(resolved.plan, randomUUID(), false);
+  if (handoff.ref !== null)
+    log(oneLine(`handoff source: ${handoff.ref.source.cli} session ${handoff.ref.source.sessionId} · last activity ${handoff.ref.source.lastActivity} · ${handoff.ref.source.path}`));
+  for (const line of handoff.lines) log(line);
+  if (handoff.markdown !== null) for (const line of handoff.markdown.replace(/\n$/, "").split("\n")) writeOut(1, `[would-handoff] ${line}\n`);
+  const argv = buildExecArgv(resolved.plan, handoff.ref ?? undefined);
+  log(`would exec ${argv.join(" ")} (one element per line below)`);
+  for (const a of argv) writeOut(1, `[would-exec] ${a}\n`);
   process.exit(0);
 }
 

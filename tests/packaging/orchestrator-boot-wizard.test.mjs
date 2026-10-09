@@ -137,6 +137,9 @@ function fixture() {
     AIGENTRY_SHIM_SCRIPT_DIR: path.join(dir, 'authdir', '..', 'authdir'),
     TELEPTY_PORT: '3848',
     SINGLETON_SELF_PID: '9999',
+    // #1201: this file pins the wizard and its argv; the context handoff is T135's subject.
+    // HOME above is already closed, so no real transcript store is reachable either way.
+    AIGENTRY_HANDOFF: 'off',
     ...seams,
   };
   // AIGENTRY_SHIM_SCRIPT_DIR must be the directory whose `lib/telepty-auth.sh` resolves.
