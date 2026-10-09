@@ -45,14 +45,18 @@
 _TELEPTY_AUTH_SH_SOURCED=1
 
 # telepty_auth_token — print the daemon token, or nothing. Always exits 0.
+# Framing is exactly one LF on every OS: the bytes go to sys.stdout.buffer, so Windows
+# text-mode stdout cannot turn it into CRLF. Same encoding/errors as print().
 telepty_auth_token() {
   python3 - <<'PY' 2>/dev/null || true
-import json, os
+import json, os, sys
 try:
     with open(os.path.join(os.path.expanduser("~"), ".telepty", "config.json")) as fh:
-        print(json.load(fh).get("authToken", "") or "")
+        out = str(json.load(fh).get("authToken", "") or "") + "\n"
+    out = out.encode(sys.stdout.encoding, sys.stdout.errors)
 except Exception:
-    print("")
+    out = b"\n"
+sys.stdout.buffer.write(out)
 PY
 }
 
@@ -73,11 +77,12 @@ PY
 # suspended while the token is in scope and restored after.
 # A bare $(...) would strip EVERY trailing LF and turn "tok\n" into an accepted
 # "tok", so the capture ends in a "." sentinel and then drops exactly the one LF
-# the resolver's print() adds; any other CR/LF is token data and is refused.
+# the resolver adds; any other CR/LF is token data and is refused.
 telepty_curl() {
-  local _tc_tok _tc_rc _tc_x='' _tc_a=''
+  local _tc_x='' _tc_a=''
   case $- in *x*) _tc_x=1; set +x ;; esac
   case $- in *a*) _tc_a=1; set +a ;; esac
+  local _tc_tok _tc_rc
   _tc_tok=$(telepty_auth_token; printf .)
   _tc_tok=${_tc_tok%.}
   case "$_tc_tok" in *$'\n') _tc_tok=${_tc_tok%?} ;; esac

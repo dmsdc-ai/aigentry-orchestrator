@@ -507,6 +507,31 @@ describe('A telepty_curl — the one credential door', { concurrency: true }, ()
     }
   });
 
+  // REVIEW-R2 B2: a variable declared `local` while the caller has allexport on keeps its export attribute
+  // on bash 3.2 even after `set +a`. macOS /bin/bash (3.2) is run explicitly beside the PATH bash.
+  test('A12 allexport (set -a) on: the token never reaches curl\'s environment, and allexport is restored', async () => {
+    await requireHelper();
+    const shells = process.platform === 'darwin' && existsSync('/bin/bash') ? ['/bin/bash', BASH] : [BASH];
+    // Every shell is measured before anything is asserted, so a failing shell never hides the other's result.
+    const outcomes = [];
+    for (const sh of shells) {
+      const c = makeCase('a12');
+      const r = await run(c, sh, ['-c', `set -a; . "$1"; shift; telepty_curl "$@" >/dev/null || true; printf 'flags=%s bash=%s' "$-" "$BASH_VERSION"`,
+        't1214', AUTH_LIB, ...S_ARGS, URL]);
+      await settle(c);
+      const cs = curlCalls(c);
+      outcomes.push({
+        shell: `${sh} (${(/bash=(\S+)/.exec(r.stdout) || [])[1] ?? '?'})`,
+        curlCalls: cs.length,
+        envCarriers: cs.flatMap((x) => x.env.split('\n').filter((l) => l.includes(c.token)).map((l) => l.split('=')[0])),
+        allexportRestored: /flags=\S*a/.test(r.stdout),
+        stdinHeader: cs.length === 1 && (() => { try { assertStdinCredential({ ...cs[0], env: '' }, c.token, 'A12'); return true; } catch { return false; } })(),
+      });
+    }
+    assert.deepEqual(outcomes.filter((o) => o.curlCalls !== 1 || o.envCarriers.length || !o.allexportRestored || !o.stdinHeader), [],
+      `A12: token in curl's environment / allexport not restored / header not on stdin — per shell: ${JSON.stringify(outcomes)}`);
+  });
+
   test('A8 pipefail + a curl that never reads stdin (incl. a token larger than the pipe buffer): curl\'s status wins', async () => {
     await requireHelper();
     const rounds = [['nonread 200 0', newToken(), 0, '200'], ['nonread 404 22', newToken(), 22, '404'], ['nonread 200 0', newToken(70000), 0, '200']];
