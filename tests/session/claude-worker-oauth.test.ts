@@ -8,7 +8,7 @@
 // - the runner runs from a temp copy of dist/src/session next to an inline FAKE
 //   @anthropic-ai/sandbox-runtime. MOCK BOUNDARY: that fake applies NO OS isolation. These tests
 //   prove env routing, sealing and refusal logic, never confinement.
-//   Exception: the last test (darwin only) runs the built runner on the REAL sandbox-runtime.
+//   Exception: the last two tests (darwin; Linux with SRT dependencies) run the built runner on the REAL sandbox-runtime.
 // The fake CLIs record booleans only; no token value, hash or length is ever printed.
 // Windows portability (fixture only, product untouched): libuv spawn(shell:false) resolves only
 // .com/.exe, os.homedir() reads USERPROFILE (not HOME), PATH uses path.delimiter, import() needs a
@@ -581,4 +581,27 @@ if (process.platform === "darwin") test("live macOS confinement preflight passes
   assert.match(old.stderr, /\[sandbox\] REFUSED: SANDBOX_PREFLIGHT_FAILED: 71 /);
   // 71 is also sandbox-exec's own exit when it cannot apply a profile (nested sandbox); that is not this.
   assert.doesNotMatch(old.stderr, /sandbox_apply/);
+});
+
+// #652 LIVE, Linux arm: the same built runner on the REAL @anthropic-ai/sandbox-runtime (bubblewrap),
+// no fake. Registered only on Linux AND only when the real SRT's own dependency check reports no error
+// on this host (bwrap, socat, ripgrep): without them the runner refuses SANDBOX_DEPENDENCIES before any
+// preflight, so there is no live confinement to measure, and a test that is not registered is not a
+// skip. CI's ubuntu test job installs them. Only the repaired deny set is asserted: the darwin mutant
+// rests on sandbox-exec's directory-metadata rule, which bwrap does not share and nobody has measured
+// here, so the old deny set is never reused as a Linux mutant.
+const linuxLive = process.platform === "linux" &&
+  (await (await import("@anthropic-ai/sandbox-runtime")).SandboxManager.checkDependenciesAsync()).errors.length === 0;
+if (linuxLive) test("live Linux confinement preflight passes on the real SRT (bubblewrap) with the repaired deny set", () => {
+  const W = world();
+  W.sessions = join(W.host, ".aigentry", "sessions");
+  const p = prepare(W, "live2");
+  assert.equal(p.error, null);
+  roots.push(String((p.m.env as Json).TMPDIR));
+  const runner = join(DIST_SESSION, "worker-sandbox-runner.js");
+  assert.equal((read(runner).match(new RegExp(NEW_DENIES.source, "g")) ?? []).length, 1, "the built runner carries the repaired deny set");
+  const ok = spawnSync(process.execPath, [runner, p.manifest, p.hash, "--preflight-only"],
+    { encoding: "utf8", timeout: 60000, env: sysEnv(W) });
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.match(ok.stderr, / OS confinement preflight passed\n/);
 });

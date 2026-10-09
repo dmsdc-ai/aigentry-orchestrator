@@ -53,6 +53,35 @@ export function assertExecutableIdentity(binding: ExecutableBinding, file: strin
   if (real !== binding.realpath || !st.isFile() || !sameFileIdentity(binding, st)) throw new Error("SANDBOX_EXECUTABLE_CHANGED");
 }
 
+/**
+ * #652: a bound file with no version evidence (versionSource "unknown") that is a text script
+ * whose `#!` interpreter (or the argument to `env`) is a shell is a wrapper (e.g. a terminal's
+ * PATH shim), not the CLI: sealed, the sandbox would exec a launcher whose target it cannot read.
+ * node/python `#!` wrappers are deliberately out of scope until the resolver can follow them.
+ * Reads the first bytes only; the script is never executed or parsed.
+ */
+const WRAPPER_SHELLS = ["sh", "bash", "zsh", "dash", "ksh", "mksh", "fish"];
+export function assertNotCliWrapper(binding: ExecutableBinding): void {
+  if (binding.versionSource !== "unknown") return;
+  const head = Buffer.alloc(512);
+  let n: number, fd: number | undefined;
+  try {
+    fd = fs.openSync(binding.realpath, "r");
+    n = fs.readSync(fd, head, 0, head.length, 0);
+  } catch {
+    throw new Error("SANDBOX_EXECUTABLE_CHANGED");
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+  const text = head.subarray(0, n);
+  const line = /^#!\s*(\S+)(?:[ \t]+(\S+))?/.exec(text.toString("latin1"));
+  const interpreter = !line ? "" : path.basename(line[1]!) === "env" ? path.basename(line[2] ?? "") : path.basename(line[1]!);
+  if (text[0] === 0x23 && text[1] === 0x21 && !text.includes(0) && WRAPPER_SHELLS.includes(interpreter)) {
+    throw new Error(`SANDBOX_CLI_WRAPPER: ${JSON.stringify(binding.path)} is a #! script wrapper, not the ${binding.cli} ` +
+      `executable; put the real ${binding.cli} binary first on PATH`);
+  }
+}
+
 const identity = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 export const quote = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'";
 export const digest = (s: string): string => createHash("sha256").update(s).digest("hex");
@@ -184,6 +213,7 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   if (binding) {
     if (binding.cli !== cli || argv[0] !== binding.path || !path.isAbsolute(argv[0]!)) throw new Error("SANDBOX_COMMAND_BINDING");
     assertExecutableIdentity(binding, binding.path);
+    assertNotCliWrapper(binding);
   }
   // #652: validated before any staging write. Claude only; codex never reads it.
   const oauthToken = cli === "claude" ? selectedClaudeOAuthToken(process.env) : undefined;

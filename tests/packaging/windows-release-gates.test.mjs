@@ -1582,6 +1582,33 @@ function assertDispatchGuardBytes(source, label) {
   assert.equal(lf(source).split(`${dispatchGuardAfter}${dispatchGuardNext}`).length, 2,
     `${label}: exactly the approved Dispatch guard suite step bytes`);
 }
+// #652 — the one approved addition to the `test` job besides the Dispatch guard suite step: the Linux
+// sandbox-runtime dependencies, inserted right after the jq step every historical fixture carries, so the
+// Linux live confinement preflight registers on the ubuntu leg. Restated here as an independent literal and
+// never derived from either workflow; it adds one step and changes nothing else.
+const sandboxDepsName = 'Install the Linux sandbox-runtime dependencies (bubblewrap, socat, ripgrep)';
+const sandboxDepsPrev = `      - name: Install jq (a hard dependency of init, checked at step 1)
+        run: command -v jq || sudo apt-get install -y jq
+        if: matrix.os == 'ubuntu-latest'
+`;
+const sandboxDepsAfter = `      # #652: the real sandbox-runtime's Linux dependencies. The Linux live confinement preflight in
+      # tests/session/claude-worker-oauth.test.ts registers only where they are all present.
+      - name: ${sandboxDepsName}
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap socat ripgrep
+        if: matrix.os == 'ubuntu-latest'
+`;
+const sandboxDepsStep = named(parse('approved-sandbox-deps', `jobs:\n  test:\n    steps:\n${sandboxDepsAfter}`).jobs.test, sandboxDepsName);
+function withApprovedSandboxDeps(job) {
+  const copy = structuredClone(job);
+  assert.ok(!copy.steps.some(step => step.name === sandboxDepsName), 'historical test job has no sandbox dependency step');
+  copy.steps.splice(copy.steps.indexOf(named(copy, 'Install jq (a hard dependency of init, checked at step 1)')) + 1, 0,
+    structuredClone(sandboxDepsStep));
+  return copy;
+}
+function assertSandboxDepsBytes(source, label) {
+  assert.equal(lf(source).split(`${sandboxDepsPrev}${sandboxDepsAfter}`).length, 2,
+    `${label}: exactly the approved sandbox dependency step bytes`);
+}
 // #1196 — the one approved change to the `publish` job: the publish step gains `id: publish`, the
 // PUBLISH_FAILED step follows it, and the registry read-back waits for npm's asynchronous processing
 // (one read, then one every 15 s for 12 minutes) and names the registry's last answer. Restated here
@@ -1857,8 +1884,8 @@ function validate(workflow, policy = currentPolicy()) {
   delete securityEnv.RELEASE_SECURITY_POLICY_SHA256;
   delete securityEnv.RELEASE_SECURITY_COMMIT;
   assert.deepEqual(guard, original.jobs.guard, 'guard changes only the required security trust inputs');
-  assert.deepEqual(workflow.jobs.test, withApprovedDispatchGuard(original.jobs.test, dispatchGuardSteps.release),
-    'unchanged test except the approved Dispatch guard suite step');
+  assert.deepEqual(workflow.jobs.test, withApprovedSandboxDeps(withApprovedDispatchGuard(original.jobs.test, dispatchGuardSteps.release)),
+    'unchanged test except the approved Dispatch guard suite and sandbox dependency steps');
   const guardSteps = workflow.jobs.guard.steps;
   const admission = guardSteps.indexOf(named(workflow.jobs.guard, 'Release planning and changed-file admission'));
   const token = guardSteps.indexOf(named(workflow.jobs.guard, 'NPM_TOKEN must be present'));
@@ -1918,10 +1945,11 @@ acceptance('frozen final workflow preserves non-Windows behaviour and requires t
 function validateReleaseHistory(workflow, source = readFileSync(join(root, '.github/workflows/release.yml'), 'utf8')) {
   validate(workflow);
   assertDispatchGuardBytes(source, 'release');
+  assertSandboxDepsBytes(source, 'release');
   assertPublishReadbackBytes(source, 'release');
   const copy = withoutBrowser(workflow, true);
   const history = structuredClone(rejected);
-  history.jobs.test = withApprovedDispatchGuard(history.jobs.test, dispatchGuardSteps.release);
+  history.jobs.test = withApprovedSandboxDeps(withApprovedDispatchGuard(history.jobs.test, dispatchGuardSteps.release));
   history.jobs.publish = withApprovedPublishReadback(history.jobs.publish);
   for (const item of [copy, history]) {
     const env = named(item.jobs.guard, 'Release planning and changed-file admission').env ?? {};
@@ -1963,11 +1991,11 @@ function validateCIHistory(source, historicalSource = readFileSync(join(root, fi
   }
   const history = structuredClone(ciBefore);
   for (const id of oldIds) delete history.jobs[id];
-  history.jobs.test = withApprovedDispatchGuard(history.jobs.test, dispatchGuardSteps.ci);
+  history.jobs.test = withApprovedSandboxDeps(withApprovedDispatchGuard(history.jobs.test, dispatchGuardSteps.ci));
   assert.deepEqual(copy, history, 'CI without its browser and Windows jobs is the historical CI without its two Windows jobs');
   // Bytes: everything before the historical Windows boundary is the historical CI except the one approved
-  // header sentence and the approved Dispatch guard suite step, and everything from there to EOF is the
-  // approved Windows region.
+  // header sentence, the approved Dispatch guard suite step and the approved sandbox dependency step, and
+  // everything from there to EOF is the approved Windows region.
   const bytes = lf(source);
   const addition = `jobs:\n${ciBrowserAddition}`;
   assert.equal(bytes.split(addition).length, 2, 'exactly one approved browser block at the jobs boundary');
@@ -1977,9 +2005,11 @@ function validateCIHistory(source, historicalSource = readFileSync(join(root, fi
   const prefix = historical.slice(0, historical.indexOf(windowsBoundary));
   assert.equal(prefix.split(ciHeaderBefore).length, 2, 'one historical Windows header sentence');
   assert.equal(prefix.split(`${ciDispatchGuardBefore}${dispatchGuardNext}`).length, 2, 'one historical Dispatch guard suite step');
+  assert.equal(prefix.split(sandboxDepsPrev).length, 2, 'one historical jq step');
   assert.equal(currentBytes, prefix.replace(ciHeaderBefore, () => ciHeaderAfter)
-    .replace(ciDispatchGuardBefore, () => dispatchGuardAfter) + approvedWindowsRegion,
-    'every CI byte outside the approved header sentence, Dispatch guard suite step and Windows region is the historical CI');
+    .replace(ciDispatchGuardBefore, () => dispatchGuardAfter)
+    .replace(sandboxDepsPrev, () => `${sandboxDepsPrev}${sandboxDepsAfter}`) + approvedWindowsRegion,
+    'every CI byte outside the approved header sentence, Dispatch guard suite step, sandbox dependency step and Windows region is the historical CI');
 }
 acceptance('CI Windows jobs match release and every other CI byte remains unchanged', 'ci-parity', () => validateCIHistory(readFileSync(join(root, '.github/workflows/ci.yml'), 'utf8')));
 // #1196 — the POSIX `test` job, compared between the two workflows themselves. Each file is frozen
@@ -3909,6 +3939,14 @@ const publishDependencies = ['browser-tls', 'guard', 'test', declared, ...ids];
 const publishNeeds = `    needs: [${publishDependencies.join(', ')}]\n`;
 // The current pin line, whatever literal it holds (UNREVIEWED today, the reviewed hash later); validate() judges it.
 const policyPinLine = lf(readFileSync(join(root, '.github/workflows/release.yml'), 'utf8')).match(/^          RELEASE_SECURITY_POLICY_SHA256: [^\n]*\n/m)[0];
+// #652 — the approved sandbox dependency step, byte for byte, in both workflows.
+const sandboxDepsMutations = [
+  ['sandbox dependency step removed', sandboxDepsAfter, ''],
+  ['sandbox dependency step drops bubblewrap', 'sudo apt-get install -y bubblewrap socat ripgrep\n', 'sudo apt-get install -y socat ripgrep\n'],
+  ['sandbox dependency step runs on every OS', `${sandboxDepsName}\n        run: sudo apt-get update && sudo apt-get install -y bubblewrap socat ripgrep\n        if: matrix.os == 'ubuntu-latest'\n`,
+    `${sandboxDepsName}\n        run: sudo apt-get update && sudo apt-get install -y bubblewrap socat ripgrep\n`],
+  ['sandbox dependency step may fail', `${sandboxDepsName}\n`, `${sandboxDepsName}\n        continue-on-error: true\n`],
+];
 const releaseBrowserMutations = [
   ['missing guard browser dependency', '    needs: [browser-tls]\n', ''],
   ['extra guard dependency', '    needs: [browser-tls]\n', '    needs: [browser-tls, test]\n'],
@@ -4006,7 +4044,8 @@ for (const [workflowName, path] of [['CI', '.github/workflows/ci.yml'], ['releas
       ...ciDiagnosticMutations,
       ...ciFullSuiteMutations,
       ['unrelated comment byte changed', '# #894.', '# #894 changed.'],
-    ] : [...browserMutations, ...ciDiagnosticMutations, ...releaseBrowserMutations];
+      ...sandboxDepsMutations,
+    ] : [...browserMutations, ...ciDiagnosticMutations, ...releaseBrowserMutations, ...sandboxDepsMutations];
     for (const [name, needle, replacement] of mutations) {
       acceptance(`browser projection rejects ${workflowName} ${ending}: ${name}`, 'browser-projection-mutant', () => {
         const changed = encode(replaceOnce(source, needle, replacement));

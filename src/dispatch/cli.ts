@@ -27,7 +27,7 @@ import { USAGE } from "./usage.js";
 import { geminiBinary } from "../session/boot-adapter/gemini.js";
 import { isCliKind, type LaunchConfig } from "../session/boot-adapter/types.js";
 import { normalizeLaunch } from "../session/boot-adapter/launch-config.js";
-import { loadWorkerScope, prepareWorkerSandbox, assertConfinedTarget, stageWorkerRef } from "../session/worker-sandbox.js";
+import { loadWorkerScope, prepareWorkerSandbox, assertConfinedTarget, stageWorkerRef, assertNotCliWrapper } from "../session/worker-sandbox.js";
 import { validateSpawnDecision, type SpawnDecision } from "../session/model-decision.js";
 
 // ── environment seams (identical names/defaults to the shell) ────────────────
@@ -631,6 +631,16 @@ function resolveSpawnDecision(o: Opts, sid: string): void {
     o.decision = validateSpawnDecision(out.decision, { cli: o.cli, sid, task: o.taskId });
   } catch (e) {
     die(`dispatch.sh: MODEL_RESOLVER_FAILED: ${printable(String(e))}; nothing was spawned`, 10);
+  }
+  // #652: a resolved `#!` wrapper with no version evidence is refused here, before boot-prepare
+  // or any staging; prepareWorkerSandbox repeats the check at the seal. Sandbox platforms only:
+  // win32 seals nothing and keeps its SANDBOX_PLATFORM_UNSUPPORTED refusal.
+  if (process.platform === "darwin" || process.platform === "linux") {
+    try {
+      assertNotCliWrapper(o.decision.executable);
+    } catch (e) {
+      die(`dispatch.sh: ${printable(e instanceof Error ? e.message : String(e))}; nothing was spawned`, 78);
+    }
   }
   // The legacy route fields now name what the argv carries, not a literal default.
   o.route.model = o.decision.model ?? "omitted";
