@@ -1597,16 +1597,28 @@ const sandboxDepsAfter = `      # #652: the real sandbox-runtime's Linux depende
         run: sudo apt-get update && sudo apt-get install -y bubblewrap socat ripgrep
         if: matrix.os == 'ubuntu-latest'
 `;
-const sandboxDepsStep = named(parse('approved-sandbox-deps', `jobs:\n  test:\n    steps:\n${sandboxDepsAfter}`).jobs.test, sandboxDepsName);
+// #652 — immediately after it, Linux only and before the tests: the runner's AppArmor unprivileged-userns
+// restriction lifted so bubblewrap can configure loopback (measured: as-is `bwrap: loopback: Failed
+// RTM_NEWADDR`, OK once the sysctl is 0). Also an independent literal; it adds one step.
+const sandboxUsernsName = 'Let bubblewrap configure loopback (lift the AppArmor unprivileged-userns restriction)';
+const sandboxUsernsAfter = `      # #652: measured on ubuntu-latest, apparmor_restrict_unprivileged_userns=1 makes bwrap fail loopback RTM_NEWADDR (EPERM).
+      - name: ${sandboxUsernsName}
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        if: matrix.os == 'ubuntu-latest'
+`;
+const sandboxDepsJob = parse('approved-sandbox-deps', `jobs:\n  test:\n    steps:\n${sandboxDepsAfter}${sandboxUsernsAfter}`).jobs.test;
+const sandboxDepsSteps = [named(sandboxDepsJob, sandboxDepsName), named(sandboxDepsJob, sandboxUsernsName)];
+assert.deepEqual(sandboxDepsJob.steps, sandboxDepsSteps, 'the approved sandbox literals are exactly these two steps, in order');
 function withApprovedSandboxDeps(job) {
   const copy = structuredClone(job);
   assert.ok(!copy.steps.some(step => step.name === sandboxDepsName), 'historical test job has no sandbox dependency step');
+  assert.ok(!copy.steps.some(step => step.name === sandboxUsernsName), 'historical test job has no loopback userns step');
   copy.steps.splice(copy.steps.indexOf(named(copy, 'Install jq (a hard dependency of init, checked at step 1)')) + 1, 0,
-    structuredClone(sandboxDepsStep));
+    ...structuredClone(sandboxDepsSteps));
   return copy;
 }
 function assertSandboxDepsBytes(source, label) {
-  assert.equal(lf(source).split(`${sandboxDepsPrev}${sandboxDepsAfter}`).length, 2,
+  assert.equal(lf(source).split(`${sandboxDepsPrev}${sandboxDepsAfter}${sandboxUsernsAfter}`).length, 2,
     `${label}: exactly the approved sandbox dependency step bytes`);
 }
 // #1196 — the one approved change to the `publish` job: the publish step gains `id: publish`, the
@@ -2008,7 +2020,7 @@ function validateCIHistory(source, historicalSource = readFileSync(join(root, fi
   assert.equal(prefix.split(sandboxDepsPrev).length, 2, 'one historical jq step');
   assert.equal(currentBytes, prefix.replace(ciHeaderBefore, () => ciHeaderAfter)
     .replace(ciDispatchGuardBefore, () => dispatchGuardAfter)
-    .replace(sandboxDepsPrev, () => `${sandboxDepsPrev}${sandboxDepsAfter}`) + approvedWindowsRegion,
+    .replace(sandboxDepsPrev, () => `${sandboxDepsPrev}${sandboxDepsAfter}${sandboxUsernsAfter}`) + approvedWindowsRegion,
     'every CI byte outside the approved header sentence, Dispatch guard suite step, sandbox dependency step and Windows region is the historical CI');
 }
 acceptance('CI Windows jobs match release and every other CI byte remains unchanged', 'ci-parity', () => validateCIHistory(readFileSync(join(root, '.github/workflows/ci.yml'), 'utf8')));
@@ -2501,6 +2513,10 @@ const workerInputsRelative = 'tests/dispatch/worker-inputs.test.mjs';
 // test-owned sentinels at these paths; the real suites are never imported or run here.
 const initPlatformRelative = 'tests/packaging/init-platform.test.mjs';
 const releaseEvidenceRelative = 'tests/packaging/release-evidence.test.mjs';
+// #1204 context-compact suite: one explicit source entry on EVERY platform, win32 included, directly after the
+// release-evidence entry and ahead of the POSIX-only entries. The fixture only places a test-owned sentinel
+// at this path; the real suite is never imported or run here.
+const contextCompactRelative = 'tests/bin/context-compact.test.mjs';
 function callerFixture(mode, symlinked = false) {
   const directory = mkdtempSync(join(admin, 'caller fixture '));
   const put = (path, source) => {
@@ -2538,6 +2554,7 @@ function callerFixture(mode, symlinked = false) {
   if (mode !== 'missing-worker-inputs') put(workerInputsRelative, checks + `console.log('CALLER_WORKER_INPUTS_SENTINEL');\nprocess.exit(${mode === 'failing-worker-inputs' ? 8 : 0});\n`);
   if (mode !== 'missing-init-platform') put(initPlatformRelative, checks + `console.log('CALLER_INIT_PLATFORM_SENTINEL');\nprocess.exit(${mode === 'failing-init-platform' ? 8 : 0});\n`);
   if (mode !== 'missing-release-evidence') put(releaseEvidenceRelative, checks + `console.log('CALLER_RELEASE_EVIDENCE_SENTINEL');\nprocess.exit(${mode === 'failing-release-evidence' ? 8 : 0});\n`);
+  if (mode !== 'missing-context-compact') put(contextCompactRelative, checks + `console.log('CALLER_CONTEXT_COMPACT_SENTINEL');\nprocess.exit(${mode === 'failing-context-compact' ? 8 : 0});\n`);
   if (mode !== 'missing-wizard') put(wizardRelative, checks + `console.log('CALLER_WIZARD_SENTINEL');\nprocess.exit(${mode === 'failing-wizard' ? 8 : 0});\n`);
   if (mode !== 'missing-supervisor') put(supervisorRelative, checks + `console.log('CALLER_SUPERVISOR_SENTINEL');\nprocess.exit(${mode === 'failing-supervisor' ? 8 : 0});\n`);
   for (const [index, path] of agentMetadataRelatives.entries()) {
@@ -2602,6 +2619,9 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic, onlyFailed
   ['failing-init-platform', 1, true, true, false, undefined, /tests[\\/]packaging[\\/]init-platform\.test\.mjs$/],
   ['missing-release-evidence', 1, false, false, false, /Could not find '[^'\n]*tests[\\/]packaging[\\/]release-evidence\.test\.mjs'/],
   ['failing-release-evidence', 1, true, true, false, undefined, /tests[\\/]packaging[\\/]release-evidence\.test\.mjs$/],
+  // #1204 the context-compact suite alone missing or failing, analogous to the #1171 entries.
+  ['missing-context-compact', 1, false, false, false, /Could not find '[^'\n]*tests[\\/]bin[\\/]context-compact\.test\.mjs'/],
+  ['failing-context-compact', 1, true, true, false, undefined, /tests[\\/]bin[\\/]context-compact\.test\.mjs$/],
   ['missing-harness', 1, true, true, false, /POSIX control harness failed with exit status: 1/],
   ['empty', 1, false, false, false, /No compiled test files found/],
   ['missing-dist', 1, false, false, false, /Failed to enumerate compiled tests/],
@@ -2637,6 +2657,7 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic, onlyFailed
   assert.equal(result.stdout.includes('CALLER_WORKER_INPUTS_SENTINEL'), compiled);
   assert.equal(result.stdout.includes('CALLER_INIT_PLATFORM_SENTINEL'), compiled);
   assert.equal(result.stdout.includes('CALLER_RELEASE_EVIDENCE_SENTINEL'), compiled);
+  assert.equal(result.stdout.includes('CALLER_CONTEXT_COMPACT_SENTINEL'), compiled);
   assert.ok(!result.stdout.includes('CALLER_UNSELECTED_MJS'), 'no automatic source .mjs discovery');
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_COMPILED_CONTROL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (security && sentinel) assert.ok(result.stdout.indexOf('CALLER_SECURITY_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
@@ -2661,6 +2682,7 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic, onlyFailed
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_WORKER_INPUTS_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_INIT_PLATFORM_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_RELEASE_EVIDENCE_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
+  if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_CONTEXT_COMPACT_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (diagnostic) assert.match(result.stderr, diagnostic);
   if (onlyFailedFile) {
     const failures = result.stdout.split('\n').filter(line => /^not ok \d+ - /.test(line));
@@ -2738,6 +2760,7 @@ const timedOut = { status: null, signal: 'SIGKILL', error: 'synthetic ETIMEDOUT'
 const callerArgv = platform => ['--test', 'dist/tests/a.test.js', 'dist/tests/nested/b.test.js', 'dist/tests/z.test.js',
   securityRelative, admissionRelative, ...jevRelatives, ...taskAdvisorRelatives, controlRelative, fakeCmuxInertRelative,
   ...preservationRelatives, workflowPolicyRelative, workerInputsRelative, initPlatformRelative, releaseEvidenceRelative,
+  contextCompactRelative,
   ...(['linux', 'darwin'].includes(platform) ? [nativeRelative, wizardRelative, supervisorRelative, ...agentMetadataRelatives] : [])];
 const vmCases = [];
 for (const platform of ['linux', 'darwin']) {
@@ -2913,11 +2936,13 @@ for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #117
 });
 // #1167 explicit placement of the init-platform entry: exactly once on every platform, win32 included,
 // directly after the worker-inputs entry, then (#1171) the release-evidence entry — literal neighbours only.
-// #1171 the release-evidence entry: exactly once on every platform directly after init-platform, then the
-// first POSIX-only entry on POSIX and nothing after it on win32.
+// #1171 the release-evidence entry: exactly once on every platform directly after init-platform, then (#1204)
+// the context-compact entry. #1204 the context-compact entry: exactly once on every platform directly after
+// release-evidence, then the first POSIX-only entry on POSIX and nothing after it on win32.
 for (const [label, entry, previous] of [
   ['#1167 init-platform follows worker-inputs', 'tests/packaging/init-platform.test.mjs', 'tests/dispatch/worker-inputs.test.mjs'],
   ['#1171 release-evidence follows init-platform', 'tests/packaging/release-evidence.test.mjs', 'tests/packaging/init-platform.test.mjs'],
+  ['#1204 context-compact follows release-evidence', 'tests/bin/context-compact.test.mjs', 'tests/packaging/release-evidence.test.mjs'],
 ]) for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: ${label} exactly once ahead of the POSIX-only entries (${platform})`, 'caller-vm', () => {
   const config = join(admin, `caller-vm-${label.replace(/[^a-z0-9]+/g, '-')}-placement-${platform}.json`);
   writeFileSync(config, JSON.stringify({ platform, results: platform === 'win32' ? [success] : [success, success], source: callerSource }));
@@ -2934,6 +2959,8 @@ for (const [label, entry, previous] of [
   assert.equal(spawned.indexOf(entry), spawned.indexOf(previous) + 1);
   if (entry === 'tests/packaging/init-platform.test.mjs') {
     assert.equal(spawned.indexOf('tests/packaging/release-evidence.test.mjs'), spawned.indexOf(entry) + 1);
+  } else if (entry === 'tests/packaging/release-evidence.test.mjs') {
+    assert.equal(spawned.indexOf('tests/bin/context-compact.test.mjs'), spawned.indexOf(entry) + 1);
   } else if (platform === 'win32') assert.equal(spawned.indexOf(entry), spawned.length - 1);
   else assert.equal(spawned.indexOf('tests/packaging/native-capture.test.mjs'), spawned.indexOf(entry) + 1);
 });
@@ -3044,6 +3071,7 @@ const workflowPolicyPush = "sourceTestFiles.push('tests/packaging/workflow-polic
 const workerInputsPush = "sourceTestFiles.push('tests/dispatch/worker-inputs.test.mjs');\n";
 const initPlatformPush = "sourceTestFiles.push('tests/packaging/init-platform.test.mjs');\n";
 const releaseEvidencePush = "sourceTestFiles.push('tests/packaging/release-evidence.test.mjs');\n";
+const contextCompactPush = "sourceTestFiles.push('tests/bin/context-compact.test.mjs');\n";
 for (const [name, mutate, platforms] of [
   ['wizard entry placed on every platform, win32 included', source => replaceOnce(replaceOnce(source, wizardPosixPush, wizardPosixDropped),
     baseSourceList, "'tests/packaging/release-admission.test.mjs', 'tests/packaging/orchestrator-boot-wizard.test.mjs'];"), ['win32', 'linux', 'darwin']],
@@ -3139,10 +3167,11 @@ for (const [name, mutate, platforms] of [
     workflowPolicyPush, `${workerInputsPush}${workflowPolicyPush}`), ['win32', 'linux', 'darwin']],
   ['worker-inputs suite after the POSIX-only entries', source => replaceOnce(replaceOnce(source, workerInputsPush, ''),
     `${agentMetadataBlock}}\n`, `${agentMetadataBlock}}\n${workerInputsPush}`), ['linux', 'darwin']],
-  // #1167 / #1171: the init-platform and release-evidence entries are required exactly once on every platform,
-  // in that order directly after worker-inputs and ahead of the POSIX branch. Placing one on win32 only or after
-  // the POSIX branch leaves the win32 argv unchanged, so those counterfactuals apply to POSIX alone.
-  ...[['init-platform', initPlatformPush, workerInputsPush], ['release-evidence', releaseEvidencePush, initPlatformPush]]
+  // #1167 / #1171 / #1204: the init-platform, release-evidence and context-compact entries are required exactly
+  // once on every platform, in that order directly after worker-inputs and ahead of the POSIX branch. Placing one
+  // on win32 only or after the POSIX branch leaves the win32 argv unchanged, so those counterfactuals apply to POSIX alone.
+  ...[['init-platform', initPlatformPush, workerInputsPush], ['release-evidence', releaseEvidencePush, initPlatformPush],
+    ['context-compact', contextCompactPush, releaseEvidencePush]]
     .flatMap(([label, push, previous]) => [
       [`${label} suite missing`, source => replaceOnce(source, push, ''), ['win32', 'linux', 'darwin']],
       [`${label} suite duplicated`, source => replaceOnce(source, push, `${push}${push}`), ['win32', 'linux', 'darwin']],
@@ -3946,6 +3975,13 @@ const sandboxDepsMutations = [
   ['sandbox dependency step runs on every OS', `${sandboxDepsName}\n        run: sudo apt-get update && sudo apt-get install -y bubblewrap socat ripgrep\n        if: matrix.os == 'ubuntu-latest'\n`,
     `${sandboxDepsName}\n        run: sudo apt-get update && sudo apt-get install -y bubblewrap socat ripgrep\n`],
   ['sandbox dependency step may fail', `${sandboxDepsName}\n`, `${sandboxDepsName}\n        continue-on-error: true\n`],
+  ['loopback userns step removed', sandboxUsernsAfter, ''],
+  ['loopback userns step keeps the restriction', 'kernel.apparmor_restrict_unprivileged_userns=0\n', 'kernel.apparmor_restrict_unprivileged_userns=1\n'],
+  ['loopback userns step runs on every OS', "kernel.apparmor_restrict_unprivileged_userns=0\n        if: matrix.os == 'ubuntu-latest'\n",
+    'kernel.apparmor_restrict_unprivileged_userns=0\n'],
+  ['loopback userns step may fail', `${sandboxUsernsName}\n`, `${sandboxUsernsName}\n        continue-on-error: true\n`],
+  ['loopback userns step moved after the tests', `${sandboxUsernsAfter}      - name: Run the regression suite\n        run: npm test\n`,
+    `      - name: Run the regression suite\n        run: npm test\n${sandboxUsernsAfter}`],
 ];
 const releaseBrowserMutations = [
   ['missing guard browser dependency', '    needs: [browser-tls]\n', ''],
