@@ -179,7 +179,7 @@ test("claude: exact closed 8-tool set, one --tools and one --allowedTools, same 
   const rest = [...argv.slice(1)];
   rest.splice(rest.indexOf("--permission-mode"), 2);
   assert.deepEqual(cmd.slice(1), [...rest, "--permission-mode", "bypassPermissions", "--tools", TOOLS, "--allowedTools", TOOLS,
-    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "", "--no-chrome",
+    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "user", "--no-chrome",
     "--add-dir", cmd[cmd.length - 1]]);
   assert.ok(!cmd.includes("acceptEdits"));
   // env/config/auth unchanged.
