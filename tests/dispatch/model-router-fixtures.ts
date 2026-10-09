@@ -145,7 +145,7 @@ if (process.argv.length === 3 && process.argv[2] === 'capabilities') {
     assert.deepEqual([m.task, m.sid], ["1083", "router-fixture"]);
     // #1206: scope domains are [], so exactly the code-owned provider hosts of the sealed CLI.
     assert.deepEqual(m.config.network?.allowedDomains, m.cli === "codex"
-      ? ["chatgpt.com:443", "auth.openai.com:443", "api.openai.com:443"]
+      ? ["chatgpt.com:443", "auth.openai.com:443", "api.openai.com:443", "*.oaiusercontent.com:443"]
       : ["api.anthropic.com:443", "claude.ai:443", "platform.claude.com:443", "statsig.anthropic.com:443", "console.anthropic.com:443"]);
     assert.equal(m.config.network?.allowAllUnixSockets, false);
     assert.equal(m.config.network?.allowLocalBinding, false);

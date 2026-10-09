@@ -95,7 +95,7 @@ if (action === 'init') {
   assert.equal(scope.sid, sid);
   // #1206: scope domains are [], so exactly the code-owned provider hosts of the sealed CLI.
   assert.deepEqual(manifest.config.network.allowedDomains, manifest.cli === 'codex'
-    ? ['chatgpt.com:443', 'auth.openai.com:443', 'api.openai.com:443']
+    ? ['chatgpt.com:443', 'auth.openai.com:443', 'api.openai.com:443', '*.oaiusercontent.com:443']
     : ['api.anthropic.com:443', 'claude.ai:443', 'platform.claude.com:443', 'statsig.anthropic.com:443', 'console.anthropic.com:443']);
   assert.deepEqual(manifest.config.network.allowUnixSockets, []);
   assert.equal(manifest.config.network.allowAllUnixSockets, false);

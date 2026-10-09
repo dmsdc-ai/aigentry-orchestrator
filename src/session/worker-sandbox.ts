@@ -163,7 +163,8 @@ export const CONFINED_CLIS = ["claude", "codex"] as const;
 export const PROVIDER_DOMAINS: Readonly<Record<(typeof CONFINED_CLIS)[number], readonly string[]>> = {
   claude: ["api.anthropic.com:443", "claude.ai:443", "platform.claude.com:443", "statsig.anthropic.com:443",
     "console.anthropic.com:443"],
-  codex: ["chatgpt.com:443", "auth.openai.com:443", "api.openai.com:443"],
+  codex: ["chatgpt.com:443", "auth.openai.com:443", "api.openai.com:443",
+    "*.oaiusercontent.com:443"], // codex 0.160 TUI bootstrap "workspace routing discovery" probe (sdmntpr<region>), measured 2026-10-09
 };
 
 function seedAuth(cli: string, home: string, cwd: string, oauthSelected = false): Record<string, string> {

@@ -26,7 +26,7 @@ const WIN = process.platform === "win32";
 // Pinned literally (not read from the module under test): a drift in the code-owned list must fail here.
 const CLAUDE_HOSTS = ["api.anthropic.com:443", "claude.ai:443", "platform.claude.com:443",
   "statsig.anthropic.com:443", "console.anthropic.com:443"];
-const CODEX_HOSTS = ["chatgpt.com:443", "auth.openai.com:443", "api.openai.com:443"];
+const CODEX_HOSTS = ["chatgpt.com:443", "auth.openai.com:443", "api.openai.com:443", "*.oaiusercontent.com:443"];
 const HOSTS: Record<string, string[]> = { claude: CLAUDE_HOSTS, codex: CODEX_HOSTS };
 const OTHER: Record<string, string[]> = { claude: CODEX_HOSTS, codex: CLAUDE_HOSTS };
 
@@ -84,8 +84,8 @@ test("CONFINED_CLIS and PROVIDER_DOMAINS: exact code-owned lists, one entry per 
   assert.deepEqual([...PROVIDER_DOMAINS.claude], CLAUDE_HOSTS);
   assert.deepEqual([...PROVIDER_DOMAINS.codex], CODEX_HOSTS);
   assert.ok(!CLAUDE_HOSTS.some((h) => CODEX_HOSTS.includes(h)));
-  // Same shape loadWorkerScope admits for task extras: HTTPS public hostnames, no wildcard.
-  for (const h of [...CLAUDE_HOSTS, ...CODEX_HOSTS]) assert.match(h, /^[a-z0-9][a-z0-9.-]*:443$/);
+  // Same shape loadWorkerScope admits for task extras: HTTPS public hostnames, optional leading `*.` wildcard.
+  for (const h of [...CLAUDE_HOSTS, ...CODEX_HOSTS]) assert.match(h, /^(?:\*\.)?[a-z0-9][a-z0-9.-]*:443$/);
 });
 
 for (const cli of ["claude", "codex"]) {
