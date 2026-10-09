@@ -95,7 +95,8 @@ async function main(): Promise<void> {
       deny('lstat',()=>fs.lstatSync(process.argv[3]+'/synthetic.txt'));
       fs.writeFileSync(process.argv[2],'ok'); fs.unlinkSync(process.argv[2]);
       const s=net.connect({host:'127.0.0.1',port:3848});
-      s.on('connect',()=>process.exit(72)); s.on('error',e=>process.exit(['EPERM','EACCES'].includes(e.code)?0:73));
+      s.on('connect',()=>{fs.writeSync(2,'connect:open ');process.exit(72)});
+      s.on('error',e=>{const ok=['EPERM','EACCES'].includes(e.code);if(!ok)fs.writeSync(2,'connect:'+e.code+' ');process.exit(ok?0:73)});
       setTimeout(()=>process.exit(74),3000);`;
     // The host's canary text: on Linux a read inside the sandbox is readable only if it returns exactly this.
     const canary = fs.readFileSync(m.probeFile, "utf8");
