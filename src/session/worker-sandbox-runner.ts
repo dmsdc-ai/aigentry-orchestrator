@@ -1,8 +1,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
-import { assertExecutableIdentity, quote, readSealedManifest, type WorkerManifest } from "./worker-sandbox.js";
+import { assertExecutableIdentity, quote, readSealedManifest, withSeccompHelperRead, type WorkerManifest } from "./worker-sandbox.js";
 import { CLAUDE_OAUTH_CHILD, CLAUDE_OAUTH_DIR, CLAUDE_OAUTH_FILE, readClaudeOAuthHandoff } from "./claude-worker-oauth.js";
 
 async function run(m: WorkerManifest, command: string[], capture = false,
@@ -72,7 +73,9 @@ async function main(): Promise<void> {
   // SRT's temporary paths must belong to this worker, never to shared host /tmp.
   for (const key of Object.keys(process.env)) delete process.env[key];
   Object.assign(process.env, m.env);
-  await SandboxManager.initialize(m.config, undefined, false);
+  // #652: the sealed config plus, on Linux only, the runtime's own seccomp helper directory.
+  const runtimeDir = path.dirname(createRequire(import.meta.url).resolve("@anthropic-ai/sandbox-runtime/package.json"));
+  await SandboxManager.initialize(withSeccompHelperRead(m.config, process.platform, runtimeDir), undefined, false);
   try {
     // The directory canary attests the metadata boundary through what macOS sandbox-exec
     // enforces: listing the directory and stat/lstat of a file inside it are denied. stat of

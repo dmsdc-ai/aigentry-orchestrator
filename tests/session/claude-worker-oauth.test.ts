@@ -20,11 +20,13 @@ import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync, copyFileSync, cpSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync,
-  rmSync, statSync, symlinkSync, writeFileSync,
+  realpathSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import type { SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
+import { withSeccompHelperRead } from "../../src/session/worker-sandbox.js";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..", "..", "..");
 const BOOT = join(REPO_ROOT, "bin", "boot-prepare.mjs");
@@ -545,6 +547,39 @@ test("legacy launcher with the dist helper missing refuses 78 (no inline fallbac
   writeFileSync(copy, src.split(helper).join(join(W.root, "absent", "claude-worker-oauth.js")), { mode: 0o700 });
   const r = runLauncher(W, copy);
   assert.deepEqual([r.status, r.rec], [78, null]);
+});
+
+// #652 Linux seccomp helper read: SRT's bwrap wrapper execs <runtime>/vendor/seccomp/<arch>/apply-seccomp by host
+// path inside the sandbox and binds nothing for it. Config shaping only (pure, every OS), never confinement.
+test("pure withSeccompHelperRead: Linux appends only <runtime>/vendor/seccomp to allowRead; other platforms untouched", () => {
+  const config: SandboxRuntimeConfig = {
+    network: { allowedDomains: ["api.anthropic.com:443"], deniedDomains: [], allowUnixSockets: [],
+      allowAllUnixSockets: false, allowLocalBinding: false },
+    filesystem: { denyRead: ["/home", "/tmp"], allowRead: ["/w", "/w/bin/claude"], allowWrite: ["/w"], denyWrite: ["/w/cwd"] },
+    allowPty: true, allowAppleEvents: false, enableWeakerNestedSandbox: false, enableWeakerNetworkIsolation: false,
+  };
+  const before = JSON.stringify(config), rt = join("/", "nm", "@anthropic-ai", "sandbox-runtime");
+  const helper = join(rt, "vendor", "seccomp");
+  const linux = withSeccompHelperRead(config, "linux", rt);
+  assert.deepEqual(linux.filesystem.allowRead, ["/w", "/w/bin/claude", helper]);
+  assert.deepEqual({ ...linux, filesystem: { ...linux.filesystem, allowRead: config.filesystem.allowRead } }, config);
+  assert.equal(JSON.stringify(config), before, "the sealed input is never mutated");
+  for (const platform of ["darwin", "win32", "freebsd"] as const) assert.equal(withSeccompHelperRead(config, platform, rt), config);
+  const bare = withSeccompHelperRead({ ...config, filesystem: { ...config.filesystem, allowRead: undefined } }, "linux", rt);
+  assert.deepEqual(bare.filesystem.allowRead, [helper]);
+});
+
+// The built runner hands SRT exactly the sealed config shaped for THIS platform with the runtime directory it
+// resolves itself (here the fake's). MOCK BOUNDARY: wiring only; the Linux bind is proven by the live case on CI.
+test("runner (fake SRT): initialize gets the sealed config, plus the runtime's vendor/seccomp on Linux only", () => {
+  const W = world(), p = prepare(W, "sc1");
+  if (WIN) return refusedOnWin(W, p);
+  const r = runRunner(W, p.manifest, p.hash, ["--preflight-only"]);
+  assert.equal(r.status, 0, r.stderr);
+  const rt = realpathSync(join(dirname(runnerCopy()), "..", "..", "..", "node_modules", "@anthropic-ai", "sandbox-runtime"));
+  const init = r.srt.filter((e) => e.ev === "initialize");
+  assert.equal(init.length, 1);
+  assert.deepEqual(init[0]?.config, withSeccompHelperRead(p.m.config as SandboxRuntimeConfig, process.platform, rt));
 });
 
 // #652 LIVE, darwin only (registered only there; Linux and win32 collect no test, so no skip): the
