@@ -222,25 +222,26 @@ test("managed: auto route keeps the routed codex model; no hidden codex effort",
   } finally { f.cleanup(); }
 });
 
+// #1206 D7: the codex route used to come from the classifier for an architect; it is now the coder table row.
 test("managed: cap fallback re-resolves the whole tuple for the FINAL cli", () => {
   const f = fixture();
   try {
-    writeFileSync(join(f.aig, "instructions/roles/architect.md"), "# ARCHITECT\nFIXTURE-ROLE\n");
-    const r = f.dispatch([...f.spawnArgs, "--role", "architect"], { PATH: pathWith(f.bin), AIGENTRY_CLI_CAP_CODEX: "2",
+    const r = f.dispatch([...f.spawnArgs, "--role", "coder"], { PATH: pathWith(f.bin), AIGENTRY_CLI_CAP_CODEX: "2",
       LIVE_SESSIONS: JSON.stringify([{ id: SID, command: "codex" }, { id: "live-1", command: f.liveLauncher("codex") }]),
       // Codex-only operator inputs must not leak into the claude tuple (an invalid one would refuse).
       AIGENTRY_CODEX_EXECUTABLE: "relative/codex", AIGENTRY_CODEX_EFFORT: "ultra", AIGENTRY_CODEX_MODEL: "gpt-5.4" });
     if (!posix) {
       const d = refusedManaged(f, r);
-      assert.match(r.stderr, /codex at cap/);
-      assert.deepEqual([d.cli, d.decided_by, d.capped_cli, basename(d.executable ?? "")], ["claude", "llm-capped", "codex", "claude"]);
+      assert.match(r.stderr, /codex at cap .*; gpt-6-astra -> opus-5 \(claude\)/);
+      assert.deepEqual([d.cli, d.decided_by, d.capped_cli, basename(d.executable ?? "")], ["claude", "table-capped", "codex", "claude"]);
       assert.notEqual(d.effort, "ultra", "codex-only inputs never reach the claude tuple");
       return;
     }
     const { exe, audit, cmd } = assertManaged(f, r, "claude");
-    assert.match(r.stderr, /codex at cap/);
+    assert.match(r.stderr, /codex at cap .*; gpt-6-astra -> opus-5 \(claude\)/);
     assert.equal(basename(exe.path), "claude");
-    assert.equal(audit.decided_by, "llm-capped");
+    assert.equal(audit.decided_by, "table-capped");
+    assert.equal(f.calls(), 0, "D7: no classifier call");
     assert.equal(cmd.includes("ultra"), false);
     assert.equal(audit.requested.executable, undefined);
   } finally { f.cleanup(); }

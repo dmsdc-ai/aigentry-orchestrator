@@ -65,7 +65,9 @@ function refusedAudit(f: CapFixture, r: SpawnSyncReturns<string>): { payload: Di
     note: `cli=${d.cli}/${d.model ?? "unknown"} by=${d.decided_by}${d.capped_cli ? ` capped_cli=${d.capped_cli}` : ""}` };
 }
 
-const OPUS = '{"label":"opus-5","reason":"judgment","confidence":0.9}';
+// #1206 D7: dispatch never sends the ref to the classifier, so the route is the profile's role row:
+// architect -> opus-5 (claude), coder -> gpt-6-astra (codex).
+const ROLE: Record<string, string> = { claude: "architect", codex: "coder" };
 
 interface SpawnRunResult {
   r: SpawnSyncReturns<string>;
@@ -151,17 +153,16 @@ describe("[spawn] no implicit count ceiling for missing / empty / unlimited conf
   // CONTRACT: absent or empty AIGENTRY_CLI_CAP_<CLI> means NO implicit ceiling,
   // for EVERY CLI. The pre-#1148 behaviour violated this (codex 2 / claude 4).
   const knobs: [string, string | undefined][] = [["missing", undefined], ["empty", ""], ["unlimited", "unlimited"]];
-  const clis: [string, string | undefined, number][] = [["claude", OPUS, 8], ["codex", undefined, 8]];
+  const clis: [string, number][] = [["claude", 8], ["codex", 8]];
 
   for (const [knobDesc, knob] of knobs) {
-    for (const [cli, reply, n] of clis) {
+    for (const [cli, n] of clis) {
       test(`${cli}: ${knobDesc} config + ${n} live -> routes ${cli}, no cap`, async () => {
         const knobVar = `AIGENTRY_CLI_CAP_${cli.toUpperCase()}`;
         const { r, payload, note } = await spawnRun((f) => ({
           LIVE_SESSIONS: liveRows(f, cli, n),
-          ...(reply ? { CLASSIFIER_REPLY: reply } : {}),
           ...(knob === undefined ? {} : { [knobVar]: knob }),
-        }));
+        }), ["--role", ROLE[cli]!]);
         assert.equal(r.status, SPAWN_EXIT, r.stderr);
         assert.equal(payload.cli, cli, `expected no cap, got route ${JSON.stringify(payload.route)}`);
         assert.equal(payload.route.capped_cli, undefined);
@@ -174,7 +175,7 @@ describe("[spawn] no implicit count ceiling for missing / empty / unlimited conf
   // CLI counts above the old hardcoded ceilings must not trigger a ceiling.
   for (const n of [3, 5, 9]) {
     test(`claude: ${n} live with no config exceeds old default 4 without capping`, async () => {
-      const { r, payload } = await spawnRun((f) => ({ LIVE_SESSIONS: liveRows(f, "claude", n), CLASSIFIER_REPLY: OPUS }));
+      const { r, payload } = await spawnRun((f) => ({ LIVE_SESSIONS: liveRows(f, "claude", n) }), ["--role", ROLE.claude!]);
       assert.equal(r.status, SPAWN_EXIT, r.stderr);
       assert.equal(payload.cli, "claude");
       assert.equal(payload.route.capped_cli, undefined);

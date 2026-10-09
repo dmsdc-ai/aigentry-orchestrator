@@ -13,6 +13,11 @@ function route(f: ReturnType<typeof fixture>, r: SpawnSyncReturns<string>) {
   return [d.cli, d.model, d.decided_by, d.capped_cli];
 }
 
+// #1206 D7: dispatch never passes `--ref` to the router, so the classifier is never called (f.calls() === 0) and
+// every `--cli auto` route is the profile's role row: decided_by "table", reason "no task ref; role default",
+// and a cap fallback is "table-capped". The fixture profile rows are coder -> gpt-6-astra, architect -> opus-5.
+const TABLE_REASON = "no task ref; role default";
+
 function audit(f: ReturnType<typeof fixture>) {
   const events = readFileSync(f.env.TELEMETRY_LOG!, "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[]);
   const event = events.find((e) => e[e.indexOf("--subtype") + 1] === "dispatch_start")!;
@@ -26,22 +31,24 @@ function audit(f: ReturnType<typeof fixture>) {
   return result;
 }
 
-for (const flags of [[], ["--cli", "auto"]]) test(`T140: ${flags.length ? "explicit auto" : "omitted CLI"} routes once and audits applied child model`, () => {
+for (const flags of [[], ["--cli", "auto"]]) test(`T140: ${flags.length ? "explicit auto" : "omitted CLI"} routes from the role table and audits applied child model`, () => {
   const f = fixture();
   try {
     const r = f.dispatch([...f.spawnArgs, "--role", "coder", ...flags], { AIGENTRY_CODEX_MODEL: "parent-model" });
     if (WIN32) {
-      assert.deepEqual(route(f, r), ["codex", "gpt-6-astra", "llm", undefined]);
-      assert.equal(f.calls(), 1);
+      assert.deepEqual(route(f, r), ["codex", "gpt-6-astra", "table", undefined]);
+      assert.equal(f.calls(), 0);
       return;
     }
     assert.equal(r.status, 0, r.stderr);
-    assert.equal(f.calls(), 1);
+    assert.equal(f.calls(), 0, "D7: the ref never reaches the classifier");
+    assert.equal(existsSync(f.env.PROMPT_LOG!), false, "no classifier prompt was written");
     assert.doesNotMatch(r.stderr, /boot-prepare.mjs failed|legacy path active/);
     const { payload, note } = audit(f);
     assert.equal(payload.cli, "codex");
-    assert.deepEqual(payload.route, { label: "gpt-6-astra", decided_by: "llm", reason: "implementation" });
-    assert.match(note, /seed \| dispatched .* sid=router-fixture ref=ref.md track=router cli=codex\/gpt-6-astra by=llm/);
+    // The coder row of the fixture profile decided.
+    assert.deepEqual(payload.route, { label: "gpt-6-astra", decided_by: "table", reason: TABLE_REASON });
+    assert.match(note, /seed \| dispatched .* sid=router-fixture ref=ref.md track=router cli=codex\/gpt-6-astra by=table/);
     assert.equal(JSON.parse(readFileSync(f.env.OPEN_LOG!, "utf8")).model, "gpt-6-astra");
     assert.deepEqual(f.manifest().command.slice(1, 3), ["-m", "gpt-6-astra"]);
     assert.equal(f.manifest().cli, "codex");
@@ -69,19 +76,21 @@ test("T140: explicit CLI bypasses classifier and profile and records by=explicit
   } finally { f.cleanup(); }
 });
 
-test("T140: classifier failure still spawns and audits role-table fallback", () => {
+test("T140: a broken classifier is never reached; the role table decides and spawns", () => {
   const f = fixture();
   try {
     const r = f.dispatch([...f.spawnArgs, "--role", "coder"], { CLASSIFIER_REPLY: "broken" });
     if (WIN32) {
       assert.deepEqual(route(f, r), ["codex", "gpt-6-astra", "table", undefined]);
-      assert.equal(f.calls(), 1);
+      assert.equal(f.calls(), 0);
       return;
     }
     assert.equal(r.status, 0, r.stderr);
-    assert.equal(f.calls(), 1);
+    assert.equal(f.calls(), 0);
+    assert.doesNotMatch(r.stderr, /model-router: .*using table/, "no classifier failure to fall back from");
     const { payload, note } = audit(f);
     assert.equal(payload.route.decided_by, "table");
+    assert.equal(payload.route.reason, TABLE_REASON);
     assert.match(note, /cli=codex\/gpt-6-astra by=table/);
   } finally { f.cleanup(); }
 });
@@ -105,9 +114,9 @@ test("T140: deduplicated fresh dispatch does not classify or spawn again", () =>
   try {
     if (WIN32) {
       // A refused spawn records nothing, so the repeat is not deduplicated: it is decided and refused again.
-      for (const calls of [1, 2]) {
-        assert.deepEqual(route(f, f.dispatch([...f.spawnArgs, "--role", "coder"])), ["codex", "gpt-6-astra", "llm", undefined]);
-        assert.equal(f.calls(), calls);
+      for (let i = 0; i < 2; i++) {
+        assert.deepEqual(route(f, f.dispatch([...f.spawnArgs, "--role", "coder"])), ["codex", "gpt-6-astra", "table", undefined]);
+        assert.equal(f.calls(), 0);
       }
       return;
     }
@@ -116,7 +125,7 @@ test("T140: deduplicated fresh dispatch does not classify or spawn again", () =>
     assert.equal(first.status, 0, first.stderr);
     const r = f.dispatch([...f.spawnArgs, "--role", "coder"]);
     assert.equal(r.status, 8, r.stderr);
-    assert.equal(f.calls(), 1);
+    assert.equal(f.calls(), 0);
     assert.equal(readFileSync(f.env.OPEN_LOG! + ".calls", "utf8"), "open\n");
   } finally { f.cleanup(); }
 });
@@ -134,25 +143,28 @@ function twoCodex(f: ReturnType<typeof fixture>): NodeJS.ProcessEnv {
   };
 }
 
-test("T140: codex at cap, role table is another CLI -> falls to it, by=llm-capped + capped_cli", () => {
+// #1206 D7: this used to be "codex at cap, role table is another CLI -> falls to it" — the classifier picked Astra
+// for an architect and the cap fell back to the architect row. With no classifier the architect row (opus-5) is the
+// route itself, so a codex cap never applies to it.
+test("T140: codex at cap, architect's table row is claude -> routed there directly, never capped", () => {
   const f = fixture();
   try {
     writeFileSync(join(f.aig, "instructions/roles/architect.md"), "# ARCHITECT\nFIXTURE-ROLE\n");
     const r = f.dispatch([...f.spawnArgs, "--role", "architect"], twoCodex(f));
     if (WIN32) {
-      assert.deepEqual(route(f, r), ["claude", "claude-opus-5[1m]", "llm-capped", "codex"]);
-      assert.equal(f.calls(), 1);
-      assert.match(r.stderr, /codex at cap \(2 live, AIGENTRY_CLI_CAP_CODEX=2\); gpt-6-astra -> opus-5 \(claude\)/);
+      assert.deepEqual(route(f, r), ["claude", "claude-opus-5[1m]", "table", undefined]);
+      assert.equal(f.calls(), 0);
+      assert.doesNotMatch(r.stderr, /at cap/);
       return;
     }
     assert.equal(r.status, 0, r.stderr);
-    assert.equal(f.calls(), 1);
-    assert.match(r.stderr, /codex at cap \(2 live, AIGENTRY_CLI_CAP_CODEX=2\); gpt-6-astra -> opus-5 \(claude\)/);
+    assert.equal(f.calls(), 0);
+    assert.doesNotMatch(r.stderr, /at cap/);
     const { payload, note } = audit(f);
     assert.equal(payload.cli, "claude");
-    assert.deepEqual([payload.route.label, payload.route.decided_by, payload.route.capped_cli], ["opus-5", "llm-capped", "codex"]);
-    assert.match(payload.route.reason, /^codex at cap .*; router chose gpt-6-astra: implementation$/);
-    assert.match(note, /cli=claude\/claude-opus-5\[1m\] by=llm-capped capped_cli=codex/);
+    assert.deepEqual([payload.route.label, payload.route.decided_by, payload.route.capped_cli], ["opus-5", "table", undefined]);
+    assert.equal(payload.route.reason, TABLE_REASON);
+    assert.match(note, /cli=claude\/claude-opus-5\[1m\] by=table$/);
     assert.ok(f.manifest().command.includes("claude-opus-5[1m]"));
   } finally { f.cleanup(); }
 });
@@ -161,14 +173,18 @@ test("T140: codex at cap, role table is codex too -> first under-cap profile mod
   const f = fixture();
   try {
     const r = f.dispatch([...f.spawnArgs, "--role", "coder"], twoCodex(f));
+    // Candidate order: the coder row (gpt-6-astra, capped) first, then profile order -> opus-5.
+    assert.match(r.stderr, /codex at cap \(2 live, AIGENTRY_CLI_CAP_CODEX=2\); gpt-6-astra -> opus-5 \(claude\)/);
     if (WIN32) {
-      assert.deepEqual(route(f, r), ["claude", "claude-opus-5[1m]", "llm-capped", "codex"]);
+      assert.deepEqual(route(f, r), ["claude", "claude-opus-5[1m]", "table-capped", "codex"]);
       return;
     }
     assert.equal(r.status, 0, r.stderr);
+    assert.equal(f.calls(), 0);
     const { payload, note } = audit(f);
-    assert.deepEqual([payload.cli, payload.route.label, payload.route.decided_by, payload.route.capped_cli], ["claude", "opus-5", "llm-capped", "codex"]);
-    assert.match(note, /cli=claude\/claude-opus-5\[1m\] by=llm-capped capped_cli=codex/);
+    assert.deepEqual([payload.cli, payload.route.label, payload.route.decided_by, payload.route.capped_cli], ["claude", "opus-5", "table-capped", "codex"]);
+    assert.match(payload.route.reason, /^codex at cap .*; router chose gpt-6-astra: no task ref; role default$/);
+    assert.match(note, /cli=claude\/claude-opus-5\[1m\] by=table-capped capped_cli=codex/);
     assert.ok(f.manifest().command.includes("claude-opus-5[1m]"));
   } finally { f.cleanup(); }
 });
@@ -195,15 +211,15 @@ test("T140: under cap is unchanged: raised knob, or a live row whose launcher ca
     try {
       const r = f.dispatch([...f.spawnArgs, "--role", "coder"], { ...twoCodex(f), ...overrides });
       if (WIN32) {
-        assert.deepEqual(route(f, r), ["codex", "gpt-6-astra", "llm", undefined]);
+        assert.deepEqual(route(f, r), ["codex", "gpt-6-astra", "table", undefined]);
         assert.doesNotMatch(r.stderr, /at cap/);
         continue;
       }
       assert.equal(r.status, 0, r.stderr);
       assert.doesNotMatch(r.stderr, /at cap/);
       const { payload, note } = audit(f);
-      assert.deepEqual(payload.route, { label: "gpt-6-astra", decided_by: "llm", reason: "implementation" });
-      assert.match(note, /cli=codex\/gpt-6-astra by=llm$/);
+      assert.deepEqual(payload.route, { label: "gpt-6-astra", decided_by: "table", reason: TABLE_REASON });
+      assert.match(note, /cli=codex\/gpt-6-astra by=table$/);
     } finally { f.cleanup(); }
   }
 });
@@ -215,12 +231,12 @@ test("T140: AIGENTRY_CLI_CAP_CODEX=1 caps at one live codex; 0 never auto-routes
       const r = f.dispatch([...f.spawnArgs, "--role", "coder"], { AIGENTRY_CLI_CAP_CODEX: cap });
       if (WIN32) {
         assert.match(r.stderr, new RegExp(`codex at cap \\(1 live, AIGENTRY_CLI_CAP_CODEX=${cap}\\)`));
-        assert.equal(route(f, r)[2], "llm-capped");
+        assert.equal(route(f, r)[2], "table-capped");
         continue;
       }
       assert.equal(r.status, 0, r.stderr);
       assert.match(r.stderr, new RegExp(`codex at cap \\(1 live, AIGENTRY_CLI_CAP_CODEX=${cap}\\)`));
-      assert.equal(audit(f).payload.route.decided_by, "llm-capped");
+      assert.equal(audit(f).payload.route.decided_by, "table-capped");
     } finally { f.cleanup(); }
   }
 });
@@ -273,6 +289,7 @@ test("T140: readiness probe and --target audit receive the CLI kind for a worker
 });
 
 // #1098: count Claude guard launchers as well as the orchestrator's bare CLI.
+// #1206 D7: an Opus route used to come from a classifier reply for a coder; it is now the architect row.
 // #1148: the `live=4, cap=""` row used to be capped by the built-in `claude 4` default. That
 // default is gone, so the finite-cap case now states quota 4 explicitly (same live count, same
 // capped outcome, same assertions), and a new blank-knob row at the SAME live count asserts the
@@ -281,29 +298,32 @@ for (const [live, cap, capped] of [[3, "", false], [4, "4", true], [4, "", false
   test(`T140: Claude live=${live}, cap=${cap || "unset"} routes ${capped ? "next candidate" : "Opus"}`, () => {
     const f = fixture();
     try {
-      const r = f.dispatch([...f.spawnArgs, "--role", "coder"], {
+      writeFileSync(join(f.aig, "instructions/roles/architect.md"), "# ARCHITECT\nFIXTURE-ROLE\n");
+      const r = f.dispatch([...f.spawnArgs, "--role", "architect"], {
         AIGENTRY_CLI_CAP_CLAUDE: cap, AIGENTRY_CLI_CAP_CODEX: "",
-        CLASSIFIER_REPLY: '{"label":"opus-5","reason":"judgment","confidence":0.9}',
         LIVE_SESSIONS: JSON.stringify(Array.from({ length: live }, (_, i) => ({
           id: i === 0 ? "router-fixture" : `live-${i}`, command: i === 0 ? "claude" : f.liveLauncher("claude"),
         }))),
       });
       if (WIN32) {
-        assert.deepEqual(route(f, r), capped ? ["codex", "gpt-6-astra", "llm-capped", "claude"] : ["claude", "claude-opus-5[1m]", "llm", undefined]);
-        assert.equal(f.calls(), 1);
+        assert.deepEqual(route(f, r), capped ? ["codex", "gpt-6-astra", "table-capped", "claude"] : ["claude", "claude-opus-5[1m]", "table", undefined]);
+        assert.equal(f.calls(), 0);
         if (capped) assert.ok(r.stderr.includes(`claude at cap (${live} live, AIGENTRY_CLI_CAP_CLAUDE=${cap})`));
         else assert.doesNotMatch(r.stderr, /at cap/);
         return;
       }
       assert.equal(r.status, 0, r.stderr);
-      assert.equal(f.calls(), 1);
+      assert.equal(f.calls(), 0);
       const { payload, note } = audit(f);
       assert.deepEqual([payload.cli, payload.route.label, payload.route.decided_by, payload.route.capped_cli],
-        capped ? ["codex", "gpt-6-astra", "llm-capped", "claude"] : ["claude", "opus-5", "llm", undefined]);
+        capped ? ["codex", "gpt-6-astra", "table-capped", "claude"] : ["claude", "opus-5", "table", undefined]);
       if (capped) {
+        // Candidate order: the architect row (opus-5, capped) first, then profile order -> gpt-6-astra.
+        assert.match(r.stderr, /; opus-5 -> gpt-6-astra \(codex\)/);
+        assert.match(payload.route.reason, /; router chose opus-5: no task ref; role default$/);
         // Every capped row now carries an explicit quota, so the status line echoes `cap` itself.
         assert.ok(r.stderr.includes(`claude at cap (${live} live, AIGENTRY_CLI_CAP_CLAUDE=${cap})`));
-        assert.match(note, /cli=codex\/gpt-6-astra by=llm-capped capped_cli=claude/);
+        assert.match(note, /cli=codex\/gpt-6-astra by=table-capped capped_cli=claude/);
       } else assert.doesNotMatch(r.stderr, /at cap/);
     } finally { f.cleanup(); }
   });

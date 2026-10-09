@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { geminiBinary, geminiAdapter } from "../../src/session/boot-adapter/gemini.js";
 import { fixture } from "./model-router-fixtures.js";
@@ -137,21 +137,176 @@ for (const withRole of [false, true]) for (const [cli, env, expected] of [
 // C3-a: this used to pin `gpt-6-astra -> gemini (gemini)` then SANDBOX_CLI_UNSUPPORTED (exit 78): the cap fallback
 // took the fixture profile's researcher row (gemini), a CLI the confined spawn refuses. `--cli auto` now asks the
 // router for confinable CLIs only, so the fallback lands on the next confinable candidate and spawns it.
+// #1206 D7: no classifier; the researcher row (gemini) is filtered, so the router's pick is Opus and the cap is Claude's.
 test("T141: capped researcher route falls to a confinable CLI, never to Gemini", () => {
   const f = fixture();
   try {
     writeFileSync(join(f.aig, "instructions/roles/researcher.md"), "# RESEARCHER\nFIXTURE-ROLE\n");
-    const r = f.dispatch([...f.spawnArgs, "--role", "researcher"], { AIGENTRY_CLI_CAP_CODEX: "0" });
-    assert.match(r.stderr, /gpt-6-astra -> opus-5 \(claude\)/);
+    const r = f.dispatch([...f.spawnArgs, "--role", "researcher"], { AIGENTRY_CLI_CAP_CLAUDE: "0" });
+    assert.match(r.stderr, /opus-5 -> gpt-6-astra \(codex\)/);
     assert.doesNotMatch(r.stderr, /SANDBOX_CLI_UNSUPPORTED/);
-    assert.equal(f.calls(), 1);
+    assert.equal(f.calls(), 0);
     if (process.platform === "win32") {
       const d = f.refused(r);
-      assert.deepEqual([d.cli, d.model, d.decided_by, d.capped_cli], ["claude", "claude-opus-5[1m]", "llm-capped", "codex"]);
+      assert.deepEqual([d.cli, d.model, d.decided_by, d.capped_cli], ["codex", "gpt-6-astra", "table-capped", "claude"]);
       return;
     }
     assert.equal(r.status, 0, r.stderr);
-    assert.equal(f.manifest().cli, "claude");
-    assert.ok(f.manifest().command.includes("claude-opus-5[1m]"));
+    assert.equal(f.manifest().cli, "codex");
+    assert.deepEqual(f.manifest().command.slice(1, 3), ["-m", "gpt-6-astra"]);
+  } finally { f.cleanup(); }
+});
+
+// #1206 S1-C: a role × task-class policy profile (S1-A syntax). Effort tokens are per CLI.
+const POLICY_PROFILE = `---
+measured_at: 2026-10-09
+models:
+  - {label: opus-5, cli: claude, model: "claude-opus-5[1m]"}
+  - {label: gpt-6-astra, cli: codex, model: "gpt-6-astra"}
+  - {label: grok-4.6, cli: grok, model: "grok-4.6"}
+default_table:
+  coder: gpt-6-astra
+  coder.integration: opus-5
+role_effort:
+  coder: medium
+  coder.integration: high
+role_fallback:
+  coder: grok-4.6 opus-5
+  coder.integration: gpt-6-astra
+---
+Fixture only. PROFILE-BODY-T141-POLICY
+`;
+
+function policy(f: ReturnType<typeof fixture>): NodeJS.ProcessEnv {
+  const file = join(f.root, "policy-profile.md");
+  writeFileSync(file, POLICY_PROFILE);
+  return { AIGENTRY_ROUTER_PROFILE: file };
+}
+
+/** The routed tuple a fresh spawn applied: the sealed argv on POSIX, the refusal's decision on win32. */
+function applied(f: ReturnType<typeof fixture>, r: ReturnType<ReturnType<typeof fixture>["dispatch"]>) {
+  if (process.platform === "win32") {
+    const d = f.refused(r);
+    return { cli: d.cli, model: d.model, effort: d.effort ?? null, decided_by: d.decided_by, capped_cli: d.capped_cli };
+  }
+  assert.equal(r.status, 0, r.stderr);
+  const m = f.manifest(), cmd = m.command;
+  const effort = m.cli === "codex" ? cmd.find((a) => a.startsWith("model_reasoning_effort="))?.slice(23) ?? null
+    : cmd.includes("--effort") ? cmd[cmd.indexOf("--effort") + 1]! : null;
+  const events = readFileSync(f.env.TELEMETRY_LOG!, "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[]);
+  const event = events.find((e) => e[e.indexOf("--subtype") + 1] === "dispatch_start")!;
+  const payload = JSON.parse(event[event.indexOf("--payload-json") + 1]!);
+  assert.equal(payload.decision.selected.effort.token, effort, "the argv carries the decision's effort");
+  return { cli: m.cli, model: cmd[cmd.indexOf(m.cli === "codex" ? "-m" : "--model") + 1], effort,
+    decided_by: payload.route.decided_by, capped_cli: payload.route.capped_cli, state: payload.decision.selected.effort.state };
+}
+
+test("T141: --task-class is forwarded as the router's --class; the row's effort reaches the argv as policy", () => {
+  for (const [args, expected] of [
+    [["--task-class", "integration"], { cli: "claude", model: "claude-opus-5[1m]", effort: "high" }],
+    [[], { cli: "codex", model: "gpt-6-astra", effort: "medium" }],
+    [["--task-class", "unlisted"], { cli: "codex", model: "gpt-6-astra", effort: "medium" }],
+  ] as const) {
+    const f = fixture();
+    try {
+      const r = f.dispatch([...f.spawnArgs, "--role", "coder", ...args], policy(f));
+      const got = applied(f, r);
+      assert.deepEqual([got.cli, got.model, got.effort, got.decided_by, got.capped_cli],
+        [expected.cli, expected.model, expected.effort, "table", undefined], JSON.stringify(args));
+      if (process.platform !== "win32") assert.equal((got as { state?: string }).state, "policy");
+      assert.equal(f.calls(), 0, "D7: the ref never reaches the classifier");
+      assert.doesNotMatch(r.stderr, /model router unavailable/);
+    } finally { f.cleanup(); }
+  }
+});
+
+test("T141: an invalid --task-class refuses with exit 4 before routing or any effect", () => {
+  for (const bad of ["Integration", "1x", "a b", "x".repeat(33), "", "-x"]) {
+    const f = fixture();
+    try {
+      const r = f.dispatch([...f.spawnArgs, "--role", "coder", "--task-class", bad], policy(f));
+      assert.equal(r.status, 4, r.stderr);
+      assert.match(r.stderr, /dispatch\.sh: --task-class: invalid class/);
+      assert.equal(existsSync(f.env.OPEN_LOG!), false);
+      assert.equal(existsSync(f.env.TELEMETRY_LOG!), false);
+      assert.equal(f.calls(), 0);
+    } finally { f.cleanup(); }
+  }
+});
+
+test("T141: a router effort that is not a profile token is an invalid router result (emergency route)", () => {
+  const good = { cli: "codex", model: "gpt-6-astra", label: "gpt-6-astra" };
+  for (const route of [
+    { ...good, decided_by: "table", reason: "r", effort: "high; touch SHOULD-NOT-EXECUTE", candidates: [good] },
+    { ...good, decided_by: "table", reason: "r", effort: 7, candidates: [good] },
+    { ...good, decided_by: "table", reason: "r", effort: "medium", candidates: [{ ...good, effort: "MEDIUM" }] },
+    { ...good, decided_by: "table", reason: "r", candidates: [null] },
+  ]) {
+    const f = fixture();
+    try {
+      const dir = join(f.root, "fake-router");
+      mkdirSync(dir);
+      writeFileSync(join(dir, "model-router.mjs"), `process.stdout.write(${JSON.stringify(JSON.stringify(route))} + "\\n");\n`);
+      const r = f.dispatch([...f.spawnArgs, "--role", "coder"], { DISPATCH_SCRIPT_DIR: dir });
+      assert.match(r.stderr, /model router unavailable; using emergency table default/, JSON.stringify(route));
+      const got = applied(f, r);
+      assert.deepEqual([got.cli, got.model, got.decided_by], ["claude", "claude-opus-5[1m]", "table"]);
+      assert.equal(existsSync(join(f.root, "SHOULD-NOT-EXECUTE")), false);
+    } finally { f.cleanup(); }
+  }
+});
+
+test("T141: an unroutable primary walks the router's candidates in order, carrying the candidate's effort", () => {
+  // Codex capped: the coder row's fallback list is grok (never confinable, filtered by the router) then Opus.
+  let f = fixture();
+  try {
+    const r = f.dispatch([...f.spawnArgs, "--role", "coder"], { ...policy(f), AIGENTRY_CLI_CAP_CODEX: "0" });
+    assert.match(r.stderr, /codex at cap \(1 live, AIGENTRY_CLI_CAP_CODEX=0\); gpt-6-astra -> opus-5 \(claude\)/);
+    const got = applied(f, r);
+    assert.deepEqual([got.cli, got.model, got.effort, got.decided_by, got.capped_cli],
+      ["claude", "claude-opus-5[1m]", "medium", "table-capped", "codex"]);
+    if (process.platform !== "win32") assert.equal((got as { state?: string }).state, "policy");
+  } finally { f.cleanup(); }
+  // No codex credential file (stat only): skipped like a cap, never a raw seedAuth ENOENT.
+  f = fixture();
+  try {
+    rmSync(join(f.env.CODEX_HOME!, "auth.json"));
+    const r = f.dispatch([...f.spawnArgs, "--role", "coder"]);
+    assert.match(r.stderr, /codex has no credential file; gpt-6-astra -> opus-5 \(claude\)/);
+    assert.doesNotMatch(r.stderr, /ENOENT/);
+    const got = applied(f, r);
+    assert.deepEqual([got.cli, got.decided_by, got.capped_cli], ["claude", "table-capped", "codex"]);
+  } finally { f.cleanup(); }
+});
+
+test("T141: no routable confined candidate refuses with exit 78 before any effect", () => {
+  const f = fixture();
+  try {
+    const r = f.dispatch([...f.spawnArgs, "--role", "coder"], { ...policy(f), AIGENTRY_CLI_CAP_CODEX: "0", AIGENTRY_CLI_CAP_CLAUDE: "0" });
+    assert.equal(r.status, 78, r.stderr);
+    assert.match(r.stderr, /dispatch\.sh: ROUTE_CANDIDATES_EXHAUSTED: codex at cap .*no unconfined fallback\); nothing was spawned/);
+    assert.doesNotMatch(r.stderr, /SANDBOX_PLATFORM_UNSUPPORTED/);
+    for (const effect of [f.env.OPEN_LOG!, f.env.TELEMETRY_LOG!, f.env.PARENT_MODEL_LOG!]) assert.equal(existsSync(effect), false, effect);
+    assert.equal(f.calls(), 0);
+  } finally { f.cleanup(); }
+});
+
+test("T141: an explicit grok/gemini keeps SANDBOX_CLI_UNSUPPORTED with a task class; explicit at cap still spawns", () => {
+  for (const cli of ["grok", "gemini"]) {
+    const f = fixture();
+    try {
+      const r = f.dispatch([...f.spawnArgs, "--cli", cli, "--role", "coder", "--task-class", "integration"], policy(f));
+      assert.equal(r.status, 78, r.stderr);
+      assert.match(r.stderr, new RegExp(`SANDBOX_CLI_UNSUPPORTED: ${cli}`));
+      assert.equal(existsSync(f.env.OPEN_LOG!), false);
+    } finally { f.cleanup(); }
+  }
+  const f = fixture();
+  try {
+    const r = f.dispatch([...f.spawnArgs, "--cli", "codex", "--role", "coder", "--task-class", "integration"],
+      { ...policy(f), AIGENTRY_CLI_CAP_CODEX: "0" });
+    assert.equal(r.stderr.match(/WARNING codex at cap \(1 live, AIGENTRY_CLI_CAP_CODEX=0\); explicit --cli codex spawns anyway/g)?.length, 1);
+    const got = applied(f, r);
+    assert.deepEqual([got.cli, got.model, got.effort, got.decided_by], ["codex", "gpt-6-astra", null, "explicit"]);
   } finally { f.cleanup(); }
 });

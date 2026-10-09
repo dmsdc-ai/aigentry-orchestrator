@@ -27,7 +27,8 @@ import { USAGE } from "./usage.js";
 import { geminiBinary } from "../session/boot-adapter/gemini.js";
 import { isCliKind, type LaunchConfig } from "../session/boot-adapter/types.js";
 import { normalizeLaunch } from "../session/boot-adapter/launch-config.js";
-import { loadWorkerScope, prepareWorkerSandbox, assertConfinedTarget, stageWorkerRef, assertNotCliWrapper } from "../session/worker-sandbox.js";
+import { loadWorkerScope, prepareWorkerSandbox, assertConfinedTarget, stageWorkerRef, assertNotCliWrapper, CONFINED_CLIS } from "../session/worker-sandbox.js";
+import { CLAUDE_OAUTH_OPT_IN } from "../session/claude-worker-oauth.js";
 import { validateSpawnDecision, type SpawnDecision } from "../session/model-decision.js";
 
 // ── environment seams (identical names/defaults to the shell) ────────────────
@@ -361,7 +362,12 @@ export function screenShowsDelivery(post: string, firstLine: string): boolean {
 }
 
 // ── CLI state ───────────────────────────────────────────────────────────────
-interface RouteCandidate { cli: string; model: string; label: string }
+// #1206: bin/model-router.mjs's TOKEN — a `--class` value and a profile effort token.
+const ROUTE_TOKEN = /^[a-z][a-z0-9-]{0,31}$/;
+const validEffort = (c: object): boolean => !Object.hasOwn(c, "effort") ||
+  (typeof (c as { effort?: unknown }).effort === "string" && ROUTE_TOKEN.test((c as { effort: string }).effort));
+
+interface RouteCandidate { cli: string; model: string; label: string; effort?: string }
 
 interface Opts {
   target: string;
@@ -374,11 +380,13 @@ interface Opts {
   name: string;
   cwd: string;
   cli: string;
-  route?: { label: string; model: string; decided_by: string; reason: string; candidates?: RouteCandidate[]; capped_cli?: string };
+  route?: { label: string; model: string; decided_by: string; reason: string; candidates?: RouteCandidate[]; capped_cli?: string; effort?: string };
   worktree: string;
   verifyDelivered: boolean;
   verifyStarted: boolean;
   role: string;
+  /** #1206: the role's task class (router `--class`); "" = the role row. */
+  taskClass: string;
   keepAlive: boolean;
   taskId: string;
   noTask: boolean;
@@ -412,6 +420,7 @@ function parseArgs(argv: string[]): Opts {
     // Rule 33: confirm session actually started working post-inject.
     verifyStarted: true,
     role: "",
+    taskClass: "",
     keepAlive: false,
     taskId: "",
     noTask: false,
@@ -448,6 +457,13 @@ function parseArgs(argv: string[]): Opts {
       case "--worktree": o.worktree = val(a); i += 2; break;
       case "--cli": o.cli = val(a); i += 2; break;
       case "--role": o.role = val(a); i += 2; break;
+      case "--task-class":
+        o.taskClass = val(a); i += 2;
+        if (!ROUTE_TOKEN.test(o.taskClass)) {
+          process.stderr.write("dispatch.sh: --task-class: invalid class (want ^[a-z][a-z0-9-]{0,31}$)\n");
+          process.exit(4);
+        }
+        break;
       case "--task": o.taskId = val(a); i += 2; break;
       case "--no-task": o.noTask = true; o.noTaskReason = val(a); i += 2; break;
       case "--verify-delivered": o.verifyDelivered = true; i += 1; break;
@@ -498,9 +514,10 @@ function resolveRoute(o: Opts, sid: string, skipPreparation: boolean): void {
     o.route = { label: model, model, decided_by: "explicit", reason: "explicit --cli override" };
     return;
   }
+  // #1206 D7: no `--ref`, so the router never calls its classifier; the role (× task class) table decides.
   try {
     const result = spawnSync(process.execPath, [path.join(SCRIPT_DIR, "model-router.mjs"),
-      "--role", o.role, "--ref", o.refFile, "--candidates", "1", "--confined", "1"], {
+      "--role", o.role, ...(o.taskClass ? ["--class", o.taskClass] : []), "--candidates", "1", "--confined", "1"], {
       encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], timeout: 16000, killSignal: "SIGKILL",
     });
     if (result.error || result.status !== 0) throw new Error("router unavailable");
@@ -508,7 +525,8 @@ function resolveRoute(o: Opts, sid: string, skipPreparation: boolean): void {
     if (!["claude", "codex", "grok", "gemini"].includes(route.cli) ||
       !["llm", "table"].includes(route.decided_by) || typeof route.model !== "string" ||
       typeof route.label !== "string" || typeof route.reason !== "string" ||
-      !Array.isArray(route.candidates)) throw new Error("invalid router result");
+      !Array.isArray(route.candidates) || !validEffort(route) ||
+      !route.candidates.every((c: unknown) => typeof c === "object" && c !== null && validEffort(c))) throw new Error("invalid router result");
     o.cli = route.cli;
     o.route = route;
   } catch {
@@ -581,21 +599,52 @@ function cliCap(cli: string): number {
   return Infinity;
 }
 
-/** Fresh spawn only: a routed CLI at cap falls to the next candidate; an explicit --cli warns and proceeds. */
+// #1206 (PLAN §2.3): stat only, nothing is read or run. An executable the resolver would bind by name
+// (`<cli>` in an absolute PATH dir); a declared AIGENTRY_<CLI>_EXECUTABLE is an explicit request the
+// resolver judges itself, never substituted. A credential source seedAuth can copy: codex auth.json;
+// claude's opted-in token handoff, its credentials file, or on darwin the login Keychain (not statable).
+function executablePresent(cli: string): boolean {
+  if (env[`AIGENTRY_${cli.toUpperCase()}_EXECUTABLE`]) return true;
+  return (env.PATH || "").split(path.delimiter).some((dir) => path.isAbsolute(dir) && isExecutable(path.join(dir, cli)));
+}
+
+function credentialPresent(cli: string): boolean {
+  const isFile = (p: string): boolean => { try { return fs.statSync(p).isFile(); } catch { return false; } };
+  if (cli === "codex") return isFile(path.join(env.CODEX_HOME || path.join(os.homedir(), ".codex"), "auth.json"));
+  return !!env[CLAUDE_OAUTH_OPT_IN] || process.platform === "darwin" || isFile(path.join(os.homedir(), ".claude", ".credentials.json"));
+}
+
+/**
+ * Fresh spawn only: a routed CLI that is not routable (at cap, no executable, no credential) falls to the
+ * first routable router candidate, in order; none left refuses (exit 78) — never an unconfined fallback.
+ * An explicit --cli warns at cap and proceeds.
+ */
 function applyCliCap(o: Opts): void {
   if (!o.route || o.route.decided_by === "existing") return;
   const live = liveCliCounts();
   const atCap = (cli: string): boolean => (live[cli] || 0) >= cliCap(cli);
-  if (!atCap(o.cli)) return;
-  const status = `${o.cli} at cap (${live[o.cli] || 0} live, AIGENTRY_CLI_CAP_${o.cli.toUpperCase()}=${cliCap(o.cli)})`;
+  const capStatus = (cli: string): string =>
+    `${cli} at cap (${live[cli] || 0} live, AIGENTRY_CLI_CAP_${cli.toUpperCase()}=${cliCap(cli)})`;
   if (o.route.decided_by === "explicit") {
-    process.stderr.write(`dispatch.sh: WARNING ${status}; explicit --cli ${o.cli} spawns anyway\n`);
+    if (atCap(o.cli)) process.stderr.write(`dispatch.sh: WARNING ${capStatus(o.cli)}; explicit --cli ${o.cli} spawns anyway\n`);
     return;
   }
-  const pick = (o.route.candidates || []).find((c) => !atCap(c.cli)) || EMERGENCY_ROUTE;
+  const unroutable = (cli: string): string | undefined =>
+    !(CONFINED_CLIS as readonly string[]).includes(cli) ? `${cli} is not a confined CLI`
+      : atCap(cli) ? capStatus(cli)
+        : !executablePresent(cli) ? `${cli} has no executable on PATH`
+          : !credentialPresent(cli) ? `${cli} has no credential file` : undefined;
+  const status = unroutable(o.cli);
+  if (!status) return;
+  const pick = (o.route.candidates || []).find((c) => !unroutable(c.cli));
+  if (!pick) {
+    die(`dispatch.sh: ROUTE_CANDIDATES_EXHAUSTED: ${status}; no routable confined candidate after ` +
+      `${printable(o.route.label)} (HOLD; no unconfined fallback); nothing was spawned`, 78);
+  }
   process.stderr.write(`dispatch.sh: ${status}; ${o.route.label} -> ${pick.label} (${pick.cli})\n`);
   o.route = { label: pick.label, model: pick.model, decided_by: `${o.route.decided_by}-capped`,
-    reason: `${status}; router chose ${o.route.label}: ${o.route.reason}`, capped_cli: o.cli };
+    reason: `${status}; router chose ${o.route.label}: ${o.route.reason}`, capped_cli: o.cli,
+    ...(pick.effort !== undefined ? { effort: pick.effort } : {}) };
   o.cli = pick.cli;
 }
 
@@ -610,10 +659,11 @@ const MODEL_ROUTER = fileURLToPath(new URL("../../../bin/model-router.mjs", impo
 const printable = (s: string): string => s.replace(/[^\x20-\x7e]/g, "?").slice(0, 600);
 
 function resolveSpawnDecision(o: Opts, sid: string): void {
-  if (!["claude", "codex"].includes(o.cli) || !o.role || !o.taskId || !o.route) return;
+  if (!(CONFINED_CLIS as readonly string[]).includes(o.cli) || !o.role || !o.taskId || !o.route) return;
   const args = [MODEL_ROUTER, "--resolve", "--cli", o.cli, "--sid", sid, "--task", o.taskId, "--role", o.role];
   if (o.route.decided_by !== "explicit") {
-    args.push("--route-json", JSON.stringify({ model: o.route.model, decided_by: o.route.decided_by }));
+    args.push("--route-json", JSON.stringify({ model: o.route.model, decided_by: o.route.decided_by,
+      ...(o.route.effort !== undefined ? { effort: o.route.effort } : {}) }));
   }
   for (const file of o.observe) args.push("--observe", file);
   const r = spawnSync(process.execPath, args, {
@@ -1157,7 +1207,7 @@ async function waitForReady(o: Opts, sid: string): Promise<number> {
 // ── the spawn arm (#431 / #532) ─────────────────────────────────────────────
 function spawnWorkspace(o: Opts, sid: string): void {
   const scope = loadWorkerScope(env.AIGENTRY_WORKER_SCOPE, o.taskId, sid);
-  if (!o.role || !["claude", "codex"].includes(o.cli)) die(`dispatch.sh: SANDBOX_CLI_UNSUPPORTED: ${o.cli}; no unrestricted fallback`, 78);
+  if (!o.role || !(CONFINED_CLIS as readonly string[]).includes(o.cli)) die(`dispatch.sh: SANDBOX_CLI_UNSUPPORTED: ${o.cli}; no unrestricted fallback`, 78);
   // #1167 P6: no OS sandbox runtime here (win32), so the confined spawn refuses now — after the routing/spawn
   // decision, before boot-prepare stages anything, the git guard is installed or a terminal opens. Same
   // predicate as prepareWorkerSandbox; darwin/linux never enter. The decision is named, non-ASCII escaped.
