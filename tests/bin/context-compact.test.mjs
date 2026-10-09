@@ -23,8 +23,12 @@ const SID = 'orch-t1204';
 const RESTORE_RE = /^CONTEXT SNAPSHOT restored after compact — (.+) \(written [^)]+\)\. Read it, then continue the work it describes\.$/;
 
 const sessions = [];
+// Called once per /api/sessions request before the answer is built: the waiter case drives its busy → idle
+// transitions from here (by request count), so no assertion races the waiter's poll.
+let onProbe = null;
 const server = createServer((req, res) => {
   if (req.url.split('?')[0] !== '/api/sessions') { res.writeHead(404).end(); return; }
+  if (onProbe) onProbe();
   res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(sessions));
 });
 await new Promise((ok) => server.listen(0, '127.0.0.1', ok));
@@ -102,21 +106,34 @@ test('claude: injects /compact into its own session and starts no waiter', { ski
 // grok is here too: its PostCompact hook is passive (stdout never reaches the model), so no native restore.
 for (const [cli, command] of [['codex', '/opt/homebrew/bin/codex'], ['grok', '/Users/x/.grok/bin/grok']]) {
 test(`${cli}: injects /compact, then the waiter restores the snapshot after busy → idle`, { skip: noBash || (WIN && 'win32: no detached waiter (no setsid); the instruction backstop applies') }, async (t) => {
-  const ws = workspace(); t.after(() => rmSync(ws.dir, { recursive: true, force: true }));
+  const ws = workspace(); t.after(() => { onProbe = null; rmSync(ws.dir, { recursive: true, force: true }); });
   setSession(command);
+  // Probe 1 is the script's own CLI lookup; the waiter then sees idle-but-never-busy on probes 2–4, busy
+  // on 5–7 and idle again from 8. The waiter probes strictly one after another, so when probe N arrives it
+  // has fully acted on answer N-1: the stub's call count read here is exact, whatever the clock says.
+  let probes = 0;
+  const seen = {};
+  onProbe = () => {
+    probes += 1;
+    if (probes === 5) {
+      seen.beforeBusy = calls(ws).length;
+      setSession(cli, { ready: false, idleSeconds: 0, lastActivityAt: '2026-10-09T00:00:05Z' });
+    } else if (probes === 8) {
+      seen.whileBusy = calls(ws).length;
+      setSession(cli, { ready: true, idleSeconds: 6, lastActivityAt: '2026-10-09T00:00:05Z' });
+    }
+  };
   const r = await run(ws);
   assert.equal(r.status, 0, r.out);
   assert.deepEqual(calls(ws), [['inject', '--submit', '--from', SID, SID, '/compact']]);
   assert.ok(await waitFor(() => existsSync(ws.log) && /waiter pid=/.test(readFileSync(ws.log, 'utf8')), 10000), 'waiter started');
   rememberWaiter(ws);
-  // Idle from the start but never seen busy: no restore yet.
-  await sleep(1000);
-  assert.equal(calls(ws).length, 1, 'restore must wait for the compaction to run');
-  setSession(cli, { ready: false, idleSeconds: 0, lastActivityAt: '2026-10-09T00:00:05Z' });
-  await sleep(600);
-  assert.equal(calls(ws).length, 1, 'no restore while busy');
-  setSession(cli, { ready: true, idleSeconds: 6, lastActivityAt: '2026-10-09T00:00:05Z' });
-  assert.ok(await waitFor(() => calls(ws).length === 2, 30000), `restore injected; log:\n${existsSync(ws.log) ? readFileSync(ws.log, 'utf8') : ''}`);
+  const log = () => (existsSync(ws.log) ? readFileSync(ws.log, 'utf8') : '');
+  // The stub records the call before the waiter logs it: wait for both, bounded.
+  assert.ok(await waitFor(() => calls(ws).length === 2 && /restore injected/.test(log()), 30000), `restore injected; probes=${probes}; log:\n${log()}`);
+  assert.equal(seen.beforeBusy, 1, 'restore must wait for the compaction to run');
+  assert.equal(seen.whileBusy, 1, 'no restore while busy');
+  assert.equal(probes, 8, 'the restore follows the first idle answer after busy, and the waiter then stops polling');
   const [verb, submit, from, fromSid, target, line] = calls(ws)[1];
   assert.deepEqual([verb, submit, from, fromSid, target], ['inject', '--submit', '--from', SID, SID]);
   const m = RESTORE_RE.exec(line);
@@ -167,4 +184,44 @@ test('stale snapshot: exit 3 and no inject', { skip: noBash }, async (t) => {
   assert.equal(r.status, 3, r.out);
   assert.match(r.out, /refresh it before compacting/);
   assert.deepEqual(calls(ws), []);
+});
+
+// ubuntu-latest CI died with `line 86: File: unbound variable`: on GNU coreutils `stat -f` is --file-system,
+// so the BSD form `stat -f %m` printed a "  File: ..." block into $(( )). Emulate the Linux userland on any
+// POSIX host — uname says Linux, setsid exists, stat has GNU semantics — so that path runs here too.
+// win32 skips by name: Git for Windows bash ships GNU stat already, so the cases above run that path there.
+test('Linux userland (GNU stat, setsid): injects /compact and starts the waiter through setsid', { skip: noBash || (WIN && 'win32: Git for Windows already ships GNU stat; no setsid waiter there') }, async (t) => {
+  const ws = workspace(); t.after(() => rmSync(ws.dir, { recursive: true, force: true }));
+  const bin = join(ws.dir, 'linux-bin');
+  mkdirSync(bin);
+  const tool = (name, body) => { writeFileSync(join(bin, name), `#!/usr/bin/env bash\n${body}\n`); chmodSync(join(bin, name), 0o755); };
+  const setsidArgv = join(ws.dir, 'setsid-argv.txt');
+  tool('uname', 'echo Linux');
+  tool('setsid', `printf '%s\\n' "$@" > '${setsidArgv}'\nexec "$@"`);
+  // GNU stat: -c FORMAT prints %Y as the mtime; -f is --file-system and takes every operand as a file.
+  tool('stat', [
+    'case "$1" in',
+    '  -c) [ "$2" = %Y ] || exit 2',
+    '      exec node -e \'process.stdout.write(Math.floor(require("fs").statSync(process.argv[1]).mtimeMs / 1000) + "\\n")\' "$3" ;;',
+    '  -f) shift; rc=0',
+    '      for f in "$@"; do',
+    '        if [ -e "$f" ]; then printf \'  File: "%s"\\n    ID: 0        Namelen: 255     Type: ext2/ext3\\n\' "$f"',
+    '        else echo "stat: cannot read file system information for \'$f\': No such file or directory" >&2; rc=1; fi',
+    '      done; exit $rc ;;',
+    '  *) exit 2 ;;',
+    'esac',
+  ].join('\n'));
+  setSession('/usr/bin/codex');
+  const r = await run(ws, { PATH: `${bin}:${process.env.PATH}` });
+  assert.equal(r.status, 0, r.out);
+  assert.deepEqual(calls(ws), [['inject', '--submit', '--from', SID, SID, '/compact']]);
+  assert.match(r.out, /snapshot is \d+s old/);
+  assert.ok(await waitFor(() => existsSync(ws.log) && /waiter pid=/.test(readFileSync(ws.log, 'utf8')), 10000), 'waiter started');
+  rememberWaiter(ws);
+  try { process.kill(waiterPids.at(-1), 'SIGTERM'); } catch { /* already exited */ }
+  assert.ok(existsSync(setsidArgv), 'the waiter went through setsid');
+  const argv = readFileSync(setsidArgv, 'utf8').split('\n').filter(Boolean);
+  assert.equal(argv[0], 'bash');
+  assert.match(argv[1], /\/bin\/context-compact\.sh$/);
+  assert.deepEqual(argv.slice(2), ['--wait-and-restore', SID, fwd(ws.snap)]);
 });

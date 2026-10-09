@@ -83,7 +83,9 @@ wait_and_restore() {
 if [ "${1:-}" = "--wait-and-restore" ]; then wait_and_restore "$2" "$3"; exit $?; fi
 
 if [ ! -f "$snap" ]; then echo "context-compact: no snapshot at $snap — write it first" >&2; exit 3; fi
-age=$(( $(date +%s) - $(stat -f %m "$snap" 2>/dev/null || stat -c %Y "$snap") ))
+# GNU form first: GNU `stat -f` is --file-system and prints a "File: ..." report into $(( )) (#1204);
+# BSD stat refuses -c with nothing on stdout.
+age=$(( $(date +%s) - $(stat -c %Y "$snap" 2>/dev/null || stat -f %m "$snap") ))
 if [ "$age" -gt "$max_age" ]; then
   echo "context-compact: snapshot is ${age}s old (limit ${max_age}s) — refresh it before compacting" >&2; exit 3
 fi
