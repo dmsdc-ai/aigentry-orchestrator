@@ -362,12 +362,21 @@ export function withSeccompHelperRead(config: SandboxRuntimeConfig, platform: No
 /**
  * #652: the preflight's deny probe, as script source. sandbox-exec refuses a denied path with
  * EPERM/EACCES; bwrap masks a denied directory with an empty tmpfs, so on Linux only, ENOENT on a
- * canary the runner has asserted exists on the host is the denial too. Success exits 71 (readable);
- * any other error is thrown, a hard failure.
+ * canary the runner has asserted exists on the host is the denial too. bwrap hides content instead of
+ * failing the call, so on Linux only: a readFile whose content is not the host's canary `x`, a readdir
+ * whose listing lacks `x`, and a writeFile refused EROFS are denials. A Linux writeFile that succeeds
+ * lands in that tmpfs, so it is not 71 here: the runner refuses it host-side if the canary's bytes changed.
+ * Any other success exits 71 (readable); any other error is thrown, a hard failure. Either way the probe's token `t` and the
+ * outcome go to stderr first, so the preflight failure names the probe.
  */
 export function preflightDenyProbe(platform: NodeJS.Platform): string {
-  const codes = platform === "linux" ? ["EPERM", "EACCES", "ENOENT"] : ["EPERM", "EACCES"];
-  return `const deny=f=>{try{f();process.exit(71)}catch(e){if(!${JSON.stringify(codes)}.includes(e.code))throw e}};`;
+  const linux = platform === "linux";
+  const base = linux ? ["EPERM", "EACCES", "ENOENT"] : ["EPERM", "EACCES"];
+  const codes = { readFile: base, writeFile: linux ? [...base, "EROFS"] : base, readdir: base, stat: base, lstat: base };
+  // Double quotes only: the runner's shell quoting must leave this source verbatim.
+  const hidden = linux ? 't==="readFile"&&r!==x||t==="readdir"&&!r.includes(x)||t==="writeFile"' : "false";
+  return `const deny=(t,f,x)=>{let r;try{r=f()}catch(e){if(${JSON.stringify(codes)}[t].includes(e.code))return;` +
+    `fs.writeSync(2,t+":"+e.code+" ");throw e}if(${hidden})return;fs.writeSync(2,t+":readable ");process.exit(71)};`;
 }
 
 export function assertConfinedTarget(stagingRoot: string, sid: string, task: string): void {

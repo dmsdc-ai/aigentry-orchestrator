@@ -115,7 +115,7 @@ process.stdout.write(JSON.stringify({ result, error, counters }) + "\\n");
 // preflight with a recorder child, runs the worker command unconfined.
 const FAKE_SRT = `import fs from "node:fs";
 const E = process.env, LOG = E.FAKE_SRT_LOG, PRE = E.FAKE_PREFLIGHT_RECORD, WREC = E.FAKE_WORKER_RECORD, EXP = E.FAKE_EXPECT_FILE;
-const PF_EXIT = E.FAKE_PREFLIGHT_EXIT || "0", BASH = E.FAKE_BASH || "/bin/bash";
+const PF_EXIT = E.FAKE_PREFLIGHT_EXIT || "0", BASH = E.FAKE_BASH || "/bin/bash", LEAK = E.FAKE_PREFLIGHT_LEAK;
 const log = (o) => { if (LOG) fs.appendFileSync(LOG, JSON.stringify(o) + "\\n"); };
 const has = () => "${CC}" in process.env;
 const REC = "const fs=require(\\"fs\\");let x=null;try{x=fs.readFileSync(process.env.FAKE_EXPECT_FILE,\\"utf8\\")}catch{}" +
@@ -128,6 +128,7 @@ export const SandboxManager = {
   wrapWithSandboxArgv: async (cmd, shell, a, b, cwd, o) => {
     const pre = String(o && o.commandId).endsWith(":preflight");
     log({ ev: "wrap", pre, env: has(), cmd });
+    if (pre && LEAK) fs.appendFileSync(LEAK, "changed");
     return pre ? { argv: [process.execPath, "-e", REC, PRE], env: { FAKE_EXPECT_FILE: EXP, FAKE_PREFLIGHT_EXIT: PF_EXIT } }
       : { argv: [BASH, "-c", cmd], env: { FAKE_RECORD: WREC, FAKE_EXPECT_FILE: EXP } };
   },
@@ -587,26 +588,58 @@ test("runner (fake SRT): initialize gets the sealed config, plus the runtime's v
 });
 
 // #652 deny classifier (pure, every OS): the exact probe source the runner embeds, evaluated per platform in a vm
-// whose process.exit only records. sandbox-exec refuses with EPERM/EACCES; bwrap masks a denied directory with an
-// empty tmpfs, so ENOENT is the denial on Linux only. Classification only, never confinement.
-test("pure preflightDenyProbe: denied (EPERM/EACCES, ENOENT on Linux only), success exits 71, any other error throws", () => {
-  const outcome = (platform: NodeJS.Platform, code?: string): string => {
-    const exits: number[] = [];
-    const deny = runInNewContext(`${preflightDenyProbe(platform)}deny`,
-      { process: { exit: (c: number) => { exits.push(c); } } }) as (f: () => void) => void;
+// whose process.exit and fs.writeSync only record. sandbox-exec refuses with EPERM/EACCES. bwrap hides instead of
+// failing: a denied directory is an empty tmpfs (ENOENT, empty listing, a write lands in it), a denied file a read-only
+// /dev/null (empty content, EROFS on write), so those are denials on Linux only. Classification only, never confinement.
+test("pure preflightDenyProbe: errno denials, Linux-only hiding denials, readable exits 71 and any other error throws, both naming the probe", () => {
+  const CANARY = "sandbox boundary canary; not a user secret\n";
+  const outcome = (platform: NodeJS.Platform, t: string, act: { code?: string; ret?: unknown }, x?: string): string => {
+    const exits: number[] = [], err: string[] = [];
+    const deny = runInNewContext(`${preflightDenyProbe(platform)}deny`, {
+      process: { exit: (c: number) => { exits.push(c); } },
+      fs: { writeSync: (fd: number, s: string) => { err.push(`${fd}>${s}`); } },
+    }) as (t: string, f: () => unknown, x?: string) => void;
     try {
-      deny(() => { if (code) throw Object.assign(new Error(code), { code }); });
+      deny(t, () => { if (act.code) throw Object.assign(new Error(act.code), { code: act.code }); return act.ret; }, x);
     } catch (e) {
-      return `throws ${String((e as { code?: string }).code)}`;
+      return `throws ${String((e as { code?: string }).code)} ${err.join("")}`;
     }
-    return exits.length ? `exit ${exits.join(",")}` : "denied";
+    return exits.length ? `exit ${exits.join(",")} ${err.join("")}` : `denied${err.join("")}`;
   };
   for (const platform of ["darwin", "linux", "win32"] as const) {
-    assert.equal(outcome(platform), "exit 71", `${platform}: readable`);
-    for (const code of ["EPERM", "EACCES"]) assert.equal(outcome(platform, code), "denied", `${platform}: ${code}`);
-    assert.equal(outcome(platform, "ENOENT"), platform === "linux" ? "denied" : "throws ENOENT", `${platform}: ENOENT`);
-    for (const code of ["EIO", "EROFS", "ENOTDIR"]) assert.equal(outcome(platform, code), `throws ${code}`, `${platform}: ${code}`);
+    const linux = platform === "linux", hidden = (t: string): string => linux ? "denied" : `exit 71 2>${t}:readable `;
+    for (const t of ["readFile", "writeFile", "readdir", "stat", "lstat"]) {
+      for (const code of ["EPERM", "EACCES"]) assert.equal(outcome(platform, t, { code }), "denied", `${platform} ${t}: ${code}`);
+      assert.equal(outcome(platform, t, { code: "ENOENT" }), linux ? "denied" : `throws ENOENT 2>${t}:ENOENT `, `${platform} ${t}: ENOENT`);
+      assert.equal(outcome(platform, t, { code: "EROFS" }), linux && t === "writeFile" ? "denied" : `throws EROFS 2>${t}:EROFS `,
+        `${platform} ${t}: EROFS`);
+      for (const code of ["EIO", "ENOTDIR"]) assert.equal(outcome(platform, t, { code }), `throws ${code} 2>${t}:${code} `, `${platform} ${t}: ${code}`);
+    }
+    // readFile: only the host's canary text is readable; empty (/dev/null) or other content is hidden on Linux.
+    assert.equal(outcome(platform, "readFile", { ret: CANARY }, CANARY), "exit 71 2>readFile:readable ", `${platform}: canary read`);
+    assert.equal(outcome(platform, "readFile", { ret: "" }, CANARY), hidden("readFile"), `${platform}: empty content`);
+    assert.equal(outcome(platform, "readFile", { ret: "other\n" }, CANARY), hidden("readFile"), `${platform}: other content`);
+    // writeFile: a successful write is 71 off Linux; on Linux it lands in bwrap's tmpfs and the runner checks the host.
+    assert.equal(outcome(platform, "writeFile", { ret: undefined }), hidden("writeFile"), `${platform}: write`);
+    // readdir: only a listing that contains the child is readable; an empty tmpfs listing is hidden on Linux.
+    assert.equal(outcome(platform, "readdir", { ret: ["synthetic.txt"] }, "synthetic.txt"), "exit 71 2>readdir:readable ",
+      `${platform}: listing with the child`);
+    assert.equal(outcome(platform, "readdir", { ret: [] }, "synthetic.txt"), hidden("readdir"), `${platform}: empty listing`);
+    assert.equal(outcome(platform, "readdir", { ret: ["other.txt"] }, "synthetic.txt"), hidden("readdir"), `${platform}: listing without the child`);
+    for (const t of ["stat", "lstat"]) assert.equal(outcome(platform, t, { ret: {} }), `exit 71 2>${t}:readable `, `${platform}: ${t}`);
   }
+});
+
+// #652: a preflight that exits 0 but changed the host canary (a write that reached the host) refuses. MOCK BOUNDARY:
+// the fake appends to the canary host-side when wrapping the preflight; without that every fake preflight passes.
+test("runner (fake SRT): a preflight that changed the host canary refuses writeFile:leaked, no worker, no receipt", () => {
+  const W = world(), p = prepare(W, "lk1");
+  if (WIN) return refusedOnWin(W, p);
+  const r = runRunner(W, p.manifest, p.hash, [], { FAKE_PREFLIGHT_LEAK: String(p.m.probeFile) });
+  assert.equal(r.status, 78);
+  assert.match(r.stderr, /\[sandbox\] REFUSED: SANDBOX_PREFLIGHT_FAILED: writeFile:leaked\n$/);
+  assert.equal(r.worker, null);
+  assert.equal(existsSync(join(dirname(p.manifest), "receipt.json")), false);
 });
 
 // The built runner's preflight carries exactly this platform's probe. MOCK BOUNDARY: the fake records the wrapped
@@ -628,8 +661,8 @@ test("runner (fake SRT): the preflight command embeds preflightDenyProbe(process
 // read deny exists, so stat/lstat of the directory canary is allowed and only readdir of it and
 // stat/lstat of the file inside it can be required. Mutation: the 2026-10-04 (ef40fdf) deny set,
 // which required stat/lstat of the directory itself, must still fail with 71 on the same manifest.
-const NEW_DENIES = /deny\(\(\)=>fs\.readdirSync\(process\.argv\[3\]\)\);\s*deny\(\(\)=>fs\.statSync\(process\.argv\[3\]\+'\/synthetic\.txt'\)\);\s*deny\(\(\)=>fs\.lstatSync\(process\.argv\[3\]\+'\/synthetic\.txt'\)\);/;
-const OLD_DENIES = "deny(()=>fs.statSync(process.argv[3]));deny(()=>fs.lstatSync(process.argv[3]));deny(()=>fs.readdirSync(process.argv[3]));";
+const NEW_DENIES = /deny\('readdir',\(\)=>fs\.readdirSync\(process\.argv\[3\]\),'synthetic\.txt'\);\s*deny\('stat',\(\)=>fs\.statSync\(process\.argv\[3\]\+'\/synthetic\.txt'\)\);\s*deny\('lstat',\(\)=>fs\.lstatSync\(process\.argv\[3\]\+'\/synthetic\.txt'\)\);/;
+const OLD_DENIES = "deny('stat',()=>fs.statSync(process.argv[3]));deny('lstat',()=>fs.lstatSync(process.argv[3]));deny('readdir',()=>fs.readdirSync(process.argv[3]),'synthetic.txt');";
 if (process.platform === "darwin") test("live macOS confinement preflight passes on the real SRT; the old directory-stat deny set fails 71", () => {
   const W = world();
   W.sessions = join(W.host, ".aigentry", "sessions");
@@ -652,7 +685,7 @@ if (process.platform === "darwin") test("live macOS confinement preflight passes
   writeFileSync(mutant, src.replace(NEW_DENIES, OLD_DENIES));
   const old = live(mutant);
   assert.equal(old.status, 78, old.stderr);
-  assert.match(old.stderr, /\[sandbox\] REFUSED: SANDBOX_PREFLIGHT_FAILED: 71 /);
+  assert.match(old.stderr, /\[sandbox\] REFUSED: SANDBOX_PREFLIGHT_FAILED: 71 stat:readable /);
   // 71 is also sandbox-exec's own exit when it cannot apply a profile (nested sandbox); that is not this.
   assert.doesNotMatch(old.stderr, /sandbox_apply/);
 });

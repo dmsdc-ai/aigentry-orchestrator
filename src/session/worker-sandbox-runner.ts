@@ -88,17 +88,21 @@ async function main(): Promise<void> {
     const sentinel = path.join(m.env.TMPDIR!, "preflight.txt");
     const script = `const fs=require('fs'),net=require('net');
       ${preflightDenyProbe(process.platform)}
-      deny(()=>fs.readFileSync(process.argv[1]));
-      deny(()=>fs.writeFileSync(process.argv[1],'changed'));
-      deny(()=>fs.readdirSync(process.argv[3]));
-      deny(()=>fs.statSync(process.argv[3]+'/synthetic.txt'));
-      deny(()=>fs.lstatSync(process.argv[3]+'/synthetic.txt'));
+      deny('readFile',()=>fs.readFileSync(process.argv[1],'utf8'),process.argv[4]);
+      deny('writeFile',()=>fs.writeFileSync(process.argv[1],'changed'));
+      deny('readdir',()=>fs.readdirSync(process.argv[3]),'synthetic.txt');
+      deny('stat',()=>fs.statSync(process.argv[3]+'/synthetic.txt'));
+      deny('lstat',()=>fs.lstatSync(process.argv[3]+'/synthetic.txt'));
       fs.writeFileSync(process.argv[2],'ok'); fs.unlinkSync(process.argv[2]);
       const s=net.connect({host:'127.0.0.1',port:3848});
       s.on('connect',()=>process.exit(72)); s.on('error',e=>process.exit(['EPERM','EACCES'].includes(e.code)?0:73));
       setTimeout(()=>process.exit(74),3000);`;
-    const check = await run(m, [process.execPath, "-e", script, m.probeFile, sentinel, m.probeDirectory], true);
+    // The host's canary text: on Linux a read inside the sandbox is readable only if it returns exactly this.
+    const canary = fs.readFileSync(m.probeFile, "utf8");
+    const check = await run(m, [process.execPath, "-e", script, m.probeFile, sentinel, m.probeDirectory, canary], true);
     if (check.code !== 0) throw new Error(`SANDBOX_PREFLIGHT_FAILED: ${check.code} ${check.output}`);
+    // A Linux write the probe accepted (into bwrap's tmpfs) must not have reached the host canary.
+    if (fs.readFileSync(m.probeFile, "utf8") !== canary) throw new Error("SANDBOX_PREFLIGHT_FAILED: writeFile:leaked");
     process.stderr.write(`[sandbox] ${m.sid} task=${m.task} attempt=${m.attempt} OS confinement preflight passed\n`);
     if (process.argv[4] === "--preflight-only") return;
     // Token goes to the worker child env only: not process.env, not m.env, not preflight.
