@@ -1,0 +1,25 @@
+name: bwrap probe (652)
+on:
+  push:
+    branches: [ci/652-bwrap-probe]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+      - name: environment
+        run: |
+          bwrap --version; ls -l "$(command -v bwrap)"; uname -r; lsb_release -ds
+          cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns || true
+          cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || true
+          ls /etc/apparmor.d/ | grep -i -E "bwrap|userns" || true
+      - name: A — as-is
+        run: bwrap --unshare-net --ro-bind / / --dev /dev --proc /proc -- /bin/true && echo "A OK" || echo "A FAIL $?"
+      - name: B — sysctl apparmor_restrict_unprivileged_userns=0
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; bwrap --unshare-net --ro-bind / / --dev /dev --proc /proc -- /bin/true && echo "B OK" || echo "B FAIL $?"
+      - name: C — remove the bwrap-userns-restrict AppArmor profile
+        run: |
+          if [ -f /etc/apparmor.d/bwrap-userns-restrict ]; then sudo apparmor_parser -R /etc/apparmor.d/bwrap-userns-restrict && echo removed; fi
+          bwrap --unshare-net --ro-bind / / --dev /dev --proc /proc -- /bin/true && echo "C OK" || echo "C FAIL $?"
+      - name: D — unshare-net without loopback (bwrap keeps lo down)
+        run: bwrap --unshare-net --ro-bind / / --dev /dev --proc /proc -- /bin/sh -c 'ip addr 2>/dev/null | head -5; true' && echo "D OK" || echo "D FAIL $?"
