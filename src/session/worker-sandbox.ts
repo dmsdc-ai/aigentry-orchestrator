@@ -359,6 +359,17 @@ export function withSeccompHelperRead(config: SandboxRuntimeConfig, platform: No
     allowRead: [...(config.filesystem.allowRead ?? []), path.join(runtimeDir, "vendor", "seccomp")] } };
 }
 
+/**
+ * #652: the preflight's deny probe, as script source. sandbox-exec refuses a denied path with
+ * EPERM/EACCES; bwrap masks a denied directory with an empty tmpfs, so on Linux only, ENOENT on a
+ * canary the runner has asserted exists on the host is the denial too. Success exits 71 (readable);
+ * any other error is thrown, a hard failure.
+ */
+export function preflightDenyProbe(platform: NodeJS.Platform): string {
+  const codes = platform === "linux" ? ["EPERM", "EACCES", "ENOENT"] : ["EPERM", "EACCES"];
+  return `const deny=f=>{try{f();process.exit(71)}catch(e){if(!${JSON.stringify(codes)}.includes(e.code))throw e}};`;
+}
+
 export function assertConfinedTarget(stagingRoot: string, sid: string, task: string): void {
   if (!identity.test(sid)) throw new Error("SANDBOX_TARGET_SID");
   const current = JSON.parse(fs.readFileSync(path.join(stagingRoot, "sandbox-current.json"), "utf8"));

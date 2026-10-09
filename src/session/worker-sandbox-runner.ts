@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
-import { assertExecutableIdentity, quote, readSealedManifest, withSeccompHelperRead, type WorkerManifest } from "./worker-sandbox.js";
+import { assertExecutableIdentity, preflightDenyProbe, quote, readSealedManifest, withSeccompHelperRead, type WorkerManifest } from "./worker-sandbox.js";
 import { CLAUDE_OAUTH_CHILD, CLAUDE_OAUTH_DIR, CLAUDE_OAUTH_FILE, readClaudeOAuthHandoff } from "./claude-worker-oauth.js";
 
 async function run(m: WorkerManifest, command: string[], capture = false,
@@ -61,10 +61,13 @@ async function main(): Promise<void> {
   // replays this same manifest) and again right before exec; a replaced file refuses.
   if (m.executable) assertExecutableIdentity(m.executable, m.command[0]!);
   if (!SandboxManager.isSupportedPlatform()) throw new Error("SANDBOX_PLATFORM_UNSUPPORTED");
-  // A legacy or unusable canary cannot attest the metadata boundary.
+  // A legacy or unusable canary cannot attest the metadata boundary. The probed files must exist
+  // on the host: on Linux the deny probe reads ENOENT inside the sandbox as the denial.
   try {
     if (!m.probeDirectory || !path.isAbsolute(m.probeDirectory) ||
       !fs.lstatSync(m.probeDirectory).isDirectory()) throw new Error("invalid canary");
+    if (!fs.lstatSync(m.probeFile).isFile() ||
+      !fs.lstatSync(path.join(m.probeDirectory, "synthetic.txt")).isFile()) throw new Error("invalid canary");
   } catch {
     throw new Error("SANDBOX_METADATA_CANARY_REQUIRED");
   }
@@ -84,7 +87,7 @@ async function main(): Promise<void> {
     // boundary this preflight can require without refusing every spawn on that platform.
     const sentinel = path.join(m.env.TMPDIR!, "preflight.txt");
     const script = `const fs=require('fs'),net=require('net');
-      const deny=f=>{try{f();process.exit(71)}catch(e){if(!['EPERM','EACCES'].includes(e.code))throw e}};
+      ${preflightDenyProbe(process.platform)}
       deny(()=>fs.readFileSync(process.argv[1]));
       deny(()=>fs.writeFileSync(process.argv[1],'changed'));
       deny(()=>fs.readdirSync(process.argv[3]));

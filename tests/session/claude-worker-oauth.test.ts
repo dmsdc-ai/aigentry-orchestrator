@@ -26,7 +26,8 @@ import { tmpdir } from "node:os";
 import { delimiter, dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
-import { withSeccompHelperRead } from "../../src/session/worker-sandbox.js";
+import { runInNewContext } from "node:vm";
+import { preflightDenyProbe, withSeccompHelperRead } from "../../src/session/worker-sandbox.js";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..", "..", "..");
 const BOOT = join(REPO_ROOT, "bin", "boot-prepare.mjs");
@@ -475,6 +476,9 @@ test("metadata canary missing/not-a-directory/symlink refuses before any token r
     missing: (d) => rmSync(d, { recursive: true }),
     file: (d) => { rmSync(d, { recursive: true }); writeFileSync(d, "x\n", { mode: 0o600 }); },
     symlink: (d) => { renameSync(d, `${d}.real`); symlinkSync(`${d}.real`, d); },
+    // #652: on Linux the deny probe reads ENOENT as the denial, so every probed file must exist on the host.
+    "file-canary-missing": (d) => rmSync(join(dirname(d), "outside-canary.txt")),
+    "synthetic-missing": (d) => rmSync(join(d, "synthetic.txt")),
   };
   for (const [name, brk] of Object.entries(breakers)) {
     for (const opted of [false, true]) {
@@ -580,6 +584,41 @@ test("runner (fake SRT): initialize gets the sealed config, plus the runtime's v
   const init = r.srt.filter((e) => e.ev === "initialize");
   assert.equal(init.length, 1);
   assert.deepEqual(init[0]?.config, withSeccompHelperRead(p.m.config as SandboxRuntimeConfig, process.platform, rt));
+});
+
+// #652 deny classifier (pure, every OS): the exact probe source the runner embeds, evaluated per platform in a vm
+// whose process.exit only records. sandbox-exec refuses with EPERM/EACCES; bwrap masks a denied directory with an
+// empty tmpfs, so ENOENT is the denial on Linux only. Classification only, never confinement.
+test("pure preflightDenyProbe: denied (EPERM/EACCES, ENOENT on Linux only), success exits 71, any other error throws", () => {
+  const outcome = (platform: NodeJS.Platform, code?: string): string => {
+    const exits: number[] = [];
+    const deny = runInNewContext(`${preflightDenyProbe(platform)}deny`,
+      { process: { exit: (c: number) => { exits.push(c); } } }) as (f: () => void) => void;
+    try {
+      deny(() => { if (code) throw Object.assign(new Error(code), { code }); });
+    } catch (e) {
+      return `throws ${String((e as { code?: string }).code)}`;
+    }
+    return exits.length ? `exit ${exits.join(",")}` : "denied";
+  };
+  for (const platform of ["darwin", "linux", "win32"] as const) {
+    assert.equal(outcome(platform), "exit 71", `${platform}: readable`);
+    for (const code of ["EPERM", "EACCES"]) assert.equal(outcome(platform, code), "denied", `${platform}: ${code}`);
+    assert.equal(outcome(platform, "ENOENT"), platform === "linux" ? "denied" : "throws ENOENT", `${platform}: ENOENT`);
+    for (const code of ["EIO", "EROFS", "ENOTDIR"]) assert.equal(outcome(platform, code), `throws ${code}`, `${platform}: ${code}`);
+  }
+});
+
+// The built runner's preflight carries exactly this platform's probe. MOCK BOUNDARY: the fake records the wrapped
+// command and never runs it.
+test("runner (fake SRT): the preflight command embeds preflightDenyProbe(process.platform)", () => {
+  const W = world(), p = prepare(W, "dp1");
+  if (WIN) return refusedOnWin(W, p);
+  const r = runRunner(W, p.manifest, p.hash, ["--preflight-only"]);
+  assert.equal(r.status, 0, r.stderr);
+  const wrap = r.srt.filter((e) => e.ev === "wrap" && e.pre === true);
+  assert.equal(wrap.length, 1);
+  assert.ok(String(wrap[0]?.cmd).includes(preflightDenyProbe(process.platform)));
 });
 
 // #652 LIVE, darwin only (registered only there; Linux and win32 collect no test, so no skip): the
