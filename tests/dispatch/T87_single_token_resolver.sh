@@ -20,7 +20,10 @@
 #      freezes its token at module load from that same file and can never see one
 #      (daemon.js:33 → http-auth.js closure; its launchd plist supplies only PATH),
 #      so honouring an env var would send a token the daemon does not expect;
-#   5. exactly one `authToken` reader exists under bin/.
+#   5. exactly one `authToken` reader exists under bin/;
+#   6. (#1214) exactly one HTTP door, `telepty_curl`, defined in the same lib, and all
+#      five daemon HTTP callers go through it — none builds the header into curl argv.
+#      Its runtime behaviour is tests/dispatch/telepty-http-auth.test.mjs's subject.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
@@ -107,18 +110,30 @@ defs=$(grep -rlE '^[[:space:]]*(function[[:space:]]+)?telepty_auth_token[[:space
   || { echo "--- files defining telepty_auth_token ---" >&2; printf '%s\n' "$defs" >&2
        fail "telepty_auth_token must be defined once, in $LIB"; }
 
-# ── both call sites route through the shared resolver ───────────────────────
+# ── (6) every call site routes through the shared HTTP door ─────────────────
 # The tracker's poll lives in src/tracker/cli.ts (#899 tranche 1b) and the cleanup
 # DELETE in src/cleanup/cli.ts (#899 tranche 2a) — bin/dispatch-tracker.sh and
 # bin/session-cleanup.sh are exec shims now, so the file that resolves the
-# credential is the one asserted. Both invoke telepty_auth_token as the shell
-# function it is rather than re-reading the config, which is what keeps assertion
-# (5) above — one authToken reader under bin/ — literally true.
-for caller in src/tracker/cli.ts src/cleanup/cli.ts; do
-  grep -q 'telepty_auth_token' "$REPO_ROOT/$caller" \
-    || fail "$caller does not use the shared resolver"
-  grep -q 'lib/telepty-auth.sh' "$REPO_ROOT/$caller" \
+# credential is the one asserted. #1214: the five callers no longer hold the token
+# at all — each invokes telepty_curl, which resolves it through telepty_auth_token
+# inside the lib and hands it to curl on stdin. That is what keeps assertion (5)
+# above — one authToken reader under bin/ — literally true, and what keeps the token
+# out of curl's argv and out of Node memory.
+defs=$(grep -rlE '^[[:space:]]*(function[[:space:]]+)?telepty_curl[[:space:]]*\(\)' \
+  "$REPO_ROOT/bin" 2>/dev/null | sort || true)
+[ "$defs" = "$LIB" ] \
+  || { echo "--- files defining telepty_curl ---" >&2; printf '%s\n' "$defs" >&2
+       fail "telepty_curl must be defined once, in $LIB"; }
+for caller in src/tracker/cli.ts src/cleanup/cli.ts src/orchestrator-boot/cli.ts \
+              bin/context-compact.sh bin/lib/telepty-listing.sh; do
+  grep -q 'telepty_curl' "$REPO_ROOT/$caller" \
+    || fail "$caller does not use the shared HTTP door telepty_curl"
+  grep -q 'telepty-auth.sh' "$REPO_ROOT/$caller" \
     || fail "$caller does not source lib/telepty-auth.sh"
+  # The two shapes the argv credential took: bash `-H "x-telepty-token: $(…)"` and
+  # TS `` `x-telepty-token: ${…}` ``.
+  grep -qE -- '-H[[:space:]]+"x-telepty-token:[[:space:]]*\$\(|x-telepty-token:[[:space:]]*\$\{' "$REPO_ROOT/$caller" \
+    && fail "$caller still builds the credential into curl's argv (#1214)"
 done
 
 echo "T87 PASS"

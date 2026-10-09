@@ -54,7 +54,6 @@ const TRACKER_SID = env.TRACKER_FROM_SID || "dispatch-tracker";
 
 // Test seams (override in tests via env) — identical names/defaults to the shell.
 const TELEPTY = env.TELEPTY || "telepty";
-const CURL = env.CURL || "curl";
 const GIT = env.GIT || "git";
 const DISPATCH_SH = env.DISPATCH_SH || path.join(SCRIPT_DIR, "dispatch.sh");
 const SESSION_PROBE_PY = env.SESSION_PROBE_PY || path.join(SCRIPT_DIR, "session-probe.py");
@@ -63,6 +62,12 @@ const DISPATCH_REGISTRY_PY = env.DISPATCH_REGISTRY_PY || path.join(SCRIPT_DIR, "
 const HITL_SH = env.HITL_SH || path.join(SCRIPT_DIR, "hitl.sh");
 const NOW_OVERRIDE = env.TRACKER_NOW || "";
 const TELEPTY_AUTH_SH = path.join(SCRIPT_DIR, "lib/telepty-auth.sh");
+const TELEPTY_LISTING_SH = path.join(SCRIPT_DIR, "lib/telepty-listing.sh");
+// #1214: backstop for a spawn that waits on the telepty daemon. The real HTTP deadline
+// is telepty_curl's fixed curl limits (--connect-timeout 2 --max-time 5); on expiry the
+// owned child is SIGKILLed and the call reads as a failure (UNKNOWN), never an answer.
+// Caveat: curl is that bash's child, not ours — it ends at its own --max-time 5.
+const TELEPTY_SPAWN_TIMEOUT_MS = 7000;
 
 // #1172: report-sweep accepts no argument or exactly `--json`. Anything else is a
 // usage error decided HERE, before the mkdir below or any state/shared/registry access.
@@ -85,6 +90,8 @@ interface RunOpts {
   input?: string;
   /** "inherit" mirrors a bare call; "ignore" mirrors `2>/dev/null`. */
   stderr?: "inherit" | "ignore";
+  /** ms; on expiry the child is SIGKILLed and the call reads as unrunnable (127, no stdout). */
+  timeout?: number;
 }
 
 /** stdout captured; stderr per opts. Status 127 for an unrunnable command, as bash. */
@@ -94,6 +101,7 @@ function capture(cmd: string, args: string[], opts: RunOpts = {}): { status: num
     shell: false,
     ...(opts.env ? { env: { ...process.env, ...opts.env } } : {}),
     ...(opts.input === undefined ? {} : { input: opts.input }),
+    ...(opts.timeout === undefined ? {} : { timeout: opts.timeout, killSignal: "SIGKILL" as const }),
     stdio: [opts.input === undefined ? "ignore" : "pipe", "pipe", opts.stderr === "inherit" ? "inherit" : "ignore"],
   });
   if (r.error) return { status: 127, stdout: "" };
@@ -266,7 +274,7 @@ const ABSENT = "ABSENT";
  * exists to remove.
  */
 function sessionPresence(sid: string): string {
-  const listing = chomp(capture(TELEPTY, ["list", "--json"]).stdout);
+  const listing = chomp(capture(TELEPTY, ["list", "--json"], { timeout: TELEPTY_SPAWN_TIMEOUT_MS }).stdout);
   const parsed = (() => {
     try {
       return JSON.parse(listing);
@@ -278,6 +286,13 @@ function sessionPresence(sid: string): string {
   for (const s of parsed) {
     if (s && s.id === sid) return String(s.healthStatus || s.status || "");
   }
+  // #1214: `[]` is also what a refusal or a silent daemon prints. The one shared rule
+  // (telepty_listing_trusted, bin/lib/telepty-listing.sh) decides whether the listing
+  // may stand as evidence of absence; untrusted, failed or timed out → UNKNOWN.
+  const trusted = capture("bash", ["-c", '. "$1"; telepty_listing_trusted "$2"', "_", TELEPTY_LISTING_SH, listing], {
+    timeout: TELEPTY_SPAWN_TIMEOUT_MS,
+  });
+  if (trusted.status !== 0) return "";
   return ABSENT;
 }
 
@@ -305,14 +320,18 @@ function policyForTracker(stateJson: string): string {
 }
 
 /**
- * The ONE credential resolver, called as the shell function it is
- * (bin/lib/telepty-auth.sh). Re-implementing the config read here would create
- * the second copy tests/dispatch/T87 exists to forbid — a divergent copy of a
- * credential is how the two ends stop agreeing about who is calling. Degrades to
- * "" (no credential presented) exactly as the lib does.
+ * `telepty_curl <args>` from bin/lib/telepty-auth.sh — the ONE credential resolver
+ * and the one door that presents it, called as the shell function it is.
+ * Re-implementing the config read here would create the second copy
+ * tests/dispatch/T87 exists to forbid. The token travels from the lib to curl's stdin
+ * inside bash: never node memory, never an argv. `args` are positional parameters,
+ * never interpolated into the script. Degrades to no credential presented exactly as
+ * the lib does.
  */
-function teleptyAuthToken(): string {
-  return chomp(capture("bash", ["-c", '. "$1"; telepty_auth_token', "_", TELEPTY_AUTH_SH]).stdout);
+function teleptyCurl(args: string[]): { status: number; stdout: string } {
+  return capture("bash", ["-c", '. "$1"; shift; telepty_curl "$@"', "_", TELEPTY_AUTH_SH, ...args], {
+    timeout: TELEPTY_SPAWN_TIMEOUT_MS,
+  });
 }
 
 // ── #909 item (d): sleep-aware telemetry gate ───────────────────────────────
@@ -671,9 +690,8 @@ function pollObservationsAndHold(sid: string, dispatchId: string, injectId: stri
   if (!injectId || injectId === "null") {
     reason = "no_transport_inject_id";
   } else {
-    const r = capture(CURL, [
+    const r = teleptyCurl([
       "-s", "-w", "\n%{http_code}",
-      "-H", `x-telepty-token: ${teleptyAuthToken()}`,
       `http://127.0.0.1:${port}/api/inject-observations/${injectId}`,
     ]);
     if (r.status !== 0) {

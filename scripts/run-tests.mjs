@@ -56,6 +56,10 @@ sourceTestFiles.push('tests/packaging/release-evidence.test.mjs');
 // #1204 — bin/context-compact.sh per-CLI command + restore waiter against a fake daemon and telepty stub;
 // Node built-ins and bash (Git for Windows bash on win32); every OS, the waiter case skipped by name on win32.
 sourceTestFiles.push('tests/bin/context-compact.test.mjs');
+// #1214 — telepty credential on curl's stdin via bin/lib/telepty-auth.sh telepty_curl, bounded daemon HTTP, tracker
+// listing trust. Helper, real curl and bash callers on every OS (Git for Windows bash on win32); the TS callers end to
+// end on darwin/linux, branched inside the file; the loopback real-curl cases fail rather than skip under CI.
+sourceTestFiles.push('tests/dispatch/telepty-http-auth.test.mjs');
 // Native capture fixtures require POSIX ownership/modes; on native Windows init refuses native
 // capture with exit 2 (a 0.2.2 limitation), asserted in tests/packaging/init-platform.test.mjs.
 // The boot wizard suite drives an owned POSIX PTY.
