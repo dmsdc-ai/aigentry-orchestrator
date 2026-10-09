@@ -12,7 +12,7 @@
 # measurement — so it gets a distinct reason and a test.
 #
 # Asserts:
-#   1. the poll sends `x-telepty-token`;
+#   1. the poll sends `x-telepty-token` — on curl's stdin (`-H @-`), never in its argv (#1214);
 #   2. a 401 maps to `observation_poll_unauthorized`, NOT `observation_endpoint_absent`;
 #   3. the outcome is still nobody's to assert (unknown), and the dispatch keeps being polled.
 set -euo pipefail
@@ -21,26 +21,39 @@ source "$HERE/lib.sh"
 t_setup; trap t_teardown EXIT
 
 CURL_LOG="$T_TMP/curl.log"
+CURL_STDIN_LOG="$T_TMP/curl-stdin.log"
+# #1214: a private HOME with a KNOWN token, so the value on the wire is asserted — and the
+# operator's real credential is never read.
+mkdir -p "$T_TMP/home/.telepty"
+printf '%s' '{"authToken":"tok-T88-445566"}' > "$T_TMP/home/.telepty/config.json"
+export HOME="$T_TMP/home"
 cat > "$STUB_BIN/curl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$CURL_LOG"
+# Like real curl, stdin is read only when told to (`-H @-`) — the credential's channel.
+for a in "$@"; do [ "$a" = "@-" ] && { cat >> "$CURL_STDIN_LOG"; break; }; done
 # What a credential-checking daemon answers an unauthenticated caller: a refusal, with no body of
 # the schema-v2 shape at all.
 printf '%s' '{"success":false,"code":"UNAUTHORIZED","error":"missing or invalid token"}'
 printf '\n401'
 EOF
 chmod +x "$STUB_BIN/curl"
-export CURL="$STUB_BIN/curl" CURL_LOG
+export CURL="$STUB_BIN/curl" CURL_LOG CURL_STDIN_LOG
 
 t_seed_dispatch sid-A cwd="$T_TMP" transport.inject_id=uuid-401 \
   expected_report_by="2026-05-12T11:30:00Z"
 
 t_run_tracker check >/dev/null
 
-# (1) The poll presents the daemon token. Without this the fix is cosmetic.
-if ! grep -q 'x-telepty-token' "$CURL_LOG"; then
-  echo "FAIL: the observation poll did not send x-telepty-token" >&2
+# (1) The poll presents the daemon token. Without this the fix is cosmetic. #1214: on
+# curl's stdin, never in its argv, where any same-uid process can read it.
+if ! grep -qx 'x-telepty-token: tok-T88-445566' "$CURL_STDIN_LOG" 2>/dev/null; then
+  echo "FAIL: the observation poll did not send x-telepty-token on curl's stdin (-H @-)" >&2
   echo "--- curl invocations ---" >&2; cat "$CURL_LOG" >&2
+  exit 1
+fi
+if grep -qiE 'x-telepty-token|tok-T88-445566' "$CURL_LOG"; then
+  echo "FAIL: the observation poll put the credential into curl's argv (#1214)" >&2
   exit 1
 fi
 

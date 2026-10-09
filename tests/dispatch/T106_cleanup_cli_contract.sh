@@ -261,7 +261,10 @@ printf '%s' '[
 # These sids are all PRESENT in the listing, so each takes the normal
 # kill+close+DELETE path — the registry DELETE is the per-sid record of what the
 # selection actually reached.
-deleted() { grep -qE "ARGV .*-X DELETE .*/api/sessions/$1\$" "$CURL_LOG"; }
+# The URL is matched as a whole argv word, not as the end of the line: since #1214 the DELETE goes
+# through telepty_curl, which appends its fixed `--connect-timeout 2 --max-time 5 -H @-` AFTER the
+# caller's arguments (bin/lib/telepty-auth.sh). The word boundary keeps the sid exact.
+deleted() { grep -qE "ARGV .*-X DELETE .*/api/sessions/$1( |\$)" "$CURL_LOG"; }
 
 res=$(run --all-disconnected); rc=$(rc_of "$res"); out=$(out_of "$res")
 [ "$rc" = "0" ] || fail "--all-disconnected exited $rc: $out"

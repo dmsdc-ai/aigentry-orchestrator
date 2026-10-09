@@ -54,8 +54,7 @@ _TELEPTY_LISTING_SH_SOURCED=1
 # leaves curl's own code as the single source of truth.
 telepty_listing_verdict() {
   local port="${TELEPTY_PORT:-3848}" http
-  http=$("${CURL:-curl}" -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 \
-    -H "x-telepty-token: $(telepty_auth_token)" \
+  http=$(telepty_curl -s -o /dev/null -w '%{http_code}' \
     "http://127.0.0.1:${port}/api/sessions" 2>/dev/null || true)
   case "$http" in
     200)     printf 'ok' ;;

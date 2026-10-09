@@ -160,8 +160,11 @@ done
 cp -R "$REPO_ROOT/dist/src/." "$BOOT_FIXTURE/dist/src/"
 printf '{"type":"module"}\n' > "$BOOT_FIXTURE/package.json"
 AUTH_LOG="$T_TMP/auth.log"
-printf 'telepty_auth_token() { printf "auth\\n" >> "%s"; printf "fixture-token-T131"; }\n' "$AUTH_LOG" \
-  > "$BOOT_FIXTURE/bin/lib/telepty-auth.sh"
+# #1214: the REAL lib, so its shared HTTP door (telepty_curl) is what runs, with only the
+# resolver replaced by the synthetic one — no host credential is ever read.
+{ cat "$REPO_ROOT/bin/lib/telepty-auth.sh"
+  printf 'telepty_auth_token() { printf "auth\\n" >> "%s"; printf "fixture-token-T131"; }\n' "$AUTH_LOG"
+} > "$BOOT_FIXTURE/bin/lib/telepty-auth.sh"
 BOOT="$BOOT_FIXTURE/bin/orchestrator-boot.sh"
 BOOT_CLI="$BOOT_FIXTURE/dist/src/orchestrator-boot/cli.js"
 chmod +x "$BOOT"
@@ -251,11 +254,14 @@ EOF
 chmod +x "$TELEPTY_STUB"
 
 CURL_LOG="$T_TMP/curl-calls.log"
+CURL_STDIN_LOG="$T_TMP/curl-stdin.log"
 CURL_CODE="$T_TMP/curl-code.txt"
 CURL_STUB="$STUB_BIN/curl-recorder2.sh"
+# #1214: stdin is read only when told to (`-H @-`), as real curl does, and recorded.
 cat > "$CURL_STUB" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$CURL_LOG"
+for a in "\$@"; do [ "\$a" = "@-" ] && { cat >> "$CURL_STDIN_LOG"; break; }; done
 printf '%s' "\$(cat "$CURL_CODE" 2>/dev/null || echo 200)"
 exit 0
 EOF
@@ -284,7 +290,7 @@ export ORCHESTRATOR_SID="$SID"
 # which still kill exactly what they always killed.
 BRIDGE="node /Users/x/.nvm/versions/node/v20.20.0/bin/telepty allow --id $SID --auto-restart $PLAN_TAIL"
 
-reset() { : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$ORDER_LOG"; : > "$PS_ARGV"; : > "$TELEPTY_ARGV"; }
+reset() { : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$CURL_STDIN_LOG"; : > "$ORDER_LOG"; : > "$PS_ARGV"; : > "$TELEPTY_ARGV"; }
 # `grep -c .` prints the count and exits 1 when the count is zero, so the status is
 # swallowed rather than answered with a second line.
 kills() { grep -c . "$KILL_LOG" 2>/dev/null || true; }
@@ -674,13 +680,20 @@ w_arm 000 "→ no answer from the daemon (the STALE record STAYS; nothing was re
 w_arm 500 "→ 500 (unexpected; the record may still be there)"
 printf '200' > "$CURL_CODE"
 
-# The token is NEVER logged — invariant 4. It reaches the curl header argument and
-# nowhere else.
+# The token is NEVER logged — invariant 4. It reaches curl's header and nowhere else:
+# the original put it in the header ARGUMENT; the port (#1214) hands it to curl on
+# stdin (`-H @-`), so it is not in the argv either.
 reset
 printf '[{"id":"%s","healthStatus":"STALE","active_clients":0}]' "$SID" > "$LIST_JSON"
 W_ERR="$T_TMP/w2.err"
 reconcile >/dev/null 2>"$W_ERR"
-grep -q 'x-telepty-token: fixture-token-T131' "$CURL_LOG" || fail "W: synthetic token did not reach curl"
+if [ "$ORIGINAL" = "1" ]; then
+  grep -q 'x-telepty-token: fixture-token-T131' "$CURL_LOG" || fail "W: synthetic token did not reach curl"
+else
+  grep -qx 'x-telepty-token: fixture-token-T131' "$CURL_STDIN_LOG" \
+    || fail "W: synthetic token did not reach curl on stdin (-H @-); argv: $(cat "$CURL_LOG")"
+  grep -q 'fixture-token-T131' "$CURL_LOG" && fail "W: the token is in curl's argv (#1214)"
+fi
 grep -q 'fixture-token-T131' "$W_ERR" && fail "W: token value appears in log output"
 grep -q 'x-telepty-token' "$W_ERR" \
   && fail "W: the credential header appears in the log output: $(cat "$W_ERR")"
@@ -747,8 +760,18 @@ printf '[{"id":"%s","healthStatus":"STALE","active_clients":0}]' "$SID" > "$LIST
 reconcile >/dev/null 2>&1
 grep -qx -- 'list --json' "$TELEPTY_ARGV" \
   || fail "Y: the listing argv is not 'list --json': $(cat "$TELEPTY_ARGV")"
-grep -qF -- "-s -o /dev/null -w %{http_code} -H x-telepty-token: " "$CURL_LOG" \
-  || fail "Y: the curl argv shape changed: $(cat "$CURL_LOG")"
+if [ "$ORIGINAL" = "1" ]; then
+  grep -qF -- "-s -o /dev/null -w %{http_code} -H x-telepty-token: " "$CURL_LOG" \
+    || fail "Y: the curl argv shape changed: $(cat "$CURL_LOG")"
+else
+  # #1214: the reconcile's own args reach curl through the shared door, which adds the
+  # stdin header (`-H @-`); the credential header itself is no longer an argument.
+  y_line=" $(cat "$CURL_LOG") "
+  for want in " -s " " -o /dev/null " " -w %{http_code} " " -H @- "; do
+    case "$y_line" in *"$want"*) ;; *) fail "Y: the curl argv shape changed (no '$want'): $(cat "$CURL_LOG")" ;; esac
+  done
+  case "$y_line" in *x-telepty-token*) fail "Y: curl's argv names the credential header (#1214): $(cat "$CURL_LOG")" ;; esac
+fi
 grep -qF -- "-X DELETE http://127.0.0.1:3848/api/sessions/$SID" "$CURL_LOG" \
   || fail "Y: the DELETE url changed: $(cat "$CURL_LOG")"
 

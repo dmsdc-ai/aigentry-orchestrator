@@ -35,8 +35,8 @@
 //      launched — `exec`s it. Node has already exited by then, so the shell becomes
 //      the bridge exactly as it did in bash and there is no node generation left in
 //      the middle to swallow a signal or a TTY. T131 block Q pins the shim.
-//   4. THE TOKEN IS NEVER LOGGED. It goes into the curl header argument and nowhere
-//      else, exactly as bin/lib/telepty-auth.sh requires.
+//   4. THE TOKEN IS NEVER LOGGED. It goes onto curl's stdin through telepty_curl and
+//      nowhere else, exactly as bin/lib/telepty-auth.sh requires.
 //
 // STDOUT IS NOW A CONTRACT CHANNEL. The bash wrote nothing to stdout (every line
 // went through `log()` to stderr) and the port keeps that for LOGS, but stdout now
@@ -252,8 +252,13 @@ const SINGLETON_SELF_PID = env.SINGLETON_SELF_PID || String(process.pid);
 // Registry seams, named from the repo-wide env vars (bin/lib/telepty-listing.sh,
 // bin/session-reconciler.sh) so a caller sets what it already knows.
 const TELEPTY_CMD = env.TELEPTY || "telepty";
-const CURL_CMD = env.CURL || "curl";
 const TELEPTY_PORT = env.TELEPTY_PORT || "3848";
+// #1214: backstop for a spawn that waits on the telepty daemon — identical to
+// src/tracker/cli.ts. The real HTTP deadline is telepty_curl's fixed curl limits
+// (--connect-timeout 2 --max-time 5); on expiry the owned child is SIGKILLed and the
+// call lands in its existing SKIPPED / no-answer arm. Caveat: curl is that bash's
+// child, not ours — it ends at its own --max-time 5.
+const TELEPTY_SPAWN_TIMEOUT_MS = 7000;
 
 // fs.writeSync rather than process.stdout.write: writes to a pipe are asynchronous in
 // node and this process exits explicitly, so a buffered argv line could be truncated
@@ -564,16 +569,21 @@ function jqToString(v: unknown): string {
 }
 
 /**
- * The ONE sanctioned credential resolver (#824), called as the shell function it is —
- * identical to src/cleanup/cli.ts:129 and src/tracker/cli.ts. Degrades to "" (no
- * credential presented) exactly as the lib does, and the value is never logged.
+ * `telepty_curl <args>` from bin/lib/telepty-auth.sh — the ONE sanctioned credential
+ * resolver (#824) and the one door that presents it, called as the shell function it
+ * is — identical to src/cleanup/cli.ts and src/tracker/cli.ts. The token travels from
+ * the lib to curl's stdin inside bash: never node memory, never an argv, never logged;
+ * `args` are positional, never interpolated into the script. Degrades to no
+ * credential presented exactly as the lib does. Returns curl's stdout ("" on expiry).
  */
-function teleptyAuthToken(): string {
-  const r = spawnSync("bash", ["-c", '. "$1"; telepty_auth_token', "_", TELEPTY_AUTH_SH], {
+function teleptyCurl(args: string[]): string {
+  const r = spawnSync("bash", ["-c", '. "$1"; shift; telepty_curl "$@"', "_", TELEPTY_AUTH_SH, ...args], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],
+    timeout: TELEPTY_SPAWN_TIMEOUT_MS,
+    killSignal: "SIGKILL",
   });
-  return chomp(r.stdout || "");
+  return r.error ? "" : r.stdout || "";
 }
 
 /**
@@ -599,6 +609,8 @@ function orchestratorRegistryReconcile(sid: string): void {
   const r = spawnSync(TELEPTY_CMD, ["list", "--json"], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],
+    timeout: TELEPTY_SPAWN_TIMEOUT_MS,
+    killSignal: "SIGKILL",
   });
   if (r.status !== 0) {
     log(
@@ -676,23 +688,18 @@ function orchestratorRegistryReconcile(sid: string): void {
     );
     return;
   }
-  const c = spawnSync(
-    CURL_CMD,
-    [
+  const http = chomp(
+    teleptyCurl([
       "-s",
       "-o",
       "/dev/null",
       "-w",
       "%{http_code}",
-      "-H",
-      `x-telepty-token: ${teleptyAuthToken()}`,
       "-X",
       "DELETE",
       `http://127.0.0.1:${TELEPTY_PORT}/api/sessions/${sid}`,
-    ],
-    { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    ]),
   );
-  const http = chomp(c.stdout || "");
   if (http === "200") {
     log(`DELETE /api/sessions/${sid} → 200 (stale record removed; the id is claimable)`);
   } else if (http === "404") {

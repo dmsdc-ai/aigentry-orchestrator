@@ -80,7 +80,11 @@ const reader = (run, args) => sh(NODE, [READER, ...args], { env: hermeticEnv(run
 
 function wrapper(run, name, who) {
   const p = path.join(run.fakes, name);
-  fs.writeFileSync(p, `#!/bin/sh\nexec '${NODE}' '${ACTUATORS}' ${who} "$@"\n`, { mode: 0o755 });
+  // #1214: curl reads stdin only when told to (`-H @-`), as real curl does; what it read is recorded.
+  const stdin = who === "curl"
+    ? `for a in "$@"; do if [ "$a" = "@-" ]; then cat >> '${path.join(run.logs, "curl-stdin.log")}'; break; fi; done\n`
+    : "";
+  fs.writeFileSync(p, `#!/bin/sh\n${stdin}exec '${NODE}' '${ACTUATORS}' ${who} "$@"\n`, { mode: 0o755 });
   return p;
 }
 
@@ -141,6 +145,36 @@ function assertConfined(run, seq) {
   assert.deepEqual(seq.filter((e) => e.who === "ps-path"), [], "no PATH ps");
 }
 
+/**
+ * #1214: every curl goes through the shared door — the header from stdin (`-H @-`), the fixed
+ * bounds, no credential in argv. The private HOME holds no token, so stdin must stay EMPTY: the
+ * degraded shape is "no credential presented" (it was an empty-valued `-H 'x-telepty-token: '`).
+ */
+function assertCurlDoor(run, seq) {
+  const last = (a, names) => { let v; a.forEach((x, i) => { if (names.includes(x)) v = a[i + 1]; }); return v; };
+  for (const { argv: a } of seq.filter((e) => e.who === "curl")) {
+    assert.ok(!a.some((x) => /x-telepty-token/i.test(x)), `curl argv names the credential header: ${JSON.stringify(a)}`);
+    assert.ok(a.some((x, i) => x === "-H@-" || ((x === "-H" || x === "--header") && a[i + 1] === "@-")),
+      `curl was not told to read its header from stdin (-H @-): ${JSON.stringify(a)}`);
+    assert.equal(last(a, ["--max-time", "-m"]), "5", `curl --max-time is not 5: ${JSON.stringify(a)}`);
+    assert.equal(last(a, ["--connect-timeout"]), "2", `curl --connect-timeout is not 2: ${JSON.stringify(a)}`);
+  }
+  const stdin = path.join(run.logs, "curl-stdin.log");
+  assert.equal(fs.existsSync(stdin) ? fs.readFileSync(stdin, "utf8") : "", "", "a credential was presented with no token configured");
+}
+
+/** #1214: the caller's own curl args, in order, without the door's `-H @-` and bounds (assertCurlDoor pins those). */
+function curlCaller(argv) {
+  const own = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "-H@-") continue;
+    if ((argv[i] === "-H" || argv[i] === "--header") && argv[i + 1] === "@-") { i++; continue; }
+    if (["--connect-timeout", "--max-time", "-m"].includes(argv[i])) { i++; continue; }
+    own.push(argv[i]);
+  }
+  return own;
+}
+
 /** Run the compiled cleanup CLI against a fresh world. */
 function cleanup(label, o = {}) {
   const run = makeRun(label);
@@ -159,6 +193,7 @@ function cleanup(label, o = {}) {
   const res = sh(NODE, [CLEANUP, ...(o.args ?? [SID])], { env: r.env(extraEnv), timeout: 90000 });
   const seq = r.seq();
   assertConfined(run, seq);
+  assertCurlDoor(run, seq);
   return { ...res, seq, w, run };
 }
 
@@ -176,13 +211,15 @@ function legacyView(r) {
     status: r.status,
     stdout: r.stdout.split("\n").filter((l) => !isMeta(l)),
     stderr: r.stderr,
-    seq: r.seq.filter((e) => !isMetaCall(e) && e.who !== "ps" && e.who !== "whcli").map((e) => [e.who, ...e.argv]),
+    seq: r.seq.filter((e) => !isMetaCall(e) && e.who !== "ps" && e.who !== "whcli")
+      .map((e) => [e.who, ...(e.who === "curl" ? curlCaller(e.argv) : e.argv)]),
   };
 }
 
 // ── explicit legacy expectations (release behaviour of cleanupOne) ────────────
 const L = (msg) => `[session-cleanup] ${msg}`;
-const DELETE = (sid) => ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-H", "x-telepty-token: ", "-X", "DELETE",
+// #1214: the credential header is no longer a curl argument (assertCurlDoor pins the stdin door).
+const DELETE = (sid) => ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "DELETE",
   `http://127.0.0.1:${PORT}/api/sessions/${sid}`];
 const REGISTRY = (sid) => [["registry", "observe", "--sid", sid, "--kind", "session_absent_observed", "--all"],
   ["registry", "set-lifecycle", "--sid", sid, "--state", "cleaned", "--all"]];

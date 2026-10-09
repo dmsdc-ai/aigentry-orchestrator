@@ -71,6 +71,12 @@ const DISPATCH_REGISTRY_PY = env.DISPATCH_REGISTRY_PY || path.join(SCRIPT_DIR, "
 const WH_CLI = path.join(SCRIPT_DIR, "wh-cli.sh");
 const TELEPTY_AUTH_SH = path.join(SCRIPT_DIR, "lib/telepty-auth.sh");
 const TELEPTY_LISTING_SH = path.join(SCRIPT_DIR, "lib/telepty-listing.sh");
+// #1214: backstop for a spawn that waits on the telepty daemon — identical to
+// src/tracker/cli.ts. The real HTTP deadline is telepty_curl's fixed curl limits
+// (--connect-timeout 2 --max-time 5); on expiry the owned child is SIGKILLed and the
+// call lands in its caller's existing failure arm. Caveat: curl is that bash's child,
+// not ours — it ends at its own --max-time 5.
+const TELEPTY_SPAWN_TIMEOUT_MS = 7000;
 // #1162 G2b sealed reader, compiled next to this file (dist/src/session/).
 const AGENT_BINDING_JS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "session", "agent-binding.js");
 
@@ -80,9 +86,16 @@ function chomp(s: string): string {
   return s.replace(/\n+$/, "");
 }
 
-/** stdout captured, stderr discarded (`2>/dev/null`). Status 127 for an unrunnable command, as bash. */
-function capture(cmd: string, args: string[]): { status: number; stdout: string } {
-  const r = spawnSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+/**
+ * stdout captured, stderr discarded (`2>/dev/null`). Status 127 for an unrunnable command, as bash.
+ * `timeoutMs`: on expiry the child is SIGKILLed and the call reads as unrunnable (127, no stdout).
+ */
+function capture(cmd: string, args: string[], timeoutMs?: number): { status: number; stdout: string } {
+  const r = spawnSync(cmd, args, {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+    ...(timeoutMs === undefined ? {} : { timeout: timeoutMs, killSignal: "SIGKILL" as const }),
+  });
   if (r.error) return { status: 127, stdout: "" };
   return { status: r.status ?? 1, stdout: r.stdout ?? "" };
 }
@@ -125,13 +138,15 @@ function sleepMs(ms: number): void {
 
 // ── the three lib seams ─────────────────────────────────────────────────────
 /**
- * The ONE credential resolver, called as the shell function it is
- * (bin/lib/telepty-auth.sh) — identical to src/tracker/cli.ts. Degrades to ""
- * (no credential presented) exactly as the lib does, which is what keeps a
- * teardown working instead of aborting it.
+ * `telepty_curl <args>` from bin/lib/telepty-auth.sh — the ONE credential resolver
+ * and the one door that presents it, called as the shell function it is —
+ * identical to src/tracker/cli.ts. The token travels from the lib to curl's stdin
+ * inside bash: never node memory, never an argv; `args` are positional, never
+ * interpolated into the script. Degrades to no credential presented exactly as
+ * the lib does, which is what keeps a teardown working instead of aborting it.
  */
-function teleptyAuthToken(): string {
-  return chomp(capture("bash", ["-c", '. "$1"; telepty_auth_token', "_", TELEPTY_AUTH_SH]).stdout);
+function teleptyCurl(args: string[]): { status: number; stdout: string } {
+  return capture("bash", ["-c", '. "$1"; shift; telepty_curl "$@"', "_", TELEPTY_AUTH_SH, ...args], TELEPTY_SPAWN_TIMEOUT_MS);
 }
 
 /**
@@ -256,7 +271,12 @@ function requireDeps(): void {
  * not harden it), which is what lets the guards put a stub in front.
  */
 function teleptyListJson(): string {
-  const r = spawnSync("telepty", ["list", "--json"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  const r = spawnSync("telepty", ["list", "--json"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: TELEPTY_SPAWN_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+  });
   if (r.error || (r.status ?? 1) !== 0) {
     err("telepty list --json exited non-zero");
     process.exit(3);
@@ -503,12 +523,8 @@ function deleteSessionRegistry(sid: string): void {
   // `000000` — matching no arm and reaching the catch-all. That is why the
   // no-answer case never had a voice here even after it was given one.
   const http = chomp(
-    capture("curl", [
+    teleptyCurl([
       "-s", "-o", "/dev/null", "-w", "%{http_code}",
-      // With no token the header carries no content, and curl DROPS such a header
-      // rather than sending an empty one — degraded means "no credential
-      // presented", never "empty credential presented as if it were valid".
-      "-H", `x-telepty-token: ${teleptyAuthToken()}`,
       "-X", "DELETE", `http://127.0.0.1:${port}/api/sessions/${sid}`,
     ]).stdout,
   );
@@ -533,7 +549,10 @@ function deleteSessionRegistry(sid: string): void {
     // curl's own failure lands here as the literal "000" it printed before exiting
     // non-zero. It shares the refusal's consequence — the entry stays in the
     // registry — but not its cause, and "unexpected" told the operator neither. (#835)
+    // An empty response (spawn backstop expired, helper refused to send) is the
+    // same no-answer. (#1214)
     case "000":
+    case "":
       err(
         `DELETE /api/sessions/${sid} → no answer from the daemon (the entry STAYS in the daemon registry; nothing was removed — re-run once the daemon answers)`,
       );

@@ -73,10 +73,13 @@ cat "$LIST_JSON"
 exit 0
 EOF
 CURL_LOG="$T_TMP/curl-calls.log"
+CURL_STDIN_LOG="$T_TMP/curl-stdin.log"
 CURL_STUB="$STUB_BIN/curl132.sh"
+# #1214: stdin is read only when told to (`-H @-`), as real curl does, and recorded.
 cat > "$CURL_STUB" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$CURL_LOG"
+for a in "\$@"; do [ "\$a" = "@-" ] && { cat >> "$CURL_STDIN_LOG"; break; }; done
 printf '200'
 exit 0
 EOF
@@ -113,16 +116,18 @@ export AIGENTRY_BOOT_PLAN=1 AIGENTRY_BOOT_PERMISSION='approval=manual' AIGENTRY_
 PLAN_EXEC="allow --id $SID --auto-restart claude --permission-mode manual"
 
 # Every auth door is private; only B deliberately gives the two copies different tokens.
+# #1214: each is the REAL lib, so its shared HTTP door (telepty_curl) is what runs, with
+# only the resolver replaced — no host credential is ever read.
 export AUTH_LOG="$T_TMP/auth.log"
 : > "$AUTH_LOG"
 PRIVATE_AUTH="$T_TMP/telepty-auth.sh"
-cat > "$PRIVATE_AUTH" <<'EOF'
-#!/usr/bin/env bash
+{ cat "$REPO_ROOT/bin/lib/telepty-auth.sh"; cat <<'EOF'
 telepty_auth_token() {
   printf 'auth\n' >> "$AUTH_LOG"
   printf 'tok-FIXTURE-T132'
 }
 EOF
+} > "$PRIVATE_AUTH"
 
 # ── the workspace: bin/ without dist/ ──
 WS="$T_TMP/workspace"
@@ -203,15 +208,15 @@ grep -qF 'tok-FIXTURE-T132' "$T_TMP/a.err" \
 #    The two copies are made to differ so the answer is measurable: whichever token
 #    reaches the curl header names the copy that was sourced.
 # ===========================================================================
-cat > "$WS/bin/lib/telepty-auth.sh" <<'EOF'
-#!/usr/bin/env bash
+{ cat "$REPO_ROOT/bin/lib/telepty-auth.sh"; cat <<'EOF'
 telepty_auth_token() { printf 'tok-FROM-WORKSPACE'; }
 EOF
-cat > "$PKG/bin/lib/telepty-auth.sh" <<'EOF'
-#!/usr/bin/env bash
+} > "$WS/bin/lib/telepty-auth.sh"
+{ cat "$REPO_ROOT/bin/lib/telepty-auth.sh"; cat <<'EOF'
 telepty_auth_token() { printf 'tok-FROM-PACKAGE'; }
 EOF
-: > "$CURL_LOG"; : > "$KILL_LOG"; : > "$EXEC_LOG"
+} > "$PKG/bin/lib/telepty-auth.sh"
+: > "$CURL_LOG"; : > "$CURL_STDIN_LOG"; : > "$KILL_LOG"; : > "$EXEC_LOG"
 PATH="$EXEC_DIR:$PKGBIN:$PATH" bash "$BOOT" >"$T_TMP/b.out" 2>"$T_TMP/b.err" \
   || fail "B: the workspace boot exited non-zero: $(cat "$T_TMP/b.err")"
 grep -q -- '-X DELETE' "$CURL_LOG" || fail "B: the workspace boot ran no reconcile"
@@ -219,10 +224,13 @@ grep -qxF -- '-9 50349' "$KILL_LOG" || fail "B: the workspace boot ran no SIGKIL
 [ "$(cat "$EXEC_LOG")" = "$PLAN_EXEC" ] \
   || fail "B: the workspace boot did not exec the bridge argv"
 [ ! -s "$T_TMP/b.out" ] || fail "B: the workspace boot wrote to stdout"
-grep -qF 'tok-FROM-WORKSPACE' "$CURL_LOG" \
+# #1214: the credential reaches curl on stdin (`-H @-`), never in its argv.
+grep -qxF 'x-telepty-token: tok-FROM-WORKSPACE' "$CURL_STDIN_LOG" \
   || fail "B: the DELETE did not carry the WORKSPACE's credential — AIGENTRY_SHIM_SCRIPT_DIR was not honoured, so bin/lib/telepty-auth.sh was resolved against the compiled module's location instead. calls: $(cat "$CURL_LOG")"
-grep -qF 'tok-FROM-PACKAGE' "$CURL_LOG" \
+grep -qF 'tok-FROM-PACKAGE' "$CURL_LOG" "$CURL_STDIN_LOG" \
   && fail "B: the PACKAGE's credential resolver was sourced from a workspace boot: $(cat "$CURL_LOG")"
+grep -qiE 'x-telepty-token|tok-FROM-' "$CURL_LOG" \
+  && fail "B: the credential is in curl's argv (#1214): $(cat "$CURL_LOG")"
 # Invariant 4: the token never appears in the log stream either way.
 grep -q 'tok-FROM-' "$T_TMP/b.err" \
   && fail "B: the credential leaked into the log output: $(cat "$T_TMP/b.err")"

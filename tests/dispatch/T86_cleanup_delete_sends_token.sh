@@ -13,7 +13,8 @@
 # an unreadable config must leave the script working, not abort it.
 #
 # Asserts:
-#   1. the DELETE sends `x-telepty-token`, valued from ~/.telepty/config.json;
+#   1. the DELETE sends `x-telepty-token`, valued from ~/.telepty/config.json, on curl's
+#      STDIN (`-H @-`, #1214) — never in its argv, where every same-uid process can read it;
 #   2. 401 gets its OWN loud arm naming the registry leak, not the catch-all;
 #   3. a missing config degrades — DELETE still attempted, exit still 0;
 #   4. the 200 / 404 arms are untouched.
@@ -30,17 +31,21 @@ BASH_BIN="$(command -v bash)"
 fail() { echo "FAIL[T86]: $*" >&2; exit 1; }
 
 CURL_LOG="$T_TMP/curl.log"
-export CURL_LOG
+CURL_STDIN_LOG="$T_TMP/curl-stdin.log"
+export CURL_LOG CURL_STDIN_LOG
 
 # curl stub: record argv ONE ARGUMENT PER LINE, answer with $STUB_HTTP.
 # Per-line matters: "$*" would flatten `-H` + `x-telepty-token: ` + `-X` into one
 # space-joined string, in which an EMPTY header value is indistinguishable from one
 # whose value follows — the exact distinction assertion (3) turns on.
+# #1214: like real curl, it reads stdin only when told to (`-H @-`), and records what
+# it read — the channel the credential must travel on.
 # delete_session_registry uses `-o /dev/null -w '%{http_code}'`, so the stub's
 # stdout IS the status code.
 cat > "$STUB_BIN/curl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$@" >> "$CURL_LOG"
+for a in "$@"; do [ "$a" = "@-" ] && { cat >> "$CURL_STDIN_LOG"; break; }; done
 echo "${STUB_HTTP:-200}"
 EOF
 chmod +x "$STUB_BIN/curl"
@@ -67,7 +72,7 @@ printf '%s' '[{"id":"someone-else","healthStatus":"CONNECTED"}]' > "$STUB_LIST_F
 # run_cleanup <http> → stdout+stderr of one cleanup run; asserts exit 0.
 run_cleanup() {
   local http="$1" out rc
-  : > "$CURL_LOG"
+  : > "$CURL_LOG"; : > "$CURL_STDIN_LOG"
   set +e
   out=$(STUB_HTTP="$http" HOME="$FAKE_HOME" "$BASH_BIN" "$CLEANUP" "$SID" 2>&1)
   rc=$?
@@ -76,14 +81,18 @@ run_cleanup() {
   printf '%s' "$out"
 }
 
-# ── (1) the DELETE presents the daemon token ────────────────────────────────
+# ── (1) the DELETE presents the daemon token — on stdin, never in argv ──────
 out=$(run_cleanup 200)
-grep -q '^x-telepty-token:' "$CURL_LOG" \
+grep -q '^x-telepty-token:' "$CURL_STDIN_LOG" \
   || { echo "--- curl argv ---" >&2; cat "$CURL_LOG" >&2
-       fail "the cleanup DELETE did not send x-telepty-token"; }
-grep -qx 'x-telepty-token: tok-T86-abcdef' "$CURL_LOG" \
+       fail "the cleanup DELETE did not send x-telepty-token on curl's stdin (-H @-)"; }
+grep -qx 'x-telepty-token: tok-T86-abcdef' "$CURL_STDIN_LOG" \
   || { echo "--- curl argv ---" >&2; cat "$CURL_LOG" >&2
        fail "the token was not resolved from \$HOME/.telepty/config.json"; }
+grep -q 'tok-T86-abcdef' "$CURL_LOG" \
+  && fail "the token is in curl's argv — readable by every same-uid process for the call's lifetime (#1214)"
+grep -qi 'x-telepty-token' "$CURL_LOG" \
+  && fail "curl's argv names the credential header — it belongs on stdin (#1214): $(cat "$CURL_LOG")"
 # (4a) the 200 arm still says what it said.
 case "$out" in
   *"200 (removed from registry)"*) ;;
@@ -115,7 +124,7 @@ esac
 # ── (3) a missing config degrades; it does not abort a teardown ─────────────
 NO_TOKEN_HOME="$T_TMP/home-empty"
 mkdir -p "$NO_TOKEN_HOME"
-: > "$CURL_LOG"
+: > "$CURL_LOG"; : > "$CURL_STDIN_LOG"
 set +e
 out=$(STUB_HTTP=401 HOME="$NO_TOKEN_HOME" "$BASH_BIN" "$CLEANUP" "$SID" 2>&1)
 rc=$?
@@ -125,15 +134,17 @@ set -e
 [ -s "$CURL_LOG" ] \
   || fail "no DELETE was attempted at all when the token could not be resolved"
 # Degraded means "no credential sent", never "empty credential sent as if valid".
-# curl drops a header given with no content, so the empty-valued argument is the
-# correct degraded shape; what must NOT appear is a header carrying some value.
-if grep -qE '^x-telepty-token: +[^ ]' "$CURL_LOG"; then
+# What must NOT appear is a header carrying some value — on either channel.
+if grep -qE '^x-telepty-token: +[^ ]' "$CURL_LOG" "$CURL_STDIN_LOG"; then
   echo "--- curl argv ---" >&2; cat "$CURL_LOG" >&2
   fail "a token was fabricated when the config was absent"
 fi
-grep -qE '^x-telepty-token: *$' "$CURL_LOG" \
-  || { echo "--- curl argv ---" >&2; cat "$CURL_LOG" >&2
-       fail "degraded DELETE sent neither an empty-valued header nor none at all"; }
+# #1214: with no token the helper hands curl an EMPTY stdin, so no header is sent at
+# all — the degraded shape is "no x-telepty-token anywhere", where it used to be an
+# empty-valued `-H 'x-telepty-token: '` argument that curl dropped.
+grep -qi 'x-telepty-token' "$CURL_LOG" "$CURL_STDIN_LOG" \
+  && { echo "--- curl argv ---" >&2; cat "$CURL_LOG" >&2
+       fail "degraded DELETE presented a credential header instead of none at all"; }
 
 # ── (4b) the 404 arm still says what it said ────────────────────────────────
 out=$(run_cleanup 404)

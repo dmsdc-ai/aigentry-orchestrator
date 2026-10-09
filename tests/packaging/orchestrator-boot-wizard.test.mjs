@@ -107,8 +107,12 @@ function fixture() {
     KILL_CMD: recorder('kill-recorder', 'kill'),
     TELEPTY: recorder('telepty-list-recorder', 'list',
       `try{process.stdout.write(fs.readFileSync(${JSON.stringify(path.join(dir, 'list.json'))}))}catch{}\n`),
-    CURL: recorder('curl-recorder', 'curl', `process.stdout.write('200');\n`),
+    // #1214: like real curl, stdin is read only when told to (`-H @-`) — the credential's channel.
+    CURL: recorder('curl-recorder', 'curl',
+      `if(process.argv.includes('@-'))fs.appendFileSync(${JSON.stringify(path.join(logs, 'curl-stdin.jsonl'))},JSON.stringify(fs.readFileSync(0,'utf8'))+'\\n');\n` +
+      `process.stdout.write('200');\n`),
   };
+  fs.writeFileSync(path.join(logs, 'curl-stdin.jsonl'), '');
   // The bridge the shim finally execs, resolved from PATH exactly as a real boot resolves
   // it. Its presence in the log is the ONLY evidence that a boot completed.
   recorder('telepty', 'exec');
@@ -152,6 +156,8 @@ function fixture() {
 
   return {
     dir, bin, logs, home, cwd, env, calls, kinds,
+    /** What each `-H @-` curl call read from stdin, in call order. */
+    curlStdin: () => calls('curl-stdin'),
     psTable: rows => fs.writeFileSync(path.join(dir, 'ps.txt'), rows.join('\n') + (rows.length ? '\n' : '')),
     listing: value => fs.writeFileSync(path.join(dir, 'list.json'), JSON.stringify(value)),
     /** Remove a provider from PATH, to drive the "missing binary" screen. */
@@ -196,6 +202,25 @@ function pty(fx, { cmd, steps, env = {}, cwd = fx.cwd, timeout = 25 }) {
 const bootCmd = () => ['/bin/bash', SHIM];
 
 const argvLines = stdout => stdout.split('\n').filter(Boolean);
+
+// #1214: the registry DELETE goes through bin/lib/telepty-auth.sh `telepty_curl`, which APPENDS
+// `--connect-timeout 2 --max-time 5 -H @-` after the caller's args, so the URL is no longer argv's
+// last element. Parse the argv as curl does — these options take a value, and the one remaining
+// word is the URL — and pin the credential door on the way: header from stdin, never in argv.
+const CURL_VALUE_OPTS = new Set(['-o', '--output', '-w', '--write-out', '-X', '--request', '-H', '--header',
+  '-m', '--max-time', '--connect-timeout']);
+function curlUrl(argv) {
+  const urls = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (CURL_VALUE_OPTS.has(argv[i])) { i++; continue; }
+    if (!argv[i].startsWith('-')) urls.push(argv[i]);
+  }
+  assert.equal(urls.length, 1, `curl argv does not carry exactly one URL: ${JSON.stringify(argv)}`);
+  assert.ok(argv.some((a, i) => (a === '-H' || a === '--header') && argv[i + 1] === '@-'),
+    `curl was not told to read its header from stdin (-H @-): ${JSON.stringify(argv)}`);
+  assert.ok(!argv.some(a => /x-telepty-token/i.test(a)), `curl argv names the credential header: ${JSON.stringify(argv)}`);
+  return urls[0];
+}
 
 /**
  * "It did not boot" — asserted in a way that cannot pass vacuously.
@@ -603,8 +628,10 @@ test('the wizard chooses; the environment only suggests', async t => {
       [['allow', '--id', chosen, '--auto-restart', 'claude', '--permission-mode', 'manual']]);
     assert.deepEqual(fx.calls('kill'), [['-9', '4002']],
       `the SIGKILL did not target the chosen session's bridge only: ${JSON.stringify(fx.calls('kill'))}`);
-    const deletes = fx.calls('curl').map(a => a[a.length - 1]);
+    const deletes = fx.calls('curl').map(curlUrl);
     assert.deepEqual(deletes, [`http://127.0.0.1:3848/api/sessions/${chosen}`]);
+    // The closed HOME holds no telepty config, so no credential is presented on curl's stdin.
+    assert.deepEqual(fx.curlStdin(), ['']);
 
     // …and NOTHING landed on the inherited one. This is the r1 bug, stated as its own
     // assertion so a regression names itself.
@@ -646,8 +673,9 @@ test('the wizard chooses; the environment only suggests', async t => {
     assert.deepEqual(fx.calls('exec'),
       [['allow', '--id', 'planned-orch', '--auto-restart', 'claude', '--permission-mode', 'manual']]);
     assert.deepEqual(fx.calls('kill'), [['-9', '4002']]);
-    assert.deepEqual(fx.calls('curl').map(a => a[a.length - 1]),
+    assert.deepEqual(fx.calls('curl').map(curlUrl),
       ['http://127.0.0.1:3848/api/sessions/planned-orch']);
+    assert.deepEqual(fx.curlStdin(), [''], 'a credential was presented from a closed HOME');
   });
 
   await t.test('ORCHESTRATOR_CLI on a terminal is a printed hint, not a selection', () => {

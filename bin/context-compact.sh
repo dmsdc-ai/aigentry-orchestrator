@@ -36,7 +36,7 @@ telepty="${AIGENTRY_TELEPTY:-$(command -v telepty || true)}"
 # session_probe <sid> — the sid's daemon record as "command␟ready␟idleSeconds␟lastActivityAt",
 # or nothing when the daemon does not answer or holds no such session.
 session_probe() {
-  curl -sf --max-time 5 -H "x-telepty-token: $(telepty_auth_token)" "$api/api/sessions" 2>/dev/null \
+  telepty_curl -sf "$api/api/sessions" 2>/dev/null \
     | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const d=JSON.parse(s);
 const a=Array.isArray(d)?d:(d&&d.sessions)||[];const r=a.find(x=>x&&x.id===process.argv[1]);
 if(r)process.stdout.write([r.command,r.ready,r.idleSeconds,r.lastActivityAt]
