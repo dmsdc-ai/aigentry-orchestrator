@@ -133,6 +133,8 @@ cd "$LAUNCHER_WORK"
 git push origin HEAD:refs/heads/main >"$LAUNCHER_OUT" 2>"$LAUNCHER_ERR"
 SH
 chmod 0755 "$FAKE_BIN/codex"
+# #652: version evidence the resolver accepts, so the #! fake is not refused as a CLI wrapper.
+printf '%s\n' '{"name":"codex","version":"9.9.9","bin":{"codex":"codex"}}' > "$FAKE_BIN/package.json"
 
 FAKE_OPEN_SESSION="$TMP_ROOT/fake-open-session.sh"
 FAKE_OPEN_STATUS="$TMP_ROOT/fake-open-status"

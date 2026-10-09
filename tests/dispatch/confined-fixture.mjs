@@ -62,8 +62,13 @@ if (action === 'init') {
   // methods, so set/clear end `unsupported` before any RPC. Every other argv is denied.
   script('cmux', 'if [ "$#" -eq 1 ] && [ "$1" = capabilities ]; then ' +
     'printf \'%s\\n\' \'{"protocol":"cmux-socket","version":2,"methods":[]}\'; exit 0; fi\n' + deny);
-  for (const cli of ['claude', 'codex', 'gemini', 'grok', 'agy'])
+  const clis = ['claude', 'codex', 'gemini', 'grok', 'agy'];
+  for (const cli of clis)
     script(cli, 'if [ "$#" -eq 1 ] && [ "$1" = --version ]; then echo 9.9.9; exit 0; fi\n' + deny);
+  // #652: the resolver never runs --version; its only version evidence is a package.json whose
+  // `bin` resolves to the bound file. Without it the #! fakes are refused as SANDBOX_CLI_WRAPPER.
+  json(join(process.env.STUB_BIN, 'package.json'), { name: 'fixture-clis', version: '9.9.9',
+    bin: Object.fromEntries(clis.map(cli => [cli, cli])) });
   script('fixture-probe', 'echo \'{"ready":true}\'');
   script('fixture-noop', 'exit 0');
   script('fixture-report', 'echo fixture-orchestrator');
