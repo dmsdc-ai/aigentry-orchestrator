@@ -297,7 +297,13 @@ async function settle(c) {
   assert.deepEqual(left, [], `${c.dir}: owned children outlived the case and were reaped`);
 }
 
-const bash = (c, script, args = [], opts = {}) => run(c, BASH, ['-c', script, 't1214', ...args], opts);
+// Case arguments travel INSIDE the -c script as single-quoted `set --` words, never as argv words of their own. On
+// win32 node hands Git for Windows bash one command line and quotes only words with a space, tab or `"`; the MSYS
+// runtime glob/brace-expands a bare word there, so `%{http_code}` reached curl as `%http_code` (native CI: A1-A3, A8,
+// A10, C1, C2), while the quoted script word kept its bytes. Here bash, not the command line, splits the arguments.
+const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+const viaScript = (script, args) => ['-c', `set -- ${args.map(shq).join(' ')}\n${script}`, 't1214'];
+const bash = (c, script, args = [], opts = {}) => run(c, BASH, viaScript(script, args), opts);
 
 async function helperPresent() {
   const c = makeCase('helper-probe');
@@ -516,8 +522,8 @@ describe('A telepty_curl — the one credential door', { concurrency: true }, ()
     const outcomes = [];
     for (const sh of shells) {
       const c = makeCase('a12');
-      const r = await run(c, sh, ['-c', `set -a; . "$1"; shift; telepty_curl "$@" >/dev/null || true; printf 'flags=%s bash=%s' "$-" "$BASH_VERSION"`,
-        't1214', AUTH_LIB, ...S_ARGS, URL]);
+      const r = await run(c, sh, viaScript(`set -a; . "$1"; shift; telepty_curl "$@" >/dev/null || true; printf 'flags=%s bash=%s' "$-" "$BASH_VERSION"`,
+        [AUTH_LIB, ...S_ARGS, URL]));
       await settle(c);
       const cs = curlCalls(c);
       outcomes.push({
@@ -555,9 +561,11 @@ describe('A telepty_curl — the one credential door', { concurrency: true }, ()
 telepty_auth_token() { printf 'r\\n' >> "$T1214_FAKE_DIR/resolver.calls"; printf 'OVERRIDE-1214'; }
 telepty_curl "$@"`, [AUTH_LIB, ...S_ARGS, URL]);
     const r2 = await bash(c, STRICT, [AUTH_LIB, ...S_ARGS, URL], { env: caseEnv(c, { CURL: undefined }) });
+    // Observation only (no curl is run): which curl bash resolves in r2's environment, for the failure message.
+    const which = await bash(c, 'type -a curl; printf "PATH=%s\\n" "$PATH"', [], { env: caseEnv(c, { CURL: undefined }) });
     await settle(c);
     assert.equal(r.status, 0, r.stderr);
-    assert.equal(r2.status, 0, r2.stderr);
+    assert.equal(r2.status, 0, `${r2.stderr}\nPATH curl as bash resolves it (fakebin first expected):\n${which.stdout}${which.stderr}`);
     assert.equal(c.read('resolver.calls'), 'r\n', 'the helper must resolve the token exactly once, through telepty_auth_token');
     const cs = curlCalls(c);
     assert.equal(cs.length, 2, 'CURL seam used, and PATH curl when CURL is unset');
@@ -1208,5 +1216,14 @@ describe('G harness controls (no product code)', () => {
     mkdirSync(c.file('state/deep'), { recursive: true });
     writeFileSync(c.file('state/deep/alerts.log'), `x ${c.token} y`);
     assert.deepEqual(leaks(c, c.token), ['state/deep/alerts.log']);
+  });
+
+  test('G4 the harness argv transport: every case argument reaches bash byte-exact, glob/brace/quote words included', async () => {
+    const c = makeCase('g4');
+    const words = ['%{http_code}', '{a,b}', '{x}', '*', '?', '[ab]', '~', "it's", 'q"uote', 'a b', '$HOME', '', '-H@-', fwd(c.file('ws'))];
+    const r = await bash(c, 'printf \'%s\\0\' "$@"', words);
+    await settle(c);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(r.stdout.split('\0').slice(0, -1), words);
   });
 });
