@@ -6,20 +6,16 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
-      - name: environment
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: sandbox-runtime vendor contents after npm ci
         run: |
-          bwrap --version; ls -l "$(command -v bwrap)"; uname -r; lsb_release -ds
-          cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns || true
-          cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || true
-          ls /etc/apparmor.d/ | grep -i -E "bwrap|userns" || true
-      - name: A — as-is
-        run: bwrap --unshare-net --ro-bind / / --dev /dev --proc /proc -- /bin/true && echo "A OK" || echo "A FAIL $?"
-      - name: B — sysctl apparmor_restrict_unprivileged_userns=0
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; bwrap --unshare-net --ro-bind / / --dev /dev --proc /proc -- /bin/true && echo "B OK" || echo "B FAIL $?"
-      - name: C — remove the bwrap-userns-restrict AppArmor profile
-        run: |
-          if [ -f /etc/apparmor.d/bwrap-userns-restrict ]; then sudo apparmor_parser -R /etc/apparmor.d/bwrap-userns-restrict && echo removed; fi
-          bwrap --unshare-net --ro-bind / / --dev /dev --proc /proc -- /bin/true && echo "C OK" || echo "C FAIL $?"
-      - name: D — unshare-net without loopback (bwrap keeps lo down)
-        run: bwrap --unshare-net --ro-bind / / --dev /dev --proc /proc -- /bin/sh -c 'ip addr 2>/dev/null | head -5; true' && echo "D OK" || echo "D FAIL $?"
+          node -e 'console.log(require("@anthropic-ai/sandbox-runtime/package.json").version)'
+          ls -laR node_modules/@anthropic-ai/sandbox-runtime/vendor | head -40
+          file node_modules/@anthropic-ai/sandbox-runtime/vendor/seccomp/x64/apply-seccomp || true
+          npm pack @anthropic-ai/sandbox-runtime@0.0.76 --dry-run 2>&1 | grep -iE "seccomp|apply" || true
+          grep -n "seccomp\|apply" node_modules/@anthropic-ai/sandbox-runtime/package.json | head
