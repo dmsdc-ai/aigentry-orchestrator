@@ -178,10 +178,10 @@ test("claude: exact closed 8-tool set, one --tools and one --allowedTools, same 
   // Caller --permission-mode pair is replaced exactly as before; everything else is the pre-#652 shape.
   const rest = [...argv.slice(1)];
   rest.splice(rest.indexOf("--permission-mode"), 2);
-  assert.deepEqual(cmd.slice(1), [...rest, "--permission-mode", "acceptEdits", "--tools", TOOLS, "--allowedTools", TOOLS,
+  assert.deepEqual(cmd.slice(1), [...rest, "--permission-mode", "bypassPermissions", "--tools", TOOLS, "--allowedTools", TOOLS,
     "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "", "--no-chrome",
     "--add-dir", cmd[cmd.length - 1]]);
-  assert.ok(!cmd.includes("bypassPermissions"));
+  assert.ok(!cmd.includes("acceptEdits"));
   // env/config/auth unchanged.
   const e = p.m.env as Record<string, string>, home = e.HOME ?? "";
   assert.deepEqual(Object.keys(e).sort(), ["AIGENTRY_TARGET_CWD", "AIGENTRY_TASK_ID", "AIGENTRY_WORKER_ATTEMPT",
@@ -193,6 +193,32 @@ test("claude: exact closed 8-tool set, one --tools and one --allowedTools, same 
   assert.deepEqual((fsCfg.allowWrite as string[]).slice(1), [home, e.TMPDIR]);
   assert.deepEqual(((p.m.config as Json).network as Json).allowedDomains, ["api.anthropic.com:443"]);
   assert.equal(p.m.claudeOAuthHandoff, undefined);
+});
+
+// #1200: a confined worker has nobody to answer Claude Code's own permission prompt; the OS sandbox is
+// the boundary. Confined (scope loaded, sandbox prepared) => the sealed manifest command carries
+// bypassPermissions, never acceptEdits. Unconfined => boot-prepare argv/launcher exactly as before.
+test("#1200 claude: confined manifest command stages bypassPermissions (not acceptEdits); unconfined argv unchanged", () => {
+  const W = world();
+  const u = spawnSync(process.execPath, [BOOT, "--role", "tester", "--cwd", W.project, "--sid", "pm", "--cli", "claude"],
+    { encoding: "utf8", env: env(W), timeout: 30000 });
+  assert.equal(u.status, 0, u.stderr);
+  const uj = parse(u.stdout) ?? {}, uArgv = uj.argv as string[];
+  assert.deepEqual(uArgv.slice(-2), ["--permission-mode", "bypassPermissions"]);
+  assert.equal(count(uArgv, "--permission-mode"), 1);
+  assert.ok(!uArgv.includes("acceptEdits"));
+  assert.match(read(String(uj.spawn_cli)), / --permission-mode bypassPermissions "\$@"\n$/);
+  const { argv, roleCwd } = bootArgv(W, "pm", "claude");
+  // boot-prepare stages the same argv either way; only prepareWorkerSandbox decides the confined mode.
+  assert.deepEqual(argv, uArgv);
+  const p = prepare(W, "pm", "claude", argv, roleCwd);
+  if (WIN) return assertRefused(W, p, UNSUPPORTED);
+  assert.equal(p.status, 0, p.out);
+  const cmd = p.m.command as string[];
+  assert.equal(count(cmd, "--permission-mode"), 1);
+  assert.equal(cmd[cmd.indexOf("--permission-mode") + 1], "bypassPermissions");
+  assert.ok(!cmd.includes("acceptEdits"));
+  for (const f of ["--tools", "--allowedTools"]) assert.equal(cmd[cmd.indexOf(f) + 1], TOOLS);
 });
 
 test("codex: command unchanged, no tool flags added, claude-only gate does not apply", () => {

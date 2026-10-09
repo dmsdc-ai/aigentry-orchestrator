@@ -261,7 +261,8 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   } else {
     const i = command.indexOf("--permission-mode");
     if (i >= 0) command.splice(i, 2);
-    command.push("--permission-mode", "acceptEdits", "--tools", CLAUDE_WORKER_TOOLS, "--allowedTools", CLAUDE_WORKER_TOOLS,
+    // #1200: the OS sandbox is the boundary; a confined worker has nobody to answer a permission prompt.
+    command.push("--permission-mode", "bypassPermissions", "--tools", CLAUDE_WORKER_TOOLS, "--allowedTools", CLAUDE_WORKER_TOOLS,
       "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "", "--no-chrome");
     for (const p of scope.write) command.push("--add-dir", fs.existsSync(p) && fs.statSync(p).isDirectory() ? p : path.dirname(p));
   }
