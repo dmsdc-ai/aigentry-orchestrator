@@ -191,7 +191,12 @@ function seedAuth(cli: string, home: string, cwd: string, oauthSelected = false)
       }
       writePrivate(path.join(config, ".credentials.json"), auth);
     }
+    // #1200: the confined override runs claude with --permission-mode bypassPermissions, and a fresh
+    // config shows the one-time "Bypass Permissions mode … Yes, I accept" dialog before the REPL;
+    // nobody can answer it inside the sandbox (telepty send-key is ready-gated), so the
+    // acknowledgement is staged with the onboarding and trust flags. Key measured in claude 2.1.283.
     writePrivate(path.join(config, ".claude.json"), JSON.stringify({ hasCompletedOnboarding: true,
+      bypassPermissionsModeAccepted: true,
       projects: { [cwd]: { hasTrustDialogAccepted: true } } }));
     return { CLAUDE_CONFIG_DIR: config, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
   }
