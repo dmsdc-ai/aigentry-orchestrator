@@ -302,7 +302,11 @@ async function settle(c) {
 // runtime glob/brace-expands a bare word there, so `%{http_code}` reached curl as `%http_code` (native CI: A1-A3, A8,
 // A10, C1, C2), while the quoted script word kept its bytes. Here bash, not the command line, splits the arguments.
 const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
-const viaScript = (script, args) => ['-c', `set -- ${args.map(shq).join(' ')}\n${script}`, 't1214'];
+// Git for Windows bash's startup puts /mingw64/bin:/usr/bin:$HOME/bin AHEAD of the inherited PATH (native CI-DIAG-R1:
+// A9 resolved /mingw64/bin/curl before the case fakebin). So the case's fakebin is put first again after startup, in
+// bash's own spelling of it; the inherited remainder is kept. On POSIX it is already first. G5 measures the result.
+const FAKEBIN_FIRST = 'PATH="$(cd -- "${T1214_FAKE_DIR:?}/fakebin" && pwd -P):$PATH" || exit 125';
+const viaScript = (script, args) => ['-c', `${FAKEBIN_FIRST}\nset -- ${args.map(shq).join(' ')}\n${script}`, 't1214'];
 const bash = (c, script, args = [], opts = {}) => run(c, BASH, viaScript(script, args), opts);
 
 async function helperPresent() {
@@ -1226,4 +1230,36 @@ describe('G harness controls (no product code)', () => {
     assert.equal(r.status, 0, r.stderr);
     assert.deepEqual(r.stdout.split('\0').slice(0, -1), words);
   });
+
+  // Positive control for every PATH-resolved fake: an empty recorder log is evidence only if the recorder was reachable.
+  // Identity is checked with `-ef` against the node-side fakebin path, not against the spelling the plumbing computes.
+  test('G5 bash resolves every case fake on PATH to the case fakebin; with no fake curl the real curl is still reached', async () => {
+    const names = ['curl', 'telepty', 'kill', 'cmux', 'ps', 'git', 'hitl.sh', 'dispatch.sh'];
+    const probe = 'for n in "$@"; do p=$(type -P "$n"); if [ -n "$p" ] && [ "$p" -ef "$T1214_FAKE_DIR/fakebin/$n" ]; then s=fake; else s=other; fi; printf \'%s %s %s\\n\' "$n" "$s" "$p"; done';
+    const c = makeCase('g5');
+    const r = await bash(c, probe, names, { env: caseEnv(c, { CURL: undefined }) });
+    const real = makeCase('g5-real', { realCurl: true });
+    const rr = await bash(real, `${probe}; "$(type -P curl)" --version | head -n 1`, ['curl'], { env: caseEnv(real, { CURL: undefined }) });
+    await settle(c);
+    await settle(real);
+    assert.equal(r.status, 0, r.stderr);
+    const seen = r.stdout.trim().split('\n').map((l) => l.split(' '));
+    assert.deepEqual(seen.map(([n, s]) => `${n} ${s}`), names.map((n) => `${n} fake`), `resolved: ${r.stdout}`);
+    assert.equal(rr.status, 0, rr.stderr);
+    const [line, version] = rr.stdout.trim().split('\n');
+    assert.match(line, /^curl other \S/, `realCurl case: ${rr.stdout}`);
+    assert.match(version, /^curl \d/, `realCurl case did not reach a real curl: ${rr.stdout}`);
+  });
+
+  // The TS callers (E, POSIX) spawn kill/cmux/ps/git from node through the case PATH; their tripwire logs are asserted empty.
+  if (POSIX) {
+    test('G6 a node-spawned kill/cmux/ps/git on the case PATH is the recorder (E tripwires are reachable)', () => {
+      const c = makeCase('g6');
+      for (const n of ['kill', 'cmux', 'ps', 'git']) {
+        const r = spawnSync(n, ['t1214-probe'], { cwd: c.dir, env: caseEnv(c), encoding: 'utf8', timeout: 5000 });
+        assert.ifError(r.error);
+        assert.deepEqual(calls(c, n), ['t1214-probe\t'], `${n}: the case recorder was not the command node resolved`);
+      }
+    });
+  }
 });
