@@ -566,6 +566,96 @@ test("legacy kept: no decision → boot-prepare argv carries today's literals", 
   } finally { f.cleanup(); }
 });
 
+// ── #1206 S1-B route effort (role policy) through the real --resolve command ──
+// Precedence (PLAN D4): operator env AIGENTRY_<CLI>_EFFORT > route policy effort > catalog model default > omit.
+// Metadata is off, so every fact is the bootstrap catalog (claude-opus-5-5 → medium; gpt-6-astra → none; codex band null).
+function resolveRoute(f: Fx, cli: "claude" | "codex", route: Rec | null, env: NodeJS.ProcessEnv = {}): Run {
+  const routeArgs = route ? ["--route-json", JSON.stringify(route)] : [];
+  return spawnSync(process.execPath, [ROUTER, "--resolve", "--cli", cli, "--sid", SID, "--task", TASK, ...routeArgs],
+    { cwd: f.root, env: { ...f.env, PATH: pathWith(f.bin), ...env }, encoding: "utf8", timeout: 20000 });
+}
+function routedDecision(f: Fx, cli: "claude" | "codex", route: Rec, env: NodeJS.ProcessEnv = {}): Rec {
+  const r = resolveRoute(f, cli, route, env);
+  assert.equal(r.status, 0, `resolver: ${r.stderr}${r.stdout}`);
+  return (JSON.parse(r.stdout) as Rec).decision as Rec;
+}
+const OPUS = { model: "claude-opus-5-5", decided_by: "table" };
+
+test("S1-B: operator env effort beats the route policy effort", () => {
+  const f = fixture();
+  try {
+    const d = routedDecision(f, "claude", { ...OPUS, effort: "high" }, { AIGENTRY_CLAUDE_EFFORT: "low" });
+    assert.deepEqual(d.effort, { channel: "argv:--effort", token: "low", state: "explicit-unverified" });
+    assert.deepEqual([d.requested.effort, d.requested.source], ["low", "env"], "the operator request is what is recorded");
+  } finally { f.cleanup(); }
+});
+
+test("S1-B: a route policy effort beats the model default (state policy, source role-config)", () => {
+  const f = fixture();
+  try {
+    const d = routedDecision(f, "claude", { ...OPUS, effort: "high" });
+    assert.deepEqual(d.effort, { channel: "argv:--effort", token: "high", state: "policy" });
+    assert.deepEqual([d.requested.model, d.requested.effort, d.requested.source], ["claude-opus-5-5", "high", "role-config"]);
+    assert.match(String(d.rationale), /effort high policy/);
+    // Control: the same route without an effort keeps today's model default.
+    const plain = routedDecision(f, "claude", OPUS);
+    assert.deepEqual([plain.effort.token, plain.effort.state, plain.requested.effort], ["medium", "model-default", undefined]);
+    // A route effort that is not a token is a malformed route, never silently dropped.
+    for (const effort of ["", " high", 3, null]) {
+      const r = resolveRoute(f, "claude", { ...OPUS, effort });
+      assert.equal(r.status, 2, `${JSON.stringify(effort)}: ${r.stdout}`);
+      assert.match(r.stdout, /MODEL_RESOLVE_USAGE/);
+    }
+  } finally { f.cleanup(); }
+});
+
+test("S1-B: policy xhigh passes the claude band; max (auto_effort_never) and an off-band token drop to the model default", () => {
+  const f = fixture();
+  try {
+    const x = routedDecision(f, "claude", { ...OPUS, effort: "xhigh" });
+    assert.deepEqual([x.effort.token, x.effort.state], ["xhigh", "policy"]);
+    for (const [token, why] of [["max", /auto_effort_never/], ["turbo", /not a documented argv:--effort level/]] as const) {
+      const d = routedDecision(f, "claude", { ...OPUS, effort: token });
+      assert.deepEqual([d.effort.token, d.effort.state], ["medium", "model-default"], `${token} is dropped, not refused`);
+      assert.equal(d.requested.effort, token, "requested keeps the policy token apart from the selection");
+      assert.match(String(d.rationale), new RegExp(`policy effort ${token} dropped`));
+      assert.match(String(d.rationale), why);
+    }
+  } finally { f.cleanup(); }
+});
+
+test("S1-B: a codex route effort passes as policy (band null) on the codex channel", () => {
+  const f = fixture();
+  try {
+    const d = routedDecision(f, "codex", { model: "gpt-6-astra", decided_by: "table", effort: "medium" });
+    assert.deepEqual(d.effort, { channel: "argv:-c model_reasoning_effort", token: "medium", state: "policy" });
+    assert.equal(d.requested.source, "role-config");
+  } finally { f.cleanup(); }
+});
+
+test("S1-B D9: catalog Fable rows carry worker_never and the resolver refuses them for a worker spawn by name", () => {
+  const catalog = JSON.parse(readFileSync(join(REPO, "docs/model-profiles/model-catalog.json"), "utf8")) as Rec;
+  const rows = catalog.surfaces["anthropic-models"].rows as Rec[];
+  const fable = rows.filter((r) => r.tier === "fable");
+  assert.ok(fable.length >= 1 && fable.every((r) => r.worker_never === true), JSON.stringify(fable));
+  assert.ok(rows.filter((r) => r.tier !== "fable").every((r) => r.worker_never === undefined), "only Fable rows are worker_never");
+  const f = fixture();
+  try {
+    for (const { model } of fable) {
+      // Explicit operator request: refused (exit 4), never substituted.
+      const explicitRun = resolveRoute(f, "claude", null, { AIGENTRY_CLAUDE_MODEL: model });
+      assert.equal(explicitRun.status, 4, explicitRun.stdout);
+      assert.match(explicitRun.stdout, /MODEL_TUPLE_INCOMPATIBLE/);
+      assert.match(explicitRun.stdout, new RegExp(`${model} is catalog worker_never`));
+      // Routed (role policy): no eligible tuple (exit 10), same named reason.
+      const routedRun = resolveRoute(f, "claude", { model, decided_by: "table", effort: "high" });
+      assert.equal(routedRun.status, 10, routedRun.stdout);
+      assert.match(routedRun.stdout, /MODEL_NO_ELIGIBLE_TUPLE/);
+      assert.match(routedRun.stdout, new RegExp(`${model} is catalog worker_never`));
+    }
+  } finally { f.cleanup(); }
+});
+
 test("packaging: the resolver siblings ship and #1166 inventory stays listed", () => {
   const manifest = readFileSync(join(REPO, "bin/init/manifest.mjs"), "utf8");
   for (const file of ["bin/request-capture-inventory.mjs", "bin/boot-prepare.mjs", "bin/model-router.mjs",

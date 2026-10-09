@@ -13,8 +13,12 @@
 //     current row, and exactly one current row exists in the same documented
 //     tier (or a documented replacement is current). Degraded metadata keeps the
 //     incumbent and says so. No eligible tuple is exit 10.
-//   - effort: explicit token if compatible; else the documented model default
-//     if it is in the channel band and not max/ultra/ultracode; else OMIT.
+//   - effort: explicit token if compatible; else the route's role-policy token
+//     (#1206) if compatible and not max/ultra/ultracode, else dropped with a
+//     note; else the documented model default if it is in the channel band and
+//     not max/ultra/ultracode; else OMIT.
+//   - worker_never (#1206 D9): a catalog row so marked is never a worker model,
+//     refused by name even when requested explicitly.
 //   - executable: operator-declared first (no fallback), else the first PATH hit
 //     not positively excluded (known version below a documented/observed
 //     minimum, or an identity-keyed rejection).
@@ -79,7 +83,8 @@ function validRow(r) {
     (r.retire_not_before === null || r.retire_not_before === undefined || DATE.test(r.retire_not_before)) &&
     (r.labels === undefined || (Array.isArray(r.labels) && r.labels.every(isToken))) &&
     (r.effort_excluded === undefined || (Array.isArray(r.effort_excluded) && r.effort_excluded.every(isToken))) &&
-    (r.replacement === undefined || isToken(r.replacement));
+    (r.replacement === undefined || isToken(r.replacement)) &&
+    (r.worker_never === undefined || r.worker_never === true);
 }
 
 /** Structural check of docs/model-profiles/model-catalog.json. Returns the catalog or throws. */
@@ -122,7 +127,7 @@ function publicBinding(e) {
 /**
  * input = {
  *   cli: "claude"|"codex", sid, task, today: "YYYY-MM-DD",
- *   route: null | { model, decided_by }            // null = explicit --cli
+ *   route: null | { model, decided_by, effort? }   // null = explicit --cli; effort = role policy token
  *   explicitCli: boolean,                           // --cli was given by flag
  *   request: { model?: {value, source}, effort?: {value, source}, executable?: {path, source} },
  *   catalog,                                        // validateCatalog() output
@@ -144,6 +149,7 @@ export function resolveSpawnDecision(input) {
     if (r !== undefined && !isToken(v)) return refuse(REFUSAL.REQUEST_INVALID, `requested ${name} is empty, too long or contains control characters`);
   }
   if (route && !isToken(route.model)) return refuse(REFUSAL.REQUEST_INVALID, "route model");
+  if (route && route.effort !== undefined && !isToken(route.effort)) return refuse(REFUSAL.REQUEST_INVALID, "route effort");
 
   const bootstrap = own(catalog.surfaces, policy.surface);
   const fresh = surface && surface.id === policy.surface && surface.result === "fresh" && Array.isArray(surface.rows);
@@ -157,6 +163,8 @@ export function resolveSpawnDecision(input) {
   // Documented retirement is a hard gate from every source, fresh or not.
   const retired = (m) => [bootRow(m), freshRow(m)].some((r) => r && (r.lifecycle === "retired" ||
     (r.retire_on && r.retire_on <= today)));
+  // #1206 D9: worker_never is catalog policy (bootstrap rows), never read from fetched documentation.
+  const workerNever = (m) => bootRow(m)?.worker_never === true;
   // "Not sooner than D" is a lower bound, never a retirement date: on/after D the source
   // commits to neither continued availability nor retirement, so it is noted, never refused.
   const floorRow = (m) => (fresh && freshRow(m) ? freshRow(m) : bootRow(m));
@@ -215,6 +223,7 @@ export function resolveSpawnDecision(input) {
 
   const explicitModel = request.model?.value;
   const explicitEffort = request.effort?.value;
+  const policyEffort = explicitEffort === undefined ? route?.effort : undefined;
   const incumbent = route ? route.model : policy.policy_incumbent;
   const candidates = [];
   const notes = [];
@@ -249,14 +258,21 @@ export function resolveSpawnDecision(input) {
 
   const rejections = [];
   for (const model of candidates) {
+    if (workerNever(model)) { rejections.push(`${model} is catalog worker_never: never a worker model`); continue; }
     if (retired(model)) { rejections.push(`${model} is documented retired on this surface as of ${today}`); continue; }
     if (unavailable(model)) { rejections.push(`${model} was rejected as unavailable (operator observation)`); continue; }
     const floor = floorPassed(model);
+    // #1206: a role-policy token the catalog rejects is dropped to the model default, never refused
+    // (it is not an operator request).
+    const policyDropped = policyEffort === undefined ? null : policy.auto_effort_never.includes(policyEffort)
+      ? `effort ${policyEffort} is never auto-selected (auto_effort_never)` : effortRejection(model, policyEffort);
     let effort;
     if (explicitEffort !== undefined) {
       const why = effortRejection(model, explicitEffort);
       if (why) { rejections.push(why); continue; }
       effort = { token: explicitEffort, state: !floor && defaultEffort(model) === explicitEffort ? "explicit" : "explicit-unverified" };
+    } else if (policyEffort !== undefined && !policyDropped) {
+      effort = { token: policyEffort, state: "policy" };
     } else {
       const d = defaultEffort(model);
       effort = d && d !== "unsupported" && !policy.auto_effort_never.includes(d) && (!band || band.includes(d))
@@ -276,6 +292,7 @@ export function resolveSpawnDecision(input) {
     if (explicitModel !== undefined) requested.model = explicitModel;
     else if (route) requested.model = route.model;
     if (explicitEffort !== undefined) requested.effort = explicitEffort;
+    else if (policyEffort !== undefined) requested.effort = policyEffort;
     if (request.executable) requested.executable = request.executable.path;
     const sources = [request.model?.source, request.effort?.source, request.executable?.source].filter(Boolean);
     requested.source = sources.includes("flag") ? "flag" : sources.includes("env") ? "env"
@@ -287,8 +304,10 @@ export function resolveSpawnDecision(input) {
       ...notes,
       `catalog membership: ${membership} (${factSource}); cli compatibility: ${cliCompat}; account availability: unknown`,
       ...(floor ? [floorNote(model, floor) + (explicitModel !== undefined ? "; explicit request kept unverified" : "")] : []),
+      ...(policyDropped ? [`policy effort ${policyEffort} dropped (${policyDropped}); model default applies`] : []),
       effort.token === null ? `effort omitted (${defaultEffort(model) === "unsupported" ? `documented not supported; source: ${effortFact(model).source}` : "no usable documented default"})`
-        : `effort ${effort.token} ${effort.state}` + (effort.state === "model-default" ? ` (source: ${effortFact(model).source})` : ""),
+        : `effort ${effort.token} ${effort.state}` + (effort.state === "model-default" ? ` (source: ${effortFact(model).source})`
+          : effort.state === "policy" ? " (role-config route)" : ""),
       `executable ${exe.path} -> ${exe.realpath} version ${exe.version ?? "unknown"} (${exe.versionSource})`,
       ...skipped.map((s) => `skipped ${s}`),
       ...(input.executableNotes || []),
