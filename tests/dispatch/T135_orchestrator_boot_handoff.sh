@@ -75,6 +75,7 @@ LATEST_MD="$WS/state/handoff/latest.md"
 # ── recorders (T131/T134 shapes) ────────────────────────────────────────────
 PS_ARGV="$T_TMP/ps-argv.log"; KILL_LOG="$T_TMP/kill.log"; CURL_LOG="$T_TMP/curl.log"
 TELEPTY_ARGV="$T_TMP/telepty-argv.log"; EXEC_LOG="$T_TMP/exec.log"
+t_list_sessions  # an empty `telepty list --json`, through the lib.sh helper (T69 fixture invariant)
 cat > "$STUB_BIN/ps-recorder135.sh" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$PS_ARGV"
@@ -86,7 +87,7 @@ EOF
 cat > "$STUB_BIN/telepty-recorder135.sh" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$TELEPTY_ARGV"
-printf '[]'
+cat "$STUB_LIST_FILE"
 EOF
 cat > "$STUB_BIN/curl-recorder135.sh" <<EOF
 #!/usr/bin/env bash

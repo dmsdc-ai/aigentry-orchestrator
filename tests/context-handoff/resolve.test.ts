@@ -17,6 +17,7 @@ import {
   boundViolations,
   bytes,
   dropBox,
+  engineWs,
   findResolveHandoff,
   hasControlOtherThanNewline,
   makeBox,
@@ -60,7 +61,7 @@ test("write:false — a ref, the first-turn line, the markdown; nothing written 
   const bootId = randomUUID();
   const r = await resolve(b, { write: false, bootId });
   assert.ok(r.ref !== null, `a source exists: ${JSON.stringify(r.record)}`);
-  assert.equal(r.ref.file, path.join(b.ws, "state", "handoff", "latest.md"), "absolute <ws>/state/handoff/latest.md");
+  assert.equal(r.ref.file, path.join(engineWs(b.ws), "state", "handoff", "latest.md"), "absolute <ws>/state/handoff/latest.md");
   assert.equal(r.ref.source.cli, "codex");
   assert.equal(r.ref.source.sessionId, p.session);
   assert.equal(r.ref.source.path, p.file);

@@ -28,6 +28,7 @@ import {
   REPO,
   at,
   dropBox,
+  engineWs,
   makeBox,
   parseHandoff,
   plant,
@@ -123,7 +124,7 @@ function assertInert(boot: Boot, label: string): void {
 function assertDelivery(boot: Boot, booted: Cli, ws: string, label: string): void {
   const head = ["telepty", "allow", "--id", SID, "--auto-restart", ...TAIL[booted]];
   if (booted === "claude") {
-    assert.deepEqual(boot.argv, [...head, "--append-system-prompt-file", path.join(ws, "state", "handoff", "latest.md")], `${label}: claude's measured delivery tokens`);
+    assert.deepEqual(boot.argv, [...head, "--append-system-prompt-file", path.join(engineWs(ws), "state", "handoff", "latest.md")], `${label}: claude's measured delivery tokens`);
   } else {
     assert.deepEqual(boot.argv, head, `${label}: an owed delivery contributes no tokens`);
     assert.ok(`${boot.stdout}\n${boot.stderr}`.includes(`handoff: ${booted} delivery unmeasured — backstop only (AGENTS.md)`), `${label}: the backstop line`);

@@ -51,6 +51,15 @@ export function makeBox(opts: { state?: boolean } = {}): Box {
   return { base, home, ws: fs.realpathSync(ws) };
 }
 
+/**
+ * The workspace as the engine resolves it (`fs.realpathSync.native`). On win32 that expands an
+ * 8.3 short name (`RUNNER~1`) which `fs.realpathSync` keeps, so an expected engine path is built
+ * from this, not from `Box.ws`.
+ */
+export function engineWs(ws: string): string {
+  return process.platform === "win32" ? fs.realpathSync.native(ws) : ws;
+}
+
 export function dropBox(b: Box): void {
   fs.rmSync(b.base, { recursive: true, force: true });
 }
