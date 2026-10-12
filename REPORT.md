@@ -1,96 +1,123 @@
-REPORT: oc-1204-idq task #2026101204 — CONTRACT SPEC — DONE
+REPORT: oc-1204-idq2 task #2026101204 — CONTRACT SPEC FIX 1 (idq) — DONE
 
-Contract specs for ES-01 identity/device and ES-03 shared queue (with the ES-08 intake
-linkage) are written, with the ADR. This is a specification deliverable only: no code,
-no tests, no queue edit, no migration, no credential, no network use. It does not claim
-completion of #2026101204 or any child.
+branch: task-1204-env-continuity-idq (base e2269f3, new commits only, not pushed)
+files: docs/specs/2026-10-12-env-continuity-identity.md (ES-01), docs/specs/2026-10-12-env-continuity-shared-queue.md (ES-03 + ES-08 §12), docs/adr/2026-10-12-env-continuity-identity-and-queue.md, REPORT.md
 
 commits:
-- 38eed58 docs(2026101204): ES-01 identity, ES-03 shared queue + ES-08 linkage contract specs and ADR (branch task-1204-env-continuity-idq, not pushed)
+- d1d6440 B1 slowapi wiring restated; per-route /devices limits as new work; fail closed
+- 92a1f8b B2–B4 inference vs measurement; neutral §3.4; per-proposal 제4조; scheme-neutral §11
+- e528072 B5–B7 gate contract vs cli.ts; same-device re-claim; lease keeper
+- d4cacfb B8 refresh check order and retry tolerance
+- 82afaf4 B9 durable device check on every ES-0x request
+- e3568a4 B10 stdin-only secret transport
+- e267cfd B12 ES-08 retry contract
+- f0cfe8a B13 Rule 47 rows (local amend of my own unpushed commit; a script failure had left the ADR half out)
+- 8b7b22b B11 per-row testability matrices
+- e4a75cc non-blocking + grounding corrections + ES-01 §8.1 interface for ES-02/ES-04
+- f3643e8 escape two table pipes
 
-files:
-- docs/specs/2026-10-12-env-continuity-identity.md (ES-01)
-- docs/specs/2026-10-12-env-continuity-shared-queue.md (ES-03 + ES-08 §12)
-- docs/adr/2026-10-12-env-continuity-identity-and-queue.md (ADR)
-- REPORT.md
+resolved:
+- B1: ES-01 §1.4 now reports the wiring as measured: a Limiter is built (main.py:90-95) but no SlowAPIMiddleware is registered (main.py:191-203), so default limits do not run. The only decorator is repositories.py:80, on its own Limiter (:26). The registry rate-limiter issue is cited. §7.4 proposes per-route decorators on /devices/* and does not turn on the global middleware. If the limiter store (Redis) is down, authorize/approve/deny/token fail closed with 503. Test rows ID-12 and ID-13. ADR §7 prices this as new work.
+- B2: ES-03 §3.1 "Exists (measured)" now says "observed …; issuer not measured". The parent-row quote is marked as a record, not a measurement. The "presumably" and "no coordination" text moved into a labelled "Inference (not measured)" list.
+- B3: ES-03 §3.4 "architect's input" was replaced by a summary of the §3.2 table with no ranking. P-C is stated as having the best issuance availability. The P-B cross-host path and the 제4조 cost are listed as consequences of the options, with no default.
+- B4: ADR §4 gives a 제4조 verdict per proposal (CONSTITUTION.md:68-75). P-A complies. P-B is two authorities and is admissible only with an SSOT allocator contract plus a declared mirror. P-C is admissible only with exactly one client-side counter (the lease keeper). ES-03 §11 local-only mode is now scheme-neutral. The ADR D-Q-1 row no longer points to an "architect's input".
+- B5: ES-03 §3.6 now separates internal rc (cli.ts:764-788) from process exits (taskGateReject: exit 4 in hard at :731, proceed in warn/off at :725-729; ambiguous id exits 5 in every mode at :774).
+  - New finding: exit 6 is already taken by waitForReady "never registered" (:1123-1126, exited at :1335). The lease refusal is therefore exit 11 TASK_LEASE_HELD, and "lease unavailable" is exit 12. Both are mode-independent; warn/off do not bypass them. In account mode the escape hatch is the audited --no-task.
+  - The gate at :1260 stays read-only. The claim is a separate lease step after the dedup/retry checks (:1285-1308) and before spawn (:1310-1312).
+  - Exits before transport detach the sid and release the lease. Exits 8, 7, 5-after-transport and 3-after-a-failed-inject (:1388-1395) keep the attachment. kill -9 falls back to TTL expiry.
+  - A dispatch promotes only pending|queued → delegated, as today's ledger does (:855). Q-15 was rewritten to match.
+- B6: §4.2 SQL now allows `OR lease_device_id = :d`. A live same-device claim does not bump the token, extends the TTL and returns new_lease=false. An expired or absent lease bumps. Q-18 covers the second dispatch from the same device; Q-7 and Q-9 were adjusted.
+- B7: new ES-03 §5.1 names the devkit lease keeper as the heartbeat owner: a user-level, on-demand, single-instance process that is the only reader of the ES-01 key store. Callers reach it over a 0600 UDS with peer-uid check, or an ACL'd named pipe on Windows; tokens never cross that endpoint. §5.1 gives its lifecycle and failure modes. Q-7 now kills this process. The ADR §3 rejected row is narrowed to network daemons/relays. Running the keeper is decision D-Q-9.
+- B8: ES-01 §5 defines the check order: device lookup, then the Ed25519 proof, then the hash.
+  - Current hash → rotate.
+  - refresh_prev_hash → treated as a lost-response retry: re-rotate, never revoke, at any age.
+  - Any older hash with a valid proof → revoke.
+  - No valid proof → invalid_grant with no state change.
+  - New columns refresh_prev_hash and refresh_rotated_at; new rows ID-14 and ID-15.
+  - Pattern cited: RFC 9700 §4.14.2 and RFC 6749 §10.4, from memory; not re-read (no network).
+- B9: ES-01 §7.1 and §7.2 now run a durable device check (`FOR SHARE`, against the revoke's `FOR UPDATE`) on every ES-0x request, reads included, with no Redis dependency. §11 is consistent with this. Brain-Git data is reader-verified (ES-02 R7). New row ID-16; Q-5 now covers sync reads.
+- B10: §6 requires stdin-only secret transport: macOS `security -i` with the command on stdin, PowerShell `-Command -` with `[Console]::In`, Linux `secret-tool` reading stdin. No argv, env or temp files. The macOS default is explicitly conditional on ES-09 verifying the stdin path; if it cannot, D-ID-2 must be re-decided. The macOS fallback is now an explicit `--keystore file`. ID-10 now covers argv and env; D-ID-2 rows updated.
+- B11: ES-01 §15.1 and ES-03 §13.1 add per-row "Measures / Does not measure / Env (Linux-only counts?) / Blocked on".
+  - F1/H2/H3/OS3 are defined. Linux-only results never close H2, H3 or OS3 rows.
+  - BLOCKED rows: ID-11, Q-17 (Mac offline, no Windows runner), Q-14, Q-22 (D-Q-1). Rows needing the Mac are marked "Mac offline".
+  - New rows: ID-17 (admin does not cross users), ID-18 (X-API-Key refused), ID-19 (approval CSRF), Q-20 (untrusted content, issue text grants nothing), Q-21 (receipt states and atomicity), Q-22 (offline create), Q-23 (DEPENDENCIES_OPEN / VERSION_CONFLICT / EVIDENCE_REQUIRED).
+  - Redis-down behaviour: ID-13 and ID-16. ES-08 retry: Q-19.
+- B12: ES-03 §12.2 retry contract:
+  - Only the adapter retries, from a local durable outbox.
+  - Every attempt uses the same intake:<key>, delivery_ref and hash.
+  - Retryable and never-retried sets are defined.
+  - At most 8 attempts, full-jitter backoff (base 30 s, ×2, cap 1 h).
+  - Terminal states rejected and retry_exhausted are visible in ES-07. Manual retry reuses the key.
+  - Row Q-19.
+- B13: new rows:
+  - D-Q-6: OS hosts/runners (cost).
+  - D-Q-7: hosted Postgres storage (cost / personal data).
+  - D-Q-8: ES-08 blobs and receipts retention (personal data, third-party authors).
+  - D-ID-5: revoked/expired device rows and authorizations retention (personal data).
+  - D-Q-9: lease keeper (operational change).
+  - Each has a recommended default, in the specs and in ADR §5.
+  - The P-B network path is folded into the D-Q-1 category with no default.
 
-guardrail applied (orchestrator follow-up 2026-10-12 13:59Z):
-- ES-03 §3 is now Findings → Proposals (P-A server per-queue counter, P-B Mac ledger +
-  server mirror, P-C partitioned ranges, each with concurrent-issuance, offline,
-  alias/migration analysis) → "DECISION REQUIRED BY USER" (D-Q-1). No issuance scheme
-  adopted, no migration before the Mac ledger/allocator and mapping are reviewed.
-  Dependent text (schema, projection, offline create, ES-01 enumeration note, matrix
-  Q-14/Q-15) reworded so that no rule reads as adopted.
-- Finding (a) re-measured: no allocator rule in docs/rules.md, AGENTS.md,
-  .agents/skills/orchestrate-turn/SKILL.md, bin/tq-*.sh (read and sort only; the one write
-  is active_focus at tq-focus.sh:19), release/PROJECTION.md. Finding (b): Mac ledger
-  unreadable (offline).
+non_blocking_applied:
+- N1: the four line cites are corrected (api_key.py:21-31, user_session.py:21-25, session_service.py:13, API-CONTRACT:173).
+- N2: two devkit binaries (package.json:19-20); the build plan's `aigentry login` is recorded as renamed to `aigentry-devkit login`.
+- N3: samesite lax at login vs strict on /refresh (oauth.py:194-211). CORS allow_headers is noted (main.py:194-200).
+- N4: G2 is closed only for ES-0x endpoints. The ADR §7 pricing is corrected and the general fix is left to the registry issue.
+- N5: FOR SHARE vs FOR UPDATE (done with B9).
+- N6: explicit --keystore file on macOS (done with B10).
+- N7: tq-focus.sh:18-20 is named as a second writer, with its non-atomic cross-filesystem mv. active_focus and tracks are local-only cache fields. The atomicity fix is mentioned only.
+- N8: the ADR says M1–M5 is needed under every option, and P-C only avoids renumbering. Lease keeper and outbox work are added to the estimate inputs.
+- N9: the tasks.progress/progress_at columns hold the latest progress.
+- N10: ID-5 and ID-6 are labelled supplementary.
+- N11: ES-03 §2.3 is now conditional on D-Q-2.
+- N12: D-Q-5 `auto` covers the claim only. Worker start is the AC5 approval (§6 and D-Q-5 rows).
+- N13: sign-up = first GitHub login (oauth_service.py:84-136), in §4 and ID-2.
+- N14: the approval page shows request time and network prefix (new request_net_prefix column). Active devices are capped at 20 (proposal, under D-ID-1). Row ID-20.
+- N15: install-state.json with no chmod (install.sh:255) is added to the observed-not-fixed list.
+- Grounding WRONG/NOT FOUND #12, #14, #15, #21, #24 and the #29 sub-cite were all re-measured and corrected.
+- Sibling interface: ES-01 §8.1 provides what ES-02 §5.5 R1–R7 ask for:
+  - signed per-device age_recipient (new columns plus PUT /devices/me/age-recipient);
+  - an authenticated keyed device list including revoked devices and revoked_at (GET /devices?include=keys&all=true);
+  - revoked_at set once and never re-bound;
+  - registry-as-key-directory trust model, with endorsement left to ES-02 D-9;
+  - github_id in /devices/me for the brain-repo binding;
+  - the §7.2/§7.3 rows for brain-Git data reworded (R7);
+  - row ID-21.
+  The ES-02/ES-04 files were not edited.
 
-grounded_in:
-- aigentry-registry@ac221cd
-  - src/aigentry/api/v1/auth.py:43-106 — JWT-cookie path substitutes any active tenant API key (user identity lost, :71-82); Redis failure falls through (:83-84).
-  - src/aigentry/api/v1/oauth.py:28-246 — GitHub web flow; cookies only (:94-113); refresh reads cookie only (:166); rotation without reuse detection (:186-191); state values logged (:59-72).
-  - src/aigentry/services/auth/oauth_service.py:29,84-169 — scope read:user user:email; one tenant per user (:102-109); admin via ADMIN_GITHUB_IDS (:111-120); JWT claims and lifetimes.
-  - services/auth/revocation_service.py — Redis-only jti revocation with TTL.
-  - services/auth/session_service.py:11 — 24 h sessions tied to API key.
-  - services/auth/api_key_service.py:20,55-87 — aig_ keys, sha256 hash.
-  - models/user.py, api_key.py, user_session.py, tenant.py, user_role.py — schemas (api_keys has no user_id; github_id Integer).
-  - alembic/versions/20260309_000001…, 20260214_000002… — users/auth tables; single alembic head 20260319_000002 (computed).
-  - api/v1/tenants.py:34-70 — unauthenticated first-tenant bootstrap.
-  - db/session.py:10-20 — request-scoped commit/rollback.
-  - config.py:16-18,91-93,107-122 — Postgres asyncpg, rate limits, JWT settings (60 min / 7 d).
-  - main.py:89-108 — slowapi limiter.
-  - pyproject.toml:36-37 — cryptography, PyJWT present.
-  - api/router.py:85,100 — auth/oauth mount points.
-- aigentry-devkit@604f2b5
-  - package.json:18-21 — only `aigentry-devkit` binaries.
-  - bin/aigentry-devkit.js:24-60,754-830 — command table, no login/device.
-  - install.sh:24-26,242-246,261-269,666-725 — plaintext API key in env.sh and install-state.json; registry modes cloud/self_hosted/skip; bootstrap call.
-  - install.ps1:17-19,160-184 — same on Windows, no ACL step.
-- aigentry-telesession@90d88aa (main; PR #3 commit b7effec not present, not read)
-  - API-CONTRACT-TELESESSION.md:141-147,172,180-182 — request_id dedupe semantics, id alphabet, "not exactly-once".
-  - src/transports/telepty.js:989-993 — REQUEST_IN_FLIGHT / REQUEST_ID_CONFLICT.
-  - src/store.js:63,316-330 — request states; atomic write pattern.
-- orchestrator (this clone @71cc2da, plus private state from the main checkout, read-only)
-  - src/dispatch/cli.ts:671-892 — task gate modes/statuses/rc codes, ambiguity rc 5, auto-ledger and atomic write.
-  - release/tasks.json, release/PROJECTION.md:20-75, scripts/release-admission.mjs:17-27,228-242 — projection = positive safe integer id + slug; hand-authored; private queue is the authority.
-  - src/control/contracts.ts:18-24 — task.create is a pending (refused) operation.
-  - docs/rules.md Rule 34 (568-597), 45 (837-849), 47 (864-882), 50 (907-918).
-  - tooling/instructions/CONSTITUTION.md 제1,4,6,14,15,17조.
-  - state/task-queue.json (main checkout) — 37 rows, all integer date-form ids; status counts; link-field shapes (free-text dependencies); #2026101204 canonical_id BLOCKED, approval/not_approved, children 2026101206–14.
-  - state/specs/2026-10-12-environment-sharing-release-requirements.md, state/draft/2026-10-12-environment-sharing-build-plan-proposal.md — scope, acceptance criteria, test matrix.
+declined: none.
+- Partly deferred: N3's CORS change is conditional ("add it if the approval page is served cross-origin"). Where the page is served was not measured (the frontend was not read).
 
-decisions_needed:
-- D-ID-1 token lifetimes — privacy/permission — rec: access 15 min; refresh idle 30 d / absolute 90 d; rotation with reuse → revoke.
-- D-ID-2 device secret storage — privacy/permission — rec: macOS Keychain (`security`), Linux 0600 file ~/.config/aigentry/device/, Windows DPAPI file; never env/state files/logs.
-- D-ID-3 enable device credential + endpoints on a deployed registry — permission expansion/production deploy — rec: ship disabled, enable after ES-09 isolation PASS.
-- D-ID-4 devices → registry HTTPS traffic — network change/personal-data transfer — rec: only to the install-chosen registry URL; no new relay.
-- D-Q-1 canonical ID issuance (P-A/P-B/P-C) and whether to migrate — operational data change — NO default adopted (guardrail); prerequisites: Mac ledger read + sha256, mapping dry-run with collision list, issuance freeze.
-- D-Q-2 registry Postgres as authoritative store (opt-in) — operational data/personal-data transfer — rec: yes, opt-in, self-hostable, local-only unchanged.
-- D-Q-3 execute migration M3/M5 — operational data change — rec: only after D-Q-1 and the user's review of mapping.json; nothing deleted.
-- D-Q-4 server retention of notes/events — personal data — rec: queue lifetime + export.
-- D-Q-5 default reassign_policy (autonomous Linux takeover) — permission — rec: auto for tasks Linux is configured to serve, else manual.
+new_decisions: D-ID-5, D-Q-6, D-Q-7, D-Q-8, D-Q-9 (each with a recommended default). D-Q-1 now also carries "network change if P-B" (no default). The active-device cap of 20 is folded into D-ID-1.
+
+grounded_in (new, read this cycle):
+- registry @ac221cd:
+  - main.py:90-95, :93, :107-108, :191-203, :194-200
+  - config.py:23, :91-93
+  - api/v1/repositories.py:7-8, :26, :80
+  - api/v1/oauth.py:160-211 (/refresh: strict, no domain)
+  - models/api_key.py:21-31; models/user_session.py:21-25
+  - services/auth/session_service.py:13
+  - services/auth/oauth_service.py:84-136
+- devkit @604f2b5: package.json:19-20; install.sh:250-255 (writeFileSync, no chmod).
+- telesession: API-CONTRACT-TELESESSION.md:173.
+- orchestrator @71cc2da: src/dispatch/cli.ts
+  - gate: :671-892, :725-731, :764-788, :774, :790-828, :855
+  - exit-6 owner: :1123-1141, :1335
+  - other exits: :1338, :1355, :1362, :1366-1368, :1388-1395, :1402-1404, :1413-1415, :1418-1420, :1424
+  - sid derivation and dedup: :1260-1308
+- orchestrator other files: bin/tq-focus.sh:18-20; tooling/instructions/CONSTITUTION.md:68-75; requirements §상세 수용 기준 AC1/3/5/8 and §검증 매트릭스; build plan line 84 ("OS runner 확보").
+- sibling: ES-02 spec §5.1–§5.5 (ctxws clone @dbdf2ea), read-only.
 
 not_measured:
-- Mac queue/ledger (offline): contents, max id, issuance practice, duplicates.
-- Registry deployment state, version, secrets/Redis/Postgres config, TLS; GitHub OAuth configured or not.
-- Registry frontend (settings/approval page) — not read.
-- telesession PR #3 at b7effec — not in the readable checkout.
-- macOS/Windows behaviour of any key store; Postgres isolation level in deployments (spec assumes the default READ COMMITTED).
-- Whether aigentry-ssot already registers any devices/queues contract.
-
-estimate_inputs:
-- Identity: the reusable base is larger than assumed, but the new surface (2 tables, about 7 endpoints, a frontend approval page, bearer dependency, refresh family, a 3-OS key store, 4 CLI commands) and the G2 fix in a shared auth dependency push it to the upper half of 3–6.
-- Queue: about 7 tables, about 11 ops, cache/sync client, gate changes (resolve + lease + rc 6 + event ledger), reconcile. Upper half of 5–10 under P-A/P-B (Mac read + mapper + dry-run); lower half under P-C.
-- ES-08 contract: small.
-- ES-09: the per-OS rows cannot close on Linux only. Mac offline and no Windows runner measured.
-- 제15조 SSOT multi-component approval adds latency that the placeholder does not include.
+- Runtime: nothing was executed, including slowapi without middleware, READ COMMITTED behaviour of FOR SHARE/FOR UPDATE, `security -i` stdin handling on macOS, PowerShell stdin/DPAPI on Windows, secret-tool, and SO_PEERCRED/getpeereid and named-pipe ACLs.
+- Whether confined-worker sandbox profiles exclude the device directory (ES-09 item).
+- RFC 9700 / RFC 6749 sections cited from knowledge; not re-read (no network).
+- Not read: the Mac queue, the registry deployment, the frontend (where the approval page would be served), Postgres config, and aigentry-ssot.
+- Whether a second or third real host is available for the H2/H3 rows.
 
 snyk: NOT_APPLICABLE_DOCS
 
-blockers:
-- none for this deliverable.
-- For follow-on work: D-Q-1 (needs the Mac online), D-ID-3/4 approvals, SSOT registration.
-- Report inject: per dispatch the telepty inject is expected to fail in the sandbox. This file is the evidence fallback, not proof of delivery (Rule 49 §5).
-
-remaining issues noted, not fixed (Rule 29): plaintext registry API key in devkit env/state files; OAuth state logged; users.github_id 32-bit Integer.
+blockers: none for the specs.
+- telepty is not on PATH, so this file is the evidence fallback. It is not proof of delivery.
+- Open for the orchestrator/user: D-Q-1 (no default); the new Rule 47 rows above; the conditional macOS default in D-ID-2.
