@@ -299,7 +299,12 @@ browser first if it is off); every computer you add before Kkoma is trusted also
 Kkoma right after your first computer if you want only one; after that, Kkoma alone is enough. Before you approve a new
 device, compare the fingerprint shown with the one that device prints (`aigentry-devkit login` or `aigentry-devkit
 whoami` on it). A first computer set up without an interactive console is approved from Kkoma or the approval page (or
-from its own terminal after you turn approval on for it). Only you should do this: brain cannot tell you from a program that drives your terminal or holds a device key,
+from its own terminal after you turn approval on for it). If a new device has to be re-anchored because your first
+device was revoked, compare the fingerprint the older device shows with the one `aigentry-devkit device list` shows
+for it on the new device. If a device reports that the registry lists a different key for its own uploads, run
+`aigentry-devkit login` on it. If a device was approved without you, delete its trust state (the `trust-state.json`
+file whose folder `aigentry-brain trust refresh` prints) and approve it again yourself. A device that comes back
+after it expired may need one more approval on devices added while it was away. Only you should do this: brain cannot tell you from a program that drives your terminal or holds a device key,
 so an agent must never approve or answer an approval. Until then the capture stays on this device." A device that
 nobody approves for keeps waiting; it no longer needs a terminal of its own (interface invariants §B.1 "Channels").
 The one terminal step that can remain, and the order that avoids it, are stated in interface invariants §B.1
