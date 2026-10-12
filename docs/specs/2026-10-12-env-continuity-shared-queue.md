@@ -608,18 +608,27 @@ one-shot, and the orchestrator is an agent CLI session. Neither can be the heart
   - `device_list()`: a proxied `GET /devices?include=keys,approvals&all=true` returning the
     list, the user's approval records and `server_time`; `device_me()`: a proxied
     `GET /devices/me`.
-  - `request_approval(action, fields)`: creates an ES-01 approval request for this device
-    (ES-01 §8.2) and returns `request_id`, `nonce`, `issued_at`, `expires_at`. It confers
-    nothing.
-  - `approve(request_id)`: fetches that pending request, builds the canonical
-    `aigentry-approval-v1|` string from the registry's fields (the caller supplies no payload),
-    signs it and sends it (ES-01 §8.2). Its only intended caller is `aigentry-devkit approve`
-    (ES-01 §9); brain and the ES-04 commands never call it.
+  - `request_approval(action, fields)`: creates an ES-01 approval request on behalf of this
+    device (its target may be another device, for `endorse` and `recipient_accept`; ES-01 §8.2)
+    and returns `request_id`, `nonce`, `issued_at`, `expires_at`. It confers nothing.
+  - `preview_approval(request_id)`: fetches that pending request and returns the canonical
+    `aigentry-approval-v1|` string built from the registry's fields, its SHA-256 and the parsed
+    fields with `scope`. It signs nothing.
+  - `approve(request_id, expected_sha256)`: fetches that pending request again, builds the
+    canonical string the same way and, only if its SHA-256 equals `expected_sha256`, signs it,
+    sends it (ES-01 §8.2) and appends `request_id` and the hash to its local log; otherwise
+    `APPROVAL_REQUEST_CHANGED` and nothing is signed. The caller supplies no payload, only the
+    hash of what it displayed. Its only intended caller is `aigentry-devkit approve` (ES-01 §9),
+    which displays only the preview's fields; brain and the ES-04 commands never call it or
+    `preview_approval`.
+  - `signed_approvals()`: returns that log (read-only), which brain's trust refresh compares
+    with the approvals listed with this device as approver (`APPROVAL_NOT_SIGNED_HERE`;
+    interface invariants §B.1 "Audit").
 - **Callers:** the dispatch gate, the `aigentry-devkit` CLI (incl. the ES-04 capture/restore
   commands, which use `sign` only and obtain the device list and trust state through brain's
   `aigentry-brain trust refresh`, interface invariants I3/I12, BR-6), brain (ES-02 writer, reader,
-  pre-push gate and `trust refresh`, which also calls `request_approval`) and
-  `aigentry-devkit approve` (the only caller of `approve`). Each starts the keeper on
+  pre-push gate and `trust refresh`, which also calls `request_approval` and `signed_approvals`) and
+  `aigentry-devkit approve` (the only caller of `preview_approval` and `approve`). Each starts the keeper on
   demand. This local protocol is a 제15조 contract: it is registered in aigentry-ssot before
   implementation, with devkit as owner and brain and the orchestrator as consumers.
 - **Authority:** any process running as the same OS user that can reach the socket can
@@ -630,8 +639,9 @@ one-shot, and the orchestrator is an agent CLI session. Neither can be the heart
   call `approve` and so approve a pending bootstrap, anchor, endorsement or recipient change
   (ES-01 §8.2): the keeper cannot tell a person from a program, and the comparison the
   terminal channel shows is a step of the user interface, not something the keeper
-  enforces. What narrows it: `approve` signs only a pending request's canonical string, one
-  request per call, and every approval is listed with this device as approver; `can_approve`
+  enforces. What narrows it: `approve` signs only a pending request's canonical string whose
+  hash the caller previewed, one request per call, and every approval is listed with this
+  device as approver and logged locally; `can_approve`
   off on hosts that agents drive (ES-01 D-ID-6). Such a process can also call
   `register_age_recipient`: on the other devices that only holds pushes until a
   `recipient_accept` approval (interface invariant I5); on this device the registry value then
