@@ -743,11 +743,46 @@ comment, merge or deploy are **not** in this release. Each needs its own Rule 47
 content_sha256, content_bytes, state, task_id, attempts, last_error)`, unique
 `(queue_id, source, delivery_ref)`. `delivery_ref` is the delivery id or the poll cursor.
 `state` is one of `received, task_linked, analysis_requested, analysis_recorded,
-review_recorded, rejected`. The receipt row is written **in the same transaction** as the
-task create/link and the `intake_received`/`intake_linked` events.
+review_recorded, rejected, retry_exhausted`. The receipt row is written **in the same
+transaction** as the task create/link and the `intake_received`/`intake_linked` events.
 
 The receipt is **internal**: it is what the intake adapter returns to its caller. No
 GitHub-side acknowledgement is posted in this release.
+
+**Retry contract (AC8 "retry").**
+
+- **Who retries:** only the intake adapter. It runs as an owner device through the lease
+  keeper (§5.1) and holds a local durable outbox: one file per delivery, written tmp +
+  fsync + rename, holding `delivery_ref`, `content_sha256`, `attempts` and `next_at`. The
+  server never retries toward GitHub, and nothing retries toward GitHub in this release.
+- **Same identity on every attempt:** every attempt of one delivery reuses idempotency key
+  `intake:<key>` and the same `delivery_ref` and content hash. A retry after an unknown
+  outcome therefore returns the stored result (`deduplicated: true`, §7). It never yields
+  a second task (business-level dedupe `gh:<key>`, §12.1). If the 7-day idempotency window
+  has passed, the `dedupe_key` still returns the same task.
+- **Retryable (transient):** no response or timeout (`unknown`, §8); HTTP 5xx; 503
+  (`device_auth_disabled`, `rate_limit_unavailable`); `REQUEST_IN_FLIGHT`; 429 (honouring
+  `Retry-After`).
+- **Never retried:** any 4xx other than 429, which includes 401 `device_inactive`
+  (revoked: retrying cannot help), 404, `IDEMPOTENCY_KEY_CONFLICT` (the same key with a
+  different body means the adapter's own state is wrong), `ALIAS_TAKEN` for a different
+  task, `SECRET_SUSPECTED`, and content over 256 KiB. Also never retried: anything that
+  would act on GitHub (none exists in this release) or that issue content asks for
+  (§12.3).
+- **Bound and backoff:** at most 8 attempts per delivery. Exponential backoff with full
+  jitter: base 30 s, factor 2, cap 1 h, so the worst case is about 2 h before the
+  delivery stops.
+- **Terminal states** (visible in ES-07 and in `GET` of the receipt):
+  - `rejected`: a never-retried error. The server writes the receipt with `last_error` in
+    its own transaction, with no task.
+  - `retry_exhausted`: the dead letter after 8 attempts. If the server was never reached,
+    the adapter records this in its outbox and reports it to ES-07 locally. On the next
+    successful contact it writes the receipt row with `attempts` and `last_error`.
+- **Manual retry:** a user action re-queues a `retry_exhausted` delivery with the same
+  key and `delivery_ref`, and resets the attempt count. No automatic retry happens after
+  a terminal state.
+- **Counters:** `attempts` on the server counts attempts that reached the server. The
+  outbox counts all attempts. Both are shown.
 
 ### 12.3 Untrusted-content isolation
 
@@ -796,6 +831,7 @@ cross-platform or real-endpoint PASS.**
 | Q-15 | Gate (after D-Q-1 and migration, account mode): `--task <runtime id or alias>` resolves to the task's id; another device's live lease → exit 11 in **each** of `hard`, `warn`, `off`; server unreachable + stale cache → exit 12 in each mode; unknown/terminal/non-dispatchable keep today's mode behaviour (exit 4 / proceed, no lease); claim refused after the gate → exit 11 with no spawned workspace; pre-transport failure after claim → sid detached and lease released; exit 7/8 → attachment kept; a dispatch of a `pending` task leaves it `delegated` | concurrent claim / partition |
 | Q-18 | Second dispatch from the same device while its lease is live: claim returns the same token, `new_lease=false`; the first worker's heartbeat/complete with that token still succeed (not `FENCED`) | concurrent claim (same device) |
 | Q-16 | Secret patterns in `annotate`/`complete` bodies refused; no tokens in events or cache | other account isolation (secrets) |
+| Q-19 | ES-08 retry: the first intake attempt's response is dropped (commit happened), then a 5xx, then success: exactly one task and one receipt, `deduplicated: true` on the replays; a non-retryable error (`IDEMPOTENCY_KEY_CONFLICT`, 401 `device_inactive`) is not retried and ends `rejected`; 8 transient failures end `retry_exhausted` with attempts=8, no 9th attempt, visible in ES-07; a manual retry reuses `intake:<key>` | duplicate message / late ACK (AC8 retry) |
 | Q-17 | The device-side client (claim/heartbeat/lease-loss timer/reconcile) verified on real macOS, Linux and Windows hosts | per-OS verification |
 
 ## 14. Decisions needed (Rule 47) — recorded in the ADR
