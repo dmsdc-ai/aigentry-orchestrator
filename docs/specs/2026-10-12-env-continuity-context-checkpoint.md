@@ -242,16 +242,34 @@ list next to `.aigentry/sync-status.json`, `GitBackend.ts:60-65`):
 
 ```
 { "v": 1, "remote_commit": "<sha of origin/main last scanned>",
-  "seen": { "<checkpoint_id>": "<content_sha256>" }, "heads": { "<project_key>/<lineage root>": [ids] } }
+  "seen": { "<checkpoint_id>": { "sha256": "<content_sha256>", "first_seen_by": "<server ISO>" | null,
+            "state": "accepted" | "provisional" | "DEMOTED:<code>" | "QUARANTINED:<reason>",
+            "restored_at"?: "<ISO>" } },
+  "heads": { "<project_key>/<lineage root>": [ids] },
+  "trust": { "anchors": [ { "device_id", "fp", "kind": "self" | "root" | "local", "first_seen_by" } ],
+             "pinned": { "<device_id>": { "fp", "created_at", "revoked_at", "first_seen_by" } },
+             "endorsements": { "<trust/… path>": { "state", "first_seen_by" } } },
+  "device_list": { "server_time": "<of the last successful fetch>", "fetched_at": "<local>" } }
 ```
 
-Sync step (after the existing `pull`): (1) fast path — `git diff --name-only <remote_commit>..HEAD --
-checkpoints/`; (2) if `remote_commit` is unknown to the repo (shallow clone `--depth 1`,
-`GitBackend.ts:30`, or history rewrite) fall back to a full `git ls-tree -r --name-only HEAD
-checkpoints/` and diff against `seen`. New paths are decrypted, integrity- and signature-verified (§5.4), added to `seen`,
-and lineage heads recomputed. A record that fails decryption stays `pending_key` (not `seen`) and is
-retried on the next pass (§5.3); a record that fails integrity is quarantined (`seen` value
-`"QUARANTINED:<reason>"`) and reported, never restored.
+`first_seen_by` is a server-clock upper bound on when this reader first observed an item. It is the
+`server_time` of the first successful device-list fetch (ES-01 §8.1 R6: every list response carries
+`server_time`) that **started after** the item was in the local tree. `null` = not yet confirmed by such a
+fetch (`provisional`, §5.7 T7). The writer clock is never used for it. It is kept for every `seen` record,
+pinned device, anchor and endorsement (§5.4 rule 5, §5.6 E4).
+
+Sync step (after the existing `pull`):
+1. Fetch the device list (§5.4). Its `server_time` becomes the `first_seen_by` of every item first observed in
+   this pass. If the fetch fails, those items get `null` and state `provisional`.
+2. Fast path: `git diff --name-only <remote_commit>..HEAD -- checkpoints/ trust/`.
+3. If `remote_commit` is unknown to the repo (shallow clone `--depth 1`, `GitBackend.ts:30`, or history
+   rewrite), fall back to a full `git ls-tree -r --name-only HEAD checkpoints/ trust/` and diff it against
+   `seen` and `trust.endorsements`.
+
+New paths are decrypted, integrity- and signature-verified (§5.4), added to `seen`, and lineage heads are
+recomputed over `accepted` and `provisional` records only.
+- A record that fails decryption stays `pending_key` (not `seen`) and is retried on the next pass (§5.3).
+- A record that fails integrity is quarantined (state `QUARANTINED:<reason>`) and reported, never restored.
 
 ### 4.3 Conflict policy — lineage fork + user choice (`[DRAFT line 43]`; details new)
 
@@ -345,9 +363,11 @@ A reader (sync pass §4.2, restore §6, list) accepts a record only if all hold:
 4. `user_id` equals the logged-in user (`CHECKPOINT_USER_MISMATCH`, §5.2);
 5. revocation: if the device has `revoked_at`, a record with `created_at ≥ revoked_at` is rejected
    (`CHECKPOINT_DEVICE_REVOKED`). `created_at` is the writer's clock and a revoked device can backdate it,
-   so a record with `created_at < revoked_at` that this reader first sees after `revoked_at` is accepted
-   only when anchored — already in this reader's `seen` set before `revoked_at`, or listed in `parents` /
-   `resumed_from` of an accepted record signed by a non-revoked device. An unanchored one is
+   so a record with `created_at < revoked_at` is accepted only when anchored:
+   - its `first_seen_by` on this reader (§4.2, server clock) is earlier than `revoked_at`, or
+   - it is listed in `parents` / `resumed_from` of an accepted record signed by a non-revoked device.
+
+   A `null` (provisional) `first_seen_by` never anchors. An unanchored record is
    `CHECKPOINT_REVOKED_WRITER_UNANCHORED`: listed with device and time, never restored as context without
    an explicit user choice. ES-01 `expired` (idle expiry) is not revoked; its signatures stay valid.
 
@@ -355,6 +375,33 @@ Rejection happens on the reader, not at the remote: anyone with push access to t
 device that kept its Git credential, or another account given access) can add files, but no reader
 accepts them. The reader caches the device list with `fetched_at`; offline it uses the cache, and the
 restore output shows `device_list_fetched_at` so a revoke newer than the cache is visibly not yet applied.
+
+**Stale-cache window.** Items observed while no list fetch has succeeded since are `provisional` (§4.2, §5.7
+T7).
+- A provisional record whose writer is already a confirmed trusted, non-revoked device in the cache may be
+  listed and restored. The restore output labels it `provisional (device list as of <fetched_at>)`.
+- A provisional endorsement counts for nothing: it neither adds a trusted device nor a recipient.
+- A provisional item never anchors (rule 5, §5.6 E4).
+
+**Re-evaluation on every list refresh.** Each successful fetch does the following, in order:
+1. Gives every provisional item `first_seen_by` = this fetch's `server_time`.
+2. Recomputes the trusted and recipient sets (§5.6).
+3. For every device whose `revoked_at` is new to this reader, or that left the trusted set, re-checks rule 2,
+   rule 5 and §5.6 E3/E4 for each of that device's records and endorsements whose `first_seen_by` is `null` or
+   ≥ that `revoked_at`.
+
+An item that now fails is **demoted, not deleted**:
+- Its index state becomes `DEMOTED:<code>` with the code it would get now: `CHECKPOINT_REVOKED_WRITER_UNANCHORED`,
+  `CHECKPOINT_DEVICE_REVOKED`, `CHECKPOINT_WRITER_UNKNOWN`, `ENDORSEMENT_REVOKED_ENDORSER_UNANCHORED` or
+  `ENDORSEMENT_AFTER_REVOKE`.
+- The file is untouched. The record leaves the lineage heads. It is never restored as context again without an
+  explicit user choice.
+- If it was already restored (`restored_at`), the next CLI/MCP interaction and the restore metrics (`demoted`,
+  §6) say "restored at `<restored_at>` under device list as of `<fetched_at>`, since demoted: `<code>`". Text
+  that is already in a session cannot be recalled; the notice is the remedy.
+
+A device whose only counted endorsement is demoted leaves the trusted set and the recipient set (R6 notice).
+The recomputation cascades to the devices it endorsed and to their records.
 
 Writer side: the recipient set comes from the same cache. The write output and `brain_checkpoint_write`
 result show `recipients as of <fetched_at>`; a cache older than 24 h (proposal) adds a warning. Before a
@@ -422,10 +469,14 @@ A reader counts an endorsement only if all hold:
 - E3. server-clock test (R5): the endorsed device's ES-01 `created_at` precedes the endorser's `revoked_at`
   (or the endorser has no `revoked_at`) — else void, `ENDORSEMENT_AFTER_REVOKE`. The file's `created_at`
   (endorser clock) is informational only and is never compared with `revoked_at`;
-- E4. anchoring (the §5.4 rule-5 rule applied to endorsements): if the endorser has `revoked_at` and this
-  reader first sees the endorsement after that `revoked_at`, the endorsement counts only when anchored —
-  already in this reader's pinned/seen set before `revoked_at`, or the endorsed device is also endorsed by a
-  non-revoked trusted device. Otherwise `ENDORSEMENT_REVOKED_ENDORSER_UNANCHORED`. Cost (same as §5.4
+- E4. anchoring (the §5.4 rule-5 rule applied to endorsements): if the endorser has `revoked_at`, the
+  endorsement counts only when anchored. It is anchored if either holds:
+  - its `first_seen_by` on this reader (§4.2, server clock; `null` never anchors) is earlier than that
+    `revoked_at`;
+  - the endorsed device is also endorsed by a non-revoked trusted device.
+
+  Otherwise `ENDORSEMENT_REVOKED_ENDORSER_UNANCHORED`. The check is repeated on each list refresh (§5.4
+  re-evaluation). Cost (same as §5.4
   anchoring, D-8): "revoking a device does not revoke the devices it endorsed" holds on readers that had
   already counted the endorsement. On a fresh device, a device endorsed only by a since-revoked device is
   trusted only after one of two things: a non-revoked trusted device re-endorses it (re-endorsement prompt,
@@ -497,7 +548,8 @@ Output additions (a new content block placed before the packed memory text, plus
 
 metrics JSON gains `checkpoint: {id, verified: bool, lineage: "linear"|"forked", heads: [ids],
 provenance_counts: {original, summary, unavailable}, pending_key: bool, device_list_fetched_at,
-recipients_changed: bool, rejected: [{id, code}]}` (§5.4, §5.5 R6).
+recipients_changed: bool, rejected: [{id, code}], provisional: bool, demoted: [{id, code, restored_at?}]}`
+(§5.4, §5.5 R6).
 
 Rules: integrity and the §5.4 writer checks must pass or the record is not restored
 (`CHECKPOINT_INTEGRITY_FAILED` / the §5.4 code); a forked
@@ -530,7 +582,7 @@ required (never dropped before memory entries).
 |---|---|---|
 | checkpoint (M1 content) | 90d after the record is no longer a lineage head; heads kept until superseded + 90d | expiry pass deletes the file from `HEAD` in a normal commit |
 | raw fragment (M2) | 30d | the M2 writer stores raw text in a sibling `<seq>.raw.age` so it can expire independently of the M1 record |
-| local index | rebuildable; no TTL | |
+| local index | rebuildable, except `first_seen_by` and local anchors: a rebuilt index sets `first_seen_by` from the first fetch after the rebuild (so it anchors less, like a fresh device) and repeats the bootstrap/recovery confirmation of §5.6; no TTL | |
 
 Deletion is from `HEAD` only; Git history and host-side copies remain until the user rewrites history.
 This is disclosed in the opt-in text. Retention values are a Rule 47 privacy/retention decision (D-3 in
@@ -594,7 +646,7 @@ writes and reads require ES-01 (§5); none of them measures the real ES-01 integ
 | CK-08 | Original vs summary marking | M1 and M2 records | M1 restore contains no `[original …]` blocks; M2 marks `original` only when the hash verifies; tampered raw text → that fragment downgraded to `unavailable` and integrity failure reported | provenance marking original/summary/unavailable and tamper downgrade | faithfulness or quality of summaries | Linux fixture | — |
 | CK-09 | Integrity | flip one byte of a decrypted-then-re-encrypted record; separately copy a valid signed record to another `project_key`/`session_ref`/`seq` path | `CHECKPOINT_INTEGRITY_FAILED`, record quarantined, other records restore; the copied record → `CHECKPOINT_PATH_MISMATCH`, never restored for the other project | integrity detection and quarantine; path ↔ record binding (§5.4 rule 2) | the signature path (CK-11) | Linux fixture | — |
 | CK-10 | Encryption fail-closed | remove age key on writer | `CHECKPOINT_ENCRYPTION_FAILED`; no plaintext file in the repo tree or history | no plaintext fallback on encryption failure | other crypto failure modes (corrupt recipient list) | Linux fixture | — |
-| CK-11 | Revoked device (reader-side) | revoke B in ES-01; A writes a new record; B (keeping its Git credential and a modified, non-cooperating client) pushes (i) a record with `created_at` after `revoked_at`, (ii) a record backdated before `revoked_at`, (iii) a record with a forged `device_id` = A, (iv) an endorsement by B, dated before `revoked_at`, of a device D registered in the registry (iv-a) after B's `revoked_at` and (iv-b) before it but never endorsed by a non-revoked device, plus a record signed by D; A and C sync; (v) separately: root A revoked, B endorsed only by A (counted on B before the revoke), fresh C with stub keys | B is not a recipient of A's new record; A and C reject (i) `CHECKPOINT_DEVICE_REVOKED`, (ii) `CHECKPOINT_REVOKED_WRITER_UNANCHORED` (not restored without a user choice), (iii) `CHECKPOINT_SIGNATURE_INVALID`; (iv) the endorsement is void — (iv-a) `ENDORSEMENT_AFTER_REVOKE`, (iv-b) `ENDORSEMENT_REVOKED_ENDORSER_UNANCHORED` — so D is not trusted, not a recipient of A's next record, D's record is `CHECKPOINT_WRITER_UNKNOWN`, and D appears in the R6 notice; none appears as context; device list shows B `git_access: unknown` until the user confirms the credential rotation; (v) on B, A stays trusted as a chain node (A→B still counts) but is not a recipient; on C, B's records are `CHECKPOINT_WRITER_UNKNOWN` and C reports `TRUST_ANCHOR_REQUIRED`; after the user pins B as a local anchor on C, B's records are accepted on C and B (holding its endorsement of C) encrypts its next record to C; a second fresh device E is still `TRUST_ANCHOR_REQUIRED` (the anchor is not synced) | reader-side rejection of post-revoke, backdated and forged writers and of backdated endorsements (§5.6 E3/E4); trusted ≠ recipient and trust-anchor recovery (v) | revocation of the GitHub credential (user step, D-8); prevention of deletions (only detected); the real ES-01 revoke | logic variant: Linux fixture (stub ES-01 list with `created_at`/`revoked_at` set by the fixture, local bare remote, modified client for B); real-ES-01 variant: BLOCKED | real-ES-01 variant: ES-01 (revoke, `revoked_at` R3/R4) |
+| CK-11 | Revoked device (reader-side) | revoke B in ES-01; A writes a new record; B (keeping its Git credential and a modified, non-cooperating client) pushes (i) a record with `created_at` after `revoked_at`, (ii) a record backdated before `revoked_at`, (iii) a record with a forged `device_id` = A, (iv) an endorsement by B, dated before `revoked_at`, of a device D registered in the registry (iv-a) after B's `revoked_at` and (iv-b) before it but never endorsed by a non-revoked device, plus a record signed by D; A and C sync; (v) separately: root A revoked, B endorsed only by A (counted on B before the revoke), fresh C with stub keys; (vi) stale-cache window: reader C last fetched the list before B's revoke at T and the stub registry is then unreachable; after T, B pushes (vi-a) a record backdated before T and (vi-b) a backdated endorsement of D (registered before T) plus a record by D; C pulls, restores (vi-a), then the registry becomes reachable and C refreshes; control: a record of B that C confirmed with a fetch before T | B is not a recipient of A's new record; A and C reject (i) `CHECKPOINT_DEVICE_REVOKED`, (ii) `CHECKPOINT_REVOKED_WRITER_UNANCHORED` (not restored without a user choice), (iii) `CHECKPOINT_SIGNATURE_INVALID`; (iv) the endorsement is void — (iv-a) `ENDORSEMENT_AFTER_REVOKE`, (iv-b) `ENDORSEMENT_REVOKED_ENDORSER_UNANCHORED` — so D is not trusted, not a recipient of A's next record, D's record is `CHECKPOINT_WRITER_UNKNOWN`, and D appears in the R6 notice; none appears as context; device list shows B `git_access: unknown` until the user confirms the credential rotation; (v) on B, A stays trusted as a chain node (A→B still counts) but is not a recipient; on C, B's records are `CHECKPOINT_WRITER_UNKNOWN` and C reports `TRUST_ANCHOR_REQUIRED`; after the user pins B as a local anchor on C, B's records are accepted on C and B (holding its endorsement of C) encrypts its next record to C; a second fresh device E is still `TRUST_ANCHOR_REQUIRED` (the anchor is not synced); (vi) before the refresh: (vi-a) is `provisional` with `first_seen_by: null` and restores only labelled `provisional (device list as of …)`; the (vi-b) endorsement counts for nothing, so D is neither trusted nor a recipient, and D's record is `CHECKPOINT_WRITER_UNKNOWN`. After the refresh: (vi-a) becomes `DEMOTED:CHECKPOINT_REVOKED_WRITER_UNANCHORED` (file still in the tree, never restored again without a user choice, and `demoted` lists it with its `restored_at`); the endorsement becomes `DEMOTED:ENDORSEMENT_REVOKED_ENDORSER_UNANCHORED`; the control record stays accepted (`first_seen_by` < T) | reader-side rejection of post-revoke, backdated and forged writers and of backdated endorsements (§5.6 E3/E4); trusted ≠ recipient and trust-anchor recovery (v); server-clock `first_seen_by` anchoring, nothing from a stale cache adds trust, re-evaluation and demotion on refresh (vi) | revocation of the GitHub credential (user step, D-8); prevention of deletions (only detected); the real ES-01 revoke | logic variant: Linux fixture (stub ES-01 list with `created_at`/`revoked_at` set by the fixture, local bare remote, modified client for B); real-ES-01 variant: BLOCKED | real-ES-01 variant: ES-01 (revoke, `revoked_at` R3/R4) |
 | CK-11b | Recipient change notice / trust | registry list gains device D that no trusted device endorsed | D is not a recipient and D's records are `CHECKPOINT_WRITER_UNKNOWN`; the notice (R6) is shown; after the user endorses D on A, new records include D | trust endorsement gate and recipient-change notice | a real compromised registry | BLOCKED | ES-01 (list R3, R5, notice R6); decision D-9 |
 | CK-12 | Backward compatibility | call `brain_context_resume` without `checkpoint` | identical content items for identical state, compared with the current tool (`BrainMcpServer.ts:288-324`), including the setup hint it may prepend (`:313-321`) | default `brain_context_resume` output unchanged | other brain MCP tools | Linux fixture | — |
 | CK-13 | Schema upcast | v1 record read by a v2 reader; v2 record read by a v1 reader | v2 reader upcasts without rewriting; v1 reader returns `unsupported_version`, file unchanged | on-read upcast; newer version left untouched | a real v2 schema (none exists) | Linux fixture | — |
