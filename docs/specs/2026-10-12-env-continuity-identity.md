@@ -165,7 +165,9 @@ user (existing users.id, UUID)          ← the account; one GitHub identity
 | `public_key` | bytea(32), unique | raw Ed25519 public key |
 | `status` | varchar(16) | `active` \| `revoked` \| `expired` |
 | `refresh_family_id` | UUID | current refresh family |
-| `refresh_hash` | char(64) | sha256 of the *current* refresh token; previous one is not kept |
+| `refresh_hash` | char(64) | sha256 of the *current* refresh token (issued, not yet presented) |
+| `refresh_prev_hash` | char(64) null | sha256 of the token whose presentation produced the current one (§5 retry rule) |
+| `refresh_rotated_at` | timestamptz null | when `refresh_prev_hash` last changed |
 | `refresh_idle_expires_at` | timestamptz | sliding |
 | `refresh_abs_expires_at` | timestamptz | absolute, set at registration / re-login |
 | `client_version` | varchar(32) | devkit version string |
@@ -255,10 +257,38 @@ Rules:
 - Refresh = `{grant_type: refresh_token, refresh_token, device_id, proof}` with proof over
   `"aigentry-device-v1|refresh|" + device_id + "|" + ts`. A stolen refresh token without the
   private key cannot be used.
-- Rotation with **reuse detection** (closes G5): the server keeps only the current hash. If
-  a request presents a token whose family matches but hash does not, the device is set
-  `revoked` with `revoked_reason=refresh_reuse` and every live device access `jti` for that
-  device is added to the Redis revoke list. The legitimate holder must log in again.
+- Rotation with **reuse detection** (closes G5). A refresh whose *response* was lost
+  (partition, late ACK) is retried with the old token. That retry must not revoke the
+  device, and nobody without the device key may trigger a revoke. The server therefore
+  checks in this order, in one transaction holding the device row `FOR UPDATE`:
+  1. Load the device by `device_id`. Unknown, `revoked` or `expired` → `invalid_grant`,
+     uniform body, no state change.
+  2. **Verify `proof` first**: Ed25519 over `"aigentry-device-v1|refresh|" + device_id +
+     "|" + ts` with the row's `public_key`, `ts` within ±300 s. Failure → `invalid_grant`,
+     **no state change, no revoke, no reuse classification**, counted against the
+     per-`device_id` limit (§7.4). Knowing a `device_id` (lists, logs, lease view) is
+     therefore not enough to revoke a device.
+  3. `sha256(token) = refresh_hash` (normal case) → rotate: `refresh_prev_hash :=
+     refresh_hash`, `refresh_hash := sha256(new)`, `refresh_rotated_at := now()`.
+  4. `sha256(token) = refresh_prev_hash` → **retry of a lost response**. Presenting the
+     previous token proves that the current one has never been presented, because
+     presenting it would have moved it into `refresh_prev_hash`. The server re-rotates:
+     a new pair is issued, `refresh_hash` is replaced (the unseen pair dies), and
+     `refresh_prev_hash` is unchanged. No revoke at any age; event `refresh_retry`. The
+     client keeps the same `Idempotency-Key` across these retries (ES-03 §7 style), so
+     audit groups them.
+  5. Any other hash, with a valid proof → **reuse**. Someone holding the device key
+     presented a token older than the previous one. That is the copied-device-directory
+     case: two holders alternate and one ends up presenting a superseded token. The
+     device is set `revoked`, `revoked_reason=refresh_reuse`. The server holds no other
+     state to check.
+  - Pattern: refresh-token rotation with reuse detection, sender-constrained by the
+    device key, as in the OAuth 2.0 Security BCP (RFC 9700 §4.14.2) and RFC 6749 §10.4.
+    Accepting the immediately previous token as a retry is the "previous token stays
+    valid until the new one is used" variant of rotation grace periods. Cited from the
+    architect's knowledge; these documents were **not re-read** in this cycle (no network).
+  - Because revoke is checked durably on every request (§7.2), no Redis entry is needed to
+    stop the device's live access tokens.
 - Idle expiry sets `status=expired` (not revoked); `aigentry-devkit login` re-binds the
   **same** device row if the same public key proves possession, so history and lease
   attribution survive a long absence (the Mac case).
@@ -401,7 +431,7 @@ gains an optional "log this device in now?" step that runs `aigentry-devkit logi
 
 | Id | Decision | Category | Recommended default |
 |---|---|---|---|
-| D-ID-1 | Token lifetimes | privacy / permission | access 15 min; refresh idle 30 d, absolute 90 d; rotation + reuse → revoke |
+| D-ID-1 | Token lifetimes | privacy / permission | access 15 min; refresh idle 30 d, absolute 90 d; rotation; proof checked first; previous-token retry re-rotates; older token with valid proof → revoke (§5) |
 | D-ID-2 | Device secret storage location | privacy / permission | macOS Keychain (`security`), Linux 0600 file under `~/.config/aigentry/device/`, Windows DPAPI file; never env/state files |
 | D-ID-3 | Enabling device credentials on a deployed registry (new credential type + new endpoints) | permission expansion / production deploy | ship behind `DEVICE_AUTH_ENABLED=false`; enable per instance after ES-09 isolation tests pass |
 | D-ID-4 | Devices talk to the registry over its existing HTTPS endpoint (new client→server traffic from every device) | network change / personal-data transfer | allowed only to the registry URL the user chose at install (cloud or self-hosted); no new relay |
@@ -457,7 +487,9 @@ Matrix rows are the user's (requirements §검증 매트릭스). IDs are stable 
 | ID-2 | A fresh install on a third machine completes `login` without copying any file from A/B and sees the same account | third fresh device |
 | ID-3 | User Y's device token gets 404 (identical body) on every `devices` and ES-03 resource of user X, including guessed ids, and never sees X's rows in lists | other account isolation |
 | ID-4 | After `device revoke`, the revoked device's next write is rejected in the same transaction; its refresh fails with `invalid_grant` | other account isolation (revoke) |
-| ID-5 | Replaying a rotated refresh token revokes the device (`refresh_reuse`) | stale completion fencing (credential analogue) |
+| ID-5 | With a valid proof, presenting a token older than the previous one (rotate twice, then replay the first) revokes the device (`refresh_reuse`) | stale completion fencing (credential analogue) |
+| ID-14 | Refresh response dropped, then the client retries with the same (previous) token, immediately and again after > 1 h: both retries yield a new pair, the device stays `active`, `refresh_retry` events recorded | late ACK (credential analogue) |
+| ID-15 | Refresh for a known `device_id` with a garbage or stale token and **no valid proof** → `invalid_grant`; the device row is unchanged (status, hashes) | other account isolation (revoke by stranger) |
 | ID-6 | `device_code` without the matching private-key proof never yields tokens | duplicate message |
 | ID-7 | A device that has been offline past the access TTL refreshes on reconnect without user action. A device that has been offline past idle expiry gets `expired` and re-binds to the same `device_id` with `login` | partition/reconnect |
 | ID-8 | Killing the CLI during `login` polling leaves no partial secret file; rerun succeeds or code expires | process kill |

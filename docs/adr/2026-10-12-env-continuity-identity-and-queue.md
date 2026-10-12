@@ -89,7 +89,7 @@ decided here** (orchestrator guardrail 2026-10-12 13:59Z); it is D-Q-1.
 
 | Id | Question | Category | Recommended default | Blocks |
 |---|---|---|---|---|
-| D-ID-1 | Device token lifetimes | privacy / permission | access 15 min; refresh idle 30 d / absolute 90 d; rotation + reuse → revoke | ES-01 impl |
+| D-ID-1 | Device token lifetimes | privacy / permission | access 15 min; refresh idle 30 d / absolute 90 d; rotation; proof checked first; previous-token retry re-rotates, older token with valid proof → revoke (ES-01 §5) | ES-01 impl |
 | D-ID-2 | Device secret storage location | privacy / permission | macOS Keychain via `security`; Linux 0600 file under `~/.config/aigentry/device/`; Windows DPAPI file; never env/state files | ES-01 impl |
 | D-ID-3 | Enable the new device credential type + endpoints on a deployed registry | permission expansion / production deploy | ship disabled (`DEVICE_AUTH_ENABLED=false`); enable per instance after ES-09 isolation PASS | ES-01/03 rollout |
 | D-ID-4 | Every opted-in device talks to the registry over HTTPS | network change / personal-data transfer | only to the registry URL chosen at install; no new relay | ES-01/03 rollout |
