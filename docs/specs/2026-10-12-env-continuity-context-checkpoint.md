@@ -45,7 +45,7 @@ inside Part B is the proposed contract's wording, not an existing rule.
 | Conflict policy = per-entry version vector, then LWW, then tie-breaks; loser logged, not kept | `src/sync/ConflictResolver.ts:22-61`, `:114-168` |
 | Pull failure recovery merges entries and **resets to remote** | `src/sync/PushPullManager.ts:61-159` |
 | Encryption: age per entry; on encryption failure the writer **silently falls back to plaintext** | `ProfileFormat.ts:160-181` |
-| New-device TOFU: a new device adds its recipient but **cannot decrypt** until an existing device re-encrypts | `GitBackend.ts:104-175` (esp. `:150-153`) |
+| New-device TOFU: a new device adds its recipient but **cannot decrypt** until an existing device re-encrypts. Being online is not enough: an existing device returns early when its own key is already a recipient (`:132`); re-encryption to the merged recipient set happens on that device's **next profile write**. Recipients are a union and never shrink | `GitBackend.ts:104-175` (esp. `:132`, `:150-153`); `ProfileFormat.ts:256-277` |
 | Entry schema: `version_vector`, `device_id`, `source_machine_id`, `scope`, `policy`, `structured_payload.type` incl. `session_context` | `src/core/EntrySchema.ts:30-53` |
 | Profile schema migration: `CURRENT_SCHEMA_VERSION = 2`, in-place migration on read | `src/core/SchemaMigration.ts:28-44` |
 | Retention vocabulary exists (`retention_ttl` "30d"/"24h"/"1y"/"forever") inside `PolicyEnvelope` | `src/policy/PolicyEnvelope.ts`, `src/policy/RetentionParser.ts:6-50` |
@@ -53,6 +53,7 @@ inside Part B is the proposed contract's wording, not an existing rule.
 | `ContextRestoreService.restore` packs `user`-scope entries by category slots; no notion of original vs summary | `src/context/ContextRestoreService.ts:309-390` |
 | `brain_save_session_context` stores one mutable `session_context` entry per project (architecture, decisions, session_history summaries) | `BrainMcpServer.ts:726-769`, `src/contract/BrainContract.ts:899-923` |
 | Existing redaction is a tool-argument **allowlist**, not a content secret scanner | `src/capture/capture-tool.ts:38-56` |
+| A `redactionViolations` metric exists in the capture shadow evaluator (threshold 0); it counts violations, it does not scan content | `src/capture/shadow-evaluator.ts:13`, `:52` |
 | devkit "snapshot restore" (604f2b5) = a local SessionStart(compact) hook that re-reads `$root/.context-snapshot.md` (≤400 lines/32 KiB); no sync | aigentry-devkit `hooks/post-compact-restore.sh:1-16` |
 
 ### 0.2 Searched for and not found
@@ -71,7 +72,9 @@ inside Part B is the proposed contract's wording, not an existing rule.
   description "Used by devkit for workspace init" (`BrainMcpServer.ts:730`): grep over aigentry-devkit
   for `session_context|getSessionContext` returned nothing.
 - `bin/context-compact.sh` (referenced by devkit 604f2b5 commit message) is not present in the
-  orchestrator clone at `task-1204-env-continuity-ctxws`.
+  orchestrator clone at `task-1204-env-continuity-ctxws`. It exists on `origin/release/0.2.5` (commits
+  `1d8a600` "context-compact.sh works for every orchestrator CLI", `ac94b35`), i.e. the compaction path
+  for non-Claude CLIs (codex/gemini/grok/agy per the 604f2b5 message) is on another branch.
 - `~/projects/aigentry/docs/CONSTITUTION.md` is not present in the aigentry checkout (find returned no
   constitution file); Article 1/17 are taken from the session's common instructions only.
 
@@ -79,7 +82,9 @@ inside Part B is the proposed contract's wording, not an existing rule.
 
 Brain sync between two real hosts (only the unit/e2e test names in `tests/e2e/e2e.device-sync.test.ts:13-170`
 were seen, not run); registry auth deployment and any ES-01 device API; Git-host behaviour for deleted
-refs/history; macOS/Windows; size/latency of `ls-tree` on large brain repos; tests were not run (SAWP).
+refs/history; macOS/Windows; size/latency of `ls-tree` on large brain repos; per-CLI availability of a
+compaction hook/trigger (only Claude `SessionStart(compact)` and the `context-compact.sh` commit subjects
+were seen); tests were not run (SAWP).
 
 # PART B — PROPOSALS (each requires user review unless tagged)
 
@@ -148,7 +153,10 @@ Fragment = { idx, role: "user"|"assistant"|"tool"|"system", turn_range: [from, t
 ```
 
 `sha256` is over the exact UTF-8 bytes of the fragment as the CLI produced it (after newline
-normalisation to LF). The hash is **always** stored, in every mode.
+normalisation to LF) **and after §3.2 redaction**, in every mode — so M1 and M2 never store a hash of
+unredacted text, which would be a guessing oracle for short secrets. The hash is **always** stored.
+Verifying an M1 fragment against the source transcript therefore re-applies the redaction of the
+recorded `scanner_version` first.
 
 #### 3.1 Modes (decision needed — Rule 47 "개인정보 전송", ADR D-1)
 
@@ -173,9 +181,11 @@ requirement asks to state which facts are original vs summary (line 39), which M
   `password=`/`token=`/`secret=` assignments, high-entropy strings ≥ 32 chars adjacent to such names,
   `.env`-style `NAME=value` lines whose NAME contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD` or
   `CREDENTIAL` (ES-04 has no env-name deny-list; its §3.1 secret set covers the files themselves).
-- A finding replaces the match with `[REDACTED:<detector>]`; in M2 the fragment `sha256` is then the
-  hash of the redacted text and `raw_original_sha256` is omitted (an un-redacted hash of a secret
+- A finding replaces the match with `[REDACTED:<detector>]`; in both modes the fragment `sha256` is then
+  the hash of the redacted text (§3) and `raw_original_sha256` is omitted (an un-redacted hash of a secret
   is itself a guessing oracle for short secrets). `privacy.redaction.findings_dropped` counts them.
+- Scanner findings, error messages and brain logger output name the field and detector only; they
+  never carry the matched text (requirement line 49 "로그").
 - If the scanner cannot run (missing, crashed, version mismatch) the write **fails closed**
   (`CHECKPOINT_REDACTION_UNAVAILABLE`); no record is written.
 - Scanner false negatives are possible; the guarantee is "scanned with detector set vN", never
@@ -193,12 +203,17 @@ requirement asks to state which facts are original vs summary (line 39), which M
 ```
 
 - `user_key`, `project_key` = sha256(...)[:16] of `user_id` / `project_id` (no raw URLs in paths).
+  These are unkeyed: for a public repo a dictionary of remote URLs reverses `project_key`; `device_id`,
+  `session_ref` and commit timing are visible too. A keyed hash would need a per-user secret shared by all
+  devices, which does not exist (device keys are per device, §5.5). This metadata exposure is therefore
+  stated in the checkpoint-upload opt-in text (D-7).
 - File body = age ciphertext (existing `encryptBlock`, `AgeCrypto.ts`) of the canonical record.
   Recipients = the age public keys of the user's **active, trusted** ES-01 devices (§5.3, §5.5).
 - **No plaintext fallback.** Unlike `ProfileFormat.writeToFile` (`ProfileFormat.ts:160-181`), an
   encryption failure aborts the write (`CHECKPOINT_ENCRYPTION_FAILED`).
-- Records are immutable. Writers never modify or delete a checkpoint file in place; a path that
-  already exists with different bytes is an integrity incident (`CHECKPOINT_KEY_CONFLICT`), the new
+- Records are immutable. Writers never modify or delete a checkpoint file in place. A path that already
+  exists with **identical** bytes (duplicate write, replay after a partition) is an idempotent no-op: no
+  new file, no commit, the existing id is returned. A path that already exists with different bytes is an integrity incident (`CHECKPOINT_KEY_CONFLICT`), the new
   record is written as `<seq>.<content_sha256[:8]>.ckpt.age` and both are surfaced at restore.
 - Why not brain entries: entries live inside one rewritten file (`ProfileFormat.ts:140-182`) and are
   merged by LWW (`ConflictResolver.ts:49-51`), which would silently drop a concurrent device's
@@ -242,6 +257,7 @@ retried on the next pass (§5.3); a record that fails integrity is quarantined (
 |---|---|---|
 | `SyncBackend.diffNames(fromRef, toRef, pathspec)` and `listTree(ref, pathspec)` | `src/backend/SyncBackend.ts:1-13`, `GitBackend.ts` | cursor fast path + shallow-clone fallback |
 | `commitPaths(paths, message)` (add only the given paths) | `GitBackend.ts:177-184` uses `git add .` | avoid committing unrelated files; explicit checkpoint commit |
+| Checkpoint commit independent of the profile merge outcome | the recovery path returns after `resetToRef` (a `--soft` reset, `GitBackend.ts:217-219`) **without committing** when the merged entries equal the remote (`PushPullManager.ts:142-146`), which would leave checkpoint files staged but uncommitted | checkpoint files are committed by their own `commitPaths` call after every pull/recovery, never as a side effect of the profile merge commit (CK-17) |
 | Commit trigger for `checkpoints/**` | `SyncEngine.ts:106-124` watches only profile files | checkpoint writes call `autoCommitter.scheduleCommit()` directly |
 | `CheckpointStore` (write/read/verify/list heads) + `CheckpointIndex` (cursor) | new `src/checkpoint/` | §2–§4 |
 | Fail-closed encryption path | new; must not reuse `ProfileFormat.writeToFile` fallback | §4.1 |
@@ -258,6 +274,12 @@ No new dependency is required: `simple-git`, age and Node stdlib are already use
 A write requires: ES-01 identity present (`user_id`, `device_id`, device `active`, device signing key
 readable); for remote sync, brain sync opt-in (`enableSync`) **and** the separate checkpoint-upload
 opt-in (N4, ADR D-7) — else the record is written **local-only** and flagged `sync:"local_only"`; scanner available; encryption available.
+
+Written ≠ synced (the checkpoint analogue of "accepted ≠ completed"). The local index records per record
+`sync_state ∈ written` (file fsynced locally) `→ committed` (in a local commit) `→ pushed` (the push
+succeeded and a fetch of `origin/main` contains the commit). A trigger or CLI may say "saved on this
+device" at `written` and "saved for your other devices" only at `pushed`. Whether another device has
+actually read it is not observable by the writer and is never claimed.
 
 ### 5.2 Isolation (other account)
 Three independent barriers, all required: (1) storage — the brain remote is the user's own private
@@ -359,7 +381,9 @@ required (never dropped before memory entries).
 ## 7. Writers (orchestrator side)
 
 - Triggers: `compact` (alongside the existing `.context-snapshot.md` flow, devkit
-  `hooks/post-compact-restore.sh`), `session_end` (brain already installs `src/cli/hooks/session-end.sh`),
+  `hooks/post-compact-restore.sh`; for non-Claude CLIs through the orchestrator's `bin/context-compact.sh`
+  on `origin/release/0.2.5`, §0.2 — per-CLI hook availability not measured, a CLI without one has no
+  `compact` trigger), `session_end` (brain already installs `src/cli/hooks/session-end.sh`),
   `dispatch_report` (a worker's REPORT), `manual` (`aigentry checkpoint` CLI) and an optional
   `interval`.
 - Which triggers upload automatically is a Rule 47 개인정보 전송 decision (ADR D-7), because every
