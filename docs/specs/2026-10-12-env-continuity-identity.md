@@ -307,9 +307,9 @@ Recommended default (only OS-shipped tools — Constitution 제17조, no native 
 
 | OS | Default store | Fallback | Path / mechanism |
 |---|---|---|---|
-| macOS | login Keychain via `/usr/bin/security add-generic-password -s aigentry-device -a <device_id>` | file store if Keychain is locked/unavailable (e.g. SSH-only session), with a warning | `~/.config/aigentry/device/` for the non-secret metadata |
-| Linux | file store: dir `0700`, files `0600`, owner check on every read, refuse if group/world bits are set | Secret Service via `secret-tool` **only** when explicitly requested (`--keystore secret-service`); headless hosts usually have no unlocked keyring | `${XDG_CONFIG_HOME:-~/.config}/aigentry/device/` |
-| Windows | file encrypted with DPAPI `CurrentUser` scope via PowerShell `System.Security.Cryptography.ProtectedData` (ships with Windows PowerShell 5.1) + owner-only ACL | none — refuse login if DPAPI unavailable | `%USERPROFILE%\.config\aigentry\device\` (matches devkit's state-dir convention, `install.ps1:17`) |
+| macOS | login Keychain via `/usr/bin/security -i`, with the `add-generic-password -U -s aigentry-device -a <device_id> -w <secret>` command line written to the child's **stdin** (argv is only `security -i`); read back with `find-generic-password -s … -a … -w` on stdout | none automatic. If the Keychain is locked/unavailable (e.g. SSH-only session), `login` exits 5 and names the explicit `--keystore file` opt-in; it never downgrades silently | `~/.config/aigentry/device/` for the non-secret metadata |
+| Linux | file store: dir `0700`, files `0600`, owner check on every read, refuse if group/world bits are set (no helper process) | Secret Service via `secret-tool store`, which reads the secret from stdin, **only** when explicitly requested (`--keystore secret-service`); headless hosts usually have no unlocked keyring | `${XDG_CONFIG_HOME:-~/.config}/aigentry/device/` |
+| Windows | file encrypted with DPAPI `CurrentUser` scope via PowerShell `System.Security.Cryptography.ProtectedData` (ships with Windows PowerShell 5.1) + owner-only ACL. PowerShell is started as `powershell -NoProfile -NonInteractive -Command -`; the script arrives on stdin and the secret is read inside it with `[Console]::In.ReadLine()`, never placed in `-Command`/`-EncodedCommand` arguments | none — refuse login if DPAPI unavailable | `%USERPROFILE%\.config\aigentry\device\` (matches devkit's state-dir convention, `install.ps1:17`) |
 
 The file store holds `device.json` (non-secret: ids, URL, key_alg, created_at) and
 `secret.json` (private key + refresh token). Writes are tmp + fsync + rename (same pattern
@@ -317,9 +317,27 @@ as telesession `src/store.js:316-330`). Copying the directory to another machine
 *detected*, not prevented: the server sees one device key used from two places only if
 refresh reuse fires (§5); there is no hardware binding in this release (§11).
 
+**Secret transport to helper processes (all OSes).** A secret reaches a spawned process
+only on its **stdin** (or a pipe the parent writes). It never goes in argv, which other
+local users can read through `ps` / `/proc/<pid>/cmdline` / WMI. It never goes in env vars
+(`/proc/<pid>/environ` is readable by the same user and is inherited by children). It
+never goes in a temp file. A helper whose only interface takes the secret in argv is not
+used. That rules out `security add-generic-password … -w <secret>` as a direct argv call;
+the same command is sent through `security -i` stdin instead. Reading back goes the other
+way: the secret arrives on the helper's stdout pipe, and the parent never echoes it.
+
+**Not measured:** `security -i` was not run on a macOS host (the Mac is offline). Its
+handling of piped stdin (no tty echo, no history file, exit status per command) is
+documented tool behaviour that the architect has not verified here. PowerShell's stdin
+script mode and `[Console]::In` were not run on Windows either. ID-10 and ID-11 cover
+both. **If ES-09 cannot verify the macOS stdin path, the macOS default is not safe as
+recommended and D-ID-2 must be decided again** (choices: file store on macOS too; or
+Keychain via a different OS-shipped interface).
+
 Open question that stays with the user (D-ID-2): Keychain-by-default on macOS vs a uniform
-file store everywhere. Recommended: Keychain on macOS, because it is OS-shipped and protects
-the key at rest. The file store is the fallback.
+file store everywhere. Recommended: Keychain on macOS through `security -i` stdin,
+conditional on the verification above, because it is OS-shipped and protects the key at
+rest. The file store is used on macOS only with an explicit `--keystore file`.
 
 ## 7. Authorization and isolation rules
 
@@ -447,7 +465,7 @@ gains an optional "log this device in now?" step that runs `aigentry-devkit logi
 | Id | Decision | Category | Recommended default |
 |---|---|---|---|
 | D-ID-1 | Token lifetimes | privacy / permission | access 15 min; refresh idle 30 d, absolute 90 d; rotation; proof checked first; previous-token retry re-rotates; older token with valid proof → revoke (§5) |
-| D-ID-2 | Device secret storage location | privacy / permission | macOS Keychain (`security`), Linux 0600 file under `~/.config/aigentry/device/`, Windows DPAPI file; never env/state files |
+| D-ID-2 | Device secret storage location | privacy / permission | macOS Keychain via `security -i` with the secret on stdin (conditional on ES-09 verifying that path, §6), file store on macOS only with explicit `--keystore file`; Linux 0600 file under `~/.config/aigentry/device/`; Windows DPAPI file via PowerShell reading stdin; never env/state files, never argv |
 | D-ID-3 | Enabling device credentials on a deployed registry (new credential type + new endpoints) | permission expansion / production deploy | ship behind `DEVICE_AUTH_ENABLED=false`; enable per instance after ES-09 isolation tests pass |
 | D-ID-4 | Devices talk to the registry over its existing HTTPS endpoint (new client→server traffic from every device) | network change / personal-data transfer | allowed only to the registry URL the user chose at install (cloud or self-hosted); no new relay |
 
@@ -512,7 +530,7 @@ Matrix rows are the user's (requirements §검증 매트릭스). IDs are stable 
 | ID-7 | A device that has been offline past the access TTL refreshes on reconnect without user action. A device that has been offline past idle expiry gets `expired` and re-binds to the same `device_id` with `login` | partition/reconnect |
 | ID-8 | Killing the CLI during `login` polling leaves no partial secret file; rerun succeeds or code expires | process kill |
 | ID-9 | Registry restart: issued tokens stay valid (stateless JWT + DB device row); pending authorizations survive until `expires_at` | origin restart |
-| ID-10 | No token/code/key bytes in logs, `--json`, telemetry, `env.sh`, `install-state.json`; secret files have the per-OS protection in §6 | other account isolation (secrets) |
+| ID-10 | No token/code/key bytes in logs, `--json`, telemetry, `env.sh`, `install-state.json`; secret files have the per-OS protection in §6; **no secret in the argv or environment of any spawned process** (sampled `ps -o args` / `/proc/*/cmdline` / `/proc/*/environ` during `login`, refresh and logout; Windows: process command lines via WMI) | other account isolation (secrets) |
 | ID-11 | Per-OS key store behaviour verified on real macOS, Linux and Windows. A Linux-only fixture PASS is **not** reported as cross-platform | per-OS verification |
 | ID-12 | Per-route limits of §7.4 enforced: 11th `/devices/authorize` from one IP in a minute → 429; 6th wrong `user_code` in 10 min → 429; existing non-device endpoints show no new limit (global middleware still off) | other account isolation (enumeration) |
 | ID-13 | Limiter store (Redis) unreachable: `/devices/authorize|approve|deny|token` → 503 `rate_limit_unavailable`, never served unlimited | origin restart (dependency down) |
