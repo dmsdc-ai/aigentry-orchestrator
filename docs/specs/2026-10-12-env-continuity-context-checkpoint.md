@@ -150,7 +150,7 @@ Fragment = { idx, role: "user"|"assistant"|"tool"|"system", turn_range: [from, t
 `sha256` is over the exact UTF-8 bytes of the fragment as the CLI produced it (after newline
 normalisation to LF). The hash is **always** stored, in every mode.
 
-#### 3.1 Modes (decision needed — Rule 47 "개인정보 전송")
+#### 3.1 Modes (decision needed — Rule 47 "개인정보 전송", ADR D-1)
 
 | Mode | Stored and synced | Restore fidelity | Privacy exposure |
 |---|---|---|---|
@@ -256,9 +256,8 @@ No new dependency is required: `simple-git`, age and Node stdlib are already use
 
 ### 5.1 Writer preconditions
 A write requires: ES-01 identity present (`user_id`, `device_id`, device `active`, device signing key
-readable); brain sync
-opt-in enabled for remote sync (else the record is written **local-only** and flagged
-`sync:"local_only"`); scanner available; encryption available.
+readable); for remote sync, brain sync opt-in (`enableSync`) **and** the separate checkpoint-upload
+opt-in (N4, ADR D-7) — else the record is written **local-only** and flagged `sync:"local_only"`; scanner available; encryption available.
 
 ### 5.2 Isolation (other account)
 Three independent barriers, all required: (1) storage — the brain remote is the user's own private
@@ -274,7 +273,8 @@ re-encrypts (`GitBackend.ts:150-153`). For checkpoints, recipients are taken fro
 device list at write time, restricted to trusted devices (§5.5 R5). Consequences, stated honestly:
 - Records written **after** the new device registers and becomes trusted are readable on it immediately.
 - Records written **before** are readable only after any active device re-wraps them (a background
-  "rekey" pass that writes `<seq>.rekey-<n>.ckpt.age` siblings, never modifying originals). Until then
+  "rekey" pass that writes `<seq>.rekey-<n>.ckpt.age` siblings, never modifying originals; an automatic
+  write into the user's repo, covered by ADR D-4). Until then
   restore reports `pending_key` with the list of devices that can rekey. The "third device restores
   the same work" test (CK-03) therefore requires either an online existing device or a checkpoint
   written after registration; the test must record which.
@@ -362,10 +362,14 @@ required (never dropped before memory entries).
   `hooks/post-compact-restore.sh`), `session_end` (brain already installs `src/cli/hooks/session-end.sh`),
   `dispatch_report` (a worker's REPORT), `manual` (`aigentry checkpoint` CLI) and an optional
   `interval`.
+- Which triggers upload automatically is a Rule 47 개인정보 전송 decision (ADR D-7), because every
+  automatic trigger sends conversation-derived data off the device. Recommended default: after the
+  separate checkpoint-upload opt-in, `manual` and `session_end` are on; `compact` and `dispatch_report` are
+  off until the user enables them; `interval` is off.
 - The writer is the CLI-side hook/agent calling `brain_checkpoint_write`; brain owns persistence. The
   orchestrator does not write into the brain repo directly.
 - Existing `session_context` entries (`BrainContract.ts:899-923`) are untouched; an optional one-time
-  import creates one root checkpoint per project with every item marked `summary` and
+  import (run only on an explicit user command — a write into the user's repo, ADR D-4) creates one root checkpoint per project with every item marked `summary` and
   `trigger:"manual"`, `source_session.cli:"legacy"`.
 
 ## 8. Retention
