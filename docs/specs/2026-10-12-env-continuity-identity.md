@@ -89,8 +89,17 @@ is a separate Rule 47 decision (§10, D-ID-1..4).
 
 - Request-scoped transaction: commit on success, rollback on exception
   (`db/session.py:10-20`). Postgres via asyncpg (`config.py:16-18`).
-- Rate limiting through slowapi, enabled by default `100/minute` (`main.py:89-108`,
-  `config.py:91-93`).
+- slowapi is a dependency, but **default limits do not run** (re-measured 2026-10-12). `main.py:90-95`
+  builds a `Limiter` with `default_limits=[settings.rate_limit_default]` (`100/minute`,
+  `config.py:91-92`), storage `settings.redis_url` (`main.py:93`). It is attached to
+  `app.state` with an exception handler (`main.py:107-108`). No `SlowAPIMiddleware` is
+  registered: the only middlewares are `RequestLogMiddleware`, `CORSMiddleware` and
+  `SecurityHeadersMiddleware` (`main.py:191-203`). Default limits apply only through the
+  middleware, so no route has a default limit. The only `@limiter.limit` in `src/aigentry` is
+  `api/v1/repositories.py:80`. It uses a **separate** `Limiter` instance with no `storage_uri`
+  (`repositories.py:26`). Inference, not run: that instance uses slowapi's in-memory default.
+  The orchestrator has filed this as the "registry rate-limiter issue". This spec does not fix
+  it (§7.4).
 - `cryptography>=43` and `PyJWT>=2.8` are already dependencies (`pyproject.toml:36-37`), so
   Ed25519 verification needs no new library.
 - Alembic has a single head `20260319_000002` (computed from all `down_revision` values in
@@ -224,9 +233,10 @@ Rules:
 - `approve` and `deny` require the browser JWT (`type=access`, not revoked) **and** a
   custom header (`X-Aigentry-Intent: device-approve`) so a cross-site form post cannot
   approve (the cookies are `samesite=lax` — `oauth.py:94-102`).
-- Wrong `user_code` attempts: 5 per browser session per 10 min, then 429; global
-  slowapi limit for `/devices/authorize` 10/min per IP. Codes are single-use; `consumed`
-  on first successful token exchange.
+- Wrong `user_code` attempts: 5 per browser session per 10 min, then 429.
+  `/devices/authorize` is limited to 10/min per IP. Both are **new** per-route limits
+  (§7.4); none exists today (§1.4). Codes are single-use; `consumed` on first successful
+  token exchange.
 - Headless machines (the always-on Linux orchestrator) do step 4–5 on any other device that
   has a browser. Nothing is typed into a GUI on the headless host.
 - `--open` may launch the platform browser; default is print-only (requirements: no GUI
@@ -334,8 +344,19 @@ Existing endpoints keep accepting it unchanged.
 - `/devices/authorize` and `/devices/token` responses never reveal whether a user exists.
   `/devices/token` with an unknown `device_code` returns `expired_token`, exactly as for
   an expired one.
-- Rate limits (slowapi, existing): approve 5/10 min per session; authorize 10/min per IP;
-  token poll obeys `interval` (else `slow_down`).
+- Rate limits (**proposal; new work**, because no limit runs today, §1.4): add per-route
+  `@limiter.limit` decorators on `/devices/authorize` (10/min per IP), `/devices/approve`
+  and `/devices/deny` (5 per browser session per 10 min), and `/devices/token` (60/min per
+  `device_id`, and 30/min per IP for unknown ids). `/devices/token` also enforces the poll
+  `interval` (else `slow_down`). The decorators use the `main.py` `Limiter` (Redis store,
+  `main.py:93`).
+  - The global `SlowAPIMiddleware` is **not** switched on: that would change every existing
+    endpoint, which is a production behaviour change outside this spec. The general fix
+    belongs to the registry rate-limiter issue.
+  - **Limiter store down** (Redis unreachable): `/devices/authorize|approve|deny|token`
+    **fail closed** with 503 `rate_limit_unavailable`. They never fall through to "no
+    limit". Other ES-0x endpoints do not depend on Redis (§7.1).
+  - Test rows ID-12 (limits enforced) and ID-13 (store down → 503) in §15.
 - Logs: `user_id`/`device_id` only; never codes, tokens, public keys in full (first 8 hex
   for correlation), never the GitHub login of another user.
 
@@ -399,7 +420,7 @@ gains an optional "log this device in now?" step that runs `aigentry-devkit logi
 
 | Reused unchanged | New |
 |---|---|
-| `users`, `tenants`, GitHub OAuth web flow, JWT signing key/algorithm, `decode_token`, Redis revoke list, slowapi, request transaction, `cryptography`/PyJWT | `devices`, `device_authorizations`, `/api/v1/devices/*`, `get_current_device`, `device_access` token type, refresh family/reuse detection, device-approve page, devkit `login/logout/whoami/device *`, per-OS key store |
+| `users`, `tenants`, GitHub OAuth web flow, JWT signing key/algorithm, `decode_token`, Redis revoke list, the `main.py` slowapi `Limiter` object (not its unwired defaults), request transaction, `cryptography`/PyJWT | `devices`, `device_authorizations`, `/api/v1/devices/*`, `get_current_device`, `device_access` token type, refresh family/reuse detection, per-route rate limits on `/devices/*`, device-approve page, devkit `login/logout/whoami/device *`, per-OS key store |
 
 ## 13. Migration for existing users
 
@@ -443,3 +464,5 @@ Matrix rows are the user's (requirements §검증 매트릭스). IDs are stable 
 | ID-9 | Registry restart: issued tokens stay valid (stateless JWT + DB device row); pending authorizations survive until `expires_at` | origin restart |
 | ID-10 | No token/code/key bytes in logs, `--json`, telemetry, `env.sh`, `install-state.json`; secret files have the per-OS protection in §6 | other account isolation (secrets) |
 | ID-11 | Per-OS key store behaviour verified on real macOS, Linux and Windows. A Linux-only fixture PASS is **not** reported as cross-platform | per-OS verification |
+| ID-12 | Per-route limits of §7.4 enforced: 11th `/devices/authorize` from one IP in a minute → 429; 6th wrong `user_code` in 10 min → 429; existing non-device endpoints show no new limit (global middleware still off) | other account isolation (enumeration) |
+| ID-13 | Limiter store (Redis) unreachable: `/devices/authorize|approve|deny|token` → 503 `rate_limit_unavailable`, never served unlimited | origin restart (dependency down) |

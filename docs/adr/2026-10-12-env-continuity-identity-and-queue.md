@@ -103,7 +103,9 @@ restarts/relay activation (task approval 2026-10-12 13:47Z).
 Learned from source (not schedules):
 
 - **Identity (3–6 placeholder):** the reusable base is larger than assumed (accounts,
-  JWT, Redis, rate limit, `cryptography` present). The new surface is still real: 2
+  JWT, Redis, `cryptography` present). The slowapi `Limiter` exists but is not wired
+  (no middleware; ES-01 §1.4), so per-route limits on `/devices/*` and their
+  fail-closed behaviour are new work. The new surface is still real: 2
   tables, about 7 endpoints, an approval page in the frontend (a frontend dir exists and
   was **not read**), bearer auth dependency, refresh family, a per-OS key store in devkit
   (3 OS paths), and 4 CLI commands. Fixing G2 (user identity loss) touches a shared
