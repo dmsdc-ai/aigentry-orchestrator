@@ -515,23 +515,65 @@ gains an optional "log this device in now?" step that runs `aigentry-devkit logi
 
 ## 15. Acceptance criteria → test matrix rows
 
-Matrix rows are the user's (requirements §검증 매트릭스). IDs are stable for ES-09.
+Matrix rows are the user's (requirements §검증 매트릭스). IDs are stable for ES-09. Rows
+marked *supplementary* are analogues and are **not** coverage of the named user row.
 
 | AC | Criterion | Matrix row |
 |---|---|---|
 | ID-1 | Device A and device B logged in as the same user get the same `user_id` and distinct `device_id`s; both see each other in `device list` | two machines same account |
-| ID-2 | A fresh install on a third machine completes `login` without copying any file from A/B and sees the same account | third fresh device |
+| ID-2 | A fresh install on a third machine completes `login` without copying any file from A/B and sees the same account. For a GitHub user with no registry account yet, the approval step's GitHub login is the sign-up (`oauth_service.py:84-136`) | third fresh device |
 | ID-3 | User Y's device token gets 404 (identical body) on every `devices` and ES-03 resource of user X, including guessed ids, and never sees X's rows in lists | other account isolation |
 | ID-4 | After `device revoke`, the revoked device's next write is rejected in the same transaction; its refresh fails with `invalid_grant` | other account isolation (revoke) |
-| ID-16 | After `device revoke` (and with Redis stopped, to show independence): the revoked device's `GET /devices`, `GET /devices/me`, ES-03 `list`, `get`, `events`, `resolve` and `export` → 401 `device_inactive`; its lease keeper's reconcile/sync gets no data; a request racing the revoke either completes before it or is refused | revoked device sync refused |
-| ID-5 | With a valid proof, presenting a token older than the previous one (rotate twice, then replay the first) revokes the device (`refresh_reuse`) | stale completion fencing (credential analogue) |
-| ID-14 | Refresh response dropped, then the client retries with the same (previous) token, immediately and again after > 1 h: both retries yield a new pair, the device stays `active`, `refresh_retry` events recorded | late ACK (credential analogue) |
-| ID-15 | Refresh for a known `device_id` with a garbage or stale token and **no valid proof** → `invalid_grant`; the device row is unchanged (status, hashes) | other account isolation (revoke by stranger) |
-| ID-6 | `device_code` without the matching private-key proof never yields tokens | duplicate message |
+| ID-5 | With a valid proof, presenting a token older than the previous one (rotate twice, then replay the first) revokes the device (`refresh_reuse`) | *supplementary* (credential analogue of stale completion fencing; Q-10 covers the row) |
+| ID-6 | `device_code` without the matching private-key proof never yields tokens | *supplementary* (Q-11 covers duplicate message) |
 | ID-7 | A device that has been offline past the access TTL refreshes on reconnect without user action. A device that has been offline past idle expiry gets `expired` and re-binds to the same `device_id` with `login` | partition/reconnect |
 | ID-8 | Killing the CLI during `login` polling leaves no partial secret file; rerun succeeds or code expires | process kill |
 | ID-9 | Registry restart: issued tokens stay valid (stateless JWT + DB device row); pending authorizations survive until `expires_at` | origin restart |
 | ID-10 | No token/code/key bytes in logs, `--json`, telemetry, `env.sh`, `install-state.json`; secret files have the per-OS protection in §6; **no secret in the argv or environment of any spawned process** (sampled `ps -o args` / `/proc/*/cmdline` / `/proc/*/environ` during `login`, refresh and logout; Windows: process command lines via WMI) | other account isolation (secrets) |
-| ID-11 | Per-OS key store behaviour verified on real macOS, Linux and Windows. A Linux-only fixture PASS is **not** reported as cross-platform | per-OS verification |
+| ID-11 | Per-OS key store behaviour verified on real macOS, Linux and Windows, including the stdin-only secret transport of §6 | per-OS verification |
 | ID-12 | Per-route limits of §7.4 enforced: 11th `/devices/authorize` from one IP in a minute → 429; 6th wrong `user_code` in 10 min → 429; existing non-device endpoints show no new limit (global middleware still off) | other account isolation (enumeration) |
-| ID-13 | Limiter store (Redis) unreachable: `/devices/authorize|approve|deny|token` → 503 `rate_limit_unavailable`, never served unlimited | origin restart (dependency down) |
+| ID-13 | Limiter store (Redis) unreachable: `/devices/authorize`, `/approve`, `/deny`, `/token` → 503 `rate_limit_unavailable`, never served unlimited | origin restart (dependency down) |
+| ID-14 | Refresh response dropped, then the client retries with the same (previous) token, immediately and again after > 1 h: both retries yield a new pair, the device stays `active`, `refresh_retry` events recorded | late ACK (credential analogue) |
+| ID-15 | Refresh for a known `device_id` with a garbage or stale token and **no valid proof** → `invalid_grant`; the device row is unchanged (status, hashes) | other account isolation (revoke by stranger) |
+| ID-16 | After `device revoke` (and with Redis stopped, to show independence): the revoked device's `GET /devices`, `GET /devices/me`, ES-03 `list`, `get`, `events`, `resolve` and `export` → 401 `device_inactive`; its lease keeper's reconcile/sync gets no data; a request racing the revoke either completes before it or is refused | revoked device: sync refused |
+| ID-17 | A `role=admin` user (`ADMIN_GITHUB_IDS`) gets 404 on every ES-0x resource of another user, read and write | other account isolation (admin) |
+| ID-18 | `X-API-Key` (valid tenant key) on every ES-0x endpoint → 401; the same key still works on an existing endpoint | other account isolation (tenant key) |
+| ID-19 | `POST /devices/approve` with a valid browser cookie but without `X-Aigentry-Intent: device-approve` → 403 and the authorization stays `pending`; a cross-origin form post cannot approve | other account isolation (approval CSRF) |
+
+### 15.1 Testability per row (criterion 4)
+
+Environments:
+- **F1:** one Linux host, a local registry fixture (Postgres + Redis), several simulated
+  devices (separate key directories or OS users), and a fault proxy that can drop
+  responses. A PASS here is reported as **"Linux fixture"**. It never counts as
+  cross-platform, cross-host or real-endpoint.
+- **H2 / H3:** two or three real hosts, one of them the Mac, because the requirement pairs
+  the always-on Linux host with the Mac. A Linux-only host set may run the row, but that
+  result is recorded as partial evidence ("Linux hosts only") and does not close it.
+- **OS3:** real macOS, Linux and Windows hosts.
+- A deployed registry (real endpoint) is needed only for the D-ID-3 enablement check. It
+  is not a row here.
+
+Status today for **every** row: **NOT RUN**. No implementation exists, and this is a spec.
+
+| Row | Measures | Does not measure | Env (Linux-only counts?) | Blocked on (today) |
+|---|---|---|---|---|
+| ID-1 | same `user_id`, distinct `device_id`, mutual listing | key-store protection per OS (ID-11); network faults | H2 (no) | implementation; **Mac offline** |
+| ID-2 | login with no copied file; sign-up via first GitHub login | restore of work (ES-02 CK-03, Q-3) | H3 (no) | implementation; Mac offline; third host not measured as available |
+| ID-3 | identical 404 body/status/code path across not-found and not-owned | timing side channels | F1 (yes) | implementation |
+| ID-4 | write refused in-transaction after revoke; refresh `invalid_grant` | reads (ID-16) | F1 (yes) | implementation |
+| ID-5 | reuse with valid proof → revoke | the user's stale-completion row (Q-10) | F1 (yes) | implementation |
+| ID-6 | proof required for code exchange | duplicate message (Q-11) | F1 (yes) | implementation |
+| ID-7 | refresh after access TTL; idle expiry → re-bind same row (short TTL settings) | a real Mac sleep/wake (Q-6) | F1 (yes, protocol only) | implementation |
+| ID-8 | no partial secret on kill (Linux file store) | Keychain/DPAPI atomicity (ID-11) | F1 (Linux part only) | implementation |
+| ID-9 | tokens and pending authorizations survive restart | deployed-instance restart behaviour | F1 (yes) | implementation |
+| ID-10 | no secret in files/logs/argv/env on Linux | macOS/Windows argv/env (ID-11) | F1 (Linux part only) | implementation |
+| ID-11 | Keychain via `security -i` stdin, DPAPI via PowerShell stdin, Linux file store; ID-8/ID-10 per OS | — | OS3 (no) | **BLOCKED**: Mac offline; no Windows runner (D-Q-6) |
+| ID-12 | per-route limits enforced; no global limit added | distributed (multi-IP) abuse | F1 (yes) | implementation |
+| ID-13 | fail-closed on limiter store loss | partial Redis degradation (latency) | F1 (yes) | implementation |
+| ID-14 | lost refresh response never revokes | client crash between receipt and fsync on Keychain/DPAPI | F1 (yes) | implementation |
+| ID-15 | no revoke without proof | — | F1 (yes) | implementation |
+| ID-16 | revoke stops reads and writes, independent of Redis; race ordering | data outside the registry (ES-02 brain Git, ES-02 CK-11) | F1 (yes) | implementation |
+| ID-17 | admin does not cross users | admin features (none in this release) | F1 (yes) | implementation |
+| ID-18 | tenant API key refused on ES-0x, unchanged elsewhere | G2 on existing endpoints (registry issue) | F1 (yes) | implementation |
+| ID-19 | intent header required; CSRF form refused | phishing of a willing user (§4 approval display) | F1 (yes, HTTP client; no GUI typing) | implementation |

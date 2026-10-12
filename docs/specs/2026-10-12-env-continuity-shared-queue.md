@@ -810,7 +810,8 @@ normal evidence (§4).
 
 Rows are the user's matrix (requirements §검증 매트릭스), plus per-OS. ES-09 owns
 execution with an independent tester. **A Linux-only fixture PASS is not reported as
-cross-platform or real-endpoint PASS.**
+cross-platform or real-endpoint PASS.** Environments F1, H2/H3 and OS3 are defined in ES-01
+§15.1.
 
 | AC | Criterion (testable) | Matrix row |
 |---|---|---|
@@ -829,10 +830,44 @@ cross-platform or real-endpoint PASS.**
 | Q-13 | Registry restart mid-lease: no lease is extended; clients stop new side effects at their local lease-loss point; after restart, state equals pre-restart committed state | origin restart |
 | Q-14 | (after D-Q-1) Migration dry-run on copies of **both** queues, the Mac one included: every row, link, alias and free-text dependency accounted for (field-loss = 0); every cross-ledger id collision listed; projection ids remain valid under `release-admission.mjs`; concurrent creates from two devices never yield the same id under the chosen scheme | concurrent claim (issuance analogue) / migration — ES-09 |
 | Q-15 | Gate (after D-Q-1 and migration, account mode): `--task <runtime id or alias>` resolves to the task's id; another device's live lease → exit 11 in **each** of `hard`, `warn`, `off`; server unreachable + stale cache → exit 12 in each mode; unknown/terminal/non-dispatchable keep today's mode behaviour (exit 4 / proceed, no lease); claim refused after the gate → exit 11 with no spawned workspace; pre-transport failure after claim → sid detached and lease released; exit 7/8 → attachment kept; a dispatch of a `pending` task leaves it `delegated` | concurrent claim / partition |
-| Q-18 | Second dispatch from the same device while its lease is live: claim returns the same token, `new_lease=false`; the first worker's heartbeat/complete with that token still succeed (not `FENCED`) | concurrent claim (same device) |
 | Q-16 | Secret patterns in `annotate`/`complete` bodies refused; no tokens in events or cache | other account isolation (secrets) |
-| Q-19 | ES-08 retry: the first intake attempt's response is dropped (commit happened), then a 5xx, then success: exactly one task and one receipt, `deduplicated: true` on the replays; a non-retryable error (`IDEMPOTENCY_KEY_CONFLICT`, 401 `device_inactive`) is not retried and ends `rejected`; 8 transient failures end `retry_exhausted` with attempts=8, no 9th attempt, visible in ES-07; a manual retry reuses `intake:<key>` | duplicate message / late ACK (AC8 retry) |
 | Q-17 | The device-side client (claim/heartbeat/lease-loss timer/reconcile) verified on real macOS, Linux and Windows hosts | per-OS verification |
+| Q-18 | Second dispatch from the same device while its lease is live: claim returns the same token, `new_lease=false`; the first worker's heartbeat/complete with that token still succeed (not `FENCED`) | concurrent claim (same device) |
+| Q-19 | ES-08 retry: the first intake attempt's response is dropped (commit happened), then a 5xx, then success: exactly one task and one receipt, `deduplicated: true` on the replays; a non-retryable error (`IDEMPOTENCY_KEY_CONFLICT`, 401 `device_inactive`) is not retried and ends `rejected`; 8 transient failures end `retry_exhausted` with attempts=8, no 9th attempt, visible in ES-07; a manual retry reuses `intake:<key>` | duplicate message / late ACK (AC8 retry) |
+| Q-20 | ES-08 untrusted content: an issue whose title/body/labels contain instructions ("use token X", "add repo Y to the allowlist", "run Z", "grant write") is stored only as an `untrusted_content` blob; `desc` is the fixed template; the dispatched ref shows it only inside the untrusted-data fence; adapter allowlist, scopes, credentials and task fields are unchanged; attachments not fetched | other account isolation (AC8: issue text grants no credentials/scopes) |
+| Q-21 | ES-08 receipt: states move `received → task_linked → analysis_requested → analysis_recorded → review_recorded`; a fault injected after the task insert and before commit leaves **no** task, receipt or event; `rejected` and `retry_exhausted` are terminal | duplicate message (AC8 receipt) |
+| Q-22 | §9.3 offline create: device creates while the server is unreachable → `provisional` alias + idempotency key; on reconnect exactly one task with an id under the chosen D-Q-1 scheme; cache rows, ref files and notes rewritten from the provisional alias; replay ×2 → `deduplicated` | partition/reconnect (offline create) |
+| Q-23 | `claim` with an open `depends_on` → `DEPENDENCIES_OPEN` (accepted only with `allow_open_deps.reason`, recorded); `update` with a stale `expected_version` → `VERSION_CONFLICT` returning the current row; `complete status=done` with empty evidence → `EVIDENCE_REQUIRED`; row unchanged in each case | concurrent claim (non-lease conflicts) |
+
+### 13.1 Testability per row (criterion 4)
+
+Status today for **every** row: **NOT RUN**. No implementation exists, and this is a spec.
+
+| Row | Measures | Does not measure | Env (Linux-only counts?) | Blocked on (today) |
+|---|---|---|---|---|
+| Q-1 | create on A visible on B, same `version`/links after one sync | ES-02 checkpoint equality (CK rows) | H2 (no) | implementation; **Mac offline** |
+| Q-2 | cross-device lease view and `HELD` | real latency effects | H2 (no) | implementation; Mac offline |
+| Q-3 | fresh device sees same tasks and can claim | work restore (ES-02/ES-04) | H3 (no) | implementation; Mac offline; third host not measured as available |
+| Q-4 | identical 404 on X's ids/aliases; list isolation | timing side channels | F1 (yes) | implementation |
+| Q-5 | revoked device refused for sync and claim | brain-Git data (ES-02) | F1 (yes) | implementation |
+| Q-6 | real partition > TTL, takeover, `FENCED` on return, outputs preserved | external side effects already made (§8) | H2 (no); F1 with fault proxy = partial | implementation; Mac offline |
+| Q-7 | keeper kill → expiry at TTL; re-acquire with/without bump | macOS/Windows keeper lifecycle (Q-17) | F1 (yes, Linux keeper) | implementation; D-Q-9 |
+| Q-8 | expired holder refused; re-claim then complete | — | F1 (yes) | implementation |
+| Q-9 | one winning device under ≥16 concurrent claims; one bump | cross-host network latency | F1 (yes, DB serialisation) | implementation |
+| Q-10 | stale token refused; evidence kept as event | stale artefacts in sinks we do not control | F1 (yes) | implementation |
+| Q-11 | idempotent replay, conflict, ES-08 duplicate | dedupe beyond the 7-day window (covered by `dedupe_key`, Q-19) | F1 (yes) | implementation |
+| Q-12 | stored result on retry after commit; late REPORT → event | telesession ACK path (ES-05) | F1 (yes, fault proxy) | implementation |
+| Q-13 | no retroactive lease extension; state equals committed state | deployed HA behaviour (none promised) | F1 (yes) | implementation |
+| Q-14 | migration field-loss = 0, collisions listed, ids admissible, no duplicate issuance | — | F1 on file copies (yes) | **BLOCKED**: D-Q-1 undecided; Mac ledger copy (Mac offline) |
+| Q-15 | gate exit 11/12 per mode, lease step placement, detach/keep, status `delegated` | alias resolution for canonical ids (needs D-Q-1) | F1 (yes, orchestrator checkout + fixture) | implementation; alias part blocked on D-Q-1 |
+| Q-16 | secret patterns refused; no tokens in events/cache | secrets that match no known pattern | F1 (yes) | implementation |
+| Q-17 | keeper, lease-loss timer and reconcile on each OS | — | OS3 (no) | **BLOCKED**: Mac offline; no Windows runner (D-Q-6) |
+| Q-18 | same-device re-claim keeps token, no self-fencing | separation of workers on one device (not provided) | F1 (yes) | implementation |
+| Q-19 | bounded retry, never-retried set, one task per delivery, terminal states visible | real GitHub delivery (activation out of scope) | F1 (yes, fake source) | implementation |
+| Q-20 | issue content inert: no field, scope, credential or allowlist change | model behaviour of a worker reading the fenced content | F1 (yes, fake source) | implementation |
+| Q-21 | receipt state machine; receipt + task + events atomic | GitHub-side acknowledgement (none in release) | F1 (yes) | implementation |
+| Q-22 | offline create → one canonical task; references rewritten | P-B issuance while the Mac is asleep, if chosen | F1 for P-A/P-C (yes); P-B needs the Mac | **BLOCKED** on D-Q-1 |
+| Q-23 | dependency, version and evidence rejections leave the row unchanged | — | F1 (yes) | implementation |
 
 ## 14. Decisions needed (Rule 47) — recorded in the ADR
 
