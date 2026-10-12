@@ -328,17 +328,32 @@ the key at rest. The file store is the fallback.
 1. Read `Authorization: Bearer`; decode with existing `decode_token` (`oauth_service.py:167-169`).
 2. Require `type == "device_access"`; reject `access`/`refresh` web tokens on device
    endpoints and device tokens on cookie endpoints.
-3. Redis revoke check as today; **if Redis is unreachable, fail closed (503)** for device
-   endpoints (today's web path silently falls through — `auth.py:83-84`).
+3. Durable device check (§7.2) on **every** request. Reads and writes are treated the same.
+   There is no Redis lookup on this path, so a Redis outage cannot open it. Today's web
+   path silently falls through on a Redis error (`auth.py:83-84`); this one has nothing to
+   fall through to.
 4. Return `(user_id, device_id, tenant_id)`. Never substitute an API key (G2).
 
-### 7.2 Durable revoke check
+### 7.2 Durable revoke check (every ES-0x request)
 
-Every ES-03 mutation (`create/claim/heartbeat/release/complete`) and every ES-02/ES-04
-write loads `devices` by `(id = did, user_id = sub)` **inside the same transaction** and
-requires `status='active'`. Revoke therefore takes effect immediately for writes. Reads
-are bounded by the 15-min access lifetime. Also, revoke adds the device's live access
-`jti`s to Redis so reads stop as well while Redis is up.
+Every request on a registry ES-0x endpoint loads the device in the request's transaction,
+**reads included** (`get`, `list`, `events`, `resolve`, `export`, `GET /devices`, `GET
+/devices/me`):
+`SELECT status FROM devices WHERE id = :did AND user_id = :sub FOR SHARE`. It requires
+`status = 'active'`, else 401 `device_inactive`. This is one primary-key lookup.
+`DELETE /devices/{id}` (revoke) sets `status='revoked'` and `revoked_at = now()` under
+`SELECT … FOR UPDATE`. Under READ COMMITTED, a plain `SELECT` would not serialise against a
+concurrent revoke. With `FOR SHARE` against `FOR UPDATE`, every ES-0x transaction either
+commits before the revoke or sees `revoked`.
+
+So: **a request whose transaction starts after the revoke commits is refused, read or
+write.** The 15-min access lifetime and Redis do not matter to device tokens. The
+`refresh_token` grant is refused by §5 step 1.
+
+Data that never reaches the registry is outside this check. ES-02 checkpoints and ES-04
+captures stored in the user's brain Git repo are such data, and their revoke enforcement
+is reader-side: readers verify the writer against the authenticated device list (§8.1,
+ES-02 §5.4).
 
 ### 7.3 Resource isolation table
 
@@ -352,7 +367,7 @@ Every row the feature stores carries `owner_user_id`. Every query includes
 | `device_authorizations` | `user_id` after approval | nobody via API except the polling device by `device_code` | approve/deny: logged-in user | uniform `expired_token` / 404 |
 | ES-03 queues, tasks, aliases, events, leases | `owner_user_id` | owner's active devices | owner's active devices | 404 |
 | ES-08 intake receipts | `owner_user_id` | owner's devices | intake adapter acting as an owner device | 404 |
-| ES-02 checkpoints, ES-04 captures (defined by their specs) | `owner_user_id` | owner's devices | owner's devices | 404 |
+| ES-02 checkpoints, ES-04 captures (defined by their specs) | only if stored in the registry: `owner_user_id` | registry-stored: owner's active devices (§7.2). Brain-Git-stored: not a registry resource; readers verify the writer against the device list (§8.1, ES-02 §5.4) | same split | registry-stored: 404 |
 
 `role=admin` (`oauth_service.py:120`) **does not** grant read or write on another user's
 rows for any resource in this table. Admin operations across users are not provided in
@@ -439,8 +454,10 @@ gains an optional "log this device in now?" step that runs `aigentry-devkit logi
 ## 11. What this does NOT guarantee
 
 - No hardware binding: a copied device directory works until refresh reuse is detected.
-- Read access after revoke may last up to 15 min if Redis is unavailable (writes stop
-  immediately — §7.2).
+- Revoke stops every registry ES-0x request, read or write, that starts after the revoke
+  commits (§7.2), with or without Redis. It cannot stop a request already in flight, or
+  reads of data the device already holds locally or can fetch from storage outside the
+  registry (brain Git repo, ES-02 §5.3 "Known limit").
 - No secret of any kind (API keys, `.env`, SSH keys, cloud credentials) is synchronised by
   identity. ES-04 shares only env **names** and supply paths.
 - Identity does not move processes; a device that comes back reconnects and recreates its
@@ -487,6 +504,7 @@ Matrix rows are the user's (requirements §검증 매트릭스). IDs are stable 
 | ID-2 | A fresh install on a third machine completes `login` without copying any file from A/B and sees the same account | third fresh device |
 | ID-3 | User Y's device token gets 404 (identical body) on every `devices` and ES-03 resource of user X, including guessed ids, and never sees X's rows in lists | other account isolation |
 | ID-4 | After `device revoke`, the revoked device's next write is rejected in the same transaction; its refresh fails with `invalid_grant` | other account isolation (revoke) |
+| ID-16 | After `device revoke` (and with Redis stopped, to show independence): the revoked device's `GET /devices`, `GET /devices/me`, ES-03 `list`, `get`, `events`, `resolve` and `export` → 401 `device_inactive`; its lease keeper's reconcile/sync gets no data; a request racing the revoke either completes before it or is refused | revoked device sync refused |
 | ID-5 | With a valid proof, presenting a token older than the previous one (rotate twice, then replay the first) revokes the device (`refresh_reuse`) | stale completion fencing (credential analogue) |
 | ID-14 | Refresh response dropped, then the client retries with the same (previous) token, immediately and again after > 1 h: both retries yield a new pair, the device stays `active`, `refresh_retry` events recorded | late ACK (credential analogue) |
 | ID-15 | Refresh for a known `device_id` with a garbage or stale token and **no valid proof** → `invalid_grant`; the device row is unchanged (status, hashes) | other account isolation (revoke by stranger) |

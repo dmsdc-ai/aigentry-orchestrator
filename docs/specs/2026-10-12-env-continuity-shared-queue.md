@@ -783,7 +783,7 @@ cross-platform or real-endpoint PASS.**
 | Q-2 | A claims, then B's `get` shows A's device name and remaining TTL; B's `claim` → `HELD` | two machines same account |
 | Q-3 | Fresh install + `login` on device C; `list` returns the same tasks/versions; C can claim an unheld task | third fresh device |
 | Q-4 | User Y: `get`/`claim`/`complete`/`annotate`/`resolve` on X's ids and aliases → 404 with identical body; `list` never contains X's rows | other account isolation |
-| Q-5 | Revoked device: next `claim/heartbeat/complete` rejected in-transaction | other account isolation (revoke) |
+| Q-5 | Revoked device: next `claim/heartbeat/complete` **and** `list/get/events/resolve/export` (sync) refused (401 `device_inactive`) in-transaction (ES-01 §7.2, ID-16) | revoked device: sync·claim refused |
 | Q-6 | Partition A for > TTL: Linux claims (token n+1); A reconnects → `FENCED`; A's outputs preserved, nothing merged | partition/reconnect |
 | Q-7 | `kill -9` of the holder device's **lease keeper** (§5.1) mid-lease: lease expires at TTL, task claimable, no row corruption; a keeper restarted after TTL re-claims with a new token (bump); one restarted within TTL gets the same token (`new_lease=false`) | process kill |
 | Q-8 | Lease expiry with nobody re-claiming: holder's `complete` with current token → `LEASE_EXPIRED`; after re-claim, `complete` succeeds with the new token | lease expiry |
