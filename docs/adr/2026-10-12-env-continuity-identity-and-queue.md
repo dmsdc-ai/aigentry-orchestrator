@@ -36,7 +36,7 @@ decided here** (orchestrator guardrail 2026-10-12 13:59Z); it is D-Q-1.
 | A7 | **Single-statement transactional claim**; per-task monotonic fencing token; server-clock leases with client-side `lease_remaining_s` and a safety margin; expired holders are refused even before anyone re-claims | ES-03 §4.2, §5 |
 | A8 | **Idempotency keys** on all mutations, with telesession's semantics (dedupe / conflict / in-flight) stored in the effect's transaction | ES-03 §7 |
 | A9 | **Reconnect/recreate, never live process migration.** Fenced work is preserved as evidence and never auto-merged | ES-03 §6, §9 |
-| A10 | Keep the local `task-queue.json` shape as a **single-writer cache**, so the gate, `tq-*` and the release maintainer keep working. The gate adds alias resolution and a lease check (`rc 6`) | ES-03 §3.6, §11 |
+| A10 | Keep the local `task-queue.json` shape as a **single-writer cache**, so the gate, `tq-*` and the release maintainer keep working. The gate adds alias resolution and a read-only lease view (mode-independent exit 11 held / 12 unavailable; exit 6 is already taken in `cli.ts`); the claim is a separate lease step before spawn | ES-03 §3.6, §11 |
 | A11 | **ES-08**: dedupe on the `owner/repo#N` alias; durable receipt in the same transaction; issue content is stored as an untrusted blob, never in `desc` or instructions; no outward GitHub action in this release | ES-03 §12 |
 
 ## 3. Alternatives rejected
@@ -49,7 +49,7 @@ decided here** (orchestrator guardrail 2026-10-12 13:59Z); it is D-Q-1.
 | GitHub's own device flow / new GitHub scopes | Needs a new OAuth app configuration and scope approval (not approved). Proves a GitHub identity but not possession of an aigentry device key |
 | OS keystore through a native addon (e.g. keytar) | External native dependency (제17조, 제1조). OS-shipped CLIs/APIs are enough, with a file fallback |
 | Redis as the lease store | Revocation already shows Redis is TTL/volatile (`revocation_service.py`). Leases and fences must survive restarts and sit in the same transaction as the task row |
-| New daemon/relay for queue sync | The registry API + the existing telepty daemon suffice. A new service is a network/ops change and adds weight (제1조) |
+| New network daemon/relay for queue sync (server-side or cross-host) | The registry API suffices for sync. A new network service is a network/ops change and adds weight (제1조). Not rejected: a device-local, user-level **lease keeper** with no listening network port (ES-03 §5.1), because a one-shot `dispatch.sh` and an agent-CLI orchestrator cannot heartbeat a 600 s lease; it is a new operational component and therefore decision D-Q-9 |
 | Global id counter across users | Leaks activity volume across users and makes cross-user guessing meaningful. If a server counter is chosen at all (P-A), it is per-queue |
 
 ## 4. Constitutional review (위헌 심사)
@@ -79,7 +79,7 @@ decided here** (orchestrator guardrail 2026-10-12 13:59Z); it is D-Q-1.
   - **P-C:** every host runs a per-host counter, so issuance logic lives in a client on
     each host, and the registry only validates ranges and uniqueness. This is one
     implementation deployed many times, not a duplicate, provided the counter lives in
-    exactly one client component (the device sync client) and nowhere in the
+    exactly one client component (the devkit lease keeper, ES-03 §5.1) and nowhere in the
     orchestrator's gate. Admissible on that condition. A second counter anywhere else
     violates 제4조(3).
   The architect does not rank these. The boundary cost is an input to D-Q-1.
@@ -129,7 +129,7 @@ Learned from source (not schedules):
   dependency used by existing endpoints, so regression risk is high. **Estimate pressure:
   upper half.**
 - **Queue (5–10 placeholder):** about 7 tables, about 11 operations, a sync/cache client,
-  gate changes in `cli.ts` (resolve + lease + `rc 6` + event ledger), and the reconcile
+  gate changes in `cli.ts` (resolve + lease view + exit 11/12 + lease step with exit-hook detach + event ledger), the devkit lease keeper (resident process, local socket/pipe, ES-03 §5.1), and the reconcile
   path. Migration effort depends on D-Q-1: P-C ≈ no migration; P-A/P-B need the Mac read,
   a mapper, a dry-run and a review. **Upper half under P-A/P-B; lower half under P-C.**
 - **ES-08 contract:** small (one table, alias kind, fence wrapper for refs), because

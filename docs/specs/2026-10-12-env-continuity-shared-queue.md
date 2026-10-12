@@ -356,7 +356,7 @@ Each step is reversible until M5. M3 and M5 are Rule 47 operational-data changes
 | M1 backup | Byte-copy both queue files; record sha256 | backups + hash list |
 | M2 dry-run | Read-only mapper produces `mapping.json` per §3.4(2) | report for human review |
 | M3 import | One transaction: queue row; rows under the chosen scheme; aliases; links; dependency notes; one `migrated` event per task carrying the source file hash and the source row's sha256 | server queue |
-| M4 cutover | Local writers stop (manual edits; the dispatch auto-ledger `cli.ts:835-892` switches to the event API). The local file is rewritten by the sync client only, as a cache (§11) | cache with canonical IDs + `aliases` per row |
+| M4 cutover | Local writers stop (manual edits; the dispatch auto-ledger `cli.ts:835-892` switches to the event API). The local file is rewritten by the lease keeper only, as a cache (§11) | cache with canonical IDs + `aliases` per row |
 | M5 freeze | Old files renamed `*.pre-migration`, read-only, **not deleted** | |
 
 Existing `parent`/`children` of #2026101204 (children 2026101206…2026101214) become
@@ -369,26 +369,94 @@ Rollback before M5: discard the server queue; local files are untouched. After M
 
 ### 3.6 What the `--task` gate validates after migration
 
-The gate (`cli.ts:790-828`) keeps its modes (`AIGENTRY_TASK_GATE=hard|warn|off`,
-`cli.ts:678`) and exit codes. Its lookup changes:
+**Today, as measured (orchestrator `71cc2da`).** Two layers must not be mixed:
 
-1. **Resolve.** `--task <ref>` accepts the canonical ID, any `runtime_id`, or an explicit
-   alias (`gh:owner/repo#N`, `req:<key>`). The ref is resolved on the server
-   (`/tasks/resolve`); the ledger records both forms.
-2. **Status.** Same sets as today (`cli.ts:682-683`); `rc 3` unknown, `rc 4` terminal,
-   `rc 5` non-dispatchable.
-3. **Lease (new).** Before the inject, the dispatching device must **hold a live lease on
-   the task, or acquire one** (`claim`, idempotency key `dispatch:<task>:<sid>`). Another
-   device's live lease → refuse with a new `rc 6` (`held by another device`, showing that
-   device's *name* and remaining TTL). This stops two orchestrators from dispatching the
-   same task. Several workers on one device share that device's lease.
-4. **Server unreachable.** The gate may fall back to the local cache only if `synced_at`
-   is less than 10 min old and the cached row shows **this device** as lease holder with
-   `lease_remaining` > 0 at sync time. Otherwise it behaves as today's "queue unreadable"
-   (`rc 2` → `taskGateReject`). It never claims offline.
-5. **Ledger.** The dispatch note/`spawn_decisions` write (`cli.ts:853-868`) becomes a
+- *Internal* results of `taskQueueStatus` (`cli.ts:764-788`): 0 dispatchable, 2 queue
+  unreadable (`:769`), 3 unknown id (`:782`), 4 terminal or archived (`:780`, `:787`),
+  5 non-dispatchable status (`:787`).
+- *Process exit codes*: internal 2, 3, 4 and 5 all go to `taskGateReject`
+  (`cli.ts:810-826`). It exits **4** in `hard` (`:731`), and in `warn` it prints and audits
+  and **proceeds** (`:726-729`). In `off` it proceeds silently (`:725`). Process exit **5**
+  from the gate means *ambiguous id* (`:774`). It is mode-independent (`:748-751`).
+  `--task` with `--no-task`, and an empty `--no-task` reason, exit 4 in every mode
+  (`:791-798`).
+- Exit codes already used elsewhere in `cli.ts`: 1 and **6** (`waitForReady`: ready
+  timeout / never registered, `:1123-1141`, exited at `:1335`), 2, 3 (`:1338`, `:1395`), 4,
+  5 (also `DELIVERY_FAILED` after transport, `:1418`), 7, 8, 9, 10, 78. **6 is taken**, so
+  the lease refusal cannot be "rc 6".
+- The gate runs at `cli.ts:1260`, before the sid is derived (`:1262-1277`), the read-only
+  dedup query (`:1285-1294`), spawn (`:1310-1312`), readiness and ref staging
+  (`:1328-1347`), and the durable `beginDelivery` (`:1351-1373`). Its own comment says it
+  runs "BEFORE any side effect" (`:675-676`).
+- The ledger promotes only `pending|queued → delegated` and never regresses `in_progress`
+  (`:854-855`). It runs after the inject (`:1424`) and is best-effort (`:887-891`).
+
+**After migration, in account mode.** The read-only gate stays where it is. The claim is a
+separate *lease step* later in the pipeline:
+
+1. **Resolve (gate, `:1260`, read-only).** `--task <ref>` accepts the canonical ID, any
+   `runtime_id`, or an explicit alias (`gh:owner/repo#N`, `req:<key>`). It is resolved on
+   the server (`/tasks/resolve`) through the lease keeper (§5.1). The ledger records both
+   forms.
+2. **Status (gate, read-only).** Same sets as today (`cli.ts:682-683`). Unknown, terminal
+   and non-dispatchable still go through `taskGateReject`, so they keep today's mode
+   behaviour: exit 4 in `hard`; proceed in `warn`/`off`. A dispatch that proceeds this way
+   takes **no** lease and writes no `dispatched` event, which matches today, where such a
+   dispatch has no row to ledger.
+3. **Lease view (gate, read-only).** If the task shows a live lease of **another device**,
+   the gate exits **11** `TASK_LEASE_HELD`, showing that device's *name* and remaining TTL.
+   Exit 11 is **mode-independent**, like the ambiguity exit 5, and for the same reason.
+   `AIGENTRY_TASK_GATE` sets how strict the gate is about a known row's status. It cannot
+   authorise two devices to work on one task. `warn` and `off` do not bypass it.
+4. **Lease unavailable (gate, read-only).** If the server is unreachable, the gate may use
+   the local cache only when `synced_at` is less than 10 min old **and** the cached row
+   shows this device as the holder with `lease_remaining` > 0 at sync time. Otherwise it
+   exits **12** `TASK_LEASE_UNAVAILABLE`, mode-independent, and never claims offline. In
+   account mode, the escape hatches are the existing audited `--no-task "<reason>"`
+   (`:794-800`), which dispatches with no task and no lease, or leaving account mode.
+   `warn`/`off` are not escape hatches here, because a dispatch without a lease is exactly
+   the double-dispatch the lease prevents.
+5. **Claim (lease step; new; the only queue side effect).** It sits after the sid exists
+   and after the read-only dedup and retry checks (`cli.ts:1285-1308`), and before
+   `resolveRoute`/spawn (`:1310-1312`). So a refused claim leaves no spawned worker, which
+   keeps the intent of `:675-676`. The step asks the lease keeper to `claim` with
+   idempotency key `dispatch:<task>:<sid>` and `promote_to=delegated` (§4.2), and to
+   *attach* the sid to the lease. Outcomes:
+   - `HELD`, from a race since the gate's view → exit 11, as in (3).
+   - Server unreachable → exit 12.
+   - Success → continue.
+6. **Exit after the claim.** What happens to the attachment depends on how the process
+   ends:
+   - **Exit before any transport write** (`:1335` 1/6, `:1338` 3, the 2/78 spawn and
+     staging failures, `beginDelivery` 9 or 4 `DISPATCH_RETRY_REFUSED` `:1355`): an exit hook
+     **detaches** the sid. If no other sid of this device is attached, the keeper
+     `release`s with `status_after=unchanged`. The status that `promote_to` set stays
+     `delegated`, which is the same imprecision today's local ledger has for a failed
+     dispatch. If the hook itself cannot run (`kill -9` of `dispatch.sh`), the attachment
+     stays `pending_delivery`. The keeper drops `pending_delivery` attachments after 10 min,
+     and the lease then expires at TTL. That is the deliberate TTL fallback.
+   - **Exit 8 `DISPATCH_DEDUPLICATED`** (`:1362`): a prior delivery with the same sid
+     landed. The claim was the same idempotent request, so the attachment is the prior
+     one's. It is **kept**.
+   - **Exit 7 `DISPATCH_RETRY_HELD` / `DELIVERY_UNKNOWN`** (`:1366-1368`, `:1402-1404`,
+     `:1413-1415`), exit 3 after a failed inject that is recorded as `unknown`
+     (`:1388-1395`; the same number as the pre-transport `:1338`, so the hook must tell them
+     apart by the pipeline stage, not by the exit code), and exit 5 `DELIVERY_FAILED`
+     after transport (`:1418-1420`): the worker may be running. The
+     attachment is marked `delivery_unknown` and **kept**. It is shown in ES-07 until the
+     operator resolves it with `detach` or `complete`. It is never dropped automatically.
+   - **Exit 0:** the attachment becomes `delivered`.
+7. **Status a dispatch produces.** With `promote_to=delegated`, the claim promotes only
+   `pending|queued → delegated` and leaves every other status unchanged. That is today's
+   ledger rule (`cli.ts:855`), now applied on the server in the claim statement. A dispatch
+   never sets `in_progress`. `in_progress` is set by an explicit `update` from the
+   orchestrator, just as the orchestrator sets it by hand today.
+8. **Ledger.** The dispatch note/`spawn_decisions` write (`cli.ts:853-868`) becomes a
    `dispatched` event carrying the fencing token. It stays best-effort *after* the inject,
    as today (`cli.ts:887-891`).
+
+In **local-only mode** none of (3)–(7) applies, and the gate is exactly today's code.
+Q-15 tests this contract.
 
 ## 4. API operations
 
@@ -401,7 +469,7 @@ mutation: `Idempotency-Key` header (§7) and the in-transaction device-active ch
 | `create` | `title, desc?, kind, track, priority, parent_id?, depends_on[]?, release_group?, release_component?, aliases[]?, dedupe_key?, status? (pending default)` | `{id, version, deduplicated}` | `DEDUPE_KEY_EXISTS` returns the existing id with `deduplicated: true`; `ALIAS_TAKEN`; `PARENT_NOT_FOUND` |
 | `get` | id or `?ref=` alias | task + links + aliases + lease view `{device_name, label, remaining_s, fencing_token}` | 404 |
 | `list` | `status, parent_id, held_by=me\|any, release_group, updated_since_seq, cursor, limit≤200` | page + `next_cursor` + `event_seq` | — |
-| `claim` | `ttl_s (60–3600, default 600), label?, allow_open_deps?: {reason}` | `{fencing_token, lease_remaining_s, status}` | `HELD` (live lease of another holder), `NOT_DISPATCHABLE`, `DEPENDENCIES_OPEN` |
+| `claim` | `ttl_s (60–3600, default 600), label?, promote_to? ∈ {delegated} (absent = status unchanged), allow_open_deps?: {reason}` | `{fencing_token, lease_remaining_s, status, new_lease}` | `HELD` (live lease of another device), `NOT_DISPATCHABLE`, `DEPENDENCIES_OPEN` |
 | `heartbeat` | `fencing_token, ttl_s?, progress?` (≤2 KiB) | `{lease_remaining_s}` | `FENCED`, `LEASE_EXPIRED`, `NOT_HOLDER` |
 | `release` | `fencing_token, status_after ∈ {unchanged, pending, blocked, awaiting-user}, note?` | `{status}` | same as heartbeat |
 | `complete` | `fencing_token, status ∈ {done, cancelled, superseded}, evidence {commits[], prs[], reports[], checks[]}, note` | `{status, completed_fencing_token}` | same as heartbeat; `EVIDENCE_REQUIRED` for `done` with empty evidence |
@@ -422,28 +490,47 @@ stored.
 
 ### 4.2 Transactional claim (single statement)
 
+A lease belongs to a **device**, not to a worker. All workers and dispatches of one device
+share it (§3.6), and fencing separates devices. In the statement below, `live_mine` means
+"this device already holds a live lease". It is evaluated on the old row, as Postgres
+evaluates every `SET` expression against the pre-update row.
+
 ```sql
 UPDATE tasks
-   SET lease_device_id = :d, lease_label = :label,
-       fencing_token = fencing_token + 1,
-       lease_expires_at = now() + make_interval(secs => :ttl),
-       claimed_at = now(), last_heartbeat_at = now(),
-       status = CASE WHEN status IN ('pending','queued','delegated') THEN 'in_progress' ELSE status END,
+   SET fencing_token    = CASE WHEN lease_device_id = :d AND lease_expires_at > now()      -- live_mine
+                               THEN fencing_token ELSE fencing_token + 1 END,
+       lease_expires_at = CASE WHEN lease_device_id = :d AND lease_expires_at > now()
+                               THEN GREATEST(lease_expires_at, now() + make_interval(secs => :ttl))
+                               ELSE now() + make_interval(secs => :ttl) END,
+       claimed_at       = CASE WHEN lease_device_id = :d AND lease_expires_at > now()
+                               THEN claimed_at ELSE now() END,
+       lease_device_id = :d, lease_label = COALESCE(:label, lease_label),
+       last_heartbeat_at = now(),
+       status = CASE WHEN :promote_to = 'delegated' AND status IN ('pending','queued')
+                     THEN 'delegated' ELSE status END,
        version = version + 1, updated_at = now()
  WHERE queue_id = :q AND id = :t AND owner_user_id = :u
    AND status IN ('pending','queued','in_progress','delegated','blocked-by-observation')
-   AND (lease_device_id IS NULL OR lease_expires_at <= now())
-RETURNING fencing_token, lease_expires_at;
+   AND (lease_device_id IS NULL OR lease_expires_at <= now() OR lease_device_id = :d)
+RETURNING fencing_token, lease_expires_at, (claimed_at = now()) AS new_lease;
 ```
 
-Under Postgres READ COMMITTED, a second concurrent `UPDATE` blocks on the row lock. Once
-the first commits, it re-evaluates the `WHERE` against the new row, and the lease predicate
-now fails, so it updates 0 rows. **Exactly one claimant wins**; the loser receives `HELD`.
-The dependency check (`depends_on` targets terminal) runs in the same transaction before
-the update. The claim event (§10) is inserted in the same transaction.
+- **Other device, live lease:** the predicate fails, 0 rows → `HELD`.
+- **No lease, or an expired lease** (any device, including this one after a restart that
+  outlived the TTL): the token **is bumped**, and `new_lease = true`. Q-7.
+- **Same device, live lease** (a second dispatch, or the keeper re-acquiring after a
+  restart within TTL): the token is **not** bumped and the TTL is extended. The call
+  returns the current token with `new_lease = false`. It therefore never fences the
+  device's own first worker (Q-18). A worker that must be stopped on the same device is
+  stopped by the orchestrator, not by the fence.
 
-Re-claim by the **current holder** of a live lease is allowed (same device). It bumps the
-token as well, so a holder that restarted cannot be confused with its pre-restart self.
+Under Postgres READ COMMITTED, a second concurrent `UPDATE` blocks on the row lock. Once
+the first commits, it re-evaluates the `WHERE` against the new row. If the competing claim
+is from another device, the lease predicate now fails and it updates 0 rows. **Exactly one
+device wins**, and the token is bumped exactly once. Concurrent claims from the winning
+device join its lease. The dependency check (`depends_on` targets terminal) runs in the
+same transaction before the update. The `claimed` event (§10, with `new_lease`) is inserted
+in the same transaction.
 
 ## 5. Lease, TTL and fencing semantics
 
@@ -453,8 +540,9 @@ token as well, so a holder that restarted cannot be confused with its pre-restar
   safety_margin`, where `safety_margin = max(30 s, 10% of TTL)`. It must stop starting new
   side effects after that point, even if it cannot reach the server.
 - **TTL:** default 600 s; heartbeat every `TTL/3` (200 s). Bounds 60–3600 s per claim.
-  The orchestrator process on the device heartbeats; agent CLIs never hold registry
-  credentials (Rule 46/49 — workers get no host-wide tokens).
+  The **lease keeper** (§5.1) heartbeats. No agent CLI holds registry credentials, and
+  that includes the orchestrator session, which is itself an agent CLI (Rule 46/49:
+  workers get no host-wide tokens).
 - **Fencing token:** per-task `bigint`, incremented on *every* successful claim, never
   decremented. A mutation by a holder is accepted only if all of these hold, in the same
   statement: `fencing_token = :token AND lease_device_id = :caller_device AND
@@ -478,11 +566,54 @@ token as well, so a holder that restarted cannot be confused with its pre-restar
   current live token. Sinks we do not control (GitHub comments, package registries,
   external APIs) cannot check a token; see §8.
 
+### 5.1 Lease keeper (heartbeat and sync owner)
+
+A 600 s TTL with a 200 s heartbeat needs a resident process. `dispatch.sh`/`cli.ts` is
+one-shot, and the orchestrator is an agent CLI session. Neither can be the heartbeat owner.
+
+- **Component:** `aigentry-devkit lease-keeper`. It is a user-level process shipped by
+  devkit, the component that already owns the ES-01 client and key store (ES-01 §9), so no
+  new package is needed. One instance runs per ES-01 device directory, enforced by an
+  `O_EXCL` lock file holding its pid in that directory.
+- **Duties:** claim, heartbeat, release, complete and annotate on behalf of local callers;
+  token refresh (ES-01 §5); reconnect reconcile (§9) and the cache rewrite (§11); the
+  sid-attachment table (§3.6(5)–(6)); local lease-loss timers (§5).
+- **Credentials:** it is the only process that reads the ES-01 key store. Callers (the
+  dispatch gate, the `aigentry-devkit` CLI) talk to it over a local endpoint: a Unix domain
+  socket `0600` in the device directory (`0700`), with peer-uid check (`SO_PEERCRED` /
+  `getpeereid`), or on Windows a named pipe whose ACL allows only the current user. The
+  protocol carries operations and results, **never tokens, codes or key bytes**.
+  Confined workers (Rule 46/49) must not have the device directory in their sandbox
+  allowlist. Whether today's sandbox profiles exclude it was **not measured** (ES-09 item).
+- **Lifecycle:**
+  - Started on demand by the first command that needs it (gate lease step, `login`,
+    `device` commands).
+  - Exits after 10 min with no attachment and no held lease.
+  - No boot-time service (no launchd/systemd unit, no Windows scheduled task) and no
+    automatic restart in this release. Adding one is an operational change (D-Q-9).
+- **Failure modes:**
+  - Killed (`kill -9`), crashed, or the device sleeps: heartbeats stop and leases expire
+    at TTL (Q-7 kills **this** process). The next on-demand start reconciles (§9). A
+    lease it still holds within TTL is re-acquired without a bump (§4.2); after TTL, with
+    a bump.
+  - Key store locked or unavailable (e.g. macOS Keychain locked after sleep): it cannot
+    refresh. When the access token expires, it stops heartbeating and marks the leases
+    lost locally at the lease-loss point (§5). The state is shown in ES-07 as
+    `keystore_locked`. It never falls back to another store (ES-01 §6).
+  - Registry unreachable: as in §6.
+  - Second instance: refused by the lock. A stale lock (pid not alive) is taken over.
+- **What it cannot do:** it does not start, stop or kill workers. Telling a stale worker
+  to stop (§6, §9) is the orchestrator's job, using the keeper's `FENCED` result.
+
+This is a **new operational component**. ADR §3 rejects a new network service or relay.
+The keeper is neither: it listens on no network port, and its only outbound traffic is to
+the registry URL already covered by D-ID-4. Running it at all is decision D-Q-9.
+
 ## 6. Crash, offline and reassignment
 
 | Event | What happens |
 |---|---|
-| Holder process killed / device sleeps | Heartbeats stop. After `lease_expires_at`, the task is claimable; `status` is still `in_progress` |
+| Lease keeper killed (§5.1) / device sleeps | Heartbeats stop. After `lease_expires_at`, the task is claimable; `status` is still `in_progress` |
 | Reassignment policy | Field `reassign_policy ∈ auto \| manual` (default `auto`). `auto`: the always-on Linux orchestrator claims expired-lease tasks it is configured to serve, at most one claim per task per 60 s (no flapping). `manual`: the task is surfaced to the user (ES-07) and nobody claims automatically |
 | Same device returns before expiry | Heartbeat succeeds; work continues |
 | Holder returns after takeover | Its next heartbeat/complete gets `FENCED`. The client must stop the stale worker (an operation inside its own sealed scope), annotate `stale_execution` with what it produced (branches, commits, files), and **not** push or merge further |
@@ -528,7 +659,7 @@ working state from ES-02 checkpoints and ES-04 captures and starts a new worker.
 
 ## 9. Reconnect reconcile
 
-On every (re)connect, the sync client:
+On every (re)connect, the lease keeper (§5.1):
 
 1. `GET list?held_by=me` and `GET events?since_seq=<local cursor>`.
 2. For each task the device *locally* believes it holds:
@@ -582,7 +713,7 @@ the queue exists. A retention limit, if wanted, is a Rule 47 decision (D-Q-4).
 - **Account mode:** `state/task-queue.json` keeps today's shape (`tasks[]` with `id` and
   `status`), so existing readers (the gate, `tq-*` scripts, the release maintainer) keep
   working. Rows carry canonical `id`, `aliases`, and lease view. The file gets a top-level
-  `authority: {mode: "server", queue, synced_at, event_seq}`. **Only the sync client
+  `authority: {mode: "server", queue, synced_at, event_seq}`. **Only the lease keeper
   writes it** (single writer, same temp+fsync+rename as `cli.ts:869-881`). Human or tool
   edits go through the API; a hand edit is overwritten at the next sync, after the diff
   is logged as a warning.
@@ -654,15 +785,16 @@ cross-platform or real-endpoint PASS.**
 | Q-4 | User Y: `get`/`claim`/`complete`/`annotate`/`resolve` on X's ids and aliases → 404 with identical body; `list` never contains X's rows | other account isolation |
 | Q-5 | Revoked device: next `claim/heartbeat/complete` rejected in-transaction | other account isolation (revoke) |
 | Q-6 | Partition A for > TTL: Linux claims (token n+1); A reconnects → `FENCED`; A's outputs preserved, nothing merged | partition/reconnect |
-| Q-7 | `kill -9` of the holder's orchestrator mid-lease: lease expires at TTL, task claimable, no row corruption; restarted holder re-claims with a new token | process kill |
+| Q-7 | `kill -9` of the holder device's **lease keeper** (§5.1) mid-lease: lease expires at TTL, task claimable, no row corruption; a keeper restarted after TTL re-claims with a new token (bump); one restarted within TTL gets the same token (`new_lease=false`) | process kill |
 | Q-8 | Lease expiry with nobody re-claiming: holder's `complete` with current token → `LEASE_EXPIRED`; after re-claim, `complete` succeeds with the new token | lease expiry |
-| Q-9 | N ≥ 16 concurrent `claim`s on one task from ≥ 2 devices: exactly one success, others `HELD`; token incremented exactly once | concurrent claim |
+| Q-9 | N ≥ 16 concurrent `claim`s on one task from ≥ 2 devices: every success belongs to one device, every claim from the other devices gets `HELD`; token incremented exactly once | concurrent claim |
 | Q-10 | Holder with token n after someone claimed n+1: `complete` → `FENCED`; row unchanged; `stale_execution` annotation accepted | stale completion fencing |
 | Q-11 | Same request with the same idempotency key ×3 → one effect, two `deduplicated: true`; same key + different body → `IDEMPOTENCY_KEY_CONFLICT`; duplicate ES-08 delivery → same task | duplicate message |
 | Q-12 | `complete` committed but response dropped; retry with same key after lease expiry → stored success (not `LEASE_EXPIRED`); a worker REPORT arriving after takeover → `late_report` event, not completion | late ACK |
 | Q-13 | Registry restart mid-lease: no lease is extended; clients stop new side effects at their local lease-loss point; after restart, state equals pre-restart committed state | origin restart |
 | Q-14 | (after D-Q-1) Migration dry-run on copies of **both** queues, the Mac one included: every row, link, alias and free-text dependency accounted for (field-loss = 0); every cross-ledger id collision listed; projection ids remain valid under `release-admission.mjs`; concurrent creates from two devices never yield the same id under the chosen scheme | concurrent claim (issuance analogue) / migration — ES-09 |
-| Q-15 | Gate (after D-Q-1 and migration): `--task <runtime id or alias>` resolves to the task's id; another device's live lease → `rc 6`; server unreachable + stale cache → `rc 2` path | concurrent claim / partition |
+| Q-15 | Gate (after D-Q-1 and migration, account mode): `--task <runtime id or alias>` resolves to the task's id; another device's live lease → exit 11 in **each** of `hard`, `warn`, `off`; server unreachable + stale cache → exit 12 in each mode; unknown/terminal/non-dispatchable keep today's mode behaviour (exit 4 / proceed, no lease); claim refused after the gate → exit 11 with no spawned workspace; pre-transport failure after claim → sid detached and lease released; exit 7/8 → attachment kept; a dispatch of a `pending` task leaves it `delegated` | concurrent claim / partition |
+| Q-18 | Second dispatch from the same device while its lease is live: claim returns the same token, `new_lease=false`; the first worker's heartbeat/complete with that token still succeed (not `FENCED`) | concurrent claim (same device) |
 | Q-16 | Secret patterns in `annotate`/`complete` bodies refused; no tokens in events or cache | other account isolation (secrets) |
 | Q-17 | The device-side client (claim/heartbeat/lease-loss timer/reconcile) verified on real macOS, Linux and Windows hosts | per-OS verification |
 
