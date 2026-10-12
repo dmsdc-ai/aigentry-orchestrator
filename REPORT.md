@@ -18,6 +18,7 @@ commits:
 - 9c484f8 coordination C1–C5 (ES-01 §3.1, §8, §8.1, ID-21)
 - 7f64e38 coordination C6 (ES-01 §6, §8.1 R2, §10 D-ID-2; ADR §5 D-ID-2)
 - 5440250 coordination C8/C9 (ES-01 §8.1 R5, §10 D-ID-5; ADR §5 D-ID-5)
+- 5fc3d94 coordination C10 (ES-01 §8 GET /, §8.1 R5 + new row FP, §9 whoami/device list, ID-22)
 
 resolved:
 - B1: ES-01 §1.4 now reports the wiring as measured: a Limiter is built (main.py:90-95) but no SlowAPIMiddleware is registered (main.py:191-203), so default limits do not run. The only decorator is repositories.py:80, on its own Limiter (:26). The registry rate-limiter issue is cited. §7.4 proposes per-route decorators on /devices/* and does not turn on the global middleware. If the limiter store (Redis) is down, authorize/approve/deny/token fail closed with 503. Test rows ID-12 and ID-13. ADR §7 prices this as new work.
@@ -139,6 +140,14 @@ coordination (orchestrator follow-up 14:39Z, ES-02 §5.5 R1–R7, sibling clone 
 - C7 (15:00Z, informational): no change needed. §8.1 is kept stable: C8/C9 were edited inside existing table cells, so no lines were added or renumbered (diff: 3 lines changed in place).
 - C8: D-ID-5 kept-fields for revoked device rows now include `created_at` (plus `age_recipient_sig`), with the reason: ES-02 endorsement validity compares the endorsed device's `created_at` with the endorser's `revoked_at`. Changed in ES-01 §10 and ADR §5.
 - C9: ES-01 §8.1 R5 no longer states "first device self-trusted" as final. The trust anchor is marked "per ES-02 §5.6 (in revision)", under ES-02 D-9.
+
+- C10 (15:13Z): ES-01 now owns the device fingerprint format, in the new §8.1 row FP (appended as the last row; lines 465–476 unmoved).
+  - Format: `aigfp1:` + the first 16 bytes of SHA-256("aigentry-device-fingerprint-v1|" ‖ raw Ed25519 public_key), as 32 lowercase hex digits in 8 groups of 4. Comparison ignores case and `-`.
+  - This replaces the earlier 8-byte form in R5, edited in place: 128 bits, because the threat is a registry choosing a substitute key.
+  - The registry list (§8 `GET /`, edited in place) carries the server-recorded `fingerprint`.
+  - `aigentry-devkit device list` and `whoami` (the build plan's `aigentry device list`, renamed) show `fingerprint_local` for the current device. It is computed from its own key store and never taken from any registry response. They also show `fingerprint_server` and `fingerprint_match`; a mismatch warns on stderr and exits 6 `KEY_MISMATCH`, with no automatic change.
+  - Test row ID-22 includes a substituted-key fixture and a known-answer vector.
+  - Noted: ES-02 re-pinned its ES-01 column to 6f8ab9d. This commit (5fc3d94) adds the FP row and CLI fields after that pin, so ES-02 may need to re-pin to cite §8.1 FP.
 
 snyk: NOT_APPLICABLE_DOCS
 
