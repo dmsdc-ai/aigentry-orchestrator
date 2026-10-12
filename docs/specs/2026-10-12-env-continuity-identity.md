@@ -165,7 +165,8 @@ user (existing users.id, UUID)          ← the account; one GitHub identity
 | `key_alg` | varchar(16) | `ed25519` (only value in this release) |
 | `public_key` | bytea(32), unique | raw Ed25519 public key. Stays bound to the row after revoke, so a revoked device logs in again only with a **new** key pair and gets a new `device_id` (§5) |
 | `age_recipient` | varchar(128) null | X25519 age recipient (`age1…`) for ES-02/ES-04 encryption (§8.1) |
-| `age_recipient_sig` | bytea(64) null | Ed25519 signature by this device's key over `"aigentry-age-recipient-v1\|" + device_id + "\|" + age_recipient`; the registry cannot substitute the recipient without breaking it |
+| `age_recipient_sig` | bytea(64) null | Ed25519 signature by this device's key over `"aigentry-age-recipient-v1\|" + hex(public_key) + "\|" + age_recipient`. It is bound to `public_key`, not `device_id`, because the device signs at `/devices/authorize`, before any `device_id` exists. The key never changes for a row, so the binding is just as strong. The registry cannot substitute the recipient without breaking the signature |
+| `age_recipient_set_at` | timestamptz null | server clock; set whenever a new signed recipient is stored (rotation is visible to R6 diffs) |
 | `status` | varchar(16) | `active` \| `revoked` \| `expired` |
 | `refresh_family_id` | UUID | current refresh family |
 | `refresh_hash` | char(64) | sha256 of the *current* refresh token (issued, not yet presented) |
@@ -174,8 +175,10 @@ user (existing users.id, UUID)          ← the account; one GitHub identity
 | `refresh_idle_expires_at` | timestamptz | sliding |
 | `refresh_abs_expires_at` | timestamptz | absolute, set at registration / re-login |
 | `client_version` | varchar(32) | devkit version string |
-| `created_at`, `last_seen_at`, `revoked_at` | timestamptz | |
-| `revoked_reason` | varchar(32) | `user` \| `refresh_reuse` \| `idle_expiry` \| `admin_disable_user` |
+| `created_at` | timestamptz | **server clock**, set once when the device row is created (token exchange, §4). Never moved: an `expired` re-bind (§5) keeps it. ES-02 endorsement validity depends on it (§8.1 R5) |
+| `revoked_at` | timestamptz null | **server clock**, set once by revoke, never cleared or moved (§8.1 R4) |
+| `last_seen_at` | timestamptz | |
+| `revoked_reason` | varchar(32) null | set only when `status='revoked'`: `user` \| `refresh_reuse` \| `admin_disable_user`. Idle expiry is **not** a revoke: it sets `status='expired'` and leaves `revoked_reason` and `revoked_at` null (§5) |
 | `revoked_by_device_id` | UUID null | which device issued the revoke (audit) |
 
 Constraint: `(user_id, name)` unique among `status='active'` (partial unique index).
@@ -448,7 +451,7 @@ Existing endpoints keep accepting it unchanged.
 | `POST /authorize` | none (rate-limited) | start device-code login (§4) |
 | `POST /approve`, `POST /deny` | browser JWT cookie + intent header | bind code to user |
 | `POST /token` | device_code + proof, or refresh + proof | issue / rotate tokens |
-| `GET /` | device bearer or browser cookie | list caller's devices: id, name, os, status, created_at, last_seen_at, `current: bool`; with `include=keys&all=true` (device bearer only) also `revoked_at`, `public_key`, `age_recipient`, `age_recipient_sig` and revoked devices (§8.1) |
+| `GET /` | device bearer or browser cookie | list caller's devices: id, name, os, status, created_at, last_seen_at, `current: bool`; with `include=keys&all=true` (device bearer only) also `revoked_at`, `public_key`, `age_recipient`, `age_recipient_sig`, `age_recipient_set_at`, `server_time` and revoked/expired devices (§8.1) |
 | `GET /me` | device bearer | this device + user (`user_id`, `github_id`, `github_login`) |
 | `PUT /me/age-recipient` | device bearer | set or rotate this device's signed age recipient (§8.1) |
 | `PATCH /{id}` | device bearer or browser | rename (own only) |
@@ -463,10 +466,10 @@ Errors use the RFC 8628 names for the token endpoint (`authorization_pending`,
 |---|---|
 | R1 signing key | the device's Ed25519 key (§3.1). ES-01 signs only with prefix `aigentry-device-v1\|` (and `aigentry-age-recipient-v1\|`). ES-02/ES-04 use their own prefixes. The key store (§6) exposes a *sign* operation through the lease keeper (ES-03 §5.1); key bytes never leave the store |
 | R2 age recipient | `age_recipient` + `age_recipient_sig` per device (§3.1), sent with `/devices/authorize` or set later by `PUT /devices/me/age-recipient` (device bearer, new signed value = rotation). Generated on the device. The private half follows the same store rules as the device key (§6) |
-| R3 authenticated device list | `GET /devices?include=keys&all=true` (owner's device bearer only, §7.2) returns per device: `id, name, os, status, created_at, revoked_at, public_key, age_recipient, age_recipient_sig`, revoked devices included. Over TLS to the registry URL of D-ID-4. Integrity rests on the registry (R5) |
-| R4 revoke time | `revoked_at`: server clock, set once, never cleared or moved; revoked rows are never re-bound (§5). Retention: D-ID-5 |
-| R5 trust model | the registry is the **key directory** and is trusted for membership. A compromised registry could add a device key or recipient. ES-01 provides the signed recipient (R2) and stable ids/fingerprints (first 8 bytes of sha256 of `public_key`) for client-side pinning. The endorsement scheme and whether it is required are ES-02's (its decision D-9); ES-01 adds no server-side endorsement |
-| R6 change notice | the list carries `created_at`/`revoked_at` and keys, so a client can diff against its pinned set. Display is the client's (ES-02) |
+| R3 authenticated device list | `GET /devices?include=keys&all=true` (owner's device bearer only, §7.2) returns per device: `id, name, os, status, created_at, revoked_at, public_key, age_recipient, age_recipient_sig, age_recipient_set_at`, revoked and expired devices included, plus `server_time`. Over TLS to the registry URL of D-ID-4. Integrity rests on the registry (R5) |
+| R4 revoke time | `revoked_at`: server clock, set once, never cleared or moved; revoked rows are never re-bound, and logging in again creates a new `device_id` with a new key (§5). `expired` is not revoked: `revoked_at` stays null and the device's signatures stay valid. Retention: D-ID-5 |
+| R5 trust model | **Model:** the registry is the **key directory** and is trusted for membership. A compromised registry could add a device key and so become a recipient of new records. **What ES-01 provides for the mitigation:** stable `device_id`; an immutable `public_key` per id; a fingerprint (first 8 bytes of sha256 of `public_key`, hex, shown by `device list`); the signed recipient (R2); and server-clock `created_at` and `revoked_at` that are never moved (§3.1). Clients pin `id + fingerprints`. A pinned device whose `public_key`, `created_at` or `revoked_at` changes in a later list is treated as a registry fault, not as an update, and is surfaced (R6). **Endorsement validity, using ES-01 timestamps:** an endorsement is valid only if the endorsed device's server-clock `created_at` **precedes** the endorser's `revoked_at` (or the endorser has no `revoked_at`). An endorsement by a device dated after that device's `revoked_at` is void. Revoking a device does not revoke the devices it endorsed. The user's first device (earliest `created_at`) is self-trusted. Endorsements are signed with the endorser's device key through the R1 sign operation, under an ES-02 prefix. The endorsement file, its storage in the brain repo, and whether endorsement is required (decision D-9) belong to ES-02. ES-01 adds no server-side endorsement and does not make the registry the judge of trust. Because `created_at`/`revoked_at` are registry assertions, they are as trustworthy as the registry under this model; pinning makes later changes visible but cannot prove the first value |
+| R6 change notice | The list makes every change ES-02 must announce observable, so a client can diff it against its pinned set: **addition** (a new `device_id`), **key change** (new `age_recipient`/`age_recipient_sig`, with `age_recipient_set_at`; `public_key` never changes for an id), **revoke** (`status`, `revoked_at`). The list carries the fields the notice must show: `name`, `os`, `created_at`, fingerprints. Every list response includes `server_time`, so the client can show freshness. Showing the notice (CLI/MCP, `recipients_changed`) before the new set is used for writes, with removals taking effect immediately, is the client's job (ES-02) |
 | R7 Git-stored data | ES-01 §7.2/§7.3 no longer claim registry-transaction enforcement for brain-Git data; readers verify against R3 |
 | GitHub binding (ES-02 §5.2) | `GET /devices/me` returns `github_id` (stable) and `github_login` of the user, so a client can check that the brain repo's GitHub owner is the same account. The binding is the existing `users.github_id` (§1.1); nothing new is stored |
 
@@ -576,7 +579,7 @@ marked *supplementary* are analogues and are **not** coverage of the named user 
 | ID-18 | `X-API-Key` (valid tenant key) on every ES-0x endpoint → 401; the same key still works on an existing endpoint | other account isolation (tenant key) |
 | ID-19 | `POST /devices/approve` with a valid browser cookie but without `X-Aigentry-Intent: device-approve` → 403 and the authorization stays `pending`; a cross-origin form post cannot approve | other account isolation (approval CSRF) |
 | ID-20 | Approval page shows name/os/version, request time and network prefix; the 21st active device → `device_limit` | other account isolation (device-code phishing) |
-| ID-21 | `GET /devices?include=keys&all=true` returns keys, signed age recipients and `revoked_at` for active **and** revoked devices; a tampered `age_recipient` fails its signature check; `revoked_at` never changes after revoke; logging in again after a revoke yields a new `device_id` | revoked device (ES-02/ES-04 reader inputs) |
+| ID-21 | `GET /devices?include=keys&all=true` returns keys, signed age recipients and `revoked_at` for active **and** revoked devices; a tampered `age_recipient` fails its signature check against `public_key`; `revoked_at` never changes after revoke; `created_at` is unchanged by an `expired` re-bind; idle expiry leaves `revoked_reason`/`revoked_at` null; logging in again after a revoke yields a new `device_id` | revoked device (ES-02/ES-04 reader inputs) |
 
 ### 15.1 Testability per row (criterion 4)
 
