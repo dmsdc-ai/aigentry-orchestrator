@@ -119,7 +119,7 @@ JCS canonicalisation, error codes, detector list, freshness defaults.
 | Area | Finding that changes the estimate | Direction |
 |---|---|---|
 | ES-02 | needs new SyncBackend primitives, CheckpointStore/Index, fail-closed crypto, ES-01-based recipients + rekey pass, MCP tools, `brain_context_resume` extension, secret scanner (none exists), orchestrator/devkit triggers, 20 test rows after fix cycle 1 | upper half: **6–9** (scanner shared with ES-04 counted here) |
-| ES-04 | no existing capture code in devkit; bundle/shelf/worktree handling, preview/journal/rollback, runtime manifest detectors for several ecosystems, per-OS FS checks | upper half or above: **9–13**; per-OS verification blocked on runners |
+| ES-04 | no existing capture code in devkit; bundle/shelf/worktree handling, preview/journal/rollback, runtime manifest detectors for several ecosystems (test rows WS-15/WS-15b added in fix cycle 2), per-OS FS checks | upper half or above: **9–13**; per-OS verification blocked on runners |
 | ES-07 | data model only now; PTY hop has no evidence source (telepty not read); depends on PR3 merge | data model + view **2–3** within the 4–8 OS/diagnostics bucket; no reduction of the OS part |
 | Cross-cutting | ES-01 user/device + key distribution is a hard prerequisite for both; registry not read — unknown | estimate blocked until ES-01 design |
 | Cross-cutting (fix cycle 1) | record/manifest signing + reader-side verification, device-list cache, trust endorsements, and the ES-01 key interface (`age_recipient`, list fields — ES-02 §5.5) are not in the ES-02/ES-04 ranges above | add, unestimated; ES-01 side belongs to the identity estimate |
