@@ -601,12 +601,15 @@ one-shot, and the orchestrator is an agent CLI session. Neither can be the heart
     keeper signs those two only inside its own `login`, refresh and
     `register_age_recipient` operations.
   - `public_key()`, `fingerprint()` (ES-01 FP; the local value, never from the registry).
-  - `register_age_recipient(age_recipient)`: checks the `age1…` format, signs and sends
-    `PUT /devices/me/age-recipient`.
+  - `register_age_recipient(age_recipient)`: checks the `age1…` format, reads the current
+    `age_recipient_seq` through `device_me()`, signs with the next value (ES-01 §3.1, §8.1 R2) and
+    sends `PUT /devices/me/age-recipient`.
   - `device_list()`: a proxied `GET /devices?include=keys&all=true` returning the list and
     `server_time`; `device_me()`: a proxied `GET /devices/me`.
 - **Callers:** the dispatch gate, the `aigentry-devkit` CLI (incl. the ES-04 capture/restore
-  commands) and brain (ES-02 writer, reader and pre-push gate). Each starts the keeper on
+  commands, which use `sign` only and obtain the device list and trust state through brain's
+  `aigentry-brain trust refresh`, interface invariants I3/I12, BR-6) and brain (ES-02 writer, reader,
+  pre-push gate and `trust refresh`). Each starts the keeper on
   demand. This local protocol is a 제15조 contract: it is registered in aigentry-ssot before
   implementation, with devkit as owner and brain and the orchestrator as consumers.
 - **Authority:** any process running as the same OS user that can reach the socket can
