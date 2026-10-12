@@ -193,13 +193,15 @@ update at implementation time; no generator is added.
 - The dispatch gate looks a task up by `String(id) === taskId` and refuses when an ID
   matches two rows (rc 5) (`src/dispatch/cli.ts:735-741, 764-788`). It validates
   existence and status only, not issuance.
-- Smaller integer IDs, presumably issued from the Mac queue, appear in Linux-visible
-  artefacts: projection IDs 652 and 1195–1199 (`release/tasks.json`), and
-  `linked_mac_tasks` `"1215","1226","1229"` on #2026101110 (stored as strings).
-- The parent row records the same gap itself: `canonical_id.status = "BLOCKED"`, "No
-  canonical task-ID allocator is defined anywhere measured … Integer ids have been issued
-  informally from the Mac orchestrator's queue, which is offline", with aliases
-  `runtime_id`, `request_keys` and `doc_refs` (`state/task-queue.json`, row 2026101204).
+- Observed: integers below 10⁴ appear in Linux-visible artefacts. They are projection IDs
+  652 and 1195–1199 (`release/tasks.json`) and `linked_mac_tasks` `"1215","1226","1229"` on
+  #2026101110 (stored as strings). **Their issuer was not measured.**
+- The parent row records the same gap: `canonical_id.status = "BLOCKED"`, "No canonical
+  task-ID allocator is defined anywhere measured … Integer ids have been issued informally
+  from the Mac orchestrator's queue, which is offline", with aliases `runtime_id`,
+  `request_keys` and `doc_refs` (`state/task-queue.json`, row 2026101204). What is measured
+  is that the row *says* this. The statement itself is a record written by a previous
+  session, not a measurement of the Mac.
 
 **Searched and not found (re-measured 2026-10-12):** an ID allocator or issuance rule in
 `docs/rules.md`, `AGENTS.md`, `.agents/skills/orchestrate-turn/SKILL.md`, `bin/tq-*.sh`
@@ -214,9 +216,14 @@ update at implementation time; no generator is added.
 - Whether any ID below 10⁹ was ever issued on Linux, or any date-form ID on the Mac.
 - Whether other hosts or tools issue IDs.
 
-Consequence: today, two hosts can mint IDs independently (Linux date-form, Mac small
-integers) with **no coordination**. The only collision protection is that the two
-*observed* forms differ in magnitude, which is a convention, not a rule.
+**Inference (not measured):**
+
+- The integers below 10⁴ were probably issued by the Mac queue. This rests on the
+  `linked_mac_tasks` field name and the parent row's note, not on reading the Mac.
+- If so, two hosts mint IDs independently (Linux date-form, Mac small integers), and
+  no coordination rule was found (see "Searched and not found"). Whether the Mac follows
+  an unwritten coordination practice was not measured. The two *observed* forms differ in
+  magnitude. That separates them by convention, not by a rule anyone enforces.
 
 ### 3.2 Proposals (alternatives — none adopted)
 
@@ -316,10 +323,24 @@ inputs before the user decides:
 3. A freeze agreement: neither host mints IDs between the measurement and the cutover
    (P-A/P-B).
 
-The architect's input, not a decision: P-A gives the best availability with
-single-issuer safety, but only once the Mac ledger is read. P-C is the only option that
-needs no migration of existing IDs. P-B matches today's practice but cannot issue while
-the Mac is asleep.
+Summary of the §3.2 table, with no ranking:
+
+- P-C has the best issuance availability (yes in both offline rows) and renumbers no
+  existing ID, but keeps two ID shapes and needs a per-host atomic counter and range rules.
+- P-A has one issuer and one ID shape, but cannot issue while the server is offline, and
+  its seed depends on reading the Mac.
+- P-B keeps the Mac as issuer, but cannot issue while the Mac is offline, and needs a new
+  cross-host request path (below).
+
+All three still need the store import M1–M5 (§3.5) if D-Q-2 is adopted.
+
+**Consequences that belong to the choice itself, with no default:**
+
+- P-B adds a **new cross-host path**: non-Mac devices request IDs from the Mac (via
+  telepty or via the server as a relay). That is a network change. It conflicts with
+  D-ID-4 ("no new relay") unless the user approves the path as part of choosing P-B.
+- P-B and P-C put issuance logic outside the registry: in the Mac orchestrator (P-B) or in
+  every host's client (P-C). See the ADR §4 제4조 assessment.
 
 Until D-Q-1 is decided, the rest of this spec treats `id` as "the task's canonical
 integer under the chosen scheme". The server schema keys tasks by `(queue_id, id)` and
@@ -566,8 +587,9 @@ the queue exists. A retention limit, if wanted, is a Rule 47 decision (D-Q-4).
   edits go through the API; a hand edit is overwritten at the next sync, after the diff
   is logged as a warning.
 - **Local-only mode** (not logged in, `DEVICE_AUTH_ENABLED=false`, or a user who opts
-  out): exactly today's behaviour. The file is the authority, there is no lease and no
-  shared allocator (date-form ids continue). Rule 34's gate works unchanged.
+  out): exactly today's behaviour. The file is the authority, there is no lease, and IDs
+  are chosen as they are today, whatever D-Q-1 decides for account mode. Rule 34's gate
+  works unchanged.
 
 ## 12. ES-08 intake linkage (contract only this release)
 

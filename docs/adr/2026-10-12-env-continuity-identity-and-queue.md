@@ -63,9 +63,26 @@ decided here** (orchestrator guardrail 2026-10-12 13:59Z); it is D-Q-1.
 - **제15조 SSOT:** the `/api/v1/devices/*` and `/api/v1/queues/*` contracts must be
   registered in aigentry-ssot and approved by registry, devkit and orchestrator before
   implementation. Not done here.
-- **제4조 경계:** the server logic lives in the registry. devkit holds only the client and
-  key store. The orchestrator holds only the gate/cache client. There is no duplicate
-  allocator in the orchestrator.
+- **제4조 경계** (`tooling/instructions/CONSTITUTION.md:68-75`: client adapter only, no
+  duplicate implementation, single source of truth). Identity, lease, fencing and the
+  store are registry logic. devkit holds the client and key store. The orchestrator holds
+  the gate/cache client. That part holds under every D-Q-1 option. Task-ID issuance depends
+  on the option, so the verdict is given per proposal:
+  - **P-A:** compliant. Issuance is registry logic; the orchestrator issues nothing.
+  - **P-B:** the Mac orchestrator becomes the issuer, and other devices call it ("Mac
+    allocator API"). Issuance is then core logic in the orchestrator, and the registry
+    holds a second, mirror authority for the same IDs. That is two sources of truth for
+    one fact, which 제4조(3) forbids unless the split is explicit. Admissible only if the
+    allocator API is registered as an orchestrator contract in aigentry-ssot (제15조), the
+    registry is declared a mirror that enforces uniqueness only, and the mirror reconcile
+    is specified. Otherwise it violates 제4조.
+  - **P-C:** every host runs a per-host counter, so issuance logic lives in a client on
+    each host, and the registry only validates ranges and uniqueness. This is one
+    implementation deployed many times, not a duplicate, provided the counter lives in
+    exactly one client component (the device sync client) and nowhere in the
+    orchestrator's gate. Admissible on that condition. A second counter anywhere else
+    violates 제4조(3).
+  The architect does not rank these. The boundary cost is an input to D-Q-1.
 - **제14조 안전 가드:** migration, deletion and auto-reassignment are gated (§5).
 
 ## 5. Open decisions for the user (Rule 47)
@@ -76,7 +93,7 @@ decided here** (orchestrator guardrail 2026-10-12 13:59Z); it is D-Q-1.
 | D-ID-2 | Device secret storage location | privacy / permission | macOS Keychain via `security`; Linux 0600 file under `~/.config/aigentry/device/`; Windows DPAPI file; never env/state files | ES-01 impl |
 | D-ID-3 | Enable the new device credential type + endpoints on a deployed registry | permission expansion / production deploy | ship disabled (`DEVICE_AUTH_ENABLED=false`); enable per instance after ES-09 isolation PASS | ES-01/03 rollout |
 | D-ID-4 | Every opted-in device talks to the registry over HTTPS | network change / personal-data transfer | only to the registry URL chosen at install; no new relay | ES-01/03 rollout |
-| D-Q-1 | **Canonical task-ID issuance:** P-A server counter / P-B Mac ledger + mirror / P-C partitioned ranges, and whether to migrate | operational data change | **none adopted.** First: read the Mac ledger, run the mapping dry-run, agree a freeze (ES-03 §3.4). The architect's input is in ES-03 §3.4 and is not a recommendation to adopt | ES-03 ids, migration, gate change |
+| D-Q-1 | **Canonical task-ID issuance:** P-A server counter / P-B Mac ledger + mirror / P-C partitioned ranges, and whether to migrate | operational data change | **none adopted.** First: read the Mac ledger, run the mapping dry-run, agree a freeze (ES-03 §3.4). ES-03 §3.4 summarises the trade-offs with no ranking. Consequences that come with an option: P-B's new cross-host ID-request path (a network change that conflicts with D-ID-4 unless approved with P-B); the 제4조 boundary cost of P-B/P-C (§4) | ES-03 ids, migration, gate change |
 | D-Q-2 | Registry Postgres as authoritative store for opted-in users | operational data / personal-data transfer | yes, opt-in, self-hostable | ES-03 impl |
 | D-Q-3 | Execute the migration (M3/M5) | operational data change | only after D-Q-1 and the user's review of `mapping.json` | cutover |
 | D-Q-4 | Server retention of notes/events | personal data | queue lifetime, export on demand | ES-03 impl |
