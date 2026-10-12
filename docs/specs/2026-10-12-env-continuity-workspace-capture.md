@@ -61,6 +61,13 @@ the user; macOS/Windows file-system behaviour (case folding, symlinks, path leng
   contexts and in-memory state are not transferred.
 - G4. A capture is a point-in-time copy; it is not a live mirror and is not continuously synced.
 - G5. `[REQ line 52]` Linux-only fixture PASS is not reported as cross-platform PASS.
+- G6. `[REQ line 12]` `[DRAFT line 9, 27]` Works from any terminal on the telepty daemon; no GUI typing,
+  no cmux dependency; a copied log file or an SSH connection alone never claims completion. Applied here:
+  capture, preview and restore are CLI commands (or telepty-daemon-delivered invocations of them); nothing
+  types into a GUI, reads a cmux pane or scrapes a screen. Evidence of a completed capture is the
+  reader-verified manifest (`capture_id`, `content_sha256`, `bundle_sha256`, signature §4); evidence of a
+  completed restore is the `restore-journal.json` with every step `done` plus the restored HEAD/file hashes;
+  a log copy or an SSH-run listing is not evidence.
 
 ## 2. Capture manifest (`workspace_capture`, schema_version 1)
 
@@ -241,3 +248,4 @@ the journal is detected and the tool offers resume or rollback; it never re-appl
 | WS-11 | Fresh device | third device restores a capture written before it registered with/without another device online | succeeds or `RESTORE_PENDING_KEY` (same rule as ES-02 CK-03) |
 | WS-12 | Cross-OS file system (per OS runner; Linux fixture does not count) | case-collision files, long path, exec bit, CRLF repo restored on macOS and Windows | incompatibilities reported and skipped, not silently renamed; results recorded per OS |
 | WS-13 | Retention | fast-clock fixture | capture refs beyond 14 d / newest 5 removed; preserve copies on targets untouched |
+| WS-14 | `[REQ line 12]` No GUI / no cmux | cmux not installed, no GUI session (no `DISPLAY`/`WAYLAND_DISPLAY`); capture on A and preview + restore on B through the CLI only | same outcome as WS-06; the PASS evidence is only the verified manifest and the journal + hashes (G6); a log copy or an SSH-run listing is not accepted |

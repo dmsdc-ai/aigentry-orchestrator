@@ -59,6 +59,12 @@ freshness; real cross-host behaviour (Mac offline per requirement line 60); RC5/
   (`[EXISTING line 405]`), and "cannot be observed by design" is distinguished from "not yet observed".
 - P4. Diagnostics are computed on read; they are not stored as authority. A cache, if any, is labelled
   with its `fetched_at`.
+- P5. `[REQ line 12]` `[DRAFT line 9, 27]` Works from any terminal on the telepty daemon; no GUI typing,
+  no cmux dependency; a copied log file or an SSH connection alone never claims completion. Applied here:
+  diagnostics read only the telesession ledger/status API, telepty daemon APIs and the ES-01 registry
+  (the `evidence.source` enum, §3); no hop is derived from a GUI, a cmux pane, screen scraping, a copied
+  log file or the output of an SSH session. A hop whose only available evidence would be one of those is
+  `unknown`.
 
 ## 2. Stage model
 
@@ -155,3 +161,4 @@ shows `ledger_status` first. Access health is rendered in a separate block title
 | DG-08 | Backward compatibility | `request_status` without `diagnostics:true` | output identical to the current view |
 | DG-09 | Origin restart | restart telesession between stages | diagnostics recomputed from the ledger; no stage lost or advanced by the restart |
 | DG-10 | No secrets/ids leak | inspect the diagnostics JSON | no tokens, no prompt text, host shown as a key, not an address |
+| DG-11 | `[REQ line 12]` No GUI / no cmux | cmux not installed, no GUI session; request sent and diagnosed through telesession/telepty APIs only; a log file copied from the destination is placed next to the CLI | every `evidence.source` is in the §3 enum; the copied log changes no hop; same states as with the log absent |

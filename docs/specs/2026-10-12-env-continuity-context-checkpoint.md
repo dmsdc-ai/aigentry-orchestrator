@@ -93,6 +93,12 @@ refs/history; macOS/Windows; size/latency of `ls-tree` on large brain repos; tes
   and hash-verified may be marked `original` (§6).
 - N4. `[REQ line 16]` Account login (ES-01) never silently enables remote sync. Remote checkpoint sync requires the
   existing brain opt-in (`enableSync`, `SetupWizard.ts:54`) **and** an ES-01 identity binding (§5.4).
+- N5. `[REQ line 12]` `[DRAFT line 9, 27]` Works from any terminal on the telepty daemon; no GUI typing,
+  no cmux dependency; a copied log file or an SSH connection alone never claims completion. Applied here:
+  triggers, write, sync and restore are invoked only through CLI commands, CLI hooks, brain MCP tools or
+  telepty daemon APIs; nothing types into a GUI, reads a cmux pane or scrapes a screen. The only evidence
+  that a checkpoint was written/synced/restored is the reader-verified `checkpoint_id` + `content_sha256`
+  (§2, §6); a log line, a copied file or a command run over SSH is not evidence.
 
 ## 2. Checkpoint record (schema_version 1) — key and field list `[DRAFT line 42]`, `[REQ line 39]`; types/bounds new
 
@@ -369,3 +375,4 @@ real-endpoint PASS (requirement line 52).
 | CK-13 | Schema upcast | v1 record read by a v2 reader; v2 record read by a v1 reader | v2 reader upcasts without rewriting; v1 reader returns `unsupported_version`, file unchanged |
 | CK-14 | Non-claim wording | inspect restore text and CLI help | states "context restored from checkpoint; model/process state not restored" (N1/N2) |
 | CK-15 | Retention | fast-clock fixture | expired non-head records removed from `HEAD`; heads kept; M2 raw sibling removed at 30d while M1 record stays |
+| CK-16 | `[REQ line 12]` No GUI / no cmux | cmux not installed, no GUI session (no `DISPLAY`/`WAYLAND_DISPLAY`); `manual` and `session_end` triggers via CLI/MCP on A; sync and `brain_context_resume` on B | same outcome as CK-01; the PASS evidence is only B's verified `checkpoint_id` + `content_sha256`; a log copy or an SSH-run file listing is not accepted as evidence |
