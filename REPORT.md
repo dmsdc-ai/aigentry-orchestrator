@@ -55,7 +55,7 @@ estimate_inputs:
 
 snyk: NOT_APPLICABLE_DOCS
 
-blockers: none for this dispatch. The telepty REPORT inject is attempted next; if it fails in the sandbox, this file is the evidence (Rule 49 §5: transport blocked, not delivered).
+blockers: none for the spec work. REPORT transport BLOCKED: the telepty REPORT inject failed in the sandbox with "telepty: command not found". This file is the evidence; it is not a delivered report (Rule 49 §5).
 </content>
 </invoke>
 <parameter name="description">Write REPORT.md
