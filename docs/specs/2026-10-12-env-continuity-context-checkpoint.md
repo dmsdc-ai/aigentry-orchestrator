@@ -199,6 +199,8 @@ requirement asks to state which facts are original vs summary (line 39), which M
 <brain repo>/                          (existing; memory-profile.enc.json untouched)
   checkpoints/
     v1/<user_key>/<project_key>/<device_id>/<session_ref>/<seq:08d>.ckpt.age
+  trust/
+    v1/<user_key>/<endorsed_device_id>/<endorser_device_id>.endorse.json   (§5.6)
   .aigentry/checkpoint-index.json      local only, gitignored (cursor + seen set, §4.2)
 ```
 
@@ -317,7 +319,7 @@ device list at write time, restricted to trusted devices (§5.5 R5). Consequence
 A reader (sync pass §4.2, restore §6, list) accepts a record only if all hold:
 1. integrity verifies (`CHECKPOINT_INTEGRITY_FAILED`);
 2. `signature.device_id` == `device_id` == the `device_id` path component, and that device is in the
-   authenticated device list of the logged-in `user_id` (§5.5) and trusted (R5) — else
+   authenticated device list of the logged-in `user_id` (§5.5) and trusted (R5, §5.6) — else
    `CHECKPOINT_WRITER_UNKNOWN` (kept unseen and retried after the next list fetch, never restored);
 3. the Ed25519 signature verifies with that device's signing key (`CHECKPOINT_SIGNATURE_INVALID`,
    quarantined);
@@ -341,11 +343,43 @@ restore output shows `device_list_fetched_at` so a revoke newer than the cache i
 | R1 | per-device signing key | Ed25519 key pair per device, private half never leaves (ES-01 §2, §3.1 `public_key`, §6) | met; ES-02/ES-04 use domain-separated prefixes (`aigentry-checkpoint-v1\|`, `aigentry-capture-v1\|`) distinct from ES-01's `aigentry-device-v1\|` (§4) |
 | R2 | per-device age recipient | none: `devices` holds only the Ed25519 `public_key` (§3.1) | add `age_recipient` (X25519) per device, registered at `/devices/authorize` together with an Ed25519 signature over it by the device key, so the registry cannot substitute it without breaking the signature; rotation = a new signed value |
 | R3 | authenticated device list with keys and revoke time | `GET /devices` returns id, name, os, status, created_at, last_seen_at, current (§8); `public_key`, `revoked_at` exist in the table (§3.1) | list also returns `public_key`, `age_recipient` + its signature, `revoked_at`, and includes revoked devices for verification (CLI `--all` exists, §9); served only to the owner's device bearer (§7.1) |
-| R4 | trustworthy revoke time | `revoked_at` column, set by `DELETE /devices/{id}` (§3.1, §8) | `revoked_at` is server-clock, set once, never cleared or moved; re-login of a revoked device creates a new `device_id` |
-| R5 | key-directory trust model | registry is the authority for device membership (§7) | stated model: the registry is the key directory and is trusted for membership; a compromised registry could add a device key and become a recipient of new records. Mitigation: each client pins the device set (id + key fingerprints) it last trusted; a device is **trusted** when it is in the registry list **and** carries an endorsement signed by an already-trusted device (the first device of a user is self-trusted); the endorsement is a small signed file in the brain repo written when the user confirms the new device on any trusted device after comparing the fingerprint (an endorsement by a device dated after that device's `revoked_at` is
-void; revoking a device does not revoke the devices it endorsed). Whether endorsement is required (recommended) or the registry list alone suffices is decision D-9 |
+| R4 | trustworthy revoke time | `revoked_at` column, set by `DELETE /devices/{id}` (§3.1, §8) | `revoked_at` is server-clock, set once, never cleared or moved; re-login of a revoked device creates a new `device_id`; the list also exposes each device's server-clock `created_at`, set once and never moved (the §5.6 E3 endorsement test depends on it) |
+| R5 | key-directory trust model | registry is the authority for device membership (§7) | stated model: the registry is the key directory and is trusted for membership; a compromised registry could add a device key and become a recipient of new records. Mitigation: each client pins the device set (id + key fingerprints) it last trusted; a device is **trusted** when it is in the registry list **and** carries a valid endorsement signed by an already-trusted device (the user's first device — earliest server-clock `created_at` — is self-trusted); the endorsement is a small signed file in the brain repo (§5.6) written when the user confirms the new device on any trusted device after comparing the fingerprint. **Endorsement validity, using ES-01 timestamps:** an endorsement is valid only if the endorsed device's server-clock `created_at` **precedes** the endorser's `revoked_at` (or the endorser has no `revoked_at`). An endorsement by a device dated after that device's `revoked_at` is void. Revoking a device does not revoke the devices it endorsed. The endorsement's own `created_at` is the endorser's clock and is never used for this test; the §5.4 rule-5 anchoring applies to endorsements too (§5.6 E3–E4). Whether endorsement is required (recommended) or the registry list alone suffices is decision D-9 |
 | R6 | user-visible recipient-change notice | none | any addition, key change or revoke in the pinned set is shown to the user (device name, os, created_at, fingerprints) at the next CLI/MCP interaction and in the restore metrics (`recipients_changed`) before the new set is used for writes; removals take effect immediately |
 | R7 | revoke enforcement for Git-stored data | §7.2/§7.3 list ES-02 checkpoints and ES-04 captures as rows whose writes load `devices` in the same registry transaction | under brain-Git storage (§4, ES-04 S1) these writes never reach the registry, so that row cannot hold; enforcement is the reader-side rule of §5.4. ES-01 should drop or reword those rows to "verified by readers against the device list" |
+
+### 5.6 Endorsement file and reader rules (R5; new proposal, needs review — decision D-9)
+
+```
+trust/v1/<user_key>/<endorsed_device_id>/<endorser_device_id>.endorse.json
+{ "schema": "aigentry-endorsement", "schema_version": 1, "endorsed_device_id", "endorsed_key_fp",
+  "endorser_device_id", "created_at", "sig" }
+```
+
+`sig` = the endorser's ES-01 device key over `"aigentry-endorsement-v1|" + user_id + "|" + endorsed_device_id
++ "|" + endorsed_key_fp + "|" + endorser_device_id`; `endorsed_key_fp` is the ES-01 fingerprint of the endorsed
+device's `public_key`. The file is signed, not encrypted (ids and a fingerprint only; `user_id` is bound by the
+signature, not stored). Endorsements are append-only like records (§4.1). A reader counts an endorsement only
+if all hold:
+- E1. path binding: the path's `user_key` is the logged-in user's and its two device ids equal the file's
+  fields — else `ENDORSEMENT_PATH_MISMATCH` (quarantined);
+- E2. the endorser is in the authenticated device list and is itself trusted (a chain back to the self-trusted
+  first device; cycles confer nothing); `sig` verifies with the endorser's `public_key`; `endorsed_key_fp`
+  matches the endorsed device's listed `public_key` — else `ENDORSEMENT_INVALID`;
+- E3. server-clock test (R5): the endorsed device's ES-01 `created_at` precedes the endorser's `revoked_at`
+  (or the endorser has no `revoked_at`) — else void, `ENDORSEMENT_AFTER_REVOKE`. The file's `created_at`
+  (endorser clock) is informational only and is never compared with `revoked_at`;
+- E4. anchoring (the §5.4 rule-5 rule applied to endorsements): if the endorser has `revoked_at` and this
+  reader first sees the endorsement after that `revoked_at`, the endorsement counts only when anchored —
+  already in this reader's pinned/seen set before `revoked_at`, or the endorsed device is also endorsed by a
+  non-revoked trusted device. Otherwise `ENDORSEMENT_REVOKED_ENDORSER_UNANCHORED`.
+
+A device without a counted endorsement is not trusted: it is not a recipient of new records or captures
+(§4.1, ES-04 §4 step 4), its records are `CHECKPOINT_WRITER_UNKNOWN` (ES-04: `RESTORE_WRITER_UNKNOWN`), and
+it is listed in the R6 notice so the user can endorse it on a trusted device after comparing fingerprints.
+Effect on the round-2 attack: a revoked device B that registers D after its revoke fails E3; one that
+registered D before its revoke and pushes a backdated endorsement later fails E4 on every reader that had not
+already seen it (CK-11 (iv), WS-10 (e)).
 
 ## 6. Restore via `brain_context_resume` (`[DRAFT line 44]`; interface new)
 
@@ -434,7 +468,9 @@ and implemented by ES-05. ES-02 only guarantees that the id is stable and resolv
 `CHECKPOINT_ENCRYPTION_FAILED`, `CHECKPOINT_KEY_CONFLICT`, `CHECKPOINT_INTEGRITY_FAILED`,
 `CHECKPOINT_USER_MISMATCH`, `CHECKPOINT_PENDING_KEY`, `CHECKPOINT_UNSUPPORTED_VERSION`,
 `CHECKPOINT_FORKED_CHOICE_REQUIRED`, `CHECKPOINT_SYNC_LOCAL_ONLY` (informational),
-`CHECKPOINT_SIGNATURE_INVALID`, `CHECKPOINT_WRITER_UNKNOWN`, `CHECKPOINT_REVOKED_WRITER_UNANCHORED`.
+`CHECKPOINT_SIGNATURE_INVALID`, `CHECKPOINT_WRITER_UNKNOWN`, `CHECKPOINT_REVOKED_WRITER_UNANCHORED`;
+endorsements (§5.6): `ENDORSEMENT_PATH_MISMATCH`, `ENDORSEMENT_INVALID`, `ENDORSEMENT_AFTER_REVOKE`,
+`ENDORSEMENT_REVOKED_ENDORSER_UNANCHORED`.
 `CHECKPOINT_DEVICE_REVOKED` is a reader-side rejection (§5.4); a cooperating writer may also refuse
 early, but that is never the enforcement.
 
@@ -464,7 +500,7 @@ writes and reads require ES-01 (§5); none of them measures the real ES-01 integ
 | CK-08 | Original vs summary marking | M1 and M2 records | M1 restore contains no `[original …]` blocks; M2 marks `original` only when the hash verifies; tampered raw text → that fragment downgraded to `unavailable` and integrity failure reported | provenance marking original/summary/unavailable and tamper downgrade | faithfulness or quality of summaries | Linux fixture | — |
 | CK-09 | Integrity | flip one byte of a decrypted-then-re-encrypted record | `CHECKPOINT_INTEGRITY_FAILED`, record quarantined, other records restore | integrity detection and quarantine | the signature path (CK-11) | Linux fixture | — |
 | CK-10 | Encryption fail-closed | remove age key on writer | `CHECKPOINT_ENCRYPTION_FAILED`; no plaintext file in the repo tree or history | no plaintext fallback on encryption failure | other crypto failure modes (corrupt recipient list) | Linux fixture | — |
-| CK-11 | Revoked device (reader-side) | revoke B in ES-01; A writes a new record; B (keeping its Git credential and a modified, non-cooperating client) pushes (i) a record with `created_at` after `revoked_at`, (ii) a record backdated before `revoked_at`, (iii) a record with a forged `device_id` = A; A and C sync | B is not a recipient of A's new record; A and C reject (i) `CHECKPOINT_DEVICE_REVOKED`, (ii) `CHECKPOINT_REVOKED_WRITER_UNANCHORED` (not restored without a user choice), (iii) `CHECKPOINT_SIGNATURE_INVALID`; none appears as context; device list shows B `git_access: unknown` until the user confirms the credential rotation | reader-side rejection of post-revoke, backdated and forged writers | revocation of the GitHub credential (user step, D-8); prevention of deletions (only detected) | BLOCKED | ES-01 (revoke, `revoked_at` R3/R4) |
+| CK-11 | Revoked device (reader-side) | revoke B in ES-01; A writes a new record; B (keeping its Git credential and a modified, non-cooperating client) pushes (i) a record with `created_at` after `revoked_at`, (ii) a record backdated before `revoked_at`, (iii) a record with a forged `device_id` = A, (iv) an endorsement by B, dated before `revoked_at`, of a device D registered in the registry (iv-a) after B's `revoked_at` and (iv-b) before it but never endorsed by a non-revoked device, plus a record signed by D; A and C sync | B is not a recipient of A's new record; A and C reject (i) `CHECKPOINT_DEVICE_REVOKED`, (ii) `CHECKPOINT_REVOKED_WRITER_UNANCHORED` (not restored without a user choice), (iii) `CHECKPOINT_SIGNATURE_INVALID`; (iv) the endorsement is void — (iv-a) `ENDORSEMENT_AFTER_REVOKE`, (iv-b) `ENDORSEMENT_REVOKED_ENDORSER_UNANCHORED` — so D is not trusted, not a recipient of A's next record, D's record is `CHECKPOINT_WRITER_UNKNOWN`, and D appears in the R6 notice; none appears as context; device list shows B `git_access: unknown` until the user confirms the credential rotation | reader-side rejection of post-revoke, backdated and forged writers and of backdated endorsements (§5.6 E3/E4) | revocation of the GitHub credential (user step, D-8); prevention of deletions (only detected) | BLOCKED | ES-01 (revoke, `revoked_at` R3/R4) |
 | CK-11b | Recipient change notice / trust | registry list gains device D that no trusted device endorsed | D is not a recipient and D's records are `CHECKPOINT_WRITER_UNKNOWN`; the notice (R6) is shown; after the user endorses D on A, new records include D | trust endorsement gate and recipient-change notice | a real compromised registry | BLOCKED | ES-01 (list R3, R5, notice R6); decision D-9 |
 | CK-12 | Backward compatibility | call `brain_context_resume` without `checkpoint` | identical content items for identical state, compared with the current tool (`BrainMcpServer.ts:288-324`), including the setup hint it may prepend (`:313-321`) | default `brain_context_resume` output unchanged | other brain MCP tools | Linux fixture | — |
 | CK-13 | Schema upcast | v1 record read by a v2 reader; v2 record read by a v1 reader | v2 reader upcasts without rewriting; v1 reader returns `unsupported_version`, file unchanged | on-read upcast; newer version left untouched | a real v2 schema (none exists) | Linux fixture | — |
