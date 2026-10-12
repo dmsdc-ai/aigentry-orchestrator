@@ -14,8 +14,10 @@ decided here** (orchestrator guardrail 2026-10-12 13:59Z); it is D-Q-1.
   JWT path then substitutes *any* tenant API key, which drops user identity
   (`aigentry-registry/src/aigentry/api/v1/auth.py:71-82`). There is no device entity and
   no CLI login.
-- devkit ships only the `aigentry-devkit` binary. It stores the registry API key in
-  plaintext in `env.sh`/`env.ps1` and `install-state.json`.
+- devkit ships two binaries, `aigentry-devkit` and `aigentry-devkit-bootstrap`
+  (`package.json:19-20`). The new commands go into `aigentry-devkit`; the build plan's
+  `aigentry login` is renamed to `aigentry-devkit login`. devkit stores the registry API
+  key in plaintext in `env.sh`/`env.ps1` and `install-state.json`.
 - The orchestrator queue is a per-host, gitignored JSON file. Its only writer-side safety is
   a single-host atomic rename (`src/dispatch/cli.ts:869-881`). Linux ids are date-form
   integers. No id-allocator rule exists anywhere measured, and the Mac ledger could not be
@@ -45,7 +47,7 @@ decided here** (orchestrator guardrail 2026-10-12 13:59Z); it is D-Q-1.
 |---|---|
 | Git-file queue (synced `task-queue.json`) | Six concrete failures: clean auto-merge producing a double claim, claim unconfirmed until push, no CAS for fencing, client-set clocks, no per-user isolation with permanent history, manual offline divergence (ES-03 §1.1) |
 | Reuse the web JWT cookies in the CLI | The cookie path is browser-only (`oauth.py:94-113,166`); the 7-day refresh is too short for devices that sleep; there is no proof of possession |
-| Reuse tenant API keys as device credentials | No user or device identity (`api_key.py:79-89`), admin-created, no per-device revoke UX. Copying a key between machines is exactly what the requirements forbid (secrets must not be auto-copied) |
+| Reuse tenant API keys as device credentials | No user or device identity (`api_key.py:21-31`), admin-created, no per-device revoke UX. Copying a key between machines is exactly what the requirements forbid (secrets must not be auto-copied) |
 | GitHub's own device flow / new GitHub scopes | Needs a new OAuth app configuration and scope approval (not approved). Proves a GitHub identity but not possession of an aigentry device key |
 | OS keystore through a native addon (e.g. keytar) | External native dependency (제17조, 제1조). OS-shipped CLIs/APIs are enough, with a file fallback |
 | Redis as the lease store | Revocation already shows Redis is TTL/volatile (`revocation_service.py`). Leases and fences must survive restarts and sit in the same transaction as the task row |
@@ -130,13 +132,17 @@ Learned from source (not schedules):
   fail-closed behaviour are new work. The new surface is still real: 2
   tables, about 7 endpoints, an approval page in the frontend (a frontend dir exists and
   was **not read**), bearer auth dependency, refresh family, a per-OS key store in devkit
-  (3 OS paths), and 4 CLI commands. Fixing G2 (user identity loss) touches a shared
-  dependency used by existing endpoints, so regression risk is high. **Estimate pressure:
-  upper half.**
+  (3 OS paths), and 4 CLI commands. G2 is closed only for the new ES-0x endpoints
+  (a new dependency, `get_current_device`); the shared `get_current_user_or_key` is not
+  changed, so this spec carries no regression risk from G2. The general G2 fix is a
+  separate registry issue and is not priced here. **Estimate pressure: upper half.**
 - **Queue (5–10 placeholder):** about 7 tables, about 11 operations, a sync/cache client,
   gate changes in `cli.ts` (resolve + lease view + exit 11/12 + lease step with exit-hook detach + event ledger), the devkit lease keeper (resident process, local socket/pipe, ES-03 §5.1), and the reconcile
-  path. Migration effort depends on D-Q-1: P-C ≈ no migration; P-A/P-B need the Mac read,
-  a mapper, a dry-run and a review. **Upper half under P-A/P-B; lower half under P-C.**
+  path. The store import M1–M5 (backup, mapper, dry-run, review, import) is needed under
+  **every** D-Q-1 option once D-Q-2 is adopted. P-C only avoids renumbering existing ids;
+  P-A/P-B add the Mac seed/issuer read and renumbering or provisional handling. The
+  lease keeper (ES-03 §5.1) and the ES-08 retry outbox are new client work under every
+  option. **Upper half under P-A/P-B; mid-range under P-C.**
 - **ES-08 contract:** small (one table, alias kind, fence wrapper for refs), because
   activation is out of scope.
 - **Verification (ES-09):** the matrix needs real 2–3 devices and a real registry. Mac

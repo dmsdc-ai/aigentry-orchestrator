@@ -75,12 +75,12 @@ is a separate Rule 47 decision (§10, D-ID-1..4).
 ### 1.3 API keys and sessions
 
 - `api_keys`: `tenant_id`, `key_hash` (sha256), `name`, `role`, `is_active`,
-  `expires_at` — `models/api_key.py:79-89`. **No `user_id`.** Raw key format `aig_<64 hex>`
+  `expires_at` — `models/api_key.py:21-31`. **No `user_id`.** Raw key format `aig_<64 hex>`
   (`services/auth/api_key_service.py:20`).
 - `get_current_user_or_key` accepts a JWT cookie but then returns **any active API key of
   the same tenant** (`api/v1/auth.py:71-82`). The user identity is dropped at that point.
-- `user_sessions` are tied to an API key, not a user, 24 h (`models/user_session.py:45-58`,
-  `services/auth/session_service.py:11`).
+- `user_sessions` are tied to an API key, not a user, 24 h (`models/user_session.py:21-25`,
+  `services/auth/session_service.py:13`).
 - Unauthenticated `POST /api/v1/tenants/bootstrap` creates the first tenant + admin key and
   is refused once any tenant exists (`api/v1/tenants.py:34-70`). devkit's self-hosted mode
   calls it (`aigentry-devkit/install.sh:699-707`).
@@ -107,9 +107,9 @@ is a separate Rule 47 decision (§10, D-ID-1..4).
 
 ### 1.5 Client side (devkit)
 
-- Only the `aigentry-devkit` binary is shipped (`aigentry-devkit/package.json:18-21`);
-  commands are dispatched in `bin/aigentry-devkit.js:754-830`. There is no `login` or
-  `device` command.
+- Two binaries are shipped: `aigentry-devkit` and `aigentry-devkit-bootstrap`
+  (`aigentry-devkit/package.json:19-20`). Commands of the first are dispatched in
+  `bin/aigentry-devkit.js:754-830`. There is no `login` or `device` command.
 - The registry API key is written **in plaintext** to the env fan-out file
   (`install.sh:261-269`, file `${XDG_CONFIG_HOME:-$HOME/.config}/aigentry-devkit/env.sh`
   mode 600 — `install.sh:24-26`) **and** to `install-state.json`
@@ -121,14 +121,15 @@ is a separate Rule 47 decision (§10, D-ID-1..4).
 | # | Gap | Evidence |
 |---|---|---|
 | G1 | No device entity, no CLI login | no `device` model in `src/aigentry/models/`; §1.5 |
-| G2 | JWT path loses the user (tenant-key substitution) | `auth.py:71-82` |
+| G2 | JWT path loses the user (tenant-key substitution). Closed **only for the new ES-0x endpoints** (§7.1). `get_current_user_or_key` stays unchanged for existing endpoints; the general fix belongs to a separate registry issue | `auth.py:71-82` |
 | G3 | Revocation is Redis-only and TTL-bounded; a lost device cannot be revoked durably | `revocation_service.py:17-22` |
 | G4 | JWTs are cookie-only; a CLI cannot present them | `oauth.py:94-113, 166` |
 | G5 | Refresh rotation has no reuse detection | `oauth.py:186-191` |
-| G6 | API keys are tenant-scoped, carry no user/device | `api_key.py:79-89` |
+| G6 | API keys are tenant-scoped, carry no user/device | `api_key.py:21-31` |
 
 Observed but **not** fixed here (mentioned only, Rule 29): plaintext API key in devkit
-state files (§1.5); OAuth callback logs the CSRF state values (`oauth.py:59-72`);
+state files (§1.5), with `install-state.json` written with no `chmod`, so its mode follows
+the umask (`install.sh:255`); OAuth callback logs the CSRF state values (`oauth.py:59-72`);
 `users.github_id` is a 32-bit `Integer` (`user.py:19`). Each needs its own task.
 
 ## 2. Identity model
@@ -162,7 +163,9 @@ user (existing users.id, UUID)          ← the account; one GitHub identity
 | `name` | varchar(64) | user-chosen, default `<os>-<short random>`; never the hostname unless the user typed it |
 | `os` | varchar(16) | `macos` \| `linux` \| `windows` \| `other` (client-reported, informational) |
 | `key_alg` | varchar(16) | `ed25519` (only value in this release) |
-| `public_key` | bytea(32), unique | raw Ed25519 public key |
+| `public_key` | bytea(32), unique | raw Ed25519 public key. Stays bound to the row after revoke, so a revoked device logs in again only with a **new** key pair and gets a new `device_id` (§5) |
+| `age_recipient` | varchar(128) null | X25519 age recipient (`age1…`) for ES-02/ES-04 encryption (§8.1) |
+| `age_recipient_sig` | bytea(64) null | Ed25519 signature by this device's key over `"aigentry-age-recipient-v1|" + device_id + "|" + age_recipient`; the registry cannot substitute the recipient without breaking it |
 | `status` | varchar(16) | `active` \| `revoked` \| `expired` |
 | `refresh_family_id` | UUID | current refresh family |
 | `refresh_hash` | char(64) | sha256 of the *current* refresh token (issued, not yet presented) |
@@ -186,6 +189,8 @@ Constraint: `(user_id, name)` unique among `status='active'` (partial unique ind
 | `user_code_hash` | char(64) unique among pending | sha256 of normalized user code |
 | `public_key` | bytea(32) | key the device will be bound to |
 | `requested_name`, `os`, `client_version` | | shown to the user on approval |
+| `request_net_prefix` | varchar(48) | requester IP truncated to /24 (IPv4) or /48 (IPv6); shown on approval; purged with the row |
+| `age_recipient`, `age_recipient_sig` | | optional; copied to `devices` on consumption (§8.1) |
 | `status` | varchar(16) | `pending` \| `approved` \| `denied` \| `consumed` \| `expired` |
 | `user_id` | UUID null | set on approval |
 | `expires_at` | timestamptz | created + 600 s |
@@ -211,7 +216,8 @@ CLI (device)                         registry                         browser (a
  3 print verification_uri + user_code (no browser launch by default)
                                                                     4 user opens URI, logs in
                                                                       with the EXISTING GitHub
-                                                                      OAuth (oauth.py:28-128)
+                                                                      OAuth (oauth.py:28-128);
+                                                                      first login = sign-up
                                                                     5 enters user_code; page shows
                                                                       name/os/version; Approve
                                        ◀─ POST /api/v1/devices/approve {user_code}
@@ -230,11 +236,21 @@ Rules:
 - `proof` = Ed25519 signature by the new private key over
   `"aigentry-device-v1|" + device_code + "|" + ts` with `ts` within ±300 s. Proves the
   poller holds the key that the user approved (a leaked `device_code` alone is useless).
-- The approval page must display the device's name/os/version and the time of the request;
-  approval requires an explicit click (no auto-approve, no approve-by-link).
+- The approval page must display the device's name/os/version, the time of the request
+  and its network prefix (`request_net_prefix`), with a warning to approve only a code
+  the user started themselves (device-code phishing). Approval requires an explicit click
+  (no auto-approve, no approve-by-link). A user may have at most **20** `active` devices
+  (proposal, part of D-ID-1); approval beyond that → `device_limit`, revoke one first.
+- Sign-up (AC1 "가입") is the existing first GitHub login (`find_or_create_user`,
+  `oauth_service.py:84-136`), performed during the approval step. No separate sign-up
+  endpoint exists or is added.
 - `approve` and `deny` require the browser JWT (`type=access`, not revoked) **and** a
   custom header (`X-Aigentry-Intent: device-approve`) so a cross-site form post cannot
-  approve (the cookies are `samesite=lax` — `oauth.py:94-102`).
+  approve. The cookies are `samesite=lax` when set at login (`oauth.py:94-113`), but
+  `/refresh` re-sets them `samesite="strict"` without `domain` (`oauth.py:194-211`). The
+  header requirement does not depend on either. If the approval page is served from
+  another origin, `X-Aigentry-Intent` must be added to CORS `allow_headers`, which today
+  lists only `Content-Type, Authorization, X-API-Key, X-Request-ID` (`main.py:194-200`).
 - Wrong `user_code` attempts: 5 per browser session per 10 min, then 429.
   `/devices/authorize` is limited to 10/min per IP. Both are **new** per-route limits
   (§7.4); none exists today (§1.4). Codes are single-use; `consumed` on first successful
@@ -291,7 +307,9 @@ Rules:
     stop the device's live access tokens.
 - Idle expiry sets `status=expired` (not revoked); `aigentry-devkit login` re-binds the
   **same** device row if the same public key proves possession, so history and lease
-  attribution survive a long absence (the Mac case).
+  attribution survive a long absence (the Mac case). A **revoked** row is never re-bound:
+  `revoked_at` is set once by the server clock and never cleared or moved, and logging in
+  again needs a new key pair and creates a new `device_id`.
 - Why not reuse the 60 min / 7 day web defaults: a CLI device is long-lived and offline
   for days, so it needs a longer refresh than the browser's 7 days. To compensate, the
   access token is shorter and proof-of-possession is required.
@@ -430,18 +448,36 @@ Existing endpoints keep accepting it unchanged.
 | `POST /authorize` | none (rate-limited) | start device-code login (§4) |
 | `POST /approve`, `POST /deny` | browser JWT cookie + intent header | bind code to user |
 | `POST /token` | device_code + proof, or refresh + proof | issue / rotate tokens |
-| `GET /` | device bearer or browser cookie | list caller's devices: id, name, os, status, created_at, last_seen_at, `current: bool` |
-| `GET /me` | device bearer | this device + user (`user_id`, `github_login`) |
+| `GET /` | device bearer or browser cookie | list caller's devices: id, name, os, status, created_at, last_seen_at, `current: bool`; with `include=keys&all=true` (device bearer only) also `revoked_at`, `public_key`, `age_recipient`, `age_recipient_sig` and revoked devices (§8.1) |
+| `GET /me` | device bearer | this device + user (`user_id`, `github_id`, `github_login`) |
+| `PUT /me/age-recipient` | device bearer | set or rotate this device's signed age recipient (§8.1) |
 | `PATCH /{id}` | device bearer or browser | rename (own only) |
 | `DELETE /{id}` | device bearer or browser | revoke (own only; self allowed) — idempotent, 204 also when already revoked |
 
 Errors use the RFC 8628 names for the token endpoint (`authorization_pending`,
 `slow_down`, `access_denied`, `expired_token`) and `invalid_grant` for bad refresh/proof.
 
+### 8.1 Interface for ES-02 / ES-04 (their "Requirements on ES-01", ES-02 §5.5 R1–R7)
+
+| # | Provided by ES-01 |
+|---|---|
+| R1 signing key | the device's Ed25519 key (§3.1). ES-01 signs only with prefix `aigentry-device-v1|` (and `aigentry-age-recipient-v1|`). ES-02/ES-04 use their own prefixes. The key store (§6) exposes a *sign* operation through the lease keeper (ES-03 §5.1); key bytes never leave the store |
+| R2 age recipient | `age_recipient` + `age_recipient_sig` per device (§3.1), sent with `/devices/authorize` or set later by `PUT /devices/me/age-recipient` (device bearer, new signed value = rotation). Generated on the device. The private half follows the same store rules as the device key (§6) |
+| R3 authenticated device list | `GET /devices?include=keys&all=true` (owner's device bearer only, §7.2) returns per device: `id, name, os, status, created_at, revoked_at, public_key, age_recipient, age_recipient_sig`, revoked devices included. Over TLS to the registry URL of D-ID-4. Integrity rests on the registry (R5) |
+| R4 revoke time | `revoked_at`: server clock, set once, never cleared or moved; revoked rows are never re-bound (§5). Retention: D-ID-5 |
+| R5 trust model | the registry is the **key directory** and is trusted for membership. A compromised registry could add a device key or recipient. ES-01 provides the signed recipient (R2) and stable ids/fingerprints (first 8 bytes of sha256 of `public_key`) for client-side pinning. The endorsement scheme and whether it is required are ES-02's (its decision D-9); ES-01 adds no server-side endorsement |
+| R6 change notice | the list carries `created_at`/`revoked_at` and keys, so a client can diff against its pinned set. Display is the client's (ES-02) |
+| R7 Git-stored data | ES-01 §7.2/§7.3 no longer claim registry-transaction enforcement for brain-Git data; readers verify against R3 |
+| GitHub binding (ES-02 §5.2) | `GET /devices/me` returns `github_id` (stable) and `github_login` of the user, so a client can check that the brain repo's GitHub owner is the same account. The binding is the existing `users.github_id` (§1.1); nothing new is stored |
+
 Per 제15조 these request/response schemas are registered in aigentry-ssot before
 implementation; the registry owns the server, devkit owns the client.
 
-## 9. CLI surface (devkit; `aigentry-devkit` is the only shipped binary — `package.json:18-21`)
+## 9. CLI surface (devkit; hosted in the `aigentry-devkit` binary, one of the two shipped — `package.json:19-20`)
+
+The build plan's names `aigentry login` / `aigentry device …` are **renamed** to
+`aigentry-devkit login` / `aigentry-devkit device …`, because no `aigentry` binary is
+shipped by devkit. `aigentry-devkit-bootstrap` gets no new command.
 
 | Command | Flags | Behaviour | Exit codes |
 |---|---|---|---|
@@ -486,7 +522,7 @@ gains an optional "log this device in now?" step that runs `aigentry-devkit logi
 
 | Reused unchanged | New |
 |---|---|
-| `users`, `tenants`, GitHub OAuth web flow, JWT signing key/algorithm, `decode_token`, Redis revoke list, the `main.py` slowapi `Limiter` object (not its unwired defaults), request transaction, `cryptography`/PyJWT | `devices`, `device_authorizations`, `/api/v1/devices/*`, `get_current_device`, `device_access` token type, refresh family/reuse detection, per-route rate limits on `/devices/*`, device-approve page, devkit `login/logout/whoami/device *`, per-OS key store |
+| `users`, `tenants`, GitHub OAuth web flow, JWT signing key/algorithm, `decode_token`, Redis (as the limiter store only; device revoke does not use the Redis revoke list, §7.2), the `main.py` slowapi `Limiter` object (not its unwired defaults), request transaction, `cryptography`/PyJWT | `devices`, `device_authorizations`, `/api/v1/devices/*`, `get_current_device`, `device_access` token type, refresh family/reuse detection, per-route rate limits on `/devices/*`, device-approve page, devkit `login/logout/whoami/device *`, per-OS key store |
 
 ## 13. Migration for existing users
 
@@ -539,6 +575,8 @@ marked *supplementary* are analogues and are **not** coverage of the named user 
 | ID-17 | A `role=admin` user (`ADMIN_GITHUB_IDS`) gets 404 on every ES-0x resource of another user, read and write | other account isolation (admin) |
 | ID-18 | `X-API-Key` (valid tenant key) on every ES-0x endpoint → 401; the same key still works on an existing endpoint | other account isolation (tenant key) |
 | ID-19 | `POST /devices/approve` with a valid browser cookie but without `X-Aigentry-Intent: device-approve` → 403 and the authorization stays `pending`; a cross-origin form post cannot approve | other account isolation (approval CSRF) |
+| ID-20 | Approval page shows name/os/version, request time and network prefix; the 21st active device → `device_limit` | other account isolation (device-code phishing) |
+| ID-21 | `GET /devices?include=keys&all=true` returns keys, signed age recipients and `revoked_at` for active **and** revoked devices; a tampered `age_recipient` fails its signature check; `revoked_at` never changes after revoke; logging in again after a revoke yields a new `device_id` | revoked device (ES-02/ES-04 reader inputs) |
 
 ### 15.1 Testability per row (criterion 4)
 
@@ -577,3 +615,5 @@ Status today for **every** row: **NOT RUN**. No implementation exists, and this 
 | ID-17 | admin does not cross users | admin features (none in this release) | F1 (yes) | implementation |
 | ID-18 | tenant API key refused on ES-0x, unchanged elsewhere | G2 on existing endpoints (registry issue) | F1 (yes) | implementation |
 | ID-19 | intent header required; CSRF form refused | phishing of a willing user (§4 approval display) | F1 (yes, HTTP client; no GUI typing) | implementation |
+| ID-20 | approval display fields; device cap | whether a user notices a phishing prompt | F1 (yes) | implementation |
+| ID-21 | list contents and immutability for ES-02/ES-04 readers | reader-side verification itself (ES-02 CK-11) | F1 (yes) | implementation |

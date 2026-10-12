@@ -135,6 +135,7 @@ Today's local writer is atomic **only on one host** (temp + fsync + rename,
 | `lease_expires_at` | timestamptz null | server clock |
 | `fencing_token` | bigint not null default 0 | §5 |
 | `claimed_at`, `last_heartbeat_at` | timestamptz null | |
+| `progress`, `progress_at` | jsonb null (≤ 2 KiB), timestamptz null | latest heartbeat `progress`, overwritten on each heartbeat that carries one (events keep only a sample, §10) |
 | `completed_at`, `completed_by_device_id`, `completed_fencing_token` | | |
 | `created_at`, `created_by_device_id`, `updated_at` | | |
 
@@ -168,9 +169,9 @@ each of the three proposals in §3.2, every task has a positive integer `id` (P-
 10-digit date-form ids, which are also valid) and an optional `release_component` that
 obeys the same regex. Any subset therefore projects without a schema change.
 `provisional` tasks have no integer id yet and cannot be projected. The projection stays
-hand-authored and hand-reviewed (`PROJECTION.md:44-58`). The "private task queue" it
-names as the sole authority is now this server queue. That sentence needs a one-line doc
-update at implementation time; no generator is added.
+hand-authored and hand-reviewed (`PROJECTION.md:44-58`). **If D-Q-2 is adopted**, the "private task queue" it names as the sole authority becomes
+this server queue for opted-in users, and that sentence needs a one-line doc update at
+implementation time. Until then it stays as written. No generator is added either way.
 
 ## 3. Canonical ID allocation
 
@@ -614,19 +615,21 @@ the registry URL already covered by D-ID-4. Running it at all is decision D-Q-9.
 | Event | What happens |
 |---|---|
 | Lease keeper killed (§5.1) / device sleeps | Heartbeats stop. After `lease_expires_at`, the task is claimable; `status` is still `in_progress` |
-| Reassignment policy | Field `reassign_policy ∈ auto \| manual` (default `auto`). `auto`: the always-on Linux orchestrator claims expired-lease tasks it is configured to serve, at most one claim per task per 60 s (no flapping). `manual`: the task is surfaced to the user (ES-07) and nobody claims automatically |
+| Reassignment policy | Field `reassign_policy ∈ auto \| manual` (default per D-Q-5). `auto`: an expired-lease task is eligible for takeover by the always-on Linux orchestrator. The claim happens through its normal dispatch (§3.6 lease step), at most one claim per task per 60 s (no flapping). `manual`: the task is surfaced to the user (ES-07) and is not taken over without the user. **Neither policy starts a worker by itself**: automatic session creation or restart needs the separate operational approval of AC5 |
 | Same device returns before expiry | Heartbeat succeeds; work continues |
 | Holder returns after takeover | Its next heartbeat/complete gets `FENCED`. The client must stop the stale worker (an operation inside its own sealed scope), annotate `stale_execution` with what it produced (branches, commits, files), and **not** push or merge further |
 | Registry down (origin restart) | Clients keep working only until their local lease-loss point (§5). No new claims. On recovery, leases whose `lease_expires_at` passed during the outage are expired; the server never extends leases retroactively |
 | Network partition | Same as registry down for the partitioned side. The other side may take over after expiry. The fence decides who may write |
 
 Running processes are **never migrated**. The device that takes over **recreates** the
-working state from ES-02 checkpoints and ES-04 captures and starts a new worker.
+working state from ES-02 checkpoints and ES-04 captures, and a new worker is started by a
+normal dispatch. Whether that dispatch may happen without asking the user is the AC5
+operational approval, not D-Q-5.
 
 ## 7. Idempotency keys
 
 - Required on every mutation: `Idempotency-Key: [A-Za-z0-9._:-]{1,128}` (same alphabet as
-  telesession `request_id`, `API-CONTRACT-TELESESSION.md:172`).
+  telesession `request_id`, `API-CONTRACT-TELESESSION.md:173`).
 - Store `idempotency_records(queue_id, device_id, key, op, request_sha256, response,
   created_at)`, unique `(queue_id, device_id, key)`, retained 7 days.
 - Semantics are copied from telesession's durable send (`telepty.js:989-993`):
@@ -714,9 +717,15 @@ the queue exists. A retention limit, if wanted, is a Rule 47 decision (D-Q-4).
   `status`), so existing readers (the gate, `tq-*` scripts, the release maintainer) keep
   working. Rows carry canonical `id`, `aliases`, and lease view. The file gets a top-level
   `authority: {mode: "server", queue, synced_at, event_seq}`. **Only the lease keeper
-  writes it** (single writer, same temp+fsync+rename as `cli.ts:869-881`). Human or tool
-  edits go through the API; a hand edit is overwritten at the next sync, after the diff
-  is logged as a warning.
+  writes `tasks[]` and `authority`** (single writer, same temp+fsync+rename as
+  `cli.ts:869-881`). Human or tool edits to tasks go through the API; a hand edit is
+  overwritten at the next sync, after the diff is logged as a warning. One other writer
+  exists today: `bin/tq-focus.sh:18-20` sets `active_focus` through `jq` → `mktemp` →
+  `mv`. The temp file is created by `mktemp` in `$TMPDIR`, so the `mv` may cross
+  filesystems and is then not atomic. `active_focus` and `tracks` are **local-only cache
+  fields**: never sent to the server, and preserved verbatim by the keeper's rewrite.
+  `tq-focus.sh` stays a writer of those two fields only. Making its write atomic
+  (same-dir temp) is a separate small fix, mentioned only (Rule 29).
 - **Local-only mode** (not logged in, `DEVICE_AUTH_ENABLED=false`, or a user who opts
   out): exactly today's behaviour. The file is the authority, there is no lease, and IDs
   are chosen as they are today, whatever D-Q-1 decides for account mode. Rule 34's gate
@@ -877,7 +886,7 @@ Status today for **every** row: **NOT RUN**. No implementation exists, and this 
 | D-Q-2 | Authoritative store = registry Postgres for opted-in users | operational data / personal-data transfer | registry Postgres, opt-in, self-hostable; local-only mode unchanged |
 | D-Q-3 | Executing the queue migration (M3 import, M5 freeze), once D-Q-1 is decided | operational data change | only after the user reviews `mapping.json`; backups kept, nothing deleted |
 | D-Q-4 | Event/note retention on the server | personal data | keep for the queue's life; export available; no automatic expiry |
-| D-Q-5 | Default `reassign_policy` (`auto` lets the always-on Linux claim expired leases) | permission (autonomous takeover) | `auto` for tasks the Linux orchestrator is configured to serve, `manual` otherwise |
+| D-Q-5 | Default `reassign_policy` (`auto` makes expired-lease tasks eligible for takeover by the always-on Linux orchestrator's dispatch) | permission (autonomous takeover) | `auto` for tasks the Linux orchestrator is configured to serve, `manual` otherwise. Covers the **claim only**; starting a worker automatically is the separate AC5 approval |
 | D-Q-6 | Real macOS and Windows hosts/runners for the rows that need them (ID-1/2/11, Q-1/2/3/6/17 and every row marked BLOCKED in §13 / ES-01 §15); the build plan names "OS runner 확보" as a re-estimate condition | cost | no paid runner or host is procured without approval; get a quote first. Until approved, those rows stay `BLOCKED` and the release states its verified support as Linux-only |
 | D-Q-7 | Hosted (cloud registry) Postgres storage for opted-in users' queues, events, receipts and untrusted blobs | cost / personal-data transfer | do not enable account mode on the cloud instance until its storage cost per user is measured; per-user storage quota (proposal: 100 MiB, `413 QUOTA_EXCEEDED` beyond); self-hosted instances unaffected |
 | D-Q-8 | Retention and deletion of ES-08 `untrusted_content` blobs and `intake_receipts`. These hold **third-party** GitHub authors' text and logins, which D-Q-4 does not cover | personal data | blob deleted 90 days after the intake task reaches a terminal status (sha256, size and `owner/repo#N` kept); receipts keep no content, only metadata, for the queue's life; author identity only inside the blob, never as a column; export includes blobs only while they exist |
