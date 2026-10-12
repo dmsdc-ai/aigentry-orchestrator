@@ -90,7 +90,8 @@ the user; macOS/Windows file-system behaviour (case folding, symlinks, path leng
   "signature": { "alg": "ed25519", "device_id", "sig" }
 }
 ```
-`content_sha256` covers the manifest without `integrity` and `signature`. `sig` = the writer's ES-01 device
+`content_sha256` covers the manifest without `integrity` and `signature`. `bundle_sha256` is over the
+**plaintext** bundle bytes (before age encryption), so the signature binds the content, not one encryption of it. `sig` = the writer's ES-01 device
 key over `"aigentry-capture-v1|" + user_id + "|" + capture_id + "|" + content_sha256 + "|" + bundle_sha256`
 (writer authentication; `[DRAFT line 36]` device-key signing, binding new).
 
@@ -100,7 +101,7 @@ key over `"aigentry-capture-v1|" + user_id + "|" + capture_id + "|" + content_sh
 | `path_rel` | path relative to the workspace root; absolute paths and home directories are never stored |
 | `remote_url` | `origin` fetch URL with userinfo/credentials stripped; other remotes listed by name + stripped URL |
 | `branch`, `head_sha`, `upstream`, `ahead`, `behind` | from git; detached HEAD recorded as `branch: null` |
-| `unpushed_commits` | count + range `<base>..HEAD` (`base` = upstream, else §3.4); scanned (§3.4) and, only if the scan passes, included in the bundle (§5) because the target cannot fetch them; `base_source: "upstream"\|"merge_base_default"\|"user"` |
+| `unpushed_commits` | count + range `<base>..HEAD` (`base` = upstream, else §3.4); scanned (§3.4) and, only if the scan passes, included in the bundle (§5) because the target cannot fetch them; `base_source: "upstream"\|"merge_base_default"\|"user"`; `base_remote: {name, url (stripped)}` — the remote whose tracking ref contains `base`, which may differ from `origin` (checked in preview, §6.1) |
 | `refused` | `null` \| `{code, hits: [{commit, path, detector}]}` — set when the repo's bundle is refused (§3.4); hits never contain matched text |
 | `worktrees[]` | `{path_rel, branch, head_sha, locked: bool}` from `git worktree list --porcelain`; each worktree is captured as its own working-tree state |
 | `staged_patch`, `unstaged_patch` | `{sha256, bytes, files: n, binary_files: [path]}`; produced with `git diff --binary --cached` / `git diff --binary`; stored in the bundle, not in the manifest |
@@ -185,9 +186,11 @@ Symlinked directories are never traversed (prevents capturing outside the root).
   (`CAPTURE_BASE_UNDEFINED`; metadata only, listed in the summary). The whole history is never bundled
   implicitly.
 - **Scan.** Before the bundle is built, the range `base..HEAD` is checked with the same rules as the working
-  tree: (a) every path added or modified by any commit in the range (`git log --format= --name-only
-  base..HEAD`, including paths deleted again by a later commit — their blobs are still in the bundle)
-  against the §3.1 secret set; (b) every blob reachable from `HEAD` and not from `base` (`git rev-list
+  tree: (a) every path added or modified by any commit in the range — the union of `git log --format=
+  --name-only --diff-merges=separate base..HEAD` (merge commits list their paths against each parent; the
+  default prints none for merges) and the path names `git rev-list --objects base..HEAD` prints for every new
+  blob, including paths deleted again by a later commit — their blobs are still in the bundle — against the
+  §3.1 secret set; (b) every blob reachable from `HEAD` and not from `base` (`git rev-list
   --objects base..HEAD`, blobs only) with the §3.2 detector set; (c) the commit messages of the range with
   the detector set. Blobs count against the §3.2 size limits.
 - **Refusal.** Commits cannot be partially redacted (a rewrite changes their ids and the user's branch). On
@@ -210,10 +213,13 @@ Symlinked directories are never traversed (prevents capturing outside the root).
    active, trusted devices per ES-02 §5.5–§5.6, fail-closed — no plaintext fallback, cf. brain
    `ProfileFormat.ts:160-181` which does fall back).
 5. Store (§5); print a summary: captured repos, excluded paths with reasons, non-portable items, size.
+   Stored ≠ pushed (the analogue of ES-02 §5.1): the capture's local `sync_state` is `written` (local ref
+   created) → `pushed` (the ref push succeeded and `git ls-remote` shows the ref at the same commit). The
+   summary says "saved on this device" at `written` and "available on your other devices" only at `pushed`.
 
 The source working tree, index, stash list, branches and refs are unchanged by capture (tested, WS-08).
 
-## 5. Storage (decision needed — Rule 47 cost / retention / privacy)
+## 5. Storage (decision needed — Rule 47 cost / retention / privacy; ADR D-2, D-3, D-6)
 
 | Option | Where | Cost | Retention control | Privacy | Notes |
 |---|---|---|---|---|---|
@@ -235,7 +241,11 @@ fetch ciphertext (decrypting captures written before the revoke) and push refs, 
 Fetch and decrypt the capture, verify integrity and the writer signature with the same reader-side rules
 as ES-02 §5.4 (device in the authenticated, trusted list of the logged-in user; signature valid;
 `user_id` match; a capture by a revoked device with `created_at ≥ revoked_at` → `RESTORE_DEVICE_REVOKED`,
-older but first seen after the revoke → shown only with a warning and an explicit user choice), then show
+older but first seen after the revoke → shown only with a warning and an explicit user choice; the ref name
+`refs/aigentry/ws/<device_id>/<capture_id>` must equal the manifest's `device_id` and `capture_id`, else
+`RESTORE_PATH_MISMATCH`). Each device keeps a local list of capture refs it has seen (`capture_id` → commit);
+a seen ref that disappears outside a retention pass, or now points to another commit (force push), is reported
+(`CAPTURE_REF_CHANGED`) — detected, not prevented (§5 known limit). Then show
 per repo: target path, clone needed or not,
 branch/HEAD, unpushed commits to import, files to be written (staged / unstaged / untracked), excluded
 items from capture, non-portable items, env names needing a supply path, toolchain version
@@ -250,6 +260,7 @@ is recorded in `restore-journal.json` (who/when/which repo). Nothing is written 
 | repo missing on target | path absent | clone from `remote_url` (user's own credentials) |
 | different remote | `origin` URL differs after normalisation | stop for that repo (`RESTORE_REMOTE_MISMATCH`) |
 | HEAD not reachable | `head_sha` not in remote and not in bundle | stop (`RESTORE_HEAD_UNAVAILABLE`) |
+| bundle base not reachable | in preview, `git bundle verify` against the target repo reports missing prerequisites and `base_remote` ≠ `origin` | stop before any write (`RESTORE_BASE_UNAVAILABLE`), naming `base_remote` so the user can add and fetch it |
 | target has local uncommitted changes | `git status --porcelain` non-empty | preserve (§6.3) then restore into a new worktree (§6.4) |
 | target branch diverged | branch exists with different tip | new branch `aigentry/restore/<capture_id>` |
 | file collision (untracked) | path exists with different sha256 | preserve original; captured file written into the new worktree only |
@@ -284,7 +295,7 @@ the journal is detected and the tool offers resume or rollback; it never re-appl
 `CAPTURE_NOT_A_REPO`, `CAPTURE_SECRET_IN_UNPUSHED_COMMIT`, `CAPTURE_BASE_UNDEFINED`, `CAPTURE_SECRET_IN_IDENTIFIER`, `RESTORE_INTEGRITY_FAILED`, `RESTORE_USER_MISMATCH`, `RESTORE_PENDING_KEY`,
 `RESTORE_REMOTE_MISMATCH`, `RESTORE_HEAD_UNAVAILABLE`, `RESTORE_PATCH_CONFLICT`,
 `RESTORE_FS_INCOMPATIBLE`, `RESTORE_JOURNAL_PENDING`, `RESTORE_SIGNATURE_INVALID`, `RESTORE_WRITER_UNKNOWN`,
-`RESTORE_DEVICE_REVOKED`.
+`RESTORE_DEVICE_REVOKED`, `RESTORE_PATH_MISMATCH`, `RESTORE_BASE_UNAVAILABLE`, `CAPTURE_REF_CHANGED`.
 
 ## 8. Acceptance criteria → test matrix
 
@@ -301,7 +312,7 @@ writes and reads require ES-01 (§4, §6.1); none of them measures the real ES-0
 |---|---|---|---|---|---|---|---|
 | WS-01 | `[REQ line 51]` Uncommitted conflict | target checkout has its own uncommitted edits to a file also changed in the capture | preview lists the conflict; preserve ref + copies created before any write; restore lands in a new worktree; target's original edits byte-identical afterwards | preserve-before-write, new-worktree default, originals byte-identical | macOS/Windows file systems; large repos | Linux fixture (two local clones) | — |
 | WS-02 | `[REQ line 51]` Excluded files | source has `.env`, `id_ed25519`, a 6 MiB untracked file, a file with a synthetic AWS key, `node_modules/`; manifest inputs: a synthetic key in an `env[].note`, a synthetic token as a `secret_manager_ref` value, and a non-origin remote `https://u:synthpass@host/r.git?token=<synthetic>` | none of the files in the decrypted bundle; all listed in `excluded[]` with reasons; the manifest carries `[REDACTED:*]` in place of the note/ref secrets, the remote URL without userinfo and query, `redaction.findings_dropped` ≥ 2; tester greps the decrypted bundle **and** decrypted manifest (and logs) for the fixture secrets → 0 hits | deny-list, size and detector exclusions in the working tree; every-string manifest scan and URL stripping | false negatives on real secrets | Linux fixture | — |
-| WS-02b | `[REQ line 41, 49]` Secrets in unpushed commits; no upstream | repo R1: an unpushed commit adds a synthetic AWS key in `src/cfg.js`, a later unpushed commit deletes it; repo R2: committed `.env` in an unpushed commit; repo R3: branch with no upstream, remote default branch present; repo R4: no remote, no `--base` | R1, R2: `CAPTURE_SECRET_IN_UNPUSHED_COMMIT` with commit + path + detector, no R1/R2 object in the decrypted bundle (tester greps for the fixture secret → 0 hits, also in logs); R3: `base_source: merge_base_default`, bundle holds only commits after the merge-base; R4: `CAPTURE_BASE_UNDEFINED`, metadata only; other repos captured normally | unpushed-range scan, per-repo refusal, base resolution, no matched text in logs | false negatives; remote default-branch configurations beyond the fixture | Linux fixture (local bare remotes) | — |
+| WS-02b | `[REQ line 41, 49]` Secrets in unpushed commits; no upstream | repo R1: an unpushed commit adds a synthetic AWS key in `src/cfg.js`, a later unpushed commit deletes it; repo R2: committed `.env` in an unpushed commit; repo R3: branch with no upstream, remote default branch present; repo R4: no remote, no `--base`; repo R5: a `.env` (content matching no detector) introduced only in a merge resolution within the unpushed range | R5: `CAPTURE_SECRET_IN_UNPUSHED_COMMIT` by the path check (merge paths listed); R1, R2: `CAPTURE_SECRET_IN_UNPUSHED_COMMIT` with commit + path + detector, no R1/R2 object in the decrypted bundle (tester greps for the fixture secret → 0 hits, also in logs); R3: `base_source: merge_base_default`, bundle holds only commits after the merge-base; R4: `CAPTURE_BASE_UNDEFINED`, metadata only; other repos captured normally | unpushed-range scan, per-repo refusal, base resolution, no matched text in logs | false negatives; remote default-branch configurations beyond the fixture | Linux fixture (local bare remotes) | — |
 | WS-03 | `[REQ line 51]` Non-portable manifest | source has an absolute path in config, a `.so` build output, a dev server listening on a port, CUDA in lock | each appears in `nonportable[]` with the right disposition; restore performs no port/process/GPU action and prints hints | detection and disposition of the listed non-portable kinds on Linux | macOS `lsof` / Windows `netstat` detection; real GPU runtimes | Linux fixture | per-OS variants: macOS/Windows runners |
 | WS-04 | `[REQ line 51]` Restore failure preserves originals | inject failure after preserve and after the 2nd of 4 apply steps; also `kill -9` mid-apply | journal shows the failed step; originals unchanged; rollback returns the target to its pre-restore tree (hash of `git status` + file hashes equal) | journal, stop-on-failure, rollback to the pre-restore tree | power loss; Windows file locking | Linux fixture | — |
 | WS-05 | Env without values | project with `.env.example` and code reading 3 env vars | `env[]` has names + required + supply path; the manifest schema has no value field; no value from the source environment appears anywhere in the capture | env names only; no value field, no value anywhere | code-scan recall for env names | Linux fixture | — |
@@ -316,3 +327,4 @@ writes and reads require ES-01 (§4, §6.1); none of them measures the real ES-0
 | WS-14 | `[REQ line 12]` No GUI / no cmux | cmux not installed, no GUI session (no `DISPLAY`/`WAYLAND_DISPLAY`); capture on A and preview + restore on B through the CLI only | same outcome as WS-06; the PASS evidence is only the verified manifest and the journal + hashes (G6); a log copy or an SSH-run listing is not accepted | no GUI/cmux needed; only manifest + journal + hashes count as evidence | real two hosts; macOS/Windows terminals | Linux fixture (single host, two device dirs, stub ES-01 list) | real two-host variant: ES-01 |
 | WS-15 | `[REQ line 41]` Runtime / toolchain / lock / config-schema manifest | source project with `.nvmrc` (`20`) and `.python-version`, `package-lock.json` and `uv.lock`, a `config.schema.json` and a `.env.example`; target fixture whose `node --version` reports 18.x | manifest `toolchains[]` lists node and python with `pinned_by` and `detected_version`; `package_locks[]` lists both locks with `manager` and `sha256` equal to the files; `config_schema[]` lists both refs, no values; preview shows `node: required 20.x, found 18.x`; recreate commands (`npm ci`, `uv sync`, toolchain hint) are **printed, not executed**: no process spawned by the restore tool beyond `--version` probes and git (process audit of the fixture), no global install, no file written outside the restore worktree and the preserve/journal paths | §2.2 manifest content, §6.1 toolchain-difference preview, §6.4 print-not-run | real installs or rebuilds on any OS (ES-06); detector recall on ecosystems beyond the fixture | Linux fixture | — |
 | WS-15b | `[REQ line 41, 52]` Runtime manifest per OS (macOS, Windows) | WS-15 project captured on Linux, previewed/restored on macOS and Windows targets | as WS-15 on each OS, plus `source.os` vs target differences shown in preview; results recorded per OS | per-OS toolchain detection and preview | real installs (ES-06) | BLOCKED | macOS/Windows runners (Mac offline, requirement line 60; no Windows runner) |
+| WS-16 | Stored ≠ pushed; ref tampering; base on a non-origin upstream | (a) capture with the brain remote unreachable, later reachable; (b) a seen capture ref deleted, and another force-pushed to a different commit; (c) a capture ref renamed to another `capture_id`; (d) branch whose upstream is on remote `fork` ≠ `origin`, target cloned from `origin` only | (a) `sync_state: written`, summary "saved on this device" only; after the push `pushed` and only then "available on your other devices"; (b) `CAPTURE_REF_CHANGED` for both; (c) `RESTORE_PATH_MISMATCH`; (d) manifest `base_remote.name: fork`; preview stops with `RESTORE_BASE_UNAVAILABLE` naming `fork`, nothing written | `sync_state` wording, ref deletion/overwrite detection, ref ↔ manifest binding, base-remote preview check | prevention of ref deletion (only detected); Git-host GC | Linux fixture (local bare remotes, stub ES-01 list) | — |
