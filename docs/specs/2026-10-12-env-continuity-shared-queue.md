@@ -613,7 +613,10 @@ one-shot, and the orchestrator is an agent CLI session. Neither can be the heart
   claim, complete, annotate, sign under the allowed prefixes and read the device list. That
   includes an unconfined agent CLI. "No agent CLI holds registry credentials" is true of
   tokens and key bytes, **not** of authority. The OS user is the boundary (interface
-  non-claim N-U4). Sandbox exclusion of the socket is the only narrower control, and it is
+  non-claim N-U4). In particular, such a process can sign an `aigentry-endorsement-v1|`
+  endorsement: the fingerprint comparison before an endorsement is a step of the user
+  interface, not something the keeper enforces, and a prompt-injected agent could endorse a
+  registry-listed device (ES-02 §5.6). Sandbox exclusion of the socket is the only narrower control, and it is
   not measured (below).
 - **Credentials:** it is the only process that reads the ES-01 key store. Callers talk to it
   over a local endpoint: a Unix domain

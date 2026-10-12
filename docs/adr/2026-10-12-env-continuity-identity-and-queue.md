@@ -4,7 +4,9 @@ Status: **proposed** (architect, 2026-10-12). Specs:
 `docs/specs/2026-10-12-env-continuity-identity.md` (ES-01) and
 `docs/specs/2026-10-12-env-continuity-shared-queue.md` (ES-03, with ES-08 §12). Interface with ES-02/ES-04: the
 shared invariants I1–I12 in `aigentry-orchestrator-wt-1204-ctxws`
-`docs/specs/2026-10-13-env-continuity-interface-invariants.md` (A12). Technical
+`docs/specs/2026-10-13-env-continuity-interface-invariants.md` (A12; revision 2 of 2026-10-13 changes ES-01's
+side only in I8, where a newly revoked device has **all** its items re-checked, and in N-U4, where a same-uid
+process can sign endorsements). Technical
 choices are for the orchestrator to accept (Rule 24 / Rule 47 §1). The items in §5 touch
 Rule 47 categories and need the user. **The canonical task-ID issuance scheme is not
 decided here** (orchestrator guardrail 2026-10-12 13:59Z); it is D-Q-1.
