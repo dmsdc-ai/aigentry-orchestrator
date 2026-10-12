@@ -369,7 +369,8 @@ Output additions (a new content block placed before the packed memory text, plus
 ```
 
 metrics JSON gains `checkpoint: {id, verified: bool, lineage: "linear"|"forked", heads: [ids],
-provenance_counts: {original, summary, unavailable}, pending_key: bool}`.
+provenance_counts: {original, summary, unavailable}, pending_key: bool, device_list_fetched_at,
+recipients_changed: bool, rejected: [{id, code}]}` (§5.4, §5.5 R6).
 
 Rules: integrity and the §5.4 writer checks must pass or the record is not restored
 (`CHECKPOINT_INTEGRITY_FAILED` / the §5.4 code); a forked

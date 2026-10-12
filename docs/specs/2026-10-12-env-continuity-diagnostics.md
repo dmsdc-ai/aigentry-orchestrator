@@ -4,7 +4,8 @@
 - Parent: task #2026101204; requirement `state/specs/2026-10-12-environment-sharing-release-requirements.md`
   acceptance criterion 7 (line 44); build-plan draft §3 ES-07 (lines 66–67).
 - Owners (proposal): orchestrator + CLI (view), telesession (ledger fields it already owns).
-- Depends on: ES-05 / telesession #2026101110 PR3 ledger; telepty #100, #102, #103/#104.
+- Depends on: ES-05 / telesession #2026101110 PR3 ledger; telepty #100, #102, #103/#104; ES-01
+  (`devices.last_seen_at`, for `offline` only).
 - ADR: `docs/adr/2026-10-12-env-continuity-context-and-workspace.md`.
 
 **Reading convention (orchestrator guardrail 2026-10-12 13:59Z).** Part A = FINDINGS only. Part B =

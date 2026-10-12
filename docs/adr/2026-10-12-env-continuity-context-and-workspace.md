@@ -32,7 +32,7 @@ review. Tags `[REQ]`/`[DRAFT]`/`[EXISTING]` mark statements that restate an exis
    `checkpoint` means the origin agent's read cursor (`e2e-delivery-protocol.md:82,109-160,313-319`).
    Whether telepty can observe a PTY write is **not measured** (telepty not read).
 6. Not found / not read: registry (auth, device API, storage), the constitution file in the aigentry
-   checkout, `bin/context-compact.sh` in the orchestrator clone. Not measured: any real multi-host run,
+   checkout, `bin/context-compact.sh` in the orchestrator clone (it exists on `origin/release/0.2.5`, `1d8a600`/`ac94b35`). Not measured: any real multi-host run,
    macOS/Windows.
 
 ## 2. Decisions (proposed)
