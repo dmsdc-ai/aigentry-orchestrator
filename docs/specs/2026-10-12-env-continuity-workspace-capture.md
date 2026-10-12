@@ -304,7 +304,9 @@ device was revoked, compare the fingerprint the older device shows with the one 
 for it on the new device. If a device reports that the registry lists a different key for its own uploads, run
 `aigentry-devkit login` on it. If a device was approved without you, delete its trust state (the `trust-state.json`
 file whose folder `aigentry-brain trust refresh` prints) and approve it again yourself. A device that comes back
-after it expired may need one more approval on devices added while it was away. Only you should do this: brain cannot tell you from a program that drives your terminal or holds a device key,
+after it expired may need one more approval on devices added while it was away. A key change of one of your devices is
+approved from Kkoma registered as a device or from a terminal on a trusted device, not from the approval page alone. A
+computer you approve from in a terminal needs aigentry-brain installed and set up on it. Only you should do this: brain cannot tell you from a program that drives your terminal or holds a device key,
 so an agent must never approve or answer an approval. Until then the capture stays on this device." A device that
 nobody approves for keeps waiting; it no longer needs a terminal of its own (interface invariants §B.1 "Channels").
 The one terminal step that can remain, and the order that avoids it, are stated in interface invariants §B.1
