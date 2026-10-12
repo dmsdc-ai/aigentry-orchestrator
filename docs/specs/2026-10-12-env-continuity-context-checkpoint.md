@@ -215,6 +215,7 @@ requirement asks to state which facts are original vs summary (line 39), which M
   trust/
     v1/<user_key>/<endorsed_device_id>/<endorser_device_id>.endorse.json   (§5.6)
   .aigentry/checkpoint-index.json      local only, gitignored (cursor + seen set, §4.2)
+  .aigentry/checkpoint-outbox/         local only, gitignored (`written` records before the pre-push gate, §5.4)
 ```
 
 - `user_key`, `project_key` = sha256(...)[:16] of `user_id` / `project_id` (no raw URLs in paths).
@@ -226,7 +227,9 @@ requirement asks to state which facts are original vs summary (line 39), which M
   Recipients = the age public keys of the user's **active, trusted** ES-01 devices (§5.3, §5.5).
 - **No plaintext fallback.** Unlike `ProfileFormat.writeToFile` (`ProfileFormat.ts:160-181`), an
   encryption failure aborts the write (`CHECKPOINT_ENCRYPTION_FAILED`).
-- Records are immutable. Writers never modify or delete a checkpoint file in place. A path that already
+- Records are immutable once `pushed` (§5.1). Writers never modify or delete a checkpoint file in place; the
+  only exception is the pre-push gate, which replaces the age wrapper of a record that has never left the device
+  (§5.4). A path that already
   exists with **identical** bytes (duplicate write, replay after a partition) is an idempotent no-op: no
   new file, no commit, the existing id is returned. A path that already exists with different bytes is an integrity incident (`CHECKPOINT_KEY_CONFLICT`), the new
   record is written as `<seq>.<content_sha256[:8]>.ckpt.age` and both are surfaced at restore.
@@ -249,7 +252,8 @@ list next to `.aigentry/sync-status.json`, `GitBackend.ts:60-65`):
   "trust": { "anchors": [ { "device_id", "fp", "kind": "self" | "root" | "local", "first_seen_by" } ],
              "pinned": { "<device_id>": { "fp", "created_at", "revoked_at", "first_seen_by" } },
              "endorsements": { "<trust/… path>": { "state", "first_seen_by" } } },
-  "device_list": { "server_time": "<of the last successful fetch>", "fetched_at": "<local>" } }
+  "device_list": { "server_time": "<of the last successful fetch>", "fetched_at": "<local>" },
+  "unpushed": { "<checkpoint_id>": { "recipients_fp": [fp] } } }   // writer side, §5.4 pre-push gate
 ```
 
 `first_seen_by` is a server-clock upper bound on when this reader first observed an item. It is the
@@ -291,6 +295,7 @@ recomputed over `accepted` and `provisional` records only.
 | `SyncBackend.diffNames(fromRef, toRef, pathspec)` and `listTree(ref, pathspec)` | `src/backend/SyncBackend.ts:1-13`, `GitBackend.ts` | cursor fast path + shallow-clone fallback |
 | `commitPaths(paths, message)` (add only the given paths) | `GitBackend.ts:177-184` uses `git add .` | avoid committing unrelated files; explicit checkpoint commit |
 | Checkpoint commit independent of the profile merge outcome | the recovery path returns after `resetToRef` (a `--soft` reset, `GitBackend.ts:217-219`) **without committing** when the merged entries equal the remote (`PushPullManager.ts:142-146`), which would leave checkpoint files staged but uncommitted | checkpoint files are committed by their own `commitPaths` call after every pull/recovery, never as a side effect of the profile merge commit (CK-17) |
+| Pre-push recipient gate + outbox | in front of `GitBackend.push` (`GitBackend.ts:186-191`); outbox path added to the ignore list (`:60-65`) | §5.4: no push sends a checkpoint encrypted to a non-recipient; rebuild of the unpushed range; hold when the list is unavailable (CK-20) |
 | Commit trigger for `checkpoints/**` | `SyncEngine.ts:106-124` watches only profile files | checkpoint writes call `autoCommitter.scheduleCommit()` directly |
 | `CheckpointStore` (write/read/verify/list heads) + `CheckpointIndex` (cursor) | new `src/checkpoint/` | §2–§4 |
 | Fail-closed encryption path | new; must not reuse `ProfileFormat.writeToFile` fallback | §4.1 |
@@ -309,8 +314,9 @@ readable); for remote sync, brain sync opt-in (`enableSync`) **and** the separat
 opt-in (N4, ADR D-7) — else the record is written **local-only** and flagged `sync:"local_only"`; scanner available; encryption available.
 
 Written ≠ synced (the checkpoint analogue of "accepted ≠ completed"). The local index records per record
-`sync_state ∈ written` (file fsynced locally) `→ committed` (in a local commit) `→ pushed` (the push
-succeeded and a fetch of `origin/main` contains the commit). A trigger or CLI may say "saved on this
+`sync_state ∈ written` (file fsynced in the local outbox) `→ committed` (moved into `checkpoints/` and
+committed by the pre-push gate, §5.4) `→ pushed` (the push succeeded and a fetch of `origin/main` contains the
+commit). A trigger or CLI may say "saved on this
 device" at `written` and "saved for your other devices" only at `pushed`. Whether another device has
 actually read it is not observable by the writer and is never claimed.
 
@@ -404,11 +410,40 @@ A device whose only counted endorsement is demoted leaves the trusted set and th
 The recomputation cascades to the devices it endorsed and to their records.
 
 Writer side: the recipient set comes from the same cache. The write output and `brain_checkpoint_write`
-result show `recipients as of <fetched_at>`; a cache older than 24 h (proposal) adds a warning. Before a
-`written`/`committed` record is pushed (§5.1), the writer re-fetches the list; if a recipient was revoked or
-lost trust since `fetched_at`, the record is re-encrypted to the current set first (the canonical record and
-its signature are unchanged; only the age wrapper of the not-yet-pushed file is replaced). A record already
-`pushed` stays readable by that device — the past-ciphertext limit of §5.3.
+result show `recipients as of <fetched_at>`; a cache older than 24 h (proposal) adds a warning. The fingerprints
+used are recorded per record in the index (`unpushed`, §4.2). Age X25519 stanzas do not name their recipient, so
+the ciphertext alone cannot tell.
+
+**Pre-push recipient gate.** The gate runs in front of every push of the brain repo (`GitBackend.push`,
+`GitBackend.ts:186-191`), including brain's own profile pushes, because a push sends all unpushed history. It runs
+after the `pull --rebase` succeeded, so `HEAD` descends from `origin/main`.
+
+New records are first written to the gitignored outbox `.aigentry/checkpoint-outbox/<same relative path>` (state
+`written`). Brain's `git add .` (`GitBackend.ts:177-184`) therefore cannot sweep them into a commit. They enter
+`checkpoints/` only through the gate:
+1. Fetch the device list (the §4.2 step-1 fetch). Current recipients = R (§5.6).
+2. Compare `recipients_fp` with R for every outbox record and every checkpoint file added in `origin/main..HEAD`
+   (a commit whose earlier push failed). A record encrypted to any device not in R is re-encrypted to R. The
+   canonical record and its signature are unchanged; only the age wrapper of a file that has never left the
+   device is replaced (§4.1: immutability starts at `pushed`).
+3. If a re-encrypted file was already in a local commit, the unpushed range is rebuilt:
+   - `git reset --soft origin/main`, as brain's recovery already does (`GitBackend.ts:217-219`);
+   - stage the re-encrypted files;
+   - make one new commit.
+
+   The old commits become unreachable and are never pushed, because a push sends only reachable objects.
+4. Move the outbox records into `checkpoints/` with `commitPaths` (§4.4); the state becomes `committed`. Push; the
+   state becomes `pushed` (§5.1).
+
+If the list fetch in step 1 fails, the default is **hold** (ADR D-8 (b)):
+- The unpushed range is rebuilt without its checkpoint files (soft reset as in step 3). The checkpoint files move
+  back to the outbox (`written`), and the rest (the profile) is pushed.
+- The output says `CHECKPOINT_PUSH_HELD: saved on this device; device list unavailable since <fetched_at>`.
+- Pushing with the cached set instead is a per-user opt-in under D-8 (b), because it may send data to a device
+  revoked after `fetched_at`.
+
+A record already `pushed` stays readable by a device revoked later. That is the past-ciphertext limit of §5.3.
+ES-04 applies the same gate to capture refs (ES-04 §4 step 5).
 
 Anchoring cost: a fresh device has no `seen` set, so every legitimate pre-revoke record of a revoked device
 that is not referenced by an accepted record reads `CHECKPOINT_REVOKED_WRITER_UNANCHORED` there and needs an
@@ -614,7 +649,8 @@ and implemented by ES-05. ES-02 only guarantees that the id is stable and resolv
 `CHECKPOINT_USER_MISMATCH`, `CHECKPOINT_PENDING_KEY`, `CHECKPOINT_UNSUPPORTED_VERSION`,
 `CHECKPOINT_FORKED_CHOICE_REQUIRED`, `CHECKPOINT_SYNC_LOCAL_ONLY` (informational),
 `CHECKPOINT_SECRET_IN_IDENTIFIER`, `CHECKPOINT_PATH_MISMATCH`,
-`CHECKPOINT_SIGNATURE_INVALID`, `CHECKPOINT_WRITER_UNKNOWN`, `CHECKPOINT_REVOKED_WRITER_UNANCHORED`;
+`CHECKPOINT_SIGNATURE_INVALID`, `CHECKPOINT_WRITER_UNKNOWN`, `CHECKPOINT_REVOKED_WRITER_UNANCHORED`,
+`CHECKPOINT_PUSH_HELD` (informational);
 endorsements (§5.6): `ENDORSEMENT_PATH_MISMATCH`, `ENDORSEMENT_INVALID`, `ENDORSEMENT_AFTER_REVOKE`,
 `ENDORSEMENT_REVOKED_ENDORSER_UNANCHORED`, `TRUST_ANCHOR_REQUIRED`.
 `CHECKPOINT_DEVICE_REVOKED` is a reader-side rejection (§5.4); a cooperating writer may also refuse
@@ -653,6 +689,7 @@ writes and reads require ES-01 (§5); none of them measures the real ES-01 integ
 | CK-14 | Non-claim wording | inspect restore text and CLI help | states "context restored from checkpoint; model/process state not restored" (N1/N2) | non-claim wording present | whether an agent behaves as if state were restored | Linux fixture | — |
 | CK-15 | Retention | fast-clock fixture | expired non-head records removed from `HEAD`; heads kept; M2 raw sibling removed at 30d while M1 record stays | removal from `HEAD` per class | deletion from Git history or host GC | Linux fixture (fast clock) | — |
 | CK-16 | `[REQ line 12]` No GUI / no cmux | cmux not installed, no GUI session (no `DISPLAY`/`WAYLAND_DISPLAY`); `manual` and `session_end` triggers via CLI/MCP on A; sync and `brain_context_resume` on B | same outcome as CK-01; the PASS evidence is only B's verified `checkpoint_id` + `content_sha256`; a log copy or an SSH-run file listing is not accepted as evidence | no GUI/cmux needed; only verified ids/hashes count as evidence | real two hosts; macOS/Windows terminals | Linux fixture (single host, two device dirs, stub ES-01 list) | real two-host variant: ES-01 |
-| CK-17 | Recovery path commits checkpoints | a staged checkpoint file while `pull --rebase` fails and the merged profile entries equal the remote (`PushPullManager.ts:142-146`) | the checkpoint file is committed by its own commit and pushed; `sync_state` reaches `pushed`; no checkpoint file left staged-only | checkpoint commit survives the `entriesEqual` recovery branch | other recovery paths of brain sync | Linux fixture (local bare remote) | — |
+| CK-17 | Recovery path commits checkpoints | a `written` checkpoint record (outbox, §5.4) while `pull --rebase` fails and the merged profile entries equal the remote (`PushPullManager.ts:142-146`) | the pre-push gate commits the checkpoint file by its own commit and pushes it; `sync_state` reaches `pushed`; no checkpoint file left staged-only | checkpoint commit survives the `entriesEqual` recovery branch | other recovery paths of brain sync | Linux fixture (local bare remote) | — |
 | CK-18 | `[REQ line 50]` Duplicate write / replay | the same record written twice; identical bytes replayed after a partition | no new file, no new commit, the same `checkpoint_id` returned; different bytes at the same path still → `CHECKPOINT_KEY_CONFLICT` | duplicate write / replay is an idempotent no-op | concurrent writers on two hosts | Linux fixture | — |
 | CK-19 | Written ≠ synced | push fails (remote unreachable), later succeeds | `sync_state` stays `committed`; output says "saved on this device", never "saved for your other devices"; after the push `pushed` and only then the second wording | `sync_state` and the wording "saved for your other devices" only at `pushed` | whether another device has read it (not observable, never claimed) | Linux fixture (local bare remote made unreachable) | — |
+| CK-20 | `[REQ line 49]` Revoked device gets nothing pushed after the revoke (pre-push gate, §5.4) | A's list cache includes B as a recipient; Git remote unreachable; A writes record r1 (outbox) and, through a brain profile write, a commit holding record r2 from an earlier failed push (both encrypted to B); B is revoked in the stub registry; then (a) remote and registry reachable, A syncs; (b) remote reachable, registry unreachable, A syncs; (c) as (b) with the user's D-8 (b) opt-in to push with the cached set; (d) A writes with a list cache 25 h old | A's write output shows `recipients as of <fetched_at>`; (a) r1 and r2 re-encrypted to the current set before push; the unpushed range rebuilt (old commits unreachable); **no object in the pushed history** (`git rev-list --objects origin/main` on the bare remote, every blob under `checkpoints/`) decrypts with B's age key, and r1/r2 decrypt with A's; signatures and `content_sha256` unchanged; (b) `CHECKPOINT_PUSH_HELD`, r1 and r2 back in the outbox (`written`), the profile commit pushed, nothing under `checkpoints/` pushed; wording "saved on this device" only; (c) pushed with the `recipients as of` warning; (d) the 24 h warning shown | no object pushed after a revoke is decryptable by the revoked device; rebuild of unpushed commits; hold when the list is unavailable; writer-side `recipients as of` and 24 h warning | records pushed before the revoke (past-ciphertext limit, §5.3); the real ES-01 list; Git-host behaviour | Linux fixture (local bare remote, stub ES-01 list and registry made unreachable) | real-ES-01 variant: ES-01 (revoke, R3/R4) |
