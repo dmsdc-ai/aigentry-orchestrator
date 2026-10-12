@@ -15,6 +15,7 @@ commits:
 - 8b7b22b B11 per-row testability matrices
 - e4a75cc non-blocking + grounding corrections + ES-01 §8.1 interface for ES-02/ES-04
 - f3643e8 escape two table pipes
+- 9c484f8 coordination C1–C5 (ES-01 §3.1, §8, §8.1, ID-21)
 
 resolved:
 - B1: ES-01 §1.4 now reports the wiring as measured: a Limiter is built (main.py:90-95) but no SlowAPIMiddleware is registered (main.py:191-203), so default limits do not run. The only decorator is repositories.py:80, on its own Limiter (:26). The registry rate-limiter issue is cited. §7.4 proposes per-route decorators on /devices/* and does not turn on the global middleware. If the limiter store (Redis) is down, authorize/approve/deny/token fail closed with 503. Test rows ID-12 and ID-13. ADR §7 prices this as new work.
@@ -115,6 +116,18 @@ not_measured:
 - RFC 9700 / RFC 6749 sections cited from knowledge; not re-read (no network).
 - Not read: the Mac queue, the registry deployment, the frontend (where the approval page would be served), Postgres config, and aigentry-ssot.
 - Whether a second or third real host is available for the H2/H3 rows.
+
+coordination (orchestrator follow-up 14:39Z, ES-02 §5.5 R1–R7, sibling clone @623b8f6, read-only):
+- The round-2 review read ES-01 @82afaf4. §8.1 and the R2/R3 fields were added later, in e4a75cc, and refined in 9c484f8.
+- C1 (R2): ES-01 §3.1 has `age_recipient`, `age_recipient_sig` and `age_recipient_set_at`. They are registered at `/devices/authorize` (§3.2) or rotated by `PUT /devices/me/age-recipient` (§8).
+  - Fixed in 9c484f8: the signature covered `device_id`, which does not exist yet when the device signs at authorize time. It now signs over `hex(public_key)`, which never changes for a row.
+- C2 (R3): `GET /devices?include=keys&all=true` (device bearer only) returns `public_key`, `revoked_at`, the signed recipient with its set time, `server_time`, and revoked and expired devices (ES-01 §8, §8.1). §8.1 exists since e4a75cc. Row ID-21 tests it.
+- C3 (R5/R6): §8.1 R5 states the key-directory model and the endorsement validity rule. An endorsement is valid only if the endorsed device's server-clock `created_at` precedes the endorser's `revoked_at`. An endorsement dated after the endorser's revoke is void. Revoking a device does not revoke the devices it endorsed. The first device is self-trusted.
+  - §3.1 makes `created_at` and `revoked_at` server-clock values that are never moved.
+  - A pinned device whose key or timestamps change is surfaced as a registry fault.
+  - The endorsement file and decision D-9 stay with ES-02.
+  - R6: the list makes additions, key changes and revokes observable and carries name, os, created_at and fingerprints. Showing the notice is ES-02's job.
+- C5: `idle_expiry` is removed from `revoked_reason`. Idle expiry sets `status=expired` and leaves `revoked_reason` and `revoked_at` null; only `revoked` sets them (§3.1, §5, R4). ID-21 tests this.
 
 snyk: NOT_APPLICABLE_DOCS
 
