@@ -165,7 +165,7 @@ user (existing users.id, UUID)          ← the account; one GitHub identity
 | `key_alg` | varchar(16) | `ed25519` (only value in this release) |
 | `public_key` | bytea(32), unique | raw Ed25519 public key. Stays bound to the row after revoke, so a revoked device logs in again only with a **new** key pair and gets a new `device_id` (§5) |
 | `age_recipient` | varchar(128) null | X25519 age recipient (`age1…`) for ES-02/ES-04 encryption (§8.1) |
-| `age_recipient_sig` | bytea(64) null | Ed25519 signature by this device's key over `"aigentry-age-recipient-v1|" + device_id + "|" + age_recipient`; the registry cannot substitute the recipient without breaking it |
+| `age_recipient_sig` | bytea(64) null | Ed25519 signature by this device's key over `"aigentry-age-recipient-v1\|" + device_id + "\|" + age_recipient`; the registry cannot substitute the recipient without breaking it |
 | `status` | varchar(16) | `active` \| `revoked` \| `expired` |
 | `refresh_family_id` | UUID | current refresh family |
 | `refresh_hash` | char(64) | sha256 of the *current* refresh token (issued, not yet presented) |
@@ -461,7 +461,7 @@ Errors use the RFC 8628 names for the token endpoint (`authorization_pending`,
 
 | # | Provided by ES-01 |
 |---|---|
-| R1 signing key | the device's Ed25519 key (§3.1). ES-01 signs only with prefix `aigentry-device-v1|` (and `aigentry-age-recipient-v1|`). ES-02/ES-04 use their own prefixes. The key store (§6) exposes a *sign* operation through the lease keeper (ES-03 §5.1); key bytes never leave the store |
+| R1 signing key | the device's Ed25519 key (§3.1). ES-01 signs only with prefix `aigentry-device-v1\|` (and `aigentry-age-recipient-v1\|`). ES-02/ES-04 use their own prefixes. The key store (§6) exposes a *sign* operation through the lease keeper (ES-03 §5.1); key bytes never leave the store |
 | R2 age recipient | `age_recipient` + `age_recipient_sig` per device (§3.1), sent with `/devices/authorize` or set later by `PUT /devices/me/age-recipient` (device bearer, new signed value = rotation). Generated on the device. The private half follows the same store rules as the device key (§6) |
 | R3 authenticated device list | `GET /devices?include=keys&all=true` (owner's device bearer only, §7.2) returns per device: `id, name, os, status, created_at, revoked_at, public_key, age_recipient, age_recipient_sig`, revoked devices included. Over TLS to the registry URL of D-ID-4. Integrity rests on the registry (R5) |
 | R4 revoke time | `revoked_at`: server clock, set once, never cleared or moved; revoked rows are never re-bound (§5). Retention: D-ID-5 |
