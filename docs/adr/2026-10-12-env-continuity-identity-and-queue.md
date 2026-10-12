@@ -2,7 +2,9 @@
 
 Status: **proposed** (architect, 2026-10-12). Specs:
 `docs/specs/2026-10-12-env-continuity-identity.md` (ES-01) and
-`docs/specs/2026-10-12-env-continuity-shared-queue.md` (ES-03, with ES-08 §12). Technical
+`docs/specs/2026-10-12-env-continuity-shared-queue.md` (ES-03, with ES-08 §12). Interface with ES-02/ES-04: the
+shared invariants I1–I12 in `aigentry-orchestrator-wt-1204-ctxws`
+`docs/specs/2026-10-13-env-continuity-interface-invariants.md` (A12). Technical
 choices are for the orchestrator to accept (Rule 24 / Rule 47 §1). The items in §5 touch
 Rule 47 categories and need the user. **The canonical task-ID issuance scheme is not
 decided here** (orchestrator guardrail 2026-10-12 13:59Z); it is D-Q-1.
@@ -39,6 +41,9 @@ decided here** (orchestrator guardrail 2026-10-12 13:59Z); it is D-Q-1.
 | A8 | **Idempotency keys** on all mutations, with telesession's semantics (dedupe / conflict / in-flight) stored in the effect's transaction | ES-03 §7 |
 | A9 | **Reconnect/recreate, never live process migration.** Fenced work is preserved as evidence and never auto-merged | ES-03 §6, §9 |
 | A10 | Keep the local `task-queue.json` shape as a **single-writer cache**, so the gate, `tq-*` and the release maintainer keep working. The gate adds alias resolution and a read-only lease view (mode-independent exit 11 held / 12 unavailable; exit 6 is already taken in `cli.ts`); the claim is a separate lease step before spawn | ES-03 §3.6, §11 |
+| A12 | **One trust/revocation model shared with ES-02/ES-04**: ES-01 implements the ES-01 column of the interface invariants I1–I12 (ES-01 §8.1). The obligations are: the registry refuses an `age_recipient` whose signature does not verify (I5); revoked rows keep keys, `created_at` and `revoked_at` (I3, I11); a revoke reaches Git-stored data only through each client's next list fetch (I8, I10); the canonical signed fingerprint form (I4) | two spec sets patched separately kept diverging (ctxws round 4, idq round 2 `interface_check`) |
+| A13 | **The lease keeper is the only signer and device-list fetcher**: `sign(prefix, payload)` with an allowlist of ES-02/ES-04 prefixes (ES-01 prefixes refused), `public_key`/`fingerprint`, `register_age_recipient`, `device_list`, `device_me`; brain and the ES-04 CLI are callers; a 제15조 contract (ES-03 §5.1, invariant I12) | idq round 2 blocking 1: ES-01 R1 named a keeper operation that ES-03 never defined; brain must not read the key store |
+| A14 | **Device routes take the client IP from the socket peer**; forwarded headers are read only from configured trusted-proxy CIDRs (default none); the device-route limiter is independent of `RATE_LIMIT_ENABLED` (ES-01 §7.4). Error-path writes that must persist (reuse revoke, rejection events, `rejected` receipts) commit before an error body is returned (ES-01 §5, ES-03 §10, §12.2). The claim idempotency key is per dispatch attempt and a stored claim is replayed only while its lease is live (ES-03 §3.6, §7). The gate's offline cache exception is removed (ES-03 §3.6(4)) | idq round 2 blocking 2–6 |
 | A11 | **ES-08**: dedupe on the `owner/repo#N` alias; durable receipt in the same transaction; issue content is stored as an untrusted blob, never in `desc` or instructions; no outward GitHub action in this release | ES-03 §12 |
 
 ## 3. Alternatives rejected
@@ -52,6 +57,10 @@ decided here** (orchestrator guardrail 2026-10-12 13:59Z); it is D-Q-1.
 | OS keystore through a native addon (e.g. keytar) | External native dependency (제17조, 제1조). OS-shipped CLIs/APIs are enough, with a file fallback |
 | Redis as the lease store | Revocation already shows Redis is TTL/volatile (`revocation_service.py`). Leases and fences must survive restarts and sit in the same transaction as the task row |
 | New network daemon/relay for queue sync (server-side or cross-host) | The registry API suffices for sync. A new network service is a network/ops change and adds weight (제1조). Not rejected: a device-local, user-level **lease keeper** with no listening network port (ES-03 §5.1), because a one-shot `dispatch.sh` and an agent-CLI orchestrator cannot heartbeat a 600 s lease; it is a new operational component and therefore decision D-Q-9 |
+| A keeper `sign` operation over caller-chosen bytes with any prefix | a same-uid caller could then mint ES-01 proofs and age-recipient signatures; the allowlist keeps ES-01 prefixes keeper-internal (A13) |
+| brain reads the ES-01 key store itself | contradicts "the keeper is the only reader" and spreads the key to a second process (A13, I12) |
+| Keep `get_real_ip` (forwarded headers trusted unconditionally) for device routes | a client rotates the header to reset per-IP limits and to choose the network prefix shown on the approval page (`main.py:75-86`) |
+| Keep the gate's offline cache exception and add an offline local attach | adds a second lease path that works without the server; removing the exception is simpler, and `--no-task` stays the escape hatch |
 | Global id counter across users | Leaks activity volume across users and makes cross-user guessing meaningful. If a server counter is chosen at all (P-A), it is per-queue |
 
 ## 4. Constitutional review (위헌 심사)
@@ -62,8 +71,9 @@ decided here** (orchestrator guardrail 2026-10-12 13:59Z); it is D-Q-1.
 - **제17조 무의존:** satisfied. Ed25519 comes from Node crypto and Python `cryptography`
   (already a dependency). Key storage uses OS-shipped tools (`security`, PowerShell
   DPAPI) with a file fallback.
-- **제15조 SSOT:** the `/api/v1/devices/*` and `/api/v1/queues/*` contracts must be
-  registered in aigentry-ssot and approved by registry, devkit and orchestrator before
+- **제15조 SSOT:** the `/api/v1/devices/*` and `/api/v1/queues/*` contracts, and the keeper's
+  local protocol (ES-03 §5.1, consumed by brain and the orchestrator), must be registered in
+  aigentry-ssot and approved by registry, devkit, brain and orchestrator before
   implementation. Not done here.
 - **제4조 경계** (`tooling/instructions/CONSTITUTION.md:68-75`: client adapter only, no
   duplicate implementation, single source of truth). Identity, lease, fencing and the
@@ -91,11 +101,11 @@ decided here** (orchestrator guardrail 2026-10-12 13:59Z); it is D-Q-1.
 
 | Id | Question | Category | Recommended default | Blocks |
 |---|---|---|---|---|
-| D-ID-1 | Device token lifetimes | privacy / permission | access 15 min; refresh idle 30 d / absolute 90 d; rotation; proof checked first; previous-token retry re-rotates, older token with valid proof → revoke (ES-01 §5) | ES-01 impl |
+| D-ID-1 | Device token lifetimes and the active-device cap | privacy / permission | access 15 min; refresh idle 30 d / absolute 90 d; rotation; proof checked first; previous-token retry re-rotates, older token with valid proof → revoke (ES-01 §5); at most 20 active devices per user | ES-01 impl |
 | D-ID-2 | (a) Device secret storage location; (b) whether to move the existing brain age key (`~/.config/sops/age/keys.txt`, 0600 plain file; ES-02's proposed `age_recipient`) into the ES-01 store | privacy / permission | macOS Keychain via `security -i` with the secret on stdin (conditional on ES-09 verification; else re-decide), file store on macOS only with explicit `--keystore file`; Linux 0600 file under `~/.config/aigentry/device/`; Windows DPAPI file via PowerShell reading stdin; never env/state files, never argv. (b) do not move in this release: brain owns the key and its readers (제4조), and moving it risks the only decryption key; record the gap and leave it to a brain-side task | ES-01 impl |
 | D-ID-3 | Enable the new device credential type + endpoints on a deployed registry | permission expansion / production deploy | ship disabled (`DEVICE_AUTH_ENABLED=false`); enable per instance after ES-09 isolation PASS | ES-01/03 rollout |
 | D-ID-4 | Every opted-in device talks to the registry over HTTPS | network change / personal-data transfer | only to the registry URL chosen at install; no new relay | ES-01/03 rollout |
-| D-ID-5 | Retention of revoked/expired device rows and device authorizations | personal data | expired kept; revoked: `os`/`client_version`/`last_seen_at` cleared after 90 d, keys, `created_at` and `revoked_at` kept for the account's life (ES-02/ES-04 signature and endorsement checks); authorizations purged 24 h after terminal | ES-01 impl |
+| D-ID-5 | Retention of revoked/expired device rows and device authorizations | personal data | expired kept; revoked: `os`/`client_version`/`last_seen_at` cleared after 90 d, refresh hashes cleared at revoke, keys, `created_at`, `revoked_at` and all other columns kept for the account's life (ES-02/ES-04 signature, endorsement and recovery-order checks, interface invariants I3/I11); authorizations purged 24 h after terminal | ES-01 impl |
 | D-Q-1 | **Canonical task-ID issuance:** P-A server counter / P-B Mac ledger + mirror / P-C partitioned ranges, and whether to migrate | operational data change; network change if P-B | **none adopted.** First: read the Mac ledger, run the mapping dry-run, agree a freeze (ES-03 §3.4). ES-03 §3.4 summarises the trade-offs with no ranking. Consequences that come with an option: P-B's new cross-host ID-request path (a network change that conflicts with D-ID-4 unless approved with P-B); the 제4조 boundary cost of P-B/P-C (§4) | ES-03 ids, migration, gate change |
 | D-Q-2 | Registry Postgres as authoritative store for opted-in users | operational data / personal-data transfer | yes, opt-in, self-hostable | ES-03 impl |
 | D-Q-3 | Execute the migration (M3/M5) | operational data change | only after D-Q-1 and the user's review of `mapping.json` | cutover |
@@ -104,7 +114,7 @@ decided here** (orchestrator guardrail 2026-10-12 13:59Z); it is D-Q-1.
 | D-Q-6 | Real macOS/Windows hosts or runners for the BLOCKED matrix rows | cost | none procured without approval; quote first; rows stay BLOCKED and support is stated Linux-only meanwhile | ES-09 cross-platform rows |
 | D-Q-7 | Hosted Postgres storage for opted-in users on the cloud registry | cost / personal-data transfer | measure cost per user before enabling; per-user quota (proposal 100 MiB) | cloud rollout |
 | D-Q-8 | Retention of ES-08 untrusted blobs and intake receipts (third-party authors' text) | personal data | blob deleted 90 d after the task is terminal; receipts metadata-only | ES-08 impl |
-| D-Q-9 | Run the devkit lease keeper (new user-level resident process, ES-03 §5.1) | operational change | on-demand start, idle exit, no boot-time service or auto-restart | ES-03 impl |
+| D-Q-9 | Run the devkit lease keeper (new user-level resident process, ES-03 §5.1); it is also the only signer and list fetcher for ES-02/ES-04 (A13) | operational change | on-demand start (incl. by brain and ES-04), idle exit, no boot-time service or auto-restart | ES-03 impl; ES-01 local fingerprint; ES-02/ES-04 writes |
 
 Separately approved items stay out of scope: new auth scopes/credentials, network changes,
 restarts/relay activation (task approval 2026-10-12 13:47Z).
@@ -113,8 +123,12 @@ restarts/relay activation (task approval 2026-10-12 13:47Z).
 
 - (+) One account sees one queue from any device. Concurrent claim and stale completion
   are structurally impossible to *record*. A lost device can be revoked.
-- (+) The existing release projection, the gate's exit codes and local-only users are
-  unaffected.
+- (+) The existing release projection and local-only users are unaffected. The gate's existing
+  exit codes keep their meaning; exits 11 and 12 are added, in account mode only (A10).
+- (−) ES-02/ES-04 writes and the local fingerprint depend on the lease keeper (A13). If D-Q-9 is
+  declined, no checkpoint or capture can be signed.
+- (−) An offline device cannot dispatch an account-mode task, even one it holds a lease for
+  (A14). The escape hatches are `--no-task` and leaving account mode.
 - (−) A registry outage stops claims and new ids under P-A. Work continues only inside
   live leases.
 - (−) External side effects of fenced workers are not undone; reconcile only surfaces them.

@@ -409,28 +409,42 @@ separate *lease step* later in the pipeline:
    Exit 11 is **mode-independent**, like the ambiguity exit 5, and for the same reason.
    `AIGENTRY_TASK_GATE` sets how strict the gate is about a known row's status. It cannot
    authorise two devices to work on one task. `warn` and `off` do not bypass it.
-4. **Lease unavailable (gate, read-only).** If the server is unreachable, the gate may use
-   the local cache only when `synced_at` is less than 10 min old **and** the cached row
-   shows this device as the holder with `lease_remaining` > 0 at sync time. Otherwise it
-   exits **12** `TASK_LEASE_UNAVAILABLE`, mode-independent, and never claims offline. In
+4. **Lease unavailable (gate, read-only).** If the server is unreachable, the gate exits
+   **12** `TASK_LEASE_UNAVAILABLE`, mode-independent, always. It never uses the local cache
+   for this decision and never claims offline (§9.3). (An earlier draft let a fresh cache
+   that showed this device as holder pass here, but step (5) then needs the server anyway,
+   so that path could only end in exit 12. It is removed.) In
    account mode, the escape hatches are the existing audited `--no-task "<reason>"`
    (`:794-800`), which dispatches with no task and no lease, or leaving account mode.
    `warn`/`off` are not escape hatches here, because a dispatch without a lease is exactly
-   the double-dispatch the lease prevents.
+   the double-dispatch the lease prevents. A third path exists today and is unchanged: in
+   account mode, a dispatch with neither `--task` nor `--no-task` goes through
+   `taskGateReject` (`cli.ts:802-804`) and, in `warn`/`off`, proceeds with no task and no
+   lease, as it does now.
 5. **Claim (lease step; new; the only queue side effect).** It sits after the sid exists
    and after the read-only dedup and retry checks (`cli.ts:1285-1308`), and before
-   `resolveRoute`/spawn (`:1310-1312`). So a refused claim leaves no spawned worker, which
-   keeps the intent of `:675-676`. The step asks the lease keeper to `claim` with
-   idempotency key `dispatch:<task>:<sid>` and `promote_to=delegated` (§4.2), and to
-   *attach* the sid to the lease. Outcomes:
+   `resolveRoute` (`:1311`) and `spawnWorkspace` (`:1313`). So a refused claim leaves no
+   spawned worker, which keeps the intent of `:675-676`. The step asks the lease keeper to
+   `claim` with `promote_to=delegated` (§4.2), and to *attach* the sid to the lease. The
+   idempotency key is **per dispatch attempt**: `claim:<task>:<attempt_id>`, where
+   `attempt_id` is a random UUID generated once by this `dispatch.sh` invocation before the
+   first claim call and reused only for that invocation's network retries. A re-dispatch of
+   the same task to the same `--target` (follow-ups, fix cycles) is a new attempt with a new
+   key, so it never replays an earlier attempt's stored lease (§7). Outcomes:
    - `HELD`, from a race since the gate's view → exit 11, as in (3).
    - Server unreachable → exit 12.
+   - `409 IDEMPOTENCY_KEY_CONFLICT` (a client bug: the same attempt key with another body) →
+     exit 12 with reason `idempotency_conflict`; no spawn.
    - Success → continue.
 6. **Exit after the claim.** What happens to the attachment depends on how the process
    ends:
    - **Exit before any transport write** (`:1335` 1/6, `:1338` 3, the 2/78 spawn and
-     staging failures, `beginDelivery` 9 or 4 `DISPATCH_RETRY_REFUSED` `:1355`): an exit hook
-     **detaches** the sid. If no other sid of this device is attached, the keeper
+     staging failures, `beginDelivery` 9 or 4 `DISPATCH_RETRY_REFUSED` `:1355`): the sid is
+     **detached** before the process exits. `die()` calls `process.exit` (`cli.ts:101-104`),
+     and Node `exit` listeners cannot wait for IPC, so the detach is not an exit listener:
+     every post-claim `die`/`process.exit` site first calls a synchronous helper (a
+     `spawnSync` of `aigentry-devkit lease-keeper detach <sid>`, bounded to 5 s) and then
+     exits. A helper failure falls back to the `pending_delivery` TTL path below. If no other sid of this device is attached, the keeper
      `release`s with `status_after=unchanged`. The status that `promote_to` set stays
      `delegated`, which is the same imprecision today's local ledger has for a failed
      dispatch. If the hook itself cannot run (`kill -9` of `dispatch.sh`), the attachment
@@ -579,8 +593,30 @@ one-shot, and the orchestrator is an agent CLI session. Neither can be the heart
 - **Duties:** claim, heartbeat, release, complete and annotate on behalf of local callers;
   token refresh (ES-01 §5); reconnect reconcile (§9) and the cache rewrite (§11); the
   sid-attachment table (§3.6(5)–(6)); local lease-loss timers (§5).
-- **Credentials:** it is the only process that reads the ES-01 key store. Callers (the
-  dispatch gate, the `aigentry-devkit` CLI) talk to it over a local endpoint: a Unix domain
+- **Identity operations** (ES-01 §8.1 R1/R2/FP; interface invariant I12), the only way any
+  other component uses the device key or the device list:
+  - `sign(prefix, payload)` → signature. Prefix allowlist: `aigentry-checkpoint-v1|`,
+    `aigentry-capture-v1|`, `aigentry-endorsement-v1|`. Any other prefix, including ES-01's
+    `aigentry-device-v1|` and `aigentry-age-recipient-v1|`, → `SIGN_PREFIX_REFUSED`. The
+    keeper signs those two only inside its own `login`, refresh and
+    `register_age_recipient` operations.
+  - `public_key()`, `fingerprint()` (ES-01 FP; the local value, never from the registry).
+  - `register_age_recipient(age_recipient)`: checks the `age1…` format, signs and sends
+    `PUT /devices/me/age-recipient`.
+  - `device_list()`: a proxied `GET /devices?include=keys&all=true` returning the list and
+    `server_time`; `device_me()`: a proxied `GET /devices/me`.
+- **Callers:** the dispatch gate, the `aigentry-devkit` CLI (incl. the ES-04 capture/restore
+  commands) and brain (ES-02 writer, reader and pre-push gate). Each starts the keeper on
+  demand. This local protocol is a 제15조 contract: it is registered in aigentry-ssot before
+  implementation, with devkit as owner and brain and the orchestrator as consumers.
+- **Authority:** any process running as the same OS user that can reach the socket can
+  claim, complete, annotate, sign under the allowed prefixes and read the device list. That
+  includes an unconfined agent CLI. "No agent CLI holds registry credentials" is true of
+  tokens and key bytes, **not** of authority. The OS user is the boundary (interface
+  non-claim N-U4). Sandbox exclusion of the socket is the only narrower control, and it is
+  not measured (below).
+- **Credentials:** it is the only process that reads the ES-01 key store. Callers talk to it
+  over a local endpoint: a Unix domain
   socket `0600` in the device directory (`0700`), with peer-uid check (`SO_PEERCRED` /
   `getpeereid`), or on Windows a named pipe whose ACL allows only the current user. The
   protocol carries operations and results, **never tokens, codes or key bytes**.
@@ -588,7 +624,7 @@ one-shot, and the orchestrator is an agent CLI session. Neither can be the heart
   allowlist. Whether today's sandbox profiles exclude it was **not measured** (ES-09 item).
 - **Lifecycle:**
   - Started on demand by the first command that needs it (gate lease step, `login`,
-    `device` commands).
+    `device` commands, a brain checkpoint write/read/push, an ES-04 capture or restore).
   - Exits after 10 min with no attachment and no held lease.
   - No boot-time service (no launchd/systemd unit, no Windows scheduled task) and no
     automatic restart in this release. Adding one is an operational change (D-Q-9).
@@ -639,8 +675,14 @@ operational approval, not D-Q-5.
   - same key while the first is still running → `409 REQUEST_IN_FLIGHT`.
 - The record is written **in the same transaction** as the effect, so a crash after commit
   replays the stored result. A crash before commit leaves no record and no effect.
-- Recommended keys: `create:<dedupe_key or provisional uuid>`,
-  `claim:<task>:<sid or attempt>`, `complete:<task>:<token>`,
+- **Only successful effects are stored.** A rejection (`HELD`, `FENCED`, `LEASE_EXPIRED`,
+  `NOT_HOLDER`, `DEPENDENCIES_OPEN`, `VERSION_CONFLICT`, …) writes no idempotency record, so
+  a retry with the same key is evaluated again. (Rejections are still logged as events, §10.)
+- **A stored `claim` is replayed only while the lease it granted is live**: same device, same
+  `fencing_token`, `lease_expires_at > now()`. Otherwise the claim is executed again and its
+  record replaced, so a replay never hands out a token for a lease that has expired.
+- Keys (one name per operation, used in §3.6 and here): `create:<dedupe_key or provisional
+  uuid>`, `claim:<task>:<attempt_id>` (§3.6(5)), `complete:<task>:<token>`,
   `heartbeat:<task>:<token>:<n>`.
 - Business-level dedupe for create: `dedupe_key` (unique per queue, forever) and ES-08's
   `github_issue` alias. These outlive the 7-day idempotency window.
@@ -702,7 +744,7 @@ devices cannot claim, heartbeat or complete.
 | `fencing_token` | presented and/or resulting |
 | `idempotency_key`, `request_sha256` | |
 | `from_status`, `to_status` | |
-| `result` | `ok` or the rejection code (`FENCED`, `LEASE_EXPIRED`, …). Rejections are logged too |
+| `result` | `ok` or the rejection code (`FENCED`, `LEASE_EXPIRED`, …). Rejections are logged too. A rejection event must persist while the client gets an error: the request session rolls back on any exception (registry `db/session.py:15-20`), so the handler commits the event and then **returns** the error body without raising (ES-01 §5 step 5 uses the same rule). Q-10 and Q-23 assert the event exists |
 | `body` | bounded (16 KiB) jsonb: notes, evidence, progress. **Secret-scan on write**: values that match known credential patterns are refused with `SECRET_SUSPECTED` (ES-01 §11) |
 
 ### 10.6 Export and retention
@@ -724,8 +766,12 @@ the queue exists. A retention limit, if wanted, is a Rule 47 decision (D-Q-4).
   `mv`. The temp file is created by `mktemp` in `$TMPDIR`, so the `mv` may cross
   filesystems and is then not atomic. `active_focus` and `tracks` are **local-only cache
   fields**: never sent to the server, and preserved verbatim by the keeper's rewrite.
-  `tq-focus.sh` stays a writer of those two fields only. Making its write atomic
-  (same-dir temp) is a separate small fix, mentioned only (Rule 29).
+  In fact `tq-focus.sh` rewrites the **whole file** from a snapshot (`jq … "$TQ" > "$tmp";
+  mv "$tmp" "$TQ"`, `bin/tq-focus.sh:18-20`). A keeper rewrite between its `jq` and its `mv`
+  is lost: `tasks[]` and `authority` revert to the older snapshot. The keeper therefore
+  re-reads the file before each rewrite, and when it finds an `authority.event_seq` older than
+  its own last write it re-syncs from the server and rewrites. Making `tq-focus.sh` write only
+  its two fields atomically (same-dir temp) is a separate small fix, mentioned only (Rule 29).
 - **Local-only mode** (not logged in, `DEVICE_AUTH_ENABLED=false`, or a user who opts
   out): exactly today's behaviour. The file is the authority, there is no lease, and IDs
   are chosen as they are today, whatever D-Q-1 decides for account mode. Rule 34's gate
@@ -750,7 +796,9 @@ comment, merge or deploy are **not** in this release. Each needs its own Rule 47
 
 `intake_receipts(queue_id, source='github', dedupe_key, delivery_ref, received_at,
 content_sha256, content_bytes, state, task_id, attempts, last_error)`, unique
-`(queue_id, source, delivery_ref)`. `delivery_ref` is the delivery id or the poll cursor.
+`(queue_id, source, delivery_ref)`. `delivery_ref` is the webhook delivery id, or for a poll
+the poll cursor **plus the issue key** (`<cursor>:<owner/repo#N>`), because one poll can
+return several issues.
 `state` is one of `received, task_linked, analysis_requested, analysis_recorded,
 review_recorded, rejected, retry_exhausted`. The receipt row is written **in the same
 transaction** as the task create/link and the `intake_received`/`intake_linked` events.
@@ -762,7 +810,11 @@ GitHub-side acknowledgement is posted in this release.
 
 - **Who retries:** only the intake adapter. It runs as an owner device through the lease
   keeper (§5.1) and holds a local durable outbox: one file per delivery, written tmp +
-  fsync + rename, holding `delivery_ref`, `content_sha256`, `attempts` and `next_at`. The
+  fsync + rename, holding `delivery_ref`, `content_sha256`, `attempts`, `next_at` and the
+  local terminal state. The outbox holds **no issue content**: a retry re-fetches the issue
+  from the source and sends it only if its sha256 still equals `content_sha256`; if it
+  changed, the new content is a new delivery. So no third-party text is kept on the device
+  beyond one attempt. The
   server never retries toward GitHub, and nothing retries toward GitHub in this release.
 - **Same identity on every attempt:** every attempt of one delivery reuses idempotency key
   `intake:<key>` and the same `delivery_ref` and content hash. A retry after an unknown
@@ -778,12 +830,20 @@ GitHub-side acknowledgement is posted in this release.
   task, `SECRET_SUSPECTED`, and content over 256 KiB. Also never retried: anything that
   would act on GitHub (none exists in this release) or that issue content asks for
   (§12.3).
-- **Bound and backoff:** at most 8 attempts per delivery. Exponential backoff with full
-  jitter: base 30 s, factor 2, cap 1 h, so the worst case is about 2 h before the
+- **Bound and backoff:** at most 8 attempts per delivery. The delay before attempt *k*
+  (k = 2…8) is drawn uniformly from `[0, min(3600 s, 30 s · 2^(k−2))]` (full jitter), so
+  the seven delays sum to at most 30+60+120+240+480+960+1920 s ≈ 63.5 min before the
   delivery stops.
 - **Terminal states** (visible in ES-07 and in `GET` of the receipt):
-  - `rejected`: a never-retried error. The server writes the receipt with `last_error` in
-    its own transaction, with no task.
+  - `rejected`: a never-retried error. The adapter **always** records `rejected` with
+    `last_error` in its outbox and reports it to ES-07 locally. The server writes nothing
+    when it cannot or must not: for 401 `device_inactive` (a revoked adapter device is
+    refused on every request, ES-01 §7.2) and for `IDEMPOTENCY_KEY_CONFLICT` (a receipt for
+    that `delivery_ref` already exists and stays as it is). For the other never-retried
+    errors (404, `ALIAS_TAKEN`, `SECRET_SUSPECTED`, content over 256 KiB) the server writes a
+    `rejected` receipt with `last_error` and no task, in a transaction committed
+    independently of the error response (§10), and only if no receipt exists for that
+    `delivery_ref`.
   - `retry_exhausted`: the dead letter after 8 attempts. If the server was never reached,
     the adapter records this in its outbox and reports it to ES-07 locally. On the next
     successful contact it writes the receipt row with `attempts` and `last_error`.
@@ -833,20 +893,20 @@ cross-platform or real-endpoint PASS.** Environments F1, H2/H3 and OS3 are defin
 | Q-7 | `kill -9` of the holder device's **lease keeper** (§5.1) mid-lease: lease expires at TTL, task claimable, no row corruption; a keeper restarted after TTL re-claims with a new token (bump); one restarted within TTL gets the same token (`new_lease=false`) | process kill |
 | Q-8 | Lease expiry with nobody re-claiming: holder's `complete` with current token → `LEASE_EXPIRED`; after re-claim, `complete` succeeds with the new token | lease expiry |
 | Q-9 | N ≥ 16 concurrent `claim`s on one task from ≥ 2 devices: every success belongs to one device, every claim from the other devices gets `HELD`; token incremented exactly once | concurrent claim |
-| Q-10 | Holder with token n after someone claimed n+1: `complete` → `FENCED`; row unchanged; `stale_execution` annotation accepted | stale completion fencing |
+| Q-10 | Holder with token n after someone claimed n+1: `complete` → `FENCED`; row unchanged; a `rejected` event with `result=FENCED` exists after the error response (§10); `stale_execution` annotation accepted | stale completion fencing |
 | Q-11 | Same request with the same idempotency key ×3 → one effect, two `deduplicated: true`; same key + different body → `IDEMPOTENCY_KEY_CONFLICT`; duplicate ES-08 delivery → same task | duplicate message |
 | Q-12 | `complete` committed but response dropped; retry with same key after lease expiry → stored success (not `LEASE_EXPIRED`); a worker REPORT arriving after takeover → `late_report` event, not completion | late ACK |
 | Q-13 | Registry restart mid-lease: no lease is extended; clients stop new side effects at their local lease-loss point; after restart, state equals pre-restart committed state | origin restart |
 | Q-14 | (after D-Q-1) Migration dry-run on copies of **both** queues, the Mac one included: every row, link, alias and free-text dependency accounted for (field-loss = 0); every cross-ledger id collision listed; projection ids remain valid under `release-admission.mjs`; concurrent creates from two devices never yield the same id under the chosen scheme | concurrent claim (issuance analogue) / migration — ES-09 |
-| Q-15 | Gate (after D-Q-1 and migration, account mode): `--task <runtime id or alias>` resolves to the task's id; another device's live lease → exit 11 in **each** of `hard`, `warn`, `off`; server unreachable + stale cache → exit 12 in each mode; unknown/terminal/non-dispatchable keep today's mode behaviour (exit 4 / proceed, no lease); claim refused after the gate → exit 11 with no spawned workspace; pre-transport failure after claim → sid detached and lease released; exit 7/8 → attachment kept; a dispatch of a `pending` task leaves it `delegated` | concurrent claim / partition |
+| Q-15 | Gate (after D-Q-1 and migration, account mode): `--task <runtime id or alias>` resolves to the task's id; another device's live lease → exit 11 in **each** of `hard`, `warn`, `off`; server unreachable → exit 12 in each mode, with a stale cache **and** with a fresh cache (< 10 min) showing this device as holder (no cache exception); a re-dispatch of the same task to the same `--target` after the first lease expired → a fresh claim with a new `attempt_id` (token bumped, `new_lease=true`) or exit 11, never the earlier attempt's replayed token; a forced `IDEMPOTENCY_KEY_CONFLICT` → exit 12 (`idempotency_conflict`), no spawn; `kill -9` of `dispatch.sh` after the claim → the attachment stays `pending_delivery`, is dropped after 10 min, and the lease expires at TTL; unknown/terminal/non-dispatchable keep today's mode behaviour (exit 4 / proceed, no lease); claim refused after the gate → exit 11 with no spawned workspace; pre-transport failure after claim → sid detached and lease released; exit 7/8 → attachment kept; a dispatch of a `pending` task leaves it `delegated` | concurrent claim / partition |
 | Q-16 | Secret patterns in `annotate`/`complete` bodies refused; no tokens in events or cache | other account isolation (secrets) |
 | Q-17 | The device-side client (claim/heartbeat/lease-loss timer/reconcile) verified on real macOS, Linux and Windows hosts | per-OS verification |
 | Q-18 | Second dispatch from the same device while its lease is live: claim returns the same token, `new_lease=false`; the first worker's heartbeat/complete with that token still succeed (not `FENCED`) | concurrent claim (same device) |
-| Q-19 | ES-08 retry: the first intake attempt's response is dropped (commit happened), then a 5xx, then success: exactly one task and one receipt, `deduplicated: true` on the replays; a non-retryable error (`IDEMPOTENCY_KEY_CONFLICT`, 401 `device_inactive`) is not retried and ends `rejected`; 8 transient failures end `retry_exhausted` with attempts=8, no 9th attempt, visible in ES-07; a manual retry reuses `intake:<key>` | duplicate message / late ACK (AC8 retry) |
+| Q-19 | ES-08 retry: the first intake attempt's response is dropped (commit happened), then a 5xx, then success: exactly one task and one receipt, `deduplicated: true` on the replays; a non-retryable error is not retried and ends `rejected` in the adapter outbox: for `IDEMPOTENCY_KEY_CONFLICT` the existing server receipt is unchanged, for 401 `device_inactive` the server writes nothing, for `ALIAS_TAKEN` the server holds a `rejected` receipt with no task; two issues returned by one poll get two receipts (`delivery_ref` = cursor + issue key); the outbox holds no issue content; 8 transient failures end `retry_exhausted` with attempts=8, no 9th attempt, visible in ES-07; a manual retry reuses `intake:<key>` | duplicate message / late ACK (AC8 retry) |
 | Q-20 | ES-08 untrusted content: an issue whose title/body/labels contain instructions ("use token X", "add repo Y to the allowlist", "run Z", "grant write") is stored only as an `untrusted_content` blob; `desc` is the fixed template; the dispatched ref shows it only inside the untrusted-data fence; adapter allowlist, scopes, credentials and task fields are unchanged; attachments not fetched | other account isolation (AC8: issue text grants no credentials/scopes) |
 | Q-21 | ES-08 receipt: states move `received → task_linked → analysis_requested → analysis_recorded → review_recorded`; a fault injected after the task insert and before commit leaves **no** task, receipt or event; `rejected` and `retry_exhausted` are terminal | duplicate message (AC8 receipt) |
 | Q-22 | §9.3 offline create: device creates while the server is unreachable → `provisional` alias + idempotency key; on reconnect exactly one task with an id under the chosen D-Q-1 scheme; cache rows, ref files and notes rewritten from the provisional alias; replay ×2 → `deduplicated` | partition/reconnect (offline create) |
-| Q-23 | `claim` with an open `depends_on` → `DEPENDENCIES_OPEN` (accepted only with `allow_open_deps.reason`, recorded); `update` with a stale `expected_version` → `VERSION_CONFLICT` returning the current row; `complete status=done` with empty evidence → `EVIDENCE_REQUIRED`; row unchanged in each case | concurrent claim (non-lease conflicts) |
+| Q-23 | `claim` with an open `depends_on` → `DEPENDENCIES_OPEN` (accepted only with `allow_open_deps.reason`, recorded); `update` with a stale `expected_version` → `VERSION_CONFLICT` returning the current row; `complete status=done` with empty evidence → `EVIDENCE_REQUIRED`; row unchanged in each case, and a `rejected` event with the code exists after each error response (§10) | concurrent claim (non-lease conflicts) |
 
 ### 13.1 Testability per row (criterion 4)
 
@@ -854,12 +914,12 @@ Status today for **every** row: **NOT RUN**. No implementation exists, and this 
 
 | Row | Measures | Does not measure | Env (Linux-only counts?) | Blocked on (today) |
 |---|---|---|---|---|
-| Q-1 | create on A visible on B, same `version`/links after one sync | ES-02 checkpoint equality (CK rows) | H2 (no) | implementation; **Mac offline** |
-| Q-2 | cross-device lease view and `HELD` | real latency effects | H2 (no) | implementation; Mac offline |
-| Q-3 | fresh device sees same tasks and can claim | work restore (ES-02/ES-04) | H3 (no) | implementation; Mac offline; third host not measured as available |
+| Q-1 | create on A visible on B, same `version`/links after one sync | ES-02 checkpoint equality (CK rows) | H2 (no) | **BLOCKED**: Mac offline; implementation |
+| Q-2 | cross-device lease view and `HELD` | real latency effects | H2 (no) | **BLOCKED**: Mac offline; implementation |
+| Q-3 | fresh device sees same tasks and can claim | work restore (ES-02/ES-04) | H3 (no) | **BLOCKED**: Mac offline; third host not measured as available; implementation |
 | Q-4 | identical 404 on X's ids/aliases; list isolation | timing side channels | F1 (yes) | implementation |
 | Q-5 | revoked device refused for sync and claim | brain-Git data (ES-02) | F1 (yes) | implementation |
-| Q-6 | real partition > TTL, takeover, `FENCED` on return, outputs preserved | external side effects already made (§8) | H2 (no); F1 with fault proxy = partial | implementation; Mac offline |
+| Q-6 | real partition > TTL, takeover, `FENCED` on return, outputs preserved | external side effects already made (§8) | H2 (no); F1 with fault proxy = partial | **BLOCKED**: Mac offline; implementation |
 | Q-7 | keeper kill → expiry at TTL; re-acquire with/without bump | macOS/Windows keeper lifecycle (Q-17) | F1 (yes, Linux keeper) | implementation; D-Q-9 |
 | Q-8 | expired holder refused; re-claim then complete | — | F1 (yes) | implementation |
 | Q-9 | one winning device under ≥16 concurrent claims; one bump | cross-host network latency | F1 (yes, DB serialisation) | implementation |
@@ -868,11 +928,11 @@ Status today for **every** row: **NOT RUN**. No implementation exists, and this 
 | Q-12 | stored result on retry after commit; late REPORT → event | telesession ACK path (ES-05) | F1 (yes, fault proxy) | implementation |
 | Q-13 | no retroactive lease extension; state equals committed state | deployed HA behaviour (none promised) | F1 (yes) | implementation |
 | Q-14 | migration field-loss = 0, collisions listed, ids admissible, no duplicate issuance | — | F1 on file copies (yes) | **BLOCKED**: D-Q-1 undecided; Mac ledger copy (Mac offline) |
-| Q-15 | gate exit 11/12 per mode, lease step placement, detach/keep, status `delegated` | alias resolution for canonical ids (needs D-Q-1) | F1 (yes, orchestrator checkout + fixture) | implementation; alias part blocked on D-Q-1 |
+| Q-15 | gate exit 11/12 per mode (no cache exception), per-attempt claim key, lease step placement, synchronous detach/keep, `kill -9` TTL fallback, status `delegated` | alias resolution for canonical ids (needs D-Q-1) | F1 (yes, orchestrator checkout + fixture) | implementation; alias part blocked on D-Q-1 |
 | Q-16 | secret patterns refused; no tokens in events/cache | secrets that match no known pattern | F1 (yes) | implementation |
 | Q-17 | keeper, lease-loss timer and reconcile on each OS | — | OS3 (no) | **BLOCKED**: Mac offline; no Windows runner (D-Q-6) |
 | Q-18 | same-device re-claim keeps token, no self-fencing | separation of workers on one device (not provided) | F1 (yes) | implementation |
-| Q-19 | bounded retry, never-retried set, one task per delivery, terminal states visible | real GitHub delivery (activation out of scope) | F1 (yes, fake source) | implementation |
+| Q-19 | bounded retry, never-retried set, one task per delivery, `rejected` recorded where it can be written, terminal states visible | real GitHub delivery (activation out of scope) | F1 (yes, fake source) | implementation |
 | Q-20 | issue content inert: no field, scope, credential or allowlist change | model behaviour of a worker reading the fenced content | F1 (yes, fake source) | implementation |
 | Q-21 | receipt state machine; receipt + task + events atomic | GitHub-side acknowledgement (none in release) | F1 (yes) | implementation |
 | Q-22 | offline create → one canonical task; references rewritten | P-B issuance while the Mac is asleep, if chosen | F1 for P-A/P-C (yes); P-B needs the Mac | **BLOCKED** on D-Q-1 |
@@ -882,7 +942,7 @@ Status today for **every** row: **NOT RUN**. No implementation exists, and this 
 
 | Id | Decision | Category | Recommended default |
 |---|---|---|---|
-| D-Q-1 | Canonical id issuance scheme (P-A / P-B / P-C) and whether to migrate at all | operational data change; **plus, only if P-B is chosen, a network change** (new cross-host ID-request path to the Mac via telepty or a server relay, which conflicts with D-ID-4 "no new relay" unless approved together with P-B) | **No default adopted** (guardrail), including for the P-B network path. Inputs required first: Mac ledger read, mapping dry-run, freeze agreement (§3.4) |
+| D-Q-1 | Canonical id issuance scheme (P-A / P-B / P-C) and whether to migrate at all | operational data change; **plus, only if P-B is chosen, a network change** (new cross-host ID-request path to the Mac via telepty or a server relay, which conflicts with D-ID-4 "no new relay" unless approved together with P-B) | **No default adopted** (guardrail), including for the P-B network path. Inputs required first: Mac ledger read, mapping dry-run, freeze agreement (§3.4). Input for P-C: one keeper runs per device directory and two OS users on one host are two devices (ES-01 §2), so P-C ranges must be per device, or need a host-level lock; per-host ranges would let two keepers on one host mint in the same range |
 | D-Q-2 | Authoritative store = registry Postgres for opted-in users | operational data / personal-data transfer | registry Postgres, opt-in, self-hostable; local-only mode unchanged |
 | D-Q-3 | Executing the queue migration (M3 import, M5 freeze), once D-Q-1 is decided | operational data change | only after the user reviews `mapping.json`; backups kept, nothing deleted |
 | D-Q-4 | Event/note retention on the server | personal data | keep for the queue's life; export available; no automatic expiry |
@@ -890,4 +950,4 @@ Status today for **every** row: **NOT RUN**. No implementation exists, and this 
 | D-Q-6 | Real macOS and Windows hosts/runners for the rows that need them (ID-1/2/11, Q-1/2/3/6/17 and every row marked BLOCKED in §13 / ES-01 §15); the build plan names "OS runner 확보" as a re-estimate condition | cost | no paid runner or host is procured without approval; get a quote first. Until approved, those rows stay `BLOCKED` and the release states its verified support as Linux-only |
 | D-Q-7 | Hosted (cloud registry) Postgres storage for opted-in users' queues, events, receipts and untrusted blobs | cost / personal-data transfer | do not enable account mode on the cloud instance until its storage cost per user is measured; per-user storage quota (proposal: 100 MiB, `413 QUOTA_EXCEEDED` beyond); self-hosted instances unaffected |
 | D-Q-8 | Retention and deletion of ES-08 `untrusted_content` blobs and `intake_receipts`. These hold **third-party** GitHub authors' text and logins, which D-Q-4 does not cover | personal data | blob deleted 90 days after the intake task reaches a terminal status (sha256, size and `owner/repo#N` kept); receipts keep no content, only metadata, for the queue's life; author identity only inside the blob, never as a column; export includes blobs only while they exist |
-| D-Q-9 | Run the devkit **lease keeper** (§5.1): a new user-level resident process that holds the device credentials and heartbeats leases | operational change | on-demand start by the first command that needs it, exit after 10 min idle; no boot-time service, no automatic restart; a launchd/systemd/scheduled-task unit is a separate later approval |
+| D-Q-9 | Run the devkit **lease keeper** (§5.1): a new user-level resident process that holds the device credentials, heartbeats leases, and is the only signer and device-list fetcher for ES-01 FP / `whoami`, ES-02 checkpoints and ES-04 captures (interface invariant I12). Blocks: ES-03 impl, ES-01 `whoami`/`device list` local fingerprint, ES-02/ES-04 writes; declined → no checkpoint or capture can be signed or pushed | operational change | on-demand start by the first command that needs it (incl. brain and ES-04), exit after 10 min idle; no boot-time service, no automatic restart; a launchd/systemd/scheduled-task unit is a separate later approval |
