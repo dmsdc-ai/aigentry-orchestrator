@@ -406,7 +406,10 @@ if all hold:
 - E4. anchoring (the §5.4 rule-5 rule applied to endorsements): if the endorser has `revoked_at` and this
   reader first sees the endorsement after that `revoked_at`, the endorsement counts only when anchored —
   already in this reader's pinned/seen set before `revoked_at`, or the endorsed device is also endorsed by a
-  non-revoked trusted device. Otherwise `ENDORSEMENT_REVOKED_ENDORSER_UNANCHORED`.
+  non-revoked trusted device. Otherwise `ENDORSEMENT_REVOKED_ENDORSER_UNANCHORED`. Cost (same as §5.4
+  anchoring, D-8): "revoking a device does not revoke the devices it endorsed" holds on readers that had
+  already counted the endorsement; a fresh device does not trust a device endorsed only by a since-revoked
+  device until a non-revoked trusted device re-endorses it (prompted through the R6 notice).
 
 A device without a counted endorsement is not trusted: it is not a recipient of new records or captures
 (§4.1, ES-04 §4 step 4), its records are `CHECKPOINT_WRITER_UNKNOWN` (ES-04: `RESTORE_WRITER_UNKNOWN`), and
