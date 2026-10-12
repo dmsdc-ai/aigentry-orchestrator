@@ -305,10 +305,16 @@ for it on the new device. If a device reports that the registry lists a differen
 `aigentry-devkit login` on it. If a device was approved without you, delete its trust state (the `trust-state.json`
 file whose folder `aigentry-brain trust refresh` prints) and approve it again yourself. A device that comes back
 after it expired may need one more approval on devices added while it was away. A key change of one of your devices is
-approved from Kkoma registered as a device or from a terminal on a trusted device, not from the approval page alone. A
+approved from Kkoma registered as a device or from a terminal on a trusted device, not from the approval page alone;
+if you have only two computers and Kkoma is not registered as a device, a key change of one is approved only in a
+terminal on the other (turn on approval for it in the browser first if it is off), and on Windows that terminal
+approval is not yet verified, so there you need Kkoma registered as a device. A
 computer you approve from in a terminal needs aigentry-brain installed and set up on it. Only you should do this: brain cannot tell you from a program that drives your terminal or holds a device key,
 so an agent must never approve or answer an approval. Until then the capture stays on this device." A device that
-nobody approves for keeps waiting; it no longer needs a terminal of its own (interface invariants §B.1 "Channels").
+nobody approves for keeps waiting. It needs no terminal of its own for its own approvals, but under ES-01 D-ID-6 (e)
+(B) (recommended, pending; bundle 2l), with two computers and no Kkoma device, its terminal is the only place where
+the other computer's key change is approved (interface invariants §B.1 "Platform scope", "UX cost of (B)"; revision
+11).
 The one terminal step that can remain, and the order that avoids it, are stated in interface invariants §B.1
 "Product consequence" (decision bundle 2i). A
 revoked device keeps Git access to the capture refs until the user revokes its GitHub credential — it can
