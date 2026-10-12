@@ -108,7 +108,7 @@ Matches requirement order line 56 and draft release split R-B (draft line 78).
 | D-5 | Binding the brain repo GitHub account to the aigentry account (ES-01) | 권한 확대 | record binding only; no new GitHub scopes; reuse the user's existing `gh`/git credentials |
 | D-6 | Uploading uncommitted code (including unpushed commits) off the device at all | 개인정보 전송 | allowed only by explicit per-capture command; no automatic/periodic capture in this release |
 | D-7 | Uploading conversation-derived checkpoints: does it need its own opt-in separate from brain's `enableSync` memory consent (`SetupWizard.ts:54`), and which triggers upload automatically (ES-02 N4, §5.1, §7) | 개인정보 전송 | separate explicit opt-in (login or `enableSync` alone never enables it); automatic triggers `manual` + `session_end` only; `compact` and `dispatch_report` off until enabled; `interval` off |
-| D-8 | Revoked device's remaining Git access (S1 known limit, ES-02 §5.3) | 권한 (축소 미완) / 개인정보 | accept as a stated known limit; the revoke flow includes a required user step "revoke this machine's GitHub credential" and shows `git_access: unknown` until the user confirms; aigentry gets no GitHub scope to do it itself |
+| D-8 | Revoked device's remaining Git access (S1 known limit, ES-02 §5.3) | 개인정보 전송 (a revoked machine can still pull ciphertext and metadata) | accept as a stated known limit; the revoke flow includes a required user step "revoke this machine's GitHub credential" and shows `git_access: unknown` until the user confirms; aigentry gets no GitHub scope to do it itself |
 | D-9 | Key-directory trust: is a registry-listed device a recipient immediately, or only after an existing trusted device endorses it (ES-02 §5.5 R5/R6) | 개인정보 전송 | endorsement required (one confirmation per new device, on any trusted device, after comparing fingerprints) + recipient-change notice; registry-only is the fallback if the user prefers fewer steps and accepts that a compromised registry can read new records |
 
 Technical items the orchestrator can decide without the user (Rule 47 §1): record layout, cursor design,
@@ -118,7 +118,7 @@ JCS canonicalisation, error codes, detector list, freshness defaults.
 
 | Area | Finding that changes the estimate | Direction |
 |---|---|---|
-| ES-02 | needs new SyncBackend primitives, CheckpointStore/Index, fail-closed crypto, ES-01-based recipients + rekey pass, MCP tools, `brain_context_resume` extension, secret scanner (none exists), orchestrator/devkit triggers, 15 test rows | upper half: **6–9** (scanner shared with ES-04 counted here) |
+| ES-02 | needs new SyncBackend primitives, CheckpointStore/Index, fail-closed crypto, ES-01-based recipients + rekey pass, MCP tools, `brain_context_resume` extension, secret scanner (none exists), orchestrator/devkit triggers, 21 test rows after fix cycle 1 | upper half: **6–9** (scanner shared with ES-04 counted here) |
 | ES-04 | no existing capture code in devkit; bundle/shelf/worktree handling, preview/journal/rollback, runtime manifest detectors for several ecosystems, per-OS FS checks | upper half or above: **9–13**; per-OS verification blocked on runners |
 | ES-07 | data model only now; PTY hop has no evidence source (telepty not read); depends on PR3 merge | data model + view **2–3** within the 4–8 OS/diagnostics bucket; no reduction of the OS part |
 | Cross-cutting | ES-01 user/device + key distribution is a hard prerequisite for both; registry not read — unknown | estimate blocked until ES-01 design |
