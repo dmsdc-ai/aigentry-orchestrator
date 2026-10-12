@@ -65,7 +65,8 @@ write is unobservable" is **not** a finding); real cross-host behaviour (Mac off
 - P4. Diagnostics are computed on read; they are not stored as authority. A cache, if any, is labelled
   with its `fetched_at`.
 - P5. `[REQ line 12]` `[DRAFT line 9, 27]` Works from any terminal on the telepty daemon; no GUI typing,
-  no cmux dependency; a copied log file or an SSH connection alone never claims completion. Applied here:
+  no cmux dependency; a copied log file or an SSH connection alone never claims completion. New proposal (needs
+  review), applied here:
   diagnostics read only the telesession ledger/status API, telepty daemon APIs and the ES-01 registry
   (the `evidence.source` enum, §3); no hop is derived from a GUI, a cmux pane, screen scraping, a copied
   log file or the output of an SSH session. A hop whose only available evidence would be one of those is
