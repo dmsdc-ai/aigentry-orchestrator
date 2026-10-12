@@ -173,9 +173,18 @@ requirement asks to state which facts are original vs summary (line 39), which M
 
 #### 3.2 Secret exclusion (both modes; `[REQ line 49]` secrets excluded from sync — detector set and fail-closed rule are new proposals)
 
-- A content secret scanner runs on every text field (`summary`, `decisions`, `constraints`,
-  `open_items`, `fragments[].summary`, `fragments[].raw`) **before** encryption. brain has none today
-  (`capture-tool.ts:38-56` is an argument allowlist) — this is new work.
+- A content secret scanner runs on **every string value** of the canonical record — not a field list:
+  free text (`summary`, `decisions[].text`, `decisions[].evidence`, `constraints`, `open_items`,
+  `fragments[].summary`, `fragments[].raw`), refs (`evidence[].ref`, `task_refs`, `resumed_from`) and
+  metadata (`source_session.*`, any other string) — **before** integrity, signing and encryption. brain has
+  none today (`capture-tool.ts:38-56` is an argument allowlist) — this is new work.
+- URL-shaped values (`evidence[]` of kind `url`/`pr`, URLs inside `decisions[].evidence` and other refs)
+  have userinfo (`user:pass@`), the query string and the fragment stripped by default, before the scan;
+  keeping them is a per-ref user choice recorded in the ref (`keep_query: true`), and the kept part is still
+  scanned.
+- A hit in free text or a ref is redacted as below. A hit in a key-forming identifier (`user_id`,
+  `device_id`, `checkpoint_id`, `source_session.session_ref`/`project_id`) cannot be redacted without breaking
+  the key, so the write is refused (`CHECKPOINT_SECRET_IN_IDENTIFIER`, field and detector named only).
 - Minimum detector set: private-key PEM blocks, age secret keys (`AGE-SECRET-KEY-`, cf.
   `src/crypto/AgeCrypto.ts:43`), cloud provider key patterns, `Authorization: Bearer`/JWT shapes,
   `password=`/`token=`/`secret=` assignments, high-entropy strings ≥ 32 chars adjacent to such names,
@@ -468,6 +477,7 @@ and implemented by ES-05. ES-02 only guarantees that the id is stable and resolv
 `CHECKPOINT_ENCRYPTION_FAILED`, `CHECKPOINT_KEY_CONFLICT`, `CHECKPOINT_INTEGRITY_FAILED`,
 `CHECKPOINT_USER_MISMATCH`, `CHECKPOINT_PENDING_KEY`, `CHECKPOINT_UNSUPPORTED_VERSION`,
 `CHECKPOINT_FORKED_CHOICE_REQUIRED`, `CHECKPOINT_SYNC_LOCAL_ONLY` (informational),
+`CHECKPOINT_SECRET_IN_IDENTIFIER`,
 `CHECKPOINT_SIGNATURE_INVALID`, `CHECKPOINT_WRITER_UNKNOWN`, `CHECKPOINT_REVOKED_WRITER_UNANCHORED`;
 endorsements (§5.6): `ENDORSEMENT_PATH_MISMATCH`, `ENDORSEMENT_INVALID`, `ENDORSEMENT_AFTER_REVOKE`,
 `ENDORSEMENT_REVOKED_ENDORSER_UNANCHORED`.
@@ -494,7 +504,7 @@ writes and reads require ES-01 (§5); none of them measures the real ES-01 integ
 | CK-02 | Incremental cursor | B already synced N records; A writes 3 more | B's pass decrypts exactly 3 new files (counted), `remote_commit` advances; with a shallow clone the `ls-tree` fallback yields the same set | cursor delta = exactly the new files; shallow-clone fallback yields the same set | performance on large brain repos; real Git host | Linux fixture (local bare remote, stub ES-01 list) | — |
 | CK-03 | Third fresh device restore | C fresh install + ES-01 login/register; case (a) records written after C registered; case (b) older records with A online for rekey; case (c) older records with A/B offline | (a) restore succeeds once C is trusted (§5.5 R5); (b) succeeds after rekey sibling appears; (c) `CHECKPOINT_PENDING_KEY` listing rekey-capable devices — never empty context reported as success | fresh-device readability rules (a)/(b)/(c) and the honest `PENDING_KEY` report | real install on another OS (ES-06) | BLOCKED | ES-01 (registration, `age_recipient` R2, endorsement R5) |
 | CK-04 | Other-account isolation | user U2 on device D2 obtains (by copy) U1's checkpoint file | decrypt fails or `CHECKPOINT_USER_MISMATCH`; U2's list/resume never shows U1 data; no enumeration of U1 project keys through any tool; a record U2 signs and pushes into U1's repo (U2 given push access) is rejected by U1's readers (`CHECKPOINT_WRITER_UNKNOWN`) | the three isolation barriers and reader-side rejection of a foreign writer | GitHub ACL behaviour of a real host | BLOCKED | ES-01 (two real users, authenticated list R3) |
-| CK-05 | Secrets never in checkpoints | fixture transcript with synthetic PEM, age secret key, bearer token, `.env` lines; both modes | stored plaintext (decrypted by the tester) contains `[REDACTED:*]` and none of the fixture secrets; scanner disabled → `CHECKPOINT_REDACTION_UNAVAILABLE`, no file written | the detector set catches the fixture secrets; fail-closed when the scanner is missing | false-negative rate on real secrets (guarantee is "scanned with vN") | Linux fixture | — |
+| CK-05 | Secrets never in checkpoints | fixture transcript with synthetic PEM, age secret key, bearer token, `.env` lines; both modes; an `evidence` ref of kind `url` `https://u:synthpass@host/x?token=<synthetic>` and a `decisions[].evidence` URL with `access_token=<synthetic>`; a `source_session.project_id` whose URL path segment carries a synthetic token (survives credential stripping) | stored plaintext (decrypted by the tester) contains `[REDACTED:*]` and none of the fixture secrets (0 grep hits, also in brain logs and error output); the evidence URLs are stored without userinfo and query; the identifier case → `CHECKPOINT_SECRET_IN_IDENTIFIER`, no file written; scanner disabled → `CHECKPOINT_REDACTION_UNAVAILABLE`, no file written | the detector set catches the fixture secrets in every string field incl. refs and URLs; URL stripping; no matched text in logs; fail-closed when the scanner is missing | false-negative rate on real secrets (guarantee is "scanned with vN") | Linux fixture | — |
 | CK-06 | Origin restart | kill the writer between seq fsync and file write; restart | next write uses seq+1 (gap allowed, reuse forbidden); no partial file committed; index rebuilds from tree | seq never reused, no partial commit after `kill -9`, index rebuild | power loss / file-system fsync guarantees | Linux fixture | — |
 | CK-07 | Fork + user choice | A and B both resume from X offline, each writes; then sync | both heads visible on both devices; resume without id → `CHECKPOINT_FORKED_CHOICE_REQUIRED` + heads; choosing B's head writes next record with `parents:[B-head]`; A's head preserved | fork detection, head listing, explicit choice, no silent loss | a real partition between two hosts | Linux fixture (two local clones, stub ES-01 list) | real two-host variant: ES-01 |
 | CK-08 | Original vs summary marking | M1 and M2 records | M1 restore contains no `[original …]` blocks; M2 marks `original` only when the hash verifies; tampered raw text → that fragment downgraded to `unavailable` and integrity failure reported | provenance marking original/summary/unavailable and tamper downgrade | faithfulness or quality of summaries | Linux fixture | — |

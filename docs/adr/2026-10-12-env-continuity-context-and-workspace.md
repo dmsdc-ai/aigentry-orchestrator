@@ -51,7 +51,7 @@ review. Tags `[REQ]`/`[DRAFT]`/`[EXISTING]` mark statements that restate an exis
 | A9 | Restore default = **new worktree**, after preview, conflict detection and a preserve ref/copy + journal; runtime recreate commands are printed, not run | `[REQ line 41, 51]` no original loss |
 | A10 | Diagnostics = read-only derived view attached optionally to `telesession_request_status`; `completed` only from the ledger; access health in a separate object with `implies_request_state:false` | `[REQ line 44]`, `[EXISTING e2e-delivery-protocol.md:142]` |
 | A11 | ES-02 ids link to telesession via a separate `origin_checkpoint_id` field owned by ES-05 (never the ledger's `checkpoint` field) | finding 5 naming collision |
-| A12 | Shared secret detector set for ES-02 and ES-04, fail-closed when unavailable | finding 3; `[REQ line 49]` |
+| A12 | Shared secret detector set for ES-02 and ES-04, applied to every string value that leaves the device (checkpoint record incl. evidence refs/URLs; capture files, patches, unpushed range and the manifest itself) before signing and encryption; URL userinfo/query stripped by default; fail-closed when unavailable | finding 3; `[REQ line 49]` |
 
 ## 3. Alternatives rejected
 

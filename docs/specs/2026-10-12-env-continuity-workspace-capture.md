@@ -84,6 +84,7 @@ the user; macOS/Windows file-system behaviour (case folding, symlinks, path leng
   "runtime": Runtime,
   "nonportable": [ NonPortable ],
   "limits": { "max_file_bytes", "max_total_bytes", "applied": bool },
+  "redaction": { "scanner_version", "findings_dropped": int },
   "integrity": { "alg": "sha256", "canonical": "jcs", "content_sha256", "bundle_sha256" },
   "signature": { "alg": "ed25519", "device_id", "sig" }
 }
@@ -153,6 +154,16 @@ target already gets from the remote; their **uncommitted** modifications are exc
   set as ES-02 §3.2. A finding excludes the whole file (`secret_suspected`) — no partial redaction of
   code (a redacted source file would restore as broken code). The user can override per file only by
   adding it to a project allow-list, which is itself recorded in the manifest.
+- The manifest itself is scanned too: **every string value** of the canonical manifest (§2) — user/derived
+  free text (`env[].note`, a `secret_manager_ref` supply value, `services[].how_to_recreate`,
+  `nonportable[].detail`/`recreate_hint`, `config_schema[].ref`), URLs (`remote_url`, other remotes,
+  `submodules[].url`) and every other string — before integrity, signing and encryption, with the same
+  detector set. URL values have userinfo, query string and fragment stripped by default before the scan
+  (keeping a query is a per-value user choice, still scanned). A hit in a free-text or URL value replaces the
+  match with `[REDACTED:<detector>]` and is counted in `redaction: {scanner_version, findings_dropped}` (a
+  manifest field); a hit in a path of a captured file excludes that file (`secret_suspected`); a hit in a
+  key-forming identifier (`capture_id`, `user_id`, `device_id`) refuses the capture
+  (`CAPTURE_SECRET_IN_IDENTIFIER`). Findings name the field and detector only.
 - Scanner unavailable → capture fails closed (`CAPTURE_SCAN_UNAVAILABLE`).
 - Defaults: `max_file_bytes` 5 MiB, `max_total_bytes` 50 MiB per capture (bundle after compression).
   Files over the per-file limit are excluded (`size`); if the total is exceeded the capture stops with
@@ -194,7 +205,7 @@ Symlinked directories are never traversed (prevents capturing outside the root).
    untracked files (temporary index via `GIT_INDEX_FILE`), never `git stash push`.
 3. Resolve `base` and scan `base..HEAD` (§3.4); on a refusal nothing of that repo is bundled. Otherwise build
    `git bundle` containing `base..HEAD` (unpushed commits) + the shelf commit(s).
-4. Write manifest, compute integrity, sign (§2), encrypt bundle + manifest (age, recipients = user's
+4. Write manifest, scan every string value of it (§3.2), compute integrity, sign (§2), encrypt bundle + manifest (age, recipients = user's
    active, trusted devices per ES-02 §5.5–§5.6, fail-closed — no plaintext fallback, cf. brain
    `ProfileFormat.ts:160-181` which does fall back).
 5. Store (§5); print a summary: captured repos, excluded paths with reasons, non-portable items, size.
@@ -269,7 +280,7 @@ the journal is detected and the tool offers resume or rollback; it never re-appl
 
 ## 7. Error codes
 `CAPTURE_IDENTITY_MISSING`, `CAPTURE_SCAN_UNAVAILABLE`, `CAPTURE_ENCRYPTION_FAILED`, `CAPTURE_TOO_LARGE`,
-`CAPTURE_NOT_A_REPO`, `CAPTURE_SECRET_IN_UNPUSHED_COMMIT`, `CAPTURE_BASE_UNDEFINED`, `RESTORE_INTEGRITY_FAILED`, `RESTORE_USER_MISMATCH`, `RESTORE_PENDING_KEY`,
+`CAPTURE_NOT_A_REPO`, `CAPTURE_SECRET_IN_UNPUSHED_COMMIT`, `CAPTURE_BASE_UNDEFINED`, `CAPTURE_SECRET_IN_IDENTIFIER`, `RESTORE_INTEGRITY_FAILED`, `RESTORE_USER_MISMATCH`, `RESTORE_PENDING_KEY`,
 `RESTORE_REMOTE_MISMATCH`, `RESTORE_HEAD_UNAVAILABLE`, `RESTORE_PATCH_CONFLICT`,
 `RESTORE_FS_INCOMPATIBLE`, `RESTORE_JOURNAL_PENDING`, `RESTORE_SIGNATURE_INVALID`, `RESTORE_WRITER_UNKNOWN`,
 `RESTORE_DEVICE_REVOKED`.
@@ -288,7 +299,7 @@ writes and reads require ES-01 (§4, §6.1); none of them measures the real ES-0
 | ID | Criterion | Setup | Expected | Measures | Does not measure | Runnable now | Blocked on |
 |---|---|---|---|---|---|---|---|
 | WS-01 | `[REQ line 51]` Uncommitted conflict | target checkout has its own uncommitted edits to a file also changed in the capture | preview lists the conflict; preserve ref + copies created before any write; restore lands in a new worktree; target's original edits byte-identical afterwards | preserve-before-write, new-worktree default, originals byte-identical | macOS/Windows file systems; large repos | Linux fixture (two local clones) | — |
-| WS-02 | `[REQ line 51]` Excluded files | source has `.env`, `id_ed25519`, a 6 MiB untracked file, a file with a synthetic AWS key, `node_modules/` | none of them in the decrypted bundle; all listed in `excluded[]` with reasons; tester greps bundle for the fixture secrets → 0 hits | deny-list, size and detector exclusions in the working tree | false negatives on real secrets | Linux fixture | — |
+| WS-02 | `[REQ line 51]` Excluded files | source has `.env`, `id_ed25519`, a 6 MiB untracked file, a file with a synthetic AWS key, `node_modules/`; manifest inputs: a synthetic key in an `env[].note`, a synthetic token as a `secret_manager_ref` value, and a non-origin remote `https://u:synthpass@host/r.git?token=<synthetic>` | none of the files in the decrypted bundle; all listed in `excluded[]` with reasons; the manifest carries `[REDACTED:*]` in place of the note/ref secrets, the remote URL without userinfo and query, `redaction.findings_dropped` ≥ 2; tester greps the decrypted bundle **and** decrypted manifest (and logs) for the fixture secrets → 0 hits | deny-list, size and detector exclusions in the working tree; every-string manifest scan and URL stripping | false negatives on real secrets | Linux fixture | — |
 | WS-02b | `[REQ line 41, 49]` Secrets in unpushed commits; no upstream | repo R1: an unpushed commit adds a synthetic AWS key in `src/cfg.js`, a later unpushed commit deletes it; repo R2: committed `.env` in an unpushed commit; repo R3: branch with no upstream, remote default branch present; repo R4: no remote, no `--base` | R1, R2: `CAPTURE_SECRET_IN_UNPUSHED_COMMIT` with commit + path + detector, no R1/R2 object in the decrypted bundle (tester greps for the fixture secret → 0 hits, also in logs); R3: `base_source: merge_base_default`, bundle holds only commits after the merge-base; R4: `CAPTURE_BASE_UNDEFINED`, metadata only; other repos captured normally | unpushed-range scan, per-repo refusal, base resolution, no matched text in logs | false negatives; remote default-branch configurations beyond the fixture | Linux fixture (local bare remotes) | — |
 | WS-03 | `[REQ line 51]` Non-portable manifest | source has an absolute path in config, a `.so` build output, a dev server listening on a port, CUDA in lock | each appears in `nonportable[]` with the right disposition; restore performs no port/process/GPU action and prints hints | detection and disposition of the listed non-portable kinds on Linux | macOS `lsof` / Windows `netstat` detection; real GPU runtimes | Linux fixture | per-OS variants: macOS/Windows runners |
 | WS-04 | `[REQ line 51]` Restore failure preserves originals | inject failure after preserve and after the 2nd of 4 apply steps; also `kill -9` mid-apply | journal shows the failed step; originals unchanged; rollback returns the target to its pre-restore tree (hash of `git status` + file hashes equal) | journal, stop-on-failure, rollback to the pre-restore tree | power loss; Windows file locking | Linux fixture | — |
