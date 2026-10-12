@@ -92,7 +92,8 @@ the user; macOS/Windows file-system behaviour (case folding, symlinks, path leng
 | `path_rel` | path relative to the workspace root; absolute paths and home directories are never stored |
 | `remote_url` | `origin` fetch URL with userinfo/credentials stripped; other remotes listed by name + stripped URL |
 | `branch`, `head_sha`, `upstream`, `ahead`, `behind` | from git; detached HEAD recorded as `branch: null` |
-| `unpushed_commits` | count + range `<upstream>..HEAD`; included in the bundle (§5) because the target cannot fetch them |
+| `unpushed_commits` | count + range `<base>..HEAD` (`base` = upstream, else §3.4); scanned (§3.4) and, only if the scan passes, included in the bundle (§5) because the target cannot fetch them; `base_source: "upstream"\|"merge_base_default"\|"user"` |
+| `refused` | `null` \| `{code, hits: [{commit, path, detector}]}` — set when the repo's bundle is refused (§3.4); hits never contain matched text |
 | `worktrees[]` | `{path_rel, branch, head_sha, locked: bool}` from `git worktree list --porcelain`; each worktree is captured as its own working-tree state |
 | `staged_patch`, `unstaged_patch` | `{sha256, bytes, files: n, binary_files: [path]}`; produced with `git diff --binary --cached` / `git diff --binary`; stored in the bundle, not in the manifest |
 | `untracked[]` | `{path, bytes, sha256, mode}` from `git ls-files --others --exclude-standard` (ignored files are never captured) |
@@ -149,6 +150,7 @@ target already gets from the remote; their **uncommitted** modifications are exc
 - Defaults: `max_file_bytes` 5 MiB, `max_total_bytes` 50 MiB per capture (bundle after compression).
   Files over the per-file limit are excluded (`size`); if the total is exceeded the capture stops with
   `CAPTURE_TOO_LARGE` and a list of the largest items — it never silently drops files to fit.
+- The unpushed commit range is scanned too (§3.4).
 
 ### 3.3 Symlinks
 Never followed. Recorded as `{path, target}`. `disposition`: `in_repo_relative` (restored as a symlink),
@@ -156,13 +158,35 @@ Never followed. Recorded as `{path, target}`. `disposition`: `in_repo_relative` 
 `windows_unsupported` (decided at restore when symlink creation is not permitted on the target).
 Symlinked directories are never traversed (prevents capturing outside the root).
 
+### 3.4 Unpushed commits (`[REQ line 41, 49]` no automatic secret copy — base rule, scan and refusal are new proposals)
+- **Base.** `base` = the upstream tip when the branch has an upstream. Without an upstream: `git merge-base
+  HEAD <remote>/<default>` where `<default>` is read from `refs/remotes/<remote>/HEAD`. If that ref is absent
+  or the repo has no remote, the user names a base (`--base <ref>`), which must be contained in a
+  remote-tracking ref (`git branch -r --contains`). With none of these the repo is not bundled
+  (`CAPTURE_BASE_UNDEFINED`; metadata only, listed in the summary). The whole history is never bundled
+  implicitly.
+- **Scan.** Before the bundle is built, the range `base..HEAD` is checked with the same rules as the working
+  tree: (a) every path added or modified by any commit in the range (`git log --format= --name-only
+  base..HEAD`, including paths deleted again by a later commit — their blobs are still in the bundle)
+  against the §3.1 secret set; (b) every blob reachable from `HEAD` and not from `base` (`git rev-list
+  --objects base..HEAD`, blobs only) with the §3.2 detector set; (c) the commit messages of the range with
+  the detector set. Blobs count against the §3.2 size limits.
+- **Refusal.** Commits cannot be partially redacted (a rewrite changes their ids and the user's branch). On
+  any hit the bundle for that repo is refused (`CAPTURE_SECRET_IN_UNPUSHED_COMMIT`): the repo entry keeps its
+  metadata with `refused: {code, hits[{commit, path, detector}]}`, nothing from that repo (unpushed commits
+  or shelf) is stored, and the other repos of the capture continue. Capture never rewrites history; the
+  remedy (amend/rebase/drop the commit) is the user's.
+- Scanner findings, error messages and logs name the commit, path and detector only; they never carry the
+  matched text (requirement line 49 "로그").
+
 ## 4. Capture flow
 
 1. Preflight: ES-01 identity, scanner, encryption key available; repo is a git work tree.
 2. For each repo/worktree: collect §2.1 metadata; build a **shelf commit** without touching the user's
    index or working tree: `git stash create` semantics (tracked changes) plus a separate tree for
    untracked files (temporary index via `GIT_INDEX_FILE`), never `git stash push`.
-3. Build `git bundle` containing `upstream..HEAD` (unpushed commits) + the shelf commit(s).
+3. Resolve `base` and scan `base..HEAD` (§3.4); on a refusal nothing of that repo is bundled. Otherwise build
+   `git bundle` containing `base..HEAD` (unpushed commits) + the shelf commit(s).
 4. Write manifest, compute integrity, encrypt bundle + manifest (age, recipients = user's active devices,
    fail-closed — no plaintext fallback, cf. brain `ProfileFormat.ts:160-181` which does fall back).
 5. Store (§5); print a summary: captured repos, excluded paths with reasons, non-portable items, size.
@@ -227,7 +251,7 @@ the journal is detected and the tool offers resume or rollback; it never re-appl
 
 ## 7. Error codes
 `CAPTURE_IDENTITY_MISSING`, `CAPTURE_SCAN_UNAVAILABLE`, `CAPTURE_ENCRYPTION_FAILED`, `CAPTURE_TOO_LARGE`,
-`CAPTURE_NOT_A_REPO`, `RESTORE_INTEGRITY_FAILED`, `RESTORE_USER_MISMATCH`, `RESTORE_PENDING_KEY`,
+`CAPTURE_NOT_A_REPO`, `CAPTURE_SECRET_IN_UNPUSHED_COMMIT`, `CAPTURE_BASE_UNDEFINED`, `RESTORE_INTEGRITY_FAILED`, `RESTORE_USER_MISMATCH`, `RESTORE_PENDING_KEY`,
 `RESTORE_REMOTE_MISMATCH`, `RESTORE_HEAD_UNAVAILABLE`, `RESTORE_PATCH_CONFLICT`,
 `RESTORE_FS_INCOMPATIBLE`, `RESTORE_JOURNAL_PENDING`.
 
@@ -237,6 +261,7 @@ the journal is detected and the tool offers resume or rollback; it never re-appl
 |---|---|---|---|
 | WS-01 | `[REQ line 51]` Uncommitted conflict | target checkout has its own uncommitted edits to a file also changed in the capture | preview lists the conflict; preserve ref + copies created before any write; restore lands in a new worktree; target's original edits byte-identical afterwards |
 | WS-02 | `[REQ line 51]` Excluded files | source has `.env`, `id_ed25519`, a 6 MiB untracked file, a file with a synthetic AWS key, `node_modules/` | none of them in the decrypted bundle; all listed in `excluded[]` with reasons; tester greps bundle for the fixture secrets → 0 hits |
+| WS-02b | `[REQ line 41, 49]` Secrets in unpushed commits; no upstream | repo R1: an unpushed commit adds a synthetic AWS key in `src/cfg.js`, a later unpushed commit deletes it; repo R2: committed `.env` in an unpushed commit; repo R3: branch with no upstream, remote default branch present; repo R4: no remote, no `--base` | R1, R2: `CAPTURE_SECRET_IN_UNPUSHED_COMMIT` with commit + path + detector, no R1/R2 object in the decrypted bundle (tester greps for the fixture secret → 0 hits, also in logs); R3: `base_source: merge_base_default`, bundle holds only commits after the merge-base; R4: `CAPTURE_BASE_UNDEFINED`, metadata only; other repos captured normally |
 | WS-03 | `[REQ line 51]` Non-portable manifest | source has an absolute path in config, a `.so` build output, a dev server listening on a port, CUDA in lock | each appears in `nonportable[]` with the right disposition; restore performs no port/process/GPU action and prints hints |
 | WS-04 | `[REQ line 51]` Restore failure preserves originals | inject failure after preserve and after the 2nd of 4 apply steps; also `kill -9` mid-apply | journal shows the failed step; originals unchanged; rollback returns the target to its pre-restore tree (hash of `git status` + file hashes equal) |
 | WS-05 | Env without values | project with `.env.example` and code reading 3 env vars | `env[]` has names + required + supply path; the manifest schema has no value field; no value from the source environment appears anywhere in the capture |

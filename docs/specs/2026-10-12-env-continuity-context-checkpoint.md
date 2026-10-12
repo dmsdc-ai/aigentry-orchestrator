@@ -165,7 +165,8 @@ requirement asks to state which facts are original vs summary (line 39), which M
 - Minimum detector set: private-key PEM blocks, age secret keys (`AGE-SECRET-KEY-`, cf.
   `src/crypto/AgeCrypto.ts:43`), cloud provider key patterns, `Authorization: Bearer`/JWT shapes,
   `password=`/`token=`/`secret=` assignments, high-entropy strings ≥ 32 chars adjacent to such names,
-  `.env`-style `NAME=value` lines whose NAME matches the env deny-list of ES-04 §3.4.
+  `.env`-style `NAME=value` lines whose NAME contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD` or
+  `CREDENTIAL` (ES-04 has no env-name deny-list; its §3.1 secret set covers the files themselves).
 - A finding replaces the match with `[REDACTED:<detector>]`; in M2 the fragment `sha256` is then the
   hash of the redacted text and `raw_original_sha256` is omitted (an un-redacted hash of a secret
   is itself a guessing oracle for short secrets). `privacy.redaction.findings_dropped` counts them.
