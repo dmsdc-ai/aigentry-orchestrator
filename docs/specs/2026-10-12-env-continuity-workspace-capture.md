@@ -293,9 +293,13 @@ path for an artefact kept 14 days. **Upload can wait indefinitely** (§4 step 5)
 "a capture is uploaded only after you have approved this device once, and, after any of your devices is added or
 rotates its key, only after you approve that change; there is no timeout. You approve in Kkoma, on the registry
 approval page, or in a terminal on one of your trusted devices; a new device is approved from a device you already
-trust. Only you should do this: brain cannot tell you from a program that drives your terminal or holds a device key,
+trust. Kkoma can do that only if it is registered as a device and every device trusts it: register Kkoma first, or
+approve Kkoma once from a terminal on the computer you registered first (turn on approval for that computer in the
+browser first if it is off); after that, Kkoma alone is enough. Only you should do this: brain cannot tell you from a program that drives your terminal or holds a device key,
 so an agent must never approve or answer an approval. Until then the capture stays on this device." A device that
-nobody approves for keeps waiting; it no longer needs a terminal of its own (interface invariants §B.1 "Channels"). A
+nobody approves for keeps waiting; it no longer needs a terminal of its own (interface invariants §B.1 "Channels").
+The one terminal step that can remain, and the order that avoids it, are stated in interface invariants §B.1
+"Product consequence" (decision bundle 2i). A
 revoked device keeps Git access to the capture refs until the user revokes its GitHub credential — it can
 fetch ciphertext (decrypting captures written before the revoke) and push refs, which readers reject (§6.1)
 (ES-02 §5.3 known limit, ADR D-8).
