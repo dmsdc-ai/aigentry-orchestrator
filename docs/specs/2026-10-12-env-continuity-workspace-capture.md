@@ -294,8 +294,12 @@ path for an artefact kept 14 days. **Upload can wait indefinitely** (§4 step 5)
 rotates its key, only after you approve that change; there is no timeout. You approve in Kkoma, on the registry
 approval page, or in a terminal on one of your trusted devices; a new device is approved from a device you already
 trust. Kkoma can do that only if it is registered as a device and every device trusts it: register Kkoma first, or
-approve Kkoma once from a terminal on the computer you registered first (turn on approval for that computer in the
-browser first if it is off); after that, Kkoma alone is enough. Only you should do this: brain cannot tell you from a program that drives your terminal or holds a device key,
+approve Kkoma from a terminal on a computer you registered earlier (turn on approval for that computer in the
+browser first if it is off); every computer you add before Kkoma is trusted also needs that terminal step, so register
+Kkoma right after your first computer if you want only one; after that, Kkoma alone is enough. Before you approve a new
+device, compare the fingerprint shown with the one that device prints (`aigentry-devkit login` or `aigentry-devkit
+whoami` on it). A first computer set up without an interactive console is approved from Kkoma or the approval page (or
+from its own terminal after you turn approval on for it). Only you should do this: brain cannot tell you from a program that drives your terminal or holds a device key,
 so an agent must never approve or answer an approval. Until then the capture stays on this device." A device that
 nobody approves for keeps waiting; it no longer needs a terminal of its own (interface invariants §B.1 "Channels").
 The one terminal step that can remain, and the order that avoids it, are stated in interface invariants §B.1

@@ -49,6 +49,17 @@
   device: registered first, or endorsed once from a trusted computer's terminal), and a Kkoma device has defined
   obligations (§B.1 "Channels", "Product consequence"); plus the round-6 non-blocking items (anchor candidates must
   be pinned, V6 "active at `approved_at`", deny and `can_approve` availability, registry-computed `S`).
+- Revision 8 (reconciliation cycle 8, 2026-10-13, after joint review round 7 of ES-01/03 `35c4d78` and ES-02/04/07
+  `5771e44`): (1) the bootstrap approver compares a recipient only for a device that is `active` in `S` and in its
+  own `T`, and refuses only while its **own** I5 hold condition holds for that device, which is exactly the
+  condition under which its own refresh creates that device's `recipient_accept` request; a `bootstrap` pins a
+  recipient only for the devices whose status in `S` is `active`, and the status is bound in `scope_digest`; so a
+  device that rotated and was then revoked, expired, or rotated while untrusted on the approver never blocks a
+  bootstrap (§B.1 "Request", approver table, "Channels", I5); (2) a Kkoma device signs only after a user
+  verification on its own approval screen, never from a message, notification, deep link, automation or an
+  interface reachable by the orchestrator or agents (KK-4); plus the round-7 non-blocking items (standing denials,
+  the bootstrap override narrowed and fingerprint-based, audit of untrusted bootstrap approvers, the per-computer
+  terminal step and the `whoami` check stated, seq floor from approvals, own-key check, self-audit wording).
 - Why: the trust/revocation rules were patched case by case in two spec sets, and every review round found a new
   gap between them. This document is the **single model** both sets cite. A rule in ES-01, ES-02 or ES-04 that
   touches trust, recipients, revocation, anchors or pushes must cite an invariant here. If it contradicts one,
@@ -168,11 +179,12 @@ approval** for it in a fresh list. An approval is a registry record created for 
   anchor, endorse, recipient_accept}`, `reader_device_id` (the device the approval applies to: `r` for `bootstrap`
   and `anchor`; null for `endorse` and `recipient_accept`, which apply to every reader), `target_device_id`,
   `target_fp`, `target_age_recipient_seq`, `target_age_recipient_sha256`, `scope_digest` (for `bootstrap`: SHA-256 of
-  the UTF-8 lines `device_id|fp|age_recipient_seq|age_recipient_sha256` of every device of the set `S` to be pinned,
-  sorted by `device_id`, each ending in `\n`, followed by the line `root|<root device_id>`; empty otherwise; a device
-  without a recipient has empty seq and hash fields), `scope` (for `bootstrap`: `root_device_id` and, per device of
-  `S`, `device_id`, `fp`, `age_recipient_seq`, `age_recipient_sha256` and the display fields `name`, `os`, server
-  `created_at`; for the other actions the same per-device entry for the target), `requested_by`, server-clock
+  the UTF-8 lines `device_id|fp|status|age_recipient_seq|age_recipient_sha256` of every device of the set `S` to be
+  pinned, sorted by `device_id`, each ending in `\n`, followed by the line `root|<root device_id>`; empty otherwise; a
+  device without a recipient has empty seq and hash fields; `status ∈ {active, expired, revoked}` as listed),
+  `scope` (for `bootstrap`: `root_device_id` and, per device of `S`, `device_id`, `fp`, `status`,
+  `age_recipient_seq`, `age_recipient_sha256` and the display fields `name`, `os`, server `created_at`; for the
+  other actions the same per-device entry for the target), `requested_by`, server-clock
   `issued_at` and `expires_at` = `issued_at` + the validity window (technical value, proposed 15 minutes). Every
   channel recomputes `scope_digest` from `scope` and refuses a mismatch, and for the other actions checks that the
   `scope` entry equals the bound target fields (`APPROVAL_SCOPE_MISMATCH`), so what it displays is what the signature
@@ -180,9 +192,17 @@ approval** for it in a fresh list. An approval is a registry record created for 
   created and refuses a request whose `scope` or digest differs (defence in depth; ES-01 §8.2). Brain creates
   requests through the keeper (I12): in every trust refresh while a condition holds (no `root` anchor; I11's trigger;
   an untrusted active device, the device itself included when it is not reachable from its root and local anchors;
-  a recipient change not yet accepted), and again when the previous request has expired or was denied. The registry
-  keeps at most one pending request per `(action, reader_device_id, target_device_id, target_age_recipient_seq,
-  scope_digest)`.
+  for a `recipient_accept` of `(d, seq)`: exactly while I5's **hold condition** holds for `d` on this reader, i.e.
+  `d ∈ T(r)`, `d` is `active`, `d ≠ r`, and `d`'s verified listed recipient differs from `r`'s pin or `r` has none;
+  a change of a revoked, expired or untrusted device creates no request), and again when the previous request has
+  expired. The registry keeps at most one pending request per `(action, reader_device_id, target_device_id,
+  target_age_recipient_seq, scope_digest)`. **A denial stands** (round-7 non-blocking 1): for the key `(action,
+  reader_device_id, target_device_id, target_age_recipient_seq)` the registry returns the denied request instead of
+  creating a new one, until the user clears the denial on the approval page or in Kkoma (account session; a device
+  bearer cannot clear it) or the target is revoked; a later seq (a new rotation) is a new key. Brain reports a
+  standing denial with its `request_id` and the text "denied earlier; clear the denial in Kkoma or on the approval
+  page to be asked again, or revoke the device". `POST /approval-requests` is rate-limited per device bearer
+  (ES-01 §7.4; technical value).
 - **Approval** (append-only, never edited): every request field, plus `approval_id`, `approver_kind ∈ {device,
   account}`, `approver_device_id` and `sig` (kind `device`), `second_factor` (kind `account`: the method used,
   never its secret), `channel ∈ {terminal, approval_page, mobile}` (informational), and server-clock `approved_at`.
@@ -193,14 +213,16 @@ approval** for it in a fresh list. An approval is a registry record created for 
   scope_digest + "|" + expires_at` (null fields as the empty string; fingerprints in the canonical `aigfp1:` form).
   The registry accepts at most one approval or denial per request and consumes its `nonce`. It refuses an approval
   after `expires_at`, one whose device signature does not verify, one from a device that is not `active` or has
-  `can_approve: false`, one whose kind the action does not allow, and an account approval without a second factor
-  (defence in depth, never the trust basis; ES-01 §8.2).
+  `can_approve: false`, one whose kind the action does not allow, an `endorse` or `recipient_accept` whose approver
+  is the target, a `bootstrap` whose `scope` no longer equals the set the registry computes now (`approval_scope_stale`,
+  so a user never approves a request the reader would reject under V3), and an account approval without a second
+  factor (defence in depth, never the trust basis; ES-01 §8.2).
 
 **Approver rules** (per action; the only place where approval authority is defined):
 
 | Action | Binds | Effect on reader `r` when valid | A `device` approver must be | `account` kind |
 |---|---|---|---|---|
-| `bootstrap` | `r`, `r`'s fp, `scope_digest` of `S` (ids, fps, recipient seqs and hashes) and the root | pins every device of `S` and the root, each recipient at its bound seq and hash; records the `root` anchor | an `active` device of `S` **other than `r`**; `r` itself only when `S` has no `active` device other than `r` | only when `S` has no `active` device other than `r` (a user's first device, a lone survivor) |
+| `bootstrap` | `r`, `r`'s fp, `scope_digest` of `S` (ids, fps, statuses, recipient seqs and hashes) and the root | pins every device of `S` (fp, `created_at`, `revoked_at`) and the root; pins a recipient, at its bound seq and hash, **only for the devices whose status in `S` is `active`** (a revoked or expired device gets no recipient pin; one that returns goes through I5's "no pinned one" path); records the `root` anchor | an `active` device of `S` **other than `r`**; `r` itself only when `S` has no `active` device other than `r` | only when `S` has no `active` device other than `r` (a user's first device, a lone survivor) |
 | `anchor` | `r`, candidate `c`, `c`'s fp | adds `c` as a local anchor | the candidate `c`, never `r` | yes (I11's trigger already means that no active trusted device other than `r` exists to sign) |
 | `endorse` | target `d`, `d`'s fp, recipient seq and hash | counts as the endorsement `e → d` (ES-02 §5.6 E1–E4) while `d`'s key is the bound fp, whatever `d`'s seq is now (V3); pins `d`'s recipient only when `d` has none pinned and its verified listed recipient has the bound hash (at the bound seq; a higher listed seq with that hash is not a change, I5); otherwise `d`'s recipient waits for a `recipient_accept` | the endorser `e`, with `e ∈ T(r)`, `e ≠ d` | **never**: membership is what a compromised registry would forge (ES-01 R5) |
 | `recipient_accept` | target `d`, fp, seq, recipient hash | sets `d`'s pinned `age_recipient` and seq to the bound values | `e ∈ T(r)`, `e ≠ d` | yes (the rotation still needs a valid `age_recipient_sig` by `d`'s pinned key, I5, so an account approval can accept only a value `d` itself signed) |
@@ -233,8 +255,11 @@ count it only when `e ∈ T(r)`.
     a same-key re-login (not a change, I5) and a rotation (held until a `recipient_accept`, I5) leave `d ∈ T`.
   - `recipient_accept`: `target_age_recipient_seq` and hash = the target's verified listed recipient (strict).
   - `bootstrap`: `scope_digest` = the digest `r` stored with its request **and** the digest of `S` recomputed from
-    this fresh list (strict; it covers every recipient seq and hash). UX cost, accepted: a re-login of any device of
-    `S` between the request and its application forces a new request and a new approval.
+    this fresh list (strict; it covers every status, recipient seq and hash), and `target_fp` = `r`'s **local**
+    fingerprint from its keeper (`fingerprint()`); a refresh that finds `r`'s own listed key ≠ its local key reports
+    a registry fault, as I5 does for `r`'s own recipient. UX cost, accepted: a re-login, expiry or revoke of any
+    device of `S` between the request and its application forces a new request and a new approval (the registry
+    refuses to approve such a stale request, so no approval is wasted on it).
   - `anchor`: the candidate is pinned on `r` (every device older than `r` was in `r`'s bootstrap `S`, so an older
     candidate that `r` has not pinned is a registry fault, R6, and gets no request).
   A changed list means a new request, never a stretched approval.
@@ -255,23 +280,45 @@ deleted. A failed V6 signature check against a pin is a registry fault (R6).
 **Audit.** Every approval is a registry record that all channels list (the account's approval history: action,
 target, approver, kind, channel, `approved_at`). Every reader reports, as a registry-fault notice, a `device`
 approval whose signature fails against its pin, or whose approver is not in its `T` while the approval names one of
-its trusted devices (`APPROVAL_APPROVER_UNTRUSTED`). **Self-audit:** every device's trust refresh also compares
+its trusted devices or is a `bootstrap` (`APPROVAL_APPROVER_UNTRUSTED`; a `bootstrap` scope holds every device of
+the user, so a forged bootstrap of any fresh device is reported by every genuine device that does not trust its
+approver). **Self-audit:** every device's trust refresh also compares
 the `device` approvals in its list that name **itself** as approver with its keeper's local log of what it signed
 (`signed_approvals()`, ES-03 §5.1: `request_id` and the SHA-256 of the canonical string), and reports every one that
 is not in the log, or whose canonical string hashes differently, as a registry fault (`APPROVAL_NOT_SIGNED_HERE`).
-A registry that forges an approval is therefore visible on every genuine device it shows that approval to, the
-named approver included; one that shows different lists to different devices (equivocation) is not (N-U3).
+For a `device` approval the registry cannot forge a signature that verifies against a pinned key, so
+`APPROVAL_NOT_SIGNED_HERE` detects a valid signature made with this device's key outside its keeper (a stolen key),
+or the loss of the keeper's log; an approval signed by a key the reader does not trust is reported as
+`APPROVAL_APPROVER_UNTRUSTED` above. Both are visible only on the devices the registry shows the record to; one
+that shows different lists to different devices (equivocation) is not caught (N-U3).
 
 **Channels** (all produce the same record; none is the trust boundary):
 - **Terminal** on a device that can approve: `aigentry-devkit approve <request_id>` (ES-01 §9). It obtains the
   request **only** from the keeper's `preview_approval(request_id)` (the canonical string, its SHA-256 and the parsed
   fields with `scope`; ES-03 §5.1), never from a separate fetch, and displays those fields. It recomputes
   `scope_digest` from `scope` (for the other actions, checks the `scope` entry against the bound target fields) and
-  refuses a mismatch (`APPROVAL_SCOPE_MISMATCH`). For a `bootstrap` or `endorse` request it then compares the scope
-  with this device's own pins, read-only through `aigentry-brain trust refresh` and its printed `aig` (as ES-04 does,
-  BR-6): it refuses a device whose fp differs from its pin, a device of `S` whose recipient hash differs from its pin
-  (an unaccepted change: the user approves that device's `recipient_accept` first), and a device it does not trust
-  unless the user overrides that device by name (`APPROVAL_SCOPE_MISMATCH`). After the answer it calls the keeper's
+  refuses a mismatch (`APPROVAL_SCOPE_MISMATCH`). For a `bootstrap` or `endorse` request it then runs the **pin
+  comparison** against this device's own trust state, read-only through `aigentry-brain trust refresh` (whose run
+  also creates this device's due requests, BR-6) and its printed `aig` (as ES-04 does). It refuses
+  (`APPROVAL_SCOPE_MISMATCH`), with no override:
+  - a device whose fp or `created_at` differs from its pin; for a `bootstrap`, a pinned device that is not revoked
+    and is missing from `S`, and a `root_device_id` that differs from this device's own `root` anchor;
+  - for a `bootstrap`, a device that is `active` in `S` **and** in this device's `T` while this device's **own** I5
+    hold condition holds for it (its verified listed recipient differs from the pin, or there is none). The refusal
+    names that device's `recipient_accept` request, which the same condition makes this device's refresh create
+    (§B.1 "Request"), and says "approve it first (any channel; the account may), or revoke that device"; both are
+    always possible. A standing denial of that request is named with the same text and "clear the denial". Also
+    such a device whose listed recipient is a registry fault on this device (signature or seq, I5; for this device
+    itself, a listed value ≠ its local key): reason "registry fault", released only when the registry lists a
+    consistent value (availability under a faulty registry is not promised, N-U3).
+  Every other device of `S` (revoked, expired, or not in this device's `T`) is compared by fp and `created_at`
+  only. A revoked or expired one gets no recipient pin from this bootstrap (approver table), so its recipient is
+  irrelevant here. The device the request is about (the bootstrap's reader, the endorse's target) is shown with
+  its fp, which the user compares with that device's own `aigentry-devkit whoami` (or `login`) output, and needs no
+  override. Every other `active` or `expired` device of `S` that this device does not trust is refused unless the
+  user overrides it by name after the channel has shown its fp, `created_at` and recipient hash. A revoked device
+  that this device does not trust needs no override: it is never re-bound (ES-01 §8.1 R4), never in `R`, `H` or an
+  I11 candidate set, its endorsements cannot count on a fresh reader (E4), and the root is checked above. After the answer it calls the keeper's
   `approve(request_id, expected_sha256)` with the previewed hash; the keeper signs only if the request it fetches
   again has that canonical string (`APPROVAL_REQUEST_CHANGED` otherwise), so a registry that serves the display and
   the signer different bodies obtains no signature. When the same approver also has the target's pending `endorse`
@@ -294,20 +341,32 @@ named approver included; one that shows different lists to different devices (eq
 - **Kkoma/mobile**: produces `device` approvals when the app is registered as an ES-01 device that holds its own key,
   and `account` approvals (same second factor) otherwise. Whether Kkoma registers as a device, and where its key is
   kept, is D-ID-6 (b) (pending user decision). **A Kkoma device's obligations** (requirements on the Kkoma app, which
-  these specs do not implement; KK-1..KK-3), so that its `device` approvals are not registry-trusting:
+  these specs do not implement; KK-1..KK-4), so that its `device` approvals are neither registry-trusting nor
+  completed without the user:
   - KK-1 (key): its device key is used only inside the app's own approval flow, with the keeper's discipline: no
     general signing of `aigentry-approval-v1|`, a signature only over a request it previewed and fetched again with
     the same canonical-string hash, and a local log of what it signed for the self-audit (I12, §B.1 "Audit").
   - KK-2 (trust state): it keeps its own trust state with the content of I3 (pins, `root` anchor, consumed
     approvals), applied only from approvals valid on it (V1–V6), and it is bootstrapped like any reader. Its
     trust state stays on the phone. Being a device holding no `age_recipient`, it is never in `R` or `H` and never in I5's hold condition
-    (which concerns a verified recipient that differs from its pin, or a verified one with no pin).
+    (which concerns a verified recipient that differs from its pin, or a verified one with no pin). As a reader it
+    creates the requests its own state makes due (§B.1 "Request"), a `recipient_accept` included while its own I5
+    hold condition holds for a device, so its KK-3 refusal always names an existing request.
   - KK-3 (checks): before it signs, it runs the terminal channel's checks with the same refusal codes
-    (`APPROVAL_SCOPE_MISMATCH` incl. the digest recomputation and the pin comparison, `APPROVAL_NOT_BOOTSTRAPPED`)
-    and shows the same fields, fingerprints included.
+    (`APPROVAL_SCOPE_MISMATCH` incl. the digest recomputation and the pin comparison, `APPROVAL_NOT_BOOTSTRAPPED`),
+    shows the same fields, fingerprints included, and offers the same override (by name, after showing the fp,
+    `created_at` and recipient hash), which is a user action under KK-4.
+  - KK-4 (input): each `device` signature, and each override, requires a **user verification** (platform biometric
+    or device passcode) on Kkoma's own approval screen, given after that screen has shown the preview fields. It is
+    never completed from a chat or agent message, a notification action, a deep link that carries the answer,
+    accessibility or automation input, or any interface reachable by the orchestrator or by agents (Kkoma relays
+    agent replies to the user, requirement l.12, l.44; that stream can open the approval screen, never answer it).
+    This is the Kkoma counterpart of the terminal channel's input discipline and of the account channel's second
+    factor; like them it does not tell a person from a program that controls the phone itself (N-U4).
   Readers cannot verify that an approver ran these checks (as for the terminal channel). A Kkoma build that does not
-  meet KK-1..KK-3 must give only `account` approvals; its `device` approvals would sign what the registry shows,
-  which is why account endorsements are forbidden.
+  meet KK-1..KK-4 must give only `account` approvals (which carry the account's own second factor); its `device`
+  approvals would sign what the registry shows, or what a relayed message asked for, which is why account
+  endorsements are forbidden.
 - **Product consequence** (decision bundle 2i). Approving from the phone or the browser alone covers a first device, a
   lone survivor, an anchor and a recipient change. A later device's bootstrap and every endorsement need a `device`
   approver `e` with `e ∈ T(r)` on every reader `r`. **Kkoma-only management holds iff Kkoma is a device (D-ID-6 (b))
@@ -324,8 +383,22 @@ named approver included; one that shows different lists to different devices (eq
     (the N-U4 mitigation for agent-driven hosts; D-ID-6 (c)), the user first turns it on with the browser and the
     second factor, then runs the command in a terminal on that host (SSH or a telepty session), and may turn it off
     again. After that step every later device is managed from Kkoma alone.
-  This is the one place where a terminal can still be required. It is a UX constraint for the user to decide in 2i
-  (register Kkoma first, or accept the one-time terminal step), not a requirement cut.
+  **CLI steps that remain** (round-7 non-blocking 4; each stated, none a quiet requirement cut):
+  - **Each computer added before Kkoma is trusted** needs the same terminal step: its `bootstrap` and an `endorse`
+    of it need a `device` approver in `T`, and until Kkoma is in `T` everywhere only a trusted computer is one. So
+    with computers A and B registered before Kkoma, B is approved from a terminal on A, and Kkoma then once from a
+    terminal on A or B. The step is "one-time" only when Kkoma is registered right after the first computer.
+  - **Every `endorse` needs a fingerprint comparison** with the new device's own value, which is printed only on
+    that device: `aigentry-devkit login` prints `fingerprint_local` when it finishes, and `aigentry-devkit whoami`
+    prints it again (ES-01 §9); a Kkoma device shows its own in the app. For a device that has no screen of its own (a headless host reached over SSH or a
+    telepty session), that is reading one command's output in that session. It is the only defence against a
+    registry that serves the approver the same altered request (N-U3).
+  - **A headless first computer** with `can_approve` off (the recommended D-ID-6 (c) default with no interactive
+    console) cannot approve its own bootstrap: its bootstrap is an `account` approval (approval page or Kkoma, with
+    the second factor), unless the user first turns `can_approve` on for it (browser + second factor) and approves
+    in its terminal. D-ID-6 (a)'s "own terminal approval" option is then unavailable on that device.
+  These are the places where a terminal can still be required. They are UX constraints for the user to decide in 2i
+  (register Kkoma first, or accept the terminal steps), not a requirement cut.
 Brain, ES-04 and every MCP tool only **request** approvals and **verify** them from a fresh list. No brain or ES-04
 command and no MCP tool creates an approval, and the keeper's general `sign` refuses the approval prefix (I12).
 **Platform scope.** Because any channel can approve, a device needs no terminal of its own: a Windows device, or an
@@ -372,7 +445,7 @@ Deleting or re-cloning the brain repo deletes this state, and the device is then
 | trust refresh | brain only (`aigentry-brain trust refresh`, BR-6); the list itself through the keeper (I12). ES-04 calls the command and reads the persisted result | new `L`; under the trust-state lock: assigns `first_seen_by`, re-evaluates (I8), applies every approval that is valid on this reader (§B.1 "Approval", V1–V6), runs the self-audit of its own approvals (§B.1 "Audit"), computes `T` and `R`, records R6 notices, creates the approval requests that are due (through the keeper), writes the trust state |
 | revoke | ES-01 `DELETE /devices/{id}` | sets `revoked_at` once; takes effect for `r` at `r`'s next fresh list (I8, I10) |
 | bootstrap | the user, on any channel, approving `r`'s `bootstrap` request (§B.1 "Approval"); applied by `r`'s next trust refresh | pins the set `S` computed from a fresh list and the root; adds the `root` anchor. Before it, the device reports `TRUST_BOOTSTRAP_REQUIRED` and holds checkpoint and capture pushes |
-| endorse | the user, approving an `endorse` request with endorser device `e` (terminal on `e`, or Kkoma when it is `e` and meets KK-1..KK-3; §B.1 "Approval", "Channels"); signed inside the keeper's `approve(request_id, expected_sha256)` (I12) | adds a record to `E`; counted on readers per E1–E4 |
+| endorse | the user, approving an `endorse` request with endorser device `e` (terminal on `e`, or Kkoma when it is `e` and meets KK-1..KK-4; §B.1 "Approval", "Channels"); signed inside the keeper's `approve(request_id, expected_sha256)` (I12) | adds a record to `E`; counted on readers per E1–E4 |
 | write | ES-02 `brain_checkpoint_write`, ES-04 capture | signed through the keeper; encrypted to `R`; state `written` in the outbox (local only) |
 | rekey | ES-02 only, on an active device after a fresh list in which `R` holds a recipient `(device_id, age_recipient_seq)` not in the persisted `rekeyed_for` set (a new recipient, or a rotation once approved, I5), for its own `accepted` records. The seq is the **pinned** one, which changes only with an approved change of `age_recipient` (I5), so a re-registration of the same recipient with a higher seq re-arms nothing | writes one sibling of each unchanged signed record to the outbox (`written`; its `<n>` is assigned at push, I10 (ii)); adds those `(device_id, age_recipient_seq)` pairs to `rekeyed_for` once every sibling is written; it leaves the device only through push (I10). Cost: every active holder writes one sibling per accepted record per new pair; a sibling follows its record's retention class (ES-02 §8). Captures are never rekeyed (N-U5) |
 | push | the pre-push gate (I10), and nothing else | fresh list → re-evaluate → reference check (I9) → re-wrap to `R` → commit → push |
@@ -394,8 +467,8 @@ No row has been run; nothing is implemented. I9 has no ES-01 row, because it inv
 | I1 | **Per user.** Trust, acceptance and recipients are computed only from `U`'s own authenticated list. An item under another `user_key` / `user_id` never counts. | The list is owner-filtered in the same SQL statement (§7.3); device bearer only; 404 for not-owned (§7.4) | ES-02 §5.4 rule 4, E1; ES-04 §6.1 `RESTORE_USER_MISMATCH` | ES-01 ID-3, ID-21; ES-02 CK-04, CK-21 (d); ES-04 WS-10 (a)(b) |
 | I2 | **Server clock only.** Every decision that *accepts*, *trusts* or *anchors* uses only ES-01 `created_at`, `revoked_at`, and `first_seen_by` derived from `server_time`. Writer-clock fields (record / manifest `created_at`) are **never used to accept or anchor**; an approval carries only server-clock times (`issued_at`, `expires_at`, `approved_at`). They may only reject (`created_at ≥ revoked_at` → `*_DEVICE_REVOKED`). | `created_at`, `revoked_at` server clock, set once, never moved; `server_time` in every list response (§3.1, §8.1 R4, R6) | ES-02 §5.4 rule 5, E3, §4.2; ES-04 §6.1 | ES-01 ID-21; ES-02 CK-11 (iv-a); ES-04 WS-10 (e) |
 | I3 | **Pins are monotone and durable.** A change of a pinned `fp`, `created_at`, `revoked_at` or verified `age_recipient` that is not a validly signed rotation (I5), or a disappearing `revoked_at`, or a pinned device missing from a later list, is a registry fault. It is surfaced (R6). For `revoked_at` the earlier of pinned and listed is used, and a revoke is never undone; every other pinned field keeps its pinned value. A pinned device missing from the list leaves `T` (I8). Pins, anchors, endorsement states, outstanding approval requests, consumed approvals and every item's `first_seen_by` / state / `restored_at` live in **one trust state per device**, at `<aig>/trust-state.json` in the brain repo's Git directory (§B.1 "Local state"), never in the work tree and never behind `.gitignore` (BR-5). Brain is its **only writer**: every write is a read-modify-write under the trust-state lock (BR-6), committed atomically (tmp → fsync → rename). It is never rebuilt from the repo or the registry, and no repo file is ever read as trust state: a pulled tracked path under `.aigentry/` is `CHECKPOINT_REPO_TAMPERED` (reported, never read). If it is lost or corrupt, the device is a fresh device: a new `bootstrap` request and approval, all `first_seen_by` from the next fresh list, no item accepted until then. | `public_key` immutable per id; revoked rows kept with `created_at`, `revoked_at`, `public_key`, `age_recipient`, `age_recipient_sig` for the account's life (D-ID-5, pending user decision; bundle 2d default) | ES-02 §4.1/§4.2 trust state and its location, §5.4 trust refresh, §8 retention; ES-04 consumes the same trust state read-only, after asking brain to refresh it (ES-04 §4 step 5, §6.1), and keeps only its own seen-ref item list (`<aig>/capture-seen.json`) | ES-01 ID-21; ES-02 CK-06 (trust state survives `kill -9`; deleted trust state → fresh-device behaviour), CK-21 (c), CK-27 (pulled tracked state path; pulled `.gitignore` edit; concurrent writers); ES-04 WS-10 (h) |
-| I4 | **Trust.** `T` is the least fixpoint from `A` over endorsements counted by E1–E4. Nothing else confers trust: not a registry listing, a repo file, a **reference**, a writer-clock field, or another user's list. A local anchor is added only when I11 allows it. **The anchors and the endorsements themselves are inputs only through approvals that are valid on the reader** (§B.1 "Approval", V1–V6 and the approver rules): the root and the first pins only by a `bootstrap` approval, a local anchor only by an `anchor` approval, an endorsement only by an `endorse` approval signed by the endorser. No terminal, MCP tool, sync pass, flag or channel confers trust by itself; a channel only produces an approval record, which the reader checks. The sync pass, the gate, P2, ES-04 and every MCP tool only request approvals and report `TRUST_BOOTSTRAP_REQUIRED` / `TRUST_ANCHOR_REQUIRED`; before the bootstrap `T` = {`r`}. | FP format and the canonical signed form (`aigfp1:` + 32 lowercase hex, no dashes) (§8.1 FP); `fingerprint_local` from the keeper's `public_key` operation, never from a registry response (I12); the approval request and approval endpoints, the approval records in the list, `can_approve`, and the registry-side refusals (§8.2); `scope` with every `device_id` and the root id, registry-computed `S` (§3.3, §8.2); the keeper's `preview_approval`, `approve(request_id, expected_sha256)` and `signed_approvals` (ES-03 §5.1) | ES-02 §5.6 E1–E4 (endorsements are `endorse` approvals; E4 uses the record's server-clock `approved_at`), bootstrap and recovery by approval, self-audit, §5.4 gate step 1 (bootstrap hold); ES-04 §6.1 uses `T` from the trust state and reports, never approves | ES-01 ID-22, ID-24 incl. (j) different bodies to display and keeper, (k) `scope` not hashing to the digest; ES-02 CK-11 (iv), CK-21 (d)(e), CK-03 (h) MCP-only bootstrap and anchor, CK-28 (approval primitive, incl. (m) substituted body, (n) self-audit), CK-29 (product path with Kkoma); ES-04 WS-10 (e), WS-11 MCP-only variant |
-| I5 | **Recipient.** `d ∈ R` ⟺ `d ∈ T` ∧ `status = active` ∧ learned under a fresh list ∧ `age_recipient_sig` verifies with `d`'s **pinned** `public_key` over `"aigentry-age-recipient-v1|" + hex(public_key) + "|" + age_recipient_seq + "|" + age_recipient` ∧ `age_recipient_seq` ≥ the highest seq this reader has verified for `d`, pinned or in a notice (lower, or equal with a different `age_recipient`, is a replayed older value: a registry fault) ∧ the `age_recipient` **equals the pinned one**. The pinned `age_recipient` and its seq are set or changed **only by an approval valid on the reader** (§B.1 "Approval"): a `bootstrap` approval (for the devices of `S`, at the bound seq and hash), an `endorse` approval (for an endorsed device with no pin, only when its verified listed recipient has the bound hash; at the bound seq), or a `recipient_accept` approval (for a validly signed rotation, at the bound seq). Trust and recipient are separate: an endorsement keeps `d ∈ T` across every later seq of `d` (§B.1 V3), and only the recipient waits for an approval. A verified value with a higher seq and the pinned `age_recipient` (e.g. `login` re-registering the same key, which signs seq + 1) is **not a change**: no notice, no hold, and the pin keeps its seq. A refresh that finds no such approval records the notice, creates the `recipient_accept` request and leaves the pin as it is. **While some `d ∈ T` with `status = active` has a verified `age_recipient` that differs from its pin, or has no pinned one, the gate holds every checkpoint and capture push** (`CHECKPOINT_PUSH_HELD` / `CAPTURE_PUSH_HELD`, reason `RECIPIENT_CHANGE_UNAPPROVED`; outbox objects stay `written`; the profile push continues), so a change is neither used nor silently left out before a user has approved it. Removals (revoke, leaving `T`, `status ≠ active`, a signature or seq fault) take effect at once and never hold. An `expired` device that re-binds with its pinned recipient is not a change. The reader itself uses its **local** age public key, never the registry's value, and is **not** in the hold condition (`d ≠ r`); a verified registry value equal to that local key updates `r`'s own pin without a notice (its own rotation); any other value is a registry fault. Before the bootstrap is confirmed (§B.1 "Before the bootstrap") nothing is pinned and the gate holds every checkpoint and capture push (`TRUST_BOOTSTRAP_REQUIRED`). A signature failure removes `d` from `R` and raises a registry-fault notice. Only `R` receives new records and captures. | Store and return `age_recipient_sig` and `age_recipient_seq`, and the `recipient_accept` approval records (§8.2); the registry **refuses** `/devices/authorize` and `PUT /devices/me/age-recipient` when the signature does not verify or the seq is not greater than the stored one (defence in depth, never the trust basis); only the keeper signs this prefix (I12) | ES-02 §4.1, §5.4 trust refresh and gate step 1, §5.6 "Recipient"; ES-04 §4 step 4 (R from the refreshed trust state), step 5 (hold) | ES-01 ID-21, ID-23 (c); ES-02 CK-21 (f), (f3) replay, (f4) rotation held until a `recipient_accept` approval, CK-11b addition pinned only by its `endorse` approval, CK-03 (h) no pin before a `bootstrap` approval, CK-28 (wrong seq, replay, stale), CK-24 (h) same-recipient re-registration, CK-21 (h) same-key re-login and (i) rotation, each on an old and a fresh reader; ES-04 WS-16 (f), (j) incl. the brain-pass-first variant, WS-11 MCP-only variant |
+| I4 | **Trust.** `T` is the least fixpoint from `A` over endorsements counted by E1–E4. Nothing else confers trust: not a registry listing, a repo file, a **reference**, a writer-clock field, or another user's list. A local anchor is added only when I11 allows it. **The anchors and the endorsements themselves are inputs only through approvals that are valid on the reader** (§B.1 "Approval", V1–V6 and the approver rules): the root and the first pins only by a `bootstrap` approval, a local anchor only by an `anchor` approval, an endorsement only by an `endorse` approval signed by the endorser. No terminal, MCP tool, sync pass, flag or channel confers trust by itself; a channel only produces an approval record, which the reader checks. The sync pass, the gate, P2, ES-04 and every MCP tool only request approvals and report `TRUST_BOOTSTRAP_REQUIRED` / `TRUST_ANCHOR_REQUIRED`; before the bootstrap `T` = {`r`}. | FP format and the canonical signed form (`aigfp1:` + 32 lowercase hex, no dashes) (§8.1 FP); `fingerprint_local` from the keeper's `public_key` operation, never from a registry response (I12); the approval request and approval endpoints, the approval records in the list, `can_approve`, and the registry-side refusals (§8.2); `scope` with every `device_id`, status and the root id, registry-computed `S`, standing denials and the stale-scope refusal (§3.3, §8.2); the keeper's `preview_approval`, `approve(request_id, expected_sha256)` and `signed_approvals` (ES-03 §5.1) | ES-02 §5.6 E1–E4 (endorsements are `endorse` approvals; E4 uses the record's server-clock `approved_at`), bootstrap and recovery by approval, self-audit, §5.4 gate step 1 (bootstrap hold); ES-04 §6.1 uses `T` from the trust state and reports, never approves | ES-01 ID-22, ID-24 incl. (j) different bodies to display and keeper, (k) `scope` not hashing to the digest; ES-02 CK-11 (iv), CK-21 (d)(e), CK-03 (h) MCP-only bootstrap and anchor, CK-28 (approval primitive, incl. (m) substituted body, (n) self-audit, (o) Kkoma input discipline KK-4, (p) standing denial), CK-29 (product path with Kkoma, incl. two computers before Kkoma and the `whoami` comparison); ES-04 WS-10 (e), WS-11 MCP-only variant |
+| I5 | **Recipient.** `d ∈ R` ⟺ `d ∈ T` ∧ `status = active` ∧ learned under a fresh list ∧ `age_recipient_sig` verifies with `d`'s **pinned** `public_key` over `"aigentry-age-recipient-v1|" + hex(public_key) + "|" + age_recipient_seq + "|" + age_recipient` ∧ `age_recipient_seq` ≥ the highest seq this reader has verified for `d`, pinned, in a notice, or bound in a `device` approval naming `d` as target whose signature and approver pass V1, V4 and V6 on this reader (an `endorse` or `recipient_accept`, valid or not under V3; round-7 non-blocking 5) (lower, or equal with a different `age_recipient`, is a replayed older value: a registry fault) ∧ the `age_recipient` **equals the pinned one**. The pinned `age_recipient` and its seq are set or changed **only by an approval valid on the reader** (§B.1 "Approval"): a `bootstrap` approval (for the devices whose status in `S` is `active`, at the bound seq and hash), an `endorse` approval (for an endorsed device with no pin, only when its verified listed recipient has the bound hash; at the bound seq), or a `recipient_accept` approval (for a validly signed rotation, at the bound seq). Trust and recipient are separate: an endorsement keeps `d ∈ T` across every later seq of `d` (§B.1 V3), and only the recipient waits for an approval. A verified value with a higher seq and the pinned `age_recipient` (e.g. `login` re-registering the same key, which signs seq + 1) is **not a change**: no notice, no hold, and the pin keeps its seq. A refresh that finds no such approval records the notice and leaves the pin as it is; it creates the `recipient_accept` request exactly while the hold condition below holds for `d` (§B.1 "Request"), so a change of a revoked, expired or untrusted device is a notice only, and every bootstrap approver's "approve it first" refusal names a request that exists (§B.1 "Channels"). **While some `d ∈ T` with `status = active` has a verified `age_recipient` that differs from its pin, or has no pinned one, the gate holds every checkpoint and capture push** (`CHECKPOINT_PUSH_HELD` / `CAPTURE_PUSH_HELD`, reason `RECIPIENT_CHANGE_UNAPPROVED`; outbox objects stay `written`; the profile push continues), so a change is neither used nor silently left out before a user has approved it. Removals (revoke, leaving `T`, `status ≠ active`, a signature or seq fault) take effect at once and never hold. An `expired` device that re-binds with its pinned recipient is not a change. The reader itself uses its **local** age public key, never the registry's value, and is **not** in the hold condition (`d ≠ r`); a verified registry value equal to that local key updates `r`'s own pin without a notice (its own rotation); any other value is a registry fault. Before the bootstrap is confirmed (§B.1 "Before the bootstrap") nothing is pinned and the gate holds every checkpoint and capture push (`TRUST_BOOTSTRAP_REQUIRED`). A signature failure removes `d` from `R` and raises a registry-fault notice. Only `R` receives new records and captures. | Store and return `age_recipient_sig` and `age_recipient_seq`, and the `recipient_accept` approval records (§8.2); the registry **refuses** `/devices/authorize` and `PUT /devices/me/age-recipient` when the signature does not verify or the seq is not greater than the stored one (defence in depth, never the trust basis); only the keeper signs this prefix (I12) | ES-02 §4.1, §5.4 trust refresh and gate step 1, §5.6 "Recipient"; ES-04 §4 step 4 (R from the refreshed trust state), step 5 (hold) | ES-01 ID-21, ID-23 (c); ES-02 CK-21 (f), (f3) replay, (f4) rotation held until a `recipient_accept` approval, CK-11b addition pinned only by its `endorse` approval, CK-03 (h) no pin before a `bootstrap` approval, CK-28 (wrong seq, replay, stale), CK-24 (h) same-recipient re-registration, CK-21 (h) same-key re-login and (i) rotation, each on an old and a fresh reader, CK-21 (j) rotation then revoke / expiry / rotation of an untrusted device, each followed by a fresh device's bootstrap on a terminal approver and on Kkoma; ES-04 WS-16 (f), (j) incl. the brain-pass-first variant, WS-11 MCP-only variant |
 | I6 | **Acceptance under revocation.** An item `x` of a writer with `revoked_at` is accepted only if `created_at(x) < revoked_at` (necessary, never sufficient) **and** `first_seen_by(f) < revoked_at`, where `f` is the file (path + Git blob id; for a capture, the ref's commit id) from which this reader decrypted and verified `x`. **Acceptance is per file read; no bound transfers between files.** A rekey sibling, a conflict sibling or a re-pushed blob carries its own `first_seen_by`. A record seen earlier only as ciphertext (`pending_key`) is anchored by that early bound only if that same file later decrypts. Two files that decrypt to one `checkpoint_id` with different `content_sha256` are `CHECKPOINT_KEY_CONFLICT`, both surfaced, and neither inherits from the other. The writer signature covers `user_id\|checkpoint_id\|content_sha256` and is verified on the file read, so a forged sibling either fails it or is a different signed content judged by its own late bound. **No reference anchors anything**: being listed in `parents`, `resumed_from`, `workspace_capture_id` or `checkpoint_id` of any record confers nothing on any reader. Otherwise `*_REVOKED_WRITER_UNANCHORED`, restored only by an explicit user choice on that reader. That choice is local: it changes nothing on other readers. | `revoked_at` server clock, never moved (§8.1 R4) | ES-02 §4.2 (per-file `first_seen_by`, no inheritance), §5.4 rule 5 (reference clause deleted), E4; ES-04 §6.1 (per-commit bound) | ES-01 ID-21; ES-02 CK-11 (ii), (vi-c), CK-23; ES-04 WS-10 (c)(g) incl. the (g) reference variant |
 | I7 | **Stale cache.** Items observed with no successful list fetch since are `provisional`. *May*: list, and restore labelled `provisional (device list as of …)`, a record whose writer is already confirmed trusted and non-revoked in the cache. *May not*: count an endorsement, apply any approval, add a trusted device, recipient or anchor, anchor anything, or be pushed past the gate (I9, I10). | `server_time` in every list response | ES-02 §5.4 "Stale-cache window"; ES-04 §6.1 | ES-01 ID-23 (d) (`server_time` in the list through the keeper); ES-02 CK-11 (vi) before refresh; ES-04 WS-10 (g) before refresh |
 | I8 | **Re-evaluation.** Every fresh list, in order: assigns `first_seen_by`; recomputes `T` and `R`; and re-checks items. For a device whose `revoked_at` is new, it re-checks **all** of its items, so the writer-clock test (I2) also rejects an item first seen before the revoke but dated ≥ `revoked_at`, and old and fresh readers agree. For a device that **left `T`** without a revoke, it re-checks **all** of its items, which become `*_WRITER_UNKNOWN`. Failures are demoted (`DEMOTED:<code>`), never deleted. A demoted item leaves the heads, an earlier restore is reported with `restored_at`, and the cascade runs through endorsements. | list carries every state change (§8.1 R6) | ES-02 §5.4 "Re-evaluation"; ES-04 §6.1 | ES-01 ID-21, ID-23 (d); ES-02 CK-11 (vi) after refresh, (vii), CK-25; ES-04 WS-10 (g) after refresh |
@@ -404,10 +477,11 @@ No row has been run; nothing is implemented. I9 has no ES-01 row, because it inv
 | I11 | **Recovery is scoped.** `TRUST_ANCHOR_REQUIRED` is raised only when all hold: (0) the bootstrap is confirmed (before it, `TRUST_BOOTSTRAP_REQUIRED` is reported instead, §B.1 "Before the bootstrap"); (1) a fresh list in this pass; (2) `T` has no active device other than `r`; (3) `L` lists at least one active device `c ≠ r` with `created_at(c) < created_at(r)` (an older candidate), which `r` pinned in its bootstrap (an older listed device that `r` has not pinned is a registry fault, R6, and no candidate; §B.1 V3). Brain then creates one `anchor` request per candidate and reports only those candidates; the anchor is added only by a valid `anchor` approval (§B.1 "Approval": approver the candidate or the account, never `r`). Otherwise there is no prompt. On a device that is *older* than every untrusted active device, those devices get the normal `endorse` request (R6). With **no** active device other than `r` (a user's first device, or a **lone survivor** whose others are all revoked, expired or lost), there is no prompt and `r` proceeds as the only active trusted device; an `expired` older device that re-binds becomes an active candidate, and the trigger then fires. **Key-state codes are defined only by what `r` can compute** from its fresh list and its own key, because age stanzas do not name recipients and no recipient list is stored. They use `H` (§B.1), the **non-revoked** devices other than `r` that have a recipient, listed or pinned and missing: an `expired` device re-binds with the same `device_id` and key (ES-01 §5, ID-7) and may still hold and rekey the record; only `revoked` is terminal (ES-01 §8.1 R4). For a file `r` cannot decrypt: `H` empty → `CHECKPOINT_UNRECOVERABLE_KEY` / `RESTORE_UNRECOVERABLE_KEY` (non-claim N-U1), and that file keeps the code (state `unrecoverable_key`; it is not re-computed when a device registers later, because a later device can receive the record only from a non-revoked holder, and there was none). That state is assigned only after the bootstrap is confirmed, so its `L` was the list whose set `S` (every device listed, revoked and expired included) the user approved; before it, such a file stays `pending_key` and no key-state code is computed (N-U3); otherwise a checkpoint is `CHECKPOINT_PENDING_KEY`, listing the devices of `H` with the text "readable here only if one of them holds it and re-wraps it for this device; this device cannot tell whether any of them can", plus, for each `expired` one, "may become readable after `<name>` logs in again (`aigentry-devkit login`)", and never a promise that it will resolve. A capture is then `RESTORE_NOT_A_RECIPIENT` (terminal, N-U5). A root revoke is **permanent**: the root is the earliest `created_at`, revoked or not, and revoked rows are kept, so every later fresh device without a non-revoked chain must anchor once. | `created_at` server clock, set once, kept for revoked rows (D-ID-5, pending user decision); `status` tells `expired` (re-binds the same row and key, §5) from `revoked` (never re-bound, R4), and the list includes both (R3) | ES-02 §5.6 bootstrap and recovery, §5.3 (codes; rekey cursor per `(device_id, age_recipient_seq)`); ES-04 §6.1 / WS-11 | ES-01 ID-7, ID-21; ES-02 CK-03 (c)(d)(e)(f)(g)(h)(i), CK-21 (g), CK-24 (h) rotation and same-recipient control; ES-04 WS-11 (variants incl. expired peer, pinned-but-missing peer, MCP-only) |
 | I12 | **One signer, one list fetcher, one trust-state writer.** The device private key is used only inside the devkit lease keeper (ES-03 §5.1). The keeper offers `sign(prefix, payload)` with the prefix allowlist `aigentry-checkpoint-v1\|`, `aigentry-capture-v1\|`, and refuses every other prefix. `aigentry-device-v1\|`, `aigentry-age-recipient-v1\|` and `aigentry-approval-v1\|` are signed only inside the keeper's own `login`, refresh, `register_age_recipient` and `approve(request_id, expected_sha256)` operations; `approve` signs only when the request it fetches has a canonical string with the SHA-256 the caller previewed through `preview_approval(request_id)` (the caller still supplies no payload), and logs what it signed (`signed_approvals()`); `preview_approval` and `approve` are called only by the terminal channel (`aigentry-devkit approve`, §B.1 "Channels"), never by brain or ES-04. It also offers `public_key()` / `fingerprint()`, `device_list()` (proxied `GET /devices?include=keys,approvals&all=true` with `server_time`), `device_me()`, `request_approval(action, fields)` and `signed_approvals()`. Brain (ES-02) and the ES-04 CLI are callers and start the keeper on demand; brain also calls `request_approval` and `signed_approvals` (self-audit). On a Kkoma device the app's own key store has the same discipline (KK-1). ES-04 uses `sign` only: it obtains the list and the trust state through brain's trust refresh (BR-6), and brain is the only writer of the trust state. If the keeper is unavailable, no record or capture is written and no checkpoint or capture push runs (brain's profile push is not affected): `CHECKPOINT_IDENTITY_MISSING` / `CAPTURE_IDENTITY_MISSING`. Running the keeper is D-Q-9 (pending user decision; bundle 4d default "on demand"). | ES-01 §8.1 R1, FP; ES-03 §5.1 operations, callers, D-Q-9 "Blocks" | ES-02 §5.1 precondition "sign operation available", §5.4 trust refresh; ES-04 §4 step 1, step 5 | ES-01 ID-23 (a)(b), ID-24 (g) approval prefix refused by `sign`, (j) changed body refused by `approve`; ES-02 CK-22, CK-27 (c), CK-28 (m)(n); ES-04 WS-16 (h), (j) |
 
-**B.3 — verified by author (revision 7, 2026-10-13).** Re-run of the table above after this cycle's edits, against
-ES-01/ES-03 in clone `aigentry-orchestrator-wt-1204-idq` (`35c4d78`: ES-01 §3.3
-`scope`, §8.2 registry-computed `S`, §9, D-ID-6, ID-24 (j)(k) and the keeper's `preview_approval` /
-`approve(request_id, expected_sha256)` / `signed_approvals`) and ES-02/ES-04 in this clone.
+**B.3 — verified by author (revision 8, 2026-10-13).** Re-run of the table above after this cycle's edits, against
+ES-01/ES-03 in clone `aigentry-orchestrator-wt-1204-idq` (`f7c021a`, on top of `35c4d78`: ES-01 §3.3
+`scope` and digest with `status`, §8.2 standing denials, stale-scope and approver ≠ target refusals, the Kkoma
+bullet with KK-4, §9 `login`/`approve`, D-ID-6 (b), ID-24 (e)(l)(m); the keeper's `preview_approval` /
+`approve(request_id, expected_sha256)` / `signed_approvals` unchanged) and ES-02/ES-04 in this clone.
 Revision-6 traces (the approval primitive; (2) and (3) corrected in revision 7):
 - (1) Fresh C, reached only through MCP calls and brain sync passes; the registry lists a fake root R′ with the
   earliest `created_at`. Every pass reports `TRUST_BOOTSTRAP_REQUIRED` and creates a `bootstrap` request with the
@@ -418,10 +492,14 @@ Revision-6 traces (the approval primitive; (2) and (3) corrected in revision 7):
   pins, so R′ is refused (`APPROVAL_SCOPE_MISMATCH`). If the registry serves A's display one body and A's keeper
   another, the keeper's hash check refuses (`APPROVAL_REQUEST_CHANGED`) and nothing is signed. If it serves both the
   same altered body, A signs exactly what A displayed and compared: a `scope` that does not hash to its digest is
-  refused, and a digest of `S′ ∋ R′` shows R′ and is refused; an `endorse` for X instead of D shows X's fingerprint,
-  which the user compares with D's `whoami`. C applies an approval only if its digest equals C's own (V3). If the
-  registry forges an approval by R′ itself (R′ ∈ `S`), C accepts it: this is the trust-on-first-use residual (N-U3).
-  The forged record is in the list, and A reports `APPROVAL_APPROVER_UNTRUSTED` unless the registry equivocates.
+  refused; a digest of `S′ ∋ R′` shows R′, which A refuses unless the user overrides R′ by name after seeing its fp
+  (revision 8: the new device C itself no longer needs an override, so an override is asked only for an extra
+  device and is not a routine step; a revoked R′ is inert and a fake root is refused without override, because
+  `root_device_id` must equal A's own root anchor); an `endorse` for X instead of D shows X's fingerprint, which the
+  user compares with D's `whoami`. C applies an approval only if its digest equals C's own (V3). If the registry
+  forges an approval by R′ itself (R′ ∈ `S`), C accepts it: this is the trust-on-first-use residual (N-U3). The
+  forged record is in the list; A, which does not trust R′, reports it as `APPROVAL_APPROVER_UNTRUSTED` (revision 8:
+  the audit covers every `bootstrap` by an untrusted approver) unless the registry equivocates.
 - (3) Replay of C's consumed `bootstrap` approval fails V5. The same approval applied on another device fails V2.
   After `expires_at`, the registry refuses the approval and the reader fails V4. A `recipient_accept` for B at seq 1
   when B lists a different recipient at seq 2 fails V3, unless it is the value already pinned (then a no-op, V5). An `endorse` A → B made at seq 1
@@ -446,9 +524,11 @@ Revision-7 traces:
 - (8) Rotation. B rotates to (3, h′) (validly signed). On A, B stays in `T` (fp unchanged), its verified recipient
   differs from the pin → `RECIPIENT_CHANGE_UNAPPROVED` hold and a `recipient_accept` request for (B, 3, h′); the
   user approves it on any channel; A pins (3, h′) and releases. A fresh reader C that requests its bootstrap while
-  (3, h′) is not yet accepted: the terminal channel on A refuses C's `S` (B's hash differs from A's pin; the user
-  approves B's `recipient_accept` first), so C stays held (`TRUST_BOOTSTRAP_REQUIRED`); afterwards C's bootstrap pins
-  B at (3, h′) and A → B counts on C (CK-21 (i)). The rotation is never used before an approval on any reader that
+  (3, h′) is not yet accepted: B is `active` in `S` and in `T(A)` and A's own hold condition holds for B, so the
+  terminal channel on A refuses C's `S` and names the `recipient_accept` request for (B, 3) that A's own refresh
+  created; C stays held (`TRUST_BOOTSTRAP_REQUIRED`); after that request is approved C's bootstrap is approved, pins
+  B at (3, h′), and A → B counts on C (CK-21 (i)). Revision 8 removes the cases where no such request exists
+  (traces (10)–(12)). The rotation is never used before an approval on any reader that
   bootstrapped through a pin-holding approver; an `account` bootstrap (first device, lone survivor) has no pins to
   compare (N-U3).
 - (9) Kkoma join orders. Computer M first: M is the root. Kkoma K registers; K's `bootstrap` needs a `device`
@@ -456,6 +536,32 @@ Revision-7 traces:
   session on M (`can_approve` on M, turned on with the browser and second factor if it was off). A later device D:
   its bootstrap and K → D from K alone; every reader counts K → D because M → K counts. K first: K is the root,
   bootstraps itself, and approves every later device; no terminal (CK-29).
+Revision-8 traces (the release path of I5 for a fresh reader, joint round 7 blocking 1; approvers A = a terminal on
+a trusted computer, K = a Kkoma device meeting KK-1..KK-4; both pinned B at (1, h)):
+- (10) Rotate, then revoke before acceptance. B registers (2, h′); A and K record the notice, and while B is active
+  and trusted their refreshes create the request for (B, 2) and hold pushes. The user revokes B instead. On A and K
+  the hold condition no longer holds (B not active): removals never hold, the request is no longer re-created, B
+  leaves `R` at once. Fresh C's `S` lists B `revoked` at (2, h′). A and K compare B by fp and `created_at` only
+  (B is not `active` in `S`); B is revoked, so no override is asked. C's bootstrap is approved; C pins B's fp,
+  `created_at` and `revoked_at`, no recipient for B. I5's release path is reached: nothing waits on B anywhere.
+- (11) Rotate, then expire. As (10), but B goes `expired`. A and K: no hold, no request (B not active); C's `S`
+  lists B `expired`; A and K compare fp only; if B ∉ `T(A)` it is shown for an override, otherwise no question. C
+  pins no recipient for B. B logs in again: `login` re-registers its local key, (3, h′). Now on A: B active,
+  trusted, verified h′ ≠ pin h → hold + request (B, 3); on C: B active, trusted (A → B counts, fp only), no pinned
+  recipient → hold + the same deduplicated request. One approval on any channel releases both (`recipient_accept`
+  approver `e ∈ T`, `e ≠ B`, or the account). Reachable.
+- (12) Rotate while untrusted on the approver. B is pinned on A (in A's bootstrap `S`) but not in `T(A)` (never
+  endorsed, or its only endorser was revoked and not re-endorsed), and B registers (2, h′). A: no hold for B (not
+  in `T`), no request. C's `S` lists B `active` at (2, h′). A compares B's fp and `created_at`, and asks the
+  override for B, showing its fp and recipient hash; if the user overrides, C pins B at (2, h′), and B is in `T(C)`
+  only through an endorsement (which the user approves after comparing fps). If not, the approval is declined and
+  the user can endorse or revoke B first. No branch waits on a request that does not exist.
+- (13) Trusted active rotation on the approver itself and on K: as trace (8); K's own refresh created the request
+  (KK-2), so K's refusal names it. With the request denied earlier (standing denial), both name it with "clear the
+  denial", which the user can do on the page or in Kkoma; or the user revokes B, which leads to (10).
+In every case the bootstrap is reachable by a user action that is always available (approve the named request,
+clear its denial, override, or revoke), and a recipient is pinned on C only when an approver compared it with its
+own accepted pin, or the user overrode that device after seeing its hash (I5 safety unchanged).
 Rules are cited by section. "Counter-example" is the attack or case the author traced through those rules.
 This column is the author's own check, not a review verdict (Rule 39). The reviewer re-checks it.
 
@@ -464,8 +570,8 @@ This column is the author's own check, not a review verdict (Rule 39). The revie
 | I1 | ES-01 §7.1 device bearer, §7.3 owner filter, §7.4 identical 404, §8.1 R3 | ES-02 §5.4 rules 2, 4; §5.6 E1; ES-04 §6.1 `RESTORE_USER_MISMATCH` | ID-3, ID-17, ID-18, ID-21; CK-04, CK-21 (d); WS-10 (a)(b) | U2 pushes into U1's repo → writer not in U1's list → `*_WRITER_UNKNOWN`. Holds |
 | I2 | ES-01 §3.1 `created_at`/`revoked_at`, §8.1 R3 `server_time`, R4 | ES-02 §4.2 `first_seen_by`, §5.4 rule 5, §5.6 E3; ES-04 §6.1 | ID-21; CK-11 (iv-a), CK-25; WS-10 (e) | Backdated item → accepted only through a per-file server bound. Holds |
 | I3 | ES-01 §3.1 immutable `public_key`, §8.1 R5 (change or disappearance = fault), D-ID-5 | ES-02 §4.1/§4.2 `<aig>/trust-state.json` (Git directory), §5.4 trust refresh and lock, §8; ES-04 §6.1 (reads it after a refresh; `RESTORE_TRUST_STATE_MISSING`) | ID-21; CK-06, CK-21 (c), CK-11 (vii), CK-27; WS-10 (h) | Registry clears `revoked_at` → earlier value used, B stays revoked. Trust state deleted → fresh device; ES-04 stops and points to the pending `bootstrap` request. Joint round 2 Exp1 (revoked B pushes a force-added `.aigentry/trust-state.json`; re-run in A.3) → the pulled file lands in the work tree, which brain never reads; `CHECKPOINT_REPO_TAMPERED`; `<aig>/trust-state.json` unchanged. A brain MCP pass, a P2 tick, a refresh that applies an approval and an ES-04-requested refresh at once → serialized by the trust-state lock, no lost update. Holds |
-| I4 | ES-01 §3.3 `scope` (ids, hashes, root), §8.1 FP, R1 (`fingerprint()` via the keeper), R5, §8.2 approvals and registry-computed `S`; ES-03 §5.1 `preview_approval`, `approve(request_id, expected_sha256)`, `signed_approvals` | ES-02 §5.6 anchors, E1–E4, bootstrap and recovery by approval, self-audit (§B.1 "Approval", "Audit", "Channels"); ES-04 §6.1 (reports, never approves) | ID-22, ID-24 (j)(k); CK-11 (iv), CK-21 (d)(e), CK-27 (a), CK-03 (h), CK-28 (m)(n), CK-29; WS-10 (e)(f), WS-11 MCP-only variant | Cycle, reference, registry listing → no trust. A pulled file with a forged `anchors` entry → never read (I3). An agent-made `endorse` approval on an approval-capable device → N-U4 (stated, visible in the history, not prevented). Fake root at a fresh device's first fetch → traces (1)–(2) above. Round-6 blocking 2 (registry serves B's CLI an `endorse` of D and B's keeper an `endorse` of X) → the keeper's hash check refuses, nothing signed (ID-24 (j), CK-28 (m)); both served X → B displays X's fp, which is what B signs, and the user's comparison with D's `whoami` fails; an approval listed with B as approver that B's keeper did not sign → `APPROVAL_NOT_SIGNED_HERE` on B (CK-28 (n)). A Kkoma device signs only after KK-1..KK-3. Holds within N-U3 (first decision; the user's fingerprint comparison) and N-U4 |
-| I5 | ES-01 §3.1 `age_recipient_sig`, §3.3 `scope_digest` (incl. recipient hashes), §8 (422), §8.1 R2, §8.2 `recipient_accept`; ES-03 §5.1 `register_age_recipient` | ES-02 §4.1, §4.2 `notices`, §5.4 trust refresh and gate step 1, §5.6 "Recipient" and E2; ES-04 §4 steps 4, 5 | ID-21, ID-23 (c), ID-24; CK-21 (f)(f2)(f3)(f4)(h)(i), CK-11b, CK-24 (h), CK-28; WS-16 (f), (j) | Substituted recipient without a valid signature → not in `R`. Registry replays B's older validly signed recipient → its seq is below the highest verified one → registry fault, B not in `R` (CK-21 (f3)). Joint round 3 scenario: B rotates (seq 2, possibly a same-uid agent); A's AutoCommitter debounce starts a push → the gate's refresh finds no `recipient_accept` approval for (B, 2), keeps the pin at seq 1, creates the request, sees an active trusted device whose verified recipient differs from its pin → `CHECKPOINT_PUSH_HELD` (`RECIPIENT_CHANGE_UNAPPROVED`); no blob is wrapped to either key of B; after the user approves (B, 2) on any channel, the next refresh on A sets pin = seq 2 and the next push wraps to it (CK-21 (f4)). An approval by B itself → refused (approver ≠ target). An approval bound to seq 1 replayed for seq 2 → V3. The same with D added by an `endorse` approval (CK-11b): D is pinned at the bound seq when its listed recipient has the bound hash; if D rotated meanwhile, D is trusted, unpinned and held until a `recipient_accept`. Round-6 blocking 1: same-key re-login of B (seq + 1) → the endorsement still counts (V3 binds the fp only), not a change, no notice, no hold, nothing demoted, on an old and a fresh reader (trace (7), CK-21 (h)); rotation → B stays trusted, held until `recipient_accept` (trace (8), CK-21 (i)); CK-21 (f2) now expects that hold. Rollback of the unapproved seq 2 to seq 1 → below the highest verified seq (the notice's) → fault. ES-04 after a brain pass → still unapproved → `CAPTURE_PUSH_HELD`, then pushes after the approval (WS-16 (j)). B's `expired` re-bind re-registers the same recipient at seq + 1 → not a change: no request, no hold (CK-24 (h) control). R's own key regenerated and registered → R is not in the hold condition; its self-pin follows its local key. Before the bootstrap → nothing pinned, pushes held (CK-03 (h)). Holds within N-U4 (an agent on an approval-capable device can approve) |
+| I4 | ES-01 §3.3 `scope` (ids, hashes, root), §8.1 FP, R1 (`fingerprint()` via the keeper), R5, §8.2 approvals and registry-computed `S`; ES-03 §5.1 `preview_approval`, `approve(request_id, expected_sha256)`, `signed_approvals` | ES-02 §5.6 anchors, E1–E4, bootstrap and recovery by approval, self-audit (§B.1 "Approval", "Audit", "Channels"); ES-04 §6.1 (reports, never approves) | ID-22, ID-24 (j)(k); CK-11 (iv), CK-21 (d)(e), CK-27 (a), CK-03 (h), CK-28 (m)(n), CK-29; WS-10 (e)(f), WS-11 MCP-only variant | Cycle, reference, registry listing → no trust. A pulled file with a forged `anchors` entry → never read (I3). An agent-made `endorse` approval on an approval-capable device → N-U4 (stated, visible in the history, not prevented). Fake root at a fresh device's first fetch → traces (1)–(2) above. Round-6 blocking 2 (registry serves B's CLI an `endorse` of D and B's keeper an `endorse` of X) → the keeper's hash check refuses, nothing signed (ID-24 (j), CK-28 (m)); both served X → B displays X's fp, which is what B signs, and the user's comparison with D's `whoami` fails; an approval listed with B as approver that B's keeper did not sign → `APPROVAL_NOT_SIGNED_HERE` on B (CK-28 (n)). A Kkoma device signs only after KK-1..KK-4. Revision 8: a relayed agent message, a notification action or a deep link asks Kkoma to approve an `endorse` → the approval screen opens at most; no signature without the user verification on that screen (KK-4, CK-28 (o)); a Kkoma build without KK-4 gives only `account` approvals, which cannot endorse. A forged `bootstrap` of fresh C by R′ → reported on every genuine device that does not trust R′ (Audit, revision 8). Holds within N-U3 (first decision; the user's fingerprint comparison) and N-U4 |
+| I5 | ES-01 §3.1 `age_recipient_sig`, §3.3 `scope_digest` (incl. recipient hashes), §8 (422), §8.1 R2, §8.2 `recipient_accept`; ES-03 §5.1 `register_age_recipient` | ES-02 §4.1, §4.2 `notices`, §5.4 trust refresh and gate step 1, §5.6 "Recipient" and E2; ES-04 §4 steps 4, 5 | ID-21, ID-23 (c), ID-24; CK-21 (f)(f2)(f3)(f4)(h)(i), CK-11b, CK-24 (h), CK-28; WS-16 (f), (j) | Substituted recipient without a valid signature → not in `R`. Registry replays B's older validly signed recipient → its seq is below the highest verified one → registry fault, B not in `R` (CK-21 (f3)). Joint round 3 scenario: B rotates (seq 2, possibly a same-uid agent); A's AutoCommitter debounce starts a push → the gate's refresh finds no `recipient_accept` approval for (B, 2), keeps the pin at seq 1, creates the request, sees an active trusted device whose verified recipient differs from its pin → `CHECKPOINT_PUSH_HELD` (`RECIPIENT_CHANGE_UNAPPROVED`); no blob is wrapped to either key of B; after the user approves (B, 2) on any channel, the next refresh on A sets pin = seq 2 and the next push wraps to it (CK-21 (f4)). An approval by B itself → refused (approver ≠ target). An approval bound to seq 1 replayed for seq 2 → V3. The same with D added by an `endorse` approval (CK-11b): D is pinned at the bound seq when its listed recipient has the bound hash; if D rotated meanwhile, D is trusted, unpinned and held until a `recipient_accept`. Round-6 blocking 1: same-key re-login of B (seq + 1) → the endorsement still counts (V3 binds the fp only), not a change, no notice, no hold, nothing demoted, on an old and a fresh reader (trace (7), CK-21 (h)); rotation → B stays trusted, held until `recipient_accept` (trace (8), CK-21 (i)); CK-21 (f2) now expects that hold. Rollback of the unapproved seq 2 to seq 1 → below the highest verified seq (the notice's) → fault. ES-04 after a brain pass → still unapproved → `CAPTURE_PUSH_HELD`, then pushes after the approval (WS-16 (j)). B's `expired` re-bind re-registers the same recipient at seq + 1 → not a change: no request, no hold (CK-24 (h) control). R's own key regenerated and registered → R is not in the hold condition; its self-pin follows its local key. Before the bootstrap → nothing pinned, pushes held (CK-03 (h)). Revision 8 (joint round 7 blocking 1): rotate then revoke, rotate then expire, rotate while untrusted on the approver, each before acceptance, then a fresh device's bootstrap on A and on K → traces (10)–(13): the bootstrap is approvable in every case, and C pins a recipient only for a device `active` in the digest-bound `S` that the approver compared with its own accepted pin or the user overrode (CK-21 (j)). Unpinned old reader G served B's older (1, h) after B's (2, h′) was accepted by a `device` `recipient_accept` in the same list → the bound seq 2 is the floor → registry fault, B ∉ `R(G)` (round-7 non-blocking 5). Holds within N-U4 (an agent on an approval-capable device can approve) |
 | I6 | ES-01 §8.1 R4, R5 ("no other path, and no reference") | ES-02 §4.2 (per-file bound, `seen` keyed by file, no inheritance), §5.4 rule 5, §5.6 E4; ES-04 §6.1 (bound per ref commit; a checkpoint reference anchors nothing) | ID-21; CK-11 (ii)(vi-c), CK-23, CK-27 (a); WS-10 (c)(g) incl. the reference variant | Exp1 with forged `observed`/`seen` → never read (I3). Joint-review scenario: C holds B's P as `pending_key` (S1 < T); B pushes a backdated sibling r′ after T → the sibling's own bound S2 > T → `CHECKPOINT_REVOKED_WRITER_UNANCHORED`. Same content re-pushed → also unanchored (D-8 cost). D, which accepted r from P, sees r′ → `CHECKPOINT_KEY_CONFLICT`. Holds |
 | I7 | ES-01 §8.1 R3 `server_time`; ES-03 §5.1 `device_list()` | ES-02 §5.4 "Stale-cache window"; ES-04 §6.1 | ID-23 (d); CK-11 (vi); WS-10 (g) | Provisional endorsement → counts for nothing; provisional record continued → held (I9). The rekey pass runs only after a fresh list and only on `accepted` records. Holds |
 | I8 | ES-01 §8.1 R6, revoke-semantics row (all items re-checked) | ES-02 §5.4 "Re-evaluation" (all items of a newly revoked device; all items of a device that left `T`); ES-04 §6.1 | ID-21, ID-23 (d); CK-11 (vi)(vii), CK-25; WS-10 (g) | Writer clock ahead, first seen before T → now demoted on the old reader too (non-blocking 9 closed). Holds |
@@ -547,22 +653,28 @@ capture upload waits on BR-5/BR-6 (not BR-1/BR-2).
   yet, so it checks a `bootstrap` approver's signature against the key the **list** gives for that approver (§B.1 V6).
   A registry compromised at that moment can therefore list a fake device R′, put it in `S` and forge R′'s approval,
   and the fresh device accepts it. What the primitive adds against that registry:
-  - a genuine trusted approver recomputes the digest from the `scope` it displays, compares `S` with its own pins and
-    refuses (`APPROVAL_SCOPE_MISMATCH`), and its keeper signs only the request it displayed
-    (`APPROVAL_REQUEST_CHANGED`), so the registry cannot swap the body under a genuine approval;
+  - a genuine trusted approver recomputes the digest from the `scope` it displays, compares `S` with its own pins
+    and its own root anchor and refuses a changed fp, `created_at` or root, or a missing pinned device, with no
+    override (`APPROVAL_SCOPE_MISMATCH`); an extra `active` or `expired` device R′ it does not trust is refused unless
+    the user overrides R′ by name after seeing its fp (an override the user should give only for a device they just
+    added and compared with its `whoami`; the new device itself needs none); its keeper signs only the request it
+    displayed (`APPROVAL_REQUEST_CHANGED`), so the registry cannot swap the body under a genuine approval;
   - an altered request breaks the digest (V3);
-  - every forged approval is a record that genuine devices report (`APPROVAL_APPROVER_UNTRUSTED`), and the named
-    approver reports one its keeper did not sign (`APPROVAL_NOT_SIGNED_HERE`);
+  - a forged approval by a device a genuine device does not trust is reported there when it names one of its
+    trusted devices or is a `bootstrap` (`APPROVAL_APPROVER_UNTRUSTED`), and the named approver reports one its
+    keeper did not sign (`APPROVAL_NOT_SIGNED_HERE`);
   - the registry computes `S` itself at request creation (defence in depth only).
   None of these helps against a registry that **equivocates** (shows the fresh device and the trusted devices
   different lists). Nor does it help when the user approves on a channel without pins (the approval page,
-  Kkoma that is not a device, or a Kkoma build that does not meet KK-1..KK-3) without comparing fingerprints. An
+  Kkoma that is not a device, or a Kkoma build that does not meet KK-1..KK-4) without comparing fingerprints. An
   `endorse` swapped for another target still shows that target's fingerprint, which the user must compare with the
   new device's `whoami`; the channel cannot do that comparison for a device it does not yet trust. An `account` approval is a registry assertion; it is
   accepted only for a first device, a lone survivor and anchors (§B.1 approver rules), where no trusted device
   exists to sign. The comparison is of device keys, not of age recipients: `age_recipient_seq` protects only a reader
-  that already holds a pin, so a compromised registry can serve a fresh reader a device's older, validly signed
-  recipient, and no approval catches it. The `bootstrap` scope shows each device's `age_recipient_seq`; nothing more
+  that already holds a pin or a seq bound in a `device` approval for that device (I5), so a compromised registry
+  can serve a reader with no pin for a device (a fresh reader, or an old reader for a later-joined device) that
+  device's older, validly signed recipient, and no approval catches it unless a later seq is bound in an approval
+  in the same list. The `bootstrap` scope shows each device's `age_recipient_seq`; nothing more
   is claimed. Until a valid approval arrives, the device pins nothing, accepts no other writer's item and holds its
   checkpoint and capture pushes (I5). A registry that omits a device from `S` is caught only if the user notices the
   omission in the scope; `*_UNRECOVERABLE_KEY` is assigned only after the bootstrap (I11).
@@ -580,6 +692,11 @@ capture upload waits on BR-5/BR-6 (not BR-1/BR-2).
     was not measured).
   - Remote channels: whoever holds the account session and its second factor can approve on the approval page or in
     Kkoma.
+  - A Kkoma device's key: it is an approval reach like a terminal device with `can_approve: true`, and it can
+    `endorse`. KK-4 narrows it to a user verification on Kkoma's own approval screen, so neither the agent-reply
+    stream Kkoma relays, a notification action, a deep link, automation input, nor any interface the orchestrator
+    or agents can call completes a signature. What remains is whoever controls the unlocked phone and passes its
+    user verification, and a Kkoma build that breaks KK-4 (readers cannot tell; §B.1 "Channels").
 
   So a prompt-injected agent with any of these reaches can bootstrap a device against a set that a compromised
   registry chose. It can also endorse a registry-listed device, which then becomes a recipient everywhere, and accept
@@ -602,7 +719,8 @@ capture upload waits on BR-5/BR-6 (not BR-1/BR-2).
     console, default answer no, and with no interactive console attached the device starts with it off, so the
     likely agent-driven first device does not approve by default; with a computer first and Kkoma later this makes
     the one-time terminal step of §B.1 "Product consequence" start with turning it on);
-  - Kkoma registered as a device whose key needs user presence (D-ID-6, pending);
+  - Kkoma registered as a device (D-ID-6 (b), pending), whose every signature needs a user verification on its own
+    approval screen (KK-4, an obligation on a compliant build, not a setting);
   - telepty's peer allowlist and token kept in place (telepty #820);
   - the approval history, which lists every approval with its approver and channel;
   - revoking on suspicion: revoke a device you did not add (`aigentry-devkit device revoke`, I8), or delete
@@ -611,10 +729,20 @@ capture upload waits on BR-5/BR-6 (not BR-1/BR-2).
 
   **Availability residual** (round-6 non-blocking 3): any own device bearer, an agent on any device included, can
   deny a pending request and can switch `can_approve` off on any of the user's devices (ES-01 §8.2). Both only
-  remove authority, never add it: a denied request is created again at the next trust refresh while its condition
-  holds, and `can_approve` is turned on again with the browser and the second factor. An agent can therefore delay
-  approvals, never make one. Not restricted further, because restricting deny or `off` to fewer callers would add an
-  authority rule that protects only availability.
+  remove authority, never add it: a denial stands until the user clears it on the approval page or in Kkoma (§B.1
+  "Request"), and `can_approve` is turned on again with the browser and the second factor. An agent can therefore
+  delay approvals until the user clears them, never make one. Not restricted further, because restricting deny or
+  `off` to fewer callers would add an authority rule that protects only availability.
+  **Approval fatigue** (round-7 non-blocking 1): a device the user does not want trusted (a stray registration, or
+  one made with a stolen account session) makes every trusted device and itself request an `endorse` for it in every
+  refresh. Before revision 8 a denial was undone at the next refresh, so the prompt returned after every "no". Now
+  one denial stands for that device (and for a `recipient_accept`, for that seq), the registry rate-limits request
+  creation per device bearer, and the durable answer stays "revoke a device you did not add". What remains: one
+  prompt per unwanted device (or per rotation), and a user who approves out of habit.
+  **Bootstrap livelock** (round-7 non-blocking 6): a same-uid process that calls `register_age_recipient` in a loop
+  on any device changes that device's seq, so every pending `bootstrap` digest goes stale and fresh devices cannot
+  be bootstrapped while it runs (the registry refuses the stale approvals, so none is wasted). Availability only;
+  remedy: stop the process or revoke that device.
 
   The same boundary covers local files: a same-uid process can edit `<aig>/trust-state.json` itself (add a `root`
   anchor or pins), write under `checkpoints/` or into `<aig>/checkpoint-outbox/`, and run `git push`. I3 and I10 hold
@@ -645,4 +773,7 @@ orchestrator's design record (telepty `ca44782`), not run. The Windows console d
 `CONIN$`) and node-pty's controlling-terminal behaviour are from knowledge. No registry approval endpoint, approval
 page or Kkoma approval exists to measure. No spec tests were run. Revision 7 re-measured only `GitBackend.ts:87`
 (the TOFU `syncRecipients()` call after a pull; `:86` is its comment; brain `0ffa6ee`). The Kkoma app was not read
-(no Kkoma code is in the readable set), so KK-1..KK-3 are requirements, not findings.
+(no Kkoma code is in the readable set), so KK-1..KK-3 are requirements, not findings. Revision 8 measured nothing
+new: it changes rules only (no brain push path or trust-state claim changed, so no brain line was re-read). KK-4 is a
+requirement on an app that was not read; its premise that Kkoma relays agent replies to the user is the requirement
+doc (l.12, l.44), not code.
