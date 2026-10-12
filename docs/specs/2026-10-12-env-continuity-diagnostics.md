@@ -25,7 +25,8 @@ All references are to `aigentry-telesession-wt-1110/docs/specs/2026-10-11-e2e-de
 | `completed` requires `origin_ack_received` AND an origin checkpoint covering the first final reply | 142–147 |
 | `rejected` only from an authenticated destination event | 151–154 |
 | Timeout/deadline never yields `not_delivered`; `unknown` = deadline passed or outbox uncertain | 155–157 |
-| `expired` = tracking ended while outcome open, "outcome unknown, no longer tracked" | 158–160 |
+| `expired` = tracking ended while outcome open, "outcome unknown, no longer tracked"; a retired record already `completed`/`rejected` keeps that status (`RETIRED`) | 158–160 |
+| Record lifecycle `active` (≤ deadline) / `past_deadline` (open outcome reads `unknown`, `DEADLINE_PASSED`) / `retired` (open outcome reads `expired`, `RETIRED`) | 211–215 |
 | Intermediary hop ACK can only advance stages 1–2 (R1); marker strings are corroboration, not authentication (R3) | 47–52 |
 | Telepty dependencies: #100 (remote sender not host-attributed → no remote destination stage applied), #103/#104 ("submitted" = queue receipt → maps only to `transport_accepted`), #102 (queue vs parked backlog diagnostics) | 313–319 |
 | Diagnostics linkage rule: report separately daemon queue depth vs bridge parked backlog, heartbeat-ok vs data-path-ok, `lastActivity` vs `lastOutput`; missing evidence → `unknown` | 402–405 |
@@ -109,13 +110,17 @@ RequestDiagnostics = {
 ### 3.1 State semantics
 | State | May be set when | Never set when |
 |---|---|---|
-| `observed` | evidence exists for this hop and the request is not finished | — |
+| `observed` | evidence exists for this hop — whether or not the request is finished (`completed`/`rejected`/`expired`); a finished request never fills a hop that has no evidence | from a later hop's evidence (that is `unknown`, below) |
 | `completed` | only on `final_reply`, and only when `ledger_status == "completed"` | anywhere else; from health; from a marker string |
-| `pending` | within the ledger deadline, no evidence yet, hop observable | deadline passed |
-| `unknown` | no evidence and (deadline passed, or hop unobservable, or evidence source unreachable, or evidence unauthenticated) | — (default) |
+| `pending` | ledger `lifecycle == "active"` (within `deadline_ms`, ledger lines 211–213) and `ledger_status == "pending"`, no evidence for this hop, **no later hop has evidence**, hop observable | deadline passed; request finished; a later hop has evidence |
+| `unknown` | no evidence and any of: a later hop has evidence (`SKIPPED_STAGE_NO_EVIDENCE` — `[EXISTING line 124-125]` skipped lower stages stay null and read `unknown`); deadline passed with the outcome open (`DEADLINE_PASSED` — `[EXISTING line 155-157, 214]`, ledger lifecycle `past_deadline`); the request finished without evidence for this hop (`NO_HOP_EVIDENCE`); hop unobservable; evidence source unreachable; evidence unauthenticated | — (default) |
 | `offline` | the evidence source for the **destination host** reports it unreachable/down with `fetched_at` within `max_age_ms` (e.g. registry device last-seen, daemon health) | the source itself is unreachable (that is `unknown`); used for a request outcome |
 | `rejected` | `[EXISTING line 151]` ledger `terminal.state == "rejected"` (authenticated) — shown on the hop that refused | from an unauthenticated message, timeout or local error |
-| `expired` | `[EXISTING line 158]` ledger status `expired`, or outbox/transport TTL ended with the outcome open | to mean "not delivered" |
+| `expired` | exactly when `ledger_status == "expired"` (`[EXISTING line 158-160, 215]`: record retired while the outcome was open, reason `RETIRED`) — on every hop without evidence; hops with evidence stay `observed` | to mean "not delivered"; from a transport/nonce TTL or outbox state (a passed deadline with an open outcome is `unknown`/`DEADLINE_PASSED`); for a retired record that was already `completed`/`rejected` (it keeps that status, line 160) |
+
+Evaluation order per hop (first match wins): `rejected` → `completed` → `observed` → `expired` →
+`unknown` (each condition above) → `offline` → `pending`. Hence a hop can never read `expired` while
+`ledger_status` is `unknown`, and never `pending` once a later hop has evidence or the request finished.
 
 `offline` describes the host at observation time; it does not change the request's `ledger_status`
 (a request to an offline host stays `pending` → `unknown` per the ledger rules, lines 155–157).
@@ -155,7 +160,10 @@ shows `ledger_status` first. Access health is rendered in a separate block title
 | DG-02 | PTY unobservable | any request | `pty.state: unknown`, reason `PTY_WRITE_UNOBSERVABLE` (until telepty #103/#104 supply evidence) |
 | DG-03 | Offline vs unknown | destination host down with fresh registry last-seen; separately, registry unreachable | first: `offline` on `daemon`; second: `unknown` with `EVIDENCE_SOURCE_UNREACHABLE` |
 | DG-04 | Rejected only authenticated | unauthenticated refusal text vs authenticated destination `rejected` event | first does not set `rejected`; second sets `rejected` on `agent` |
-| DG-05 | Expired | record retired with open outcome | `expired`; UI never says "not delivered" |
+| DG-05 | Expired = ledger expired only | (a) record retired with open outcome; (b) record `past_deadline` (deadline passed, not retired) with open outcome; (c) transport nonce TTL ended (`TRANSPORT_NONCE_EXPIRED`) while the ledger is `active`/`past_deadline` | (a) `ledger_status: expired`, hops without evidence `expired` (`RETIRED`), hops with evidence `observed`; (b) `ledger_status: unknown`, hops without evidence `unknown` with `DEADLINE_PASSED`, no hop `expired`; (c) no hop `expired`; UI never says "not delivered" in any case |
+| DG-05b | Retired after finish | record `completed` (or `rejected`), then retired | `ledger_status` stays `completed`/`rejected` with reason `RETIRED`; no hop `expired` |
+| DG-12 | Skipped stage | within the deadline, `agent_consumed` has evidence while `transport_accepted`/`durable_received` are null | `daemon.state: unknown`, reason `SKIPPED_STAGE_NO_EVIDENCE` (not `pending`); `agent.state: observed` |
+| DG-13 | Finished request, non-final hops | (a) `completed` request whose `daemon` hop has evidence and `access_layer` has none; (b) `rejected` request with `daemon` evidence | (a) `daemon: observed`, `access_layer: unknown` (`NO_HOP_EVIDENCE` / `SKIPPED_STAGE_NO_EVIDENCE`), `final_reply: completed`; (b) `daemon: observed`, no hop `pending` |
 | DG-06 | Completed only via ledger | final reply recorded but not read by origin agent | `final_reply.state: observed`, reason `AWAITING_ORIGIN_AGENT_READ`; after checkpoint covers it → `completed` |
 | DG-07 | Stale evidence | daemon health older than `max_age_ms` | downgraded to `unknown`, `EVIDENCE_STALE` |
 | DG-08 | Backward compatibility | `request_status` without `diagnostics:true` | output identical to the current view |
