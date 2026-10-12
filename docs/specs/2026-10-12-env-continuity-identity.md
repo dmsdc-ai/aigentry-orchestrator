@@ -7,7 +7,9 @@ change. Parent task #2026101204 ("동일 계정으로 다른 머신에서 개발
 ES-03 `docs/specs/2026-10-12-env-continuity-shared-queue.md`. Trust, recipients, revocation effects on Git-stored
 data, signing and the device list follow the interface invariants I1–I12 shared with ES-02/ES-04
 (`aigentry-orchestrator-wt-1204-ctxws` `docs/specs/2026-10-13-env-continuity-interface-invariants.md`). Each
-invariant names its ES-01 obligation; §8.1 implements them.
+invariant names its ES-01 obligation; §8.1 implements them. Revision 6 (2026-10-13) adds the signed **approval**
+primitive that the invariants now use for bootstrap, anchors, endorsements and recipient-change acceptance (§3.3,
+§8.2; invariants §B.1 "Approval", I4, I5, I11, I12).
 
 **Measured:** 2026-10-12 by reading source at the commits below (Rule 39 — every claim
 re-read, not taken from the requirements or the build-plan draft).
@@ -184,6 +186,7 @@ user (existing users.id, UUID)          ← the account; one GitHub identity
 | `last_seen_at` | timestamptz | |
 | `revoked_reason` | varchar(32) null | set only when `status='revoked'`: `user` \| `refresh_reuse` \| `admin_disable_user`. Idle expiry is **not** a revoke: it sets `status='expired'` and leaves `revoked_reason` and `revoked_at` null (§5) |
 | `revoked_by_device_id` | UUID null | which device issued the revoke (audit) |
+| `can_approve` | bool | whether this device's key may approve (§3.3, §8.2; default D-ID-6 (c)) |
 
 Constraint: `(user_id, name)` unique among `status='active'` (partial unique index).
 
@@ -208,6 +211,47 @@ Rows are purged 24 h after a terminal state. Raw device/user codes are never sto
 
 No existing table is altered. `users`, `tenants`, `api_keys`, `user_sessions` are
 unchanged.
+
+### 3.3 `approval_requests` and `approvals` (interface invariants §B.1 "Approval"; revision 6)
+
+An approval is the one primitive by which a user confirms a trust input: a device's **bootstrap**, a local
+**anchor**, an **endorsement**, or the **acceptance of a recipient change**. ES-01 owns its format, storage and
+server-side checks. Readers (ES-02 brain, ES-04) verify it from the device list (§8.2) and never create it.
+
+`approval_requests` (harmless; confers nothing):
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID (v4) | `request_id` |
+| `user_id` | FK → users.id | owner (§7.3) |
+| `nonce` | char(32) | 128 random bits, server-generated; consumed by the one approval or denial |
+| `action` | varchar(16) | `bootstrap` \| `anchor` \| `endorse` \| `recipient_accept` |
+| `reader_device_id` | UUID null | the device the approval applies to (`bootstrap`, `anchor`); null for `endorse` / `recipient_accept` |
+| `target_device_id`, `target_fp`, `target_age_recipient_seq`, `target_age_recipient_sha256` | | the bound target (fingerprint in the canonical signed form, §8.1 FP); for `bootstrap`, the reader itself |
+| `scope_digest` | char(64) | for `bootstrap`: SHA-256 of the canonical sorted `(device_id, fp, age_recipient_seq)` list of the set to pin, plus the root id; empty otherwise |
+| `scope` | jsonb | display data only (per device: name, os, created_at, fp, age_recipient_seq); never used for a decision |
+| `requested_by_device_id` | UUID | the device bearer that created it |
+| `issued_at`, `expires_at` | timestamptz | **server clock**; `expires_at` = `issued_at` + validity window (technical, proposed 15 min) |
+| `state` | varchar(16) | `pending` \| `approved` \| `denied` \| `expired` |
+
+At most one `pending` request per `(user_id, action, reader_device_id, target_device_id, target_age_recipient_seq,
+scope_digest)`; a duplicate create returns the existing one.
+
+`approvals` (append-only; never updated or deleted while retained, D-ID-6 (d)):
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID (v4) | `approval_id` |
+| `request_id` | FK, unique | one approval per request |
+| every bound request column | | copied, so the record verifies on its own |
+| `approver_kind` | varchar(8) | `device` \| `account` |
+| `approver_device_id`, `sig` | UUID, bytea | kind `device`: Ed25519 over `"aigentry-approval-v1\|" + user_id + "\|" + request_id + "\|" + nonce + "\|" + action + "\|" + reader_device_id + "\|" + target_device_id + "\|" + target_fp + "\|" + target_age_recipient_seq + "\|" + target_age_recipient_sha256 + "\|" + scope_digest + "\|" + expires_at` (null as empty string; `expires_at` as RFC 3339 UTC), signed only inside the keeper's `approve` (§8.1 R1) |
+| `second_factor` | varchar(16) null | kind `account`: the method used (D-ID-6 (a)); never a secret |
+| `channel` | varchar(16) | `terminal` \| `approval_page` \| `mobile` (informational) |
+| `approved_at` | timestamptz | **server clock**, set once |
+
+`devices` gains `can_approve` (bool). Turning it **off** is allowed to any of the owner's device bearers or the browser
+session; turning it **on** requires the account session plus the second factor (§8.2). The default is D-ID-6 (c).
 
 ## 4. Device registration (device-code style login)
 
@@ -414,6 +458,7 @@ Every row the feature stores carries `owner_user_id`. Every query includes
 | Resource | Owner column | Who can read | Who can write | Cross-user response |
 |---|---|---|---|---|
 | `devices` | `user_id` | owner (any of own devices, browser session) | owner (rename/revoke) | 404 |
+| `approval_requests`, `approvals` (§3.3) | `user_id` | owner's devices (any status that can still authenticate) and browser session | create request: owner's active device bearer; approve/deny: §8.2 | 404 |
 | `device_authorizations` | `user_id` after approval | nobody via API except the polling device by `device_code` | approve/deny: logged-in user | uniform `expired_token` / 404 |
 | ES-03 queues, tasks, aliases, events, leases | `owner_user_id` | owner's active devices | owner's active devices | 404 |
 | ES-08 intake receipts | `owner_user_id` | owner's devices | intake adapter acting as an owner device | 404 |
@@ -476,9 +521,14 @@ Existing endpoints keep accepting it unchanged.
 | `POST /authorize` | none (rate-limited) | start device-code login (§4) |
 | `POST /approve`, `POST /deny` | browser JWT cookie + intent header | bind code to user |
 | `POST /token` | device_code + proof, or refresh + proof | issue / rotate tokens |
-| `GET /` | device bearer or browser cookie | list caller's devices: id, name, os, status, created_at, last_seen_at, `current: bool`; every row carries `fingerprint` (server-recorded, computed by the registry from the stored `public_key`, format §8.1 FP); with `include=keys&all=true` (device bearer only) also `revoked_at`, `public_key`, `age_recipient`, `age_recipient_sig`, `age_recipient_seq`, `age_recipient_set_at`, `server_time` and revoked/expired devices (§8.1) |
+| `GET /` | device bearer or browser cookie | list caller's devices: id, name, os, status, created_at, last_seen_at, `current: bool`; every row carries `fingerprint` (server-recorded, computed by the registry from the stored `public_key`, format §8.1 FP); with `include=keys&all=true` (device bearer only) also `revoked_at`, `public_key`, `age_recipient`, `age_recipient_sig`, `age_recipient_seq`, `age_recipient_set_at`, `can_approve`, `server_time` and revoked/expired devices (§8.1); with `include=keys,approvals&all=true` also every retained approval record of the user (§8.2) |
 | `GET /me` | device bearer | this device + user (`user_id`, `github_id`, `github_login`) |
 | `PUT /me/age-recipient` | device bearer | set or rotate this device's signed age recipient (§8.1). The registry verifies `age_recipient_sig` against the row's `public_key` and refuses a bad signature with 422 `age_recipient_sig_invalid` and an `age_recipient_seq` that is not greater than the stored one with 409 `age_recipient_seq_stale`; `/authorize` does the same for the optional pair (defence in depth only; readers verify again, invariant I5) |
+| `POST /approval-requests` | device bearer | create an approval request (§3.3, §8.2); confers nothing |
+| `GET /approval-requests` | device bearer or browser | the caller's pending requests and approval history (§8.2) |
+| `POST /approval-requests/{id}/approve` | device bearer + approver signature, or browser JWT + intent header + second factor | approve once (§8.2) |
+| `POST /approval-requests/{id}/deny` | device bearer or browser JWT + intent header | deny once; consumes the nonce |
+| `PUT /{id}/can-approve` | off: device bearer or browser; on: browser JWT + intent header + second factor | set `can_approve` (§3.3, §8.2) |
 | `PATCH /{id}` | device bearer or browser | rename (own only) |
 | `DELETE /{id}` | device bearer or browser | revoke (own only; self allowed) — idempotent, 204 also when already revoked |
 
@@ -489,12 +539,12 @@ Errors use the RFC 8628 names for the token endpoint (`authorization_pending`,
 
 | # | Provided by ES-01 |
 |---|---|
-| R1 signing key (invariant I12) | the device's Ed25519 key (§3.1). The private key is used **only inside the devkit lease keeper** (ES-03 §5.1), the only process that reads the key store (§6). The keeper offers its local callers: `sign(prefix, payload)` with the prefix allowlist `aigentry-checkpoint-v1\|`, `aigentry-capture-v1\|`, `aigentry-endorsement-v1\|` (any other prefix → `SIGN_PREFIX_REFUSED`); `public_key()` and `fingerprint()` (row FP); `device_list()` (the R3 list with `server_time`) and `device_me()`. ES-01's own prefixes `aigentry-device-v1\|` and `aigentry-age-recipient-v1\|` are **never** offered through `sign`; the keeper uses them only inside its own `login`, refresh and `register_age_recipient` operations. Callers include brain (ES-02 writer, reader and pre-push gate) and the ES-04 CLI; they start the keeper on demand. Key bytes never leave the keeper. If the keeper is unavailable, ES-02/ES-04 write nothing (I12). ID-23 |
-| R2 age recipient (invariant I5) | `age_recipient` + `age_recipient_sig` per device (§3.1), sent with `/devices/authorize` or set later by `PUT /devices/me/age-recipient` (device bearer, new signed value = rotation). Each value carries `age_recipient_seq` inside the signed string (§3.1): `1` at `/authorize`, the stored value + 1 for a rotation. Signing: only the keeper signs `aigentry-age-recipient-v1\|`, inside `register_age_recipient(age_recipient)`, called by `login` or by the recipient's owner (brain) with the public recipient string; the keeper checks the `age1…` format, reads the current `age_recipient_seq` through `device_me()`, signs with the next value and sends it. The registry **refuses** a recipient whose signature does not verify against the row's `public_key` (§8, 422). That is defence in depth: the trust basis is the reader-side check of I5. A client uses a device's `age_recipient` only when the signature verifies against the device's **pinned** `public_key`, its `age_recipient_seq` is not lower than the highest this reader has verified for the device, pinned or in a notice (lower, or equal with a different recipient, is a registry fault: a replayed older value), and a change is shown in the R6 notice on a terminal before use (I5). A higher seq with the same recipient, as `login` registers after an `expired` re-bind, is not a change. **Finding (C6):** ES-02 proposes that the recipient be the device's **existing** brain age key pair, stored as a plain `0600` file at `~/.config/sops/age/keys.txt` (`AgeCrypto.ts:24`; re-measured 2026-10-13 by the reconciliation cycle at brain `0ffa6ee`). It is not new key material. That file does not meet the §6 store rules on macOS (Keychain) or Windows (DPAPI). ES-01 therefore makes **no** claim that the age private half meets §6. Where it lives is D-ID-2 sub-question (b), §10. A same-uid process that can call `register_age_recipient` can also read that `0600` file, so the operation widens nothing beyond the OS-user boundary (interface non-claim N-U4) |
-| R3 authenticated device list | `GET /devices?include=keys&all=true` (owner's device bearer only, §7.2) returns per device: `id, name, os, status, created_at, revoked_at, public_key, age_recipient, age_recipient_sig, age_recipient_seq, age_recipient_set_at`, revoked and expired devices included, plus `server_time`. Over TLS to the registry URL of D-ID-4. Integrity rests on the registry (R5) |
+| R1 signing key (invariant I12) | the device's Ed25519 key (§3.1). The private key is used **only inside the devkit lease keeper** (ES-03 §5.1), the only process that reads the key store (§6). The keeper offers its local callers: `sign(prefix, payload)` with the prefix allowlist `aigentry-checkpoint-v1\|`, `aigentry-capture-v1\|` (any other prefix → `SIGN_PREFIX_REFUSED`); `public_key()` and `fingerprint()` (row FP); `device_list()` (the R3 list with `server_time` and approval records) and `device_me()`; `request_approval(action, fields)` (creates an approval request, §8.2). ES-01's own prefixes `aigentry-device-v1\|`, `aigentry-age-recipient-v1\|` and `aigentry-approval-v1\|` are **never** offered through `sign`; the keeper uses them only inside its own `login`, refresh, `register_age_recipient` and `approve(request_id)` operations. `approve` is called by `aigentry-devkit approve` (§9), never by brain or ES-04. The `aigentry-endorsement-v1\|` prefix of earlier revisions is withdrawn (an endorsement is an `endorse` approval). Callers include brain (ES-02 writer, reader and pre-push gate) and the ES-04 CLI; they start the keeper on demand. Key bytes never leave the keeper. If the keeper is unavailable, ES-02/ES-04 write nothing (I12). ID-23 |
+| R2 age recipient (invariant I5) | `age_recipient` + `age_recipient_sig` per device (§3.1), sent with `/devices/authorize` or set later by `PUT /devices/me/age-recipient` (device bearer, new signed value = rotation). Each value carries `age_recipient_seq` inside the signed string (§3.1): `1` at `/authorize`, the stored value + 1 for a rotation. Signing: only the keeper signs `aigentry-age-recipient-v1\|`, inside `register_age_recipient(age_recipient)`, called by `login` or by the recipient's owner (brain) with the public recipient string; the keeper checks the `age1…` format, reads the current `age_recipient_seq` through `device_me()`, signs with the next value and sends it. The registry **refuses** a recipient whose signature does not verify against the row's `public_key` (§8, 422). That is defence in depth: the trust basis is the reader-side check of I5. A client uses a device's `age_recipient` only when the signature verifies against the device's **pinned** `public_key`, its `age_recipient_seq` is not lower than the highest this reader has verified for the device, pinned or in a notice (lower, or equal with a different recipient, is a registry fault: a replayed older value), and a change is used only after an approval valid on that reader (`recipient_accept`, or the `bootstrap` / `endorse` approval that pins the device; I5, §8.2). A higher seq with the same recipient, as `login` registers after an `expired` re-bind, is not a change. **Finding (C6):** ES-02 proposes that the recipient be the device's **existing** brain age key pair, stored as a plain `0600` file at `~/.config/sops/age/keys.txt` (`AgeCrypto.ts:24`; re-measured 2026-10-13 by the reconciliation cycle at brain `0ffa6ee`). It is not new key material. That file does not meet the §6 store rules on macOS (Keychain) or Windows (DPAPI). ES-01 therefore makes **no** claim that the age private half meets §6. Where it lives is D-ID-2 sub-question (b), §10. A same-uid process that can call `register_age_recipient` can also read that `0600` file, so the operation widens nothing beyond the OS-user boundary (interface non-claim N-U4) |
+| R3 authenticated device list | `GET /devices?include=keys,approvals&all=true` (owner's device bearer only, §7.2) returns per device: `id, name, os, status, created_at, revoked_at, public_key, age_recipient, age_recipient_sig, age_recipient_seq, age_recipient_set_at, can_approve`, revoked and expired devices included, plus `server_time` and every retained approval record of the user (§3.3, §8.2). Over TLS to the registry URL of D-ID-4. Integrity rests on the registry (R5) |
 | R4 revoke time | `revoked_at`: server clock, set once, never cleared or moved; revoked rows are never re-bound, and logging in again creates a new `device_id` with a new key (§5). `expired` is not revoked: `revoked_at` stays null and the device's signatures stay valid. Retention: D-ID-5 |
-| R5 trust model (invariants I3, I4, I6, I11) | **Model:** the registry is the **key directory** and is trusted for membership. A compromised registry could add a device key and so become a recipient of new records. **What ES-01 provides for the mitigation:** stable `device_id`; an immutable `public_key` per id; the device fingerprint (format: §8.1 row FP); the signed recipient (R2); and server-clock `created_at` and `revoked_at` that are never moved (§3.1). Clients pin `id + fingerprints + verified age_recipient + age_recipient_seq`. A pinned device whose `public_key`, `created_at` or `revoked_at` changes in a later list, or that disappears from it, is treated as a registry fault, not as an update, and is surfaced (R6); a revoke is never undone (I3). **Endorsement validity, using ES-01 timestamps:** an endorsement is valid only if the endorsed device's server-clock `created_at` **precedes** the endorser's `revoked_at` (or the endorser has no `revoked_at`). An endorsement by a device dated after that device's `revoked_at` is void. An endorsement by a revoked device counts only if the reader saw it (server-clock `first_seen_by`) before the revoke; no other path, and no reference, makes it count (I6). Revoking a device does not revoke the devices it endorsed on readers that had already counted the endorsement. The trust anchors (own device, root = earliest `created_at` revoked or not, user-confirmed local anchors; the root and local anchors are confirmed only on a terminal through `aigentry-brain trust bootstrap` / `trust anchor`, never through an MCP tool, I4) and the scoped recovery trigger are defined by I4/I11 and ES-02 §5.6, under ES-02 decision D-9 (pending user decision; decision bundle 2h default). ES-01 supplies the `created_at` order the trigger uses, and the `status` the readers' key-state codes use: an `expired` device re-binds with the same `device_id` and key (§5, ID-7), so a reader counts it as a possible holder of records it cannot decrypt; only `revoked` (never re-bound, R4) is final, so a reader reports `*_UNRECOVERABLE_KEY` only when every other device in the list is revoked (I11, interface non-claim N-U1). Endorsements are signed with the endorser's device key through the R1 `sign` operation, under `aigentry-endorsement-v1\|`, over the canonical signed fingerprint form (row FP). The endorsement file, its storage in the brain repo, and whether endorsement is required (D-9) belong to ES-02. ES-01 adds no server-side endorsement and does not make the registry the judge of trust. Because `created_at`/`revoked_at` are registry assertions, they are as trustworthy as the registry under this model; pinning makes later changes visible but cannot prove the first value (non-claim N-U3) |
-| R6 change notice | The list makes every change ES-02 must announce observable, so a client can diff it against its pinned set: **addition** (a new `device_id`), **key change** (new `age_recipient`/`age_recipient_sig`, with `age_recipient_set_at`; `public_key` never changes for an id), **revoke** (`status`, `revoked_at`). The list carries the fields the notice must show: `name`, `os`, `created_at`, fingerprints. Every list response includes `server_time`, so the client can show freshness. Showing the notice (CLI/MCP, `recipients_changed`) before the new set is used for writes, with removals taking effect immediately, is the client's job (ES-02) |
+| R5 trust model (invariants I3, I4, I6, I11) | **Model:** the registry is the **key directory** and is trusted for membership. A compromised registry could add a device key and so become a recipient of new records. **What ES-01 provides for the mitigation:** stable `device_id`; an immutable `public_key` per id; the device fingerprint (format: §8.1 row FP); the signed recipient (R2); and server-clock `created_at` and `revoked_at` that are never moved (§3.1). Clients pin `id + fingerprints + verified age_recipient + age_recipient_seq`. A pinned device whose `public_key`, `created_at` or `revoked_at` changes in a later list, or that disappears from it, is treated as a registry fault, not as an update, and is surfaced (R6); a revoke is never undone (I3). **Endorsement validity, using ES-01 timestamps:** an endorsement is valid only if the endorsed device's server-clock `created_at` **precedes** the endorser's `revoked_at` (or the endorser has no `revoked_at`). An endorsement by a device dated after that device's `revoked_at` is void. An endorsement by a revoked device counts only if the reader saw it (server-clock `first_seen_by`) before the revoke; no other path, and no reference, makes it count (I6). Revoking a device does not revoke the devices it endorsed on readers that had already counted the endorsement. The trust anchors (own device, root = earliest `created_at` revoked or not, local anchors; the root and local anchors enter a reader only through a `bootstrap` or `anchor` approval valid on that reader, §8.2, I4) and the scoped recovery trigger are defined by I4/I11 and ES-02 §5.6, under ES-02 decision D-9 (pending user decision; decision bundle 2h default). ES-01 supplies the `created_at` order the trigger uses, and the `status` the readers' key-state codes use: an `expired` device re-binds with the same `device_id` and key (§5, ID-7), so a reader counts it as a possible holder of records it cannot decrypt; only `revoked` (never re-bound, R4) is final, so a reader reports `*_UNRECOVERABLE_KEY` only when every other device in the list is revoked (I11, interface non-claim N-U1). An endorsement is an `endorse` approval (§3.3, §8.2): signed with the endorser's device key inside the keeper's `approve` under `aigentry-approval-v1\|`, over the canonical signed fingerprint form (row FP), stored as an approval record and listed with R3. The reader rules (ES-02 §5.6 E1–E4) and whether endorsement is required (D-9) belong to ES-02. ES-01 stores and checks approvals as defence in depth; it does not make the registry the judge of trust: readers verify every approval themselves (interface invariants §B.1 V1–V6). Because `created_at`/`revoked_at` are registry assertions, they are as trustworthy as the registry under this model; pinning makes later changes visible but cannot prove the first value (non-claim N-U3) |
+| R6 change notice | The list makes every change ES-02 must announce observable, so a client can diff it against its pinned set: **addition** (a new `device_id`), **key change** (new `age_recipient`/`age_recipient_sig`, with `age_recipient_set_at`; `public_key` never changes for an id), **revoke** (`status`, `revoked_at`). The list carries the fields the notice must show: `name`, `os`, `created_at`, fingerprints. Every list response includes `server_time`, so the client can show freshness. Recording the notice, requesting the approval (§8.2) and using a new recipient only after a valid approval, with removals taking effect immediately, is the client's job (ES-02) |
 | R7 Git-stored data | ES-01 §7.2/§7.3 no longer claim registry-transaction enforcement for brain-Git data; readers verify against R3 |
 | Revoke semantics for Git-stored data (invariants I6, I8, I10) | `DELETE /devices/{id}` sets `revoked_at` once (server clock) and stops every registry ES-0x request that starts after it commits (§7.2), including the revoked device's own `device_list()`. For brain-Git data the revoke takes effect **on each client at that client's next successful list fetch**: the device leaves the recipient set at once, every unpushed object (new records, checkpoint rekey siblings, captures) is re-wrapped before any push (I10), and **all** its items are re-checked, those that now fail being demoted (I8). Ciphertext pushed before that fetch stays readable by the revoked device, and so does its Git access (interface non-claims N-U2, ES-02 §5.3, D-8). ES-01 claims nothing about brain-Git data beyond supplying `revoked_at` and `server_time` |
 | GitHub binding (ES-02 §5.2) | `GET /devices/me` returns `github_id` (stable) and `github_login` of the user, so a client can check that the brain repo's GitHub owner is the same account. The binding is the existing `users.github_id` (§1.1); nothing new is stored |
@@ -502,6 +552,62 @@ Errors use the RFC 8628 names for the token endpoint (`authorization_pending`,
 
 Per 제15조 these request/response schemas are registered in aigentry-ssot before
 implementation; the registry owns the server, devkit owns the client.
+
+### 8.2 Approvals (interface invariants §B.1 "Approval", I4, I5, I11, I12; revision 6)
+
+An approval is the one way a user confirms a trust input: a **bootstrap**, a local **anchor**, an **endorsement**,
+or the **acceptance of a recipient change**. ES-01 owns the format (§3.3), the endpoints (§8) and the server-side
+checks. The trust basis is the reader-side check (invariants §B.1 V1–V6); everything below is defence in depth plus
+the audit record. Brain, ES-04 and MCP tools request approvals and verify them from the list. They never create one.
+
+**Request.** `POST /approval-requests` (device bearer, through the keeper's `request_approval`, ES-03 §5.1) with
+`action` and the bound fields of §3.3. The registry sets `nonce`, `issued_at`, `expires_at` (server clock; validity
+window a technical value, proposed 15 min) and `requested_by_device_id`, and refuses (422) a `bootstrap` or `anchor`
+request whose `reader_device_id` is not the caller. A duplicate pending request returns the existing one.
+
+**Approve.** `POST /approval-requests/{id}/approve` with `channel`, in one of two kinds:
+- `device`: device bearer of the approver **and** `sig`, the approver's Ed25519 signature over the §3.3 canonical
+  string, made only inside the keeper's `approve(request_id)`. The keeper builds that string from the pending request
+  as the registry returns it; its caller supplies no payload (ES-03 §5.1).
+- `account`: browser JWT, the intent header `X-Aigentry-Intent: trust-approve` (as §4 for device approval, so a
+  cross-site post cannot approve), and a fresh second factor. The method is D-ID-6 (a), pending user decision.
+
+In one transaction the registry refuses, writing nothing:
+- a request that is not `pending` → 409 `approval_consumed` (single use; a replay);
+- `now > expires_at` → 410 `approval_expired` (the request becomes `expired`);
+- a `device` signature that does not verify against the approver's stored `public_key` → 422 `approval_sig_invalid`
+  (a signature over another device, fp, seq or digest fails here);
+- an approver that is not `active`, has `can_approve: false`, or belongs to another user → 403 / 404 (§7.4);
+- a kind or approver the action does not allow (interface invariants §B.1 approver rules) → 422
+  `approval_kind_not_allowed`. For a `bootstrap` the registry checks the approver against the request's `scope`
+  device ids, and refuses `r` itself, or an `account` approval, while `scope` lists another `active` device. For
+  an `endorse`, only `device` kind. For an `anchor`, the approver is the candidate or `account`;
+- `account` kind without a verified second factor → 401 `second_factor_required`.
+
+Otherwise it sets `state='approved'` with `UPDATE … WHERE id = :id AND state = 'pending' AND now() <= expires_at`
+(one winner under concurrency) and inserts the `approvals` row with server-clock `approved_at`.
+`POST …/deny` consumes the nonce the same way and records `denied`.
+
+**List.** `GET /devices?include=keys,approvals&all=true` returns every retained approval record of the user with all
+bound fields, so readers verify each one on their own (R3). `GET /approval-requests` gives the channels the pending
+requests (with the display `scope`) and the history: action, target, approver, kind, channel, `approved_at`. The
+browser settings page and Kkoma show the same history. This is the user-visible audit.
+
+**`can_approve`** (per device). Turning it off is allowed to any of the owner's device bearers and to the browser
+session. Turning it on needs the browser session plus the second factor, so an agent holding one device's bearer
+cannot enable approval on another device. The default for new devices is D-ID-6 (c), pending user decision.
+
+**Channels.** All of them produce the same record:
+- the terminal on a device that can approve (`aigentry-devkit approve`, §9; its input discipline, including the
+  Windows console form, is in interfaces §B.1 "Channels");
+- the registry approval page (the §4 page; `account` kind);
+- Kkoma/mobile (`device` kind when it is registered as a device holding its own key, otherwise `account`; D-ID-6 (b)).
+
+**What an approval proves.** That the approver device's key, or the account with its second factor, approved this
+exact target, scope and seq inside the window, once. It does **not** prove that a person acted: a program that
+drives that device's terminal, or that can call its keeper, approves the same way (interface non-claim N-U4). The
+mitigations are the record itself, `can_approve`, revoke (§5), and the rule that the approver of a device is never
+that device while another active device exists (invariants §B.1).
 
 ## 9. CLI surface (devkit; hosted in the `aigentry-devkit` binary, one of the two shipped — `package.json:19-20`)
 
@@ -517,6 +623,9 @@ shipped by devkit. `aigentry-devkit-bootstrap` gets no new command.
 | `aigentry-devkit device list` | `--json`, `--all` (include revoked/expired) | own devices, current marked; server-recorded `fingerprint` per device; for the current device also `fingerprint_local` (from its own key store, never from the server) and `fingerprint_match` (§8.1 FP) | 0, 1, 4, 6 key mismatch |
 | `aigentry-devkit device revoke <device-id>` | `--yes`, `--json` | revoke one of own devices (lost-device path); confirmation required without `--yes` | 0, 1, 4 |
 | `aigentry-devkit device rename <device-id> <name>` | `--json` | | 0, 1, 4 |
+| `aigentry-devkit approve [<request_id>]` | `--json` (output only) | terminal channel of §8.2. Without an id it lists the pending requests. With an id it shows the request (action, target name/os/`created_at`, fingerprint, `age_recipient_seq`; for `bootstrap` every device of `scope` and the root). For `bootstrap` and `endorse` it compares the target with this device's pins, read through `aigentry-brain trust refresh` (interface invariants BR-6), and refuses a device whose fp differs from its pin or that it does not trust unless the user types that device's name (`APPROVAL_SCOPE_MISMATCH`). It refuses `endorse` on a device with no `root` anchor (`APPROVAL_NOT_BOOTSTRAPPED`). It then asks under the input discipline of invariants §B.1 "Channels" (`isatty(2)`, answer from `/dev/tty`, on Windows `CONIN$`; never stdin, argument, flag or environment) and calls the keeper's `approve`. There is no `--yes` | 0 approved, 1 not logged in, 3 denied/declined, 4 network unknown, 7 refused (no terminal, scope mismatch, not bootstrapped, `can_approve` off) |
+| `aigentry-devkit approvals` | `--json`, `--all` | approval history of the account (§8.2) | 0, 1, 4 |
+| `aigentry-devkit device can-approve <device-id> on\|off` | `--json` | `off` directly; `on` prints the approval-page URL, because it needs the second factor (§8.2) | 0, 1, 4 |
 
 `--json` output never contains tokens, codes or key bytes. The registry UI gets the same
 list/revoke on the existing settings page (`oauth.py:90` redirects there after login),
@@ -535,6 +644,7 @@ gains an optional "log this device in now?" step that runs `aigentry-devkit logi
 | D-ID-3 | Enabling device credentials on a deployed registry (new credential type + new endpoints) | permission expansion / production deploy | ship behind `DEVICE_AUTH_ENABLED=false`; enable per instance after ES-09 isolation tests pass |
 | D-ID-4 | Devices talk to the registry over its existing HTTPS endpoint (new client→server traffic from every device) | network change / personal-data transfer | allowed only to the registry URL the user chose at install (cloud or self-hosted); no new relay |
 | D-ID-5 | Retention of `revoked`/`expired` device rows (`name`, `os`, `client_version`, `last_seen_at`, keys, `revoked_at`) and of `device_authorizations` (incl. request network prefix, §4) | personal data | `expired` rows kept as they are (they can re-bind, §5). `revoked` rows: `os`, `client_version`, `last_seen_at` cleared 90 days after `revoked_at`; `id`, `name`, `public_key`, `age_recipient`, `age_recipient_sig`, `age_recipient_seq`, `status`, `created_at`, `revoked_at` kept for the account's life (`created_at` because ES-02 endorsement validity compares it with the endorser's `revoked_at`), because ES-02/ES-04 readers verify old signatures against them (§8.1); all rows deleted with the account. `device_authorizations` purged 24 h after a terminal state (§3.2). Every other `devices` column (`age_recipient_set_at`, `revoked_reason`, `revoked_by_device_id`, `key_alg`, `tenant_id`, `user_id`) is kept with the row; the refresh hashes and family id are cleared at revoke, because no reader needs them. After the 90 days the R6 notice for that device shows `os: unknown` |
+| D-ID-6 | Approvals (§3.3, §8.2; decision bundle 2i): (a) the second factor for `account` approvals, and which options a user's first device (or a lone survivor) is offered; (b) whether Kkoma/mobile registers as an ES-01 device holding its own key (then it gives `device` approvals, including a second device's bootstrap and endorsements), and where that key is kept; (c) the `can_approve` default for new devices; (d) retention of `approval_requests` and `approvals` | authentication / permission / personal data | (a) WebAuthn passkey with user verification on the approval page and in Kkoma, verified with the existing `cryptography` dependency; GitHub re-authentication is **not** recommended, because a live GitHub browser session can complete it without a prompt. First device: both its own terminal approval and an `account` approval are offered. (b) yes: Kkoma logs in with the §4 flow, keeps its key in the platform key store behind user presence, and gives `account` approvals only until then. (c) `true` for an account's first device and for Kkoma; `false` for every later device until the user turns it on (browser + second factor), so that agent-driven hosts do not approve by default. (d) requests purged 24 h after a terminal state; approvals kept for the account's life (later fresh devices verify `bootstrap`/`endorse` records, and they are the audit), deleted with the account |
 
 ## 11. What this does NOT guarantee
 
@@ -545,6 +655,8 @@ gains an optional "log this device in now?" step that runs `aigentry-devkit logi
   registry (brain Git repo, ES-02 §5.3 "Known limit").
 - No secret of any kind (API keys, `.env`, SSH keys, cloud credentials) is synchronised by
   identity. ES-04 shares only env **names** and supply paths.
+- An approval (§8.2) proves which key or account approved, not that a person did: a program that drives an
+  approval-capable device's terminal, or calls its keeper, approves the same way (interface non-claim N-U4).
 - Identity does not move processes; a device that comes back reconnects and recreates its
   state (ES-03 §9 fencing rejects its stale work).
 
@@ -552,7 +664,7 @@ gains an optional "log this device in now?" step that runs `aigentry-devkit logi
 
 | Reused unchanged | New |
 |---|---|
-| `users`, `tenants`, GitHub OAuth web flow, JWT signing key/algorithm, `decode_token`, Redis (as the limiter store only; device revoke does not use the Redis revoke list, §7.2), the `main.py` slowapi `Limiter` object (not its unwired defaults), request transaction, `cryptography`/PyJWT | `devices`, `device_authorizations`, `/api/v1/devices/*`, `get_current_device`, `device_access` token type, refresh family/reuse detection, per-route rate limits on `/devices/*`, device-approve page, devkit `login/logout/whoami/device *`, per-OS key store |
+| `users`, `tenants`, GitHub OAuth web flow, JWT signing key/algorithm, `decode_token`, Redis (as the limiter store only; device revoke does not use the Redis revoke list, §7.2), the `main.py` slowapi `Limiter` object (not its unwired defaults), request transaction, `cryptography`/PyJWT | `devices`, `device_authorizations`, `/api/v1/devices/*`, `get_current_device`, `device_access` token type, refresh family/reuse detection, per-route rate limits on `/devices/*`, device-approve page, devkit `login/logout/whoami/device *`, per-OS key store; `approval_requests`, `approvals`, `devices.can_approve`, `/approval-requests*`, `aigentry-devkit approve` / `approvals` / `device can-approve`, keeper `approve` / `request_approval` (§8.2) |
 
 ## 13. Migration for existing users
 
@@ -606,9 +718,10 @@ marked *supplementary* are analogues and are **not** coverage of the named user 
 | ID-18 | `X-API-Key` (valid tenant key) on every ES-0x endpoint → 401; the same key still works on an existing endpoint | other account isolation (tenant key) |
 | ID-19 | `POST /devices/approve` with a valid browser cookie but without `X-Aigentry-Intent: device-approve` → 403 and the authorization stays `pending`; a cross-origin form post cannot approve | other account isolation (approval CSRF) |
 | ID-20 | Approval page shows name/os/version, request time and network prefix; a spoofed `X-Forwarded-For` from an untrusted peer does not change the displayed prefix (it is the socket peer's); the 21st active device → `device_limit` | other account isolation (device-code phishing) |
-| ID-21 | `GET /devices?include=keys&all=true` returns keys, signed age recipients and `revoked_at` for active **and** revoked devices; a tampered `age_recipient` fails its signature check against `public_key`, and `PUT /devices/me/age-recipient` or `/authorize` with a bad signature → 422 `age_recipient_sig_invalid`, nothing stored; a replay of an earlier validly signed value (`age_recipient_seq` not greater than the stored one) → 409 `age_recipient_seq_stale`, nothing stored; `revoked_at` never changes after revoke; `created_at` is unchanged by an `expired` re-bind; idle expiry leaves `revoked_reason`/`revoked_at` null; logging in again after a revoke yields a new `device_id` | revoked device (ES-02/ES-04 reader inputs) |
+| ID-21 | `GET /devices?include=keys,approvals&all=true` returns keys, signed age recipients and `revoked_at` for active **and** revoked devices; a tampered `age_recipient` fails its signature check against `public_key`, and `PUT /devices/me/age-recipient` or `/authorize` with a bad signature → 422 `age_recipient_sig_invalid`, nothing stored; a replay of an earlier validly signed value (`age_recipient_seq` not greater than the stored one) → 409 `age_recipient_seq_stale`, nothing stored; `revoked_at` never changes after revoke; `created_at` is unchanged by an `expired` re-bind; idle expiry leaves `revoked_reason`/`revoked_at` null; logging in again after a revoke yields a new `device_id` | revoked device (ES-02/ES-04 reader inputs) |
 | ID-22 | Fingerprint (§8.1 FP): for the current device `device list`/`whoami` show `fingerprint_local` computed from the local key and `fingerprint_server` from the list, both in `aigfp1:` format; equal for an honest registry; a fixture registry that serves a substituted `public_key` yields `fingerprint_match=false`, a stderr warning and exit 6; the local value never changes when the server response changes; known-answer vector for the format | other account isolation (key substitution) |
 | ID-23 | Keeper signing and list (§8.1 R1; interface invariant I12): (a) a local caller asks `sign` with `aigentry-device-v1\|`, `aigentry-age-recipient-v1\|` and an unknown prefix → `SIGN_PREFIX_REFUSED` each, nothing signed; `sign` with `aigentry-checkpoint-v1\|` returns a signature that verifies with the device's `public_key`; (b) the calling process (a fixture standing in for brain) opens no file under the device directory and receives no key bytes over the socket (protocol capture); (c) `register_age_recipient` with a malformed recipient → refused; with a valid one → the registry stores it with a verifying signature; (d) `device_list()` returns the R3 list with `server_time`; after the device is revoked, its `device_list()` → 401 `device_inactive` | revoked device (ES-02/ES-04 signer and list inputs) |
+| ID-24 | Approval primitive (§3.3, §8.2; interface invariants §B.1 "Approval", I4, I5, I12): (a) a device bearer creates a `bootstrap` request for itself → `pending` with server `issued_at`/`expires_at` and a fresh nonce; for another `reader_device_id` → 422; a duplicate → the same request; (b) a valid `device` approval → `approved`, one `approvals` row with server `approved_at`, listed with `include=approvals`; a second approve of the same request (replay) → 409 `approval_consumed`, nothing written; two concurrent approves → exactly one wins; (c) an approve after `expires_at` (fixture clock) → 410 `approval_expired`, nothing written; (d) signatures over another `target_device_id`, `target_fp`, `target_age_recipient_seq` or `scope_digest` → 422 `approval_sig_invalid`; (e) approver revoked, or `can_approve: false` → 403; an `account` approval of an `endorse` → 422 `approval_kind_not_allowed`; an `account` approval of a `bootstrap` whose `scope` lists another active device, or `r` approving its own such bootstrap → 422; an `account` approval without a second factor, or without the intent header → 401 / 403; (f) `can-approve on` with a device bearer only → 403, with browser + second factor → set; `off` with any own device bearer → set; (g) the keeper's `sign` with `aigentry-approval-v1\|` → `SIGN_PREFIX_REFUSED`; `approve(request_id)` signs exactly the canonical string of the pending request (protocol capture; the caller cannot supply a payload); `aigentry-devkit approve` with stderr piped or the answer on stdin → exit 7, no approval; under a fixture pseudo-terminal with the answer typed → approved (the documented N-U4 residual, not a defence); (h) the same `aigentry-devkit approve` discipline on Windows (`CONIN$`, console handle; no console → exit 7); (i) user Y's device or browser approving user X's request → 404, identical body | revoked device (approval replay, staleness, wrong target) |
 
 ### 15.1 Testability per row (criterion 4)
 
@@ -651,3 +764,4 @@ Status today for **every** row: **NOT RUN**. No implementation exists, and this 
 | ID-21 | list contents and immutability for ES-02/ES-04 readers | reader-side verification itself (ES-02 CK-11) | F1 (yes) | implementation |
 | ID-22 | local vs server fingerprint, format, mismatch exit | whether the user actually compares out of band | F1 (yes) | implementation |
 | ID-23 | keeper prefix allowlist, no key bytes to callers, recipient registration, list through the keeper | other same-uid processes using the keeper (OS-user boundary, interface non-claim N-U4); macOS/Windows keeper (ES-03 Q-17) | F1 (yes, Linux keeper) | implementation; D-Q-9 |
+| ID-24 | (a)–(g), (i): request binding, single use, expiry, signature binding to device/fp/seq/digest, approver rules, `can_approve`, prefix refusal, the terminal channel's discipline against incidental runs | whether a person, rather than a program driving the terminal or calling the keeper, approved (N-U4); a compromised or equivocating registry (N-U3); the real passkey / Kkoma channels (D-ID-6) | F1 (yes, Linux keeper; (h) no) | implementation; (h) **BLOCKED**: no Windows runner (D-Q-6) |

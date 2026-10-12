@@ -596,31 +596,48 @@ one-shot, and the orchestrator is an agent CLI session. Neither can be the heart
 - **Identity operations** (ES-01 §8.1 R1/R2/FP; interface invariant I12), the only way any
   other component uses the device key or the device list:
   - `sign(prefix, payload)` → signature. Prefix allowlist: `aigentry-checkpoint-v1|`,
-    `aigentry-capture-v1|`, `aigentry-endorsement-v1|`. Any other prefix, including ES-01's
-    `aigentry-device-v1|` and `aigentry-age-recipient-v1|`, → `SIGN_PREFIX_REFUSED`. The
-    keeper signs those two only inside its own `login`, refresh and
-    `register_age_recipient` operations.
+    `aigentry-capture-v1|`. Any other prefix, including ES-01's `aigentry-device-v1|`,
+    `aigentry-age-recipient-v1|` and `aigentry-approval-v1|`, → `SIGN_PREFIX_REFUSED`. The
+    keeper signs those three only inside its own `login`, refresh, `register_age_recipient`
+    and `approve` operations. The `aigentry-endorsement-v1|` prefix of earlier revisions is
+    withdrawn: an endorsement is an ES-01 `endorse` approval (ES-01 §3.3, §8.2).
   - `public_key()`, `fingerprint()` (ES-01 FP; the local value, never from the registry).
   - `register_age_recipient(age_recipient)`: checks the `age1…` format, reads the current
     `age_recipient_seq` through `device_me()`, signs with the next value (ES-01 §3.1, §8.1 R2) and
     sends `PUT /devices/me/age-recipient`.
-  - `device_list()`: a proxied `GET /devices?include=keys&all=true` returning the list and
-    `server_time`; `device_me()`: a proxied `GET /devices/me`.
+  - `device_list()`: a proxied `GET /devices?include=keys,approvals&all=true` returning the
+    list, the user's approval records and `server_time`; `device_me()`: a proxied
+    `GET /devices/me`.
+  - `request_approval(action, fields)`: creates an ES-01 approval request for this device
+    (ES-01 §8.2) and returns `request_id`, `nonce`, `issued_at`, `expires_at`. It confers
+    nothing.
+  - `approve(request_id)`: fetches that pending request, builds the canonical
+    `aigentry-approval-v1|` string from the registry's fields (the caller supplies no payload),
+    signs it and sends it (ES-01 §8.2). Its only intended caller is `aigentry-devkit approve`
+    (ES-01 §9); brain and the ES-04 commands never call it.
 - **Callers:** the dispatch gate, the `aigentry-devkit` CLI (incl. the ES-04 capture/restore
   commands, which use `sign` only and obtain the device list and trust state through brain's
-  `aigentry-brain trust refresh`, interface invariants I3/I12, BR-6) and brain (ES-02 writer, reader,
-  pre-push gate and `trust refresh`). Each starts the keeper on
+  `aigentry-brain trust refresh`, interface invariants I3/I12, BR-6), brain (ES-02 writer, reader,
+  pre-push gate and `trust refresh`, which also calls `request_approval`) and
+  `aigentry-devkit approve` (the only caller of `approve`). Each starts the keeper on
   demand. This local protocol is a 제15조 contract: it is registered in aigentry-ssot before
   implementation, with devkit as owner and brain and the orchestrator as consumers.
 - **Authority:** any process running as the same OS user that can reach the socket can
   claim, complete, annotate, sign under the allowed prefixes and read the device list. That
   includes an unconfined agent CLI. "No agent CLI holds registry credentials" is true of
   tokens and key bytes, **not** of authority. The OS user is the boundary (interface
-  non-claim N-U4). In particular, such a process can sign an `aigentry-endorsement-v1|`
-  endorsement: the fingerprint comparison before an endorsement is a step of the user
-  interface, not something the keeper enforces, and a prompt-injected agent could endorse a
-  registry-listed device (ES-02 §5.6). Sandbox exclusion of the socket is the only narrower control, and it is
-  not measured (below).
+  non-claim N-U4). In particular, on a device whose `can_approve` is true, such a process can
+  call `approve` and so approve a pending bootstrap, anchor, endorsement or recipient change
+  (ES-01 §8.2): the keeper cannot tell a person from a program, and the comparison the
+  terminal channel shows is a step of the user interface, not something the keeper
+  enforces. What narrows it: `approve` signs only a pending request's canonical string, one
+  request per call, and every approval is listed with this device as approver; `can_approve`
+  off on hosts that agents drive (ES-01 D-ID-6). Such a process can also call
+  `register_age_recipient`: on the other devices that only holds pushes until a
+  `recipient_accept` approval (interface invariant I5); on this device the registry value then
+  differs from the local age key, a registry fault there, and the remedy is to register the
+  local key again (`aigentry-devkit login`, next seq). Sandbox exclusion of the socket is the
+  only narrower control, and it is not measured (below).
 - **Credentials:** it is the only process that reads the ES-01 key store. Callers talk to it
   over a local endpoint: a Unix domain
   socket `0600` in the device directory (`0700`), with peer-uid check (`SO_PEERCRED` /
