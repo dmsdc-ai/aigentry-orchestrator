@@ -644,7 +644,10 @@ one-shot, and the orchestrator is an agent CLI session. Neither can be the heart
   device as approver and logged locally; `can_approve`
   off on hosts that agents drive (ES-01 D-ID-6). Such a process can also call
   `register_age_recipient`: on the other devices that only holds pushes until a
-  `recipient_accept` approval (interface invariant I5); on this device the registry value then
+  `recipient_accept` approval (interface invariant I5), of kind `device` under the recommended
+  ES-01 D-ID-6 (e) (B); under alternative (A) also an `account` one, which a compromised registry
+  can forge, so that every reader would then use the rogue value (stated residual, interface
+  invariants §B.1 "`account` `recipient_accept`", N-U3; revision 10); on this device the registry value then
   differs from the local age key, a registry fault there, and the remedy is to register the
   local key again (`aigentry-devkit login`, next seq). Sandbox exclusion of the socket is the
   only narrower control, and it is not measured (below).
