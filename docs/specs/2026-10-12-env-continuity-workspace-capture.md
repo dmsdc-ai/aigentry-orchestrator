@@ -244,7 +244,7 @@ fetch ciphertext (decrypting captures written before the revoke) and push refs, 
 
 ### 6.1 Preview (read-only; no writes)
 Fetch and decrypt the capture, verify integrity and the writer signature with the same reader-side rules
-as ES-02 §5.4 (device in the authenticated, trusted list of the logged-in user; signature valid;
+as ES-02 §5.4 and the invariants of ES-02 §5.7 (device in the authenticated, trusted list of the logged-in user; signature valid;
 `user_id` match; a capture by a revoked device with `created_at ≥ revoked_at` → `RESTORE_DEVICE_REVOKED`;
 an older one is anchored only if its seen ref's `first_seen_by` is earlier than `revoked_at`, else
 `RESTORE_REVOKED_WRITER_UNANCHORED` — shown only with a warning and an explicit user choice; the ref name
