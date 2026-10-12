@@ -40,7 +40,8 @@ review. Tags `[REQ]`/`[DRAFT]`/`[EXISTING]` mark statements that restate an exis
 | A1 | Checkpoints are **immutable, append-only, one encrypted file per record** under `checkpoints/v1/…` in the existing brain repo — not brain entries | entries are merged by LWW and stored in one rewritten file (finding 1) → a concurrent device's context would be dropped |
 | A2 | Conflict = **lineage fork + explicit user choice**; no automatic merge or LWW for checkpoints | `[DRAFT line 43]`; avoids silent loss |
 | A3 | Incremental cursor is local (`remote_commit` + seen set) with `git diff --name-only` fast path and `ls-tree` fallback (shallow clones) | `SyncBackend` lacks primitives; clone is `--depth 1` |
-| A4 | Encryption **fail-closed**; recipients = ES-01 active device keys (not TOFU) for checkpoints and captures | finding 2 |
+| A4 | Encryption **fail-closed**; recipients = ES-01 active, trusted device keys (not TOFU) for checkpoints and captures | finding 2 |
+| A4b | Every checkpoint record and capture manifest is **signed with the writer's ES-01 device key**; readers verify against the authenticated device list (incl. `revoked_at`) and reject unknown, forged or post-revoke writers. Revoke is enforced reader-side, because Git writes never pass through the registry. Requirements on ES-01 are listed in ES-02 §5.5 | `integrity` is unkeyed and age gives no sender authentication; anyone with push access could otherwise write as any device; `[DRAFT line 36]` device-key signing |
 | A5 | Transcript storage default = **hash + summary (M1)**; raw (M2) opt-in per project | Git history makes raw deletion impractical; `[REQ line 39]` original-vs-summary marking |
 | A6 | Restore through an **optional extension** of `brain_context_resume`; default output unchanged; every restored item marked `original`/`summary`/`unavailable` | `[DRAFT line 44]`, backward compatibility |
 | A7 | Workspace capture = git metadata + shelf commit + bundle of unpushed commits, built without touching the user's index/worktree; ignored files never captured; deny-list + content scan + size caps, applied to the unpushed commit range too (a hit refuses that repo's bundle; no-upstream base = merge-base with the remote default branch or a user-named base); symlinks never followed | `[REQ line 41]` |
@@ -75,6 +76,12 @@ review. Tags `[REQ]`/`[DRAFT]`/`[EXISTING]` mark statements that restate an exis
   device (or post-registration writes) to read older records; brain repo grows with checkpoint files
   (bounded by retention and the 1 MiB record cap) and capture refs (50 MiB cap, newest 5 per device).
 - Isolation depends on ES-01 binding the brain repo's GitHub account to the aigentry `user_id` — open.
+- A revoked device keeps Git access to the brain repo until the user revokes its GitHub credential
+  (outside aigentry). Until then it can pull ciphertext (decrypting everything written before the revoke),
+  read path metadata and push. Its new writes are rejected by readers, but deletions/overwrites are only
+  detected, not prevented (ES-02 §5.3; D-8).
+- The registry is the key directory. Without the endorsement step (D-9), a compromised registry could add
+  a recipient and read every new record.
 - brain needs a content secret scanner (new code, false negatives possible; guarantee is "scanned").
 - **Linux-only caveat** `[REQ line 52]`: only Linux can be exercised now (Mac offline, line 60); macOS and
   Windows file-system rows (WS-12) and install/reconnect rows remain unverified until real runners exist.
@@ -98,6 +105,8 @@ Matches requirement order line 56 and draft release split R-B (draft line 78).
 | D-4 | Expiry deletion executing automatically in the user's repo (commits deleting files/refs) | 운영 데이터 변경/삭제 | allowed for aigentry-created paths/refs only, after the user enables sync; history rewrite never automatic |
 | D-5 | Binding the brain repo GitHub account to the aigentry account (ES-01) | 권한 확대 | record binding only; no new GitHub scopes; reuse the user's existing `gh`/git credentials |
 | D-6 | Uploading uncommitted code (including unpushed commits) off the device at all | 개인정보 전송 | allowed only by explicit per-capture command; no automatic/periodic capture in this release |
+| D-8 | Revoked device's remaining Git access (S1 known limit, ES-02 §5.3) | 권한 (축소 미완) / 개인정보 | accept as a stated known limit; the revoke flow includes a required user step "revoke this machine's GitHub credential" and shows `git_access: unknown` until the user confirms; aigentry gets no GitHub scope to do it itself |
+| D-9 | Key-directory trust: is a registry-listed device a recipient immediately, or only after an existing trusted device endorses it (ES-02 §5.5 R5/R6) | 개인정보 전송 | endorsement required (one confirmation per new device, on any trusted device, after comparing fingerprints) + recipient-change notice; registry-only is the fallback if the user prefers fewer steps and accepts that a compromised registry can read new records |
 
 Technical items the orchestrator can decide without the user (Rule 47 §1): record layout, cursor design,
 JCS canonicalisation, error codes, detector list, freshness defaults.

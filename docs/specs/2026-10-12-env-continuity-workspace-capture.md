@@ -6,7 +6,7 @@
   acceptance criterion 4 (line 41), verification line 51; build-plan draft §3 ES-04 (lines 54–57).
 - Owners (proposal): aigentry-devkit (CLI + manifest) + workspace owner; storage via aigentry-brain repo
   (§5) unless the user chooses otherwise.
-- Depends on: ES-01 (user/device identity, device keys). Optional link to ES-02 (`workspace_capture_id`
+- Depends on: ES-01 (user/device identity, device keys; the requirements on ES-01 are those of ES-02 §5.5). Optional link to ES-02 (`workspace_capture_id`
   in a checkpoint).
 - ADR: `docs/adr/2026-10-12-env-continuity-context-and-workspace.md`.
 
@@ -82,9 +82,13 @@ the user; macOS/Windows file-system behaviour (case folding, symlinks, path leng
   "runtime": Runtime,
   "nonportable": [ NonPortable ],
   "limits": { "max_file_bytes", "max_total_bytes", "applied": bool },
-  "integrity": { "alg": "sha256", "canonical": "jcs", "content_sha256", "bundle_sha256" }
+  "integrity": { "alg": "sha256", "canonical": "jcs", "content_sha256", "bundle_sha256" },
+  "signature": { "alg": "ed25519", "device_id", "sig" }
 }
 ```
+`content_sha256` covers the manifest without `integrity` and `signature`. `sig` = the writer's ES-01 device
+key over `"aigentry-capture-v1|" + user_id + "|" + capture_id + "|" + content_sha256 + "|" + bundle_sha256`
+(writer authentication; `[DRAFT line 36]` device-key signing, binding new).
 
 ### 2.1 Repo
 | Field | Rule |
@@ -187,8 +191,9 @@ Symlinked directories are never traversed (prevents capturing outside the root).
    untracked files (temporary index via `GIT_INDEX_FILE`), never `git stash push`.
 3. Resolve `base` and scan `base..HEAD` (§3.4); on a refusal nothing of that repo is bundled. Otherwise build
    `git bundle` containing `base..HEAD` (unpushed commits) + the shelf commit(s).
-4. Write manifest, compute integrity, encrypt bundle + manifest (age, recipients = user's active devices,
-   fail-closed — no plaintext fallback, cf. brain `ProfileFormat.ts:160-181` which does fall back).
+4. Write manifest, compute integrity, sign (§2), encrypt bundle + manifest (age, recipients = user's
+   active, trusted devices per ES-02 §5.5, fail-closed — no plaintext fallback, cf. brain
+   `ProfileFormat.ts:160-181` which does fall back).
 5. Store (§5); print a summary: captured repos, excluded paths with reasons, non-portable items, size.
 
 The source working tree, index, stash list, branches and refs are unchanged by capture (tested, WS-08).
@@ -204,12 +209,19 @@ The source working tree, index, stash list, branches and refs are unchanged by c
 Recommended default **S1** with: retention 14 days per capture, keep at most the newest 5 captures per
 device, 50 MiB cap. Rationale: no new infrastructure or credentials (Article 1, 17), per-user isolation
 already exists, data encrypted to the user's devices, cost borne by the user's existing Git host. Known
-limits: deleted refs may persist on the host until GC; the fresh-device key gap applies (ES-02 §5.3).
+limits: deleted refs may persist on the host until GC; the fresh-device key gap applies (ES-02 §5.3); a
+revoked device keeps Git access to the capture refs until the user revokes its GitHub credential — it can
+fetch ciphertext (decrypting captures written before the revoke) and push refs, which readers reject (§6.1)
+(ES-02 §5.3 known limit, ADR D-8).
 
 ## 6. Restore flow (preview → conflict detection → preserve copy → apply)
 
 ### 6.1 Preview (read-only; no writes)
-Fetch and decrypt the capture, verify integrity, then show per repo: target path, clone needed or not,
+Fetch and decrypt the capture, verify integrity and the writer signature with the same reader-side rules
+as ES-02 §5.4 (device in the authenticated, trusted list of the logged-in user; signature valid;
+`user_id` match; a capture by a revoked device with `created_at ≥ revoked_at` → `RESTORE_DEVICE_REVOKED`,
+older but first seen after the revoke → shown only with a warning and an explicit user choice), then show
+per repo: target path, clone needed or not,
 branch/HEAD, unpushed commits to import, files to be written (staged / unstaged / untracked), excluded
 items from capture, non-portable items, env names needing a supply path, toolchain version
 differences (`required 20.x, found 18.19` / `missing`). The user confirms per repo; no default "yes".
@@ -253,7 +265,8 @@ the journal is detected and the tool offers resume or rollback; it never re-appl
 `CAPTURE_IDENTITY_MISSING`, `CAPTURE_SCAN_UNAVAILABLE`, `CAPTURE_ENCRYPTION_FAILED`, `CAPTURE_TOO_LARGE`,
 `CAPTURE_NOT_A_REPO`, `CAPTURE_SECRET_IN_UNPUSHED_COMMIT`, `CAPTURE_BASE_UNDEFINED`, `RESTORE_INTEGRITY_FAILED`, `RESTORE_USER_MISMATCH`, `RESTORE_PENDING_KEY`,
 `RESTORE_REMOTE_MISMATCH`, `RESTORE_HEAD_UNAVAILABLE`, `RESTORE_PATCH_CONFLICT`,
-`RESTORE_FS_INCOMPATIBLE`, `RESTORE_JOURNAL_PENDING`.
+`RESTORE_FS_INCOMPATIBLE`, `RESTORE_JOURNAL_PENDING`, `RESTORE_SIGNATURE_INVALID`, `RESTORE_WRITER_UNKNOWN`,
+`RESTORE_DEVICE_REVOKED`.
 
 ## 8. Acceptance criteria → test matrix
 
@@ -269,8 +282,8 @@ the journal is detected and the tool offers resume or rollback; it never re-appl
 | WS-07 | Symlink policy | relative in-repo link, absolute link, link escaping root, symlinked dir | only the in-repo relative link is restored; others listed; escaping dir not traversed |
 | WS-08 | Capture is read-only on source | snapshot of `git status`, index, stash list, refs before/after capture | identical |
 | WS-09 | Size limit | total > 50 MiB | `CAPTURE_TOO_LARGE`, nothing stored, largest items listed |
-| WS-10 | Isolation | user U2 fetches U1's capture ref by id | no access (repo ACL) or decrypt failure or `RESTORE_USER_MISMATCH` |
-| WS-11 | Fresh device | third device restores a capture written before it registered with/without another device online | succeeds or `RESTORE_PENDING_KEY` (same rule as ES-02 CK-03) |
+| WS-10 | Isolation + writer authentication (reader-side) | (a) user U2 fetches U1's capture ref by id; (b) U2, given push access, pushes a capture signed by U2's device into U1's repo; (c) revoked device B (keeping its Git credential, non-cooperating client) pushes a capture after `revoked_at`; (d) a capture whose manifest claims `device_id` = A but is signed by B | (a) no access (repo ACL) or decrypt failure or `RESTORE_USER_MISMATCH`; (b) `RESTORE_WRITER_UNKNOWN`; (c) `RESTORE_DEVICE_REVOKED`; (d) `RESTORE_SIGNATURE_INVALID`; in (b)–(d) preview shows nothing to apply and nothing is written on the target |
+| WS-11 | Fresh device | third device restores a capture written before it registered with/without another device online | succeeds (after the writer signature verifies against the device list) or `RESTORE_PENDING_KEY` (same rule as ES-02 CK-03) |
 | WS-12 | Cross-OS file system (per OS runner; Linux fixture does not count) | case-collision files, long path, exec bit, CRLF repo restored on macOS and Windows | incompatibilities reported and skipped, not silently renamed; results recorded per OS |
 | WS-13 | Retention | fast-clock fixture | capture refs beyond 14 d / newest 5 removed; preserve copies on targets untouched |
 | WS-14 | `[REQ line 12]` No GUI / no cmux | cmux not installed, no GUI session (no `DISPLAY`/`WAYLAND_DISPLAY`); capture on A and preview + restore on B through the CLI only | same outcome as WS-06; the PASS evidence is only the verified manifest and the journal + hashes (G6); a log copy or an SSH-run listing is not accepted |
