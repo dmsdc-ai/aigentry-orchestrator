@@ -7,7 +7,7 @@ shared invariants I1–I12 in `aigentry-orchestrator-wt-1204-ctxws`
 `docs/specs/2026-10-13-env-continuity-interface-invariants.md` (A12; revision 2 of 2026-10-13 changes ES-01's
 side only in I8, where a newly revoked device has **all** its items re-checked, and in N-U4, where a same-uid
 process can sign endorsements; revision 3 of 2026-10-13 adds `age_recipient_seq` to the signed recipient so a
-replayed older value is refused (I5), and makes ES-04 read the device list through brain's `trust refresh` (I12)). Technical
+replayed older value is refused (I5), and makes ES-04 read the device list through brain's `trust refresh` (I12); revision 4 of 2026-10-13 changes ES-01's side only in wording: readers count an `expired` device, which re-binds with the same key, as a possible holder, so `*_UNRECOVERABLE_KEY` requires every other device to be revoked (I11, N-U1); no ES-01 rule changes). Technical
 choices are for the orchestrator to accept (Rule 24 / Rule 47 §1). The items in §5 touch
 Rule 47 categories and need the user. **The canonical task-ID issuance scheme is not
 decided here** (orchestrator guardrail 2026-10-12 13:59Z); it is D-Q-1.
