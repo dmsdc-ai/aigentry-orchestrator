@@ -26,9 +26,10 @@ review. Tags `[REQ]`/`[DRAFT]`/`[EXISTING]` mark statements that restate an exis
 4. devkit has no repository/worktree/uncommitted capture and no runtime manifest; 604f2b5 is a local
    post-compaction snapshot reader (`hooks/post-compact-restore.sh:1-16`, `lib/workspace-init.js:1-8`).
    No devkit caller of brain's `session_context` tools was found.
-5. telesession PR3 spec defines ledger stages, status vocabulary and "timeout ≠ not delivered"; PTY write
-   is unobservable through telepty today; its ledger field `checkpoint` means the origin agent's read
-   cursor (`e2e-delivery-protocol.md:82,109-160,313-319`).
+5. telesession PR3 spec defines ledger stages, status vocabulary and "timeout ≠ not delivered"; it
+   defines no PTY-write evidence (telepty "submitted" maps only to `transport_accepted`); its ledger field
+   `checkpoint` means the origin agent's read cursor (`e2e-delivery-protocol.md:82,109-160,313-319`).
+   Whether telepty can observe a PTY write is **not measured** (telepty not read).
 6. Not found / not read: registry (auth, device API, storage), the constitution file in the aigentry
    checkout, `bin/context-compact.sh` in the orchestrator clone. Not measured: any real multi-host run,
    macOS/Windows.
@@ -117,7 +118,7 @@ JCS canonicalisation, error codes, detector list, freshness defaults.
 |---|---|---|
 | ES-02 | needs new SyncBackend primitives, CheckpointStore/Index, fail-closed crypto, ES-01-based recipients + rekey pass, MCP tools, `brain_context_resume` extension, secret scanner (none exists), orchestrator/devkit triggers, 15 test rows | upper half: **6–9** (scanner shared with ES-04 counted here) |
 | ES-04 | no existing capture code in devkit; bundle/shelf/worktree handling, preview/journal/rollback, runtime manifest detectors for several ecosystems, per-OS FS checks | upper half or above: **9–13**; per-OS verification blocked on runners |
-| ES-07 | data model only now; PTY hop blocked on telepty #103/#104; depends on PR3 merge | data model + view **2–3** within the 4–8 OS/diagnostics bucket; no reduction of the OS part |
+| ES-07 | data model only now; PTY hop has no evidence source (telepty not read); depends on PR3 merge | data model + view **2–3** within the 4–8 OS/diagnostics bucket; no reduction of the OS part |
 | Cross-cutting | ES-01 user/device + key distribution is a hard prerequisite for both; registry not read — unknown | estimate blocked until ES-01 design |
 
 These are planning inputs, not commitments (requirement line 57; draft line 84).

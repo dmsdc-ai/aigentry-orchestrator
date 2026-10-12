@@ -90,10 +90,14 @@ refs/history; macOS/Windows; size/latency of `ls-tree` on large brain repos; tes
   process memory, open file descriptors, PTY buffers or environment of the source process.
 - N2. `[REQ line 42]` A restored session is a **new session that has read the checkpoint**. Resumption is
   "reconnect/recreate", never live migration.
-- N3. `[REQ line 39]` A summary is never presented as the original text. Only fragments whose raw bytes are present
-  and hash-verified may be marked `original` (§6).
-- N4. `[REQ line 16]` Account login (ES-01) never silently enables remote sync. Remote checkpoint sync requires the
-  existing brain opt-in (`enableSync`, `SetupWizard.ts:54`) **and** an ES-01 identity binding (§5.4).
+- N3. `[REQ line 39]` `[DRAFT line 44]` Restore states which facts are original and which are summary; a
+  summary is never presented as the original text. New proposal (needs review): only fragments whose raw
+  bytes are present and hash-verified may be marked `original` (§6).
+- N4. `[REQ line 16]` Remote consent is never bypassed silently by account login. New proposal (needs
+  review, decision D-7): uploading conversation-derived checkpoints needs its **own** explicit opt-in,
+  separate from brain's `enableSync` memory-sync consent (`SetupWizard.ts:54`); without it records are
+  local-only (`sync:"local_only"`). The binding of the brain repo's GitHub account to the ES-01 identity
+  (§5.2, D-5) and the writer checks (§5.4) are new proposals too.
 - N5. `[REQ line 12]` `[DRAFT line 9, 27]` Works from any terminal on the telepty daemon; no GUI typing,
   no cmux dependency; a copied log file or an SSH connection alone never claims completion. Applied here:
   triggers, write, sync and restore are invoked only through CLI commands, CLI hooks, brain MCP tools or

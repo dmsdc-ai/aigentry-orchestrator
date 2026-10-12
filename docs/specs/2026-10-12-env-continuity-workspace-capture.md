@@ -55,8 +55,9 @@ the user; macOS/Windows file-system behaviour (case folding, symlinks, path leng
 
 - G1. `[REQ line 41]` Capture never copies secret values; env is shared as name, required flag and safe
   supply path only.
-- G2. `[REQ line 51]` A restore never loses original data on the target device: anything it would
-  overwrite is preserved first (§6.3), and the default restore writes into a **new worktree** (§6.4).
+- G2. `[REQ line 51]` `[DRAFT line 57]` A restore never loses original data on the target device:
+  anything it would overwrite is preserved first (§6.3). New proposal (needs review): the default restore
+  writes into a **new worktree** (§6.4).
 - G3. `[REQ line 42]` Runtime state is recreated, never migrated: running processes, open ports, GPU
   contexts and in-memory state are not transferred.
 - G4. A capture is a point-in-time copy; it is not a live mirror and is not continuously synced.

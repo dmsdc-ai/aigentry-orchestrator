@@ -35,8 +35,9 @@ All references are to `aigentry-telesession-wt-1110/docs/specs/2026-10-11-e2e-de
 
 ## 0.2 Searched for and not found
 
-- No per-hop observation for the "access layer" or "PTY write" in the telesession spec: PTY delivery
-  is not observable through telepty today (lines 318: queue receipt only).
+- No per-hop observation for the "access layer" or "PTY write" in the telesession spec: a search for
+  `PTY` in it finds no match. Its telepty mappings cover only "submitted" = queue receipt →
+  `transport_accepted` (line 318) and a consumption observation → `agent_consumed` (lines 327, 339).
 - No field in the status view that carries per-hop evidence source or freshness (`stages` has only
   timestamps, line 75).
 - No definition of an `offline` state in the ledger (status enum line 110 has none).
@@ -46,7 +47,8 @@ All references are to `aigentry-telesession-wt-1110/docs/specs/2026-10-11-e2e-de
 ## 0.3 Not measured
 
 telesession code (`src/relay/*.js`) and tests were not read or run; telepty daemon APIs and their
-freshness; real cross-host behaviour (Mac offline per requirement line 60); RC5/#107 state.
+freshness — in particular whether telepty can observe a PTY write at all (telepty was not read, so "PTY
+write is unobservable" is **not** a finding); real cross-host behaviour (Mac offline per requirement line 60); RC5/#107 state.
 
 # PART B — PROPOSALS (each requires user review unless tagged)
 
@@ -54,8 +56,9 @@ freshness; real cross-host behaviour (Mac offline per requirement line 60); RC5/
 
 - P1. `[REQ line 44]` Access health never implies request completion. A healthy host/daemon is
   reported in a separate `access_health` object with `implies_request_state: false`.
-- P2. `[EXISTING line 142]` Only the telesession ledger decides `completed`. Diagnostics are a
-  read-only, derived **view**; they never write ledger stages or change `status`.
+- P2. `[EXISTING line 142]` Only the telesession ledger decides `completed`. New proposal (needs
+  review): diagnostics are a read-only, derived **view**; they never write ledger stages or change
+  `status`.
 - P3. `[REQ line 44]` Each stage carries time, evidence and freshness; missing evidence is `unknown`
   (`[EXISTING line 405]`), and "cannot be observed by design" is distinguished from "not yet observed".
 - P4. Diagnostics are computed on read; they are not stored as authority. A cache, if any, is labelled
@@ -76,7 +79,7 @@ Hops (ordered, per request leg): `kkoma` → `access_layer` → `daemon` → `pt
 | `kkoma` | request created by the user's front agent at the origin | ledger record `created_ms`, `request_id`, `correlation_id` | record exists (lines 61–79) |
 | `access_layer` | the request reached the route toward the destination host (tunnel / relay / account access) | outbox item state (`sent`/`uncertain`/`failed`), route resolver result | outbox (§10 of the telesession spec) |
 | `daemon` | destination telepty daemon accepted / durably stored | `transport_accepted`, `durable_received` | stages 1–2 |
-| `pty` | bytes written into the destination session's PTY | **not observable today** (telepty #103/#104) → `unknown` with reason `PTY_WRITE_UNOBSERVABLE` | none |
+| `pty` | bytes written into the destination session's PTY | no evidence source is defined (none in the telesession spec, §0.2; telepty not read, §0.3) → `unknown` with reason `PTY_EVIDENCE_UNAVAILABLE` until a telepty source is identified and mapped | none |
 | `agent` | destination agent consumed the request | `agent_consumed` (authenticated destination event) | stage 3 |
 | `final_reply` | authenticated final ACK recorded at origin and read by the origin agent | `processing_completed` + `origin_ack_received` + checkpoint cover | stages 4–5, `completed` |
 
@@ -93,7 +96,7 @@ StageObservation = {
               authenticated: bool,      // adapter attestation (telesession R3), false for corroboration
               basis: string },          // e.g. "verified_sender_sid+epoch", "queue_receipt"
   freshness: { fetched_at: ISO, age_ms: int, max_age_ms: int, stale: bool, cached: bool },
-  reasons: string[]                    // e.g. PTY_WRITE_UNOBSERVABLE, REMOTE_PROVENANCE_UNAVAILABLE, DEADLINE_PASSED
+  reasons: string[]                    // e.g. PTY_EVIDENCE_UNAVAILABLE, REMOTE_PROVENANCE_UNAVAILABLE, DEADLINE_PASSED
 }
 
 RequestDiagnostics = {
@@ -157,7 +160,7 @@ shows `ledger_status` first. Access health is rendered in a separate block title
 | ID | Criterion | Setup | Expected |
 |---|---|---|---|
 | DG-01 | `[REQ line 44]` Health ≠ completion | daemon up, heartbeat fresh, request has only `transport_accepted` | `access_health.daemon: up`; `final_reply.state` ≠ `completed`; `ledger_status` `pending` |
-| DG-02 | PTY unobservable | any request | `pty.state: unknown`, reason `PTY_WRITE_UNOBSERVABLE` (until telepty #103/#104 supply evidence) |
+| DG-02 | PTY evidence unavailable | (a) any request today; (b) once a telepty PTY-write source is identified and mapped | (a) `pty.state: unknown`, reason `PTY_EVIDENCE_UNAVAILABLE`, never `observed`; (b) `observed` only from that source, with `authenticated` per its attestation |
 | DG-03 | Offline vs unknown | destination host down with fresh registry last-seen; separately, registry unreachable | first: `offline` on `daemon`; second: `unknown` with `EVIDENCE_SOURCE_UNREACHABLE` |
 | DG-04 | Rejected only authenticated | unauthenticated refusal text vs authenticated destination `rejected` event | first does not set `rejected`; second sets `rejected` on `agent` |
 | DG-05 | Expired = ledger expired only | (a) record retired with open outcome; (b) record `past_deadline` (deadline passed, not retired) with open outcome; (c) transport nonce TTL ended (`TRANSPORT_NONCE_EXPIRED`) while the ledger is `active`/`past_deadline` | (a) `ledger_status: expired`, hops without evidence `expired` (`RETIRED`), hops with evidence `observed`; (b) `ledger_status: unknown`, hops without evidence `unknown` with `DEADLINE_PASSED`, no hop `expired`; (c) no hop `expired`; UI never says "not delivered" in any case |
