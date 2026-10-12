@@ -369,5 +369,3 @@ real-endpoint PASS (requirement line 52).
 | CK-13 | Schema upcast | v1 record read by a v2 reader; v2 record read by a v1 reader | v2 reader upcasts without rewriting; v1 reader returns `unsupported_version`, file unchanged |
 | CK-14 | Non-claim wording | inspect restore text and CLI help | states "context restored from checkpoint; model/process state not restored" (N1/N2) |
 | CK-15 | Retention | fast-clock fixture | expired non-head records removed from `HEAD`; heads kept; M2 raw sibling removed at 30d while M1 record stays |
-</content>
-</invoke>

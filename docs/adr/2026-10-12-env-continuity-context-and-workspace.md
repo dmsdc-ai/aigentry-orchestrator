@@ -112,6 +112,3 @@ JCS canonicalisation, error codes, detector list, freshness defaults.
 | Cross-cutting | ES-01 user/device + key distribution is a hard prerequisite for both; registry not read — unknown | estimate blocked until ES-01 design |
 
 These are planning inputs, not commitments (requirement line 57; draft line 84).
-</content>
-</invoke>
-<parameter name="description">Write ADR

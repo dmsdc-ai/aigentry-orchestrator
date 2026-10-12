@@ -155,6 +155,3 @@ shows `ledger_status` first. Access health is rendered in a separate block title
 | DG-08 | Backward compatibility | `request_status` without `diagnostics:true` | output identical to the current view |
 | DG-09 | Origin restart | restart telesession between stages | diagnostics recomputed from the ledger; no stage lost or advanced by the restart |
 | DG-10 | No secrets/ids leak | inspect the diagnostics JSON | no tokens, no prompt text, host shown as a key, not an address |
-</content>
-</invoke>
-<parameter name="description">Write ES-07 diagnostics spec
