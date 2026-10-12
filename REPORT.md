@@ -17,6 +17,7 @@ commits:
 - f3643e8 escape two table pipes
 - 9c484f8 coordination C1–C5 (ES-01 §3.1, §8, §8.1, ID-21)
 - 7f64e38 coordination C6 (ES-01 §6, §8.1 R2, §10 D-ID-2; ADR §5 D-ID-2)
+- 5440250 coordination C8/C9 (ES-01 §8.1 R5, §10 D-ID-5; ADR §5 D-ID-5)
 
 resolved:
 - B1: ES-01 §1.4 now reports the wiring as measured: a Limiter is built (main.py:90-95) but no SlowAPIMiddleware is registered (main.py:191-203), so default limits do not run. The only decorator is repositories.py:80, on its own Limiter (:26). The registry rate-limiter issue is cited. §7.4 proposes per-route decorators on /devices/* and does not turn on the global middleware. If the limiter store (Redis) is down, authorize/approve/deny/token fail closed with 503. Test rows ID-12 and ID-13. ADR §7 prices this as new work.
@@ -134,6 +135,10 @@ coordination (orchestrator follow-up 14:39Z, ES-02 §5.5 R1–R7, sibling clone 
   - ES-01 §8.1 R2 no longer claims the age private half follows §6; §6 carries the finding.
   - D-ID-2 gains sub-question (b), "move the brain age key into the ES-01 store?", in ES-01 §10 and ADR §5.
   - Recommended default for (b): do not move it in this release; record the gap. Brain owns the key and its readers (제4조), sops and brain read that path directly, and a move risks the only key that decrypts existing memory records. Any move belongs to a brain-side task coordinated with ES-02.
+
+- C7 (15:00Z, informational): no change needed. §8.1 is kept stable: C8/C9 were edited inside existing table cells, so no lines were added or renumbered (diff: 3 lines changed in place).
+- C8: D-ID-5 kept-fields for revoked device rows now include `created_at` (plus `age_recipient_sig`), with the reason: ES-02 endorsement validity compares the endorsed device's `created_at` with the endorser's `revoked_at`. Changed in ES-01 §10 and ADR §5.
+- C9: ES-01 §8.1 R5 no longer states "first device self-trusted" as final. The trust anchor is marked "per ES-02 §5.6 (in revision)", under ES-02 D-9.
 
 snyk: NOT_APPLICABLE_DOCS
 
