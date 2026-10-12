@@ -6,7 +6,7 @@ no tests, no queue edit, no migration, no credential, no network use. It does no
 completion of #2026101204 or any child.
 
 commits:
-- see `git log task-1204-env-continuity-idq` (single docs commit on top of 71cc2da; hash is in the REPORT inject)
+- 38eed58 docs(2026101204): ES-01 identity, ES-03 shared queue + ES-08 linkage contract specs and ADR (branch task-1204-env-continuity-idq, not pushed)
 
 files:
 - docs/specs/2026-10-12-env-continuity-identity.md (ES-01)
