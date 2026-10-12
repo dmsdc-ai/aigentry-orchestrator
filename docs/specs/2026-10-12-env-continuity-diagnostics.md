@@ -77,7 +77,7 @@ Hops (ordered, per request leg): `kkoma` → `access_layer` → `daemon` → `pt
 | Hop | Meaning | Evidence sources (preferred first) | Ledger mapping `[EXISTING]` where applicable |
 |---|---|---|---|
 | `kkoma` | request created by the user's front agent at the origin | ledger record `created_ms`, `request_id`, `correlation_id` | record exists (lines 61–79) |
-| `access_layer` | the request reached the route toward the destination host (tunnel / relay / account access) | outbox item state (`sent`/`uncertain`/`failed`), route resolver result | outbox (§10 of the telesession spec) |
+| `access_layer` | the request reached the route toward the destination host (tunnel / relay / account access) | outbox item — exists only for **relayed** items, and the relay runner is off by default (telesession lines 383, 399); route resolver result (`ROUTE_UNRESOLVED`/`ROUTE_AMBIGUOUS`, line 307). A direct send has no access-layer source → `unknown`, reason `NO_ACCESS_LAYER_SOURCE`. Outbox mapping: `queued`/`intent` → no evidence yet (reasons `OUTBOX_QUEUED`/`OUTBOX_INTENT`); `sent` → `observed`, basis `queue_receipt`, `authenticated:false` (hop evidence only, line 373); `failed` → `unknown`, `OUTBOX_FAILED`; `uncertain` → `unknown`, `OUTBOX_UNCERTAIN`; a quarantine marker adds `OUTBOX_QUARANTINED:<reason>` (lines 222–232) | outbox (§10 of the telesession spec) |
 | `daemon` | destination telepty daemon accepted / durably stored | `transport_accepted`, `durable_received` | stages 1–2 |
 | `pty` | bytes written into the destination session's PTY | no evidence source is defined (none in the telesession spec, §0.2; telepty not read, §0.3) → `unknown` with reason `PTY_EVIDENCE_UNAVAILABLE` until a telepty source is identified and mapped | none |
 | `agent` | destination agent consumed the request | `agent_consumed` (authenticated destination event) | stage 3 |
@@ -117,11 +117,11 @@ RequestDiagnostics = {
 | `completed` | only on `final_reply`, and only when `ledger_status == "completed"` | anywhere else; from health; from a marker string |
 | `pending` | ledger `lifecycle == "active"` (within `deadline_ms`, ledger lines 211–213) and `ledger_status == "pending"`, no evidence for this hop, **no later hop has evidence**, hop observable | deadline passed; request finished; a later hop has evidence |
 | `unknown` | no evidence and any of: a later hop has evidence (`SKIPPED_STAGE_NO_EVIDENCE` — `[EXISTING line 124-125]` skipped lower stages stay null and read `unknown`); deadline passed with the outcome open (`DEADLINE_PASSED` — `[EXISTING line 155-157, 214]`, ledger lifecycle `past_deadline`); the request finished without evidence for this hop (`NO_HOP_EVIDENCE`); hop unobservable; evidence source unreachable; evidence unauthenticated | — (default) |
-| `offline` | the evidence source for the **destination host** reports it unreachable/down with `fetched_at` within `max_age_ms` (e.g. registry device last-seen, daemon health) | the source itself is unreachable (that is `unknown`); used for a request outcome |
-| `rejected` | `[EXISTING line 151]` ledger `terminal.state == "rejected"` (authenticated) — shown on the hop that refused | from an unauthenticated message, timeout or local error |
+| `offline` | the evidence source for the **destination host** reports it unreachable/down with `fetched_at` within `max_age_ms` (e.g. registry device last-seen — an **ES-01 dependency**: `devices.last_seen_at` is proposed in the ES-01 spec §3.1 and does not exist yet; daemon health) | the source itself is unreachable (that is `unknown`); used for a request outcome |
+| `rejected` | `[EXISTING line 151]` ledger `terminal.state == "rejected"` (authenticated). The ledger `terminal` is `{state, at, reason}` with no hop (line 76); the hop is derived from the ledger rule that `rejected` is a destination-only stage (lines 165–166): shown on `agent` (the destination endpoint) and on `final_reply` (the outcome), with `terminal.reason` as the reason; other hops are evaluated normally | from an unauthenticated message, timeout or local error; on `kkoma`/`access_layer`/`daemon`/`pty` |
 | `expired` | exactly when `ledger_status == "expired"` (`[EXISTING line 158-160, 215]`: record retired while the outcome was open, reason `RETIRED`) — on every hop without evidence; hops with evidence stay `observed` | to mean "not delivered"; from a transport/nonce TTL or outbox state (a passed deadline with an open outcome is `unknown`/`DEADLINE_PASSED`); for a retired record that was already `completed`/`rejected` (it keeps that status, line 160) |
 
-Evaluation order per hop (first match wins): `rejected` → `completed` → `observed` → `expired` →
+Evaluation order per hop (first match wins): `rejected` (on `agent`/`final_reply` only) → `completed` → `observed` → `expired` →
 `unknown` (each condition above) → `offline` → `pending`. Hence a hop can never read `expired` while
 `ledger_status` is `unknown`, and never `pending` once a later hop has evidence or the request finished.
 
@@ -129,7 +129,8 @@ Evaluation order per hop (first match wins): `rejected` → `completed` → `obs
 (a request to an offline host stays `pending` → `unknown` per the ledger rules, lines 155–157).
 
 ### 3.2 Freshness
-Default `max_age_ms`: ledger 0 (read directly), daemon/health 30 000, registry device last-seen 120 000.
+Default `max_age_ms`: ledger 0 (read directly), daemon/health 30 000, registry device last-seen 120 000
+(ES-01 dependency; until it exists `offline` can come only from daemon health).
 `stale: true` downgrades `offline` and `observed` evidence from non-ledger sources to `unknown` with
 reason `EVIDENCE_STALE`. Values are proposals; tuned during ES-09.
 
@@ -162,7 +163,7 @@ shows `ledger_status` first. Access health is rendered in a separate block title
 | DG-01 | `[REQ line 44]` Health ≠ completion | daemon up, heartbeat fresh, request has only `transport_accepted` | `access_health.daemon: up`; `final_reply.state` ≠ `completed`; `ledger_status` `pending` |
 | DG-02 | PTY evidence unavailable | (a) any request today; (b) once a telepty PTY-write source is identified and mapped | (a) `pty.state: unknown`, reason `PTY_EVIDENCE_UNAVAILABLE`, never `observed`; (b) `observed` only from that source, with `authenticated` per its attestation |
 | DG-03 | Offline vs unknown | destination host down with fresh registry last-seen; separately, registry unreachable | first: `offline` on `daemon`; second: `unknown` with `EVIDENCE_SOURCE_UNREACHABLE` |
-| DG-04 | Rejected only authenticated | unauthenticated refusal text vs authenticated destination `rejected` event | first does not set `rejected`; second sets `rejected` on `agent` |
+| DG-04 | Rejected only authenticated | unauthenticated refusal text vs authenticated destination `rejected` event | first does not set `rejected`; second sets `rejected` on `agent` and `final_reply` (derived from the destination-only rule, §3.1) with `terminal.reason`; earlier hops keep their own evidence |
 | DG-05 | Expired = ledger expired only | (a) record retired with open outcome; (b) record `past_deadline` (deadline passed, not retired) with open outcome; (c) transport nonce TTL ended (`TRANSPORT_NONCE_EXPIRED`) while the ledger is `active`/`past_deadline` | (a) `ledger_status: expired`, hops without evidence `expired` (`RETIRED`), hops with evidence `observed`; (b) `ledger_status: unknown`, hops without evidence `unknown` with `DEADLINE_PASSED`, no hop `expired`; (c) no hop `expired`; UI never says "not delivered" in any case |
 | DG-05b | Retired after finish | record `completed` (or `rejected`), then retired | `ledger_status` stays `completed`/`rejected` with reason `RETIRED`; no hop `expired` |
 | DG-12 | Skipped stage | within the deadline, `agent_consumed` has evidence while `transport_accepted`/`durable_received` are null | `daemon.state: unknown`, reason `SKIPPED_STAGE_NO_EVIDENCE` (not `pending`); `agent.state: observed` |
@@ -172,4 +173,6 @@ shows `ledger_status` first. Access health is rendered in a separate block title
 | DG-08 | Backward compatibility | `request_status` without `diagnostics:true` | output identical to the current view |
 | DG-09 | Origin restart | restart telesession between stages | diagnostics recomputed from the ledger; no stage lost or advanced by the restart |
 | DG-10 | No secrets/ids leak | inspect the diagnostics JSON | no tokens, no prompt text, host shown as a key, not an address |
+| DG-14 | Late ACK | (a) `completed` request, then a newer final reply arrives; (b) a final reply verified after the transport TTL (`late_after_ttl`) | (a) `final_reply` stays `completed` with reason `NEWER_FINAL_ACK_UNREAD` until the checkpoint covers it (ledger lines 145–147); (b) reason `LATE_AFTER_TTL`, `completed` only once the origin checkpoint covers it (line 279) |
+| DG-15 | Access layer evidence | (a) direct send; (b) relayed item `sent`; (c) relayed item `uncertain`; (d) quarantined item | (a) `access_layer: unknown`, `NO_ACCESS_LAYER_SOURCE`; (b) `observed`, `authenticated:false`; (c) `unknown`, `OUTBOX_UNCERTAIN`; (d) reason `OUTBOX_QUARANTINED:<reason>` added |
 | DG-11 | `[REQ line 12]` No GUI / no cmux | cmux not installed, no GUI session; request sent and diagnosed through telesession/telepty APIs only; a log file copied from the destination is placed next to the CLI | every `evidence.source` is in the §3 enum; the copied log changes no hop; same states as with the log absent |

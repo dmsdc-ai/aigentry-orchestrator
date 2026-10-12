@@ -20,7 +20,8 @@ review. Tags `[REQ]`/`[DRAFT]`/`[EXISTING]` mark statements that restate an exis
    LWW (brain `SetupWizard.ts:54,146-213`, `GitBackend.ts:19,30,83`, `ProfileFormat.ts:140-182`,
    `ConflictResolver.ts:40-61`).
 2. brain encryption falls back to plaintext on failure (`ProfileFormat.ts:160-181`); a new device
-   cannot decrypt until an existing device re-encrypts (`GitBackend.ts:150-153`).
+   cannot decrypt until an existing device re-encrypts (`GitBackend.ts:150-153`) — on that device's next
+   profile write, not merely by being online (`GitBackend.ts:132`, `ProfileFormat.ts:256-277`).
 3. brain has no checkpoint record, lineage, cursor, provenance marking or content secret scanner
    (`SyncBackend.ts:1-13`, `BrainMcpServer.ts:270-326`, `capture-tool.ts:38-56`).
 4. devkit has no repository/worktree/uncommitted capture and no runtime manifest; 604f2b5 is a local
@@ -121,5 +122,9 @@ JCS canonicalisation, error codes, detector list, freshness defaults.
 | ES-04 | no existing capture code in devkit; bundle/shelf/worktree handling, preview/journal/rollback, runtime manifest detectors for several ecosystems, per-OS FS checks | upper half or above: **9–13**; per-OS verification blocked on runners |
 | ES-07 | data model only now; PTY hop has no evidence source (telepty not read); depends on PR3 merge | data model + view **2–3** within the 4–8 OS/diagnostics bucket; no reduction of the OS part |
 | Cross-cutting | ES-01 user/device + key distribution is a hard prerequisite for both; registry not read — unknown | estimate blocked until ES-01 design |
+| Cross-cutting (fix cycle 1) | record/manifest signing + reader-side verification, device-list cache, trust endorsements, and the ES-01 key interface (`age_recipient`, list fields — ES-02 §5.5) are not in the ES-02/ES-04 ranges above | add, unestimated; ES-01 side belongs to the identity estimate |
+| ES-07 (fix cycle 1) | the optional `diagnostics` member of `telesession_request_status` (ES-07 §4) is a telesession-side change not counted above | add, unestimated |
 
-These are planning inputs, not commitments (requirement line 57; draft line 84).
+These are planning inputs, not commitments (requirement line 57; draft line 84). The requirement's
+32–64 agent-day total stays an unverified placeholder ("근거 불충분 예비치", draft line 84); nothing here
+replaces it.

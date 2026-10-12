@@ -27,7 +27,7 @@ still a proposal) or `[EXISTING]` (behaviour already in a cited file). Untagged 
 | devkit installer manifest v1 declares component compatibility (node ≥18, telepty target, brain optional "latest-compatible", registry_api optional contract `2026-03-14`) and install profiles | devkit `config/installer-manifest.json:1-40` |
 | devkit 604f2b5 "snapshot restore" restores a local `.context-snapshot.md` text file after compaction; no files, diffs or runtime are captured | devkit `hooks/post-compact-restore.sh:1-16` |
 | brain Git backend pulls/pushes only branch `main`; first clone is `--depth 1` (single default branch) | aigentry-brain `src/backend/GitBackend.ts:19`, `:30`, `:83`, `:188` |
-| brain encrypts with age to a recipient list; recipients grow by TOFU and a new device cannot decrypt older data until an existing device re-encrypts | brain `src/backend/GitBackend.ts:104-175` |
+| brain encrypts with age to a recipient list; recipients grow by TOFU and a new device cannot decrypt older data until an existing device re-encrypts — on that device's next profile write, not merely by being online (early return when its own key is already a recipient); recipients are a union and never shrink | brain `src/backend/GitBackend.ts:104-175` (`:132`), `src/core/ProfileFormat.ts:256-277` |
 | brain remote is the user's private GitHub repo, opt-in | brain `src/cli/SetupWizard.ts:54`, `:146-213` |
 | Requirement: env shared as name / required / safe supply path only; no automatic secret copy; native lib/GPU/OS path/port/running process marked unsupported or recreate | requirement line 41 |
 | Requirement: verify uncommitted conflict, excluded files, non-portable manifest, restore failure with no loss of originals | requirement line 51 |
@@ -45,7 +45,8 @@ still a proposal) or `[EXISTING]` (behaviour already in a cited file). Untagged 
 
 ## 0.3 Not measured
 
-Registry storage capacity/cost; Git-host retention and GC of deleted refs; repository sizes typical for
+Registry storage capacity/cost; Git-host retention and GC of deleted refs; whether the 50 MiB capture
+cap (§3.2) fits the Git host's per-file and per-push limits; repository sizes typical for
 the user; macOS/Windows file-system behaviour (case folding, symlinks, path length, exec bit) — listed in
 §8 as test rows only; `git bundle` performance on large repos. No tests were run (SAWP).
 
@@ -117,7 +118,8 @@ key over `"aigentry-capture-v1|" + user_id + "|" + capture_id + "|" + content_sh
 | `services[]` | `{name, kind: "db"|"queue"|"cache"|"other", how_to_recreate?}` from docker-compose / Procfile names only; informational |
 
 `SupplyPath` ∈ `os_keychain` (macOS Keychain / Windows Credential Manager / libsecret), `user_prompt`
-(asked at restore, written to a gitignored local file with 0600), `secret_manager_ref` (an opaque
+(asked at restore, written to a gitignored local file with mode 0600 on macOS/Linux and an owner-only ACL
+on Windows, where 0600 has no meaning), `secret_manager_ref` (an opaque
 reference string such as a vault path — never a credential), `existing_local` (already present on the
 target), `none_known`. Supplying values is always done by the user on the target device.
 
@@ -226,6 +228,9 @@ per repo: target path, clone needed or not,
 branch/HEAD, unpushed commits to import, files to be written (staged / unstaged / untracked), excluded
 items from capture, non-portable items, env names needing a supply path, toolchain version
 differences (`required 20.x, found 18.19` / `missing`). The user confirms per repo; no default "yes".
+Restore writes refs, worktrees and preserve directories in the user's project repos and home
+(`~/.aigentry/workspace-preserve/`); that per-repo confirmation is the runtime consent for those writes and
+is recorded in `restore-journal.json` (who/when/which repo). Nothing is written for an unconfirmed repo.
 
 ### 6.2 Conflict detection
 | Conflict | Detection | Default handling |
