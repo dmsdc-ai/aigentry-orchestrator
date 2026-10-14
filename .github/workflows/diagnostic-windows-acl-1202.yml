@@ -1,0 +1,53 @@
+name: Diagnostic Windows ACL 1202
+
+on:
+  push:
+    branches: [diag/1202-windows-acl-20261015]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+        env:
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: 'false'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - name: Install locked dependencies
+        shell: bash
+        run: npm ci --force
+      - name: Build selected test and Windows bridge
+        shell: bash
+        run: npm run build
+      - name: Diagnose owned ACL fixtures
+        shell: bash
+        run: node tests/diagnostics/windows-acl-1202.mjs "${RUNNER_TEMP}/windows-acl-1202.json"
+      - name: Run the selected existing resolver test
+        if: always()
+        shell: bash
+        run: |
+          node --test --test-reporter=tap \
+            --test-name-pattern='win32: an ACL-denied store is ignored while a readable store still wins' \
+            dist/tests/context-handoff/resolve.test.js \
+            > "${RUNNER_TEMP}/windows-acl-1202.tap" 2>&1
+          cat "${RUNNER_TEMP}/windows-acl-1202.tap"
+      - name: Upload bounded diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-acl-1202
+          path: |
+            ${{ runner.temp }}/windows-acl-1202.json
+            ${{ runner.temp }}/windows-acl-1202.tap
+          if-no-files-found: warn
+          retention-days: 7
