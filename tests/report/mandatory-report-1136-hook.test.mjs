@@ -14,6 +14,7 @@
 //             host --settings after --no-chrome; a caller --settings is still refused.
 // No real claude, app, daemon or telepty is run (native CLI hook firing = builder gate G0, NOTRUN).
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -22,9 +23,9 @@ import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { itemBytes, mint, sha256, worldKit } from "./mandatory-report-1170.fakes.mjs";
+import { loadReport, policyFixture, registryFixture, sandboxRefusal, turnItem } from "./mandatory-report-1170-windows-fixtures.mjs";
 
 const POSIX = process.platform === "darwin" || process.platform === "linux";
-const SKIP = POSIX ? false : `POSIX-only (real fs hook state, sealed sandbox, bash shim); not run on ${process.platform}`;
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, "..", "..");
 const DIST = path.join(REPO, "dist");
@@ -115,7 +116,7 @@ test("H-01 exact association: dispatch template ↔ matchRefPrompt, renderRefTra
 });
 
 // ── H-02..03 runHook on a real outbox ───────────────────────────────────────
-test("H-02 bound turn: exact template + sha(bytes)=name + trailer sid/attempt ⇒ TURN in <outbox>/<R>; any mismatch ⇒ unbound", { skip: SKIP }, () => {
+if (POSIX) test("H-02 bound turn: exact template + sha(bytes)=name + trailer sid/attempt ⇒ TURN in <outbox>/<R>; any mismatch ⇒ unbound", () => {
   const f = hookFixture();
   assert.deepEqual(f.run("UserPromptSubmit", { session_id: "s-a", prompt: f.prompt }), { wrote: [], degraded: [] });
   fs.mkdirSync(f.reqDir, { recursive: true, mode: 0o700 });
@@ -145,7 +146,7 @@ test("H-02 bound turn: exact template + sha(bytes)=name + trailer sid/attempt �
   assert.ok(!fs.existsSync(path.join(s.outbox, s.req.request_id, "TURN-1.md")));
 });
 
-test("H-03 duplicate Stop / Stop after SessionEnd are no-ops; overlapping prompts ⇒ assoc=unknown in both dirs; SessionEnd ends an open turn", { skip: SKIP }, () => {
+if (POSIX) test("H-03 duplicate Stop / Stop after SessionEnd are no-ops; overlapping prompts ⇒ assoc=unknown in both dirs; SessionEnd ends an open turn", () => {
   const f = hookFixture();
   f.run("UserPromptSubmit", { session_id: "s-1", prompt: f.prompt });
   assert.equal(f.run("Stop", { session_id: "s-1" }).wrote.length, 1);
@@ -170,7 +171,7 @@ test("H-03 duplicate Stop / Stop after SessionEnd are no-ops; overlapping prompt
   assert.equal(f.run("Stop", { session_id: "s-2" }).wrote.length, 1);
 });
 
-test("H-04 the hook executable never blocks: bad/oversize stdin, stop_hook_active, quota, held lock, bad args, missing outbox ⇒ exit 0, no stdout", { skip: SKIP }, () => {
+if (POSIX) test("H-04 the hook executable never blocks: bad/oversize stdin, stop_hook_active, quota, held lock, bad args, missing outbox ⇒ exit 0, no stdout", () => {
   const exec = (f, event, input, { raw, args } = {}) => {
     const t0 = Date.now();
     const res = H.sh(process.execPath, [HOOK_JS, ...(args ?? f.args(event))],
@@ -238,7 +239,7 @@ async function turn(w, wk, d, session, { during } = {}) {
 }
 const turnNotices = (calls) => K.submits(calls).filter((c) => c.argv.at(-1).startsWith("⟦aigentry-report v1⟧ TURN_ENDED_NO_REPORT"));
 
-test("H-05 status-only TURN: noticed as TURN_ENDED_NO_REPORT (verdict seen), ACK seen never resolves done", { skip: SKIP }, async () => {
+if (POSIX) test("H-05 status-only TURN: noticed as TURN_ENDED_NO_REPORT (verdict seen), ACK seen never resolves done", async () => {
   const { w, wk, d } = boundWorld("h05");
   await turn(w, wk, d, "s-h05");
   const p = w.pump(at(1));
@@ -257,7 +258,7 @@ test("H-05 status-only TURN: noticed as TURN_ENDED_NO_REPORT (verdict seen), ACK
   assert.equal(w.row(d.did).outcome.state, "unknown");
 });
 
-test("H-06 captured valid formal in the turn suppresses the TURN notice; an invalid formal does not", { skip: SKIP }, async () => {
+if (POSIX) test("H-06 captured valid formal in the turn suppresses the TURN notice; an invalid formal does not", async () => {
   const a = boundWorld("h06a");
   await turn(a.w, a.wk, a.d, "s-h06a", { during: () => a.w.write(a.d, "REPORT", 1, "real report") });
   const pa = a.w.pump(at(1));
@@ -273,7 +274,7 @@ test("H-06 captured valid formal in the turn suppresses the TURN notice; an inva
   assert.equal(turnNotices(pb.calls).length, 1, "pump truth, not the hook's list: the TURN notice still goes out");
 });
 
-test("H-07 only the newest TURN is pending; older ones are superseded and stale to ACK", { skip: SKIP }, async () => {
+if (POSIX) test("H-07 only the newest TURN is pending; older ones are superseded and stale to ACK", async () => {
   const { w, wk, d } = boundWorld("h07");
   await turn(w, wk, d, "s-h07");
   await turn(w, wk, d, "s-h07");
@@ -289,7 +290,7 @@ test("H-07 only the newest TURN is pending; older ones are superseded and stale 
   assert.deepEqual(turnNotices(p2.calls).map((c) => /item=(TURN-\d+)/.exec(c.argv.at(-1))[1]), ["TURN-3"]);
 });
 
-test("H-08 unbound turns: one notice per new seq (deduplicated across passes), silent when a formal appeared, silent once accepted", { skip: SKIP }, async () => {
+if (POSIX) test("H-08 unbound turns: one notice per new seq (deduplicated across passes), silent when a formal appeared, silent once accepted", async () => {
   const { w, wk, d } = boundWorld("h08");
   const unboundTurn = (session, during) => {
     w.hook(wk, "UserPromptSubmit", { session_id: session, prompt: "chat, not a dispatch ref" });
@@ -317,7 +318,7 @@ test("H-08 unbound turns: one notice per new seq (deduplicated across passes), s
 });
 
 // ── H-09 sandbox staging ────────────────────────────────────────────────────
-test("H-09 prepareWorkerSandbox stages the hook read-only + sealed, adds exactly one host --settings; caller --settings refused", { skip: SKIP }, () => {
+if (POSIX) test("H-09 prepareWorkerSandbox stages the hook read-only + sealed, adds exactly one host --settings; caller --settings refused", () => {
   const run = H.makeRun("h09");
   const prep = path.join(run.fakes, "prepare-sandbox");
   fs.symlinkSync(path.join(HERE, "mandatory-report-1170.fakes.mjs"), prep);
@@ -369,3 +370,155 @@ test("H-09 prepareWorkerSandbox stages the hook read-only + sealed, adds exactly
   assert.deepEqual(settings, { hooks: expected });
   assert.equal(run.tripwireHits(), "");
 });
+
+// Native Windows: each H-02..09 keeps its case identity and asserts a reachable real function.
+// Anchored capture and sandbox staging remain explicit unsupported paths.
+if (!POSIX) {
+  test("H-02 native hook binds exact ref and refuses hash/attempt mismatches before bound TURN", () => {
+    const f = hookFixture();
+    f.run("UserPromptSubmit", { session_id: "h02", prompt: f.prompt });
+    const bound = f.run("Stop", { session_id: "h02" }).wrote;
+    assert.deepEqual(bound, [path.join(f.reqDir, "TURN-1.md")]);
+    assert.equal(turnOf(bound[0], f.req).assoc, "exact");
+    const g = hookFixture();
+    const renamed = path.join(g.shared, `${"b".repeat(64)}.md`);
+    fs.renameSync(g.ref, renamed);
+    g.run("UserPromptSubmit", { session_id: "hash", prompt: dispatchPromptTemplate()(renamed) });
+    assert.deepEqual(g.run("Stop", { session_id: "hash" }).wrote, [path.join(g.outbox, "_unbound", "TURN-1.md")]);
+    assert.equal(fs.existsSync(path.join(g.outbox, g.req.request_id)), false);
+    const h = hookFixture();
+    const foreign = hookFixture({ sid: h.sid });
+    const copied = path.join(h.shared, path.basename(foreign.ref));
+    fs.copyFileSync(foreign.ref, copied);
+    h.run("UserPromptSubmit", { session_id: "attempt", prompt: dispatchPromptTemplate()(copied) });
+    assert.deepEqual(h.run("Stop", { session_id: "attempt" }).wrote, [path.join(h.outbox, "_unbound", "TURN-1.md")]);
+    assert.equal(fs.existsSync(path.join(h.outbox, foreign.req.request_id)), false);
+  });
+
+  test("H-03 native hook duplicate, overlap and SessionEnd transitions", () => {
+    const f = hookFixture();
+    f.run("UserPromptSubmit", { session_id: "h03", prompt: f.prompt });
+    assert.equal(f.run("Stop", { session_id: "h03" }).wrote.length, 1);
+    assert.deepEqual(f.run("Stop", { session_id: "h03" }).wrote, []);
+    assert.deepEqual(f.run("SessionEnd", { session_id: "h03" }).wrote, []);
+    f.run("UserPromptSubmit", { session_id: "h03", prompt: f.prompt });
+    f.run("UserPromptSubmit", { session_id: "h03", prompt: "ordinary chat" });
+    const overlap = f.run("StopFailure", { session_id: "h03", error: "rate_limit" }).wrote;
+    assert.deepEqual(overlap.sort(), [path.join(f.reqDir, "TURN-2.md"), path.join(f.outbox, "_unbound", "TURN-1.md")].sort());
+    assert.equal(turnOf(path.join(f.reqDir, "TURN-2.md"), f.req).assoc, "unknown");
+    assert.equal(turnOf(path.join(f.outbox, "_unbound", "TURN-1.md")).assoc, "unknown");
+    f.run("UserPromptSubmit", { session_id: "h03", prompt: f.prompt });
+    const end = f.run("SessionEnd", { session_id: "h03", reason: "logout" }).wrote;
+    assert.deepEqual(end, [path.join(f.reqDir, "TURN-3.md")]);
+    assert.equal(turnOf(end[0], f.req).end, "session_end");
+  });
+
+  test("H-04 native hook CLI exits cleanly with no stdout and exact degraded markers", () => {
+    const f = hookFixture();
+    const run = (event, input, args = f.args(event)) => spawnSync(process.execPath, [HOOK_JS, ...args], {
+      input, cwd: REPO, env: { PATH: process.env.PATH, HOME: f.home, SYSTEMROOT: process.env.SYSTEMROOT },
+      encoding: "utf8", timeout: 30000 });
+    for (const [event, input, args] of [["UserPromptSubmit", "{broken", undefined],
+      ["UserPromptSubmit", "x".repeat(1024 * 1024 + 1), undefined],
+      ["Stop", JSON.stringify({ session_id: "../../etc" }), undefined],
+      ["Stop", "{}", ["Stop", f.outbox, f.shared, f.sid]]]) {
+      const r = run(event, input, args);
+      assert.ifError(r.error);
+      assert.deepEqual([r.status, r.stdout, r.stderr], [0, "", ""]);
+    }
+    assert.deepEqual(fs.readdirSync(f.outbox).filter((n) => n.startsWith(".hook-degraded-")).sort(),
+      [".hook-degraded-args_invalid", ".hook-degraded-session_invalid", ".hook-degraded-stdin_oversize", ".hook-degraded-stdin_unparsable"]);
+    const g = hookFixture();
+    assert.equal(run("UserPromptSubmit", JSON.stringify({ session_id: "active", prompt: g.prompt }), g.args("UserPromptSubmit")).stdout, "");
+    const active = run("Stop", JSON.stringify({ session_id: "active", stop_hook_active: true }), g.args("Stop"));
+    assert.deepEqual([active.status, active.stdout], [0, ""]);
+    assert.ok(fs.existsSync(path.join(g.reqDir, "TURN-1.md")));
+    const q = hookFixture();
+    fs.mkdirSync(q.reqDir, { recursive: true });
+    for (let i = 1; i <= 64; i++) fs.writeFileSync(path.join(q.reqDir, `TURN-${i}.md`), "x");
+    run("UserPromptSubmit", JSON.stringify({ session_id: "quota", prompt: q.prompt }), q.args("UserPromptSubmit"));
+    assert.equal(run("Stop", JSON.stringify({ session_id: "quota" }), q.args("Stop")).stdout, "");
+    assert.deepEqual(fs.readdirSync(q.outbox).filter((n) => n.startsWith(".hook-degraded-")), [".hook-degraded-turn_limit"]);
+    const m = hookFixture();
+    fs.rmSync(m.outbox, { recursive: true });
+    const missing = run("Stop", JSON.stringify({ session_id: "missing" }), m.args("Stop"));
+    assert.deepEqual([missing.status, missing.stdout, missing.stderr], [0, "", hookMod.STORAGE_FAILURE_MARKER]);
+  });
+
+  test("H-05 native decide TURN notice and real registry seen-only ACK", async () => {
+    const decide = await loadReport("decide");
+    const req = mint();
+    const { row, scan } = policyFixture(req);
+    scan.items = [turnItem(1)];
+    const actions = decide.decide(row, scan, T0, decide.DEFAULT_POLICY);
+    assert.deepEqual(actions.filter((a) => a.type === "notice").map((a) => a.subject), ["TURN-1"]);
+    const note = env1170.renderNotice({ subject: "TURN", task: "1170", sid: row.sid, attempt: row.attempt,
+      dispatch_id: row.dispatch_id, request_id: req.request_id, item: "TURN-1", sha256: "1".repeat(64), bytes: 1,
+      n: 1, inbox: "native-fixture", successor: null, event: null, detail: null, verdicts: ["seen"],
+      turn: { end: "stop", assoc: "exact", error: null } }, null);
+    assert.match(note, /TURN_ENDED_NO_REPORT/);
+    assert.match(note, /--verdict seen$/);
+    const reg = registryFixture(SCRATCH, req);
+    const fields = ["bytes=1", "inbox=native-fixture", "end=stop", "assoc=exact", "turn_error=", "new_formal="];
+    reg.event("captured", "TURN-1", "1".repeat(64), fields);
+    reg.event("reviewed", "TURN-1", "1".repeat(64), ["verdict=seen"]);
+    assert.equal(reg.event("reviewed", "TURN-1", "1".repeat(64), ["verdict=accepted"], 4).result, "invalid_verdict");
+    assert.equal(reg.row().report.resolution, "open");
+    assert.equal(reg.row().report.current_final, null);
+  });
+
+  test("H-06 native decide suppresses only a truly captured formal", async () => {
+    const decide = await loadReport("decide");
+    const req = mint();
+    const formal = { key: "REPORT-1", kind: "REPORT", seq: 1, sha256: "a".repeat(64), bytes: 1, raw: Buffer.from("x") };
+    const valid = policyFixture(req);
+    valid.scan.items = [turnItem(1, ["REPORT-1"]), formal];
+    assert.deepEqual(decide.decide(valid.row, valid.scan, T0, decide.DEFAULT_POLICY)
+      .filter((a) => a.type === "notice" && a.subject === "TURN-1"), []);
+    const invalid = policyFixture(req);
+    invalid.scan.items = [turnItem(1, ["REPORT-1"])];
+    invalid.scan.invalid = [{ name: "REPORT-1.md", code: "bad_challenge" }];
+    assert.deepEqual(decide.decide(invalid.row, invalid.scan, T0, decide.DEFAULT_POLICY)
+      .filter((a) => a.type === "notice").map((a) => a.subject), ["TURN-1"]);
+  });
+
+  test("H-07 native real registry supersedes old TURN and decide notices newest", async () => {
+    const decide = await loadReport("decide");
+    const req = mint();
+    const reg = registryFixture(path.join(SCRATCH, `reg-${randomUUID()}`), req);
+    for (let seq = 1; seq <= 3; seq++) reg.event("captured", `TURN-${seq}`, String(seq).repeat(64),
+      ["bytes=1", "inbox=native-fixture", "end=stop", "assoc=exact", "turn_error=", "new_formal="]);
+    const row = reg.row();
+    assert.equal(row.report.items["TURN-1"].superseded_by, "TURN-2");
+    assert.equal(row.report.items["TURN-2"].superseded_by, "TURN-3");
+    assert.equal(reg.event("reviewed", "TURN-1", "1".repeat(64), ["verdict=seen"], 4).result, "STALE_SUBJECT");
+    const scan = policyFixture(req).scan;
+    assert.deepEqual(decide.decide(row, scan, T0, decide.DEFAULT_POLICY)
+      .filter((a) => a.type === "notice").map((a) => a.subject), ["TURN-3"]);
+  });
+
+  test("H-08 native production unbound selector deduplicates; reader refuses before effects", async () => {
+    const pump = await loadReport("pump");
+    const outbox = await loadReport("outbox");
+    const entries = [{ name: "TURN-1.md", kind: "TURN", seq: 1 }, { name: "TURN-3.md", kind: "TURN", seq: 3 },
+      { name: "REPORT-2.md", kind: "REPORT", seq: 2 }];
+    assert.equal(pump.selectUnboundTurn(entries, 0).seq, 3);
+    assert.equal(pump.selectUnboundTurn(entries, 2).seq, 3);
+    assert.equal(pump.selectUnboundTurn(entries, 3), undefined);
+    assert.match(env1170.renderUnboundTurnNotice({ sid: "w1136-native", attempt: randomUUID(), item: "TURN-3",
+      end: "stop", assoc: "unknown", open_requests: [mint().request_id] }), /UNKNOWN: .*no ACK\.$/);
+    const f = hookFixture();
+    const marker = path.join(f.outbox, "_unbound", "TURN-1.md");
+    fs.mkdirSync(path.dirname(marker));
+    fs.writeFileSync(marker, "HOST-SECRET-H08");
+    const before = fs.readFileSync(marker);
+    assert.deepEqual(outbox.scanAnchoredOutbox(f.home, "b".repeat(64), f.sid, f.attempt, "_unbound"),
+      { status: "refused", error: "anchored_read_unsupported", entries: [], markers: [], ignored: 0 });
+    assert.deepEqual(fs.readFileSync(marker), before);
+  });
+
+  test("H-09 native sandbox refuses normal and caller settings before staging", async () => {
+    for (const [i, args] of [["claude"], ["claude", "--settings", "{}"], ["claude", "--settings={}"]].entries())
+      await sandboxRefusal(SCRATCH, `w1136-h09-native-${i}`, args);
+  });
+}

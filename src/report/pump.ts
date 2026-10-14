@@ -15,8 +15,8 @@
 //
 // Nothing here uses bash, curl, pmset, launchd, telepty-auth.sh, uid or mode
 // checks as authority: the same code runs on macOS, Linux and native Windows (on
-// Windows the sealed-chain check refuses first, `chain_agent_binding_*`; a direct
-// outbox read is refused too: no O_NOFOLLOW there).
+// Windows a valid bound capture refuses before filesystem access because the
+// anchored reader has no O_NOFOLLOW there).
 import { spawnSync } from "node:child_process";
 import crossSpawn from "cross-spawn";
 import { createHash } from "node:crypto";
@@ -39,7 +39,7 @@ import {
   renderUnboundTurnNotice, sanitizeBody, type ItemKind, type LegacyDigestEntry, type NoticeHeader, type SanitizedBody,
 } from "./envelope.js";
 import {
-  DISPATCH_ID_RE, UNBOUND_DIR, scanAnchoredOutbox, writeInboxCopy,
+  DISPATCH_ID_RE, UNBOUND_DIR, scanAnchoredOutbox, writeInboxCopy, type AnchoredEntry,
 } from "./outbox.js";
 
 export const BROKER_SID = "dispatch-tracker";
@@ -393,6 +393,7 @@ function locate(row: ReportRow, deps: PumpDeps): Chain {
   if (!REQUEST_ID_RE.test(row.attempt) || !HEX64_RE.test(row.manifest_sha256)) {
     return { ok: false, code: "chain_bad_binding", missing: false };
   }
+  if (process.platform === "win32") return { ok: false, code: "anchored_read_unsupported", missing: false };
   let stage: string;
   try {
     stage = fs.realpathSync(path.join(deps.sessionsRoot, row.sid));
@@ -693,6 +694,11 @@ interface AttemptGroup {
   openRequests: string[];
 }
 
+/** Newest unhandled TURN; an incomplete item is still retried by processUnbound. */
+export function selectUnboundTurn(entries: readonly AnchoredEntry[], seen: number): AnchoredEntry | undefined {
+  return entries.filter((e) => e.kind === "TURN" && e.seq > seen).sort((a, b) => b.seq - a.seq)[0];
+}
+
 function processUnbound(g: AttemptGroup, seen: number, deps: PumpDeps, res: PumpResult): void {
   const listing = scanAnchoredOutbox(g.root, g.manifestSha, g.sid, g.attempt, UNBOUND_DIR);
   const key = `${g.sid}/${g.attempt}`;
@@ -701,7 +707,7 @@ function processUnbound(g: AttemptGroup, seen: number, deps: PumpDeps, res: Pump
     res.captureFailed += 1;
     return;
   }
-  const newest = listing.entries.filter((e) => e.kind === "TURN" && e.seq > seen).sort((a, b) => b.seq - a.seq)[0];
+  const newest = selectUnboundTurn(listing.entries, seen);
   if (!newest) return;
   const p = newest.bytes ? parseItem(newest.bytes, { requestId: "unbound", challengeSha256: "", kind: "TURN", seq: newest.seq, unbound: true }) : null;
   if (p && !p.ok && p.error === "incomplete") return; // re-checked next pass

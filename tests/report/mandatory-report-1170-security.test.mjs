@@ -14,9 +14,8 @@
 //               overlapping another sid's stage, the sessions root, the registry state or the
 //               control/package roots BEFORE any write; a valid minimal scope is staged.
 //
-// POSIX-only cases carry an explicit `skip` naming the platform (counted by node:test); a
-// Windows run proves the portable cases and the explicit refusals only — native Windows
-// confined workers remain an unresolved prerequisite, not a pass.
+// POSIX and native Windows register distinct assertions for S-04/05/07/08/09.
+// Native Windows confined workers and anchored capture remain unsupported.
 import assert from "node:assert/strict";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
@@ -26,9 +25,9 @@ import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { itemBytes, mint, worldKit } from "./mandatory-report-1170.fakes.mjs";
+import { loadReport, policyFixture, sandboxRefusal, turnItem } from "./mandatory-report-1170-windows-fixtures.mjs";
 
 const POSIX = process.platform === "darwin" || process.platform === "linux";
-const POSIX_ONLY = POSIX ? false : `POSIX-only (symlink/FIFO/O_NOFOLLOW/sandbox); explicit refusal covered by S-06/S-10 on ${process.platform}`;
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, "..", "..");
 const DIST = path.join(REPO, "dist");
@@ -52,7 +51,7 @@ function box() {
   fs.writeFileSync(path.join(root, "manifest.json"), raw, { mode: 0o600 });
   const outside = path.join(SCRATCH, `outside-${id}`);
   fs.mkdirSync(outside, { mode: 0o700 });
-  return { root, home, req, dir, outside, scan: (request = req.request_id) =>
+  return { root, home, req, dir, outside, sid, attempt, scan: (request = req.request_id) =>
     outbox.scanAnchoredOutbox(root, sha256(raw), sid, attempt, request) };
 }
 const expect = (req, kind = "REPORT", seq = 1) => ({ requestId: req.request_id, challengeSha256: req.challenge_sha256, kind, seq });
@@ -143,7 +142,7 @@ test("S-03 ref trailer: controller fields are tokenized; worker-controlled shape
 });
 
 // ── S-04..S-06 anchored helper reads (real fs) ─────────────────────────────
-test("S-04 anchored listing: names, missing request, symlinked parents and entry bound", { skip: POSIX_ONLY }, () => {
+if (POSIX) test("S-04 anchored listing: names, missing request, symlinked parents and entry bound", () => {
   const b = box();
   fs.writeFileSync(path.join(b.dir, "REPORT-1.md"), "x", { mode: 0o600 });
   for (const name of ["REPORT-0.md", "REPORT-33.md", "REPORT-01.md", "REPORT-1.md.tmp", "HOLD-1.txt", "README"])
@@ -171,7 +170,7 @@ test("S-04 anchored listing: names, missing request, symlinked parents and entry
   assert.equal(s4.scan().error, "outbox_entry_limit");
 });
 
-test("S-05 anchored items: valid, symlink, hardlink, FIFO, directory and oversize", { skip: POSIX_ONLY }, () => {
+if (POSIX) test("S-05 anchored items: valid, symlink, hardlink, FIFO, directory and oversize", () => {
   const b = box(), host = path.join(b.outside, "host-secret.md");
   fs.writeFileSync(host, itemBytes(b.req, "REPORT", 1, "HOST-SECRET-1170"));
   const good = itemBytes(b.req, "REPORT", 2, "fine");
@@ -201,7 +200,7 @@ test("S-06 unsupported platforms refuse and inbox names remain constrained", () 
 });
 
 // ── S-07..S-08 through the real pump + registry ─────────────────────────────
-test("S-07 pump: adversarial items are never captured or forwarded; each surfaces as item_invalid with its code; incomplete waits", { skip: POSIX_ONLY }, () => {
+if (POSIX) test("S-07 pump: adversarial items are never captured or forwarded; each surfaces as item_invalid with its code; incomplete waits", () => {
   const w = K.world("s07");
   const SECRET = "HOST-SECRET-S07-1170";
   const cases = {};
@@ -249,7 +248,7 @@ test("S-07 pump: adversarial items are never captured or forwarded; each surface
   assert.equal(w.run.tripwireHits(), "");
 });
 
-test("S-08 pump: overwrite after capture = item_conflict (original kept); wrong sealed outbox binding refused (chain_outbox_binding)", { skip: POSIX_ONLY }, () => {
+if (POSIX) test("S-08 pump: overwrite after capture = item_conflict (original kept); wrong sealed outbox binding refused (chain_outbox_binding)", () => {
   const w = K.world("s08");
   const wk = w.worker("w1170-s08");
   const d = w.dispatch(wk);
@@ -286,7 +285,7 @@ test("S-08 pump: overwrite after capture = item_conflict (original kept); wrong 
 });
 
 // ── S-09..S-10 RC6: cross-worker control scope ──────────────────────────────
-test("S-09 prepareWorkerSandbox refuses control-root overlap BEFORE any write; a valid minimal scope is staged with its outbox", { skip: POSIX_ONLY }, () => {
+if (POSIX) test("S-09 prepareWorkerSandbox refuses control-root overlap BEFORE any write; a valid minimal scope is staged with its outbox", () => {
   const run = H.makeRun("s09");
   const prep = path.join(run.fakes, "prepare-sandbox");
   fs.symlinkSync(fileURLToPath(new URL("./mandatory-report-1170.fakes.mjs", import.meta.url)), prep);
@@ -350,4 +349,92 @@ test("S-10 prepareWorkerSandbox on a non-POSIX platform is an explicit refusal (
   assert.throws(() => ws.prepareWorkerSandbox({ version: 1, task: "1170", sid: "w", read: [], write: [], domains: [] },
     "claude", SCRATCH, ["claude"], SCRATCH), /SANDBOX_PLATFORM_UNSUPPORTED/);
 });
+
+if (!POSIX) {
+  test("S-04 native reader validates names then refuses before attempt-root access", () => {
+    const b = box();
+    fs.writeFileSync(path.join(b.dir, "REPORT-1.md"), "ordinary");
+    assert.deepEqual(b.scan("../../etc"), { status: "refused", error: "helper_bad_args", entries: [], markers: [], ignored: 0 });
+    const absent = path.join(SCRATCH, `absent-${randomUUID()}`);
+    assert.deepEqual(outbox.scanAnchoredOutbox(absent, "b".repeat(64), b.sid, b.attempt, b.req.request_id),
+      { status: "refused", error: "anchored_read_unsupported", entries: [], markers: [], ignored: 0 });
+    assert.equal(b.scan().error, "anchored_read_unsupported");
+  });
+
+  test("S-05 native reader accepts no secret or oversized item bytes", () => {
+    const b = box();
+    const secret = "HOST-SECRET-S05-1170";
+    fs.writeFileSync(path.join(b.dir, "REPORT-1.md"), itemBytes(b.req, "REPORT", 1, secret));
+    fs.writeFileSync(path.join(b.dir, "REPORT-2.md"), Buffer.alloc(65537, 0x41));
+    const before = fs.readdirSync(b.dir).sort();
+    const result = b.scan();
+    assert.deepEqual(result, { status: "refused", error: "anchored_read_unsupported", entries: [], markers: [], ignored: 0 });
+    assert.ok(!JSON.stringify(result).includes(secret));
+    assert.deepEqual(fs.readdirSync(b.dir).sort(), before);
+    assert.equal(fs.existsSync(path.join(SCRATCH, "inbox")), false);
+  });
+
+  test("S-07 native decide rejects malformed items; valid bound pump refuses before capture or inject", async () => {
+    const decide = await loadReport("decide");
+    const pump = await loadReport("pump");
+    const req = mint();
+    const bad = [
+      itemBytes(req, "REPORT", 1, "secret", { challenge: mint().challenge }),
+      itemBytes(req, "REPORT", 1, "secret", { end: `AIGENTRY_REPORT_END ${req.request_id} REPORT-9` }),
+    ];
+    for (const [bytes, code] of bad.map((bytes, i) => [bytes, i === 0 ? "bad_challenge" : "bad_end"])) {
+      assert.deepEqual(env1170.parseItem(bytes, expect(req)), { ok: false, error: code });
+      const { row, scan } = policyFixture(req);
+      scan.invalid = [{ name: "REPORT-1.md", code }];
+      const actions = decide.decide(row, scan, Date.now(), decide.DEFAULT_POLICY);
+      assert.deepEqual(actions.filter((a) => a.type === "capture"), []);
+      assert.deepEqual(actions.filter((a) => a.type === "failure").map((a) => a.detail), [`REPORT-1.md: ${code}`]);
+    }
+    const partial = itemBytes(req, "REPORT", 1, "partial").subarray(0, -30);
+    assert.equal(env1170.parseItem(partial, expect(req)).error, "incomplete");
+    const { row, scan } = policyFixture(req);
+    assert.deepEqual(decide.decide(row, scan, Date.now(), decide.DEFAULT_POLICY).filter((a) => a.type === "capture"), []);
+    const state = path.join(SCRATCH, `pump-state-${randomUUID()}`);
+    fs.mkdirSync(state);
+    const effects = { registry: 0, inject: 0, audit: 0 };
+    const deps = { stateDir: state, sessionsRoot: path.join(SCRATCH, "unread-sessions"), orchestratorSid: "orchestrator",
+      registry: { list: () => ({ status: 0, stdout: JSON.stringify(row) + "\n" }),
+        event: () => { effects.registry++; throw new Error("unexpected registry event"); } },
+      telepty: { list: () => [], inject: () => { effects.inject++; throw new Error("unexpected inject"); },
+        injects: () => { effects.audit++; throw new Error("unexpected audit"); } },
+      clock: { nowMs: () => Date.parse("2026-10-09T12:01:00Z") }, pidAlive: () => null, policy: decide.DEFAULT_POLICY };
+    const result = pump.pumpOnce(deps, { sid: row.sid });
+    assert.equal(result.captureFailed, 1);
+    assert.deepEqual(result.errors[row.dispatch_id], ["anchored_read_unsupported"]);
+    assert.deepEqual([result.captured, result.notices, result.unboundSeen], [0, 0, {}]);
+    assert.deepEqual(effects, { registry: 0, inject: 0, audit: 0 });
+    assert.deepEqual(fs.readdirSync(state), []);
+  });
+
+  test("S-08 native decide preserves original SHA on conflict; S-07 pump guard covers binding", async () => {
+    const decide = await loadReport("decide");
+    const req = mint();
+    const original = "a".repeat(64);
+    const { row, scan } = policyFixture(req, { "REPORT-1": { sha256: original, bytes: 1, inbox: "original-inbox",
+      captured_at: "2026-10-09T12:00:00Z", superseded_by: null, notice: null, review: null } });
+    row.report.current_final = "REPORT-1";
+    scan.items = [{ key: "REPORT-1", kind: "REPORT", seq: 1, sha256: "c".repeat(64), bytes: 2,
+      raw: Buffer.from("HOST-SECRET-S08") }];
+    const actions = decide.decide(row, scan, Date.now(), decide.DEFAULT_POLICY);
+    assert.deepEqual(actions.filter((a) => a.type === "capture"), []);
+    assert.deepEqual(actions.filter((a) => a.type === "failure" && a.event === "item_conflict")
+      .map((a) => [a.key, a.detail]), [["REPORT-1", "REPORT-1 changed after capture"]]);
+    assert.equal(row.report.items["REPORT-1"].sha256, original);
+    assert.equal(row.report.items["REPORT-1"].inbox, "original-inbox");
+  });
+
+  test("S-09 native sandbox refuses overlapping and valid scopes before writes", async () => {
+    const control = path.join(SCRATCH, "control-native");
+    const work = path.join(SCRATCH, "work-native");
+    fs.mkdirSync(control);
+    fs.mkdirSync(work);
+    await sandboxRefusal(SCRATCH, "w1170-s09-overlap", ["claude"], [control], [control]);
+    await sandboxRefusal(SCRATCH, "w1170-s09-valid", ["claude"], [], [work]);
+  });
+}
 

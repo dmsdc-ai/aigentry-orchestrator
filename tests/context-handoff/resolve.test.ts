@@ -7,6 +7,8 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
+import * as fsModule from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -274,39 +276,114 @@ if (!POSIX) {
     assert.deepEqual(fs.readdirSync(path.join(b.ws, "state")), []);
   });
 
-  test("win32: an ACL-denied store is ignored while a readable store still wins", async (t) => {
+  test("win32: injected transcript read failure is skipped while a readable store still wins", async (t) => {
     const b = makeBox();
-    t.after(() => dropBox(b));
-    const p = plantClaude(b, { last: at(50) });
-    assert.ok(winPrivateStorage, "Windows private-storage primitive is required");
-    const principal = winPrivateStorage.currentPrincipal();
-    assert.equal(principal.status, "ok", JSON.stringify(principal));
-    if (principal.status !== "ok") return;
-    const sid = `*${principal.userSid}`;
-    // Deny the transcript itself: an ACE on projects/ without inheritance does not deny reads below it.
-    icacls([p.file, "/deny", `${sid}:(R)`, "/q"]);
-    try {
-      let readError: NodeJS.ErrnoException | null = null;
+    let originalDescriptor: PropertyDescriptor | undefined;
+    let originalOpenSync: typeof fs.openSync | undefined;
+    let transcript: string | undefined;
+    let control: string | undefined;
+    let originalBytes: Buffer | undefined;
+    let identity: { dev: number; ino: number } | undefined;
+    let controlIdentity: { dev: number; ino: number } | undefined;
+    let failure: unknown;
+    let failed = false;
+    const firstByte = (file: string): Buffer => {
+      const fd = fs.openSync(file, fs.constants.O_RDONLY);
       try {
-        const fd = fs.openSync(p.file, fs.constants.O_RDONLY);
-        try {
-          fs.readSync(fd, Buffer.alloc(1), 0, 1, 0);
-        } finally {
-          fs.closeSync(fd);
-        }
-      } catch (error) {
-        readError = error as NodeJS.ErrnoException;
+        const byte = Buffer.alloc(1);
+        assert.equal(fs.readSync(fd, byte, 0, 1, 0), 1, `one byte from ${file}`);
+        return byte;
+      } finally {
+        fs.closeSync(fd);
       }
-      assert.ok(readError, "ACL fixture setup failed: O_RDONLY transcript open/read succeeded");
-      assert.ok(["EACCES", "EPERM"].includes(readError.code ?? ""),
-        `ACL fixture setup failed: expected access denied from transcript open/read, got ${readError.code ?? "unknown"}`);
-      assertSkipped(await resolve(b, { write: true }), "unreadable Claude store");
+    };
+    try {
+      const p = plantClaude(b, { last: at(50) });
+      transcript = p.file;
+      const canonical = fs.realpathSync.native(p.file);
+      const root = fs.realpathSync.native(b.base);
+      const relative = path.relative(root, canonical);
+      assert.ok(relative && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative), "transcript must be an owned file");
+      const before = fs.lstatSync(canonical);
+      assert.ok(before.isFile(), "transcript must be a regular file");
+      identity = { dev: before.dev, ino: before.ino };
+      originalBytes = fs.readFileSync(canonical);
+      control = path.join(b.base, "readable-control.jsonl");
+      fs.copyFileSync(canonical, control);
+      const controlBefore = fs.lstatSync(control);
+      assert.ok(controlBefore.isFile(), "positive control must be a regular file");
+      controlIdentity = { dev: controlBefore.dev, ino: controlBefore.ino };
+      assert.deepEqual(fs.readFileSync(control), originalBytes, "positive control has the same bytes");
+      const controlByte = firstByte(control);
+      assert.deepEqual(firstByte(p.file), controlByte, "both original files allow a direct Node read");
+
+      originalDescriptor = Object.getOwnPropertyDescriptor(fs, "openSync");
+      if (!originalDescriptor?.configurable || !originalDescriptor.writable) throw new Error("openSync must be restorable");
+      originalOpenSync = fs.openSync;
+      const nativeOpenSync = originalOpenSync;
+      const ownedPaths = new Set([path.resolve(p.file).toLowerCase(), path.resolve(canonical).toLowerCase()]);
+      const injectedError = Object.assign(new Error("injected owned transcript read failure"), { code: "EACCES", syscall: "open" });
+      let attempts = 0;
+      const faultedOpenSync: typeof fs.openSync = (file, flags, mode) => {
+        if (typeof file === "string" && ownedPaths.has(path.resolve(file).toLowerCase()) && flags === fs.constants.O_RDONLY) {
+          attempts++;
+          throw injectedError;
+        }
+        return nativeOpenSync(file, flags, mode);
+      };
+      // readBounded imports the ESM fs namespace; synchronize its openSync binding with the test-owned fault.
+      Object.defineProperty(fs, "openSync", { ...originalDescriptor, value: faultedOpenSync });
+      syncBuiltinESMExports();
+      assert.equal(fsModule.openSync, faultedOpenSync, "the resolver's ESM builtin binding must see the fault");
+      let directFailure: unknown;
+      try { firstByte(p.file); } catch (error) { directFailure = error; }
+      assert.equal(directFailure, injectedError, "only the owned transcript has the injected EACCES");
+      assert.equal((directFailure as NodeJS.ErrnoException).code, "EACCES", "the injected read failure is explicit");
+      assert.equal(attempts, 1, "direct owned-path read reached the injected open");
+      assert.deepEqual(firstByte(control), controlByte, "unrelated same-byte control remains readable");
+      const beforeClaudeResolve = attempts;
+      assertSkipped(await resolve(b, { write: true }), "injected Claude transcript read failure");
+      assert.ok(attempts > beforeClaudeResolve, "resolver attempted the owned transcript read");
       const c = plant("codex", b, { last: at(10) });
       const r = await resolve(b, { write: true });
       assert.equal(r.ref?.source.sessionId, c.session, "the readable store is still used");
+    } catch (error) {
+      failed = true;
+      failure = error;
     } finally {
-      icacls([p.file, "/remove:d", sid, "/q"]);
+      const cleanup = (label: string, action: () => void): void => {
+        try { action(); }
+        catch (error) {
+          if (failed) t.diagnostic(`${label} also failed: ${String(error)}`);
+          else { failed = true; failure = error; }
+        }
+      };
+      cleanup("fs binding restoration", () => {
+        if (originalDescriptor) {
+          Object.defineProperty(fs, "openSync", originalDescriptor);
+          syncBuiltinESMExports();
+          assert.deepEqual(Object.getOwnPropertyDescriptor(fs, "openSync"), originalDescriptor, "original descriptor is restored");
+          if (originalOpenSync) assert.equal(fsModule.openSync, originalOpenSync, "ESM fs binding is restored");
+        }
+      });
+      cleanup("post-injection file verification", () => {
+        if (transcript && originalBytes && identity) {
+          const after = fs.lstatSync(transcript);
+          assert.ok(after.isFile(), "transcript remains a regular file");
+          assert.deepEqual({ dev: after.dev, ino: after.ino }, identity, "transcript identity is unchanged");
+          assert.deepEqual(fs.readFileSync(transcript), originalBytes, "transcript bytes are unchanged");
+          assert.equal(firstByte(transcript).length, 1, "transcript is directly readable after restoration");
+        }
+        if (control && originalBytes && controlIdentity) {
+          const after = fs.lstatSync(control);
+          assert.ok(after.isFile(), "positive control remains a regular file");
+          assert.deepEqual({ dev: after.dev, ino: after.ino }, controlIdentity, "positive control identity is unchanged");
+          assert.deepEqual(fs.readFileSync(control), originalBytes, "positive control bytes are unchanged");
+        }
+      });
+      cleanup("fixture deletion", () => dropBox(b));
     }
+    if (failed) throw failure;
   });
 }
 
