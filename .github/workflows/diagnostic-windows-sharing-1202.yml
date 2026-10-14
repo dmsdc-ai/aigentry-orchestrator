@@ -31,7 +31,7 @@ jobs:
         run: npm run build
       - name: Diagnose exclusive-sharing holder lifetime
         shell: bash
-        run: node tests/diagnostics/windows-sharing-1202.mjs "${RUNNER_TEMP}/windows-sharing-1202.json"
+        run: node tests/diagnostics/windows-sharing-1202.mjs
       - name: Run the selected exclusive-sharing resolver test
         if: always()
         shell: bash
@@ -50,7 +50,7 @@ jobs:
         with:
           name: windows-sharing-1202
           path: |
-            ${{ runner.temp }}/windows-sharing-1202.json
+            ${{ github.workspace }}/windows-sharing-1202.json
             ${{ runner.temp }}/windows-sharing-1202.tap
           if-no-files-found: warn
           retention-days: 7

@@ -5,6 +5,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+if (process.argv.length !== 2) throw new Error("Windows sharing diagnostic accepts no CLI arguments");
+
 const ORIGINAL_HOLDER = [
   "$ErrorActionPreference = 'Stop'",
   "$encoded = [Console]::In.ReadLine()",
@@ -52,7 +54,7 @@ const READER = [
 const scripts = { originalHolder: ORIGINAL_HOLDER, acknowledgementHolder: ACK_HOLDER, dotnetReader: READER };
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const powershell = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-const reportPath = process.argv[2];
+const reportPath = path.join(process.cwd(), "windows-sharing-1202.json");
 const report = {
   task: 1202,
   kind: "diagnostic-only",
@@ -215,7 +217,6 @@ async function compareWhileHeld(holder, denied, readable) {
 
 async function run() {
   if (process.platform !== "win32") throw new Error("Windows diagnostic only");
-  if (!reportPath || !path.isAbsolute(reportPath) || path.basename(reportPath) !== "windows-sharing-1202.json") throw new Error("expected absolute diagnostic report path");
   fixture = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "sharing-1202-"));
   const denied = path.join(fixture, "synthetic-transcript.jsonl");
   const readable = path.join(fixture, "readable-control.jsonl");
@@ -277,8 +278,6 @@ try {
     }
   }
   report.children = handles.map((handle) => handle.record);
-  if (reportPath && path.isAbsolute(reportPath)) {
-    try { fs.writeFileSync(reportPath, JSON.stringify(report, null, 2) + "\n"); }
-    catch (error) { process.stderr.write(`diagnostic report write failed: ${String(error)}\n`); process.exitCode = 1; }
-  }
+  try { fs.writeFileSync(reportPath, JSON.stringify(report, null, 2) + "\n"); }
+  catch (error) { process.stderr.write(`diagnostic report write failed: ${String(error)}\n`); process.exitCode = 1; }
 }
