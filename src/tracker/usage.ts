@@ -43,6 +43,19 @@ export const USAGE = `# dispatch-tracker.sh — Orchestrator-side dispatch healt
 #       discovery: unattempted_fresh null); a cursor/lock error lists items [] with
 #       null pending; a stdout failure may leave inbox/cursor committed with no
 #       deliverable JSON. Exit 4 usage (any other argument; no state touched).
+#   dispatch-tracker.sh report-pump [--once | --loop <s>] [--sid <sid>] [--capture-only]
+#       — controller-side broker for confined worker reports (#1170): captures
+#       envelope-valid outbox items of the sealed attempt pinned at dispatch into
+#       state/dispatch/inbox/reports/, records them, and notifies the record's
+#       destination as dispatch-tracker (--submit --no-submit-force) on a durable
+#       retry schedule until reviewed. Failure events (exited/dead/gone/overdue/
+#       delivery_unknown) are notices, never completion. Exit 3 record errors, 9 registry.
+#   dispatch-tracker.sh report-ack --dispatch-id <D> --item <REPORT-n|HOLD-n|failure-n|legacy>
+#       --sha256 <H> --verdict <accepted|rework|rejected|answered|seen> — the review
+#       ACK; only an accepted current REPORT resolves a dispatch to done. Exit 4
+#       stale subject/invalid verdict, 8 already recorded.
+#   dispatch-tracker.sh report-status [--json] — open report obligations and pump
+#       health. Exit 3 degraded, 9 registry. See docs/setup/worker-reports.md.
 #   dispatch-tracker.sh --help
 #
 # Records are created by bin/dispatch.sh's begin-delivery transaction BEFORE the

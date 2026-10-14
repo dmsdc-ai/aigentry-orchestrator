@@ -22,12 +22,16 @@ import { fileURLToPath } from "node:url";
 
 import { registryAvailable, registryEnvironment, registryInvocation } from "./registry-command.js";
 export { registryInvocation } from "./registry-command.js";
+import { parseInjectId } from "./inject-id.js";
+export { parseInjectId } from "./inject-id.js";
+import { mintRequest, renderRefTrailer, type ReportRequest } from "../report/envelope.js";
 
 import { USAGE } from "./usage.js";
 import { geminiBinary } from "../session/boot-adapter/gemini.js";
 import { isCliKind, type LaunchConfig } from "../session/boot-adapter/types.js";
 import { normalizeLaunch } from "../session/boot-adapter/launch-config.js";
-import { loadWorkerScope, prepareWorkerSandbox, assertConfinedTarget, stageWorkerRef, assertNotCliWrapper, CONFINED_CLIS } from "../session/worker-sandbox.js";
+import { loadWorkerScope, prepareWorkerSandbox, assertConfinedTarget, stageWorkerRef, assertNotCliWrapper, CONFINED_CLIS,
+  readSandboxCurrent, readSealedManifest } from "../session/worker-sandbox.js";
 import { CLAUDE_OAUTH_OPT_IN } from "../session/claude-worker-oauth.js";
 import { validateSpawnDecision, type SpawnDecision } from "../session/model-decision.js";
 
@@ -135,9 +139,34 @@ function safeSessionComponent(s: string): string {
   return s.replace(/[^A-Za-z0-9_.-]/g, "_");
 }
 
-function mkTemp(prefix: string): string {
+/** #1170 N1: temp refs may hold a report challenge — unlinked on every process.exit path (die included). */
+const tempFiles = new Set<string>();
+let tempExitHook = false;
+
+/**
+ * A fresh private temp file holding `data`: O_CREAT|O_EXCL 0600 ("wx"), so an existing
+ * file or a planted symlink at the name is refused, never followed; written through the fd.
+ */
+function mkTemp(prefix: string, data: string | Uint8Array): string {
   const dir = env.TMPDIR || "/tmp";
-  return path.join(dir, `${prefix}.${randomBytes(3).toString("hex")}`);
+  const file = path.join(dir, `${prefix}.${randomBytes(16).toString("hex")}`);
+  if (!tempExitHook) {
+    tempExitHook = true;
+    process.on("exit", () => { for (const f of tempFiles) { try { fs.unlinkSync(f); } catch { /* already gone */ } } });
+  }
+  const fd = fs.openSync(file, "wx", 0o600);
+  tempFiles.add(file);
+  try {
+    fs.writeFileSync(fd, data);
+  } finally {
+    fs.closeSync(fd);
+  }
+  return file;
+}
+
+function rmTemp(file: string): void {
+  try { fs.unlinkSync(file); } catch { /* already gone */ }
+  tempFiles.delete(file);
 }
 
 // ── spawn-path helpers ──────────────────────────────────────────────────────
@@ -318,34 +347,6 @@ function registryQuiet(args: string[]): number {
   const r = spawnSync(invocation.cmd, invocation.args, { stdio: ["ignore", "ignore", "inherit"], shell: false, env: registryEnvironment() });
   if (r.error) return 127;
   return r.status ?? 1;
-}
-
-// ── inject_id scraping (#872) ───────────────────────────────────────────────
-/**
- * The transport id telepty printed, or "" (#872).
- *
- * telepty 0.8.0 prints it on its own undecorated line so a caller can scrape it
- * without parsing the decorated success line. That is still human-facing stdout,
- * not a machine contract, so this reads conservatively: the whole line must be
- * the prefix plus the exact UUID shape crypto.randomUUID() emits, anchored at
- * both ends. Anything else yields NO id — transport.inject_id stays null and
- * dispatch-tracker.sh fires its existing no_transport_inject_id HOLD, which is
- * the honest answer. A guessed id would send the tracker to poll a DIFFERENT
- * dispatch's observation record.
- */
-export function parseInjectId(text: string): string {
-  const hex = "[0-9a-fA-F]";
-  const re = new RegExp(
-    `^[ \\t]*inject_id:[ \\t]+(${hex}{8}-${hex}{4}-${hex}{4}-${hex}{4}-${hex}{12})[ \\t]*$`,
-  );
-  const ids = new Set<string>();
-  for (const line of text.replace(/\r/g, "").split("\n")) {
-    const m = re.exec(line);
-    if (m) ids.add(m[1]!);
-  }
-  // Exactly one DISTINCT id, or none. Two different ids in one inject's output
-  // is ambiguity, not a menu.
-  return ids.size === 1 ? [...ids][0]! : "";
 }
 
 // ── verify_delivered screen analysis (#835) ─────────────────────────────────
@@ -963,6 +964,43 @@ interface Delivery {
    * delivery was never staged — see the refusal in main().
    */
   refPrompt: string;
+  /** #1170: the envelope minted for this dispatch and the sealed attempt it is bound to. */
+  report?: ReportRequest;
+  reportBinding?: { attempt: string; hash: string };
+}
+
+/**
+ * #1170: the sealed attempt a confined ref is staged into, read through the strict
+ * sealed reader. null (with a named WARNING) when the target cannot carry an envelope
+ * — e.g. a worker spawned before report outboxes existed: the record is then created
+ * without a report binding and report-pump surfaces it as legacy_unbound.
+ */
+function pinReportAttempt(stage: string, sid: string): { attempt: string; hash: string } | null {
+  try {
+    const real = fs.realpathSync(stage);
+    const current = readSandboxCurrent(real);
+    const { m, root, stage: owner } = readSealedManifest(current.manifest, current.hash);
+    const home = path.join(root, "home");
+    if (owner !== real || m.sid !== sid) throw new Error("REPORT_ATTEMPT_IDENTITY");
+    if (m.env.HOME !== home || m.env.AIGENTRY_REPORT_OUTBOX !== path.join(home, "report-outbox")) {
+      throw new Error("REPORT_OUTBOX_UNSEALED");
+    }
+    return { attempt: m.attempt, hash: current.hash };
+  } catch (e) {
+    const why = String((e as Error)?.message ?? e).replace(/[^\x20-\x7e]/g, "?").slice(0, 120);
+    process.stderr.write(`dispatch.sh: WARNING REPORT_ENVELOPE_UNAVAILABLE for ${sid} (${why}) — no report envelope ` +
+      "is bound; the record stays legacy_unbound and report-pump surfaces it\n");
+    return null;
+  }
+}
+
+/** #1170: the trailer goes into a private temp copy; o.refFile (dedup hash / verify) stays original. */
+function appendRefTrailer(d: Delivery, trailer: string): void {
+  // A new exclusive temp with base + trailer (never an in-place append by path); the old temp goes.
+  const prev = d.tmpRef;
+  d.tmpRef = mkTemp("dispatch-ref", Buffer.concat([fs.readFileSync(d.effRef), Buffer.from(trailer)]));
+  d.effRef = d.tmpRef;
+  if (prev) rmTemp(prev);
 }
 
 /**
@@ -971,7 +1009,7 @@ interface Delivery {
  * whose default promptPath is tilde-rooted against the HOST home.
  * The private staged file remains the content source; only its address travels.
  */
-function buildContextRefPrompt(stagedPath: string): string {
+export function buildContextRefPrompt(stagedPath: string): string {
   return `[context-ref] Read ${stagedPath} and use it as the source of truth for this task.`;
 }
 
@@ -1008,8 +1046,7 @@ function prepareEffectiveRef(o: Opts, d: Delivery): boolean {
     );
     return false;
   }
-  d.tmpRef = mkTemp("dispatch-ref");
-  fs.writeFileSync(d.tmpRef, body.split("{{ORCHESTRATOR_REPORT_TARGET}}").join(targetAddr));
+  d.tmpRef = mkTemp("dispatch-ref", body.split("{{ORCHESTRATOR_REPORT_TARGET}}").join(targetAddr));
   d.effRef = d.tmpRef;
   return true;
 }
@@ -1044,9 +1081,7 @@ function inject(o: Opts, d: Delivery, sid: string): Promise<number> {
     });
     const finish = (rc: number) => {
       d.transportInjectId = parseInjectId(out);
-      if (d.tmpRef) {
-        try { fs.unlinkSync(d.tmpRef); } catch { /* already gone */ }
-      }
+      if (d.tmpRef) rmTemp(d.tmpRef);
       resolve(rc); // preserve the inject's real exit code (callers gate on it)
     };
     child.on("error", () => finish(127));
@@ -1132,6 +1167,10 @@ function beginDelivery(o: Opts, d: Delivery, sid: string): { status: number; std
   if (o.worktree) a.push("--worktree", o.worktree);
   if (o.keepAlive) a.push("--keep-alive");
   if (o.retryUnknown) a.push("--retry-unknown", o.retryUnknown);
+  if (d.report && d.reportBinding) {
+    a.push("--attempt", d.reportBinding.attempt, "--manifest-sha256", d.reportBinding.hash,
+      "--report-request-id", d.report.request_id, "--report-challenge-sha256", d.report.challenge_sha256);
+  }
   return registryOut(a);
 }
 
@@ -1288,8 +1327,11 @@ function spawnWorkspace(o: Opts, sid: string): void {
     // boot-prepare (#509). display_cli = o.cli (#532) so the guard wrapper's
     // `exec -a <cli>` and telepty visibility match the actual CLI.
     const protectedRoot = path.join(env.AIGENTRY_SESSIONS_ROOT || path.join(os.homedir(), ".aigentry", "sessions"), sid);
+    // #1170 (RC6): the registry state (the registry's own default) and this control workspace.
+    const stateDir = path.resolve(env.DISPATCH_STATE_DIR ||
+      path.join(path.dirname(path.dirname(path.resolve(DISPATCH_REGISTRY_PY))), "state", "dispatch"));
     const sandbox = prepareWorkerSandbox(scope, o.cli, bootSpawnCwd, bootArgv, protectedRoot, o.cwd, workerHooksDir, bootLaunch,
-      o.decision?.executable);
+      o.decision?.executable, { noAccess: [stateDir], noWrite: [path.resolve(SCRIPT_DIR, "..")] });
     launcher = writeWorkerLauncher(sid, o.cli, sandbox.launcher, "", workerHooksDir, spawnEnv);
     spawnCwd = bootSpawnCwd;
   } else {
@@ -1396,12 +1438,26 @@ async function main(argv: string[]): Promise<never> {
     // #1162 G2b: after readiness, publish the sealed worker's metadata once.
     if (spawned) publishAgentMeta(sid, o.cli, path.join(env.AIGENTRY_SESSIONS_ROOT || path.join(os.homedir(), ".aigentry", "sessions"), sid));
     if (!prepareEffectiveRef(o, d)) process.exit(3);
+    const stage = path.join(env.AIGENTRY_SESSIONS_ROOT || path.join(os.homedir(), ".aigentry", "sessions"), sid);
+    // #1170: mint the envelope and put its trailer in the ref BEFORE staging, so it lands
+    // in the worker's read-only copy; refHash above stays the original ref's.
+    const pinned = pinReportAttempt(stage, sid);
+    if (pinned) {
+      d.report = mintRequest();
+      appendRefTrailer(d, renderRefTrailer(d.report, { task: o.taskId, sid, attempt: pinned.attempt }));
+    }
     try {
       // Stage A, like prepareEffectiveRef: the message is built from the verified
       // staged path HERE, before the durable commit, so the transport call itself
       // stays infallible.
-      const staged = stageWorkerRef(path.join(env.AIGENTRY_SESSIONS_ROOT || path.join(os.homedir(), ".aigentry", "sessions"), sid), sid, o.taskId, d.effRef);
+      const staged = stageWorkerRef(stage, sid, o.taskId, d.effRef);
       d.refPrompt = buildContextRefPrompt(staged);
+      // #1170: the ref must have landed in the very attempt the envelope names.
+      if (pinned) {
+        const after = pinReportAttempt(stage, sid);
+        if (!after || after.attempt !== pinned.attempt || after.hash !== pinned.hash) throw new Error("REPORT_ATTEMPT_CHANGED");
+        d.reportBinding = after;
+      }
     } catch (e) {
       die(`dispatch.sh: SANDBOX_REF_REFUSED: ${String(e)}`, 78);
     }

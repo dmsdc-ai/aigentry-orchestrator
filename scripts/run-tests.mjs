@@ -56,6 +56,11 @@ sourceTestFiles.push('tests/packaging/release-evidence.test.mjs');
 // #1204 — bin/context-compact.sh per-CLI command + restore waiter against a fake daemon and telepty stub;
 // Node built-ins and bash (Git for Windows bash on win32); every OS, the waiter case skipped by name on win32.
 sourceTestFiles.push('tests/bin/context-compact.test.mjs');
+// #1170 — mandatory-report envelope/outbox security suite: pure cases and explicit platform refusals run on
+// every OS; its POSIX-only cases (symlink/FIFO/O_NOFOLLOW/sandbox) are skipped by name on win32, never passed.
+sourceTestFiles.push('tests/report/mandatory-report-1170-security.test.mjs');
+// #1136 turn-end hook suite: H-01 pure association runs on every OS; the rest is skipped by name off POSIX.
+sourceTestFiles.push('tests/report/mandatory-report-1136-hook.test.mjs');
 // Native capture fixtures require POSIX ownership/modes; on native Windows init refuses native
 // capture with exit 2 (a 0.2.2 limitation), asserted in tests/packaging/init-platform.test.mjs.
 // The boot wizard suite drives an owned POSIX PTY.
@@ -77,6 +82,18 @@ if (process.platform === 'darwin' || process.platform === 'linux') {
     'tests/dispatch/agent-metadata/g3-stage-workspace-denial.test.mjs',
     'tests/dispatch/agent-metadata/g3-stale-fallback.test.mjs',
   );
+  // #1170 mandatory-report caller chain (real reconciler → tracker report-pump → registry) and
+  // obligation lifecycle (report-pump/report-ack/cleanup): the agent-metadata harness, POSIX only.
+  sourceTestFiles.push('tests/report/mandatory-report-1170-caller.test.mjs', 'tests/report/mandatory-report-1170.test.mjs');
+  // #1170 phase-2 review reproductions (F1–F4) as desired-behaviour assertions; F1c pins fail-closed policy.
+  sourceTestFiles.push('tests/report/mandatory-report-1170-review.test.mjs');
+  // The helper controls and pathname-swap probe exercise the shipped Python reader through fd 3.
+  sourceTestFiles.push('tests/report/mandatory-report-1170-helper.test.mjs',
+    'tests/report/mandatory-report-1170-parent-race.test.mjs',
+    'tests/report/mandatory-report-1170-reader.test.mjs');
+  // #1170 rework acceptance boundaries (R1–R4: prune archive, locate binding guard, TURN refusal naming,
+  // exclusive temp ref): the shared agent-metadata harness, POSIX only.
+  sourceTestFiles.push('tests/report/mandatory-report-1170-rework-boundaries.test.mjs');
 }
 
 function collectTestFiles(dir) {

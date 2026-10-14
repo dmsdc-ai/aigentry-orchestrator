@@ -231,8 +231,8 @@ node --input-type=module -e '
 ok b "all $(cat "$TMP/manifest-count") manifest paths present, bin/** executable"
 
 # (c) counts. The bin/** expectation is DERIVED from the installed manifest rather than the
-#     literal 35 of §7.1: the tree carried 36 at 02135be (bin/telepty-bus-bridge.sh landed in
-#     9434a41, after the spec was measured) plus bin/init/{cli,manifest}.mjs = 38. T96 is what
+#     literal 35 of §7.1: the current manifest declares 54 bin/ files, including the
+#     report-outbox reader. T96 is what
 #     pins the manifest to `git ls-files bin`, so deriving here chains tree -> manifest ->
 #     workspace instead of freezing a number that was already stale when it was written.
 EXPECT_BIN=$(node --input-type=module -e '

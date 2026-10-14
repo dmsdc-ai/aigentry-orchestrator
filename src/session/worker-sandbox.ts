@@ -41,6 +41,8 @@ export interface WorkerManifest {
   launch?: LaunchConfig;
   /** #1148: resolver-bound executable identity, sealed by the manifest hash. Absent on legacy spawns. */
   executable?: ExecutableBinding;
+  /** #1136: the staged read-only turn-end hook (claude only). Absent on codex and on older spawns. */
+  reportHook?: { path: string; sha256: string };
 }
 
 /**
@@ -220,9 +222,22 @@ function seedAuth(cli: string, home: string, cwd: string, oauthSelected = false)
   throw new Error(`SANDBOX_AUTH_UNSUPPORTED: ${cli}; no unrestricted fallback`);
 }
 
+/**
+ * #1170 (RC6): control roots a worker scope must not reach. `noAccess`: neither
+ * scope.read nor scope.write may overlap (either way). `noWrite`: scope.write may
+ * not overlap. prepareWorkerSandbox always adds the sessions root (every sid's
+ * stage, outbox and handoff), the host `~/.telepty` and the package root it runs
+ * from; the caller adds what only it knows (registry state, control workspace).
+ */
+export interface ControlRoots {
+  noAccess: string[];
+  noWrite: string[];
+}
+
 export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: string,
   argv: string[], stagingRoot: string, targetCwd = roleCwd,
-  hooksDir?: string, launch?: LaunchConfig, binding?: ExecutableBinding): { launcher: string; manifest: string; hash: string } {
+  hooksDir?: string, launch?: LaunchConfig, binding?: ExecutableBinding,
+  controlRoots: ControlRoots = { noAccess: [], noWrite: [] }): { launcher: string; manifest: string; hash: string } {
   if (!["darwin", "linux"].includes(process.platform)) throw new Error("SANDBOX_PLATFORM_UNSUPPORTED");
   if (!(CONFINED_CLIS as readonly string[]).includes(cli)) throw new Error(`SANDBOX_CLI_UNSUPPORTED: ${cli}`);
   if (!argv.length || path.basename(argv[0]!) !== cli) throw new Error("SANDBOX_COMMAND_BINDING");
@@ -240,6 +255,14 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   // #652: validated before any staging write. Claude only; codex never reads it.
   const oauthToken = cli === "claude" ? selectedClaudeOAuthToken(process.env) : undefined;
   const cwd = canonical(roleCwd);
+  // #1170 (RC6): before any write. A scope reaching another sid's stage, the registry or
+  // the control code would let one worker forge or erase another's report.
+  const noAccess = [path.dirname(stagingRoot), path.join(os.homedir(), ".telepty"), ...controlRoots.noAccess].map(canonical);
+  const noWrite = [fileURLToPath(new URL("../../..", import.meta.url)), ...controlRoots.noWrite].map(canonical);
+  const overlaps = (p: string, roots: string[]): boolean => roots.some(x => within(x, p) || within(p, x));
+  if ([...scope.read, ...scope.write].some(p => overlaps(p, noAccess)) || scope.write.some(p => overlaps(p, noWrite))) {
+    throw new Error("SANDBOX_POLICY_CONTROL_OVERLAP");
+  }
   const attempt = randomUUID();
   const root = canonical(path.join(stagingRoot, "sandbox", attempt));
   const home = path.join(root, "home");
@@ -261,6 +284,9 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   if (patchBinary) fs.symlinkSync(patchBinary, path.join(localBin, "apply_patch"));
   const shared = path.join(home, ".telepty", "shared");
   fs.mkdirSync(shared, { recursive: true, mode: 0o700 });
+  // #1170: the worker's only report channel; the host report pump reads it by the pinned attempt.
+  const reportOutbox = path.join(home, "report-outbox");
+  fs.mkdirSync(reportOutbox, { mode: 0o700 });
   const hookCopy = path.join(root, "git-hooks");
   if (hooksDir) writePrivate(path.join(hookCopy, "pre-push"), fs.readFileSync(path.join(hooksDir, "pre-push"), "utf8"));
   if (hooksDir) fs.chmodSync(path.join(hookCopy, "pre-push"), 0o700);
@@ -292,6 +318,21 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   for (const p of scope.write) {
     if (protectedPaths.some(x => within(x, p) || within(p, x))) throw new Error("SANDBOX_POLICY_WRITABLE");
   }
+  // #1136: claude only. A host-staged copy of the turn-end hook under the attempt root
+  // (read-only to the worker), sealed by path + sha256, wired by ONE host-generated inline
+  // --settings (a caller --settings was refused above). node execPath + direct args, no shell.
+  let reportHook: { path: string; sha256: string } | undefined;
+  if (cli === "claude") {
+    const hookSource = fs.readFileSync(fileURLToPath(new URL("../report/turn-hook.js", import.meta.url)), "utf8");
+    reportHook = { path: path.join(root, "report-hook", "turn-hook.mjs"), sha256: digest(hookSource) };
+    writePrivate(reportHook.path, hookSource);
+    const node = fs.realpathSync(process.execPath);
+    const hook = (event: string, timeout: number) => [{ hooks: [{ type: "command", command: node,
+      args: [reportHook!.path, event, reportOutbox, shared, scope.sid, attempt], timeout }] }];
+    const settings = JSON.stringify({ hooks: { UserPromptSubmit: hook("UserPromptSubmit", 5), Stop: hook("Stop", 5),
+      StopFailure: hook("StopFailure", 5), SessionEnd: hook("SessionEnd", 1) } });
+    command.splice(command.indexOf("--no-chrome") + 1, 0, "--settings", settings);
+  }
   // Do not inherit host credentials, sockets, hooks, NODE_OPTIONS or shell startup files.
   const childEnv: Record<string, string> = {
     HOME: home, TMPDIR: tmp, TMP: tmp, TEMP: tmp, CLAUDE_CODE_TMPDIR: tmp,
@@ -299,7 +340,7 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
     TERM: process.env.TERM || "xterm-256color", LANG: process.env.LANG || "en_US.UTF-8",
     AIGENTRY_WORKER_SESSION: "1", AIGENTRY_TASK_ID: scope.task,
     AIGENTRY_WORKER_SESSION_ID: scope.sid, AIGENTRY_WORKER_ATTEMPT: attempt,
-    AIGENTRY_TARGET_CWD: canonical(targetCwd),
+    AIGENTRY_TARGET_CWD: canonical(targetCwd), AIGENTRY_REPORT_OUTBOX: reportOutbox,
     ...(hooksDir ? { AIGENTRY_GIT_HOOKS_DIR: hookCopy, GIT_CONFIG_COUNT: "1",
       GIT_CONFIG_KEY_0: "core.hooksPath", GIT_CONFIG_VALUE_0: hookCopy } : {}),
     ...authEnv,
@@ -307,6 +348,7 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   const read = [...scope.read, ...scope.write, cwd, home, tmp, realCli, ...(patchBinary ? [patchBinary] : []),
     fs.realpathSync(process.execPath)];
   if (hooksDir) read.push(hookCopy);
+  if (reportHook) read.push(path.dirname(reportHook.path));
   const promptIndex = argv.indexOf("--append-system-prompt-file");
   if (promptIndex >= 0) read.push(canonical(argv[promptIndex + 1]));
   // Whole-process isolation includes native file tools and every local child/MCP.
@@ -331,7 +373,7 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
     command, env: childEnv, config, probeFile, probeDirectory, receipt,
     ...(oauthHandoff ? { claudeOAuthHandoff: oauthHandoff } : {}),
     ...(launch && isCliKind(cli) ? { launch: normalizeLaunch(cli, launch) } : {}),
-    ...(binding ? { executable: binding } : {}) };
+    ...(binding ? { executable: binding } : {}), ...(reportHook ? { reportHook } : {}) };
   const data = JSON.stringify(m, null, 2) + "\n";
   const manifest = path.join(root, "manifest.json"), hash = digest(data);
   writePrivate(manifest, data);

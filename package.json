@@ -43,6 +43,7 @@
     "docs/model-profiles/model-catalog.json",
     "docs/setup/dispatch-capacity.md",
     "docs/setup/orchestrator-boot.md",
+    "docs/setup/worker-reports.md",
     "docs/setup/task-console.md",
     "docs/templates",
     "git-hooks",

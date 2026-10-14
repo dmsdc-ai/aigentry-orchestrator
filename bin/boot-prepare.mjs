@@ -239,7 +239,21 @@ function projectMemoryNoun(cli) {
   }
 }
 
-function buildSessionContract({ role, sandboxCwd, targetCwd, sid, cli }) {
+// #1170: the report channel of a CONFINED worker. Its sandbox denies sockets and
+// ~/.telepty, so a `telepty inject` report can never leave it; the host report pump
+// reads this outbox instead. Same text as tooling/dispatch-prelude/template.md and
+// tooling/instructions/common.md.
+const CONFINED_REPORT_CLAUSE =
+  `\n` +
+  `## Confined worker report (mandatory, #1170)\n` +
+  `\n` +
+  `- This sandbox cannot reach telepty. Never run \`telepty\` (inject, list or any other command); report only through \`$AIGENTRY_REPORT_OUTBOX\`.\n` +
+  `- Your dispatch file ends with \`<!-- aigentry-report v1 -->\` and a line \`REPORT_ENVELOPE request_id=<R> challenge=<C> …\`. Use the LAST such line of the newest dispatch you were handed; never reuse an older dispatch's envelope.\n` +
+  `- Write \`<KIND>-<n>.md\` in \`$AIGENTRY_REPORT_OUTBOX/<R>/\` (\`mkdir -p\` it): KIND \`REPORT\` when done, \`HOLD\` when blocked or asking. n = 1, 2, … up to 32; never overwrite or reuse a number — a correction or a later answer is the next n.\n` +
+  `- First line exactly \`AIGENTRY_REPORT v1 request_id=<R> challenge=<C> kind=<KIND> seq=<n>\`; last line exactly \`AIGENTRY_REPORT_END <R> <KIND>-<n>\`; your report in between; at most 64 KiB in total.\n` +
+  `- Write it as \`<KIND>-<n>.md.tmp\`, then \`mv\` it to \`<KIND>-<n>.md\`. Writing the file is your report, not task completion: the orchestrator reviews it.\n`;
+
+function buildSessionContract({ role, sandboxCwd, targetCwd, sid, cli, confined = false }) {
   // Documented session contract — no surprise for the worker. Appended to the
   // staged effective_prompt.md. claude reads it via --append-system-prompt-file;
   // codex/gemini read it via the staged cwd context file (AGENTS.md / GEMINI.md)
@@ -260,7 +274,8 @@ function buildSessionContract({ role, sandboxCwd, targetCwd, sid, cli }) {
     `- **AIGENTRY_TARGET_CWD** env var = \`${targetCwd}\`\n` +
     `- **Session id**: \`${sid}\`\n` +
     `\n` +
-    `The role contract above takes precedence over any per-project ${memNoun} you may later discover via tool calls or \`cd\`. Do not infer your role from cwd; trust this contract.\n`
+    `The role contract above takes precedence over any per-project ${memNoun} you may later discover via tool calls or \`cd\`. Do not infer your role from cwd; trust this contract.\n` +
+    (confined ? CONFINED_REPORT_CLAUSE : "")
   );
 }
 
@@ -637,6 +652,7 @@ async function main() {
       targetCwd: args.cwd,
       sid: args.sid,
       cli: args.cli,
+      confined: args.confined,
     }),
   );
 

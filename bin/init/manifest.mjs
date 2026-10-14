@@ -63,6 +63,7 @@ const MANIFEST = [
   "bin/policy.py",
   // #1166 U1: read-only capture inventory wrapper; resolves dist like hook-prompt-submit.mjs.
   "bin/request-capture-inventory.mjs",
+  "bin/report-outbox-read.py",
   "bin/session-cleanup.sh",
   "bin/session-comms-auditor.sh",
   "bin/session-layout.py",
@@ -92,6 +93,7 @@ const MANIFEST = [
   "docs/model-profiles/model-catalog.json",
   // #1181: orchestrator-boot usage and init guidance cite this path. Exact leaf only.
   "docs/setup/orchestrator-boot.md",
+  "docs/setup/worker-reports.md",
   "docs/templates/dispatch-ref-checklist.md",
   "docs/templates/dispatch-ref-template.md",
 
@@ -139,6 +141,7 @@ const GOVERNANCE_ROOTS = [
   "docs/model-profiles/",
   "docs/rules.md",
   "docs/setup/orchestrator-boot.md",
+  "docs/setup/worker-reports.md",
   "docs/templates/",
   ".agents/",
   ".claude/",

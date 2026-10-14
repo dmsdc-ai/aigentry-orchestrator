@@ -34,6 +34,16 @@ REPORT: <modified files> | <change summary> | <build result> | <remaining issues
 
 Source: `docs/rules.md` Rule 7.
 
+### Confined worker report (mandatory, #1170)
+
+If `$AIGENTRY_REPORT_OUTBOX` is set you are a confined worker and an inject cannot leave your sandbox:
+
+- This sandbox cannot reach telepty. Never run `telepty` (inject, list or any other command); report only through `$AIGENTRY_REPORT_OUTBOX`.
+- Your dispatch file ends with `<!-- aigentry-report v1 -->` and a line `REPORT_ENVELOPE request_id=<R> challenge=<C> …`. Use the LAST such line of the newest dispatch you were handed; never reuse an older dispatch's envelope.
+- Write `<KIND>-<n>.md` in `$AIGENTRY_REPORT_OUTBOX/<R>/` (`mkdir -p` it): KIND `REPORT` when done, `HOLD` when blocked or asking. n = 1, 2, … up to 32; never overwrite or reuse a number — a correction or a later answer is the next n.
+- First line exactly `AIGENTRY_REPORT v1 request_id=<R> challenge=<C> kind=<KIND> seq=<n>`; last line exactly `AIGENTRY_REPORT_END <R> <KIND>-<n>`; your report in between; at most 64 KiB in total.
+- Write it as `<KIND>-<n>.md.tmp`, then `mv` it to `<KIND>-<n>.md`. Writing the file is your report, not task completion: the orchestrator reviews it.
+
 ## Ambiguity gate (Rule 37 — HARD RULE)
 
 For a task-shaped request, resolve what was asked by **reading first**
