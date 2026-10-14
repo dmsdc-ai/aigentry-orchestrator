@@ -18,6 +18,26 @@ const sha256 = (file) => createHash("sha256").update(fs.readFileSync(file)).dige
 const rel = (file) => path.relative(b.base, file).replaceAll("\\", "/");
 const clean = (value) => String(value ?? "").replaceAll(b.base, "<owned-root>").replaceAll(b.base.toLowerCase(), "<owned-root>");
 const bridgeUrl = new URL("../../dist/src/session/private-storage.js", import.meta.url).href;
+const ordinaryReadScript = String.raw`
+$lines = [Console]::In.ReadToEnd().Split([char]10)
+for ($i = 0; $i -lt 2; $i++) {
+  $stream = $null
+  try {
+    $p = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($lines[$i].Trim()))
+    $stream = [IO.File]::Open($p, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    $n = $stream.ReadByte()
+    $count = [int]($n -ne -1)
+    [Console]::Out.WriteLine($i.ToString() + ' ok ' + $count.ToString())
+  } catch {
+    $x = $_.Exception
+    while ($null -ne $x.InnerException) { $x = $x.InnerException }
+    $message = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($x.Message))
+    [Console]::Out.WriteLine($i.ToString() + ' err ' + $x.GetType().FullName + ' ' + $x.HResult + ' ' + $message)
+  } finally {
+    if ($null -ne $stream) { $stream.Dispose() }
+  }
+}
+`;
 
 // A fresh Node child starts with built-ins only. The product mode observes the same file
 // before and after the source's read-only currentPrincipal/readSecurity operations.
@@ -104,6 +124,58 @@ function read(file) {
   }
 }
 
+function ownedFile(file) {
+  const relative = path.win32.relative(b.base, file);
+  if (!relative || relative === ".." || relative.startsWith(`..${path.win32.sep}`) || path.win32.isAbsolute(relative)) {
+    throw new Error("ordinary read target escapes the owned fixture box");
+  }
+  const stat = fs.lstatSync(file);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("ordinary read target is not an owned regular file");
+  return file;
+}
+
+function ordinaryPowerShellRead(denied, positive) {
+  const sr = process.env.SystemRoot;
+  // readSecurity() above already validated SystemRoot and this fixed tool path.
+  const executable = path.win32.join(sr, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const stat = fs.lstatSync(executable);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error("source-resolved PowerShell path is not a regular file");
+  }
+  const targets = [ownedFile(denied), ownedFile(positive)];
+  const input = targets.map((file) => Buffer.from(file, "utf8").toString("base64")).join("\n") + "\n";
+  const argv = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ordinaryReadScript];
+  const env = {
+    SystemRoot: sr, WINDIR: sr,
+    PSModulePath: path.win32.join(sr, "System32", "WindowsPowerShell", "v1.0", "Modules"),
+  };
+  for (const key of ["TEMP", "TMP", "LOCALAPPDATA", "USERPROFILE"]) {
+    if (typeof process.env[key] === "string") env[key] = process.env[key];
+  }
+  const r = spawnSync(executable, argv, {
+    input, env, encoding: "utf8", windowsHide: true, timeout: 30_000, maxBuffer: 64 * 1024,
+  });
+  const result = {
+    executable, argv, targets: targets.map(rel), status: r.status, signal: r.signal,
+    error: r.error?.code ?? null, stderr: r.stderr ?? "", stdout: r.stdout ?? "",
+  };
+  const lines = (r.stdout ?? "").trim().split(/\r?\n/);
+  result.observations = lines.map((line) => {
+    const ok = /^([01]) ok ([01])$/.exec(line);
+    if (ok) return { index: Number(ok[1]), outcome: "ok", bytes: Number(ok[2]) };
+    const error = /^([01]) err ([A-Za-z0-9_.]+) (-?\d+) ([A-Za-z0-9+/=]+)$/.exec(line);
+    if (error) return {
+      index: Number(error[1]), outcome: "error", type: error[2], hresult: Number(error[3]),
+      message: Buffer.from(error[4], "base64").toString("utf8"),
+    };
+    return { outcome: "invalid", line };
+  });
+  if (r.status !== 0 || result.observations.length !== 2 || result.observations[0].index !== 0 ||
+      result.observations[1].index !== 1 || result.observations[1].outcome !== "ok" ||
+      result.observations[1].bytes !== 1) process.exitCode = 1;
+  return result;
+}
+
 function caseFile(label, file, denyArgs, sid) {
   const item = { label, before: { identity: identity(file), acl: acl(file), read: read(file) } };
   report.cases.push(item);
@@ -171,6 +243,17 @@ try {
       productBridge: freshChild("product", childFile, positive),
     };
     comparison.afterChildren = { identity: identity(childFile), acl: acl(childFile), read: read(childFile) };
+    comparison.ordinaryRead = {
+      before: {
+        denied: { identity: identity(childFile), acl: acl(childFile), read: read(childFile) },
+        positive: { identity: identity(positive), acl: acl(positive), read: read(positive) },
+      },
+      powershell: ordinaryPowerShellRead(childFile, positive),
+      after: {
+        denied: { identity: identity(childFile), acl: acl(childFile), read: read(childFile) },
+        positive: { identity: identity(positive), acl: acl(positive), read: read(positive) },
+      },
+    };
   } else if (comparison) {
     comparison.childrenSkipped = "exact user read-data deny ACE was not observed";
     process.exitCode = 1;
