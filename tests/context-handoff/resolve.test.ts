@@ -4,11 +4,13 @@
 // In-process, under `withHermeticEnv`: every store root is the fixture HOME whether the engine
 // reads the `env` it is handed or `os.homedir()`.
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { winPrivateStorage } from "../../src/session/private-storage.js";
 import {
   type Box,
   MAX_FIRST_TURN_BYTES,
@@ -153,7 +155,7 @@ test("no source anywhere → ref null, skipped:*, never throws", async (t) => {
   assertSkipped(await resolve(b, { write: true }), "garbage transcript");
 });
 
-test("a state/ that is a symlink → skipped:*, nothing written through it (SPEC §9.3)", { skip: !POSIX && "NOTRUN on win32: creating a symlink needs a privilege the test job does not hold" }, async (t) => {
+if (POSIX) test("a state/ that is a symlink → skipped:*, nothing written through it (SPEC §9.3)", async (t) => {
   const b = makeBox({ state: false });
   t.after(() => dropBox(b));
   const elsewhere = path.join(b.base, "elsewhere");
@@ -164,7 +166,7 @@ test("a state/ that is a symlink → skipped:*, nothing written through it (SPEC
   assert.deepEqual(fs.readdirSync(elsewhere), []);
 });
 
-test("a state/handoff that is a symlink → skipped:*, nothing written through it (SPEC §6.4)", { skip: !POSIX && "NOTRUN on win32: symlink privilege" }, async (t) => {
+if (POSIX) test("a state/handoff that is a symlink → skipped:*, nothing written through it (SPEC §6.4)", async (t) => {
   const b = makeBox();
   t.after(() => dropBox(b));
   const elsewhere = path.join(b.base, "elsewhere");
@@ -175,7 +177,7 @@ test("a state/handoff that is a symlink → skipped:*, nothing written through i
   assert.deepEqual(fs.readdirSync(elsewhere), []);
 });
 
-test("a group/other-writable state/handoff is refused (SPEC §6.4 lstat checks)", { skip: !POSIX && "NOTRUN on win32: POSIX mode bits" }, async (t) => {
+if (POSIX) test("a group/other-writable state/handoff is refused (SPEC §6.4 lstat checks)", async (t) => {
   const b = makeBox();
   t.after(() => dropBox(b));
   const dir = path.join(b.ws, "state", "handoff");
@@ -186,7 +188,7 @@ test("a group/other-writable state/handoff is refused (SPEC §6.4 lstat checks)"
   assert.deepEqual(fs.readdirSync(dir), []);
 });
 
-test("a transcript that is a symlink is not followed (SPEC §3: O_NOFOLLOW reads)", { skip: !POSIX && "NOTRUN on win32: symlink privilege; O_NOFOLLOW is POSIX-only" }, async (t) => {
+if (POSIX) test("a transcript that is a symlink is not followed (SPEC §3: O_NOFOLLOW reads)", async (t) => {
   const b = makeBox();
   t.after(() => dropBox(b));
   const p = plantClaude(b, { last: at(10) });
@@ -196,7 +198,7 @@ test("a transcript that is a symlink is not followed (SPEC §3: O_NOFOLLOW reads
   assertSkipped(await resolve(b, { write: true }), "symlinked transcript");
 });
 
-test("an unreadable store is skipped, never thrown; a readable one still wins", { skip: (!POSIX || ROOT) && "NOTRUN: needs POSIX permissions and a non-root user" }, async (t) => {
+if (POSIX && !ROOT) test("an unreadable store is skipped, never thrown; a readable one still wins", async (t) => {
   const b = makeBox();
   const projects = path.join(b.home, ".claude", "projects");
   t.after(() => {
@@ -210,6 +212,89 @@ test("an unreadable store is skipped, never thrown; a readable one still wins", 
   const r = await resolve(b, { write: true });
   assert.equal(r.ref?.source.sessionId, c.session, "the readable store is still used");
 });
+
+if (!POSIX) {
+  const junction = (target: string, link: string): void => fs.symlinkSync(target, link, "junction");
+  const icacls = (args: string[]): void => {
+    const tool = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "icacls.exe");
+    const r = spawnSync(tool, args, { encoding: "utf8", windowsHide: true, timeout: 30_000 });
+    assert.equal(r.status, 0, `icacls ${args.join(" ")}: ${r.error?.message ?? r.stderr}`);
+  };
+
+  test("win32: a state/ junction is refused without writing through it", async (t) => {
+    const b = makeBox({ state: false });
+    t.after(() => dropBox(b));
+    const elsewhere = path.join(b.base, "elsewhere");
+    fs.mkdirSync(elsewhere);
+    junction(elsewhere, path.join(b.ws, "state"));
+    plant("codex", b, { last: at(10) });
+    const r = await resolve(b, { write: true });
+    assertSkipped(r, "state junction");
+    assert.equal(r.record.outcome, "skipped:unsafe-path");
+    assert.deepEqual(fs.readdirSync(elsewhere), []);
+  });
+
+  test("win32: a state/handoff junction is refused without writing through it", async (t) => {
+    const b = makeBox();
+    t.after(() => dropBox(b));
+    const elsewhere = path.join(b.base, "elsewhere");
+    fs.mkdirSync(elsewhere);
+    junction(elsewhere, path.join(b.ws, "state", "handoff"));
+    plant("codex", b, { last: at(10) });
+    const r = await resolve(b, { write: true });
+    assertSkipped(r, "handoff junction");
+    assert.equal(r.record.outcome, "skipped:unsafe-path");
+    assert.deepEqual(fs.readdirSync(elsewhere), []);
+  });
+
+  test("win32: a pre-existing handoff directory with an Everyone ACE is refused", async (t) => {
+    const b = makeBox();
+    t.after(() => dropBox(b));
+    const dir = path.join(b.ws, "state", "handoff");
+    fs.mkdirSync(dir);
+    assert.ok(winPrivateStorage, "Windows private-storage primitive is required");
+    assert.deepEqual(winPrivateStorage.setPrivate(dir, "directory"), { status: "ok" });
+    icacls([dir, "/grant", "*S-1-1-0:(R)", "/q"]);
+    plant("codex", b, { last: at(10) });
+    const r = await resolve(b, { write: true });
+    assertSkipped(r, "unsafe Windows ACL");
+    assert.equal(r.record.outcome, "skipped:unsafe-path");
+    assert.deepEqual(fs.readdirSync(dir), []);
+  });
+
+  test("win32: a junction in a transcript store is not followed", async (t) => {
+    const b = makeBox();
+    t.after(() => dropBox(b));
+    const p = plantClaude(b, { last: at(10) });
+    const projects = path.dirname(path.dirname(p.file));
+    const elsewhere = path.join(b.base, "elsewhere-projects");
+    fs.renameSync(projects, elsewhere);
+    junction(elsewhere, projects);
+    assertSkipped(await resolve(b, { write: true }), "transcript store junction");
+    assert.deepEqual(fs.readdirSync(path.join(b.ws, "state")), []);
+  });
+
+  test("win32: an ACL-denied store is ignored while a readable store still wins", async (t) => {
+    const b = makeBox();
+    t.after(() => dropBox(b));
+    const p = plantClaude(b, { last: at(50) });
+    const projects = path.dirname(path.dirname(p.file));
+    assert.ok(winPrivateStorage, "Windows private-storage primitive is required");
+    const principal = winPrivateStorage.currentPrincipal();
+    assert.equal(principal.status, "ok", JSON.stringify(principal));
+    if (principal.status !== "ok") return;
+    const sid = `*${principal.userSid}`;
+    icacls([projects, "/deny", `${sid}:(R)`, "/q"]);
+    try {
+      assertSkipped(await resolve(b, { write: true }), "unreadable Claude store");
+      const c = plant("codex", b, { last: at(10) });
+      const r = await resolve(b, { write: true });
+      assert.equal(r.ref?.source.sessionId, c.session, "the readable store is still used");
+    } finally {
+      icacls([projects, "/remove:d", sid, "/q"]);
+    }
+  });
+}
 
 test("a workspace that does not exist → skipped:*, never throws", async (t) => {
   const b = makeBox();

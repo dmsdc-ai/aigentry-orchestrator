@@ -33,9 +33,10 @@ import {
   parseHandoff,
   plant,
   plantAgy,
+  runCli,
 } from "./harness.js";
 
-const POSIX_ONLY = process.platform === "win32" && "NOTRUN on win32: bin/orchestrator-boot.sh is a POSIX shim; a native Windows boot is out of this release (SPEC §13)";
+const POSIX = process.platform !== "win32";
 const SHIM = path.join(REPO, "bin", "orchestrator-boot.sh");
 const SID = "fixture-1201";
 const PERMISSION: Record<Cli, string> = {
@@ -135,7 +136,7 @@ function sourceLine(boot: Boot): string {
   return parseHandoff(boot.handoff).header.find((l) => l.startsWith("source: ")) ?? "";
 }
 
-test("AT-1(a): a HOME with ONLY native transcripts → [would-handoff] names the newest; nothing is written", { skip: POSIX_ONLY }, (t) => {
+if (POSIX) test("AT-1(a): a HOME with ONLY native transcripts → [would-handoff] names the newest; nothing is written", (t) => {
   const b = makeBox();
   t.after(() => dropBox(b));
   plant("claude", b, { last: at(10) });
@@ -148,7 +149,7 @@ test("AT-1(a): a HOME with ONLY native transcripts → [would-handoff] names the
   assertInert(boot, "AT-1(a)");
 });
 
-test("AT-3: 4×4 — the newest source is named whichever CLI boots; a newer other-cwd transcript is ignored", { skip: POSIX_ONLY }, (t) => {
+if (POSIX) test("AT-3: 4×4 — the newest source is named whichever CLI boots; a newer other-cwd transcript is ignored", (t) => {
   for (const [i, newest] of CLIS.entries()) {
     const b = makeBox();
     t.after(() => dropBox(b));
@@ -165,7 +166,7 @@ test("AT-3: 4×4 — the newest source is named whichever CLI boots; a newer oth
   }
 });
 
-test("AT-3: newer activity in the detect-only agy store puts the staleness warning in the handoff", { skip: POSIX_ONLY }, (t) => {
+if (POSIX) test("AT-3: newer activity in the detect-only agy store puts the staleness warning in the handoff", (t) => {
   const b = makeBox();
   t.after(() => dropBox(b));
   plant("gemini", b, { last: at(20) });
@@ -173,6 +174,44 @@ test("AT-3: newer activity in the detect-only agy store puts the staleness warni
   const boot = dryRun(b, "gemini");
   assert.equal(boot.status, 0, boot.stderr);
   assert.match(boot.handoff, /newer activity in unmeasured .+ store — handoff may not be the latest/);
+});
+
+// Native Windows exposes the Node handoff CLI; the POSIX boot shim has no native boot contract.
+if (!POSIX) test("win32 AT-1(a) engine: native transcripts select the newest without writing", (t) => {
+  const b = makeBox();
+  t.after(() => dropBox(b));
+  plant("claude", b, { last: at(10) });
+  const newest = plant("codex", b, { last: at(20) });
+  const r = runCli(b, ["--dry-run"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, new RegExp(`source: codex session ${newest.session}`));
+  assert.deepEqual(fs.readdirSync(path.join(b.ws, "state")), []);
+});
+
+if (!POSIX) test("win32 AT-3 engine: each of four CLIs can be the newest; another cwd is ignored", (t) => {
+  for (const newest of CLIS) {
+    const b = makeBox();
+    t.after(() => dropBox(b));
+    const planted = CLIS.map((cli, i) => plant(cli, b, { last: at(cli === newest ? 40 : 10 + i) }));
+    plant("codex", b, { last: at(90), cwd: path.join(b.base, "other-workspace") });
+    const r = runCli(b, ["--json", "--dry-run"]);
+    assert.equal(r.status, 0, r.stderr);
+    const record = JSON.parse(r.stdout) as { source?: { cli?: string; session_id?: string } };
+    assert.equal(record.source?.cli, newest);
+    assert.equal(record.source?.session_id, planted[CLIS.indexOf(newest)].session);
+    assert.deepEqual(fs.readdirSync(path.join(b.ws, "state")), []);
+  }
+});
+
+if (!POSIX) test("win32 AT-3 engine: newer detect-only agy activity warns in the handoff", (t) => {
+  const b = makeBox();
+  t.after(() => dropBox(b));
+  plant("gemini", b, { last: at(20) });
+  plantAgy(b, at(30));
+  const r = runCli(b, ["--dry-run"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /newer activity in unmeasured .+ store — handoff may not be the latest/);
+  assert.deepEqual(fs.readdirSync(path.join(b.ws, "state")), []);
 });
 
 // ── AT-1(b), AT-1(c): static ────────────────────────────────────────────────

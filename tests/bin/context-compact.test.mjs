@@ -3,7 +3,7 @@
 // snapshot restore line once the session has been busy and is idle again. The daemon is a tiny HTTP
 // server serving /api/sessions from a mutable array (AIGENTRY_TELEPTY_API); telepty is a stub that
 // appends its argv to a file (AIGENTRY_TELEPTY). Node built-ins only. win32 needs Git for Windows
-// bash and skips the waiter case by name: the script starts no waiter there by design.
+// bash. The native Windows contract injects the compact command and names the instruction backstop.
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -18,7 +18,6 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const fwd = (p) => p.replace(/\\/g, '/');
 const script = fwd(join(repoRoot, 'bin', 'context-compact.sh'));
 const bash = WIN ? join(process.env.ProgramFiles || 'C:\\Program Files', 'Git', 'bin', 'bash.exe') : 'bash';
-const noBash = WIN && !existsSync(bash) ? `Git for Windows bash not found at ${bash}` : false;
 const SID = 'orch-t1204';
 const RESTORE_RE = /^CONTEXT SNAPSHOT restored after compact — (.+) \(written [^)]+\)\. Read it, then continue the work it describes\.$/;
 
@@ -92,7 +91,7 @@ async function waitFor(pred, ms) {
   return pred();
 }
 
-test('claude: injects /compact into its own session and starts no waiter', { skip: noBash }, async (t) => {
+test('claude: injects /compact into its own session and starts no waiter', async (t) => {
   const ws = workspace(); t.after(() => rmSync(ws.dir, { recursive: true, force: true }));
   setSession('claude');
   const r = await run(ws);
@@ -105,7 +104,7 @@ test('claude: injects /compact into its own session and starts no waiter', { ski
 
 // grok is here too: its PostCompact hook is passive (stdout never reaches the model), so no native restore.
 for (const [cli, command] of [['codex', '/opt/homebrew/bin/codex'], ['grok', '/Users/x/.grok/bin/grok']]) {
-test(`${cli}: injects /compact, then the waiter restores the snapshot after busy → idle`, { skip: noBash || (WIN && 'win32: no detached waiter (no setsid); the instruction backstop applies') }, async (t) => {
+if (!WIN) test(`${cli}: injects /compact, then the waiter restores the snapshot after busy → idle`, async (t) => {
   const ws = workspace(); t.after(() => { onProbe = null; rmSync(ws.dir, { recursive: true, force: true }); });
   setSession(command);
   // Probe 1 is the script's own CLI lookup; the waiter then sees idle-but-never-busy on probes 2–4, busy
@@ -141,9 +140,21 @@ test(`${cli}: injects /compact, then the waiter restores the snapshot after busy
   assert.equal(fwd(m[1]), fwd(ws.snap));
   assert.match(readFileSync(ws.log, 'utf8'), /idle — injecting the restore line[\s\S]*restore injected/);
 });
+if (WIN) test(`${cli}: native Windows injects /compact and names the restore backstop`, async (t) => {
+  const ws = workspace(); t.after(() => rmSync(ws.dir, { recursive: true, force: true }));
+  setSession(command);
+  const before = readFileSync(ws.snap, 'utf8');
+  const r = await run(ws);
+  assert.equal(r.status, 0, r.out);
+  assert.match(r.out, /snapshot is \d+s old/); // Git for Windows GNU stat read the fixture mtime.
+  assert.match(r.out, /no restore waiter on native Windows \(no setsid\); the instruction backstop applies: read /);
+  assert.deepEqual(calls(ws), [['inject', '--submit', '--from', SID, SID, '/compact']]);
+  assert.equal(existsSync(ws.log), false, 'no detached waiter is promised on native Windows');
+  assert.equal(readFileSync(ws.snap, 'utf8'), before, 'the snapshot remains for the instructed restore');
+});
 }
 
-test('gemini: injects /compress', { skip: noBash }, async (t) => {
+test('gemini: injects /compress', async (t) => {
   const ws = workspace(); t.after(() => rmSync(ws.dir, { recursive: true, force: true }));
   setSession('gemini');
   const r = await run(ws);
@@ -156,7 +167,7 @@ test('gemini: injects /compress', { skip: noBash }, async (t) => {
   try { process.kill(waiterPids.at(-1), 'SIGTERM'); } catch { /* already exited */ }
 });
 
-test('unknown CLI: exit 5 naming the CLI and the override, nothing injected', { skip: noBash }, async (t) => {
+test('unknown CLI: exit 5 naming the CLI and the override, nothing injected', async (t) => {
   const ws = workspace(); t.after(() => rmSync(ws.dir, { recursive: true, force: true }));
   setSession('aider');
   const r = await run(ws);
@@ -166,7 +177,7 @@ test('unknown CLI: exit 5 naming the CLI and the override, nothing injected', { 
   assert.deepEqual(calls(ws), []);
 });
 
-test('AIGENTRY_COMPACT_COMMAND wins over the table (and over an unknown CLI)', { skip: noBash }, async (t) => {
+test('AIGENTRY_COMPACT_COMMAND wins over the table (and over an unknown CLI)', async (t) => {
   const ws = workspace(); t.after(() => rmSync(ws.dir, { recursive: true, force: true }));
   setSession('claude');
   let r = await run(ws, { AIGENTRY_COMPACT_COMMAND: '/compact keep the plan' });
@@ -177,7 +188,7 @@ test('AIGENTRY_COMPACT_COMMAND wins over the table (and over an unknown CLI)', {
   assert.deepEqual(calls(ws).map((c) => c.at(-1)), ['/compact keep the plan', '/squash']);
 });
 
-test('stale snapshot: exit 3 and no inject', { skip: noBash }, async (t) => {
+test('stale snapshot: exit 3 and no inject', async (t) => {
   const ws = workspace({ staleSeconds: 1200 }); t.after(() => rmSync(ws.dir, { recursive: true, force: true }));
   setSession('claude');
   const r = await run(ws);
@@ -189,8 +200,8 @@ test('stale snapshot: exit 3 and no inject', { skip: noBash }, async (t) => {
 // ubuntu-latest CI died with `line 86: File: unbound variable`: on GNU coreutils `stat -f` is --file-system,
 // so the BSD form `stat -f %m` printed a "  File: ..." block into $(( )). Emulate the Linux userland on any
 // POSIX host — uname says Linux, setsid exists, stat has GNU semantics — so that path runs here too.
-// win32 skips by name: Git for Windows bash ships GNU stat already, so the cases above run that path there.
-test('Linux userland (GNU stat, setsid): injects /compact and starts the waiter through setsid', { skip: noBash || (WIN && 'win32: Git for Windows already ships GNU stat; no setsid waiter there') }, async (t) => {
+// Native Windows exercises Git for Windows GNU stat in the compact/backstop cases above.
+if (!WIN) test('Linux userland (GNU stat, setsid): injects /compact and starts the waiter through setsid', async (t) => {
   const ws = workspace(); t.after(() => rmSync(ws.dir, { recursive: true, force: true }));
   const bin = join(ws.dir, 'linux-bin');
   mkdirSync(bin);
