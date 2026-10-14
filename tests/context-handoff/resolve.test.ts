@@ -278,20 +278,34 @@ if (!POSIX) {
     const b = makeBox();
     t.after(() => dropBox(b));
     const p = plantClaude(b, { last: at(50) });
-    const projects = path.dirname(path.dirname(p.file));
     assert.ok(winPrivateStorage, "Windows private-storage primitive is required");
     const principal = winPrivateStorage.currentPrincipal();
     assert.equal(principal.status, "ok", JSON.stringify(principal));
     if (principal.status !== "ok") return;
     const sid = `*${principal.userSid}`;
-    icacls([projects, "/deny", `${sid}:(R)`, "/q"]);
+    // Deny the transcript itself: an ACE on projects/ without inheritance does not deny reads below it.
+    icacls([p.file, "/deny", `${sid}:(R)`, "/q"]);
     try {
+      let readError: NodeJS.ErrnoException | null = null;
+      try {
+        const fd = fs.openSync(p.file, fs.constants.O_RDONLY);
+        try {
+          fs.readSync(fd, Buffer.alloc(1), 0, 1, 0);
+        } finally {
+          fs.closeSync(fd);
+        }
+      } catch (error) {
+        readError = error as NodeJS.ErrnoException;
+      }
+      assert.ok(readError, "ACL fixture setup failed: O_RDONLY transcript open/read succeeded");
+      assert.ok(["EACCES", "EPERM"].includes(readError.code ?? ""),
+        `ACL fixture setup failed: expected access denied from transcript open/read, got ${readError.code ?? "unknown"}`);
       assertSkipped(await resolve(b, { write: true }), "unreadable Claude store");
       const c = plant("codex", b, { last: at(10) });
       const r = await resolve(b, { write: true });
       assert.equal(r.ref?.source.sessionId, c.session, "the readable store is still used");
     } finally {
-      icacls([projects, "/remove:d", sid, "/q"]);
+      icacls([p.file, "/remove:d", sid, "/q"]);
     }
   });
 }
