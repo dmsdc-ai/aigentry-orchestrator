@@ -108,7 +108,7 @@ function rig(run, w, { cmux = {}, fakes = {}, list, ps } = {}) {
     "ps-path": { rc: 97 },
     curl: { stdout: "200" },
     kill: { rc: 0 },
-    registry: { rc: 0 },
+    registry: { rc: 0, match: [{ argv0: "report-list", stdout: "" }], ...fakes.registry },
     ...(fakes.whcli ? { whcli: fakes.whcli } : {}),
   }));
   const cmuxScen = path.join(run.dir, "cmux.json");
@@ -186,6 +186,7 @@ const DELETE = (sid) => ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", 
   `http://127.0.0.1:${PORT}/api/sessions/${sid}`];
 const REGISTRY = (sid) => [["registry", "observe", "--sid", sid, "--kind", "session_absent_observed", "--all"],
   ["registry", "set-lifecycle", "--sid", sid, "--state", "cleaned", "--all"]];
+const REPORT_LIST = (sid) => ["registry", "report-list", "--sid", sid];
 const REFUSE_KILL = (sid) => `ERR refusing to SIGTERM PID 5000 for ${sid} — it is in the orchestrator's own process tree; this session was spawned surface-less (forbidden). Close it from the user's terminal.\n`;
 
 /**
@@ -195,7 +196,7 @@ const REFUSE_KILL = (sid) => `ERR refusing to SIGTERM PID 5000 for ${sid} — it
 function legacy({ sid = SID, kill = "killed", close = "ok" } = {}) {
   const stdout = [];
   let stderr = "";
-  const seq = [["telepty", "list", "--json"]];
+  const seq = [REPORT_LIST(sid), ["telepty", "list", "--json"]];
   if (kill === "killed") { stdout.push(L(`killed parent telepty-allow PID 5000 for ${sid}`)); seq.push(["kill", "-TERM", "5000"]); }
   if (kill === "no-parent") stdout.push(L(`no parent telepty-allow process for ${sid} (already exited?)`));
   if (kill === "refused") stderr += REFUSE_KILL(sid);
@@ -208,7 +209,7 @@ function legacy({ sid = SID, kill = "killed", close = "ok" } = {}) {
   }
   stdout.push(L(`DELETE /api/sessions/${sid} → 200 (removed from registry)`), "");
   seq.push(DELETE(sid));
-  if (close === "ok") seq.push(...REGISTRY(sid));
+  if (close === "ok") seq.push(...REGISTRY(sid), REPORT_LIST(sid));
   return { view: { status: close === "ok" ? 0 : 1, stdout, stderr, seq }, ps: kill === "no-parent" ? 1 : 2 };
 }
 
@@ -218,7 +219,8 @@ const LEGACY_ORPHAN = {
     stdout: [L(`session not in telepty list: ${SID} (already cleaned or never registered); closing terminal surface by sid`),
       L(`DELETE /api/sessions/${SID} → 200 (removed from registry)`), ""],
     stderr: "",
-    seq: [["telepty", "list", "--json"], ["telepty", "list", "--json"], ["cmux", "--json", "list-workspaces"], DELETE(SID), ...REGISTRY(SID)],
+    seq: [REPORT_LIST(SID), ["telepty", "list", "--json"], ["telepty", "list", "--json"],
+      ["cmux", "--json", "list-workspaces"], DELETE(SID), ...REGISTRY(SID), REPORT_LIST(SID)],
   },
   ps: 0,
 };
@@ -592,11 +594,13 @@ for (const [name, o, reason] of CAPTURE_FAIL) {
   });
 }
 
-test("PC-C10b invalid sid syntax → skipped invalid-sid (reader never consulted)", () => {
+test("PC-C10b invalid sid syntax → report capture refuses before reader or teardown", () => {
   const bad = "bad sid";
   const r = cleanup("c10b", { list: [{ ...ROW, id: bad }], args: [bad] });
-  expectLegacy(r, legacy({ sid: bad, kill: "no-parent" }));
-  assert.deepEqual(metaLines(r), [line(`clear skipped: ${bad} (invalid-sid)`)]);
+  assert.equal(r.status, 1);
+  assert.equal(r.stdout, "");
+  assert.equal(r.stderr, `ERR REPORT_CAPTURE_FAILED for ${bad}: bad_sid — cleanup refused; worker files and registry records are preserved (see bin/dispatch-tracker.sh report-status)\n`);
+  assert.deepEqual(r.seq, []);
   assert.deepEqual(metaCalls(r), []);
 });
 
@@ -724,9 +728,18 @@ test("PC-C20 --all-disconnected: per-sid clear/veto never changes 'cleaned: N' o
       L(`no workspace host id mapped for ${two}; skipping`), L(`DELETE /api/sessions/${two} → 200 (removed from registry)`),
       "cleaned: 2 disconnected sessions", ""],
     stderr: "",
-    seq: [["telepty", "list", "--json"], ["telepty", "list", "--json"], ["kill", "-TERM", "5000"], ["cmux", "close-workspace", "--workspace", WS],
-      DELETE(SID), ...REGISTRY(SID), ["telepty", "list", "--json"], DELETE(two), ...REGISTRY(two)],
+    seq: [["telepty", "list", "--json"], REPORT_LIST(SID), ["telepty", "list", "--json"], ["kill", "-TERM", "5000"],
+      ["cmux", "close-workspace", "--workspace", WS], DELETE(SID), ...REGISTRY(SID), REPORT_LIST(SID),
+      REPORT_LIST(two), ["telepty", "list", "--json"], DELETE(two), ...REGISTRY(two), REPORT_LIST(two)],
   });
   assert.equal(psCount(r), 2 + 1 + 1, "legacy ps (2 for the killed sid, 1 for the other) + 1 veto snapshot");
   assert.deepEqual(metaLines(r), [line(`clear: ${SID} (cleared)`), line(`clear skipped: ${two} (binding-missing)`)]);
+});
+
+test("PC-C21 report capture refusal stops before listing, metadata clear, kill, close and DELETE", () => {
+  const r = cleanup("c21", { fakes: { registry: { match: [{ argv0: "report-list", rc: 9 }] } } });
+  assert.equal(r.status, 1);
+  assert.equal(r.stdout, "");
+  assert.equal(r.stderr, `ERR REPORT_CAPTURE_FAILED for ${SID}: *:registry_list_9 — cleanup refused; worker files and registry records are preserved (see bin/dispatch-tracker.sh report-status)\n`);
+  assert.deepEqual(r.seq.map((e) => [e.who, ...e.argv]), [REPORT_LIST(SID)]);
 });

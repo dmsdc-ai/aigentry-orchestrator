@@ -24,7 +24,7 @@ const python = (process.env.PATH ?? "/usr/bin:/bin").split(path.delimiter)
   .find(file => { try { return fs.statSync(file).isFile(); } catch { return false; } });
 assert.ok(python, "selected parent-race test requires Python 3");
 assert.ok(fs.statSync(python).isFile());
-const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "parent-race-"));
+const fixture = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "parent-race-")));
 fs.chmodSync(fixture, 0o700);
 const root = path.join(fixture, "attempt");
 const sid = "mr1170-parent-race", attempt = randomUUID(), requestId = randomUUID();

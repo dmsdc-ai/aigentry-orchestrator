@@ -16,7 +16,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync,
   realpathSync, rmSync, writeFileSync,
@@ -175,18 +175,34 @@ test("claude: exact closed 8-tool set, one --tools and one --allowedTools, same 
   }
   assert.deepEqual(TOOLS.split(","), ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch"]);
   assert.ok(!cmd.some((a) => /^(Agent|Task|Workflow|TodoWrite)$/.test(a) || /(^|,)(Agent|Task|Workflow)(,|$)/.test(a)));
-  // Caller --permission-mode pair is replaced exactly as before; everything else is the pre-#652 shape.
+  // Caller --permission-mode pair is replaced; the host adds one exact report-hook settings pair.
+  const home = String((p.m.env as Record<string, string>).HOME);
+  const reportHook = p.m.reportHook as { path: string; sha256: string };
+  assert.equal(reportHook.path, join(dirname(home), "report-hook", "turn-hook.mjs"));
+  assert.equal(read(reportHook.path), read(join(DIST, "src", "report", "turn-hook.js")));
+  assert.equal(reportHook.sha256, createHash("sha256").update(readFileSync(reportHook.path)).digest("hex"));
+  const outbox = join(home, "report-outbox"), shared = join(home, ".telepty", "shared");
+  const settings = JSON.stringify({ hooks: Object.fromEntries(
+    (["UserPromptSubmit", "Stop", "StopFailure", "SessionEnd"] as const).map((event) => [event, [{ hooks: [{
+      type: "command", command: realpathSync(process.execPath),
+      args: [reportHook.path, event, outbox, shared, "p1", String(p.m.attempt)],
+      timeout: event === "SessionEnd" ? 1 : 5,
+    }] }]]),
+  ) });
+  assert.equal(count(cmd, "--settings"), 1);
   const rest = [...argv.slice(1)];
   rest.splice(rest.indexOf("--permission-mode"), 2);
   assert.deepEqual(cmd.slice(1), [...rest, "--permission-mode", "bypassPermissions", "--tools", TOOLS, "--allowedTools", TOOLS,
     "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "user", "--no-chrome",
+    "--settings", settings,
     "--add-dir", cmd[cmd.length - 1]]);
   assert.ok(!cmd.includes("acceptEdits"));
   // env/config/auth unchanged.
-  const e = p.m.env as Record<string, string>, home = e.HOME ?? "";
-  assert.deepEqual(Object.keys(e).sort(), ["AIGENTRY_TARGET_CWD", "AIGENTRY_TASK_ID", "AIGENTRY_WORKER_ATTEMPT",
+  const e = p.m.env as Record<string, string>;
+  assert.deepEqual(Object.keys(e).sort(), ["AIGENTRY_REPORT_OUTBOX", "AIGENTRY_TARGET_CWD", "AIGENTRY_TASK_ID", "AIGENTRY_WORKER_ATTEMPT",
     "AIGENTRY_WORKER_SESSION", "AIGENTRY_WORKER_SESSION_ID", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
     "CLAUDE_CODE_TMPDIR", "CLAUDE_CONFIG_DIR", "HOME", "LANG", "PATH", "SHELL", "TEMP", "TERM", "TMP", "TMPDIR"]);
+  assert.equal(e.AIGENTRY_REPORT_OUTBOX, outbox);
   assert.equal(e.CLAUDE_CONFIG_DIR, join(home, ".claude"));
   assert.equal(read(join(home, ".claude", ".credentials.json")), W.hostCreds);
   const fsCfg = (p.m.config as Json).filesystem as Json;

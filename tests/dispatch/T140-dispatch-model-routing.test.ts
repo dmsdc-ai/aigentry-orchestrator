@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { SpawnSyncReturns } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fixture } from "./model-router-fixtures.js";
 
@@ -332,7 +332,9 @@ for (const [live, cap, capped] of [[3, "", false], [4, "4", true], [4, "", false
 test("T140: unavailable router uses emergency Opus in audit and child launcher", () => {
   const f = fixture();
   try {
-    const r = f.dispatch([...f.spawnArgs, "--role", "coder"], { DISPATCH_SCRIPT_DIR: f.bin, AIGENTRY_CLI_CAP_CLAUDE: "" });
+    const controlBin = join(f.root, "control", "bin");
+    mkdirSync(controlBin, { recursive: true });
+    const r = f.dispatch([...f.spawnArgs, "--role", "coder"], { DISPATCH_SCRIPT_DIR: controlBin, AIGENTRY_CLI_CAP_CLAUDE: "" });
     if (WIN32) {
       assert.deepEqual(route(f, r), ["claude", "claude-opus-5[1m]", "table", undefined]);
       assert.equal(f.calls(), 0);

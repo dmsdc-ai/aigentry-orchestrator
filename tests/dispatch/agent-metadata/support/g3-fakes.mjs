@@ -45,6 +45,7 @@ switch (role) {
   }
   case "dispatch-registry.py": {
     const a = argv.join(" ");
+    if (a === "report-list") done(0, "");
     if (a === "list --live --fields assigned.sid,lifecycle.state,ref_path,re_dispatch_count") {
       done(0, s.live.map((r) => `${r.sid}\t${r.state}\tnull\t0\n`).join(""));
     }

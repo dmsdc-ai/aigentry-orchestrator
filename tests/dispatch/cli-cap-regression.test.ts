@@ -83,6 +83,8 @@ async function spawnRun(
   const f = fixture();
   try {
     const r = f.dispatch([...f.spawnArgs, ...args], overrides(f));
+    assert.equal(r.status, SPAWN_EXIT,
+      `status=${r.status} signal=${r.signal} error=${String(r.error)} stdout=${r.stdout} stderr=${r.stderr}`);
     return { r, ...(WIN32 ? refusedAudit(f, r) : audit(f)) };
   } finally { await f.cleanup(); }
 }

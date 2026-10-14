@@ -45,7 +45,7 @@ const ARTIFACTS = ['active.db', 'active.db-journal', 'active.db-wal', 'active.db
   'active.json.source', 'active.json.pre-sqlite.bak', 'active.json.barrier.tmp'] as const;
 // Every known registry operation, in --list-ops order. A new operation must join this table.
 const OPERATIONS = ['archive-sidecars', 'begin-delivery', 'check-dedup', 'get', 'list', 'migrate',
-  'observe', 'prune', 'set-gate', 'set-lifecycle', 'set-transport-result', 'snapshot'] as const;
+  'observe', 'prune', 'report-event', 'report-list', 'set-gate', 'set-lifecycle', 'set-transport-result', 'snapshot'] as const;
 // Diagnostic siblings a refusal may touch; neither is registry data or authority.
 const DIAGNOSTIC = new Set(['state/registry-health.log', 'state/active.json.lock']);
 // Mutation controls hold on every OS: Windows writes proceed at file-fsync-only (P3).
@@ -178,6 +178,8 @@ function operationArgs(f: Fixture, op: typeof OPERATIONS[number]): string[] {
     case 'migrate': return [op, '--now', NOW];
     case 'observe': return [op, '--sid', 'lock-fixture', '--kind', 'transition_probe', '--now', NOW];
     case 'prune': return [op, '--older-than-seconds', '0', '--now', NOW];
+    case 'report-event': return [op, '--dispatch-id', 'transition-fixture', '--kind', 'legacy', '--item', 'legacy', '--now', NOW];
+    case 'report-list': return [op, '--sid', 'lock-fixture'];
     case 'set-gate': return [op, '--sid', 'lock-fixture', '--state', 'awaiting_user', '--now', NOW];
     case 'set-lifecycle': return [op, '--sid', 'lock-fixture', '--state', 're_dispatched', '--now', NOW];
     case 'set-transport-result': return [op, '--sid', 'lock-fixture', '--result', 'write_observed', '--now', NOW];
@@ -295,7 +297,9 @@ test('CLI usage and invalid arguments keep exit 4 with and without transition ar
   const invalid: [string[], string][] = [[[], 'usage'], [['bogus-op'], 'unknown_operation'],
     [['snapshot', '--bogus', 'x'], 'invalid_argument'], [['snapshot', 'positional'], 'invalid_argument'],
     [['begin-delivery', '--sid', 'x'], 'invalid_argument'], [['get', '--sid'], 'invalid_argument'],
-    [['migrate', '--dir', 'x'], 'invalid_argument'], [['archive-sidecars', '--now', NOW], 'invalid_argument']];
+    [['migrate', '--dir', 'x'], 'invalid_argument'], [['archive-sidecars', '--now', NOW], 'invalid_argument'],
+    [['report-event', '--dispatch-id', 'transition-fixture', '--kind', 'legacy'], 'invalid_argument'],
+    [['report-list', '--bogus', 'x'], 'invalid_argument']];
   for (const artifacts of [false, true]) {
     await t.test(artifacts ? 'all seven artifacts present' : 'no artifacts', st => {
       const f = fixture(st, 'valid');

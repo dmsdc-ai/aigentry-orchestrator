@@ -44,7 +44,7 @@
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import type { SpawnSyncReturns } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -98,13 +98,16 @@ export function fixture() {
   // code and reads a credential source; os.homedir() honours HOME, which is this
   // fixture home. The claude branch only falls through to the login keychain when
   // the credentials file is absent, so seeding it keeps that branch unreached.
-  // These bytes are synthetic and are a credential for nothing.
+  // Runtime UUID canaries are synthetic and are credentials for nothing.
+  const claudeCanary = randomUUID();
+  let codexCanary: string;
+  do { codexCanary = randomUUID(); } while (codexCanary === claudeCanary);
   mkdirSync(join(home, ".claude"), { recursive: true, mode: 0o700 });
   writeFileSync(join(home, ".claude/.credentials.json"),
-    JSON.stringify({ claudeAiOauth: { accessToken: "FIXTURE-NOT-A-CREDENTIAL", expiresAt: 4102444800000 } }), { mode: 0o600 });
+    JSON.stringify({ claudeAiOauth: { accessToken: claudeCanary, expiresAt: 4102444800000 } }), { mode: 0o600 });
   mkdirSync(join(root, "codex-home"), { recursive: true, mode: 0o700 });
   writeFileSync(join(root, "codex-home/auth.json"),
-    JSON.stringify({ OPENAI_API_KEY: "FIXTURE-NOT-A-CREDENTIAL" }), { mode: 0o600 });
+    JSON.stringify({ OPENAI_API_KEY: codexCanary }), { mode: 0o600 });
   writeFileSync(join(aig, "instructions/common.md"), "# COMMON\nFIXTURE-COMMON\n");
   writeFileSync(join(aig, "instructions/roles/coder.md"), "# CODER\nFIXTURE-ROLE\n");
   // #1206 D7: dispatch no longer asks the classifier, so a claude route is the architect row of the profile.
@@ -212,14 +215,10 @@ process.exit(0);
   const scopeFile = join(root, "scope.json");
   writeFileSync(scopeFile, JSON.stringify({
     version: 1, task: "1083", sid: "router-fixture",
-    // Must not be an ancestor of HOME (the product rejects SANDBOX_SCOPE_TOO_BROAD),
-    // so scope the project/aigentry/state subtrees rather than the fixture root.
-    read: [join(root, "project"), aig, join(root, "state")],
-    // The writable set must not overlap the staging root, which lives at
-    // <aig>/sessions/<sid>; the REAL prepareWorkerSandbox() rejects that with
-    // SANDBOX_POLICY_WRITABLE. aig stays readable, and the spawn arm only needs
-    // project/state writable. Product check honoured, not relaxed.
-    write: [join(root, "project"), join(root, "state")],
+    // The worker needs only the project tree; sessions and dispatch state are host controls.
+    read: [join(root, "project")],
+    // Keep the writable scope disjoint from <aig>/sessions and the dispatch state.
+    write: [join(root, "project")],
     domains: ["api.anthropic.com:443"],
   }));
 

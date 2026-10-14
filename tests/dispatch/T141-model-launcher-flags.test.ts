@@ -244,8 +244,8 @@ test("T141: a router effort that is not a profile token is an invalid router res
   ]) {
     const f = fixture();
     try {
-      const dir = join(f.root, "fake-router");
-      mkdirSync(dir);
+      const dir = join(f.root, "control", "fake-router");
+      mkdirSync(dir, { recursive: true });
       writeFileSync(join(dir, "model-router.mjs"), `process.stdout.write(${JSON.stringify(JSON.stringify(route))} + "\\n");\n`);
       const r = f.dispatch([...f.spawnArgs, "--role", "coder"], { DISPATCH_SCRIPT_DIR: dir });
       assert.match(r.stderr, /model router unavailable; using emergency table default/, JSON.stringify(route));
