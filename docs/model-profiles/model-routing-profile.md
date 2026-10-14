@@ -40,6 +40,27 @@ role_fallback:            # #1206: space-separated labels tried in order after t
 ---
 # Model routing profile (task #1082)
 
+## Managed model catalog authoring
+
+`model-catalog.json` uses `aigentry-model-catalog/2`. Each `cli.claude` and
+`cli.codex` policy requires `family_prefixes`: either `null` to disable family
+fallback, or an array of at most 32 literal `{ "prefix": "...", "tier": "..." }`
+records. An empty array matches no family. Prefixes are nonempty printable ASCII,
+at most 200 characters, without leading or trailing whitespace. Tiers use the
+existing nonempty catalog token rule. Duplicate or overlapping prefixes are
+invalid. Matching uses `modelKey(model).startsWith(prefix)` after removing a
+terminal context suffix such as `[1m]`; a listed row tier wins first, then a
+bootstrap row tier, then the family prefix tier.
+
+To migrate a `/1` catalog, change `schema` to `aigentry-model-catalog/2` and
+replace each `family_pattern` with literal `family_prefixes` records. The bundled
+Claude prefixes are `claude-fable-`, `claude-opus-`, `claude-sonnet-`, and
+`claude-haiku-`, mapped to their respective tiers; Codex uses `null`. A custom
+regular expression has no automatic equivalent: review its intended families
+and write explicit literal prefixes. `/1`, `family_pattern`, and unknown policy
+fields fail with `MODEL_CATALOG_INVALID` before metadata, executable, or provider
+collection. Existing operator catalogs are not rewritten automatically.
+
 Tags: `claim:` vendor-reported · `bench:` independent leaderboard · `measured:` this session, 2026-09-05 · `unmeasured` = nothing found. Dates 2026; prices USD per 1M tokens in/out.
 
 ## opus-5 — `claude -p --model 'claude-opus-5[1m]'` (2026-09-06: the claude candidate is Opus 5 for workers; the numbers below were measured for Fable 5.1 and are a CEILING for this slot — Opus 5 itself is unmeasured here, see tq#1098)
