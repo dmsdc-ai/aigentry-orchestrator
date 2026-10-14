@@ -17,6 +17,59 @@ const owned = new Map();
 const sha256 = (file) => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 const rel = (file) => path.relative(b.base, file).replaceAll("\\", "/");
 const clean = (value) => String(value ?? "").replaceAll(b.base, "<owned-root>").replaceAll(b.base.toLowerCase(), "<owned-root>");
+const bridgeUrl = new URL("../../dist/src/session/private-storage.js", import.meta.url).href;
+
+// A fresh Node child starts with built-ins only. The product mode observes the same file
+// before and after the source's read-only currentPrincipal/readSecurity operations.
+const childSource = String.raw`
+import fs from "node:fs";
+const [mode, denied, positive, bridge] = process.argv.slice(1);
+if (!["builtins", "product"].includes(mode)) throw new Error("invalid fixed diagnostic mode");
+function observe(file) {
+  let fd;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY);
+    return { outcome: "ok", bytes: fs.readSync(fd, Buffer.alloc(1), 0, 1, 0) };
+  } catch (e) {
+    return { outcome: "error", code: e.code ?? null, errno: e.errno ?? null, syscall: e.syscall ?? null };
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+const result = { mode, before: { denied: observe(denied), positive: observe(positive) } };
+if (mode === "product") {
+  try {
+    const { winPrivateStorage } = await import(bridge);
+    result.operation = {
+      principal: winPrivateStorage.currentPrincipal(),
+      security: winPrivateStorage.readSecurity([{ path: denied, kind: "file" }])[0],
+    };
+  } catch (e) {
+    result.operation = { error: { name: e.name ?? "Error", message: String(e.message ?? "") } };
+  }
+  result.after = { denied: observe(denied), positive: observe(positive) };
+}
+process.stdout.write(JSON.stringify(result));
+`;
+
+function freshChild(mode, denied, positive) {
+  const argv = ["--input-type=module", "-e", childSource, mode, denied, positive, bridgeUrl];
+  const r = spawnSync(process.execPath, argv, {
+    encoding: "utf8", windowsHide: true, timeout: 30_000, maxBuffer: 64 * 1024,
+  });
+  const result = {
+    executable: process.execPath, argv, status: r.status, signal: r.signal,
+    error: r.error?.code ?? null, stderr: r.stderr ?? "",
+  };
+  try { result.observation = JSON.parse(r.stdout ?? ""); }
+  catch { result.stdout = r.stdout ?? ""; process.exitCode = 1; }
+  if (r.status !== 0 || result.observation?.mode !== mode ||
+      result.observation?.before?.positive?.outcome !== "ok" ||
+      (mode === "product" && (result.observation?.operation?.error || result.observation?.after?.positive?.outcome !== "ok"))) {
+    process.exitCode = 1;
+  }
+  return result;
+}
 
 function invoke(label, args) {
   const r = spawnSync(tool, args, { encoding: "utf8", windowsHide: true, timeout: 30_000 });
@@ -77,13 +130,16 @@ try {
   const p = plantClaude(b, { last: new Date() });
   const canonical = path.join(path.dirname(p.file), "canonical-control.jsonl");
   const readData = path.join(path.dirname(p.file), "read-data-variant.jsonl");
+  const childFile = path.join(path.dirname(p.file), "fresh-child-comparison.jsonl");
   const positive = path.join(path.dirname(p.file), "readable-control.jsonl");
   fs.copyFileSync(p.file, canonical);
   fs.copyFileSync(p.file, readData);
+  fs.copyFileSync(p.file, childFile);
   fs.copyFileSync(p.file, positive);
   report.fixture = {
-    root: "private test box", baseline: rel(p.file), canonical: rel(canonical), readDataVariant: rel(readData), positive: rel(positive),
-    sha256: sha256(p.file), sameBytes: [canonical, readData, positive].every((file) => sha256(p.file) === sha256(file)),
+    root: "private test box", baseline: rel(p.file), canonical: rel(canonical), readDataVariant: rel(readData),
+    childComparison: rel(childFile), positive: rel(positive),
+    sha256: sha256(p.file), sameBytes: [canonical, readData, childFile, positive].every((file) => sha256(p.file) === sha256(file)),
   };
   if (!report.fixture.sameBytes) throw new Error("control files differ from baseline transcript");
   report.fixture.acl = {
@@ -104,6 +160,21 @@ try {
   runCase("direct canonical control", canonical, ["/deny", `${sid}:(R)`], principal.userSid);
   // Proposed narrower right, diagnostic variant only; no production test change.
   runCase("read-data diagnostic variant", readData, ["/deny", `${sid}:(RD)`], principal.userSid);
+  // One additional same-byte file, exact original deny, two fresh Node processes.
+  runCase("fresh child comparison", childFile, ["/deny", `${sid}:(R)`, "/q"], principal.userSid);
+  const comparison = report.cases.find((item) => item.label === "fresh child comparison");
+  const exactDeny = comparison?.after?.acl.status === "ok" &&
+    comparison.after.acl.dacl?.some((ace) => ace.type === 1 && ace.sid === principal.userSid && (ace.mask & 1) === 1);
+  if (exactDeny) {
+    comparison.children = {
+      builtinsOnly: freshChild("builtins", childFile, positive),
+      productBridge: freshChild("product", childFile, positive),
+    };
+    comparison.afterChildren = { identity: identity(childFile), acl: acl(childFile), read: read(childFile) };
+  } else if (comparison) {
+    comparison.childrenSkipped = "exact user read-data deny ACE was not observed";
+    process.exitCode = 1;
+  }
 } catch (e) {
   report.error = { name: e.name ?? "Error", message: clean(e.message) };
   process.exitCode = 1;
