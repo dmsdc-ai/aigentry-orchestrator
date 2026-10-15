@@ -7,6 +7,46 @@ extracts the matching section as the GitHub Release notes, so a publish fails
 without one. Unreleased harness work is still grouped under a dated
 `## [<YYYY-MM-DD>]` section beneath the ongoing `## [Unreleased]` working set.
 
+## [0.2.5] - 2026-10-14
+
+Candidate release for context handoff, snapshot-before-compact, bounded model
+routing and catalog validation, worker confinement corrections, and mandatory
+attempt-bound worker reports. The public task disposition and exact path scope
+are recorded in `release/0.2.5-dispositions.md`. These are proposed included
+bytes; publishing this release would not close any task.
+
+### Added
+
+- **Context handoff and compaction (#1201, #1203, #1204).** Boot can compose
+  bounded context from supported CLI transcripts, while the orchestrator can
+  snapshot context before compacting and restore it afterward.
+- **Routing and catalog (#1206, #1223).** Dispatch can select a bounded
+  per-purpose CLI, model and effort and seal provider domains; catalog lookup
+  validates bounded literal prefixes.
+- **Worker report path (#1136, #1170).** Confined workers write attempt-bound
+  reports to an outbox; host-side registry and pump logic capture, surface and
+  review them. A turn-end hook records status observations separately.
+
+### Fixed
+
+- **Confinement and worker launch (#652, #1200).** The candidate includes
+  wrapper refusal, Linux preflight corrections and sealed worker settings for
+  noninteractive launch.
+
+### Known limitations
+
+- Exact integrated CI, configured security scanning and reviewed per-finding
+  policy, release workflow trust pin, native Windows anchored capture and
+  installed telepty report ACK remain release gates. A prior integrated CI run
+  failed; focused corrections are not final acceptance. Historical 16 LOW
+  scanner findings require individual review.
+- Focus rebind (#507), full cross-CLI context restoration proof (#1204), and
+  durable provider auth refresh (#1208) are not complete. Native Windows
+  ACL/sharing root cause remains open.
+- The required unified CLI `@dmsdc-ai/aigentry` 0.2.0 (#1211) is a separate
+  companion artifact; it is not included in this orchestrator package. Its
+  native/systemd/live installation gates and publication remain open.
+
 ## [0.2.4] - 2026-10-08
 
 Hotfix. The published 0.2.2 and 0.2.3 cannot dispatch a confined worker on

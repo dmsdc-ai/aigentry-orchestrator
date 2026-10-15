@@ -1,0 +1,278 @@
+{
+  "schema_version": 1,
+  "release_group": "release-1202",
+  "release_task": 1202,
+  "package": "@dmsdc-ai/aigentry-orchestrator",
+  "version": "0.2.5",
+  "base_tag": "v0.2.4",
+  "base_commit": "71cc2daa674549af0e0978d07cdb8e2020500ee9",
+  "tasks": [
+    {
+      "task_id": 652,
+      "disposition": "shipping",
+      "scope": "Confinement preflight, wrapper refusal, Linux CI support and focused tests are included; native Windows anchored capture and staging remain unproven.",
+      "paths": [
+        ".github/workflows/ci.yml",
+        ".github/workflows/release.yml",
+        "src/session/worker-sandbox-runner.ts",
+        "tests/dispatch/T28_protected_push_guard.sh",
+        "tests/dispatch/cli-wrapper-refusal.test.ts",
+        "tests/packaging/windows-release-gates.test.mjs",
+        "tests/session/claude-worker-oauth.test.ts"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.5-dispositions.md",
+          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+        }
+      ]
+    },
+    {
+      "task_id": 1136,
+      "disposition": "shipping",
+      "scope": "The turn-end observation hook and focused test are included; observations do not establish a worker report.",
+      "paths": [
+        "src/report/turn-hook.ts",
+        "tests/report/mandatory-report-1136-hook.test.mjs"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.5-dispositions.md",
+          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+        }
+      ]
+    },
+    {
+      "task_id": 1170,
+      "disposition": "shipping",
+      "scope": "Attempt-bound outbox, report pump, registry, review and cleanup integration with focused tests are included; installed telepty ACK and native Windows capture remain open.",
+      "paths": [
+        "bin/boot-prepare.mjs",
+        "bin/dispatch-registry.py",
+        "bin/report-outbox-read.py",
+        "docs/setup/worker-reports.md",
+        "src/cleanup/cli.ts",
+        "src/dispatch/cli.ts",
+        "src/dispatch/inject-id.ts",
+        "src/reconciler/cli.ts",
+        "src/report/decide.ts",
+        "src/report/envelope.ts",
+        "src/report/outbox.ts",
+        "src/report/pump.ts",
+        "src/tracker/cli.ts",
+        "src/tracker/usage.ts",
+        "tests/dispatch/T140-dispatch-model-routing.test.ts",
+        "tests/dispatch/T141-model-launcher-flags.test.ts",
+        "tests/dispatch/agent-metadata/g2c-pinned-clear.test.mjs",
+        "tests/dispatch/agent-metadata/g3-reconciler-matrix.test.mjs",
+        "tests/dispatch/agent-metadata/support/g3-fakes.mjs",
+        "tests/dispatch/cli-cap-fixtures.ts",
+        "tests/dispatch/cli-cap-regression.test.ts",
+        "tests/dispatch/registry-transition-artifacts.test.ts",
+        "tests/packaging/installed-boot-selector.test.mjs",
+        "tests/packaging/orchestrator-boot-wizard.test.mjs",
+        "tests/packaging/smoke-init.sh",
+        "tests/report/mandatory-report-1170-caller.test.mjs",
+        "tests/report/mandatory-report-1170-helper.test.mjs",
+        "tests/report/mandatory-report-1170-parent-race.test.mjs",
+        "tests/report/mandatory-report-1170-reader.test.mjs",
+        "tests/report/mandatory-report-1170-review.test.mjs",
+        "tests/report/mandatory-report-1170-rework-boundaries.test.mjs",
+        "tests/report/mandatory-report-1170-security.test.mjs",
+        "tests/report/mandatory-report-1170-windows-fixtures.mjs",
+        "tests/report/mandatory-report-1170.fakes.mjs",
+        "tests/report/mandatory-report-1170.test.mjs",
+        "tests/session/worker-tool-admission.test.ts",
+        "tooling/dispatch-prelude/template.md"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.5-dispositions.md",
+          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+        }
+      ]
+    },
+    {
+      "task_id": 1195,
+      "disposition": "non-shipping",
+      "scope": "Historical fixture cleanup test corrections are included; no standalone product feature or task completion is claimed.",
+      "paths": [
+        "tests/session/boot-adapter/spawner-stdin.test.ts",
+        "tests/session/boot-prepare.test.ts"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.5-dispositions.md",
+          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+        }
+      ]
+    },
+    {
+      "task_id": 1200,
+      "disposition": "shipping",
+      "scope": "Confined worker settings and permission acknowledgement in the shared sandbox path plus a seed test are included; durable absence of stalls is unproven.",
+      "paths": [
+        "src/session/worker-sandbox.ts",
+        "tests/session/worker-auth-seed.test.ts"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.5-dispositions.md",
+          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+        }
+      ]
+    },
+    {
+      "task_id": 1201,
+      "disposition": "shipping",
+      "scope": "Boot-time context handoff engine, adapters, integration and fixtures are included; runtime or installed-source acceptance is not claimed.",
+      "paths": [
+        "AGENTS.md",
+        "bin/context-handoff.mjs",
+        "bin/context-handoff.sh",
+        "docs/setup/orchestrator-boot.md",
+        "src/context-handoff/adapters/claude.ts",
+        "src/context-handoff/adapters/codex.ts",
+        "src/context-handoff/adapters/gemini.ts",
+        "src/context-handoff/adapters/grok.ts",
+        "src/context-handoff/adapters/index.ts",
+        "src/context-handoff/cli.ts",
+        "src/context-handoff/compose.ts",
+        "src/context-handoff/enrich.ts",
+        "src/context-handoff/redact.ts",
+        "src/context-handoff/select.ts",
+        "src/context-handoff/types.ts",
+        "src/context-handoff/write.ts",
+        "src/orchestrator-boot/boot-record.ts",
+        "src/orchestrator-boot/cli.ts",
+        "src/orchestrator-boot/plan.ts",
+        "src/orchestrator-boot/provider-capabilities.ts",
+        "src/orchestrator-boot/usage.ts",
+        "src/orchestrator-boot/wizard.ts",
+        "tests/context-handoff/acceptance.test.ts",
+        "tests/context-handoff/adapters.test.ts",
+        "tests/context-handoff/compose.test.ts",
+        "tests/context-handoff/harness.ts",
+        "tests/context-handoff/redact.test.ts",
+        "tests/context-handoff/resolve.test.ts",
+        "tests/context-handoff/select.test.ts",
+        "tests/context-handoff/size.test.ts",
+        "tests/dispatch/T131_orchestrator_boot_parity.sh",
+        "tests/dispatch/T134_orchestrator_boot_noexec.sh",
+        "tests/dispatch/T135_orchestrator_boot_handoff.sh",
+        "tests/dispatch/T40_orchestrator_singleton_guard.sh",
+        "tests/dispatch/run-all.sh",
+        "tests/fixtures/context-handoff/README.md",
+        "tests/fixtures/context-handoff/agy/conversation.pb",
+        "tests/fixtures/context-handoff/claude/no-text.jsonl",
+        "tests/fixtures/context-handoff/claude/session.jsonl",
+        "tests/fixtures/context-handoff/claude/subagent.jsonl",
+        "tests/fixtures/context-handoff/codex/rollout.jsonl",
+        "tests/fixtures/context-handoff/gemini/projects.json",
+        "tests/fixtures/context-handoff/gemini/session.jsonl",
+        "tests/fixtures/context-handoff/grok/chat_history.jsonl",
+        "tests/fixtures/context-handoff/grok/prompt_context.json",
+        "tests/fixtures/context-handoff/grok/prompt_history.jsonl",
+        "tests/fixtures/context-handoff/grok/system_prompt.txt"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.5-dispositions.md",
+          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+        }
+      ]
+    },
+    {
+      "task_id": 1202,
+      "disposition": "shipping",
+      "scope": "Shared integration and release metadata, package version, lockfile, public projection, changelog and planning evidence are included; security, exact CI and publication remain pending.",
+      "paths": [
+        "CHANGELOG.md",
+        "bin/init/manifest.mjs",
+        "package-lock.json",
+        "package.json",
+        "release/0.2.5-dispositions.md",
+        "release/0.2.5.json",
+        "release/tasks.json",
+        "scripts/run-tests.mjs",
+        "tooling/instructions/common.md"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.5-dispositions.md",
+          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+        }
+      ]
+    },
+    {
+      "task_id": 1203,
+      "disposition": "shipping",
+      "scope": "Snapshot-before-compact hook and settings are included at source level.",
+      "paths": [
+        ".claude/hooks/session-start-compact.sh",
+        ".claude/settings.json"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.5-dispositions.md",
+          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+        }
+      ]
+    },
+    {
+      "task_id": 1204,
+      "disposition": "shipping",
+      "scope": "Cross-CLI compact command and focused test are included; complete cross-CLI context restoration proof remains open.",
+      "paths": [
+        "bin/context-compact.sh",
+        "tests/bin/context-compact.test.mjs"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.5-dispositions.md",
+          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+        }
+      ]
+    },
+    {
+      "task_id": 1206,
+      "disposition": "shipping",
+      "scope": "Per-purpose routing and provider-domain sealing with focused tests are included for the candidate's bounded providers.",
+      "paths": [
+        "bin/model-evidence.mjs",
+        "bin/model-router.mjs",
+        "src/dispatch/usage.ts",
+        "tests/dispatch/confined-fixture.mjs",
+        "tests/dispatch/managed-model-decision.test.ts",
+        "tests/dispatch/model-router-confinable.test.ts",
+        "tests/dispatch/model-router-fixtures.ts",
+        "tests/dispatch/model-router-policy.test.ts",
+        "tests/packaging/installed-model-routing.test.mjs",
+        "tests/session/worker-sandbox-providers.test.ts"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.5-dispositions.md",
+          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+        }
+      ]
+    },
+    {
+      "task_id": 1223,
+      "disposition": "shipping",
+      "scope": "Bounded literal catalog validation port and focused test are included as a partial task slice.",
+      "paths": [
+        "bin/model-resolve.mjs",
+        "docs/model-profiles/model-catalog.json",
+        "docs/model-profiles/model-routing-profile.md",
+        "tests/dispatch/model-catalog-v2.test.ts"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.5-dispositions.md",
+          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+        }
+      ]
+    }
+  ]
+}
