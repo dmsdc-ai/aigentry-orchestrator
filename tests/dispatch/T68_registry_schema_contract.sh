@@ -46,7 +46,10 @@ PY
 # (2) the operation table IS the enforcement surface — pin it exactly, so adding a
 #     terminal mutation op has to change this test on purpose.
 ops=$(t_registry --list-ops | tr '\n' ' ' | sed 's/ *$//')
-want="archive-sidecars begin-delivery check-dedup get list migrate observe prune set-gate set-lifecycle set-transport-result snapshot"
+# report-event/report-list joined the table with the #1170 report obligation
+# (6578dfa) and are admitted here BY NAME, never derived from the table under
+# test. Section (5) is what earns them the entry: neither is an outcome writer.
+want="archive-sidecars begin-delivery check-dedup get list migrate observe prune report-event report-list set-gate set-lifecycle set-transport-result snapshot"
 [ "$ops" = "$want" ] || { echo "FAIL: op table = [$ops], want [$want]" >&2; exit 1; }
 
 # (3) there is no outcome-mutation entrance, by any of its historical names.
@@ -61,6 +64,53 @@ t_assert_outcome_unknown sid-A
 if t_registry set-lifecycle --sid sid-A --state re_dispatched --outcome complete >/dev/null 2>&1; then
   echo "FAIL: set-lifecycle accepted an --outcome field" >&2; exit 1
 fi
+t_assert_outcome_unknown sid-A
+
+# (5) the two report operations are evidence entrances, not outcome entrances.
+#     report-event writes the record's `report` subtree only; report-list reads.
+#     If either ever grows a path to the outcome axis, this section fails before
+#     the allowlist in (2) can make it look intentional.
+did=$(t_v2 sid-A dispatch_id)
+
+# Field rejection is probed BEFORE the capture below, and only ever with the
+# capture's own otherwise-valid argv. After a legacy capture exists the repeat
+# is DEDUPLICATED(8) on its own, which would mask an accepted field behind a
+# nonzero exit — green by construction, the exact bug this file was born from.
+for bad in --outcome --state; do
+  if t_registry report-event --dispatch-id "$did" --kind legacy --item legacy \
+      "$bad" complete >/dev/null 2>&1; then
+    echo "FAIL: report-event accepted an outcome field '$bad'" >&2; exit 1
+  fi
+  if t_registry report-list "$bad" complete >/dev/null 2>&1; then
+    echo "FAIL: report-list accepted an outcome field '$bad'" >&2; exit 1
+  fi
+done
+t_assert_outcome_unknown sid-A
+
+t_registry report-event --dispatch-id "$did" --kind legacy --item legacy \
+  --now "2026-05-12T11:02:00Z" >/dev/null
+t_assert_outcome_unknown sid-A
+
+# `seen` is the only verdict a legacy subject takes, and it is as far as the
+# evidence in this fixture goes: it derives report.resolution=legacy_seen. The
+# free-form --field channel carries an outcome-shaped key alongside it here on
+# purpose. Reported evidence is still not completion: the outcome axis does not
+# move for the strongest review this subject can carry.
+t_registry report-event --dispatch-id "$did" --kind reviewed --item legacy \
+  --sha256 "$(t_v2 sid-A report.legacy.subject_sha256)" \
+  --field verdict=seen --field outcome=complete --now "2026-05-12T11:03:00Z" >/dev/null
+t_assert_outcome_unknown sid-A
+
+# report-list observes; a reader may not bump the generation it reads.
+gen_of() {
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["generation"])' \
+    "$DISPATCH_STATE_DIR/active.json"
+}
+gen_before=$(gen_of)
+t_registry report-list >/dev/null
+gen_after=$(gen_of)
+[ "$gen_before" = "$gen_after" ] || {
+  echo "FAIL: report-list wrote a generation ($gen_before -> $gen_after)" >&2; exit 1; }
 t_assert_outcome_unknown sid-A
 
 echo "T68 PASS"
