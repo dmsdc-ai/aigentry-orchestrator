@@ -1,0 +1,15 @@
+# Exact finding disposition
+
+Commit: `78e12076f154b9bf9cd8ab38f7ab070ebcdf6609`. Fingerprint: `b45912279d54682ba0f6a98f6cf66f768c4008683f23e53e5c9ae0afdbd2ce08`.
+
+Controller technical disposition: eligible for this exact source and documented local operator boundary; not a zero-finding or security completion claim.
+
+The bounded list read receives the same fixed active.json path from load(), opens it read-only, and reads at most limit+1 bytes. Record content cannot choose another file.
+
+Trust boundary: The path root comes from DISPATCH_STATE_DIR, treated as operator-controlled configuration.
+
+Remaining limits: The file can be replaced between path construction and open; no runtime directory ownership/provenance was measured.
+
+Source citations: `bin/dispatch-registry.py:148-164`, `bin/dispatch-registry.py:362-389`.
+
+Existing tests are cited as source only; independent reviewer ran no tests.

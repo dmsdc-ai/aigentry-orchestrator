@@ -22,6 +22,9 @@ const PEER_CLOSED = ["EPIPE", "ECONNRESET"];
 // win32 (measured): a write to a gone reader can also fail with EOF (-4095); accepted only from write().
 const PEER_CLOSED_WIN = [...PEER_CLOSED, "EOF"];
 const MULTI = "héllo-世界-\u{1F600}\n";
+// #1195 win32 (measured): unlinking bin/node.exe right after its child exited failed EBUSY; the image lock can
+// outlive the process, so fixture removal gets rmSync's bounded EBUSY/EPERM retry (linear 100 ms, 10 tries).
+const RM = { recursive: true, force: true, ...(WIN ? { maxRetries: 10, retryDelay: 100 } : {}) } as const;
 
 const SH: Record<string, string> = {
   "close-stdin-exit5": `: > "$PIDDIR/$$"\nexec 0<&-\n: > "$MARK"\nexit 5\n`,
@@ -60,7 +63,7 @@ function stageNode(to: string): void {
   }
   try { linkSync(nodeCopy, to); } catch { copyFileSync(process.execPath, to); }
 }
-after(() => { if (nodeCopy !== undefined) rmSync(dirname(nodeCopy), { recursive: true, force: true }); });
+after(() => { if (nodeCopy !== undefined) rmSync(dirname(nodeCopy), RM); });
 
 interface DriverOut {
   scenario: string; outcome: "resolved" | "rejected" | "unknown-scenario";
@@ -91,6 +94,10 @@ function drive(t: TestContext, scenario: string): DriverOut {
     });
     const leftover = readdirSync(join(root, "pids")).map(Number).filter(isAlive);
     for (const pid of leftover) { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } }
+    // #1195: wait (bounded, no throw) for what was just killed, so the leftover assertion below is not masked by an
+    // EBUSY from removing a still-running image in finally.
+    const tick = new Int32Array(new SharedArrayBuffer(4)), until = Date.now() + 15_000;
+    while (leftover.some(isAlive) && Date.now() < until) Atomics.wait(tick, 0, 0, 50);
     assert.equal(r.error, undefined, `driver did not finish (hang?): ${String(r.error)}`);
     assert.equal(r.signal, null, `driver killed by ${r.signal}`);
     assert.equal(r.status, 0, `driver (parent of the child) crashed: exit ${r.status} stderr=${r.stderr}`);
@@ -101,7 +108,7 @@ function drive(t: TestContext, scenario: string): DriverOut {
     t.diagnostic(`driver: ${JSON.stringify(out.error ?? out.result)}`);
     return out;
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    rmSync(root, RM);
   }
 }
 

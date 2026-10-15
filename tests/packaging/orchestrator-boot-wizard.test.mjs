@@ -137,6 +137,9 @@ function fixture() {
     AIGENTRY_SHIM_SCRIPT_DIR: path.join(dir, 'authdir', '..', 'authdir'),
     TELEPTY_PORT: '3848',
     SINGLETON_SELF_PID: '9999',
+    // #1201: this file pins the wizard and its argv; the context handoff is T135's subject.
+    // HOME above is already closed, so no real transcript store is reachable either way.
+    AIGENTRY_HANDOFF: 'off',
     ...seams,
   };
   // AIGENTRY_SHIM_SCRIPT_DIR must be the directory whose `lib/telepty-auth.sh` resolves.
@@ -1573,6 +1576,7 @@ test('shipping metadata declares the boot doc and the wizard suite', async t => 
   }
   const manifest = await import(pathToFileURL(manifestPath).href);
   const DOC = 'docs/setup/orchestrator-boot.md';
+  const REPORT_DOC = 'docs/setup/worker-reports.md';
 
   await t.test(`the tarball declares ${DOC}`, () => {
     // usage.ts and the init guidance both cite this path. If npm does not ship it, the
@@ -1584,10 +1588,11 @@ test('shipping metadata declares the boot doc and the wizard suite', async t => 
       'docs/setup/ is declared wholesale; the exact-leaf reasoning below no longer holds');
   });
 
-  await t.test(`init's MANIFEST declares EXACTLY ${DOC} under docs/setup/`, () => {
+  await t.test(`init's MANIFEST declares the two named docs/setup leaves`, () => {
     const under = manifest.MANIFEST.filter(p => p.startsWith('docs/setup/'));
-    assert.deepEqual(under, [DOC],
-      `init must place exactly this one docs/setup leaf, got: ${JSON.stringify(under)}`);
+    assert.deepEqual(under, [DOC, REPORT_DOC]);
+    assert.ok(pkg.files.includes(REPORT_DOC));
+    assert.ok(manifest.GOVERNANCE_ROOTS.includes(REPORT_DOC));
     // …and the governance root is the LEAF, not the directory. This is the composition
     // that matters: `bin/init/manifest.mjs` asserts "every tarball path under a
     // GOVERNANCE_ROOT must appear in MANIFEST". Declaring `docs/setup/` as a root would
@@ -1599,7 +1604,7 @@ test('shipping metadata declares the boot doc and the wizard suite', async t => 
       'docs/setup/ is a governance root; the other docs/setup files package.json ships would then require MANIFEST entries');
     // The composition, stated as the arithmetic it is: the tarball ships other
     // docs/setup files, and none of them is under a governance root.
-    const otherSetupShipped = pkg.files.filter(f => f.startsWith('docs/setup/') && f !== DOC);
+    const otherSetupShipped = pkg.files.filter(f => f.startsWith('docs/setup/') && f !== DOC && f !== REPORT_DOC);
     assert.ok(otherSetupShipped.length > 0, 'fixture assumption changed: no other docs/setup file is shipped');
     for (const f of otherSetupShipped) {
       assert.ok(!manifest.GOVERNANCE_ROOTS.some(r => f === r || (r.endsWith('/') && f.startsWith(r))),

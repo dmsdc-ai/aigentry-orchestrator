@@ -39,6 +39,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { registryAvailable, registryEnvironment, registryInvocation } from "../dispatch/registry-command.js";
+import { captureForSid, defaultPumpDeps, recordCleaned, type PumpDeps } from "../report/pump.js";
 import { defaultPathConfig } from "../session/persist-context.js";
 
 import { USAGE } from "./usage.js";
@@ -564,6 +565,46 @@ function registryCleaned(sid: string): void {
   runQuiet(lifecycle.cmd, lifecycle.args, registryEnvironment());
 }
 
+// ── #1170 report capture before teardown ────────────────────────────────────
+// `cleaned` is a retired lifecycle and prune reclaims retired rows, so a report a
+// confined worker wrote but nobody captured would vanish with the session. Every
+// complete item is captured into the inbox FIRST, in-process (no telepty, no
+// notice); a capture that fails refuses the cleanup and changes nothing. There is
+// deliberately no flag that skips this.
+function reportDeps(): PumpDeps {
+  return defaultPumpDeps({
+    stateDir: env.DISPATCH_STATE_DIR || path.join(path.dirname(path.dirname(path.resolve(DISPATCH_REGISTRY_PY))), "state", "dispatch"),
+    registryScript: DISPATCH_REGISTRY_PY, telepty: env.TELEPTY || "telepty", orchestratorSid: PROTECTED_SID, nowIso: "",
+  });
+}
+
+/** true = every complete item is captured (or the registry is absent); false = refuse the cleanup. */
+function captureReportsBeforeCleanup(sid: string): boolean {
+  if (!registryAvailable(DISPATCH_REGISTRY_PY)) return true; // same absence rule as registryCleaned
+  let summary: ReturnType<typeof captureForSid>;
+  try {
+    summary = captureForSid(sid, reportDeps());
+  } catch {
+    summary = { ok: false, records: 0, captured: 0, failed: 1, errors: ["capture_exception"] };
+  }
+  if (summary.captured > 0) log(`report capture: ${sid} captured=${summary.captured}`);
+  if (summary.ok) return true;
+  err(`REPORT_CAPTURE_FAILED for ${sid}: ${summary.errors.join(" ") || "unknown"} — cleanup refused; ` +
+    "worker files and registry records are preserved (see bin/dispatch-tracker.sh report-status)");
+  return false;
+}
+
+/** After a successful cleanup: an obligation with no REPORT becomes a `cleaned` failure notice, never done. */
+function reportCleaned(sid: string): void {
+  if (!registryAvailable(DISPATCH_REGISTRY_PY)) return;
+  try {
+    const n = recordCleaned(sid, reportDeps());
+    if (n > 0) log(`report obligation: ${sid} cleaned with no REPORT captured (${n} record(s); failure notice pending)`);
+  } catch {
+    log(`report obligation: ${sid} cleaned-failure record not written (report-pump will raise exited/gone)`);
+  }
+}
+
 // ── #1162 pinned agent-metadata clear (display-only) ────────────────────────
 // A fixed tuple captured ONCE before the listing, corroborated against the listed
 // owner in ONE ps snapshot, then handed to the adapter as an exact pin that it
@@ -680,6 +721,8 @@ function cleanupOne(sid: string, force: boolean): number {
     err(`refusing to clean protected session '${PROTECTED_SID}' (pass --force to override)`);
     return 1;
   }
+  // #1170: reports before any kill/close/DELETE; a failed capture refuses the whole cleanup.
+  if (!captureReportsBeforeCleanup(sid)) return 1;
   // #1162: capture strictly BEFORE the one listing; its failure is only a skip reason.
   const cap = captureAgentBinding(sid);
   const rows = sessionRows(sid);
@@ -713,6 +756,7 @@ function cleanupOne(sid: string, force: boolean): number {
     // this is LIFECYCLE only. A session disappearing is not a task completing, so
     // the outcome stays unknown and the record keeps its history.
     registryCleaned(sid);
+    reportCleaned(sid);
     return 0;
   }
   // #1162 — pinned, display-only metadata clear BEFORE the legacy kill (log-only).
@@ -728,6 +772,7 @@ function cleanupOne(sid: string, force: boolean): number {
   if (!closeOk) return 1;
   // #540 — same lifecycle-only mark on the normal kill+close+DELETE path.
   registryCleaned(sid);
+  reportCleaned(sid);
   return 0;
 }
 

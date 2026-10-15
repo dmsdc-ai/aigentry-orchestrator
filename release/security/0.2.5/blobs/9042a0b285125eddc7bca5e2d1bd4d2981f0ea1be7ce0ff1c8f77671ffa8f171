@@ -1,0 +1,15 @@
+# Exact finding disposition
+
+Commit: `78e12076f154b9bf9cd8ab38f7ab070ebcdf6609`. Fingerprint: `42a8a94325e1eb8771daefa0ea6cd0c90648ab5720d13e501cc995f38b671e60`.
+
+Controller technical disposition: eligible for this exact source and documented local operator boundary; not a zero-finding or security completion claim.
+
+--ref is an intentional local file selector. openSync uses read-only mode and the descriptor is read for at most 4096 bytes; the content becomes a task excerpt in the classifier prompt rather than a filesystem path.
+
+Trust boundary: Direct router caller chooses the ref; managed dispatch auto routing currently omits --ref, so task text cannot select this path through that caller.
+
+Remaining limits: A future lower-trust caller forwarding arbitrary --ref would change this judgment because the first 4 KiB can be sent to a classifier; local symlink races are unmeasured.
+
+Source citations: `bin/model-router.mjs:21-24`, `bin/model-router.mjs:102-112`, `src/dispatch/cli.ts:1413-1415`.
+
+Existing tests are cited as source only; independent reviewer ran no tests.

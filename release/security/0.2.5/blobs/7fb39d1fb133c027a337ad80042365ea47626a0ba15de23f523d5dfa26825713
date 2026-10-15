@@ -1,0 +1,14 @@
+{
+  "base_commit": "71cc2daa674549af0e0978d07cdb8e2020500ee9",
+  "roots": [
+    "bin",
+    "src",
+    "scripts"
+  ],
+  "leaves": [
+    "package.json",
+    "package-lock.json"
+  ],
+  "assumptions": "Select every changed committed production source and test-runner file under bin/src/scripts since v0.2.4, plus exact package dependency identities. Snyk supported-language static findings are source evidence; no runtime exploit or clearance is inferred. At-inception tests and emitted JS scans are separately preserved by their owning tasks.",
+  "limits": "This is a changed-production-source projection, not whole-repository or dependency vulnerability coverage. Shell code is inventoried but Snyk Code language coverage is not asserted. Tests, generated dist, native/installed execution, secret configuration and unchanged source outside these roots are not scanned here. Historical findings require exact per-fingerprint source/evidence review; no blanket waiver."
+}

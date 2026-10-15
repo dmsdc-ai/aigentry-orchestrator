@@ -1,0 +1,15 @@
+# Exact finding disposition
+
+Commit: `78e12076f154b9bf9cd8ab38f7ab070ebcdf6609`. Fingerprint: `536b199fb8bbc14f49b07bff7bce44226433c89cd92943230361dda1f20fc7a6`.
+
+Controller technical disposition: eligible for this exact source and documented local operator boundary; not a zero-finding or security completion claim.
+
+The migration backup appends the fixed .legacy-v1.bak suffix to the fixed active.json registry path while holding the registry lock. No legacy record field contributes to the backup filename.
+
+Trust boundary: The migration command and state-root environment are operator-controlled; legacy JSON bytes are read as content only.
+
+Remaining limits: Same-UID or shared-directory symlink/race attacks on the state root/backup are outside this source-only recommendation.
+
+Source citations: `bin/dispatch-registry.py:148-164`, `bin/dispatch-registry.py:1417-1445`, `bin/dispatch-registry.py:227-243`.
+
+Existing tests are cited as source only; independent reviewer ran no tests.

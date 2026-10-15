@@ -1022,6 +1022,15 @@ jobs:
       - name: Install jq (a hard dependency of init, checked at step 1)
         run: command -v jq || sudo apt-get install -y jq
         if: matrix.os == 'ubuntu-latest'
+      # #652: the real sandbox-runtime's Linux dependencies. The Linux live confinement preflight in
+      # tests/session/claude-worker-oauth.test.ts registers only where they are all present.
+      - name: Install the Linux sandbox-runtime dependencies (bubblewrap, socat, ripgrep)
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap socat ripgrep
+        if: matrix.os == 'ubuntu-latest'
+      # #652: measured on ubuntu-latest, apparmor_restrict_unprivileged_userns=1 makes bwrap fail loopback RTM_NEWADDR (EPERM).
+      - name: Let bubblewrap configure loopback (lift the AppArmor unprivileged-userns restriction)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        if: matrix.os == 'ubuntu-latest'
       - name: Run the regression suite
         run: npm test
       # Runs after npm test because several guards gate on dist/ being built, and

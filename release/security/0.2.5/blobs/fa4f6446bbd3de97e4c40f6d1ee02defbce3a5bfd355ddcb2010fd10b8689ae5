@@ -1,0 +1,15 @@
+# Exact finding disposition
+
+Commit: `78e12076f154b9bf9cd8ab38f7ab070ebcdf6609`. Fingerprint: `3f971d9f39dfc53f35413171544c1f5b8b821e133aeb7b162a0903bc6f5976be`.
+
+Controller technical disposition: eligible for this exact source and documented local operator boundary; not a zero-finding or security completion claim.
+
+The runner reads a hash-sealed, private manifest; the production command is assembled from a bound executable plus argv. Each argv element is single-quote escaped before SandboxManager receives a /bin/bash command string, and spawn takes the wrapper executable plus separate argv. This is a bounded source reason against metacharacter injection at this call, not proof of SRT or installed CLI behavior.
+
+Trust boundary: CLI manifest/hash are launcher-generated in the ordinary route; a direct same-UID invocation can create its own manifest but gains no higher authority. The worker cannot write the host attempt root under the configured sandbox.
+
+Remaining limits: SRT wrapper implementation, native executable/interpreter behavior, shell implementation, replacement between identity check and exec, and OS confinement are not established by this static review.
+
+Source citations: `src/session/worker-sandbox-runner.ts:10-16`, `src/session/worker-sandbox-runner.ts:90-110`, `src/session/worker-sandbox.ts:88-90`, `src/session/worker-sandbox.ts:250-253`, `src/session/worker-sandbox.ts:372-390`, `src/session/worker-sandbox.ts:604-623`.
+
+Existing tests are cited as source only; independent reviewer ran no tests.

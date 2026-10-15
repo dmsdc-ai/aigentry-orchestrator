@@ -870,7 +870,7 @@ function parseResolveArgs(argv) {
 }
 
 /**
- * argv: --cli claude|codex --sid S --task T [--role R] [--route-json {model,decided_by}] [--observe F]…
+ * argv: --cli claude|codex --sid S --task T [--role R] [--route-json {model,decided_by,effort?}] [--observe F]…
  * env:  PATH, AIGENTRY_<CLI>_{MODEL (explicit path only), EFFORT, EXECUTABLE, EXECUTABLE_VERSION},
  *       AIGENTRY_MODEL_METADATA=off, AIGENTRY_CATALOG_{REVALIDATE_MS,MAX_BYTES,MAX_REDIRECTS}.
  * deps: { transport, now, catalogPath } — test seams.
@@ -886,10 +886,12 @@ export async function resolveCommand(argv, env = process.env, deps = {}) {
   let route = null;
   if (a["route-json"] !== undefined) {
     try { route = JSON.parse(a["route-json"]); } catch { route = null; }
-    if (!route || !isToken(route.model) || !/^(llm|table)(-capped)?$/.test(route.decided_by ?? "")) {
+    // #1206 S1-B: `effort` (optional) is the role policy token; absent means no policy effort.
+    if (!route || !isToken(route.model) || !/^(llm|table)(-capped)?$/.test(route.decided_by ?? "") ||
+      (Object.hasOwn(route, "effort") && !isToken(route.effort))) {
       return refusal("MODEL_RESOLVE_USAGE", 2, "invalid --route-json");
     }
-    route = { model: route.model, decided_by: route.decided_by };
+    route = { model: route.model, decided_by: route.decided_by, ...(route.effort !== undefined ? { effort: route.effort } : {}) };
   }
   let catalog;
   try { catalog = loadCatalog(deps.catalogPath); } catch (e) { return refusal("MODEL_CATALOG_INVALID", 10, String(e?.message ?? e)); }

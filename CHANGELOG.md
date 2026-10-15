@@ -7,6 +7,59 @@ extracts the matching section as the GitHub Release notes, so a publish fails
 without one. Unreleased harness work is still grouped under a dated
 `## [<YYYY-MM-DD>]` section beneath the ongoing `## [Unreleased]` working set.
 
+## [0.2.5] - 2026-10-15
+
+Candidate release for context handoff, snapshot-before-compact, bounded model
+routing and catalog validation, worker confinement corrections, and mandatory
+attempt-bound worker reports. The public task disposition and exact path scope
+are recorded in `release/0.2.5-dispositions.md`. These are proposed included
+bytes; publishing this release would not close any task.
+
+### Added
+
+- **Context handoff and compaction (#1201, #1203, #1204).** Boot can compose
+  bounded context from supported CLI transcripts, while the orchestrator can
+  snapshot context before compacting and restore it afterward.
+- **Routing and catalog (#1206, #1223).** Dispatch can select a bounded
+  per-purpose CLI, model and effort and seal provider domains; catalog lookup
+  validates bounded literal prefixes.
+- **Worker report path (#1136, #1170).** Confined workers write attempt-bound
+  reports to an outbox; host-side registry and pump logic capture, surface and
+  review them. A turn-end hook records status observations separately.
+
+### Fixed
+
+- **Confinement and worker launch (#652, #1200).** The candidate includes
+  wrapper refusal, Linux preflight corrections and sealed worker settings for
+  noninteractive launch.
+
+### Release gates
+
+- The configured source scan of the frozen candidate reported 17 findings
+  (1 MEDIUM, 16 LOW; exit 1). Portable per-fingerprint records describe
+  conditional eligible decisions for the local operator/control-root trust
+  boundary. Publication requires controller review of the exact policy bytes
+  and a literal workflow pin to the reviewed SHA-256. This is not a
+  zero-findings or security-clearance claim.
+- Publication requires exact integrated CI, including Windows W1 (full suite)
+  and W0 (installed package), followed by registry verification. A prior
+  integrated run failed; focused corrections do not replace the required run.
+- The required unified CLI `@dmsdc-ai/aigentry` 0.2.0 (#1211) is a separate
+  companion artifact at commit `4fc6b65a550d79ed32ef6b286499387a99dcc0b6`,
+  not part of this package. Its exact CI and offline ignore-scripts install
+  with inert probes passed; its publication is tracked independently.
+
+### Unsupported or incomplete capabilities
+
+- Native Windows anchored capture and staging, the original ACL/sharing root
+  cause, and installed telepty end-to-end report ACK are not established by
+  this candidate. New lower-trust callers, path and identity races, and
+  installed sandbox-runtime or interpreter provenance also remain unproven.
+- Focus rebind (#507), full cross-CLI context restoration proof (#1204), and
+  durable provider auth refresh (#1208) are not complete. The companion CLI's
+  inert probes do not establish native, systemd, live installation, or
+  install-script behavior.
+
 ## [0.2.4] - 2026-10-08
 
 Hotfix. The published 0.2.2 and 0.2.3 cannot dispatch a confined worker on

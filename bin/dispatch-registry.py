@@ -61,6 +61,34 @@ LOCK_TIMEOUT_S = 10.0
 RETIRED_LIFECYCLES = {"cleaned", "cutover_retired", "delivery_failed", "not_delivered",
                       "superseded"}
 
+# #1170 report obligation (the `report` key, additive). Resolutions the pump still
+# scans — and that pruning must therefore never reclaim, whatever the lifecycle (the one
+# exception, a retired failed_seen past the scan window, is archived first: op_prune).
+REPORT_RESOLUTIONS = {"open", "done", "rework_requested", "rejected", "failed_seen",
+                      "not_delivered", "legacy_unbound", "legacy_seen"}
+REPORT_KEEP = {"open", "rework_requested", "failed_seen", "legacy_unbound"}
+REPORT_ITEM_RE = re.compile(r"(REPORT|HOLD)-([1-9]|[12][0-9]|3[0-2])")
+# #1136 hook-written turn-end status: own seq space, never a final, never resolves anything.
+REPORT_TURN_RE = re.compile(r"TURN-([1-9]|[1-5][0-9]|6[0-4])")
+REPORT_MAX_TURNS = 64
+REPORT_FAILURE_EVENTS = {"exited", "dead", "gone", "cleaned", "overdue", "delivery_unknown",
+                         "item_conflict", "item_invalid", "hook_degraded"}
+REPORT_SUBMIT = {"consumed", "queued", "unknown", "gate_timeout", "failed"}
+REPORT_VERDICTS = {"REPORT": {"accepted", "rework", "rejected"}, "HOLD": {"answered", "rejected"},
+                   "TURN": {"seen"}, "failure": {"seen"}, "legacy": {"seen"}}
+# REPORT_MAX_ITEMS is per kind (REPORT-1..32 and HOLD-1..32, as the worker prompt allows).
+# Failures: 7 record-level kinds once each + item_invalid/item_conflict once per item identity.
+REPORT_ITEM_FAILURE_EVENTS = {"item_conflict", "item_invalid"}
+REPORT_MAX_ITEMS, REPORT_MAX_HISTORY = 32, 64
+REPORT_MAX_FAILURES = (len(REPORT_FAILURE_EVENTS) - len(REPORT_ITEM_FAILURE_EVENTS)
+                       + len(REPORT_ITEM_FAILURE_EVENTS) * (2 * REPORT_MAX_ITEMS + REPORT_MAX_TURNS))
+# A retired failed_seen record leaves the hot registry only after the pump's own late-scan
+# window (decide.ts DEFAULT_POLICY.failedSeenScanDays) and a durable append to this archive.
+REPORT_FAILED_SEEN_SCAN_DAYS = 7
+REPORT_ARCHIVE = "report-archive.jsonl"
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+HEX64_RE = re.compile(r"[0-9a-f]{64}")
+
 CAPABILITY = {
     "turn_boundary": "unavailable",
     "observation_tracking": "persistent",
@@ -100,8 +128,9 @@ def state_dir() -> str:
 
       * every filename under this directory is a FIXED LITERAL — `active.json`,
         `active.json.lock`, `registry-health.log`, `active.json.legacy-v1.bak`,
-        and the `.<pid>.tmp` sibling. No sid, dispatch_id, track, ref path or any
-        other record value is ever interpolated into a path;
+        `report-archive.jsonl` (#1170) and the `.<pid>.tmp` sibling. No sid,
+        dispatch_id, track, ref path or any other record value is ever
+        interpolated into a path;
       * the value is orchestrator configuration, not request data. Anyone who can
         set it on the orchestrator process already has code execution as that user;
       * the normalisation below (absolute, no `..`, no NUL) is real hardening, but
@@ -319,6 +348,14 @@ def validate(doc: object) -> dict:
             raise RegistryError("registry_corrupt", f"{did}: outcome.reported_value is not null")
         if not isinstance(lifecycle.get("state"), str):
             raise RegistryError("registry_corrupt", f"{did}: lifecycle.state missing")
+        report = rec.get("report")
+        if report is not None and not (
+                isinstance(report, dict) and report.get("v") == 1
+                and report.get("resolution") in REPORT_RESOLUTIONS
+                and isinstance(report.get("items"), dict)
+                and isinstance(report.get("failures"), list)
+                and isinstance(report.get("history"), list)):
+            raise RegistryError("registry_corrupt", f"{did}: report is malformed")
     return doc
 
 
@@ -533,6 +570,7 @@ def op_begin_delivery(args: dict) -> int:
     key = dedup_key(sid, ref_hash)
     retry_requested = "retry-unknown" in args
     retry_reason = (args.get("retry-unknown") or "").strip()
+    binding = report_binding(args)
     with _Lock():
         doc = load()
         verdict, prior = dedup_verdict(doc, key)
@@ -573,6 +611,11 @@ def op_begin_delivery(args: dict) -> int:
             }
             if args.get("worktree"):
                 record["worktree"] = args["worktree"]
+            if binding:
+                record["assigned"]["attempt"] = binding["attempt"]
+                record["assigned"]["manifest_sha256"] = binding["manifest-sha256"]
+                record["report"] = new_report(binding["report-request-id"],
+                                              binding["report-challenge-sha256"])
             append_observation(record, "dispatch_tracking_started", at)
             if retry_requested:
                 # Supersede and append in one commit; no old transport/completion fact changes.
@@ -707,6 +750,9 @@ def op_set_transport_result(args: dict) -> int:
         elif result == "not_delivered":
             rec["lifecycle"] = {"state": "not_delivered", "at": at}
             append_observation(rec, "transport_not_delivered", at)
+            report = rec.get("report")
+            if isinstance(report, dict) and report.get("request_id") and not report["items"]:
+                report["resolution"] = "not_delivered"   # nothing was handed over: no obligation
         else:
             rec["lifecycle"] = {"state": "delivery_state_unknown", "at": at}
             append_observation(rec, "delivery_state_unknown", at)
@@ -921,18 +967,450 @@ def op_prune(args: dict) -> int:
     with _Lock():
         doc = load()
         keep = []
+        archive = []
         for rec in doc["dispatches"]:
+            aged = False
             if rec["lifecycle"]["state"] in RETIRED_LIFECYCLES:
                 try:
                     seen = datetime.datetime.fromisoformat(
                         str(rec.get("last_seen_at", "")).replace("Z", "+00:00"))
-                    if (now_dt - seen).total_seconds() > cutoff:
-                        continue
+                    aged = (now_dt - seen).total_seconds() > cutoff
                 except ValueError:
                     pass
+            # #1170: an unresolved report obligation outlives its lifecycle (cleaned included).
+            report = rec.get("report")
+            if isinstance(report, dict) and report.get("resolution") in REPORT_KEEP:
+                if aged and failed_seen_past_scan(report, now_dt):
+                    archive.append(rec)
+                keep.append(rec)
+                continue
+            if aged:
+                continue
             keep.append(rec)
+        archive_error = None
+        if archive:
+            try:
+                append_report_archive(archive, at)
+                archived = {id(rec) for rec in archive}
+                keep = [rec for rec in keep if id(rec) not in archived]
+            except OSError as exc:
+                # Never drop a record that is not durably archived: keep them all hot, in place.
+                archive_error = f"report archive append failed, {len(archive)} record(s) kept: {exc}"
         doc["dispatches"] = keep
         commit(doc)
+    if archive_error:
+        raise RegistryError("registry_write_failed", archive_error)
+    return OK
+
+
+def failed_seen_past_scan(rep: dict, now_dt: datetime.datetime) -> bool:
+    """failed_seen whose last failure review is older than the pump's late-scan window,
+    i.e. a record no pump pass, capture or cleanup will ever look at again
+    (decide.ts inScanSet). Anything unparseable stays hot."""
+    if rep.get("resolution") != "failed_seen":
+        return False
+    last = None
+    for f in rep.get("failures") or []:
+        review = f.get("review") if isinstance(f, dict) else None
+        if not review:
+            continue
+        try:
+            t = datetime.datetime.fromisoformat(str(review.get("at", "")).replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        last = t if last is None or t > last else last
+    if last is None:
+        return False
+    return (now_dt - last).total_seconds() > REPORT_FAILED_SEEN_SCAN_DAYS * 86400
+
+
+def append_report_archive(records: list[dict], at: str) -> None:
+    """Evidence, not authority: one full row per line, append → fsync (→ dir fsync), before
+    the registry commit that drops them. Fixed literal name; the worker bytes stay where the
+    inbox copy is (never moved or deleted). A crash before the commit repeats a line."""
+    path = os.path.join(state_dir(), REPORT_ARCHIVE)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as fh:
+        for rec in records:
+            fh.write(json.dumps({"v": 1, "archived_at": at, "reason": "failed_seen_retired_past_scan_window",
+                                 "record": rec}, ensure_ascii=True, separators=(",", ":")) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    if os.name != "nt":
+        dir_fd = os.open(state_dir(), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+
+# --- #1170 report obligation -------------------------------------------------
+# One `report` object per dispatch, written ONLY by report-event under the same
+# lock and commit as every other mutation. Four facts stay apart: captured (an
+# envelope-valid item reached the inbox), notice (what the transport said),
+# observed (what the receiver's audit log said) and review (an explicit ACK).
+# `resolution` is derived from them here and nowhere else; only an accepted
+# current final derives `done`. The outcome axis is still never touched.
+
+
+def report_binding(args: dict) -> dict | None:
+    """The four begin-delivery binding flags: all or none, each exactly shaped."""
+    names = ("attempt", "manifest-sha256", "report-request-id", "report-challenge-sha256")
+    given = [args.get(n) for n in names]
+    if not any(given):
+        return None
+    shapes = (UUID_RE, HEX64_RE, UUID_RE, HEX64_RE)
+    if not all(v and shape.fullmatch(v) for v, shape in zip(given, shapes)):
+        raise RegistryError("invalid_argument",
+                            "begin-delivery: --attempt/--manifest-sha256/--report-request-id/"
+                            "--report-challenge-sha256 go together and must be uuid/sha256 shaped")
+    return dict(zip(names, given))
+
+
+def new_report(request_id: str | None, challenge_sha256: str | None) -> dict:
+    return {"v": 1, "request_id": request_id, "challenge_sha256": challenge_sha256,
+            "resolution": "open", "current_final": None, "items": {}, "failures": [],
+            "suspect": {}, "history": [], "history_dropped": 0}
+
+
+def report_history(rep: dict, at: str, event: str, item: str, **extra) -> None:
+    entry = {"at": at, "event": event, "item": item}
+    entry.update({k: v for k, v in extra.items() if v is not None})
+    rep["history"].append(entry)
+    while len(rep["history"]) > REPORT_MAX_HISTORY:
+        rep["history"].pop(0)
+        rep["history_dropped"] = int(rep.get("history_dropped", 0)) + 1
+
+
+def derive_resolution(rep: dict) -> str:
+    if not rep.get("request_id"):
+        return "legacy_seen" if (rep.get("legacy") or {}).get("review") else "legacy_unbound"
+    if rep.get("resolution") == "not_delivered" and not rep["items"]:
+        return "not_delivered"
+    pending = (any(v.get("review") is None and not v.get("superseded_by")
+                   for k, v in rep["items"].items() if not k.startswith("TURN-"))
+               or any(f.get("review") is None for f in rep["failures"]))
+    if pending:
+        return "open"
+    final = rep["items"].get(rep.get("current_final") or "")
+    if final:
+        return {"accepted": "done", "rework": "rework_requested",
+                "rejected": "rejected"}[final["review"]["verdict"]]
+    return "failed_seen" if rep["failures"] else "open"
+
+
+def report_subject(rep: dict, item: str) -> tuple[str, dict | None, str | None]:
+    """(kind, subject, subject sha) for an item key; subject None when absent."""
+    m = REPORT_ITEM_RE.fullmatch(item)
+    if m:
+        sub = rep["items"].get(item)
+        return m.group(1), sub, sub["sha256"] if sub else None
+    if REPORT_TURN_RE.fullmatch(item):
+        sub = rep["items"].get(item)
+        return "TURN", sub, sub["sha256"] if sub else None
+    if item == "legacy":
+        sub = rep.get("legacy")
+        return "legacy", sub, sub["subject_sha256"] if sub else None
+    fm = re.fullmatch(r"failure-([1-9][0-9]{0,2})", item)
+    if fm:
+        n = int(fm.group(1))
+        sub = rep["failures"][n - 1] if n <= len(rep["failures"]) else None
+        return "failure", sub, sub["subject_sha256"] if sub else None
+    raise RegistryError("invalid_argument", f"report-event: unknown item {item!r}")
+
+
+def bounded_text(value: str | None, limit: int) -> str:
+    return (value or "").replace("\x00", "")[:limit]
+
+
+def rep_captured(did: str, rec: dict, item: str, args: dict, fields: dict, at: str):
+    rep = rec.get("report")
+    if not isinstance(rep, dict) or not rep.get("request_id"):
+        return "report_unbound", USAGE, {}   # legacy cannot claim a request without proof
+    m = REPORT_ITEM_RE.fullmatch(item) or REPORT_TURN_RE.fullmatch(item)
+    sha = args.get("sha256") or ""
+    inbox = fields.get("inbox") or ""
+    if not m or not HEX64_RE.fullmatch(sha) or not re.fullmatch(r"[0-9]{1,5}", fields.get("bytes", "")) \
+            or int(fields["bytes"]) > 65536 or not inbox or len(inbox) > 4096:
+        raise RegistryError("invalid_argument", "report-event captured: item/sha256/bytes/inbox")
+    existing = rep["items"].get(item)
+    if existing:
+        if existing["sha256"] == sha:
+            return "duplicate", DEDUPLICATED, {}
+        return "item_conflict", USAGE, {"existing_sha256": existing["sha256"]}
+    turn = item.startswith("TURN-")
+    kind = item.split("-")[0]
+    same_space = [k for k in rep["items"] if k.split("-")[0] == kind]
+    if len(same_space) >= (REPORT_MAX_TURNS if turn else REPORT_MAX_ITEMS):
+        return "item_limit", USAGE, {}
+    entry = {"sha256": sha, "bytes": int(fields["bytes"]), "inbox": inbox, "captured_at": at,
+             "superseded_by": None, "notice": None, "review": None}
+    if turn:
+        new_formal = [x for x in (fields.get("new_formal") or "").split(",") if x]
+        if fields.get("end") not in ("stop", "api_error", "session_end") \
+                or fields.get("assoc") not in ("exact", "unknown") or len(new_formal) > 32 \
+                or not all(REPORT_ITEM_RE.fullmatch(x) for x in new_formal) \
+                or not re.fullmatch(r"[A-Za-z0-9_.-]{0,64}", fields.get("turn_error", "")):
+            # Worker-authored status fields (a bound TURN names plain KIND-n only): a refused
+            # item, not a registry error — the pump lists it as ignored, never as a capture failure.
+            return "turn_fields_invalid", USAGE, {}
+        entry.update({"end": fields["end"], "assoc": fields["assoc"],
+                      "error": fields.get("turn_error") or None, "new_formal": new_formal})
+        seq = int(item.split("-")[1])
+        newer = [k for k in same_space if int(k.split("-")[1]) > seq]
+        if newer:
+            entry["superseded_by"] = max(newer, key=lambda k: int(k.split("-")[1]))
+        else:
+            for key in same_space:
+                if rep["items"][key].get("review") is None and not rep["items"][key].get("superseded_by"):
+                    rep["items"][key]["superseded_by"] = item
+    rep["items"][item] = entry
+    if m.group(1) == "REPORT":
+        current = rep.get("current_final")
+        if current is None or int(m.group(2)) > int(current.split("-")[1]):
+            for key, other in rep["items"].items():
+                if key.startswith("REPORT-") and key != item and other.get("review") is None \
+                        and not other.get("superseded_by"):
+                    other["superseded_by"] = item
+            rep["current_final"] = item
+        else:
+            entry["superseded_by"] = current   # a late lower seq never becomes the final
+    report_history(rep, at, "captured", item, sha256=sha)
+    rep["resolution"] = derive_resolution(rep)
+    return "captured", OK, {"current_final": rep["current_final"], "resolution": rep["resolution"]}
+
+
+def failure_item_key(f: dict) -> str | None:
+    """The item an item_invalid/item_conflict failure is about: its `key`, or — for rows
+    written before keys existed — the KIND-n the host-written detail starts with."""
+    if f.get("key"):
+        return f["key"]
+    m = re.match(r"((?:REPORT|HOLD|TURN)-[0-9]{1,2})(?:\.md: | changed after capture)", str(f.get("detail") or ""))
+    return m.group(1) if m else None
+
+
+def rep_failure(did: str, rec: dict, item: str, args: dict, fields: dict, at: str):
+    rep = rec.get("report")
+    if not isinstance(rep, dict) or not rep.get("request_id"):
+        return "report_unbound", USAGE, {}
+    if item not in REPORT_FAILURE_EVENTS:
+        raise RegistryError("invalid_argument", f"report-event failure: unknown event {item!r}")
+    stage = fields.get("stage", "confirm")
+    key = fields.get("key") or None
+    if key is not None and (item not in REPORT_ITEM_FAILURE_EVENTS
+                            or not (REPORT_ITEM_RE.fullmatch(key) or REPORT_TURN_RE.fullmatch(key))):
+        raise RegistryError("invalid_argument", "report-event failure: key=KIND-n for item_invalid/item_conflict only")
+    if item in REPORT_ITEM_FAILURE_EVENTS:
+        key = key or failure_item_key({"detail": fields.get("detail")})
+    suspect = rep.setdefault("suspect", {})
+    if any(f["event"] == item and (item not in REPORT_ITEM_FAILURE_EVENTS or failure_item_key(f) == key)
+           for f in rep["failures"]):
+        return "duplicate", DEDUPLICATED, {}
+    if stage == "suspect":
+        if item in suspect:
+            return "duplicate", DEDUPLICATED, {}
+        suspect[item] = at
+        report_history(rep, at, "failure_suspect", item)
+        return "suspect", OK, {}
+    if stage == "clear":
+        if item not in suspect:
+            return "duplicate", DEDUPLICATED, {}
+        del suspect[item]
+        report_history(rep, at, "failure_cleared", item)
+        return "cleared", OK, {}
+    if stage != "confirm":
+        raise RegistryError("invalid_argument", f"report-event failure: unknown stage {stage!r}")
+    if len(rep["failures"]) >= REPORT_MAX_FAILURES:
+        return "failure_limit", USAGE, {}
+    n = len(rep["failures"]) + 1
+    subject = hashlib.sha256(f"{did}\nfailure-{n}\n{item}\n{at}".encode("utf-8")).hexdigest()
+    rep["failures"].append({"n": n, "event": item, "detail": bounded_text(fields.get("detail"), 256),
+                            "at": at, "subject_sha256": subject, "notice": None, "review": None,
+                            **({"key": key} if key else {})})
+    suspect.pop(item, None)
+    report_history(rep, at, "failure", f"failure-{n}", failure_event=item)
+    rep["resolution"] = derive_resolution(rep)
+    return "failure_recorded", OK, {"item": f"failure-{n}", "subject_sha256": subject,
+                                    "resolution": rep["resolution"]}
+
+
+def rep_notice(did: str, rec: dict, item: str, args: dict, fields: dict, at: str):
+    rep = rec.get("report")
+    if not isinstance(rep, dict):
+        return "STALE_SUBJECT", USAGE, {}
+    _, sub, _ = report_subject(rep, item)
+    if sub is None or sub.get("review") is not None:
+        return "STALE_SUBJECT", USAGE, {}
+    expect = args.get("expect-n") or ""
+    next_at = fields.get("next_at") or ""
+    if not re.fullmatch(r"[0-9]{1,6}", expect) or not re.fullmatch(r"[0-9T:+.Z-]{10,40}", next_at):
+        raise RegistryError("invalid_argument", "report-event notice: --expect-n and next_at required")
+    notice = sub.get("notice") or {"n": 0, "last_at": None, "next_at": None, "rc": None,
+                                   "inject_id": None, "submit": None, "delivery_result": None,
+                                   "verified_sender": None, "dest": None}
+    phase = fields.get("phase")
+    if notice["n"] != int(expect):
+        return "notice_raced", DEDUPLICATED, {"n": notice["n"]}
+    if phase == "claim":
+        dest = fields.get("dest") or ""
+        owner = fields.get("owner") or ""
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", dest):
+            raise RegistryError("invalid_argument", "report-event notice: dest")
+        if owner and not re.fullmatch(r"[0-9]{1,10}@[A-Za-z0-9_.-]{1,64}", owner):
+            raise RegistryError("invalid_argument", "report-event notice: owner=<pid>@<host>")
+        notice.update({"n": notice["n"] + 1, "last_at": at, "next_at": next_at, "rc": None,
+                       "inject_id": None, "submit": "pending", "delivery_result": None,
+                       "verified_sender": None, "dest": dest})
+        # Transient owner of the pending claim (the pump that may still be sending); gone at its result.
+        owners = rep.setdefault("claim_owners", {})
+        if owner:
+            owners[item] = owner
+        else:
+            owners.pop(item, None)
+        if not owners:
+            rep.pop("claim_owners", None)
+    elif phase == "result":
+        if notice.get("submit") != "pending":
+            return "notice_raced", DEDUPLICATED, {"n": notice["n"]}
+        inject_id = fields.get("inject_id") or ""
+        if fields.get("submit") not in REPORT_SUBMIT or not re.fullmatch(r"-?[0-9]{1,4}", fields.get("rc", "")) \
+                or (inject_id and not re.fullmatch(r"[0-9a-fA-F-]{36}", inject_id)):
+            raise RegistryError("invalid_argument", "report-event notice: rc/submit/inject_id")
+        notice.update({"rc": int(fields["rc"]), "inject_id": inject_id or None,
+                       "submit": fields["submit"], "next_at": next_at})
+        (rep.get("claim_owners") or {}).pop(item, None)
+        if not rep.get("claim_owners"):
+            rep.pop("claim_owners", None)
+    else:
+        raise RegistryError("invalid_argument", "report-event notice: phase=claim|result")
+    sub["notice"] = notice
+    report_history(rep, at, f"notice_{phase}", item, n=notice["n"], submit=notice["submit"],
+                   inject_id=notice["inject_id"])
+    return "notice", OK, {"n": notice["n"]}
+
+
+def rep_observed(did: str, rec: dict, item: str, args: dict, fields: dict, at: str):
+    rep = rec.get("report")
+    if not isinstance(rep, dict):
+        return "STALE_SUBJECT", USAGE, {}
+    _, sub, _ = report_subject(rep, item)
+    notice = (sub or {}).get("notice") or {}
+    if not notice.get("inject_id") or notice["inject_id"] != fields.get("inject_id"):
+        return "STALE_SUBJECT", USAGE, {}
+    result = bounded_text(fields.get("delivery_result"), 64)
+    sender = bounded_text(fields.get("verified_sender"), 128) or None
+    if notice.get("delivery_result") == result and notice.get("verified_sender") == sender:
+        return "duplicate", DEDUPLICATED, {}
+    notice["delivery_result"], notice["verified_sender"] = result, sender
+    report_history(rep, at, "observed", item, delivery_result=result,
+                   anomaly="verified_sender_not_null" if sender else None)
+    return "observed", OK, {}
+
+
+def rep_reviewed(did: str, rec: dict, item: str, args: dict, fields: dict, at: str):
+    rep = rec.get("report")
+    if not isinstance(rep, dict):
+        return "STALE_SUBJECT", USAGE, {}
+    kind, sub, sha = report_subject(rep, item)
+    verdict = fields.get("verdict")
+    if verdict not in REPORT_VERDICTS[kind]:
+        return "invalid_verdict", USAGE, {"allowed": sorted(REPORT_VERDICTS[kind])}
+    if sub is None or args.get("sha256") != sha:
+        return "STALE_SUBJECT", USAGE, {}       # review before capture, or a different subject
+    if kind == "REPORT" and item != rep.get("current_final"):
+        return "STALE_SUBJECT", USAGE, {"current_final": rep.get("current_final")}
+    if kind == "TURN" and sub.get("superseded_by"):
+        return "STALE_SUBJECT", USAGE, {"superseded_by": sub["superseded_by"]}
+    if sub.get("review") is not None:
+        if sub["review"]["verdict"] == verdict:
+            return "duplicate", DEDUPLICATED, {}
+        return "STALE_SUBJECT", USAGE, {"reviewed": sub["review"]["verdict"]}
+    by = fields.get("by_claimed") or ""
+    sub["review"] = {"verdict": verdict, "at": at,
+                     "by_claimed": by if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", by) else None}
+    report_history(rep, at, "reviewed", item, verdict=verdict)
+    rep["resolution"] = derive_resolution(rep)
+    return "reviewed", OK, {"resolution": rep["resolution"]}
+
+
+def rep_legacy(did: str, rec: dict, item: str, args: dict, fields: dict, at: str):
+    if item != "legacy":
+        raise RegistryError("invalid_argument", "report-event legacy: --item legacy")
+    if rec.get("report") is not None:
+        return "duplicate", DEDUPLICATED, {}
+    rep = new_report(None, None)
+    rep["resolution"] = "legacy_unbound"
+    rep["legacy"] = {"at": at, "notice": None, "review": None,
+                     "subject_sha256": hashlib.sha256(f"{did}\nlegacy\n{at}".encode("utf-8")).hexdigest()}
+    report_history(rep, at, "legacy_unbound", "legacy")
+    rec["report"] = rep
+    return "legacy_unbound", OK, {"subject_sha256": rep["legacy"]["subject_sha256"]}
+
+
+REPORT_EVENTS = {"captured": rep_captured, "failure": rep_failure, "notice": rep_notice,
+                 "observed": rep_observed, "reviewed": rep_reviewed, "legacy": rep_legacy}
+
+
+def op_report_event(args: dict) -> int:
+    """One report fact, one commit. 0 written · 8 same fact/raced · 4 conflict/stale/invalid."""
+    at = now_iso(args.get("now"))
+    did, kind, item = args["dispatch-id"], args["kind"], args["item"]
+    if kind not in REPORT_EVENTS:
+        raise RegistryError("invalid_argument", f"report-event: unknown kind {kind!r}")
+    fields = {}
+    for entry in args.get("field", []):
+        key, sep, value = entry.partition("=")
+        if not sep or not re.fullmatch(r"[a-z_]{1,32}", key):
+            raise RegistryError("invalid_argument", f"report-event: bad --field {key!r}")
+        fields[key] = value
+    with _Lock():
+        doc = load()
+        rec = next((r for r in doc["dispatches"] if r["dispatch_id"] == did), None)
+        if rec is None:
+            raise RegistryError("dispatch_not_found", f"no dispatch record {did!r}")
+        result, code, extra = REPORT_EVENTS[kind](did, rec, item, args, fields, at)
+        if code == OK:
+            rec["last_seen_at"] = at
+            commit(doc)
+    emit({"result": result, "dispatch_id": did, "kind": kind, "item": item, **extra,
+          "completion_fact": None})
+    return code
+
+
+def superseded_by(rec: dict) -> str | None:
+    for obs in reversed(rec.get("observations") or []):
+        if obs.get("kind") == "superseded_by_retry":
+            return obs.get("superseded_by")
+    return None
+
+
+def op_report_list(args: dict) -> int:
+    """Read-only JSONL for the pump. Default: every bound record still in REPORT_KEEP,
+    plus live, ungated records with no report yet (legacy candidates). --sid: that
+    sid's bound records in REPORT_KEEP. --all: every record that has a report."""
+    doc = load()
+    sid = args.get("sid")
+    for rec in doc["dispatches"]:
+        if sid and rec["assigned"]["sid"] != sid:
+            continue
+        rep = rec.get("report")
+        if rep is None:
+            if args.get("all") or sid or rec["lifecycle"]["state"] in RETIRED_LIFECYCLES \
+                    or (rec.get("gate") or {}).get("state") is not None:
+                continue
+        elif not args.get("all") and (rep.get("resolution") not in REPORT_KEEP
+                                      or (sid and not rep.get("request_id"))):
+            continue
+        row = {"dispatch_id": rec["dispatch_id"], "sid": rec["assigned"]["sid"],
+               "attempt": rec["assigned"].get("attempt"),
+               "manifest_sha256": rec["assigned"].get("manifest_sha256"),
+               "from_sid": rec.get("from_sid") or "", "lifecycle": rec["lifecycle"]["state"],
+               "gate": (rec.get("gate") or {}).get("state"),
+               "transport": (rec.get("transport") or {}).get("result"),
+               "expected_report_by": rec.get("expected_report_by"),
+               "dispatched_at": rec.get("dispatched_at"), "superseded_by": superseded_by(rec),
+               "report": rep}
+        print(json.dumps(row, ensure_ascii=True, separators=(",", ":")))
     return OK
 
 
@@ -1043,6 +1521,8 @@ OPS = {
     "migrate": (op_migrate, ()),
     "observe": (op_observe, ("sid", "kind")),
     "prune": (op_prune, ()),
+    "report-event": (op_report_event, ("dispatch-id", "kind", "item")),
+    "report-list": (op_report_list, ()),
     "set-gate": (op_set_gate, ("sid",)),
     "set-lifecycle": (op_set_lifecycle, ("sid",)),
     "set-transport-result": (op_set_transport_result, ("sid", "result")),
@@ -1054,7 +1534,8 @@ OPS = {
 FLAGS = {
     "archive-sidecars": {"dir"},
     "begin-delivery": {"sid", "ref-hash", "ref-path", "cwd", "from", "track", "role",
-                       "branch", "worktree", "keep-alive", "now", "retry-unknown"},
+                       "branch", "worktree", "keep-alive", "now", "retry-unknown",
+                       "attempt", "manifest-sha256", "report-request-id", "report-challenge-sha256"},
     "check-dedup": {"sid", "ref-hash"},
     "get": {"sid", "pointer"},
     "list": {"fields", "live", "not-retired", "keep-alive", "due-before",
@@ -1064,6 +1545,8 @@ FLAGS = {
     # session, and a session has as many records as it had dispatches (#853).
     "observe": {"sid", "kind", "field", "json", "now", "all"},
     "prune": {"older-than-seconds", "now"},
+    "report-event": {"dispatch-id", "kind", "item", "sha256", "expect-n", "field", "now"},
+    "report-list": {"sid", "all"},
     "set-gate": {"sid", "state", "clear", "now"},
     "set-lifecycle": {"sid", "state", "re-dispatch-count", "bump-re-dispatch-count",
                       "expected-report-by", "extend-minutes", "now", "all"},

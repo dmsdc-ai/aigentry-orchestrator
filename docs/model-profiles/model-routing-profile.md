@@ -1,20 +1,65 @@
 ---
 measured_at: 2026-09-05
 models:
-  - {label: opus-5,      cli: claude, model: "claude-opus-5[1m]"}   # 2026-09-06: was fable-5.1 — Fable is the orchestrator model; six Fable workers burned the claude.ai session limit in ~2 h
+  - {label: opus-5,      cli: claude, model: "claude-opus-5-5"}     # 2026-10-09 (#1206 D11): was claude-opus-5[1m] (legacy row). 2026-09-06: was fable-5.1 — Fable is the orchestrator model; six Fable workers burned the claude.ai session limit in ~2 h
   - {label: gpt-6-astra, cli: codex,  model: "gpt-6-astra"}
   - {label: grok-4.6,    cli: grok,   model: "grok-4.6"}
   - {label: gemini,      cli: gemini, model: "gemini-3.8-flash-high"}
 default_table:            # deterministic fallback, role -> label; used when the LLM call fails
   architect: opus-5   
   analyst:   opus-5   
+  reviewer:  gpt-6-astra  # #1206: a different vendor from the usual author gives an independent second read
   researcher: gpt-6-astra # was grok-4.6 (C3-a): confined dispatch spawns claude/codex only; of those, the cheaper (rubric tie rule)
+  researcher.docs: gpt-6-astra
   coder:     gpt-6-astra
+  coder.integration: opus-5  # #1206: rubric "integration across modules"; by task class, not language (unmeasured)
   tester:    gpt-6-astra
   builder:   gpt-6-astra
   logger:    gpt-6-astra  # was gemini (C3-a): confined dispatch spawns claude/codex only; of those, the cheaper (rubric tie rule)
+role_effort:              # #1206 Stage 1: role or role.class -> CLI-native effort token; no row -> no effort
+  architect: high         # not max: auto_effort_never (model-catalog.json)
+  analyst:   high
+  reviewer:  high
+  researcher: medium
+  researcher.docs: low
+  coder:     medium       # not xhigh: three Astra xhigh workers drained the codex 5-hour window in ~10 min
+  coder.integration: high
+  tester:    low
+  builder:   low
+  logger:    low
+role_fallback:            # #1206: space-separated labels tried in order after the table pick, then profile order
+  architect: gpt-6-astra
+  analyst:   gpt-6-astra
+  reviewer:  opus-5
+  researcher: opus-5
+  coder:     opus-5
+  coder.integration: gpt-6-astra
+  tester:    opus-5
+  builder:   opus-5
+  logger:    opus-5
 ---
 # Model routing profile (task #1082)
+
+## Managed model catalog authoring
+
+`model-catalog.json` uses `aigentry-model-catalog/2`. Each `cli.claude` and
+`cli.codex` policy requires `family_prefixes`: either `null` to disable family
+fallback, or an array of at most 32 literal `{ "prefix": "...", "tier": "..." }`
+records. An empty array matches no family. Prefixes are nonempty printable ASCII,
+at most 200 characters, without leading or trailing whitespace. Tiers use the
+existing nonempty catalog token rule. Duplicate or overlapping prefixes are
+invalid. Matching uses `modelKey(model).startsWith(prefix)` after removing a
+terminal context suffix such as `[1m]`; a listed row tier wins first, then a
+bootstrap row tier, then the family prefix tier.
+
+To migrate a `/1` catalog, change `schema` to `aigentry-model-catalog/2` and
+replace each `family_pattern` with literal `family_prefixes` records. The bundled
+Claude prefixes are `claude-fable-`, `claude-opus-`, `claude-sonnet-`, and
+`claude-haiku-`, mapped to their respective tiers; Codex uses `null`. A custom
+regular expression has no automatic equivalent: review its intended families
+and write explicit literal prefixes. `/1`, `family_pattern`, and unknown policy
+fields fail with `MODEL_CATALOG_INVALID` before metadata, executable, or provider
+collection. Existing operator catalogs are not rewritten automatically.
 
 Tags: `claim:` vendor-reported · `bench:` independent leaderboard · `measured:` this session, 2026-09-05 · `unmeasured` = nothing found. Dates 2026; prices USD per 1M tokens in/out.
 

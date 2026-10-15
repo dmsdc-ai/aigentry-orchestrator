@@ -1,0 +1,15 @@
+# Exact finding disposition
+
+Commit: `78e12076f154b9bf9cd8ab38f7ab070ebcdf6609`. Fingerprint: `64ac4570288950b88842494754ef600c59ee5ecbfa3185928a3caeb834d86d21`.
+
+Controller technical disposition: eligible for this exact source and documented local operator boundary; not a zero-finding or security completion claim.
+
+The flagged open is the bounded header read of the resolver-selected CLI executable. validateSpawnDecision binds the executable and assertNotCliWrapper reads only its first 512 bytes, then refuses shell shebang wrappers with unknown version evidence.
+
+Trust boundary: The executable path comes from the operator's model resolver decision, validated before staging; it is not formed from task ref text.
+
+Remaining limits: The resolver's installed binary provenance and replacement between stat/header read and launch are not proven.
+
+Source citations: `src/dispatch/cli.ts:681-694`, `src/session/worker-sandbox.ts:59-85`, `src/session/model-decision.ts:127-146`.
+
+Existing tests are cited as source only; independent reviewer ran no tests.

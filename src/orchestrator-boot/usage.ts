@@ -152,6 +152,15 @@ Env:
                             A control character in it is refused (exit 2) on every
                             path but --help: the exec argv crosses back to the shim
                             as text and could not survive the round trip.
+  AIGENTRY_HANDOFF          auto (default, also when unset) | off. With auto and a NEW
+                            conversation, the boot reads the claude/codex/gemini/grok
+                            transcript stores read-only after the singleton guard, picks
+                            this workspace's newest orchestrator session, writes
+                            state/handoff/latest.md (+ latest.json) and passes only a
+                            pointer to that file to providers whose delivery is measured.
+                            off skips it and leaves the argv unchanged; any other value
+                            warns and is treated as off. Not a plan field. --dry-run shows
+                            the handoff under [would-handoff] and writes nothing.
   TELEPTY                   telepty binary for 'list --json' (default: telepty). The
                             bridge itself is exec'd from PATH, deliberately unpinned.
   CURL                      http client for the registry DELETE (default: curl).

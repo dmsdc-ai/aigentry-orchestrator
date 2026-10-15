@@ -17,7 +17,7 @@ export const USAGE = `# dispatch.sh — Wraps \`telepty inject\` with REPL-ready
 #   dispatch.sh --target <sid> --ref <file> [--from <orch-sid>] [--timeout-ms 30000]
 #               [--retry-unknown "<reason>"]
 #   dispatch.sh --spawn-and-dispatch --track T --name N --cwd P --cli claude \\
-#               --ref <file> [--from <orch-sid>] [--role coder|architect|...] [--worktree P]
+#               --ref <file> [--from <orch-sid>] [--role coder|architect|...] [--task-class C] [--worktree P]
 #   dispatch.sh --help
 #
 # Rule 34 task-gate (#736): every dispatch must name the task it actuates.
@@ -29,7 +29,13 @@ export const USAGE = `# dispatch.sh — Wraps \`telepty inject\` with REPL-ready
 #   AIGENTRY_TASK_GATE=hard|warn|off (default hard) — warn audits+proceeds, off = legacy.
 #   AIGENTRY_TASK_QUEUE=<path> overrides the queue (default <repo>/state/task-queue.json).
 #
-# --cli defaults to auto (profile + LLM, then role table); explicit CLI bypasses routing.
+# --cli defaults to auto (the profile's role table; the ref is never sent to a classifier, #1206);
+#   explicit CLI bypasses routing.
+#   --task-class C  (auto only) picks the profile's role.C row (e.g. coder + integration),
+#                   else the role row; C must match ^[a-z][a-z0-9-]{0,31}$ (else exit 4).
+#   Routed candidates are tried in order; one at its AIGENTRY_CLI_CAP_<CLI>, with no
+#   executable on PATH or no credential file is skipped (stat only); none left exits 78
+#   (ROUTE_CANDIDATES_EXHAUSTED), never an unconfined fallback.
 # --role (cli=claude|codex|gemini|grok, #431 / #532 / #1083): wires boot-prepare.mjs so the
 #   wrapped CLI skips project context-file auto-discovery (the cwd→role
 #   contamination exposed by the 2026-05-23 incident). claude uses

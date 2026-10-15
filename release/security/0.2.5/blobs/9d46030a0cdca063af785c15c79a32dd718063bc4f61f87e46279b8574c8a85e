@@ -1,0 +1,15 @@
+# Exact finding disposition
+
+Commit: `78e12076f154b9bf9cd8ab38f7ab070ebcdf6609`. Fingerprint: `4381a8c99fb3c969e96d76257962e86eeaf0c21e91566a17b7e8cace7518be7e`.
+
+Controller technical disposition: eligible for this exact source and documented local operator boundary; not a zero-finding or security completion claim.
+
+stageWorkerRef repeats the SID guard before reading the target current pointer, verifies manifest hash and SID/task, then stages under the manifest HOME with a digest filename. In the ordinary route HOME is generated under the attempt root, not from task content.
+
+Trust boundary: Ref text is task data, but the destination root comes from host-authored sealed state; a same-UID actor that can replace control state is within the trusted controller boundary.
+
+Remaining limits: The target helper only checks HOME is absolute and does not independently confine it to the attempt root; review stage ownership, symlinks and replacement windows in native/public deployment.
+
+Source citations: `src/dispatch/cli.ts:1441-1458`, `src/session/worker-sandbox.ts:482-503`, `src/session/worker-sandbox.ts:266-289`, `src/session/worker-sandbox.ts:372-390`.
+
+Existing tests are cited as source only; independent reviewer ran no tests.

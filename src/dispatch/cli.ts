@@ -22,12 +22,17 @@ import { fileURLToPath } from "node:url";
 
 import { registryAvailable, registryEnvironment, registryInvocation } from "./registry-command.js";
 export { registryInvocation } from "./registry-command.js";
+import { parseInjectId } from "./inject-id.js";
+export { parseInjectId } from "./inject-id.js";
+import { mintRequest, renderRefTrailer, type ReportRequest } from "../report/envelope.js";
 
 import { USAGE } from "./usage.js";
 import { geminiBinary } from "../session/boot-adapter/gemini.js";
 import { isCliKind, type LaunchConfig } from "../session/boot-adapter/types.js";
 import { normalizeLaunch } from "../session/boot-adapter/launch-config.js";
-import { loadWorkerScope, prepareWorkerSandbox, assertConfinedTarget, stageWorkerRef } from "../session/worker-sandbox.js";
+import { loadWorkerScope, prepareWorkerSandbox, assertConfinedTarget, stageWorkerRef, assertNotCliWrapper, CONFINED_CLIS,
+  readSandboxCurrent, readSealedManifest } from "../session/worker-sandbox.js";
+import { CLAUDE_OAUTH_OPT_IN } from "../session/claude-worker-oauth.js";
 import { validateSpawnDecision, type SpawnDecision } from "../session/model-decision.js";
 
 // ── environment seams (identical names/defaults to the shell) ────────────────
@@ -134,9 +139,34 @@ function safeSessionComponent(s: string): string {
   return s.replace(/[^A-Za-z0-9_.-]/g, "_");
 }
 
-function mkTemp(prefix: string): string {
+/** #1170 N1: temp refs may hold a report challenge — unlinked on every process.exit path (die included). */
+const tempFiles = new Set<string>();
+let tempExitHook = false;
+
+/**
+ * A fresh private temp file holding `data`: O_CREAT|O_EXCL 0600 ("wx"), so an existing
+ * file or a planted symlink at the name is refused, never followed; written through the fd.
+ */
+function mkTemp(prefix: string, data: string | Uint8Array): string {
   const dir = env.TMPDIR || "/tmp";
-  return path.join(dir, `${prefix}.${randomBytes(3).toString("hex")}`);
+  const file = path.join(dir, `${prefix}.${randomBytes(16).toString("hex")}`);
+  if (!tempExitHook) {
+    tempExitHook = true;
+    process.on("exit", () => { for (const f of tempFiles) { try { fs.unlinkSync(f); } catch { /* already gone */ } } });
+  }
+  const fd = fs.openSync(file, "wx", 0o600);
+  tempFiles.add(file);
+  try {
+    fs.writeFileSync(fd, data);
+  } finally {
+    fs.closeSync(fd);
+  }
+  return file;
+}
+
+function rmTemp(file: string): void {
+  try { fs.unlinkSync(file); } catch { /* already gone */ }
+  tempFiles.delete(file);
 }
 
 // ── spawn-path helpers ──────────────────────────────────────────────────────
@@ -319,34 +349,6 @@ function registryQuiet(args: string[]): number {
   return r.status ?? 1;
 }
 
-// ── inject_id scraping (#872) ───────────────────────────────────────────────
-/**
- * The transport id telepty printed, or "" (#872).
- *
- * telepty 0.8.0 prints it on its own undecorated line so a caller can scrape it
- * without parsing the decorated success line. That is still human-facing stdout,
- * not a machine contract, so this reads conservatively: the whole line must be
- * the prefix plus the exact UUID shape crypto.randomUUID() emits, anchored at
- * both ends. Anything else yields NO id — transport.inject_id stays null and
- * dispatch-tracker.sh fires its existing no_transport_inject_id HOLD, which is
- * the honest answer. A guessed id would send the tracker to poll a DIFFERENT
- * dispatch's observation record.
- */
-export function parseInjectId(text: string): string {
-  const hex = "[0-9a-fA-F]";
-  const re = new RegExp(
-    `^[ \\t]*inject_id:[ \\t]+(${hex}{8}-${hex}{4}-${hex}{4}-${hex}{4}-${hex}{12})[ \\t]*$`,
-  );
-  const ids = new Set<string>();
-  for (const line of text.replace(/\r/g, "").split("\n")) {
-    const m = re.exec(line);
-    if (m) ids.add(m[1]!);
-  }
-  // Exactly one DISTINCT id, or none. Two different ids in one inject's output
-  // is ambiguity, not a menu.
-  return ids.size === 1 ? [...ids][0]! : "";
-}
-
 // ── verify_delivered screen analysis (#835) ─────────────────────────────────
 /**
  * Pure half of verify_delivered: given the post-inject screen and the ref's
@@ -361,7 +363,12 @@ export function screenShowsDelivery(post: string, firstLine: string): boolean {
 }
 
 // ── CLI state ───────────────────────────────────────────────────────────────
-interface RouteCandidate { cli: string; model: string; label: string }
+// #1206: bin/model-router.mjs's TOKEN — a `--class` value and a profile effort token.
+const ROUTE_TOKEN = /^[a-z][a-z0-9-]{0,31}$/;
+const validEffort = (c: object): boolean => !Object.hasOwn(c, "effort") ||
+  (typeof (c as { effort?: unknown }).effort === "string" && ROUTE_TOKEN.test((c as { effort: string }).effort));
+
+interface RouteCandidate { cli: string; model: string; label: string; effort?: string }
 
 interface Opts {
   target: string;
@@ -374,11 +381,13 @@ interface Opts {
   name: string;
   cwd: string;
   cli: string;
-  route?: { label: string; model: string; decided_by: string; reason: string; candidates?: RouteCandidate[]; capped_cli?: string };
+  route?: { label: string; model: string; decided_by: string; reason: string; candidates?: RouteCandidate[]; capped_cli?: string; effort?: string };
   worktree: string;
   verifyDelivered: boolean;
   verifyStarted: boolean;
   role: string;
+  /** #1206: the role's task class (router `--class`); "" = the role row. */
+  taskClass: string;
   keepAlive: boolean;
   taskId: string;
   noTask: boolean;
@@ -412,6 +421,7 @@ function parseArgs(argv: string[]): Opts {
     // Rule 33: confirm session actually started working post-inject.
     verifyStarted: true,
     role: "",
+    taskClass: "",
     keepAlive: false,
     taskId: "",
     noTask: false,
@@ -448,6 +458,13 @@ function parseArgs(argv: string[]): Opts {
       case "--worktree": o.worktree = val(a); i += 2; break;
       case "--cli": o.cli = val(a); i += 2; break;
       case "--role": o.role = val(a); i += 2; break;
+      case "--task-class":
+        o.taskClass = val(a); i += 2;
+        if (!ROUTE_TOKEN.test(o.taskClass)) {
+          process.stderr.write("dispatch.sh: --task-class: invalid class (want ^[a-z][a-z0-9-]{0,31}$)\n");
+          process.exit(4);
+        }
+        break;
       case "--task": o.taskId = val(a); i += 2; break;
       case "--no-task": o.noTask = true; o.noTaskReason = val(a); i += 2; break;
       case "--verify-delivered": o.verifyDelivered = true; i += 1; break;
@@ -498,9 +515,10 @@ function resolveRoute(o: Opts, sid: string, skipPreparation: boolean): void {
     o.route = { label: model, model, decided_by: "explicit", reason: "explicit --cli override" };
     return;
   }
+  // #1206 D7: no `--ref`, so the router never calls its classifier; the role (× task class) table decides.
   try {
     const result = spawnSync(process.execPath, [path.join(SCRIPT_DIR, "model-router.mjs"),
-      "--role", o.role, "--ref", o.refFile, "--candidates", "1", "--confined", "1"], {
+      "--role", o.role, ...(o.taskClass ? ["--class", o.taskClass] : []), "--candidates", "1", "--confined", "1"], {
       encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], timeout: 16000, killSignal: "SIGKILL",
     });
     if (result.error || result.status !== 0) throw new Error("router unavailable");
@@ -508,7 +526,8 @@ function resolveRoute(o: Opts, sid: string, skipPreparation: boolean): void {
     if (!["claude", "codex", "grok", "gemini"].includes(route.cli) ||
       !["llm", "table"].includes(route.decided_by) || typeof route.model !== "string" ||
       typeof route.label !== "string" || typeof route.reason !== "string" ||
-      !Array.isArray(route.candidates)) throw new Error("invalid router result");
+      !Array.isArray(route.candidates) || !validEffort(route) ||
+      !route.candidates.every((c: unknown) => typeof c === "object" && c !== null && validEffort(c))) throw new Error("invalid router result");
     o.cli = route.cli;
     o.route = route;
   } catch {
@@ -581,21 +600,52 @@ function cliCap(cli: string): number {
   return Infinity;
 }
 
-/** Fresh spawn only: a routed CLI at cap falls to the next candidate; an explicit --cli warns and proceeds. */
+// #1206 (PLAN §2.3): stat only, nothing is read or run. An executable the resolver would bind by name
+// (`<cli>` in an absolute PATH dir); a declared AIGENTRY_<CLI>_EXECUTABLE is an explicit request the
+// resolver judges itself, never substituted. A credential source seedAuth can copy: codex auth.json;
+// claude's opted-in token handoff, its credentials file, or on darwin the login Keychain (not statable).
+function executablePresent(cli: string): boolean {
+  if (env[`AIGENTRY_${cli.toUpperCase()}_EXECUTABLE`]) return true;
+  return (env.PATH || "").split(path.delimiter).some((dir) => path.isAbsolute(dir) && isExecutable(path.join(dir, cli)));
+}
+
+function credentialPresent(cli: string): boolean {
+  const isFile = (p: string): boolean => { try { return fs.statSync(p).isFile(); } catch { return false; } };
+  if (cli === "codex") return isFile(path.join(env.CODEX_HOME || path.join(os.homedir(), ".codex"), "auth.json"));
+  return !!env[CLAUDE_OAUTH_OPT_IN] || process.platform === "darwin" || isFile(path.join(os.homedir(), ".claude", ".credentials.json"));
+}
+
+/**
+ * Fresh spawn only: a routed CLI that is not routable (at cap, no executable, no credential) falls to the
+ * first routable router candidate, in order; none left refuses (exit 78) — never an unconfined fallback.
+ * An explicit --cli warns at cap and proceeds.
+ */
 function applyCliCap(o: Opts): void {
   if (!o.route || o.route.decided_by === "existing") return;
   const live = liveCliCounts();
   const atCap = (cli: string): boolean => (live[cli] || 0) >= cliCap(cli);
-  if (!atCap(o.cli)) return;
-  const status = `${o.cli} at cap (${live[o.cli] || 0} live, AIGENTRY_CLI_CAP_${o.cli.toUpperCase()}=${cliCap(o.cli)})`;
+  const capStatus = (cli: string): string =>
+    `${cli} at cap (${live[cli] || 0} live, AIGENTRY_CLI_CAP_${cli.toUpperCase()}=${cliCap(cli)})`;
   if (o.route.decided_by === "explicit") {
-    process.stderr.write(`dispatch.sh: WARNING ${status}; explicit --cli ${o.cli} spawns anyway\n`);
+    if (atCap(o.cli)) process.stderr.write(`dispatch.sh: WARNING ${capStatus(o.cli)}; explicit --cli ${o.cli} spawns anyway\n`);
     return;
   }
-  const pick = (o.route.candidates || []).find((c) => !atCap(c.cli)) || EMERGENCY_ROUTE;
+  const unroutable = (cli: string): string | undefined =>
+    !(CONFINED_CLIS as readonly string[]).includes(cli) ? `${cli} is not a confined CLI`
+      : atCap(cli) ? capStatus(cli)
+        : !executablePresent(cli) ? `${cli} has no executable on PATH`
+          : !credentialPresent(cli) ? `${cli} has no credential file` : undefined;
+  const status = unroutable(o.cli);
+  if (!status) return;
+  const pick = (o.route.candidates || []).find((c) => !unroutable(c.cli));
+  if (!pick) {
+    die(`dispatch.sh: ROUTE_CANDIDATES_EXHAUSTED: ${status}; no routable confined candidate after ` +
+      `${printable(o.route.label)} (HOLD; no unconfined fallback); nothing was spawned`, 78);
+  }
   process.stderr.write(`dispatch.sh: ${status}; ${o.route.label} -> ${pick.label} (${pick.cli})\n`);
   o.route = { label: pick.label, model: pick.model, decided_by: `${o.route.decided_by}-capped`,
-    reason: `${status}; router chose ${o.route.label}: ${o.route.reason}`, capped_cli: o.cli };
+    reason: `${status}; router chose ${o.route.label}: ${o.route.reason}`, capped_cli: o.cli,
+    ...(pick.effort !== undefined ? { effort: pick.effort } : {}) };
   o.cli = pick.cli;
 }
 
@@ -610,10 +660,11 @@ const MODEL_ROUTER = fileURLToPath(new URL("../../../bin/model-router.mjs", impo
 const printable = (s: string): string => s.replace(/[^\x20-\x7e]/g, "?").slice(0, 600);
 
 function resolveSpawnDecision(o: Opts, sid: string): void {
-  if (!["claude", "codex"].includes(o.cli) || !o.role || !o.taskId || !o.route) return;
+  if (!(CONFINED_CLIS as readonly string[]).includes(o.cli) || !o.role || !o.taskId || !o.route) return;
   const args = [MODEL_ROUTER, "--resolve", "--cli", o.cli, "--sid", sid, "--task", o.taskId, "--role", o.role];
   if (o.route.decided_by !== "explicit") {
-    args.push("--route-json", JSON.stringify({ model: o.route.model, decided_by: o.route.decided_by }));
+    args.push("--route-json", JSON.stringify({ model: o.route.model, decided_by: o.route.decided_by,
+      ...(o.route.effort !== undefined ? { effort: o.route.effort } : {}) }));
   }
   for (const file of o.observe) args.push("--observe", file);
   const r = spawnSync(process.execPath, args, {
@@ -631,6 +682,16 @@ function resolveSpawnDecision(o: Opts, sid: string): void {
     o.decision = validateSpawnDecision(out.decision, { cli: o.cli, sid, task: o.taskId });
   } catch (e) {
     die(`dispatch.sh: MODEL_RESOLVER_FAILED: ${printable(String(e))}; nothing was spawned`, 10);
+  }
+  // #652: a resolved `#!` wrapper with no version evidence is refused here, before boot-prepare
+  // or any staging; prepareWorkerSandbox repeats the check at the seal. Sandbox platforms only:
+  // win32 seals nothing and keeps its SANDBOX_PLATFORM_UNSUPPORTED refusal.
+  if (process.platform === "darwin" || process.platform === "linux") {
+    try {
+      assertNotCliWrapper(o.decision.executable);
+    } catch (e) {
+      die(`dispatch.sh: ${printable(e instanceof Error ? e.message : String(e))}; nothing was spawned`, 78);
+    }
   }
   // The legacy route fields now name what the argv carries, not a literal default.
   o.route.model = o.decision.model ?? "omitted";
@@ -903,6 +964,43 @@ interface Delivery {
    * delivery was never staged — see the refusal in main().
    */
   refPrompt: string;
+  /** #1170: the envelope minted for this dispatch and the sealed attempt it is bound to. */
+  report?: ReportRequest;
+  reportBinding?: { attempt: string; hash: string };
+}
+
+/**
+ * #1170: the sealed attempt a confined ref is staged into, read through the strict
+ * sealed reader. null (with a named WARNING) when the target cannot carry an envelope
+ * — e.g. a worker spawned before report outboxes existed: the record is then created
+ * without a report binding and report-pump surfaces it as legacy_unbound.
+ */
+function pinReportAttempt(stage: string, sid: string): { attempt: string; hash: string } | null {
+  try {
+    const real = fs.realpathSync(stage);
+    const current = readSandboxCurrent(real);
+    const { m, root, stage: owner } = readSealedManifest(current.manifest, current.hash);
+    const home = path.join(root, "home");
+    if (owner !== real || m.sid !== sid) throw new Error("REPORT_ATTEMPT_IDENTITY");
+    if (m.env.HOME !== home || m.env.AIGENTRY_REPORT_OUTBOX !== path.join(home, "report-outbox")) {
+      throw new Error("REPORT_OUTBOX_UNSEALED");
+    }
+    return { attempt: m.attempt, hash: current.hash };
+  } catch (e) {
+    const why = String((e as Error)?.message ?? e).replace(/[^\x20-\x7e]/g, "?").slice(0, 120);
+    process.stderr.write(`dispatch.sh: WARNING REPORT_ENVELOPE_UNAVAILABLE for ${sid} (${why}) — no report envelope ` +
+      "is bound; the record stays legacy_unbound and report-pump surfaces it\n");
+    return null;
+  }
+}
+
+/** #1170: the trailer goes into a private temp copy; o.refFile (dedup hash / verify) stays original. */
+function appendRefTrailer(d: Delivery, trailer: string): void {
+  // A new exclusive temp with base + trailer (never an in-place append by path); the old temp goes.
+  const prev = d.tmpRef;
+  d.tmpRef = mkTemp("dispatch-ref", Buffer.concat([fs.readFileSync(d.effRef), Buffer.from(trailer)]));
+  d.effRef = d.tmpRef;
+  if (prev) rmTemp(prev);
 }
 
 /**
@@ -911,7 +1009,7 @@ interface Delivery {
  * whose default promptPath is tilde-rooted against the HOST home.
  * The private staged file remains the content source; only its address travels.
  */
-function buildContextRefPrompt(stagedPath: string): string {
+export function buildContextRefPrompt(stagedPath: string): string {
   return `[context-ref] Read ${stagedPath} and use it as the source of truth for this task.`;
 }
 
@@ -948,8 +1046,7 @@ function prepareEffectiveRef(o: Opts, d: Delivery): boolean {
     );
     return false;
   }
-  d.tmpRef = mkTemp("dispatch-ref");
-  fs.writeFileSync(d.tmpRef, body.split("{{ORCHESTRATOR_REPORT_TARGET}}").join(targetAddr));
+  d.tmpRef = mkTemp("dispatch-ref", body.split("{{ORCHESTRATOR_REPORT_TARGET}}").join(targetAddr));
   d.effRef = d.tmpRef;
   return true;
 }
@@ -984,9 +1081,7 @@ function inject(o: Opts, d: Delivery, sid: string): Promise<number> {
     });
     const finish = (rc: number) => {
       d.transportInjectId = parseInjectId(out);
-      if (d.tmpRef) {
-        try { fs.unlinkSync(d.tmpRef); } catch { /* already gone */ }
-      }
+      if (d.tmpRef) rmTemp(d.tmpRef);
       resolve(rc); // preserve the inject's real exit code (callers gate on it)
     };
     child.on("error", () => finish(127));
@@ -1072,6 +1167,10 @@ function beginDelivery(o: Opts, d: Delivery, sid: string): { status: number; std
   if (o.worktree) a.push("--worktree", o.worktree);
   if (o.keepAlive) a.push("--keep-alive");
   if (o.retryUnknown) a.push("--retry-unknown", o.retryUnknown);
+  if (d.report && d.reportBinding) {
+    a.push("--attempt", d.reportBinding.attempt, "--manifest-sha256", d.reportBinding.hash,
+      "--report-request-id", d.report.request_id, "--report-challenge-sha256", d.report.challenge_sha256);
+  }
   return registryOut(a);
 }
 
@@ -1147,7 +1246,7 @@ async function waitForReady(o: Opts, sid: string): Promise<number> {
 // ── the spawn arm (#431 / #532) ─────────────────────────────────────────────
 function spawnWorkspace(o: Opts, sid: string): void {
   const scope = loadWorkerScope(env.AIGENTRY_WORKER_SCOPE, o.taskId, sid);
-  if (!o.role || !["claude", "codex"].includes(o.cli)) die(`dispatch.sh: SANDBOX_CLI_UNSUPPORTED: ${o.cli}; no unrestricted fallback`, 78);
+  if (!o.role || !(CONFINED_CLIS as readonly string[]).includes(o.cli)) die(`dispatch.sh: SANDBOX_CLI_UNSUPPORTED: ${o.cli}; no unrestricted fallback`, 78);
   // #1167 P6: no OS sandbox runtime here (win32), so the confined spawn refuses now — after the routing/spawn
   // decision, before boot-prepare stages anything, the git guard is installed or a terminal opens. Same
   // predicate as prepareWorkerSandbox; darwin/linux never enter. The decision is named, non-ASCII escaped.
@@ -1228,8 +1327,11 @@ function spawnWorkspace(o: Opts, sid: string): void {
     // boot-prepare (#509). display_cli = o.cli (#532) so the guard wrapper's
     // `exec -a <cli>` and telepty visibility match the actual CLI.
     const protectedRoot = path.join(env.AIGENTRY_SESSIONS_ROOT || path.join(os.homedir(), ".aigentry", "sessions"), sid);
+    // #1170 (RC6): the registry state (the registry's own default) and this control workspace.
+    const stateDir = path.resolve(env.DISPATCH_STATE_DIR ||
+      path.join(path.dirname(path.dirname(path.resolve(DISPATCH_REGISTRY_PY))), "state", "dispatch"));
     const sandbox = prepareWorkerSandbox(scope, o.cli, bootSpawnCwd, bootArgv, protectedRoot, o.cwd, workerHooksDir, bootLaunch,
-      o.decision?.executable);
+      o.decision?.executable, { noAccess: [stateDir], noWrite: [path.resolve(SCRIPT_DIR, "..")] });
     launcher = writeWorkerLauncher(sid, o.cli, sandbox.launcher, "", workerHooksDir, spawnEnv);
     spawnCwd = bootSpawnCwd;
   } else {
@@ -1336,12 +1438,26 @@ async function main(argv: string[]): Promise<never> {
     // #1162 G2b: after readiness, publish the sealed worker's metadata once.
     if (spawned) publishAgentMeta(sid, o.cli, path.join(env.AIGENTRY_SESSIONS_ROOT || path.join(os.homedir(), ".aigentry", "sessions"), sid));
     if (!prepareEffectiveRef(o, d)) process.exit(3);
+    const stage = path.join(env.AIGENTRY_SESSIONS_ROOT || path.join(os.homedir(), ".aigentry", "sessions"), sid);
+    // #1170: mint the envelope and put its trailer in the ref BEFORE staging, so it lands
+    // in the worker's read-only copy; refHash above stays the original ref's.
+    const pinned = pinReportAttempt(stage, sid);
+    if (pinned) {
+      d.report = mintRequest();
+      appendRefTrailer(d, renderRefTrailer(d.report, { task: o.taskId, sid, attempt: pinned.attempt }));
+    }
     try {
       // Stage A, like prepareEffectiveRef: the message is built from the verified
       // staged path HERE, before the durable commit, so the transport call itself
       // stays infallible.
-      const staged = stageWorkerRef(path.join(env.AIGENTRY_SESSIONS_ROOT || path.join(os.homedir(), ".aigentry", "sessions"), sid), sid, o.taskId, d.effRef);
+      const staged = stageWorkerRef(stage, sid, o.taskId, d.effRef);
       d.refPrompt = buildContextRefPrompt(staged);
+      // #1170: the ref must have landed in the very attempt the envelope names.
+      if (pinned) {
+        const after = pinReportAttempt(stage, sid);
+        if (!after || after.attempt !== pinned.attempt || after.hash !== pinned.hash) throw new Error("REPORT_ATTEMPT_CHANGED");
+        d.reportBinding = after;
+      }
     } catch (e) {
       die(`dispatch.sh: SANDBOX_REF_REFUSED: ${String(e)}`, 78);
     }

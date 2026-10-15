@@ -21,6 +21,9 @@ import path from "node:path";
 const MANIFEST = [
   // ---- bin/** — `git ls-files bin`, complete. T96 assertion 4 pins this to the tree.
   "bin/ask.sh",
+  "bin/context-compact.sh",
+  "bin/context-handoff.mjs",
+  "bin/context-handoff.sh",
   "bin/boot-prepare.mjs",
   // #751: bin/session-probe.py's read-only current-viewport adapter module. It is imported
   // as a SIBLING from the probe's own directory, so a workspace that holds the probe
@@ -60,6 +63,7 @@ const MANIFEST = [
   "bin/policy.py",
   // #1166 U1: read-only capture inventory wrapper; resolves dist like hook-prompt-submit.mjs.
   "bin/request-capture-inventory.mjs",
+  "bin/report-outbox-read.py",
   "bin/session-cleanup.sh",
   "bin/session-comms-auditor.sh",
   "bin/session-layout.py",
@@ -89,6 +93,7 @@ const MANIFEST = [
   "docs/model-profiles/model-catalog.json",
   // #1181: orchestrator-boot usage and init guidance cite this path. Exact leaf only.
   "docs/setup/orchestrator-boot.md",
+  "docs/setup/worker-reports.md",
   "docs/templates/dispatch-ref-checklist.md",
   "docs/templates/dispatch-ref-template.md",
 
@@ -99,6 +104,7 @@ const MANIFEST = [
 
   ".claude/settings.json",
   ".claude/hooks/post-dispatch-verify-reminder.sh",
+  ".claude/hooks/session-start-compact.sh",
 
   "tooling/dispatch-prelude/README.md",
   "tooling/dispatch-prelude/generator.sh",
@@ -135,6 +141,7 @@ const GOVERNANCE_ROOTS = [
   "docs/model-profiles/",
   "docs/rules.md",
   "docs/setup/orchestrator-boot.md",
+  "docs/setup/worker-reports.md",
   "docs/templates/",
   ".agents/",
   ".claude/",

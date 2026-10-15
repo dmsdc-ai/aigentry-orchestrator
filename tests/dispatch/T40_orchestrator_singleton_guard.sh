@@ -56,6 +56,12 @@ export AIGENTRY_SHIM_SCRIPT_DIR="$BOOT_FIXTURE/bin" AIGENTRY_HOME="$BOOT_FIXTURE
 export ORCHESTRATOR_CLI=claude ORCHESTRATOR_SID=orchestrator TELEPTY_PORT=3848
 # The complete, benign, explicit plan (#1181; see header). ORCHESTRATOR_SID is set per call.
 export AIGENTRY_BOOT_PLAN=1 AIGENTRY_BOOT_PERMISSION='approval=manual' AIGENTRY_BOOT_HISTORY=new
+# #1201: this file pins argv. The handoff step is T135's subject: it is switched off here, and
+# HOME is a scratch dir with every store override unset, so the operator's real transcript
+# stores (~/.claude, ~/.codex, ~/.gemini, ~/.grok) are never scanned whatever the switch does.
+export AIGENTRY_HANDOFF=off HOME="$T_TMP/scratch-home"
+mkdir -p "$HOME"
+unset CLAUDE_CONFIG_DIR CODEX_HOME GEMINI_CLI_HOME CLAUDE_CODE_SESSION_ID
 # plan_argv <sid> — the exact exec argv that plan produces, one element per line.
 plan_argv() { printf '%s\n' telepty allow --id "$1" --auto-restart claude --permission-mode manual; }
 cd "$BOOT_FIXTURE"

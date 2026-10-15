@@ -1,0 +1,7 @@
+{"type":"system","content":"CANARY-GROK-SYSTEM","id":"g0"}
+{"type":"user","content":"CH-GROK-REQ-1 first grok request","prompt_index":0,"id":"g1"}
+{"type":"reasoning","content":"","summary":[{"type":"summary_text","text":"CANARY-GROK-REASONING"}],"encrypted_content":"CANARY-GROK-ENCRYPTED","id":"g2","status":"completed"}
+{"type":"assistant","content":[{"type":"text","text":"CH-GROK-STATUS-OLD"}],"prompt_index":0,"id":"g3","status":"completed"}
+{"type":"tool_result","content":"CANARY-GROK-TOOLRESULT","id":"g4"}
+{"type":"user","content":[{"type":"text","text":"CH-GROK-REQ-LAST continue grok work"}],"prompt_index":1,"id":"g5"}
+{"type":"assistant","content":"CH-GROK-STATUS: grok status line","prompt_index":1,"id":"g6","status":"completed"}

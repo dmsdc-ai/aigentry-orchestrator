@@ -337,6 +337,7 @@ test("admitted seeding keeps wx flag, 0600/0700 modes, and writes only under the
   assert.deepEqual(r.writes.map(w => ({ p: w.p, mode: w.mode, flag: w.flag })), [
     { p: `${home}/.claude/.credentials.json`, mode: 0o600, flag: "wx" },
     { p: `${home}/.claude/.claude.json`, mode: 0o600, flag: "wx" },
+    { p: `${home}/.claude/settings.json`, mode: 0o600, flag: "wx" },
   ]);
   assert.ok(r.mkdirs.every(m => m.mode === 0o700 && m.recursive === true));
   assert.deepEqual(r.hostWrites, [], "no write may land under the host home");

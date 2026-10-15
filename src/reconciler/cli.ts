@@ -1403,6 +1403,22 @@ function main(argv: string[]): void {
     if (sweep.error || (sweep.status ?? 1) !== 0) log("ERR report-sweep non-zero (continuing)");
   }
 
+  // --- step 0b3: report pump (#1170) — the broker for CONFINED workers, which cannot
+  // reach telepty: captures each envelope-valid item from the sealed attempt's outbox,
+  // records it and notifies its destination on a durable schedule. Called as the
+  // compiled entrypoint next to this file (no bash), so each tick loads the current
+  // dist. Act-only and best-effort, as step 0b. AIGENTRY_REPORT_PUMP=0 disables it.
+  if (DRY_RUN === 0 && (env.AIGENTRY_REPORT_PUMP || "1") !== "0") {
+    const pump = spawnSync(process.execPath, [fileURLToPath(new URL("../tracker/cli.js", import.meta.url)), "report-pump", "--once"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      env,
+      timeout: 300_000,
+    });
+    for (const line of readLines((pump.stdout ?? "") + (pump.stderr ?? ""))) log(line);
+    if (pump.error || (pump.status ?? 1) !== 0) log("ERR report-pump non-zero (continuing)");
+  }
+
   // --- step 0c: PEER-LANE comms auditor (#533 Phase 1) — tail telepty's peer-inject
   // log, classify each non-orch↔non-orch inject, reconcile round counters, and
   // escalate violations via an orchestrator HOLD (warn-mode). Act-only. ---

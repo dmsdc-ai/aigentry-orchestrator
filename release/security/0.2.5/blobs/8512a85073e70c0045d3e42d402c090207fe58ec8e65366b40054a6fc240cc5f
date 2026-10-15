@@ -1,0 +1,15 @@
+# Exact finding disposition
+
+Commit: `78e12076f154b9bf9cd8ab38f7ab070ebcdf6609`. Fingerprint: `e3307e7a4b1080c98ea00aff38c59b69fff686af20e93e81cbf9e7ca595cfdea`.
+
+Controller technical disposition: eligible for this exact source and documented local operator boundary; not a zero-finding or security completion claim.
+
+The normal registry read is from state_dir()/active.json, a fixed basename under the operator-selected state root. Parsed content is validated before use; no SID or ref controls the pathname.
+
+Trust boundary: DISPATCH_STATE_DIR is host configuration; dispatch record fields are lower-trust data but do not enter this path.
+
+Remaining limits: A symlinked or replaced active.json is not excluded by this code; operator state-directory ownership is an environmental requirement.
+
+Source citations: `bin/dispatch-registry.py:148-164`, `bin/dispatch-registry.py:362-377`.
+
+Existing tests are cited as source only; independent reviewer ran no tests.

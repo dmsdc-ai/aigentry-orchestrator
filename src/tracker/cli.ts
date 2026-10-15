@@ -26,6 +26,7 @@ import { fileURLToPath } from "node:url";
 
 import { registryEnvironment, registryInvocation } from "../dispatch/registry-command.js";
 
+import { defaultPumpDeps, pumpOnce, reportAck, reportStatus, SID_RE, type PumpDeps } from "../report/pump.js";
 import { cmdReportSweep } from "./report-sweep.js";
 import { USAGE } from "./usage.js";
 
@@ -1015,6 +1016,92 @@ function cmdPrune(): void {
   process.exit(registryRun(["prune", "--older-than-seconds", "86400"]));
 }
 
+// ── #1170 report pump / ack / status ────────────────────────────────────────
+// Pure node + the registry + the telepty CLI: none of the `check` helpers above
+// (bash, curl, pmset, telepty-auth.sh) is reached from these three commands.
+function reportPumpDeps(): PumpDeps {
+  return defaultPumpDeps({ stateDir: STATE_DIR, registryScript: DISPATCH_REGISTRY_PY, telepty: TELEPTY,
+    orchestratorSid: ORCH_SID, nowIso: NOW_OVERRIDE });
+}
+
+function reportUsage(cmd: string): number {
+  process.stderr.write(`dispatch-tracker: ${cmd}: invalid_argument\n` + USAGE + "\n");
+  return 4;
+}
+
+/** `report-pump [--once | --loop <seconds>] [--sid <sid>] [--capture-only]` */
+function cmdReportPump(flags: string[]): number {
+  let loop = 0;
+  let mode = "";
+  let sid = "";
+  let captureOnly = false;
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i]!;
+    if (f === "--once" && !mode) mode = "once";
+    else if (f === "--loop" && !mode && /^[1-9][0-9]{0,4}$/.test(flags[i + 1] ?? "")) { mode = "loop"; loop = Number(flags[++i]); }
+    else if (f === "--sid" && !sid && SID_RE.test(flags[i + 1] ?? "")) sid = flags[++i]!;
+    else if (f === "--capture-only" && !captureOnly) captureOnly = true;
+    else return reportUsage("report-pump");
+  }
+  for (;;) {
+    const res = pumpOnce(reportPumpDeps(), { ...(sid ? { sid } : {}), captureOnly });
+    for (const line of res.lines) process.stdout.write(`${nowIso()} ${line}\n`);
+    const errors = Object.entries(res.errors).map(([k, v]) => `${k}:${v.join(",")}`);
+    process.stdout.write(`report-pump: rows=${res.rows} captured=${res.captured} capture_failed=${res.captureFailed} ` +
+      `notices=${res.notices} legacy_marked=${res.legacyMarked} errors=${errors.length ? errors.join(";") : "none"}\n`);
+    const rc = !res.ok ? 9 : errors.length || res.captureFailed ? 3 : 0;
+    if (mode !== "loop") return rc;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, loop * 1000);
+  }
+}
+
+/** `report-ack --dispatch-id D --item K --sha256 H --verdict V` */
+function cmdReportAck(flags: string[]): number {
+  // The ACK principal is the registry writer domain; a worker session never reviews.
+  if (env.AIGENTRY_WORKER_SESSION) {
+    process.stderr.write("dispatch-tracker: report-ack is orchestrator-only — refusing in a worker session\n");
+    return 4;
+  }
+  const v: Record<string, string> = {};
+  for (let i = 0; i < flags.length; i += 2) {
+    const name = flags[i]!;
+    const value = flags[i + 1];
+    if (!["--dispatch-id", "--item", "--sha256", "--verdict"].includes(name) || value === undefined || name in v) {
+      return reportUsage("report-ack");
+    }
+    v[name] = value;
+  }
+  if (Object.keys(v).length !== 4) return reportUsage("report-ack");
+  const claimed = env.TELEPTY_SESSION_ID && SID_RE.test(env.TELEPTY_SESSION_ID) ? env.TELEPTY_SESSION_ID : null;
+  const r = reportAck({ dispatchId: v["--dispatch-id"]!, item: v["--item"]!, sha256: v["--sha256"]!,
+    verdict: v["--verdict"]!, byClaimed: claimed }, reportPumpDeps());
+  process.stdout.write(r.stdout);
+  return r.status;
+}
+
+/** `report-status [--json]`: 0 healthy, 3 degraded, 9 registry unreadable. */
+function cmdReportStatus(flags: string[]): number {
+  if (flags.length > 1 || (flags.length === 1 && flags[0] !== "--json")) return reportUsage("report-status");
+  const { code, doc } = reportStatus(reportPumpDeps());
+  if (!doc) {
+    process.stderr.write("dispatch-tracker: report-status: registry_error\n");
+    return code;
+  }
+  if (flags[0] === "--json") {
+    process.stdout.write(JSON.stringify(doc) + "\n");
+    return code;
+  }
+  const h = doc.health;
+  process.stdout.write(`report-pump: last_pass=${h?.last_pass_at ?? "never"} last_ok=${h?.last_ok_at ?? "never"} ` +
+    `consecutive_failures=${h?.consecutive_failures ?? 0} degraded=${doc.degraded ? doc.degraded_reasons.join(",") : "no"}\n`);
+  for (const r of doc.records) {
+    process.stdout.write(`${pad(r.sid, 40)} ${r.dispatch_id} ${pad(r.resolution, 16)} final=${r.current_final ?? "-"} ` +
+      `pending=${r.pending.length ? r.pending.join(",") : "-"}\n`);
+  }
+  if (doc.records_truncated) process.stdout.write(`… ${doc.records_truncated} more (use --json)\n`);
+  return code;
+}
+
 function usage(stream: NodeJS.WriteStream): void {
   stream.write(USAGE + "\n");
 }
@@ -1046,6 +1133,15 @@ function main(argv: string[]): void {
       void cmdReportSweep(STATE_DIR, REPO_DIR, NOW_OVERRIDE, DISPATCH_REGISTRY_PY, rest[0] === "--json").then((rc) => {
         if (rc !== 0) process.exit(rc);
       });
+      return;
+    case "report-pump":
+      process.exitCode = cmdReportPump(rest);
+      return;
+    case "report-ack":
+      process.exitCode = cmdReportAck(rest);
+      return;
+    case "report-status":
+      process.exitCode = cmdReportStatus(rest);
       return;
     case "-h":
     case "--help":

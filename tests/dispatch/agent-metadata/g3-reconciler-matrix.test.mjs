@@ -14,6 +14,7 @@ const BASELINE_NON_WH = [
   "dispatch-registry.py list --live --fields assigned.sid,lifecycle.state,ref_path,re_dispatch_count",
   "session-probe.py --sid s1", "policy.py --status delivered --state -",
   "session-probe.py --sid s2", "policy.py --status delivered --state -",
+  "dispatch-registry.py report-list",
   "telepty list --json",
   "dispatch-registry.py list --not-retired --fields assigned.sid",
   "dispatch-registry.py list --keep-alive --fields assigned.sid",

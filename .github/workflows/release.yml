@@ -1031,7 +1031,7 @@ jobs:
         env:
           RELEASE_VERSION: ${{ steps.identity.outputs.version }}
           # Replace only after maintainer review of exact portable policy bytes and exception rationale.
-          RELEASE_SECURITY_POLICY_SHA256: 0fac7d3941a49038d4a95ff335c9d651f5ba741eeb94d17eda393cd7b1de29ee
+          RELEASE_SECURITY_POLICY_SHA256: 33ba90d4dac9a34b00bbc8fd8106d5e1ad2d9add38f1472efe2154f6c25d6d17
           RELEASE_SECURITY_COMMIT: ${{ github.sha }}
         run: node scripts/release-admission.mjs --root "$GITHUB_WORKSPACE" --version "$RELEASE_VERSION"
 
@@ -1078,6 +1078,15 @@ jobs:
         run: npm ci
       - name: Install jq (a hard dependency of init, checked at step 1)
         run: command -v jq || sudo apt-get install -y jq
+        if: matrix.os == 'ubuntu-latest'
+      # #652: the real sandbox-runtime's Linux dependencies. The Linux live confinement preflight in
+      # tests/session/claude-worker-oauth.test.ts registers only where they are all present.
+      - name: Install the Linux sandbox-runtime dependencies (bubblewrap, socat, ripgrep)
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap socat ripgrep
+        if: matrix.os == 'ubuntu-latest'
+      # #652: measured on ubuntu-latest, apparmor_restrict_unprivileged_userns=1 makes bwrap fail loopback RTM_NEWADDR (EPERM).
+      - name: Let bubblewrap configure loopback (lift the AppArmor unprivileged-userns restriction)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
         if: matrix.os == 'ubuntu-latest'
       - name: Run the regression suite
         run: npm test

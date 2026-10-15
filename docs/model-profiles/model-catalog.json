@@ -1,5 +1,5 @@
 {
-  "schema": "aigentry-model-catalog/1",
+  "schema": "aigentry-model-catalog/2",
   "as_of": "2026-09-27",
   "status": "dated bootstrap: an observation of public documentation at T, never proof of current, latest or account availability",
   "evidence": {
@@ -26,7 +26,12 @@
       },
       "auto_effort_never": ["max", "ultra", "ultracode"],
       "policy_incumbent": "claude-opus-5",
-      "family_pattern": "^claude-(fable|opus|sonnet|haiku)-"
+      "family_prefixes": [
+        {"prefix": "claude-fable-", "tier": "fable"},
+        {"prefix": "claude-opus-", "tier": "opus"},
+        {"prefix": "claude-sonnet-", "tier": "sonnet"},
+        {"prefix": "claude-haiku-", "tier": "haiku"}
+      ]
     },
     "codex": {
       "provider": "openai",
@@ -41,7 +46,7 @@
       },
       "auto_effort_never": ["max", "ultra", "ultracode"],
       "policy_incumbent": "gpt-6-astra",
-      "family_pattern": null
+      "family_prefixes": null
     }
   },
   "surfaces": {
@@ -51,11 +56,11 @@
       "sha256": "404372e69b13defcb4598bb8a8cfbc359c0c31384d809daf53d75c3ca9316bc3",
       "scope": "Anthropic-operated platforms; retirement dates are 'not sooner than' commitments, recorded as retire_not_before (a floor, never retire_on); API lifecycle is not evidence of Claude Code CLI or account support",
       "rows": [
-        {"model": "claude-fable-5-1", "tier": "fable", "lifecycle": "current", "default_effort": "high", "retire_on": null, "retire_not_before": "2027-09-01", "labels": []},
+        {"model": "claude-fable-5-1", "tier": "fable", "lifecycle": "current", "default_effort": "high", "retire_on": null, "retire_not_before": "2027-09-01", "labels": [], "worker_never": true},
         {"model": "claude-opus-5-5", "tier": "opus", "lifecycle": "current", "default_effort": "medium", "retire_on": null, "retire_not_before": "2027-09-22", "labels": ["documented-default-pick"]},
         {"model": "claude-sonnet-5", "tier": "sonnet", "lifecycle": "current", "default_effort": "high", "retire_on": null, "retire_not_before": "2027-06-30", "labels": []},
         {"model": "claude-haiku-4-5-20251001", "tier": "haiku", "lifecycle": "current", "default_effort": "unsupported", "retire_on": null, "retire_not_before": "2026-10-15", "labels": []},
-        {"model": "claude-fable-5", "tier": "fable", "lifecycle": "legacy", "default_effort": null, "retire_on": null, "labels": []},
+        {"model": "claude-fable-5", "tier": "fable", "lifecycle": "legacy", "default_effort": null, "retire_on": null, "labels": [], "worker_never": true},
         {"model": "claude-opus-5", "tier": "opus", "lifecycle": "legacy", "default_effort": "high", "retire_on": null, "labels": []},
         {"model": "claude-opus-4-8", "tier": "opus", "lifecycle": "legacy", "default_effort": null, "retire_on": null, "labels": []},
         {"model": "claude-opus-4-7", "tier": "opus", "lifecycle": "legacy", "default_effort": "xhigh", "retire_on": null, "labels": []},

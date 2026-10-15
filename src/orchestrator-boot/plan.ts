@@ -24,9 +24,9 @@
 //      is the array stored beside them. `bypassPermissions` for claude and
 //      `bypassPermissions` for grok are two unrelated lookups that happen to spell the
 //      same word.
-//   4. NEVER CALLING A HANDOFF A RESUME. Only the provider's own measured history flags
-//      appear here. There is no prompt-file, transcript or context-injection mechanism in
-//      this module at all.
+//   4. NEVER CALLING A HANDOFF A RESUME. Native resume is never called a handoff. A handoff
+//      is delivered only as tokens from provider-capabilities.ts `handoff` data that point
+//      at a file; this module reads no transcript (task 1201, D-1).
 import {
   type AxisName,
   type AxisValue,
@@ -40,6 +40,7 @@ import {
   findCapability,
   findHistory,
 } from "./provider-capabilities.js";
+import type { HandoffDelivery } from "../context-handoff/types.js";
 
 // ── the env schema, in one place ────────────────────────────────────────────
 // ONE deterministic spelling per field, no aliases, no comma lists. The per-axis field is
@@ -391,8 +392,92 @@ export function providerArgv(plan: BootPlan): string[] {
  * `allowArgs[0]`), the telepty lifecycle is untouched, and the singleton guard's match
  * token (`--id <sid>`) is still the same token this boot will carry.
  */
-export function buildExecArgv(plan: BootPlan): string[] {
-  return ["telepty", "allow", "--id", plan.sid, "--auto-restart", ...providerArgv(plan)];
+export function buildExecArgv(plan: BootPlan, ref?: HandoffRef): string[] {
+  // D-5: a handoff rides only on a NEW conversation. With no ref the argv is byte-identical
+  // to the pre-handoff one.
+  const handoff = ref === undefined || plan.history.kind !== "new" ? [] : handoffArgv(plan.provider, ref);
+  return ["telepty", "allow", "--id", plan.sid, "--auto-restart", ...providerArgv(plan), ...handoff];
+}
+
+// ── context handoff (task 1201, SPEC §6.2) ──────────────────────────────────
+
+/**
+ * What this module knows of a resolved handoff: the file it points at, the one-line
+ * first-turn prompt, and the source it names. Structural, so the engine's own ref
+ * (src/context-handoff) is accepted as-is and this file still imports nothing from it.
+ */
+export interface HandoffRef {
+  readonly file: string;
+  readonly line: string;
+  readonly source: { readonly cli: string; readonly sessionId: string; readonly lastActivity: string };
+}
+
+/** The review screen's view of the handoff scan. Absent = not scanned yet (it runs after the guard). */
+export type HandoffPreview = { readonly kind: "found"; readonly ref: HandoffRef } | { readonly kind: "none"; readonly reason: string };
+
+const HANDOFF_LINE_MAX_BYTES = 400;
+
+/**
+ * Why a ref may not reach the argv, or null. The same floor as baseFieldError — no control
+ * character, no leading `-` — because these tokens cross back to the shim as
+ * newline-delimited text too, plus §4.1's bound on the first-turn line.
+ */
+export function handoffRefusal(ref: HandoffRef): string | null {
+  // The source fields are printed on the review screen and the boot line, never exec'd.
+  if ([ref.source.cli, ref.source.sessionId, ref.source.lastActivity].some(hasControlChar)) return "the source names a control character";
+  if (ref.file === "" || hasControlChar(ref.file) || ref.file.startsWith("-")) return "the handoff path is empty, has a control character or starts with '-'";
+  if (ref.line === "" || hasControlChar(ref.line) || ref.line.startsWith("-")) return "the first-turn line is empty, has a control character or starts with '-'";
+  if (Buffer.byteLength(ref.line, "utf8") > HANDOFF_LINE_MAX_BYTES) return `the first-turn line is longer than ${HANDOFF_LINE_MAX_BYTES} bytes`;
+  return null;
+}
+
+/**
+ * The delivery tokens for one provider, from its `handoff` data only. Pointer-only (D-2): the
+ * path and the one-line prompt, never the content. An `owed` channel contributes nothing,
+ * and a ref that fails handoffRefusal contributes nothing at all.
+ */
+export function handoffArgv(cap: ProviderCapability, ref: HandoffRef): string[] {
+  if (handoffRefusal(ref) !== null) return [];
+  const tokens: string[] = [];
+  const { content, firstTurn } = cap.handoff;
+  const inSystemPrompt = content.kind === "system-file" && content.status === "measured";
+  if (inSystemPrompt) tokens.push(content.flag, ref.file);
+  if (firstTurn.status === "measured") {
+    // §6.2: with the content already in the system prompt the model is told so, not asked to load it.
+    const line = inSystemPrompt ? systemPromptFirstTurn(ref) : ref.line;
+    if (handoffRefusal({ ...ref, line }) !== null) return tokens;
+    if (firstTurn.placement === "flag-value" && firstTurn.flag !== null) tokens.push(firstTurn.flag, line);
+    else if (firstTurn.placement === "positional") tokens.push(line);
+  }
+  return tokens;
+}
+
+/** The §6.2 first-turn line for a provider that already holds the handoff in its system prompt. */
+export function systemPromptFirstTurn(ref: HandoffRef): string {
+  return (
+    `aigentry handoff: continuing from ${ref.source.cli} session ${ref.source.sessionId.slice(0, 8)}, last activity ` +
+    `${ref.source.lastActivity}. The handoff (${ref.file}) is already in your system prompt; reply with one line ` +
+    "naming what you are continuing and wait for the user."
+  );
+}
+
+/** latest.json's `delivery` object (W's optional resolveHandoff input), from the same data. */
+export function handoffDeliveryRecord(cap: ProviderCapability): HandoffDelivery | undefined {
+  // Integration (1201): the engine's record names the CLI with its closed union; a provider key
+  // outside it (none exists today) yields no delivery record rather than a mislabelled one.
+  const cli = cap.key;
+  if (cli !== "claude" && cli !== "codex" && cli !== "gemini" && cli !== "grok") return undefined;
+  const c = cap.handoff.content;
+  const content = c.kind === "turn-1-read" ? "first-turn-read" : c.status === "measured" ? "system-file" : "none";
+  return { cli, content, first_turn: cap.handoff.firstTurn.status };
+}
+
+/** `<cli>:system-file+first-turn` and its subsets, or `<cli>:unmeasured` (§7's delivery field). */
+export function handoffDeliveryLabel(cap: ProviderCapability): string {
+  const parts: string[] = [];
+  if (cap.handoff.content.kind === "system-file" && cap.handoff.content.status === "measured") parts.push("system-file");
+  if (cap.handoff.firstTurn.status === "measured") parts.push("first-turn");
+  return `${cap.key}:${parts.length > 0 ? parts.join("+") : "unmeasured"}`;
 }
 
 // ── the env plan (non-TTY) ──────────────────────────────────────────────────
@@ -563,7 +648,7 @@ export function parseEnvPlan(env: Readonly<Record<string, string | undefined>>, 
  * The review screen's body and `--dry-run`'s plan report, as lines. One function so the two
  * cannot describe the same plan differently.
  */
-export function describePlan(plan: BootPlan): string[] {
+export function describePlan(plan: BootPlan, handoff?: HandoffPreview): string[] {
   const cap = plan.provider;
   const lines: string[] = [];
   lines.push(`provider    ${cap.key} — ${cap.displayName}, capabilities measured at ${cap.measuredVersion} (provenance: ${cap.provenance})`);
@@ -590,7 +675,17 @@ export function describePlan(plan: BootPlan): string[] {
   const support = findHistory(cap, plan.history.kind);
   const selector = plan.history.kind === "selected" ? ` '${plan.history.selector}'` : "";
   lines.push(`history     ${plan.history.kind}${selector} — ${support?.scope ?? ""}`);
-  lines.push(`            native resume is NOT a context handoff: the provider reopens its own session, nothing is injected here.`);
+  lines.push(`            native resume is NOT a context handoff: the provider reopens its own session. A handoff is derived from the previous transcript and delivered as a file (below).`);
+  const delivery = handoffDeliveryLabel(cap);
+  const backstop = delivery.endsWith(":unmeasured") ? " — backstop only (AGENTS.md)" : "";
+  if (plan.history.kind !== "new") lines.push(`handoff     not run — native resume chosen (the handoff runs only on history=new)`);
+  else if (handoff === undefined)
+    lines.push(`handoff     scanned after the singleton guard (claude/codex/gemini/grok stores, read-only) — delivery ${delivery}${backstop}`);
+  else if (handoff.kind === "none") lines.push(`handoff     none — ${handoff.reason}`);
+  else
+    lines.push(
+      `handoff     ${handoff.ref.source.cli} session ${handoff.ref.source.sessionId.slice(0, 8)}, last activity ${handoff.ref.source.lastActivity} → ${handoff.ref.file} — delivery ${delivery}${backstop}`,
+    );
   lines.push(`cwd         ${plan.inheritedCwd}   (INHERITED — the shell execs the bridge and keeps this cwd. No provider cwd flag is passed: ${cap.cwd.note})`);
   for (const w of cap.warnings) lines.push(`warning     ${w}`);
   return lines;

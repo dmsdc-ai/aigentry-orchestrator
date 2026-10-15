@@ -78,11 +78,14 @@ const env = {};
 for (const [key, value] of Object.entries(process.env)) {
   if (/^(https?_proxy|all_proxy|no_proxy)$/i.test(key) || /^(NODE_EXTRA_CA_CERTS|SSL_CERT_FILE|SSL_CERT_DIR|REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE)$/.test(key)) env[key] = value;
 }
-for (const key of ['HOME', 'AIGENTRY_HOME', 'TMPDIR', 'TMP', 'TEMP', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_RUNTIME_DIR', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_TMPDIR', 'TELEPTY_HOME', 'npm_config_cache', 'AIGENTRY_ROLE_SANDBOX_ROOT', 'AIGENTRY_STATE_DIR']) {
+for (const key of ['HOME', 'AIGENTRY_HOME', 'TMPDIR', 'TMP', 'TEMP', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_RUNTIME_DIR', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'GEMINI_CLI_HOME', 'CLAUDE_CODE_TMPDIR', 'TELEPTY_HOME', 'npm_config_cache', 'AIGENTRY_ROLE_SANDBOX_ROOT', 'AIGENTRY_STATE_DIR']) {
   env[key] = path.join(fixture, key.toLowerCase());
   fs.mkdirSync(env[key]);
 }
 env.PATH = bin;
+// #1201: this file pins argv; the context handoff is T135's subject. Every transcript-store root
+// above (HOME, CODEX_HOME, CLAUDE_CONFIG_DIR, GEMINI_CLI_HOME) is an empty fixture dir as well.
+env.AIGENTRY_HANDOFF = 'off';
 env.AIGENTRY_CONTROL_WORKSPACE = ws;
 env.AIGENTRY_TARGET_CWD = ws;
 env.ORCHESTRATOR_SID = sid;
@@ -125,7 +128,8 @@ const bootModule = ['cli.js', 'usage.js', 'plan.js', 'wizard.js', 'provider-capa
 // #1181 v4: the doc usage.ts cites is now shipped AND init-placed, so it belongs in the
 // immutability snapshot beside the rest of the governance surface.
 const BOOT_DOC = 'docs/setup/orchestrator-boot.md';
-const tracked = ['package.json', 'bin/init/cli.mjs', 'bin/init/manifest.mjs', BOOT_DOC, shimRel, 'bin/lib/node-shim.sh', 'bin/lib/telepty-auth.sh', ...bootModule];
+const REPORT_DOC = 'docs/setup/worker-reports.md';
+const tracked = ['package.json', 'bin/init/cli.mjs', 'bin/init/manifest.mjs', BOOT_DOC, REPORT_DOC, shimRel, 'bin/lib/node-shim.sh', 'bin/lib/telepty-auth.sh', ...bootModule];
 for (const rel of bootModule) {
   assert.ok(fs.existsSync(path.join(root, rel)),
     `GAP: the installed package is missing ${rel}. The boot module cannot import, so no boot assertion below can fail for the right reason.`);
@@ -232,10 +236,12 @@ test('exact installed boot selector acceptance (independent T134 A-I)', async t 
       // did not. Nothing below is a source check.
       const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
       assert.ok(pkg.files.includes(BOOT_DOC), `the installed package.json does not ship ${BOOT_DOC}`);
+      assert.ok(pkg.files.includes(REPORT_DOC), `the installed package.json does not ship ${REPORT_DOC}`);
       const manifest = await import(pathToFileURL(path.join(root, 'bin/init/manifest.mjs')).href);
-      assert.deepEqual(manifest.MANIFEST.filter(p => p.startsWith('docs/setup/')), [BOOT_DOC],
-        'init must place exactly one docs/setup leaf');
+      assert.deepEqual(manifest.MANIFEST.filter(p => p.startsWith('docs/setup/')), [BOOT_DOC, REPORT_DOC],
+        'init must place the two named docs/setup leaves');
       assert.ok(manifest.GOVERNANCE_ROOTS.includes(BOOT_DOC));
+      assert.ok(manifest.GOVERNANCE_ROOTS.includes(REPORT_DOC));
       assert.ok(!manifest.GOVERNANCE_ROOTS.includes('docs/setup/'),
         'docs/setup/ as a root would require MANIFEST entries for the other shipped setup docs');
 
@@ -243,6 +249,7 @@ test('exact installed boot selector acceptance (independent T134 A-I)', async t 
       const placed = path.join(ws, BOOT_DOC);
       assert.ok(fs.existsSync(placed), `init did not place ${BOOT_DOC} into the workspace`);
       assert.equal(hash(placed), before[BOOT_DOC], 'the placed doc differs from the shipped one');
+      assert.equal(hash(path.join(ws, REPORT_DOC)), before[REPORT_DOC], 'the report guide differs from the shipped one');
       assert.equal(fs.statSync(placed).mode & 0o777, 0o644, 'the placed doc is not 0644');
       // The usage text cites this path; on an installed host it must resolve to content.
       assert.ok(fs.readFileSync(placed, 'utf8').length > 0, 'the placed doc is empty');

@@ -14,6 +14,7 @@ import {
   mkdirSync,
   writeFileSync,
   readFileSync,
+  realpathSync,
   rmSync,
   existsSync,
   statSync,
@@ -70,6 +71,58 @@ function writeCliShims(binDir: string): void {
   }
 }
 
+// #1195 — win32 refuses to unlink a running (or still-mapped) executable, so cleanup
+// must not race the fake CLI. The fake is not the test's child: boot-prepare (the
+// test's spawnSync child) launches it for the version probe, so its pid is found by
+// image path, waited out, and only then is the tree removed. rmSync's EBUSY/EPERM
+// retry is the second line (image lock lingering past exit), never the only one.
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+// Synchronous so every test's `finally { cleanup(); }` stays as is. Bounded: a fake
+// that outlives the bound is a leak worth failing on, not one to delete around.
+function waitForExit(pids: readonly number[], timeoutMs = 15_000, pollMs = 50): void {
+  const deadline = Date.now() + timeoutMs;
+  const tick = new Int32Array(new SharedArrayBuffer(4));
+  let alive = pids.filter(isAlive);
+  while (alive.length > 0) {
+    if (Date.now() >= deadline) {
+      throw new Error(`waitForExit: pid(s) ${alive.join(", ")} still running after ${timeoutMs} ms`);
+    }
+    Atomics.wait(tick, 0, 0, pollMs);
+    alive = alive.filter(isAlive);
+  }
+}
+
+// win32 only: pids of processes whose image lives under `dir` (the fixture shimbin).
+// Native realpath expands RUNNER~1-style short names to match ExecutablePath; the
+// prefix is passed via env, never spliced into the PowerShell command text.
+function pidsUnder(dir: string): number[] {
+  const sr = process.env["SystemRoot"];
+  if (!sr) throw new Error("pidsUnder: SystemRoot is not set");
+  const r = spawnSync(
+    join(sr, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    ["-NoProfile", "-NonInteractive", "-Command",
+      "Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and " +
+        "$_.ExecutablePath.StartsWith($env:AIGENTRY_1195_PREFIX, [System.StringComparison]::OrdinalIgnoreCase) } | " +
+        "ForEach-Object { $_.ProcessId }"],
+    {
+      env: { ...process.env, AIGENTRY_1195_PREFIX: `${realpathSync.native(dir)}\\` },
+      encoding: "utf8", shell: false, windowsHide: true, timeout: 30_000,
+    },
+  );
+  if (r.error || r.status !== 0) {
+    throw new Error(`pidsUnder: process query failed (${r.error ? r.error.message : `exit ${r.status}`}): ${r.stderr}`);
+  }
+  return r.stdout.split(/\s+/).filter((s) => s !== "").map(Number);
+}
+
 function setupTempHome(): { home: string; targetCwd: string; cleanup: () => void } {
   const root = mkdtempSync(join(tmpdir(), "boot-prepare-431-"));
   const home = join(root, "aig");
@@ -100,7 +153,11 @@ function setupTempHome(): { home: string; targetCwd: string; cleanup: () => void
   return {
     home,
     targetCwd,
-    cleanup: () => rmSync(root, { recursive: true, force: true }),
+    cleanup: () => {
+      if (process.platform === "win32") waitForExit(pidsUnder(join(root, "shimbin")));
+      rmSync(root, { recursive: true, force: true,
+        ...(process.platform === "win32" ? { maxRetries: 10, retryDelay: 100 } : {}) });
+    },
   };
 }
 
@@ -665,5 +722,42 @@ test("551-gemini — AIGENTRY_GEMINI_MODEL overrides boot-prep launcher model", 
     assert.match(execLine!, /-m gemini-test-override\b/);
   } finally {
     cleanup();
+  }
+});
+
+// #1195 — the cleanup wait, measured on every platform (the win32 EBUSY itself needs
+// Windows CI). Same topology as the version probe: the fake is a grandchild whose
+// launcher has already exited, so the test holds only its pid. Detached + stdio
+// ignored so the launcher's spawnSync returns at once and the orphan is reaped by
+// the OS, not left a zombie of this process.
+function spawnLateChild(lifeMs: number): number {
+  const r = spawnSync(process.execPath, ["-e",
+    `const c = require("node:child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, ${lifeMs})"],` +
+      ` { detached: true, stdio: "ignore", windowsHide: true }); c.unref(); process.stdout.write(String(c.pid));`],
+  { encoding: "utf8", timeout: 30_000 });
+  assert.equal(r.status, 0, `launcher exit ${r.status} stderr=${r.stderr}`);
+  const pid = Number(r.stdout);
+  assert.ok(Number.isInteger(pid) && pid > 0, `launcher must print the fake's pid; got ${r.stdout}`);
+  return pid;
+}
+
+test("1195-A — waitForExit returns only after a late-exiting fake child is gone", () => {
+  const pid = spawnLateChild(1_500);
+  try {
+    assert.equal(isAlive(pid), true, "fake must still be running when the wait starts");
+    waitForExit([pid]);
+    assert.equal(isAlive(pid), false, "fake must have exited when the wait returns");
+  } finally {
+    if (isAlive(pid)) process.kill(pid, "SIGKILL");
+  }
+});
+
+test("1195-B — waitForExit is bounded: a fake outliving the bound throws, naming its pid", () => {
+  const pid = spawnLateChild(60_000);
+  try {
+    assert.throws(() => waitForExit([pid], 300), new RegExp(`pid\\(s\\) ${pid} still running after 300 ms`));
+  } finally {
+    if (isAlive(pid)) process.kill(pid, "SIGKILL");
+    waitForExit([pid]);
   }
 });

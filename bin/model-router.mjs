@@ -22,6 +22,14 @@ const args = Object.fromEntries(process.argv.slice(2).reduce((pairs, key, i, all
   if (i % 2 === 0) pairs.push([key, all[i + 1]]);
   return pairs;
 }, []));
+// #1206: role × task class policy. `--class` (dispatch's --task-class) selects the `role.class` row of each
+// section, else the `role` row. The same token shape guards a class and a profile effort token.
+const TOKEN = /^[a-z][a-z0-9-]{0,31}$/;
+const taskClass = args["--class"];
+if (Object.hasOwn(args, "--class") && (typeof taskClass !== "string" || !TOKEN.test(taskClass))) {
+  await new Promise((done) => process.stderr.write("model-router: invalid --class (want ^[a-z][a-z0-9-]{0,31}$)\n", done));
+  process.exit(2);
+}
 const scalar = (s) => s.trim().replace(/^(['"])(.*)\1$/, "$2");
 // Only the profile contract: flat scalars, inline flat maps, and a list of those maps.
 function flatMap(text) {
@@ -38,7 +46,7 @@ function flatMap(text) {
 // argv. Reviewed and accepted, not silenced (same rationale as bin/spawn-telemetry-report.mjs:50):
 // argv here IS the operator (dispatch.sh, which already validated --ref), a task ref or profile
 // may live anywhere, so there is no base path to jail to, and path.resolve() does not satisfy the rule.
-let models = [], table = {}, body = "", failure = "", decision;
+let models = [], table = {}, efforts = {}, fallbacks = {}, body = "", failure = "", decision;
 try {
   const profile = readFileSync(args["--profile"] || process.env.AIGENTRY_ROUTER_PROFILE ||
     fileURLToPath(new URL("../docs/model-profiles/model-routing-profile.md", import.meta.url)), "utf8");
@@ -47,22 +55,29 @@ try {
   let section = "";
   const parsedModels = [];
   let parsedTable = {};
+  const parsedPolicy = { effort: {}, fallback: {} };
   for (const raw of front[1].split(/\r?\n/)) {
     const line = raw.replace(/(^|\s)#.*$/, "").trimEnd(); // YAML comments: '#' at line start or after whitespace
-    const entry = line.match(/^\s+([\w-]+)\s*:\s*(.+)$/); // block-form `  role: label`
+    const entry = line.match(/^\s+([\w.-]+)\s*:\s*(.+)$/); // block-form `  role: label` or `  role.class: label`
     if (!line) continue;
     if (/^models:$/.test(line)) { section = "models"; continue; }
     if (/^default_table:$/.test(line)) { section = "table"; continue; }
+    if (/^role_effort:$/.test(line)) { section = "effort"; continue; }
+    if (/^role_fallback:$/.test(line)) { section = "fallback"; continue; }
     if (/^\s*-\s*\{/.test(line) && section === "models") parsedModels.push(flatMap(line.replace(/^\s*-\s*/, "")));
     else if (/^default_table:/.test(line)) { parsedTable = flatMap(line.slice(line.indexOf(":") + 1)); section = ""; }
     else if (entry && section === "table") parsedTable[entry[1]] = scalar(entry[2]);
+    else if (entry && (section === "effort" || section === "fallback")) parsedPolicy[section][entry[1]] = scalar(entry[2]);
     else if (!/^measured_at:\s*\S/.test(line)) throw new Error("unsupported profile syntax");
   }
   if (!parsedModels.length || parsedModels.some((m) => !m.label || !m.model ||
     !["claude", "codex", "grok", "gemini"].includes(m.cli)) ||
     new Set(parsedModels.map((m) => m.label)).size !== parsedModels.length) throw new Error("invalid profile models");
+  if (Object.values(parsedPolicy.effort).some((token) => !TOKEN.test(token))) throw new Error("invalid profile effort");
   models = parsedModels;
   table = parsedTable;
+  efforts = parsedPolicy.effort;
+  fallbacks = parsedPolicy.fallback;
   body = front[2];
 } catch { failure = "profile missing or invalid"; }
 // C3-a: a confined spawn admits only claude and codex (SANDBOX_CLI_UNSUPPORTED in src/dispatch/cli.ts
@@ -70,6 +85,19 @@ try {
 // allowlist, the role table pick and the cap candidates never name a CLI that spawn would refuse.
 // Without the flag the label router is unchanged for its other callers.
 if (args["--confined"]) models = models.filter((m) => ["claude", "codex"].includes(m.cli));
+// #1206: a section's `role.class` row, else its `role` row, else undefined (own keys only).
+const row = (section) => {
+  for (const key of taskClass === undefined ? [args["--role"]] : [`${args["--role"]}.${taskClass}`, args["--role"]]) {
+    if (Object.hasOwn(section, key)) return section[key];
+  }
+};
+// The row's own list: its table pick, then role_fallback (space-separated labels; unknown or filtered ones
+// skipped). Its effort token applies to these and nothing else; no row → no effort.
+const first = models.find((m) => m.label === row(table));
+const policy = [first, ...String(row(fallbacks) ?? "").split(/\s+/).map((label) => models.find((m) => m.label === label))]
+  .filter(Boolean);
+const effort = row(efforts);
+const withEffort = (entry, m) => (effort !== undefined && policy.includes(m) ? { ...entry, effort } : entry);
 
 if (!failure && args["--ref"]) {
   try {
@@ -107,22 +135,21 @@ if (!failure && args["--ref"]) {
     if (!selected) throw new Error("classifier label not allowed");
     if (typeof reply.reason !== "string" || !reply.reason.trim() ||
       !Number.isFinite(reply.confidence) || reply.confidence < 0 || reply.confidence > 1) throw new Error("invalid classifier response");
-    decision = { cli: selected.cli, model: selected.model, label: selected.label, decided_by: "llm",
-      reason: reply.reason.replace(/[\r\n]+/g, " ").slice(0, 500), confidence: reply.confidence };
+    decision = withEffort({ cli: selected.cli, model: selected.model, label: selected.label, decided_by: "llm",
+      reason: reply.reason.replace(/[\r\n]+/g, " ").slice(0, 500), confidence: reply.confidence }, selected);
   } catch (error) { failure = error instanceof SyntaxError ? "unparsable classifier response" : error.message; }
 }
 if (!decision) {
-  const selected = models.find((m) => m.label === table[args["--role"]]) ||
-    models.find((m) => m.label === "opus-5") || emergency;
-  decision = { cli: selected.cli, model: selected.model, label: selected.label, decided_by: "table",
-    reason: failure || "no task ref; role default", confidence: 0 };
+  const selected = first || models.find((m) => m.label === "opus-5") || emergency;
+  decision = withEffort({ cli: selected.cli, model: selected.model, label: selected.label, decided_by: "table",
+    reason: failure || "no task ref; role default", confidence: 0 }, selected);
   if (failure) process.stderr.write(`model-router: ${failure.replace(/[\r\n]+/g, " ")}; using table\n`);
 }
 // #1084: dispatch's cap fallback order — the role's table pick, then profile order. Emitted only on
 // request so the plain decision shape is unchanged; the profile is parsed here and nowhere else.
+// #1206: role_fallback orders the candidates after the table pick, then profile order (as before).
 if (args["--candidates"]) {
-  const first = models.find((m) => m.label === table[args["--role"]]);
-  decision.candidates = [first, ...models.filter((m) => m !== first)].filter(Boolean)
-    .map(({ cli, model, label }) => ({ cli, model, label }));
+  decision.candidates = [...new Set([...policy, ...models])]
+    .map((m) => withEffort({ cli: m.cli, model: m.model, label: m.label }, m));
 }
 process.stdout.write(JSON.stringify(decision) + "\n");

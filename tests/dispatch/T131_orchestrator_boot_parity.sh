@@ -155,6 +155,9 @@ for _f in orchestrator-boot/boot-record.js session/boot-adapter/launch-config.js
   mkdir -p "$BOOT_FIXTURE/dist/src/$(dirname "$_f")"
   cp "$REPO_ROOT/dist/src/$_f" "$BOOT_FIXTURE/dist/src/$_f"
 done
+# #1201: cli.js also imports the context-handoff engine, whose own imports are its business.
+# Stage the whole compiled tree so the fixture cannot die at import on a list kept here.
+cp -R "$REPO_ROOT/dist/src/." "$BOOT_FIXTURE/dist/src/"
 printf '{"type":"module"}\n' > "$BOOT_FIXTURE/package.json"
 AUTH_LOG="$T_TMP/auth.log"
 printf 'telepty_auth_token() { printf "auth\\n" >> "%s"; printf "fixture-token-T131"; }\n' "$AUTH_LOG" \
@@ -164,6 +167,12 @@ BOOT_CLI="$BOOT_FIXTURE/dist/src/orchestrator-boot/cli.js"
 chmod +x "$BOOT"
 export AIGENTRY_SHIM_SCRIPT_DIR="$BOOT_FIXTURE/bin" AIGENTRY_HOME="$BOOT_FIXTURE/home"
 export ORCHESTRATOR_CLI=claude SINGLETON_SELF_PID=9999 TELEPTY_PORT=3848
+# #1201: this file pins argv. The handoff step is T135's subject: it is switched off here, and
+# HOME is a scratch dir with every store override unset, so the operator's real transcript
+# stores (~/.claude, ~/.codex, ~/.gemini, ~/.grok) are never scanned whatever the switch does.
+export AIGENTRY_HANDOFF=off HOME="$T_TMP/scratch-home"
+mkdir -p "$HOME"
+unset CLAUDE_CONFIG_DIR CODEX_HOME GEMINI_CLI_HOME CLAUDE_CODE_SESSION_ID
 unset _NODE_SHIM_SH_SOURCED
 cd "$BOOT_FIXTURE"
 

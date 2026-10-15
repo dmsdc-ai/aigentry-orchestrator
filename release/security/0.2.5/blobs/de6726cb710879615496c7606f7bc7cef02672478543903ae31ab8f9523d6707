@@ -1,0 +1,15 @@
+# Exact finding disposition
+
+Commit: `78e12076f154b9bf9cd8ab38f7ab070ebcdf6609`. Fingerprint: `bb1fde2350066dfb83c38043135883b9baee491403c1e8ddea77850426d5de03`.
+
+Controller technical disposition: eligible for this exact source and documented local operator boundary; not a zero-finding or security completion claim.
+
+Migration opens the fixed active.json path under the registry lock and parses legacy bytes. The environment chooses only the operator state root; legacy entries do not affect the read path.
+
+Trust boundary: Migration is an operator action; legacy record content is not used to construct the pathname.
+
+Remaining limits: Locking does not authenticate the underlying directory or prevent same-UID path replacement.
+
+Source citations: `bin/dispatch-registry.py:148-164`, `bin/dispatch-registry.py:1417-1437`.
+
+Existing tests are cited as source only; independent reviewer ran no tests.

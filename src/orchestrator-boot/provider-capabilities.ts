@@ -172,6 +172,32 @@ export interface InfoOption {
   readonly detail: string;
 }
 
+/**
+ * How a context handoff reaches this provider (task 1201, SPEC §6.2). DATA ONLY: plan.ts
+ * `handoffArgv` turns it into tokens, and every token is a POINTER — an absolute path to
+ * `<ws>/state/handoff/latest.md`, or the one-line first-turn prompt naming it. Content never
+ * goes on argv (D-2: the argv is logged and is readable from the process table).
+ *
+ * `status` is rule 3 applied to delivery: `owed` means the flag is inferred, not measured
+ * for this provider's orchestrator path, and an owed entry contributes NO token. The boot
+ * then says so on one line and the AGENTS.md backstop is the only channel. Flipping an
+ * entry to `measured` (Phase 0 item P0-6) is the whole of activating it.
+ */
+export interface HandoffChannel {
+  readonly status: "measured" | "owed";
+  readonly evidence: string;
+}
+
+export interface HandoffDelivery {
+  /** `system-file`: the flag takes the file path and the content is in the system prompt at
+   *  turn 0. `turn-1-read`: no content flag; the model reads the file in its first turn. */
+  readonly content:
+    | ({ readonly kind: "system-file"; readonly flag: string } & HandoffChannel)
+    | { readonly kind: "turn-1-read"; readonly evidence: string };
+  /** The auto-submitted first turn: a positional prompt, or a flag followed by the line. */
+  readonly firstTurn: { readonly placement: "positional" | "flag-value"; readonly flag: string | null } & HandoffChannel;
+}
+
 export interface ProviderCapability {
   /** Registry key AND executable basename. Executable-keyed, not vendor-keyed. */
   readonly key: string;
@@ -188,6 +214,8 @@ export interface ProviderCapability {
   readonly info: readonly InfoOption[];
   /** Rendered verbatim on the provider's own screens. */
   readonly warnings: readonly string[];
+  /** Context-handoff delivery (task 1201). See HandoffDelivery. */
+  readonly handoff: HandoffDelivery;
 }
 
 // ── claude 2.1.283 ──────────────────────────────────────────────────────────
@@ -259,6 +287,20 @@ const CLAUDE: ProviderCapability = {
     "claude-help output was captured truncated at exactly 16384 bytes (mid-flag, '--settings <file-or'). Flags after that point are UNMEASURED and none of them are offered here.",
     "'ultracode' is documented elsewhere as an effort level but is NOT printed by 2.1.283's --effort help. It is therefore not offered.",
   ],
+  handoff: {
+    // [measured] on the worker path, not in this capture: the flag sits past the 16384-byte
+    // truncation of claude-help, and SPEC F7 records it as verified end to end.
+    content: {
+      kind: "system-file",
+      flag: "--append-system-prompt-file",
+      status: "measured",
+      evidence:
+        "src/session/boot-adapter/claude.ts:30,39 and bin/boot-prepare.mjs:13-14 (verified end to end under OAuth: " +
+        "`claude --append-system-prompt-file <file> --print …`). Not in the truncated 2.1.283 help capture.",
+    },
+    // [inferred] P0-6: a positional [prompt] that auto-submits in the interactive TUI is not measured.
+    firstTurn: { placement: "positional", flag: null, status: "owed", evidence: "positional [prompt] — inferred; SPEC P0-6 owes the live boot" },
+  },
 };
 
 // ── codex-cli 0.157.1 ───────────────────────────────────────────────────────
@@ -348,6 +390,12 @@ const CODEX: ProviderCapability = {
   warnings: [
     "Effort is a recorded GAP for codex (see effort.evidence) — not an unsupported feature, and not a value guessed from another provider's enum.",
   ],
+  handoff: {
+    // codex has no system-prompt flag (src/session/boot-adapter/codex.ts:2-10); the model reads the file.
+    content: { kind: "turn-1-read", evidence: "no system-prompt flag; codex reads AGENTS.md from cwd (boot-adapter/codex.ts:6-9)" },
+    // [inferred] P0-6: positional [PROMPT] for the interactive session is not measured.
+    firstTurn: { placement: "positional", flag: null, status: "owed", evidence: "positional [PROMPT] — inferred; SPEC P0-6 owes the live boot" },
+  },
 };
 
 // ── gemini 0.53.0 ───────────────────────────────────────────────────────────
@@ -422,6 +470,18 @@ const GEMINI: ProviderCapability = {
     "Measured 2026-09: `gemini --help` itself created $HOME/.gemini/projects.json.*.tmp. This wizard therefore never executes gemini to describe it.",
     "0.53.0's help does NOT mark --yolo deprecated, contrary to secondary documentation. Only --approval-mode yolo is offered, so the ambiguity cannot reach the argv.",
   ],
+  handoff: {
+    // gemini-cli has no system-prompt flag (src/session/boot-adapter/gemini.ts:1-10); the model reads the file.
+    content: { kind: "turn-1-read", evidence: "no system-prompt flag; gemini reads GEMINI.md → @AGENTS.md from cwd (boot-adapter/gemini.ts:1-10)" },
+    // [inferred] for gemini-cli 0.53.0. --prompt-interactive is measured for agy only
+    // (boot-adapter/gemini.ts:54), and agy is not this registry's `gemini`.
+    firstTurn: {
+      placement: "flag-value",
+      flag: "--prompt-interactive",
+      status: "owed",
+      evidence: "--prompt-interactive <line> — measured for agy (boot-adapter/gemini.ts:54), inferred for gemini-cli 0.53.0; SPEC P0-6",
+    },
+  },
 };
 
 // ── grok 1.0.25 (f7e67d6988e2) ──────────────────────────────────────────────
@@ -517,6 +577,14 @@ const GROK: ProviderCapability = {
     "grok-sandbox.md records that child-network restriction is enforced on Linux only and is a no-op on macOS for read-only/strict. A profile name is not a platform guarantee.",
     "grok-sandbox.md also records that a managed requirements.toml can OVERRIDE the CLI flag. What this wizard shows is what it passes, not necessarily what grok ends up enforcing.",
   ],
+  handoff: {
+    // `--rules` is measured at grok 0.2.93 only (boot-adapter/grok.ts:1) and is system-level,
+    // so it does not start a turn; it is not this entry. grok reads AGENTS.md from cwd
+    // (PHASE0 P0-8, measured), and the model reads the file.
+    content: { kind: "turn-1-read", evidence: "no measured content flag at 1.0.25; grok reads AGENTS.md from cwd (Phase 0 P0-8)" },
+    // [inferred] P0-6: a positional prompt for the interactive TUI is not measured.
+    firstTurn: { placement: "positional", flag: null, status: "owed", evidence: "positional prompt — inferred; SPEC P0-6 owes the live boot" },
+  },
 };
 
 /**
