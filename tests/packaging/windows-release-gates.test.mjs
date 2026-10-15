@@ -2716,7 +2716,7 @@ async function callerVMDriver() {
   const { createContext, SourceTextModule, SyntheticModule } = await import('node:vm');
   const paths = await import('node:path');
   const { pathToFileURL } = await import('node:url');
-  const config = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+  const config = JSON.parse(readFileSync(0, 'utf8'));
   for (const result of config.results) {
     assert.ok(result.status === null || Number.isInteger(result.status));
     assert.ok(result.signal === null || typeof result.signal === 'string');
@@ -2802,8 +2802,8 @@ vmCases.push({ name: 'impossible numeric-status-plus-signal mock is rejected bef
 for (const item of vmCases) acceptance(`caller VM: ${item.name}`, 'caller-vm', () => {
   const config = join(admin, `caller-vm-${vmCases.indexOf(item)}.json`);
   writeFileSync(config, JSON.stringify({ ...item, source: callerSource }));
-  const argv = ['--experimental-vm-modules', driver, config];
-  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, encoding: 'utf8', timeout });
+  const argv = ['--experimental-vm-modules', driver];
+  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, input: readFileSync(config), encoding: 'utf8', timeout });
   const invocation = { kind: 'caller-vm', label: item.name, executable: process.execPath, argv, timeout,
     exit: result.status, signal: result.signal, error: result.error?.message, stdout: result.stdout, stderr: result.stderr,
     runnerSha256: sha(callerSource), scenario: { ...item, diagnostic: item.diagnostic?.source, invalid: item.invalid?.source } };
@@ -2831,8 +2831,8 @@ for (const item of vmCases) acceptance(`caller VM: ${item.name}`, 'caller-vm', (
 for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #1171 t12 follows t11 and g2c-pinned-clear sits between g2c-host-contract and g2c-transport only on POSIX (${platform})`, 'caller-vm', () => {
   const config = join(admin, `caller-vm-1171-placement-${platform}.json`);
   writeFileSync(config, JSON.stringify({ platform, results: platform === 'win32' ? [success] : [success, success], source: callerSource }));
-  const argv = ['--experimental-vm-modules', driver, config];
-  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, encoding: 'utf8', timeout });
+  const argv = ['--experimental-vm-modules', driver];
+  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, input: readFileSync(config), encoding: 'utf8', timeout });
   invocations.push({ kind: 'caller-vm-1171-placement', label: platform, executable: process.execPath, argv, timeout,
     exit: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr, runnerSha256: sha(callerSource) });
   assert.ifError(result.error);
@@ -2858,8 +2858,8 @@ for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #117
 for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #1182 control core follows t9-suspicions exactly once ahead of the POSIX-only entries (${platform})`, 'caller-vm', () => {
   const config = join(admin, `caller-vm-1182-placement-${platform}.json`);
   writeFileSync(config, JSON.stringify({ platform, results: platform === 'win32' ? [success] : [success, success], source: callerSource }));
-  const argv = ['--experimental-vm-modules', driver, config];
-  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, encoding: 'utf8', timeout });
+  const argv = ['--experimental-vm-modules', driver];
+  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, input: readFileSync(config), encoding: 'utf8', timeout });
   invocations.push({ kind: 'caller-vm-1182-placement', label: platform, executable: process.execPath, argv, timeout,
     exit: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr, runnerSha256: sha(callerSource) });
   assert.ifError(result.error);
@@ -2877,8 +2877,8 @@ for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #118
 for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #1167 fake-cmux win32 inert follows control core exactly once ahead of the POSIX-only entries (${platform})`, 'caller-vm', () => {
   const config = join(admin, `caller-vm-1167-placement-${platform}.json`);
   writeFileSync(config, JSON.stringify({ platform, results: platform === 'win32' ? [success] : [success, success], source: callerSource }));
-  const argv = ['--experimental-vm-modules', driver, config];
-  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, encoding: 'utf8', timeout });
+  const argv = ['--experimental-vm-modules', driver];
+  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, input: readFileSync(config), encoding: 'utf8', timeout });
   invocations.push({ kind: 'caller-vm-1167-placement', label: platform, executable: process.execPath, argv, timeout,
     exit: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr, runnerSha256: sha(callerSource) });
   assert.ifError(result.error);
@@ -2897,8 +2897,8 @@ for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #116
 for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #1191 preservation suites follow fake-cmux win32 inert exactly once ahead of the POSIX-only entries (${platform})`, 'caller-vm', () => {
   const config = join(admin, `caller-vm-1191-placement-${platform}.json`);
   writeFileSync(config, JSON.stringify({ platform, results: platform === 'win32' ? [success] : [success, success], source: callerSource }));
-  const argv = ['--experimental-vm-modules', driver, config];
-  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, encoding: 'utf8', timeout });
+  const argv = ['--experimental-vm-modules', driver];
+  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, input: readFileSync(config), encoding: 'utf8', timeout });
   invocations.push({ kind: 'caller-vm-1191-placement', label: platform, executable: process.execPath, argv, timeout,
     exit: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr, runnerSha256: sha(callerSource) });
   assert.ifError(result.error);
@@ -2918,8 +2918,8 @@ for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #119
 for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #1172 workflow policy follows preservation-directories exactly once ahead of the POSIX-only entries (${platform})`, 'caller-vm', () => {
   const config = join(admin, `caller-vm-1172-placement-${platform}.json`);
   writeFileSync(config, JSON.stringify({ platform, results: platform === 'win32' ? [success] : [success, success], source: callerSource }));
-  const argv = ['--experimental-vm-modules', driver, config];
-  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, encoding: 'utf8', timeout });
+  const argv = ['--experimental-vm-modules', driver];
+  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, input: readFileSync(config), encoding: 'utf8', timeout });
   invocations.push({ kind: 'caller-vm-1172-placement', label: platform, executable: process.execPath, argv, timeout,
     exit: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr, runnerSha256: sha(callerSource) });
   assert.ifError(result.error);
@@ -2937,8 +2937,8 @@ for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #117
 for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #1172 worker-inputs follows workflow policy exactly once ahead of the POSIX-only entries (${platform})`, 'caller-vm', () => {
   const config = join(admin, `caller-vm-1172-worker-inputs-placement-${platform}.json`);
   writeFileSync(config, JSON.stringify({ platform, results: platform === 'win32' ? [success] : [success, success], source: callerSource }));
-  const argv = ['--experimental-vm-modules', driver, config];
-  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, encoding: 'utf8', timeout });
+  const argv = ['--experimental-vm-modules', driver];
+  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, input: readFileSync(config), encoding: 'utf8', timeout });
   invocations.push({ kind: 'caller-vm-1172-worker-inputs-placement', label: platform, executable: process.execPath, argv, timeout,
     exit: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr, runnerSha256: sha(callerSource) });
   assert.ifError(result.error);
@@ -2963,8 +2963,8 @@ for (const [label, entry, previous] of [
 ]) for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: ${label} exactly once ahead of the POSIX-only entries (${platform})`, 'caller-vm', () => {
   const config = join(admin, `caller-vm-${label.replace(/[^a-z0-9]+/g, '-')}-placement-${platform}.json`);
   writeFileSync(config, JSON.stringify({ platform, results: platform === 'win32' ? [success] : [success, success], source: callerSource }));
-  const argv = ['--experimental-vm-modules', driver, config];
-  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, encoding: 'utf8', timeout });
+  const argv = ['--experimental-vm-modules', driver];
+  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, input: readFileSync(config), encoding: 'utf8', timeout });
   invocations.push({ kind: 'caller-vm-entry-placement', label: `${label} ${platform}`, executable: process.execPath, argv, timeout,
     exit: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr, runnerSha256: sha(callerSource) });
   assert.ifError(result.error);
@@ -3241,8 +3241,8 @@ for (const [name, mutate, platforms] of [
   const source = mutate(callerSource);
   const config = join(admin, `caller-vm-negative-${name.replace(/[^a-z0-9]+/g, '-')}-${platform}.json`);
   writeFileSync(config, JSON.stringify({ platform, results: [success, success], source }));
-  const argv = ['--experimental-vm-modules', driver, config];
-  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, encoding: 'utf8', timeout });
+  const argv = ['--experimental-vm-modules', driver];
+  const result = spawnSync(process.execPath, argv, { env: { PATH: '', TMPDIR: admin }, input: readFileSync(config), encoding: 'utf8', timeout });
   invocations.push({ kind: 'caller-vm-negative', label: `${name} ${platform}`, executable: process.execPath, argv, timeout,
     exit: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr, runnerSha256: sha(source) });
   assert.ifError(result.error);
