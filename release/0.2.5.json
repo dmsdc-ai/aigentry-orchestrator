@@ -62,6 +62,7 @@
         "src/tracker/usage.ts",
         "tests/dispatch/T140-dispatch-model-routing.test.ts",
         "tests/dispatch/T141-model-launcher-flags.test.ts",
+        "tests/dispatch/T68_registry_schema_contract.sh",
         "tests/dispatch/agent-metadata/g2c-pinned-clear.test.mjs",
         "tests/dispatch/agent-metadata/g3-reconciler-matrix.test.mjs",
         "tests/dispatch/agent-metadata/support/g3-fakes.mjs",

@@ -5,7 +5,7 @@
     "version": "0.2.5",
     "group": "release-1202",
     "task": 1202,
-    "planning_manifest_sha256": "b98320e54483e56bd0c1c041a7f42c088a7f2e0a6a2cfd8050b619952ae8356a"
+    "planning_manifest_sha256": "255e17598c7c52bef977d9b40188fc4e499ec8a626aab074da6dcc4dd388826c"
   },
   "candidate": {
     "inventory_sha256": "1a630abd321a376ab1ea5fd424a528bcad31fe28579e9a40ee35365ac18b1dc8",

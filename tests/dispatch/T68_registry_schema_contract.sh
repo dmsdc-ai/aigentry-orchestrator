@@ -16,17 +16,23 @@ t_registry begin-delivery --sid sid-B --ref-hash h2 --ref-path /tmp/r2 \
   --now "2026-05-12T11:01:00Z" >/dev/null
 
 # (1) envelope + required pointers on EVERY record.
-python3 - "$DISPATCH_STATE_DIR/active.json" <<'PY'
+#     The document arrives on stdin, from a quoted redirection of the harness's
+#     own state file. No filesystem path is passed to the interpreter, so the
+#     reader has no path argument to resolve and nothing to traverse. Code is a
+#     literal -c argument precisely because stdin is carrying the JSON.
+python3 -c '
 import json, sys
 
-doc = json.load(open(sys.argv[1], encoding="utf-8"))
-assert doc.get("schema_version") == 2, f"schema_version={doc.get('schema_version')!r}"
+doc = json.load(sys.stdin.buffer)
+schema_version = doc.get("schema_version")
+assert schema_version == 2, f"schema_version={schema_version!r}"
 assert isinstance(doc.get("generation"), int), "generation must be an int"
 recs = doc.get("dispatches")
 assert isinstance(recs, list) and len(recs) == 2, f"dispatches={recs!r}"
 REQUIRED = ("/outcome/state", "/outcome/reported_value", "/lifecycle/state",
             "/dedup/key", "/dedup/ref_hash")
 for rec in recs:
+    did = rec.get("dispatch_id")
     for pointer in REQUIRED:
         cur, missing = rec, False
         for part in pointer.strip("/").split("/"):
@@ -34,14 +40,15 @@ for rec in recs:
                 missing = True
                 break
             cur = cur[part]
-        assert not missing, f"missing pointer {pointer} in {rec.get('dispatch_id')}"
-    assert rec["outcome"]["state"] == "unknown", f"outcome.state={rec['outcome']['state']!r}"
+        assert not missing, f"missing pointer {pointer} in {did}"
+    outcome_state = rec["outcome"]["state"]
+    assert outcome_state == "unknown", f"outcome.state={outcome_state!r}"
     assert rec["outcome"]["reported_value"] is None, "outcome.reported_value must be null"
     assert rec["lifecycle"]["state"] == "delivery_attempt_started"
     assert rec["dedup"]["key"], "dedup.key must be non-empty"
 ids = [r["dispatch_id"] for r in recs]
 assert len(set(ids)) == 2, f"dispatch_id not unique: {ids}"
-PY
+' < "$DISPATCH_STATE_DIR/active.json"
 
 # (2) the operation table IS the enforcement surface — pin it exactly, so adding a
 #     terminal mutation op has to change this test on purpose.
@@ -103,8 +110,8 @@ t_assert_outcome_unknown sid-A
 
 # report-list observes; a reader may not bump the generation it reads.
 gen_of() {
-  python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["generation"])' \
-    "$DISPATCH_STATE_DIR/active.json"
+  python3 -c 'import json,sys; print(json.load(sys.stdin.buffer)["generation"])' \
+    < "$DISPATCH_STATE_DIR/active.json"
 }
 gen_before=$(gen_of)
 t_registry report-list >/dev/null
