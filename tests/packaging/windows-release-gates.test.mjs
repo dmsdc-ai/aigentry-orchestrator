@@ -2517,6 +2517,12 @@ const releaseEvidenceRelative = 'tests/packaging/release-evidence.test.mjs';
 // release-evidence entry and ahead of the POSIX-only entries. The fixture only places a test-owned sentinel
 // at this path; the real suite is never imported or run here.
 const contextCompactRelative = 'tests/bin/context-compact.test.mjs';
+const reportCommonRelatives = ['tests/report/mandatory-report-1170-security.test.mjs',
+  'tests/report/mandatory-report-1136-hook.test.mjs'];
+const reportPosixRelatives = ['tests/report/mandatory-report-1170-caller.test.mjs',
+  'tests/report/mandatory-report-1170.test.mjs', 'tests/report/mandatory-report-1170-review.test.mjs',
+  'tests/report/mandatory-report-1170-helper.test.mjs', 'tests/report/mandatory-report-1170-parent-race.test.mjs',
+  'tests/report/mandatory-report-1170-reader.test.mjs', 'tests/report/mandatory-report-1170-rework-boundaries.test.mjs'];
 function callerFixture(mode, symlinked = false) {
   const directory = mkdtempSync(join(admin, 'caller fixture '));
   const put = (path, source) => {
@@ -2555,12 +2561,16 @@ function callerFixture(mode, symlinked = false) {
   if (mode !== 'missing-init-platform') put(initPlatformRelative, checks + `console.log('CALLER_INIT_PLATFORM_SENTINEL');\nprocess.exit(${mode === 'failing-init-platform' ? 8 : 0});\n`);
   if (mode !== 'missing-release-evidence') put(releaseEvidenceRelative, checks + `console.log('CALLER_RELEASE_EVIDENCE_SENTINEL');\nprocess.exit(${mode === 'failing-release-evidence' ? 8 : 0});\n`);
   if (mode !== 'missing-context-compact') put(contextCompactRelative, checks + `console.log('CALLER_CONTEXT_COMPACT_SENTINEL');\nprocess.exit(${mode === 'failing-context-compact' ? 8 : 0});\n`);
+  for (const [index, path] of reportCommonRelatives.entries())
+    put(path, checks + `console.log('CALLER_REPORT_COMMON_SENTINEL_${index}');\n`);
   if (mode !== 'missing-wizard') put(wizardRelative, checks + `console.log('CALLER_WIZARD_SENTINEL');\nprocess.exit(${mode === 'failing-wizard' ? 8 : 0});\n`);
   if (mode !== 'missing-supervisor') put(supervisorRelative, checks + `console.log('CALLER_SUPERVISOR_SENTINEL');\nprocess.exit(${mode === 'failing-supervisor' ? 8 : 0});\n`);
   for (const [index, path] of agentMetadataRelatives.entries()) {
     if (mode === 'missing-agent-metadata-pinned-clear' && path === agentMetadataPinnedClear) continue;
     if (mode !== 'missing-agent-metadata' || index !== agentMetadataRelatives.length - 1) put(path, checks + `console.log('CALLER_AGENT_METADATA_SENTINEL_${index}');\nprocess.exit(${(mode === 'failing-agent-metadata' && index === 0) || (mode === 'failing-agent-metadata-pinned-clear' && path === agentMetadataPinnedClear) ? 8 : 0});\n`);
   }
+  for (const [index, path] of reportPosixRelatives.entries())
+    put(path, checks + `console.log('CALLER_REPORT_POSIX_SENTINEL_${index}');\n`);
   if (mode !== 'missing-harness') put(harnessRelative, checks + `console.log('CALLER_SOURCE_SENTINEL');\nprocess.exit(${mode === 'sentinel-fail' ? 9 : 0});\n`);
   put('tests/packaging/unselected.test.mjs', "console.log('CALLER_UNSELECTED_MJS'); process.exit(99);\n");
   if (symlinked) {
@@ -2658,6 +2668,8 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic, onlyFailed
   assert.equal(result.stdout.includes('CALLER_INIT_PLATFORM_SENTINEL'), compiled);
   assert.equal(result.stdout.includes('CALLER_RELEASE_EVIDENCE_SENTINEL'), compiled);
   assert.equal(result.stdout.includes('CALLER_CONTEXT_COMPACT_SENTINEL'), compiled);
+  for (const index of reportCommonRelatives.keys()) assert.equal(result.stdout.includes(`CALLER_REPORT_COMMON_SENTINEL_${index}`), compiled);
+  for (const index of reportPosixRelatives.keys()) assert.equal(result.stdout.includes(`CALLER_REPORT_POSIX_SENTINEL_${index}`), compiled);
   assert.ok(!result.stdout.includes('CALLER_UNSELECTED_MJS'), 'no automatic source .mjs discovery');
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_COMPILED_CONTROL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (security && sentinel) assert.ok(result.stdout.indexOf('CALLER_SECURITY_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
@@ -2683,6 +2695,10 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic, onlyFailed
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_INIT_PLATFORM_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_RELEASE_EVIDENCE_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_CONTEXT_COMPACT_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
+  if (compiled && sentinel) for (const index of reportCommonRelatives.keys())
+    assert.ok(result.stdout.indexOf(`CALLER_REPORT_COMMON_SENTINEL_${index}`) < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
+  if (compiled && sentinel) for (const index of reportPosixRelatives.keys())
+    assert.ok(result.stdout.indexOf(`CALLER_REPORT_POSIX_SENTINEL_${index}`) < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (diagnostic) assert.match(result.stderr, diagnostic);
   if (onlyFailedFile) {
     const failures = result.stdout.split('\n').filter(line => /^not ok \d+ - /.test(line));
@@ -2760,8 +2776,9 @@ const timedOut = { status: null, signal: 'SIGKILL', error: 'synthetic ETIMEDOUT'
 const callerArgv = platform => ['--test', 'dist/tests/a.test.js', 'dist/tests/nested/b.test.js', 'dist/tests/z.test.js',
   securityRelative, admissionRelative, ...jevRelatives, ...taskAdvisorRelatives, controlRelative, fakeCmuxInertRelative,
   ...preservationRelatives, workflowPolicyRelative, workerInputsRelative, initPlatformRelative, releaseEvidenceRelative,
-  contextCompactRelative,
-  ...(['linux', 'darwin'].includes(platform) ? [nativeRelative, wizardRelative, supervisorRelative, ...agentMetadataRelatives] : [])];
+  contextCompactRelative, ...reportCommonRelatives,
+  ...(['linux', 'darwin'].includes(platform) ? [nativeRelative, wizardRelative, supervisorRelative,
+    ...agentMetadataRelatives, ...reportPosixRelatives] : [])];
 const vmCases = [];
 for (const platform of ['linux', 'darwin']) {
   vmCases.push({ name: `${platform} compiled/security/admission/native success then exact harness invocation`, platform, results: [success, success], status: 0, calls: 2 });
@@ -2938,7 +2955,7 @@ for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: #117
 // directly after the worker-inputs entry, then (#1171) the release-evidence entry — literal neighbours only.
 // #1171 the release-evidence entry: exactly once on every platform directly after init-platform, then (#1204)
 // the context-compact entry. #1204 the context-compact entry: exactly once on every platform directly after
-// release-evidence, then the first POSIX-only entry on POSIX and nothing after it on win32.
+// release-evidence, then the two platform-neutral report suites before the POSIX-only entries.
 for (const [label, entry, previous] of [
   ['#1167 init-platform follows worker-inputs', 'tests/packaging/init-platform.test.mjs', 'tests/dispatch/worker-inputs.test.mjs'],
   ['#1171 release-evidence follows init-platform', 'tests/packaging/release-evidence.test.mjs', 'tests/packaging/init-platform.test.mjs'],
@@ -2961,8 +2978,12 @@ for (const [label, entry, previous] of [
     assert.equal(spawned.indexOf('tests/packaging/release-evidence.test.mjs'), spawned.indexOf(entry) + 1);
   } else if (entry === 'tests/packaging/release-evidence.test.mjs') {
     assert.equal(spawned.indexOf('tests/bin/context-compact.test.mjs'), spawned.indexOf(entry) + 1);
-  } else if (platform === 'win32') assert.equal(spawned.indexOf(entry), spawned.length - 1);
-  else assert.equal(spawned.indexOf('tests/packaging/native-capture.test.mjs'), spawned.indexOf(entry) + 1);
+  } else {
+    assert.equal(spawned.indexOf(reportCommonRelatives[0]), spawned.indexOf(entry) + 1);
+    assert.equal(spawned.indexOf(reportCommonRelatives[1]), spawned.indexOf(reportCommonRelatives[0]) + 1);
+    if (platform === 'win32') assert.equal(spawned.indexOf(reportCommonRelatives[1]), spawned.length - 1);
+    else assert.equal(spawned.indexOf('tests/packaging/native-capture.test.mjs'), spawned.indexOf(reportCommonRelatives[1]) + 1);
+  }
 });
 // #1191 checkout-EOL policy for the one raw-byte-pinned preservation source. Each case commits LF bytes to a
 // fresh fake repo under the private admin directory and clones it locally (no remote, no network). Git runs
@@ -3072,6 +3093,7 @@ const workerInputsPush = "sourceTestFiles.push('tests/dispatch/worker-inputs.tes
 const initPlatformPush = "sourceTestFiles.push('tests/packaging/init-platform.test.mjs');\n";
 const releaseEvidencePush = "sourceTestFiles.push('tests/packaging/release-evidence.test.mjs');\n";
 const contextCompactPush = "sourceTestFiles.push('tests/bin/context-compact.test.mjs');\n";
+const posixReportEnd = "  sourceTestFiles.push('tests/report/mandatory-report-1170-rework-boundaries.test.mjs');\n}\n";
 for (const [name, mutate, platforms] of [
   ['wizard entry placed on every platform, win32 included', source => replaceOnce(replaceOnce(source, wizardPosixPush, wizardPosixDropped),
     baseSourceList, "'tests/packaging/release-admission.test.mjs', 'tests/packaging/orchestrator-boot-wizard.test.mjs'];"), ['win32', 'linux', 'darwin']],
@@ -3152,7 +3174,7 @@ for (const [name, mutate, platforms] of [
   ['workflow policy suite ahead of the preservation suites', source => replaceOnce(replaceOnce(source, workflowPolicyPush, ''),
     preservationPush, `${workflowPolicyPush}${preservationPush}`), ['win32', 'linux', 'darwin']],
   ['workflow policy suite after the POSIX-only entries', source => replaceOnce(replaceOnce(source, workflowPolicyPush, ''),
-    `${agentMetadataBlock}}\n`, `${agentMetadataBlock}}\n${workflowPolicyPush}`), ['linux', 'darwin']],
+    posixReportEnd, `${posixReportEnd}${workflowPolicyPush}`), ['linux', 'darwin']],
   // #1172: the worker-inputs entry is required exactly once on every platform, directly after the workflow
   // policy entry and ahead of the POSIX branch. Placing it on win32 only or after the POSIX branch leaves
   // the win32 argv unchanged, so those counterfactuals apply to POSIX alone.
@@ -3166,7 +3188,7 @@ for (const [name, mutate, platforms] of [
   ['worker-inputs suite ahead of the workflow policy suite', source => replaceOnce(replaceOnce(source, workerInputsPush, ''),
     workflowPolicyPush, `${workerInputsPush}${workflowPolicyPush}`), ['win32', 'linux', 'darwin']],
   ['worker-inputs suite after the POSIX-only entries', source => replaceOnce(replaceOnce(source, workerInputsPush, ''),
-    `${agentMetadataBlock}}\n`, `${agentMetadataBlock}}\n${workerInputsPush}`), ['linux', 'darwin']],
+    posixReportEnd, `${posixReportEnd}${workerInputsPush}`), ['linux', 'darwin']],
   // #1167 / #1171 / #1204: the init-platform, release-evidence and context-compact entries are required exactly
   // once on every platform, in that order directly after worker-inputs and ahead of the POSIX branch. Placing one
   // on win32 only or after the POSIX branch leaves the win32 argv unchanged, so those counterfactuals apply to POSIX alone.
@@ -3181,7 +3203,7 @@ for (const [name, mutate, platforms] of [
       [`${label} suite ahead of the entry it follows`, source => replaceOnce(replaceOnce(source, push, ''), previous, `${push}${previous}`),
         ['win32', 'linux', 'darwin']],
       [`${label} suite after the POSIX-only entries`, source => replaceOnce(replaceOnce(source, push, ''),
-        `${agentMetadataBlock}}\n`, `${agentMetadataBlock}}\n${push}`), ['linux', 'darwin']],
+        posixReportEnd, `${posixReportEnd}${push}`), ['linux', 'darwin']],
     ]),
   // #1177: the XRes supervisor suite is required on POSIX and must never reach win32.
   ['XRes supervisor suite missing', source => replaceOnce(source, supervisorPosixPush, ''), ['linux', 'darwin']],
