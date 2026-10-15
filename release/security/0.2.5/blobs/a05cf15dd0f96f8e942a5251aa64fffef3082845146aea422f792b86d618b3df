@@ -1,0 +1,15 @@
+# Exact finding disposition
+
+Commit: `78e12076f154b9bf9cd8ab38f7ab070ebcdf6609`. Fingerprint: `cf1d2266ae36de4fcb34cb1bb8c027a647413a1cfb7eba928f221e227ca67262`.
+
+Controller technical disposition: eligible for this exact source and documented local operator boundary; not a zero-finding or security completion claim.
+
+The second flagged open repeats the same bound executable header check immediately before the worker launch; it is a deliberate recheck of the host-selected CLI file.
+
+Trust boundary: Manifest and executable identity remain host-owned data; no task-controlled filename is joined at this sink.
+
+Remaining limits: A race remains between the second read and exec; SRT/CLI provenance and native confinement need separate validation.
+
+Source citations: `src/session/worker-sandbox-runner.ts:167-173`, `src/session/worker-sandbox.ts:59-85`, `src/session/worker-sandbox.ts:372-390`.
+
+Existing tests are cited as source only; independent reviewer ran no tests.

@@ -1,0 +1,190 @@
+# Exact per-fingerprint public evidence
+
+Commit: `78e12076f154b9bf9cd8ab38f7ab070ebcdf6609`. SARIF SHA-256: `ee43ac1e36c2aa9bbe0ec5168901ca141f4a551cd45c46b23e1d8c20b42825e6`. Static recommendations only; controller decides final disposition.
+
+## `3f971d9f39dfc53f35413171544c1f5b8b821e133aeb7b162a0903bc6f5976be`
+
+- Rule: `javascript/IndirectCommandInjection`; level: `warning`; classification: `recommend_eligible`.
+- Region: `src/session/worker-sandbox-runner.ts:14`; source SHA-256: `bef3bc1019347311e1a424fc67a82374888a87c2c628de542e96f9543d04be2a`.
+- SARIF source paths: `src/session/worker-sandbox-runner.ts`.
+- Source reason: The runner reads a hash-sealed, private manifest; the production command is assembled from a bound executable plus argv. Each argv element is single-quote escaped before SandboxManager receives a /bin/bash command string, and spawn takes the wrapper executable plus separate argv. This is a bounded source reason against metacharacter injection at this call, not proof of SRT or installed CLI behavior.
+- Caller and trust boundary: CLI manifest/hash are launcher-generated in the ordinary route; a direct same-UID invocation can create its own manifest but gains no higher authority. The worker cannot write the host attempt root under the configured sandbox.
+- Source lines: `src/session/worker-sandbox-runner.ts:10-16`, `src/session/worker-sandbox-runner.ts:90-110`, `src/session/worker-sandbox.ts:88-90`, `src/session/worker-sandbox.ts:250-253`, `src/session/worker-sandbox.ts:372-390`, `src/session/worker-sandbox.ts:604-623`.
+- Existing test source: `tests/session/claude-worker-oauth.test.ts:466-489`, `tests/session/claude-worker-oauth.test.ts:822-845`.
+- Dynamic limit: SRT wrapper implementation, native executable/interpreter behavior, shell implementation, replacement between identity check and exec, and OS confinement are not established by this static review.
+
+## `00af55a0d2de73a140bdcfdcf0b9d19bbd9ad2f3aeb38b4cc0cd8f2b232915d9`
+
+- Rule: `javascript/PT`; level: `note`; classification: `recommend_eligible`.
+- Region: `bin/model-router.mjs:51`; source SHA-256: `e68376917c570429482b588b8739985866c1fe8d8d34b714aa12ade3b1158f74`.
+- SARIF source paths: `bin/model-router.mjs`.
+- Source reason: --profile and AIGENTRY_ROUTER_PROFILE deliberately select an operator profile file; the default is a package-relative profile. No task text is interpolated into this path. A malformed profile falls back to the fixed table result.
+- Caller and trust boundary: Direct router CLI/environment are local operator configuration. The managed dispatch auto route does not pass a task ref into this profile selector.
+- Source lines: `bin/model-router.mjs:21-24`, `bin/model-router.mjs:45-53`, `bin/model-router.mjs:73-82`.
+- Existing test source: `tests/packaging/installed-model-routing.test.mjs:319-336`, `tests/packaging/installed-model-routing.test.mjs:369-381`.
+- Dynamic limit: Local symlink replacement, profile provenance, and any privileged wrapper that forwards attacker-controlled --profile remain outside static proof.
+
+## `8a68cdc58a4c83289b9925147e269013421f75638298375b4d63422795d14d85`
+
+- Rule: `javascript/PT`; level: `note`; classification: `recommend_eligible`.
+- Region: `src/dispatch/cli.ts:1373`; source SHA-256: `89636f1c3ba8004fa942a5b6ec8d8f772c96aee828214ced423ea6df5fe9da99`.
+- SARIF source paths: `src/dispatch/cli.ts`, `src/session/worker-sandbox.ts`.
+- Source reason: The target SID is checked against a separator-free identity regex before the first session path read. The subsequent current/manifest/receipt chain is used only for an existing running confined target.
+- Caller and trust boundary: --target comes from the dispatch caller; AIGENTRY_SESSIONS_ROOT and current state are host-side operator/control-root data, assumed protected from the worker.
+- Source lines: `src/dispatch/cli.ts:1364-1375`, `src/session/worker-sandbox.ts:88-91`, `src/session/worker-sandbox.ts:460-471`.
+- Existing test source: `tests/session/worker-sandbox-target-sid.test.ts:70-78`, `tests/dispatch/target-sid.test.ts:43-62`.
+- Dynamic limit: The current pointer and receipt are hash checked but not an authenticated same-UID signature; symlink/time races and nondefault session-root permissions require native review.
+
+## `4381a8c99fb3c969e96d76257962e86eeaf0c21e91566a17b7e8cace7518be7e`
+
+- Rule: `javascript/PT`; level: `note`; classification: `recommend_eligible`.
+- Region: `src/dispatch/cli.ts:1453`; source SHA-256: `89636f1c3ba8004fa942a5b6ec8d8f772c96aee828214ced423ea6df5fe9da99`.
+- SARIF source paths: `src/dispatch/cli.ts`, `src/session/worker-sandbox.ts`.
+- Source reason: stageWorkerRef repeats the SID guard before reading the target current pointer, verifies manifest hash and SID/task, then stages under the manifest HOME with a digest filename. In the ordinary route HOME is generated under the attempt root, not from task content.
+- Caller and trust boundary: Ref text is task data, but the destination root comes from host-authored sealed state; a same-UID actor that can replace control state is within the trusted controller boundary.
+- Source lines: `src/dispatch/cli.ts:1441-1458`, `src/session/worker-sandbox.ts:482-503`, `src/session/worker-sandbox.ts:266-289`, `src/session/worker-sandbox.ts:372-390`.
+- Existing test source: `tests/session/worker-sandbox-target-sid.test.ts:80-109`, `tests/dispatch/target-sid.test.ts:65-85`.
+- Dynamic limit: The target helper only checks HOME is absolute and does not independently confine it to the attempt root; review stage ownership, symlinks and replacement windows in native/public deployment.
+
+## `42a8a94325e1eb8771daefa0ea6cd0c90648ab5720d13e501cc995f38b671e60`
+
+- Rule: `javascript/PT`; level: `note`; classification: `recommend_eligible`.
+- Region: `bin/model-router.mjs:104`; source SHA-256: `e68376917c570429482b588b8739985866c1fe8d8d34b714aa12ade3b1158f74`.
+- SARIF source paths: `bin/model-router.mjs`.
+- Source reason: --ref is an intentional local file selector. openSync uses read-only mode and the descriptor is read for at most 4096 bytes; the content becomes a task excerpt in the classifier prompt rather than a filesystem path.
+- Caller and trust boundary: Direct router caller chooses the ref; managed dispatch auto routing currently omits --ref, so task text cannot select this path through that caller.
+- Source lines: `bin/model-router.mjs:21-24`, `bin/model-router.mjs:102-112`, `src/dispatch/cli.ts:1413-1415`.
+- Existing test source: `tests/packaging/installed-model-routing.test.mjs:389-415`, `tests/packaging/installed-model-routing.test.mjs:418-445`.
+- Dynamic limit: A future lower-trust caller forwarding arbitrary --ref would change this judgment because the first 4 KiB can be sent to a classifier; local symlink races are unmeasured.
+
+## `64ac4570288950b88842494754ef600c59ee5ecbfa3185928a3caeb834d86d21`
+
+- Rule: `javascript/PT`; level: `note`; classification: `recommend_eligible`.
+- Region: `src/dispatch/cli.ts:691`; source SHA-256: `89636f1c3ba8004fa942a5b6ec8d8f772c96aee828214ced423ea6df5fe9da99`.
+- SARIF source paths: `src/dispatch/cli.ts`, `src/session/worker-sandbox.ts`.
+- Source reason: The flagged open is the bounded header read of the resolver-selected CLI executable. validateSpawnDecision binds the executable and assertNotCliWrapper reads only its first 512 bytes, then refuses shell shebang wrappers with unknown version evidence.
+- Caller and trust boundary: The executable path comes from the operator's model resolver decision, validated before staging; it is not formed from task ref text.
+- Source lines: `src/dispatch/cli.ts:681-694`, `src/session/worker-sandbox.ts:59-85`, `src/session/model-decision.ts:127-146`.
+- Existing test source: `tests/packaging/installed-model-routing.test.mjs:661-700`.
+- Dynamic limit: The resolver's installed binary provenance and replacement between stat/header read and launch are not proven.
+
+## `3b7f408c9f5ee8637716c3d88ccb292ccc1448b6f45cef12fc3506a6af7c7c6f`
+
+- Rule: `javascript/PT`; level: `note`; classification: `recommend_eligible`.
+- Region: `src/dispatch/cli.ts:1333`; source SHA-256: `89636f1c3ba8004fa942a5b6ec8d8f772c96aee828214ced423ea6df5fe9da99`.
+- SARIF source paths: `src/dispatch/cli.ts`, `src/session/worker-sandbox.ts`.
+- Source reason: prepareWorkerSandbox repeats the executable header check while sealing the command and manifest. The open reads the configured binary, not a path component from a task or SID.
+- Caller and trust boundary: The decision and executable binding are host-side resolver/operator data; worker task text is excluded before this check.
+- Source lines: `src/dispatch/cli.ts:1333-1334`, `src/session/worker-sandbox.ts:250-253`, `src/session/worker-sandbox.ts:59-85`.
+- Existing test source: `tests/packaging/installed-model-routing.test.mjs:661-700`.
+- Dynamic limit: Identity checks are stat based, not atomic open-to-exec; native path replacement and interpreter behavior remain.
+
+## `240524cd0d7229269d6f83c77f6e5cf5be9be6b076a2f18b9bd1eb0b0c0e5982`
+
+- Rule: `javascript/PT`; level: `note`; classification: `recommend_eligible`.
+- Region: `src/session/worker-sandbox-runner.ts:110`; source SHA-256: `bef3bc1019347311e1a424fc67a82374888a87c2c628de542e96f9543d04be2a`.
+- SARIF source paths: `src/session/worker-sandbox-runner.ts`, `src/session/worker-sandbox.ts`.
+- Source reason: At runner start, readSealedManifest verifies the manifest path shape, private owner-only read, hash, attempt and receipt location. The flagged open reads the bound executable header and rejects a shell wrapper where version evidence is unknown.
+- Caller and trust boundary: Runner argv is generated by the host launcher; the sealed executable binding comes from the host resolver, not worker task content.
+- Source lines: `src/session/worker-sandbox-runner.ts:90-110`, `src/session/worker-sandbox.ts:59-85`, `src/session/worker-sandbox.ts:604-623`.
+- Existing test source: `tests/session/claude-worker-oauth.test.ts:466-489`, `tests/packaging/installed-model-routing.test.mjs:661-700`.
+- Dynamic limit: The static check cannot prove the installed executable or exclude a check-to-exec replacement race.
+
+## `cf1d2266ae36de4fcb34cb1bb8c027a647413a1cfb7eba928f221e227ca67262`
+
+- Rule: `javascript/PT`; level: `note`; classification: `recommend_eligible`.
+- Region: `src/session/worker-sandbox-runner.ts:171`; source SHA-256: `bef3bc1019347311e1a424fc67a82374888a87c2c628de542e96f9543d04be2a`.
+- SARIF source paths: `src/session/worker-sandbox-runner.ts`, `src/session/worker-sandbox.ts`.
+- Source reason: The second flagged open repeats the same bound executable header check immediately before the worker launch; it is a deliberate recheck of the host-selected CLI file.
+- Caller and trust boundary: Manifest and executable identity remain host-owned data; no task-controlled filename is joined at this sink.
+- Source lines: `src/session/worker-sandbox-runner.ts:167-173`, `src/session/worker-sandbox.ts:59-85`, `src/session/worker-sandbox.ts:372-390`.
+- Existing test source: `tests/session/claude-worker-oauth.test.ts:466-489`, `tests/packaging/installed-model-routing.test.mjs:661-700`.
+- Dynamic limit: A race remains between the second read and exec; SRT/CLI provenance and native confinement need separate validation.
+
+## `7b573f0a67d6314301b42354489bae88654c3709ab10e6385a2682c5cb7208f0`
+
+- Rule: `javascript/PT`; level: `note`; classification: `recommend_eligible`.
+- Region: `bin/model-router.mjs:107`; source SHA-256: `e68376917c570429482b588b8739985866c1fe8d8d34b714aa12ade3b1158f74`.
+- SARIF source paths: `bin/model-router.mjs`.
+- Source reason: readSync operates on the descriptor just opened read-only for the explicit --ref path, caps the excerpt at 4096 bytes and closes it. It cannot redirect an additional path read after open.
+- Caller and trust boundary: The direct local router caller selects --ref; production dispatch auto routing omits it.
+- Source lines: `bin/model-router.mjs:102-112`, `bin/model-router.mjs:124-140`.
+- Existing test source: `tests/packaging/installed-model-routing.test.mjs:389-415`, `tests/packaging/installed-model-routing.test.mjs:800-817`.
+- Dynamic limit: The selected file's contents may reach an external classifier; any new lower-trust path forwarding needs a fresh privacy review.
+
+## `9faca85517cb1e8c493c821db916b38a8f38d6fd26cfe993fc8712e98d2155f7`
+
+- Rule: `javascript/PT`; level: `note`; classification: `recommend_eligible`.
+- Region: `src/session/worker-sandbox-runner.ts:18`; source SHA-256: `bef3bc1019347311e1a424fc67a82374888a87c2c628de542e96f9543d04be2a`.
+- SARIF source paths: `src/session/worker-sandbox-runner.ts`.
+- Source reason: The receipt path is required to equal <private attempt root>/receipt.json in the sealed manifest before this write. The hash, attempt and child PID are then written to that fixed location.
+- Caller and trust boundary: Manifest location/hash are launcher-generated; the worker task cannot change m.receipt through the ordinary sandbox route.
+- Source lines: `src/session/worker-sandbox-runner.ts:90-101`, `src/session/worker-sandbox-runner.ts:17-20`, `src/session/worker-sandbox.ts:604-623`, `src/session/worker-sandbox.ts:372-390`.
+- Existing test source: `tests/session/claude-worker-oauth.test.ts:466-489`, `tests/session/claude-worker-oauth.test.ts:822-845`.
+- Dynamic limit: Receipt write follows a path, so same-UID replacement of private directories or symlinks between validation and write is not excluded statically.
+
+## `10e7664462925fb6d08b6c3dd98699ded5bd97b71e9eb9d9a37e96520b3df442`
+
+- Rule: `python/PT`; level: `note`; classification: `recommend_eligible`.
+- Region: `bin/dispatch-registry.py:213`; source SHA-256: `befb9748ee2402912680aa275a2a1a8138b48dd6066180ffe86f2b204f5fc47e`.
+- SARIF source paths: `bin/dispatch-registry.py`.
+- Source reason: DISPATCH_STATE_DIR is an operator-configured state root; state_dir rejects NUL and literal parent segments, resolves the root, then appends the fixed registry-health.log name. Error details do not become path segments.
+- Caller and trust boundary: Environment is inherited by the orchestrator and registry child; it is local configuration, not a dispatch record field.
+- Source lines: `bin/dispatch-registry.py:125-164`, `bin/dispatch-registry.py:209-217`, `src/dispatch/registry-command.ts:10-13`.
+- Existing test source: `tests/dispatch/T76_corrupt_registry_fails_closed.sh:15-47`.
+- Dynamic limit: Realpath does not pin a directory handle; root and log symlink replacement or a future lower-trust env injector require re-review.
+
+## `536b199fb8bbc14f49b07bff7bce44226433c89cd92943230361dda1f20fc7a6`
+
+- Rule: `python/PT`; level: `note`; classification: `recommend_eligible`.
+- Region: `bin/dispatch-registry.py:1441`; source SHA-256: `befb9748ee2402912680aa275a2a1a8138b48dd6066180ffe86f2b204f5fc47e`.
+- SARIF source paths: `bin/dispatch-registry.py`.
+- Source reason: The migration backup appends the fixed .legacy-v1.bak suffix to the fixed active.json registry path while holding the registry lock. No legacy record field contributes to the backup filename.
+- Caller and trust boundary: The migration command and state-root environment are operator-controlled; legacy JSON bytes are read as content only.
+- Source lines: `bin/dispatch-registry.py:148-164`, `bin/dispatch-registry.py:1417-1445`, `bin/dispatch-registry.py:227-243`.
+- Existing test source: `tests/dispatch/T85_migrate_and_archive_sidecars.sh:13-22`, `tests/dispatch/T85_migrate_and_archive_sidecars.sh:60-64`.
+- Dynamic limit: Same-UID or shared-directory symlink/race attacks on the state root/backup are outside this source-only recommendation.
+
+## `e3307e7a4b1080c98ea00aff38c59b69fff686af20e93e81cbf9e7ca595cfdea`
+
+- Rule: `python/PT`; level: `note`; classification: `recommend_eligible`.
+- Region: `bin/dispatch-registry.py:371`; source SHA-256: `befb9748ee2402912680aa275a2a1a8138b48dd6066180ffe86f2b204f5fc47e`.
+- SARIF source paths: `bin/dispatch-registry.py`.
+- Source reason: The normal registry read is from state_dir()/active.json, a fixed basename under the operator-selected state root. Parsed content is validated before use; no SID or ref controls the pathname.
+- Caller and trust boundary: DISPATCH_STATE_DIR is host configuration; dispatch record fields are lower-trust data but do not enter this path.
+- Source lines: `bin/dispatch-registry.py:148-164`, `bin/dispatch-registry.py:362-377`.
+- Existing test source: `tests/dispatch/T76_corrupt_registry_fails_closed.sh:18-47`.
+- Dynamic limit: A symlinked or replaced active.json is not excluded by this code; operator state-directory ownership is an environmental requirement.
+
+## `b45912279d54682ba0f6a98f6cf66f768c4008683f23e53e5c9ae0afdbd2ce08`
+
+- Rule: `python/PT`; level: `note`; classification: `recommend_eligible`.
+- Region: `bin/dispatch-registry.py:384`; source SHA-256: `befb9748ee2402912680aa275a2a1a8138b48dd6066180ffe86f2b204f5fc47e`.
+- SARIF source paths: `bin/dispatch-registry.py`.
+- Source reason: The bounded list read receives the same fixed active.json path from load(), opens it read-only, and reads at most limit+1 bytes. Record content cannot choose another file.
+- Caller and trust boundary: The path root comes from DISPATCH_STATE_DIR, treated as operator-controlled configuration.
+- Source lines: `bin/dispatch-registry.py:148-164`, `bin/dispatch-registry.py:362-389`.
+- Existing test source: `tests/dispatch/T76_corrupt_registry_fails_closed.sh:18-47`.
+- Dynamic limit: The file can be replaced between path construction and open; no runtime directory ownership/provenance was measured.
+
+## `bb1fde2350066dfb83c38043135883b9baee491403c1e8ddea77850426d5de03`
+
+- Rule: `python/PT`; level: `note`; classification: `recommend_eligible`.
+- Region: `bin/dispatch-registry.py:1426`; source SHA-256: `befb9748ee2402912680aa275a2a1a8138b48dd6066180ffe86f2b204f5fc47e`.
+- SARIF source paths: `bin/dispatch-registry.py`.
+- Source reason: Migration opens the fixed active.json path under the registry lock and parses legacy bytes. The environment chooses only the operator state root; legacy entries do not affect the read path.
+- Caller and trust boundary: Migration is an operator action; legacy record content is not used to construct the pathname.
+- Source lines: `bin/dispatch-registry.py:148-164`, `bin/dispatch-registry.py:1417-1437`.
+- Existing test source: `tests/dispatch/T85_migrate_and_archive_sidecars.sh:13-22`, `tests/dispatch/T85_migrate_and_archive_sidecars.sh:24-58`.
+- Dynamic limit: Locking does not authenticate the underlying directory or prevent same-UID path replacement.
+
+## `75501f8baf9aa6861cb7837d558a9d917f8cab99b5a90283dd7bc32b7b99c930`
+
+- Rule: `python/PT`; level: `note`; classification: `recommend_eligible`.
+- Region: `bin/dispatch-registry.py:418`; source SHA-256: `befb9748ee2402912680aa275a2a1a8138b48dd6066180ffe86f2b204f5fc47e`.
+- SARIF source paths: `bin/dispatch-registry.py`.
+- Source reason: commit writes a fixed active.json.<pid>.tmp sibling, fsyncs it, then atomically replaces the fixed active.json path. The only variable suffix is the local process PID, not a record field.
+- Caller and trust boundary: DISPATCH_STATE_DIR is operator configuration; dispatch records are validated data and do not choose filenames.
+- Source lines: `bin/dispatch-registry.py:148-164`, `bin/dispatch-registry.py:396-424`.
+- Existing test source: `tests/dispatch/T77_atomic_write_preserves_generation.sh:13-50`.
+- Dynamic limit: Atomic rename protects completeness, not a malicious symlinked/replaced state directory; directory provenance and same-UID races remain unmeasured.

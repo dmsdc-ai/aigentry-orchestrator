@@ -1,0 +1,15 @@
+# Exact finding disposition
+
+Commit: `78e12076f154b9bf9cd8ab38f7ab070ebcdf6609`. Fingerprint: `9faca85517cb1e8c493c821db916b38a8f38d6fd26cfe993fc8712e98d2155f7`.
+
+Controller technical disposition: eligible for this exact source and documented local operator boundary; not a zero-finding or security completion claim.
+
+The receipt path is required to equal <private attempt root>/receipt.json in the sealed manifest before this write. The hash, attempt and child PID are then written to that fixed location.
+
+Trust boundary: Manifest location/hash are launcher-generated; the worker task cannot change m.receipt through the ordinary sandbox route.
+
+Remaining limits: Receipt write follows a path, so same-UID replacement of private directories or symlinks between validation and write is not excluded statically.
+
+Source citations: `src/session/worker-sandbox-runner.ts:90-101`, `src/session/worker-sandbox-runner.ts:17-20`, `src/session/worker-sandbox.ts:604-623`, `src/session/worker-sandbox.ts:372-390`.
+
+Existing tests are cited as source only; independent reviewer ran no tests.

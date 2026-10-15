@@ -1,0 +1,15 @@
+# Exact finding disposition
+
+Commit: `78e12076f154b9bf9cd8ab38f7ab070ebcdf6609`. Fingerprint: `10e7664462925fb6d08b6c3dd98699ded5bd97b71e9eb9d9a37e96520b3df442`.
+
+Controller technical disposition: eligible for this exact source and documented local operator boundary; not a zero-finding or security completion claim.
+
+DISPATCH_STATE_DIR is an operator-configured state root; state_dir rejects NUL and literal parent segments, resolves the root, then appends the fixed registry-health.log name. Error details do not become path segments.
+
+Trust boundary: Environment is inherited by the orchestrator and registry child; it is local configuration, not a dispatch record field.
+
+Remaining limits: Realpath does not pin a directory handle; root and log symlink replacement or a future lower-trust env injector require re-review.
+
+Source citations: `bin/dispatch-registry.py:125-164`, `bin/dispatch-registry.py:209-217`, `src/dispatch/registry-command.ts:10-13`.
+
+Existing tests are cited as source only; independent reviewer ran no tests.

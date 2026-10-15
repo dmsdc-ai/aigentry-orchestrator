@@ -7,7 +7,7 @@ extracts the matching section as the GitHub Release notes, so a publish fails
 without one. Unreleased harness work is still grouped under a dated
 `## [<YYYY-MM-DD>]` section beneath the ongoing `## [Unreleased]` working set.
 
-## [0.2.5] - 2026-10-14
+## [0.2.5] - 2026-10-15
 
 Candidate release for context handoff, snapshot-before-compact, bounded model
 routing and catalog validation, worker confinement corrections, and mandatory
@@ -33,19 +33,30 @@ bytes; publishing this release would not close any task.
   wrapper refusal, Linux preflight corrections and sealed worker settings for
   noninteractive launch.
 
-### Known limitations
+### Release gates
 
-- Exact integrated CI, configured security scanning and reviewed per-finding
-  policy, release workflow trust pin, native Windows anchored capture and
-  installed telepty report ACK remain release gates. A prior integrated CI run
-  failed; focused corrections are not final acceptance. Historical 16 LOW
-  scanner findings require individual review.
-- Focus rebind (#507), full cross-CLI context restoration proof (#1204), and
-  durable provider auth refresh (#1208) are not complete. Native Windows
-  ACL/sharing root cause remains open.
+- The configured source scan of the frozen candidate reported 17 findings
+  (1 MEDIUM, 16 LOW; exit 1). Portable per-fingerprint records describe
+  conditional eligible decisions for the local operator/control-root trust
+  boundary. The exact policy bytes still need controller review and a reviewed
+  literal workflow pin. This is not a zero-findings or security-clearance claim.
+- Exact integrated CI remains pending. A prior integrated run failed; focused
+  corrections do not replace a final run. Publication is not authorized.
 - The required unified CLI `@dmsdc-ai/aigentry` 0.2.0 (#1211) is a separate
-  companion artifact; it is not included in this orchestrator package. Its
-  native/systemd/live installation gates and publication remain open.
+  companion artifact at commit `4fc6b65a550d79ed32ef6b286499387a99dcc0b6`,
+  not part of this package. Its exact CI and offline ignore-scripts install
+  with inert probes passed; its publication remains pending.
+
+### Unsupported or incomplete capabilities
+
+- Native Windows anchored capture and staging, the original ACL/sharing root
+  cause, and installed telepty end-to-end report ACK are not established by
+  this candidate. New lower-trust callers, path and identity races, and
+  installed sandbox-runtime or interpreter provenance also remain unproven.
+- Focus rebind (#507), full cross-CLI context restoration proof (#1204), and
+  durable provider auth refresh (#1208) are not complete. The companion CLI's
+  inert probes do not establish native, systemd, live installation, or
+  install-script behavior.
 
 ## [0.2.4] - 2026-10-08
 

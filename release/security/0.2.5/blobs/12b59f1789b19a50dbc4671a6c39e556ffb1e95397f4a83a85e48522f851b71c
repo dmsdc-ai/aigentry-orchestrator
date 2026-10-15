@@ -1,0 +1,15 @@
+# Exact finding disposition
+
+Commit: `78e12076f154b9bf9cd8ab38f7ab070ebcdf6609`. Fingerprint: `75501f8baf9aa6861cb7837d558a9d917f8cab99b5a90283dd7bc32b7b99c930`.
+
+Controller technical disposition: eligible for this exact source and documented local operator boundary; not a zero-finding or security completion claim.
+
+commit writes a fixed active.json.<pid>.tmp sibling, fsyncs it, then atomically replaces the fixed active.json path. The only variable suffix is the local process PID, not a record field.
+
+Trust boundary: DISPATCH_STATE_DIR is operator configuration; dispatch records are validated data and do not choose filenames.
+
+Remaining limits: Atomic rename protects completeness, not a malicious symlinked/replaced state directory; directory provenance and same-UID races remain unmeasured.
+
+Source citations: `bin/dispatch-registry.py:148-164`, `bin/dispatch-registry.py:396-424`.
+
+Existing tests are cited as source only; independent reviewer ran no tests.

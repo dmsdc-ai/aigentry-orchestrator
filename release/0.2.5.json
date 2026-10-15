@@ -10,10 +10,9 @@
     {
       "task_id": 652,
       "disposition": "shipping",
-      "scope": "Confinement preflight, wrapper refusal, Linux CI support and focused tests are included; native Windows anchored capture and staging remain unproven.",
+      "scope": "Confinement preflight, wrapper refusal, Linux CI support and focused tests are included; native Windows anchored capture and staging remain unproven and are not claimed release capabilities.",
       "paths": [
         ".github/workflows/ci.yml",
-        ".github/workflows/release.yml",
         "src/session/worker-sandbox-runner.ts",
         "tests/dispatch/T28_protected_push_guard.sh",
         "tests/dispatch/cli-wrapper-refusal.test.ts",
@@ -23,7 +22,7 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
         }
       ]
     },
@@ -38,14 +37,14 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
         }
       ]
     },
     {
       "task_id": 1170,
       "disposition": "shipping",
-      "scope": "Attempt-bound outbox, report pump, registry, review and cleanup integration with focused tests are included; installed telepty ACK and native Windows capture remain open.",
+      "scope": "Attempt-bound outbox, report pump, registry, review and cleanup integration with focused tests are included; installed telepty ACK and native Windows capture are not established capabilities.",
       "paths": [
         "bin/boot-prepare.mjs",
         "bin/dispatch-registry.py",
@@ -88,7 +87,7 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
         }
       ]
     },
@@ -103,7 +102,7 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
         }
       ]
     },
@@ -118,7 +117,7 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
         }
       ]
     },
@@ -178,21 +177,44 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
         }
       ]
     },
     {
       "task_id": 1202,
       "disposition": "shipping",
-      "scope": "Shared integration and release metadata, package version, lockfile, public projection, changelog and planning evidence are included; security, exact CI and publication remain pending.",
+      "scope": "Shared integration and release records, version and lockfile, public projection, 21 portable evidence blobs and policy path are included; 17 scanner findings have conditional local-boundary dispositions, while exact policy review, workflow pin, final CI and publication remain pending.",
       "paths": [
+        ".github/workflows/release.yml",
         "CHANGELOG.md",
         "bin/init/manifest.mjs",
         "package-lock.json",
         "package.json",
         "release/0.2.5-dispositions.md",
         "release/0.2.5.json",
+        "release/security/0.2.5/blobs/0473a19da4e50b2a597518b1db2d1c3d70b4dbda0bcde561527acb23dc8bf5c8",
+        "release/security/0.2.5/blobs/12b59f1789b19a50dbc4671a6c39e556ffb1e95397f4a83a85e48522f851b71c",
+        "release/security/0.2.5/blobs/23b4996de8008903f2aa881de918b4da6ae00cb0efff207f43c42cb175ccfe18",
+        "release/security/0.2.5/blobs/323f43d41b40e9d84eb394a24ba5dd81254335305d628537e9875e976f02e21a",
+        "release/security/0.2.5/blobs/44f1ba9540dad778509795ca013331b081f70e909f998ac3180bbadcef679e4e",
+        "release/security/0.2.5/blobs/5876fb5eccc2db2d05b84f16b0009c04c382e63be565f02a1b78c2e6ade0280b",
+        "release/security/0.2.5/blobs/6b12d950444ad6810bb7de98c2cc2a7162e2f983d0fc70530cfe645f7e98c19b",
+        "release/security/0.2.5/blobs/7cc40d839f71a90a57f88490a167dffcc56af71dc1c4f64e2ab3aa6056ea05a9",
+        "release/security/0.2.5/blobs/7fb39d1fb133c027a337ad80042365ea47626a0ba15de23f523d5dfa26825713",
+        "release/security/0.2.5/blobs/8512a85073e70c0045d3e42d402c090207fe58ec8e65366b40054a6fc240cc5f",
+        "release/security/0.2.5/blobs/8bad7647c1b3a82109ade70fc32469bc4210aee6c024f4b53a8331afa4707daa",
+        "release/security/0.2.5/blobs/9042a0b285125eddc7bca5e2d1bd4d2981f0ea1be7ce0ff1c8f77671ffa8f171",
+        "release/security/0.2.5/blobs/9d46030a0cdca063af785c15c79a32dd718063bc4f61f87e46279b8574c8a85e",
+        "release/security/0.2.5/blobs/a05cf15dd0f96f8e942a5251aa64fffef3082845146aea422f792b86d618b3df",
+        "release/security/0.2.5/blobs/a08c904029663a3b8ba64541c15a458a46a10ec093fc5819ead89fbbbf634ef8",
+        "release/security/0.2.5/blobs/a0aef21f47d8addced9fbaf40db85e766b1c369daf6b247273a296316dd9b7b3",
+        "release/security/0.2.5/blobs/cdba472388320c0b7d4c84d378a31dde2ef4efaa82eaf713870ec8967e36330e",
+        "release/security/0.2.5/blobs/de6726cb710879615496c7606f7bc7cef02672478543903ae31ab8f9523d6707",
+        "release/security/0.2.5/blobs/e0ae6463365c383bc81999ba638b7748382be82f337051586bf9d2c528da5d8f",
+        "release/security/0.2.5/blobs/ee43ac1e36c2aa9bbe0ec5168901ca141f4a551cd45c46b23e1d8c20b42825e6",
+        "release/security/0.2.5/blobs/fa4f6446bbd3de97e4c40f6d1ee02defbce3a5bfd355ddcb2010fd10b8689ae5",
+        "release/security/0.2.5/policy.json",
         "release/tasks.json",
         "scripts/run-tests.mjs",
         "tooling/instructions/common.md"
@@ -200,7 +222,7 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
         }
       ]
     },
@@ -215,7 +237,7 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
         }
       ]
     },
@@ -230,7 +252,7 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
         }
       ]
     },
@@ -253,7 +275,7 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
         }
       ]
     },
@@ -270,7 +292,7 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "4fbd5f02857183c3940e778ca2ab56af80aa1021f0bc21c7e7906985adf9d74d"
+          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
         }
       ]
     }

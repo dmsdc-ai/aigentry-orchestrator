@@ -1,0 +1,15 @@
+# Exact finding disposition
+
+Commit: `78e12076f154b9bf9cd8ab38f7ab070ebcdf6609`. Fingerprint: `8a68cdc58a4c83289b9925147e269013421f75638298375b4d63422795d14d85`.
+
+Controller technical disposition: eligible for this exact source and documented local operator boundary; not a zero-finding or security completion claim.
+
+The target SID is checked against a separator-free identity regex before the first session path read. The subsequent current/manifest/receipt chain is used only for an existing running confined target.
+
+Trust boundary: --target comes from the dispatch caller; AIGENTRY_SESSIONS_ROOT and current state are host-side operator/control-root data, assumed protected from the worker.
+
+Remaining limits: The current pointer and receipt are hash checked but not an authenticated same-UID signature; symlink/time races and nondefault session-root permissions require native review.
+
+Source citations: `src/dispatch/cli.ts:1364-1375`, `src/session/worker-sandbox.ts:88-91`, `src/session/worker-sandbox.ts:460-471`.
+
+Existing tests are cited as source only; independent reviewer ran no tests.

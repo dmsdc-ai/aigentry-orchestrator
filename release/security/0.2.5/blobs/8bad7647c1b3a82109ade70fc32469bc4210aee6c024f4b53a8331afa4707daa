@@ -1,0 +1,15 @@
+# Exact finding disposition
+
+Commit: `78e12076f154b9bf9cd8ab38f7ab070ebcdf6609`. Fingerprint: `7b573f0a67d6314301b42354489bae88654c3709ab10e6385a2682c5cb7208f0`.
+
+Controller technical disposition: eligible for this exact source and documented local operator boundary; not a zero-finding or security completion claim.
+
+readSync operates on the descriptor just opened read-only for the explicit --ref path, caps the excerpt at 4096 bytes and closes it. It cannot redirect an additional path read after open.
+
+Trust boundary: The direct local router caller selects --ref; production dispatch auto routing omits it.
+
+Remaining limits: The selected file's contents may reach an external classifier; any new lower-trust path forwarding needs a fresh privacy review.
+
+Source citations: `bin/model-router.mjs:102-112`, `bin/model-router.mjs:124-140`.
+
+Existing tests are cited as source only; independent reviewer ran no tests.

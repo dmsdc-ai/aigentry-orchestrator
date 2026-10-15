@@ -1,0 +1,15 @@
+# Exact finding disposition
+
+Commit: `78e12076f154b9bf9cd8ab38f7ab070ebcdf6609`. Fingerprint: `00af55a0d2de73a140bdcfdcf0b9d19bbd9ad2f3aeb38b4cc0cd8f2b232915d9`.
+
+Controller technical disposition: eligible for this exact source and documented local operator boundary; not a zero-finding or security completion claim.
+
+--profile and AIGENTRY_ROUTER_PROFILE deliberately select an operator profile file; the default is a package-relative profile. No task text is interpolated into this path. A malformed profile falls back to the fixed table result.
+
+Trust boundary: Direct router CLI/environment are local operator configuration. The managed dispatch auto route does not pass a task ref into this profile selector.
+
+Remaining limits: Local symlink replacement, profile provenance, and any privileged wrapper that forwards attacker-controlled --profile remain outside static proof.
+
+Source citations: `bin/model-router.mjs:21-24`, `bin/model-router.mjs:45-53`, `bin/model-router.mjs:73-82`.
+
+Existing tests are cited as source only; independent reviewer ran no tests.
