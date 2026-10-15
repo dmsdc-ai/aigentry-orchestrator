@@ -38,14 +38,16 @@ bytes; publishing this release would not close any task.
 - The configured source scan of the frozen candidate reported 17 findings
   (1 MEDIUM, 16 LOW; exit 1). Portable per-fingerprint records describe
   conditional eligible decisions for the local operator/control-root trust
-  boundary. The exact policy bytes still need controller review and a reviewed
-  literal workflow pin. This is not a zero-findings or security-clearance claim.
-- Exact integrated CI remains pending. A prior integrated run failed; focused
-  corrections do not replace a final run. Publication is not authorized.
+  boundary. Publication requires controller review of the exact policy bytes
+  and a literal workflow pin to the reviewed SHA-256. This is not a
+  zero-findings or security-clearance claim.
+- Publication requires exact integrated CI, including Windows W1 (full suite)
+  and W0 (installed package), followed by registry verification. A prior
+  integrated run failed; focused corrections do not replace the required run.
 - The required unified CLI `@dmsdc-ai/aigentry` 0.2.0 (#1211) is a separate
   companion artifact at commit `4fc6b65a550d79ed32ef6b286499387a99dcc0b6`,
   not part of this package. Its exact CI and offline ignore-scripts install
-  with inert probes passed; its publication remains pending.
+  with inert probes passed; its publication is tracked independently.
 
 ### Unsupported or incomplete capabilities
 

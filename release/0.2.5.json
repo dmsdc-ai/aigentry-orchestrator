@@ -22,7 +22,7 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
+          "sha256": "b39908ced4d45e062c12954dcd483123fd14d0029de62444572de87c04ec4bc3"
         }
       ]
     },
@@ -37,7 +37,7 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
+          "sha256": "b39908ced4d45e062c12954dcd483123fd14d0029de62444572de87c04ec4bc3"
         }
       ]
     },
@@ -87,7 +87,7 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
+          "sha256": "b39908ced4d45e062c12954dcd483123fd14d0029de62444572de87c04ec4bc3"
         }
       ]
     },
@@ -102,7 +102,7 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
+          "sha256": "b39908ced4d45e062c12954dcd483123fd14d0029de62444572de87c04ec4bc3"
         }
       ]
     },
@@ -117,7 +117,7 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
+          "sha256": "b39908ced4d45e062c12954dcd483123fd14d0029de62444572de87c04ec4bc3"
         }
       ]
     },
@@ -177,14 +177,14 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
+          "sha256": "b39908ced4d45e062c12954dcd483123fd14d0029de62444572de87c04ec4bc3"
         }
       ]
     },
     {
       "task_id": 1202,
       "disposition": "shipping",
-      "scope": "Shared integration and release records, version and lockfile, public projection, 21 portable evidence blobs and policy path are included; 17 scanner findings have conditional local-boundary dispositions, while exact policy review, workflow pin, final CI and publication remain pending.",
+      "scope": "Shared integration and release records, version and lockfile, public projection, 21 portable evidence blobs and policy path are included; 17 scanner findings have conditional local-boundary dispositions. Publication requires controller-reviewed exact policy bytes, a literal workflow pin to their SHA-256, exact integrated CI including Windows W1 (full suite) and W0 (installed package), then registry verification.",
       "paths": [
         ".github/workflows/release.yml",
         "CHANGELOG.md",
@@ -222,7 +222,7 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
+          "sha256": "b39908ced4d45e062c12954dcd483123fd14d0029de62444572de87c04ec4bc3"
         }
       ]
     },
@@ -237,7 +237,7 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
+          "sha256": "b39908ced4d45e062c12954dcd483123fd14d0029de62444572de87c04ec4bc3"
         }
       ]
     },
@@ -252,7 +252,7 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
+          "sha256": "b39908ced4d45e062c12954dcd483123fd14d0029de62444572de87c04ec4bc3"
         }
       ]
     },
@@ -275,7 +275,7 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
+          "sha256": "b39908ced4d45e062c12954dcd483123fd14d0029de62444572de87c04ec4bc3"
         }
       ]
     },
@@ -292,7 +292,7 @@
       "evidence": [
         {
           "path": "release/0.2.5-dispositions.md",
-          "sha256": "b4aa449bfef1f9806e1db531afad5f67540ebb7afeeee9358b5031c63a625ed6"
+          "sha256": "b39908ced4d45e062c12954dcd483123fd14d0029de62444572de87c04ec4bc3"
         }
       ]
     }
