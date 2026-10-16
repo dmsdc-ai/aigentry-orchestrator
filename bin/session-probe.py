@@ -439,7 +439,7 @@ def current_prompt_control(pattern: str, screen: str) -> bool:
 def codex_current_composer(screen: str) -> str | None:
     """Separate the measured Codex footer from an eligible prompt and its input.
 
-    Only the complete, blank-separated model/cwd/status + shortcuts suffix is
+    Only the complete, blank-separated model/cwd + shortcuts suffix is
     chrome. Unknown tails stay in the composer and cannot establish empty input.
     This frames text only; current_screen still owns binding and currentness.
     """
@@ -461,7 +461,7 @@ def codex_current_composer(screen: str) -> str | None:
     if (len(lines) - start >= 4 and not lines[-3].strip()
             and re.fullmatch(
                 r"  GPT-[A-Za-z0-9.-]+ (?:low|medium|high|xhigh|max|ultra)"
-                r" · /[^·\n]+ · [^\n]+", lines[-2])
+                r" · /[^·\n]+(?: · \S[^\n]*)?", lines[-2])
             and re.fullmatch(
                 r"  \? for shortcuts(?: · \d+ warnings?"
                 r"| {2,}⚠ \d+ warnings? · f2 to view)", lines[-1])):
