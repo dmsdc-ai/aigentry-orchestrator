@@ -447,6 +447,11 @@ def codex_current_composer(screen: str) -> str | None:
     prompts = [i for i, line in enumerate(lines) if re.match(r"^[ \t]*›", line)]
     if not prompts:
         return None
+    # The measured current prompt starts at column zero. An indented glyph may
+    # be multiline input, so it cannot replace an earlier composer anchor.
+    # Keep all pending rows even across blank lines or additional glyphs.
+    while len(prompts) > 1 and lines[prompts[-1]].startswith((" ", "\t")):
+        prompts.pop()
     start = prompts[-1]
     # Check this occurrence, not an identical prompt quoted elsewhere in a fence.
     if lines[start].lstrip(" \t") not in error_banner_lines("\n".join(lines[:start + 1]), 1):

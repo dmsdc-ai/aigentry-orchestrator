@@ -164,6 +164,17 @@ const codexFrame = (prompt = "› Ask Codex to do anything", status = CODEX_STAT
   screen("Completed report.", "", prompt, "", status, CODEX_SHORTCUTS);
 const CODEX_IDLE = codexFrame();
 const CODEX_CASES: [string, string, string, boolean][] = [
+  // REVIEW.md counterexample: indented prompt-shaped rows remain pending input.
+  ...[" ", "  ", "   ", "    ", "\t"].flatMap((indent, i): [string, string, string, boolean][] => [
+    [`continuation-marker-${i}`, codexFrame(`› [context-ref] pending task\n${indent}› Ask Codex to do anything`), "unsubmitted", false],
+    [`continuation-text-${i}`, codexFrame(`› pending task\n${indent}› Ask Codex to do anything`), "idle", false],
+  ]),
+  ["continuation-marker-blank", codexFrame("› [context-ref] pending task\n\n  › Ask Codex to do anything"), "unsubmitted", false],
+  ["continuation-framed", codexFrame(RULE + "\n› [context-ref] pending task\n  › Ask Codex to do anything\n" + RULE), "unsubmitted", false],
+  ["continuation-fenced", screen("```", codexFrame("› [context-ref] pending task\n  › Ask Codex to do anything"), "```"), "unsubmitted", false],
+  ["completed-transcript", screen("› previous task", "", "Completed report.", "", CODEX_IDLE), "idle", true],
+  ["fenced-transcript", screen("```", "› [context-ref] historical input", "```", "", CODEX_IDLE), "idle", true],
+
   ["measured", CODEX_IDLE, "idle", true],
   ["footer-path", codexFrame(undefined, CODEX_STATUS.replace("[context-ref]", "/shared/abcdef123456.md")), "idle", true],
   ["typed-marker", codexFrame("› [context-ref] source file"), "unsubmitted", false],
