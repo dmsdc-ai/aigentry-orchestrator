@@ -185,24 +185,32 @@ an environment token or the optional private token file, a confined Claude spawn
 dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_REQUIRED: confined Claude workers authenticate only with an approved automation token (claude setup-token) supplied as AIGENTRY_CLAUDE_OAUTH_TOKEN or in ~/.aigentry/credentials/claude-worker/token; the host login is never copied; see docs/setup/dispatch-capacity.md; nothing was spawned (exit 78)
 ```
 
-The refusal comes after routing and the spawn decision have been made and
-before anything is staged. No boot preparation runs, no git guard is
-installed, no terminal opens and no sandbox is prepared. The message names the
-variable and never echoes a value.
+Initially missing or invalid authentication refuses during automatic Claude
+candidate selection or the selected Claude spawn precheck, before boot
+preparation, git-guard installation, sandbox staging or terminal opening.
+Automatic candidate selection can refuse before the final spawn decision.
 
-The library entry point (`prepareWorkerSandbox`) refuses with the same fixed
-code before any staging write.
+The library entry point (`prepareWorkerSandbox`) rereads the source before its
+own staging writes. If the store disappears or becomes invalid after the
+precheck, dispatch returns the fixed REQUIRED or INVALID diagnostic and exit 78.
+Boot preparation and git-guard installation have already run at that point;
+their effects remain, but no sandbox attempt is staged and no terminal or worker
+is spawned. Authentication diagnostics never echo token values or error details.
 
 Other launch behavior:
 
-- **Codex and Gemini workers.** No change.
+- **Explicit Codex and eligible automatic Codex primary.** Claude authentication
+  is not inspected. Gemini behavior is unchanged.
 - **`--target` delivery** to a session that is already running. No change.
 - **The legacy unconfined boot path.** No change.
 - **Routing.** Automatic Claude routing uses the same environment/file
   selector, including on Linux without a host interactive credential file.
   Missing or invalid Claude authentication refuses with exit 78 rather than
   silently choosing another provider or billing path. Capacity and executable
-  availability rules remain separate. Codex does not inspect the Claude store.
+  availability rules remain separate. An automatic Codex primary at cap can
+  reach an executable, uncapped Claude fallback candidate; missing or invalid
+  Claude authentication then refuses with the same fixed diagnostic and exit 78,
+  rather than silently skipping Claude or choosing another provider.
 - **Workers already running.** They keep whatever they were started with.
   Nothing is restarted or cleaned up.
 

@@ -627,6 +627,7 @@ function credentialPresent(cli: string): boolean {
 /**
  * Fresh spawn only: a routed CLI that is not routable (at cap, no executable, no credential) falls to the
  * first routable router candidate, in order; none left refuses (exit 78) — never an unconfined fallback.
+ * Reaching a Claude candidate with missing/invalid authentication refuses immediately.
  * An explicit --cli warns at cap and proceeds.
  */
 function applyCliCap(o: Opts): void {
@@ -1341,8 +1342,26 @@ function spawnWorkspace(o: Opts, sid: string): void {
     // #1170 (RC6): the registry state (the registry's own default) and this control workspace.
     const stateDir = path.resolve(env.DISPATCH_STATE_DIR ||
       path.join(path.dirname(path.dirname(path.resolve(DISPATCH_REGISTRY_PY))), "state", "dispatch"));
-    const sandbox = prepareWorkerSandbox(scope, o.cli, bootSpawnCwd, bootArgv, protectedRoot, o.cwd, workerHooksDir, bootLaunch,
-      o.decision?.executable, { noAccess: [stateDir], noWrite: [path.resolve(SCRIPT_DIR, "..")] });
+    let sandbox: ReturnType<typeof prepareWorkerSandbox>;
+    try {
+      sandbox = prepareWorkerSandbox(scope, o.cli, bootSpawnCwd, bootArgv, protectedRoot, o.cwd, workerHooksDir, bootLaunch,
+        o.decision?.executable, { noAccess: [stateDir], noWrite: [path.resolve(SCRIPT_DIR, "..")] });
+    } catch (error) {
+      // The source may change after precheck. Boot/guard effects already exist, but no terminal has opened.
+      if (o.cli === "claude" && error instanceof Error) {
+        if (error.message === "SANDBOX_AUTH_WORKER_TOKEN_REQUIRED") {
+          die("dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_REQUIRED: confined Claude workers authenticate only with an approved " +
+            "automation token (claude setup-token) supplied as AIGENTRY_CLAUDE_OAUTH_TOKEN or in " +
+            "~/.aigentry/credentials/claude-worker/token; the host login is never copied; " +
+            "see docs/setup/dispatch-capacity.md; nothing was spawned (exit 78)", 78);
+        }
+        if (error.message === "CLAUDE_OAUTH_STORE_INVALID" || error.message === "CLAUDE_OAUTH_TOKEN_INVALID") {
+          die("dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_INVALID: invalid automation token or unsafe private token store; " +
+            "see docs/setup/dispatch-capacity.md; nothing was spawned (exit 78)", 78);
+        }
+      }
+      throw error;
+    }
     launcher = writeWorkerLauncher(sid, o.cli, sandbox.launcher, "", workerHooksDir, spawnEnv);
     spawnCwd = bootSpawnCwd;
   } else {

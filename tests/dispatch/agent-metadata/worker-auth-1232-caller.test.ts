@@ -1,7 +1,7 @@
 // #1232 — confined Claude worker authentication on the ACTUAL compiled dispatch caller path
-// (dist/src/dispatch/cli.js --spawn-and-dispatch). Without AIGENTRY_CLAUDE_OAUTH_TOKEN the spawn arm refuses
-// SANDBOX_AUTH_WORKER_TOKEN_REQUIRED (exit 78) before boot-prepare, the git guard or the terminal; with a FAKE
-// opt-in it reaches prepareWorkerSandbox and seals the handoff marker, never a host credential copy.
+// (dist/src/dispatch/cli.js --spawn-and-dispatch). Initially missing/invalid env/store authentication
+// refuses before boot/guard/terminal. Late store invalidation refuses after boot/guard, before sandbox
+// staging or terminal. Valid FAKE authentication seals a handoff, never a host credential copy.
 // Hermetic: fake CLIs/HOME/open-session/telepty from model-router-fixtures (whose fake host HOME still holds a
 // synthetic .credentials.json, so "never copied" is observable). No real CLI, terminal, daemon, provider or
 // network; the token is fabricated and never valid anywhere.
@@ -142,7 +142,7 @@ for (const kind of ["malformed file", "unsafe file", "invalid env"] as const) {
   });
 }
 
-posixTest("#1232 caller: Codex ignores malformed Claude store and explicit token", () => {
+posixTest("#1232 caller: explicit Codex ignores malformed Claude store and explicit token", () => {
   const f = fixture();
   try {
     provision(f, "FAKE INVALID STORE");
@@ -203,3 +203,86 @@ posixTest("#1232 caller: automatic Claude routing uses only the private store", 
     assert.doesNotMatch(r.stderr, /has no credential| -> /);
   } finally { f.cleanup(); }
 });
+
+const INVALID_REFUSAL = "dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_INVALID: invalid automation token or unsafe private token store; " +
+  "see docs/setup/dispatch-capacity.md; nothing was spawned (exit 78)";
+
+// The fixture owns this node shim. Mutate only after actual boot succeeds: dispatch's initial
+// auth precheck has passed, while prepareWorkerSandbox has not yet reread the store.
+for (const kind of ["missing", "malformed", "unsafe", "unrelated executable change"] as const) {
+  posixTest(`#1232 caller: late preparation ${kind} preserves its error boundary`, () => {
+    const f = fixture();
+    try {
+      const source = provision(f);
+      const seeded = [f.queue, join(f.root, "state/active.json")].map(p => [p, readFileSync(p, "utf8")] as const);
+      f.script("node", `
+const fs = require('node:fs'), path = require('node:path');
+const r = require('node:child_process').spawnSync(process.execPath, process.argv.slice(2), { stdio: 'inherit' });
+if (r.status === 0 && path.basename(process.argv[2] || '') === 'boot-prepare.mjs') {
+  const source = path.join(process.env.HOME, '.aigentry/credentials/claude-worker/token');
+  const kind = ${JSON.stringify(kind)};
+  if (kind === 'missing') fs.unlinkSync(source);
+  else if (kind === 'malformed') {
+    fs.writeFileSync(source + '.replacement', 'FAKE-LATE-INVALID-DETAIL no-newline', { mode: 0o600 });
+    fs.renameSync(source + '.replacement', source);
+  } else if (kind === 'unsafe') fs.chmodSync(source, 0o644);
+  else fs.appendFileSync(path.join(__dirname, 'claude'), '\\n// fixture identity change\\n');
+  fs.writeFileSync(path.join(process.env.HOME, 'after-boot'), 'boot returned successfully');
+}
+process.exit(r.status ?? 99);
+`);
+      const r = spawnClaude(f, { AIGENTRY_CLAUDE_OAUTH_TOKEN: undefined });
+      // Assert the actual boundary even on RED, before the expected diagnostic assertion fails.
+      assert.equal(readFileSync(join(f.env.HOME!, "after-boot"), "utf8"), "boot returned successfully");
+      assert.ok(existsSync(join(f.env.AIGENTRY_GIT_HOOKS_DIR!, "pre-push")), "guard already installed");
+      assert.deepEqual(readdirSync(join(f.aig, "sessions/router-fixture")), ["boot"], "only boot staging survives");
+      assert.ok(files(join(f.aig, "sessions/router-fixture/boot")).length > 0, "actual boot staged files");
+      assert.deepEqual(readdirSync(join(f.root, "tmp")).filter(n => n.startsWith("agw-")), []);
+      for (const p of [f.env.OPEN_LOG!, `${f.env.OPEN_LOG}.calls`, f.env.WORK_LOG!, f.env.PARENT_MODEL_LOG!]) {
+        assert.equal(existsSync(p), false, "no terminal/worker/delivery");
+      }
+      for (const [p, bytes] of seeded) assert.equal(readFileSync(p, "utf8"), bytes);
+      const output = r.stdout + r.stderr;
+      for (const secret of [FAKE_TOKEN, "FAKE-LATE-INVALID-DETAIL", source, "fixture-access-token-not-a-real-credential"]) {
+        assert.equal(output.includes(secret), false, "no token/source/parser detail disclosure");
+      }
+      if (kind === "unrelated executable change") {
+        assert.equal(r.status, 1, r.stderr);
+        assert.match(r.stderr, /SANDBOX_EXECUTABLE_CHANGED/);
+        assert.doesNotMatch(r.stderr, /SANDBOX_AUTH_WORKER_TOKEN_(REQUIRED|INVALID)/);
+      } else {
+        assert.equal(r.status, 78, r.stderr);
+        assert.equal(r.stderr.trim(), kind === "missing" ? REFUSAL : INVALID_REFUSAL);
+      }
+    } finally { f.cleanup(); }
+  });
+}
+
+// Characterization: Codex bypass applies to explicit/eligible primary selection, not Claude fallback scanning.
+for (const atCap of [false, true]) {
+  for (const kind of ["missing", "invalid"] as const) {
+    posixTest(`#1232 caller characterization: automatic Codex ${atCap ? "at cap" : "eligible"}, Claude auth ${kind}`, () => {
+      const f = fixture();
+      try {
+        if (kind === "invalid") provision(f, "FAKE-INVALID-CLAUDE-STORE");
+        const r = f.dispatch([...f.spawnArgs, "--role", "coder"], {
+          PATH: [f.bin, cleanHostPath()].join(delimiter), AIGENTRY_CLAUDE_OAUTH_TOKEN: undefined,
+          AIGENTRY_CLI_CAP_CODEX: atCap ? "0" : "10", AIGENTRY_CLI_CAP_CLAUDE: "10",
+        });
+        if (atCap) {
+          assert.equal(r.status, 78, r.stderr);
+          assert.equal(r.stderr.trim(), kind === "missing" ? REFUSAL : INVALID_REFUSAL);
+          for (const p of [f.env.OPEN_LOG!, join(f.aig, "sessions"), join(f.aig, "role-sandbox"), f.env.AIGENTRY_GIT_HOOKS_DIR!]) {
+            assert.equal(existsSync(p), false, "fallback selection refuses before boot");
+          }
+        } else {
+          assert.equal(r.status, 0, r.stderr);
+          assert.equal(f.manifest().cli, "codex");
+          assert.equal(f.manifest().claudeOAuthHandoff, undefined);
+        }
+        assert.equal((r.stdout + r.stderr).includes("FAKE-INVALID-CLAUDE-STORE"), false);
+        assert.equal(existsSync(f.env.WORK_LOG!), false);
+      } finally { f.cleanup(); }
+    });
+  }
+}
