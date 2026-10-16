@@ -475,3 +475,35 @@ test('mutation must fail: routing guidance names bare status as bounded', () => 
   const bare = base.skill.replace(routing, routing.replace(`\`${BOUNDED_STATUS}\``, 'bounded `bin/dispatch-tracker.sh status`'));
   assert.ok(checkBoundedStatusLiteral({ ...base, skill: bare }).length > 0, 'mutant passed: bare status not caught');
 });
+
+// U1 (#1172): queue MUTATION doctrine must name the locked `bin/tq-note.mjs` command that U3
+// shipped, not the direct `state/task-queue.json` hand edit U3 exists to remove. Text-only, like
+// the rest of this file: it does not prove the command runs, is installed, or is enforced at runtime.
+const DIRECT_QUEUE_EDIT = /(direct(ly)?|by hand|hand-?edit)[^.\n]{0,40}state\/task-queue\.json|state\/task-queue\.json[^.\n]{0,40}(direct(ly)?|by hand|hand-?edit|\(jq\)|with jq|jq edit)/i;
+// Only flags the shipped usage actually declares (bin/tq-note.mjs USAGE): no --idempotency-key.
+const TQ_REGISTER = /bin\/tq-note\.mjs\s+register\b[^\n]*--task-file/;
+const TQ_APPEND = /bin\/tq-note\.mjs\s+append\b[^\n]*--task\b[^\n]*--segment-file/;
+function checkQueueMutationDoctrine(d) {
+  const problems = [];
+  const text = operative(d.skill);
+  for (const s of sentences(text)) {
+    if (DIRECT_QUEUE_EDIT.test(s) && !NEGATION.test(s)) problems.push(`skill: direct queue-edit instruction: ${s.trim().slice(0, 160)}`);
+  }
+  const row = norm(needSection(problems, 'skill 1-1 row', lineOf(text, /^\|\s*1-1\s*\|/)));
+  if (row && !TQ_REGISTER.test(row)) problems.push('skill 1-1: registration does not name bin/tq-note.mjs register --task-file');
+  const s4a = norm(needSection(problems, 'skill Step 4-A section', section(text, /^## Step 4-A\b/)));
+  if (s4a && !TQ_APPEND.test(s4a)) problems.push('skill Step 4-A: Rule 40 segment append does not name bin/tq-note.mjs append --task … --segment-file');
+  return problems;
+}
+test('queue mutation doctrine names the locked tq-note command, not a direct queue edit', () => {
+  assert.deepEqual(checkQueueMutationDoctrine(docs()), []);
+});
+test('mutation must fail: doctrine restores the direct state/task-queue.json edit', () => {
+  const base = docs();
+  assert.deepEqual(checkQueueMutationDoctrine(base), [], 'unmodified staged text must pass before a mutation can discriminate');
+  const row = base.skill.split('\n').find(l => /^\|\s*1-1\s*\|/.test(l));
+  assert.ok(row, 'Step 1-1 table row not found in staged text');
+  const reverted = base.skill.replace(row, row.replace(/`bin\/tq-note\.mjs register --task-file <path>`[^;|]*/, 'direct `state/task-queue.json` edit (jq)'));
+  assert.notEqual(reverted, base.skill, 'mutation target not found in staged text');
+  assert.ok(checkQueueMutationDoctrine({ ...base, skill: reverted }).length > 0, 'mutant passed: direct queue-edit instruction not caught');
+});

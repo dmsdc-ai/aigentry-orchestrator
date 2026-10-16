@@ -428,7 +428,18 @@ function createState(ws, opts) {
   // Python 3 is already a hard prerequisite checked in Step 1 (:205-228 on POSIX,
   // winHardDependencies on win32), so the broker adds no dependency to init. If the lock
   // capability is nonetheless unavailable, this step refuses BY NAME rather than falling
-  // back to an unlocked write, and the rest of init is unaffected.
+  // back to an unlocked write, and that refusal ABORTS init — it is not a skipped step.
+  //
+  // RW3 (review qu1172bdi) corrected the earlier claim that "the rest of init is unaffected",
+  // which was residue from the phase-5 warn-and-skip version that this file no longer has:
+  // the `die(3)` below exits the process. On native win32 the consequence is reached in
+  // practice, not hypothetically — Python exposes O_NOFOLLOW on POSIX only, so the broker
+  // returns exit 6 for every call and `aigentry init` itself aborts with exit 3. That abort
+  // fires with work already done: createState is called after copyManifest and with the
+  // native-capture transaction still open, so the partial-workspace outcome is a real and
+  // currently UNMEASURED question owned by the installed/native path, not a success and not
+  // a waiver. The Windows no-follow requirement stays REQUIRED and OPEN; the refusal must
+  // not be softened or given an unlocked fallback to make Windows green.
   const { status, body } = callBroker({
     v: 1, op: "init-create", queue,
     params: { document: { tasks: [], active_focus: null } },

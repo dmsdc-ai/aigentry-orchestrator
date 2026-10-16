@@ -26,7 +26,7 @@ is context isolation only. Policy text is not evidence that runtime gates are wi
 | Step | Action | Existing infra |
 |------|--------|----------------|
 | 1 | Confirm context with user | conversation; AskUserQuestion for ambiguity (multi-interpretation surface) |
-| 1-1 | Break down → decide # sessions | `work-breakdown` skill (decompose to parallelizable tasks) + register via direct `state/task-queue.json` edit (jq); `bin/tq-track.sh`/`bin/tq-status.sh` read-only views |
+| 1-1 | Break down → decide # sessions | `work-breakdown` skill (decompose to parallelizable tasks) + register via `bin/tq-note.mjs register --task-file <path>` (locked, atomic); `bin/tq-track.sh`/`bin/tq-status.sh` read-only views |
 | 1-2 | Parallel breakdown MANDATORY, conflict-aware | Rules 9/10/36: bundle coupled files; separate independent verification; parallelize independent units within measured resources, with no fixed worker-count cap; track ownership, progress and reports even when deliberation is unavailable |
 | 1-3 | Match CLI to task | "CLI별 역할" table (claude=architecture/MCP, codex=impl/test, gemini=websearch/docs) → `--cli` / `--role` |
 | 2 | Spawn + ref/inline + adaptor | `bin/dispatch.sh --spawn-and-dispatch --cli <c> --role <r> --ref <file> --task <id>` → `bin/open-session.sh` (`detect_terminal`) → `bin/lib/workspace-host.sh` adaptor |
@@ -193,8 +193,10 @@ Before step 5, any context from this turn that **differs from what the task alre
 records** goes onto that task, not into chat only:
 
 ```bash
-# append a dated segment to the OWNING task's note in state/task-queue.json
-# new task only when no existing task owns the context
+# append a dated segment to the OWNING task's note (Rule 40), committed under the queue lock
+bin/tq-note.mjs append --task <id> --segment-file <path>
+# the segment body comes from the FILE, never argv, so a multi-sentence note is not
+# mangled by shell quoting; register a new task only when no existing task owns the context
 ```
 
 Name what was measured and what was not (Rule 38). Closing messages and record-only

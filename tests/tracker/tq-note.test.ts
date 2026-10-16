@@ -1016,7 +1016,11 @@ test("A-15: a hung transform is killed by name, the lock is released, and foreig
   assert.equal(timedOut.r.status, 3, timedOut.r.stdout);
   assert.equal(timedOut.body.reason, "transform_timeout");
   assert.ok(timedOutMs < 25_000, `the timeout was not bounded by --timeout: ${timedOutMs}ms`);
-  assert.equal(fs.readFileSync(q, "utf8"), fs.readFileSync(q, "utf8"), "the queue still reads");
+  // RW2 (review qu1172bdi): a `readFileSync(q) === readFileSync(q)` self-comparison stood here.
+  // It read as a post-timeout integrity check but compared a value to itself, so it could never
+  // fail. Deleted rather than repaired into a byte-identity check: this is the timed-out
+  // pause_before_rename race, and byte-identity under a concurrent writer is not promised. The
+  // oracle is the refusal above plus this parse check — no coverage is lost.
   assert.doesNotThrow(() => readDoc(q), "a killed transform left an unparseable queue");
 
   // The lock was released despite the kill: the next call succeeds promptly.
