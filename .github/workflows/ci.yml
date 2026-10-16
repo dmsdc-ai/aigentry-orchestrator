@@ -1,4 +1,4 @@
-name: CI
+name: Diagnostic exact-source authentication CI
 
 # #894. This file exists because the repo had no test-running CI at all, and the first
 # execution of release.yml — a tag push, at publish time — was therefore also the first
@@ -27,9 +27,8 @@ name: CI
 # limitations are asserted as clean refusals, not skipped.
 
 on:
-  pull_request:
   push:
-    branches: [ main ]
+    branches: [ validation/1238-auth-exact ]
 
 permissions:
   contents: read
@@ -53,6 +52,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          ref: 193ccd4b9cba41fa73b0ffcecd84c620e49d17b6
       - uses: actions/setup-node@v4
         with:
           node-version: '20.20.0'
@@ -1013,6 +1013,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: 193ccd4b9cba41fa73b0ffcecd84c620e49d17b6
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
@@ -1070,6 +1072,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: 193ccd4b9cba41fa73b0ffcecd84c620e49d17b6
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -1098,6 +1102,8 @@ jobs:
         shell: bash
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
+        with:
+          ref: 193ccd4b9cba41fa73b0ffcecd84c620e49d17b6
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -1216,6 +1222,8 @@ jobs:
         shell: bash
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
+        with:
+          ref: 193ccd4b9cba41fa73b0ffcecd84c620e49d17b6
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
