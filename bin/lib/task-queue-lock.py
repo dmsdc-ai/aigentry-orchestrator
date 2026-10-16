@@ -29,7 +29,20 @@ writes nothing. There is no unlocked fallback: an unlocked write is the defect U
 exists to remove.
 
 Usage (callers only; not an operator command):
-  task-queue-lock.py --queue <abs-path> [--timeout <sec>] [--node <exe>]  < request.json
+  task-queue-lock.py --queue <abs-path> --node <abs-exe> [--timeout <sec>]  < request.json
+
+`--node` is REQUIRED and must be an absolute path to an existing regular executable.
+It is always the calling process's own `process.execPath`: every caller is itself Node
+(`bin/tq-note.mjs`, `src/dispatch/cli.ts` taskLedgerUpdate, and the suite), and the two
+non-Node callers reach this file THROUGH `bin/tq-note.mjs` rather than directly
+(`bin/tq-focus.sh` runs `node .../tq-note.mjs`; `bin/init/cli.mjs` imports its
+`callBroker`). There is deliberately no `AIGENTRY_TQ_NODE` and no `PATH` lookup: an
+earlier version had both, nothing in the tree ever set them, and an ambient fallback only
+widens which executable this file can start. Removing it is a reduction of an unused
+internal selection surface — NOT a trust boundary against a same-UID caller, who can edit
+this file anyway. Snyk python/CommandInjection
+6a365508-cd04-4257-908b-b46857eb504b named the flow; the fix is that there is no longer
+an ambient source for it to come from.
 """
 
 from __future__ import annotations
@@ -38,7 +51,6 @@ import errno
 import json
 import os
 import secrets
-import shutil
 import stat
 import subprocess
 import sys
@@ -108,27 +120,40 @@ def parse_argv(argv: list[str]) -> dict[str, str]:
         respond("invalid_argument", "--queue is required", EXIT_USAGE)
     if not os.path.isabs(opts["queue"]):
         respond("invalid_argument", "--queue must be absolute: %s" % opts["queue"], EXIT_USAGE)
+    if not opts.get("node"):
+        # Required, with no ambient fallback to fall back TO. Every caller is a Node
+        # process passing its own process.execPath; see the module docstring.
+        respond("invalid_argument",
+                "--node is required and must be the calling process's own executable "
+                "(an absolute path to an existing regular executable); there is no "
+                "environment or PATH fallback", EXIT_USAGE)
     return opts
 
 
-def resolve_node(explicit: str | None) -> str:
-    """The Node executable, in order: the caller's own `process.execPath`, the declared
-    env override, then PATH. Every source is the CALLING PROCESS or the environment —
-    never a queue field, which is the distinction the no-executable-from-data rule
-    draws. The result must be an existing regular file before it is used."""
-    for candidate in (explicit, os.environ.get("AIGENTRY_TQ_NODE") or None,
-                      shutil.which("node"), shutil.which("node.exe")):
-        if not candidate:
-            continue
-        try:
-            st = os.stat(candidate)
-        except OSError:
-            continue
-        if stat.S_ISREG(st.st_mode):
-            return candidate
-    respond("node_unavailable",
-            "no Node executable found (--node, AIGENTRY_TQ_NODE, PATH); the packaged "
-            "transform cannot run and nothing was written", EXIT_CAPABILITY)
+def resolve_node(explicit: str) -> str:
+    """The ONE Node executable this file may start: the one the caller named on `--node`,
+    which is always that caller's own `process.execPath`.
+
+    There is no second source. No environment variable, no `PATH` search, and — as
+    everywhere else in this file — nothing from a queue field. The value must be an
+    absolute path to an existing REGULAR, EXECUTABLE file; anything else is a named
+    refusal and nothing is written."""
+    if not os.path.isabs(explicit):
+        respond("node_invalid",
+                "--node must be absolute: %s" % explicit, EXIT_USAGE)
+    try:
+        st = os.stat(explicit)
+    except OSError as exc:
+        respond("node_invalid",
+                "--node does not resolve to a usable file (%s): %s" % (explicit, exc),
+                EXIT_CAPABILITY)
+    if not stat.S_ISREG(st.st_mode):
+        respond("node_invalid",
+                "--node is not a regular file: %s" % explicit, EXIT_CAPABILITY)
+    if not os.access(explicit, os.X_OK):
+        respond("node_invalid",
+                "--node is not executable: %s" % explicit, EXIT_CAPABILITY)
+    return explicit
 
 
 class Lock:
@@ -279,7 +304,7 @@ def main(argv: list[str]) -> int:
                 "the packaged transform is absent at %s; this install is incomplete and "
                 "nothing was written" % TRANSFORM, EXIT_CAPABILITY)
 
-    node = resolve_node(opts.get("node"))
+    node = resolve_node(opts["node"])
     env = dict(os.environ)
     env["AIGENTRY_TQ_LOCK_TOKEN"] = secrets.token_hex(16)
     env["AIGENTRY_TQ_LOCK_PATH"] = queue + ".lock"

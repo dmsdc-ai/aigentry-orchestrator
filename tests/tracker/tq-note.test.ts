@@ -320,8 +320,9 @@ test("A-3: the real dispatch ledger and a concurrent tq-note append BOTH survive
 
 test("A-3: the real dispatch ledger and a concurrent bin/tq-focus.sh write BOTH survive", async () => {
   if (WIN32) {
-    // bin/*.sh needs Git bash; the shell caller is measured on POSIX only and is NOT
-    // counted as win32 coverage.
+    // bin/*.sh needs Git bash, so this case's assertions are NOT RUN on win32. Not a TAP
+    // skip, and not counted as win32 coverage.
+    console.log("A-3: tq-focus.sh assertions NOT RUN on win32 (bash required).");
     return;
   }
   const f = fixture();
@@ -726,7 +727,9 @@ test("A-11: #1148's per-sid spawn decision still reaches the row through the loc
     // win32 has no OS sandbox runtime and refuses the confined spawn BEFORE the ledger
     // (T150 measures the same boundary), so the routing arm is POSIX-only here. Not
     // counted as win32 coverage.
-    console.log("A-11: SKIP(win32-no-sandbox-runtime) - the routing arm refuses before the ledger");
+    console.log("A-11: routing-arm assertions NOT RUN on win32 (no OS sandbox runtime, so the "
+      + "confined spawn refuses before the ledger). Not a TAP skip, and not counted as "
+      + "win32 coverage.");
     return;
   }
   const f = fixture();
@@ -1144,7 +1147,9 @@ test("A-18: the three new helpers ship, and the manifest still agrees with the t
   // Skipped BY NAME, never silently, where git is unavailable (e.g. an installed package).
   const git = spawnSync("git", ["-C", repoRoot, "ls-files", "bin"], { encoding: "utf8", timeout: WALL_MS });
   if (git.status !== 0) {
-    console.log("A-18: SKIP(no-git) — the manifest/tree bin count comparison is CI's T96 here");
+    console.log("A-18: the manifest-vs-tree bin count comparison was NOT RUN (git unavailable, "
+      + "e.g. an installed package); every other assertion in this case ran. CI's T96 "
+      + "assertion 4 is the gate for it.");
   } else {
     const tree = git.stdout.trim().split("\n").filter(Boolean);
     assert.equal(MANIFEST.filter((p) => p.startsWith("bin/")).length, tree.length,
@@ -1225,7 +1230,83 @@ test("A-19: the helpers hold no authority and a stale row grants nothing", () =>
 
 // ── A-20 — platform ─────────────────────────────────────────────────────────────────
 
-test("A-20: platform coverage is stated, and a skip is never counted as coverage", () => {
+// ── A-21 — the broker starts exactly one named executable ───────────────────────────
+
+test("A-21: --node is required and explicit; no environment or PATH value is ever used", () => {
+  // Snyk python/CommandInjection 6a365508-cd04-4257-908b-b46857eb504b flagged an env var
+  // flowing into subprocess.Popen. Verified first: every path to the broker passes
+  // `--node process.execPath` (bin/tq-note.mjs:184, src/dispatch/cli.ts:946, brokerCall/
+  // brokerSpawn above; bin/tq-focus.sh and bin/init/cli.mjs reach it THROUGH tq-note.mjs),
+  // and nothing in the tree ever set AIGENTRY_TQ_NODE. The ambient fallback was unused
+  // selection surface and is gone. This case pins that it stays gone.
+  //
+  // Reachability of the OLD surface was reproduced separately with an inert stand-in
+  // (OUTPUT/phase4/red-ambient-node.sh). It is NOT an exploit and NOT a trust boundary
+  // against a same-UID caller, who could edit the broker itself.
+  const dir = caseDir("a21-node-contract");
+  const q = seed(dir);
+  const before = fs.readFileSync(q, "utf8");
+
+  // An INERT stand-in: it records that it was started and exits. It is never Node.
+  const marker = path.join(dir, "inert-was-selected.log");
+  const inert = path.join(dir, "inert-node");
+  fs.writeFileSync(inert, `#!${process.execPath}\nrequire("node:fs").appendFileSync(${JSON.stringify(marker)}, "started\\n");\n`,
+    { mode: 0o700 });
+  const notExecutable = path.join(dir, "not-executable");
+  fs.writeFileSync(notExecutable, "not an executable\n", { mode: 0o600 });
+
+  const request = JSON.stringify({ v: 1, op: "set-focus", queue: q, params: { track: "beta" } });
+  /** Deliberately NOT brokerCall(): these cases are about argv the helpers never send. */
+  const raw = (args: string[]) => spawnSync(WIN32 ? "python" : BROKER, WIN32 ? [BROKER, ...args] : args, {
+    input: request, encoding: "utf8", timeout: WALL_MS, shell: false,
+    // The ambient value is set in EVERY case below and must never be consulted.
+    env: { ...BASE_ENV, AIGENTRY_TQ_NODE: inert, PATH: `${dir}${path.delimiter}${BASE_ENV.PATH ?? ""}` },
+  });
+
+  // 1. Absent --node, with the ambient value set: a named refusal, not a fallback.
+  const absent = raw(["--queue", q]);
+  assert.equal(absent.status, 4, absent.stdout);
+  const absentBody = JSON.parse(lastLine(absent.stdout)) as Body;
+  assert.equal(absentBody.reason, "invalid_argument");
+  assert.match(String(absentBody.detail), /--node is required/);
+  assert.match(String(absentBody.detail), /no environment or PATH fallback/);
+
+  // 2-5. Invalid --node values are each a named refusal.
+  for (const [label, value, code] of [
+    ["relative", "bin/node", 4],
+    ["missing", path.join(dir, "no-such-node"), 6],
+    ["a directory", dir, 6],
+    ["not executable", notExecutable, 6],
+  ] as const) {
+    const r = raw(["--queue", q, "--node", value]);
+    assert.equal(r.status, code, `${label}: ${r.stdout}`);
+    const body = JSON.parse(lastLine(r.stdout)) as Body;
+    assert.equal(body.reason, "node_invalid", `${label}: ${r.stdout}`);
+  }
+
+  // 6. POSITIVE: the real current Node — exactly what every product caller passes.
+  const ok = raw(["--queue", q, "--node", process.execPath]);
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.equal((JSON.parse(lastLine(ok.stdout)) as Body).applied, true);
+  assert.equal(readDoc(q).active_focus, "beta");
+
+  // The inert stand-in was never started, in any of the six cases.
+  assert.equal(fs.existsSync(marker), false, "the ambient value selected the executable");
+  // …and nothing was written by any of the five refusals (case 6 is the only writer).
+  assert.notEqual(fs.readFileSync(q, "utf8"), before, "the positive case did not apply");
+
+  // Source-level: there is no ambient source left for the flagged flow to come from.
+  const brokerSrc = fs.readFileSync(BROKER, "utf8");
+  const code = brokerSrc.slice(brokerSrc.indexOf('"""', brokerSrc.indexOf('"""') + 3) + 3);
+  assert.ok(!code.includes("AIGENTRY_TQ_NODE"), "the env fallback is still in the code");
+  assert.ok(!/\bshutil\b/.test(code), "the PATH lookup helper is still imported");
+  assert.ok(!/which\(/.test(code), "a PATH lookup is still present");
+  // The one Popen call still takes a fixed two-element argv and never a shell.
+  assert.match(code, /subprocess\.Popen\(\s*\n?\s*\[node, TRANSFORM\]/);
+  assert.match(code, /shell=False/);
+});
+
+test("A-20: the platform contract holds statically; native Windows is NOT RUN here", () => {
   if (WIN32) {
     // The win32 half: msvcrt locking and NO directory fsync (the rename is the last
     // boundary, exactly as bin/dispatch-registry.py:425-427 documents for the registry).
@@ -1238,15 +1319,21 @@ test("A-20: platform coverage is stated, and a skip is never counted as coverage
     assert.match(src, /msvcrt\.locking\(self\.fh\.fileno\(\), msvcrt\.LK_NBLCK, 1\)/);
     return;
   }
-  // POSIX run: the win32 lock path and the no-dir-fsync rule are NOT measured here and are
-  // not claimed. They are asserted as source facts only, and native Windows acceptance
-  // remains a CI/native gate. No fake platform stands in for it.
+  // POSIX run. This branch is NOT a skip: the three assertions below RUN and must pass, so
+  // this case reports TAP `ok` on its own merit. What they prove is a STATIC platform
+  // contract — that the win32 lock path and the POSIX-only directory-fsync guard are
+  // present in the source. They do not execute the win32 path.
+  //
+  // Native Windows behaviour is therefore NOT RUN here, not skipped-and-counted: there is
+  // no TAP skip anywhere in this suite (raw TAP is 27 pass / 0 skip), and nothing below
+  // stands in for a native run. Native acceptance remains a separate CI/native gate.
   const broker = fs.readFileSync(BROKER, "utf8");
   assert.match(broker, /msvcrt\.locking\(self\.fh\.fileno\(\), msvcrt\.LK_NBLCK, 1\)/,
     "the win32 lock path is absent");
   assert.match(broker, /fcntl\.flock\(self\.fh, fcntl\.LOCK_EX \| fcntl\.LOCK_NB\)/);
   const transform = fs.readFileSync(TRANSFORM, "utf8");
   assert.match(transform, /process\.platform !== "win32"/, "the dir-fsync platform guard is absent");
-  console.log("A-20: SKIP(posix-host) — win32 msvcrt locking and rename-as-last-boundary are "
-    + "unmeasured locally and remain a native CI gate; this is not counted as coverage.");
+  console.log("A-20: static platform contract asserted and PASSED on a POSIX host. "
+    + "Native Windows execution: NOT RUN (separate native/CI gate). This is not a TAP skip "
+    + "and is not counted as native coverage.");
 });
