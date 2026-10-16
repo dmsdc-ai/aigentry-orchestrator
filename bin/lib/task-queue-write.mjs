@@ -222,6 +222,19 @@ const APPLY = {
     const body = raw.trim();
     const wanted = normalizeSegment(raw);
     if (!wanted) refuse("empty_segment", "the segment body is blank after normalization", EXIT.state);
+    // R2 (review qr1172bct): `||` is the Rule 40 segment separator, so a body containing it
+    // would be written as TWO segments. Its dedup identity could then never match on replay
+    // (measured: the same append applied twice instead of answering already_applied), and
+    // src/context-handoff/enrich.ts's latest-segment convention would read a truncated tail.
+    // Refused BEFORE any write. Deliberately not encoded, escaped or split: the existing
+    // ledger format is not changed, and a single `|` — which W-A's own ` | dispatched …`
+    // stamps use — stays legal.
+    if (wanted.includes("||")) {
+      refuse("invalid_argument",
+        "the segment body contains '||', which is the Rule 40 segment separator; it would be "
+        + "stored as two segments and could never be recognised on replay. Put the detail in a "
+        + "report file and cite its path in one sentence instead (Rule 40 ¶4)", EXIT.usage);
+    }
 
     const note = row.note ?? "";
     const segs = splitSegments(note);
@@ -306,6 +319,11 @@ const APPLY = {
   "set-focus": function setFocus(doc, p, ctx) {
     const track = String(p.track ?? "").trim();
     if (!track) refuse("invalid_argument", "--track is required", EXIT.usage);
+    // R10 (review qr1172bct): this op used to rewrite a document whose `tasks` was missing
+    // or not an array, while every other op refuses it — measured: a corrupt document was
+    // committed. Validated BEFORE any mutation. Non-strict on purpose: a malformed
+    // NEIGHBOUR row must not block a focus change, which touches no row at all.
+    tasksOf(doc, ctx.queue, false);
     const current = doc.active_focus === undefined || doc.active_focus === null
       ? null : String(doc.active_focus);
 

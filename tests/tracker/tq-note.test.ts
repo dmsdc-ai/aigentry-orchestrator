@@ -318,13 +318,12 @@ test("A-3: the real dispatch ledger and a concurrent tq-note append BOTH survive
   }
 });
 
-test("A-3: the real dispatch ledger and a concurrent bin/tq-focus.sh write BOTH survive", async () => {
-  if (WIN32) {
-    // bin/*.sh needs Git bash, so this case's assertions are NOT RUN on win32. Not a TAP
-    // skip, and not counted as win32 coverage.
-    console.log("A-3: tq-focus.sh assertions NOT RUN on win32 (bash required).");
-    return;
-  }
+// R3 (review qr1172bct): a real runner skip with a reason, instead of a console.log inside
+// a test that then reported `ok`. Every assertion in this case needs bash, so there is no
+// platform-independent remainder to strip out and keep running.
+test("A-3: the real dispatch ledger and a concurrent bin/tq-focus.sh write BOTH survive", {
+  skip: WIN32 ? "POSIX-only: bin/tq-focus.sh needs Git bash; not win32 coverage" : false,
+}, async () => {
   const f = fixture();
   try {
     const dir = caseDir("a3-focus-race");
@@ -722,16 +721,12 @@ test("A-11: ledger-dispatch replays exactly once and never regresses in_progress
   }
 });
 
-test("A-11: #1148's per-sid spawn decision still reaches the row through the locked path", () => {
-  if (WIN32) {
-    // win32 has no OS sandbox runtime and refuses the confined spawn BEFORE the ledger
-    // (T150 measures the same boundary), so the routing arm is POSIX-only here. Not
-    // counted as win32 coverage.
-    console.log("A-11: routing-arm assertions NOT RUN on win32 (no OS sandbox runtime, so the "
-      + "confined spawn refuses before the ledger). Not a TAP skip, and not counted as "
-      + "win32 coverage.");
-    return;
-  }
+// R3: win32 has no OS sandbox runtime and refuses the confined spawn BEFORE the ledger
+// (T150 measures the same boundary), so the whole routing arm is unsupported there — a real
+// runner skip, not a console note inside a passing test. Not win32 coverage.
+test("A-11: #1148's per-sid spawn decision still reaches the row through the locked path", {
+  skip: WIN32 ? "POSIX-only: no OS sandbox runtime on win32, so the confined spawn refuses before the ledger" : false,
+}, () => {
   const f = fixture();
   try {
     fs.writeFileSync(f.queue, committed(seedDoc({
@@ -1004,22 +999,31 @@ test("A-15: a hung transform is killed by name, the lock is released, and foreig
   fs.utimesSync(foreignOwnPattern, old, old);
   fs.utimesSync(foreignOther, old, old);
 
-  // transform_hang: the barrier is armed with no releaser, so the child parks and the
-  // broker's deadline fires.
+  // R7 (review qr1172bct): there used to be a SECOND run here that armed a barrier with no
+  // releaser and then discarded its result (`void hung`), leaving a ~30 s race nobody
+  // asserted. Removed. One bounded case remains, and its result IS the oracle: the barrier
+  // parks the child, `--timeout 2` bounds the wait, and the refusal must be named.
+  //
+  // There is no `transform_hang` fault value — phase-3 prose named one that was never
+  // implemented. The implemented set is {lock, temp_write, fsync, verify, rename,
+  // dir_fsync, pause_before_verify, pause_before_rename}; the SPEC was corrected rather
+  // than a production seam invented to match stale text.
   const { env, base } = barrierFor(dir, "pause_before_rename");
-  const hung = tqJson(appendArgs(q, "1172", file), { ...env, AIGENTRY_TQ_NOTE_FAULT_BARRIER: base });
-  // With --timeout unset the default is 30s; pass a short one so the case stays bounded.
+  const started = Date.now();
   const timedOut = tqJson([...appendArgs(q, "1172", file), "--timeout", "2"],
-    { ...env, AIGENTRY_TQ_NOTE_FAULT_BARRIER: `${base}-2` });
-  void hung;
+    { ...env, AIGENTRY_TQ_NOTE_FAULT_BARRIER: base });
+  const timedOutMs = Date.now() - started;
   assert.equal(timedOut.r.status, 3, timedOut.r.stdout);
   assert.equal(timedOut.body.reason, "transform_timeout");
+  assert.ok(timedOutMs < 25_000, `the timeout was not bounded by --timeout: ${timedOutMs}ms`);
+  assert.equal(fs.readFileSync(q, "utf8"), fs.readFileSync(q, "utf8"), "the queue still reads");
+  assert.doesNotThrow(() => readDoc(q), "a killed transform left an unparseable queue");
 
   // The lock was released despite the kill: the next call succeeds promptly.
-  const started = Date.now();
+  const resumed = Date.now();
   const after = tqJson(appendArgs(q, "1172", file));
   assert.equal(after.r.status, 0, after.r.stderr);
-  assert.ok(Date.now() - started < 9_000, "the timeout left the lock held");
+  assert.ok(Date.now() - resumed < 9_000, "the timeout left the lock held");
 
   // Neither foreign temp was touched. Only this operation's own temp is ever unlinked.
   assert.equal(fs.readFileSync(foreignOwnPattern, "utf8"), "a foreign writer's temp\n");
@@ -1125,7 +1129,7 @@ test("A-17: the transform refuses to run outside the broker, so no unlocked writ
 
 // ── A-18 — shipping declarations ────────────────────────────────────────────────────
 
-test("A-18: the three new helpers ship, and the manifest still agrees with the tree", () => {
+test("A-18: the three new helpers ship, and the manifest still agrees with the tree", async (t) => {
   const read = spawnSync(process.execPath, ["--input-type=module", "-e",
     `import { MANIFEST, GOVERNANCE_ROOTS } from ${JSON.stringify(MANIFEST_MJS)};
      process.stdout.write(JSON.stringify({ MANIFEST, GOVERNANCE_ROOTS }));`,
@@ -1143,26 +1147,26 @@ test("A-18: the three new helpers ship, and the manifest still agrees with the t
   // Assertion P's premise stays non-vacuous: the manifest still names Python sources.
   assert.ok(MANIFEST.filter((p) => p.endsWith(".py")).length >= 7);
 
-  // T96 assertion 4, recomputed here so the count cannot drift unnoticed between CI runs.
-  // Skipped BY NAME, never silently, where git is unavailable (e.g. an installed package).
+  // R3: the two ENVIRONMENT-dependent assertions become named subtests with real skip
+  // reasons, so the runner reports them honestly. The generic assertions above and below
+  // always run — a mixed test is never skipped wholesale to hide them.
   const git = spawnSync("git", ["-C", repoRoot, "ls-files", "bin"], { encoding: "utf8", timeout: WALL_MS });
-  if (git.status !== 0) {
-    console.log("A-18: the manifest-vs-tree bin count comparison was NOT RUN (git unavailable, "
-      + "e.g. an installed package); every other assertion in this case ran. CI's T96 "
-      + "assertion 4 is the gate for it.");
-  } else {
+  await t.test("T96 assertion 4 recomputed: manifest bin count == git ls-files bin", {
+    skip: git.status !== 0 ? "git unavailable here (e.g. an installed package); CI's T96 is the gate" : false,
+  }, () => {
     const tree = git.stdout.trim().split("\n").filter(Boolean);
     assert.equal(MANIFEST.filter((p) => p.startsWith("bin/")).length, tree.length,
       "T96 assertion 4 would fail: init would ship an incomplete bin/");
-  }
+  });
 
-  // Executability: the two entry points are executed, the transform is only ever run as
-  // `<node> task-queue-write.mjs`, so it needs no exec bit (bin/lib/win-private-storage.mjs
-  // ships 0644 for the same reason).
-  if (!WIN32) {
+  await t.test("the two entry points carry an exec bit", {
+    skip: WIN32 ? "POSIX file modes; win32 has no exec bit" : false,
+  }, () => {
+    // The transform is only ever run as `<node> task-queue-write.mjs`, so it needs none
+    // (bin/lib/win-private-storage.mjs ships 0644 for the same reason).
     assert.ok(fs.statSync(TQ_NOTE).mode & 0o111, "bin/tq-note.mjs is not executable");
     assert.ok(fs.statSync(BROKER).mode & 0o111, "the broker is not executable");
-  }
+  });
   assert.doesNotThrow(() => fs.accessSync(TRANSFORM, fs.constants.R_OK));
 
   // --help works without touching a queue, which is how a packaging check can probe it.
@@ -1306,34 +1310,273 @@ test("A-21: --node is required and explicit; no environment or PATH value is eve
   assert.match(code, /shell=False/);
 });
 
-test("A-20: the platform contract holds statically; native Windows is NOT RUN here", () => {
-  if (WIN32) {
-    // The win32 half: msvcrt locking and NO directory fsync (the rename is the last
-    // boundary, exactly as bin/dispatch-registry.py:425-427 documents for the registry).
+// ── A-22..A-27 — the qr1172bct review corrections ───────────────────────────────────
+
+test("A-22 (R1): the entry guard runs through a symlinked parent and never exits 0 silently", () => {
+  const dir = caseDir("a22-entry-guard");
+  const q = seed(dir);
+  const seg = segFile(dir, "seg.txt", "A segment reached through a symlinked parent.");
+
+  // The owned symlinked fixture parent the review asked for. `SELF` is realpath'd by the
+  // ESM loader while argv[1] is the path as typed, so an unresolved comparison made this
+  // exit 0 having written nothing — and bin/tq-focus.sh then printed success.
+  const linkedBin = path.join(dir, "linked-bin");
+  fs.symlinkSync(path.join(repoRoot, "bin"), linkedBin);
+
+  const r = spawnSync(process.execPath, [path.join(linkedBin, "tq-note.mjs"),
+    "append", "--task", "1172", "--segment-file", seg, "--queue", q, "--json"],
+    { encoding: "utf8", env: BASE_ENV, timeout: WALL_MS });
+  assert.equal(r.status, 0, r.stderr);
+  const body = JSON.parse(r.stdout) as Body;
+  assert.equal(body.applied, true, "the symlinked route still produced no write");
+  assert.match(String(rowOf(q, "1172").note), /reached through a symlinked parent/);
+
+  // A malformed/unresolvable argv[1] must not be mistaken for this file either.
+  const bogus = spawnSync(process.execPath, [path.join(dir, "does-not-exist.mjs")],
+    { encoding: "utf8", env: BASE_ENV, timeout: WALL_MS });
+  assert.notEqual(bogus.status, 0, "a nonexistent entry path reported success");
+
+  // R1 also requires the imported path to stay INERT — that is how bin/init/cli.mjs uses
+  // callBroker. Importing must not run main() or touch the queue.
+  const beforeImport = fs.readFileSync(q, "utf8");
+  const imported = spawnSync(process.execPath, ["--input-type=module", "-e",
+    `const m = await import(${JSON.stringify(TQ_NOTE)});
+     process.stdout.write(typeof m.callBroker === "function" ? "inert-with-callBroker" : "missing");`,
+  ], { encoding: "utf8", env: BASE_ENV, timeout: WALL_MS });
+  assert.equal(imported.status, 0, imported.stderr);
+  assert.equal(imported.stdout.trim(), "inert-with-callBroker");
+  assert.equal(fs.readFileSync(q, "utf8"), beforeImport, "importing the module wrote the queue");
+});
+
+test("A-22 (R1): bin/tq-focus.sh cannot report a switch that did not happen", {
+  skip: WIN32 ? "POSIX-only: bin/tq-focus.sh needs Git bash" : false,
+}, () => {
+  const dir = caseDir("a22-focus-truth");
+  const q = seed(dir);
+  const linkedBin = path.join(dir, "linked-bin");
+  fs.symlinkSync(path.join(repoRoot, "bin"), linkedBin);
+
+  // Through the symlinked parent, which used to yield "Focus switched to: beta" with
+  // active_focus still "alpha" on disk.
+  const r = spawnSync("bash", [path.join(linkedBin, "tq-focus.sh"), "beta"],
+    { encoding: "utf8", env: { ...BASE_ENV, TQ: q }, timeout: WALL_MS });
+  assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+  assert.match(r.stdout, /Focus switched to: beta/);
+  assert.equal(readDoc(q).active_focus, "beta", "the script reported a switch that did not happen");
+
+  // …and the response-document check means a silent helper can never read as success.
+  const unknown = spawnSync("bash", [path.join(linkedBin, "tq-focus.sh"), "no-such-track"],
+    { encoding: "utf8", env: { ...BASE_ENV, TQ: q }, timeout: WALL_MS });
+  assert.equal(unknown.status, 1, unknown.stderr);
+  assert.match(unknown.stdout, /ERR unknown track: no-such-track/);
+  assert.equal(readDoc(q).active_focus, "beta", "a refused switch changed the focus");
+});
+
+test("A-23 (R2): a segment body containing '||' is refused before any write", () => {
+  const dir = caseDir("a23-pipe-body");
+  const q = seed(dir);
+  const before = fs.readFileSync(q, "utf8");
+
+  for (const body of [
+    "Left half of the sentence || right half of the sentence.",
+    "|| leading separator",
+    "trailing separator ||",
+    "a ||| b",
+  ]) {
+    const seg = segFile(dir, "bad.txt", `${body}\n`);
+    const r = tqJson(appendArgs(q, "1172", seg));
+    assert.equal(r.r.status, 4, `${body}: ${r.r.stdout}`);
+    assert.equal(r.body.reason, "invalid_argument", body);
+    assert.match(String(r.body.detail), /segment separator/);
+    assert.match(String(r.body.detail), /report file/, "the report-path hint is missing");
+    assert.equal(fs.readFileSync(q, "utf8"), before, `${body}: a refused body was written`);
+  }
+
+  // NEGATIVE control is above (no write). POSITIVE controls: a single `|` stays legal —
+  // W-A's own ` | dispatched …` stamps use it — and normal replay still works.
+  const ok = segFile(dir, "ok.txt", "A body with a single | pipe is still legal.");
+  assert.equal(tq(appendArgs(q, "1172", ok)).status, 0);
+  assert.match(String(rowOf(q, "1172").note), /single \| pipe/);
+  const replay = tqJson(appendArgs(q, "1172", ok));
+  assert.equal(replay.r.status, 0);
+  assert.equal(replay.body.reason, "already_applied", "replay identity broke for a legal body");
+  assert.equal(String(rowOf(q, "1172").note).split("||").length, 2, "segment count drifted");
+});
+
+test("A-24 (R4): the lock never follows a planted symlink and never truncates", {
+  skip: WIN32 ? "POSIX-only: O_NOFOLLOW and symlink planting; win32 behaviour is unmeasured here" : false,
+}, () => {
+  const dir = caseDir("a24-lock-symlink");
+  const q = seed(dir);
+  const victim = path.join(dir, "victim.txt");
+  const victimBytes = "an unrelated file that must not be opened, locked or changed\n";
+  fs.writeFileSync(victim, victimBytes, { mode: 0o600 });
+  const victimIno = fs.statSync(victim).ino;
+  fs.symlinkSync(victim, `${q}.lock`);
+
+  const r = tqJson(["set-focus", "--track", "beta", "--queue", q]);
+  assert.equal(r.r.status, 3, r.r.stdout);
+  assert.equal(r.body.reason, "lock_not_regular");
+  // The planted target is byte-unchanged and was never adopted as the lock inode.
+  assert.equal(fs.readFileSync(victim, "utf8"), victimBytes, "the symlink target was modified");
+  assert.equal(fs.statSync(victim).ino, victimIno);
+  assert.notEqual(r.body.lock_inode, victimIno);
+  assert.ok(fs.lstatSync(`${q}.lock`).isSymbolicLink(), "the planted symlink was replaced");
+  assert.equal(readDoc(q).active_focus, "alpha", "a refused lock still wrote the queue");
+
+  // A directory in the lock's place is also refused by the fstat identity check.
+  fs.rmSync(`${q}.lock`);
+  fs.mkdirSync(`${q}.lock`);
+  const asDir = tqJson(["set-focus", "--track", "beta", "--queue", q]);
+  assert.equal(asDir.r.status, 3, asDir.r.stdout);
+  assert.equal(asDir.body.reason, "lock_not_regular");
+  fs.rmdirSync(`${q}.lock`);
+
+  // With no planted lock the same call succeeds, and the lock is created 0600.
+  const ok = tqJson(["set-focus", "--track", "beta", "--queue", q]);
+  assert.equal(ok.r.status, 0, ok.r.stderr);
+  assert.equal(readDoc(q).active_focus, "beta");
+  assert.equal(fs.statSync(`${q}.lock`).mode & 0o777, 0o600, "the lock is not 0600");
+});
+
+test("A-25 (R5): init refuses with its existing failure class when the queue cannot be created", {
+  skip: WIN32 ? "POSIX-only: the staged tree uses POSIX modes and bash-free node entry" : false,
+}, () => {
+  // A test-owned staging tree: bin/tq-note.mjs present, bin/lib/* deliberately ABSENT, so
+  // the broker cannot run. Nothing is installed and no host path is touched.
+  const dir = caseDir("a25-init-refusal");
+  const stage = path.join(dir, "pkg");
+  fs.mkdirSync(path.join(stage, "bin", "lib"), { recursive: true });
+  fs.copyFileSync(TQ_NOTE, path.join(stage, "bin", "tq-note.mjs"));
+  fs.chmodSync(path.join(stage, "bin", "tq-note.mjs"), 0o755);
+
+  const q = path.join(dir, "ws", "state", "task-queue.json");
+  fs.mkdirSync(path.dirname(q), { recursive: true });
+  const r = spawnSync(process.execPath, [path.join(stage, "bin", "tq-note.mjs"),
+    "set-focus", "--track", "beta", "--queue", q, "--json"],
+    { encoding: "utf8", env: BASE_ENV, timeout: WALL_MS });
+  const body = JSON.parse(r.stdout) as Body;
+  // This is the failure shape createState now turns into die(3, …) rather than a warning.
+  assert.equal(r.status, 6, r.stdout);
+  assert.equal(body.reason, "lock_capability_unavailable");
+  assert.equal(fs.existsSync(q), false, "a failed creation left a file behind");
+
+  // The source-level contract: a non-zero broker status is fatal with exit class 3, and an
+  // existing queue is still a success. (Running real init would need its whole installer
+  // closure — jq/python/bash/AIGENTRY_HOME — which is out of this suite's scope.)
+  const initSrc = fs.readFileSync(path.join(repoRoot, "bin", "init", "cli.mjs"), "utf8");
+  const createState = initSrc.slice(initSrc.indexOf("function createState"),
+    initSrc.indexOf("// ------------------------------------------------------- step 5"));
+  assert.match(createState, /die\(3, `state\/task-queue\.json could not be created/,
+    "init no longer fails with its dependency/state class");
+  assert.ok(!/summary\.skipped\.push\(`state\/task-queue\.json/.test(createState),
+    "init still records the queue as a benign skip");
+  assert.match(createState, /body\.reason === "exists"[\s\S]{0,200}summary\.preserved/,
+    "an existing queue is no longer preserved as a success");
+});
+
+test("A-26 (R6): a signalled or unrecognized transform becomes exit 9 with a named reason", {
+  skip: WIN32 ? "POSIX-only: signal semantics; win32 returncodes are unmeasured here" : false,
+}, () => {
+  const dir = caseDir("a26-signal-exit");
+  const q = seed(dir);
+  const before = fs.readFileSync(q, "utf8");
+
+  // A test-owned stand-in for `node` that kills ITSELF. The only process signalled is the
+  // broker's own direct child; no host pid is probed, listed or signalled.
+  const suicide = path.join(dir, "self-killing-node");
+  fs.writeFileSync(suicide, "#!/usr/bin/env bash\nkill -9 $$\n", { mode: 0o700 });
+  const killed = spawnSync(BROKER, ["--queue", q, "--node", suicide], {
+    input: JSON.stringify({ v: 1, op: "set-focus", queue: q, params: { track: "beta" } }),
+    encoding: "utf8", env: BASE_ENV, timeout: WALL_MS,
+  });
+  assert.equal(killed.status, 9, killed.stdout);
+  const killedBody = JSON.parse(lastLine(killed.stdout)) as Body;
+  assert.equal(killedBody.reason, "transform_signalled");
+  // The actual signal is preserved in bounded detail rather than discarded.
+  assert.match(String(killedBody.detail), /killed by signal 9/);
+  assert.notEqual(killed.status, 247, "the POSIX negative convention leaked through");
+  assert.equal(fs.readFileSync(q, "utf8"), before, "a signalled transform wrote the queue");
+
+  // An undocumented exit code is likewise normalized, with the raw value kept.
+  const odd = path.join(dir, "odd-exit-node");
+  fs.writeFileSync(odd, "#!/usr/bin/env bash\nexit 42\n", { mode: 0o700 });
+  const weird = spawnSync(BROKER, ["--queue", q, "--node", odd], {
+    input: JSON.stringify({ v: 1, op: "set-focus", queue: q, params: { track: "beta" } }),
+    encoding: "utf8", env: BASE_ENV, timeout: WALL_MS,
+  });
+  assert.equal(weird.status, 9, weird.stdout);
+  const weirdBody = JSON.parse(lastLine(weird.stdout)) as Body;
+  assert.equal(weirdBody.reason, "transform_unrecognized");
+  assert.match(String(weirdBody.detail), /42/);
+  assert.equal(fs.readFileSync(q, "utf8"), before);
+});
+
+test("A-27 (R10): set-focus validates the tasks shape before rewriting", () => {
+  for (const [label, bytes] of [
+    ["tasks absent", '{\n  "active_focus": null,\n  "tracks": {\n    "alpha": {}\n  }\n}\n'],
+    ["tasks not an array", '{\n  "active_focus": null,\n  "tracks": {\n    "alpha": {}\n  },\n  "tasks": {}\n}\n'],
+  ] as const) {
+    const dir = caseDir(`a27-${label.replace(/\s+/g, "-")}`);
+    const q = path.join(dir, "state", "task-queue.json");
+    fs.writeFileSync(q, bytes, { mode: 0o600 });
+    const r = tqJson(["set-focus", "--track", "alpha", "--queue", q]);
+    assert.equal(r.r.status, 9, `${label}: ${r.r.stdout}`);
+    assert.equal(r.body.reason, "queue_corrupt", label);
+    // No-write control.
+    assert.equal(fs.readFileSync(q, "utf8"), bytes, `${label}: a corrupt document was rewritten`);
+  }
+
+  // Non-strict on purpose: a malformed NEIGHBOUR row must not block a focus change, which
+  // touches no row at all.
+  const dir = caseDir("a27-malformed-neighbour");
+  const q = seed(dir, seedDoc({
+    tasks: [{ id: 1172, desc: "fine", status: "pending", note: "n." }, { desc: "no id at all" }],
+  }));
+  const ok = tqJson(["set-focus", "--track", "beta", "--queue", q]);
+  assert.equal(ok.r.status, 0, ok.r.stderr);
+  assert.equal(readDoc(q).active_focus, "beta");
+});
+
+test("A-20: platform contract (static) and the native win32 commit path", async (t) => {
+  // R3: two named subtests with explicit boundaries, instead of one test that printed a
+  // console note and reported `ok`. The static check ALWAYS runs on every OS; the native
+  // check is really skipped where it cannot run, with a reason the runner reports.
+  await t.test("STATIC source contract: both lock primitives and the dir-fsync guard exist", () => {
+    runStaticPlatformContract();
+  });
+  await t.test("NATIVE win32: a commit lands and the rename is the last durable boundary", {
+    skip: WIN32 ? false
+      : "native win32 only — NOT RUN on this POSIX host and NOT substituted by the static check above",
+  }, () => {
+    // msvcrt locking and NO directory fsync (the rename is the last boundary, exactly as
+    // bin/dispatch-registry.py:425-427 documents for the registry).
     const dir = caseDir("a20-win32");
     const q = seed(dir);
     const r = tqJson(appendArgs(q, "1172", segFile(dir, "seg.txt", "A win32 commit landed.")));
     assert.equal(r.r.status, 0, r.r.stderr);
     assert.equal(fs.readFileSync(q, "utf8"), committed(readDoc(q)));
-    const src = fs.readFileSync(BROKER, "utf8");
-    assert.match(src, /msvcrt\.locking\(self\.fh\.fileno\(\), msvcrt\.LK_NBLCK, 1\)/);
-    return;
-  }
-  // POSIX run. This branch is NOT a skip: the three assertions below RUN and must pass, so
-  // this case reports TAP `ok` on its own merit. What they prove is a STATIC platform
-  // contract — that the win32 lock path and the POSIX-only directory-fsync guard are
-  // present in the source. They do not execute the win32 path.
-  //
-  // Native Windows behaviour is therefore NOT RUN here, not skipped-and-counted: there is
-  // no TAP skip anywhere in this suite (raw TAP is 27 pass / 0 skip), and nothing below
-  // stands in for a native run. Native acceptance remains a separate CI/native gate.
+  });
+});
+
+/**
+ * The platform-independent half of A-20. Source-shape assertions ONLY: they prove the two
+ * platform branches exist in the source. They are explicitly NOT native acceptance, and
+ * nothing here substitutes for running on Windows.
+ */
+function runStaticPlatformContract(): void {
   const broker = fs.readFileSync(BROKER, "utf8");
   assert.match(broker, /msvcrt\.locking\(self\.fh\.fileno\(\), msvcrt\.LK_NBLCK, 1\)/,
     "the win32 lock path is absent");
   assert.match(broker, /fcntl\.flock\(self\.fh, fcntl\.LOCK_EX \| fcntl\.LOCK_NB\)/);
   const transform = fs.readFileSync(TRANSFORM, "utf8");
   assert.match(transform, /process\.platform !== "win32"/, "the dir-fsync platform guard is absent");
-  console.log("A-20: static platform contract asserted and PASSED on a POSIX host. "
-    + "Native Windows execution: NOT RUN (separate native/CI gate). This is not a TAP skip "
-    + "and is not counted as native coverage.");
-});
+  // R4: the no-follow lock open, asserted as a source fact on every platform.
+  assert.match(broker, /O_NOFOLLOW = getattr\(os, "O_NOFOLLOW", 0\)/, "the no-follow primitive is absent");
+  assert.match(broker, /os\.open\(self\.path, flags, 0o600\)/, "the 0600 lock open is absent");
+  // The exact flags expression, which is prose-proof: scanning the file for the STRING
+  // "O_TRUNC" would match the comment that explains why it is absent (the same trap A-19
+  // documents). Pinning the flags pins the behaviour.
+  assert.match(broker, /^ {12}flags = os\.O_RDWR \| os\.O_CREAT \| O_NOFOLLOW$/m,
+    "the lock open flags changed; O_TRUNC must never appear among them");
+}

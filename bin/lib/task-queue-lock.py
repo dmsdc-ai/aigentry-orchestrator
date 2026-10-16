@@ -102,6 +102,29 @@ def fault(name: str) -> bool:
     return os.environ.get("AIGENTRY_TQ_NOTE_FAULT", "") == name
 
 
+DOCUMENTED_EXITS = (EXIT_OK, EXIT_STATE, EXIT_USAGE, EXIT_CAPABILITY, EXIT_CORRUPT)
+
+
+def normalized_exit(returncode: int | None) -> int:
+    """R4/R6 (review qr1172bct): the child's status, mapped into the documented table.
+
+    `subprocess` reports a signal death as a NEGATIVE returncode, and `sys.exit(-9)` is
+    reported by the shell as 247 — outside the documented set and with no named reason.
+    A killed or unrecognised transform is a state failure (9); the actual signal or raw
+    value is preserved in the bounded detail so the evidence is not lost."""
+    if returncode in DOCUMENTED_EXITS:
+        return returncode
+    if returncode is not None and returncode < 0:
+        respond("transform_signalled",
+                "the transform was killed by signal %d; the queue is either the old or the "
+                "new complete document and the lock is released" % -returncode,
+                EXIT_CORRUPT)
+    respond("transform_unrecognized",
+            "the transform returned %r, which is not one of the documented exits %s; treated "
+            "as a state failure" % (returncode, list(DOCUMENTED_EXITS)),
+            EXIT_CORRUPT)
+
+
 def parse_argv(argv: list[str]) -> dict[str, str]:
     opts: dict[str, str] = {}
     rest = list(argv)
@@ -156,11 +179,24 @@ def resolve_node(explicit: str) -> str:
     return explicit
 
 
+#: R4 (review qr1172bct): the no-follow open primitive, where the platform has one.
+#: Python exposes O_NOFOLLOW only on POSIX. Windows is handled honestly rather than
+#: pretended: see Lock.__enter__.
+O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+NOFOLLOW_SUPPORTED = O_NOFOLLOW != 0
+
+
 class Lock:
     """Exclusive lock on the stable `<queue>.lock` sibling.
 
     Released in __exit__, and by the kernel on fd close if this process dies anyway —
-    so no path, including a kill, leaves the lock held."""
+    so no path, including a kill, leaves the lock held.
+
+    R4: this used to be `open(path, "a+b")`, which FOLLOWS a symlink. A planted
+    `<queue>.lock -> /elsewhere/victim` therefore made the broker open and lock an
+    unrelated file and report that file's inode as the lock inode (measured). The open is
+    now O_NOFOLLOW where the platform has it, 0600, never O_TRUNC, and the fd is
+    fstat'd for regular-file identity before use."""
 
     def __init__(self, queue: str, deadline_s: float) -> None:
         self.path = queue + ".lock"
@@ -178,8 +214,45 @@ class Lock:
                     "available; refusing rather than writing the task queue unlocked",
                     EXIT_CAPABILITY)
         try:
-            self.fh = open(self.path, "a+b", buffering=0)
-            self.inode = os.fstat(self.fh.fileno()).st_ino
+            # Fixed sibling path, created once and NEVER unlinked, so the lock inode stays
+            # stable and two writers cannot end up locking different inodes.
+            #
+            # O_TRUNC is deliberately absent: even a path that somehow resolves elsewhere is
+            # never emptied. O_NOFOLLOW refuses a symlink outright on POSIX.
+            flags = os.O_RDWR | os.O_CREAT | O_NOFOLLOW
+            try:
+                fd = os.open(self.path, flags, 0o600)
+            except OSError as exc:
+                # ELOOP (POSIX) / EMLINK (some BSDs) is O_NOFOLLOW refusing a symlink.
+                if exc.errno in (errno.ELOOP, getattr(errno, "EMLINK", errno.ELOOP)):
+                    respond("lock_not_regular",
+                            "%s is a symlink; refusing to lock or write through it" % self.path,
+                            EXIT_STATE)
+                # EISDIR is a directory in the lock's place: the same refusal the fstat
+                # identity check below would give, named here because the open fails first.
+                if exc.errno == errno.EISDIR:
+                    respond("lock_not_regular",
+                            "%s is a directory; refusing to use it as the queue lock" % self.path,
+                            EXIT_STATE)
+                raise
+            self.fh = os.fdopen(fd, "r+b", buffering=0)
+            st = os.fstat(self.fh.fileno())
+            # Identity is checked on the FD, not the path: no second lookup to race.
+            if not stat.S_ISREG(st.st_mode):
+                respond("lock_not_regular",
+                        "%s is not a regular file; refusing to use it as the queue lock"
+                        % self.path, EXIT_STATE)
+            if not NOFOLLOW_SUPPORTED:
+                # Honest diagnostic rather than a racy lstat pre-check dressed up as a
+                # guarantee. Where O_NOFOLLOW does not exist the open above can still follow
+                # a link, and the fstat only catches the non-regular case; a symlink to a
+                # regular file would pass. That residue is NAMED here, is not claimed to be
+                # equivalent protection, and is unmeasured on native Windows.
+                sys.stderr.write(
+                    "task-queue-lock.py: note: this platform has no O_NOFOLLOW, so the lock "
+                    "open cannot refuse a symlink to a regular file; the regular-file check "
+                    "still applies and nothing is truncated\n")
+            self.inode = st.st_ino
             deadline = time.monotonic() + self.deadline_s
             while True:
                 if os.name == "nt":
@@ -347,7 +420,7 @@ def main(argv: list[str]) -> int:
         if not out.strip() and child.returncode == 0:
             respond("transform_silent",
                     "the transform exited 0 without a response document", EXIT_STATE)
-        return child.returncode if child.returncode is not None else EXIT_STATE
+        return normalized_exit(child.returncode)
 
 
 if __name__ == "__main__":

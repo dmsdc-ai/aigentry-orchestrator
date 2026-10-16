@@ -23,9 +23,27 @@ if [ -n "$new_focus" ]; then
   #
   # `--expect-focus` is the revision guard: the value just read here, refused by name if
   # the focus moved underneath. Track validation now happens INSIDE the lock, which
-  # closes the old check-then-write TOCTOU; the `ERR unknown track` contract below is
-  # reproduced from that named refusal, so this script's observable behaviour is
-  # unchanged. The `jq` READER below is untouched.
+  # closes the old check-then-write TOCTOU. The `jq` READER below is untouched.
+  #
+  # R11 (review qr1172bct) — what is preserved and what intentionally changed. The earlier
+  # claim that "observable behaviour is unchanged" was too strong:
+  #   PRESERVED: an unknown track still prints `ERR unknown track: <t>` on stdout and
+  #              exits 1; a successful switch still prints `Focus switched to: <t>`;
+  #              a same-value switch still reports success (the helper no-ops).
+  #   NEW, intentionally: the locked path ADDS refusals that did not exist before —
+  #              expect_focus_mismatch, queue_corrupt, queue_unavailable, lock_not_regular,
+  #              transform_timeout/_signalled/_unrecognized and the --node/capability
+  #              refusals. Each surfaces as `ERR focus switch refused (rc N)` on stderr and
+  #              exits with the helper's own code (3 state, 4 usage, 6 capability, 9 corrupt).
+  #
+  # R9: this script invokes `node`, so it REQUIRES node on PATH — that is a real new
+  # requirement of the write path and is why the script itself passes no `--node`.
+  # `bin/tq-note.mjs` supplies the broker's required explicit `--node process.execPath`.
+  # The removed AIGENTRY_TQ_NODE / PATH fallback inside the broker is NOT restored.
+  command -v node >/dev/null 2>&1 || {
+    echo "ERR node is required to switch focus (bin/tq-note.mjs performs the locked write): not on PATH" >&2
+    exit 3
+  }
   prev="$(jq -r '.active_focus // "null"' "$TQ")"
   rc=0
   out="$(node "$SCRIPT_DIR/tq-note.mjs" set-focus --track "$new_focus" --queue "$TQ" \
@@ -36,6 +54,13 @@ if [ -n "$new_focus" ]; then
       *) echo "ERR focus switch refused (rc $rc): $out" >&2; exit "$rc" ;;
     esac
   fi
+  # R1: rc 0 alone is NOT proof of a write. The entry-guard defect made tq-note.mjs exit 0
+  # having written nothing, and this script printed success anyway (measured). A successful
+  # `--json` run always emits a response document, so its absence is a failure.
+  case "$out" in
+    *'"applied"'*) : ;;
+    *) echo "ERR focus switch produced no response document (rc $rc): ${out:-(empty)}" >&2; exit 3 ;;
+  esac
   echo "Focus switched to: $new_focus"
   echo ""
 fi

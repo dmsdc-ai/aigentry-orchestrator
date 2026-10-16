@@ -242,4 +242,32 @@ function main() {
   process.exit(status);
 }
 
-if (path.resolve(process.argv[1] ?? "") === path.resolve(SELF)) main();
+/**
+ * Canonical real path, never throwing — `process.argv[1]` may name something that does not
+ * resolve, and a guard that throws is a guard that fails open.
+ */
+function realOf(p) {
+  const abs = path.resolve(p);
+  try {
+    return fs.realpathSync(abs);
+  } catch {
+    return abs;               // unresolvable: compare the absolute form rather than give up
+  }
+}
+
+// R1 (review qr1172bct): `SELF` comes from `import.meta.url`, which the ESM loader has
+// ALREADY realpath'd, while `process.argv[1]` is the path as typed. Comparing them with
+// `path.resolve` alone meant that reaching this command through a symlinked parent made the
+// two unequal, so `main()` never ran: the process exited 0 having written nothing, and
+// `bin/tq-focus.sh` printed "Focus switched to: …" because it only checked the exit code.
+// Measured before the fix: exit 0, empty stdout, queue byte-unchanged.
+//
+// Canonical REAL paths are compared instead, so the route taken to the file is irrelevant.
+// A DIFFERENT real file means a genuine `import` and must stay inert — that is how
+// `bin/init/cli.mjs` uses `callBroker`, and R1 requires it preserved.
+//
+// An ABSENT argv[1] also stays inert, and that is not a silent-success hole: measured on
+// node 20, a process whose entry is `--eval`/`-e` or stdin has NO argv[1] at all, so this
+// module can only have been reached by `import` in that case. A file entry always has one.
+const entryPath = process.argv[1];
+if (typeof entryPath === "string" && entryPath !== "" && realOf(entryPath) === realOf(SELF)) main();

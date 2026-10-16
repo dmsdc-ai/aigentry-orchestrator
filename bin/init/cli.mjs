@@ -434,9 +434,16 @@ function createState(ws, opts) {
     params: { document: { tasks: [], active_focus: null } },
   });
   if (status !== 0) {
-    warn(`state/task-queue.json was NOT created: ${body.reason} — ${body.detail || "(no detail)"}. `
-      + "No unlocked fallback write was attempted; re-run init once the cause is fixed.");
-    summary.skipped.push(`state/task-queue.json (${body.reason})`);
+    // R5 (review qr1172bct): this used to warn, record summary.skipped and let init exit 0 —
+    // reporting SUCCESS for a workspace with no task queue, which every later dispatch and
+    // every tq-* command then fails on. It is a dependency/state failure, so it takes the
+    // exit class Step 1 already uses for exactly that cause (3). No new code is invented,
+    // and an existing valid queue is never reached by this branch — `exists` is a success
+    // below. No unlocked fallback write is attempted.
+    die(3, `state/task-queue.json could not be created: ${body.reason} — ${body.detail || "(no detail)"}\n`
+      + "The task queue is required: Rule 34's gate, every bin/tq-* command and the dispatch "
+      + "ledger all read it, so a workspace without one is not usable.\n"
+      + "No unlocked fallback write was attempted. Fix the cause and re-run init.");
   } else if (body.reason === "exists") {
     info("state/task-queue.json exists — preserved");
     summary.preserved.push("state/task-queue.json");
