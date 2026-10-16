@@ -336,7 +336,9 @@ if (POSIX) test("H-09 prepareWorkerSandbox stages the hook read-only + sealed, a
     const st = H.privDir(path.join(sessions, sid));
     const r = H.sh(prep, [JSON.stringify({ scopeFile, task: "1136", sid, cli: "claude", roleCwd,
       argv: ["claude", ...extra, "--append-system-prompt-file", scopeFile], stagingRoot: st,
-      controlRoots: { noAccess: [], noWrite: [] } })], { env: H.hermeticEnv(run, { MR_DIST: DIST }), timeout: 60000 });
+      controlRoots: { noAccess: [], noWrite: [] } })],
+    // #1232: FAKE worker-token opt-in, so the refusal and staging under test are not masked by the token refusal.
+    { env: H.hermeticEnv(run, { MR_DIST: DIST, AIGENTRY_CLAUDE_OAUTH_TOKEN: "FAKE-MR1136-WORKER-TOKEN" }), timeout: 60000 });
     assert.equal(r.status, 0, r.stderr);
     return { out: JSON.parse(r.stdout), st };
   };

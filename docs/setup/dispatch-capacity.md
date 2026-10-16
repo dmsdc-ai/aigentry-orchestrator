@@ -165,3 +165,157 @@ itself and for every directory and file inside it; the root's host ancestors
 (for example macOS `/var` -> `/private/var`) resolve normally and are not
 confined by this check. On Windows the snapshot's read-only POSIX modes are
 not observable, so the mode check reports `skipped-win32`.
+
+## Confined Claude worker authentication (#652, #1232)
+
+A confined Claude worker authenticates **only** with an automation token that
+you mint and supply yourself. Dispatch's confined path never copies your own
+interactive Claude login (`~/.claude/.credentials.json` or the macOS Keychain
+item) into a worker.
+
+### Breaking change
+
+Before #1232, when `AIGENTRY_CLAUDE_OAUTH_TOKEN` was unset or empty, every
+confined Claude spawn silently copied the host's interactive login record,
+including its refresh token, into the worker's private home. Every worker then
+held its own copy of that one interactive lineage. That fallback is gone. Without
+the opt-in, a confined Claude spawn now refuses:
+
+```
+dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_REQUIRED: confined Claude workers authenticate only with an approved automation token (claude setup-token) supplied as AIGENTRY_CLAUDE_OAUTH_TOKEN in the dispatcher environment; the host login is never copied; see docs/setup/dispatch-capacity.md; nothing was spawned (exit 78)
+```
+
+The refusal comes after routing and the spawn decision have been made and
+before anything is staged. No boot preparation runs, no git guard is
+installed, no terminal opens and no sandbox is prepared. The message names the
+variable and never echoes a value.
+
+The library entry point (`prepareWorkerSandbox`) refuses with the same fixed
+code before any staging write.
+
+Not changed by this:
+
+- **Codex and Gemini workers.** No change.
+- **`--target` delivery** to a session that is already running. No change.
+- **The legacy unconfined boot path.** No change.
+- **Routing.** Automatic routing counts Claude as available in three cases:
+  - the opt-in variable is set;
+  - the host is macOS (always, whether or not anyone is logged in);
+  - `~/.claude/.credentials.json` exists.
+
+  That selection logic is unchanged. An automatically routed spawn can
+  therefore still choose Claude and then stop with the refusal above, before
+  anything is spawned. It is not silently re-routed to another provider or
+  billing path.
+- **Workers already running.** They keep whatever they were started with.
+  Nothing is restarted or cleaned up.
+
+### Supported path
+
+1. **Mint the token yourself.** In your own terminal, run `claude setup-token`
+   and complete the browser authorization. Never paste the value into a chat,
+   an agent prompt, a report, a dispatch file, or a command whose output is
+   captured.
+2. **Store it where you choose.** Use a secret store of your choice. Aigentry
+   adds no token storage.
+3. **Export it to the dispatcher.** Set it as `AIGENTRY_CLAUDE_OAUTH_TOKEN` in
+   the environment that launches the orchestrator/dispatcher. A process reads
+   its environment once, at start, so an orchestrator that is already running
+   needs a restart that you initiate.
+
+For each confined Claude attempt, dispatch checks the value's syntax and then
+writes it to a private handoff file outside the worker's home. The runner
+places it only in the worker child's environment, as `CLAUDE_CODE_OAUTH_TOKEN`.
+It never enters the sealed manifest, the argv or the launcher. When the runner
+relaunches the worker, it re-reads the same per-attempt handoff.
+
+**Known limitation (follow-up).** A non-empty value that fails the syntax check
+is not refused up front with exit 78. It is refused later, during sandbox
+preparation, with `CLAUDE_OAUTH_TOKEN_INVALID`. By then boot staging and the git
+guard have already run. The value is never echoed.
+
+### Official references
+
+Anthropic's current documentation:
+
+- authentication and `claude setup-token`:
+  <https://code.claude.com/docs/en/iam>
+- Claude Code environment variables:
+  <https://code.claude.com/docs/en/env-vars>
+
+Those pages, not this one, describe the token and how the CLI reads its
+environment. Nothing in this repository has measured what the *installed*
+Claude CLI actually does with a setup token. Its acceptance, its lifetime and
+which account features it lacks are all unmeasured here.
+
+### What is and is not validated
+
+**Validated locally:**
+
+- one line of printable ASCII, at most 4096 bytes;
+- private ownership, mode, link count, size and no symlinks on the handoff
+  directory and file;
+- the handoff path is the exact one sealed for the attempt;
+- the token is injected into the child only.
+
+All errors are fixed strings: `CLAUDE_OAUTH_TOKEN_INVALID`,
+`CLAUDE_OAUTH_HANDOFF_WRITE`, `CLAUDE_OAUTH_HANDOFF_INVALID`,
+`SANDBOX_AUTH_WORKER_TOKEN_REQUIRED`.
+
+**Not validated:**
+
+- provider validity;
+- expiry (dispatch has no expiry information for the token);
+- revocation;
+- account, plan or scopes;
+- whether the value really is a setup token.
+
+Checking any of these before launch would need a provider request or a CLI
+run, and dispatch does neither. So:
+
+- **A token that is already invalid at launch** (expired, revoked or wrong)
+  fails at the worker's first request.
+- **A token that is valid at launch but expires or is revoked later** fails at
+  the next request after that. This can happen in the middle of a task.
+
+Nothing here guarantees that authentication lasts for any given time.
+
+### Expiry, rotation and revocation
+
+A setup token **can expire and can be revoked**, and dispatch cannot renew it.
+The token's real lifetime has not been measured here.
+
+When the token expires or you revoke it:
+
+1. mint a new one;
+2. update the exported variable;
+3. restart the orchestrator.
+
+New attempts use the new token. Running attempts keep the token in their
+per-attempt handoff until they end, and fail at their next request once it is
+no longer accepted.
+
+Dispatch no longer copies your login into workers. Whether provider-side token
+rotation or revocation caused earlier login losses has not been measured.
+
+### Authority boundaries and residual exposure
+
+- **Minting and storage are yours.** Aigentry does not mint, store, refresh or
+  validate the token with the provider. It adds no broker, no shared auth store
+  and no configuration knob.
+- **The variable is visible to same-user processes.** Same-user ancestors and
+  children of the dispatcher inherit it until the sandbox runner clears its own
+  environment. That includes the orchestrator's own shell tool, if you launched
+  the orchestrator with it.
+- **The worker holds a long-lived bearer token.** It sits in the worker child's
+  environment, so a worker shell can read it. Egress is configured to the
+  sealed `allowedDomains`. The blast radius is larger than for a short-lived
+  access token, and revocation is under your control.
+- **Handoff files are retained per attempt.** Each confined Claude attempt
+  keeps one private (0600) copy of the token in its attempt directory, so that
+  the runner can relaunch the worker. This release has no automatic removal
+  path for these files. They stay until something outside dispatch removes
+  them. A retention policy is a separate follow-up.
+- **The confined path never reads your login.** Dispatch's confined path does
+  not read your own interactive login for a Claude worker. The legacy unconfined
+  path is a different scope and is unchanged.

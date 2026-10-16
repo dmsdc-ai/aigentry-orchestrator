@@ -19,8 +19,8 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
-  chmodSync, copyFileSync, cpSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync,
-  realpathSync, rmSync, statSync, symlinkSync, writeFileSync,
+  chmodSync, copyFileSync, cpSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync,
+  renameSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, relative, resolve } from "node:path";
@@ -223,8 +223,25 @@ function boot(W: World, sid: string, extra: Record<string, string> = {}, cli = "
   return { status: r.status, stdout: r.stdout, stderr: r.stderr, json, launcher: String(json?.spawn_cli ?? "") };
 }
 
+/** #1232 R4: sorted `kind:relpath[:sha256|->target]` of every entry under `dir` (lstat; [] when absent). */
+function tree(dir: string): string[] {
+  const out: string[] = [];
+  const walk = (d: string): void => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      const p = join(d, e.name), rel = relative(dir, p).split(/[\\/]/).join("/");
+      if (e.isSymbolicLink()) out.push(`link:${rel}->${readlinkSync(p)}`);
+      else if (e.isDirectory()) { out.push(`dir:${rel}`); walk(p); }
+      else out.push(`file:${rel}:${sha(readFileSync(p, "utf8"))}`);
+    }
+  };
+  if (existsSync(dir)) walk(dir);
+  return out.sort();
+}
+
 interface Prep { error: string | null; counters: Record<string, number>; manifest: string; hash: string;
-  launcher: string; m: Json; stdout: string; stderr: string }
+  launcher: string; m: Json; stdout: string; stderr: string;
+  /** Staging root and TMPDIR trees after the test's own boot-prepare, before the prepareWorkerSandbox child ran. */
+  beforePrepare: { staging: string[]; tmp: string[] } }
 function prepare(W: World, sid: string, extra: Record<string, string> = {}, cli = "claude", noHostCreds = false): Prep {
   if (noHostCreds) rmSync(join(W.host, ".claude", ".credentials.json"), { force: true });
   const b = boot(W, sid, extra, cli, true);
@@ -233,6 +250,7 @@ function prepare(W: World, sid: string, extra: Record<string, string> = {}, cli 
   writeFileSync(scopeFile, JSON.stringify({ version: 1, task: TASK, sid, read: [W.project], write: [W.project],
     domains: ["api.anthropic.com:443"] }));
   mkdirSync(stagingRoot, { recursive: true });
+  const beforePrepare = { staging: tree(stagingRoot), tmp: tree(join(W.root, "tmp")) };
   const spec = { module: pathToFileURL(join(DIST_SESSION, "worker-sandbox.js")).href, scopeFile, task: TASK, sid, cli,
     roleCwd: String(b.json?.spawn_cwd), argv: b.json?.argv, stagingRoot, targetCwd: W.project, hooksDir: W.hooks,
     host: W.host, fakeSecurity: JSON.stringify({ claudeAiOauth: { refreshToken: "FAKE-keychain" } }) };
@@ -243,7 +261,7 @@ function prepare(W: World, sid: string, extra: Record<string, string> = {}, cli 
   const manifest = String(res.manifest ?? "");
   return { error: (out.error as string | null) ?? null, counters: (out.counters ?? {}) as Record<string, number>,
     manifest, hash: String(res.hash ?? ""), launcher: String(res.launcher ?? ""),
-    m: manifest ? (readJson(manifest) ?? {}) : {}, stdout: b.stdout + r.stdout, stderr: b.stderr + r.stderr };
+    m: manifest ? (readJson(manifest) ?? {}) : {}, stdout: b.stdout + r.stdout, stderr: b.stderr + r.stderr, beforePrepare };
 }
 
 // The runner from a temp copy of the built session dir + inline fake SRT (see MOCK BOUNDARY).
@@ -330,18 +348,30 @@ test("unset: legacy descriptor/launcher/child unchanged; inherited CLAUDE_CODE_O
   assert.equal(runLauncher(W, b.launcher, { [CC]: W.token }).rec?.oauthEqualsFake, true);
 });
 
-test("unset/empty: confined manifest has no marker, host copy seeded as before; empty == unset byte-for-byte", () => {
+// #1232: the host login is never copied. Unset and empty both refuse with one fixed code before any effect.
+const REQUIRED = "SANDBOX_AUTH_WORKER_TOKEN_REQUIRED";
+test("unset/empty: confined prepare refuses SANDBOX_AUTH_WORKER_TOKEN_REQUIRED before any read, exec or write", () => {
   const W = world(), u = prepare(W, "u2"), e = prepare(W, "e2", { [OPT]: "" });
   if (WIN) {
     for (const p of [u, e]) refusedOnWin(W, p);
   } else {
-    for (const p of [u, e]) {
-      assert.equal(p.error, null);
-      assert.equal(p.m.claudeOAuthHandoff, undefined);
-      assert.equal(read(join(String((p.m.env as Json).CLAUDE_CONFIG_DIR), ".credentials.json")), W.hostCreds);
-      assert.equal(p.counters.hostClaudeRead, 1);
+    for (const [sid, p] of [["u2", u], ["e2", e]] as const) {
+      assert.equal(p.error, REQUIRED);
+      assert.equal(p.manifest, "");
+      assert.deepEqual(p.counters, { security: 0, otherExec: 0, hostClaudeRead: 0, hostCodexRead: 0 });
+      // #1232 R4: the staging root legitimately holds the test's own boot-prepare output (`boot/`, staged by boot() in
+      // prepare() before the refused call). The refused prepareWorkerSandbox must add or change nothing: no
+      // sandbox/<attempt>, no sandbox-current.json, no claude-oauth, and no new entry in this world's TMPDIR.
+      const staging = join(W.sessions, sid);
+      assert.ok(p.beforePrepare.staging.length > 0 && p.beforePrepare.staging.every((x) => /^[a-z]+:boot(\/|:|->|$)/.test(x)),
+        `boot baseline is only the test-owned boot subtree: ${JSON.stringify(p.beforePrepare.staging)}`);
+      assert.deepEqual(tree(staging), p.beforePrepare.staging, "staging root byte-unchanged by the refused prepare");
+      assert.deepEqual(readdirSync(staging), ["boot"]);
+      assert.deepEqual(tree(join(W.root, "tmp")), p.beforePrepare.tmp, "no new temp subtree in this world's TMPDIR");
     }
-    assert.deepEqual(Object.keys(e.m.env as Json).sort(), Object.keys(u.m.env as Json).sort());
+    assert.deepEqual(handoffs(W), []);
+    assert.deepEqual(leaks(W, [u.stdout, u.stderr, e.stdout, e.stderr]), []);
+    assert.ok(![u, e].some((p) => (p.stdout + p.stderr).includes(W.hostRefresh)), "no host refresh token in output");
   }
   const V = world(), lu = boot(V, "same"), X = world(), le = boot(X, "same", { [OPT]: "" });
   assert.equal(read(le.launcher).split(X.root).join("<R>"), read(lu.launcher).split(V.root).join("<R>"));
@@ -472,7 +502,7 @@ test("runner refuses a symlinked, oversized or unsealed-path manifest with its f
     unsealedPath: (f) => { const copy = join(dirname(f), "copy.json"); copyFileSync(f, copy); return { file: copy, hash: sha(read(f)) }; },
   };
   for (const [name, setup] of Object.entries(cases)) {
-    const W = world(), p = prepare(W, `sm-${name}`);
+    const W = world(), p = prepare(W, `sm-${name}`, { [OPT]: W.token });
     if (WIN) { refusedOnWin(W, p); continue; }
     const { file, hash } = setup(p.manifest);
     const r = runRunner(W, file, hash);
@@ -480,7 +510,7 @@ test("runner refuses a symlinked, oversized or unsealed-path manifest with its f
     assert.match(r.stderr, /\[sandbox\] REFUSED: SANDBOX_MANIFEST_INVALID\n$/, name);
     assert.deepEqual([r.srt.length, r.worker, existsSync(join(dirname(p.manifest), "receipt.json"))], [0, null, false], name);
   }
-  const W = world(), p = prepare(W, "sm-changed");
+  const W = world(), p = prepare(W, "sm-changed", { [OPT]: W.token });
   if (WIN) return refusedOnWin(W, p);
   const r = runRunner(W, p.manifest, sha("not the sealed manifest"));
   assert.equal(r.status, 78);
@@ -504,6 +534,8 @@ test("metadata canary missing/not-a-directory/symlink refuses before any token r
     for (const opted of [false, true]) {
       const W = world(), p = prepare(W, `cn-${name}-${String(opted)}`, opted ? { [OPT]: W.token } : {});
       if (WIN) { refusedOnWin(W, p); continue; }
+      // #1232: the unopted contrast never reaches a manifest.
+      if (!opted) { assert.deepEqual([p.error, p.manifest], [REQUIRED, ""]); continue; }
       assert.equal(typeof p.m.probeDirectory, "string", "manifest lacks the deployed probeDirectory canary");
       brk(String(p.m.probeDirectory));
       if (opted) rmSync(String(p.m.claudeOAuthHandoff));
@@ -519,6 +551,8 @@ test("failed preflight: no worker, no receipt, token never read, nothing leaked"
   for (const opted of [false, true]) {
     const W = world(), p = prepare(W, `pf-${String(opted)}`, opted ? { [OPT]: W.token } : {});
     if (WIN) { refusedOnWin(W, p); continue; }
+    // #1232: the unopted contrast never reaches a manifest.
+    if (!opted) { assert.deepEqual([p.error, p.manifest], [REQUIRED, ""]); continue; }
     if (opted) rmSync(String(p.m.claudeOAuthHandoff));
     const r = runRunner(W, p.manifest, p.hash, [], { FAKE_PREFLIGHT_EXIT: "71" });
     assert.equal(r.status, 78);
@@ -596,7 +630,7 @@ test("pure withSeccompHelperRead: Linux appends only <runtime>/vendor/seccomp to
 // The built runner hands SRT exactly the sealed config shaped for THIS platform with the runtime directory it
 // resolves itself (here the fake's). MOCK BOUNDARY: wiring only; the Linux bind is proven by the live case on CI.
 test("runner (fake SRT): initialize gets the sealed config, plus the runtime's vendor/seccomp on Linux only", () => {
-  const W = world(), p = prepare(W, "sc1");
+  const W = world(), p = prepare(W, "sc1", { [OPT]: W.token });
   if (WIN) return refusedOnWin(W, p);
   const r = runRunner(W, p.manifest, p.hash, ["--preflight-only"]);
   assert.equal(r.status, 0, r.stderr);
@@ -652,7 +686,7 @@ test("pure preflightDenyProbe: errno denials, Linux-only hiding denials, readabl
 // #652: a preflight that exits 0 but changed the host canary (a write that reached the host) refuses. MOCK BOUNDARY:
 // the fake appends to the canary host-side when wrapping the preflight; without that every fake preflight passes.
 test("runner (fake SRT): a preflight that changed the host canary refuses writeFile:leaked, no worker, no receipt", () => {
-  const W = world(), p = prepare(W, "lk1");
+  const W = world(), p = prepare(W, "lk1", { [OPT]: W.token });
   if (WIN) return refusedOnWin(W, p);
   const r = runRunner(W, p.manifest, p.hash, [], { FAKE_PREFLIGHT_LEAK: String(p.m.probeFile) });
   assert.equal(r.status, 78);
@@ -664,7 +698,7 @@ test("runner (fake SRT): a preflight that changed the host canary refuses writeF
 // The built runner's preflight carries exactly this platform's probe. MOCK BOUNDARY: the fake records the wrapped
 // command and never runs it.
 test("runner (fake SRT): the preflight command embeds preflightDenyProbe(process.platform)", () => {
-  const W = world(), p = prepare(W, "dp1");
+  const W = world(), p = prepare(W, "dp1", { [OPT]: W.token });
   if (WIN) return refusedOnWin(W, p);
   const r = runRunner(W, p.manifest, p.hash, ["--preflight-only"]);
   assert.equal(r.status, 0, r.stderr);
@@ -878,7 +912,7 @@ const OLD_DENIES = "deny('stat',()=>fs.statSync(process.argv[3]));deny('lstat',(
 if (process.platform === "darwin") test("live macOS confinement preflight passes on the real SRT; the old directory-stat deny set fails 71", () => {
   const W = world();
   W.sessions = join(W.host, ".aigentry", "sessions");
-  const p = prepare(W, "live1");
+  const p = prepare(W, "live1", { [OPT]: W.token });
   assert.equal(p.error, null);
   roots.push(String((p.m.env as Json).TMPDIR));
   const live = (runner: string) => spawnSync(process.execPath, [runner, p.manifest, p.hash, "--preflight-only"],
@@ -914,7 +948,7 @@ const linuxLive = process.platform === "linux" &&
 if (linuxLive) test("live Linux confinement preflight passes on the real SRT (bubblewrap) with the repaired deny set", () => {
   const W = world();
   W.sessions = join(W.host, ".aigentry", "sessions");
-  const p = prepare(W, "live2");
+  const p = prepare(W, "live2", { [OPT]: W.token });
   assert.equal(p.error, null);
   roots.push(String((p.m.env as Json).TMPDIR));
   const runner = join(DIST_SESSION, "worker-sandbox-runner.js");

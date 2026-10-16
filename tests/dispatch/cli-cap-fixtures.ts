@@ -35,8 +35,9 @@
 //                      tripwire stubs that exit 99 if a real provider launch is
 //                      ever attempted — no provider, auth or network.
 //   provider credentials
-//                      synthetic files only, so the real seedAuth() never falls
-//                      through to the login keychain. They authenticate nothing.
+//                      synthetic files plus a FAKE claude worker-token opt-in
+//                      (#1232); seedAuth() never reads a host claude login or the
+//                      keychain. They authenticate nothing.
 //
 // REAL and unstubbed through the spawn arm: bin/boot-prepare.mjs, the boot
 // adapter, installWorkerGitGuard(), prepareWorkerSandbox(), assertConfinedTarget()
@@ -95,10 +96,10 @@ export function fixture() {
   writeFileSync(join(home, ".claude.json"), "{}");
 
   // Synthetic provider auth. prepareWorkerSandbox() -> seedAuth() is real product
-  // code and reads a credential source; os.homedir() honours HOME, which is this
-  // fixture home. The claude branch only falls through to the login keychain when
-  // the credentials file is absent, so seeding it keeps that branch unreached.
-  // Runtime UUID canaries are synthetic and are credentials for nothing.
+  // code; os.homedir() honours HOME, which is this fixture home. Codex reads its
+  // auth file; since #1232 claude never reads this file or the keychain and needs
+  // the FAKE AIGENTRY_CLAUDE_OAUTH_TOKEN below. The file stays so routing's
+  // credential check is unchanged. Runtime UUID canaries are synthetic and are credentials for nothing.
   const claudeCanary = randomUUID();
   let codexCanary: string;
   do { codexCanary = randomUUID(); } while (codexCanary === claudeCanary);
@@ -239,6 +240,8 @@ process.exit(0);
     AIGENTRY_WORKER_SCOPE: scopeFile,
     // #1148: per-spawn public model metadata is OFF here (no real network from a fixture).
     AIGENTRY_MODEL_METADATA: "off",
+    // #1232: confined claude needs the worker-token opt-in; FAKE, never valid, never reaches a provider.
+    AIGENTRY_CLAUDE_OAUTH_TOKEN: "FAKE-cli-cap-fixture-worker-token-NOT-A-SECRET",
     AIGENTRY_SHIM_SCRIPT_DIR: "", DISPATCH_SCRIPT_DIR: "", DISPATCH_REGISTRY_PY: registry,
     REGISTRY_LOG: join(root, "registry.log"), REGISTRY_DB: join(root, "registry.json"),
     COUNTER: join(root, "counter"), PROMPT_LOG: join(root, "prompt"),

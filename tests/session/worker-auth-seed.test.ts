@@ -64,7 +64,7 @@ const PROGRAM = `${ERASED}\n;({ seedAuth, writePrivate });`;
 const EXPECTED_EXPORTS = ["writePrivate"];
 
 interface Decls {
-  seedAuth: (cli: string, home: string, cwd: string) => Record<string, string>;
+  seedAuth: (cli: string, home: string, cwd: string, oauthSelected?: boolean) => Record<string, string>;
   writePrivate: (file: string, data: string) => void;
 }
 
@@ -148,6 +148,7 @@ interface RunOpts {
   home?: string;
   env?: Record<string, string>;
   prefill?: Record<string, string>;
+  oauthSelected?: boolean;       // #1232: the opted-in worker token flag prepareWorkerSandbox passes
 }
 
 // ---- vm-realm boundary ---------------------------------------------------
@@ -204,7 +205,7 @@ function runSeed(opts: RunOpts) {
   });
   let threw: Error | null = null;
   let env: Record<string, string> | null = null;
-  try { env = seedAuth(cli, home, CWD); } catch (e) { threw = e as Error; }
+  try { env = seedAuth(cli, home, CWD, opts.oauthSelected ?? false); } catch (e) { threw = e as Error; }
   const sourcePath = cli === "codex" ? HOST_CODEX : HOST_CRED;
   return {
     threw,
@@ -219,137 +220,70 @@ function runSeed(opts: RunOpts) {
   };
 }
 
-const INVALID = "SANDBOX_AUTH_INVALID_SEED";
+// #1232: confined Claude never reads or copies the host login. Without the opted-in worker token
+// seedAuth refuses with one fixed code before any read, Keychain call, mkdir or write.
+const REQUIRED = "SANDBOX_AUTH_WORKER_TOKEN_REQUIRED";
 
-function assertRefused(r: ReturnType<typeof runSeed>) {
-  assert.ok(r.threw, "expected seedAuth to throw");
-  assert.equal(r.threw!.message, INVALID, "error must be the one stable non-secret code");
-  assert.equal(r.env, null);
-  assert.deepEqual(r.writes, [], "refusal must happen before any write");
-  assert.deepEqual(r.mkdirs, [], "refusal must happen before any directory creation");
-}
-
-// ---- refusals ------------------------------------------------------------
-const refusals: Array<[string, string]> = [
-  ["empty object", "{}"],
-  ["json null", "null"],
-  ["json true", "true"],
-  ["number primitive", "42"],
-  ["string primitive", '"FAKE-ACCESS-A"'],
-  ["outer array", '[{"claudeAiOauth":{"accessToken":"FAKE-ACCESS-A"}}]'],
-  ["claudeAiOauth null", JSON.stringify({ claudeAiOauth: null })],
-  ["claudeAiOauth array", JSON.stringify({ claudeAiOauth: [{ accessToken: "FAKE-ACCESS-A" }] })],
-  ["claudeAiOauth string", JSON.stringify({ claudeAiOauth: "FAKE-ACCESS-A" })],
-  ["oauth key absent", JSON.stringify({ otherKey: { accessToken: "FAKE-ACCESS-A" } })],
-  ["both tokens empty", JSON.stringify({ claudeAiOauth: { accessToken: "", refreshToken: "" } })],
-  ["both tokens whitespace", JSON.stringify({ claudeAiOauth: { accessToken: "   ", refreshToken: "\t\n " } })],
-  ["tokens absent, metadata present", JSON.stringify({ claudeAiOauth: { expiresAt: 4102444800000, scopes: ["user:inference"] } })],
-  ["non-string access, absent refresh", JSON.stringify({ claudeAiOauth: { accessToken: 12345 } })],
-  ["non-string tokens only", JSON.stringify({ claudeAiOauth: { accessToken: true, refreshToken: { nested: 1 } } })],
-  ["access empty, refresh non-string", JSON.stringify({ claudeAiOauth: { accessToken: "", refreshToken: 99 } })],
+// ---- T1: no opt-in is a refusal, whatever the host holds ------------------
+const hostStates: Array<[string, RunOpts]> = [
+  ["host file with access and refresh", { hostFile: F.both }],
+  ["host file with expired access and refresh", { hostFile: F.expiredWithRefresh }],
+  ["host file refresh only", { hostFile: F.refreshOnly }],
+  ["host file malformed with sentinel", { hostFile: F.malformed }],
+  ["no host file, Keychain item present", { hostFile: undefined, keychain: `${F.keychain}\n` }],
+  ["no host file, no Keychain item", { hostFile: undefined, keychain: null }],
 ];
 
-for (const [name, blob] of refusals) {
-  test(`seedAuth refuses missing material before any write: ${name}`, () => {
-    assertRefused(runSeed({ hostFile: blob, home: `${WORKER}/refuse` }));
+for (const [name, opts] of hostStates) {
+  test(`T1 seedAuth without the opt-in refuses with zero reads, Keychain calls and writes: ${name}`, () => {
+    const r = runSeed({ ...opts, home: `${WORKER}/t1-${name.replace(/[^A-Za-z0-9]+/g, "-")}` });
+    assert.ok(r.threw, "expected seedAuth to throw");
+    assert.equal(r.threw!.message, REQUIRED, "error must be the one stable non-secret code");
+    assert.equal(r.env, null);
+    assert.deepEqual(r.reads, [], "no host credential read");
+    assert.deepEqual(r.keychainCalls, [], "no Keychain invocation");
+    assert.deepEqual(r.writes, [], "refusal must happen before any write");
+    assert.deepEqual(r.mkdirs, [], "refusal must happen before any directory creation");
+    assert.equal(r.seeded, null, "no .credentials.json is seeded");
+    assert.ok(r.sourceUnchanged, "the host source is untouched");
+    const text = `${r.threw!.message}\n${r.threw!.stack ?? ""}`;
+    assert.ok(!text.includes(SENTINEL), "synthetic credential sentinel leaked into the error");
+    assert.ok(!text.includes(HOST_CRED), "source path leaked into the error");
+    assert.equal(Object.prototype.hasOwnProperty.call(r.threw, "cause"), false, "the refusal must not attach a cause");
+    assert.ok(!inspect(r.threw, { depth: 10, showHidden: true }).includes(SENTINEL),
+      "synthetic credential sentinel reachable from the error object");
   });
 }
 
-test("malformed JSON refuses with the stable code and never leaks the sentinel", () => {
-  const r = runSeed({ hostFile: F.malformed, home: `${WORKER}/malformed` });
-  assertRefused(r);
-  const text = `${r.threw!.message}\n${r.threw!.stack ?? ""}`;
-  assert.ok(!text.includes(SENTINEL), "synthetic credential sentinel leaked into the error");
-  assert.ok(!text.includes(HOST_CRED), "source path leaked into the error");
-  assert.ok(!text.includes("JSON"), "parser cause leaked into the error");
-  assert.equal(Object.prototype.hasOwnProperty.call(r.threw, "cause"), false, "the refusal must not attach a cause");
-  assert.ok(!inspect(r.threw, { depth: 10, showHidden: true }).includes(SENTINEL),
-    "synthetic credential sentinel reachable from the error object");
-});
-
-test("a keychain source with no material is refused before any write", () => {
-  const r = runSeed({ hostFile: undefined, keychain: "{}\n", home: `${WORKER}/kc-empty` });
-  assertRefused(r);
-  assert.equal(r.keychainCalls.length, 1);
-});
-
-// ---- acceptances ---------------------------------------------------------
-const accepted: Array<[string, string]> = [
-  ["access and refresh", F.both],
-  ["access only", F.accessOnly],
-  ["refresh only", F.refreshOnly],
-  ["expired access with refresh", F.expiredWithRefresh],
-  ["no expiry field", F.noExpiry],
-];
-
-for (const [name, blob] of accepted) {
-  test(`seedAuth admits ${name} and seeds the original bytes`, () => {
-    const home = `${WORKER}/ok-${name.replace(/\s+/g, "-")}`;
-    const r = runSeed({ hostFile: blob, home });
+// ---- T2: opted in, only the non-credential config is staged ---------------
+for (const [name, opts] of hostStates) {
+  test(`T2 seedAuth with the opt-in writes only .claude.json and settings.json (0600 wx), no host read: ${name}`, () => {
+    const home = `${WORKER}/t2-${name.replace(/[^A-Za-z0-9]+/g, "-")}`;
+    const r = runSeed({ ...opts, home, oauthSelected: true });
     assert.equal(r.threw, null, `unexpected throw: ${r.threw?.message}`);
-    assert.equal(r.seeded, blob, "admitted input must be seeded byte-identically");
     assert.deepEqual(r.env, {
       CLAUDE_CONFIG_DIR: `${home}/.claude`,
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
     });
-    assert.ok(r.sourceUnchanged, "selected source must not be rewritten");
+    assert.deepEqual(r.writes.map(w => ({ p: w.p, mode: w.mode, flag: w.flag })), [
+      { p: `${home}/.claude/.claude.json`, mode: 0o600, flag: "wx" },
+      { p: `${home}/.claude/settings.json`, mode: 0o600, flag: "wx" },
+    ]);
+    assert.ok(r.mkdirs.every(m => m.mode === 0o700 && m.recursive === true));
+    assert.equal(r.seeded, null, "no .credentials.json is seeded");
+    assert.deepEqual(r.reads, [], "no host credential read");
+    assert.deepEqual(r.keychainCalls, [], "no Keychain invocation");
+    assert.deepEqual(r.hostWrites, [], "no write may land under the host home");
+    assert.deepEqual(r.outsideHomeWrites, [], "no write may land outside the sandbox HOME");
+    assert.ok(r.sourceUnchanged, "the host source is untouched");
   });
 }
 
-test("unknown metadata on an admitted blob survives byte-identically", () => {
-  const blob = '{"claudeAiOauth":{"accessToken":"FAKE-ACCESS-A","futureField":{"k":[1,2]}},"topLevelUnknown":"keep-me"}';
-  const r = runSeed({ hostFile: blob, home: `${WORKER}/metadata` });
-  assert.equal(r.threw, null);
-  assert.equal(r.seeded, blob);
-});
-
-// ---- source selection is unchanged --------------------------------------
-test("a present but invalid file does NOT fall back to the fake Keychain", () => {
-  const r = runSeed({ hostFile: "{}", keychain: F.keychain, home: `${WORKER}/no-fallback` });
-  assertRefused(r);
-  assert.deepEqual(r.keychainCalls, [], "selection precedence must stay file-first with no fallback");
-  assert.equal(r.seeded, null);
-});
-
-test("an absent file still reads the fake Keychain with the pinned argv", () => {
-  const home = `${WORKER}/kc-ok`;
-  const r = runSeed({ hostFile: undefined, keychain: `${F.keychain}\n`, home });
-  assert.equal(r.threw, null, `unexpected throw: ${r.threw?.message}`);
-  assert.equal(r.keychainCalls.length, 1);
-  assert.equal(r.keychainCalls[0]!.file, "/usr/bin/security");
-  assert.deepEqual(r.keychainCalls[0]!.args, KEYCHAIN_ARGV);
-  assert.equal(r.seeded, F.keychain, "the trimmed keychain bytes are seeded unchanged");
-  assert.deepEqual(r.reads, [], "no file read when the selected source is absent");
-});
-
-test("absent file and absent Keychain item still refuse before any write", () => {
-  const r = runSeed({ hostFile: undefined, keychain: null, home: `${WORKER}/kc-absent` });
-  assert.ok(r.threw);
-  assert.equal(r.threw!.message, "fake: item not found", "the reader error must not be reclassified");
-  assert.deepEqual(r.writes, []);
-});
-
-// ---- write discipline ----------------------------------------------------
-test("admitted seeding keeps wx flag, 0600/0700 modes, and writes only under the sandbox HOME", () => {
-  const home = `${WORKER}/modes`;
-  const r = runSeed({ hostFile: F.both, home });
-  assert.equal(r.threw, null);
-  assert.deepEqual(r.writes.map(w => ({ p: w.p, mode: w.mode, flag: w.flag })), [
-    { p: `${home}/.claude/.credentials.json`, mode: 0o600, flag: "wx" },
-    { p: `${home}/.claude/.claude.json`, mode: 0o600, flag: "wx" },
-    { p: `${home}/.claude/settings.json`, mode: 0o600, flag: "wx" },
-  ]);
-  assert.ok(r.mkdirs.every(m => m.mode === 0o700 && m.recursive === true));
-  assert.deepEqual(r.hostWrites, [], "no write may land under the host home");
-  assert.deepEqual(r.outsideHomeWrites, [], "no write may land outside the sandbox HOME");
-  assert.ok(r.sourceUnchanged);
-});
-
-test("wx still refuses to overwrite an already-seeded credential file", () => {
+test("wx still refuses to overwrite an already-staged worker config", () => {
   const home = `${WORKER}/reuse`;
   const r = runSeed({
-    hostFile: F.both, home,
-    prefill: { [`${home}/.claude/.credentials.json`]: F.both },
+    hostFile: F.both, home, oauthSelected: true,
+    prefill: { [`${home}/.claude/.claude.json`]: "{}" },
   });
   assert.ok(r.threw);
   assert.match(r.threw!.message, /EEXIST/);
@@ -370,13 +304,42 @@ test("the codex branch is unchanged: no material guard, same two writes", () => 
   assert.ok(r.sourceUnchanged);
 });
 
-test("the guard is confined to the claude branch and names one stable error", () => {
+/** Identifiers and string/template literal texts under `nodes`. Code only: comments are trivia, never AST nodes. */
+function codeTokens(nodes: readonly unknown[]): { ids: Set<string>; literals: string[] } {
+  const ids = new Set<string>(), literals: string[] = [];
+  const visit = (n: any): void => {
+    if (ts.isIdentifier(n)) ids.add(n.text);
+    else if (ts.isStringLiteralLike(n) || ts.isTemplateHead(n) || ts.isTemplateMiddle(n) || ts.isTemplateTail(n)) literals.push(n.text);
+    ts.forEachChild(n, visit);
+  };
+  nodes.forEach(visit);
+  return { ids, literals };
+}
+
+test("the refusal is confined to the claude branch, names one stable error and no host credential source", () => {
   const decl = DECLS.get("seedAuth")!;
   const codexBranch = decl.slice(decl.indexOf('if (cli === "codex")'), decl.indexOf('if (cli === "claude")'));
-  assert.ok(!codexBranch.includes(INVALID), "the codex branch must not reference the new error");
-  assert.equal(decl.split(INVALID).length - 1, 2, "exactly one stable error code, thrown from two type/parse paths");
-  assert.ok(!/SANDBOX_AUTH_INVALID_SEED[^"]/.test(decl), "the error string must carry no interpolated detail");
-  assert.equal(/\$\{/.test(decl.slice(decl.indexOf(INVALID) - 40, decl.lastIndexOf(INVALID) + 40)), false);
+  assert.ok(!codexBranch.includes(REQUIRED), "the codex branch must not reference the claude refusal");
+  assert.equal(decl.split(REQUIRED).length - 1, 1, "exactly one stable error code, thrown once");
+  assert.ok(!/SANDBOX_AUTH_WORKER_TOKEN_REQUIRED[^"]/.test(decl), "the error string must carry no interpolated detail");
+  // #1232 F1: the host-read/copy prohibition is checked on CODE (identifiers + literals from the claude branch to the end of
+  // seedAuth, as before), so prose in a comment can neither fail nor satisfy it.
+  const sf = ts.createSourceFile("seedAuth.ts", decl, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS);
+  const fn = sf.statements[0];
+  assert.ok(ts.isFunctionDeclaration(fn) && fn.body, "seedAuth parsed as one function declaration");
+  const body = fn.body.statements as readonly any[];
+  const at = body.findIndex((s) => ts.isIfStatement(s) && s.expression.getText(sf) === 'cli === "claude"');
+  assert.ok(at > 0, "claude branch located in the AST");
+  const { ids, literals } = codeTokens(body.slice(at));
+  // Positive controls: the walk sees the branch's real code, so the absences below are not vacuous.
+  for (const lit of [REQUIRED, ".claude.json", "settings.json"]) assert.ok(literals.includes(lit), `walk misses literal ${lit}`);
+  assert.ok(ids.has("writePrivate") && ids.has("oauthSelected"), "walk misses the branch identifiers");
+  for (const id of ["execFileSync", "readFileSync"]) {
+    assert.ok(!ids.has(id), `the claude branch must not reference ${id}`);
+  }
+  for (const gone of ["/usr/bin/security", "Claude Code-credentials", ".credentials.json", "SANDBOX_AUTH_INVALID_SEED"]) {
+    assert.ok(!literals.some((l) => l.includes(gone)), `the claude branch must not reference ${gone}`);
+  }
 });
 
 test("the candidate declarations contain no destructive or host-directed fs call", () => {

@@ -55,7 +55,8 @@ function world(): World {
   return { root, host, bin, project: join(root, "project") };
 }
 
-// Explicit env only: no ambient auth, developer HOME, CODEX_HOME or AIGENTRY_CLAUDE_OAUTH_TOKEN reaches the child.
+// Explicit env only: no ambient auth, developer HOME, CODEX_HOME or AIGENTRY_CLAUDE_OAUTH_TOKEN reaches the child
+// (#1232: prepare() adds a FAKE opt-in for claude only).
 const env = (W: World): Record<string, string> => ({
   PATH: `${W.bin}${WIN ? ";" : ":/usr/bin:/bin"}`, HOME: W.host, TMPDIR: join(W.root, "tmp"), LANG: "en_US.UTF-8",
   AGENT_METADATA_DIST: DIST,
@@ -68,8 +69,10 @@ function prepare(W: World, sid: string, cli: string, domains: string[]): Prep {
   const scopeFile = join(W.root, `scope-${sid}.json`), stagingRoot = join(W.root, "sessions", sid);
   writeFileSync(scopeFile, JSON.stringify({ version: 1, task: TASK, sid, read: [W.project], write: [W.project], domains }));
   mkdirSync(stagingRoot, { recursive: true });
+  // #1232: a confined claude worker needs the opted-in worker token; this one is FAKE and never used.
   const r = spawnSync(process.execPath, [DRIVER, JSON.stringify({ scopeFile, task: TASK, sid, cli, roleCwd: W.project,
-    argv: [cli], stagingRoot })], { encoding: "utf8", env: env(W), timeout: 30000 });
+    argv: [cli], stagingRoot })], { encoding: "utf8", timeout: 30000,
+    env: { ...env(W), ...(cli === "claude" ? { AIGENTRY_CLAUDE_OAUTH_TOKEN: "FAKE-1206-WORKER-NOT-A-SECRET" } : {}) } });
   const res = parse(r.stdout.trim());
   const line = /^Error: (.*)$/m.exec(r.stderr);
   const manifest = res ? String(res.manifest) : "", hash = res ? String(res.hash) : "";

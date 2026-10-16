@@ -309,7 +309,8 @@ if (POSIX) test("S-09 prepareWorkerSandbox refuses control-root overlap BEFORE a
     const stage = H.privDir(path.join(sessions, sid));
     const r = H.sh(prep, [JSON.stringify({ scopeFile, task: "1170", sid, cli: "claude", roleCwd,
       argv: ["claude", "--append-system-prompt-file", scopeFile], stagingRoot: stage, controlRoots })],
-    { env: H.hermeticEnv(run, { MR_DIST: DIST }), timeout: 60000 });
+    // #1232: FAKE worker-token opt-in, so AUTH_REQUIRED does not mask SANDBOX_POLICY_CONTROL_OVERLAP.
+    { env: H.hermeticEnv(run, { MR_DIST: DIST, AIGENTRY_CLAUDE_OAUTH_TOKEN: "FAKE-MR1170-WORKER-TOKEN" }), timeout: 60000 });
     assert.equal(r.status, 0, r.stderr);
     return { out: JSON.parse(r.stdout), stage };
   };

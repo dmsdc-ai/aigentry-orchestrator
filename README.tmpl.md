@@ -133,12 +133,12 @@ Orchestration infra for the aigentry ecosystem — not a standalone tool, and in
 
 ## Optional: long-lived Claude token for workers (#652)
 
-Status: opt-in **code path only**. It is compile-checked, and an independent tester owns the fake-fixture regression. It is not configured or adopted anywhere yet, and longitudinal stability (fewer forced re-logins) is **not verified**. Treat it as a temporary mitigation, not a guarantee.
+Status: since #1232 this is the **only** credential path for confined Claude workers, not an alternative one. It is compile-checked, and an independent tester owns the fake-fixture regression. No token is configured anywhere yet, so live activation is still pending, and longitudinal stability (fewer forced re-logins) is **not verified**. Treat it as a temporary mitigation, not a guarantee.
 
-By default each Claude worker gets a copy of the host Claude login (access + refresh token). With this opt-in, Claude workers instead use a long-lived `claude setup-token` token, and the host login is never read or copied for them.
+For **confined** Claude workers this opt-in is **mandatory** (#1232): the host Claude login is never read or copied into a worker, so a long-lived `claude setup-token` token is the only credential such a worker can authenticate with. Without it a confined Claude spawn is refused outright — nothing is staged, registered or started. On the legacy unconfined launcher the host login is still used as before.
 
 - **Selector:** `AIGENTRY_CLAUDE_OAUTH_TOKEN` in the **controller** environment (the process running dispatch / `bin/boot-prepare.mjs`). Nonempty selects it for **Claude workers only**. Codex/Gemini/Grok are unaffected.
-- **Unset or empty:** the old behavior, unchanged (including any inherited `CLAUDE_CODE_OAUTH_TOKEN` on the legacy path).
+- **Unset or empty:** a **confined** Claude worker is refused with `SANDBOX_AUTH_WORKER_TOKEN_REQUIRED` and **exit 78** — before boot-prepare stages anything, before the worker git guard is installed and before any terminal opens, so nothing is spawned. The refusal names the variable only; no value is ever echoed. On the legacy **unconfined** path the old behavior is unchanged (including any inherited `CLAUDE_CODE_OAUTH_TOKEN`).
 - **Set but invalid** (must be one line of printable ASCII, at most 4096 bytes): the launch is refused with a fixed error. There is **no fallback** to host credentials.
 - The worker receives it as `CLAUDE_CODE_OAUTH_TOKEN`. Per the official docs ([authentication: generate a long-lived token](https://code.claude.com/docs/en/authentication#generate-a-long-lived-token), [CLI reference](https://code.claude.com/docs/en/cli-reference)), `claude setup-token` issues a one-year subscription token that covers model requests, not Remote Control or connectors. Actual expiry behavior has not been measured here.
 

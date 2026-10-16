@@ -61,7 +61,7 @@ const fake = (k: string): string => `FAKE-sk-ant-${k}01-${randomUUID()}-NOT-A-SE
 
 interface World {
   root: string; host: string; aig: string; bin: string; project: string; hostCreds: string; hostCodex: string;
-  fakes: string[];
+  fakes: string[]; workerToken: string;
 }
 
 const roots: string[] = [];
@@ -96,15 +96,17 @@ function world(): World {
   w(join(aig, "instructions", "roles", "tester.md"), "# tester\n");
   mkdirSync(join(root, "project"), { recursive: true });
   mkdirSync(join(root, "tmp"), { recursive: true });
-  const fakes = [fake("oat"), fake("ort"), fake("cdx")];
+  // #1232: fakes[3] is the FAKE opted-in worker token; the host record stays present to prove it is never copied.
+  const fakes = [fake("oat"), fake("ort"), fake("cdx"), fake("wkr")];
   const hostCreds = JSON.stringify({ claudeAiOauth: { accessToken: fakes[0], refreshToken: fakes[1] } });
   w(join(host, ".claude", ".credentials.json"), hostCreds, 0o600);
   const hostCodex = JSON.stringify({ fake: fakes[2] });
   w(join(host, ".codex", "auth.json"), hostCodex, 0o600);
-  return { root, host, aig, bin, project: join(root, "project"), hostCreds, hostCodex, fakes };
+  return { root, host, aig, bin, project: join(root, "project"), hostCreds, hostCodex, fakes, workerToken: fakes[3]! };
 }
 
 // Explicit env only: no ambient auth, developer HOME or AIGENTRY_CLAUDE_OAUTH_TOKEN reaches a child.
+// #1232: only a claude prepare child gets the FAKE opt-in (prepare() below), never the boot.
 // win32 adds only fake USERPROFILE (os.homedir), TEMP/TMP (os.tmpdir) and SystemRoot (Windows runtime).
 const env = (W: World): Record<string, string> => ({
   PATH: WIN ? [W.bin, probeExeDir()].join(delimiter) : `${W.bin}:/usr/bin:/bin`, HOME: W.host,
@@ -125,13 +127,15 @@ function bootArgv(W: World, sid: string, cli: string): { argv: string[]; roleCwd
 }
 
 interface Prep { status: number | null; out: string; error: string | null; m: Json; stagingRoot: string }
-function prepare(W: World, sid: string, cli: string, argv: string[], roleCwd: string, pathEnv?: string): Prep {
+function prepare(W: World, sid: string, cli: string, argv: string[], roleCwd: string, pathEnv?: string,
+  opted = cli === "claude"): Prep {
   const scopeFile = join(W.root, `scope-${sid}.json`), stagingRoot = join(W.root, "sessions", sid);
   writeFileSync(scopeFile, JSON.stringify({ version: 1, task: TASK, sid, read: [W.project], write: [W.project],
     domains: ["api.anthropic.com:443"] }));
   mkdirSync(stagingRoot, { recursive: true });
   const r = spawnSync(process.execPath, [DRIVER, JSON.stringify({ scopeFile, task: TASK, sid, cli, roleCwd, argv,
-    stagingRoot })], { encoding: "utf8", env: { ...env(W), ...(pathEnv === undefined ? {} : { PATH: pathEnv }) },
+    stagingRoot })], { encoding: "utf8", env: { ...env(W), ...(pathEnv === undefined ? {} : { PATH: pathEnv }),
+    ...(opted ? { AIGENTRY_CLAUDE_OAUTH_TOKEN: W.workerToken } : {}) },
     timeout: 30000 });
   const res = parse(r.stdout.trim());
   const line = /^Error: (.*)$/m.exec(r.stderr);
@@ -204,13 +208,15 @@ test("claude: exact closed 8-tool set, one --tools and one --allowedTools, same 
     "CLAUDE_CODE_TMPDIR", "CLAUDE_CONFIG_DIR", "HOME", "LANG", "PATH", "SHELL", "TEMP", "TERM", "TMP", "TMPDIR"]);
   assert.equal(e.AIGENTRY_REPORT_OUTBOX, outbox);
   assert.equal(e.CLAUDE_CONFIG_DIR, join(home, ".claude"));
-  assert.equal(read(join(home, ".claude", ".credentials.json")), W.hostCreds);
+  // #1232: the host login is never copied; the opted-in token travels only through the sealed handoff marker.
+  assert.equal(existsSync(join(home, ".claude", ".credentials.json")), false);
   const fsCfg = (p.m.config as Json).filesystem as Json;
   assert.deepEqual((fsCfg.allowWrite as string[]).slice(1), [home, e.TMPDIR]);
   // #1206: scope extra (api.anthropic.com) kept first, then the code-owned claude provider hosts, deduplicated.
   assert.deepEqual(((p.m.config as Json).network as Json).allowedDomains, ["api.anthropic.com:443", "claude.ai:443",
     "platform.claude.com:443", "statsig.anthropic.com:443", "console.anthropic.com:443"]);
-  assert.equal(p.m.claudeOAuthHandoff, undefined);
+  assert.ok(String(p.m.claudeOAuthHandoff).endsWith(join(String(p.m.attempt), "claude-oauth", "token")), "handoff marker present");
+  assert.ok(!JSON.stringify(p.m).includes(W.workerToken), "the token never enters the manifest");
 });
 
 // #1200: a confined worker has nobody to answer Claude Code's own permission prompt; the OS sandbox is
@@ -276,6 +282,21 @@ test("claude: every override flag/alias, equals form, position and variadic is r
     }
   }
   assert.equal(read(join(W.host, ".claude", ".credentials.json")), hostBefore);
+});
+
+// #1232: without the opt-in a clean claude argv refuses SANDBOX_AUTH_WORKER_TOKEN_REQUIRED before staging, and the
+// tool-policy refusal keeps its place ahead of it; the codex branch never asks for the opt-in.
+test("#1232 claude without the opt-in: token refusal before staging; SANDBOX_TOOL_ARG still first; codex unaffected", () => {
+  const W = world(), { argv, roleCwd } = bootArgv(W, "q0", "claude");
+  const clean = prepare(W, "q0", "claude", argv, roleCwd, undefined, false);
+  assertRefused(W, clean, WIN ? UNSUPPORTED : "SANDBOX_AUTH_WORKER_TOKEN_REQUIRED");
+  const secret = fake("pay");
+  const attack = prepare(W, "q1", "claude", [...argv, "--tools", secret], roleCwd, undefined, false);
+  assertRefused(W, attack, WIN ? UNSUPPORTED : "SANDBOX_TOOL_ARG: --tools", [secret]);
+  const cx = bootArgv(W, "q2", "codex"), c = prepare(W, "q2", "codex", cx.argv, cx.roleCwd, undefined, false);
+  if (WIN) return assertRefused(W, c, UNSUPPORTED);
+  assert.equal(c.status, 0, c.out);
+  assert.equal(c.m.claudeOAuthHandoff, undefined);
 });
 
 test("claude: lookalike flags are not overmatched (no prefix/substring refusal)", () => {

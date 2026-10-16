@@ -31,6 +31,8 @@ for (let p = privateTmp; ; p = dirname(p)) {
 const runRoot = mkdtempSync(join(privateTmp, 'ir1171-'));
 const evidence = mkdtempSync(join(runRoot, 'evidence-'));
 const parentEnv = { ...process.env };
+// #1232: the fabricated confined-claude worker-token opt-in every fixture passes; authenticates nothing.
+const FAKE_WORKER_TOKEN = 'FAKE-installed-routing-worker-token-NOT-A-SECRET';
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 const save = (name, value) => writeFileSync(join(evidence, name), JSON.stringify(value, null, 2) + '\n');
 const log = value => appendFileSync(join(evidence, 'commands.jsonl'), JSON.stringify(value) + '\n');
@@ -117,6 +119,7 @@ process.on('exit', status => portRecord({event: 'exit', status, elapsedMs: Date.
         return file;
     };
     writeFileSync(join(home, ".claude.json"), "{}");
+    // #1232: kept so a host-login copy would be observable; confined claude authenticates only via the FAKE opt-in below.
     writeFileSync(join(home, ".claude/.credentials.json"), '{"fixture":true}');
     writeFileSync(join(root, "codex-home/auth.json"), '{"fixture":true}');
     writeFileSync(join(root, "scope.json"), JSON.stringify({ version: 1, task: "1083", sid: "router-fixture",
@@ -179,7 +182,9 @@ fs.writeFileSync(manifest.receipt, JSON.stringify({ hash: current.hash, attempt:
         COUNTER: join(root, "counter"), PROMPT_LOG: join(root, "prompt"), CLASSIFIER_ARGS: join(root, "classifier-args"),
         PARENT_MODEL_LOG: join(root, "parent-model"),
         CLASSIFIER_REPLY: '{"label":"gpt-6-astra","reason":"implementation","confidence":0.9}',
-        CLASSIFIER_EXIT: "0", CLASSIFIER_HANG: "0", OPEN_LOG: join(root, "open.json"), TELEMETRY_LOG: join(root, "telemetry.jsonl") };
+        CLASSIFIER_EXIT: "0", CLASSIFIER_HANG: "0", OPEN_LOG: join(root, "open.json"), TELEMETRY_LOG: join(root, "telemetry.jsonl"),
+        // #1232: confined claude needs the worker-token opt-in; FAKE, never valid, never reaches a provider.
+        AIGENTRY_CLAUDE_OAUTH_TOKEN: FAKE_WORKER_TOKEN };
   let child;
   const childPid = () => {
     child ??= spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], { env: { ...systemEnv, HOME: home, USERPROFILE: home }, stdio: "ignore" });
@@ -204,8 +209,15 @@ fs.writeFileSync(manifest.receipt, JSON.stringify({ hash: current.hash, attempt:
     assert.equal(m.config.enableWeakerNetworkIsolation, false);
     assert.deepEqual(m.config.network?.allowUnixSockets, []);
     assert.equal(m.env.AIGENTRY_TARGET_CWD, join(root, "project"));
-    const auth = m.cli === "codex" ? join(m.env.CODEX_HOME, "auth.json") : join(m.env.CLAUDE_CONFIG_DIR, ".credentials.json");
-    assert.deepEqual(JSON.parse(readFileSync(auth, "utf8")), { fixture: true });
+    if (m.cli === "codex") {
+        assert.deepEqual(JSON.parse(readFileSync(join(m.env.CODEX_HOME, "auth.json"), "utf8")), { fixture: true });
+    } else {
+        // #1232: no host credential copy; the sealed marker names this attempt's private handoff.
+        assert.equal(existsSync(join(m.env.CLAUDE_CONFIG_DIR, ".credentials.json")), false, "the host login is never copied");
+        assert.equal(m.claudeOAuthHandoff, join(dirname(current.manifest), "claude-oauth", "token"));
+        assert.equal(readFileSync(m.claudeOAuthHandoff, "utf8").trim() === FAKE_WORKER_TOKEN, true, "handoff carries the fake opt-in");
+        assert.equal("CLAUDE_CODE_OAUTH_TOKEN" in m.env, false);
+    }
     assert.ok(m.config.filesystem?.allowWrite?.includes(join(root, "project")));
     assert.equal(existsSync(env.WORK_LOG), false, "no model/work operation");
     return m;

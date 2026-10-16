@@ -11,11 +11,12 @@ import { writeNpmCmdShim } from "../session/boot-adapter/_win-launch-fixture.js"
 export const REPO = resolve(import.meta.dirname, "../../..");
 export const PROFILE = join(REPO, "tests/dispatch/fixtures/model-routing-profile.md");
 export const ROUTER = join(REPO, "bin/model-router.mjs");
-// The Claude boot guard refuses a seed source carrying no OAuth material at all, so the
-// positive fixture must present the real `.credentials.json` shape. These bytes are
-// fabricated: no live token, provider call or refresh path is involved, and `fixture`
-// keeps the record self-identifying. `accessToken` alone is what the guard needs.
+// #1232: a confined claude worker never receives a copy of the host login. The fixture host still
+// holds this fabricated `.credentials.json` (no live token, provider call or refresh path) so a copy
+// would be observable, and the worker authenticates only through the private handoff of the FAKE
+// opt-in below. A no-token case must delete/undefine AIGENTRY_CLAUDE_OAUTH_TOKEN explicitly.
 const CLAUDE_AUTH = { fixture: true, claudeAiOauth: { accessToken: "fixture-access-token-not-a-real-credential" } };
+export const FAKE_WORKER_TOKEN = "FAKE-model-router-fixture-worker-token-NOT-A-SECRET";
 /** #1167 P6: the spawn decision a win32 SANDBOX_PLATFORM_UNSUPPORTED refusal names (effort/executable only with a resolver decision). */
 export interface Decided { cli: string; model: string | null; decided_by: string | null; capped_cli?: string; effort?: string | null; executable?: string }
 export function fixture() {
@@ -113,7 +114,9 @@ fs.writeFileSync(manifest.receipt, JSON.stringify({ hash: current.hash, attempt:
     // #1148: per-spawn public model metadata is OFF in every subprocess fixture (no real network);
     // fresh metadata is exercised only through an injected fake transport. Every `--version`/`--help`
     // probe of a fake CLI is recorded so the managed path can assert it never probes.
-    AIGENTRY_MODEL_METADATA: "off", CLI_PROBE_LOG: join(root, "cli-probe.log") };
+    AIGENTRY_MODEL_METADATA: "off", CLI_PROBE_LOG: join(root, "cli-probe.log"),
+    // #1232: confined claude needs the worker-token opt-in; FAKE, never valid, never reaches a provider.
+    AIGENTRY_CLAUDE_OAUTH_TOKEN: FAKE_WORKER_TOKEN };
   for (const command of ["apply_patch", "ps", "kill", "pkill", "killall", "launchctl", "open", "osascript", "tmux", "curl", "wget", "ssh", "npm", "npx", "srt"])
     script(command, "require('node:fs').appendFileSync(process.env.WORK_LOG, 'forbidden\\n'); process.exit(99)");
   // #1162: a spawned dispatch publishes agent metadata once (wh-cli agent-meta-set), and the cmux
@@ -154,8 +157,15 @@ if (process.argv.length === 3 && process.argv[2] === 'capabilities') {
     assert.equal(m.config.enableWeakerNetworkIsolation, false);
     assert.deepEqual(m.config.network?.allowUnixSockets, []);
     assert.equal(m.env.AIGENTRY_TARGET_CWD, join(root, "project"));
-    const auth = m.cli === "codex" ? join(m.env.CODEX_HOME!, "auth.json") : join(m.env.CLAUDE_CONFIG_DIR!, ".credentials.json");
-    assert.deepEqual(JSON.parse(readFileSync(auth, "utf8")), m.cli === "codex" ? { fixture: true } : CLAUDE_AUTH);
+    if (m.cli === "codex") {
+      assert.deepEqual(JSON.parse(readFileSync(join(m.env.CODEX_HOME!, "auth.json"), "utf8")), { fixture: true });
+    } else {
+      // #1232: no host credential copy; the sealed marker names this attempt's private handoff.
+      assert.equal(existsSync(join(m.env.CLAUDE_CONFIG_DIR!, ".credentials.json")), false, "the host login is never copied");
+      assert.equal(m.claudeOAuthHandoff, join(dirname(current.manifest), "claude-oauth", "token"));
+      assert.equal(readFileSync(m.claudeOAuthHandoff!, "utf8").trim() === FAKE_WORKER_TOKEN, true, "handoff carries the fake opt-in");
+      assert.equal("CLAUDE_CODE_OAUTH_TOKEN" in m.env, false);
+    }
     assert.ok(m.config.filesystem?.allowWrite?.includes(join(root, "project")));
     assert.equal(existsSync(env.WORK_LOG!), false, "no model/work operation");
     return m;

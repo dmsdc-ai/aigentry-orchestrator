@@ -41,7 +41,9 @@ function prepare(run, { sid = "w1162-p", task = "1162", launch, stagingRoot } = 
   const stage = stagingRoot ?? privDir(path.join(run.dir, "sessions", sid));
   const r = sh(process.execPath, [PREPARE, JSON.stringify({ scopeFile, task, sid, cli: "claude", roleCwd,
     argv: ["claude", "--append-system-prompt-file", scopeFile], stagingRoot: stage,
-    ...(launch === undefined ? {} : { launch }) })], { env: hermeticEnv(run, { AGENT_METADATA_DIST: DIST }) });
+    ...(launch === undefined ? {} : { launch }) })],
+  // #1232: a confined claude worker needs the worker-token opt-in; FAKE, so the binding gates stay observable.
+  { env: hermeticEnv(run, { AGENT_METADATA_DIST: DIST, AIGENTRY_CLAUDE_OAUTH_TOKEN: "FAKE-IT1162-WORKER-TOKEN" }) });
   assert.equal(r.status, 0, `prepare failed: ${r.stderr}`);
   return { ...JSON.parse(r.stdout), stage, write, sid, task };
 }

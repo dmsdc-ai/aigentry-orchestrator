@@ -602,8 +602,11 @@ function cliCap(cli: string): number {
 
 // #1206 (PLAN §2.3): stat only, nothing is read or run. An executable the resolver would bind by name
 // (`<cli>` in an absolute PATH dir); a declared AIGENTRY_<CLI>_EXECUTABLE is an explicit request the
-// resolver judges itself, never substituted. A credential source seedAuth can copy: codex auth.json;
-// claude's opted-in token handoff, its credentials file, or on darwin the login Keychain (not statable).
+// resolver judges itself, never substituted. A credential source: codex auth.json seedAuth copies; for
+// claude the opted-in token, its credentials file, or on darwin the login Keychain (not statable).
+// #1232 (D1): claude routing is deliberately unchanged. seedAuth no longer copies the host login, and
+// spawnWorkspace refuses claude without the opt-in (SANDBOX_AUTH_WORKER_TOKEN_REQUIRED, exit 78) rather
+// than letting this predicate silently re-route the spawn to another provider/billing path.
 function executablePresent(cli: string): boolean {
   if (env[`AIGENTRY_${cli.toUpperCase()}_EXECUTABLE`]) return true;
   return (env.PATH || "").split(path.delimiter).some((dir) => path.isAbsolute(dir) && isExecutable(path.join(dir, cli)));
@@ -1258,6 +1261,14 @@ function spawnWorkspace(o: Opts, sid: string): void {
     die(`dispatch.sh: SANDBOX_PLATFORM_UNSUPPORTED: a confined worker needs the macOS/Linux OS sandbox and ` +
       `${process.platform} has none (documented limitation; no unrestricted fallback); decided ${decided}; ` +
       "nothing was spawned or registered (exit 78)", 78);
+  }
+  // #1232: the host login is never copied into a confined Claude worker; without the opt-in it cannot
+  // authenticate, so refuse now — before boot-prepare stages anything, the git guard is installed or a
+  // terminal opens. Names the variable only; it is unset here, so no value can be echoed.
+  if (o.cli === "claude" && !env[CLAUDE_OAUTH_OPT_IN]) {
+    die("dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_REQUIRED: confined Claude workers authenticate only with an approved " +
+      "automation token (claude setup-token) supplied as AIGENTRY_CLAUDE_OAUTH_TOKEN in the dispatcher environment; " +
+      "the host login is never copied; see docs/setup/dispatch-capacity.md; nothing was spawned (exit 78)", 78);
   }
   const spawnEnv: NodeJS.ProcessEnv = o.route && /^(llm|table)(-capped)?$/.test(o.route.decided_by) && o.decision?.model !== null
     ? { [`AIGENTRY_${o.cli.toUpperCase()}_MODEL`]: o.route.model } : {};

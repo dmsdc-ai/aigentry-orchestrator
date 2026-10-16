@@ -320,6 +320,9 @@ t_confined_setup() {
   export AIGENTRY_TASK_QUEUE="$T_TMP/fixture-queue.json" AIGENTRY_TASK_GATE=hard
   export AIGENTRY_GIT_HOOKS_DIR="$T_TMP/hooks" AIGENTRY_GIT_HOOK_SOURCE_DIR="$REPO_ROOT/git-hooks"
   export AIGENTRY_WORKER_SCOPE="$T_TMP/scope.json"
+  # #1232: a confined claude spawn needs the worker-token opt-in. FAKE value (the loop above already dropped any
+  # ambient one); the fixture never runs a provider CLI, and the live-only T16 never sources this setup.
+  export AIGENTRY_CLAUDE_OAUTH_TOKEN="FAKE-confined-fixture-worker-token-NOT-A-SECRET"
   export T_FIXTURE_HELPER="$TEST_LIB_DIR/confined-fixture.mjs"
   export T_FIXTURE_NODE="$(command -v node)"
   # Canonical, private temp path also avoids the production macOS /var/folders

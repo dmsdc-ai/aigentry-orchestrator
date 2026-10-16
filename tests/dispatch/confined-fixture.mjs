@@ -1,7 +1,7 @@
 // Synthetic caller preconditions only: these receipts prove no OS enforcement.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
@@ -38,11 +38,12 @@ const receipt = (current, manifest) => {
   json(manifest.receipt, { hash: current.hash, attempt: manifest.attempt,
     state: 'running', supervisorPid: pid, childPid: pid });
 };
-// The Claude boot guard refuses a seed source carrying no OAuth material at all, so the
-// positive fixture must present the real `.credentials.json` shape. These bytes are
-// fabricated: no live token, provider call or refresh path is involved, and `fixture`
-// keeps the record self-identifying. `accessToken` alone is what the guard needs.
+// #1232: a confined claude worker never receives a copy of the host login. The fixture host still
+// holds a fabricated `.credentials.json` (no live token, provider call or refresh path) so that a
+// copy would be observable; the worker authenticates only through the private handoff of the FAKE
+// opt-in that t_confined_setup exports (same literal as FAKE_WORKER_TOKEN).
 const CLAUDE_AUTH = { fixture: true, claudeAiOauth: { accessToken: 'fixture-access-token-not-a-real-credential' } };
+const FAKE_WORKER_TOKEN = 'FAKE-confined-fixture-worker-token-NOT-A-SECRET';
 
 if (action === 'init') {
   for (const dir of ['home/.config', 'home/.cache', 'gemini-home', 'sessions', 'role-sandbox'])
@@ -103,9 +104,17 @@ if (action === 'init') {
   assert.equal(manifest.config.enableWeakerNestedSandbox, false);
   assert.equal(manifest.config.enableWeakerNetworkIsolation, false);
   confined(manifest.env.TMPDIR);
-  const auth = manifest.cli === 'codex' ? join(manifest.env.CODEX_HOME, 'auth.json')
-    : join(manifest.env.CLAUDE_CONFIG_DIR, '.credentials.json');
-  assert.deepEqual(read(auth), manifest.cli === 'codex' ? { fixture: true } : CLAUDE_AUTH);
+  if (manifest.cli === 'codex') {
+    assert.deepEqual(read(join(manifest.env.CODEX_HOME, 'auth.json')), { fixture: true });
+  } else {
+    // #1232: no host credential copy; the sealed marker names this attempt's private handoff.
+    assert.equal(existsSync(join(manifest.env.CLAUDE_CONFIG_DIR, '.credentials.json')), false);
+    const handoff = join(dirname(current.manifest), 'claude-oauth', 'token');
+    assert.equal(manifest.claudeOAuthHandoff, handoff);
+    assert.equal(statSync(confined(handoff)).mode & 0o777, 0o600);
+    assert.equal(readFileSync(handoff, 'utf8').trim() === FAKE_WORKER_TOKEN, true, 'handoff carries the fake opt-in');
+    assert.equal('CLAUDE_CODE_OAUTH_TOKEN' in manifest.env, false);
+  }
   receipt(current, manifest);
   if (action === 'guard') {
     // Execute the actual generated guard body. Intercept only its final exec,

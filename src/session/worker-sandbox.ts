@@ -2,7 +2,6 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { createHash, randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { AddressInfo } from "node:net";
 import type { SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
@@ -182,29 +181,9 @@ function seedAuth(cli: string, home: string, cwd: string, oauthSelected = false)
   }
   if (cli === "claude") {
     const config = path.join(home, ".claude");
-    // #652: an opted-in worker token replaces the host credential copy entirely;
-    // neither .credentials.json nor the Keychain is read, so no refresh token is shared.
-    if (!oauthSelected) {
-      const source = path.join(realHome, ".claude", ".credentials.json");
-      const auth = fs.existsSync(source) ? fs.readFileSync(source, "utf8") :
-        execFileSync("/usr/bin/security", ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
-          { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000 }).trim();
-      // Refuse a selected source that carries no credential material at all, before
-      // any seed write. Purely syntactic: it does not ask the provider anything and
-      // does not judge freshness, so an expired access token with a refresh token
-      // still passes. Either token alone suffices; neither is a refusal. The error
-      // is a fixed string so no credential byte, path or parser detail can leak.
-      const record = (v: unknown): v is Record<string, unknown> =>
-        typeof v === "object" && v !== null && !Array.isArray(v);
-      const material = (v: unknown): boolean => typeof v === "string" && v.trim() !== "";
-      let parsed: unknown;
-      try { parsed = JSON.parse(auth); } catch { throw new Error("SANDBOX_AUTH_INVALID_SEED"); }
-      const oauth = record(parsed) ? parsed.claudeAiOauth : undefined;
-      if (!record(oauth) || !(material(oauth.accessToken) || material(oauth.refreshToken))) {
-        throw new Error("SANDBOX_AUTH_INVALID_SEED");
-      }
-      writePrivate(path.join(config, ".credentials.json"), auth);
-    }
+    // #652/#1232: the opted-in worker token is the only confined Claude credential. The host
+    // .credentials.json and Keychain are never read or copied, so no refresh token is shared.
+    if (!oauthSelected) throw new Error("SANDBOX_AUTH_WORKER_TOKEN_REQUIRED");
     // #1200: the confined override runs claude with --permission-mode bypassPermissions, and a fresh
     // config shows the one-time "Bypass Permissions mode … Yes, I accept" dialog before the REPL;
     // nobody can answer it inside the sandbox (telepty send-key is ready-gated), so the
@@ -254,6 +233,8 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   }
   // #652: validated before any staging write. Claude only; codex never reads it.
   const oauthToken = cli === "claude" ? selectedClaudeOAuthToken(process.env) : undefined;
+  // #1232: no opt-in, no confined Claude worker; refused before any filesystem effect.
+  if (cli === "claude" && oauthToken === undefined) throw new Error("SANDBOX_AUTH_WORKER_TOKEN_REQUIRED");
   const cwd = canonical(roleCwd);
   // #1170 (RC6): before any write. A scope reaching another sid's stage, the registry or
   // the control code would let one worker forge or erase another's report.
