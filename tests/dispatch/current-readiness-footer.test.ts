@@ -166,7 +166,21 @@ const codexFrame = (prompt = "› Ask Codex to do anything", status = CODEX_STAT
 const CODEX_IDLE = codexFrame();
 const CODEX_LIVE = "› Ask Codex to do anything\n \n  GPT-6-Astra medium · /Users/duckyoungkim/.aigentry/role-sandbox/coder-ac1232bgr-coder · Read [context-ref] source file\n  ? for shortcuts                                                                                                                                                        ⚠ 1 warning · f2 to view\n";
 assert.equal(createHash("sha256").update(CODEX_LIVE).digest("hex"), "5bec0a9557d5a333afeb663592ac23b5036e0485511854ee68a2199354b1f50d");
+// Exact fresh-session captures; no status segment yet, no normalization.
+const CODEX_FRESH_ARCHITECT = "› Ask Codex to do anything\n \n  GPT-6-Astra medium · /Users/duckyoungkim/.aigentry/role-sandbox/architect-ba1218bgh-architect\n  ? for shortcuts                                                         ⚠ 1 warning · f2 to view";
+assert.equal(createHash("sha256").update(CODEX_FRESH_ARCHITECT).digest("hex"), "719c70937b452b979fe4f2237131c300ebaad7cce70478c433fbbe12516b14b2");
+const CODEX_FRESH_CODER = "› Ask Codex to do anything\n \n  GPT-6-Astra medium · /Users/duckyoungkim/.aigentry/role-sandbox/coder-ts1226bgg-coder\n  ? for shortcuts                                                                                                                                                        ⚠ 1 warning · f2 to view";
+assert.equal(createHash("sha256").update(CODEX_FRESH_CODER).digest("hex"), "b69f981fa61f8cc94bb4b2f68b4e146f92c4958360a98ba922699538b63c20ef");
 const CODEX_CASES: [string, string, string, boolean][] = [
+  ["fresh-architect", CODEX_FRESH_ARCHITECT, "idle", true],
+  ["fresh-coder", CODEX_FRESH_CODER, "idle", true],
+  ...[CODEX_FRESH_ARCHITECT, CODEX_FRESH_CODER].flatMap((frame, i): [string, string, string, boolean][] => [
+    [`fresh-occupied-${i}`, frame.replace("› Ask Codex to do anything", "› [context-ref] pending"), "unsubmitted", false],
+    [`fresh-continuation-${i}`, frame.replace("› Ask Codex to do anything", "› [context-ref] pending\n  › Ask Codex to do anything"), "unsubmitted", false],
+    [`fresh-trailing-${i}`, frame + "[context-ref] pending\n", "unsubmitted", false],
+    [`fresh-partial-hint-${i}`, frame.replace("f2 to view", "f3 to view"), "idle", false],
+    [`fresh-empty-status-${i}`, frame.replace("\n  ? for shortcuts", " · \n  ? for shortcuts"), "idle", false],
+  ]),
   ["live-warning", CODEX_LIVE, "idle", true],
   ["live-warning-no-glyph", CODEX_LIVE.replace("⚠ ", ""), "unsubmitted", false],
   ["live-warning-no-count", CODEX_LIVE.replace("1 warning", "warning"), "unsubmitted", false],
