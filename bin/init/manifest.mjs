@@ -13,6 +13,14 @@
 //           landed in 9434a41, after the spec was measured — plus the 2 files of bin/init/.
 //   tooling/instructions/**  12, as specified.
 //   Governance layer 51 (spec said 48; delta is exactly the bin/** delta above).
+// #1172 — re-measured again when U3 added its three helpers. The figures above are the
+// count at THAT implementation time and had already drifted (bin/** was 54, not 38, before
+// U3); they are kept as the historical record rather than silently rewritten. Measured now:
+//   bin/**  57 = 54 at c90a75f + bin/tq-note.mjs + bin/lib/task-queue-lock.py
+//           + bin/lib/task-queue-write.mjs. `git ls-files bin` agrees, which is what
+//           tests/packaging/T96_ship_set_agreement.sh assertion 4 compares — the assertion
+//           derives from the tree, never from this comment, so the comment can inform but
+//           can never satisfy the gate.
 
 import os from "node:os";
 import path from "node:path";
@@ -48,6 +56,13 @@ const MANIFEST = [
   "bin/lib/platform-unix.sh",
   "bin/lib/platform-windows.sh",
   "bin/lib/platform.sh",
+  // #1172: the two halves of the one locked task-queue transaction. The broker holds the OS
+  // advisory lock on <queue>.lock (Node has no fcntl/msvcrt); the transform is the only
+  // mutator and preserves the committed JSON.stringify(…, null, 2) shape. A workspace that
+  // holds bin/tq-note.mjs without BOTH of these holds a command that refuses every write,
+  // and bin/tq-focus.sh, bin/init/cli.mjs and dispatch's ledger all reach them too.
+  "bin/lib/task-queue-lock.py",
+  "bin/lib/task-queue-write.mjs",
   "bin/lib/telepty-auth.sh",
   "bin/lib/telepty-listing.sh",
   "bin/lib/win-private-storage.mjs",
@@ -74,6 +89,9 @@ const MANIFEST = [
   "bin/spawn-telemetry-report.mjs",
   "bin/telepty-bus-bridge.sh",
   "bin/tq-focus.sh",
+  // #1172: the operator command for every task-queue mutation (Rule 40 append, register,
+  // set-status, set-focus), committed atomically under bin/lib/task-queue-lock.py.
+  "bin/tq-note.mjs",
   "bin/tq-status.sh",
   "bin/tq-track.sh",
   "bin/trust-path.sh",

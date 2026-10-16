@@ -736,6 +736,9 @@ function decisionAudit(d: SpawnDecision): Record<string, unknown> {
 // through. It runs BEFORE any side effect so a violation can never leave a
 // half-started worker behind.
 const TASK_QUEUE = env.AIGENTRY_TASK_QUEUE || path.join(SCRIPT_DIR, "..", "state", "task-queue.json");
+// #1172 U3: the packaged broker that holds `<queue>.lock` while the packaged Node transform
+// commits. Node has neither `fcntl` nor `msvcrt`, so the lock cannot live in this file.
+const TASK_QUEUE_LOCK_PY = path.join(SCRIPT_DIR, "lib", "task-queue-lock.py");
 const TASK_GATE_MODE = env.AIGENTRY_TASK_GATE || "hard";
 const TASK_GATE_HINT =
   'register the task in state/task-queue.json first (--task <id>), or use --no-task "<reason>" for exempt work.';
@@ -812,9 +815,19 @@ function findTaskRows(rows: unknown[], taskId: string): number[] {
  * only warns, because by then the dispatch has already landed.
  */
 function ambiguousTaskIdMessage(rows: unknown[], hits: number[], taskId: string): string {
-  const where = hits
-    .map((i) => `idx ${i} ("${String((rows[i] as { desc?: unknown } | undefined)?.desc ?? "").slice(0, 40)}")`)
-    .join(" and ");
+  return ambiguousTaskIdMessageFor(
+    hits.map((i) => ({ idx: i, desc: String((rows[i] as { desc?: unknown } | undefined)?.desc ?? "") })),
+    taskId,
+  );
+}
+
+/**
+ * #1172 U3: the same sentence, built from (idx, desc) pairs. The GATE still reads the rows
+ * itself; the LEDGER learns them from inside `<queue>.lock` (taskLedgerUpdate), so both
+ * sites keep producing byte-identical text from ONE copy of it.
+ */
+function ambiguousTaskIdMessageFor(hits: { idx: number; desc: string }[], taskId: string): string {
+  const where = hits.map((h) => `idx ${h.idx} ("${h.desc.slice(0, 40)}")`).join(" and ");
   return (
     `Rule 34 task-gate: task id '${taskId}' matches ${hits.length} rows in ${TASK_QUEUE} — ${where}. ` +
     `Ambiguous task id — not a gate mode decision. Rename one row (e.g. '${taskId}b') and dispatch the id you mean.`
@@ -896,60 +909,73 @@ function taskGateCheck(o: Opts): void {
 function taskLedgerUpdate(o: Opts, sid: string): void {
   if (!o.taskId) return;
   if (!fs.existsSync(TASK_QUEUE)) return;
+  // #1172 U3: this used to be its own unlocked read → modify → temp+rename. No writer of
+  // state/task-queue.json took a lock, so an overlapping writer could overwrite a committed
+  // ledger write; measured 3/3 against bin/tq-focus.sh at c90a75f. Every effect below is
+  // unchanged — the promote-only-from-pending/queued rule, the ` | dispatched …` stamp, the
+  // per-sid spawn_decisions entry, the committed `JSON.stringify(data, null, 2) + "\n"`
+  // shape of #1110, the ambiguity warning and this function's best-effort contract. What
+  // changed is WHERE they are decided and applied: inside <queue>.lock, held by
+  // bin/lib/task-queue-lock.py, which bin/tq-note.mjs, bin/tq-focus.sh and bin/init/cli.mjs
+  // now also go through. Node has no fcntl/msvcrt, which is why the lock is Python's.
+  const now = utcNow();
+  const stamp = ` | dispatched ${isoSeconds(now)} sid=${sid} ref=${path.basename(o.refFile)} track=${o.track || "-"}` +
+    ` cli=${o.cli}/${o.route?.model || "unknown"} by=${o.route?.decided_by || "explicit"}` +
+    (o.route?.capped_cli ? ` capped_cli=${o.route.capped_cli}` : "");
+  const request: Record<string, unknown> = {
+    v: 1,
+    op: "ledger-dispatch",
+    queue: path.resolve(TASK_QUEUE),
+    params: {
+      task: o.taskId,
+      note_stamp: stamp,
+      updated_at: utcDate(now),
+      // Only promote from a not-yet-started state; in_progress must never regress.
+      promote_from: ["pending", "queued"],
+      promote_to: "delegated",
+      // #1148: the fresh spawn's decision, keyed by sid (requested/selected/observed apart).
+      ...(o.decision ? { spawn_decision: { sid, value: { at: isoSeconds(now), ...decisionAudit(o.decision) } } } : {}),
+    },
+  };
+
+  let status = 1;
+  let body: { reason?: string; hits?: { idx: number; desc: string }[] } = {};
   try {
-    const data = JSON.parse(fs.readFileSync(TASK_QUEUE, "utf8")) as { tasks?: unknown[] };
-    const tasks = Array.isArray(data.tasks) ? data.tasks : [];
-    const hits = findTaskRows(tasks, o.taskId);
-    if (hits.length > 1) {
-      // Unreachable while the gate stands (it refuses first, in every mode) — kept because
-      // a first-match ledger WRITE is the worse half of #1110. Warns and skips instead of
-      // refusing: the inject already landed, so this site must never fail the dispatch.
-      const msg = ambiguousTaskIdMessage(tasks, hits, o.taskId);
-      process.stderr.write(`dispatch.sh: WARNING ${msg} (ledger write skipped; dispatch already landed)\n`);
-      noTaskTelemetry(o, `task-ledger-ambiguous: ${msg}`);
-      return;
-    }
-    const task = (hits.length === 1 ? tasks[hits[0]!] : undefined) as Record<string, unknown> | undefined;
-    if (task === undefined) throw new Error("task row vanished");
-    const now = utcNow();
-    // Only promote from a not-yet-started state; in_progress must never regress.
-    if (task.status === "pending" || task.status === "queued") task.status = "delegated";
-    task.updated_at = utcDate(now);
-    const stamp = ` | dispatched ${isoSeconds(now)} sid=${sid} ref=${path.basename(o.refFile)} track=${o.track || "-"}` +
-      ` cli=${o.cli}/${o.route?.model || "unknown"} by=${o.route?.decided_by || "explicit"}` +
-      (o.route?.capped_cli ? ` capped_cli=${o.route.capped_cli}` : "");
-    const note = (task.note as string) || "";
-    task.note = note ? note + stamp : stamp.replace(/^[ |]+/, "");
-    // #1148: the fresh spawn's decision, keyed by sid (requested/selected/observed apart).
-    if (o.decision) {
-      const prior = task.spawn_decisions;
-      const bySid = prior && typeof prior === "object" && !Array.isArray(prior) ? prior as Record<string, unknown> : {};
-      bySid[sid] = { at: isoSeconds(now), ...decisionAudit(o.decision) };
-      task.spawn_decisions = bySid;
-    }
-    // Atomic: same-dir temp + rename, so a crash can never truncate the live queue.
-    const dir = path.dirname(path.resolve(TASK_QUEUE));
-    const tmp = path.join(dir, `.task-queue.${process.pid}.${randomBytes(3).toString("hex")}`);
-    const fd = fs.openSync(tmp, "w");
-    try {
-      // The shape the file is COMMITTED in — json.dumps(..., ensure_ascii=False, indent=2)
-      // plus the trailing newline — so a dispatch touches only the row it ledgers. This
-      // was indent=1 and newline-less while the orchestrator wrote indent=2: every other
-      // commit re-serialised all 26k lines and buried the real change (#1110).
-      fs.writeFileSync(fd, JSON.stringify(data, null, 2) + "\n");
-      fs.fsyncSync(fd);
-      fs.closeSync(fd);
-      fs.renameSync(tmp, TASK_QUEUE);
-    } catch (e) {
-      try { fs.closeSync(fd); } catch { /* already closed */ }
-      fs.unlinkSync(tmp);
-      throw e;
-    }
-  } catch {
-    process.stderr.write(
-      `dispatch.sh: WARNING task-gate ledger update failed for task ${o.taskId} (dispatch already landed)\n`,
+    const invocation = registryInvocation(
+      TASK_QUEUE_LOCK_PY,
+      ["--queue", path.resolve(TASK_QUEUE), "--node", process.execPath],
+      process.platform,
     );
+    const r = spawnSync(invocation.cmd, invocation.args, {
+      input: JSON.stringify(request), encoding: "utf8", shell: false, env: registryEnvironment(),
+    });
+    if (r.error) throw r.error;
+    status = r.status ?? 1;
+    const line = (r.stdout || "").trim().split("\n").filter(Boolean).pop();
+    if (line) body = JSON.parse(line) as typeof body;
+  } catch {
+    status = 1;
+    body = {};
   }
+  if (status === 0) return;                       // applied, or an observed already_applied
+
+  if (body.reason === "ambiguous_task_id" && body.hits) {
+    // Unreachable while the gate stands (it refuses first, in every mode) — kept because
+    // a first-match ledger WRITE is the worse half of #1110. Warns and skips instead of
+    // refusing: the inject already landed, so this site must never fail the dispatch. The
+    // colliding rows are now reported from inside the lock rather than from a second
+    // unlocked read, so the message cannot describe a document that has already changed.
+    const msg = ambiguousTaskIdMessageFor(body.hits, o.taskId);
+    process.stderr.write(`dispatch.sh: WARNING ${msg} (ledger write skipped; dispatch already landed)\n`);
+    noTaskTelemetry(o, `task-ledger-ambiguous: ${msg}`);
+    return;
+  }
+  // Every other refusal — including an unavailable lock capability, for which no unlocked
+  // fallback write is attempted — keeps the existing contract: warn, never fail.
+  process.stderr.write(
+    `dispatch.sh: WARNING task-gate ledger update failed for task ${o.taskId}` +
+    `${body.reason ? ` (${body.reason})` : ""} (dispatch already landed)\n`,
+  );
 }
 
 // ── delivery pipeline ───────────────────────────────────────────────────────

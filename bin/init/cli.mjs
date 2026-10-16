@@ -18,6 +18,10 @@ import {
   commitNativeCapture, inspectNativeOperation, restoreNativeOperation, beginLegacyInit,
 } from "./native-capture.mjs";
 
+// #1172 U3: the one locked task-queue transaction path. Step 4 creates the queue through
+// it instead of with its own `existsSync` → `writeFileSync` pair.
+import { callBroker } from "../tq-note.mjs";
+
 import {
   MANIFEST,
   SCAFFOLD_PREFIX,
@@ -413,11 +417,30 @@ function createState(ws, opts) {
   }
   for (const d of STATE_DIRS) fs.mkdirSync(path.join(ws, "state", d), { recursive: true });
   const queue = path.join(ws, "state", "task-queue.json");
-  if (fs.existsSync(queue)) {
+  // #1172 U3 — creation goes through the one locked transaction path, which opens the
+  // file `wx`. The old `existsSync` → `writeFileSync` pair was a TOCTOU: between the
+  // check and the write, another writer's real queue could be created and then
+  // overwritten with the empty document. Exclusive creation IS the atomicity, and doing
+  // it under `<queue>.lock` means no unlocked write to this file remains anywhere —
+  // not even init's. The bytes are unchanged: the same `{tasks:[],active_focus:null}` in
+  // the same committed shape, emitted by the same JSON.stringify(…, null, 2) + "\n".
+  //
+  // Python 3 is already a hard prerequisite checked in Step 1 (:205-228 on POSIX,
+  // winHardDependencies on win32), so the broker adds no dependency to init. If the lock
+  // capability is nonetheless unavailable, this step refuses BY NAME rather than falling
+  // back to an unlocked write, and the rest of init is unaffected.
+  const { status, body } = callBroker({
+    v: 1, op: "init-create", queue,
+    params: { document: { tasks: [], active_focus: null } },
+  });
+  if (status !== 0) {
+    warn(`state/task-queue.json was NOT created: ${body.reason} — ${body.detail || "(no detail)"}. `
+      + "No unlocked fallback write was attempted; re-run init once the cause is fixed.");
+    summary.skipped.push(`state/task-queue.json (${body.reason})`);
+  } else if (body.reason === "exists") {
     info("state/task-queue.json exists — preserved");
     summary.preserved.push("state/task-queue.json");
   } else {
-    fs.writeFileSync(queue, JSON.stringify({ tasks: [], active_focus: null }, null, 2) + "\n");
     summary.written.push("state/task-queue.json");
     info(`state/ initialised empty (${STATE_DIRS.length} directories + task-queue.json)`);
   }
