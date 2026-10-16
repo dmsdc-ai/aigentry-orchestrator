@@ -1538,6 +1538,87 @@ test("A-27 (R10): set-focus validates the tasks shape before rewriting", () => {
   assert.equal(readDoc(q).active_focus, "beta");
 });
 
+// ── A-28 — R4 completed: no no-follow primitive means no lock at all ────────────────
+
+test("A-28 (R4): without O_NOFOLLOW the broker fails closed before any side effect", {
+  skip: WIN32
+    ? "the mask technique below needs a POSIX host that HAS the primitive to take away; on "
+      + "win32 the primitive is genuinely absent and A-20's native subtest asserts the refusal"
+    : false,
+}, () => {
+  // Phase 5 warned and CONTINUED here, which still followed the link: the fstat identity
+  // check cannot catch a symlink to a REGULAR file. Measured before this correction (
+  // OUTPUT/phase6/evidence/red-nofollow.stdout.txt): the planted target was opened and
+  // locked AND the transform child was launched. Never following a link is a requirement of
+  // this lock, so without the primitive there is no path at all.
+  const dir = caseDir("a28-nofollow-failclosed");
+  const q = seed(dir);
+  const before = fs.readFileSync(q, "utf8");
+
+  // An OWNED fixture import masks the capability IN-PROCESS. `sitecustomize` is imported by
+  // `site` at interpreter startup, so `del os.O_NOFOLLOW` lands before the broker's module
+  // body runs. No host module is modified — asserted at the end of this case.
+  const mask = path.join(dir, "mask");
+  fs.mkdirSync(mask, { mode: 0o700 });
+  fs.writeFileSync(path.join(mask, "sitecustomize.py"),
+    "import os\ntry:\n    del os.O_NOFOLLOW\nexcept AttributeError:\n    pass\n", { mode: 0o600 });
+
+  // A tripwire passed through the EXISTING required --node contract: if the transform is
+  // ever launched it leaves a file. No new argv/env authority is introduced.
+  const tripwire = path.join(dir, "tripwire-node");
+  const launched = path.join(dir, "transform-was-launched.log");
+  fs.writeFileSync(tripwire,
+    `#!${process.execPath}\nrequire("node:fs").appendFileSync(${JSON.stringify(launched)}, "launched\\n");\n`,
+    { mode: 0o700 });
+
+  const request = JSON.stringify({ v: 1, op: "set-focus", queue: q, params: { track: "beta" } });
+  const run = (extraEnv: NodeJS.ProcessEnv) => spawnSync(BROKER, ["--queue", q, "--node", tripwire], {
+    input: request, encoding: "utf8", timeout: WALL_MS, shell: false,
+    env: { ...BASE_ENV, ...extraEnv },
+  });
+
+  // 1. Plain absence: refused by name, nothing created.
+  const absent = run({ PYTHONPATH: mask });
+  assert.equal(absent.status, 6, absent.stdout);
+  const body = JSON.parse(lastLine(absent.stdout)) as Body;
+  assert.equal(body.reason, "lock_capability_unavailable");
+  assert.match(String(body.detail), /no O_NOFOLLOW/);
+  assert.match(String(body.detail), /before any open, creation, lock or transform launch/);
+  assert.equal(fs.existsSync(`${q}.lock`), false, "the lock file was created anyway");
+  assert.equal(fs.readFileSync(q, "utf8"), before, "the queue was written anyway");
+  assert.equal(fs.existsSync(launched), false, "the transform child was launched anyway");
+
+  // 2. Absence WITH a planted symlink onto an unrelated regular file — the case the fstat
+  //    check cannot catch. The target must be byte-identical and still linked.
+  const victim = path.join(dir, "victim.txt");
+  const victimBytes = "an unrelated regular file that must never be opened or locked\n";
+  fs.writeFileSync(victim, victimBytes, { mode: 0o600 });
+  const victimIno = fs.statSync(victim).ino;
+  fs.symlinkSync(victim, `${q}.lock`);
+
+  const planted = run({ PYTHONPATH: mask });
+  assert.equal(planted.status, 6, planted.stdout);
+  assert.equal((JSON.parse(lastLine(planted.stdout)) as Body).reason, "lock_capability_unavailable");
+  assert.equal(fs.readFileSync(victim, "utf8"), victimBytes, "the planted target was modified");
+  assert.equal(fs.statSync(victim).ino, victimIno, "the planted target was replaced");
+  assert.ok(fs.lstatSync(`${q}.lock`).isSymbolicLink(), "the planted symlink was replaced");
+  assert.equal(fs.readFileSync(q, "utf8"), before, "the queue was written anyway");
+  assert.equal(fs.existsSync(launched), false, "the transform child was launched anyway");
+  fs.rmSync(`${q}.lock`);
+
+  // 3. Capability-POSITIVE control: unmasked, the ordinary path still works on this host.
+  //    Without this the case could pass by refusing everything.
+  const ok = tqJson(["set-focus", "--track", "beta", "--queue", q]);
+  assert.equal(ok.r.status, 0, ok.r.stderr);
+  assert.equal(readDoc(q).active_focus, "beta");
+  assert.ok(fs.existsSync(`${q}.lock`), "the positive path did not create the lock");
+
+  // 4. The mask touched nothing on the host: a fresh interpreter still has the primitive.
+  const host = spawnSync("python3", ["-c", "import os; print(hasattr(os, 'O_NOFOLLOW'))"],
+    { encoding: "utf8", env: BASE_ENV, timeout: WALL_MS });
+  assert.equal(host.stdout.trim(), "True", "the fixture modified the host os module");
+});
+
 test("A-20: platform contract (static) and the native win32 commit path", async (t) => {
   // R3: two named subtests with explicit boundaries, instead of one test that printed a
   // console note and reported `ok`. The static check ALWAYS runs on every OS; the native
@@ -1545,18 +1626,36 @@ test("A-20: platform contract (static) and the native win32 commit path", async 
   await t.test("STATIC source contract: both lock primitives and the dir-fsync guard exist", () => {
     runStaticPlatformContract();
   });
-  await t.test("NATIVE win32: a commit lands and the rename is the last durable boundary", {
+  // PHASE 6: this subtest used to assert a SUCCESSFUL win32 commit. R4's fail-closed
+  // correction makes that false — Python exposes O_NOFOLLOW on POSIX only, so on native
+  // Windows the broker now refuses every mutation by name until the required native
+  // no-follow support exists. The assertion is corrected to the ACTUAL behaviour rather
+  // than left asserting a success that can no longer happen.
+  await t.test("NATIVE win32: refuses by name without the required no-follow primitive", {
     skip: WIN32 ? false
       : "native win32 only — NOT RUN on this POSIX host and NOT substituted by the static check above",
   }, () => {
-    // msvcrt locking and NO directory fsync (the rename is the last boundary, exactly as
-    // bin/dispatch-registry.py:425-427 documents for the registry).
     const dir = caseDir("a20-win32");
     const q = seed(dir);
-    const r = tqJson(appendArgs(q, "1172", segFile(dir, "seg.txt", "A win32 commit landed.")));
-    assert.equal(r.r.status, 0, r.r.stderr);
-    assert.equal(fs.readFileSync(q, "utf8"), committed(readDoc(q)));
+    const before = fs.readFileSync(q, "utf8");
+    const r = tqJson(appendArgs(q, "1172", segFile(dir, "seg.txt", "A win32 commit attempt.")));
+    assert.equal(r.r.status, 6, r.r.stdout);
+    assert.equal(r.body.reason, "lock_capability_unavailable");
+    assert.match(String(r.body.detail), /no O_NOFOLLOW/);
+    assert.equal(fs.readFileSync(q, "utf8"), before, "a refused platform still wrote the queue");
+    assert.equal(fs.existsSync(`${q}.lock`), false, "a refused platform created the lock file");
   });
+
+  // The native requirement is RETAINED, not deleted, and not disguised as a pass. `todo`
+  // is the honest TAP state for a required capability that does not exist yet: it is
+  // neither green nor skipped-and-forgotten. Phase 5 reported 0 TODO; this phase reports 1
+  // on purpose, because the requirement is real and open.
+  await t.test("NATIVE win32: required no-follow SUPPORT is not implemented (release gate)", {
+    todo: "REQUIRED and OPEN: a Windows no-follow primitive (e.g. an O_NOFOLLOW equivalent "
+      + "or a verified-by-handle open) must be implemented before native Windows release "
+      + "acceptance. Until then the broker fails closed there. Not cancelled, not waived, "
+      + "and no static or simulated check substitutes for native execution.",
+  }, () => { /* intentionally empty: there is nothing honest to assert yet */ });
 });
 
 /**
@@ -1579,4 +1678,12 @@ function runStaticPlatformContract(): void {
   // documents). Pinning the flags pins the behaviour.
   assert.match(broker, /^ {12}flags = os\.O_RDWR \| os\.O_CREAT \| O_NOFOLLOW$/m,
     "the lock open flags changed; O_TRUNC must never appear among them");
+  // PHASE 6: the fail-closed gate exists and runs FIRST in __enter__, and the
+  // warn-and-continue branch it replaced must not come back.
+  assert.match(broker, /def require_nofollow_capability\(\) -> None:/,
+    "the fail-closed no-follow gate is absent");
+  assert.match(broker, /def __enter__\(self\) -> "Lock":\n(?: *#[^\n]*\n)* *self\.require_nofollow_capability\(\)/,
+    "the no-follow gate is no longer the first statement in __enter__");
+  assert.ok(!/no O_NOFOLLOW, so the lock\s+"?\s*"?open cannot refuse/.test(broker),
+    "the warn-and-continue branch came back");
 }

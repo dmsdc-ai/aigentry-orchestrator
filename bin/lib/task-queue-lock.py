@@ -179,9 +179,9 @@ def resolve_node(explicit: str) -> str:
     return explicit
 
 
-#: R4 (review qr1172bct): the no-follow open primitive, where the platform has one.
-#: Python exposes O_NOFOLLOW only on POSIX. Windows is handled honestly rather than
-#: pretended: see Lock.__enter__.
+#: R4: the no-follow open primitive. Python exposes O_NOFOLLOW on POSIX only.
+#: This lock is REQUIRED to never follow a link, so the primitive is a HARD REQUIREMENT
+#: rather than an optimisation — see Lock.require_nofollow_capability.
 O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 NOFOLLOW_SUPPORTED = O_NOFOLLOW != 0
 
@@ -195,8 +195,15 @@ class Lock:
     R4: this used to be `open(path, "a+b")`, which FOLLOWS a symlink. A planted
     `<queue>.lock -> /elsewhere/victim` therefore made the broker open and lock an
     unrelated file and report that file's inode as the lock inode (measured). The open is
-    now O_NOFOLLOW where the platform has it, 0600, never O_TRUNC, and the fd is
-    fstat'd for regular-file identity before use."""
+    now O_NOFOLLOW, 0600, never O_TRUNC, and the fd is fstat'd for regular-file identity
+    before use.
+
+    R4 completion (phase 6): an earlier version WARNED and continued where O_NOFOLLOW was
+    absent, which still followed the link — the fstat identity check cannot catch a symlink
+    to a REGULAR file. Measured with the primitive masked: the planted target was opened and
+    locked AND the transform child was launched. Disclosing that was not the same as
+    honouring "never follow link", so the branch is gone: without the primitive this
+    refuses, fail-closed, before touching anything."""
 
     def __init__(self, queue: str, deadline_s: float) -> None:
         self.path = queue + ".lock"
@@ -205,7 +212,27 @@ class Lock:
         self.acquired = False
         self.inode = None
 
+    @staticmethod
+    def require_nofollow_capability() -> None:
+        """R4, fail-closed. Called BEFORE any open, creation, locking or transform launch.
+
+        Never following a link is a REQUIREMENT of this lock, not a nicety, and O_NOFOLLOW
+        is the only primitive that delivers it here. An `lstat` pre-check would be a race,
+        so it is deliberately not attempted and no equivalence is claimed. Without the
+        primitive there is no safe path, so there is no path at all."""
+        if NOFOLLOW_SUPPORTED:
+            return
+        respond("lock_capability_unavailable",
+                "this platform provides no O_NOFOLLOW, and the queue lock is required never "
+                "to follow a symlink: a link to a REGULAR file would pass the fstat identity "
+                "check, so opening it at all would follow the link. Refusing before any "
+                "open, creation, lock or transform launch. Native no-follow support is "
+                "required and not implemented; no unsafe fallback is attempted",
+                EXIT_CAPABILITY)
+
     def __enter__(self) -> "Lock":
+        # FIRST, before every side effect.
+        self.require_nofollow_capability()
         if fault("lock"):
             respond("queue_unavailable", "lock acquisition faulted (test seam)", EXIT_STATE)
         if (os.name == "nt" and msvcrt is None) or (os.name != "nt" and fcntl is None):
@@ -218,7 +245,8 @@ class Lock:
             # stable and two writers cannot end up locking different inodes.
             #
             # O_TRUNC is deliberately absent: even a path that somehow resolves elsewhere is
-            # never emptied. O_NOFOLLOW refuses a symlink outright on POSIX.
+            # never emptied. O_NOFOLLOW refuses a symlink outright, and its presence was
+            # already made a precondition above.
             flags = os.O_RDWR | os.O_CREAT | O_NOFOLLOW
             try:
                 fd = os.open(self.path, flags, 0o600)
@@ -242,16 +270,9 @@ class Lock:
                 respond("lock_not_regular",
                         "%s is not a regular file; refusing to use it as the queue lock"
                         % self.path, EXIT_STATE)
-            if not NOFOLLOW_SUPPORTED:
-                # Honest diagnostic rather than a racy lstat pre-check dressed up as a
-                # guarantee. Where O_NOFOLLOW does not exist the open above can still follow
-                # a link, and the fstat only catches the non-regular case; a symlink to a
-                # regular file would pass. That residue is NAMED here, is not claimed to be
-                # equivalent protection, and is unmeasured on native Windows.
-                sys.stderr.write(
-                    "task-queue-lock.py: note: this platform has no O_NOFOLLOW, so the lock "
-                    "open cannot refuse a symlink to a regular file; the regular-file check "
-                    "still applies and nothing is truncated\n")
+            # No "warn and continue" branch exists: require_nofollow_capability() has
+            # already refused if the primitive is missing, so reaching here means the open
+            # above could not have followed a link.
             self.inode = st.st_ino
             deadline = time.monotonic() + self.deadline_s
             while True:
