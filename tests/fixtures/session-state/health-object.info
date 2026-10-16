@@ -1,0 +1,14 @@
+{
+  "id": "sid-A",
+  "command": "claude",
+  "ready": true,
+  "healthStatus": {
+    "health": "CONNECTED"
+  },
+  "transport": {
+    "ready": true,
+    "bootstrap": {
+      "ready": true
+    }
+  }
+}

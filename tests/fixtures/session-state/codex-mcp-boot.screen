@@ -1,0 +1,9 @@
+╭───────────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.133.0)                            │
+│ model:       gpt-5.5 xhigh   /model to change         │
+│ directory:   ~/.aigentry/role-sandbox/coder-wtB-codex │
+│ permissions: YOLO mode                                │
+╰───────────────────────────────────────────────────────╯
+
+• Starting MCP servers (1/6): aigentry-brain, codex_apps, computer-use, … (0s • esc to interrupt)
+ › Use /skills to list available skills
