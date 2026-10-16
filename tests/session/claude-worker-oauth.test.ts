@@ -874,7 +874,7 @@ test("runner (fake SRT): a preflight that reached the live control port but exit
     }
     // The fixed credential is fixture input, not a runner leak; preserve its exact tree and bytes.
     const credentialDir = join(W.host, ".aigentry", "credentials");
-    const credentialTree = (): string[] => existsSync(credentialDir) ? readdirSync(credentialDir, { recursive: true }).sort() : [];
+    const credentialTree = (): string[] => existsSync(credentialDir) ? readdirSync(credentialDir, { recursive: true, encoding: "utf8" }).sort() : [];
     const beforeTree = credentialTree();
     const beforeBytes = files(credentialDir).map((f) => [f, readFileSync(f)] as const);
     const beforeLeaks = leaks(W, []);
