@@ -1875,7 +1875,18 @@ for (const [key, command] of Object.entries(commands)) {
   assert.equal(result.status, 0, result.stderr);
 }
 
+// #1232: independent same-event-SHA contract for exactly the five execution jobs.
+const sameShaJobs = ['browser-tls', 'test', 'windows-declared-supported', 'windows-suite', 'windows-installed'];
+function assertCheckoutRefs(workflow, label) {
+  for (const id of sameShaJobs) {
+    const steps = workflow.jobs[id]?.steps.filter(step => step.uses === 'actions/checkout@v4') ?? [];
+    assert.equal(steps.length, 1, `${label} ${id}: one checkout`);
+    assert.equal(steps[0].with?.ref, '${{ github.sha }}', `${label} ${id}: checkout ref is github.sha`);
+  }
+}
+
 function validate(workflow, policy = currentPolicy()) {
+  assertCheckoutRefs(workflow, 'release');
   workflow = withoutBrowser(workflow, true);
   const top = structuredClone(workflow);
   delete top.jobs;
@@ -1993,6 +2004,7 @@ acceptance('C1 security pin: UNREVIEWED only without a policy, then exactly the 
 const windowsBoundary = '  # #901 (W1)';
 function validateCIHistory(source, historicalSource = readFileSync(join(root, fixtureRoot, 'ci.before-parity.yml'), 'utf8')) {
   const workflow = parse('CI historical comparison', source);
+  assertCheckoutRefs(workflow, 'CI');
   const persistence = named(workflow.jobs[ids[0]], persistenceStep).run;
   assert.equal(persistence, commands.persistence);
   assert.equal(sha(persistence), '50b8b702d34566ab8ef1b3ec310770ee5c32af62950d8d7ddb0996e234df6850');
@@ -2075,6 +2087,36 @@ for (const [name, side, needle, replacement, refusal] of testParityMutations) {
       : [ciSource, replaceOnce(releaseSource, needle, replacement)];
     assert.throws(() => validateTestParity(...changed), error => error instanceof assert.AssertionError && refusal.test(error.message));
   });
+}
+
+// New controls remain source-only until independent exact-candidate CI executes them.
+for (const [label, workflowPath] of [['CI', '.github/workflows/ci.yml'], ['release', '.github/workflows/release.yml']]) {
+  const source = lf(readFileSync(join(root, workflowPath), 'utf8'));
+  const check = value => label === 'CI' ? validateCIHistory(value)
+    : validateReleaseHistory(parse('release checkout control', value), value);
+  for (const [ending, newline] of [['LF', '\n'], ['CRLF', '\r\n']]) {
+    const encode = value => lf(value).replaceAll('\n', newline);
+    acceptance(`same-SHA checkout accepts ${label} ${ending}`, 'checkout-ref', () => {
+      check(encode(source));
+    });
+    for (const id of sameShaJobs) {
+      for (const [fault, replacement] of [
+        ['missing', ''],
+        ['wrong', '          ref: refs/heads/main\n'],
+        ['stale', '          ref: 193ccd4b9cba41fa73b0ffcecd84c620e49d17b6\n'],
+      ]) {
+        acceptance(`same-SHA checkout rejects ${label} ${ending} ${id}: ${fault}`, 'checkout-ref-mutant', () => {
+          check(encode(source)); // A pre-existing failure cannot make a negative vacuously pass.
+          const jobs = [...source.matchAll(new RegExp(`^  ${id}:\\n(?:(?!  \\S)[^\\n]*\\n)*`, 'gm'))];
+          assert.equal(jobs.length, 1, `${label} ${id}: unique mutation job`);
+          const changedJob = replaceOnce(jobs[0][0], '          ref: ${{ github.sha }}\n', replacement);
+          const changed = encode(replaceOnce(source, jobs[0][0], changedJob));
+          assert.throws(() => check(changed), error => error instanceof assert.AssertionError
+            && error.message.startsWith(`${label} ${id}: checkout ref is github.sha`));
+        });
+      }
+    }
+  }
 }
 
 const mutants = [];
