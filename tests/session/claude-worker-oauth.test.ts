@@ -872,6 +872,13 @@ test("runner (fake SRT): a preflight that reached the live control port but exit
       mkdirSync(dir, { recursive: true, mode: 0o700 });
       writeFileSync(join(dir, "token"), W.token + "\n", { mode: 0o600 });
     }
+    // The fixed credential is fixture input, not a runner leak; preserve its exact tree and bytes.
+    const credentialDir = join(W.host, ".aigentry", "credentials");
+    const credentialTree = (): string[] => existsSync(credentialDir) ? readdirSync(credentialDir, { recursive: true }).sort() : [];
+    const beforeTree = credentialTree();
+    const beforeBytes = files(credentialDir).map((f) => [f, readFileSync(f)] as const);
+    const beforeLeaks = leaks(W, []);
+    assert.deepEqual(beforeLeaks, !opted && !WIN ? [relative(W.root, join(credentialDir, "claude-worker", "token"))] : [], name);
     const p = prepare(W, `nl-${name.replace(/\W/g, "")}`, opted ? { [OPT]: W.token } : {});
     if (WIN) { refusedOnWin(W, p); continue; }
     assert.equal(p.error, null);
@@ -882,6 +889,7 @@ test("runner (fake SRT): a preflight that reached the live control port but exit
     if (opted) rmSync(String(p.m.claudeOAuthHandoff));
     const env2 = { FAKE_PREFLIGHT_CONNECT: "1", ...extraEnv };
     if ("FAKE_PREFLIGHT_LEAK" in env2) env2.FAKE_PREFLIGHT_LEAK = String(p.m.probeFile);
+    const beforeHandoffTree = readdirSync(dirname(p.manifest), { recursive: true }).sort();
     const r = traced(W, p.manifest, p.hash, args, env2);
     assert.equal(r.status, 78, `${name}: ${r.stderr}`);
     assert.match(r.stderr, /\[sandbox\] REFUSED: SANDBOX_PREFLIGHT_FAILED: connect:leaked\n$/, name);
@@ -890,7 +898,10 @@ test("runner (fake SRT): a preflight that reached the live control port but exit
     assert.deepEqual(fc.map((e) => [e.port, e.connected]), [[r.port, true]], `${name}: the fake reached the live listener`);
     assert.equal(r.worker, null, name);
     assert.equal(existsSync(join(dirname(p.manifest), "receipt.json")), false, name);
-    assert.deepEqual(leaks(W, [r.stderr]), [], name);
+    assert.deepEqual(credentialTree(), beforeTree, `${name}: credential fixture tree unchanged`);
+    for (const [f, bytes] of beforeBytes) assert.ok(readFileSync(f).equals(bytes), `${name}: credential fixture bytes unchanged`);
+    assert.deepEqual(readdirSync(dirname(p.manifest), { recursive: true }).sort(), beforeHandoffTree, `${name}: no new handoff artifacts`);
+    assert.deepEqual(leaks(W, [r.stderr]), beforeLeaks, name);
     cleanedUp(r, 2, name);
   }
 });
