@@ -436,6 +436,32 @@ def current_prompt_control(pattern: str, screen: str) -> bool:
     return re.search(prefix + "(?:" + pattern + ")", screen, re.I | re.M) is not None
 
 
+def codex_current_composer(screen: str) -> str | None:
+    """Separate the measured Codex footer from an eligible prompt and its input.
+
+    Only the complete, blank-separated model/cwd/status + shortcuts suffix is
+    chrome. Unknown tails stay in the composer and cannot establish empty input.
+    This frames text only; current_screen still owns binding and currentness.
+    """
+    lines = screen.splitlines()
+    prompts = [i for i, line in enumerate(lines) if re.match(r"^[ \t]*›", line)]
+    if not prompts:
+        return None
+    start = prompts[-1]
+    # Check this occurrence, not an identical prompt quoted elsewhere in a fence.
+    if lines[start].lstrip(" \t") not in error_banner_lines("\n".join(lines[:start + 1]), 1):
+        return None
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if (len(lines) - start >= 4 and not lines[-3].strip()
+            and re.fullmatch(
+                r"  GPT-[A-Za-z0-9.-]+ (?:low|medium|high|xhigh|max|ultra)"
+                r" · /[^·\n]+ · [^\n]+", lines[-2])
+            and re.fullmatch(r"  \? for shortcuts · \d+ warnings?", lines[-1])):
+        lines = lines[:-3]
+    return "\n".join(lines[start:]).strip()
+
+
 def ready_by_current_screen(cli: str, screen: str, surface: str) -> tuple[bool, str]:
     if surface not in ("idle", "welcome", "working"):
         return False, "current-surface-not-ready"
@@ -447,8 +473,11 @@ def ready_by_current_screen(cli: str, screen: str, surface: str) -> tuple[bool, 
     # kind only (see CODEX_EMPTY_COMPOSER_HINT). Case-sensitive and closed on both sides by
     # the surrounding anchors, so nothing may precede or follow it on the prompt row.
     hint = rf"|\s+{CODEX_EMPTY_COMPOSER_HINT}" if cli == "codex" else ""
-    if not re.search(rf"(?m)^\s*(?:{prompt})(?:\s*|\s+Try \"[^\"]+\"|\s+Ask Codex to do anything{hint})\s*$",
-                     tail(lines, 5)):
+    composer = codex_current_composer(screen) if cli == "codex" else None
+    prompt_text = composer if cli == "codex" else tail(lines, 5)
+    empty_prompt = rf"\s*(?:{prompt})(?:\s*|\s+Try \"[^\"]+\"|\s+Ask Codex to do anything{hint})\s*"
+    if not (re.fullmatch(empty_prompt, prompt_text or "") if cli == "codex" else
+            re.search(rf"(?m)^{empty_prompt}$", prompt_text)):
         return False, "no-empty-current-prompt"
     controls = current_controls(cli, screen)
     if current_busy_signal(controls):
@@ -488,7 +517,10 @@ def classify_surface(cli: str, screen: str, *, current: bool = False) -> tuple[s
         r"esc to interrupt|Working|\u276f|\u203a|\u273b|Esc to", tail20, re.I
     ):
         return "raw_shell", "raw shell prompt at tail"
-    if re.search(UNSUBMITTED, last4):
+    # Current Codex markers belong to the composer, not its status footer.
+    # Without an eligible prompt retain the conservative historical tail check.
+    composer = codex_current_composer(screen) if current and cli == "codex" else None
+    if re.search(UNSUBMITTED, composer if composer is not None else last4):
         return "unsubmitted", "context-ref still at live prompt"
     if current and re.search(
         r"^\s*[\u2722\u2733\u2736\u273b\u273d][^\n]*\bfor\s+"

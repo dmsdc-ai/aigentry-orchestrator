@@ -71,6 +71,10 @@ def call(case):
     fn = case["fn"]
     cli = case["cli"]
     screen = case["screen"]
+    if fn == "pipeline_ready":
+        return list(module.ready_by_current_screen(cli, screen, pipeline_surface(cli, screen)))
+    if fn == "legacy_surface":
+        return module.classify_surface(cli, screen)[0]
     if fn == "current_controls":
         return module.current_controls(cli, screen)
     if fn == "busy_after_controls":
@@ -95,6 +99,8 @@ json.dump({"probe": probe,
 `;
 
 type Fn =
+  | "pipeline_ready"
+  | "legacy_surface"
   | "current_controls"
   | "ready_by_current_screen"
   | "pipeline_surface"
@@ -151,7 +157,46 @@ const UNREADY_SURFACES = ["unknown", "modal", "error", "unsubmitted", "crash", "
 const ready = (id: string, screenText: string, surface: string): Case =>
   ({ id, fn: "ready_by_current_screen", cli: "claude", screen: screenText, surface });
 
+// Reduced measured Codex suffix from OBSERVATION.md; other rows are synthetic controls.
+const CODEX_STATUS = "  GPT-6-Astra medium · /owned/worker · Read [context-ref] source file";
+const CODEX_SHORTCUTS = "  ? for shortcuts · 1 warning";
+const codexFrame = (prompt = "› Ask Codex to do anything", status = CODEX_STATUS) =>
+  screen("Completed report.", "", prompt, "", status, CODEX_SHORTCUTS);
+const CODEX_IDLE = codexFrame();
+const CODEX_CASES: [string, string, string, boolean][] = [
+  ["measured", CODEX_IDLE, "idle", true],
+  ["footer-path", codexFrame(undefined, CODEX_STATUS.replace("[context-ref]", "/shared/abcdef123456.md")), "idle", true],
+  ["typed-marker", codexFrame("› [context-ref] source file"), "unsubmitted", false],
+  ["typed-path", codexFrame("› /shared/abcdef123456.md"), "unsubmitted", false],
+  ["typed-task", codexFrame("› implement the change"), "idle", false],
+  ["hint-trailing", codexFrame("› Ask Codex to do anything extra"), "idle", false],
+  ["multiline-marker", codexFrame("› implement\n  [context-ref] source file\n  next line\n  another line\n  final line"), "unsubmitted", false],
+  ["multiline-text", codexFrame("› Ask Codex to do anything\n  actual pending input"), "idle", false],
+  ["trailing-text", CODEX_IDLE + "\n  pending input", "unsubmitted", false],
+  ["truncated-footer", screen("› Ask Codex to do anything", "", CODEX_STATUS), "unsubmitted", false],
+  ["unframed-marker", screen("› Ask Codex to do anything", "", "  Read [context-ref] source file", CODEX_SHORTCUTS), "unsubmitted", false],
+  ["no-separator", screen("› Ask Codex to do anything", CODEX_STATUS, CODEX_SHORTCUTS), "unsubmitted", false],
+  ["no-prompt", screen(CODEX_STATUS, CODEX_SHORTCUTS), "unsubmitted", false],
+  ["unknown", "Unrecognized viewport", "unknown", false],
+  ["fenced", screen("```", CODEX_IDLE, "```"), "unsubmitted", false],
+  ["indented", CODEX_IDLE.split("\n").map(line => "    " + line).join("\n"), "unsubmitted", false],
+  ["busy", "Working (3s · esc to interrupt)\n" + CODEX_IDLE, "working", false],
+  ["spinner", "⠹ Working\n" + CODEX_IDLE, "working", false],
+  ["trust", "Do you trust this folder?\n" + CODEX_IDLE, "modal", false],
+  ["sandbox", "Would you like to run the following command?\n" + CODEX_IDLE, "sandbox_prompt", false],
+  ["error", "API Error: 503 unavailable\n" + CODEX_IDLE, "error", false],
+  ["plain-placeholder", "› Ask Codex to do anything", "idle", true],
+  ["skills-placeholder", "› Use /skills to list available skills", "idle", true],
+  ["bare-prompt", "›", "idle", true],
+  ["plain-multiline", "› Ask Codex to do anything\n  pending input", "idle", false],
+];
+
 const CASES: Case[] = [
+  ...CODEX_CASES.flatMap(([name, screenText]): Case[] => [
+    { id: `codex/${name}/surface`, fn: "pipeline_surface", cli: "codex", screen: screenText },
+    { id: `codex/${name}/ready`, fn: "pipeline_ready", cli: "codex", screen: screenText },
+  ]),
+  { id: "codex/legacy-footer", fn: "legacy_surface", cli: "codex", screen: CODEX_IDLE },
   // Positives — the fix: a bare completed row is not a spinner.
   ready("bare/ready", IDLE_BARE, "idle"),
   ready("bare-alt/ready", IDLE_BARE_ALT, "idle"),
@@ -342,4 +387,14 @@ test("#1136(i): non-claude CLIs and the legacy --screen-file path are byte-for-b
   assert.equal(got("spinner/frame"), true);
   assert.equal(got("spinner/logo"), false, "braille logo art is not a spinner");
   assert.equal(got("spinner/footer"), false);
+});
+
+for (const [name, , surface, isReady] of CODEX_CASES) {
+  test(`#1136(k): Codex composer/footer ${name}`, () => {
+    assert.equal(got(`codex/${name}/surface`), surface, name);
+    assert.equal((got(`codex/${name}/ready`) as [boolean, string])[0], isReady, name);
+  });
+}
+test("#1136(l): legacy Codex footer classification is unchanged", () => {
+  assert.equal(got("codex/legacy-footer"), "unsubmitted");
 });
