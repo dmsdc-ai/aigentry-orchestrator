@@ -331,12 +331,12 @@ const credsIn = (m: Json): boolean => existsSync(join(String((m.env as Json).CLA
 /** Handoff artefacts under the world, matched on the path RELATIVE to the world (temp prefix excluded). */
 const handoffs = (W: World): string[] => files(W.sessions).filter((f) => /(^|[\\/])claude-oauth/.test(relative(W.root, f)));
 /** #1167 P6 counterpart: win32 has no OS sandbox, so the confined prepare refuses before any effect. */
-function refusedOnWin(W: World, p: Prep): void {
+function refusedOnWin(W: World, p: Prep, expectedLeaks: string[] = []): void {
   assert.equal(p.error, "SANDBOX_PLATFORM_UNSUPPORTED");
   assert.equal(p.manifest, "");
   assert.deepEqual(p.counters, { security: 0, otherExec: 0, hostClaudeRead: 0, hostCodexRead: 0 });
   assert.deepEqual(handoffs(W), []);
-  assert.deepEqual(leaks(W, [p.stdout, p.stderr]), []);
+  assert.deepEqual(leaks(W, [p.stdout, p.stderr]), expectedLeaks);
 }
 
 test("unset: legacy descriptor/launcher/child unchanged; inherited CLAUDE_CODE_OAUTH_TOKEN passes through untouched", () => {
@@ -1089,9 +1089,14 @@ test("#1232 store: fresh preparations reread replacement and preserve earlier ha
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const file = join(dir, "token"), next = "FAKE-1232-REPLACEMENT";
   writeFileSync(file, W.token + "\n", { mode: 0o600 });
+  const beforeCredentials = tree(dirname(dir)), beforeBytes = readFileSync(file);
+  const beforeLeaks = leaks(W, []);
+  assert.deepEqual(beforeLeaks, [relative(W.root, file)], "only the fabricated fixed input contains the token");
   const first = prepare(W, "store-first");
   if (WIN) {
-    refusedOnWin(W, first);
+    refusedOnWin(W, first, beforeLeaks);
+    assert.deepEqual(tree(dirname(dir)), beforeCredentials, "unsupported preparation preserves the credential tree");
+    assert.ok(readFileSync(file).equals(beforeBytes), "unsupported preparation preserves exact fixture bytes");
     assert.equal(first.hash, "");
     assert.equal(first.launcher, "");
     assert.deepEqual(first.m, {});
