@@ -24,6 +24,7 @@
 //
 // Readiness is a screen observation only. Nothing here says a task finished, that work
 // was delivered, or that any modal may be answered.
+import { createHash } from "node:crypto";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -163,7 +164,19 @@ const CODEX_SHORTCUTS = "  ? for shortcuts · 1 warning";
 const codexFrame = (prompt = "› Ask Codex to do anything", status = CODEX_STATUS) =>
   screen("Completed report.", "", prompt, "", status, CODEX_SHORTCUTS);
 const CODEX_IDLE = codexFrame();
+const CODEX_LIVE = "› Ask Codex to do anything\n \n  GPT-6-Astra medium · /Users/duckyoungkim/.aigentry/role-sandbox/coder-ac1232bgr-coder · Read [context-ref] source file\n  ? for shortcuts                                                                                                                                                        ⚠ 1 warning · f2 to view\n";
+assert.equal(createHash("sha256").update(CODEX_LIVE).digest("hex"), "5bec0a9557d5a333afeb663592ac23b5036e0485511854ee68a2199354b1f50d");
 const CODEX_CASES: [string, string, string, boolean][] = [
+  ["live-warning", CODEX_LIVE, "idle", true],
+  ["live-warning-no-glyph", CODEX_LIVE.replace("⚠ ", ""), "unsubmitted", false],
+  ["live-warning-no-count", CODEX_LIVE.replace("1 warning", "warning"), "unsubmitted", false],
+  ["live-warning-no-hint", CODEX_LIVE.replace(" · f2 to view", ""), "unsubmitted", false],
+  ["live-warning-wrong-hint", CODEX_LIVE.replace("f2 to view", "f3 to view"), "unsubmitted", false],
+  ["live-warning-extra", CODEX_LIVE.trimEnd() + " pending input\n", "unsubmitted", false],
+  ["live-warning-extra-row", CODEX_LIVE + "pending input\n", "unsubmitted", false],
+  ["live-warning-occupied", CODEX_LIVE.replace("› Ask Codex to do anything", "› [context-ref] pending task"), "unsubmitted", false],
+  ["live-warning-continuation", CODEX_LIVE.replace("› Ask Codex to do anything", "› [context-ref] pending task\n  › Ask Codex to do anything"), "unsubmitted", false],
+
   // REVIEW.md counterexample: indented prompt-shaped rows remain pending input.
   ...[" ", "  ", "   ", "    ", "\t"].flatMap((indent, i): [string, string, string, boolean][] => [
     [`continuation-marker-${i}`, codexFrame(`› [context-ref] pending task\n${indent}› Ask Codex to do anything`), "unsubmitted", false],

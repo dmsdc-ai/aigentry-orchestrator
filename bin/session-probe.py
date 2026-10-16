@@ -462,7 +462,9 @@ def codex_current_composer(screen: str) -> str | None:
             and re.fullmatch(
                 r"  GPT-[A-Za-z0-9.-]+ (?:low|medium|high|xhigh|max|ultra)"
                 r" · /[^·\n]+ · [^\n]+", lines[-2])
-            and re.fullmatch(r"  \? for shortcuts · \d+ warnings?", lines[-1])):
+            and re.fullmatch(
+                r"  \? for shortcuts(?: · \d+ warnings?"
+                r"| {2,}⚠ \d+ warnings? · f2 to view)", lines[-1])):
         lines = lines[:-3]
     return "\n".join(lines[start:]).strip()
 
