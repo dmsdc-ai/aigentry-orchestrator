@@ -120,4 +120,56 @@ out4=$("$BASH_BIN" -c "
 echo "$out4" | grep -q "nocmux=present" \
   || { echo "FAIL: an unreachable cmux reported the surface GONE — 'I cannot probe' is not 'it is not there'"; echo "$out4"; exit 1; }
 
+# Task1206: one approved launch must not imply bridge child retries. Execute the
+# generated wrapper against an argv-only telepty stub, never a real CLI/daemon.
+cat > "$STUB_BIN/telepty" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$T_TMP/allow-argv"
+printf '%s\n' "$PWD" > "$T_TMP/allow-cwd"
+EOF
+cat > "$STUB_BIN/cmux-open" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "$T_TMP/open-calls"
+case "$1" in
+  --help) echo 'new-workspace --focus <bool>';;
+  new-workspace)
+    shift
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = --command ]; then bash -c "$2" || exit; break; fi
+      shift
+    done
+    echo 'OK workspace:23';;
+  list-workspaces) echo 'workspace:23 fixture';;
+  surface-health) echo 'type=terminal';;
+  read-screen) [ "${T23_NOT_READY:-0}" = 1 ] || echo 'fixture prompt';;
+  *) :;;
+esac
+EOF
+chmod +x "$STUB_BIN/telepty" "$STUB_BIN/cmux-open"
+mkdir -p "$T_TMP/cwd with space"
+open_fixture() (
+  export CMUX="$STUB_BIN/cmux-open" CMUX_READY_TIMEOUT_MS=1 CMUX_READY_INTERVAL_MS=1
+  . "$REPO_ROOT/bin/lib/workspace-host.sh"
+  _wh_cmux_open 'fixture-t23' "$T_TMP/cwd with space" 'fixture-cli --fixture-only'
+)
+for setting in unset 1 0; do
+  if [ "$setting" = unset ]; then unset AIGENTRY_WORKER_AUTO_RESTART;
+  else export AIGENTRY_WORKER_AUTO_RESTART="$setting"; fi
+  [ "$(open_fixture)" = workspace:23 ] || { echo 'FAIL: open result'; exit 1; }
+  printf '%s\n' allow --id fixture-t23 > "$T_TMP/expected-argv"
+  [ "$setting" = 0 ] || printf '%s\n' --auto-restart >> "$T_TMP/expected-argv"
+  printf '%s\n' fixture-cli --fixture-only >> "$T_TMP/expected-argv"
+  cmp "$T_TMP/expected-argv" "$T_TMP/allow-argv" || { echo "FAIL: restart argv setting=$setting"; exit 1; }
+  [ "$(cat "$T_TMP/allow-cwd")" = "$T_TMP/cwd with space" ] || exit 1
+done
+for setting in '' invalid; do
+  : > "$T_TMP/open-calls"
+  export AIGENTRY_WORKER_AUTO_RESTART="$setting"
+  rc=0; open_fixture > "$T_TMP/invalid.out" 2> "$T_TMP/invalid.err" || rc=$?
+  [ "$rc" = 2 ] && [ ! -s "$T_TMP/open-calls" ] || { echo 'FAIL: invalid value acted'; exit 1; }
+done
+export AIGENTRY_WORKER_AUTO_RESTART=0 T23_NOT_READY=1
+rc=0; open_fixture > "$T_TMP/not-ready.out" 2> "$T_TMP/not-ready.err" || rc=$?
+[ "$rc" = 3 ] && [ ! -s "$T_TMP/not-ready.out" ] && grep -qx close-workspace "$T_TMP/open-calls" \
+  || { echo 'FAIL: readiness refusal changed'; exit 1; }
 echo "T23 PASS"
