@@ -1,0 +1,110 @@
+name: Diagnose Windows no-follow (#1172)
+
+# #1172 phase 4 — DIAGNOSTIC ONLY. Runs .github/scripts/windows-nofollow-probe-1172.py once
+# on a native windows-latest runner to measure the four behaviours the task-queue lock's
+# no-follow design depends on and that official documentation does not settle (P0/P1/P2/P4).
+#
+# What a green run here does NOT mean: Windows is supported, the broker works, or native
+# acceptance is met. This workflow builds nothing, tests nothing and ships nothing. It
+# records measurements; the product change is a separate, later, reviewed task.
+#
+# A push event reads this workflow from the pushed branch, so the diagnostic branch carries
+# its own copy and no dispatch-only workflow has to land on the default branch first.
+#
+# The probe is standard-library Python: there is deliberately no npm install and no Node
+# build step, so the dependency and build surface is absent by construction.
+
+on:
+  push:
+    branches: ['validation/1238-queue-native-probes']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: Windows no-follow probe (diagnostic)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # setup-python has no precedent in this repo (only checkout@v4, setup-node@v4 and
+      # upload-artifact@v4 are used anywhere), so this pin is a disclosed new choice for
+      # root to confirm or re-pin during inspection — see phase4 REPORT Q13.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # Context for the measurement, never a substitute for it: per controller disposition
+      # Q7 a version string alone proves no capability, so the probe performs the actual
+      # capability checks and this step only records what interpreter produced them.
+      - name: Record the interpreter and runner context
+        shell: bash
+        run: |
+          set -euo pipefail
+          python --version
+          python -c "import sys; print(sys.executable)"
+          echo "runner: ${RUNNER_OS} ${RUNNER_ARCH}; image: ${ImageOS:-unknown}"
+
+      # One run, never retried, 3-minute cap. The probe writes its JSON document to stdout;
+      # this step captures it to a file for the artifact while still showing it in the log.
+      # `set +e` keeps the documented non-zero exits (3 gap / 4 contradiction / 5 not-win32 /
+      # 64 usage) readable instead of aborting before the result is captured.
+      - name: Run the no-follow probe once
+        id: probe
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -uo pipefail
+          OUT="${RUNNER_TEMP}/windows-nofollow-probe-1172.json"
+          LOG="${RUNNER_TEMP}/windows-nofollow-probe-1172.log"
+          set +e
+          python .github/scripts/windows-nofollow-probe-1172.py > "${OUT}" 2> "${LOG}"
+          RC=$?
+          set -e
+          echo "probe exit: ${RC}"
+          echo "--- stderr ---"
+          cat "${LOG}" || true
+          echo "--- result document ---"
+          cat "${OUT}" || true
+          echo "probe_exit=${RC}" >> "${GITHUB_OUTPUT}"
+          # A missing or empty result is an error, never a silent pass.
+          if [ ! -s "${OUT}" ]; then
+            echo "::error::the probe produced no result document; refusing to report a vacuous run."
+            exit 1
+          fi
+          case "${RC}" in
+            0)  echo "::notice::all required measurements were obtained and are consistent with the design." ;;
+            3)  echo "::warning::a required measurement was UNAVAILABLE (capability gap). This is an explicit acceptance gap, not a skipped success." ;;
+            4)  echo "::error::an observation CONTRADICTS the no-follow design; read the result document before any implementation." ;;
+            5)  echo "::error::the probe refused: not running on win32." ;;
+            64) echo "::error::the probe refused unexpected operands." ;;
+            *)  echo "::error::the probe exited ${RC}, which is outside its documented set (0/3/4/5/64)." ;;
+          esac
+          # The job fails for a contradiction, a refusal or an undocumented exit. A gap (3)
+          # leaves the job green-with-warning on purpose: the measurement ran correctly and
+          # honestly reported that a fixture capability was unavailable, which root needs to
+          # see as a recorded gap rather than as a red build it might retry.
+          case "${RC}" in
+            0|3) exit 0 ;;
+            *)   exit 1 ;;
+          esac
+
+      - name: Upload the probe result and stderr
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-nofollow-probe-1172
+          path: |
+            ${{ runner.temp }}/windows-nofollow-probe-1172.json
+            ${{ runner.temp }}/windows-nofollow-probe-1172.log
+          if-no-files-found: warn
+          retention-days: 7
