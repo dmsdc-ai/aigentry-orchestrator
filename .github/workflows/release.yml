@@ -38,6 +38,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          ref: ${{ github.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20.20.0'
@@ -1070,6 +1071,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
@@ -1123,6 +1126,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -1145,6 +1150,8 @@ jobs:
         shell: bash
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -1261,6 +1268,8 @@ jobs:
         shell: bash
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20'

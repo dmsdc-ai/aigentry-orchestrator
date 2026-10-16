@@ -109,6 +109,7 @@ const browserAddition = `  browser-tls:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          ref: \${{ github.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20.20.0'
@@ -1163,6 +1164,8 @@ const approvedWindowsRegion = `  # Windows is supported in 0.2.2, with two docum
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: \${{ github.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -1191,6 +1194,8 @@ const approvedWindowsRegion = `  # Windows is supported in 0.2.2, with two docum
         shell: bash
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
+        with:
+          ref: \${{ github.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -1309,6 +1314,8 @@ const approvedWindowsRegion = `  # Windows is supported in 0.2.2, with two docum
         shell: bash
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
+        with:
+          ref: \${{ github.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -1885,6 +1892,17 @@ function assertCheckoutRefs(workflow, label) {
   }
 }
 
+// #1232: add only the reviewed ref to the historical test job; never strip current refs.
+function withApprovedTestCheckout(job) {
+  const copy = structuredClone(job);
+  assert.equal(copy.name, 'Full suite', 'historical checkout delta is test-job-only');
+  assert.deepEqual(copy.steps[0], { uses: 'actions/checkout@v4' }, 'exact historical test checkout');
+  copy.steps[0].with = { ref: '${{ github.sha }}' };
+  return copy;
+}
+const testCheckoutBefore = '      - uses: actions/checkout@v4\n      - uses: actions/setup-node@v4\n';
+const testCheckoutAfter = '      - uses: actions/checkout@v4\n        with:\n          ref: ${{ github.sha }}\n      - uses: actions/setup-node@v4\n';
+
 function validate(workflow, policy = currentPolicy()) {
   assertCheckoutRefs(workflow, 'release');
   workflow = withoutBrowser(workflow, true);
@@ -1907,8 +1925,8 @@ function validate(workflow, policy = currentPolicy()) {
   delete securityEnv.RELEASE_SECURITY_POLICY_SHA256;
   delete securityEnv.RELEASE_SECURITY_COMMIT;
   assert.deepEqual(guard, original.jobs.guard, 'guard changes only the required security trust inputs');
-  assert.deepEqual(workflow.jobs.test, withApprovedSandboxDeps(withApprovedDispatchGuard(original.jobs.test, dispatchGuardSteps.release)),
-    'unchanged test except the approved Dispatch guard suite and sandbox dependency steps');
+  assert.deepEqual(workflow.jobs.test, withApprovedTestCheckout(withApprovedSandboxDeps(withApprovedDispatchGuard(original.jobs.test, dispatchGuardSteps.release))),
+    'unchanged test except the approved checkout ref, Dispatch guard suite and sandbox dependency steps');
   const guardSteps = workflow.jobs.guard.steps;
   const admission = guardSteps.indexOf(named(workflow.jobs.guard, 'Release planning and changed-file admission'));
   const token = guardSteps.indexOf(named(workflow.jobs.guard, 'NPM_TOKEN must be present'));
@@ -1972,7 +1990,7 @@ function validateReleaseHistory(workflow, source = readFileSync(join(root, '.git
   assertPublishReadbackBytes(source, 'release');
   const copy = withoutBrowser(workflow, true);
   const history = structuredClone(rejected);
-  history.jobs.test = withApprovedSandboxDeps(withApprovedDispatchGuard(history.jobs.test, dispatchGuardSteps.release));
+  history.jobs.test = withApprovedTestCheckout(withApprovedSandboxDeps(withApprovedDispatchGuard(history.jobs.test, dispatchGuardSteps.release)));
   history.jobs.publish = withApprovedPublishReadback(history.jobs.publish);
   for (const item of [copy, history]) {
     const env = named(item.jobs.guard, 'Release planning and changed-file admission').env ?? {};
@@ -2015,7 +2033,7 @@ function validateCIHistory(source, historicalSource = readFileSync(join(root, fi
   }
   const history = structuredClone(ciBefore);
   for (const id of oldIds) delete history.jobs[id];
-  history.jobs.test = withApprovedSandboxDeps(withApprovedDispatchGuard(history.jobs.test, dispatchGuardSteps.ci));
+  history.jobs.test = withApprovedTestCheckout(withApprovedSandboxDeps(withApprovedDispatchGuard(history.jobs.test, dispatchGuardSteps.ci)));
   assert.deepEqual(copy, history, 'CI without its browser and Windows jobs is the historical CI without its two Windows jobs');
   // Bytes: everything before the historical Windows boundary is the historical CI except the one approved
   // header sentence, the approved Dispatch guard suite step and the approved sandbox dependency step, and
@@ -2030,10 +2048,11 @@ function validateCIHistory(source, historicalSource = readFileSync(join(root, fi
   assert.equal(prefix.split(ciHeaderBefore).length, 2, 'one historical Windows header sentence');
   assert.equal(prefix.split(`${ciDispatchGuardBefore}${dispatchGuardNext}`).length, 2, 'one historical Dispatch guard suite step');
   assert.equal(prefix.split(sandboxDepsPrev).length, 2, 'one historical jq step');
-  assert.equal(currentBytes, prefix.replace(ciHeaderBefore, () => ciHeaderAfter)
+  const checkoutPrefix = replaceOnce(prefix, testCheckoutBefore, testCheckoutAfter);
+  assert.equal(currentBytes, checkoutPrefix.replace(ciHeaderBefore, () => ciHeaderAfter)
     .replace(ciDispatchGuardBefore, () => dispatchGuardAfter)
     .replace(sandboxDepsPrev, () => `${sandboxDepsPrev}${sandboxDepsAfter}${sandboxUsernsAfter}`) + approvedWindowsRegion,
-    'every CI byte outside the approved header sentence, Dispatch guard suite step, sandbox dependency step and Windows region is the historical CI');
+    'every CI byte outside the approved checkout ref, header sentence, Dispatch guard suite step, sandbox dependency step and Windows region is the historical CI');
 }
 acceptance('CI Windows jobs match release and every other CI byte remains unchanged', 'ci-parity', () => validateCIHistory(readFileSync(join(root, '.github/workflows/ci.yml'), 'utf8')));
 // #1196 — the POSIX `test` job, compared between the two workflows themselves. Each file is frozen
@@ -2083,6 +2102,7 @@ const testParityMutations = [
 for (const [name, side, needle, replacement, refusal] of testParityMutations) {
   acceptance(`test job parity rejects: ${name}`, 'test-parity-mutant', () => {
     const [ciSource, releaseSource] = testParitySources();
+    validateTestParity(ciSource, releaseSource); // Comment negatives must reach the byte comparison.
     const changed = side === 'CI' ? [replaceOnce(ciSource, needle, replacement), releaseSource]
       : [ciSource, replaceOnce(releaseSource, needle, replacement)];
     assert.throws(() => validateTestParity(...changed), error => error instanceof assert.AssertionError && refusal.test(error.message));
@@ -4148,7 +4168,11 @@ for (const [workflowName, path] of [['CI', '.github/workflows/ci.yml'], ['releas
     ] : [...browserMutations, ...ciDiagnosticMutations, ...releaseBrowserMutations, ...sandboxDepsMutations];
     for (const [name, needle, replacement] of mutations) {
       acceptance(`browser projection rejects ${workflowName} ${ending}: ${name}`, 'browser-projection-mutant', () => {
+        if (name === 'missing browser job') check(encode(source));
         const changed = encode(replaceOnce(source, needle, replacement));
+        if (name === 'missing browser job') {
+          assert.equal(parse('missing-browser mutation', changed).jobs['browser-tls'], undefined);
+        }
         assert.throws(() => check(changed), assert.AssertionError);
       });
     }
