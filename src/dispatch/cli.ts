@@ -32,7 +32,7 @@ import { isCliKind, type LaunchConfig } from "../session/boot-adapter/types.js";
 import { normalizeLaunch } from "../session/boot-adapter/launch-config.js";
 import { loadWorkerScope, prepareWorkerSandbox, assertConfinedTarget, stageWorkerRef, assertNotCliWrapper, CONFINED_CLIS,
   readSandboxCurrent, readSealedManifest } from "../session/worker-sandbox.js";
-import { CLAUDE_OAUTH_OPT_IN } from "../session/claude-worker-oauth.js";
+import { selectedClaudeOAuthToken } from "../session/claude-worker-oauth.js";
 import { validateSpawnDecision, type SpawnDecision } from "../session/model-decision.js";
 
 // ── environment seams (identical names/defaults to the shell) ────────────────
@@ -600,13 +600,8 @@ function cliCap(cli: string): number {
   return Infinity;
 }
 
-// #1206 (PLAN §2.3): stat only, nothing is read or run. An executable the resolver would bind by name
-// (`<cli>` in an absolute PATH dir); a declared AIGENTRY_<CLI>_EXECUTABLE is an explicit request the
-// resolver judges itself, never substituted. A credential source: codex auth.json seedAuth copies; for
-// claude the opted-in token, its credentials file, or on darwin the login Keychain (not statable).
-// #1232 (D1): claude routing is deliberately unchanged. seedAuth no longer copies the host login, and
-// spawnWorkspace refuses claude without the opt-in (SANDBOX_AUTH_WORKER_TOKEN_REQUIRED, exit 78) rather
-// than letting this predicate silently re-route the spawn to another provider/billing path.
+// #1206: executable discovery stays separate from authentication. #1232: a Claude
+// authentication failure refuses rather than selecting a different provider.
 function executablePresent(cli: string): boolean {
   if (env[`AIGENTRY_${cli.toUpperCase()}_EXECUTABLE`]) return true;
   return (env.PATH || "").split(path.delimiter).some((dir) => path.isAbsolute(dir) && isExecutable(path.join(dir, cli)));
@@ -615,7 +610,18 @@ function executablePresent(cli: string): boolean {
 function credentialPresent(cli: string): boolean {
   const isFile = (p: string): boolean => { try { return fs.statSync(p).isFile(); } catch { return false; } };
   if (cli === "codex") return isFile(path.join(env.CODEX_HOME || path.join(os.homedir(), ".codex"), "auth.json"));
-  return !!env[CLAUDE_OAUTH_OPT_IN] || process.platform === "darwin" || isFile(path.join(os.homedir(), ".claude", ".credentials.json"));
+  let configured = false;
+  try { configured = selectedClaudeOAuthToken(env) !== undefined; } catch {
+    die("dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_INVALID: invalid automation token or unsafe private token store; " +
+      "see docs/setup/dispatch-capacity.md; nothing was spawned (exit 78)", 78);
+  }
+  if (!configured) {
+    die("dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_REQUIRED: confined Claude workers authenticate only with an approved " +
+      "automation token (claude setup-token) supplied as AIGENTRY_CLAUDE_OAUTH_TOKEN or in " +
+      "~/.aigentry/credentials/claude-worker/token; the host login is never copied; " +
+      "see docs/setup/dispatch-capacity.md; nothing was spawned (exit 78)", 78);
+  }
+  return true;
 }
 
 /**
@@ -1262,14 +1268,8 @@ function spawnWorkspace(o: Opts, sid: string): void {
       `${process.platform} has none (documented limitation; no unrestricted fallback); decided ${decided}; ` +
       "nothing was spawned or registered (exit 78)", 78);
   }
-  // #1232: the host login is never copied into a confined Claude worker; without the opt-in it cannot
-  // authenticate, so refuse now — before boot-prepare stages anything, the git guard is installed or a
-  // terminal opens. Names the variable only; it is unset here, so no value can be echoed.
-  if (o.cli === "claude" && !env[CLAUDE_OAUTH_OPT_IN]) {
-    die("dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_REQUIRED: confined Claude workers authenticate only with an approved " +
-      "automation token (claude setup-token) supplied as AIGENTRY_CLAUDE_OAUTH_TOKEN in the dispatcher environment; " +
-      "the host login is never copied; see docs/setup/dispatch-capacity.md; nothing was spawned (exit 78)", 78);
-  }
+  // Explicit CLI and automatic routing use the same fresh validation; no token cache.
+  if (o.cli === "claude") credentialPresent("claude");
   const spawnEnv: NodeJS.ProcessEnv = o.route && /^(llm|table)(-capped)?$/.test(o.route.decided_by) && o.decision?.model !== null
     ? { [`AIGENTRY_${o.cli.toUpperCase()}_MODEL`]: o.route.model } : {};
   // #1148: boot-prepare turns this ONE decision into argv; its launcher export dies at the runner (C3).

@@ -8,7 +8,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { accessSync, constants, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { accessSync, chmodSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
 import { fixture } from "../model-router-fixtures.js";
 
@@ -17,8 +17,8 @@ const posixTest = posix ? test : (() => undefined) as unknown as typeof test;
 // #1232 F8: obviously fake and prefix-free (no real token prefix), so it cannot look like a credential to a scanner.
 const FAKE_TOKEN = "FAKE-1232-caller-worker-token-NOT-A-SECRET";
 const REFUSAL = "dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_REQUIRED: confined Claude workers authenticate only with an " +
-  "approved automation token (claude setup-token) supplied as AIGENTRY_CLAUDE_OAUTH_TOKEN in the dispatcher " +
-  "environment; the host login is never copied; see docs/setup/dispatch-capacity.md; nothing was spawned (exit 78)";
+  "approved automation token (claude setup-token) supplied as AIGENTRY_CLAUDE_OAUTH_TOKEN or in " +
+  "~/.aigentry/credentials/claude-worker/token; the host login is never copied; see docs/setup/dispatch-capacity.md; nothing was spawned (exit 78)";
 
 // Host PATH minus every directory holding a claude/codex: the resolver must only ever see the fakes.
 function cleanHostPath(): string {
@@ -95,5 +95,111 @@ if (!posix) test("#1232 caller (win32): the platform refusal precedes the token 
   try {
     const d = f.refused(spawnClaude(f));
     assert.equal(d.cli, "claude");
+  } finally { f.cleanup(); }
+});
+
+
+function provision(f: ReturnType<typeof fixture>, raw = FAKE_TOKEN + "\n"): string {
+  const dir = join(f.env.HOME!, ".aigentry/credentials/claude-worker");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const file = join(dir, "token");
+  writeFileSync(file, raw, { mode: 0o600 });
+  return file;
+}
+
+posixTest("#1232 caller: private store reaches handoff without exposing source path or token", () => {
+  const f = fixture();
+  try {
+    const source = provision(f);
+    const r = spawnClaude(f, { AIGENTRY_CLAUDE_OAUTH_TOKEN: undefined });
+    assert.equal(r.status, 0, r.stderr);
+    const current = JSON.parse(readFileSync(join(f.aig, "sessions/router-fixture/sandbox-current.json"), "utf8"));
+    const raw = readFileSync(current.manifest, "utf8"), m = JSON.parse(raw);
+    assert.equal(readFileSync(m.claudeOAuthHandoff, "utf8") === FAKE_TOKEN + "\n", true);
+    assert.equal(raw.includes(source), false);
+    assert.equal(raw.includes(FAKE_TOKEN), false);
+    assert.deepEqual(files(f.root).filter(p => p !== source && p !== m.claudeOAuthHandoff &&
+      readFileSync(p, "utf8").includes(FAKE_TOKEN)), []);
+    assert.equal((r.stdout + r.stderr).includes(FAKE_TOKEN), false);
+    assert.equal(existsSync(f.env.WORK_LOG!), false);
+  } finally { f.cleanup(); }
+});
+
+for (const kind of ["malformed file", "unsafe file", "invalid env"] as const) {
+  posixTest("#1232 caller: " + kind + " refuses before spawn without disclosure", () => {
+    const f = fixture();
+    try {
+      const file = provision(f, kind === "malformed file" ? FAKE_TOKEN : FAKE_TOKEN + "\n");
+      if (kind === "unsafe file") chmodSync(file, 0o644);
+      const r = spawnClaude(f, { AIGENTRY_CLAUDE_OAUTH_TOKEN: kind === "invalid env" ? FAKE_TOKEN + " invalid" : undefined });
+      assert.equal(r.status, 78, r.stderr);
+      assert.match(r.stderr, /SANDBOX_AUTH_WORKER_TOKEN_INVALID/);
+      assert.equal((r.stdout + r.stderr).includes(FAKE_TOKEN), false);
+      for (const effect of [f.env.OPEN_LOG!, join(f.aig, "sessions"), join(f.aig, "role-sandbox"), f.env.AIGENTRY_GIT_HOOKS_DIR!]) {
+        assert.equal(existsSync(effect), false);
+      }
+    } finally { f.cleanup(); }
+  });
+}
+
+posixTest("#1232 caller: Codex ignores malformed Claude store and explicit token", () => {
+  const f = fixture();
+  try {
+    provision(f, "FAKE INVALID STORE");
+    const r = f.dispatch([...f.spawnArgs, "--cli", "codex", "--role", "coder"],
+      { PATH: [f.bin, cleanHostPath()].join(delimiter), AIGENTRY_CLAUDE_OAUTH_TOKEN: "FAKE INVALID ENV" });
+    assert.equal(r.status, 0, r.stderr);
+    const m = f.manifest();
+    assert.equal(m.cli, "codex");
+    assert.equal(m.claudeOAuthHandoff, undefined);
+  } finally { f.cleanup(); }
+});
+
+
+// #1232 routing RED/GREEN uses the actual predicate source with an explicitly
+// simulated Linux platform. No native Linux confinement claim.
+import { runInNewContext as routingContext } from "node:vm";
+import * as routingTs from "typescript";
+
+test("#1232 routing: Linux store selection and missing/invalid sources never silently fall back", () => {
+  const source = readFileSync(join(process.cwd(), "src/dispatch/cli.ts"), "utf8");
+  const start = source.indexOf("function credentialPresent(");
+  const end = source.indexOf("\n/**", start);
+  const predicate = routingTs.transpileModule(source.slice(start, end), {
+    compilerOptions: { target: routingTs.ScriptTarget.ES2022 },
+  }).outputText;
+  for (const state of ["valid", "missing", "invalid"] as const) {
+    let selected = 0, stats = 0;
+    const context = {
+      env: {}, process: { platform: "linux" }, CLAUDE_OAUTH_OPT_IN: "AIGENTRY_CLAUDE_OAUTH_TOKEN",
+      path: { join }, os: { homedir: () => "/synthetic-controller" },
+      fs: { statSync: () => { stats++; throw new Error("NO_HOST_CREDENTIAL"); } },
+      selectedClaudeOAuthToken: () => { selected++; if (state === "invalid") throw new Error("CLAUDE_OAUTH_STORE_INVALID");
+        return state === "valid" ? "FAKE-1232-ROUTING" : undefined; },
+      die: (message: string, code: number) => { throw Object.assign(new Error(message), { code }); },
+    };
+    const run = () => routingContext(predicate + ";credentialPresent('claude')", context);
+    if (state === "valid") assert.equal(run(), true, "Linux store must remain routable");
+    else assert.throws(run, (e: any) => e.code === 78 &&
+      e.message.includes(state === "missing" ? "SANDBOX_AUTH_WORKER_TOKEN_REQUIRED" : "SANDBOX_AUTH_WORKER_TOKEN_INVALID"));
+    assert.equal(selected, 1);
+    assert.equal(stats, 0, "no host credential inspection for Claude");
+  }
+});
+
+posixTest("#1232 caller: automatic Claude routing uses only the private store", () => {
+  const f = fixture();
+  try {
+    provision(f);
+    unlinkSync(join(f.env.HOME!, ".claude/.credentials.json"));
+    writeFileSync(join(f.aig, "instructions/roles/architect.md"), "# Fixture architect\n");
+    const r = f.dispatch([...f.spawnArgs, "--role", "architect"],
+      { PATH: [f.bin, cleanHostPath()].join(delimiter), AIGENTRY_CLAUDE_OAUTH_TOKEN: undefined });
+    assert.equal(r.status, 0, r.stderr);
+    const current = JSON.parse(readFileSync(join(f.aig, "sessions/router-fixture/sandbox-current.json"), "utf8"));
+    const m = JSON.parse(readFileSync(current.manifest, "utf8"));
+    assert.equal(m.cli, "claude");
+    assert.equal(readFileSync(m.claudeOAuthHandoff, "utf8") === FAKE_TOKEN + "\n", true);
+    assert.doesNotMatch(r.stderr, /has no credential| -> /);
   } finally { f.cleanup(); }
 });

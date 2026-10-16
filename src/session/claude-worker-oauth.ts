@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as os from "node:os";
 import { winPrivateStorage } from "./private-storage.js";
 import type { VerifyItem, VerifyResult, WinPrivateStorage } from "./private-storage.js";
 
@@ -20,12 +21,48 @@ const valid = (v: string): boolean => v.length <= CLAUDE_OAUTH_MAX && /^[\x21-\x
 const euid = (): number => (process.geteuid ? process.geteuid() : -1);
 const literalPath = (p: string): boolean => path.isAbsolute(p) && path.normalize(p) === p && !/[\0\r\n]/.test(p);
 
-/** The opted-in token, or undefined when unset/empty (old behavior). Invalid is a refusal. */
+/**
+ * Explicit nonempty env wins (invalid input refuses). Otherwise reread the fixed
+ * controller-owned store on every call; only an absent safe path is unconfigured.
+ * The source path never leaves this selector or enters a worker manifest.
+ */
 export function selectedClaudeOAuthToken(env: NodeJS.ProcessEnv = process.env): string | undefined {
   const v = env[CLAUDE_OAUTH_OPT_IN];
-  if (v === undefined || v === "") return undefined;
-  if (!valid(v)) throw new Error("CLAUDE_OAUTH_TOKEN_INVALID");
-  return v;
+  if (v !== undefined && v !== "") {
+    if (!valid(v)) throw new Error("CLAUDE_OAUTH_TOKEN_INVALID");
+    return v;
+  }
+  try {
+    const home = os.homedir();
+    if (!literalPath(home)) throw new Error();
+    const aigentry = path.join(home, ".aigentry");
+    const credentials = path.join(aigentry, "credentials");
+    const dir = path.join(credentials, "claude-worker");
+    for (const parent of [home, aigentry, credentials, dir]) {
+      let st: fs.Stats;
+      try { st = fs.lstatSync(parent); } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === "ENOENT" && parent !== home) return undefined;
+        throw e;
+      }
+      if (!st.isDirectory() || st.isSymbolicLink()) throw new Error();
+      const privateDir = parent === credentials || parent === dir;
+      if (process.platform === "win32") {
+        if (!winPrivateStorage) throw new Error();
+        verifyWinPrivate(winPrivateStorage, [{ path: parent, kind: "directory", want: privateDir ? "private" : "owned" }],
+          "CLAUDE_OAUTH_STORE_INVALID");
+      } else if (st.uid !== euid() || (st.mode & (privateDir ? 0o077 : 0o022)) !== 0) {
+        throw new Error();
+      }
+    }
+    const file = path.join(dir, CLAUDE_OAUTH_FILE);
+    try { fs.lstatSync(file); } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw e;
+    }
+    return readClaudeOAuthHandoff(file, file);
+  } catch {
+    throw new Error("CLAUDE_OAUTH_STORE_INVALID");
+  }
 }
 
 // #1167 F6 (win32, P2 + Q-FILE R2): mode bits and uid mean nothing there, so the ACL is read back.
