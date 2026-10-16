@@ -833,8 +833,13 @@ function cleanedUp(r: ReturnType<typeof traced>, accepted: number, label: string
 // #652 F1: the preflight targets a LIVE host listener the runner bound itself (never the empty literal 3848), passed
 // as the last argv after the canary; the runner consults SRT's proxy-port getters when present. MOCK BOUNDARY.
 test("runner (fake SRT): preflight connects to the runner's own live 127.0.0.1 listener port, last argv, never 3848; cleaned up", () => {
-  const W = world(), p = prepare(W, "np1");
+  const W = world(), p = prepare(W, "np1", { [OPT]: W.token });
   if (WIN) return refusedOnWin(W, p);
+  assert.equal(p.error, null);
+  assert.ok(p.manifest && existsSync(p.manifest));
+  assert.match(p.hash, /^[a-f0-9]{64}$/);
+  assert.equal(typeof p.m.probeFile, "string");
+  assert.ok(existsSync(String(p.m.probeFile)));
   const canary = read(String(p.m.probeFile));
   for (const proxy of [false, true]) {
     const r = traced(W, p.manifest, p.hash, ["--preflight-only"], proxy ? { FAKE_PROXY_PORTS: "1" } : {});
@@ -861,8 +866,19 @@ test("runner (fake SRT): a preflight that reached the live control port but exit
     ["exit71", false, [], { FAKE_PREFLIGHT_EXIT: "71" }], ["canary", false, [], { FAKE_PREFLIGHT_LEAK: "" }],
   ];
   for (const [name, opted, args, extraEnv] of cases) {
-    const W = world(), p = prepare(W, `nl-${name.replace(/\W/g, "")}`, opted ? { [OPT]: W.token } : {});
+    const W = world();
+    if (!opted && !WIN) {
+      const dir = join(W.host, ".aigentry", "credentials", "claude-worker");
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(dir, "token"), W.token + "\n", { mode: 0o600 });
+    }
+    const p = prepare(W, `nl-${name.replace(/\W/g, "")}`, opted ? { [OPT]: W.token } : {});
     if (WIN) { refusedOnWin(W, p); continue; }
+    assert.equal(p.error, null);
+    assert.ok(p.manifest && existsSync(p.manifest));
+    assert.match(p.hash, /^[a-f0-9]{64}$/);
+    assert.equal(typeof p.m.probeFile, "string");
+    assert.ok(existsSync(String(p.m.probeFile)));
     if (opted) rmSync(String(p.m.claudeOAuthHandoff));
     const env2 = { FAKE_PREFLIGHT_CONNECT: "1", ...extraEnv };
     if ("FAKE_PREFLIGHT_LEAK" in env2) env2.FAKE_PREFLIGHT_LEAK = String(p.m.probeFile);
@@ -882,8 +898,13 @@ test("runner (fake SRT): a preflight that reached the live control port but exit
 // #652 F1 cleanup: on every refusal path after bind (child exit 72/73/74, wrap error, spawn error) the listener and
 // all sockets are closed and the runner exits by itself; the existing exit-code refusal text is unchanged.
 test("runner (fake SRT): listener cleanup on failed preflight, wrap error and spawn error; no worker, no receipt", () => {
-  const W = world(), p = prepare(W, "nc1");
+  const W = world(), p = prepare(W, "nc1", { [OPT]: W.token });
   if (WIN) return refusedOnWin(W, p);
+  assert.equal(p.error, null);
+  assert.ok(p.manifest && existsSync(p.manifest));
+  assert.match(p.hash, /^[a-f0-9]{64}$/);
+  assert.equal(typeof p.m.probeFile, "string");
+  assert.ok(existsSync(String(p.m.probeFile)));
   const cases: [string, Record<string, string>, RegExp][] = [
     ...["72", "73", "74"].map((c): [string, Record<string, string>, RegExp] =>
       [`exit${c}`, { FAKE_PREFLIGHT_EXIT: c }, new RegExp(`\\[sandbox\\] REFUSED: SANDBOX_PREFLIGHT_FAILED: ${c} \\n$`)]),
@@ -968,9 +989,21 @@ import { runInNewContext as selectorContext } from "node:vm";
 import { test as selectorTest } from "node:test";
 import selectorAssert from "node:assert/strict";
 import { tmpdir as selectorTmpdir } from "node:os";
+import type { VerifyItem, VerifyResult } from "../../src/session/private-storage.js";
 
-selectorTest("#1232 store: source selector precedence, replacement, absence and unsafe rejection", { skip: process.platform === "win32" }, () => {
+selectorTest("#1232 store: source selector precedence, replacement, absence and unsafe rejection", () => {
   const home = selectorFs.mkdtempSync(selectorPath.join(selectorTmpdir(), "store-1232-"));
+  // Owned ACL seam for the selector contract only; no claim of native ACL verification.
+  const denied = new Set<string>(), verified: VerifyItem[][] = [];
+  const storage = { verify(items: readonly VerifyItem[]): VerifyResult[] {
+    verified.push(Array.from(items, (item) => ({ ...item })));
+    return items.map((item) => {
+      selectorAssert.ok(item.path === home || item.path.startsWith(home + selectorPath.sep));
+      const st = selectorFs.lstatSync(item.path, { bigint: true });
+      return { ok: !denied.has(item.path) && !st.isSymbolicLink() &&
+        (item.kind === "directory" ? st.isDirectory() : st.isFile()), dev: String(st.dev), ino: String(st.ino) };
+    });
+  } };
   const source = selectorFs.readFileSync(selectorPath.join(process.cwd(), "src/session/claude-worker-oauth.ts"), "utf8");
   const exports: Record<string, any> = {};
   const js = selectorTs.transpileModule(source, { compilerOptions: { module: selectorTs.ModuleKind.CommonJS,
@@ -979,7 +1012,7 @@ selectorTest("#1232 store: source selector precedence, replacement, absence and 
     if (name === "node:fs") return selectorFs;
     if (name === "node:path") return selectorPath;
     if (name === "node:os") return { homedir: () => home };
-    if (name === "./private-storage.js") return { winPrivateStorage: null };
+    if (name === "./private-storage.js") return { winPrivateStorage: WIN ? storage : null };
     throw new Error("UNEXPECTED_SELECTOR_DEPENDENCY");
   } });
   const select = exports.selectedClaudeOAuthToken as (env: NodeJS.ProcessEnv) => string | undefined;
@@ -990,7 +1023,15 @@ selectorTest("#1232 store: source selector precedence, replacement, absence and 
     selectorAssert.equal(select({}), undefined);
     selectorFs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     selectorFs.writeFileSync(file, first + "\n", { mode: 0o600 });
+    verified.length = 0;
     selectorAssert.equal(select({}) === first, true, "file source selected");
+    if (WIN) selectorAssert.deepEqual(verified, [
+      [{ path: home, kind: "directory", want: "owned" }],
+      [{ path: selectorPath.join(home, ".aigentry"), kind: "directory", want: "owned" }],
+      [{ path: selectorPath.dirname(dir), kind: "directory", want: "private" }],
+      [{ path: dir, kind: "directory", want: "private" }],
+      [{ path: dir, kind: "directory", want: "private" }, { path: file, kind: "file", want: "private" }],
+    ]);
     selectorAssert.equal(select({ AIGENTRY_CLAUDE_OAUTH_TOKEN: "" }) === first, true);
     selectorAssert.equal(select({ AIGENTRY_CLAUDE_OAUTH_TOKEN: second }) === second, true);
     selectorAssert.throws(() => select({ AIGENTRY_CLAUDE_OAUTH_TOKEN: "INVALID value" }),
@@ -1003,6 +1044,19 @@ selectorTest("#1232 store: source selector precedence, replacement, absence and 
       selectorFs.writeFileSync(file, raw); refuses();
     }
     selectorFs.writeFileSync(file, first + "\n");
+    if (WIN) {
+      for (const unsafe of [file, dir, selectorPath.dirname(dir), selectorPath.join(home, ".aigentry"), home]) {
+        denied.add(unsafe); refuses();
+        verified.length = 0;
+        selectorAssert.equal(select({ AIGENTRY_CLAUDE_OAUTH_TOKEN: second }) === second, true, "env bypasses unsafe store");
+        selectorAssert.deepEqual(verified, [], "explicit env does not inspect storage");
+        denied.delete(unsafe);
+      }
+      selectorFs.linkSync(file, replacement); refuses(); selectorFs.unlinkSync(replacement);
+      selectorFs.unlinkSync(file); selectorAssert.equal(select({}), undefined);
+      selectorFs.mkdirSync(file); refuses();
+      return;
+    }
     selectorFs.chmodSync(file, 0o644); refuses();
     selectorAssert.equal(select({ AIGENTRY_CLAUDE_OAUTH_TOKEN: second }) === second, true, "env bypasses unsafe store");
     selectorFs.chmodSync(file, 0o600);
@@ -1019,12 +1073,22 @@ selectorTest("#1232 store: source selector precedence, replacement, absence and 
   } finally { selectorFs.rmSync(home, { recursive: true, force: true }); }
 });
 
-test("#1232 store: fresh preparations reread replacement and preserve earlier handoff", { skip: WIN }, () => {
+test("#1232 store: fresh preparations reread replacement and preserve earlier handoff", () => {
   const W = world(), dir = join(W.host, ".aigentry/credentials/claude-worker");
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const file = join(dir, "token"), next = "FAKE-1232-REPLACEMENT";
   writeFileSync(file, W.token + "\n", { mode: 0o600 });
   const first = prepare(W, "store-first");
+  if (WIN) {
+    refusedOnWin(W, first);
+    assert.equal(first.hash, "");
+    assert.equal(first.launcher, "");
+    assert.deepEqual(first.m, {});
+    assert.deepEqual(tree(join(W.sessions, "store-first")), first.beforePrepare.staging);
+    assert.deepEqual(tree(join(W.root, "tmp")), first.beforePrepare.tmp);
+    assert.equal(read(file), W.token + "\n", "unsupported preparation leaves the source untouched");
+    return;
+  }
   assert.equal(first.error, null);
   const handoff = String(first.m.claudeOAuthHandoff);
   assert.equal(read(handoff) === W.token + "\n", true);
