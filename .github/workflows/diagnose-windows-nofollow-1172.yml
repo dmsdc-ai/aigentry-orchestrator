@@ -1,8 +1,13 @@
 name: Diagnose Windows no-follow (#1172)
 
-# #1172 phase 4 — DIAGNOSTIC ONLY. Runs .github/scripts/windows-nofollow-probe-1172.py once
-# on a native windows-latest runner to measure the four behaviours the task-queue lock's
-# no-follow design depends on and that official documentation does not settle (P0/P1/P2/P4).
+# #1172 phases 4-5 — DIAGNOSTIC ONLY. Runs .github/scripts/windows-nofollow-probe-1172.py
+# once on a native windows-latest runner to measure the behaviours the task-queue lock's
+# no-follow design depends on and that official documentation does not settle
+# (P0, P1 symlink, P1 junction, P2, P4 — all required).
+#
+# What a green run DOES mean, and only this: every required measurement was obtained and
+# none contradicted the design. Since the phase-5 Q14 correction, only probe exit 0 is a
+# success, so green can no longer be reached while a required measurement is missing.
 #
 # What a green run here does NOT mean: Windows is supported, the broker works, or native
 # acceptance is met. This workflow builds nothing, tests nothing and ships nothing. It
@@ -37,8 +42,10 @@ jobs:
           persist-credentials: false
 
       # setup-python has no precedent in this repo (only checkout@v4, setup-node@v4 and
-      # upload-artifact@v4 are used anywhere), so this pin is a disclosed new choice for
-      # root to confirm or re-pin during inspection — see phase4 REPORT Q13.
+      # upload-artifact@v4 are used anywhere). Raised as Q13 and ACCEPTED by root for this
+      # bounded diagnostic, citing GitHub's own Python tutorial, which demonstrates
+      # actions/setup-python@v5 with Python 3.13 in its matrix. That acceptance is not a
+      # claim that v5 is the newest major, and no action upgrade was requested here.
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -81,22 +88,32 @@ jobs:
             echo "::error::the probe produced no result document; refusing to report a vacuous run."
             exit 1
           fi
+          # The log distinguishes a gap from a contradiction, because they need different
+          # responses — but it never suppresses status: every non-zero probe exit fails
+          # this step (see the final case).
           case "${RC}" in
             0)  echo "::notice::all required measurements were obtained and are consistent with the design." ;;
-            3)  echo "::warning::a required measurement was UNAVAILABLE (capability gap). This is an explicit acceptance gap, not a skipped success." ;;
+            3)  echo "::error::a required measurement was UNAVAILABLE (capability gap). The measurement ran honestly, but a required observation is MISSING: this is an explicit acceptance gap, not a skipped success, and not a pass." ;;
             4)  echo "::error::an observation CONTRADICTS the no-follow design; read the result document before any implementation." ;;
             5)  echo "::error::the probe refused: not running on win32." ;;
             64) echo "::error::the probe refused unexpected operands." ;;
             *)  echo "::error::the probe exited ${RC}, which is outside its documented set (0/3/4/5/64)." ;;
           esac
-          # The job fails for a contradiction, a refusal or an undocumented exit. A gap (3)
-          # leaves the job green-with-warning on purpose: the measurement ran correctly and
-          # honestly reported that a fixture capability was unavailable, which root needs to
-          # see as a recorded gap rather than as a red build it might retry.
-          case "${RC}" in
-            0|3) exit 0 ;;
-            *)   exit 1 ;;
-          esac
+          # Q14 correction (phase 5): ONLY probe exit 0 maps to step success.
+          #
+          # Phase 4 let exit 3 pass as green-with-warning. That was wrong: a gap means a
+          # REQUIRED measurement was not obtained, so a green run here would be readable as
+          # "the required measurements were obtained" when they were not. A gap, a
+          # contradiction, a refusal and any undocumented exit now all fail the step. The
+          # raw probe exit is still recorded above and in ${GITHUB_OUTPUT}, and the result
+          # document and stderr are still uploaded by the always() step below, so failing
+          # loses no evidence. There is deliberately no continue-on-error anywhere in this
+          # workflow.
+          if [ "${RC}" != "0" ]; then
+            echo "::error::probe exit ${RC} is not success; required measurements are not established by this run."
+            exit 1
+          fi
+          exit 0
 
       - name: Upload the probe result and stderr
         if: always()

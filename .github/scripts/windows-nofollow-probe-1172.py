@@ -8,7 +8,9 @@ documentation does not settle. It exists so the design stops resting on inferenc
   P0  a regular file opens through the designed CreateFileW flags, converts to a CRT fd,
       is non-inheritable, and is NOT truncated (invariant L2).
   P1  a symlink leaf is either detected on the converted handle or refused outright --
-      never silently followed to its target. Plus a directory-junction preflight.
+      never silently followed to its target. A directory junction is measured the same
+      way and is equally REQUIRED (Q15): both reparse shapes must be observed, and an
+      uncreatable fixture fails the run instead of passing quietly.
   P2  an ordinary directory at the lock leaf produces a refusal, with its EXACT Win32
       error recorded rather than guessed.
   P4  a byte-range lock taken with msvcrt.locking is actually released after the real
@@ -29,6 +31,13 @@ SAFETY SURFACE, deliberately closed:
   * Standard library only. No network, no install, no registry, no service, no host
     process enumeration, and the only process ever signalled is this probe's own direct
     child.
+  * One step DOES invoke a command interpreter, and that is stated plainly rather than
+    glossed: the junction fixture runs `cmd /c mklink /J` because `mklink` is a cmd.exe
+    builtin with no API equivalent here. It is a FIXED LITERAL command-interpreter
+    invocation whose operands are module-derived constants. `subprocess` is called with
+    shell=False, which means Python interpolates no shell string -- but cmd.exe is
+    itself an interpreter, so this file does NOT claim "no shell anywhere". No caller
+    input reaches it, because no caller input exists.
   * No symlink privilege is requested and Developer Mode is never enabled. Where a
     fixture cannot be created, that is recorded as an explicit NOTRUN gap -- never
     substituted, never reported as a success.
@@ -98,12 +107,18 @@ CHILD_MAX_HOLD_S = 150.0
 # ── Win32 constants, WITH PROVENANCE ────────────────────────────────────────────────
 # Values marked DOC appear verbatim in the frozen CreateFileW reference verified in
 # phase 3 (sha256 e41c7126db972d34854e54f614c444a57e6723a1e99a9bcca654208a3ab75c17).
-# Values marked UNCONFIRMED live in winnt.h, which was NOT in the supplied document
-# set; they are raised as Q12 for root. The constant table is emitted in the JSON
-# output so a wrong value is visible in the log instead of silently changing
-# behaviour -- and a wrong access mask fails loudly at the open rather than quietly.
-GENERIC_READ = 0x80000000   # UNCONFIRMED by supplied docs (winnt.h) -- Q12
-GENERIC_WRITE = 0x40000000  # UNCONFIRMED by supplied docs (winnt.h) -- Q12
+# Values marked GENERIC-ACCESS-RIGHTS were raised as Q12 while unconfirmed and are now
+# confirmed against the official Microsoft generic-access-rights reference
+# (learn.microsoft.com/en-us/windows/win32/secauthz/generic-access-rights), which
+# documents GENERIC_READ as 0x80000000 and GENERIC_WRITE as 0x40000000. The masks below
+# are unchanged by that confirmation. The reference's own caveat is kept rather than
+# dropped: these are GENERIC access-mask constants, and their object-specific mapping
+# remains an operating-system contract, so confirming the constant is not a claim about
+# what access a given object grants. The constant table is emitted in the JSON output so
+# a wrong value is visible in the log instead of silently changing behaviour -- and a
+# wrong access mask fails loudly at the open rather than quietly.
+GENERIC_READ = 0x80000000   # official generic-access-rights reference (Q12 confirmed)
+GENERIC_WRITE = 0x40000000  # official generic-access-rights reference (Q12 confirmed)
 FILE_SHARE_READ = 0x00000001           # DOC: dwShareMode table
 FILE_SHARE_WRITE = 0x00000002          # DOC: dwShareMode table
 OPEN_ALWAYS = 4                        # DOC: dwCreationDisposition table
@@ -115,8 +130,16 @@ FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000  # DOC: dwFlagsAndAttributes table
 # is what makes a directory or junction fail at the open, which is P2's whole point.
 
 CONSTANTS_USED = {
-    "GENERIC_READ": {"value": GENERIC_READ, "provenance": "winnt.h, UNCONFIRMED by supplied docs (Q12)"},
-    "GENERIC_WRITE": {"value": GENERIC_WRITE, "provenance": "winnt.h, UNCONFIRMED by supplied docs (Q12)"},
+    "GENERIC_READ": {
+        "value": GENERIC_READ,
+        "provenance": "official Microsoft generic-access-rights reference (Q12 confirmed); "
+                      "a GENERIC mask whose object-specific mapping stays an OS contract",
+    },
+    "GENERIC_WRITE": {
+        "value": GENERIC_WRITE,
+        "provenance": "official Microsoft generic-access-rights reference (Q12 confirmed); "
+                      "a GENERIC mask whose object-specific mapping stays an OS contract",
+    },
     "FILE_SHARE_READ": {"value": FILE_SHARE_READ, "provenance": "DOC CreateFileW dwShareMode"},
     "FILE_SHARE_WRITE": {"value": FILE_SHARE_WRITE, "provenance": "DOC CreateFileW dwShareMode"},
     "OPEN_ALWAYS": {"value": OPEN_ALWAYS, "provenance": "DOC CreateFileW dwCreationDisposition"},
@@ -479,14 +502,22 @@ def probe_p1(opener: Win32Opener) -> list:
             sym["note"] = "the target was modified or replaced during a no-follow open"
         results.append(sym)
 
-    # --- directory junction, recorded separately ---
-    jun = {"probe": "P1-junction", "required": False, "title": "directory junction leaf"}
+    # --- directory junction, recorded separately but REQUIRED (Q15) ---
+    # Promoted to required alongside the symlink: a junction needs no symlink privilege, so
+    # on a stock runner it is the more reliably creatable of the two reparse shapes, and
+    # leaving it optional would let the central reparse case go unmeasured while the run
+    # still reported success. An unavailable fixture is therefore a NOTRUN_GAP that fails
+    # the run, not a quiet skip.
+    jun = {"probe": "P1-junction", "required": True, "title": "directory junction leaf"}
     try:
         os.makedirs(P1_JUNCTION_TARGET, exist_ok=True)
         write_file(P1_JUNCTION_SENTINEL, JUNCTION_SENTINEL)
-        # A FIXED, bounded native command. Both operands are module-derived constants;
-        # mklink is a cmd builtin, so `cmd /c` is required. shell=False, argv list, no
-        # arbitrary operand source anywhere.
+        # A FIXED LITERAL command-interpreter invocation with module-derived operands,
+        # bounded by MKLINK_TIMEOUT_S. `mklink` is a cmd.exe builtin with no API
+        # equivalent available here, so `cmd /c` is required and this step really does
+        # start an interpreter -- shell=False stops Python interpolating a shell string,
+        # it does not make cmd.exe stop being one. Both operands are module-derived
+        # constants and there is no caller operand source anywhere in this file.
         proc = subprocess.run(
             ["cmd", "/c", "mklink", "/J", P1_JUNCTION, P1_JUNCTION_TARGET],
             capture_output=True,
@@ -512,6 +543,17 @@ def probe_p1(opener: Win32Opener) -> list:
         except OSError as exc:
             jun["target_sentinel_unchanged"] = False
             jun["target_read_error"] = str(exc)
+        jun_after = path_facts(P1_JUNCTION_TARGET)
+        jun["target_after"] = jun_after
+        jun["target_still_directory"] = bool(jun_after.get("is_dir_by_lstat"))
+        # Q15: a modified target is a CONTRADICTION, exactly as it already is for the
+        # symlink arm. Phase 4 recorded target_sentinel_unchanged here but never promoted
+        # it, which left the two reparse arms inconsistent.
+        if not jun.get("target_sentinel_unchanged") or not jun["target_still_directory"]:
+            jun["status"] = "CONTRADICTION"
+            jun["note"] = (
+                "the junction's target was modified or replaced during a no-follow open"
+            )
     else:
         jun["status"] = "NOTRUN_GAP"
         jun["reason"] = "junction_fixture_unavailable"
@@ -793,13 +835,18 @@ def cleanup() -> list:
 # ── aggregation ─────────────────────────────────────────────────────────────────────
 def overall_exit(observations: list) -> int:
     """A required measurement that contradicts the design outranks a gap. A probe that
-    merely refused everything cannot reach 0, because P0 is required and must succeed."""
+    merely refused everything cannot reach 0, because P0 is required and must succeed.
+
+    As of Q15 every probe in this file is required, so the non-required branch below is
+    currently unreachable. It is kept deliberately: it is the rule for any future probe
+    added as optional, and deleting it would invite the next author to assume optional
+    gaps fail the run."""
     contradiction = False
     gap = False
     for obs in observations:
         status = str(obs.get("status", "GAP_UNRECORDED"))
         if not obs.get("required"):
-            # A non-required probe can still report a contradiction; a gap in it cannot
+            # An optional probe can still report a contradiction; a gap in one cannot
             # fail the run.
             if status == "CONTRADICTION":
                 contradiction = True
