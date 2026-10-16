@@ -439,7 +439,13 @@ _wh_cmux_open() {
   # word-split a cwd containing a space. cli_cmd stays unquoted deliberately: it is a
   # COMMAND LINE (`claude --model … --effort …`), not a value, and must word-split.
   local CMUX_BIN="${CMUX:-cmux}"
-  local out ref q_cwd q_sid
+  local out ref q_cwd q_sid restart_arg
+  # Per-launch retry budget; 0 permits one child launch without automatic retries.
+  case "${AIGENTRY_WORKER_AUTO_RESTART-1}" in
+    1) restart_arg=' --auto-restart';;
+    0) restart_arg='';;
+    *) echo 'ERR AIGENTRY_WORKER_AUTO_RESTART must be 0 or 1' >&2; return 2;;
+  esac
   printf -v q_cwd '%q' "$cwd"; printf -v q_sid '%q' "$sid"
   # #507/#616: a worker workspace opens in the background (sidebar-visible, its own
   # foreground process) and never takes the operator's focus. A cmux that does not
@@ -449,7 +455,7 @@ _wh_cmux_open() {
     echo "ERR CMUX_NO_FOCUS_UNSUPPORTED: '$CMUX_BIN --help' does not advertise new-workspace --focus <true|false>; refusing to open a focus-stealing workspace for $sid (upgrade cmux)" >&2
     return 2
   fi
-  out=$("$CMUX_BIN" new-workspace --focus false --cwd "$cwd" --command "bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd' _ $q_cwd $q_sid" 2>&1)
+  out=$("$CMUX_BIN" new-workspace --focus false --cwd "$cwd" --command "bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\"$restart_arg $cli_cmd' _ $q_cwd $q_sid" 2>&1)
   ref=$(echo "$out" | grep -oE 'workspace:[0-9]+' | head -1)
   [ -z "$ref" ] && { echo "ERR cmux new-workspace failed: $out" >&2; return 2; }
   # title == sid (open-session.sh SID convention); rename to the stable handle.
