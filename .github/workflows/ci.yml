@@ -1,4 +1,4 @@
-name: Diagnostic exact-source authentication CI
+name: CI
 
 # #894. This file exists because the repo had no test-running CI at all, and the first
 # execution of release.yml — a tag push, at publish time — was therefore also the first
@@ -27,8 +27,9 @@ name: Diagnostic exact-source authentication CI
 # limitations are asserted as clean refusals, not skipped.
 
 on:
+  pull_request:
   push:
-    branches: [ validation/1238-auth-exact ]
+    branches: [ main ]
 
 permissions:
   contents: read
