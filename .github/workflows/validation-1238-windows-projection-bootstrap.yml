@@ -1,0 +1,289 @@
+name: Validation 1238 Windows projection bootstrap
+on:
+  push:
+    branches:
+      - validation/1238-windows-projection-bootstrap
+permissions:
+  contents: read
+jobs:
+  bootstrap:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Bounded native diagnostic
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $supervisor = Join-Path $env:RUNNER_TEMP ('bootstrap1238-supervisor-' + [Guid]::NewGuid().ToString('N') + '.cjs')
+          $source = @'
+          'use strict';
+          // One direct child. This is not descendant containment or outer-runner isolation.
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const os = require('node:os');
+          const crypto = require('node:crypto');
+          const { spawn } = require('node:child_process');
+          const started = Date.now();
+          const LIMIT = 256 * 1024;
+          const receipt = {
+            schema: 1, diagnosticOnly: true, nativeSafety: 'NOT_ESTABLISHED',
+            directChildOnly: true, outerRunnerIsolation: 'NOT_ESTABLISHED',
+            limitBytesPerStream: LIMIT, timeoutMs: 60000, events: [], cleanup: [],
+          };
+          let owned;
+          let privateDirs = [];
+          let childStarted = false;
+          function errorText(error) {
+            return { name: error.name, message: String(error.message).slice(0, 2048), code: error.code };
+          }
+          function hashFile(file) {
+            const fd = fs.openSync(file, 'r');
+            const digest = crypto.createHash('sha256');
+            const block = Buffer.alloc(64 * 1024);
+            try {
+              let size;
+              while ((size = fs.readSync(fd, block, 0, block.length, null)) > 0) {
+                digest.update(block.subarray(0, size));
+              }
+            } finally { fs.closeSync(fd); }
+            return digest.digest('hex');
+          }
+          function plainAbsolute(value) {
+            if (typeof value !== 'string' || value.length > 220 ||
+                !/^[A-Za-z]:\\[A-Za-z0-9_. -]+(?:\\[A-Za-z0-9_. -]+)*$/.test(value) ||
+                path.win32.normalize(value) !== value) {
+              throw new Error('Unsafe lexical path');
+            }
+            for (const part of value.slice(3).split('\\')) {
+              if (part === '.' || part === '..' || /[. ]$/.test(part) ||
+                  /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$/i.test(part)) {
+                throw new Error('Unsafe path component');
+              }
+            }
+            return value;
+          }
+          function resolvePython() {
+            // Existing PATH entries only; no directory enumeration, probes or install.
+            const entries = (process.env.PATH || '').split(';');
+            if (entries.length > 128) throw new Error('PATH bound');
+            const failures = [];
+            for (const entry of entries) {
+              if (!entry || !path.win32.isAbsolute(entry)) continue;
+              const candidate = path.join(entry, 'python.exe');
+              try {
+                const stat = fs.lstatSync(candidate);
+                if (!stat.isFile() || stat.isSymbolicLink()) continue;
+                const actual = fs.realpathSync.native(candidate);
+                receipt.pythonResolution = { candidate, resolved: actual, earlierFailures: failures };
+                return actual;
+              } catch (error) {
+                if (failures.length < 128) failures.push({ candidate, error: errorText(error) });
+                if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error;
+              }
+            }
+            receipt.pythonResolution = { earlierFailures: failures };
+            throw new Error('No existing python.exe in PATH');
+          }
+          async function supervise(python, script, root, env) {
+            if (childStarted) throw new Error('Second child forbidden');
+            childStarted = true;
+            return await new Promise((resolve) => {
+              const chunks = { stdout: [], stderr: [] };
+              const bytes = { stdout: 0, stderr: 0 };
+              const pipes = {
+                stdout: { end: false, close: false, errors: [] },
+                stderr: { end: false, close: false, errors: [] },
+              };
+              let timeout = false, overflow = false, killAttempted = false;
+              let timer, settleTimer;
+              let settled = false;
+              let exitSeen = false, closeSeen = false;
+              let child;
+              const event = (type, facts = {}) => {
+                // Event types occur a bounded number of times; data chunks are not events.
+                if (receipt.events.length < 64) {
+                  receipt.events.push({ type, elapsedMs: Date.now() - started, ...facts });
+                } else {
+                  receipt.eventOverflow = true;
+                }
+              };
+              function stop(reason) {
+                if (killAttempted) return;
+                killAttempted = true;
+                try { event('kill', { reason, result: child.kill('SIGKILL') }); }
+                catch (error) { event('kill-error', { reason, error: errorText(error) }); }
+                // Do not allow an inherited pipe or failed kill to keep the supervisor alive forever.
+                settleTimer = setTimeout(() => {
+                  event('close-deadline');
+                  child.stdout.destroy();
+                  child.stderr.destroy();
+                  child.unref();
+                  finish(null, null, 'direct-close-not-observed');
+                }, 5000);
+              }
+              function finish(code, signal, failure) {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                clearTimeout(settleTimer);
+                const streams = {};
+                for (const name of ['stdout', 'stderr']) {
+                  const raw = Buffer.concat(chunks[name]);
+                  streams[name] = { bytesObserved: bytes[name], bytesRetained: raw.length,
+                                    sha256: crypto.createHash('sha256').update(raw).digest('hex'),
+                                    rawBase64: raw.toString('base64'), ...pipes[name] };
+                }
+                receipt.child = { code, signal, failure, timeout, overflow, exitSeen, closeSeen,
+                                  streams, elapsedMs: Date.now() - started };
+                const good = code === 0 && signal === null && exitSeen && closeSeen &&
+                  !failure && !timeout && !overflow && !receipt.eventOverflow &&
+                  !receipt.spawnError &&
+                  Object.values(pipes).every(p => p.end && p.close && p.errors.length === 0);
+                resolve(good);
+              }
+              try {
+                const argv = ['-I', '-B', script, root];
+                receipt.childRequest = { executable: python, argv, cwd: owned,
+                                         environment: env };
+                child = spawn(python, argv, { cwd: owned, env, shell: false, windowsHide: true,
+                                             stdio: ['ignore', 'pipe', 'pipe'] });
+              } catch (error) {
+                receipt.spawnError = errorText(error);
+                finish(null, null, 'spawn-threw');
+                return;
+              }
+              for (const name of ['stdout', 'stderr']) {
+                const stream = child[name];
+                stream.on('data', data => {
+                  const old = bytes[name];
+                  bytes[name] += data.length;
+                  if (old < LIMIT) chunks[name].push(data.subarray(0, LIMIT - old));
+                  if (bytes[name] > LIMIT) {
+                    overflow = true;
+                    stop(name + '-overflow');
+                  }
+                });
+                stream.on('end', () => { pipes[name].end = true; event(name + '-end'); });
+                stream.on('close', () => { pipes[name].close = true; event(name + '-close'); });
+                stream.on('error', error => {
+                  pipes[name].errors.push(errorText(error));
+                  event(name + '-error', { error: errorText(error) });
+                  stop(name + '-error');
+                });
+              }
+              child.on('spawn', () => event('spawn', { pid: child.pid }));
+              child.on('error', error => {
+                receipt.spawnError = errorText(error);
+                event('child-error', { error: errorText(error) });
+                stop('child-error');
+              });
+              child.on('exit', (code, signal) => {
+                exitSeen = true;
+                event('exit', { code, signal });
+              });
+              child.on('close', (code, signal) => {
+                closeSeen = true;
+                event('close', { code, signal });
+                finish(code, signal);
+              });
+              timer = setTimeout(() => {
+                timeout = true;
+                event('timeout');
+                stop('timeout');
+              }, 60000);
+            });
+          }
+          async function main() {
+            let good = false;
+            try {
+              if (process.platform !== 'win32') throw new Error('Windows required');
+              const temp = plainAbsolute(process.env.RUNNER_TEMP);
+              const tempStat = fs.lstatSync(temp);
+              if (!tempStat.isDirectory() || tempStat.isSymbolicLink()) throw new Error('Runner temp type');
+              owned = fs.mkdtempSync(path.join(temp, 'bootstrap1238-'));
+              plainAbsolute(owned);
+              const root = path.join(owned, 'fixture');
+              if (root.length > 180) throw new Error('Fixture root bound');
+              privateDirs = ['home', 'profile', 'xdg-config', 'xdg-cache', 'xdg-data', 'temp']
+                .map(name => path.join(owned, name));
+              for (const directory of privateDirs) fs.mkdirSync(directory);
+              const systemRoot = plainAbsolute(process.env.SystemRoot || process.env.SYSTEMROOT);
+              const env = {
+                SystemRoot: systemRoot, WINDIR: systemRoot,
+                HOME: privateDirs[0], USERPROFILE: privateDirs[1],
+                XDG_CONFIG_HOME: privateDirs[2], XDG_CACHE_HOME: privateDirs[3],
+                XDG_DATA_HOME: privateDirs[4], TEMP: privateDirs[5], TMP: privateDirs[5],
+              };
+              const workspace = fs.realpathSync.native(plainAbsolute(process.env.GITHUB_WORKSPACE));
+              const candidate = path.join(workspace, 'tests', 'dispatch', 'windows-projection-bootstrap.test.py');
+              const stat = fs.lstatSync(candidate);
+              if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Script type');
+              const script = fs.realpathSync.native(candidate);
+              if (script !== candidate) throw new Error('Script lexical identity');
+              const python = resolvePython();
+              receipt.runtime = {
+                node: { executable: process.execPath, resolved: fs.realpathSync.native(process.execPath),
+                        sha256: hashFile(process.execPath), versions: process.versions },
+                python: { executable: python, sha256: hashFile(python) },
+                script: { path: script, sha256: hashFile(script) },
+                os: { type: os.type(), release: os.release(), version: os.version(), arch: os.arch() },
+                root, childPrivateEnvironment: true,
+              };
+              good = await supervise(python, script, root, env);
+            } catch (error) {
+              receipt.supervisorError = errorText(error);
+            } finally {
+              // Known directories only; never recurse into fixture residues or reparse points.
+              for (const directory of privateDirs.slice().reverse()) {
+                try {
+                  fs.rmdirSync(directory);
+                  receipt.cleanup.push({ path: directory, removed: true });
+                } catch (error) {
+                  good = false;
+                  receipt.cleanup.push({ path: directory, removed: false, error: errorText(error) });
+                }
+              }
+              if (owned) {
+                try {
+                  fs.rmdirSync(owned);
+                  receipt.cleanup.push({ path: owned, removed: true });
+                } catch (error) {
+                  good = false;
+                  receipt.cleanup.push({ path: owned, removed: false, error: errorText(error) });
+                }
+              }
+            }
+            receipt.ok = good;
+            receipt.elapsedMs = Date.now() - started;
+            // At most 512KiB raw streams, encoded once; no artifacts or inherited secrets.
+            const serialized = JSON.stringify(receipt);
+            const segments = Math.ceil(serialized.length / 4096);
+            for (let n = 0; n < segments; n++) {
+              process.stdout.write(JSON.stringify({ receiptSegment: n, segments,
+                text: serialized.slice(n * 4096, (n + 1) * 4096) }) + '\n');
+            }
+            process.exitCode = good ? 0 : 1;
+          }
+          main().catch(error => {
+            process.stdout.write(JSON.stringify({ fatal: errorText(error), ok: false }) + '\n');
+            process.exitCode = 1;
+          });
+          '@
+          $exitCode = 1
+          try {
+            [IO.File]::WriteAllText($supervisor, $source, [Text.UTF8Encoding]::new($false))
+            & node $supervisor
+            $exitCode = $LASTEXITCODE
+          } finally {
+            try {
+              Remove-Item -LiteralPath $supervisor -ErrorAction Stop
+            } catch {
+              Write-Output ('supervisor-source-cleanup-error: ' + $_.Exception.Message)
+              $exitCode = 1
+            }
+          }
+          exit $exitCode
