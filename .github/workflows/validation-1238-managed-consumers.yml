@@ -331,4 +331,4 @@ jobs:
             AIGENTRY_STATUS_TEST_PYTHON_SHA256="$selected_python_sha256" \
             AIGENTRY_STATUS_TEST_OLD_CLI="$AIGENTRY_STATUS_TEST_OLD_CLI" \
             AIGENTRY_STATUS_TEST_OLD_CLI_SHA256="$AIGENTRY_STATUS_TEST_OLD_CLI_SHA256" \
-            PATH=/usr/bin:/bin "$NODE_EXECUTABLE" --test --test-concurrency=1 dist/tests/dispatch/registry-status-projection.test.js dist/tests/tracker/status-json.test.js
+            PATH=/usr/bin:/bin "$NODE_EXECUTABLE" --test --test-concurrency=1 dist/tests/dispatch/registry-status-projection.test.js dist/tests/tracker/status-json.test.js tests/report/intermediate-report-review.test.mjs

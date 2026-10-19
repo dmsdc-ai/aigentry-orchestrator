@@ -71,8 +71,22 @@ Every notice ends with the exact `report-ack` line to run. Verdicts:
 | `observed` `delivery_result` | the receiver's audit row for that inject | a review |
 | `review` | your ACK | — |
 
-Only an **accepted current REPORT** resolves a dispatch to `done`. `rework`
-waits for the next REPORT number; a lower or older number is `superseded` and
+Only an **accepted current REPORT**, with no pending HOLD or failure review,
+resolves the report obligation to `done`; task/release completion is separate.
+Leave preliminary acknowledgments and amendment-only REPORTs **unreviewed**.
+Accept the final scoped REPORT only after reviewing its evidence and exact
+captured hash. There is no REPORT `seen`/progress verdict; `rework` requests
+revised work, not receipt acknowledgment. An unreviewed preliminary REPORT
+allows a later REPORT to become current-final and supersede it.
+
+Accepting a preliminary REPORT with nothing else pending makes the obligation
+`done`. Both default and sid capture selection exclude `done`, and the pump's
+scan predicate independently rejects it: later valid outbox files are not
+captured. File preservation, a notice or `report-sweep` recovery does not reopen
+that obligation or establish acceptance. Do not repair historical rows or
+widen terminal scanning to treat those files as captured evidence.
+
+`rework` waits for the next REPORT number; a lower or older number is `superseded` and
 an ACK naming it is refused (`STALE_SUBJECT`, exit 4). A HOLD is reviewed
 independently. A worker that exits, dies, disappears, is cleaned up or misses
 its deadline without a REPORT raises a **failure notice** (`exited`, `dead`,
@@ -91,7 +105,8 @@ until each is ACKed `seen`. Retired history is never notified.
 
 ## Cleanup
 
-`session-cleanup.sh` captures every complete item of the session first. If a
+`session-cleanup.sh` first captures complete items from eligible report
+obligations for the session; terminal `done` obligations are excluded. If a
 capture fails it **refuses** the cleanup (exit 1) and preserves the worker files
 and registry records; there is no override flag. A cleanup with no REPORT
 captured records a `cleaned` failure. `prune` never removes a record whose
