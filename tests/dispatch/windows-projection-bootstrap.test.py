@@ -330,6 +330,11 @@ def run_case(api, root, number, positive):
             mutator = api.open(src, access[number], SHARE_ALL, "mutator")
             if mutator is not None:
                 same(api.info(mutator, "mutator"), identities[src], "mutator")
+        if number == 9:
+            api.event("C09-open-only", pin_open=pin is not None,
+                      mutator_open=mutator is not None)
+            record["status"] = "observed" if mutator is not None else "observed-open-denial"
+            return False  # C09 has no mutation stimulus; finally still cleans up.
         if number == 12:
             require(pin, "C12 pin")
             before = api.observe(src + "\\marker", "marker-path-before-delete")
