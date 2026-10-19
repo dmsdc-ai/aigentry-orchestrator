@@ -925,7 +925,7 @@ function parseStatusJsonl(out: Buffer, limit: number, since: number | null): Rec
   const h = parseObjectLine(lines[0]!);
   if (!h || !hasExactKeys(h, STATUS_JSON_HEADER)) return null;
   const { generation, unchanged, matching, oversize, more, next_after: nextAfter, rows: count } = h;
-  if (h.v !== 1 || !isCount(generation) || typeof unchanged !== "boolean" || !isCount(matching)) return null;
+  if ((h.v !== 1 && h.v !== 2) || !isCount(generation) || typeof unchanged !== "boolean" || !isCount(matching)) return null;
   if (!isCount(oversize) || typeof more !== "boolean" || !isCount(count)) return null;
   if (nextAfter !== null && !(typeof nextAfter === "string" && STATUS_JSON_CURSOR.test(nextAfter))) return null;
   if (count > limit || count > matching || lines.length !== count + 1 || more !== (nextAfter !== null)) return null;
@@ -944,8 +944,10 @@ function parseStatusJsonl(out: Buffer, limit: number, since: number | null): Rec
     rows.push(row);
   }
   return {
-    v: 1, generation, unchanged, rows, more, next_after: nextAfter, matching, oversize,
-    read_bound_bytes: STATUS_JSON_READ_BOUND, scan: "full", evidence: "registry-observation", completion_fact: null,
+    v: h.v, generation, unchanged, rows, more, next_after: nextAfter, matching, oversize,
+    read_bound_bytes: STATUS_JSON_READ_BOUND, scan: h.v === 1 ? "full" : "projection-full",
+    ...(h.v === 2 ? { validation: "commit-bound-projection" } : {}),
+    evidence: "registry-observation", completion_fact: null,
   };
 }
 
