@@ -1,0 +1,94 @@
+name: Validation 1238 managed consumers
+
+"on":
+  push:
+    branches: [validation/1238-managed-consumers]
+
+permissions:
+  contents: read
+
+jobs:
+  managed-consumers:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash --noprofile --norc -e -o pipefail {0}
+    env:
+      NODE_OPTIONS: ""
+      BASH_ENV: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.20.0
+      - name: Prepare private runtime and record identity
+        run: |
+          umask 077
+          selected_node="$(command -v node)"
+          selected_npm="$(command -v npm)"
+          case "$selected_node:$selected_npm" in /*:/*) ;; *) exit 1 ;; esac
+          runner_temp="$(cd "$RUNNER_TEMP" && pwd -P)"
+          checkout="$(pwd -P)"
+          case "$runner_temp/" in "$checkout/"*) exit 1 ;; esac
+          runtime="$(mktemp -d "$runner_temp/managed-consumers.XXXXXXXX")"
+          chmod 0700 "$runtime"
+          mkdir -m 0700 "$runtime/home" "$runtime/tmp" "$runtime/config" \
+            "$runtime/cache" "$runtime/data" "$runtime/npm-cache"
+          : > "$runtime/npm-user.rc"
+          : > "$runtime/npm-global.rc"
+          {
+            printf "NODE_EXECUTABLE=%s\nNPM_CLI=%s\n" "$selected_node" "$selected_npm"
+            printf "HOME=%s\nUSERPROFILE=%s\n" "$runtime/home" "$runtime/home"
+            printf "XDG_CONFIG_HOME=%s\nXDG_CACHE_HOME=%s\nXDG_DATA_HOME=%s\n" \
+              "$runtime/config" "$runtime/cache" "$runtime/data"
+            printf "TMPDIR=%s\nnpm_config_cache=%s\n" "$runtime/tmp" "$runtime/npm-cache"
+            printf "npm_config_userconfig=%s\nnpm_config_globalconfig=%s\n" \
+              "$runtime/npm-user.rc" "$runtime/npm-global.rc"
+          } >> "$GITHUB_ENV"
+          printf "Runner: %s; event commit: %s\n" "$RUNNER_OS" "$GITHUB_SHA"
+          /usr/bin/git rev-parse HEAD
+          env -i PATH=/usr/bin:/bin "$selected_node" --version
+      - name: Install locked dependencies without scripts
+        run: |
+          umask 077
+          env -i HOME="$HOME" USERPROFILE="$USERPROFILE" \
+            XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+            XDG_DATA_HOME="$XDG_DATA_HOME" TMPDIR="$TMPDIR" \
+            PATH="$(dirname "$NODE_EXECUTABLE"):/usr/bin:/bin" \
+            npm_config_cache="$npm_config_cache" \
+            npm_config_userconfig="$npm_config_userconfig" \
+            npm_config_globalconfig="$npm_config_globalconfig" \
+            "$NODE_EXECUTABLE" "$NPM_CLI" ci --ignore-scripts --no-audit --no-fund
+      - name: Compile original TypeScript
+        id: build
+        run: |
+          umask 077
+          test ! -e dist
+          test ! -L dist
+          env -i HOME="$HOME" USERPROFILE="$USERPROFILE" \
+            XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+            XDG_DATA_HOME="$XDG_DATA_HOME" TMPDIR="$TMPDIR" \
+            PATH=/usr/bin:/bin "$NODE_EXECUTABLE" node_modules/typescript/bin/tsc -p .
+      - name: Worker tool admission
+        run: |
+          umask 077
+          env -i HOME="$HOME" USERPROFILE="$USERPROFILE" \
+            XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+            XDG_DATA_HOME="$XDG_DATA_HOME" TMPDIR="$TMPDIR" \
+            PATH=/usr/bin:/bin "$NODE_EXECUTABLE" --test dist/tests/session/worker-tool-admission.test.js
+      - name: Worker sandbox providers
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          umask 077
+          env -i HOME="$HOME" USERPROFILE="$USERPROFILE" \
+            XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+            XDG_DATA_HOME="$XDG_DATA_HOME" TMPDIR="$TMPDIR" \
+            PATH=/usr/bin:/bin "$NODE_EXECUTABLE" --test dist/tests/session/worker-sandbox-providers.test.js
