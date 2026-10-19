@@ -100,3 +100,12 @@ jobs:
             XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
             XDG_DATA_HOME="$XDG_DATA_HOME" TMPDIR="$TMPDIR" \
             PATH=/usr/bin:/bin "$NODE_EXECUTABLE" --test --test-concurrency=1 dist/tests/release-benchmark/contracts.test.js dist/tests/release-benchmark/compare.test.js dist/tests/release-benchmark/cli.test.js
+      - name: Ordinary init first-parent prewrite regression
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          umask 077
+          env -i HOME="$HOME" USERPROFILE="$USERPROFILE" \
+            XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+            XDG_DATA_HOME="$XDG_DATA_HOME" TMPDIR="$TMPDIR" \
+            AIGENTRY_PREWRITE_FIXTURE_ROOT="$HOME" \
+            PATH=/usr/bin:/bin "$NODE_EXECUTABLE" --test --test-concurrency=1 tests/packaging/legacy-init-prewrite.test.mjs
