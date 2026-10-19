@@ -109,6 +109,172 @@ jobs:
             XDG_DATA_HOME="$XDG_DATA_HOME" TMPDIR="$TMPDIR" \
             AIGENTRY_PREWRITE_FIXTURE_ROOT="$HOME" \
             PATH=/usr/bin:/bin "$NODE_EXECUTABLE" --test --test-concurrency=1 tests/packaging/legacy-init-prewrite.test.mjs
+      - name: Checkout pinned old status source
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: actions/checkout@v4
+        with:
+          ref: 340f5f6472a8bb1131c305cbf46dc8b490185aaa
+          persist-credentials: false
+          path: .ci-old-status-340f5f6
+      - name: Admit complete old status closure
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          umask 077
+          old_receipts="$(mktemp -d "$TMPDIR/old-status.XXXXXXXX")"
+          env -i HOME="$HOME" USERPROFILE="$USERPROFILE" \
+            XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+            XDG_DATA_HOME="$XDG_DATA_HOME" TMPDIR="$TMPDIR" \
+            PATH=/usr/bin:/bin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+            GIT_OPTIONAL_LOCKS=0 \
+            STATUS_CANDIDATE_ROOT="$(pwd -P)" STATUS_OLD_RECEIPTS="$old_receipts" \
+            STATUS_ENV_FILE="$GITHUB_ENV" \
+            "$NODE_EXECUTABLE" --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const assert = require('node:assert/strict');
+          const { createHash } = require('node:crypto');
+          const { spawn, spawnSync } = require('node:child_process');
+          const sha = bytes => createHash('sha256').update(bytes).digest('hex');
+          const candidate = process.env.STATUS_CANDIDATE_ROOT;
+          const receipts = process.env.STATUS_OLD_RECEIPTS;
+          const envFile = process.env.STATUS_ENV_FILE;
+          for (const value of [candidate, receipts, envFile]) {
+            assert(value && path.isAbsolute(value) && !/[\r\n\t]/.test(value));
+            assert.equal(fs.realpathSync(value), value);
+          }
+          const old = path.join(candidate, '.ci-old-status-340f5f6');
+          assert.equal(fs.realpathSync(old), old);
+          assert(fs.lstatSync(old).isDirectory());
+          const env = {};
+          for (const key of ['HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME',
+            'XDG_DATA_HOME', 'TMPDIR', 'PATH', 'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_OPTIONAL_LOCKS']) {
+            assert(process.env[key]);
+            env[key] = process.env[key];
+          }
+          const save = (name, value) => fs.writeFileSync(path.join(receipts, name),
+            JSON.stringify(value, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+          let gitSequence = 0;
+          function git(args) {
+            const start = process.hrtime.bigint();
+            const result = spawnSync('/usr/bin/git', args, { cwd: old, env, shell: false,
+              timeout: 10000, killSignal: 'SIGKILL', maxBuffer: 1048576, encoding: 'utf8',
+              stdio: ['ignore', 'pipe', 'pipe'] });
+            const receipt = { executable: '/usr/bin/git', args, cwd: old, env,
+              status: result.status, signal: result.signal, error: result.error?.message ?? null,
+              elapsedMs: Number(process.hrtime.bigint() - start) / 1e6,
+              stdout: result.stdout, stderr: result.stderr };
+            save(`git-${++gitSequence}.json`, receipt);
+            console.log(JSON.stringify(receipt));
+            assert.ifError(result.error);
+            assert.equal(result.signal, null);
+            assert.equal(result.status, 0);
+            return result.stdout;
+          }
+          async function main() {
+            assert.equal(git(['rev-parse', 'HEAD']).trim(), '340f5f6472a8bb1131c305cbf46dc8b490185aaa');
+            git(['diff', '--exit-code', 'HEAD', '--']);
+            const lock = fs.readFileSync(path.join(candidate, 'package-lock.json'));
+            assert(lock.equals(fs.readFileSync(path.join(old, 'package-lock.json'))));
+            const dependencies = path.join(candidate, 'node_modules');
+            assert(fs.lstatSync(dependencies).isDirectory());
+            for (const name of ['node_modules', 'dist']) {
+              assert(!fs.readdirSync(old).includes(name), `old ${name} must be absent`);
+            }
+            fs.symlinkSync(dependencies, path.join(old, 'node_modules'), 'dir');
+            const compiler = fs.realpathSync(path.join(dependencies, 'typescript/bin/tsc'));
+            assert(fs.lstatSync(compiler).isFile());
+            const executable = process.execPath;
+            const argv = [compiler, '-p', '.'];
+            const streams = Object.fromEntries(['stdout', 'stderr'].map(name => [name,
+              { bytes: 0, retainedBytes: 0, chunks: [], eof: false, closed: false, error: null }]));
+            const start = process.hrtime.bigint();
+            let timedOut = false, overflow = false, error = null, exit = null, closed = false;
+            const child = spawn(executable, argv, { cwd: old, env, shell: false,
+              stdio: ['ignore', 'pipe', 'pipe'] });
+            function stop() {
+              child.kill('SIGKILL');
+              child.stdout.destroy();
+              child.stderr.destroy();
+            }
+            const timer = setTimeout(() => { timedOut = true; stop(); }, 60000);
+            for (const name of ['stdout', 'stderr']) {
+              const stream = streams[name];
+              child[name].on('data', chunk => {
+                stream.bytes += chunk.length;
+                const retained = chunk.subarray(0, Math.max(0, 1048576 - stream.retainedBytes));
+                stream.chunks.push(retained);
+                stream.retainedBytes += retained.length;
+                if (stream.bytes > 1048576) { overflow = true; stop(); }
+              });
+              child[name].on('end', () => { stream.eof = true; });
+              child[name].on('close', () => { stream.closed = true; });
+              child[name].on('error', e => { stream.error = e.message; stop(); });
+            }
+            child.on('error', e => { error = { message: e.message, code: e.code ?? null }; });
+            child.on('exit', (status, signal) => { exit = { status, signal }; });
+            const result = await new Promise(resolve => child.on('close', (status, signal) => {
+              closed = true;
+              clearTimeout(timer);
+              resolve({ status, signal });
+            }));
+            const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
+            const output = {};
+            for (const name of ['stdout', 'stderr']) {
+              const { chunks, ...counts } = streams[name];
+              const bytes = Buffer.concat(chunks);
+              fs.writeFileSync(path.join(receipts, 'compile.' + name), bytes, { flag: 'wx', mode: 0o600 });
+              output[name] = { ...counts, text: bytes.toString('utf8') };
+            }
+            const receipt = { executable, nodeSha256: sha(fs.readFileSync(executable)), argv,
+              compilerSha256: sha(fs.readFileSync(compiler)), lockSha256: sha(lock), cwd: old, env,
+              ...result, error, elapsedMs, timeoutMs: 60000, perStreamLimit: 1048576,
+              timedOut, overflow, directChildExit: exit, directChildClose: closed, ...output };
+            save('compile.json', receipt);
+            console.log(JSON.stringify(receipt));
+            assert.equal(error, null);
+            assert(!timedOut && !overflow && elapsedMs <= 60000);
+            assert.equal(result.status, 0);
+            assert.equal(result.signal, null);
+            assert.deepEqual(exit, { status: 0, signal: null });
+            assert(closed);
+            for (const stream of Object.values(streams)) {
+              assert(stream.eof && stream.closed && stream.error === null);
+            }
+            git(['diff', '--exit-code', 'HEAD', '--']);
+            const dist = path.join(old, 'dist');
+            assert(fs.lstatSync(dist).isDirectory());
+            const rows = [];
+            function inventory(relative) {
+              const full = path.join(dist, relative);
+              const stat = fs.lstatSync(full);
+              if (stat.isDirectory()) {
+                for (const name of fs.readdirSync(full)) inventory(relative + '/' + name);
+              } else {
+                assert(stat.isFile(), `non-regular old closure entry: ${relative}`);
+                rows.push({ path: relative, size: stat.size, sha256: sha(fs.readFileSync(full)) });
+              }
+            }
+            inventory('src');
+            rows.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+            const canonicalSha256 = sha(Buffer.from(JSON.stringify(rows), 'utf8'));
+            const cli = path.join(dist, 'src/tracker/cli.js');
+            assert.equal(fs.realpathSync(cli), cli);
+            assert(fs.lstatSync(cli).isFile());
+            const cliSha256 = sha(fs.readFileSync(cli));
+            const closure = { source: '340f5f6472a8bb1131c305cbf46dc8b490185aaa',
+              files: rows.length, bytes: rows.reduce((sum, row) => sum + row.size, 0),
+              canonicalSha256, cli, cliSha256, rows };
+            save('closure.json', closure);
+            console.log(JSON.stringify({ ...closure, rows: undefined }));
+            assert.equal(closure.files, 405);
+            assert.equal(closure.bytes, 3245052);
+            assert.equal(canonicalSha256, 'c19571bd59b376175b72d68b3d25c3038dedb1005f81adae5dcdc1d946d2968d');
+            assert.equal(cliSha256, '434ba6d8012b945a257577c01ba736279217a3a0b5042377f38af052ef8ac24a');
+            // Direct-child receipts do not establish descendant containment; legacy tests retain their own bounds.
+            fs.appendFileSync(envFile, `AIGENTRY_STATUS_TEST_OLD_CLI=${cli}\nAIGENTRY_STATUS_TEST_OLD_CLI_SHA256=${cliSha256}\n`);
+          }
+          main().catch(error => { console.error(error); process.exitCode = 1; });
+          NODE
       - name: Retained-history bounded status regression
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 5
@@ -163,4 +329,6 @@ jobs:
             AIGENTRY_STATUS_TEST_ROOT="$status_root" \
             AIGENTRY_STATUS_TEST_PYTHON="$selected_python" \
             AIGENTRY_STATUS_TEST_PYTHON_SHA256="$selected_python_sha256" \
-            PATH=/usr/bin:/bin "$NODE_EXECUTABLE" --test --test-concurrency=1 dist/tests/dispatch/registry-status-projection.test.js
+            AIGENTRY_STATUS_TEST_OLD_CLI="$AIGENTRY_STATUS_TEST_OLD_CLI" \
+            AIGENTRY_STATUS_TEST_OLD_CLI_SHA256="$AIGENTRY_STATUS_TEST_OLD_CLI_SHA256" \
+            PATH=/usr/bin:/bin "$NODE_EXECUTABLE" --test --test-concurrency=1 dist/tests/dispatch/registry-status-projection.test.js dist/tests/tracker/status-json.test.js
