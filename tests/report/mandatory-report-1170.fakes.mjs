@@ -6,9 +6,9 @@
 //     (dispatch-registry.py, dispatch-tracker.sh, session-probe.py, policy.py) → exec real path.
 //   DRIVER role prepare-sandbox: the REAL compiled prepareWorkerSandbox with explicit controlRoots
 //     (argv[2] = JSON), in the hermetic env it was spawned with. Prints {ok, result|error}.
-// Every call is appended to $MR_LOG as {role, argv, rc, …}. Anything the scenario does not
-// cover → unexpected, exit 97. Scenario: $MR_SCENARIO (JSON, re-read on every call so a
-// test can change it between passes).
+// Calls use worldKit-owned launcher paths/config, or $MR_LOG/$MR_SCENARIO for direct
+// legacy roles. Anything the scenario does not cover → unexpected, exit 97.
+// Scenario JSON is re-read on every call so a test can change it between passes.
 //
 // Imported as a module (not executed) it exports worldKit(): the hermetic world builder the
 // #1170 lifecycle and security suites share — real registry, real tracker CLI, these fakes.
@@ -21,7 +21,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const SELF = fileURLToPath(import.meta.url);
 const isMain = (() => { try { return fs.realpathSync(process.argv[1] ?? "") === SELF; } catch { return false; } })();
 
-async function fakeMain() {
+export async function fakeMain(owned) {
+  const scenarioFile = owned ? owned.scenario : process.env.MR_SCENARIO;
+  const log = owned ? owned.log : process.env.MR_LOG;
+  const dist = owned ? owned.dist : process.env.MR_DIST;
   const role = path.basename(process.argv[1]);
   const argv = process.argv.slice(2);
 
@@ -49,7 +52,7 @@ async function fakeMain() {
     const a = JSON.parse(argv[0]);
     const { prepareSandboxFixture } = await import("../dispatch/agent-metadata/support/prepare-sandbox.mjs");
     try {
-      const r = await prepareSandboxFixture({ ...a, launch: undefined }, process.env.MR_DIST, a.controlRoots);
+      const r = await prepareSandboxFixture({ ...a, launch: undefined }, dist, a.controlRoots);
       process.stdout.write(JSON.stringify({ ok: true, result: r }) + "\n");
     } catch (e) {
       process.stdout.write(JSON.stringify({ ok: false, error: String(e?.message ?? e) }) + "\n");
@@ -57,11 +60,11 @@ async function fakeMain() {
     process.exit(0);
   }
 
-  const s = JSON.parse(fs.readFileSync(process.env.MR_SCENARIO, "utf8"));
+  const s = JSON.parse(fs.readFileSync(scenarioFile, "utf8"));
   const rec = { role, argv };
   const done = (code, out = "") => {
     rec.rc = code;
-    fs.appendFileSync(process.env.MR_LOG, JSON.stringify(rec) + "\n");
+    fs.appendFileSync(log, JSON.stringify(rec) + "\n");
     if (out) process.stdout.write(out);
     process.exit(code);
   };
@@ -70,13 +73,15 @@ async function fakeMain() {
 
   const real = s.passthrough?.[role];
   if (real) {
+    if (owned && (role !== "dispatch-registry.py" || real !== owned.registry ||
+        process.env.DISPATCH_STATE_DIR !== owned.stateDir)) unexpected();
     let input;
     if (role === "policy.py") {
       try { input = fs.readFileSync(0, "utf8"); } catch { input = ""; }
       rec.stdin = input;
     }
     // Log BEFORE exec so a hung child still leaves its argv in the trace.
-    fs.appendFileSync(process.env.MR_LOG, JSON.stringify({ ...rec, phase: "start" }) + "\n");
+    fs.appendFileSync(log, JSON.stringify({ ...rec, phase: "start" }) + "\n");
     const r = spawnSync(real, argv, {
       stdio: [input === undefined ? "inherit" : "pipe", "inherit", "inherit"],
       ...(input === undefined ? {} : { input }),
@@ -87,7 +92,7 @@ async function fakeMain() {
 
   /** Next value of a per-log counter (one file per counter name). */
   function nextCount(name) {
-    const f = `${process.env.MR_LOG}.${name}`;
+    const f = `${log}.${name}`;
     let n = 0;
     try { n = Number(fs.readFileSync(f, "utf8")) || 0; } catch { /* first */ }
     fs.writeFileSync(f, String(n + 1));
@@ -137,13 +142,18 @@ async function fakeMain() {
         if (reply.crash) {
           // Simulated broker crash between the registry claim and the result.
           // Only the direct pump child spawned by this fixture may be signaled.
-          const proofFile = process.env.MR_OWNED_PUMP_PID_FILE;
-          const nonce = process.env.MR_OWNED_PUMP_NONCE;
+          let control;
+          try {
+            control = owned ? JSON.parse(fs.readFileSync(owned.pumpControl, "utf8")) : {
+              proofFile: process.env.MR_OWNED_PUMP_PID_FILE, nonce: process.env.MR_OWNED_PUMP_NONCE,
+            };
+          } catch { unexpected(); }
+          const { proofFile, nonce } = control;
           if (!proofFile || !nonce) unexpected();
           let proof;
           try { proof = JSON.parse(fs.readFileSync(proofFile, "utf8")); } catch { unexpected(); }
           if (!Number.isSafeInteger(proof.pid) || proof.pid !== process.ppid || proof.nonce !== nonce) unexpected();
-          fs.appendFileSync(process.env.MR_LOG, JSON.stringify({ ...rec, crash: true }) + "\n");
+          fs.appendFileSync(log, JSON.stringify({ ...rec, crash: true }) + "\n");
           process.kill(proof.pid, "SIGKILL");
           sleep(200);
           process.exit(137);
@@ -245,18 +255,27 @@ export function worldKit(H) {
     const trace = privDir(path.join(run.dir, "trace"));
     const bin = privDir(path.join(run.dir, "bin"));
     privDir(path.join(bin, "lib"));
-    fs.symlinkSync(SELF, path.join(bin, "wh-cli.sh"));
     writePriv(path.join(bin, "lib", "telepty-listing.sh"),
       "telepty_listing_trusted() { return 0; }\ntelepty_sid_live() { return 0; }\n", 0o644);
     writePriv(path.join(bin, "lib", "telepty-auth.sh"), "telepty_auth_token() { echo ''; }\n", 0o644);
-    for (const name of ["telepty", "cmux", "ps", "curl", "git", "jq"]) fs.symlinkSync(SELF, path.join(run.fakes, name));
     fs.symlinkSync(onPath("python3"), path.join(run.fakes, "python3"));
-    fs.symlinkSync(SELF, path.join(trace, "dispatch-registry.py"));
     const sessionsRoot = privDir(path.join(run.dir, "sessions"));
     const stateDir = path.join(run.dir, "state");
     const log = path.join(run.logs, "trace.jsonl");
     fs.writeFileSync(log, "");
     const scenFile = path.join(run.dir, "scenario.json");
+    const pumpControl = path.join(run.dir, "pump-control.json");
+    const owned = { scenario: scenFile, log, dist: DIST, stateDir, pumpControl,
+      registry: path.join(BIN, "dispatch-registry.py") };
+    // Serialized owned paths survive child-env sanitization without forwarding any authority.
+    const launcher = path.join(run.dir, "fake-launcher.mjs");
+    writePriv(launcher, `#!${process.execPath}\n` +
+      `import(${JSON.stringify(pathToFileURL(SELF).href)}).then(({ fakeMain }) => fakeMain(${JSON.stringify(owned)}));\n`, 0o700);
+    fs.symlinkSync(launcher, path.join(bin, "wh-cli.sh"));
+    for (const name of ["telepty", "cmux", "ps", "curl", "git", "jq"]) {
+      fs.symlinkSync(launcher, path.join(run.fakes, name));
+    }
+    fs.symlinkSync(launcher, path.join(trace, "dispatch-registry.py"));
     let scenario = { passthrough: { "dispatch-registry.py": path.join(BIN, "dispatch-registry.py") },
       sessions: [{ id: ORCH, host: "127.0.0.1" }], injectReplies: [], audit: [] };
     const save = () => fs.writeFileSync(scenFile, JSON.stringify(scenario));
@@ -331,9 +350,15 @@ export function worldKit(H) {
         if (scenario.injectReplies?.some(reply => reply.crash)) {
           const proofFile = path.join(run.dir, `owned-pump-${randomUUID()}.json`);
           const nonce = randomBytes(16).toString("hex");
-          const driver = spawnSync(process.execPath,
-            [SELF, "--owned-pump-driver", TRACKER, now, proofFile, nonce, JSON.stringify(args)],
-            { env: { ...env, ...extra }, encoding: "utf8", timeout: 70000 });
+          writePriv(pumpControl, JSON.stringify({ proofFile, nonce }));
+          let driver;
+          try {
+            driver = spawnSync(process.execPath,
+              [SELF, "--owned-pump-driver", TRACKER, now, proofFile, nonce, JSON.stringify(args)],
+              { env: { ...env, ...extra }, encoding: "utf8", timeout: 70000 });
+          } finally {
+            fs.rmSync(pumpControl, { force: true });
+          }
           if (driver.error || driver.status !== 0) throw new Error(`owned pump driver failed: ${driver.stderr}`);
           return { ...JSON.parse(driver.stdout), calls: w.since(m) };
         }

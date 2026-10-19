@@ -740,7 +740,10 @@ export function readSealedManifest(manifestFile: string, hash: unknown): { m: An
 export function readSandboxCurrent(stage: string): { manifest: string; hash: string } {
   let c: unknown;
   try { c = strictJson(readPrivate(path.join(stage, "sandbox-current.json"), 4096, true)); }
-  catch { throw new AgentBindingError("invalid", "AGENT_BINDING_CURRENT"); }
+  catch (e) {
+    throw new AgentBindingError(e instanceof AgentBindingError && e.code === "missing" ? "missing" : "invalid",
+      "AGENT_BINDING_CURRENT");
+  }
   if (!isRecord(c) || !exactKeys(c, ["manifest", "hash"]) || typeof c.manifest !== "string" || !isHash(c.hash)) {
     throw new AgentBindingError("invalid", "AGENT_BINDING_CURRENT");
   }

@@ -316,12 +316,17 @@ test("G2b-09 launch labels: shell/newline text, extra keys, observed source → 
   for (const launch of cases) {
     const run = makeRun("g2b09");
     const f = sealedFixture(run, { launch });
+    const bindingBefore = fs.readFileSync(f.bindingFile, "utf8");
     const r = reader(run, ["--stage", f.stage, "--sid", f.sid]);
-    assert.equal(r.status, 0, r.stderr);
-    const out = JSON.parse(r.stdout).launch;
-    const cliMismatch = launch.cli !== "claude" || launch.v !== 2;
-    assert.deepEqual(out.model, { value: "unknown", source: "unknown" }, JSON.stringify(launch));
-    if (cliMismatch) assert.deepEqual(out.effort, { value: "unknown", source: "unknown" });
+    // The strict manifest reader now refuses these labels before binding/normalization.
+    assert.equal(r.status, 30, r.stderr);
+    assert.equal(r.stdout, "", "malformed launch never produces partial output");
+    assert.equal(r.stderr, "agent-binding: AGENT_BINDING_MANIFEST\n");
+    for (const secret of [run.dir, "IT1162-ENV-CANARY-7f3a", "CANARY_ENV", "HOME", launch.model.value]) {
+      assert.ok(!r.stderr.includes(secret), "diagnostic must not disclose fixture data");
+    }
+    assert.equal(fs.readFileSync(f.bindingFile, "utf8"), bindingBefore, "reader must not alter the binding");
+    assertNoTrip(run);
   }
 });
 
