@@ -42,6 +42,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import sys
 import time
 import uuid
@@ -123,10 +124,14 @@ def state_dir() -> str:
     ACCEPTED SNYK FINDING — `python/PT` Path Traversal, Low, 5 occurrences
     (2026-07-30, reviewed and accepted by the orchestrator).
 
+    That historical waiver does not cover the new status-projections paths.
+    Their digest-only names and dir_fd admission require separate exact-source
+    review; no inherited security clearance is claimed for them.
+
     Snyk taints this env var and follows it into `open()` and `os.replace()`.
     The finding is accepted rather than fixed, for these reasons:
 
-      * every filename under this directory is a FIXED LITERAL — `active.json`,
+      * legacy filenames under this directory are FIXED LITERALS — `active.json`,
         `active.json.lock`, `registry-health.log`, `active.json.legacy-v1.bak`,
         `report-archive.jsonl` (#1170) and the `.<pid>.tmp` sibling. No sid,
         dispatch_id, track, ref path or any other record value is ever
@@ -229,6 +234,8 @@ class _Lock:
     atomic rename replaces that, so two writers would hold locks on different
     inodes and both think they were exclusive."""
 
+    active = None
+
     def __init__(self) -> None:
         self.path = registry_path() + ".lock"
         self.fh = None
@@ -270,6 +277,7 @@ class _Lock:
                     self.acquired = True
                     # Artifacts may have appeared while this writer waited.
                     refuse_transition_artifacts()
+                    _Lock.active = self
                     return self
         except BaseException as exc:
             self.__exit__(*sys.exc_info())
@@ -278,6 +286,8 @@ class _Lock:
             raise
 
     def __exit__(self, *exc_info):
+        if _Lock.active is self:
+            _Lock.active = None
         cleanup_error = None
         if self.fh is not None:
             try:
@@ -367,19 +377,41 @@ def load(required: bool = True, limit: int | None = None) -> dict:
         raise RegistryError("registry_unavailable", f"no registry at {path}")
     if limit is not None:
         return validate(load_bounded(path, limit))
+    duplicate = False
+
+    def authority_object(pairs):
+        nonlocal duplicate
+        obj = {}
+        for key, value in pairs:
+            if key in obj:
+                duplicate = True
+            obj[key] = value
+        return obj
+
     try:
-        with open(path, encoding="utf-8") as fh:
-            raw = json.load(fh)
+        with open(path, encoding="utf-8", newline="") as fh:
+            first = fh.readline(STATUS_PREFIX_LIMIT + 1)
+            raw = json.loads(first + fh.read(), object_pairs_hook=authority_object)
     except json.JSONDecodeError as exc:
         raise RegistryError("registry_corrupt", f"unparseable registry: {exc}")
     except OSError as exc:
         raise RegistryError("registry_unavailable", f"cannot read registry: {exc}")
-    return validate(raw)
+    doc = validate(raw)
+    if "status_projection" in doc:
+        descriptor = validate_status_descriptor(doc["status_projection"])
+        canonical = {key: descriptor[key] for key in ("v", "sha256", "bytes", "rows")}
+        expected = status_prefix_bytes(doc["generation"], canonical)
+        # Full-authority writers keep validate()'s generation domain. Only
+        # status applies its existing safe, nonnegative generation bound.
+        if duplicate or len(expected) > STATUS_PREFIX_LIMIT or first.encode("utf-8") != expected:
+            raise RegistryError("registry_corrupt", "conflicting status projection metadata")
+        if os.name == "nt":
+            raise RegistryError("registry_unavailable", "native projection admission unavailable")
+    return doc
 
 
 def load_bounded(path: str, limit: int) -> object:
-    """list --jsonl only: read at most limit+1 bytes from ONE opened file, then
-    parse. The default load() path above is unchanged."""
+    """Legacy capped load helper. Status uses load_status's shared budget."""
     try:
         with open(path, "rb") as fh:
             data = fh.read(limit + 1)
@@ -399,6 +431,9 @@ def commit(doc: dict) -> None:
     a half-written file."""
     doc["generation"] = int(doc.get("generation", 0)) + 1
     validate(doc)
+    if os.name != "nt":
+        commit_status_projection(doc)
+        return
     path = registry_path()
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
@@ -888,9 +923,8 @@ def jsonl_value(value) -> tuple[object, bool]:
     return None, False
 
 
-# Pure protocol helpers for the commit-bound projection. Filesystem publication
-# and reader admission must be wired together only with the private-storage
-# adapter; these helpers alone do not activate projection-backed status.
+# Commit-bound projection protocol and POSIX admission. Windows remains on the
+# legacy writer until its in-process native admission adapter is implemented.
 STATUS_PREFIX_LIMIT = 65536
 STATUS_PROJECTION_FIELDS = JSONL_FIELDS + ("gate_invalid", "gated")
 
@@ -1077,6 +1111,327 @@ def validate_status_projection(data: bytes, descriptor: dict) -> list[dict]:
     return value["rows"]
 
 
+def status_same_inode(left, right) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+class PosixProjectionStore:
+    """Admitted directory handles, never a record-derived path or a repair.
+    Relative opens pin resolution even if a namespace is renamed. Ancestor and
+    named-object identity checks additionally reject observed substitutions.
+    Root/current-user ownership and writable-parent restrictions exclude other
+    unprivileged users; this does not grant protection from root/the owner.
+    """
+
+    def __init__(self, directory: str, create: bool = False) -> None:
+        self.directory = directory
+        self.create = create
+        self.handles = []
+        self.entries = []
+        self.state_fd = None
+        self.objects_fd = None
+
+    @staticmethod
+    def parent_safe(info) -> bool:
+        return (stat.S_ISDIR(info.st_mode) and info.st_uid in (0, os.geteuid())
+                and (not info.st_mode & 0o022 or bool(info.st_mode & stat.S_ISVTX)))
+
+    def __enter__(self):
+        if os.name == "nt":
+            raise RegistryError("registry_unavailable", "native projection admission unavailable")
+        try:
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            fd = os.open(os.sep, flags)
+            self.handles.append(fd)
+            if not self.parent_safe(os.fstat(fd)):
+                raise RegistryError("registry_unavailable", "unsafe projection ancestor")
+            for name in self.directory.split(os.sep)[1:]:
+                if not name or name in (os.curdir, os.pardir):
+                    raise RegistryError("registry_unavailable", "unsafe projection directory")
+                child = os.open(name, flags, dir_fd=fd)
+                self.handles.append(child)
+                self.entries.append((fd, name, child))
+                if not self.parent_safe(os.fstat(child)):
+                    raise RegistryError("registry_unavailable", "unsafe projection ancestor")
+                fd = child
+            self.state_fd = fd
+            info = os.fstat(fd)
+            if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+                raise RegistryError("registry_unavailable", "unsafe projection state directory")
+            if self.create:
+                self.check_lock()
+                try:
+                    os.mkdir("status-projections", mode=0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                else:
+                    # Persist the new parent entry before any authority replace.
+                    os.fsync(fd)
+            objects = os.open("status-projections", flags, dir_fd=fd)
+            self.handles.append(objects)
+            self.entries.append((fd, "status-projections", objects))
+            self.objects_fd = objects
+            self.check_namespace()
+            return self
+        except BaseException:
+            self.__exit__(*sys.exc_info())
+            raise
+
+    def __exit__(self, *exc_info):
+        error = None
+        for fd in reversed(self.handles):
+            try:
+                os.close(fd)
+            except OSError as exc:
+                if error is None:
+                    error = exc
+        self.handles = []
+        if error is not None and exc_info[0] is None:
+            raise error
+        return False
+
+    def check_namespace(self) -> None:
+        for parent, name, fd in self.entries:
+            actual = os.fstat(fd)
+            named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if not self.parent_safe(actual) or not status_same_inode(actual, named):
+                raise RegistryError("registry_unavailable", "projection namespace changed")
+        state = os.fstat(self.state_fd)
+        objects = os.fstat(self.objects_fd)
+        if (state.st_uid != os.geteuid() or state.st_mode & 0o022
+                or objects.st_uid != os.geteuid() or objects.st_mode & 0o077):
+            raise RegistryError("registry_unavailable", "projection directory is not private")
+
+    def check_lock(self) -> None:
+        held = _Lock.active
+        named = os.stat("active.json.lock", dir_fd=self.state_fd, follow_symlinks=False)
+        if (held is None or not held.acquired or held.fh is None
+                or not stat.S_ISREG(named.st_mode) or named.st_nlink != 1
+                or named.st_uid != os.geteuid() or named.st_mode & 0o022
+                or not status_same_inode(named, os.fstat(held.fh.fileno()))):
+            raise RegistryError("registry_unavailable", "projection publication lock changed")
+
+    @staticmethod
+    def object_info(fd: int):
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_mode & 0o077 or info.st_nlink != 1):
+            raise RegistryError("registry_corrupt", "unsafe status projection object")
+        return info
+
+    def open_object(self, digest: str) -> int:
+        if not isinstance(digest, str) or not HEX64_RE.fullmatch(digest):
+            raise RegistryError("registry_corrupt", "invalid status projection digest")
+        fd = os.open(digest, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                     dir_fd=self.objects_fd)
+        try:
+            self.object_info(fd)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+    def check_object(self, digest: str, fd: int, before) -> None:
+        after = self.object_info(fd)
+        named = os.stat(digest, dir_fd=self.objects_fd, follow_symlinks=False)
+        if (not status_same_inode(before, after) or not status_same_inode(after, named)
+                or before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns
+                or before.st_ctime_ns != after.st_ctime_ns):
+            raise RegistryError("registry_corrupt", "status projection object changed")
+        self.check_namespace()
+
+    def fetch(self, descriptor: dict, budget: StatusReadBudget) -> list[dict]:
+        if budget.consumed + descriptor["bytes"] > JSONL_READ_LIMIT:
+            raise RegistryError("registry_too_large", "status read budget exhausted")
+        fd = self.open_object(descriptor["sha256"])
+        try:
+            before = self.object_info(fd)
+            if before.st_size != descriptor["bytes"]:
+                raise RegistryError("registry_corrupt", "status projection size mismatch")
+            data = budget.remainder(fd)
+            self.check_object(descriptor["sha256"], fd, before)
+            return validate_status_projection(data, descriptor)
+        finally:
+            os.close(fd)
+
+    def verify_existing(self, digest: str, data: bytes) -> None:
+        """Full-authority writer verification, not a second status read budget."""
+        fd = self.open_object(digest)
+        try:
+            before = self.object_info(fd)
+            if before.st_size != len(data):
+                raise RegistryError("registry_corrupt", "existing projection size mismatch")
+            offset = 0
+            while True:
+                chunk = os.read(fd, min(65536, len(data) + 1 - offset))
+                if not chunk:
+                    break
+                if chunk != data[offset:offset + len(chunk)]:
+                    raise RegistryError("registry_corrupt", "existing projection bytes mismatch")
+                offset += len(chunk)
+            if offset != len(data):
+                raise RegistryError("registry_corrupt", "existing projection is truncated")
+            self.check_object(digest, fd, before)
+        finally:
+            os.close(fd)
+
+    def install(self, digest: str, data: bytes) -> None:
+        if not HEX64_RE.fullmatch(digest):
+            raise RegistryError("registry_corrupt", "invalid status projection digest")
+        self.check_namespace()
+        self.check_lock()
+        name = ".projection-" + uuid.uuid4().hex + ".tmp"
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     0o600, dir_fd=self.objects_fd)
+        try:
+            self.object_info(fd)
+            status_write_all(fd, data)
+            os.fsync(fd)
+            source = self.object_info(fd)
+            if not status_same_inode(source, os.stat(name, dir_fd=self.objects_fd, follow_symlinks=False)):
+                raise RegistryError("registry_corrupt", "projection temporary changed")
+            try:
+                os.link(name, digest, src_dir_fd=self.objects_fd, dst_dir_fd=self.objects_fd,
+                        follow_symlinks=False)
+            except FileExistsError:
+                self.verify_existing(digest, data)
+                os.unlink(name, dir_fd=self.objects_fd)
+            else:
+                linked = os.fstat(fd)
+                target = os.stat(digest, dir_fd=self.objects_fd, follow_symlinks=False)
+                if linked.st_nlink != 2 or not status_same_inode(linked, target):
+                    raise RegistryError("registry_corrupt", "projection installation identity changed")
+                os.unlink(name, dir_fd=self.objects_fd)
+                installed = self.object_info(fd)
+                self.check_object(digest, fd, installed)
+            self.check_namespace()
+            os.fsync(self.objects_fd)
+        finally:
+            # Failed installation can leave a private orphan; never remove old
+            # digest objects or perform discovery/repair/GC here.
+            os.close(fd)
+
+
+def status_write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        count = os.write(fd, view)
+        if count <= 0:
+            raise OSError("short status write")
+        view = view[count:]
+
+
+def commit_status_projection(doc: dict) -> None:
+    """POSIX-only publication under the same authority lock and generation."""
+    replaced = False
+    try:
+        data = status_projection_bytes(doc)
+        descriptor = status_projection_descriptor(data, len(doc["dispatches"]))
+        prefix = status_prefix_bytes(doc["generation"], descriptor)
+        if len(prefix) > STATUS_PREFIX_LIMIT:
+            raise RegistryError("registry_write_failed", "status prefix exceeds bound")
+        remaining = {key: value for key, value in doc.items()
+                     if key not in ("schema_version", "generation", "status_projection")}
+        authority = prefix + json.dumps(remaining, ensure_ascii=True, indent=2).encode("ascii")[1:] + b"\n"
+        with PosixProjectionStore(state_dir(), create=True) as store:
+            store.install(descriptor["sha256"], data)
+            name = f"active.json.{os.getpid()}.tmp"
+            created = False
+            try:
+                if fault("temp_write"):
+                    raise RegistryError("registry_write_failed", "temp write faulted (test seam)")
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                             0o600, dir_fd=store.state_fd)
+                created = True
+                try:
+                    store.object_info(fd)
+                    status_write_all(fd, authority)
+                    if fault("fsync"):
+                        raise RegistryError("registry_write_failed", "fsync faulted (test seam)")
+                    os.fsync(fd)
+                    store.check_namespace()
+                    store.check_lock()
+                    named = os.stat(name, dir_fd=store.state_fd, follow_symlinks=False)
+                    if not status_same_inode(named, store.object_info(fd)):
+                        raise RegistryError("registry_write_failed", "authority temporary changed")
+                    if fault("rename"):
+                        raise RegistryError("registry_write_failed", "rename faulted (test seam)")
+                    os.replace(name, "active.json", src_dir_fd=store.state_fd, dst_dir_fd=store.state_fd)
+                    replaced = True
+                finally:
+                    os.close(fd)
+            finally:
+                if created and not replaced:
+                    # Only the exclusive temporary owned by this attempt.
+                    try:
+                        os.unlink(name, dir_fd=store.state_fd)
+                    except OSError:
+                        pass
+            if fault("dir_fsync"):
+                raise RegistryError("registry_write_failed", "authority replaced; directory fsync faulted")
+            os.fsync(store.state_fd)
+            store.check_namespace()
+    except RegistryError as exc:
+        if replaced:
+            raise RegistryError("registry_write_failed", "authority replaced; durability or namespace uncertain") from exc
+        raise
+    except OSError as exc:
+        detail = ("authority replaced; durability uncertain" if replaced
+                  else "projection publication failed before authority replacement")
+        raise RegistryError("registry_write_failed", detail) from exc
+
+
+def status_prefix_advertised(data: bytes) -> bool:
+    """Recognize only the canonical key positions in the bounded first line."""
+    start = b'{"schema_version":2,"generation":'
+    if not data.startswith(start):
+        return False
+    try:
+        tail = data[len(start):].decode("ascii")
+        _, end = json.JSONDecoder().raw_decode(tail)
+    except (ValueError, RecursionError):
+        return False
+    return tail[end:].startswith(',"status_projection":')
+
+
+def load_status() -> tuple[dict, int]:
+    """One active open, one budget; v2 observes only its committed projection."""
+    path = registry_path()
+    if not os.path.exists(path):
+        return {"schema_version": SCHEMA_VERSION, "generation": 0, "dispatches": []}, 1
+    try:
+        directory = os.path.dirname(path)
+        parent_before = os.stat(directory)
+        before = os.lstat(path)
+        budget = StatusReadBudget()
+        with open(path, "rb", buffering=0) as fh:
+            first = budget.prefix(fh.fileno())
+            if status_prefix_advertised(first):
+                prefix = parse_status_prefix(first)
+                if os.name == "nt":
+                    raise RegistryError("registry_unavailable", "native projection admission unavailable")
+                active = os.fstat(fh.fileno())
+                if (not stat.S_ISREG(before.st_mode) or not status_same_inode(before, active)
+                        or active.st_uid != os.geteuid() or active.st_mode & 0o022
+                        or active.st_nlink > 1):
+                    raise RegistryError("registry_corrupt", "unsafe status authority identity")
+                with PosixProjectionStore(directory) as store:
+                    if not status_same_inode(parent_before, os.fstat(store.state_fd)):
+                        raise RegistryError("registry_unavailable", "status authority parent changed")
+                    rows = store.fetch(prefix["status_projection"], budget)
+                return {"generation": prefix["generation"], "dispatches": rows}, 2
+            data = first + budget.remainder(fh.fileno())
+        try:
+            raw = json.loads(data.decode("utf-8"))
+        except (ValueError, RecursionError) as exc:
+            raise RegistryError("registry_corrupt", "unparseable status authority") from exc
+        if isinstance(raw, dict) and "status_projection" in raw:
+            raise RegistryError("registry_corrupt", "noncanonical status projection metadata")
+        return validate(raw), 1
+    except OSError as exc:
+        raise RegistryError("registry_unavailable", "cannot read status registry") from exc
+
+
 def op_list_jsonl(args: dict) -> int:
     if any(name in args for name in ("fields", "not-retired", "keep-alive", "due-before")):
         raise RegistryError("invalid_argument", "list --jsonl: unsupported flag")
@@ -1089,7 +1444,7 @@ def op_list_jsonl(args: dict) -> int:
              if "since-generation" in args else None)
     cursor = cursor_decode(args["after"]) if "after" in args else None
     live = bool(args.get("live"))
-    doc = load(limit=JSONL_READ_LIMIT)
+    doc, version = load_status()
     generation = doc["generation"]
     if type(generation) is not int or not 0 <= generation <= JSONL_MAX_INT:
         raise RegistryError("registry_corrupt", "generation out of range")
@@ -1099,15 +1454,21 @@ def op_list_jsonl(args: dict) -> int:
         raise RegistryError("invalid_argument", "list --jsonl: cursor filter mismatch")
     matching = []
     for rec in doc["dispatches"]:
-        gate = rec.get("gate")
-        if gate is not None and not isinstance(gate, dict):
+        if version == 2:
+            invalid, gated = rec["gate_invalid"], rec["gated"]
+            lifecycle = rec["lifecycle.state"]
+        else:
+            gate = rec.get("gate")
+            invalid = gate is not None and not isinstance(gate, dict)
+            gated = isinstance(gate, dict) and gate.get("state") is not None
+            lifecycle = rec["lifecycle"]["state"]
+        if invalid:
             raise RegistryError("registry_corrupt", "gate axis is not an object")
-        gated = gate is not None and gate.get("state") is not None
-        if live and (rec["lifecycle"]["state"] in RETIRED_LIFECYCLES or gated):
+        if live and (lifecycle in RETIRED_LIFECYCLES or gated):
             continue
         matching.append(rec)
     matching.sort(key=jsonl_key)
-    header = {"v": 1, "generation": generation, "unchanged": since == generation,
+    header = {"v": version, "generation": generation, "unchanged": since == generation,
               "matching": len(matching), "oversize": 0, "more": False, "next_after": None, "rows": 0}
     lines = []
     if since != generation:
@@ -1121,7 +1482,7 @@ def op_list_jsonl(args: dict) -> int:
                 raise RegistryError("identity_too_large", "dispatch identity exceeds bound")
             row = {}
             for field in JSONL_FIELDS:
-                row[field], oversize = jsonl_value(pointer(rec, field))
+                row[field], oversize = jsonl_value(rec[field] if version == 2 else pointer(rec, field))
                 header["oversize"] += oversize
             lines.append(json.dumps(row, ensure_ascii=True, separators=(",", ":"), allow_nan=False))
         if len(matching) > limit:
@@ -1142,7 +1503,9 @@ def op_list_jsonl(args: dict) -> int:
 
 
 def op_snapshot(args: dict) -> int:
-    print(json.dumps(load(), ensure_ascii=False, indent=2))
+    doc = load()
+    doc.pop("status_projection", None)
+    print(json.dumps(doc, ensure_ascii=False, indent=2))
     return OK
 
 
@@ -1684,7 +2047,8 @@ def op_archive_sidecars(args: dict) -> int:
     dest_root = os.path.realpath(dest)
     for name in os.listdir(src):
         # This is the ONE place in this file where a name read off the filesystem
-        # becomes part of a path. Everything else joins a fixed literal. Confine
+        # becomes part of a path. Projection names are computed digests, not
+        # filesystem-derived names. Confine
         # it: a plain basename only, and a destination that provably stays inside
         # the archive directory. Fails closed — an unexpected entry aborts the
         # archival rather than being moved somewhere unexamined.
@@ -1796,7 +2160,7 @@ def main(argv: list[str]) -> int:
         refuse_transition_artifacts()
         return OPS[op][0](args)
     except RegistryError as exc:
-        if exc.result in ("registry_corrupt", "registry_unavailable", "registry_write_failed"):
+        if not jsonl and exc.result in ("registry_corrupt", "registry_unavailable", "registry_write_failed"):
             health(exc.result, exc.detail)
         if jsonl:
             # Fixed, nonsensitive: no detail, path, id or registry bytes; stdout empty.

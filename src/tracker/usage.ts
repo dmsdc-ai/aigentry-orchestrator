@@ -30,6 +30,8 @@ export const USAGE = `# dispatch-tracker.sh — Orchestrator-side dispatch healt
 #       Legacy v1 scan=full validates the full registry; v2 scan=projection-full,
 #       validation=commit-bound-projection excludes unread authority history,
 #       including corruption/truncation. Both scan fully even for unchanged generation.
+#       Projection publication/admission is currently POSIX-only. Windows keeps
+#       legacy v1 writing and refuses v2 reads pending native storage integration.
 #   dispatch-tracker.sh prune
 #   dispatch-tracker.sh report-sweep            — durable pull side of worker
 #       reporting (#904): copies every ref newly appearing under
