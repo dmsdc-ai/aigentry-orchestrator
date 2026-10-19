@@ -140,3 +140,43 @@ test("fake SRT chooses the supported platform grammar and real overlay guard acc
       process.platform === "darwin" ? darwin : linux, manifestEnv));
   }
 });
+
+test("runner preload resolves SRT from the candidate before the real overlay guard", () => {
+  const root = fixture();
+  try {
+    const preload = fileURLToPath(new URL("./_runner-preload.js", import.meta.url));
+    const driver = fileURLToPath(new URL("./_managed-driver.js", import.meta.url));
+    const runnerUrl = new URL("../../../src/session/worker-sandbox-runner.js", import.meta.url).href;
+    const expected = fileURLToPath(new URL(
+      "../../../../node_modules/@anthropic-ai/sandbox-runtime/package.json", import.meta.url));
+    assert.equal(createRequire(import.meta.url).resolve("@anthropic-ai/sandbox-runtime/package.json"),
+      expected, "fixture control must resolve the candidate-owned SRT");
+    const env = { ...childEnv(root), USERPROFILE: root, XDG_CONFIG_HOME: root,
+      XDG_CACHE_HOME: root, XDG_DATA_HOME: root, XDG_STATE_HOME: root, XDG_RUNTIME_DIR: root,
+      R2_FIXTURE_ROOT: root };
+    const prepared = spawnSync(process.execPath, ["--import", preload, driver, "prepare"], {
+      encoding: "utf8", timeout: 30_000, maxBuffer: 64 * 1024, cwd: root,
+      stdio: ["ignore", "pipe", "pipe"], env: { ...env, R2_MODE: "prepare" },
+    });
+    assert.ifError(prepared.error);
+    assert.equal(prepared.status, 0, prepared.stderr);
+    // Resolve from the real runner's module context without importing or launching it.
+    const program = 'import { createRequire } from "node:module";\n' +
+      'process.stdout.write(JSON.stringify(createRequire(process.argv[1]).resolve("@anthropic-ai/sandbox-runtime/package.json")) + "\\n");\n';
+    const resolved = spawnSync(process.execPath,
+      ["--import", preload, "--input-type=module", "-e", program, runnerUrl], {
+        encoding: "utf8", timeout: 30_000, maxBuffer: 64 * 1024, cwd: root,
+        stdio: ["ignore", "pipe", "pipe"], env: { ...env, R2_MODE: "runner" },
+      });
+    assert.ifError(resolved.error);
+    assert.equal(resolved.status, 0, resolved.stderr);
+    const actual: unknown = JSON.parse(resolved.stdout);
+    // Never open, stat or canonicalize a mismatched result (including the author's host path).
+    assert.equal(actual, expected, "runner preload must resolve the candidate-owned SRT");
+    const manifestEnv = { HOME: root, TMPDIR: path.join(root, "tmp") };
+    assert.doesNotThrow(() => assertRuntimeOverlaySupported(path.dirname(expected),
+      fixtureSrtWrapper(process.platform, manifestEnv), manifestEnv));
+  } finally {
+    finish(root, { controls: "candidate SRT resolution before real version/source-hash guard" });
+  }
+});
