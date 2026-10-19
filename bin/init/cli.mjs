@@ -956,6 +956,15 @@ async function main() {
   const subs = templateSubs(ws, AIGENTRY_HOME);
 
   verifyPackageComplete();
+  if (!native) {
+    const firstDestination = path.join(ws, MANIFEST[0]);
+    const firstParent = path.dirname(firstDestination);
+    let parentStat;
+    try { parentStat = fs.lstatSync(firstParent); }
+    catch { /* Uninspectable parents retain the existing locked copy path. */ }
+    if (parentStat?.isFile())
+      die(5, `could not write ${firstDestination}: destination parent is a regular file`);
+  }
   if (!native) fs.mkdirSync(ws, { recursive: true });
   const finishLegacy = native ? null : beginLegacyInit(ws, AIGENTRY_HOME, winStorage);
   if (!native && fs.existsSync(existingStamp) &&
