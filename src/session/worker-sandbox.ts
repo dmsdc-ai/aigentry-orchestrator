@@ -277,12 +277,15 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   if ([...scope.read, ...scope.write].some(p => overlaps(p, noAccess)) || scope.write.some(p => overlaps(p, noWrite))) {
     throw new Error("SANDBOX_POLICY_CONTROL_OVERLAP");
   }
+  // Admit the canonical SRT scratch parent before reserving IDs or writing preparation state.
+  const tmpParent = fs.realpathSync(os.tmpdir().startsWith("/var/folders") ? "/tmp" : os.tmpdir());
+  if (/[^A-Za-z0-9/_.-]/.test(tmpParent)) throw new Error("SANDBOX_SRT_TMPDIR_UNSAFE");
   const reserved = managed ? reserveDeliveryIds() : undefined;
   const attempt = reserved?.attempt ?? randomUUID();
   const root = canonical(path.join(stagingRoot, "sandbox", attempt));
   const home = path.join(root, "home");
   // Keep SRT Unix socket names below sockaddr_un's path limit on macOS.
-  const tmp = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir().startsWith("/var/folders") ? "/tmp" : os.tmpdir()), "agw-"));
+  const tmp = fs.mkdtempSync(path.join(tmpParent, "agw-"));
   fs.chmodSync(tmp, 0o700);
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
   fs.mkdirSync(tmp, { recursive: true, mode: 0o700 });
