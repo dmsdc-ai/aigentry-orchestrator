@@ -95,6 +95,10 @@ if (process.platform === 'darwin' || process.platform === 'linux') {
   // #1170 rework acceptance boundaries (R1–R4: prune archive, locate binding guard, TURN refusal naming,
   // exclusive temp ref): the shared agent-metadata harness, POSIX only.
   sourceTestFiles.push('tests/report/mandatory-report-1170-rework-boundaries.test.mjs');
+  // #1166 U1 — the intake ledger against the real bin/dispatch-registry.py on test-owned fixture
+  // roots; asserts 0600/0700 modes and flock contention, so POSIX only. Native Windows is
+  // unmeasured and not claimed.
+  sourceTestFiles.push('tests/request-capture/intake-registry.test.mjs');
 }
 
 function collectTestFiles(dir) {

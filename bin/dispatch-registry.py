@@ -232,12 +232,19 @@ def fault(name: str) -> bool:
 class _Lock:
     """Exclusive lock on a stable sibling file. Never the registry inode: an
     atomic rename replaces that, so two writers would hold locks on different
-    inodes and both think they were exclusive."""
+    inodes and both think they were exclusive.
+
+    `path` routes the lock to the document being written. It defaults to the
+    dispatch registry's own lock, so every existing caller is unchanged. The
+    #1166 intake ledger is a separate document with a separate lock file
+    (`intake_lock_path()`): an intake write must never contend with a dispatch
+    write, which is what makes an urgent cancel responsive by topology rather
+    than by hope."""
 
     active = None
 
-    def __init__(self) -> None:
-        self.path = registry_path() + ".lock"
+    def __init__(self, path: str | None = None) -> None:
+        self.path = path if path is not None else registry_path() + ".lock"
         self.fh = None
         self.acquired = False
 
@@ -2065,11 +2072,701 @@ def op_archive_sidecars(args: dict) -> int:
     return OK
 
 
+# --- #1166 U1 durable request intake ledger ----------------------------------
+# A SEPARATE document with a SEPARATE lock, written by this same single-writer
+# program. Not an array inside active.json: validate() requires dispatch_id /
+# assigned.sid / dedup / outcome / lifecycle on every record, so an intake row
+# would force a SCHEMA_VERSION bump of the live registry (a live-state
+# migration) and would put every prompt write behind the dispatch lock, in
+# direct conflict with #1172. On a separate inode none of that happens, and
+# refuse_transition_artifacts() still covers these ops unchanged (main()).
+#
+# The decision core is specified once in src/request-capture/intake.ts (pure);
+# this is the only WRITER. tests/request-capture/intake-registry.test.mjs
+# R-DIFF replays one event sequence through both and asserts the documents are
+# equal, so the two cannot drift silently.
+#
+# Four facts stay apart: a transport delivery is not an event here at all;
+# binding records an owner and moves nothing; `answered` is a human answer, not
+# a completion; only `work-completed` (verdict AND result link AND evidence)
+# completes a row. Idle, cleanup, session end, worker exit, a notice, a
+# transport rc, a turn boundary and liveness have no event, so they cannot
+# reach a request state.
+#
+# Every path below is a FIXED LITERAL. No ingress_id, capture_id, digest or any
+# other record field is ever interpolated into a path, which is exactly the
+# condition the accepted state_dir() waiver names as its invalidation.
+
+INTAKE_SCHEMA_VERSION = 1
+INTAKE_FILE = "intake.json"
+INTAKE_LOCK = "intake.json.lock"
+INTAKE_ARCHIVE = "intake-archive.jsonl"
+INTAKE_ORDER_LABEL = "received-at-then-ingress-id-not-commit-not-execution"
+# Bounded archive lookup: non-resurrection must be PROVEN, and an unprovable
+# scan refuses the capture instead of admitting it.
+INTAKE_ARCHIVE_SCAN_BYTES = 32 * 1024 * 1024
+INTAKE_ARCHIVE_SCAN_LINES = 262144
+INTAKE_ARCHIVE_MAX_LINE = 1024 * 1024
+INTAKE_STATES = ("queued", "in_progress", "waiting", "completed", "failed", "cancelled")
+INTAKE_CLOSED = ("completed", "cancelled")
+# The exhaustive transition table. Absence is a refusal; there is no default arm.
+INTAKE_TRANSITIONS = {
+    "captured": (),
+    "bind": ("queued", "in_progress", "waiting"),
+    "start": ("queued", "waiting"),
+    "pause": ("queued", "in_progress"),
+    "resume": ("waiting",),
+    "answered": ("queued", "in_progress", "waiting"),
+    "work-completed": ("queued", "in_progress", "waiting"),
+    "fail": ("queued", "in_progress", "waiting"),
+    "cancel": ("queued", "in_progress", "waiting", "failed"),
+    "amend": ("queued", "in_progress", "waiting", "failed"),
+}
+INTAKE_ANSWER_VERDICTS = ("answered", "rejected", "rework")
+INTAKE_WORK_VERDICTS = ("accepted", "rejected")
+INTAKE_FAILURE_REASONS = ("evidence_missing", "evidence_corrupt", "measured_failure")
+INTAKE_BOUNDS = {"rows": 4096, "history": 256, "revisions": 64, "review": 64, "binding": 64,
+                 "depends_on": 32, "id_chars": 128, "text_chars": 256, "result_ref_chars": 512,
+                 "byte_len": 2 ** 53 - 1}
+# Fields that would make the ledger a second copy of the prompt, or a record
+# value a path or a command. Refused by the validator, not by convention.
+INTAKE_FORBIDDEN_KEYS = ("argv", "attachment", "attachments", "body", "command", "content",
+                         "cwd", "env", "excerpt", "file", "filename", "metadata", "original",
+                         "original_text", "path", "prompt", "raw", "raw_ref", "script", "shell",
+                         "text", "original_ref")
+INTAKE_UUID4_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+INTAKE_AT_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+INTAKE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
+INTAKE_NAMESPACE_RE = re.compile(r"[a-z0-9][a-z0-9._/-]*")
+INTAKE_REFERENCE_RE = re.compile(r"[A-Za-z0-9._:/-]+")
+INTAKE_TOKEN_RE = re.compile(r"[A-Za-z0-9._:-]+")
+INTAKE_TEXT_RE = re.compile(r"[^\x00-\x1f\x7f]+")
+INTAKE_UINT_RE = re.compile(r"0|[1-9][0-9]*")
+# The shipped exit vocabulary (0/4/7/8/9); nothing new is invented. These are
+# returned by the op itself, so main()'s existing mapping is untouched.
+INTAKE_EXITS = {"invalid_argument": USAGE, "intake_malformed": USAGE,
+                "intake_transition_refused": USAGE, "intake_identity_collision": USAGE,
+                "intake_bounds_exceeded": USAGE, "intake_not_found": USAGE,
+                "intake_replay": DEDUPLICATED, "intake_upstream_duplicate": DEDUPLICATED,
+                "intake_archived": DEDUPLICATED,
+                "intake_archive_unbounded": REGISTRY_ERROR}
+INTAKE_IMMUTABLE = ("capture_id", "channel", "upstream_namespace", "upstream_delivery_id",
+                    "upstream_id_status", "upstream_scope_sha256", "sha256", "byte_len",
+                    "received_at")
+
+
+class IntakeRefusal(Exception):
+    """A refused intake event: an exact result, zero writes, a shipped exit code."""
+
+    def __init__(self, result: str, detail: str) -> None:
+        super().__init__(detail)
+        self.result = result
+        self.detail = detail
+
+
+def intake_path() -> str:
+    return os.path.join(state_dir(), INTAKE_FILE)
+
+
+def intake_lock_path() -> str:
+    return os.path.join(state_dir(), INTAKE_LOCK)
+
+
+def intake_archive_path() -> str:
+    return os.path.join(state_dir(), INTAKE_ARCHIVE)
+
+
+def intake_validate(doc: object) -> dict:
+    """Fail closed. A malformed ledger is reported, never repaired, never
+    partially read, and its bytes are left exactly as found."""
+    if not isinstance(doc, dict):
+        raise RegistryError("registry_corrupt", "intake root is not an object")
+    if doc.get("schema_version") != INTAKE_SCHEMA_VERSION:
+        raise RegistryError("registry_corrupt",
+                            f"intake schema_version={doc.get('schema_version')!r}, "
+                            f"want {INTAKE_SCHEMA_VERSION}")
+    if not isinstance(doc.get("generation"), int) or isinstance(doc.get("generation"), bool):
+        raise RegistryError("registry_corrupt", "intake generation is not an integer")
+    rows = doc.get("requests")
+    if not isinstance(rows, list):
+        raise RegistryError("registry_corrupt", "intake requests is not an array")
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RegistryError("registry_corrupt", "intake record is not an object")
+        ingress = row.get("ingress_id")
+        if not isinstance(ingress, str) or not INTAKE_UUID4_RE.fullmatch(ingress):
+            raise RegistryError("registry_corrupt", f"invalid ingress_id {ingress!r}")
+        if ingress in seen:
+            raise RegistryError("registry_corrupt", f"duplicate ingress_id {ingress!r}")
+        seen.add(ingress)
+        for key in INTAKE_FORBIDDEN_KEYS:
+            if key in row:
+                raise RegistryError("registry_corrupt",
+                                    f"{ingress}: forbidden field {key!r}; the intake ledger "
+                                    "stores identifiers and measurements only")
+        if row.get("state") not in INTAKE_STATES:
+            raise RegistryError("registry_corrupt", f"{ingress}: invalid state "
+                                                    f"{row.get('state')!r}")
+        for key in ("history", "review", "binding", "revisions", "depends_on",
+                    "bound_dispatch_ids"):
+            if not isinstance(row.get(key), list):
+                raise RegistryError("registry_corrupt", f"{ingress}: {key} is not an array")
+    return doc
+
+
+def intake_load() -> dict:
+    """An absent ledger is a valid empty one — there is nothing to migrate."""
+    path = intake_path()
+    if not os.path.exists(path):
+        return {"schema_version": INTAKE_SCHEMA_VERSION, "generation": 0, "requests": []}
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        raise RegistryError("registry_unavailable", f"cannot read intake ledger: {exc}")
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RegistryError("registry_corrupt", f"unparseable intake ledger: {exc}")
+    return intake_validate(parsed)
+
+
+def intake_commit(doc: dict) -> None:
+    """The same durable sequence as the dispatch registry's commit(), on the
+    intake inode: temp -> fsync(temp) -> rename -> fsync(dir), Windows stopping
+    after the journaled rename. Recovery sees one complete generation or the
+    other, never a half-written ledger. There is no truncate-in-place path."""
+    doc["generation"] = int(doc.get("generation", 0)) + 1
+    intake_validate(doc)
+    path = intake_path()
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        if fault("temp_write"):
+            raise RegistryError("registry_write_failed", "temp write faulted (test seam)")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+            fh.flush()
+            if fault("fsync"):
+                raise RegistryError("registry_write_failed", "fsync faulted (test seam)")
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        if fault("rename"):
+            raise RegistryError("registry_write_failed", "rename faulted (test seam)")
+        os.replace(tmp, path)
+    except RegistryError:
+        _unlink(tmp)
+        raise
+    except OSError as exc:
+        _unlink(tmp)
+        raise RegistryError("registry_write_failed", f"durable intake write failed: {exc}")
+    if os.name == "nt":
+        return
+    if fault("dir_fsync"):
+        raise RegistryError("registry_write_failed", "directory fsync faulted (test seam)")
+    dir_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def append_intake_archive(records: list[dict], at: str) -> None:
+    """Evidence, not authority: one full row per line, append -> fsync (-> dir
+    fsync), BEFORE the commit that drops them. Fixed literal name. The archive
+    and the hot rewrite are two separate durable boundaries and this does not
+    pretend otherwise: a crash in between repeats a line, keyed by the exact
+    immutable ingress_id, so the repeat is the same evidence and never a second
+    request."""
+    path = intake_archive_path()
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as fh:
+        for rec in records:
+            fh.write(json.dumps({"v": 1, "archived_at": at,
+                                 "reason": "closed_aged_past_cutoff",
+                                 "ingress_id": rec["ingress_id"], "record": rec},
+                                ensure_ascii=True, separators=(",", ":")) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    if os.name != "nt":
+        dir_fd = os.open(state_dir(), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+
+def intake_archived_ids() -> tuple[set, bool]:
+    """Bounded lookup. Returns (ids, complete). `complete=False` means
+    non-resurrection could not be proven within the bound, which the caller
+    turns into a refusal — never into an admission."""
+    ids: set = set()
+    try:
+        fh = open(intake_archive_path(), "rb")
+    except FileNotFoundError:
+        return ids, True
+    except OSError as exc:
+        raise RegistryError("registry_unavailable", f"cannot read intake archive: {exc}")
+    total = lines = 0
+    with fh:
+        while True:
+            # Bounded read: never materialise more than the line bound plus one byte. `for raw in
+            # fh` allocated a whole unterminated line BEFORE the named bound was evaluated, so a
+            # corrupt private archive could make this read hundreds of MiB to reach a refusal it
+            # already knew it would make (ir1166bcx R4). The extra byte is what distinguishes a
+            # line exactly at the bound from one past it.
+            raw = fh.readline(INTAKE_ARCHIVE_MAX_LINE + 1)
+            if not raw:
+                break                       # EOF: the scan completed
+            if len(raw) > INTAKE_ARCHIVE_MAX_LINE:
+                return ids, False
+            total += len(raw)
+            lines += 1
+            if total > INTAKE_ARCHIVE_SCAN_BYTES or lines > INTAKE_ARCHIVE_SCAN_LINES:
+                return ids, False
+            if not raw.endswith(b"\n"):
+                # A crash mid-append can leave a torn final line. It is skipped,
+                # never repaired. Any EARLIER unparseable line fails closed below.
+                break
+            try:
+                entry = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return ids, False
+            if isinstance(entry, dict) and isinstance(entry.get("ingress_id"), str):
+                ids.add(entry["ingress_id"])
+    return ids, True
+
+
+def intake_text(value: object, name: str, limit: int, pattern) -> str:
+    """Length first: an over-long but well-shaped value is a bound, not a shape."""
+    if not isinstance(value, str) or not value:
+        raise IntakeRefusal("intake_malformed", f"{name} is required")
+    if len(value) > limit:
+        raise IntakeRefusal("intake_bounds_exceeded", f"{name} exceeds {limit} characters")
+    if not pattern.fullmatch(value):
+        raise IntakeRefusal("intake_malformed", f"{name} is malformed")
+    return value
+
+
+def intake_immutable(args: dict) -> dict:
+    """The identity and measurement set of one delivery. An upstream identity is
+    never fabricated, and a claimed one is never left unbacked."""
+    capture_id = intake_text(args.get("capture-id"), "capture-id", INTAKE_BOUNDS["id_chars"],
+                             INTAKE_UUID4_RE)
+    channel = intake_text(args.get("channel"), "channel", INTAKE_BOUNDS["id_chars"],
+                          INTAKE_NAME_RE)
+    namespace = intake_text(args.get("upstream-namespace"), "upstream-namespace",
+                            INTAKE_BOUNDS["id_chars"], INTAKE_NAMESPACE_RE)
+    digest = intake_text(args.get("sha256"), "sha256", 64, HEX64_RE)
+    received_at = intake_text(args.get("received-at"), "received-at", 32, INTAKE_AT_RE)
+    raw_len = args.get("byte-len")
+    if not isinstance(raw_len, str) or not INTAKE_UINT_RE.fullmatch(raw_len) \
+            or int(raw_len) > INTAKE_BOUNDS["byte_len"]:
+        raise IntakeRefusal("intake_malformed", "byte-len must be a non-negative safe integer")
+    status = args.get("upstream-id-status")
+    if status not in ("available", "unavailable"):
+        raise IntakeRefusal("intake_malformed",
+                            "upstream-id-status must be available or unavailable")
+    delivery_id = args.get("upstream-delivery-id")
+    scope = args.get("upstream-scope-sha256")
+    if status == "unavailable" and delivery_id is not None:
+        raise IntakeRefusal("intake_malformed",
+                            "upstream-delivery-id is present but upstream-id-status is "
+                            "unavailable; an upstream identity is never fabricated")
+    if status == "available":
+        intake_text(delivery_id, "upstream-delivery-id", INTAKE_BOUNDS["id_chars"],
+                    INTAKE_TOKEN_RE)
+        intake_text(scope, "upstream-scope-sha256", 64, HEX64_RE)
+    elif scope is not None:
+        intake_text(scope, "upstream-scope-sha256", 64, HEX64_RE)
+    return {"capture_id": capture_id, "channel": channel, "upstream_namespace": namespace,
+            "upstream_delivery_id": delivery_id, "upstream_id_status": status,
+            "upstream_scope_sha256": scope, "sha256": digest, "byte_len": int(raw_len),
+            "received_at": received_at}
+
+
+def intake_upstream_key(row: dict) -> str:
+    """channel + namespace + provider/session scope + the provider id. Every
+    component is mandatory, so one provider's id can never collide across
+    channels, providers or sessions."""
+    parts = (row["channel"], row["upstream_namespace"], row.get("upstream_scope_sha256") or "",
+             row.get("upstream_delivery_id") or "")
+    return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()
+
+
+def intake_new_row(fields: dict, at: str, supersedes: str | None, ingress_id: str) -> dict:
+    return {"ingress_id": ingress_id, **fields, "state": "queued", "work_state": "unstarted",
+            "answered_at": None, "owning_task": None, "bound_dispatch_ids": [], "depends_on": [],
+            "pause": None, "result": None, "failure": None, "supersedes": supersedes,
+            "superseded_by": None, "revisions": [], "review": [], "binding": [], "notice": None,
+            "last_event_at": at,
+            "history": [{"at": at, "event": "captured" if supersedes is None else "amend",
+                         "from": None, "to": "queued"}]}
+
+
+def intake_bounds_check(row: dict) -> None:
+    """Growth REFUSES at the bound: an intake obligation must not lose its own
+    audit trail, so nothing here evicts the way the report history rotates."""
+    for key in ("history", "review", "binding", "revisions", "depends_on"):
+        if len(row[key]) > INTAKE_BOUNDS[key]:
+            raise IntakeRefusal("intake_bounds_exceeded",
+                                f"{key} would exceed {INTAKE_BOUNDS[key]} entries")
+
+
+def intake_history(row: dict, kind: str, at: str, to: str, **extra) -> None:
+    """One transition, one append. No field is ever rewritten in place."""
+    entry = {"at": at, "event": kind, "from": row["state"], "to": to}
+    entry.update({k: v for k, v in extra.items() if v is not None})
+    row["history"].append(entry)
+    row["state"] = to
+    row["last_event_at"] = at
+
+
+def intake_find(doc: dict, ingress_id: str) -> dict | None:
+    for row in doc["requests"]:
+        if row["ingress_id"] == ingress_id:
+            return row
+    return None
+
+
+def intake_creation(doc: dict, kind: str, ingress_id: str, args: dict, at: str) -> dict:
+    fields = intake_immutable(args)
+    existing = intake_find(doc, ingress_id)
+    if existing is not None:
+        for key in INTAKE_IMMUTABLE:
+            if existing.get(key) != fields[key]:
+                # The stored row is authority: a mismatch refuses. It never
+                # overwrites and never silently no-ops.
+                raise IntakeRefusal("intake_identity_collision",
+                                    f"{ingress_id}: {key} does not match the recorded delivery")
+        raise IntakeRefusal("intake_replay", f"{ingress_id} was already captured")
+    archived, complete = intake_archived_ids()
+    if not complete:
+        raise IntakeRefusal("intake_archive_unbounded",
+                            "the intake archive could not be scanned within its bound; capture "
+                            "refused rather than admitted, because non-resurrection cannot be "
+                            "proven")
+    if ingress_id in archived:
+        raise IntakeRefusal("intake_archived", f"{ingress_id} is archived and is not resurrected")
+    if fields["upstream_id_status"] == "available":
+        key = intake_upstream_key(dict(fields))
+        for row in doc["requests"]:
+            if row.get("upstream_id_status") == "available" and intake_upstream_key(row) == key:
+                raise IntakeRefusal("intake_upstream_duplicate",
+                                    f"upstream delivery already recorded as {row['ingress_id']}")
+    if kind == "captured":
+        if len(doc["requests"]) + 1 > INTAKE_BOUNDS["rows"]:
+            raise IntakeRefusal("intake_bounds_exceeded",
+                                f"the ledger holds {INTAKE_BOUNDS['rows']} requests")
+        row = intake_new_row(fields, at, None, ingress_id)
+        doc["requests"].append(row)
+        return row
+    # amend: a new delivery superseding an earlier one; the original is preserved verbatim.
+    supersedes = intake_text(args.get("supersedes"), "supersedes", INTAKE_BOUNDS["id_chars"],
+                             INTAKE_UUID4_RE)
+    original = intake_find(doc, supersedes)
+    if original is None:
+        raise IntakeRefusal("intake_not_found", f"no intake request {supersedes}")
+    if original["state"] not in INTAKE_TRANSITIONS["amend"]:
+        raise IntakeRefusal("intake_transition_refused",
+                            f"amend is not authorised from {original['state']}")
+    if original.get("superseded_by") is not None:
+        raise IntakeRefusal("intake_transition_refused",
+                            f"{supersedes} is already superseded by "
+                            f"{original['superseded_by']}; the link is set once")
+    if len(doc["requests"]) + 1 > INTAKE_BOUNDS["rows"]:
+        raise IntakeRefusal("intake_bounds_exceeded",
+                            f"the ledger holds {INTAKE_BOUNDS['rows']} requests")
+    original["superseded_by"] = ingress_id
+    original["revisions"].append({"at": at, "kind": "superseded_by", "revision": ingress_id})
+    original["history"].append({"at": at, "event": "amend", "from": original["state"],
+                                "to": original["state"]})
+    original["last_event_at"] = at
+    intake_bounds_check(original)
+    row = intake_new_row(fields, at, supersedes, ingress_id)
+    row["revisions"] = [{"at": at, "kind": "amends", "revision": supersedes}]
+    doc["requests"].append(row)
+    return row
+
+
+def intake_mutation(doc: dict, kind: str, ingress_id: str, args: dict, at: str) -> dict:
+    row = intake_find(doc, ingress_id)
+    # An event for an unknown request is never a creation.
+    if row is None:
+        raise IntakeRefusal("intake_not_found", f"no intake request {ingress_id}")
+    allowed = INTAKE_TRANSITIONS[kind]
+
+    if kind == "bind":
+        task = intake_text(args.get("owning-task"), "owning-task", INTAKE_BOUNDS["id_chars"],
+                           INTAKE_TOKEN_RE)
+        dispatch = intake_text(args.get("dispatch-id"), "dispatch-id",
+                               INTAKE_BOUNDS["id_chars"], INTAKE_TOKEN_RE)
+        if row["state"] not in allowed:
+            raise IntakeRefusal("intake_transition_refused",
+                                f"bind is not authorised from {row['state']}")
+        # Recording an owner is not a grant: no state moves, nothing is
+        # dispatched, no task is created, no command is admitted.
+        row["owning_task"] = task
+        if dispatch not in row["bound_dispatch_ids"]:
+            row["bound_dispatch_ids"].append(dispatch)
+        row["binding"].append({"at": at, "owning_task": task, "dispatch_id": dispatch})
+        intake_history(row, kind, at, row["state"])
+    elif kind == "start":
+        if row["state"] not in allowed:
+            raise IntakeRefusal("intake_transition_refused",
+                                f"start is not authorised from {row['state']}")
+        if not row["binding"]:
+            raise IntakeRefusal("intake_transition_refused",
+                                f"{ingress_id} has no recorded owner; bind before start")
+        # start is the other exit from `waiting`, so it clears the pause it resolves, in this
+        # same single transition. Leaving it set made `pause` permanently unavailable, because a
+        # pause is set-once while it holds (ir1166bcx R2). From `queued` this is a no-op, so
+        # start has one behaviour and not two. A second pause after this is a NEW fact.
+        row["pause"] = None
+        row["depends_on"] = []
+        intake_history(row, kind, at, "in_progress")
+        row["work_state"] = "in_progress"
+    elif kind == "pause":
+        reason = intake_text(args.get("reason"), "reason", INTAKE_BOUNDS["text_chars"],
+                             INTAKE_TEXT_RE)
+        owner = intake_text(args.get("owner"), "owner", INTAKE_BOUNDS["id_chars"],
+                            INTAKE_TOKEN_RE)
+        condition = intake_text(args.get("resume-condition"), "resume-condition",
+                                INTAKE_BOUNDS["text_chars"], INTAKE_TEXT_RE)
+        depends_on = list(args.get("depends-on") or [])
+        if len(depends_on) > INTAKE_BOUNDS["depends_on"]:
+            raise IntakeRefusal("intake_bounds_exceeded",
+                                f"depends_on would exceed {INTAKE_BOUNDS['depends_on']} entries")
+        for dependency in depends_on:
+            intake_text(dependency, "depends-on", INTAKE_BOUNDS["id_chars"], INTAKE_TOKEN_RE)
+        if row["state"] not in allowed:
+            raise IntakeRefusal("intake_transition_refused",
+                                f"pause is not authorised from {row['state']}")
+        if row.get("pause") is not None:
+            raise IntakeRefusal("intake_transition_refused",
+                                f"{ingress_id} already carries a pause; it is set once")
+        row["pause"] = {"reason": reason, "owner": owner, "resume_condition": condition,
+                        "resume_to": row["state"]}
+        row["depends_on"] = depends_on
+        intake_history(row, kind, at, "waiting")
+        row["work_state"] = "paused"
+    elif kind == "resume":
+        if row["state"] not in allowed or row.get("pause") is None:
+            raise IntakeRefusal("intake_transition_refused",
+                                f"resume requires a recorded pause; {ingress_id} is "
+                                f"{row['state']}")
+        back = row["pause"]["resume_to"]
+        row["pause"] = None
+        row["depends_on"] = []
+        intake_history(row, kind, at, back)
+        row["work_state"] = "in_progress" if back == "in_progress" else "unstarted"
+    elif kind == "answered":
+        verdict = intake_text(args.get("verdict"), "verdict", INTAKE_BOUNDS["id_chars"],
+                              INTAKE_TOKEN_RE)
+        if verdict not in INTAKE_ANSWER_VERDICTS:
+            raise IntakeRefusal("intake_malformed",
+                                "verdict must be one of "
+                                f"{'|'.join(INTAKE_ANSWER_VERDICTS)} for an answer")
+        scope = intake_text(args.get("scope"), "scope", INTAKE_BOUNDS["text_chars"],
+                            INTAKE_TEXT_RE)
+        if row["state"] not in allowed:
+            raise IntakeRefusal("intake_transition_refused",
+                                f"answered is not authorised from {row['state']}")
+        if row.get("answered_at") is not None:
+            raise IntakeRefusal("intake_transition_refused",
+                                f"{ingress_id} was answered at {row['answered_at']}; the answer "
+                                "is set once")
+        # An answer is NOT a completion: state and work_state are deliberately
+        # unchanged, and any result reference passed here is not admitted as one.
+        row["answered_at"] = at
+        row["review"].append({"at": at, "verdict": verdict, "scope": scope})
+        intake_history(row, kind, at, row["state"])
+    elif kind == "work-completed":
+        verdict = intake_text(args.get("verdict"), "verdict", INTAKE_BOUNDS["id_chars"],
+                              INTAKE_TOKEN_RE)
+        if verdict not in INTAKE_WORK_VERDICTS:
+            raise IntakeRefusal("intake_malformed",
+                                "verdict must be one of "
+                                f"{'|'.join(INTAKE_WORK_VERDICTS)} for a work completion")
+        ref = intake_text(args.get("result-ref"), "result-ref",
+                          INTAKE_BOUNDS["result_ref_chars"], INTAKE_REFERENCE_RE)
+        evidence = intake_text(args.get("evidence-sha256"), "evidence-sha256", 64, HEX64_RE)
+        if row["state"] not in allowed:
+            raise IntakeRefusal("intake_transition_refused",
+                                f"work-completed is not authorised from {row['state']}")
+        if row.get("result") is not None:
+            raise IntakeRefusal("intake_transition_refused",
+                                f"{ingress_id} already carries a completion result; it is set "
+                                "once")
+        # `review` is the human-answer log and nothing else: a work verdict appended here was
+        # indistinguishable from an answer, and showed a review on a row nobody had answered
+        # (ir1166bcx R3). No fact is lost — the verdict and its evidence are in `result` and the
+        # appended history entry, and the work axis is result + history + work_state.
+        row["result"] = {"verdict": verdict, "result_ref": ref, "evidence_sha256": evidence}
+        intake_history(row, kind, at, "completed")
+        row["work_state"] = "completed"
+    elif kind == "fail":
+        reason = intake_text(args.get("reason"), "reason", INTAKE_BOUNDS["text_chars"],
+                             INTAKE_TOKEN_RE)
+        if reason not in INTAKE_FAILURE_REASONS:
+            raise IntakeRefusal("intake_malformed",
+                                f"reason must be one of {'|'.join(INTAKE_FAILURE_REASONS)}")
+        if row["state"] not in allowed:
+            raise IntakeRefusal("intake_transition_refused",
+                                f"fail is not authorised from {row['state']}")
+        # Recorded, never swept: a failed row is never pruned, at any age.
+        row["failure"] = {"at": at, "reason": reason}
+        intake_history(row, kind, at, "failed")
+        row["work_state"] = "failed"
+    elif kind == "cancel":
+        reason = intake_text(args.get("reason"), "reason", INTAKE_BOUNDS["text_chars"],
+                             INTAKE_TEXT_RE)
+        if row["state"] not in allowed:
+            raise IntakeRefusal("intake_transition_refused",
+                                f"cancel is not authorised from {row['state']}")
+        # Scope-exact to this one row, and never a completion: nothing touches
+        # `result`, and a cancellation is not a review verdict, so `review` stays
+        # as it was. The reason is preserved in the appended history entry.
+        intake_history(row, kind, at, "cancelled", reason=reason)
+        row["work_state"] = "cancelled"
+    else:
+        raise IntakeRefusal("invalid_argument", f"unknown intake event kind {kind!r}")
+    intake_bounds_check(row)
+    return row
+
+
+def op_intake_event(args: dict) -> int:
+    """One intake fact, one commit, under the INTAKE lock only.
+
+    0 written · 4 refused/invalid · 8 replay/duplicate/archived · 9 storage."""
+    kind = args["kind"]
+    try:
+        if kind not in INTAKE_TRANSITIONS:
+            raise IntakeRefusal("invalid_argument", f"unknown intake event kind {kind!r}")
+        at = intake_text(now_iso(args.get("now")), "now", 32, INTAKE_AT_RE)
+        ingress_id = intake_text(args.get("ingress-id"), "ingress-id",
+                                 INTAKE_BOUNDS["id_chars"], INTAKE_UUID4_RE)
+        with _Lock(intake_lock_path()):
+            doc = intake_load()
+            row = (intake_creation(doc, kind, ingress_id, args, at)
+                   if kind in ("captured", "amend")
+                   else intake_mutation(doc, kind, ingress_id, args, at))
+            intake_commit(doc)
+    except IntakeRefusal as exc:
+        emit({"result": exc.result, "detail": exc.detail, "completion_fact": None})
+        return INTAKE_EXITS[exc.result]
+    emit({"result": "intake_written", "kind": kind, "ingress_id": ingress_id,
+          "state": row["state"], "work_state": row["work_state"],
+          "generation": doc["generation"], "completion_fact": None})
+    return OK
+
+
+def op_intake_list(args: dict) -> int:
+    """Read-only and unlocked, like get/list/snapshot/report-list.
+
+    `position` is DERIVED here and never stored: ascending (received_at,
+    ingress_id) over rows that are neither closed nor superseded. It is receipt
+    order — not commit order, not execution order — and the label says so. A
+    closed or superseded row is still listed, with position null; an amended
+    request is therefore not counted twice.
+
+    `--jsonl` is one row per line. It is NOT the bounded `list --jsonl` paging
+    core (#1172): jsonl_requested() is scoped to argv[0] == "list", so nothing
+    here touches that path or its exit mapping."""
+    doc = intake_load()
+    rows = sorted(doc["requests"], key=lambda r: (r["received_at"], r["ingress_id"]))
+    wanted_state, wanted_id = args.get("state"), args.get("ingress-id")
+    if wanted_state is not None and wanted_state not in INTAKE_STATES:
+        raise RegistryError("invalid_argument", f"intake-list: unknown state {wanted_state!r}")
+    position = 0
+    listed = []
+    for row in rows:
+        open_row = row["state"] not in INTAKE_CLOSED and row.get("superseded_by") is None
+        if open_row:
+            position += 1
+        if wanted_state is not None and row["state"] != wanted_state:
+            continue
+        if wanted_id is not None and row["ingress_id"] != wanted_id:
+            continue
+        listed.append({**row, "position": position if open_row else None})
+    if args.get("jsonl"):
+        for row in listed:
+            print(json.dumps(row, ensure_ascii=True, separators=(",", ":")))
+        return OK
+    print(json.dumps({"schema_version": doc["schema_version"], "generation": doc["generation"],
+                      "order": INTAKE_ORDER_LABEL, "count": len(listed), "requests": listed},
+                     ensure_ascii=False, indent=2))
+    return OK
+
+
+def op_intake_prune(args: dict) -> int:
+    """Archive a CLOSED and AGED row, and nothing else, ever.
+
+    The #1170 precedent in op_prune, applied to an obligation that outlives any
+    dispatch: a row in queued/in_progress/waiting/failed is never reclaimed at
+    any age, a superseded but open row is never reclaimed, and no row is dropped
+    that is not durably archived first. On an archive OSError EVERY candidate
+    stays hot, in place, byte-identical, and the op surfaces
+    registry_write_failed. Dispatch cleanup, session reaping, cleaned /
+    cutover_retired and Layer-D retirement have no path to an intake row."""
+    cutoff = int(args.get("older-than-seconds") or 86400)
+    at = now_iso(args.get("now"))
+    now_dt = datetime.datetime.fromisoformat(at.replace("Z", "+00:00"))
+    archive_error = None
+    with _Lock(intake_lock_path()):
+        doc = intake_load()
+        keep, archive = [], []
+        for row in doc["requests"]:
+            aged = False
+            # Closed and aged, and nothing else. Supersession is NOT a retention rule: a
+            # cancelled or completed row that happens to have been superseded is finished work,
+            # and gating on it here left such a row hot forever at any age while the pure core
+            # archived it (ir1166bcx R1). The supersession exclusion belongs to FIFO accounting
+            # in op_intake_list, where it stays, so an amended request is still never counted
+            # twice in the queue. An OPEN superseded row is still retained — by the closed test.
+            if row["state"] in INTAKE_CLOSED:
+                try:
+                    seen = datetime.datetime.fromisoformat(
+                        str(row.get("last_event_at", "")).replace("Z", "+00:00"))
+                    aged = (now_dt - seen).total_seconds() > cutoff
+                except ValueError:
+                    aged = False
+            if aged:
+                archive.append(row)
+            else:
+                keep.append(row)
+        if archive:
+            try:
+                append_intake_archive(archive, at)
+            except OSError as exc:
+                # Never drop a record that is not durably archived: keep them all
+                # hot, in place, and write nothing at all.
+                archive_error = (f"intake archive append failed, {len(archive)} record(s) "
+                                 f"kept: {exc}")
+                archive = []
+                keep = list(doc["requests"])
+        if archive:
+            doc["requests"] = keep
+            intake_commit(doc)
+    if archive_error:
+        raise RegistryError("registry_write_failed", archive_error)
+    emit({"result": "pruned", "archived": len(archive), "kept": len(keep),
+          "completion_fact": None})
+    return OK
+
+
 OPS = {
     "archive-sidecars": (op_archive_sidecars, ()),
     "begin-delivery": (op_begin_delivery, ("sid", "ref-hash")),
     "check-dedup": (op_check_dedup, ("sid", "ref-hash")),
     "get": (op_get, ("sid",)),
+    "intake-event": (op_intake_event, ("kind", "ingress-id")),
+    "intake-list": (op_intake_list, ()),
+    "intake-prune": (op_intake_prune, ()),
     "list": (op_list, ()),
     "migrate": (op_migrate, ()),
     "observe": (op_observe, ("sid", "kind")),
@@ -2091,6 +2788,14 @@ FLAGS = {
                        "attempt", "manifest-sha256", "report-request-id", "report-challenge-sha256"},
     "check-dedup": {"sid", "ref-hash"},
     "get": {"sid", "pointer"},
+    # #1166 intake ledger. No flag here is ever interpolated into a path.
+    "intake-event": {"kind", "ingress-id", "capture-id", "channel", "upstream-namespace",
+                     "upstream-delivery-id", "upstream-id-status", "upstream-scope-sha256",
+                     "sha256", "byte-len", "received-at", "owning-task", "dispatch-id",
+                     "verdict", "scope", "result-ref", "evidence-sha256", "reason", "owner",
+                     "resume-condition", "depends-on", "supersedes", "now"},
+    "intake-list": {"state", "ingress-id", "jsonl"},
+    "intake-prune": {"older-than-seconds", "now"},
     "list": {"fields", "live", "not-retired", "keep-alive", "due-before",
              "jsonl", "limit", "after", "since-generation"},
     "migrate": {"now"},
@@ -2108,7 +2813,7 @@ FLAGS = {
 }
 BOOLEAN_FLAGS = {"keep-alive", "live", "not-retired", "clear", "bump-re-dispatch-count",
                  "all", "jsonl"}
-REPEATED_FLAGS = {"field"}
+REPEATED_FLAGS = {"field", "depends-on"}
 
 
 def emit(payload: dict) -> None:
