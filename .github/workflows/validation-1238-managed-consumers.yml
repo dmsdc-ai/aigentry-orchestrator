@@ -109,3 +109,58 @@ jobs:
             XDG_DATA_HOME="$XDG_DATA_HOME" TMPDIR="$TMPDIR" \
             AIGENTRY_PREWRITE_FIXTURE_ROOT="$HOME" \
             PATH=/usr/bin:/bin "$NODE_EXECUTABLE" --test --test-concurrency=1 tests/packaging/legacy-init-prewrite.test.mjs
+      - name: Retained-history bounded status regression
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 5
+        run: |
+          umask 077
+          selected_python="$(command -v python3)"
+          case "$selected_python" in /*) ;; *) exit 1 ;; esac
+          status_root="$(mktemp -d "$TMPDIR/status-projection.XXXXXXXX")"
+          env -i HOME="$HOME" USERPROFILE="$USERPROFILE" \
+            XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+            XDG_DATA_HOME="$XDG_DATA_HOME" TMPDIR="$TMPDIR" \
+            PATH=/usr/bin:/bin PYTHONIOENCODING=utf-8 PYTHONUTF8=1 \
+            PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
+            STATUS_PYTHON_CANDIDATE="$selected_python" STATUS_ADMISSION_ROOT="$status_root" \
+            "$NODE_EXECUTABLE" --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const assert = require('node:assert/strict');
+          const { createHash } = require('node:crypto');
+          const { spawnSync } = require('node:child_process');
+          const candidate = process.env.STATUS_PYTHON_CANDIDATE;
+          assert(candidate && path.isAbsolute(candidate));
+          const selected = fs.realpathSync(candidate);
+          assert(fs.lstatSync(selected).isFile());
+          fs.accessSync(selected, fs.constants.X_OK);
+          assert(!/[\r\n\t]/.test(selected));
+          const sha256 = createHash('sha256').update(fs.readFileSync(selected)).digest('hex');
+          const env = {};
+          for (const key of ['HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
+            'TMPDIR', 'PATH', 'PYTHONIOENCODING', 'PYTHONUTF8', 'PYTHONDONTWRITEBYTECODE', 'PYTHONNOUSERSITE']) {
+            assert(process.env[key]);
+            env[key] = process.env[key];
+          }
+          const root = process.env.STATUS_ADMISSION_ROOT;
+          assert(root && path.isAbsolute(root) && fs.realpathSync(root) === root);
+          const result = spawnSync(selected, ['--version'], { cwd: root, env, shell: false,
+            timeout: 10000, killSignal: 'SIGKILL', maxBuffer: 4096, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+          const receipt = { selected, sha256, argv: ['--version'], cwd: root, env, status: result.status,
+            signal: result.signal, error: result.error?.message, stdout: result.stdout, stderr: result.stderr };
+          fs.writeFileSync(path.join(root, 'python-admission.json'), JSON.stringify(receipt, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+          console.log(JSON.stringify(receipt));
+          assert.ifError(result.error);
+          assert.equal(result.signal, null);
+          assert.equal(result.status, 0);
+          assert.match((result.stdout + result.stderr).trim(), /^Python 3\.[0-9]+\.[0-9]+[^\r\n]*$/);
+          fs.writeFileSync(path.join(root, 'python-selection.tsv'), selected + '\t' + sha256 + '\n', { flag: 'wx', mode: 0o600 });
+          NODE
+          IFS=$'\t' read -r selected_python selected_python_sha256 < "$status_root/python-selection.tsv"
+          env -i HOME="$HOME" USERPROFILE="$USERPROFILE" \
+            XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+            XDG_DATA_HOME="$XDG_DATA_HOME" TMPDIR="$TMPDIR" \
+            AIGENTRY_STATUS_TEST_ROOT="$status_root" \
+            AIGENTRY_STATUS_TEST_PYTHON="$selected_python" \
+            AIGENTRY_STATUS_TEST_PYTHON_SHA256="$selected_python_sha256" \
+            PATH=/usr/bin:/bin "$NODE_EXECUTABLE" --test --test-concurrency=1 dist/tests/dispatch/registry-status-projection.test.js
