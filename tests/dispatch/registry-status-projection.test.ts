@@ -15,6 +15,8 @@ const helper = path.join(repo, "bin/dispatch-registry.py");
 const cli = path.join(repo, "dist/src/tracker/cli.js");
 const B = 33_554_432;
 const OUTPUT_CAP = 1_048_576;
+const RECEIPT_PREVIEW_BYTES = 1024;
+const RECEIPT_DIAGNOSTIC_CAP = 64 * 1024;
 const OLD = "2026-01-01T00:00:00Z";
 const NOW = "2026-01-02T00:00:00Z";
 const sha = (bytes: Buffer): string => createHash("sha256").update(bytes).digest("hex");
@@ -33,7 +35,10 @@ interface Authority {
   }>;
   status_projection?: unknown;
 }
-interface Case { root: string; python: string; pythonBin: string; deadline: number; sequence: number }
+interface Case {
+  root: string; python: string; pythonBin: string; deadline: number; sequence: number;
+  diagnostics: string[]; previewTruncated: boolean;
+}
 interface Fixture { root: string; state: string; env: Record<string, string>; original: Authority }
 interface Receipt {
   code: number | null; signal: NodeJS.Signals | null; faults: string[];
@@ -62,7 +67,8 @@ function begin(name: string): Case {
   fs.symlinkSync(python, path.join(pythonBin, "python3"));
   fs.writeFileSync(path.join(root, "admission.json"), JSON.stringify({ python, pythonHash, node: process.execPath,
     helper, cli, pythonBin, platform: process.platform }) + "\n", { mode: 0o600 });
-  return { root, python, pythonBin, deadline: Date.now() + 110_000, sequence: 0 };
+  return { root, python, pythonBin, deadline: Date.now() + 110_000, sequence: 0,
+    diagnostics: [], previewTruncated: false };
 }
 
 function fixture(c: Case, name: string, large: boolean): Fixture {
@@ -152,7 +158,34 @@ async function run(c: Case, f: Fixture, label: string, command: string, args: st
   fs.writeFileSync(receiptPath + ".stderr", stderr, { mode: 0o600 });
   fs.writeFileSync(receiptPath + ".json", JSON.stringify({ command, args, cwd: f.root, env: f.env,
     timeout, code, signal, faults, observedBytes: lengths, stdoutSha256: sha(stdout), stderrSha256: sha(stderr) }, null, 2) + "\n", { mode: 0o600 });
+  const preview = (bytes: Buffer, observedBytes: number): ObjectValue => {
+    const raw = bytes.subarray(0, RECEIPT_PREVIEW_BYTES);
+    const truncated = raw.length < observedBytes;
+    c.previewTruncated ||= truncated;
+    return { observedBytes, capturedBytes: bytes.length, sha256: sha(bytes), hashScope: "captured-bytes",
+      previewEncoding: "base64", previewBytes: raw.length, truncated, rawPreview: raw.toString("base64") };
+  };
+  c.diagnostics.push(JSON.stringify({ receipt: label, command, args, code, signal, faults,
+    stdout: preview(stdout, lengths[0]!), stderr: preview(stderr, lengths[1]!) }));
   return { code, signal, faults, stdout, stderr };
+}
+
+function emitReceipts(c: Case, t: { diagnostic(message: string): void }): void {
+  let emittedBytes = 0;
+  let omitted = 0;
+  // Reserve a bounded overflow marker and eight bytes per line for TAP framing.
+  // JSON/base64 keeps every receipt on one line, including arbitrary raw bytes.
+  for (const line of c.diagnostics) {
+    const bytes = Buffer.byteLength(line) + 8;
+    if (emittedBytes + bytes > RECEIPT_DIAGNOSTIC_CAP - 256) { omitted++; continue; }
+    t.diagnostic(line);
+    emittedBytes += bytes;
+  }
+  if (omitted) t.diagnostic(JSON.stringify({ receiptDiagnosticsOverflow: true, omittedReceipts: omitted,
+    emittedBytes, capBytes: RECEIPT_DIAGNOSTIC_CAP }));
+  // All invocations and raw on-disk observations precede either failure.
+  assert.equal(omitted, 0, "receipt diagnostics exceeded the per-case 64 KiB cap");
+  assert.equal(c.previewTruncated, false, "raw receipt preview truncated; minimal one-record regression must fit");
 }
 
 async function status(c: Case, f: Fixture, label: string): Promise<Receipt[]> {
@@ -218,6 +251,7 @@ test("legacy retained history at B+1 still refuses both bounded status callers",
   const f = fixture(c, "large", true);
   const before = snapshot(f.root);
   const results = await status(c, f, "legacy"); // Collect BOTH before asserting either.
+  emitReceipts(c, t);
   assert.deepEqual(snapshot(f.root), before, "read preserves authority bytes/stat and creates no lock/object");
   for (const [index, r] of results.entries()) {
     clean(r); assert.equal(r.code, 9); assert.equal(r.stdout.length, 0);
@@ -239,6 +273,7 @@ test("ordinary observe retains all large history while status equals the small-h
   const firstSmall = await status(c, small, "small-first");
   const secondLarge = await status(c, large, "large-repeat");
   const secondSmall = await status(c, small, "small-repeat");
+  emitReceipts(c, t);
   // All eight status receipts exist before any availability assertion. Do not
   // encode current registry_too_large as success or fabricate a projection.
   for (const r of writes) { clean(r); assert.equal(r.code, 0); assert.equal(r.stdout.length, 0); assert.equal(r.stderr.length, 0); }
