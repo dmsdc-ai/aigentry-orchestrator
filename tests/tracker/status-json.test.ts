@@ -231,7 +231,7 @@ function fakeBackend(spec: FakeSpec): { env: Record<string, string>; log: string
     "    signal.signal(signal.SIGTERM, signal.SIG_IGN)",
     "with open(os.path.join(d, \"pid\"), \"w\", encoding=\"ascii\") as fh:",
     "    fh.write(str(os.getpid()))",
-    "with open(os.environ[\"FAKE1172_LOG\"], \"a\", encoding=\"utf-8\") as fh:",
+    "with open(os.path.join(d, \"calls.log\"), \"a\", encoding=\"utf-8\") as fh:",
     "    fh.write(repr(sys.argv[1:]) + \"\\n\")",
     "for name, stream in ((\"stdout.bin\", sys.stdout), (\"stderr.bin\", sys.stderr)):",
     "    with open(os.path.join(d, name), \"rb\") as fh:",

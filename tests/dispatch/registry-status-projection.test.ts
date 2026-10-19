@@ -322,7 +322,7 @@ async function call511(c: Case, f: Fixture, t: Diagnostic, args: string[], track
 function success511(r: Receipt, tracker = false, version = 2): ObjectValue {
   assert.equal(r.code, 0, r.stderr.toString()); assert.equal(r.stderr.length, 0);
   assert.ok(r.stdout.length <= OUTPUT_CAP && r.stdout.toString().endsWith("\n"));
-  const lines = r.stdout.toString("ascii").trimEnd().split("\n").map(s => JSON.parse(s) as ObjectValue);
+  const lines = r.stdout.toString(tracker ? "utf8" : "ascii").trimEnd().split("\n").map(s => JSON.parse(s) as ObjectValue);
   const head = lines[0]!;
   assert.equal(head.v, version);
   const keys = ["v", "generation", "unchanged", "matching", "oversize", "more", "next_after", "rows"];
@@ -599,8 +599,10 @@ sys.argv = [helper] + sys.argv[4:]
 state = os.path.abspath(os.environ["DISPATCH_STATE_DIR"])
 original_open, original_io_open = builtins.open, io.open
 original_os_open, original_read = os.open, os.read
+original_write, original_close = os.write, os.close
 original_fsync, original_replace, original_link = os.fsync, os.replace, os.link
 fds = {}
+authority_replaced = False
 trace = {"opens": [], "reads": {}, "buffered": [], "stages": [], "hit": False}
 def old_reader(p):
     if fault_stage != "old-reader" or trace["hit"] or p != os.path.join(state, "active.json"):
@@ -648,6 +650,13 @@ def old_reader(p):
     trace["writer"] = {"code": code, "faults": faults, "stdout_bytes": len(streams[0]), "stderr_bytes": len(streams[1])}
     if code != 0 or faults:
         raise RuntimeError("concurrent writer failed; retained trace and streams")
+def resolved(file, dir_fd=None):
+    if isinstance(file, int):
+        return fds.get(file, "")
+    p = os.fsdecode(file)
+    if not os.path.isabs(p) and dir_fd is not None:
+        p = os.path.join(fds[dir_fd], p)
+    return os.path.abspath(p)
 def tracked(p):
     if not isinstance(p, (str, bytes, os.PathLike)):
         return fds.get(p, "") if isinstance(p, int) else ""
@@ -671,7 +680,19 @@ class Stream:
         self.stream.__enter__()
         return self
     def __exit__(self, *args):
-        return self.stream.__exit__(*args)
+        fd = self.stream.fileno()
+        try:
+            return self.stream.__exit__(*args)
+        finally:
+            if self.stream.closed:
+                fds.pop(fd, None)
+    def close(self):
+        fd = self.stream.fileno() if not self.stream.closed else None
+        try:
+            return self.stream.close()
+        finally:
+            if self.stream.closed:
+                fds.pop(fd, None)
     def read(self, *args):
         data = self.stream.read(*args)
         count(self.p, data)
@@ -690,9 +711,11 @@ class Stream:
         return self.stream.write(data)
 def opened(original, file, *args, **kwargs):
     stream = original(file, *args, **kwargs)
-    p = tracked(file)
+    actual = resolved(file)
+    # Replace any stale mapping when a stream reuses a descriptor.
+    fds.pop(stream.fileno(), None)
+    p = tracked(actual)
     # Also track authority temporary streams for publication fault stages.
-    actual = os.path.abspath(os.fsdecode(file)) if isinstance(file, (str, bytes, os.PathLike)) else fds.get(file, "")
     if actual.startswith(os.path.join(state, "active.json.")):
         p = actual
     if p:
@@ -706,12 +729,24 @@ def opened(original, file, *args, **kwargs):
     return stream
 def os_open(file, flags, *args, **kwargs):
     fd = original_os_open(file, flags, *args, **kwargs)
-    p = os.path.abspath(os.fsdecode(file))
+    p = resolved(file, kwargs.get("dir_fd"))
     fds[fd] = p
     old_reader(p)
-    if tracked(file):
+    if tracked(p):
         trace["opens"].append({"path": p, "flags": flags})
     return fd
+def close(fd):
+    try:
+        return original_close(fd)
+    finally:
+        fds.pop(fd, None)
+def write(fd, data):
+    p = fds.get(fd, "")
+    if p.startswith(os.path.join(state, "status-projections") + os.sep):
+        stage("projection-write")
+    elif p.startswith(os.path.join(state, "active.json.")):
+        stage("authority-write")
+    return original_write(fd, data)
 def read(fd, n):
     data = original_read(fd, n)
     count(tracked(fds.get(fd, "")), data)
@@ -719,7 +754,7 @@ def read(fd, n):
 def fsync(fd):
     p = fds.get(fd, "")
     if p == state:
-        stage("authority-dir-fsync")
+        stage("authority-dir-fsync" if authority_replaced else "state-initialization-fsync")
     elif p == os.path.join(state, "status-projections"):
         stage("projection-dir-fsync")
     elif p.startswith(os.path.join(state, "status-projections") + os.sep):
@@ -728,19 +763,29 @@ def fsync(fd):
         stage("authority-fsync")
     return original_fsync(fd)
 def replace(src, dst, *args, **kwargs):
-    p = os.path.abspath(os.fsdecode(dst))
+    global authority_replaced
+    source = resolved(src, kwargs.get("src_dir_fd"))
+    p = resolved(dst, kwargs.get("dst_dir_fd"))
+    trace.setdefault("replaces", []).append({"src": source, "dst": p})
     if p == os.path.join(state, "active.json"):
         stage("authority-replace")
     elif p.startswith(os.path.join(state, "status-projections") + os.sep):
         stage("projection-install")
-    return original_replace(src, dst, *args, **kwargs)
+    result = original_replace(src, dst, *args, **kwargs)
+    if p == os.path.join(state, "active.json"):
+        authority_replaced = True
+    return result
 def link(src, dst, *args, **kwargs):
-    if os.path.abspath(os.fsdecode(dst)).startswith(os.path.join(state, "status-projections") + os.sep):
+    source = resolved(src, kwargs.get("src_dir_fd"))
+    p = resolved(dst, kwargs.get("dst_dir_fd"))
+    trace.setdefault("links", []).append({"src": source, "dst": p})
+    if p.startswith(os.path.join(state, "status-projections") + os.sep):
         stage("projection-install")
     return original_link(src, dst, *args, **kwargs)
 builtins.open = lambda file, *args, **kwargs: opened(original_open, file, *args, **kwargs)
 io.open = lambda file, *args, **kwargs: opened(original_io_open, file, *args, **kwargs)
-os.open, os.read, os.fsync, os.replace, os.link = os_open, read, fsync, replace, link
+os.open, os.read, os.write, os.close = os_open, read, write, close
+os.fsync, os.replace, os.link = fsync, replace, link
 try:
     runpy.run_path(helper, run_name="__main__")
 finally:
