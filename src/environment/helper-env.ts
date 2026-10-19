@@ -99,7 +99,7 @@ export function instructionsInstallerEnvironment(ctx: TrustedRuntimeContext, sou
 }
 
 export function trustedTool(ctx: TrustedRuntimeContext, name: string): string {
-  if (!/^[a-z][a-z0-9-]{0,63}$/.test(name)) throw new Error("ENV_HELPER_PATH_REFUSED");
+  if (name !== "apply_patch" && !/^[a-z][a-z0-9-]{0,63}$/.test(name)) throw new Error("ENV_HELPER_PATH_REFUSED");
   for (const dir of (ctx.base.PATH ?? "").split(path.delimiter)) {
     const file = path.join(dir, name);
     try {
