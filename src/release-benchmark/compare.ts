@@ -75,7 +75,8 @@ export function compareEvidence(json: string): Result<Comparison> {
     if (!o.warmup && o.metrics.durationMs.value === null) reasons.add('duration-unavailable');
     if (scenario && o.runKey === runKey && o.repetition < (o.warmup ? run.selection.warmups : run.selection.repetitions)) comparable.push(o);
     // Retain selected candidate correctness evidence even when performance cannot be compared.
-    if (scenario && o.runKey === runKey && o.variant === 'candidate' && o.outcome === 'failure') {
+    if (scenario && o.runKey === runKey && o.repetition < (o.warmup ? run.selection.warmups : run.selection.repetitions)
+      && o.variant === 'candidate' && o.outcome === 'failure') {
       const baseline = observations.find(b => b.variant === 'baseline' && b.runKey === runKey && o.runKey === runKey
         && b.scenario === o.scenario && b.repetition === o.repetition && b.warmup === o.warmup);
       addFinding(o.scenario, scenario.requirement, o.failure as string,
