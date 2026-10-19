@@ -774,3 +774,97 @@ test("S31 output overflow from a SIGTERM-ignoring backend is killed at once (max
   assert.equal(liveAfter, false, "no live backend after the tracker returns");
   refused(r, 3, "overflow from SIGTERM-ignoring backend", "output_too_large");
 });
+
+// Task 511: independent v2 parser controls. The original v1 suite above is intact.
+// Complete emitted program; statically extracted and pinned at author checkpoint.
+const V2_REPLAY_PY = String.raw`#!/usr/bin/env python3
+import os, sys
+with open(os.path.join(os.path.dirname(__file__), "stream.bin"), "rb") as stream:
+    sys.stdout.buffer.write(stream.read())
+    sys.stdout.buffer.flush()
+`;
+
+function v2Replay(t: { diagnostic(message: string): void }, stream: string, flags: string[] = []): Run {
+  const parent = process.env.AIGENTRY_STATUS_TEST_ROOT;
+  const python = process.env.AIGENTRY_STATUS_TEST_PYTHON;
+  assert.ok(parent && path.isAbsolute(parent));
+  assert.ok(python && path.isAbsolute(python));
+  assert.equal(fs.realpathSync(parent), parent);
+  assert.equal(fs.realpathSync(python), python);
+  assert.ok(fs.lstatSync(python).isFile());
+  assert.match(process.env.AIGENTRY_STATUS_TEST_PYTHON_SHA256 ?? "", /^[a-f0-9]{64}$/);
+  assert.equal(sha(fs.readFileSync(python)), process.env.AIGENTRY_STATUS_TEST_PYTHON_SHA256);
+  const root = fs.mkdtempSync(path.join(parent, "v2-parser-"));
+  for (const name of ["home", "config", "cache", "data", "tmp", "state", "bin"])
+    fs.mkdirSync(path.join(root, name), { mode: 0o700 });
+  // Existing platform harness requires separate native Windows interpreter admission.
+  assert.notEqual(process.platform, "win32", "native Windows parser execution needs approved launcher support");
+  fs.symlinkSync(python, path.join(root, "bin/python3"));
+  const backend = path.join(root, "replay.py");
+  fs.writeFileSync(backend, V2_REPLAY_PY, { mode: 0o700 });
+  fs.writeFileSync(path.join(root, "stream.bin"), stream, { mode: 0o600 });
+  const env = { HOME: path.join(root, "home"), USERPROFILE: path.join(root, "home"),
+    XDG_CONFIG_HOME: path.join(root, "config"), XDG_CACHE_HOME: path.join(root, "cache"),
+    XDG_DATA_HOME: path.join(root, "data"), TMPDIR: path.join(root, "tmp"),
+    PATH: path.join(root, "bin"), LANG: "C", LC_ALL: "C", PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8",
+    PYTHONDONTWRITEBYTECODE: "1", PYTHONNOUSERSITE: "1", DISPATCH_STATE_DIR: path.join(root, "state"),
+    AIGENTRY_SHIM_SCRIPT_DIR: binDir, DISPATCH_REGISTRY_PY: backend };
+  const args = [cli, "status", "--json", ...flags];
+  const started = Date.now();
+  const result = spawnSync(process.execPath, args, { cwd: root, env, shell: false,
+    timeout: 10_000, killSignal: "SIGKILL", maxBuffer: 1_048_576, stdio: ["ignore", "pipe", "pipe"] });
+  const stdout = result.stdout ?? Buffer.alloc(0), stderr = result.stderr ?? Buffer.alloc(0);
+  fs.writeFileSync(path.join(root, "stdout.bin"), stdout);
+  fs.writeFileSync(path.join(root, "stderr.bin"), stderr);
+  const receipt = { root, args, env, status: result.status, signal: result.signal,
+    error: result.error?.message ?? null, elapsedMs: Date.now() - started,
+    stdoutBytes: stdout.length, stdoutSha256: sha(stdout), stderrBytes: stderr.length, stderrSha256: sha(stderr) };
+  fs.writeFileSync(path.join(root, "receipt.json"), JSON.stringify(receipt, null, 2));
+  t.diagnostic(JSON.stringify(receipt));
+  assert.ifError(result.error); assert.equal(result.signal, null);
+  assert.ok(stdout.length <= 1_048_576 && stderr.length <= 1_048_576);
+  return { code: result.status, stdout: stdout.toString("utf8"), stderr: stderr.toString("utf8") };
+}
+
+test("S32 v2 exact metadata declares commit-bound projection observation", { timeout: 120_000 }, t => {
+  for (const equal of [false, true]) {
+    const r = v2Replay(t, jsonlStream({ v: 2, unchanged: equal, matching: 1 }, equal ? [] : [jsonlRow()]),
+      equal ? ["--since-generation", "7"] : []);
+    assert.equal(r.code, 0); assert.equal(r.stderr, "");
+    const actual = JSON.parse(r.stdout) as Rec;
+    assert.deepEqual(Object.keys(actual).sort(), [...ENVELOPE_KEYS, "validation"].sort());
+    assert.deepEqual(actual, { v: 2, generation: 7, unchanged: equal, matching: 1, oversize: 0,
+      more: false, next_after: null, rows: equal ? [] : [jsonlRow()], evidence: "registry-observation",
+      completion_fact: null, read_bound_bytes: READ_CAP, scan: "projection-full", validation: "commit-bound-projection" });
+  }
+});
+
+const v2Missing = jsonlRow(); delete v2Missing.track;
+const v2Mutants: Array<[string, string, string[]]> = [
+  ["unsupported version zero", jsonlStream({ v: 0 }), []],
+  ["unsupported version three", jsonlStream({ v: 3 }), []],
+  ["version string", jsonlStream({ v: "2" }), []],
+  ["version boolean", jsonlStream({ v: true }), []],
+  ["extra header", jsonlStream({ v: 2, extra: 1 }), []],
+  ["backend cannot claim full authority scan", jsonlStream({ v: 2, scan: "full" }), []],
+  ["backend cannot add validation", jsonlStream({ v: 2, validation: "full" }), []],
+  ["missing row field", jsonlStream({ v: 2 }, [v2Missing]), []],
+  ["private gate flag", jsonlStream({ v: 2 }, [jsonlRow({ gated: true })]), []],
+  ["nested field", jsonlStream({ v: 2 }, [jsonlRow({ track: {} })]), []],
+  ["oversized display", jsonlStream({ v: 2 }, [jsonlRow({ track: "x".repeat(257) })]), []],
+  ["empty identity", jsonlStream({ v: 2 }, [jsonlRow({ dispatch_id: "" })]), []],
+  ["row count", jsonlStream({ v: 2, rows: 2, matching: 2 }), []],
+  ["matching count", jsonlStream({ v: 2, matching: 0 }), []],
+  ["cursor missing", jsonlStream({ v: 2, more: true }), []],
+  ["unsafe cursor", jsonlStream({ v: 2, more: true, next_after: "../bad" }), []],
+  ["unexpected unchanged", jsonlStream({ v: 2, unchanged: true }, []), []],
+  ["rows above limit", jsonlStream({ v: 2 }, [jsonlRow(), jsonlRow({ dispatch_id: "b" })]), ["--limit", "1"]],
+  ["trailing bytes", jsonlStream({ v: 2 }) + "{}\n", []],
+  ["no final LF", jsonlStream({ v: 2 }).slice(0, -1), []],
+  ["CRLF", jsonlStream({ v: 2 }).replace(/\n/g, "\r\n"), []],
+  ["non ASCII", jsonlStream({ v: 2 }, [jsonlRow({ track: "é" })]), []],
+];
+for (const [name, stream, flags] of v2Mutants)
+  test(`S33 v2 parser refuses ${name}`, { timeout: 120_000 }, t => {
+    refused(v2Replay(t, stream, flags), 3, name, "malformed_output");
+  });
