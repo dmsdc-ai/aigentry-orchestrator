@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import fsDefault from "node:fs";
 import osDefault from "node:os";
 import childDefault from "node:child_process";
-import moduleDefault, { register, syncBuiltinESMExports } from "node:module";
+import { register, syncBuiltinESMExports } from "node:module";
 import { assertFixtureSrtSpawn } from "./_srt-loader.js";
 import { assertFixtureRoot } from "./fixture.js";
 
@@ -44,15 +44,6 @@ osDefault.uptime = () => 1000;
 if (mode === "runner") {
   const barrier = process.env.R2_BARRIER;
   register(new URL("./_srt-loader.js", import.meta.url), import.meta.url);
-  const realCreateRequire = moduleDefault.createRequire;
-  moduleDefault.createRequire = ((filename: string | URL) => {
-    const request = realCreateRequire(filename);
-    const realResolve = request.resolve.bind(request);
-    request.resolve = ((id: string, options?: { paths?: string[] }) => id === "@anthropic-ai/sandbox-runtime/package.json"
-      ? "/Users/duckyoungkim/projects/aigentry-orchestrator/node_modules/@anthropic-ai/sandbox-runtime/package.json"
-      : realResolve(id, options)) as typeof request.resolve;
-    return request;
-  }) as typeof moduleDefault.createRequire;
   const info = JSON.parse(realRead(path.join(root, "managed-info.json"), "utf8")) as {
     manifest: string; provider: string; grantId: string };
   const manifest = JSON.parse(realRead(info.manifest, "utf8")) as { command: string[] };
