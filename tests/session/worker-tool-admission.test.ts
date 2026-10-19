@@ -24,6 +24,8 @@ import {
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { CLAUDE_TOOL_POLICY_FLAGS, CLAUDE_WORKER_TOOLS, claudeToolPolicyViolation } from "../../src/session/worker-sandbox.js";
+import type { WorkerManifestV2 } from "../../src/session/worker-sandbox.js";
+import type { ConfigV2 } from "../../src/environment/contract.js";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..", "..", "..");
 const BOOT = join(REPO_ROOT, "bin", "boot-prepare.mjs");
@@ -208,14 +210,54 @@ test("claude: exact closed 8-tool set, one --tools and one --allowedTools, same 
     "CLAUDE_CODE_TMPDIR", "CLAUDE_CONFIG_DIR", "HOME", "LANG", "PATH", "SHELL", "TEMP", "TERM", "TMP", "TMPDIR"]);
   assert.equal(e.AIGENTRY_REPORT_OUTBOX, outbox);
   assert.equal(e.CLAUDE_CONFIG_DIR, join(home, ".claude"));
-  // #1232: the host login is never copied; the opted-in token travels only through the sealed handoff marker.
+  // #1232: the host login is never copied; the opted-in token is delivered only through the managed grant.
   assert.equal(existsSync(join(home, ".claude", ".credentials.json")), false);
   const fsCfg = (p.m.config as Json).filesystem as Json;
   assert.deepEqual((fsCfg.allowWrite as string[]).slice(1), [home, e.TMPDIR]);
   // #1206: scope extra (api.anthropic.com) kept first, then the code-owned claude provider hosts, deduplicated.
   assert.deepEqual(((p.m.config as Json).network as Json).allowedDomains, ["api.anthropic.com:443", "claude.ai:443",
     "platform.claude.com:443", "statsig.anthropic.com:443", "console.anthropic.com:443"]);
-  assert.ok(String(p.m.claudeOAuthHandoff).endsWith(join(String(p.m.attempt), "claude-oauth", "token")), "handoff marker present");
+  assert.equal(p.m.version, 2);
+  const managed = p.m as unknown as WorkerManifestV2;
+  const config = JSON.parse(read(join(W.root, "environment", "config.json"))) as ConfigV2;
+  assert.equal(config.version, 2);
+  assert.equal(config.controller.canonicalRoot, realpathSync(W.root));
+  assert.equal(managed.controllerRootId, config.controller.rootId);
+  assert.equal(managed.authorityGeneration, config.authorityGeneration);
+  assert.deepEqual(managed.launchPolicy, { kind: "managed-secret", restart: "never" });
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  for (const id of [managed.controllerRootId, managed.targetProject.enrollmentId, managed.delivery.grantId]) {
+    assert.match(id, uuid);
+  }
+  const project = config.projectEnrollments[managed.targetProject.enrollmentId]!;
+  const projectStat = lstatSync(realpathSync(roleCwd));
+  assert.equal(project.enabled, true);
+  assert.deepEqual(managed.targetProject, { enrollmentId: managed.targetProject.enrollmentId,
+    canonicalRoot: realpathSync(roleCwd), identity: { dev: String(projectStat.dev), ino: String(projectStat.ino) },
+    epoch: project.securityEpoch });
+  assert.equal(project.canonicalRoot, managed.targetProject.canonicalRoot);
+  assert.deepEqual(project.identity, managed.targetProject.identity);
+  const grantRoot = join(W.root, "environment", "grants", managed.delivery.grantId);
+  assert.equal(managed.delivery.grantArtifact, join(grantRoot, "grant.json"));
+  const grant = JSON.parse(read(managed.delivery.grantArtifact)) as Json;
+  assert.match(String(grant.bindingId), uuid);
+  const binding = config.bindings[String(grant.bindingId)]!;
+  assert.equal(binding.enabled, true);
+  assert.deepEqual(binding.projectEnrollmentIds, [managed.targetProject.enrollmentId]);
+  assert.equal(binding.source.kind, "invocation-input");
+  assert.equal(binding.descriptorId, "claude.worker.oauth");
+  assert.deepEqual(binding.executableBinding, managed.executable);
+  assert.equal(managed.executable.path, cmd[0]);
+  assert.deepEqual(grant, { version: 1, grantId: managed.delivery.grantId,
+    controllerRootId: managed.controllerRootId, authorityGeneration: managed.authorityGeneration,
+    task: TASK, sid: "p1", attempt: managed.attempt, consumerId: "claude-confined-worker",
+    executableBinding: managed.executable, projectEnrollmentId: managed.targetProject.enrollmentId,
+    targetRootIdentity: managed.targetProject.identity, configRevision: config.revision,
+    bindingId: grant.bindingId, bindingEpoch: binding.securityEpoch, projectEpoch: managed.targetProject.epoch,
+    destinationId: "claude-code-oauth-env", issuedAt: grant.issuedAt, expiresAt: grant.expiresAt });
+  assert.ok(Number.isSafeInteger(grant.issuedAt));
+  assert.equal(grant.expiresAt, Number(grant.issuedAt) + 300_000);
+  assert.equal(Object.hasOwn(p.m, "claudeOAuthHandoff"), false);
   assert.ok(!JSON.stringify(p.m).includes(W.workerToken), "the token never enters the manifest");
 });
 

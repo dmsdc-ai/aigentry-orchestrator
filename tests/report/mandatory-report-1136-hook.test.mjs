@@ -322,6 +322,7 @@ if (POSIX) test("H-09 prepareWorkerSandbox stages the hook read-only + sealed, a
   const run = H.makeRun("h09");
   const prep = path.join(run.fakes, "prepare-sandbox");
   fs.symlinkSync(path.join(HERE, "mandatory-report-1170.fakes.mjs"), prep);
+  H.fixtureClaude(run);
   H.fake(run, "apply_patch", "#!/bin/sh\nexit 97\n");
   H.privDir(path.join(run.home, ".claude"));
   H.writePriv(path.join(run.home, ".claude", ".credentials.json"),

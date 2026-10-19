@@ -124,6 +124,25 @@ export function fake(run, name, body, dir = run.fakes) {
   return p;
 }
 
+/** Opt-in staging-only Node CLI: default tripwires remain, accidental execution is a failure. */
+export function fixtureClaude(run) {
+  const file = path.join(run.fakes, "claude");
+  const body = `#!${process.execPath}\n` +
+    `require("node:fs").appendFileSync(${JSON.stringify(run.tripLog)}, "claude-fixture unexpected invocation\\n");\n` +
+    `process.exit(97);\n`;
+  try { fs.writeFileSync(file, body, { flag: "wx", mode: 0o700 }); }
+  catch (e) {
+    // Repeated preparations must keep the executable identity pinned by the real binding.
+    if (e.code !== "EEXIST") throw e;
+    const st = fs.lstatSync(file);
+    if (!st.isFile() || st.isSymbolicLink() || st.uid !== process.getuid?.() ||
+        (st.mode & 0o777) !== 0o700 || fs.readFileSync(file, "utf8") !== body) {
+      throw new Error("FIXTURE_CLAUDE_CHANGED");
+    }
+  }
+  return file;
+}
+
 export function sh(cmd, args, opts = {}) {
   const r = spawnSync(cmd, args, { encoding: "utf8", timeout: 60000, ...opts });
   return { status: r.status, signal: r.signal, stdout: r.stdout ?? "", stderr: r.stderr ?? "", error: r.error };

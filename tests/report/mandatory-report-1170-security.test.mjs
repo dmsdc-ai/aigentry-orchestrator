@@ -289,6 +289,7 @@ if (POSIX) test("S-09 prepareWorkerSandbox refuses control-root overlap BEFORE a
   const run = H.makeRun("s09");
   const prep = path.join(run.fakes, "prepare-sandbox");
   fs.symlinkSync(fileURLToPath(new URL("./mandatory-report-1170.fakes.mjs", import.meta.url)), prep);
+  H.fixtureClaude(run);
   H.fake(run, "apply_patch", "#!/bin/sh\nexit 97\n");
   H.privDir(path.join(run.home, ".claude"));
   H.writePriv(path.join(run.home, ".claude", ".credentials.json"),

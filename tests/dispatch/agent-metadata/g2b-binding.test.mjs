@@ -7,7 +7,7 @@ import * as path from "node:path";
 import { test } from "node:test";
 
 import {
-  DIST, fake, hermeticEnv, makeRun, mkfifo, privDir, sealedFixture, sh, sha256, uuid, writePriv, HERE,
+  DIST, fake, fixtureClaude, hermeticEnv, makeRun, mkfifo, privDir, sealedFixture, sh, sha256, uuid, writePriv, HERE,
 } from "./support/harness.mjs";
 
 const READER = path.join(DIST, "src/session/agent-binding.js");
@@ -30,6 +30,7 @@ function assertNoTrip(run) {
 
 /** Stage a real sealed attempt with the REAL prepareWorkerSandbox (fake creds/cli). */
 function prepare(run, { sid = "w1162-p", task = "1162", launch, stagingRoot } = {}) {
+  fixtureClaude(run);
   fake(run, "apply_patch", "#!/bin/sh\nexit 97\n");
   privDir(path.join(run.home, ".claude"));
   writePriv(path.join(run.home, ".claude", ".credentials.json"),
