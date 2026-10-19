@@ -14,10 +14,14 @@ platform::has_tmux_session() {
 # platform::spawn_tmux_window <name> <cwd> <cmd>
 # Wraps `tmux new-window`. Name becomes the window label, cwd the starting dir.
 platform::spawn_tmux_window() {
-  local name="${1:-}" cwd="${2:-}" cmd="${3:-}"
+  local name="${1:-}" cwd="${2:-}" cmd="${3:-}" tmux_bin=tmux
   [[ -z "$name" || -z "$cwd" || -z "$cmd" ]] && { echo "spawn_tmux_window: 3 args" >&2; return 2; }
-  command -v tmux >/dev/null 2>&1 || { echo "tmux not installed" >&2; return 4; }
-  tmux new-window -c "$cwd" -n "$name" "$cmd"
+  if [[ -n "${AIGENTRY_MANAGED_BIN_DIR:-}" ]]; then
+    tmux_bin="$AIGENTRY_MANAGED_BIN_DIR/tmux"
+    [[ -x "$tmux_bin" && ! -L "$tmux_bin" ]] || { echo "ENV_HELPER_PATH_REFUSED" >&2; return 78; }
+  fi
+  command -v "$tmux_bin" >/dev/null 2>&1 || { echo "tmux not installed" >&2; return 4; }
+  "$tmux_bin" new-window -c "$cwd" -n "$name" "$cmd"
 }
 
 # platform::spawn_iterm_tab <cwd> <cmd>  (macOS-only, via AppleScript)
@@ -39,10 +43,14 @@ platform::spawn_tmux_window() {
 # word-split. Values carried inside it are the caller's to quote -- _wh_iterm_open %q's
 # the sid before building it.
 platform::spawn_iterm_tab() {
-  local cwd="${1:-}" cmd="${2:-}"
+  local cwd="${1:-}" cmd="${2:-}" osascript_bin=osascript
   [[ -z "$cwd" || -z "$cmd" ]] && { echo "spawn_iterm_tab: 2 args" >&2; return 2; }
   [[ "$(platform::os_type)" == "macos" ]] || { echo "iTerm requires macOS" >&2; return 4; }
-  osascript - "$cwd" "$cmd" >/dev/null 2>&1 <<'APPLESCRIPT'
+  if [[ -n "${AIGENTRY_MANAGED_BIN_DIR:-}" ]]; then
+    osascript_bin="$AIGENTRY_MANAGED_BIN_DIR/osascript"
+    [[ -x "$osascript_bin" && ! -L "$osascript_bin" ]] || { echo "ENV_HELPER_PATH_REFUSED" >&2; return 78; }
+  fi
+  "$osascript_bin" - "$cwd" "$cmd" >/dev/null 2>&1 <<'APPLESCRIPT'
 on run argv
   set theCwd to item 1 of argv
   set theCmd to item 2 of argv

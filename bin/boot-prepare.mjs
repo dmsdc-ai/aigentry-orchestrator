@@ -59,7 +59,7 @@
 
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync, rmSync, statSync } from "node:fs";
 import {
   appendFile,
   chmod,
@@ -68,6 +68,7 @@ import {
   readdir,
   readFile,
   realpath,
+  rm,
   rename,
   symlink,
   unlink,
@@ -79,7 +80,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import * as winPrivate from "./lib/win-private-storage.mjs";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = resolve(SCRIPT_DIR, "..");
+let REPO_ROOT = resolve(SCRIPT_DIR, "..");
 
 function die(msg, code = 1) {
   process.stderr.write(`boot-prepare: ${msg}\n`);
@@ -128,7 +129,7 @@ function aigentryHome() {
     : join(homedir(), ".aigentry");
 }
 
-function ensureInstructionsTree() {
+function ensureInstructionsTree(helperRuntime, boundary) {
   const root = instructionsRoot();
   const commonPath = join(root, "common.md");
   if (existsSync(commonPath)) return root;
@@ -139,9 +140,17 @@ function ensureInstructionsTree() {
       2,
     );
   }
-  const r = spawnSync("bash", [installer], {
+  let bash = "bash", env = { ...process.env };
+  if (helperRuntime) {
+    bash = boundary.trustedTool(helperRuntime, "bash");
+    boundary.pinTrustedFile(helperRuntime, "boot", installer);
+    env = boundary.instructionsInstallerEnvironment(helperRuntime, process.env);
+    boundary.assertTrustedTool(helperRuntime, "bash", bash);
+    boundary.assertTrustedFile(helperRuntime, "boot", installer);
+  }
+  const r = spawnSync(bash, [installer], {
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env },
+    env,
   });
   if (r.status !== 0) {
     const err = r.stderr ? r.stderr.toString().trim() : "(no stderr)";
@@ -501,11 +510,46 @@ function assertCwdSafe(cwd) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  let explicitRaw = process.env.AIGENTRY_CLAUDE_OAUTH_TOKEN;
+  delete process.env.AIGENTRY_CLAUDE_OAUTH_TOKEN;
+  const { centralEnvironment } = await import("./model-evidence.mjs");
   if (!args.role) die("--role required", 4);
   if (!args.cwd) die("--cwd required", 4);
   if (!args.sid) die("--sid required", 4);
   assertSidSafe(args.sid);
   assertCwdSafe(args.cwd);
+  try {
+    const central = await centralEnvironment(process.env, { role: args.role, targetCwd: args.cwd,
+      ...(process.argv.includes("--cli") ? { flags: { "dispatch.cli": args.cli } } : {}) });
+    if (!process.argv.includes("--cli") && central.env.AIGENTRY_DISPATCH_CLI && central.env.AIGENTRY_DISPATCH_CLI !== "auto") args.cli = central.env.AIGENTRY_DISPATCH_CLI;
+    REPO_ROOT = central.runtimeRoot;
+    // Only registered nonsecret aliases are added; token/scope/identity lifecycles
+    // remain owned by the existing launcher. This is this Node invocation only.
+    for (const [key, value] of Object.entries(central.env)) {
+      if (process.env[key] !== value && value !== undefined) process.env[key] = value;
+    }
+  } catch { die("ENV_CONFIGURATION_REFUSED", 4); }
+  let explicitController = null;
+  let claudeOAuth = null;
+  let legacyInput;
+  let acquisitionKind = "absent";
+  const claudeOAuthModule = join(REPO_ROOT, "dist/src/session/claude-worker-oauth.js");
+  if (args.cli === "claude" && !args.confined) {
+    try {
+      const selector = await import(pathToFileURL(claudeOAuthModule).href);
+      const acquired = selector.acquireClaudeOAuthInput({ AIGENTRY_CLAUDE_OAUTH_TOKEN: explicitRaw });
+      legacyInput = acquired.input; acquisitionKind = acquired.kind;
+      if (legacyInput) claudeOAuth = selector;
+    } catch (e) { die(e?.message === "CLAUDE_OAUTH_TOKEN_INVALID" ? "CLAUDE_OAUTH_TOKEN_INVALID" : "CLAUDE_OAUTH_STORE_INVALID", 78); }
+  }
+  explicitRaw = undefined;
+  process.once("exit", () => legacyInput?.dispose());
+  if (legacyInput) {
+    try {
+      const { controllerContext } = await import(pathToFileURL(join(REPO_ROOT, "dist/src/environment/grants.js")).href);
+      explicitController = controllerContext(aigentryHome());
+    } catch { die("ENV_SCHEMA_UPGRADE_REQUIRED: explicit Claude handoff requires config v2", 78); }
+  }
   // #532: gate lifted from claude-only to claude|codex|gemini. Unknown CLIs are
   // still rejected here (and again by getBootAdapter's registry) with a non-zero
   // exit + clear stderr — never a silent broken contract.
@@ -537,7 +581,24 @@ async function main() {
     }
   }
 
-  ensureInstructionsTree();
+  let helperEnvironment = { ...process.env };
+  let helperRuntime = null;
+  let helperBoundary = null;
+  if (decision || explicitController) {
+    const boundary = await import(pathToFileURL(join(REPO_ROOT, "dist/src/environment/helper-env.js")).href);
+    try {
+      helperRuntime = boundary.captureManagedRuntime(process.env, join(explicitController?.home ?? aigentryHome(), "environment"));
+      helperEnvironment = boundary.helperEnvironment(helperRuntime, "boot", process.env);
+      helperBoundary = boundary;
+      process.once("exit", () => rmSync(helperRuntime.temporary, { recursive: true, force: true }));
+    } catch { die("ENV_HELPER_PATH_REFUSED", 78); }
+  }
+
+  try { ensureInstructionsTree(helperRuntime, helperBoundary); }
+  catch (e) {
+    if (helperRuntime) die(e?.message === "ENV_HELPER_INPUT_REFUSED" ? e.message : "ENV_HELPER_PATH_REFUSED", 78);
+    throw e;
+  }
 
   const distMarker = join(
     REPO_ROOT,
@@ -571,18 +632,6 @@ async function main() {
   // byte-for-byte; --confined is owned by prepareWorkerSandbox (the stub below
   // still refuses), and codex/gemini/grok never read it. Validated before any
   // side effect; errors are fixed strings and never carry the value.
-  let claudeOAuth = null;
-  let claudeOAuthToken;
-  const claudeOAuthModule = join(REPO_ROOT, "dist/src/session/claude-worker-oauth.js");
-  if (args.cli === "claude" && !args.confined && process.env.AIGENTRY_CLAUDE_OAUTH_TOKEN) {
-    claudeOAuth = await import(pathToFileURL(claudeOAuthModule).href);
-    try {
-      claudeOAuthToken = claudeOAuth.selectedClaudeOAuthToken(process.env);
-    } catch {
-      die("CLAUDE_OAUTH_TOKEN_INVALID: AIGENTRY_CLAUDE_OAUTH_TOKEN must be one line of printable ASCII (max 4096); refusing launch", 4);
-    }
-  }
-
   // Sandbox cwd: $HOME/.aigentry/role-sandbox/<role>-<sid>/ (hybrid (c) leg).
   // Contains no CLAUDE.md → cwd auto-discovery yields no project memory.
   const sandboxCwd = join(
@@ -628,14 +677,20 @@ async function main() {
   };
 
   const adapter = getBootAdapter(args.cli, geminiBinary());
-  const cmd = await adapter.buildBootCommand(ctx, resolved, {
-    staging_dir: stagingDir,
-    fs,
-    spawner: nodeSpawner(),
-    // #1148: the bound executable replaces the version/capability probe and is argv[0];
-    // the adapter applies the decision's model/effort (no env/literal default).
-    ...(decision ? { executable: decision.executable, decision } : {}),
-  });
+  let cmd;
+  try {
+    cmd = await adapter.buildBootCommand(ctx, resolved, {
+      staging_dir: stagingDir,
+      fs,
+      spawner: nodeSpawner(helperEnvironment),
+      environment: helperEnvironment,
+      // #1148: the bound executable replaces the version/capability probe and is argv[0];
+      // the adapter applies the decision's model/effort (no env/literal default).
+      ...(decision ? { executable: decision.executable, decision } : {}),
+    });
+  } finally {
+    if (helperRuntime) await rm(helperRuntime.temporary, { recursive: true, force: true });
+  }
 
   if (!existsSync(cmd.prompt_file)) {
     die(`buildBootCommand returned but ${cmd.prompt_file} missing`, 2);
@@ -739,13 +794,28 @@ async function main() {
   // time. Neither the token nor a digest of it enters the stdout descriptor,
   // argv or launcher source. Retained (no auto-cleanup) so a relaunch works.
   let oauthLines = "";
+  let explicitReceipt = null;
   if (claudeOAuth) {
     try {
-      oauthLines = claudeOAuth.claudeOAuthLauncherLines(claudeOAuth.writeClaudeOAuthHandoff(
-        join(stagingDir, `${claudeOAuth.CLAUDE_OAUTH_DIR}-${randomUUID()}`), claudeOAuthToken),
-        process.execPath, claudeOAuthModule);
-    } catch {
-      die("CLAUDE_OAUTH_HANDOFF_WRITE: could not stage the private Claude worker token handoff; refusing launch", 2);
+      const absoluteExecutable = cmd.argv[0].startsWith("/") ? cmd.argv[0] :
+        (process.env.PATH || "").split(":").filter(p => p.startsWith("/"))
+          .map(p => join(p, cmd.argv[0])).find(p => { try { return statSync(p).isFile(); } catch { return false; } });
+      if (!absoluteExecutable) throw new Error("ENV_BINDING_POLICY_REFUSED");
+      const real = realpathSync.native(absoluteExecutable), stat = statSync(real);
+      const executable = { cli: "claude", path: absoluteExecutable, realpath: real, dev: stat.dev, ino: stat.ino,
+        size: stat.size, mtimeMs: stat.mtimeMs, version: null, versionSource: "unknown" };
+      if (acquisitionKind === "store") {
+        legacyInput?.dispose(); legacyInput = undefined;
+        const fresh = claudeOAuth.acquireClaudeOAuthInput({});
+        if (!fresh.input) throw new Error("SANDBOX_AUTH_WORKER_TOKEN_REQUIRED");
+        legacyInput = fresh.input;
+      }
+      explicitReceipt = claudeOAuth.prepareExplicitClaudeHandoff(explicitController, legacyInput,
+        { sid: args.sid, attempt: randomUUID(), executable, command: [absoluteExecutable, ...flagsArgv] });
+      oauthLines = `unset AIGENTRY_CLAUDE_OAUTH_TOKEN NODE_OPTIONS NODE_PATH BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH\n`;
+    } catch (e) {
+      legacyInput?.dispose();
+      die(/^(?:ENV_|CLAUDE_OAUTH_|SANDBOX_AUTH_)/.test(e?.message ?? "") ? e.message : "CLAUDE_OAUTH_HANDOFF_WRITE", 78);
     }
   }
   const launcherBody =
@@ -758,7 +828,9 @@ async function main() {
     `export AIGENTRY_TARGET_CWD=${shellQuote(args.cwd)}\n` +
     homeExportLines +
     oauthLines +
-    `exec -a ${shellQuote(args.cli)} ${shellQuote(execName)} ${flagsLine} "$@"\n`;
+    (explicitReceipt
+      ? `exec ${shellQuote(process.execPath)} ${shellQuote(claudeOAuthModule)} --launch-explicit ${shellQuote(explicitReceipt.receipt)}\n`
+      : `exec -a ${shellQuote(args.cli)} ${shellQuote(execName)} ${flagsLine} "$@"\n`);
   // writeFile with mode atomically sets +x — avoids a separate chmodSync call
   // (CWE-23 Snyk avoidance: single FS op on the validated path).
   await writeFile(launcherPath, args.confined
@@ -775,6 +847,8 @@ async function main() {
     // a missing/invalid record (external adapter) is explicit unknown.
     launch: normalizeLaunch(args.cli, cmd.launch),
     ...(decision ? { decision } : {}),
+    ...(explicitReceipt ? { launchPolicy: { kind: "managed-secret", restart: "never" },
+      explicitHandoffReceipt: explicitReceipt.receipt } : {}),
   };
   process.stdout.write(JSON.stringify(out) + "\n");
 }

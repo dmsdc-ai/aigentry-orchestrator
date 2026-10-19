@@ -9,7 +9,10 @@ export function registryInvocation(script: string, args: string[], platform: Nod
 
 /** Python's redirected output must be UTF-8 even when Windows defaults to cp1252. */
 export function registryEnvironment(inherited: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  return { ...inherited, PYTHONIOENCODING: "utf-8" };
+  const result: NodeJS.ProcessEnv = { PYTHONIOENCODING: "utf-8" };
+  for (const key of ["HOME", "PATH", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "TERM", "DISPATCH_STATE_DIR"])
+    if (inherited[key] !== undefined) result[key] = inherited[key];
+  return result;
 }
 
 /** Windows reads the Python source; POSIX executes its shebang. */

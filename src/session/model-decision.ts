@@ -39,7 +39,7 @@ export interface EffortSelection {
   state: EffortState;
 }
 
-export type RequestSource = "flag" | "env" | "role-config" | "none";
+export type RequestSource = "flag" | "env" | "project" | "profile" | "settings" | "role-config" | "none";
 
 export interface SpawnRequest {
   cli?: string;
@@ -88,7 +88,7 @@ const EFFORT_CHANNEL: Record<DecisionCli, EffortChannel> = {
   codex: "argv:-c model_reasoning_effort",
 };
 const EFFORT_STATES: readonly EffortState[] = ["explicit", "explicit-unverified", "model-default", "policy", "omitted"];
-const REQUEST_SOURCES: readonly RequestSource[] = ["flag", "env", "role-config", "none"];
+const REQUEST_SOURCES: readonly RequestSource[] = ["flag", "env", "project", "profile", "settings", "role-config", "none"];
 const VERSION_SOURCES: readonly VersionSource[] = ["npm-package-metadata", "operator-declared", "unknown"];
 
 function fail(field: string): never {

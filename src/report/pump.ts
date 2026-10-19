@@ -27,6 +27,8 @@ import { performance } from "node:perf_hooks";
 
 import { parseInjectId } from "../dispatch/inject-id.js";
 import { registryEnvironment, registryInvocation } from "../dispatch/registry-command.js";
+import { validatedTeleptyPort } from "../telepty/http.js";
+import { strictJson } from "../environment/contract.js";
 import { defaultPathConfig } from "../session/persist-context.js";
 import { readPrivate, readSealedManifest } from "../session/worker-sandbox.js";
 import {
@@ -296,8 +298,10 @@ export function resolveDestination(fromSid: string, orchestratorSid: string, wor
 }
 
 export function teleptyChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const e = { ...base };
-  for (const k of TELEPTY_IDENTITY_ENV) delete e[k];
+  const e: NodeJS.ProcessEnv = { HOME: os.userInfo().homedir };
+  for (const k of ["PATH", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "TERM"])
+    if (base[k] !== undefined) e[k] = base[k];
+  if (base.TELEPTY_PORT !== undefined) e.TELEPTY_PORT = String(validatedTeleptyPort(base.TELEPTY_PORT));
   return e;
 }
 
@@ -431,12 +435,17 @@ function locate(row: ReportRow, deps: PumpDeps): Chain {
   return { ok: true, task: m.task, attempt: m.attempt, root, manifestSha: row.manifest_sha256, receipt: m.receipt, hookAnomaly };
 }
 
-function readReceipt(file: string, deps: PumpDeps): { receipt: ScanResult["receipt"]; pidsAlive: boolean | null } {
+function readReceipt(file: string, deps: PumpDeps, attempt: string, hash: string):
+  { receipt: ScanResult["receipt"]; pidsAlive: boolean | null } {
   try {
-    const r: unknown = JSON.parse(readPrivate(file, 4096));
+    const r: unknown = strictJson(readPrivate(file, 4096));
     if (!isRecord(r)) return { receipt: "unknown", pidsAlive: null };
-    if (r.state === "exited") return { receipt: "exited", pidsAlive: null };
+    const keys = Object.keys(r).sort().join(",");
+    if (r.state === "exited") return keys === "attempt,code,state" && r.attempt === attempt &&
+      Number.isSafeInteger(r.code) ? { receipt: "exited", pidsAlive: null } : { receipt: "unknown", pidsAlive: null };
     if (r.state !== "running") return { receipt: "unknown", pidsAlive: null };
+    if (keys !== "attempt,checkedAt,childPid,hash,state,supervisorPid" || r.attempt !== attempt ||
+        r.hash !== hash || typeof r.checkedAt !== "string") return { receipt: "unknown", pidsAlive: null };
     const pids = [r.supervisorPid, r.childPid].filter((p): p is number => typeof p === "number" && Number.isSafeInteger(p) && p > 1);
     if (pids.length !== 2) return { receipt: "running", pidsAlive: null };
     const alive = pids.map((p) => deps.pidAlive(p));
@@ -593,7 +602,7 @@ function processRecord(row: ReportRow, deps: PumpDeps, policy: PumpPolicy, res: 
   let hookDegraded: string[] = [];
   if (chain.ok) {
     ({ items, invalid, markers: hookDegraded } = scanOutbox(row, chain, res));
-    ({ receipt, pidsAlive } = readReceipt(chain.receipt, deps));
+    ({ receipt, pidsAlive } = readReceipt(chain.receipt, deps, row.attempt!, row.manifest_sha256!));
     if (chain.hookAnomaly) addError(res, did, chain.hookAnomaly);
   } else {
     addError(res, did, chain.code);

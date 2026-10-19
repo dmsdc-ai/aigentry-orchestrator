@@ -4,7 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve, sep } from "node:path";
 import { writeNpmCmdShim } from "./boot-adapter/_win-launch-fixture.js";
@@ -12,7 +12,6 @@ import { writeNpmCmdShim } from "./boot-adapter/_win-launch-fixture.js";
 const REPO_ROOT = resolve(import.meta.dirname, "..", "..", "..");
 const BOOT_PREPARE = join(REPO_ROOT, "bin", "boot-prepare.mjs");
 const SHIMS = ["claude", "codex", "gemini", "agy", "grok"];
-const UNKNOWN = { value: "unknown", source: "unknown" };
 const CLI_DEF = { value: "unknown", source: "cli-default" };
 
 interface Out {
@@ -123,11 +122,28 @@ test("BP2 claude configured env reaches argv once and launch as env:<NAME>", () 
     effort: { value: "low", source: "env:AIGENTRY_CLAUDE_EFFORT" } });
 });
 
-test("BP3 invalid label: argv/launcher keep raw value, launch reports unknown", () => {
-  const { out, launcher } = run("claude", { AIGENTRY_CLAUDE_MODEL: "claude-opus-5[1m]", AIGENTRY_CLAUDE_EFFORT: "MAX" });
-  assert.deepEqual(out.argv.slice(3, 7), ["--model", "claude-opus-5[1m]", "--effort", "MAX"]);
-  assert.ok(execLine(launcher).includes("--model 'claude-opus-5[1m]' --effort MAX"), execLine(launcher));
-  assert.deepEqual(out.launch, { v: 2, cli: "claude", model: UNKNOWN, effort: UNKNOWN });
+test("BP3 bracketed model reaches exact argv and known launch metadata", () => {
+  const { out } = run("claude", { AIGENTRY_CLAUDE_MODEL: "claude-opus-5[1m]" });
+  assert.deepEqual(out.argv.slice(3), ["--model", "claude-opus-5[1m]", "--effort", "xhigh", "--permission-mode", "bypassPermissions"]);
+  assert.deepEqual(out.launch, { v: 2, cli: "claude",
+    model: { value: "claude-opus-5[1m]", source: "env:AIGENTRY_CLAUDE_MODEL" },
+    effort: { value: "xhigh", source: "default" } });
+});
+
+test("BP3 MAX effort refuses before staging", () => {
+  for (const bad of [{ AIGENTRY_CLAUDE_EFFORT: "MAX" }, { AIGENTRY_CLAUDE_MODEL: "claude-opus-5[1m]", AIGENTRY_CLAUDE_EFFORT: "MAX" }]) {
+    const f = fixture();
+    try {
+      const sid = "t1162-invalid";
+      const r = spawnSync(process.execPath,
+        [BOOT_PREPARE, "--role", "coder", "--cwd", f.target, "--sid", sid, "--cli", "claude"],
+        { env: f.env(bad), encoding: "utf8" });
+      assert.equal(r.status, 4);
+      assert.match(r.stderr, /^boot-prepare: ENV_CONFIGURATION_REFUSED\n$/);
+      assert.equal(r.stdout, "");
+      assert.equal(existsSync(join(f.home, "sessions", sid)), false);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }
 });
 
 test("BP4 codex / agy / gemini-cli / grok: stdout launch agrees with final argv", () => {
@@ -141,7 +157,7 @@ test("BP4 codex / agy / gemini-cli / grok: stdout launch agrees with final argv"
     ["agy", { AIGENTRY_GEMINI_EFFORT: "high" },
       { v: 2, cli: "gemini", model: { value: "gemini-3.8-flash-high", source: "default" }, effort: { value: "high", source: "env:AIGENTRY_GEMINI_EFFORT" } },
       (a) => assert.deepEqual(a.slice(0, 7), ["agy", "--model", "gemini-3.8-flash-high", "--dangerously-skip-permissions", "--effort", "high", "--prompt-interactive"])],
-    ["gemini", { AIGENTRY_GEMINI_EFFORT: "high" }, { v: 2, cli: "gemini", model: { value: "gemini-2.5-flash", source: "default" }, effort: CLI_DEF },
+    ["gemini", {}, { v: 2, cli: "gemini", model: { value: "gemini-2.5-flash", source: "default" }, effort: CLI_DEF },
       (a) => assert.deepEqual(a, ["gemini", "-m", "gemini-2.5-flash", "--approval-mode", "yolo", "--skip-trust"])],
     ["grok", {}, { v: 2, cli: "grok", model: { value: "grok-4.6", source: "default" }, effort: CLI_DEF },
       (a) => { assert.deepEqual(a.slice(0, 5), ["grok", "--always-approve", "-m", "grok-4.6", "--rules"]); assert.equal(a.length, 6); }],
@@ -155,4 +171,18 @@ test("BP4 codex / agy / gemini-cli / grok: stdout launch agrees with final argv"
     check(out.argv);
     noDup(out.argv);
   }
+});
+
+test("BP4 gemini-cli refuses explicit effort before launcher write", () => {
+  const f = fixture();
+  try {
+    const sid = "t1162-gemini-effort";
+    const r = spawnSync(process.execPath,
+      [BOOT_PREPARE, "--role", "coder", "--cwd", f.target, "--sid", sid, "--cli", "gemini"],
+      { env: f.env({ AIGENTRY_GEMINI_BINARY: "gemini", AIGENTRY_GEMINI_EFFORT: "high" }), encoding: "utf8" });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /^boot-prepare: UNSUPPORTED_CLI: gemini-cli has no effort flag\n$/);
+    assert.equal(r.stdout, "");
+    assert.equal(existsSync(join(f.home, "sessions", sid, "boot", "launcher.sh")), false);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
 });

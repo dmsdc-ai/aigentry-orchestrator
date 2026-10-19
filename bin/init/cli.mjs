@@ -13,33 +13,175 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import readline from "node:readline/promises";
-import {
+// Validate the public route before acquiring its selected pipe. Consume and
+// close an acquired pipe before package imports or an environment snapshot.
+let earlyRaw = process.env.AIGENTRY_CLAUDE_OAUTH_TOKEN;
+delete process.env.AIGENTRY_CLAUDE_OAUTH_TOKEN;
+let earlyBytes;
+let earlyCompatible;
+let earlyOwner;
+let earlyNeedsClaude = false;
+const earlyRoute = process.argv[2];
+const earlyFdCandidates = [];
+const inputFdPattern = /^(?:[3-9]|[1-5][0-9]|6[0-3])$/;
+const earlyValueOptions = new Set([
+  "--target", "--ref", "--from", "--timeout-ms", "--track", "--name", "--cwd", "--worktree",
+  "--cli", "--model", "--effort", "--executable", "--executable-version", "--role", "--task-class",
+  "--task", "--no-task", "--input-root", "--input-manifest", "--input-sha256", "--observe", "--retry-unknown",
+  "--binding",
+]);
+const earlySwitchOptions = new Set(["--spawn-and-dispatch", "--verify-delivered", "--no-verify-started", "--keep-alive"]);
+function preflightDispatchOptions(args) {
+  const seen = new Set();
+  let provider;
+  let fresh = false;
+  for (let i = 0; i < args.length;) {
+    const option = args[i];
+    if (option === "-h" || option === "--help") { earlyNeedsClaude = false; return; }
+    if (earlySwitchOptions.has(option)) {
+      if (seen.has(option)) throw new Error("ENV_DUPLICATE_OPTION");
+      seen.add(option); if (option === "--spawn-and-dispatch") fresh = true; i++; continue;
+    }
+    if (!earlyValueOptions.has(option)) throw new Error("ENV_INPUT_INVALID");
+    if (option !== "--observe" && seen.has(option)) throw new Error("ENV_DUPLICATE_OPTION");
+    seen.add(option);
+    if (!args[i + 1] || args[i + 1].startsWith("-")) throw new Error("ENV_INPUT_INVALID");
+    if (option === "--cli") provider = args[i + 1];
+    i += 2;
+  }
+  earlyNeedsClaude = fresh && (provider === undefined || provider === "auto" || provider === "claude");
+}
+function preflightInputRoute() {
+  if (earlyRoute === "env" && process.argv[3] === "run") {
+    let binding;
+    let split = -1;
+    for (let i = 4; i < process.argv.length; i++) {
+      if (process.argv[i] === "--") { split = i; break; }
+      const option = process.argv[i];
+      if (option !== "--binding" && option !== "--input-fd") throw new Error("ENV_INPUT_INVALID");
+      const value = process.argv[++i];
+      if (!value || value.startsWith("-")) throw new Error("ENV_INPUT_INVALID");
+      if (option === "--binding") {
+        if (binding !== undefined) throw new Error("ENV_DUPLICATE_OPTION");
+        binding = value;
+      } else earlyFdCandidates.push(value);
+    }
+    if (earlyFdCandidates.length > 1) throw new Error("ENV_DUPLICATE_OPTION");
+    if (earlyFdCandidates.length && earlyCompatible) throw new Error("ENV_INPUT_CONFLICT");
+    if (earlyFdCandidates.length && !inputFdPattern.test(earlyFdCandidates[0])) throw new Error("ENV_INPUT_CHANNEL_UNSUPPORTED");
+    if (split < 0 || process.argv[split + 1] !== "dispatch" || !binding ||
+        !/^[0-9a-f-]{36}$/i.test(binding)) throw new Error("ENV_MANAGED_ROUTE_REFUSED");
+    preflightDispatchOptions(process.argv.slice(split + 2));
+  } else if (earlyRoute === "dispatch-compat") {
+    const args = process.argv.slice(3);
+    if (args[0] === "--input-fd") {
+      earlyFdCandidates.push(args[1]);
+      if (!inputFdPattern.test(args[1] ?? "")) throw new Error("ENV_INPUT_CHANNEL_UNSUPPORTED");
+      if (args[2] !== "--") throw new Error("ENV_MANAGED_ROUTE_REFUSED");
+      if (args[3] !== "__probe") preflightDispatchOptions(args.slice(3));
+    } else if (args[0] === "--" && args[1] !== "__probe") preflightDispatchOptions(args.slice(1));
+  }
+}
+function acquireEarlyInput(fd) {
+  const st = fs.fstatSync(fd);
+  if (!(st.isFIFO() || st.isSocket())) throw new Error("ENV_INPUT_CHANNEL_UNSUPPORTED");
+  let closed = false;
+  return { fd, dispose() {
+    if (closed) return;
+    closed = true;
+    try { fs.closeSync(fd); } catch { throw new Error("ENV_INPUT_CHANNEL_UNSUPPORTED"); }
+  } };
+}
+async function earlyRead(owner) {
+  const fd = owner.fd;
+  const chunks = [];
+  let length = 0;
+  const stream = fs.createReadStream("", { fd, autoClose: false, highWaterMark: 4098 });
+  const bytes = await new Promise((resolve, reject) => {
+    let settled = false;
+    const clear = () => { for (const chunk of chunks) chunk.fill(0); };
+    const done = error => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) { clear(); stream.destroy(); reject(error); }
+      else { const value = Buffer.concat(chunks, length); clear(); resolve(value); }
+    };
+    const timer = setTimeout(() => done(new Error("ENV_INPUT_TIMEOUT")), 10_000);
+    stream.on("data", chunk => {
+      if (settled) { chunk.fill(0); return; }
+      length += chunk.length;
+      if (length > 4097) { chunk.fill(0); done(new Error("ENV_INPUT_INVALID")); return; }
+      chunks.push(chunk);
+    });
+    stream.once("error", () => done(new Error("ENV_INPUT_INVALID")));
+    stream.once("end", () => done());
+    stream.once("close", () => done(new Error("ENV_INPUT_INVALID")));
+  });
+  if (bytes.length < 2 || bytes.length > 4097 || bytes[bytes.length - 1] !== 10 ||
+      !bytes.subarray(0, -1).every(b => b >= 0x21 && b <= 0x7e)) {
+    bytes.fill(0); throw new Error("ENV_INPUT_INVALID");
+  }
+  return bytes;
+}
+try {
+  preflightInputRoute();
+  if (earlyRaw && earlyNeedsClaude) {
+    earlyCompatible = Buffer.from(earlyRaw, "utf8");
+    if (earlyCompatible.length < 1 || earlyCompatible.length > 4096 ||
+        !earlyCompatible.every(b => b >= 0x21 && b <= 0x7e)) throw new Error("CLAUDE_OAUTH_TOKEN_INVALID");
+  }
+  earlyRaw = undefined;
+  if (earlyFdCandidates.length && earlyCompatible) throw new Error("ENV_INPUT_CONFLICT");
+  if (earlyFdCandidates.length) {
+    earlyOwner = acquireEarlyInput(Number(earlyFdCandidates[0]));
+    try { if (earlyNeedsClaude) earlyBytes = await earlyRead(earlyOwner); }
+    finally { earlyOwner.dispose(); }
+  }
+} catch (e) {
+  console.error(e?.message?.startsWith("ENV_") || e?.message === "CLAUDE_OAUTH_TOKEN_INVALID" ? e.message : "ENV_INPUT_INVALID");
+  process.exitCode = e?.message === "ENV_MANAGED_ROUTE_REFUSED" || e?.message === "CLAUDE_OAUTH_TOKEN_INVALID" ? 78 : 4;
+  earlyBytes?.fill(0);
+  earlyCompatible?.fill(0);
+  process.exit(process.exitCode);
+}
+const earlyEnvironment = { ...process.env };
+process.once("exit", () => { earlyBytes?.fill(0); earlyCompatible?.fill(0); });
+
+const {
   NATIVE_FILES, assertNoNativeOperation, prepareNativeCapture, beginNativeCapture,
   commitNativeCapture, inspectNativeOperation, restoreNativeOperation, beginLegacyInit,
-} from "./native-capture.mjs";
+} = await import("./native-capture.mjs");
 
-import {
-  MANIFEST,
-  SCAFFOLD_PREFIX,
-  TEMPLATE_TOKENS,
-  templateSubs,
-  substitute,
-  isSubstitutionExempt,
-  isExecutable,
-  STATE_DIRS,
-  AIGENTRY_DIRS,
-  FOREIGN_CONFIG_KEYS,
-} from "./manifest.mjs";
+const {
+  MANIFEST, SCAFFOLD_PREFIX, TEMPLATE_TOKENS, templateSubs, substitute,
+  isSubstitutionExempt, isExecutable, STATE_DIRS, AIGENTRY_DIRS, FOREIGN_CONFIG_KEYS,
+} = await import("./manifest.mjs");
 
-const PKG_ROOT = path.resolve(path.dirname(fs.realpathSync.native(fileURLToPath(import.meta.url))), "..", "..");
+const PKG_ROOT = process.argv[2] === "dispatch-compat" && process.env.AIGENTRY_RUNTIME_PACKAGE_ROOT
+  ? fs.realpathSync.native(process.env.AIGENTRY_RUNTIME_PACKAGE_ROOT)
+  : path.resolve(path.dirname(fs.realpathSync.native(fileURLToPath(import.meta.url))), "..", "..");
 const PKG = JSON.parse(fs.readFileSync(path.join(PKG_ROOT, "package.json"), "utf8"));
-const AIGENTRY_HOME = process.env.AIGENTRY_HOME || path.join(os.homedir(), ".aigentry");
+let initEnvironment;
+let AIGENTRY_HOME;
+async function initializeEnvironment(metadataOnly = false) {
+  try {
+    const { environmentHome } = await import(path.join(PKG_ROOT, "dist/src/environment/storage.js"));
+    if (metadataOnly) initEnvironment = { env: { ...process.env, AIGENTRY_HOME: environmentHome(process.env) } };
+    else {
+      const { bootstrapEnvironment } = await import(path.join(PKG_ROOT, "dist/src/environment/bootstrap.js"));
+      initEnvironment = bootstrapEnvironment(process.env, { targetCwd: fs.realpathSync.native(process.cwd()) });
+    }
+    AIGENTRY_HOME = initEnvironment.env.AIGENTRY_HOME;
+  } catch { console.error("ENV_CONFIGURATION_REFUSED"); process.exit(2); }
+}
 // win32 only: the P2 private-storage primitive for the legacy init lock (C7). Never loaded on POSIX.
 const winStorage = process.platform === "win32" ? await import("../lib/win-private-storage.mjs") : null;
 // win32 only: the Git for Windows bash.exe resolved in step 1 (C5) and used by step 5.
 let gitBash = null;
 
-const USAGE = `aigentry-orchestrator init [--workspace PATH] [--yes] [--dry-run] [--force] [--upgrade]
+const USAGE = `aigentry-orchestrator env locate | list --json | explain ID | doctor --json | set | unset | profile select
+aigentry-orchestrator init [--workspace PATH] [--yes] [--dry-run] [--force] [--upgrade]
 
   --workspace PATH  where the control workspace goes (default: ~/aigentry/_orchestrator,
                     or $AIGENTRY_CONTROL_WORKSPACE)
@@ -309,7 +451,7 @@ async function resolveWorkspace(opts) {
   step("Step 2 — control workspace");
 
   const fallback = path.join(os.homedir(), "aigentry", "_orchestrator");
-  let ws = opts.workspace || process.env.AIGENTRY_CONTROL_WORKSPACE || null;
+  let ws = opts.workspace || initEnvironment.env.AIGENTRY_CONTROL_WORKSPACE || null;
   if (!ws) {
     const nonInteractive = opts.yes || !process.stdin.isTTY;
     ws = await ask(`Control workspace path [${fallback}]: `, fallback, nonInteractive);
@@ -427,6 +569,7 @@ function createState(ws, opts) {
 
 async function scaffold(ws, opts, subs) {
   step(`Step 5 — ${AIGENTRY_HOME} scaffold`);
+  fs.mkdirSync(AIGENTRY_HOME, { recursive: true, mode: 0o700 });
 
   // 5.1 — delegate to the script that already owns this layer (§2.5, Article 1).
   const script = path.join(ws, "bin", "install-instructions.sh");
@@ -628,6 +771,104 @@ function dryRun(ws) {
 // ------------------------------------------------------------------------------- main
 
 async function main() {
+  if (process.argv[2] === "dispatch-compat") {
+    const argv = process.argv.slice(3);
+    let fd;
+    let source;
+    try {
+      if (argv[0] === "--input-fd") {
+        if (!/^(?:[3-9]|[1-5][0-9]|6[0-3])$/.test(argv[1] ?? "")) throw new Error("ENV_INPUT_CHANNEL_UNSUPPORTED");
+        fd = Number(argv[1]); argv.splice(0, 2);
+      }
+      if (argv.shift() !== "--") throw new Error("ENV_MANAGED_ROUTE_REFUSED");
+      const { parseDispatchInvocation, dispatchOptionArgs } = await import(path.join(PKG_ROOT, "dist/src/environment/invocation.js"));
+      const parsed = parseDispatchInvocation(dispatchOptionArgs(argv));
+      if (fd !== undefined && earlyNeedsClaude) {
+        if (!earlyBytes) throw new Error("ENV_INPUT_CHANNEL_UNSUPPORTED");
+        const { OwnedInput } = await import(path.join(PKG_ROOT, "dist/src/environment/owned-input.js"));
+        try { source = OwnedInput.fromBytes(earlyBytes.subarray(0, -1)); }
+        finally { earlyBytes.fill(0); earlyBytes = undefined; }
+        fd = undefined;
+      }
+      if (earlyCompatible) {
+        const { OwnedInput } = await import(path.join(PKG_ROOT, "dist/src/environment/owned-input.js"));
+        try { source = OwnedInput.fromBytes(earlyCompatible); }
+        finally { earlyCompatible.fill(0); earlyCompatible = undefined; }
+      }
+      const { dispatchMain, dispatchProbe } = await import(path.join(PKG_ROOT, "dist/src/dispatch/cli.js"));
+      if (argv[0] === "__probe") {
+        if (source) throw new Error("ENV_INPUT_CONFLICT");
+        await dispatchProbe(parsed, argv.slice(1));
+      } else await dispatchMain(parsed, source, earlyEnvironment);
+    } catch (e) {
+      console.error(e?.message === "ENV_INPUT_INVALID" ? "CLAUDE_OAUTH_TOKEN_INVALID" :
+        /^(?:ENV_|CLAUDE_OAUTH_|SANDBOX_AUTH_)/.test(e?.message ?? "") ? e.message : "ENV_CONFIGURATION_REFUSED");
+      process.exitCode = /^(?:CLAUDE_OAUTH_|SANDBOX_AUTH_|ENV_(?:SCHEMA|BINDING|CONTROLLER|HELPER))/.test(e?.message ?? "") ? 78 : 4;
+    } finally {
+      source?.dispose();
+    }
+    return;
+  }
+  if (process.argv[2] === "env") {
+    if (process.argv[3] === "run") {
+      const { OwnedInput } = await import(path.join(PKG_ROOT, "dist/src/environment/owned-input.js"));
+      let compatible;
+      let fd;
+      let source;
+      try {
+        if (earlyCompatible) {
+          try { compatible = OwnedInput.fromBytes(earlyCompatible); }
+          finally { earlyCompatible.fill(0); earlyCompatible = undefined; }
+        }
+        const args = process.argv.slice(4);
+        let binding;
+        let split = -1;
+        for (let i = 0; i < args.length; i++) {
+          if (args[i] === "--") { split = i; break; }
+          if (args[i] === "--binding" || args[i] === "--input-fd") {
+            const option = args[i], value = args[++i];
+            if (value === undefined || value.startsWith("-")) throw new Error("ENV_INPUT_INVALID");
+            if (option === "--binding") {
+              if (binding !== undefined) throw new Error("ENV_DUPLICATE_OPTION");
+              binding = value;
+            } else {
+              if (fd !== undefined || !/^(?:[3-9]|[1-5][0-9]|6[0-3])$/.test(value)) throw new Error("ENV_INPUT_CHANNEL_UNSUPPORTED");
+              fd = Number(value);
+            }
+          } else throw new Error("ENV_INPUT_INVALID");
+        }
+        if (split < 0 || args[split + 1] !== "dispatch" || !binding || !/^[0-9a-f-]{36}$/i.test(binding)) throw new Error("ENV_MANAGED_ROUTE_REFUSED");
+        const { parseDispatchInvocation } = await import(path.join(PKG_ROOT, "dist/src/environment/invocation.js"));
+        const parsed = parseDispatchInvocation([...args.slice(split + 2), "--binding", binding]);
+        if (!parsed.switches.has("--spawn-and-dispatch") || !["claude", "codex"].includes(parsed.values["--cli"]) || parsed.values["--target"] || parsed.values["--retry-unknown"]) {
+          throw new Error("ENV_MANAGED_ROUTE_REFUSED");
+        }
+        if (fd !== undefined && compatible) throw new Error("ENV_INPUT_CONFLICT");
+        if (fd !== undefined && earlyNeedsClaude && !earlyBytes) throw new Error("ENV_INPUT_CHANNEL_UNSUPPORTED");
+        if (fd === undefined) source = compatible;
+        else if (earlyNeedsClaude) {
+          try { source = OwnedInput.fromBytes(earlyBytes.subarray(0, -1)); }
+          finally { earlyBytes.fill(0); earlyBytes = undefined; }
+        }
+        fd = undefined;
+        const { dispatchMain } = await import(path.join(PKG_ROOT, "dist/src/dispatch/cli.js"));
+        await dispatchMain(parsed, source, earlyEnvironment);
+      } catch (e) {
+        const code = /^(?:CLAUDE_OAUTH_|SANDBOX_AUTH_|SANDBOX_EXECUTABLE_CHANGED|ENV_MANAGED_ROUTE_REFUSED)/.test(e?.message ?? "") ? 78 : 4;
+        console.error(/^(?:ENV_|CLAUDE_OAUTH_|SANDBOX_AUTH_|SANDBOX_EXECUTABLE_CHANGED)/.test(e?.message ?? "") ? e.message : "ENV_INPUT_INVALID");
+        process.exitCode = code;
+      } finally { source?.dispose(); compatible?.dispose(); }
+      return;
+    }
+    await initializeEnvironment(true);
+    const { environmentCommand } = await import(path.join(PKG_ROOT, "dist/src/environment/cli.js"));
+    const result = environmentCommand(process.argv.slice(3), process.env);
+    process.stdout.write(result.out);
+    process.stderr.write(result.err);
+    process.exitCode = result.code;
+    return;
+  }
+  await initializeEnvironment();
   // Help must return before parsing or invoking dependency/probe subprocesses.
   if (process.argv.slice(2).some((arg) => arg === "--help" || arg === "-h")) {
     console.log(USAGE);

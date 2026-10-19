@@ -330,12 +330,14 @@ test("431-H — effective_prompt.md appends the session contract preamble", () =
   }
 });
 
-test("431-C — unknown --cli still rejected (#532 lifted claude-only gate to claude|codex|gemini)", () => {
+test("431-C — unknown --cli is refused by the typed environment boundary before staging", () => {
   const { home, targetCwd, cleanup } = setupTempHome();
   try {
     const r = runBootPrepare(home, ["--role", "coder", "--cwd", targetCwd, "--sid", "test-431-C", "--cli", "opencode"]);
-    assert.notEqual(r.code, 0);
-    assert.match(r.stderr, /unsupported --cli|unknown CLI|opencode/);
+    assert.equal(r.code, 4);
+    assert.match(r.stderr, /^boot-prepare: ENV_CONFIGURATION_REFUSED\n$/);
+    assert.equal(r.stdout, "");
+    assert.equal(existsSync(join(home, "sessions", "test-431-C")), false);
   } finally {
     cleanup();
   }

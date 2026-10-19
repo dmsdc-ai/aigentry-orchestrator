@@ -1,21 +1,40 @@
 #!/usr/bin/env node
 // ponytail: one classifier call, no cache; expected ~1–3 s per dispatch, 15 s ceiling.
 import { spawnSync } from "node:child_process";
-import crossSpawn from "cross-spawn";
 import { closeSync, openSync, readFileSync, readSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { classifierRetired, resolveCommand } from "./model-evidence.mjs";
+import { centralEnvironment, classifierRetired, resolveCommand } from "./model-evidence.mjs";
+import { environmentRuntime, packageCrossSpawn } from "./lib/environment-runtime.mjs";
 
 // #1148: `--resolve …` is the managed spawn-decision path (pure resolver over bounded
 // public metadata; no classifier, no model call). It exits here; the label router below
 // is unchanged for its existing callers.
 if (process.argv[2] === "--resolve") {
+  try { packageCrossSpawn(environmentRuntime(process.env).runtimeRoot); }
+  catch {
+    await new Promise((done) => process.stdout.write(JSON.stringify({ refusal: {
+      code: "ENV_CONFIGURATION_REFUSED", reason: "package runtime or dependency unavailable before model effects",
+    } }) + "\n", done));
+    process.exit(4);
+  }
   const { code, out } = await resolveCommand(process.argv.slice(3), process.env);
   await new Promise((done) => process.stdout.write(out, done));
   process.exit(code);
 }
 
 // Keep in sync with EMERGENCY_ROUTE in src/dispatch/cli.ts.
+let routerEnvironment, crossSpawn;
+try {
+  const all = process.argv.slice(2), at = all.indexOf("--profile"), roleAt = all.indexOf("--role");
+  const central = await centralEnvironment(process.env, { role: roleAt < 0 ? undefined : all[roleAt + 1],
+    targetCwd: process.env.AIGENTRY_TARGET_CWD ?? process.cwd(),
+    ...(at >= 0 ? { flags: { "router.profile": all[at + 1] } } : {}) });
+  crossSpawn = packageCrossSpawn(central.runtimeRoot);
+  routerEnvironment = central.env;
+} catch {
+  process.stderr.write("model-router: ENV_CONFIGURATION_REFUSED\n");
+  process.exit(4);
+}
 const emergency = { cli: "claude", model: "claude-opus-5[1m]", label: "opus-5" };
 const CLASSIFIER_MODEL = "claude-haiku-4-5-20251001";
 const args = Object.fromEntries(process.argv.slice(2).reduce((pairs, key, i, all) => {
@@ -48,7 +67,7 @@ function flatMap(text) {
 // may live anywhere, so there is no base path to jail to, and path.resolve() does not satisfy the rule.
 let models = [], table = {}, efforts = {}, fallbacks = {}, body = "", failure = "", decision;
 try {
-  const profile = readFileSync(args["--profile"] || process.env.AIGENTRY_ROUTER_PROFILE ||
+  const profile = readFileSync(args["--profile"] || routerEnvironment.AIGENTRY_ROUTER_PROFILE ||
     fileURLToPath(new URL("../docs/model-profiles/model-routing-profile.md", import.meta.url)), "utf8");
   const front = profile.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)([\s\S]*)$/);
   if (!front) throw new Error("profile front matter missing");
@@ -111,7 +130,7 @@ if (!failure && args["--ref"]) {
       "Do not use tools. Return only JSON {\"label\":string,\"reason\":string,\"confidence\":number} with confidence in [0,1].\n" +
       `Role: ${JSON.stringify(args["--role"] || "")}\nTask excerpt (first 4KB): ${JSON.stringify(ref)}\n`;
     // Env-only seam (no argv form): an argv value reaching spawnSync is Snyk CWE-78 MEDIUM.
-    const classifier = process.env.AIGENTRY_ROUTER_CLASSIFIER;
+    const classifier = routerEnvironment.AIGENTRY_ROUTER_CLASSIFIER;
     // #1148: the default classifier model is not called on/after the existing conservative no-call
     // cutoff (docs/model-profiles/model-catalog.json classifier.retire_on — the model's "not sooner
     // than" floor, not an official retirement fact); routing falls to the table. No replacement model.

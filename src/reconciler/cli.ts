@@ -1086,11 +1086,14 @@ function consumeSurfaceOrphaned(gcRoot: string, keepAlive: string): void {
 }
 
 /**
- * consume_surface_mismatched — re-bind a live session's workspace onto its real PTY
- * surface when telepty signals the surface is ALIVE-but-mismatched (task #507).
- * wh_focus is NON-DESTRUCTIVE (best-effort raise; always 0), so unlike orphan-close
- * it needs no INV-17 kill-corroboration — re-focusing a stray surface cannot lose
- * work. Single safety gate: the sid must resolve to a host_id.
+ * consume_surface_mismatched — telepty signals a live session whose surface is
+ * ALIVE-but-mismatched (task #507). The event is a DIAGNOSTIC OBSERVATION only
+ * (#616 policy, user steering 2026-10-09): focusing/raising/selecting a workspace
+ * re-binds nothing, and doing it here stole the operator's focus every tick a worker
+ * emitted the event. So no wh_focus, no select, and no automatic return to the
+ * orchestrator either — a deliberate user selection is respected. The mismatch is
+ * logged as UNRESOLVED (the read-only lookup only names the host id) and the file is
+ * drained as before. It says nothing about completion or liveness.
  */
 function consumeSurfaceMismatched(): void {
   let body: string;
@@ -1105,19 +1108,9 @@ function consumeSurfaceMismatched(): void {
     const sid = jqField(line, "sid");
     const exppty = jqField(line, "expectedPtyPid");
     if (!sid) continue;
-    if (DRY_RUN === 1) {
-      log(`SURFACE_MISMATCHED would-refocus sid=${sid} expectedPty=${exppty || "?"}`);
-      processed += 1;
-      continue;
-    }
-    const hostId = chomp(wh(["lookup", sid]).stdout);
-    if (hostId) {
-      if (wh(["focus", hostId], { out: "inherit" }).status === 0) {
-        log(`SURFACE_MISMATCHED refocused sid=${sid} host=${hostId} expectedPty=${exppty || "?"}`);
-      } else {
-        log(`SURFACE_MISMATCHED refocus non-zero sid=${sid} host=${hostId}`);
-      }
-    }
+    const hostId = DRY_RUN === 1 ? "" : chomp(wh(["lookup", sid]).stdout);
+    log(`SURFACE_MISMATCHED unresolved sid=${sid} host=${hostId || "?"} expectedPty=${exppty || "?"} ` +
+      "— diagnostic only; no focus/rebind actuation");
     processed += 1;
   }
   // rm, and unconditional — same handoff with bin/telepty-bus-bridge.sh as
@@ -1517,7 +1510,7 @@ function main(argv: string[]): void {
 
   // event-driven surface_orphaned consumer (dormant until a bus→file bridge exists)
   consumeSurfaceOrphaned(gcRoot, keepAlive);
-  // event-driven surface_mismatched consumer — re-focus stray surfaces (#507, dormant)
+  // event-driven surface_mismatched consumer — diagnostic observation only, never focus (#507/#616)
   consumeSurfaceMismatched();
 
   const candidates: string[] = [];

@@ -32,26 +32,125 @@ import { isCliKind, type LaunchConfig } from "../session/boot-adapter/types.js";
 import { normalizeLaunch } from "../session/boot-adapter/launch-config.js";
 import { loadWorkerScope, prepareWorkerSandbox, assertConfinedTarget, stageWorkerRef, assertNotCliWrapper, CONFINED_CLIS,
   readSandboxCurrent, readSealedManifest } from "../session/worker-sandbox.js";
-import { selectedClaudeOAuthToken } from "../session/claude-worker-oauth.js";
+import { controllerContext, resolveBinding } from "../environment/grants.js";
 import { validateSpawnDecision, type SpawnDecision } from "../session/model-decision.js";
+import { bootstrapEnvironment } from "../environment/bootstrap.js";
+import { dispatchOptionArgs, InvocationError, parseDispatchInvocation, type DispatchInvocation } from "../environment/invocation.js";
+import { acquireClaudeOAuthInput, type ClaudeAcquisitionKind } from "../session/claude-worker-oauth.js";
+import { captureCompatibilityInput, type OwnedInput } from "../environment/owned-input.js";
+import { assertTrustedFile, assertTrustedTool, captureManagedRuntime, helperEnvironment, pinTrustedFile, trustedTool,
+  type HelperOperation, type TrustedRuntimeContext } from "../environment/helper-env.js";
 
 // ── environment seams (identical names/defaults to the shell) ────────────────
 // SCRIPT_DIR was `cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P` — the repo's
 // bin/. The shim exports it so a symlinked entrypoint resolves exactly as bash
 // did; the fallback keeps a direct `node dist/src/dispatch/cli.js` working.
-const SCRIPT_DIR =
-  process.env.DISPATCH_SCRIPT_DIR ||
-  path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "bin");
+let SCRIPT_DIR: string;
+let invocation: DispatchInvocation;
+let env: NodeJS.ProcessEnv;
+let DISPATCH_REGISTRY_PY: string;
+let VERIFY_SH: string;
+let OPEN_SESSION_SH: string;
+let SESSION_PROBE_PY: string;
+let TELEPTY: string;
+let EMIT_TELEMETRY_MJS: string;
+let REPORT_TARGET_SH: string;
+let WH_CLI: string;
+let activeInput: OwnedInput | undefined;
+let acquisitionKind: ClaudeAcquisitionKind = "absent";
+let managedRuntime: TrustedRuntimeContext | undefined;
+function helperFor(op: HelperOperation, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  return managedRuntime ? helperEnvironment(managedRuntime, op, env, extra) : { ...env, ...extra };
+}
+function managedExecutable(op: HelperOperation, cmd: string, args: string[] = []): string {
+  if (!managedRuntime) return cmd;
+  if (cmd === TELEPTY) {
+    if (op !== "control") throw new Error("ENV_HELPER_PATH_REFUSED");
+    assertTrustedTool(managedRuntime, "telepty", cmd);
+    return cmd;
+  }
+  if (cmd === "ps" || cmd === "git") {
+    if (op !== "control") throw new Error("ENV_HELPER_PATH_REFUSED");
+    const resolved = trustedTool(managedRuntime, cmd);
+    assertTrustedTool(managedRuntime, cmd, resolved);
+    return resolved;
+  }
+  const allowed: Record<HelperOperation, string[]> = {
+    verify: [process.execPath], model: [process.execPath], boot: [process.execPath],
+    registry: [DISPATCH_REGISTRY_PY], telemetry: [EMIT_TELEMETRY_MJS],
+    control: [SESSION_PROBE_PY, REPORT_TARGET_SH, VERIFY_SH],
+    terminal: [WH_CLI, OPEN_SESSION_SH], binder: [],
+  };
+  if (!allowed[op].includes(cmd)) throw new Error("ENV_HELPER_PATH_REFUSED");
+  pinTrustedFile(managedRuntime, op, cmd);
+  assertTrustedFile(managedRuntime, op, cmd);
+  if (cmd === process.execPath) {
+    const scripts: Record<string, string> = {
+      verify: WORKER_INPUTS, model: MODEL_ROUTER,
+      boot: fileURLToPath(new URL("../../../bin/boot-prepare.mjs", import.meta.url)),
+    };
+    const script = scripts[op];
+    if (!script || args[0] !== script) throw new Error("ENV_HELPER_PATH_REFUSED");
+    pinTrustedFile(managedRuntime, op, script, false);
+    assertTrustedFile(managedRuntime, op, script, false);
+  } else if (/\.(?:sh|py|mjs)$/.test(cmd)) {
+    const interpreterName = cmd.endsWith(".sh") ? "bash" : cmd.endsWith(".py") ? "python3" : null;
+    const interpreter = interpreterName ? trustedTool(managedRuntime, interpreterName) : process.execPath;
+    if (interpreterName) assertTrustedTool(managedRuntime, interpreterName, interpreter);
+    else {
+      pinTrustedFile(managedRuntime, op, interpreter);
+      assertTrustedFile(managedRuntime, op, interpreter);
+    }
+    args.unshift(cmd);
+    return interpreter;
+  }
+  return cmd;
+}
 
-const env = process.env;
-const DISPATCH_REGISTRY_PY = env.DISPATCH_REGISTRY_PY || path.join(SCRIPT_DIR, "dispatch-registry.py");
-const VERIFY_SH = path.join(SCRIPT_DIR, "dispatch-verify.sh");
-const OPEN_SESSION_SH = env.OPEN_SESSION_SH || path.join(SCRIPT_DIR, "open-session.sh");
-const SESSION_PROBE_PY = env.SESSION_PROBE_PY || path.join(SCRIPT_DIR, "session-probe.py");
-const TELEPTY = env.TELEPTY || "telepty";
-const EMIT_TELEMETRY_MJS = env.EMIT_TELEMETRY_MJS || path.join(SCRIPT_DIR, "emit-telemetry.mjs");
-const REPORT_TARGET_SH = env.REPORT_TARGET_SH || path.join(SCRIPT_DIR, "orchestrator-report-target.sh");
-const WH_CLI = path.join(SCRIPT_DIR, "wh-cli.sh");
+function initialize(parsed: DispatchInvocation, source?: OwnedInput, trustedEnvironment: NodeJS.ProcessEnv = process.env): void {
+  invocation = parsed;
+  const central = bootstrapEnvironment(trustedEnvironment, parsed.context);
+  const provider = parsed.values["--cli"] ?? central.env.AIGENTRY_DISPATCH_CLI ?? "auto";
+  const fresh = parsed.switches.has("--spawn-and-dispatch") && !parsed.help;
+  acquisitionKind = source ? "explicit" : "absent";
+  if (!fresh || !["claude", "auto"].includes(provider)) { source?.dispose(); source = undefined; }
+  else if (!source && provider === "claude") {
+    const acquired = acquireClaudeOAuthInput({});
+    source = acquired.input; acquisitionKind = acquired.kind;
+  }
+  activeInput = source;
+  process.once("exit", () => activeInput?.dispose());
+  const shippedBin = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "bin");
+  if (source && trustedEnvironment.DISPATCH_SCRIPT_DIR && trustedEnvironment.DISPATCH_SCRIPT_DIR !== shippedBin) {
+    throw new Error("ENV_HELPER_PATH_REFUSED");
+  }
+  SCRIPT_DIR = source ? shippedBin : trustedEnvironment.DISPATCH_SCRIPT_DIR || shippedBin;
+  env = central.env;
+  managedRuntime = undefined;
+  const fixedHelpers: Record<string, string> = {
+    DISPATCH_REGISTRY_PY: path.join(SCRIPT_DIR, "dispatch-registry.py"),
+    OPEN_SESSION_SH: path.join(SCRIPT_DIR, "open-session.sh"),
+    SESSION_PROBE_PY: path.join(SCRIPT_DIR, "session-probe.py"),
+    EMIT_TELEMETRY_MJS: path.join(SCRIPT_DIR, "emit-telemetry.mjs"),
+    REPORT_TARGET_SH: path.join(SCRIPT_DIR, "orchestrator-report-target.sh"),
+  };
+  if (source) {
+    for (const [key, fixed] of Object.entries(fixedHelpers)) {
+      if (env[key] && env[key] !== fixed) throw new Error("ENV_HELPER_PATH_REFUSED");
+      env[key] = fixed;
+    }
+  }
+  DISPATCH_REGISTRY_PY = env.DISPATCH_REGISTRY_PY || fixedHelpers.DISPATCH_REGISTRY_PY!;
+  VERIFY_SH = path.join(SCRIPT_DIR, "dispatch-verify.sh");
+  OPEN_SESSION_SH = env.OPEN_SESSION_SH || fixedHelpers.OPEN_SESSION_SH!;
+  SESSION_PROBE_PY = env.SESSION_PROBE_PY || fixedHelpers.SESSION_PROBE_PY!;
+  TELEPTY = env.TELEPTY || "telepty";
+  EMIT_TELEMETRY_MJS = env.EMIT_TELEMETRY_MJS || fixedHelpers.EMIT_TELEMETRY_MJS!;
+  REPORT_TARGET_SH = env.REPORT_TARGET_SH || fixedHelpers.REPORT_TARGET_SH!;
+  WH_CLI = path.join(SCRIPT_DIR, "wh-cli.sh");
+  TASK_QUEUE = env.AIGENTRY_TASK_QUEUE || path.join(SCRIPT_DIR, "..", "state", "task-queue.json");
+  TASK_GATE_MODE = env.AIGENTRY_TASK_GATE || "hard";
+}
 
 const REGISTER_TIMEOUT_MS_DEFAULT = 180000;
 
@@ -67,9 +166,11 @@ function isExecutable(p: string): boolean {
 
 /** stdout+status, stderr swallowed — the shell's `$(cmd 2>/dev/null || true)`. */
 function capture(cmd: string, args: string[], extraEnv?: NodeJS.ProcessEnv): { status: number; stdout: string } {
-  const r = (process.platform === "win32" ? crossSpawn.sync : spawnSync)(cmd, args, {
+  const executable = managedExecutable("control", cmd, args);
+  const r = (process.platform === "win32" ? crossSpawn.sync : spawnSync)(executable, args, {
     encoding: "utf8",
-    env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
+    stdio: ["ignore", "pipe", "ignore"],
+    env: helperFor("control", extraEnv),
   });
   if (r.error) return { status: 127, stdout: "" };
   return { status: r.status ?? 1, stdout: r.stdout ?? "" };
@@ -77,23 +178,26 @@ function capture(cmd: string, args: string[], extraEnv?: NodeJS.ProcessEnv): { s
 
 /** stdout captured, stderr inherited — the shell's plain `out=$(cmd)`. */
 function captureOut(cmd: string, args: string[], extraEnv?: NodeJS.ProcessEnv): { status: number; stdout: string } {
-  const r = (process.platform === "win32" ? crossSpawn.sync : spawnSync)(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], env: { ...env, ...extraEnv } });
+  const op = args[0]?.endsWith("/boot-prepare.mjs") ? "boot" : "control";
+  const executable = managedExecutable(op, cmd, args);
+  const r = (process.platform === "win32" ? crossSpawn.sync : spawnSync)(executable, args, { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], env: helperFor(op, extraEnv) });
   if (r.error) return { status: 127, stdout: "" };
   return { status: r.status ?? 1, stdout: r.stdout ?? "" };
 }
 
 /** stdout+stderr both captured — the shell's `out=$(cmd 2>&1)`. */
 function captureBoth(cmd: string, args: string[], childEnv?: NodeJS.ProcessEnv): { status: number; output: string } {
-  const r = spawnSync(cmd, args, { encoding: "utf8", shell: false, ...(childEnv ? { env: childEnv } : {}) });
+  const r = spawnSync(managedExecutable("registry", cmd, args), args, { encoding: "utf8", shell: false, env: helperFor("registry", childEnv) });
   if (r.error) return { status: 127, output: String(r.error.message ?? "") };
   return { status: r.status ?? 1, output: (r.stdout ?? "") + (r.stderr ?? "") };
 }
 
 /** Fully inherited stdio — the shell's bare `cmd`. */
 function run(cmd: string, args: string[], extraEnv?: NodeJS.ProcessEnv): number {
-  const r = (process.platform === "win32" ? crossSpawn.sync : spawnSync)(cmd, args, {
+  const executable = managedExecutable("control", cmd, args);
+  const r = (process.platform === "win32" ? crossSpawn.sync : spawnSync)(executable, args, {
     stdio: "inherit",
-    env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
+    env: helperFor("control", extraEnv),
   });
   if (r.error) return 127;
   return r.status ?? 1;
@@ -116,7 +220,8 @@ function nowMs(): number {
 function emitTelemetry(args: string[]): void {
   if (!isExecutable(EMIT_TELEMETRY_MJS)) return;
   try {
-    (process.platform === "win32" ? crossSpawn.sync : spawnSync)(EMIT_TELEMETRY_MJS, args, { stdio: "ignore" });
+    (process.platform === "win32" ? crossSpawn.sync : spawnSync)(managedExecutable("telemetry", EMIT_TELEMETRY_MJS, args),
+      args, { stdio: "ignore", env: helperFor("telemetry") });
   } catch {
     /* swallowed, exactly as `|| true` did */
   }
@@ -302,8 +407,9 @@ function publishAgentMeta(sid: string, cliKind: string, stagingRoot: string): vo
   let rc: string;
   try {
     const status = JSON.stringify(agentStatus(sid, cliKind));
-    const r = spawnSync(WH_CLI, ["agent-meta-set", sid, "--stage", stagingRoot, "--status-json", status],
-      { stdio: ["ignore", "ignore", "inherit"], timeout: 15000 });
+    const args = ["agent-meta-set", sid, "--stage", stagingRoot, "--status-json", status];
+    const r = spawnSync(managedExecutable("terminal", WH_CLI, args), args,
+      { stdio: ["ignore", "ignore", "inherit"], timeout: 15000, env: helperFor("terminal") });
     rc = r.error ? "spawn-error" : String(r.status ?? r.signal);
   } catch {
     rc = "error";
@@ -326,15 +432,16 @@ function registryMissing(): boolean {
 function registryBoth(args: string[]): { status: number; output: string } {
   if (registryMissing()) return { status: 9, output: "" };
   const invocation = registryInvocation(DISPATCH_REGISTRY_PY, args, process.platform);
-  return captureBoth(invocation.cmd, invocation.args, registryEnvironment());
+  return captureBoth(invocation.cmd, invocation.args, { DISPATCH_STATE_DIR: registryEnvironment(env).DISPATCH_STATE_DIR });
 }
 
 /** `registry "$@"` with stdout captured, stderr passed through. */
 function registryOut(args: string[]): { status: number; stdout: string } {
   if (registryMissing()) return { status: 9, stdout: "" };
   const invocation = registryInvocation(DISPATCH_REGISTRY_PY, args, process.platform);
-  const r = spawnSync(invocation.cmd, invocation.args, {
-    encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], shell: false, env: registryEnvironment(),
+  const r = spawnSync(managedExecutable("registry", invocation.cmd, invocation.args), invocation.args, {
+    encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], shell: false,
+    env: helperFor("registry", { DISPATCH_STATE_DIR: registryEnvironment(env).DISPATCH_STATE_DIR }),
   });
   if (r.error) return { status: 127, stdout: "" };
   return { status: r.status ?? 1, stdout: r.stdout ?? "" };
@@ -344,7 +451,9 @@ function registryOut(args: string[]): { status: number; stdout: string } {
 function registryQuiet(args: string[]): number {
   if (registryMissing()) return 9;
   const invocation = registryInvocation(DISPATCH_REGISTRY_PY, args, process.platform);
-  const r = spawnSync(invocation.cmd, invocation.args, { stdio: ["ignore", "ignore", "inherit"], shell: false, env: registryEnvironment() });
+  const r = spawnSync(managedExecutable("registry", invocation.cmd, invocation.args), invocation.args,
+    { stdio: ["ignore", "ignore", "inherit"], shell: false,
+    env: helperFor("registry", { DISPATCH_STATE_DIR: registryEnvironment(env).DISPATCH_STATE_DIR }) });
   if (r.error) return 127;
   return r.status ?? 1;
 }
@@ -404,101 +513,21 @@ interface Opts {
   inputSha256: string;
 }
 
-function parseArgs(argv: string[]): Opts {
-  const o: Opts = {
-    target: "",
-    refFile: "",
-    fromId: "",
-    timeoutMs: 30000,
-    timeoutExplicit: false,
-    spawn: false,
-    track: "",
-    name: "",
-    cwd: "",
-    cli: "auto",
-    worktree: "",
-    verifyDelivered: false,
-    // Rule 33: confirm session actually started working post-inject.
-    verifyStarted: true,
-    role: "",
-    taskClass: "",
-    keepAlive: false,
-    taskId: "",
-    noTask: false,
-    noTaskReason: "",
-    retryUnknown: "",
-    observe: [],
-    inputRoot: "",
-    inputManifest: "",
-    inputSha256: "",
+function invocationOptions(): Opts {
+  const v = invocation.values, has = (option: string) => invocation.switches.has(option);
+  if (invocation.help) { process.stdout.write(USAGE + "\n"); process.exit(0); }
+  return {
+    target: v["--target"] ?? "", refFile: v["--ref"] ?? "", fromId: v["--from"] ?? "",
+    timeoutMs: v["--timeout-ms"] === undefined ? 30000 : Number(v["--timeout-ms"]),
+    timeoutExplicit: v["--timeout-ms"] !== undefined, spawn: has("--spawn-and-dispatch"),
+    track: v["--track"] ?? "", name: v["--name"] ?? "", cwd: v["--cwd"] ?? "",
+    cli: v["--cli"] ?? env.AIGENTRY_DISPATCH_CLI ?? "auto", worktree: v["--worktree"] ?? "",
+    verifyDelivered: has("--verify-delivered"), verifyStarted: !has("--no-verify-started"),
+    role: v["--role"] ?? "", taskClass: v["--task-class"] ?? "", keepAlive: has("--keep-alive"),
+    taskId: v["--task"] ?? "", noTask: v["--no-task"] !== undefined, noTaskReason: v["--no-task"] ?? "",
+    retryUnknown: v["--retry-unknown"] ?? "", observe: [...invocation.observe],
+    inputRoot: v["--input-root"] ?? "", inputManifest: v["--input-manifest"] ?? "", inputSha256: v["--input-sha256"] ?? "",
   };
-  let i = 0;
-  // `shift 2` on a value flag reads $2 even when absent; bash's `set -u` makes
-  // that an error, so a trailing value-flag is a usage error either way.
-  const val = (flag: string): string => {
-    const v = argv[i + 1];
-    if (v === undefined) {
-      process.stderr.write(`dispatch.sh: ${flag}: option requires an argument\n`);
-      process.stderr.write(USAGE + "\n");
-      process.exit(4);
-    }
-    return v;
-  };
-  while (i < argv.length) {
-    const a = argv[i]!;
-    switch (a) {
-      case "--target": o.target = val(a); i += 2; break;
-      case "--ref": o.refFile = val(a); i += 2; break;
-      case "--from": o.fromId = val(a); i += 2; break;
-      case "--timeout-ms": o.timeoutMs = Number(val(a)); o.timeoutExplicit = true; i += 2; break;
-      case "--spawn-and-dispatch": o.spawn = true; i += 1; break;
-      case "--track": o.track = val(a); i += 2; break;
-      case "--name": o.name = val(a); i += 2; break;
-      case "--cwd": o.cwd = val(a); i += 2; break;
-      case "--worktree": o.worktree = val(a); i += 2; break;
-      case "--cli": o.cli = val(a); i += 2; break;
-      case "--role": o.role = val(a); i += 2; break;
-      case "--task-class":
-        o.taskClass = val(a); i += 2;
-        if (!ROUTE_TOKEN.test(o.taskClass)) {
-          process.stderr.write("dispatch.sh: --task-class: invalid class (want ^[a-z][a-z0-9-]{0,31}$)\n");
-          process.exit(4);
-        }
-        break;
-      case "--task": o.taskId = val(a); i += 2; break;
-      case "--no-task": o.noTask = true; o.noTaskReason = val(a); i += 2; break;
-      case "--verify-delivered": o.verifyDelivered = true; i += 1; break;
-      case "--no-verify-started": o.verifyStarted = false; i += 1; break;
-      case "--keep-alive": o.keepAlive = true; i += 1; break;
-      case "--input-root": o.inputRoot = val(a); i += 2; break;
-      case "--input-manifest": o.inputManifest = val(a); i += 2; break;
-      case "--input-sha256": o.inputSha256 = val(a); i += 2; break;
-      case "--observe":
-        if (o.observe.length >= 4) {
-          process.stderr.write("dispatch.sh: --observe may be given at most 4 times\n");
-          process.exit(4);
-        }
-        o.observe.push(val(a)); i += 2;
-        break;
-      case "--retry-unknown":
-        o.retryUnknown = val(a); i += 2;
-        if (!o.retryUnknown.trim()) {
-          process.stderr.write("dispatch.sh: --retry-unknown needs a non-empty reason\n");
-          process.exit(4);
-        }
-        break;
-      case "-h":
-      case "--help":
-        process.stdout.write(USAGE + "\n");
-        process.exit(0);
-        break;
-      default:
-        process.stderr.write(`dispatch.sh: unknown arg: ${a}\n`);
-        process.stderr.write(USAGE + "\n");
-        process.exit(4);
-    }
-  }
-  return o;
 }
 
 function resolveRoute(o: Opts, sid: string, skipPreparation: boolean): void {
@@ -517,10 +546,12 @@ function resolveRoute(o: Opts, sid: string, skipPreparation: boolean): void {
   }
   // #1206 D7: no `--ref`, so the router never calls its classifier; the role (× task class) table decides.
   try {
-    const result = spawnSync(process.execPath, [path.join(SCRIPT_DIR, "model-router.mjs"),
-      "--role", o.role, ...(o.taskClass ? ["--class", o.taskClass] : []), "--candidates", "1", "--confined", "1"], {
-      encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], timeout: 16000, killSignal: "SIGKILL",
+    const routerArgs = [path.join(SCRIPT_DIR, "model-router.mjs"),
+      "--role", o.role, ...(o.taskClass ? ["--class", o.taskClass] : []), "--candidates", "1", "--confined", "1"];
+    const result = spawnSync(managedExecutable("model", process.execPath, routerArgs), routerArgs, {
+      encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], timeout: 16000, killSignal: "SIGKILL", env: helperFor("model", { AIGENTRY_TARGET_CWD: o.cwd }),
     });
+    if (result.status === 4) die("dispatch.sh: ENV_CONFIGURATION_REFUSED; router refused before spawn", 4);
     if (result.error || result.status !== 0) throw new Error("router unavailable");
     const route = JSON.parse(result.stdout);
     if (!["claude", "codex", "grok", "gemini"].includes(route.cli) ||
@@ -600,8 +631,13 @@ function cliCap(cli: string): number {
   return Infinity;
 }
 
-// #1206: executable discovery stays separate from authentication. #1232: a Claude
-// authentication failure refuses rather than selecting a different provider.
+// #1206 (PLAN §2.3): stat only, nothing is read or run. An executable the resolver would bind by name
+// (`<cli>` in an absolute PATH dir); a declared AIGENTRY_<CLI>_EXECUTABLE is an explicit request the
+// resolver judges itself, never substituted. A credential source: codex auth.json seedAuth copies; for
+// claude the opted-in token, its credentials file, or on darwin the login Keychain (not statable).
+// #1232 (D1): claude routing is deliberately unchanged. seedAuth no longer copies the host login, and
+// spawnWorkspace refuses claude without the opt-in (SANDBOX_AUTH_WORKER_TOKEN_REQUIRED, exit 78) rather
+// than letting this predicate silently re-route the spawn to another provider/billing path.
 function executablePresent(cli: string): boolean {
   if (env[`AIGENTRY_${cli.toUpperCase()}_EXECUTABLE`]) return true;
   return (env.PATH || "").split(path.delimiter).some((dir) => path.isAbsolute(dir) && isExecutable(path.join(dir, cli)));
@@ -610,24 +646,24 @@ function executablePresent(cli: string): boolean {
 function credentialPresent(cli: string): boolean {
   const isFile = (p: string): boolean => { try { return fs.statSync(p).isFile(); } catch { return false; } };
   if (cli === "codex") return isFile(path.join(env.CODEX_HOME || path.join(os.homedir(), ".codex"), "auth.json"));
-  let configured = false;
-  try { configured = selectedClaudeOAuthToken(env) !== undefined; } catch {
-    die("dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_INVALID: invalid automation token or unsafe private token store; " +
-      "see docs/setup/dispatch-capacity.md; nothing was spawned (exit 78)", 78);
+  if (cli === "claude") {
+    if (!activeInput) {
+      try {
+        const acquired = acquireClaudeOAuthInput({});
+        activeInput = acquired.input; acquisitionKind = acquired.kind;
+      } catch {
+        die("dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_INVALID: invalid automation token or unsafe private token store; nothing was spawned", 78);
+      }
+    }
+    if (!activeInput) die("dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_REQUIRED; nothing was spawned", 78);
+    return true;
   }
-  if (!configured) {
-    die("dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_REQUIRED: confined Claude workers authenticate only with an approved " +
-      "automation token (claude setup-token) supplied as AIGENTRY_CLAUDE_OAUTH_TOKEN or in " +
-      "~/.aigentry/credentials/claude-worker/token; the host login is never copied; " +
-      "see docs/setup/dispatch-capacity.md; nothing was spawned (exit 78)", 78);
-  }
-  return true;
+  return process.platform === "darwin" || isFile(path.join(os.homedir(), ".claude", ".credentials.json"));
 }
 
 /**
  * Fresh spawn only: a routed CLI that is not routable (at cap, no executable, no credential) falls to the
  * first routable router candidate, in order; none left refuses (exit 78) — never an unconfined fallback.
- * Reaching a Claude candidate with missing/invalid authentication refuses immediately.
  * An explicit --cli warns at cap and proceeds.
  */
 function applyCliCap(o: Opts): void {
@@ -672,13 +708,16 @@ const printable = (s: string): string => s.replace(/[^\x20-\x7e]/g, "?").slice(0
 function resolveSpawnDecision(o: Opts, sid: string): void {
   if (!(CONFINED_CLIS as readonly string[]).includes(o.cli) || !o.role || !o.taskId || !o.route) return;
   const args = [MODEL_ROUTER, "--resolve", "--cli", o.cli, "--sid", sid, "--task", o.taskId, "--role", o.role];
+  for (const [suffix, flag] of [["model", "--model"], ["effort", "--effort"], ["executable", "--executable"], ["version", "--executable-version"]]) {
+    if (invocation.context.flags[`${o.cli}.${suffix}`] !== undefined) args.push(flag!, invocation.context.flags[`${o.cli}.${suffix}`]!);
+  }
   if (o.route.decided_by !== "explicit") {
     args.push("--route-json", JSON.stringify({ model: o.route.model, decided_by: o.route.decided_by,
       ...(o.route.effort !== undefined ? { effort: o.route.effort } : {}) }));
   }
   for (const file of o.observe) args.push("--observe", file);
-  const r = spawnSync(process.execPath, args, {
-    encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], timeout: 10000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024,
+  const r = spawnSync(managedExecutable("model", process.execPath, args), args, {
+    encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], timeout: 10000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024, env: helperFor("model", { AIGENTRY_TARGET_CWD: o.cwd }),
   });
   let out: { decision?: unknown; refusal?: { code?: unknown; reason?: unknown } } = {};
   try { out = JSON.parse(r.stdout || "{}"); } catch { /* reported below */ }
@@ -718,10 +757,11 @@ function verifyWorkerInputs(o: Opts): void {
   const given = [o.inputRoot, o.inputManifest, o.inputSha256].filter((v) => v !== "").length;
   if (given === 0) return;
   if (given !== 3) die("dispatch.sh: --input-root, --input-manifest and --input-sha256 are all-or-none", 4);
-  const r = spawnSync(process.execPath, [WORKER_INPUTS, "verify", "--root", o.inputRoot,
-    "--manifest", o.inputManifest, "--sha256", o.inputSha256], {
+  const verifyArgs = [WORKER_INPUTS, "verify", "--root", o.inputRoot,
+    "--manifest", o.inputManifest, "--sha256", o.inputSha256];
+  const r = spawnSync(managedExecutable("verify", process.execPath, verifyArgs), verifyArgs, {
     encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], shell: false, timeout: 120000, killSignal: "SIGKILL",
-    maxBuffer: 1024 * 1024,
+    maxBuffer: 1024 * 1024, env: helperFor("verify"),
   });
   if (r.error || r.status !== 0) {
     const detail = (r.stderr || "").split("\n")[0] || `helper exit ${r.status ?? r.signal ?? "none"}`;
@@ -745,8 +785,8 @@ function decisionAudit(d: SpawnDecision): Record<string, unknown> {
 // lives here — dispatch.sh is the actuation chokepoint every delegation flows
 // through. It runs BEFORE any side effect so a violation can never leave a
 // half-started worker behind.
-const TASK_QUEUE = env.AIGENTRY_TASK_QUEUE || path.join(SCRIPT_DIR, "..", "state", "task-queue.json");
-const TASK_GATE_MODE = env.AIGENTRY_TASK_GATE || "hard";
+let TASK_QUEUE: string;
+let TASK_GATE_MODE: string;
 const TASK_GATE_HINT =
   'register the task in state/task-queue.json first (--task <id>), or use --no-task "<reason>" for exempt work.';
 
@@ -1084,12 +1124,16 @@ function inject(o: Opts, d: Delivery, sid: string): Promise<number> {
   if (d.refPrompt) a.push(d.refPrompt);
   return new Promise((resolve) => {
     let out = "";
-    const child = (process.platform === "win32" ? crossSpawn : spawn)(TELEPTY, a, { stdio: ["inherit", "pipe", "inherit"] });
+    const child = (process.platform === "win32" ? crossSpawn : spawn)(managedExecutable("control", TELEPTY, a), a,
+      { stdio: ["inherit", "pipe", "inherit"], env: helperFor("control") });
     child.stdout!.on("data", (chunk: Buffer) => {
       out += chunk.toString();
       process.stdout.write(chunk);
     });
+    let finished = false;
     const finish = (rc: number) => {
+      if (finished) return;
+      finished = true;
       d.transportInjectId = parseInjectId(out);
       if (d.tmpRef) rmTemp(d.tmpRef);
       resolve(rc); // preserve the inject's real exit code (callers gate on it)
@@ -1269,13 +1313,29 @@ function spawnWorkspace(o: Opts, sid: string): void {
       `${process.platform} has none (documented limitation; no unrestricted fallback); decided ${decided}; ` +
       "nothing was spawned or registered (exit 78)", 78);
   }
-  // Explicit CLI and automatic routing use the same fresh validation; no token cache.
-  if (o.cli === "claude") credentialPresent("claude");
+  // #1232: the host login is never copied into a confined Claude worker; without the opt-in it cannot
+  // authenticate, so refuse now — before boot-prepare stages anything, the git guard is installed or a
+  // terminal opens. Names the variable only; it is unset here, so no value can be echoed.
+  if (o.cli === "claude" && !activeInput) {
+    die("dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_REQUIRED: confined Claude workers authenticate only with an approved " +
+      "automation token (claude setup-token) supplied as AIGENTRY_CLAUDE_OAUTH_TOKEN in the dispatcher environment; " +
+      "the host login is never copied; see docs/setup/dispatch-capacity.md; nothing was spawned (exit 78)", 78);
+  }
+  const managed = o.cli === "claude" && activeInput ? (() => {
+    if (!o.decision || o.decision.cli !== "claude") throw new Error("ENV_BINDING_POLICY_REFUSED");
+    const ctx = controllerContext(env.AIGENTRY_HOME!);
+    if (env.AIGENTRY_SESSIONS_ROOT && env.AIGENTRY_SESSIONS_ROOT !== path.join(ctx.home, "sessions")) {
+      throw new Error("ENV_CONTROLLER_ROOT_REFUSED");
+    }
+    const selection = resolveBinding(ctx, o.cwd, o.decision.executable, invocation.values["--binding"]);
+    if (!managedRuntime?.base.PATH) throw new Error("ENV_HELPER_PATH_REFUSED");
+    return { ctx, selection, input: activeInput!, runtime: managedRuntime };
+  })() : undefined;
   const spawnEnv: NodeJS.ProcessEnv = o.route && /^(llm|table)(-capped)?$/.test(o.route.decided_by) && o.decision?.model !== null
     ? { [`AIGENTRY_${o.cli.toUpperCase()}_MODEL`]: o.route.model } : {};
   // #1148: boot-prepare turns this ONE decision into argv; its launcher export dies at the runner (C3).
   if (o.decision) spawnEnv.AIGENTRY_SPAWN_DECISION = JSON.stringify(o.decision);
-  const childEnv = { ...env, ...spawnEnv };
+  const childEnv = { ...env, ...spawnEnv, AIGENTRY_TARGET_CWD: o.cwd };
   // #431 (ADR 2026-05-12 enforcement) — hybrid (b-2)+(c) boot wiring.
   // A failed role boot must never fall back to an unrestricted CLI.
   let bootSpawnCli = "";
@@ -1289,8 +1349,9 @@ function spawnWorkspace(o: Opts, sid: string): void {
     // Resolve boot from this installed package, even when SCRIPT_DIR is a copied control workspace.
     const bootPrepare = fileURLToPath(new URL("../../../bin/boot-prepare.mjs", import.meta.url));
     if (isExecutable(bootPrepare)) {
-      const r = captureOut("node", [bootPrepare, "--role", o.role, "--cwd", o.cwd, "--sid", sid, "--cli", o.cli, "--confined"],
-        o.decision ? { ...spawnEnv, AIGENTRY_TASK_ID: o.taskId } : spawnEnv);
+      const r = captureOut(managedRuntime ? process.execPath : "node",
+        [bootPrepare, "--role", o.role, "--cwd", o.cwd, "--sid", sid, "--cli", o.cli, "--confined"],
+        o.decision ? { ...spawnEnv, AIGENTRY_TASK_ID: o.taskId, AIGENTRY_TARGET_CWD: o.cwd } : { ...spawnEnv, AIGENTRY_TARGET_CWD: o.cwd });
       let parsed: { spawn_cli?: unknown; spawn_cwd?: unknown; argv?: unknown; launch?: unknown; decision?: unknown } | null = null;
       if (r.status === 0 && r.stdout) {
         try {
@@ -1332,6 +1393,7 @@ function spawnWorkspace(o: Opts, sid: string): void {
   }
   let launcher: string;
   let spawnCwd: string;
+  let managedPin: { manifest: string; hash: string } | undefined;
   if (bootSpawnCli && bootSpawnCwd) {
     // Hybrid/additive path active. bootSpawnCli already encodes
     // AIGENTRY_TARGET_CWD export + the role delivery. Wrap it again at the
@@ -1342,37 +1404,31 @@ function spawnWorkspace(o: Opts, sid: string): void {
     // #1170 (RC6): the registry state (the registry's own default) and this control workspace.
     const stateDir = path.resolve(env.DISPATCH_STATE_DIR ||
       path.join(path.dirname(path.dirname(path.resolve(DISPATCH_REGISTRY_PY))), "state", "dispatch"));
-    let sandbox: ReturnType<typeof prepareWorkerSandbox>;
-    try {
-      sandbox = prepareWorkerSandbox(scope, o.cli, bootSpawnCwd, bootArgv, protectedRoot, o.cwd, workerHooksDir, bootLaunch,
-        o.decision?.executable, { noAccess: [stateDir], noWrite: [path.resolve(SCRIPT_DIR, "..")] });
-    } catch (error) {
-      // The source may change after precheck. Boot/guard effects already exist, but no terminal has opened.
-      if (o.cli === "claude" && error instanceof Error) {
-        if (error.message === "SANDBOX_AUTH_WORKER_TOKEN_REQUIRED") {
-          die("dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_REQUIRED: confined Claude workers authenticate only with an approved " +
-            "automation token (claude setup-token) supplied as AIGENTRY_CLAUDE_OAUTH_TOKEN or in " +
-            "~/.aigentry/credentials/claude-worker/token; the host login is never copied; " +
-            "see docs/setup/dispatch-capacity.md; nothing was spawned (exit 78)", 78);
-        }
-        if (error.message === "CLAUDE_OAUTH_STORE_INVALID" || error.message === "CLAUDE_OAUTH_TOKEN_INVALID") {
-          die("dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_INVALID: invalid automation token or unsafe private token store; " +
-            "see docs/setup/dispatch-capacity.md; nothing was spawned (exit 78)", 78);
-        }
-      }
-      throw error;
+    if (managed && acquisitionKind === "store") {
+      activeInput?.dispose(); activeInput = undefined;
+      const fresh = acquireClaudeOAuthInput({});
+      if (!fresh.input) throw new Error("SANDBOX_AUTH_WORKER_TOKEN_REQUIRED");
+      activeInput = fresh.input;
+      managed.input = fresh.input;
+      managed.selection = resolveBinding(managed.ctx, o.cwd, o.decision!.executable, invocation.values["--binding"]);
     }
-    launcher = writeWorkerLauncher(sid, o.cli, sandbox.launcher, "", workerHooksDir, spawnEnv);
+    const sandbox = prepareWorkerSandbox(scope, o.cli, bootSpawnCwd, bootArgv, protectedRoot, o.cwd, workerHooksDir, bootLaunch,
+      o.decision?.executable, { noAccess: [stateDir], noWrite: [path.resolve(SCRIPT_DIR, "..")] }, managed);
+    if (managed) activeInput = undefined;
+    if (managed) managedPin = { manifest: sandbox.manifest, hash: sandbox.hash };
+    launcher = managed ? sandbox.launcher : writeWorkerLauncher(sid, o.cli, sandbox.launcher, "", workerHooksDir, spawnEnv);
     spawnCwd = bootSpawnCwd;
   } else {
     die("dispatch.sh: SANDBOX_BOOT_REQUIRED", 78);
   }
   // Empty --extra-flags so open-session.sh's claude-default flags do NOT apply
   // (we control the full argv via the launcher).
+  const terminalArgs = ["--track", o.track, "--name", o.name, "--cwd", spawnCwd, "--cli", launcher, "--extra-flags", " ",
+    ...(managedPin ? ["--launch-policy", "managed-secret", "--managed-manifest", managedPin.manifest,
+      "--manifest-sha256", managedPin.hash] : [])];
   const r = (process.platform === "win32" ? crossSpawn.sync : spawnSync)(
-    OPEN_SESSION_SH,
-    ["--track", o.track, "--name", o.name, "--cwd", spawnCwd, "--cli", launcher, "--extra-flags", " "],
-    { stdio: ["inherit", "ignore", "inherit"], env: childEnv },
+    managedExecutable("terminal", OPEN_SESSION_SH, terminalArgs), terminalArgs,
+    { stdio: ["inherit", "ignore", "inherit"], env: helperFor("terminal", managedRuntime ? { AIGENTRY_TARGET_CWD: o.cwd } : childEnv) },
   );
   if (r.error || (r.status ?? 1) !== 0) {
     die("dispatch.sh: open-session.sh failed", 2);
@@ -1380,12 +1436,26 @@ function spawnWorkspace(o: Opts, sid: string): void {
 }
 
 // ── main ────────────────────────────────────────────────────────────────────
-async function main(argv: string[]): Promise<never> {
-  const o = parseArgs(argv);
+async function main(): Promise<never> {
+  const o = invocationOptions();
+  if (o.spawn && o.cli === "claude" && !activeInput) die("dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_REQUIRED; nothing was spawned", 78);
+  if (o.spawn && activeInput && o.cli !== "claude" && o.cli !== "auto") { activeInput.dispose(); activeInput = undefined; }
+  if (!o.spawn && activeInput) { activeInput.dispose(); activeInput = undefined; }
+  if (activeInput) {
+    if (o.target || o.retryUnknown || !o.track || !o.name || !o.cwd ||
+        !["darwin", "linux"].includes(process.platform)) die("dispatch.sh: ENV_MANAGED_ROUTE_REFUSED; nothing was spawned", 78);
+    const ctx = controllerContext(env.AIGENTRY_HOME!);
+    resolveBinding(ctx, o.cwd, undefined, invocation.values["--binding"]);
+  }
 
   if (!o.refFile) die("dispatch.sh: --ref required", 4);
   if (!fs.existsSync(o.refFile) || !fs.statSync(o.refFile).isFile()) {
     die(`dispatch.sh: ref file not found: ${o.refFile}`, 4);
+  }
+  if (activeInput) {
+    const controller = controllerContext(env.AIGENTRY_HOME!);
+    managedRuntime = captureManagedRuntime(env, path.join(controller.home, "environment"));
+    TELEPTY = trustedTool(managedRuntime, "telepty");
   }
 
   verifyWorkerInputs(o);
@@ -1442,7 +1512,20 @@ async function main(argv: string[]): Promise<never> {
 
   resolveRoute(o, sid, skipPreparation || o.retryUnknown !== "");
   const spawned = !skipPreparation && o.spawn && !o.retryUnknown;
-  if (spawned) { applyCliCap(o); resolveSpawnDecision(o, sid); spawnWorkspace(o, sid); }
+  if (spawned) {
+    applyCliCap(o);
+    if (o.cli === "claude" && activeInput && !managedRuntime) {
+      const kind = acquisitionKind;
+      initialize(invocation, activeInput, env);
+      acquisitionKind = kind;
+      const ctx = controllerContext(env.AIGENTRY_HOME!);
+      resolveBinding(ctx, o.cwd, undefined, invocation.values["--binding"]);
+      managedRuntime = captureManagedRuntime(env, path.join(ctx.home, "environment"));
+      TELEPTY = trustedTool(managedRuntime, "telepty");
+    }
+    if (o.cli !== "claude") { activeInput?.dispose(); activeInput = undefined; }
+    resolveSpawnDecision(o, sid); spawnWorkspace(o, sid);
+  }
 
   emitTelemetry([
     "--helper", "dispatch",
@@ -1614,13 +1697,13 @@ async function probe(argv: string[]): Promise<never> {
   }
   if (sub === "verify-delivered") {
     // __probe verify-delivered --ref <file> <sid> → 0 landed / 1 did not / 2 unknown
-    const o = parseArgs(argv.slice(1, argv.length - 1));
+    const o = invocationOptions();
     process.exit(await verifyDelivered(o, argv[argv.length - 1] ?? ""));
   }
   if (sub === "dispatch-ref") {
     // __probe dispatch-ref --ref <file> [--from <id>] <sid>
     // prepare_effective_ref + do_inject, the pair T67 calls back to back.
-    const o = parseArgs(argv.slice(1, argv.length - 1));
+    const o = invocationOptions();
     // Unconfined probe: no staging, so refPrompt stays empty and inject keeps the
     // legacy `--ref` argv the 12 guards measure. Not the production path.
     const d: Delivery = { refHash: "", effRef: "", tmpRef: "", transportInjectId: "", refPrompt: "" };
@@ -1631,9 +1714,37 @@ async function probe(argv: string[]): Promise<never> {
   process.exit(4);
 }
 
-const argv = process.argv.slice(2);
-if (argv[0] === "__probe") {
-  await probe(argv.slice(1));
-} else {
-  await main(argv);
+export async function dispatchMain(parsed: DispatchInvocation, source?: OwnedInput,
+  trustedEnvironment: NodeJS.ProcessEnv = process.env): Promise<void> {
+  initialize(parsed, source, trustedEnvironment);
+  try { await main(); } finally { activeInput?.dispose(); source?.dispose(); activeInput = undefined; }
+}
+
+export async function dispatchProbe(parsed: DispatchInvocation, argv: string[]): Promise<void> {
+  initialize(parsed, undefined);
+  await probe(argv);
+}
+
+// An import is inert. The shipped entry owns capture/parse before importing this
+// module; direct invocation retains the original CLI and probe behavior.
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const argv = process.argv.slice(2);
+  let raw = process.env.AIGENTRY_CLAUDE_OAUTH_TOKEN;
+  delete process.env.AIGENTRY_CLAUDE_OAUTH_TOKEN;
+  let source: OwnedInput | undefined;
+  try {
+    const parsed = parseDispatchInvocation(dispatchOptionArgs(argv));
+    const provider = parsed.values["--cli"] ?? bootstrapEnvironment(process.env, parsed.context).env.AIGENTRY_DISPATCH_CLI ?? "auto";
+    if (argv[0] !== "__probe" && !parsed.help && parsed.switches.has("--spawn-and-dispatch") && ["claude", "auto"].includes(provider)) {
+      source = captureCompatibilityInput({ AIGENTRY_CLAUDE_OAUTH_TOKEN: raw });
+    }
+    raw = undefined;
+    initialize(parsed, source);
+    if (argv[0] === "__probe") await probe(argv.slice(1));
+    else await main();
+  } catch (e) {
+    const message = e instanceof Error && (e instanceof InvocationError || (e.message.startsWith("ENV_") || e.message.startsWith("CLAUDE_OAUTH_") || e.message.startsWith("SANDBOX_AUTH_") || e.message === "SANDBOX_EXECUTABLE_CHANGED")) ? e.message : "ENV_CONFIGURATION_REFUSED";
+    process.stderr.write(`dispatch.sh: ${message}; nothing was spawned\n`);
+    process.exitCode = e instanceof InvocationError || message.startsWith("ENV_INPUT_") ? 4 : message === "SANDBOX_EXECUTABLE_CHANGED" ? 1 : 78;
+  } finally { activeInput?.dispose(); source?.dispose(); }
 }

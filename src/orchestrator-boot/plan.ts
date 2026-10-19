@@ -392,7 +392,10 @@ export function providerArgv(plan: BootPlan): string[] {
  * `allowArgs[0]`), the telepty lifecycle is untouched, and the singleton guard's match
  * token (`--id <sid>`) is still the same token this boot will carry.
  */
-export function buildExecArgv(plan: BootPlan, ref?: HandoffRef): string[] {
+export function buildExecArgv(plan: BootPlan, ref?: HandoffRef,
+  launchPolicy: { kind: "native-only"; restart: "native-default" } | { kind: "managed-secret"; restart: "never" } =
+    { kind: "native-only", restart: "native-default" }): string[] {
+  if (launchPolicy.kind !== "native-only") throw new Error("ENV_MANAGED_ROUTE_REFUSED");
   // D-5: a handoff rides only on a NEW conversation. With no ref the argv is byte-identical
   // to the pre-handoff one.
   const handoff = ref === undefined || plan.history.kind !== "new" ? [] : handoffArgv(plan.provider, ref);

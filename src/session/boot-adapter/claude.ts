@@ -22,7 +22,7 @@ export function claudeAdapter() {
     min_version: CLAUDE_MIN_VERSION,
     // #1162: --model/--effort moved here from boot-prepare (same env names,
     // defaults and argv position) so argv and launch share one resolution.
-    buildArgvEnv: ({ prompt_file, decision }) => {
+    buildArgvEnv: ({ prompt_file, decision, environment }) => {
       // #1148: a resolver decision carries the exact model/effort; null omits the flag and
       // no env or literal default is consulted.
       if (decision) {
@@ -33,8 +33,8 @@ export function claudeAdapter() {
           launch: decisionLaunch(decision),
         };
       }
-      const model = envOrDefault(process.env, "AIGENTRY_CLAUDE_MODEL", "claude-opus-5");
-      const effort = envOrDefault(process.env, "AIGENTRY_CLAUDE_EFFORT", "xhigh");
+      const model = envOrDefault(environment, "AIGENTRY_CLAUDE_MODEL", "claude-opus-5");
+      const effort = envOrDefault(environment, "AIGENTRY_CLAUDE_EFFORT", "xhigh");
       return {
         argv: ["claude", "--append-system-prompt-file", prompt_file,
           "--model", model.arg, "--effort", effort.arg],

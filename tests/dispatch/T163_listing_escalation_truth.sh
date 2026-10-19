@@ -76,12 +76,16 @@ case "$1" in
 esac
 exit 99
 EOF
-# fake curl: records argv (with the presented header), prints the configured
+# fake curl: records argv, and (#1214) ONE stdin line per call — the presented header,
+# read only when told to (`-H @-`) as real curl does — prints the configured
 # http_code as -w would, exits $FAKE_CURL_RC (real curl prints 000 and exits 7 on a
 # failed connect).
 cat > "$FAKES/curl" <<"EOF"
 #!/usr/bin/env bash
 printf "%s\n" "$*" >> "$FAKE_LOG_DIR/curl.calls"
+hdr="<stdin not read>"
+for a in "$@"; do [ "$a" = "@-" ] && { hdr=$(cat); break; }; done
+printf "%s\n" "${hdr//$'\n'/\\n}" >> "$FAKE_LOG_DIR/curl.stdin"
 printf "%s" "${FAKE_HTTP_CODE:-200}"
 exit "${FAKE_CURL_RC:-0}"
 EOF
@@ -100,7 +104,7 @@ setup_case() { # <dir> <raw listing>
   mkdir -p "$1/home/.telepty" "$1/log" "$1/comms"
   printf "%s\n" "{\"authToken\":\"FAKE-TOKEN-974\"}" > "$1/home/.telepty/config.json"
   printf "%s\n" "$2" > "$1/list.json"
-  : > "$1/log/curl.calls"; : > "$1/log/telepty.calls"; : > "$1/log/inject.targets"
+  : > "$1/log/curl.calls"; : > "$1/log/curl.stdin"; : > "$1/log/telepty.calls"; : > "$1/log/inject.targets"
 }
 
 # run_env <dir> <suffix> <cmd...> — the only way this guard runs product code. The env
@@ -129,12 +133,15 @@ listing() { # <dir> <trusted|sidlive> — prints the rc
 count() { wc -l < "$1" | tr -d " "; }
 bytes() { wc -c < "$1" | tr -d " "; }
 # curl_hdr <dir> — na: no probe; yes: EVERY probe presented the fake HOME token (never
-# the env one) to the pinned loopback port; NO otherwise.
+# the env one) to the pinned loopback port; NO otherwise. #1214: presented on curl's
+# stdin (`-H @-`) — the argv names neither the token nor the header.
 curl_hdr() {
   local n m
   n=$(count "$1/log/curl.calls")
   if [ "$n" -eq 0 ]; then printf na; return 0; fi
-  m=$(grep -cF "x-telepty-token: FAKE-TOKEN-974 http://127.0.0.1:1/api/sessions" "$1/log/curl.calls" || true)
+  m=$(paste -d '\t' "$1/log/curl.calls" "$1/log/curl.stdin" | awk -F '\t' '
+    $1 ~ /(^| )(-H|--header) ?@-( |$)/ && $1 ~ /http:\/\/127\.0\.0\.1:1\/api\/sessions( |$)/ &&
+    $1 !~ /FAKE-TOKEN|x-telepty-token/ && $2 == "x-telepty-token: FAKE-TOKEN-974"' | grep -c . || true)
   if [ "$m" -eq "$n" ]; then printf yes; else printf NO; fi
 }
 want_hdr() { if [ "$1" -eq 0 ]; then printf na; else printf yes; fi; }

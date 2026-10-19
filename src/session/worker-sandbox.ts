@@ -7,8 +7,15 @@ import type { AddressInfo } from "node:net";
 import type { SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import { isCliKind, type LaunchConfig } from "./boot-adapter/types.js";
 import { normalizeLaunch } from "./boot-adapter/launch-config.js";
-import { CLAUDE_OAUTH_DIR, selectedClaudeOAuthToken, writeClaudeOAuthHandoff } from "./claude-worker-oauth.js";
-import { sameFileIdentity, type ExecutableBinding } from "./model-decision.js";
+import { CLAUDE_OAUTH_DIR, CLAUDE_OAUTH_FILE, selectedClaudeOAuthToken, writeClaudeOAuthHandoff } from "./claude-worker-oauth.js";
+import { sameFileIdentity, validateExecutableBinding, type ExecutableBinding } from "./model-decision.js";
+import { strictJson, uuid } from "../environment/contract.js";
+import { prepareGrant, reserveDeliveryIds } from "../environment/delivery.js";
+import type { BindingSelection, ControllerContext } from "../environment/grants.js";
+import type { OwnedInput } from "../environment/owned-input.js";
+import { fsyncDirectory } from "../environment/storage.js";
+import { assertTrustedFile, assertTrustedTool, pinTrustedFile, trustedTool,
+  type TrustedRuntimeContext } from "../environment/helper-env.js";
 
 export interface WorkerScope {
   version: 1;
@@ -43,6 +50,16 @@ export interface WorkerManifest {
   /** #1136: the staged read-only turn-end hook (claude only). Absent on codex and on older spawns. */
   reportHook?: { path: string; sha256: string };
 }
+export interface WorkerManifestV2 extends Omit<WorkerManifest, "version" | "claudeOAuthHandoff" | "executable"> {
+  version: 2;
+  controllerRootId: string;
+  authorityGeneration: number;
+  targetProject: { enrollmentId: string; canonicalRoot: string; identity: { dev: string; ino: string }; epoch: number };
+  delivery: { grantId: string; grantArtifact: string };
+  launchPolicy: { kind: "managed-secret"; restart: "never" };
+  executable: ExecutableBinding;
+}
+export type AnyWorkerManifest = WorkerManifest | WorkerManifestV2;
 
 /**
  * #1148 U4: the bound file must still be the one the resolver chose — same realpath and
@@ -128,10 +145,16 @@ export function loadWorkerScope(file: string | undefined, task: string, sid: str
   return { version: 1, task, sid, read, write, domains: [...new Set(s.domains)] };
 }
 
-function executable(name: string): string {
-  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
+function executable(name: string, lookupPath = process.env.PATH || "", trusted = false): string {
+  for (const dir of lookupPath.split(path.delimiter)) {
     const p = path.isAbsolute(name) ? name : path.join(dir, name);
-    try { fs.accessSync(p, fs.constants.X_OK); return fs.realpathSync(p); } catch { /* next path */ }
+    try {
+      const real = fs.realpathSync(p), st = fs.statSync(real);
+      fs.accessSync(real, fs.constants.X_OK);
+      if (trusted && (!st.isFile() || (st.mode & 0o022) ||
+          (st.uid !== 0 && st.uid !== process.getuid?.()))) continue;
+      return real;
+    } catch { /* next path */ }
   }
   throw new Error(`SANDBOX_EXECUTABLE_MISSING: ${name}`);
 }
@@ -212,11 +235,18 @@ export interface ControlRoots {
   noAccess: string[];
   noWrite: string[];
 }
+export interface ManagedWorkerPreparation {
+  readonly ctx: ControllerContext;
+  readonly selection: BindingSelection;
+  readonly input: OwnedInput;
+  readonly runtime: TrustedRuntimeContext;
+}
 
 export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: string,
   argv: string[], stagingRoot: string, targetCwd = roleCwd,
   hooksDir?: string, launch?: LaunchConfig, binding?: ExecutableBinding,
-  controlRoots: ControlRoots = { noAccess: [], noWrite: [] }): { launcher: string; manifest: string; hash: string } {
+  controlRoots: ControlRoots = { noAccess: [], noWrite: [] },
+  managed?: ManagedWorkerPreparation): { launcher: string; manifest: string; hash: string } {
   if (!["darwin", "linux"].includes(process.platform)) throw new Error("SANDBOX_PLATFORM_UNSUPPORTED");
   if (!(CONFINED_CLIS as readonly string[]).includes(cli)) throw new Error(`SANDBOX_CLI_UNSUPPORTED: ${cli}`);
   if (!argv.length || path.basename(argv[0]!) !== cli) throw new Error("SANDBOX_COMMAND_BINDING");
@@ -232,9 +262,12 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
     assertNotCliWrapper(binding);
   }
   // #652: validated before any staging write. Claude only; codex never reads it.
-  const oauthToken = cli === "claude" ? selectedClaudeOAuthToken(process.env) : undefined;
+  if (cli === "claude" && !managed && selectedClaudeOAuthToken(process.env) !== undefined) throw new Error("ENV_LEGACY_SECRET_RELAUNCH_REFUSED: create a new approved dispatch with current configuration and binding");
+  const oauthToken: string | undefined = undefined;
   // #1232: no opt-in, no confined Claude worker; refused before any filesystem effect.
-  if (cli === "claude" && oauthToken === undefined) throw new Error("SANDBOX_AUTH_WORKER_TOKEN_REQUIRED");
+  if (cli === "claude" && oauthToken === undefined && !managed) throw new Error("SANDBOX_AUTH_WORKER_TOKEN_REQUIRED");
+  if (managed && (cli !== "claude" || !binding || managed.selection.binding.executableBinding.path !== binding.path ||
+      stagingRoot !== path.join(managed.ctx.home, "sessions", scope.sid))) throw new Error("ENV_BINDING_POLICY_REFUSED");
   const cwd = canonical(roleCwd);
   // #1170 (RC6): before any write. A scope reaching another sid's stage, the registry or
   // the control code would let one worker forge or erase another's report.
@@ -244,7 +277,8 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   if ([...scope.read, ...scope.write].some(p => overlaps(p, noAccess)) || scope.write.some(p => overlaps(p, noWrite))) {
     throw new Error("SANDBOX_POLICY_CONTROL_OVERLAP");
   }
-  const attempt = randomUUID();
+  const reserved = managed ? reserveDeliveryIds() : undefined;
+  const attempt = reserved?.attempt ?? randomUUID();
   const root = canonical(path.join(stagingRoot, "sandbox", attempt));
   const home = path.join(root, "home");
   // Keep SRT Unix socket names below sockaddr_un's path limit on macOS.
@@ -252,7 +286,7 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   fs.chmodSync(tmp, 0o700);
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
   fs.mkdirSync(tmp, { recursive: true, mode: 0o700 });
-  const authEnv = seedAuth(cli, home, cwd, oauthToken !== undefined);
+  const authEnv = seedAuth(cli, home, cwd, oauthToken !== undefined || !!managed);
   // Outside HOME and outside allowRead; the token itself never enters the manifest.
   const oauthHandoff = oauthToken === undefined ? undefined :
     writeClaudeOAuthHandoff(path.join(root, CLAUDE_OAUTH_DIR), oauthToken);
@@ -261,7 +295,8 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   // #652: apply_patch is on PATH only under a Codex host. Optional helper: when absent,
   // no symlink and no allowRead entry; the real CLI below still fails closed.
   let patchBinary: string | undefined;
-  try { patchBinary = executable("apply_patch"); } catch { patchBinary = undefined; }
+  try { patchBinary = managed ? trustedTool(managed.runtime, "apply_patch") : executable("apply_patch"); }
+  catch { patchBinary = undefined; }
   if (patchBinary) fs.symlinkSync(patchBinary, path.join(localBin, "apply_patch"));
   const shared = path.join(home, ".telepty", "shared");
   fs.mkdirSync(shared, { recursive: true, mode: 0o700 });
@@ -271,9 +306,16 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   const hookCopy = path.join(root, "git-hooks");
   if (hooksDir) writePrivate(path.join(hookCopy, "pre-push"), fs.readFileSync(path.join(hooksDir, "pre-push"), "utf8"));
   if (hooksDir) fs.chmodSync(path.join(hookCopy, "pre-push"), 0o700);
-  const realCli = executable(argv[0]!);
+  const realCli = executable(argv[0]!, managed?.runtime.base.PATH, !!managed);
   const runner = fileURLToPath(new URL("./worker-sandbox-runner.js", import.meta.url));
   const binder = fileURLToPath(new URL("./worker-sandbox-bind.js", import.meta.url));
+  if (managed) {
+    for (const [file, executable] of [["/bin/bash", true], [process.execPath, true],
+      [runner, false], [binder, false]] as const) {
+      pinTrustedFile(managed.runtime, "binder", file, executable);
+      assertTrustedFile(managed.runtime, "binder", file, executable);
+    }
+  }
   const probeFile = path.join(root, "outside-canary.txt");
   writePrivate(probeFile, "sandbox boundary canary; not a user secret\n");
   const probeDirectory = path.join(root, "outside-directory-canary");
@@ -317,7 +359,7 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   // Do not inherit host credentials, sockets, hooks, NODE_OPTIONS or shell startup files.
   const childEnv: Record<string, string> = {
     HOME: home, TMPDIR: tmp, TMP: tmp, TEMP: tmp, CLAUDE_CODE_TMPDIR: tmp,
-    PATH: `${localBin}${path.delimiter}${process.env.PATH || "/usr/bin:/bin"}`, SHELL: "/bin/bash",
+    PATH: `${localBin}${path.delimiter}${managed ? managed.runtime.base.PATH : process.env.PATH || "/usr/bin:/bin"}`, SHELL: "/bin/bash",
     TERM: process.env.TERM || "xterm-256color", LANG: process.env.LANG || "en_US.UTF-8",
     AIGENTRY_WORKER_SESSION: "1", AIGENTRY_TASK_ID: scope.task,
     AIGENTRY_WORKER_SESSION_ID: scope.sid, AIGENTRY_WORKER_ATTEMPT: attempt,
@@ -350,7 +392,19 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
     if (realCli !== binding.realpath) throw new Error("SANDBOX_EXECUTABLE_CHANGED");
     assertExecutableIdentity(binding, realCli);
   }
-  const m: WorkerManifest = { version: 1, task: scope.task, sid: scope.sid, attempt, cli, cwd,
+  if (managed && patchBinary) assertTrustedTool(managed.runtime, "apply_patch", patchBinary);
+  const m: AnyWorkerManifest = managed && reserved && binding ? {
+    version: 2, task: scope.task, sid: scope.sid, attempt, cli, cwd,
+    command, env: childEnv, config, probeFile, probeDirectory, receipt,
+    controllerRootId: managed.ctx.rootId, authorityGeneration: managed.selection.authorityGeneration,
+    targetProject: { enrollmentId: managed.selection.enrollmentId, canonicalRoot: managed.selection.projectRoot,
+      identity: managed.selection.projectIdentity, epoch: managed.selection.projectEpoch },
+    delivery: { grantId: reserved.grantId,
+      grantArtifact: path.join(managed.ctx.home, "environment", "grants", reserved.grantId, "grant.json") },
+    launchPolicy: { kind: "managed-secret", restart: "never" }, executable: binding,
+    ...(launch && isCliKind(cli) ? { launch: normalizeLaunch(cli, launch) } : {}),
+    ...(reportHook ? { reportHook } : {})
+  } : { version: 1, task: scope.task, sid: scope.sid, attempt, cli, cwd,
     command, env: childEnv, config, probeFile, probeDirectory, receipt,
     ...(oauthHandoff ? { claudeOAuthHandoff: oauthHandoff } : {}),
     ...(launch && isCliKind(cli) ? { launch: normalizeLaunch(cli, launch) } : {}),
@@ -358,17 +412,25 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   const data = JSON.stringify(m, null, 2) + "\n";
   const manifest = path.join(root, "manifest.json"), hash = digest(data);
   writePrivate(manifest, data);
+  if (managed) {
+    const fd = fs.openSync(manifest, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fsyncDirectory(root);
+  }
   const launcher = path.join(root, "launcher.sh");
   // #1162 pane binding runs before the OS sandbox, as the same host process chain
   // as the runner. Its failure only leaves metadata unsupported; the worker starts.
-  writePrivate(launcher, `#!/usr/bin/env bash\n${quote(process.execPath)} ${quote(binder)} ${quote(manifest)} ${quote(hash)} ||` +
+  writePrivate(launcher, `${managed ? "#!/bin/bash" : "#!/usr/bin/env bash"}\n${quote(process.execPath)} ${quote(binder)} ${quote(manifest)} ${quote(hash)} ||` +
     ` echo "agent-meta: binding unavailable rc=$?" >&2\n` +
     `exec ${quote(process.execPath)} ${quote(runner)} ${quote(manifest)} ${quote(hash)}\n`);
   fs.chmodSync(launcher, 0o700);
-  const current = path.join(stagingRoot, "sandbox-current.json");
-  const next = `${current}.${attempt}`;
-  writePrivate(next, JSON.stringify({ manifest, hash }));
-  fs.renameSync(next, current);
+  if (managed) prepareGrant(managed.ctx, managed.selection, scope, m as WorkerManifestV2, data, managed.input);
+  else {
+    const current = path.join(stagingRoot, "sandbox-current.json");
+    const next = `${current}.${attempt}`;
+    writePrivate(next, JSON.stringify({ manifest, hash }));
+    fs.renameSync(next, current);
+  }
   return { launcher, manifest, hash };
 }
 
@@ -440,10 +502,9 @@ export function preflightControlPort(address: AddressInfo | string | null, reser
 
 export function assertConfinedTarget(stagingRoot: string, sid: string, task: string): void {
   if (!identity.test(sid)) throw new Error("SANDBOX_TARGET_SID");
-  const current = JSON.parse(fs.readFileSync(path.join(stagingRoot, "sandbox-current.json"), "utf8"));
-  const raw = fs.readFileSync(current.manifest, "utf8");
-  if (digest(raw) !== current.hash) throw new Error("SANDBOX_MANIFEST_CHANGED");
-  const m = JSON.parse(raw) as WorkerManifest;
+  const current = readSandboxCurrent(stagingRoot);
+  const { m, stage } = readSealedManifest(current.manifest, current.hash);
+  if (stage !== fs.realpathSync(stagingRoot)) throw new Error("SANDBOX_MANIFEST_INVALID");
   const r = JSON.parse(fs.readFileSync(m.receipt, "utf8"));
   if (m.sid !== sid || m.task !== task || r.hash !== current.hash || r.attempt !== m.attempt || r.state !== "running") {
     throw new Error("SANDBOX_TARGET_NOT_RUNNING");
@@ -462,10 +523,9 @@ export function assertConfinedTarget(stagingRoot: string, sid: string, task: str
  */
 export function stageWorkerRef(stagingRoot: string, sid: string, task: string, refFile: string): string {
   assertConfinedTarget(stagingRoot, sid, task);
-  const current = JSON.parse(fs.readFileSync(path.join(stagingRoot, "sandbox-current.json"), "utf8"));
-  const raw = fs.readFileSync(current.manifest, "utf8");
-  if (digest(raw) !== current.hash) throw new Error("SANDBOX_MANIFEST_CHANGED");
-  const m = JSON.parse(raw) as WorkerManifest;
+  const current = readSandboxCurrent(stagingRoot);
+  const { m, stage } = readSealedManifest(current.manifest, current.hash);
+  if (stage !== fs.realpathSync(stagingRoot)) throw new Error("SANDBOX_MANIFEST_INVALID");
   if (m.sid !== sid || m.task !== task) throw new Error("SANDBOX_REF_BINDING");
   const body = fs.readFileSync(refFile, "utf8");
   if (!body.trim()) throw new Error("SANDBOX_REF_EMPTY");
@@ -574,7 +634,7 @@ export function readPrivate(file: string, max: number, absentIsMissing = false):
 }
 
 function parseJson(raw: string, what: string): unknown {
-  try { return JSON.parse(raw); } catch { throw new AgentBindingError("invalid", `AGENT_BINDING_PARSE: ${what}`); }
+  try { return strictJson(raw); } catch { throw new AgentBindingError("invalid", `AGENT_BINDING_PARSE: ${what}`); }
 }
 
 /**
@@ -582,7 +642,7 @@ function parseJson(raw: string, what: string): unknown {
  * canonical private root `<stage>/sandbox/<attempt>/`. The hash is integrity,
  * not authority. Returns the manifest and the stage it belongs to.
  */
-export function readSealedManifest(manifestFile: string, hash: unknown): { m: WorkerManifest; root: string; stage: string } {
+export function readSealedManifest(manifestFile: string, hash: unknown): { m: AnyWorkerManifest; root: string; stage: string } {
   if (!isHash(hash) || typeof manifestFile !== "string" || !path.isAbsolute(manifestFile) ||
       path.basename(manifestFile) !== "manifest.json") {
     throw new AgentBindingError("invalid", "AGENT_BINDING_MANIFEST_PATH");
@@ -595,18 +655,89 @@ export function readSealedManifest(manifestFile: string, hash: unknown): { m: Wo
   assertPrivateDir(root);
   const raw = readPrivate(manifestFile, 1024 * 1024);
   if (digest(raw) !== hash) throw new AgentBindingError("invalid", "SANDBOX_MANIFEST_CHANGED");
-  const m = parseJson(raw, "manifest");
-  if (!isRecord(m) || m.version !== 1 || typeof m.sid !== "string" || !identity.test(m.sid) ||
+  let m: unknown;
+  try { m = strictJson(raw); } catch { throw new AgentBindingError("invalid", "AGENT_BINDING_MANIFEST"); }
+  if (!isRecord(m) || (m.version !== 1 && m.version !== 2) || typeof m.sid !== "string" || !identity.test(m.sid) ||
       typeof m.task !== "string" || !m.task || m.attempt !== path.basename(root) ||
       typeof m.cli !== "string" || m.receipt !== path.join(root, "receipt.json")) {
     throw new AgentBindingError("invalid", "AGENT_BINDING_MANIFEST");
   }
-  return { m: m as unknown as WorkerManifest, root, stage: path.dirname(path.dirname(root)) };
+  const common = ["version", "task", "sid", "attempt", "cli", "cwd", "command", "env", "config", "probeFile", "probeDirectory", "receipt"];
+  const optional = ["launch", "executable", "reportHook"];
+  const required = m.version === 1 ? common : [...common, "controllerRootId", "authorityGeneration", "targetProject", "delivery", "launchPolicy", "executable"];
+  const allowed = m.version === 1 ? [...common, ...optional, "claudeOAuthHandoff"] : [...required, "launch", "reportHook"];
+  if (required.some(k => !Object.hasOwn(m as Record<string, unknown>, k)) || Object.keys(m).some(k => !allowed.includes(k)) ||
+      !Array.isArray(m.command) || !m.command.length || !m.command.every(x => typeof x === "string") ||
+      !isRecord(m.env) || Object.values(m.env).some(x => typeof x !== "string") ||
+      !isRecord(m.config) || typeof m.cwd !== "string" || !path.isAbsolute(m.cwd) ||
+      m.probeFile !== path.join(root, "outside-canary.txt") || m.probeDirectory !== path.join(root, "outside-directory-canary")) {
+    throw new AgentBindingError("invalid", "AGENT_BINDING_MANIFEST");
+  }
+  if (m.reportHook !== undefined && (!isRecord(m.reportHook) || !exactKeys(m.reportHook, ["path", "sha256"]) ||
+      m.reportHook.path !== path.join(root, "report-hook", "turn-hook.mjs") || !isHash(m.reportHook.sha256))) {
+    throw new AgentBindingError("invalid", "AGENT_BINDING_MANIFEST");
+  }
+  if (m.version === 1 && m.claudeOAuthHandoff !== undefined &&
+      (m.cli !== "claude" || m.claudeOAuthHandoff !== path.join(root, CLAUDE_OAUTH_DIR, CLAUDE_OAUTH_FILE))) {
+    throw new AgentBindingError("invalid", "AGENT_BINDING_MANIFEST");
+  }
+  if (m.executable !== undefined) {
+    if (m.cli !== "claude" && m.cli !== "codex") throw new AgentBindingError("invalid", "AGENT_BINDING_MANIFEST");
+    try { validateExecutableBinding(m.executable, m.cli); }
+    catch { throw new AgentBindingError("invalid", "AGENT_BINDING_MANIFEST"); }
+  }
+  if (m.launch !== undefined) {
+    const l = m.launch;
+    const validValue = (v: unknown, effort: boolean): boolean => {
+      if (!isRecord(v) || !exactKeys(v, ["value", "source"]) || typeof v.value !== "string" || typeof v.source !== "string") return false;
+      if (v.source === "cli-default" || v.source === "unknown") return v.value === "unknown";
+      return (v.source === "default" || v.source === "wizard" || /^env:AIGENTRY_[A-Z0-9_]{1,64}$/.test(v.source)) &&
+        (effort ? /^[a-z0-9_-]{1,24}$/ : /^[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,199}$/).test(v.value);
+    };
+    if (!isRecord(l) || !exactKeys(l, ["v", "cli", "model", "effort"]) || l.v !== 2 || l.cli !== m.cli ||
+        !validValue(l.model, false) || !validValue(l.effort, true)) throw new AgentBindingError("invalid", "AGENT_BINDING_MANIFEST");
+  }
+  if (m.version === 2) {
+    const stage = path.dirname(path.dirname(root));
+    const controllerRoot = path.dirname(path.dirname(stage));
+    const target = m.targetProject, delivery = m.delivery, policy = m.launchPolicy;
+    if (!uuid(m.controllerRootId) || !Number.isSafeInteger(m.authorityGeneration) || Number(m.authorityGeneration) < 1 ||
+        path.basename(path.dirname(stage)) !== "sessions" || path.basename(stage) !== m.sid ||
+        !isRecord(target) || !exactKeys(target, ["enrollmentId", "canonicalRoot", "identity", "epoch"]) ||
+        !uuid(target.enrollmentId) || typeof target.canonicalRoot !== "string" || !path.isAbsolute(target.canonicalRoot) ||
+        !isRecord(target.identity) || !exactKeys(target.identity, ["dev", "ino"]) ||
+        typeof target.identity.dev !== "string" || typeof target.identity.ino !== "string" ||
+        !/^(0|[1-9][0-9]*)$/.test(target.identity.dev) || !/^(0|[1-9][0-9]*)$/.test(target.identity.ino) ||
+        !Number.isSafeInteger(target.epoch) || Number(target.epoch) < 1 ||
+        !isRecord(delivery) || !exactKeys(delivery, ["grantId", "grantArtifact"]) || !uuid(delivery.grantId) ||
+        delivery.grantArtifact !== path.join(controllerRoot, "environment", "grants", delivery.grantId, "grant.json") ||
+        !isRecord(policy) || !exactKeys(policy, ["kind", "restart"]) || policy.kind !== "managed-secret" || policy.restart !== "never" ||
+        m.cli !== "claude" || !isRecord(m.executable) || m.env.CLAUDE_CODE_OAUTH_TOKEN !== undefined ||
+        m.env.AIGENTRY_CLAUDE_OAUTH_TOKEN !== undefined || m.command[0] !== m.executable.path) {
+      throw new AgentBindingError("invalid", "AGENT_BINDING_MANIFEST");
+    }
+    const config = m.config as Record<string, unknown>;
+    const network = config.network, filesystem = config.filesystem;
+    if (!exactKeys(config, ["network", "filesystem", "allowPty", "allowAppleEvents", "enableWeakerNestedSandbox", "enableWeakerNetworkIsolation"]) ||
+        !isRecord(network) || !exactKeys(network, ["allowedDomains", "deniedDomains", "allowUnixSockets", "allowAllUnixSockets", "allowLocalBinding"]) ||
+        !isRecord(filesystem) || !exactKeys(filesystem, ["denyRead", "allowRead", "allowWrite", "denyWrite"]) ||
+        ![network.allowedDomains, network.deniedDomains, network.allowUnixSockets,
+          filesystem.denyRead, filesystem.allowRead, filesystem.allowWrite, filesystem.denyWrite]
+          .every(v => Array.isArray(v) && v.every(x => typeof x === "string")) ||
+        network.allowAllUnixSockets !== false || network.allowLocalBinding !== false ||
+        config.allowPty !== true || config.allowAppleEvents !== false ||
+        config.enableWeakerNestedSandbox !== false || config.enableWeakerNetworkIsolation !== false) {
+      throw new AgentBindingError("invalid", "AGENT_BINDING_MANIFEST");
+    }
+  }
+  return { m: m as unknown as AnyWorkerManifest, root, stage: path.dirname(path.dirname(root)) };
 }
 
 /** `<stage>/sandbox-current.json`, exact keys; absent = no sealed session (missing). */
 export function readSandboxCurrent(stage: string): { manifest: string; hash: string } {
-  const c = parseJson(readPrivate(path.join(stage, "sandbox-current.json"), 4096, true), "current");
+  let c: unknown;
+  try { c = strictJson(readPrivate(path.join(stage, "sandbox-current.json"), 4096, true)); }
+  catch { throw new AgentBindingError("invalid", "AGENT_BINDING_CURRENT"); }
   if (!isRecord(c) || !exactKeys(c, ["manifest", "hash"]) || typeof c.manifest !== "string" || !isHash(c.hash)) {
     throw new AgentBindingError("invalid", "AGENT_BINDING_CURRENT");
   }

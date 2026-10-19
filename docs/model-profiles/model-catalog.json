@@ -1,5 +1,5 @@
 {
-  "schema": "aigentry-model-catalog/2",
+  "schema": "aigentry-model-catalog/1",
   "as_of": "2026-09-27",
   "status": "dated bootstrap: an observation of public documentation at T, never proof of current, latest or account availability",
   "evidence": {
@@ -26,12 +26,7 @@
       },
       "auto_effort_never": ["max", "ultra", "ultracode"],
       "policy_incumbent": "claude-opus-5",
-      "family_prefixes": [
-        {"prefix": "claude-fable-", "tier": "fable"},
-        {"prefix": "claude-opus-", "tier": "opus"},
-        {"prefix": "claude-sonnet-", "tier": "sonnet"},
-        {"prefix": "claude-haiku-", "tier": "haiku"}
-      ]
+      "family_pattern": "^claude-(fable|opus|sonnet|haiku)-"
     },
     "codex": {
       "provider": "openai",
@@ -46,7 +41,7 @@
       },
       "auto_effort_never": ["max", "ultra", "ultracode"],
       "policy_incumbent": "gpt-6-astra",
-      "family_prefixes": null
+      "family_pattern": null
     }
   },
   "surfaces": {

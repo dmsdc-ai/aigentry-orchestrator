@@ -36,7 +36,7 @@ export function optInEnv(env: NodeJS.ProcessEnv, name: `AIGENTRY_${string}`): La
 }
 
 // Bounded label charsets (contract v1 §2). Labels are data only.
-const MODEL_RE = /^[A-Za-z0-9._:/@-]{1,96}$/;
+const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,199}$/;
 const EFFORT_RE = /^[a-z0-9_-]{1,24}$/;
 const ENV_SOURCE_RE = /^env:AIGENTRY_[A-Z0-9_]{1,64}$/;
 

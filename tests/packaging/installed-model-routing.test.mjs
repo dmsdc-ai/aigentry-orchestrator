@@ -176,7 +176,7 @@ fs.writeFileSync(manifest.receipt, JSON.stringify({ hash: current.hash, attempt:
         AIGENTRY_GIT_HOOKS_DIR: join(root, "hooks"), AIGENTRY_GIT_HOOK_SOURCE_DIR: join(REPO, "git-hooks"),
         CODEX_HOME: join(root, "codex-home"), GEMINI_CLI_HOME: join(root, "gemini-home"),
         AIGENTRY_ROUTER_PROFILE: PROFILE, AIGENTRY_ROUTER_CLASSIFIER: classifier,
-        AIGENTRY_CLAUDE_MODEL: "", AIGENTRY_CODEX_MODEL: "", AIGENTRY_GROK_MODEL: "", AIGENTRY_GEMINI_MODEL: "",
+        AIGENTRY_CLAUDE_MODEL: undefined, AIGENTRY_CODEX_MODEL: undefined, AIGENTRY_GROK_MODEL: undefined, AIGENTRY_GEMINI_MODEL: undefined,
         AIGENTRY_GEMINI_BINARY: "agy", AIGENTRY_DISPATCH_REGISTER_TIMEOUT_MS: "0",
         AIGENTRY_SHIM_SCRIPT_DIR: "", DISPATCH_SCRIPT_DIR: "", DISPATCH_REGISTRY_PY: join(REPO, "bin/dispatch-registry.py"),
         COUNTER: join(root, "counter"), PROMPT_LOG: join(root, "prompt"), CLASSIFIER_ARGS: join(root, "classifier-args"),

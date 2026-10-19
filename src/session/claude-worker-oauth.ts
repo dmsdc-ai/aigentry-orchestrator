@@ -1,8 +1,18 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import * as os from "node:os";
 import { winPrivateStorage } from "./private-storage.js";
 import type { VerifyItem, VerifyResult, WinPrivateStorage } from "./private-storage.js";
+import * as os from "node:os";
+import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { strictJson, uuid } from "../environment/contract.js";
+import { controllerContext, currentConfig, inspectGrants, type ControllerContext } from "../environment/grants.js";
+import { durableWriteExclusive, fsyncDirectory, readBounded, withWriterLock } from "../environment/storage.js";
+import { OwnedInput } from "../environment/owned-input.js";
+import { assertExecutableIdentity } from "./worker-sandbox.js";
+import { validateExecutableBinding, type ExecutableBinding } from "./model-decision.js";
+import { captureManagedRuntime } from "../environment/helper-env.js";
 
 // #652 opt-in long-lived Claude worker token (`claude setup-token`). The raw value
 // is written only to one private per-attempt handoff file and the actual worker
@@ -63,6 +73,18 @@ export function selectedClaudeOAuthToken(env: NodeJS.ProcessEnv = process.env): 
   } catch {
     throw new Error("CLAUDE_OAUTH_STORE_INVALID");
   }
+}
+
+export type ClaudeAcquisitionKind = "explicit" | "store" | "absent";
+export function acquireClaudeOAuthInput(env: NodeJS.ProcessEnv = process.env): {
+  input?: OwnedInput; kind: ClaudeAcquisitionKind;
+} {
+  let selected = selectedClaudeOAuthToken(env);
+  if (selected === undefined) return { kind: "absent" };
+  const bytes = Buffer.from(selected, "utf8");
+  selected = undefined;
+  try { return { input: OwnedInput.fromBytes(bytes), kind: env[CLAUDE_OAUTH_OPT_IN] ? "explicit" : "store" }; }
+  finally { bytes.fill(0); }
 }
 
 // #1167 F6 (win32, P2 + Q-FILE R2): mode bits and uid mean nothing there, so the ACL is read back.
@@ -210,4 +232,156 @@ export function claudeOAuthLauncherLines(file: string, nodeBin: string, helperMo
     `export ${CLAUDE_OAUTH_CHILD}="$__aig_oauth_tok"\n` +
     `unset __aig_oauth_tok ${CLAUDE_OAUTH_OPT_IN}\n`
   );
+}
+
+export interface ExplicitReceiptRef { readonly receipt: string; readonly attempt: string; readonly authorityGeneration: number }
+const safeSid = (sid: string): boolean => /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(sid);
+const receiptDir = (ctx: ControllerContext, sid: string, attempt: string): string =>
+  path.join(ctx.home, "sessions", sid, "explicit-handoffs", attempt);
+const currentPointer = (ctx: ControllerContext, sid: string): string => path.join(ctx.home, "sessions", sid, "explicit-current.json");
+function boundedClock(): { now: number; uptime: number; bootEstimateEpochMs: number } {
+  try {
+    const now = Date.now(), rawUptime = os.uptime(), uptime = Math.floor(rawUptime * 1000);
+    const bootEstimateEpochMs = now - uptime;
+    if (!Number.isSafeInteger(now) || now < 0 || !Number.isFinite(rawUptime) || rawUptime < 0 ||
+        !Number.isSafeInteger(uptime) || uptime < 0 || !Number.isSafeInteger(bootEstimateEpochMs) ||
+        bootEstimateEpochMs < 0 || !Number.isSafeInteger(now + 300_000)) throw new Error();
+    return { now, uptime, bootEstimateEpochMs };
+  } catch { throw new Error("ENV_GRANT_CLOCK_UNCERTAIN"); }
+}
+function checkExpiry(receipt: Record<string, unknown>): number {
+  const c = receipt.clock as { issuedUptimeMs?: unknown; bootEstimateEpochMs?: unknown };
+  const { now, uptime: up, bootEstimateEpochMs } = boundedClock();
+  if (!c || typeof c !== "object" || Object.keys(c).sort().join(",") !== "bootEstimateEpochMs,issuedUptimeMs" ||
+      !Number.isSafeInteger(receipt.issuedAt) || !Number.isSafeInteger(receipt.expiresAt) ||
+      !Number.isSafeInteger(c.issuedUptimeMs) || !Number.isSafeInteger(c.bootEstimateEpochMs) ||
+      typeof receipt.issuedAt !== "number" || typeof receipt.expiresAt !== "number" ||
+      typeof c.issuedUptimeMs !== "number" || typeof c.bootEstimateEpochMs !== "number" ||
+      receipt.issuedAt < 0 || receipt.expiresAt < 0 || c.issuedUptimeMs < 0 || c.bootEstimateEpochMs < 0 ||
+      receipt.expiresAt - receipt.issuedAt !== 300_000 || now < receipt.issuedAt || up < c.issuedUptimeMs ||
+      Math.abs(bootEstimateEpochMs - c.bootEstimateEpochMs) > 1000 ||
+      Math.abs(now - receipt.issuedAt - (up - c.issuedUptimeMs)) > 1000) throw new Error("ENV_GRANT_CLOCK_UNCERTAIN");
+  if (now >= receipt.expiresAt || up - c.issuedUptimeMs >= 300_000) throw new Error("ENV_GRANT_EXPIRED");
+  return now;
+}
+export function prepareExplicitClaudeHandoff(ctx: ControllerContext, input: OwnedInput, options: {
+  sid: string; attempt: string; executable: ExecutableBinding; command: string[];
+}): ExplicitReceiptRef {
+  if (!safeSid(options.sid) || !uuid(options.attempt) || options.executable.cli !== "claude" ||
+      options.command[0] !== options.executable.path || options.command.includes("--bare") ||
+      options.command.some(a => /[\u0000-\u001f\u007f]/.test(a))) throw new Error("ENV_BINDING_POLICY_REFUSED");
+  assertExecutableIdentity(options.executable, options.command[0]);
+  let token: Buffer | undefined;
+  try {
+    return withWriterLock(ctx.home, () => {
+      const c = currentConfig(ctx);
+      if (inspectGrants(ctx).total >= 1024) throw new Error("ENV_GRANT_STORE_FULL");
+      const { now, uptime, bootEstimateEpochMs } = boundedClock();
+      const dir = receiptDir(ctx, options.sid, options.attempt), stage = path.dirname(path.dirname(dir));
+      const counted = path.join(ctx.home, "environment", "explicit-receipts", options.attempt);
+      fs.mkdirSync(path.dirname(counted), { mode: 0o700, recursive: true });
+      fs.mkdirSync(counted, { mode: 0o700 }); fsyncDirectory(path.dirname(counted));
+      durableWriteExclusive(path.join(counted, "record.json"), JSON.stringify({ version: 1,
+        controllerRootId: ctx.rootId, authorityGeneration: c.authorityGeneration,
+        sid: options.sid, attempt: options.attempt }) + "\n");
+      fs.mkdirSync(dir, { mode: 0o700, recursive: true }); fsyncDirectory(path.dirname(dir));
+      token = input.consume();
+      if (token.length < 1 || token.length > 4096 || !token.every(b => b >= 33 && b <= 126)) throw new Error("ENV_INPUT_INVALID");
+      const payload = path.join(dir, "token");
+      durableWriteExclusive(payload, Buffer.concat([token, Buffer.from("\n")]));
+      token.fill(0); token = undefined;
+      const receipt = { version: 2, consumerId: "claude-explicit-legacy", controllerRootId: ctx.rootId,
+        authorityGeneration: c.authorityGeneration, sid: options.sid, attempt: options.attempt,
+        executable: options.executable, command: options.command, issuedAt: now, expiresAt: now + 300_000,
+        payloadPath: payload, restart: "never", clock: { issuedUptimeMs: uptime, bootEstimateEpochMs } };
+      const file = path.join(dir, "receipt.json");
+      durableWriteExclusive(file, JSON.stringify(receipt) + "\n");
+      const pointer = `${currentPointer(ctx, options.sid)}.${options.attempt}.tmp`;
+      durableWriteExclusive(pointer, JSON.stringify({ receipt: file, attempt: options.attempt }) + "\n");
+      fs.renameSync(pointer, currentPointer(ctx, options.sid)); fsyncDirectory(stage);
+      return { receipt: file, attempt: options.attempt, authorityGeneration: c.authorityGeneration };
+    });
+  } finally { token?.fill(0); input.dispose(); }
+}
+export function claimExplicitClaudeHandoff(ctx: ControllerContext, file: string): {
+  command: string[]; executable: ExecutableBinding; env: Record<string, string>;
+} {
+  if (!path.isAbsolute(file) || path.basename(file) !== "receipt.json" || !uuid(path.basename(path.dirname(file)))) {
+    throw new Error("ENV_GRANT_INVALID");
+  }
+  return withWriterLock(ctx.home, () => {
+    const c = currentConfig(ctx), attempt = path.basename(path.dirname(file));
+    const sid = path.basename(path.dirname(path.dirname(path.dirname(file))));
+    if (!safeSid(sid) || file !== path.join(receiptDir(ctx, sid, attempt), "receipt.json")) throw new Error("ENV_GRANT_INVALID");
+    const counted = path.join(ctx.home, "environment", "explicit-receipts", attempt);
+    for (const parent of [path.dirname(counted), counted]) {
+      const st = fs.lstatSync(parent);
+      if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o077)) {
+        throw new Error("ENV_GRANT_INVALID");
+      }
+    }
+    const countedRaw = readBounded(path.join(counted, "record.json"));
+    if (countedRaw === null || Buffer.byteLength(countedRaw) > 4096) throw new Error("ENV_GRANT_INVALID");
+    const protectedRecord = strictJson(countedRaw) as Record<string, unknown>;
+    if (!protectedRecord || typeof protectedRecord !== "object" || Array.isArray(protectedRecord) ||
+        Object.keys(protectedRecord).sort().join(",") !== "attempt,authorityGeneration,controllerRootId,sid,version" ||
+        protectedRecord.version !== 1 || protectedRecord.controllerRootId !== ctx.rootId ||
+        protectedRecord.authorityGeneration !== c.authorityGeneration || protectedRecord.sid !== sid ||
+        protectedRecord.attempt !== attempt) throw new Error("ENV_GRANT_INVALID");
+    const dir = path.dirname(file), spent = path.join(dir, "spent.json");
+    if (fs.existsSync(spent)) throw new Error("ENV_GRANT_SPENT");
+    if (fs.existsSync(path.join(dir, "terminal.json"))) throw new Error("ENV_GRANT_REVOKED");
+    const raw = readBounded(file);
+    if (raw === null || Buffer.byteLength(raw) > 16 * 1024) throw new Error("ENV_GRANT_INVALID");
+    const r = strictJson(raw) as Record<string, unknown>;
+    const keys = ["version", "consumerId", "controllerRootId", "authorityGeneration", "sid", "attempt", "executable",
+      "command", "issuedAt", "expiresAt", "payloadPath", "restart", "clock"];
+    if (Object.keys(r).length !== keys.length || keys.some(k => !Object.hasOwn(r, k)) || r.version !== 2 ||
+        r.consumerId !== "claude-explicit-legacy" || r.controllerRootId !== ctx.rootId ||
+        r.authorityGeneration !== c.authorityGeneration || r.sid !== sid || r.attempt !== attempt || r.restart !== "never" ||
+        r.payloadPath !== path.join(dir, "token") || !Array.isArray(r.command) ||
+        !r.command.every(x => typeof x === "string") || !r.executable || typeof r.executable !== "object") throw new Error("ENV_GRANT_INVALID");
+    try { validateExecutableBinding(r.executable, "claude"); } catch { throw new Error("ENV_GRANT_INVALID"); }
+    const pinRaw = readBounded(currentPointer(ctx, sid));
+    if (pinRaw === null || Buffer.byteLength(pinRaw) > 4096) throw new Error("ENV_GRANT_INVALID");
+    const pin = strictJson(pinRaw) as { receipt?: unknown; attempt?: unknown };
+    if (!pin || typeof pin !== "object" || Object.keys(pin).sort().join(",") !== "attempt,receipt" ||
+        pin.receipt !== file || pin.attempt !== attempt) throw new Error("ENV_GRANT_INVALID");
+    const executable = r.executable as ExecutableBinding;
+    if (executable.cli !== "claude" || r.command[0] !== executable.path || r.command.includes("--bare")) throw new Error("ENV_BINDING_POLICY_REFUSED");
+    assertExecutableIdentity(executable, executable.path);
+    const claimedAt = checkExpiry(r);
+    durableWriteExclusive(spent, JSON.stringify({ version: 1, controllerRootId: ctx.rootId,
+      authorityGeneration: c.authorityGeneration, attempt, claimedAt, claimNonce: randomUUID() }) + "\n");
+    const token = readClaudeOAuthHandoff(path.join(dir, "token"), path.join(dir, "token"));
+    fs.unlinkSync(path.join(dir, "token")); fsyncDirectory(dir);
+    return { command: r.command as string[], executable, env: { [CLAUDE_OAUTH_CHILD]: token } };
+  });
+}
+
+export async function launchExplicitClaudeHandoff(file: string): Promise<number> {
+  const attemptDir = path.dirname(file), sid = path.basename(path.dirname(path.dirname(attemptDir)));
+  const home = path.dirname(path.join(attemptDir, "..", "..", ".."));
+  const ctx = controllerContext(home);
+  if (!safeSid(sid)) throw new Error("ENV_GRANT_INVALID");
+  const runtime = captureManagedRuntime(process.env, path.join(ctx.home, "environment"));
+  try {
+    const claimed = claimExplicitClaudeHandoff(ctx, file);
+    const childEnv = { HOME: os.userInfo().homedir, PATH: runtime.base.PATH,
+      TMPDIR: runtime.temporary, TMP: runtime.temporary, TEMP: runtime.temporary,
+      LANG: runtime.base.LANG, LC_ALL: runtime.base.LC_ALL, TERM: runtime.base.TERM,
+      ...claimed.env };
+    assertExecutableIdentity(claimed.executable, claimed.command[0]!);
+    const child = spawn(claimed.command[0]!, claimed.command.slice(1), { stdio: "inherit", env: childEnv, argv0: "claude" });
+    process.title = "claude";
+    const forward = (signal: NodeJS.Signals): void => { child.kill(signal); };
+    process.on("SIGINT", forward); process.on("SIGTERM", forward);
+    try { return await new Promise<number>((resolve, reject) => { child.once("error", reject); child.once("exit", code => resolve(code ?? 1)); }); }
+    finally { process.off("SIGINT", forward); process.off("SIGTERM", forward); }
+  } finally { fs.rmSync(runtime.temporary, { recursive: true, force: true }); }
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url) && process.argv[2] === "--launch-explicit") {
+  launchExplicitClaudeHandoff(process.argv[3] ?? "").then(code => { process.exitCode = code; })
+    .catch(() => { process.stderr.write("ENV_LEGACY_SECRET_RELAUNCH_REFUSED: create a new approved dispatch with current configuration and binding\n"); process.exitCode = 78; });
 }

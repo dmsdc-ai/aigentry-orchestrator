@@ -1,11 +1,14 @@
 // ADR-MF #13 — shared adapter factory (Article 1 trim).
 // Each per-CLI file declares an AdapterConfig and delegates here.
 import * as path from "node:path";
+import * as fs from "node:fs";
 import type { ResolvedInstructions } from "../resolve-instructions.js";
 import type { SessionContext } from "../types.js";
 import type { SpawnDecision } from "../model-decision.js";
+import { sameFileIdentity } from "../model-decision.js";
 import { canonicalBytes } from "../persistence/canonical-bytes.js";
 import type { Spawner } from "./spawner.js";
+import { bootstrapEnvironment } from "../../environment/bootstrap.js";
 import { CLI_DEFAULT, launchConfig, normalizeLaunch, type LaunchSetting } from "./launch-config.js";
 import {
   BootAdapterError,
@@ -66,6 +69,7 @@ export interface AdapterConfig {
     prompt_file: string;
     // #1148: present only on a resolver-managed spawn; the adapter then reads no env default.
     decision?: SpawnDecision | undefined;
+    environment: NodeJS.ProcessEnv;
   }): { argv: readonly string[]; env: Readonly<Record<string, string>>; launch?: LaunchConfig };
 }
 
@@ -104,6 +108,13 @@ export function makeAdapter(cfg: AdapterConfig): BootAdapter {
       resolved: ResolvedInstructions,
       opts: BuildOptions,
     ): Promise<BootCommand> {
+      const captured = opts.environment ?? process.env;
+      const { env: environment } = bootstrapEnvironment(captured, { role: ctx.role,
+        targetCwd: captured.AIGENTRY_TARGET_CWD ?? ctx.cwd, flags: { "dispatch.cli": cfg.name } });
+      const declared = environment[`AIGENTRY_${cfg.name.toUpperCase()}_EXECUTABLE`];
+      if (cfg.name === "gemini" && !cfg.capabilityProbe && environment.AIGENTRY_GEMINI_EFFORT !== undefined) {
+        throw new BootAdapterError("UNSUPPORTED_CLI", "gemini-cli has no effort flag");
+      }
       if (opts.executable || opts.decision) {
         // #1148: no probe. A known version below the adapter floor is drift; unknown proceeds
         // (the decision already labels it). The decision must bind the same file.
@@ -114,6 +125,12 @@ export function makeAdapter(cfg: AdapterConfig): BootAdapter {
         if (opts.executable.version !== null && !semverGte(opts.executable.version, cfg.min_version)) {
           throw new BootAdapterError("CLI_VERSION_DRIFT",
             `${cfg.name} installed=${opts.executable.version} min=${cfg.min_version}`);
+        }
+        let real: string, stat: fs.Stats;
+        try { real = fs.realpathSync.native(opts.executable.path); stat = fs.statSync(real); }
+        catch { throw new BootAdapterError("CLI_LAUNCH_UNSUPPORTED", `${cfg.name}: executable changed`); }
+        if (real !== opts.executable.realpath || !stat.isFile() || !sameFileIdentity(opts.executable, stat)) {
+          throw new BootAdapterError("CLI_LAUNCH_UNSUPPORTED", `${cfg.name}: executable changed`);
         }
       } else if (cfg.capabilityProbe) {
         const { executable, flags } = cfg.capabilityProbe;
@@ -126,19 +143,22 @@ export function makeAdapter(cfg: AdapterConfig): BootAdapter {
           throw new BootAdapterError("CLI_VERSION_DRIFT", `${executable}: required flags missing`);
         }
       } else {
-        await versionGate(opts.spawner);
+        if (declared) {
+          const version = await opts.spawner.probeVersion(declared);
+          if (!semverGte(version, cfg.min_version)) throw new BootAdapterError("CLI_VERSION_DRIFT", cfg.name);
+        } else await versionGate(opts.spawner);
       }
       await opts.fs.mkdirP(opts.staging_dir);
       const prompt_file = path.join(opts.staging_dir, "effective_prompt.md");
       await opts.fs.writeFile(prompt_file, canonicalBytes(resolved.effective_prompt));
-      const { argv, env, launch } = cfg.buildArgvEnv({ ctx, prompt_file, decision: opts.decision });
+      const { argv, env, launch } = cfg.buildArgvEnv({ ctx, prompt_file, decision: opts.decision, environment });
       const normalized = normalizeLaunch(cfg.name, launch);
       // #1148: an adapter that did not apply the decision (its metadata differs) never launches.
       if (opts.decision && JSON.stringify(normalized) !== JSON.stringify(decisionLaunch(opts.decision))) {
         throw new BootAdapterError("UNSUPPORTED_CLI", `${cfg.name}: adapter did not apply the spawn decision`);
       }
       return Object.freeze({
-        argv: Object.freeze(opts.executable ? [opts.executable.path, ...argv.slice(1)] : [...argv]),
+        argv: Object.freeze(opts.executable ? [opts.executable.path, ...argv.slice(1)] : declared ? [declared, ...argv.slice(1)] : [...argv]),
         env: Object.freeze({ ...env }),
         cwd: ctx.cwd,
         prompt_file,

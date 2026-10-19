@@ -397,3 +397,13 @@ a session can ask for its predecessor rather than itself. Exit codes: 0 printed,
   nothing, and read the screen for up to 90 s (`tests/packaging/pty-driver.py`). It passes when
   the screen shows the source line and the model's first reply contains the canary. It fails if
   an approval prompt appears before that reply.
+
+## Central settings
+
+The S1 candidate resolves registered boot settings before module-level env reads.
+See [environment settings](environment.md) for the canonical document, precedence,
+revision/provenance awareness and the supported subset. A complete explicit boot
+plan still owns permission, history and risk acknowledgement. Metadata configuration
+does not establish authentication. Both shim layouts preserve the exec-argv stdout
+protocol and carry changed nonsecret settings into the shell's real invocation.
+

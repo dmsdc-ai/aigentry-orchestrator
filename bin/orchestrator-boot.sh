@@ -150,6 +150,9 @@ if [ "$#" -gt 0 ]; then
   exec node "$AIGENTRY_SHIM_JS" "$@"
 fi
 
+# The implementation carries resolved nonsecret settings in an env exec prefix
+# when they differ from this shell. stdout still contains one exec argument per line;
+# a child Node process cannot export settings into this parent shell.
 # Reconcile + guard + argv. A non-zero exit here (D1's control-character refusal, or
 # node-shim's missing dist) aborts under `set -e` and NOTHING is exec'd.
 ORCH_BOOT_ARGV_RAW="$(node "$AIGENTRY_SHIM_JS" "$@")"

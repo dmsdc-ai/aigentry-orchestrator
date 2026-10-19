@@ -2585,6 +2585,10 @@ const reportPosixRelatives = ['tests/report/mandatory-report-1170-caller.test.mj
   'tests/report/mandatory-report-1170.test.mjs', 'tests/report/mandatory-report-1170-review.test.mjs',
   'tests/report/mandatory-report-1170-helper.test.mjs', 'tests/report/mandatory-report-1170-parent-race.test.mjs',
   'tests/report/mandatory-report-1170-reader.test.mjs', 'tests/report/mandatory-report-1170-rework-boundaries.test.mjs'];
+// #1214 telepty-http-auth suite: one explicit source entry on EVERY platform, win32 included, directly after the
+// context-compact entry and ahead of the POSIX-only entries. The fixture only places a test-owned sentinel
+// at this path; the real suite is never imported or run here.
+const teleptyHttpAuthRelative = 'tests/dispatch/telepty-http-auth.test.mjs';
 function callerFixture(mode, symlinked = false) {
   const directory = mkdtempSync(join(admin, 'caller fixture '));
   const put = (path, source) => {
@@ -2625,6 +2629,7 @@ function callerFixture(mode, symlinked = false) {
   if (mode !== 'missing-context-compact') put(contextCompactRelative, checks + `console.log('CALLER_CONTEXT_COMPACT_SENTINEL');\nprocess.exit(${mode === 'failing-context-compact' ? 8 : 0});\n`);
   for (const [index, path] of reportCommonRelatives.entries())
     put(path, checks + `console.log('CALLER_REPORT_COMMON_SENTINEL_${index}');\n`);
+  if (mode !== 'missing-telepty-http-auth') put(teleptyHttpAuthRelative, checks + `console.log('CALLER_TELEPTY_HTTP_AUTH_SENTINEL');\nprocess.exit(${mode === 'failing-telepty-http-auth' ? 8 : 0});\n`);
   if (mode !== 'missing-wizard') put(wizardRelative, checks + `console.log('CALLER_WIZARD_SENTINEL');\nprocess.exit(${mode === 'failing-wizard' ? 8 : 0});\n`);
   if (mode !== 'missing-supervisor') put(supervisorRelative, checks + `console.log('CALLER_SUPERVISOR_SENTINEL');\nprocess.exit(${mode === 'failing-supervisor' ? 8 : 0});\n`);
   for (const [index, path] of agentMetadataRelatives.entries()) {
@@ -2694,6 +2699,9 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic, onlyFailed
   // #1204 the context-compact suite alone missing or failing, analogous to the #1171 entries.
   ['missing-context-compact', 1, false, false, false, /Could not find '[^'\n]*tests[\\/]bin[\\/]context-compact\.test\.mjs'/],
   ['failing-context-compact', 1, true, true, false, undefined, /tests[\\/]bin[\\/]context-compact\.test\.mjs$/],
+  // #1214 the telepty-http-auth suite alone missing or failing, analogous to the #1204 entries.
+  ['missing-telepty-http-auth', 1, false, false, false, /Could not find '[^'\n]*tests[\\/]dispatch[\\/]telepty-http-auth\.test\.mjs'/],
+  ['failing-telepty-http-auth', 1, true, true, false, undefined, /tests[\\/]dispatch[\\/]telepty-http-auth\.test\.mjs$/],
   ['missing-harness', 1, true, true, false, /POSIX control harness failed with exit status: 1/],
   ['empty', 1, false, false, false, /No compiled test files found/],
   ['missing-dist', 1, false, false, false, /Failed to enumerate compiled tests/],
@@ -2732,6 +2740,7 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic, onlyFailed
   assert.equal(result.stdout.includes('CALLER_CONTEXT_COMPACT_SENTINEL'), compiled);
   for (const index of reportCommonRelatives.keys()) assert.equal(result.stdout.includes(`CALLER_REPORT_COMMON_SENTINEL_${index}`), compiled);
   for (const index of reportPosixRelatives.keys()) assert.equal(result.stdout.includes(`CALLER_REPORT_POSIX_SENTINEL_${index}`), compiled);
+  assert.equal(result.stdout.includes('CALLER_TELEPTY_HTTP_AUTH_SENTINEL'), compiled);
   assert.ok(!result.stdout.includes('CALLER_UNSELECTED_MJS'), 'no automatic source .mjs discovery');
   if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_COMPILED_CONTROL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (security && sentinel) assert.ok(result.stdout.indexOf('CALLER_SECURITY_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
@@ -2761,6 +2770,7 @@ for (const [mode, expected, compiled, security, sentinel, diagnostic, onlyFailed
     assert.ok(result.stdout.indexOf(`CALLER_REPORT_COMMON_SENTINEL_${index}`) < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (compiled && sentinel) for (const index of reportPosixRelatives.keys())
     assert.ok(result.stdout.indexOf(`CALLER_REPORT_POSIX_SENTINEL_${index}`) < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
+  if (compiled && sentinel) assert.ok(result.stdout.indexOf('CALLER_TELEPTY_HTTP_AUTH_SENTINEL') < result.stdout.indexOf('CALLER_SOURCE_SENTINEL'));
   if (diagnostic) assert.match(result.stderr, diagnostic);
   if (onlyFailedFile) {
     const failures = result.stdout.split('\n').filter(line => /^not ok \d+ - /.test(line));
@@ -2838,7 +2848,7 @@ const timedOut = { status: null, signal: 'SIGKILL', error: 'synthetic ETIMEDOUT'
 const callerArgv = platform => ['--test', 'dist/tests/a.test.js', 'dist/tests/nested/b.test.js', 'dist/tests/z.test.js',
   securityRelative, admissionRelative, ...jevRelatives, ...taskAdvisorRelatives, controlRelative, fakeCmuxInertRelative,
   ...preservationRelatives, workflowPolicyRelative, workerInputsRelative, initPlatformRelative, releaseEvidenceRelative,
-  contextCompactRelative, ...reportCommonRelatives,
+  contextCompactRelative, ...reportCommonRelatives, teleptyHttpAuthRelative,
   ...(['linux', 'darwin'].includes(platform) ? [nativeRelative, wizardRelative, supervisorRelative,
     ...agentMetadataRelatives, ...reportPosixRelatives] : [])];
 const vmCases = [];
@@ -3022,6 +3032,7 @@ for (const [label, entry, previous] of [
   ['#1167 init-platform follows worker-inputs', 'tests/packaging/init-platform.test.mjs', 'tests/dispatch/worker-inputs.test.mjs'],
   ['#1171 release-evidence follows init-platform', 'tests/packaging/release-evidence.test.mjs', 'tests/packaging/init-platform.test.mjs'],
   ['#1204 context-compact follows release-evidence', 'tests/bin/context-compact.test.mjs', 'tests/packaging/release-evidence.test.mjs'],
+  ['#1214 telepty-http-auth follows report hooks', 'tests/dispatch/telepty-http-auth.test.mjs', 'tests/report/mandatory-report-1136-hook.test.mjs'],
 ]) for (const platform of ['linux', 'darwin', 'win32']) acceptance(`caller VM: ${label} exactly once ahead of the POSIX-only entries (${platform})`, 'caller-vm', () => {
   const config = join(admin, `caller-vm-${label.replace(/[^a-z0-9]+/g, '-')}-placement-${platform}.json`);
   writeFileSync(config, JSON.stringify({ platform, results: platform === 'win32' ? [success] : [success, success], source: callerSource }));
@@ -3040,11 +3051,13 @@ for (const [label, entry, previous] of [
     assert.equal(spawned.indexOf('tests/packaging/release-evidence.test.mjs'), spawned.indexOf(entry) + 1);
   } else if (entry === 'tests/packaging/release-evidence.test.mjs') {
     assert.equal(spawned.indexOf('tests/bin/context-compact.test.mjs'), spawned.indexOf(entry) + 1);
-  } else {
+  } else if (entry === 'tests/bin/context-compact.test.mjs') {
     assert.equal(spawned.indexOf(reportCommonRelatives[0]), spawned.indexOf(entry) + 1);
     assert.equal(spawned.indexOf(reportCommonRelatives[1]), spawned.indexOf(reportCommonRelatives[0]) + 1);
-    if (platform === 'win32') assert.equal(spawned.indexOf(reportCommonRelatives[1]), spawned.length - 1);
-    else assert.equal(spawned.indexOf('tests/packaging/native-capture.test.mjs'), spawned.indexOf(reportCommonRelatives[1]) + 1);
+    assert.equal(spawned.indexOf(teleptyHttpAuthRelative), spawned.indexOf(reportCommonRelatives[1]) + 1);
+  } else {
+    if (platform === 'win32') assert.equal(spawned.indexOf(entry), spawned.length - 1);
+    else assert.equal(spawned.indexOf('tests/packaging/native-capture.test.mjs'), spawned.indexOf(entry) + 1);
   }
 });
 // #1191 checkout-EOL policy for the one raw-byte-pinned preservation source. Each case commits LF bytes to a
@@ -3156,6 +3169,7 @@ const initPlatformPush = "sourceTestFiles.push('tests/packaging/init-platform.te
 const releaseEvidencePush = "sourceTestFiles.push('tests/packaging/release-evidence.test.mjs');\n";
 const contextCompactPush = "sourceTestFiles.push('tests/bin/context-compact.test.mjs');\n";
 const posixReportEnd = "  sourceTestFiles.push('tests/report/mandatory-report-1170-rework-boundaries.test.mjs');\n}\n";
+const teleptyHttpAuthPush = "sourceTestFiles.push('tests/dispatch/telepty-http-auth.test.mjs');\n";
 for (const [name, mutate, platforms] of [
   ['wizard entry placed on every platform, win32 included', source => replaceOnce(replaceOnce(source, wizardPosixPush, wizardPosixDropped),
     baseSourceList, "'tests/packaging/release-admission.test.mjs', 'tests/packaging/orchestrator-boot-wizard.test.mjs'];"), ['win32', 'linux', 'darwin']],
@@ -3251,11 +3265,12 @@ for (const [name, mutate, platforms] of [
     workflowPolicyPush, `${workerInputsPush}${workflowPolicyPush}`), ['win32', 'linux', 'darwin']],
   ['worker-inputs suite after the POSIX-only entries', source => replaceOnce(replaceOnce(source, workerInputsPush, ''),
     posixReportEnd, `${posixReportEnd}${workerInputsPush}`), ['linux', 'darwin']],
-  // #1167 / #1171 / #1204: the init-platform, release-evidence and context-compact entries are required exactly
-  // once on every platform, in that order directly after worker-inputs and ahead of the POSIX branch. Placing one
-  // on win32 only or after the POSIX branch leaves the win32 argv unchanged, so those counterfactuals apply to POSIX alone.
+  // #1167 / #1171 / #1204 / #1214: the init-platform, release-evidence, context-compact and telepty-http-auth entries
+  // are required exactly once on every platform, in that order directly after worker-inputs and ahead of the POSIX branch.
+  // Placing one on win32 only or after the POSIX branch leaves the win32 argv unchanged, so those counterfactuals apply
+  // to POSIX alone.
   ...[['init-platform', initPlatformPush, workerInputsPush], ['release-evidence', releaseEvidencePush, initPlatformPush],
-    ['context-compact', contextCompactPush, releaseEvidencePush]]
+    ['context-compact', contextCompactPush, releaseEvidencePush], ['telepty-http-auth', teleptyHttpAuthPush, "sourceTestFiles.push('tests/report/mandatory-report-1136-hook.test.mjs');\n"]]
     .flatMap(([label, push, previous]) => [
       [`${label} suite missing`, source => replaceOnce(source, push, ''), ['win32', 'linux', 'darwin']],
       [`${label} suite duplicated`, source => replaceOnce(source, push, `${push}${push}`), ['win32', 'linux', 'darwin']],

@@ -45,6 +45,7 @@
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import type { SpawnSyncReturns } from "node:child_process";
+import { managedFixtureImports } from "./model-router-fixtures.js";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -235,7 +236,7 @@ process.exit(0);
     AIGENTRY_GIT_HOOKS_DIR: join(root, "hooks"), AIGENTRY_GIT_HOOK_SOURCE_DIR: join(REPO, "git-hooks"),
     CODEX_HOME: join(root, "codex-home"), GEMINI_CLI_HOME: join(root, "gemini-home"),
     AIGENTRY_ROUTER_PROFILE: PROFILE, AIGENTRY_ROUTER_CLASSIFIER: classifier,
-    AIGENTRY_CLAUDE_MODEL: "", AIGENTRY_CODEX_MODEL: "", AIGENTRY_GROK_MODEL: "", AIGENTRY_GEMINI_MODEL: "",
+    AIGENTRY_CLAUDE_MODEL: undefined, AIGENTRY_CODEX_MODEL: undefined, AIGENTRY_GROK_MODEL: undefined, AIGENTRY_GEMINI_MODEL: undefined,
     AIGENTRY_GEMINI_BINARY: "agy", AIGENTRY_DISPATCH_REGISTER_TIMEOUT_MS: "0",
     AIGENTRY_WORKER_SCOPE: scopeFile,
     // #1148: per-spawn public model metadata is OFF here (no real network from a fixture).
@@ -254,10 +255,15 @@ process.exit(0);
   mkdirSync(env.TMPDIR!, { recursive: true });
   writeFileSync(env.REGISTRY_LOG!, "");
 
-  const dispatch = (args: string[] = [], overrides: NodeJS.ProcessEnv = {}): SpawnSyncReturns<string> =>
-    spawnSync(process.execPath,
-      [CLI_JS, "--ref", ref, "--task", "1083", "--no-verify-started", "--timeout-ms", "500", ...args],
-      { cwd: root, env: { ...env, ...overrides }, encoding: "utf8", timeout: 22000 });
+  const dispatch = (args: string[] = [], overrides: NodeJS.ProcessEnv = {}): SpawnSyncReturns<string> => {
+    const invocation = { ...env, ...overrides };
+    const imports = managedFixtureImports(args, invocation, overrides, root, home, aig, bin, {
+      [join(REPO, "bin/open-session.sh")]: open, [join(REPO, "bin/session-probe.py")]: probe,
+      [join(REPO, "bin/emit-telemetry.mjs")]: telemetry });
+    return spawnSync(process.execPath,
+      [...imports, CLI_JS, "--ref", ref, "--task", "1083", "--no-verify-started", "--timeout-ms", "500", ...args],
+      { cwd: root, env: invocation, encoding: "utf8", timeout: 22000 });
+  };
 
   // A live worker shows up in `telepty list` as its guard launcher; the CLI kind
   // is its `exec -a` line.

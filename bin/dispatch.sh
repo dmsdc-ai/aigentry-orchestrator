@@ -19,7 +19,13 @@
 #   * The two-layout dist resolution moved to bin/lib/node-shim.sh when the
 #     tracker shim needed the same logic (#899 tranche 1b). One copy, two shims;
 #     tests/dispatch/T99 still pins the workspace layout for this one.
+{ set +xv; } 2>/dev/null
+set +a
 set -euo pipefail
+unset NODE_OPTIONS NODE_PATH BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FALLBACK_LIBRARY_PATH
+__aig_compat_present="${AIGENTRY_CLAUDE_OAUTH_TOKEN+x}"
+__aig_compat_token="${AIGENTRY_CLAUDE_OAUTH_TOKEN-}"
+unset AIGENTRY_CLAUDE_OAUTH_TOKEN
 # #930 — homebrew APPENDED: a fallback for `node`/`python3` under launchd, never an
 # override of the caller's PATH. It was a prefix, which is #400's mechanism
 # (bin/session-cleanup.sh:34-41). Identical in every shim on purpose — a policy that
@@ -42,4 +48,12 @@ export DISPATCH_SCRIPT_DIR
 # shellcheck source=lib/node-shim.sh
 . "$AIGENTRY_SHIM_SCRIPT_DIR/lib/node-shim.sh"
 aigentry_node_shim dispatch.sh dist/src/dispatch/cli.js
-exec node "$AIGENTRY_SHIM_JS" "$@"
+AIGENTRY_RUNTIME_PACKAGE_ROOT="$(cd "$(dirname "$AIGENTRY_SHIM_JS")/../../.." && pwd -P)"
+export AIGENTRY_RUNTIME_PACKAGE_ROOT
+if [ -n "$__aig_compat_token" ]; then
+  exec 3< <(printf '%s\n' "$__aig_compat_token")
+  unset __aig_compat_token __aig_compat_present
+  exec node "$AIGENTRY_SHIM_SCRIPT_DIR/init/cli.mjs" dispatch-compat --input-fd 3 -- "$@"
+fi
+unset __aig_compat_token __aig_compat_present
+exec node "$AIGENTRY_SHIM_SCRIPT_DIR/init/cli.mjs" dispatch-compat -- "$@"

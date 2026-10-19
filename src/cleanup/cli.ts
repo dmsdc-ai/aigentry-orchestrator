@@ -36,6 +36,9 @@
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as os from "node:os";
+import { teleptyChildEnv } from "../report/pump.js";
+import { requestTelepty, validatedTeleptyPort } from "../telepty/http.js";
 import { fileURLToPath } from "node:url";
 
 import { registryAvailable, registryEnvironment, registryInvocation } from "../dispatch/registry-command.js";
@@ -70,7 +73,6 @@ const SCRIPT_DIR =
 const DISPATCH_REGISTRY_PY = env.DISPATCH_REGISTRY_PY || path.join(SCRIPT_DIR, "dispatch-registry.py");
 
 const WH_CLI = path.join(SCRIPT_DIR, "wh-cli.sh");
-const TELEPTY_AUTH_SH = path.join(SCRIPT_DIR, "lib/telepty-auth.sh");
 const TELEPTY_LISTING_SH = path.join(SCRIPT_DIR, "lib/telepty-listing.sh");
 // #1162 G2b sealed reader, compiled next to this file (dist/src/session/).
 const AGENT_BINDING_JS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "session", "agent-binding.js");
@@ -82,8 +84,8 @@ function chomp(s: string): string {
 }
 
 /** stdout captured, stderr discarded (`2>/dev/null`). Status 127 for an unrunnable command, as bash. */
-function capture(cmd: string, args: string[]): { status: number; stdout: string } {
-  const r = spawnSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+function capture(cmd: string, args: string[], timeoutMs = 7000): { status: number; stdout: string } {
+  const r = spawnSync(cmd, args, { encoding: "utf8", timeout: timeoutMs, killSignal: "SIGKILL", env: cmd === "telepty" || (cmd === "bash" && args.includes(TELEPTY_LISTING_SH)) ? { ...teleptyChildEnv(env), TELEPTY: env.TELEPTY, CURL: env.CURL } : env, stdio: ["ignore", "pipe", "ignore"] });
   if (r.error) return { status: 127, stdout: "" };
   return { status: r.status ?? 1, stdout: r.stdout ?? "" };
 }
@@ -125,16 +127,6 @@ function sleepMs(ms: number): void {
 }
 
 // ── the three lib seams ─────────────────────────────────────────────────────
-/**
- * The ONE credential resolver, called as the shell function it is
- * (bin/lib/telepty-auth.sh) — identical to src/tracker/cli.ts. Degrades to ""
- * (no credential presented) exactly as the lib does, which is what keeps a
- * teardown working instead of aborting it.
- */
-function teleptyAuthToken(): string {
-  return chomp(capture("bash", ["-c", '. "$1"; telepty_auth_token', "_", TELEPTY_AUTH_SH]).stdout);
-}
-
 /**
  * `telepty_listing_trusted <raw>` from bin/lib/telepty-listing.sh, as a subprocess:
  * 0 when <raw> may be used as evidence that a session is ABSENT, 1 with the
@@ -257,7 +249,7 @@ function requireDeps(): void {
  * not harden it), which is what lets the guards put a stub in front.
  */
 function teleptyListJson(): string {
-  const r = spawnSync("telepty", ["list", "--json"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  const r = spawnSync("telepty", ["list", "--json"], { timeout: 7000, killSignal: "SIGKILL", env: teleptyChildEnv(env), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
   if (r.error || (r.status ?? 1) !== 0) {
     err("telepty list --json exited non-zero");
     process.exit(3);
@@ -496,30 +488,18 @@ function killParentTeleptyAllow(sid: string): void {
  * DELETE /api/sessions/<sid> on the local daemon (daemon.js:2367).
  * 200 = removed, 404 = already gone (after parent kill).
  */
-function deleteSessionRegistry(sid: string): void {
+async function deleteSessionRegistry(sid: string): Promise<boolean> {
   const port = env.TELEPTY_PORT || "3848";
-  // The status is discarded, the bytes are not — bash's `$(curl … || true)`. NOT
-  // `|| echo "000"`: with -w '%{http_code}' curl prints `000` on a connect failure
-  // and ALSO exits non-zero, so the echo idiom appended a second copy and produced
-  // `000000` — matching no arm and reaching the catch-all. That is why the
-  // no-answer case never had a voice here even after it was given one.
-  const http = chomp(
-    capture("curl", [
-      "-s", "-o", "/dev/null", "-w", "%{http_code}",
-      // With no token the header carries no content, and curl DROPS such a header
-      // rather than sending an empty one — degraded means "no credential
-      // presented", never "empty credential presented as if it were valid".
-      "-H", `x-telepty-token: ${teleptyAuthToken()}`,
-      "-X", "DELETE", `http://127.0.0.1:${port}/api/sessions/${sid}`,
-    ]).stdout,
-  );
+  const result = await requestTelepty({ trustedHome: os.userInfo().homedir },
+    { operation: "delete-session", id: sid, port: validatedTeleptyPort(port), discardBody: true });
+  const http = result.transportCode === "000" ? "000" : String(result.httpStatus);
   switch (http) {
     case "200":
       log(`DELETE /api/sessions/${sid} → 200 (removed from registry)`);
-      break;
+      return true;
     case "404":
       log(`DELETE /api/sessions/${sid} → 404 (already gone — parent kill propagated)`);
-      break;
+      return true;
     // A refusal is not an unexpected status. Folded into the catch-all it read as
     // "unexpected; manual verify", which says nothing about what to verify — while
     // the actual consequence is a session left in the daemon registry forever,
@@ -530,7 +510,7 @@ function deleteSessionRegistry(sid: string): void {
       err(
         `DELETE /api/sessions/${sid} → ${http} (daemon refused the credential — the entry STAYS in the daemon registry; check authToken in ~/.telepty/config.json is readable, then re-run)`,
       );
-      break;
+      return false;
     // curl's own failure lands here as the literal "000" it printed before exiting
     // non-zero. It shares the refusal's consequence — the entry stays in the
     // registry — but not its cause, and "unexpected" told the operator neither. (#835)
@@ -538,9 +518,10 @@ function deleteSessionRegistry(sid: string): void {
       err(
         `DELETE /api/sessions/${sid} → no answer from the daemon (the entry STAYS in the daemon registry; nothing was removed — re-run once the daemon answers)`,
       );
-      break;
+      return false;
     default:
       log(`DELETE /api/sessions/${sid} → ${http} (unexpected; manual verify)`);
+      return false;
   }
 }
 
@@ -716,7 +697,7 @@ function clearAgentMetaPinned(sid: string, rows: Array<Record<string, unknown>>,
  * withholding of an assertion, not a rollback: nothing done here is undone, and
  * nothing about the surface is retained or asserted to be retained.
  */
-function cleanupOne(sid: string, force: boolean): number {
+async function cleanupOne(sid: string, force: boolean): Promise<number> {
   if (sid === PROTECTED_SID && !force) {
     err(`refusing to clean protected session '${PROTECTED_SID}' (pass --force to override)`);
     return 1;
@@ -750,8 +731,8 @@ function cleanupOne(sid: string, force: boolean): number {
       log(`workspace host close failed for ${sid} (by sid): release UNCONFIRMED — neither release nor retention was observed [${category}]`);
       err(`workspace host close-for-sid non-zero for ${sid} [${category}]`);
     }
-    deleteSessionRegistry(sid);
-    if (!closeOk) return 1;
+    const deleted = await deleteSessionRegistry(sid);
+    if (!closeOk || !deleted) return 1;
     // #540 — take the cleaned session out of the pollers' way. telepty#60 Stage A:
     // this is LIFECYCLE only. A session disappearing is not a task completing, so
     // the outcome stays unknown and the record keeps its history.
@@ -768,8 +749,8 @@ function cleanupOne(sid: string, force: boolean): number {
   // Brief settle so daemon notices parent death
   sleepMs(500);
   // Step 3 — DELETE registry (force-remove residue)
-  deleteSessionRegistry(sid);
-  if (!closeOk) return 1;
+  const deleted = await deleteSessionRegistry(sid);
+  if (!closeOk || !deleted) return 1;
   // #540 — same lifecycle-only mark on the normal kill+close+DELETE path.
   registryCleaned(sid);
   reportCleaned(sid);
@@ -782,7 +763,7 @@ function cleanupOne(sid: string, force: boolean): number {
  * still get their teardown — but it is no longer absorbed: `cleaned:` counts the
  * sids that actually succeeded, and the failures reach the exit status.
  */
-function cleanupAllDisconnected(): number {
+async function cleanupAllDisconnected(): Promise<number> {
   const sids = disconnectedSids();
   if (sids.length === 0) {
     process.stdout.write("cleaned: 0 disconnected sessions\n");
@@ -794,7 +775,7 @@ function cleanupAllDisconnected(): number {
     if (!sid) continue;
     // The shell's `|| true` kept the LOOP going, which still holds; what it must
     // not keep doing is counting an unfinished teardown as a cleaned session.
-    if (cleanupOne(sid, false) === 0) count += 1;
+    if (await cleanupOne(sid, false) === 0) count += 1;
     else failed += 1;
   }
   process.stdout.write(`cleaned: ${count} disconnected sessions\n`);
@@ -817,7 +798,7 @@ function keptByList(id: string, keep: string[]): boolean {
  * Every session not in the keep-list and not protected. #1162: same aggregation
  * as cleanupAllDisconnected — 0 when all succeeded, 1 when any did not.
  */
-function cleanupAllUnused(keepCsv: string): number {
+async function cleanupAllUnused(keepCsv: string): Promise<number> {
   const keep = keepCsv.split(",").filter((s) => s.length > 0);
   const sids = listing()
     .filter((s) => s && s.id !== PROTECTED_SID && !keptByList(String(s.id), keep))
@@ -830,14 +811,14 @@ function cleanupAllUnused(keepCsv: string): number {
   let failed = 0;
   for (const sid of sids) {
     if (!sid) continue;
-    if (cleanupOne(sid, false) === 0) count += 1;
+    if (await cleanupOne(sid, false) === 0) count += 1;
     else failed += 1;
   }
   process.stdout.write(`cleaned: ${count} unused sessions\n`);
   return failed > 0 ? 1 : 0;
 }
 
-function main(argv: string[]): void {
+async function main(argv: string[]): Promise<void> {
   if (argv.length === 0) usage(1);
   requireDeps();
 
@@ -880,19 +861,19 @@ function main(argv: string[]): void {
 
   if (modeAllDisc) {
     if (sid) { err("--all-disconnected does not take a sid argument"); process.exit(1); }
-    process.exit(cleanupAllDisconnected());
+    process.exit(await cleanupAllDisconnected());
   }
 
   if (modeAllUnused) {
     if (sid) { err("--all-unused does not take a sid argument"); process.exit(1); }
-    process.exit(cleanupAllUnused(keepList));
+    process.exit(await cleanupAllUnused(keepList));
   }
 
   if (!sid) { err("<sid> required (or use --all-disconnected / --all-unused)"); usage(1); }
   // `set -e` on the shell's last statement: a protected refusal (1) is the
   // script's exit status — and since #1162 so is an observed non-zero workspace
   // host close, which used to be reported on both streams and then exited 0.
-  process.exit(cleanupOne(sid, force));
+  process.exit(await cleanupOne(sid, force));
 }
 
 // ── __probe: the test seam that replaced `source session-cleanup.sh` ────────
@@ -921,5 +902,5 @@ const argv = process.argv.slice(2);
 if (argv[0] === "__probe") {
   probe(argv.slice(1));
 } else {
-  main(argv);
+  await main(argv);
 }

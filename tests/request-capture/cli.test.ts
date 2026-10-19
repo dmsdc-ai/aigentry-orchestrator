@@ -14,7 +14,7 @@ const digest = (raw: Buffer): string => createHash('sha256').update(raw).digest(
 type Receipt = { capture_id: string; original_ref: string; byte_len: number; sha256: string;
   provenance: string; task_binding: string; durability: string };
 type Exit = { code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string };
-type Run = { child: ChildProcess; done: Promise<Exit>; output: () => string; messages: string[];
+type Run = { preloadPath: string; child: ChildProcess; done: Promise<Exit>; output: () => string; messages: string[];
   wait: (message: string) => Promise<void> };
 
 async function fixture(t: TestContext): Promise<{ base: string; root: string }> {
@@ -120,6 +120,70 @@ if (mode === 'stdout-error') {
     queueMicrotask(() => callback ? callback(error) : this.emit('error', error)); return false;
   };
 }
+// Buffered observation adds no probes/retries; exit receipt is outside the store.
+if (mode === 'observe-concurrent') {
+  const { createHash } = require('node:crypto');
+  const events = []; let sequence = 0; let overflow = false;
+  const hash = value => createHash('sha256').update(String(value)).digest('hex');
+  const area = value => {
+    const relative = path.relative(root, String(value));
+    if (relative === '') return 'root';
+    if (relative === 'store.json') return 'marker';
+    if (relative === 'store.json.lock') return 'lock';
+    if (relative.startsWith('store.json.lock.tmp.')) return 'lock-stage';
+    if (relative.split(path.sep)[0] === 'raw') return 'raw';
+    if (relative.split(path.sep)[0] === 'receipts') return 'receipt';
+    return 'other';
+  };
+  const record = (operation, value, stage, id, result, error) => {
+    if (events.length >= 2048) { overflow = true; return; }
+    const code = typeof error?.code === 'string' && /^E[A-Z0-9_]{1,40}$/.test(error.code)
+      ? error.code : null;
+    events.push({ sequence: ++sequence, id, operation, area: area(value), stage,
+      tick: process.hrtime.bigint().toString(), code, target: hash(path.relative(root, String(value))),
+      identity: result && typeof result === 'object' && 'ino' in result && 'dev' in result
+        ? hash(String(result.dev) + ':' + String(result.ino)) : null });
+  };
+  const wrap = (object, name, target, opened = false) => {
+    const original = object[name];
+    object[name] = async function(...args) {
+      const value = opened ? target : args[0];
+      const id = sequence + 1; record(name, value, 'begin', id);
+      try {
+        const result = await original.apply(this, args);
+        record(name, value, 'ok', id, result);
+        if (name === 'open') {
+          for (const method of ['stat', 'readFile', 'writeFile', 'write', 'sync', 'datasync', 'close'])
+            wrap(result, method, value, true);
+        }
+        return result;
+      } catch (error) {
+        record(name, value, 'error', id, null, error);
+        throw error;
+      }
+    };
+  };
+  for (const name of ['open', 'lstat', 'stat', 'mkdir', 'readFile', 'unlink', 'link', 'rename'])
+    wrap(p, name);
+  const kill = process.kill;
+  process.kill = function(pid, signal) {
+    if (signal !== 0) return kill.call(this, pid, signal);
+    const id = sequence + 1;
+    record('liveness', 'pid-' + hash(pid), 'begin', id);
+    try {
+      const result = kill.call(this, pid, signal);
+      record('liveness', 'pid-' + hash(pid), 'ok', id); return result;
+    } catch (error) {
+      record('liveness', 'pid-' + hash(pid), 'error', id, null, error); throw error;
+    }
+  };
+  process.once('exit', () => {
+    try {
+      fs.writeFileSync(__filename + '.diagnostic.json',
+        JSON.stringify({ version: 1, overflow, events }), { flag: 'wx', mode: 0o600 });
+    } catch { /* Missing receipt means unavailable to the parent. */ }
+  });
+}
 syncBuiltinESMExports();
 send('ready');
 `;
@@ -154,7 +218,7 @@ async function launch(t: TestContext, base: string, root: string, args = ['--roo
       void done.then(result => { child.off('message', listener); reject(new Error(`Missing ${message}: ${JSON.stringify(result)}`)); }, reject);
     });
   };
-  return { child, done, output: () => stdout, messages, wait };
+  return { preloadPath, child, done, output: () => stdout, messages, wait };
 }
 
 function block(result: Exit, root: string): void {
@@ -225,13 +289,118 @@ test('same bytes twice create distinct receipts', async t => {
   assert.deepEqual(await fs.readdir(path.join(root, 'raw')), [`${digest(raw)}.bin`]);
 });
 
+// Copy outside base before fixture cleanup; incomplete/overflow evidence fails closed.
+async function retainConcurrent(base: string, root: string, raw: Buffer,
+  runs: Array<Run | undefined>): Promise<boolean> {
+  const settled = await Promise.allSettled(runs.map(run => run?.done));
+  const summary: Record<string, unknown> = {
+    version: 1, expectedChildren: 8, expectedSha256: digest(raw), expectedBytes: raw.length,
+    platform: process.platform, node: process.version, status: 'unavailable',
+    outcomes: settled.map((result, index) => {
+      if (result.status !== 'fulfilled' || !result.value) return { index, status: 'unavailable' };
+      const value = result.value;
+      return { index, status: 'closed', code: value.code, signal: value.signal,
+        stdoutBytes: Buffer.byteLength(value.stdout), stdoutSha256: digest(Buffer.from(value.stdout)),
+        stderrBytes: Buffer.byteLength(value.stderr), stderrSha256: digest(Buffer.from(value.stderr)),
+        allowed: value.stdout === '{}\n' && value.code === 0 && value.signal === null && value.stderr === '' };
+    }),
+  };
+  let retained: string | undefined;
+  let complete = false;
+  try {
+    retained = await fs.mkdtemp(path.join(tmpdir(), 'capture-concurrent-evidence-'));
+    let total = 0; let entries = 0;
+    const inventory: Array<{ name: string; bytes: number; sha256: string }> = [];
+    const observations: unknown[] = [];
+    const copy = async (directory: string, relative = ''): Promise<void> => {
+      for (const name of (await fs.readdir(directory)).sort()) {
+        if (++entries > 128) throw new Error('diagnostic entry overflow');
+        const source = path.join(directory, name); const rel = path.join(relative, name);
+        const stat = await fs.lstat(source);
+        if (stat.isSymbolicLink()) throw new Error('diagnostic symlink unavailable');
+        const destination = path.join(retained!, 'fixture', rel);
+        if (stat.isDirectory()) {
+          await fs.mkdir(destination, { recursive: true, mode: 0o700 }); await copy(source, rel);
+        } else {
+          if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error('diagnostic file overflow');
+          const bytes = await fs.readFile(source);
+          total += bytes.length;
+          if (bytes.length > 1024 * 1024 || total > 2 * 1024 * 1024) throw new Error('diagnostic byte overflow');
+          await fs.mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
+          await fs.writeFile(destination, bytes, { flag: 'wx', mode: 0o600 });
+          inventory.push({ name: digest(Buffer.from(rel)), bytes: bytes.length, sha256: digest(bytes) });
+          if (name === 'preload.cjs.diagnostic.json') observations.push({
+            childIndex: runs.findIndex(run => run && source === run.preloadPath + '.diagnostic.json'),
+            ...JSON.parse(bytes.toString('utf8')),
+          });
+        }
+      }
+    };
+    summary.inventory = inventory; summary.observations = observations;
+    await copy(base);
+    const retainedRoot = path.join(retained, 'fixture', path.relative(base, root));
+    const names = (await fs.readdir(path.join(retainedRoot, 'receipts'))).sort();
+    const rawNames = (await fs.readdir(path.join(retainedRoot, 'raw'))).sort();
+    summary.receiptFiles = names.length; summary.rawFiles = rawNames.length;
+    const rows = await receipts(retainedRoot);
+    const matches = rows.map(row => ({
+      captureIdSha256: digest(Buffer.from(row.capture_id)),
+      matches: row.sha256 === digest(raw) && row.byte_len === raw.length
+        && row.original_ref === 'raw/' + digest(raw) + '.bin'
+        && row.provenance === 'unverified' && row.task_binding === 'pending',
+      durability: row.durability === 'file-fsync-only' || row.durability === 'file-and-directory-fsync'
+        ? row.durability : 'unknown',
+    }));
+    const blobMatches = rawNames.length === 1 && rawNames[0] === digest(raw) + '.bin'
+      && (await fs.readFile(path.join(retainedRoot, 'raw', rawNames[0]))).equals(raw);
+    Object.assign(summary, { inventory, observations, receiptFiles: names.length,
+      parsedReceipts: rows.length, distinctReceipts: new Set(rows.map(row => row.capture_id)).size,
+      receipts: matches, rawFiles: rawNames.length, blobMatches,
+      markerMatches: JSON.stringify(JSON.parse(await fs.readFile(path.join(retainedRoot, 'store.json'), 'utf8')))
+        === JSON.stringify({ schema_version: 1, kind: 'request-capture' }) });
+    complete = observations.length === 8
+      && new Set(observations.map(value => (value as { childIndex: number }).childIndex)).size === 8 && observations.every(value => {
+      const observation = value as { childIndex: number; version?: unknown; overflow?: unknown; events?: unknown };
+      return observation.childIndex >= 0 && observation.version === 1 && observation.overflow === false && Array.isArray(observation.events);
+    }) && settled.every(value => value.status === 'fulfilled' && value.value !== undefined);
+    summary.status = complete ? 'complete' : 'unavailable';
+  } catch {
+    summary.status = 'unavailable'; // No exception text, stack or host path.
+  }
+  let encoded = JSON.stringify(summary);
+  if (Buffer.byteLength(encoded) > 4 * 1024 * 1024) {
+    complete = false;
+    encoded = JSON.stringify({ version: 1, status: 'overflow', outcomes: summary.outcomes });
+  }
+  if (retained) {
+    try { await fs.writeFile(path.join(retained, 'summary.json'), encoded, { flag: 'wx', mode: 0o600 }); }
+    catch { complete = false; encoded = JSON.stringify({ version: 1, status: 'unavailable', outcomes: summary.outcomes }); }
+  }
+  console.log('# capture-concurrent ' + encoded);
+  return complete;
+}
+
 test('concurrent real child captures retain every receipt', async t => {
   const { base, root } = await fixture(t); const raw = Buffer.from(secret);
-  const runs = await Promise.all(Array.from({ length: 8 }, () => launch(t, base, root)));
-  await Promise.all(runs.map(run => run.wait('ready')));
-  for (const run of runs) run.child.stdin!.end(raw);
-  for (const result of await Promise.all(runs.map(run => run.done))) allow(result);
-  await evidence(root, raw, 8);
+  const observed: Array<Run | undefined> = Array.from({ length: 8 });
+  let diagnosticComplete = false;
+  try {
+    const launches = await Promise.allSettled(observed.map(async (_, index) => {
+      const run = await launch(t, base, root, undefined, 'observe-concurrent');
+      observed[index] = run; return run;
+    }));
+    const runs = launches.map(result => {
+      if (result.status === 'rejected') throw result.reason;
+      return result.value;
+    });
+    await Promise.all(runs.map(run => run.wait('ready')));
+    for (const run of runs) run.child.stdin!.end(raw);
+    for (const result of await Promise.all(runs.map(run => run.done))) allow(result);
+    await evidence(root, raw, 8);
+  } finally {
+    diagnosticComplete = await retainConcurrent(base, root, raw, observed);
+  }
+  assert.equal(diagnosticComplete, true, 'concurrent diagnostic evidence unavailable or overflow');
 });
 
 // #1166: the holder releases and exits between a waiter's lock read and its liveness

@@ -45,6 +45,8 @@ const MANIFEST = [
   "bin/install-instructions.sh",
   "bin/install-launchd.sh",
   "bin/lib/node-shim.sh",
+  "bin/lib/executable-version.mjs",
+  "bin/lib/environment-runtime.mjs",
   "bin/lib/platform-unix.sh",
   "bin/lib/platform-windows.sh",
   "bin/lib/platform.sh",
@@ -92,6 +94,7 @@ const MANIFEST = [
   // #1148: dated bootstrap/policy metadata the resolver and the classifier retirement gate read.
   "docs/model-profiles/model-catalog.json",
   // #1181: orchestrator-boot usage and init guidance cite this path. Exact leaf only.
+  "docs/setup/environment.md",
   "docs/setup/orchestrator-boot.md",
   "docs/setup/worker-reports.md",
   "docs/templates/dispatch-ref-checklist.md",
@@ -140,6 +143,7 @@ const GOVERNANCE_ROOTS = [
   "bin/",
   "docs/model-profiles/",
   "docs/rules.md",
+  "docs/setup/environment.md",
   "docs/setup/orchestrator-boot.md",
   "docs/setup/worker-reports.md",
   "docs/templates/",

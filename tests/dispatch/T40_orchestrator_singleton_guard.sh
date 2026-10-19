@@ -50,8 +50,11 @@ BOOT_CLI="$REPO_ROOT/dist/src/orchestrator-boot/cli.js"
 BOOT_FIXTURE="$T_TMP/boot-fixture"
 mkdir -p "$BOOT_FIXTURE/bin/lib" "$BOOT_FIXTURE/home"
 AUTH_LOG="$T_TMP/auth.log"
-printf 'telepty_auth_token() { printf "auth\\n" >> "%s"; printf "fixture-token-T40"; }\n' "$AUTH_LOG" \
-  > "$BOOT_FIXTURE/bin/lib/telepty-auth.sh"
+# #1214: the REAL lib, so its shared HTTP door (telepty_curl) is what runs, with only the
+# resolver replaced by the synthetic one — no host credential is ever read.
+{ cat "$REPO_ROOT/bin/lib/telepty-auth.sh"
+  printf 'telepty_auth_token() { printf "auth\\n" >> "%s"; printf "fixture-token-T40"; }\n' "$AUTH_LOG"
+} > "$BOOT_FIXTURE/bin/lib/telepty-auth.sh"
 export AIGENTRY_SHIM_SCRIPT_DIR="$BOOT_FIXTURE/bin" AIGENTRY_HOME="$BOOT_FIXTURE/home"
 export ORCHESTRATOR_CLI=claude ORCHESTRATOR_SID=orchestrator TELEPTY_PORT=3848
 # The complete, benign, explicit plan (#1181; see header). ORCHESTRATOR_SID is set per call.
@@ -208,6 +211,7 @@ grep -q -- '-9' "$KILL_LOG" || fail "E: SIGKILL (-9) not used; log: $(cat "$KILL
 LIST_JSON="$T_TMP/list.json"
 LIST_MODE="$T_TMP/list-mode.txt"       # ok | fail | garbage
 CURL_LOG="$T_TMP/curl-calls.log"
+CURL_STDIN_LOG="$T_TMP/curl-stdin.log"
 CURL_CODE="$T_TMP/curl-code.txt"
 
 TELEPTY_STUB="$STUB_BIN/telepty-list-stub.sh"
@@ -225,10 +229,12 @@ chmod +x "$TELEPTY_STUB"
 
 # Records the full argv, prints the http code the case under test wants. Mirrors
 # `curl -s -o /dev/null -w '%{http_code}'`, which prints ONLY the code on stdout.
+# #1214: stdin is read only when told to (`-H @-`), as real curl does, and recorded.
 CURL_STUB="$STUB_BIN/curl-recorder.sh"
 cat > "$CURL_STUB" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$CURL_LOG"
+for a in "\$@"; do [ "\$a" = "@-" ] && { cat >> "$CURL_STDIN_LOG"; break; }; done
 printf '%s' "\$(cat "$CURL_CODE" 2>/dev/null || echo 200)"
 exit 0
 EOF
@@ -245,7 +251,7 @@ reconcile() {
 }
 
 run_reconcile() {
-  : > "$CURL_LOG"
+  : > "$CURL_LOG"; : > "$CURL_STDIN_LOG"
   printf 'ok'  > "$LIST_MODE"
   printf '200' > "$CURL_CODE"
   reconcile
@@ -259,11 +265,14 @@ grep -q -- '-X DELETE' "$CURL_LOG" \
   || fail "F: no DELETE issued for a STALE 0-client record; calls: $(cat "$CURL_LOG")"
 grep -q '/api/sessions/orchestrator' "$CURL_LOG" \
   || fail "F: DELETE did not target /api/sessions/orchestrator; calls: $(cat "$CURL_LOG")"
-grep -q 'x-telepty-token:' "$CURL_LOG" \
-  || fail "F: DELETE carried no credential header (the daemon would 401 and the record would STAY); calls: $(cat "$CURL_LOG")"
+# #1214: the credential header arrives on curl's stdin (`-H @-`), never in its argv.
+grep -q 'x-telepty-token:' "$CURL_STDIN_LOG" \
+  || fail "F: DELETE carried no credential header on curl's stdin (the daemon would 401 and the record would STAY); calls: $(cat "$CURL_LOG")"
 grep -q '127.0.0.1' "$CURL_LOG" \
   || fail "F: DELETE was not addressed to loopback; calls: $(cat "$CURL_LOG")"
-grep -q 'x-telepty-token: fixture-token-T40' "$CURL_LOG" || fail "F: synthetic auth token missing"
+grep -qx 'x-telepty-token: fixture-token-T40' "$CURL_STDIN_LOG" || fail "F: synthetic auth token missing"
+grep -qiE 'x-telepty-token|fixture-token-T40' "$CURL_LOG" \
+  && fail "F: the credential is in curl's argv (#1214); calls: $(cat "$CURL_LOG")"
 grep -q 'fixture-token-T40' "$T_TMP/boot.out" "$T_TMP/boot.err" && fail "F: token leaked into output"
 
 # --- G) CONNECTED → no DELETE ---------------------------------------------------

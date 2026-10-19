@@ -14,8 +14,9 @@ import { CLI_DEFAULT, envOrDefault, launchConfig, optInEnv } from "./launch-conf
 import { accessSync, constants } from "node:fs";
 import { delimiter, join } from "node:path";
 import { findWindowsCommand } from "./win-launch.js";
+import { bootstrapEnvironment } from "../../environment/bootstrap.js";
 
-export function geminiBinary(env: NodeJS.ProcessEnv = process.env): "agy" | "gemini" {
+export function geminiBinary(env: NodeJS.ProcessEnv = bootstrapEnvironment(process.env, { targetCwd: process.env.AIGENTRY_TARGET_CWD ?? process.cwd() }).env): "agy" | "gemini" {
   if (env.AIGENTRY_GEMINI_BINARY === "gemini" || env.AIGENTRY_GEMINI_BINARY === "agy") return env.AIGENTRY_GEMINI_BINARY;
   // #1167: on win32 any first cmd-search hit (agy.cmd, agy.exe, …) is agy, even one
   // the launcher will refuse; only a missing agy falls back to gemini.
@@ -52,9 +53,9 @@ export function geminiAdapter(binary: "agy" | "gemini" = "gemini") {
     name: "gemini",
     min_version: "0.0.0", // no numeric version claim; capability-gated below
     capabilityProbe: { executable: "agy", flags: ["--model", "--dangerously-skip-permissions", "--prompt-interactive"] },
-    buildArgvEnv: () => {
-      const model = envOrDefault(process.env, "AIGENTRY_GEMINI_MODEL", "gemini-3.8-flash-high");
-      const effort = optInEnv(process.env, "AIGENTRY_GEMINI_EFFORT"); // #1084 opt-in
+    buildArgvEnv: ({ environment }) => {
+      const model = envOrDefault(environment, "AIGENTRY_GEMINI_MODEL", "gemini-3.8-flash-high");
+      const effort = optInEnv(environment, "AIGENTRY_GEMINI_EFFORT"); // #1084 opt-in
       return { argv: ["agy", "--model", model.arg,
         "--dangerously-skip-permissions",
         ...(effort.arg !== null ? ["--effort", effort.arg] : [])], env: {},
@@ -68,8 +69,8 @@ export function geminiAdapter(binary: "agy" | "gemini" = "gemini") {
     homeEnv: GEMINI_HOME_ENV,
     homeExclude: GEMINI_HOME_EXCLUDE,
     homeConfigSubdir: GEMINI_CONFIG_SUBDIR,
-    buildArgvEnv: () => {
-      const model = envOrDefault(process.env, "AIGENTRY_GEMINI_MODEL", "gemini-2.5-flash");
+    buildArgvEnv: ({ environment }) => {
+      const model = envOrDefault(environment, "AIGENTRY_GEMINI_MODEL", "gemini-2.5-flash");
       return {
         argv: [
           "gemini",

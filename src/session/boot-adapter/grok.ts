@@ -7,9 +7,9 @@ export function grokAdapter() {
   return makeAdapter({
     name: "grok",
     min_version: "0.2.93",
-    buildArgvEnv: () => {
-      const model = envOrDefault(process.env, "AIGENTRY_GROK_MODEL", "grok-4.6");
-      const effort = optInEnv(process.env, "AIGENTRY_GROK_EFFORT"); // #1084 opt-in
+    buildArgvEnv: ({ environment }) => {
+      const model = envOrDefault(environment, "AIGENTRY_GROK_MODEL", "grok-4.6");
+      const effort = optInEnv(environment, "AIGENTRY_GROK_EFFORT"); // #1084 opt-in
       return {
         argv: ["grok", "--always-approve", "-m", model.arg,
           ...(effort.arg !== null ? ["--reasoning-effort", effort.arg] : [])],

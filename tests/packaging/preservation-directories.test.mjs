@@ -13,7 +13,7 @@ const admin = path.join(repo, '.aigentry-report-dv1169');
 const source = path.join(repo, 'bin/init/preservation.mjs');
 const sha = x => createHash('sha256').update(x).digest('hex');
 const sourceBefore = sha(fs.readFileSync(source));
-assert.equal(sourceBefore, '5978524c38134fbba8321542fccb162ef8ff81a5b8cf426b478aed0fae4f066a');
+assert.equal(sourceBefore, '7a4f492057061f09937201e3462c3eacf0b85fb2796f8ccd38fc760846721f91');
 const { plan, apply, restore, inspectOperation, inspectPending, PreservationError } = await import(pathToFileURL(source));
 // win32 counterparts of mode 0700/0750 (PRINCIPLES P2/P7): product Set plus an independent icacls oracle.
 const winAcl = process.platform === 'win32' ? await import('../helpers/win-acl.mjs') : null;

@@ -178,3 +178,7 @@ The orchestrator is internal infrastructure that drives the aigentry ecosystem v
 ## License
 
 MIT
+
+### 0.3.0 environment integration
+
+Environment settings and single-use Claude delivery are described in [environment setup](docs/setup/environment.md). Fresh selection preserves the checked private store and explicit-input rules; delivery requires current v2 authority and binding. The shared bounded shell transport keeps daemon credentials outside Node memory. Worker reports retain anchored capture. Source integration and compilation do not establish runtime, installed, native, security or interrupted-request acceptance; those gates require independent verification.

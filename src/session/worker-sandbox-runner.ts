@@ -1,40 +1,72 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as net from "node:net";
+import { preflightControlPort } from "./worker-sandbox.js";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
-import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
-import { assertExecutableIdentity, preflightConnectProbe, preflightControlPort, preflightDenyProbe, quote, readSealedManifest, withSeccompHelperRead, type WorkerManifest } from "./worker-sandbox.js";
-import { CLAUDE_OAUTH_CHILD, CLAUDE_OAUTH_DIR, CLAUDE_OAUTH_FILE, readClaudeOAuthHandoff } from "./claude-worker-oauth.js";
+import type { AnyWorkerManifest } from "./worker-sandbox.js";
+import type { openWorkerReceipt } from "./worker-receipt.js";
+import * as os from "node:os";
 
-async function run(m: WorkerManifest, command: string[], capture = false,
-  secretEnv: Record<string, string> = {}): Promise<{ code: number; output: string }> {
-  const wrapped = await SandboxManager.wrapWithSandboxArgv(command.map(quote).join(" "), "/bin/bash",
+async function run(manager: typeof import("@anthropic-ai/sandbox-runtime").SandboxManager,
+  quote: (value: string) => string, m: AnyWorkerManifest, command: string[], capture = false,
+  secretEnv: Record<string, string> = {}, prewrapped?: { argv: string[]; env: NodeJS.ProcessEnv },
+  receipt?: ReturnType<typeof openWorkerReceipt>): Promise<{ code: number; output: string }> {
+  const wrapped = prewrapped ?? await manager.wrapWithSandboxArgv(command.map(quote).join(" "), "/bin/bash",
     undefined, undefined, m.cwd, { commandId: `${m.attempt}:${capture ? "preflight" : "worker"}` });
   const child = spawn(wrapped.argv[0]!, wrapped.argv.slice(1), {
     cwd: m.cwd, env: { ...m.env, ...wrapped.env, ...secretEnv }, stdio: capture ? ["ignore", "pipe", "pipe"] : "inherit",
   });
-  if (!capture) {
-    fs.writeFileSync(m.receipt, JSON.stringify({ state: "running", hash: process.argv[3],
-      attempt: m.attempt, supervisorPid: process.pid, childPid: child.pid, checkedAt: new Date().toISOString() }), { mode: 0o600 });
-  }
   let output = "";
+  const collect = (data: Buffer): void => { if (output.length < 8192) output += String(data); };
   if (capture) {
-    child.stdout?.on("data", d => { if (output.length < 8192) output += String(d); });
-    child.stderr?.on("data", d => { if (output.length < 8192) output += String(d); });
+    child.stdout?.on("data", collect);
+    child.stderr?.on("data", collect);
   }
-  const forward = (): void => { child.kill("SIGTERM"); };
+  let ended = false;
+  let resolveExit!: () => void;
+  const exited = new Promise<void>(resolve => { resolveExit = resolve; });
+  let resolveFinished!: (result: { code: number; error?: Error }) => void;
+  const finished = new Promise<{ code: number; error?: Error }>(resolve => { resolveFinished = resolve; });
+  const onError = (error: Error): void => { resolveFinished({ code: 1, error }); };
+  const onExit = (code: number | null): void => {
+    ended = true;
+    resolveExit();
+    resolveFinished({ code: code ?? 1 });
+  };
+  child.once("error", onError);
+  child.once("exit", onExit);
+  const forward = (): void => { if (!ended && child.pid !== undefined) child.kill("SIGTERM"); };
   process.once("SIGTERM", forward);
   process.once("SIGINT", forward);
   const timer = capture ? setTimeout(() => child.kill("SIGKILL"), 15000) : undefined;
   try {
-    const code = await new Promise<number>((resolve, reject) => {
-      child.once("error", reject);
-      child.once("exit", c => resolve(c ?? 1));
-    });
-    return { code, output };
+    if (!capture && child.pid === undefined) {
+      const failedSpawn = await finished;
+      throw failedSpawn.error ?? new Error("SANDBOX_WORKER_SPAWN_FAILED");
+    }
+    if (!capture) receipt!.publish({ state: "running", hash: process.argv[3],
+      attempt: m.attempt, supervisorPid: process.pid, childPid: child.pid, checkedAt: new Date().toISOString() });
+    const result = await finished;
+    if (result.error) throw result.error;
+    return { code: result.code, output };
+  } catch (error) {
+    // Only this ChildProcess handle is signalled; a receipt PID is never kill authority.
+    if (!ended && child.pid !== undefined) {
+      try { child.kill("SIGTERM"); } catch { /* preserve the original failure */ }
+      const escalation = setTimeout(() => { if (!ended) { try { child.kill("SIGKILL"); } catch { /* best effort */ } } }, 2000);
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([exited, new Promise<void>(resolve => { timeout = setTimeout(resolve, 5000); })]);
+      } finally { clearTimeout(escalation); if (timeout) clearTimeout(timeout); }
+    }
+    throw error;
   } finally {
     if (timer) clearTimeout(timer);
+    child.removeListener("error", onError);
+    child.removeListener("exit", onExit);
+    child.stdout?.removeListener("data", collect);
+    child.stderr?.removeListener("data", collect);
     process.removeListener("SIGTERM", forward);
     process.removeListener("SIGINT", forward);
   }
@@ -90,25 +122,24 @@ async function openControl(reserved: readonly (number | undefined)[]):
 async function main(): Promise<void> {
   const file = process.argv[2], expected = process.argv[3];
   if (!file || !expected) throw new Error("SANDBOX_MANIFEST_REQUIRED");
+  // This first-party reader has only inert top-level declarations on this entry path.
+  // In particular its SRT reference is type-only; the runtime module is loaded below.
+  const { assertExecutableIdentity, preflightConnectProbe, preflightDenyProbe, quote, readSealedManifest, withSeccompHelperRead } =
+    await import("./worker-sandbox.js");
   // The binder's sealed read (O_NOFOLLOW, owner-only, 1 MiB cap, sealed path and receipt);
   // its failures map onto this runner's fixed codes.
-  let m: WorkerManifest;
+  let m: AnyWorkerManifest;
   try {
     m = readSealedManifest(file, expected).m;
   } catch (e) {
     throw new Error(e instanceof Error && e.message === "SANDBOX_MANIFEST_CHANGED" ? "SANDBOX_MANIFEST_CHANGED" : "SANDBOX_MANIFEST_INVALID");
   }
-  if (m.version !== 1 || !m.command.length || !m.task || !m.attempt) throw new Error("SANDBOX_MANIFEST_INVALID");
-  // #652: the sealed marker must name exactly this attempt's handoff; checked
-  // before any sandbox work, read only for the actual worker below.
-  const handoff = path.join(path.dirname(path.resolve(file)), CLAUDE_OAUTH_DIR, CLAUDE_OAUTH_FILE);
-  if (m.claudeOAuthHandoff !== undefined && (m.cli !== "claude" || m.claudeOAuthHandoff !== handoff)) {
-    throw new Error("CLAUDE_OAUTH_HANDOFF_INVALID");
-  }
+  if (!m.command.length || !m.task || !m.attempt) throw new Error("SANDBOX_MANIFEST_INVALID");
+  if (m.version === 1 && m.claudeOAuthHandoff !== undefined) throw new Error("ENV_LEGACY_SECRET_RELAUNCH_REFUSED: create a new approved dispatch with current configuration and binding");
+  const trustedHome = path.join(os.userInfo().homedir, ".aigentry");
   // #1148 U4: a sealed executable identity is re-checked on every start (auto-restart
   // replays this same manifest) and again right before exec; a replaced file refuses.
   if (m.executable) assertExecutableIdentity(m.executable, m.command[0]!);
-  if (!SandboxManager.isSupportedPlatform()) throw new Error("SANDBOX_PLATFORM_UNSUPPORTED");
   // A legacy or unusable canary cannot attest the metadata boundary. The probed files must exist
   // on the host: on Linux the deny probe reads ENOENT inside the sandbox as the denial.
   try {
@@ -119,11 +150,18 @@ async function main(): Promise<void> {
   } catch {
     throw new Error("SANDBOX_METADATA_CANARY_REQUIRED");
   }
+  // The runner inherited the terminal host, not an admitted helper environment.
+  // Sanitize before dependency checks or runtime initialization can spawn tools.
+  for (const key of Object.keys(process.env)) delete process.env[key];
+  Object.assign(process.env, m.env);
+  const { SandboxManager } = await import("@anthropic-ai/sandbox-runtime");
+  const { claimGrant } = await import("../environment/delivery.js");
+  const { controllerContext } = await import("../environment/grants.js");
+  const { assertRuntimeOverlaySupported } = await import("../environment/helper-env.js");
+  if (!SandboxManager.isSupportedPlatform()) throw new Error("SANDBOX_PLATFORM_UNSUPPORTED");
   const deps = await SandboxManager.checkDependenciesAsync();
   if (deps.errors.length) throw new Error(`SANDBOX_DEPENDENCIES: ${deps.errors.join("; ")}`);
   // SRT's temporary paths must belong to this worker, never to shared host /tmp.
-  for (const key of Object.keys(process.env)) delete process.env[key];
-  Object.assign(process.env, m.env);
   // #652: the sealed config plus, on Linux only, the runtime's own seccomp helper directory.
   const runtimeDir = path.dirname(createRequire(import.meta.url).resolve("@anthropic-ai/sandbox-runtime/package.json"));
   await SandboxManager.initialize(withSeccompHelperRead(m.config, process.platform, runtimeDir), undefined, false);
@@ -149,7 +187,7 @@ async function main(): Promise<void> {
     const control = await openControl([SandboxManager.getProxyPort?.(), SandboxManager.getSocksProxyPort?.()]);
     let check: { code: number; output: string };
     try {
-      check = await run(m, [process.execPath, "-e", script, m.probeFile, sentinel, m.probeDirectory, canary,
+      check = await run(SandboxManager, quote, m, [process.execPath, "-e", script, m.probeFile, sentinel, m.probeDirectory, canary,
         String(control.port)], true);
       // Accepts that became ready with the child's exit are counted before the listener closes.
       await new Promise(r => setImmediate(r));
@@ -165,13 +203,20 @@ async function main(): Promise<void> {
     if (fs.readFileSync(m.probeFile, "utf8") !== canary) throw new Error("SANDBOX_PREFLIGHT_FAILED: writeFile:leaked");
     process.stderr.write(`[sandbox] ${m.sid} task=${m.task} attempt=${m.attempt} OS confinement preflight passed\n`);
     if (process.argv[4] === "--preflight-only") return;
-    // Token goes to the worker child env only: not process.env, not m.env, not preflight.
-    const secretEnv: Record<string, string> = m.claudeOAuthHandoff === undefined ? {} :
-      { [CLAUDE_OAUTH_CHILD]: readClaudeOAuthHandoff(m.claudeOAuthHandoff, handoff) };
-    if (m.executable) assertExecutableIdentity(m.executable, m.command[0]!);
-    const result = await run(m, m.command, false, secretEnv);
-    fs.writeFileSync(m.receipt, JSON.stringify({ state: "exited", attempt: m.attempt, code: result.code }), { mode: 0o600 });
-    process.exitCode = result.code;
+    const preparedWrapper = m.version === 2 ? await SandboxManager.wrapWithSandboxArgv(m.command.map(quote).join(" "), "/bin/bash",
+      undefined, undefined, m.cwd, { commandId: `${m.attempt}:worker` }) : undefined;
+    if (m.version === 2 && preparedWrapper) assertRuntimeOverlaySupported(runtimeDir, preparedWrapper, m.env);
+    // Claim after all preflight effects and wrapper validation. A v1 secret
+    // handoff cannot relaunch.
+    const { openWorkerReceipt } = await import("./worker-receipt.js");
+    const receipt = openWorkerReceipt(m.receipt, file);
+    try {
+      const secretEnv: Record<string, string> = m.version === 2 ? claimGrant(controllerContext(trustedHome), m, expected) : {};
+      if (m.executable) assertExecutableIdentity(m.executable, m.command[0]!);
+      const result = await run(SandboxManager, quote, m, m.command, false, secretEnv, preparedWrapper, receipt);
+      receipt.publish({ state: "exited", attempt: m.attempt, code: result.code });
+      process.exitCode = result.code;
+    } finally { receipt.close(); }
   } finally {
     await SandboxManager.reset();
   }

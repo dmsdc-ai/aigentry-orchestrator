@@ -66,6 +66,13 @@
 # code the sourced call never produces, which is precisely the drift T104 forbids.
 set -uo pipefail
 
+# Managed policy is admitted only by the validated TypeScript caller's internal
+# dispatcher. A public caller's map is not an authentication credential.
+if [ "${AIGENTRY_MANAGED_BIN_DIR+x}" ] ||
+   { [ "${1:-}" = "open" ] && [ "${5:-}" = "managed-secret" ]; }; then
+  echo "ENV_HELPER_PATH_REFUSED" >&2; exit 78
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # Relative source: bin/lib/workspace-host.sh ships in the init manifest alongside
 # this file, so a control workspace (bin/ copied, no repo, no dist/) resolves it the

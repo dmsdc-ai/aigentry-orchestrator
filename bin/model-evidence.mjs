@@ -18,10 +18,21 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as https from "node:https";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { isToken, resolveSpawnDecision, safeText, validateCatalog } from "./model-resolve.mjs";
+import { parseDeclaredVersion } from "./lib/executable-version.mjs";
+import { environmentRuntime } from "./lib/environment-runtime.mjs";
+export { parseDeclaredVersion };
 
 export const DEFAULT_CATALOG = fileURLToPath(new URL("../docs/model-profiles/model-catalog.json", import.meta.url));
+
+// Managed lookup uses only the caller's supplied environment, inside the
+// caller's existing configuration refusal boundary. Pure exports stay sync.
+export async function centralEnvironment(env, context = {}) {
+  const { modulePath, runtimeRoot } = environmentRuntime(env);
+  const { bootstrapEnvironment } = await import(pathToFileURL(modulePath).href);
+  return { ...bootstrapEnvironment(env, context), runtimeRoot };
+}
 
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
 const VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
@@ -72,20 +83,6 @@ export function npmPackageVersion(realpath, cli, fsImpl = fs) {
     if (up === dir) break;
     dir = up;
   }
-  return null;
-}
-
-/**
- * AIGENTRY_<CLI>_EXECUTABLE_VERSION: compact JSON {version, dev, ino, size, mtimeMs}
- * naming the declared file's identity. Anything else is not a declaration.
- */
-export function parseDeclaredVersion(raw) {
-  try {
-    const v = JSON.parse(raw);
-    const n = (x) => typeof x === "number" && Number.isFinite(x) && x >= 0;
-    if (v && typeof v === "object" && VERSION.test(v.version ?? "") && n(v.dev) && n(v.ino) && n(v.size) && n(v.mtimeMs) &&
-      Object.keys(v).every((k) => ["version", "dev", "ino", "size", "mtimeMs"].includes(k))) return v;
-  } catch { /* not JSON */ }
   return null;
 }
 
@@ -863,7 +860,7 @@ function parseResolveArgs(argv) {
     const k = argv[i], v = argv[i + 1];
     if (v === undefined) return null;
     if (k === "--observe") { if (a.observe.length >= 4) return null; a.observe.push(v); }
-    else if (["--cli", "--sid", "--task", "--role", "--route-json"].includes(k) && a[k.slice(2)] === undefined) a[k.slice(2)] = v;
+    else if (["--cli", "--sid", "--task", "--role", "--route-json", "--model", "--effort", "--executable", "--executable-version"].includes(k) && a[k.slice(2)] === undefined) a[k.slice(2)] = v;
     else return null;
   }
   return a;
@@ -883,6 +880,15 @@ export async function resolveCommand(argv, env = process.env, deps = {}) {
   if (!a || !["claude", "codex"].includes(a.cli) || !IDENTITY.test(a.sid ?? "") || !/^[\x21-\x7e]{1,128}$/.test(a.task ?? "")) {
     return refusal("MODEL_RESOLVE_USAGE", 2, "usage: --resolve --cli claude|codex --sid S --task T [--route-json J] [--observe F]");
   }
+  let central;
+  try {
+    const flags = {};
+    for (const [key, suffix] of [["model", "model"], ["effort", "effort"], ["executable", "executable"], ["executable-version", "version"]]) {
+      if (a[key] !== undefined) flags[`${a.cli}.${suffix}`] = a[key];
+    }
+    central = await centralEnvironment(env, { flags, role: a.role, targetCwd: env.AIGENTRY_TARGET_CWD ?? process.cwd() });
+    env = central.env;
+  } catch { return refusal("ENV_CONFIGURATION_REFUSED", 4, "central settings validation failed before model effects"); }
   let route = null;
   if (a["route-json"] !== undefined) {
     try { route = JSON.parse(a["route-json"]); } catch { route = null; }
@@ -899,10 +905,14 @@ export async function resolveCommand(argv, env = process.env, deps = {}) {
   const upper = a.cli.toUpperCase();
   const request = {};
   const envValue = (key) => (env[key] === undefined || env[key] === "" ? undefined : env[key]);
-  if (!route && envValue(`AIGENTRY_${upper}_MODEL`) !== undefined) request.model = { value: env[`AIGENTRY_${upper}_MODEL`], source: "env" };
-  if (envValue(`AIGENTRY_${upper}_EFFORT`) !== undefined) request.effort = { value: env[`AIGENTRY_${upper}_EFFORT`], source: "env" };
+  const source = (suffix) => {
+    const s = central.resolution.provenance[`${a.cli}.${suffix}`];
+    return s?.startsWith("env:") ? "env" : s === "legacy-role" ? "role-config" : s ?? "none";
+  };
+  if (envValue(`AIGENTRY_${upper}_MODEL`) !== undefined) request.model = { value: env[`AIGENTRY_${upper}_MODEL`], source: source("model") };
+  if (envValue(`AIGENTRY_${upper}_EFFORT`) !== undefined) request.effort = { value: env[`AIGENTRY_${upper}_EFFORT`], source: source("effort") };
   const declaredPath = envValue(`AIGENTRY_${upper}_EXECUTABLE`);
-  if (declaredPath !== undefined) request.executable = { path: declaredPath, source: "env" };
+  if (declaredPath !== undefined) request.executable = { path: declaredPath, source: source("executable") };
   const collected = collectExecutables(a.cli, { pathValue: env.PATH ?? "", declaredPath,
     declaredVersion: envValue(`AIGENTRY_${upper}_EXECUTABLE_VERSION`) });
   if (collected.error) return refusal("MODEL_TUPLE_INCOMPATIBLE", 4, `${a.cli}: ${collected.error}`);

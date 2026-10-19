@@ -34,9 +34,9 @@ function launch(exe: string, args: readonly string[], env: NodeJS.ProcessEnv, cw
   return { file: l.file, args: l.args, opts };
 }
 
-function collect(exe: string, args: readonly string[]): Promise<string> {
+function collect(exe: string, args: readonly string[], environment: NodeJS.ProcessEnv): Promise<string> {
   return new Promise((resolve, reject) => {
-    const l = launch(exe, args, process.env, undefined);
+    const l = launch(exe, args, environment, undefined);
     const c = spawn(l.file, l.args, l.opts);
     let out: string[] = [];
     let bytes = 0;
@@ -71,13 +71,14 @@ function collect(exe: string, args: readonly string[]): Promise<string> {
   });
 }
 
-export function nodeSpawner(): Spawner {
+export function nodeSpawner(environment: NodeJS.ProcessEnv = process.env): Spawner {
+  const captured = { ...environment };
   return {
     async run(cmd, stdin, timeout_ms = 5_000) {
       const start = Date.now();
       const [exe, ...args] = cmd.argv;
       if (!exe) throw new Error("nodeSpawner: empty argv");
-      const l = launch(exe, args, { ...process.env, ...cmd.env }, cmd.cwd);
+      const l = launch(exe, args, { ...captured, ...cmd.env }, cmd.cwd);
       return await new Promise<RunResult>((resolve, reject) => {
         const child = spawn(l.file, l.args, l.opts);
         let out = "", err = "";
@@ -128,7 +129,7 @@ export function nodeSpawner(): Spawner {
     },
     async probeVersion(exe) {
       try {
-        const out = await collect(exe, ["--version"]);
+        const out = await collect(exe, ["--version"], captured);
         const m = out.match(/(\d+)\.(\d+)\.(\d+)(?:-[A-Za-z0-9.-]+)?/);
         return m ? m[0] : out.trim();
       } catch { throw new Error("CLI_NOT_FOUND"); }

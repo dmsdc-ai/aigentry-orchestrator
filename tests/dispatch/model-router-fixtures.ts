@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess, type SpawnSyncReturns } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, statSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
+import { upgradeConfig, controllerContext, currentConfig, enrollProject, createBinding } from "../../src/environment/grants.js";
+import { mutateConfig, readConfig } from "../../src/environment/storage.js";
 import type { WorkerManifest } from "../../src/session/worker-sandbox.js";
 import { installFakeCmux } from "./fake-cmux-win32.js";
 import { writeNpmCmdShim } from "../session/boot-adapter/_win-launch-fixture.js";
@@ -11,6 +13,71 @@ import { writeNpmCmdShim } from "../session/boot-adapter/_win-launch-fixture.js"
 export const REPO = resolve(import.meta.dirname, "../../..");
 export const PROFILE = join(REPO, "tests/dispatch/fixtures/model-routing-profile.md");
 export const ROUTER = join(REPO, "bin/model-router.mjs");
+// Shared migration seam: current enrollment/binding and real grant preparation;
+// only the pre-existing fake external process boundaries are intercepted.
+export function managedFixtureImports(args: string[], invocation: NodeJS.ProcessEnv, overrides: NodeJS.ProcessEnv,
+  root: string, home: string, aig: string, bin: string, replacements: Record<string, string | undefined>): string[] {
+    const explicitCli = args[args.lastIndexOf("--cli") + 1];
+    const managed = process.platform !== "win32" && args.includes("--spawn-and-dispatch") &&
+      (args.lastIndexOf("--cli") < 0 || explicitCli === "auto" || explicitCli === "claude");
+    const imports: string[] = [];
+    if (managed) {
+      chmodSync(aig, 0o700);
+      const provider = realpathSync(join(bin, "claude")), st = statSync(provider);
+      const declaration = { version: "9.9.9", dev: st.dev, ino: st.ino, size: st.size, mtimeMs: st.mtimeMs };
+      let config = readConfig(aig);
+      if (config.version === 1) {
+        config = mutateConfig(aig, config.revision, c => {
+          c.settings["claude.executable"] = provider;
+          c.settings["claude.version"] = JSON.stringify(declaration);
+          return c;
+        });
+        upgradeConfig(aig, config.revision);
+      }
+      const ctx = controllerContext(aig), current = currentConfig(ctx), project = join(root, "project");
+      let enrolled = Object.entries(current.projectEnrollments).find(([, e]) => e.canonicalRoot === project && e.enabled)?.[0];
+      if (!enrolled) enrolled = enrollProject(ctx, project, current.revision).id;
+      if (!Object.values(currentConfig(ctx).bindings).some(b => b.enabled && b.projectEnrollmentIds.includes(enrolled!))) {
+        createBinding(ctx, enrolled, { cli: "claude", path: provider, realpath: provider,
+          dev: st.dev, ino: st.ino, size: st.size, mtimeMs: st.mtimeMs,
+          version: "9.9.9", versionSource: "operator-declared" }, currentConfig(ctx).revision);
+      }
+      // Keep the original fake external effects, but let the real public producer
+      // resolve and prepare its grant through the shipped helpers. No claim is mocked.
+      const fixtureKeys = new Set(["HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "AIGENTRY_HOME",
+        "AIGENTRY_SESSIONS_ROOT", "AIGENTRY_TASK_QUEUE", "AIGENTRY_TASK_GATE", "DISPATCH_STATE_DIR",
+        "AIGENTRY_GIT_HOOKS_DIR", "AIGENTRY_GIT_HOOK_SOURCE_DIR", "CODEX_HOME", "GEMINI_CLI_HOME",
+        "FIXTURE_CHILD_PID", "KEEPALIVE_PID", "SPAWN_STAGING_ROOT", "COUNTER", "PROMPT_LOG",
+        "CLASSIFIER_ARGS", "CLASSIFIER_REPLY", "CLASSIFIER_EXIT", "CLASSIFIER_HANG", "LIVE_SESSIONS",
+        "OBSERVED_CLI", "OPEN_LOG", "PARENT_MODEL_LOG", "INJECT_ARGS", "TELEMETRY_LOG", "WORK_LOG",
+        "CLI_PROBE_LOG", "CMUX_CAPS_LOG", "REGISTRY_DB", "REGISTRY_LOG"]);
+      const controls = Object.fromEntries(Object.entries(invocation).filter(([key]) => fixtureKeys.has(key)));
+      const preload = join(root, "dispatch-boundary.mjs");
+      writeFileSync(preload, `import cp from 'node:child_process'; import os from 'node:os'; import {syncBuiltinESMExports} from 'node:module';
+const nativeUserInfo=os.userInfo; os.userInfo=()=>({...nativeUserInfo(),homedir:${JSON.stringify(home)}});
+const controls=${JSON.stringify(controls)}, replacements=${JSON.stringify(replacements)};
+const original=cp.spawnSync;
+cp.spawnSync=function(command,args=[],options={}) {
+  const helper=replacements[command] || replacements[args[0]];
+  const childEnv={...controls,...options.env};
+  delete childEnv.AIGENTRY_CLAUDE_OAUTH_TOKEN; delete childEnv.CLAUDE_CODE_OAUTH_TOKEN;
+  if(helper) {
+    const rest=replacements[command]?args:args.slice(1);
+    return original(process.execPath,[helper,...rest],{...options,env:childEnv});
+  }
+  if(${existsSync(join(bin, "node"))} && command===process.execPath && args[0]===${JSON.stringify(join(REPO, "bin/boot-prepare.mjs"))}) {
+    return original(process.execPath,[${JSON.stringify(join(bin, "node"))},...args],{...options,env:childEnv});
+  }
+  return original(command,args,{...options,env:childEnv});
+}; syncBuiltinESMExports();`);
+      imports.push("--import", preload);
+      for (const key of ["OPEN_SESSION_SH", "SESSION_PROBE_PY", "EMIT_TELEMETRY_MJS", "REPORT_TARGET_SH"]) {
+        if (!Object.hasOwn(overrides, key)) delete invocation[key];
+      }
+    }
+    return imports;
+}
+
 // #1232: a confined claude worker never receives a copy of the host login. The fixture host still
 // holds this fabricated `.credentials.json` (no live token, provider call or refresh path) so a copy
 // would be observable, and the worker authenticates only through the private handoff of the FAKE
@@ -103,7 +170,7 @@ fs.writeFileSync(manifest.receipt, JSON.stringify({ hash: current.hash, attempt:
     AIGENTRY_GIT_HOOKS_DIR: join(root, "hooks"), AIGENTRY_GIT_HOOK_SOURCE_DIR: join(REPO, "git-hooks"),
     CODEX_HOME: join(root, "codex-home"), GEMINI_CLI_HOME: join(root, "gemini-home"),
     AIGENTRY_ROUTER_PROFILE: PROFILE, AIGENTRY_ROUTER_CLASSIFIER: classifier,
-    AIGENTRY_CLAUDE_MODEL: "", AIGENTRY_CODEX_MODEL: "", AIGENTRY_GROK_MODEL: "", AIGENTRY_GEMINI_MODEL: "",
+    AIGENTRY_CLAUDE_MODEL: undefined, AIGENTRY_CODEX_MODEL: undefined, AIGENTRY_GROK_MODEL: undefined, AIGENTRY_GEMINI_MODEL: undefined,
     AIGENTRY_GEMINI_BINARY: "agy", AIGENTRY_DISPATCH_REGISTER_TIMEOUT_MS: "0",
     AIGENTRY_SHIM_SCRIPT_DIR: "", DISPATCH_SCRIPT_DIR: "", DISPATCH_REGISTRY_PY: join(REPO, "bin/dispatch-registry.py"),
     COUNTER: join(root, "counter"), PROMPT_LOG: join(root, "prompt"), CLASSIFIER_ARGS: join(root, "classifier-args"),
@@ -162,8 +229,9 @@ if (process.argv.length === 3 && process.argv[2] === 'capabilities') {
     } else {
       // #1232: no host credential copy; the sealed marker names this attempt's private handoff.
       assert.equal(existsSync(join(m.env.CLAUDE_CONFIG_DIR!, ".credentials.json")), false, "the host login is never copied");
-      assert.equal(m.claudeOAuthHandoff, join(dirname(current.manifest), "claude-oauth", "token"));
-      assert.equal(readFileSync(m.claudeOAuthHandoff!, "utf8").trim() === FAKE_WORKER_TOKEN, true, "handoff carries the fake opt-in");
+      assert.equal(m.version, 2);
+      assert.equal(m.claudeOAuthHandoff, undefined);
+      assert.equal(readFileSync(join(dirname(current.manifest), "claude-oauth", "token"), "utf8").trim() === FAKE_WORKER_TOKEN, true, "handoff carries the fake opt-in");
       assert.equal("CLAUDE_CODE_OAUTH_TOKEN" in m.env, false);
     }
     assert.ok(m.config.filesystem?.allowWrite?.includes(join(root, "project")));
@@ -201,9 +269,16 @@ if (process.argv.length === 3 && process.argv[2] === 'capabilities') {
     { cwd: root, env: { ...env, ...overrides }, encoding: "utf8", timeout: 20000 });
   const router = (args: string[] = [], overrides: NodeJS.ProcessEnv = {}) => spawnSync(process.execPath,
     [ROUTER, "--role", "coder", "--profile", PROFILE, ...args], { cwd: REPO, env: { ...env, ...overrides }, encoding: "utf8", timeout: 20000 });
-  const dispatch = (args: string[] = [], overrides: NodeJS.ProcessEnv = {}) => spawnSync(process.execPath,
-    [join(REPO, "dist/src/dispatch/cli.js"), "--ref", ref, "--task", "1083", "--no-verify-started", "--timeout-ms", "500", ...args],
-    { cwd: root, env: { ...env, FIXTURE_CHILD_PID: String(childPid()), ...overrides }, encoding: "utf8", timeout: 22000 });
+  const dispatch = (args: string[] = [], overrides: NodeJS.ProcessEnv = {}) => {
+    const invocation: NodeJS.ProcessEnv = { ...env, FIXTURE_CHILD_PID: String(childPid()), ...overrides };
+    const imports = managedFixtureImports(args, invocation, overrides, root, home, aig, bin, {
+      [join(REPO, "bin/open-session.sh")]: open, [join(REPO, "bin/session-probe.py")]: probe,
+      [join(REPO, "bin/emit-telemetry.mjs")]: telemetry,
+      [join(REPO, "bin/orchestrator-report-target.sh")]: env.REPORT_TARGET_SH });
+    return spawnSync(process.execPath,
+      [...imports, join(REPO, "dist/src/dispatch/cli.js"), "--ref", ref, "--task", "1083", "--no-verify-started", "--timeout-ms", "500", ...args],
+      { cwd: root, env: invocation, encoding: "utf8", timeout: 22000 });
+  };
   // #1084: a live worker shows up in `telepty list` as its guard launcher; the CLI kind is its `exec -a` line.
   const liveLauncher = (cli: string) => { const file = join(root, `live-${cli}-launcher.sh`); writeFileSync(file, `#!/usr/bin/env bash\nexec -a ${cli} ${cli} "$@"\n`); return file; };
   return { root, bin, aig, ref, queue, env, script, router, dispatch, liveLauncher, manifest, refused, prepareTarget, boot,

@@ -21,6 +21,8 @@
 # Guard against double-source (platform.sh precedent).
 [[ "${_NODE_SHIM_SH_SOURCED:-}" == "1" ]] && return 0
 _NODE_SHIM_SH_SOURCED=1
+{ set +xv; } 2>/dev/null
+unset NODE_OPTIONS NODE_PATH BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FALLBACK_LIBRARY_PATH
 
 # aigentry_node_shim <shim-name> <dist-relative-path>
 #
@@ -42,4 +44,16 @@ aigentry_node_shim() {
     echo "$name: compiled implementation not found at $AIGENTRY_SHIM_JS (run \`tsc -p .\` in the repo, or install @dmsdc-ai/aigentry-orchestrator so 'aigentry-orchestrator' is on PATH)" >&2
     exit 2
   fi
+  # These callers resolve central settings before their module-level env reads.
+  # A copied bin/ must find the same compiled environment closure in the package.
+  case "$rel" in
+    dist/src/dispatch/cli.js|dist/src/orchestrator-boot/cli.js)
+      local env_js
+      env_js="$(dirname "$(dirname "$AIGENTRY_SHIM_JS")")/environment/bootstrap.js"
+      if [ ! -f "$env_js" ]; then
+        echo "$name: ENV_RUNTIME_MISSING (compiled environment/bootstrap.js required)" >&2
+        exit 2
+      fi
+      ;;
+  esac
 }

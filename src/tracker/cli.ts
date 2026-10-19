@@ -22,11 +22,13 @@ import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as os from "node:os";
 import { fileURLToPath } from "node:url";
 
 import { registryEnvironment, registryInvocation } from "../dispatch/registry-command.js";
+import { requestTelepty, validatedTeleptyPort } from "../telepty/http.js";
 
-import { defaultPumpDeps, pumpOnce, reportAck, reportStatus, SID_RE, type PumpDeps } from "../report/pump.js";
+import { teleptyChildEnv, defaultPumpDeps, pumpOnce, reportAck, reportStatus, SID_RE, type PumpDeps } from "../report/pump.js";
 import { cmdReportSweep } from "./report-sweep.js";
 import { USAGE } from "./usage.js";
 
@@ -55,15 +57,15 @@ const TRACKER_SID = env.TRACKER_FROM_SID || "dispatch-tracker";
 
 // Test seams (override in tests via env) — identical names/defaults to the shell.
 const TELEPTY = env.TELEPTY || "telepty";
-const CURL = env.CURL || "curl";
 const GIT = env.GIT || "git";
 const DISPATCH_SH = env.DISPATCH_SH || path.join(SCRIPT_DIR, "dispatch.sh");
 const SESSION_PROBE_PY = env.SESSION_PROBE_PY || path.join(SCRIPT_DIR, "session-probe.py");
 const POLICY_PY = env.POLICY_PY || path.join(SCRIPT_DIR, "policy.py");
 const DISPATCH_REGISTRY_PY = env.DISPATCH_REGISTRY_PY || path.join(SCRIPT_DIR, "dispatch-registry.py");
 const HITL_SH = env.HITL_SH || path.join(SCRIPT_DIR, "hitl.sh");
+const TELEPTY_LISTING_SH = path.join(SCRIPT_DIR, "lib/telepty-listing.sh");
+const TELEPTY_SPAWN_TIMEOUT_MS = 7000;
 const NOW_OVERRIDE = env.TRACKER_NOW || "";
-const TELEPTY_AUTH_SH = path.join(SCRIPT_DIR, "lib/telepty-auth.sh");
 
 // #1172: report-sweep accepts no argument or exactly `--json`. Anything else is a
 // usage error decided HERE, before the mkdir below or any state/shared/registry access.
@@ -85,6 +87,7 @@ interface RunOpts {
   env?: NodeJS.ProcessEnv;
   input?: string;
   /** "inherit" mirrors a bare call; "ignore" mirrors `2>/dev/null`. */
+  timeout?: number;
   stderr?: "inherit" | "ignore";
 }
 
@@ -93,7 +96,8 @@ function capture(cmd: string, args: string[], opts: RunOpts = {}): { status: num
   const r = spawnSync(cmd, args, {
     encoding: "utf8",
     shell: false,
-    ...(opts.env ? { env: { ...process.env, ...opts.env } } : {}),
+    env: cmd === "bash" || cmd === TELEPTY ? { ...teleptyChildEnv(process.env), TELEPTY, ...(env.CURL ? { CURL: env.CURL } : {}) } : { ...process.env, ...opts.env },
+    timeout: opts.timeout ?? 7000, killSignal: "SIGKILL",
     ...(opts.input === undefined ? {} : { input: opts.input }),
     stdio: [opts.input === undefined ? "ignore" : "pipe", "pipe", opts.stderr === "inherit" ? "inherit" : "ignore"],
   });
@@ -267,7 +271,7 @@ const ABSENT = "ABSENT";
  * exists to remove.
  */
 function sessionPresence(sid: string): string {
-  const listing = chomp(capture(TELEPTY, ["list", "--json"]).stdout);
+  const listing = chomp(capture(TELEPTY, ["list", "--json"], { timeout: TELEPTY_SPAWN_TIMEOUT_MS }).stdout);
   const parsed = (() => {
     try {
       return JSON.parse(listing);
@@ -279,6 +283,13 @@ function sessionPresence(sid: string): string {
   for (const s of parsed) {
     if (s && s.id === sid) return String(s.healthStatus || s.status || "");
   }
+  // #1214: `[]` is also what a refusal or a silent daemon prints. The one shared rule
+  // (telepty_listing_trusted, bin/lib/telepty-listing.sh) decides whether the listing
+  // may stand as evidence of absence; untrusted, failed or timed out → UNKNOWN.
+  const trusted = capture("bash", ["-c", '. "$1"; telepty_listing_trusted "$2"', "_", TELEPTY_LISTING_SH, listing], {
+    timeout: TELEPTY_SPAWN_TIMEOUT_MS,
+  });
+  if (trusted.status !== 0) return "";
   return ABSENT;
 }
 
@@ -303,17 +314,6 @@ const POLICY_FALLBACK = '{"action":"ESCALATE","reason":"policy failed","status":
 function policyForTracker(stateJson: string): string {
   const r = capture(POLICY_PY, ["--status", "tracker_check", "--state", "-"], { input: stateJson + "\n" });
   return r.status === 0 ? chomp(r.stdout) : POLICY_FALLBACK;
-}
-
-/**
- * The ONE credential resolver, called as the shell function it is
- * (bin/lib/telepty-auth.sh). Re-implementing the config read here would create
- * the second copy tests/dispatch/T87 exists to forbid — a divergent copy of a
- * credential is how the two ends stop agreeing about who is calling. Degrades to
- * "" (no credential presented) exactly as the lib does.
- */
-function teleptyAuthToken(): string {
-  return chomp(capture("bash", ["-c", '. "$1"; telepty_auth_token', "_", TELEPTY_AUTH_SH]).stdout);
 }
 
 // ── #909 item (d): sleep-aware telemetry gate ───────────────────────────────
@@ -665,26 +665,21 @@ function gitCheckAndObserve(sid: string, cwd: string, dispatchedAt: string, scre
  * There is deliberately no DELETE here: a record the orchestrator does not own is
  * not its to discard, and idempotency lives in the seen-ledger.
  */
-function pollObservationsAndHold(sid: string, dispatchId: string, injectId: string): boolean {
+async function pollObservationsAndHold(sid: string, dispatchId: string, injectId: string): Promise<boolean> {
   const port = env.TELEPTY_PORT || "3848";
   let reason = "";
 
   if (!injectId || injectId === "null") {
     reason = "no_transport_inject_id";
   } else {
-    const r = capture(CURL, [
-      "-s", "-w", "\n%{http_code}",
-      "-H", `x-telepty-token: ${teleptyAuthToken()}`,
-      `http://127.0.0.1:${port}/api/inject-observations/${injectId}`,
-    ]);
-    if (r.status !== 0) {
+    const r = await requestTelepty({ trustedHome: os.userInfo().homedir },
+      { operation: "observe-inject", id: injectId, port: validatedTeleptyPort(port) });
+    if (r.transportCode !== "ok") {
       fs.appendFileSync(DISCONNECTED_LOG, `${nowIso()} OBSERVATION_POLL_SKIP sid=${sid} curl_failed\n`);
       reason = "observation_poll_failed";
     } else {
-      const resp = chomp(r.stdout);
-      const cut = resp.lastIndexOf("\n");
-      const http = cut >= 0 ? resp.slice(cut + 1) : resp;
-      const body = cut >= 0 ? resp.slice(0, cut) : resp;
+      const http = String(r.httpStatus);
+      const body = r.body;
       if (http === "401" || http === "403") {
         // A refusal is NOT an absence (#820/#823). Folding it into
         // `observation_endpoint_absent` would report "the endpoint is absent"
@@ -692,8 +687,10 @@ function pollObservationsAndHold(sid: string, dispatchId: string, injectId: stri
         // unauthenticated caller — the same overclaim-beyond-the-measurement
         // defect telepty#60 exists to remove.
         reason = "observation_poll_unauthorized";
-      } else if (http !== "200") {
+      } else if (http === "404") {
         reason = "observation_endpoint_absent";
+      } else if (http !== "200") {
+        reason = "observation_poll_failed";
       } else if (jsonGet(body, "schema_version") !== "2") {
         reason = "unknown_observation_schema";
       } else if (jsonGet(body, "tracking_state") === "unavailable") {
@@ -742,7 +739,7 @@ function pollObservationsAndHold(sid: string, dispatchId: string, injectId: stri
 }
 
 // ── subcommands ─────────────────────────────────────────────────────────────
-function cmdCheck(): void {
+async function cmdCheck(): Promise<void> {
   const now = nowIso();
   // Candidates: still-open dispatches whose expected_report_by has elapsed. A
   // corrupt/unavailable registry makes this call fail, and the tick stops before
@@ -800,7 +797,7 @@ function cmdCheck(): void {
     // welcome screen still need actuating, and none of them settles anything.
     let evidenceBlocked = false;
     let ledger = "available";
-    if (pollObservationsAndHold(sid, dispatchId, injectId)) {
+    if (await pollObservationsAndHold(sid, dispatchId, injectId)) {
       evidenceBlocked = true;
       ledger = "unavailable";
     }
@@ -1106,7 +1103,7 @@ function usage(stream: NodeJS.WriteStream): void {
   stream.write(USAGE + "\n");
 }
 
-function main(argv: string[]): void {
+async function main(argv: string[]): Promise<void> {
   if (argv.length === 0) {
     usage(process.stdout);
     process.exit(4);
@@ -1115,7 +1112,7 @@ function main(argv: string[]): void {
   const rest = argv.slice(1);
   switch (cmd) {
     case "check":
-      cmdCheck();
+      await cmdCheck();
       return;
     case "status":
       if (rest[0] === "--json") {
@@ -1130,9 +1127,7 @@ function main(argv: string[]): void {
     // #904 — the only async subcommand (atomicWrite is a promise). node keeps the
     // loop alive until it settles, so `void` here is the return, not a discard.
     case "report-sweep":
-      void cmdReportSweep(STATE_DIR, REPO_DIR, NOW_OVERRIDE, DISPATCH_REGISTRY_PY, rest[0] === "--json").then((rc) => {
-        if (rc !== 0) process.exit(rc);
-      });
+      process.exitCode = await cmdReportSweep(STATE_DIR, REPO_DIR, NOW_OVERRIDE, DISPATCH_REGISTRY_PY, rest[0] === "--json");
       return;
     case "report-pump":
       process.exitCode = cmdReportPump(rest);
@@ -1154,4 +1149,4 @@ function main(argv: string[]): void {
   }
 }
 
-main(process.argv.slice(2));
+await main(process.argv.slice(2));

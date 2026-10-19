@@ -75,6 +75,12 @@ import { fileURLToPath } from "node:url";
 import { LEGACY_CMUX_SPAWN } from "./legacy-spawn.js";
 import { USAGE } from "./usage.js";
 import { geminiBinary } from "../boot-adapter/gemini.js";
+import { readSandboxCurrent, readSealedManifest } from "../worker-sandbox.js";
+import { controllerContext, currentConfig } from "../../environment/grants.js";
+import { readBounded } from "../../environment/storage.js";
+import { strictJson } from "../../environment/contract.js";
+import { assertTrustedFile, assertTrustedTool, bindManagedTerminalTools, captureManagedRuntime, helperEnvironment,
+  pinTrustedFile, trustedTool, type ManagedTerminalTools, type TrustedRuntimeContext } from "../../environment/helper-env.js";
 
 const env = process.env;
 
@@ -92,6 +98,39 @@ const WH_CLI = path.join(SCRIPT_DIR, "wh-cli.sh");
 const PLATFORM_SH = path.join(SCRIPT_DIR, "lib/platform.sh");
 const HOME = env.HOME || "";
 const CONFIG_FILE = env.AIGENTRY_CONFIG || path.join(HOME, ".aigentry/config.json");
+let managedRuntime: TrustedRuntimeContext | undefined;
+let managedTools: ManagedTerminalTools | undefined;
+let adapterHandoffPossible = false;
+let managedFinalized = false;
+
+function finalizeManagedTools(): void {
+  if (!managedTools || managedFinalized) return;
+  managedFinalized = true;
+  try {
+    if (adapterHandoffPossible) managedTools.retireSource();
+    else managedTools.retireBeforeHandoff();
+  } catch {
+    try { process.stderr.write("ENV_HELPER_RETIRE_REFUSED\n"); }
+    catch { /* preserve the earlier failure */ }
+  }
+}
+
+function managedChild(cmd: string, args: string[]): string {
+  if (!managedRuntime) return cmd;
+  if (cmd === "telepty" || cmd === "bash") {
+    const actual = trustedTool(managedRuntime, cmd);
+    assertTrustedTool(managedRuntime, cmd, actual);
+    if (cmd === "telepty" && env.TELEPTY && env.TELEPTY !== actual) throw new Error("ENV_HELPER_PATH_REFUSED");
+    return actual;
+  }
+  if (!path.isAbsolute(cmd) || !cmd.endsWith(".sh")) throw new Error("ENV_HELPER_PATH_REFUSED");
+  pinTrustedFile(managedRuntime, "terminal", cmd);
+  assertTrustedFile(managedRuntime, "terminal", cmd);
+  const bash = trustedTool(managedRuntime, "bash");
+  assertTrustedTool(managedRuntime, "bash", bash);
+  args.unshift(cmd);
+  return bash;
+}
 
 // ── small process helpers (src/reconciler/cli.ts's, same shapes) ─────────────
 /** bash `$(cmd)`: command substitution strips every trailing newline. */
@@ -113,10 +152,17 @@ interface RunOpts {
 
 /** One spawn helper; each call site's redirections are the shell line's, verbatim. */
 function run(cmd: string, args: string[], opts: RunOpts = {}): { status: number; stdout: string } {
-  const r = spawnSync(cmd, args, {
+  managedTools?.assertDoors();
+  const actual = managedChild(cmd, args);
+  const terminal = cmd !== "telepty";
+  const childEnv = managedRuntime ? helperEnvironment(managedRuntime, terminal ? "terminal" : "control", env,
+    { ...(opts.env?.AIGENTRY_WORKSPACE_HOST ? { AIGENTRY_WORKSPACE_HOST: opts.env.AIGENTRY_WORKSPACE_HOST } : {}),
+      ...(terminal && managedTools ? { AIGENTRY_MANAGED_BIN_DIR: managedTools.directory } : {}) }) : opts.env ?? env;
+  if (terminal && managedTools) childEnv.PATH = managedTools.directory;
+  const r = spawnSync(actual, args, {
     encoding: "utf8",
     stdio: ["ignore", opts.out ?? "pipe", opts.err ?? "inherit"],
-    env: opts.env ?? env,
+    env: childEnv,
   });
   // bash prints "command not found"/"Permission denied" and yields 127/126; the
   // callers all treat any non-zero the same way, so one code is enough.
@@ -157,12 +203,29 @@ function jqField(file: string, keys: string[], alt: string): string {
 
 // ── the lib seams ───────────────────────────────────────────────────────────
 /** A bin/wh-cli.sh verb: 1:1 with the shell function this script used to source. */
+const MANAGED_WH_DISPATCH = `. "$1" || exit 78; . "$2" || exit 78; shift 2; verb="$1"; shift
+case "$verb" in
+  open) wh_open "$@" ;;
+  detect-terminal) detect_terminal "$@" ;;
+  agent-meta-caps) wh_agent_meta_caps "$@" ;;
+  set-status) wh_set_status "$@" ;;
+  *) exit 78 ;;
+esac`;
 function wh(args: string[], opts: RunOpts = {}): { status: number; stdout: string } {
+  if (managedTools) { managedTools.assertSource(); return run("bash", ["-c", MANAGED_WH_DISPATCH, "_", managedTools.platform,
+    managedTools.workspaceHost, ...args], opts);
+  }
   return run(WH_CLI, args, opts);
 }
 
 /** `platform::<fn>` from bin/lib/platform.sh, as a subprocess (src/reconciler/cli.ts's idiom). */
 function platform(fn: string, args: string[] = [], opts: RunOpts = {}): { status: number; stdout: string } {
+  if (managedTools) { managedTools.assertSource(); return run("bash", ["-c", `. "$1" || exit 78; shift; case "$1" in
+platform::session_pid) shift; platform::session_pid "$@" ;;
+platform::hold_awake) shift; platform::hold_awake "$@" ;;
+*) exit 78 ;;
+esac`, "_", managedTools.platform, fn, ...args], { err: "inherit", ...opts });
+  }
   return run("bash", ["-c", `. "$1"; ${fn} "\${@:3}"`, "_", PLATFORM_SH, "_", ...args], { err: "inherit", ...opts });
 }
 
@@ -178,6 +241,15 @@ let cwdOverride = "";
 let extraFlags = "";
 let sid = "";
 let autoCleanup = 0;
+let launchPolicy: "native-only" | "managed-secret" = "native-only";
+let managedManifest = "";
+let manifestSha256 = "";
+let explicitReceipt = "";
+const seenManagedSelectors = new Set<string>();
+function onceManagedSelector(flag: string): void {
+  if (seenManagedSelectors.has(flag)) { process.stderr.write("ENV_MANAGED_ROUTE_REFUSED\n"); process.exit(78); }
+  seenManagedSelectors.add(flag);
+}
 
 let ai = 0;
 /** bash `"$2"` under `set -u`: a flag with no value was a fatal, exit 1. */
@@ -224,6 +296,29 @@ while (ai < argv.length) {
     case "--auto-cleanup-on-exit":
       autoCleanup = 1;
       ai += 1;
+      break;
+    case "--launch-policy": {
+      onceManagedSelector(a);
+      const policy = flagValue(a);
+      if (policy !== "native-only" && policy !== "managed-secret") { process.stderr.write("ENV_MANAGED_ROUTE_REFUSED\n"); process.exit(78); }
+      launchPolicy = policy;
+      ai += 2;
+      break;
+    }
+    case "--managed-manifest":
+      onceManagedSelector(a);
+      managedManifest = flagValue(a);
+      ai += 2;
+      break;
+    case "--manifest-sha256":
+      onceManagedSelector(a);
+      manifestSha256 = flagValue(a);
+      ai += 2;
+      break;
+    case "--explicit-handoff-receipt":
+      onceManagedSelector(a);
+      explicitReceipt = flagValue(a);
+      ai += 2;
       break;
     case "-h":
     case "--help":
@@ -324,6 +419,56 @@ if (trustStatus !== "true" && cli === "claude") {
 
 const title = `${track}-${name}`;
 sid = title; // SID convention = title (track-name)
+if (launchPolicy === "managed-secret") {
+  try {
+    let managedHome: string;
+    if (explicitReceipt) {
+      if (managedManifest || manifestSha256 || !path.isAbsolute(explicitReceipt)) throw new Error("ENV_MANAGED_ROUTE_REFUSED");
+      const root = path.dirname(path.dirname(path.dirname(path.dirname(path.dirname(explicitReceipt)))));
+      const ctx = controllerContext(root), config = currentConfig(ctx);
+      const expected = path.join(ctx.home, "sessions", sid, "explicit-handoffs", path.basename(path.dirname(explicitReceipt)), "receipt.json");
+      const raw = readBounded(explicitReceipt), pointer = readBounded(path.join(ctx.home, "sessions", sid, "explicit-current.json"));
+      if (expected !== explicitReceipt || raw === null || pointer === null || Buffer.byteLength(raw) > 16 * 1024 ||
+          Buffer.byteLength(pointer) > 4096 || cli !== path.join(ctx.home, "sessions", sid, "boot", "launcher.sh")) throw new Error("ENV_MANAGED_ROUTE_REFUSED");
+      const r = strictJson(raw) as Record<string, unknown>, p = strictJson(pointer) as Record<string, unknown>;
+      if (r.version !== 2 || r.sid !== sid || r.controllerRootId !== ctx.rootId || r.authorityGeneration !== config.authorityGeneration ||
+          r.restart !== "never" || p.receipt !== explicitReceipt || p.attempt !== r.attempt) throw new Error("ENV_MANAGED_ROUTE_REFUSED");
+      managedHome = ctx.home;
+    } else {
+      if (!managedManifest || !manifestSha256) throw new Error("ENV_MANAGED_ROUTE_REFUSED");
+      const sealed = readSealedManifest(managedManifest, manifestSha256);
+      const current = readSandboxCurrent(sealed.stage);
+      if (sealed.m.version !== 2 || sealed.m.sid !== sid || current.manifest !== managedManifest || current.hash !== manifestSha256 ||
+          sealed.m.launchPolicy.restart !== "never" || cli !== path.join(sealed.root, "launcher.sh")) throw new Error("ENV_MANAGED_ROUTE_REFUSED");
+      managedHome = path.dirname(path.dirname(sealed.stage));
+    }
+    managedRuntime = captureManagedRuntime(env, path.join(managedHome, "environment"));
+    pinTrustedFile(managedRuntime, "terminal", cli);
+    assertTrustedFile(managedRuntime, "terminal", cli);
+    managedTools = bindManagedTerminalTools(managedRuntime, cli, SCRIPT_DIR,
+      path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", ".."));
+    if (env.CMUX && env.CMUX !== "cmux" && env.CMUX !== trustedTool(managedRuntime, "cmux")) {
+      throw new Error("ENV_HELPER_PATH_REFUSED");
+    }
+  } catch {
+    try { managedTools?.retireBeforeHandoff(); } catch { /* retain an unsafe tree */ }
+    process.stderr.write("ENV_MANAGED_ROUTE_REFUSED\n"); process.exit(78);
+  }
+} else if (managedManifest || manifestSha256 || explicitReceipt ||
+    (() => {
+      if (!path.isAbsolute(cli)) return false;
+      let resolved = cli;
+      try { resolved = fs.realpathSync(cli); } catch { /* refuse shaped path below */ }
+      const root = path.dirname(resolved), stage = path.dirname(path.dirname(root));
+      return path.basename(resolved) === "launcher.sh" && path.basename(root) !== "boot" &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(path.basename(root)) &&
+        path.basename(path.dirname(root)) === "sandbox" && path.basename(stage) === sid &&
+        path.basename(path.dirname(stage)) === "sessions";
+    })() ||
+    (path.isAbsolute(cli) && cli.endsWith("/boot/launcher.sh") &&
+      (() => { try { return fs.readFileSync(cli, "utf8").includes("--launch-explicit"); } catch { return false; } })())) {
+  process.stderr.write("ENV_MANAGED_ROUTE_REFUSED\n"); process.exit(78);
+}
 
 // CLI flags: --extra-flags arg > config > defaults
 if (!extraFlags && cliFlagsFromConfig) {
@@ -368,7 +513,8 @@ switch (cli) {
 // and they stay pre-trap here — a port that flushed a session-end journal for
 // `--track` typo would be inventing a lifecycle event.
 function cleanupOnExit(ec: number): never {
-  const ctxRouter = env.CTX_ROUTER_PATH || path.join(HOME, "projects/aigentry-devkit/bin/ctx-router.sh");
+  try {
+  const ctxRouter = (managedRuntime ? undefined : env.CTX_ROUTER_PATH) || path.join(HOME, "projects/aigentry-devkit/bin/ctx-router.sh");
   if (executable(ctxRouter) && sid) {
     run(ctxRouter, ["on-session-end", sid], { out: "ignore", err: "ignore" });
   } else if (sid) {
@@ -382,6 +528,7 @@ function cleanupOnExit(ec: number): never {
     const sc = path.join(INVOKED_DIR, "session-cleanup.sh");
     if (executable(sc)) run(sc, [sid], { out: "ignore", err: "ignore" });
   }
+  } finally { finalizeManagedTools(); }
   process.exit(ec);
 }
 
@@ -394,13 +541,19 @@ function cleanupOnExit(ec: number): never {
  * seam regresses (live daemon 3848 protection) — see ./legacy-spawn.ts.
  */
 function openInTerminal(): string {
+  if (managedRuntime) { assertTrustedFile(managedRuntime, "terminal", cli); managedTools?.assert(); }
   const term = chomp(wh(["detect-terminal"]).stdout);
-  const cliCmd = `${cli} ${extraFlags}`;
+  const cliCmd = `${managedTools ? shellQuote(managedTools.launcher) : cli} ${extraFlags}`;
 
   if (term === "cmux" && env.AIGENTRY_WH_LEGACY_SPAWN === "1") {
-    const r = spawnSync("bash", ["-c", LEGACY_CMUX_SPAWN, "_", cwd, sid, cliCmd, title], {
+    const legacyArgs = ["-c", LEGACY_CMUX_SPAWN, "_", cwd, sid, cliCmd, title, launchPolicy];
+    managedTools?.markHandoffPossible();
+    adapterHandoffPossible = true;
+    const r = spawnSync(managedChild("bash", legacyArgs), legacyArgs, {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "inherit"],
+      env: managedRuntime ? { ...helperEnvironment(managedRuntime, "terminal", env,
+        { AIGENTRY_MANAGED_BIN_DIR: managedTools!.directory }), PATH: managedTools!.directory } : env,
     });
     // The arm's own `exit 2` / `exit 3` (and `set -e`) are the shell's; they
     // reached the trap through the enclosing `ref=$(open_in_terminal)`, and they
@@ -415,7 +568,9 @@ function openInTerminal(): string {
   // which only auto-selects cmux/headless). Adapter exit codes propagate verbatim —
   // e.g. the cmux contract: 2 = spawn failure, 3 = ready-timeout with the workspace
   // closed, 64 = no such adapter.
-  const opened = wh(["open", sid, cwd, cliCmd], { env: { ...env, AIGENTRY_WORKSPACE_HOST: term } });
+  managedTools?.markHandoffPossible();
+  adapterHandoffPossible = true;
+  const opened = wh(["open", sid, cwd, cliCmd, launchPolicy], { env: { ...env, AIGENTRY_WORKSPACE_HOST: term } });
   if (opened.status !== 0) cleanupOnExit(opened.status);
   const ref = chomp(opened.stdout);
 
@@ -465,8 +620,16 @@ function teleptyConnection(forSid: string): "connected" | "disconnected" | "" {
 }
 
 // Spawn the session (the ref/sid is this process's sole stdout line)
-const ref = openInTerminal();
+let ref: string;
+try { ref = openInTerminal(); }
+catch (e) {
+  if (!managedRuntime) throw e;
+  finalizeManagedTools();
+  process.stderr.write("ENV_HELPER_PATH_REFUSED\n");
+  process.exit(78);
+}
 
+try {
 // Log
 const logFile = path.join(HOME, ".aigentry/open-session.log");
 fs.mkdirSync(path.dirname(logFile), { recursive: true });
@@ -492,3 +655,4 @@ if ((env.AIGENTRY_SLEEP_GUARD ?? "1") !== "0") {
 
 process.stdout.write(`${ref}\n`);
 cleanupOnExit(0);
+} finally { finalizeManagedTools(); }

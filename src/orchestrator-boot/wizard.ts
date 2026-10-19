@@ -52,6 +52,7 @@ import {
   validateSelector,
   validateSid,
 } from "./plan.js";
+import type { Resolution as EnvironmentResolution } from "../environment/resolve.js";
 import { CAPABILITIES, type ProviderCapability } from "./provider-capabilities.js";
 
 export type WizardOutcome =
@@ -70,6 +71,8 @@ export interface WizardIo {
   readonly input: NodeJS.ReadableStream;
   readonly env: Readonly<Record<string, string | undefined>>;
   readonly cwd: string;
+  /** Resolved suggestions, separate from invocation-owned plan intent. */
+  readonly defaults?: EnvironmentResolution;
   /** Task 1201: the review screen's READ-ONLY handoff scan, supplied by cli.ts (reading is not
    *  an effect). Absent = the review says the scan runs at boot. */
   readonly handoffPreview?: (plan: BootPlan) => HandoffPreview;
@@ -172,6 +175,14 @@ async function drive(
       `  ${NAV}\n`,
   );
 
+  const suggestion = (field: "model" | "effort"): string | undefined => {
+    if (!io.defaults) return io.env[`AIGENTRY_BOOT_${field.toUpperCase()}`];
+    const values = io.defaults.values;
+    // Generic boot hints apply to their suggested provider. After a provider
+    // switch, its own typed settings supply defaults; no foreign effort leaks.
+    const bootApplies = values["boot.cli"] === undefined || values["boot.cli"] === provider.key;
+    return (bootApplies ? values[`boot.${field}`] : undefined) ?? values[`${provider.key}.${field}`];
+  };
   let cursor: Cursor = "provider";
   for (;;) {
     if (cursor === "provider") {
@@ -234,7 +245,7 @@ async function drive(
     if (cursor === "model") {
       write("\n── 2. Model ────────────────────────────────────────────────────────\n");
       write(`   ${provider.model.flag} — ${provider.model.evidence}\n`);
-      write(`   Enter alone = provider default. ${provider.model.defaultNote}\n`);
+      write(`   Enter alone = the configured setting for this provider, otherwise provider default. ${provider.model.defaultNote}\n`);
       write("   No model catalogue is pinned in this wizard, so nothing here claims to be 'the latest'\n");
       write("   and nothing here can promise your account may use what you type — the provider answers\n");
       write("   that at boot. Shared fresh-model discovery is #1148's; this step will call it, not copy it.\n");
@@ -245,7 +256,9 @@ async function drive(
         continue;
       }
       if (a === "") {
-        model = { kind: "provider-default" };
+        const configured = validateModel(provider, suggestion("model"));
+        if (!configured.ok) return { kind: "cancelled", reason: "configured boot model refused for selected provider" };
+        model = configured.choice;
         cursor = "effort";
         continue;
       }
@@ -262,6 +275,7 @@ async function drive(
     if (cursor === "effort") {
       const cap = provider.effort;
       if (cap.kind === "unsupported" || cap.kind === "gap") {
+        if (suggestion("effort") !== undefined) return { kind: "cancelled", reason: "configured boot effort unsupported for selected provider" };
         // NOT shown as "default" — an absent capability and a defaulted one are different
         // facts, and this is the screen where conflating them would become a claim.
         write("\n── 3. Effort ───────────────────────────────────────────────────────\n");
@@ -289,7 +303,9 @@ async function drive(
         continue;
       }
       if (a === "") {
-        effort = { kind: "provider-default" };
+        const configured = validateEffort(provider, suggestion("effort"));
+        if (!configured.ok) return { kind: "cancelled", reason: "configured boot effort refused for selected provider" };
+        effort = configured.choice;
         cursor = "permission:0";
         continue;
       }

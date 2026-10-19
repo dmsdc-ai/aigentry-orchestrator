@@ -107,8 +107,12 @@ function fixture() {
     KILL_CMD: recorder('kill-recorder', 'kill'),
     TELEPTY: recorder('telepty-list-recorder', 'list',
       `try{process.stdout.write(fs.readFileSync(${JSON.stringify(path.join(dir, 'list.json'))}))}catch{}\n`),
-    CURL: recorder('curl-recorder', 'curl', `process.stdout.write('200');\n`),
+    // #1214: like real curl, stdin is read only when told to (`-H @-`) — the credential's channel.
+    CURL: recorder('curl-recorder', 'curl',
+      `if(process.argv.includes('@-'))fs.appendFileSync(${JSON.stringify(path.join(logs, 'curl-stdin.jsonl'))},JSON.stringify(fs.readFileSync(0,'utf8'))+'\\n');\n` +
+      `process.stdout.write('200');\n`),
   };
+  fs.writeFileSync(path.join(logs, 'curl-stdin.jsonl'), '');
   // The bridge the shim finally execs, resolved from PATH exactly as a real boot resolves
   // it. Its presence in the log is the ONLY evidence that a boot completed.
   recorder('telepty', 'exec');
@@ -152,6 +156,8 @@ function fixture() {
 
   return {
     dir, bin, logs, home, cwd, env, calls, kinds,
+    /** What each `-H @-` curl call read from stdin, in call order. */
+    curlStdin: () => calls('curl-stdin'),
     psTable: rows => fs.writeFileSync(path.join(dir, 'ps.txt'), rows.join('\n') + (rows.length ? '\n' : '')),
     listing: value => fs.writeFileSync(path.join(dir, 'list.json'), JSON.stringify(value)),
     /** Remove a provider from PATH, to drive the "missing binary" screen. */
@@ -197,6 +203,25 @@ const bootCmd = () => ['/bin/bash', SHIM];
 
 const argvLines = stdout => stdout.split('\n').filter(Boolean);
 
+// #1214: the registry DELETE goes through bin/lib/telepty-auth.sh `telepty_curl`, which APPENDS
+// `--connect-timeout 2 --max-time 5 -H @-` after the caller's args, so the URL is no longer argv's
+// last element. Parse the argv as curl does — these options take a value, and the one remaining
+// word is the URL — and pin the credential door on the way: header from stdin, never in argv.
+const CURL_VALUE_OPTS = new Set(['-o', '--output', '-w', '--write-out', '-X', '--request', '-H', '--header',
+  '-m', '--max-time', '--connect-timeout']);
+function curlUrl(argv) {
+  const urls = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (CURL_VALUE_OPTS.has(argv[i])) { i++; continue; }
+    if (!argv[i].startsWith('-')) urls.push(argv[i]);
+  }
+  assert.equal(urls.length, 1, `curl argv does not carry exactly one URL: ${JSON.stringify(argv)}`);
+  assert.ok(argv.some((a, i) => (a === '-H' || a === '--header') && argv[i + 1] === '@-'),
+    `curl was not told to read its header from stdin (-H @-): ${JSON.stringify(argv)}`);
+  assert.ok(!argv.some(a => /x-telepty-token/i.test(a)), `curl argv names the credential header: ${JSON.stringify(argv)}`);
+  return urls[0];
+}
+
 /**
  * "It did not boot" — asserted in a way that cannot pass vacuously.
  *
@@ -236,6 +261,59 @@ const CLAUDE_TO_REVIEW = [
 ];
 
 // ════════════════════════════════════════════════════════════════════════════
+// B1: persisted defaults are suggestions; fresh invocation fields retain their gate.
+test('central boot hints reach the bare terminal wizard and cancel without effects', () => {
+  for (const hints of [
+    { 'boot.model': 'central-model' }, { 'boot.effort': 'high' },
+    { 'boot.model': 'central-model', 'boot.effort': 'high' },
+  ]) {
+    const fx = fixture(), aig = fx.env.AIGENTRY_HOME;
+    fs.mkdirSync(path.join(aig, 'environment'), { recursive: true, mode: 0o700 });
+    const file = path.join(aig, 'environment/config.json');
+    const raw = JSON.stringify({ version: 1, revision: 0, selectedProfile: null,
+      settings: { 'boot.cli': 'claude', ...hints }, profiles: {}, projects: {} });
+    fs.writeFileSync(file, raw, { mode: 0o600 });
+    const r = pty(fx, { cmd: bootCmd(), steps: [...CLAUDE_TO_REVIEW, { expect: 'confirm [yes/NO]', send: 'q\n' }] });
+    assertDidNotBoot(r, 'central suggestions/cancel', { expectExit: 1 });
+    assert.match(r.terminal, /7\. Review/);
+    if (hints['boot.model']) assert.ok(r.terminal.includes('| central-model'));
+    if (hints['boot.effort']) assert.ok(r.terminal.includes('| high'));
+    fx.assertInert('central suggestions/cancel', { reads: true });
+    assert.equal(fs.readFileSync(file, 'utf8'), raw);
+    assert.deepEqual(fs.readdirSync(aig).sort(), ['environment']);
+    // Same bytes still refuse when supplied by the fresh caller, so provenance
+    // cannot be guessed by comparing values with persisted defaults.
+    const explicit = pty(fx, { cmd: bootCmd(), env: { AIGENTRY_BOOT_MODEL: 'central-model' }, steps: [] });
+    assertDidNotBoot(explicit, 'fresh plan field', { expectExit: 2 });
+    assert.match(explicit.terminal, /set without AIGENTRY_BOOT_PLAN=1/);
+    fx.assertInert('explicit refusal', { reads: true });
+    const piped = spawnSync(NODE, [path.join(DIST, 'cli.js')], { cwd: fx.cwd, env: fx.env, encoding: 'utf8' });
+    assert.equal(piped.status, 2); assert.equal(piped.stdout, '');
+    fx.assertInert('noninteractive defaults', { reads: true });
+  }
+});
+
+test('switching provider uses its own configured model without carrying another provider effort', () => {
+  const fx = fixture(), aig = fx.env.AIGENTRY_HOME;
+  fs.mkdirSync(path.join(aig, 'environment'), { recursive: true, mode: 0o700 });
+  const file = path.join(aig, 'environment/config.json');
+  const raw = JSON.stringify({ version: 1, revision: 0, selectedProfile: null,
+    settings: { 'boot.cli': 'claude', 'boot.model': 'claude-hint', 'boot.effort': 'high', 'codex.model': 'codex-hint' },
+    profiles: {}, projects: {} });
+  fs.writeFileSync(file, raw, { mode: 0o600 });
+  const r = pty(fx, { cmd: bootCmd(), steps: [
+    { expect: 'provider [1-', send: '2\n' }, { expect: 'model id', send: '\n' },
+    { expect: 'Enter to continue:', send: '\n' }, { expect: 'approval [1-', send: '\n' },
+    { expect: 'sandbox [1-', send: '\n' }, { expect: 'history [1-', send: '\n' },
+    { expect: 'session id [', send: '\n' }, { expect: 'confirm [yes/NO]', send: 'q\n' },
+  ] });
+  assertDidNotBoot(r, 'selected-provider defaults', { expectExit: 1 });
+  assert.ok(r.terminal.includes('| codex-hint')); assert.ok(!r.terminal.includes('| claude-hint'));
+  fx.assertInert('provider switch/cancel', { reads: true });
+  assert.equal(fs.readFileSync(file, 'utf8'), raw);
+});
+
+
 test('the wizard is the terminal door, and a typed YES is the only thing that boots', async t => {
 
   await t.test('a bare boot from a real terminal asks, then execs exactly what was agreed', () => {
@@ -603,8 +681,10 @@ test('the wizard chooses; the environment only suggests', async t => {
       [['allow', '--id', chosen, '--auto-restart', 'claude', '--permission-mode', 'manual']]);
     assert.deepEqual(fx.calls('kill'), [['-9', '4002']],
       `the SIGKILL did not target the chosen session's bridge only: ${JSON.stringify(fx.calls('kill'))}`);
-    const deletes = fx.calls('curl').map(a => a[a.length - 1]);
+    const deletes = fx.calls('curl').map(curlUrl);
     assert.deepEqual(deletes, [`http://127.0.0.1:3848/api/sessions/${chosen}`]);
+    // The closed HOME holds no telepty config, so no credential is presented on curl's stdin.
+    assert.deepEqual(fx.curlStdin(), ['']);
 
     // …and NOTHING landed on the inherited one. This is the r1 bug, stated as its own
     // assertion so a regression names itself.
@@ -646,8 +726,9 @@ test('the wizard chooses; the environment only suggests', async t => {
     assert.deepEqual(fx.calls('exec'),
       [['allow', '--id', 'planned-orch', '--auto-restart', 'claude', '--permission-mode', 'manual']]);
     assert.deepEqual(fx.calls('kill'), [['-9', '4002']]);
-    assert.deepEqual(fx.calls('curl').map(a => a[a.length - 1]),
+    assert.deepEqual(fx.calls('curl').map(curlUrl),
       ['http://127.0.0.1:3848/api/sessions/planned-orch']);
+    assert.deepEqual(fx.curlStdin(), [''], 'a credential was presented from a closed HOME');
   });
 
   await t.test('ORCHESTRATOR_CLI on a terminal is a printed hint, not a selection', () => {
@@ -1590,7 +1671,7 @@ test('shipping metadata declares the boot doc and the wizard suite', async t => 
 
   await t.test(`init's MANIFEST declares the two named docs/setup leaves`, () => {
     const under = manifest.MANIFEST.filter(p => p.startsWith('docs/setup/'));
-    assert.deepEqual(under, [DOC, REPORT_DOC]);
+    assert.deepEqual(under, ['docs/setup/environment.md', DOC, REPORT_DOC]);
     assert.ok(pkg.files.includes(REPORT_DOC));
     assert.ok(manifest.GOVERNANCE_ROOTS.includes(REPORT_DOC));
     // …and the governance root is the LEAF, not the directory. This is the composition
@@ -1604,7 +1685,7 @@ test('shipping metadata declares the boot doc and the wizard suite', async t => 
       'docs/setup/ is a governance root; the other docs/setup files package.json ships would then require MANIFEST entries');
     // The composition, stated as the arithmetic it is: the tarball ships other
     // docs/setup files, and none of them is under a governance root.
-    const otherSetupShipped = pkg.files.filter(f => f.startsWith('docs/setup/') && f !== DOC && f !== REPORT_DOC);
+    const otherSetupShipped = pkg.files.filter(f => f.startsWith('docs/setup/') && f !== DOC && f !== REPORT_DOC && f !== 'docs/setup/environment.md');
     assert.ok(otherSetupShipped.length > 0, 'fixture assumption changed: no other docs/setup file is shipped');
     for (const f of otherSetupShipped) {
       assert.ok(!manifest.GOVERNANCE_ROOTS.some(r => f === r || (r.endsWith('/') && f.startsWith(r))),

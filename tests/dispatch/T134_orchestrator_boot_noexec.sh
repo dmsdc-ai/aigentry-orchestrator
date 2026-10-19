@@ -111,8 +111,11 @@ done
 cp -R "$REPO_ROOT/dist/src/." "$BOOT_FIXTURE/dist/src/"
 printf '{"type":"module"}\n' > "$BOOT_FIXTURE/package.json"
 AUTH_LOG="$T_TMP/auth.log"
-printf 'telepty_auth_token() { printf "auth\\n" >> "%s"; printf "fixture-token-T134"; }\n' "$AUTH_LOG" \
-  > "$BOOT_FIXTURE/bin/lib/telepty-auth.sh"
+# #1214: the REAL lib, so its shared HTTP door (telepty_curl) is what runs, with only the
+# resolver replaced by the synthetic one — no host credential is ever read.
+{ cat "$REPO_ROOT/bin/lib/telepty-auth.sh"
+  printf 'telepty_auth_token() { printf "auth\\n" >> "%s"; printf "fixture-token-T134"; }\n' "$AUTH_LOG"
+} > "$BOOT_FIXTURE/bin/lib/telepty-auth.sh"
 BOOT="$BOOT_FIXTURE/bin/orchestrator-boot.sh"
 BOOT_CLI="$BOOT_FIXTURE/dist/src/orchestrator-boot/cli.js"
 chmod +x "$BOOT"
@@ -171,10 +174,13 @@ exit 0
 EOF
 
 CURL_LOG="$T_TMP/curl-calls.log"
+CURL_STDIN_LOG="$T_TMP/curl-stdin.log"
 CURL_STUB="$STUB_BIN/curl-recorder134.sh"
+# #1214: stdin is read only when told to (`-H @-`), as real curl does, and recorded.
 cat > "$CURL_STUB" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$CURL_LOG"
+for a in "\$@"; do [ "\$a" = "@-" ] && { cat >> "$CURL_STDIN_LOG"; break; }; done
 printf '200'
 exit 0
 EOF
@@ -202,7 +208,7 @@ export ORCHESTRATOR_SID="$SID"
 # <sid>` and never the tail, so no kill decision below changes.
 BRIDGE="node /Users/x/.nvm/versions/node/v20.20.0/bin/telepty allow --id $SID --auto-restart $PLAN_TAIL"
 
-reset() { : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$PS_ARGV"; : > "$TELEPTY_ARGV"; : > "$EXEC_LOG"; : > "$AUTH_LOG"; }
+reset() { : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$CURL_STDIN_LOG"; : > "$PS_ARGV"; : > "$TELEPTY_ARGV"; : > "$EXEC_LOG"; : > "$AUTH_LOG"; }
 # `grep -c .` prints the count and exits 1 on zero, so the status is swallowed rather
 # than answered with a second line (T131's idiom).
 lines() { grep -c . "$1" 2>/dev/null || true; }
@@ -355,7 +361,9 @@ EOF
 reset; stale_listing
 SINGLETON_SELF_PID=3333 node "$BOOT_CLI" >"$T_TMP/normal.out" 2>"$T_TMP/normal.err"
 grep -q -- '-X DELETE' "$CURL_LOG" || fail "D: normal boot did not DELETE the stale fixture"
-grep -q 'x-telepty-token: fixture-token-T134' "$CURL_LOG" || fail "D: synthetic auth missing"
+# #1214: the credential reaches curl on stdin (`-H @-`), never in its argv.
+grep -qx 'x-telepty-token: fixture-token-T134' "$CURL_STDIN_LOG" || fail "D: synthetic auth missing"
+grep -qiE 'x-telepty-token|fixture-token-T134' "$CURL_LOG" && fail "D: the credential is in curl's argv (#1214)"
 grep -q 'fixture-token-T134' "$T_TMP/normal.out" "$T_TMP/normal.err" && fail "D: token leaked"
 [ ! -s "$EXEC_LOG" ] || fail "D: compiled CLI exec'd a bridge"
 printf '%s\n' telepty allow --id "$SID" --auto-restart "${PLAN_TAIL_ARGV[@]}" \

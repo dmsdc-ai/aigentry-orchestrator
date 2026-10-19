@@ -61,6 +61,7 @@ sourceTestFiles.push('tests/bin/context-compact.test.mjs');
 sourceTestFiles.push('tests/report/mandatory-report-1170-security.test.mjs');
 // #1136 turn-end hook suite: H-01 pure association runs on every OS; the rest is skipped by name off POSIX.
 sourceTestFiles.push('tests/report/mandatory-report-1136-hook.test.mjs');
+sourceTestFiles.push('tests/dispatch/telepty-http-auth.test.mjs');
 // Native capture fixtures require POSIX ownership/modes; on native Windows init refuses native
 // capture with exit 2 (a 0.2.2 limitation), asserted in tests/packaging/init-platform.test.mjs.
 // The boot wizard suite drives an owned POSIX PTY.

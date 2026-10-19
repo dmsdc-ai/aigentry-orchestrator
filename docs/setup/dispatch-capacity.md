@@ -350,3 +350,9 @@ rotation or revocation caused earlier login losses has not been measured.
 - **The confined path never reads your login.** Dispatch's confined path does
   not read your own interactive login for a Claude worker. The legacy unconfined
   path is a different scope and is unchanged.
+
+### 0.3.0 delivery migration
+
+Fresh Claude credential selection retains explicit nonempty precedence and the checked fixed private store fallback. Empty environment input is absent; invalid explicit input refuses. Immediately before preparing a store-sourced launch, the selector rechecks the store. Explicit Codex and nonspawn/probe/help paths do not acquire Claude credentials.
+
+The reusable secret launcher behavior described for prior releases is superseded: new secret launches require current v2 configuration, enrollment and executable binding and use the existing single-use producers. Old v1 secret manifests and spent receipts refuse with migration/new-dispatch guidance. A new approved invocation creates a distinct grant; managed failures never retry acquisition, renew a grant, switch providers, copy host login, or restart automatically. Nonsecret legacy launch behavior remains.

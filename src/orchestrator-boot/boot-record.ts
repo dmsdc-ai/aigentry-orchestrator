@@ -152,7 +152,8 @@ function supported(p: BootRecordPlatform): Safe | null {
 
 /** Same rule as cli.ts validateCapture and boot-prepare: AIGENTRY_HOME if non-empty. */
 export function controllerRecordRoot(env: Readonly<Record<string, string | undefined>>): string {
-  return env.AIGENTRY_HOME || path.join(os.homedir(), ".aigentry");
+  if (env.AIGENTRY_HOME !== undefined && (!path.isAbsolute(env.AIGENTRY_HOME) || !env.AIGENTRY_HOME)) throw new Error("ENV_HOME_NOT_ABSOLUTE");
+  return env.AIGENTRY_HOME ?? path.join(os.homedir(), ".aigentry");
 }
 
 export function isSafeSid(sid: unknown): sid is string {

@@ -16,9 +16,7 @@ const posix = process.platform === "darwin" || process.platform === "linux";
 const posixTest = posix ? test : (() => undefined) as unknown as typeof test;
 // #1232 F8: obviously fake and prefix-free (no real token prefix), so it cannot look like a credential to a scanner.
 const FAKE_TOKEN = "FAKE-1232-caller-worker-token-NOT-A-SECRET";
-const REFUSAL = "dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_REQUIRED: confined Claude workers authenticate only with an " +
-  "approved automation token (claude setup-token) supplied as AIGENTRY_CLAUDE_OAUTH_TOKEN or in " +
-  "~/.aigentry/credentials/claude-worker/token; the host login is never copied; see docs/setup/dispatch-capacity.md; nothing was spawned (exit 78)";
+const REFUSAL = "dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_REQUIRED; nothing was spawned";
 
 // Host PATH minus every directory holding a claude/codex: the resolver must only ever see the fakes.
 function cleanHostPath(): string {
@@ -76,7 +74,8 @@ posixTest("#1232 caller: a FAKE opt-in reaches prepareWorkerSandbox; sealed hand
     const m = JSON.parse(raw) as Record<string, any>;
     assert.equal(m.cli, "claude");
     const handoff = join(dirname(current.manifest), "claude-oauth", "token");
-    assert.equal(m.claudeOAuthHandoff, handoff);
+    assert.equal(m.version, 2);
+    assert.equal(m.claudeOAuthHandoff, undefined);
     assert.equal(statSync(handoff).mode & 0o777, 0o600);
     assert.equal(readFileSync(handoff, "utf8").trim() === FAKE_TOKEN, true, "the handoff carries the opted-in token");
     assert.equal(existsSync(join(m.env.CLAUDE_CONFIG_DIR, ".credentials.json")), false, "the host login is never copied");
@@ -115,10 +114,12 @@ posixTest("#1232 caller: private store reaches handoff without exposing source p
     assert.equal(r.status, 0, r.stderr);
     const current = JSON.parse(readFileSync(join(f.aig, "sessions/router-fixture/sandbox-current.json"), "utf8"));
     const raw = readFileSync(current.manifest, "utf8"), m = JSON.parse(raw);
-    assert.equal(readFileSync(m.claudeOAuthHandoff, "utf8") === FAKE_TOKEN + "\n", true);
+    assert.equal(m.version, 2);
+    assert.equal(m.claudeOAuthHandoff, undefined);
+    assert.equal(readFileSync(join(dirname(current.manifest), "claude-oauth", "token"), "utf8") === FAKE_TOKEN + "\n", true);
     assert.equal(raw.includes(source), false);
     assert.equal(raw.includes(FAKE_TOKEN), false);
-    assert.deepEqual(files(f.root).filter(p => p !== source && p !== m.claudeOAuthHandoff &&
+    assert.deepEqual(files(f.root).filter(p => p !== source && p !== join(dirname(current.manifest), "claude-oauth", "token") &&
       readFileSync(p, "utf8").includes(FAKE_TOKEN)), []);
     assert.equal((r.stdout + r.stderr).includes(FAKE_TOKEN), false);
     assert.equal(existsSync(f.env.WORK_LOG!), false);
@@ -133,7 +134,7 @@ for (const kind of ["malformed file", "unsafe file", "invalid env"] as const) {
       if (kind === "unsafe file") chmodSync(file, 0o644);
       const r = spawnClaude(f, { AIGENTRY_CLAUDE_OAUTH_TOKEN: kind === "invalid env" ? FAKE_TOKEN + " invalid" : undefined });
       assert.equal(r.status, 78, r.stderr);
-      assert.match(r.stderr, /SANDBOX_AUTH_WORKER_TOKEN_INVALID/);
+      assert.match(r.stderr, /CLAUDE_OAUTH_(?:TOKEN|STORE)_INVALID/);
       assert.equal((r.stdout + r.stderr).includes(FAKE_TOKEN), false);
       for (const effect of [f.env.OPEN_LOG!, join(f.aig, "sessions"), join(f.aig, "role-sandbox"), f.env.AIGENTRY_GIT_HOOKS_DIR!]) {
         assert.equal(existsSync(effect), false);
@@ -171,11 +172,11 @@ test("#1232 routing: Linux store selection and missing/invalid sources never sil
   for (const state of ["valid", "missing", "invalid"] as const) {
     let selected = 0, stats = 0;
     const context = {
-      env: {}, process: { platform: "linux" }, CLAUDE_OAUTH_OPT_IN: "AIGENTRY_CLAUDE_OAUTH_TOKEN",
+      env: {}, activeInput: undefined, acquisitionKind: "absent", process: { platform: "linux" }, CLAUDE_OAUTH_OPT_IN: "AIGENTRY_CLAUDE_OAUTH_TOKEN",
       path: { join }, os: { homedir: () => "/synthetic-controller" },
       fs: { statSync: () => { stats++; throw new Error("NO_HOST_CREDENTIAL"); } },
-      selectedClaudeOAuthToken: () => { selected++; if (state === "invalid") throw new Error("CLAUDE_OAUTH_STORE_INVALID");
-        return state === "valid" ? "FAKE-1232-ROUTING" : undefined; },
+      acquireClaudeOAuthInput: () => { selected++; if (state === "invalid") throw new Error("CLAUDE_OAUTH_STORE_INVALID");
+        return state === "valid" ? { input: { dispose() {} }, kind: "store" } : { kind: "absent" }; },
       die: (message: string, code: number) => { throw Object.assign(new Error(message), { code }); },
     };
     const run = () => routingContext(predicate + ";credentialPresent('claude')", context);
@@ -199,13 +200,13 @@ posixTest("#1232 caller: automatic Claude routing uses only the private store", 
     const current = JSON.parse(readFileSync(join(f.aig, "sessions/router-fixture/sandbox-current.json"), "utf8"));
     const m = JSON.parse(readFileSync(current.manifest, "utf8"));
     assert.equal(m.cli, "claude");
-    assert.equal(readFileSync(m.claudeOAuthHandoff, "utf8") === FAKE_TOKEN + "\n", true);
+    assert.equal(readFileSync(join(dirname(current.manifest), "claude-oauth", "token"), "utf8") === FAKE_TOKEN + "\n", true);
     assert.doesNotMatch(r.stderr, /has no credential| -> /);
   } finally { f.cleanup(); }
 });
 
 const INVALID_REFUSAL = "dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_INVALID: invalid automation token or unsafe private token store; " +
-  "see docs/setup/dispatch-capacity.md; nothing was spawned (exit 78)";
+  "nothing was spawned";
 
 // The fixture owns this node shim. Mutate only after actual boot succeeds: dispatch's initial
 // auth precheck has passed, while prepareWorkerSandbox has not yet reread the store.
@@ -252,7 +253,8 @@ process.exit(r.status ?? 99);
         assert.doesNotMatch(r.stderr, /SANDBOX_AUTH_WORKER_TOKEN_(REQUIRED|INVALID)/);
       } else {
         assert.equal(r.status, 78, r.stderr);
-        assert.equal(r.stderr.trim(), kind === "missing" ? REFUSAL : INVALID_REFUSAL);
+        if (kind === "missing") assert.equal(r.stderr.trim(), REFUSAL);
+        else assert.match(r.stderr, /CLAUDE_OAUTH_STORE_INVALID/);
       }
     } finally { f.cleanup(); }
   });

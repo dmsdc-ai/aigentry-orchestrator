@@ -8,6 +8,7 @@ import {
   memoryBootFs,
   mockSpawner,
   type BootCommand,
+  type Spawner,
 } from "../../../src/session/boot-adapter/index.js";
 import { makeAdapter } from "../../../src/session/boot-adapter/common.js";
 import {
@@ -22,6 +23,9 @@ import { makeCtx, makeResolved, readyScript } from "./_fixtures.js";
 
 const KNOB = /^AIGENTRY_.*_(EFFORT|MODEL)$/;
 let saved: NodeJS.ProcessEnv;
+function resetKnobs(): void {
+  for (const k of Object.keys(process.env)) if (KNOB.test(k)) delete process.env[k];
+}
 beforeEach(() => {
   saved = {};
   for (const k of Object.keys(process.env)) {
@@ -29,7 +33,7 @@ beforeEach(() => {
   }
 });
 afterEach(() => {
-  for (const k of Object.keys(process.env)) if (KNOB.test(k)) delete process.env[k];
+  resetKnobs();
   Object.assign(process.env, saved);
 });
 
@@ -39,16 +43,27 @@ const UNKNOWN = { value: "unknown", source: "unknown" };
 const CLI_DEF = { value: "unknown", source: "cli-default" };
 
 type Door = "claude" | "codex" | "agy" | "gemini-cli" | "grok";
+const cliForDoor = (door: Door): CliKind => door === "claude" || door === "codex" || door === "grok" ? door : "gemini";
 const spawner = () => mockSpawner({
   claude: readyScript(), codex: readyScript(), gemini: readyScript("0.42.0"), grok: readyScript("0.2.93"),
   agy: { on_run: () => ({ stdout: "--model --dangerously-skip-permissions --prompt-interactive", stderr: "", exit_code: 0, duration_ms: 1 }) },
 });
-async function build(door: Door, env: Record<string, string> = {}): Promise<BootCommand> {
+async function build(door: Door, env: Record<string, string> = {}, suppliedSpawner: Spawner = spawner()): Promise<BootCommand> {
   Object.assign(process.env, env);
   const a = door === "agy" ? getBootAdapter("gemini", "agy")
     : door === "gemini-cli" ? getBootAdapter("gemini", "gemini")
     : getBootAdapter(door);
-  return a.buildBootCommand(makeCtx(), makeResolved(), { staging_dir: STAGING, fs: memoryBootFs(), spawner: spawner() });
+  return a.buildBootCommand(makeCtx(), makeResolved(), { staging_dir: STAGING, fs: memoryBootFs(), spawner: suppliedSpawner });
+}
+async function refusesBeforeSpawn(door: Door, env: Record<string, string>, message: string, code?: string): Promise<void> {
+  const supplied = spawner();
+  const effects = { run: 0, probe: 0 };
+  const observed: Spawner = {
+    async run(cmd, stdin, timeout_ms) { effects.run++; return supplied.run(cmd, stdin, timeout_ms); },
+    async probeVersion(executable) { effects.probe++; return supplied.probeVersion(executable); },
+  };
+  await assert.rejects(build(door, env, observed), code ? { name: "BootAdapterError", message, code } : { message });
+  assert.deepEqual(effects, { run: 0, probe: 0 }, `${door} ${JSON.stringify(env)} reached the supplied spawner`);
 }
 const lc = (cli: CliKind, model: object, effort: object) => ({ v: 2, cli, model, effort });
 
@@ -99,13 +114,13 @@ test("L2 claude configured: env values + env:<NAME> sources", async () => {
     { value: "claude-sonnet-5", source: "env:AIGENTRY_CLAUDE_MODEL" }, { value: "medium", source: "env:AIGENTRY_CLAUDE_EFFORT" }));
   assertAgreement("claude", cmd);
 });
-test("L3 claude empty env ⇒ default (existing || precedence)", async () => {
-  const cmd = await build("claude", { AIGENTRY_CLAUDE_MODEL: "", AIGENTRY_CLAUDE_EFFORT: "" });
-  assert.deepEqual([...cmd.argv].slice(3), ["--model", "claude-opus-5", "--effort", "xhigh"]);
-  assert.deepEqual(cmd.launch, lc("claude", { value: "claude-opus-5", source: "default" }, { value: "xhigh", source: "default" }));
+test("L3 claude empty model and effort each refuse before spawn", async () => {
+  await refusesBeforeSpawn("claude", { AIGENTRY_CLAUDE_MODEL: "" }, "ENV_INVALID_VALUE: claude.model");
+  resetKnobs();
+  await refusesBeforeSpawn("claude", { AIGENTRY_CLAUDE_EFFORT: "" }, "ENV_INVALID_VALUE: claude.effort");
 });
 
-test("L4 codex default / configured / empty", async () => {
+test("L4 codex default / configured / empty refusal", async () => {
   const d = await build("codex");
   assert.deepEqual([...d.argv], ["codex", "-m", "gpt-6-astra", "-c", "model_reasoning_effort=high",
     "-c", "check_for_update_on_startup=false", "--dangerously-bypass-approvals-and-sandbox"]);
@@ -117,9 +132,10 @@ test("L4 codex default / configured / empty", async () => {
   assert.deepEqual(c.launch, lc("codex",
     { value: "gpt-5.5", source: "env:AIGENTRY_CODEX_MODEL" }, { value: "xhigh", source: "env:AIGENTRY_CODEX_EFFORT" }));
   assertAgreement("codex", c);
-  const e = await build("codex", { AIGENTRY_CODEX_MODEL: "", AIGENTRY_CODEX_EFFORT: "" });
-  assert.deepEqual([...e.argv], [...d.argv]);
-  assert.deepEqual(e.launch, d.launch);
+  resetKnobs();
+  await refusesBeforeSpawn("codex", { AIGENTRY_CODEX_MODEL: "" }, "ENV_INVALID_VALUE: codex.model");
+  resetKnobs();
+  await refusesBeforeSpawn("codex", { AIGENTRY_CODEX_EFFORT: "" }, "ENV_INVALID_VALUE: codex.effort");
 });
 
 test("L5 agy default (no effort ⇒ cli-default, no --effort flag)", async () => {
@@ -135,25 +151,30 @@ test("L6 agy configured + opt-in effort ⇒ trailing --effort", async () => {
     { value: "gemini-3.8-pro", source: "env:AIGENTRY_GEMINI_MODEL" }, { value: "high", source: "env:AIGENTRY_GEMINI_EFFORT" }));
   assertAgreement("agy", cmd);
 });
-test("L7 agy empty opt-in effort ⇒ no flag, cli-default", async () => {
-  const cmd = await build("agy", { AIGENTRY_GEMINI_MODEL: "", AIGENTRY_GEMINI_EFFORT: "" });
-  assert.deepEqual([...cmd.argv], ["agy", "--model", "gemini-3.8-flash-high", "--dangerously-skip-permissions"]);
-  assert.deepEqual(cmd.launch, lc("gemini", { value: "gemini-3.8-flash-high", source: "default" }, CLI_DEF));
+test("L7 agy empty model and effort each refuse before spawn", async () => {
+  await refusesBeforeSpawn("agy", { AIGENTRY_GEMINI_MODEL: "" }, "ENV_INVALID_VALUE: gemini.model");
+  resetKnobs();
+  await refusesBeforeSpawn("agy", { AIGENTRY_GEMINI_EFFORT: "" }, "ENV_INVALID_VALUE: gemini.effort");
 });
 
-test("L8 gemini-cli default / configured; effort env never claimed (no flag exists)", async () => {
+test("L8 gemini-cli default / configured; explicit and empty effort refusal", async () => {
   const d = await build("gemini-cli");
   assert.deepEqual([...d.argv], ["gemini", "-m", "gemini-2.5-flash", "--approval-mode", "yolo", "--skip-trust"]);
   assert.deepEqual(d.launch, lc("gemini", { value: "gemini-2.5-flash", source: "default" }, CLI_DEF));
-  const c = await build("gemini-cli", { AIGENTRY_GEMINI_MODEL: "gemini-2.5-pro", AIGENTRY_GEMINI_EFFORT: "high" });
+  const c = await build("gemini-cli", { AIGENTRY_GEMINI_MODEL: "gemini-2.5-pro" });
   assert.deepEqual([...c.argv], ["gemini", "-m", "gemini-2.5-pro", "--approval-mode", "yolo", "--skip-trust"]);
   assert.deepEqual(c.launch, lc("gemini", { value: "gemini-2.5-pro", source: "env:AIGENTRY_GEMINI_MODEL" }, CLI_DEF));
   assertAgreement("gemini-cli", c);
-  const e = await build("gemini-cli", { AIGENTRY_GEMINI_MODEL: "" });
-  assert.deepEqual(e.launch, d.launch);
+  resetKnobs();
+  await refusesBeforeSpawn("gemini-cli", { AIGENTRY_GEMINI_EFFORT: "high" },
+    "UNSUPPORTED_CLI: gemini-cli has no effort flag", "UNSUPPORTED_CLI");
+  resetKnobs();
+  await refusesBeforeSpawn("gemini-cli", { AIGENTRY_GEMINI_MODEL: "" }, "ENV_INVALID_VALUE: gemini.model");
+  resetKnobs();
+  await refusesBeforeSpawn("gemini-cli", { AIGENTRY_GEMINI_EFFORT: "" }, "ENV_INVALID_VALUE: gemini.effort");
 });
 
-test("L9 grok default / configured + opt-in / empty", async () => {
+test("L9 grok default / configured + opt-in / empty refusal", async () => {
   const d = await build("grok");
   assert.deepEqual([...d.argv], ["grok", "--always-approve", "-m", "grok-4.6"]);
   assert.deepEqual(d.launch, lc("grok", { value: "grok-4.6", source: "default" }, CLI_DEF));
@@ -163,14 +184,15 @@ test("L9 grok default / configured + opt-in / empty", async () => {
   assert.deepEqual(c.launch, lc("grok",
     { value: "grok-5", source: "env:AIGENTRY_GROK_MODEL" }, { value: "low", source: "env:AIGENTRY_GROK_EFFORT" }));
   assertAgreement("grok", c);
-  const e = await build("grok", { AIGENTRY_GROK_MODEL: "", AIGENTRY_GROK_EFFORT: "" });
-  assert.deepEqual([...e.argv], [...d.argv]);
-  assert.deepEqual(e.launch, d.launch);
+  resetKnobs();
+  await refusesBeforeSpawn("grok", { AIGENTRY_GROK_MODEL: "" }, "ENV_INVALID_VALUE: grok.model");
+  resetKnobs();
+  await refusesBeforeSpawn("grok", { AIGENTRY_GROK_EFFORT: "" }, "ENV_INVALID_VALUE: grok.effort");
 });
 
-// ---- invalid labels: argv keeps the raw value, launch field becomes unknown ----
+// ---- invalid aliases refuse boot; untrusted metadata independently becomes unknown ----
 
-const BAD_MODELS = ["claude-opus-5[1m]", "a b", "x\ny", "m".repeat(97), "$(id)", "é"];
+const BAD_MODELS = ["a b", "x\ny", "m".repeat(201), "-m", ".m", "[m]", "$(id)", "é"];
 const BAD_EFFORTS = ["XHIGH", "hi gh", "e".repeat(25), "x;y"];
 const DOOR_ENV: Record<Door, { model: string; effort: string | null }> = {
   claude: { model: "AIGENTRY_CLAUDE_MODEL", effort: "AIGENTRY_CLAUDE_EFFORT" },
@@ -182,40 +204,49 @@ const DOOR_ENV: Record<Door, { model: string; effort: string | null }> = {
 const GOOD_EFFORT: Record<Door, string> = { claude: "high", codex: "high", agy: "high", "gemini-cli": "high", grok: "high" };
 
 for (const door of Object.keys(DOOR_ENV) as Door[]) {
-  test(`L10 ${door}: invalid model label ⇒ model unknown, argv raw, effort intact`, async () => {
+  test(`L10 ${door}: bracketed and max-length model retain argv and source`, async () => {
+    for (const model of ["claude-opus-5[1m]", "m".repeat(96), "m".repeat(97), `m${"x".repeat(199)}`]) {
+      const cmd = await build(door, { [DOOR_ENV[door].model]: model });
+      assert.equal(flagValue(cmd.argv, MODEL_FLAGS[door]), model);
+      assert.deepEqual(cmd.launch!.model, { value: model, source: `env:${DOOR_ENV[door].model}` });
+      assertAgreement(door, cmd);
+    }
+  });
+  test(`L10 ${door}: invalid model alias refuses; external model metadata unknown`, async () => {
     for (const bad of BAD_MODELS) {
-      for (const k of Object.keys(process.env)) if (KNOB.test(k)) delete process.env[k];
+      resetKnobs();
       const env: Record<string, string> = { [DOOR_ENV[door].model]: bad };
       if (DOOR_ENV[door].effort) env[DOOR_ENV[door].effort!] = GOOD_EFFORT[door];
-      const cmd = await build(door, env);
-      assert.equal(flagValue(cmd.argv, MODEL_FLAGS[door]), bad, "argv must carry the raw configured value");
-      assert.deepEqual(cmd.launch!.model, UNKNOWN, `model ${JSON.stringify(bad)} must be unknown`);
-      if (DOOR_ENV[door].effort) {
-        assert.deepEqual(cmd.launch!.effort, { value: "high", source: `env:${DOOR_ENV[door].effort}` });
-      } else {
-        assert.deepEqual(cmd.launch!.effort, CLI_DEF);
-      }
-      assertNoDupFlags(cmd.argv);
+      const cli = cliForDoor(door);
+      await refusesBeforeSpawn(door, env, `ENV_INVALID_VALUE: ${cli}.model`);
+      const validEffort = DOOR_ENV[door].effort
+        ? { value: "high", source: `env:${DOOR_ENV[door].effort}` } : CLI_DEF;
+      const normalized = normalizeLaunch(cli, lc(cli, { value: bad, source: `env:${DOOR_ENV[door].model}` }, validEffort));
+      assert.deepEqual(normalized.model, UNKNOWN, `external model ${JSON.stringify(bad)} must be unknown`);
+      assert.deepEqual(normalized.effort, validEffort, "valid sibling effort and source survive");
     }
   });
   if (DOOR_ENV[door].effort) {
-    test(`L11 ${door}: invalid effort label ⇒ effort unknown, argv raw, model intact`, async () => {
+    test(`L11 ${door}: invalid effort alias refuses; external effort metadata unknown`, async () => {
       for (const bad of BAD_EFFORTS) {
-        for (const k of Object.keys(process.env)) if (KNOB.test(k)) delete process.env[k];
-        const cmd = await build(door, { [DOOR_ENV[door].model]: "m-1", [DOOR_ENV[door].effort!]: bad });
-        assert.equal(flagValue(cmd.argv, EFFORT_FLAGS[door]), bad, "argv must carry the raw configured effort");
-        assert.deepEqual(cmd.launch!.effort, UNKNOWN);
-        assert.deepEqual(cmd.launch!.model, { value: "m-1", source: `env:${DOOR_ENV[door].model}` });
+        resetKnobs();
+        const cli = cliForDoor(door);
+        await refusesBeforeSpawn(door, { [DOOR_ENV[door].model]: "m-1", [DOOR_ENV[door].effort!]: bad },
+          `ENV_INVALID_VALUE: ${cli}.effort`);
+        const validModel = { value: "m-1", source: `env:${DOOR_ENV[door].model}` };
+        const normalized = normalizeLaunch(cli, lc(cli, validModel, { value: bad, source: `env:${DOOR_ENV[door].effort}` }));
+        assert.deepEqual(normalized.effort, UNKNOWN, `external effort ${JSON.stringify(bad)} must be unknown`);
+        assert.deepEqual(normalized.model, validModel, "valid sibling model and source survive");
       }
     });
   }
 }
 
-test("L12 label bounds: model 96 ok / 97 unknown; effort 24 ok / 25 unknown", () => {
-  const ok = normalizeLaunch("claude", lc("claude", { value: "m".repeat(96), source: "default" }, { value: "e".repeat(24), source: "default" }));
-  assert.equal(ok.model.value, "m".repeat(96));
+test("L12 label bounds: model 200 ok / 201 unknown; effort 24 ok / 25 unknown", () => {
+  const ok = normalizeLaunch("claude", lc("claude", { value: "m".repeat(200), source: "default" }, { value: "e".repeat(24), source: "default" }));
+  assert.equal(ok.model.value, "m".repeat(200));
   assert.equal(ok.effort.value, "e".repeat(24));
-  const over = normalizeLaunch("claude", lc("claude", { value: "m".repeat(97), source: "default" }, { value: "e".repeat(25), source: "default" }));
+  const over = normalizeLaunch("claude", lc("claude", { value: "m".repeat(201), source: "default" }, { value: "e".repeat(25), source: "default" }));
   assert.deepEqual(over.model, UNKNOWN);
   assert.deepEqual(over.effort, UNKNOWN);
 });

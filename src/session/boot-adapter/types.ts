@@ -66,6 +66,8 @@ export interface BuildOptions {
   staging_dir: string;
   fs: BootFS;
   spawner: Spawner;
+  /** Captured helper environment; managed callers supply their positive projection. */
+  environment?: NodeJS.ProcessEnv;
   // #1148 managed spawn: the resolver-bound executable replaces the `--version` /
   // capability probe (none is run) and becomes argv[0]; the decision's model/effort
   // are the only model flags. Both absent = legacy behaviour, unchanged.

@@ -167,8 +167,16 @@ import {
 import { runWizard } from "./wizard.js";
 // #1162 — the display-only controller boot record. Written once, from main() only.
 import { type PlanSource, controllerRecordRoot, writeControllerBootRecord } from "./boot-record.js";
+import { bootstrapEnvironment, invocationAssignments } from "../environment/bootstrap.js";
+import { teleptyChildEnv } from "../report/pump.js";
+import { requestTelepty, validatedTeleptyPort } from "../telepty/http.js";
 
-const env = process.env;
+const invocationEnv = { ...process.env };
+const central = (() => {
+  try { return bootstrapEnvironment(invocationEnv, { targetCwd: process.cwd(), role: "orchestrator" }); }
+  catch { process.stderr.write("[orchestrator-boot] ENV_CONFIGURATION_REFUSED\n"); process.exit(2); }
+})();
+const env = central.env;
 
 // ── the modes (#934) ────────────────────────────────────────────────────────
 // THE INCIDENT: on 2026-08-18 the orchestrator ran `bin/orchestrator-boot.sh --help |
@@ -226,7 +234,6 @@ const NO_EXEC = MODE === "help" || MODE === "dry-run" || MODE === "wizard-plan" 
 const SCRIPT_DIR =
   env.AIGENTRY_SHIM_SCRIPT_DIR ||
   path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "bin");
-const TELEPTY_AUTH_SH = path.join(SCRIPT_DIR, "lib/telepty-auth.sh");
 
 // Configurable orchestrator sid — same source as bin/dispatch-tracker.sh (Rule 16, no
 // hardcode). `:-` semantics: an EMPTY value falls back to the default, as in bash.
@@ -252,7 +259,6 @@ const SINGLETON_SELF_PID = env.SINGLETON_SELF_PID || String(process.pid);
 // Registry seams, named from the repo-wide env vars (bin/lib/telepty-listing.sh,
 // bin/session-reconciler.sh) so a caller sets what it already knows.
 const TELEPTY_CMD = env.TELEPTY || "telepty";
-const CURL_CMD = env.CURL || "curl";
 const TELEPTY_PORT = env.TELEPTY_PORT || "3848";
 
 // fs.writeSync rather than process.stdout.write: writes to a pipe are asynchronous in
@@ -304,11 +310,6 @@ function writeOut(fd: number, s: string): void {
   } catch (e) {
     if (!NO_EXEC || (e as NodeJS.ErrnoException)?.code !== "EPIPE") throw e;
   }
-}
-
-/** `$(...)`: strip ALL trailing newlines, as command substitution does. */
-function chomp(s: string): string {
-  return s.replace(/\n+$/, "");
 }
 
 // ── D1: the sid crosses back to the shim as text ────────────────────────────
@@ -365,9 +366,9 @@ if (MODE !== "help" && hasControlChar(ORCH_SID)) {
 // anything: ORCHESTRATOR_SID pre-fills a prompt the operator still presses Enter on, and
 // ORCHESTRATOR_CLI is displayed as a hint next to a list the operator still chooses from.
 const PLAN_FIELDS = [PLAN_ENV.model, PLAN_ENV.effort, PLAN_ENV.permission, PLAN_ENV.history, PLAN_ENV.ack] as const;
-const PLAN_FLAG = env.AIGENTRY_BOOT_PLAN;
+const PLAN_FLAG = invocationEnv.AIGENTRY_BOOT_PLAN;
 const PLAN_FIELD_SET = PLAN_FIELDS.filter((name) => {
-  const v = env[name];
+  const v = invocationEnv[name];
   return v !== undefined && v !== "";
 });
 // Unknown/multiple modes refuse: the ONLY accepted value is "1". A caller that wrote
@@ -568,13 +569,6 @@ function jqToString(v: unknown): string {
  * identical to src/cleanup/cli.ts:129 and src/tracker/cli.ts. Degrades to "" (no
  * credential presented) exactly as the lib does, and the value is never logged.
  */
-function teleptyAuthToken(): string {
-  const r = spawnSync("bash", ["-c", '. "$1"; telepty_auth_token', "_", TELEPTY_AUTH_SH], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-  return chomp(r.stdout || "");
-}
 
 /**
  * `orchestrator_registry_reconcile()` (bash :141-189) — delete the daemon's record for
@@ -595,8 +589,9 @@ function teleptyAuthToken(): string {
  * place on purpose, because an unrecognised listing shape is an UNKNOWN and an unknown
  * must never authorise a DELETE aimed at the orchestrator's own id (#835).
  */
-function orchestratorRegistryReconcile(sid: string): void {
+async function orchestratorRegistryReconcile(sid: string): Promise<void> {
   const r = spawnSync(TELEPTY_CMD, ["list", "--json"], {
+    timeout: 7000, killSignal: "SIGKILL", env: teleptyChildEnv(env),
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],
   });
@@ -676,23 +671,9 @@ function orchestratorRegistryReconcile(sid: string): void {
     );
     return;
   }
-  const c = spawnSync(
-    CURL_CMD,
-    [
-      "-s",
-      "-o",
-      "/dev/null",
-      "-w",
-      "%{http_code}",
-      "-H",
-      `x-telepty-token: ${teleptyAuthToken()}`,
-      "-X",
-      "DELETE",
-      `http://127.0.0.1:${TELEPTY_PORT}/api/sessions/${sid}`,
-    ],
-    { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-  );
-  const http = chomp(c.stdout || "");
+  const result = await requestTelepty({ trustedHome: os.userInfo().homedir },
+    { operation: "delete-session", id: sid, port: validatedTeleptyPort(TELEPTY_PORT), discardBody: true });
+  const http = result.transportCode === "000" ? "000" : String(result.httpStatus);
   if (http === "200") {
     log(`DELETE /api/sessions/${sid} → 200 (stale record removed; the id is claimable)`);
   } else if (http === "404") {
@@ -951,7 +932,7 @@ async function resolveForBoot(): Promise<Resolution> {
     reviewedHandoff = handoffStep(engine, plan, randomUUID(), false);
     return previewOf(reviewedHandoff);
   };
-  const outcome = await runWizard({ out: process.stderr, input: process.stdin, env, cwd: process.cwd(), handoffPreview });
+  const outcome = await runWizard({ out: process.stderr, input: process.stdin, env, defaults: central.resolution, cwd: process.cwd(), handoffPreview });
   if (outcome.kind === "cancelled") {
     writeOut(2, `[orchestrator-boot] ${outcome.reason} — nothing was listed, deleted, signalled or exec'd.\n`);
     // 1, not 2: this is the operator's own decision, not a refusal of bad input. Either way
@@ -1029,13 +1010,14 @@ async function validateCapture(cli: string): Promise<void> {
  * Task 1201 adds the context handoff between the guard and the boot record; it never blocks.
  */
 async function main(): Promise<never> {
+  writeOut(2, `[orchestrator-boot] environment: ${JSON.stringify(central.awareness)}\n`);
   const resolved = await resolveForBoot();
   await validateCapture(resolved.cli);
   // The RESOLVED sid, not the environment's: the wizard may have been given another one, and
   // a DELETE or a SIGKILL aimed at the env's id would hit a session this boot is not about to
   // become. In an explicit plan the two are the same value by construction, because
   // ORCHESTRATOR_SID *is* the plan's sid field.
-  orchestratorRegistryReconcile(resolved.sid);
+  await orchestratorRegistryReconcile(resolved.sid);
   orchestratorSingletonGuard(resolved.sid);
   // Task 1201 — the context handoff, after the guard. One boot id is shared by the handoff
   // record (latest.json) and the boot record below.
@@ -1066,7 +1048,12 @@ async function main(): Promise<never> {
   }
   writeOut(2, `[orchestrator-boot] boot record: ${bootRecord}\n`);
   log(`exec ${argv.join(" ")}`);
-  emitExecArgv(argv);
+  const assignments = invocationAssignments(env).filter((v) => {
+    const at = v.indexOf("="), key = v.slice(0, at);
+    return process.env[key] !== v.slice(at + 1) && key !== "AIGENTRY_HOME" &&
+      !(key === "ORCHESTRATOR_SID" && central.resolution.provenance["boot.sid"] === "default");
+  });
+  emitExecArgv(assignments.length ? ["env", ...assignments, ...argv] : argv);
   process.exit(0);
 }
 
@@ -1107,7 +1094,7 @@ async function dryRun(): Promise<never> {
       "this terminal WOULD get the interactive wizard on a bare 'bin/orchestrator-boot.sh'; " +
         "--dry-run deliberately does not prompt, so what it reports is the plan this environment states",
     );
-  orchestratorRegistryReconcile(resolved.sid);
+  await orchestratorRegistryReconcile(resolved.sid);
   orchestratorSingletonGuard(resolved.sid);
   // Task 1201 §6.3 — the same handoff step with write:false. Nothing is written; the composed
   // handoff is shown under [would-handoff] and its delivery tokens are in the [would-exec] lines.
@@ -1136,7 +1123,7 @@ async function wizardPlan(): Promise<never> {
     writeOut(2, "orchestrator-boot.sh: --wizard-plan needs a terminal on stdin and stderr; there is nothing to collect a plan from here\n");
     process.exit(2);
   }
-  const outcome = await runWizard({ out: process.stderr, input: process.stdin, env, cwd: process.cwd() });
+  const outcome = await runWizard({ out: process.stderr, input: process.stdin, env, defaults: central.resolution, cwd: process.cwd() });
   if (outcome.kind === "cancelled") {
     writeOut(2, `[orchestrator-boot] ${outcome.reason} — no plan was printed and nothing was acted on.\n`);
     process.exit(1);
@@ -1185,7 +1172,7 @@ async function probe(argv: string[]): Promise<never> {
     process.exit(0);
   }
   if (sub === "registry-reconcile") {
-    orchestratorRegistryReconcile(resolved.sid);
+    await orchestratorRegistryReconcile(resolved.sid);
     process.exit(0);
   }
   if (sub === "exec-argv") {

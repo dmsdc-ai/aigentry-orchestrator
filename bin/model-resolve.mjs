@@ -39,11 +39,6 @@ const TASK = /^[\x21-\x7e]{1,128}$/;
 const VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 const LIFECYCLES = ["current", "legacy", "deprecated", "retired"];
-const FAMILY_PREFIX = /^[\x20-\x7e]{1,200}$/;
-const CATALOG_FIELDS = new Set(["schema", "as_of", "status", "evidence", "cli", "surfaces",
-  "known_incompatibilities", "classifier"]);
-const CLI_POLICY_FIELDS = new Set(["provider", "surface", "effort_channel", "effort_band",
-  "effort_band_source", "auto_effort_never", "policy_incumbent", "family_prefixes"]);
 // The executable surface a negative observation must name to affect this CLI's tuple.
 // Public catalog surface ids (anthropic-models, …) are documentation, not execution surfaces.
 export const EXECUTION_SURFACE = Object.freeze({ claude: "claude-code", codex: "codex-cli" });
@@ -95,31 +90,11 @@ function validRow(r) {
 /** Structural check of docs/model-profiles/model-catalog.json. Returns the catalog or throws. */
 export function validateCatalog(c) {
   const bad = (what) => { throw new Error(`MODEL_CATALOG_INVALID: ${what}`); };
-  if (!c || typeof c !== "object" || Array.isArray(c)) bad("header");
-  if (c.schema !== "aigentry-model-catalog/2") bad("schema: migrate catalog/1 and family_pattern to catalog/2 family_prefixes literal {prefix,tier} mappings");
-  if (!DATE.test(c.as_of)) bad("header");
-  if (Object.keys(c).some((key) => !CATALOG_FIELDS.has(key)) || !c.cli || typeof c.cli !== "object" ||
-    Array.isArray(c.cli) || Object.keys(c.cli).some((key) => key !== "claude" && key !== "codex")) bad("fields");
+  if (!c || typeof c !== "object" || c.schema !== "aigentry-model-catalog/1" || !DATE.test(c.as_of)) bad("header");
   for (const cli of ["claude", "codex"]) {
     const p = own(c.cli, cli);
     if (!p || !isToken(p.provider) || !isToken(p.surface) || prototypeKey(p.surface) || !own(c.surfaces, p.surface) ||
       !isToken(p.policy_incumbent)) bad(cli);
-    if (Object.keys(p).some((key) => !CLI_POLICY_FIELDS.has(key))) bad(`${cli}: unsupported field; migrate family_pattern to family_prefixes literal mappings`);
-    const prefixes = own(p, "family_prefixes");
-    if (prefixes !== null && (!Array.isArray(prefixes) || prefixes.length > 32)) bad(`${cli}.family_prefixes`);
-    if (Array.isArray(prefixes)) {
-      const seen = [];
-      for (const entry of prefixes) {
-        if (!entry || typeof entry !== "object" || Array.isArray(entry) ||
-          Object.keys(entry).length !== 2 || !Object.hasOwn(entry, "prefix") || !Object.hasOwn(entry, "tier") ||
-          typeof entry.prefix !== "string" || !FAMILY_PREFIX.test(entry.prefix) || entry.prefix.trim() !== entry.prefix ||
-          !isToken(entry.tier)) bad(`${cli}.family_prefixes entry: expected literal {prefix,tier}`);
-        if (seen.some((prefix) => prefix.startsWith(entry.prefix) || entry.prefix.startsWith(prefix))) {
-          bad(`${cli}.family_prefixes duplicate or overlapping prefix`);
-        }
-        seen.push(entry.prefix);
-      }
-    }
     if (p.effort_band !== null && !(Array.isArray(p.effort_band) && p.effort_band.every(isToken))) bad(`${cli}.effort_band`);
     if (!Array.isArray(p.auto_effort_never) || !p.auto_effort_never.every(isToken)) bad(`${cli}.auto_effort_never`);
     const rows = own(c.surfaces, p.surface).rows;
@@ -183,8 +158,8 @@ export function resolveSpawnDecision(input) {
   const freshRow = (m) => freshRows.find((r) => r.model === modelKey(m));
   const factRow = (m) => (fresh ? freshRow(m) : bootRow(m));
   const factSource = fresh ? `fresh ${policy.surface}` : `bootstrap ${catalog.as_of}`;
-  const tierOf = (m) => factRow(m)?.tier ?? bootRow(m)?.tier ??
-    (policy.family_prefixes?.find(({ prefix }) => modelKey(m).startsWith(prefix))?.tier ?? null);
+  const familyPattern = typeof policy.family_pattern === "string" ? new RegExp(policy.family_pattern) : null;
+  const tierOf = (m) => factRow(m)?.tier ?? bootRow(m)?.tier ?? (familyPattern?.exec(modelKey(m))?.[1] ?? null);
   // Documented retirement is a hard gate from every source, fresh or not.
   const retired = (m) => [bootRow(m), freshRow(m)].some((r) => r && (r.lifecycle === "retired" ||
     (r.retire_on && r.retire_on <= today)));
@@ -320,8 +295,8 @@ export function resolveSpawnDecision(input) {
     else if (policyEffort !== undefined) requested.effort = policyEffort;
     if (request.executable) requested.executable = request.executable.path;
     const sources = [request.model?.source, request.effort?.source, request.executable?.source].filter(Boolean);
-    requested.source = sources.includes("flag") ? "flag" : sources.includes("env") ? "env"
-      : route ? "role-config" : input.explicitCli ? "flag" : "none";
+    requested.source = ["flag", "env", "project", "profile", "settings", "role-config"].find((s) => sources.includes(s))
+      ?? (route ? "role-config" : input.explicitCli ? "flag" : "none");
     const label = fresh ? `current-as-of-${surface.fetched_at}` : `degraded:${policy.surface}:${surface?.result ?? "absent"}`;
     const parts = [
       explicitModel !== undefined ? `explicit model ${explicitModel} kept verbatim (${request.model.source})`

@@ -317,7 +317,7 @@ function protectedEntry(entry) {
   return entry.kind !== "package" ||
     (entry.root === "workspace" && (file === "state" || file.startsWith("state/") ||
       file === ".git" || file.startsWith(".git/"))) ||
-    (entry.root === "home" && (file === "config.json" || file === "instructions/projects" ||
+    (entry.root === "home" && (file === "config.json" || file === "environment" || file.startsWith("environment/") || file === "instructions/projects" ||
       file.startsWith("instructions/projects/")));
 }
 function normalizedInput(input) {

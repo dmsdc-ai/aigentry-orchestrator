@@ -6,7 +6,7 @@
 // prevent caller input drift / tampering.
 // OQ1: missing layer = graceful skip (digest still deterministic); required-layer
 // enforcement is the spawn gate's job (ADR §6 #15), not this module's.
-import * as os from "node:os";
+import { environmentHome } from "../environment/storage.js";
 import * as path from "node:path";
 import type { LayerKind, LayerMeta, Role } from "./types.js";
 import {
@@ -46,11 +46,7 @@ export interface ResolvedInstructions {
 }
 
 function defaultRoot(): string {
-  const envHome = process.env["AIGENTRY_HOME"];
-  if (envHome && envHome.length > 0) {
-    return path.join(envHome, "instructions");
-  }
-  return path.join(os.homedir(), ".aigentry", "instructions");
+  return path.join(environmentHome(), "instructions");
 }
 
 interface Normalized {

@@ -37,7 +37,7 @@ export function codexAdapter() {
     contextFile: CODEX_CONTEXT_FILE,
     homeEnv: CODEX_HOME_ENV,
     homeExclude: CODEX_HOME_EXCLUDE,
-    buildArgvEnv: ({ decision }) => {
+    buildArgvEnv: ({ decision, environment }) => {
       // #1148: a resolver decision carries the exact model/effort; null omits the flag and
       // no env or literal default is consulted.
       if (decision) {
@@ -48,8 +48,8 @@ export function codexAdapter() {
           launch: decisionLaunch(decision),
         };
       }
-      const model = envOrDefault(process.env, "AIGENTRY_CODEX_MODEL", "gpt-6-astra");
-      const effort = envOrDefault(process.env, "AIGENTRY_CODEX_EFFORT", "high");
+      const model = envOrDefault(environment, "AIGENTRY_CODEX_MODEL", "gpt-6-astra");
+      const effort = envOrDefault(environment, "AIGENTRY_CODEX_EFFORT", "high");
       return {
         argv: [
           "codex",

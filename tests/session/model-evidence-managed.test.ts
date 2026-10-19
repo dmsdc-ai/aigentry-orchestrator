@@ -7,7 +7,7 @@
 // any real socket attempt is recorded and fails the run.
 import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
 import { syncBuiltinESMExports } from "node:module";
@@ -230,7 +230,7 @@ describe("U1 resolver with fake fresh metadata (selection semantics, delta §5)"
   before(() => {
     dir = realpathSync(mkdtempSync(join(tmpdir(), "model-evidence-1148-")));
     mkdirSync(join(dir, "bin"));
-    writeFileSync(join(dir, "bin/claude"), "#!/bin/sh\nexit 99\n", { mode: 0o755 });
+    writeFileSync(join(dir, "bin/claude"), `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(join(dir, "provider-launched"))}, 'launch'); process.exit(99);\n`, { mode: 0o755 });
   });
   after(() => rmSync(dir, { recursive: true, force: true }));
   const NOW = () => new Date("2026-10-05T00:00:00.000Z");
@@ -277,8 +277,42 @@ describe("U1 resolver with fake fresh metadata (selection semantics, delta §5)"
     assert.equal(out.decision.model, "claude-opus-5-5");
   });
 
-  for (const [name, env] of [["metadata off", { AIGENTRY_MODEL_METADATA: "off" }], ["unlimited budget", { AIGENTRY_CATALOG_REVALIDATE_MS: "unlimited" }],
-    ["NaN budget", { AIGENTRY_CATALOG_MAX_BYTES: "NaN" }], ["proxy configured", { HTTPS_PROXY: "http://127.0.0.1:9" }]] as const) {
+  for (const [name, env] of [["unlimited budget", { AIGENTRY_CATALOG_REVALIDATE_MS: "unlimited" }],
+    ["NaN budget", { AIGENTRY_CATALOG_MAX_BYTES: "NaN" }]] as const) {
+    test(`${name} → structured configuration refusal before transport or launch`, async () => {
+      const home = mkdtempSync(join(dir, "invalid-budget-"));
+      const legacy = join(home, "config.json"), launch = join(dir, "provider-launched");
+      const supplied = { AIGENTRY_HOME: home, ...env }, invocationBefore = { ...supplied };
+      writeFileSync(legacy, '{"foreign":{"budget-fixture":"unchanged"}}\n', { mode: 0o600 });
+      const bytesBefore = readFileSync(legacy), identityBefore = statSync(legacy);
+      const homeBefore = readdirSync(home).sort(), rootBefore = readdirSync(dir).sort(), networkBefore = [...netAttempts];
+      assert.equal(existsSync(launch), false, "provider tripwire starts absent");
+      assert.equal(existsSync(join(home, "environment")), false, "central state starts absent");
+      try {
+        const { code, out, calls } = await resolveWith(anthropicPage([["claude-opus-5-5", "medium"]]), {
+          env: supplied, transport: async () => assert.fail("invalid explicit budget must refuse before transport"),
+        });
+        assert.equal(code, 4, show(out));
+        assert.equal(out.refusal?.code, "ENV_CONFIGURATION_REFUSED", show(out));
+        assert.ok(typeof out.refusal.reason === "string" && out.refusal.reason.length > 0, show(out));
+        assert.equal(Object.hasOwn(out, "decision"), false, "refusal must not include a successful decision");
+        assert.deepEqual(calls, [], "injected transport was never called");
+        assert.deepEqual(netAttempts, networkBefore, "no real network attempt");
+        assert.equal(existsSync(launch), false, "fake provider was never launched, including probes");
+        assert.deepEqual(supplied, invocationBefore, "explicit invalid setting remains unchanged");
+        assert.deepEqual(readFileSync(legacy), bytesBefore, "legacy input bytes remain unchanged");
+        const identityAfter = statSync(legacy);
+        assert.deepEqual([identityAfter.dev, identityAfter.ino, identityAfter.size, identityAfter.mtimeMs, identityAfter.mode],
+          [identityBefore.dev, identityBefore.ino, identityBefore.size, identityBefore.mtimeMs, identityBefore.mode], "legacy input was not rewritten");
+        assert.deepEqual(readdirSync(home).sort(), homeBefore, "no central config, lock or staging path created");
+        assert.deepEqual(readdirSync(dir).sort(), rootBefore, "no launch or worker artifact created");
+        assert.equal(existsSync(join(home, "environment")), false);
+      } finally { rmSync(home, { recursive: true, force: true }); }
+    });
+  }
+
+  for (const [name, env] of [["metadata off", { AIGENTRY_MODEL_METADATA: "off" }],
+    ["proxy configured", { HTTPS_PROXY: "http://127.0.0.1:9" }]] as const) {
     test(`${name} → no fetch, degraded label, incumbent kept`, async () => {
       const transport: Transport | "real" = name === "proxy configured" ? "real" : async () => assert.fail("transport must not be called");
       const { code, out, calls } = await resolveWith(anthropicPage([["claude-opus-5-5", "medium"]]), { env, transport });

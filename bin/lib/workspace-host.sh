@@ -80,6 +80,17 @@ WORKSPACE_HOST_SH_LOADED=1
 # tees its own `log`; the adapter only emits to stderr so it never blocks a sweep.
 _wh_log() { echo "[workspace-host] $*" >&2; }
 
+# In managed opens the caller created these doors from the pinned runtime context.
+# Each door checks the selected source identity again when it is actually invoked.
+_wh_bound_bin() {
+  local name="$1"
+  if [ -z "${AIGENTRY_MANAGED_BIN_DIR:-}" ]; then printf '%s\n' "$name"; return 0; fi
+  [ -x "$AIGENTRY_MANAGED_BIN_DIR/$name" ] && [ ! -L "$AIGENTRY_MANAGED_BIN_DIR/$name" ] || {
+    echo "ENV_HELPER_PATH_REFUSED" >&2; return 78;
+  }
+  printf '%s\n' "$AIGENTRY_MANAGED_BIN_DIR/$name"
+}
+
 # _wh_fail_category <text> — map a host tool's failure output to ONE generated
 # token from a CLOSED vocabulary. #1162: a diagnostic must never carry an excerpt
 # of host output (arbitrary terminal text: pane content, credentials, control
@@ -241,6 +252,7 @@ _wh_cmux_set_status() {
   # cmux daemon 3848 under test (open-session.sh prepends the real cmux to PATH, so a
   # bare `cmux` here would escape the stub). Defaults to the real `cmux` in production.
   local host_id="$1" state="$2" icon color cmux_bin="${CMUX:-cmux}"
+  if [ -n "${AIGENTRY_MANAGED_BIN_DIR:-}" ]; then cmux_bin=$(_wh_bound_bin cmux) || return 78; fi
   [ -z "$host_id" ] && return 0
   command -v "$cmux_bin" >/dev/null 2>&1 || return 0
   case "$state" in
@@ -423,7 +435,8 @@ _wh_cmux_wait_ready() {
 # from open-session.sh:open_in_terminal()'s cmux branch (#608 Phase 1, ADR §7).
 # Exit contract (handle emitted ⇒ pane ready; no half-spawned surface on failure):
 #   0  → ref printed on stdout (surface can accept send-key).
-#   2  → new-workspace produced no ref (spawn failed); nothing to clean up.
+#   2  → new-workspace produced no ref (spawn failed), or cmux lacks
+#        `new-workspace --focus` (CMUX_NO_FOCUS_UNSUPPORTED); nothing to clean up.
 #   3  → ready-gate timed out; the workspace is closed, NO ref emitted.
 # CMUX seam: injectable cmux binary so the readiness gate is hermetically testable
 # (BUG-A); defaults to the real `cmux` in production.
@@ -438,9 +451,25 @@ _wh_cmux_open() {
   # word-split a cwd containing a space. cli_cmd stays unquoted deliberately: it is a
   # COMMAND LINE (`claude --model … --effort …`), not a value, and must word-split.
   local CMUX_BIN="${CMUX:-cmux}"
-  local out ref q_cwd q_sid
+  local out ref q_cwd q_sid q_bash q_telepty bash_bin telepty_bin
+  if [ -n "${AIGENTRY_MANAGED_BIN_DIR:-}" ]; then CMUX_BIN=$(_wh_bound_bin cmux) || return 78; fi
+  bash_bin=$(_wh_bound_bin bash) || return 78
+  telepty_bin=$(_wh_bound_bin telepty) || return 78
+  printf -v q_bash '%q' "$bash_bin"; printf -v q_telepty '%q' "$telepty_bin"
   printf -v q_cwd '%q' "$cwd"; printf -v q_sid '%q' "$sid"
-  out=$("$CMUX_BIN" new-workspace --cwd "$cwd" --command "bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd' _ $q_cwd $q_sid" 2>&1)
+  # #507/#616: a worker workspace opens in the background (sidebar-visible, its own
+  # foreground process) and never takes the operator's focus. A cmux that does not
+  # advertise `new-workspace … --focus` is refused here, before anything is spawned —
+  # there is no focus-stealing fallback.
+  if ! "$CMUX_BIN" --help 2>&1 | grep -qE 'new-workspace.*--focus'; then
+    echo "ERR CMUX_NO_FOCUS_UNSUPPORTED: '$CMUX_BIN --help' does not advertise new-workspace --focus <true|false>; refusing to open a focus-stealing workspace for $sid (upgrade cmux)" >&2
+    return 2
+  fi
+  if [ -n "${AIGENTRY_MANAGED_BIN_DIR:-}" ]; then
+    out=$("$CMUX_BIN" new-workspace --focus false --cwd "$cwd" --command "$q_bash -c 'cd \"\$1\" && exec \"\$3\" allow --id \"\$2\"$_WH_RESTART_FLAG $cli_cmd' _ $q_cwd $q_sid $q_telepty" 2>&1)
+  else
+    out=$("$CMUX_BIN" new-workspace --focus false --cwd "$cwd" --command "bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\"$_WH_RESTART_FLAG $cli_cmd' _ $q_cwd $q_sid" 2>&1)
+  fi
   ref=$(echo "$out" | grep -oE 'workspace:[0-9]+' | head -1)
   [ -z "$ref" ] && { echo "ERR cmux new-workspace failed: $out" >&2; return 2; }
   # title == sid (open-session.sh SID convention); rename to the stable handle.
@@ -796,9 +825,16 @@ _wh_warp_open() {
   # (`command = '…'` admits no escape) — a parse failure, not an execution, and the
   # neighbouring `cwd = '%s'` line has had the same limitation since #608. Fixing it
   # means moving the writer to TOML basic strings; separate ticket, not this one.
-  local q_cwd q_sid q_sentinel
+  local q_cwd q_sid q_sentinel q_telepty q_touch telepty_bin touch_bin
+  telepty_bin=$(_wh_bound_bin telepty) || return 78
+  touch_bin=$(_wh_bound_bin touch) || return 78
+  printf -v q_telepty '%q' "$telepty_bin"
+  printf -v q_touch '%q' "$touch_bin"
   printf -v q_cwd '%q' "$cwd"; printf -v q_sid '%q' "$sid"; printf -v q_sentinel '%q' "$sentinel"
-  local wrapper="cd $q_cwd && touch $q_sentinel && exec telepty allow --id $q_sid --auto-restart $cli_cmd"
+  local wrapper="cd $q_cwd && touch $q_sentinel && exec telepty allow --id $q_sid$_WH_RESTART_FLAG $cli_cmd"
+  if [ -n "${AIGENTRY_MANAGED_BIN_DIR:-}" ]; then
+    wrapper="cd $q_cwd && $q_touch $q_sentinel && exec $q_telepty allow --id $q_sid$_WH_RESTART_FLAG $cli_cmd"
+  fi
 
   if ! _wh_warp_write_tab_config "$toml" "$marker" "$cwd" "$wrapper"; then
     echo "[workspace-host] warp wh_open: failed to write tab_config $toml" >&2
@@ -856,6 +892,10 @@ _wh_warp_open() {
 # branch natively. Caller must have sourced platform.sh (open-session.sh does).
 _wh_fallback_spawn() {
   local _sid="$1" _cwd="$2" _cli_cmd="$3"
+  local telepty_bin bash_bin q_telepty
+  telepty_bin=$(_wh_bound_bin telepty) || return 78
+  bash_bin=$(_wh_bound_bin bash) || return 78
+  printf -v q_telepty '%q' "$telepty_bin"
   # #926: this function is the reason the fix could not stop at cmux/warp/aterm —
   # it is where EVERY other adapter lands when its terminal CLI is missing, so the
   # hole here survives a fix everywhere else by the user simply not having cmux.
@@ -866,12 +906,16 @@ _wh_fallback_spawn() {
     # The sid IS in it, because tmux runs the 3rd argument through a shell and the
     # signature offers no argv channel for it; `%q` is that guarantee here (a real
     # shell parses it, so there is no second parser to fight — unlike iTerm).
-    platform::spawn_tmux_window "$_sid" "$_cwd" "telepty allow --id $_q_sid --auto-restart $_cli_cmd"
+    local tmux_cmd="telepty allow --id $_q_sid$_WH_RESTART_FLAG $_cli_cmd"
+    if [ -n "${AIGENTRY_MANAGED_BIN_DIR:-}" ]; then tmux_cmd="$q_telepty allow --id $_q_sid$_WH_RESTART_FLAG $_cli_cmd"; fi
+    platform::spawn_tmux_window "$_sid" "$_cwd" "$tmux_cmd"
+    local rc=$?; if [ -n "${AIGENTRY_MANAGED_BIN_DIR:-}" ] && [ "$rc" -ne 0 ]; then return "$rc"; fi
     echo "$_sid"
   else
     # `telepty spawn -- …` execs its argv directly, so this takes the true argv
     # shape and needs no quoting pass at all.
-    telepty spawn --id "$_sid" -- bash -c "cd \"\$1\" && exec $_cli_cmd" _ "$_cwd" >/dev/null
+    "$telepty_bin" spawn --id "$_sid" -- "$bash_bin" -c "cd \"\$1\" && exec $_cli_cmd" _ "$_cwd" >/dev/null
+    local rc=$?; if [ -n "${AIGENTRY_MANAGED_BIN_DIR:-}" ] && [ "$rc" -ne 0 ]; then return "$rc"; fi
     echo "⚠️  Session spawned as daemon (no visible terminal). Attach: telepty attach $_sid" >&2
     echo "$_sid"
   fi
@@ -883,14 +927,22 @@ _wh_aterm_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
   # #926: same shape as _wh_cmux_open — --cmd is shell text, so cwd and sid go on
   # argv, %q-quoted; cli_cmd stays unquoted because it is a command line.
-  local q_cwd q_sid
+  local q_cwd q_sid q_bash q_telepty bash_bin telepty_bin aterm_bin
+  bash_bin=$(_wh_bound_bin bash) || return 78
+  telepty_bin=$(_wh_bound_bin telepty) || return 78
+  printf -v q_bash '%q' "$bash_bin"; printf -v q_telepty '%q' "$telepty_bin"
   printf -v q_cwd '%q' "$cwd"; printf -v q_sid '%q' "$sid"
-  if command -v aterm >/dev/null 2>&1 \
-    && aterm new-session --cwd "$cwd" --cmd "bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd' _ $q_cwd $q_sid" 2>/dev/null; then
-    echo "$sid"
-  else
-    _wh_fallback_spawn "$sid" "$cwd" "$cli_cmd"
+  if command -v aterm >/dev/null 2>&1; then
+    aterm_bin=$(_wh_bound_bin aterm) || return 78
+    local aterm_cmd="bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\"$_WH_RESTART_FLAG $cli_cmd' _ $q_cwd $q_sid"
+    if [ -n "${AIGENTRY_MANAGED_BIN_DIR:-}" ]; then
+      aterm_cmd="$q_bash -c 'cd \"\$1\" && exec \"\$3\" allow --id \"\$2\"$_WH_RESTART_FLAG $cli_cmd' _ $q_cwd $q_sid $q_telepty"
+    fi
+    if "$aterm_bin" new-session --cwd "$cwd" --cmd "$aterm_cmd" 2>/dev/null; then
+      echo "$sid"; return 0
+    fi
   fi
+  _wh_fallback_spawn "$sid" "$cwd" "$cli_cmd"
 }
 
 # _wh_tmux_open <sid> <cwd> <cli_cmd> — tmux new-window via platform:: (Tier 1).
@@ -899,8 +951,13 @@ _wh_tmux_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
   # #926: see _wh_fallback_spawn's tmux branch — cwd never enters this string, the
   # sid is %q-quoted because spawn_tmux_window's 3rd argument is shell text.
-  local q_sid; printf -v q_sid '%q' "$sid"
-  platform::spawn_tmux_window "$sid" "$cwd" "telepty allow --id $q_sid --auto-restart $cli_cmd"
+  local q_sid q_telepty telepty_bin; printf -v q_sid '%q' "$sid"
+  telepty_bin=$(_wh_bound_bin telepty) || return 78
+  printf -v q_telepty '%q' "$telepty_bin"
+  local tmux_cmd="telepty allow --id $q_sid$_WH_RESTART_FLAG $cli_cmd"
+  if [ -n "${AIGENTRY_MANAGED_BIN_DIR:-}" ]; then tmux_cmd="$q_telepty allow --id $q_sid$_WH_RESTART_FLAG $cli_cmd"; fi
+  platform::spawn_tmux_window "$sid" "$cwd" "$tmux_cmd"
+  local rc=$?; if [ -n "${AIGENTRY_MANAGED_BIN_DIR:-}" ] && [ "$rc" -ne 0 ]; then return "$rc"; fi
   echo "$sid"
 }
 
@@ -908,10 +965,19 @@ _wh_tmux_open() {
 # Explicit cd inside bash -c guarantees cwd propagation into claude (#311).
 _wh_wezterm_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
+  local wezterm_bin bash_bin telepty_bin
+  bash_bin=$(_wh_bound_bin bash) || return 78
+  telepty_bin=$(_wh_bound_bin telepty) || return 78
   if command -v wezterm >/dev/null 2>&1; then
+    wezterm_bin=$(_wh_bound_bin wezterm) || return 78
     # #926: `wezterm cli spawn -- …` execs its argv directly (no shell re-parse),
     # so cwd and sid go on argv as-is — no %q pass needed.
-    wezterm cli spawn --cwd "$cwd" -- bash -c "cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd" _ "$cwd" "$sid" >/dev/null
+    if [ -n "${AIGENTRY_MANAGED_BIN_DIR:-}" ]; then
+      "$wezterm_bin" cli spawn --cwd "$cwd" -- "$bash_bin" -c "cd \"\$1\" && exec \"\$3\" allow --id \"\$2\"$_WH_RESTART_FLAG $cli_cmd" _ "$cwd" "$sid" "$telepty_bin" >/dev/null
+    else
+      wezterm cli spawn --cwd "$cwd" -- bash -c "cd \"\$1\" && exec telepty allow --id \"\$2\"$_WH_RESTART_FLAG $cli_cmd" _ "$cwd" "$sid" >/dev/null
+    fi
+    local rc=$?; if [ -n "${AIGENTRY_MANAGED_BIN_DIR:-}" ] && [ "$rc" -ne 0 ]; then return "$rc"; fi
     echo "$sid"
   else
     _wh_fallback_spawn "$sid" "$cwd" "$cli_cmd"
@@ -933,8 +999,12 @@ _wh_iterm_open() {
   # What is left here is the ordinary thing every other adapter does: %q the SID,
   # because it is a value inside a command LINE, while cli_cmd stays unquoted because
   # it IS the command line and must word-split.
-  local q_sid; printf -v q_sid '%q' "$sid"
-  platform::spawn_iterm_tab "$cwd" "telepty allow --id $q_sid --auto-restart $cli_cmd" \
+  local q_sid q_telepty telepty_bin; printf -v q_sid '%q' "$sid"
+  telepty_bin=$(_wh_bound_bin telepty) || return 78
+  printf -v q_telepty '%q' "$telepty_bin"
+  local iterm_cmd="telepty allow --id $q_sid$_WH_RESTART_FLAG $cli_cmd"
+  if [ -n "${AIGENTRY_MANAGED_BIN_DIR:-}" ]; then iterm_cmd="$q_telepty allow --id $q_sid$_WH_RESTART_FLAG $cli_cmd"; fi
+  platform::spawn_iterm_tab "$cwd" "$iterm_cmd" \
     || { echo "ERR iTerm spawn failed" >&2; return 2; }
   echo "$sid"
 }
@@ -954,8 +1024,12 @@ _wh_iterm_ready_attestation()   { printf 'none'; }
 # fallback, ADR §7 Phase 3 "generic→headless adapter"). No visible UI surface.
 _wh_headless_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
+  local telepty_bin bash_bin
+  telepty_bin=$(_wh_bound_bin telepty) || return 78
+  bash_bin=$(_wh_bound_bin bash) || return 78
   # #926: argv shape — `telepty spawn -- …` execs its argv directly.
-  telepty spawn --id "$sid" -- bash -c "cd \"\$1\" && exec $cli_cmd" _ "$cwd" >/dev/null
+  "$telepty_bin" spawn --id "$sid" -- "$bash_bin" -c "cd \"\$1\" && exec $cli_cmd" _ "$cwd" >/dev/null
+  local rc=$?; if [ -n "${AIGENTRY_MANAGED_BIN_DIR:-}" ] && [ "$rc" -ne 0 ]; then return "$rc"; fi
   echo "⚠️  Session spawned as daemon (headless: no spawn-tab CLI)." >&2
   echo "    Attach via: telepty attach $sid" >&2
   echo "$sid"
@@ -1124,6 +1198,13 @@ EOF
 # explicit-error policy — never a silent surface failure).
 wh_open() {
   local adapter; adapter=$(_wh_adapter)
+  case "${4:-native-only}" in
+    native-only) _WH_RESTART_FLAG=' --auto-restart' ;;
+    managed-secret)
+      [ -n "${AIGENTRY_MANAGED_BIN_DIR:-}" ] || { echo "ENV_HELPER_PATH_REFUSED" >&2; return 78; }
+      _WH_RESTART_FLAG='' ;;
+    *) _wh_log "open: invalid launch policy"; return 64 ;;
+  esac
   _wh_log "open: adapter=$adapter sid=${1:-}"
   if ! declare -F "_wh_${adapter}_open" >/dev/null 2>&1; then
     _wh_log "$adapter wh_open: UNSUPPORTED — no _wh_${adapter}_open spawn adapter registered (#608: cmux/warp/aterm/tmux/wezterm/iterm/headless migrated)"
