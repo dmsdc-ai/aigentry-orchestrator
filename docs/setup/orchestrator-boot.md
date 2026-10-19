@@ -406,4 +406,3 @@ revision/provenance awareness and the supported subset. A complete explicit boot
 plan still owns permission, history and risk acknowledgement. Metadata configuration
 does not establish authentication. Both shim layouts preserve the exec-argv stdout
 protocol and carry changed nonsecret settings into the shell's real invocation.
-

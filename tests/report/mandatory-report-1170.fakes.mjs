@@ -47,11 +47,9 @@ async function fakeMain() {
 
   if (role === "prepare-sandbox") {
     const a = JSON.parse(argv[0]);
-    const ws = await import(pathToFileURL(path.join(process.env.MR_DIST, "src/session/worker-sandbox.js")).href);
+    const { prepareSandboxFixture } = await import("../dispatch/agent-metadata/support/prepare-sandbox.mjs");
     try {
-      const scope = ws.loadWorkerScope(a.scopeFile, a.task, a.sid);
-      const r = ws.prepareWorkerSandbox(scope, a.cli, a.roleCwd, a.argv, a.stagingRoot, a.roleCwd, undefined, undefined,
-        undefined, a.controlRoots);
+      const r = await prepareSandboxFixture({ ...a, launch: undefined }, process.env.MR_DIST, a.controlRoots);
       process.stdout.write(JSON.stringify({ ok: true, result: r }) + "\n");
     } catch (e) {
       process.stdout.write(JSON.stringify({ ok: false, error: String(e?.message ?? e) }) + "\n");
