@@ -92,11 +92,11 @@ jobs:
             XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
             XDG_DATA_HOME="$XDG_DATA_HOME" TMPDIR="$TMPDIR" \
             PATH=/usr/bin:/bin "$NODE_EXECUTABLE" --test dist/tests/session/worker-sandbox-providers.test.js
-      - name: Release benchmark pure contracts and comparison
+      - name: Release benchmark public CLI and pure contracts
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           umask 077
           env -i HOME="$HOME" USERPROFILE="$USERPROFILE" \
             XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
             XDG_DATA_HOME="$XDG_DATA_HOME" TMPDIR="$TMPDIR" \
-            PATH=/usr/bin:/bin "$NODE_EXECUTABLE" --test --test-concurrency=1 dist/tests/release-benchmark/contracts.test.js dist/tests/release-benchmark/compare.test.js
+            PATH=/usr/bin:/bin "$NODE_EXECUTABLE" --test --test-concurrency=1 dist/tests/release-benchmark/contracts.test.js dist/tests/release-benchmark/compare.test.js dist/tests/release-benchmark/cli.test.js
