@@ -11,7 +11,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import readline from "node:readline/promises";
 // Validate the public route before acquiring its selected pipe. Consume and
 // close an acquired pipe before package imports or an environment snapshot.
@@ -181,6 +181,7 @@ const winStorage = process.platform === "win32" ? await import("../lib/win-priva
 let gitBash = null;
 
 const USAGE = `aigentry-orchestrator env locate | list --json | explain ID | doctor --json | set | unset | profile select
+aigentry-orchestrator benchmark compare --input ABSOLUTE_JSON_FILE
 aigentry-orchestrator init [--workspace PATH] [--yes] [--dry-run] [--force] [--upgrade]
 
   --workspace PATH  where the control workspace goes (default: ~/aigentry/_orchestrator,
@@ -771,6 +772,32 @@ function dryRun(ws) {
 // ------------------------------------------------------------------------------- main
 
 async function main() {
+  if (process.argv[2] === "benchmark") {
+    let outputFailed = false;
+    const outputFailure = () => {
+      process.exitCode = 65;
+      if (outputFailed) return;
+      outputFailed = true;
+      try {
+        if (!process.stderr.destroyed) process.stderr.write('{"code":"output-refused"}\n');
+      } catch { process.exitCode = 65; }
+    };
+    process.stdout.on("error", outputFailure);
+    process.stderr.on("error", () => { outputFailed = true; process.exitCode = 65; });
+    let result;
+    try {
+      const { benchmarkCommand } = await import(pathToFileURL(path.join(PKG_ROOT, "dist/src/release-benchmark/cli.js")).href);
+      result = benchmarkCommand(process.argv.slice(3));
+    } catch {
+      result = { code: 65, out: "", err: '{"code":"input-refused"}\n' };
+    }
+    process.exitCode = result.code;
+    try {
+      if (result.out) process.stdout.write(result.out);
+      if (result.err) process.stderr.write(result.err);
+    } catch { outputFailure(); }
+    return;
+  }
   if (process.argv[2] === "dispatch-compat") {
     const argv = process.argv.slice(3);
     let fd;
