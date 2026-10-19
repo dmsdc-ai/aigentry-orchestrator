@@ -888,6 +888,195 @@ def jsonl_value(value) -> tuple[object, bool]:
     return None, False
 
 
+# Pure protocol helpers for the commit-bound projection. Filesystem publication
+# and reader admission must be wired together only with the private-storage
+# adapter; these helpers alone do not activate projection-backed status.
+STATUS_PREFIX_LIMIT = 65536
+STATUS_PROJECTION_FIELDS = JSONL_FIELDS + ("gate_invalid", "gated")
+
+
+class StatusReadBudget:
+    """One status request's prefix/object budget over already admitted fds.
+    Native storage admission owns the handles and their lifetime. This counter
+    never opens, seeks, reopens or closes them; os.read has no hidden prefetch.
+    """
+
+    def __init__(self) -> None:
+        self.consumed = 0
+
+    def read(self, fd: int, count: int) -> bytes:
+        if count <= 0:
+            raise RegistryError("registry_error", "invalid status read size")
+        allowance = JSONL_READ_LIMIT + 1 - self.consumed
+        if allowance <= 0:
+            raise RegistryError("registry_too_large", "status read budget exhausted")
+        try:
+            data = os.read(fd, min(count, allowance))
+        except OSError as exc:
+            raise RegistryError("registry_unavailable", "cannot read status data") from exc
+        self.consumed += len(data)
+        if self.consumed > JSONL_READ_LIMIT:
+            raise RegistryError("registry_too_large", "status read budget exhausted")
+        return data
+
+    def prefix(self, fd: int) -> bytes:
+        """Retain the bounded first line even when it selects the legacy path."""
+        data = bytearray()
+        while len(data) < STATUS_PREFIX_LIMIT:
+            byte = self.read(fd, 1)
+            if not byte:
+                break
+            data.extend(byte)
+            if byte == b"\n":
+                break
+        return bytes(data)
+
+    def remainder(self, fd: int) -> bytes:
+        """Consume to EOF with the same allowance, including one refusal probe.
+        Legacy callers prepend the retained prefix; projection callers keep it
+        separate. Neither path may allocate a second counter for the object.
+        """
+        chunks = []
+        while True:
+            data = self.read(fd, 65536)
+            if not data:
+                return b"".join(chunks)
+            chunks.append(data)
+
+
+def status_json_bytes(value: object) -> bytes:
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False).encode("ascii")
+
+
+def status_unique_object(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate status key")
+        result[key] = value
+    return result
+
+
+def status_invalid_constant(value: str) -> None:
+    raise ValueError("nonfinite status number")
+
+
+def status_projection_bytes(doc: dict) -> bytes:
+    """Full raw strings survive until selected-page jsonl_value projection.
+    gate facts preserve the distinction between a normalized-null state and an
+    actual null state. A status-invalid gate does not reject a valid mutation.
+    Generation is deliberately absent, so identical projections can be reused.
+    """
+    validate(doc)
+    rows = []
+    for rec in doc["dispatches"]:
+        row = {}
+        for field in JSONL_FIELDS:
+            value = pointer(rec, field)
+            row[field] = value if isinstance(value, str) else jsonl_value(value)[0]
+        gate = rec.get("gate")
+        row["gate_invalid"] = gate is not None and not isinstance(gate, dict)
+        row["gated"] = isinstance(gate, dict) and gate.get("state") is not None
+        rows.append(row)
+    return status_json_bytes({"v": 1, "rows": rows}) + b"\n"
+
+
+def status_projection_descriptor(data: bytes, rows: int) -> dict:
+    return {"v": 1, "sha256": hashlib.sha256(data).hexdigest(),
+            "bytes": len(data), "rows": rows}
+
+
+def validate_status_descriptor(value: object) -> dict:
+    if not (isinstance(value, dict) and set(value) == {"v", "sha256", "bytes", "rows"}
+            and type(value["v"]) is int and value["v"] == 1
+            and isinstance(value["sha256"], str) and HEX64_RE.fullmatch(value["sha256"])
+            and type(value["bytes"]) is int and 0 < value["bytes"] <= JSONL_MAX_INT
+            and type(value["rows"]) is int and 0 <= value["rows"] <= JSONL_MAX_INT):
+        raise RegistryError("registry_corrupt", "invalid status projection descriptor")
+    return value
+
+
+def status_prefix_bytes(generation: int, descriptor: dict) -> bytes:
+    """Canonical fragment; remaining complete authority members follow it."""
+    return status_json_bytes({"schema_version": SCHEMA_VERSION,
+                              "generation": generation,
+                              "status_projection": descriptor})[:-1] + b",\n"
+
+
+def parse_status_prefix(data: bytes) -> dict:
+    """Parse only an already bounded first line, never search authority history."""
+    bad = RegistryError("registry_corrupt", "invalid status projection prefix")
+    if len(data) > STATUS_PREFIX_LIMIT or not data.endswith(b",\n"):
+        raise bad
+    try:
+        value = json.loads((data[:-2] + b"}").decode("ascii"),
+                           object_pairs_hook=status_unique_object,
+                           parse_constant=status_invalid_constant)
+    except (ValueError, RecursionError) as exc:
+        raise bad from exc
+    if not (isinstance(value, dict)
+            and set(value) == {"schema_version", "generation", "status_projection"}
+            and type(value["schema_version"]) is int and value["schema_version"] == SCHEMA_VERSION
+            and type(value["generation"]) is int and 0 <= value["generation"] <= JSONL_MAX_INT):
+        raise bad
+    descriptor = validate_status_descriptor(value["status_projection"])
+    canonical_descriptor = {key: descriptor[key] for key in ("v", "sha256", "bytes", "rows")}
+    if status_prefix_bytes(value["generation"], canonical_descriptor) != data:
+        raise bad
+    return value
+
+
+def validate_status_projection(data: bytes, descriptor: dict) -> list[dict]:
+    """Validate the entire fetched object, including rows outside the query page.
+    Caller must account prefix plus object bytes before calling; descriptor size
+    alone never authorizes a read. No generation/cursor shortcut belongs here.
+    """
+    descriptor = validate_status_descriptor(descriptor)
+    bad = RegistryError("registry_corrupt", "invalid status projection object")
+    if (len(data) != descriptor["bytes"] or hashlib.sha256(data).hexdigest() != descriptor["sha256"]
+            or not data.endswith(b"\n")):
+        raise bad
+    try:
+        decoder = json.JSONDecoder(object_pairs_hook=status_unique_object,
+                                   parse_constant=status_invalid_constant)
+        text = data.decode("ascii")
+        value, end = decoder.raw_decode(text)
+        if end != len(text) - 1:
+            raise bad
+    except (ValueError, RecursionError) as exc:
+        raise bad from exc
+    if not (isinstance(value, dict) and set(value) == {"v", "rows"}
+            and type(value["v"]) is int and value["v"] == 1
+            and isinstance(value["rows"], list) and len(value["rows"]) == descriptor["rows"]):
+        raise bad
+    seen = set()
+    for row in value["rows"]:
+        if not isinstance(row, dict) or set(row) != set(STATUS_PROJECTION_FIELDS):
+            raise bad
+        for field in JSONL_FIELDS:
+            scalar = row[field]
+            if not (scalar is None or isinstance(scalar, (str, bool))
+                    or (type(scalar) is int and abs(scalar) <= JSONL_MAX_INT)
+                    or (type(scalar) is float and math.isfinite(scalar))):
+                raise bad
+        did = row["dispatch_id"]
+        if not isinstance(did, str) or not did or did in seen:
+            raise bad
+        seen.add(did)
+        if (not all(isinstance(row[field], str) for field in
+                    ("assigned.sid", "lifecycle.state", "dedup.ref_hash"))
+                or row["outcome.state"] != "unknown"
+                or type(row["gate_invalid"]) is not bool or type(row["gated"]) is not bool):
+            raise bad
+        if row["gate_invalid"]:
+            if row["gated"] or row["gate.state"] is not None:
+                raise bad
+        elif row["gate.state"] is not None and not row["gated"]:
+            raise bad
+    return value["rows"]
+
+
 def op_list_jsonl(args: dict) -> int:
     if any(name in args for name in ("fields", "not-retired", "keep-alive", "due-before")):
         raise RegistryError("invalid_argument", "list --jsonl: unsupported flag")
