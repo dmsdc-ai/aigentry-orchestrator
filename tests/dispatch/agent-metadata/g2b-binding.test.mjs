@@ -52,7 +52,7 @@ function prepare(run, { sid = "w1162-p", task = "1162", launch, stagingRoot } = 
 /** The launcher's binder line (line 2), executed verbatim by bash; the exec line is NOT run. */
 function runBinderLine(run, launcher, paneEnv) {
   const lines = fs.readFileSync(launcher, "utf8").split("\n");
-  assert.equal(lines[0], "#!/usr/bin/env bash");
+  assert.equal(lines[0], "#!/bin/bash");
   assert.match(lines[1], /worker-sandbox-bind\.js' '.+manifest\.json' '[0-9a-f]{64}' \|\| echo "agent-meta: binding unavailable rc=\$\?" >&2$/);
   assert.match(lines[2], /^exec .+worker-sandbox-runner\.js' /, "exec runner line must follow, unchanged");
   return sh("bash", ["-c", lines[1]], { env: hermeticEnv(run, paneEnv) });

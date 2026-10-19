@@ -186,6 +186,7 @@ export function sealedFixture(run, o = {}) {
     env: { HOME: path.join(root, "home"), CANARY_ENV: "IT1162-ENV-CANARY-7f3a" },
     config: { filesystem: { allowWrite: [path.join(root, "home")] } },
     probeFile: path.join(root, "outside-canary.txt"),
+    probeDirectory: path.join(root, "outside-directory-canary"),
     receipt: path.join(root, "receipt.json"),
     ...(o.launch === undefined ? {} : o.launch === null ? {} : { launch: o.launch }),
     ...(o.manifestExtra ?? {}),
