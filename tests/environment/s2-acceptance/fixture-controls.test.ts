@@ -180,3 +180,90 @@ test("runner preload resolves SRT from the candidate before the real overlay gua
     finish(root, { controls: "candidate SRT resolution before real version/source-hash guard" });
   }
 });
+
+for (const [caseName, leaf, allowed] of [
+  ["safe", "tmp-safe", true],
+  ["space", "tmp space", false],
+  ["dollar-parenthesis", "tmp$(fixture)", false],
+  ["semicolon", "tmp;fixture", false],
+  ["comma", "tmp,fixture", false],
+] as const) {
+  test(`actual preparation admits only a safe canonical scratch parent: ${caseName}`, () => {
+    const root = fixture();
+    try {
+      const home = path.join(root, "host"), auth = path.join(home, ".codex");
+      const bin = path.join(root, "bin"), scratch = path.join(root, leaf);
+      const project = path.join(root, "project space,allowed");
+      const sessions = path.join(root, "sessions");
+      for (const dir of [home, auth, bin, scratch, project, sessions]) fs.mkdirSync(dir, { mode: 0o700 });
+      const authBytes = JSON.stringify({ OPENAI_API_KEY: "fixture-only-not-a-secret" });
+      fs.writeFileSync(path.join(auth, "auth.json"), authBytes, { flag: "wx", mode: 0o600 });
+      // An executable fixture path for preparation only; no CLI is launched.
+      fs.writeFileSync(path.join(bin, "codex"), "", { flag: "wx", mode: 0o700 });
+      const tree = (dir: string): unknown => {
+        const stat = fs.lstatSync(dir);
+        return { mode: stat.mode, mtimeMs: stat.mtimeMs,
+          entries: fs.readdirSync(dir).sort().map(name => {
+            const file = path.join(dir, name), entry = fs.lstatSync(file);
+            assert.equal(entry.isSymbolicLink(), false, "scratch fixture must not acquire external links");
+            return { name, value: entry.isDirectory() ? tree(file) :
+              { mode: entry.mode, mtimeMs: entry.mtimeMs, bytes: fs.readFileSync(file).toString("base64") } };
+          }) };
+      };
+      const before = tree(root);
+      const moduleUrl = new URL("../../../src/session/worker-sandbox.js", import.meta.url).href;
+      // No runner preload: the production call consumes this child's real os.tmpdir().
+      const program = 'import fs from "node:fs";\n' +
+        'import os from "node:os";\n' +
+        'import path from "node:path";\n' +
+        'const { prepareWorkerSandbox } = await import(process.argv[1]);\n' +
+        'const root = process.argv[2], project = path.join(root, "project space,allowed");\n' +
+        'const tmpdir = os.tmpdir(), canonicalParent = fs.realpathSync(tmpdir);\n' +
+        'const scope = { version: 1, task: "1233", sid: "f3-worker", read: [project], write: [project], domains: [] };\n' +
+        'let prepared, error;\n' +
+        'try { prepared = prepareWorkerSandbox(scope, "codex", project, [path.join(root, "bin", "codex")], path.join(root, "sessions", "f3-worker")); }\n' +
+        'catch (cause) { if (!(cause instanceof Error)) throw cause; error = cause.message; }\n' +
+        'process.stdout.write(JSON.stringify({ tmpdir, canonicalParent, prepared, error }) + "\\n");\n';
+      const result = spawnSync(process.execPath, ["--input-type=module", "-e", program, moduleUrl, root], {
+        encoding: "utf8", timeout: 30_000, maxBuffer: 64 * 1024, cwd: root,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...childEnv(root), HOME: home, USERPROFILE: home, CODEX_HOME: auth,
+          XDG_CONFIG_HOME: home, XDG_CACHE_HOME: home, XDG_DATA_HOME: home,
+          XDG_STATE_HOME: home, XDG_RUNTIME_DIR: home, TMPDIR: scratch, TMP: scratch, TEMP: scratch,
+          PATH: bin },
+      });
+      assert.ifError(result.error);
+      assert.equal(result.status, 0, result.stderr);
+      const outcome = JSON.parse(result.stdout) as {
+        tmpdir: string; canonicalParent: string; error?: string;
+        prepared?: { launcher: string; manifest: string; hash: string };
+      };
+      assert.equal(outcome.tmpdir, scratch, "real os.tmpdir must consume the selected fixture input");
+      assert.equal(outcome.canonicalParent, fs.realpathSync(scratch));
+      if (!allowed) {
+        const after = tree(root);
+        assert.equal(outcome.error, "SANDBOX_SRT_TMPDIR_UNSAFE", "unsafe scratch parent admission must refuse explicitly");
+        assert.equal(outcome.prepared, undefined);
+        assert.deepEqual(after, before, "unsafe scratch refusal must precede all preparation writes");
+      } else {
+        assert.equal(outcome.error, undefined, "safe scratch parent must reach actual preparation");
+        assert.ok(outcome.prepared);
+        const stage = path.dirname(outcome.prepared.manifest);
+        assert.equal(path.dirname(path.dirname(stage)), path.join(sessions, "f3-worker"));
+        assert.equal(outcome.prepared.launcher, path.join(stage, "launcher.sh"));
+        assert.equal(fs.statSync(outcome.prepared.launcher).isFile(), true);
+        const manifest = JSON.parse(fs.readFileSync(outcome.prepared.manifest, "utf8")) as {
+          cwd: string; env: { HOME: string; TMPDIR: string; CODEX_HOME: string };
+        };
+        assert.equal(manifest.cwd, project);
+        assert.equal(path.dirname(manifest.env.TMPDIR), fs.realpathSync(scratch));
+        assert.match(path.basename(manifest.env.TMPDIR), /^agw-/);
+        assert.equal(manifest.env.HOME, path.join(stage, "home"));
+        assert.equal(manifest.env.CODEX_HOME, path.join(stage, "home", ".codex"));
+        assert.equal(fs.readFileSync(path.join(manifest.env.CODEX_HOME, "auth.json"), "utf8"), authBytes);
+      }
+    } finally {
+      finish(root, { controls: "actual canonical scratch-parent admission", caseName });
+    }
+  });
+}
