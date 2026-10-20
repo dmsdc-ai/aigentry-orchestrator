@@ -162,3 +162,44 @@ test("simulated final composition binds exact attempt, final trailer and input-g
   ports.authority!.validateCut = () => ({ source_cut: "new-cut", selection_revision: "sim-selection", receipt: "sim-change" });
   assert.throws(() => composeContextRef(prepared, f.ref, trailer, { attempt: "sim-attempt", hash: f.m.identity.scope_sha256 }), code("source_cut_changed"));
 });
+
+test("local port simulation refuses a preexisting stale final cut before provider admission", () => {
+  const setup = (finalCut: string) => {
+    const f = fixture(), assembly = assembleManifest(f.m, f.selection, () => f.bytes);
+    let admitCalls = 0;
+    const phases: string[] = [];
+    const ports: ContextPorts = {
+      authority: { select: () => f.selection, validateCut: (_selection, phase) => {
+        phases.push(phase);
+        return { source_cut: finalCut, selection_revision: f.selection.selection_revision, receipt: "sim-final-cut" };
+      } },
+      provider: { capacity: { receipt: "sim-capacity", provider: "simulation", version: "1", available_bytes: 1024 * 1024 },
+        admit: (body, selection) => {
+          admitCalls++;
+          return { receipt: "sim-input-gate", body_sha256: sha256(body), attempt: selection.identity.attempt,
+            input_status: "awaiting-observation", route: "input-gated" };
+        } },
+      registry: { schema: "aigentry-context-binding/1" },
+    };
+    const raw = canonicalBytes(f.m);
+    const prepared = { manifest: f.m, manifestBytes: raw, originalRef: f.ref, manifestSha256: sha256(raw),
+      selection: f.selection, assembly, ports, cutReceipt: "sim-preflight" };
+    const trailer = "\n<!-- aigentry-report v1 -->\nREPORT_ENVELOPE simulation-only\n";
+    return { compose: () => composeContextRef(prepared, f.ref, trailer,
+      { attempt: f.m.identity.attempt, hash: f.m.identity.scope_sha256 }),
+      admissionCount: () => admitCalls, phases };
+  };
+
+  const valid = setup("sim-cut");
+  const composed = valid.compose();
+  assert.equal(composed.binding.final_ref_sha256, sha256(composed.bytes));
+  assert.equal(composed.binding.source_cut, "sim-cut");
+  assert.equal(valid.admissionCount(), 1);
+  assert.deepEqual(valid.phases, ["before-binding"]);
+
+  // Fresh fixture: the final cut is already stale, independent of admission.
+  const stale = setup("sim-known-stale-cut");
+  assert.throws(() => stale.compose(), code("source_cut_changed"));
+  assert.deepEqual(stale.phases, ["before-binding"]);
+  assert.equal(stale.admissionCount(), 0);
+});
