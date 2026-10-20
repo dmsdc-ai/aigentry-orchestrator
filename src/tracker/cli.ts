@@ -31,6 +31,7 @@ import { requestTelepty, validatedTeleptyPort } from "../telepty/http.js";
 import { teleptyChildEnv, defaultPumpDeps, pumpOnce, reportAck, reportStatus, SID_RE, type PumpDeps } from "../report/pump.js";
 import { cmdReportSweep } from "./report-sweep.js";
 import { USAGE } from "./usage.js";
+import { runIntakeCommand } from "../request-capture/intake-pump.js";
 
 const env = process.env;
 
@@ -70,6 +71,14 @@ const NOW_OVERRIDE = env.TRACKER_NOW || "";
 // #1172: report-sweep accepts no argument or exactly `--json`. Anything else is a
 // usage error decided HERE, before the mkdir below or any state/shared/registry access.
 const ARGV = process.argv.slice(2);
+// Intake validation/status/unauthenticated ACK must precede the legacy mkdir.
+if (["intake-pump", "intake-status", "intake-ack"].includes(ARGV[0] ?? "")) {
+  const result = await runIntakeCommand(ARGV, { stateDir: STATE_DIR,
+    registryScript: DISPATCH_REGISTRY_PY, telepty: TELEPTY,
+    destination: env.ORCHESTRATOR_SID ?? "", env });
+  await new Promise<void>(resolve => { process.stdout.write(result.output, () => resolve()); });
+  process.exit(result.code);
+}
 if (ARGV[0] === "report-sweep" && !(ARGV.length === 1 || (ARGV.length === 2 && ARGV[1] === "--json"))) {
   process.stderr.write("dispatch-tracker: report-sweep: invalid_argument\n" + USAGE + "\n");
   process.exit(4);

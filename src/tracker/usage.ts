@@ -22,6 +22,13 @@ export const USAGE = `# dispatch-tracker.sh — Orchestrator-side dispatch healt
 # See docs/specs/2026-05-12-dispatch-healthcheck.md (Rule 32 영구 fix for #113).
 #
 # Commands:
+#   dispatch-tracker.sh intake-pump --once --capture-root <ABSOLUTE>
+#       — one bounded inventory/import/notice pass; explicit ORCHESTRATOR_SID required.
+#       Exit 0 pass complete, 3 degraded/unknown, 4 refusal, 9 storage uncertainty.
+#   dispatch-tracker.sh intake-status [--json] — read-only intake obligations.
+#   dispatch-tracker.sh intake-ack — refuses receiver_verification_unavailable without
+#       mutation until an authenticated receiver contract exists; no bypass arguments.
+#       See docs/setup/request-intake.md for the timestamp prerequisite and open gates.
 #   dispatch-tracker.sh check                    — one-shot scan; alerts to stdout + log
 #   dispatch-tracker.sh status [<sid>]
 #   dispatch-tracker.sh status --json [--live] [--limit N] [--after CURSOR]

@@ -56,6 +56,7 @@ import { defaultPathConfig } from "../session/persist-context.js";
 import { agentStatus, metaOutcome, SID_V1 } from "./agent-metadata.js";
 import { keepNodeOptionsShimAlive } from "./node-options-shim.js";
 import { USAGE } from "./usage.js";
+import { intakeChildEnvironment, reconcilerIntakeArguments } from "../request-capture/intake-pump.js";
 
 const env = process.env;
 
@@ -1410,6 +1411,21 @@ function main(argv: string[]): void {
     });
     for (const line of readLines((pump.stdout ?? "") + (pump.stderr ?? ""))) log(line);
     if (pump.error || (pump.status ?? 1) !== 0) log("ERR report-pump non-zero (continuing)");
+  }
+
+  // --- step 0b4: explicit, default-off intake pass after report reconciliation.
+  const intakeArgs = reconcilerIntakeArguments(DRY_RUN, env);
+  if (intakeArgs) {
+    const intake = spawnSync(process.execPath,
+      [fileURLToPath(new URL("../tracker/cli.js", import.meta.url)), ...intakeArgs], {
+        encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], shell: false,
+        env: intakeChildEnvironment(env), timeout: 60_000, killSignal: "SIGKILL",
+        maxBuffer: 1024 * 1024,
+      });
+    for (const line of readLines((intake.stdout ?? "") + (intake.stderr ?? ""))) log(line);
+    if (intake.error || (intake.status ?? 1) !== 0) log("ERR intake-pump non-zero (continuing)");
+  } else if (DRY_RUN === 0 && env.AIGENTRY_INTAKE_PUMP === "1") {
+    log("ERR intake-pump requires explicit absolute AIGENTRY_CAPTURE_ROOT (continuing)");
   }
 
   // --- step 0c: PEER-LANE comms auditor (#533 Phase 1) — tail telepty's peer-inject

@@ -99,6 +99,8 @@ if (process.platform === 'darwin' || process.platform === 'linux') {
   // roots; asserts 0600/0700 modes and flock contention, so POSIX only. Native Windows is
   // unmeasured and not claimed.
   sourceTestFiles.push('tests/request-capture/intake-registry.test.mjs');
+  // #1166 U3 actual caller controls; real capture/registry fixture requires POSIX.
+  sourceTestFiles.push('tests/request-capture/intake-pump.test.mjs');
 }
 
 function collectTestFiles(dir) {
