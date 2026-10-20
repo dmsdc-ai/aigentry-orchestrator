@@ -332,3 +332,116 @@ jobs:
             AIGENTRY_STATUS_TEST_OLD_CLI="$AIGENTRY_STATUS_TEST_OLD_CLI" \
             AIGENTRY_STATUS_TEST_OLD_CLI_SHA256="$AIGENTRY_STATUS_TEST_OLD_CLI_SHA256" \
             PATH=/usr/bin:/bin "$NODE_EXECUTABLE" --test --test-concurrency=1 dist/tests/dispatch/registry-status-projection.test.js dist/tests/tracker/status-json.test.js tests/report/intermediate-report-review.test.mjs
+          env -i HOME="$HOME" USERPROFILE="$USERPROFILE" \
+            XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+            XDG_DATA_HOME="$XDG_DATA_HOME" TMPDIR="$TMPDIR" \
+            PATH=/usr/bin:/bin U1_STATUS_ROOT="$status_root" \
+            U1_PYTHON="$selected_python" U1_PYTHON_SHA256="$selected_python_sha256" \
+            "$NODE_EXECUTABLE" --input-type=commonjs <<'U1_NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const assert = require('node:assert/strict');
+          const { createHash } = require('node:crypto');
+          const { spawn } = require('node:child_process');
+          const sha = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+          async function main() {
+            const root = process.env.U1_STATUS_ROOT;
+            const python = process.env.U1_PYTHON;
+            const pythonSha256 = process.env.U1_PYTHON_SHA256;
+            for (const value of [root, python]) {
+              assert(value && path.isAbsolute(value) && !/[\r\n\t]/.test(value));
+              assert.equal(fs.realpathSync(value), value);
+            }
+            assert(fs.lstatSync(root).isDirectory());
+            assert.equal(fs.lstatSync(root).uid, process.getuid());
+            assert.equal(fs.lstatSync(root).mode & 0o777, 0o700);
+            assert(fs.lstatSync(python).isFile());
+            fs.accessSync(python, fs.constants.X_OK);
+            assert.match(pythonSha256, /^[0-9a-f]{64}$/);
+            assert.equal(sha(python), pythonSha256);
+            const bin = path.join(root, 'u1-bin');
+            fs.mkdirSync(bin, { mode: 0o700 });
+            const launcher = path.join(bin, 'python3');
+            fs.symlinkSync(python, launcher);
+            assert.equal(fs.realpathSync(launcher), python);
+            assert.equal(sha(launcher), pythonSha256);
+            const env = {};
+            for (const key of ['HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME',
+              'XDG_DATA_HOME', 'TMPDIR']) {
+              assert(process.env[key]);
+              env[key] = process.env[key];
+            }
+            env.PATH = bin + ':/usr/bin:/bin';
+            env.PYTHONIOENCODING = 'utf-8';
+            env.PYTHONUTF8 = '1';
+            env.PYTHONDONTWRITEBYTECODE = '1';
+            env.PYTHONNOUSERSITE = '1';
+            const executable = process.execPath;
+            const argv = ['--test', '--test-concurrency=1',
+              'dist/tests/request-capture/intake.test.js', 'tests/request-capture/intake-registry.test.mjs'];
+            const cwd = process.cwd();
+            const timeoutMs = 180000, perStreamLimit = 1048576;
+            const streams = Object.fromEntries(['stdout', 'stderr'].map(name => [name,
+              { receivedBytes: 0, retainedBytes: 0, chunks: [], eof: false, closed: false, error: null }]));
+            let timedOut = false, overflow = false, error = null, exit = null, close = null;
+            const kills = [];
+            const start = process.hrtime.bigint();
+            const child = spawn(executable, argv, { cwd, env, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+            function stop(reason) {
+              // Direct child only: this does not clean up or contain grandchildren.
+              kills.push({ reason, signal: 'SIGKILL', sent: child.kill('SIGKILL') });
+              child.stdout.destroy();
+              child.stderr.destroy();
+            }
+            const timer = setTimeout(() => { timedOut = true; stop('timeout'); }, timeoutMs);
+            for (const name of ['stdout', 'stderr']) {
+              const stream = streams[name];
+              child[name].on('data', chunk => {
+                stream.receivedBytes += chunk.length;
+                const retained = chunk.subarray(0, Math.max(0, perStreamLimit - stream.retainedBytes));
+                if (retained.length) stream.chunks.push(Buffer.from(retained));
+                stream.retainedBytes += retained.length;
+                if (stream.receivedBytes > perStreamLimit && !overflow) { overflow = true; stop('overflow'); }
+              });
+              child[name].on('end', () => { stream.eof = true; });
+              child[name].on('close', () => { stream.closed = true; });
+              child[name].on('error', e => { stream.error = { message: e.message, code: e.code ?? null }; stop(name + '-error'); });
+            }
+            child.on('error', e => { error = { message: e.message, code: e.code ?? null }; stop('child-error'); });
+            child.on('exit', (status, signal) => {
+              exit = { status, signal };
+              if (status !== 0 || signal !== null) stop('unsuccessful-exit');
+            });
+            await new Promise(resolve => child.on('close', (status, signal) => {
+              close = { status, signal };
+              clearTimeout(timer);
+              resolve();
+            }));
+            const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
+            const output = {};
+            for (const name of ['stdout', 'stderr']) {
+              const { chunks, ...counts } = streams[name];
+              const bytes = Buffer.concat(chunks);
+              const file = path.join(root, 'u1.' + name);
+              fs.writeFileSync(file, bytes, { flag: 'wx', mode: 0o600 });
+              output[name] = { ...counts, file, sha256: sha(file) };
+              console.log('U1 raw ' + name + ' begin');
+              process.stdout.write(bytes);
+              console.log('\nU1 raw ' + name + ' end');
+            }
+            const receipt = { executable, nodeSha256: sha(executable), argv, cwd, env,
+              python, pythonSha256, launcher, timeoutMs, perStreamLimit, elapsedMs,
+              timedOut, overflow, error, exit, close, kills, output };
+            fs.writeFileSync(path.join(root, 'u1-result.json'), JSON.stringify(receipt, null, 2) + '\n',
+              { flag: 'wx', mode: 0o600 });
+            console.log(JSON.stringify(receipt));
+            assert.equal(error, null);
+            assert(!timedOut && !overflow && elapsedMs <= timeoutMs);
+            assert.deepEqual(exit, { status: 0, signal: null });
+            assert.deepEqual(close, { status: 0, signal: null });
+            for (const stream of Object.values(streams)) {
+              assert(stream.eof && stream.closed && stream.error === null);
+            }
+          }
+          main().catch(error => { console.error(error); process.exitCode = 1; });
+          U1_NODE
