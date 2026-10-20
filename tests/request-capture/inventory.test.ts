@@ -21,9 +21,16 @@ const inventoryWrapper = path.join(repoRoot, 'bin', 'request-capture-inventory.m
 const SECRET = 'INV_SECRET_1166';
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const HEX64 = /^[0-9a-f]{64}$/;
-const ITEM_KEYS = ['byte_len', 'capture_id', 'durability', 'provenance', 'received_at', 'sha256', 'task_binding'];
-const RECEIPT_KEYS = ['byte_len', 'capture_id', 'channel', 'durability', 'metadata', 'original_ref', 'provenance',
+const ITEM_KEYS = ['byte_len', 'capture_id', 'durability', 'ingress_id', 'ingress_id_provenance', 'provenance',
+  'received_at', 'receipt_schema_version', 'sha256', 'task_binding', 'upstream_delivery_id', 'upstream_id_status',
+  'upstream_scope_sha256'].sort();
+const RECEIPT_KEYS_V1 = ['byte_len', 'capture_id', 'channel', 'durability', 'metadata', 'original_ref', 'provenance',
   'received_at', 'schema_version', 'sha256', 'task_binding', 'upstream_delivery_id', 'upstream_namespace'];
+// #1166 U2: v2 adds the per-delivery ingress identity and the explicit upstream-id status.
+const RECEIPT_KEYS_V2 = [...RECEIPT_KEYS_V1, 'ingress_id', 'ingress_id_provenance', 'upstream_id_status',
+  'upstream_scope_sha256'].sort();
+const MINTED = 'minted-at-capture';
+const LEGACY = 'legacy-derived-from-capture-id';
 const FIXED: Record<string, unknown> = {
   schema_version: 1, snapshot: 'non-atomic-observation', order: 'received-at-then-capture-id-not-commit',
   raw_content_read: false, content_hash_verified: false, hook_outcome: 'unrecorded',
@@ -33,7 +40,9 @@ const MARKER = JSON.stringify({ schema_version: 1, kind: 'request-capture' });
 const MiB = 1024 * 1024;
 
 type Item = { capture_id: string; received_at: string; byte_len: number; sha256: string;
-  durability: string; task_binding: string; provenance: string };
+  durability: string; task_binding: string; provenance: string; ingress_id: string;
+  ingress_id_provenance: string; receipt_schema_version: number; upstream_delivery_id: null;
+  upstream_id_status: string; upstream_scope_sha256: null };
 type Anomaly = Record<string, unknown> & { code: string };
 type Inventory = Record<string, unknown> & { complete: boolean; items: Item[]; anomalies: Anomaly[] };
 type ListFn = (root: string, options?: { limit: number }) => Promise<unknown> | unknown;
@@ -117,8 +126,21 @@ function checkInventory(inventory: Inventory, forbidden: readonly string[] = [])
     assert.ok(['file-and-directory-fsync', 'file-fsync-only'].includes(item.durability), 'durability enum');
     assert.equal(item.task_binding, 'pending');
     assert.equal(item.provenance, 'unverified');
+    // #1166 U2: delivery identity is reported with explicit provenance, and a provider delivery
+    // identity is never claimed on a channel where none has been measured.
+    assert.match(item.ingress_id, UUID_V4);
+    assert.ok([MINTED, LEGACY].includes(item.ingress_id_provenance), 'ingress_id provenance enum');
+    assert.ok([1, 2].includes(item.receipt_schema_version), 'receipt_schema_version enum');
+    assert.equal(item.ingress_id_provenance === LEGACY, item.receipt_schema_version === 1,
+      'only a v1 receipt carries a legacy-derived delivery identity');
+    assert.equal(item.ingress_id === item.capture_id, item.receipt_schema_version === 1,
+      'a v2 delivery identity is minted, never a copy of the receipt id');
+    assert.equal(item.upstream_id_status, 'unavailable');
+    assert.equal(item.upstream_delivery_id, null);
+    assert.equal(item.upstream_scope_sha256, null);
   }
   assert.equal(new Set(inventory.items.map(item => item.capture_id)).size, inventory.items.length, 'distinct capture ids');
+  assert.equal(new Set(inventory.items.map(item => item.ingress_id)).size, inventory.items.length, 'distinct ingress ids');
   for (let index = 1; index < inventory.items.length; index++) {
     assert.ok(compareItems(inventory.items[index - 1]!, inventory.items[index]!) < 0, 'received_at then capture_id order');
   }
@@ -167,7 +189,8 @@ async function initStore(root: string): Promise<void> {
   }
 }
 
-function receiptFor(raw: Uint8Array, over: Json = {}): Json {
+/** A legacy v1 receipt exactly as the shipped 0.2.2 writer left it on disk. */
+function receiptForV1(raw: Uint8Array, over: Json = {}): Json {
   const sha = digest(raw);
   return {
     schema_version: 1, capture_id: randomUUID(), byte_len: raw.byteLength, sha256: sha,
@@ -178,9 +201,17 @@ function receiptFor(raw: Uint8Array, over: Json = {}): Json {
   };
 }
 
+/** The current v2 receipt: a minted per-delivery ingress id beside the capture id. */
+function receiptFor(raw: Uint8Array, over: Json = {}): Json {
+  return {
+    ...receiptForV1(raw), schema_version: 2, ingress_id: randomUUID(), ingress_id_provenance: MINTED,
+    upstream_id_status: 'unavailable', upstream_scope_sha256: null, ...over,
+  };
+}
+
 async function addReceipt(root: string, raw: Uint8Array, over: Json = {},
-  options: { blob?: boolean; name?: string; text?: string } = {}): Promise<Json> {
-  const receipt = receiptFor(raw, over);
+  options: { blob?: boolean; name?: string; text?: string; version?: 1 | 2 } = {}): Promise<Json> {
+  const receipt = options.version === 1 ? receiptForV1(raw, over) : receiptFor(raw, over);
   const blob = path.join(root, 'raw', `${digest(raw)}.bin`);
   if (options.blob !== false && !(await exists(blob))) await writePrivate(blob, raw);
   await writePrivate(path.join(root, 'receipts', options.name ?? `${String(receipt.capture_id)}.json`),
@@ -559,7 +590,7 @@ const BLOCKED_WITH_RECEIPT = WIN32 ? ['lock-release', 'stdout-error'] as const
   : ['directory-fsync', 'lock-release', 'stdout-error', 'weak-durability'] as const;
 
 for (const mode of BLOCKED_WITH_RECEIPT) {
-  test(`baseline repro: hook blocks (${mode}) yet a durable v1 receipt exists with no outcome field`, async t => {
+  test(`baseline repro: hook blocks (${mode}) yet a durable receipt exists with no outcome field`, async t => {
     const { root } = await fixture(t);
     const raw = Buffer.from(`prompt ${SECRET} ${mode}`);
     const run = await hook(t, root, mode); await run.wait('ready'); run.child.stdin!.end(raw);
@@ -576,7 +607,7 @@ for (const mode of BLOCKED_WITH_RECEIPT) {
     const rows = await receiptFiles(root);
     assert.equal(rows.length, 1, 'blocked prompt still left a receipt');
     const receipt = rows[0]!;
-    assert.deepEqual(Object.keys(receipt).sort(), RECEIPT_KEYS, 'receipt carries no hook outcome / admission field');
+    assert.deepEqual(Object.keys(receipt).sort(), RECEIPT_KEYS_V2, 'receipt carries no hook outcome / admission field');
     assert.equal(receipt.task_binding, 'pending');
     assert.equal(receipt.durability, WIN32 || mode === 'weak-durability' ? 'file-fsync-only' : 'file-and-directory-fsync');
     assert.deepEqual(await fs.readFile(path.join(root, String(receipt.original_ref))), raw);
@@ -654,6 +685,71 @@ test('inventory: equal bytes twice stay two distinct receipts (no text dedupe)',
   assert.deepEqual(new Set(inventory.items.map(item => item.capture_id)), new Set([first.capture_id, second.capture_id]));
   assert.deepEqual(inventory.items.map(item => item.sha256), [digest(raw), digest(raw)]);
   assert.deepEqual(await fs.readdir(path.join(root, 'raw')), [`${digest(raw)}.bin`]);
+  // One shared blob, two deliveries: the persisted ingress ids are reported, not recomputed.
+  assert.deepEqual(new Set(inventory.items.map(item => item.ingress_id)),
+    new Set([first.ingress_id, second.ingress_id]));
+  assert.equal(new Set(inventory.items.map(item => item.ingress_id)).size, 2);
+  for (const item of inventory.items) assert.equal(item.ingress_id_provenance, MINTED);
+});
+
+// #1166 U2 I1: the delivery identity the writer persisted is the one the reader reports.
+test('inventory: v2 delivery identity is read from disk, never reminted across repeated reads', async t => {
+  const { base, root } = await fixture(t);
+  const captured = await realCapture(root, Buffer.from(`v2 identity ${SECRET}`));
+  const before = await snapshot(base);
+  for (let pass = 0; pass < 3; pass++) {
+    const inventory = await list(root);
+    checkInventory(inventory, [root, base, SECRET]);
+    assertClean(inventory);
+    assert.deepEqual(inventory.items.map(item => item.ingress_id), [captured.ingress_id]);
+    assert.deepEqual(inventory.items.map(item => item.capture_id), [captured.capture_id]);
+    assert.equal(inventory.items[0]!.ingress_id_provenance, MINTED);
+    assert.equal(inventory.items[0]!.receipt_schema_version, 2);
+  }
+  assert.equal(await snapshot(base), before, 'reading the inventory three times changed nothing');
+});
+
+// #1166 U2 I2: a legacy v1 store stays readable, with provenance stated, and is never migrated.
+test('inventory: legacy v1 receipt is read with explicit legacy provenance and no disk rewrite', async t => {
+  const { base, root } = await fixture(t);
+  await initStore(root);
+  const raw = Buffer.from(`legacy ${SECRET}`);
+  const legacy = await addReceipt(root, raw, {}, { version: 1 });
+  const before = await snapshot(base);
+  const inventory = await list(root);
+  assert.equal(await snapshot(base), before, 'v1 store is byte-identical: no migration, no rewrite');
+  checkInventory(inventory, [root, base, SECRET]);
+  assertClean(inventory);
+  const [item] = inventory.items;
+  assert.equal(item!.capture_id, legacy.capture_id);
+  // The legacy identity is derived from the unique receipt id and labelled as derived; it is
+  // never presented as a measured upstream provider id.
+  assert.equal(item!.ingress_id, legacy.capture_id);
+  assert.equal(item!.ingress_id_provenance, LEGACY);
+  assert.equal(item!.receipt_schema_version, 1);
+  assert.equal(item!.upstream_id_status, 'unavailable');
+  assert.equal(item!.upstream_delivery_id, null);
+  // The stored document still has exactly the v1 key set: nothing was added to it.
+  assert.deepEqual(Object.keys((await receiptFiles(root))[0]!).sort(), RECEIPT_KEYS_V1);
+});
+
+// #1166 U2 I7: a mixed store is listed in full, each row carrying its own provenance.
+test('inventory: v1 and v2 receipts coexist, each with its own provenance, in receipt order', async t => {
+  const { base, root } = await fixture(t);
+  await initStore(root);
+  const earlier = '2026-01-01T00:00:01.000Z'; const later = '2026-01-01T00:00:02.000Z';
+  const one = await addReceipt(root, Buffer.from('legacy row'), { received_at: earlier }, { version: 1 });
+  const two = await addReceipt(root, Buffer.from('current row'), { received_at: later });
+  const before = await snapshot(base);
+  const inventory = await list(root);
+  assert.equal(await snapshot(base), before);
+  checkInventory(inventory, [root, base]);
+  assertClean(inventory);
+  assert.equal(inventory.order, 'received-at-then-capture-id-not-commit');
+  assert.deepEqual(inventory.items.map(item => item.capture_id), [one.capture_id, two.capture_id]);
+  assert.deepEqual(inventory.items.map(item => item.receipt_schema_version), [1, 2]);
+  assert.deepEqual(inventory.items.map(item => item.ingress_id_provenance), [LEGACY, MINTED]);
+  assert.deepEqual(inventory.items.map(item => item.ingress_id), [one.capture_id, two.ingress_id]);
 });
 
 test('inventory: SIGKILL before receipt leaves preserved orphan, dead lock and tmp residue across restart', async t => {
@@ -720,7 +816,54 @@ const RECEIPT_VARIANTS: Record<string, Variant> = {
     const receipt = receiptFor(raw); delete receipt.metadata;
     await addReceipt(root, raw, {}, { name: `${String(receipt.capture_id)}.json`, text: JSON.stringify(receipt) });
   } },
-  'schema-2': { codes: ['invalid_receipt'], setup: async (root, _b, raw) => { await addReceipt(root, raw, { schema_version: 2 }); } },
+  // Unknown and future versions stay fail-closed: v2 is now known, v3 and the rest are not.
+  'schema-3': { codes: ['invalid_receipt'], setup: async (root, _b, raw) => { await addReceipt(root, raw, { schema_version: 3 }); } },
+  'schema-0': { codes: ['invalid_receipt'], setup: async (root, _b, raw) => { await addReceipt(root, raw, { schema_version: 0 }); } },
+  'schema-string': { codes: ['invalid_receipt'], setup: async (root, _b, raw) => { await addReceipt(root, raw, { schema_version: '2' }); } },
+  'schema-null': { codes: ['invalid_receipt'], setup: async (root, _b, raw) => { await addReceipt(root, raw, { schema_version: null }); } },
+  'schema-absent': { codes: ['invalid_receipt'], setup: async (root, _b, raw) => {
+    const receipt = receiptFor(raw); delete receipt.schema_version;
+    await addReceipt(root, raw, {}, { name: `${String(receipt.capture_id)}.json`, text: JSON.stringify(receipt) });
+  } },
+  // A v2 shape under a v1 version, and a v1 shape under a v2 version: neither is guessed.
+  'v1-version-with-v2-keys': { codes: ['invalid_receipt'], setup: async (root, _b, raw) => {
+    await addReceipt(root, raw, { schema_version: 1 });
+  } },
+  'v2-version-with-v1-keys': { codes: ['invalid_receipt'], setup: async (root, _b, raw) => {
+    await addReceipt(root, raw, { schema_version: 2 }, { version: 1 });
+  } },
+  // The delivery identity is never absent, never a non-uuid4 and never a copy of the receipt id.
+  'ingress-absent': { codes: ['invalid_receipt'], setup: async (root, _b, raw) => {
+    const receipt = receiptFor(raw); delete receipt.ingress_id;
+    await addReceipt(root, raw, {}, { name: `${String(receipt.capture_id)}.json`, text: JSON.stringify(receipt) });
+  } },
+  'ingress-null': { codes: ['invalid_receipt'], setup: async (root, _b, raw) => { await addReceipt(root, raw, { ingress_id: null }); } },
+  'ingress-not-uuid4': { codes: ['invalid_receipt'], setup: async (root, _b, raw) => {
+    await addReceipt(root, raw, { ingress_id: '6ba7b810-9dad-11d1-80b4-00c04fd430c8' });
+  } },
+  'ingress-is-digest': { codes: ['invalid_receipt'], setup: async (root, _b, raw) => { await addReceipt(root, raw, { ingress_id: digest(raw) }); } },
+  'ingress-equals-capture': { codes: ['invalid_receipt'], setup: async (root, _b, raw) => {
+    const id = randomUUID(); await addReceipt(root, raw, { capture_id: id, ingress_id: id }, { name: `${id}.json` });
+  } },
+  'ingress-provenance-legacy-on-v2': { codes: ['invalid_receipt'], setup: async (root, _b, raw) => {
+    await addReceipt(root, raw, { ingress_id_provenance: LEGACY });
+  } },
+  'ingress-provenance-unknown': { codes: ['invalid_receipt'], setup: async (root, _b, raw) => {
+    await addReceipt(root, raw, { ingress_id_provenance: 'provider' });
+  } },
+  // Forged or unbacked upstream identity, refused in both directions (U2 §6 N-R2c).
+  'upstream-available-without-id': { codes: ['invalid_receipt'], setup: async (root, _b, raw) => {
+    await addReceipt(root, raw, { upstream_id_status: 'available' });
+  } },
+  'upstream-available-with-id': { codes: ['invalid_receipt'], setup: async (root, _b, raw) => {
+    await addReceipt(root, raw, { upstream_id_status: 'available', upstream_delivery_id: SECRET });
+  } },
+  'upstream-status-unknown': { codes: ['invalid_receipt'], setup: async (root, _b, raw) => {
+    await addReceipt(root, raw, { upstream_id_status: 'pending' });
+  } },
+  'upstream-scope-present': { codes: ['invalid_receipt'], setup: async (root, _b, raw) => {
+    await addReceipt(root, raw, { upstream_scope_sha256: digest(raw) });
+  } },
   'uppercase-id': { codes: ['invalid_receipt'], setup: async (root, _b, raw) => {
     await addReceipt(root, raw, { capture_id: upper }, { name: `${upper}.json` });
   } },

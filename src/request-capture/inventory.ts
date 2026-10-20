@@ -12,14 +12,32 @@ export type InventoryAnomalyCode =
   | "bad_mode" | "symlink" | "tmp_residue" | "lock_present" | "orphan_blob" | "scan_limit"
   | "changed_during_scan" | "io_error";
 
+/**
+ * How the reported delivery identity was obtained (#1166 U2).
+ *
+ * `minted-at-capture` is the v2 writer's own per-delivery `ingress_id`, read back verbatim.
+ * `legacy-derived-from-capture-id` is a v1 receipt's `capture_id` reused as the delivery
+ * identity. That is licensed only because the shipped writer mints one receipt per
+ * `captureSubmittedPrompt` call and refuses a colliding receipt path (`receipt.ts` `writeNew`),
+ * so one valid v1 receipt is provably one durable delivery. It is a documented derivation, never
+ * a measured upstream provider id — a malformed or ambiguous v1 receipt is refused instead.
+ */
+export type IngressIdProvenance = "minted-at-capture" | "legacy-derived-from-capture-id";
+
 export interface InventoryItem {
   capture_id: string;
+  ingress_id: string;
+  ingress_id_provenance: IngressIdProvenance;
+  receipt_schema_version: 1 | 2;
   received_at: string;
   byte_len: number;
   sha256: string;
   durability: CaptureReceipt["durability"];
   task_binding: "pending";
   provenance: "unverified";
+  upstream_delivery_id: null;
+  upstream_id_status: "unavailable";
+  upstream_scope_sha256: null;
 }
 
 /** `count` is exact; `refs` holds only validated capture IDs or digests and may be shorter. */
@@ -54,11 +72,18 @@ const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 const SHA256 = /^[0-9a-f]{64}$/;
 const RECEIPT_NAME = /^([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/;
 const BLOB_NAME = /^([0-9a-f]{64})\.bin$/;
-const RECEIPT_KEYS = [
+const RECEIPT_FIELDS_V1 = [
   "byte_len", "capture_id", "channel", "durability", "metadata", "original_ref", "provenance",
   "received_at", "schema_version", "sha256", "task_binding", "upstream_delivery_id",
   "upstream_namespace",
-].join(",");
+];
+const RECEIPT_KEYS_V1 = RECEIPT_FIELDS_V1.join(",");
+// v2 adds the persisted delivery identity and the explicit upstream-id status. Each version has
+// its own exact key set, so a version split never loosens the shape check.
+const RECEIPT_KEYS_V2 = [
+  ...RECEIPT_FIELDS_V1, "ingress_id", "ingress_id_provenance", "upstream_id_status",
+  "upstream_scope_sha256",
+].sort().join(",");
 const METADATA_KEYS = ["hook_event_name", "model", "session_id", "turn_id"].join(",");
 const DURABILITY = new Set(["file-and-directory-fsync", "file-fsync-only"]);
 
@@ -202,22 +227,32 @@ function isCanonicalIso(value: unknown): value is string {
   return Number.isFinite(time) && new Date(time).toISOString() === value;
 }
 
-/** Exact v1 receipt contract of receipt.ts; returns the item or null. */
+/**
+ * Exact v1 **or** v2 receipt contract of receipt.ts; returns the item or null.
+ * An unknown, future, absent or wrongly typed `schema_version` fails closed before any other
+ * field is looked at, so nothing is ever guessed from the remaining keys.
+ */
 function validateReceipt(value: unknown, captureId: string): InventoryItem | null {
-  if (!isRecord(value) || Object.keys(value).sort().join(",") !== RECEIPT_KEYS) return null;
+  if (!isRecord(value)) return null;
+  const version = value.schema_version;
+  if (version !== 1 && version !== 2) return null;
+  if (Object.keys(value).sort().join(",") !== (version === 2 ? RECEIPT_KEYS_V2 : RECEIPT_KEYS_V1)) {
+    return null;
+  }
   const metadata = value.metadata;
   if (!isRecord(metadata) || Object.keys(metadata).sort().join(",") !== METADATA_KEYS
     || !Object.values(metadata).every((field) => field === null || typeof field === "string")) {
     return null;
   }
   const { sha256, byte_len: byteLen, durability, received_at: receivedAt } = value;
-  if (value.schema_version !== 1
-    || value.capture_id !== captureId || !UUID_V4.test(captureId)
+  if (value.capture_id !== captureId || !UUID_V4.test(captureId)
     || typeof byteLen !== "number" || !Number.isSafeInteger(byteLen) || byteLen < 0
     || typeof sha256 !== "string" || !SHA256.test(sha256)
     || value.original_ref !== `raw/${sha256}.bin`
     || value.channel !== "codex-native"
     || value.upstream_namespace !== "codex/session"
+    // No provider identity has been measured on this channel, so a receipt carrying one is
+    // malformed rather than informative: an upstream identity is never fabricated.
     || value.upstream_delivery_id !== null
     || !isCanonicalIso(receivedAt)
     || value.provenance !== "unverified"
@@ -225,14 +260,34 @@ function validateReceipt(value: unknown, captureId: string): InventoryItem | nul
     || typeof durability !== "string" || !DURABILITY.has(durability)) {
     return null;
   }
+  // The delivery identity is read, never minted here: a read is not a delivery.
+  let ingressId = captureId;
+  let ingressProvenance: IngressIdProvenance = "legacy-derived-from-capture-id";
+  if (version === 2) {
+    const minted = value.ingress_id;
+    if (typeof minted !== "string" || !UUID_V4.test(minted) || minted === captureId
+      || value.ingress_id_provenance !== "minted-at-capture"
+      || value.upstream_id_status !== "unavailable"
+      || value.upstream_scope_sha256 !== null) {
+      return null;
+    }
+    ingressId = minted;
+    ingressProvenance = "minted-at-capture";
+  }
   return {
     capture_id: captureId,
+    ingress_id: ingressId,
+    ingress_id_provenance: ingressProvenance,
+    receipt_schema_version: version,
     received_at: receivedAt,
     byte_len: byteLen,
     sha256,
     durability: durability as CaptureReceipt["durability"],
     task_binding: "pending",
     provenance: "unverified",
+    upstream_delivery_id: null,
+    upstream_id_status: "unavailable",
+    upstream_scope_sha256: null,
   };
 }
 
