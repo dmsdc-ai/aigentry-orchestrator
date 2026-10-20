@@ -640,3 +640,120 @@ test("results map onto the shipped exit codes, and nothing invents a new one", (
   }
   assert.deepEqual([...new Set(Object.values(expected))].sort(), [0, 4, 8, 9]);
 });
+
+// Notice controls are appended; every original lifecycle/oracle byte above is retained.
+import { applyIntakeNotice, intakeNoticeId, type IntakeNoticeEvent,
+  type IntakeNoticeRecord } from "../../src/request-capture/intake.js";
+
+function noticeClaimEvent(attempt = 1): IntakeNoticeEvent {
+  return { action: "claim", ingress_id: uuid(1), notice_id: intakeNoticeId(uuid(1)),
+    attempt, claim: `claim_${attempt}`, owner: "owner_1", at: at(attempt * 10),
+    previous_attempt: attempt - 1, previous_claim: attempt === 1 ? null : `claim_${attempt - 1}` };
+}
+function noticeFact(action: "result" | "resolve" | "ack", attempt = 1,
+  status: "unknown" | "not_sent" | "sent" = "sent"): IntakeNoticeEvent {
+  const common = { ingress_id: uuid(1), notice_id: intakeNoticeId(uuid(1)), attempt,
+    claim: `claim_${attempt}`, owner: "owner_1", at: at(attempt * 10 + (action === "result" ? 1 : 2)),
+    evidence_sha256: hex64(attempt) };
+  if (action === "ack") return { ...common, action };
+  if (action === "resolve" && status === "unknown") throw Error("invalid fixture");
+  return { ...common, action, status, retry_at: status === "not_sent" ? at(attempt * 10 + 3) : null } as IntakeNoticeEvent;
+}
+function noticeStep(doc: IntakeDocument, event: IntakeNoticeEvent,
+  result = "intake_written"): IntakeDocument {
+  const before = JSON.stringify(doc), outcome = applyIntakeNotice(doc, event);
+  assert.equal(outcome.result, result, outcome.detail);
+  assert.equal(JSON.stringify(doc), before, "pure input never mutated");
+  if (result !== "intake_written") { assert.equal(outcome.document, null); return doc; }
+  assert.ok(outcome.document);
+  assert.equal(outcome.document.generation, doc.generation);
+  const { notice: _beforeNotice, ...beforeRow } = row(doc, 1);
+  const { notice: _afterNotice, ...afterRow } = row(outcome.document, 1);
+  assert.deepEqual(afterRow, beforeRow, "transport facts change no lifecycle field");
+  assert.deepEqual((row(outcome.document, 1).notice as IntakeNoticeRecord).events.slice(0, -1),
+    (row(doc, 1).notice as IntakeNoticeRecord | null)?.events ?? [], "evidence prefix retained");
+  return outcome.document;
+}
+
+test("N-CLAIM deterministic identity, exact replay, competing owner and reserved token", () => {
+  let doc = ok(emptyIntakeDocument(), capture(1));
+  assert.equal(intakeNoticeId(uuid(1)), intakeNoticeId(uuid(1)));
+  assert.notEqual(intakeNoticeId(uuid(1)), intakeNoticeId(uuid(2)));
+  const claim = noticeClaimEvent();
+  noticeStep(doc, { ...claim, claim: "none" }, "intake_malformed");
+  noticeStep(doc, { ...claim, claim: "claim\n" }, "intake_malformed");
+  noticeStep(doc, { ...claim, notice_id: hex64(4) }, "intake_identity_collision");
+  doc = noticeStep(doc, claim);
+  noticeStep(doc, { ...claim }, "intake_notice_replay");
+  noticeStep(doc, { ...claim, claim: "other", owner: "other" }, "intake_notice_race");
+  noticeStep(doc, { ...noticeClaimEvent(2), at: at(10000) }, "intake_transition_refused");
+  noticeStep(doc, { ...noticeFact("result"), owner: "other" }, "intake_transition_refused");
+  assert.equal(intakeExitCode({ result: "intake_notice_replay" }), 8);
+  assert.equal(intakeExitCode({ result: "intake_notice_race" }), 8);
+});
+
+test("N-UNKNOWN measured resolution alone enables retry with same identity and new attempt", () => {
+  let doc = noticeStep(ok(emptyIntakeDocument(), capture(1)), noticeClaimEvent());
+  doc = noticeStep(doc, noticeFact("result", 1, "unknown"));
+  noticeStep(doc, { ...noticeClaimEvent(2), at: at(10000) }, "intake_transition_refused");
+  noticeStep(doc, noticeFact("result", 1, "not_sent"), "intake_transition_refused");
+  doc = noticeStep(doc, noticeFact("resolve", 1, "not_sent"));
+  noticeStep(doc, { ...noticeClaimEvent(2), at: at(12) }, "intake_transition_refused");
+  doc = noticeStep(doc, noticeClaimEvent(2));
+  noticeStep(doc, noticeFact("result", 1, "sent"), "intake_transition_refused");
+  doc = noticeStep(doc, noticeFact("result", 2, "sent"));
+  noticeStep(doc, noticeClaimEvent(3), "intake_transition_refused");
+  doc = noticeStep(doc, noticeFact("ack", 2));
+  noticeStep(doc, noticeFact("ack", 2), "intake_notice_replay");
+  noticeStep(doc, { ...noticeFact("ack", 2), evidence_sha256: hex64(9) }, "intake_transition_refused");
+  assert.equal(row(doc, 1).answered_at, null);
+  assert.equal(row(doc, 1).state, "queued");
+});
+
+test("N-RACE paused/cancelled claims refuse, issued results persist without re-enabling work", () => {
+  const fresh = ok(emptyIntakeDocument(), capture(1));
+  const pause: IntakeEvent = { kind: "pause", ingress_id: uuid(1), at: at(11),
+    reason: "blocked", owner: "owner", resume_condition: "review" };
+  noticeStep(ok(fresh, pause), noticeClaimEvent(), "intake_transition_refused");
+  for (const event of [pause, { kind: "cancel", ingress_id: uuid(1), at: at(11), reason: "cancelled" } as IntakeEvent]) {
+    let doc = ok(noticeStep(fresh, noticeClaimEvent()), event);
+    noticeStep(doc, noticeFact("ack"), "intake_transition_refused");
+    doc = noticeStep(doc, noticeFact("result"));
+    noticeStep(doc, noticeFact("ack"));
+  }
+  const closed = ok(fresh, { kind: "cancel", ingress_id: uuid(1), at: at(12), reason: "cancelled" });
+  noticeStep(closed, noticeClaimEvent(), "intake_transition_refused");
+  noticeStep(emptyIntakeDocument(), noticeClaimEvent(), "intake_not_found");
+});
+
+test("N-VALIDATION malformed new logs fail closed and legacy unknown claims cannot be stolen", () => {
+  const fresh = ok(emptyIntakeDocument(), capture(1));
+  row(fresh, 1).notice = { claim: "none", owner: "legacy", at: "legacy" };
+  assert.equal(validateIntakeDocument(fresh).result, "ok");
+  noticeStep(fresh, noticeClaimEvent(), "intake_transition_refused");
+  const doc = noticeStep(ok(emptyIntakeDocument(), capture(1)), noticeClaimEvent());
+  const valid = row(doc, 1).notice as IntakeNoticeRecord;
+  for (const bad of [{ ...valid, generation: 2 }, { ...valid, version: true },
+    { ...valid, notice_id: hex64(9) }, { ...valid, path: "/tmp" },
+    { ...valid, events: Array(65).fill(noticeClaimEvent()) },
+    { ...valid, events: [{ ...noticeClaimEvent(), attempt: true }] },
+    { ...valid, events: [{ ...noticeClaimEvent(), at: "2026-02-30T00:00:00Z" }] },
+    { ...valid, events: [{ ...noticeClaimEvent(), claim: "none" }] }]) {
+    const broken = structuredClone(doc); row(broken, 1).notice = bad as unknown as IntakeNoticeRecord;
+    noticeStep(broken, noticeFact("result"), "registry_corrupt");
+  }
+  for (const over of [{ at: "2026-02-30T00:00:00Z" }, { attempt: 1.5 }, { attempt: true },
+    { owner: "../path" }, { evidence_sha256: "oops" }, { retry_at: at(1) }, { command: "run" }]) {
+    noticeStep(doc, { ...noticeFact("result"), ...over } as unknown as IntakeNoticeEvent, "intake_malformed");
+  }
+});
+
+test("N-BOUND attempt evidence is retained at exhaustion instead of pruned", () => {
+  let doc = ok(emptyIntakeDocument(), capture(1));
+  for (let attempt = 1; attempt <= 16; attempt++) {
+    doc = noticeStep(doc, noticeClaimEvent(attempt));
+    doc = noticeStep(doc, noticeFact("result", attempt, "not_sent"));
+  }
+  noticeStep(doc, noticeClaimEvent(17), "intake_bounds_exceeded");
+  assert.equal((row(doc, 1).notice as IntakeNoticeRecord).events.length, 32);
+});

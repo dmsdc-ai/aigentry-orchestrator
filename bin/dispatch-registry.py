@@ -2148,6 +2148,7 @@ INTAKE_EXITS = {"invalid_argument": USAGE, "intake_malformed": USAGE,
                 "intake_transition_refused": USAGE, "intake_identity_collision": USAGE,
                 "intake_bounds_exceeded": USAGE, "intake_not_found": USAGE,
                 "intake_replay": DEDUPLICATED, "intake_upstream_duplicate": DEDUPLICATED,
+                "intake_notice_replay": DEDUPLICATED, "intake_notice_race": DEDUPLICATED,
                 "intake_archived": DEDUPLICATED,
                 "intake_archive_unbounded": REGISTRY_ERROR}
 INTAKE_IMMUTABLE = ("capture_id", "channel", "upstream_namespace", "upstream_delivery_id",
@@ -2200,6 +2201,8 @@ def intake_validate(doc: object) -> dict:
         if ingress in seen:
             raise RegistryError("registry_corrupt", f"duplicate ingress_id {ingress!r}")
         seen.add(ingress)
+        if "notice" not in row or not intake_notice_valid(row["notice"], ingress):
+            raise RegistryError("registry_corrupt", f"{ingress}: invalid notice")
         for key in INTAKE_FORBIDDEN_KEYS:
             if key in row:
                 raise RegistryError("registry_corrupt",
@@ -2665,6 +2668,168 @@ def op_intake_event(args: dict) -> int:
     return OK
 
 
+INTAKE_NOTICE_MAX_EVENTS = 64
+INTAKE_NOTICE_MAX_ATTEMPTS = 16
+INTAKE_NOTICE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+
+
+def intake_notice_id(ingress: str) -> str:
+    return hashlib.sha256("\0".join(("intake-notice-v1", ingress, "1")).encode("utf-8")).hexdigest()
+
+
+def intake_notice_time(value: object) -> bool:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", value):
+        return False
+    try:
+        datetime.datetime.fromisoformat(value[:-1] + "+00:00")
+        return True
+    except ValueError:
+        return False
+
+
+def intake_notice_token(value: object, claim: bool = False) -> bool:
+    return (isinstance(value, str) and INTAKE_NOTICE_TOKEN.fullmatch(value) is not None
+            and (not claim or value != "none"))
+
+
+def intake_notice_integer(value: object, low: int, high: int) -> bool:
+    return type(value) is int and low <= value <= high
+
+
+def intake_notice_event_valid(e: object) -> bool:
+    if not isinstance(e, dict):
+        return False
+    common = {"action", "ingress_id", "notice_id", "attempt", "claim", "owner", "at"}
+    action = e.get("action")
+    extra = ({"previous_attempt", "previous_claim"} if action == "claim"
+             else {"status", "evidence_sha256", "retry_at"} if action in ("result", "resolve")
+             else {"evidence_sha256"} if action == "ack" else None)
+    if extra is None or set(e) != common | extra:
+        return False
+    if (not isinstance(e["ingress_id"], str) or not INTAKE_UUID4_RE.fullmatch(e["ingress_id"])
+            or not isinstance(e["notice_id"], str) or not HEX64_RE.fullmatch(e["notice_id"])
+            or not intake_notice_integer(e["attempt"], 1, INTAKE_NOTICE_MAX_ATTEMPTS + 1)
+            or not intake_notice_token(e["claim"], True) or not intake_notice_token(e["owner"])
+            or not intake_notice_time(e["at"])):
+        return False
+    if action == "claim":
+        return (intake_notice_integer(e["previous_attempt"], 0, INTAKE_NOTICE_MAX_ATTEMPTS)
+                and (e["previous_claim"] is None if e["previous_attempt"] == 0
+                     else intake_notice_token(e["previous_claim"], True)))
+    if not isinstance(e["evidence_sha256"], str) or not HEX64_RE.fullmatch(e["evidence_sha256"]):
+        return False
+    if action == "ack":
+        return True
+    if e["status"] not in ("sent", "not_sent") and not (action == "result" and e["status"] == "unknown"):
+        return False
+    return ((intake_notice_time(e["retry_at"]) and e["retry_at"] >= e["at"])
+            if e["status"] == "not_sent" else e["retry_at"] is None)
+
+
+def intake_notice_append(events: list, e: dict) -> str | None:
+    if e["attempt"] > INTAKE_NOTICE_MAX_ATTEMPTS:
+        return "intake_bounds_exceeded"
+    last = events[-1] if events else None
+    if e["action"] == "claim":
+        if (e["previous_attempt"] != (last["attempt"] if last else 0)
+                or e["previous_claim"] != (last["claim"] if last else None)):
+            return "intake_notice_race"
+        if (e["attempt"] != (last["attempt"] if last else 0) + 1
+                or any(old["action"] == "claim" and old["claim"] == e["claim"] for old in events)
+                or (last and (last["action"] not in ("result", "resolve")
+                              or last["status"] != "not_sent" or last["retry_at"] is None
+                              or e["at"] < last["retry_at"]))):
+            return "intake_transition_refused"
+    else:
+        if not last or any(e[k] != last[k] for k in ("attempt", "claim", "owner")):
+            return "intake_transition_refused"
+        allowed = (last["action"] == "claim" if e["action"] == "result"
+                   else last["action"] == "result" and last["status"] == "unknown"
+                   if e["action"] == "resolve"
+                   else last["action"] in ("result", "resolve") and last["status"] == "sent")
+        if not allowed:
+            return "intake_transition_refused"
+    if last and e["at"] < last["at"]:
+        return "intake_transition_refused"
+    return "intake_bounds_exceeded" if len(events) >= INTAKE_NOTICE_MAX_EVENTS else None
+
+
+def intake_notice_valid(value: object, ingress: str) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, dict):
+        return False
+    if "version" not in value:
+        return set(value) == {"claim", "owner", "at"} and all(isinstance(v, str) for v in value.values())
+    if (set(value) != {"version", "notice_id", "generation", "events"}
+            or type(value["version"]) is not int or value["version"] != 1
+            or type(value["generation"]) is not int or value["generation"] != 1
+            or value["notice_id"] != intake_notice_id(ingress)
+            or not isinstance(value["events"], list)
+            or not 1 <= len(value["events"]) <= INTAKE_NOTICE_MAX_EVENTS):
+        return False
+    prior = []
+    for e in value["events"]:
+        if (not intake_notice_event_valid(e) or e["ingress_id"] != ingress
+                or e["notice_id"] != value["notice_id"] or intake_notice_append(prior, e) is not None):
+            return False
+        prior.append(e)
+    return True
+
+
+def intake_notice_mutation(doc: dict, e: dict) -> dict:
+    if not intake_notice_event_valid(e):
+        raise IntakeRefusal("intake_malformed", "invalid notice event")
+    if e["notice_id"] != intake_notice_id(e["ingress_id"]):
+        raise IntakeRefusal("intake_identity_collision", "notice identity does not match ingress")
+    row = intake_find(doc, e["ingress_id"])
+    if row is None:
+        raise IntakeRefusal("intake_not_found", "notice target is not in hot ledger")
+    notice = row.get("notice")
+    if notice is not None and "version" not in notice:
+        raise IntakeRefusal("intake_transition_refused", "legacy claim outcome is unknown")
+    events = notice["events"] if notice else []
+    if e in events:
+        raise IntakeRefusal("intake_notice_replay", "exact retained notice event")
+    refused = intake_notice_append(events, e)
+    if refused:
+        raise IntakeRefusal(refused, "notice append refused")
+    if e["action"] == "claim" and (row.get("state") != "queued" or row.get("work_state") != "unstarted"
+            or any(row.get(k) is not None for k in ("pause", "superseded_by", "result", "failure"))):
+        raise IntakeRefusal("intake_transition_refused", "notice target is not queued and unstarted")
+    row["notice"] = {"version": 1, "notice_id": e["notice_id"], "generation": 1, "events": [*events, dict(e)]}
+    return row
+
+
+def op_intake_notice(args: dict) -> int:
+    """Evidence custody only: no transport/probing, lifecycle mutation or authenticity claim.
+
+    Archived rows have no ACK/recovery writer in this slice; only hot rows are addressable.
+    """
+    try:
+        e = {k.replace("-", "_"): v for k, v in args.items() if k != "now"}
+        e["at"] = args.get("now")
+        for key in ("attempt", "previous_attempt"):
+            if key in e:
+                if not re.fullmatch(r"0|[1-9][0-9]{0,2}", e[key]):
+                    raise IntakeRefusal("intake_malformed", "invalid notice integer")
+                e[key] = int(e[key])
+        for key in ("previous_claim", "retry_at"):
+            if e.get(key) == "none":
+                e[key] = None
+        with _Lock(intake_lock_path()):
+            doc = intake_load()
+            row = intake_notice_mutation(doc, e)
+            intake_commit(doc)
+    except IntakeRefusal as exc:
+        emit({"result": exc.result, "detail": exc.detail, "completion_fact": None})
+        return INTAKE_EXITS[exc.result]
+    emit({"result": "intake_written", "action": e["action"], "ingress_id": e["ingress_id"],
+          "notice_id": e["notice_id"], "state": row["state"], "work_state": row["work_state"],
+          "generation": doc["generation"], "completion_fact": None})
+    return OK
+
+
 def op_intake_list(args: dict) -> int:
     """Read-only and unlocked, like get/list/snapshot/report-list.
 
@@ -2765,6 +2930,7 @@ OPS = {
     "check-dedup": (op_check_dedup, ("sid", "ref-hash")),
     "get": (op_get, ("sid",)),
     "intake-event": (op_intake_event, ("kind", "ingress-id")),
+    "intake-notice": (op_intake_notice, ("action", "ingress-id", "notice-id", "attempt", "claim", "owner", "now")),
     "intake-list": (op_intake_list, ()),
     "intake-prune": (op_intake_prune, ()),
     "list": (op_list, ()),
@@ -2795,6 +2961,8 @@ FLAGS = {
                      "verdict", "scope", "result-ref", "evidence-sha256", "reason", "owner",
                      "resume-condition", "depends-on", "supersedes", "now"},
     "intake-list": {"state", "ingress-id", "jsonl"},
+    "intake-notice": {"action", "ingress-id", "notice-id", "attempt", "claim", "owner", "now",
+                      "previous-attempt", "previous-claim", "status", "evidence-sha256", "retry-at"},
     "intake-prune": {"older-than-seconds", "now"},
     "list": {"fields", "live", "not-retired", "keep-alive", "due-before",
              "jsonl", "limit", "after", "since-generation"},
@@ -2840,6 +3008,8 @@ def parse(argv: list[str]) -> tuple[str, dict]:
         if not token.startswith("--"):
             raise RegistryError("invalid_argument", f"unexpected argument {token!r}")
         name = token[2:]
+        if op == "intake-notice" and name in args:
+            raise RegistryError("invalid_argument", f"{op}: duplicate field {name!r}")
         if name not in allowed:
             raise RegistryError("invalid_argument", f"{op}: unknown field {name!r}")
         if name in BOOLEAN_FLAGS:

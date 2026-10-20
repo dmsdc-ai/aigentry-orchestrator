@@ -48,6 +48,7 @@ export type IntakeResultCode =
   | "invalid_argument" | "intake_malformed" | "intake_transition_refused"
   | "intake_identity_collision" | "intake_bounds_exceeded" | "intake_not_found"
   | "intake_replay" | "intake_upstream_duplicate" | "intake_archived"
+  | "intake_notice_replay" | "intake_notice_race"
   | "intake_archive_unbounded" | "registry_corrupt";
 
 export interface IntakeHistoryEntry {
@@ -100,11 +101,37 @@ export interface IntakeRevision {
   revision: string;
 }
 
-/** Written by the U3 pump; U1 only carries it so a claim survives a restart. */
+/** Legacy ownership has unknown outcome and is never reclaimed by this slice. */
 export interface IntakeNotice {
   claim: string;
   owner: string;
   at: string;
+}
+
+interface IntakeNoticeCommon {
+  action: "claim" | "result" | "resolve" | "ack";
+  ingress_id: string;
+  notice_id: string;
+  attempt: number;
+  claim: string;
+  owner: string;
+  at: string;
+}
+
+export type IntakeNoticeEvent = IntakeNoticeCommon & (
+  | { action: "claim"; previous_attempt: number; previous_claim: string | null }
+  | { action: "result"; status: "unknown" | "not_sent" | "sent";
+      evidence_sha256: string; retry_at: string | null }
+  | { action: "resolve"; status: "not_sent" | "sent";
+      evidence_sha256: string; retry_at: string | null }
+  | { action: "ack"; evidence_sha256: string }
+);
+
+export interface IntakeNoticeRecord {
+  version: 1;
+  notice_id: string;
+  generation: 1;
+  events: IntakeNoticeEvent[];
 }
 
 export interface IntakeRequest {
@@ -132,7 +159,7 @@ export interface IntakeRequest {
   revisions: IntakeRevision[];
   review: IntakeReview[];
   binding: IntakeBinding[];
-  notice: IntakeNotice | null;
+  notice: IntakeNotice | IntakeNoticeRecord | null;
   last_event_at: string;
   history: IntakeHistoryEntry[];
 }
@@ -262,6 +289,8 @@ const EXIT_CODES: Record<IntakeResultCode, number> = {
   intake_bounds_exceeded: 4,
   intake_not_found: 4,
   intake_replay: 8,
+  intake_notice_replay: 8,
+  intake_notice_race: 8,
   intake_upstream_duplicate: 8,
   intake_archived: 8,
   intake_archive_unbounded: 9,
@@ -326,6 +355,7 @@ export function validateIntakeDocument(
     }
     if (seen.has(id)) return corrupt(`duplicate ingress_id ${JSON.stringify(id)}`);
     seen.add(id);
+    if (!validIntakeNotice(fields.notice, id)) return corrupt(`${id}: invalid notice`);
     for (const key of INTAKE_FORBIDDEN_KEYS) {
       if (key in fields) {
         return corrupt(`${id}: forbidden field ${JSON.stringify(key)}; the intake ledger stores `
@@ -761,6 +791,127 @@ export function applyIntakeEvent(
   return event.kind === "captured" || event.kind === "amend"
     ? creation(doc, event, context)
     : mutate(doc, event);
+}
+
+/** Stable logical identity; attempts never choose a replacement identity. */
+export function intakeNoticeId(ingressId: string): string {
+  return createHash("sha256").update(["intake-notice-v1", ingressId, "1"].join("\u0000"),
+    "utf8").digest("hex");
+}
+
+const NOTICE_MAX_EVENTS = 64;
+const NOTICE_MAX_ATTEMPTS = 16;
+const NOTICE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const noticeObject = (v: unknown): v is Record<string, unknown> =>
+  v !== null && typeof v === "object" && !Array.isArray(v);
+const noticeKeys = (v: Record<string, unknown>, keys: readonly string[]): boolean =>
+  Object.keys(v).length === keys.length && keys.every(k => Object.hasOwn(v, k));
+const noticeMatches = (v: unknown, pattern: RegExp): v is string =>
+  typeof v === "string" && pattern.exec(v)?.[0] === v;
+const noticeToken = (v: unknown): v is string => noticeMatches(v, NOTICE_TOKEN);
+const noticeClaim = (v: unknown): v is string => noticeToken(v) && v !== "none";
+const noticeInteger = (v: unknown, min: number, max: number): v is number =>
+  typeof v === "number" && Number.isInteger(v) && v >= min && v <= max;
+const noticeTime = (v: unknown): v is string => {
+  if (typeof v !== "string" || !RFC3339_Z.test(v) || v.startsWith("0000")) return false;
+  const time = Date.parse(v);
+  return Number.isFinite(time) && new Date(time).toISOString() === v.slice(0, -1) + ".000Z";
+};
+
+function validNoticeEvent(v: unknown): v is IntakeNoticeEvent {
+  if (!noticeObject(v)) return false;
+  const common = ["action", "ingress_id", "notice_id", "attempt", "claim", "owner", "at"];
+  const extra = v.action === "claim" ? ["previous_attempt", "previous_claim"]
+    : v.action === "result" || v.action === "resolve" ? ["status", "evidence_sha256", "retry_at"]
+      : v.action === "ack" ? ["evidence_sha256"] : null;
+  if (!extra || !noticeKeys(v, [...common, ...extra])
+    || !noticeMatches(v.ingress_id, UUID4) || !noticeMatches(v.notice_id, HEX64)
+    || !noticeInteger(v.attempt, 1, NOTICE_MAX_ATTEMPTS + 1)
+    || !noticeClaim(v.claim) || !noticeToken(v.owner) || !noticeTime(v.at)) return false;
+  if (v.action === "claim") return noticeInteger(v.previous_attempt, 0, NOTICE_MAX_ATTEMPTS)
+    && (v.previous_attempt === 0 ? v.previous_claim === null : noticeClaim(v.previous_claim));
+  if (!noticeMatches(v.evidence_sha256, HEX64)) return false;
+  if (v.action === "ack") return true;
+  if (v.status !== "sent" && v.status !== "not_sent"
+    && !(v.action === "result" && v.status === "unknown")) return false;
+  return v.status === "not_sent" ? noticeTime(v.retry_at) && v.retry_at >= v.at
+    : v.retry_at === null;
+}
+
+/** Check one append without mutating or interpreting evidence as authenticity. */
+function noticeAppend(events: readonly IntakeNoticeEvent[], e: IntakeNoticeEvent): IntakeResultCode | null {
+  if (e.attempt > NOTICE_MAX_ATTEMPTS) return "intake_bounds_exceeded";
+  const last = events.at(-1);
+  if (e.action === "claim") {
+    if (e.previous_attempt !== (last?.attempt ?? 0) || e.previous_claim !== (last?.claim ?? null)) {
+      return "intake_notice_race";
+    }
+    if (e.attempt !== (last?.attempt ?? 0) + 1
+      || events.some(old => old.action === "claim" && old.claim === e.claim)
+      || (last && (!(last.action === "result" || last.action === "resolve")
+        || last.status !== "not_sent" || last.retry_at === null || e.at < last.retry_at))) {
+      return "intake_transition_refused";
+    }
+  } else {
+    if (!last || e.attempt !== last.attempt || e.claim !== last.claim || e.owner !== last.owner) {
+      return "intake_transition_refused";
+    }
+    const allowed = e.action === "result" ? last.action === "claim"
+      : e.action === "resolve" ? last.action === "result" && last.status === "unknown"
+        : (last.action === "result" || last.action === "resolve") && last.status === "sent";
+    if (!allowed) return "intake_transition_refused";
+  }
+  if (last && e.at < last.at) return "intake_transition_refused";
+  return events.length >= NOTICE_MAX_EVENTS ? "intake_bounds_exceeded" : null;
+}
+
+function validIntakeNotice(value: unknown, ingress: string): boolean {
+  if (value === null) return true;
+  if (!noticeObject(value)) return false;
+  if (!Object.hasOwn(value, "version")) return noticeKeys(value, ["claim", "owner", "at"])
+    && typeof value.claim === "string" && typeof value.owner === "string" && typeof value.at === "string";
+  if (!noticeKeys(value, ["version", "notice_id", "generation", "events"])
+    || value.version !== 1 || value.generation !== 1 || value.notice_id !== intakeNoticeId(ingress)
+    || !Array.isArray(value.events) || value.events.length < 1 || value.events.length > NOTICE_MAX_EVENTS) return false;
+  const prior: IntakeNoticeEvent[] = [];
+  for (const e of value.events) {
+    if (!validNoticeEvent(e) || e.ingress_id !== ingress || e.notice_id !== value.notice_id
+      || noticeAppend(prior, e) !== null) return false;
+    prior.push(e);
+  }
+  return true;
+}
+
+/** Notice facts never answer, bind, start, complete or resurrect requested work. */
+export function applyIntakeNotice(doc: IntakeDocument, event: IntakeNoticeEvent): IntakeOutcome {
+  const checked = validateIntakeDocument(doc);
+  if (checked.result !== "ok") return refuse("registry_corrupt", checked.detail);
+  if (!validNoticeEvent(event)) return refuse("intake_malformed", "invalid notice event");
+  if (event.notice_id !== intakeNoticeId(event.ingress_id)) {
+    return refuse("intake_identity_collision", "notice identity does not match ingress");
+  }
+  const index = doc.requests.findIndex(r => r.ingress_id === event.ingress_id);
+  if (index < 0) return refuse("intake_not_found", "notice target is not in hot ledger");
+  const row = doc.requests[index]!;
+  if (row.notice !== null && !("version" in row.notice)) {
+    return refuse("intake_transition_refused", "legacy claim outcome is unknown");
+  }
+  const events = row.notice?.events ?? [];
+  if (events.some(old => Object.keys(old).every(key =>
+    old[key as keyof IntakeNoticeEvent] === event[key as keyof IntakeNoticeEvent])
+    && Object.keys(old).length === Object.keys(event).length)) {
+    return refuse("intake_notice_replay", "exact retained notice event");
+  }
+  const refused = noticeAppend(events, event);
+  if (refused) return refuse(refused, "notice append refused");
+  if (event.action === "claim" && (row.state !== "queued" || row.work_state !== "unstarted"
+    || row.pause !== null || row.superseded_by !== null || row.result !== null || row.failure !== null)) {
+    return refuse("intake_transition_refused", "notice target is not queued and unstarted");
+  }
+  const requests = [...doc.requests];
+  requests[index] = { ...row, notice: { version: 1, notice_id: event.notice_id, generation: 1,
+    events: [...events, { ...event }] } };
+  return { result: "intake_written", document: { ...doc, requests } };
 }
 
 /**

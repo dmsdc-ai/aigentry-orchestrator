@@ -1207,3 +1207,162 @@ test("R-DIFF the real Python writer and the compiled pure core agree event for e
     assert.equal(again.status, 0, again.stdout + again.stderr);
     assert.equal(JSON.parse(again.stdout).archived, 0);
   });
+
+// Appended notice controls. All new child calls use these tighter source bounds.
+function noticeRun(w, argv) {
+  const r = spawnSync(REGISTRY, argv, { env: w.env, encoding: "utf8", timeout: 10_000,
+    killSignal: "SIGKILL", maxBuffer: 1024 * 1024 });
+  assert.equal(r.error, undefined, String(r.error));
+  assert.equal(r.signal, null);
+  return r;
+}
+function noticeArgv(e) {
+  return ["intake-notice", ...Object.entries(e).flatMap(([k, v]) =>
+    [`--${k === "at" ? "now" : k.replaceAll("_", "-")}`, v === null ? "none" : String(v)])];
+}
+async function noticeWorld(label) {
+  const core = await import(CORE), w = world(label);
+  const capturedResult = noticeRun(w, ["intake-event", ...w.capture(1)]);
+  assert.equal(capturedResult.status, 0, capturedResult.stdout + capturedResult.stderr);
+  let doc = w.doc();
+  const claim = (attempt = 1) => ({ action: "claim", ingress_id: uuid(1),
+    notice_id: core.intakeNoticeId(uuid(1)), attempt, claim: `claim_${attempt}`, owner: "owner_1",
+    at: at(attempt * 10), previous_attempt: attempt - 1,
+    previous_claim: attempt === 1 ? null : `claim_${attempt - 1}` });
+  const fact = (action, attempt = 1, status = "sent") => ({ action, ingress_id: uuid(1),
+    notice_id: core.intakeNoticeId(uuid(1)), attempt, claim: `claim_${attempt}`, owner: "owner_1",
+    at: at(attempt * 10 + (action === "result" ? 1 : 2)), evidence_sha256: hex64(attempt),
+    ...(action === "ack" ? {} : { status, retry_at: status === "not_sent" ? at(attempt * 10 + 3) : null }) });
+  const step = (e, expected = "intake_written") => {
+    // Capture BEFORE either path; refusal must preserve exact bytes AND generation.
+    const rawBefore = w.raw(), generationBefore = w.doc().generation, pureBefore = JSON.stringify(doc);
+    const pure = core.applyIntakeNotice(doc, e);
+    assert.equal(JSON.stringify(doc), pureBefore);
+    const r = noticeRun(w, noticeArgv(e)), actual = JSON.parse(r.stdout);
+    assert.equal(pure.result, expected, pure.detail);
+    assert.equal(actual.result, expected, r.stdout + r.stderr);
+    assert.equal(r.status, core.intakeExitCode(pure));
+    assert.equal(actual.completion_fact, null);
+    if (expected === "intake_written") {
+      const { notice: beforeNotice, ...beforeRow } = doc.requests[0];
+      const { notice: afterNotice, ...afterRow } = pure.document.requests[0];
+      assert.deepEqual(afterRow, beforeRow);
+      assert.deepEqual(afterNotice.events.slice(0, -1), beforeNotice?.events ?? []);
+      doc = { ...pure.document, generation: generationBefore + 1 };
+      assert.deepEqual(w.doc(), doc);
+    } else {
+      assert.equal(pure.document, null);
+      assert.equal(w.raw(), rawBefore);
+      assert.equal(w.doc().generation, generationBefore);
+    }
+    assert.equal(w.exists("active.json"), false);
+    assert.equal(w.exists("active.json.lock"), false);
+  };
+  const lifecycle = e => {
+    const pure = core.applyIntakeEvent(doc, e);
+    assert.equal(pure.result, "intake_written", pure.detail);
+    const argv = ["intake-event", ...Object.entries(e).flatMap(([k, v]) =>
+      [`--${k === "at" ? "now" : k.replaceAll("_", "-")}`, String(v)])];
+    const r = noticeRun(w, argv); assert.equal(r.status, 0, r.stdout + r.stderr);
+    doc = { ...pure.document, generation: doc.generation + 1 }; assert.deepEqual(w.doc(), doc);
+  };
+  return { w, core, claim, fact, step, lifecycle,
+    setDoc: value => { doc = value; fs.writeFileSync(w.file("intake.json"), JSON.stringify(value)); },
+    getDoc: () => doc };
+}
+
+test("R-NOTICE-DIFF durable claims, uncertainty, measured retry, exact results and ACK separation",
+  { skip: SKIP }, async () => {
+    const n = await noticeWorld("notice-diff"), { claim, fact, step } = n;
+    step({ ...claim(), claim: "none" }, "intake_malformed");
+    step({ ...claim(), claim: "claim\n" }, "intake_malformed");
+    step({ ...claim(), notice_id: hex64(9) }, "intake_identity_collision");
+    step(claim()); step(claim(), "intake_notice_replay");
+    step({ ...claim(), claim: "contender", owner: "other" }, "intake_notice_race");
+    step({ ...claim(2), at: at(10000) }, "intake_transition_refused");
+    step({ ...fact("result"), owner: "other" }, "intake_transition_refused");
+    step(fact("ack"), "intake_transition_refused");
+    step(fact("result", 1, "unknown"));
+    step({ ...claim(2), at: at(10000) }, "intake_transition_refused");
+    step(fact("result", 1, "not_sent"), "intake_transition_refused");
+    step(fact("resolve", 1, "not_sent"));
+    step({ ...claim(2), at: at(12) }, "intake_transition_refused");
+    // Valid non-sentinel token survives serialization and predecessor round-trip.
+    step(claim(2));
+    assert.equal(n.getDoc().requests[0].notice.events.at(-1).previous_claim, "claim_1");
+    step(fact("result", 1), "intake_transition_refused");
+    step(fact("result", 2)); step(claim(3), "intake_transition_refused");
+    step(fact("ack", 2)); step(fact("ack", 2), "intake_notice_replay");
+    step({ ...fact("ack", 2), evidence_sha256: hex64(9) }, "intake_transition_refused");
+    assert.equal(n.getDoc().requests[0].answered_at, null);
+    assert.equal(n.getDoc().requests[0].state, "queued");
+    for (const extra of [["--claim", "duplicate"], ["--path", "/tmp"], ["--previous-attempt", "01"]]) {
+      const rawBefore = n.w.raw(), generationBefore = n.w.doc().generation;
+      const r = noticeRun(n.w, [...noticeArgv(claim()), ...extra]);
+      assert.equal(r.status, 4); assert.equal(n.w.raw(), rawBefore);
+      assert.equal(n.w.doc().generation, generationBefore);
+    }
+  });
+
+test("R-NOTICE-RACE actual lifecycle eligibility, late outcomes, archived and missing refusal",
+  { skip: SKIP }, async () => {
+    for (const kind of ["pause", "cancel"]) {
+      const n = await noticeWorld(`notice-${kind}`);
+      n.step(n.claim());
+      n.lifecycle({ kind, ingress_id: uuid(1), at: at(11), reason: "blocked",
+        ...(kind === "pause" ? { owner: "owner", resume_condition: "review" } : {}) });
+      n.step(n.fact("result")); n.step(n.fact("ack"));
+      const fresh = await noticeWorld(`notice-ineligible-${kind}`);
+      fresh.lifecycle({ kind, ingress_id: uuid(1), at: at(2), reason: "blocked",
+        ...(kind === "pause" ? { owner: "owner", resume_condition: "review" } : {}) });
+      fresh.step(fresh.claim(), "intake_transition_refused");
+      if (kind === "cancel") {
+        const before = n.getDoc().requests[0];
+        const r = noticeRun(n.w, ["intake-prune", "--older-than-seconds", "0", "--now", at(10000)]);
+        assert.equal(r.status, 0, r.stdout + r.stderr);
+        assert.deepEqual(JSON.parse(fs.readFileSync(n.w.file("intake-archive.jsonl"), "utf8").trim()).record, before);
+        n.setDoc(n.w.doc());
+        n.step(n.claim(), "intake_not_found"); n.step(n.fact("ack"), "intake_not_found");
+      }
+      n.step({ ...n.claim(), ingress_id: uuid(99), notice_id: n.core.intakeNoticeId(uuid(99)) }, "intake_not_found");
+    }
+  });
+
+test("R-NOTICE-VALIDATION strict fields, legacy unknown, malformed persisted logs, bounded history",
+  { skip: SKIP }, async () => {
+    const n = await noticeWorld("notice-validation");
+    for (const over of [{ at: "2026-02-30T00:00:00Z" }, { claim: "none" },
+      { attempt: 1.5 }, { owner: "../path" }]) {
+      n.step({ ...n.claim(), ...over }, "intake_malformed");
+    }
+    const legacy = structuredClone(n.getDoc());
+    legacy.requests[0].notice = { claim: "none", owner: "legacy", at: "legacy" };
+    n.setDoc(legacy); n.step(n.claim(), "intake_transition_refused");
+    legacy.requests[0].notice = null; n.setDoc(legacy);
+    n.step(n.claim());
+    const valid = structuredClone(n.getDoc()), notice = valid.requests[0].notice;
+    for (const bad of [{ ...notice, version: true }, { ...notice, generation: 2 },
+      { ...notice, notice_id: hex64(9) }, { ...notice, path: "/tmp" },
+      { ...notice, events: Array(65).fill(n.claim()) },
+      { ...notice, events: [{ ...n.claim(), attempt: true }] },
+      { ...notice, events: [{ ...n.claim(), claim: "none" }] },
+      { ...notice, events: [{ ...n.claim(), at: "2026-02-30T00:00:00Z" }] }]) {
+      const broken = structuredClone(valid); broken.requests[0].notice = bad;
+      n.setDoc(broken); n.step(n.fact("result"), "registry_corrupt");
+    }
+    n.setDoc(valid);
+    for (const over of [{ evidence_sha256: "oops" }, { retry_at: at(1) }, { command: "run" }]) {
+      if ("command" in over) {
+        const before = n.w.raw(), generationBefore = n.w.doc().generation;
+        const r = noticeRun(n.w, noticeArgv({ ...n.fact("result"), ...over }));
+        assert.equal(r.status, 4); assert.equal(n.w.raw(), before);
+        assert.equal(n.w.doc().generation, generationBefore);
+      } else n.step({ ...n.fact("result"), ...over }, "intake_malformed");
+    }
+    for (let attempt = 1; attempt <= 16; attempt++) {
+      if (attempt > 1) n.step(n.claim(attempt));
+      n.step(n.fact("result", attempt, "not_sent"));
+    }
+    n.step(n.claim(17), "intake_bounds_exceeded");
+    assert.equal(n.getDoc().requests[0].notice.events.length, 32);
+  });
