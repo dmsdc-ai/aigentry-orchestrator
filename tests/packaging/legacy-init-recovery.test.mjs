@@ -17,7 +17,35 @@ import { builtinModules } from 'node:module';
 const INPUT_BYTES = 48 * 1024 * 1024, STREAM_BYTES = 1024 * 1024;
 const CLOSE_MS = 5000, FINAL_MS = 5000;
 let budget;
+let suiteFailure;
+function firstFailure() {
+  let failed = false, error;
+  return {
+    get failed() { return failed; },
+    get error() { return error; },
+    record(value) { if (!failed) { failed = true; error = value; } },
+    check() { if (failed) throw error; },
+    async run(callback) {
+      try { this.check(); return await callback(); }
+      catch (value) { this.record(value); throw value; }
+    },
+  };
+}
+function withCleanup(callback, cleanup) {
+  let failed = false;
+  try { return callback(); }
+  catch (error) { failed = true; suiteFailure?.record(error); throw error; }
+  finally {
+    try { cleanup(); }
+    catch (error) {
+      suiteFailure?.record(error);
+      if (!failed) throw error;
+      console.error('Additional cleanup failure:', error);
+    }
+  }
+}
 function boundary(label, final = budget?.finalizing ?? false) {
+  if (!final) suiteFailure?.check();
   assert.ok(budget, 'deadline must be initialized before fixture work');
   const now = Number(process.hrtime.bigint()) / 1e6;
   if (!Number.isFinite(now) || now < budget.last || now >= budget.end - (final ? 0 : CLOSE_MS + FINAL_MS)) {
@@ -47,7 +75,7 @@ function hashFile(file, final = false, maxBytes = Infinity) {
   boundary('file hash', final);
   const fd = fs.openSync(file, 'r'), hash = createHash('sha256'), chunk = Buffer.alloc(64 * 1024);
   let bytes = 0;
-  try {
+  withCleanup(() => {
     for (;;) {
       boundary('file hash chunk', final);
       const n = fs.readSync(fd, chunk, 0, chunk.length, null);
@@ -56,7 +84,7 @@ function hashFile(file, final = false, maxBytes = Infinity) {
       assert.ok(bytes <= maxBytes, 'file grew beyond hash input bound');
       hash.update(chunk.subarray(0, n));
     }
-  } finally { fs.closeSync(fd); }
+  }, () => fs.closeSync(fd));
   boundary('file hash complete', final);
   return hash.digest('hex');
 }
@@ -91,8 +119,13 @@ function regular(root, rel) {
   assert.ok(s.size <= 8 * 1024 * 1024, 'per-file fixture input bound');
   return { file, stat: s };
 }
+const SNAPSHOT_SCHEMA = Object.freeze({ version: 1, root: '.', atime: 'excluded',
+  columns: ['type', 'mode', 'dev', 'ino', 'uid', 'gid', 'nlink', 'size', 'mtimeNs', 'ctimeNs', 'content'],
+  row: 'column values in order; integer metadata strings retain full precision',
+  reference: '[path, pack index, row index]; packs are SHA-256 addressed JSON',
+});
 function snapshot(root) {
-  const images = {};
+  const images = Object.create(null);
   let count = 0, bytes = 0, metadataBytes = 2;
   function visit(file, rel) {
     boundary('snapshot entry');
@@ -110,16 +143,17 @@ function snapshot(root) {
       content = s.isFile() ? hashFile(file, false, Number(s.size)) : fs.readlinkSync(file);
     }
     images[rel] = { ...metadata, content };
-    metadataBytes += Buffer.byteLength(JSON.stringify({ [rel]: images[rel] }));
+    metadataBytes += Buffer.byteLength(JSON.stringify([rel, ...SNAPSHOT_SCHEMA.columns.map(key => images[rel][key])])) +
+      (count > 1 ? 1 : 0);
     assert.ok(metadataBytes <= STREAM_BYTES, 'snapshot serialized metadata bound');
     if (s.isDirectory()) {
       const dir = fs.opendirSync(file);
-      try {
+      withCleanup(() => {
         for (let entry; (entry = dir.readSync()) !== null;) {
           boundary('snapshot directory');
           visit(path.join(file, entry.name), rel === '.' ? entry.name : `${rel}/${entry.name}`);
         }
-      } finally { dir.closeSync(); }
+      }, () => dir.closeSync());
     }
     boundary('snapshot entry complete');
   }
@@ -136,27 +170,157 @@ function retain(file, bytes, terminal = false) {
   boundary('evidence retained', true);
 }
 const writeJSON = (file, value, terminal = false) => retain(file, JSON.stringify(value, null, 2) + '\n', terminal);
+function snapshotStore(evidence) {
+  const schemaBytes = JSON.stringify(SNAPSHOT_SCHEMA) + '\n', schemaHash = sha(schemaBytes);
+  retain(path.join(evidence, 'snapshot-schema.json'), schemaBytes);
+  const rows = new Map(), packs = new Map();
+  function readJSON(file, limit) {
+    boundary('snapshot reference read');
+    assert.ok(fs.lstatSync(file).size <= limit, 'snapshot retained object bound');
+    const bytes = fs.readFileSync(file);
+    assert.ok(bytes.length <= limit, 'snapshot retained object grew');
+    return { bytes, value: JSON.parse(bytes) };
+  }
+  function reconstruct(file) {
+    const schema = readJSON(path.join(evidence, 'snapshot-schema.json'), STREAM_BYTES);
+    assert.equal(sha(schema.bytes), schemaHash, 'schema hash');
+    assert.deepEqual(schema.value, SNAPSHOT_SCHEMA, 'known lossless schema');
+    const ref = readJSON(file, STREAM_BYTES).value;
+    assert.equal(ref.schema, schemaHash);
+    assert.ok(Array.isArray(ref.packs) && ref.packs.length <= 4096);
+    assert.equal(new Set(ref.packs).size, ref.packs.length, 'duplicate/conflicting pack references');
+    assert.ok(Array.isArray(ref.entries) && ref.entries.length <= 4096);
+    let loadedBytes = 0;
+    const loaded = ref.packs.map(digest => {
+      assert.match(digest, /^[0-9a-f]{64}$/);
+      const file = path.join(evidence, `rows-${digest}.json`);
+      assert.ok(loadedBytes + fs.lstatSync(file).size <= INPUT_BYTES, 'reconstruction aggregate bytes bound');
+      const pack = readJSON(file, 8 * 1024 * 1024);
+      loadedBytes += pack.bytes.length;
+      assert.ok(loadedBytes <= INPUT_BYTES, 'reconstruction aggregate bytes bound after read');
+      assert.equal(sha(pack.bytes), digest, 'missing/conflicting packs cannot pass');
+      assert.equal(pack.value.schema, schemaHash);
+      assert.ok(Array.isArray(pack.value.rows) && pack.value.rows.length <= 4096);
+      return pack.value.rows;
+    });
+    const image = Object.create(null);
+    let metadataBytes = 2, reconstructedCount = 0;
+    for (const entry of ref.entries) {
+      boundary('snapshot reconstruction row');
+      assert.ok(Array.isArray(entry) && entry.length === 3);
+      const [rel, packIndex, rowIndex] = entry;
+      assert.ok(rel === '.' || safeRelative(rel));
+      assert.equal(Object.hasOwn(image, rel), false, 'duplicate/conflicting snapshot path');
+      assert.ok(Number.isInteger(packIndex) && packIndex >= 0 && packIndex < loaded.length);
+      assert.ok(Number.isInteger(rowIndex) && rowIndex >= 0 && rowIndex < loaded[packIndex].length);
+      const row = loaded[packIndex][rowIndex];
+      assert.ok(Array.isArray(row) && row.length === SNAPSHOT_SCHEMA.columns.length);
+      metadataBytes += Buffer.byteLength(JSON.stringify([rel, ...row])) +
+        (reconstructedCount++ ? 1 : 0);
+      assert.ok(metadataBytes <= STREAM_BYTES, 'reconstructed snapshot metadata bound');
+      image[rel] = Object.fromEntries(SNAPSHOT_SCHEMA.columns.map((key, i) => [key, row[i]]));
+    }
+    assert.ok(Object.hasOwn(image, '.'), 'root metadata required');
+    return image;
+  }
+  return (file, image) => {
+    boundary('snapshot encoding');
+    // Only retained rows are reused. Every image comes from a fresh full walk.
+    const pending = new Map(), entries = [];
+    for (const rel of Object.keys(image).sort()) {
+      boundary('snapshot encoding row');
+      const row = SNAPSHOT_SCHEMA.columns.map(key => image[rel][key]);
+      const encoded = JSON.stringify(row), digest = sha(encoded);
+      const known = rows.get(digest) ?? pending.get(digest);
+      if (known) assert.equal(known.encoded, encoded, 'row hash collision/conflict');
+      else pending.set(digest, { encoded, row });
+      entries.push([rel, digest]);
+    }
+    if (pending.size) {
+      const values = [...pending.values()];
+      const encoded = JSON.stringify({ schema: schemaHash, rows: values.map(v => v.row) }) + '\n';
+      const digest = sha(encoded);
+      assert.ok(Buffer.byteLength(encoded) <= 8 * 1024 * 1024, 'snapshot pack leaf bound');
+      if (packs.has(digest)) assert.equal(packs.get(digest), encoded, 'pack hash collision/conflict');
+      else { retain(path.join(evidence, `rows-${digest}.json`), encoded); packs.set(digest, encoded); }
+      [...pending].forEach(([key, value], index) => rows.set(key, { encoded: value.encoded, pack: digest, index }));
+    }
+    const packList = [...new Set(entries.map(([, key]) => rows.get(key).pack))];
+    const packIndex = new Map(packList.map((digest, index) => [digest, index]));
+    const encoded = JSON.stringify({ schema: schemaHash, packs: packList,
+      entries: entries.map(([rel, key]) => { const row = rows.get(key); return [rel, packIndex.get(row.pack), row.index]; }) }) + '\n';
+    assert.ok(Buffer.byteLength(encoded) <= STREAM_BYTES, 'snapshot reference metadata bound');
+    retain(file, encoded);
+    assert.deepEqual(reconstruct(file), image, 'retained snapshot independently reconstructs complete measured values');
+  };
+}
+function finalReceipt(file, value) {
+  const captured = { ...value, budget: value.budget ? { ...value.budget } : null };
+  let total = retainedBytes, encoded;
+  for (;;) {
+    boundary('final receipt accounting', true);
+    encoded = JSON.stringify({ ...captured, retainedBytes: total }, null, 2) + '\n';
+    const next = retainedBytes + Buffer.byteLength(encoded);
+    if (next === total) break;
+    total = next;
+  }
+  retain(file, encoded, true);
+  assert.equal(retainedBytes, total, 'final receipt included in exact retained-byte accounting');
+}
+
+async function verifyFailureLatch() {
+  for (const phase of ['setup', 'oracle']) {
+    const latch = firstFailure();
+    let deliberate = new Error(`deliberate ${phase} failure`);
+    let launches = 0;
+    await assert.rejects(latch.run(() => {
+      if (phase === 'setup') throw deliberate;
+      try { assert.equal('actual', 'expected', 'deliberate oracle failure'); }
+      catch (error) { deliberate = error; throw error; }
+    }), error => error === deliberate);
+    assert.equal(latch.error, deliberate, 'first thrown error identity retained');
+    await assert.rejects(latch.run(() => { launches++; }), error => error === deliberate);
+    assert.equal(launches, 0, 'a later launch callback cannot run');
+  }
+}
 
 test('actual public legacy recovery plan is read-only evidence', async t => {
+  suiteFailure = firstFailure();
+  const abortSuite = () => suiteFailure.record(t.signal.reason ?? new Error('suite aborted'));
+  if (t.signal.aborted) abortSuite();
+  else t.signal.addEventListener('abort', abortSuite, { once: true });
+  let run, evidence, source, manifestFile, manifestBytes, manifest, frozen, node, nodeBefore;
+  let counter = 0, hasPrimaryError = false;
+  try {
+  suiteFailure.check();
   initializeBudget();
   assert.ok(['darwin', 'linux'].includes(process.platform), 'current inspector platform contract');
-  const source = process.env.LEGACY_RECOVERY_TEST_PACKAGE;
-  const manifestFile = process.env.LEGACY_RECOVERY_TEST_MANIFEST;
+  source = process.env.LEGACY_RECOVERY_TEST_PACKAGE;
+  manifestFile = process.env.LEGACY_RECOVERY_TEST_MANIFEST;
   const parent = process.env.LEGACY_RECOVERY_TEST_ROOT;
-  canonicalDirectory(source);
   canonicalDirectory(parent, true);
   for (let dir = parent; ; dir = path.dirname(dir)) {
     assert.equal(fs.existsSync(path.join(dir, '.git')), false, 'fixtures must be outside Git');
     if (dir === path.dirname(dir)) break;
   }
+  boundary('owned evidence root creation');
+  run = fs.mkdtempSync(path.join(parent, 'legacy-recovery-'));
+  fs.chmodSync(run, 0o700);
+  const evidencePath = path.join(run, 'evidence');
+  fs.mkdirSync(evidencePath, { mode: 0o700 });
+  evidence = evidencePath; // Only publish a safely established owned directory.
+  await verifyFailureLatch(); // Harness-only negative control; no product invocation.
+  const retainSnapshot = snapshotStore(evidence);
+  canonicalDirectory(source);
   assert.ok(manifestFile && path.isAbsolute(manifestFile));
   const manifestStat = fs.lstatSync(manifestFile);
   assert.ok(manifestStat.isFile() && !manifestStat.isSymbolicLink() && manifestStat.size <= 1024 * 1024);
-  const manifestBytes = fs.readFileSync(manifestFile);
+  manifestBytes = fs.readFileSync(manifestFile);
   boundary('manifest read complete');
-  const manifest = JSON.parse(manifestBytes);
+  manifest = JSON.parse(manifestBytes);
   assert.ok(Array.isArray(manifest.files) && manifest.files.length > 0 && manifest.files.length <= 4096);
-  const paths = new Set(), frozen = {};
+  const paths = new Set();
+  frozen = {};
   let bytes = 0;
   for (const entry of manifest.files) {
     boundary('manifest entry');
@@ -187,7 +351,7 @@ test('actual public legacy recovery plan is read-only evidence', async t => {
   let productionEntries = 0;
   function production(dir, prefix) {
     const directory = fs.opendirSync(dir);
-    try {
+    withCleanup(() => {
     for (let entry; (entry = directory.readSync()) !== null;) {
       boundary('production closure entry');
       assert.ok(++productionEntries <= 4096, 'production closure entry bound');
@@ -197,7 +361,7 @@ test('actual public legacy recovery plan is read-only evidence', async t => {
       if (s.isDirectory()) production(file, rel + '/');
       else if (name.endsWith('.js')) { assert.ok(s.isFile()); compiled.push(rel); assert.ok(compiled.length <= 4096); }
     }
-    } finally { directory.closeSync(); }
+    }, () => directory.closeSync());
   }
   production(path.join(source, 'dist/src'), 'dist/src/');
   assert.ok(compiled.length > 0);
@@ -228,10 +392,8 @@ test('actual public legacy recovery plan is read-only evidence', async t => {
   // responsible for computed imports and complete external package closures;
   // the literal check above is an additional omission check, not that authority.
   boundary('fixture root creation');
-  const run = fs.mkdtempSync(path.join(parent, 'legacy-recovery-'));
-  fs.chmodSync(run, 0o700);
-  const data = path.join(run, 'data'), evidence = path.join(run, 'evidence');
-  for (const dir of [data, evidence]) fs.mkdirSync(dir, { mode: 0o700 });
+  const data = path.join(run, 'data');
+  fs.mkdirSync(data, { mode: 0o700 });
   const packageRoot = path.join(data, 'package');
   fs.mkdirSync(packageRoot, { mode: 0o700 });
   for (const entry of manifest.files) {
@@ -244,8 +406,8 @@ test('actual public legacy recovery plan is read-only evidence', async t => {
   }
   writeJSON(path.join(evidence, 'custody.json'), { source, manifest: manifestFile, manifestHash: sha(manifestBytes),
     packageName: pkg.name, packageVersion: pkg.version, compiled, external: [...external], frozen });
-  const node = fs.realpathSync(process.execPath), nodeBefore = hashFile(node);
-  let counter = 0;
+  node = fs.realpathSync(process.execPath);
+  nodeBefore = hashFile(node);
   function fixture() {
     boundary('fixture creation');
     const base = fs.mkdtempSync(path.join(data, 'case-'));
@@ -266,7 +428,7 @@ test('actual public legacy recovery plan is read-only evidence', async t => {
     const id = String(++counter);
     const args = [path.join(packageRoot, 'bin/init/cli.mjs'), 'init', '--legacy-recovery-plan', '--workspace', workspace, ...extras];
     const before = snapshot(data);
-    writeJSON(path.join(evidence, `${id}-before.json`), before);
+    retainSnapshot(path.join(evidence, `${id}-before.json`), before);
     const started = Date.now();
     const launchedAt = boundary('child launch');
     const timeoutMs = Math.min(10000, Math.floor(budget.end - CLOSE_MS - FINAL_MS - launchedAt));
@@ -286,6 +448,7 @@ test('actual public legacy recovery plan is read-only evidence', async t => {
         if (finished) return;
         if (!receipt.failures.includes(reason)) receipt.failures.push(reason);
         budget.failure ??= reason;
+        suiteFailure.record(new Error(reason));
       };
       function finish() {
         if (finished) return;
@@ -350,22 +513,31 @@ test('actual public legacy recovery plan is read-only evidence', async t => {
         finish(); // Explicitly records any unobserved close/EOF, never a pass.
       }, Math.max(1, Math.min(budget.end - FINAL_MS, launchedAt + timeoutMs + CLOSE_MS) - stamp()));
     });
-    let after;
+    let after, afterRetained = false, evidenceFailed = false;
     try {
       retain(path.join(evidence, `${id}.stdout`), r.stdoutBytes);
       retain(path.join(evidence, `${id}.stderr`), r.stderrBytes);
       if (!r.error) {
         after = snapshot(data);
-        writeJSON(path.join(evidence, `${id}-after.json`), after);
+        retainSnapshot(path.join(evidence, `${id}-after.json`), after);
+        afterRetained = true;
       }
     } catch (error) {
+      evidenceFailed = true;
+      suiteFailure.record(error);
       budget.failure ??= `partial evidence: ${error.message}`;
       receipt.failures.push(`partial evidence: ${error.message}`);
       throw error;
     } finally {
-      writeJSON(path.join(evidence, `${id}-child.json`), { ...receipt,
-        elapsedMs: Date.now() - started, status: r.status, signal: r.signal,
-        evidenceComplete: Boolean(after), budgetFailure: budget.failure }, true);
+      try {
+        writeJSON(path.join(evidence, `${id}-child.json`), { ...receipt,
+          elapsedMs: Date.now() - started, status: r.status, signal: r.signal,
+          evidenceComplete: afterRetained, budgetFailure: budget.failure }, true);
+      } catch (error) {
+        suiteFailure.record(error);
+        if (!evidenceFailed) throw error;
+        console.error('Child receipt unavailable:', error);
+      }
     }
     assert.equal(r.error, undefined, r.stderr);
     assert.ok(after, 'partial evidence cannot pass');
@@ -388,8 +560,9 @@ test('actual public legacy recovery plan is read-only evidence', async t => {
     assert.equal(result.value.package_leaves, undefined, 'refusal never emits partial or denied hashes');
   };
 
-  try {
-  await t.test('frozen final package rendering, raw copies and unavailable owner contracts', async () => {
+  // t.test may resolve despite failure: latch inside its callback, then rethrow.
+  const scenario = (name, callback) => t.test(name, () => suiteFailure.run(callback));
+  await scenario('frozen final package rendering, raw copies and unavailable owner contracts', async () => {
     const f = fixture();
     // Present targets are opaque existing bytes, never desired source content.
     const present = [
@@ -450,7 +623,7 @@ test('actual public legacy recovery plan is read-only evidence', async t => {
     assert.equal(fs.existsSync(path.join(f.home, 'environment')), false, 'no managed bootstrap');
   });
 
-  await t.test('upgrade skips the state object before stat while fresh mode refuses a state link', async () => {
+  await scenario('upgrade skips the state object before stat while fresh mode refuses a state link', async () => {
     const f = fixture();
     fs.symlinkSync(path.join(f.unrelated, 'retain'), path.join(f.workspace, 'state'));
     const value = planned(await invoke(f, ['--upgrade']));
@@ -458,7 +631,7 @@ test('actual public legacy recovery plan is read-only evidence', async t => {
     refused(await invoke(f), 'unknown-target-object');
   });
 
-  await t.test('historical UUID lock preserved; unknown lock members refuse without content disclosure', async () => {
+  await scenario('historical UUID lock preserved; unknown lock members refuse without content disclosure', async () => {
     const f = fixture(), lock = path.join(f.workspace, '.aigentry-native-capture.lock');
     fs.mkdirSync(lock, { mode: 0o700 });
     fs.writeFileSync(path.join(lock, 'owner.json'), '{"kind":"legacy-init","operationId":"4bc8a54c-023b-4e64-9c55-8ffca1c3bd8d"}\n', { mode: 0o600 });
@@ -475,7 +648,7 @@ test('actual public legacy recovery plan is read-only evidence', async t => {
     refused(await invoke(f, ['--upgrade']), 'unknown-lock-object');
   });
 
-  await t.test('invalid config is opaque; no environment bootstrap or dependency probes', async () => {
+  await scenario('invalid config is opaque; no environment bootstrap or dependency probes', async () => {
     const f = fixture();
     fs.writeFileSync(path.join(f.home, 'config.json'), '{ secret: DO_NOT_EMIT_1171', { mode: 0o600 });
     fs.mkdirSync(path.join(f.home, 'environment'), { mode: 0o700 });
@@ -490,7 +663,7 @@ test('actual public legacy recovery plan is read-only evidence', async t => {
     assert.deepEqual(fs.readdirSync(f.ports), []);
   });
 
-  await t.test('incompatible and duplicate options refuse; force/yes never confer authority', async () => {
+  await scenario('incompatible and duplicate options refuse; force/yes never confer authority', async () => {
     const f = fixture();
     for (const args of [['--force'], ['--yes'], ['-y'], ['--dry-run'], ['--help'],
       ['--capture-root', f.unrelated], ['--preservation-root', f.unrelated],
@@ -498,7 +671,7 @@ test('actual public legacy recovery plan is read-only evidence', async t => {
       ['--upgrade', '--upgrade'], ['--legacy-recovery-plan'], ['--workspace', f.workspace]]) refused(await invoke(f, args), 'incompatible-options');
   });
 
-  await t.test('missing roots, linked roots and unknown planned target objects refuse', async () => {
+  await scenario('missing roots, linked roots and unknown planned target objects refuse', async () => {
     const f = fixture();
     refused(await invoke(f, [], {}, path.join(f.base, 'absent')), 'roots-unavailable');
     refused(await invoke(f, [], { AIGENTRY_HOME: '' }), 'explicit-canonical-roots-required');
@@ -509,7 +682,7 @@ test('actual public legacy recovery plan is read-only evidence', async t => {
     refused(await invoke(f), 'unknown-target-object');
   });
 
-  await t.test('incomplete real package closure refuses without target writes', async () => {
+  await scenario('incomplete real package closure refuses without target writes', async () => {
     const f = fixture();
     // Only the private fixture is faulted; original admitted source remains frozen.
     const file = path.join(packageRoot, 'tooling/instructions/common.md');
@@ -517,10 +690,21 @@ test('actual public legacy recovery plan is read-only evidence', async t => {
     refused(await invoke(f), 'incomplete-source-closure');
   });
 
+  suiteFailure.check();
+  assert.equal(budget.failure, null, 'budget/lifecycle failure cannot pass');
+  assert.equal(counter, 24, 'all original stimuli executed');
+  console.error(`Recovery-plan evidence retained: ${run}`);
+  } catch (error) {
+    suiteFailure.record(error);
+    hasPrimaryError = true;
+    throw error;
   } finally {
-  budget.finalizing = true;
+  t.signal.removeEventListener('abort', abortSuite);
+  if (budget) budget.finalizing = true;
   let custodyComplete = false;
   try {
+  if (nodeBefore && manifestBytes && Array.isArray(manifest?.files) &&
+      frozen && manifest.files.every(entry => Object.hasOwn(frozen, entry.path))) {
   assert.equal(hashFile(node, true), nodeBefore);
   assert.equal(sha(fs.readFileSync(manifestFile)), sha(manifestBytes));
   for (const entry of manifest.files) {
@@ -529,13 +713,22 @@ test('actual public legacy recovery plan is read-only evidence', async t => {
     assert.equal(stat.mode & 0o777, frozen[entry.path].mode);
   }
   custodyComplete = true;
+  }
+  } catch (error) {
+    suiteFailure.record(error);
+    if (!hasPrimaryError) { hasPrimaryError = true; throw error; }
+    console.error('Additional final custody failure:', error);
   } finally {
-    writeJSON(path.join(evidence, 'final.json'), { budget, counter, custodyComplete,
-      retainedBytes, partial: !custodyComplete || Boolean(budget.failure),
-      validation: 'custody receipt only; test assertions determine acceptance' }, true);
+    try {
+      if (evidence) finalReceipt(path.join(evidence, 'final.json'), { budget, counter, custodyComplete,
+        failure: suiteFailure.failed ? { name: suiteFailure.error?.name, message: String(suiteFailure.error?.message ?? suiteFailure.error) } : null,
+        partial: !custodyComplete || suiteFailure.failed || Boolean(budget?.failure),
+        validation: 'best-effort custody receipt only; test assertions determine acceptance' });
+    } catch (error) {
+      suiteFailure.record(error);
+      if (!hasPrimaryError) throw error;
+      console.error('Failure receipt unavailable:', error);
+    }
   }
   }
-  assert.equal(budget.failure, null, 'budget/lifecycle failure cannot pass');
-  assert.equal(counter, 24, 'all original stimuli executed');
-  console.error(`Recovery-plan evidence retained: ${run}`);
 });
