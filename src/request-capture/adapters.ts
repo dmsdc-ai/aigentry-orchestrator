@@ -75,8 +75,8 @@ export const SUBMISSION_ADAPTERS: readonly SubmissionAdapter[] = Object.freeze([
     mechanism: "synchronous UserPromptSubmit command hook in .codex/hooks.json; blocks the "
       + "submission when the prompt cannot be durably recorded",
     caller_evidence: [
-      "bin/init/cli.mjs:947#opts.captureRoot ? prepareNativeCapture(",
-      "bin/init/cli.mjs:922#process.platform === \"win32\" && (opts.captureRoot",
+      "bin/init/cli.mjs:1142#opts.captureRoot ? prepareNativeCapture(",
+      "bin/init/cli.mjs:1117#process.platform === \"win32\" && (opts.captureRoot",
       "bin/init/native-capture.mjs:100#[\"darwin\", \"linux\"].includes(process.platform)",
       "bin/init/native-capture.mjs:177#UserPromptSubmit",
       "bin/init/native-capture.mjs:19#.codex/hooks.json",
