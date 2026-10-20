@@ -651,13 +651,13 @@ function noticeClaimEvent(attempt = 1): IntakeNoticeEvent {
     previous_attempt: attempt - 1, previous_claim: attempt === 1 ? null : `claim_${attempt - 1}` };
 }
 function noticeFact(action: "result" | "resolve" | "ack", attempt = 1,
-  status: "unknown" | "not_sent" | "sent" = "sent"): IntakeNoticeEvent {
+  status: "unknown" | "not_sent" | "sent" = "sent"): Exclude<IntakeNoticeEvent, { action: "claim" }> {
   const common = { ingress_id: uuid(1), notice_id: intakeNoticeId(uuid(1)), attempt,
     claim: `claim_${attempt}`, owner: "owner_1", at: at(attempt * 10 + (action === "result" ? 1 : 2)),
     evidence_sha256: hex64(attempt) };
   if (action === "ack") return { ...common, action };
   if (action === "resolve" && status === "unknown") throw Error("invalid fixture");
-  return { ...common, action, status, retry_at: status === "not_sent" ? at(attempt * 10 + 3) : null } as IntakeNoticeEvent;
+  return { ...common, action, status, retry_at: status === "not_sent" ? at(attempt * 10 + 3) : null } as Exclude<IntakeNoticeEvent, { action: "claim" }>;
 }
 function noticeStep(doc: IntakeDocument, event: IntakeNoticeEvent,
   result = "intake_written"): IntakeDocument {
