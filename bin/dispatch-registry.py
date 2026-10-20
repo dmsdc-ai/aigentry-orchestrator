@@ -2844,7 +2844,9 @@ def op_intake_list(args: dict) -> int:
     core (#1172): jsonl_requested() is scoped to argv[0] == "list", so nothing
     here touches that path or its exit mapping."""
     doc = intake_load()
-    rows = sorted(doc["requests"], key=lambda r: (r["received_at"], r["ingress_id"]))
+    rows = sorted(doc["requests"], key=lambda r: (
+        r["received_at"][:-1] + ".000Z" if len(r["received_at"]) == 20 else r["received_at"],
+        r["ingress_id"]))
     wanted_state, wanted_id = args.get("state"), args.get("ingress-id")
     if wanted_state is not None and wanted_state not in INTAKE_STATES:
         raise RegistryError("invalid_argument", f"intake-list: unknown state {wanted_state!r}")

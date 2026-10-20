@@ -923,10 +923,13 @@ export function applyIntakeNotice(doc: IntakeDocument, event: IntakeNoticeEvent)
 export function derivePositions(
   doc: IntakeDocument,
 ): (IntakeRequest & { position: number | null })[] {
-  const ordered = doc.requests.slice().sort((a, b) => (
-    a.received_at < b.received_at ? -1
-      : a.received_at > b.received_at ? 1
-        : a.ingress_id < b.ingress_id ? -1 : a.ingress_id > b.ingress_id ? 1 : 0));
+  const ordered = doc.requests.slice().sort((a, b) => {
+    const aKey = a.received_at.length === 20 ? a.received_at.slice(0, -1) + ".000Z" : a.received_at;
+    const bKey = b.received_at.length === 20 ? b.received_at.slice(0, -1) + ".000Z" : b.received_at;
+    return aKey < bKey ? -1
+      : aKey > bKey ? 1
+        : a.ingress_id < b.ingress_id ? -1 : a.ingress_id > b.ingress_id ? 1 : 0;
+  });
   let position = 0;
   return ordered.map((row) => {
     const open = row.state !== "completed" && row.state !== "cancelled"
