@@ -2795,7 +2795,7 @@ def intake_notice_mutation(doc: dict, e: dict) -> dict:
     if refused:
         raise IntakeRefusal(refused, "notice append refused")
     if e["action"] == "claim" and (row.get("state") != "queued" or row.get("work_state") != "unstarted"
-            or any(row.get(k) is not None for k in ("pause", "superseded_by", "result", "failure"))):
+            or any(k not in row or row[k] is not None for k in ("pause", "superseded_by", "result", "failure"))):
         raise IntakeRefusal("intake_transition_refused", "notice target is not queued and unstarted")
     row["notice"] = {"version": 1, "notice_id": e["notice_id"], "generation": 1, "events": [*events, dict(e)]}
     return row
