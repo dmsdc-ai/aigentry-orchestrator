@@ -5,15 +5,38 @@ import * as path from "node:path";
 import { atomicWrite } from "../session/persistence/atomic-write.js";
 import { withIndexLock } from "../session/persistence/index-lock.js";
 
+/**
+ * Receipt v2 (#1166 U2). Three identities are kept apart and never collapsed:
+ *
+ *  - `ingress_id`   the DELIVERY. Minted once per accepted delivery and persisted here, so the
+ *                   intake ledger (a separate document, separate lock) does not have to invent
+ *                   one and a restart replay can key on it. Reading never remints it.
+ *  - `capture_id`   the durable RECEIPT, and the only identity that addresses a file.
+ *  - `sha256`       the CONTENT address. Storage sharing only: equal bytes are still two
+ *                   deliveries with two receipts. There is no content, byte, text or time dedupe.
+ *
+ * `upstream_delivery_id` is the provider's identity, and no provider field has been measured on
+ * any channel in this source. It is therefore typed as the literal `null` with an explicit
+ * `upstream_id_status: "unavailable"`: the writer cannot be typed into claiming one. When a
+ * provider id is first measured, it must be scoped by channel + namespace + provider/session
+ * scope hash (`intake.ts` `upstreamDedupeKey`) before it may enter any ledger.
+ *
+ * v1 receipts already on disk stay readable and are never rewritten or migrated; `inventory.ts`
+ * owns that compatibility read.
+ */
 export interface CaptureReceipt {
-  schema_version: 1;
+  schema_version: 2;
   capture_id: string;
+  ingress_id: string;
+  ingress_id_provenance: "minted-at-capture";
   byte_len: number;
   sha256: string;
   original_ref: string;
   channel: "codex-native";
   upstream_namespace: "codex/session";
   upstream_delivery_id: null;
+  upstream_id_status: "unavailable";
+  upstream_scope_sha256: null;
   received_at: string;
   provenance: "unverified";
   task_binding: "pending";
@@ -166,14 +189,20 @@ export async function captureSubmittedPrompt(
         await writeNew(blobPath, bytes);
       }
       const receipt: CaptureReceipt = {
-        schema_version: 1,
+        schema_version: 2,
         capture_id: randomUUID(),
+        // Minted once, inside the store lock, in the same object the single atomic receipt write
+        // persists. There is no second write and no read path that could mint a replacement.
+        ingress_id: randomUUID(),
+        ingress_id_provenance: "minted-at-capture",
         byte_len: bytes.byteLength,
         sha256: digest,
         original_ref: originalRef,
         channel: "codex-native",
         upstream_namespace: "codex/session",
         upstream_delivery_id: null,
+        upstream_id_status: "unavailable",
+        upstream_scope_sha256: null,
         received_at: receivedAt,
         provenance: "unverified",
         task_binding: "pending",

@@ -10,12 +10,17 @@ import { test, type TestContext } from 'node:test';
 // Missing product code is a test failure, never a skip or a product mock.
 const moduleUrl = new URL('../../src/request-capture/receipt.js', import.meta.url);
 type Receipt = {
-  schema_version: 1; capture_id: string; byte_len: number; sha256: string;
+  schema_version: 2; capture_id: string; ingress_id: string;
+  ingress_id_provenance: 'minted-at-capture'; byte_len: number; sha256: string;
   original_ref: string; channel: 'codex-native'; upstream_namespace: 'codex/session';
-  upstream_delivery_id: null; received_at: string; provenance: 'unverified';
+  upstream_delivery_id: null; upstream_id_status: 'unavailable'; upstream_scope_sha256: null;
+  received_at: string; provenance: 'unverified';
   task_binding: 'pending'; durability: 'file-and-directory-fsync' | 'file-fsync-only';
   metadata: Record<'session_id' | 'turn_id' | 'hook_event_name' | 'model', string | null>;
 };
+// #1166 U2: the delivery identity is minted per delivery and must be a real uuid4, never a
+// digest, a timestamp or a copy of the receipt id.
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 type Capture = (raw: Uint8Array, options: { root: string }) => Promise<Receipt>;
 const nullMetadata: Receipt['metadata'] = {
   session_id: null, turn_id: null, hook_event_name: null, model: null,
@@ -65,14 +70,22 @@ async function accepted(root: string): Promise<string[]> {
 }
 
 async function checkReceipt(root: string, raw: Uint8Array, receipt: Receipt): Promise<void> {
-  assert.equal(receipt.schema_version, 1);
+  assert.equal(receipt.schema_version, 2);
   assert.match(receipt.capture_id, /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  // Delivery identity: minted, separate from the receipt identity and from the content address.
+  assert.match(receipt.ingress_id, UUID_V4);
+  assert.notEqual(receipt.ingress_id, receipt.capture_id);
+  assert.notEqual(receipt.ingress_id, receipt.sha256);
+  assert.equal(receipt.ingress_id_provenance, 'minted-at-capture');
   assert.equal(receipt.byte_len, raw.byteLength);
   assert.equal(receipt.sha256, digest(raw));
   assert.equal(receipt.original_ref, `raw/${digest(raw)}.bin`);
   assert.equal(receipt.channel, 'codex-native');
   assert.equal(receipt.upstream_namespace, 'codex/session');
   assert.equal(receipt.upstream_delivery_id, null);
+  // No provider delivery id has been measured on this channel, so none may be claimed.
+  assert.equal(receipt.upstream_id_status, 'unavailable');
+  assert.equal(receipt.upstream_scope_sha256, null);
   assert.equal(receipt.provenance, 'unverified');
   assert.equal(receipt.task_binding, 'pending');
   assert.equal(new Date(receipt.received_at).toISOString(), receipt.received_at);
@@ -355,8 +368,9 @@ test('typed metadata cannot import embedded authority, tasks, or referenced file
   const receipt = await capture(raw, { root });
   await checkReceipt(root, raw, receipt);
   assert.deepEqual(receipt.metadata, { session_id: 's', turn_id: 't', hook_event_name: 'UserPromptSubmit', model: 'm' });
-  assert.deepEqual(Object.keys(receipt).sort(), ['schema_version', 'capture_id', 'byte_len', 'sha256', 'original_ref', 'channel',
-    'upstream_namespace', 'upstream_delivery_id', 'received_at', 'provenance', 'task_binding', 'metadata', 'durability'].sort());
+  assert.deepEqual(Object.keys(receipt).sort(), ['schema_version', 'capture_id', 'ingress_id', 'ingress_id_provenance',
+    'byte_len', 'sha256', 'original_ref', 'channel', 'upstream_namespace', 'upstream_delivery_id', 'upstream_id_status',
+    'upstream_scope_sha256', 'received_at', 'provenance', 'task_binding', 'metadata', 'durability'].sort());
   assert.doesNotMatch(JSON.stringify(receipt), /PROMPT_MUST_NOT_BE_DUPLICATED|FILE_SECRET_MUST_NOT_BE_IMPORTED|approved/);
   assert.equal(await fs.readFile(secretPath, 'utf8'), 'FILE_SECRET_MUST_NOT_BE_IMPORTED');
   assert.equal((await fs.readdir(base)).includes('raw'), false);
@@ -384,6 +398,8 @@ test('same bytes and Codex turn retain distinct request identities', async t => 
   const first = await capture(raw, { root });
   const second = await capture(raw, { root });
   assert.notEqual(first.capture_id, second.capture_id);
+  // Equal bytes are two deliveries sharing one blob: two ingress ids, no content dedupe.
+  assert.notEqual(first.ingress_id, second.ingress_id);
   assert.equal(first.original_ref, second.original_ref);
   await checkReceipt(root, raw, first);
   await checkReceipt(root, raw, second);
@@ -513,14 +529,18 @@ test('independent concurrent child writers retain every receipt and exact blob',
   const results = await Promise.all(runs.map(run => run.waitFor('result')));
   const exits = await Promise.all(runs.map(run => run.done));
   const ids = new Set<string>();
+  const ingress = new Set<string>();
   for (let i = 0; i < runs.length; i++) {
     assert.equal(exits[i].code, 0, JSON.stringify(exits[i]));
     assert.equal(results[i].ok, true, JSON.stringify(results[i]));
     const receipt = results[i].receipt!;
     ids.add(receipt.capture_id);
+    ingress.add(receipt.ingress_id);
     await checkReceipt(root, payloads[i], receipt);
   }
   assert.equal(ids.size, runs.length);
+  // Four of the eight payloads are byte-identical: every delivery still gets its own ingress id.
+  assert.equal(ingress.size, runs.length);
   assert.equal((await accepted(root)).length, runs.length);
   await sentinels(base, root);
 });
@@ -747,8 +767,49 @@ test('fresh processes preserve earlier outputs and generate new identities for r
     receipts.push(result.receipt!);
   }
   assert.notEqual(receipts[0].capture_id, receipts[1].capture_id);
+  assert.notEqual(receipts[0].ingress_id, receipts[1].ingress_id);
   for (const receipt of receipts) await checkReceipt(root, raw, receipt);
   assert.equal((await accepted(root)).length, 2);
+  await sentinels(base, root);
+});
+
+// #1166 U2 R2: the ingress id is persisted, not computed at read time. Repeated reads of the
+// same receipt file must return the same delivery identity and must not create a second entry.
+test('persisted delivery identity is never reminted by reading the receipt back', async t => {
+  const capture = await product();
+  const { base, root } = await fixture(t);
+  const raw = Buffer.from('{"prompt":"replay read"}');
+  const receipt = await capture(raw, { root });
+  const file = path.join(root, 'receipts', `${receipt.capture_id}.json`);
+  const before = await fs.readFile(file);
+  for (let read = 0; read < 3; read++) {
+    const stored = JSON.parse(await fs.readFile(file, 'utf8')) as Receipt;
+    assert.equal(stored.ingress_id, receipt.ingress_id, 'stored delivery identity is stable');
+    assert.equal(stored.ingress_id_provenance, 'minted-at-capture');
+    assert.deepEqual(stored, receipt, 'the returned receipt is exactly what is on disk');
+  }
+  assert.deepEqual(await fs.readFile(file), before, 'reading must not rewrite the receipt');
+  assert.deepEqual(await accepted(root), [`${receipt.capture_id}.json`]);
+  await sentinels(base, root);
+});
+
+// #1166 U2 R4: no store path is derived from the delivery identity (U2-ORIGINAL-SPEC §2.6).
+test('no store path is derived from the delivery identity', async t => {
+  const capture = await product();
+  const { base, root } = await fixture(t);
+  const receipt = await capture(Buffer.from('path rule'), { root });
+  assert.match(receipt.ingress_id, UUID_V4, 'fixture precondition: a delivery identity exists');
+  const names: string[] = [];
+  async function walk(current: string): Promise<void> {
+    names.push(path.relative(root, current));
+    const stat = await fs.lstat(current);
+    if (stat.isDirectory()) for (const name of await fs.readdir(current)) await walk(path.join(current, name));
+  }
+  await walk(root);
+  assert.equal(names.some(name => name.includes(receipt.ingress_id)), false,
+    `ingress_id reached a path: ${JSON.stringify(names)}`);
+  assert.equal(names.includes(path.join('receipts', `${receipt.capture_id}.json`)), true,
+    'the receipt is still addressed by capture_id');
   await sentinels(base, root);
 });
 
