@@ -62,6 +62,14 @@ export const USAGE = `# dispatch.sh — Wraps \`telepty inject\` with REPL-ready
 #   declared files only, at that moment; it grants and restricts nothing.
 #   Omitted, dispatch behaves exactly as before. See docs/setup/dispatch-capacity.md.
 #
+# Task context (#1163), optional pair, otherwise legacy_unverified:
+#   --context-manifest FILE --context-sha256 HASH
+#   requires controller-authenticated source grants/cut, provider input admission
+#   and registry context binding. These ports are currently unavailable: strict
+#   calls refuse before initialization/spawn (ENV_TASK_CONTEXT_REFUSED).
+#   A manifest path/hash grants no read access. Staging is not provider input.
+#   Partial/duplicate pairs or malformed hashes exit 4. See docs/setup/task-context.md.
+#
 # Registration wait (#727): a freshly spawned worker needs tens of seconds to
 #   appear in \`telepty list\` (workspace boot → CLI boot → bridge registration).
 #   The spawn path polls every 5s up to AIGENTRY_DISPATCH_REGISTER_TIMEOUT_MS

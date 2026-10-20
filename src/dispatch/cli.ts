@@ -38,6 +38,8 @@ import { bootstrapEnvironment } from "../environment/bootstrap.js";
 import { dispatchOptionArgs, InvocationError, parseDispatchInvocation, type DispatchInvocation } from "../environment/invocation.js";
 import { acquireClaudeOAuthInput, type ClaudeAcquisitionKind } from "../session/claude-worker-oauth.js";
 import { captureCompatibilityInput, type OwnedInput } from "../environment/owned-input.js";
+import { UNAVAILABLE_PORTS, refuse, type ContextPorts } from "../task-context/contract.js";
+import { prepareContext, composeContextRef, contextBindingArgs, type PreparedContext, type ContextBinding } from "../task-context/assemble.js";
 import { assertTrustedFile, assertTrustedTool, captureManagedRuntime, helperEnvironment, pinTrustedFile, trustedTool,
   type HelperOperation, type TrustedRuntimeContext } from "../environment/helper-env.js";
 
@@ -1017,6 +1019,7 @@ interface Delivery {
   /** #1170: the envelope minted for this dispatch and the sealed attempt it is bound to. */
   report?: ReportRequest;
   reportBinding?: { attempt: string; hash: string };
+  contextBinding?: ContextBinding;
 }
 
 /**
@@ -1225,6 +1228,7 @@ function beginDelivery(o: Opts, d: Delivery, sid: string): { status: number; std
     a.push("--attempt", d.reportBinding.attempt, "--manifest-sha256", d.reportBinding.hash,
       "--report-request-id", d.report.request_id, "--report-challenge-sha256", d.report.challenge_sha256);
   }
+  if (d.contextBinding) a.push(...contextBindingArgs(d.contextBinding));
   return registryOut(a);
 }
 
@@ -1436,7 +1440,7 @@ function spawnWorkspace(o: Opts, sid: string): void {
 }
 
 // ── main ────────────────────────────────────────────────────────────────────
-async function main(): Promise<never> {
+async function main(strictContext: PreparedContext | null = null): Promise<never> {
   const o = invocationOptions();
   if (o.spawn && o.cli === "claude" && !activeInput) die("dispatch.sh: SANDBOX_AUTH_WORKER_TOKEN_REQUIRED; nothing was spawned", 78);
   if (o.spawn && activeInput && o.cli !== "claude" && o.cli !== "auto") { activeInput.dispose(); activeInput = undefined; }
@@ -1483,8 +1487,11 @@ async function main(): Promise<never> {
   // telepty#60 Stage A: the read-only dedup query runs BEFORE any side effect,
   // so a duplicate never spawns a workspace or waits for readiness. It creates
   // no record and no sidecar.
-  d.refHash = computeRefHash(o.refFile);
-  const dedup = registryBoth(["check-dedup", "--sid", sid, "--ref-hash", d.refHash]);
+  d.refHash = strictContext ? strictContext.manifest.delivery.original_ref_sha256 : computeRefHash(o.refFile);
+  const dedup = registryBoth(strictContext
+    ? ["check-context-dedup", "--sid", sid, "--context-manifest-sha256", strictContext.manifestSha256,
+      "--context-attempt", strictContext.selection.identity.attempt]
+    : ["check-dedup", "--sid", sid, "--ref-hash", d.refHash]);
   let skipPreparation = false;
   if (dedup.status === 7 || dedup.status === 8) {
     skipPreparation = true; // duplicate/ambiguous: go straight to the atomic recheck
@@ -1508,6 +1515,12 @@ async function main(): Promise<never> {
       die(retryRefused(sid, dedup.output), 4);
     }
     skipPreparation = false;
+  }
+  if (strictContext && skipPreparation) {
+    // A strict duplicate/unknown query may refuse without a new transaction;
+    // it must never fall through to legacy begin-delivery without a binding.
+    if (dedup.output) process.stdout.write(dedup.output);
+    die(`dispatch.sh: ${dedup.status === 7 ? "DISPATCH_RETRY_HELD" : "DISPATCH_DEDUPLICATED"} for ${sid} — strict context was not dispatched`, dedup.status);
   }
 
   resolveRoute(o, sid, skipPreparation || o.retryUnknown !== "");
@@ -1550,14 +1563,25 @@ async function main(): Promise<never> {
     if (rc !== 0) process.exit(rc);
     // #1162 G2b: after readiness, publish the sealed worker's metadata once.
     if (spawned) publishAgentMeta(sid, o.cli, path.join(env.AIGENTRY_SESSIONS_ROOT || path.join(os.homedir(), ".aigentry", "sessions"), sid));
-    if (!prepareEffectiveRef(o, d)) process.exit(3);
+    if (strictContext) d.effRef = o.refFile; // Required original bytes must not undergo placeholder substitution.
+    else if (!prepareEffectiveRef(o, d)) process.exit(3);
     const stage = path.join(env.AIGENTRY_SESSIONS_ROOT || path.join(os.homedir(), ".aigentry", "sessions"), sid);
     // #1170: mint the envelope and put its trailer in the ref BEFORE staging, so it lands
     // in the worker's read-only copy; refHash above stays the original ref's.
     const pinned = pinReportAttempt(stage, sid);
+    if (strictContext && !pinned) refuse("attempt_changed", strictContext.manifest);
     if (pinned) {
       d.report = mintRequest();
-      appendRefTrailer(d, renderRefTrailer(d.report, { task: o.taskId, sid, attempt: pinned.attempt }));
+      const trailer = renderRefTrailer(d.report, { task: o.taskId, sid, attempt: pinned.attempt });
+      if (strictContext) {
+        const composed = composeContextRef(strictContext, strictContext.originalRef, trailer, pinned);
+        d.tmpRef = mkTemp("dispatch-context", composed.bytes);
+        d.effRef = d.tmpRef;
+        d.contextBinding = composed.binding;
+        // Publish the exact manifest before binding its identity. No mutable active-store writes.
+        const manifestTemp = mkTemp("dispatch-context-manifest", strictContext.manifestBytes);
+        try { stageWorkerRef(stage, sid, o.taskId, manifestTemp); } finally { rmTemp(manifestTemp); }
+      } else appendRefTrailer(d, trailer);
     }
     try {
       // Stage A, like prepareEffectiveRef: the message is built from the verified
@@ -1578,6 +1602,7 @@ async function main(): Promise<never> {
 
   // Nothing fallible may run between this commit and the inject: a crash in
   // that window is conservatively delivery-unknown.
+  if (strictContext && !d.contextBinding) refuse("registry_context_unavailable", strictContext.manifest);
   const begin = beginDelivery(o, d, sid);
   if (begin.status === 4 && begin.stdout.includes('"DISPATCH_RETRY_REFUSED"')) {
     process.stdout.write(begin.stdout);
@@ -1716,13 +1741,30 @@ async function probe(argv: string[]): Promise<never> {
 
 export async function dispatchMain(parsed: DispatchInvocation, source?: OwnedInput,
   trustedEnvironment: NodeJS.ProcessEnv = process.env): Promise<void> {
-  initialize(parsed, source, trustedEnvironment);
-  try { await main(); } finally { activeInput?.dispose(); source?.dispose(); activeInput = undefined; }
+  try {
+    const strictContext = preflightDispatchContext(parsed);
+    initialize(parsed, source, trustedEnvironment);
+    await main(strictContext);
+  } finally { activeInput?.dispose(); source?.dispose(); activeInput = undefined; }
 }
 
 export async function dispatchProbe(parsed: DispatchInvocation, argv: string[]): Promise<void> {
+  preflightDispatchContext(parsed);
   initialize(parsed, undefined);
   await probe(argv);
+}
+
+/** Production has no installed authority/provider port. Tests may simulate this
+ * preflight function; they do not install a port in dispatchMain or prove input. */
+export function preflightDispatchContext(parsed: DispatchInvocation, ports: ContextPorts = UNAVAILABLE_PORTS): PreparedContext | null {
+  if (parsed.help || parsed.values["--context-manifest"] === undefined) return null;
+  return prepareContext({
+    manifestPath: parsed.values["--context-manifest"]!,
+    manifestSha256: parsed.values["--context-sha256"]!,
+    refPath: parsed.values["--ref"] ?? "",
+    task: parsed.values["--task"] ?? "",
+    sid: parsed.values["--target"] ?? `${parsed.values["--track"] ?? ""}-${parsed.values["--name"] ?? ""}`,
+  }, ports);
 }
 
 // An import is inert. The shipped entry owns capture/parse before importing this
@@ -1734,6 +1776,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   let source: OwnedInput | undefined;
   try {
     const parsed = parseDispatchInvocation(dispatchOptionArgs(argv));
+    const strictContext = preflightDispatchContext(parsed);
     const provider = parsed.values["--cli"] ?? bootstrapEnvironment(process.env, parsed.context).env.AIGENTRY_DISPATCH_CLI ?? "auto";
     if (argv[0] !== "__probe" && !parsed.help && parsed.switches.has("--spawn-and-dispatch") && ["claude", "auto"].includes(provider)) {
       source = captureCompatibilityInput({ AIGENTRY_CLAUDE_OAUTH_TOKEN: raw });
@@ -1741,7 +1784,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     raw = undefined;
     initialize(parsed, source);
     if (argv[0] === "__probe") await probe(argv.slice(1));
-    else await main();
+    else await main(strictContext);
   } catch (e) {
     const message = e instanceof Error && (e instanceof InvocationError || (e.message.startsWith("ENV_") || e.message.startsWith("CLAUDE_OAUTH_") || e.message.startsWith("SANDBOX_AUTH_") || e.message === "SANDBOX_EXECUTABLE_CHANGED")) ? e.message : "ENV_CONFIGURATION_REFUSED";
     process.stderr.write(`dispatch.sh: ${message}; nothing was spawned\n`);
