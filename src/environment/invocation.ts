@@ -15,7 +15,7 @@ const VALUE_OPTIONS = new Set([
   "--target", "--ref", "--from", "--timeout-ms", "--track", "--name", "--cwd", "--worktree",
   "--cli", "--model", "--effort", "--executable", "--executable-version", "--role", "--task-class",
   "--task", "--no-task", "--input-root", "--input-manifest", "--input-sha256", "--observe", "--retry-unknown",
-  "--binding",
+  "--binding", "--context-manifest", "--context-sha256",
 ]);
 const SWITCH_OPTIONS = new Set(["--spawn-and-dispatch", "--verify-delivered", "--no-verify-started", "--keep-alive"]);
 const TUPLE_OPTIONS = [["--model", "model"], ["--effort", "effort"], ["--executable", "executable"], ["--executable-version", "version"]] as const;
@@ -48,6 +48,14 @@ export function parseDispatchInvocation(argv: readonly string[], cwd = process.c
       observe.push(value);
     } else values[option] = value;
     i += 2;
+  }
+  if (!help) {
+    const manifest = values["--context-manifest"], digest = values["--context-sha256"];
+    if ((manifest === undefined) !== (digest === undefined)) throw new InvocationError("ENV_CONTEXT_OPTION_PAIR_REQUIRED");
+    if (manifest !== undefined && (Buffer.byteLength(manifest) > 4096 || /[\u0000-\u001f\u007f]/.test(manifest))) {
+      throw new InvocationError("ENV_CONTEXT_MANIFEST_INVALID");
+    }
+    if (digest !== undefined && !/^[0-9a-f]{64}$/.test(digest)) throw new InvocationError("ENV_CONTEXT_SHA256_INVALID");
   }
   const flags: Settings = {}, cli = values["--cli"];
   if (cli !== undefined) flags["dispatch.cli"] = validateSetting("dispatch.cli", cli);
