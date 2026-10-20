@@ -445,3 +445,153 @@ jobs:
           }
           main().catch(error => { console.error(error); process.exitCode = 1; });
           U1_NODE
+      - name: U2 receipt inventory and adapter regression
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 3
+        run: |
+          umask 077
+          env -i TMPDIR="$TMPDIR" PATH=/usr/bin:/bin \
+            "$NODE_EXECUTABLE" --input-type=commonjs <<'U2_NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const assert = require('node:assert/strict');
+          const { createHash } = require('node:crypto');
+          const { spawn } = require('node:child_process');
+          const sha = bytes => createHash('sha256').update(bytes).digest('hex');
+          const fileHash = file => sha(fs.readFileSync(file));
+          const errorInfo = e => ({ message: String(e.message), code: e.code ?? null });
+          async function main() {
+            process.umask(0o077);
+            const parent = process.env.TMPDIR;
+            assert(parent && path.isAbsolute(parent) && !/[\r\n\t]/.test(parent));
+            assert.equal(fs.realpathSync(parent), parent);
+            function privateDirectory(dir) {
+              const stat = fs.lstatSync(dir);
+              assert(stat.isDirectory() && !stat.isSymbolicLink());
+              assert.equal(stat.uid, process.getuid());
+              assert.equal(stat.mode & 0o777, 0o700);
+            }
+            privateDirectory(parent);
+            const root = fs.mkdtempSync(path.join(parent, 'u2-managed-'));
+            privateDirectory(root);
+            const owned = {};
+            for (const name of ['home', 'config', 'cache', 'data', 'tmp']) {
+              owned[name] = path.join(root, name);
+              fs.mkdirSync(owned[name], { mode: 0o700 });
+              privateDirectory(owned[name]);
+            }
+            const env = { HOME: owned.home, USERPROFILE: owned.home,
+              XDG_CONFIG_HOME: owned.config, XDG_CACHE_HOME: owned.cache,
+              XDG_DATA_HOME: owned.data, TMPDIR: owned.tmp, TEMP: owned.tmp, TMP: owned.tmp,
+              PATH: '/usr/bin:/bin' };
+            // All unchanged suite children fork Node. No Python, shell or PATH launcher is needed.
+            const executable = process.execPath;
+            assert.equal(fs.realpathSync(executable), executable);
+            assert(fs.lstatSync(executable).isFile());
+            const cwd = fs.realpathSync(process.cwd());
+            const argv = ['--test', '--test-concurrency=1',
+              'dist/tests/request-capture/receipt.test.js',
+              'dist/tests/request-capture/inventory.test.js',
+              'dist/tests/request-capture/adapters.test.js'];
+            const timeoutMs = 170000, perStreamLimit = 1048576;
+            const save = (name, bytes) => fs.writeFileSync(path.join(root, name), bytes,
+              { flag: 'wx', mode: 0o600 });
+            const descriptor = { executable, nodeSha256: fileHash(executable), argv, cwd, env,
+              bootstrap: { argv: process.argv, execArgv: process.execArgv,
+                env: { TMPDIR: parent, PATH: process.env.PATH }, cwd: process.cwd() },
+              timeoutMs, perStreamLimit,
+              workflowSha256: fileHash(path.join(cwd, '.github/workflows/validation-1238-managed-consumers.yml')),
+              suites: argv.slice(2).map(file => ({ file, sha256: fileHash(path.join(cwd, file)) })),
+              root, scope: 'owned synthetic hosted lane; direct child only; no descendant containment' };
+            save('invocation.json', JSON.stringify(descriptor, null, 2) + '\n');
+            console.log('U2 invocation ' + JSON.stringify(descriptor));
+            const streams = Object.fromEntries(['stdout', 'stderr'].map(name => [name,
+              { receivedBytes: 0, retainedBytes: 0, chunks: [], eof: false, closed: false, errors: [] }]));
+            const errors = [], kills = [], destroys = [];
+            let timedOut = false, overflow = false, exit = null, close = null, stopping = false;
+            let child = null;
+            const start = process.hrtime.bigint();
+            function stop(reason) {
+              if (stopping) return;
+              stopping = true;
+              // A successful direct-child kill is not evidence of descendant termination.
+              try {
+                const sent = child.kill('SIGKILL');
+                kills.push({ reason, signal: 'SIGKILL', sent });
+                if (!sent) errors.push({ operation: 'kill', message: 'SIGKILL was not sent', reason });
+              } catch (e) {
+                errors.push({ operation: 'kill', reason, ...errorInfo(e) });
+              }
+              for (const name of ['stdout', 'stderr']) {
+                try {
+                  child[name].destroy();
+                  destroys.push({ name, requested: true });
+                } catch (e) {
+                  errors.push({ operation: 'destroy', name, ...errorInfo(e) });
+                }
+              }
+            }
+            let timer;
+            try {
+              child = spawn(executable, argv, { cwd, env, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+              const closed = new Promise(resolve => {
+                child.on('error', e => { errors.push({ operation: 'child', ...errorInfo(e) }); stop('child-error'); });
+                child.on('exit', (status, signal) => {
+                  exit = { status, signal };
+                  if (status !== 0 || signal !== null) stop('unsuccessful-exit');
+                });
+                child.on('close', (status, signal) => { close = { status, signal }; resolve(); });
+              });
+              for (const name of ['stdout', 'stderr']) {
+                const stream = streams[name];
+                child[name].on('data', chunk => {
+                  stream.receivedBytes += chunk.length;
+                  const retained = chunk.subarray(0, Math.max(0, perStreamLimit - stream.retainedBytes));
+                  if (retained.length) stream.chunks.push(Buffer.from(retained));
+                  stream.retainedBytes += retained.length;
+                  if (stream.receivedBytes > perStreamLimit && !overflow) { overflow = true; stop('overflow'); }
+                });
+                child[name].on('end', () => { stream.eof = true; });
+                child[name].on('close', () => { stream.closed = true; });
+                child[name].on('error', e => { stream.errors.push(errorInfo(e)); stop(name + '-error'); });
+              }
+              // Timers request refusal/termination; they do not guarantee elapsed time or cleanup.
+              timer = setTimeout(() => { timedOut = true; stop('timeout'); }, timeoutMs);
+              await closed;
+            } catch (e) {
+              errors.push({ operation: 'spawn-or-observe', ...errorInfo(e) });
+              if (child) stop('observation-error');
+            } finally {
+              clearTimeout(timer);
+            }
+            const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
+            const output = {};
+            for (const name of ['stdout', 'stderr']) {
+              const { chunks, ...counts } = streams[name];
+              const bytes = Buffer.concat(chunks);
+              save('u2.' + name, bytes);
+              output[name] = { ...counts, file: path.join(root, 'u2.' + name), sha256: sha(bytes) };
+            }
+            const receipt = { ...descriptor, elapsedMs, timedOut, overflow, errors, exit, close,
+              status: close?.status ?? null, signal: close?.signal ?? null, kills, destroys, output };
+            save('u2-result.json', JSON.stringify(receipt, null, 2) + '\n');
+            console.log('U2 result ' + JSON.stringify(receipt));
+            for (const name of ['stdout', 'stderr']) {
+              console.log('U2 raw ' + name + ' begin');
+              const bytes = Buffer.concat(streams[name].chunks);
+              await new Promise((resolve, reject) => process.stdout.write(bytes, e => e ? reject(e) : resolve()));
+              console.log('\nU2 raw ' + name + ' end');
+            }
+            assert.equal(errors.length, 0);
+            assert(!timedOut && !overflow && elapsedMs <= timeoutMs);
+            assert.deepEqual(exit, { status: 0, signal: null });
+            assert.deepEqual(close, { status: 0, signal: null });
+            for (const stream of Object.values(streams)) {
+              assert(stream.eof && stream.closed && stream.errors.length === 0);
+              assert(stream.receivedBytes <= perStreamLimit);
+            }
+          }
+          process.stdout.on('error', error => { process.exitCode = 1; });
+          process.stderr.on('error', error => { process.exitCode = 1; });
+          main().catch(error => { console.error(error); process.exitCode = 1; });
+          U2_NODE
