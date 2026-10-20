@@ -376,6 +376,7 @@ export async function listCaptureInventory(
     // Receipts.
     const items: InventoryItem[] = [];
     const referenced = new Set<string>();
+    const ingressCaptures = new Map<string, string | null>();
     const receiptList = await listDirectory(receiptsPath);
     if (receiptList.overflow) {
       anomalies.add("scan_limit");
@@ -406,6 +407,17 @@ export async function listCaptureInventory(
       if (item === null) {
         anomalies.add("invalid_receipt", captureId);
         continue;
+      }
+      const firstCapture = ingressCaptures.get(item.ingress_id);
+      if (firstCapture === undefined) {
+        ingressCaptures.set(item.ingress_id, captureId);
+      } else {
+        if (firstCapture !== null) {
+          anomalies.add("invalid_receipt", firstCapture);
+          // null marks a collision whose first capture has already been counted.
+          ingressCaptures.set(item.ingress_id, null);
+        }
+        anomalies.add("invalid_receipt", captureId);
       }
       // Blob METADATA only: lstat, never open, read or hash.
       let blob = blobStats.get(item.sha256);
