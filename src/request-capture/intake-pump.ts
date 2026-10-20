@@ -318,6 +318,10 @@ export async function intakePumpOnce(root: string, destination: string, ports: I
       if (!row.owning_task || !row.bound_dispatch_ids.length)
         result.reasons.push("binding_pending:" + row.ingress_id);
     }
+    if (blocked.size) {
+      result.code = 3;
+      return result;
+    }
     for (const row of derivePositions(doc)) {
       if (blocked.has(row.ingress_id) || row.position === null || row.state !== "queued" ||
           row.work_state !== "unstarted" || row.pause !== null || row.superseded_by !== null ||
