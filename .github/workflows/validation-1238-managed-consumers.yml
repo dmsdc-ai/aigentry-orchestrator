@@ -379,7 +379,7 @@ jobs:
             const executable = process.execPath;
             const argv = ['--test', '--test-concurrency=1',
               'dist/tests/request-capture/intake.test.js', 'tests/request-capture/intake-registry.test.mjs',
-              'tests/request-capture/intake-pump.test.mjs'];
+              'tests/request-capture/intake-pump.test.mjs', 'dist/tests/task-context/assembly.test.js'];
             const cwd = process.cwd();
             const timeoutMs = 180000, perStreamLimit = 1048576;
             const streams = Object.fromEntries(['stdout', 'stderr'].map(name => [name,
