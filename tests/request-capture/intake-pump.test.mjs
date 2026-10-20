@@ -369,3 +369,166 @@ test('real public entrypoint: invalid args/ACK/status never create state; corrup
     assert.deepEqual(await fs.readdir(stateDir), ['intake.json']);
     assert.equal(await fs.readFile(path.join(stateDir, 'intake.json'), 'utf8'), '{broken');
   });
+
+// U3-F4 controls use the labelled registry/transport simulation above and the actual
+// compiled pump/core. Replay admits existing ingress even on conflicting capture:
+// this isolates refreshed evidence comparison, not real registry collision handling.
+// These controls do not prove filesystem/transport authenticity, delivery or ACK.
+test('U3-F4-MISSING: simulation stops the whole pass when the first receipt is missing', async () => {
+  const a = item(1), b = item(2);
+  const sim = simulation([b]);
+  for (const receipt of [a, b]) {
+    const admitted = await sim.ports.registry(capturedArguments(receipt, at));
+    assert.equal(admitted.code, 0);
+    assert.equal(JSON.parse(admitted.stdout).result, 'intake_written');
+  }
+  assert.equal((await runIntakeCommand(['intake-status', '--json'], config, sim.ports)).code, 3,
+    'the actual caller must accept the setup document');
+  assert.deepEqual(intakeStatusDocument(sim.doc).requests.map(row => [row.ingress_id, row.position]),
+    [[id(1), 1], [id(2), 2]]);
+  for (const [index, receipt] of [a, b].entries()) {
+    const row = sim.doc.requests[index];
+    for (const key of ['ingress_id', 'capture_id', 'sha256', 'byte_len', 'received_at'])
+      assert.equal(row[key], receipt[key], `setup preserves ${key}`);
+    assert.equal(row.state, 'queued');
+    assert.equal(row.work_state, 'unstarted');
+    assert.equal(row.owning_task, null);
+    assert.deepEqual(row.bound_dispatch_ids, []);
+    for (const key of ['notice', 'pause', 'superseded_by', 'result', 'failure'])
+      assert.equal(row[key], null);
+    assert.equal(applyIntakeNotice(sim.doc, { action: 'claim', ingress_id: receipt.ingress_id,
+      notice_id: intakeNoticeId(receipt.ingress_id), attempt: 1, claim: 'precondition',
+      owner: 'intake-pump', at, previous_attempt: 0, previous_claim: null }).result, 'intake_written');
+  }
+  assert.deepEqual((await sim.ports.inventory('/capture')).items, [b]);
+  const before = JSON.stringify(sim.doc);
+  sim.calls.length = 0;
+
+  const pass = await intakePumpOnce('/capture', 'orch', sim.ports);
+  assert.equal(pass.code, 3);
+  assert.ok(pass.reasons.includes('evidence_missing_or_identity_mismatch:' + id(1)));
+  assert.equal(pass.imported, 0);
+  assert.equal(pass.replayed, 1);
+  assert.ok(sim.calls.some(c => Array.isArray(c) && c[0] === 'intake-list'));
+  assert.equal(pass.notices, 0, 'eligible B must not send after missing evidence for A');
+  assert.equal(sim.calls.filter(c => Array.isArray(c) && c[0] === 'intake-notice'
+    && fields(c).action === 'claim').length, 0);
+  assert.equal(sim.calls.filter(c => Array.isArray(c) && c[0] === 'intake-notice'
+    && fields(c).action === 'result').length, 0);
+  assert.equal(sim.calls.filter(c => c === 'send').length, 0);
+  assert.equal(JSON.stringify(sim.doc), before, 'both original identities/timestamps and all document bytes retained');
+});
+
+test('U3-F4-CONFLICT: simulation stops the whole pass on one conflicting receipt digest', async () => {
+  const a = item(1), b = item(2);
+  const conflict = { ...a, sha256: 'b'.repeat(64) };
+  assert.match(conflict.sha256, /^[a-f0-9]{64}$/);
+  assert.notEqual(conflict.sha256, a.sha256);
+  assert.deepEqual(Object.keys(a).filter(key => a[key] !== conflict[key]), ['sha256']);
+  const sim = simulation([conflict, b]);
+  for (const receipt of [a, b]) {
+    const admitted = await sim.ports.registry(capturedArguments(receipt, at));
+    assert.equal(admitted.code, 0);
+    assert.equal(JSON.parse(admitted.stdout).result, 'intake_written');
+  }
+  assert.equal((await runIntakeCommand(['intake-status', '--json'], config, sim.ports)).code, 3,
+    'the actual caller must accept the setup document');
+  assert.deepEqual(intakeStatusDocument(sim.doc).requests.map(row => [row.ingress_id, row.position]),
+    [[id(1), 1], [id(2), 2]]);
+  for (const [index, receipt] of [a, b].entries()) {
+    const row = sim.doc.requests[index];
+    for (const key of ['ingress_id', 'capture_id', 'sha256', 'byte_len', 'received_at'])
+      assert.equal(row[key], receipt[key], `setup preserves ${key}`);
+    assert.equal(row.state, 'queued');
+    assert.equal(row.work_state, 'unstarted');
+    assert.equal(row.owning_task, null);
+    assert.deepEqual(row.bound_dispatch_ids, []);
+    for (const key of ['notice', 'pause', 'superseded_by', 'result', 'failure'])
+      assert.equal(row[key], null);
+    assert.equal(applyIntakeNotice(sim.doc, { action: 'claim', ingress_id: receipt.ingress_id,
+      notice_id: intakeNoticeId(receipt.ingress_id), attempt: 1, claim: 'precondition',
+      owner: 'intake-pump', at, previous_attempt: 0, previous_claim: null }).result, 'intake_written');
+  }
+  assert.deepEqual((await sim.ports.inventory('/capture')).items, [conflict, b]);
+  const before = JSON.stringify(sim.doc);
+  sim.calls.length = 0;
+
+  const pass = await intakePumpOnce('/capture', 'orch', sim.ports);
+  assert.equal(pass.code, 3);
+  assert.ok(pass.reasons.includes('evidence_missing_or_identity_mismatch:' + id(1)));
+  assert.equal(pass.imported, 0);
+  assert.equal(pass.replayed, 2, 'labelled replay must reach refreshed evidence comparison');
+  assert.ok(sim.calls.some(c => Array.isArray(c) && c[0] === 'intake-list'));
+  assert.equal(pass.notices, 0, 'eligible B must not send after conflicting evidence for A');
+  assert.equal(sim.calls.filter(c => Array.isArray(c) && c[0] === 'intake-notice'
+    && fields(c).action === 'claim').length, 0);
+  assert.equal(sim.calls.filter(c => Array.isArray(c) && c[0] === 'intake-notice'
+    && fields(c).action === 'result').length, 0);
+  assert.equal(sim.calls.filter(c => c === 'send').length, 0);
+  assert.equal(JSON.stringify(sim.doc), before, 'both original identities/timestamps and all document bytes retained');
+});
+
+test('U3-F4-MATCHING: simulation confirms one claim/send/unknown result and stops before B', async () => {
+  const a = item(1), b = item(2);
+  const sim = simulation([a, b]);
+  for (const receipt of [a, b]) {
+    const admitted = await sim.ports.registry(capturedArguments(receipt, at));
+    assert.equal(admitted.code, 0);
+    assert.equal(JSON.parse(admitted.stdout).result, 'intake_written');
+  }
+  assert.equal((await runIntakeCommand(['intake-status', '--json'], config, sim.ports)).code, 3,
+    'the actual caller must accept the setup document');
+  assert.deepEqual(intakeStatusDocument(sim.doc).requests.map(row => [row.ingress_id, row.position]),
+    [[id(1), 1], [id(2), 2]]);
+  for (const [index, receipt] of [a, b].entries()) {
+    const row = sim.doc.requests[index];
+    for (const key of ['ingress_id', 'capture_id', 'sha256', 'byte_len', 'received_at'])
+      assert.equal(row[key], receipt[key], `setup preserves ${key}`);
+    assert.equal(row.state, 'queued');
+    assert.equal(row.work_state, 'unstarted');
+    assert.equal(row.owning_task, null);
+    assert.deepEqual(row.bound_dispatch_ids, []);
+    for (const key of ['notice', 'pause', 'superseded_by', 'result', 'failure'])
+      assert.equal(row[key], null);
+    assert.equal(applyIntakeNotice(sim.doc, { action: 'claim', ingress_id: receipt.ingress_id,
+      notice_id: intakeNoticeId(receipt.ingress_id), attempt: 1, claim: 'precondition',
+      owner: 'intake-pump', at, previous_attempt: 0, previous_claim: null }).result, 'intake_written');
+  }
+  assert.deepEqual((await sim.ports.inventory('/capture')).items, [a, b]);
+  const before = structuredClone(sim.doc);
+  const expectedClaim = { action: 'claim', ingress_id: id(1), notice_id: intakeNoticeId(id(1)),
+    attempt: 1, previous_attempt: 0, previous_claim: null, claim: 'claim-1', owner: 'intake-pump', at };
+  const send = sim.ports.send;
+  sim.ports.send = async (...args) => {
+    assert.deepEqual(sim.doc.requests[0].notice.events, [expectedClaim],
+      'claim must be durably confirmed before the actual send-port call');
+    assert.equal(args[0], 'orch');
+    assert.equal(JSON.parse(args[1]).ingress_id, id(1));
+    return send(...args);
+  };
+  sim.calls.length = 0;
+
+  const pass = await intakePumpOnce('/capture', 'orch', sim.ports);
+  assert.equal(pass.code, 3);
+  assert.equal(pass.imported, 0);
+  assert.equal(pass.replayed, 2);
+  assert.equal(pass.notices, 1);
+  assert.ok(pass.reasons.includes('notice_unknown:' + id(1)));
+  assert.deepEqual(sim.calls.map(c => Array.isArray(c)
+    ? c[0] === 'intake-notice' ? `${c[0]}:${fields(c).action}` : c[0] : c),
+  ['inventory', 'intake-event', 'intake-event', 'intake-list',
+    'intake-notice:claim', 'send', 'intake-notice:result', 'intake-list']);
+  assert.equal(sim.calls.filter(c => c === 'send').length, 1);
+  const events = sim.doc.requests[0].notice.events;
+  assert.equal(events.length, 2);
+  assert.deepEqual(events[0], expectedClaim);
+  assert.equal(events[1].action, 'result');
+  assert.equal(events[1].status, 'unknown', 'queued transport is not delivery or semantic ACK');
+  assert.equal(events[1].retry_at, null);
+  for (const key of ['ingress_id', 'notice_id', 'attempt', 'claim', 'owner', 'at'])
+    assert.equal(events[1][key], expectedClaim[key]);
+  assert.match(events[1].evidence_sha256, /^[a-f0-9]{64}$/);
+  assert.deepEqual({ ...sim.doc.requests[0], notice: null }, before.requests[0]);
+  assert.deepEqual(sim.doc.requests[1], before.requests[1], 'B remains wholly unchanged and unnotified');
+  assert.equal(sim.doc.generation, before.generation + 2);
+});
