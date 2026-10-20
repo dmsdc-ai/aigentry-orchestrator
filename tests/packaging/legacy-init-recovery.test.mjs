@@ -268,6 +268,74 @@ function finalReceipt(file, value) {
   assert.equal(retainedBytes, total, 'final receipt included in exact retained-byte accounting');
 }
 
+function childClosure(receipt, { stamp, event, fail, settle }) {
+  let settled = false;
+  function complete() {
+    return receipt.exit && receipt.close &&
+      Object.values(receipt.streams).every(s => s.eof && s.closed);
+  }
+  function check(terminal = false) {
+    if (settled || (!terminal && !complete())) return;
+    if (!complete()) fail('incomplete child/stream closure');
+    if (receipt.exit && receipt.close &&
+        (receipt.exit.code !== receipt.close.code || receipt.exit.signal !== receipt.close.signal)) {
+      fail('child exit/close status mismatch');
+    }
+    settled = true;
+    settle();
+  }
+  return {
+    observe(kind, detail = {}) {
+      if (settled) return;
+      if (kind === 'exit' || kind === 'close') receipt[kind] = { ...detail, at: stamp() };
+      else {
+        const [name, observation] = kind.split('-');
+        receipt.streams[name][observation === 'eof' ? 'eof' : 'closed'] = true;
+      }
+      event(kind, detail);
+      check();
+    },
+    terminal() { check(true); },
+  };
+}
+
+async function verifyChildClosure() {
+  for (const code of [0, 4]) {
+    for (const missing of [null, 'stdout-eof', 'stdout-close', 'stderr-eof', 'stderr-close']) {
+      const receipt = { exit: null, close: null, streams: {
+        stdout: { eof: false, closed: false }, stderr: { eof: false, closed: false } } };
+      const latch = firstFailure(), events = [], failures = [];
+      let settlements = 0, launches = 0;
+      const closure = childClosure(receipt, {
+        stamp: () => events.length,
+        event: kind => events.push(kind),
+        fail: reason => { failures.push(reason); latch.record(new Error(reason)); },
+        settle: () => { settlements++; },
+      });
+      const sequence = ['exit', 'stdout-eof', 'stderr-eof', 'stderr-close', 'close', 'stdout-close'];
+      for (const kind of sequence.filter(kind => kind !== missing)) {
+        assert.equal(settlements, 0, 'independent observations must remain pending');
+        closure.observe(kind, kind === 'exit' || kind === 'close' ? { code, signal: null } : {});
+        assert.deepEqual(failures, [], 'child close cannot prematurely refuse stream drainage');
+      }
+      assert.deepEqual(events, sequence.filter(kind => kind !== missing), 'actual observation order retained');
+      assert.equal(settlements, missing ? 0 : 1, 'only complete independent closure settles');
+      assert.equal(receipt.exit.code, code, 'zero/refusal status preserved');
+      assert.equal(receipt.close.code, code, 'matching close status preserved');
+      // Deterministically drive the same terminal hook as the bounded close timer.
+      closure.terminal();
+      assert.equal(settlements, 1, 'terminal settlement is bounded and single');
+      assert.deepEqual(failures, missing ? ['incomplete child/stream closure'] : []);
+      if (missing) {
+        await assert.rejects(latch.run(() => { launches++; }), error => error === latch.error);
+        assert.equal(launches, 0, 'incomplete terminal closure latches against later launch');
+      }
+      closure.terminal();
+      assert.equal(settlements, 1, 'repeated terminal observation cannot settle again');
+    }
+  }
+}
+
 async function verifyFailureLatch() {
   for (const phase of ['setup', 'oracle']) {
     const latch = firstFailure();
@@ -310,6 +378,7 @@ test('actual public legacy recovery plan is read-only evidence', async t => {
   fs.mkdirSync(evidencePath, { mode: 0o700 });
   evidence = evidencePath; // Only publish a safely established owned directory.
   await verifyFailureLatch(); // Harness-only negative control; no product invocation.
+  await verifyChildClosure(); // Shared lifecycle control; no product invocation or timer.
   const retainSnapshot = snapshotStore(evidence);
   canonicalDirectory(source);
   assert.ok(manifestFile && path.isAbsolute(manifestFile));
@@ -450,12 +519,11 @@ test('actual public legacy recovery plan is read-only evidence', async t => {
         budget.failure ??= reason;
         suiteFailure.record(new Error(reason));
       };
+      const closure = childClosure(receipt, { stamp, event, fail, settle: finish });
       function finish() {
         if (finished) return;
         if (stamp() > launchedAt + timeoutMs) fail('child runtime/drain deadline exceeded');
         if (receipt.exit?.signal) fail('child terminated by signal');
-        if (!receipt.exit || !receipt.close ||
-            Object.values(receipt.streams).some(s => !s.eof || !s.closed)) fail('incomplete child/stream closure');
         finished = true;
         clearTimeout(runtimeTimer); clearTimeout(closeTimer);
         t.signal.removeEventListener('abort', abort);
@@ -479,16 +547,16 @@ test('actual public legacy recovery plan is read-only evidence', async t => {
         }
       }
       function abort() { stop('suite aborted'); }
-      if (t.signal.aborted) { fail('suite aborted before spawn'); finish(); return; }
+      if (t.signal.aborted) { fail('suite aborted before spawn'); closure.terminal(); return; }
       t.signal.addEventListener('abort', abort, { once: true });
       try {
         child = spawn(node, args, { cwd: f.base, env: receipt.env, shell: false,
           detached: false, stdio: ['ignore', 'pipe', 'pipe'] });
-      } catch (error) { event('spawn-throw', { error: String(error) }); fail('spawn threw'); finish(); return; }
+      } catch (error) { event('spawn-throw', { error: String(error) }); fail('spawn threw'); closure.terminal(); return; }
       child.on('spawn', () => event('spawn'));
       child.on('error', error => { event('child-error', { error: String(error), code: error.code }); stop('child error'); });
-      child.on('exit', (code, signal) => { receipt.exit = { code, signal, at: stamp() }; event('exit', { code, signal }); });
-      child.on('close', (code, signal) => { receipt.close = { code, signal, at: stamp() }; event('close', { code, signal }); finish(); });
+      child.on('exit', (code, signal) => closure.observe('exit', { code, signal }));
+      child.on('close', (code, signal) => closure.observe('close', { code, signal }));
       for (const name of ['stdout', 'stderr']) {
         const stream = child[name], state = receipt.streams[name];
         stream.on('data', chunk => {
@@ -498,8 +566,8 @@ test('actual public legacy recovery plan is read-only evidence', async t => {
           state.bytes += chunk.length;
           if (state.bytes > STREAM_BYTES) stop(`${name} overflow`);
         });
-        stream.on('end', () => { state.eof = true; event(`${name}-eof`); });
-        stream.on('close', () => { state.closed = true; event(`${name}-close`); });
+        stream.on('end', () => closure.observe(`${name}-eof`));
+        stream.on('close', () => closure.observe(`${name}-close`));
         stream.on('error', error => { event(`${name}-error`, { error: String(error) }); stop(`${name} error`); });
       }
       runtimeTimer = setTimeout(() => stop('child runtime/drain timeout'), Math.max(1, launchedAt + timeoutMs - stamp()));
@@ -510,7 +578,7 @@ test('actual public legacy recovery plan is read-only evidence', async t => {
           try { child[name].destroy(); event(`${name}-destroy`); }
           catch (error) { event(`${name}-destroy-error`, { error: String(error) }); fail(`${name} destroy failed`); }
         }
-        finish(); // Explicitly records any unobserved close/EOF, never a pass.
+        closure.terminal(); // Explicitly records any unobserved close/EOF, never a pass.
       }, Math.max(1, Math.min(budget.end - FINAL_MS, launchedAt + timeoutMs + CLOSE_MS) - stamp()));
     });
     let after, afterRetained = false, evidenceFailed = false;
