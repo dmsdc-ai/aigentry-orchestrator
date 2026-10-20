@@ -842,7 +842,7 @@ jobs:
             "src/tracker/cli.ts": "a96b64138da85424f420312c164b1ddf0d1d5ddf6193a5bfedb55e6ba5eee700",
             "src/tracker/report-sweep.ts": "85f7d2e177674be7ebbe974580e17ea79618c2f49df7e600fe3cc7127a2be3dc",
             "src/tracker/usage.ts": "4978e3d6edf471ab779d77d6a5c413df7607d1071e00c003b83f532b8d68badb",
-            "tests/packaging/legacy-init-recovery.test.mjs": "3e2f458f59d2fc200f3f8c93ee8652c4d1c61cba1b50ca8760e7488a8a17cd46",
+            "tests/packaging/legacy-init-recovery.test.mjs": "1ed98638f64da75db7ea77bdca4b4963804c3c501eb429ac8d2b6ed01a7a5de8",
             "tsconfig.json": "7f867214418ae3ed617dba351c2d4c99064b8e7afd3b9a0d34ece8cc8a94bc97"
           };
           const expectedCompiled = [
