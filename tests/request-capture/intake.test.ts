@@ -787,3 +787,40 @@ for (const missing of ["pause", "superseded_by", "result", "failure"] as const) 
     assert.equal(row(doc, 1).notice, null);
   });
 }
+
+// Mixed received_at formats: expected order is specified independently of the sorter.
+for (const fifo of [
+  { name: "U1-FIFO-T1 whole second precedes its later millisecond",
+    first: 2, firstAt: "2026-10-20T00:00:00Z", second: 1, secondAt: "2026-10-20T00:00:00.001Z" },
+  { name: "U1-FIFO-T2 equivalent instants use ingress identity",
+    first: 1, firstAt: "2026-10-20T00:00:00Z", second: 2, secondAt: "2026-10-20T00:00:00.000Z" },
+  { name: "U1-FIFO-T3 adjacent seconds retain both deliveries",
+    first: 2, firstAt: "2026-10-20T00:00:00.999Z", second: 1, secondAt: "2026-10-20T00:00:01Z" },
+]) {
+  test(fifo.name, () => {
+    let doc = emptyIntakeDocument();
+    for (const [id, receivedAt] of [
+      [fifo.second, fifo.secondAt], [fifo.first, fifo.firstAt],
+    ] as const) {
+      doc = ok(doc, capture(id, { received_at: receivedAt, sha256: hex64(7), byte_len: 7 }));
+      assert.equal(validateIntakeDocument(doc).result, "ok");
+      assert.equal(row(doc, id).received_at, receivedAt);
+      assert.equal(row(doc, id).capture_id, uuid(900 + id));
+      assert.equal(row(doc, id).state, "queued");
+      assert.equal(row(doc, id).work_state, "unstarted");
+    }
+    assert.equal(doc.requests.length, 2);
+    assert.deepEqual(doc.requests.map(r => [r.ingress_id, r.received_at]), [
+      [uuid(fifo.second), fifo.secondAt], [uuid(fifo.first), fifo.firstAt],
+    ]);
+    const before = JSON.stringify(doc);
+    const expected = [
+      { ...row(doc, fifo.first), position: 1 },
+      { ...row(doc, fifo.second), position: 2 },
+    ];
+    const actual = derivePositions(doc);
+    assert.equal(JSON.stringify(doc), before, "position derivation must not mutate any input");
+    assert.equal(validateIntakeDocument(doc).result, "ok");
+    assert.deepEqual(actual, expected, "complete FIFO rows, identities, timestamps and positions");
+  });
+}

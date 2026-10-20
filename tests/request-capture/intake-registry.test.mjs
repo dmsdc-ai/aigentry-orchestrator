@@ -1595,3 +1595,64 @@ for (const kind of ["pause", "cancel"]) {
       } finally { await child.cleanup(); }
     });
 }
+
+// Three worlds, two captures and one list each; all nine calls are serial and bounded.
+for (const fifo of [
+  { name: "R-FIFO-T1 whole second precedes its later millisecond", label: "fifo-t1",
+    first: 2, firstAt: "2026-10-20T00:00:00Z", second: 1, secondAt: "2026-10-20T00:00:00.001Z" },
+  { name: "R-FIFO-T2 equivalent instants use ingress identity", label: "fifo-t2",
+    first: 1, firstAt: "2026-10-20T00:00:00Z", second: 2, secondAt: "2026-10-20T00:00:00.000Z" },
+  { name: "R-FIFO-T3 adjacent seconds retain both deliveries", label: "fifo-t3",
+    first: 2, firstAt: "2026-10-20T00:00:00.999Z", second: 1, secondAt: "2026-10-20T00:00:01Z" },
+]) {
+  test(fifo.name, () => {
+    const w = world(fifo.label);
+    const captures = [];
+    try {
+      for (const [id, receivedAt] of [
+        [fifo.second, fifo.secondAt], [fifo.first, fifo.firstAt],
+      ]) {
+        const result = noticeRun(w, ["intake-event", ...w.capture(id, {
+          "--received-at": receivedAt, "--sha256": hex64(7), "--byte-len": "7",
+        })]);
+        captures.push(result);
+        assert.equal(result.status, 0, result.stdout + result.stderr);
+        const accepted = JSON.parse(result.stdout);
+        assert.equal(accepted.result, "intake_written", result.stdout);
+        assert.equal(accepted.state, "queued");
+        assert.equal(accepted.work_state, "unstarted");
+      }
+      assert.equal(captures.length, 2);
+      const before = fs.readFileSync(w.file("intake.json"));
+      const mode = fs.lstatSync(w.file("intake.json")).mode;
+      const doc = JSON.parse(before.toString("utf8"));
+      assert.equal(doc.generation, 2);
+      assert.equal(doc.requests.length, 2);
+      const expectedRows = [
+        [fifo.first, fifo.firstAt], [fifo.second, fifo.secondAt],
+      ].map(([id, receivedAt], index) => {
+        const matches = doc.requests.filter(r => r.ingress_id === uuid(id));
+        assert.equal(matches.length, 1, "each accepted delivery occurs exactly once");
+        const stored = matches[0];
+        assert.equal(stored.capture_id, uuid(900 + id));
+        assert.equal(stored.received_at, receivedAt);
+        assert.equal(stored.sha256, hex64(7));
+        assert.equal(stored.byte_len, 7);
+        assert.equal(stored.state, "queued");
+        assert.equal(stored.work_state, "unstarted");
+        return { ...stored, position: index + 1 };
+      });
+      const listed = noticeRun(w, ["intake-list"]);
+      assert.equal(listed.status, 0, listed.stdout + listed.stderr);
+      assert.deepEqual(fs.readFileSync(w.file("intake.json")), before, "listing preserves raw bytes");
+      assert.equal(fs.lstatSync(w.file("intake.json")).mode, mode, "listing preserves mode");
+      assert.equal(w.doc().generation, doc.generation, "listing preserves generation");
+      assert.deepEqual(JSON.parse(listed.stdout), {
+        schema_version: doc.schema_version, generation: doc.generation,
+        order: ORDER, count: 2, requests: expectedRows,
+      }, "complete listing, identities, original timestamps, order and positions");
+    } finally {
+      fs.rmSync(w.root, { recursive: true, force: true });
+    }
+  });
+}
