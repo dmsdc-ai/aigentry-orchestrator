@@ -247,6 +247,7 @@ export const INTAKE_FORBIDDEN_KEYS: readonly string[] = [
 const UUID4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const HEX64 = /^[0-9a-f]{64}$/;
 const RFC3339_Z = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+const RECEIVED_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z(?![\s\S])/;
 const NAME = /^[a-z0-9][a-z0-9._-]*$/;
 const NAMESPACE = /^[a-z0-9][a-z0-9._/-]*$/;
 const REFERENCE = /^[A-Za-z0-9._:/-]+$/;
@@ -418,7 +419,7 @@ function immutableFields(event: IntakeEvent): IntakeOutcome | Immutable {
   if (isRefusal(namespace)) return namespace;
   const digest = textField(event.sha256, "sha256", 64, HEX64);
   if (isRefusal(digest)) return digest;
-  const receivedAt = textField(event.received_at, "received-at", 32, RFC3339_Z);
+  const receivedAt = textField(event.received_at, "received-at", 32, RECEIVED_AT);
   if (isRefusal(receivedAt)) return receivedAt;
   const byteLen = event.byte_len;
   if (typeof byteLen !== "number" || !Number.isInteger(byteLen) || byteLen < 0

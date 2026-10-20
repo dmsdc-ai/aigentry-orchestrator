@@ -2136,6 +2136,7 @@ INTAKE_FORBIDDEN_KEYS = ("argv", "attachment", "attachments", "body", "command",
                          "text", "original_ref")
 INTAKE_UUID4_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 INTAKE_AT_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+INTAKE_RECEIVED_AT_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z")
 INTAKE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
 INTAKE_NAMESPACE_RE = re.compile(r"[a-z0-9][a-z0-9._/-]*")
 INTAKE_REFERENCE_RE = re.compile(r"[A-Za-z0-9._:/-]+")
@@ -2365,7 +2366,7 @@ def intake_immutable(args: dict) -> dict:
     namespace = intake_text(args.get("upstream-namespace"), "upstream-namespace",
                             INTAKE_BOUNDS["id_chars"], INTAKE_NAMESPACE_RE)
     digest = intake_text(args.get("sha256"), "sha256", 64, HEX64_RE)
-    received_at = intake_text(args.get("received-at"), "received-at", 32, INTAKE_AT_RE)
+    received_at = intake_text(args.get("received-at"), "received-at", 32, INTAKE_RECEIVED_AT_RE)
     raw_len = args.get("byte-len")
     if not isinstance(raw_len, str) or not INTAKE_UINT_RE.fullmatch(raw_len) \
             or int(raw_len) > INTAKE_BOUNDS["byte_len"]:
