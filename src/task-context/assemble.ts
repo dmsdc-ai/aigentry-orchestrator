@@ -261,7 +261,7 @@ export function assembleManifest(m: ContextManifest, selection: Selection, read:
   } };
 }
 
-function verifyCut(p: ContextPorts, selection: Selection, phase: "preflight" | "before-binding"): string {
+function verifyCut(p: ContextPorts, selection: Selection, phase: "preflight" | "before-admission" | "before-binding"): string {
   if (!p.authority) refuse("source_cut_unverified");
   const cut = p.authority.validateCut(selection, phase);
   if (!cut.receipt || cut.source_cut !== selection.source_cut || cut.selection_revision !== selection.selection_revision) refuse("source_cut_changed");
@@ -310,6 +310,7 @@ export function composeContextRef(prepared: PreparedContext, original: Buffer, t
   if (bytes.length - assembly.optional_bytes > LIMITS.requiredBodyBytes) refuse("required_context_overflow", m, undefined,
     { bytes: bytes.length - assembly.optional_bytes, limit: LIMITS.requiredBodyBytes });
   if (!ports.provider || bytes.length > ports.provider.capacity.available_bytes) refuse("required_context_overflow", m);
+  verifyCut(ports, selection, "before-admission");
   const admission = ports.provider.admit(bytes, selection);
   if (!admission.receipt || admission.route !== "input-gated" || admission.input_status !== "awaiting-observation" ||
       admission.body_sha256 !== sha256(bytes) || admission.attempt !== pinned.attempt) refuse("input_unobservable", m);

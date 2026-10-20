@@ -87,7 +87,7 @@ export interface ContextRequest { manifestPath: string; manifestSha256: string; 
 export interface AuthorityPort {
   select(request: ContextRequest): Selection;
   /** Existing writers must validate one authoritative cut, not matching unlocked reads. */
-  validateCut(selection: Selection, phase: "preflight" | "before-binding"): {
+  validateCut(selection: Selection, phase: "preflight" | "before-admission" | "before-binding"): {
     source_cut: string; selection_revision: string; receipt: string;
   };
 }
