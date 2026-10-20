@@ -1031,17 +1031,43 @@ jobs:
           }
           function directory(dir, privateRoot = false) {
             boundary('directory');
+            let inspected = dir, s, canonical, inspection = 'path';
+            try {
             assert(path.isAbsolute(dir) && path.normalize(dir) === dir && !/[\x00-\x1f\x7f]/.test(dir));
             for (let p = dir;; p = path.dirname(p)) {
-              const s = fs.lstatSync(p);
+              inspected = p; s = undefined; inspection = 'lstat';
+              s = fs.lstatSync(p); inspection = 'directory predicate';
               assert(s.isDirectory() && !s.isSymbolicLink() && (s.uid === 0 || s.uid === process.getuid()) &&
                 (s.mode & 0o022) === 0, 'unsafe directory: ' + p);
               if (p === path.dirname(p)) break;
             }
-            assert.equal(fs.realpathSync(dir), dir);
+            inspected = dir; s = undefined; inspection = 'realpath';
+            canonical = fs.realpathSync(dir); inspection = 'canonicality';
+            assert.equal(canonical, dir);
             if (privateRoot) {
-              const s = fs.lstatSync(dir);
+              inspection = 'private lstat';
+              s = fs.lstatSync(dir); inspection = 'private predicate';
               assert.equal(s.uid, process.getuid()); assert.equal(s.mode & 0o777, 0o700);
+            }
+            } catch (e) {
+              const currentUid = process.getuid();
+              e.message = 'unsafe directory: ' + JSON.stringify({
+                path: String(inspected).slice(0,512), pathTruncated: String(inspected).length > 512,
+                inspection, inspectionCode: inspection === 'lstat' || inspection === 'private lstat' ||
+                  inspection === 'realpath' ? e.code ?? null : null,
+                type: s ? s.mode & 0o170000 : null, link: s ? s.isSymbolicLink() : null,
+                uid: s?.uid ?? null, gid: s?.gid ?? null, mode: s?.mode ?? null, currentUid,
+                predicates: {absolute: path.isAbsolute(dir), normalized: path.normalize(dir) === dir,
+                  noControlCharacters: !/[\x00-\x1f\x7f]/.test(dir),
+                  directory: s ? s.isDirectory() : null, nonlink: s ? !s.isSymbolicLink() : null,
+                  rootOwner: s ? s.uid === 0 : null, currentOwner: s ? s.uid === currentUid : null,
+                  allowedOwner: s ? s.uid === 0 || s.uid === currentUid : null,
+                  noGroupOtherWrite: s ? (s.mode & 0o022) === 0 : null,
+                  canonical: canonical === undefined ? null : canonical === dir,
+                  privateOwner: privateRoot && s ? s.uid === currentUid : null,
+                  privateMode: privateRoot && s ? (s.mode & 0o777) === 0o700 : null}
+              });
+              throw e;
             }
           }
           function read(root, rel, max = 8 * limit) {
