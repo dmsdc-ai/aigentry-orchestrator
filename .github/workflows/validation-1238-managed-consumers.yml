@@ -672,3 +672,616 @@ jobs:
           process.stderr.on('error', () => { process.exitCode = 1; });
           main().catch(error => { console.error(error); process.exitCode = 1; });
           U2_NODE
+      - name: Bounded POSIX legacy recovery plan
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 5
+        run: |
+          umask 077
+          env -i HOME="$HOME" USERPROFILE="$USERPROFILE" \
+            XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+            XDG_DATA_HOME="$XDG_DATA_HOME" TMPDIR="$TMPDIR" \
+            PATH=/usr/bin:/bin RECOVERY_CHECKOUT_SHA="$GITHUB_SHA" \
+            "$NODE_EXECUTABLE" --input-type=module <<'RECOVERY_NODE'
+          // Source-only authoring: this complete program is executed only after hosted admission.
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import assert from 'node:assert/strict';
+          import {createHash} from 'node:crypto';
+          import {spawn} from 'node:child_process';
+          import {pathToFileURL} from 'node:url';
+          import {builtinModules} from 'node:module';
+
+          const started = Date.now(), start = process.hrtime.bigint();
+          const elapsed = () => Number(process.hrtime.bigint() - start) / 1e6;
+          const limit = 1048576, packageLimit = 48 * limit;
+          const sha = bytes => createHash('sha256').update(bytes).digest('hex');
+          const sourcePins = {
+            "bin/init/cli.mjs": "9b7d7a38563b9adec6a700a28f7e30a55c508b28d0a943f4ee9fbe828b99a9b1",
+            "bin/init/manifest.mjs": "c178778e664383e835cba904f3c5d8c25c7203ab61d1e59a30b936fc5d2df33b",
+            "bin/init/native-capture.mjs": "97ad80ec2a1bfb44341414eebc717d326ed67337927d2a617e7bd194a26029bb",
+            "bin/init/preservation.mjs": "7a4f492057061f09937201e3462c3eacf0b85fb2796f8ccd38fc760846721f91",
+            "package-lock.json": "e0ab7099e362f3bee0d0c0cdf4ae601d8a0315c6706dfebc54b81ad12bf02b1d",
+            "package.json": "efbee05f0e3909ddfad520dd49996932f1ac6749e0f6392224a49bdfec22d9b5",
+            "src/bridge-auditor/cli.ts": "f061a7128bbc200f263ddbe5d4b39261f5af7f1e8b3c237a3b896ff0266d120d",
+            "src/bridge-auditor/usage.ts": "3972c1d0c081c5672b6bdc184c1abcd2a64e07843f30a2af73ff0eea88ad53d7",
+            "src/bus-bridge/cli.ts": "b12a06c0317c7f671d8f1776ae2936c8933dfe69952c11c1745edbf812f0975e",
+            "src/bus-bridge/usage.ts": "e516cc11e12c8d2e2d0b07335054a648bf375cb5c4ce070bd24c9bb9471105ff",
+            "src/cleanup-scheduler/cli.ts": "0cefb0d83bb42efb78cfce7989fa6778ea50445116298239ca604343978f8ca3",
+            "src/cleanup-scheduler/usage.ts": "1f421dd029c885ae2c08b609e13aa5e2cc97bdb942577fbf5d801e587740187c",
+            "src/cleanup/cli.ts": "8b45f7a2aee336816f977bf50e4c86d9175521eab3f417e2351abc5135490435",
+            "src/cleanup/usage.ts": "fd9b6903098089ef93f09a0e8081430360d88e80e0fbca3ae665b8d7db750340",
+            "src/comms-auditor/cli.ts": "81f89164e9a0aa552a98462bf73321d58fa482dcb41774b94dcf7aa474d21c35",
+            "src/context-handoff/adapters/claude.ts": "8fde274743c5490d72d26ae6df55a3553b947eeb54ae0a3cd73a061781b0e2ec",
+            "src/context-handoff/adapters/codex.ts": "548468ddc4895e9501235775c88d002f0ad4e6bcdf2bec5cff3cd3fbb77fbce2",
+            "src/context-handoff/adapters/gemini.ts": "6282855d9c52fa0a62456667191ac33b09254f68d35988662e96b353c3f03d64",
+            "src/context-handoff/adapters/grok.ts": "8838e5d3e02961baee9bd5cde0bb3b2450aa6c17e7d08fe728ee8e8855919ffd",
+            "src/context-handoff/adapters/index.ts": "9950bc4779fdcc43d908541e9a09185035b8995b0d0b5978de8fa2240c19fb7c",
+            "src/context-handoff/cli.ts": "54e1d7276a3316b9ae115acfb54e04b6e274c257e7135f04ec1cf5ab497c5c1d",
+            "src/context-handoff/compose.ts": "e9fada5cc87d800ec56184009eeefdd46eae037cc0661d1cdbfd2fc377931fb3",
+            "src/context-handoff/enrich.ts": "a098a86b82ed789c6fae696be58cfd164e6fd2e7f3356ef4d74156a9cff202a0",
+            "src/context-handoff/redact.ts": "eb13df17d945b65a0729e1b377d77cae9f074f072e3ed78524184dd7d0dfdfd7",
+            "src/context-handoff/select.ts": "1e674aab03edb1d7b67272cb404593cd8eea007d61d6ae883320ace5e1a6ec1d",
+            "src/context-handoff/types.ts": "fa8adbcaec00981c40315ecbd93a3439311a3af055cf9b41d373740a6ba9e1bc",
+            "src/context-handoff/write.ts": "432c06d6d91737cf23b30ff8959dc9397f5cef996aa5cbdff46f96148a3c1398",
+            "src/control/admission.ts": "3663f81e0f05d966d62a2077a118c667617d57c6b6b5372c272cde7a89d9f609",
+            "src/control/cards.ts": "b13bc9165273aa55f3b13a6cadf1d2be2bbf4403cf32a17a6922c56d4d7386c0",
+            "src/control/contracts.ts": "579b61f2e353294f504e35a49169b8fc37f6325524682f720d5bddc07ea70db5",
+            "src/dispatch/cli.ts": "c8772fe212f775f7be7254b19e5a0e540a76de22587e9562b1778cda46aa72b4",
+            "src/dispatch/inject-id.ts": "3055de64ab0ac6d2681ff01394f2359e5e1d45f27cee7a475fcdab8c58c645cd",
+            "src/dispatch/registry-command.ts": "06c784a45ece615d6d9ad09e9b042dc1d2cdc8071fe3b96073509185137ba1a0",
+            "src/dispatch/usage.ts": "cd14ded153fbdd3771dd7572db51ec9b30ca36cd731903f4515fffec33ea26c7",
+            "src/environment/awareness.ts": "9b9aa9569b000b91ea6047daebfc2fc09ad52b8786dba4be6cfc7bf7fd60c478",
+            "src/environment/bootstrap.ts": "6562e589d4dda57e0dd3b229adcc6182df082b3edaa9ad4f78d378bc7afbd2fd",
+            "src/environment/cli.ts": "dcc9bdf6e051eedc8405de5e392af9bd26e3ffc3604bbddb6ac0642476861169",
+            "src/environment/contract.ts": "48f4c97b727661fccd705c4ef6740c38f7538073f26cb411fa2e9973bfe4408c",
+            "src/environment/delivery.ts": "f9b0c9773ce094d63df462958c350beab13c5b8d6ede1d1b91e060a65da80592",
+            "src/environment/descriptors.ts": "57bb44e988e493ea7eb192376dd50bc155fd697f0cb9ed092a32d575e71cd55c",
+            "src/environment/executable-version.ts": "d83393e5a5c342ec8c168d41175be078a0d28bdb83fe6b417d021ea9dc7c658b",
+            "src/environment/grants.ts": "979c5dd13d23c0e75e818eb41556b13a8bd5afb1f7aee0e5a9d357642fccc69f",
+            "src/environment/helper-env.ts": "45c92beb3cae9864704274cea8e4a9101249ded37a662f0e3343dfdd7b801415",
+            "src/environment/invocation.ts": "7b982a3e2621a0222cc936f49ffb03c3c4f4adf33329ffae2ea63a4ee77161dc",
+            "src/environment/native-boot.ts": "999e0cfc3245b2c3efa8a0c6d7decb062ff224f9aba81188201c387ca099b9f5",
+            "src/environment/owned-input.ts": "c6596570c2b1885c3930581f742f821993427fc9b2330ae606b856cb0060a2c8",
+            "src/environment/resolve.ts": "d35f010185a725fc1d82bf19014af9fb29f1ab59fcc2c519e931f7e801bea496",
+            "src/environment/storage.ts": "011fe0330a68e0a2e15829f4073cbcbb0a9ef0a663ce4537b15514e9669b3215",
+            "src/gate/class-a/cli_direct.ts": "9030614d7c767c8b18c4b05b42bfb7c1e3a06109b83e6d5e2ef783fe70d560bb",
+            "src/gate/class-a/cmux.ts": "d375844c41b69b32ca03e26af80d81e1e9996fb523e20e2dfc56250ed458fb18",
+            "src/gate/class-a/telepty.ts": "49366a51f2694e6cc1fab4d0d6c0f809d1fb9d017cf9f4b5f7fc0ac74b3b000e",
+            "src/gate/class-b/agent-tool-validator.ts": "b1c959f28407e6753b206bc6f0ec26fea10c0917af27383ed7481e9827652ae2",
+            "src/gate/class-c/mcp-deliberation-adapter.ts": "dbcaf4b151c707187f487ff1b6aa0853c59537125cf2a2f541657e43eb5a10cd",
+            "src/gate/common.ts": "1926edd4a6897f4d5a5f0a2af80b53c34512e9e601fc80bcbf6355bd841ef324",
+            "src/gate/index.ts": "58ffa5747344a6c76c0c93eff97ecf398753851c837e86af88130e7e411a04bb",
+            "src/hitl/cli.ts": "e4d0ab78c5a68a6c00d94a5e99098c2a0856f0727c857d63797c930c67e81c92",
+            "src/hitl/usage.ts": "4acbff5a8e1000950828f99fe8ae05f82fb124aa2269e569af1f51585dee830d",
+            "src/hitl/web/assets.ts": "5e672fa10ce8c6ca9e3f59c0097b0667b55a812838367850bf4a13b956ff0f1a",
+            "src/hitl/web/auth-port.ts": "14e8bed19324f0b23ebb0abdd4dea3248c6b5ecdeed783fe7c0414237dc37feb",
+            "src/hitl/web/auth.ts": "8d1431be41753cbcd8ef0f00299c9a2fac8189cc236ae03ae2effe3cdca2a1b1",
+            "src/hitl/web/cli.ts": "b754998086eb16e66ae1a4ce38eef71b46c94cd7edac8f9ed1c5d09effedca39",
+            "src/hitl/web/console-contracts.ts": "4db3b103ca3c1e0a2fd273e3d016dc5ec0ecac5967f35e813925faa5fc937977",
+            "src/hitl/web/console-read-model.ts": "c55c4fed276c97446775d94c37ea50a1e8142a737595ce5611f8b8baea76c9a9",
+            "src/hitl/web/read-model.ts": "bc3620cd023fd6bb2f191e137a7cb6b186768395225b7f0c3a1f710d4328c46c",
+            "src/hitl/web/server.ts": "77545068f4838cdc4ad1de076ed78f35ca2e69fd15a6d6f302344fdd5484230a",
+            "src/inject-handler/cli.ts": "f0a3b2bedcfcbc5ea2e9ae8abecd728b62e9700085e89421f81d5dafaebdc836",
+            "src/inject-handler/usage.ts": "e5758a9dc3abb54da9ea45a6bf6fecf900182fe5d9545328d76f414a99d9461f",
+            "src/jev/contracts.ts": "7eddb997d2a3df2a90df5e4dcc7977887212958a149045d7c96ee3bd9f2e2e20",
+            "src/jev/price-table.ts": "78233c449dd009a88c61c4fcd27e0bed55e3bd458553fd3b208ee62c47cc8d31",
+            "src/jev/reserve.ts": "b906c4381146b1930cb119d02ae3b8eef1f029d74a083cf7812e4a8a7e57d7a0",
+            "src/knowledge/event-identity.ts": "88e3be4059b19417f4b11ec0d9d9c7e62be4c303073ca102133972c8675b43e0",
+            "src/orchestrator-boot/boot-record.ts": "9b26c4209051373afe2183bd9f2fb2e58bae901ec01847edf7bc56200e8623ea",
+            "src/orchestrator-boot/cli.ts": "7eb23263ea2e97b9af8630568dd3a9ea2c850e15b36a076051ab778eda94931b",
+            "src/orchestrator-boot/plan.ts": "55fb06e2c097fa03ef2b51a76265bf1f276cb27d7495a5522e2d11da317f7f1c",
+            "src/orchestrator-boot/provider-capabilities.ts": "15f22036fc625650af505baaec4139f018d02b18ee438b17c7b3e903f804d9df",
+            "src/orchestrator-boot/usage.ts": "b56481b23cfb0151552a9d4d8d3c82aff8ec2ffd1d782789f5abe6be731952b8",
+            "src/orchestrator-boot/wizard.ts": "272cd7fb820a4c4245403611b1a9b9bce672e8c30cb34790a00e4a723dd915e4",
+            "src/reconciler/agent-metadata.ts": "ad69e2bf30263208511d310fb69e19aee6dfd3ef3151354233645caf6f7bfa18",
+            "src/reconciler/cli.ts": "437f1be6bb014c3344e34346fcfa06e226f9ae921eb8bfce92556319150a9d1a",
+            "src/reconciler/node-options-shim.ts": "e5e77e4dbb8265037db01c4b94af91d28170621a625d1cf52f6c96770b9e10c5",
+            "src/reconciler/usage.ts": "b7939c90c144993af89474f3ec0ad5e7b247b21c9a6b9b0d590dcd66707130f8",
+            "src/release-benchmark/cli.ts": "c1e8f3ee86faa515f727ad99e352132205241ef5d423b47c3a3e343060416d6f",
+            "src/release-benchmark/compare.ts": "18c8d0bf43b90f1d05c5745c226809be9fb059fbb417bfc6817a5535d8ef6bd7",
+            "src/release-benchmark/contracts.ts": "6c9d5ec702bc3a88b648ab17bc61b2fdee2c31540409faa205e844a336b9a32d",
+            "src/report-target/cli.ts": "98598b0a0a75e0e6678cdfad3fbe5ba70062450368b504a10ac8929a4a3f176f",
+            "src/report/decide.ts": "36c51ea02313884a381c8952a22b3d8cfd15da2e69da660f3c92deb6fcdfbbce",
+            "src/report/envelope.ts": "1003f0543769971ab20964be8d508f49056428bfaec961c8e23d0e87a1de6026",
+            "src/report/outbox.ts": "ccdd07e40c5645e303a03b69051c23e2e3a4577ec7b29818e9af72ea78878fe3",
+            "src/report/pump.ts": "89277cea859cb30a701990f988fb059dbfb7090956e34d5280c844b9abc11664",
+            "src/report/turn-hook.ts": "acbcd83691846c5d79910ad1e711562f86cde8592aac763b3e505261c79376eb",
+            "src/request-capture/adapters.ts": "3bb49819410588e97f2a5c43bd39cd5479eba2d362d1e64acb08db61f60cdae5",
+            "src/request-capture/cli.ts": "17e9b6b074f61e797d2e6e8124e4ec9854a46d7cb4211e2b5da7f61fc601cb1f",
+            "src/request-capture/intake-pump.ts": "270005f3056edfbc44a16a35f378468e2a470c129bbddb812968c247298d033d",
+            "src/request-capture/intake.ts": "d7c942144d86fa1aa075db4495af7dcc7d747dd3b848ed83b11fe97ccdcd0dfb",
+            "src/request-capture/inventory-cli.ts": "f4379e635600891016c1d1d13f69dab6f0f88058e4a7e814775b6e29fa16f8b2",
+            "src/request-capture/inventory.ts": "93ef69fbd6b3d54f8c9b425de5be6a98839601d9ebf4be66308034f0c7c88527",
+            "src/request-capture/receipt.ts": "c4e059b66cade27aeb27ad8a3e91c605c2f5e10fb422ff137302c547b601130d",
+            "src/session/agent-binding.ts": "3664182493baa71d437bdd59aab27d42d3afa53268769ec42c2f885f6ca62af3",
+            "src/session/agent-metadata.ts": "4b9e73514f34dc5c58a21e40dd6894ab0b208524d2e8d3b01b1fec3b2086ce99",
+            "src/session/boot-adapter/boot-fs.ts": "0cda0ba1effe33e42d1ab27a9afc3f55ad53a401a16b0ee6416ca82e2d4b7c1f",
+            "src/session/boot-adapter/claude.ts": "c51d484db38761ce54eb53fdf8bf884d87f57b05fabbcf7a4a744f86d4fa2e97",
+            "src/session/boot-adapter/codex.ts": "a98219c37fc043251117c50e574954e0dce51d08e4288135eb8035fa8722fb4f",
+            "src/session/boot-adapter/common.ts": "e0492d03ca56b9394fbe5e9dc1bb35cac28b3b6a6141e317ba84c9a273ae6f04",
+            "src/session/boot-adapter/gemini.ts": "b2bb3ab16e83906f160b17a0bcd5afe2dedc051adf94ce00ce609d6e6df8f777",
+            "src/session/boot-adapter/grok.ts": "46ea53608f94b3e95050732546dfa68fb1f64b29fd094ea2b3f4ab9a090bbbc9",
+            "src/session/boot-adapter/index.ts": "c697e445412f87a4f8b4944bd382a4a9365ed3f11803a6f97da10b9beea9c088",
+            "src/session/boot-adapter/launch-config.ts": "69b852e411c6c206cafa83ce9d7512272b67b8d578c4dd261b00a9e1962c5ce9",
+            "src/session/boot-adapter/spawner.ts": "35fb8238eb017ee81db2d3d1f6bdd1b6dd4aee93caf6b7898cb9c1f43829abdd",
+            "src/session/boot-adapter/types.ts": "125a0f3655c0b9a8baf548f8ce880650d02625afda1a5915be31f61f1f28ddcc",
+            "src/session/boot-adapter/win-launch.ts": "46b191a4e61b5490415bfeb4927e2d2aeb73a6d45cc47004e8add7234a49b43f",
+            "src/session/claude-worker-oauth.ts": "8cc8f9ab63493c2ca96ec2688d40c3472781c3ee08a8e93457da64fc35cadc77",
+            "src/session/inject-parser.ts": "b3f3be78b2a87b312524766b376a818dc019327337b702e14cc94cff6fc109c8",
+            "src/session/model-decision.ts": "2a76c037d5c54af7de5256e7aa10e61a907ebac67d6b61620b3274ff73c288ff",
+            "src/session/open-session/cli.ts": "d3ce486d82c76be400437c8a90d6574c0bc1d069ef7762cc5a784b29bb966962",
+            "src/session/open-session/legacy-spawn.ts": "0581e943ab43131b1b3edaf319541e39c0f3d3fe902d29ad7d9979992c73bdd9",
+            "src/session/open-session/usage.ts": "10356e5956b74e5df651f1dd96564879f645d29ae71297caef131c64ed3dae4c",
+            "src/session/permission-manager.ts": "8c5c6458f5b8e8d09b8e6daaff1f7402783483b8eab25ef98b74b7c962c6b25a",
+            "src/session/persist-context.ts": "f616d58dce2ad64e02ef8dec271c0cbec5f7ae632c7d058451ebbb5a7ab363e6",
+            "src/session/persistence/atomic-write.ts": "68cbe93558dfcf1ffcc3994e1583bd63510f4f1049fe856bda90afff4a16a35e",
+            "src/session/persistence/canonical-bytes.ts": "e598a6c8dddd1cf6dd0ce6d078625f13efcf0042364af76795911189352e7f2c",
+            "src/session/persistence/crash-recovery.ts": "a5f99ef8674908f82a779ab04d0c9a549561aecb0b7773b299b722859a1218e8",
+            "src/session/persistence/index-lock.ts": "22f8c57667ae891edd0c74188085c2e3d889e158f9fcb313048d55ec33966efa",
+            "src/session/persistence/index.ts": "688d8e63c08bbc0692c01c765428cb39224917f6fbf5aff721acf31affc24a98",
+            "src/session/private-storage.ts": "f115ef66f7954d21b65f2aab7f726199c8a7986cc856a436810181cb8d37627b",
+            "src/session/project-id.ts": "8c0ba1effe4c752470a7e8778c56f32efe110f7e1e4bf7820a5074691241c761",
+            "src/session/resolve-instructions.ts": "aab2e85b4399a46671eca99055d7d6e94ad6eb2fb84aeab6748ce9a9d6746658",
+            "src/session/role-capabilities.ts": "d224c9705df7ec1416c88d59931ced0d8e3b75b0f2067b54aba53dae32befef1",
+            "src/session/types.ts": "e7210345caa8e48d2a49c7023b5777676439fdc9e37ad0fb9fe1088c76503fea",
+            "src/session/validate-spawn.ts": "2be221723c960ee79eb40234708bb6e2d7027b960ac134c828a6ce654b018799",
+            "src/session/virtual-fs.ts": "e67ca4371170a8081fe338ae5e33f51ae03604a630e973023fedf9be070e92d4",
+            "src/session/worker-receipt.ts": "d7bc8f8953abde766774ff5f1274c50269a620215c874dcca826002faa9cccc6",
+            "src/session/worker-sandbox-bind.ts": "1f282792c1fb471f0b02468f4a50e9d586a803e0d3755107c08a427bec93a434",
+            "src/session/worker-sandbox-runner.ts": "32dacf368b3f87407c3081e8943d8704ede0929cb6ec6db6e0714cb28702b9b9",
+            "src/session/worker-sandbox.ts": "179511ca52db72359c601624fbf55dc34eafdc9b28e2090e465e13ad2fceccd9",
+            "src/task-advisor/collect.ts": "3343ec3d0c3382fb8d2aa73f1c1c51e61a909efdcbfe17f2fd41005e4c82a699",
+            "src/task-advisor/contracts.ts": "08600eb7b5b82ee21c37b8e608f2ea3f41e1d2491d4e0b993e7924ce8dab6ab2",
+            "src/task-advisor/efficiency-contracts.ts": "957ec9ba057023664302daf84f2470052d671a1e1b40e9a59809807ff5453d9a",
+            "src/task-advisor/efficiency.ts": "b6e91901d89c924e488994910b539e0e35ab6ede93c3f476d08e1dae9793e4e9",
+            "src/task-context/assemble.ts": "bfbb222e2daeb862af35d62104ffd527e78afa066c663813186e8e01638a0842",
+            "src/task-context/contract.ts": "437fa0ad150c765445e314b5eedeb50f135bc595b9ee268d629f5cd891aadefd",
+            "src/telemetry/logger-emit.ts": "0ae7bd2b3044c8863ca5bbae02020ac133667084f16acd06830429d36ae2b377",
+            "src/telemetry/spawn-events.ts": "9aabbc33683c67b3b4c509125b6d71bd7e87762642df79c2c65063e96bec710e",
+            "src/telepty/http.ts": "278c9ad8050155f59195b71e779273fbecb01f4d6f8f98f1aa96b2ba26ff9c7e",
+            "src/tracker/cli.ts": "a96b64138da85424f420312c164b1ddf0d1d5ddf6193a5bfedb55e6ba5eee700",
+            "src/tracker/report-sweep.ts": "85f7d2e177674be7ebbe974580e17ea79618c2f49df7e600fe3cc7127a2be3dc",
+            "src/tracker/usage.ts": "4978e3d6edf471ab779d77d6a5c413df7607d1071e00c003b83f532b8d68badb",
+            "tests/packaging/legacy-init-recovery.test.mjs": "3e2f458f59d2fc200f3f8c93ee8652c4d1c61cba1b50ca8760e7488a8a17cd46",
+            "tsconfig.json": "7f867214418ae3ed617dba351c2d4c99064b8e7afd3b9a0d34ece8cc8a94bc97"
+          };
+          const expectedCompiled = [
+            "dist/src/bridge-auditor/cli.js",
+            "dist/src/bridge-auditor/usage.js",
+            "dist/src/bus-bridge/cli.js",
+            "dist/src/bus-bridge/usage.js",
+            "dist/src/cleanup-scheduler/cli.js",
+            "dist/src/cleanup-scheduler/usage.js",
+            "dist/src/cleanup/cli.js",
+            "dist/src/cleanup/usage.js",
+            "dist/src/comms-auditor/cli.js",
+            "dist/src/context-handoff/adapters/claude.js",
+            "dist/src/context-handoff/adapters/codex.js",
+            "dist/src/context-handoff/adapters/gemini.js",
+            "dist/src/context-handoff/adapters/grok.js",
+            "dist/src/context-handoff/adapters/index.js",
+            "dist/src/context-handoff/cli.js",
+            "dist/src/context-handoff/compose.js",
+            "dist/src/context-handoff/enrich.js",
+            "dist/src/context-handoff/redact.js",
+            "dist/src/context-handoff/select.js",
+            "dist/src/context-handoff/types.js",
+            "dist/src/context-handoff/write.js",
+            "dist/src/control/admission.js",
+            "dist/src/control/cards.js",
+            "dist/src/control/contracts.js",
+            "dist/src/dispatch/cli.js",
+            "dist/src/dispatch/inject-id.js",
+            "dist/src/dispatch/registry-command.js",
+            "dist/src/dispatch/usage.js",
+            "dist/src/environment/awareness.js",
+            "dist/src/environment/bootstrap.js",
+            "dist/src/environment/cli.js",
+            "dist/src/environment/contract.js",
+            "dist/src/environment/delivery.js",
+            "dist/src/environment/descriptors.js",
+            "dist/src/environment/executable-version.js",
+            "dist/src/environment/grants.js",
+            "dist/src/environment/helper-env.js",
+            "dist/src/environment/invocation.js",
+            "dist/src/environment/native-boot.js",
+            "dist/src/environment/owned-input.js",
+            "dist/src/environment/resolve.js",
+            "dist/src/environment/storage.js",
+            "dist/src/gate/class-a/cli_direct.js",
+            "dist/src/gate/class-a/cmux.js",
+            "dist/src/gate/class-a/telepty.js",
+            "dist/src/gate/class-b/agent-tool-validator.js",
+            "dist/src/gate/class-c/mcp-deliberation-adapter.js",
+            "dist/src/gate/common.js",
+            "dist/src/gate/index.js",
+            "dist/src/hitl/cli.js",
+            "dist/src/hitl/usage.js",
+            "dist/src/hitl/web/assets.js",
+            "dist/src/hitl/web/auth-port.js",
+            "dist/src/hitl/web/auth.js",
+            "dist/src/hitl/web/cli.js",
+            "dist/src/hitl/web/console-contracts.js",
+            "dist/src/hitl/web/console-read-model.js",
+            "dist/src/hitl/web/read-model.js",
+            "dist/src/hitl/web/server.js",
+            "dist/src/inject-handler/cli.js",
+            "dist/src/inject-handler/usage.js",
+            "dist/src/jev/contracts.js",
+            "dist/src/jev/price-table.js",
+            "dist/src/jev/reserve.js",
+            "dist/src/knowledge/event-identity.js",
+            "dist/src/orchestrator-boot/boot-record.js",
+            "dist/src/orchestrator-boot/cli.js",
+            "dist/src/orchestrator-boot/plan.js",
+            "dist/src/orchestrator-boot/provider-capabilities.js",
+            "dist/src/orchestrator-boot/usage.js",
+            "dist/src/orchestrator-boot/wizard.js",
+            "dist/src/reconciler/agent-metadata.js",
+            "dist/src/reconciler/cli.js",
+            "dist/src/reconciler/node-options-shim.js",
+            "dist/src/reconciler/usage.js",
+            "dist/src/release-benchmark/cli.js",
+            "dist/src/release-benchmark/compare.js",
+            "dist/src/release-benchmark/contracts.js",
+            "dist/src/report-target/cli.js",
+            "dist/src/report/decide.js",
+            "dist/src/report/envelope.js",
+            "dist/src/report/outbox.js",
+            "dist/src/report/pump.js",
+            "dist/src/report/turn-hook.js",
+            "dist/src/request-capture/adapters.js",
+            "dist/src/request-capture/cli.js",
+            "dist/src/request-capture/intake-pump.js",
+            "dist/src/request-capture/intake.js",
+            "dist/src/request-capture/inventory-cli.js",
+            "dist/src/request-capture/inventory.js",
+            "dist/src/request-capture/receipt.js",
+            "dist/src/session/agent-binding.js",
+            "dist/src/session/agent-metadata.js",
+            "dist/src/session/boot-adapter/boot-fs.js",
+            "dist/src/session/boot-adapter/claude.js",
+            "dist/src/session/boot-adapter/codex.js",
+            "dist/src/session/boot-adapter/common.js",
+            "dist/src/session/boot-adapter/gemini.js",
+            "dist/src/session/boot-adapter/grok.js",
+            "dist/src/session/boot-adapter/index.js",
+            "dist/src/session/boot-adapter/launch-config.js",
+            "dist/src/session/boot-adapter/spawner.js",
+            "dist/src/session/boot-adapter/types.js",
+            "dist/src/session/boot-adapter/win-launch.js",
+            "dist/src/session/claude-worker-oauth.js",
+            "dist/src/session/inject-parser.js",
+            "dist/src/session/model-decision.js",
+            "dist/src/session/open-session/cli.js",
+            "dist/src/session/open-session/legacy-spawn.js",
+            "dist/src/session/open-session/usage.js",
+            "dist/src/session/permission-manager.js",
+            "dist/src/session/persist-context.js",
+            "dist/src/session/persistence/atomic-write.js",
+            "dist/src/session/persistence/canonical-bytes.js",
+            "dist/src/session/persistence/crash-recovery.js",
+            "dist/src/session/persistence/index-lock.js",
+            "dist/src/session/persistence/index.js",
+            "dist/src/session/private-storage.js",
+            "dist/src/session/project-id.js",
+            "dist/src/session/resolve-instructions.js",
+            "dist/src/session/role-capabilities.js",
+            "dist/src/session/types.js",
+            "dist/src/session/validate-spawn.js",
+            "dist/src/session/virtual-fs.js",
+            "dist/src/session/worker-receipt.js",
+            "dist/src/session/worker-sandbox-bind.js",
+            "dist/src/session/worker-sandbox-runner.js",
+            "dist/src/session/worker-sandbox.js",
+            "dist/src/task-advisor/collect.js",
+            "dist/src/task-advisor/contracts.js",
+            "dist/src/task-advisor/efficiency-contracts.js",
+            "dist/src/task-advisor/efficiency.js",
+            "dist/src/task-context/assemble.js",
+            "dist/src/task-context/contract.js",
+            "dist/src/telemetry/logger-emit.js",
+            "dist/src/telemetry/spawn-events.js",
+            "dist/src/telepty/http.js",
+            "dist/src/tracker/cli.js",
+            "dist/src/tracker/report-sweep.js",
+            "dist/src/tracker/usage.js"
+          ];
+          const manifestPathsHash = "d78d3254d24f987c70c580d04f471983befa1d59d7957a842634e901ecd46c4c";
+          const externalNames = ['@anthropic-ai/sandbox-runtime', '@dmsdc-ai/aigentry-logger',
+            '@dmsdc-ai/aigentry-ssot', '@simplewebauthn/server', 'cross-spawn'];
+          const receipt = {
+            started, innerDeadline: String(started + 170000),
+            limits: {wrapperMs: 180000, innerMs: 170000, perStreamBytes: limit,
+              packageBytes: packageLimit, packageEntries: 4096, fileBytes: 8 * limit,
+              manifestBytes: limit, harnessRetainedBytes: packageLimit},
+            runner: {os: process.platform, arch: process.arch, nodeVersion: process.version},
+            errors: [], timedOut: false, overflow: false, exit: null, close: null,
+            kills: [], streamDestroys: [], wrapperEvidenceBytes: 0,
+            retention: 'Runner-local inputs and snapshots are not downloaded durable custody.',
+            containment: 'Direct-child observations do not prove descendant termination.',
+            fit: 'Configured bounds do not certify duration, complete runtime fit or a passing test.'
+          };
+          const streams = Object.fromEntries(['stdout','stderr'].map(k => [k,
+            {receivedBytes: 0, retainedBytes: 0, chunks: [], eof: false, closed: false, errors: []}]));
+          let child, owned, exitSeen = false, closeSeen = false, stopped = false;
+          const errorInfo = e => ({message: String(e?.message ?? e).slice(0,4096), code: e?.code ?? null});
+          function fail(e) {
+            if (receipt.errors.length < 32) receipt.errors.push(errorInfo(e));
+            process.exitCode = 1;
+          }
+          function kill(reason) {
+            if (stopped) return;
+            stopped = true;
+            if (child?.pid && !exitSeen && child.exitCode === null && child.signalCode === null) {
+              try { receipt.kills.push({reason, at: elapsed(), returned: child.kill('SIGKILL')}); }
+              catch(e) { fail(e); }
+            }
+          }
+          // This timer bounds the final attempt as well. Missing final receipts remain failure.
+          const terminalTimer = setTimeout(() => {
+            receipt.timedOut = true; kill('wrapper deadline'); process.exit(1);
+          }, 180000);
+          function boundary(label) {
+            assert(elapsed() < 175000 && Date.now() < started + 175000, 'wrapper work deadline: ' + label);
+          }
+          function safe(rel) {
+            assert(typeof rel === 'string' && rel && !rel.includes('\\') && !/[\x00-\x1f\x7f]/.test(rel));
+            assert(!path.posix.isAbsolute(rel) && rel.split('/').every(x => x && x !== '.' && x !== '..'));
+          }
+          function directory(dir, privateRoot = false) {
+            boundary('directory');
+            assert(path.isAbsolute(dir) && path.normalize(dir) === dir && !/[\x00-\x1f\x7f]/.test(dir));
+            for (let p = dir;; p = path.dirname(p)) {
+              const s = fs.lstatSync(p);
+              assert(s.isDirectory() && !s.isSymbolicLink() && (s.uid === 0 || s.uid === process.getuid()) &&
+                (s.mode & 0o022) === 0, 'unsafe directory: ' + p);
+              if (p === path.dirname(p)) break;
+            }
+            assert.equal(fs.realpathSync(dir), dir);
+            if (privateRoot) {
+              const s = fs.lstatSync(dir);
+              assert.equal(s.uid, process.getuid()); assert.equal(s.mode & 0o777, 0o700);
+            }
+          }
+          function read(root, rel, max = 8 * limit) {
+            boundary('read'); safe(rel);
+            const file = path.join(root, rel);
+            directory(path.dirname(file));
+            const before = fs.lstatSync(file);
+            assert(before.isFile() && !before.isSymbolicLink() && before.nlink === 1 &&
+              before.uid === process.getuid() && (before.mode & 0o7022) === 0 &&
+              before.size <= max, 'unsafe input: ' + rel);
+            const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+            let bytes;
+            try {
+              const opened = fs.fstatSync(fd);
+              assert.equal(opened.dev, before.dev); assert.equal(opened.ino, before.ino);
+              bytes = Buffer.alloc(before.size);
+              let offset = 0;
+              while (offset < bytes.length) {
+                boundary('read chunk');
+                const n = fs.readSync(fd, bytes, offset, Math.min(65536, bytes.length-offset), null);
+                assert(n > 0, 'short input'); offset += n;
+              }
+              assert.equal(fs.readSync(fd, Buffer.alloc(1), 0, 1, null), 0, 'input grew');
+              const after = fs.fstatSync(fd);
+              for (const k of ['size','mode','uid','gid','nlink','mtimeMs','ctimeMs'])
+                assert.equal(after[k], before[k], 'input changed: ' + rel);
+            } finally { fs.closeSync(fd); }
+            boundary('read complete');
+            return {bytes, row: {path: rel, bytes: bytes.length, sha256: sha(bytes), mode: before.mode & 0o777}};
+          }
+          function save(name, bytes) {
+            assert(owned, 'owned receipt directory unavailable'); safe(name);
+            assert(!name.includes('/') && Buffer.byteLength(bytes) <= limit);
+            assert(receipt.wrapperEvidenceBytes + Buffer.byteLength(bytes) <= 4 * limit);
+            fs.writeFileSync(path.join(owned, name), bytes, {flag:'wx',mode:0o600});
+            receipt.wrapperEvidenceBytes += Buffer.byteLength(bytes);
+          }
+          async function print(bytes) {
+            assert(elapsed() < 180000, 'final log deadline');
+            await new Promise((resolve,reject) => process.stdout.write(bytes, e => e ? reject(e) : resolve()));
+          }
+          async function main() {
+            assert(['linux','darwin'].includes(process.platform)); assert.equal(process.version,'v20.20.0');
+            assert(Number.isSafeInteger(started));
+            const checkout = process.cwd(); directory(checkout);
+            const runtime = path.dirname(process.env.HOME); directory(runtime, true);
+            assert(!runtime.startsWith(checkout + path.sep) && runtime !== checkout);
+            for (let dir=runtime;;dir=path.dirname(dir)) {
+              assert(!fs.existsSync(path.join(dir,'.git')), 'private runtime must be outside Git');
+              if(dir===path.dirname(dir))break;
+            }
+            owned = fs.mkdtempSync(path.join(runtime,'recovery-ci-'));
+            fs.chmodSync(owned,0o700); directory(owned,true);
+            const source = path.join(owned,'source'), parent = path.join(owned,'test-parent');
+            for (const name of ['source','test-parent','home','tmp','config','cache','data','ports'])
+              fs.mkdirSync(path.join(owned,name),{mode:0o700});
+            directory(source,true); directory(parent,true);
+            receipt.checkout = {path:checkout, commit:process.env.RECOVERY_CHECKOUT_SHA};
+            assert.match(receipt.checkout.commit ?? '',/^[0-9a-f]{40}$/);
+            const head = read(checkout,'.git/HEAD',4096).bytes.toString('utf8').trim();
+            assert.equal(head,receipt.checkout.commit,'detached checkout identity required');
+            receipt.sourceBase = 'f957ca23c1407c5e636211c2c81b1c8aff299712';
+            // Pins bind current source and the exact reviewed active route. New active imports
+            // or caller changes require source review, not permissive external resolution.
+            receipt.sourceHashes = {};
+            for (const [rel,digest] of Object.entries(sourcePins)) {
+              const input = read(checkout,rel);
+              assert.equal(input.row.sha256,digest,'source binding changed: '+rel);
+              receipt.sourceHashes[rel] = digest;
+            }
+            const node = process.execPath;
+            assert.equal(fs.realpathSync(node),node);
+            directory(path.dirname(node));
+            const nodeStat = fs.lstatSync(node);
+            assert(nodeStat.isFile() && !nodeStat.isSymbolicLink() &&
+              (nodeStat.uid===0||nodeStat.uid===process.getuid()) && (nodeStat.mode & 0o022)===0);
+            assert(nodeStat.size<=128*limit,'Node identity hash bound');
+            receipt.node = {path:node,bytes:nodeStat.size,sha256:sha(fs.readFileSync(node))};
+            boundary('node hash');
+            const {MANIFEST} = await import(pathToFileURL(path.join(checkout,'bin/init/manifest.mjs')).href);
+            boundary('manifest owner import');
+            assert(Array.isArray(MANIFEST) && MANIFEST.length===87);
+            assert.equal(sha(JSON.stringify([...MANIFEST].sort())),manifestPathsHash,'manifest membership changed');
+            const compiled=[], visited=new Set();let entries=0;
+            function census(rel) {
+              safe(rel); directory(path.join(checkout,rel));
+              const dir=fs.opendirSync(path.join(checkout,rel));
+              try {
+                for(let entry;(entry=dir.readSync())!==null;) {
+                  boundary('production census'); assert(++entries<=4096);
+                  const next=rel+'/'+entry.name;safe(next);
+                  const fold=next.toLowerCase();assert(!visited.has(fold),'case collision');visited.add(fold);
+                  const s=fs.lstatSync(path.join(checkout,next));assert(!s.isSymbolicLink());
+                  if(s.isDirectory())census(next);
+                  else {
+                    assert(s.isFile(),'nonregular build output');
+                    if(next.endsWith('.js'))compiled.push(next);
+                    else assert(next.endsWith('.js.map')||next.endsWith('.d.ts'),'unexplained build output');
+                  }
+                }
+              } finally {dir.closeSync();}
+            }
+            census('dist/src');
+            assert.deepEqual(compiled.sort(),expectedCompiled,'production census changed');
+            const selected=[...MANIFEST,'package.json',...compiled,
+              ...externalNames.map(n=>'node_modules/'+n+'/package.json')].sort();
+            assert.equal(selected.length,233);
+            const folded=new Set(), allPaths=new Set(selected), directories=new Map(), inputs=[];
+            let bytes=0;
+            for(const rel of selected) {
+              safe(rel);const fold=rel.toLowerCase();assert(!folded.has(fold),'duplicate/case collision');folded.add(fold);
+              for(let d=path.posix.dirname(rel);d!=='.';d=path.posix.dirname(d)) {
+                const previous=directories.get(d.toLowerCase());
+                assert(previous===undefined||previous===d,'directory case collision');
+                assert(!allPaths.has(d),'file/directory collision');directories.set(d.toLowerCase(),d);
+              }
+              const input=read(checkout,rel);bytes+=input.bytes.length;assert(bytes<=packageLimit);
+              inputs.push(input);
+            }
+            assert(selected.length+directories.size+1<=4096,'complete package entry bound');
+            const externals=new Set();
+            for(const rel of compiled) {
+              const code=inputs.find(x=>x.row.path===rel).bytes.toString('utf8');
+              const imports=[
+                ...code.matchAll(/^\s*(?:import|export)\s+(?:[^;\n]*?\s+from\s+)?(["'])([^"'\n]+)\1/gm),
+                ...code.matchAll(/\b(?:import|require)\s*\(\s*(["'])([^"'\n]+)\1\s*\)/g)
+              ].map(m=>m[2]);
+              for(const name of imports) {
+                if(name.startsWith('node:')||builtinModules.includes(name))continue;
+                if(name.startsWith('.'))assert(allPaths.has(path.posix.normalize(path.posix.join(path.posix.dirname(rel),name))),rel+': '+name);
+                else {
+                  assert(/^(?:@[\w.-]+\/)?[\w.-]+(?:\/[\w./-]+)?$/.test(name),'unknown import form');
+                  externals.add(name.startsWith('@')?name.split('/').slice(0,2).join('/'):name.split('/')[0]);
+                }
+              }
+            }
+            assert.deepEqual([...externals].sort(),[...externalNames].sort(),'external census changed');
+            // Compiled modules and external manifests are data on the pinned POSIX
+            // recovery route. No fake executable stubs or external module imports.
+            const manifest=Buffer.from(JSON.stringify({files:inputs.map(x=>x.row)})+'\n');
+            assert(manifest.length<=limit);
+            for(const input of inputs) {
+              boundary('copy');
+              const target=path.join(source,input.row.path);
+              fs.mkdirSync(path.dirname(target),{recursive:true,mode:0o700});
+              directory(path.dirname(target));
+              fs.writeFileSync(target,input.bytes,{flag:'wx',mode:input.row.mode});
+              fs.chmodSync(target,input.row.mode);
+              const copied=read(source,input.row.path);
+              assert.deepEqual(copied.row,input.row,'copied identity mismatch');
+            }
+            const manifestFile=path.join(owned,'fixture-manifest.json');
+            save('fixture-manifest.json',manifest);
+            receipt.fixture={source,parent,manifestFile,manifestHash:sha(manifest),files:inputs.map(x=>x.row),
+              bytes,entries:selected.length+directories.size+1,compiled,externals:[...externals].sort()};
+            const test=path.join(checkout,'tests/packaging/legacy-init-recovery.test.mjs');
+            const env={HOME:path.join(owned,'home'),USERPROFILE:path.join(owned,'home'),
+              XDG_CONFIG_HOME:path.join(owned,'config'),XDG_CACHE_HOME:path.join(owned,'cache'),
+              XDG_DATA_HOME:path.join(owned,'data'),TMPDIR:path.join(owned,'tmp'),
+              PATH:path.join(owned,'ports'),LANG:'C',LC_ALL:'C',
+              LEGACY_RECOVERY_TEST_PACKAGE:source,LEGACY_RECOVERY_TEST_MANIFEST:manifestFile,
+              LEGACY_RECOVERY_TEST_ROOT:parent,LEGACY_RECOVERY_TEST_DEADLINE_MS:receipt.innerDeadline};
+            const argv=['--test','--test-concurrency=1',test];
+            receipt.command={executable:node,argv,cwd:parent,env,shell:false};
+            const admission=JSON.stringify({checkout:receipt.checkout,node:receipt.node,
+              fixture:receipt.fixture,sourceHashes:receipt.sourceHashes,command:receipt.command,limits:receipt.limits})+'\n';
+            save('admission.json',admission);await print(admission);
+            boundary('launch');
+            assert(Date.now()<started+160000,'insufficient inner allowance');
+            await new Promise(resolve=>{
+              let settled=false,closeTimer,runtimeTimer;
+              function finish(){
+                if(settled)return;settled=true;clearTimeout(closeTimer);clearTimeout(runtimeTimer);resolve();
+              }
+              function closure(){
+                if(closeTimer)return;
+                closeTimer=setTimeout(()=>{
+                  fail(new Error('incomplete direct-child/stream closure'));
+                  for(const key of ['stdout','stderr'])if(!streams[key].closed){
+                    receipt.streamDestroys.push({stream:key,at:elapsed()});child[key].destroy();
+                  }
+                  finish();
+                },Math.max(0,Math.min(3000,178000-elapsed())));
+              }
+              function stop(reason){fail(new Error(reason));kill(reason);closure();}
+              child=spawn(node,argv,{cwd:parent,env,shell:false,stdio:['ignore','pipe','pipe']});
+              receipt.launchedAt=elapsed();receipt.pid=child.pid??null;
+              runtimeTimer=setTimeout(()=>{receipt.timedOut=true;stop('runtime/drain timeout');},Math.max(0,175000-elapsed()));
+              child.on('error',e=>{fail(e);stop('child error');});
+              child.on('exit',(code,signal)=>{exitSeen=true;receipt.exit={code,signal,at:elapsed()};closure();});
+              child.on('close',(code,signal)=>{closeSeen=true;receipt.close={code,signal,at:elapsed()};finish();});
+              for(const key of ['stdout','stderr']){
+                const s=streams[key];
+                child[key].on('data',chunk=>{
+                  if(settled)return;
+                  s.receivedBytes+=chunk.length;
+                  const keep=chunk.subarray(0,Math.max(0,limit-s.retainedBytes));
+                  if(keep.length)s.chunks.push(Buffer.from(keep));
+                  s.retainedBytes+=keep.length;
+                  if(s.receivedBytes>limit){receipt.overflow=true;stop(key+' overflow');}
+                });
+                child[key].on('end',()=>{s.eof=true;s.eofAt=elapsed();});
+                child[key].on('close',()=>{s.closed=true;s.closedAt=elapsed();});
+                child[key].on('error',e=>{if(s.errors.length<8)s.errors.push(errorInfo(e));stop(key+' error');});
+              }
+            });
+            assert(!receipt.timedOut&&!receipt.overflow&&receipt.errors.length===0);
+            assert(exitSeen&&closeSeen&&receipt.exit.code===0&&receipt.exit.signal===null);
+            assert(receipt.close.code===receipt.exit.code&&receipt.close.signal===receipt.exit.signal);
+            for(const s of Object.values(streams))assert(s.eof&&s.closed&&s.errors.length===0);
+          }
+          process.stdout.on('error',fail);process.stderr.on('error',fail);
+          try {await main();}catch(e){fail(e);kill('wrapper error');}
+          let finalComplete = false;
+          try {
+            receipt.output={};
+            for(const key of ['stdout','stderr']){
+              const {chunks,...observation}=streams[key], bytes=Buffer.concat(chunks);
+              if(owned)save('child.'+key,bytes);
+              receipt.output[key]={...observation,sha256:sha(bytes)};
+              await print(Buffer.from('RECOVERY raw '+key+' begin\n'));
+              await print(bytes);await print(Buffer.from('\nRECOVERY raw '+key+' end\n'));
+            }
+            receipt.elapsedMs=elapsed();
+            receipt.success=receipt.errors.length===0&&exitSeen&&closeSeen&&!receipt.timedOut&&!receipt.overflow;
+            if(!receipt.success)process.exitCode=1;
+            let finalBytes;
+            const previous=receipt.wrapperEvidenceBytes;
+            for(let i=0;i<8;i++){
+              finalBytes=Buffer.from(JSON.stringify(receipt)+'\n');
+              const total=previous+finalBytes.length;
+              if(total===receipt.wrapperEvidenceBytes)break;
+              receipt.wrapperEvidenceBytes=total;
+              assert(i<7,'final receipt accounting did not converge');
+            }
+            assert(finalBytes.length<=limit);
+            receipt.wrapperEvidenceBytes=previous;
+            if(owned)save('result.json',finalBytes);
+            await print(finalBytes);
+            finalComplete = true;
+          }catch(e){fail(e);process.stderr.write('Recovery final receipt/log failure: '+String(e).slice(0,4096)+'\n');}
+          if(finalComplete)clearTimeout(terminalTimer);
+          RECOVERY_NODE
