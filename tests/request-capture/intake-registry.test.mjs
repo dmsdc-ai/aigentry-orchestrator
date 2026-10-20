@@ -243,33 +243,35 @@ test("R-LIFE the authorised lifecycle appends exactly one history entry per tran
 test("R-REFUSE every off-table transition is refused with a zero-write proof", { skip: SKIP }, () => {
   const w = world("refuse");
   captured(w, 1);
-  const zeroWrite = (label, r, result) => {
+  const zeroWrite = (label, operation, result) => {
     const before = w.raw();
-    refused(r, result);
+    const generation = JSON.parse(before).generation;
+    refused(operation(), result);
     assert.equal(w.raw(), before, `${label}: the ledger must be byte-identical after a refusal`);
+    assert.equal(w.doc().generation, generation, `${label}: a refusal must not commit a generation`);
   };
   // start without a binding: the owner is a record, and work cannot start without one
-  zeroWrite("start unbound", w.event("start", 1, { "--now": at(2) }), "intake_transition_refused");
+  zeroWrite("start unbound", () => w.event("start", 1, { "--now": at(2) }), "intake_transition_refused");
   assert.equal(w.event("bind", 1, { "--owning-task": "1166", "--dispatch-id": uuid(11),
     "--now": at(2) }).status, 0);
   // resume without a pause; pause missing its mandatory payload ("busy" is never a pause)
-  zeroWrite("resume unpaused", w.event("resume", 1, { "--now": at(3) }),
+  zeroWrite("resume unpaused", () => w.event("resume", 1, { "--now": at(3) }),
     "intake_transition_refused");
-  zeroWrite("bare pause", w.event("pause", 1, { "--reason": "busy", "--now": at(3) }),
+  zeroWrite("bare pause", () => w.event("pause", 1, { "--reason": "busy", "--now": at(3) }),
     "intake_malformed");
   // work-completed needs a verdict AND a result link AND evidence
-  zeroWrite("completed, no link", w.event("work-completed", 1, { "--verdict": "accepted",
+  zeroWrite("completed, no link", () => w.event("work-completed", 1, { "--verdict": "accepted",
     "--now": at(3) }), "intake_malformed");
-  zeroWrite("completed, no evidence", w.event("work-completed", 1, { "--verdict": "accepted",
+  zeroWrite("completed, no evidence", () => w.event("work-completed", 1, { "--verdict": "accepted",
     "--result-ref": "r", "--now": at(3) }), "intake_malformed");
-  zeroWrite("completed, bad verdict", w.event("work-completed", 1, { "--verdict": "answered",
+  zeroWrite("completed, bad verdict", () => w.event("work-completed", 1, { "--verdict": "answered",
     "--result-ref": "r", "--evidence-sha256": hex64(3), "--now": at(3) }), "intake_malformed");
   // unknown kinds, including the ones a careless caller might expect to exist
   for (const kind of ["complete", "retire", "clean", "noop", "set-state", "captured-again"]) {
-    zeroWrite(`kind ${kind}`, w.event(kind, 1, { "--now": at(3) }), "invalid_argument");
+    zeroWrite(`kind ${kind}`, () => w.event(kind, 1, { "--now": at(3) }), "invalid_argument");
   }
   // an event for an absent row is never a creation
-  zeroWrite("unknown row", w.event("start", 77, { "--now": at(3) }), "intake_not_found");
+  zeroWrite("unknown row", () => w.event("start", 77, { "--now": at(3) }), "intake_not_found");
   // terminal states are terminal
   assert.equal(w.event("cancel", 1, { "--reason": "superseded by hand", "--now": at(4) }).status, 0);
   assert.equal(w.row(uuid(1)).state, "cancelled");
@@ -278,15 +280,15 @@ test("R-REFUSE every off-table transition is refused with a zero-write proof", {
     ["work-completed", { "--verdict": "accepted", "--result-ref": "r",
       "--evidence-sha256": hex64(3) }], ["fail", { "--reason": "measured_failure" }],
     ["pause", { "--reason": "r", "--owner": "o", "--resume-condition": "c" }]]) {
-    zeroWrite(`cancelled + ${kind}`, w.event(kind, 1, { ...flags, "--now": at(5) }),
+    zeroWrite(`cancelled + ${kind}`, () => w.event(kind, 1, { ...flags, "--now": at(5) }),
       "intake_transition_refused");
   }
   captured(w, 2);
   assert.equal(w.event("work-completed", 2, { "--verdict": "accepted", "--result-ref": "r",
     "--evidence-sha256": hex64(3), "--now": at(6) }).status, 0);
-  zeroWrite("completed + cancel", w.event("cancel", 2, { "--reason": "too late", "--now": at(7) }),
+  zeroWrite("completed + cancel", () => w.event("cancel", 2, { "--reason": "too late", "--now": at(7) }),
     "intake_transition_refused");
-  zeroWrite("completed + work-completed", w.event("work-completed", 2, { "--verdict": "accepted",
+  zeroWrite("completed + work-completed", () => w.event("work-completed", 2, { "--verdict": "accepted",
     "--result-ref": "r2", "--evidence-sha256": hex64(4), "--now": at(7) }),
     "intake_transition_refused");
 });
@@ -406,7 +408,9 @@ test("R-FIFO position is receipt order, derived, labelled, and excludes closed a
     assert.equal(listed.order, ORDER, "the order label names receipt order and denies the others");
     assert.deepEqual(listed.requests.map((r) => r.ingress_id), [uuid(1), uuid(2), uuid(3)]);
     assert.deepEqual(listed.requests.map((r) => r.position), [1, 2, 3]);
-    assert.equal(listed.requests.every((r) => !("position" in w.doc().requests[0])), true,
+    const stored = w.doc().requests;
+    assert.deepEqual(stored.map((r) => r.ingress_id), [uuid(3), uuid(1), uuid(2)]);
+    assert.equal(stored.every((r) => !("position" in r)), true,
       "position is derived on read, never stored");
     // a cancelled row leaves the accounting; the rest renumber without reordering
     assert.equal(w.event("cancel", 1, { "--reason": "withdrawn", "--now": at(40) }).status, 0);
@@ -811,6 +815,72 @@ test("R-ARCHIVE-BOUND one oversized unterminated line is refused without being m
     captured(w, 1);
     const before = w.raw();
     const MAX_LINE = 1024 * 1024;              // INTAKE_ARCHIVE_MAX_LINE
+    // Observe the real registry's requested archive reads, not refusal as a proxy for allocation.
+    // The one-byte lookahead is admitted; Python buffering/RSS and descendants are not measured.
+    const observeArchiveReads = (fixture, returnedBytes) => {
+      const witness = path.join(fixture.root, "archive-read-witness.json");
+      const program = String.raw`
+import builtins, json, runpy, sys
+registry, archive, witness, limit = sys.argv[1:5]
+limit = int(limit)
+sys.argv = [registry, *sys.argv[5:]]
+real_open = builtins.open
+observed = {"opens": 0, "calls": []}
+class ArchiveReads:
+    def __init__(self, raw):
+        self.raw = raw
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        return self.raw.__exit__(*exc)
+    def request(self, method, size):
+        call = {"method": method, "requested": size}
+        observed["calls"].append(call)
+        if not isinstance(size, int) or size < 0 or size > limit:
+            raise AssertionError("unbounded or oversized archive read request")
+        data = getattr(self.raw, method)(size)
+        call["returned"] = len(data)
+        return data
+    def readline(self, size=-1):
+        return self.request("readline", size)
+    def read(self, size=-1):
+        return self.request("read", size)
+    def __iter__(self):
+        observed["calls"].append({"method": "iteration", "requested": -1})
+        raise AssertionError("unbounded archive iteration")
+def observed_open(file, mode="r", *args, **kwargs):
+    raw = real_open(file, mode, *args, **kwargs)
+    if file == archive and mode == "rb":
+        observed["opens"] += 1
+        return ArchiveReads(raw)
+    return raw
+builtins.open = observed_open
+try:
+    runpy.run_path(registry, run_name="__main__")
+finally:
+    builtins.open = real_open
+    with real_open(witness, "x", encoding="utf-8") as fh:
+        json.dump(observed, fh)
+`;
+      const rawBefore = fixture.raw();
+      const observed = spawnSync("python3", ["-I", "-c", program, REGISTRY,
+        fixture.file("intake-archive.jsonl"), witness, String(MAX_LINE + 1),
+        "intake-event", ...fixture.capture(2)], {
+        env: fixture.env, shell: false, encoding: "utf8", timeout: 10_000,
+        killSignal: "SIGKILL", maxBuffer: 1024 * 1024,
+      });
+      assert.ifError(observed.error);
+      assert.equal(observed.signal, null);
+      assert.equal(observed.status, 9, observed.stdout + observed.stderr);
+      assert.equal(JSON.parse(observed.stdout).result, "intake_archive_unbounded");
+      assert.equal(observed.stderr.includes("Traceback"), false);
+      const reads = JSON.parse(fs.readFileSync(witness, "utf8"));
+      assert.equal(reads.opens, 1, "the actual archive read must be observed");
+      assert.deepEqual(reads.calls,
+        [{ method: "readline", requested: MAX_LINE + 1, returned: returnedBytes }],
+        "one bounded real read, including the admitted lookahead byte");
+      assert.equal(fixture.raw(), rawBefore, "instrumented refusal preserves the ledger");
+    };
     // exactly MAX_LINE + 1 bytes, no newline anywhere: the bound must fire on the first read
     const fd = fs.openSync(w.file("intake-archive.jsonl"), "w", 0o600);
     try {
@@ -825,6 +895,7 @@ test("R-ARCHIVE-BOUND one oversized unterminated line is refused without being m
     assert.equal(r.stderr.includes("Traceback"), false, "a bound is a refusal, not a crash");
     assert.equal(w.raw(), before, "no admission and no write");
     assert.equal(w.list().requests.length, 1, "the capture was refused, not admitted");
+    observeArchiveReads(w, MAX_LINE + 1);
     // a line exactly AT the bound is not over it: it is read, and found unparseable, which is
     // also a fail-closed refusal — the off-by-one is pinned in both directions
     const atBound = world("archive-line-at-bound");
@@ -839,6 +910,7 @@ test("R-ARCHIVE-BOUND one oversized unterminated line is refused without being m
     assert.equal(r2.status, 9, r2.stdout + r2.stderr);
     assert.equal(JSON.parse(r2.stdout).result, "intake_archive_unbounded");
     assert.equal(r2.stderr.includes("Traceback"), false);
+    observeArchiveReads(atBound, MAX_LINE);
   });
 
 test("R-ARCHIVE-BOUND a torn final line is still skipped and the scan still completes",
@@ -865,14 +937,28 @@ test("R-ARCHIVE-BOUND a torn final line is still skipped and the scan still comp
 // --- R-CORRUPT ----------------------------------------------------------------
 
 test("R-CORRUPT a corrupt ledger fails closed with its bytes preserved", { skip: SKIP }, () => {
+  // Build both rows through successful real captures before changing only the second ingress id.
+  const valid = world("corrupt-duplicate-prerequisites");
+  for (const n of [1, 2]) {
+    const accepted = spawnSync(REGISTRY, ["intake-event", ...valid.capture(n)], {
+      env: valid.env, shell: false, encoding: "utf8", timeout: 10_000,
+      killSignal: "SIGKILL", maxBuffer: 1024 * 1024,
+    });
+    assert.ifError(accepted.error);
+    assert.equal(accepted.signal, null);
+    assert.equal(accepted.status, 0, accepted.stdout + accepted.stderr);
+    assert.equal(JSON.parse(accepted.stdout).result, "intake_written");
+  }
+  const duplicate = valid.doc();
+  assert.deepEqual(duplicate.requests.map((r) => r.ingress_id), [uuid(1), uuid(2)]);
+  duplicate.requests[1].ingress_id = duplicate.requests[0].ingress_id;
   const cases = [
     ["truncated", '{"schema_version":1,"generation":1,"requests":[{"ing'],
     ["root array", "[]"],
     ["wrong schema", '{"schema_version":2,"generation":1,"requests":[]}'],
     ["requests not an array", '{"schema_version":1,"generation":1,"requests":{}}'],
     ["generation not an int", '{"schema_version":1,"generation":"1","requests":[]}'],
-    ["duplicate ingress id", JSON.stringify({ schema_version: 1, generation: 1, requests:
-      [{ ingress_id: uuid(1) }, { ingress_id: uuid(1) }] })],
+    ["duplicate ingress id", JSON.stringify(duplicate)],
     ["row not an object", '{"schema_version":1,"generation":1,"requests":[3]}'],
   ];
   for (const [label, bytes] of cases) {
@@ -883,6 +969,10 @@ test("R-CORRUPT a corrupt ledger fails closed with its bytes preserved", { skip:
     assert.equal(JSON.parse(read.stdout).result, "registry_corrupt", label);
     const write = w.reg(["intake-event", ...w.capture(1)]);
     assert.equal(write.status, 9, `${label} write: ${write.stdout}${write.stderr}`);
+    if (label === "duplicate ingress id") {
+      assert.match(JSON.parse(read.stdout).detail, /duplicate ingress_id/);
+      assert.match(JSON.parse(write.stdout).detail, /duplicate ingress_id/);
+    }
     assert.equal(w.raw(), bytes, `${label}: corrupt bytes are preserved, never repaired`);
     assert.ok(fs.readFileSync(w.file("registry-health.log"), "utf8").includes("registry_corrupt"),
       `${label}: the health line goes outside the corrupt file`);
