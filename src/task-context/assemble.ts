@@ -3,7 +3,7 @@ import * as path from "node:path";
 import {
   LIMITS, STATE_KEYS, ContextRefusal, canonicalBytes, decodeUtf8, parseManifest, refuse, sha256,
   type ContextManifest, type ContextPorts, type ContextRequest, type ReadGrant,
-  type RecordEntry, type Selection, type Source,
+  type RecordEntry, type Selection,
 } from "./contract.js";
 
 export interface Span { id: string; start: number; end: number; sha256: string }
