@@ -378,20 +378,40 @@ jobs:
             env.PYTHONNOUSERSITE = '1';
             const executable = process.execPath;
             const argv = ['--test', '--test-concurrency=1',
-              'dist/tests/request-capture/intake.test.js', 'tests/request-capture/intake-registry.test.mjs'];
+              'dist/tests/request-capture/intake.test.js', 'tests/request-capture/intake-registry.test.mjs',
+              'tests/request-capture/intake-pump.test.mjs'];
             const cwd = process.cwd();
             const timeoutMs = 180000, perStreamLimit = 1048576;
             const streams = Object.fromEntries(['stdout', 'stderr'].map(name => [name,
               { receivedBytes: 0, retainedBytes: 0, chunks: [], eof: false, closed: false, error: null }]));
             let timedOut = false, overflow = false, error = null, exit = null, close = null;
-            const kills = [];
+            const kills = [], destroys = [], stopErrors = [];
+            let stopping = false;
             const start = process.hrtime.bigint();
             const child = spawn(executable, argv, { cwd, env, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
             function stop(reason) {
-              // Direct child only: this does not clean up or contain grandchildren.
-              kills.push({ reason, signal: 'SIGKILL', sent: child.kill('SIGKILL') });
-              child.stdout.destroy();
-              child.stderr.destroy();
+              if (stopping) return;
+              stopping = true;
+              // Never kill after observed exit; direct-child termination does not contain grandchildren.
+              if (exit === null && close === null) {
+                try {
+                  const sent = child.kill('SIGKILL');
+                  kills.push({ reason, signal: 'SIGKILL', sent });
+                  if (!sent) stopErrors.push({ operation: 'kill', reason, message: 'SIGKILL was not sent' });
+                } catch (e) {
+                  stopErrors.push({ operation: 'kill', reason, message: e.message, code: e.code ?? null });
+                }
+              }
+              for (const name of ['stdout', 'stderr']) {
+                try {
+                  const returned = child[name].destroy();
+                  destroys.push({ reason, name, returnedSelf: returned === child[name], destroyed: child[name].destroyed });
+                  if (returned !== child[name] || !child[name].destroyed)
+                    stopErrors.push({ operation: 'destroy', reason, name, message: 'stream destruction was not confirmed' });
+                } catch (e) {
+                  stopErrors.push({ operation: 'destroy', reason, name, message: e.message, code: e.code ?? null });
+                }
+              }
             }
             const timer = setTimeout(() => { timedOut = true; stop('timeout'); }, timeoutMs);
             for (const name of ['stdout', 'stderr']) {
@@ -409,8 +429,8 @@ jobs:
             }
             child.on('error', e => { error = { message: e.message, code: e.code ?? null }; stop('child-error'); });
             child.on('exit', (status, signal) => {
+              // Retain a red exit while both bounded streams continue to drain.
               exit = { status, signal };
-              if (status !== 0 || signal !== null) stop('unsuccessful-exit');
             });
             await new Promise(resolve => child.on('close', (status, signal) => {
               close = { status, signal };
@@ -431,10 +451,11 @@ jobs:
             }
             const receipt = { executable, nodeSha256: sha(executable), argv, cwd, env,
               python, pythonSha256, launcher, timeoutMs, perStreamLimit, elapsedMs,
-              timedOut, overflow, error, exit, close, kills, output };
+              timedOut, overflow, error, exit, close, kills, destroys, stopErrors, output };
             fs.writeFileSync(path.join(root, 'u1-result.json'), JSON.stringify(receipt, null, 2) + '\n',
               { flag: 'wx', mode: 0o600 });
             console.log(JSON.stringify(receipt));
+            assert.equal(stopErrors.length, 0);
             assert.equal(error, null);
             assert(!timedOut && !overflow && elapsedMs <= timeoutMs);
             assert.deepEqual(exit, { status: 0, signal: null });
