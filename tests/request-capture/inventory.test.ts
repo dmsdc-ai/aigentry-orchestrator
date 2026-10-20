@@ -1373,3 +1373,105 @@ test('inventory: isolated raw/ directory drift is partial; a drift-check-removed
   // POSIX: the mutant would wrongly claim complete (exit 0). win32: never complete, so only the code discriminates.
   assertClean(missed, mutant.code);
 });
+
+// #1166 U2: collision reporting retains evidence and never treats an identity alias as dedupe.
+async function collisionObservation(t: TestContext, kind: 'v2' | 'v1-earlier' | 'v1-later'): Promise<void> {
+  const { base, root } = await fixture(t); await initStore(root);
+  const raw = Buffer.from('two distinct captures of the same collision-control bytes');
+  const low = '11111111-1111-4111-8111-111111111111';
+  const high = 'eeeeeeee-eeee-4eee-aeee-eeeeeeeeeeee';
+  const firstIngress = '33333333-3333-4333-8333-333333333333';
+  const secondIngress = '44444444-4444-4444-8444-444444444444';
+  const received_at = '2026-01-01T00:00:00.000Z';
+  const first = await addReceipt(root, raw, kind === 'v1-earlier'
+    ? { capture_id: low, received_at }
+    : { capture_id: low, received_at, ingress_id: firstIngress },
+  { version: kind === 'v1-earlier' ? 1 : 2 });
+  const second = await addReceipt(root, raw, kind === 'v1-later'
+    ? { capture_id: high, received_at }
+    : { capture_id: high, received_at, ingress_id: secondIngress },
+  { version: kind === 'v1-later' ? 1 : 2 });
+  const rows = [first, second];
+  const ids = [low, high];
+  const files = ids.map(id => path.join(root, 'receipts', id + '.json'));
+  const rawFile = path.join(root, 'raw', digest(raw) + '.bin');
+  const rawMode = (await fs.stat(rawFile)).mode;
+  const markerBytes = await fs.readFile(path.join(root, 'store.json'));
+  const originals = await Promise.all(files.map(file => fs.readFile(file)));
+  const modes = await Promise.all(files.map(async file => (await fs.stat(file)).mode));
+  assert.deepEqual(await fs.readdir(path.join(root, 'raw')), [digest(raw) + '.bin']);
+  assert.deepEqual(await fs.readFile(path.join(root, 'raw', digest(raw) + '.bin')), raw);
+  for (let i = 0; i < files.length; i++) {
+    assert.deepEqual(JSON.parse(originals[i]!.toString('utf8')), rows[i]);
+    assert.equal(modes[i]! & 0o777, 0o600);
+  }
+  const validSnapshot = await snapshot(base);
+  const valid = await list(root);
+  assert.equal(await snapshot(base), validSnapshot, 'valid observation is read-only');
+  checkInventory(valid, [root, base]);
+  assert.equal(valid.complete, true, 'owned POSIX fixture is valid before identity corruption');
+  assert.deepEqual(valid.anomalies, []);
+  assert.deepEqual(valid.items.map(item => item.capture_id), ids, 'same timestamp sorts by capture ID');
+  assert.equal(new Set(valid.items.map(item => item.ingress_id)).size, 2);
+  assert.deepEqual(valid.items.map(item => item.sha256), [digest(raw), digest(raw)]);
+  assert.deepEqual(valid.items.map(item => item.receipt_schema_version),
+    kind === 'v1-earlier' ? [1, 2] : kind === 'v1-later' ? [2, 1] : [2, 2]);
+  if (kind !== 'v2') {
+    const legacy = valid.items.find(item => item.receipt_schema_version === 1)!;
+    const current = valid.items.find(item => item.receipt_schema_version === 2)!;
+    assert.equal(legacy.ingress_id, legacy.capture_id);
+    assert.equal(legacy.ingress_id_provenance, LEGACY);
+    assert.equal(legacy.capture_id < current.capture_id, kind === 'v1-earlier');
+  }
+
+  // listDirectory uses opendir/read without sorting; only the returned items are sorted.
+  // Observe discovery order without assuming lexical or insertion order is the OS order.
+  const directory = await fs.opendir(path.join(root, 'receipts'));
+  const discovery: string[] = [];
+  for await (const entry of directory) discovery.push(entry.name);
+  assert.deepEqual([...discovery].sort(), ids.map(id => id + '.json'));
+  t.diagnostic(JSON.stringify({ collision: kind, observedDiscovery: discovery,
+    discoveryOrderIsNotAssumed: true }));
+
+  const changedIndex = kind === 'v1-later' ? 0 : 1;
+  const unchangedIndex = changedIndex === 0 ? 1 : 0;
+  const shared = kind === 'v2' ? firstIngress : kind === 'v1-earlier' ? low : high;
+  const changed = { ...rows[changedIndex]!, ingress_id: shared };
+  await fs.writeFile(files[changedIndex]!, JSON.stringify(changed));
+  assert.equal((await fs.stat(files[changedIndex]!)).mode, modes[changedIndex]);
+  assert.deepEqual(await fs.readFile(files[unchangedIndex]!), originals[unchangedIndex]);
+  assert.equal((await fs.stat(files[unchangedIndex]!)).mode, modes[unchangedIndex]);
+  assert.equal((await fs.stat(rawFile)).mode, rawMode);
+  assert.deepEqual(await fs.readFile(path.join(root, 'store.json')), markerBytes);
+  assert.deepEqual(JSON.parse(await fs.readFile(files[changedIndex]!, 'utf8')), changed);
+  assert.deepEqual({ ...changed, ingress_id: rows[changedIndex]!.ingress_id }, rows[changedIndex]);
+  assert.deepEqual(await fs.readFile(path.join(root, 'raw', digest(raw) + '.bin')), raw);
+
+  const beforeRead = await snapshot(base);
+  const collided = await list(root);
+  assert.equal(await snapshot(base), beforeRead, 'collision observation preserves every byte and mode');
+  // Do not call checkInventory here: its normal-fixture uniqueness assertion would hide this oracle.
+  assert.deepEqual(collided.items, valid.items.map(item => item.capture_id === ids[changedIndex]
+    ? { ...item, ingress_id: shared } : item), 'both captures retained with stored IDs, no dedupe or remint');
+  for (const [key, value] of Object.entries(FIXED)) assert.deepEqual(collided[key], value);
+  assert.equal(collided.complete, false, 'an identity collision makes the observation incomplete');
+  assert.deepEqual(codes(collided), new Set(['invalid_receipt']));
+  const refs = collided.anomalies.filter(anomaly => anomaly.code === 'invalid_receipt')
+    .flatMap(anomaly => {
+      assert.ok(Array.isArray(anomaly.refs), 'invalid_receipt identifies the colliding captures');
+      return anomaly.refs as unknown[];
+    });
+  assert.deepEqual([...new Set(refs)].sort(), ids, 'both collision participants are identified');
+}
+
+test('U2-ID1: two v2 receipts sharing an ingress ID retain both captures and report both invalid', async t => {
+  await collisionObservation(t, 'v2');
+});
+
+test('U2-ID2: lexically earlier v1 identity colliding with v2 retains both captures and reports both invalid', async t => {
+  await collisionObservation(t, 'v1-earlier');
+});
+
+test('U2-ID3: lexically later v1 identity colliding with v2 retains both captures and reports both invalid', async t => {
+  await collisionObservation(t, 'v1-later');
+});
