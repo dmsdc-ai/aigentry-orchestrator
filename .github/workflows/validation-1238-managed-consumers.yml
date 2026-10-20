@@ -1109,6 +1109,143 @@ jobs:
             assert(elapsed() < 180000, 'final log deadline');
             await new Promise((resolve,reject) => process.stdout.write(bytes, e => e ? reject(e) : resolve()));
           }
+          // Acquisition trusts the already running hosted bootstrap, not source ancestors.
+          // Hash equality establishes copied-byte custody, not upstream authenticity.
+          const toolLimit = 128 * limit;
+          const identityKeys = ['dev','ino','size','mode','uid','gid','nlink','mtimeNs','ctimeNs'];
+          function sameIdentity(before, after) {
+            for (const key of identityKeys) assert.equal(after[key],before[key],'interpreter identity changed: '+key);
+          }
+          function toolLeaf(s, destination = false) {
+            assert(s.isFile() && !s.isSymbolicLink(), 'interpreter must be a regular nonlink leaf');
+            assert(s.uid === 0n || s.uid === BigInt(process.getuid()), 'interpreter owner');
+            assert((s.mode & 0o022n) === 0n, 'interpreter writable by group/other');
+            assert(s.size > 0n && s.size <= BigInt(toolLimit), 'Node identity hash bound');
+            if (destination) {
+              assert.equal(s.uid,BigInt(process.getuid()));
+              assert.equal(s.nlink,1n);
+              assert.equal(s.mode & 0o7777n,0o500n,'private executable mode');
+            }
+          }
+          function toolIdentity(file, destination = false) {
+            boundary('interpreter identity');
+            assert(path.isAbsolute(file) && path.normalize(file) === file &&
+              !/[\x00-\x1f\x7f]/.test(file),'canonical interpreter path');
+            const s=fs.lstatSync(file,{bigint:true}); toolLeaf(s,destination);
+            assert.equal(fs.realpathSync(file),file,'canonical interpreter');
+            if(destination)directory(path.dirname(file),true);
+            return s;
+          }
+          function toolRead(file, expected, destination = false, consume = () => {}) {
+            sameIdentity(expected,toolIdentity(file,destination));
+            const fd=fs.openSync(file,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);
+            const hash=createHash('sha256'),chunk=Buffer.alloc(65536);let bytes=0;
+            try {
+              sameIdentity(expected,fs.fstatSync(fd,{bigint:true}));
+              while(bytes<Number(expected.size)){
+                boundary('interpreter descriptor read');
+                const n=fs.readSync(fd,chunk,0,Math.min(chunk.length,Number(expected.size)-bytes),bytes);
+                assert(n>0,'short interpreter');
+                hash.update(chunk.subarray(0,n));consume(chunk.subarray(0,n),bytes);bytes+=n;
+              }
+              assert.equal(fs.readSync(fd,chunk,0,1,bytes),0,'interpreter grew');
+              sameIdentity(expected,fs.fstatSync(fd,{bigint:true}));
+              sameIdentity(expected,toolIdentity(file,destination));
+            } finally {fs.closeSync(fd);}
+            return {bytes,sha256:hash.digest('hex')};
+          }
+          function sourceAncestors(file) {
+            const rows=[];
+            for(let p=path.dirname(file);;p=path.dirname(p)){
+              boundary('source ancestor observation');assert(rows.length<128,'source ancestor bound');
+              const s=fs.lstatSync(p);
+              rows.push({path:p,mode:s.mode,uid:s.uid,gid:s.gid,directory:s.isDirectory(),
+                nonlink:!s.isSymbolicLink(),allowedOwner:s.uid===0||s.uid===process.getuid(),
+                noGroupOtherWrite:(s.mode&0o022)===0});
+              if(p===path.dirname(p))break;
+            }
+            return rows;
+          }
+          function provisioningControls() {
+            const root=path.join(owned,'provisioning-controls');
+            fs.mkdirSync(root,{mode:0o700});directory(root,true);
+            const file=path.join(root,'leaf');
+            fs.writeFileSync(file,'x',{flag:'wx',mode:0o500});
+            const good=toolIdentity(file,true),passed=[];
+            function refused(label,fn){assert.throws(fn);passed.push(label);}
+            refused('nonregular source',()=>toolLeaf(fs.lstatSync(root,{bigint:true})));
+            refused('writable source',()=>toolLeaf({...good,mode:good.mode|0o020n,
+              isFile:()=>true,isSymbolicLink:()=>false}));
+            refused('foreign owner',()=>toolLeaf({...good,uid:BigInt(process.getuid())+1n,
+              isFile:()=>true,isSymbolicLink:()=>false}));
+            refused('oversize source',()=>toolLeaf({...good,size:BigInt(toolLimit)+1n,
+              isFile:()=>true,isSymbolicLink:()=>false}));
+            for(const key of identityKeys)
+              refused('changed '+key,()=>sameIdentity(good,{...good,[key]:good[key]+1n}));
+            const link=path.join(root,'link');fs.symlinkSync('leaf',link);
+            refused('linked source',()=>toolIdentity(link));
+            const replacement=path.join(root,'replacement');
+            fs.writeFileSync(replacement,'y',{flag:'wx',mode:0o500});
+            fs.renameSync(replacement,file);
+            refused('replaced source',()=>toolRead(file,good));
+            const unsafe=path.join(root,'unsafe');fs.mkdirSync(unsafe,{mode:0o700});
+            fs.chmodSync(unsafe,0o720);
+            const observed=sourceAncestors(path.join(unsafe,'unused'));
+            assert.equal(observed[0].noGroupOtherWrite,false);
+            refused('unsafe destination directory',()=>directory(unsafe,true));
+            fs.chmodSync(unsafe,0o700);
+            refused('destination write bits',()=>toolLeaf({...good,mode:0o100700n,
+              isFile:()=>true,isSymbolicLink:()=>false},true));
+            refused('destination hardlinks',()=>toolLeaf({...good,nlink:2n,
+              isFile:()=>true,isSymbolicLink:()=>false},true));
+            refused('destination exclusive creation',()=>fs.openSync(file,
+              fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o600));
+            // Two one-byte files were created; one replaced the other. Link text is four bytes.
+            return {passed,createdRegularBytes:2,retainedRegularBytes:1,retainedLinkBytes:4,
+              entries:4,limitBytes:4096,productInvocations:0};
+          }
+          function provisionSelectedInterpreter() {
+            const selected=process.execPath, before=toolIdentity(selected);
+            const observations=sourceAncestors(selected);
+            const storage=fs.mkdtempSync(path.join(owned,'interpreter-'));
+            fs.chmodSync(storage,0o700);directory(storage,true);
+            const node=path.join(storage,'node');
+            const fd=fs.openSync(node,fs.constants.O_RDWR|fs.constants.O_CREAT|
+              fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o600);
+            let acquired,sealed;
+            try {
+              const empty=fs.fstatSync(fd,{bigint:true});
+              assert(empty.isFile() && empty.uid===BigInt(process.getuid()) && empty.nlink===1n);
+              assert.equal(empty.mode&0o7777n,0o600n);assert.equal(empty.size,0n);
+              acquired=toolRead(selected,before,false,(chunk,offset)=>{
+                let written=0;
+                while(written<chunk.length){
+                  boundary('private interpreter write');
+                  const n=fs.writeSync(fd,chunk,written,chunk.length-written,offset+written);
+                  assert(n>0,'short interpreter write');written+=n;
+                }
+              });
+              fs.fsyncSync(fd);fs.fchmodSync(fd,0o500);
+              sealed=fs.fstatSync(fd,{bigint:true});toolLeaf(sealed,true);
+              assert.equal(sealed.dev,empty.dev);assert.equal(sealed.ino,empty.ino);
+              assert.equal(sealed.size,before.size);
+              sameIdentity(sealed,toolIdentity(node,true));
+            } finally {fs.closeSync(fd);}
+            const copied=toolRead(node,sealed,true);assert.deepEqual(copied,acquired);
+            sameIdentity(before,toolIdentity(selected));
+            receipt.provisioning={source:{path:selected,...acquired,ancestors:observations},
+              destination:{path:node,...copied,mode:0o500},
+              trust:'Already running admitted hosted bootstrap/setup-node; hashes prove byte custody only.',
+              storage:{executableBytes:copied.bytes,executableLimitBytes:toolLimit,
+                controls:provisioningControls(),packageAndEvidenceLimitsUnchanged:true}};
+            receipt.node={path:node,...copied};
+            return {node,verify(){
+              sameIdentity(before,toolIdentity(selected));
+              sameIdentity(sealed,toolIdentity(node,true));
+              assert.deepEqual(toolRead(node,sealed,true),copied);
+            }};
+          }
+
           async function main() {
             assert(['linux','darwin'].includes(process.platform)); assert.equal(process.version,'v20.20.0');
             assert(Number.isSafeInteger(started));
@@ -1138,15 +1275,8 @@ jobs:
               assert.equal(input.row.sha256,digest,'source binding changed: '+rel);
               receipt.sourceHashes[rel] = digest;
             }
-            const node = process.execPath;
-            assert.equal(fs.realpathSync(node),node);
-            directory(path.dirname(node));
-            const nodeStat = fs.lstatSync(node);
-            assert(nodeStat.isFile() && !nodeStat.isSymbolicLink() &&
-              (nodeStat.uid===0||nodeStat.uid===process.getuid()) && (nodeStat.mode & 0o022)===0);
-            assert(nodeStat.size<=128*limit,'Node identity hash bound');
-            receipt.node = {path:node,bytes:nodeStat.size,sha256:sha(fs.readFileSync(node))};
-            boundary('node hash');
+            const provisioned = provisionSelectedInterpreter();
+            const node = provisioned.node;
             const {MANIFEST} = await import(pathToFileURL(path.join(checkout,'bin/init/manifest.mjs')).href);
             boundary('manifest owner import');
             assert(Array.isArray(MANIFEST) && MANIFEST.length===87);
@@ -1233,8 +1363,9 @@ jobs:
             const argv=['--test','--test-concurrency=1',test];
             receipt.command={executable:node,argv,cwd:parent,env,shell:false};
             const admission=JSON.stringify({checkout:receipt.checkout,node:receipt.node,
-              fixture:receipt.fixture,sourceHashes:receipt.sourceHashes,command:receipt.command,limits:receipt.limits})+'\n';
+              provisioning:receipt.provisioning,fixture:receipt.fixture,sourceHashes:receipt.sourceHashes,command:receipt.command,limits:receipt.limits})+'\n';
             save('admission.json',admission);await print(admission);
+            provisioned.verify();
             boundary('launch');
             assert(Date.now()<started+160000,'insufficient inner allowance');
             await new Promise(resolve=>{
