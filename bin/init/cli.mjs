@@ -190,6 +190,9 @@ aigentry-orchestrator init [--workspace PATH] [--yes] [--dry-run] [--force] [--u
   --dry-run         run the checks, print every path that would be touched, write nothing
   --force           overwrite an already-initialised workspace
   --upgrade         re-copy the manifest into an existing workspace; state/ is never touched
+  --legacy-recovery-plan   read-only source plan; requires --workspace ABS and explicit
+                          AIGENTRY_HOME, both existing private roots; optional --upgrade
+                          emits evidence only, never authorizes recovery
   --capture-root ABS       existing canonical private capture root (mode 0700)
   --preservation-root ABS  existing canonical private backup root (mode 0700)
                           supply both to install native capture; roots must be disjoint
@@ -771,7 +774,199 @@ function dryRun(ws) {
 
 // ------------------------------------------------------------------------------- main
 
+// This route never bootstraps the managed environment or calls a writer. Desired
+// package bytes are source-derived candidates, not verified old install baselines.
+function legacyRecoveryPlan(argv) {
+  const result = {
+    version: 1, kind: "legacy-recovery-plan", evidence_only: true, reusable_as_capability: false,
+    mutating_recovery_admitted: false, source_plan_complete: false,
+    package_rendering_complete: false,
+    unavailable_capabilities: [
+      "current-caller-authenticated-executor-and-descendant-ownership",
+      "verified-old-per-leaf-baselines", "current-caller-executor-association",
+      "fixed-config-recovery-contract", "fixed-state-recovery-contract", "fixed-finalization-recovery-contract",
+    ],
+  };
+  const refuse = (reason) => { throw new Error(reason); };
+  let phase = "options";
+  try {
+    const seen = new Set();
+    let ws, upgrade = false;
+    for (let i = 0; i < argv.length; i++) {
+      const option = argv[i];
+      if (seen.has(option)) refuse("incompatible-options");
+      seen.add(option);
+      if (option === "--workspace") ws = argv[++i];
+      else if (option === "--upgrade") upgrade = true;
+      else if (option !== "--legacy-recovery-plan") refuse("incompatible-options");
+    }
+    const home = process.env.AIGENTRY_HOME;
+    const absolute = (value) => typeof value === "string" && path.isAbsolute(value) &&
+      value !== path.parse(value).root && path.normalize(value) === value &&
+      !value.endsWith(path.sep) && !/[\x00-\x1f\x7f]/.test(value);
+    if (!absolute(ws) || !absolute(home)) refuse("explicit-canonical-roots-required");
+    if (typeof process.getuid !== "function" || !fs.constants.O_NOFOLLOW || !fs.constants.O_NONBLOCK)
+      refuse("current-inspector-primitives-unavailable");
+    phase = "roots";
+    const uid = process.getuid();
+    const safeDirectory = (file) => {
+      const s = fs.lstatSync(file);
+      if (!s.isDirectory() || s.isSymbolicLink() || (s.uid !== uid && s.uid !== 0) ||
+          (s.mode & 0o022)) refuse("unsafe-directory");
+      return s;
+    };
+    const ancestry = (dir) => {
+      let current = path.parse(dir).root;
+      safeDirectory(current);
+      for (const part of dir.slice(current.length).split(path.sep).filter(Boolean)) {
+        current = path.join(current, part);
+        safeDirectory(current);
+      }
+    };
+    for (const root of [ws, home, PKG_ROOT]) {
+      ancestry(root);
+      if (fs.realpathSync.native(root) !== root) refuse("unsafe-directory");
+    }
+    for (const root of [ws, home]) {
+      const s = fs.lstatSync(root);
+      if (s.uid !== uid || (s.mode & 0o777) !== 0o700) refuse("private-roots-required");
+    }
+    const overlaps = (a, b) => {
+      a = a.normalize("NFC").toLowerCase(); b = b.normalize("NFC").toLowerCase();
+      return a === b || a.startsWith(b + path.sep) || b.startsWith(a + path.sep);
+    };
+    if (overlaps(ws, home) || overlaps(ws, PKG_ROOT) || overlaps(home, PKG_ROOT)) refuse("overlapping-roots");
+    const relative = (rel) => typeof rel === "string" && rel.length > 0 &&
+      !rel.includes("\\") && !/[\x00-\x1f\x7f]/.test(rel) && !path.posix.isAbsolute(rel) &&
+      rel.split("/").every(part => part && part !== "." && part !== "..");
+    const inspect = (root, rel, directory = false) => {
+      if (!relative(rel)) refuse("invalid-declared-path");
+      ancestry(root);
+      const parts = rel.split("/");
+      let current = root;
+      for (let i = 0; i < parts.length; i++) {
+        current = path.join(current, parts[i]);
+        let s;
+        try { s = fs.lstatSync(current); }
+        catch (error) { if (error.code === "ENOENT") return null; throw error; }
+        if (s.isSymbolicLink() || (s.uid !== uid && s.uid !== 0) || (s.mode & 0o022))
+          refuse("unknown-target-object");
+        if (i < parts.length - 1 || directory) {
+          if (!s.isDirectory()) refuse("unknown-target-object");
+        } else if (!s.isFile() || s.nlink !== 1) refuse("unknown-target-object");
+        if (i === parts.length - 1) return s;
+      }
+    };
+    const metadata = (s) => s ? { present: true, mode: s.mode & 0o777, bytes: s.size } : { present: false };
+    const identity = (s) => [s.dev, s.ino, s.size, s.mode, s.uid, s.gid, s.nlink, s.mtimeMs, s.ctimeMs].join(":");
+    let sourceBytes = 0;
+    const readSource = (rel) => {
+      const before = inspect(PKG_ROOT, rel);
+      if (!before || before.size > 4 * 1024 * 1024) refuse("incomplete-source-closure");
+      sourceBytes += before.size;
+      if (sourceBytes > 32 * 1024 * 1024) refuse("source-bound-exceeded");
+      const file = path.join(PKG_ROOT, rel);
+      const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+      try {
+        if (identity(before) !== identity(fs.fstatSync(fd))) refuse("source-changed");
+        const bytes = Buffer.alloc(before.size + 1);
+        let count = 0;
+        while (count < bytes.length) {
+          const n = fs.readSync(fd, bytes, count, bytes.length - count, null);
+          if (!n) break;
+          count += n;
+        }
+        if (count !== before.size || identity(before) !== identity(fs.fstatSync(fd)) ||
+            identity(before) !== identity(inspect(PKG_ROOT, rel))) refuse("source-changed");
+        return bytes.subarray(0, count);
+      } finally { fs.closeSync(fd); }
+    };
+    const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
+    phase = "source";
+    if (!MANIFEST.length || MANIFEST.length > 512 || new Set(MANIFEST).size !== MANIFEST.length ||
+        MANIFEST.some(rel => !relative(rel) || rel === "state" || rel.startsWith("state/")))
+      refuse("incomplete-source-closure");
+    const subs = Object.freeze(templateSubs(ws, home));
+    const sources = new Map();
+    const packageLeaves = MANIFEST.map(rel => {
+      const bytes = readSource(rel);
+      sources.set(rel, bytes);
+      const exempt = isSubstitutionExempt(rel);
+      const text = exempt ? null : bytes.toString("utf8");
+      const rendered = !exempt && TEMPLATE_TOKENS.some(token => text.includes(token))
+        ? Buffer.from(substitute(text, subs)) : bytes;
+      if (!exempt && TEMPLATE_TOKENS.some(token => rendered.includes(token))) refuse("source-token-survived");
+      return { path: rel, desired_sha256: digest(rendered), desired_bytes: rendered.length,
+        copy_mode: isExecutable(rel) ? 0o755 : 0o644, substitution_exempt: exempt };
+    });
+    const candidate = (rel) => {
+      const bytes = sources.get(rel);
+      if (!bytes) refuse("incomplete-source-closure");
+      return { desired_sha256: digest(bytes), desired_bytes: bytes.length };
+    };
+    phase = "targets";
+    for (const leaf of packageLeaves) leaf.target = metadata(inspect(ws, leaf.path));
+    const skillPath = ".claude/skills/orchestrate-turn/SKILL.md";
+    const skill = { path: skillPath, ...candidate(".agents/skills/orchestrate-turn/SKILL.md"),
+      treatment: "raw-copy-not-substituted", mode: "source-mode-if-created-existing-mode-if-replaced",
+      target: metadata(inspect(ws, skillPath)) };
+    const constitution = { path: "CONSTITUTION.md", ...candidate("tooling/instructions/CONSTITUTION.md"),
+      treatment: "raw-copy-if-absent-existing-decision-unavailable", target: metadata(inspect(home, "CONSTITUTION.md")) };
+    // Derive role leaves from the actual manifest, without duplicating role bytes.
+    const scaffoldFiles = ["instructions/common.md", ...MANIFEST.filter(rel =>
+      rel.startsWith("tooling/instructions/roles/")).map(rel => rel.slice("tooling/".length))];
+    const scaffoldPlan = { available: false, reason: "scaffold-owner-prepare-contract-unavailable",
+      files: scaffoldFiles.map(rel => ({ path: rel, target: metadata(inspect(home, rel)) })),
+      directories: ["instructions", "instructions/roles", "instructions/projects"].map(rel =>
+        ({ path: rel, target: metadata(inspect(home, rel, true)) })) };
+    const config = { path: "config.json", available: false, reason: "config-merge-plan-unavailable",
+      target: metadata(inspect(home, "config.json")) };
+    // Keep this branch before *any* call involving a state path. No queue bytes
+    // are decoded in fresh mode either.
+    const state = upgrade ? { status: "skipped-upgrade", inspected: false } : {
+      status: "contract-unavailable", inspected: true,
+      directories: STATE_DIRS.map(rel => ({ path: `state/${rel}`, target: metadata(inspect(ws, `state/${rel}`, true)) })),
+      queue: { path: "state/task-queue.json", target: metadata(inspect(ws, "state/task-queue.json")) },
+    };
+    const runtimeDirectories = AIGENTRY_DIRS.map(rel => ({ path: rel, target: metadata(inspect(home, rel, true)) }));
+    const finalization = { available: false, reason: "finalization-plan-unavailable",
+      files: [".aigentry-init.json", "GETTING-STARTED.md"].map(rel => ({ path: rel, target: metadata(inspect(ws, rel)) })) };
+    const locks = [[ws, "workspace", ".aigentry-native-capture.lock"],
+      [ws, "workspace", ".aigentry-preservation.lock"], [home, "home", ".aigentry-preservation.lock"]]
+      .map(([root, rootName, lockPath]) => {
+      const s = inspect(root, lockPath, true);
+      if (s) {
+        const dir = fs.opendirSync(path.join(root, lockPath));
+        try {
+          if (dir.readSync()?.name !== "owner.json" || dir.readSync() !== null) refuse("unknown-lock-object");
+        } finally { dir.closeSync(); }
+        if (!inspect(root, `${lockPath}/owner.json`)) refuse("unknown-lock-object");
+      }
+      return { root: rootName, path: lockPath, present: Boolean(s),
+        status: s ? "unverified-inspect-only-including-historical-uuid-locks" : "absent",
+        owner_content_read: false };
+    });
+    return { ...result, status: "planned", package_rendering_complete: true,
+      rendering: { created_at: subs["{{CREATED_AT}}"], scope: "one-invocation-source-candidates-only" },
+      package_leaves: packageLeaves, package_semantics: "replacement-candidates-not-existing-target-or-recovery-authority",
+      skill, constitution, scaffold: scaffoldPlan, config, state, runtime_directories: runtimeDirectories,
+      finalization, locks };
+  } catch (error) {
+    const reasons = new Set(["incompatible-options", "explicit-canonical-roots-required",
+      "current-inspector-primitives-unavailable", "unsafe-directory", "private-roots-required",
+      "overlapping-roots", "invalid-declared-path", "unknown-target-object", "incomplete-source-closure",
+      "source-bound-exceeded", "source-changed", "source-token-survived", "unknown-lock-object"]);
+    return { ...result, status: "refused", reason: reasons.has(error.message) ? error.message : `${phase}-unavailable` };
+  }
+}
+
 async function main() {
+  if (process.argv[2] === "init" && process.argv.slice(3).includes("--legacy-recovery-plan")) {
+    const result = legacyRecoveryPlan(process.argv.slice(3));
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    process.exitCode = result.status === "planned" ? 0 : 4;
+    return;
+  }
   if (process.argv[2] === "benchmark") {
     let outputFailed = false;
     const outputFailure = () => {
