@@ -757,3 +757,33 @@ test("N-BOUND attempt evidence is retained at exhaustion instead of pruned", () 
   noticeStep(doc, noticeClaimEvent(17), "intake_bounds_exceeded");
   assert.equal((row(doc, 1).notice as IntakeNoticeRecord).events.length, 32);
 });
+
+for (const missing of ["pause", "superseded_by", "result", "failure"] as const) {
+  test(`N-MISSING-${missing} first claim requires an explicit null eligibility fact`, () => {
+    const captured = applyIntakeEvent(emptyIntakeDocument(), capture(1));
+    assert.equal(captured.result, "intake_written");
+    assert.equal(intakeExitCode(captured), 0);
+    assert.ok(captured.document);
+    const doc = captured.document, original = structuredClone(doc);
+    assert.equal(row(doc, 1).state, "queued");
+    assert.equal(row(doc, 1).work_state, "unstarted");
+    assert.equal(row(doc, 1).notice, null);
+    for (const key of ["pause", "superseded_by", "result", "failure"] as const) {
+      assert.equal(row(doc, 1)[key], null);
+    }
+    const corrupt = row(doc, 1) as unknown as Record<string, unknown>;
+    delete corrupt[missing];
+    assert.equal(Object.hasOwn(corrupt, missing), false);
+    assert.deepEqual({ ...corrupt, [missing]: null }, row(original, 1));
+    const rawBefore = JSON.stringify(doc), generationBefore = doc.generation;
+    const rowBefore = structuredClone(row(doc, 1));
+    const outcome = applyIntakeNotice(doc, noticeClaimEvent());
+    assert.equal(outcome.result, "intake_transition_refused", missing);
+    assert.equal(intakeExitCode(outcome), 4);
+    assert.equal(outcome.document, null);
+    assert.equal(JSON.stringify(doc), rawBefore);
+    assert.equal(doc.generation, generationBefore);
+    assert.deepEqual(row(doc, 1), rowBefore);
+    assert.equal(row(doc, 1).notice, null);
+  });
+}

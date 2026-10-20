@@ -1298,7 +1298,16 @@ test("R-NOTICE-DIFF durable claims, uncertainty, measured retry, exact results a
     assert.equal(n.getDoc().requests[0].state, "queued");
     for (const extra of [["--claim", "duplicate"], ["--path", "/tmp"], ["--previous-attempt", "01"]]) {
       const rawBefore = n.w.raw(), generationBefore = n.w.doc().generation;
-      const r = noticeRun(n.w, [...noticeArgv(claim()), ...extra]);
+      const argv = noticeArgv(claim());
+      if (extra[0] === "--previous-attempt") {
+        assert.equal(argv.filter(value => value === "--previous-attempt").length, 1);
+        argv[argv.indexOf("--previous-attempt") + 1] = extra[1];
+      } else argv.push(...extra);
+      const r = noticeRun(n.w, argv);
+      if (extra[0] === "--previous-attempt") {
+        assert.equal(argv.filter(value => value === "--previous-attempt").length, 1);
+        assert.equal(JSON.parse(r.stdout).result, "intake_malformed");
+      }
       assert.equal(r.status, 4); assert.equal(n.w.raw(), rawBefore);
       assert.equal(n.w.doc().generation, generationBefore);
     }
@@ -1366,3 +1375,223 @@ test("R-NOTICE-VALIDATION strict fields, legacy unknown, malformed persisted log
     n.step(n.claim(17), "intake_bounds_exceeded");
     assert.equal(n.getDoc().requests[0].notice.events.length, 32);
   });
+
+// All children below share a single absolute deadline per invocation, including
+// readiness, release and cleanup. No timer extends the child's ten-second budget.
+function noticeChild(w, argv, observe = false) {
+  const deadline = Date.now() + 10_000;
+  const env = { PATH: w.env.PATH, HOME: w.env.HOME, TMPDIR: w.root,
+    DISPATCH_STATE_DIR: w.stateDir, PYTHONIOENCODING: "utf-8",
+    PYTHONDONTWRITEBYTECODE: "1" };
+  const lock = observe ? fs.lstatSync(w.file("intake.json.lock")) : null;
+  if (lock) assert.ok(lock.isFile());
+  // Observer parameters: script, lock path, device, inode, then original CLI argv.
+  const args = observe ? ["-I", "-B", "-c", NOTICE_FLOCK_OBSERVER, REGISTRY,
+    w.file("intake.json.lock"), String(lock.dev), String(lock.ino), ...argv] : argv;
+  const child = spawn(observe ? "python3" : REGISTRY, args,
+    { cwd: w.root, env, shell: false, stdio: ["pipe", "pipe", "pipe", "pipe"] });
+  const chunks = [[], [], []], sizes = [0, 0, 0], eof = [false, false, false];
+  let exited = false, closed = false, status = null, signal = null, failure = null;
+  let ready = false, released = false, stdinFinished = false;
+  let resolveDone, rejectDone, resolveReady, rejectReady;
+  const done = new Promise((resolve, reject) => { resolveDone = resolve; rejectDone = reject; });
+  const readiness = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+  // Register rejection handlers immediately; callers still receive original failures.
+  done.catch(() => {}); readiness.catch(() => {});
+  const stop = error => {
+    failure ??= error;
+    rejectReady(failure);
+    if (!exited && !closed && !child.kill("SIGKILL")) {
+      failure = new AggregateError([failure, Error("owned child kill failed")]);
+    }
+  };
+  const timer = setTimeout(() => {
+    stop(Error("notice child absolute deadline expired"));
+    rejectDone(failure);
+  }, Math.max(0, deadline - Date.now()));
+  child.on("error", stop);
+  child.stdin.on("error", stop);
+  child.stdin.on("finish", () => { stdinFinished = true; });
+  for (const [i, stream] of [child.stdout, child.stderr, child.stdio[3]].entries()) {
+    stream.on("error", stop);
+    stream.on("end", () => { eof[i] = true; });
+    stream.on("data", chunk => {
+      sizes[i] += chunk.length;
+      if (sizes[i] > 1024 * 1024) { stop(Error(`notice stream ${i} overflow`)); return; }
+      chunks[i].push(chunk);
+      if (i === 2) {
+        const message = Buffer.concat(chunks[2]).toString("utf8");
+        if (message === "ready\n" && !ready) { ready = true; resolveReady(); }
+        else if (!"ready\n".startsWith(message)) stop(Error("invalid observer handshake"));
+      }
+    });
+  }
+  child.on("exit", (code, sig) => { exited = true; status = code; signal = sig; });
+  child.on("close", (code, sig) => {
+    closed = true; clearTimeout(timer);
+    if (!exited || code !== status || sig !== signal || signal !== null ||
+        !eof.every(Boolean) || !stdinFinished || (observe && (!ready || !released))) {
+      failure ??= Error(`incomplete child closure: ${JSON.stringify({ exited, code, sig, eof,
+        stdinFinished, ready, released })}`);
+    }
+    if (!ready) rejectReady(failure ?? Error("closed before readiness"));
+    if (failure) rejectDone(failure);
+    else resolveDone({ status, signal, stdout: Buffer.concat(chunks[0]).toString("utf8"),
+      stderr: Buffer.concat(chunks[1]).toString("utf8") });
+  });
+  if (!observe) child.stdin.end();
+  return { done, readiness,
+    release() {
+      assert.ok(observe && ready && !released && !exited && !closed);
+      assert.ok(Date.now() < deadline, "release within absolute deadline");
+      released = true; child.stdin.end("release\n");
+    },
+    async cleanup() {
+      if (!closed) stop(Error("unfinished owned child during cleanup"));
+      await done; // Errors, including cleanup and deadline errors, remain failures.
+    } };
+}
+
+// Standard library only. No result/reducer/writer substitution. The actual flock
+// is called with the exact original arguments after one owned-pipe rendezvous.
+const NOTICE_FLOCK_OBSERVER = String.raw`
+import fcntl, os, runpy, select, stat, sys, time
+script, lock_path, device, inode = sys.argv[1:5]
+original_argv = sys.argv[5:]
+expected = (int(device), int(inode))
+lock_stat = os.lstat(lock_path)
+if not stat.S_ISREG(lock_stat.st_mode) or (lock_stat.st_dev, lock_stat.st_ino) != expected:
+    raise RuntimeError("owned lock identity mismatch")
+original_flock = fcntl.flock
+observed = False
+deadline = time.monotonic() + 10.0
+def observer(handle, flags):
+    global observed
+    fd = handle if isinstance(handle, int) else handle.fileno()
+    current = os.fstat(fd)
+    if (current.st_dev, current.st_ino) == expected and flags == (fcntl.LOCK_EX | fcntl.LOCK_NB) and not observed:
+        observed = True
+        if os.write(3, b"ready\n") != 6:
+            raise RuntimeError("short readiness write")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([0], [], [], remaining)[0]:
+            raise RuntimeError("release deadline")
+        if os.read(0, 8) != b"release\n":
+            raise RuntimeError("invalid release or EOF")
+    return original_flock(handle, flags)
+fcntl.flock = observer
+sys.argv = [script] + original_argv
+try:
+    runpy.run_path(script, run_name="__main__")
+finally:
+    fcntl.flock = original_flock
+    os.close(3)
+    if not observed:
+        raise RuntimeError("claim never reached owned exclusive lock")
+`;
+
+async function boundedNoticeRun(w, argv) {
+  const child = noticeChild(w, argv);
+  try { return await child.done; } finally { await child.cleanup(); }
+}
+
+async function capturedNoticeFixture(label) {
+  const w = world(label);
+  const result = await boundedNoticeRun(w, ["intake-event", ...w.capture(1)]);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.equal(JSON.parse(result.stdout).result, "intake_written");
+  const doc = w.doc(), row = doc.requests[0];
+  assert.equal(doc.requests.length, 1);
+  assert.equal(row.ingress_id, uuid(1));
+  assert.equal(row.state, "queued"); assert.equal(row.work_state, "unstarted");
+  assert.equal(row.notice, null);
+  for (const key of ["pause", "superseded_by", "result", "failure"]) assert.equal(row[key], null);
+  const core = await import(CORE);
+  const claim = { action: "claim", ingress_id: uuid(1), notice_id: core.intakeNoticeId(uuid(1)),
+    attempt: 1, previous_attempt: 0, previous_claim: null, claim: "claim_A", owner: "owner_A", at: at(10) };
+  return { w, doc, claim };
+}
+
+for (const missing of ["pause", "superseded_by", "result", "failure"]) {
+  test(`R-NOTICE-MISSING-${missing} actual writer refuses absent eligibility fact`,
+    { skip: SKIP }, async () => {
+      const { w, doc, claim } = await capturedNoticeFixture(`notice-missing-${missing}`);
+      const original = structuredClone(doc);
+      const capturedRaw = w.raw(), removedLine = `      "${missing}": null,\n`;
+      assert.equal(capturedRaw.split(removedLine).length, 2, "exactly one owned null field");
+      delete doc.requests[0][missing];
+      assert.equal(Object.hasOwn(doc.requests[0], missing), false);
+      assert.deepEqual({ ...doc.requests[0], [missing]: null }, original.requests[0]);
+      const corruptedRaw = capturedRaw.replace(removedLine, "");
+      assert.deepEqual(JSON.parse(corruptedRaw), doc);
+      fs.writeFileSync(w.file("intake.json"), corruptedRaw);
+      const before = w.raw(), generation = w.doc().generation, rowBefore = structuredClone(doc.requests[0]);
+      const r = await boundedNoticeRun(w, noticeArgv(claim));
+      assert.equal(r.status, 4, `${missing}: ${r.stdout}${r.stderr}`);
+      assert.equal(JSON.parse(r.stdout).result, "intake_transition_refused");
+      assert.equal(w.raw(), before); assert.equal(w.doc().generation, generation);
+      assert.deepEqual(w.doc().requests[0], rowBefore); assert.equal(w.doc().requests[0].notice, null);
+    });
+}
+
+test("R-NOTICE-CONTEND two real first claimants commit exactly one immutable winner",
+  { skip: SKIP }, async () => {
+    const { w, doc, claim } = await capturedNoticeFixture("notice-contend");
+    const other = { ...claim, claim: "claim_B", owner: "owner_B" };
+    const before = w.raw(), generation = doc.generation;
+    const children = [noticeChild(w, noticeArgv(claim), true), noticeChild(w, noticeArgv(other), true)];
+    try {
+      await Promise.all(children.map(c => c.readiness));
+      assert.equal(w.raw(), before, "both real processes parked before original flock");
+      for (const child of children) child.release();
+      const results = await Promise.all(children.map(c => c.done));
+      assert.deepEqual(results.map(r => r.status).sort(), [0, 8]);
+      assert.deepEqual(results.map(r => JSON.parse(r.stdout).result).sort(),
+        ["intake_notice_race", "intake_written"]);
+      const winner = results[0].status === 0 ? claim : other;
+      const loser = results[0].status === 0 ? other : claim;
+      const after = w.doc(), { notice, ...ordinary } = after.requests[0];
+      const { notice: priorNotice, ...priorOrdinary } = doc.requests[0];
+      assert.equal(priorNotice, null); assert.deepEqual(ordinary, priorOrdinary);
+      assert.equal(after.generation, generation + 1);
+      assert.deepEqual(notice.events, [winner]);
+      const committed = w.raw();
+      const refused = await boundedNoticeRun(w, noticeArgv(loser));
+      assert.equal(refused.status, 8); assert.equal(JSON.parse(refused.stdout).result, "intake_notice_race");
+      assert.equal(w.raw(), committed); assert.deepEqual(w.doc(), after);
+    } finally {
+      const cleanup = await Promise.allSettled(children.map(c => c.cleanup()));
+      const errors = cleanup.filter(r => r.status === "rejected").map(r => r.reason);
+      if (errors.length) throw new AggregateError(errors, "claimant cleanup failed");
+    }
+  });
+
+for (const kind of ["pause", "cancel"]) {
+  test(`R-NOTICE-LATE-${kind} ordinary commit precedes actual claim lock acquisition`,
+    { skip: SKIP }, async () => {
+      const { w, doc, claim } = await capturedNoticeFixture(`notice-late-${kind}`);
+      const before = w.raw();
+      const child = noticeChild(w, noticeArgv(claim), true);
+      try {
+        await child.readiness;
+        assert.equal(w.raw(), before);
+        const argv = ["intake-event", "--kind", kind, "--ingress-id", uuid(1),
+          "--now", at(2), "--reason", "blocked",
+          ...(kind === "pause" ? ["--owner", "owner", "--resume-condition", "review"] : [])];
+        const lifecycle = await boundedNoticeRun(w, argv);
+        assert.equal(lifecycle.status, 0, lifecycle.stdout + lifecycle.stderr);
+        assert.equal(JSON.parse(lifecycle.stdout).result, "intake_written");
+        const post = w.doc(), rawPost = w.raw();
+        assert.equal(post.generation, doc.generation + 1);
+        assert.equal(post.requests[0].state, kind === "pause" ? "waiting" : "cancelled");
+        assert.equal(post.requests[0].notice, null);
+        if (kind === "pause") assert.equal(post.requests[0].pause.reason, "blocked");
+        child.release();
+        const result = await child.done;
+        assert.equal(result.status, 4, result.stdout + result.stderr);
+        assert.equal(JSON.parse(result.stdout).result, "intake_transition_refused");
+        assert.equal(w.raw(), rawPost); assert.deepEqual(w.doc(), post);
+        assert.equal(w.doc().generation, post.generation);
+      } finally { await child.cleanup(); }
+    });
+}
