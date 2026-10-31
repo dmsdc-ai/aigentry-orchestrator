@@ -40,6 +40,7 @@ import {
   type EffortChoice,
   type HandoffPreview,
   type HistoryChoice,
+  type InputPolicy,
   type ModelChoice,
   ackPhrase,
   buildExecArgv,
@@ -73,6 +74,9 @@ export interface WizardIo {
   /** Task 1201: the review screen's READ-ONLY handoff scan, supplied by cli.ts (reading is not
    *  an effect). Absent = the review says the scan runs at boot. */
   readonly handoffPreview?: (plan: BootPlan) => HandoffPreview;
+  /** Task 1215: the input policy cli.ts already resolved and checked. Display + argv only;
+   *  the wizard never derives or asks for it. Absent = the review is unchanged. */
+  readonly inputPolicy?: InputPolicy;
 }
 
 /**
@@ -484,12 +488,12 @@ async function drive(
     const plan: BootPlan = { provider, sid, model, effort, permissions, history, inheritedCwd: io.cwd };
     write("\n── 7. Review ───────────────────────────────────────────────────────\n");
     const preview = io.handoffPreview?.(plan);
-    for (const line of describePlan(plan, preview)) write(`   ${line}\n`);
+    for (const line of describePlan(plan, preview, io.inputPolicy)) write(`   ${line}\n`);
     write("\n   This boot WILL:\n");
     for (const line of describeEffects(plan)) write(`     - ${line}\n`);
     write("\n   Command your shell will become (one element per line):\n");
     // Prefixed, on fd 2. Nothing here may look like the fd 1 contract channel.
-    for (const element of buildExecArgv(plan, preview?.kind === "found" ? preview.ref : undefined)) write(`     | ${element}\n`);
+    for (const element of buildExecArgv(plan, preview?.kind === "found" ? preview.ref : undefined, io.inputPolicy)) write(`     | ${element}\n`);
     const elevated = elevatedChoices(plan);
     if (elevated.length > 0) {
       write(`\n   ⚠ ELEVATED: ${elevated.map((c) => `${c.axis}=${c.value}`).join(", ")}\n`);

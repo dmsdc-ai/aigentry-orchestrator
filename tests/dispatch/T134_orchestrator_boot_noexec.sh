@@ -77,6 +77,13 @@
 # (a malformed opt-in, a control-character sid, junk in every plan field). Help is what an
 # operator runs when already confused; refusing it over an unrelated variable, or acting
 # while printing it, are the two failures this ticket is about.
+#
+# BLOCK K (task 1215): TELEPTY_SUPERVISION_CLIENT_FILE. Non-empty ⇒ the fixed telepty pair
+# `--input-policy user-supervised` right after `--auto-restart` on the normal boot, the probe
+# and the dry run; unset/empty ⇒ the old argv and no check; a relative/control-character path,
+# and every answer of telepty's PATH `allow-check` but its one success (recorded, never real),
+# refuse before the scan, the read, the SIGKILL and the DELETE; and the guard still classifies
+# the new argv as a bridge.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
@@ -125,6 +132,8 @@ export AIGENTRY_HANDOFF=off HOME="$T_TMP/scratch-home"
 mkdir -p "$HOME"
 unset CLAUDE_CONFIG_DIR CODEX_HOME GEMINI_CLI_HOME CLAUDE_CODE_SESSION_ID
 unset _NODE_SHIM_SH_SOURCED
+# Task 1215: a host value would change every argv below (or refuse it); block K sets it per row.
+unset TELEPTY_SUPERVISION_CLIENT_FILE
 cd "$BOOT_FIXTURE"
 
 fail() { echo "FAIL[T134]: $*" >&2; exit 1; }
@@ -143,12 +152,16 @@ PLAN_TAIL_ARGV=(claude --permission-mode manual)
 PLAN_TAIL="claude --permission-mode manual"
 
 # ── recorders: the same four seams T131 uses, same shapes ───────────────────
+# Task 1215 (boot42): each of the four also appends its kind to ONE shared sequence log, so
+# block K can prove the telepty admission check ran BEFORE any read or effect.
+SEQ_LOG="$T_TMP/sequence.log"
 PS_TABLE="$T_TMP/ps-table.txt"
 PS_ARGV="$T_TMP/ps-argv.log"
 PS_STUB="$STUB_BIN/ps-recorder134.sh"
 cat > "$PS_STUB" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$PS_ARGV"
+printf 'ps\n' >> "$SEQ_LOG"
 cat "$PS_TABLE"
 EOF
 
@@ -157,6 +170,7 @@ KILL_STUB="$STUB_BIN/kill-recorder134.sh"
 cat > "$KILL_STUB" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$KILL_LOG"
+printf 'kill\n' >> "$SEQ_LOG"
 exit 0
 EOF
 
@@ -166,6 +180,7 @@ TELEPTY_STUB="$STUB_BIN/telepty-recorder134.sh"
 cat > "$TELEPTY_STUB" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$TELEPTY_ARGV"
+printf 'list\n' >> "$SEQ_LOG"
 cat "$LIST_JSON" 2>/dev/null || true
 exit 0
 EOF
@@ -175,6 +190,7 @@ CURL_STUB="$STUB_BIN/curl-recorder134.sh"
 cat > "$CURL_STUB" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$CURL_LOG"
+printf 'curl\n' >> "$SEQ_LOG"
 printf '200'
 exit 0
 EOF
@@ -193,6 +209,42 @@ exit 0
 EOF
 chmod +x "$EXEC_DIR/telepty"
 
+# Task 1215 (boot42) — THE ADMISSION CHECKER. A declared supervised boot runs
+# `telepty allow-check --input-policy user-supervised` from PATH (the binary it would exec),
+# so every block-K run puts this recorder FIRST on PATH and no real telepty is reachable.
+# It records argv, the client variable it inherited and its place in SEQ_LOG, then answers
+# as $CHECK_MODE says (default: the one-line success). Never on PATH outside block K.
+CHECK_DIR="$T_TMP/check-path"
+mkdir -p "$CHECK_DIR"
+CHECK_LOG="$T_TMP/check-argv.log"
+CHECK_ENV_LOG="$T_TMP/check-env.log"
+CHECK_MODE="$T_TMP/check-mode"
+export T134_CHECK_LOG="$CHECK_LOG" T134_CHECK_ENV_LOG="$CHECK_ENV_LOG" T134_CHECK_MODE="$CHECK_MODE" T134_SEQ_LOG="$SEQ_LOG"
+cat > "$CHECK_DIR/telepty" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$T134_CHECK_LOG"
+printf '%s\n' "${TELEPTY_SUPERVISION_CLIENT_FILE-<unset>}" >> "$T134_CHECK_ENV_LOG"
+printf 'check\n' >> "$T134_SEQ_LOG"
+ok='{"schema":"telepty.allow-admission/v1","ok":true,"telepty_version":"0.10.0","input_policy":"user-supervised","supervision_client":"loaded","daemon_origin":"http://127.0.0.1:3848"}'
+mode=ok
+if [ -f "$T134_CHECK_MODE" ]; then mode="$(cat "$T134_CHECK_MODE")"; fi
+case "$mode" in
+  ok) printf '%s\n' "$ok"; exit 0 ;;
+  exit1) printf '%s\n' '{"schema":"telepty.allow-admission/v1","ok":false,"code":"FIXTURE_REFUSED"}'
+         printf 'fixture refusal \033[31mred\033[0m text\n' >&2; exit 1 ;;
+  help0) printf 'Usage: telepty <command>\n\n  allow    wrap a command\n'; exit 0 ;;
+  malformed) printf '%s\n' '{"schema":"telepty.allow-admission/v1","ok":tru'; exit 0 ;;
+  okfalse) printf '%s\n' '{"schema":"telepty.allow-admission/v1","ok":false,"input_policy":"user-supervised","supervision_client":"loaded"}'; exit 0 ;;
+  wrongschema) printf '%s\n' '{"schema":"telepty.allow-admission/v2","ok":true,"input_policy":"user-supervised","supervision_client":"loaded"}'; exit 0 ;;
+  missingfield) printf '%s\n' '{"schema":"telepty.allow-admission/v1","ok":true,"input_policy":"user-supervised"}'; exit 0 ;;
+  twolines) printf '%s\n%s\n' "$ok" "$ok"; exit 0 ;;
+  hang) exec sleep 30 ;;
+  signal) kill -KILL $$ ;;
+  *) printf 'unknown fixture mode %s\n' "$mode" >&2; exit 97 ;;
+esac
+EOF
+chmod +x "$CHECK_DIR/telepty"
+
 export SINGLETON_PS_CMD="$PS_STUB" KILL_CMD="$KILL_STUB"
 export TELEPTY="$TELEPTY_STUB" CURL="$CURL_STUB"
 export ORCHESTRATOR_SID="$SID"
@@ -202,7 +254,8 @@ export ORCHESTRATOR_SID="$SID"
 # <sid>` and never the tail, so no kill decision below changes.
 BRIDGE="node /Users/x/.nvm/versions/node/v20.20.0/bin/telepty allow --id $SID --auto-restart $PLAN_TAIL"
 
-reset() { : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$PS_ARGV"; : > "$TELEPTY_ARGV"; : > "$EXEC_LOG"; : > "$AUTH_LOG"; }
+reset() { : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$PS_ARGV"; : > "$TELEPTY_ARGV"; : > "$EXEC_LOG"; : > "$AUTH_LOG"
+  : > "$SEQ_LOG"; : > "$CHECK_LOG"; : > "$CHECK_ENV_LOG"; rm -f "$CHECK_MODE"; }
 # `grep -c .` prints the count and exits 1 on zero, so the status is swallowed rather
 # than answered with a second line (T131's idiom).
 lines() { grep -c . "$1" 2>/dev/null || true; }
@@ -674,4 +727,222 @@ for j_p in claude codex gemini grok; do
 done
 echo "T134 J PASS (help readable and inert under a hostile environment)"
 
-echo "T134 PASS blocks=A-J inspection=read-only normal-control=recorded-kill-and-DELETE execs=0"
+# ===========================================================================
+# K) THE DECLARED INPUT POLICY (task 1215).
+#
+#    telepty refuses TELEPTY_SUPERVISION_CLIENT_FILE without `--input-policy user-supervised`
+#    — after the exec, when this boot's guard has already SIGKILLed the old bridge. So the
+#    variable alone must produce the fixed pair, in the telepty allow arguments (after
+#    `--auto-restart`, before the provider's executable), and the declaration must be
+#    admitted while every effect is still ahead. The expected argv is written out literally.
+#
+#    boot42: the admission is telepty's OWN `allow-check`, run from PATH. Every run below has
+#    the CHECK_DIR recorder first on PATH (TB7), so no real telepty is reachable; the recorder
+#    answers as CHECK_MODE says. WHAT THIS DOES NOT MEASURE: telepty's own admission rules,
+#    daemon trust or liveness. The client fixture is `{}`.
+# ===========================================================================
+KPATH="$CHECK_DIR:$EXEC_DIR:$PATH"
+K_DIR="$T_TMP/k-client"
+mkdir -p "$K_DIR"
+K_CLIENT="$K_DIR/client.json"
+printf '{}\n' > "$K_CLIENT"; chmod 600 "$K_CLIENT"
+K_EXPECTED="$T_TMP/k.expected"
+printf '%s\n' telepty allow --id "$SID" --auto-restart --input-policy user-supervised "${PLAN_TAIL_ARGV[@]}" > "$K_EXPECTED"
+K_PLAIN="$T_TMP/k.plain"
+printf '%s\n' telepty allow --id "$SID" --auto-restart "${PLAN_TAIL_ARGV[@]}" > "$K_PLAIN"
+K_CHECK_ARGV='allow-check --input-policy user-supervised'
+
+# The checker ran exactly once, with the exact argv and the exact client path, and it is the
+# FIRST entry of the shared sequence log — before any ps, list, curl or kill.
+assert_checked_once_first() { # assert_checked_once_first <label> <client path>
+  [ "$(lines "$CHECK_LOG")" = "1" ] || fail "$1: the admission checker ran $(lines "$CHECK_LOG") times, expected 1: $(cat "$CHECK_LOG")"
+  [ "$(cat "$CHECK_LOG")" = "$K_CHECK_ARGV" ] || fail "$1: checker argv is not '$K_CHECK_ARGV': $(cat "$CHECK_LOG")"
+  [ "$(cat "$CHECK_ENV_LOG")" = "$2" ] || fail "$1: the checker did not inherit the client path unchanged: $(cat "$CHECK_ENV_LOG")"
+  [ "$(head -1 "$SEQ_LOG")" = "check" ] || fail "$1: something ran before the admission check: $(tr '\n' ' ' < "$SEQ_LOG")"
+  [ "$(grep -c '^check$' "$SEQ_LOG")" = "1" ] || fail "$1: the sequence log has more than one check"
+  if grep -q 'allow-check' "$TELEPTY_ARGV"; then fail "$1: the check went to the TELEPTY list seam, not the PATH telepty"; fi
+}
+
+# K.1 — normal boot (the zero-argv compiled CLI, as in block D): the exact supervised argv,
+# the check first, and the reconcile and the guard still act on the armed fixtures — the head
+# changed, not the order. (TB2)
+reset; loaded_ps_table; stale_listing
+TELEPTY_SUPERVISION_CLIENT_FILE="$K_CLIENT" PATH="$KPATH" node "$BOOT_CLI" >"$T_TMP/k1.out" 2>"$T_TMP/k1.err" \
+  || fail "K.1: an admitted client must boot; stderr: $(cat "$T_TMP/k1.err")"
+cmp "$K_EXPECTED" "$T_TMP/k1.out" || fail "K.1: normal boot stdout is not the exact supervised argv: $(cat "$T_TMP/k1.out")"
+assert_checked_once_first "K.1" "$K_CLIENT"
+[ "$(sed 's/^-9 //' "$KILL_LOG")" = "7777" ] || fail "K.1: the guard did not act on the loaded fixture: $(cat "$KILL_LOG")"
+grep -q -- '-X DELETE' "$CURL_LOG" || fail "K.1: the reconcile did not act on the STALE fixture"
+[ ! -s "$EXEC_LOG" ] || fail "K.1: compiled CLI exec'd a bridge"
+
+# K.2 — the probe's exec argv is the same argv, after one check and no effect. (TB5)
+reset
+TELEPTY_SUPERVISION_CLIENT_FILE="$K_CLIENT" PATH="$KPATH" bash "$BOOT" __probe exec-argv \
+  >"$T_TMP/k2.out" 2>"$T_TMP/k2.err" || fail "K.2: probe exec-argv failed; stderr: $(cat "$T_TMP/k2.err")"
+cmp "$K_EXPECTED" "$T_TMP/k2.out" || fail "K.2: probe argv is not the exact supervised argv: $(cat "$T_TMP/k2.out")"
+assert_checked_once_first "K.2" "$K_CLIENT"
+assert_no_side_effects "K.2"
+
+# K.3 — the dry run reports the same argv element for element, its plan report names the
+# policy, and it checked once without acting. (TB5)
+reset; loaded_ps_table; stale_listing
+TELEPTY_SUPERVISION_CLIENT_FILE="$K_CLIENT" PATH="$KPATH" bash "$BOOT" --dry-run \
+  >"$T_TMP/k3.out" 2>"$T_TMP/k3.err" || fail "K.3: --dry-run failed; stderr: $(cat "$T_TMP/k3.err")"
+sed 's/^/[would-exec] /' "$K_EXPECTED" > "$T_TMP/k3.expected"
+grep '^\[would-exec\]' "$T_TMP/k3.out" > "$T_TMP/k3.actual"
+diff -u "$T_TMP/k3.expected" "$T_TMP/k3.actual" || fail "K.3: dry-run argv mismatch"
+grep -qE 'plan +input +user-supervised' "$T_TMP/k3.out" \
+  || fail "K.3: the dry-run plan report does not describe the declared input policy: $(cat "$T_TMP/k3.out")"
+grep -qF 'not proof of authentication' "$T_TMP/k3.out" \
+  || fail "K.3: the dry-run report does not say the admission is not authentication"
+assert_checked_once_first "K.3" "$K_CLIENT"
+assert_no_side_effects "K.3"
+
+# K.4 — unset and EMPTY are both "not declared": the argv is the old one byte for byte, on
+# the normal boot and in the dry run, no policy line is reported, and NO checker runs. (TB4)
+for k_val in unset empty; do
+  reset; loaded_ps_table; stale_listing
+  if [ "$k_val" = unset ]; then
+    PATH="$KPATH" node "$BOOT_CLI" >"$T_TMP/k4.out" 2>"$T_TMP/k4.err" || fail "K.4/$k_val: boot failed; stderr: $(cat "$T_TMP/k4.err")"
+  else
+    TELEPTY_SUPERVISION_CLIENT_FILE= PATH="$KPATH" node "$BOOT_CLI" >"$T_TMP/k4.out" 2>"$T_TMP/k4.err" \
+      || fail "K.4/$k_val: boot failed; stderr: $(cat "$T_TMP/k4.err")"
+  fi
+  cmp "$K_PLAIN" "$T_TMP/k4.out" || fail "K.4/$k_val: the undeclared argv changed: $(cat "$T_TMP/k4.out")"
+  [ "$(lines "$CHECK_LOG")" = "0" ] || fail "K.4/$k_val: an undeclared boot ran the admission checker"
+  reset; loaded_ps_table; stale_listing
+  if [ "$k_val" = unset ]; then
+    PATH="$KPATH" bash "$BOOT" --dry-run >"$T_TMP/k4d.out" 2>/dev/null || fail "K.4/$k_val: --dry-run failed"
+  else
+    TELEPTY_SUPERVISION_CLIENT_FILE= PATH="$KPATH" bash "$BOOT" --dry-run >"$T_TMP/k4d.out" 2>/dev/null \
+      || fail "K.4/$k_val: --dry-run failed"
+  fi
+  sed 's/^/[would-exec] /' "$K_PLAIN" > "$T_TMP/k4d.expected"
+  grep '^\[would-exec\]' "$T_TMP/k4d.out" > "$T_TMP/k4d.actual"
+  diff -u "$T_TMP/k4d.expected" "$T_TMP/k4d.actual" || fail "K.4/$k_val: dry-run argv changed"
+  if grep -qE 'plan +input ' "$T_TMP/k4d.out"; then fail "K.4/$k_val: an undeclared policy was reported"; fi
+  [ "$(lines "$CHECK_LOG")" = "0" ] || fail "K.4/$k_val: an undeclared dry run ran the admission checker"
+  assert_no_side_effects "K.4/$k_val/dry-run"
+done
+
+# Every refusal below: exit 2, empty stdout, and NOTHING read or acted on — no ps, no list,
+# no kill, no curl, no auth, no exec — on the normal boot (where kill and DELETE are real
+# recorder calls), in the dry run and through the probe.
+k_assert_refused() { # k_assert_refused <label> <rc> <want-in-stderr>
+  [ "$2" = "2" ] || fail "$1: must exit 2, got $2; stderr: $(cat "$T_TMP/k5.err")"
+  [ ! -s "$T_TMP/k5.out" ] || fail "$1: a refusal wrote to stdout: $(cat "$T_TMP/k5.out")"
+  grep -qF -- "$3" "$T_TMP/k5.err" || fail "$1: the refusal does not say '$3': $(cat "$T_TMP/k5.err")"
+  [ "$(lines "$PS_ARGV")" = "0" ] || fail "$1: the refusal scanned the process table"
+  [ "$(lines "$TELEPTY_ARGV")" = "0" ] || fail "$1: the refusal read the registry"
+  assert_no_side_effects "$1"
+}
+k_run() { # k_run <boot|dry-run|probe> <client value> [PATH]  -> rc in K_RC
+  local k_path="${3:-$KPATH}"
+  K_RC=0
+  case "$1" in
+    boot) TELEPTY_SUPERVISION_CLIENT_FILE="$2" PATH="$k_path" node "$BOOT_CLI" >"$T_TMP/k5.out" 2>"$T_TMP/k5.err" || K_RC=$? ;;
+    dry-run) TELEPTY_SUPERVISION_CLIENT_FILE="$2" PATH="$k_path" bash "$BOOT" --dry-run >"$T_TMP/k5.out" 2>"$T_TMP/k5.err" || K_RC=$? ;;
+    probe) TELEPTY_SUPERVISION_CLIENT_FILE="$2" PATH="$k_path" bash "$BOOT" __probe exec-argv >"$T_TMP/k5.out" 2>"$T_TMP/k5.err" || K_RC=$? ;;
+  esac
+}
+
+# K.5 — THE BOOT'S OWN ARGV-SAFETY CHECKS refuse before even the checker runs. (TB1: the
+# newline is EMBEDDED — a trailing one would be stripped by the command substitution and the
+# value would silently become the valid fixture.)
+k_refuse() { # k_refuse <label> <client-file value> <reason fragment>
+  local k_mode
+  for k_mode in boot dry-run probe; do
+    reset; loaded_ps_table; stale_listing
+    k_run "$k_mode" "$2"
+    k_assert_refused "K.5/$1/$k_mode" "$K_RC" "TELEPTY_SUPERVISION_CLIENT_FILE $3"
+    [ "$(lines "$CHECK_LOG")" = "0" ] || fail "K.5/$1/$k_mode: the checker ran for a value the boot itself refuses"
+  done
+}
+# Relative, although it EXISTS and is otherwise usable (the cwd here is the fixture root).
+printf '{}\n' > "$BOOT_FIXTURE/k-rel-client.json"; chmod 600 "$BOOT_FIXTURE/k-rel-client.json"
+k_refuse relative 'k-rel-client.json' 'is not an absolute path'
+K_NL_PATH="$K_DIR/$(printf 'cl\nient.json')"
+case "$K_NL_PATH" in *"$(printf '\n')"*) ;; *) fail "K.5: the control-character fixture lost its newline" ;; esac
+k_refuse control-char "$K_NL_PATH" 'contains a control character'
+
+# K.6 — EVERY CHECKER ANSWER BUT THE ONE SUCCESS REFUSES BEFORE ANY EFFECT. (TB3) The
+# checker ran exactly once and nothing after it. `hang` waits out the 10 s bound, so it runs
+# on the normal boot only.
+k_check_refuse() { # k_check_refuse <mode> <reason fragment> <boot modes...>
+  local k_cmode="$1" k_want="$2" k_mode; shift 2
+  for k_mode in "$@"; do
+    reset; loaded_ps_table; stale_listing
+    printf '%s' "$k_cmode" > "$CHECK_MODE"
+    k_run "$k_mode" "$K_CLIENT"
+    k_assert_refused "K.6/$k_cmode/$k_mode" "$K_RC" "$k_want"
+    [ "$(lines "$CHECK_LOG")" = "1" ] || fail "K.6/$k_cmode/$k_mode: expected exactly one checker run, got $(lines "$CHECK_LOG")"
+    [ "$(tr '\n' ' ' < "$SEQ_LOG")" = "check " ] || fail "K.6/$k_cmode/$k_mode: something ran after a refused check: $(tr '\n' ' ' < "$SEQ_LOG")"
+  done
+}
+k_check_refuse exit1 'refused (exit 1)' boot dry-run probe
+# The relay: telepty's own words reach stderr, control-stripped (the fixture sends ESC).
+grep -qF 'telepty said:' "$T_TMP/k5.err" || fail "K.6/exit1: telepty's message was not relayed"
+grep -qF 'fixture refusal' "$T_TMP/k5.err" || fail "K.6/exit1: telepty's stderr was not relayed"
+if grep -q "$(printf '\033')" "$T_TMP/k5.err"; then fail "K.6/exit1: a control character was relayed raw"; fi
+# Private-file rules are telepty's now (boot42): a MISSING client is not judged here — it is
+# handed to the checker unchanged, and the checker's refusal is what stops the boot.
+reset; loaded_ps_table; stale_listing
+printf 'exit1' > "$CHECK_MODE"
+k_run boot "$K_DIR/absent.json"
+k_assert_refused "K.6/delegated-missing/boot" "$K_RC" 'refused (exit 1)'
+[ "$(cat "$CHECK_ENV_LOG")" = "$K_DIR/absent.json" ] || fail "K.6/delegated-missing: the path did not reach the checker unchanged: $(cat "$CHECK_ENV_LOG")"
+k_check_refuse help0 'did not print exactly one admission line' boot dry-run probe
+k_check_refuse malformed 'printed a line that is not JSON' boot dry-run probe
+k_check_refuse okfalse 'did not answer a telepty.allow-admission/v1 success' boot dry-run probe
+k_check_refuse wrongschema 'did not answer a telepty.allow-admission/v1 success' boot dry-run probe
+k_check_refuse missingfield 'did not answer a telepty.allow-admission/v1 success' boot dry-run probe
+k_check_refuse twolines 'did not print exactly one admission line' boot dry-run probe
+k_check_refuse signal 'was terminated by SIGKILL' boot dry-run probe
+k_check_refuse hang 'did not answer within 10000 ms' boot
+
+# No telepty on PATH at all: a private PATH holding only what the boot itself needs. No
+# recorder — so the checker log stays empty — and still no read or effect.
+K_NOTEL="$T_TMP/k-no-telepty"
+mkdir -p "$K_NOTEL"
+for k_tool in bash node cat dirname; do ln -s "$(command -v "$k_tool")" "$K_NOTEL/$k_tool"; done
+for k_mode in boot dry-run probe; do
+  reset; loaded_ps_table; stale_listing
+  k_run "$k_mode" "$K_CLIENT" "$K_NOTEL"
+  k_assert_refused "K.6/enoent/$k_mode" "$K_RC" "no 'telepty' on PATH"
+  [ "$(lines "$CHECK_LOG")" = "0" ] || fail "K.6/enoent/$k_mode: a recorder was reachable"
+done
+
+# K.7 — THE MODES THAT RESOLVE NO EXEC ARGV NEVER CHECK. (TB5) --help, --wizard-plan (no
+# terminal here, so it refuses on its own) and an unknown flag, all with the variable set.
+for k_args in --help --wizard-plan --bogus; do
+  reset
+  TELEPTY_SUPERVISION_CLIENT_FILE="$K_CLIENT" PATH="$KPATH" bash "$BOOT" "$k_args" >/dev/null 2>"$T_TMP/k7.err" || true
+  [ "$(lines "$CHECK_LOG")" = "0" ] || fail "K.7/$k_args: the admission checker ran for a mode that resolves no exec argv"
+  assert_no_side_effects "K.7/$k_args"
+done
+
+# K.8 — THE GUARD STILL KNOWS A SUPERVISED BRIDGE. A ps row carrying the new argv is a bridge
+# for this sid: the real run kills the stale one, skips the ancestor, and the dry run names
+# the same set.
+SUP_BRIDGE="node /Users/x/.nvm/versions/node/v20.20.0/bin/telepty allow --id $SID --auto-restart --input-policy user-supervised $PLAN_TAIL"
+cat > "$PS_TABLE" <<EOF
+3333 1111 bash $BOOT
+1111 1 $SUP_BRIDGE
+7778 1 $SUP_BRIDGE
+EOF
+reset; stale_listing
+SINGLETON_SELF_PID=3333 PATH="$KPATH" node "$BOOT_CLI" >"$T_TMP/k8.out" 2>"$T_TMP/k8.err" \
+  || fail "K.8: boot failed; stderr: $(cat "$T_TMP/k8.err")"
+[ "$(sed 's/^-9 //' "$KILL_LOG" | sort -u)" = "7778" ] \
+  || fail "K.8: the supervised argv was not classified as the bridge (or its ancestor was killed): $(cat "$KILL_LOG")"
+grep -q 'skip self/ancestor bridge pid=1111' "$T_TMP/k8.err" \
+  || fail "K.8: the supervised ancestor bridge was not skipped: $(cat "$T_TMP/k8.err")"
+reset; stale_listing
+SINGLETON_SELF_PID=3333 PATH="$KPATH" bash "$BOOT" --dry-run >"$T_TMP/k8d.out" 2>/dev/null \
+  || fail "K.8: --dry-run failed"
+[ "$(sed -n 's/.*would SIGKILL[^=]*pid=\([0-9][0-9]*\).*/\1/p' "$T_TMP/k8d.out" | sort -u)" = "7778" ] \
+  || fail "K.8: the dry run's would-kill set is not exactly 7778: $(cat "$T_TMP/k8d.out")"
+assert_no_side_effects "K.8/dry-run"
+echo "T134 K PASS (declared input policy: exact flag position, shared admission check first, every checker refusal before effects, unset/empty unchanged and unchecked, classifier)"
+
+echo "T134 PASS blocks=A-K inspection=read-only normal-control=recorded-kill-and-DELETE execs=0"

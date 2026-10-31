@@ -391,13 +391,34 @@ export function providerArgv(plan: BootPlan): string[] {
  * pre-command-word position (telepty cli.js 0.8.0 splices it out before reading
  * `allowArgs[0]`), the telepty lifecycle is untouched, and the singleton guard's match
  * token (`--id <sid>`) is still the same token this boot will carry.
+ *
+ * Task 1215: a declared `inputPolicy` adds the FIXED pair `--input-policy user-supervised`
+ * directly after `--auto-restart` — a TELEPTY allow argument, before the command word, never
+ * part of the provider tail. Absent, the argv is byte-identical to the pre-1215 one.
  */
-export function buildExecArgv(plan: BootPlan, ref?: HandoffRef): string[] {
+export function buildExecArgv(plan: BootPlan, ref?: HandoffRef, inputPolicy?: InputPolicy): string[] {
   // D-5: a handoff rides only on a NEW conversation. With no ref the argv is byte-identical
   // to the pre-handoff one.
   const handoff = ref === undefined || plan.history.kind !== "new" ? [] : handoffArgv(plan.provider, ref);
-  return ["telepty", "allow", "--id", plan.sid, "--auto-restart", ...providerArgv(plan), ...handoff];
+  const policy = inputPolicy === "user-supervised" ? ["--input-policy", "user-supervised"] : [];
+  return ["telepty", "allow", "--id", plan.sid, "--auto-restart", ...policy, ...providerArgv(plan), ...handoff];
 }
+
+// ── the telepty input policy (task 1215) ─────────────────────────────────────
+
+/**
+ * The ONE environment name that declares a user-supervised bridge. NOT a plan field and not
+ * in PLAN_ENV: it selects no provider argv and grants nothing. Telepty refuses the client file
+ * without `--input-policy user-supervised` (and the flag without the file), so cli.ts derives
+ * the flag from this name alone — the pair cannot be split — and, before any reconcile,
+ * SIGKILL or DELETE, has the declaration admitted by Telepty's own `allow-check` (the same
+ * local check a real allow runs). Daemon trust, network liveness and any grant stay unproven
+ * here; nothing in this module authenticates.
+ */
+export const INPUT_POLICY_CLIENT_ENV = "TELEPTY_SUPERVISION_CLIENT_FILE";
+
+/** The single policy value this boot can request. There is no arbitrary-flag passthrough. */
+export type InputPolicy = "user-supervised";
 
 // ── context handoff (task 1201, SPEC §6.2) ──────────────────────────────────
 
@@ -648,11 +669,17 @@ export function parseEnvPlan(env: Readonly<Record<string, string | undefined>>, 
  * The review screen's body and `--dry-run`'s plan report, as lines. One function so the two
  * cannot describe the same plan differently.
  */
-export function describePlan(plan: BootPlan, handoff?: HandoffPreview): string[] {
+export function describePlan(plan: BootPlan, handoff?: HandoffPreview, inputPolicy?: InputPolicy): string[] {
   const cap = plan.provider;
   const lines: string[] = [];
   lines.push(`provider    ${cap.key} — ${cap.displayName}, capabilities measured at ${cap.measuredVersion} (provenance: ${cap.provenance})`);
   lines.push(`session id  ${plan.sid}   (telepty allow --id ${plan.sid}; the singleton guard matches this token)`);
+  // Task 1215: shown only when declared, so an undeclared plan's report is unchanged.
+  if (inputPolicy === "user-supervised")
+    lines.push(
+      `input       user-supervised   (telepty allow --input-policy user-supervised, because ${INPUT_POLICY_CLIENT_ENV} is set; ` +
+        "its local configuration was admitted by 'telepty allow-check', the same check a real allow runs — that does not establish daemon trust, network liveness or a grant, so this is a request, not proof of authentication)",
+    );
   lines.push(
     plan.model.kind === "explicit"
       ? `model       ${plan.model.id}   (passed as ${cap.model.flag}; availability is the provider's answer, not this wizard's)`
