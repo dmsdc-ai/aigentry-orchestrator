@@ -182,6 +182,54 @@ jobs:
           [ "$cases" = "13" ] || { echo "::error::expected 13 cases, ran $cases"; exit 1; }
           [ "$failed" = "0" ] || { echo "::error::$failed of $cases focused cases failed (logs in the artifact)"; exit 1; }
 
+      # Task 1215 boot90 — the genuine compiled boot runtime, kept ONLY when the full `tsc -p .` build and all 13 focused
+      # cases above succeeded (the implicit success() also requires every earlier step). It is the exact `dist/` this job
+      # built and tested, the checked-out `bin/`, package.json and package-lock.json, plus the job's own existing identity
+      # and result records (identity.txt, expected-bodies.sha256, bodies.txt, results.jsonl, cases-summary.txt). Never
+      # node_modules, HOME, credentials, case logs or the rest of the repository. Any missing runtime or binding file, or
+      # a bin/package file that differs from the checked-out commit, fails here instead of uploading a partial artifact.
+      - name: Stage the tested boot runtime (dist, bin, package files and binding evidence)
+        id: runtime_stage
+        if: steps.build.outcome == 'success' && steps.cases.outcome == 'success'
+        shell: bash
+        timeout-minutes: 3
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/boot-runtime-1215"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/checkout" "$STAGE/evidence"
+          [ "$(git rev-parse HEAD)" = "$EXPECTED_HEAD" ] || { echo "::error::HEAD moved from $EXPECTED_HEAD"; exit 1; }
+          for f in dist/src/orchestrator-boot/cli.js dist/src/orchestrator-boot/plan.js dist/src/orchestrator-boot/wizard.js \
+                   dist/src/orchestrator-boot/usage.js bin/orchestrator-boot.sh bin/lib/node-shim.sh \
+                   bin/init/cli.mjs package.json package-lock.json \
+                   "$EVIDENCE/identity.txt" "$EVIDENCE/expected-bodies.sha256" "$EVIDENCE/bodies.txt" \
+                   "$EVIDENCE/results.jsonl" "$EVIDENCE/cases-summary.txt"; do
+            [ -f "$f" ] && [ -s "$f" ] || { echo "::error::expected runtime/binding file missing or empty: $f"; exit 1; }
+          done
+          grep -qx 'cases=13 failed=0' "$EVIDENCE/cases-summary.txt" || { echo "::error::cases-summary is not cases=13 failed=0"; exit 1; }
+          # bin/ and the package files are tracked: they must be the checked-out commit's bytes (no edits, no untracked
+          # additions); dist/ is the build output of this job, bound by step order and the identity above.
+          git diff --quiet HEAD -- bin package.json package-lock.json || { echo "::error::bin/package files differ from HEAD"; exit 1; }
+          [ -z "$(git status --porcelain --untracked-files=all -- bin package.json package-lock.json)" ] || { echo "::error::untracked or modified files under bin/package"; exit 1; }
+          cp -Rp dist bin package.json package-lock.json "$STAGE/checkout/"
+          cp -p "$EVIDENCE/identity.txt" "$EVIDENCE/expected-bodies.sha256" "$EVIDENCE/bodies.txt" \
+                "$EVIDENCE/results.jsonl" "$EVIDENCE/cases-summary.txt" "$STAGE/evidence/"
+          # Interpreter caches are runtime state, not source: removed from the staged COPY only (the checkout is untouched).
+          find "$STAGE/checkout" \( -name __pycache__ -o -name '*.pyc' -o -name '*.pyo' \) -prune -exec rm -rf {} +
+          [ -z "$(find "$STAGE" -name node_modules -print -quit)" ] || { echo "::error::node_modules found in the staged runtime"; exit 1; }
+          echo "staged: $(find "$STAGE/checkout" -type f | wc -l | tr -d ' ') runtime files, $(find "$STAGE/evidence" -type f | wc -l | tr -d ' ') evidence files"
+
+      - name: Upload the tested boot runtime
+        id: runtime_upload
+        if: steps.build.outcome == 'success' && steps.cases.outcome == 'success' && steps.runtime_stage.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-runtime-1215-${{ matrix.os }}
+          path: ${{ runner.temp }}/boot-runtime-1215
+          if-no-files-found: error
+
       - name: Cleanup (tripwire only; guards clean their own fixtures)
         id: cleanup
         if: always()
