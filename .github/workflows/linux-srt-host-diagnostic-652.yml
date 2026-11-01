@@ -1,0 +1,213 @@
+name: Linux SRT host diagnostic (#652, unprivileged)
+
+# #652 / task 1215 — HOST OPERATION-CLASS DISCRIMINATION. Nothing else.
+#
+# The live Linux SRT confinement preflight fails on ubuntu-26.04. The SRT bubblewrap chain refuses
+# inside its seccomp helper with
+#   apply-seccomp: write /proc/self/setgroups (nested userns is capability-restricted; …): EPERM
+# SRT 0.0.76's own sources document that the helper creates a nested user namespace and writes
+# /proc/self/setgroups and uid_map (dist/sandbox/linux-sandbox-utils.js). This job measures, on two
+# disposable hosted images and with NO privilege, whether the HOST permits the corresponding
+# operation classes:
+#   P1  a user namespace created by bubblewrap (single userns)
+#   P2  a nested user namespace with a setgroups/uid_map mapping, created under bubblewrap
+#   P3  a direct unprivileged user namespace with that mapping (no bubblewrap)
+#
+# WHAT THIS IS NOT:
+#   - It does not reproduce the SRT chain: no SRT, no apply-seccomp, no seccomp filter, no
+#     --unshare-net / --unshare-pid / --proc.
+#   - It runs with each image's DEFAULT host policy. ci.yml's Full suite lifts
+#     kernel.apparmor_restrict_unprivileged_userns before its live test; this job does NOT (no
+#     sudo, no sysctl write), so it does not measure that configuration.
+#   - A green job means "diagnostic complete": every fact was read and every probe reached a
+#     definite outcome. A refused probe is a MEASURED REFUSAL, not a failure of this job. Green is
+#     never SRT success, full-CI success, or a passing live test.
+#
+# NEVER: sudo, sysctl writes, apt/npm installs, AppArmor changes, added capabilities, SRT
+# execution, secrets. ci.yml and boot-admission-1215.yml are untouched.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/linux-srt-host-diagnostic-652.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-srt-host-diagnostic-652-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-diagnostic:
+    name: Host diagnostic (${{ matrix.image }})
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # pull_request: the exact PR head. workflow_dispatch: the commit of the dispatched ref.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Read-only host facts
+        id: facts
+        shell: bash
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          MATRIX_IMAGE: ${{ matrix.image }}
+        run: |
+          # Explicit checks only (GitHub's default bash -e is switched off so one absent fact cannot hide the rest).
+          set +e
+          set -uo pipefail
+          EV="$RUNNER_TEMP/linux-srt-host-diagnostic-652"
+          mkdir -p "$EV/probes"
+          echo "EV=$EV" >> "$GITHUB_ENV"
+          missing=0
+          fact() { printf '%s=%s\n' "$1" "$2" >> "$EV/facts.txt"; }
+          readproc() { # readproc <name> <path>: value, or 'absent' / 'unreadable', never a write
+            if [ ! -e "$2" ]; then fact "$1" absent
+            elif [ -r "$2" ]; then fact "$1" "$(head -c 256 "$2" | tr -d '\n')"
+            else fact "$1" unreadable; fi
+          }
+          : > "$EV/facts.txt"
+          fact expected_head "$EXPECTED_HEAD"
+          fact checked_out_head "$(git rev-parse HEAD)"
+          fact matrix_image "$MATRIX_IMAGE"
+          fact image_os "${ImageOS:-unset}"
+          fact image_version "${ImageVersion:-unset}"
+          fact os_release "$( (. /etc/os-release 2>/dev/null && printf '%s %s' "${NAME:-?}" "${VERSION_ID:-?}") || echo unreadable)"
+          fact kernel "$(uname -srvm)"
+          fact uid "$(id -u)"
+          fact shell_apparmor_label "$(cat /proc/self/attr/current 2>/dev/null || echo unreadable)"
+          fact shell_status_caps "$(grep -E '^(CapEff|CapPrm|NoNewPrivs|Seccomp):' /proc/self/status | tr '\n' ' ' || echo unreadable)"
+          readproc kernel.apparmor_restrict_unprivileged_userns /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          readproc kernel.apparmor_restrict_unprivileged_unconfined /proc/sys/kernel/apparmor_restrict_unprivileged_unconfined
+          readproc kernel.unprivileged_userns_apparmor_policy /proc/sys/kernel/unprivileged_userns_apparmor_policy
+          readproc kernel.unprivileged_userns_clone /proc/sys/kernel/unprivileged_userns_clone
+          readproc user.max_user_namespaces /proc/sys/user/max_user_namespaces
+          for tool in bwrap unshare timeout dpkg-query python3 pgrep; do
+            p="$(command -v "$tool" || true)"
+            if [ -n "$p" ]; then fact "tool.$tool" "$p"; else fact "tool.$tool" unavailable; missing=1; fi
+          done
+          fact bwrap_version "$(bwrap --version 2>&1 | head -1 || echo unavailable)"
+          fact unshare_version "$(unshare --version 2>&1 | head -1 || echo unavailable)"
+          fact packages "$(dpkg-query -W -f='${Package}=${Version} ' bubblewrap apparmor util-linux 2>/dev/null || echo unavailable)"
+          # AppArmor profile NAMES only, never contents.
+          if [ -d /etc/apparmor.d ]; then
+            fact apparmor_d_relevant_names "$(ls -1 /etc/apparmor.d 2>/dev/null | grep -iE 'bwrap|bubblewrap|userns|unpriv|unshare' | tr '\n' ' ')"
+          else fact apparmor_d_relevant_names absent; fi
+          if [ -r /sys/kernel/security/apparmor/profiles ]; then
+            fact loaded_profiles_relevant "$(grep -iE 'bwrap|bubblewrap|userns|unpriv|unshare' /sys/kernel/security/apparmor/profiles | head -20 | tr '\n' ';')"
+          else fact loaded_profiles_relevant unreadable-unprivileged; fi
+          echo "TOOLS_MISSING=$missing" >> "$GITHUB_ENV"
+          cat "$EV/facts.txt"
+          [ "$(git rev-parse HEAD)" = "$EXPECTED_HEAD" ] || { echo "::error::checked-out HEAD is not $EXPECTED_HEAD"; exit 1; }
+          [ "$missing" = "0" ] || { echo "::error::a required tool is unavailable; probes needing it are recorded as not-run and the diagnostic is INCOMPLETE"; exit 1; }
+
+      - name: Three unprivileged probes (each <= 30 s)
+        id: probes
+        if: always() && env.EV != ''
+        shell: bash
+        run: |
+          # A refusal is a measured result, so it must not stop the step; -e is off.
+          set +e
+          set -u
+          RESULTS="$EV/probes.jsonl"
+          : > "$RESULTS"
+          stop=""
+          incomplete=0
+          run_probe() { # run_probe <id> <required tools, space-separated> <argv...>
+            local id="$1" need="$2" out err rc started finished state t absent=""
+            shift 2
+            out="$EV/probes/$id.stdout"
+            err="$EV/probes/$id.stderr"
+            started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            for t in $need timeout python3; do command -v "$t" >/dev/null 2>&1 || absent="$absent $t"; done
+            if [ -n "$stop" ]; then
+              state="not-run: $stop"
+              rc=""
+              : > "$out"
+              : > "$err"
+              incomplete=1
+            elif [ -n "$absent" ]; then
+              # Never classified as a refusal: a missing tool is not a host decision.
+              state="not-run: tool unavailable:$absent"
+              rc=""
+              : > "$out"
+              : > "$err"
+              incomplete=1
+            else
+              timeout -s KILL 30 "$@" >"$out.raw" 2>"$err.raw"
+              rc=$?
+              # Bounded logs: at most 64 KiB of each stream is kept; the raw copies are removed.
+              head -c 65536 "$out.raw" > "$out"
+              head -c 65536 "$err.raw" > "$err"
+              rm -f "$out.raw" "$err.raw"
+              if [ "$rc" = "0" ]; then state="permitted"
+              elif [ "$rc" = "124" ] || [ "$rc" = "137" ]; then
+                state="timeout-or-killed (rc=$rc)"
+                stop="prior probe $id terminated uncertainly"
+                incomplete=1
+              elif [ "$rc" -ge 128 ]; then
+                state="signal (rc=$rc)"
+                stop="prior probe $id ended on a signal"
+                incomplete=1
+              else state="refused (rc=$rc)"; fi
+            fi
+            finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            python3 -c 'import json,sys;a=sys.argv;print(json.dumps({"id":a[1],"state":a[2],"exit_status":(int(a[3]) if a[3] else None),"signal":(int(a[3])-128 if a[3] and int(a[3])>128 else None),"timeout_s":30,"timeout_wrapper":"timeout -s KILL 30","started":a[4],"finished":a[5],"stdout":open(a[6],errors="replace").read(),"stderr":open(a[7],errors="replace").read(),"argv":a[8:]}))' \
+              "$id" "$state" "$rc" "$started" "$finished" "$out" "$err" "$@" >> "$RESULTS" || { echo "::error::could not record $id"; incomplete=1; }
+            echo "$id: $state"
+            sed 's/^/  stderr| /' "$err"
+          }
+          run_probe P1-bwrap-single-userns "bwrap" bwrap --unshare-user --ro-bind / / -- /bin/true
+          run_probe P2-bwrap-nested-userns-setgroups "bwrap unshare" bwrap --unshare-user --ro-bind / / -- unshare --user --map-root-user /bin/true
+          run_probe P3-direct-userns-setgroups "unshare" unshare --user --map-root-user /bin/true
+          echo "INCOMPLETE=$incomplete" >> "$GITHUB_ENV"
+          echo "Measured refusals are evidence, not failures. P1-P3 discriminate host operation classes only; they do not reproduce the SRT chain."
+          [ "$incomplete" = "0" ] || { echo "::error::diagnostic INCOMPLETE (a probe did not reach a definite outcome)"; exit 1; }
+
+      - name: Truthful cleanup check (report-only; nothing is killed or changed)
+        id: cleanup
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          left="$(pgrep -u "$(id -u)" -a -f '(^| |/)(bwrap|unshare) ' 2>/dev/null || true)"
+          if [ -n "${EV:-}" ] && [ -d "$EV" ]; then printf '%s\n' "${left:-none}" > "$EV/leftover-processes.txt"; fi
+          if [ -n "$left" ]; then echo "::error::probe processes are still present:"; echo "$left"; exit 1; fi
+          echo "no probe process left"
+
+      - name: Upload evidence
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-srt-host-diagnostic-652-${{ matrix.image }}
+          path: ${{ runner.temp }}/linux-srt-host-diagnostic-652
+          if-no-files-found: error
+
+      - name: Status (diagnostic-complete is NOT SRT, full-CI or test success)
+        if: always()
+        shell: bash
+        env:
+          FACTS: ${{ steps.facts.outcome }}
+          PROBES: ${{ steps.probes.outcome }}
+          CLEANUP: ${{ steps.cleanup.outcome }}
+          UPLOAD: ${{ steps.upload.outcome }}
+        run: |
+          set -uo pipefail
+          echo "facts=$FACTS probes=$PROBES cleanup=$CLEANUP upload=$UPLOAD"
+          if [ "$FACTS" = success ] && [ "$PROBES" = success ] && [ "$CLEANUP" = success ] && [ "$UPLOAD" = success ]; then
+            echo "diagnostic-complete: every fact read, every probe reached a definite outcome (permitted or refused)."
+            echo "This is NOT SRT success, NOT full-CI success and NOT a passing live confinement test."
+          else
+            echo "::error::diagnostic incomplete"
+            exit 1
+          fi

@@ -153,6 +153,8 @@ import { USAGE } from "./usage.js";
 import {
   type BootPlan,
   type HandoffPreview,
+  type InputPolicy,
+  INPUT_POLICY_CLIENT_ENV,
   PLAN_ENV,
   buildExecArgv,
   describeEffects,
@@ -390,6 +392,112 @@ if (MODE !== "help" && !PLAN_REQUESTED && PLAN_FIELD_SET.length > 0) {
   process.exit(2);
 }
 const WIZARD_TTY = process.stdin.isTTY === true && process.stderr.isTTY === true;
+
+// ── task 1215: the declared telepty input policy, resolved ONCE, before any effect ──
+// Telepty refuses TELEPTY_SUPERVISION_CLIENT_FILE without `--input-policy user-supervised`,
+// and it refuses AFTER exec — by then the guard below has already SIGKILLed the old bridge
+// and nothing replaces it. So the flag is derived from the variable alone (the pair cannot be
+// split), and the declaration is ADMITTED HERE: before the wizard, the capture validation,
+// the registry read, the DELETE and the SIGKILL. Unset or empty = no policy, no check, and the
+// argv is byte-identical to before. Only the modes that resolve an exec argv take part (boot,
+// --dry-run, __probe); --help, --wizard-plan and the unknown-flag arm never check.
+//
+// boot42: THE ADMISSION IS TELEPTY'S OWN. This file keeps only the argv-safety checks below;
+// every client-file, key, nested-session and conflict rule is decided by
+// `telepty allow-check --input-policy user-supervised` — the same local admission a real
+// `telepty allow` runs — spawned from PATH, i.e. the binary the shell will exec, NOT the
+// TELEPTY list seam. No second client validator lives here. A pass means "the local
+// configuration was admitted"; it is NOT proof of daemon trust, network liveness or a grant,
+// and the file/binary/env can still change between the last check and the exec.
+function inputPolicyRefusal(file: string): string | null {
+  if (hasControlChar(file)) return "contains a control character";
+  if (!path.isAbsolute(file)) return "is not an absolute path";
+  return null;
+}
+
+const ALLOW_CHECK_ARGV = ["allow-check", "--input-policy", "user-supervised"] as const;
+const ALLOW_CHECK_SCHEMA = "telepty.allow-admission/v1";
+const ALLOW_CHECK_TIMEOUT_MS = 10000;
+const ALLOW_CHECK_RELAY_BYTES = 2048;
+
+/** The checker's own words, flattened and bounded: no control character reaches the terminal. */
+function allowCheckRelay(s: string): string {
+  const flat = s.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim();
+  const bytes = Buffer.from(flat, "utf8");
+  return bytes.length <= ALLOW_CHECK_RELAY_BYTES ? flat : `${bytes.subarray(0, ALLOW_CHECK_RELAY_BYTES).toString("utf8")}…`;
+}
+
+/**
+ * ONE bounded run of the shared admission. Success is exactly: no spawn error, exit 0, no
+ * signal, and stdout is ONE line holding one JSON object with schema telepty.allow-admission/v1,
+ * ok:true, input_policy "user-supervised" and supervision_client "loaded". Anything else is a
+ * refusal — including an older telepty, which answers an unknown subcommand with help + exit 0.
+ */
+function allowCheckRefusal(): { readonly reason: string; readonly detail: string } | null {
+  const r = spawnSync("telepty", [...ALLOW_CHECK_ARGV], {
+    env,
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: ALLOW_CHECK_TIMEOUT_MS,
+    maxBuffer: 65536,
+    encoding: "utf8",
+  });
+  const stdout = r.stdout ?? "";
+  const detail = allowCheckRelay(`${stdout} ${r.stderr ?? ""}`);
+  const code = (r.error as NodeJS.ErrnoException | undefined)?.code;
+  if (code === "ENOENT") return { reason: "could not run: no 'telepty' on PATH", detail };
+  if (code === "ETIMEDOUT") return { reason: `did not answer within ${ALLOW_CHECK_TIMEOUT_MS} ms`, detail };
+  if (r.error !== undefined) return { reason: `could not run (${code ?? "spawn error"})`, detail };
+  if (r.signal !== null) return { reason: `was terminated by ${r.signal}`, detail };
+  if (r.status !== 0) return { reason: `refused (exit ${String(r.status)})`, detail };
+  const line = stdout.trim();
+  if (line === "" || line.includes("\n"))
+    return { reason: "did not print exactly one admission line (a telepty without allow-check prints its help and exits 0)", detail };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return { reason: "printed a line that is not JSON", detail };
+  }
+  const o: Record<string, unknown> = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  if (o.schema !== ALLOW_CHECK_SCHEMA || o.ok !== true || o.input_policy !== "user-supervised" || o.supervision_client !== "loaded")
+    return {
+      reason: `did not answer a ${ALLOW_CHECK_SCHEMA} success (ok true, input_policy user-supervised, supervision_client loaded)`,
+      detail,
+    };
+  return null;
+}
+
+/** Exit 2 with an empty stdout unless the shared admission passes. `when` names the call site. */
+function refuseUnlessAdmitted(when: string): void {
+  const refusal = allowCheckRefusal();
+  if (refusal === null) return;
+  writeOut(
+    2,
+    `orchestrator-boot.sh: 'telepty ${ALLOW_CHECK_ARGV.join(" ")}' ${refusal.reason} ${when} — refusing to boot. ` +
+      "Nothing was listed, reconciled, signalled, deleted or exec'd.\n",
+  );
+  if (refusal.detail !== "") writeOut(2, `orchestrator-boot.sh: telepty said: ${refusal.detail}\n`);
+  process.exit(2);
+}
+
+const INPUT_POLICY: InputPolicy | undefined = ((): InputPolicy | undefined => {
+  if (MODE !== "boot" && MODE !== "dry-run" && MODE !== "probe") return undefined;
+  const file = env[INPUT_POLICY_CLIENT_ENV];
+  if (file === undefined || file === "") return undefined;
+  const why = inputPolicyRefusal(file);
+  if (why !== null) {
+    writeOut(
+      2,
+      `orchestrator-boot.sh: ${INPUT_POLICY_CLIENT_ENV} ${why} — refusing to boot. Nothing was listed, ` +
+        "reconciled, signalled, deleted or exec'd. Unset it for an unsupervised boot, or name the client " +
+        "file by absolute path.\n",
+    );
+    process.exit(2);
+  }
+  refuseUnlessAdmitted("before any effect");
+  return "user-supervised";
+})();
 
 // ── the ps snapshot ─────────────────────────────────────────────────────────
 type Row = { pid: string; ppid: string; cmd: string[] };
@@ -887,7 +995,7 @@ type Resolution = {
 };
 
 function resolutionOf(plan: BootPlan, planSource: PlanSource): Resolution {
-  return { argv: buildExecArgv(plan), cli: plan.provider.key, sid: plan.sid, plan, planSource };
+  return { argv: buildExecArgv(plan, undefined, INPUT_POLICY), cli: plan.provider.key, sid: plan.sid, plan, planSource };
 }
 
 /**
@@ -951,7 +1059,7 @@ async function resolveForBoot(): Promise<Resolution> {
     reviewedHandoff = handoffStep(engine, plan, randomUUID(), false);
     return previewOf(reviewedHandoff);
   };
-  const outcome = await runWizard({ out: process.stderr, input: process.stdin, env, cwd: process.cwd(), handoffPreview });
+  const outcome = await runWizard({ out: process.stderr, input: process.stdin, env, cwd: process.cwd(), handoffPreview, ...(INPUT_POLICY !== undefined ? { inputPolicy: INPUT_POLICY } : {}) });
   if (outcome.kind === "cancelled") {
     writeOut(2, `[orchestrator-boot] ${outcome.reason} — nothing was listed, deleted, signalled or exec'd.\n`);
     // 1, not 2: this is the operator's own decision, not a refusal of bad input. Either way
@@ -1035,6 +1143,10 @@ async function main(): Promise<never> {
   // a DELETE or a SIGKILL aimed at the env's id would hit a session this boot is not about to
   // become. In an explicit plan the two are the same value by construction, because
   // ORCHESTRATOR_SID *is* the plan's sid field.
+  // Task 1215 (boot42): the wizard waited on a human, so the local configuration may have
+  // changed since the pre-effect admission. Re-run the same check after the confirmation and
+  // immediately before the first effect.
+  if (INPUT_POLICY !== undefined && resolved.planSource === "wizard") refuseUnlessAdmitted("on the post-confirmation recheck");
   orchestratorRegistryReconcile(resolved.sid);
   orchestratorSingletonGuard(resolved.sid);
   // Task 1201 — the context handoff, after the guard. One boot id is shared by the handoff
@@ -1045,7 +1157,7 @@ async function main(): Promise<never> {
   // Same session = same cli and session id; its last activity may legitimately have moved.
   if (reviewedHandoff !== undefined && handoffSourceId(reviewedHandoff.ref) !== handoffSourceId(handoff.ref))
     log(`handoff source changed since review: ${handoffSourceKey(handoff.ref)}`);
-  const argv = buildExecArgv(resolved.plan, handoff.ref ?? undefined);
+  const argv = buildExecArgv(resolved.plan, handoff.ref ?? undefined, INPUT_POLICY);
   // #1162 — DISPLAY-ONLY boot record (boot-record.ts), after every guard and before the argv.
   // Best effort and never authority: it cannot exit, never writes fd 1, makes no host or network
   // call, and changes neither the argv nor the exit code. Its one stderr line is fixed vocabulary.
@@ -1100,7 +1212,7 @@ async function dryRun(): Promise<never> {
   // leaves stdout empty instead of describing effects it will never reach (#1181).
   await validateCapture(resolved.cli);
   log(`plan source: ${PLAN_ENV.enable}=1 explicit plan (validated; nothing below was acted on)`);
-  for (const line of describePlan(resolved.plan)) log(`plan  ${line}`);
+  for (const line of describePlan(resolved.plan, undefined, INPUT_POLICY)) log(`plan  ${line}`);
   for (const line of describeEffects(resolved.plan)) log(`would ${line}`);
   if (WIZARD_TTY)
     log(
@@ -1116,7 +1228,7 @@ async function dryRun(): Promise<never> {
     log(oneLine(`handoff source: ${handoff.ref.source.cli} session ${handoff.ref.source.sessionId} · last activity ${handoff.ref.source.lastActivity} · ${handoff.ref.source.path}`));
   for (const line of handoff.lines) log(line);
   if (handoff.markdown !== null) for (const line of handoff.markdown.replace(/\n$/, "").split("\n")) writeOut(1, `[would-handoff] ${line}\n`);
-  const argv = buildExecArgv(resolved.plan, handoff.ref ?? undefined);
+  const argv = buildExecArgv(resolved.plan, handoff.ref ?? undefined, INPUT_POLICY);
   log(`would exec ${argv.join(" ")} (one element per line below)`);
   for (const a of argv) writeOut(1, `[would-exec] ${a}\n`);
   process.exit(0);

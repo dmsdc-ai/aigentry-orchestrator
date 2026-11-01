@@ -87,6 +87,7 @@ t_setup() {
   # Tests that exercise the worker guard (T28/T34) set this marker inline per
   # invocation, so clearing the inherited value here is safe and deterministic.
   unset AIGENTRY_WORKER_SESSION
+  unset TELEPTY_SUPERVISION_CLIENT_FILE
   T_TMP="$setup_tmp"
   export T_TMP
   # A reconciler tick under test runs wh_prune_orphans, whose ONLY ownership gate

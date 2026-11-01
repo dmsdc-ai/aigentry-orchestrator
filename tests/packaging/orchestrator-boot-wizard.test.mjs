@@ -1549,6 +1549,152 @@ test('the no-exec and refusal paths never reach an exec, whatever the environmen
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// TASK 1215 — a declared TELEPTY_SUPERVISION_CLIENT_FILE, through the shared planner.
+// The flag is telepty's, not the provider's: it must sit right after `--auto-restart`. An
+// undeclared plan must be described and composed exactly as before. NOT measured here:
+// telepty's own admission rules — the client fixture is `{}`, the PATH telepty is a recorder
+// answering `allow-check`, and no real telepty runs.
+test('task 1215: a declared client file adds the fixed telepty input-policy pair, and nothing else', async t => {
+  const plan = await import(pathToFileURL(path.join(DIST, 'plan.js')).href);
+  const SUPERVISED = ['--input-policy', 'user-supervised'];
+  const clientFile = fx => {
+    const file = path.join(fx.dir, 'supervision-client.json');
+    fs.writeFileSync(file, '{}\n', { mode: 0o600 });
+    fs.chmodSync(file, 0o600);
+    return file;
+  };
+
+  await t.test('the shared planner: exact position when declared, unchanged when not', () => {
+    const p = plan.parseEnvPlan({
+      ORCHESTRATOR_CLI: 'codex', ORCHESTRATOR_SID: 'orchestrator',
+      AIGENTRY_BOOT_PERMISSION: 'approval=on-request;sandbox=read-only', AIGENTRY_BOOT_HISTORY: 'new',
+    }, '/tmp');
+    assert.equal(p.ok, true, JSON.stringify(p.errors));
+    const head = ['telepty', 'allow', '--id', 'orchestrator', '--auto-restart'];
+    const tail = ['codex', '--ask-for-approval', 'on-request', '--sandbox', 'read-only'];
+    assert.deepEqual(plan.buildExecArgv(p.plan), [...head, ...tail]);
+    assert.deepEqual(plan.buildExecArgv(p.plan, undefined, undefined), [...head, ...tail]);
+    assert.deepEqual(plan.buildExecArgv(p.plan, undefined, 'user-supervised'), [...head, ...SUPERVISED, ...tail]);
+    // The plan itself carries no policy, so the provider half cannot have picked it up.
+    assert.deepEqual(plan.providerArgv(p.plan), tail);
+    // Undeclared: the description is the pre-1215 one, line for line.
+    assert.deepEqual(plan.describePlan(p.plan, undefined, undefined), plan.describePlan(p.plan));
+    assert.ok(!plan.describePlan(p.plan).some(l => l.startsWith('input ')));
+    // Declared: one added line, which says it is a request and not authentication.
+    const declared = plan.describePlan(p.plan, undefined, 'user-supervised');
+    assert.equal(declared.length, plan.describePlan(p.plan).length + 1);
+    const line = declared.find(l => l.startsWith('input '));
+    assert.ok(line && line.includes('--input-policy user-supervised') && line.includes('TELEPTY_SUPERVISION_CLIENT_FILE'), String(line));
+    assert.match(line, /not proof of authentication/);
+  });
+
+  // boot42: a declared boot runs the PATH telepty's `allow-check` before it draws and again
+  // after YES. This recorder IS that PATH telepty: it answers allow-check from `answers` (one per
+  // call, the last repeating) and records every other invocation as the exec. No real telepty
+  // is reachable from this fixture's PATH.
+  const ADMITTED = '{"schema":"telepty.allow-admission/v1","ok":true,"telepty_version":"0.10.0",' +
+    '"input_policy":"user-supervised","supervision_client":"loaded","daemon_origin":"http://127.0.0.1:3848"}';
+  const REFUSED = '{"schema":"telepty.allow-admission/v1","ok":false,"code":"FIXTURE_REFUSED"}';
+  const CHECK_ARGV = ['allow-check', '--input-policy', 'user-supervised'];
+  const supervisedTelepty = (fx, answers) => {
+    const count = path.join(fx.dir, 'check-count');
+    fs.writeFileSync(path.join(fx.logs, 'check.jsonl'), '');
+    const lines = [
+      `#!${NODE}`,
+      "const fs=require('node:fs');",
+      'const argv=process.argv.slice(2);',
+      "if(argv[0]==='allow-check'){",
+      `  fs.appendFileSync(${JSON.stringify(path.join(fx.logs, 'check.jsonl'))},JSON.stringify([argv,process.env.TELEPTY_SUPERVISION_CLIENT_FILE??null])+'\\n');`,
+      `  let n=0;try{n=Number(fs.readFileSync(${JSON.stringify(count)},'utf8'))}catch{}`,
+      `  fs.writeFileSync(${JSON.stringify(count)},String(n+1));`,
+      `  const answers=${JSON.stringify(answers)};`,
+      `  const ok=answers[Math.min(n,answers.length-1)]==='ok';`,
+      `  process.stdout.write((ok?${JSON.stringify(ADMITTED)}:${JSON.stringify(REFUSED)})+'\\n');`,
+      '  process.exit(ok?0:1);',
+      '}',
+      `fs.appendFileSync(${JSON.stringify(path.join(fx.logs, 'exec.jsonl'))},JSON.stringify(argv)+'\\n');`,
+      `fs.appendFileSync(${JSON.stringify(path.join(fx.logs, 'exec-env.jsonl'))},JSON.stringify(process.env.TELEPTY_SUPERVISION_CLIENT_FILE ?? null)+'\\n');`,
+    ];
+    fs.writeFileSync(path.join(fx.bin, 'telepty'), lines.join('\n') + '\n', { mode: 0o700 });
+  };
+
+  await t.test('the wizard reviews and boots the supervised argv after two admissions, and the client path reaches the bridge unchanged', () => {
+    const fx = fixture();
+    const file = clientFile(fx);
+    supervisedTelepty(fx, ['ok']);
+    const r = pty(fx, {
+      cmd: bootCmd(),
+      env: { ORCHESTRATOR_SID: 'orchestrator', TELEPTY_SUPERVISION_CLIENT_FILE: file },
+      steps: [...CLAUDE_TO_REVIEW, { expect: 'confirm [yes/NO]', send: 'YES\n' }],
+    });
+    assert.equal(r.rc, 0, `the boot exited ${r.rc}\n${r.terminal}`);
+    assert.deepEqual(argvLines(r.stdout), []);
+    // Once before the wizard drew, once after YES — the same argv and the same client path.
+    assert.deepEqual(fx.calls('check'), [[CHECK_ARGV, file], [CHECK_ARGV, file]]);
+    assert.deepEqual(fx.calls('exec'),
+      [['allow', '--id', 'orchestrator', '--auto-restart', ...SUPERVISED, 'claude', '--permission-mode', 'manual']]);
+    assert.deepEqual(fx.calls('exec-env'), [file], 'the client path did not reach the bridge exactly as given');
+    for (const el of ['--auto-restart', ...SUPERVISED, 'claude']) {
+      assert.ok(r.terminal.includes(`| ${el}`), `the review screen did not list '${el}': ${r.terminal}`);
+    }
+    assert.match(r.terminal, /input\s+user-supervised/);
+    fx.assertNoProviderRan('supervised wizard boot');
+  });
+
+  await t.test('an unusable client path refuses before the wizard draws, with nothing read or acted on', () => {
+    const fx = fixture();
+    fx.psTable(['7777 1 node /usr/local/bin/telepty allow --id orchestrator --auto-restart claude']);
+    fx.listing([{ id: 'orchestrator', healthStatus: 'STALE', active_clients: 0 }]);
+    const r = pty(fx, {
+      cmd: bootCmd(),
+      env: { ORCHESTRATOR_SID: 'orchestrator', TELEPTY_SUPERVISION_CLIENT_FILE: 'relative/client.json' },
+      steps: [],
+      timeout: 20,
+    });
+    assertDidNotBoot(r, 'relative client path', { expectExit: 2 });
+    assert.ok(!r.terminal.includes('Orchestrator boot wizard'), 'the wizard was drawn before the refusal');
+    assert.match(r.terminal, /TELEPTY_SUPERVISION_CLIENT_FILE is not an absolute path/);
+    fx.assertInert('relative client path', { reads: true });
+  });
+
+  await t.test('a refused admission stops the boot before the wizard draws, with nothing read or acted on', () => {
+    const fx = fixture();
+    supervisedTelepty(fx, ['refuse']);
+    fx.psTable(['7777 1 node /usr/local/bin/telepty allow --id orchestrator --auto-restart claude']);
+    fx.listing([{ id: 'orchestrator', healthStatus: 'STALE', active_clients: 0 }]);
+    const r = pty(fx, {
+      cmd: bootCmd(),
+      env: { ORCHESTRATOR_SID: 'orchestrator', TELEPTY_SUPERVISION_CLIENT_FILE: clientFile(fx) },
+      steps: [],
+      timeout: 20,
+    });
+    assertDidNotBoot(r, 'refused admission', { expectExit: 2 });
+    assert.ok(!r.terminal.includes('Orchestrator boot wizard'), 'the wizard was drawn before the refusal');
+    assert.match(r.terminal, /allow-check --input-policy user-supervised' refused \(exit 1\)/);
+    assert.equal(fx.calls('check').length, 1);
+    fx.assertInert('refused admission', { reads: true });
+  });
+
+  await t.test('a post-confirmation recheck refusal leaves the reconcile and the guard unrun', () => {
+    const fx = fixture();
+    supervisedTelepty(fx, ['ok', 'refuse']);
+    fx.psTable(['7777 1 node /usr/local/bin/telepty allow --id orchestrator --auto-restart claude']);
+    fx.listing([{ id: 'orchestrator', healthStatus: 'STALE', active_clients: 0 }]);
+    const r = pty(fx, {
+      cmd: bootCmd(),
+      env: { ORCHESTRATOR_SID: 'orchestrator', TELEPTY_SUPERVISION_CLIENT_FILE: clientFile(fx) },
+      steps: [...CLAUDE_TO_REVIEW, { expect: 'confirm [yes/NO]', send: 'YES\n' }],
+    });
+    assertDidNotBoot(r, 'recheck refusal', { expectExit: 2 });
+    assert.match(r.terminal, /7\. Review/, 'the wizard never reached the review');
+    assert.match(r.terminal, /on the post-confirmation recheck/);
+    assert.equal(fx.calls('check').length, 2);
+    // No registry read, no process scan, no DELETE, no SIGKILL, no credential, no exec.
+    fx.assertInert('recheck refusal', { reads: true });
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // SHIPPING METADATA (bt1181jm-v4). SOURCE-LEVEL ONLY — read this boundary first.
 //
 // These cases read the package's OWN declarations out of the repo: `package.json`

@@ -161,6 +161,23 @@ Env:
                             off skips it and leaves the argv unchanged; any other value
                             warns and is treated as off. Not a plan field. --dry-run shows
                             the handoff under [would-handoff] and writes nothing.
+  TELEPTY_SUPERVISION_CLIENT_FILE
+                            optional: when non-empty, the bridge is booted with the fixed
+                            telepty allow flag '--input-policy user-supervised' (right after
+                            --auto-restart, never in the provider's arguments); unset or
+                            empty leaves the argv exactly as before and runs no check. Not
+                            a plan field and not printed by --wizard-plan. When it is set,
+                            the boot, --dry-run and __probe refuse with exit 2 a relative
+                            path or one with a control character, and otherwise run
+                            'telepty allow-check --input-policy user-supervised' — the
+                            telepty on PATH that would be exec'd, with this environment,
+                            10 s bound — BEFORE the wizard, any registry read, DELETE or
+                            SIGKILL; a wizard boot runs it again after YES. Anything but a
+                            one-line telepty.allow-admission/v1 success (ok, user-supervised,
+                            supervision_client loaded) exits 2 with telepty's message,
+                            including an older telepty without allow-check. That admits the
+                            LOCAL configuration only: it does not prove daemon trust, network
+                            liveness or a grant. --dry-run and the wizard review show the flag.
   TELEPTY                   telepty binary for 'list --json' (default: telepty). The
                             bridge itself is exec'd from PATH, deliberately unpinned.
   CURL                      http client for the registry DELETE (default: curl).

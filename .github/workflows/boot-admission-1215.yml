@@ -1,0 +1,279 @@
+name: Boot admission 1215 (focused)
+
+# Task 1215 — FOCUSED CALLER ACCEPTANCE for the orchestrator boot change, on the exact PR head.
+#
+# Why this exists: in ci.yml the Full suite job runs `npm test` first and the dispatch guard
+# suite (tests/dispatch/run-all.sh) only after it. An unrelated failure in `npm test` (the live
+# Linux SRT confinement preflight, which needs privileges that are deliberately NOT granted)
+# therefore stops the shell guards that measure this change from running at all. This workflow
+# runs only those guards, plus the wizard suite, after the same locked install and the same
+# full `tsc -p .` build. ci.yml is unchanged, and its failure stays visible there.
+#
+# WHAT A GREEN RUN HERE IS: the wizard suite and T131/T40/T132/T134/T135/T137 passed on this
+# OS. The six shell guards pass both with TELEPTY_SUPERVISION_CLIENT_FILE unset and with it set
+# to the literal /nonexistent, which exercises tests/dispatch/lib.sh t_setup isolation against
+# the host-variable leak (admission45 B1).
+#
+# WHAT IT IS NOT: full-project green, a release gate, or proof of live Mac/Linux delivery. No
+# real telepty, daemon, root bridge or user host is involved. Every guard uses its own
+# disposable fixtures and recorders, and a tripwire `telepty` sits on PATH as in run-all.sh.
+# No security setting is changed: no sysctl, no AppArmor or seccomp change, no added
+# capability, no confinement bypass. Nothing is tagged, published or installed for a user.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: boot-admission-1215-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  boot-admission:
+    name: Boot admission (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The exact PR head, not the synthetic merge commit pull_request checks out by default.
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.0'
+          cache: npm
+
+      - name: Record identity and toolchain; pin the seven boot bodies
+        id: identity
+        shell: bash
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/boot-admission-1215"
+          mkdir -p "$EVIDENCE/logs"
+          echo "EVIDENCE=$EVIDENCE" >> "$GITHUB_ENV"
+          head="$(git rev-parse HEAD)"
+          {
+            echo "expected_head=$EXPECTED_HEAD"
+            echo "checked_out_head=$head"
+            echo "uname=$(uname -a)"
+            echo "node=$(node --version)"
+            echo "npm=$(npm --version)"
+            echo "bash=$BASH_VERSION"
+            echo "python3=$(python3 --version 2>&1 || echo absent)"
+            echo "jq=$(jq --version 2>&1 || echo absent-before-install-step)"
+            echo "timeout=$(command -v timeout || command -v gtimeout || echo none)"
+            echo "perl=$(command -v perl || echo none)"
+          } > "$EVIDENCE/identity.txt"
+          cat "$EVIDENCE/identity.txt"
+          [ "$head" = "$EXPECTED_HEAD" ] || { echo "::error::checked-out HEAD $head is not the PR head $EXPECTED_HEAD"; exit 1; }
+          [ "$(node --version)" = "v20.20.0" ] || { echo "::error::node is $(node --version), expected v20.20.0"; exit 1; }
+          # The boot52/boot47 candidate bodies this acceptance is about. A run on any other bytes
+          # is not evidence for them, so a mismatch fails here rather than measuring something else.
+          cat > "$EVIDENCE/expected-bodies.sha256" <<'SUMS'
+          fb5380acf7ad770678dfcb53211ca6d829b64ab73c2dafdb402f83f5cda7d887  src/orchestrator-boot/plan.ts
+          9efde087c71f0cb1fff57a9829be836feade6607e3453fbbbd86e20d8ae4c457  src/orchestrator-boot/cli.ts
+          863d88c0cccb88276daa6f4d99441c72bb8a63bca31dbf83b9644af46ea57118  src/orchestrator-boot/wizard.ts
+          b23a80e12123c193e3cbb0793290de01ac081b9082a0f2223d947bba39111687  src/orchestrator-boot/usage.ts
+          328fea6a5774f13ff06df0f81b67a78267dc6a85bf6d779c3391d8507c69131e  tests/dispatch/T134_orchestrator_boot_noexec.sh
+          0a9957e6b536b748d2fabd07bc13e97aa803f747ce9d4d7bc737a6c4f22a1d3c  tests/dispatch/lib.sh
+          5b644daa79dfd30aaba89999909a221af10b66dfa56f028e9d10664afecdaba1  tests/packaging/orchestrator-boot-wizard.test.mjs
+          SUMS
+          node -e 'const fs=require("fs"),c=require("crypto");let bad=0;for(const l of fs.readFileSync(process.argv[1],"utf8").trim().split("\n")){const i=l.indexOf("  "),want=l.slice(0,i),p=l.slice(i+2);let got="missing";try{got=c.createHash("sha256").update(fs.readFileSync(p)).digest("hex")}catch{}console.log((got===want?"OK   ":"DIFF ")+got+"  "+p);if(got!==want)bad++}process.exit(bad?1:0)' "$EVIDENCE/expected-bodies.sha256" | tee "$EVIDENCE/bodies.txt"
+
+      - name: Install dependencies (locked)
+        id: install
+        shell: bash
+        timeout-minutes: 5
+        run: npm ci 2>&1 | tee "$EVIDENCE/logs/npm-ci.log"
+
+      # The same step, byte for byte, as ci.yml's Full suite job. T131 block T needs jq present.
+      - name: Install jq (a hard dependency of init, checked at step 1)
+        id: jq
+        run: command -v jq || sudo apt-get install -y jq
+        if: matrix.os == 'ubuntu-latest'
+
+      - name: Build (full tsc -p ., not transpileModule)
+        id: build
+        shell: bash
+        timeout-minutes: 5
+        run: npm run build 2>&1 | tee "$EVIDENCE/logs/build.log"
+
+      - name: Focused cases — wizard suite, then six shell guards x {unset, /nonexistent}
+        id: cases
+        if: steps.build.outcome == 'success'
+        shell: bash
+        timeout-minutes: 8
+        run: |
+          # Deliberately NOT -e: one failing case must not stop the independent ones after it. Every
+          # case's outcome is counted, and this step fails at the end if any of them failed.
+          set +e
+          set -u
+          export EVIDENCE="${EVIDENCE:?}"
+          RESULTS="$EVIDENCE/results.jsonl"
+          : > "$RESULTS"
+          # Mirror tests/dispatch/run-all.sh, the runner these guards normally run under:
+          # (1) scrub ambient AIGENTRY_* knobs, so live tests stay off;
+          # (2) put a tripwire `telepty` first on PATH, so a guard that drops its stub finds this
+          #     instead of a real CLI;
+          # (3) give each guard a wall clock, using the same timeout/gtimeout/perl fallback;
+          # (4) run its leading `chmod +x` of the guards and stubs (working-tree mode only, nothing committed).
+          chmod +x tests/dispatch/T*.sh tests/dispatch/stubs/* 2>/dev/null || true
+          for k in $(env | sed -nE 's/^(AIGENTRY_[A-Z0-9_]+)=.*/\1/p'); do unset "$k"; done
+          export TRIP_DIR="$RUNNER_TEMP/boot-admission-1215-tripwire"
+          mkdir -p "$TRIP_DIR"
+          cat > "$TRIP_DIR/telepty" <<'TRIPWIRE'
+          #!/usr/bin/env bash
+          echo "BOOT-ADMISSION TRIPWIRE: a case resolved a real telepty by PATH lookup; argv: $*" >&2
+          exit 97
+          TRIPWIRE
+          chmod +x "$TRIP_DIR/telepty"
+          export PATH="$TRIP_DIR:$PATH"
+          unset TELEPTY_SUPERVISION_CLIENT_FILE
+          export CASE_TIMEOUT_S=150
+          if command -v timeout >/dev/null 2>&1; then bounded() { timeout -s KILL "$CASE_TIMEOUT_S" "$@"; }
+          elif command -v gtimeout >/dev/null 2>&1; then bounded() { gtimeout -s KILL "$CASE_TIMEOUT_S" "$@"; }
+          elif command -v perl >/dev/null 2>&1; then bounded() { perl -e 'alarm shift; exec @ARGV' "$CASE_TIMEOUT_S" "$@"; }
+          else bounded() { "$@"; }; fi
+          cases=0
+          failed=0
+          run_case() { # run_case <id> <client: "<unset>" or a literal value> <argv...>
+            local id="$1" client="$2" log rc started finished skips trip verdict
+            shift 2
+            log="$EVIDENCE/logs/$id.log"
+            cases=$((cases + 1))
+            started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            if [ "$client" = "<unset>" ]; then
+              bounded env -u TELEPTY_SUPERVISION_CLIENT_FILE "$@" >"$log" 2>&1
+            else
+              bounded env TELEPTY_SUPERVISION_CLIENT_FILE="$client" "$@" >"$log" 2>&1
+            fi
+            rc=$?
+            finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            # run-all.sh's skip pattern: none of these guards is a declared skip, so a skip is a failure.
+            skips="$(grep -cE '^T[0-9]+[: ].*SKIP' "$log" || true)"
+            trip="$(grep -c 'BOOT-ADMISSION TRIPWIRE' "$log" || true)"
+            verdict=pass
+            if [ "$rc" != 0 ] || [ "$skips" != 0 ] || [ "$trip" != 0 ]; then verdict=fail; failed=$((failed + 1)); fi
+            node -e 'const [id,client,rc,started,finished,log,skips,trip,verdict,...argv]=process.argv.slice(1);const fs=require("fs"),c=require("crypto");const b=fs.readFileSync(log);const lines=b.toString("utf8").trimEnd().split("\n");process.stdout.write(JSON.stringify({id,argv,env_delta:client==="<unset>"?{unset:["TELEPTY_SUPERVISION_CLIENT_FILE"]}:{set:{TELEPTY_SUPERVISION_CLIENT_FILE:client}},common_env_delta:{path_prepended:process.env.TRIP_DIR,unset:["AIGENTRY_* (ambient)","TELEPTY_SUPERVISION_CLIENT_FILE (inherited)"]},timeout_s:Number(process.env.CASE_TIMEOUT_S),exit_status:Number(rc),started,finished,log:log.slice(process.env.EVIDENCE.length+1),log_bytes:b.length,log_sha256:c.createHash("sha256").update(b).digest("hex"),last_line:lines[lines.length-1]||"",skip_announcements:Number(skips),tripwire_hits:Number(trip),verdict})+"\n")' \
+              "$id" "$client" "$rc" "$started" "$finished" "$log" "$skips" "$trip" "$verdict" "$@" >> "$RESULTS"
+            echo "::group::$id — exit $rc, $verdict"
+            cat "$log"
+            echo "::endgroup::"
+            case "$rc" in 124|137|142) echo "::error::$id exceeded ${CASE_TIMEOUT_S}s (rc=$rc)" ;; esac
+            if [ "$verdict" = fail ]; then echo "::error::$id failed (exit $rc, skips $skips, tripwire $trip)"; fi
+          }
+          run_case wizard-unset "<unset>" node --test tests/packaging/orchestrator-boot-wizard.test.mjs
+          for t in T131_orchestrator_boot_parity T40_orchestrator_singleton_guard T132_orchestrator_boot_workspace_shim \
+                   T134_orchestrator_boot_noexec T135_orchestrator_boot_handoff T137_shim_resolves_operator_telepty; do
+            run_case "${t%%_*}-unset" "<unset>" bash "tests/dispatch/$t.sh"
+            run_case "${t%%_*}-nonexistent" "/nonexistent" bash "tests/dispatch/$t.sh"
+          done
+          echo "cases=$cases failed=$failed" | tee "$EVIDENCE/cases-summary.txt"
+          [ "$cases" = "13" ] || { echo "::error::expected 13 cases, ran $cases"; exit 1; }
+          [ "$failed" = "0" ] || { echo "::error::$failed of $cases focused cases failed (logs in the artifact)"; exit 1; }
+
+      # Task 1215 boot90 — the genuine compiled boot runtime, kept ONLY when the full `tsc -p .` build and all 13 focused
+      # cases above succeeded (the implicit success() also requires every earlier step). It is the exact `dist/` this job
+      # built and tested, the checked-out `bin/`, package.json and package-lock.json, plus the job's own existing identity
+      # and result records (identity.txt, expected-bodies.sha256, bodies.txt, results.jsonl, cases-summary.txt). Never
+      # node_modules, HOME, credentials, case logs or the rest of the repository. Any missing runtime or binding file, or
+      # a bin/package file that differs from the checked-out commit, fails here instead of uploading a partial artifact.
+      - name: Stage the tested boot runtime (dist, bin, package files and binding evidence)
+        id: runtime_stage
+        if: steps.build.outcome == 'success' && steps.cases.outcome == 'success'
+        shell: bash
+        timeout-minutes: 3
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/boot-runtime-1215"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/checkout" "$STAGE/evidence"
+          [ "$(git rev-parse HEAD)" = "$EXPECTED_HEAD" ] || { echo "::error::HEAD moved from $EXPECTED_HEAD"; exit 1; }
+          for f in dist/src/orchestrator-boot/cli.js dist/src/orchestrator-boot/plan.js dist/src/orchestrator-boot/wizard.js \
+                   dist/src/orchestrator-boot/usage.js bin/orchestrator-boot.sh bin/lib/node-shim.sh \
+                   bin/init/cli.mjs package.json package-lock.json \
+                   "$EVIDENCE/identity.txt" "$EVIDENCE/expected-bodies.sha256" "$EVIDENCE/bodies.txt" \
+                   "$EVIDENCE/results.jsonl" "$EVIDENCE/cases-summary.txt"; do
+            [ -f "$f" ] && [ -s "$f" ] || { echo "::error::expected runtime/binding file missing or empty: $f"; exit 1; }
+          done
+          grep -qx 'cases=13 failed=0' "$EVIDENCE/cases-summary.txt" || { echo "::error::cases-summary is not cases=13 failed=0"; exit 1; }
+          # bin/ and the package files are tracked: they must be the checked-out commit's bytes (no edits, no untracked
+          # additions); dist/ is the build output of this job, bound by step order and the identity above.
+          git diff --quiet HEAD -- bin package.json package-lock.json || { echo "::error::bin/package files differ from HEAD"; exit 1; }
+          [ -z "$(git status --porcelain --untracked-files=all -- bin package.json package-lock.json)" ] || { echo "::error::untracked or modified files under bin/package"; exit 1; }
+          cp -Rp dist bin package.json package-lock.json "$STAGE/checkout/"
+          cp -p "$EVIDENCE/identity.txt" "$EVIDENCE/expected-bodies.sha256" "$EVIDENCE/bodies.txt" \
+                "$EVIDENCE/results.jsonl" "$EVIDENCE/cases-summary.txt" "$STAGE/evidence/"
+          # Interpreter caches are runtime state, not source: removed from the staged COPY only (the checkout is untouched).
+          find "$STAGE/checkout" \( -name __pycache__ -o -name '*.pyc' -o -name '*.pyo' \) -prune -exec rm -rf {} +
+          [ -z "$(find "$STAGE" -name node_modules -print -quit)" ] || { echo "::error::node_modules found in the staged runtime"; exit 1; }
+          echo "staged: $(find "$STAGE/checkout" -type f | wc -l | tr -d ' ') runtime files, $(find "$STAGE/evidence" -type f | wc -l | tr -d ' ') evidence files"
+
+      - name: Upload the tested boot runtime
+        id: runtime_upload
+        if: steps.build.outcome == 'success' && steps.cases.outcome == 'success' && steps.runtime_stage.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-runtime-1215-${{ matrix.os }}
+          path: ${{ runner.temp }}/boot-runtime-1215
+          if-no-files-found: error
+
+      - name: Cleanup (tripwire only; guards clean their own fixtures)
+        id: cleanup
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/boot-admission-1215-tripwire"
+          [ ! -e "$RUNNER_TEMP/boot-admission-1215-tripwire" ]
+          if [ -n "${EVIDENCE:-}" ] && [ -d "$EVIDENCE" ]; then ps -eo pid,ppid,command > "$EVIDENCE/ps-after.txt" || true; fi
+
+      - name: Upload evidence
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-admission-1215-${{ matrix.os }}
+          path: ${{ runner.temp }}/boot-admission-1215
+          if-no-files-found: error
+
+      - name: Verdict (fails unless identity, install, build, every case, cleanup and upload succeeded)
+        if: always()
+        shell: bash
+        env:
+          IDENTITY: ${{ steps.identity.outcome }}
+          INSTALL: ${{ steps.install.outcome }}
+          JQ: ${{ steps.jq.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+          CASES: ${{ steps.cases.outcome }}
+          CLEANUP: ${{ steps.cleanup.outcome }}
+          UPLOAD: ${{ steps.upload.outcome }}
+          IS_LINUX: ${{ matrix.os == 'ubuntu-latest' }}
+        run: |
+          set -euo pipefail
+          echo "identity=$IDENTITY install=$INSTALL jq=$JQ build=$BUILD cases=$CASES cleanup=$CLEANUP upload=$UPLOAD"
+          bad=0
+          for pair in "identity:$IDENTITY" "install:$INSTALL" "build:$BUILD" "cases:$CASES" "cleanup:$CLEANUP" "upload:$UPLOAD"; do
+            [ "${pair#*:}" = "success" ] || { echo "::error::step ${pair%%:*} was ${pair#*:}"; bad=1; }
+          done
+          if [ "$IS_LINUX" = "true" ]; then [ "$JQ" = "success" ] || { echo "::error::jq install was $JQ"; bad=1; }
+          else [ "$JQ" = "skipped" ] || { echo "::error::jq step was $JQ on macOS"; bad=1; }; fi
+          if [ -s "${EVIDENCE:-/nonexistent-evidence}/results.jsonl" ]; then
+            node -e 'const r=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n").map(JSON.parse);const f=r.filter(x=>x.verdict!=="pass");console.log("cases",r.length,"failed",f.length);for(const x of r)console.log(x.verdict.padEnd(5),String(x.exit_status).padStart(3),x.id,"|",x.last_line);process.exit(r.length===13&&f.length===0?0:1)' "$EVIDENCE/results.jsonl" || bad=1
+          else
+            echo "::error::no results.jsonl"; bad=1
+          fi
+          echo "Focused caller acceptance only — NOT full-project green and NOT proof of live Mac/Linux delivery."
+          exit "$bad"
