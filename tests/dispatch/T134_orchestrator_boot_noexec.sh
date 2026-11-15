@@ -77,6 +77,15 @@
 # (a malformed opt-in, a control-character sid, junk in every plan field). Help is what an
 # operator runs when already confused; refusing it over an unrelated variable, or acting
 # while printing it, are the two failures this ticket is about.
+#
+# ── TASK 1270: THE GUARD AND THE RECONCILE ARE REMOVED ──────────────────────────────
+# The boot no longer SIGKILLs or DELETEs anything; it runs a bounded exact-local preflight
+# (`telepty boot-capabilities` → GET /api/meta → GET /api/sessions/<sid>) and only a 404 (FRESH)
+# emits `telepty allow-create-v1 …`. Blocks C, D and G above describe the OLD reads/verdicts; they
+# are migrated in place (each says "was: …"): a dry run now reads and probes NOTHING and reports no
+# verdict, the normal boot on D's armed fixture kills/deletes nothing, the removed probes exit 4, and
+# G reports no DELETE because none exists. Every no-exec assertion now also requires the capability
+# probe to stay silent. ps/kill/list/curl recorders stay armed throughout.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
@@ -171,23 +180,62 @@ exit 0
 EOF
 
 CURL_LOG="$T_TMP/curl-calls.log"
+# Task 1270: the CURL seam now answers the boot preflight's two GETs by route as `<body>\n<code>`
+# (curl -w '\n%{http_code}') — default FRESH: meta with both capabilities, the exact sid 404. Any DELETE would
+# still be recorded (and is asserted absent everywhere).
+META_CODE="$T_TMP/meta-code"; META_BODY="$T_TMP/meta-body"
+SESSION_CODE="$T_TMP/session-code"; SESSION_BODY="$T_TMP/session-body"
 CURL_STUB="$STUB_BIN/curl-recorder134.sh"
 cat > "$CURL_STUB" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$CURL_LOG"
-printf '200'
+case "\${!#}" in
+  */api/meta)       cat "$META_BODY"; printf '\n%s' "\$(cat "$META_CODE")" ;;
+  */api/sessions/*) cat "$SESSION_BODY"; printf '\n%s' "\$(cat "$SESSION_CODE")" ;;
+  *)                printf '\n000'; exit 7 ;;
+esac
 exit 0
 EOF
 
 chmod +x "$PS_STUB" "$KILL_STUB" "$TELEPTY_STUB" "$CURL_STUB"
 
+# Task 1270 — the preflight's capability probe, `telepty boot-capabilities`, resolved by bash from PATH. A private
+# stub prepended to PATH answers EXACTLY that argv and logs it; any other argv is a tripwire. (lib.sh's
+# `stubs/telepty` is not relied on.) No no-exec mode may ever run it.
+CAPS_DIR="$T_TMP/caps-path"; mkdir -p "$CAPS_DIR"
+CAPS_LOG="$T_TMP/caps-calls.log"; CAPS_TRIP="$T_TMP/caps-tripwire.log"
+SEALED_CAPS='{"schema":"telepty-boot-capabilities-v1","verbs":["allow-create-v1"],"viewer_detach":"nondeleting-v1"}'
+CAPS_BRANCH="$(cat <<EOF
+if [ "\$#" = 1 ] && [ "\$1" = boot-capabilities ]; then printf 'boot-capabilities\n' >> "$CAPS_LOG"; printf '%s\n' '$SEALED_CAPS'; exit 0; fi
+EOF
+)"
+cat > "$CAPS_DIR/telepty" <<EOF
+#!/usr/bin/env bash
+$CAPS_BRANCH
+printf '%s\n' "\$*" >> "$CAPS_TRIP"
+exit 97
+EOF
+chmod +x "$CAPS_DIR/telepty"
+export PATH="$CAPS_DIR:$PATH"
+unset TELEPTY_HOST
+daemon_fresh() {
+  printf '200' > "$META_CODE"
+  printf '{"capabilities":["sessions","wrapped-sessions","register-create-only"]}' > "$META_BODY"
+  printf '404' > "$SESSION_CODE"
+  printf '{"error":"Session not found"}' > "$SESSION_BODY"
+}
+daemon_fresh
+
 # The exec target. Resolved from PATH exactly as the shim resolves it, so if any mode
 # ever reaches the exec this file records it. It must stay EMPTY in every block here.
+# Task 1270: it answers the capability probe through the shared branch first, so a probe is logged as a probe
+# (CAPS_LOG, asserted empty in every no-exec mode) and never mistaken for an exec.
 EXEC_DIR="$T_TMP/exec-path"
 mkdir -p "$EXEC_DIR"
 EXEC_LOG="$T_TMP/exec.log"
 cat > "$EXEC_DIR/telepty" <<EOF
 #!/usr/bin/env bash
+$CAPS_BRANCH
 printf '%s\n' "\$*" >> "$EXEC_LOG"
 exit 0
 EOF
@@ -202,7 +250,7 @@ export ORCHESTRATOR_SID="$SID"
 # <sid>` and never the tail, so no kill decision below changes.
 BRIDGE="node /Users/x/.nvm/versions/node/v20.20.0/bin/telepty allow --id $SID --auto-restart $PLAN_TAIL"
 
-reset() { : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$PS_ARGV"; : > "$TELEPTY_ARGV"; : > "$EXEC_LOG"; : > "$AUTH_LOG"; }
+reset() { : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$PS_ARGV"; : > "$TELEPTY_ARGV"; : > "$EXEC_LOG"; : > "$AUTH_LOG"; : > "$CAPS_LOG"; : > "$CAPS_TRIP"; daemon_fresh; }
 # `grep -c .` prints the count and exits 1 on zero, so the status is swallowed rather
 # than answered with a second line (T131's idiom).
 lines() { grep -c . "$1" 2>/dev/null || true; }
@@ -230,6 +278,9 @@ assert_no_side_effects() { # assert_no_side_effects <label>
   [ "$(lines "$EXEC_LOG")" = "0" ] \
     || fail "$1: THE MODE BOOTED THE ORCHESTRATOR — the exec recorder fired: $(cat "$EXEC_LOG")"
   [ "$(lines "$AUTH_LOG")" = "0" ] || fail "$1: inspection resolved auth"
+  # Task 1270: a no-exec mode never runs the boot preflight's capability probe, and telepty never runs otherwise.
+  [ "$(lines "$CAPS_LOG")" = "0" ] || fail "$1: a no-exec mode ran the capability probe"
+  [ "$(lines "$CAPS_TRIP")" = "0" ] || fail "$1: telepty ran with an unexpected argv: $(cat "$CAPS_TRIP")"
 }
 
 # ===========================================================================
@@ -315,14 +366,19 @@ c_rc=$?
 set -e
 [ "$c_rc" = "0" ] || fail "C: --dry-run must exit 0, got $c_rc; stderr: $(cat "$C_ERR")"
 assert_no_side_effects "C"
-grep -qx -- '-eo pid,ppid,command' "$PS_ARGV" \
-  || fail "C: --dry-run did not run the process scan, so its verdict is not measured: $(cat "$PS_ARGV")"
-grep -qx -- 'list --json' "$TELEPTY_ARGV" \
-  || fail "C: --dry-run did not read the registry, so its reconcile verdict is not measured: $(cat "$TELEPTY_ARGV")"
+# Task 1270 (was: the dry run DID read ps and `telepty list --json`, so its guard/reconcile verdicts were
+# measured). Those verdicts no longer exist, and the boot's only reads are the preflight's — which a dry run
+# must NOT perform (no capability probe, no credential, no daemon request; asserted above). It therefore reads
+# NOTHING and reports NO verdict, and it says so.
+[ "$(lines "$PS_ARGV")" = "0" ] || fail "C: --dry-run ran the process lister: $(cat "$PS_ARGV")"
+[ "$(lines "$TELEPTY_ARGV")" = "0" ] || fail "C: --dry-run read the registry listing: $(cat "$TELEPTY_ARGV")"
+grep -q 'not probed' "$C_OUT" || fail "C: --dry-run does not say it probed nothing: $(cat "$C_OUT")"
+grep -q 'only on a FRESH verdict' "$C_OUT" || fail "C: --dry-run does not say the exec needs a FRESH verdict: $(cat "$C_OUT")"
+grep -qE 'boot preflight (FRESH|EXISTS)' "$C_OUT" "$C_ERR" && fail "C: --dry-run reported a verdict it never probed"
 
 # The exec argv is reported, one element per line, PREFIXED so nothing can confuse it
 # with the contract channel the shim reads on the boot path.
-for a in telepty allow --id "$SID" --auto-restart "${PLAN_TAIL_ARGV[@]}"; do
+for a in telepty allow-create-v1 --id "$SID" --auto-restart "${PLAN_TAIL_ARGV[@]}"; do
   grep -qxF -- "[would-exec] $a" "$C_OUT" \
     || fail "C: --dry-run did not report '[would-exec] $a' as its own line: $(cat "$C_OUT")"
 done
@@ -352,13 +408,23 @@ EOF
 
 # Actuate through zero-argv compiled boot: same implementation, prints argv without
 # exec. Every effect reaches a recorder, including the synthetic auth door.
+# Task 1270 (was: the normal boot DELETEd the STALE fixture and SIGKILLed exactly 7777, and the dry run
+# named that same set). The boot's only effects now are its bounded preflight: one capability probe and the
+# two GETs, with the credential as a header argument. With this fixture ARMED (a stale bridge, the ancestor,
+# the operator's pgrep, a STALE/0 listing) it kills nothing, deletes nothing, reads neither table, and — the
+# exact sid being absent — boots FRESH with the create-only argv.
 reset; stale_listing
 SINGLETON_SELF_PID=3333 node "$BOOT_CLI" >"$T_TMP/normal.out" 2>"$T_TMP/normal.err"
-grep -q -- '-X DELETE' "$CURL_LOG" || fail "D: normal boot did not DELETE the stale fixture"
-grep -q 'x-telepty-token: fixture-token-T134' "$CURL_LOG" || fail "D: synthetic auth missing"
+grep -q -- '-X DELETE' "$CURL_LOG" && fail "D: the normal boot issued a DELETE: $(cat "$CURL_LOG")"
+[ "$(grep -c 'x-telepty-token: fixture-token-T134' "$CURL_LOG")" = "2" ] \
+  || fail "D: the two preflight GETs did not both carry the synthetic credential: $(cat "$CURL_LOG")"
 grep -q 'fixture-token-T134' "$T_TMP/normal.out" "$T_TMP/normal.err" && fail "D: token leaked"
+[ "$(lines "$CAPS_LOG")" = "1" ] || fail "D: expected exactly one capability probe: $(cat "$CAPS_LOG")"
+[ "$(lines "$KILL_LOG")" = "0" ] || fail "D: the normal boot killed something: $(cat "$KILL_LOG")"
+[ "$(lines "$PS_ARGV")" = "0" ] || fail "D: the normal boot listed the process table: $(cat "$PS_ARGV")"
+[ "$(lines "$TELEPTY_ARGV")" = "0" ] || fail "D: the normal boot read the registry listing: $(cat "$TELEPTY_ARGV")"
 [ ! -s "$EXEC_LOG" ] || fail "D: compiled CLI exec'd a bridge"
-printf '%s\n' telepty allow --id "$SID" --auto-restart "${PLAN_TAIL_ARGV[@]}" \
+printf '%s\n' telepty allow-create-v1 --id "$SID" --auto-restart "${PLAN_TAIL_ARGV[@]}" \
   > "$T_TMP/normal.expected"
 cmp "$T_TMP/normal.expected" "$T_TMP/normal.out" || fail "D: normal boot stdout is not exact argv"
 # #1162: exactly one fixed-vocabulary boot-record line on the normal boot (fixture ROOT has no sessions/).
@@ -369,41 +435,46 @@ grep -qx '\[orchestrator-boot\] boot record: skipped:unsafe-path relation=none' 
 [ ! -e "$BOOT_FIXTURE/home/sessions" ] || fail "D: the boot record created sessions/ under the fixture ROOT"
 REAL_KILLS="$T_TMP/real-kills.txt"
 sed 's/^-9 //' "$KILL_LOG" | sort -u > "$REAL_KILLS"
-[ "$(cat "$REAL_KILLS")" = "7777" ] \
-  || fail "D: the real run's kill set is not exactly 7777 (the fixture changed under this guard): $(cat "$REAL_KILLS")"
+[ ! -s "$REAL_KILLS" ] \
+  || fail "D: the real run's kill set is not EMPTY (task 1270 removed the guard): $(cat "$REAL_KILLS")"
 
 # Probe inspection uses the identical actionable fixtures, separately from control.
+# Task 1270: singleton-guard and registry-reconcile are REMOVED (exit 4, unknown subcommand) and still inert;
+# exec-argv is unchanged.
 for probe in singleton-guard registry-reconcile exec-argv; do
   reset
+  set +e
   SINGLETON_SELF_PID=3333 PATH="$EXEC_DIR:$PATH" bash "$BOOT" __probe "$probe" \
     >"$T_TMP/probe.out" 2>"$T_TMP/probe.err"
+  d_rc=$?
+  set -e
   assert_no_side_effects "D/probe/$probe"
+  [ "$(lines "$PS_ARGV")" = "0" ] && [ "$(lines "$TELEPTY_ARGV")" = "0" ] || fail "D/probe/$probe: a probe read ps or the registry"
   case "$probe" in
-    singleton-guard) grep -q 'would SIGKILL.*pid=7777' "$T_TMP/probe.err" || fail "D: missing probe kill verdict" ;;
-    registry-reconcile) grep -q 'would DELETE' "$T_TMP/probe.err" || fail "D: missing probe DELETE verdict" ;;
-    exec-argv) cmp "$T_TMP/normal.expected" "$T_TMP/probe.out" || fail "D: probe argv changed" ;;
+    singleton-guard|registry-reconcile)
+      [ "$d_rc" = "4" ] || fail "D/probe/$probe: a removed probe must exit 4, got $d_rc"
+      grep -qx "orchestrator-boot.sh: unknown __probe subcommand: $probe" "$T_TMP/probe.err" \
+        || fail "D/probe/$probe: not the unknown-subcommand refusal: $(cat "$T_TMP/probe.err")" ;;
+    exec-argv)
+      [ "$d_rc" = "0" ] || fail "D/probe/exec-argv exited $d_rc"
+      cmp "$T_TMP/normal.expected" "$T_TMP/probe.out" || fail "D: probe argv changed" ;;
   esac
 done
 
-# The dry run's would-kill set, from its own report.
+# The dry run's would-kill set, from its own report: EMPTY, matching the (empty) real kill set on the SAME
+# fixture. There is no guard left to prove, so the dry run names no pid, no skip and no near miss — it may not
+# invent a guard verdict any more than it may act.
 reset; stale_listing
 D_OUT="$T_TMP/d.out"
 SINGLETON_SELF_PID=3333 PATH="$EXEC_DIR:$PATH" bash "$BOOT" --dry-run >"$D_OUT" 2>/dev/null
 assert_no_side_effects "D"
 DRY_KILLS="$T_TMP/dry-kills.txt"
 sed -n 's/.*would SIGKILL[^=]*pid=\([0-9][0-9]*\).*/\1/p' "$D_OUT" | sort -u > "$DRY_KILLS"
-[ -s "$DRY_KILLS" ] || fail "D: --dry-run named no would-kill pid at all: $(cat "$D_OUT")"
 diff -u "$REAL_KILLS" "$DRY_KILLS" \
   || fail "D: the dry run's would-kill set differs from what a real run kills on the SAME fixture. real: $(tr '\n' ' ' < "$REAL_KILLS") dry: $(tr '\n' ' ' < "$DRY_KILLS")"
-
-# The guard is PROVEN, not bypassed: the ancestor is named as a skip, and the operator's
-# `pgrep` is named as a non-bridge. Both are the reasons a human runs --dry-run for.
-grep -q "skip self/ancestor bridge pid=1111" "$D_OUT" \
-  || fail "D: --dry-run did not SHOW the #539 ancestor skip for 1111 — it must prove the guard, not bypass it: $(cat "$D_OUT")"
-grep -q "8888" "$D_OUT" \
-  || fail "D: --dry-run never mentions 8888, the operator's own pgrep — the D4 near miss is exactly what a dry run is read for: $(cat "$D_OUT")"
-grep -qE 'would SIGKILL[^=]*pid=(1111|8888)' "$D_OUT" \
-  && fail "D: --dry-run announced it would kill an ancestor or a mere mention of the marker: $(cat "$D_OUT")"
+grep -qE 'would SIGKILL|skip self/ancestor bridge|skip pid=' "$D_OUT" \
+  && fail "D: --dry-run still reports a guard verdict that no longer exists: $(cat "$D_OUT")"
+[ "$(lines "$PS_ARGV")" = "0" ] || fail "D: --dry-run read the process table"
 
 # ===========================================================================
 # E) AN UNKNOWN FLAG IS A REFUSAL, NOT A BOOT. This is the arm that did not exist:
@@ -457,10 +528,13 @@ G_OUT="$T_TMP/g.out"
 PATH="$EXEC_DIR:$PATH" bash "$BOOT" --dry-run >"$G_OUT" 2>/dev/null
 [ "$(lines "$CURL_LOG")" = "0" ] \
   || fail "G: --dry-run issued the DELETE it was only supposed to report; calls: $(cat "$CURL_LOG")"
+# Task 1270 (was: the dry run REPORTED the DELETE it would send for the STALE/0 record). There is no DELETE
+# any more, so there is nothing to report: the dry run names only the exact, read-only lookup it would make.
 grep -qiE 'would DELETE' "$G_OUT" \
-  || fail "G: --dry-run reached the STALE/0-clients arm but never reported the DELETE it would send: $(cat "$G_OUT")"
-grep -qF -- "/api/sessions/$SID" "$G_OUT" \
-  || fail "G: the reported DELETE does not name the endpoint it would hit: $(cat "$G_OUT")"
+  && fail "G: --dry-run still reports a DELETE, an effect the boot no longer has: $(cat "$G_OUT")"
+grep -qF -- "/api/sessions/$SID and boot only on 404" "$G_OUT" \
+  || fail "G: the dry run does not name the exact lookup it would make: $(cat "$G_OUT")"
+assert_no_side_effects "G"
 # Invariant 4 travels with it: the credential is never printed, dry or not.
 grep -q 'x-telepty-token' "$G_OUT" \
   && fail "G: --dry-run printed the credential header: $(cat "$G_OUT")"
@@ -503,7 +577,7 @@ h_dry() { # h_dry <label> <expected-tail...> ; reads H_PLAN_ENV[] for the plan
    env "${H_PLAN_ENV[@]}" PATH="$EXEC_DIR:$PATH" bash "$BOOT" --dry-run) >"$out" 2>"$T_TMP/h.err" \
     || fail "H/$label: --dry-run exited non-zero for a COMPLETE plan; stderr: $(cat "$T_TMP/h.err")"
   local expected="$T_TMP/h.expected"
-  printf '[would-exec] %s\n' telepty allow --id "$SID" --auto-restart >"$expected"
+  printf '[would-exec] %s\n' telepty allow-create-v1 --id "$SID" --auto-restart >"$expected"
   printf '[would-exec] %s\n' "$@" >>"$expected"
   grep '^\[would-exec\]' "$out" >"$T_TMP/h.actual"
   diff -u "$expected" "$T_TMP/h.actual" || fail "H/$label: argv mismatch"
@@ -674,4 +748,4 @@ for j_p in claude codex gemini grok; do
 done
 echo "T134 J PASS (help readable and inert under a hostile environment)"
 
-echo "T134 PASS blocks=A-J inspection=read-only normal-control=recorded-kill-and-DELETE execs=0"
+echo "T134 PASS blocks=A-J inspection=read-only normal-control=preflight-only-no-kill-no-DELETE execs=0"

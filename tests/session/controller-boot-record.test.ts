@@ -1036,7 +1036,19 @@ test("cli boot: the preflight command door passes values as arguments — shell 
   assert.equal(r.status, 0, `exit: ${r.stderr}`);
   assert.deepEqual(r.stdout.split("\n").filter(Boolean), ["telepty", "allow-create-v1", "--id", sid, "--auto-restart", "claude", "--permission-mode", "manual"],
     "the sid is ONE argv element, byte-exact");
-  assert.deepEqual(effectLines(c.effects), preflightEffects(sid), "the probe and both GETs ran once each, the URL as one argument");
+  // The session GET's last path segment, stated LITERALLY (strict RFC 3986: every non-unreserved character encoded,
+  // the apostrophe and the parentheses included). CI 43736341103 (native Windows) recorded this segment with the
+  // apostrophe DROPPED — encodeURIComponent left `'` raw and the argv transport stripped it — so the literal pins the
+  // representation and the decode below pins the identity: the daemon must receive exactly the sid that was booted.
+  const segment = "orch%27%3B%24%28touch%24%7BIFS%7DSIDPWNED%29";
+  assert.equal(decodeURIComponent(segment), sid, "the transmitted segment decodes to the exact original sid");
+  assert.deepEqual(effectLines(c.effects), [
+    "telepty-path boot-capabilities",
+    "curl http://127.0.0.1:3848/api/meta",
+    `curl http://127.0.0.1:3848/api/sessions/${segment}`,
+  ], "the probe and both GETs ran once each, the URL as one argument, the sid intact");
+  assert.equal(decodeURIComponent(effectLines(c.effects)[2]!.split("/api/sessions/")[1]!), sid,
+    "what curl actually received decodes to the exact original sid");
   for (const canary of ["SIDPWNED", "CURLPWNED"]) {
     assert.ok(!listTree(c.base).some((p) => path.basename(p) === canary), `${canary}: a value was executed as shell text`);
   }

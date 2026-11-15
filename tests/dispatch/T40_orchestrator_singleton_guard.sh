@@ -1,45 +1,31 @@
 #!/usr/bin/env bash
-# T40 — bin/orchestrator-boot.sh singleton guard (#539).
-# HERMETIC: actuation uses the unchanged compiled CLI with zero argv (prints argv,
-# never execs a bridge), with a STUBBED process lister (SINGLETON_PS_CMD → fixture table), a
-# STUBBED killer (KILL_CMD → call recorder) and an overridable SINGLETON_SELF_PID.
-# NO real process is ever listed or killed. Asserts:
-#   A) two bridges (one self-ancestor + one stale) → ONLY the non-self one is
-#      kill -9'd; ancestor bridge (grandparent) survives (kill-self belt).
-#   B) zero bridges → no-op.
-#   C) one bridge == self → no-op.
-#   D) ORCH_SID configurable (ORCHESTRATOR_SID) → only the matching sid killed.
-#   E) signal is ALWAYS -9, NEVER -TERM/-15.
+# T40 — bin/orchestrator-boot.sh: the former singleton guard (#539) and registry reconcile (#905),
+# migrated to the task-1270 create-only boot.
 #
-# #899 tranche 5 — this file used to `source` bin/orchestrator-boot.sh and call
-# orchestrator_singleton_guard / orchestrator_registry_reconcile as bash functions and
-# read ORCH_EXEC_ARGV as a bash array. That script is a shim onto
-# src/orchestrator-boot/cli.ts now and an exec shim exports no shell functions, so the
-# actuation assertions now use normal boot through private fixtures. Probes are
-# read-only and have separate assertions below; they must never DELETE or kill.
+# HISTORY. Until task 1270 this file asserted a SIGKILL guard (kill every stale `telepty allow --id
+# <sid>` except self and ancestors, -9 never -15) and a pre-exec DELETE of a STALE/0-client registry
+# record. Task 1270 REMOVED both: the boot no longer lists processes or sessions, signals anything or
+# deletes anything. It asks a bounded, exact-local PREFLIGHT instead —
+#   `telepty boot-capabilities` (exact sealed JSON) → curl GET /api/meta (wrapped-sessions +
+#   register-create-only) → curl GET /api/sessions/<sid>
+# — and only a 404 (FRESH) emits `telepty allow-create-v1 --id <sid> --auto-restart <tail>`. Every
+# other verdict exits 3 with an EMPTY stdout and acts on nothing.
 #
-# #905 — the guard above kills PROCESSES; it never reconciled the daemon's REGISTRY
-# record, and on 2026-08-16 that made an orchestrator restart structurally impossible:
-# the record survived its dead bridge holding that bridge's owner token (telepty #815),
-# so every `telepty allow --id orchestrator` was refused the owner claim. F–K cover the
-# pre-exec reconcile, and L the exec argv. Every registry interaction goes through a
-# recorder seam — NO real DELETE is ever issued, against :3848 or anything else:
-#   F) STALE + 0 clients          → DELETE issued for the right sid, with a credential.
-#   G) CONNECTED                  → no DELETE (that is a live orchestrator).
-#   H) DISCONNECTED (not STALE)   → no DELETE (may be mid-reconnect), announced.
-#   I) no record                  → no DELETE, nothing to reconcile.
-#   J) daemon unreachable         → announced, no DELETE, boot still proceeds.
-#   K) STALE but clients > 0      → no DELETE (someone is attached).
-#   L) exec argv carries --auto-restart, before the command word.
+# WHAT IS KEPT. Every adversarial input the old blocks used — the ancestor bridge, the stale bridge, an
+# unrelated process, the self bridge, a second sid, every registry health shape, an unreachable or
+# garbage daemon — is still fed to the REAL compiled boot through the SAME recorder seams, and the
+# assertion is now the opposite one: ZERO ps, ZERO kill, ZERO `telepty list`, ZERO DELETE. The old
+# positive expectations (kill 4444, DELETE the STALE record) are the removed behaviour; each block
+# states its new causal expectation next to the old one.
 #
-# #1181 — a bare non-TTY boot is no longer a vehicle: without AIGENTRY_BOOT_PLAN=1 and a
-# complete plan the CLI exits 2 before any read (cli.ts refusePlan). Every block below now
-# boots with the SAME complete, benign, explicit plan T131 uses — claude, approval=manual,
-# history=new, no elevated value and so no AIGENTRY_BOOT_RISK_ACK — and makes exactly the
-# assertions it always made. Only the exec argv tail changed, and it is pinned exactly.
-# Block N0 pins the refusal itself: no plan → exit 2, empty stdout, zero effects.
-# The `ps` fixture rows below still spell the old bypass argv on purpose: they describe
-# STALE bridges an earlier boot left running, which is a fact about the table, not a plan.
+# HERMETIC: actuation is the unchanged compiled CLI with zero argv (prints argv, never execs a bridge).
+# ps/kill/`telepty list`/curl are recorders; `telepty boot-capabilities` is answered by a private stub
+# prepended to PATH (the lib.sh `stubs/telepty` is not relied on); the auth door is synthetic. No real
+# process is listed or signalled and no real daemon is contacted.
+#
+# #1181 — the boot needs a complete explicit plan (claude, approval=manual, history=new); N0 pins the
+# refusal without one. The `ps` rows still spell old bypass argv on purpose: they describe bridges an
+# earlier boot left running.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
@@ -54,6 +40,7 @@ printf 'telepty_auth_token() { printf "auth\\n" >> "%s"; printf "fixture-token-T
   > "$BOOT_FIXTURE/bin/lib/telepty-auth.sh"
 export AIGENTRY_SHIM_SCRIPT_DIR="$BOOT_FIXTURE/bin" AIGENTRY_HOME="$BOOT_FIXTURE/home"
 export ORCHESTRATOR_CLI=claude ORCHESTRATOR_SID=orchestrator TELEPTY_PORT=3848
+unset TELEPTY_HOST
 # The complete, benign, explicit plan (#1181; see header). ORCHESTRATOR_SID is set per call.
 export AIGENTRY_BOOT_PLAN=1 AIGENTRY_BOOT_PERMISSION='approval=manual' AIGENTRY_BOOT_HISTORY=new
 # #1201: this file pins argv. The handoff step is T135's subject: it is switched off here, and
@@ -62,22 +49,23 @@ export AIGENTRY_BOOT_PLAN=1 AIGENTRY_BOOT_PERMISSION='approval=manual' AIGENTRY_
 export AIGENTRY_HANDOFF=off HOME="$T_TMP/scratch-home"
 mkdir -p "$HOME"
 unset CLAUDE_CONFIG_DIR CODEX_HOME GEMINI_CLI_HOME CLAUDE_CODE_SESSION_ID
-# plan_argv <sid> — the exact exec argv that plan produces, one element per line.
-plan_argv() { printf '%s\n' telepty allow --id "$1" --auto-restart claude --permission-mode manual; }
+# plan_argv <sid> — the exact exec argv a FRESH boot of that plan produces, one element per line.
+plan_argv() { printf '%s\n' telepty allow-create-v1 --id "$1" --auto-restart claude --permission-mode manual; }
 cd "$BOOT_FIXTURE"
 
 fail() { echo "FAIL[T40]: $*" >&2; exit 1; }
 
-# --- stub: process lister. Ignores args, prints the fixture table file. --------
+# --- tripwires: the removed guard's and reconcile's seams. All must stay EMPTY. ---------------
 PS_TABLE="$T_TMP/ps-table.txt"
+PS_LOG="$T_TMP/ps-calls.log"
 PS_STUB="$STUB_BIN/ps-stub.sh"
 cat > "$PS_STUB" <<EOF
 #!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$PS_LOG"
 cat "$PS_TABLE"
 EOF
 chmod +x "$PS_STUB"
 
-# --- stub: kill recorder. Appends args, exits 0 (simulates successful kill). ---
 KILL_LOG="$T_TMP/kill-calls.log"
 KILL_STUB="$STUB_BIN/kill-stub.sh"
 cat > "$KILL_STUB" <<EOF
@@ -86,25 +74,112 @@ printf '%s\n' "\$*" >> "$KILL_LOG"
 exit 0
 EOF
 chmod +x "$KILL_STUB"
-export SINGLETON_PS_CMD="$PS_STUB" KILL_CMD="$KILL_STUB"
-# Guard cases also traverse reconcile; its input cannot reach a live daemon.
-GUARD_LIST="$STUB_BIN/guard-list.sh"
-printf '#!/usr/bin/env bash\nprintf '\''[{"id":"fixture-unrelated"}]'\''\n' > "$GUARD_LIST"
-chmod +x "$GUARD_LIST"
-export TELEPTY="$GUARD_LIST" CURL="$KILL_STUB"
 
-# ORCH_SID / SINGLETON_SELF_PID are set by each block below and read from the env by
-# the compiled CLI, where the sourced script used to read them from this shell.
-ORCH_SID="orchestrator"
-SINGLETON_SELF_PID="9999"
-run_guard() {
-  : > "$KILL_LOG"
-  ORCHESTRATOR_SID="$ORCH_SID" SINGLETON_SELF_PID="$SINGLETON_SELF_PID" \
-    SINGLETON_PS_CMD="$PS_STUB" KILL_CMD="$KILL_STUB" \
-    node "$BOOT_CLI" >"$T_TMP/guard.out" 2>"$T_TMP/guard.err" \
-    || fail "guard boot for $ORCH_SID exited non-zero: $(cat "$T_TMP/guard.err")"
-  plan_argv "$ORCH_SID" | cmp - "$T_TMP/guard.out" \
-    || fail "guard boot stdout is not the exact plan argv: $(cat "$T_TMP/guard.out")"
+LIST_JSON="$T_TMP/list.json"
+LIST_MODE="$T_TMP/list-mode.txt"       # ok | fail | garbage
+LIST_LOG="$T_TMP/list-calls.log"
+TELEPTY_STUB="$STUB_BIN/telepty-list-stub.sh"
+cat > "$TELEPTY_STUB" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$LIST_LOG"
+mode="\$(cat "$LIST_MODE" 2>/dev/null || echo ok)"
+case "\$mode" in
+  fail)    exit 7 ;;
+  garbage) printf 'not json at all' ;;
+  *)       cat "$LIST_JSON" ;;
+esac
+exit 0
+EOF
+chmod +x "$TELEPTY_STUB"
+export SINGLETON_PS_CMD="$PS_STUB" KILL_CMD="$KILL_STUB" TELEPTY="$TELEPTY_STUB"
+
+# --- the preflight's two seams --------------------------------------------------------------
+# (1) `telepty boot-capabilities`, resolved by bash from PATH: a private stub prepended to PATH answers
+#     EXACTLY that argv (sealed line, or CAPS_TEXT); any other argv is a tripwire.
+CAPS_DIR="$T_TMP/caps-path"; mkdir -p "$CAPS_DIR"
+CAPS_LOG="$T_TMP/caps-calls.log"; CAPS_TRIP="$T_TMP/caps-tripwire.log"; CAPS_TEXT="$T_TMP/caps.txt"
+SEALED_CAPS='{"schema":"telepty-boot-capabilities-v1","verbs":["allow-create-v1"],"viewer_detach":"nondeleting-v1"}'
+cat > "$CAPS_DIR/telepty" <<EOF
+#!/usr/bin/env bash
+if [ "\$#" = 1 ] && [ "\$1" = boot-capabilities ]; then
+  printf 'boot-capabilities\n' >> "$CAPS_LOG"
+  cat "$CAPS_TEXT"
+  exit 0
+fi
+printf '%s\n' "\$*" >> "$CAPS_TRIP"
+exit 97
+EOF
+chmod +x "$CAPS_DIR/telepty"
+export PATH="$CAPS_DIR:$PATH"
+# (2) the CURL seam: records the full argv (the existing practice: the only token in it is the synthetic
+#     fixture token), and answers the preflight's GETs by route as `<body>\n<code>` (curl -w '\n%{http_code}').
+CURL_LOG="$T_TMP/curl-calls.log"
+META_CODE="$T_TMP/meta-code"; META_BODY="$T_TMP/meta-body"
+SESSION_CODE="$T_TMP/session-code"; SESSION_BODY="$T_TMP/session-body"; CURL_EXIT="$T_TMP/curl-exit"
+CURL_STUB="$STUB_BIN/curl-recorder.sh"
+cat > "$CURL_STUB" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$CURL_LOG"
+rc="\$(cat "$CURL_EXIT" 2>/dev/null || echo 0)"
+if [ "\$rc" != 0 ]; then printf '\n000'; exit "\$rc"; fi
+for a in "\$@"; do u="\$a"; done
+case "\$u" in
+  */api/meta)       cat "$META_BODY"; printf '\n%s' "\$(cat "$META_CODE")" ;;
+  */api/sessions/*) cat "$SESSION_BODY"; printf '\n%s' "\$(cat "$SESSION_CODE")" ;;
+  *)                printf '\n000'; exit 7 ;;
+esac
+exit 0
+EOF
+chmod +x "$CURL_STUB"
+export CURL="$CURL_STUB"
+
+# daemon_fresh — a current daemon (both capabilities) holding NO session with the sid: the FRESH answer.
+daemon_fresh() {
+  printf '%s\n' "$SEALED_CAPS" > "$CAPS_TEXT"
+  printf '200' > "$META_CODE"
+  printf '{"capabilities":["sessions","wrapped-sessions","register-create-only"]}' > "$META_BODY"
+  printf '404' > "$SESSION_CODE"
+  printf '{"error":"Session not found"}' > "$SESSION_BODY"
+  printf '0' > "$CURL_EXIT"
+}
+# session_answer <code> <body> — the exact-sid lookup's answer.
+session_answer() { printf '%s' "$1" > "$SESSION_CODE"; printf '%s' "$2" > "$SESSION_BODY"; }
+reset() { : > "$PS_LOG"; : > "$KILL_LOG"; : > "$LIST_LOG"; : > "$CURL_LOG"; : > "$AUTH_LOG"; : > "$CAPS_LOG"; : > "$CAPS_TRIP"; daemon_fresh; printf 'ok' > "$LIST_MODE"; }
+
+# boot <sid> — one real compiled boot; sets BOOT_RC. Output in $T_TMP/boot.out / boot.err.
+boot() {
+  set +e
+  ORCHESTRATOR_SID="$1" SINGLETON_SELF_PID="${SELF_PID:-9999}" node "$BOOT_CLI" >"$T_TMP/boot.out" 2>"$T_TMP/boot.err"
+  BOOT_RC=$?
+  set -e
+}
+# no_destructive_effect <label> — the removed guard and reconcile never ran, whatever the fixture.
+no_destructive_effect() {
+  [ ! -s "$PS_LOG" ] || fail "$1: the process table was listed (the removed guard ran): $(cat "$PS_LOG")"
+  [ ! -s "$KILL_LOG" ] || fail "$1: a kill was issued: $(cat "$KILL_LOG")"
+  [ ! -s "$LIST_LOG" ] || fail "$1: the registry was listed (the removed reconcile ran): $(cat "$LIST_LOG")"
+  grep -q -- '-X DELETE' "$CURL_LOG" && fail "$1: a DELETE was issued: $(cat "$CURL_LOG")"
+  [ ! -s "$CAPS_TRIP" ] || fail "$1: telepty was run with an argv other than boot-capabilities: $(cat "$CAPS_TRIP")"
+  grep -q 'fixture-token-T40' "$T_TMP/boot.out" "$T_TMP/boot.err" && fail "$1: the token leaked into output"
+  return 0
+}
+# fresh_boot <label> <sid> — FRESH: exit 0, stdout exactly the create-only argv, exactly the preflight.
+fresh_boot() {
+  [ "$BOOT_RC" = "0" ] || fail "$1: a FRESH boot exited $BOOT_RC: $(cat "$T_TMP/boot.err")"
+  plan_argv "$2" | cmp - "$T_TMP/boot.out" || fail "$1: stdout is not the exact create-only argv: $(cat "$T_TMP/boot.out")"
+  [ "$(grep -c . "$CAPS_LOG")" = "1" ] || fail "$1: expected exactly one boot-capabilities probe: $(cat "$CAPS_LOG")"
+  [ "$(grep -c '/api/meta' "$CURL_LOG")" = "1" ] || fail "$1: expected exactly one GET /api/meta: $(cat "$CURL_LOG")"
+  [ "$(grep -c "/api/sessions/$2\$" "$CURL_LOG")" = "1" ] || fail "$1: expected exactly one GET /api/sessions/$2: $(cat "$CURL_LOG")"
+  grep -q "boot preflight FRESH — no session '$2'" "$T_TMP/boot.err" || fail "$1: no FRESH verdict line: $(cat "$T_TMP/boot.err")"
+  no_destructive_effect "$1"
+}
+# refused_boot <label> <verdict> — every non-FRESH verdict: exit 3, EMPTY stdout, verdict named, no effect.
+refused_boot() {
+  [ "$BOOT_RC" = "3" ] || fail "$1: expected exit 3 ($2), got $BOOT_RC: $(cat "$T_TMP/boot.err")"
+  [ ! -s "$T_TMP/boot.out" ] || fail "$1: a refused preflight wrote to the exec-argv channel: $(cat "$T_TMP/boot.out")"
+  grep -q "boot preflight $2 for " "$T_TMP/boot.err" || fail "$1: the verdict $2 is not named: $(cat "$T_TMP/boot.err")"
+  grep -q "Nothing was created, attached, signalled, deleted or exec'd." "$T_TMP/boot.err" || fail "$1: no zero-effect statement"
+  no_destructive_effect "$1"
 }
 
 B="node telepty allow --id orchestrator claude --dangerously-skip-permissions --continue"
@@ -112,7 +187,7 @@ B="node telepty allow --id orchestrator claude --dangerously-skip-permissions --
 # ===========================================================================
 # N0) no plan → refused BEFORE any effect (#1181). The fixture is actionable (a stale
 #     bridge row) and every seam is one recorder, so a refusal that leaked past the gate
-#     would show up as a list, ps, kill, DELETE or credential read.
+#     would show up as a list, ps, kill, DELETE, credential read or capability probe.
 # ===========================================================================
 NP_LOG="$T_TMP/no-plan-effects.log"
 NP_REC="$STUB_BIN/no-plan-recorder.sh"
@@ -123,7 +198,7 @@ exit 97
 EOF
 chmod +x "$NP_REC"
 printf '4444 1 %s\n' "$B" > "$PS_TABLE"
-: > "$NP_LOG"; : > "$AUTH_LOG"; : > "$KILL_LOG"
+reset; : > "$NP_LOG"
 set +e
 (unset AIGENTRY_BOOT_PLAN AIGENTRY_BOOT_PERMISSION AIGENTRY_BOOT_HISTORY
  SINGLETON_SELF_PID=9999 SINGLETON_PS_CMD="$NP_REC" KILL_CMD="$NP_REC" TELEPTY="$NP_REC" \
@@ -132,14 +207,15 @@ np_rc=$?
 set -e
 [ "$np_rc" = "2" ] || fail "N0: a no-plan boot must exit 2, got $np_rc: $(cat "$T_TMP/np.err")"
 [ ! -s "$T_TMP/np.out" ] || fail "N0: the refusal wrote to the exec-argv channel: $(cat "$T_TMP/np.out")"
-[ ! -s "$NP_LOG" ] || fail "N0: the refusal listed, scanned, signalled or DELETEd: $(cat "$NP_LOG")"
+[ ! -s "$NP_LOG" ] || fail "N0: the refusal listed, scanned, signalled, DELETEd or probed: $(cat "$NP_LOG")"
 [ ! -s "$KILL_LOG" ] || fail "N0: the refusal reached the kill recorder: $(cat "$KILL_LOG")"
 [ ! -s "$AUTH_LOG" ] || fail "N0: the refusal resolved a credential"
+[ ! -s "$CAPS_LOG" ] || fail "N0: the refusal ran the capability probe"
 grep -qF 'AIGENTRY_BOOT_PLAN' "$T_TMP/np.err" || fail "N0: the refusal does not name the opt-in"
 
 # ===========================================================================
-# A) two bridges: 1111 is a SELF ANCESTOR (grandparent), 4444 is STALE.
-#    ancestry(3333) = 3333→2222→1111. Only 4444 must be SIGKILLed.
+# A) WAS: two bridges (1111 a self ANCESTOR, 4444 stale) → only 4444 SIGKILLed.
+#    NOW: the same table, armed — the boot never reads it, kills nothing, and boots FRESH.
 # ===========================================================================
 cat > "$PS_TABLE" <<EOF
 3333 2222 node $BOOT_CLI
@@ -148,173 +224,111 @@ cat > "$PS_TABLE" <<EOF
 4444 1 $B
 5555 1 node some-unrelated-daemon
 EOF
-ORCH_SID="orchestrator"; SINGLETON_SELF_PID="3333"
-run_guard
-grep -qw 4444 "$KILL_LOG" || fail "A: stale bridge 4444 not killed; log: $(cat "$KILL_LOG")"
-grep -qw 1111 "$KILL_LOG" && fail "A: self-ANCESTOR bridge 1111 was killed (kill-self belt broken!)"
-grep -qw 5555 "$KILL_LOG" && fail "A: unrelated process 5555 killed (over-match)"
-grep -q -- '-9' "$KILL_LOG" || fail "A: signal not -9; log: $(cat "$KILL_LOG")"
-[ "$(grep -c . "$KILL_LOG")" = "1" ] || fail "A: expected exactly 1 kill; log: $(cat "$KILL_LOG")"
+reset; SELF_PID=3333 boot orchestrator
+fresh_boot A orchestrator
 
 # ===========================================================================
-# B) zero bridges → no kill.
+# B) WAS: zero bridges → no kill.  C) WAS: one bridge == self → no kill.  NOW: the same, and FRESH.
 # ===========================================================================
 cat > "$PS_TABLE" <<EOF
 9999 1 bash
 8888 1 node unrelated
 EOF
-ORCH_SID="orchestrator"; SINGLETON_SELF_PID="9999"
-run_guard
-[ -s "$KILL_LOG" ] && fail "B: kill invoked with zero bridges; log: $(cat "$KILL_LOG")"
+reset; SELF_PID=9999 boot orchestrator
+fresh_boot B orchestrator
 
-# ===========================================================================
-# C) one bridge == self → no kill.
-# ===========================================================================
 cat > "$PS_TABLE" <<EOF
 1111 1 $B
 EOF
-ORCH_SID="orchestrator"; SINGLETON_SELF_PID="1111"
-run_guard
-[ -s "$KILL_LOG" ] && fail "C: self bridge killed (must no-op); log: $(cat "$KILL_LOG")"
+reset; SELF_PID=1111 boot orchestrator
+fresh_boot C orchestrator
 
 # ===========================================================================
-# D) configurable sid: ORCH_SID=custom-orch → kill ONLY the custom-orch bridge,
-#    leave the default 'orchestrator' bridge untouched (Rule 16).
+# D) WAS: ORCHESTRATOR_SID=custom-orch → kill ONLY the custom-orch bridge (Rule 16).
+#    NOW: the selected sid is the ONE that is looked up and booted; nothing is killed for either.
 # ===========================================================================
 cat > "$PS_TABLE" <<EOF
 4444 1 node telepty allow --id custom-orch claude --continue
 5555 1 node telepty allow --id orchestrator claude --continue
 EOF
-ORCH_SID="custom-orch"; SINGLETON_SELF_PID="9999"
-run_guard
-grep -qw 4444 "$KILL_LOG" || fail "D: custom-orch bridge 4444 not killed; log: $(cat "$KILL_LOG")"
-grep -qw 5555 "$KILL_LOG" && fail "D: non-matching sid bridge 5555 killed (sid match too loose)"
+reset; boot custom-orch
+fresh_boot D custom-orch
+grep -q '/api/sessions/orchestrator$' "$CURL_LOG" && fail "D: the default sid was looked up instead of the selected one: $(cat "$CURL_LOG")"
 
 # ===========================================================================
-# E) signal is ALWAYS -9, NEVER -TERM/-15 (re-run A and inspect every call).
+# E) WAS: the signal is ALWAYS -9, NEVER -TERM/-15. NOW: no signal of any kind is sent (stronger).
 # ===========================================================================
 cat > "$PS_TABLE" <<EOF
 4444 1 $B
 EOF
-ORCH_SID="orchestrator"; SINGLETON_SELF_PID="9999"
-run_guard
-grep -qE -- '-TERM|-15|-SIGTERM' "$KILL_LOG" && fail "E: SIGTERM used (cascades DELETE!); log: $(cat "$KILL_LOG")"
-grep -q -- '-9' "$KILL_LOG" || fail "E: SIGKILL (-9) not used; log: $(cat "$KILL_LOG")"
+reset; boot orchestrator
+fresh_boot E orchestrator
+[ ! -s "$KILL_LOG" ] || fail "E: a signal was sent: $(cat "$KILL_LOG")"
 
 # ===========================================================================
-# #905 — pre-exec registry reconcile. Seams: TELEPTY (the listing query) and
-# CURL (the DELETE). Both are recorders; nothing real is contacted.
+# #905 cases, migrated. WAS: the STALE/0-client record was DELETEd before the exec. NOW: the registry
+# listing is never read; the EXACT session lookup decides. A session that exists — whatever its health
+# or client count — is EXISTS_IDENTITY_UNPROVEN: exit 3, empty stdout, NOT deleted, attached or replaced.
 # ===========================================================================
-LIST_JSON="$T_TMP/list.json"
-LIST_MODE="$T_TMP/list-mode.txt"       # ok | fail | garbage
-CURL_LOG="$T_TMP/curl-calls.log"
-CURL_CODE="$T_TMP/curl-code.txt"
-
-TELEPTY_STUB="$STUB_BIN/telepty-list-stub.sh"
-cat > "$TELEPTY_STUB" <<EOF
-#!/usr/bin/env bash
-mode="\$(cat "$LIST_MODE" 2>/dev/null || echo ok)"
-case "\$mode" in
-  fail)    exit 7 ;;                       # daemon unreachable / CLI error
-  garbage) printf 'not json at all' ;;     # version mismatch shape
-  *)       cat "$LIST_JSON" ;;
-esac
-exit 0
-EOF
-chmod +x "$TELEPTY_STUB"
-
-# Records the full argv, prints the http code the case under test wants. Mirrors
-# `curl -s -o /dev/null -w '%{http_code}'`, which prints ONLY the code on stdout.
-CURL_STUB="$STUB_BIN/curl-recorder.sh"
-cat > "$CURL_STUB" <<EOF
-#!/usr/bin/env bash
-printf '%s\n' "\$*" >> "$CURL_LOG"
-printf '%s' "\$(cat "$CURL_CODE" 2>/dev/null || echo 200)"
-exit 0
-EOF
-chmod +x "$CURL_STUB"
-
-# rec <health> <clients> — one orchestrator record with the daemon's real field
-# names (daemon.js:2205-2214 — healthStatus + active_clients; cli.js:1334 prints
-# exactly this pair as "<STATUS> ... - Clients: <n>").
 rec() { printf '[{"id":"orchestrator","command":"claude","healthStatus":"%s","active_clients":%s}]' "$1" "$2"; }
-
-reconcile() {
-  ORCHESTRATOR_SID="orchestrator" TELEPTY="$TELEPTY_STUB" CURL="$CURL_STUB" \
-    SINGLETON_SELF_PID=9999 node "$BOOT_CLI" >"$T_TMP/boot.out" 2>"$T_TMP/boot.err"
-}
-
-run_reconcile() {
-  : > "$CURL_LOG"
-  printf 'ok'  > "$LIST_MODE"
-  printf '200' > "$CURL_CODE"
-  reconcile
-}
-
-# --- F) STALE + 0 clients → DELETE ----------------------------------------------
+EXISTING='{"id":"orchestrator","type":"wrapped","alias":null,"active_clients":0}'
 : > "$PS_TABLE"
+
+# --- F) WAS: STALE + 0 clients → DELETE with a credential. NOW: exists → refused, no DELETE. ---
 rec STALE 0 > "$LIST_JSON"
-run_reconcile
-grep -q -- '-X DELETE' "$CURL_LOG" \
-  || fail "F: no DELETE issued for a STALE 0-client record; calls: $(cat "$CURL_LOG")"
-grep -q '/api/sessions/orchestrator' "$CURL_LOG" \
-  || fail "F: DELETE did not target /api/sessions/orchestrator; calls: $(cat "$CURL_LOG")"
-grep -q 'x-telepty-token:' "$CURL_LOG" \
-  || fail "F: DELETE carried no credential header (the daemon would 401 and the record would STAY); calls: $(cat "$CURL_LOG")"
-grep -q '127.0.0.1' "$CURL_LOG" \
-  || fail "F: DELETE was not addressed to loopback; calls: $(cat "$CURL_LOG")"
-grep -q 'x-telepty-token: fixture-token-T40' "$CURL_LOG" || fail "F: synthetic auth token missing"
-grep -q 'fixture-token-T40' "$T_TMP/boot.out" "$T_TMP/boot.err" && fail "F: token leaked into output"
+reset; session_answer 200 "$EXISTING"; boot orchestrator
+refused_boot F EXISTS_IDENTITY_UNPROVEN
+# The credential still travels — on the two GETs, as the curl header argument — and is never printed.
+[ "$(grep -c 'x-telepty-token: fixture-token-T40' "$CURL_LOG")" = "2" ] \
+  || fail "F: the preflight GETs did not both carry the synthetic credential header: $(cat "$CURL_LOG")"
+grep -q '127.0.0.1:3848' "$CURL_LOG" || fail "F: the preflight was not addressed to loopback: $(cat "$CURL_LOG")"
 
-# --- G) CONNECTED → no DELETE ---------------------------------------------------
-rec CONNECTED 1 > "$LIST_JSON"
-run_reconcile
-[ -s "$CURL_LOG" ] && fail "G: DELETE issued against a LIVE orchestrator; calls: $(cat "$CURL_LOG")"
-
-# --- H) DISCONNECTED but not yet STALE → no DELETE ------------------------------
-# A bridge that dropped seconds ago may be mid-reconnect (cli.js scheduleReconnect);
-# deleting it would race a session that is about to come back.
-rec DISCONNECTED 0 > "$LIST_JSON"
-run_reconcile
-[ -s "$CURL_LOG" ] && fail "H: DELETE issued for DISCONNECTED (not STALE) — races a reconnecting bridge; calls: $(cat "$CURL_LOG")"
-
-# --- I) no record for this sid → nothing to reconcile ---------------------------
-printf '[{"id":"some-worker","command":"claude","healthStatus":"CONNECTED","active_clients":1}]' > "$LIST_JSON"
-run_reconcile
-[ -s "$CURL_LOG" ] && fail "I: DELETE issued with no orchestrator record present; calls: $(cat "$CURL_LOG")"
-
-# --- J) daemon unreachable → announced, no DELETE, boot proceeds ----------------
-: > "$CURL_LOG"; printf 'fail' > "$LIST_MODE"
-reconcile \
-  || fail "J: reconcile returned non-zero when the daemon was unreachable — that would block the boot it exists to enable"
-[ -s "$CURL_LOG" ] && fail "J: DELETE issued despite no answer from the daemon; calls: $(cat "$CURL_LOG")"
-
-# A non-JSON answer is the same class of unknown and must not authorise a delete.
-: > "$CURL_LOG"; printf 'garbage' > "$LIST_MODE"
-reconcile || fail "J: reconcile returned non-zero on a non-JSON listing"
-[ -s "$CURL_LOG" ] && fail "J: DELETE issued on an unparseable listing; calls: $(cat "$CURL_LOG")"
-
-# --- K) STALE but someone is attached → no DELETE -------------------------------
-rec STALE 2 > "$LIST_JSON"
-run_reconcile
-[ -s "$CURL_LOG" ] && fail "K: DELETE issued while clients were attached; calls: $(cat "$CURL_LOG")"
-
-# An absent client count is an UNKNOWN, and unknown must never authorise a delete.
+# --- G) CONNECTED / H) DISCONNECTED / K) STALE + clients, and an absent count: all → exists → refused. ---
+for shape in "CONNECTED 1" "DISCONNECTED 0" "STALE 2"; do
+  # shellcheck disable=SC2086
+  rec $shape > "$LIST_JSON"
+  reset; session_answer 200 "$EXISTING"; boot orchestrator
+  refused_boot "G/H/K($shape)" EXISTS_IDENTITY_UNPROVEN
+done
 printf '[{"id":"orchestrator","command":"claude","healthStatus":"STALE"}]' > "$LIST_JSON"
-run_reconcile
-[ -s "$CURL_LOG" ] && fail "K: DELETE issued when the client count was absent (unknown ≠ zero); calls: $(cat "$CURL_LOG")"
+reset; session_answer 200 "$EXISTING"; boot orchestrator
+refused_boot "K(no count)" EXISTS_IDENTITY_UNPROVEN
 
-# --- L) the exec argv carries --auto-restart, before the command word -----------
-# Measured in cli.js: --auto-restart is extracted by indexOf over the args AFTER
-# `allow`, then spliced out before `command = allowArgs[0]` (cli.js:1837-1846) — so
-# it has to sit ahead of the command, exactly where the workers carry it. The array
-# `__probe exec-argv` prints one element per line is the SAME array the shim execs.
+# --- I) WAS: no record → nothing to reconcile. NOW: 404 → FRESH: the only answer that boots. ---
+printf '[{"id":"some-worker","command":"claude","healthStatus":"CONNECTED","active_clients":1}]' > "$LIST_JSON"
+reset; boot orchestrator
+fresh_boot I orchestrator
+cp "$T_TMP/boot.out" "$T_TMP/fresh-boot.out"
+
+# --- J) WAS: daemon unreachable / non-JSON → announced, no DELETE, boot PROCEEDS.
+#        NOW (changed on purpose): an unknown never boots — UNKNOWN, exit 3, no exec, no DELETE. ---
+reset; printf 'fail' > "$LIST_MODE"; printf '7' > "$CURL_EXIT"; boot orchestrator
+refused_boot "J(unreachable)" UNKNOWN
+reset; printf 'garbage' > "$LIST_MODE"; printf 'not json at all' > "$META_BODY"; boot orchestrator
+refused_boot "J(meta not JSON)" UNKNOWN
+grep -q '/api/sessions/' "$CURL_LOG" && fail "J: the session was looked up after an unusable meta answer"
+
+# ===========================================================================
+# NEW) unsupported CLI or daemon → UNSUPPORTED before any further request.
+# ===========================================================================
+reset; printf 'Usage: telepty <command>\n' > "$CAPS_TEXT"; boot orchestrator
+refused_boot "old telepty (help + exit 0)" UNSUPPORTED
+[ ! -s "$CURL_LOG" ] || fail "an unsupported telepty was followed by a daemon request: $(cat "$CURL_LOG")"
+[ ! -s "$AUTH_LOG" ] || fail "an unsupported telepty was followed by a credential read"
+reset; printf '{"capabilities":["sessions","wrapped-sessions"]}' > "$META_BODY"; boot orchestrator
+refused_boot "meta without register-create-only" UNSUPPORTED
+
+# ===========================================================================
+# L) the exec argv carries --auto-restart, before the command word (unchanged property).
+# ===========================================================================
 ARGV_OUT="$T_TMP/exec-argv.txt"
+reset
 node "$BOOT_CLI" __probe exec-argv > "$ARGV_OUT" 2>/dev/null \
   || fail "L: __probe exec-argv exited non-zero"
 plan_argv orchestrator > "$T_TMP/expected-argv.txt"
 cmp "$T_TMP/expected-argv.txt" "$ARGV_OUT" || fail "L: probe stdout is not exact argv"
-cmp "$T_TMP/expected-argv.txt" "$T_TMP/boot.out" || fail "L: normal boot stdout is not exact argv"
+cmp "$T_TMP/expected-argv.txt" "$T_TMP/fresh-boot.out" || fail "L: normal FRESH boot stdout is not exact argv"
+[ ! -s "$CAPS_LOG" ] && [ ! -s "$CURL_LOG" ] && [ ! -s "$AUTH_LOG" ] || fail "L: __probe exec-argv ran the preflight"
 ORCH_EXEC_ARGV=()
 while IFS= read -r a; do ORCH_EXEC_ARGV+=("$a"); done < "$ARGV_OUT"
 argv="${ORCH_EXEC_ARGV[*]}"
@@ -330,21 +344,47 @@ for a in "${ORCH_EXEC_ARGV[@]}"; do
 done
 [ "$flag_pos" -ge 0 ] && [ "$cmd_pos" -gt "$flag_pos" ] \
   || fail "L: --auto-restart must precede the command word; argv: $argv"
+[ "${ORCH_EXEC_ARGV[1]}" = "allow-create-v1" ] || fail "L: the verb is not allow-create-v1: $argv"
 
-# M) The same actionable fixtures are read-only through each probe.
+# ===========================================================================
+# M) WAS: the probes reported would-SIGKILL / would-DELETE on actionable fixtures, acting on nothing.
+#    NOW: singleton-guard and registry-reconcile are REMOVED (exit 4, unknown subcommand), still inert;
+#    exec-argv is unchanged. The same actionable fixtures stay armed.
+# ===========================================================================
 printf '7777 1 %s\n' "$B" > "$PS_TABLE"
 rec STALE 0 > "$LIST_JSON"
 for probe in singleton-guard registry-reconcile exec-argv; do
-  : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$AUTH_LOG"
-  TELEPTY="$TELEPTY_STUB" CURL="$CURL_STUB" SINGLETON_SELF_PID=9999 \
-    node "$BOOT_CLI" __probe "$probe" >"$T_TMP/probe.out" 2>"$T_TMP/probe.err"
-  [ ! -s "$KILL_LOG" ] && [ ! -s "$CURL_LOG" ] && [ ! -s "$AUTH_LOG" ] \
-    || fail "M/$probe: probe acted or resolved auth"
+  reset
+  set +e
+  SINGLETON_SELF_PID=9999 node "$BOOT_CLI" __probe "$probe" >"$T_TMP/probe.out" 2>"$T_TMP/probe.err"
+  probe_rc=$?
+  set -e
+  [ ! -s "$CURL_LOG" ] && [ ! -s "$AUTH_LOG" ] && [ ! -s "$CAPS_LOG" ] || fail "M/$probe: probe ran the preflight or resolved auth"
+  no_destructive_effect "M/$probe"
   case "$probe" in
-    singleton-guard) grep -q 'would SIGKILL.*pid=7777' "$T_TMP/probe.err" || fail "M: missing kill verdict" ;;
-    registry-reconcile) grep -q 'would DELETE' "$T_TMP/probe.err" || fail "M: missing DELETE verdict" ;;
-    exec-argv) cmp "$ARGV_OUT" "$T_TMP/probe.out" || fail "M: probe argv changed" ;;
+    singleton-guard|registry-reconcile)
+      [ "$probe_rc" = "4" ] || fail "M/$probe: a removed probe must exit 4, got $probe_rc"
+      [ ! -s "$T_TMP/probe.out" ] || fail "M/$probe: a removed probe wrote stdout"
+      grep -qx "orchestrator-boot.sh: unknown __probe subcommand: $probe" "$T_TMP/probe.err" \
+        || fail "M/$probe: not the unknown-subcommand refusal: $(cat "$T_TMP/probe.err")"
+      grep -qE 'would (SIGKILL|DELETE)' "$T_TMP/probe.err" && fail "M/$probe: a removed effect was still described" ;;
+    exec-argv)
+      [ "$probe_rc" = "0" ] || fail "M/exec-argv exited $probe_rc"
+      cmp "$ARGV_OUT" "$T_TMP/probe.out" || fail "M: probe argv changed" ;;
   esac
 done
+
+# ===========================================================================
+# NEW) --dry-run probes nothing and claims no verdict, with every fixture armed.
+# ===========================================================================
+reset
+SINGLETON_SELF_PID=9999 node "$BOOT_CLI" --dry-run >"$T_TMP/dry.out" 2>"$T_TMP/dry.err" \
+  || fail "dry-run exited non-zero: $(cat "$T_TMP/dry.err")"
+[ ! -s "$CAPS_LOG" ] && [ ! -s "$CURL_LOG" ] && [ ! -s "$AUTH_LOG" ] || fail "dry-run probed (caps/curl/auth)"
+cp /dev/null "$T_TMP/boot.out"; cp /dev/null "$T_TMP/boot.err"
+no_destructive_effect "dry-run"
+grep -q 'only on a FRESH verdict' "$T_TMP/dry.out" || fail "dry-run does not say the exec needs a FRESH verdict"
+grep -qE 'boot preflight (FRESH|EXISTS)' "$T_TMP/dry.out" "$T_TMP/dry.err" && fail "dry-run reported an unprobed verdict"
+grep -qx '\[would-exec\] allow-create-v1' "$T_TMP/dry.out" || fail "dry-run [would-exec] verb is not allow-create-v1"
 
 echo "T40 PASS"

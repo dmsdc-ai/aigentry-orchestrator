@@ -82,7 +82,10 @@ const sid = 'fixture-it1171b';
 const hash = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 const save = (name, data) => fs.writeFileSync(path.join(evidence, name), typeof data === 'string' ? data : JSON.stringify(data, null, 2) + '\n');
 const noGit = dir => { for (;;) { assert.ok(!fs.existsSync(path.join(dir, '.git')), `git ancestor: ${dir}`); const up = path.dirname(dir); if (up === dir) break; dir = up; } };
-assert.equal(process.version, 'v20.20.0');
+// Task 1270 installed CI: admit ONLY the fixed pair — v20.20.0 (original measured baseline) and v26.13.0 (new measured
+// target). Every other runtime is rejected; the actual one is recorded below in fixture.json `version`.
+const ADMITTED_RUNTIMES = ['v20.20.0', 'v26.13.0'];
+assert.ok(ADMITTED_RUNTIMES.includes(process.version), `runtime ${process.version} is not an admitted installed-acceptance runtime`);
 noGit(tmp);
 fs.mkdirSync(evidence, { recursive: true });
 const fixture = fs.mkdtempSync(path.join(tmp, 'installed-boot-'));
@@ -277,9 +280,15 @@ test('exact installed boot selector acceptance (independent T134 A-I)', async t 
       const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
       assert.ok(pkg.files.includes(BOOT_DOC), `the installed package.json does not ship ${BOOT_DOC}`);
       const manifest = await import(pathToFileURL(path.join(root, 'bin/init/manifest.mjs')).href);
-      assert.deepEqual(manifest.MANIFEST.filter(p => p.startsWith('docs/setup/')), [BOOT_DOC],
-        'init must place exactly one docs/setup leaf');
-      assert.ok(manifest.GOVERNANCE_ROOTS.includes(BOOT_DOC));
+      // Task 1270 (CI 43736341103): init places EXACTLY TWO docs/setup leaves — this boot doc and
+      // docs/setup/worker-reports.md (#1170, the confined report pump). Both are required documents, each placed
+      // once, each a governance-root LEAF. (Was: "exactly one docs/setup leaf".) No manifest or doc is changed here.
+      const INIT_SETUP_DOCS = [BOOT_DOC, 'docs/setup/worker-reports.md'];
+      const setupLeaves = manifest.MANIFEST.filter(p => p.startsWith('docs/setup/'));
+      assert.deepEqual([...setupLeaves].sort(), [...INIT_SETUP_DOCS].sort(),
+        `init must place exactly these two docs/setup leaves, got: ${JSON.stringify(setupLeaves)}`);
+      assert.equal(setupLeaves.length, 2, 'each init-placed docs/setup leaf appears exactly once');
+      for (const leaf of INIT_SETUP_DOCS) assert.ok(manifest.GOVERNANCE_ROOTS.includes(leaf), `${leaf} is not a governance-root leaf`);
       assert.ok(!manifest.GOVERNANCE_ROOTS.includes('docs/setup/'),
         'docs/setup/ as a root would require MANIFEST entries for the other shipped setup docs');
 

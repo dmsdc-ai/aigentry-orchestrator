@@ -430,6 +430,16 @@ function shown(v: string): string {
 }
 
 /** One JSON object, or null for anything else (array, scalar, null, unparseable). */
+/**
+ * The sid as ONE strict RFC 3986 path segment: every character outside the unreserved set is percent-encoded.
+ * encodeURIComponent leaves ' ( ) * ! raw, and a raw quote does not survive every OS argument transport — measured on
+ * native Windows (CI 43736341103), where Git Bash's argv parser dropped a lone `'` from the unquoted URL element on its
+ * way through the boot command door. Fully encoded, the URL is plain data on every platform and decodes to the exact sid.
+ */
+function sidPathSegment(sid: string): string {
+  return encodeURIComponent(sid).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
 function jsonObject(text: string): Record<string, unknown> | null {
   try {
     const v: unknown = JSON.parse(text);
@@ -577,8 +587,8 @@ function bootPreflight(sid: string): Preflight {
   const missing = REQUIRED_DAEMON_CAPS.filter((cap) => !Array.isArray(caps) || !caps.includes(cap));
   if (missing.length > 0)
     return { verdict: "UNSUPPORTED", reason: `the daemon's /api/meta capabilities do not include ${missing.join(" and ")}` };
-  const where = `GET /api/sessions/${encodeURIComponent(sid)}`;
-  const s = localGet(target.port, `/api/sessions/${encodeURIComponent(sid)}`, token);
+  const where = `GET /api/sessions/${sidPathSegment(sid)}`;
+  const s = localGet(target.port, `/api/sessions/${sidPathSegment(sid)}`, token);
   if (s.status === 401 || s.status === 403) return { verdict: "CREDENTIAL_REFUSED", reason: `${where} answered ${s.status}` };
   if (s.status === 404)
     return jsonObject(s.body) !== null
@@ -1010,7 +1020,7 @@ async function dryRun(): Promise<never> {
   else {
     log(`would run 'telepty boot-capabilities' (the telepty on PATH) and require the sealed ${BOOT_CAPABILITIES_SCHEMA} document — not probed`);
     log(`would GET http://127.0.0.1:${target.port}/api/meta and require ${REQUIRED_DAEMON_CAPS.join(" and ")} — not probed`);
-    log(`would GET http://127.0.0.1:${target.port}/api/sessions/${encodeURIComponent(resolved.sid)} and boot only on 404 — not probed`);
+    log(`would GET http://127.0.0.1:${target.port}/api/sessions/${sidPathSegment(resolved.sid)} and boot only on 404 — not probed`);
   }
   log(`the exec below happens only on a FRESH verdict; a dry run probes nothing, so no verdict is reported (not probed)`);
   // Task 1201 §6.3 — the same handoff step with write:false. Nothing is written; the composed

@@ -1830,22 +1830,29 @@ test('shipping metadata declares the boot doc and the wizard suite', async t => 
       'docs/setup/ is declared wholesale; the exact-leaf reasoning below no longer holds');
   });
 
-  await t.test(`init's MANIFEST declares EXACTLY ${DOC} under docs/setup/`, () => {
+  // Task 1270 (CI 43736341103): init now places TWO docs/setup leaves — this boot doc and docs/setup/worker-reports.md
+  // (#1170, the confined report pump). Both are required documents; the subtest pins that EXACT set rather than the
+  // obsolete "exactly one leaf" or a loose inclusion. Nothing in the manifest is changed to fit a test.
+  const INIT_SETUP_DOCS = [DOC, 'docs/setup/worker-reports.md'];
+  await t.test(`init's MANIFEST declares EXACTLY the two init-placed docs/setup leaves (${INIT_SETUP_DOCS.join(', ')})`, () => {
     const under = manifest.MANIFEST.filter(p => p.startsWith('docs/setup/'));
-    assert.deepEqual(under, [DOC],
-      `init must place exactly this one docs/setup leaf, got: ${JSON.stringify(under)}`);
-    // …and the governance root is the LEAF, not the directory. This is the composition
+    assert.deepEqual([...under].sort(), [...INIT_SETUP_DOCS].sort(),
+      `init must place exactly these docs/setup leaves, got: ${JSON.stringify(under)}`);
+    assert.equal(under.length, 2, `exactly two docs/setup leaves, got: ${JSON.stringify(under)}`);
+    // …and each governance root is the LEAF, not the directory. This is the composition
     // that matters: `bin/init/manifest.mjs` asserts "every tarball path under a
     // GOVERNANCE_ROOT must appear in MANIFEST". Declaring `docs/setup/` as a root would
-    // drag in the other two docs/setup files package.json ships and turn a passing
+    // drag in the other docs/setup files package.json ships and turn a passing
     // packaging guard red for an unrelated reason.
-    assert.ok(manifest.GOVERNANCE_ROOTS.includes(DOC),
-      `${DOC} is shipped and init-placed but is not a governance root — it could ship without init placing it`);
+    for (const leaf of INIT_SETUP_DOCS) {
+      assert.ok(manifest.GOVERNANCE_ROOTS.includes(leaf),
+        `${leaf} is init-placed but is not a governance root — it could ship without init placing it`);
+    }
     assert.ok(!manifest.GOVERNANCE_ROOTS.includes('docs/setup/'),
       'docs/setup/ is a governance root; the other docs/setup files package.json ships would then require MANIFEST entries');
     // The composition, stated as the arithmetic it is: the tarball ships other
     // docs/setup files, and none of them is under a governance root.
-    const otherSetupShipped = pkg.files.filter(f => f.startsWith('docs/setup/') && f !== DOC);
+    const otherSetupShipped = pkg.files.filter(f => f.startsWith('docs/setup/') && !INIT_SETUP_DOCS.includes(f));
     assert.ok(otherSetupShipped.length > 0, 'fixture assumption changed: no other docs/setup file is shipped');
     for (const f of otherSetupShipped) {
       assert.ok(!manifest.GOVERNANCE_ROOTS.some(r => f === r || (r.endsWith('/') && f.startsWith(r))),
