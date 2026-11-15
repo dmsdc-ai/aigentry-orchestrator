@@ -10,7 +10,9 @@ name: Bridge readers (task 1270)
 #           83897518f31acdf7ab72b144d940c9bfaa31d3db, each pinned by SHA-256. Each test must fail
 #           at its specifically named new assertion (or, for the T52 invariant, pass).
 #   GREEN — after restoring the checked-out Git blobs and rebuilding, every test must pass. GREEN also
-#           runs the three migrated boot shell guards T131/T132/T135 whole; they are NOT part of RED.
+#           runs the three migrated boot shell guards T131/T132/T135 whole, and the four whole cleanup-contract
+#           MJS suites (g2c-pinned-clear, mandatory-report-1170 + review + rework-boundaries) via node --test;
+#           none of these is part of RED.
 # Test and source identity are recorded before, between and after, and must match the checkout.
 #
 # What this does NOT measure: native Windows (platform::session_pid there intentionally returns
@@ -109,7 +111,10 @@ jobs:
           shasum -a 256 tests/dispatch/T127_bridge_auditor_parity.sh tests/dispatch/T26_reconciler_inv17_surface_gone.sh \
             tests/dispatch/T52_cleanup_self_ancestor_guard.sh tests/dispatch/T106_cleanup_cli_contract.sh \
             tests/dispatch/T131_orchestrator_boot_parity.sh tests/dispatch/T132_orchestrator_boot_workspace_shim.sh \
-            tests/dispatch/T135_orchestrator_boot_handoff.sh > "$EVID/tests.sha256"
+            tests/dispatch/T135_orchestrator_boot_handoff.sh \
+            tests/dispatch/agent-metadata/g2c-pinned-clear.test.mjs tests/dispatch/agent-metadata/support/pinned-clear-actuators.mjs \
+            tests/report/mandatory-report-1170.test.mjs tests/report/mandatory-report-1170-review.test.mjs \
+            tests/report/mandatory-report-1170-rework-boundaries.test.mjs > "$EVID/tests.sha256"
           cat "$EVID/candidate-sources.sha256" "$EVID/tests.sha256"
           git cat-file -e "${BASELINE_COMMIT}^{commit}" || { echo "::error::baseline commit ${BASELINE_COMMIT} is not in the fetched history"; exit 1; }
           while read -r sum file; do
@@ -180,6 +185,26 @@ jobs:
           done
           exit "$bad"
 
+      - name: GREEN — the four whole cleanup-contract MJS suites (node --test, strict TAP)
+        run: |
+          # The default shell is `bash -eo pipefail`; -e is off so the real Node and tee exits are captured.
+          set +e -uo pipefail
+          tap="$EVID/green-cleanup-contract.tap"
+          node --test --test-reporter=tap \
+            tests/dispatch/agent-metadata/g2c-pinned-clear.test.mjs tests/report/mandatory-report-1170.test.mjs \
+            tests/report/mandatory-report-1170-review.test.mjs tests/report/mandatory-report-1170-rework-boundaries.test.mjs \
+            2>&1 | tee "$tap"
+          st=("${PIPESTATUS[@]}")
+          [ "${#st[@]}" -eq 2 ] || { echo "::error::expected 2 pipeline statuses, got ${#st[@]}: ${st[*]}"; exit 1; }
+          echo "green cleanup-contract-mjs node_exit=${st[0]} tee_exit=${st[1]}" >> "$EVID/exits.txt"
+          [ "${st[0]}" -eq 0 ] || { echo "::error::the cleanup-contract suites exited ${st[0]} (tee ${st[1]})"; exit "${st[0]}"; }
+          [ "${st[1]}" -eq 0 ] || { echo "::error::TAP capture (tee) exited ${st[1]}; the observation is incomplete, not a pass"; exit "${st[1]}"; }
+          grep -Eq '^# tests [1-9][0-9]*$' "$tap" || { echo "::error::empty run: no tests counted"; exit 1; }
+          grep -Eq '^# pass [1-9][0-9]*$' "$tap" || { echo "::error::empty pass: nothing passed"; exit 1; }
+          for line in '# fail 0' '# cancelled 0' '# skipped 0' '# todo 0'; do
+            grep -qx "$line" "$tap" || { echo "::error::TAP summary lacks '${line}'"; exit 1; }
+          done
+
       - name: Final identity — tests and sources still equal the checkout
         run: |
           set -euo pipefail
@@ -189,7 +214,10 @@ jobs:
             tests/dispatch/T127_bridge_auditor_parity.sh tests/dispatch/T26_reconciler_inv17_surface_gone.sh \
             tests/dispatch/T52_cleanup_self_ancestor_guard.sh tests/dispatch/T106_cleanup_cli_contract.sh \
             tests/dispatch/T131_orchestrator_boot_parity.sh tests/dispatch/T132_orchestrator_boot_workspace_shim.sh \
-            tests/dispatch/T135_orchestrator_boot_handoff.sh
+            tests/dispatch/T135_orchestrator_boot_handoff.sh \
+            tests/dispatch/agent-metadata/g2c-pinned-clear.test.mjs tests/dispatch/agent-metadata/support/pinned-clear-actuators.mjs \
+            tests/report/mandatory-report-1170.test.mjs tests/report/mandatory-report-1170-review.test.mjs \
+            tests/report/mandatory-report-1170-rework-boundaries.test.mjs
           cat "$EVID/exits.txt"
 
       - name: Preserve the per-cell review artifact (review only, not a publication)

@@ -32,6 +32,17 @@ const POSIX = process.platform === "darwin" || process.platform === "linux";
 const SKIP = POSIX ? false : `POSIX-only review reproductions; not run on ${process.platform}`;
 const H = POSIX ? await import("../dispatch/agent-metadata/support/harness.mjs") : null;
 const K = POSIX ? worldKit(H) : null;
+// Task 1270: cleanup's read-only versioned-bridge precheck (`ps -eo pid,ppid,command`) runs BEFORE report capture. A
+// capture-failure world configures an explicit SUCCESSFUL empty process view (existing psTable schema; the fake's
+// rc-97 trap stays for everything unconfigured), and the refused cleanup's trace must be EXACTLY that one precheck
+// first, then report-list, with no other non-registry call.
+const EMPTY_PS_VIEW = "  PID  PPID COMMAND\n";
+const PRECHECK = { role: "ps", argv: ["-eo", "pid,ppid,command"], rc: 0 };
+function assertPrecheckOnly(calls, label) {
+  assert.deepEqual(calls[0], PRECHECK, `${label}: the first call is the successful read-only precheck`);
+  assert.deepEqual([calls[1]?.role, calls[1]?.argv[0]], ["dispatch-registry.py", "report-list"], `${label}: capture follows the precheck`);
+  assert.deepEqual(calls.filter((c) => c.role !== "dispatch-registry.py"), [PRECHECK], `${label}: no teardown actuator reached`);
+}
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const env1170 = await import(pathToFileURL(path.join(REPO, "dist/src/report/envelope.js")).href);
 
@@ -108,10 +119,11 @@ test("F1c unreadable outbox (worker chmod 000) = controller fail-closed policy: 
     assert.equal(st.status, 3, "report-status degraded (visible)");
     assert.ok(JSON.parse(st.stdout).health.errors[d.did].includes("outbox_root_invalid"));
     const before = w.activeRaw();
+    w.set({ psTable: EMPTY_PS_VIEW });
     const c = w.cleanup(wk.sid);
     assert.equal(c.status, 1, "fail-closed: cleanup refused");
     assert.match(c.stderr, new RegExp(`REPORT_CAPTURE_FAILED for ${wk.sid}: ${d.did}:outbox_root_invalid`), "named in the refusal");
-    assert.deepEqual(c.calls.filter((x) => x.role !== "dispatch-registry.py"), [], "no teardown actuator reached");
+    assertPrecheckOnly(c.calls, "F1c");
     assert.equal(w.activeRaw(), before, "registry untouched");
     assert.equal(fs.statSync(wk.outbox).mode & 0o777, 0, "no permission reset by the product");
   } finally {
@@ -134,10 +146,11 @@ test("F1d malformed helper output fails capture and refuses cleanup while preser
   assert.match(p.stdout, /capture_failed=2 .*helper_protocol_invalid/);
   assert.deepEqual(rep(w, d).items, {});
   const state = w.activeRaw();
+  w.set({ psTable: EMPTY_PS_VIEW });
   const c = w.cleanup(wk.sid);
   assert.equal(c.status, 1, c.stdout + c.stderr);
   assert.match(c.stderr, /REPORT_CAPTURE_FAILED.*helper_protocol_invalid/);
-  assert.deepEqual(c.calls.filter(x => x.role !== "dispatch-registry.py"), [], "no teardown actuator reached");
+  assertPrecheckOnly(c.calls, "F1d");
   assert.equal(w.activeRaw(), state);
   assert.ok(fs.readFileSync(item.file).equals(item.bytes));
 });

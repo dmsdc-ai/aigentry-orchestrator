@@ -31,6 +31,17 @@ const POSIX = process.platform === "darwin" || process.platform === "linux";
 const SKIP = POSIX ? false : `POSIX-only lifecycle suite (sealed modes, bash shim); not run on ${process.platform}`;
 const H = POSIX ? await import("../dispatch/agent-metadata/support/harness.mjs") : null;
 const K = POSIX ? worldKit(H) : null;
+// Task 1270: cleanup's read-only versioned-bridge precheck (`ps -eo pid,ppid,command`) runs BEFORE report capture. A
+// capture-failure world configures an explicit SUCCESSFUL empty process view (existing psTable schema; the fake's
+// rc-97 trap stays for everything unconfigured), and the refused cleanup's trace must be EXACTLY that one precheck
+// first, then report-list, with no other non-registry call.
+const EMPTY_PS_VIEW = "  PID  PPID COMMAND\n";
+const PRECHECK = { role: "ps", argv: ["-eo", "pid,ppid,command"], rc: 0 };
+function assertPrecheckOnly(calls, label) {
+  assert.deepEqual(calls[0], PRECHECK, `${label}: the first call is the successful read-only precheck`);
+  assert.deepEqual([calls[1]?.role, calls[1]?.argv[0]], ["dispatch-registry.py", "report-list"], `${label}: capture follows the precheck`);
+  assert.deepEqual(calls.filter((c) => c.role !== "dispatch-registry.py"), [PRECHECK], `${label}: no teardown actuator reached`);
+}
 
 const T0 = Date.parse("2026-10-09T12:00:00Z");
 /** ISO second `min` minutes after the 12:00 dispatch. */
@@ -392,11 +403,12 @@ test("L-12 cleanup: capture before teardown; capture failure refuses with nothin
   const rB = w.write(dB, "REPORT", 1, "cannot be captured: sealed chain broken");
   fs.appendFileSync(wkB.manifest, " "); // sealed manifest no longer matches the pinned hash
   const before = w.activeRaw();
+  w.set({ psTable: EMPTY_PS_VIEW });
   const cB = w.cleanup(wkB.sid);
   assert.equal(cB.status, 1, cB.stdout + cB.stderr);
   assert.match(cB.stderr, new RegExp(`REPORT_CAPTURE_FAILED for ${wkB.sid}: ${dB.did}:chain_`));
-  assert.deepEqual(cB.calls.filter((c) => c.role !== "dispatch-registry.py"), [], "nothing torn down");
-  assert.deepEqual(cB.calls.map((c) => c.argv[0]), ["report-list"]);
+  assertPrecheckOnly(cB.calls, "L-12 nothing torn down");
+  assert.deepEqual(cB.calls.map((c) => [c.role, c.argv[0]]), [["ps", "-eo"], ["dispatch-registry.py", "report-list"]]);
   assert.equal(w.activeRaw(), before, "registry untouched");
   assert.ok(fs.readFileSync(rB.file).equals(rB.bytes), "worker item preserved");
 
