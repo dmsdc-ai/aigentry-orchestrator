@@ -371,7 +371,11 @@ test("relation gates nothing in cli.ts: one writer call, relation only interpola
   for (const lit of ["same-recorded-target", "different-recorded-target", "target-unknown"]) assert.ok(!src.includes(lit), lit);
   const main = src.slice(src.indexOf("async function main()"), src.indexOf("function help()"));
   const at = (s: string) => main.indexOf(s);
-  assert.ok(at("orchestratorSingletonGuard(") >= 0 && at("orchestratorSingletonGuard(") < at("writeControllerBootRecord("));
+  // Task 1270: the singleton SIGKILL guard and the DELETE reconcile are REMOVED; the record now follows a SUCCESSFUL bounded
+  // boot preflight, and every non-FRESH verdict exits (refusePreflight) before the writer can run.
+  for (const gone of ["orchestratorSingletonGuard", "orchestratorRegistryReconcile"]) assert.ok(!src.includes(gone), `${gone} is back`);
+  assert.ok(at("bootPreflight(") >= 0 && at("bootPreflight(") < at("writeControllerBootRecord("), "record after the preflight");
+  assert.ok(at("refusePreflight(") >= 0 && at("refusePreflight(") < at("writeControllerBootRecord("), "a refused preflight exits before the record");
   assert.ok(at("writeControllerBootRecord(") < at("emitExecArgv("));
 });
 
@@ -817,9 +821,21 @@ test("nested exact keys: an extra key in pane or in a launch value is invalid, a
 // cli.js is run directly (never the shim, so nothing can be exec'd). ps/kill/curl/telepty are
 // recorder scripts; real binaries that must never run sit first on PATH as tripwires; the auth
 // door is a synthetic bash function. The compiled test sits at dist/tests/session.
+// Task 1270: the boot's only effects before the record are its bounded preflight — `telepty boot-capabilities` (the PATH
+// telepty, which stays a tripwire for EVERY other argv) and two curl GETs (/api/meta, /api/sessions/<sid>). The ps/kill and
+// TELEPTY(list) stubs stay armed: the removed SIGKILL guard and DELETE reconcile must never reach them.
 const CLI_JS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "src", "orchestrator-boot", "cli.js");
 const RECORD_LINE_PREFIX = "[orchestrator-boot] boot record: ";
-const PLAN_ARGV = ["telepty", "allow", "--id", "orch-1162", "--auto-restart", "claude", "--permission-mode", "manual"];
+const PLAN_ARGV = ["telepty", "allow-create-v1", "--id", "orch-1162", "--auto-restart", "claude", "--permission-mode", "manual"];
+// The exact sealed `telepty boot-capabilities` line (telepty cli.js bootCapabilitiesLine).
+const SEALED_CAPS = '{"schema":"telepty-boot-capabilities-v1","verbs":["allow-create-v1"],"viewer_detach":"nondeleting-v1"}';
+// What one successful preflight puts in the effects log, in order (curl records only the URL, never the token header).
+const preflightEffects = (sid: string) => [
+  "telepty-path boot-capabilities",
+  "curl http://127.0.0.1:3848/api/meta",
+  `curl http://127.0.0.1:3848/api/sessions/${encodeURIComponent(sid)}`,
+];
+const effectLines = (file: string) => fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
 // An --import preload that logs every sync fs call on a `/sessions` path (`\sessions` on win32):
 // "no read and no write" is then a measurement. `realpathSync.native` is wrapped too, so the
 // win32 arm (and the primitive's SystemRoot check) keep it. Inline (data: URL) so it needs no extra file.
@@ -837,6 +853,24 @@ const TRACE_SRC = [
 ].join("\n");
 const TRACE_IMPORT = `data:text/javascript,${encodeURIComponent(TRACE_SRC)}`;
 
+// Task 1270 (orch-windows-preflight): the preflight starts `telepty boot-capabilities` and the CURL seam through the SAME
+// explicit bash door as the credential lookup (fixed `bash -c` text, values as positional arguments). So the fixture PATH must
+// be a real PATH on every platform: joined with path.delimiter (the POSIX value is byte-identical to the previous `:` join),
+// and on win32 it must reach an EXISTING Git-for-Windows bash — the first PATH dir holding BOTH bash.exe and sh.exe, which
+// excludes the System32 WSL launcher. No bash is installed or copied; its absence is a named GAP failure, never a skip.
+// The #!/bin/sh stubs are then reached exactly the way production reaches them (bash `exec`); nothing is intercepted.
+function windowsGitBashDir(): string {
+  const dir = (process.env.PATH ?? "").split(path.delimiter)
+    .find((d) => d !== "" && fs.existsSync(path.join(d, "bash.exe")) && fs.existsSync(path.join(d, "sh.exe")));
+  assert.ok(dir !== undefined,
+    "GAP: no Git-for-Windows bash (a PATH dir with bash.exe AND sh.exe) on this runner; the boot preflight's command door cannot run here");
+  return dir;
+}
+function fixturePath(trip: string): string {
+  const dirs = WIN ? [trip, windowsGitBashDir(), path.dirname(process.execPath)] : [trip, "/usr/bin", "/bin", path.dirname(process.execPath)];
+  return dirs.join(path.delimiter);
+}
+
 function cliFixture() {
   const f = fixture();
   const stub = path.join(f.base, "stub");
@@ -852,11 +886,31 @@ function cliFixture() {
   const script = (p: string, body: string) => fs.writeFileSync(p, `#!/bin/sh\n${body}\n`, { mode: 0o700 });
   script(path.join(stub, "ps"), `printf 'ps %s\\n' "$*" >> '${effects}'`);
   script(path.join(stub, "kill"), `printf 'kill %s\\n' "$*" >> '${effects}'`);
-  script(path.join(stub, "curl"), `printf 'curl %s\\n' "$*" >> '${effects}'; printf '200'`);
+  // The CURL seam: answers the preflight's two GETs per route (the URL is the last argument) and records ONLY the URL.
+  // FIXTURE_SESSION=exists makes the exact-id lookup answer 200 (an existing session).
+  script(path.join(stub, "curl"), [
+    'for a in "$@"; do u="$a"; done',
+    `printf 'curl %s\\n' "$u" >> '${effects}'`,
+    'case "$u" in',
+    `  */api/meta) printf '%s\\n200' '{"capabilities":["sessions","wrapped-sessions","register-create-only"]}' ;;`,
+    `  */api/sessions/*) if [ "$FIXTURE_SESSION" = exists ]; then printf '%s\\n200' '{"id":"orch-1162","type":"wrapped","alias":null}'; else printf '%s\\n404' '{"error":"Session not found"}'; fi ;;`,
+    `  *) printf '\\n000'; exit 7 ;;`,
+    'esac',
+  ].join("\n"));
   script(path.join(stub, "telepty"), `printf 'telepty %s\\n' "$*" >> '${effects}'; printf '[]'`);
-  for (const b of ["cmux", "curl", "telepty", "claude", "codex", "gemini", "grok", "kill", "pkill", "killall", "osascript", "open", "launchctl"]) {
+  for (const b of ["cmux", "curl", "claude", "codex", "gemini", "grok", "kill", "pkill", "killall", "osascript", "open", "launchctl"]) {
     script(path.join(trip, b), `printf '${b} %s\\n' "$*" >> '${tripLog}'; exit 97`);
   }
+  // PATH's telepty: a tripwire for every argv except exactly `boot-capabilities`, which answers the sealed document (or an
+  // old telepty's help + exit 0 when FIXTURE_BOOT_CAPS=old).
+  script(path.join(trip, "telepty"), [
+    'if [ "$#" -eq 1 ] && [ "$1" = boot-capabilities ]; then',
+    `  printf 'telepty-path %s\\n' "$*" >> '${effects}'`,
+    `  if [ "$FIXTURE_BOOT_CAPS" = old ]; then printf 'Usage: telepty <command>\\n'; exit 0; fi`,
+    `  printf '%s\\n' '${SEALED_CAPS}'; exit 0`,
+    "fi",
+    `printf 'telepty %s\\n' "$*" >> '${tripLog}'; exit 97`,
+  ].join("\n"));
   fs.writeFileSync(path.join(shimLib, "telepty-auth.sh"), 'telepty_auth_token() { printf "fixture-token-1162"; }\n');
   const run = (args: string[], over: Record<string, string> = {}) => {
     const r = spawnSync(process.execPath, ["--import", TRACE_IMPORT, CLI_JS, ...args], {
@@ -865,7 +919,7 @@ function cliFixture() {
       input: "",
       timeout: 30_000,
       env: {
-        PATH: `${trip}:/usr/bin:/bin:${path.dirname(process.execPath)}`,
+        PATH: fixturePath(trip),
         HOME: fakeHome, TMPDIR: tmp, AIGENTRY_HOME: f.root,
         AIGENTRY_SHIM_SCRIPT_DIR: path.join(f.base, "shim", "bin"),
         SINGLETON_PS_CMD: path.join(stub, "ps"), KILL_CMD: path.join(stub, "kill"),
@@ -889,11 +943,16 @@ function cliFixture() {
 const recordLines = (stderr: string) => stderr.split("\n").filter((l) => l.startsWith(RECORD_LINE_PREFIX));
 const withoutRecordLine = (stderr: string) => stderr.split("\n").filter((l) => !l.startsWith(RECORD_LINE_PREFIX)).join("\n");
 
-test("cli boot: stdout argv and exit are independent of the record outcome; one fixed stderr line after the guards", () => {
+test("cli boot: stdout argv and exit are independent of the record outcome; one fixed stderr line after the preflight", () => {
   const c = cliFixture();
   const expectedStdout = `${PLAN_ARGV.join("\n")}\n`;
   const runs: Array<[string, ReturnType<typeof c.run>]> = [];
 
+  // Task 1270 — WINDOWS COVERAGE IS PRESERVED, NOT SUBSTITUTED. These boot-path record/content/order runs stay registered on
+  // every platform they were registered on before. History: with the preflight spawning `telepty`/CURL directly (shell:false,
+  // win32 resolves only .com/.exe) they could not pass on win32 (orch-test-coupling-win/HOLD.md). orch-windows-preflight routes
+  // both launches through the existing bash command door and gives this fixture a real win32 PATH (fixturePath); the win32
+  // result of that fix has NOT been run here and is owed to independent Windows CI. No skip, substitute or narrowed acceptance.
   runs.push(["written relation=first", c.run([])]);
   const target = targetOf(c.root);
   const st = fs.lstatSync(target);
@@ -922,32 +981,83 @@ test("cli boot: stdout argv and exit are independent of the record outcome; one 
     if (!want.startsWith("skipped:sid")) assert.equal(withoutRecordLine(r.stderr), baseStderr, `${want}: other stderr unchanged`);
     const all = r.stderr.split("\n");
     const at = (p: string) => all.findIndex((l) => l.includes(p));
-    assert.ok(at("singleton guard done") >= 0 && at("singleton guard done") < at(RECORD_LINE_PREFIX), `${want}: record after the guard`);
+    // Task 1270: the record follows a SUCCESSFUL bounded preflight (was: "after the singleton guard", which is removed).
+    assert.ok(at("boot preflight FRESH") >= 0 && at("boot preflight FRESH") < at(RECORD_LINE_PREFIX), `${want}: record after the preflight`);
     assert.ok(at(RECORD_LINE_PREFIX) < at("[orchestrator-boot] exec "), `${want}: record before the argv`);
     for (const s of [...SECRETS, "fixture-token-1162"]) assert.ok(!r.stdout.includes(s) && !r.stderr.includes(s), `${want}: leaks ${s}`);
   }
-  if (WIN) {
-    // The seams are extensionless #!/bin/sh recorders, which win32 cannot spawn (only .com/.exe are
-    // tried): the guard saw an empty table and the reconcile was skipped — no real ps/telepty ran.
-    const first = runs[0]![1].stderr;
-    assert.ok(first.includes("singleton guard done: killed=0") && first.includes("registry reconcile SKIPPED"), first);
-  } else {
-    assert.ok(fs.readFileSync(c.effects, "utf8").includes("ps "), "the guard ran through the ps recorder");
+  // Exactly the preflight, once per boot, in order — and never a ps, kill, `telepty list` or DELETE (the removed effects).
+  const sids = ["orch-1162", "orch-1162", "orch-1162", "a/../b", "orch-1162"];
+  assert.deepEqual(effectLines(c.effects), sids.flatMap(preflightEffects), "the effects are exactly the bounded preflights");
+  assert.equal(fs.readFileSync(c.tripLog, "utf8"), "", "no real binary was reached");
+});
+
+test("cli boot: an existing session or an old telepty stops the boot with no record, no argv and nothing killed or deleted", () => {
+  const c = cliFixture();
+  // Registered on every platform, like the boot test above (same win32 expectation and HOLD; no platform branch here).
+  // A prior record from a successful boot, so "untouched" is measurable.
+  assert.equal(c.run([]).status, 0);
+  const target = targetOf(c.root);
+  const before = snapshot(target, true);
+  for (const [over, verdict, effects] of [
+    [{ FIXTURE_SESSION: "exists" }, "EXISTS_IDENTITY_UNPROVEN", preflightEffects("orch-1162")],
+    [{ FIXTURE_BOOT_CAPS: "old" }, "UNSUPPORTED", ["telepty-path boot-capabilities"]],
+  ] as Array<[Record<string, string>, string, string[]]>) {
+    const name = JSON.stringify(over);
+    const baseline = effectLines(c.effects).length;
+    const r = c.run([], over);
+    assert.equal(r.status, 3, `${name}: exit`);
+    assert.equal(r.stdout, "", `${name}: a refused preflight wrote to the exec-argv channel`);
+    assert.match(r.stderr, new RegExp(`boot preflight ${verdict} for 'orch-1162'`), `${name}: verdict`);
+    assert.match(r.stderr, /Nothing was created, attached, signalled, deleted or exec'd\./, `${name}: zero-effect statement`);
+    assert.deepEqual(recordLines(r.stderr), [], `${name}: record line`);
+    assert.equal(r.traced, "", `${name}: touched sessions/: ${r.traced}`);
+    assert.deepEqual(snapshot(target, true), before, `${name}: the prior record changed`);
+    assert.deepEqual(effectLines(c.effects).slice(baseline), effects, `${name}: only the bounded preflight ran — no ps, kill, list or DELETE`);
+    for (const s of [...SECRETS, "fixture-token-1162"]) assert.ok(!r.stdout.includes(s) && !r.stderr.includes(s), `${name}: leaks ${s}`);
   }
+  assert.equal(fs.readFileSync(c.tripLog, "utf8"), "", "no real binary was reached");
+});
+
+test("cli boot: the preflight command door passes values as arguments — shell metacharacters in the sid and the CURL path stay data", () => {
+  // Task 1270 (orch-windows-preflight): the probe and the GETs go through `bash -c <FIXED text>` with every value positional.
+  // Two values the boot really carries are made hostile, and the real door is exercised with no other effect:
+  //   - the sid (validateSid admits it: no whitespace, no control character, no leading '-');
+  //   - the CURL seam path: a directory name with spaces, quotes, `$(...)`, `;` and `&` (all legal in file names on every OS).
+  // If either value were spliced into the script text, its `touch` would create a canary file in the boot's cwd (c.base).
+  const c = cliFixture();
+  const sid = "orch';$(touch${IFS}SIDPWNED)";
+  const weird = path.join(c.base, "cu rl $(touch CURLPWNED); & 'q'");
+  fs.mkdirSync(weird, { mode: 0o700 });
+  const curl = path.join(weird, "curl");
+  fs.copyFileSync(path.join(c.base, "stub", "curl"), curl);
+  fs.chmodSync(curl, 0o700);
+  const r = c.run([], { ORCHESTRATOR_SID: sid, CURL: curl });
+  assert.equal(r.status, 0, `exit: ${r.stderr}`);
+  assert.deepEqual(r.stdout.split("\n").filter(Boolean), ["telepty", "allow-create-v1", "--id", sid, "--auto-restart", "claude", "--permission-mode", "manual"],
+    "the sid is ONE argv element, byte-exact");
+  assert.deepEqual(effectLines(c.effects), preflightEffects(sid), "the probe and both GETs ran once each, the URL as one argument");
+  for (const canary of ["SIDPWNED", "CURLPWNED"]) {
+    assert.ok(!listTree(c.base).some((p) => path.basename(p) === canary), `${canary}: a value was executed as shell text`);
+  }
+  for (const s of [...SECRETS, "fixture-token-1162"]) assert.ok(!r.stdout.includes(s) && !r.stderr.includes(s), `leaks ${s}`);
   assert.equal(fs.readFileSync(c.tripLog, "utf8"), "", "no real binary was reached");
 });
 
 test("cli no-exec modes: help/dry-run/probe/wizard-plan/unknown/refusals do NO record read and NO write", () => {
   const c = cliFixture();
+  // The prior record comes from a real CLI boot on every platform, as before task 1270 (win32: see the HOLD note above).
   assert.equal(c.run([]).status, 0);
   const target = targetOf(c.root);
   const before = snapshot(target, true);
+  const effectsBefore = fs.readFileSync(c.effects, "utf8");
   const cases: Array<[string[], Record<string, string>, number]> = [
     [["--help"], {}, 0],
     [["-h"], {}, 0],
     [["--dry-run"], {}, 0],
-    [["__probe", "singleton-guard"], {}, 0],
-    [["__probe", "registry-reconcile"], {}, 0],
+    // Task 1270: the destructive probe doors are REMOVED; both land on the unknown-subcommand arm (exit 4).
+    [["__probe", "singleton-guard"], {}, 4],
+    [["__probe", "registry-reconcile"], {}, 4],
     [["__probe", "exec-argv"], {}, 0],
     [["--wizard-plan"], {}, 2],
     [["--bogus"], {}, 2],
@@ -962,6 +1072,8 @@ test("cli no-exec modes: help/dry-run/probe/wizard-plan/unknown/refusals do NO r
     assert.deepEqual(recordLines(r.stderr), [], `${name}: record line`);
     assert.ok(!r.stdout.includes(RECORD_LINE_PREFIX), `${name}: record line on stdout`);
     assert.deepEqual(snapshot(target, true), before, `${name}: record changed`);
+    // No no-exec mode probes, lists, signals or deletes anything (the dry run in particular probes nothing).
+    assert.equal(fs.readFileSync(c.effects, "utf8"), effectsBefore, `${name}: an effect seam was reached`);
   }
   assert.deepEqual(listTree(c.sessions), ["orch-1162", "orch-1162/controller", "orch-1162/controller/boot-record.json"]);
   assert.equal(fs.readFileSync(c.tripLog, "utf8"), "", "no real binary was reached");
