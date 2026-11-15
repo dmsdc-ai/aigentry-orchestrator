@@ -799,7 +799,8 @@ test("PC-U04 PS-UNKNOWN truncated view without its final newline → capture kep
 
 test("PC-U05 PS-UNKNOWN oversize view beyond the existing default output bound → capture kept, process-view-unverified", () => {
   const filler = Array.from({ length: 20000 }, (_, i) => ` ${20000 + i}     1 filler-process-${"x".repeat(48)}`);
-  expectUnverified(cleanup("u05", { ps: psTable([PS_O, PS_S, PS_C, ...filler]) }), "query-failed");
+  // drainOutput: the fake exits naturally so its whole table really reaches the bounded consumer (no exit truncation).
+  expectUnverified(cleanup("u05", { ps: psTable([PS_O, PS_S, PS_C, ...filler]), fakes: { ps: { drainOutput: true } } }), "query-failed");
 });
 
 test("PC-U06 PS-UNKNOWN query killed by a signal → capture kept, process-view-unverified", () => {

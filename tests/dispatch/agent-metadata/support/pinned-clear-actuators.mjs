@@ -57,4 +57,6 @@ if (s.sleepMs && s.sleepOnceAt !== undefined) {
 if (s.stdoutFile) process.stdout.write(fs.readFileSync(s.stdoutFile));
 if (s.stdout) process.stdout.write(s.stdout);
 if (s.stderr) process.stderr.write(s.stderr);
-process.exit(s.rc ?? 0);
+// Task 1270 (opt-in drainOutput: true): exit naturally with exitCode so pending stdout is not truncated by process.exit().
+if (s.drainOutput === true) process.exitCode = s.rc ?? 0;
+else process.exit(s.rc ?? 0);
