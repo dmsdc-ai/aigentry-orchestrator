@@ -98,9 +98,15 @@ cat "$STUB_LIST_FILE"
 EOF
 # Task 1270: the preflight's two GETs, answered by route as `<body>\n<code>` — FRESH: meta with both
 # capabilities, the exact fixture sid 404. Full argv recorded; any other URL fails the transport.
+# One entry per curl INVOCATION: `<method> <last argv element>` (method = the -X value, else GET). The raw
+# CURL_LOG keeps the full argv, whose `-w` argument holds a real newline, so its physical lines are not calls.
+CURL_JOURNAL="$T_TMP/curl-journal.log"
 cat > "$STUB_BIN/curl-recorder135.sh" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$CURL_LOG"
+m=GET; p=""
+for a in "\$@"; do if [ "\$p" = -X ]; then m="\$a"; fi; p="\$a"; done
+printf '%s %s\n' "\$m" "\${!#}" >> "$CURL_JOURNAL"
 case "\${!#}" in
   http://127.0.0.1:3848/api/meta)          printf '%s\n200' '{"capabilities":["sessions","wrapped-sessions","register-create-only"]}' ;;
   http://127.0.0.1:3848/api/sessions/$SID) printf '%s\n404' '{"error":"Session not found"}' ;;
@@ -129,7 +135,7 @@ EOF
 chmod +x "$STUB_BIN"/*135.sh "$EXEC_DIR/telepty" "$CAPS_DIR/telepty"
 export SINGLETON_PS_CMD="$STUB_BIN/ps-recorder135.sh" KILL_CMD="$STUB_BIN/kill-recorder135.sh"
 export TELEPTY="$STUB_BIN/telepty-recorder135.sh" CURL="$STUB_BIN/curl-recorder135.sh"
-reset() { : > "$PS_ARGV"; : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$TELEPTY_ARGV"; : > "$EXEC_LOG"; : > "$AUTH_LOG"; : > "$CAPS_LOG"; : > "$CAPS_TRIP"; }
+reset() { : > "$PS_ARGV"; : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$CURL_JOURNAL"; : > "$TELEPTY_ARGV"; : > "$EXEC_LOG"; : > "$AUTH_LOG"; : > "$CAPS_LOG"; : > "$CAPS_TRIP"; }
 lines() { grep -c . "$1" 2>/dev/null || true; }
 assert_inert() {
   [ "$(lines "$KILL_LOG")" = 0 ] || fail "$1: a kill was issued: $(cat "$KILL_LOG")"
@@ -143,9 +149,9 @@ assert_inert() {
 assert_preflight_only() {
   [ "$(lines "$CAPS_LOG")" = 1 ] || fail "$1: expected exactly one capability probe: $(cat "$CAPS_LOG")"
   [ "$(lines "$CAPS_TRIP")" = 0 ] || fail "$1: telepty ran with an unexpected argv: $(cat "$CAPS_TRIP")"
-  [ "$(lines "$CURL_LOG")" = 2 ] || fail "$1: expected exactly the two preflight GETs: $(cat "$CURL_LOG")"
-  sed -n '1p' "$CURL_LOG" | grep -q -- ' http://127.0.0.1:3848/api/meta$' || fail "$1: first request is not GET /api/meta: $(cat "$CURL_LOG")"
-  sed -n '2p' "$CURL_LOG" | grep -q -- " http://127.0.0.1:3848/api/sessions/$SID\$" || fail "$1: second request is not GET /api/sessions/$SID: $(cat "$CURL_LOG")"
+  [ "$(grep -c '' "$CURL_JOURNAL")" = 2 ] || fail "$1: expected exactly the two preflight GETs (curl invocations): $(cat "$CURL_JOURNAL")"
+  [ "$(sed -n '1p' "$CURL_JOURNAL")" = "GET http://127.0.0.1:3848/api/meta" ] || fail "$1: first request is not GET /api/meta: $(cat "$CURL_JOURNAL")"
+  [ "$(sed -n '2p' "$CURL_JOURNAL")" = "GET http://127.0.0.1:3848/api/sessions/$SID" ] || fail "$1: second request is not GET /api/sessions/$SID: $(cat "$CURL_JOURNAL")"
   [ "$(grep -c 'x-telepty-token: fixture-token-T135' "$CURL_LOG")" = 2 ] || fail "$1: the two GETs did not both carry the credential"
   grep -q -- '-X DELETE' "$CURL_LOG" && fail "$1: a DELETE was issued: $(cat "$CURL_LOG")"
   [ "$(lines "$KILL_LOG")" = 0 ] || fail "$1: a kill was issued: $(cat "$KILL_LOG")"

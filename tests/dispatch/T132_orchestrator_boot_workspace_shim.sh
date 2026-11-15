@@ -82,6 +82,9 @@ cat "$LIST_JSON"
 exit 0
 EOF
 CURL_LOG="$T_TMP/curl-calls.log"
+# One entry per curl INVOCATION: `<method> <last argv element>` (method = the -X value, else GET). The raw
+# CURL_LOG keeps the full argv, whose `-w` argument holds a real newline, so its physical lines are not calls.
+CURL_JOURNAL="$T_TMP/curl-journal.log"
 CURL_STUB="$STUB_BIN/curl132.sh"
 # Task 1270: answers the preflight's two GETs by route as `<body>\n<code>` (curl -w '\n%{http_code}'):
 # FRESH = meta with both capabilities, the exact sid 404. Its full argv is recorded; any DELETE would show.
@@ -89,6 +92,9 @@ META_BODY='{"capabilities":["sessions","wrapped-sessions","register-create-only"
 cat > "$CURL_STUB" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$CURL_LOG"
+m=GET; p=""
+for a in "\$@"; do if [ "\$p" = -X ]; then m="\$a"; fi; p="\$a"; done
+printf '%s %s\n' "\$m" "\${!#}" >> "$CURL_JOURNAL"
 case "\${!#}" in
   http://127.0.0.1:3848/api/meta)          printf '%s\n200' '$META_BODY' ;;
   http://127.0.0.1:3848/api/sessions/$SID) printf '%s\n404' '{"error":"Session not found"}' ;;
@@ -97,7 +103,7 @@ esac
 exit 0
 EOF
 chmod +x "$PS_STUB" "$KILL_STUB" "$LIST_STUB" "$CURL_STUB"
-: > "$KILL_LOG"; : > "$CURL_LOG"
+: > "$KILL_LOG"; : > "$CURL_LOG"; : > "$CURL_JOURNAL"
 
 BRIDGE="node /usr/local/bin/telepty allow --id $SID --auto-restart claude --dangerously-skip-permissions --continue"
 cat > "$PS_TABLE" <<EOF
@@ -128,11 +134,12 @@ chmod +x "$EXEC_DIR/telepty"
 # meta then the exact sid, each carrying the credential header; nothing is killed or deleted.
 preflight_only() {
   [ "$(grep -c . "$CAPS_LOG")" = 1 ] || fail "$1: expected exactly one capability probe: $(cat "$CAPS_LOG")"
-  [ "$(grep -c . "$CURL_LOG")" = 2 ] || fail "$1: expected exactly the two preflight GETs: $(cat "$CURL_LOG")"
-  sed -n '1p' "$CURL_LOG" | grep -q -- ' http://127.0.0.1:3848/api/meta$' \
-    || fail "$1: the first request is not GET /api/meta: $(cat "$CURL_LOG")"
-  sed -n '2p' "$CURL_LOG" | grep -q -- " http://127.0.0.1:3848/api/sessions/$SID\$" \
-    || fail "$1: the second request is not GET /api/sessions/$SID: $(cat "$CURL_LOG")"
+  [ "$(grep -c '' "$CURL_JOURNAL")" = 2 ] \
+    || fail "$1: expected exactly the two preflight GETs (curl invocations): $(cat "$CURL_JOURNAL")"
+  [ "$(sed -n '1p' "$CURL_JOURNAL")" = "GET http://127.0.0.1:3848/api/meta" ] \
+    || fail "$1: the first request is not GET /api/meta: $(cat "$CURL_JOURNAL")"
+  [ "$(sed -n '2p' "$CURL_JOURNAL")" = "GET http://127.0.0.1:3848/api/sessions/$SID" ] \
+    || fail "$1: the second request is not GET /api/sessions/$SID: $(cat "$CURL_JOURNAL")"
   grep -q -- '-X DELETE' "$CURL_LOG" && fail "$1: a DELETE was issued: $(cat "$CURL_LOG")"
   [ ! -s "$KILL_LOG" ] || fail "$1: the stale bridge fixture was signalled: $(cat "$KILL_LOG")"
   return 0
@@ -216,7 +223,7 @@ grep -qF 'AIGENTRY_BOOT_PLAN' "$T_TMP/np.err" || fail "N0: the refusal does not 
 # A) a real boot from the workspace layout: the package's dist/ resolves, the
 #    preflight runs (task 1270: caps → meta → exact sid, FRESH), and the boot ends in the exec.
 # ===========================================================================
-: > "$CURL_LOG"; : > "$KILL_LOG"; : > "$EXEC_LOG"; : > "$CAPS_LOG"
+: > "$CURL_LOG"; : > "$CURL_JOURNAL"; : > "$KILL_LOG"; : > "$EXEC_LOG"; : > "$CAPS_LOG"
 set +e
 PATH="$EXEC_DIR:$PKGBIN:$PATH" bash "$BOOT" >"$T_TMP/a.out" 2>"$T_TMP/a.err"
 rc=$?
@@ -246,7 +253,7 @@ cat > "$PKG/bin/lib/telepty-auth.sh" <<'EOF'
 #!/usr/bin/env bash
 telepty_auth_token() { printf 'tok-FROM-PACKAGE'; }
 EOF
-: > "$CURL_LOG"; : > "$KILL_LOG"; : > "$EXEC_LOG"; : > "$CAPS_LOG"
+: > "$CURL_LOG"; : > "$CURL_JOURNAL"; : > "$KILL_LOG"; : > "$EXEC_LOG"; : > "$CAPS_LOG"
 PATH="$EXEC_DIR:$PKGBIN:$PATH" bash "$BOOT" >"$T_TMP/b.out" 2>"$T_TMP/b.err" \
   || fail "B: the workspace boot exited non-zero: $(cat "$T_TMP/b.err")"
 preflight_only "B"
@@ -273,7 +280,7 @@ mkdir -p "$T_TMP/c-before"
 cp -R "$WS" "$T_TMP/c-before/workspace"
 cp -R "$DISPATCH_STATE_DIR" "$T_TMP/c-before/dispatch-state"
 cp -R "$AIGENTRY_HOME" "$T_TMP/c-before/home"
-: > "$EXEC_LOG"; : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$AUTH_LOG"; : > "$CAPS_LOG"
+: > "$EXEC_LOG"; : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$CURL_JOURNAL"; : > "$AUTH_LOG"; : > "$CAPS_LOG"
 set +e
 PATH="$EXEC_DIR:$PKGBIN:$PATH" bash "$BOOT" __probe singleton-guard >"$T_TMP/c.out" 2>"$T_TMP/c.err"
 rc=$?
@@ -330,7 +337,7 @@ fi
 # E) neither layout is a fluke: the repo/package layout (sibling dist/) still works,
 #    through the copied shim and private resolver in the package fixture.
 # ===========================================================================
-: > "$EXEC_LOG"; : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$CAPS_LOG"
+: > "$EXEC_LOG"; : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$CURL_JOURNAL"; : > "$CAPS_LOG"
 PATH="$EXEC_DIR:$PATH" bash "$PKG/bin/orchestrator-boot.sh" >"$T_TMP/e.out" 2>"$T_TMP/e.err" \
   || fail "the repo-tree layout (sibling dist/) stopped working: $(cat "$T_TMP/e.err")"
 preflight_only "E"
@@ -346,7 +353,7 @@ grep -qF 'tok-FIXTURE-T132' "$T_TMP/e.err" \
 #    stdout, no credential read, no request, no signal and no exec. Never accepted.
 # ===========================================================================
 printf '%s\n' 'Usage: telepty <command> [options]' '  allow --id <id> <command...>' > "$CAPS_TEXT"
-: > "$EXEC_LOG"; : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$CAPS_LOG"; : > "$AUTH_LOG"
+: > "$EXEC_LOG"; : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$CURL_JOURNAL"; : > "$CAPS_LOG"; : > "$AUTH_LOG"
 set +e
 PATH="$EXEC_DIR:$PKGBIN:$PATH" bash "$BOOT" >"$T_TMP/u.out" 2>"$T_TMP/u.err"
 rc=$?
