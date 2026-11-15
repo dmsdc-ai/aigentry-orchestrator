@@ -103,6 +103,20 @@ CLEANUP_SELF_PID="400" ORCHESTRATOR_BRIDGE_PIDS="600" \
 [ ! -s "$KILL_LOG" ] \
   || fail "d: SIGTERM fired on env-declared bridge PID 600 — guard failed. kill log: $(cat "$KILL_LOG")"
 
+# ── (e) Task 1270: a VERSIONED bridge (`telepty allow-create-v1`) gains NO kill authority ──
+# The kill selector stays the legacy `telepty allow --id <sid> ` needle; the whole-cleanup
+# refusal for a versioned target lives before capture in cleanupOne (T106 block V).
+cat > "$PS_SNAP" <<'EOF'
+100 1 /sbin/launchd
+400 100 bash session-cleanup.sh
+999 100 cmux-pane-host
+650 999 node telepty allow-create-v1 --id v1270-sid --auto-restart claude --continue
+EOF
+run_kill 400 v1270-sid \
+  || fail "e: kill_parent_telepty_allow returned non-zero for a versioned row (should skip & continue)"
+[ ! -s "$KILL_LOG" ] \
+  || fail "e: SIGTERM fired on a VERSIONED allow-create-v1 bridge PID 650 — task 1270 grants it no kill authority. kill log: $(cat "$KILL_LOG")"
+
 # ── helper unit checks: pid_is_self_or_ancestor classification ──
 cat > "$PS_SNAP" <<'EOF'
 100 1 /sbin/launchd

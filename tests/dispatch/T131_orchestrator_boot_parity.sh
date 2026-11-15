@@ -276,7 +276,14 @@ printf '%s\n' "\$*" >> "$CURL_LOG"
 case " \$* " in
   *" -X DELETE "*) printf '%s' "\$(cat "$CURL_CODE" 2>/dev/null || echo 200)"; exit 0 ;;
 esac
-printf 'curl %s\n' "\$(case "\${!#}" in */api/meta) echo meta ;; *) echo session ;; esac)" >> "$ORDER_LOG"
+# A top-level case, NOT \$(case …) — macOS /bin/bash 3.2 ends a quoted \$( ) at the first pattern ')', which
+# logged the stub's own script text. The route word comes from the actual URL argument; any other URL is logged as is.
+case "\${!#}" in
+  */api/meta)       route=meta ;;
+  */api/sessions/*) route=session ;;
+  *)                route="other:\${!#}" ;;
+esac
+printf 'curl %s\n' "\$route" >> "$ORDER_LOG"
 rc="\$(cat "$CURL_EXIT" 2>/dev/null || echo 0)"
 if [ "\$rc" != 0 ]; then printf '\n000'; exit "\$rc"; fi
 case "\${!#}" in

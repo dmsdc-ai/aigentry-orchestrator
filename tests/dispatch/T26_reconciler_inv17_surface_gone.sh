@@ -11,7 +11,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
-t_setup; trap 't_teardown; [ -n "${ORPHAN_PID:-}" ] && kill "$ORPHAN_PID" 2>/dev/null || true' EXIT
+t_setup; trap 't_teardown; for _p in ${ORPHAN_PID:-} ${V_PIDS:-}; do kill "$_p" 2>/dev/null || true; done' EXIT
 REPO_ROOT="$(cd "$HERE/../.." && pwd -P)"
 RECONCILER="$REPO_ROOT/bin/session-reconciler.sh"
 
@@ -153,5 +153,47 @@ grep -q "dry_run=1" "$RUN_LOG" || fail "--dry-run did not record dry_run=1; log:
 $(cat "$RUN_LOG")"
 grep -q "surface_orphaned consumed" "$RUN_LOG" \
   && fail "--dry-run consumed surface_orphaned despite ABSENT source (should be dormant)"
+
+# ===========================================================================
+# V) Task 1270 — a LIVE bridge started with the boot's versioned create-only verb
+#    (`telepty allow-create-v1 --id <sid>`) is a live parent: platform::session_pid
+#    finds it, so the sweep has no false no_parent_pid. Each fixture is ONE owned,
+#    disposable `sleep` renamed via exec -a (the same technique as above), reaped by
+#    the EXIT trap. Nothing else is signalled.
+# ===========================================================================
+SIDV="sid-v1270"
+( exec -a "telepty allow-create-v1 --id $SIDV keepalive" sleep 600 ) &
+VPID=$!; V_PIDS="$VPID"
+( exec -a "telepty allow-create-v2 --id sid-w1270 keepalive" sleep 600 ) &
+V_PIDS="$V_PIDS $!"
+seen_marker() { local psout; psout=$(ps -eo pid,command 2>/dev/null || true); grep -qF -- "$1" <<<"$psout"; }
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  seen_marker "telepty allow-create-v1 --id $SIDV " && seen_marker "telepty allow-create-v2 --id sid-w1270 " && break
+  sleep 0.1
+done
+seen_marker "telepty allow-create-v1 --id $SIDV " \
+  || fail "V: could not observe the spawned versioned parent process in ps"
+seen_marker "telepty allow-create-v2 --id sid-w1270 " \
+  || fail "V: could not observe the spawned wrong-verb process in ps"
+# V1: live versioned parent + surface_gone ALONE → INV-17 skip, no cleanup. A false
+#     no_parent_pid would corroborate surface_gone and policy.py would CLEANUP it.
+: > "$CLEANUP_CALLS"
+write_list "[{\"id\":\"$SIDV\",\"healthStatus\":\"CONNECTED\",\"cmuxWorkspaceId\":\"$WS_GONE\",\"startedAt\":\"$STARTED\"}]"
+run_reconciler
+grep -q "INV-17 skip sid=$SIDV" "$RUN_LOG" \
+  || fail "V1: a LIVE allow-create-v1 parent was not found (false no_parent_pid); expected 'INV-17 skip sid=$SIDV'; log:
+$(cat "$RUN_LOG")"
+[ -s "$CLEANUP_CALLS" ] && fail "V1: cleanup was invoked on a live versioned bridge:
+$(cat "$CLEANUP_CALLS")"
+# V2: platform::session_pid literal boundaries, called directly.
+spid() { bash -c 'source "$1/bin/lib/platform.sh" && platform::session_pid "$2"' _ "$REPO_ROOT" "$1"; }
+[ "$(spid "$SIDV")" = "$VPID" ] || fail "V2: session_pid $SIDV != live versioned pid $VPID: '$(spid "$SIDV")'"
+[ -z "$(spid sid-v127)" ]  || fail "V2: a sid PREFIX matched the versioned bridge: '$(spid sid-v127)'"
+[ -z "$(spid sid.v1270)" ] || fail "V2: the versioned match must be literal, '.' matched: '$(spid sid.v1270)'"
+[ -z "$(spid sid-w1270)" ] || fail "V2: allow-create-v2 is not the versioned verb, yet it matched: '$(spid sid-w1270)'"
+[ "$(spid "$SID")" = "$ORPHAN_PID" ] || fail "V2: the legacy parent lookup changed: '$(spid "$SID")' != $ORPHAN_PID"
+# V3: once the owned versioned fixture is gone, the parent is absent again.
+kill "$VPID" 2>/dev/null || true; wait "$VPID" 2>/dev/null || true
+[ -z "$(spid "$SIDV")" ] || fail "V3: an exited versioned parent is still reported: '$(spid "$SIDV")'"
 
 echo "T26 PASS"

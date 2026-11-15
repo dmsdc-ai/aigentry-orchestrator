@@ -68,12 +68,14 @@ APPLESCRIPT
 # at 250ms; the default 0 is a single shot. The single-shot body is verbatim the
 # one session-reconciler.sh:parent_pid_for_sid used to carry inline — it calls
 # this now rather than the two scripts keeping divergent copies of one ps/awk.
+# Task 1270: the boot's versioned `telepty allow-create-v1 --id <sid> ` is matched too, LITERALLY
+# (index, no regex); the legacy clause is unchanged.
 platform::session_pid() {
   local sid="${1:-}" timeout_ms="${2:-0}" waited=0 pid
   [[ -z "$sid" ]] && return 0
   while :; do
     pid=$(ps -eo pid,command 2>/dev/null \
-      | awk -v s="$sid" '$0 ~ ("telepty allow --id " s " ") {print $1; exit}' || true)
+      | awk -v s="$sid" '$0 ~ ("telepty allow --id " s " ") || index($0, "telepty allow-create-v1 --id " s " ") {print $1; exit}' || true)
     [[ -n "$pid" ]] && { printf '%s\n' "$pid"; return 0; }
     [[ "$waited" -ge "$timeout_ms" ]] && return 0
     sleep 0.25

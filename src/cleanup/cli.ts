@@ -450,6 +450,21 @@ function selfOrAncestorIn(snap: string, pid: string): boolean {
 }
 
 /**
+ * Task 1270 C3-B: is an exact `[node] <…/>telepty allow-create-v1 … --id <sid>` bridge (the boot's
+ * versioned create-only verb) running? Detection ONLY — its result is never a kill target; the caller
+ * refuses the whole cleanup. Its own read; the kill below keeps its fresh read and ancestry check.
+ */
+function versionedBridgeObserved(sid: string): boolean {
+  for (const row of psSnapshot().split("\n")) {
+    const cmd = fields(row).slice(2); // pid ppid command…
+    const i = cmd.length > 0 && ["node", "nodejs"].includes(path.basename(cmd[0]!)) ? 1 : 0;
+    if (cmd[i] === undefined || path.basename(cmd[i]!) !== "telepty" || cmd[i + 1] !== "allow-create-v1") continue;
+    for (let j = i + 2; j + 1 < cmd.length; j++) if (cmd[j] === "--id" && cmd[j + 1] === sid) return true;
+  }
+  return false;
+}
+
+/**
  * Find the `node ... telepty allow --id <sid> ...` process and SIGTERM it. Its
  * child wrapped CLI (claude/codex/gemini/...) dies with it.
  *
@@ -719,6 +734,12 @@ function clearAgentMetaPinned(sid: string, rows: Array<Record<string, unknown>>,
 function cleanupOne(sid: string, force: boolean): number {
   if (sid === PROTECTED_SID && !force) {
     err(`refusing to clean protected session '${PROTECTED_SID}' (pass --force to override)`);
+    return 1;
+  }
+  // Task 1270 C3-B: BEFORE capture/listing/kill/close/DELETE/retirement, and --force does not override it.
+  // Provisional no-kill mode pending an operator-clear/custody design; not an identity proof.
+  if (versionedBridgeObserved(sid)) {
+    err(`refusing to clean '${sid}': a versioned 'telepty allow-create-v1' bridge for it is running; nothing was captured, signalled, closed or deleted`);
     return 1;
   }
   // #1170: reports before any kill/close/DELETE; a failed capture refuses the whole cleanup.

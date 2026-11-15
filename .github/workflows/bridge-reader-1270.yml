@@ -1,0 +1,202 @@
+name: Bridge readers (task 1270)
+
+# Task 1270 — the versioned create-only boot verb `telepty allow-create-v1` and the three
+# process-table readers: bridge-auditor (warn-only duplicate detection), cleanup (whole-cleanup
+# refusal before capture for an exact versioned target; no new kill authority) and
+# platform::session_pid (literal Unix liveness).
+#
+# Per hosted cell (Linux, macOS; exact Node 26.13.0) the SAME, unchanged tests run twice:
+#   RED   — against the exact pre-fix production preimages from commit
+#           83897518f31acdf7ab72b144d940c9bfaa31d3db, each pinned by SHA-256. Each test must fail
+#           at its specifically named new assertion (or, for the T52 invariant, pass).
+#   GREEN — after restoring the checked-out Git blobs and rebuilding, every test must pass. GREEN also
+#           runs the three migrated boot shell guards T131/T132/T135 whole; they are NOT part of RED.
+# Test and source identity are recorded before, between and after, and must match the checkout.
+#
+# What this does NOT measure: native Windows (platform::session_pid there intentionally returns
+# no pid for both verbs, #305), a live telepty bridge, or any real process outside the tests'
+# own disposable fixtures. The uploaded artifact is review-only evidence, not a publication.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  bridge-readers:
+    name: Bridge readers RED/GREEN (${{ matrix.os }}, Node 26.13.0)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      CELL_OS: ${{ matrix.os }}
+      BASELINE_COMMIT: 83897518f31acdf7ab72b144d940c9bfaa31d3db
+      PIN_AUDITOR: f061a7128bbc200f263ddbe5d4b39261f5af7f1e8b3c237a3b896ff0266d120d
+      PIN_CLEANUP: 3fb83710b96657bceb33b5e2aa8e3895036997ec7a1660b93b770f9eed5b059e
+      PIN_PLATFORM: 249fd54f4ae61558aef7460e48055ff9b75b14f194637b840330b6429b85cbae
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '26.13.0'
+
+      - name: Preconditions — hosted non-root runner, exact Node, required tools present (no install)
+        run: |
+          set -euo pipefail
+          [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] || { echo "::error::not a GitHub-hosted runner"; exit 1; }
+          [ "$(id -u)" -ne 0 ] || { echo "::error::refusing to run as root"; exit 1; }
+          [ "$(node --version)" = "v26.13.0" ] || { echo "::error::runtime $(node --version), want v26.13.0"; exit 1; }
+          for tool in bash jq python3 git shasum cmp; do
+            command -v "$tool" >/dev/null 2>&1 || { echo "::error::required tool missing: ${tool} (no install or sudo workaround)"; exit 1; }
+          done
+
+      - name: Private HOME, npm cache, TMPDIR and evidence under RUNNER_TEMP, outside Git ancestry
+        run: |
+          set -euo pipefail
+          base="${RUNNER_TEMP}/bridge-reader-1270"
+          [ ! -e "$base" ] || { echo "::error::${base} already exists"; exit 1; }
+          mkdir -p "$base/home" "$base/npm-cache" "$base/tmp" "$base/evidence"
+          base="$(cd "$base" && pwd -P)"
+          ws="$(cd "$GITHUB_WORKSPACE" && pwd -P)"
+          case "$base/" in "$ws/"*) echo "::error::private root is inside the checkout"; exit 1 ;; esac
+          d="$base"
+          while :; do
+            [ ! -e "$d/.git" ] || { echo "::error::git ancestor: ${d}"; exit 1; }
+            [ "$d" != / ] || break
+            d="$(dirname "$d")"
+          done
+          {
+            echo "BR_DIR=$base"
+            echo "EVID=$base/evidence"
+            echo "HOME=$base/home"
+            echo "TMPDIR=$base/tmp"
+            echo "npm_config_cache=$base/npm-cache"
+            echo "npm_config_update_notifier=false"
+          } >> "$GITHUB_ENV"
+
+      - name: Locked install (scripts disabled) and cell identity
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+          {
+            echo "cell_os=${CELL_OS}"
+            echo "node=$(node --version)"
+            echo "npm=$(npm --version)"
+            echo "event_sha=${GITHUB_SHA}"
+            echo "checkout_commit=$(git rev-parse HEAD)"
+            echo "baseline_commit=${BASELINE_COMMIT}"
+            echo "lifecycle_scripts=NOT RUN (npm ci --ignore-scripts)"
+          } > "$EVID/cell.txt"
+          cat "$EVID/cell.txt"
+
+      - name: Record candidate identity; verify the baseline commit exists
+        run: |
+          set -euo pipefail
+          shasum -a 256 src/bridge-auditor/cli.ts src/cleanup/cli.ts bin/lib/platform-unix.sh > "$EVID/candidate-sources.sha256"
+          shasum -a 256 tests/dispatch/T127_bridge_auditor_parity.sh tests/dispatch/T26_reconciler_inv17_surface_gone.sh \
+            tests/dispatch/T52_cleanup_self_ancestor_guard.sh tests/dispatch/T106_cleanup_cli_contract.sh \
+            tests/dispatch/T131_orchestrator_boot_parity.sh tests/dispatch/T132_orchestrator_boot_workspace_shim.sh \
+            tests/dispatch/T135_orchestrator_boot_handoff.sh > "$EVID/tests.sha256"
+          cat "$EVID/candidate-sources.sha256" "$EVID/tests.sha256"
+          git cat-file -e "${BASELINE_COMMIT}^{commit}" || { echo "::error::baseline commit ${BASELINE_COMMIT} is not in the fetched history"; exit 1; }
+          while read -r sum file; do
+            case "$file" in
+              src/bridge-auditor/cli.ts) pin="$PIN_AUDITOR" ;;
+              src/cleanup/cli.ts) pin="$PIN_CLEANUP" ;;
+              bin/lib/platform-unix.sh) pin="$PIN_PLATFORM" ;;
+              *) echo "::error::unexpected file ${file}"; exit 1 ;;
+            esac
+            [ "$sum" != "$pin" ] || { echo "::error::candidate ${file} equals its pre-fix preimage; GREEN would prove nothing"; exit 1; }
+          done < "$EVID/candidate-sources.sha256"
+
+      - name: RED — the same tests against the exact pre-fix preimages
+        run: |
+          # The default shell is `bash -eo pipefail`; -e is off so every test's real exit is captured.
+          set +e -uo pipefail
+          for pair in "src/bridge-auditor/cli.ts:$PIN_AUDITOR" "src/cleanup/cli.ts:$PIN_CLEANUP" "bin/lib/platform-unix.sh:$PIN_PLATFORM"; do
+            file="${pair%%:*}"; pin="${pair##*:}"
+            git show "${BASELINE_COMMIT}:${file}" > "$file" || { echo "::error::cannot read ${file} at ${BASELINE_COMMIT}"; exit 1; }
+            got="$(shasum -a 256 "$file" | cut -d' ' -f1)"
+            [ "$got" = "$pin" ] || { echo "::error::${file} at ${BASELINE_COMMIT} is ${got}, pinned ${pin}"; exit 1; }
+            echo "red_preimage ${file} ${got}" >> "$EVID/cell.txt"
+          done
+          npm run build > "$EVID/red-build.log" 2>&1 || { cat "$EVID/red-build.log"; echo "::error::baseline build failed; that is not a RED"; exit 1; }
+          bad=0
+          for spec in "T127_bridge_auditor_parity:FAIL[T127]: V1:" "T26_reconciler_inv17_surface_gone:FAIL[T26]: V1:" \
+                      "T106_cleanup_cli_contract:FAIL[T106]: V1 listed:" "T52_cleanup_self_ancestor_guard:PASS"; do
+            name="${spec%%:*}"; want="${spec#*:}"; log="$EVID/red-${name}.log"
+            bash "tests/dispatch/${name}.sh" 2>&1 | tee "$log"
+            st=("${PIPESTATUS[@]}")
+            echo "red ${name} test_exit=${st[0]} tee_exit=${st[1]}" >> "$EVID/exits.txt"
+            [ "${st[1]}" -eq 0 ] || { echo "::error::tee failed for ${name} (exit ${st[1]})"; exit 1; }
+            if [ "$want" = PASS ]; then
+              [ "${st[0]}" -eq 0 ] || { echo "::error::RED ${name}: this invariant must also pass on the baseline, exit ${st[0]}"; bad=1; }
+              grep -qE "^${name%%_*} PASS" "$log" || { echo "::error::RED ${name}: the baseline invariant exited ${st[0]} without its PASS line"; bad=1; }
+            else
+              nfail="$(grep -c '^FAIL\[' "$log" || true)"
+              if [ "${st[0]}" -eq 0 ] || [ "$nfail" -ne 1 ] || ! grep -qF -- "$want" "$log"; then
+                echo "::error::RED ${name}: want exactly one failure starting '${want}', got exit ${st[0]} and ${nfail} FAIL line(s)"; bad=1
+              fi
+            fi
+          done
+          exit "$bad"
+
+      - name: Restore the exact checked-out blobs and rebuild
+        run: |
+          set -euo pipefail
+          shasum -a 256 -c "$EVID/tests.sha256"
+          git checkout HEAD -- src/bridge-auditor/cli.ts src/cleanup/cli.ts bin/lib/platform-unix.sh
+          shasum -a 256 -c "$EVID/candidate-sources.sha256"
+          git diff --exit-code HEAD -- src/bridge-auditor/cli.ts src/cleanup/cli.ts bin/lib/platform-unix.sh
+          npm run build > "$EVID/green-build.log" 2>&1 || { cat "$EVID/green-build.log"; echo "::error::candidate build failed"; exit 1; }
+
+      - name: GREEN — the same tests against the candidate
+        run: |
+          # The default shell is `bash -eo pipefail`; -e is off so every test's real exit is captured.
+          set +e -uo pipefail
+          bad=0
+          for name in T127_bridge_auditor_parity T26_reconciler_inv17_surface_gone T106_cleanup_cli_contract T52_cleanup_self_ancestor_guard \
+                      T131_orchestrator_boot_parity T132_orchestrator_boot_workspace_shim T135_orchestrator_boot_handoff; do
+            log="$EVID/green-${name}.log"
+            bash "tests/dispatch/${name}.sh" 2>&1 | tee "$log"
+            st=("${PIPESTATUS[@]}")
+            echo "green ${name} test_exit=${st[0]} tee_exit=${st[1]}" >> "$EVID/exits.txt"
+            [ "${st[1]}" -eq 0 ] || { echo "::error::tee failed for ${name} (exit ${st[1]})"; exit 1; }
+            [ "${st[0]}" -eq 0 ] || { echo "::error::GREEN ${name} exited ${st[0]}"; bad=1; continue; }
+            grep -qE "^${name%%_*} PASS" "$log" || { echo "::error::GREEN ${name} exited 0 without its PASS line"; bad=1; }
+          done
+          exit "$bad"
+
+      - name: Final identity — tests and sources still equal the checkout
+        run: |
+          set -euo pipefail
+          shasum -a 256 -c "$EVID/tests.sha256"
+          shasum -a 256 -c "$EVID/candidate-sources.sha256"
+          git diff --exit-code HEAD -- src/bridge-auditor/cli.ts src/cleanup/cli.ts bin/lib/platform-unix.sh \
+            tests/dispatch/T127_bridge_auditor_parity.sh tests/dispatch/T26_reconciler_inv17_surface_gone.sh \
+            tests/dispatch/T52_cleanup_self_ancestor_guard.sh tests/dispatch/T106_cleanup_cli_contract.sh \
+            tests/dispatch/T131_orchestrator_boot_parity.sh tests/dispatch/T132_orchestrator_boot_workspace_shim.sh \
+            tests/dispatch/T135_orchestrator_boot_handoff.sh
+          cat "$EVID/exits.txt"
+
+      - name: Preserve the per-cell review artifact (review only, not a publication)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bridge-reader-1270-${{ matrix.os }}-node26.13.0
+          path: ${{ runner.temp }}/bridge-reader-1270/evidence
+          if-no-files-found: error
+          retention-days: 7
