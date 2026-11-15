@@ -38,7 +38,22 @@ if (s.copyOnce && s.copyOnceAt !== undefined) {
     for (const [src, dst] of s.copyOnce) fs.writeFileSync(dst, fs.readFileSync(src));
   }
 }
-if (s.sleepMs) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, s.sleepMs);
+// Task 1270 (opt-in, defaults unchanged): sleepOnceAt = explicit positive-integer invocation ordinal of THIS who
+// at which sleepMs applies (instead of every call); ignoreSigterm = this fake ignores SIGTERM (SIGKILL still ends it).
+// When an opted-in sleep finishes, `<seq log>.<who>.sleep-completed` records that the slow query ran to completion.
+if (s.ignoreSigterm === true) process.on("SIGTERM", () => {});
+if (s.sleepMs && s.sleepOnceAt !== undefined) {
+  if (!Number.isSafeInteger(s.sleepOnceAt) || s.sleepOnceAt < 1) {
+    process.stderr.write(`pinned-clear-actuators: sleepOnceAt must be a positive integer, got ${JSON.stringify(s.sleepOnceAt)}\n`);
+    process.exit(98);
+  }
+  const nth = fs.readFileSync(process.env.PINNED_CLEAR_SEQ_LOG, "utf8").split("\n").filter(Boolean)
+    .filter((l) => JSON.parse(l).who === who).length;
+  if (nth === s.sleepOnceAt) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, s.sleepMs);
+    fs.writeFileSync(`${process.env.PINNED_CLEAR_SEQ_LOG}.${who}.sleep-completed`, "");
+  }
+} else if (s.sleepMs) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, s.sleepMs);
 if (s.stdoutFile) process.stdout.write(fs.readFileSync(s.stdoutFile));
 if (s.stdout) process.stdout.write(s.stdout);
 if (s.stderr) process.stderr.write(s.stderr);

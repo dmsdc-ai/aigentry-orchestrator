@@ -52,7 +52,9 @@ chmod +x "$STUB_BIN/curl"
 # overrides the seam with its own table.
 PS_DEFAULT_LOG="$T_TMP/ps-default.log"; : > "$PS_DEFAULT_LOG"
 PS_DEFAULT_SNAP="$T_TMP/ps-default.txt"
-printf '%s\n' '100 1 /sbin/launchd' '400 100 bash session-cleanup.sh' > "$PS_DEFAULT_SNAP"
+# Task 1270 C3: every process table here carries the canonical `PID PPID COMMAND` header that real
+# `ps -eo pid,ppid,command` prints, so cleanup's initial process view is KNOWN (a headerless view is UNKNOWN).
+printf '%s\n' '  PID  PPID COMMAND' '100 1 /sbin/launchd' '400 100 bash session-cleanup.sh' > "$PS_DEFAULT_SNAP"
 cat > "$STUB_BIN/ps" <<EOF
 #!/usr/bin/env bash
 if [ "\$#" -eq 2 ] && [ "\$1" = "-eo" ] && [ "\$2" = "pid,ppid,command" ]; then
@@ -165,6 +167,7 @@ vrun_refused() {
   [ ! -s "$V_REG_LOG" ] || fail "$label: the registry was touched (report capture/retirement): $(cat "$V_REG_LOG")"
 }
 cat > "$V_PS_SNAP" <<EOF
+  PID  PPID COMMAND
 100 1 /sbin/launchd
 400 100 bash session-cleanup.sh
 888 100 node /usr/local/bin/telepty allow-create-v1 --id $VSID --auto-restart claude --continue
@@ -184,6 +187,7 @@ vrun_refused "V4 mixed legacy+versioned" "$VSID"
 # V5: only EXACT rows refuse. Neighbouring verbs/sids/mentions leave the ordinary path intact:
 #     no versioned target and no legacy row → no kill, but close + DELETE run, exit 0.
 cat > "$V_PS_SNAP" <<EOF
+  PID  PPID COMMAND
 100 1 /sbin/launchd
 400 100 bash session-cleanup.sh
 801 100 node telepty allow-create-v1 --id $VSID-2 --auto-restart claude
@@ -400,6 +404,7 @@ cat "$PS_SNAP"
 EOF
 chmod +x "$STUB_BIN/kill-recorder.sh" "$STUB_BIN/ps-recorder.sh"
 cat > "$PS_SNAP" <<'EOF'
+  PID  PPID COMMAND
 100 1 /sbin/launchd
 400 100 bash session-cleanup.sh
 777 100 telepty allow --id t106-live claude --continue

@@ -76,6 +76,7 @@ test("F1a forged bound TURN `after=<uuid>/REPORT-1`: no captureFailed, no refuse
   const cap = K.events([...p1.calls, ...p2.calls], "captured");
   assert.ok(cap.length >= 1 && cap.every((c) => c.rc === 4), `registry captured rc: ${cap.map((c) => c.rc)}`);
   assert.ok(cap[0].argv.includes(`new_formal=${d.req.request_id}/REPORT-1`));
+  w.set({ psTable: EMPTY_PS_VIEW }); // Task 1270 C3: an explicit KNOWN initial process view for a proceeding cleanup
   const c = w.cleanup(wk.sid);
   const observed = { pass1: [p1.status, field(p1.stdout, "capture_failed")], pass2: [p2.status, field(p2.stdout, "capture_failed")],
     cleanup: c.status, cleanupErr: c.stderr.trim().split("\n").filter((l) => l.includes("REPORT_CAPTURE_FAILED")) };
@@ -99,6 +100,7 @@ test("F1b 3 HOLD + 30 REPORT (each kind within its prompted 1..32): final REPORT
   assert.equal(Object.keys(r.items).length, 33);
   const lost = { last: capRc.at(-1), current_final: r.current_final, capture_failed: field(p1.stdout, "capture_failed"),
     errors: /errors=(\S+)/.exec(p1.stdout)?.[1] };
+  w.set({ psTable: EMPTY_PS_VIEW }); // Task 1270 C3: an explicit KNOWN initial process view for a proceeding cleanup
   const c = w.cleanup(wk.sid);
   assert.deepEqual([r.current_final, lost.capture_failed, c.status], ["REPORT-30", 0, 0],
     `REPRODUCED F1b: the legal final is lost to the combined item_limit and cleanup is refused: ${JSON.stringify({ ...lost, cleanup: c.status })}`);

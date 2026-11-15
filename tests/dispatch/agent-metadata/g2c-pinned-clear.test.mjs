@@ -762,3 +762,92 @@ test("PC-C21 report capture refusal stops before listing, metadata clear, kill, 
   // Task 1270: the one read-only precheck, then the refused capture; nothing else.
   assert.deepEqual(r.seq.map((e) => [e.who, ...e.argv]), [[PRECHECK.who, ...PRECHECK.argv], REPORT_LIST(SID)]);
 });
+
+// ═════════════════════════ U: Task 1270 C3 — PS-UNKNOWN (the INITIAL process view) ═══════════════════
+// The initial view is KNOWN only for a successful (exit 0, spawned, unsignalled, within the existing output bound)
+// `ps -eo pid,ppid,command` whose stdout is a newline-terminated table headed `PID PPID COMMAND`; header-only is a
+// known EMPTY view. Anything else is UNKNOWN: report capture still runs first, then the whole cleanup refuses
+// (process-view-unverified) BEFORE listing, metadata clear, kill, close, DELETE and retirement; --force cannot pass.
+// Every U case makes the INITIAL view unknown explicitly; U08-U10 are known/capture-failure controls.
+const UNVERIFIED = (sid, reason) => `ERR refusing to clean '${sid}': process-view-unverified (${reason}) — reports were captured first; nothing was listed, signalled, closed, deleted or retired\n`;
+const VERSIONED_REFUSAL = (sid) => `ERR refusing to clean '${sid}': a versioned 'telepty allow-create-v1' bridge for it is running; nothing was captured, signalled, closed or deleted\n`;
+function expectUnverified(r, reason, { precheckRecorded = true } = {}) {
+  assert.equal(r.status, 1, r.stderr);
+  assert.equal(r.stdout, "", "nothing listed or cleaned");
+  assert.equal(r.stderr, UNVERIFIED(SID, reason));
+  assert.deepEqual(r.seq.map((e) => [e.who, ...e.argv]),
+    [...(precheckRecorded ? [[PRECHECK.who, ...PRECHECK.argv]] : []), REPORT_LIST(SID)],
+    "exactly: the initial view, then report capture; no listing/clear/kill/close/DELETE/retirement");
+  assert.deepEqual(metaCalls(r), []);
+}
+
+test("PC-U01 PS-UNKNOWN nonzero query with a valid-looking table → capture kept, process-view-unverified, zero teardown", () => {
+  expectUnverified(cleanup("u01", { fakes: { ps: { rc: 1 } } }), "query-failed");
+});
+
+test("PC-U02 PS-UNKNOWN successful but headerless view → capture kept, process-view-unverified, zero teardown", () => {
+  expectUnverified(cleanup("u02", { ps: [PS_O, PS_S, PS_C, ""].join("\n") }), "malformed");
+});
+
+test("PC-U03 PS-UNKNOWN empty successful stdout is not absence → capture kept, process-view-unverified", () => {
+  expectUnverified(cleanup("u03", { ps: "" }), "malformed");
+});
+
+test("PC-U04 PS-UNKNOWN truncated view without its final newline → capture kept, process-view-unverified", () => {
+  expectUnverified(cleanup("u04", { ps: [...PS_HDR, PS_O, PS_S, PS_C].join("\n") }), "malformed");
+});
+
+test("PC-U05 PS-UNKNOWN oversize view beyond the existing default output bound → capture kept, process-view-unverified", () => {
+  const filler = Array.from({ length: 20000 }, (_, i) => ` ${20000 + i}     1 filler-process-${"x".repeat(48)}`);
+  expectUnverified(cleanup("u05", { ps: psTable([PS_O, PS_S, PS_C, ...filler]) }), "query-failed");
+});
+
+test("PC-U06 PS-UNKNOWN query killed by a signal → capture kept, process-view-unverified", () => {
+  // A private, owned fixture command that terminates ITSELF with SIGTERM (no other process is signalled). It is not
+  // the recorder, so this one case asserts the trace without the precheck event.
+  const sig = path.join(makeRun("u06sig").fakes, "ps-signalled");
+  fs.writeFileSync(sig, "#!/bin/sh\nkill -TERM $$\n", { mode: 0o755 });
+  expectUnverified(cleanup("u06", { env: { CLEANUP_PS_CMD: sig } }), "query-failed", { precheckRecorded: false });
+});
+
+test("PC-U07 PS-UNKNOWN --force cannot override the unverified view", () => {
+  expectUnverified(cleanup("u07", { fakes: { ps: { rc: 1 } }, args: [SID, "--force"] }), "query-failed");
+});
+
+test("PC-U08 control: a known header-only empty view is KNOWN, so the legacy path is unchanged", () => {
+  const r = cleanup("u08", { ps: psTable([]) });
+  expectLegacy(r, legacy({ kill: "no-parent" }), { vetoReachedPs: true });
+  assert.deepEqual(metaLines(r), [line(`clear skipped: ${SID} (ps-missing)`)]);
+});
+
+test("PC-U09 control: a known versioned target refuses BEFORE capture, with and without --force", () => {
+  const VROW = ` 5100     1 node /fixture/telepty allow-create-v1 --id ${SID} --auto-restart claude`;
+  for (const args of [[SID], [SID, "--force"]]) {
+    const r = cleanup("u09", { ps: psTable([VROW, PS_O, PS_S, PS_C]), args });
+    assert.equal(r.status, 1);
+    assert.equal(r.stdout, "");
+    assert.equal(r.stderr, VERSIONED_REFUSAL(SID));
+    assert.deepEqual(r.seq, [PRECHECK], "the initial view only; no capture, listing or effect");
+  }
+});
+
+test("PC-U10 control: capture failure with an unknown view keeps the exact REPORT_CAPTURE_FAILED refusal", () => {
+  const r = cleanup("u10", { fakes: { ps: { rc: 1 } , registry: { match: [{ argv0: "report-list", rc: 9 }] } } });
+  assert.equal(r.status, 1);
+  assert.equal(r.stdout, "");
+  assert.equal(r.stderr, `ERR REPORT_CAPTURE_FAILED for ${SID}: *:registry_list_9 — cleanup refused; worker files and registry records are preserved (see bin/dispatch-tracker.sh report-status)\n`);
+  assert.deepEqual(r.seq.map((e) => [e.who, ...e.argv]), [[PRECHECK.who, ...PRECHECK.argv], REPORT_LIST(SID)]);
+});
+
+test("PC-U11 PS-UNKNOWN initial query past its 2000 ms deadline (SIGTERM ignored) → own query killed, capture kept, process-view-unverified", () => {
+  // Only the FIRST ps query (the initial view) sleeps 2500 ms and ignores SIGTERM; any later query is fast. A cleanup
+  // with no deadline waits it out and proceeds; the fix must end its OWN query child at 2000 ms (SIGKILL), keep the
+  // report capture and refuse every teardown.
+  const t0 = Date.now();
+  const r = cleanup("u11", { fakes: { ps: { sleepMs: 2500, sleepOnceAt: 1, ignoreSigterm: true } } });
+  const elapsed = Date.now() - t0;
+  expectUnverified(r, "query-failed");
+  assert.ok(elapsed >= 2000, `the initial query really started and ran to its deadline (${elapsed} ms)`);
+  assert.ok(!fs.existsSync(path.join(r.run.logs, "seq.jsonl.ps.sleep-completed")),
+    "the hung initial query never completed: its own child was ended at the deadline");
+});

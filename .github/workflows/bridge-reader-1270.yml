@@ -9,6 +9,9 @@ name: Bridge readers (task 1270)
 #   RED   — against the exact pre-fix production preimages from commit
 #           83897518f31acdf7ab72b144d940c9bfaa31d3db, each pinned by SHA-256. Each test must fail
 #           at its specifically named new assertion (or, for the T52 invariant, pass).
+#   PS-UNKNOWN-RED — auditor/platform from the checkout and cleanup ONLY from the exact pre-C3 commit
+#           cab1b7faf45cee9c51d9ff2b24070e13f6548947 (SHA-256 pinned); the SAME four whole MJS suites must fail
+#           ALL and ONLY the nine named PS-UNKNOWN cases (incl. the timed initial query), each an assertion failure.
 #   GREEN — after restoring the checked-out Git blobs and rebuilding, every test must pass. GREEN also
 #           runs the three migrated boot shell guards T131/T132/T135 whole, and the four whole cleanup-contract
 #           MJS suites (g2c-pinned-clear, mandatory-report-1170 + review + rework-boundaries) via node --test;
@@ -46,6 +49,8 @@ jobs:
       PIN_AUDITOR: f061a7128bbc200f263ddbe5d4b39261f5af7f1e8b3c237a3b896ff0266d120d
       PIN_CLEANUP: 3fb83710b96657bceb33b5e2aa8e3895036997ec7a1660b93b770f9eed5b059e
       PIN_PLATFORM: 249fd54f4ae61558aef7460e48055ff9b75b14f194637b840330b6429b85cbae
+      PRE_C3_COMMIT: cab1b7faf45cee9c51d9ff2b24070e13f6548947
+      PIN_PRE_C3_CLEANUP: e9e00e27ded685b49579fe3aea719d69755debab622cee497a65c33a1600ed77
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
@@ -158,6 +163,52 @@ jobs:
             fi
           done
           exit "$bad"
+
+      - name: PS-UNKNOWN-RED — the SAME four MJS suites against the exact pre-C3 cleanup
+        run: |
+          # The default shell is `bash -eo pipefail`; -e is off so the real Node and tee exits are captured.
+          set +e -uo pipefail
+          git checkout HEAD -- src/bridge-auditor/cli.ts bin/lib/platform-unix.sh || { echo "::error::cannot restore auditor/platform"; exit 1; }
+          grep -E ' (src/bridge-auditor/cli\.ts|bin/lib/platform-unix\.sh)$' "$EVID/candidate-sources.sha256" | shasum -a 256 -c - \
+            || { echo "::error::auditor/platform are not the checked-out candidate blobs"; exit 1; }
+          git cat-file -e "${PRE_C3_COMMIT}^{commit}" || { echo "::error::pre-C3 commit ${PRE_C3_COMMIT} is not in the fetched history"; exit 1; }
+          git show "${PRE_C3_COMMIT}:src/cleanup/cli.ts" > src/cleanup/cli.ts || { echo "::error::cannot read the pre-C3 cleanup"; exit 1; }
+          got="$(shasum -a 256 src/cleanup/cli.ts | cut -d' ' -f1)"
+          [ "$got" = "$PIN_PRE_C3_CLEANUP" ] || { echo "::error::pre-C3 cleanup is ${got}, pinned ${PIN_PRE_C3_CLEANUP}"; exit 1; }
+          echo "ps_unknown_red_preimage src/cleanup/cli.ts ${got}" >> "$EVID/cell.txt"
+          shasum -a 256 -c "$EVID/tests.sha256" || { echo "::error::tests changed before PS-UNKNOWN-RED"; exit 1; }
+          npm run build > "$EVID/ps-unknown-red-build.log" 2>&1 || { cat "$EVID/ps-unknown-red-build.log"; echo "::error::pre-C3 build failed; that is not a RED"; exit 1; }
+          tap="$EVID/ps-unknown-red.tap"
+          node --test --test-reporter=tap \
+            tests/dispatch/agent-metadata/g2c-pinned-clear.test.mjs tests/report/mandatory-report-1170.test.mjs \
+            tests/report/mandatory-report-1170-review.test.mjs tests/report/mandatory-report-1170-rework-boundaries.test.mjs \
+            2>&1 | tee "$tap"
+          st=("${PIPESTATUS[@]}")
+          [ "${#st[@]}" -eq 2 ] || { echo "::error::expected 2 pipeline statuses, got ${#st[@]}: ${st[*]}"; exit 1; }
+          echo "ps-unknown-red cleanup-contract-mjs node_exit=${st[0]} tee_exit=${st[1]}" >> "$EVID/exits.txt"
+          [ "${st[1]}" -eq 0 ] || { echo "::error::TAP capture (tee) exited ${st[1]}; the observation is incomplete"; exit "${st[1]}"; }
+          [ "${st[0]}" -ne 0 ] || { echo "::error::the pre-C3 cleanup passed every case; PS-UNKNOWN has no counterexample"; exit 1; }
+          # ALL and ONLY the nine explicit PS-UNKNOWN cases fail, each as an assertion failure; nothing else.
+          LC_ALL=C sort > "$EVID/ps-unknown-red.expected" <<'NAMES'
+          PC-U01 PS-UNKNOWN nonzero query with a valid-looking table → capture kept, process-view-unverified, zero teardown
+          PC-U02 PS-UNKNOWN successful but headerless view → capture kept, process-view-unverified, zero teardown
+          PC-U03 PS-UNKNOWN empty successful stdout is not absence → capture kept, process-view-unverified
+          PC-U04 PS-UNKNOWN truncated view without its final newline → capture kept, process-view-unverified
+          PC-U05 PS-UNKNOWN oversize view beyond the existing default output bound → capture kept, process-view-unverified
+          PC-U06 PS-UNKNOWN query killed by a signal → capture kept, process-view-unverified
+          PC-U07 PS-UNKNOWN --force cannot override the unverified view
+          PC-U11 PS-UNKNOWN initial query past its 2000 ms deadline (SIGTERM ignored) → own query killed, capture kept, process-view-unverified
+          L-12u PS-UNKNOWN malformed initial view: the REPORT is captured first, then process-view-unverified with zero teardown
+          NAMES
+          grep -E '^not ok [0-9]+ - ' "$tap" | sed -E 's/^not ok [0-9]+ - //' | LC_ALL=C sort > "$EVID/ps-unknown-red.actual"
+          diff -u "$EVID/ps-unknown-red.expected" "$EVID/ps-unknown-red.actual" \
+            || { echo "::error::the pre-C3 failures are not exactly the nine PS-UNKNOWN cases"; exit 1; }
+          [ "$(grep -cE "^[[:space:]]+code: 'ERR_ASSERTION'[[:space:]]*$" "$tap")" -eq 9 ] \
+            || { echo "::error::not every PS-UNKNOWN failure is an assertion failure"; exit 1; }
+          grep -Eq '^# pass [1-9][0-9]*$' "$tap" || { echo "::error::no passing case on the pre-C3 cleanup"; exit 1; }
+          for line in '# fail 9' '# cancelled 0' '# skipped 0' '# todo 0'; do
+            grep -qx "$line" "$tap" || { echo "::error::PS-UNKNOWN-RED TAP summary lacks '${line}'"; exit 1; }
+          done
 
       - name: Restore the exact checked-out blobs and rebuild
         run: |

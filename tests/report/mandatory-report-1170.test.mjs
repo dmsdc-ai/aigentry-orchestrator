@@ -382,7 +382,8 @@ test("L-11 receiver observation recorded by inject_id; a non-null verified sende
 
 test("L-12 cleanup: capture before teardown; capture failure refuses with nothing torn down; no report ⇒ `cleaned` failure; prune keeps unresolved", { skip: SKIP }, () => {
   const w = K.world("l12");
-  w.set({ curlDelete: "404" });
+  // Task 1270 C3: every cleanup in this world has an explicit KNOWN (successful, header-only) initial process view.
+  w.set({ curlDelete: "404", psTable: EMPTY_PS_VIEW });
   const wkA = w.worker("w1170-l12a", { listed: false });
   const dA = w.dispatch(wkA);
   const rA = w.write(dA, "REPORT", 1, "captured by cleanup");
@@ -428,6 +429,27 @@ test("L-12 cleanup: capture before teardown; capture failure refuses with nothin
   assert.ok(!left.includes(dA.did), "done + cleaned + old → pruned");
   assert.ok(left.includes(dC.did), "open `cleaned` failure obligation retained");
   assert.ok(left.includes(dB.did), "refused-cleanup record retained");
+  assert.equal(w.run.tripwireHits(), "");
+});
+
+test("L-12u PS-UNKNOWN malformed initial view: the REPORT is captured first, then process-view-unverified with zero teardown", { skip: SKIP }, () => {
+  const w = K.world("l12u");
+  w.set({ curlDelete: "404" });
+  const wk = w.worker("w1170-l12u", { listed: false });
+  const d = w.dispatch(wk);
+  const item = w.write(d, "REPORT", 1, "captured even though the process view is unverified");
+  // The INITIAL view is explicitly unknown: a successful query whose output is not a PID/PPID/COMMAND table.
+  w.set({ psTable: "not a process table\n" });
+  const c = w.cleanup(wk.sid);
+  assert.equal(c.status, 1, c.stdout + c.stderr);
+  assert.equal(c.stderr, `ERR refusing to clean '${wk.sid}': process-view-unverified (malformed) — reports were captured first; nothing was listed, signalled, closed, deleted or retired\n`);
+  assert.equal(c.stdout, `[session-cleanup] report capture: ${wk.sid} captured=1\n`);
+  assert.deepEqual(c.calls[0], PRECHECK, "the first call is the (successful but malformed) initial view");
+  assert.deepEqual(c.calls.filter((x) => x.role !== "dispatch-registry.py"), [PRECHECK], "no teardown actuator reached");
+  assert.equal(rep(w, d).items["REPORT-1"].sha256, item.sha, "the REPORT was captured before the refusal");
+  assert.deepEqual(rep(w, d).failures, [], "a refused cleanup records no `cleaned` failure");
+  assert.notEqual(w.row(d.did).lifecycle?.state, "cleaned", "the record is not retired");
+  assert.ok(fs.readFileSync(item.file).equals(item.bytes), "worker evidence preserved");
   assert.equal(w.run.tripwireHits(), "");
 });
 

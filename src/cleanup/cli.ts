@@ -81,9 +81,12 @@ function chomp(s: string): string {
   return s.replace(/\n+$/, "");
 }
 
-/** stdout captured, stderr discarded (`2>/dev/null`). Status 127 for an unrunnable command, as bash. */
-function capture(cmd: string, args: string[]): { status: number; stdout: string } {
-  const r = spawnSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+/**
+ * stdout captured, stderr discarded (`2>/dev/null`). Status 127 for an unrunnable command, as bash.
+ * Task 1270: an OPTIONAL bound for THIS call's own spawned child only; absent (every legacy caller) = unchanged.
+ */
+function capture(cmd: string, args: string[], bound?: { timeout: number; killSignal: NodeJS.Signals }): { status: number; stdout: string } {
+  const r = spawnSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], ...bound });
   if (r.error) return { status: 127, stdout: "" };
   return { status: r.status ?? 1, stdout: r.stdout ?? "" };
 }
@@ -453,15 +456,24 @@ function selfOrAncestorIn(snap: string, pid: string): boolean {
  * Task 1270 C3-B: is an exact `[node] <…/>telepty allow-create-v1 … --id <sid>` bridge (the boot's
  * versioned create-only verb) running? Detection ONLY — its result is never a kill target; the caller
  * refuses the whole cleanup. Its own read; the kill below keeps its fresh read and ancestry check.
+ * C3 (PS-UNKNOWN): the view is KNOWN only when the existing capture transport reports exit 0 (a spawn
+ * error, the default output bound or a signal is nonzero there) AND stdout is a newline-terminated table
+ * headed `PID PPID COMMAND`; header-only is a known EMPTY view. Anything else is unknown, never absence.
  */
-function versionedBridgeObserved(sid: string): boolean {
-  for (const row of psSnapshot().split("\n")) {
+type InitialView = "known-versioned" | "known-no-versioned" | "unknown:query-failed" | "unknown:malformed";
+function initialProcessView(sid: string): InitialView {
+  // The initial query ONLY: a 2000 ms deadline; its own child is ended with SIGKILL (a timeout is r.error → 127 → unknown).
+  const r = capture(CLEANUP_PS_CMD, ["-eo", "pid,ppid,command"], { timeout: 2000, killSignal: "SIGKILL" });
+  if (r.status !== 0) return "unknown:query-failed";
+  const rows = r.stdout.split("\n");
+  if (!r.stdout.endsWith("\n") || !/^\s*PID\s+PPID\s+COMMAND\s*$/.test(rows[0]!)) return "unknown:malformed";
+  for (const row of rows.slice(1)) {
     const cmd = fields(row).slice(2); // pid ppid command…
     const i = cmd.length > 0 && ["node", "nodejs"].includes(path.basename(cmd[0]!)) ? 1 : 0;
     if (cmd[i] === undefined || path.basename(cmd[i]!) !== "telepty" || cmd[i + 1] !== "allow-create-v1") continue;
-    for (let j = i + 2; j + 1 < cmd.length; j++) if (cmd[j] === "--id" && cmd[j + 1] === sid) return true;
+    for (let j = i + 2; j + 1 < cmd.length; j++) if (cmd[j] === "--id" && cmd[j + 1] === sid) return "known-versioned";
   }
-  return false;
+  return "known-no-versioned";
 }
 
 /**
@@ -738,12 +750,18 @@ function cleanupOne(sid: string, force: boolean): number {
   }
   // Task 1270 C3-B: BEFORE capture/listing/kill/close/DELETE/retirement, and --force does not override it.
   // Provisional no-kill mode pending an operator-clear/custody design; not an identity proof.
-  if (versionedBridgeObserved(sid)) {
+  const view = initialProcessView(sid);
+  if (view === "known-versioned") {
     err(`refusing to clean '${sid}': a versioned 'telepty allow-create-v1' bridge for it is running; nothing was captured, signalled, closed or deleted`);
     return 1;
   }
   // #1170: reports before any kill/close/DELETE; a failed capture refuses the whole cleanup.
   if (!captureReportsBeforeCleanup(sid)) return 1;
+  // C3 (PS-UNKNOWN): an unverified initial view authorizes no teardown, --force included; reports stay captured.
+  if (view !== "known-no-versioned") {
+    err(`refusing to clean '${sid}': process-view-unverified (${view.slice("unknown:".length)}) — reports were captured first; nothing was listed, signalled, closed, deleted or retired`);
+    return 1;
+  }
   // #1162: capture strictly BEFORE the one listing; its failure is only a skip reason.
   const cap = captureAgentBinding(sid);
   const rows = sessionRows(sid);
