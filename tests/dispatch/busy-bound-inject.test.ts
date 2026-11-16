@@ -1107,9 +1107,23 @@ const logged = (es: Entry[]): LoggedCall[] => es;
 const probeReads = (es: Entry[]) => logged(es).filter((e) => e.who === "probe");
 const listReads = (es: Entry[]) => telepty(es).filter((e) => e.argv[0] === "list");
 
-// Inline screens for the two shapes no measured fixture carries. Both are claude viewports.
-/** A working-looking row with NO live-work affordance: no `(esc to interrupt)`, no spinner. */
+// Inline screens for the shapes no measured fixture carries. All are claude viewports.
+/**
+ * A working row with no parenthesised affordance and no spinner, and an empty composer.
+ * r6: this case ADMITS. r4 expected a refusal because its predicate required
+ * `tracker_class === "active"`, an expectation I derived by reading rather than measuring —
+ * and CI then showed the same guard refusing the canonical busy capture
+ * (`working_active.txt`). The probe's own verdict here is: working surface, composer empty,
+ * no approval banner. That is the state the bound path exists for.
+ */
 const WORKING_NO_AFFORDANCE = "reading bin/dispatch.sh\n\n■ Working... (12s)\n ❯ \n";
+/**
+ * A busy row while the welcome banner is still on screen (a just-resumed session that began
+ * working before the banner scrolled off). `TRACKER_WELCOME` + a prompt in the last three
+ * lines makes `tracker_class` `"welcome"` (probe :129, :294-299), which is the family the r6
+ * guard excludes — and the ONLY case that makes that exclusion load-bearing.
+ */
+const BUSY_WITH_WELCOME_BANNER = "⏺ Working... (5s · esc to interrupt)\nWelcome back!\n ❯ \n";
 /** A busy row AND an approval prompt: the modal family must win over a genuine busy glyph. */
 const BUSY_WITH_ENTER_PROMPT = "analyzing\n\n◉ Working... (5s · esc to interrupt)\nPress Enter to continue\n ❯ \n";
 /** Busy with the composer already carrying a staged context-ref (UNSUBMITTED, probe :105). */
@@ -1122,7 +1136,15 @@ describe("1270(o) r4/B1 the admission is decided by the REAL bin/session-probe.p
     // an empty composer, and the `◉ Working... (5s · esc to interrupt)` row.
     ["measured busy claude (spinner + esc-to-interrupt + empty composer)", { file: "active.txt" }],
     ["measured busy claude (working row, no composer line)", { file: "working_active.txt" }],
+    // r6, corrected from CI: a working row with no parenthesised affordance is still busy.
+    ["working row with no parenthesised affordance, empty composer", { text: WORKING_NO_AFFORDANCE }],
   ] as const) {
+    // NOTE on `working_active.txt`: that capture carries no composer line at all, so it is
+    // admitted on the OFFLINE path only — `ready_by_screen` answers `hard-negative` before it
+    // ever looks for a prompt (probe :366-374). The LIVE path would refuse the same screen
+    // with `no-empty-current-prompt` (:488), which is the composer guarantee this unit relies
+    // on in production. Nothing here should be read as "a screen with no visible composer is
+    // delivered to"; the other two screens in this family carry an empty `❯`.
     test(`${name}: admitted, exactly one bound send`, () => {
       const f = fixture();
       try {
@@ -1148,7 +1170,7 @@ describe("1270(o) r4/B1 the admission is decided by the REAL bin/session-probe.p
   for (const [name, screen, why] of [
     ["measured trust-folder modal", { file: "trust_folder_modal.txt" }, "surface=modal (TRUST_MODAL, probe :73)"],
     ["busy glyph + Press Enter to continue", { text: BUSY_WITH_ENTER_PROMPT }, "the modal reader wins over a busy glyph"],
-    ["working word with no live-work affordance", { text: WORKING_NO_AFFORDANCE }, "tracker_class is not `active`"],
+    ["busy row while the welcome banner is still on screen", { text: BUSY_WITH_WELCOME_BANNER }, "tracker_class is `welcome`"],
     ["busy with an unsubmitted context-ref in the composer", { text: BUSY_WITH_UNSUBMITTED }, "surface=unsubmitted"],
   ] as const) {
     test(`${name}: NOT admitted (${why}), nothing sent, nothing recorded`, () => {
@@ -1222,7 +1244,11 @@ describe("1270(q) r4/m-B the closed result outranks the envelope's transport wor
           result: closed({ stage: "accepted", bytes_written: 0 }) }) + "\n",
         exit: 2,
       };
-      const r = follow(f, armR1(f, contradiction));
+      // Armed ONCE: arm() truncates the shared order log (`writeFileSync(orderLogPath(f), "")`),
+      // so re-arming before the repeat would erase the first send and the count below would
+      // observe 0 — which is exactly how CI failed this case in run 43885485949.
+      const overrides = armR1(f, contradiction);
+      const r = follow(f, overrides);
       assert.equal(boundSends(entries(f)).length, 1, r.stderr);
       assert.equal(r.status, 7, `a contradicted word cannot prove unsent\n${r.stderr}`);
       assert.doesNotMatch(r.stderr, /may be dispatched again/, "the ref must NOT be freed");
@@ -1233,7 +1259,7 @@ describe("1270(q) r4/m-B the closed result outranks the envelope's transport wor
       // contradicts itself, so it is degraded to null rather than believed.
       assert.equal(boundObservation(f).bytes_written, null,
         "an accepted stage cannot carry an authoritative zero");
-      const again = follow(f, armR1(f, contradiction));
+      const again = follow(f, overrides);
       assert.equal(boundSends(entries(f)).length, 1, `held means no second send\n${again.stderr}`);
       assert.equal(again.status, 7, again.stderr);
     } finally { f.cleanup(); }

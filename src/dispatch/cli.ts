@@ -1185,8 +1185,12 @@ function boundedToken(value: unknown): boolean {
     && !/[\u0000-\u001f\u007f]/.test(value) && !value.startsWith("-");
 }
 
-/** The pinned identity ONE snapshot published, and the capability it declared with it. */
-interface BoundBinding { epoch: string; ownerGeneration: string; busyInput: string; cliKind: string }
+/**
+ * The pinned identity ONE snapshot published, and the capability it declared with it.
+ * r6/n-A: no `cliKind` here — the admission's CLI kind lives on BusyAdmission, where it is
+ * actually read (as the readiness-verdict reuse key); a copy on the binding was dead state.
+ */
+interface BoundBinding { epoch: string; ownerGeneration: string; busyInput: string }
 
 /**
  * The daemon's closed result object, every field re-bounded on the way in. r1 M2 adds the
@@ -1284,21 +1288,38 @@ interface BusyAdmission {
  *     is the probe's own third busy spelling, kept here because its source still emits it.
  *     `no-empty-current-prompt` is NOT in the set: that reason IS the composer guarantee in
  *     the live path, where it is returned before any busy test (:489-490).
- *  3. `detail.tracker_class === "active"` — the INDEPENDENT positive guard this round adds.
- *     `tracker_class` is computed from a different pattern family (`TRACKER_ACTIVE_TEXT` =
- *     `(esc to interrupt)` / `thinking with xhigh effort` / `⏵Ns`, or a braille spinner;
- *     probe :130, :294-296), and the modal/approval family it does NOT match:
- *     `Press Enter to continue` and `Do you trust` live in `TRACKER_WELCOME` (:129) and in
- *     `TRUST_MODAL` (:73). `current_busy_signal`'s own fourth arm matches those phrases
- *     (:425), so without this guard an approval prompt that escaped the modal reader could
- *     qualify on a busy word alone. `activity` is NOT usable for this: `observe()` derives
- *     it from the surface (`activity = "moving" if working_token …`, :643), so it carries no
- *     evidence the surface does not already carry.
+ *  3. `detail.tracker_class` is not one of the approval/broken families — an explicit
+ *     EXCLUSION, which is what this guard has to be. r4 required `=== "active"` instead and
+ *     CI measured the consequence: the canonical claude busy row
+ *     `⏺ Working... (5s · esc to interrupt)` (tests/dispatch/fixtures/working_active.txt, the
+ *     very row probe :415-421 calls measured) yields tracker_class **"blank"**, because
+ *     `TRACKER_ACTIVE_TEXT` (:130) needs the parenthesis to wrap the phrase exactly —
+ *     `\(esc to interrupt\)` does not match `(5s · esc to interrupt)` — and the row carries
+ *     no braille spinner. So an inclusion on "active" refused a genuinely busy session: B1
+ *     again, in a narrower form. The exclusion keeps the property that was actually wanted:
+ *       • `"welcome"` is the approval/boot family — `TRACKER_WELCOME` (:129) is
+ *         `Welcome back|Tips for getting started|Trust this folder|Press Enter to continue`,
+ *         which is a DIFFERENT pattern family from `TRUST_MODAL` (:73), so it still catches an
+ *         approval or welcome banner that the modal reader's line anchoring missed while
+ *         `current_busy_signal`'s fourth arm (:427) matched a busy word;
+ *       • `"error"` is `TRACKER_ERR` (:125-128) — an `error:`/`traceback`/`panic:`/
+ *         `command not found`/`killed:`/`exited N` line, which `classify_surface` does not test
+ *         for, so a broken session is not handed input either.
+ *     `activity` is NOT usable for any of this: `observe()` derives it from the surface
+ *     (`activity = "moving" if working_token …`, :645), so it carries no evidence the surface
+ *     does not already carry.
  *
- * The full truth table for every combination the real probe can emit is in output/REPORT.md.
+ * The modal/approval family's PRIMARY exclusion is conjunct 1: `classify_surface` tests
+ * thinking_block, sandbox_prompt, TRUST_MODAL, crash, sleep_cut, api_error, raw_shell and
+ * UNSUBMITTED before its working arm, so none of them can be `working`. CI measured that for
+ * the trust modal and for a busy row carrying `Press Enter to continue`: both refused.
+ *
+ * The corrected truth table, with each row marked measured-by-CI or derived, is in
+ * output/REPORT.md.
  */
 const BOUND_BUSY_REASONS = new Set(["current-busy-or-modal", "hard-negative", "current-working"]);
-const BOUND_TRACKER_ACTIVE = "active";
+/** r6: tracker families that must never be given input, however busy the surface looks. */
+const BOUND_TRACKER_REFUSED = new Set(["welcome", "error"]);
 
 /**
  * Only a NON-SPAWNED `--target` whose current state is qualified busy may take the
@@ -1328,7 +1349,7 @@ function admitBoundBusy(o: Opts, sid: string): BusyAdmission {
   // the legacy path's business, and the bound path is only for a session that cannot accept
   // a new task through the composer.
   if (p === null || !p.alive || p.probeError || p.ready || p.surface !== "working"
-    || !BOUND_BUSY_REASONS.has(p.readyReason) || p.trackerClass !== BOUND_TRACKER_ACTIVE) return measured;
+    || !BOUND_BUSY_REASONS.has(p.readyReason) || BOUND_TRACKER_REFUSED.has(p.trackerClass)) return measured;
   // Only NOW is one snapshot read worth taking: this session is qualified busy, so the
   // binding is about to be used. An unreadable listing leaves the readiness wait in charge
   // (the pre-feature behaviour for a busy target), rather than inventing a capability refusal.
@@ -1351,7 +1372,7 @@ function admitBoundBusy(o: Opts, sid: string): BusyAdmission {
     refuse(`the local telepty CLI does not advertise ${BOUND_VERB} in boot-capabilities ` +
       "(an unknown verb's help text and exit 0 is not support)");
   }
-  return { bound: { epoch: snap.epoch, ownerGeneration: snap.ownerGeneration, busyInput: snap.busyInput, cliKind: snap.cliKind },
+  return { bound: { epoch: snap.epoch, ownerGeneration: snap.ownerGeneration, busyInput: snap.busyInput },
     cliKind, probe: p, startedAt };
 }
 
@@ -1473,9 +1494,12 @@ function recordBoundObservation(sid: string, b: BoundBinding,
     reason: r === null ? null : r.reason,
     // The caller's pin, and (r1 M2) what the daemon itself said the answer was about, kept
     // apart: the first is an assumption, the second is the fact that was checked against it.
-    // r4 n-A: `cli` is the kind the admission resolved and pinned the probe to; recording it
-    // makes the binding self-describing and the field read rather than write-only state.
-    binding: { session_epoch: b.epoch, owner_generation: b.ownerGeneration, busy_input: b.busyInput, cli: b.cliKind },
+    // r6: exactly the three keys the contract's "exact bounded structured observation" names.
+    // r4 recorded a fourth (`cli`) to close note n-A, which asked only that the then-dead
+    // BoundBinding.cliKind be dropped OR used — no finding required a wider RECORD, and three
+    // deepStrictEqual assertions measured the narrow shape. n-A is closed by removing the
+    // field from BoundBinding instead (its interface and its one literal).
+    binding: { session_epoch: b.epoch, owner_generation: b.ownerGeneration, busy_input: b.busyInput },
     reported: r === null ? null
       : { session_id: r.sessionId, session_epoch: r.sessionEpoch, owner_generation: r.ownerGeneration },
     verdict,
