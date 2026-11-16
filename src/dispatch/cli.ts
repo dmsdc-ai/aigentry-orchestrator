@@ -1338,10 +1338,12 @@ function injectBound(o: Opts, d: Delivery, sid: string, b: BoundBinding): Promis
  * proves it: a local/host refusal that opened no socket, the schema-less 404 that proves
  * the route is unregistered, or a closed `refused` result reporting 0.
  */
-function parseBoundAnswer(out: string): { transport: string; result: BoundResult | null } {
+function parseBoundAnswer(out: string): { transport: string; cliReason: string | null; result: BoundResult | null } {
   const bounded = (value: unknown, allowed: Set<string>): string =>
     typeof value === "string" && allowed.has(value) ? value : "unknown";
   const token = (value: unknown): string | null => (boundedToken(value) ? value as string : null);
+  const reasonCode = (value: unknown): string | null =>
+    typeof value === "string" && BOUND_REASON.test(value) ? value : null;
   for (const line of out.replace(/\r/g, "").split("\n").reverse()) {
     if (!line.trim()) continue;
     let doc: unknown;
@@ -1369,9 +1371,12 @@ function parseBoundAnswer(out: string): { transport: string; result: BoundResult
       bytesWritten: body.bytes_written === 0 ? 0 : null,
     } : null;
     if (raw === "" && result === null) continue; // not this verb's line
-    return { transport, result };
+    // r2: the envelope's own bounded reason code, which for every shape WITHOUT a closed
+    // result is the only cause available (inject-bound-v1.js:91,98,116,120). Read from the
+    // envelope, never from the closed body, so the two reasons stay distinguishable.
+    return { transport, cliReason: reasonCode(envelope.reason), result };
   }
-  return { transport: "", result: null };
+  return { transport: "", cliReason: null, result: null };
 }
 
 /**
@@ -1380,12 +1385,26 @@ function parseBoundAnswer(out: string): { transport: string; result: BoundResult
  * no registry or schema expansion is involved — and none would be authorized merely to
  * relabel a hand-off. `write_observed` is deliberately absent: only matching body+CR
  * PTY receipts could justify that word, and this answer is not one.
+ *
+ * r2: every field is nested under ONE `bound` object, and that nesting is load-bearing,
+ * not cosmetic. `append_observation` stores only the fields whose value is not None
+ * (`bin/dispatch-registry.py:513-516`, `if v is not None`), so a TOP-LEVEL `null` is
+ * dropped and the key is simply absent from the durable record. For this unit that is a
+ * correctness defect, not an aesthetic one: a reader of `bytes_written` that defaults an
+ * absent key to 0 — `obs.get("bytes_written", 0)`, `Number(obs.bytes_written ?? 0)` —
+ * would read "nothing was written" for a lost answer and for an accepted hand-off, which
+ * is exactly the inference the frozen contract forbids ("never infer zero from a
+ * timeout/lost response/queued frame"). The same filter was silently erasing `schema`,
+ * `reason`, `reported` and `inject_id` on the shapes where each is legitimately null.
+ * Inside a nested object nothing is filtered, so every explicit null survives verbatim;
+ * the registry itself is untouched (its filter is shared by every other observation kind).
  */
-function recordBoundObservation(sid: string, b: BoundBinding, answer: { transport: string; result: BoundResult | null },
+function recordBoundObservation(sid: string, b: BoundBinding,
+  answer: { transport: string; cliReason: string | null; result: BoundResult | null },
   rc: number, verdict: string): void {
   const r = answer.result;
   const provenUnsent = answer.transport === "refused_locally" || answer.transport === "unsupported";
-  const payload = {
+  const bound = {
     verb: BOUND_VERB,
     schema: r === null ? null : BOUND_RESULT_SCHEMA,
     stage: r !== null ? r.stage : provenUnsent ? "refused" : "unknown",
@@ -1405,8 +1424,13 @@ function recordBoundObservation(sid: string, b: BoundBinding, answer: { transpor
     bytes_written: r !== null ? r.bytesWritten : provenUnsent ? 0 : null,
     consumption: "unknown",
     cli_exit: rc,
+    // r2: the verb's OWN bounded reason code, which is the only reason a shape without a
+    // closed result carries (`response_unavailable`, `response_unparseable`,
+    // `route_unsupported`, or an argv/host refusal code). Without it a lost or locally
+    // refused delivery left no diagnosable cause in the record at all.
+    cli_reason: answer.cliReason,
   };
-  if (registryQuiet(["observe", "--sid", sid, "--kind", "bound_inject_result", "--json", JSON.stringify(payload)]) !== 0) {
+  if (registryQuiet(["observe", "--sid", sid, "--kind", "bound_inject_result", "--json", JSON.stringify({ bound })]) !== 0) {
     process.stderr.write(`dispatch.sh: WARNING the bound-inject observation for ${sid} could not be recorded ` +
       "(the transport result itself still is)\n");
   }
@@ -1444,9 +1468,11 @@ async function completeBoundDelivery(o: Opts, d: Delivery, sid: string, b: Bound
   const unsent = !accepted && !otherSession
     && (answer.transport === "refused_locally" || answer.transport === "unsupported"
       || (r !== null && r.stage === "refused" && r.bytesWritten === 0));
-  // The named reason this verdict carries into the record and into the operator line.
+  // The named reason this verdict carries into the record and into the operator line. r2:
+  // a shape with no closed result now names the verb's OWN reason code too — `reason=
+  // outcome_unknown` was a restatement of the transport, not a cause an operator can act on.
   const why = otherSession ? "bound_session_identity_mismatch"
-    : r === null ? (answer.transport || "response_unparseable")
+    : r === null ? [answer.transport || "none", answer.cliReason].filter((p) => p !== null).join(":")
       : r.stage === "accepted" && !samePin ? "bound_binding_identity_mismatch"
         : r.reason !== null ? r.reason : r.stage;
   d.transportInjectId = r === null || r.injectId === null ? "" : r.injectId;

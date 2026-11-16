@@ -652,7 +652,16 @@ function boundObservation(f: F): Record<string, unknown> {
   const found = committed[0]!.observations.filter((o) => JSON.stringify(o).includes(RESULT_SCHEMA)
     || String((o as { kind?: unknown }).kind) === "bound_inject_result");
   assert.equal(found.length, 1, `exactly one bound-result observation:\n${JSON.stringify(committed[0])}`);
-  return found[0]!;
+  // r2: the fields live under ONE nested `bound` object, and that is load-bearing — the
+  // registry stores only the TOP-LEVEL fields whose value is not None
+  // (bin/dispatch-registry.py:513-516), so a flat `bytes_written: null` is dropped and the
+  // key goes missing from the durable record. Asserting the nesting here means a regression
+  // to the flat shape fails loudly instead of silently returning `undefined` everywhere.
+  const payload = found[0]!.bound;
+  assert.ok(payload !== null && typeof payload === "object" && !Array.isArray(payload),
+    `the bound-inject observation must nest its fields under \`bound\`, or every explicit ` +
+    `null is dropped by the registry:\n${JSON.stringify(found[0])}`);
+  return payload as Record<string, unknown>;
 }
 
 // ── (i) the REAL envelope drives the production parsing branch (M5) ─────────
@@ -730,19 +739,80 @@ describe("1270(i) r1/M5 the daemon CLI's real envelope is what the caller parses
   });
 });
 
+// ── (n) r2: an unknown effect is recorded EXPLICITLY, never as an absent key ─
+// The r1 revision wrote these fields at the TOP LEVEL of the observation, where the
+// registry drops every null (bin/dispatch-registry.py:513-516 `if v is not None`). The two
+// CI failures were `bytes_written` reading `undefined` instead of `null`; the same filter
+// was also erasing `schema`, `reason`, `reported` and `inject_id` — and, on the ACCEPTED
+// shape, `bytes_written` too, which is the most dangerous one: a consumer that defaults an
+// absent key to 0 reads "nothing was written" for a body that WAS handed over. These cases
+// pin the invariant itself (presence AND an explicit value) for every shape that has a
+// legitimately null field, so the flat shape cannot come back unnoticed.
+describe("1270(n) r2 every unknown-effect field is present with an explicit value", () => {
+  const nullableOnLost = ["schema", "reported", "inject_id", "bytes_written"];
+
+  for (const [name, answer, cliReason] of [
+    ["lost (no response)", lostEnv(), "response_unavailable"],
+    ["unparseable answer", unparseableEnv(), "response_unparseable"],
+  ] as const) {
+    test(`${name}: every nullable field is PRESENT and explicitly null, and the cause is named`, () => {
+      const f = fixture();
+      try {
+        f.prepareTarget();
+        const r = follow(f, armR1(f, answer));
+        assert.equal(r.status, 7, r.stderr);
+        const obs = boundObservation(f);
+        const flat = JSON.stringify(obs);
+        for (const key of nullableOnLost) {
+          assert.ok(Object.hasOwn(obs, key), `${key} must be PRESENT, not dropped:\n${flat}`);
+          assert.equal(obs[key], null, `${key} must be an explicit null for a ${name} answer:\n${flat}`);
+        }
+        // Not null, and not inferred either: the stages and the consumption are explicit.
+        assert.equal(obs.body_stage, "unknown", flat);
+        assert.equal(obs.submit_stage, "unknown", flat);
+        assert.equal(obs.consumption, "unknown", flat);
+        assert.equal(obs.stage, "unknown", flat);
+        // r2: the verb's own reason code is the ONLY cause such an answer carries, so the
+        // record must keep it — `transport: outcome_unknown` alone is not a diagnosis.
+        assert.equal(obs.cli_reason, cliReason, `the verb's own reason must be recorded:\n${flat}`);
+        assert.match(r.stderr, new RegExp(cliReason), "and it must reach the operator line too");
+      } finally { f.cleanup(); }
+    });
+  }
+
+  test("accepted: bytes_written is PRESENT and explicitly null — a hand-off is not a proven zero", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      const r = follow(f, armR1(f, acceptedEnv()));
+      assert.equal(r.status, 0, r.stderr);
+      const obs = boundObservation(f);
+      const flat = JSON.stringify(obs);
+      assert.ok(Object.hasOwn(obs, "bytes_written"), `bytes_written must be PRESENT:\n${flat}`);
+      assert.equal(obs.bytes_written, null,
+        `an accepted hand-off has written no PROVEN byte count; a dropped key would read as 0:\n${flat}`);
+      assert.ok(Object.hasOwn(obs, "reason"), `reason must be PRESENT even when null:\n${flat}`);
+      assert.equal(obs.reason, null, flat);
+      assert.equal(obs.cli_reason, null, "the accepted envelope carries no reason either");
+      assert.equal(obs.consumption, "unknown", flat);
+    } finally { f.cleanup(); }
+  });
+});
+
 // ── (j) the proven-unsent branch, and its complement (M4) ───────────────────
 describe("1270(j) r1/M4 an answer that PROVES nothing was written frees the ref", () => {
-  const unsentCases: Array<[string, R1Answer, string]> = [
+  // [name, answer, the reason that must reach the operator line, the verb's own reason code]
+  const unsentCases: Array<[string, R1Answer, string, string]> = [
     // Two distinct REAL refusal reasons from the route's own order (session-actions.js:1939,
     // :1946), both 4xx — on this route 4xx means nothing was written (API-MAP §1).
-    ["closed refused: epoch_mismatch", refusedEnv("epoch_mismatch", { session_epoch: "EPOCH-moved-on" }), "epoch_mismatch"],
-    ["closed refused: busy_input_unsupported", refusedEnv("busy_input_unsupported"), "busy_input_unsupported"],
+    ["closed refused: epoch_mismatch", refusedEnv("epoch_mismatch", { session_epoch: "EPOCH-moved-on" }), "epoch_mismatch", "epoch_mismatch"],
+    ["closed refused: busy_input_unsupported", refusedEnv("busy_input_unsupported"), "busy_input_unsupported", "busy_input_unsupported"],
     // The two shapes that prove it without reaching the daemon at all.
-    ["schema-less 404 (route unsupported)", unsupportedEnv(), "unsupported"],
-    ["pre-socket local refusal", refusedLocallyEnv("non_canonical_daemon_host"), "refused_locally"],
+    ["schema-less 404 (route unsupported)", unsupportedEnv(), "unsupported", "route_unsupported"],
+    ["pre-socket local refusal", refusedLocallyEnv("non_canonical_daemon_host"), "refused_locally", "non_canonical_daemon_host"],
   ];
 
-  for (const [name, answer, reason] of unsentCases) {
+  for (const [name, answer, reason, cliReason] of unsentCases) {
     test(`${name}: recorded not_delivered at exit 3, and the SAME ref may be dispatched again`, () => {
       const f = fixture();
       try {
@@ -760,6 +830,12 @@ describe("1270(j) r1/M4 an answer that PROVES nothing was written frees the ref"
         assert.equal(row.transport.result, "not_delivered", "nothing was written, and the record says exactly that");
         assert.equal(row.lifecycle.state, "not_delivered");
         assert.ok(!JSON.stringify(row).includes("write_observed"));
+        // r2: a PROVEN zero is recorded as an explicit 0 — the other half of the invariant
+        // case (n) pins, and the only shape where the contract allows a zero at all.
+        const obs = boundObservation(f);
+        assert.ok(Object.hasOwn(obs, "bytes_written"), `bytes_written must be PRESENT:\n${JSON.stringify(obs)}`);
+        assert.equal(obs.bytes_written, 0, `a proven-unsent refusal records an explicit 0:\n${JSON.stringify(obs)}`);
+        assert.equal(obs.cli_reason, cliReason, `the verb's own reason must be recorded:\n${JSON.stringify(obs)}`);
         // The whole point of the branch: the identity is NOT held, so the retry proceeds.
         const again = follow(f, overrides);
         assert.equal(boundSends(entries(f)).length, 2,
