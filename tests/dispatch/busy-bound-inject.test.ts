@@ -953,6 +953,39 @@ function runVerify(f: F, args: string[], overrides: NodeJS.ProcessEnv): SpawnSyn
     { cwd: f.root, env: { ...f.env, ...overrides }, encoding: "utf8", timeout: 40000 });
 }
 
+// r3: bin/dispatch-verify.sh refuses up front on native Windows, so on win32 these three
+// subtests ASSERT that refusal and its zero effect instead of being skipped — the Windows
+// lane's rule is zero failures AND zero skips. Convention mirrored from
+// tests/dispatch/T150-task-ledger-queue-shape.test.ts:25 (`const WIN32 = …`) and :64-69
+// (assert the exit, assert the named refusal, assert nothing happened, then return); the
+// same shape is used by tests/dispatch/cli-cap-regression.test.ts:30-31 and
+// tests/dispatch/T141-model-launcher-flags.test.ts:119,149.
+const WIN32 = process.platform === "win32";
+/**
+ * MEASURED from the script, not assumed (`bin/dispatch-verify.sh:31`):
+ *   case "$(uname -s)" in MINGW*|MSYS*) echo "dispatch-verify.sh: needs confined worker
+ *     sessions, unavailable on native Windows (SANDBOX_PLATFORM_UNSUPPORTED); use WSL2" >&2;
+ *     exit 78;; esac
+ * The message goes to stderr (`>&2`), so stdout stays empty; the exit is 78; and the line
+ * sits AFTER argument parsing but BEFORE `[ -n "$sid" ]` (:32), the `say()` definition
+ * (:34), the `mktemp` for POLICY_ACTION_FILE (:40) and every `run_check` call — so on win32
+ * no temp file is created, no probe or policy helper runs, and no key can be sent by any
+ * path. This refusal is existing product behaviour and is not changed by this unit.
+ */
+const WIN32_VERIFY_REFUSAL =
+  /^dispatch-verify\.sh: needs confined worker sessions, unavailable on native Windows \(SANDBOX_PLATFORM_UNSUPPORTED\); use WSL2$/m;
+
+function assertWin32VerifyRefusal(f: F, r: SpawnSyncReturns<string>): void {
+  assert.equal(r.status, 78, `the platform refusal exits 78\n${r.stderr}`);
+  assert.match(r.stderr, WIN32_VERIFY_REFUSAL, r.stderr);
+  assert.equal(r.stdout, "", `the refusal is written to stderr only\n${r.stdout}`);
+  // The invariant the case exists for still holds here, for the platform's own reason: the
+  // script exits before run_check, so no Enter and no send-key of any spelling is possible.
+  assert.deepEqual(keyWrites(entries(f)).map((e) => e.argv), [],
+    "a script that refuses before run_check cannot send a key either");
+  assert.doesNotMatch(r.stdout, /VERIFIED/);
+}
+
 describe("1270(m) r1/M6 the verify resubmit is observe-only for busy and policy-controlled otherwise", () => {
   test("--resubmit --observe-only on a [not-moving] verdict sends NO key (deleting the observe_only guard fails this)", () => {
     const f = fixture();
@@ -960,6 +993,7 @@ describe("1270(m) r1/M6 the verify resubmit is observe-only for busy and policy-
       f.prepareTarget();
       const overrides = { ...arm(f), POLICY_PY: policyStub(f, "RESUBMIT_ENTER") };
       const r = runVerify(f, ["--resubmit", "--observe-only"], overrides);
+      if (WIN32) { assertWin32VerifyRefusal(f, r); return; }
       // Everything the resubmit branch keys on is TRUE here except observe_only: the verdict
       // is rc 6, --resubmit is set, the marker is present and the policy asks for the Enter.
       assert.match(r.stdout, /\[not-moving\]/, `the marker the branch keys on is present\n${r.stderr}`);
@@ -976,6 +1010,7 @@ describe("1270(m) r1/M6 the verify resubmit is observe-only for busy and policy-
       f.prepareTarget();
       const overrides = { ...arm(f), POLICY_PY: policyStub(f, "ESCALATE") };
       const r = runVerify(f, ["--resubmit"], overrides);
+      if (WIN32) { assertWin32VerifyRefusal(f, r); return; }
       assert.match(r.stdout, /\[not-moving\]/, `the marker alone must not be enough\n${r.stderr}`);
       assert.equal(r.status, 6, r.stderr);
       assert.deepEqual(keyWrites(entries(f)).map((e) => e.argv), [],
@@ -991,6 +1026,7 @@ describe("1270(m) r1/M6 the verify resubmit is observe-only for busy and policy-
       const overrides = { ...arm(f, {}, { PROBE_SURFACE: "unsubmitted", PROBE_READY_REASON: "no-empty-current-prompt" }),
         POLICY_PY: policyStub(f, "RESUBMIT_ENTER") };
       const r = runVerify(f, ["--resubmit"], overrides);
+      if (WIN32) { assertWin32VerifyRefusal(f, r); return; }
       const keys = keyWrites(entries(f));
       assert.equal(keys.length, 1, `the idle recovery must still happen\n${r.stdout}\n${r.stderr}`);
       assert.deepEqual(keys[0]!.argv, ["send-key", SID, "enter"], "and it is the one documented Enter");
