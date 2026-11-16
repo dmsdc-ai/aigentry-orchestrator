@@ -33,24 +33,6 @@ case "$(uname -s)" in MINGW*|MSYS*) echo "dispatch-verify.sh: needs confined wor
 
 say() { [ "$quiet" -eq 1 ] || echo "$@"; }
 
-# Task 1270: run_check runs in a command substitution, so its policy answer cannot reach the
-# resubmit gate through a variable. It is published here instead, and read back below. An
-# unavailable temp dir must never fail a verification that used to need no temp file at all:
-# the name stays empty, nothing is written, and the resubmit gate below fails closed.
-POLICY_ACTION_FILE="$(mktemp "${TMPDIR:-/tmp}/dispatch-verify-action.XXXXXX" 2>/dev/null || true)"
-trap '[ -n "$POLICY_ACTION_FILE" ] && rm -f "$POLICY_ACTION_FILE"' EXIT
-
-# Task 1270: the Enter-resend is POLICY-controlled, not marker-controlled. The producer of
-# this action is bin/policy.py:135 (r1 m6), which answers RESUBMIT_ENTER only for the
-# not-moving startup surfaces (unsubmitted/idle/welcome/modal/sandbox_prompt) and ESCALATE for
-# a current_busy session (surface=working, policy.py:136). So a `[not-moving]` marker in the
-# SUSPECT text can no longer send a bare Enter into a composer that is already carrying input.
-# Fail closed: no readable action, no key — and the skip is announced, never silent.
-policy_wants_enter() {
-  [ -s "$POLICY_ACTION_FILE" ] || return 1
-  grep -q '"action"[[:space:]]*:[[:space:]]*"RESUBMIT_ENTER"' "$POLICY_ACTION_FILE"
-}
-
 run_check() {
   local pre_info state_json action_json
   pre_info=$("$TELEPTY" session info "$sid" --json 2>/dev/null || true)
@@ -69,7 +51,6 @@ run_check() {
     echo "SUSPECT $sid — policy failed"
     return 6
   fi
-  if [ -n "$POLICY_ACTION_FILE" ]; then printf '%s' "$action_json" > "$POLICY_ACTION_FILE"; fi
   STATE_JSON="$state_json" ACTION_JSON="$action_json" SID="$sid" OBSERVE_ONLY="$observe_only" python3 - <<'PY'
 import json, os, sys
 
@@ -103,30 +84,23 @@ sys.exit(6)
 PY
 }
 
-# Task 1275: `out=$(run_check); rc=$?` under `set -e` terminated the script on every non-zero
-# verdict, so the SUSPECT print below and the whole --resubmit branch were unreachable. The
-# verdict is captured without ending the run; nothing else about the exit contract changes.
-rc=0
-out=$(run_check) || rc=$?
+# Task 1270 scope note (r4 M-B): the base `out=$(run_check); rc=$?` under `set -euo pipefail`
+# ends the script on every non-zero verdict, so the say below and the whole --resubmit branch
+# are DEAD. That is a real defect (task 1275) and repairing it would make a `telepty send-key
+# enter` newly live for every existing caller of this script — out of this unit's scope. The
+# line is therefore left exactly as the base has it; the repair and its tests are handed off
+# in output/TASK-1275-HANDOFF.md. The bound path needs none of it: it passes --observe-only
+# and never --resubmit, and with this line unrepaired the branch cannot run at all.
+out=$(run_check); rc=$?
 say "$out"
 
-if [ "$rc" -eq 6 ] && [ "$resubmit" -eq 1 ] && [ "$observe_only" -eq 0 ] \
-   && printf '%s' "$out" | grep -q '\[not-moving\]'; then
-  # Task 1270 (r1 m6): the decision to send a key is policy.py's, not this marker's. When the
-  # policy does not ask for it, say so — a recovery that silently stops happening (an older
-  # policy.py, a POLICY_PY override, a new action spelling) is otherwise indistinguishable
-  # from one that was never needed.
-  if policy_wants_enter; then
-    say "dispatch-verify: not-moving → #412 submit-resend (send-key enter), re-verifying once..."
-    "$TELEPTY" send-key "$sid" enter >/dev/null 2>&1 || true
-    sleep 2
-    rc=0
-    out=$(run_check) || rc=$?
-    say "$out"
-    [ "$rc" -eq 0 ] && say "dispatch-verify: recovered via Enter-resend (the inject was unsubmitted — #412)."
-  else
-    say "dispatch-verify: not-moving marker present, but the policy did not answer RESUBMIT_ENTER (producer: bin/policy.py:135) — no key sent. This is the current_busy / unrecognised-action guard, not a failure."
-  fi
+if [ "$rc" -eq 6 ] && [ "$resubmit" -eq 1 ] && printf '%s' "$out" | grep -q '\[not-moving\]'; then
+  say "dispatch-verify: not-moving → #412 submit-resend (send-key enter), re-verifying once..."
+  "$TELEPTY" send-key "$sid" enter >/dev/null 2>&1 || true
+  sleep 2
+  out=$(run_check); rc=$?
+  say "$out"
+  [ "$rc" -eq 0 ] && say "dispatch-verify: recovered via Enter-resend (the inject was unsubmitted — #412)."
 fi
 
 exit "$rc"

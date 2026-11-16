@@ -267,7 +267,15 @@ function isReady(sid: string, cliKind: string, timeoutMs = READINESS_CAPTURE_MAX
  * through its exit code only — the probe itself is untouched, and so is its verdict:
  * `ready` stays false for a qualified current-busy session. null = no usable verdict.
  */
-interface ProbeState { alive: boolean; ready: boolean; surface: string; readyReason: string; probeError: boolean }
+interface ProbeState {
+  alive: boolean;
+  ready: boolean;
+  surface: string;
+  readyReason: string;
+  /** r4 B1: `detail.tracker_class`, already emitted — the independent live-work signal. */
+  trackerClass: string;
+  probeError: boolean;
+}
 
 function probeState(sid: string, cliKind: string, timeoutMs = READINESS_CAPTURE_MAX_MS): ProbeState | null {
   const { stdout } = capture(SESSION_PROBE_PY, ["--sid", sid, "--cli", cliKind], { TELEPTY }, timeoutMs);
@@ -280,6 +288,7 @@ function probeState(sid: string, cliKind: string, timeoutMs = READINESS_CAPTURE_
       ready: p.ready === true,
       surface: typeof p.surface === "string" ? p.surface : "",
       readyReason: typeof detail.ready_reason === "string" ? detail.ready_reason : "",
+      trackerClass: typeof detail.tracker_class === "string" ? detail.tracker_class : "",
       probeError: detail.probe_error !== undefined,
     };
   } catch {
@@ -1247,7 +1256,49 @@ function boundVerbAdvertised(): boolean {
  * what it paid before this feature existed — one listing (resolveRoute's, already made)
  * and one probe.
  */
-interface BusyAdmission { bound: BoundBinding | null; cliKind: string; probe: ProbeState | null }
+interface BusyAdmission {
+  bound: BoundBinding | null;
+  cliKind: string;
+  probe: ProbeState | null;
+  /** r4 m-C: when the admission's probe STARTED, so the readiness deadline can be anchored
+   *  there and a `--target` dispatch's total wall budget stays exactly `--timeout-ms`. */
+  startedAt: number;
+}
+
+/**
+ * r4 B1 — the admission predicate, derived from bin/session-probe.py (NOT edited) rather
+ * than assumed. Three facts the real probe emits, each load-bearing:
+ *
+ *  1. `surface === "working"`. In the live path `classify_surface(..., current=True)` returns
+ *     `working` only through its `current_busy_signal(controls)` arm (probe :538-540), and
+ *     `observe()` RE-CLASSIFIES the surface on `controls` (:637-640), so a settled session
+ *     whose only glyph row is a completed duration footer re-reads as `idle`, not `working`
+ *     (#1136). The arms tested before it — thinking_block, sandbox_prompt, TRUST_MODAL,
+ *     crash, sleep_cut, api_error, raw_shell, UNSUBMITTED — therefore cannot be `working`.
+ *  2. a busy ready_reason. The r0-r3 predicate required `current-working`, which is
+ *     UNREACHABLE: `surface === "working"` implies `current_busy_signal(controls)` is true,
+ *     and `ready_by_current_screen` evaluates that same expression on the same input
+ *     (:488-491) and returns `current-busy-or-modal` BEFORE its `surface == "working"` line
+ *     (:492-493). So the live reason for a busy session is `current-busy-or-modal`, the
+ *     offline `--screen-file` path answers `hard-negative` (:366-374), and `current-working`
+ *     is the probe's own third busy spelling, kept here because its source still emits it.
+ *     `no-empty-current-prompt` is NOT in the set: that reason IS the composer guarantee in
+ *     the live path, where it is returned before any busy test (:489-490).
+ *  3. `detail.tracker_class === "active"` — the INDEPENDENT positive guard this round adds.
+ *     `tracker_class` is computed from a different pattern family (`TRACKER_ACTIVE_TEXT` =
+ *     `(esc to interrupt)` / `thinking with xhigh effort` / `⏵Ns`, or a braille spinner;
+ *     probe :130, :294-296), and the modal/approval family it does NOT match:
+ *     `Press Enter to continue` and `Do you trust` live in `TRACKER_WELCOME` (:129) and in
+ *     `TRUST_MODAL` (:73). `current_busy_signal`'s own fourth arm matches those phrases
+ *     (:425), so without this guard an approval prompt that escaped the modal reader could
+ *     qualify on a busy word alone. `activity` is NOT usable for this: `observe()` derives
+ *     it from the surface (`activity = "moving" if working_token …`, :643), so it carries no
+ *     evidence the surface does not already carry.
+ *
+ * The full truth table for every combination the real probe can emit is in output/REPORT.md.
+ */
+const BOUND_BUSY_REASONS = new Set(["current-busy-or-modal", "hard-negative", "current-working"]);
+const BOUND_TRACKER_ACTIVE = "active";
 
 /**
  * Only a NON-SPAWNED `--target` whose current state is qualified busy may take the
@@ -1260,22 +1311,24 @@ interface BusyAdmission { bound: BoundBinding | null; cliKind: string; probe: Pr
  * with zero input effect of any kind.
  */
 function admitBoundBusy(o: Opts, sid: string): BusyAdmission {
-  if (o.spawn || !o.target || o.retryUnknown) return { bound: null, cliKind: "", probe: null };
+  const startedAt = nowMs();
+  if (o.spawn || !o.target || o.retryUnknown) return { bound: null, cliKind: "", probe: null, startedAt };
   // r1 m2: no listing of our own for the CLI kind. resolveRoute has just resolved this very
   // sid's wrapped CLI through cliOf() — the same `telepty list --json` row, the same
   // cliKindOf() resolution — so asking again would only duplicate it.
   const cliKind = o.cli && o.cli !== "unknown" ? o.cli : "";
-  if (!cliKind) return { bound: null, cliKind: "", probe: null };
-  // Bounded by the dispatch's own readiness budget, so this probe can never cost more time
-  // than the wait it may replace (the default 90s ceiling still applies).
-  const budget = Number.isFinite(o.timeoutMs) && o.timeoutMs > 0
-    ? Math.min(READINESS_CAPTURE_MAX_MS, o.timeoutMs) : READINESS_CAPTURE_MAX_MS;
-  const p = probeState(sid, cliKind, Math.max(1, budget));
-  const measured: BusyAdmission = { bound: null, cliKind, probe: p };
-  // The probe's own verdict qualifies the state, and only the measured working surface
-  // with an empty current composer does: `current-working` is emitted exactly when the
-  // composer is empty, no modal control is up and the CLI is working. `ready` stays false.
-  if (p === null || !p.alive || p.probeError || p.ready || p.surface !== "working" || p.readyReason !== "current-working") return measured;
+  if (!cliKind) return { bound: null, cliKind: "", probe: null, startedAt };
+  // r4 m-D: the SAME per-probe ceiling waitForReady's own first iteration would use, codex
+  // rule included, so no CLI kind's first readiness probe gets a shorter budget than in base;
+  // r4 m-C anchors the readiness deadline at `startedAt`, so the total stays --timeout-ms.
+  const budget = readinessTimeout(o, cliKind);
+  const p = probeState(sid, cliKind, Math.max(1, Math.min(READINESS_CAPTURE_MAX_MS, budget)));
+  const measured: BusyAdmission = { bound: null, cliKind, probe: p, startedAt };
+  // The three facts above, in the cheapest order. `ready` must be false: a ready session is
+  // the legacy path's business, and the bound path is only for a session that cannot accept
+  // a new task through the composer.
+  if (p === null || !p.alive || p.probeError || p.ready || p.surface !== "working"
+    || !BOUND_BUSY_REASONS.has(p.readyReason) || p.trackerClass !== BOUND_TRACKER_ACTIVE) return measured;
   // Only NOW is one snapshot read worth taking: this session is qualified busy, so the
   // binding is about to be used. An unreadable listing leaves the readiness wait in charge
   // (the pre-feature behaviour for a busy target), rather than inventing a capability refusal.
@@ -1368,7 +1421,11 @@ function parseBoundAnswer(out: string): { transport: string; cliReason: string |
       ownerGeneration: token(body.owner_generation),
       bodyStage: bounded(body.body_stage, BOUND_FRAME_STAGES),
       submitStage: bounded(body.submit_stage, BOUND_FRAME_STAGES),
-      bytesWritten: body.bytes_written === 0 ? 0 : null,
+      // r4 m-B (same family): a zero is read as zero only where a zero can be authoritative.
+      // An `accepted` stage means both frames were handed over, so a 0 beside it contradicts
+      // itself — the daemon's own builder nulls the count the moment a body may exist
+      // (bound-inject.js:126). A contradicting field is degraded, never believed.
+      bytesWritten: body.bytes_written === 0 && body.stage !== "accepted" ? 0 : null,
     } : null;
     if (raw === "" && result === null) continue; // not this verb's line
     // r2: the envelope's own bounded reason code, which for every shape WITHOUT a closed
@@ -1403,7 +1460,11 @@ function recordBoundObservation(sid: string, b: BoundBinding,
   answer: { transport: string; cliReason: string | null; result: BoundResult | null },
   rc: number, verdict: string): void {
   const r = answer.result;
-  const provenUnsent = answer.transport === "refused_locally" || answer.transport === "unsupported";
+  // r4 m-B: the same rule as the decision above — these two words are read only when the
+  // daemon sent no closed result, so a contradicting envelope can neither free a ref nor
+  // record a zero for a body the result says was accepted.
+  const provenUnsent = r === null
+    && (answer.transport === "refused_locally" || answer.transport === "unsupported");
   const bound = {
     verb: BOUND_VERB,
     schema: r === null ? null : BOUND_RESULT_SCHEMA,
@@ -1412,7 +1473,9 @@ function recordBoundObservation(sid: string, b: BoundBinding,
     reason: r === null ? null : r.reason,
     // The caller's pin, and (r1 M2) what the daemon itself said the answer was about, kept
     // apart: the first is an assumption, the second is the fact that was checked against it.
-    binding: { session_epoch: b.epoch, owner_generation: b.ownerGeneration, busy_input: b.busyInput },
+    // r4 n-A: `cli` is the kind the admission resolved and pinned the probe to; recording it
+    // makes the binding self-describing and the field read rather than write-only state.
+    binding: { session_epoch: b.epoch, owner_generation: b.ownerGeneration, busy_input: b.busyInput, cli: b.cliKind },
     reported: r === null ? null
       : { session_id: r.sessionId, session_epoch: r.sessionEpoch, owner_generation: r.ownerGeneration },
     verdict,
@@ -1461,20 +1524,31 @@ async function completeBoundDelivery(o: Opts, d: Delivery, sid: string, b: Bound
   //    owner_generation_mismatch answer (:1939-1940) — which is refused pre-effect, so it
   //    must stay re-dispatchable rather than being held forever.
   const otherSession = r !== null && r.sessionId !== null && r.sessionId !== sid;
-  const samePin = r !== null && r.sessionId === sid && r.sessionEpoch === b.epoch
+  // r4 M-C: "the daemon never said which binding this was" is a different fact from "the
+  // binding moved", and only the second is evidence about the pin. Root measured that the
+  // route passes its current sessionEpoch/interactionOwnerGeneration into boundResult on
+  // EVERY stage, so a null here means the session itself had no epoch — not a moved owner.
+  const bindingAsserted = r !== null && r.sessionEpoch !== null && r.ownerGeneration !== null;
+  const samePin = bindingAsserted && r !== null && r.sessionId === sid && r.sessionEpoch === b.epoch
     && r.ownerGeneration === b.ownerGeneration;
   const accepted = sent.rc === 0 && r !== null && r.stage === "accepted" && samePin
     && (answer.transport === "" || answer.transport === "accepted");
-  const unsent = !accepted && !otherSession
-    && (answer.transport === "refused_locally" || answer.transport === "unsupported"
-      || (r !== null && r.stage === "refused" && r.bytesWritten === 0));
+  // r4 m-B: a closed result OUTRANKS the envelope's transport word. The word is the CLI's
+  // own classification of the answer; if the daemon sent a closed object, that object is the
+  // answer, and `{transport:"refused_locally", result:{stage:"accepted"}}` must never free a
+  // ref whose body was accepted. The two pre-daemon words are read ONLY when there is no
+  // closed result at all.
+  const unsent = !accepted && !otherSession && (r !== null
+    ? (r.stage === "refused" && r.bytesWritten === 0)
+    : (answer.transport === "refused_locally" || answer.transport === "unsupported"));
   // The named reason this verdict carries into the record and into the operator line. r2:
   // a shape with no closed result now names the verb's OWN reason code too — `reason=
   // outcome_unknown` was a restatement of the transport, not a cause an operator can act on.
   const why = otherSession ? "bound_session_identity_mismatch"
     : r === null ? [answer.transport || "none", answer.cliReason].filter((p) => p !== null).join(":")
-      : r.stage === "accepted" && !samePin ? "bound_binding_identity_mismatch"
-        : r.reason !== null ? r.reason : r.stage;
+      : r.stage === "accepted" && !bindingAsserted ? "bound_binding_not_asserted"
+        : r.stage === "accepted" && !samePin ? "bound_binding_identity_mismatch"
+          : r.reason !== null ? r.reason : r.stage;
   d.transportInjectId = r === null || r.injectId === null ? "" : r.injectId;
   recordBoundObservation(sid, b, answer, sent.rc, accepted ? "accepted" : unsent ? "proven_unsent" : `held:${why}`);
   if (unsent) {
@@ -1513,8 +1587,11 @@ async function completeBoundDelivery(o: Opts, d: Delivery, sid: string, b: Bound
       "was attempted and nothing corroborates the hand-off. The record stays transport unknown\n");
   }
   // Accepted-pending-model, reported apart from started-working on purpose.
+  // r4 n-B: daemon-supplied values reach the operator stream only through printable(), as
+  // every sibling message in this file already does.
   process.stdout.write(`ACCEPTED_PENDING ${sid} — ${BOUND_VERB} accepted the bound body+CR for the pinned owner ` +
-    `(epoch=${b.epoch} owner_generation=${b.ownerGeneration} inject_id=${d.transportInjectId || "none"}); ` +
+    `(epoch=${printable(b.epoch)} owner_generation=${printable(b.ownerGeneration)} ` +
+    `inject_id=${printable(d.transportInjectId || "none")}); ` +
     "recorded transport unknown. A hand-off to the owner bridge is not a PTY write, not native queueing and not " +
     "model receipt\n");
   if (o.verifyStarted && isExecutable(VERIFY_SH)) {
@@ -1625,8 +1702,13 @@ function beginDelivery(o: Opts, d: Delivery, sid: string): { status: number; std
  * #727: presence wait, kept separate from waitForReady's REPL-ready wait
  * (telepty#18). Registration = "the bridge has published the session"; ready =
  * "its REPL is past the boot screen". Returns the wrapped CLI kind, or null.
+ *
+ * r4 m-E: it also reports whether it SLEPT before answering. A readiness verdict measured
+ * before this wait cannot be that wait's answer, and only this function knows whether any
+ * time passed (the --target default timeout is 0, but
+ * AIGENTRY_DISPATCH_REGISTER_TIMEOUT_MS can make --target wait too).
  */
-async function waitForRegistration(o: Opts, sid: string): Promise<string | null> {
+async function waitForRegistration(o: Opts, sid: string): Promise<{ kind: string; slept: boolean } | null> {
   let timeout: number;
   const knob = env.AIGENTRY_DISPATCH_REGISTER_TIMEOUT_MS;
   if (knob === undefined || knob === "") {
@@ -1640,9 +1722,10 @@ async function waitForRegistration(o: Opts, sid: string): Promise<string | null>
   const start = nowMs();
   const deadline = start + timeout;
   let notes = 0;
+  let slept = false;
   for (;;) {
     const kind = cliOf(sid);
-    if (kind) return kind;
+    if (kind) return { kind, slept };
     const now = nowMs();
     if (now >= deadline) {
       process.stderr.write(
@@ -1661,31 +1744,47 @@ async function waitForRegistration(o: Opts, sid: string): Promise<string | null>
       process.stderr.write(`dispatch.sh: waiting for session registration… ${elapsed}s\n`);
     }
     // Cap the nap at what is left so the knob's value is also the worst-case wait.
+    slept = true;
     await sleepMs(Math.min(deadline - now, 5000));
   }
+}
+
+/**
+ * The readiness budget for one dispatch, by CLI kind. Extracted verbatim from waitForReady
+ * (r4 m-D) so the busy admission's single probe is bounded by exactly the same number the
+ * wait's own first iteration would use — including #557's codex ceiling — instead of a
+ * second, shorter rule of its own.
+ *
+ * #557: codex reaches its interactive `›` REPL within seconds, but its 6 MCP servers can
+ * take >30s to finish booting. Give codex a longer default ceiling (claude/gemini
+ * unchanged). An explicit --timeout-ms always wins.
+ */
+function readinessTimeout(o: Opts, cliKind: string): number {
+  if (cliKind === "codex" && !o.timeoutExplicit) return Number(env.AIGENTRY_CODEX_READY_TIMEOUT_MS || 90000);
+  return o.timeoutMs;
 }
 
 /**
  * 0 ok, 1 ready-timeout, 6 never registered.
  *
  * `measured` (r1 m2) is the verdict the busy admission already read for this sid. When it
- * belongs to the same CLI kind this loop is about to probe, it IS this loop's first verdict,
- * so the unchanged idle path performs exactly the one probe it always did. Every later
- * iteration probes afresh, and a kind mismatch or an absent admission reuses nothing.
+ * belongs to the same CLI kind this loop is about to probe AND the registration wait did not
+ * sleep (r4 m-E — a verdict measured before a wait is not that wait's answer), it IS this
+ * loop's first verdict, so the unchanged idle path performs exactly the one probe it always
+ * did. Every later iteration probes afresh; a kind mismatch, a slept registration wait or an
+ * absent admission reuses nothing.
+ *
+ * r4 m-C: the deadline is anchored at the admission's own start when its verdict is reused,
+ * so the probe it already paid for comes OUT of this budget rather than being added to it.
  */
 async function waitForReady(o: Opts, sid: string, measured?: BusyAdmission): Promise<number> {
-  const cliKind = await waitForRegistration(o, sid);
-  if (cliKind === null) return 6;
+  const registration = await waitForRegistration(o, sid);
+  if (registration === null) return 6;
+  const cliKind = registration.kind;
   let reused: ProbeState | null | undefined =
-    measured !== undefined && measured.cliKind === cliKind ? measured.probe : undefined;
-  let effectiveTimeout = o.timeoutMs;
-  // #557: codex reaches its interactive `›` REPL within seconds, but its 6 MCP
-  // servers can take >30s to finish booting. Give codex a longer default
-  // ceiling (claude/gemini unchanged). An explicit --timeout-ms always wins.
-  if (cliKind === "codex" && !o.timeoutExplicit) {
-    effectiveTimeout = Number(env.AIGENTRY_CODEX_READY_TIMEOUT_MS || 90000);
-  }
-  const deadline = nowMs() + effectiveTimeout;
+    measured !== undefined && measured.cliKind === cliKind && !registration.slept ? measured.probe : undefined;
+  const effectiveTimeout = readinessTimeout(o, cliKind);
+  const deadline = (reused !== undefined ? measured!.startedAt : nowMs()) + effectiveTimeout;
   for (;;) {
     let ready: boolean;
     if (reused !== undefined) {

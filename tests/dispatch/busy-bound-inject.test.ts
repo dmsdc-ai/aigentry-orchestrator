@@ -940,10 +940,16 @@ describe("1270(l) r1/M3 a legitimate opaque token the old charset refused is del
 // The production policy answers RESUBMIT_ENTER only for the not-moving startup surfaces
 // and ESCALATE for surface=working (bin/policy.py:134-136), so these two stubs are the two
 // real answers. Each case names which guard it would catch if that guard were deleted.
-function policyStub(f: F, action: "RESUBMIT_ENTER" | "ESCALATE"): string {
+function policyStub(f: F, action: "NOOP" | "RESUBMIT_ENTER" | "ESCALATE"): string {
+  // The real answers bin/policy.py gives under `--status verify_started`: NOOP/verified when
+  // detail.verify_started is true (:130-131), RESUBMIT_ENTER for the not-moving startup
+  // surfaces (:134-135), ESCALATE otherwise (:136).
+  const status = action === "NOOP" ? "verified" : "not_started";
+  const reason = action === "NOOP" ? "session verified started-working"
+    : "no working spinner (idle/static) [not-moving]";
   return f.script(`policy-${action.toLowerCase()}`, `
 process.stdout.write(JSON.stringify({ action: ${JSON.stringify(action)}, key: 'enter',
-  reason: 'no working spinner (idle/static) [not-moving]', status: 'not_started' }) + '\\n');
+  reason: ${JSON.stringify(reason)}, status: ${JSON.stringify(status)} }) + '\\n');
 `);
 }
 
@@ -953,8 +959,8 @@ function runVerify(f: F, args: string[], overrides: NodeJS.ProcessEnv): SpawnSyn
     { cwd: f.root, env: { ...f.env, ...overrides }, encoding: "utf8", timeout: 40000 });
 }
 
-// r3: bin/dispatch-verify.sh refuses up front on native Windows, so on win32 these three
-// subtests ASSERT that refusal and its zero effect instead of being skipped — the Windows
+// r3: bin/dispatch-verify.sh refuses up front on native Windows, so on win32 the cases that
+// drive it ASSERT that refusal and its zero effect instead of being skipped — the Windows
 // lane's rule is zero failures AND zero skips. Convention mirrored from
 // tests/dispatch/T150-task-ledger-queue-shape.test.ts:25 (`const WIN32 = …`) and :64-69
 // (assert the exit, assert the named refusal, assert nothing happened, then return); the
@@ -968,9 +974,9 @@ const WIN32 = process.platform === "win32";
  *     exit 78;; esac
  * The message goes to stderr (`>&2`), so stdout stays empty; the exit is 78; and the line
  * sits AFTER argument parsing but BEFORE `[ -n "$sid" ]` (:32), the `say()` definition
- * (:34), the `mktemp` for POLICY_ACTION_FILE (:40) and every `run_check` call — so on win32
- * no temp file is created, no probe or policy helper runs, and no key can be sent by any
- * path. This refusal is existing product behaviour and is not changed by this unit.
+ * (:34), `run_check` (:36) and every call to it — so on win32 no probe or policy helper
+ * runs, nothing is printed on stdout, and no key can be sent by any path. This refusal is
+ * existing product behaviour and is not changed by this unit.
  */
 const WIN32_VERIFY_REFUSAL =
   /^dispatch-verify\.sh: needs confined worker sessions, unavailable on native Windows \(SANDBOX_PLATFORM_UNSUPPORTED\); use WSL2$/m;
@@ -986,51 +992,272 @@ function assertWin32VerifyRefusal(f: F, r: SpawnSyncReturns<string>): void {
   assert.doesNotMatch(r.stdout, /VERIFIED/);
 }
 
-describe("1270(m) r1/M6 the verify resubmit is observe-only for busy and policy-controlled otherwise", () => {
-  test("--resubmit --observe-only on a [not-moving] verdict sends NO key (deleting the observe_only guard fails this)", () => {
+// r4 decision 3 (M-B): the three (m) subtests that drove the reverted `set -e` repair and the
+// two resubmit guards are REMOVED with that code; their text is preserved verbatim in
+// output/TASK-1275-HANDOFF.md so task 1275 inherits the coverage it needs. What stays below
+// is the one fork the bound path itself owns — OBSERVED instead of VERIFIED — which is
+// reachable with the base defect in place because a verified verdict exits 0 and therefore
+// never trips `set -e` (bin/dispatch-verify.sh:94 `out=$(run_check); rc=$?`).
+describe("1270(m) r4/M-D observe-only prints OBSERVED, never a fresh VERIFIED", () => {
+  for (const [name, args, expectWord, forbidWord] of [
+    ["--observe-only", ["--observe-only"], /OBSERVED /, /VERIFIED/],
+    ["without it (the legacy word is intact)", [], /VERIFIED /, /OBSERVED/],
+  ] as const) {
+    test(`${name}: a verified verdict prints ${expectWord.source.trim()} and not ${forbidWord.source}`, () => {
+      const f = fixture();
+      try {
+        f.prepareTarget();
+        // The ONE state that reaches the fork: no probe_error, and the policy answering
+        // NOOP/verified (bin/dispatch-verify.sh:80-96). Both legs exit 0, so the base
+        // `set -e` defect never hides the print.
+        const overrides = { ...arm(f), POLICY_PY: policyStub(f, "NOOP") };
+        const r = runVerify(f, args, overrides);
+        if (WIN32) { assertWin32VerifyRefusal(f, r); return; }
+        assert.equal(r.status, 0, `a verified verdict exits 0\n${r.stdout}\n${r.stderr}`);
+        assert.match(r.stdout, expectWord, r.stdout);
+        assert.doesNotMatch(r.stdout, forbidWord, r.stdout);
+        // Neither leg may touch the session: this fork only chooses a WORD.
+        assert.deepEqual(keyWrites(entries(f)).map((e) => e.argv), [], "no key on either leg");
+      } finally { f.cleanup(); }
+    });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// r4 ADDITIONS — the REAL probe drives the admission (decision 2 / blocker B1), plus the
+// cases the second review asked for. Everything below either runs bin/session-probe.py
+// itself on a captured screen, or pins an operator-visible line that had no test.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/** Mirrors tests/dispatch/T144-agy-trust-readiness.test.ts:22, which runs the real probe. */
+const PYTHON = process.env.PYTHON || "python3";
+const REAL_PROBE = join(REPO, "bin/session-probe.py");
+const SCREENS = join(REPO, "tests/dispatch/fixtures");
+
+/**
+ * NOT a stub: this is the production `SESSION_PROBE_PY` seam pointed at the REAL
+ * bin/session-probe.py, run offline through its own `--screen-file` / `--info-file` inputs.
+ * The CLI's own argv (`--sid`, `--cli`) is passed through untouched and the probe's verdict
+ * is forwarded verbatim, so the admission decides on what the shipped probe really emits.
+ *
+ * `--telepty telepty` is appended because `observe()` runs `safe_token(args.telepty, …)`
+ * against SAFE_CLI before anything else (probe :595), and the fixture's TELEPTY is an
+ * absolute path — which on win32 contains `\` and would be refused. In offline mode the
+ * value is never used (both `--screen-file` and `--info-file` are supplied), so pinning it
+ * to the default changes no verdict.
+ */
+const REAL_PROBE_WRAPPER = `
+const fs = require('node:fs');
+const { spawnSync } = require('node:child_process');
+const cfg = JSON.parse(fs.readFileSync(process.env.REAL_PROBE_CONFIG, 'utf8'));
+fs.appendFileSync(process.env.BOUND_ORDER_LOG, JSON.stringify({ who: 'probe', argv: process.argv.slice(2) }) + '\\n');
+const r = spawnSync(cfg.python, [cfg.probe, ...process.argv.slice(2),
+  '--screen-file', cfg.screen, '--info-file', cfg.info, '--telepty', 'telepty'], { encoding: 'utf8' });
+if (r.stdout) process.stdout.write(r.stdout);
+if (r.stderr) process.stderr.write(r.stderr);
+process.exit(r.status === null ? 1 : r.status);
+`;
+
+/** A live, CONNECTED, transport-ready session — the half of the verdict that is not the screen. */
+const LIVE_INFO = {
+  id: SID, command: "claude", healthStatus: "CONNECTED", ready: true,
+  transport: { health_status: "CONNECTED", ready: true, bootstrap: { ready: true } },
+};
+
+/** The r1 daemon stub plus a legacy `inject` arm, for the cases where an IDLE target delivers. */
+const R4_TELEPTY_STUB = R1_TELEPTY_STUB.replace(
+  "if (argv[0] === 'inject-bound-v1') {",
+  `if (argv[0] === 'inject') {
+  process.stdout.write('inject_id: 00000000-0000-4000-8000-000000000000\\n');
+  process.exit(0);
+}
+if (argv[0] === 'inject-bound-v1') {`);
+
+/**
+ * Arm one dispatch whose readiness verdict comes from the REAL probe reading `screen`.
+ * `screen` is either a path under tests/dispatch/fixtures (a measured capture) or inline
+ * screen text, which is written into the fixture root.
+ */
+function armRealProbe(f: F, screen: { file: string } | { text: string }, answer: R1Answer = acceptedEnv()): NodeJS.ProcessEnv {
+  const base = armR1(f, answer);
+  const screenPath = "file" in screen ? join(SCREENS, screen.file) : join(f.root, "r4-screen.txt");
+  if ("text" in screen) writeFileSync(screenPath, screen.text);
+  const infoPath = join(f.root, "r4-info.json");
+  writeFileSync(infoPath, JSON.stringify(LIVE_INFO));
+  const configFile = join(f.root, "r4-probe.json");
+  writeFileSync(configFile, JSON.stringify({ python: PYTHON, probe: REAL_PROBE, screen: screenPath, info: infoPath }));
+  return { ...base, TELEPTY: f.script("telepty-r4-stub", R4_TELEPTY_STUB),
+    SESSION_PROBE_PY: f.script("probe-real-wrapper", REAL_PROBE_WRAPPER), REAL_PROBE_CONFIG: configFile };
+}
+
+const probeReads = (es: Entry[]) => es.filter((e) => e.who === "probe");
+const listReads = (es: Entry[]) => telepty(es).filter((e) => e.argv[0] === "list");
+
+// Inline screens for the two shapes no measured fixture carries. Both are claude viewports.
+/** A working-looking row with NO live-work affordance: no `(esc to interrupt)`, no spinner. */
+const WORKING_NO_AFFORDANCE = "reading bin/dispatch.sh\n\n■ Working... (12s)\n ❯ \n";
+/** A busy row AND an approval prompt: the modal family must win over a genuine busy glyph. */
+const BUSY_WITH_ENTER_PROMPT = "analyzing\n\n◉ Working... (5s · esc to interrupt)\nPress Enter to continue\n ❯ \n";
+/** Busy with the composer already carrying a staged context-ref (UNSUBMITTED, probe :105). */
+const BUSY_WITH_UNSUBMITTED = "analyzing\n\n◉ Working... (5s · esc to interrupt)\n ❯ [context-ref] Read /tmp/shared/abcdef123456.md\n";
+
+// ── (o) the REAL probe decides the admission (B1 / decision 2) ───────────────
+describe("1270(o) r4/B1 the admission is decided by the REAL bin/session-probe.py", () => {
+  for (const [name, screen] of [
+    // Measured captures, both genuinely busy: a braille spinner + `(esc to interrupt)` with
+    // an empty composer, and the `◉ Working... (5s · esc to interrupt)` row.
+    ["measured busy claude (spinner + esc-to-interrupt + empty composer)", { file: "active.txt" }],
+    ["measured busy claude (working row, no composer line)", { file: "working_active.txt" }],
+  ] as const) {
+    test(`${name}: admitted, exactly one bound send`, () => {
+      const f = fixture();
+      try {
+        f.prepareTarget();
+        const overrides = armRealProbe(f, screen);
+        const r = follow(f, overrides);
+        const es = entries(f);
+        // This is the regression the blocker named: on the r2/r3 predicate the real probe's
+        // verdict (ready_reason `hard-negative` offline, `current-busy-or-modal` live) never
+        // matched `current-working`, so NOTHING was ever delivered and this assertion failed.
+        assert.doesNotMatch(r.stderr, READY_TIMEOUT_LINE,
+          `the real probe's busy verdict must admit the bound path\n${r.stdout}\n${r.stderr}`);
+        assert.equal(boundSends(es).length, 1, `one bound send\n${r.stdout}\n${r.stderr}`);
+        assert.deepEqual(boundSends(es)[0]!.argv, expectedBoundArgv(f), "the exact frozen argv");
+        assert.deepEqual(legacyInjects(es).map((e) => e.argv), [], "never a legacy inject to a busy session");
+        assert.deepEqual(keyWrites(es).map((e) => e.argv), [], "and never a key");
+        assert.equal(r.status, 0, `accepted-pending exits 0\n${r.stderr}`);
+        assert.match(r.stdout, /ACCEPTED_PENDING/);
+      } finally { f.cleanup(); }
+    });
+  }
+
+  for (const [name, screen, why] of [
+    ["measured trust-folder modal", { file: "trust_folder_modal.txt" }, "surface=modal (TRUST_MODAL, probe :73)"],
+    ["busy glyph + Press Enter to continue", { text: BUSY_WITH_ENTER_PROMPT }, "the modal reader wins over a busy glyph"],
+    ["working word with no live-work affordance", { text: WORKING_NO_AFFORDANCE }, "tracker_class is not `active`"],
+    ["busy with an unsubmitted context-ref in the composer", { text: BUSY_WITH_UNSUBMITTED }, "surface=unsubmitted"],
+  ] as const) {
+    test(`${name}: NOT admitted (${why}), nothing sent, nothing recorded`, () => {
+      const f = fixture();
+      try {
+        f.prepareTarget();
+        const overrides = armRealProbe(f, screen);
+        const r = follow(f, overrides);
+        assert.deepEqual(boundSends(entries(f)).map((e) => e.argv), [],
+          `${why}: the bound path must stay closed\n${r.stdout}\n${r.stderr}`);
+        assertNoInputEffect(f, name);
+        assert.notEqual(r.status, 0, `and the dispatch must not report a delivery\n${r.stderr}`);
+      } finally { f.cleanup(); }
+    });
+  }
+
+  test("measured idle prompt: not admitted, delivered by the legacy inject, and the idle path's read counts are unchanged", () => {
     const f = fixture();
     try {
       f.prepareTarget();
-      const overrides = { ...arm(f), POLICY_PY: policyStub(f, "RESUBMIT_ENTER") };
-      const r = runVerify(f, ["--resubmit", "--observe-only"], overrides);
-      if (WIN32) { assertWin32VerifyRefusal(f, r); return; }
-      // Everything the resubmit branch keys on is TRUE here except observe_only: the verdict
-      // is rc 6, --resubmit is set, the marker is present and the policy asks for the Enter.
-      assert.match(r.stdout, /\[not-moving\]/, `the marker the branch keys on is present\n${r.stderr}`);
-      assert.equal(r.status, 6, `and the verdict reached the branch (the rc capture works)\n${r.stderr}`);
-      assert.deepEqual(keyWrites(entries(f)).map((e) => e.argv), [],
-        "a busy-admitted (observe-only) verification must never send a key");
-      assert.doesNotMatch(r.stdout, /VERIFIED/, "and never reports a fresh verification");
+      const overrides = armRealProbe(f, { file: "done.txt" });
+      const r = follow(f, overrides);
+      const es = entries(f);
+      assert.deepEqual(boundSends(es).map((e) => e.argv), [], "an idle target is the legacy path's business");
+      assert.equal(legacyInjects(es).length, 1, `and it IS delivered\n${r.stdout}\n${r.stderr}`);
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.stdout, /OK dispatched/, "the legacy success line is intact");
+      // r4 m-G: the unchanged idle path must pay exactly what it paid in base — one readiness
+      // probe (the admission's, REUSED as the wait's first verdict) and the two `telepty list`
+      // reads base already made (resolveRoute's cliOf, waitForRegistration's cliOf).
+      assert.equal(probeReads(es).length, 1, `exactly one probe invocation:\n${JSON.stringify(probeReads(es))}`);
+      assert.equal(listReads(es).length, 2, `exactly two listings:\n${JSON.stringify(listReads(es))}`);
+    } finally { f.cleanup(); }
+  });
+});
+
+// ── (p) M-C: "the daemon never said which binding" vs "the binding moved" ───
+describe("1270(p) r4/M-C a null epoch or owner generation is its own named hold", () => {
+  for (const [name, over] of [
+    ["session_epoch null", { session_epoch: null }],
+    ["owner_generation null", { owner_generation: null }],
+  ] as const) {
+    test(`${name}: held as bound_binding_not_asserted, never as a moved binding`, () => {
+      const f = fixture();
+      try {
+        f.prepareTarget();
+        const r = follow(f, armR1(f, acceptedEnv(over)));
+        assert.equal(boundSends(entries(f)).length, 1, r.stderr);
+        assert.equal(r.status, 7, `an unasserted binding cannot book an acceptance\n${r.stderr}`);
+        assert.match(r.stderr, /bound_binding_not_asserted/, "named distinctly");
+        assert.doesNotMatch(r.stderr, /bound_binding_identity_mismatch/, "and NOT as a mismatch");
+        assert.doesNotMatch(r.stdout, /ACCEPTED_PENDING/);
+        const row = rows(f)[0]!;
+        assert.equal(row.transport.result, "unknown", "never not_delivered: a body may exist");
+        assert.equal(boundObservation(f).verdict, "held:bound_binding_not_asserted");
+      } finally { f.cleanup(); }
+    });
+  }
+});
+
+// ── (q) m-B: a closed result outranks a contradicting envelope word ─────────
+describe("1270(q) r4/m-B the closed result outranks the envelope's transport word", () => {
+  test("transport=refused_locally with an ACCEPTED closed result is HELD, never freed", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      // A contradiction: the word says nothing was sent, the daemon's own object says both
+      // frames were handed over. Freeing the ref here would double-send the next dispatch.
+      const contradiction: R1Answer = {
+        stdout: JSON.stringify({ transport: "refused_locally", reason: "non_canonical_daemon_host",
+          result: closed({ stage: "accepted", bytes_written: 0 }) }) + "\n",
+        exit: 2,
+      };
+      const r = follow(f, armR1(f, contradiction));
+      assert.equal(boundSends(entries(f)).length, 1, r.stderr);
+      assert.equal(r.status, 7, `a contradicted word cannot prove unsent\n${r.stderr}`);
+      assert.doesNotMatch(r.stderr, /may be dispatched again/, "the ref must NOT be freed");
+      const row = rows(f)[0]!;
+      assert.equal(row.transport.result, "unknown", "held unknown, not not_delivered");
+      assert.equal(row.lifecycle.state, "delivery_state_unknown");
+      // …and the observation records NO provable zero: a 0 beside an `accepted` stage
+      // contradicts itself, so it is degraded to null rather than believed.
+      assert.equal(boundObservation(f).bytes_written, null,
+        "an accepted stage cannot carry an authoritative zero");
+      const again = follow(f, armR1(f, contradiction));
+      assert.equal(boundSends(entries(f)).length, 1, `held means no second send\n${again.stderr}`);
+      assert.equal(again.status, 7, again.stderr);
+    } finally { f.cleanup(); }
+  });
+});
+
+// ── (r) m-I: the two operator-visible lines that had no test ────────────────
+describe("1270(r) r4/m-I the --verify-delivered no-op NOTE and the SKIPPED verifier note", () => {
+  test("--verify-delivered on the bound path: exit 0, the NOTE says verification was NOT performed, and no screen is read", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      const overrides = armR1(f, acceptedEnv());
+      const r = run(f, ["--target", SID, "--from", FROM, "--verify-delivered"], overrides);
+      assert.equal(boundSends(entries(f)).length, 1, r.stderr);
+      assert.equal(r.status, 0, `the Root decision keeps exit 0\n${r.stderr}`);
+      assert.match(r.stderr, /NOTE delivery verification was NOT performed/, r.stderr);
+      assert.match(r.stderr, /declared no-op/, r.stderr);
+      assert.deepEqual(telepty(entries(f)).filter((e) => e.argv[0] === "read-screen").map((e) => e.argv), [],
+        "a queued body is not on the screen, so no screen read is attempted");
     } finally { f.cleanup(); }
   });
 
-  test("--resubmit with the policy answering ESCALATE (surface=working) sends NO key and says why (deleting policy_wants_enter fails this)", () => {
+  test("an installed dispatch-verify.sh that predates --observe-only is reported as SKIPPED, not as a bad verdict", () => {
     const f = fixture();
     try {
       f.prepareTarget();
-      const overrides = { ...arm(f), POLICY_PY: policyStub(f, "ESCALATE") };
-      const r = runVerify(f, ["--resubmit"], overrides);
-      if (WIN32) { assertWin32VerifyRefusal(f, r); return; }
-      assert.match(r.stdout, /\[not-moving\]/, `the marker alone must not be enough\n${r.stderr}`);
-      assert.equal(r.status, 6, r.stderr);
-      assert.deepEqual(keyWrites(entries(f)).map((e) => e.argv), [],
-        "a marker-triggered Enter into a current_busy composer is exactly what the guard prevents");
-      assert.match(r.stdout, /did not answer RESUBMIT_ENTER/, "and the skip is announced, not silent");
-    } finally { f.cleanup(); }
-  });
-
-  test("--resubmit with the policy answering RESUBMIT_ENTER still performs the legitimate #412 recovery, exactly once", () => {
-    const f = fixture();
-    try {
-      f.prepareTarget();
-      const overrides = { ...arm(f, {}, { PROBE_SURFACE: "unsubmitted", PROBE_READY_REASON: "no-empty-current-prompt" }),
-        POLICY_PY: policyStub(f, "RESUBMIT_ENTER") };
-      const r = runVerify(f, ["--resubmit"], overrides);
-      if (WIN32) { assertWin32VerifyRefusal(f, r); return; }
-      const keys = keyWrites(entries(f));
-      assert.equal(keys.length, 1, `the idle recovery must still happen\n${r.stdout}\n${r.stderr}`);
-      assert.deepEqual(keys[0]!.argv, ["send-key", SID, "enter"], "and it is the one documented Enter");
-      assert.match(r.stdout, /submit-resend/, "announced as the #412 resend");
+      // The old script answers its `-*)` catch-all with exit 4 (base dispatch-verify.sh:20).
+      // SCRIPT_DIR is the only seam that resolves VERIFY_SH, and every other helper it would
+      // resolve is already overridden by its own env var on the --target path.
+      f.script("dispatch-verify.sh", "process.exit(4);");
+      const overrides = { ...armR1(f, acceptedEnv()), DISPATCH_SCRIPT_DIR: f.bin };
+      const r = run(f, ["--target", SID, "--from", FROM], overrides, { verifyStarted: true });
+      assert.equal(boundSends(entries(f)).length, 1, r.stderr);
+      assert.equal(r.status, 0, `a skipped observation does not fail the accepted hand-off\n${r.stderr}`);
+      assert.match(r.stderr, /does not understand --observe-only \(exit 4\)/, r.stderr);
+      assert.match(r.stderr, /SKIPPED/, r.stderr);
+      assert.deepEqual(keyWrites(entries(f)).map((e) => e.argv), [], "and nothing was sent to the session");
     } finally { f.cleanup(); }
   });
 });

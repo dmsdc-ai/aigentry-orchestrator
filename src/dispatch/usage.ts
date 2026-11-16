@@ -106,8 +106,13 @@ export const USAGE = `# dispatch.sh — Wraps \`telepty inject\` with REPL-ready
 #             not_delivered, so the same ref may be dispatched again.
 #     exit 7  DELIVERY_UNKNOWN — lost, truncated, mismatched-identity or any other
 #             non-accepted answer: input may have been queued or written, so the identity is
-#             HELD for review (no replay, no Enter). Clear it with --retry-unknown once
-#             reviewed, exactly as for a legacy unknown delivery.
+#             HELD for review (no replay, no Enter). --retry-unknown does NOT clear a hold
+#             on a still-busy worker: the bound path refuses that flag, so the retry falls
+#             to the readiness wait and exits 1 having changed nothing. Read the held row
+#             (dispatch-registry.py get) and the worker's screen; once the worker is idle
+#             again the normal --retry-unknown "<reason>" path applies, because an idle
+#             target is delivered by the legacy inject. There is no automatic operator
+#             clear for a stranded composer — that remains an open requirement.
 #   --verify-delivered is a declared NO-OP on this path: a queued body is not on the screen,
 #   so no screen read is attempted, a stderr NOTE states that verification was not performed,
 #   and the exit stays 0. Started-working verification runs observe-only
