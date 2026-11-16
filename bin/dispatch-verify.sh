@@ -94,7 +94,10 @@ PY
 out=$(run_check); rc=$?
 say "$out"
 
-if [ "$rc" -eq 6 ] && [ "$resubmit" -eq 1 ] && printf '%s' "$out" | grep -q '\[not-moving\]'; then
+# r7 m8: --observe-only means "send nothing", so it gates the resubmit branch directly rather
+# than relying on the dead `out=$(run_check)` line above and on the caller passing no
+# --resubmit. This is the one guard that still holds once task 1275 repairs that line.
+if [ "$observe_only" -eq 0 ] && [ "$rc" -eq 6 ] && [ "$resubmit" -eq 1 ] && printf '%s' "$out" | grep -q '\[not-moving\]'; then
   say "dispatch-verify: not-moving → #412 submit-resend (send-key enter), re-verifying once..."
   "$TELEPTY" send-key "$sid" enter >/dev/null 2>&1 || true
   sleep 2

@@ -1267,6 +1267,11 @@ interface BusyAdmission {
   /** r4 m-C: when the admission's probe STARTED, so the readiness deadline can be anchored
    *  there and a `--target` dispatch's total wall budget stays exactly `--timeout-ms`. */
   startedAt: number;
+  /** r7 m9: whether a probe was actually RUN (and so actually spent wall time). `probe` can
+   *  be null for two different reasons — the admission returned before probing at all, or it
+   *  probed and got no usable verdict — and only the second must come out of the readiness
+   *  budget. `startedAt` is meaningful as an anchor exactly when this is true. */
+  probed: boolean;
 }
 
 /**
@@ -1279,32 +1284,50 @@ interface BusyAdmission {
  *     whose only glyph row is a completed duration footer re-reads as `idle`, not `working`
  *     (#1136). The arms tested before it — thinking_block, sandbox_prompt, TRUST_MODAL,
  *     crash, sleep_cut, api_error, raw_shell, UNSUBMITTED — therefore cannot be `working`.
- *  2. a busy ready_reason. The r0-r3 predicate required `current-working`, which is
- *     UNREACHABLE: `surface === "working"` implies `current_busy_signal(controls)` is true,
- *     and `ready_by_current_screen` evaluates that same expression on the same input
- *     (:488-491) and returns `current-busy-or-modal` BEFORE its `surface == "working"` line
- *     (:492-493). So the live reason for a busy session is `current-busy-or-modal`, the
- *     offline `--screen-file` path answers `hard-negative` (:366-374), and `current-working`
- *     is the probe's own third busy spelling, kept here because its source still emits it.
- *     `no-empty-current-prompt` is NOT in the set: that reason IS the composer guarantee in
- *     the live path, where it is returned before any busy test (:489-490).
- *  3. `detail.tracker_class` is not one of the approval/broken families — an explicit
- *     EXCLUSION, which is what this guard has to be. r4 required `=== "active"` instead and
+ *  2. the ONE busy ready_reason production can produce: `current-busy-or-modal` (r7 m2/m3).
+ *     The probe has three busy spellings and only this one is live-reachable, so only this
+ *     one is admitted — and because `probeState` never passes `--screen-file`, this single
+ *     equality IS the guarantee that the verdict came from the live current viewport:
+ *       • `current-working` is UNREACHABLE in BOTH modes: `surface === "working"` implies
+ *         `current_busy_signal(controls)` is true, and `ready_by_current_screen` evaluates
+ *         that same expression on the same input (:488-491) and returns
+ *         `current-busy-or-modal` BEFORE its `surface == "working"` line (:492-493). r0-r3
+ *         required exactly this dead value, which is what made the feature inert (B1).
+ *       • `hard-negative` is the OFFLINE `--screen-file` answer (:366-374), and offline mode
+ *         has NO composer guarantee at all — `ready_by_screen` never inspects the composer —
+ *         so admitting it would admit a busy session whose composer already holds typed text.
+ *         The third review measured exactly that (`hw_busy_typed_composer.txt`: offline
+ *         `hard-negative` → would admit; live `no-empty-current-prompt` → refused).
+ *     `no-empty-current-prompt` is NOT admitted: that reason IS the composer guarantee in
+ *     the live path, where it is returned before any busy test (:489-490). It is the gate
+ *     that actually carries the safety here, and it is the reason a live verdict is required.
+ *  3. `detail.tracker_class` is one of the families that may be given input — an explicit
+ *     ALLOW-list (r7 m4), so a class the probe gains later is refused by default rather than
+ *     admitted into an input-writing path. r4 required `=== "active"` instead and
  *     CI measured the consequence: the canonical claude busy row
  *     `⏺ Working... (5s · esc to interrupt)` (tests/dispatch/fixtures/working_active.txt, the
  *     very row probe :415-421 calls measured) yields tracker_class **"blank"**, because
  *     `TRACKER_ACTIVE_TEXT` (:130) needs the parenthesis to wrap the phrase exactly —
  *     `\(esc to interrupt\)` does not match `(5s · esc to interrupt)` — and the row carries
  *     no braille spinner. So an inclusion on "active" refused a genuinely busy session: B1
- *     again, in a narrower form. The exclusion keeps the property that was actually wanted:
+ *     again, in a narrower form. `tracker_class` has exactly FIVE reachable returns —
+ *     `blank` (:326), `error` (:329), `welcome` (:337), `active` (:339), `prompt_observed`
+ *     (:345) and `blank` again (:346) — so this list and the r6 exclusion
+ *     `∉ {welcome, error}` decide every screen identically today; the difference is which way
+ *     a sixth class would fall. Each admitted member is live-reachable for a genuinely busy
+ *     session, measured by the third review: `active` = active.txt, `prompt_observed` = a
+ *     busy row with an empty composer, `blank` = a busy composer followed by a footer row.
+ *     The two left out are left out for cause:
  *       • `"welcome"` is the approval/boot family — `TRACKER_WELCOME` (:129) is
  *         `Welcome back|Tips for getting started|Trust this folder|Press Enter to continue`,
  *         which is a DIFFERENT pattern family from `TRUST_MODAL` (:73), so it still catches an
  *         approval or welcome banner that the modal reader's line anchoring missed while
- *         `current_busy_signal`'s fourth arm (:427) matched a busy word;
+ *         `current_busy_signal`'s fourth arm (:427) matched a busy word. Measured: a busy row
+ *         + `Welcome back` + an empty composer is refused by THIS guard alone.
  *       • `"error"` is `TRACKER_ERR` (:125-128) — an `error:`/`traceback`/`panic:`/
  *         `command not found`/`killed:`/`exited N` line, which `classify_surface` does not test
- *         for, so a broken session is not handed input either.
+ *         for, so a broken session is not handed input either. Measured the same way: a busy
+ *         row + `error: EACCES` + an empty composer is refused by THIS guard alone.
  *     `activity` is NOT usable for any of this: `observe()` derives it from the surface
  *     (`activity = "moving" if working_token …`, :645), so it carries no evidence the surface
  *     does not already carry.
@@ -1317,9 +1340,14 @@ interface BusyAdmission {
  * The corrected truth table, with each row marked measured-by-CI or derived, is in
  * output/REPORT.md.
  */
-const BOUND_BUSY_REASONS = new Set(["current-busy-or-modal", "hard-negative", "current-working"]);
-/** r6: tracker families that must never be given input, however busy the surface looks. */
-const BOUND_TRACKER_REFUSED = new Set(["welcome", "error"]);
+/** r7 m2/m3: the one busy reason the LIVE probe can produce, and therefore the only one
+ *  admitted. A verdict carrying any other spelling did not come from a live current viewport
+ *  (or carries no composer guarantee), and is left to the readiness wait. */
+const BOUND_BUSY_REASON = "current-busy-or-modal";
+/** r7 m4: the tracker families that MAY be given input — an allow-list, so an unknown
+ *  (future) class is refused by default instead of admitted. Equivalent today to r6's
+ *  exclusion `∉ {welcome, error}`, since the probe emits exactly these five classes. */
+const BOUND_TRACKER_ADMITTED = new Set(["blank", "active", "prompt_observed"]);
 
 /**
  * Only a NON-SPAWNED `--target` whose current state is qualified busy may take the
@@ -1333,23 +1361,23 @@ const BOUND_TRACKER_REFUSED = new Set(["welcome", "error"]);
  */
 function admitBoundBusy(o: Opts, sid: string): BusyAdmission {
   const startedAt = nowMs();
-  if (o.spawn || !o.target || o.retryUnknown) return { bound: null, cliKind: "", probe: null, startedAt };
+  if (o.spawn || !o.target || o.retryUnknown) return { bound: null, cliKind: "", probe: null, startedAt, probed: false };
   // r1 m2: no listing of our own for the CLI kind. resolveRoute has just resolved this very
   // sid's wrapped CLI through cliOf() — the same `telepty list --json` row, the same
   // cliKindOf() resolution — so asking again would only duplicate it.
   const cliKind = o.cli && o.cli !== "unknown" ? o.cli : "";
-  if (!cliKind) return { bound: null, cliKind: "", probe: null, startedAt };
+  if (!cliKind) return { bound: null, cliKind: "", probe: null, startedAt, probed: false };
   // r4 m-D: the SAME per-probe ceiling waitForReady's own first iteration would use, codex
   // rule included, so no CLI kind's first readiness probe gets a shorter budget than in base;
   // r4 m-C anchors the readiness deadline at `startedAt`, so the total stays --timeout-ms.
   const budget = readinessTimeout(o, cliKind);
   const p = probeState(sid, cliKind, Math.max(1, Math.min(READINESS_CAPTURE_MAX_MS, budget)));
-  const measured: BusyAdmission = { bound: null, cliKind, probe: p, startedAt };
+  const measured: BusyAdmission = { bound: null, cliKind, probe: p, startedAt, probed: true };
   // The three facts above, in the cheapest order. `ready` must be false: a ready session is
   // the legacy path's business, and the bound path is only for a session that cannot accept
   // a new task through the composer.
   if (p === null || !p.alive || p.probeError || p.ready || p.surface !== "working"
-    || !BOUND_BUSY_REASONS.has(p.readyReason) || BOUND_TRACKER_REFUSED.has(p.trackerClass)) return measured;
+    || p.readyReason !== BOUND_BUSY_REASON || !BOUND_TRACKER_ADMITTED.has(p.trackerClass)) return measured;
   // Only NOW is one snapshot read worth taking: this session is qualified busy, so the
   // binding is about to be used. An unreadable listing leaves the readiness wait in charge
   // (the pre-feature behaviour for a busy target), rather than inventing a capability refusal.
@@ -1373,7 +1401,7 @@ function admitBoundBusy(o: Opts, sid: string): BusyAdmission {
       "(an unknown verb's help text and exit 0 is not support)");
   }
   return { bound: { epoch: snap.epoch, ownerGeneration: snap.ownerGeneration, busyInput: snap.busyInput },
-    cliKind, probe: p, startedAt };
+    cliKind, probe: p, startedAt, probed: true };
 }
 
 /**
@@ -1798,8 +1826,12 @@ function readinessTimeout(o: Opts, cliKind: string): number {
  * did. Every later iteration probes afresh; a kind mismatch, a slept registration wait or an
  * absent admission reuses nothing.
  *
- * r4 m-C: the deadline is anchored at the admission's own start when its verdict is reused,
- * so the probe it already paid for comes OUT of this budget rather than being added to it.
+ * r4 m-C / r7 m9: the deadline is anchored at the admission's own start whenever an admission
+ * probe RAN, so the time it spent comes OUT of this budget rather than being added to it. r4
+ * anchored only on the reuse path, which left the overrun m-C named in the two cases where a
+ * verdict is measured and then NOT reused — an explicit `--cli` disagreeing with the listing,
+ * and a registration wait that slept. The probe precedes this wait in all three cases, so the
+ * anchor is a property of having probed, not of reusing the answer.
  */
 async function waitForReady(o: Opts, sid: string, measured?: BusyAdmission): Promise<number> {
   const registration = await waitForRegistration(o, sid);
@@ -1808,7 +1840,8 @@ async function waitForReady(o: Opts, sid: string, measured?: BusyAdmission): Pro
   let reused: ProbeState | null | undefined =
     measured !== undefined && measured.cliKind === cliKind && !registration.slept ? measured.probe : undefined;
   const effectiveTimeout = readinessTimeout(o, cliKind);
-  const deadline = (reused !== undefined ? measured!.startedAt : nowMs()) + effectiveTimeout;
+  const anchored = measured !== undefined && measured.probed;
+  const deadline = (anchored ? measured!.startedAt : nowMs()) + effectiveTimeout;
   for (;;) {
     let ready: boolean;
     if (reused !== undefined) {

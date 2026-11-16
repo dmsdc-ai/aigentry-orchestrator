@@ -4,7 +4,7 @@
 // empty-composer REPL before every non-dedup delivery (cli.ts:1434-1439 →
 // waitForReady → isReady → bin/session-probe.py), and a qualified current-busy
 // session can never satisfy that (session-probe.py:472-494: `working` →
-// `current-working`, a populated composer → `no-empty-current-prompt`). So a
+// `current-busy-or-modal`, a populated composer → `no-empty-current-prompt`). So a
 // follow-up instruction to a busy worker times out (exit 1) before anything is
 // recorded, staged or transported. The daemon side is gaining the bound verb
 //   telepty inject-bound-v1 --from F --expected-epoch E
@@ -128,7 +128,7 @@ if (process.env.PROBE_MODE === 'empty') process.exit(1);
 const surface = process.env.PROBE_SURFACE || 'working';
 const detail = {
   health: 'CONNECTED', transport_ready: true, bootstrap_ready: true,
-  ready_reason: process.env.PROBE_READY_REASON || 'current-working',
+  ready_reason: process.env.PROBE_READY_REASON || 'current-busy-or-modal',
   screen_source: 'cmux:current-viewport', surface_detail: surface,
   tracker_class: surface === 'working' ? 'active' : 'unknown', verify_started: false,
   verify_problems: ['no working spinner (idle/static) [not-moving]'],
@@ -1003,6 +1003,11 @@ function assertWin32VerifyRefusal(f: F, r: SpawnSyncReturns<string>): void {
 // is the one fork the bound path itself owns — OBSERVED instead of VERIFIED — which is
 // reachable with the base defect in place because a verified verdict exits 0 and therefore
 // never trips `set -e` (bin/dispatch-verify.sh:94 `out=$(run_check); rc=$?`).
+//
+// r7 m8 adds `[ "$observe_only" -eq 0 ]` to that same resubmit branch, and it is deliberately
+// UNTESTED here for the same reason: the branch needs rc==6, and under the base `set -e` line
+// the script has already exited by then, so no run can reach it. The guard is there for after
+// task 1275 repairs that line, and the case for it belongs to 1275's coverage.
 describe("1270(m) r4/M-D observe-only prints OBSERVED, never a fresh VERIFIED", () => {
   for (const [name, args, expectWord, forbidWord] of [
     ["--observe-only", ["--observe-only"], /OBSERVED /, /VERIFIED/],
@@ -1050,6 +1055,18 @@ const SCREENS = join(REPO, "tests/dispatch/fixtures");
  * absolute path — which on win32 contains `\` and would be refused. In offline mode the
  * value is never used (both `--screen-file` and `--info-file` are supplied), so pinning it
  * to the default changes no verdict.
+ *
+ * r7 M1 — the LIVE field substitution, and its exact extent. The probe's mode switch is
+ * `current = not args.screen_file` (:638) and `--info-file` WITHOUT `--screen-file` raises
+ * `ScreenUnavailable` and sets probe_error (:625), so there is no flag combination that
+ * yields a live verdict without a daemon: offline is the only mode this harness can execute.
+ * The verbatim offline verdict is therefore always written to `REAL_PROBE_MEASURED` (what the
+ * real probe actually printed, asserted by the cases below), and when
+ * `REAL_PROBE_LIVE_REASON` is set, exactly ONE field — `detail.ready_reason`, the only field
+ * whose value offline mode cannot produce — is replaced before the verdict reaches the CLI.
+ * Everything else the admission reads (alive, ready, surface, tracker_class, probe_error)
+ * stays the probe's own measurement of the real screen. A verdict that does not parse is
+ * passed through untouched.
  */
 const REAL_PROBE_WRAPPER = `
 const fs = require('node:fs');
@@ -1058,7 +1075,19 @@ const cfg = JSON.parse(fs.readFileSync(process.env.REAL_PROBE_CONFIG, 'utf8'));
 fs.appendFileSync(process.env.BOUND_ORDER_LOG, JSON.stringify({ who: 'probe', argv: process.argv.slice(2) }) + '\\n');
 const r = spawnSync(cfg.python, [cfg.probe, ...process.argv.slice(2),
   '--screen-file', cfg.screen, '--info-file', cfg.info, '--telepty', 'telepty'], { encoding: 'utf8' });
-if (r.stdout) process.stdout.write(r.stdout);
+let out = r.stdout || '';
+if (out) {
+  fs.writeFileSync(process.env.REAL_PROBE_MEASURED, out);
+  const live = process.env.REAL_PROBE_LIVE_REASON || '';
+  if (live) {
+    try {
+      const v = JSON.parse(out);
+      v.detail.ready_reason = live;
+      out = JSON.stringify(v) + '\\n';
+    } catch { /* unparseable: hand the caller exactly what the probe said */ }
+  }
+}
+if (out) process.stdout.write(out);
 if (r.stderr) process.stderr.write(r.stderr);
 process.exit(r.status === null ? 1 : r.status);
 `;
@@ -1078,12 +1107,30 @@ const R4_TELEPTY_STUB = R1_TELEPTY_STUB.replace(
 }
 if (argv[0] === 'inject-bound-v1') {`);
 
+/** Where the wrapper parks the real probe's verbatim stdout for this run. */
+const measuredPath = (f: F): string => join(f.root, "r7-measured.json");
+
+/** What the REAL probe printed, for the four fields the admission predicate reads. */
+interface MeasuredVerdict { surface: string; ready: boolean; readyReason: string; trackerClass: string }
+function measuredVerdict(f: F): MeasuredVerdict {
+  const raw = readFileSync(measuredPath(f), "utf8");
+  const v = JSON.parse(raw) as { ready?: unknown; surface?: unknown; detail?: Record<string, unknown> };
+  const detail: Record<string, unknown> = v.detail ?? {};
+  return {
+    surface: String(v.surface), ready: v.ready === true,
+    readyReason: String(detail.ready_reason), trackerClass: String(detail.tracker_class),
+  };
+}
+
 /**
  * Arm one dispatch whose readiness verdict comes from the REAL probe reading `screen`.
  * `screen` is either a path under tests/dispatch/fixtures (a measured capture) or inline
- * screen text, which is written into the fixture root.
+ * screen text, which is written into the fixture root. `liveReason`, when non-empty, is the
+ * one substituted field documented on REAL_PROBE_WRAPPER; "" leaves the probe's own offline
+ * verdict completely untouched, which is what the caller then has to refuse (r7 m3).
  */
-function armRealProbe(f: F, screen: { file: string } | { text: string }, answer: R1Answer = acceptedEnv()): NodeJS.ProcessEnv {
+function armRealProbe(f: F, screen: { file: string } | { text: string },
+  answer: R1Answer = acceptedEnv(), liveReason = ""): NodeJS.ProcessEnv {
   const base = armR1(f, answer);
   const screenPath = "file" in screen ? join(SCREENS, screen.file) : join(f.root, "r4-screen.txt");
   if ("text" in screen) writeFileSync(screenPath, screen.text);
@@ -1092,7 +1139,8 @@ function armRealProbe(f: F, screen: { file: string } | { text: string }, answer:
   const configFile = join(f.root, "r4-probe.json");
   writeFileSync(configFile, JSON.stringify({ python: PYTHON, probe: REAL_PROBE, screen: screenPath, info: infoPath }));
   return { ...base, TELEPTY: f.script("telepty-r4-stub", R4_TELEPTY_STUB),
-    SESSION_PROBE_PY: f.script("probe-real-wrapper", REAL_PROBE_WRAPPER), REAL_PROBE_CONFIG: configFile };
+    SESSION_PROBE_PY: f.script("probe-real-wrapper", REAL_PROBE_WRAPPER), REAL_PROBE_CONFIG: configFile,
+    REAL_PROBE_MEASURED: measuredPath(f), REAL_PROBE_LIVE_REASON: liveReason };
 }
 
 /**
@@ -1110,9 +1158,9 @@ const listReads = (es: Entry[]) => telepty(es).filter((e) => e.argv[0] === "list
 // Inline screens for the shapes no measured fixture carries. All are claude viewports.
 /**
  * A working row with no parenthesised affordance and no spinner, and an empty composer.
- * r6: this case ADMITS. r4 expected a refusal because its predicate required
- * `tracker_class === "active"`, an expectation I derived by reading rather than measuring —
- * and CI then showed the same guard refusing the canonical busy capture
+ * r6 corrected r4 here: r4 expected a refusal because its predicate required
+ * `tracker_class === "active"`, an expectation derived by reading rather than by measuring,
+ * and CI then showed that same guard refusing the canonical busy capture
  * (`working_active.txt`). The probe's own verdict here is: working surface, composer empty,
  * no approval banner. That is the state the bound path exists for.
  */
@@ -1120,8 +1168,9 @@ const WORKING_NO_AFFORDANCE = "reading bin/dispatch.sh\n\n■ Working... (12s)\n
 /**
  * A busy row while the welcome banner is still on screen (a just-resumed session that began
  * working before the banner scrolled off). `TRACKER_WELCOME` + a prompt in the last three
- * lines makes `tracker_class` `"welcome"` (probe :129, :294-299), which is the family the r6
- * guard excludes — and the ONLY case that makes that exclusion load-bearing.
+ * lines makes `tracker_class` `"welcome"` (probe :129, :294-299), the family the tracker
+ * allow-list leaves out — and the one screen here that is qualified busy on every OTHER
+ * conjunct, so the guard is the only thing refusing it.
  */
 const BUSY_WITH_WELCOME_BANNER = "⏺ Working... (5s · esc to interrupt)\nWelcome back!\n ❯ \n";
 /** A busy row AND an approval prompt: the modal family must win over a genuine busy glyph. */
@@ -1129,34 +1178,114 @@ const BUSY_WITH_ENTER_PROMPT = "analyzing\n\n◉ Working... (5s · esc to interr
 /** Busy with the composer already carrying a staged context-ref (UNSUBMITTED, probe :105). */
 const BUSY_WITH_UNSUBMITTED = "analyzing\n\n◉ Working... (5s · esc to interrupt)\n ❯ [context-ref] Read /tmp/shared/abcdef123456.md\n";
 
-// ── (o) the REAL probe decides the admission (B1 / decision 2) ───────────────
+/**
+ * r7 M1/m2/m3: the busy reason the probe produces for a LIVE current viewport, and after
+ * r7 the ONLY reason the caller admits. See REAL_PROBE_WRAPPER for why it has to be
+ * substituted into an offline run, and for exactly what is and is not substituted.
+ */
+const LIVE_BUSY_REASON = "current-busy-or-modal";
+/** r7 m4: the tracker classes the production allow-list admits (cli.ts:1350). */
+const ADMITTED_TRACKERS = ["blank", "active", "prompt_observed"];
+
+/**
+ * The genuinely busy screens the real probe is run on. The third element is the tracker
+ * class where it has been MEASURED (`active.txt` and `working_active.txt`, both measured by
+ * CI and re-measured by the third review); `null` means this unit has not measured it, so
+ * the case asserts only what is known — membership of the admitted allow-list — rather than
+ * a value derived by reading, which is the mistake r6 had to correct.
+ */
+const BUSY_SCREENS: Array<[string, { file: string } | { text: string }, string | null]> = [
+  // A braille spinner + `(esc to interrupt)` + an empty `❯`.
+  ["measured busy claude (spinner + esc-to-interrupt + empty composer)", { file: "active.txt" }, "active"],
+  // The `⏺ Working... (5s · esc to interrupt)` row, and NO composer row at all.
+  ["measured busy claude (working row, no composer line)", { file: "working_active.txt" }, "blank"],
+  ["working row with no parenthesised affordance, empty composer", { text: WORKING_NO_AFFORDANCE }, null],
+];
+/**
+ * The subset whose composer row is present and EMPTY, i.e. the screens whose live reason
+ * really is `current-busy-or-modal`. `working_active.txt` is deliberately absent: it carries
+ * no composer row, so live mode returns `no-empty-current-prompt` BEFORE any busy test
+ * (probe :486-488) and refuses it. Handing it the live reason would assert an admission
+ * production does not make. The next case pins that premise on the capture itself.
+ */
+const LIVE_BUSY_SCREENS = [BUSY_SCREENS[0]!, BUSY_SCREENS[2]!];
+
+/** An empty composer row: the prompt glyph alone on its line (claude ❯ / codex › / gemini). */
+const EMPTY_COMPOSER_ROW = /^\s*[❯›>│]\s*$/;
+/**
+ * Whether the screen offers an empty composer row inside the window the live composer gate
+ * reads — the last 5 non-empty rows (probe :484). This is the PREMISE the live reason rests
+ * on, asserted against the screen bytes; it is not a re-implementation of the gate, which
+ * only the probe may evaluate.
+ */
+function hasEmptyComposerRow(screen: { file: string } | { text: string }): boolean {
+  const text = "file" in screen ? readFileSync(join(SCREENS, screen.file), "utf8") : screen.text;
+  const rows = text.split("\n").filter((l) => l.trim() !== "");
+  return rows.slice(-5).some((l) => EMPTY_COMPOSER_ROW.test(l));
+}
+
+/** Screens that must never be admitted, with the measured surface where it is known. */
+const REFUSED_SCREENS: Array<[string, { file: string } | { text: string }, string, string | null]> = [
+  ["measured trust-folder modal", { file: "trust_folder_modal.txt" }, "surface=modal (TRUST_MODAL, probe :73)", "modal"],
+  ["busy glyph + Press Enter to continue", { text: BUSY_WITH_ENTER_PROMPT }, "the modal reader wins over a busy glyph", null],
+  ["busy row while the welcome banner is still on screen", { text: BUSY_WITH_WELCOME_BANNER }, "tracker_class is `welcome`", null],
+  ["busy with an unsubmitted context-ref in the composer", { text: BUSY_WITH_UNSUBMITTED }, "surface=unsubmitted", null],
+];
+
+// ── (o) the REAL probe decides the admission (B1 / decision 2, r7 M1) ────────
 describe("1270(o) r4/B1 the admission is decided by the REAL bin/session-probe.py", () => {
-  for (const [name, screen] of [
-    // Measured captures, both genuinely busy: a braille spinner + `(esc to interrupt)` with
-    // an empty composer, and the `◉ Working... (5s · esc to interrupt)` row.
-    ["measured busy claude (spinner + esc-to-interrupt + empty composer)", { file: "active.txt" }],
-    ["measured busy claude (working row, no composer line)", { file: "working_active.txt" }],
-    // r6, corrected from CI: a working row with no parenthesised affordance is still busy.
-    ["working row with no parenthesised affordance, empty composer", { text: WORKING_NO_AFFORDANCE }],
-  ] as const) {
-    // NOTE on `working_active.txt`: that capture carries no composer line at all, so it is
-    // admitted on the OFFLINE path only — `ready_by_screen` answers `hard-negative` before it
-    // ever looks for a prompt (probe :366-374). The LIVE path would refuse the same screen
-    // with `no-empty-current-prompt` (:488), which is the composer guarantee this unit relies
-    // on in production. Nothing here should be read as "a screen with no visible composer is
-    // delivered to"; the other two screens in this family carry an empty `❯`.
-    test(`${name}: admitted, exactly one bound send`, () => {
+  // r7 m3: the probe's OFFLINE verdict is the one this harness can execute, and it is
+  // exactly the verdict the caller must now refuse — `ready_by_screen` (probe :360-372)
+  // never inspects the composer, so `hard-negative` is no evidence that a body can be
+  // appended safely. Before r7 these three cases asserted ADMISSION on that verdict.
+  for (const [name, screen, tracker] of BUSY_SCREENS) {
+    test(`${name}: measured busy by the real probe, and its OFFLINE verdict admits nothing`, () => {
       const f = fixture();
       try {
         f.prepareTarget();
-        const overrides = armRealProbe(f, screen);
+        const r = follow(f, armRealProbe(f, screen));
+        const m = measuredVerdict(f);
+        assert.equal(m.surface, "working", `the real probe must read this screen as busy: ${JSON.stringify(m)}`);
+        assert.equal(m.ready, false, "and a busy screen is never ready");
+        assert.equal(m.readyReason, "hard-negative", "offline speaks `ready_by_screen`'s vocabulary");
+        if (tracker !== null) assert.equal(m.trackerClass, tracker, "the measured tracker class");
+        assert.ok(ADMITTED_TRACKERS.includes(m.trackerClass),
+          `the tracker class must not be the thing refusing this screen: ${JSON.stringify(m)}`);
+        assert.deepEqual(boundSends(entries(f)).map((e) => e.argv), [],
+          `an offline verdict has no composer guarantee and must never admit\n${r.stdout}\n${r.stderr}`);
+        assertNoInputEffect(f, name);
+        assert.notEqual(r.status, 0, `and the dispatch must not report a delivery\n${r.stderr}`);
+        assert.match(r.stderr, READY_TIMEOUT_LINE, "it falls back to the unchanged readiness wait");
+      } finally { f.cleanup(); }
+    });
+  }
+
+  test("the one busy capture with no composer row is the one the live path cannot admit", () => {
+    assert.equal(hasEmptyComposerRow({ file: "working_active.txt" }), false,
+      "working_active.txt must stay a faithful capture of a busy screen with no composer row");
+    for (const [name, screen] of LIVE_BUSY_SCREENS) {
+      assert.equal(hasEmptyComposerRow(screen), true, `${name}: the live reason requires an empty composer row`);
+    }
+  });
+
+  // r7 M1: the same MEASURED classification, with the one field offline mode cannot produce
+  // set to the live value. This is the only reason production can emit, and before r7 no
+  // case in this file asserted on it at all.
+  for (const [name, screen, tracker] of LIVE_BUSY_SCREENS) {
+    test(`${name}: admitted on the LIVE busy reason, exactly one bound send`, () => {
+      const f = fixture();
+      try {
+        f.prepareTarget();
+        const overrides = armRealProbe(f, screen, acceptedEnv(), LIVE_BUSY_REASON);
         const r = follow(f, overrides);
         const es = entries(f);
-        // This is the regression the blocker named: on the r2/r3 predicate the real probe's
-        // verdict (ready_reason `hard-negative` offline, `current-busy-or-modal` live) never
-        // matched `current-working`, so NOTHING was ever delivered and this assertion failed.
+        const m = measuredVerdict(f);
+        assert.equal(m.surface, "working", `the admission still rests on the probe's own surface: ${JSON.stringify(m)}`);
+        assert.equal(m.ready, false, "and on its own ready=false");
+        if (tracker !== null) assert.equal(m.trackerClass, tracker, "and on its own tracker class");
+        assert.ok(ADMITTED_TRACKERS.includes(m.trackerClass), `tracker class in the allow-list: ${m.trackerClass}`);
         assert.doesNotMatch(r.stderr, READY_TIMEOUT_LINE,
-          `the real probe's busy verdict must admit the bound path\n${r.stdout}\n${r.stderr}`);
+          `the live busy verdict must admit the bound path\n${r.stdout}\n${r.stderr}`);
         assert.equal(boundSends(es).length, 1, `one bound send\n${r.stdout}\n${r.stderr}`);
         assert.deepEqual(boundSends(es)[0]!.argv, expectedBoundArgv(f), "the exact frozen argv");
         assert.deepEqual(legacyInjects(es).map((e) => e.argv), [], "never a legacy inject to a busy session");
@@ -1167,18 +1296,20 @@ describe("1270(o) r4/B1 the admission is decided by the REAL bin/session-probe.p
     });
   }
 
-  for (const [name, screen, why] of [
-    ["measured trust-folder modal", { file: "trust_folder_modal.txt" }, "surface=modal (TRUST_MODAL, probe :73)"],
-    ["busy glyph + Press Enter to continue", { text: BUSY_WITH_ENTER_PROMPT }, "the modal reader wins over a busy glyph"],
-    ["busy row while the welcome banner is still on screen", { text: BUSY_WITH_WELCOME_BANNER }, "tracker_class is `welcome`"],
-    ["busy with an unsubmitted context-ref in the composer", { text: BUSY_WITH_UNSUBMITTED }, "surface=unsubmitted"],
-  ] as const) {
-    test(`${name}: NOT admitted (${why}), nothing sent, nothing recorded`, () => {
+  // r7: the refusals are now measured against the LIVE reason too, so each one is carried by
+  // the probe's own surface or tracker class rather than by the offline reason being absent
+  // from the admitted set. Four screens that a busy-word reader alone would have admitted.
+  for (const [name, screen, why, surface] of REFUSED_SCREENS) {
+    test(`${name}: NOT admitted even with the live busy reason (${why}), nothing sent, nothing recorded`, () => {
       const f = fixture();
       try {
         f.prepareTarget();
-        const overrides = armRealProbe(f, screen);
+        const overrides = armRealProbe(f, screen, acceptedEnv(), LIVE_BUSY_REASON);
         const r = follow(f, overrides);
+        const m = measuredVerdict(f);
+        if (surface !== null) assert.equal(m.surface, surface, `the measured surface: ${JSON.stringify(m)}`);
+        assert.ok(m.surface !== "working" || !ADMITTED_TRACKERS.includes(m.trackerClass),
+          `the refusal must come from the probe's own classification, not from the reason: ${JSON.stringify(m)}`);
         assert.deepEqual(boundSends(entries(f)).map((e) => e.argv), [],
           `${why}: the bound path must stay closed\n${r.stdout}\n${r.stderr}`);
         assertNoInputEffect(f, name);
@@ -1298,6 +1429,124 @@ describe("1270(r) r4/m-I the --verify-delivered no-op NOTE and the SKIPPED verif
       assert.match(r.stderr, /does not understand --observe-only \(exit 4\)/, r.stderr);
       assert.match(r.stderr, /SKIPPED/, r.stderr);
       assert.deepEqual(keyWrites(entries(f)).map((e) => e.argv), [], "and nothing was sent to the session");
+    } finally { f.cleanup(); }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// r7 ADDITIONS — the ONE reason production can emit, and the allow-list that reads it.
+// The third review measured the real probe on 60 screens and derived live mode line by
+// line: `current-busy-or-modal` is the only busy reason a LIVE current viewport ever
+// produces, and no case in this file asserted on it. These cases do, and they do it on a
+// live-SHAPED verdict rather than on an offline one — see REAL_PROBE_WRAPPER for why live
+// mode cannot be executed here at all.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * A busy verdict in the shape the probe emits for a LIVE current viewport: the one
+ * reachable busy reason, `screen_source` a current viewport, and the tracker class under
+ * test. Every other field is the measured busy shape (`surface_detail: "working token"`,
+ * `activity: "moving"`, no verify problems) the third review recorded for the real probe's
+ * busy screens, so the only thing that varies between these cases is the tracker class.
+ */
+const LIVE_BUSY_PROBE_STUB = `
+process.stdout.write(JSON.stringify({
+  alive: true, ready: false, surface: 'working', activity: 'moving', cli: 'claude',
+  detail: {
+    health: 'CONNECTED', transport_ready: true, bootstrap_ready: true,
+    ready_reason: process.env.LIVE_PROBE_REASON || 'current-busy-or-modal',
+    screen_source: 'cmux:current-viewport', surface_detail: 'working token',
+    tracker_class: process.env.LIVE_PROBE_TRACKER || 'prompt_observed',
+    verify_started: true, verify_problems: [],
+  },
+}) + '\\n');
+`;
+
+/** One run whose readiness verdict is that live-shaped busy verdict. */
+const armLiveBusy = (f: F, tracker: string, reason = LIVE_BUSY_REASON): NodeJS.ProcessEnv => ({
+  ...arm(f),
+  SESSION_PROBE_PY: f.script("probe-live-busy-stub", LIVE_BUSY_PROBE_STUB),
+  LIVE_PROBE_TRACKER: tracker,
+  LIVE_PROBE_REASON: reason,
+});
+
+// ── (s) r7/M1 the live busy reason, per tracker class, and nothing else ──────
+describe("1270(s) r7/M1 the only reason production emits admits, and only it", () => {
+  // Every class the probe can return for a busy screen that is not an approval or a broken
+  // session. All three are live-reachable for a genuinely busy worker (measured by the third
+  // review: `active` = active.txt, `prompt_observed` = a busy row with an empty composer,
+  // `blank` = a busy composer followed by a footer row), so all three must deliver.
+  for (const tracker of ADMITTED_TRACKERS) {
+    test(`tracker_class ${tracker} with ready_reason current-busy-or-modal: admitted, exactly one bound send`, () => {
+      const f = fixture();
+      try {
+        f.prepareTarget();
+        const r = follow(f, armLiveBusy(f, tracker));
+        const es = entries(f);
+        assert.doesNotMatch(r.stderr, READY_TIMEOUT_LINE,
+          `the live busy reason must admit the bound path\n${r.stdout}\n${r.stderr}`);
+        assert.equal(boundSends(es).length, 1, `one bound send\n${r.stdout}\n${r.stderr}`);
+        assert.deepEqual(boundSends(es)[0]!.argv, expectedBoundArgv(f), "the exact frozen argv");
+        assert.deepEqual(legacyInjects(es).map((e) => e.argv), [], "never a legacy inject to a busy session");
+        assert.deepEqual(keyWrites(es).map((e) => e.argv), [], "and never a key");
+        assert.equal(r.status, 0, `accepted-pending exits 0\n${r.stderr}`);
+        assert.match(r.stdout, /ACCEPTED_PENDING/);
+      } finally { f.cleanup(); }
+    });
+  }
+
+  // r7 m4: the guard is an ALLOW-list, so the two refused families stay refused AND a class
+  // the probe does not emit today — the sixth-class case an exclusion would have admitted
+  // into an input-writing path — is refused by default.
+  for (const [tracker, why] of [
+    ["welcome", "the approval/boot family (TRACKER_WELCOME, probe :129)"],
+    ["error", "a broken session (TRACKER_ERR, probe :125-128)"],
+    ["queued_input", "a class the probe does not emit today: unknown means refuse, not admit"],
+  ] as const) {
+    test(`tracker_class ${tracker} is refused even on the live busy reason (${why})`, () => {
+      const f = fixture();
+      try {
+        f.prepareTarget();
+        const r = follow(f, armLiveBusy(f, tracker));
+        assert.deepEqual(boundSends(entries(f)).map((e) => e.argv), [],
+          `${why}: the bound path must stay closed\n${r.stdout}\n${r.stderr}`);
+        assertNoInputEffect(f, `tracker_class ${tracker}`);
+        assert.notEqual(r.status, 0, `and the dispatch must not report a delivery\n${r.stderr}`);
+        assert.match(r.stderr, READY_TIMEOUT_LINE, "it falls back to the unchanged readiness wait");
+      } finally { f.cleanup(); }
+    });
+  }
+
+  // r7 m2/m3: the other three busy spellings. `current-working` is unreachable in BOTH probe
+  // modes, `hard-negative` is the OFFLINE answer and carries no composer guarantee at all,
+  // and `no-empty-current-prompt` IS the live composer refusal. None may admit, on a surface
+  // that is otherwise fully qualified busy.
+  for (const [reason, why] of [
+    ["current-working", "unreachable: ready_by_current_screen answers current-busy-or-modal first (probe :491-493)"],
+    ["hard-negative", "offline only: ready_by_screen never inspects the composer (probe :360-372)"],
+    ["no-empty-current-prompt", "the live composer refusal itself (probe :486-488)"],
+    ["prompt", "a ready composer is the legacy path's business"],
+  ] as const) {
+    test(`ready_reason ${reason} is NOT admitted on a busy surface (${why})`, () => {
+      const f = fixture();
+      try {
+        f.prepareTarget();
+        const r = follow(f, armLiveBusy(f, "active", reason));
+        assert.deepEqual(boundSends(entries(f)).map((e) => e.argv), [],
+          `${reason}: only the live reason may admit\n${r.stdout}\n${r.stderr}`);
+        assertNoInputEffect(f, `ready_reason ${reason}`);
+        assert.notEqual(r.status, 0, `and the dispatch must not report a delivery\n${r.stderr}`);
+      } finally { f.cleanup(); }
+    });
+  }
+
+  test("control: the same stub with the live reason and an admitted tracker still delivers", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      const r = follow(f, armLiveBusy(f, "active"));
+      assert.equal(boundSends(entries(f)).length, 1,
+        `without this control every refusal above would also hold for a caller that never delivers\n${r.stderr}`);
     } finally { f.cleanup(); }
   });
 });
