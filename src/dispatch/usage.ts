@@ -84,4 +84,33 @@ export const USAGE = `# dispatch.sh — Wraps \`telepty inject\` with REPL-ready
 #
 # Ready detection: per-CLI prompt-symbol probe of \`telepty read-screen\` plus
 # welcome/boot banner absence (claude ❯ / codex › / gemini ›|│ >).
+#
+# Follow-up to a BUSY worker (#1270): a \`--target\` that is already working can never show
+#   the idle, empty composer the readiness wait requires, so such a dispatch used to time out
+#   with nothing delivered. A NON-SPAWNED --target measured as qualified current-busy (probe
+#   surface=working, ready=false, ready_reason=current-working) is admitted at once instead
+#   and delivered through \`telepty inject-bound-v1\`, bound to the session epoch and owner
+#   generation read from ONE \`telepty list --json\` snapshot. Fresh --spawn-and-dispatch,
+#   modal, unsubmitted, unknown surface, probe error and --retry-unknown are unchanged and
+#   stay fail-closed. It requires --from, a loopback session, the bridge's busy-input-v1
+#   capability and the verb in \`telepty boot-capabilities\`; exit 78
+#   BOUND_INJECT_UNSUPPORTED names whichever is missing, before any record or any input.
+#   Every outcome records transport \`unknown\` plus one bounded observation, never
+#   write_observed:
+#     exit 0  ACCEPTED_PENDING <sid> — both frames were handed to the pinned owner bridge.
+#             REPLACES the \`OK dispatched to <sid>\` line on this path and is NOT a delivery
+#             receipt: not a PTY write, not native queueing, not auto-submit, not model
+#             receipt. The identity is never re-sent.
+#     exit 3  BOUND_INJECT_REFUSED — the answer PROVES nothing was written (pre-socket local
+#             refusal, unregistered route, or a closed refusal reporting 0 bytes); recorded
+#             not_delivered, so the same ref may be dispatched again.
+#     exit 7  DELIVERY_UNKNOWN — lost, truncated, mismatched-identity or any other
+#             non-accepted answer: input may have been queued or written, so the identity is
+#             HELD for review (no replay, no Enter). Clear it with --retry-unknown once
+#             reviewed, exactly as for a legacy unknown delivery.
+#   --verify-delivered is a declared NO-OP on this path: a queued body is not on the screen,
+#   so no screen read is attempted, a stderr NOTE states that verification was not performed,
+#   and the exit stays 0. Started-working verification runs observe-only
+#   (bin/dispatch-verify.sh --observe-only): no key, no resubmit, and it prints OBSERVED
+#   rather than VERIFIED, because a working spinner may predate the queued body.
 #`;

@@ -20,7 +20,10 @@ while [ $# -gt 0 ]; do
     # is not a receipt for it — this mode never resubmits and never prints VERIFIED.
     --observe-only) observe_only=1; shift;;
     --quiet) quiet=1; shift;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0;;
+    # Task 1270 (r1 m5): the window is a LINE RANGE, so inserting the flag above shifted its
+    # end out of view. Widened from 2,22 to 2,29 so --help still shows everything it showed
+    # (header + the whole flag parser through `esac`), now including --observe-only.
+    -h|--help) sed -n '2,29p' "$0"; exit 0;;
     -*) echo "dispatch-verify.sh: unknown arg: $1" >&2; exit 4;;
     *) sid="$1"; shift;;
   esac
@@ -37,11 +40,12 @@ say() { [ "$quiet" -eq 1 ] || echo "$@"; }
 POLICY_ACTION_FILE="$(mktemp "${TMPDIR:-/tmp}/dispatch-verify-action.XXXXXX" 2>/dev/null || true)"
 trap '[ -n "$POLICY_ACTION_FILE" ] && rm -f "$POLICY_ACTION_FILE"' EXIT
 
-# Task 1270: the Enter-resend is POLICY-controlled, not marker-controlled. policy.py answers
-# RESUBMIT_ENTER only for the not-moving startup surfaces (unsubmitted/idle/welcome/modal/
-# sandbox_prompt); a current_busy session (surface=working) gets ESCALATE instead. So a
-# `[not-moving]` marker in the SUSPECT text can no longer send a bare Enter into a composer
-# that is already carrying input. Fail closed: no readable action, no key.
+# Task 1270: the Enter-resend is POLICY-controlled, not marker-controlled. The producer of
+# this action is bin/policy.py:135 (r1 m6), which answers RESUBMIT_ENTER only for the
+# not-moving startup surfaces (unsubmitted/idle/welcome/modal/sandbox_prompt) and ESCALATE for
+# a current_busy session (surface=working, policy.py:136). So a `[not-moving]` marker in the
+# SUSPECT text can no longer send a bare Enter into a composer that is already carrying input.
+# Fail closed: no readable action, no key — and the skip is announced, never silent.
 policy_wants_enter() {
   [ -s "$POLICY_ACTION_FILE" ] || return 1
   grep -q '"action"[[:space:]]*:[[:space:]]*"RESUBMIT_ENTER"' "$POLICY_ACTION_FILE"
@@ -106,15 +110,23 @@ rc=0
 out=$(run_check) || rc=$?
 say "$out"
 
-if [ "$rc" -eq 6 ] && [ "$resubmit" -eq 1 ] && [ "$observe_only" -eq 0 ] && policy_wants_enter \
+if [ "$rc" -eq 6 ] && [ "$resubmit" -eq 1 ] && [ "$observe_only" -eq 0 ] \
    && printf '%s' "$out" | grep -q '\[not-moving\]'; then
-  say "dispatch-verify: not-moving → #412 submit-resend (send-key enter), re-verifying once..."
-  "$TELEPTY" send-key "$sid" enter >/dev/null 2>&1 || true
-  sleep 2
-  rc=0
-  out=$(run_check) || rc=$?
-  say "$out"
-  [ "$rc" -eq 0 ] && say "dispatch-verify: recovered via Enter-resend (the inject was unsubmitted — #412)."
+  # Task 1270 (r1 m6): the decision to send a key is policy.py's, not this marker's. When the
+  # policy does not ask for it, say so — a recovery that silently stops happening (an older
+  # policy.py, a POLICY_PY override, a new action spelling) is otherwise indistinguishable
+  # from one that was never needed.
+  if policy_wants_enter; then
+    say "dispatch-verify: not-moving → #412 submit-resend (send-key enter), re-verifying once..."
+    "$TELEPTY" send-key "$sid" enter >/dev/null 2>&1 || true
+    sleep 2
+    rc=0
+    out=$(run_check) || rc=$?
+    say "$out"
+    [ "$rc" -eq 0 ] && say "dispatch-verify: recovered via Enter-resend (the inject was unsubmitted — #412)."
+  else
+    say "dispatch-verify: not-moving marker present, but the policy did not answer RESUBMIT_ENTER (producer: bin/policy.py:135) — no key sent. This is the current_busy / unrecognised-action guard, not a failure."
+  fi
 fi
 
 exit "$rc"
