@@ -1352,7 +1352,7 @@ function admitBoundBusy(o: Opts, sid: string): BusyAdmission {
       "(an unknown verb's help text and exit 0 is not support)");
   }
   return { bound: { epoch: snap.epoch, ownerGeneration: snap.ownerGeneration, busyInput: snap.busyInput, cliKind: snap.cliKind },
-    cliKind, probe: p };
+    cliKind, probe: p, startedAt };
 }
 
 /**

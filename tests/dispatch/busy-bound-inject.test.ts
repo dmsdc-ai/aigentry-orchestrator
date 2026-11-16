@@ -953,8 +953,13 @@ process.stdout.write(JSON.stringify({ action: ${JSON.stringify(action)}, key: 'e
 `);
 }
 
-/** bin/dispatch-verify.sh itself, with a zero settle so the 6s wait is not paid. */
-function runVerify(f: F, args: string[], overrides: NodeJS.ProcessEnv): SpawnSyncReturns<string> {
+/**
+ * bin/dispatch-verify.sh itself, with a zero settle so the 6s wait is not paid.
+ * r5: `readonly string[]`, because the caller's table is `as const` (a readonly tuple) and
+ * this function only spreads the args into a new array — it never mutates them. `spawnSync`
+ * itself declares `args?: readonly string[]`.
+ */
+function runVerify(f: F, args: readonly string[], overrides: NodeJS.ProcessEnv): SpawnSyncReturns<string> {
   return spawnSync("bash", [VERIFY_SH, SID, "--settle-ms", "0", ...args],
     { cwd: f.root, env: { ...f.env, ...overrides }, encoding: "utf8", timeout: 40000 });
 }
@@ -1008,7 +1013,7 @@ describe("1270(m) r4/M-D observe-only prints OBSERVED, never a fresh VERIFIED", 
       try {
         f.prepareTarget();
         // The ONE state that reaches the fork: no probe_error, and the policy answering
-        // NOOP/verified (bin/dispatch-verify.sh:80-96). Both legs exit 0, so the base
+        // NOOP/verified (bin/dispatch-verify.sh:68-77). Both legs exit 0, so the base
         // `set -e` defect never hides the print.
         const overrides = { ...arm(f), POLICY_PY: policyStub(f, "NOOP") };
         const r = runVerify(f, args, overrides);
@@ -1090,7 +1095,16 @@ function armRealProbe(f: F, screen: { file: string } | { text: string }, answer:
     SESSION_PROBE_PY: f.script("probe-real-wrapper", REAL_PROBE_WRAPPER), REAL_PROBE_CONFIG: configFile };
 }
 
-const probeReads = (es: Entry[]) => es.filter((e) => e.who === "probe");
+/**
+ * r5: the FROZEN `Entry.who` union (`:216`) is `"telepty" | "registry"` — it predates the r4
+ * real-probe wrapper, which appends a third producer (`who: "probe"`) to the same log. The
+ * original interface may not be edited, so the rows are widened once, soundly (both members
+ * of the union are strings), instead of comparing against a literal the union cannot hold or
+ * casting to `any`.
+ */
+interface LoggedCall { who: string; argv: string[] }
+const logged = (es: Entry[]): LoggedCall[] => es;
+const probeReads = (es: Entry[]) => logged(es).filter((e) => e.who === "probe");
 const listReads = (es: Entry[]) => telepty(es).filter((e) => e.argv[0] === "list");
 
 // Inline screens for the two shapes no measured fixture carries. Both are claude viewports.
