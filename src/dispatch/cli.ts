@@ -54,6 +54,7 @@ const REPORT_TARGET_SH = env.REPORT_TARGET_SH || path.join(SCRIPT_DIR, "orchestr
 const WH_CLI = path.join(SCRIPT_DIR, "wh-cli.sh");
 
 const REGISTER_TIMEOUT_MS_DEFAULT = 180000;
+const READINESS_CAPTURE_MAX_MS = 90_000;
 
 // ── small process helpers ───────────────────────────────────────────────────
 function isExecutable(p: string): boolean {
@@ -66,10 +67,11 @@ function isExecutable(p: string): boolean {
 }
 
 /** stdout+status, stderr swallowed — the shell's `$(cmd 2>/dev/null || true)`. */
-function capture(cmd: string, args: string[], extraEnv?: NodeJS.ProcessEnv): { status: number; stdout: string } {
+function capture(cmd: string, args: string[], extraEnv?: NodeJS.ProcessEnv, timeoutMs?: number): { status: number; stdout: string } {
   const r = (process.platform === "win32" ? crossSpawn.sync : spawnSync)(cmd, args, {
     encoding: "utf8",
     env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
+    ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }),
   });
   if (r.error) return { status: 127, stdout: "" };
   return { status: r.status ?? 1, stdout: r.stdout ?? "" };
@@ -248,8 +250,8 @@ function cliOf(sid: string): string {
  * The probe semantics live in session-probe.py and are deliberately untouched
  * (their false-negatives are known and documented) — this only reads its verdict.
  */
-function isReady(sid: string, cliKind: string): boolean {
-  const { stdout } = capture(SESSION_PROBE_PY, ["--sid", sid, "--cli", cliKind], { TELEPTY });
+function isReady(sid: string, cliKind: string, timeoutMs = READINESS_CAPTURE_MAX_MS): boolean {
+  const { stdout } = capture(SESSION_PROBE_PY, ["--sid", sid, "--cli", cliKind], { TELEPTY }, timeoutMs);
   if (!stdout) return false;
   try {
     return JSON.parse(stdout).ready === true;
@@ -306,7 +308,7 @@ function agentStatus(sid: string, cliKind: string): Record<string, string | numb
   } catch { /* unreadable listing: unknown */ }
   let activity = "unknown", activitySource = "unknown";
   try {
-    const p = JSON.parse(capture(SESSION_PROBE_PY, ["--sid", sid, "--cli", cliKind], { TELEPTY }).stdout);
+    const p = JSON.parse(capture(SESSION_PROBE_PY, ["--sid", sid, "--cli", cliKind], { TELEPTY }, READINESS_CAPTURE_MAX_MS).stdout);
     const detail = p && typeof p.detail === "object" && p.detail !== null ? p.detail : {};
     if (detail.probe_error === undefined && typeof detail.screen_source === "string" &&
         detail.screen_source.endsWith(":current-viewport") && PROBE_SURFACES.has(p.surface)) {
@@ -1093,8 +1095,8 @@ function inject(o: Opts, d: Delivery, sid: string): Promise<number> {
   // message: `telepty inject [flags] <session_id> "<prompt>"`. `--ref` is kept for
   // the unconfined __probe seam, where telepty derives its own tilde descriptor.
   const a = d.refPrompt
-    ? ["inject", "--submit", "--submit-retry", "2"]
-    : ["inject", "--ref", d.effRef, "--submit", "--submit-retry", "2"];
+    ? ["inject", "--submit", "--no-submit-force", "--submit-retry", "0"]
+    : ["inject", "--ref", d.effRef, "--submit", "--no-submit-force", "--submit-retry", "0"];
   if (o.fromId) a.push("--from", o.fromId);
   a.push(sid);
   // argv element, never a shell string: telepty joins args.slice(2) verbatim.
@@ -1539,7 +1541,7 @@ async function waitForReady(o: Opts, sid: string): Promise<number> {
   }
   const deadline = nowMs() + effectiveTimeout;
   for (;;) {
-    if (isReady(sid, cliKind)) return 0;
+    if (isReady(sid, cliKind, Math.max(1, Math.min(READINESS_CAPTURE_MAX_MS, deadline - nowMs())))) return 0;
     if (nowMs() >= deadline) {
       process.stderr.write(
         `dispatch.sh: timeout (${effectiveTimeout}ms) waiting for ${sid} REPL ready (cli=${cliKind})\n`,
@@ -1897,8 +1899,10 @@ async function main(argv: string[]): Promise<never> {
 async function probe(argv: string[]): Promise<never> {
   const sub = argv[0];
   if (sub === "is-ready") {
-    // __probe is-ready <sid> <cli>
-    process.exit(isReady(argv[1] ?? "", argv[2] ?? "") ? 0 : 1);
+    // __probe is-ready <sid> <cli> [budget-ms]
+    const budget = argv[3] === undefined ? READINESS_CAPTURE_MAX_MS : Number(argv[3]);
+    if (!Number.isSafeInteger(budget) || budget < 1 || budget > READINESS_CAPTURE_MAX_MS) die("dispatch.sh: invalid readiness probe budget", 4);
+    process.exit(isReady(argv[1] ?? "", argv[2] ?? "", budget) ? 0 : 1);
   }
   if (sub === "verify-delivered") {
     // __probe verify-delivered --ref <file> <sid> → 0 landed / 1 did not / 2 unknown
