@@ -54,6 +54,7 @@ const REPORT_TARGET_SH = env.REPORT_TARGET_SH || path.join(SCRIPT_DIR, "orchestr
 const WH_CLI = path.join(SCRIPT_DIR, "wh-cli.sh");
 
 const REGISTER_TIMEOUT_MS_DEFAULT = 180000;
+const READINESS_CAPTURE_MAX_MS = 90_000;
 
 // ── small process helpers ───────────────────────────────────────────────────
 function isExecutable(p: string): boolean {
@@ -66,10 +67,11 @@ function isExecutable(p: string): boolean {
 }
 
 /** stdout+status, stderr swallowed — the shell's `$(cmd 2>/dev/null || true)`. */
-function capture(cmd: string, args: string[], extraEnv?: NodeJS.ProcessEnv): { status: number; stdout: string } {
+function capture(cmd: string, args: string[], extraEnv?: NodeJS.ProcessEnv, timeoutMs?: number): { status: number; stdout: string } {
   const r = (process.platform === "win32" ? crossSpawn.sync : spawnSync)(cmd, args, {
     encoding: "utf8",
     env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
+    ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }),
   });
   if (r.error) return { status: 127, stdout: "" };
   return { status: r.status ?? 1, stdout: r.stdout ?? "" };
@@ -248,13 +250,49 @@ function cliOf(sid: string): string {
  * The probe semantics live in session-probe.py and are deliberately untouched
  * (their false-negatives are known and documented) — this only reads its verdict.
  */
-function isReady(sid: string, cliKind: string): boolean {
-  const { stdout } = capture(SESSION_PROBE_PY, ["--sid", sid, "--cli", cliKind], { TELEPTY });
+function isReady(sid: string, cliKind: string, timeoutMs = READINESS_CAPTURE_MAX_MS): boolean {
+  const { stdout } = capture(SESSION_PROBE_PY, ["--sid", sid, "--cli", cliKind], { TELEPTY }, timeoutMs);
   if (!stdout) return false;
   try {
     return JSON.parse(stdout).ready === true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * #1270: the fields session-probe.py ALREADY emits, for the one call site that has to
+ * tell "busy and otherwise healthy" apart from modal/unsubmitted/unknown/probe-failed.
+ * isReady() above stays the public boolean and `__probe is-ready` keeps answering
+ * through its exit code only — the probe itself is untouched, and so is its verdict:
+ * `ready` stays false for a qualified current-busy session. null = no usable verdict.
+ */
+interface ProbeState {
+  alive: boolean;
+  ready: boolean;
+  surface: string;
+  readyReason: string;
+  /** r4 B1: `detail.tracker_class`, already emitted — the independent live-work signal. */
+  trackerClass: string;
+  probeError: boolean;
+}
+
+function probeState(sid: string, cliKind: string, timeoutMs = READINESS_CAPTURE_MAX_MS): ProbeState | null {
+  const { stdout } = capture(SESSION_PROBE_PY, ["--sid", sid, "--cli", cliKind], { TELEPTY }, timeoutMs);
+  if (!stdout) return null;
+  try {
+    const p = JSON.parse(stdout) as { alive?: unknown; ready?: unknown; surface?: unknown; detail?: unknown };
+    const detail: Record<string, unknown> = p.detail !== null && typeof p.detail === "object" ? p.detail as Record<string, unknown> : {};
+    return {
+      alive: p.alive === true,
+      ready: p.ready === true,
+      surface: typeof p.surface === "string" ? p.surface : "",
+      readyReason: typeof detail.ready_reason === "string" ? detail.ready_reason : "",
+      trackerClass: typeof detail.tracker_class === "string" ? detail.tracker_class : "",
+      probeError: detail.probe_error !== undefined,
+    };
+  } catch {
+    return null;
   }
 }
 
@@ -279,7 +317,7 @@ function agentStatus(sid: string, cliKind: string): Record<string, string | numb
   } catch { /* unreadable listing: unknown */ }
   let activity = "unknown", activitySource = "unknown";
   try {
-    const p = JSON.parse(capture(SESSION_PROBE_PY, ["--sid", sid, "--cli", cliKind], { TELEPTY }).stdout);
+    const p = JSON.parse(capture(SESSION_PROBE_PY, ["--sid", sid, "--cli", cliKind], { TELEPTY }, READINESS_CAPTURE_MAX_MS).stdout);
     const detail = p && typeof p.detail === "object" && p.detail !== null ? p.detail : {};
     if (detail.probe_error === undefined && typeof detail.screen_source === "string" &&
         detail.screen_source.endsWith(":current-viewport") && PROBE_SURFACES.has(p.surface)) {
@@ -1066,8 +1104,8 @@ function inject(o: Opts, d: Delivery, sid: string): Promise<number> {
   // message: `telepty inject [flags] <session_id> "<prompt>"`. `--ref` is kept for
   // the unconfined __probe seam, where telepty derives its own tilde descriptor.
   const a = d.refPrompt
-    ? ["inject", "--submit", "--submit-retry", "2"]
-    : ["inject", "--ref", d.effRef, "--submit", "--submit-retry", "2"];
+    ? ["inject", "--submit", "--no-submit-force", "--submit-retry", "0"]
+    : ["inject", "--ref", d.effRef, "--submit", "--no-submit-force", "--submit-retry", "0"];
   if (o.fromId) a.push("--from", o.fromId);
   a.push(sid);
   // argv element, never a shell string: telepty joins args.slice(2) verbatim.
@@ -1094,6 +1132,543 @@ function recordTransport(d: Delivery, sid: string, result: string): number {
   const a = ["set-transport-result", "--sid", sid, "--result", result];
   if (d.transportInjectId) a.push("--inject-id", d.transportInjectId);
   return registryQuiet(a);
+}
+
+// ── #1270 bound busy delivery (caller half) ─────────────────────────────────
+// A follow-up for a worker that is ALREADY WORKING can never satisfy the idle,
+// empty-composer readiness wait below, so it used to time out with nothing
+// delivered, recorded or staged. The daemon's `inject-bound-v1` verb takes a
+// body+CR bound to one (session epoch, owner generation) pair and refuses if
+// either moved; this is the caller half of that contract.
+//
+// NOTHING here proves the wrapped CLI queued, submitted or read the body.
+// `accepted` means both frames were handed to the pinned owner bridge, so the
+// durable record stays transport `unknown` plus ONE bounded observation —
+// never `write_observed`, never a fresh VERIFIED, never a replay.
+const BOUND_VERB = "inject-bound-v1";
+const BOUND_CAPABILITY = "busy-input-v1";
+const BOUND_RESULT_SCHEMA = "telepty.bound-inject-result/v1";
+const BOUND_LOOPBACK = "127.0.0.1";
+// The frozen result vocabulary. Anything outside it is read as `unknown`, never coerced.
+const BOUND_RESULT_STAGES = new Set(["refused", "accepted", "outcome_unknown"]);
+const BOUND_FRAME_STAGES = new Set(["not_sent", "queued", "sent_to_bridge", "pty_written", "unknown"]);
+/**
+ * r1 M1: the verb's OWN classification vocabulary, closed like every sibling field, because
+ * this value is persisted in the durable observation. Measured, not assumed — these five are
+ * every value the shipped verb can print: `refused_locally` (inject-bound-v1.js:91,98),
+ * `outcome_unknown` (:116 and the classifier default), and `accepted`/`refused`/
+ * `unsupported` from classifyBoundResponse (bound-inject.js:139-144) via :120.
+ */
+const BOUND_TRANSPORTS = new Set(["accepted", "refused", "outcome_unknown", "refused_locally", "unsupported"]);
+/** The contract's bounded reason code. */
+const BOUND_REASON = /^[a-z0-9_]{1,64}$/;
+/**
+ * r1 M3: the DAEMON's shared rule for an opaque identity token, mirrored instead of a
+ * narrower one of our own — non-empty, at most 256 UTF-8 BYTES, no control character
+ * (telepty1270-bound3 `changes/src/protocol/bound-inject.js:35-39`, TOKEN_MAX_BYTES at :29;
+ * the same function gates the request end, so a value this rejects could never be sent).
+ * The contract types epoch and owner generation as OPAQUE, so the caller may not assume an
+ * alphabet: the previous `[A-Za-z0-9._:-]{1,128}` refused a legitimate daemon-minted token
+ * (`+`, `/`, `=`, a space, any non-ASCII, or over 128 UTF-16 units) at exit 78, before
+ * beginDelivery, blaming the snapshot for the caller's own narrowness.
+ *
+ * The ONE property the caller adds is argv safety: a leading `-` could be read as a flag by
+ * an argv consumer (the daemon CLI itself refuses a `--`-prefixed flag VALUE,
+ * inject-bound-v1.js:58, and `--inject-id <token>` is argv for the registry). The value
+ * stays a single argv element and never becomes a shell string.
+ */
+const BOUND_TOKEN_MAX_BYTES = 256;
+
+function boundedToken(value: unknown): boolean {
+  return typeof value === "string" && value.length > 0
+    && Buffer.byteLength(value, "utf8") <= BOUND_TOKEN_MAX_BYTES
+    && !/[\u0000-\u001f\u007f]/.test(value) && !value.startsWith("-");
+}
+
+/**
+ * The pinned identity ONE snapshot published, and the capability it declared with it.
+ * r6/n-A: no `cliKind` here — the admission's CLI kind lives on BusyAdmission, where it is
+ * actually read (as the readiness-verdict reuse key); a copy on the binding was dead state.
+ */
+interface BoundBinding { epoch: string; ownerGeneration: string; busyInput: string }
+
+/**
+ * The daemon's closed result object, every field re-bounded on the way in. r1 M2 adds the
+ * three identity fields the answer carries, so an acceptance can be checked against the
+ * binding it was supposed to be about instead of being booked on the caller's assumption.
+ */
+interface BoundResult {
+  stage: string;
+  reason: string | null;
+  injectId: string | null;
+  sessionId: string | null;
+  sessionEpoch: string | null;
+  ownerGeneration: string | null;
+  bodyStage: string;
+  submitStage: string;
+  bytesWritten: number | null;
+}
+
+/**
+ * ONE current local snapshot. `telepty list --json` is the existing read verb that
+ * carries the daemon's transport block (session-inspection serializeSession →
+ * buildSessionTransportBlock), so id, host, epoch, owner generation and the busy
+ * capability are read from the SAME row of the SAME read — a caller that took the
+ * identity from an older view, a cache or a probe could bind a body to an owner
+ * that is already gone. Exactly one matching row, or no snapshot at all.
+ */
+function boundSnapshot(sid: string): { cliKind: string; host: string; epoch: string; ownerGeneration: string; busyInput: string } | null {
+  // r1 m1: the read's own verdict decides whether it has authority, exactly as its sibling
+  // boundVerbAdvertised does. A degraded or half-written listing that still happens to parse
+  // may not supply the identity a body is bound to.
+  const { status, stdout } = capture(TELEPTY, ["list", "--json"]);
+  if (status !== 0) return null;
+  let rows: unknown;
+  try { rows = JSON.parse(stdout); } catch { return null; }
+  if (!Array.isArray(rows)) return null;
+  const hits = rows.filter((s) => s !== null && typeof s === "object" && (s as { id?: unknown }).id === sid);
+  if (hits.length !== 1) return null; // 0 = not listed; >1 = an identity nobody can resolve
+  const row = hits[0] as Record<string, unknown>;
+  const t: Record<string, unknown> = row.transport !== null && typeof row.transport === "object" ? row.transport as Record<string, unknown> : {};
+  const str = (v: unknown): string => (typeof v === "string" ? v : "");
+  const command = str(row.command);
+  return { cliKind: cliKindOf(command) || command, host: str(row.host), epoch: str(t.session_epoch),
+    ownerGeneration: str(t.owner_generation), busyInput: str(t.busy_input) };
+}
+
+/**
+ * The sealed local capability document (`telepty boot-capabilities`), purely local:
+ * printing it starts, repairs or contacts nothing. An OLD CLI answers an unknown verb
+ * with its help text and exit 0, and that is NOT support — so only a JSON object whose
+ * `verbs` array names the verb counts. Prose, a non-zero exit or no output is refusal.
+ */
+function boundVerbAdvertised(): boolean {
+  const r = capture(TELEPTY, ["boot-capabilities"]);
+  if (r.status !== 0 || !r.stdout) return false;
+  try {
+    const doc = JSON.parse(r.stdout) as { verbs?: unknown };
+    return Array.isArray(doc.verbs) && doc.verbs.includes(BOUND_VERB);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * What the admission measured: the binding when the bound path is taken, plus the ONE
+ * readiness verdict it read. r1 m2: that verdict is handed to waitForReady as its FIRST
+ * iteration instead of being thrown away, so an unchanged idle `--target` pays exactly
+ * what it paid before this feature existed — one listing (resolveRoute's, already made)
+ * and one probe.
+ */
+interface BusyAdmission {
+  bound: BoundBinding | null;
+  cliKind: string;
+  probe: ProbeState | null;
+  /** r4 m-C: when the admission's probe STARTED, so the readiness deadline can be anchored
+   *  there and a `--target` dispatch's total wall budget stays exactly `--timeout-ms`. */
+  startedAt: number;
+  /** r7 m9: whether a probe was actually RUN (and so actually spent wall time). `probe` can
+   *  be null for two different reasons — the admission returned before probing at all, or it
+   *  probed and got no usable verdict — and only the second must come out of the readiness
+   *  budget. `startedAt` is meaningful as an anchor exactly when this is true. */
+  probed: boolean;
+}
+
+/**
+ * r4 B1 — the admission predicate, derived from bin/session-probe.py (NOT edited) rather
+ * than assumed. Three facts the real probe emits, each load-bearing:
+ *
+ *  1. `surface === "working"`. In the live path `classify_surface(..., current=True)` returns
+ *     `working` only through its `current_busy_signal(controls)` arm (probe :538-540), and
+ *     `observe()` RE-CLASSIFIES the surface on `controls` (:637-640), so a settled session
+ *     whose only glyph row is a completed duration footer re-reads as `idle`, not `working`
+ *     (#1136). The arms tested before it — thinking_block, sandbox_prompt, TRUST_MODAL,
+ *     crash, sleep_cut, api_error, raw_shell, UNSUBMITTED — therefore cannot be `working`.
+ *  2. the ONE busy ready_reason production can produce: `current-busy-or-modal` (r7 m2/m3).
+ *     The probe has three busy spellings and only this one is live-reachable, so only this
+ *     one is admitted — and because `probeState` never passes `--screen-file`, this single
+ *     equality IS the guarantee that the verdict came from the live current viewport:
+ *       • `current-working` is UNREACHABLE in BOTH modes: `surface === "working"` implies
+ *         `current_busy_signal(controls)` is true, and `ready_by_current_screen` evaluates
+ *         that same expression on the same input (:488-491) and returns
+ *         `current-busy-or-modal` BEFORE its `surface == "working"` line (:492-493). r0-r3
+ *         required exactly this dead value, which is what made the feature inert (B1).
+ *       • `hard-negative` is the OFFLINE `--screen-file` answer (:366-374), and offline mode
+ *         has NO composer guarantee at all — `ready_by_screen` never inspects the composer —
+ *         so admitting it would admit a busy session whose composer already holds typed text.
+ *         The third review measured exactly that (`hw_busy_typed_composer.txt`: offline
+ *         `hard-negative` → would admit; live `no-empty-current-prompt` → refused).
+ *     `no-empty-current-prompt` is NOT admitted: that reason IS the composer guarantee in
+ *     the live path, where it is returned before any busy test (:489-490). It is the gate
+ *     that actually carries the safety here, and it is the reason a live verdict is required.
+ *  3. `detail.tracker_class` is one of the families that may be given input — an explicit
+ *     ALLOW-list (r7 m4), so a class the probe gains later is refused by default rather than
+ *     admitted into an input-writing path. r4 required `=== "active"` instead and
+ *     CI measured the consequence: the canonical claude busy row
+ *     `⏺ Working... (5s · esc to interrupt)` (tests/dispatch/fixtures/working_active.txt, the
+ *     very row probe :415-421 calls measured) yields tracker_class **"blank"**, because
+ *     `TRACKER_ACTIVE_TEXT` (:130) needs the parenthesis to wrap the phrase exactly —
+ *     `\(esc to interrupt\)` does not match `(5s · esc to interrupt)` — and the row carries
+ *     no braille spinner. So an inclusion on "active" refused a genuinely busy session: B1
+ *     again, in a narrower form. `tracker_class` has exactly FIVE reachable returns —
+ *     `blank` (:326), `error` (:329), `welcome` (:337), `active` (:339), `prompt_observed`
+ *     (:345) and `blank` again (:346) — so this list and the r6 exclusion
+ *     `∉ {welcome, error}` decide every screen identically today; the difference is which way
+ *     a sixth class would fall. Each admitted member is live-reachable for a genuinely busy
+ *     session, measured by the third review: `active` = active.txt, `prompt_observed` = a
+ *     busy row with an empty composer, `blank` = a busy composer followed by a footer row.
+ *     The two left out are left out for cause:
+ *       • `"welcome"` is the approval/boot family — `TRACKER_WELCOME` (:129) is
+ *         `Welcome back|Tips for getting started|Trust this folder|Press Enter to continue`,
+ *         which is a DIFFERENT pattern family from `TRUST_MODAL` (:73), so it still catches an
+ *         approval or welcome banner that the modal reader's line anchoring missed while
+ *         `current_busy_signal`'s fourth arm (:427) matched a busy word. Measured: a busy row
+ *         + `Welcome back` + an empty composer is refused by THIS guard alone.
+ *       • `"error"` is `TRACKER_ERR` (:125-128) — an `error:`/`traceback`/`panic:`/
+ *         `command not found`/`killed:`/`exited N` line, which `classify_surface` does not test
+ *         for, so a broken session is not handed input either. Measured the same way: a busy
+ *         row + `error: EACCES` + an empty composer is refused by THIS guard alone.
+ *     `activity` is NOT usable for any of this: `observe()` derives it from the surface
+ *     (`activity = "moving" if working_token …`, :645), so it carries no evidence the surface
+ *     does not already carry.
+ *
+ * The modal/approval family's PRIMARY exclusion is conjunct 1: `classify_surface` tests
+ * thinking_block, sandbox_prompt, TRUST_MODAL, crash, sleep_cut, api_error, raw_shell and
+ * UNSUBMITTED before its working arm, so none of them can be `working`. CI measured that for
+ * the trust modal and for a busy row carrying `Press Enter to continue`: both refused.
+ *
+ * The corrected truth table, with each row marked measured-by-CI or derived, is in
+ * output/REPORT.md.
+ */
+/** r7 m2/m3: the one busy reason the LIVE probe can produce, and therefore the only one
+ *  admitted. A verdict carrying any other spelling did not come from a live current viewport
+ *  (or carries no composer guarantee), and is left to the readiness wait. */
+const BOUND_BUSY_REASON = "current-busy-or-modal";
+/** r7 m4: the tracker families that MAY be given input — an allow-list, so an unknown
+ *  (future) class is refused by default instead of admitted. Equivalent today to r6's
+ *  exclusion `∉ {welcome, error}`, since the probe emits exactly these five classes. */
+const BOUND_TRACKER_ADMITTED = new Set(["blank", "active", "prompt_observed"]);
+
+/**
+ * Only a NON-SPAWNED `--target` whose current state is qualified busy may take the
+ * bound path, and it takes it at once: a fresh spawn, a modal, an unsubmitted
+ * composer, an unknown surface, a probe error and a missing verdict all stay exactly
+ * as fail-closed as before, through the untouched readiness wait.
+ *
+ * Returns a null binding to leave that wait in charge. A session that IS qualified busy
+ * but cannot carry a bound send is refused BY NAME right here — before beginDelivery,
+ * with zero input effect of any kind.
+ */
+function admitBoundBusy(o: Opts, sid: string): BusyAdmission {
+  const startedAt = nowMs();
+  if (o.spawn || !o.target || o.retryUnknown) return { bound: null, cliKind: "", probe: null, startedAt, probed: false };
+  // r1 m2: no listing of our own for the CLI kind. resolveRoute has just resolved this very
+  // sid's wrapped CLI through cliOf() — the same `telepty list --json` row, the same
+  // cliKindOf() resolution — so asking again would only duplicate it.
+  const cliKind = o.cli && o.cli !== "unknown" ? o.cli : "";
+  if (!cliKind) return { bound: null, cliKind: "", probe: null, startedAt, probed: false };
+  // r4 m-D: the SAME per-probe ceiling waitForReady's own first iteration would use, codex
+  // rule included, so no CLI kind's first readiness probe gets a shorter budget than in base;
+  // r4 m-C anchors the readiness deadline at `startedAt`, so the total stays --timeout-ms.
+  const budget = readinessTimeout(o, cliKind);
+  const p = probeState(sid, cliKind, Math.max(1, Math.min(READINESS_CAPTURE_MAX_MS, budget)));
+  const measured: BusyAdmission = { bound: null, cliKind, probe: p, startedAt, probed: true };
+  // The three facts above, in the cheapest order. `ready` must be false: a ready session is
+  // the legacy path's business, and the bound path is only for a session that cannot accept
+  // a new task through the composer.
+  if (p === null || !p.alive || p.probeError || p.ready || p.surface !== "working"
+    || p.readyReason !== BOUND_BUSY_REASON || !BOUND_TRACKER_ADMITTED.has(p.trackerClass)) return measured;
+  // Only NOW is one snapshot read worth taking: this session is qualified busy, so the
+  // binding is about to be used. An unreadable listing leaves the readiness wait in charge
+  // (the pre-feature behaviour for a busy target), rather than inventing a capability refusal.
+  const snap = boundSnapshot(sid);
+  if (!snap || !snap.cliKind) return measured;
+  const refuse = (why: string): never =>
+    die(`dispatch.sh: BOUND_INJECT_UNSUPPORTED for ${sid} — ${why}. Nothing was transported`, 78);
+  if (snap.host !== BOUND_LOOPBACK) {
+    refuse(`${BOUND_VERB} is ${BOUND_LOOPBACK}-only and this session is listed on host ${printable(snap.host || "unknown")}`);
+  }
+  if (!o.fromId) refuse(`${BOUND_VERB} requires an explicit --from sender`);
+  if (!boundedToken(snap.epoch) || !boundedToken(snap.ownerGeneration)) {
+    refuse(`the snapshot published no usable session_epoch/owner_generation to bind ${BOUND_VERB} to`);
+  }
+  if (snap.busyInput !== "supported") {
+    refuse(`the bridge does not declare ${BOUND_CAPABILITY} for the current owner generation ` +
+      `(transport.busy_input=${printable(snap.busyInput || "absent")}), so a busy worker cannot be given input`);
+  }
+  if (!boundVerbAdvertised()) {
+    refuse(`the local telepty CLI does not advertise ${BOUND_VERB} in boot-capabilities ` +
+      "(an unknown verb's help text and exit 0 is not support)");
+  }
+  return { bound: { epoch: snap.epoch, ownerGeneration: snap.ownerGeneration, busyInput: snap.busyInput },
+    cliKind, probe: p, startedAt, probed: true };
+}
+
+/**
+ * The frozen argv, complete and verbatim:
+ *   telepty inject-bound-v1 --from F --expected-epoch E --expected-owner-generation G -- SID PROMPT
+ * ONE send. No retry, no redelivery, no second submit, no legacy fallback and no key
+ * write — win, lose or unknown. stdout is tee'd (the operator watches the dispatch
+ * land, exactly as the legacy inject does) and kept for the daemon's closed answer.
+ */
+function injectBound(o: Opts, d: Delivery, sid: string, b: BoundBinding): Promise<{ rc: number; out: string }> {
+  const a = [BOUND_VERB, "--from", o.fromId, "--expected-epoch", b.epoch,
+    "--expected-owner-generation", b.ownerGeneration, "--", sid, d.refPrompt];
+  return new Promise((resolve) => {
+    let out = "";
+    const child = (process.platform === "win32" ? crossSpawn : spawn)(TELEPTY, a, { stdio: ["inherit", "pipe", "inherit"] });
+    child.stdout!.on("data", (chunk: Buffer) => {
+      out += chunk.toString();
+      process.stdout.write(chunk);
+    });
+    const finish = (rc: number) => {
+      if (d.tmpRef) rmTemp(d.tmpRef);
+      resolve({ rc, out });
+    };
+    child.on("error", () => finish(127));
+    child.on("close", (code) => finish(code ?? 1));
+  });
+}
+
+/**
+ * The verb's answer. It prints one bounded envelope `{transport, reason, result}` whose
+ * `result` is the daemon's closed object verbatim; a bare closed object is read too, so
+ * this binds the FACT rather than one wrapper's spelling. Every field is re-bounded here.
+ *
+ * A lost, truncated or non-schema answer yields no result, which is `outcome_unknown` —
+ * it is NEVER read as zero bytes. Zero is authoritative only where the answer itself
+ * proves it: a local/host refusal that opened no socket, the schema-less 404 that proves
+ * the route is unregistered, or a closed `refused` result reporting 0.
+ */
+function parseBoundAnswer(out: string): { transport: string; cliReason: string | null; result: BoundResult | null } {
+  const bounded = (value: unknown, allowed: Set<string>): string =>
+    typeof value === "string" && allowed.has(value) ? value : "unknown";
+  const token = (value: unknown): string | null => (boundedToken(value) ? value as string : null);
+  const reasonCode = (value: unknown): string | null =>
+    typeof value === "string" && BOUND_REASON.test(value) ? value : null;
+  for (const line of out.replace(/\r/g, "").split("\n").reverse()) {
+    if (!line.trim()) continue;
+    let doc: unknown;
+    try { doc = JSON.parse(line); } catch { continue; }
+    if (doc === null || typeof doc !== "object") continue;
+    const envelope = doc as Record<string, unknown>;
+    // r1 M1: the raw value decides only whether this line IS the verb's answer; what travels
+    // onward — into the decision and into the durable observation — is the bounded one.
+    const raw = typeof envelope.transport === "string" ? envelope.transport : "";
+    const transport = raw === "" || BOUND_TRANSPORTS.has(raw) ? raw : "unknown";
+    const body: Record<string, unknown> = envelope.result !== null && typeof envelope.result === "object"
+      ? envelope.result as Record<string, unknown> : envelope;
+    const result: BoundResult | null = body.schema === BOUND_RESULT_SCHEMA ? {
+      stage: bounded(body.stage, BOUND_RESULT_STAGES),
+      reason: typeof body.reason === "string" && BOUND_REASON.test(body.reason) ? body.reason : null,
+      injectId: token(body.inject_id),
+      // r1 M2: the daemon reports its OWN current identity on every stage
+      // (session-actions.js:1890-1899), so these are facts to check the pin against, not
+      // echoes of the request. Absent/unbounded reads as null = "not asserted".
+      sessionId: token(body.session_id),
+      sessionEpoch: token(body.session_epoch),
+      ownerGeneration: token(body.owner_generation),
+      bodyStage: bounded(body.body_stage, BOUND_FRAME_STAGES),
+      submitStage: bounded(body.submit_stage, BOUND_FRAME_STAGES),
+      // r4 m-B (same family): a zero is read as zero only where a zero can be authoritative.
+      // An `accepted` stage means both frames were handed over, so a 0 beside it contradicts
+      // itself — the daemon's own builder nulls the count the moment a body may exist
+      // (bound-inject.js:126). A contradicting field is degraded, never believed.
+      bytesWritten: body.bytes_written === 0 && body.stage !== "accepted" ? 0 : null,
+    } : null;
+    if (raw === "" && result === null) continue; // not this verb's line
+    // r2: the envelope's own bounded reason code, which for every shape WITHOUT a closed
+    // result is the only cause available (inject-bound-v1.js:91,98,116,120). Read from the
+    // envelope, never from the closed body, so the two reasons stay distinguishable.
+    return { transport, cliReason: reasonCode(envelope.reason), result };
+  }
+  return { transport: "", cliReason: null, result: null };
+}
+
+/**
+ * ONE exact bounded structured observation: schema, binding, inject_id and both frame
+ * stages. The registry already accepts an arbitrary `observe --kind … --json {…}`, so
+ * no registry or schema expansion is involved — and none would be authorized merely to
+ * relabel a hand-off. `write_observed` is deliberately absent: only matching body+CR
+ * PTY receipts could justify that word, and this answer is not one.
+ *
+ * r2: every field is nested under ONE `bound` object, and that nesting is load-bearing,
+ * not cosmetic. `append_observation` stores only the fields whose value is not None
+ * (`bin/dispatch-registry.py:513-516`, `if v is not None`), so a TOP-LEVEL `null` is
+ * dropped and the key is simply absent from the durable record. For this unit that is a
+ * correctness defect, not an aesthetic one: a reader of `bytes_written` that defaults an
+ * absent key to 0 — `obs.get("bytes_written", 0)`, `Number(obs.bytes_written ?? 0)` —
+ * would read "nothing was written" for a lost answer and for an accepted hand-off, which
+ * is exactly the inference the frozen contract forbids ("never infer zero from a
+ * timeout/lost response/queued frame"). The same filter was silently erasing `schema`,
+ * `reason`, `reported` and `inject_id` on the shapes where each is legitimately null.
+ * Inside a nested object nothing is filtered, so every explicit null survives verbatim;
+ * the registry itself is untouched (its filter is shared by every other observation kind).
+ */
+function recordBoundObservation(sid: string, b: BoundBinding,
+  answer: { transport: string; cliReason: string | null; result: BoundResult | null },
+  rc: number, verdict: string): void {
+  const r = answer.result;
+  // r4 m-B: the same rule as the decision above — these two words are read only when the
+  // daemon sent no closed result, so a contradicting envelope can neither free a ref nor
+  // record a zero for a body the result says was accepted.
+  const provenUnsent = r === null
+    && (answer.transport === "refused_locally" || answer.transport === "unsupported");
+  const bound = {
+    verb: BOUND_VERB,
+    schema: r === null ? null : BOUND_RESULT_SCHEMA,
+    stage: r !== null ? r.stage : provenUnsent ? "refused" : "unknown",
+    transport: answer.transport || null,
+    reason: r === null ? null : r.reason,
+    // The caller's pin, and (r1 M2) what the daemon itself said the answer was about, kept
+    // apart: the first is an assumption, the second is the fact that was checked against it.
+    // r6: exactly the three keys the contract's "exact bounded structured observation" names.
+    // r4 recorded a fourth (`cli`) to close note n-A, which asked only that the then-dead
+    // BoundBinding.cliKind be dropped OR used — no finding required a wider RECORD, and three
+    // deepStrictEqual assertions measured the narrow shape. n-A is closed by removing the
+    // field from BoundBinding instead (its interface and its one literal).
+    binding: { session_epoch: b.epoch, owner_generation: b.ownerGeneration, busy_input: b.busyInput },
+    reported: r === null ? null
+      : { session_id: r.sessionId, session_epoch: r.sessionEpoch, owner_generation: r.ownerGeneration },
+    verdict,
+    inject_id: r === null ? null : r.injectId,
+    body_stage: r === null ? "unknown" : r.bodyStage,
+    submit_stage: r === null ? "unknown" : r.submitStage,
+    // r1 n1: zero is authoritative for the two shapes that prove no socket was opened and no
+    // route existed; it stays null everywhere a body may already exist.
+    bytes_written: r !== null ? r.bytesWritten : provenUnsent ? 0 : null,
+    consumption: "unknown",
+    cli_exit: rc,
+    // r2: the verb's OWN bounded reason code, which is the only reason a shape without a
+    // closed result carries (`response_unavailable`, `response_unparseable`,
+    // `route_unsupported`, or an argv/host refusal code). Without it a lost or locally
+    // refused delivery left no diagnosable cause in the record at all.
+    cli_reason: answer.cliReason,
+  };
+  if (registryQuiet(["observe", "--sid", sid, "--kind", "bound_inject_result", "--json", JSON.stringify({ bound })]) !== 0) {
+    process.stderr.write(`dispatch.sh: WARNING the bound-inject observation for ${sid} could not be recorded ` +
+      "(the transport result itself still is)\n");
+  }
+}
+
+/**
+ * The one bound send and everything that may follow it. Exits; never returns.
+ *
+ * An accepted hand-off is recorded as transport `unknown` plus the observation above and
+ * reported as ACCEPTED_PENDING — a queued body is not a dispatched-and-verified worker,
+ * so this path never prints the delivered line and never prints VERIFIED. A refusal the
+ * answer proves unsent frees the ref to be re-dispatched; anything else is HELD unknown,
+ * which is what prevents a replay of an identity whose fate nobody can answer for.
+ */
+async function completeBoundDelivery(o: Opts, d: Delivery, sid: string, b: BoundBinding): Promise<never> {
+  const sent = await injectBound(o, d, sid, b);
+  const answer = parseBoundAnswer(sent.out);
+  const r = answer.result;
+  // r1 M2 — the answer must be ABOUT what was pinned, and the two identity axes are NOT the
+  // same question:
+  //  • session_id is reported verbatim as the requested id on every stage
+  //    (session-actions.js:1894), so a different one means this answer is about another
+  //    session. That is a mix-up: never accepted, and never "provably unsent" either,
+  //    because nothing it says about bytes is about OUR body.
+  //  • session_epoch / owner_generation carry the DAEMON's CURRENT values (:1895-1896,
+  //    deliberately "never the values the request claimed"). Equality is therefore required
+  //    to ACCEPT, but a difference on a refusal is the normal, informative epoch_mismatch /
+  //    owner_generation_mismatch answer (:1939-1940) — which is refused pre-effect, so it
+  //    must stay re-dispatchable rather than being held forever.
+  const otherSession = r !== null && r.sessionId !== null && r.sessionId !== sid;
+  // r4 M-C: "the daemon never said which binding this was" is a different fact from "the
+  // binding moved", and only the second is evidence about the pin. Root measured that the
+  // route passes its current sessionEpoch/interactionOwnerGeneration into boundResult on
+  // EVERY stage, so a null here means the session itself had no epoch — not a moved owner.
+  const bindingAsserted = r !== null && r.sessionEpoch !== null && r.ownerGeneration !== null;
+  const samePin = bindingAsserted && r !== null && r.sessionId === sid && r.sessionEpoch === b.epoch
+    && r.ownerGeneration === b.ownerGeneration;
+  const accepted = sent.rc === 0 && r !== null && r.stage === "accepted" && samePin
+    && (answer.transport === "" || answer.transport === "accepted");
+  // r4 m-B: a closed result OUTRANKS the envelope's transport word. The word is the CLI's
+  // own classification of the answer; if the daemon sent a closed object, that object is the
+  // answer, and `{transport:"refused_locally", result:{stage:"accepted"}}` must never free a
+  // ref whose body was accepted. The two pre-daemon words are read ONLY when there is no
+  // closed result at all.
+  const unsent = !accepted && !otherSession && (r !== null
+    ? (r.stage === "refused" && r.bytesWritten === 0)
+    : (answer.transport === "refused_locally" || answer.transport === "unsupported"));
+  // The named reason this verdict carries into the record and into the operator line. r2:
+  // a shape with no closed result now names the verb's OWN reason code too — `reason=
+  // outcome_unknown` was a restatement of the transport, not a cause an operator can act on.
+  const why = otherSession ? "bound_session_identity_mismatch"
+    : r === null ? [answer.transport || "none", answer.cliReason].filter((p) => p !== null).join(":")
+      : r.stage === "accepted" && !bindingAsserted ? "bound_binding_not_asserted"
+        : r.stage === "accepted" && !samePin ? "bound_binding_identity_mismatch"
+          : r.reason !== null ? r.reason : r.stage;
+  d.transportInjectId = r === null || r.injectId === null ? "" : r.injectId;
+  recordBoundObservation(sid, b, answer, sent.rc, accepted ? "accepted" : unsent ? "proven_unsent" : `held:${why}`);
+  if (unsent) {
+    if (recordTransport(d, sid, "not_delivered") !== 0) {
+      die(`dispatch.sh: DELIVERY_UNKNOWN for ${sid} — ${BOUND_VERB} refused with nothing written, but that result ` +
+        "could not be recorded", 7);
+    }
+    die(`dispatch.sh: BOUND_INJECT_REFUSED for ${sid} — ${BOUND_VERB} refused before any input reached the composer ` +
+      `(reason=${printable(why)}); nothing was written, so this ref may be dispatched again`, 3);
+  }
+  if (recordTransport(d, sid, "unknown") !== 0) {
+    die(`dispatch.sh: DELIVERY_UNKNOWN for ${sid} — the bound body may have been handed over but the transport ` +
+      "result could not be recorded", 7);
+  }
+  if (!accepted) {
+    die(`dispatch.sh: DELIVERY_UNKNOWN for ${sid} — ${BOUND_VERB} did not answer accepted ` +
+      `(exit ${sent.rc}, transport=${printable(answer.transport || "none")}, ` +
+      `stage=${printable(r === null ? "none" : r.stage)}, reason=${printable(why)}). Input may have been queued or ` +
+      "written, so this identity is HELD: no replay, no Enter, review before retrying", 7);
+  }
+  taskLedgerUpdate(o, sid);
+  emitTelemetry([
+    "--helper", "dispatch",
+    "--subtype", "dispatch_ack",
+    "--payload-json", JSON.stringify({ target_sid: sid, verified: false, bound: true, stage: "accepted" }),
+    "--correlation-id", sid,
+  ]);
+  if (o.verifyDelivered) {
+    // A body that is queued behind a running turn is not on the screen yet, so the
+    // post-inject screen read can neither corroborate nor refute it. It is skipped and
+    // named, rather than answered wrongly in either direction (r1 m4: the NOTE says so in
+    // as many words, because exit 0 here is the accepted-pending decision and must not be
+    // mistaken for a screen that was read and found good).
+    process.stderr.write(`dispatch.sh: NOTE delivery verification was NOT performed for ${sid}: --verify-delivered ` +
+      "is a declared no-op on the bound busy path — a queued body is not visible on the screen, so no screen read " +
+      "was attempted and nothing corroborates the hand-off. The record stays transport unknown\n");
+  }
+  // Accepted-pending-model, reported apart from started-working on purpose.
+  // r4 n-B: daemon-supplied values reach the operator stream only through printable(), as
+  // every sibling message in this file already does.
+  process.stdout.write(`ACCEPTED_PENDING ${sid} — ${BOUND_VERB} accepted the bound body+CR for the pinned owner ` +
+    `(epoch=${printable(b.epoch)} owner_generation=${printable(b.ownerGeneration)} ` +
+    `inject_id=${printable(d.transportInjectId || "none")}); ` +
+    "recorded transport unknown. A hand-off to the owner bridge is not a PTY write, not native queueing and not " +
+    "model receipt\n");
+  if (o.verifyStarted && isExecutable(VERIFY_SH)) {
+    // Observe-only: a busy-admitted delivery must never be followed by a bare Enter or a
+    // marker-triggered resubmit, and a spinner that may predate this body is not a receipt
+    // for it. Legitimate idle recovery keeps its policy-controlled --resubmit path in the
+    // legacy tail; this one observes and reports, and sends nothing.
+    const vrc = run(VERIFY_SH, [sid, "--observe-only"], { TELEPTY });
+    // r1 n4: an installed verifier that predates this flag answers its `-*` catch-all with
+    // exit 4 (unknown arg). That is a SKIPPED observation, not a bad one, and it must not be
+    // indistinguishable from a SUSPECT verdict in the record of what happened.
+    if (vrc === 4) {
+      process.stderr.write(`dispatch.sh: NOTE ${VERIFY_SH} does not understand --observe-only (exit 4), so ` +
+        `started-working observation was SKIPPED for ${sid}; the accepted hand-off stands unchanged and no key ` +
+        "was sent. Deploy bin/dispatch-verify.sh together with this cli.js\n");
+    }
+    emitTelemetry([
+      "--helper", "dispatch",
+      "--subtype", "dispatch_started_check",
+      "--payload-json", JSON.stringify({ target_sid: sid, started: false, observe_only: true,
+        observed: vrc === 0, verifier_rc: vrc, skipped: vrc === 4 }),
+      "--correlation-id", sid,
+    ]);
+  }
+  process.exit(0);
 }
 
 /**
@@ -1179,8 +1754,13 @@ function beginDelivery(o: Opts, d: Delivery, sid: string): { status: number; std
  * #727: presence wait, kept separate from waitForReady's REPL-ready wait
  * (telepty#18). Registration = "the bridge has published the session"; ready =
  * "its REPL is past the boot screen". Returns the wrapped CLI kind, or null.
+ *
+ * r4 m-E: it also reports whether it SLEPT before answering. A readiness verdict measured
+ * before this wait cannot be that wait's answer, and only this function knows whether any
+ * time passed (the --target default timeout is 0, but
+ * AIGENTRY_DISPATCH_REGISTER_TIMEOUT_MS can make --target wait too).
  */
-async function waitForRegistration(o: Opts, sid: string): Promise<string | null> {
+async function waitForRegistration(o: Opts, sid: string): Promise<{ kind: string; slept: boolean } | null> {
   let timeout: number;
   const knob = env.AIGENTRY_DISPATCH_REGISTER_TIMEOUT_MS;
   if (knob === undefined || knob === "") {
@@ -1194,9 +1774,10 @@ async function waitForRegistration(o: Opts, sid: string): Promise<string | null>
   const start = nowMs();
   const deadline = start + timeout;
   let notes = 0;
+  let slept = false;
   for (;;) {
     const kind = cliOf(sid);
-    if (kind) return kind;
+    if (kind) return { kind, slept };
     const now = nowMs();
     if (now >= deadline) {
       process.stderr.write(
@@ -1215,24 +1796,61 @@ async function waitForRegistration(o: Opts, sid: string): Promise<string | null>
       process.stderr.write(`dispatch.sh: waiting for session registration… ${elapsed}s\n`);
     }
     // Cap the nap at what is left so the knob's value is also the worst-case wait.
+    slept = true;
     await sleepMs(Math.min(deadline - now, 5000));
   }
 }
 
-/** 0 ok, 1 ready-timeout, 6 never registered. */
-async function waitForReady(o: Opts, sid: string): Promise<number> {
-  const cliKind = await waitForRegistration(o, sid);
-  if (cliKind === null) return 6;
-  let effectiveTimeout = o.timeoutMs;
-  // #557: codex reaches its interactive `›` REPL within seconds, but its 6 MCP
-  // servers can take >30s to finish booting. Give codex a longer default
-  // ceiling (claude/gemini unchanged). An explicit --timeout-ms always wins.
-  if (cliKind === "codex" && !o.timeoutExplicit) {
-    effectiveTimeout = Number(env.AIGENTRY_CODEX_READY_TIMEOUT_MS || 90000);
-  }
-  const deadline = nowMs() + effectiveTimeout;
+/**
+ * The readiness budget for one dispatch, by CLI kind. Extracted verbatim from waitForReady
+ * (r4 m-D) so the busy admission's single probe is bounded by exactly the same number the
+ * wait's own first iteration would use — including #557's codex ceiling — instead of a
+ * second, shorter rule of its own.
+ *
+ * #557: codex reaches its interactive `›` REPL within seconds, but its 6 MCP servers can
+ * take >30s to finish booting. Give codex a longer default ceiling (claude/gemini
+ * unchanged). An explicit --timeout-ms always wins.
+ */
+function readinessTimeout(o: Opts, cliKind: string): number {
+  if (cliKind === "codex" && !o.timeoutExplicit) return Number(env.AIGENTRY_CODEX_READY_TIMEOUT_MS || 90000);
+  return o.timeoutMs;
+}
+
+/**
+ * 0 ok, 1 ready-timeout, 6 never registered.
+ *
+ * `measured` (r1 m2) is the verdict the busy admission already read for this sid. When it
+ * belongs to the same CLI kind this loop is about to probe AND the registration wait did not
+ * sleep (r4 m-E — a verdict measured before a wait is not that wait's answer), it IS this
+ * loop's first verdict, so the unchanged idle path performs exactly the one probe it always
+ * did. Every later iteration probes afresh; a kind mismatch, a slept registration wait or an
+ * absent admission reuses nothing.
+ *
+ * r4 m-C / r7 m9: the deadline is anchored at the admission's own start whenever an admission
+ * probe RAN, so the time it spent comes OUT of this budget rather than being added to it. r4
+ * anchored only on the reuse path, which left the overrun m-C named in the two cases where a
+ * verdict is measured and then NOT reused — an explicit `--cli` disagreeing with the listing,
+ * and a registration wait that slept. The probe precedes this wait in all three cases, so the
+ * anchor is a property of having probed, not of reusing the answer.
+ */
+async function waitForReady(o: Opts, sid: string, measured?: BusyAdmission): Promise<number> {
+  const registration = await waitForRegistration(o, sid);
+  if (registration === null) return 6;
+  const cliKind = registration.kind;
+  let reused: ProbeState | null | undefined =
+    measured !== undefined && measured.cliKind === cliKind && !registration.slept ? measured.probe : undefined;
+  const effectiveTimeout = readinessTimeout(o, cliKind);
+  const anchored = measured !== undefined && measured.probed;
+  const deadline = (anchored ? measured!.startedAt : nowMs()) + effectiveTimeout;
   for (;;) {
-    if (isReady(sid, cliKind)) return 0;
+    let ready: boolean;
+    if (reused !== undefined) {
+      ready = reused !== null && reused.ready;
+      reused = undefined;
+    } else {
+      ready = isReady(sid, cliKind, Math.max(1, Math.min(READINESS_CAPTURE_MAX_MS, deadline - nowMs())));
+    }
+    if (ready) return 0;
     if (nowMs() >= deadline) {
       process.stderr.write(
         `dispatch.sh: timeout (${effectiveTimeout}ms) waiting for ${sid} REPL ready (cli=${cliKind})\n`,
@@ -1429,14 +2047,23 @@ async function main(argv: string[]): Promise<never> {
     "--correlation-id", sid,
   ]);
 
+  let bound: BoundBinding | null = null;
   if (!skipPreparation) {
-    // #727: a registration/readiness timeout leaves nothing behind but the
-    // workspace itself. No dedup mark is written any more, so the operator's
-    // retry with the same ref reaches the delivery transaction.
-    const rc = await waitForReady(o, sid);
-    if (rc !== 0) process.exit(rc);
-    // #1162 G2b: after readiness, publish the sealed worker's metadata once.
-    if (spawned) publishAgentMeta(sid, o.cli, path.join(env.AIGENTRY_SESSIONS_ROOT || path.join(os.homedir(), ".aigentry", "sessions"), sid));
+    // #1270: a qualified current-busy nonspawned --target is admitted AT ONCE, because
+    // its REPL will never show the idle, empty composer the wait below requires. Every
+    // other not-ready state — and every fresh spawn — still goes through that wait.
+    const admission = admitBoundBusy(o, sid);
+    bound = admission.bound;
+    if (!bound) {
+      // #727: a registration/readiness timeout leaves nothing behind but the
+      // workspace itself. No dedup mark is written any more, so the operator's
+      // retry with the same ref reaches the delivery transaction.
+      // r1 m2: the admission's one probe is this wait's first verdict, not an extra read.
+      const rc = await waitForReady(o, sid, admission);
+      if (rc !== 0) process.exit(rc);
+      // #1162 G2b: after readiness, publish the sealed worker's metadata once.
+      if (spawned) publishAgentMeta(sid, o.cli, path.join(env.AIGENTRY_SESSIONS_ROOT || path.join(os.homedir(), ".aigentry", "sessions"), sid));
+    }
     if (!prepareEffectiveRef(o, d)) process.exit(3);
     const stage = path.join(env.AIGENTRY_SESSIONS_ROOT || path.join(os.homedir(), ".aigentry", "sessions"), sid);
     // #1170: mint the envelope and put its trailer in the ref BEFORE staging, so it lands
@@ -1500,6 +2127,10 @@ async function main(argv: string[]): Promise<never> {
   if (!d.refPrompt) {
     die(`dispatch.sh: SANDBOX_REF_UNSTAGED for ${sid} — no confined ref was staged; refusing a host-rooted ref. Nothing was transported`, 78);
   }
+
+  // #1270: the busy-admitted delivery hands over through the bound verb instead, after
+  // exactly the same pin/stage/re-pin/beginDelivery ordering. It never returns.
+  if (bound) await completeBoundDelivery(o, d, sid, bound);
 
   if ((await inject(o, d, sid)) !== 0) {
     process.stderr.write(`dispatch.sh: telepty inject failed for ${sid}\n`);
@@ -1579,8 +2210,10 @@ async function main(argv: string[]): Promise<never> {
 async function probe(argv: string[]): Promise<never> {
   const sub = argv[0];
   if (sub === "is-ready") {
-    // __probe is-ready <sid> <cli>
-    process.exit(isReady(argv[1] ?? "", argv[2] ?? "") ? 0 : 1);
+    // __probe is-ready <sid> <cli> [budget-ms]
+    const budget = argv[3] === undefined ? READINESS_CAPTURE_MAX_MS : Number(argv[3]);
+    if (!Number.isSafeInteger(budget) || budget < 1 || budget > READINESS_CAPTURE_MAX_MS) die("dispatch.sh: invalid readiness probe budget", 4);
+    process.exit(isReady(argv[1] ?? "", argv[2] ?? "", budget) ? 0 : 1);
   }
   if (sub === "verify-delivered") {
     // __probe verify-delivered --ref <file> <sid> → 0 landed / 1 did not / 2 unknown
