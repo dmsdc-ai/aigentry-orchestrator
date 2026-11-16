@@ -1,0 +1,21 @@
+# task1270 diagnostic: caller-side RED for bound busy delivery. Runs ONE test file.
+# Expected to FAIL on intended-behaviour assertions until the caller GREEN lands.
+name: caller-bound-red-1270
+on:
+  push:
+    branches: [ 'diagnostic/1270-caller-bound-red-20261116' ]
+permissions:
+  contents: read
+jobs:
+  red:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.0'
+      - run: npm ci --ignore-scripts
+      - run: npx tsc -p .
+      - name: RED run (one file)
+        run: node --test --test-reporter=tap dist/tests/dispatch/busy-bound-inject.test.js
