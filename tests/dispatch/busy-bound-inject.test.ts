@@ -1938,12 +1938,12 @@ describe("1270(x) an accepted hand-off and an ordinary refusal print NO strand b
     ["refused: interaction_held", refusedEnv("interaction_held"), 3],
     ["schema-less 404 (nothing was sent)", unsupportedEnv(), 3],
     ["pre-socket local refusal", refusedLocallyEnv("non_canonical_daemon_host"), 3],
-    // The ONE outcome_unknown the daemon does NOT strand on (delivery-runtime.js:1389-1391):
-    // the body write itself was uncertain, so no record was installed. It stays HELD, as before,
-    // and claiming "no input is admitted" would state a refusal the daemon never made.
-    ["outcome_unknown: body_outcome_unknown", envelope("outcome_unknown", "body_outcome_unknown", 500,
-      closed({ stage: "outcome_unknown", reason: "body_outcome_unknown", inject_id: STRAND_ID,
-        body_stage: "unknown", submit_stage: "not_sent", bytes_written: null }), 3), 7],
+    // r1 CSR3-M1 — ONE row was removed from this table: `outcome_unknown: body_outcome_unknown`,
+    // which asserted that NO block is printed, because the daemon of this unit's inputs installs
+    // no record on an uncertain body write (delivery-runtime.js:1389-1391). Root is changing the
+    // daemon so that answer DOES strand, so that expectation reverses: the row moved to 1270(y)
+    // below, where it asserts the block, the HELD wording and the "may be empty" line. Every
+    // other row here, and every assertion in the loop, is unchanged.
   ];
 
   for (const [name, answer, status] of quiet) {
@@ -1961,4 +1961,190 @@ describe("1270(x) an accepted hand-off and an ordinary refusal print NO strand b
       } finally { f.cleanup(); }
     });
   }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// r1 ADDITIONS (Root review round 1). Everything above is unchanged except ONE removed row in
+// 1270(x) (the expectation Root's CSR3-M1 decision reverses — see the comment in its place), and
+// lines 1-1552 are still byte-identical to the phase-0 RED file.
+//   CSR3-M1 — an uncertain BODY write strands too, after the daemon change Root decided. The
+//             answer is an `outcome_unknown` whose reason is `body_outcome_unknown`, and the
+//             record it installs does NOT mean the text arrived: the block must say the composer
+//             may be empty. Driven by the production TABLE (cli.ts:1587-1599), so these cases
+//             also pin the table's `false` rows against its `true` rows.
+//   CSR3-m2 — only a FOREIGN-identity answer forces the pin; a same-session assumed answer uses
+//             the daemon's reported owner_generation.
+//   CSR3-m1 — the lookup hint's `null` wording.
+//   CSR3-n3 — the clear's own refusals, named in the block.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * The uncertain-BODY answer, with the daemon CLI's real envelope for it: the delivery returns
+ * `{stage:'outcome_unknown', reason:'body_outcome_unknown', bodyStage:'unknown',
+ * submitStage:'not_sent', bytesWritten:null}` (delivery-runtime.js:1389-1391), the route adds its
+ * own identity and schema through the ONE builder (bound-inject.js:108-131), and the strict CLI
+ * prints it as `{transport:'outcome_unknown', reason, http_status, result}` with EXIT.unknown = 3
+ * (inject-bound-v1.js:119-125). After CSR3-M1 the same branch also calls `strandIdentity`, so the
+ * reason names a record; the envelope on the wire is unchanged by that.
+ */
+const bodyUncertainEnv = (over: Partial<Closed> = {}): R1Answer =>
+  envelope("outcome_unknown", "body_outcome_unknown", 500, closed({ stage: "outcome_unknown",
+    reason: "body_outcome_unknown", inject_id: STRAND_ID, body_stage: "unknown",
+    submit_stage: "not_sent", bytes_written: null, ...over }), 3);
+
+/**
+ * An `outcome_unknown` about OUR session whose reason the table does not list: the route's own
+ * code for a delivery that threw (`delivery_threw`, in the daemon's allow-list at
+ * bound-inject.js:53). The route file is not in this unit's inputs, which is exactly why this
+ * answer is ASSUMED stranded rather than `recorded` — and why its reported owner_generation is
+ * still OUR session's current one.
+ */
+const threwEnv = (over: Partial<Closed> = {}): R1Answer =>
+  envelope("outcome_unknown", "delivery_threw", 500, closed({ stage: "outcome_unknown",
+    reason: "delivery_threw", inject_id: STRAND_ID, body_stage: "unknown",
+    submit_stage: "not_sent", bytes_written: null, ...over }), 3);
+
+/** The CSR3-M1 line: the record exists, the text may not. */
+const MAY_BE_EMPTY = "  the body MAY be in the composer — the write was uncertain, so an empty composer is possible.";
+
+// ── (y) CSR3-M1: an uncertain body write is a reported strand whose composer may be empty ──
+describe("1270(y) r1/CSR3-M1 an uncertain BODY write is reported, HELD, and says the composer may be empty", () => {
+  test("body_outcome_unknown: the block, the HELD wording, the may-be-empty line, exit 7 unchanged", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      const r = follow(f, armR1(f, bodyUncertainEnv()));
+      // The exit code and the marker are the ones this answer already had in phase 1.
+      assert.equal(r.status, 7, `an unknown outcome is still held at exit 7\n${r.stderr}`);
+      assert.match(r.stderr, /DELIVERY_UNKNOWN/, "and the marker is unchanged");
+      assert.match(r.stderr, /body_outcome_unknown/, "the daemon's reason still travels");
+      // What CSR3-M1 reverses: this used to print nothing at all.
+      assert.match(r.stderr, /^STRANDED: router-fixture — the daemon recorded a stranded composer/m,
+        `after the daemon change this answer names an existing record:\n${r.stderr}`);
+      assert.ok(r.stderr.includes("  my dispatch is HELD and will not be replayed."), r.stderr);
+      assert.doesNotMatch(r.stderr, /provably UNSENT/, "a possibly-written body is not an unsent one");
+      // The honest extra fact: the record is certain, the text is not.
+      assert.ok(r.stderr.includes(MAY_BE_EMPTY),
+        `the block must say the composer may be empty:\n${r.stderr}`);
+      // …and the identity and the command are the ordinary `recorded` ones.
+      assert.equal(strandField(r.stderr, "session_epoch"), EPOCH);
+      assert.equal(strandField(r.stderr, "owner_generation"), OWNGEN);
+      assert.equal(strandField(r.stderr, "stranded_inject_id"), STRAND_ID);
+      assert.match(r.stderr, /reason: body_outcome_unknown/, r.stderr);
+      assert.deepEqual(clearArgv(r.stderr), expectedClearArgv(EPOCH, OWNGEN, STRAND_ID));
+      const row = rows(f)[0]!;
+      assert.equal(row.transport.result, "unknown", "never not_delivered while a body may exist");
+      assert.equal(row.lifecycle.state, "delivery_state_unknown");
+      assert.equal(boundObservation(f).verdict, "held:body_outcome_unknown");
+      assertPrintsOnly(f, r, "body_outcome_unknown");
+    } finally { f.cleanup(); }
+  });
+
+  test("delivery_threw_during_body: the other table row whose body is uncertain says it too", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      // delivery-runtime.js:1429 strands on `bodyAttempted` alone — the write was entered and
+      // never returned (:1322-1332), which is the same uncertainty by a different route.
+      const r = follow(f, armR1(f, strandedEnv("delivery_threw_during_body")));
+      assert.equal(r.status, 7, r.stderr);
+      assert.match(r.stderr, /^STRANDED: /m, r.stderr);
+      assert.ok(r.stderr.includes(MAY_BE_EMPTY), `the table drives this line, not a literal:\n${r.stderr}`);
+      assert.deepEqual(clearArgv(r.stderr), expectedClearArgv(EPOCH, OWNGEN, STRAND_ID));
+      assertPrintsOnly(f, r, "delivery_threw_during_body");
+    } finally { f.cleanup(); }
+  });
+
+  for (const reason of ["submit_refused_after_body", "delivery_threw_after_body"] as const) {
+    test(`${reason}: the body IS there, so the may-be-empty line must NOT be printed`, () => {
+      const f = fixture();
+      try {
+        f.prepareTarget();
+        // The table's `true` rows: the write returned success before the failure
+        // (delivery-runtime.js:1393), so telling the operator the composer may be empty would be
+        // a weaker claim than the daemon's own record supports.
+        const r = follow(f, armR1(f, strandedEnv(reason)));
+        assert.match(r.stderr, /^STRANDED: /m, r.stderr);
+        assert.ok(!r.stderr.includes(MAY_BE_EMPTY),
+          `a handed-over body is not uncertain:\n${r.stderr}`);
+        assert.ok(r.stderr.includes("  my dispatch is HELD and will not be replayed."), r.stderr);
+        assertPrintsOnly(f, r, reason);
+      } finally { f.cleanup(); }
+    });
+  }
+});
+
+// ── (z) CSR3-m2 / m1 / n3: the three accepted minors ────────────────────────
+describe("1270(z) r1 minors: the pin is forced only for a foreign answer, the lookup names `null`, the clear's own refusals", () => {
+  test("CSR3-m2: a SAME-SESSION assumed answer suggests the daemon's reported owner_generation", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      // `delivery_threw` is about OUR session and carries the daemon's CURRENT generation, which a
+      // reclaim has just changed — exactly when the pin is stale and the clear would be refused
+      // 409 owner_generation_mismatch (CLEAR-INTERFACE-V1 §5 step 4.8).
+      const r = follow(f, armR1(f, threwEnv({ owner_generation: RECLAIMED_OWNGEN })));
+      assert.equal(r.status, 7, `unchanged: an unlisted unknown reason is held\n${r.stderr}`);
+      assert.match(r.stderr, /^STRANDED \(ASSUMED\): /m, `and assumed stranded\n${r.stderr}`);
+      assert.equal(strandField(r.stderr, "owner_generation"), RECLAIMED_OWNGEN,
+        `the FRESHER reported value must be suggested, not the pin:\n${r.stderr}`);
+      assert.equal(strandField(r.stderr, "session_epoch"), EPOCH, "the epoch is still the strand's key");
+      assert.deepEqual(clearArgv(r.stderr), expectedClearArgv(EPOCH, RECLAIMED_OWNGEN, "<uuid>"));
+      assertPrintsOnly(f, r, "same-session assumed");
+    } finally { f.cleanup(); }
+  });
+
+  test("CSR3-m2: a FOREIGN-identity answer still forces the pin, in the same shape", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      // The only difference from the case above is WHOSE session the answer names, and that alone
+      // must decide whether the reported generation may be used at all.
+      const r = follow(f, armR1(f, threwEnv({ session_id: "some-other-session",
+        owner_generation: RECLAIMED_OWNGEN })));
+      assert.equal(r.status, 7, r.stderr);
+      assert.match(r.stderr, /^STRANDED \(ASSUMED\): /m, r.stderr);
+      assert.match(r.stderr, /bound_session_identity_mismatch/, "the existing mismatch line stands");
+      assert.equal(strandField(r.stderr, "owner_generation"), OWNGEN,
+        `another session's generation may never be suggested for ours:\n${r.stderr}`);
+      assert.ok(!r.stderr.includes(RECLAIMED_OWNGEN), r.stderr);
+      assert.deepEqual(clearArgv(r.stderr), expectedClearArgv(EPOCH, OWNGEN, "<uuid>"));
+      assertPrintsOnly(f, r, "foreign assumed");
+    } finally { f.cleanup(); }
+  });
+
+  test("CSR3-m1: the lookup hint says a `null` inject_id in the view means the literal `none`", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      // The view always EMITS the key (delivery-runtime.js:1939 `inject_id: strand.inject_id`), so
+      // the operator reads `"inject_id": null` — and passing the string `null` is refused
+      // `stranded_inject_id_invalid` (clear-strand-v1.js:86).
+      const r = follow(f, armR1(f, refusedEnv("composer_stranded", { inject_id: FRESH_ID })));
+      assert.match(r.stderr, LOOKUP_LINE, r.stderr);
+      assert.ok(r.stderr.includes(
+        "        transport.stranded_composer.inject_id (`null` there ⇒ the literal `none`), .reason, .at"),
+      `the hint must name the value the view really shows:\n${r.stderr}`);
+      assert.ok(!r.stderr.includes("absent there"), `the old wording must be gone:\n${r.stderr}`);
+      assertPrintsOnly(f, r, "lookup wording");
+    } finally { f.cleanup(); }
+  });
+
+  test("CSR3-n3: the block names the clear's own refusals and what to do about each", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      // CLEAR-INTERFACE-V1 §5 steps 4.2, 4.3, 4.7 and 4.9 can refuse the very strand this block
+      // describes, and the operator meets them only after pasting the command.
+      const r = follow(f, armR1(f, bodyUncertainEnv()));
+      assert.match(r.stderr, /Refused `session_closing`\/`handoff_active`\?/, r.stderr);
+      assert.match(r.stderr, /wait, re-read the view, and if its epoch has moved the strand is already inert/, r.stderr);
+      assert.match(r.stderr, /Refused\n? *`owner_disconnected`\/`owner_generation_unavailable`\?/, r.stderr);
+      assert.match(r.stderr, /the owner bridge is gone — reconnect it/, r.stderr);
+      // The guidance is prose BETWEEN step 2 and step 3: it may not disturb the pasteable command.
+      assert.deepEqual(clearArgv(r.stderr), expectedClearArgv(EPOCH, OWNGEN, STRAND_ID));
+      assert.match(r.stderr, /  3\. Re-read `telepty session router-fixture`/, r.stderr);
+      assertPrintsOnly(f, r, "clear refusals named");
+    } finally { f.cleanup(); }
+  });
 });
