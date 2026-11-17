@@ -117,7 +117,9 @@ export const USAGE = `# dispatch.sh — Wraps \`telepty inject\` with REPL-ready
 #             receipt. The identity is never re-sent.
 #     exit 3  BOUND_INJECT_REFUSED — the answer PROVES nothing was written (pre-socket local
 #             refusal, unregistered route, or a closed refusal reporting 0 bytes); recorded
-#             not_delivered, so the same ref may be dispatched again.
+#             not_delivered, so the same ref may be dispatched again. For the one refusal that
+#             names an ALREADY stranded instance (\`composer_stranded\`) the re-dispatch only
+#             works after an operator clear, and the STRANDED block below says so.
 #     exit 7  DELIVERY_UNKNOWN — lost, truncated, mismatched-identity or any other
 #             non-accepted answer: input may have been queued or written, so the identity is
 #             HELD for review (no replay, no Enter). --retry-unknown does NOT clear a hold
@@ -125,8 +127,21 @@ export const USAGE = `# dispatch.sh — Wraps \`telepty inject\` with REPL-ready
 #             to the readiness wait and exits 1 having changed nothing. Read the held row
 #             (dispatch-registry.py get) and the worker's screen; once the worker is idle
 #             again the normal --retry-unknown "<reason>" path applies, because an idle
-#             target is delivered by the legacy inject. There is no automatic operator
-#             clear for a stranded composer — that remains an open requirement.
+#             target is delivered by the legacy inject.
+#   Stranded composer: a body that reached the composer whose paired CR did not leaves that
+#   exact session instance STRANDED — the daemon refuses every later body and key from every
+#   producer (\`composer_stranded\`) until an operator clears it. Whenever an answer proves that
+#   (a strand-reason \`outcome_unknown\`, or a \`composer_stranded\` refusal) or leaves it
+#   unknown (a lost, unparseable or foreign-identity answer), a bounded STRANDED block is
+#   written to stderr with the pinned session_epoch, the owner_generation, the
+#   stranded_inject_id (or \`none\`), the reason code and the recovery procedure: empty the
+#   composer at the bridge's own keyboard, then run the printed
+#   \`telepty clear-strand-v1 --from <operator-sid> …\` yourself. Any value the answer does not
+#   carry is printed as a <placeholder> with the read-only \`telepty session <sid>\` lookup that
+#   shows it, never guessed. THIS HELPER NEVER CLEARS: it runs no clear-strand-v1, sends no key,
+#   never retries, replays or takes another input route for a stranded session — it cannot see
+#   the composer, so the assertion a clear records must be a human's. The exit codes and markers
+#   above are unchanged by the block.
 #   --verify-delivered is a declared NO-OP on this path: a queued body is not on the screen,
 #   so no screen read is attempted, a stderr NOTE states that verification was not performed,
 #   and the exit stays 0. Started-working verification runs observe-only
