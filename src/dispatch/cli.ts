@@ -1551,6 +1551,220 @@ function recordBoundObservation(sid: string, b: BoundBinding,
   }
 }
 
+// ── #1270 the stranded composer, reported to the operator (CLEAR-DESIGN.md §7) ──
+//
+// When a bound body reached the composer but its CR did not, the daemon STRANDS that exact
+// session instance: every later body and key from every producer is refused `composer_stranded`
+// until an operator clears it. This helper only REPORTS that. It never runs
+// `clear-strand-v1`, never sends a key, never retries, replays or reaches for another input
+// route, for the three reasons CLEAR-DESIGN.md §7 gives:
+//   1. the helper cannot see the composer, so its clear would be an assertion NOBODY made —
+//      the audit line would name a machine as the asserting party;
+//   2. an automatic clear turns the strand back into the silent corruption it exists to stop:
+//      the next body would append to text that is still there and be submitted as one message;
+//   3. the frozen contract: "No automatic operator-clear or recovery is added", and the
+//      strand's own comment — "This unit refuses honestly; it does not invent a repair"
+//      (telepty src/mailbox/delivery-runtime.js:163-165).
+/**
+ * THE classification table: every reason the DAEMON records a strand for, mapped to what its own
+ * record implies about the BODY. An answer carrying one of these keys PROVES the pinned instance
+ * is stranded; the value decides one printed line, and nothing else.
+ *
+ *   `true`  — the write RETURNED success before the failure, so the text IS in that composer
+ *             (`bodyHanded`, delivery-runtime.js:1393);
+ *   `false` — the write itself never resolved, so the body MAY be there and may not
+ *             (`bodyAttempted` without `bodyHanded`, the distinction :1322-1332 draws).
+ *
+ * Sources, key by key: the four `strand()` returns after the body was handed over
+ * (delivery-runtime.js:1400-1403, called at :1404, :1410, :1415, :1416), which travel to the
+ * caller in the closed result's `reason` beside `stage: "outcome_unknown"` (:1402); the two catch
+ * arms (:1428 after a handed body, :1429 after a bare attempt), which rethrow — so whichever code
+ * the route puts on its 500 is the route's own and is not in this unit's inputs; and
+ * `body_outcome_unknown` (:1389-1391), which is a strand ONLY AFTER the daemon change recorded as
+ * STRAND_NOT_RECORDED below. An unlisted `outcome_unknown` reason is ASSUMED stranded, never
+ * cleared, so a code this table has not met yet still reaches the operator.
+ */
+const STRAND_REASONS = new Map<string, boolean>([
+  ["binding_changed_after_body", true],
+  ["admission_changed_after_body", true],
+  ["submit_refused_after_body", true],
+  ["submit_outcome_unknown", true],
+  ["delivery_threw_after_body", true],
+  ["delivery_threw_during_body", false],
+  // Task 1270 r1, Root decision CSR3-M1: the daemon is changed so that an uncertain BODY write
+  // strands too, with this reason. Before that change the same answer installed no record.
+  ["body_outcome_unknown", false],
+]);
+/**
+ * `boundAdmissionRefusal`'s code for an instance that is ALREADY stranded
+ * (delivery-runtime.js:1215). It is a pre-effect refusal with a provable zero
+ * (`refuse()`, :1268), so the dispatch is unsent — re-dispatchable AFTER a clear, not before.
+ */
+const STRAND_REFUSED = "composer_stranded";
+/**
+ * `outcome_unknown` reasons that install NO strand record, so claiming "no input is admitted"
+ * would state a refusal the daemon never made. EMPTY by Root decision CSR3-M1: the one member it
+ * had, `body_outcome_unknown` (delivery-runtime.js:1389-1391 in the sources this unit was given),
+ * moved into STRAND_REASONS above with `false`. This is the one-line seam back: if the daemon's r6
+ * round does not seal that change, put `"body_outcome_unknown"` here and remove its table row.
+ */
+const STRAND_NOT_RECORDED = new Set<string>([]);
+/** The honest, unverifiable-by-construction basis (clear-strand.js:38; CLEAR-DESIGN.md §2.2). */
+const STRAND_BASIS = "composer_emptied_by_operator";
+/** The literal `clear-strand-v1` accepts for "that strand carried no inject id" (clear-strand-v1.js:45). */
+const STRAND_INJECT_NONE = "none";
+/** The inject-id shape the strand record and the clear verb both bound (bound-inject.js:162,:192). */
+const STRAND_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/**
+ * shellQuote()'s own bare-word class (:135), reused as the paste gate. `boundedToken` bans
+ * control characters but ADMITS `$ ` ` ; ' "` and a space, and the lines below are a command an
+ * operator may paste: a value outside this class is replaced by a placeholder plus the read-only
+ * lookup, so it can never reach a shell. The contract types epoch/generation as OPAQUE, so a
+ * legitimate token can fail this (a space, `·`) — that costs a lookup, never a wrong command.
+ */
+const STRAND_ARGV_SAFE = /^[A-Za-z0-9_@%+=:,./-]+$/;
+
+/** How well this answer knows the pinned instance is stranded, or null when it is not. */
+type StrandKnowledge = "recorded" | "already" | "assumed";
+
+/**
+ * KNOW or ASSUME, decided on the daemon's own vocabulary and never on a guess:
+ *  • `recorded` — the answer names a reason the delivery strands on, so the record exists;
+ *  • `already`  — the answer is the strand's own refusal: nothing was transported;
+ *  • `assumed`  — the outcome is unknown and nothing proves the strand path did NOT run (a lost
+ *    or unparseable answer, the route's 500, an answer about another session). Fail-safe: the
+ *    message says so in as many words and asks the operator to confirm in the view.
+ * An ACCEPTED hand-off, every ordinary pre-effect refusal (`epoch_mismatch`,
+ * `busy_input_unsupported`, …), the two shapes that prove no socket/route
+ * (`refused_locally`/`unsupported`, bound-inject.js:140-142) and the one non-stranding
+ * `outcome_unknown` are NOT strands and print nothing.
+ */
+function strandKnowledge(r: BoundResult | null, transport: string, accepted: boolean,
+  otherSession: boolean): StrandKnowledge | null {
+  if (accepted) return null;
+  // An answer about another id is not about ours: its identity fields may not be printed, and
+  // our own delivery's fate is exactly as unknown as a lost answer's.
+  if (otherSession) return "assumed";
+  if (r === null) return transport === "refused_locally" || transport === "unsupported" ? null : "assumed";
+  // Reason first, stage second: the reason is the daemon's own name for the branch it took, and
+  // the table is the only thing that decides whether that branch records a strand.
+  if (r.reason !== null && STRAND_REASONS.has(r.reason)) return "recorded";
+  if (r.reason === STRAND_REFUSED) return "already";
+  if (r.stage !== "outcome_unknown" || (r.reason !== null && STRAND_NOT_RECORDED.has(r.reason))) return null;
+  return "assumed";
+}
+
+/**
+ * CLEAR-DESIGN.md §7's message block, with ONLY values this helper really has. Everything in it
+ * is bounded (an opaque token is ≤256 bytes, a reason code ≤64, bound-inject.js:29-30) and
+ * carries no prompt text, no screen text and no credential — there is no prompt on this door.
+ *
+ * Where a field is not in the answer the block prints the §7 step-3 READ-ONLY lookup instead of
+ * inventing it; no new network call is made here, and the `--from` is left as
+ * `<operator-sid>`, never this helper's own sender, so the daemon's audit line names the human
+ * who asserted (§7, last paragraph).
+ */
+function strandAdvisory(sid: string, b: BoundBinding,
+  answer: { transport: string; cliReason: string | null; result: BoundResult | null },
+  knowledge: StrandKnowledge, why: string, otherSession: boolean): string {
+  const r = answer.result;
+  /** Validated for the suggested command: the file's own token rule PLUS the paste gate. */
+  const safe = (value: string | null): string | null =>
+    value !== null && boundedToken(value) && STRAND_ARGV_SAFE.test(value) ? value : null;
+  // The strand's key IS the epoch this delivery pinned: delivery-runtime.js:1349 hands
+  // `expectedEpoch` to strandComposer, which stores it as the record's `epoch` (:177), and the
+  // clear must name that same record (`strand.epoch !== epoch` ⇒ no effect, :241). So the pin,
+  // never the answer's possibly-newer current epoch.
+  const epoch = safe(b.epoch);
+  // The clear compares `--expected-owner-generation` against the LIVE
+  // `session.interactionOwnerGeneration` (delivery-runtime.js:187-192; CLEAR-INTERFACE-V1 §5 step
+  // 4.8), so the FRESHEST value the helper holds is the right one to suggest: the daemon's own
+  // current generation, which the route reports on every stage (parseBoundAnswer :1470).
+  // r1 CSR3-m2: the guard is `otherSession`, not `knowledge`. Those are two different facts — an
+  // answer about ANOTHER session carries another session's generation and must be dropped, while
+  // an answer about OURS whose reason is merely unlisted (the route's own 500 for the two
+  // throw-strands) carries our current one, and that is exactly the case where a reclaim has made
+  // the pin stale. Keying on `knowledge` printed the stale pin for it, and printed no lookup
+  // either, because the value was non-null.
+  const reported = otherSession || r === null || r.ownerGeneration === null ? null : r.ownerGeneration;
+  const generation = safe(reported !== null ? reported : b.ownerGeneration);
+  // Only the delivery that CAUSED the strand carries its id: the record's `inject_id` is the
+  // same `injectId` the answer reports (delivery-runtime.js:178 ← :1349), nulled when it was not
+  // a valid id — which is exactly `none`. A `composer_stranded` REFUSAL reports the fresh id of
+  // THIS request instead (a new bound delivery mints a new one, CLEAR-DESIGN.md §3.5), so it is
+  // never printed as the stranded id.
+  const injectId = knowledge !== "recorded" || r === null ? null
+    : r.injectId === null ? STRAND_INJECT_NONE
+      : STRAND_UUID.test(r.injectId) ? r.injectId : null;
+  // The strand's own reason, for the one shape that carries it: the delivery passes the same
+  // string to strandComposer and to the result (delivery-runtime.js:1401-1402).
+  const reason = knowledge === "recorded" && r !== null && r.reason !== null ? r.reason
+    : knowledge === "already" ? STRAND_REFUSED : why;
+  const target = safe(sid);
+  const look = `telepty session ${target !== null ? target : "<sid>"}`;
+  const ph = (value: string | null, name: string): string => (value !== null ? value : `<${name}>`);
+  const headline = knowledge === "recorded"
+    ? `STRANDED: ${printable(sid)} — the daemon recorded a stranded composer for this session instance.`
+    : knowledge === "already"
+      ? `STRANDED: ${printable(sid)} — this session instance was ALREADY stranded before this dispatch.`
+      : `STRANDED (ASSUMED): ${printable(sid)} — this delivery's outcome is unknown, so this instance ` +
+        "must be assumed stranded until the view says otherwise.";
+  const fate = knowledge === "already"
+    ? "  nothing was transported: my dispatch is provably UNSENT and may be re-dispatched AFTER a clear."
+    : "  my dispatch is HELD and will not be replayed.";
+  // r1 CSR3-M1, table-driven: the daemon strands on an uncertain body write too, and that record
+  // does NOT mean the text arrived. Printed only where the table says the body was never
+  // confirmed handed over, so the operator is never told to look for something that must be there.
+  const bodyUncertain = knowledge === "recorded" && r !== null && r.reason !== null
+    && STRAND_REASONS.get(r.reason) === false;
+  const lines = [
+    headline,
+    "  no input is admitted for this session instance: every later body and key from every",
+    "  producer is refused `composer_stranded` until an operator clears it.",
+    `  session_epoch:      ${ph(epoch, "epoch")}`,
+    `  owner_generation:   ${ph(generation, "generation")}`,
+    `  stranded_inject_id: ${ph(injectId, "uuid")}   reason: ${printable(reason)}` +
+      `   observed_at: ${isoSeconds(utcNow())}`,
+    fate,
+  ];
+  if (bodyUncertain) {
+    lines.push("  the body MAY be in the composer — the write was uncertain, so an empty composer is possible.");
+  }
+  if (epoch === null || generation === null || injectId === null) {
+    lines.push("  every <…> above is NOT in this answer — read it (read-only, nothing is changed) with:",
+      `    ${look}   → transport.session_epoch, transport.owner_generation,`,
+      "        transport.stranded_composer.inject_id (`null` there ⇒ the literal `none`), .reason, .at");
+  }
+  lines.push(
+    "  observed_at is this helper's own clock; the strand's own `at` is in that same view.",
+    "",
+    "Do NOT `telepty attach` and press Enter: while stranded your keystrokes are dropped, and after",
+    "a clear they are not — a bare Enter would submit whatever is in the composer.",
+    "",
+    "To recover, in this order:",
+    "  1. At the terminal where this worker's bridge runs, look at the composer and empty it",
+    "     yourself (your own keyboard is the only input this session accepts right now).",
+    `  2. telepty clear-strand-v1 --from <operator-sid> --expected-epoch ${ph(epoch, "epoch")} \\`,
+    `       --expected-owner-generation ${ph(generation, "generation")} ` +
+      `--stranded-inject-id ${ph(injectId, "uuid")} \\`,
+    `       --basis ${STRAND_BASIS} -- ${target !== null ? target : "<sid>"}`,
+    // r1 note CSR3-n3: four of the clear's own gates can refuse the very strand this block
+    // describes (CLEAR-INTERFACE-V1 §5 steps 4.2, 4.3, 4.7, 4.9). Named here, in the block the
+    // operator reads during the incident, rather than only in --help.
+    "     Refused `session_closing`/`handoff_active`? that instance is on its way out or mid-handoff:",
+    "     wait, re-read the view, and if its epoch has moved the strand is already inert. Refused",
+    "     `owner_disconnected`/`owner_generation_unavailable`? the owner bridge is gone — reconnect it,",
+    "     or take the alternative below.",
+    `  3. Re-read \`${look}\`: transport.stranded_composer must be gone.`,
+    "     If the next delivery is refused `composer_stranded` by the bridge, the bridge's own half",
+    "     is engaged and only a new child clears it — restart the worker.",
+    "Alternative: re-register the session (new epoch). This loses the conversation.",
+    "This helper only PRINTS that command: it never clears, never sends a key and never replays.",
+    "",
+  );
+  return lines.join("\n");
+}
+
 /**
  * The one bound send and everything that may follow it. Exits; never returns.
  *
@@ -1603,6 +1817,11 @@ async function completeBoundDelivery(o: Opts, d: Delivery, sid: string, b: Bound
           : r.reason !== null ? r.reason : r.stage;
   d.transportInjectId = r === null || r.injectId === null ? "" : r.injectId;
   recordBoundObservation(sid, b, answer, sent.rc, accepted ? "accepted" : unsent ? "proven_unsent" : `held:${why}`);
+  // #1270 CLEAR-DESIGN.md §7 — ONE print site, after the record and before every exit below, so
+  // every situation that knows or must assume the instance is stranded reports it with the exit
+  // code and the marker it already had. The helper prints; the operator acts.
+  const knowledge = strandKnowledge(r, answer.transport, accepted, otherSession);
+  if (knowledge !== null) process.stderr.write(strandAdvisory(sid, b, answer, knowledge, why, otherSession));
   if (unsent) {
     if (recordTransport(d, sid, "not_delivered") !== 0) {
       die(`dispatch.sh: DELIVERY_UNKNOWN for ${sid} — ${BOUND_VERB} refused with nothing written, but that result ` +

@@ -1550,3 +1550,601 @@ describe("1270(s) r7/M1 the only reason production emits admits, and only it", (
     } finally { f.cleanup(); }
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// r8 ADDITIONS — the STRANDED COMPOSER is REPORTED to the operator, and never cleared
+// (CLEAR-DESIGN.md §7, the caller half). Everything above this line is unchanged
+// byte-for-byte: no existing case, assertion, stub, helper or constant is touched, and the
+// shapes below are built from the SAME `closed()`/`envelope()`/`armR1()` seams, so the stub
+// still only replays an envelope the test supplies.
+//
+// Each shape is pinned to the daemon line that produces it:
+//   • the four strand reasons the delivery returns beside `stage: "outcome_unknown"` after the
+//     body was handed over — telepty src/mailbox/delivery-runtime.js:1400-1403 (`strand()`),
+//     called at :1404 (binding_changed_after_body), :1410 (admission_changed_after_body),
+//     :1415 (submit_outcome_unknown), :1416 (submit_refused_after_body). `strand()` calls
+//     strandIdentity → strandComposer (:1348-1349, :176-197), so one of these codes in an
+//     answer PROVES the record exists;
+//   • `composer_stranded` — boundAdmissionRefusal's code for an ALREADY stranded instance
+//     (:1215), answered through `refuse()` (:1268) with `bytes_written: 0`, i.e. a pre-effect
+//     refusal that transported nothing;
+//   • `body_outcome_unknown` — the ONE outcome_unknown branch that deliberately does NOT
+//     strand (:1389-1391), so it must print no block;
+//   • the closed envelope's 11 keys and `bytes_written` 0-or-null: bound-inject.js:108-131.
+// The identity values the block may use come from that same envelope (session_epoch/
+// owner_generation/inject_id, re-bounded by parseBoundAnswer) and from the pin; the strand's
+// own `at` and a refusal's stranded id are NOT in any envelope, which is why those print the
+// read-only `telepty session <sid>` lookup instead.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/** A real inject-id shape (bound-inject.js:162 UUID_RE, the shape the record keeps at :192). */
+const STRAND_ID = "3f2b8c1d-4e5a-4b6c-8d7e-9f0a1b2c3d4e";
+/** The fresh id a LATER bound request mints (CLEAR-DESIGN.md §3.5) — never the stranded one. */
+const FRESH_ID = "9c8b7a6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d";
+/** The owner generation a reclaim minted: the DAEMON's current value, not the pin. */
+const RECLAIMED_OWNGEN = "OWNGEN-reclaimed-a1b2";
+/** The block's own headline, either knowledge level. */
+const STRAND_BLOCK = /^STRANDED(?: \(ASSUMED\))?: /m;
+/** The §7 placeholder-lookup line, printed only when a value is NOT in the answer. */
+const LOOKUP_LINE = /is NOT in this answer — read it \(read-only, nothing is changed\) with:/;
+/** The clear verb may never be SPAWNED, and may never be anything but printed text. */
+const CLEAR_VERB = "clear-strand-v1";
+
+/** An `outcome_unknown` answer carrying a strand reason: the delivery that STRANDED the pin. */
+const strandedEnv = (reason: string, over: Partial<Closed> = {}): R1Answer =>
+  envelope("outcome_unknown", reason, 500, closed({ stage: "outcome_unknown", reason,
+    inject_id: STRAND_ID, body_stage: "sent_to_bridge", submit_stage: "not_sent",
+    bytes_written: null, ...over }), 3);
+
+/**
+ * The §7 step-2 command as the operator would paste it: the three printed lines joined and the
+ * backslash continuations removed. Returned as argv, so the assertions pin the FLAG NAMES,
+ * their ORDER, the single `--` and the single positional — i.e. exactly what
+ * parseClearStrandArgv requires (clear-strand-v1.js:51-90: one `--`, one positional,
+ * `flags.length === 10`, known non-duplicate flags, no `--flag=value`).
+ */
+function clearArgv(stderr: string): string[] {
+  const at = stderr.indexOf(`  2. telepty ${CLEAR_VERB} `);
+  assert.ok(at >= 0, `the §7 step-2 clear command must be printed:\n${stderr}`);
+  const joined = stderr.slice(at).split("\n").slice(0, 3).join(" ").replace(/\\ /g, " ");
+  return joined.trim().replace(/^2\. telepty /, "").split(/\s+/);
+}
+
+/** The exact argv the block must print for these four values. */
+const expectedClearArgv = (epoch: string, generation: string, injectId: string, sid = SID): string[] =>
+  [CLEAR_VERB, "--from", "<operator-sid>", "--expected-epoch", epoch,
+    "--expected-owner-generation", generation, "--stranded-inject-id", injectId,
+    "--basis", "composer_emptied_by_operator", "--", sid];
+
+/** The printed value of one field line of the block. */
+function strandField(stderr: string, label: string): string {
+  const m = new RegExp(`^  ${label}: *(\\S+)`, "m").exec(stderr);
+  assert.ok(m !== null, `the block must carry a ${label} line:\n${stderr}`);
+  return m[1]!;
+}
+
+/**
+ * The invariant every case below shares: the helper PRINTS and nothing else. No clear verb is
+ * spawned, no key/force write, no legacy inject, no second bound send — asserted on the stub's
+ * own recorded argv list, plus the stub's catch-all refusal (it exits 97 and says
+ * `refusing verb` for anything this contract does not allow, R1_TELEPTY_STUB:636-637).
+ */
+function assertPrintsOnly(f: F, r: SpawnSyncReturns<string>, note: string): void {
+  const es = entries(f);
+  assert.deepEqual(telepty(es).filter((e) => e.argv[0] === CLEAR_VERB).map((e) => e.argv), [],
+    `${note}: the helper must NEVER run ${CLEAR_VERB} — the clear is an operator assertion`);
+  assert.deepEqual(keyWrites(es).map((e) => e.argv), [], `${note}: no key/force write`);
+  assert.deepEqual(legacyInjects(es).map((e) => e.argv), [], `${note}: no legacy inject fallback`);
+  assert.equal(boundSends(es).length, 1, `${note}: exactly one bound send, never a replay\n${r.stderr}`);
+  assert.doesNotMatch(r.stderr, /refusing verb/,
+    `${note}: no verb outside the allowed set was spawned\n${r.stderr}`);
+  // The suggested command is TEXT on stderr only: it must not appear in any recorded argv.
+  for (const e of es) {
+    assert.ok(!e.argv.includes("--basis") && !e.argv.includes("--stranded-inject-id"),
+      `${note}: a clear flag reached a real argv: ${JSON.stringify(e.argv)}`);
+  }
+}
+
+// ── (t) §7 2a: the delivery that STRANDS reports the strand, HELD, exit 7 ────
+describe("1270(t) §7/2a an outcome_unknown that stranded the pin prints the block and stays HELD", () => {
+  test("binding_changed_after_body: the exact identity values, the HELD wording and the exact clear command", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      // The real shape of :1404: the owner RECLAIMED between the body and its CR, so the
+      // daemon's own current owner_generation is a NEW one while the strand is keyed on the
+      // epoch this delivery pinned (:1349 → :177).
+      const overrides = armR1(f, strandedEnv("binding_changed_after_body",
+        { owner_generation: RECLAIMED_OWNGEN }));
+      const r = follow(f, overrides);
+      // Exit code and marker unchanged: this is the existing held-unknown outcome.
+      assert.equal(r.status, 7, `the held exit code is unchanged\n${r.stderr}`);
+      assert.match(r.stderr, /DELIVERY_UNKNOWN/, "and so is the marker");
+      assert.match(r.stderr, /binding_changed_after_body/, "the daemon's reason still travels");
+      // The block itself.
+      assert.match(r.stderr, STRAND_BLOCK, `the strand must be reported:\n${r.stderr}`);
+      assert.match(r.stderr, /^STRANDED: router-fixture — the daemon recorded a stranded composer/m, r.stderr);
+      assert.match(r.stderr, /no input is admitted for this session instance/, r.stderr);
+      assert.ok(r.stderr.includes("  my dispatch is HELD and will not be replayed."),
+        `§7's HELD line must be printed verbatim:\n${r.stderr}`);
+      assert.doesNotMatch(r.stderr, /provably UNSENT/, "a stranding delivery is not an unsent one");
+      // The identity: the epoch is the PIN (the strand's own key), the generation is the
+      // daemon's CURRENT one from the answer, the stranded id is the answer's inject_id.
+      assert.equal(strandField(r.stderr, "session_epoch"), EPOCH);
+      assert.equal(strandField(r.stderr, "owner_generation"), RECLAIMED_OWNGEN);
+      assert.equal(strandField(r.stderr, "stranded_inject_id"), STRAND_ID);
+      assert.match(r.stderr, /reason: binding_changed_after_body/, r.stderr);
+      // Every value is known, so no placeholder and no lookup line is printed.
+      assert.doesNotMatch(r.stderr, LOOKUP_LINE, `nothing is missing from this answer:\n${r.stderr}`);
+      // The command, as argv: flag names, order, the single `--`, the single exact sid, and
+      // `<operator-sid>` — never this helper's own --from.
+      assert.deepEqual(clearArgv(r.stderr), expectedClearArgv(EPOCH, RECLAIMED_OWNGEN, STRAND_ID));
+      assert.ok(!clearArgv(r.stderr).includes(FROM),
+        `the --from must stay the OPERATOR's placeholder, never the helper's sid:\n${r.stderr}`);
+      // §7's two warnings and the never-clears statement.
+      assert.match(r.stderr, /Do NOT `telepty attach` and press Enter/, r.stderr);
+      assert.match(r.stderr, /empty it\n *yourself/, "step 1: the operator empties the composer");
+      assert.match(r.stderr, /Re-read `telepty session router-fixture`/, "step 3: the read-only re-read");
+      assert.match(r.stderr, /only a new child clears it — restart the worker/, "the bridge's own half");
+      assert.match(r.stderr, /Alternative: re-register the session \(new epoch\)/, r.stderr);
+      assert.match(r.stderr, /never clears, never sends a key and never replays/, r.stderr);
+      // Nothing else changed: the record is the same held row it always was.
+      const row = rows(f)[0]!;
+      assert.equal(row.transport.result, "unknown", "never not_delivered while a body may exist");
+      assert.equal(row.lifecycle.state, "delivery_state_unknown");
+      assert.equal(boundObservation(f).verdict, "held:binding_changed_after_body");
+      assertPrintsOnly(f, r, "2a binding_changed_after_body");
+    } finally { f.cleanup(); }
+  });
+
+  test("submit_refused_after_body with NO inject id prints the literal `none` the clear verb accepts", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      // delivery-runtime.js:178 stores `inject_id: validInjectId(injectId) ? injectId : null`,
+      // and clear-strand-v1.js:45,:86,:100 spells that null `none` on the command line — which
+      // clearStrandedComposer then matches strictly, `null === null` included (:242).
+      const overrides = armR1(f, strandedEnv("submit_refused_after_body", { inject_id: null }));
+      const r = follow(f, overrides);
+      assert.equal(r.status, 7, `the held exit code is unchanged\n${r.stderr}`);
+      assert.match(r.stderr, /DELIVERY_UNKNOWN/, r.stderr);
+      assert.equal(strandField(r.stderr, "stranded_inject_id"), "none",
+        `a strand with no inject id must print the literal none:\n${r.stderr}`);
+      assert.deepEqual(clearArgv(r.stderr), expectedClearArgv(EPOCH, OWNGEN, "none"));
+      assert.match(r.stderr, /reason: submit_refused_after_body/, r.stderr);
+      assert.ok(r.stderr.includes("  my dispatch is HELD and will not be replayed."), r.stderr);
+      assertPrintsOnly(f, r, "2a submit_refused_after_body");
+    } finally { f.cleanup(); }
+  });
+
+  for (const reason of ["admission_changed_after_body", "submit_outcome_unknown"] as const) {
+    test(`${reason}: the same block, the same exit 7, the same single send`, () => {
+      const f = fixture();
+      try {
+        f.prepareTarget();
+        const r = follow(f, armR1(f, strandedEnv(reason)));
+        assert.equal(r.status, 7, `unchanged exit\n${r.stderr}`);
+        assert.match(r.stderr, STRAND_BLOCK, `${reason} strands too (delivery-runtime.js:1410,:1415)\n${r.stderr}`);
+        assert.deepEqual(clearArgv(r.stderr), expectedClearArgv(EPOCH, OWNGEN, STRAND_ID));
+        assert.match(r.stderr, new RegExp(`reason: ${reason}`), r.stderr);
+        assertPrintsOnly(f, r, reason);
+      } finally { f.cleanup(); }
+    });
+  }
+});
+
+// ── (u) §7 2b: a later dispatch to an ALREADY stranded instance ─────────────
+describe("1270(u) §7/2b a composer_stranded refusal is provably UNSENT, re-dispatchable after a clear", () => {
+  test("the block says unsent — not HELD — and never prints THIS request's fresh inject id as the stranded one", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      // The pre-effect refusal of :1215 through :1268 — bytes_written 0, nothing transported.
+      // Its `inject_id` is the id THIS request minted, not the strand's (CLEAR-DESIGN.md §3.5).
+      const overrides = armR1(f, refusedEnv("composer_stranded", { inject_id: FRESH_ID }));
+      const r = follow(f, overrides);
+      // The existing proven-unsent outcome, unchanged.
+      assert.equal(r.status, 3, `a proven-unsent refusal keeps exit 3\n${r.stderr}`);
+      assert.match(r.stderr, /BOUND_INJECT_REFUSED/, "and its marker");
+      assert.match(r.stderr, /composer_stranded/, "and names the reason");
+      assert.match(r.stderr, /may be dispatched again/, "and the existing re-dispatch line stands");
+      assert.equal(rows(f)[0]!.transport.result, "not_delivered", "nothing was written");
+      // The block, with 2b's own wording.
+      assert.match(r.stderr, /^STRANDED: router-fixture — this session instance was ALREADY stranded/m, r.stderr);
+      assert.ok(r.stderr.includes(
+        "  nothing was transported: my dispatch is provably UNSENT and may be re-dispatched AFTER a clear."),
+      `2b must say unsent, not HELD:\n${r.stderr}`);
+      assert.doesNotMatch(r.stderr, /my dispatch is HELD/, "nothing was transported, so nothing is held");
+      // The identity: epoch and generation are known (a moved epoch/generation refuses before
+      // the admission gate), the stranded id is NOT in a refusal envelope.
+      assert.equal(strandField(r.stderr, "session_epoch"), EPOCH);
+      assert.equal(strandField(r.stderr, "owner_generation"), OWNGEN);
+      assert.equal(strandField(r.stderr, "stranded_inject_id"), "<uuid>",
+        `a refusal carries THIS request's id, so the stranded id must be a placeholder:\n${r.stderr}`);
+      assert.deepEqual(clearArgv(r.stderr), expectedClearArgv(EPOCH, OWNGEN, "<uuid>"));
+      assert.ok(!clearArgv(r.stderr).includes(FRESH_ID),
+        `the fresh request id must never be suggested as the stranded id:\n${r.stderr}`);
+      // …and the read-only lookup that DOES show it is printed instead.
+      assert.match(r.stderr, LOOKUP_LINE, r.stderr);
+      assert.match(r.stderr, /telepty session router-fixture {3}→ transport\.session_epoch/, r.stderr);
+      assert.match(r.stderr, /transport\.stranded_composer\.inject_id/, r.stderr);
+      assertPrintsOnly(f, r, "2b composer_stranded");
+    } finally { f.cleanup(); }
+  });
+
+  test("the ref is still freed: the same dispatch may be sent again, and reports the strand again", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      // Armed ONCE (arm() truncates the shared order log, see case (q)).
+      const overrides = armR1(f, refusedEnv("composer_stranded", { inject_id: FRESH_ID }));
+      const first = follow(f, overrides);
+      assert.equal(first.status, 3, first.stderr);
+      const again = follow(f, overrides);
+      assert.equal(boundSends(entries(f)).length, 2,
+        `a provably unsent ref stays re-dispatchable\n${again.stderr}`);
+      assert.notEqual(again.status, 7,
+        `and must not report DISPATCH_RETRY_HELD (case (j)'s own rule)\n${again.stderr}`);
+      assert.match(again.stderr, STRAND_BLOCK, "and the strand is reported every time it is seen");
+      assert.equal(rows(f).length, 2, "each attempt is its own record");
+      assert.deepEqual(telepty(entries(f)).filter((e) => e.argv[0] === CLEAR_VERB).map((e) => e.argv), [],
+        "two reports, zero clears");
+    } finally { f.cleanup(); }
+  });
+});
+
+// ── (v) §7: an outcome nobody can answer for must ASSUME the strand ─────────
+describe("1270(v) §7 an unknown outcome assumes the strand, with only the values the helper has", () => {
+  for (const [name, answer, reason] of [
+    ["lost (no response)", lostEnv(), "outcome_unknown:response_unavailable"],
+    ["unparseable answer", unparseableEnv(), "outcome_unknown:response_unparseable"],
+  ] as const) {
+    test(`${name}: the ASSUMED block, the pinned identity, exit 7 unchanged`, () => {
+      const f = fixture();
+      try {
+        f.prepareTarget();
+        const r = follow(f, armR1(f, answer));
+        assert.equal(r.status, 7, `the held exit code is unchanged\n${r.stderr}`);
+        assert.match(r.stderr, /DELIVERY_UNKNOWN/, r.stderr);
+        assert.match(r.stderr, /^STRANDED \(ASSUMED\): router-fixture — this delivery's outcome is unknown/m,
+          `a lost answer cannot prove the strand path did NOT run:\n${r.stderr}`);
+        assert.match(r.stderr, /must be assumed stranded until the view says otherwise/, r.stderr);
+        // No daemon value exists, so the pin is all there is — and the pin IS the strand's key.
+        assert.equal(strandField(r.stderr, "session_epoch"), EPOCH);
+        assert.equal(strandField(r.stderr, "owner_generation"), OWNGEN);
+        assert.equal(strandField(r.stderr, "stranded_inject_id"), "<uuid>");
+        assert.match(r.stderr, new RegExp(`reason: ${reason}`), r.stderr);
+        assert.match(r.stderr, LOOKUP_LINE, "the unknown id is looked up, never invented");
+        assert.deepEqual(clearArgv(r.stderr), expectedClearArgv(EPOCH, OWNGEN, "<uuid>"));
+        assert.ok(r.stderr.includes("  my dispatch is HELD and will not be replayed."), r.stderr);
+        assertPrintsOnly(f, r, name);
+      } finally { f.cleanup(); }
+    });
+  }
+
+  test("an answer about ANOTHER session prints no foreign identity: the pin, and the lookup", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      const overrides = armR1(f, acceptedEnv({ session_id: "some-other-session",
+        session_epoch: "EPOCH-of-another-session", owner_generation: "OWNGEN-of-another-session",
+        inject_id: FRESH_ID }));
+      const r = follow(f, overrides);
+      assert.equal(r.status, 7, `unchanged: an answer about another session is held\n${r.stderr}`);
+      assert.match(r.stderr, /bound_session_identity_mismatch/, "the existing mismatch line stands");
+      assert.match(r.stderr, /^STRANDED \(ASSUMED\): /m, r.stderr);
+      // Not one field of the foreign answer may reach the block or its command.
+      const argv = clearArgv(r.stderr);
+      assert.deepEqual(argv, expectedClearArgv(EPOCH, OWNGEN, "<uuid>"));
+      for (const foreign of ["some-other-session", "EPOCH-of-another-session", "OWNGEN-of-another-session", FRESH_ID]) {
+        assert.ok(!argv.includes(foreign), `a foreign value reached the command: ${foreign}\n${r.stderr}`);
+      }
+      assertPrintsOnly(f, r, "foreign identity");
+    } finally { f.cleanup(); }
+  });
+});
+
+// ── (w) a hostile daemon value never reaches a line an operator may paste ───
+describe("1270(w) a hostile daemon-supplied value is replaced by a placeholder, never printed", () => {
+  // `boundedToken` (cli.ts:1182, mirroring bound-inject.js:35-39) bans control characters and
+  // >256 bytes but ADMITS `$ ` ` ; ' "` and spaces, so the paste gate is a SECOND rule. Each row
+  // says which value the block must show instead: `<generation>` when the hostile value reached
+  // the gate, the safe PIN when parseBoundAnswer already dropped it to null.
+  const hostile: Array<[string, string, string]> = [
+    ["command substitution", 'OG$(touch /tmp/pwn)', "<generation>"],
+    ["backticks", "OG`id`", "<generation>"],
+    ["a command separator", "OG;rm -rf /", "<generation>"],
+    ["quotes", `OG'"`, "<generation>"],
+    ["a space", "OG and more", "<generation>"],
+    // Dropped at parse: a control character and an over-long token are not bounded tokens, so
+    // the answer asserts no generation at all and the pin stands.
+    ["a forged newline", "OG\nSTRANDED: forged by the daemon", OWNGEN],
+    ["over-long (300 bytes)", "O".repeat(300), OWNGEN],
+  ];
+
+  for (const [name, value, expected] of hostile) {
+    test(`${name}: absent from the output, and the command shows ${expected}`, () => {
+      const f = fixture();
+      try {
+        f.prepareTarget();
+        const r = follow(f, armR1(f, strandedEnv("submit_outcome_unknown", { owner_generation: value })));
+        // stderr is where this helper composes its own lines. The daemon CLI's own stdout
+        // envelope is tee'd through verbatim by injectBound (cli.ts:1420-1423) — pre-existing
+        // behaviour this unit does not touch, and not a line anyone pastes.
+        assert.ok(!r.stderr.includes(value), `the hostile value must never be printed:\n${r.stderr}`);
+        assert.match(r.stderr, STRAND_BLOCK, `the report still happens\n${r.stderr}`);
+        assert.equal(strandField(r.stderr, "owner_generation"), expected, r.stderr);
+        assert.deepEqual(clearArgv(r.stderr), expectedClearArgv(EPOCH, expected, STRAND_ID));
+        // A dropped value takes the lookup path; a known pin needs none for the generation.
+        if (expected === "<generation>") assert.match(r.stderr, LOOKUP_LINE, r.stderr);
+        // The forged-line row is the sharp one: a daemon value may not fabricate a block.
+        assert.equal(r.stderr.match(/^STRANDED/gm)!.length, 1,
+          `exactly one STRANDED headline, never one a daemon value forged:\n${r.stderr}`);
+        assert.equal(r.status, 7, `and the exit code is still the situation's own\n${r.stderr}`);
+        assertPrintsOnly(f, r, name);
+      } finally { f.cleanup(); }
+    });
+  }
+
+  test("a bounded but non-UUID inject id is NOT suggested as the stranded id", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      // `$(id)-not-a-uuid` passes boundedToken, so only the UUID shape the record and the clear
+      // verb bound (bound-inject.js:162,:192; clear-strand-v1.js:86) keeps it out of the command.
+      const r = follow(f, armR1(f, strandedEnv("submit_refused_after_body", { inject_id: "$(id)-not-a-uuid" })));
+      assert.ok(!r.stderr.includes("$(id)"), r.stderr);
+      assert.equal(strandField(r.stderr, "stranded_inject_id"), "<uuid>", r.stderr);
+      assert.deepEqual(clearArgv(r.stderr), expectedClearArgv(EPOCH, OWNGEN, "<uuid>"));
+      assert.match(r.stderr, LOOKUP_LINE, r.stderr);
+      assertPrintsOnly(f, r, "non-uuid inject id");
+    } finally { f.cleanup(); }
+  });
+
+  test("an opaque-but-unpasteable PINNED token degrades to the lookup, and the send is unchanged", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      // The contract types these tokens as OPAQUE and case (l) proves `+ / = space ·` must be
+      // DELIVERED unchanged; the paste gate is about one line, not about the delivery. The two
+      // halves of case (l)'s pair fall differently and BOTH are right: `ep0ch+9f2c/1a7b==` is a
+      // shell-safe bare word (shellQuote's own class, cli.ts:135) and is printed as itself,
+      // while `owner gen 4b71·e0d3` is not and becomes the placeholder plus the lookup.
+      const overrides = armR1(f, strandedEnv("binding_changed_after_body",
+        { session_epoch: WIDE_EPOCH, owner_generation: WIDE_OWNGEN }),
+      { epoch: WIDE_EPOCH, ownerGeneration: WIDE_OWNGEN });
+      const r = follow(f, overrides);
+      const es = entries(f);
+      // Unchanged: the opaque token still travels as ONE argv element, byte for byte.
+      assert.equal(boundSends(es).length, 1, r.stderr);
+      assert.equal(boundSends(es)[0]!.argv[boundSends(es)[0]!.argv.indexOf("--expected-epoch") + 1], WIDE_EPOCH);
+      assert.match(r.stderr, STRAND_BLOCK, r.stderr);
+      assert.equal(strandField(r.stderr, "session_epoch"), WIDE_EPOCH, r.stderr);
+      assert.equal(strandField(r.stderr, "owner_generation"), "<generation>", r.stderr);
+      assert.ok(!r.stderr.includes(WIDE_OWNGEN), `an unpasteable token must not be printed:\n${r.stderr}`);
+      assert.deepEqual(clearArgv(r.stderr), expectedClearArgv(WIDE_EPOCH, "<generation>", STRAND_ID));
+      assert.match(r.stderr, LOOKUP_LINE, r.stderr);
+      assertPrintsOnly(f, r, "unpasteable opaque pin");
+    } finally { f.cleanup(); }
+  });
+});
+
+// ── (x) the complement: a non-strand outcome prints no block at all ─────────
+describe("1270(x) an accepted hand-off and an ordinary refusal print NO strand block", () => {
+  const quiet: Array<[string, R1Answer, number]> = [
+    ["accepted", acceptedEnv(), 0],
+    ["refused: epoch_mismatch", refusedEnv("epoch_mismatch", { session_epoch: "EPOCH-moved-on" }), 3],
+    ["refused: busy_input_unsupported", refusedEnv("busy_input_unsupported"), 3],
+    ["refused: interaction_held", refusedEnv("interaction_held"), 3],
+    ["schema-less 404 (nothing was sent)", unsupportedEnv(), 3],
+    ["pre-socket local refusal", refusedLocallyEnv("non_canonical_daemon_host"), 3],
+    // r1 CSR3-M1 — ONE row was removed from this table: `outcome_unknown: body_outcome_unknown`,
+    // which asserted that NO block is printed, because the daemon of this unit's inputs installs
+    // no record on an uncertain body write (delivery-runtime.js:1389-1391). Root is changing the
+    // daemon so that answer DOES strand, so that expectation reverses: the row moved to 1270(y)
+    // below, where it asserts the block, the HELD wording and the "may be empty" line. Every
+    // other row here, and every assertion in the loop, is unchanged.
+  ];
+
+  for (const [name, answer, status] of quiet) {
+    test(`${name}: no STRANDED block, no clear command, exit ${status} unchanged`, () => {
+      const f = fixture();
+      try {
+        f.prepareTarget();
+        const r = follow(f, armR1(f, answer));
+        assert.equal(r.status, status, `the existing exit code is unchanged\n${r.stderr}`);
+        assert.doesNotMatch(r.stderr, STRAND_BLOCK, `${name} is not a strand:\n${r.stderr}`);
+        assert.ok(!(r.stdout + r.stderr).includes(CLEAR_VERB),
+          `${name} must not suggest a clear:\n${r.stdout}\n${r.stderr}`);
+        assert.ok(!(r.stdout + r.stderr).includes("composer_emptied_by_operator"), r.stderr);
+        assertPrintsOnly(f, r, name);
+      } finally { f.cleanup(); }
+    });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// r1 ADDITIONS (Root review round 1). Everything above is unchanged except ONE removed row in
+// 1270(x) (the expectation Root's CSR3-M1 decision reverses — see the comment in its place), and
+// lines 1-1552 are still byte-identical to the phase-0 RED file.
+//   CSR3-M1 — an uncertain BODY write strands too, after the daemon change Root decided. The
+//             answer is an `outcome_unknown` whose reason is `body_outcome_unknown`, and the
+//             record it installs does NOT mean the text arrived: the block must say the composer
+//             may be empty. Driven by the production TABLE (cli.ts:1587-1599), so these cases
+//             also pin the table's `false` rows against its `true` rows.
+//   CSR3-m2 — only a FOREIGN-identity answer forces the pin; a same-session assumed answer uses
+//             the daemon's reported owner_generation.
+//   CSR3-m1 — the lookup hint's `null` wording.
+//   CSR3-n3 — the clear's own refusals, named in the block.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * The uncertain-BODY answer, with the daemon CLI's real envelope for it: the delivery returns
+ * `{stage:'outcome_unknown', reason:'body_outcome_unknown', bodyStage:'unknown',
+ * submitStage:'not_sent', bytesWritten:null}` (delivery-runtime.js:1389-1391), the route adds its
+ * own identity and schema through the ONE builder (bound-inject.js:108-131), and the strict CLI
+ * prints it as `{transport:'outcome_unknown', reason, http_status, result}` with EXIT.unknown = 3
+ * (inject-bound-v1.js:119-125). After CSR3-M1 the same branch also calls `strandIdentity`, so the
+ * reason names a record; the envelope on the wire is unchanged by that.
+ */
+const bodyUncertainEnv = (over: Partial<Closed> = {}): R1Answer =>
+  envelope("outcome_unknown", "body_outcome_unknown", 500, closed({ stage: "outcome_unknown",
+    reason: "body_outcome_unknown", inject_id: STRAND_ID, body_stage: "unknown",
+    submit_stage: "not_sent", bytes_written: null, ...over }), 3);
+
+/**
+ * An `outcome_unknown` about OUR session whose reason the table does not list: the route's own
+ * code for a delivery that threw (`delivery_threw`, in the daemon's allow-list at
+ * bound-inject.js:53). The route file is not in this unit's inputs, which is exactly why this
+ * answer is ASSUMED stranded rather than `recorded` — and why its reported owner_generation is
+ * still OUR session's current one.
+ */
+const threwEnv = (over: Partial<Closed> = {}): R1Answer =>
+  envelope("outcome_unknown", "delivery_threw", 500, closed({ stage: "outcome_unknown",
+    reason: "delivery_threw", inject_id: STRAND_ID, body_stage: "unknown",
+    submit_stage: "not_sent", bytes_written: null, ...over }), 3);
+
+/** The CSR3-M1 line: the record exists, the text may not. */
+const MAY_BE_EMPTY = "  the body MAY be in the composer — the write was uncertain, so an empty composer is possible.";
+
+// ── (y) CSR3-M1: an uncertain body write is a reported strand whose composer may be empty ──
+describe("1270(y) r1/CSR3-M1 an uncertain BODY write is reported, HELD, and says the composer may be empty", () => {
+  test("body_outcome_unknown: the block, the HELD wording, the may-be-empty line, exit 7 unchanged", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      const r = follow(f, armR1(f, bodyUncertainEnv()));
+      // The exit code and the marker are the ones this answer already had in phase 1.
+      assert.equal(r.status, 7, `an unknown outcome is still held at exit 7\n${r.stderr}`);
+      assert.match(r.stderr, /DELIVERY_UNKNOWN/, "and the marker is unchanged");
+      assert.match(r.stderr, /body_outcome_unknown/, "the daemon's reason still travels");
+      // What CSR3-M1 reverses: this used to print nothing at all.
+      assert.match(r.stderr, /^STRANDED: router-fixture — the daemon recorded a stranded composer/m,
+        `after the daemon change this answer names an existing record:\n${r.stderr}`);
+      assert.ok(r.stderr.includes("  my dispatch is HELD and will not be replayed."), r.stderr);
+      assert.doesNotMatch(r.stderr, /provably UNSENT/, "a possibly-written body is not an unsent one");
+      // The honest extra fact: the record is certain, the text is not.
+      assert.ok(r.stderr.includes(MAY_BE_EMPTY),
+        `the block must say the composer may be empty:\n${r.stderr}`);
+      // …and the identity and the command are the ordinary `recorded` ones.
+      assert.equal(strandField(r.stderr, "session_epoch"), EPOCH);
+      assert.equal(strandField(r.stderr, "owner_generation"), OWNGEN);
+      assert.equal(strandField(r.stderr, "stranded_inject_id"), STRAND_ID);
+      assert.match(r.stderr, /reason: body_outcome_unknown/, r.stderr);
+      assert.deepEqual(clearArgv(r.stderr), expectedClearArgv(EPOCH, OWNGEN, STRAND_ID));
+      const row = rows(f)[0]!;
+      assert.equal(row.transport.result, "unknown", "never not_delivered while a body may exist");
+      assert.equal(row.lifecycle.state, "delivery_state_unknown");
+      assert.equal(boundObservation(f).verdict, "held:body_outcome_unknown");
+      assertPrintsOnly(f, r, "body_outcome_unknown");
+    } finally { f.cleanup(); }
+  });
+
+  test("delivery_threw_during_body: the other table row whose body is uncertain says it too", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      // delivery-runtime.js:1429 strands on `bodyAttempted` alone — the write was entered and
+      // never returned (:1322-1332), which is the same uncertainty by a different route.
+      const r = follow(f, armR1(f, strandedEnv("delivery_threw_during_body")));
+      assert.equal(r.status, 7, r.stderr);
+      assert.match(r.stderr, /^STRANDED: /m, r.stderr);
+      assert.ok(r.stderr.includes(MAY_BE_EMPTY), `the table drives this line, not a literal:\n${r.stderr}`);
+      assert.deepEqual(clearArgv(r.stderr), expectedClearArgv(EPOCH, OWNGEN, STRAND_ID));
+      assertPrintsOnly(f, r, "delivery_threw_during_body");
+    } finally { f.cleanup(); }
+  });
+
+  for (const reason of ["submit_refused_after_body", "delivery_threw_after_body"] as const) {
+    test(`${reason}: the body IS there, so the may-be-empty line must NOT be printed`, () => {
+      const f = fixture();
+      try {
+        f.prepareTarget();
+        // The table's `true` rows: the write returned success before the failure
+        // (delivery-runtime.js:1393), so telling the operator the composer may be empty would be
+        // a weaker claim than the daemon's own record supports.
+        const r = follow(f, armR1(f, strandedEnv(reason)));
+        assert.match(r.stderr, /^STRANDED: /m, r.stderr);
+        assert.ok(!r.stderr.includes(MAY_BE_EMPTY),
+          `a handed-over body is not uncertain:\n${r.stderr}`);
+        assert.ok(r.stderr.includes("  my dispatch is HELD and will not be replayed."), r.stderr);
+        assertPrintsOnly(f, r, reason);
+      } finally { f.cleanup(); }
+    });
+  }
+});
+
+// ── (z) CSR3-m2 / m1 / n3: the three accepted minors ────────────────────────
+describe("1270(z) r1 minors: the pin is forced only for a foreign answer, the lookup names `null`, the clear's own refusals", () => {
+  test("CSR3-m2: a SAME-SESSION assumed answer suggests the daemon's reported owner_generation", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      // `delivery_threw` is about OUR session and carries the daemon's CURRENT generation, which a
+      // reclaim has just changed — exactly when the pin is stale and the clear would be refused
+      // 409 owner_generation_mismatch (CLEAR-INTERFACE-V1 §5 step 4.8).
+      const r = follow(f, armR1(f, threwEnv({ owner_generation: RECLAIMED_OWNGEN })));
+      assert.equal(r.status, 7, `unchanged: an unlisted unknown reason is held\n${r.stderr}`);
+      assert.match(r.stderr, /^STRANDED \(ASSUMED\): /m, `and assumed stranded\n${r.stderr}`);
+      assert.equal(strandField(r.stderr, "owner_generation"), RECLAIMED_OWNGEN,
+        `the FRESHER reported value must be suggested, not the pin:\n${r.stderr}`);
+      assert.equal(strandField(r.stderr, "session_epoch"), EPOCH, "the epoch is still the strand's key");
+      assert.deepEqual(clearArgv(r.stderr), expectedClearArgv(EPOCH, RECLAIMED_OWNGEN, "<uuid>"));
+      assertPrintsOnly(f, r, "same-session assumed");
+    } finally { f.cleanup(); }
+  });
+
+  test("CSR3-m2: a FOREIGN-identity answer still forces the pin, in the same shape", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      // The only difference from the case above is WHOSE session the answer names, and that alone
+      // must decide whether the reported generation may be used at all.
+      const r = follow(f, armR1(f, threwEnv({ session_id: "some-other-session",
+        owner_generation: RECLAIMED_OWNGEN })));
+      assert.equal(r.status, 7, r.stderr);
+      assert.match(r.stderr, /^STRANDED \(ASSUMED\): /m, r.stderr);
+      assert.match(r.stderr, /bound_session_identity_mismatch/, "the existing mismatch line stands");
+      assert.equal(strandField(r.stderr, "owner_generation"), OWNGEN,
+        `another session's generation may never be suggested for ours:\n${r.stderr}`);
+      assert.ok(!r.stderr.includes(RECLAIMED_OWNGEN), r.stderr);
+      assert.deepEqual(clearArgv(r.stderr), expectedClearArgv(EPOCH, OWNGEN, "<uuid>"));
+      assertPrintsOnly(f, r, "foreign assumed");
+    } finally { f.cleanup(); }
+  });
+
+  test("CSR3-m1: the lookup hint says a `null` inject_id in the view means the literal `none`", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      // The view always EMITS the key (delivery-runtime.js:1939 `inject_id: strand.inject_id`), so
+      // the operator reads `"inject_id": null` — and passing the string `null` is refused
+      // `stranded_inject_id_invalid` (clear-strand-v1.js:86).
+      const r = follow(f, armR1(f, refusedEnv("composer_stranded", { inject_id: FRESH_ID })));
+      assert.match(r.stderr, LOOKUP_LINE, r.stderr);
+      assert.ok(r.stderr.includes(
+        "        transport.stranded_composer.inject_id (`null` there ⇒ the literal `none`), .reason, .at"),
+      `the hint must name the value the view really shows:\n${r.stderr}`);
+      assert.ok(!r.stderr.includes("absent there"), `the old wording must be gone:\n${r.stderr}`);
+      assertPrintsOnly(f, r, "lookup wording");
+    } finally { f.cleanup(); }
+  });
+
+  test("CSR3-n3: the block names the clear's own refusals and what to do about each", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      // CLEAR-INTERFACE-V1 §5 steps 4.2, 4.3, 4.7 and 4.9 can refuse the very strand this block
+      // describes, and the operator meets them only after pasting the command.
+      const r = follow(f, armR1(f, bodyUncertainEnv()));
+      assert.match(r.stderr, /Refused `session_closing`\/`handoff_active`\?/, r.stderr);
+      assert.match(r.stderr, /wait, re-read the view, and if its epoch has moved the strand is already inert/, r.stderr);
+      assert.match(r.stderr, /Refused\n? *`owner_disconnected`\/`owner_generation_unavailable`\?/, r.stderr);
+      assert.match(r.stderr, /the owner bridge is gone — reconnect it/, r.stderr);
+      // The guidance is prose BETWEEN step 2 and step 3: it may not disturb the pasteable command.
+      assert.deepEqual(clearArgv(r.stderr), expectedClearArgv(EPOCH, OWNGEN, STRAND_ID));
+      assert.match(r.stderr, /  3\. Re-read `telepty session router-fixture`/, r.stderr);
+      assertPrintsOnly(f, r, "clear refusals named");
+    } finally { f.cleanup(); }
+  });
+});
