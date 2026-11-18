@@ -113,6 +113,9 @@ publishing this release closes no task.
 
 ### Release gates
 
+- The release scan over the changed production source since v0.2.5 (bin, src and scripts, plus the package manifests) 
+  completed with exit 0 and 0 findings
+  It is a changed-source projection, not whole-repository or dependency coverage.
 - Publication requires exact integrated CI, including Windows W1 (full
   suite) and W0 (installed package), followed by registry verification.
 

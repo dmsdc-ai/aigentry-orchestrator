@@ -1,0 +1,14 @@
+{
+  "base_commit": "c90a75fee78cdedf8671e46beb79e52b0f544942",
+  "roots": [
+    "bin",
+    "src",
+    "scripts"
+  ],
+  "leaves": [
+    "package.json",
+    "package-lock.json"
+  ],
+  "assumptions": "Select every changed committed production source and test-runner file under bin/src/scripts since v0.2.5, plus exact package dependency identities. Snyk supported-language static findings are source evidence; no runtime exploit or clearance is inferred. At-inception scans of the changed files during development are separately preserved by the owning task.",
+  "limits": "This is a changed-production-source projection, not whole-repository or dependency vulnerability coverage. Shell and Python code is inventoried but Snyk Code language coverage is not asserted for it. Tests, generated dist, native/installed execution, secret configuration and unchanged source outside these roots are not scanned here. Any finding requires exact per-fingerprint source/evidence review; no blanket waiver."
+}
