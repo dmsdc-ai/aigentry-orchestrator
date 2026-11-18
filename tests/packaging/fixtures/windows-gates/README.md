@@ -87,6 +87,31 @@ of the historical publish and read-back steps (6 x 10 s), and the literal itself
 to at least 10 minutes at 15–20 s. #1196 also compares the two workflows' `test`
 jobs with each other, parsed and byte for byte, allowing only release's
 `needs: guard`; a differing step `timeout-minutes` is refused.
+#1282 approves one further release-only region, the move to npm trusted
+publishing (OIDC). In `publish`: `id-token: write` sits beside the
+`contents: write` the GitHub Release needs and is the only id-token permission
+in the file; the packing `setup-node` keeps Node 20 and the npm cache and loses
+only `registry-url`, the key that makes setup-node write an `_authToken` npmrc;
+a second `setup-node` at Node 24 and a step that refuses any npm below 11.5.1
+run immediately before `Publish to npm`; and that step declares no environment
+at all and publishes with `npm_config_userconfig` pointed at a file it creates
+empty. The approved literal grows to those bytes, and the job's `permissions`
+bytes are held too, so the permission cannot be dropped, widened to the top
+level or moved to another job. The `NPM_TOKEN must be present` step is DELETED
+from `guard`: both fixtures' own copies of it are what the guard normalizer
+removes before the comparison, and it asserts they still carry it — the step,
+its token env and its emptiness test — so a regenerated fixture refuses instead
+of making the removal a silent no-op. Nothing is loosened. `admission precedes
+token` is replaced by identity -> tests -> `admission`, with `admission` last in
+`guard`, plus an outright prohibition: no job or step may reference the token,
+pass `NODE_AUTH_TOKEN`, set `registry-url` or carry the deleted gate, and the
+token expression may not appear in the workflow bytes even inside a comment. The
+single token mutation is replaced by twenty-five parsed and thirteen byte
+mutations that must each still be refused, covering a credential put back, the
+permission dropped, widened or moved, the auth npmrc restored on either
+`setup-node`, the packing Node raised so the shipped tarball would be repacked,
+the npm floor dropped, relaxed, conditioned or allowed to fail, the empty user
+npmrc dropped or redirected, and the token gate restored.
 The retired debt ratchet is replayed from the
 fixture only, as history. The security pin must be `UNREVIEWED` while no
 `release/security/<version>/policy.json` exists and exactly the sha256 of that

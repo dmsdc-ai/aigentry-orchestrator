@@ -1677,7 +1677,73 @@ function assertSandboxDepsBytes(source, label) {
 // (one read, then one every 15 s for 12 minutes) and names the registry's last answer. Restated here
 // as an independent literal and never derived from either workflow. It replaces the publish and
 // read-back steps both historical fixtures carry (6 x 10 s) and nothing else.
+//
+// #1282 — the second approved change to that job: the move to npm TRUSTED PUBLISHING (OIDC). No npm
+// token takes part in a release any more, so every assertion below that was coupled to one is
+// REPLACED and not relaxed, and the migration is held from four independent directions:
+//   * the job's own `permissions` bytes, so `id-token: write` is pinned to THIS job — deleting it,
+//     widening it to the top level, or moving it to another job leaves those bytes unmatched;
+//   * the packing `setup-node` bytes, which keep Node 20 and the npm cache and lose only
+//     `registry-url`, the key that makes setup-node write an `_authToken` npmrc;
+//   * the approved publish region bytes, grown to take in the second `setup-node` at Node 24, the
+//     npm >= 11.5.1 floor step that replaces the deleted token gate, and a publish step that
+//     declares NO environment at all and runs against a user npmrc it creates empty;
+//   * and, over the whole workflow, the prohibition that replaces the old ordering bound: no job
+//     or step may reference the npm token, pass `NODE_AUTH_TOKEN` or set `registry-url`
+//     (`assertNoNpmCredential`), and exactly one job may hold an id-token permission
+//     (`assertSingleIdToken`).
+// Every literal here is restated independently and is never derived from either workflow.
 const publishStepName = 'Publish to npm';
+const npmFloorStepName = 'The publishing toolchain must be able to do OIDC (npm >= 11.5.1)';
+const tokenGateName = 'NPM_TOKEN must be present';
+// #1282 — the publish job's permissions, with the bytes on either side of them, so the OIDC
+// permission can neither be dropped nor relocated without leaving this literal unmatched. The
+// `contents: write` the GitHub Release step needs is held here too, so the migration cannot be
+// "fixed" by replacing one permission with the other.
+const publishPermissionsBefore = `    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # gh release create
+    env:
+      PACKAGE: \${{ needs.guard.outputs.package }}
+`;
+const publishPermissionsAfter = `    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # gh release create
+      id-token: write  # npm trusted publishing (OIDC); the only job in this file that holds it
+    env:
+      PACKAGE: \${{ needs.guard.outputs.package }}
+`;
+// #1282 — the packing `setup-node`, which loses `registry-url` and nothing else. Node 20 and
+// `cache: npm` stay, because `npm ci` and `npm pack` still run there and the `test` job's T96
+// ship-set and smoke-init gates measured a tarball packed on Node 20. The historical literal
+// restates the key being removed, so a fixture that stopped carrying it would fail here rather
+// than make the removal a silent no-op.
+const publishSetupBefore = `      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          registry-url: 'https://registry.npmjs.org'
+`;
+const publishSetupAfter = `      # Node 20 and \`cache: npm\` are UNCHANGED here: \`npm ci\` and the \`npm pack\` below build the
+      # tarball this job publishes, and the \`test\` job's T96 ship-set and smoke-init gates
+      # measured a tarball packed on Node 20 (its matrix is Node [20]). The publishing toolchain
+      # is a SECOND setup-node further down, so no certified row moves and nothing re-packs.
+      #
+      # \`registry-url\` is DELETED, deliberately: with it, setup-node writes a
+      # \`//registry.npmjs.org/:_authToken=\${NODE_AUTH_TOKEN}\` line into this job's npmrc, which
+      # is precisely the mechanism that would let a stored token publish this package again.
+      # Without it the publish goes to npm's default registry — package.json declares
+      # \`publishConfig.access\` but no \`publishConfig.registry\` — which on a hosted runner is
+      # registry.npmjs.org, the same target as before.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+`;
+// The bytes on either side of the approved setup-node region in release.yml, so nothing can be
+// prepended or appended to it unseen.
+const publishSetupPrevious = '      - uses: actions/checkout@v4\n';
+const publishSetupNext = '      - name: Install dependencies\n        run: npm ci\n';
 const publishReadbackBefore = `      - name: Publish to npm
         if: steps.registry.outputs.exists != 'true'
         env:
@@ -1709,14 +1775,62 @@ const publishReadbackBefore = `      - name: Publish to npm
           fi
           echo "registry sha1 \${REMOTE} matches the packed tarball"
 `;
-const publishReadbackAfter = `      # #1196: \`id\` so the step below can name PUBLISH_FAILED. Skipped is not failure, so on
+const publishReadbackAfter = `      # Node 24, and only for the publish: npm trusted publishing needs npm >= 11.5.1, which the
+      # step after this one measures rather than assumes. Do NOT reach for node 22 on the
+      # strength of npm's "Node 22.14.0 or higher" line: node 22 ships npm 10.9.8, which has no
+      # OIDC. A SECOND setup-node rather than a bump of the first one, because the first one's
+      # Node is what packed the tarball the gates measured; publishing a tarball runs no build
+      # hook — the pack comment above says so — so nothing re-packs after this step and the bytes
+      # that reach npm are still the Node-20 bytes. No \`registry-url\` here either, for the reason
+      # the first setup-node carries, and no \`cache: npm\`: the install already happened on Node
+      # 20 and nothing below installs anything.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # The npm >= 11.5.1 floor trusted publishing requires, measured here and printed, so that
+      # "this toolchain could do OIDC" is a line in the log rather than an assumption about a
+      # runner image. This is also what is left of the deleted \`NPM_TOKEN must be present\` gate
+      # in \`guard\`: the cheap, loud refusal that comes BEFORE \`npm publish\`, so a toolchain that
+      # cannot exchange an OIDC token fails the run here instead of being discovered by the
+      # registry. It carries no condition on purpose — it measures this job's toolchain, not the
+      # publish decision, so it reports on the already-published re-run path too.
+      - name: The publishing toolchain must be able to do OIDC (npm >= 11.5.1)
+        run: |
+          set -euo pipefail
+          node --version
+          npm --version
+          node -e '
+            const measured = process.argv[1];
+            const [major, minor, patch] = measured.split(".").map(Number);
+            if (major < 11 || (major === 11 && (minor < 5 || (minor === 5 && patch < 1)))) {
+              console.error("::error::npm " + measured + " is below 11.5.1, the floor npm trusted publishing requires. This job cannot exchange an OIDC token for a publish credential, so it refuses here rather than at npm publish. Raise this job node-version until npm reports >= 11.5.1.");
+              process.exit(1);
+            }
+            console.log("npm " + measured + " >= 11.5.1: this toolchain can publish through OIDC");' "$(npm --version)"
+
+      # This publishes by npm trusted publishing (OIDC) and by nothing else; the job header above
+      # carries the npm-side registration it depends on. Why this step cannot quietly publish
+      # with a token instead: there is none to fall back to. It declares no environment at all
+      # and GitHub injects only the secrets a workflow names; neither setup-node above wrote an
+      # \`_authToken\` npmrc, because neither has a \`registry-url\`; and the command runs with
+      # \`npm_config_userconfig\` pointed at a file it creates empty, so no user- or global-level
+      # npmrc can supply auth either. A failed exchange is therefore a failed publish — which is
+      # what makes a green run evidence rather than a hope.
+      #
+      # npm attaches provenance by itself for a public repository and a public package; no flag
+      # is passed for it and nothing in this repository asserts its absence.
+      #
+      # #1196: \`id\` so the step below can name PUBLISH_FAILED. Skipped is not failure, so on
       # the already-published path every step below still runs; do not add an \`if:\` to them.
       - name: Publish to npm
         id: publish
         if: steps.registry.outputs.exists != 'true'
-        env:
-          NODE_AUTH_TOKEN: \${{ secrets.NPM_TOKEN }}
-        run: npm publish "\${{ steps.pack.outputs.tarball }}" --access public
+        run: |
+          set -euo pipefail
+          : > "\${RUNNER_TEMP}/empty-npmrc"
+          npm_config_userconfig="\${RUNNER_TEMP}/empty-npmrc" \\
+            npm publish "\${{ steps.pack.outputs.tarball }}" --access public
 
       # #1196, modelled on aigentry-telepty #1127. A red run has two causes that demand opposite
       # responses, and the badge alone cannot tell them apart. This step speaks for exactly one
@@ -1791,20 +1905,82 @@ const publishReadbackAfter = `      # #1196: \`id\` so the step below can name P
           fi
           echo "registry sha1 \${REMOTE} matches the packed tarball"
 `;
-// The bytes on either side of it in release.yml, so nothing can be prepended or appended unseen.
+// The bytes on either side of the approved publish region, same reason. `publishReadbackPrevious`
+// is the tail of the registry-existence step, which is unchanged, so the approved region now
+// starts at the comment above the second `setup-node`.
 const publishReadbackPrevious = '            exit 1\n          fi\n\n';
 const publishReadbackNext = '\n      # Second, independent proof: not the metadata npm reports, but the artifact a user\n';
 const parsePublishSteps = (label, bytes) => parse(label, `jobs:\n  publish:\n    steps:\n${bytes}`).jobs.publish.steps;
+const publishSetupSteps = {
+  historical: parsePublishSteps('historical-publish-setup-node', publishSetupBefore),
+  approved: parsePublishSteps('approved-publish-setup-node', publishSetupAfter),
+};
 const publishReadbackSteps = {
   historical: parsePublishSteps('historical-publish-readback', publishReadbackBefore),
   approved: parsePublishSteps('approved-publish-readback', publishReadbackAfter),
 };
 {
+  // #1282 — the packing setup-node, parsed: the ONE key that disappears is the one that writes an
+  // `_authToken` npmrc. Stated as a positive pair so neither half can drift: the historical step
+  // must really have carried it, and the approved step must be that same step minus exactly it.
+  assert.equal(publishSetupSteps.historical.length, 1, 'historical publishing setup-node step');
+  assert.equal(publishSetupSteps.approved.length, 1, 'approved publishing setup-node step');
+  const [historicalSetup] = publishSetupSteps.historical;
+  const [approvedSetup] = publishSetupSteps.approved;
+  assert.equal(historicalSetup.with['registry-url'], 'https://registry.npmjs.org',
+    'the historical publishing setup-node is the one that wrote an _authToken npmrc');
+  assert.deepEqual(approvedSetup, { ...historicalSetup, with: { 'node-version': '20', cache: 'npm' } },
+    'parsed, the publishing setup-node only loses its registry-url: the packing Node and the npm cache are unchanged');
+  assert.ok(!('registry-url' in approvedSetup.with), 'the approved publishing setup-node writes no npmrc at all');
+}
+{
   const [historicalPublish, historicalReadback] = publishReadbackSteps.historical;
-  const [approvedPublish, outcome, approvedReadback] = publishReadbackSteps.approved;
+  const [oidcSetup, floor, approvedPublish, outcome, approvedReadback] = publishReadbackSteps.approved;
   assert.equal(publishReadbackSteps.historical.length, 2, 'historical publish and read-back steps');
-  assert.equal(publishReadbackSteps.approved.length, 3, 'approved publish, outcome and read-back steps');
-  assert.deepEqual(approvedPublish, { ...historicalPublish, id: 'publish' }, 'parsed, the publish step only gains its id');
+  assert.equal(publishReadbackSteps.approved.length, 5,
+    'approved OIDC setup-node, npm floor, publish, outcome and read-back steps');
+  // #1282 — the publishing toolchain is a SECOND setup-node, so the Node that packed the tarball
+  // the gates measured does not move. It carries no registry-url (nothing may write an npmrc) and
+  // no cache (nothing installs after it), and Node 24 is what ships an npm that can do OIDC at all.
+  assert.deepEqual(oidcSetup, { uses: 'actions/setup-node@v4', with: { 'node-version': '24' } },
+    'the OIDC setup-node is Node 24 with no registry-url and no cache');
+  // #1282 — the floor step is what is left of the deleted `NPM_TOKEN must be present` gate, and it
+  // is strictly stronger: it measures the toolchain that actually authenticates, it refuses rather
+  // than warns, and it carries no condition, so it reports on the already-published path too.
+  assert.equal(floor.name, npmFloorStepName, 'the npm floor step is named for what it measures');
+  assert.ok(!('if' in floor), 'the npm floor step carries no condition, so it also reports on the already-published path');
+  assert.ok(!('continue-on-error' in floor), 'the npm floor step cannot swallow its own failure');
+  assert.match(floor.run, /^npm --version$/m, 'the npm floor step measures the npm it is about to publish with');
+  assert.match(floor.run, /major < 11 \|\| \(major === 11 && \(minor < 5 \|\| \(minor === 5 && patch < 1\)\)\)/,
+    'the npm floor step refuses every npm below 11.5.1, which is the floor trusted publishing requires');
+  assert.match(floor.run, /process\.exit\(1\);/, 'the npm floor step fails the job rather than printing a warning');
+  assert.match(floor.run, /::error::npm /, 'the npm floor step names the measured version in its refusal');
+  // #1196 + #1282 — the publish step gains its id AND holds no credential. The old statement was
+  // "only gains its id"; this one is that plus three measured absences, and the historical half is
+  // asserted to really have carried the token, so dropping it can never be a silent no-op.
+  assert.ok('env' in historicalPublish, 'the historical publish step is the one that carried an environment');
+  assert.deepEqual(historicalPublish.env, { NODE_AUTH_TOKEN: '${{ secrets.NPM_TOKEN }}' },
+    'the historical publish step authenticated with the npm token and nothing else');
+  const expectedPublish = { ...historicalPublish, id: 'publish', run: approvedPublish.run };
+  delete expectedPublish.env;
+  assert.deepEqual(approvedPublish, expectedPublish,
+    'parsed, the publish step gains its id, holds no credential at all, and changes only its script');
+  assert.ok(!('env' in approvedPublish),
+    'the approved publish step declares no environment, so GitHub injects no secret into it');
+  assert.doesNotMatch(approvedPublish.run, /NODE_AUTH_TOKEN|secrets\.|_authToken/,
+    'the approved publish command carries no credential either');
+  assert.equal(approvedPublish.if, "steps.registry.outputs.exists != 'true'",
+    'the approved publish step still skips a version the registry already serves');
+  // The two remaining absences of DESIGN §6.2, held as bytes of the command itself: an empty user
+  // npmrc is created, and the publish runs against it, so no inherited npmrc can supply auth.
+  assert.match(approvedPublish.run, /^: > "\$\{RUNNER_TEMP\}\/empty-npmrc"$/m,
+    'the approved publish creates an EMPTY user npmrc');
+  assert.match(approvedPublish.run, /^npm_config_userconfig="\$\{RUNNER_TEMP\}\/empty-npmrc" \\$/m,
+    'the approved publish runs against that empty user npmrc');
+  assert.match(approvedPublish.run, /^ {2}npm publish "\$\{\{ steps\.pack\.outputs\.tarball \}\}" --access public$/m,
+    'the approved publish still publishes exactly the packed tarball');
+  assert.equal(historicalPublish.run, 'npm publish "${{ steps.pack.outputs.tarball }}" --access public',
+    'the historical publish command, restated so the script change above is a measured one');
   assert.deepEqual(outcome, { name: 'Name the outcome when the publish itself failed', if: "failure() && steps.publish.outcome == 'failure'",
     run: outcome.run }, 'the outcome step runs only when the publish step failed');
   assert.deepEqual({ ...approvedReadback, run: historicalReadback.run }, historicalReadback, 'parsed, the read-back changes only its script');
@@ -1813,16 +1989,87 @@ const publishReadbackSteps = {
   const interval = Number(/^INTERVAL=(\d+)$/m.exec(approvedReadback.run)?.[1]);
   assert.ok(interval >= 15 && interval <= 20 && (attempts - 1) * interval >= 600, 'read-back polls every 15-20 s for at least 10 minutes');
 }
-function withApprovedPublishReadback(job) {
+// #1282 — the npm-credential prohibition, which REPLACES the ordering bound `admission precedes
+// token`. That bound accepted a credential as long as it came after the admission gate; this
+// refuses one anywhere in the workflow, under any key, in any job: the token expression itself,
+// the environment variable npm reads it from, and the `registry-url` that would make setup-node
+// write it into an npmrc. Applied to the PARSED workflow, so a prose comment explaining why these
+// must stay absent is not mistaken for a configuration that reintroduces them; the raw bytes are
+// held separately, and more strictly, by `assertPublishReadbackBytes`.
+const npmCredentialNeedles = [/secrets\.NPM_TOKEN/, /NODE_AUTH_TOKEN/, /_authToken/, /registry-url/];
+function assertNoNpmCredential(workflow, label) {
+  const top = structuredClone(workflow);
+  delete top.jobs;
+  for (const [id, item] of [['<top level>', top], ...Object.entries(workflow.jobs)]) {
+    const text = JSON.stringify(item);
+    for (const needle of npmCredentialNeedles) {
+      assert.doesNotMatch(text, needle, `${label} ${id}: no npm publish credential or auth npmrc (${needle.source})`);
+    }
+  }
+  // And the deleted gate itself cannot come back under its own name in any job, which is what a
+  // revert of the workflow alone — without the fixture normalizer below — would reintroduce.
+  for (const [id, job] of Object.entries(workflow.jobs)) {
+    assert.ok(!(job.steps ?? []).some(step => step.name === tokenGateName),
+      `${label} ${id}: the deleted npm token gate is not back`);
+  }
+}
+// #1282 — and the other half of that replacement: the permission that took the credential's place
+// exists in exactly one job. A permission every job inherits would hand an OIDC token to the
+// browser acceptance and to the Windows gates as well, which is the failure mode DOCS:9's
+// "the critical requirement" invites. `contents: write` is held here too, because the GitHub
+// Release step needs it and a migration that traded one for the other would break the release.
+function assertSingleIdToken(workflow, label) {
+  const holders = Object.entries(workflow.jobs).filter(([, job]) => job.permissions && 'id-token' in job.permissions);
+  assert.deepEqual(holders.map(([id]) => id), ['publish'], `${label}: exactly one job holds an id-token permission, and it is publish`);
+  assert.deepEqual(workflow.jobs.publish.permissions, { contents: 'write', 'id-token': 'write' },
+    `${label}: the publish job holds contents: write for the GitHub Release and id-token: write for OIDC, and nothing else`);
+  const top = structuredClone(workflow);
+  delete top.jobs;
+  assert.deepEqual(top.permissions, { contents: 'read' },
+    `${label}: the top-level permissions stay contents: read, so no job inherits an id-token`);
+}
+// #1282 — `withApprovedPublishReadback` grew into this: the publish job's whole approved region,
+// composed of three independent normalizations of the FROZEN FIXTURE, each with its own
+// precondition on the fixture so a regenerated or drifted fixture refuses instead of silently
+// agreeing. The fixture is still the baseline for every byte of the job outside these three.
+function withApprovedTrustedPublishing(job) {
   const copy = structuredClone(job);
+  // (1) #1282 — the OIDC permission. The fixture holds `contents: write` and nothing else.
+  assert.deepEqual(copy.permissions, { contents: 'write' },
+    'historical publish permissions are contents: write and nothing else');
+  copy.permissions = { contents: 'write', 'id-token': 'write' };
+  // (2) #1282 — the packing setup-node loses its registry-url. The fixture must still carry it.
+  const setups = copy.steps.filter(step => step.uses === 'actions/setup-node@v4');
+  assert.equal(setups.length, 1, 'the historical publish job sets up Node exactly once');
+  assert.deepEqual(setups[0], publishSetupSteps.historical[0], 'historical publishing setup-node, registry-url included');
+  copy.steps[copy.steps.indexOf(setups[0])] = structuredClone(publishSetupSteps.approved[0]);
+  // (3) #1196 + #1282 — the historical publish and read-back pair becomes the five approved steps.
   const start = copy.steps.indexOf(named(copy, publishStepName));
   assert.deepEqual(copy.steps.slice(start, start + 2), publishReadbackSteps.historical, 'historical publish and read-back steps');
   copy.steps.splice(start, 2, ...structuredClone(publishReadbackSteps.approved));
   return copy;
 }
 function assertPublishReadbackBytes(source, label) {
-  assert.equal(lf(source).split(`${publishReadbackPrevious}${publishReadbackAfter}${publishReadbackNext}`).length, 2,
-    `${label}: exactly the approved publish and registry read-back bytes`);
+  const bytes = lf(source);
+  assert.equal(bytes.split(`${publishSetupPrevious}${publishSetupAfter}${publishSetupNext}`).length, 2,
+    `${label}: exactly the approved publishing setup-node bytes, with no registry-url`);
+  assert.equal(bytes.split(publishSetupBefore).length, 1,
+    `${label}: the historical publishing setup-node bytes, registry-url included, are gone`);
+  assert.equal(bytes.split(`${publishReadbackPrevious}${publishReadbackAfter}${publishReadbackNext}`).length, 2,
+    `${label}: exactly the approved OIDC publish and registry read-back bytes`);
+  assert.equal(bytes.split(publishPermissionsAfter).length, 2,
+    `${label}: exactly the approved publish job permissions bytes, id-token: write included`);
+  assert.equal(bytes.split(publishPermissionsBefore).length, 1,
+    `${label}: the historical publish job permissions bytes, without the OIDC permission, are gone`);
+  // #1282 — exactly once in the whole file, and the literal above places that one occurrence
+  // inside the publish job's own permissions block. Together: exactly once, inside publish.
+  assert.equal(bytes.split('id-token: write').length, 2,
+    `${label}: id-token: write occurs exactly once in the whole workflow`);
+  // #1282 — the strictest form of the prohibition, on the raw bytes: the token expression may not
+  // appear at all, not even commented out, so no reviewer can mistake a disabled credential for a
+  // removed one and no editor can re-enable one by deleting a `#`.
+  assert.equal(bytes.split('secrets.NPM_TOKEN').length, 1,
+    `${label}: the npm token is not referenced anywhere in the workflow, in a step or in a comment`);
 }
 const approvedWindows = parse('approved-windows-contract', `jobs:\n${approvedWindowsRegion}`).jobs;
 assert.deepEqual(Object.keys(approvedWindows), [declared, ...ids], 'approved Windows contract names exactly the three successor jobs');
@@ -1897,6 +2144,27 @@ function assertPolicyPin(pin, policy) {
   assert.equal(pin, policy === null ? 'UNREVIEWED' : sha(policy),
     policy === null ? 'UNREVIEWED only while no policy exists for this version' : 'pin equals sha256 of the policy bytes');
 }
+// #1282 — the `NPM_TOKEN must be present` step is DELETED from `guard`, because npm trusted
+// publishing leaves no publish secret to check and a gate that fails on its absence would block
+// the migration. The fixture is still the baseline: this normalizes the FIXTURE's guard by
+// removing exactly that step, and the absence is ASSERTED rather than ignored. The fixture must
+// still carry the step (so a regenerated fixture cannot turn this into a silent no-op), that step
+// must be the one that actually read the token and tested it for emptiness, and removing it must
+// leave the historical guard with no npm-token reference at all — so the live guard being equal
+// to the result is the statement "guard lost the token gate and nothing else".
+function withoutTokenGate(job) {
+  const copy = structuredClone(job);
+  const step = named(copy, tokenGateName);
+  assert.deepEqual(step.env, { NPM_TOKEN: '${{ secrets.NPM_TOKEN }}' },
+    'the historical token gate is the step that read the npm token');
+  assert.match(step.run, /if \[ -z "\$\{NPM_TOKEN\}" \]; then/,
+    'the historical token gate tested the token for emptiness');
+  assert.match(step.run, /^\s*exit 1$/m, 'the historical token gate failed the run rather than warning');
+  copy.steps.splice(copy.steps.indexOf(step), 1);
+  assert.ok(!/secrets\.NPM_TOKEN|NODE_AUTH_TOKEN/.test(JSON.stringify(copy)),
+    'the token gate was the only npm-token reference in the historical guard');
+  return copy;
+}
 // Block-scalar bodies sit at ten spaces inside `run: |`; used for the exact byte exceptions.
 const debtIndent = body => body.split('\n').map(line => line ? '          ' + line : '').join('\n');
 // Only the parsed Bash function may differ from the rejected/archived CI block.
@@ -1946,18 +2214,29 @@ function validate(workflow, policy = currentPolicy()) {
   assert.equal(securityEnv.RELEASE_SECURITY_COMMIT, '${{ github.sha }}');
   delete securityEnv.RELEASE_SECURITY_POLICY_SHA256;
   delete securityEnv.RELEASE_SECURITY_COMMIT;
-  assert.deepEqual(guard, original.jobs.guard, 'guard changes only the required security trust inputs');
+  assert.deepEqual(guard, withoutTokenGate(original.jobs.guard),
+    'guard changes only the required security trust inputs and the deleted npm token gate');
   assert.deepEqual(workflow.jobs.test, withPinnedLinuxLeg(withApprovedSandboxDeps(withApprovedDispatchGuard(original.jobs.test, dispatchGuardSteps.release))),
     'unchanged test except the approved Dispatch guard suite and sandbox dependency steps and the pinned Linux image');
+  // #1282 — `admission precedes token` is REPLACED, because there is no token step to order any
+  // more. What it was protecting — the admission gate runs before anything that could publish —
+  // is restated as a longer chain over the steps that remain, plus the two statements the old
+  // bound could not make: identity -> tests -> admission, with admission LAST in `guard` so
+  // nothing can be slipped in after the gate, and the credential forbidden outright rather than
+  // merely placed late. `assertNoNpmCredential` and `assertSingleIdToken` are those two.
   const guardSteps = workflow.jobs.guard.steps;
+  const identity = guardSteps.indexOf(named(workflow.jobs.guard, 'Tag and package.json must name the same version'));
+  const tests = guardSteps.indexOf(named(workflow.jobs.guard, 'Release admission regression tests'));
   const admission = guardSteps.indexOf(named(workflow.jobs.guard, 'Release planning and changed-file admission'));
-  const token = guardSteps.indexOf(named(workflow.jobs.guard, 'NPM_TOKEN must be present'));
-  assert.ok(admission >= 0 && admission < token, 'admission precedes token');
+  assert.ok(identity >= 0 && tests > identity && admission > tests, 'identity -> tests -> admission');
+  assert.equal(admission, guardSteps.length - 1, 'the admission gate is the last thing guard does');
+  assertNoNpmCredential(workflow, 'release');
+  assertSingleIdToken(workflow, 'release');
   const publish = structuredClone(workflow.jobs.publish);
   assert.deepEqual(publish.needs, ['guard', 'test', declared, ...ids], 'gate and Windows successor publish dependencies');
   publish.needs = original.jobs.publish.needs;
-  assert.deepEqual(publish, withApprovedPublishReadback(original.jobs.publish),
-    'unchanged publish steps, secrets and permissions except the approved registry read-back');
+  assert.deepEqual(publish, withApprovedTrustedPublishing(original.jobs.publish),
+    'unchanged publish steps and permissions except the approved registry read-back and the approved trusted-publishing region');
   for (const id of [declared, ...ids]) {
     const job = workflow.jobs[id];
     assert.equal(job.needs, 'guard', `${id}: needs guard`);
@@ -2013,7 +2292,10 @@ function validateReleaseHistory(workflow, source = readFileSync(join(root, '.git
   const copy = withoutBrowser(workflow, true);
   const history = structuredClone(rejected);
   history.jobs.test = withPinnedLinuxLeg(withApprovedSandboxDeps(withApprovedDispatchGuard(history.jobs.test, dispatchGuardSteps.release)));
-  history.jobs.publish = withApprovedPublishReadback(history.jobs.publish);
+  // #1282 — the rejected source carries the token gate too, so the same asserted normalization is
+  // applied to it here. Both fixtures must still carry the step for either comparison to run.
+  history.jobs.guard = withoutTokenGate(history.jobs.guard);
+  history.jobs.publish = withApprovedTrustedPublishing(history.jobs.publish);
   for (const item of [copy, history]) {
     const env = named(item.jobs.guard, 'Release planning and changed-file admission').env ?? {};
     delete env.RELEASE_SECURITY_POLICY_SHA256;
@@ -2187,7 +2469,93 @@ mutants.push(['historical debt ratchet restored in place of the full suite', w =
 }]);
 mutants.push(['changed trigger', w => { w.on.workflow_dispatch = null; }]);
 mutants.push(['changed permissions', w => { w.permissions.contents = 'write'; }]);
-mutants.push(['admission after token', w => { w.jobs.guard.steps.reverse(); }]);
+// #1282 — `admission after token` is replaced by these. The step it reversed `guard` to expose is
+// gone, so what has to be refused now is any reordering of the chain that remains, the deleted
+// gate coming back, and anything appended after the admission gate.
+mutants.push(['guard steps reordered', w => { w.jobs.guard.steps.reverse(); }]);
+mutants.push(['admission moved before the identity step', w => {
+  const steps = w.jobs.guard.steps;
+  const admission = named(w.jobs.guard, 'Release planning and changed-file admission');
+  steps.splice(steps.indexOf(admission), 1);
+  steps.splice(steps.indexOf(named(w.jobs.guard, 'Tag and package.json must name the same version')), 0, admission);
+}]);
+mutants.push(['admission moved before the independent tests', w => {
+  const steps = w.jobs.guard.steps;
+  const admission = named(w.jobs.guard, 'Release planning and changed-file admission');
+  steps.splice(steps.indexOf(admission), 1);
+  steps.splice(steps.indexOf(named(w.jobs.guard, 'Release admission regression tests')), 0, admission);
+}]);
+mutants.push(['a step appended after the admission gate', w => {
+  w.jobs.guard.steps.push({ name: 'Anything at all', run: 'echo after the gate' });
+}]);
+mutants.push(['npm token gate restored in guard', w => {
+  w.jobs.guard.steps.push(structuredClone(named(original.jobs.guard, tokenGateName)));
+}]);
+// #1282 — and these replace the single `publish authentication changed` byte mutation: after the
+// migration there is no authentication line left to corrupt, so what must be refused is a
+// credential put back, the OIDC permission dropped, widened or moved, the auth npmrc restored,
+// the toolchain floor dropped or relaxed, and the empty user npmrc dropped.
+mutants.push(['publish step regains the token environment', w => {
+  named(w.jobs.publish, publishStepName).env = { NODE_AUTH_TOKEN: '${{ secrets.NPM_TOKEN }}' };
+}]);
+mutants.push(['publish step regains an arbitrary token environment', w => {
+  named(w.jobs.publish, publishStepName).env = { NODE_AUTH_TOKEN: 'arbitrary' };
+}]);
+mutants.push(['OIDC permission removed from publish', w => { delete w.jobs.publish.permissions['id-token']; }]);
+mutants.push(['OIDC permission moved from publish to the top level', w => {
+  delete w.jobs.publish.permissions['id-token'];
+  w.permissions['id-token'] = 'write';
+}]);
+mutants.push(['OIDC permission widened to every job', w => { w.permissions['id-token'] = 'write'; }]);
+mutants.push(['OIDC permission granted to the guard job as well', w => {
+  w.jobs.guard.permissions = { contents: 'read', 'id-token': 'write' };
+}]);
+mutants.push(['publish trades the GitHub Release permission for the OIDC one', w => {
+  w.jobs.publish.permissions = { 'id-token': 'write' };
+}]);
+for (const [label, index] of [['packing', 0], ['OIDC', 1]]) {
+  mutants.push([`${label} setup-node writes an auth npmrc again`, w => {
+    w.jobs.publish.steps.filter(step => step.uses === 'actions/setup-node@v4')[index].with['registry-url'] = 'https://registry.npmjs.org';
+  }]);
+}
+mutants.push(['OIDC setup-node reverted to Node 20', w => {
+  w.jobs.publish.steps.filter(step => step.uses === 'actions/setup-node@v4')[1].with['node-version'] = '20';
+}]);
+mutants.push(['OIDC setup-node removed', w => {
+  const steps = w.jobs.publish.steps;
+  steps.splice(steps.indexOf(steps.filter(step => step.uses === 'actions/setup-node@v4')[1]), 1);
+}]);
+mutants.push(['packing setup-node raised to Node 24, so the shipped tarball is repacked', w => {
+  w.jobs.publish.steps.filter(step => step.uses === 'actions/setup-node@v4')[0].with['node-version'] = '24';
+}]);
+mutants.push(['npm floor step removed', w => {
+  w.jobs.publish.steps = w.jobs.publish.steps.filter(step => step.name !== npmFloorStepName);
+}]);
+mutants.push(['npm floor step accepts npm 10', w => {
+  const step = named(w.jobs.publish, npmFloorStepName);
+  step.run = replaceOnce(step.run, 'major < 11 ||', 'major < 10 ||');
+}]);
+mutants.push(['npm floor step only warns', w => {
+  const step = named(w.jobs.publish, npmFloorStepName);
+  step.run = replaceOnce(step.run, '    process.exit(1);\n', '');
+}]);
+mutants.push(['npm floor step may fail', w => { named(w.jobs.publish, npmFloorStepName)['continue-on-error'] = true; }]);
+mutants.push(['npm floor step skipped on the already-published path', w => {
+  named(w.jobs.publish, npmFloorStepName).if = "steps.registry.outputs.exists != 'true'";
+}]);
+mutants.push(['publish stops emptying the user npmrc', w => {
+  const step = named(w.jobs.publish, publishStepName);
+  step.run = replaceOnce(step.run, ': > "${RUNNER_TEMP}/empty-npmrc"\n', '');
+}]);
+mutants.push(['publish stops using the empty user npmrc', w => {
+  const step = named(w.jobs.publish, publishStepName);
+  step.run = replaceOnce(step.run, 'npm_config_userconfig="${RUNNER_TEMP}/empty-npmrc" \\\n  ', '');
+}]);
+mutants.push(['publish points the user npmrc at the inherited one', w => {
+  const step = named(w.jobs.publish, publishStepName);
+  step.run = replaceOnce(step.run, ': > "${RUNNER_TEMP}/empty-npmrc"\n', '');
+  step.run = replaceOnce(step.run, '"${RUNNER_TEMP}/empty-npmrc"', '"$HOME/.npmrc"');
+}]);
 mutants.push(['W1 changed pass floor outside reader', w => { named(w.jobs[ids[0]], persistenceStep).run = commands.persistence.replace('-gt 20', '-gt 0'); }]);
 mutants.push(['W1 changed selected test glob outside reader', w => { named(w.jobs[ids[0]], persistenceStep).run = commands.persistence.replace('persistence/*.test.js', '*.test.js'); }]);
 mutants.push(['W1 reverted legacy reader', w => { named(w.jobs[ids[0]], persistenceStep).run = rejectedPersistence; }]);
@@ -4082,7 +4450,42 @@ const releaseBrowserMutations = [
   ['commit trust input missing', '          RELEASE_SECURITY_COMMIT: ${{ github.sha }}\n', ''],
   ['commit trust input changed', '          RELEASE_SECURITY_COMMIT: ${{ github.sha }}\n', '          RELEASE_SECURITY_COMMIT: main\n'],
   ['original release version input changed', '          RELEASE_VERSION: ${{ steps.identity.outputs.version }}\n', '          RELEASE_VERSION: arbitrary\n'],
-  ['publish authentication changed', '          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n', '          NODE_AUTH_TOKEN: arbitrary\n'],
+  // #1282 — `publish authentication changed` is REPLACED, not deleted: after the migration the
+  // line it corrupted does not exist, so the needle would no longer be unique-once and the case
+  // would fail with "unique mutation target" instead of measuring anything. These are the bytes
+  // that now carry the protection, each one refused by the byte comparisons above.
+  ['publish step regains a token environment', "        if: steps.registry.outputs.exists != 'true'\n        run: |\n",
+    "        if: steps.registry.outputs.exists != 'true'\n        env:\n          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n        run: |\n"],
+  ['publish job loses the OIDC permission',
+    '      id-token: write  # npm trusted publishing (OIDC); the only job in this file that holds it\n', ''],
+  ['OIDC permission comment rewritten so the one-job claim is lost',
+    '      id-token: write  # npm trusted publishing (OIDC); the only job in this file that holds it\n',
+    '      id-token: write\n'],
+  ['OIDC permission widened to the top level', 'permissions:\n  contents: read\n',
+    'permissions:\n  contents: read\n  id-token: write\n'],
+  ['publishing setup-node writes an auth npmrc again',
+    "          node-version: '20'\n          cache: npm\n      - name: Install dependencies\n",
+    "          node-version: '20'\n          cache: npm\n          registry-url: 'https://registry.npmjs.org'\n      - name: Install dependencies\n"],
+  ['OIDC setup-node reverted to Node 20', "          node-version: '24'\n", "          node-version: '20'\n"],
+  ['OIDC setup-node writes an auth npmrc', "          node-version: '24'\n",
+    "          node-version: '24'\n          registry-url: 'https://registry.npmjs.org'\n"],
+  ['npm toolchain floor accepts npm 10',
+    '            if (major < 11 || (major === 11 && (minor < 5 || (minor === 5 && patch < 1)))) {\n',
+    '            if (major < 10) {\n'],
+  ['npm toolchain floor only warns', '              process.exit(1);\n', ''],
+  ['npm toolchain floor step skipped once the version is published',
+    '      - name: The publishing toolchain must be able to do OIDC (npm >= 11.5.1)\n',
+    "      - name: The publishing toolchain must be able to do OIDC (npm >= 11.5.1)\n        if: steps.registry.outputs.exists != 'true'\n"],
+  ['publish loses its empty user npmrc',
+    '          : > "${RUNNER_TEMP}/empty-npmrc"\n          npm_config_userconfig="${RUNNER_TEMP}/empty-npmrc" \\\n            npm publish',
+    '          npm publish'],
+  ['publish stops emptying the user npmrc', '          : > "${RUNNER_TEMP}/empty-npmrc"\n', ''],
+  ['npm token gate restored in guard',
+    '        run: node scripts/release-admission.mjs --root "$GITHUB_WORKSPACE" --version "$RELEASE_VERSION"\n',
+    '        run: node scripts/release-admission.mjs --root "$GITHUB_WORKSPACE" --version "$RELEASE_VERSION"\n'
+      + '      - name: NPM_TOKEN must be present\n        env:\n          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}\n'
+      + '        run: |\n          set -euo pipefail\n          if [ -z "${NPM_TOKEN}" ]; then\n'
+      + '            exit 1\n          fi\n          echo "NPM_TOKEN is present"\n'],
   // #1171 — the Dispatch guard suite step must stay the approved bytes CI carries too.
   ['Dispatch guard suite cap back to 4', 'release.yml carries the same lines.\n        timeout-minutes: 12\n',
     'release.yml carries the same lines.\n        timeout-minutes: 4\n'],

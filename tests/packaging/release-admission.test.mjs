@@ -622,8 +622,35 @@ function assertWorkflowContract(text, policy = currentPolicy()) {
   const identity = steps.findIndex(s => /id: identity\b/.test(s));
   const tests = steps.findIndex(s => /run:\s*(?:\|\s*)?node --test tests\/packaging\/release-admission\.test\.mjs\b/.test(s));
   const admission = steps.findIndex(s => /run:\s*(?:\|\s*)?node scripts\/release-admission\.mjs\b/.test(s));
-  const secret = steps.findIndex(s => /secrets\.NPM_TOKEN/.test(s));
-  assert.ok(identity >= 0 && tests > identity && admission > tests && secret > admission, 'identity -> tests -> gate -> secret');
+  // #1282 — `identity -> tests -> gate -> secret` is REPLACED, not dropped. The `NPM_TOKEN must be
+  // present` step it ordered last no longer exists: npm trusted publishing (OIDC) leaves no publish
+  // secret for `guard` to check, and the cheap fail-fast it provided moved into `publish` as the
+  // npm >= 11.5.1 floor step, which measures the toolchain that actually authenticates. What that
+  // bound was protecting is the admission gate running before anything that could publish, so it is
+  // restated here as a longer chain plus the two statements the old one could not make: the gate is
+  // the LAST thing `guard` does, so nothing may be slipped in behind it, and the credential is
+  // forbidden outright rather than merely required to come late. Ordering a credential was always
+  // weaker than refusing one.
+  assert.ok(identity >= 0 && tests > identity && admission > tests, 'identity -> tests -> admission');
+  assert.equal(admission, steps.length - 1, 'admission is the last step in guard: nothing runs after the gate');
+  // The token expression may not appear in the workflow at all — not in a step, and not commented
+  // out, so a disabled credential can never be mistaken for a removed one.
+  assert.doesNotMatch(text.replace(/\r\n/g, '\n'), /secrets\.NPM_TOKEN/,
+    'no npm publish credential is referenced anywhere in the release workflow');
+  // And no step may pass the variable npm reads a token from, or set the `registry-url` that makes
+  // setup-node write one into an npmrc. Checked on the comment-stripped source, so the prose that
+  // explains why these must stay absent is not mistaken for configuration that brings them back.
+  assert.doesNotMatch(source, /NODE_AUTH_TOKEN|registry-url|_authToken/,
+    'no step passes a publish token or makes setup-node write an auth npmrc');
+  // The permission that replaced the credential exists exactly once in the file, and these bytes
+  // put that one occurrence inside the publish job's own permissions block: together, exactly
+  // once, inside `publish`. A permission the top level granted would reach every job.
+  assert.equal(text.replace(/\r\n/g, '\n').split('id-token: write').length, 2,
+    'id-token: write occurs exactly once in the release workflow');
+  assert.match(publish, /^    permissions:\n      contents: write[^\n]*\n      id-token: write[^\n]*$/m,
+    'the id-token: write permission is the publish job\'s own, beside the contents: write the GitHub Release needs');
+  assert.doesNotMatch(source, /^permissions:\n(?:  [^\n]*\n)*  id-token:/m,
+    'the top-level permissions grant no id-token to every job');
   for (const index of [tests, admission]) {
     assert.doesNotMatch(steps[index], /continue-on-error:\s*true|\|\|\s*true|^\s*if:|\bexit\s+0\b/m, 'gate cannot skip or swallow failure');
   }
@@ -637,7 +664,7 @@ function assertWorkflowContract(text, policy = currentPolicy()) {
   assert.doesNotMatch(steps[admission], /sha256sum|shasum|hashFiles|SKIP|BYPASS/);
 }
 
-test('workflow runs independent tests and admission in guard before credentials and publish', () => {
+test('workflow runs independent tests and admission last in guard, and holds no publish credential anywhere', () => {
   assertWorkflowContract(readFileSync(workflow, 'utf8'));
 });
 
@@ -710,6 +737,17 @@ for (const [ending, newline] of [['LF', '\n'], ['CRLF', '\r\n']]) {
       `${browserStepName}        if: false\n`), /browser gate cannot skip/],
     ['browser step swallows failure', 'browser-tls', job => job.replace(onlyOccurrence(job, browserStepRun),
       () => browserStepRun.replace(/\n$/, ' || true\n')), /browser gate cannot skip/],
+    // #1282 — the two negatives that prove the replacement assertions above actually bite. Each
+    // is a plausible half-migration: a credential put back under the publish step, and the OIDC
+    // permission removed from the job that needs it.
+    ['publish step regains a token environment', 'publish', job => job.replace(
+      onlyOccurrence(job, "        if: steps.registry.outputs.exists != 'true'\n        run: |\n"),
+      () => "        if: steps.registry.outputs.exists != 'true'\n        env:\n"
+        + '          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n        run: |\n'),
+      /no npm publish credential/],
+    ['publish job loses the OIDC permission', 'publish', job => job.replace(
+      onlyOccurrence(job, '      id-token: write  # npm trusted publishing (OIDC); the only job in this file that holds it\n'),
+      ''), /id-token: write occurs exactly once/],
   ];
   for (const [label, name, mutate, diagnostic] of bypasses) {
     test(`workflow contract rejects ${ending} ${label}`, () => {

@@ -23,8 +23,10 @@ and responds via inject back.
 
 - Pre-commit / pre-publish hook fails for unclear reason → inject with
   hook output before retry / decision.
-- Auth missing (NPM_TOKEN / git push credentials / etc.) → inject; never
-  attempt anonymous publish or force.
+- Auth missing or refused (npm trusted-publishing OIDC exchange / git push
+  credentials / etc.) → inject; never attempt anonymous publish or force, and
+  never reach for a stored npm token: this package publishes through npm
+  Trusted Publishing from `release.yml` and holds no publish secret.
 - Network / registry / mirror unreachable → inject with the error; do
   not fall back silently to another registry.
 - Branch state surprise (non-fast-forward, unexpected diverged history,
