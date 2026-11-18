@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "release_group": "release-1270",
+  "release_task": 1270,
+  "package": "@dmsdc-ai/aigentry-orchestrator",
+  "version": "0.2.6",
+  "base_tag": "v0.2.5",
+  "base_commit": "c90a75fee78cdedf8671e46beb79e52b0f544942",
+  "tasks": [
+    {
+      "task_id": 1270,
+      "disposition": "shipping",
+      "scope": "Non-destructive exact-local boot preflight that never kills, stops, repairs or restarts an existing session or daemon, bounded readiness capture, and no forced submit or retry on dispatch are included; bound delivery of a qualified-busy non-spawned --target through telepty inject-bound-v1, pinned to one session epoch and owner generation, is included and reports ACCEPTED_PENDING, which is never a verified delivery; named BOUND_INJECT_UNSUPPORTED (78) and BOUND_INJECT_REFUSED (3) refusals and a held, never-replayed unknown outcome (7) are included; the stranded-composer report prints the operator's own telepty clear-strand-v1 procedure and never clears. These paths require @dmsdc-ai/aigentry-telepty 0.11.1 or later on the daemon and on every restarted bridge. Also included are the release records: package version, lockfile, changelog, public projection, dispositions, this manifest, the security evidence blobs, the policy path and release-workflow ownership. Not established: native busy queueing or model receipt by any automated test, a real strand followed by a successful clear outside mocks, bound delivery for a collapsed one-line Claude viewport or a codex footer without the warnings suffix, and the unchanged dispatch-verify.sh set -e defect. Publication requires controller-reviewed exact policy bytes, a literal workflow pin to their SHA-256, exact integrated CI including Windows W1 and W0, then registry verification.",
+      "paths": [
+        ".github/workflows/bridge-reader-1270.yml",
+        ".github/workflows/installed-boot-1270.yml",
+        ".github/workflows/release.yml",
+        "CHANGELOG.md",
+        "bin/current_screen.py",
+        "bin/dispatch-verify.sh",
+        "bin/lib/platform-unix.sh",
+        "bin/session-probe.py",
+        "package-lock.json",
+        "package.json",
+        "release/0.2.6-dispositions.md",
+        "release/0.2.6.json",
+        "release/security/0.2.6/blobs/8932c9c18dc627a104762cfbd2cadd22fdcc7909d56a1ae98cd65ff0d24b62e8",
+        "release/security/0.2.6/blobs/9f5c73bc183a86b23e88cba30c079e032bbd380b1f610330ec5fb3fe0296f2d3",
+        "release/security/0.2.6/blobs/f83d49d911b24838382381cb5b2a5f0bb9efd8936835e76d1cc702086caa6b42",
+        "release/security/0.2.6/policy.json",
+        "release/tasks.json",
+        "src/bridge-auditor/cli.ts",
+        "src/cleanup/cli.ts",
+        "src/dispatch/cli.ts",
+        "src/dispatch/usage.ts",
+        "src/orchestrator-boot/cli.ts",
+        "src/orchestrator-boot/plan.ts",
+        "src/orchestrator-boot/usage.ts",
+        "src/orchestrator-boot/wizard.ts",
+        "tests/context-handoff/acceptance.test.ts",
+        "tests/dispatch/T106_cleanup_cli_contract.sh",
+        "tests/dispatch/T127_bridge_auditor_parity.sh",
+        "tests/dispatch/T131_orchestrator_boot_parity.sh",
+        "tests/dispatch/T132_orchestrator_boot_workspace_shim.sh",
+        "tests/dispatch/T134_orchestrator_boot_noexec.sh",
+        "tests/dispatch/T135_orchestrator_boot_handoff.sh",
+        "tests/dispatch/T26_reconciler_inv17_surface_gone.sh",
+        "tests/dispatch/T40_orchestrator_singleton_guard.sh",
+        "tests/dispatch/T52_cleanup_self_ancestor_guard.sh",
+        "tests/dispatch/agent-metadata/g2c-pinned-clear.test.mjs",
+        "tests/dispatch/agent-metadata/support/pinned-clear-actuators.mjs",
+        "tests/dispatch/busy-bound-inject.test.ts",
+        "tests/packaging/installed-boot-selector.test.mjs",
+        "tests/packaging/native-capture.test.mjs",
+        "tests/packaging/orchestrator-boot-wizard.test.mjs",
+        "tests/report/mandatory-report-1170-review.test.mjs",
+        "tests/report/mandatory-report-1170-rework-boundaries.test.mjs",
+        "tests/report/mandatory-report-1170.test.mjs",
+        "tests/session/controller-boot-record.test.ts"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.6-dispositions.md",
+          "sha256": "85cc79c259867afd3faef465f9ef8cc2fcebb506032df44675fd1074b7906afe"
+        }
+      ]
+    }
+  ]
+}
