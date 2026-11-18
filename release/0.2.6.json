@@ -13,6 +13,7 @@
       "scope": "Non-destructive exact-local boot preflight that never kills, stops, repairs or restarts an existing session or daemon, bounded readiness capture, and no forced submit or retry on dispatch are included; bound delivery of a qualified-busy non-spawned --target through telepty inject-bound-v1, pinned to one session epoch and owner generation, is included and reports ACCEPTED_PENDING, which is never a verified delivery; named BOUND_INJECT_UNSUPPORTED (78) and BOUND_INJECT_REFUSED (3) refusals and a held, never-replayed unknown outcome (7) are included; the stranded-composer report prints the operator's own telepty clear-strand-v1 procedure and never clears. These paths require @dmsdc-ai/aigentry-telepty 0.11.1 or later on the daemon and on every restarted bridge. Also included are the release records: package version, lockfile, changelog, public projection, dispositions, this manifest, the security evidence blobs, the policy path and release-workflow ownership. Not established: native busy queueing or model receipt by any automated test, a real strand followed by a successful clear outside mocks, bound delivery for a collapsed one-line Claude viewport or a codex footer without the warnings suffix, and the unchanged dispatch-verify.sh set -e defect. Publication requires controller-reviewed exact policy bytes, a literal workflow pin to their SHA-256, exact integrated CI including Windows W1 and W0, then registry verification.",
       "paths": [
         ".github/workflows/bridge-reader-1270.yml",
+        ".github/workflows/ci.yml",
         ".github/workflows/installed-boot-1270.yml",
         ".github/workflows/release.yml",
         "CHANGELOG.md",
@@ -53,6 +54,7 @@
         "tests/packaging/installed-boot-selector.test.mjs",
         "tests/packaging/native-capture.test.mjs",
         "tests/packaging/orchestrator-boot-wizard.test.mjs",
+        "tests/packaging/windows-release-gates.test.mjs",
         "tests/report/mandatory-report-1170-review.test.mjs",
         "tests/report/mandatory-report-1170-rework-boundaries.test.mjs",
         "tests/report/mandatory-report-1170.test.mjs",
@@ -61,7 +63,7 @@
       "evidence": [
         {
           "path": "release/0.2.6-dispositions.md",
-          "sha256": "85cc79c259867afd3faef465f9ef8cc2fcebb506032df44675fd1074b7906afe"
+          "sha256": "b748510b60031f8508780036fc81e7a14648bb703c2229f34d9e46f7af3b1c75"
         }
       ]
     }
