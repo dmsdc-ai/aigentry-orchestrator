@@ -27,6 +27,17 @@ const POSIX = process.platform === "darwin" || process.platform === "linux";
 const SKIP = POSIX ? false : `POSIX-only rework boundaries; not run on ${process.platform}`;
 const H = POSIX ? await import("../dispatch/agent-metadata/support/harness.mjs") : null;
 const K = POSIX ? worldKit(H) : null;
+// Task 1270: cleanup's read-only versioned-bridge precheck (`ps -eo pid,ppid,command`) runs BEFORE report capture. A
+// capture-failure world configures an explicit SUCCESSFUL empty process view (existing psTable schema; the fake's
+// rc-97 trap stays for everything unconfigured), and the refused cleanup's trace must be EXACTLY that one precheck
+// first, then report-list, with no other non-registry call.
+const EMPTY_PS_VIEW = "  PID  PPID COMMAND\n";
+const PRECHECK = { role: "ps", argv: ["-eo", "pid,ppid,command"], rc: 0 };
+function assertPrecheckOnly(calls, label) {
+  assert.deepEqual(calls[0], PRECHECK, `${label}: the first call is the successful read-only precheck`);
+  assert.deepEqual([calls[1]?.role, calls[1]?.argv[0]], ["dispatch-registry.py", "report-list"], `${label}: capture follows the precheck`);
+  assert.deepEqual(calls.filter((c) => c.role !== "dispatch-registry.py"), [PRECHECK], `${label}: no teardown actuator reached`);
+}
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const DISPATCH_CLI = path.join(REPO, "dist/src/dispatch/cli.js");
 
@@ -218,11 +229,12 @@ test("R3b genuine registry storage failure on capture stays capture_event_9 and 
   assert.equal(field(p.stdout, "capture_failed"), 1, p.stdout);
   assert.match(p.stdout, new RegExp(`errors=\\S*${d.did}:capture_event_9`));
   assert.equal(health(w).ignored[d.did], undefined, "a storage failure is never `ignored`");
+  w.set({ psTable: EMPTY_PS_VIEW });
   const m = w.mark();
   const c = H.sh(process.execPath, [path.join(REPO, "dist/src/cleanup/cli.js"), wk.sid], { env: { ...w.env, ...FAULT }, timeout: 60000 });
   assert.equal(c.status, 1, c.stdout + c.stderr);
   assert.match(c.stderr, new RegExp(`REPORT_CAPTURE_FAILED for ${wk.sid}: ${d.did}:capture_event_9`));
-  assert.deepEqual(w.since(m).filter((x) => x.role !== "dispatch-registry.py"), [], "no teardown actuator reached");
+  assertPrecheckOnly(w.since(m), "R3b");
   assert.equal(w.activeRaw(), before, "registry untouched");
   assert.ok(fs.readFileSync(item.file).equals(item.bytes), "worker evidence preserved");
   // positive control: same world, storage healthy ⇒ captured, cleanup proceeds

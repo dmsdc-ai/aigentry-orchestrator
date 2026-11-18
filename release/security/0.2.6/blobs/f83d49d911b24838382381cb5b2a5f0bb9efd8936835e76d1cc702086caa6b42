@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "sarif_sha256": "8932c9c18dc627a104762cfbd2cadd22fdcc7909d56a1ae98cd65ff0d24b62e8",
+  "original_receipt_sha256": "812ea9c5e149246a4baae3b607d8b519ec54210dcaca5fa7ec6aef14c81be976",
+  "stdout_sha256": "8932c9c18dc627a104762cfbd2cadd22fdcc7909d56a1ae98cd65ff0d24b62e8",
+  "manifest_sha256": "a6eb4214fe3a866c391943a3e4ae58d362e44ae774e78c0bfec04851b746b4e4",
+  "exit": 0,
+  "findings": 0,
+  "severities": {
+    "high": 0,
+    "medium": 0,
+    "low": 0,
+    "unknown": 0
+  },
+  "timed_out": false,
+  "overflow": false,
+  "signal": null,
+  "sarif_valid": true,
+  "representation": "stdout-exact"
+}

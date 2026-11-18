@@ -291,13 +291,15 @@ const snapshot = ps.stdout || "";
  * and the confirm-live-pid hedge in the HOLD text stays exactly as it was.
  */
 const INTERPRETERS = new Set(["node", "nodejs"]);
+// Task 1270: the boot's versioned create-only verb is a bridge too. Exact tokens, no prefix.
+const BRIDGE_VERBS = new Set(["allow", "allow-create-v1"]);
 function isOrchestratorBridge(cmd: string[]): boolean {
   if (cmd.length === 0) return false;
   let i = 0;
   if (INTERPRETERS.has(path.basename(cmd[0]))) i = 1;
   if (i >= cmd.length) return false;
   if (path.basename(cmd[i]) !== "telepty") return false;
-  if (cmd[i + 1] !== "allow") return false;
+  if (!BRIDGE_VERBS.has(cmd[i + 1])) return false;
   for (let j = i + 2; j + 1 < cmd.length; j++) {
     if (cmd[j] === "--id" && cmd[j + 1] === ORCH_SID) return true;
   }

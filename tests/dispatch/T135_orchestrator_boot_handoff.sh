@@ -23,6 +23,13 @@
 # synthetic transcripts (tests/fixtures/context-handoff/), every store-root override is unset,
 # `ps`, `kill`, `telepty` and `curl` are recorders, the sid is a fixture sid, and the exec
 # target is a recorder on a private PATH.
+#
+# TASK 1270 MIGRATION (boot-guard-coupling). A real boot now runs a bounded preflight before it emits
+# argv: `telepty boot-capabilities` from PATH (a private stub answering ONLY that argv with the sealed
+# one-line document), then GET /api/meta and GET /api/sessions/<sid> through the CURL seam; only a 404
+# (FRESH) emits `telepty allow-create-v1 --id <sid> --auto-restart <tail>`. So the expected verb is
+# `allow-create-v1`, and the real-boot rows' "curl never fires" becomes "exactly one capability probe and
+# the two exact GETs, nothing killed or deleted". A dry run still probes nothing (assert_inert is unchanged).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
@@ -89,25 +96,69 @@ cat > "$STUB_BIN/telepty-recorder135.sh" <<EOF
 printf '%s\n' "\$*" >> "$TELEPTY_ARGV"
 cat "$STUB_LIST_FILE"
 EOF
+# Task 1270: the preflight's two GETs, answered by route as `<body>\n<code>` — FRESH: meta with both
+# capabilities, the exact fixture sid 404. Full argv recorded; any other URL fails the transport.
+# One entry per curl INVOCATION: `<method> <last argv element>` (method = the -X value, else GET). The raw
+# CURL_LOG keeps the full argv, whose `-w` argument holds a real newline, so its physical lines are not calls.
+CURL_JOURNAL="$T_TMP/curl-journal.log"
 cat > "$STUB_BIN/curl-recorder135.sh" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$CURL_LOG"
-printf '200'
+m=GET; p=""
+for a in "\$@"; do if [ "\$p" = -X ]; then m="\$a"; fi; p="\$a"; done
+printf '%s %s\n' "\$m" "\${!#}" >> "$CURL_JOURNAL"
+case "\${!#}" in
+  http://127.0.0.1:3848/api/meta)          printf '%s\n200' '{"capabilities":["sessions","wrapped-sessions","register-create-only"]}' ;;
+  http://127.0.0.1:3848/api/sessions/$SID) printf '%s\n404' '{"error":"Session not found"}' ;;
+  *)                                       printf '\n000'; exit 7 ;;
+esac
 EOF
+# Task 1270: the capability probe — EXACTLY `telepty boot-capabilities` — resolved from PATH by the boot. One
+# branch shared by the private caps stub (prepended to PATH for every row) and the exec recorder, so a probe is
+# logged to CAPS_LOG and never mistaken for the exec; any other argv on the caps stub is a tripwire.
+CAPS_DIR="$T_TMP/caps-path"; mkdir -p "$CAPS_DIR"
+CAPS_LOG="$T_TMP/caps-calls.log"; CAPS_TRIP="$T_TMP/caps-tripwire.log"
+CAPS_BRANCH="if [ \"\$#\" = 1 ] && [ \"\$1\" = boot-capabilities ]; then printf 'boot-capabilities\n' >> \"$CAPS_LOG\"; printf '%s\n' '{\"schema\":\"telepty-boot-capabilities-v1\",\"verbs\":[\"allow-create-v1\"],\"viewer_detach\":\"nondeleting-v1\"}'; exit 0; fi"
+cat > "$CAPS_DIR/telepty" <<EOF
+#!/usr/bin/env bash
+$CAPS_BRANCH
+printf '%s\n' "\$*" >> "$CAPS_TRIP"
+exit 97
+EOF
+export PATH="$CAPS_DIR:$PATH"
 EXEC_DIR="$T_TMP/exec-path"; mkdir -p "$EXEC_DIR"
 cat > "$EXEC_DIR/telepty" <<EOF
 #!/usr/bin/env bash
+$CAPS_BRANCH
 printf '%s\n' "\$@" > "$EXEC_LOG"
 EOF
-chmod +x "$STUB_BIN"/*135.sh "$EXEC_DIR/telepty"
+chmod +x "$STUB_BIN"/*135.sh "$EXEC_DIR/telepty" "$CAPS_DIR/telepty"
 export SINGLETON_PS_CMD="$STUB_BIN/ps-recorder135.sh" KILL_CMD="$STUB_BIN/kill-recorder135.sh"
 export TELEPTY="$STUB_BIN/telepty-recorder135.sh" CURL="$STUB_BIN/curl-recorder135.sh"
-reset() { : > "$PS_ARGV"; : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$TELEPTY_ARGV"; : > "$EXEC_LOG"; : > "$AUTH_LOG"; }
+reset() { : > "$PS_ARGV"; : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$CURL_JOURNAL"; : > "$TELEPTY_ARGV"; : > "$EXEC_LOG"; : > "$AUTH_LOG"; : > "$CAPS_LOG"; : > "$CAPS_TRIP"; }
 lines() { grep -c . "$1" 2>/dev/null || true; }
 assert_inert() {
   [ "$(lines "$KILL_LOG")" = 0 ] || fail "$1: a kill was issued: $(cat "$KILL_LOG")"
   [ "$(lines "$CURL_LOG")" = 0 ] || fail "$1: a registry request was issued: $(cat "$CURL_LOG")"
   [ "$(lines "$EXEC_LOG")" = 0 ] || fail "$1: the exec recorder fired: $(cat "$EXEC_LOG")"
+  [ "$(lines "$CAPS_LOG")" = 0 ] || fail "$1: the capability probe ran: $(cat "$CAPS_LOG")"
+  [ "$(lines "$CAPS_TRIP")" = 0 ] || fail "$1: telepty ran with an unexpected argv: $(cat "$CAPS_TRIP")"
+}
+# assert_preflight_only <label> — a REAL boot's only effects: one capability probe, then exactly GET /api/meta and
+# GET /api/sessions/<sid>, each carrying the synthetic credential; no kill, no DELETE, no listing, no ps.
+assert_preflight_only() {
+  [ "$(lines "$CAPS_LOG")" = 1 ] || fail "$1: expected exactly one capability probe: $(cat "$CAPS_LOG")"
+  [ "$(lines "$CAPS_TRIP")" = 0 ] || fail "$1: telepty ran with an unexpected argv: $(cat "$CAPS_TRIP")"
+  [ "$(grep -c '' "$CURL_JOURNAL")" = 2 ] || fail "$1: expected exactly the two preflight GETs (curl invocations): $(cat "$CURL_JOURNAL")"
+  [ "$(sed -n '1p' "$CURL_JOURNAL")" = "GET http://127.0.0.1:3848/api/meta" ] || fail "$1: first request is not GET /api/meta: $(cat "$CURL_JOURNAL")"
+  [ "$(sed -n '2p' "$CURL_JOURNAL")" = "GET http://127.0.0.1:3848/api/sessions/$SID" ] || fail "$1: second request is not GET /api/sessions/$SID: $(cat "$CURL_JOURNAL")"
+  [ "$(grep -c 'x-telepty-token: fixture-token-T135' "$CURL_LOG")" = 2 ] || fail "$1: the two GETs did not both carry the credential"
+  grep -q -- '-X DELETE' "$CURL_LOG" && fail "$1: a DELETE was issued: $(cat "$CURL_LOG")"
+  [ "$(lines "$KILL_LOG")" = 0 ] || fail "$1: a kill was issued: $(cat "$KILL_LOG")"
+  [ "$(lines "$PS_ARGV")" = 0 ] || fail "$1: the process table was read: $(cat "$PS_ARGV")"
+  [ "$(lines "$TELEPTY_ARGV")" = 0 ] || fail "$1: the registry listing was read: $(cat "$TELEPTY_ARGV")"
+  [ "$(lines "$EXEC_LOG")" = 0 ] || fail "$1: the exec recorder fired (the compiled CLI prints argv, never execs): $(cat "$EXEC_LOG")"
+  return 0
 }
 
 # ── planting synthetic transcripts through the compiled fixture harness ─────────────────
@@ -135,9 +186,10 @@ perm_for() {
     grok)   echo 'approval=default;sandbox=strict' ;;
   esac
 }
-# today's argv for a restrictive new plan, one element per line (T134 block H)
+# today's argv for a restrictive new plan, one element per line (T134 block H). Task 1270: the
+# versioned create-only verb `allow-create-v1` (the measured delivery), not the legacy `allow`.
 today_argv() {
-  printf '%s\n' telepty allow --id "$SID" --auto-restart
+  printf '%s\n' telepty allow-create-v1 --id "$SID" --auto-restart
   case "$1" in
     claude) printf '%s\n' claude --permission-mode manual ;;
     codex)  printf '%s\n' codex --ask-for-approval on-request --sandbox read-only ;;
@@ -203,7 +255,7 @@ grep -qE "^\[orchestrator-boot\] handoff: written source=codex:$NEW_ID8 last=[^ 
 grep -q 'boot record: written' "$B_ERR" || fail "B: the boot record was not written, so boot_id sharing is unmeasured: $(cat "$B_ERR")"
 # SPEC F4: content never reaches argv, the exec log line, or anything else ps or a log can see.
 grep -q 'CH-CODEX' "$B_OUT" "$B_ERR" && fail "B: handoff content leaked to stdout/stderr"
-assert_inert "B"
+assert_preflight_only "B"
 # Through the SHIM: the process that replaces the shell carries the pointer tokens.
 reset
 (cd "$WS" && ORCHESTRATOR_CLI=claude AIGENTRY_BOOT_PERMISSION='approval=manual' PATH="$EXEC_DIR:$PATH" bash "$BOOT") >/dev/null 2>"$T_TMP/b2.err" \
@@ -224,7 +276,7 @@ c_boot() { # c_boot <label> <workspace> [env assignments…]
   today_argv claude > "$T_TMP/c.expected"
   cmp "$T_TMP/c.expected" "$out" || fail "C/$label: stdout is not today's argv: $(cat "$out")"
   grep -qE '^\[orchestrator-boot\] handoff: skipped:' "$err" || fail "C/$label: no 'handoff: skipped:*' line: $(cat "$err")"
-  assert_inert "C/$label"
+  assert_preflight_only "C/$label"
 }
 rm -rf "$WS/state/handoff"
 NEW_REAL="$T_TMP/codex-real.jsonl"
@@ -276,7 +328,7 @@ for mode in off bogus; do
   if [ "$mode" = bogus ]; then
     grep -q 'AIGENTRY_HANDOFF' "$T_TMP/d.err" || fail "D/bogus: no warning naming AIGENTRY_HANDOFF: $(cat "$T_TMP/d.err")"
   fi
-  assert_inert "D/$mode"
+  assert_preflight_only "D/$mode"
 done
 echo "T135 D PASS (off and bogus give today's argv)"
 
@@ -290,7 +342,7 @@ reset
 cmp "$T_TMP/e.expected" "$T_TMP/e.out" || fail "E: history=last argv changed: $(cat "$T_TMP/e.out")"
 grep -qF 'handoff: skipped — native resume chosen' "$T_TMP/e.err" || fail "E: no skip line: $(cat "$T_TMP/e.err")"
 [ ! -e "$WS/state/handoff" ] || fail "E: a handoff was written on a resume"
-assert_inert "E"
+assert_preflight_only "E"
 echo "T135 E PASS (history=last skips the handoff)"
 
 echo "T135 PASS blocks=A-E"

@@ -6,6 +6,9 @@
 // Behaviour from $PINNED_CLEAR_FAKE_SCENARIO[who]:
 //   { stdout, stdoutFile, stderr, rc, sleepMs,
 //     copyOnce: [[src, dst], ...]   first call only (marker file), rewrites dst in place,
+//     copyOnceAt: n   (task 1270) OPTIONAL explicit positive-integer invocation ordinal of THIS who (1-based,
+//                     counted from $PINNED_CLEAR_SEQ_LOG, this call included) at which copyOnce fires instead;
+//                     absent → the original first-call behaviour, unchanged,
 //     match: [{ argv0, ...same fields }]   the first entry whose argv0 equals argv[0] overrides }
 // Every call appends {who, argv} to $PINNED_CLEAR_SEQ_LOG.
 import * as fs from "node:fs";
@@ -16,15 +19,44 @@ const all = JSON.parse(fs.readFileSync(process.env.PINNED_CLEAR_FAKE_SCENARIO, "
 let s = all[who] ?? {};
 const m = (s.match ?? []).find((x) => x.argv0 === argv[0]);
 if (m) s = { ...s, ...m };
-if (s.copyOnce) {
+if (s.copyOnce && s.copyOnceAt !== undefined) {
+  if (!Number.isSafeInteger(s.copyOnceAt) || s.copyOnceAt < 1) {
+    process.stderr.write(`pinned-clear-actuators: copyOnceAt must be a positive integer, got ${JSON.stringify(s.copyOnceAt)}\n`);
+    process.exit(98);
+  }
+  const nth = fs.readFileSync(process.env.PINNED_CLEAR_SEQ_LOG, "utf8").split("\n").filter(Boolean)
+    .filter((l) => JSON.parse(l).who === who).length;
+  const marker = `${process.env.PINNED_CLEAR_SEQ_LOG}.${who}.copied`;
+  if (nth === s.copyOnceAt && !fs.existsSync(marker)) {
+    fs.writeFileSync(marker, "");
+    for (const [src, dst] of s.copyOnce) fs.writeFileSync(dst, fs.readFileSync(src));
+  }
+} else if (s.copyOnce) {
   const marker = `${process.env.PINNED_CLEAR_SEQ_LOG}.${who}.copied`;
   if (!fs.existsSync(marker)) {
     fs.writeFileSync(marker, "");
     for (const [src, dst] of s.copyOnce) fs.writeFileSync(dst, fs.readFileSync(src));
   }
 }
-if (s.sleepMs) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, s.sleepMs);
+// Task 1270 (opt-in, defaults unchanged): sleepOnceAt = explicit positive-integer invocation ordinal of THIS who
+// at which sleepMs applies (instead of every call); ignoreSigterm = this fake ignores SIGTERM (SIGKILL still ends it).
+// When an opted-in sleep finishes, `<seq log>.<who>.sleep-completed` records that the slow query ran to completion.
+if (s.ignoreSigterm === true) process.on("SIGTERM", () => {});
+if (s.sleepMs && s.sleepOnceAt !== undefined) {
+  if (!Number.isSafeInteger(s.sleepOnceAt) || s.sleepOnceAt < 1) {
+    process.stderr.write(`pinned-clear-actuators: sleepOnceAt must be a positive integer, got ${JSON.stringify(s.sleepOnceAt)}\n`);
+    process.exit(98);
+  }
+  const nth = fs.readFileSync(process.env.PINNED_CLEAR_SEQ_LOG, "utf8").split("\n").filter(Boolean)
+    .filter((l) => JSON.parse(l).who === who).length;
+  if (nth === s.sleepOnceAt) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, s.sleepMs);
+    fs.writeFileSync(`${process.env.PINNED_CLEAR_SEQ_LOG}.${who}.sleep-completed`, "");
+  }
+} else if (s.sleepMs) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, s.sleepMs);
 if (s.stdoutFile) process.stdout.write(fs.readFileSync(s.stdoutFile));
 if (s.stdout) process.stdout.write(s.stdout);
 if (s.stderr) process.stderr.write(s.stderr);
-process.exit(s.rc ?? 0);
+// Task 1270 (opt-in drainOutput: true): exit naturally with exitCode so pending stdout is not truncated by process.exit().
+if (s.drainOutput === true) process.exitCode = s.rc ?? 0;
+else process.exit(s.rc ?? 0);

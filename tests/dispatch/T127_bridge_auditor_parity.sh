@@ -574,4 +574,55 @@ grep -qF 'ORCH_BRIDGE_DUPLICATE count=2' "$T_TMP/L3/alerts.log" \
   || fail "L3: the alert was not recorded when the transport was missing: $(cat "$T_TMP/L3/alerts.log" 2>/dev/null)"
 no_kill "L3"
 
+# ===========================================================================
+# V) Task 1270 — the boot's versioned create-only verb `telepty allow-create-v1` is a
+#    bridge too: EXACTLY that one additional token, never a prefix. Still warn-only.
+#    Port-only: the original bash predates the verb (BRIDGE_PARITY_ORIGINAL=1 skips V).
+# ===========================================================================
+if [ "$ORIGINAL" != "1" ]; then
+  V1C="node telepty allow-create-v1 --id orchestrator --auto-restart claude --permission-mode default"
+  # V1: a legacy and a versioned bridge for the same sid ARE a duplicate.
+  cat > "$PS_TABLE" <<EOF
+61001 1-00:00:00 $B
+61002 00:10:00 $V1C
+EOF
+  run V1 --
+  [ "$RC" -eq 0 ] || fail "V1: rc=$RC: $(cat "$ERR")"
+  EXPECT_V1='2026-08-18T00:00:00Z ORCH_BRIDGE_DUPLICATE count=2 pids=[61001(1-00:00:00), 61002(00:10:00)] likely_stale=61001 dry_run=0'
+  [ "$(cat "$ERR")" = "$EXPECT_V1" ] \
+    || fail "V1: a legacy + versioned (allow-create-v1) pair for one sid must be ONE duplicate alert.
+  want: $EXPECT_V1
+  got : $(cat "$ERR")"
+  [ "$(sed -n '3p' "$INJ_ARGV")" = "orchestrator" ] || fail "V1: the HOLD did not go to the orchestrator: $(cat "$INJ_ARGV")"
+  grep -qF 'N=2 bridges (expected 1)' "$INJ_ARGV" || fail "V1: the HOLD text did not name N=2: $(cat "$INJ_ARGV")"
+  no_kill "V1"
+  # V2: two versioned bridges (one packaged/absolute, no node token) are a duplicate.
+  cat > "$PS_TABLE" <<EOF
+62001 2-00:00:00 /opt/homebrew/bin/telepty allow-create-v1 --id orchestrator --auto-restart codex
+62002 00:01:00 $V1C
+EOF
+  run V2 --
+  [ "$RC" -eq 0 ] || fail "V2: rc=$RC: $(cat "$ERR")"
+  grep -qF 'ORCH_BRIDGE_DUPLICATE count=2 pids=[62001(2-00:00:00), 62002(00:01:00)] likely_stale=62001' "$ERR" \
+    || fail "V2: two versioned bridges were not one duplicate: $(cat "$ERR")"
+  no_kill "V2"
+  # V3: ONE versioned bridge beside adjacent-but-different verbs, sids and a mention row → silence.
+  cat > "$PS_TABLE" <<EOF
+63001 00:10:00 $V1C
+63002 00:20:00 node telepty allow-create-v2 --id orchestrator claude
+63003 00:30:00 node telepty allow-create --id orchestrator claude
+63004 00:40:00 node telepty allowX --id orchestrator claude
+63005 00:50:00 node telepty xallow-create-v1 --id orchestrator claude
+63006 01:00:00 node telepty allow-create-v1 --id orchestrator-2 claude
+63007 01:10:00 grep -n telepty allow-create-v1 --id orchestrator  bin/foo.sh
+63008 01:20:00 node telepty allow-create-v1 --idx orchestrator claude
+EOF
+  run V3 --
+  [ "$RC" -eq 0 ] || fail "V3: rc=$RC: $(cat "$ERR")"
+  [ ! -s "$ERR" ] \
+    || fail "V3: only the exact token allow-create-v1 with the whole-token sid is a bridge; a neighbour counted: $(cat "$ERR")"
+  no_inject "V3"
+  no_kill "V3"
+fi
+
 echo "T127 PASS blocks=A-L original=$ORIGINAL help_bytes=498 children=ps+telepty kill_paths=0"

@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 
 MAX_RESPONSE_BYTES = 262144
-COMMAND_TIMEOUT_SECONDS = 3
+COMMAND_TIMEOUT_SECONDS = 12
 UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 
 

@@ -38,6 +38,15 @@
 # unchanged; only the exec argv tail changed, and it is pinned as the exact line. Block N0
 # pins the refusal itself from the workspace layout: no plan → exit 2, zero effects, no exec.
 # The `ps` row still spells the old bypass argv: it is the STALE bridge being killed.
+#
+# TASK 1270 MIGRATION (boot-guard-coupling). The boot no longer lists, DELETEs a STALE record or
+# SIGKILLs a stale bridge. It runs a bounded exact-local preflight — `telepty boot-capabilities` from
+# PATH (the exec'd telepty, which answers ONLY that exact argv with the sealed one-line document), then
+# GET /api/meta and GET /api/sessions/<sid> through the CURL seam — and only a 404 (FRESH) emits
+# `telepty allow-create-v1 --id <sid> --auto-restart <tail>`; `__probe singleton-guard` is removed (exit 4).
+# Measured on macOS CI: the old exec stub printed nothing for `boot-capabilities`, so block A exited 3
+# (UNSUPPORTED). The layout/resolver/leak/fail-loud blocks keep their subjects; the stale ps row and STALE
+# listing stay ARMED and must stay untouched (no kill, no DELETE). Block U keeps the older-telepty refusal.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 source "$HERE/lib.sh"
@@ -73,15 +82,28 @@ cat "$LIST_JSON"
 exit 0
 EOF
 CURL_LOG="$T_TMP/curl-calls.log"
+# One entry per curl INVOCATION: `<method> <last argv element>` (method = the -X value, else GET). The raw
+# CURL_LOG keeps the full argv, whose `-w` argument holds a real newline, so its physical lines are not calls.
+CURL_JOURNAL="$T_TMP/curl-journal.log"
 CURL_STUB="$STUB_BIN/curl132.sh"
+# Task 1270: answers the preflight's two GETs by route as `<body>\n<code>` (curl -w '\n%{http_code}'):
+# FRESH = meta with both capabilities, the exact sid 404. Its full argv is recorded; any DELETE would show.
+META_BODY='{"capabilities":["sessions","wrapped-sessions","register-create-only"]}'
 cat > "$CURL_STUB" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$CURL_LOG"
-printf '200'
+m=GET; p=""
+for a in "\$@"; do if [ "\$p" = -X ]; then m="\$a"; fi; p="\$a"; done
+printf '%s %s\n' "\$m" "\${!#}" >> "$CURL_JOURNAL"
+case "\${!#}" in
+  http://127.0.0.1:3848/api/meta)          printf '%s\n200' '$META_BODY' ;;
+  http://127.0.0.1:3848/api/sessions/$SID) printf '%s\n404' '{"error":"Session not found"}' ;;
+  *)                                       printf '\n000'; exit 7 ;;
+esac
 exit 0
 EOF
 chmod +x "$PS_STUB" "$KILL_STUB" "$LIST_STUB" "$CURL_STUB"
-: > "$KILL_LOG"; : > "$CURL_LOG"
+: > "$KILL_LOG"; : > "$CURL_LOG"; : > "$CURL_JOURNAL"
 
 BRIDGE="node /usr/local/bin/telepty allow --id $SID --auto-restart claude --dangerously-skip-permissions --continue"
 cat > "$PS_TABLE" <<EOF
@@ -94,13 +116,34 @@ printf '[{"id":"%s","healthStatus":"STALE","active_clients":0}]' "$SID" > "$LIST
 EXEC_DIR="$T_TMP/exec-path"
 mkdir -p "$EXEC_DIR"
 EXEC_LOG="$T_TMP/exec.log"
+# Task 1270: the same PATH telepty answers the preflight's capability probe — EXACTLY the argv
+# `boot-capabilities`, logged to CAPS_LOG and answered from CAPS_TEXT (default: the sealed one-line
+# document) — so a probe is never mistaken for the exec. Every other argv is the exec, recorded as before.
+CAPS_LOG="$T_TMP/caps-calls.log"; CAPS_TEXT="$T_TMP/caps.txt"
+SEALED_CAPS='{"schema":"telepty-boot-capabilities-v1","verbs":["allow-create-v1"],"viewer_detach":"nondeleting-v1"}'
+printf '%s\n' "$SEALED_CAPS" > "$CAPS_TEXT"
 cat > "$EXEC_DIR/telepty" <<EOF
 #!/usr/bin/env bash
+if [ "\$#" = 1 ] && [ "\$1" = boot-capabilities ]; then printf 'boot-capabilities\n' >> "$CAPS_LOG"; cat "$CAPS_TEXT"; exit 0; fi
 printf '%s\n' "\$*" >> "$EXEC_LOG"
 exit 0
 EOF
 chmod +x "$EXEC_DIR/telepty"
-: > "$EXEC_LOG"
+: > "$EXEC_LOG"; : > "$CAPS_LOG"
+# preflight_only <label> — the boot's only daemon effects are ONE capability probe and the two exact GETs,
+# meta then the exact sid, each carrying the credential header; nothing is killed or deleted.
+preflight_only() {
+  [ "$(grep -c . "$CAPS_LOG")" = 1 ] || fail "$1: expected exactly one capability probe: $(cat "$CAPS_LOG")"
+  [ "$(grep -c '' "$CURL_JOURNAL")" = 2 ] \
+    || fail "$1: expected exactly the two preflight GETs (curl invocations): $(cat "$CURL_JOURNAL")"
+  [ "$(sed -n '1p' "$CURL_JOURNAL")" = "GET http://127.0.0.1:3848/api/meta" ] \
+    || fail "$1: the first request is not GET /api/meta: $(cat "$CURL_JOURNAL")"
+  [ "$(sed -n '2p' "$CURL_JOURNAL")" = "GET http://127.0.0.1:3848/api/sessions/$SID" ] \
+    || fail "$1: the second request is not GET /api/sessions/$SID: $(cat "$CURL_JOURNAL")"
+  grep -q -- '-X DELETE' "$CURL_LOG" && fail "$1: a DELETE was issued: $(cat "$CURL_LOG")"
+  [ ! -s "$KILL_LOG" ] || fail "$1: the stale bridge fixture was signalled: $(cat "$KILL_LOG")"
+  return 0
+}
 
 export SINGLETON_PS_CMD="$PS_STUB" KILL_CMD="$KILL_STUB"
 export TELEPTY="$LIST_STUB" CURL="$CURL_STUB"
@@ -110,7 +153,7 @@ export AIGENTRY_HOME="$T_TMP/home"
 mkdir -p "$AIGENTRY_HOME"
 # The complete, benign, explicit plan (#1181; see header) and the exact argv it execs.
 export AIGENTRY_BOOT_PLAN=1 AIGENTRY_BOOT_PERMISSION='approval=manual' AIGENTRY_BOOT_HISTORY=new
-PLAN_EXEC="allow --id $SID --auto-restart claude --permission-mode manual"
+PLAN_EXEC="allow-create-v1 --id $SID --auto-restart claude --permission-mode manual"
 
 # Every auth door is private; only B deliberately gives the two copies different tokens.
 export AUTH_LOG="$T_TMP/auth.log"
@@ -173,12 +216,14 @@ set -e
 [ ! -s "$EXEC_LOG" ] || fail "N0: a no-plan workspace boot exec'd a bridge: $(cat "$EXEC_LOG")"
 [ ! -s "$NP_LOG" ] || fail "N0: the refusal listed, scanned, signalled or DELETEd: $(cat "$NP_LOG")"
 [ ! -s "$AUTH_LOG" ] || fail "N0: the refusal resolved a credential"
+[ ! -s "$CAPS_LOG" ] || fail "N0: the refusal ran the capability probe: $(cat "$CAPS_LOG")"
 grep -qF 'AIGENTRY_BOOT_PLAN' "$T_TMP/np.err" || fail "N0: the refusal does not name the opt-in"
 
 # ===========================================================================
 # A) a real boot from the workspace layout: the package's dist/ resolves, the
-#    reconcile and the guard both run, and the boot ends in the exec.
+#    preflight runs (task 1270: caps → meta → exact sid, FRESH), and the boot ends in the exec.
 # ===========================================================================
+: > "$CURL_LOG"; : > "$CURL_JOURNAL"; : > "$KILL_LOG"; : > "$EXEC_LOG"; : > "$CAPS_LOG"
 set +e
 PATH="$EXEC_DIR:$PKGBIN:$PATH" bash "$BOOT" >"$T_TMP/a.out" 2>"$T_TMP/a.err"
 rc=$?
@@ -187,10 +232,7 @@ set -e
   echo "--- stderr ---" >&2; cat "$T_TMP/a.err" >&2
   fail "a workspace-layout boot exited $rc — the shim did not resolve the package's dist/"
 }
-grep -q -- '-X DELETE' "$CURL_LOG" \
-  || fail "A: the #905 reconcile did not run in the workspace layout; calls: $(cat "$CURL_LOG")"
-grep -qxF -- '-9 50349' "$KILL_LOG" \
-  || fail "A: the singleton guard did not run in the workspace layout; kills: $(cat "$KILL_LOG")"
+preflight_only "A"
 [ "$(cat "$EXEC_LOG")" = "$PLAN_EXEC" ] \
   || fail "A: the workspace boot did not exec the bridge argv: $(cat "$EXEC_LOG")"
 [ -s "$T_TMP/a.out" ] \
@@ -201,7 +243,7 @@ grep -qF 'tok-FIXTURE-T132' "$T_TMP/a.err" \
 # ===========================================================================
 # B) the credential resolver comes from the WORKSPACE's bin/lib, not the package's.
 #    The two copies are made to differ so the answer is measurable: whichever token
-#    reaches the curl header names the copy that was sourced.
+#    reaches the curl header names the copy that was sourced (task 1270: the preflight GETs').
 # ===========================================================================
 cat > "$WS/bin/lib/telepty-auth.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -211,16 +253,15 @@ cat > "$PKG/bin/lib/telepty-auth.sh" <<'EOF'
 #!/usr/bin/env bash
 telepty_auth_token() { printf 'tok-FROM-PACKAGE'; }
 EOF
-: > "$CURL_LOG"; : > "$KILL_LOG"; : > "$EXEC_LOG"
+: > "$CURL_LOG"; : > "$CURL_JOURNAL"; : > "$KILL_LOG"; : > "$EXEC_LOG"; : > "$CAPS_LOG"
 PATH="$EXEC_DIR:$PKGBIN:$PATH" bash "$BOOT" >"$T_TMP/b.out" 2>"$T_TMP/b.err" \
   || fail "B: the workspace boot exited non-zero: $(cat "$T_TMP/b.err")"
-grep -q -- '-X DELETE' "$CURL_LOG" || fail "B: the workspace boot ran no reconcile"
-grep -qxF -- '-9 50349' "$KILL_LOG" || fail "B: the workspace boot ran no SIGKILL guard"
+preflight_only "B"
 [ "$(cat "$EXEC_LOG")" = "$PLAN_EXEC" ] \
   || fail "B: the workspace boot did not exec the bridge argv"
 [ ! -s "$T_TMP/b.out" ] || fail "B: the workspace boot wrote to stdout"
-grep -qF 'tok-FROM-WORKSPACE' "$CURL_LOG" \
-  || fail "B: the DELETE did not carry the WORKSPACE's credential — AIGENTRY_SHIM_SCRIPT_DIR was not honoured, so bin/lib/telepty-auth.sh was resolved against the compiled module's location instead. calls: $(cat "$CURL_LOG")"
+[ "$(grep -c 'x-telepty-token: tok-FROM-WORKSPACE' "$CURL_LOG")" = 2 ] \
+  || fail "B: the preflight GETs did not both carry the WORKSPACE's credential — AIGENTRY_SHIM_SCRIPT_DIR was not honoured, so bin/lib/telepty-auth.sh was resolved against the compiled module's location instead. calls: $(cat "$CURL_LOG")"
 grep -qF 'tok-FROM-PACKAGE' "$CURL_LOG" \
   && fail "B: the PACKAGE's credential resolver was sourced from a workspace boot: $(cat "$CURL_LOG")"
 # Invariant 4: the token never appears in the log stream either way.
@@ -231,23 +272,26 @@ cp "$PRIVATE_AUTH" "$WS/bin/lib/telepty-auth.sh"
 cp "$PRIVATE_AUTH" "$PKG/bin/lib/telepty-auth.sh"
 
 # ===========================================================================
-# C) `__probe` resolves and evaluates the stale bridge through the real guard,
-#    but reports a dry-run verdict without effects or persistence changes.
+# C) `__probe` resolves through the workspace shim to the real CLI. Task 1270 REMOVED
+#    `singleton-guard` (and the guard it inspected): exit 4, the unknown-subcommand line,
+#    and still no effect or persistence change with the stale bridge fixture ARMED.
 # ===========================================================================
 mkdir -p "$T_TMP/c-before"
 cp -R "$WS" "$T_TMP/c-before/workspace"
 cp -R "$DISPATCH_STATE_DIR" "$T_TMP/c-before/dispatch-state"
 cp -R "$AIGENTRY_HOME" "$T_TMP/c-before/home"
-: > "$EXEC_LOG"; : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$AUTH_LOG"
-PATH="$EXEC_DIR:$PKGBIN:$PATH" bash "$BOOT" __probe singleton-guard >"$T_TMP/c.out" 2>"$T_TMP/c.err" \
-  || fail "C: __probe singleton-guard failed in the workspace layout: $(cat "$T_TMP/c.err")"
-grep -qF "[dry-run] would SIGKILL stale orchestrator bridge pid=50349 ($SID)" "$T_TMP/c.err" \
-  || fail "C: the workspace probe did not evaluate the stale bridge fixture"
-grep -qF "[dry-run] singleton guard done: would_kill=1 stale bridge(s) for $SID" "$T_TMP/c.err" \
-  || fail "C: the workspace probe did not report its dry-run guard summary"
+: > "$EXEC_LOG"; : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$CURL_JOURNAL"; : > "$AUTH_LOG"; : > "$CAPS_LOG"
+set +e
+PATH="$EXEC_DIR:$PKGBIN:$PATH" bash "$BOOT" __probe singleton-guard >"$T_TMP/c.out" 2>"$T_TMP/c.err"
+rc=$?
+set -e
+[ "$rc" -eq 4 ] || fail "C: the removed __probe singleton-guard must exit 4 in the workspace layout, got $rc: $(cat "$T_TMP/c.err")"
+grep -qx "orchestrator-boot.sh: unknown __probe subcommand: singleton-guard" "$T_TMP/c.err" \
+  || fail "C: not the unknown-subcommand refusal: $(cat "$T_TMP/c.err")"
 [ ! -s "$KILL_LOG" ] || fail "C: the workspace probe signalled a process"
 [ ! -s "$CURL_LOG" ] || fail "C: the workspace probe called curl"
 [ ! -s "$AUTH_LOG" ] || fail "C: the workspace probe resolved credentials"
+[ ! -s "$CAPS_LOG" ] || fail "C: the workspace probe ran the capability probe"
 [ -s "$EXEC_LOG" ] && fail "C: __probe booted the orchestrator from the workspace layout: $(cat "$EXEC_LOG")"
 [ ! -s "$T_TMP/c.out" ] || fail "C: the singleton probe wrote to stdout"
 diff -r "$T_TMP/c-before/workspace" "$WS" \
@@ -293,15 +337,35 @@ fi
 # E) neither layout is a fluke: the repo/package layout (sibling dist/) still works,
 #    through the copied shim and private resolver in the package fixture.
 # ===========================================================================
-: > "$EXEC_LOG"; : > "$KILL_LOG"; : > "$CURL_LOG"
+: > "$EXEC_LOG"; : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$CURL_JOURNAL"; : > "$CAPS_LOG"
 PATH="$EXEC_DIR:$PATH" bash "$PKG/bin/orchestrator-boot.sh" >"$T_TMP/e.out" 2>"$T_TMP/e.err" \
   || fail "the repo-tree layout (sibling dist/) stopped working: $(cat "$T_TMP/e.err")"
-grep -qxF -- '-9 50349' "$KILL_LOG" || fail "the repo-tree boot ran no guard; kills: $(cat "$KILL_LOG")"
-grep -q -- '-X DELETE' "$CURL_LOG" || fail "E: the sibling-dist boot ran no reconcile"
+preflight_only "E"
 [ "$(cat "$EXEC_LOG")" = "$PLAN_EXEC" ] \
   || fail "E: the sibling-dist boot did not exec the bridge argv"
 [ ! -s "$T_TMP/e.out" ] || fail "E: the sibling-dist boot wrote to stdout"
 grep -qF 'tok-FIXTURE-T132' "$T_TMP/e.err" \
   && fail "E: the fixture credential leaked into the log output"
+
+# ===========================================================================
+# U) task 1270: an OLDER telepty (prints multi-line help and exits 0 for the unknown
+#    `boot-capabilities`) is UNSUPPORTED from the workspace layout too — exit 3, empty
+#    stdout, no credential read, no request, no signal and no exec. Never accepted.
+# ===========================================================================
+printf '%s\n' 'Usage: telepty <command> [options]' '  allow --id <id> <command...>' > "$CAPS_TEXT"
+: > "$EXEC_LOG"; : > "$KILL_LOG"; : > "$CURL_LOG"; : > "$CURL_JOURNAL"; : > "$CAPS_LOG"; : > "$AUTH_LOG"
+set +e
+PATH="$EXEC_DIR:$PKGBIN:$PATH" bash "$BOOT" >"$T_TMP/u.out" 2>"$T_TMP/u.err"
+rc=$?
+set -e
+[ "$rc" -eq 3 ] || fail "U: an older telepty must be refused with exit 3, got $rc: $(cat "$T_TMP/u.err")"
+[ ! -s "$T_TMP/u.out" ] || fail "U: the refusal wrote to stdout: $(cat "$T_TMP/u.out")"
+grep -qF "boot preflight UNSUPPORTED for '$SID'" "$T_TMP/u.err" || fail "U: not the UNSUPPORTED refusal: $(cat "$T_TMP/u.err")"
+[ "$(grep -c . "$CAPS_LOG")" = 1 ] || fail "U: expected exactly one capability probe: $(cat "$CAPS_LOG")"
+[ ! -s "$CURL_LOG" ] || fail "U: an unsupported telepty still reached the daemon: $(cat "$CURL_LOG")"
+[ ! -s "$AUTH_LOG" ] || fail "U: an unsupported telepty still resolved a credential"
+[ ! -s "$KILL_LOG" ] || fail "U: something was signalled: $(cat "$KILL_LOG")"
+[ ! -s "$EXEC_LOG" ] || fail "U: an unsupported telepty was exec'd: $(cat "$EXEC_LOG")"
+printf '%s\n' "$SEALED_CAPS" > "$CAPS_TEXT"
 
 echo "T132 PASS layouts=workspace+repo+unresolvable resolver=workspace-lib"

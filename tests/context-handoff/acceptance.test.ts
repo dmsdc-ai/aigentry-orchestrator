@@ -123,7 +123,9 @@ function assertInert(boot: Boot, label: string): void {
 
 /** The delivery a booted CLI gets in this release (SPEC §6.2: only claude's content channel is measured). */
 function assertDelivery(boot: Boot, booted: Cli, ws: string, label: string): void {
-  const head = ["telepty", "allow", "--id", SID, "--auto-restart", ...TAIL[booted]];
+  // Task 1270: the boot's fixed head carries the versioned create-only verb (no `allow` fallback). Only the verb
+  // changed; the provider tail and the delivery tokens below are exactly as before.
+  const head = ["telepty", "allow-create-v1", "--id", SID, "--auto-restart", ...TAIL[booted]];
   if (booted === "claude") {
     assert.deepEqual(boot.argv, [...head, "--append-system-prompt-file", path.join(engineWs(ws), "state", "handoff", "latest.md")], `${label}: claude's measured delivery tokens`);
   } else {

@@ -1,0 +1,200 @@
+name: Installed boot acceptance (task 1270)
+
+# Task 1270 — the ACTUAL packed and installed boot acceptance, measured in its own workflow.
+#
+# tests/packaging/installed-boot-selector.test.mjs needs a REAL installed package
+# (INSTALLED_PACKAGE_ROOT), an evidence directory (BOOT_TEST_EVIDENCE), a TMPDIR outside any Git
+# ancestry and an admitted runtime. The ordinary runner (scripts/run-tests.mjs) has none of these,
+# so the suite is deliberately NOT registered there; it runs here, where each cell builds that
+# context for itself.
+#
+# Four independent cells: hosted Linux and macOS x EXACT Node 20.20.0 (the original measured
+# baseline) and 26.13.0 (the current target, a NEW measurement). A cell never stands in for another.
+#
+# Per cell: locked source install with lifecycle scripts disabled, an explicit build, `npm pack`
+# of THAT build with scripts disabled, and an install of THAT tarball into a private prefix with
+# scripts disabled (not global, not a registry version). The installed boot modules are compared
+# byte for byte with the just-built ones, then the WHOLE installed acceptance file runs with raw
+# streamed TAP and its real exit status.
+#
+# What a green cell does NOT claim, stated so it is not read as more than it is:
+#  - lifecycle scripts (prepack/prepare/install/postinstall of this package or its dependencies)
+#    were NOT RUN. The test's own `init` run is the intentional installer exercise.
+#  - no real AI provider, telepty daemon or operating service is contacted; the test's PATH is an
+#    allowlist of fixture recorders. Fake-provider argv acceptance does not prove real providers.
+#  - dependencies of the installed tarball resolve from the registry by their declared ranges; only
+#    the source install is lock-pinned.
+#  - no native legacy task reattachment is measured.
+#
+# The uploaded artifact is a review-only evidence set per cell, not a publication.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  installed-boot:
+    name: Installed boot acceptance (${{ matrix.os }}, Node ${{ matrix.node }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ['20.20.0', '26.13.0']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      CELL_OS: ${{ matrix.os }}
+      CELL_NODE: ${{ matrix.node }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Preconditions — hosted non-root runner, exact Node, required tools present (no install)
+        run: |
+          set -euo pipefail
+          [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] || { echo "::error::not a GitHub-hosted runner"; exit 1; }
+          [ "$(id -u)" -ne 0 ] || { echo "::error::refusing to run as root"; exit 1; }
+          actual="$(node --version)"
+          [ "$actual" = "v${CELL_NODE}" ] || { echo "::error::cell Node ${CELL_NODE} but runtime ${actual}"; exit 1; }
+          for tool in bash jq python3 shasum cmp; do
+            command -v "$tool" >/dev/null 2>&1 || { echo "::error::required tool missing: ${tool} (no install or sudo workaround)"; exit 1; }
+          done
+          # The test links exactly these into its allowlisted fixture PATH.
+          for exe in /bin/bash /bin/sh /bin/mkdir /bin/cp /usr/bin/dirname; do
+            [ -x "$exe" ] || { echo "::error::fixture PATH executable missing: ${exe}"; exit 1; }
+          done
+
+      - name: Private HOME, npm cache, TMPDIR, prefix and evidence under RUNNER_TEMP, outside Git ancestry
+        run: |
+          set -euo pipefail
+          base="${RUNNER_TEMP}/installed-boot-1270"
+          [ ! -e "$base" ] || { echo "::error::${base} already exists"; exit 1; }
+          mkdir -p "$base/home" "$base/npm-cache" "$base/tmp" "$base/prefix" "$base/pack" "$base/evidence/boot"
+          base="$(cd "$base" && pwd -P)"
+          ws="$(cd "$GITHUB_WORKSPACE" && pwd -P)"
+          case "$base/" in "$ws/"*) echo "::error::private root is inside the checkout"; exit 1 ;; esac
+          d="$base"
+          while :; do
+            [ ! -e "$d/.git" ] || { echo "::error::git ancestor: ${d}"; exit 1; }
+            [ "$d" != / ] || break
+            d="$(dirname "$d")"
+          done
+          {
+            echo "IB_DIR=$base"
+            echo "HOME=$base/home"
+            echo "TMPDIR=$base/tmp"
+            echo "npm_config_cache=$base/npm-cache"
+            echo "npm_config_update_notifier=false"
+          } >> "$GITHUB_ENV"
+
+      - name: Record cell identity (runtime, npm, commit)
+        run: |
+          set -euo pipefail
+          {
+            echo "cell_os=${CELL_OS}"
+            echo "runner_os=${RUNNER_OS}"
+            echo "cell_node=v${CELL_NODE}"
+            echo "node=$(node --version)"
+            echo "npm=$(npm --version)"
+            echo "event_sha=${GITHUB_SHA}"
+            echo "checkout_commit=$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+            echo "lifecycle_scripts=NOT RUN (npm ci, npm pack and npm install all ran with --ignore-scripts)"
+          } > "$IB_DIR/evidence/cell.txt"
+          cat "$IB_DIR/evidence/cell.txt"
+          echo "::notice::lifecycle scripts NOT RUN in this cell (--ignore-scripts on ci, pack and install)"
+
+      - name: Locked source install (scripts disabled) and explicit build
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run build
+          for f in cli.js usage.js plan.js wizard.js provider-capabilities.js; do
+            [ -f "dist/src/orchestrator-boot/$f" ] || { echo "::error::build did not produce dist/src/orchestrator-boot/${f}"; exit 1; }
+          done
+
+      - name: Pack THAT build into an actual tarball (scripts disabled)
+        run: |
+          set -euo pipefail
+          npm pack --ignore-scripts --pack-destination "$IB_DIR/pack" > "$IB_DIR/evidence/pack.stdout"
+          shopt -s nullglob
+          tars=("$IB_DIR"/pack/*.tgz)
+          [ "${#tars[@]}" -eq 1 ] || { echo "::error::expected exactly one tarball, found ${#tars[@]}"; exit 1; }
+          tar_sha="$(shasum -a 256 "${tars[0]}" | cut -d' ' -f1)"
+          {
+            echo "tarball=${tars[0]}"
+            echo "tarball_sha256=${tar_sha}"
+          } >> "$IB_DIR/evidence/cell.txt"
+          echo "IB_TARBALL=${tars[0]}" >> "$GITHUB_ENV"
+
+      - name: Install THAT tarball into the private prefix (scripts disabled) and bind its boot modules
+        run: |
+          set -euo pipefail
+          prefix="$IB_DIR/prefix"
+          printf '{"name":"installed-boot-1270-prefix","version":"0.0.0","private":true}\n' > "$prefix/package.json"
+          npm install --prefix "$prefix" --ignore-scripts --no-audit --no-fund "$IB_TARBALL"
+          root="$prefix/node_modules/@dmsdc-ai/aigentry-orchestrator"
+          [ -d "$root" ] && [ ! -L "$root" ] || { echo "::error::installed package root missing or a link: ${root}"; exit 1; }
+          root="$(cd "$root" && pwd -P)"
+          src_id="$(jq -r '.name + "@" + .version' package.json)"
+          inst_id="$(jq -r '.name + "@" + .version' "$root/package.json")"
+          [ "$src_id" = "$inst_id" ] || { echo "::error::installed ${inst_id} is not the packed ${src_id}"; exit 1; }
+          : > "$IB_DIR/evidence/module-binding.txt"
+          for f in cli.js usage.js plan.js wizard.js provider-capabilities.js; do
+            rel="dist/src/orchestrator-boot/$f"
+            cmp "$rel" "$root/$rel" || { echo "::error::installed ${rel} differs from the just-built module"; exit 1; }
+            echo "$(shasum -a 256 "$root/$rel" | cut -d' ' -f1)  ${rel}" >> "$IB_DIR/evidence/module-binding.txt"
+          done
+          {
+            echo "installed_package=${inst_id}"
+            echo "installed_root=${root}"
+          } >> "$IB_DIR/evidence/cell.txt"
+          cat "$IB_DIR/evidence/module-binding.txt"
+          {
+            echo "INSTALLED_PACKAGE_ROOT=$root"
+            echo "BOOT_TEST_EVIDENCE=$IB_DIR/evidence/boot"
+          } >> "$GITHUB_ENV"
+
+      - name: Installed acceptance — the WHOLE file, raw streamed TAP, real exit
+        run: |
+          # The default shell is `bash -eo pipefail`; -e is turned off so the test's real exit is captured and reported.
+          set +e -uo pipefail
+          [ "$TMPDIR" = "$IB_DIR/tmp" ] || { echo "::error::TMPDIR is not the private one"; exit 1; }
+          node --test --test-reporter=tap tests/packaging/installed-boot-selector.test.mjs 2>&1 | tee "$IB_DIR/evidence/acceptance.tap"
+          # The COMPLETE pipeline status, captured before any other command can overwrite it. A logging (tee) failure is an
+          # observation failure, never a pass: node 0 with tee nonzero fails the cell with tee's real status.
+          statuses=("${PIPESTATUS[@]}")
+          [ "${#statuses[@]}" -eq 2 ] || { echo "::error::expected 2 pipeline statuses, got ${#statuses[@]}: ${statuses[*]}"; exit 1; }
+          node_rc="${statuses[0]}"
+          tee_rc="${statuses[1]}"
+          echo "acceptance_exit=${node_rc}" >> "$IB_DIR/evidence/cell.txt"
+          echo "tap_tee_exit=${tee_rc}" >> "$IB_DIR/evidence/cell.txt"
+          echo "pipeline statuses: node=${node_rc} tee=${tee_rc}"
+          [ "$node_rc" -eq 0 ] || { echo "::error::installed acceptance exited ${node_rc} (tee ${tee_rc})"; exit "$node_rc"; }
+          [ "$tee_rc" -eq 0 ] || { echo "::error::TAP capture (tee) exited ${tee_rc}; the observation is incomplete, not a pass"; exit "$tee_rc"; }
+          tap="$IB_DIR/evidence/acceptance.tap"
+          grep -Eq '^# tests [1-9][0-9]*$' "$tap" || { echo "::error::empty run: no tests counted"; exit 1; }
+          grep -Eq '^# pass [1-9][0-9]*$' "$tap" || { echo "::error::empty pass: nothing passed"; exit 1; }
+          for line in '# fail 0' '# cancelled 0' '# skipped 0' '# todo 0'; do
+            grep -qx "$line" "$tap" || { echo "::error::TAP summary lacks '${line}'"; exit 1; }
+          done
+
+      - name: Preserve the per-cell review artifact (review only, not a publication)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: installed-boot-1270-${{ matrix.os }}-node${{ matrix.node }}
+          path: ${{ runner.temp }}/installed-boot-1270/evidence
+          if-no-files-found: error
+          retention-days: 7

@@ -84,4 +84,69 @@ export const USAGE = `# dispatch.sh — Wraps \`telepty inject\` with REPL-ready
 #
 # Ready detection: per-CLI prompt-symbol probe of \`telepty read-screen\` plus
 # welcome/boot banner absence (claude ❯ / codex › / gemini ›|│ >).
+#
+# Follow-up to a BUSY worker (#1270): a \`--target\` that is already working can never show
+#   the idle, empty composer the readiness wait requires, so such a dispatch used to time out
+#   with nothing delivered. A NON-SPAWNED --target measured as qualified current-busy is
+#   admitted at once instead and delivered through \`telepty inject-bound-v1\`, bound to the
+#   session epoch and owner generation read from ONE \`telepty list --json\` snapshot. The
+#   admission criterion is the probe's reading of the LIVE current viewport: surface=working,
+#   ready=false, ready_reason=current-busy-or-modal, tracker_class one of
+#   blank/active/prompt_observed. That reason is the ONLY busy spelling live mode produces,
+#   and it is required: the offline --screen-file answer (hard-negative) carries no composer
+#   guarantee at all, and current-working is unreachable in both modes, so neither is
+#   admitted. Fresh --spawn-and-dispatch, modal, unsubmitted, unknown surface, probe error
+#   and --retry-unknown are unchanged and stay fail-closed. It requires --from, a loopback
+#   session, the bridge's busy-input-v1 capability and the verb in
+#   \`telepty boot-capabilities\`; exit 78
+#   BOUND_INJECT_UNSUPPORTED names whichever is missing, before any record or any input.
+#   That exit CHANGES an existing outcome: a qualified-busy --target whose bridge or local
+#   CLI cannot carry the bound verb now dies 78 by name, where before this feature it fell
+#   through to the readiness wait and exited 1 on timeout. A lane that reads exit 1 as
+#   "busy, retry later" has to read 78 the same way — nothing was transported in either case.
+#   Known limitation (probe-side, task 1277): a collapsed one-line Claude viewport and a busy
+#   codex whose footer is a bare \`? for shortcuts\` with no warnings suffix are NOT
+#   bound-deliverable — for both shapes the probe reports no empty current composer, so the
+#   dispatch still ends in the readiness timeout. There is no caller-side workaround, and
+#   neither shape is ever written to.
+#   Every outcome records transport \`unknown\` plus one bounded observation, never
+#   write_observed:
+#     exit 0  ACCEPTED_PENDING <sid> — both frames were handed to the pinned owner bridge.
+#             REPLACES the \`OK dispatched to <sid>\` line on this path and is NOT a delivery
+#             receipt: not a PTY write, not native queueing, not auto-submit, not model
+#             receipt. The identity is never re-sent.
+#     exit 3  BOUND_INJECT_REFUSED — the answer PROVES nothing was written (pre-socket local
+#             refusal, unregistered route, or a closed refusal reporting 0 bytes); recorded
+#             not_delivered, so the same ref may be dispatched again. For the one refusal that
+#             names an ALREADY stranded instance (\`composer_stranded\`) the re-dispatch only
+#             works after an operator clear, and the STRANDED block below says so.
+#     exit 7  DELIVERY_UNKNOWN — lost, truncated, mismatched-identity or any other
+#             non-accepted answer: input may have been queued or written, so the identity is
+#             HELD for review (no replay, no Enter). --retry-unknown does NOT clear a hold
+#             on a still-busy worker: the bound path refuses that flag, so the retry falls
+#             to the readiness wait and exits 1 having changed nothing. Read the held row
+#             (dispatch-registry.py get) and the worker's screen; once the worker is idle
+#             again the normal --retry-unknown "<reason>" path applies, because an idle
+#             target is delivered by the legacy inject.
+#   Stranded composer: a body that reached the composer whose paired CR did not leaves that
+#   exact session instance STRANDED — the daemon refuses every later body and key from every
+#   producer (\`composer_stranded\`) until an operator clears it. Whenever an answer proves that
+#   (a strand-reason \`outcome_unknown\`, or a \`composer_stranded\` refusal) or leaves it
+#   unknown (a lost, unparseable, foreign-identity or any other non-accepted answer), a bounded
+#   STRANDED block is written to stderr with the pinned session_epoch, the owner_generation, the
+#   stranded_inject_id (or \`none\`), the reason code and the recovery procedure: empty the
+#   composer at the bridge's own keyboard, then run the printed
+#   \`telepty clear-strand-v1 --from <operator-sid> …\` yourself. Any value the answer does not
+#   carry is printed as a <placeholder> with the read-only \`telepty session <sid>\` lookup that
+#   shows it, never guessed. One strand reason, \`body_outcome_unknown\`, means the body write
+#   itself never resolved: the record exists and the block says so, and it also says the composer
+#   may be EMPTY — look before typing. THIS HELPER NEVER CLEARS: it runs no clear-strand-v1, sends
+#   no key, never retries, replays or takes another input route for a stranded session — it cannot
+#   see the composer, so the assertion a clear records must be a human's. The exit codes and
+#   markers above are unchanged by the block.
+#   --verify-delivered is a declared NO-OP on this path: a queued body is not on the screen,
+#   so no screen read is attempted, a stderr NOTE states that verification was not performed,
+#   and the exit stays 0. Started-working verification runs observe-only
+#   (bin/dispatch-verify.sh --observe-only): no key, no resubmit, and it prints OBSERVED
+#   rather than VERIFIED, because a working spinner may predate the queued body.
 #`;

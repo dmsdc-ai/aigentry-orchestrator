@@ -1031,7 +1031,7 @@ jobs:
         env:
           RELEASE_VERSION: ${{ steps.identity.outputs.version }}
           # Replace only after maintainer review of exact portable policy bytes and exception rationale.
-          RELEASE_SECURITY_POLICY_SHA256: 33ba90d4dac9a34b00bbc8fd8106d5e1ad2d9add38f1472efe2154f6c25d6d17
+          RELEASE_SECURITY_POLICY_SHA256: 1a1071f797dd3a6c29ce6a0a576d23156b97b1972b111fec8b3c5277639db25b
           RELEASE_SECURITY_COMMIT: ${{ github.sha }}
         run: node scripts/release-admission.mjs --root "$GITHUB_WORKSPACE" --version "$RELEASE_VERSION"
 
@@ -1064,7 +1064,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # #1270: the Linux leg is pinned to an explicit image, not the moving ubuntu-latest
+        # label, because that label moved underneath this suite. The live Linux confinement
+        # preflight in tests/session/claude-worker-oauth.test.ts was last green on image
+        # ubuntu-24.04 (20261004.327.1, run of 2026-10-15); ubuntu-latest now resolves to
+        # ubuntu-26.04 (20261111.196.1), where the same unchanged product and test refuse with
+        # SANDBOX_PREFLIGHT_FAILED: 1 apply-seccomp: write /proc/self/setgroups (nested userns
+        # is capability-restricted; caller must provide CAP_SYS_ADMIN): Permission denied
+        # (exit 78). Nothing here weakens the confinement: making it work on Ubuntu 26.04 is
+        # separate open work (#652). The three Linux-only steps below compare matrix.os against
+        # this same value, so the image and those conditions move together or not at all. If
+        # this image is retired the correct move is to re-pin deliberately and measure the
+        # preflight again, not to bump the label and keep the claim.
+        os: [ubuntu-24.04, macos-latest]
         node: [20]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -1078,16 +1090,16 @@ jobs:
         run: npm ci
       - name: Install jq (a hard dependency of init, checked at step 1)
         run: command -v jq || sudo apt-get install -y jq
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-24.04'
       # #652: the real sandbox-runtime's Linux dependencies. The Linux live confinement preflight in
       # tests/session/claude-worker-oauth.test.ts registers only where they are all present.
       - name: Install the Linux sandbox-runtime dependencies (bubblewrap, socat, ripgrep)
         run: sudo apt-get update && sudo apt-get install -y bubblewrap socat ripgrep
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-24.04'
       # #652: measured on ubuntu-latest, apparmor_restrict_unprivileged_userns=1 makes bwrap fail loopback RTM_NEWADDR (EPERM).
       - name: Let bubblewrap configure loopback (lift the AppArmor unprivileged-userns restriction)
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-24.04'
       - name: Run the regression suite
         run: npm test
       # Runs after npm test because several guards gate on dist/ being built, and

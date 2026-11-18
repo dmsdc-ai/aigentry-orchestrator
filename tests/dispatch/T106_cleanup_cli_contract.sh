@@ -52,7 +52,9 @@ chmod +x "$STUB_BIN/curl"
 # overrides the seam with its own table.
 PS_DEFAULT_LOG="$T_TMP/ps-default.log"; : > "$PS_DEFAULT_LOG"
 PS_DEFAULT_SNAP="$T_TMP/ps-default.txt"
-printf '%s\n' '100 1 /sbin/launchd' '400 100 bash session-cleanup.sh' > "$PS_DEFAULT_SNAP"
+# Task 1270 C3: every process table here carries the canonical `PID PPID COMMAND` header that real
+# `ps -eo pid,ppid,command` prints, so cleanup's initial process view is KNOWN (a headerless view is UNKNOWN).
+printf '%s\n' '  PID  PPID COMMAND' '100 1 /sbin/launchd' '400 100 bash session-cleanup.sh' > "$PS_DEFAULT_SNAP"
 cat > "$STUB_BIN/ps" <<EOF
 #!/usr/bin/env bash
 if [ "\$#" -eq 2 ] && [ "\$1" = "-eo" ] && [ "\$2" = "pid,ppid,command" ]; then
@@ -125,6 +127,81 @@ run() {
 }
 rc_of()  { printf '%s' "$1" | head -1; }
 out_of() { printf '%s' "$1" | tail -n +2; }
+
+# ── (V) Task 1270 C3-B: an exact VERSIONED target bridge refuses the WHOLE cleanup ──
+# `telepty allow-create-v1 … --id <sid>` (the boot's versioned create-only verb) observed
+# for <sid> → exit 1 BEFORE report capture, listing, kill, close, DELETE and retirement,
+# with or without --force, listed or not. Its own ps/kill/registry seams keep the
+# default ps/kill logs (counted below) untouched. Every effect here is a recorder.
+V_KILL_LOG="$T_TMP/v-kill.log"; V_PS_SNAP="$T_TMP/v-ps.txt"; V_REG_LOG="$T_TMP/v-registry.log"
+cat > "$STUB_BIN/v-kill.sh" <<EOF
+#!/usr/bin/env bash
+printf 'argc=%s %s\n' "\$#" "\$*" >> "$V_KILL_LOG"
+exit 97
+EOF
+cat > "$STUB_BIN/v-ps.sh" <<EOF
+#!/usr/bin/env bash
+cat "$V_PS_SNAP"
+EOF
+cat > "$STUB_BIN/v-registry.sh" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$V_REG_LOG"
+exit 0
+EOF
+chmod +x "$STUB_BIN/v-kill.sh" "$STUB_BIN/v-ps.sh" "$STUB_BIN/v-registry.sh"
+VSID="t106-v1270"
+V_REFUSAL="a versioned 'telepty allow-create-v1' bridge for it is running"
+# vrun <label> <args…> — the cleanup under the V seams; asserts the refusal and NO effect.
+vrun_refused() {
+  local label="$1"; shift
+  : > "$V_KILL_LOG"; : > "$V_REG_LOG"
+  local res rc out
+  res=$(CLEANUP_PS_CMD="$STUB_BIN/v-ps.sh" KILL_CMD="$STUB_BIN/v-kill.sh" CLEANUP_SELF_PID=400 \
+    DISPATCH_REGISTRY_PY="$STUB_BIN/v-registry.sh" run "$@")
+  rc=$(rc_of "$res"); out=$(out_of "$res")
+  [ "$rc" = "1" ] || fail "$label: a versioned target bridge must refuse the whole cleanup with exit 1, got rc=$rc: $out"
+  case "$out" in *"$V_REFUSAL"*) ;; *) fail "$label: the versioned refusal was not stated: $out";; esac
+  [ ! -s "$V_KILL_LOG" ] || fail "$label: a SIGTERM was attempted: $(cat "$V_KILL_LOG")"
+  [ ! -s "$ACTIONS_LOG" ] || fail "$label: a workspace surface was closed: $(cat "$ACTIONS_LOG")"
+  [ ! -s "$CURL_LOG" ] || fail "$label: the daemon was contacted (corroboration/DELETE): $(cat "$CURL_LOG")"
+  [ ! -s "$V_REG_LOG" ] || fail "$label: the registry was touched (report capture/retirement): $(cat "$V_REG_LOG")"
+}
+cat > "$V_PS_SNAP" <<EOF
+  PID  PPID COMMAND
+100 1 /sbin/launchd
+400 100 bash session-cleanup.sh
+888 100 node /usr/local/bin/telepty allow-create-v1 --id $VSID --auto-restart claude --continue
+EOF
+printf '%s' "[{\"id\":\"$VSID\",\"command\":\"claude\",\"healthStatus\":\"DISCONNECTED\"}]" > "$STUB_LIST_FILE"
+vrun_refused "V1 listed" "$VSID"
+vrun_refused "V2 listed --force" "$VSID" --force
+printf '%s' '[]' > "$STUB_LIST_FILE"
+vrun_refused "V3 unlisted --force" "$VSID" --force
+ORCHESTRATOR_SID="$VSID" vrun_refused "V3b unlisted protected --force" "$VSID" --force
+# V4: a legacy AND a versioned row for the sid → still refused; the legacy pid is NOT killed.
+cat >> "$V_PS_SNAP" <<EOF
+777 100 telepty allow --id $VSID claude --continue
+EOF
+printf '%s' "[{\"id\":\"$VSID\",\"command\":\"claude\",\"healthStatus\":\"DISCONNECTED\"}]" > "$STUB_LIST_FILE"
+vrun_refused "V4 mixed legacy+versioned" "$VSID"
+# V5: only EXACT rows refuse. Neighbouring verbs/sids/mentions leave the ordinary path intact:
+#     no versioned target and no legacy row → no kill, but close + DELETE run, exit 0.
+cat > "$V_PS_SNAP" <<EOF
+  PID  PPID COMMAND
+100 1 /sbin/launchd
+400 100 bash session-cleanup.sh
+801 100 node telepty allow-create-v1 --id $VSID-2 --auto-restart claude
+802 100 node telepty allow-create-v2 --id $VSID claude
+803 100 node telepty allow-create --id $VSID claude
+804 100 grep -n telepty allow-create-v1 --id $VSID  bin/foo.sh
+805 100 node telepty allow-create-v1 --idx $VSID claude
+EOF
+: > "$V_KILL_LOG"
+res=$(CLEANUP_PS_CMD="$STUB_BIN/v-ps.sh" KILL_CMD="$STUB_BIN/v-kill.sh" CLEANUP_SELF_PID=400 run "$VSID")
+[ "$(rc_of "$res")" = "0" ] || fail "V5: a non-exact neighbour row refused the cleanup (rc=$(rc_of "$res")): $(out_of "$res")"
+grep -q "ARGV .*-X DELETE .*/api/sessions/$VSID\$" "$CURL_LOG" \
+  || fail "V5: the ordinary path did not reach its registry DELETE: $(cat "$CURL_LOG")"
+[ ! -s "$V_KILL_LOG" ] || fail "V5: a kill was attempted with no legacy row: $(cat "$V_KILL_LOG")"
 
 # ── (1) usage: the printed range is lines 2-20, NOT the whole header ────────
 # `sed -n '2,20p' "$0"` deliberately stopped before the `Usage:` block at line 21.
@@ -247,7 +324,11 @@ rc=$(rc_of "$res"); out=$(out_of "$res")
 grep -qx "SURFACE_CLOSE_BY_SID $PROT" "$ACTIONS_LOG" \
   || fail "--force exited 0 without actually cleaning: $(cat "$ACTIONS_LOG")"
 
-ps_calls_are 0 "(1)-(6)"
+# Task 1270 C3-B: every cleanupOne that passes the unforced PROTECTED refusal first makes
+# ONE defensive process-table read (the versioned-target gate, before capture/listing).
+# (5)'s two runs reach it before their listing fails (2); (6)'s --force run reaches it (1);
+# (6)'s unforced protected refusal does not (0). (1)-(4) never reach cleanupOne.
+ps_calls_are 3 "(1)-(6)"
 kill_calls_are_zero "(1)-(6)"
 
 # ── (7) batch selection: --all-disconnected and --all-unused --keep ───────
@@ -297,8 +378,10 @@ esac
 # Checked BEFORE the ps count: a kill that escapes must fail here even when the
 # count still matches (a guard that reuses its snapshot adds no extra ps call).
 kill_calls_are_zero "(7)"
-# One parent lookup per cleaned session: 2 + 2 + 0 + 2.
-ps_calls_are 6 "(7)"
+# One parent lookup per cleaned session: 2 + 2 + 0 + 2. Task 1270: plus ONE earlier
+# versioned-target gate read per cleaned session (the kill keeps its own fresh read):
+# 3 (through (6)) + (2+2) + (2+2) + 0 + (2+2) = 15.
+ps_calls_are 15 "(7)"
 
 # ── (8) the normal (session-present) path SIGTERMs the parent and cleans up ─
 # T52 pins the self/ancestor REFUSAL through the seams; nothing pinned the
@@ -321,6 +404,7 @@ cat "$PS_SNAP"
 EOF
 chmod +x "$STUB_BIN/kill-recorder.sh" "$STUB_BIN/ps-recorder.sh"
 cat > "$PS_SNAP" <<'EOF'
+  PID  PPID COMMAND
 100 1 /sbin/launchd
 400 100 bash session-cleanup.sh
 777 100 telepty allow --id t106-live claude --continue
@@ -334,7 +418,8 @@ CLEANUP_PS_CMD="$STUB_BIN/ps-recorder.sh" KILL_CMD="$STUB_BIN/kill-recorder.sh" 
   || fail "the parent telepty-allow process was not SIGTERMed exactly once as '-TERM 777' on the normal path: $(cat "$KILL_LOG")"
 grep -q "ARGV .*-X DELETE .*/api/sessions/t106-live" "$CURL_LOG" \
   || fail "the registry DELETE did not run on the normal path: $(cat "$CURL_LOG")"
-ps_calls_are 6 "(8)"
+# (8) reads through its own CLEANUP_PS_CMD seam, so the default count is (7)'s.
+ps_calls_are 15 "(8)"
 kill_calls_are_zero "(8)"
 
 echo "T106 PASS"

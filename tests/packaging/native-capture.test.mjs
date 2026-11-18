@@ -216,7 +216,8 @@ const stamp = f => json(path.join(f.workspace, '.aigentry-init.json'));
 // #1181: non-TTY boot needs an explicit complete plan. Bounded benign codex plan (most restrictive
 // measured axes, new history; installed-boot-selector reference PLANS.codex). No risk ack.
 const plan = { AIGENTRY_BOOT_PLAN: '1', AIGENTRY_BOOT_PERMISSION: 'approval=on-request;sandbox=read-only', AIGENTRY_BOOT_HISTORY: 'new' };
-const planArgv = 'telepty\nallow\n--id\nnative-fixture\n--auto-restart\ncodex\n--ask-for-approval\non-request\n--sandbox\nread-only\n';
+// Task 1270: the fixed head's verb is the versioned create-only `allow-create-v1` (no `allow` fallback).
+const planArgv = 'telepty\nallow-create-v1\n--id\nnative-fixture\n--auto-restart\ncodex\n--ask-for-approval\non-request\n--sandbox\nread-only\n';
 function boot(f, args, env = plan) {
   assert.ok(args.length && ['--help', '-h', '--dry-run', '__probe'].includes(args[0]));
   write(f.log, '');
@@ -230,6 +231,17 @@ function boot(f, args, env = plan) {
 }
 const inspectionModes = [['--dry-run'], ['__probe', 'singleton-guard'], ['__probe', 'registry-reconcile'],
   ['__probe', 'exec-argv'], ['__probe'], ['__probe', 'unknown']];
+// Task 1270: `__probe singleton-guard|registry-reconcile` are REMOVED with the SIGKILL guard and the DELETE reconcile they
+// inspected. They stay in inspectionModes as tripwire rows: the plan gate and validateCapture still run first (cli.ts
+// probe(): resolveWithoutPrompting → validateCapture → subcommand), and only then do they land on the unknown-subcommand
+// arm — exit 4, empty stdout, the exact refusal line, and no port call.
+const removedProbe = args => args[0] === '__probe' && ['singleton-guard', 'registry-reconcile'].includes(args[1]);
+function inspected(r, args) {
+  if (!removedProbe(args)) return ok(r);
+  assert.equal(r.status, 4, r.stderr); assert.equal(r.stdout, '');
+  assert.ok(r.stderr.includes(`orchestrator-boot.sh: unknown __probe subcommand: ${args[1]}\n`), r.stderr);
+  assert.deepEqual(r.calls, []);
+}
 function blockedBoot(f) {
   for (const args of inspectionModes) {
     const r = boot(f, args); assert.equal(r.status, 2, r.stderr);
@@ -261,7 +273,7 @@ test('legacy actual init baseline, help and dry run stay read-only', () => {
   ok(init(f, ['--help'], false)); ok(init(f, ['--dry-run'], false));
   assert.deepEqual(snapshot(f.workspace), before);
   ok(init(f, [], false)); assert.equal(stamp(f).nativeCapture, undefined);
-  for (const args of inspectionModes.slice(0, 4)) ok(boot(f, args));
+  for (const args of inspectionModes.slice(0, 4)) inspected(boot(f, args), args);
 });
 
 test('fresh native init registers one synchronous official hook through preservation', () => {
@@ -284,7 +296,9 @@ test('fresh native init registers one synchronous official hook through preserva
   assert.deepEqual(Object.keys(journal.packageAfter), nativeLeaves);
   assert.equal(fs.existsSync(path.join(f.workspace, '.aigentry-native-capture.lock')), false);
   for (const args of inspectionModes.slice(0, 4)) {
-    const r = boot(f, args); ok(r); assert.match(r.stderr, /installed\/pending-review/);
+    // The capture observation comes FIRST for every mode, the removed probes included (validateCapture precedes the
+    // subcommand); only then is the mode's own outcome checked.
+    const r = boot(f, args); assert.match(r.stderr, /installed\/pending-review/); inspected(r, args);
     if (args[1] === 'exec-argv') assert.equal(r.stdout, planArgv);
     if (args[0] === '--dry-run') assert.ok(r.stdout.split('\n').filter(Boolean).every(line => line.startsWith('[orchestrator-boot] [dry-run] ') || line.startsWith('[would-exec] ')));
   }
@@ -430,14 +444,24 @@ test('three cross-process native-versus-legacy init competitions admit at most o
   }
 });
 
-test('probe contracts suppress actuation while real boot retains literal SIGKILL', () => {
+test('probe contracts suppress actuation, and the real boot has no destructive default at all', () => {
   const code = read(path.join(source, 'src/orchestrator-boot/cli.ts'));
   assert.match(code, /const DRY_RUN = MODE === "dry-run" \|\| MODE === "probe"/);
-  assert.match(code, /spawnSync\(KILL_CMD, \["-9", r.pid\]/);
-  assert.match(code, /SIGKILL stale orchestrator bridge/);
+  // Task 1270 (was: the real boot RETAINS a literal `spawnSync(KILL_CMD, ["-9", r.pid])` and its SIGKILL log line). The
+  // singleton SIGKILL guard and the registry DELETE reconcile are REMOVED; the source must carry neither the signal, the
+  // DELETE, nor the seams that served them, and the boot is the create-only verb behind the bounded preflight instead.
+  const live = code.split('\n').filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');   // comments explain the removal
+  for (const gone of [/spawnSync\(KILL_CMD/, /\["-9"/, /"DELETE"/, /env\.(KILL_CMD|SINGLETON_PS_CMD|SINGLETON_SELF_PID)\b/,
+    /"list", "--json"/, /SIGKILL stale orchestrator bridge/]) assert.doesNotMatch(live, gone);
+  assert.match(code, /function bootPreflight\(sid: string\): Preflight/);
+  assert.match(code, /if \(preflight\.verdict !== "FRESH"\) refusePreflight\(resolved\.sid, preflight\);/);
   const f = fixture();
   for (const args of inspectionModes) {
-    const r = boot(f, args); assert.equal(r.status, args.length === 1 && args[0] === '__probe' || args[1] === 'unknown' ? 4 : 0);
+    const r = boot(f, args);
+    assert.equal(r.status, args.length === 1 && args[0] === '__probe' || args[1] === 'unknown' || removedProbe(args) ? 4 : 0);
+    // Every inspection mode — the removed probe names included — reaches no port: the ps/kill/curl/telepty recorders in
+    // f.ports stay armed and silent (no read, no signal, no DELETE, no capability probe).
+    assert.deepEqual(r.calls, [], `${args.join(' ')}: an inspection mode reached a port`);
     if (args[0] === '__probe' && args[1] !== 'exec-argv') assert.equal(r.stdout, '');
     if (args[1] === 'exec-argv') assert.equal(r.stdout, planArgv);
     // No plan (ORCHESTRATOR_CLI alone) refuses before any port, argv or capture validation.

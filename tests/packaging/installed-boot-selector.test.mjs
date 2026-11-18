@@ -49,6 +49,23 @@
 //     signals. The real recorder kill set comes from a planned bare boot. Probe, dry run and
 //     boot must name the same pid. A probe with no plan stays inert.
 //  4. F: the --dry-run pipe row carries the same benign plan. --help stays plan-free.
+//
+// ── TASK 1270 MIGRATION (orch-test-coupling). AMENDED, NOT EXECUTED (needs a real install). ──
+//
+// The boot no longer SIGKILLs stale bridges or DELETEs a STALE record. It runs a bounded exact-local preflight:
+// `telepty boot-capabilities` (the PATH telepty), then curl GET /api/meta and GET /api/sessions/<sid>. Only a 404 (FRESH)
+// boots, with `telepty allow-create-v1`; an existing session (200) or any other verdict is exit 3 with an empty stdout. The
+// removed `__probe singleton-guard|registry-reconcile` doors exit 4. A dry run probes nothing.
+//  1. Fixture: the PATH `telepty` answers `boot-capabilities` (recorded as `caps`, never as `exec`). The CURL recorder
+//     answers the two GETs per route and records ONLY [method, url] (no token header into the evidence files). ps/kill/list
+//     stay ARMED tripwires and must stay empty everywhere. `inert()` also requires `caps` to be empty.
+//  2. C/G/H: the dry run's old ps/list reads and `would DELETE` are replaced by "probes nothing" + "only on a FRESH verdict".
+//  3. D: the probe/dry-run/recorder KILL-SET equality is replaced by the preflight boundaries. The removed probes are inert;
+//     with the old live-bridge ps table and STALE listing still armed, a FRESH boot makes exactly two GETs and one exec,
+//     and an EXISTING session stops it with nothing killed, deleted or exec'd.
+//  4. The handoff rows' "curl/auth never fire" becomes "exactly the preflight's two GETs and one credential read".
+//  5. Every expected argv uses `allow-create-v1` (the supported boot caller's verb).
+// Nothing else was relaxed. The init/doc, help/seam, refusal-table, E/I and F checks and the immutability snapshots are unchanged.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -65,7 +82,10 @@ const sid = 'fixture-it1171b';
 const hash = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 const save = (name, data) => fs.writeFileSync(path.join(evidence, name), typeof data === 'string' ? data : JSON.stringify(data, null, 2) + '\n');
 const noGit = dir => { for (;;) { assert.ok(!fs.existsSync(path.join(dir, '.git')), `git ancestor: ${dir}`); const up = path.dirname(dir); if (up === dir) break; dir = up; } };
-assert.equal(process.version, 'v20.20.0');
+// Task 1270 installed CI: admit ONLY the fixed pair — v20.20.0 (original measured baseline) and v26.13.0 (new measured
+// target). Every other runtime is rejected; the actual one is recorded below in fixture.json `version`.
+const ADMITTED_RUNTIMES = ['v20.20.0', 'v26.13.0'];
+assert.ok(ADMITTED_RUNTIMES.includes(process.version), `runtime ${process.version} is not an admitted installed-acceptance runtime`);
 noGit(tmp);
 fs.mkdirSync(evidence, { recursive: true });
 const fixture = fs.mkdtempSync(path.join(tmp, 'installed-boot-'));
@@ -111,13 +131,32 @@ for (const name of ['jq', 'python3']) {
 // gemini and grok join the recorder set: #1181 registers four providers, and "no
 // provider is executed to describe it" is only measurable for a provider that has a
 // recorder. Without them the two new rows would have nothing to assert against.
-const kinds = ['ps', 'kill', 'list', 'curl', 'exec', 'claude', 'codex', 'gemini', 'grok', 'cmux', 'auth'];
+const kinds = ['ps', 'kill', 'list', 'curl', 'exec', 'caps', 'claude', 'codex', 'gemini', 'grok', 'cmux', 'auth'];
 const recorder = (name, kind) => executable(name, `#!${NODE}\nconst fs=require('node:fs');\nfs.appendFileSync(${JSON.stringify(path.join(logs, kind + '.jsonl'))},JSON.stringify(process.argv.slice(2))+'\\n');\n${kind === 'ps' ? `process.stdout.write(fs.readFileSync(${JSON.stringify(path.join(fixture, 'ps.txt'))}));` : kind === 'list' ? `process.stdout.write(fs.readFileSync(${JSON.stringify(path.join(fixture, 'list.json'))}));` : ''}\n`);
+// Task 1270 preflight fixture data. The sealed line is telepty cli.js bootCapabilitiesLine, exactly.
+const SEALED_CAPS = '{"schema":"telepty-boot-capabilities-v1","verbs":["allow-create-v1"],"viewer_detach":"nondeleting-v1"}\n';
+const DAEMON_FRESH = {
+  meta: { code: '200', body: JSON.stringify({ capabilities: ['sessions', 'wrapped-sessions', 'register-create-only'] }) },
+  session: { code: '404', body: JSON.stringify({ error: 'Session not found' }) },
+};
+const META_GET = ['GET', 'http://127.0.0.1:3848/api/meta'];
+const SESSION_GET = ['GET', `http://127.0.0.1:3848/api/sessions/${encodeURIComponent(sid)}`];
 env.SINGLETON_PS_CMD = recorder('ps-recorder', 'ps');
 env.KILL_CMD = recorder('kill-recorder', 'kill');
 env.TELEPTY = recorder('telepty-list-recorder', 'list');
-env.CURL = recorder('curl', 'curl');
-recorder('telepty', 'exec');
+// The CURL seam: records ONLY [method, url] — never the x-telepty-token header — and answers per route from http.json as
+// `<body>\n<code>` (the `curl -w '\n%{http_code}'` shape) with curl's own exit status.
+env.CURL = executable('curl', `#!${NODE}\nconst fs=require('node:fs');\nconst a=process.argv.slice(2);const u=a[a.length-1]||'';\n` +
+  `fs.appendFileSync(${JSON.stringify(path.join(logs, 'curl.jsonl'))},JSON.stringify([a.includes('-X')?a[a.indexOf('-X')+1]:'GET',u])+'\\n');\n` +
+  `const k=u.endsWith('/api/meta')?'meta':u.includes('/api/sessions/')?'session':'other';\n` +
+  `let r={code:'000',body:'',exit:7};try{r=JSON.parse(fs.readFileSync(${JSON.stringify(path.join(fixture, 'http.json'))},'utf8'))[k]||r}catch{}\n` +
+  `process.stdout.write(r.body+'\\n'+r.code);process.exit(r.exit||0);\n`);
+// The PATH telepty: `boot-capabilities` (exactly) is the preflight probe, recorded as `caps` and answered from caps.txt;
+// every other argv is the bridge the shim execs, recorded as `exec` exactly as before.
+executable('telepty', `#!${NODE}\nconst fs=require('node:fs');const a=process.argv.slice(2);\n` +
+  `if(a.length===1&&a[0]==='boot-capabilities'){fs.appendFileSync(${JSON.stringify(path.join(logs, 'caps.jsonl'))},JSON.stringify(a)+'\\n');` +
+  `process.stdout.write(fs.readFileSync(${JSON.stringify(path.join(fixture, 'caps.txt'))}));process.exit(0)}\n` +
+  `fs.appendFileSync(${JSON.stringify(path.join(logs, 'exec.jsonl'))},JSON.stringify(a)+'\\n');\n`);
 for (const name of ['claude', 'codex', 'gemini', 'grok', 'cmux']) recorder(name, name);
 const shimRel = 'bin/orchestrator-boot.sh';
 // H1 — the WHOLE compiled boot module. cli.js imports ./plan.js and ./wizard.js; plan.js
@@ -128,8 +167,7 @@ const bootModule = ['cli.js', 'usage.js', 'plan.js', 'wizard.js', 'provider-capa
 // #1181 v4: the doc usage.ts cites is now shipped AND init-placed, so it belongs in the
 // immutability snapshot beside the rest of the governance surface.
 const BOOT_DOC = 'docs/setup/orchestrator-boot.md';
-const REPORT_DOC = 'docs/setup/worker-reports.md';
-const tracked = ['package.json', 'bin/init/cli.mjs', 'bin/init/manifest.mjs', BOOT_DOC, REPORT_DOC, shimRel, 'bin/lib/node-shim.sh', 'bin/lib/telepty-auth.sh', ...bootModule];
+const tracked = ['package.json', 'bin/init/cli.mjs', 'bin/init/manifest.mjs', BOOT_DOC, shimRel, 'bin/lib/node-shim.sh', 'bin/lib/telepty-auth.sh', ...bootModule];
 for (const rel of bootModule) {
   assert.ok(fs.existsSync(path.join(root, rel)),
     `GAP: the installed package is missing ${rel}. The boot module cannot import, so no boot assertion below can fail for the right reason.`);
@@ -180,10 +218,15 @@ function reset() {
   const bridge = `node /fixture/telepty allow --id ${sid} --auto-restart claude --continue`;
   fs.writeFileSync(path.join(fixture, 'ps.txt'), `3333 2222 bash ${shim}\n2222 1111 node claude\n1111 1 ${bridge}\n7777 1 ${bridge}\n8888 1 /bin/zsh -c pgrep -fl telepty allow --id ${sid} --auto-restart claude\n`);
   fs.writeFileSync(path.join(fixture, 'list.json'), JSON.stringify([{ id: sid, healthStatus: 'STALE', active_clients: 0 }]));
+  // Task 1270 defaults: a current telepty and a daemon that supports create-only and holds no such session (FRESH).
+  fs.writeFileSync(path.join(fixture, 'caps.txt'), SEALED_CAPS);
+  fs.writeFileSync(path.join(fixture, 'http.json'), JSON.stringify(DAEMON_FRESH));
 }
 const inert = (reads = false) => {
-  for (const k of ['kill', 'curl', 'exec', 'claude', 'codex', 'gemini', 'grok', 'cmux', 'auth', ...(reads ? ['ps', 'list'] : [])]) assert.deepEqual(calls(k), [], k);
+  for (const k of ['kill', 'curl', 'exec', 'caps', 'claude', 'codex', 'gemini', 'grok', 'cmux', 'auth', ...(reads ? ['ps', 'list'] : [])]) assert.deepEqual(calls(k), [], k);
 };
+// Task 1270: the removed SIGKILL guard and DELETE reconcile never run again — on ANY path, a completed boot included.
+const noDestructive = label => { for (const k of ['ps', 'list', 'kill']) assert.deepEqual(calls(k), [], `${label}: the '${k}' tripwire fired`); };
 function boot(label, args, extra = {}) {
   assert.equal(hash(shim), before[shimRel]);
   assert.equal(fs.realpathSync(path.join(bin, 'aigentry-orchestrator')), path.join(root, 'bin/init/cli.mjs'));
@@ -211,7 +254,7 @@ const PLANS = {
 };
 /** The env a non-TTY caller must now state. No AIGENTRY_BOOT_RISK_ACK: nothing here is elevated. */
 const planEnv = cli => ({ AIGENTRY_BOOT_PLAN: '1', ORCHESTRATOR_CLI: cli, AIGENTRY_BOOT_PERMISSION: PLANS[cli].permission, AIGENTRY_BOOT_HISTORY: 'new' });
-const expected = cli => ['telepty', 'allow', '--id', sid, '--auto-restart', ...PLANS[cli].tail];
+const expected = cli => ['telepty', 'allow-create-v1', '--id', sid, '--auto-restart', ...PLANS[cli].tail];
 
 test('exact installed boot selector acceptance (independent T134 A-I)', async t => {
   reset();
@@ -236,12 +279,16 @@ test('exact installed boot selector acceptance (independent T134 A-I)', async t 
       // did not. Nothing below is a source check.
       const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
       assert.ok(pkg.files.includes(BOOT_DOC), `the installed package.json does not ship ${BOOT_DOC}`);
-      assert.ok(pkg.files.includes(REPORT_DOC), `the installed package.json does not ship ${REPORT_DOC}`);
       const manifest = await import(pathToFileURL(path.join(root, 'bin/init/manifest.mjs')).href);
-      assert.deepEqual(manifest.MANIFEST.filter(p => p.startsWith('docs/setup/')), [BOOT_DOC, REPORT_DOC],
-        'init must place the two named docs/setup leaves');
-      assert.ok(manifest.GOVERNANCE_ROOTS.includes(BOOT_DOC));
-      assert.ok(manifest.GOVERNANCE_ROOTS.includes(REPORT_DOC));
+      // Task 1270 (CI 43736341103): init places EXACTLY TWO docs/setup leaves — this boot doc and
+      // docs/setup/worker-reports.md (#1170, the confined report pump). Both are required documents, each placed
+      // once, each a governance-root LEAF. (Was: "exactly one docs/setup leaf".) No manifest or doc is changed here.
+      const INIT_SETUP_DOCS = [BOOT_DOC, 'docs/setup/worker-reports.md'];
+      const setupLeaves = manifest.MANIFEST.filter(p => p.startsWith('docs/setup/'));
+      assert.deepEqual([...setupLeaves].sort(), [...INIT_SETUP_DOCS].sort(),
+        `init must place exactly these two docs/setup leaves, got: ${JSON.stringify(setupLeaves)}`);
+      assert.equal(setupLeaves.length, 2, 'each init-placed docs/setup leaf appears exactly once');
+      for (const leaf of INIT_SETUP_DOCS) assert.ok(manifest.GOVERNANCE_ROOTS.includes(leaf), `${leaf} is not a governance-root leaf`);
       assert.ok(!manifest.GOVERNANCE_ROOTS.includes('docs/setup/'),
         'docs/setup/ as a root would require MANIFEST entries for the other shipped setup docs');
 
@@ -249,7 +296,6 @@ test('exact installed boot selector acceptance (independent T134 A-I)', async t 
       const placed = path.join(ws, BOOT_DOC);
       assert.ok(fs.existsSync(placed), `init did not place ${BOOT_DOC} into the workspace`);
       assert.equal(hash(placed), before[BOOT_DOC], 'the placed doc differs from the shipped one');
-      assert.equal(hash(path.join(ws, REPORT_DOC)), before[REPORT_DOC], 'the report guide differs from the shipped one');
       assert.equal(fs.statSync(placed).mode & 0o777, 0o644, 'the placed doc is not 0644');
       // The usage text cites this path; on an installed host it must resolve to content.
       assert.ok(fs.readFileSync(placed, 'utf8').length > 0, 'the placed doc is empty');
@@ -299,17 +345,20 @@ test('exact installed boot selector acceptance (independent T134 A-I)', async t 
         assert.match(r.stdout, /bare invocation|with no (flag|argument)/i); assert.match(r.stdout, /exec/i); assert.match(r.stdout, /inherits cwd/);
       }
     });
-    await t.test('C/G/H: all four providers from an explicit plan; stale deletion intent', () => {
+    await t.test('C/G/H: all four providers from an explicit plan; a dry run probes nothing and claims no verdict', () => {
       // WAS: [undefined, 'claude', 'codex', ''] — the `undefined` and `''` rows asserted
       // that a MISSING provider still booted, into a hardcoded bypass. Both are refusals
       // now (next subtest). The remaining rows become complete explicit plans, and the
       // set grows from two real providers to four.
       for (const cli of ['claude', 'codex', 'gemini', 'grok']) {
         reset(); const r = boot(`dry-${cli}`, ['--dry-run'], planEnv(cli));
-        assert.equal(r.status, 0, r.stderr); inert();
-        assert.deepEqual(calls('ps'), [['-eo', 'pid,ppid,command']]); assert.deepEqual(calls('list'), [['list', '--json']]);
+        // Task 1270 (was: ps/list read once and `would DELETE`): the dry run reads, probes, lists and deletes NOTHING —
+        // inert(true) covers ps/list/kill/curl/caps/auth/exec and the providers — and it never reports a verdict.
+        assert.equal(r.status, 0, r.stderr); inert(true);
         assert.deepEqual(r.stdout.split('\n').filter(s => s.startsWith('[would-exec] ')).map(s => s.slice(13)), expected(cli));
-        assert.match(r.stdout, /would DELETE/); assert.ok(r.stdout.includes(`/api/sessions/${sid}`));
+        assert.match(r.stdout, /not probed/); assert.match(r.stdout, /only on a FRESH verdict/);
+        assert.ok(r.stdout.includes(`/api/sessions/${sid} and boot only on 404`), 'the dry run does not name the exact-sid lookup it would make');
+        assert.ok(!/would DELETE|would SIGKILL|boot preflight (FRESH|EXISTS)/.test(r.stdout + r.stderr), `${cli}: a removed effect or an unprobed verdict was reported`);
         assert.ok(!r.stdout.includes('x-telepty-token')); assert.ok(!r.stdout.includes('fixture-token'));
         // The removed tails may not reappear from a plan that named neither.
         assert.ok(!/--dangerously-(skip-permissions|bypass-approvals-and-sandbox)/.test(r.stdout),
@@ -378,38 +427,63 @@ test('exact installed boot selector acceptance (independent T134 A-I)', async t 
       });
       assert.equal(withAck.status, 0, withAck.stderr); inert();
       assert.deepEqual(withAck.stdout.split('\n').filter(s => s.startsWith('[would-exec] ')).map(s => s.slice(13)),
-        ['telepty', 'allow', '--id', sid, '--auto-restart', 'claude', '--dangerously-skip-permissions', '--continue']);
+        ['telepty', 'allow-create-v1', '--id', sid, '--auto-restart', 'claude', '--dangerously-skip-permissions', '--continue']);
       // Positive control on the exec channel: when an elevated argv really is emitted, BYPASS sees it.
       assert.ok(BYPASS.test(withAck.stdout), 'BYPASS no longer detects an emitted elevated argv');
     });
-    await t.test('D: recorder kill set equals dry-run set, ancestor and mention skipped', () => {
-      // (io1181km) The probe is not exempt from the plan gate. Without a plan it refuses before any read.
+    await t.test('D: the guard is gone — removed probes are inert; a FRESH boot only probes; an existing session is left alone', () => {
+      // Task 1270. WAS: the probe kill set == the dry-run set == the recorder kill set ['7777']. The SIGKILL guard and the DELETE
+      // reconcile are REMOVED, so that equality has nothing left to measure. What replaces it is the opposite guarantee, with
+      // the SAME armed fixture (reset(): a live bridge 7777, a self/ancestor 1111, a `pgrep` mention 8888, and a STALE/0-client
+      // listing): nothing is listed, signalled or deleted, on every path.
+      // (io1181km, unchanged) The probe is not exempt from the plan gate. Without a plan it refuses before any read.
       reset(); const noPlan = boot('guard-probe-no-plan', ['__probe', 'singleton-guard']);
       refusal(noPlan, MISSING_PLAN, 'guard-probe-no-plan'); inert(true);
-      // With a complete benign plan the probe inspects. It shares the dry-run effect gate (cli.js
-      // DRY_RUN), so it reports the kill set on stderr and signals nothing.
-      reset(); const probe = boot('guard-probe', ['__probe', 'singleton-guard'], planEnv('claude'));
-      assert.equal(probe.status, 0, probe.stderr); assert.equal(probe.stdout, ''); inert();
-      assert.deepEqual(calls('ps'), [['-eo', 'pid,ppid,command']]); assert.deepEqual(calls('list'), []);
-      // One per-pid line each. `[^=]*` used to span lines: a planned dry run also prints the plan-level
-      // "would SIGKILL stale '…' bridges" effect line, which has no '=' and ran on into the ancestor's pid.
-      const killSet = out => [...out.matchAll(/^\[orchestrator-boot\] \[dry-run\] would SIGKILL stale orchestrator bridge pid=(\d+) /gm)].map(m => m[1]);
-      const probeSet = killSet(probe.stderr);
-      assert.deepEqual(probeSet, ['7777']);
-      assert.match(probe.stderr, /skip self\/ancestor bridge pid=1111/); assert.match(probe.stderr, /skip pid=8888 — not a bridge/);
-      // The RECORDER kill set: a planned bare boot through the fixture shim, same ps fixture. An empty
-      // registry listing keeps curl/auth out of it, so only kill and the exec recorder may fire.
-      reset(); fs.writeFileSync(path.join(fixture, 'list.json'), '[]');
-      const real = boot('guard-boot', [], planEnv('claude'));
-      assert.equal(real.status, 0, real.stderr); assert.equal(real.stdout, '');
-      assert.deepEqual(calls('kill'), [['-9', '7777']]);
+      // With a complete benign plan, the removed probe doors land on the unknown-subcommand arm.
+      for (const sub of ['singleton-guard', 'registry-reconcile']) {
+        reset(); const probe = boot(`removed-probe-${sub}`, ['__probe', sub], planEnv('claude'));
+        assert.equal(probe.status, 4, probe.stderr); assert.equal(probe.stdout, '');
+        assert.equal(probe.stderr, `orchestrator-boot.sh: unknown __probe subcommand: ${sub}\n`);
+        inert(true);
+      }
+      // FRESH (default daemon fixture: 404 for the sid): a planned bare boot through the fixture shim probes exactly once and
+      // execs the create-only argv. The live bridge 7777 is NOT signalled, and the STALE record is not deleted.
+      reset();
+      const fresh = boot('preflight-fresh', [], planEnv('claude'));
+      assert.equal(fresh.status, 0, fresh.stderr); assert.equal(fresh.stdout, '');
+      assert.deepEqual(calls('caps'), [['boot-capabilities']]);
+      assert.deepEqual(calls('curl'), [META_GET, SESSION_GET]);
+      assert.equal(calls('auth').length, 1, 'the preflight reads the credential once, through the sanctioned door');
       assert.deepEqual(calls('exec'), [expected('claude').slice(1)]);
-      for (const k of ['curl', 'auth', 'claude', 'codex', 'gemini', 'grok', 'cmux']) assert.deepEqual(calls(k), [], k);
-      assert.match(real.stderr, /skip self\/ancestor bridge pid=1111/);
-      reset(); const dry = boot('guard-dry', ['--dry-run'], planEnv('claude')); assert.equal(dry.status, 0, dry.stderr); inert();
-      const drySet = killSet(dry.stdout);
-      assert.deepEqual(drySet, ['7777']); assert.deepEqual(drySet, probeSet);
-      assert.match(dry.stdout, /skip self\/ancestor bridge pid=1111/); assert.match(dry.stdout, /8888/);
+      noDestructive('fresh');
+      for (const k of ['claude', 'codex', 'gemini', 'grok', 'cmux']) assert.deepEqual(calls(k), [], k);
+      assert.match(fresh.stderr, /boot preflight FRESH — no session 'fixture-it1171b'/);
+      assert.ok(!fresh.stderr.includes('fixture-token'), 'the credential was printed');
+      // EXISTING session (the exact sid answers 200): the boot stops — shim exit 3, empty stdout, no exec — after the same two
+      // GETs. The existing native work is not killed, replaced, attached or deleted (no kill/ps/list call, no non-GET request).
+      reset();
+      fs.writeFileSync(path.join(fixture, 'http.json'), JSON.stringify({ ...DAEMON_FRESH,
+        session: { code: '200', body: JSON.stringify({ id: sid, type: 'wrapped', alias: null, active_clients: 0 }) } }));
+      const exists = boot('preflight-exists', [], planEnv('claude'));
+      assert.equal(exists.status, 3, exists.stderr); assert.equal(exists.stdout, '');
+      assert.match(exists.stderr, /boot preflight EXISTS_IDENTITY_UNPROVEN for 'fixture-it1171b'/);
+      assert.match(exists.stderr, /Nothing was created, attached, signalled, deleted or exec'd\./);
+      assert.deepEqual(calls('caps'), [['boot-capabilities']]);
+      assert.deepEqual(calls('curl'), [META_GET, SESSION_GET]);
+      assert.deepEqual(calls('exec'), []);
+      noDestructive('exists');
+      for (const k of ['claude', 'codex', 'gemini', 'grok', 'cmux']) assert.deepEqual(calls(k), [], k);
+      // An OLD telepty (help + exit 0 for the unknown verb) is UNSUPPORTED before any daemon request.
+      reset(); fs.writeFileSync(path.join(fixture, 'caps.txt'), 'Usage: telepty <command>\n');
+      const old = boot('preflight-old-telepty', [], planEnv('claude'));
+      assert.equal(old.status, 3, old.stderr); assert.equal(old.stdout, '');
+      assert.match(old.stderr, /boot preflight UNSUPPORTED/);
+      assert.deepEqual(calls('caps'), [['boot-capabilities']]);
+      for (const k of ['curl', 'auth', 'exec']) assert.deepEqual(calls(k), [], k);
+      noDestructive('old telepty');
+      // The dry run with the same armed fixture probes nothing at all.
+      reset(); const dry = boot('guard-dry', ['--dry-run'], planEnv('claude')); assert.equal(dry.status, 0, dry.stderr); inert(true);
+      assert.ok(!/would SIGKILL|would DELETE/.test(dry.stdout + dry.stderr), 'the dry run still describes a removed effect');
     });
     await t.test('E/I: unknown flags and invalid/control selectors refuse before reads', () => {
       for (const [i, args] of [['one', ['--bogus-flag']], ['two', ['--dry-run', '--bogus']]]) {
@@ -453,9 +527,14 @@ test('exact installed boot selector acceptance (independent T134 A-I)', async t 
         // THE PROVIDERS THEMSELVES ARE NEVER RUN. The exec recorder stands in for
         // `telepty`, which is what would have gone on to run the provider; nothing on the
         // boot path may invoke one — not even to read its --help or --version.
-        for (const k of ['kill', 'curl', 'auth', 'claude', 'codex', 'gemini', 'grok', 'cmux']) {
+        for (const k of ['kill', 'ps', 'list', 'claude', 'codex', 'gemini', 'grok', 'cmux']) {
           assert.deepEqual(calls(k), [], `${cli}: the '${k}' recorder fired during a handoff boot`);
         }
+        // Task 1270 (was: curl and auth never fire): the boot's ONLY other effects are its bounded preflight — one
+        // capability probe, one credential read and exactly the two GETs (FRESH).
+        assert.deepEqual(calls('caps'), [['boot-capabilities']], `${cli}: capability probe`);
+        assert.deepEqual(calls('curl'), [META_GET, SESSION_GET], `${cli}: preflight requests`);
+        assert.equal(calls('auth').length, 1, `${cli}: credential reads`);
       }
     });
   } finally {

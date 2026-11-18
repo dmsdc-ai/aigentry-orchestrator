@@ -21,7 +21,11 @@
 //
 // ⚠️ WHAT MAY RUN. A fake PATH with fake executables, a closed temporary HOME, and
 // recorder stubs on every seam (SINGLETON_PS_CMD, KILL_CMD, TELEPTY, CURL, and the
-// `telepty` the shim finally execs). NO real provider, NO real telepty, NO real daemon,
+// `telepty` the shim finally execs). Task 1270: the boot no longer lists, signals or DELETEs
+// anything, so the ps/kill/list recorders are kept ONLY as armed tripwires that must stay empty
+// on every path; the fake `telepty` also answers the preflight's `boot-capabilities` probe
+// (recorded as `caps`, never as `exec`) and the curl recorder answers the bounded local
+// GET /api/meta and GET /api/sessions/<sid> from per-route fixture data. NO real provider, NO real telepty, NO real daemon,
 // NO network: `CURL` is a recorder that never opens a socket and nothing else in the
 // module reaches the wire. Every kill goes to a recorder; the only processes this file
 // creates are its own children and the pty driver kills only its own process group.
@@ -98,7 +102,7 @@ function fixture() {
       { mode: 0o700 });
     return file;
   };
-  const kinds = ['ps', 'kill', 'list', 'curl', 'exec', 'auth', 'claude', 'codex', 'gemini', 'grok'];
+  const kinds = ['ps', 'kill', 'list', 'curl', 'exec', 'auth', 'caps', 'claude', 'codex', 'gemini', 'grok'];
   for (const k of kinds) fs.writeFileSync(path.join(logs, `${k}.jsonl`), '');
 
   const seams = {
@@ -107,11 +111,26 @@ function fixture() {
     KILL_CMD: recorder('kill-recorder', 'kill'),
     TELEPTY: recorder('telepty-list-recorder', 'list',
       `try{process.stdout.write(fs.readFileSync(${JSON.stringify(path.join(dir, 'list.json'))}))}catch{}\n`),
-    CURL: recorder('curl-recorder', 'curl', `process.stdout.write('200');\n`),
+    // Task 1270: the bounded local GETs of the boot preflight. Answered per route from http.json as
+    // `<body>\n<code>` — the shape `curl -w '\n%{http_code}'` prints — with curl's own exit status.
+    CURL: recorder('curl-recorder', 'curl',
+      `const u=process.argv[process.argv.length-1]||'';const k=u.endsWith('/api/meta')?'meta':u.includes('/api/sessions/')?'session':'other';\n` +
+      `let r={code:'000',body:'',exit:7};try{r=JSON.parse(fs.readFileSync(${JSON.stringify(path.join(dir, 'http.json'))},'utf8'))[k]||r}catch{}\n` +
+      `process.stdout.write(r.body+'\\n'+r.code);process.exit(r.exit||0);\n`),
   };
   // The bridge the shim finally execs, resolved from PATH exactly as a real boot resolves
   // it. Its presence in the log is the ONLY evidence that a boot completed.
-  recorder('telepty', 'exec');
+  // Task 1270: the same PATH `telepty` also answers the preflight's `boot-capabilities` probe —
+  // recorded under `caps`, answered from caps.txt with exit code caps.rc — and that probe is
+  // NEVER logged as an exec.
+  fs.writeFileSync(path.join(bin, 'telepty'),
+    `#!${NODE}\n` +
+    `const fs=require('node:fs');const a=process.argv.slice(2);\n` +
+    `if(a[0]==='boot-capabilities'){fs.appendFileSync(${JSON.stringify(path.join(logs, 'caps.jsonl'))},JSON.stringify(a)+'\\n');` +
+    `try{process.stdout.write(fs.readFileSync(${JSON.stringify(path.join(dir, 'caps.txt'))}))}catch{}` +
+    `let rc=0;try{rc=Number(fs.readFileSync(${JSON.stringify(path.join(dir, 'caps.rc'))},'utf8'))}catch{}process.exit(rc)}\n` +
+    `fs.appendFileSync(${JSON.stringify(path.join(logs, 'exec.jsonl'))},JSON.stringify(a)+'\\n');\n`,
+    { mode: 0o700 });
   // THE FOUR PROVIDERS. They are on PATH so the wizard's X_OK availability check finds
   // them, and they record EVERY invocation — including a `--help` or a `--version` — so
   // "no provider is executed to describe it" is measured, not asserted.
@@ -119,6 +138,10 @@ function fixture() {
 
   fs.writeFileSync(path.join(dir, 'ps.txt'), '');
   fs.writeFileSync(path.join(dir, 'list.json'), '[]');
+  // Task 1270 defaults: a current telepty and a daemon that supports create-only and holds no such session (FRESH).
+  fs.writeFileSync(path.join(dir, 'caps.txt'), SEALED_CAPS);
+  fs.writeFileSync(path.join(dir, 'caps.rc'), '0');
+  fs.writeFileSync(path.join(dir, 'http.json'), JSON.stringify(DAEMON_FRESH));
 
   // The one sanctioned credential door, replaced by a recorder. The real resolver is not
   // staged here and must never be reached; if the boot resolves a credential this fires.
@@ -154,11 +177,33 @@ function fixture() {
     dir, bin, logs, home, cwd, env, calls, kinds,
     psTable: rows => fs.writeFileSync(path.join(dir, 'ps.txt'), rows.join('\n') + (rows.length ? '\n' : '')),
     listing: value => fs.writeFileSync(path.join(dir, 'list.json'), JSON.stringify(value)),
+    /** Task 1270: what the fake telepty prints (and exits with) for `boot-capabilities`. */
+    bootCaps: (text, rc = 0) => {
+      fs.writeFileSync(path.join(dir, 'caps.txt'), text);
+      fs.writeFileSync(path.join(dir, 'caps.rc'), String(rc));
+    },
+    /** Task 1270: what the fake daemon answers through the curl seam, merged per route ('meta', 'session'). */
+    daemon: routes => {
+      const cur = JSON.parse(fs.readFileSync(path.join(dir, 'http.json'), 'utf8'));
+      fs.writeFileSync(path.join(dir, 'http.json'), JSON.stringify({ ...cur, ...routes }));
+    },
+    /** Task 1270: every request put through the curl seam, as [method, url]. */
+    requests() {
+      return this.calls('curl').map(a => [a.includes('-X') ? a[a.indexOf('-X') + 1] : 'GET', a[a.length - 1]]);
+    },
+    /** Task 1270: nothing was listed, signalled or deleted — on EVERY path, a completed boot included. */
+    assertNoDestructiveEffect(label) {
+      for (const k of ['ps', 'list', 'kill']) assert.deepEqual(this.calls(k), [], `${label}: the '${k}' tripwire fired`);
+      for (const a of this.calls('curl')) {
+        assert.ok(!a.includes('-X') && !a.includes('--request') && !a.some(x => /^DELETE$/i.test(x)),
+          `${label}: a non-GET registry request was issued: ${JSON.stringify(a.slice(0, -1).filter(x => !x.startsWith('x-telepty-token')))}`);
+      }
+    },
     /** Remove a provider from PATH, to drive the "missing binary" screen. */
     uninstall: p => fs.rmSync(path.join(bin, p)),
     /** Nothing was listed, deleted, signalled, exec'd, or authenticated. */
     assertInert(label, { reads = false } = {}) {
-      for (const k of ['kill', 'curl', 'exec', 'auth', ...(reads ? ['ps', 'list'] : [])]) {
+      for (const k of ['kill', 'curl', 'exec', 'auth', 'caps', ...(reads ? ['ps', 'list'] : [])]) {
         assert.deepEqual(this.calls(k), [], `${label}: the '${k}' recorder fired`);
       }
       this.assertNoProviderRan(label);
@@ -196,6 +241,20 @@ function pty(fx, { cmd, steps, env = {}, cwd = fx.cwd, timeout = 25 }) {
 const bootCmd = () => ['/bin/bash', SHIM];
 
 const argvLines = stdout => stdout.split('\n').filter(Boolean);
+
+// ── task 1270: the boot preflight's fixture data ────────────────────────────
+// The exact sealed `telepty boot-capabilities` line (telepty cli.js c16e1f81… bootCapabilitiesLine).
+const SEALED_CAPS = '{"schema":"telepty-boot-capabilities-v1","verbs":["allow-create-v1"],"viewer_detach":"nondeleting-v1"}\n';
+const META_OK = { code: '200', body: JSON.stringify({ version: '0.11.0', capabilities: ['sessions', 'wrapped-sessions', 'register-create-only'] }) };
+const SESSION_ABSENT = { code: '404', body: JSON.stringify({ error: 'Session not found' }) };
+const DAEMON_FRESH = { meta: META_OK, session: SESSION_ABSENT };
+const META_URL = 'http://127.0.0.1:3848/api/meta';
+const sessionUrl = (sid, port = '3848') => `http://127.0.0.1:${port}/api/sessions/${encodeURIComponent(sid)}`;
+const CLAUDE_PLAN = {
+  AIGENTRY_BOOT_PLAN: '1', ORCHESTRATOR_CLI: 'claude',
+  AIGENTRY_BOOT_PERMISSION: 'approval=manual', AIGENTRY_BOOT_HISTORY: 'new',
+};
+const CLAUDE_ARGV = sid => ['allow-create-v1', '--id', sid, '--auto-restart', 'claude', '--permission-mode', 'manual'];
 
 /**
  * "It did not boot" — asserted in a way that cannot pass vacuously.
@@ -253,17 +312,24 @@ test('the wizard is the terminal door, and a typed YES is the only thing that bo
     assert.deepEqual(argvLines(r.stdout), []);
     // …because the SHIM consumed it and exec'd. That is where the argv shows up.
     assert.deepEqual(fx.calls('exec'),
-      [['allow', '--id', 'orchestrator', '--auto-restart', 'claude', '--permission-mode', 'manual']]);
+      [['allow-create-v1', '--id', 'orchestrator', '--auto-restart', 'claude', '--permission-mode', 'manual']]);
 
     // The review screen described that argv before it happened, element for element.
-    for (const el of ['telepty', 'allow', '--id', 'orchestrator', '--auto-restart', 'claude', '--permission-mode', 'manual']) {
+    for (const el of ['telepty', 'allow-create-v1', '--id', 'orchestrator', '--auto-restart', 'claude', '--permission-mode', 'manual']) {
       assert.ok(r.terminal.includes(`| ${el}`), `the review screen did not list '${el}': ${r.terminal}`);
     }
-    // It also stated the three effects, in advance, in plain language.
+    // It also stated the effects, in advance, in plain language. Task 1270: the old DELETE and
+    // SIGKILL effects are GONE from the screen because they are gone from the boot.
     assert.match(r.terminal, /This boot WILL:/);
-    assert.match(r.terminal, /DELETE a registry record/);
-    assert.match(r.terminal, /SIGKILL stale/);
+    assert.match(r.terminal, /CHECK that the telepty on PATH supports create-only boot/);
+    assert.match(r.terminal, /LOOK UP 'orchestrator' on the local daemon/);
     assert.match(r.terminal, /REPLACE this shell/);
+    assert.ok(!/DELETE a registry record|SIGKILL stale/.test(r.terminal), 'the review still promises a DELETE or a SIGKILL');
+    // …and the preflight it promised is what ran, on the wire, before the exec.
+    assert.match(r.terminal, /boot preflight FRESH/);
+    assert.deepEqual(fx.requests(), [['GET', META_URL], ['GET', sessionUrl('orchestrator')]]);
+    assert.deepEqual(fx.calls('caps'), [['boot-capabilities']]);
+    fx.assertNoDestructiveEffect('happy path');
 
     // DEFAULT-DENY IS VISIBLE, not just implemented — and since v3 the screen also states
     // the ACCEPTED SET rather than leaving an operator to discover it by experiment.
@@ -496,7 +562,7 @@ test('elevation is never reached by pressing Enter', async t => {
     assert.match(r.terminal, /not acknowledged; the value was NOT selected/);
     // The boot that resulted carries the RESTRICTIVE value and no bypass flag at all.
     assert.deepEqual(fx.calls('exec'),
-      [['allow', '--id', 'orchestrator', '--auto-restart', 'claude', '--permission-mode', 'manual']]);
+      [['allow-create-v1', '--id', 'orchestrator', '--auto-restart', 'claude', '--permission-mode', 'manual']]);
   });
 
   await t.test('the correct acknowledgement does select it — the door is open to someone who names it', () => {
@@ -520,7 +586,7 @@ test('elevation is never reached by pressing Enter', async t => {
     });
     assert.equal(r.rc, 0, r.terminal);
     assert.deepEqual(fx.calls('exec'),
-      [['allow', '--id', 'orchestrator', '--auto-restart', 'claude', '--dangerously-skip-permissions']]);
+      [['allow-create-v1', '--id', 'orchestrator', '--auto-restart', 'claude', '--dangerously-skip-permissions']]);
     // The review screen SHOUTED about it and printed the phrase a non-interactive caller
     // would need — restating the selection, so it cannot authorise a later, different one.
     assert.match(r.terminal, /⚠ ELEVATED: approval=dangerously-skip-permissions/);
@@ -557,15 +623,13 @@ test('elevation is never reached by pressing Enter', async t => {
 // ════════════════════════════════════════════════════════════════════════════
 test('the wizard chooses; the environment only suggests', async t => {
 
-  await t.test('THE r1 DEFECT: the guard and the reconcile act on the SELECTED sid, never the inherited one', () => {
-    // This is the latent defect the controller observed in r1 and the author fixed in r2.
-    // The guard and the reconcile read the MODULE-LEVEL env sid while the wizard can be
-    // given a different one, so a wizard boot that changed the session id would have
-    // SIGKILLed bridges for, and DELETEd the registry record of, a session this boot was
-    // NOT about to become.
+  await t.test('THE r1 DEFECT, task 1270 form: the preflight reads the SELECTED sid only, and nothing is killed or deleted', () => {
+    // History: r1's guard and reconcile read the MODULE-LEVEL env sid while the wizard could be
+    // given a different one, so a boot that changed the id SIGKILLed and DELETEd for a session it
+    // was NOT about to become. Task 1270 removed both effects outright. What remains per sid is a
+    // READ — the exact-session lookup — and it must name the CHOSEN id, never the inherited one.
     //
-    // BOTH IDS ARE ON THE TABLE AND BOTH ARE IN THE LISTING, so the test can tell "acted
-    // on the right one" from "acted on neither".
+    // BOTH IDS ARE STILL ON THE (tripwire) TABLE AND IN THE (tripwire) LISTING: neither may be read.
     const inherited = 'inherited-orch';
     const chosen = 'chosen-orch';
     const fx = fixture();
@@ -598,30 +662,22 @@ test('the wizard chooses; the environment only suggests', async t => {
     assert.ok(r.terminal.includes(`session id [Enter = ${inherited}]`),
       'the environment sid was not offered as a pre-filled suggestion');
 
-    // …and EVERY effect landed on the CHOSEN id.
-    assert.deepEqual(fx.calls('exec'),
-      [['allow', '--id', chosen, '--auto-restart', 'claude', '--permission-mode', 'manual']]);
-    assert.deepEqual(fx.calls('kill'), [['-9', '4002']],
-      `the SIGKILL did not target the chosen session's bridge only: ${JSON.stringify(fx.calls('kill'))}`);
-    const deletes = fx.calls('curl').map(a => a[a.length - 1]);
-    assert.deepEqual(deletes, [`http://127.0.0.1:3848/api/sessions/${chosen}`]);
-
-    // …and NOTHING landed on the inherited one. This is the r1 bug, stated as its own
-    // assertion so a regression names itself.
-    assert.ok(!fx.calls('kill').some(a => a.includes('4001')),
-      'the bridge of the INHERITED sid was SIGKILLed — #539/#905 aimed at a session this boot was not about to become (the r1 defect)');
-    assert.ok(!deletes.some(u => u.endsWith(`/${inherited}`)),
-      'the registry record of the INHERITED sid was DELETEd — the r1 defect');
-    // The reconcile's own verdict line must name the chosen id too, or the report and the
-    // action could disagree.
-    assert.ok(r.terminal.includes(`'${chosen}' is STALE with 0 clients`),
-      `the reconcile verdict does not name the chosen sid: ${r.terminal}`);
+    // …the exec and the one per-sid read landed on the CHOSEN id…
+    assert.deepEqual(fx.calls('exec'), [CLAUDE_ARGV(chosen)]);
+    assert.deepEqual(fx.requests(), [['GET', META_URL], ['GET', sessionUrl(chosen)]]);
+    // …NOTHING touched the inherited one, and nothing was listed, signalled or deleted at all.
+    assert.ok(!fx.requests().some(([, u]) => u.endsWith(`/${inherited}`)),
+      'the preflight looked up the INHERITED sid — the r1 defect in its task-1270 form');
+    fx.assertNoDestructiveEffect('r1');
+    // The verdict line names the chosen id, so the report and the action cannot disagree.
+    assert.ok(r.terminal.includes(`boot preflight FRESH — no session '${chosen}'`),
+      `the preflight verdict does not name the chosen sid: ${r.terminal}`);
   });
 
   await t.test('the r2 fix does not move the id when the plan states it (the explicit-plan path)', () => {
-    // In an explicit plan the two values are the same by construction — ORCHESTRATOR_SID
-    // IS the plan's sid field — so the correction must be a no-op there. Both ids are
-    // again present so "it used the right one" is distinguishable.
+    // In an explicit plan the two values are the same by construction — ORCHESTRATOR_SID IS the
+    // plan's sid field. Both ids are again present (as tripwires) so "it used the right one" is
+    // distinguishable from "it used neither".
     const fx = fixture();
     fx.psTable([
       `4001 1 node /usr/local/bin/telepty allow --id other-orch --auto-restart claude`,
@@ -633,21 +689,12 @@ test('the wizard chooses; the environment only suggests', async t => {
     ]);
     const r = spawnSync('/bin/bash', [SHIM], {
       cwd: fx.cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
-      env: {
-        ...fx.env,
-        ORCHESTRATOR_SID: 'planned-orch',
-        AIGENTRY_BOOT_PLAN: '1',
-        ORCHESTRATOR_CLI: 'claude',
-        AIGENTRY_BOOT_PERMISSION: 'approval=manual',
-        AIGENTRY_BOOT_HISTORY: 'new',
-      },
+      env: { ...fx.env, ORCHESTRATOR_SID: 'planned-orch', ...CLAUDE_PLAN },
     });
     assert.equal(r.status, 0, r.stderr);
-    assert.deepEqual(fx.calls('exec'),
-      [['allow', '--id', 'planned-orch', '--auto-restart', 'claude', '--permission-mode', 'manual']]);
-    assert.deepEqual(fx.calls('kill'), [['-9', '4002']]);
-    assert.deepEqual(fx.calls('curl').map(a => a[a.length - 1]),
-      ['http://127.0.0.1:3848/api/sessions/planned-orch']);
+    assert.deepEqual(fx.calls('exec'), [CLAUDE_ARGV('planned-orch')]);
+    assert.deepEqual(fx.requests(), [['GET', META_URL], ['GET', sessionUrl('planned-orch')]]);
+    fx.assertNoDestructiveEffect('r2');
   });
 
   await t.test('ORCHESTRATOR_CLI on a terminal is a printed hint, not a selection', () => {
@@ -750,7 +797,7 @@ test('providers are described from frozen data, never by running them', async t 
       // Each provider's own flag spelling reached the argv.
       const argv = fx.calls('exec')[0];
       assert.equal(argv[4], key);
-      assert.deepEqual(argv.slice(0, 4), ['allow', '--id', 'orchestrator', '--auto-restart']);
+      assert.deepEqual(argv.slice(0, 4), ['allow-create-v1', '--id', 'orchestrator', '--auto-restart']);
     }
   });
 
@@ -780,7 +827,7 @@ test('providers are described from frozen data, never by running them', async t 
         },
       });
       assert.equal(r.status, 0, `${key}: ${r.stderr}`);
-      assert.deepEqual(fx.calls('exec'), [['allow', '--id', 'orchestrator', '--auto-restart', ...want[key]]]);
+      assert.deepEqual(fx.calls('exec'), [['allow-create-v1', '--id', 'orchestrator', '--auto-restart', ...want[key]]]);
       fx.assertNoProviderRan(`mapping/${key}`);
     }
   });
@@ -810,7 +857,7 @@ test('history is the provider\'s own, and it is never implicit', async t => {
     });
     assert.equal(r.rc, 0, r.terminal);
     assert.deepEqual(codex.calls('exec'),
-      [['allow', '--id', 'orchestrator', '--auto-restart', 'codex', 'resume', uuid,
+      [['allow-create-v1', '--id', 'orchestrator', '--auto-restart', 'codex', 'resume', uuid,
         '--ask-for-approval', 'on-request', '--sandbox', 'read-only']]);
     // The review screen says what resume is and — more importantly — what it is NOT.
     assert.match(r.terminal, /native resume is NOT a context handoff/);
@@ -831,7 +878,7 @@ test('history is the provider\'s own, and it is never implicit', async t => {
     });
     assert.equal(r.rc, 0, r.terminal);
     assert.deepEqual(claude.calls('exec'),
-      [['allow', '--id', 'orchestrator', '--auto-restart', 'claude', '--permission-mode', 'manual', '--resume', uuid]]);
+      [['allow-create-v1', '--id', 'orchestrator', '--auto-restart', 'claude', '--permission-mode', 'manual', '--resume', uuid]]);
     // No history LISTING was ever read to offer that selector — the operator types the id
     // they already know, because listing sessions would be a read this planning step must
     // not perform.
@@ -921,7 +968,7 @@ test('--wizard-plan collects and prints, and acts on nothing', async t => {
     // No line is a bare argv element either, so this mode's output stays distinguishable
     // from the boot path's contract channel even if something ever piped it there.
     for (const l of all) {
-      assert.ok(!['telepty', 'allow', '--id', 'orchestrator', '--auto-restart', 'claude'].includes(l),
+      assert.ok(!['telepty', 'allow-create-v1', '--id', 'orchestrator', '--auto-restart', 'claude'].includes(l),
         `--wizard-plan put a bare exec-argv element alone on a line: ${l}`);
     }
     // A NON-EMPTY ARGV CAN NEVER BOOT: the shim exec'd node, so there is no command
@@ -940,7 +987,7 @@ test('--wizard-plan collects and prints, and acts on nothing', async t => {
     const back = spawnSync('/bin/bash', [SHIM], { cwd: replay.cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: env2 });
     assert.equal(back.status, 0, back.stderr);
     assert.deepEqual(replay.calls('exec'),
-      [['allow', '--id', 'orchestrator', '--auto-restart', 'claude', '--permission-mode', 'manual']]);
+      [['allow-create-v1', '--id', 'orchestrator', '--auto-restart', 'claude', '--permission-mode', 'manual']]);
   });
 
   await t.test('without a terminal it refuses rather than inventing a plan', () => {
@@ -1186,7 +1233,7 @@ test('injection: every field is one argv element, or it is refused', async t => 
     }, '/tmp');
     assert.equal(p.ok, true, JSON.stringify(p.errors));
     assert.deepEqual(plan.buildExecArgv(p.plan),
-      ['telepty', 'allow', '--id', 'orchestrator', '--auto-restart', 'claude', '--model', 'claude-fable-5', '--permission-mode', 'manual']);
+      ['telepty', 'allow-create-v1', '--id', 'orchestrator', '--auto-restart', 'claude', '--model', 'claude-fable-5', '--permission-mode', 'manual']);
   });
 
   await t.test('effort: only in the semantics each provider evidenced', () => {
@@ -1258,7 +1305,7 @@ test('injection: every field is one argv element, or it is refused', async t => 
     });
     assert.equal(withAck.ok, true, JSON.stringify(withAck.errors));
     assert.deepEqual(plan.buildExecArgv(withAck.plan),
-      ['telepty', 'allow', '--id', 'orchestrator', '--auto-restart', 'codex', '--dangerously-bypass-approvals-and-sandbox']);
+      ['telepty', 'allow-create-v1', '--id', 'orchestrator', '--auto-restart', 'codex', '--dangerously-bypass-approvals-and-sandbox']);
     // Schema abuse in the field itself.
     for (const raw of ['approval', 'approval=', '=manual', 'approval=manual;approval=plan', 'approval=manual;;', 'approval manual']) {
       assert.equal(p({ ORCHESTRATOR_CLI: 'claude', AIGENTRY_BOOT_PERMISSION: raw }).ok, false,
@@ -1315,7 +1362,7 @@ test('injection: every field is one argv element, or it is refused', async t => 
       }, '/tmp');
       assert.equal(r.ok, true, `${cli}/${perm}/${hist}: ${JSON.stringify(r.errors)}`);
       const argv = plan.buildExecArgv(r.plan);
-      assert.deepEqual(argv.slice(0, 5), ['telepty', 'allow', '--id', 'orch.tor', '--auto-restart']);
+      assert.deepEqual(argv.slice(0, 5), ['telepty', 'allow-create-v1', '--id', 'orch.tor', '--auto-restart']);
       for (const el of argv) {
         assert.equal(typeof el, 'string');
         assert.ok(!/[\n\r\t\0]/.test(el), `an argv element carries a control character: ${JSON.stringify(el)}`);
@@ -1379,32 +1426,36 @@ test('the no-exec and refusal paths never reach an exec, whatever the environmen
     }
   });
 
-  await t.test('a probe WITH a complete plan inspects without acting', () => {
-    // The probes are read-only inspection seams; with a plan they must reach a verdict and
-    // still not signal, DELETE, resolve a credential or exec.
-    const planEnv = {
-      AIGENTRY_BOOT_PLAN: '1', ORCHESTRATOR_CLI: 'claude',
-      AIGENTRY_BOOT_PERMISSION: 'approval=manual', AIGENTRY_BOOT_HISTORY: 'new',
-    };
-    for (const [sub, needle] of [
-      ['singleton-guard', /would SIGKILL.*pid=7777/],
-      ['registry-reconcile', /would DELETE/],
-    ]) {
+  await t.test('the removed destructive probes are gone, and exec-argv still acts on nothing', () => {
+    // Task 1270 — `__probe singleton-guard` and `__probe registry-reconcile` were the inspection
+    // doors of the SIGKILL guard and the DELETE reconcile, and they are REMOVED with that code.
+    // (Their earlier assertions — "would SIGKILL pid=7777", "would DELETE" — pinned effects the
+    // boot no longer has, so they are replaced, not relaxed.) With a complete plan and both old
+    // fixtures armed they now land on the unknown-subcommand arm: exit 4, every recorder empty.
+    for (const sub of ['singleton-guard', 'registry-reconcile']) {
       const fx = fixture();
       fx.psTable(['7777 1 node /usr/local/bin/telepty allow --id orchestrator --auto-restart claude']);
       fx.listing([{ id: 'orchestrator', healthStatus: 'STALE', active_clients: 0 }]);
       const r = spawnSync('/bin/bash', [SHIM, '__probe', sub], {
         cwd: fx.cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...fx.env, ORCHESTRATOR_SID: 'orchestrator', ...planEnv },
+        env: { ...fx.env, ORCHESTRATOR_SID: 'orchestrator', ...CLAUDE_PLAN },
       });
-      assert.equal(r.status, 0, r.stderr);
-      assert.match(r.stderr, needle);
-      assert.deepEqual(fx.calls('kill'), [], `${sub}: probe SIGKILLed`);
-      assert.deepEqual(fx.calls('curl'), [], `${sub}: probe issued a registry request`);
-      assert.deepEqual(fx.calls('auth'), [], `${sub}: probe resolved a credential`);
-      assert.deepEqual(fx.calls('exec'), [], `${sub}: probe reached the exec`);
-      fx.assertNoProviderRan(`probe/${sub}`);
+      assert.equal(r.status, 4, `${sub}: expected the unknown-subcommand exit 4, got ${r.status}: ${r.stderr}`);
+      assert.match(r.stderr, /unknown __probe subcommand/);
+      assert.equal(r.stdout, '');
+      assert.ok(!/would (SIGKILL|DELETE)/.test(r.stdout + r.stderr), `${sub}: a removed effect was still described`);
+      fx.assertInert(`probe/${sub}`, { reads: true });
     }
+    // exec-argv survives: it prints the would-be argv and acts on nothing — no capability probe,
+    // no daemon request, no credential read, no exec.
+    const fx = fixture();
+    const r = spawnSync('/bin/bash', [SHIM, '__probe', 'exec-argv'], {
+      cwd: fx.cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...fx.env, ORCHESTRATOR_SID: 'orchestrator', ...CLAUDE_PLAN },
+    });
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(argvLines(r.stdout), ['telepty', ...CLAUDE_ARGV('orchestrator')]);
+    fx.assertInert('probe/exec-argv', { reads: true });
   });
 
   await t.test('D1 moved for --wizard-plan ONLY; every other mode keeps the stream it had', () => {
@@ -1549,6 +1600,198 @@ test('the no-exec and refusal paths never reach an exec, whatever the environmen
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// TASK 1270 — THE CREATE-ONLY BOOT PREFLIGHT (written before the product change; not executed by its author).
+//
+// The boot no longer SIGKILLs a bridge or DELETEs a registry record. Before it hands back an argv
+// it asks three bounded, exact-local questions and boots ONLY when the answer is FRESH:
+//   1. is the target the canonical 127.0.0.1 and a numeric port (decided before any process or request);
+//   2. does the telepty on PATH print the sealed boot-capabilities document (old help + exit 0 is not support);
+//   3. does the local daemon advertise wrapped-sessions + register-create-only, and is there NO session
+//      with this exact id (404)?
+// Every other verdict is exit 3, an EMPTY stdout (so the shim cannot exec) and zero mutation. FRESH
+// execs `telepty allow-create-v1 …`, and a creation race after FRESH is refused by the daemon's own
+// create_only (409) — that server half is telepty's, not measurable through this fixture's recorder.
+function planBoot(fx, extra = {}, sid = 'orchestrator') {
+  return spawnSync('/bin/bash', [SHIM], {
+    cwd: fx.cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...fx.env, ORCHESTRATOR_SID: sid, ...CLAUDE_PLAN, ...extra },
+  });
+}
+function assertPreflightRefused(fx, r, verdict, label) {
+  assert.equal(r.status, 3, `${label}: expected exit 3, got ${r.status}: ${r.stderr}`);
+  assert.equal(r.stdout, '', `${label}: a refused preflight wrote to the exec-argv channel: ${JSON.stringify(r.stdout)}`);
+  assert.match(r.stderr, new RegExp(`boot preflight ${verdict}\\b`), `${label}: the verdict is not named: ${r.stderr}`);
+  assert.match(r.stderr, /Nothing was created, attached, signalled, deleted or exec'd\./, `${label}: no zero-effect statement`);
+  assert.deepEqual(fx.calls('exec'), [], `${label}: the exec was reached`);
+  fx.assertNoDestructiveEffect(label);
+  fx.assertNoProviderRan(label);
+  assert.ok(!(r.stdout + r.stderr).includes('fixture-token-bt1181jm'), `${label}: the credential was printed`);
+}
+
+test('task 1270: the boot preflight is exact-local, create-only and non-destructive', async t => {
+
+  await t.test('FRESH — and only FRESH — execs telepty allow-create-v1, after exactly two GETs', () => {
+    const fx = fixture();
+    // Old fixtures armed as tripwires: a live-looking bridge and a STALE/0-client record for the sid.
+    fx.psTable(['7777 1 node /usr/local/bin/telepty allow --id orchestrator --auto-restart claude']);
+    fx.listing([{ id: 'orchestrator', healthStatus: 'STALE', active_clients: 0 }]);
+    const r = planBoot(fx);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(fx.calls('exec'), [CLAUDE_ARGV('orchestrator')]);
+    assert.ok(!fx.calls('exec')[0].includes('allow'), 'the legacy `allow` verb reached the exec');
+    assert.deepEqual(fx.calls('caps'), [['boot-capabilities']]);
+    assert.deepEqual(fx.requests(), [['GET', META_URL], ['GET', sessionUrl('orchestrator')]]);
+    fx.assertNoDestructiveEffect('FRESH');
+    // The preflight runs BEFORE the boot record and the argv.
+    const at = s => r.stderr.indexOf(s);
+    assert.ok(at('boot preflight FRESH') >= 0 && at('boot preflight FRESH') < at('[orchestrator-boot] boot record: '), r.stderr);
+    assert.ok(at('[orchestrator-boot] boot record: ') < at('[orchestrator-boot] exec '), r.stderr);
+    // Bounded, exact-local, proxy-free requests; the credential is a header value only.
+    for (const a of fx.calls('curl')) {
+      assert.ok(a.includes('--noproxy') && a.includes('--max-time'), `unbounded or proxyable request: ${JSON.stringify(a.slice(-1))}`);
+      assert.ok(a[a.length - 1].startsWith('http://127.0.0.1:3848/'), a[a.length - 1]);
+    }
+    assert.ok(!(r.stdout + r.stderr).includes('fixture-token-bt1181jm'), 'the credential was printed');
+  });
+
+  await t.test('an old telepty (help + exit 0) and every malformed capability document is UNSUPPORTED, before any request', () => {
+    const rows = [
+      ['old CLI: help and exit 0', '\nUsage: telepty <command>\n  telepty allow [--id <id>] <command>\n', 0],
+      ['empty output, exit 0', '', 0],
+      ['sealed line, exit 1', SEALED_CAPS, 1],
+      ['not JSON', '{\n', 0],
+      ['no trailing newline', SEALED_CAPS.trimEnd(), 0],
+      ['two lines', SEALED_CAPS + SEALED_CAPS, 0],
+      ['extra key', '{"schema":"telepty-boot-capabilities-v1","verbs":["allow-create-v1"],"viewer_detach":"nondeleting-v1","x":1}\n', 0],
+      ['other schema', '{"schema":"telepty-boot-capabilities-v2","verbs":["allow-create-v1"],"viewer_detach":"nondeleting-v1"}\n', 0],
+      ['verb missing', '{"schema":"telepty-boot-capabilities-v1","verbs":["allow"],"viewer_detach":"nondeleting-v1"}\n', 0],
+      ['duplicate verb', '{"schema":"telepty-boot-capabilities-v1","verbs":["allow-create-v1","allow-create-v1"],"viewer_detach":"nondeleting-v1"}\n', 0],
+      ['non-string verb', '{"schema":"telepty-boot-capabilities-v1","verbs":["allow-create-v1",1],"viewer_detach":"nondeleting-v1"}\n', 0],
+      ['deleting viewer detach', '{"schema":"telepty-boot-capabilities-v1","verbs":["allow-create-v1"],"viewer_detach":"deleting"}\n', 0],
+      ['array document', '["telepty-boot-capabilities-v1"]\n', 0],
+    ];
+    for (const [label, text, rc] of rows) {
+      const fx = fixture();
+      fx.bootCaps(text, rc);
+      const r = planBoot(fx);
+      assertPreflightRefused(fx, r, 'UNSUPPORTED', label);
+      assert.deepEqual(fx.calls('caps'), [['boot-capabilities']], `${label}: the probe ran a different number of times`);
+      assert.deepEqual(fx.calls('curl'), [], `${label}: a daemon request followed an unsupported CLI`);
+      assert.deepEqual(fx.calls('auth'), [], `${label}: a credential was read for an unsupported CLI`);
+    }
+  });
+
+  await t.test('only the canonical 127.0.0.1 and a numeric port are a target; anything else is refused before any process or request', () => {
+    const refused = [
+      { TELEPTY_HOST: 'localhost' }, { TELEPTY_HOST: '::1' }, { TELEPTY_HOST: '127.0.0.1:3848' },
+      { TELEPTY_HOST: 'http://127.0.0.1' }, { TELEPTY_HOST: '127.0.0.2' }, { TELEPTY_HOST: '10.0.0.5' },
+      { TELEPTY_HOST: 'peer-a' }, { TELEPTY_PORT: 'abc' }, { TELEPTY_PORT: '0' }, { TELEPTY_PORT: '70000' },
+      { TELEPTY_PORT: '03848' }, { TELEPTY_PORT: '3848x' },
+    ];
+    for (const extra of refused) {
+      const fx = fixture();
+      const r = planBoot(fx, extra);
+      const label = JSON.stringify(extra);
+      assertPreflightRefused(fx, r, 'TARGET_REFUSED', label);
+      for (const k of ['caps', 'curl', 'auth']) assert.deepEqual(fx.calls(k), [], `${label}: '${k}' ran for a refused target`);
+    }
+    // The accepted shapes: explicit canonical host, and a chosen numeric port that both GETs then use.
+    const fx = fixture();
+    const r = planBoot(fx, { TELEPTY_HOST: '127.0.0.1', TELEPTY_PORT: '4000' });
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(fx.requests(), [['GET', 'http://127.0.0.1:4000/api/meta'], ['GET', sessionUrl('orchestrator', '4000')]]);
+    assert.deepEqual(fx.calls('exec'), [CLAUDE_ARGV('orchestrator')]);
+  });
+
+  await t.test('the daemon capability check: every non-supporting answer stops the boot before the session lookup', () => {
+    const rows = [
+      ['401', { code: '401', body: '{"error":"Unauthorized"}' }, 'CREDENTIAL_REFUSED'],
+      ['403', { code: '403', body: '{"error":"Forbidden"}' }, 'CREDENTIAL_REFUSED'],
+      ['register-create-only missing', { code: '200', body: '{"capabilities":["sessions","wrapped-sessions"]}' }, 'UNSUPPORTED'],
+      ['wrapped-sessions missing', { code: '200', body: '{"capabilities":["register-create-only"]}' }, 'UNSUPPORTED'],
+      ['no capability list (old daemon)', { code: '200', body: '{"version":"0.9.2"}' }, 'UNSUPPORTED'],
+      ['capabilities not an array', { code: '200', body: '{"capabilities":{"wrapped-sessions":true,"register-create-only":true}}' }, 'UNSUPPORTED'],
+      ['not JSON', { code: '200', body: '<html>' }, 'UNKNOWN'],
+      ['JSON null', { code: '200', body: 'null' }, 'UNKNOWN'],
+      ['5xx', { code: '500', body: '{"capabilities":["wrapped-sessions","register-create-only"]}' }, 'UNKNOWN'],
+      ['timeout', { code: '000', body: '', exit: 28 }, 'UNKNOWN'],
+      ['connection refused', { code: '000', body: '', exit: 7 }, 'UNKNOWN'],
+    ];
+    for (const [label, meta, verdict] of rows) {
+      const fx = fixture();
+      fx.daemon({ meta });
+      const r = planBoot(fx);
+      assertPreflightRefused(fx, r, verdict, `meta ${label}`);
+      assert.deepEqual(fx.requests(), [['GET', META_URL]], `meta ${label}: the session was looked up anyway`);
+    }
+  });
+
+  await t.test('the exact-session lookup: only a 404 is FRESH; an existing session is never killed, attached or replaced', () => {
+    const rows = [
+      ['exists (200, exact id)', { code: '200', body: JSON.stringify({ id: 'orchestrator', type: 'wrapped', alias: null, active_clients: 0 }) }, 'EXISTS_IDENTITY_UNPROVEN'],
+      ['resolved through an alias', { code: '200', body: JSON.stringify({ id: 'orchestrator-2', alias: 'orchestrator' }) }, 'UNKNOWN'],
+      ['alias set on the exact id', { code: '200', body: JSON.stringify({ id: 'orchestrator', alias: 'orchestrator' }) }, 'UNKNOWN'],
+      ['a different id', { code: '200', body: JSON.stringify({ id: 'someone-else' }) }, 'UNKNOWN'],
+      ['200 without JSON', { code: '200', body: 'ok' }, 'UNKNOWN'],
+      ['404 without JSON', { code: '404', body: '<html>not found</html>' }, 'UNKNOWN'],
+      ['401', { code: '401', body: '{"error":"Unauthorized"}' }, 'CREDENTIAL_REFUSED'],
+      ['403', { code: '403', body: '{"error":"Forbidden"}' }, 'CREDENTIAL_REFUSED'],
+      ['5xx', { code: '503', body: '{"error":"busy"}' }, 'UNKNOWN'],
+      ['timeout', { code: '000', body: '', exit: 28 }, 'UNKNOWN'],
+    ];
+    for (const [label, session, verdict] of rows) {
+      const fx = fixture();
+      // An existing native task with a live-looking bridge: the old boot would have SIGKILLed it.
+      fx.psTable(['7777 1 node /usr/local/bin/telepty allow --id orchestrator --auto-restart claude']);
+      fx.listing([{ id: 'orchestrator', healthStatus: 'STALE', active_clients: 0 }]);
+      fx.daemon({ session });
+      const r = planBoot(fx);
+      assertPreflightRefused(fx, r, verdict, `session ${label}`);
+      assert.deepEqual(fx.requests(), [['GET', META_URL], ['GET', sessionUrl('orchestrator')]], `session ${label}`);
+    }
+  });
+
+  await t.test('a sid is looked up as ONE encoded path segment', () => {
+    const fx = fixture();
+    const r = planBoot(fx, {}, 'orch.tor');
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(fx.requests(), [['GET', META_URL], ['GET', 'http://127.0.0.1:3848/api/sessions/orch.tor']]);
+  });
+
+  await t.test('a wizard boot whose session already exists stops after YES with an empty stdout', () => {
+    const fx = fixture();
+    fx.daemon({ session: { code: '200', body: JSON.stringify({ id: 'orchestrator', type: 'wrapped' }) } });
+    const r = pty(fx, {
+      cmd: bootCmd(), env: { ORCHESTRATOR_SID: 'orchestrator' },
+      steps: [...CLAUDE_TO_REVIEW, { expect: 'confirm [yes/NO]', send: 'YES\n' }],
+    });
+    assertDidNotBoot(r, 'wizard EXISTS', { expectExit: 3 });
+    assert.match(r.terminal, /boot preflight EXISTS_IDENTITY_UNPROVEN/);
+    assert.deepEqual(fx.calls('exec'), []);
+    fx.assertNoDestructiveEffect('wizard EXISTS');
+  });
+
+  await t.test('--dry-run probes nothing and never claims FRESH', () => {
+    for (const session of [SESSION_ABSENT, { code: '200', body: JSON.stringify({ id: 'orchestrator' }) }]) {
+      const fx = fixture();
+      fx.daemon({ session });
+      fx.psTable(['7777 1 node /usr/local/bin/telepty allow --id orchestrator --auto-restart claude']);
+      const r = spawnSync('/bin/bash', [SHIM, '--dry-run'], {
+        cwd: fx.cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...fx.env, ORCHESTRATOR_SID: 'orchestrator', ...CLAUDE_PLAN },
+      });
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(r.stdout.includes('[would-exec] allow-create-v1'), r.stdout);
+      assert.match(r.stdout, /not probed/);
+      assert.match(r.stdout, /only on a FRESH verdict/);
+      assert.ok(!/boot preflight (FRESH|EXISTS)/.test(r.stdout + r.stderr), 'a dry run reported a verdict it never probed');
+      assert.ok(!/would (SIGKILL|DELETE)/.test(r.stdout + r.stderr), 'a dry run still describes a removed effect');
+      fx.assertInert('dry-run', { reads: true });
+    }
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // SHIPPING METADATA (bt1181jm-v4). SOURCE-LEVEL ONLY — read this boundary first.
 //
 // These cases read the package's OWN declarations out of the repo: `package.json`
@@ -1576,7 +1819,6 @@ test('shipping metadata declares the boot doc and the wizard suite', async t => 
   }
   const manifest = await import(pathToFileURL(manifestPath).href);
   const DOC = 'docs/setup/orchestrator-boot.md';
-  const REPORT_DOC = 'docs/setup/worker-reports.md';
 
   await t.test(`the tarball declares ${DOC}`, () => {
     // usage.ts and the init guidance both cite this path. If npm does not ship it, the
@@ -1588,23 +1830,29 @@ test('shipping metadata declares the boot doc and the wizard suite', async t => 
       'docs/setup/ is declared wholesale; the exact-leaf reasoning below no longer holds');
   });
 
-  await t.test(`init's MANIFEST declares the two named docs/setup leaves`, () => {
+  // Task 1270 (CI 43736341103): init now places TWO docs/setup leaves — this boot doc and docs/setup/worker-reports.md
+  // (#1170, the confined report pump). Both are required documents; the subtest pins that EXACT set rather than the
+  // obsolete "exactly one leaf" or a loose inclusion. Nothing in the manifest is changed to fit a test.
+  const INIT_SETUP_DOCS = [DOC, 'docs/setup/worker-reports.md'];
+  await t.test(`init's MANIFEST declares EXACTLY the two init-placed docs/setup leaves (${INIT_SETUP_DOCS.join(', ')})`, () => {
     const under = manifest.MANIFEST.filter(p => p.startsWith('docs/setup/'));
-    assert.deepEqual(under, [DOC, REPORT_DOC]);
-    assert.ok(pkg.files.includes(REPORT_DOC));
-    assert.ok(manifest.GOVERNANCE_ROOTS.includes(REPORT_DOC));
-    // …and the governance root is the LEAF, not the directory. This is the composition
+    assert.deepEqual([...under].sort(), [...INIT_SETUP_DOCS].sort(),
+      `init must place exactly these docs/setup leaves, got: ${JSON.stringify(under)}`);
+    assert.equal(under.length, 2, `exactly two docs/setup leaves, got: ${JSON.stringify(under)}`);
+    // …and each governance root is the LEAF, not the directory. This is the composition
     // that matters: `bin/init/manifest.mjs` asserts "every tarball path under a
     // GOVERNANCE_ROOT must appear in MANIFEST". Declaring `docs/setup/` as a root would
-    // drag in the other two docs/setup files package.json ships and turn a passing
+    // drag in the other docs/setup files package.json ships and turn a passing
     // packaging guard red for an unrelated reason.
-    assert.ok(manifest.GOVERNANCE_ROOTS.includes(DOC),
-      `${DOC} is shipped and init-placed but is not a governance root — it could ship without init placing it`);
+    for (const leaf of INIT_SETUP_DOCS) {
+      assert.ok(manifest.GOVERNANCE_ROOTS.includes(leaf),
+        `${leaf} is init-placed but is not a governance root — it could ship without init placing it`);
+    }
     assert.ok(!manifest.GOVERNANCE_ROOTS.includes('docs/setup/'),
       'docs/setup/ is a governance root; the other docs/setup files package.json ships would then require MANIFEST entries');
     // The composition, stated as the arithmetic it is: the tarball ships other
     // docs/setup files, and none of them is under a governance root.
-    const otherSetupShipped = pkg.files.filter(f => f.startsWith('docs/setup/') && f !== DOC && f !== REPORT_DOC);
+    const otherSetupShipped = pkg.files.filter(f => f.startsWith('docs/setup/') && !INIT_SETUP_DOCS.includes(f));
     assert.ok(otherSetupShipped.length > 0, 'fixture assumption changed: no other docs/setup file is shipped');
     for (const f of otherSetupShipped) {
       assert.ok(!manifest.GOVERNANCE_ROOTS.some(r => f === r || (r.endsWith('/') && f.startsWith(r))),

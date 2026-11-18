@@ -10,13 +10,20 @@ TELEPTY="${TELEPTY:-telepty}"
 SESSION_PROBE_PY="${SESSION_PROBE_PY:-$SCRIPT_DIR/session-probe.py}"
 POLICY_PY="${POLICY_PY:-$SCRIPT_DIR/policy.py}"
 
-sid=""; settle_ms=6000; quiet=0; resubmit=0
+sid=""; settle_ms=6000; quiet=0; resubmit=0; observe_only=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --settle-ms) settle_ms="$2"; shift 2;;
     --resubmit) resubmit=1; shift;;
+    # Task 1270: observe, never act. For a busy-admitted (bound) delivery the session was
+    # ALREADY working, so no key may be sent and a spinner that may predate the queued body
+    # is not a receipt for it — this mode never resubmits and never prints VERIFIED.
+    --observe-only) observe_only=1; shift;;
     --quiet) quiet=1; shift;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0;;
+    # Task 1270 (r1 m5): the window is a LINE RANGE, so inserting the flag above shifted its
+    # end out of view. Widened from 2,22 to 2,29 so --help still shows everything it showed
+    # (header + the whole flag parser through `esac`), now including --observe-only.
+    -h|--help) sed -n '2,29p' "$0"; exit 0;;
     -*) echo "dispatch-verify.sh: unknown arg: $1" >&2; exit 4;;
     *) sid="$1"; shift;;
   esac
@@ -44,7 +51,7 @@ run_check() {
     echo "SUSPECT $sid — policy failed"
     return 6
   fi
-  STATE_JSON="$state_json" ACTION_JSON="$action_json" SID="$sid" python3 - <<'PY'
+  STATE_JSON="$state_json" ACTION_JSON="$action_json" SID="$sid" OBSERVE_ONLY="$observe_only" python3 - <<'PY'
 import json, os, sys
 
 sid = os.environ["SID"]
@@ -59,6 +66,13 @@ if probe_error:
     sys.exit(2)
 
 if action.get("action") == "NOOP" and action.get("status") == "verified":
+    # Task 1270: a busy-admitted delivery may never be reported as freshly verified — the
+    # spinner this reads can belong to the turn that was already running when the body was
+    # queued. The observation is printed, the word VERIFIED is not.
+    if os.environ.get("OBSERVE_ONLY") == "1":
+        print(f"OBSERVED {sid} — CONNECTED + ready + clean + moving, but a working spinner may predate "
+              "the queued body: accepted-pending, not started-verified.")
+        sys.exit(0)
     print(f"VERIFIED {sid} — CONNECTED + ready + clean + moving (working-spinner). Started as intended.")
     sys.exit(0)
 
@@ -70,10 +84,20 @@ sys.exit(6)
 PY
 }
 
+# Task 1270 scope note (r4 M-B): the base `out=$(run_check); rc=$?` under `set -euo pipefail`
+# ends the script on every non-zero verdict, so the say below and the whole --resubmit branch
+# are DEAD. That is a real defect (task 1275) and repairing it would make a `telepty send-key
+# enter` newly live for every existing caller of this script — out of this unit's scope. The
+# line is therefore left exactly as the base has it; the repair and its tests are handed off
+# in output/TASK-1275-HANDOFF.md. The bound path needs none of it: it passes --observe-only
+# and never --resubmit, and with this line unrepaired the branch cannot run at all.
 out=$(run_check); rc=$?
 say "$out"
 
-if [ "$rc" -eq 6 ] && [ "$resubmit" -eq 1 ] && printf '%s' "$out" | grep -q '\[not-moving\]'; then
+# r7 m8: --observe-only means "send nothing", so it gates the resubmit branch directly rather
+# than relying on the dead `out=$(run_check)` line above and on the caller passing no
+# --resubmit. This is the one guard that still holds once task 1275 repairs that line.
+if [ "$observe_only" -eq 0 ] && [ "$rc" -eq 6 ] && [ "$resubmit" -eq 1 ] && printf '%s' "$out" | grep -q '\[not-moving\]'; then
   say "dispatch-verify: not-moving → #412 submit-resend (send-key enter), re-verifying once..."
   "$TELEPTY" send-key "$sid" enter >/dev/null 2>&1 || true
   sleep 2

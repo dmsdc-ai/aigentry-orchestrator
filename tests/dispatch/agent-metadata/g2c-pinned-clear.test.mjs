@@ -11,7 +11,9 @@
 // The legacy teardown (exit, stdout, stderr and the ordered telepty/kill/close/DELETE/registry
 // calls) is pinned by EXPLICIT expectations below, not by a baseline checkout: the new clear
 // may add only its own `[session-cleanup] agent-meta …` line, its own cmux capabilities/rpc
-// calls and exactly one ps snapshot when the veto reaches it.
+// calls and exactly one ps snapshot when the veto reaches it. Task 1270 adds, per cleanupOne past the unforced
+// protected refusal, ONE read-only versioned-bridge precheck (`ps -eo pid,ppid,command`) BEFORE report capture; it is
+// asserted as its own first frame and counted explicitly, and `ps` drifts name their ordinal (copyOnceAt).
 //
 // Scope: display-only. Host answers are fake; these cases prove only how the adapter and the
 // cleanup CLI map them. Nothing here claims uninterrupted ownership across an ABA sequence.
@@ -225,10 +227,22 @@ const LEGACY_ORPHAN = {
   ps: 0,
 };
 
+// Task 1270: every cleanupOne that passes the unforced PROTECTED refusal first takes ONE read-only versioned-bridge
+// precheck `ps -eo pid,ppid,command` — a distinct frame BEFORE report capture (registry report-list). It never replaces
+// or consumes the old veto / kill-needle / ancestry frames, which follow it unchanged.
+const PRECHECK = { who: "ps", argv: ["-eo", "pid,ppid,command"] };
+function expectPrecheckFirst(r) {
+  const iPre = r.seq.findIndex((e) => e.who === "ps");
+  const iCap = r.seq.findIndex((e) => e.who === "registry" && e.argv[0] === "report-list");
+  assert.deepEqual(r.seq[iPre], PRECHECK, "the first ps read is the read-only precheck");
+  assert.ok(iPre >= 0 && iCap > iPre, `precheck (${iPre}) precedes report capture (${iCap})`);
+}
+
 /** Legacy flow must equal the explicit expectation; exactly one agent-meta line. */
-function expectLegacy(r, want, { vetoReachedPs = false } = {}) {
+function expectLegacy(r, want, { vetoReachedPs = false, precheckPs = 1 } = {}) {
   assert.deepEqual(legacyView(r), want.view, "legacy flow (exit/stdout/stderr/kill/close/DELETE/registry) changed");
-  assert.equal(psCount(r), want.ps + (vetoReachedPs ? 1 : 0), "ps snapshot count");
+  assert.equal(psCount(r), precheckPs + want.ps + (vetoReachedPs ? 1 : 0), "ps snapshot count (precheck + legacy + veto)");
+  if (precheckPs > 0) expectPrecheckFirst(r);
   assert.equal(metaLines(r).length, 1, `exactly one agent-meta line: ${r.stdout}`);
 }
 
@@ -600,11 +614,14 @@ test("PC-C10b invalid sid syntax → report capture refuses before reader or tea
   assert.equal(r.status, 1);
   assert.equal(r.stdout, "");
   assert.equal(r.stderr, `ERR REPORT_CAPTURE_FAILED for ${bad}: bad_sid — cleanup refused; worker files and registry records are preserved (see bin/dispatch-tracker.sh report-status)\n`);
-  assert.deepEqual(r.seq, []);
+  // Task 1270: exactly the one read-only precheck, then nothing (the refusal precedes every effect).
+  assert.deepEqual(r.seq, [PRECHECK]);
   assert.deepEqual(metaCalls(r), []);
 });
 
-// Drift injected by the recorder at an exact point of the sequence (first call only).
+// Drift injected by the recorder at an exact point of the sequence (first call only). Task 1270: a `ps` drift
+// names its EXPLICIT invocation ordinal (`copyOnceAt`), because ps call 1 is now the read-only precheck before
+// capture; ps call 2 is the original veto snapshot (after capture and listing), the phase these cases test.
 test("PC-C11 drift A→B after capture / before listing → not applied rc=10, NO rpc (capture precedes listing)", () => {
   const r = cleanup("c11", { rig: (w) => ({ fakes: { telepty: { copyOnce: [[w.currentB, w.current]] } } }) });
   expectLegacy(r, legacy(), { vetoReachedPs: true });
@@ -620,7 +637,7 @@ test("PC-C11r rebinding (same attempt/hash, new surface/lifecycle) after capture
 });
 
 test("PC-C12 drift A→B after listing / before transport (at the veto ps snapshot) → rc=10, NO rpc", () => {
-  const r = cleanup("c12", { rig: (w) => ({ fakes: { ps: { copyOnce: [[w.currentB, w.current]] } } }) });
+  const r = cleanup("c12", { rig: (w) => ({ fakes: { ps: { copyOnce: [[w.currentB, w.current]], copyOnceAt: 2 } } }) });
   expectLegacy(r, legacy(), { vetoReachedPs: true });
   assert.deepEqual(metaLines(r), [line(`clear not applied: ${SID} rc=10`)]);
   assert.deepEqual(rpcCalls(r), []);
@@ -643,7 +660,7 @@ test("PC-C13r rebinding inside the transport (before its reader) → rc=10, NO r
 // ABA: the RPC can only ever address the pinned A tuple. This is NOT a claim that A owned the
 // pane without interruption; the host's lifecycle check at mutation time is out of scope here.
 test("PC-C14 ABA (A→B at ps, B→A in transport) → the RPC addresses ONLY the pinned A tuple, never B", () => {
-  const r = cleanup("c14", { rig: (w) => ({ fakes: { ps: { copyOnce: [[w.currentB, w.current]] } },
+  const r = cleanup("c14", { rig: (w) => ({ fakes: { ps: { copyOnce: [[w.currentB, w.current]], copyOnceAt: 2 } },
     cmux: { capabilities: { stdout: caps(), copy: [[w.currentA, w.current]] } } }) });
   expectLegacy(r, legacy(), { vetoReachedPs: true });
   const rpc = rpcCalls(r);
@@ -653,7 +670,7 @@ test("PC-C14 ABA (A→B at ps, B→A in transport) → the RPC addresses ONLY th
 });
 
 test("PC-C15 ABA via rebinding (A→A'→A) → the RPC addresses only A's surface/lifecycle", () => {
-  const r = cleanup("c15", { rig: (w) => ({ fakes: { ps: { copyOnce: [[w.bindingA2, w.A.bindingFile]] } },
+  const r = cleanup("c15", { rig: (w) => ({ fakes: { ps: { copyOnce: [[w.bindingA2, w.A.bindingFile]], copyOnceAt: 2 } },
     cmux: { capabilities: { stdout: caps(), copy: [[w.bindingA, w.A.bindingFile]] } } }) });
   expectLegacy(r, legacy(), { vetoReachedPs: true });
   const rpc = rpcCalls(r);
@@ -732,7 +749,8 @@ test("PC-C20 --all-disconnected: per-sid clear/veto never changes 'cleaned: N' o
       ["cmux", "close-workspace", "--workspace", WS], DELETE(SID), ...REGISTRY(SID), REPORT_LIST(SID),
       REPORT_LIST(two), ["telepty", "list", "--json"], DELETE(two), ...REGISTRY(two), REPORT_LIST(two)],
   });
-  assert.equal(psCount(r), 2 + 1 + 1, "legacy ps (2 for the killed sid, 1 for the other) + 1 veto snapshot");
+  assert.equal(psCount(r), 2 + 2 + 1 + 1,
+    "Task 1270: 2 read-only prechecks (one per cleaned sid) + legacy ps (2 for the killed sid, 1 for the other) + 1 veto snapshot");
   assert.deepEqual(metaLines(r), [line(`clear: ${SID} (cleared)`), line(`clear skipped: ${two} (binding-missing)`)]);
 });
 
@@ -741,5 +759,96 @@ test("PC-C21 report capture refusal stops before listing, metadata clear, kill, 
   assert.equal(r.status, 1);
   assert.equal(r.stdout, "");
   assert.equal(r.stderr, `ERR REPORT_CAPTURE_FAILED for ${SID}: *:registry_list_9 — cleanup refused; worker files and registry records are preserved (see bin/dispatch-tracker.sh report-status)\n`);
-  assert.deepEqual(r.seq.map((e) => [e.who, ...e.argv]), [REPORT_LIST(SID)]);
+  // Task 1270: the one read-only precheck, then the refused capture; nothing else.
+  assert.deepEqual(r.seq.map((e) => [e.who, ...e.argv]), [[PRECHECK.who, ...PRECHECK.argv], REPORT_LIST(SID)]);
+});
+
+// ═════════════════════════ U: Task 1270 C3 — PS-UNKNOWN (the INITIAL process view) ═══════════════════
+// The initial view is KNOWN only for a successful (exit 0, spawned, unsignalled, within the existing output bound)
+// `ps -eo pid,ppid,command` whose stdout is a newline-terminated table headed `PID PPID COMMAND`; header-only is a
+// known EMPTY view. Anything else is UNKNOWN: report capture still runs first, then the whole cleanup refuses
+// (process-view-unverified) BEFORE listing, metadata clear, kill, close, DELETE and retirement; --force cannot pass.
+// Every U case makes the INITIAL view unknown explicitly; U08-U10 are known/capture-failure controls.
+const UNVERIFIED = (sid, reason) => `ERR refusing to clean '${sid}': process-view-unverified (${reason}) — reports were captured first; nothing was listed, signalled, closed, deleted or retired\n`;
+const VERSIONED_REFUSAL = (sid) => `ERR refusing to clean '${sid}': a versioned 'telepty allow-create-v1' bridge for it is running; nothing was captured, signalled, closed or deleted\n`;
+function expectUnverified(r, reason, { precheckRecorded = true } = {}) {
+  assert.equal(r.status, 1, r.stderr);
+  assert.equal(r.stdout, "", "nothing listed or cleaned");
+  assert.equal(r.stderr, UNVERIFIED(SID, reason));
+  assert.deepEqual(r.seq.map((e) => [e.who, ...e.argv]),
+    [...(precheckRecorded ? [[PRECHECK.who, ...PRECHECK.argv]] : []), REPORT_LIST(SID)],
+    "exactly: the initial view, then report capture; no listing/clear/kill/close/DELETE/retirement");
+  assert.deepEqual(metaCalls(r), []);
+}
+
+test("PC-U01 PS-UNKNOWN nonzero query with a valid-looking table → capture kept, process-view-unverified, zero teardown", () => {
+  expectUnverified(cleanup("u01", { fakes: { ps: { rc: 1 } } }), "query-failed");
+});
+
+test("PC-U02 PS-UNKNOWN successful but headerless view → capture kept, process-view-unverified, zero teardown", () => {
+  expectUnverified(cleanup("u02", { ps: [PS_O, PS_S, PS_C, ""].join("\n") }), "malformed");
+});
+
+test("PC-U03 PS-UNKNOWN empty successful stdout is not absence → capture kept, process-view-unverified", () => {
+  expectUnverified(cleanup("u03", { ps: "" }), "malformed");
+});
+
+test("PC-U04 PS-UNKNOWN truncated view without its final newline → capture kept, process-view-unverified", () => {
+  expectUnverified(cleanup("u04", { ps: [...PS_HDR, PS_O, PS_S, PS_C].join("\n") }), "malformed");
+});
+
+test("PC-U05 PS-UNKNOWN oversize view beyond the existing default output bound → capture kept, process-view-unverified", () => {
+  const filler = Array.from({ length: 20000 }, (_, i) => ` ${20000 + i}     1 filler-process-${"x".repeat(48)}`);
+  // drainOutput: the fake exits naturally so its whole table really reaches the bounded consumer (no exit truncation).
+  expectUnverified(cleanup("u05", { ps: psTable([PS_O, PS_S, PS_C, ...filler]), fakes: { ps: { drainOutput: true } } }), "query-failed");
+});
+
+test("PC-U06 PS-UNKNOWN query killed by a signal → capture kept, process-view-unverified", () => {
+  // A private, owned fixture command that terminates ITSELF with SIGTERM (no other process is signalled). It is not
+  // the recorder, so this one case asserts the trace without the precheck event.
+  const sig = path.join(makeRun("u06sig").fakes, "ps-signalled");
+  fs.writeFileSync(sig, "#!/bin/sh\nkill -TERM $$\n", { mode: 0o755 });
+  expectUnverified(cleanup("u06", { env: { CLEANUP_PS_CMD: sig } }), "query-failed", { precheckRecorded: false });
+});
+
+test("PC-U07 PS-UNKNOWN --force cannot override the unverified view", () => {
+  expectUnverified(cleanup("u07", { fakes: { ps: { rc: 1 } }, args: [SID, "--force"] }), "query-failed");
+});
+
+test("PC-U08 control: a known header-only empty view is KNOWN, so the legacy path is unchanged", () => {
+  const r = cleanup("u08", { ps: psTable([]) });
+  expectLegacy(r, legacy({ kill: "no-parent" }), { vetoReachedPs: true });
+  assert.deepEqual(metaLines(r), [line(`clear skipped: ${SID} (ps-missing)`)]);
+});
+
+test("PC-U09 control: a known versioned target refuses BEFORE capture, with and without --force", () => {
+  const VROW = ` 5100     1 node /fixture/telepty allow-create-v1 --id ${SID} --auto-restart claude`;
+  for (const args of [[SID], [SID, "--force"]]) {
+    const r = cleanup("u09", { ps: psTable([VROW, PS_O, PS_S, PS_C]), args });
+    assert.equal(r.status, 1);
+    assert.equal(r.stdout, "");
+    assert.equal(r.stderr, VERSIONED_REFUSAL(SID));
+    assert.deepEqual(r.seq, [PRECHECK], "the initial view only; no capture, listing or effect");
+  }
+});
+
+test("PC-U10 control: capture failure with an unknown view keeps the exact REPORT_CAPTURE_FAILED refusal", () => {
+  const r = cleanup("u10", { fakes: { ps: { rc: 1 } , registry: { match: [{ argv0: "report-list", rc: 9 }] } } });
+  assert.equal(r.status, 1);
+  assert.equal(r.stdout, "");
+  assert.equal(r.stderr, `ERR REPORT_CAPTURE_FAILED for ${SID}: *:registry_list_9 — cleanup refused; worker files and registry records are preserved (see bin/dispatch-tracker.sh report-status)\n`);
+  assert.deepEqual(r.seq.map((e) => [e.who, ...e.argv]), [[PRECHECK.who, ...PRECHECK.argv], REPORT_LIST(SID)]);
+});
+
+test("PC-U11 PS-UNKNOWN initial query past its 2000 ms deadline (SIGTERM ignored) → own query killed, capture kept, process-view-unverified", () => {
+  // Only the FIRST ps query (the initial view) sleeps 2500 ms and ignores SIGTERM; any later query is fast. A cleanup
+  // with no deadline waits it out and proceeds; the fix must end its OWN query child at 2000 ms (SIGKILL), keep the
+  // report capture and refuse every teardown.
+  const t0 = Date.now();
+  const r = cleanup("u11", { fakes: { ps: { sleepMs: 2500, sleepOnceAt: 1, ignoreSigterm: true } } });
+  const elapsed = Date.now() - t0;
+  expectUnverified(r, "query-failed");
+  assert.ok(elapsed >= 2000, `the initial query really started and ran to its deadline (${elapsed} ms)`);
+  assert.ok(!fs.existsSync(path.join(r.run.logs, "seq.jsonl.ps.sleep-completed")),
+    "the hung initial query never completed: its own child was ended at the deadline");
 });
