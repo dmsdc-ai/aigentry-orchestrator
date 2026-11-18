@@ -1,0 +1,172 @@
+{
+  "schema_version": 1,
+  "release": {
+    "package": "@dmsdc-ai/aigentry-orchestrator",
+    "version": "0.2.6",
+    "group": "release-1270",
+    "task": 1270,
+    "planning_manifest_sha256": "2ab1c9a35e7506423ce74558c12870d9e44c3e9966d14c4402295cd2cb971c5d"
+  },
+  "candidate": {
+    "inventory_sha256": "50d4063ba0c3712ad1fa0c01fc928da2f9cad0af9632638cef96dc5ec14d8dcc",
+    "source_ids": [
+      "src-00001",
+      "src-00002",
+      "src-00003",
+      "src-00004",
+      "src-00005",
+      "src-00006",
+      "src-00007",
+      "src-00008",
+      "src-00009",
+      "src-00010",
+      "src-00011",
+      "src-00012"
+    ],
+    "dependency_ids": [
+      "dep-package-lock-json",
+      "dep-package-json"
+    ]
+  },
+  "scan": {
+    "sarif_id": "sarif",
+    "receipt_id": "receipt",
+    "projected_ids": [
+      "src-00001",
+      "src-00002",
+      "src-00003",
+      "src-00004",
+      "src-00005",
+      "src-00006",
+      "src-00007",
+      "src-00008",
+      "src-00009",
+      "src-00010",
+      "src-00011",
+      "src-00012"
+    ],
+    "scope_id": "scope"
+  },
+  "files": [
+    {
+      "id": "src-00001",
+      "kind": "source",
+      "path": "bin/current_screen.py",
+      "bytes": 7224,
+      "sha256": "fec0bbf6b022a126211beee603bdbf69fd0127ddac6c6e1d2b1e2ac3232afa4d"
+    },
+    {
+      "id": "src-00002",
+      "kind": "source",
+      "path": "bin/dispatch-verify.sh",
+      "bytes": 5406,
+      "sha256": "e714f0b349fee0f88a613ddffd98d20a864b11f42c356885b2a8648c8f3b4ce0"
+    },
+    {
+      "id": "src-00003",
+      "kind": "source",
+      "path": "bin/lib/platform-unix.sh",
+      "bytes": 11495,
+      "sha256": "0d26886910c30848453789e89acda5e0396d275b973219fd2be8ac29fbdad75f"
+    },
+    {
+      "id": "src-00004",
+      "kind": "source",
+      "path": "bin/session-probe.py",
+      "bytes": 33493,
+      "sha256": "2de7d005944e99eed9ed7996ca718e9634653041eb28964fb1fbc139a6210020"
+    },
+    {
+      "id": "dep-package-lock-json",
+      "kind": "dependency",
+      "path": "package-lock.json",
+      "bytes": 64210,
+      "sha256": "c6311d75dd8d9346ad1f50f0d9accf7caad50308e2bc802ec168fe9b6276a3eb"
+    },
+    {
+      "id": "dep-package-json",
+      "kind": "dependency",
+      "path": "package.json",
+      "bytes": 2596,
+      "sha256": "0627c43835d2145e3c87e8cc70a1ecd3a85c93f505cdbb3452d3852cc1ed62f5"
+    },
+    {
+      "id": "src-00005",
+      "kind": "source",
+      "path": "src/bridge-auditor/cli.ts",
+      "bytes": 18997,
+      "sha256": "a1508f6bd12b040c803f6c7528dcb84ee7a49c0f93c5259f03aefd965d107f36"
+    },
+    {
+      "id": "src-00006",
+      "kind": "source",
+      "path": "src/cleanup/cli.ts",
+      "bytes": 46696,
+      "sha256": "4d6822a3545496d4ffedbfb51b8014ba4df49ace65cca1c618463662b153da13"
+    },
+    {
+      "id": "src-00007",
+      "kind": "source",
+      "path": "src/dispatch/cli.ts",
+      "bytes": 131700,
+      "sha256": "74a7ffe6788ceff67269e43622d48015c76c8ffb8fd12b08b6ba08adc2f1d7c8"
+    },
+    {
+      "id": "src-00008",
+      "kind": "source",
+      "path": "src/dispatch/usage.ts",
+      "bytes": 11428,
+      "sha256": "cc5f2e58309ff51af316d7ee813e311b642b381cc9e8d8a5619cd6f30b3751b9"
+    },
+    {
+      "id": "src-00009",
+      "kind": "source",
+      "path": "src/orchestrator-boot/cli.ts",
+      "bytes": 61685,
+      "sha256": "d3a03a6603fea739fe61e926361b68938e1e006f2c207311287d528a6f08900f"
+    },
+    {
+      "id": "src-00010",
+      "kind": "source",
+      "path": "src/orchestrator-boot/plan.ts",
+      "bytes": 40199,
+      "sha256": "f970266e79a712141ccfaf503db39f6e37fa51c2ddad0d93f92d2d924696f1a7"
+    },
+    {
+      "id": "src-00011",
+      "kind": "source",
+      "path": "src/orchestrator-boot/usage.ts",
+      "bytes": 16549,
+      "sha256": "39e6e901ad73ca2a9fbc31e1b3e147813d51bb7f88c122507d2727ca46387cb5"
+    },
+    {
+      "id": "src-00012",
+      "kind": "source",
+      "path": "src/orchestrator-boot/wizard.ts",
+      "bytes": 25891,
+      "sha256": "558736b1b02d68fba4e98d96701495b44997ece7981e4532ba167c847b7e8e39"
+    },
+    {
+      "id": "sarif",
+      "kind": "evidence",
+      "path": null,
+      "bytes": 789,
+      "sha256": "8932c9c18dc627a104762cfbd2cadd22fdcc7909d56a1ae98cd65ff0d24b62e8"
+    },
+    {
+      "id": "receipt",
+      "kind": "evidence",
+      "path": null,
+      "bytes": 621,
+      "sha256": "f83d49d911b24838382381cb5b2a5f0bb9efd8936835e76d1cc702086caa6b42"
+    },
+    {
+      "id": "scope",
+      "kind": "evidence",
+      "path": null,
+      "bytes": 995,
+      "sha256": "9f5c73bc183a86b23e88cba30c079e032bbd380b1f610330ec5fb3fe0296f2d3"
+    }
+  ],
+  "findings": []
+}
