@@ -5,7 +5,7 @@
     "version": "0.2.6",
     "group": "release-1270",
     "task": 1270,
-    "planning_manifest_sha256": "2ab1c9a35e7506423ce74558c12870d9e44c3e9966d14c4402295cd2cb971c5d"
+    "planning_manifest_sha256": "838d9e7e34657f23a42431eb12894ae23e365a8a96e1bb0a50fd32095e79853b"
   },
   "candidate": {
     "inventory_sha256": "50d4063ba0c3712ad1fa0c01fc928da2f9cad0af9632638cef96dc5ec14d8dcc",
