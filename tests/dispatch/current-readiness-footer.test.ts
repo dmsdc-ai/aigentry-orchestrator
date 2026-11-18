@@ -24,6 +24,26 @@
 //
 // Readiness is a screen observation only. Nothing here says a task finished, that work
 // was delivered, or that any modal may be answered.
+//
+// #1284 — codex-cli 0.170.0 moved its footer: the row below the model/cwd row now reads
+// `  ← for agents · ? for shortcuts … ⚠ 1 warning · f2 to view`, so the closed pattern in
+// `codex_current_composer` stopped recognizing it, an idle and EMPTY 0.170.0 composer
+// could never read as empty, and no dispatch could be delivered to such a session — safe,
+// but undispatchable. The #1284 block at the end of this file drives the SAME real
+// functions on the measured 0.170.0 capture, copied in verbatim below. Everything above
+// that block is unchanged.
+//
+// SCOPE NOTE on the "Offline and non-sensitive by construction" paragraph above: it
+// describes the #1136 fixtures, where it holds for every screen. Two of its clauses do NOT
+// hold for the #1284 fixture — "every screen below is a synthetic string" and "no private
+// paths, session ids or user content". That fixture is a
+// real capture, not a synthetic string, and it carries the captured session's own cwd — a
+// role-sandbox path containing a session id. It is reproduced verbatim because the point
+// of the case is that the reader meets codex's bytes exactly as codex emits them, and the
+// path is part of the model/cwd row the reader must match. It carries no task content, no
+// credential and no reply text. Still nothing is read from a terminal, telepty/cmux,
+// provider or network at test time, and nothing is written anywhere.
+import { createHash } from "node:crypto";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -85,6 +105,12 @@ def call(case):
         return module.has_spinner(screen)
     if fn == "ready_by_screen":
         return list(module.ready_by_screen(cli, screen))
+    if fn == "pipeline_ready":
+        return list(module.ready_by_current_screen(cli, screen, pipeline_surface(cli, screen)))
+    if fn == "legacy_surface":
+        return module.classify_surface(cli, screen)[0]
+    if fn == "codex_composer":
+        return module.codex_current_composer(screen)
     raise SystemExit("unknown fn: " + fn)
 
 json.dump({"probe": probe,
@@ -101,6 +127,9 @@ type Fn =
   | "busy_after_controls"
   | "current_busy_signal"
   | "has_spinner"
+  | "pipeline_ready"
+  | "legacy_surface"
+  | "codex_composer"
   | "ready_by_screen";
 type Case = { id: string; fn: Fn; cli: string; screen: string; surface?: string };
 type DriverOut = { probe: string; python: string; unknown: string; results: Record<string, unknown> };
@@ -150,6 +179,127 @@ const UNREADY_SURFACES = ["unknown", "modal", "error", "unsubmitted", "crash", "
 // ── Cases ───────────────────────────────────────────────────────────────────────────
 const ready = (id: string, screenText: string, surface: string): Case =>
   ({ id, fn: "ready_by_current_screen", cli: "claude", screen: screenText, surface });
+
+// ── #1284 fixture: the MEASURED idle viewport of codex-cli 0.170.0 ───────────────────
+// Copied in VERBATIM from the capture facts/CODEX-0.170.0-idle-screen-cmux.txt — the real
+// viewport of a freshly started, idle, empty session of codex-cli 0.170.0. One row per
+// array element so that no editor, formatter or lint autofix can rewrite the single-space
+// rows the capture really has, joined by LF with the capture's one trailing LF; the sha256
+// pins the exact bytes, so a later edit to the fixture fails loudly instead of quietly
+// testing something codex never printed. See the SCOPE NOTE in the file header for what
+// this capture does and does not contain.
+// 0.170.0 renders `← for agents · ` IN FRONT of `? for shortcuts` on the footer row. The
+// closed footer pattern in codex_current_composer refused that row, so the three footer
+// rows stayed in the composer and this screen — an empty composer — read
+// `no-empty-current-prompt` forever: never ready, never dispatchable.
+const CODEX_0170_ROWS = [
+  " ",
+  "  >_ OpenAI Codex (v0.170.0)",
+  "     /Users/duckyoungkim/.aigentry/role-sandbox/analyst-E-orch652-preflight-codex2-analyst-20261118",
+  "  permissions: YOLO mode",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  "                                                                                            ⣀⣤⣤⣤⣀⣀",
+  "                                                                                         ⣠⣶⣿⣿⣿⣿⣿⣿⣿⣿⣦⣤⣤⣤⣤⣤⣤⡀",
+  "                                                                                       ⢀⣾⣿⣿⠿⠋⠉⠉⢉⣭⣿⣿⣿⣿⣿⠿⣿⣿⣿⣿⣷⣄",
+  "                                                                                      ⣀⣾⣿⣿⠃ ⣀⣴⣾⣿⣿⡿⠟⠋ ⣀⡀ ⠈⠙⢿⣿⣿⣧",
+  "                                                                                   ⣀⣶⣿⣿⣿⣿⡇ ⢸⣿⣿⡿⠛⠉⢀⣠⣴⣿⣿⣿⣷⣦⣀⠈⢻⣿⣿⡇",
+  "                                                                                  ⣰⣿⣿⡿⢿⣿⣿⡇ ⢸⣿⣿⢀⣤⣶⣿⣿⣿⠟⠛⠻⣿⣿⣿⣿⣮⣿⣿⡷",
+  "                                                                                 ⢰⣿⣿⡟⠁⢸⣿⣿⡇ ⢸⣿⣿⣿⣿⠿⠿⣿⣿⣿⣦⣄⡀⠈⠛⠿⣿⣿⣿⣧⡀",
+  "                                                                                 ⣾⣿⣿⠃ ⢸⣿⣿⡇ ⢸⣿⣿⠋⠁  ⠈⠙⢻⣿⣿⣿⣶⣤⡀ ⠹⢿⣿⣷⡄",
+  "                                                                                 ⢸⣿⣿⣇ ⠸⣿⣿⣷⣦⣼⣿⣿      ⢸⣿⣿⠻⢿⣿⣿⡇ ⠘⣿⣿⣿",
+  "                                                                                 ⠈⢿⣿⣿⣦⡀⠈⠛⠿⣿⣿⣿⣿⣄⡀  ⢀⣠⣼⣿⣿  ⣿⣿⡇  ⣿⣿⣿⠇",
+  "                                                                                   ⢻⣿⣿⣿⣷⣦⣀⠈⠙⠻⣿⣿⣿⣶⣶⣿⣿⣿⣿⣿  ⣿⣿⡇ ⣠⣿⣿⣿",
+  "                                                                                   ⢸⣿⣿⡿⢿⣿⣿⣿⣦⣠⣴⣿⣿⣿⡿⠟⠋⢸⣿⣿  ⣿⣿⣷⣴⣿⣿⣿⠃",
+  "                                                                                   ⠘⣿⣿⣷ ⠈⠛⢿⣿⣿⣿⠿⠋⠉ ⣠⣴⣿⣿⣿  ⣿⣿⣿⣿⣿⠟⠁",
+  "                                                                                    ⠻⣿⣿⣿⣤⣀ ⠈⠉ ⢀⣤⣶⣿⣿⣿⠿⠟⠁ ⣰⣿⣿⡟⠋⠁",
+  "                                                                                     ⠈⠿⣿⣿⣿⣿⣶⣾⣿⣿⣿⣿⠟⠋⠁  ⣠⣼⣿⣿⡟",
+  "                                                                                        ⠙⠛⠛⠛⠻⠛⢿⣿⣿⣿⣿⣷⣾⣿⣿⣿⡿⠏",
+  "                                                                                               ⠈⠙⠛⠿⠿⠿⠿⠛⠉",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  " ",
+  "› Ask Codex to do anything",
+  " ",
+  "  GPT-6.2-Astra medium · /Users/duckyoungkim/.aigentry/role-sandbox/analyst-E-orch652-preflight-codex2-analyst-20261118",
+  "  ← for agents · ? for shortcuts                                                                                                                                         ⚠ 1 warning · f2 to view",
+];
+const CODEX_0170_IDLE = CODEX_0170_ROWS.join("\n") + "\n";
+assert.equal(createHash("sha256").update(CODEX_0170_IDLE).digest("hex"), "6d7b65f24ccf9950433ee4196999b0fd73caca5da00ef59d525f44af3301df74",
+  "CODEX_0170_IDLE must be the measured capture byte-for-byte");
+/** The measured footer, model/cwd and placeholder rows, taken FROM the fixture. */
+const CODEX_0170_FOOTER = CODEX_0170_ROWS[CODEX_0170_ROWS.length - 1];
+const CODEX_0170_MODEL = CODEX_0170_ROWS[CODEX_0170_ROWS.length - 2];
+const CODEX_0170_PROMPT = "› Ask Codex to do anything";
+/** Each helper rewrites exactly one row of the measured screen (first occurrence; every
+ *  rewritten row occurs exactly once, asserted in #1284(b)). Nothing else moves. */
+const refootered = (footer: string) => CODEX_0170_IDLE.replace(CODEX_0170_FOOTER, footer);
+const retyped = (promptRow: string) => CODEX_0170_IDLE.replace(CODEX_0170_PROMPT, promptRow);
+// [name, screen, expected pipeline surface, expected ready, expected reason]
+const CODEX_0170_CASES: [string, string, string, boolean, string][] = [
+  // The bug, and the fix: the measured idle screen with an EMPTY composer is ready.
+  ["0170-idle", CODEX_0170_IDLE, "idle", true, "prompt"],
+  // The other newly accepted footer shape: the measured `← for agents · ` prefix in front
+  // of the OTHER tail the reader's footer pattern already accepted on its own
+  // (`· <n> warnings`). This pairing is a cross-product of two separately measured
+  // segments rather than a field measurement of its own; it is pinned HERE so the whole
+  // newly-accepted set is visible in one place and can be reviewed as such.
+  ["0170-count-tail", refootered("  ← for agents · ? for shortcuts · 2 warnings"), "idle", true, "prompt"],
+
+  // Text typed after the prompt: the footer is recognized and removed, so what remains is
+  // exactly the typed text — and typed text is never an empty composer.
+  ["0170-typed", retyped("› implement the footer fix"), "idle", false, "no-empty-current-prompt"],
+  ["0170-typed-after-hint", retyped(CODEX_0170_PROMPT + " right now"), "idle", false, "no-empty-current-prompt"],
+  ["0170-typed-continuation", retyped(CODEX_0170_PROMPT + "\n  second typed row"), "idle", false, "no-empty-current-prompt"],
+  ["0170-typed-below-footer", CODEX_0170_IDLE + "pending input\n", "idle", false, "no-empty-current-prompt"],
+  // An unsubmitted context-ref at the live prompt still reads through the new footer.
+  ["0170-typed-marker", retyped("› [context-ref] pending task"), "unsubmitted", false, "current-surface-not-ready"],
+
+  // UNKNOWN footer rows stay in the composer: nothing beyond the measured prefix is
+  // tolerated, in any position on the row.
+  ["0170-footer-extra-segment", refootered(CODEX_0170_FOOTER + " · 3 queued"), "idle", false, "no-empty-current-prompt"],
+  ["0170-footer-extra-affordance", refootered(CODEX_0170_FOOTER.replace("← for agents · ", "← for agents · ctrl+r to expand · ")), "idle", false, "no-empty-current-prompt"],
+  ["0170-footer-wrong-glyph", refootered(CODEX_0170_FOOTER.replace("←", "→")), "idle", false, "no-empty-current-prompt"],
+  ["0170-footer-wrong-separator", refootered(CODEX_0170_FOOTER.replace("agents · ?", "agents, ?")), "idle", false, "no-empty-current-prompt"],
+  ["0170-footer-no-separator-space", refootered(CODEX_0170_FOOTER.replace("agents · ?", "agents ·?")), "idle", false, "no-empty-current-prompt"],
+  ["0170-footer-wrong-hint", refootered(CODEX_0170_FOOTER.replace("f2 to view", "f3 to view")), "idle", false, "no-empty-current-prompt"],
+  ["0170-footer-no-count", refootered(CODEX_0170_FOOTER.replace("1 warning", "warning")), "idle", false, "no-empty-current-prompt"],
+  ["0170-footer-unindented", refootered(CODEX_0170_FOOTER.slice(1)), "idle", false, "no-empty-current-prompt"],
+  // The rest of the frame is still required: drop the blank separator row, or put an
+  // unrecognized effort word on the model/cwd row, and the three rows are no longer the
+  // recognized suffix. (An extra ` · <segment>` on the model row is NOT in this list: the
+  // measured status segment has been recognized chrome since #1136 and is untouched here.)
+  ["0170-no-separator", CODEX_0170_IDLE.replace(CODEX_0170_PROMPT + "\n \n", CODEX_0170_PROMPT + "\n"), "idle", false, "no-empty-current-prompt"],
+  ["0170-model-row-unknown", CODEX_0170_IDLE.replace(CODEX_0170_MODEL, CODEX_0170_MODEL.replace(" medium ", " turbo ")), "idle", false, "no-empty-current-prompt"],
+];
 
 const CASES: Case[] = [
   // Positives — the fix: a bare completed row is not a spinner.
@@ -212,6 +362,23 @@ const CASES: Case[] = [
   { id: "spinner/frame", fn: "has_spinner", cli: "claude", screen: "⠹ Reticulating splines" },
   { id: "spinner/logo", fn: "has_spinner", cli: "claude", screen: "⠙⠹⠸ logo art" },
   { id: "spinner/footer", fn: "has_spinner", cli: "claude", screen: BARE_FOOTER },
+
+  // #1284 — the codex 0.170.0 footer, on the measured capture. New ids only; the cases
+  // above are untouched.
+  ...CODEX_0170_CASES.flatMap(([name, screenText]): Case[] => [
+    { id: `codex/${name}/surface`, fn: "pipeline_surface", cli: "codex", screen: screenText },
+    { id: `codex/${name}/ready`, fn: "pipeline_ready", cli: "codex", screen: screenText },
+  ]),
+  { id: "codex/0170/composer", fn: "codex_composer", cli: "codex", screen: CODEX_0170_IDLE },
+  {
+    id: "codex/0170/composer-unknown", fn: "codex_composer", cli: "codex",
+    screen: refootered(CODEX_0170_FOOTER + " · 3 queued"),
+  },
+  { id: "codex/0170/has-spinner", fn: "has_spinner", cli: "codex", screen: CODEX_0170_IDLE },
+  { id: "codex/0170/busy", fn: "current_busy_signal", cli: "codex", screen: CODEX_0170_IDLE },
+  { id: "codex/0170/controls", fn: "current_controls", cli: "codex", screen: CODEX_0170_IDLE },
+  { id: "codex/0170/legacy-surface", fn: "legacy_surface", cli: "codex", screen: CODEX_0170_IDLE },
+  { id: "codex/0170/legacy-ready", fn: "ready_by_screen", cli: "codex", screen: CODEX_0170_IDLE },
 ];
 
 // ── One bounded subprocess, at module load: an unusable probe or interpreter is a
@@ -342,4 +509,47 @@ test("#1136(i): non-claude CLIs and the legacy --screen-file path are byte-for-b
   assert.equal(got("spinner/frame"), true);
   assert.equal(got("spinner/logo"), false, "braille logo art is not a spinner");
   assert.equal(got("spinner/footer"), false);
+});
+
+// ── #1284: the readiness reader must recognise the idle footer of codex-cli 0.170.0 ──
+for (const [name, , surface, isReady, reason] of CODEX_0170_CASES) {
+  test(`#1284(a): codex 0.170.0 footer ${name}`, () => {
+    assert.equal(got(`codex/${name}/surface`), surface, name);
+    assert.deepEqual(got(`codex/${name}/ready`), [isReady, reason], name);
+  });
+}
+
+test("#1284(b): the measured idle 0.170.0 screen is ready, and ONLY its three footer rows are chrome", () => {
+  // The row the old closed pattern refused, read off the fixture itself.
+  assert.match(CODEX_0170_FOOTER, /^ {2}← for agents · \? for shortcuts {2,}⚠ 1 warning · f2 to view$/);
+  assert.doesNotMatch(CODEX_0170_FOOTER, /^ {2}\? for shortcuts/, "the whole point: `? for shortcuts` no longer starts the row");
+  // Each rewritten row must occur exactly once in the capture, or the helpers above would
+  // be editing some other row of it.
+  for (const row of [CODEX_0170_FOOTER, CODEX_0170_PROMPT, CODEX_0170_MODEL]) {
+    assert.equal(CODEX_0170_IDLE.split(row).length - 1, 1, `row must occur once: ${row}`);
+  }
+  assert.deepEqual(got("codex/0170-idle/ready"), [true, "prompt"]);
+  assert.equal(got("codex/0170-idle/surface"), "idle");
+  // The composer the reader is left with is the placeholder row ALONE: the blank
+  // separator, the model/cwd row and the footer row went, and nothing else did.
+  assert.equal(got("codex/0170/composer"), CODEX_0170_PROMPT);
+  // Sensitivity control for the line above: with ONE unknown segment on that same row the
+  // footer is not chrome, so all three rows stay in the composer and the screen is not
+  // ready. Without this, the assertion above could pass for an always-stripping reader.
+  const kept = String(got("codex/0170/composer-unknown"));
+  assert.ok(kept.startsWith(CODEX_0170_PROMPT), "the placeholder row still anchors the composer");
+  assert.ok(kept.includes("· 3 queued"), "an unknown footer row stays IN the composer");
+  assert.ok(kept.includes(CODEX_0170_MODEL), "and so does the model/cwd row above it");
+  assert.deepEqual(got("codex/0170-footer-extra-segment/ready"), [false, "no-empty-current-prompt"]);
+});
+
+test("#1284(c): the 0.170.0 welcome logo art is not a spinner, and the codex controls pass is identity", () => {
+  assert.equal(got("codex/0170/has-spinner"), false, "runs of adjacent braille cells are logo art, not a spinner frame");
+  assert.equal(got("codex/0170/busy"), false);
+  assert.equal(got("codex/0170/controls"), CODEX_0170_IDLE, "current_controls is identity for every non-claude kind");
+});
+
+test("#1284(d): the legacy --screen-file path is untouched by the footer change", () => {
+  assert.equal(got("codex/0170/legacy-surface"), "idle");
+  assert.deepEqual(got("codex/0170/legacy-ready"), [true, "prompt"]);
 });
