@@ -1617,9 +1617,60 @@ function withApprovedSandboxDeps(job) {
     ...structuredClone(sandboxDepsSteps));
   return copy;
 }
+// #1270 — the third approved change to the `test` job, and the only change to its Linux leg: the
+// matrix runs the explicit image `ubuntu-24.04` instead of the moving `ubuntu-latest` label. The
+// label moved to ubuntu-26.04 (20261111.196.1) and took the live Linux confinement preflight with
+// it — `apply-seccomp: write /proc/self/setgroups (nested userns is capability-restricted; caller
+// must provide CAP_SYS_ADMIN): Permission denied`, exit 78 — on the same unchanged product and
+// test that were last green on ubuntu-24.04 (20261004.327.1); Ubuntu 26.04 support of the
+// confinement is #652 and is not traded for here.
+//
+// The matrix value and every condition that names it move TOGETHER. The jq step and the two #652
+// sandbox steps are gated on `matrix.os`, so a pin that left one condition on the old label would
+// silently stop installing bubblewrap/socat/ripgrep, or stop lifting the userns restriction, and
+// then un-register the very test this protects — a green leg that measured nothing. So the pinned
+// bytes are derived from the historical and #652-approved literals by `replaceOnce` on exactly
+// that one condition line (so the approved step bodies are still restated independently, and a
+// literal that stopped carrying the condition would fail here rather than be re-pinned silently),
+// and `withPinnedLinuxLeg` asserts, parsed, that all three conditions name the pinned image and
+// that no other step in the job is conditional at all.
+const movingLinuxLabel = 'ubuntu-latest';
+const pinnedLinuxImage = 'ubuntu-24.04';
+const legCondition = label => `        if: matrix.os == '${label}'\n`;
+const pinLeg = bytes => replaceOnce(bytes, legCondition(movingLinuxLabel), legCondition(pinnedLinuxImage));
+const historicalMatrix = `        os: [${movingLinuxLabel}, macos-latest]\n`;
+// The pin carries its measured reason with it, so the images, the versions, the failing message
+// and the separate Ubuntu 26.04 work are held as approved bytes rather than as whatever comment
+// the workflow happens to have grown.
+const pinnedMatrix = `        # #1270: the Linux leg is pinned to an explicit image, not the moving ubuntu-latest
+        # label, because that label moved underneath this suite. The live Linux confinement
+        # preflight in tests/session/claude-worker-oauth.test.ts was last green on image
+        # ubuntu-24.04 (20261004.327.1, run of 2026-10-15); ubuntu-latest now resolves to
+        # ubuntu-26.04 (20261111.196.1), where the same unchanged product and test refuse with
+        # SANDBOX_PREFLIGHT_FAILED: 1 apply-seccomp: write /proc/self/setgroups (nested userns
+        # is capability-restricted; caller must provide CAP_SYS_ADMIN): Permission denied
+        # (exit 78). Nothing here weakens the confinement: making it work on Ubuntu 26.04 is
+        # separate open work (#652). The three Linux-only steps below compare matrix.os against
+        # this same value, so the image and those conditions move together or not at all. If
+        # this image is retired the correct move is to re-pin deliberately and measure the
+        # preflight again, not to bump the label and keep the claim.
+        os: [${pinnedLinuxImage}, macos-latest]
+`;
+function withPinnedLinuxLeg(job) {
+  const copy = structuredClone(job);
+  assert.deepEqual(copy.strategy.matrix.os, [movingLinuxLabel, 'macos-latest'],
+    'historical test job runs the moving Linux label');
+  copy.strategy.matrix.os = [pinnedLinuxImage, 'macos-latest'];
+  const gated = copy.steps.filter(step => step.if === `matrix.os == '${movingLinuxLabel}'`);
+  assert.equal(gated.length, 3, 'exactly the three Linux-only setup steps are gated on the matrix value');
+  for (const step of gated) step.if = `matrix.os == '${pinnedLinuxImage}'`;
+  assert.equal(copy.steps.filter(step => 'if' in step).length, 3,
+    'the pinned leg still gates exactly those three steps, and nothing else in the job is conditional');
+  return copy;
+}
 function assertSandboxDepsBytes(source, label) {
-  assert.equal(lf(source).split(`${sandboxDepsPrev}${sandboxDepsAfter}${sandboxUsernsAfter}`).length, 2,
-    `${label}: exactly the approved sandbox dependency step bytes`);
+  assert.equal(lf(source).split(`${pinLeg(sandboxDepsPrev)}${pinLeg(sandboxDepsAfter)}${pinLeg(sandboxUsernsAfter)}`).length, 2,
+    `${label}: exactly the approved sandbox dependency step bytes, gated on the pinned Linux image`);
 }
 // #1196 — the one approved change to the `publish` job: the publish step gains `id: publish`, the
 // PUBLISH_FAILED step follows it, and the registry read-back waits for npm's asynchronous processing
@@ -1896,8 +1947,8 @@ function validate(workflow, policy = currentPolicy()) {
   delete securityEnv.RELEASE_SECURITY_POLICY_SHA256;
   delete securityEnv.RELEASE_SECURITY_COMMIT;
   assert.deepEqual(guard, original.jobs.guard, 'guard changes only the required security trust inputs');
-  assert.deepEqual(workflow.jobs.test, withApprovedSandboxDeps(withApprovedDispatchGuard(original.jobs.test, dispatchGuardSteps.release)),
-    'unchanged test except the approved Dispatch guard suite and sandbox dependency steps');
+  assert.deepEqual(workflow.jobs.test, withPinnedLinuxLeg(withApprovedSandboxDeps(withApprovedDispatchGuard(original.jobs.test, dispatchGuardSteps.release))),
+    'unchanged test except the approved Dispatch guard suite and sandbox dependency steps and the pinned Linux image');
   const guardSteps = workflow.jobs.guard.steps;
   const admission = guardSteps.indexOf(named(workflow.jobs.guard, 'Release planning and changed-file admission'));
   const token = guardSteps.indexOf(named(workflow.jobs.guard, 'NPM_TOKEN must be present'));
@@ -1961,7 +2012,7 @@ function validateReleaseHistory(workflow, source = readFileSync(join(root, '.git
   assertPublishReadbackBytes(source, 'release');
   const copy = withoutBrowser(workflow, true);
   const history = structuredClone(rejected);
-  history.jobs.test = withApprovedSandboxDeps(withApprovedDispatchGuard(history.jobs.test, dispatchGuardSteps.release));
+  history.jobs.test = withPinnedLinuxLeg(withApprovedSandboxDeps(withApprovedDispatchGuard(history.jobs.test, dispatchGuardSteps.release)));
   history.jobs.publish = withApprovedPublishReadback(history.jobs.publish);
   for (const item of [copy, history]) {
     const env = named(item.jobs.guard, 'Release planning and changed-file admission').env ?? {};
@@ -2003,10 +2054,11 @@ function validateCIHistory(source, historicalSource = readFileSync(join(root, fi
   }
   const history = structuredClone(ciBefore);
   for (const id of oldIds) delete history.jobs[id];
-  history.jobs.test = withApprovedSandboxDeps(withApprovedDispatchGuard(history.jobs.test, dispatchGuardSteps.ci));
+  history.jobs.test = withPinnedLinuxLeg(withApprovedSandboxDeps(withApprovedDispatchGuard(history.jobs.test, dispatchGuardSteps.ci)));
   assert.deepEqual(copy, history, 'CI without its browser and Windows jobs is the historical CI without its two Windows jobs');
   // Bytes: everything before the historical Windows boundary is the historical CI except the one approved
-  // header sentence, the approved Dispatch guard suite step and the approved sandbox dependency step, and
+  // header sentence, the approved Dispatch guard suite step, the approved sandbox dependency step and the
+  // #1270 Linux image pin (the matrix value, its comment, and the three conditions that name it), and
   // everything from there to EOF is the approved Windows region.
   const bytes = lf(source);
   const addition = `jobs:\n${ciBrowserAddition}`;
@@ -2018,10 +2070,12 @@ function validateCIHistory(source, historicalSource = readFileSync(join(root, fi
   assert.equal(prefix.split(ciHeaderBefore).length, 2, 'one historical Windows header sentence');
   assert.equal(prefix.split(`${ciDispatchGuardBefore}${dispatchGuardNext}`).length, 2, 'one historical Dispatch guard suite step');
   assert.equal(prefix.split(sandboxDepsPrev).length, 2, 'one historical jq step');
+  assert.equal(prefix.split(historicalMatrix).length, 2, 'one historical test matrix on the moving Linux label');
   assert.equal(currentBytes, prefix.replace(ciHeaderBefore, () => ciHeaderAfter)
     .replace(ciDispatchGuardBefore, () => dispatchGuardAfter)
-    .replace(sandboxDepsPrev, () => `${sandboxDepsPrev}${sandboxDepsAfter}${sandboxUsernsAfter}`) + approvedWindowsRegion,
-    'every CI byte outside the approved header sentence, Dispatch guard suite step, sandbox dependency step and Windows region is the historical CI');
+    .replace(historicalMatrix, () => pinnedMatrix)
+    .replace(sandboxDepsPrev, () => `${pinLeg(sandboxDepsPrev)}${pinLeg(sandboxDepsAfter)}${pinLeg(sandboxUsernsAfter)}`) + approvedWindowsRegion,
+    'every CI byte outside the approved header sentence, Dispatch guard suite step, sandbox dependency step, Linux image pin and Windows region is the historical CI');
 }
 acceptance('CI Windows jobs match release and every other CI byte remains unchanged', 'ci-parity', () => validateCIHistory(readFileSync(join(root, '.github/workflows/ci.yml'), 'utf8')));
 // #1196 — the POSIX `test` job, compared between the two workflows themselves. Each file is frozen
@@ -2062,7 +2116,7 @@ const testParityMutations = [
     'release.yml carries the same lines.\n        timeout-minutes: 8\n', /^parsed:/],
   ['regression suite step gains a cap in release only', 'release', '        run: npm test\n', '        run: npm test\n        timeout-minutes: 20\n', /^parsed:/],
   ['job cap differs', 'CI', '    runs-on: ${{ matrix.os }}\n    timeout-minutes: 30\n', '    runs-on: ${{ matrix.os }}\n    timeout-minutes: 45\n', /^parsed:/],
-  ['matrix differs', 'release', '        os: [ubuntu-latest, macos-latest]\n', '        os: [ubuntu-latest]\n', /^parsed:/],
+  ['matrix differs', 'release', `        os: [${pinnedLinuxImage}, macos-latest]\n`, `        os: [${pinnedLinuxImage}]\n`, /^parsed:/],
   ['release drops needs: guard', 'release', `${testJobHead}    needs: guard\n`, testJobHead, /needs guard/],
   ['CI gains needs: guard', 'CI', testJobHead, `${testJobHead}    needs: guard\n`, /no needs/],
   ['comment byte differs', 'release', '      # Runs after npm test because several guards gate on dist/ being built, and\n',
@@ -3991,19 +4045,25 @@ const publishNeeds = `    needs: [${publishDependencies.join(', ')}]\n`;
 // The current pin line, whatever literal it holds (UNREVIEWED today, the reviewed hash later); validate() judges it.
 const policyPinLine = lf(readFileSync(join(root, '.github/workflows/release.yml'), 'utf8')).match(/^          RELEASE_SECURITY_POLICY_SHA256: [^\n]*\n/m)[0];
 // #652 — the approved sandbox dependency step, byte for byte, in both workflows.
+const sandboxDepsStepHead = `${sandboxDepsName}\n        run: sudo apt-get update && sudo apt-get install -y bubblewrap socat ripgrep\n`;
 const sandboxDepsMutations = [
-  ['sandbox dependency step removed', sandboxDepsAfter, ''],
+  ['sandbox dependency step removed', pinLeg(sandboxDepsAfter), ''],
   ['sandbox dependency step drops bubblewrap', 'sudo apt-get install -y bubblewrap socat ripgrep\n', 'sudo apt-get install -y socat ripgrep\n'],
-  ['sandbox dependency step runs on every OS', `${sandboxDepsName}\n        run: sudo apt-get update && sudo apt-get install -y bubblewrap socat ripgrep\n        if: matrix.os == 'ubuntu-latest'\n`,
-    `${sandboxDepsName}\n        run: sudo apt-get update && sudo apt-get install -y bubblewrap socat ripgrep\n`],
+  ['sandbox dependency step runs on every OS', `${sandboxDepsStepHead}${legCondition(pinnedLinuxImage)}`, sandboxDepsStepHead],
   ['sandbox dependency step may fail', `${sandboxDepsName}\n`, `${sandboxDepsName}\n        continue-on-error: true\n`],
-  ['loopback userns step removed', sandboxUsernsAfter, ''],
+  ['loopback userns step removed', pinLeg(sandboxUsernsAfter), ''],
   ['loopback userns step keeps the restriction', 'kernel.apparmor_restrict_unprivileged_userns=0\n', 'kernel.apparmor_restrict_unprivileged_userns=1\n'],
-  ['loopback userns step runs on every OS', "kernel.apparmor_restrict_unprivileged_userns=0\n        if: matrix.os == 'ubuntu-latest'\n",
+  ['loopback userns step runs on every OS', `kernel.apparmor_restrict_unprivileged_userns=0\n${legCondition(pinnedLinuxImage)}`,
     'kernel.apparmor_restrict_unprivileged_userns=0\n'],
   ['loopback userns step may fail', `${sandboxUsernsName}\n`, `${sandboxUsernsName}\n        continue-on-error: true\n`],
-  ['loopback userns step moved after the tests', `${sandboxUsernsAfter}      - name: Run the regression suite\n        run: npm test\n`,
-    `      - name: Run the regression suite\n        run: npm test\n${sandboxUsernsAfter}`],
+  ['loopback userns step moved after the tests', `${pinLeg(sandboxUsernsAfter)}      - name: Run the regression suite\n        run: npm test\n`,
+    `      - name: Run the regression suite\n        run: npm test\n${pinLeg(sandboxUsernsAfter)}`],
+  // #1270 — the pin itself, held from both sides: the leg may not go back to the moving label, and
+  // no condition that selects the Linux leg may be left behind on it. Either one alone is how the
+  // dependency steps stop running and the live confinement preflight stops being registered.
+  ['Linux leg back to the moving ubuntu-latest label', pinnedMatrix, historicalMatrix],
+  ['sandbox dependency step left on the moving label', `${sandboxDepsStepHead}${legCondition(pinnedLinuxImage)}`,
+    `${sandboxDepsStepHead}${legCondition(movingLinuxLabel)}`],
 ];
 const releaseBrowserMutations = [
   ['missing guard browser dependency', '    needs: [browser-tls]\n', ''],

@@ -136,6 +136,14 @@ publishing this release closes no task.
 - **A real strand followed by a successful clear has not been measured
   outside mocks.** The sequence of a real bound delivery that strands a real
   session and a clear that restores input to it has not been run.
+- **The Linux worker confinement preflight is measured on ubuntu-24.04**,
+  which is the image the release and CI Linux legs now pin (#1270). On
+  ubuntu-26.04 the sandbox runtime's seccomp helper is refused with
+  `apply-seccomp: write /proc/self/setgroups (nested userns is
+  capability-restricted; caller must provide CAP_SYS_ADMIN): Permission
+  denied` and a confined worker cannot start. This is not a change in this
+  release — the product and the test are unchanged — and Ubuntu 26.04
+  support of the confinement is separate open work (#652).
 
 ## [0.2.5] - 2026-10-15
 
