@@ -95,7 +95,10 @@ only `registry-url`, the key that makes setup-node write an `_authToken` npmrc;
 a second `setup-node` at Node 24 and a step that refuses any npm below 11.5.1
 run immediately before `Publish to npm`; and that step declares no environment
 at all and publishes with `npm_config_userconfig` pointed at a file it creates
-empty. The approved literal grows to those bytes, and the job's `permissions`
+empty — which removes the USER npmrc as a credential source and nothing wider,
+the global npmrc being a separate npm config key that this file does not
+control and does not claim about. The approved literal grows to those bytes,
+and the job's `permissions`
 bytes are held too, so the permission cannot be dropped, widened to the top
 level or moved to another job. The `NPM_TOKEN must be present` step is DELETED
 from `guard`: both fixtures' own copies of it are what the guard normalizer
@@ -103,15 +106,24 @@ removes before the comparison, and it asserts they still carry it — the step,
 its token env and its emptiness test — so a regenerated fixture refuses instead
 of making the removal a silent no-op. Nothing is loosened. `admission precedes
 token` is replaced by identity -> tests -> `admission`, with `admission` last in
-`guard`, plus an outright prohibition: no job or step may reference the token,
-pass `NODE_AUTH_TOKEN`, set `registry-url` or carry the deleted gate, and the
-token expression may not appear in the workflow bytes even inside a comment. The
-single token mutation is replaced by twenty-five parsed and thirteen byte
-mutations that must each still be refused, covering a credential put back, the
-permission dropped, widened or moved, the auth npmrc restored on either
-`setup-node`, the packing Node raised so the shipped tarball would be repacked,
-the npm floor dropped, relaxed, conditioned or allowed to fail, the empty user
-npmrc dropped or redirected, and the token gate restored.
+`guard` and the text split's entry count checked against both YAML entry forms,
+plus an outright prohibition over EVERY job in the file, `browser-tls` included:
+no job or step may reference the token, pass `NODE_AUTH_TOKEN`, set
+`registry-url` or carry the deleted gate; the token expression may not appear in
+the workflow bytes even inside a comment; and exactly one job may hold an
+id-token permission, with the top-level block held to `contents: read` by deep
+equality so `permissions: write-all` is refused as well. The two token mutations
+are replaced by thirty-three parsed and eighteen byte mutations, plus five
+negatives in `release-admission.test.mjs`, that must each still be refused:
+a credential put back on the publish step, in the publish job's own `env:`, in a
+new top-level `env:` or in `browser-tls`; the permission dropped, widened,
+moved, planted in another job or replaced by `write-all`; the auth npmrc
+restored on either `setup-node`; the packing Node raised so the shipped tarball
+would be repacked; the npm floor dropped, relaxed, conditioned or allowed to
+fail; the empty user npmrc dropped or redirected; `continue-on-error` on the
+publish or read-back step; the publish step moved into another job; a step
+appended after the admission gate in either entry form; and the token gate
+restored.
 The retired debt ratchet is replayed from the
 fixture only, as history. The security pin must be `UNREVIEWED` while no
 `release/security/<version>/policy.json` exists and exactly the sha256 of that

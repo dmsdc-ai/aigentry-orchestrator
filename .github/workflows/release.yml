@@ -1493,8 +1493,11 @@ jobs:
   # publish credential. Three absences in this job are load-bearing and must stay absent: no
   # token in any step environment (GitHub injects only the secrets a workflow names, and this
   # file names none for npm), no npmrc written by `setup-node`, which is used WITHOUT
-  # `registry-url` in both of its invocations below, and no user npmrc — the publish command
-  # points `npm_config_userconfig` at a file it creates empty. With no credential reachable, a
+  # `registry-url` in both of its invocations below, and no USER npmrc — the publish command
+  # points `npm_config_userconfig` at a file it creates empty. That key overrides npm's user
+  # config file and nothing else: the global npmrc is a separate npm config key, and the hosted
+  # runner image's global config is outside what this file controls and is not claimed here.
+  # With no credential reachable through any of those three, a
   # failed OIDC exchange FAILS the publish instead of quietly succeeding some other way, which
   # is the only reason a green run here may be read as "OIDC worked".
   #
@@ -1517,8 +1520,11 @@ jobs:
   #
   # ROLLBACK, if an OIDC publish cannot be made to work: `git revert` the single commit that
   # moved this file to trusted publishing. The workflow edit and the gate-test edit are in that
-  # one commit on purpose, so the revert is atomic — reverting the workflow alone leaves the
-  # frozen gate tests red and `guard` refuses the run. The repository secret NPM_TOKEN is
+  # one commit on purpose, so the revert is atomic — reverting the workflow alone leaves both
+  # gate tests red, and either one of them stops the publish: `guard` runs
+  # `tests/packaging/release-admission.test.mjs` directly, the `test` job's `npm test` runs
+  # `tests/packaging/windows-release-gates.test.mjs`, and `publish` needs both jobs. The
+  # repository secret NPM_TOKEN is
   # deliberately LEFT IN PLACE until a first OIDC publish has been verified; nothing in this
   # file references it and GitHub injects only referenced secrets, so it cannot be what made a
   # run pass. Delete it only after the proof. There is NO `workflow_dispatch` here (see `on:`
@@ -1616,10 +1622,15 @@ jobs:
       # The npm >= 11.5.1 floor trusted publishing requires, measured here and printed, so that
       # "this toolchain could do OIDC" is a line in the log rather than an assumption about a
       # runner image. This is also what is left of the deleted `NPM_TOKEN must be present` gate
-      # in `guard`: the cheap, loud refusal that comes BEFORE `npm publish`, so a toolchain that
-      # cannot exchange an OIDC token fails the run here instead of being discovered by the
-      # registry. It carries no condition on purpose — it measures this job's toolchain, not the
-      # publish decision, so it reports on the already-published re-run path too.
+      # in `guard`: the loud refusal that comes BEFORE `npm publish`, so a toolchain that cannot
+      # exchange an OIDC token fails the run here instead of being discovered by the registry.
+      # It is NOT as early and NOT as wide as the gate it replaces, and neither is claimed: that
+      # gate ran in `guard`, this job needs `browser-tls`, `test` and the two windows jobs first;
+      # and this measures the npm VERSION only — it does not probe that an OIDC token is
+      # obtainable, nor that the npm-side registration exists, is spelled right and is unexpired,
+      # so a wrong registration is still first detected by `npm publish` itself. It carries no
+      # condition on purpose — it measures this job's toolchain, not the publish decision, so it
+      # reports on the already-published re-run path too.
       - name: The publishing toolchain must be able to do OIDC (npm >= 11.5.1)
         run: |
           set -euo pipefail
@@ -1639,9 +1650,12 @@ jobs:
       # with a token instead: there is none to fall back to. It declares no environment at all
       # and GitHub injects only the secrets a workflow names; neither setup-node above wrote an
       # `_authToken` npmrc, because neither has a `registry-url`; and the command runs with
-      # `npm_config_userconfig` pointed at a file it creates empty, so no user- or global-level
-      # npmrc can supply auth either. A failed exchange is therefore a failed publish — which is
-      # what makes a green run evidence rather than a hope.
+      # `npm_config_userconfig` pointed at a file it creates empty, so no USER-level npmrc can
+      # supply auth either. That last one is exactly as wide as it says: `npm_config_userconfig`
+      # overrides npm's user config file only, the global npmrc is a separate config key, and the
+      # hosted runner image's global config is outside what this file controls — nothing here
+      # claims it carries no credential. A failed exchange is therefore a failed publish — which
+      # is what makes a green run evidence rather than a hope.
       #
       # npm attaches provenance by itself for a public repository and a public package; no flag
       # is passed for it and nothing in this repository asserts its absence.

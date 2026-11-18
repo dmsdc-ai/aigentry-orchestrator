@@ -1791,10 +1791,15 @@ const publishReadbackAfter = `      # Node 24, and only for the publish: npm tru
       # The npm >= 11.5.1 floor trusted publishing requires, measured here and printed, so that
       # "this toolchain could do OIDC" is a line in the log rather than an assumption about a
       # runner image. This is also what is left of the deleted \`NPM_TOKEN must be present\` gate
-      # in \`guard\`: the cheap, loud refusal that comes BEFORE \`npm publish\`, so a toolchain that
-      # cannot exchange an OIDC token fails the run here instead of being discovered by the
-      # registry. It carries no condition on purpose — it measures this job's toolchain, not the
-      # publish decision, so it reports on the already-published re-run path too.
+      # in \`guard\`: the loud refusal that comes BEFORE \`npm publish\`, so a toolchain that cannot
+      # exchange an OIDC token fails the run here instead of being discovered by the registry.
+      # It is NOT as early and NOT as wide as the gate it replaces, and neither is claimed: that
+      # gate ran in \`guard\`, this job needs \`browser-tls\`, \`test\` and the two windows jobs first;
+      # and this measures the npm VERSION only — it does not probe that an OIDC token is
+      # obtainable, nor that the npm-side registration exists, is spelled right and is unexpired,
+      # so a wrong registration is still first detected by \`npm publish\` itself. It carries no
+      # condition on purpose — it measures this job's toolchain, not the publish decision, so it
+      # reports on the already-published re-run path too.
       - name: The publishing toolchain must be able to do OIDC (npm >= 11.5.1)
         run: |
           set -euo pipefail
@@ -1814,9 +1819,12 @@ const publishReadbackAfter = `      # Node 24, and only for the publish: npm tru
       # with a token instead: there is none to fall back to. It declares no environment at all
       # and GitHub injects only the secrets a workflow names; neither setup-node above wrote an
       # \`_authToken\` npmrc, because neither has a \`registry-url\`; and the command runs with
-      # \`npm_config_userconfig\` pointed at a file it creates empty, so no user- or global-level
-      # npmrc can supply auth either. A failed exchange is therefore a failed publish — which is
-      # what makes a green run evidence rather than a hope.
+      # \`npm_config_userconfig\` pointed at a file it creates empty, so no USER-level npmrc can
+      # supply auth either. That last one is exactly as wide as it says: \`npm_config_userconfig\`
+      # overrides npm's user config file only, the global npmrc is a separate config key, and the
+      # hosted runner image's global config is outside what this file controls — nothing here
+      # claims it carries no credential. A failed exchange is therefore a failed publish — which
+      # is what makes a green run evidence rather than a hope.
       #
       # npm attaches provenance by itself for a public repository and a public package; no flag
       # is passed for it and nothing in this repository asserts its absence.
@@ -1951,8 +1959,13 @@ const publishReadbackSteps = {
   assert.ok(!('if' in floor), 'the npm floor step carries no condition, so it also reports on the already-published path');
   assert.ok(!('continue-on-error' in floor), 'the npm floor step cannot swallow its own failure');
   assert.match(floor.run, /^npm --version$/m, 'the npm floor step measures the npm it is about to publish with');
+  // The comparison is pinned as an independent literal, so this names exactly what that literal
+  // decides and no more: it refuses every RELEASE npm below 11.5.1. Its parse is
+  // `measured.split(".").map(Number)`, so a prerelease such as `11.5.1-pre.0` yields NaN for the
+  // patch and falls through — reachable only on a runner image shipping a prerelease npm at
+  // exactly 11.5.x, and a property of the approved literal rather than of this harness.
   assert.match(floor.run, /major < 11 \|\| \(major === 11 && \(minor < 5 \|\| \(minor === 5 && patch < 1\)\)\)/,
-    'the npm floor step refuses every npm below 11.5.1, which is the floor trusted publishing requires');
+    'the npm floor step refuses every release npm below 11.5.1, which is the floor trusted publishing requires');
   assert.match(floor.run, /process\.exit\(1\);/, 'the npm floor step fails the job rather than printing a warning');
   assert.match(floor.run, /::error::npm /, 'the npm floor step names the measured version in its refusal');
   // #1196 + #1282 — the publish step gains its id AND holds no credential. The old statement was
@@ -1996,6 +2009,11 @@ const publishReadbackSteps = {
 // write it into an npmrc. Applied to the PARSED workflow, so a prose comment explaining why these
 // must stay absent is not mistaken for a configuration that reintroduces them; the raw bytes are
 // held separately, and more strictly, by `assertPublishReadbackBytes`.
+//
+// "Any job" means EVERY job in the file, `browser-tls` included: `validate()` calls this before
+// `withoutBrowser` strips that job, so it is inspected here and not only by the byte-for-byte
+// comparison against the approved CI contract. The top level is inspected as its own entry, so a
+// credential planted in a workflow-level `env:` is refused too.
 const npmCredentialNeedles = [/secrets\.NPM_TOKEN/, /NODE_AUTH_TOKEN/, /_authToken/, /registry-url/];
 function assertNoNpmCredential(workflow, label) {
   const top = structuredClone(workflow);
@@ -2018,8 +2036,14 @@ function assertNoNpmCredential(workflow, label) {
 // browser acceptance and to the Windows gates as well, which is the failure mode DOCS:9's
 // "the critical requirement" invites. `contents: write` is held here too, because the GitHub
 // Release step needs it and a migration that traded one for the other would break the release.
+//
+// Like `assertNoNpmCredential`, this runs over EVERY job including `browser-tls`, because
+// `validate()` calls it before `withoutBrowser` strips that job. The top-level block is held to
+// `contents: read` by deep equality rather than by searching for the bytes `id-token: write`, so
+// `permissions: write-all` — which grants an id-token to every job without containing those
+// bytes — is refused here as well.
 function assertSingleIdToken(workflow, label) {
-  const holders = Object.entries(workflow.jobs).filter(([, job]) => job.permissions && 'id-token' in job.permissions);
+  const holders = Object.entries(workflow.jobs).filter(([, job]) => job.permissions && typeof job.permissions === 'object' && 'id-token' in job.permissions);
   assert.deepEqual(holders.map(([id]) => id), ['publish'], `${label}: exactly one job holds an id-token permission, and it is publish`);
   assert.deepEqual(workflow.jobs.publish.permissions, { contents: 'write', 'id-token': 'write' },
     `${label}: the publish job holds contents: write for the GitHub Release and id-token: write for OIDC, and nothing else`);
@@ -2195,6 +2219,14 @@ for (const [key, command] of Object.entries(commands)) {
 }
 
 function validate(workflow, policy = currentPolicy()) {
+  // #1282 — BEFORE `withoutBrowser` strips `browser-tls`, so the two prohibitions below really do
+  // run over every job in the file. Called after it they would have inspected the workflow minus
+  // that job, and a credential or an id-token planted in `browser-tls` would have passed them
+  // (it is refused by `withoutBrowser`'s own byte-for-byte comparison against the approved CI
+  // contract, but these two must bite on their own: that is the whole point of a prohibition
+  // that is stated over "every job").
+  assertNoNpmCredential(workflow, 'release');
+  assertSingleIdToken(workflow, 'release');
   workflow = withoutBrowser(workflow, true);
   const top = structuredClone(workflow);
   delete top.jobs;
@@ -2223,15 +2255,14 @@ function validate(workflow, policy = currentPolicy()) {
   // is restated as a longer chain over the steps that remain, plus the two statements the old
   // bound could not make: identity -> tests -> admission, with admission LAST in `guard` so
   // nothing can be slipped in after the gate, and the credential forbidden outright rather than
-  // merely placed late. `assertNoNpmCredential` and `assertSingleIdToken` are those two.
+  // merely placed late. The second of those is `assertNoNpmCredential` / `assertSingleIdToken`,
+  // called at the TOP of this function so they see `browser-tls` too.
   const guardSteps = workflow.jobs.guard.steps;
   const identity = guardSteps.indexOf(named(workflow.jobs.guard, 'Tag and package.json must name the same version'));
   const tests = guardSteps.indexOf(named(workflow.jobs.guard, 'Release admission regression tests'));
   const admission = guardSteps.indexOf(named(workflow.jobs.guard, 'Release planning and changed-file admission'));
   assert.ok(identity >= 0 && tests > identity && admission > tests, 'identity -> tests -> admission');
   assert.equal(admission, guardSteps.length - 1, 'the admission gate is the last thing guard does');
-  assertNoNpmCredential(workflow, 'release');
-  assertSingleIdToken(workflow, 'release');
   const publish = structuredClone(workflow.jobs.publish);
   assert.deepEqual(publish.needs, ['guard', 'test', declared, ...ids], 'gate and Windows successor publish dependencies');
   publish.needs = original.jobs.publish.needs;
@@ -2556,6 +2587,38 @@ mutants.push(['publish points the user npmrc at the inherited one', w => {
   step.run = replaceOnce(step.run, ': > "${RUNNER_TEMP}/empty-npmrc"\n', '');
   step.run = replaceOnce(step.run, '"${RUNNER_TEMP}/empty-npmrc"', '"$HOME/.npmrc"');
 }]);
+// #1282 — the two prohibitions are stated over EVERY job, so each gets a mutant that plants the
+// forbidden thing in the one job `validate()` used to strip before looking: `browser-tls`. Both
+// are also refused by `withoutBrowser`'s byte-for-byte comparison against the approved CI
+// contract, which is why they were invisible before — these exist so each helper bites on its own.
+mutants.push(['npm credential planted in the browser job', w => {
+  named(w.jobs['browser-tls'], 'Actual browser, WebAuthn and TLS controls').env.NODE_AUTH_TOKEN = '${{ secrets.NPM_TOKEN }}';
+}]);
+mutants.push(['OIDC permission planted in the browser job', w => {
+  w.jobs['browser-tls'].permissions = { contents: 'read', 'id-token': 'write' };
+}]);
+// #1282 — a credential does not have to live on the publish STEP. These put one everywhere else a
+// workflow can hold one, and move the publish out of the job that holds the OIDC permission.
+mutants.push(['publish job env regains a token', w => {
+  w.jobs.publish.env.NODE_AUTH_TOKEN = '${{ secrets.NPM_TOKEN }}';
+}]);
+mutants.push(['token added to a new top-level env', w => {
+  w.env = { NODE_AUTH_TOKEN: '${{ secrets.NPM_TOKEN }}' };
+}]);
+mutants.push(['publish step moved into the test job', w => {
+  const steps = w.jobs.publish.steps;
+  const step = named(w.jobs.publish, publishStepName);
+  steps.splice(steps.indexOf(step), 1);
+  w.jobs.test.steps.push(step);
+}]);
+mutants.push(['publish step may fail', w => { named(w.jobs.publish, publishStepName)['continue-on-error'] = true; }]);
+mutants.push(['registry read-back step may fail', w => {
+  named(w.jobs.publish, 'The registry must serve the bytes we packed')['continue-on-error'] = true;
+}]);
+// #1282 — `permissions: write-all` grants an id-token to every job WITHOUT containing the bytes
+// `id-token: write`, so the byte count cannot see it. The parsed top-level deep equality can.
+mutants.push(['top-level permissions widened to write-all', w => { w.permissions = 'write-all'; }]);
+mutants.push(['publish job permissions widened to write-all', w => { w.jobs.publish.permissions = 'write-all'; }]);
 mutants.push(['W1 changed pass floor outside reader', w => { named(w.jobs[ids[0]], persistenceStep).run = commands.persistence.replace('-gt 20', '-gt 0'); }]);
 mutants.push(['W1 changed selected test glob outside reader', w => { named(w.jobs[ids[0]], persistenceStep).run = commands.persistence.replace('persistence/*.test.js', '*.test.js'); }]);
 mutants.push(['W1 reverted legacy reader', w => { named(w.jobs[ids[0]], persistenceStep).run = rejectedPersistence; }]);
@@ -4480,6 +4543,17 @@ const releaseBrowserMutations = [
     '          : > "${RUNNER_TEMP}/empty-npmrc"\n          npm_config_userconfig="${RUNNER_TEMP}/empty-npmrc" \\\n            npm publish',
     '          npm publish'],
   ['publish stops emptying the user npmrc', '          : > "${RUNNER_TEMP}/empty-npmrc"\n', ''],
+  // #1282 — a credential does not have to go on the publish STEP, and a permission does not have
+  // to be spelled `id-token: write` to grant one. These are the other places both can appear.
+  ['publish job env regains a token', '    env:\n      PACKAGE: ${{ needs.guard.outputs.package }}\n',
+    '    env:\n      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n      PACKAGE: ${{ needs.guard.outputs.package }}\n'],
+  ['token added to a new top-level env', 'permissions:\n  contents: read\n',
+    'permissions:\n  contents: read\n\nenv:\n  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n'],
+  ['top-level permissions widened to write-all', 'permissions:\n  contents: read\n', 'permissions: write-all\n'],
+  ['publish step may fail', '      - name: Publish to npm\n        id: publish\n',
+    '      - name: Publish to npm\n        id: publish\n        continue-on-error: true\n'],
+  ['registry read-back step may fail', '      - name: The registry must serve the bytes we packed\n',
+    '      - name: The registry must serve the bytes we packed\n        continue-on-error: true\n'],
   ['npm token gate restored in guard',
     '        run: node scripts/release-admission.mjs --root "$GITHUB_WORKSPACE" --version "$RELEASE_VERSION"\n',
     '        run: node scripts/release-admission.mjs --root "$GITHUB_WORKSPACE" --version "$RELEASE_VERSION"\n'

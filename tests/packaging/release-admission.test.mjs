@@ -619,6 +619,16 @@ function assertWorkflowContract(text, policy = currentPolicy()) {
   }
   assert.doesNotMatch(browser, /continue-on-error:\s*true|\|\|\s*true|^\s*if:|\bexit\s+0\b/m, 'browser gate cannot skip or swallow failure');
   const steps = guard.split(/^      - /m).slice(1);
+  // #1282 — this split is how every index below is computed, and it only recognises a step whose
+  // dash is followed by a space. A YAML block-sequence entry may legally put the dash alone on its
+  // line with the mapping underneath, and such an entry is absorbed into the preceding element —
+  // so a sixth step really running after the admission gate would leave `steps.length` at 5 and
+  // the "admission is last" bound below would still hold. Count the entry heads independently,
+  // in BOTH forms, and require the two counts to agree, so the split cannot silently miss a step
+  // this file is then asked to make a statement about.
+  const stepHeads = guard.match(/^      -(?=[ \t]|$)/gm) ?? [];
+  assert.equal(steps.length, stepHeads.length,
+    'every guard step is a `-<space>` entry: a bare-dash entry would escape this split and the ordering bounds below');
   const identity = steps.findIndex(s => /id: identity\b/.test(s));
   const tests = steps.findIndex(s => /run:\s*(?:\|\s*)?node --test tests\/packaging\/release-admission\.test\.mjs\b/.test(s));
   const admission = steps.findIndex(s => /run:\s*(?:\|\s*)?node scripts\/release-admission\.mjs\b/.test(s));
@@ -748,6 +758,25 @@ for (const [ending, newline] of [['LF', '\n'], ['CRLF', '\r\n']]) {
     ['publish job loses the OIDC permission', 'publish', job => job.replace(
       onlyOccurrence(job, '      id-token: write  # npm trusted publishing (OIDC); the only job in this file that holds it\n'),
       ''), /id-token: write occurs exactly once/],
+    // #1282 — the entry form the `-<space>` split cannot see. A genuine sixth guard step, running
+    // after the admission gate, written with the dash alone on its line. Without the head count
+    // above this passed; with it the two counts disagree and the case is refused by name.
+    ['a bare-dash step appended after the admission gate', 'guard', job => job.replace(
+      onlyOccurrence(job, '        run: node scripts/release-admission.mjs --root "$GITHUB_WORKSPACE" --version "$RELEASE_VERSION"\n'),
+      () => '        run: node scripts/release-admission.mjs --root "$GITHUB_WORKSPACE" --version "$RELEASE_VERSION"\n'
+        + '      -\n        name: Anything at all\n        run: echo after the gate\n'), /escape this split/],
+    // #1282 — the same step in the ordinary form, so both entry shapes are covered here and not
+    // only in the parsed harness.
+    ['a step appended after the admission gate', 'guard', job => job.replace(
+      onlyOccurrence(job, '        run: node scripts/release-admission.mjs --root "$GITHUB_WORKSPACE" --version "$RELEASE_VERSION"\n'),
+      () => '        run: node scripts/release-admission.mjs --root "$GITHUB_WORKSPACE" --version "$RELEASE_VERSION"\n'
+        + '      - name: Anything at all\n        run: echo after the gate\n'), /admission is the last step in guard/],
+    // #1282 — a credential reintroduced somewhere neither of the two cases above reaches: the
+    // publish JOB's own `env:` block rather than the publish step's.
+    ['publish job env regains a token', 'publish', job => job.replace(
+      onlyOccurrence(job, '    env:\n      PACKAGE: ${{ needs.guard.outputs.package }}\n'),
+      () => '    env:\n      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n      PACKAGE: ${{ needs.guard.outputs.package }}\n'),
+      /no npm publish credential/],
   ];
   for (const [label, name, mutate, diagnostic] of bypasses) {
     test(`workflow contract rejects ${ending} ${label}`, () => {
