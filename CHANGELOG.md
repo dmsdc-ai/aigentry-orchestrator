@@ -7,6 +7,132 @@ extracts the matching section as the GitHub Release notes, so a publish fails
 without one. Unreleased harness work is still grouped under a dated
 `## [<YYYY-MM-DD>]` section beneath the ongoing `## [Unreleased]` working set.
 
+## [0.2.6] - 2026-11-18
+
+Hotfix on top of 0.2.5, for task #1270. It makes the local boot preflight
+non-destructive and lets a dispatch reach a worker that is already busy, by
+delivering through telepty's bound verb instead of waiting for an idle
+composer. The task disposition and the exact path scope are recorded in
+`release/0.2.6-dispositions.md`. These are proposed included bytes;
+publishing this release closes no task.
+
+### Added
+
+- **Bound delivery to a busy `--target` (#1270).** A non-spawned `--target`
+  that the live probe measures as qualified current-busy with an empty
+  composer is admitted at once and delivered through
+  `telepty inject-bound-v1`, pinned to the session epoch and owner
+  generation read from one `telepty list --json` snapshot. The admission
+  criterion is the live viewport reading `surface=working`, `ready=false`,
+  `ready_reason=current-busy-or-modal` and a `tracker_class` of
+  `blank`/`active`/`prompt_observed`. The offline `--screen-file` answer
+  carries no composer guarantee and is not admitted. Fresh
+  `--spawn-and-dispatch`, modal, unsubmitted, unknown-surface, probe-error
+  and `--retry-unknown` paths are unchanged and stay fail-closed.
+- **`ACCEPTED_PENDING`, not a delivery receipt.** On this path exit 0 prints
+  `ACCEPTED_PENDING <sid>` in place of `OK dispatched to <sid>`, and every
+  outcome records transport `unknown` plus one bounded observation, never
+  `write_observed`. `accepted` means both frames were handed to the pinned
+  owner bridge: it is not a PTY write, not native queueing, not auto-submit
+  and not model receipt. The identity is never re-sent, and the result is
+  never reported as VERIFIED.
+- **Named refusals before any input.** Exit 78
+  `BOUND_INJECT_UNSUPPORTED` names whichever requirement is missing —
+  `--from`, a loopback session, the bridge's `busy-input-v1` capability, or
+  the verb in `telepty boot-capabilities` — before any record and before any
+  input. Exit 3 `BOUND_INJECT_REFUSED` is used only where the answer proves
+  nothing was written, and is recorded `not_delivered`, so the same ref may
+  be dispatched again.
+- **An unknown outcome is held, never replayed.** Exit 7
+  `DELIVERY_UNKNOWN` covers a lost, truncated, mismatched-identity or any
+  other non-accepted answer: input may have been queued or written, so the
+  identity is held for review with no replay and no Enter.
+  `--retry-unknown` does not clear a hold on a still-busy worker — the bound
+  path refuses the flag, so the retry falls to the readiness wait and exits
+  1 having changed nothing.
+- **Stranded-composer report with the operator's own clear procedure.**
+  When an answer proves the pinned session instance is stranded (a
+  strand-reason `outcome_unknown`, or a `composer_stranded` refusal) or
+  leaves it unknown, a bounded STRANDED block goes to stderr with the pinned
+  `session_epoch`, the `owner_generation`, the `stranded_inject_id` (or
+  `none`), the reason code, and the recovery procedure: empty the composer
+  at the bridge's own keyboard, then run the printed
+  `telepty clear-strand-v1 --from <operator-sid> …` yourself. A value the
+  answer does not carry is printed as a `<placeholder>` next to the
+  read-only `telepty session <sid>` lookup that shows it, never guessed.
+  The reason `body_outcome_unknown` means the body write itself never
+  resolved, and the block says the composer may be empty — look before
+  typing. **The helper never clears:** it runs no `clear-strand-v1`, sends
+  no key, and never retries, replays or takes another input route for a
+  stranded session. Exit codes and markers are unchanged by the block.
+
+### Changed
+
+- **Exit 78 replaces a timeout on one existing path (#1270).** A
+  qualified-busy `--target` whose bridge or local CLI cannot carry the bound
+  verb now dies 78 by name, where before this change it fell through to the
+  readiness wait and exited 1 on timeout. A lane that reads exit 1 as "busy,
+  retry later" has to read 78 the same way: nothing was transported in
+  either case.
+- **`--verify-delivered` is a declared no-op on the bound path.** A queued
+  body is not on the screen, so no screen read is attempted, a stderr NOTE
+  states that verification was not performed, and the exit stays 0.
+  Started-working verification runs observe-only
+  (`bin/dispatch-verify.sh --observe-only`): no key, no resubmit, and it
+  prints OBSERVED rather than VERIFIED, because a working spinner may
+  predate the queued body.
+
+### Fixed
+
+- **Non-destructive local boot preflight (#1270).** Boot uses an
+  exact-local preflight that preserves provider and history choices and
+  boot records: automatic singleton signals and registry deletion are gone,
+  and it never kills, stops, repairs or restarts an existing session or
+  daemon. Versioned CLI capabilities are required, only a fresh target may
+  create once, and an existing or uncertain identity fails closed. The
+  duplicate and liveness readers recognise create-only bridges, and
+  automatic cleanup of an observed versioned target is refused before
+  capture or any destructive effect; fresh legacy kill and ancestry checks
+  are retained. The session is encoded as a strict URI segment while
+  keeping its original record and exec identity, and the bounded bash
+  command door is reused for Windows npm shims.
+- **Bounded readiness capture, no forced submit, no retry on dispatch.**
+  The readiness capture is bounded, and the dispatch submit path neither
+  forces a submit nor retries one.
+
+### Requirements
+
+- **The telepty daemon and every `telepty allow` bridge must run
+  `@dmsdc-ai/aigentry-telepty` 0.11.1 or later** for the bound-delivery and
+  strand-report paths. 0.11.1 is what provides `inject-bound-v1` and
+  `clear-strand-v1`, and a bridge keeps the code it was started with — a
+  bridge already running cannot declare the `busy-input-v1` capability this
+  release's admission requires. Restart the daemon and every bridge to pick
+  them up. Where either is missing, dispatch refuses with exit 78
+  `BOUND_INJECT_UNSUPPORTED` rather than falling back.
+
+### Release gates
+
+- Publication requires exact integrated CI, including Windows W1 (full
+  suite) and W0 (installed package), followed by registry verification.
+
+### Known limits
+
+- **Two busy viewport shapes are not bound-deliverable** (probe-side, task
+  #1277): a collapsed one-line Claude viewport, and a busy codex whose
+  footer is a bare `? for shortcuts` with no warnings suffix. For both
+  shapes the probe reports no empty current composer, so the dispatch still
+  ends in the readiness timeout. There is no caller-side workaround, and
+  neither shape is ever written to.
+- **`bin/dispatch-verify.sh`'s `set -e` defect is unchanged.** Its repair is
+  task #1275 and is not included here.
+- **No automated test proves native busy queueing or model receipt.**
+  `accepted` still claims only that both frames were handed to the pinned
+  owner bridge.
+- **A real strand followed by a successful clear has not been measured
+  outside mocks.** The sequence of a real bound delivery that strands a real
+  session and a clear that restores input to it has not been run.
+
 ## [0.2.5] - 2026-10-15
 
 Candidate release for context handoff, snapshot-before-compact, bounded model

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "release_group": "release-1202",
+  "release_group": "release-1270",
   "tasks": [
     {
       "id": 507,
@@ -57,6 +57,10 @@
     {
       "id": 1223,
       "release_component": "catalog-validation"
+    },
+    {
+      "id": 1270,
+      "release_component": "busy-bound-dispatch"
     }
   ]
 }
