@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "release": {
+    "package": "@dmsdc-ai/aigentry-orchestrator",
+    "version": "0.2.7",
+    "group": "release-1282",
+    "task": 1282,
+    "planning_manifest_sha256": "418efbd17c123f8d8a624b3094d1245afa18c8cf622c68914c132f16a8670d52"
+  },
+  "candidate": {
+    "inventory_sha256": "9a939d77de6e6149e03baff5da33d3109543973cf3f391b94be155f6d65d7f8d",
+    "source_ids": [
+      "src-00001",
+      "src-00002",
+      "src-00003"
+    ],
+    "dependency_ids": [
+      "dep-package-lock-json",
+      "dep-package-json"
+    ]
+  },
+  "scan": {
+    "sarif_id": "sarif",
+    "receipt_id": "receipt",
+    "projected_ids": [
+      "src-00001",
+      "src-00002",
+      "src-00003"
+    ],
+    "scope_id": "scope"
+  },
+  "files": [
+    {
+      "id": "dep-package-lock-json",
+      "kind": "dependency",
+      "path": "package-lock.json",
+      "bytes": 64210,
+      "sha256": "4e215d3c69adede425d8227465e73c013875a2c3f7ee30266a6d681d3d13b272"
+    },
+    {
+      "id": "dep-package-json",
+      "kind": "dependency",
+      "path": "package.json",
+      "bytes": 2596,
+      "sha256": "4e806511a5a7693f0be1f810fee2ec261a82bed472c2ff95bdb50eced03e0ede"
+    },
+    {
+      "id": "src-00001",
+      "kind": "source",
+      "path": "tests/packaging/fixtures/windows-gates/README.md",
+      "bytes": 9459,
+      "sha256": "e3f3b13b2fa9628c4b4e8b32f15b549a4ea6f57353272e2dc515da00dcbc6c11"
+    },
+    {
+      "id": "src-00002",
+      "kind": "source",
+      "path": "tests/packaging/release-admission.test.mjs",
+      "bytes": 76164,
+      "sha256": "0a32bcac53e1dd28651b72dc83b4f0e50752e9b67d9b80a40729806f0ecce05b"
+    },
+    {
+      "id": "src-00003",
+      "kind": "source",
+      "path": "tests/packaging/windows-release-gates.test.mjs",
+      "bytes": 342690,
+      "sha256": "70867c63cfe70652a44ecf7eff1c990436cded99d296931742eaf1dc994bd47d"
+    },
+    {
+      "id": "sarif",
+      "kind": "evidence",
+      "path": null,
+      "bytes": 649,
+      "sha256": "b11dc1d7e401ca1372872c5ca587b526201eb891e2d5afc8059a55bc98a3df87"
+    },
+    {
+      "id": "receipt",
+      "kind": "evidence",
+      "path": null,
+      "bytes": 621,
+      "sha256": "3c7dfe3c385965a7cd30dc05f23d272d3c9fe0b7fd15c0d5bd5e08425aa138a5"
+    },
+    {
+      "id": "scope",
+      "kind": "evidence",
+      "path": null,
+      "bytes": 1265,
+      "sha256": "889eaee5e43e01755563e59cdf0776ddd90eff18d0c57e47541f217ac825474d"
+    }
+  ],
+  "findings": []
+}
