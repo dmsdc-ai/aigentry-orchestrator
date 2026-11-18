@@ -36,10 +36,11 @@ release exists to prove the new publishing path. The path scope is recorded in
 
 ### Release gates
 
-- The release scan covers the package manifests only, because no production
-  source under `bin`, `src` or `scripts` changed since v0.2.6. It completed
-  with exit 0 and 0 findings. It is a changed-source projection, not
-  whole-repository or dependency coverage.
+- No production source under `bin`, `src` or `scripts` changed since v0.2.6.
+  The release scan covers the changed packaging test harnesses under
+  `tests/packaging` and the package manifests; it completed with exit 0 and
+  0 findings. It is a changed-source projection, not whole-repository or
+  dependency coverage.
 - Publication requires exact integrated CI, including Windows W1 (full
   suite) and W0 (installed package), followed by registry verification.
 

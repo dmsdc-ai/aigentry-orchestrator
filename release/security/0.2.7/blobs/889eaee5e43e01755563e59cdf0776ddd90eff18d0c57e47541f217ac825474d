@@ -1,0 +1,15 @@
+{
+  "base_commit": "6c2a33f73cd58daba000fe5e0172e680ea4cd357",
+  "roots": [
+    "bin",
+    "src",
+    "scripts",
+    "tests/packaging"
+  ],
+  "leaves": [
+    "package.json",
+    "package-lock.json"
+  ],
+  "assumptions": "Select every changed committed file under bin/src/scripts and tests/packaging since v0.2.6, plus exact package dependency identities. No file under bin, src or scripts changed in this range; the changed first-party code is the two packaging test harnesses that hold the release workflow to its approved bytes, so they are the projected sources. Snyk supported-language static findings are source evidence; no runtime exploit or clearance is inferred.",
+  "limits": "This is a changed-source projection, not whole-repository or dependency vulnerability coverage. The release workflow itself (.github/workflows/release.yml) and tooling/instructions changed in this range and are outside these roots; they are reviewed and CI-verified, not scanned here. Markdown under the roots is inventoried but Snyk Code language coverage is not asserted for it. Generated dist, native/installed execution, secret configuration and unchanged source are not scanned here. Any finding requires exact per-fingerprint source/evidence review; no blanket waiver."
+}
