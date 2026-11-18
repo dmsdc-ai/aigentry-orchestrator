@@ -7,6 +7,56 @@ extracts the matching section as the GitHub Release notes, so a publish fails
 without one. Unreleased harness work is still grouped under a dated
 `## [<YYYY-MM-DD>]` section beneath the ongoing `## [Unreleased]` working set.
 
+## [0.2.7] - 2026-11-18
+
+Release-engineering change for task #1282. The package contents are
+functionally identical to 0.2.6: no file under `src/` or `bin/` changed. This
+release exists to prove the new publishing path. The path scope is recorded in
+`release/0.2.7-dispositions.md`; publishing this release closes no task.
+
+### Changed
+
+- **Publication moved from a stored `NPM_TOKEN` to npm trusted publishing
+  (OIDC).** In `.github/workflows/release.yml` only the `publish` job holds
+  `id-token: write`. The archive is still installed and packed on Node 20; a
+  second `setup-node` (Node 24) and a step that fails unless the measured
+  `npm --version` is at least 11.5.1 run immediately before the publish.
+- **No token fallback.** The publish step has no `NODE_AUTH_TOKEN`, the
+  publishing setup writes no `registry-url` npmrc, and the publish runs with an
+  empty user-level npmrc, so a failed OIDC exchange fails the run instead of
+  publishing with a token. The `NPM_TOKEN must be present` gate is removed from
+  `guard`; the toolchain floor and the registry read-back keep "a green run
+  means published".
+- **The frozen-gate tests express this as a new approved region.** Every
+  assertion that was coupled to the token is replaced by one at least as
+  strong: no job, including `browser-tls`, may reference `secrets.NPM_TOKEN`;
+  `id-token: write` occurs exactly once, in `publish`; the single token
+  mutation is replaced by mutations that must each still be refused. The
+  frozen fixtures are unchanged.
+
+### Release gates
+
+- No production source under `bin`, `src` or `scripts` changed since v0.2.6.
+  The release scan covers the changed packaging test harnesses under
+  `tests/packaging` and the package manifests; it completed with exit 0 and
+  0 findings. It is a changed-source projection, not whole-repository or
+  dependency coverage.
+- Publication requires exact integrated CI, including Windows W1 (full
+  suite) and W0 (installed package), followed by registry verification.
+
+### Known limits
+
+- The npm-side trusted publisher must be registered for this package
+  (`dmsdc-ai/aigentry-orchestrator`, workflow `release.yml`, no environment,
+  `npm publish` allowed) on the day of a release: an unused registration
+  expires after 2 days.
+- This workflow has no `workflow_dispatch`, so a rejected publish cannot be
+  retried at the same tag with a corrected file; recovery is a new patch
+  version.
+- The repository secret `NPM_TOKEN` is no longer read by any workflow step. It
+  is removed separately, after this release is verified.
+- All Known limits of 0.2.6 still apply.
+
 ## [0.2.6] - 2026-11-18
 
 Hotfix on top of 0.2.5, for task #1270. It makes the local boot preflight

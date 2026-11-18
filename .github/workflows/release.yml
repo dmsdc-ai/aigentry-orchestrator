@@ -10,9 +10,9 @@ name: Release
 # 2026-08-15-npm-init-environment §0).
 #
 # So the rule here: a green run must mean the version is on npm AND the registry serves the
-# bytes this tag builds. Every gate fails loudly; none of them skip into green. A missing
-# secret is a failure, not a no-op. A local build agreeing with itself is not evidence — the
-# proof steps read back from the registry.
+# bytes this tag builds. Every gate fails loudly; none of them skip into green. A toolchain
+# that cannot authenticate is a failure, not a no-op. A local build agreeing with itself is
+# not evidence — the proof steps read back from the registry. (`publish` carries the rest.)
 
 on:
   push:
@@ -987,8 +987,19 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Gate 1 + 2, after browser/TLS acceptance: the tag must agree with the tree, and
-  # the credential must exist. Both are cheap and both are unrecoverable later.
+  # Gate 1 + 2, after browser/TLS acceptance: the tag must agree with the tree, and the
+  # release records must admit every changed path. Both are cheap and both are unrecoverable
+  # later.
+  #
+  # NO CREDENTIAL IS CHECKED HERE ANY MORE. This job used to end with an `NPM_TOKEN must be
+  # present` step, because a workflow that silently no-ops when the secret is absent is
+  # green-without-publishing — the bug this file exists to prevent. Since the move to npm
+  # trusted publishing (OIDC) there is no publish secret to check at all, so that step is
+  # DELETED rather than left to fail on an absence that is now correct. Its purpose moved into
+  # `publish`, where the OIDC permission lives, and got stronger there: the npm >= 11.5.1 floor
+  # step refuses the run BEFORE `npm publish` when this toolchain cannot exchange an OIDC token,
+  # which measures the thing that actually authenticates instead of the presence of a string.
+  # The registry read-back still refuses any run that ends without npm serving the packed bytes.
   guard:
     name: Gate
     needs: [browser-tls]
@@ -1031,23 +1042,9 @@ jobs:
         env:
           RELEASE_VERSION: ${{ steps.identity.outputs.version }}
           # Replace only after maintainer review of exact portable policy bytes and exception rationale.
-          RELEASE_SECURITY_POLICY_SHA256: 1a1071f797dd3a6c29ce6a0a576d23156b97b1972b111fec8b3c5277639db25b
+          RELEASE_SECURITY_POLICY_SHA256: 6da2709907a7c6bc3ef4b2d06becfb282d6fbe63e1fd4311d80b911c7ce71510
           RELEASE_SECURITY_COMMIT: ${{ github.sha }}
         run: node scripts/release-admission.mjs --root "$GITHUB_WORKSPACE" --version "$RELEASE_VERSION"
-
-      # A workflow that silently no-ops when the secret is absent is green-without-publishing,
-      # i.e. the bug this file exists to prevent. The token's value is never printed, only its
-      # emptiness is tested.
-      - name: NPM_TOKEN must be present
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "${NPM_TOKEN}" ]; then
-            echo "::error::repository secret NPM_TOKEN is not set. This run cannot publish, so it fails instead of passing. Create an npm automation token with publish rights for ${{ steps.identity.outputs.package }} and add it at Settings > Secrets and variables > Actions > New repository secret, named NPM_TOKEN."
-            exit 1
-          fi
-          echo "NPM_TOKEN is present"
 
   # Gate 3. Full suites on macOS and Linux; the Windows gates below hold windows-latest to
   # the same zero. Windows is supported except confined worker spawn and native request capture.
@@ -1490,23 +1487,78 @@ jobs:
           esac
           [ "$(snapshot)" = "${BEFORE}" ] || { echo "::error::the refused native capture changed the workspace or the home."; exit 1; }
 
+  # HOW THIS PUBLISHES — npm TRUSTED PUBLISHING (OIDC). No npm token takes part in a release any
+  # more. This job alone holds the `id-token` permission (it appears exactly once in this file,
+  # here); npm exchanges the GitHub OIDC token that permission enables for its own short-lived
+  # publish credential. Three absences in this job are load-bearing and must stay absent: no
+  # token in any step environment (GitHub injects only the secrets a workflow names, and this
+  # file names none for npm), no npmrc written by `setup-node`, which is used WITHOUT
+  # `registry-url` in both of its invocations below, and no USER npmrc — the publish command
+  # points `npm_config_userconfig` at a file it creates empty. That key overrides npm's user
+  # config file and nothing else: the global npmrc is a separate npm config key, and the hosted
+  # runner image's global config is outside what this file controls and is not claimed here.
+  # With no credential reachable through any of those three, a
+  # failed OIDC exchange FAILS the publish instead of quietly succeeding some other way, which
+  # is the only reason a green run here may be read as "OIDC worked".
+  #
+  # THE NPM-SIDE REGISTRATION THIS FILE DEPENDS ON. npmjs.com -> the package -> Settings ->
+  # Trusted publishing -> GitHub Actions. All fields are case-sensitive and exact, and npm does
+  # not validate them when they are saved — a wrong field surfaces only as a failed publish:
+  #   organization or user   dmsdc-ai
+  #   repository             aigentry-orchestrator
+  #   workflow filename      release.yml   (the filename only, never a path, and never this
+  #                                        file's `name:` at the top, which is `Release`)
+  #   environment name       empty — no job in this file uses a GitHub environment
+  #   allowed actions        `npm publish` must be ALLOWED explicitly. A configuration created
+  #                          after 2026-09-03 defaults to stage publish only, and the publish
+  #                          step below runs `npm publish`, so the default would fail the release.
+  # CREATE IT ON THE DAY OF THE RELEASE: a new configuration expires unless a publish succeeds
+  # within 2 days, and it cannot be edited afterwards — a wrong field is fixed by deleting and
+  # recreating it, which restarts that 2-day clock. Register only once the gate chain below has
+  # passed on the release candidate, because `browser-tls`, the 30-minute suites and the two
+  # windows-latest jobs can burn that window without ever reaching `npm publish`.
+  #
+  # ROLLBACK, if an OIDC publish cannot be made to work: `git revert` the single commit that
+  # moved this file to trusted publishing. The workflow edit and the gate-test edit are in that
+  # one commit on purpose, so the revert is atomic — reverting the workflow alone leaves both
+  # gate tests red, and either one of them stops the publish: `guard` runs
+  # `tests/packaging/release-admission.test.mjs` directly, the `test` job's `npm test` runs
+  # `tests/packaging/windows-release-gates.test.mjs`, and `publish` needs both jobs. The
+  # repository secret NPM_TOKEN is
+  # deliberately LEFT IN PLACE until a first OIDC publish has been verified; nothing in this
+  # file references it and GitHub injects only referenced secrets, so it cannot be what made a
+  # run pass. Delete it only after the proof. There is NO `workflow_dispatch` here (see `on:`
+  # above), so a rejected publish cannot be re-released at the same tag: npm versions are
+  # immutable, nothing is shipped when the publish is rejected, and recovery costs one patch
+  # version and a new tag. Budget a spare patch version for the first OIDC release.
   publish:
     name: Publish and verify from the registry
     needs: [browser-tls, guard, test, windows-declared-supported, windows-suite, windows-installed]
     runs-on: ubuntu-latest
     permissions:
       contents: write  # gh release create
+      id-token: write  # npm trusted publishing (OIDC); the only job in this file that holds it
     env:
       PACKAGE: ${{ needs.guard.outputs.package }}
       VERSION: ${{ needs.guard.outputs.version }}
       TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+      # Node 20 and `cache: npm` are UNCHANGED here: `npm ci` and the `npm pack` below build the
+      # tarball this job publishes, and the `test` job's T96 ship-set and smoke-init gates
+      # measured a tarball packed on Node 20 (its matrix is Node [20]). The publishing toolchain
+      # is a SECOND setup-node further down, so no certified row moves and nothing re-packs.
+      #
+      # `registry-url` is DELETED, deliberately: with it, setup-node writes a
+      # `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` line into this job's npmrc, which
+      # is precisely the mechanism that would let a stored token publish this package again.
+      # Without it the publish goes to npm's default registry — package.json declares
+      # `publishConfig.access` but no `publishConfig.registry` — which on a hosted runner is
+      # registry.npmjs.org, the same target as before.
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: npm
-          registry-url: 'https://registry.npmjs.org'
       - name: Install dependencies
         run: npm ci
 
@@ -1554,14 +1606,70 @@ jobs:
             exit 1
           fi
 
+      # Node 24, and only for the publish: npm trusted publishing needs npm >= 11.5.1, which the
+      # step after this one measures rather than assumes. Do NOT reach for node 22 on the
+      # strength of npm's "Node 22.14.0 or higher" line: node 22 ships npm 10.9.8, which has no
+      # OIDC. A SECOND setup-node rather than a bump of the first one, because the first one's
+      # Node is what packed the tarball the gates measured; publishing a tarball runs no build
+      # hook — the pack comment above says so — so nothing re-packs after this step and the bytes
+      # that reach npm are still the Node-20 bytes. No `registry-url` here either, for the reason
+      # the first setup-node carries, and no `cache: npm`: the install already happened on Node
+      # 20 and nothing below installs anything.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # The npm >= 11.5.1 floor trusted publishing requires, measured here and printed, so that
+      # "this toolchain could do OIDC" is a line in the log rather than an assumption about a
+      # runner image. This is also what is left of the deleted `NPM_TOKEN must be present` gate
+      # in `guard`: the loud refusal that comes BEFORE `npm publish`, so a toolchain that cannot
+      # exchange an OIDC token fails the run here instead of being discovered by the registry.
+      # It is NOT as early and NOT as wide as the gate it replaces, and neither is claimed: that
+      # gate ran in `guard`, this job needs `browser-tls`, `test` and the two windows jobs first;
+      # and this measures the npm VERSION only — it does not probe that an OIDC token is
+      # obtainable, nor that the npm-side registration exists, is spelled right and is unexpired,
+      # so a wrong registration is still first detected by `npm publish` itself. It carries no
+      # condition on purpose — it measures this job's toolchain, not the publish decision, so it
+      # reports on the already-published re-run path too.
+      - name: The publishing toolchain must be able to do OIDC (npm >= 11.5.1)
+        run: |
+          set -euo pipefail
+          node --version
+          npm --version
+          node -e '
+            const measured = process.argv[1];
+            const [major, minor, patch] = measured.split(".").map(Number);
+            if (major < 11 || (major === 11 && (minor < 5 || (minor === 5 && patch < 1)))) {
+              console.error("::error::npm " + measured + " is below 11.5.1, the floor npm trusted publishing requires. This job cannot exchange an OIDC token for a publish credential, so it refuses here rather than at npm publish. Raise this job node-version until npm reports >= 11.5.1.");
+              process.exit(1);
+            }
+            console.log("npm " + measured + " >= 11.5.1: this toolchain can publish through OIDC");' "$(npm --version)"
+
+      # This publishes by npm trusted publishing (OIDC) and by nothing else; the job header above
+      # carries the npm-side registration it depends on. Why this step cannot quietly publish
+      # with a token instead: there is none to fall back to. It declares no environment at all
+      # and GitHub injects only the secrets a workflow names; neither setup-node above wrote an
+      # `_authToken` npmrc, because neither has a `registry-url`; and the command runs with
+      # `npm_config_userconfig` pointed at a file it creates empty, so no USER-level npmrc can
+      # supply auth either. That last one is exactly as wide as it says: `npm_config_userconfig`
+      # overrides npm's user config file only, the global npmrc is a separate config key, and the
+      # hosted runner image's global config is outside what this file controls — nothing here
+      # claims it carries no credential. A failed exchange is therefore a failed publish — which
+      # is what makes a green run evidence rather than a hope.
+      #
+      # npm attaches provenance by itself for a public repository and a public package; no flag
+      # is passed for it and nothing in this repository asserts its absence.
+      #
       # #1196: `id` so the step below can name PUBLISH_FAILED. Skipped is not failure, so on
       # the already-published path every step below still runs; do not add an `if:` to them.
       - name: Publish to npm
         id: publish
         if: steps.registry.outputs.exists != 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish "${{ steps.pack.outputs.tarball }}" --access public
+        run: |
+          set -euo pipefail
+          : > "${RUNNER_TEMP}/empty-npmrc"
+          npm_config_userconfig="${RUNNER_TEMP}/empty-npmrc" \
+            npm publish "${{ steps.pack.outputs.tarball }}" --access public
 
       # #1196, modelled on aigentry-telepty #1127. A red run has two causes that demand opposite
       # responses, and the badge alone cannot tell them apart. This step speaks for exactly one

@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "release_group": "release-1282",
+  "release_task": 1282,
+  "package": "@dmsdc-ai/aigentry-orchestrator",
+  "version": "0.2.7",
+  "base_tag": "v0.2.6",
+  "base_commit": "6c2a33f73cd58daba000fe5e0172e680ea4cd357",
+  "tasks": [
+    {
+      "task_id": 1282,
+      "disposition": "shipping",
+      "scope": "The release workflow publishes through npm trusted publishing (OIDC) instead of a stored NPM_TOKEN: id-token: write on the publish job only, the archive still installed and packed on Node 20, a Node 24 publishing toolchain with a measured npm >= 11.5.1 floor, no NODE_AUTH_TOKEN, no registry-url npmrc, an empty user-level npmrc, and the token-presence gate removed. The two packaging test harnesses express this as a new approved region in which every assertion that was coupled to the token is replaced by one at least as strong; the frozen fixtures are unchanged. Also included are the release records: package version, lockfile, changelog, public projection, this file, the planning manifest, the security evidence blobs, the policy path and the workflow's security-policy pin. No file under bin, src or scripts changed, so the package contents are functionally identical to 0.2.6. The release scan over the changed packaging test harnesses and the package manifests completed with exit 0 and 0 findings; it is a changed-source projection, not whole-repository or dependency coverage. Not established before this release runs: that the OIDC exchange succeeds for this package (the proof is this release's own publish and registry read-back; the sibling package aigentry-telepty proved the same workflow shape on 2026-11-18). Publication requires controller-reviewed exact policy bytes, a literal workflow pin to their SHA-256, exact integrated CI including Windows W1 and W0, then registry verification.",
+      "paths": [
+        ".github/workflows/release.yml",
+        "CHANGELOG.md",
+        "package-lock.json",
+        "package.json",
+        "release/0.2.7-dispositions.md",
+        "release/0.2.7.json",
+        "release/security/0.2.7/blobs/3c7dfe3c385965a7cd30dc05f23d272d3c9fe0b7fd15c0d5bd5e08425aa138a5",
+        "release/security/0.2.7/blobs/889eaee5e43e01755563e59cdf0776ddd90eff18d0c57e47541f217ac825474d",
+        "release/security/0.2.7/blobs/b11dc1d7e401ca1372872c5ca587b526201eb891e2d5afc8059a55bc98a3df87",
+        "release/security/0.2.7/policy.json",
+        "release/tasks.json",
+        "tests/packaging/fixtures/windows-gates/README.md",
+        "tests/packaging/release-admission.test.mjs",
+        "tests/packaging/windows-release-gates.test.mjs",
+        "tooling/instructions/roles/builder.md"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.7-dispositions.md",
+          "sha256": "568d03e3dfbfddaf88b39eb5b637727b52a23034e71abf1de76ff187c107b765"
+        }
+      ]
+    }
+  ]
+}
