@@ -178,7 +178,95 @@ function seedAuth(cli: string, home: string, cwd: string, oauthSelected = false)
     writePrivate(path.join(config, "auth.json"), fs.readFileSync(source, "utf8"));
     writePrivate(path.join(config, "config.toml"),
       `check_for_update_on_startup = false\n[sandbox_workspace_write]\nexclude_slash_tmp = true\n[projects.${JSON.stringify(cwd)}]\ntrust_level = "trusted"\n`);
-    return { CODEX_HOME: config };
+    // #652 OPT-IN, macOS only: hand the confined Codex worker a CA bundle FILE that the OS
+    // ships. Default OFF — with AIGENTRY_CODEX_SYSTEM_CA unset nothing below runs and the
+    // sealed environment is byte-for-byte what it was. Only the exact value `1` opts in.
+    //
+    // WHAT THIS OPTION IS, AND WHAT IT IS NOT. It selects the root-owned PEM file macOS
+    // ships at /etc/ssl/cert.pem and puts its RESOLVED pathname in CODEX_CA_CERTIFICATE —
+    // that one variable, no other. That file is NOT "the system trust": the effective macOS
+    // trust decision lives in the Keychain and trustd (per-certificate trust settings,
+    // administrator and user overrides), which a PEM file cannot carry. The two may differ
+    // IN EITHER DIRECTION, so this is neither a subset nor a superset of host trust: the
+    // file can list a root that host policy explicitly distrusts, and the host can trust an
+    // anchor the file does not list. Nothing here reads PEM bytes, and nothing here
+    // establishes whether the Codex client ADDS these roots to any it already has or
+    // REPLACES them — that is the client's behaviour and it was not observed. The
+    // measurement behind this option had BOTH CODEX_CA_CERTIFICATE and SSL_CERT_FILE set,
+    // so it does not isolate which variable the client honoured; see PR/commit notes.
+    //
+    // THE CHECK IS BOUND TO THE OBJECT THE WORKER WILL READ. realpathSync resolves the
+    // chain ONCE; every check below runs on that resolved pathname, and that same resolved
+    // pathname is what the worker is handed. A symlinked /etc/ssl/cert.pem (the normal macOS
+    // layout — /etc is itself a symlink to /private/etc) is therefore followed DELIBERATELY:
+    // the target AND every directory component above it must be root-owned and not
+    // group/other-writable, or the option is dropped. Because the worker never receives the
+    // pre-resolution path, replacing a symlink in the original chain afterwards cannot
+    // redirect the worker's open.
+    //
+    // RESIDUAL RISK, stated plainly — this narrows the window, it does not close it:
+    //   * TOCTOU: between these checks and the worker's open, ROOT can still replace the
+    //     file or any parent. Root is already trusted by this design. What the chain walk
+    //     removes is the NON-root replace — a component owned by a non-root uid, or writable
+    //     by group or other, is one somebody other than root can swap, and that now refuses.
+    //   * st_mode cannot see a macOS extended ACL, so a component whose ACL grants write to
+    //     some other non-root principal still passes the mode gate. The W_OK pass below is a
+    //     cheap partial backstop: access(2) does consult ACLs, but only for THIS process.
+    //   * Host readability is not readability inside the confinement; this option changes no
+    //     sandbox read rule, not even for this file.
+    //
+    // A rejected bundle is NOT fatal: the option is dropped with one precise warning and the
+    // worker is prepared exactly as it would have been without it. Failing the spawn over an
+    // optional convenience would turn a trust-store permission problem into "no worker
+    // starts at all", and the pre-existing configuration is a supported one.
+    const tlsEnv: Record<string, string> = {};
+    if (process.platform === "darwin" && process.env.AIGENTRY_CODEX_SYSTEM_CA === "1") {
+      const requested = "/etc/ssl/cert.pem";
+      let resolved = "";
+      let reject = "";
+      try {
+        resolved = fs.realpathSync(requested);
+        // lstat, not stat: after realpath the final component cannot be a link, so a link
+        // HERE means one appeared after the resolve — and !isFile() refuses it.
+        const st = fs.lstatSync(resolved);
+        if (!st.isFile()) reject = "not a regular file";
+        else if (st.uid !== 0) reject = `not root-owned (uid ${st.uid})`;
+        else if ((st.mode & 0o022) !== 0) reject = `group/other-writable (mode ${(st.mode & 0o777).toString(8)})`;
+        // Every directory component of the RESOLVED path, up to and including "/": a
+        // replaceable parent makes the file replaceable whatever the file's own mode says.
+        for (let dir = path.dirname(resolved); !reject; dir = path.dirname(dir)) {
+          const ds = fs.lstatSync(dir);
+          if (!ds.isDirectory()) reject = `under a non-directory component (${dir})`;
+          else if (ds.uid !== 0) reject = `under a non-root-owned directory (${dir}, uid ${ds.uid})`;
+          else if ((ds.mode & 0o022) !== 0) {
+            reject = `under a group/other-writable directory (${dir}, mode ${(ds.mode & 0o777).toString(8)})`;
+          }
+          if (dir === path.dirname(dir)) break; // "/" checked; dirname("/") === "/"
+        }
+        if (!reject) fs.accessSync(resolved, fs.constants.R_OK);
+        // ACL backstop: if THIS process can write the file or any component, the chain is
+        // not root-only after all. Skipped when we are root, where W_OK is true everywhere
+        // and so carries no information.
+        const uid = typeof process.getuid === "function" ? process.getuid() : -1;
+        for (let p = resolved; !reject && uid !== 0; p = path.dirname(p)) {
+          let writable = false;
+          try { fs.accessSync(p, fs.constants.W_OK); writable = true; } catch { /* refused: as required */ }
+          if (writable) reject = `writable by this non-root process (${p})`;
+          if (p === path.dirname(p)) break;
+        }
+      } catch (e) {
+        reject = reject || `unusable (${(e as NodeJS.ErrnoException).code ?? "error"})`;
+      }
+      if (reject) {
+        const named = resolved && resolved !== requested ? `${requested} → ${resolved}` : requested;
+        process.stderr.write(
+          `worker-sandbox: AIGENTRY_CODEX_SYSTEM_CA=1 ignored — ${named} is ${reject}; CODEX_CA_CERTIFICATE not set\n`);
+      } else {
+        // The RESOLVED path, so the worker opens the object these checks were run on.
+        tlsEnv.CODEX_CA_CERTIFICATE = resolved;
+      }
+    }
+    return { CODEX_HOME: config, ...tlsEnv };
   }
   if (cli === "claude") {
     const config = path.join(home, ".claude");
