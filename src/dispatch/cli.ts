@@ -68,18 +68,20 @@ function isExecutable(p: string): boolean {
 
 /**
  * stdout+status, stderr swallowed — the shell's `$(cmd 2>/dev/null || true)`.
- * #1293: `spawnError` is the errno code when the command could not be STARTED at all (a missing
- * telepty is ENOENT), which a status of 127 cannot distinguish from a command that ran and exited
- * 127. Purely additive: every existing caller reads `status`/`stdout` and is unchanged.
+ * #1293: `spawnError` is the errno code of any child error — a command that could not be STARTED
+ * (a missing telepty is ENOENT) but also a timeout or an output overflow (ENOBUFS) of one that did
+ * start — which a status of 127 cannot distinguish. `signal` is set when the child was killed by
+ * one, which a status of 1 would otherwise hide (review F5). Purely additive: every existing caller
+ * reads `status`/`stdout` and is unchanged.
  */
-function capture(cmd: string, args: string[], extraEnv?: NodeJS.ProcessEnv, timeoutMs?: number): { status: number; stdout: string; spawnError?: string } {
+function capture(cmd: string, args: string[], extraEnv?: NodeJS.ProcessEnv, timeoutMs?: number): { status: number; stdout: string; spawnError?: string; signal?: string } {
   const r = (process.platform === "win32" ? crossSpawn.sync : spawnSync)(cmd, args, {
     encoding: "utf8",
     env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
     ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }),
   });
   if (r.error) return { status: 127, stdout: "", spawnError: (r.error as NodeJS.ErrnoException).code ?? "spawn error" };
-  return { status: r.status ?? 1, stdout: r.stdout ?? "" };
+  return { status: r.status ?? 1, stdout: r.stdout ?? "", ...(r.status === null && r.signal ? { signal: r.signal } : {}) };
 }
 
 /** stdout captured, stderr inherited — the shell's plain `out=$(cmd)`. */
@@ -235,7 +237,8 @@ function writeWorkerLauncher(
 /**
  * Look up the wrapped CLI ("claude"/"codex"/"gemini") for a sid; `kind` is "" if absent.
  *
- * #1293: it also reports whether the telepty COMMAND ITSELF could not be started. Both answers
+ * #1293: it also reports the listing's child error code, if any (`capture`), so the caller can tell a
+ * telepty COMMAND that could not be started from a session that is not listed. Both answers
  * used to be the same empty string, so a host with no telepty at all waited out the whole
  * registration budget and then blamed the timeout knob — see waitForRegistration.
  */
@@ -1284,7 +1287,8 @@ function boundVerbVerdict(): "ok" | "refused" | "unprobed" {
   // #1293 (review R2): a command that could not be STARTED has not told us anything about its
   // version, so it must not draw upgrade advice. Everything else — a non-zero exit, no output,
   // prose, a document without the verb — is telepty's own answer, and that answer is "no".
-  if (r.spawnError !== undefined) return "unprobed";
+  // A child killed by a signal (review F5) has not answered either.
+  if (r.spawnError !== undefined || r.signal !== undefined) return "unprobed";
   if (r.status !== 0 || !r.stdout) return "refused";
   try {
     const doc = JSON.parse(r.stdout) as { verbs?: unknown };
@@ -1445,7 +1449,7 @@ function admitBoundBusy(o: Opts, sid: string): BusyAdmission {
   if (boundVerb === "unprobed") {
     // The probe never reached telepty, so the version is unknown and no upgrade is advised here;
     // the missing-executable door above already names that condition when it is the cause.
-    refuse(`'${TELEPTY} boot-capabilities' could not be run, so ${BOUND_VERB} support is unknown and ` +
+    refuse(`'${TELEPTY} boot-capabilities' could not be run to completion, so ${BOUND_VERB} support is unknown and ` +
       "bound delivery to a busy worker cannot be admitted");
   }
   return { bound: { epoch: snap.epoch, ownerGeneration: snap.ownerGeneration, busyInput: snap.busyInput },
@@ -2048,9 +2052,10 @@ async function waitForRegistration(o: Opts, sid: string): Promise<{ kind: string
     // #1293: this is where dispatch first NEEDS telepty, and where a host without one used to spend
     // the whole budget (180000 ms for a spawn) before advising a longer timeout — advice that cannot
     // help, for a condition the very first listing had already proved. Refuse here instead, by name
-    // and at once. Only a command that could not be STARTED lands here: a telepty that runs and
-    // reports no such session is the registration wait's business and is untouched.
-    if (spawnError !== null) {
+    // and at once. Only a command that could not be STARTED lands here — ENOENT (no such file) or
+    // EACCES (not executable): a telepty that runs and reports no such session, or overflows the
+    // listing buffer (ENOBUFS, review F6), is the registration wait's business and is untouched.
+    if (spawnError === "ENOENT" || spawnError === "EACCES") {
       // On the spawn path a workspace was already opened before this wait, so say so in exactly
       // the words the deadline branch below uses: the refusal is new, the operator's cleanup is not.
       die(`dispatch.sh: ${TELEPTY_UNAVAILABLE} for ${sid} — the telepty CLI ${TELEPTY} could not be run ` +

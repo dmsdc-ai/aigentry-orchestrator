@@ -22,7 +22,7 @@
 // on every OS with no skips.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fixture } from "./model-router-fixtures.js";
 
@@ -85,6 +85,27 @@ test("1293: a telepty that RUNS and does not list the session keeps the registra
     assert.match(r.stderr, new RegExp(`session '${SID}' never registered in telepty list`), r.stderr);
     assert.match(r.stderr, KNOB_ADVICE, "the registration advice must survive for the case it fits");
     assert.doesNotMatch(r.stderr, /TELEPTY_CLI_UNAVAILABLE/, "a telepty that ran must not be reported as unavailable");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("1293 r2: a telepty that STARTS but overflows the listing buffer keeps the registration wait and exit 6", () => {
+  // review F6: r1 treated ANY child error of the listing as "the CLI could not run", so a healthy
+  // telepty whose `list --json` exceeded the 1 MiB child buffer (ENOBUFS) was refused with 78 and
+  // install advice. Only ENOENT/EACCES — a command that cannot be STARTED — is that condition now.
+  // This FAILS on r1 (exit 78).
+  const f = fixture();
+  try {
+    f.prepareTarget();
+    const overflow = join(f.root, "telepty-overflow");
+    writeFileSync(overflow, (process.platform === "win32" ? "#!/usr/bin/env node\n" : `#!${process.execPath}\n`) +
+      "if (process.argv[2] === 'list') process.stdout.write('[' + ' '.repeat(2 * 1024 * 1024) + ']');\n" +
+      "else process.exit(99);\n", { mode: 0o755 });
+    const r = f.dispatch(["--target", SID, "--from", FROM], { TELEPTY: overflow });
+    assert.equal(r.status, 6, `expected the registration wait's exit 6, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+    assert.match(r.stderr, new RegExp(`session '${SID}' never registered in telepty list`), r.stderr);
+    assert.doesNotMatch(r.stderr, /TELEPTY_CLI_UNAVAILABLE/, "a telepty that started must not be reported as unavailable");
   } finally {
     f.cleanup();
   }

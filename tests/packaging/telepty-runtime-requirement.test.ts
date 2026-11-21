@@ -9,22 +9,20 @@
 // viewer detach, src/dispatch/cli.ts requires inject-bound-v1), and says what is required, which
 // published version carries it, which command installs it and what each later door does until then.
 //
-// It is also the MIGRATION door. An install of 0.2.5-0.2.7 left a real, runnable telepty inside
-// this package's own tree — npm hoists a dependency's bins — so a host could have been using
-//   <project>/node_modules/.bin/telepty                                         (local install)
-//   <prefix>/lib/node_modules/@dmsdc-ai/aigentry-orchestrator/node_modules/…    (global install)
-// through PATH, through an explicit TELEPTY, or through a launchd/systemd program path. For such a
-// host 0.2.8 removes the only telepty it had, so init DETECTS that and prints one instruction. It
-// installs, repairs, starts, stops and restarts nothing.
+// r2 (review F1/F2): init asks only questions with an exact answer. It never guesses who installed
+// or "owns" a telepty — a healthy telepty is never told to reinstall, wherever it lives, including
+// beside the orchestrator in one shared npm prefix — and, independently of the CLI verdict, it
+// reports a readable telepty service definition ONLY when the program it starts does not exist or
+// is not executable. A service it cannot read, or a platform it does not inspect, gets silence.
 //
 // WHAT IS MEASURED HERE, and nothing else:
 //   * the real bin/init/cli.mjs of this checkout, as a subprocess, in a fresh HOME and a fresh
 //     workspace, with `--dry-run` so nothing is written anywhere (one case runs a FULL init on
 //     purpose — the review R6 case — and asserts the console states the command once);
 //   * a FAKE telepty — absent, an older CLI that answers the unknown verb with its help text and
-//     exit 0, documents malformed in each way the boot door refuses, a sufficient one, and a
-//     sufficient one that lives inside a fake orchestrator install;
-//   * fake user service definitions under the fixture HOME;
+//     exit 0, documents malformed in each way the boot door refuses, and a sufficient one placed in
+//     every layout an npm install produces;
+//   * fake service definitions under the fixture HOME (never the host's own services);
 //   * that init runs the capability probe and NOT a version comparison (the stub records its argv,
 //     and `--version` is never asked for);
 //   * that init installs, upgrades, starts, stops and restarts nothing: `npm`, `npx`,
@@ -41,14 +39,14 @@
 //     same five /bin symlinks tests/packaging/installed-boot-selector.test.mjs runs a full init
 //     with). win32's step 1 probes jq.exe/python.exe by RUNNING them and resolves Git for Windows
 //     bash before it reaches the telepty check, and those are real host tools — so win32 appends
-//     the ambient PATH, after asserting that the ambient PATH resolves no telepty of its own,
-//     which would otherwise decide these cases;
-//   * the service-target case asserts the launchd directory on darwin, the systemd user directory
-//     on linux, and the "not inspected on this platform" sentence on win32.
+//     ONLY the ambient directories that hold jq.exe, python.exe, bash.exe or git.exe (review F8),
+//     never the whole ambient PATH, so a contributor's own telepty cannot decide a case;
+//   * the service cases write a launchd plist on darwin and systemd units on linux, and assert
+//     silence on win32, where no service definition is inspected.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 
@@ -57,6 +55,7 @@ const INIT_CLI = join(REPO, "bin/init/cli.mjs");
 const MIN_VERSION = "0.11.1";
 const INSTALL_COMMAND = "npm i -g @dmsdc-ai/aigentry-telepty@latest";
 const ORCHESTRATOR_PACKAGE = "@dmsdc-ai/aigentry-orchestrator";
+const TELEPTY_PACKAGE = "@dmsdc-ai/aigentry-telepty";
 const WIN = process.platform === "win32";
 /** Anything named here would mean init tried to change the host. */
 const TRIPWIRES = ["npm", "npx", "telepty-install", "launchctl", "systemctl", "kill", "brew", "apt-get"] as const;
@@ -69,9 +68,11 @@ const SEALED = { schema: "telepty-boot-capabilities-v1", verbs: ["allow-create-v
 /** The help text an older telepty prints for an unknown verb, before exiting 0. */
 const OLD_HELP = "telepty — session multiplexer\nUsage: telepty <command> [options]\n  inject, send-key, list, read-screen, session\n";
 const PRINT_SEALED = `console.log(JSON.stringify(${JSON.stringify(SEALED)}));`;
-/** The fake global install the migration cases place a nested telepty inside. */
+/** The 0.2.5-0.2.7 global install's own nested tree, where its dependency copy of telepty lived. */
 const GLOBAL_INSTALL = `prefix/lib/node_modules/${ORCHESTRATOR_PACKAGE}`;
 const NESTED_BIN = `${GLOBAL_INSTALL}/node_modules/.bin`;
+/** The sentence init prints for a stale service definition, and only for one. */
+const SERVICE_WARNING = /A telepty service definition starts a program that does not exist or is not executable/;
 
 function insideGit(dir: string): boolean {
   for (let cur = dir; ; cur = dirname(cur)) {
@@ -81,27 +82,22 @@ function insideGit(dir: string): boolean {
 }
 
 /**
- * The ambient PATH must not resolve a telepty of its own wherever it is appended, or it — not the
- * fixture — would answer the capability probe in the cases that place no stub. Resolved the way
- * each platform's own door resolves it, so this check cannot disagree with the product.
+ * win32 (review F8): the ambient directories holding a real tool init's win32 step 1 RUNS (jq.exe,
+ * python.exe) or resolves Git for Windows bash from (bash.exe, git.exe) — and nothing else from the
+ * ambient PATH. A directory among them that also holds a telepty would decide these cases, so that
+ * one host shape fails loudly by name instead of silently changing an outcome.
  */
-function assertNoAmbientTelepty(): void {
-  const exts = WIN
-    ? (process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean).map((e) => e.toLowerCase())
-    : [""];
-  const found: string[] = [];
+function windowsToolDirs(): string[] {
+  const dirs: string[] = [];
   for (const entry of (process.env.PATH || "").split(delimiter)) {
-    if (entry === "") continue;
-    for (const ext of exts) {
-      const file = join(entry.replace(/^"(.*)"$/, "$1"), `telepty${ext}`);
-      try {
-        if (statSync(file).isFile()) found.push(file);
-      } catch {
-        // not present in this PATH entry
-      }
-    }
+    const dir = entry.replace(/^"(.*)"$/, "$1");
+    if (dir === "" || dirs.includes(dir)) continue;
+    if (["jq.exe", "python.exe", "bash.exe", "git.exe"].some((exe) => existsSync(join(dir, exe)))) dirs.push(dir);
   }
-  assert.deepEqual(found, [], "the ambient PATH already resolves a telepty; it would decide these cases");
+  const shared = dirs.filter((dir) => ["telepty.cmd", "telepty.exe", "telepty.bat", "telepty.com"]
+    .some((name) => existsSync(join(dir, name))));
+  assert.deepEqual(shared, [], "a directory that supplies jq/python/Git also holds a telepty; it would decide these cases");
+  return dirs;
 }
 
 interface Options {
@@ -109,10 +105,8 @@ interface Options {
   readonly telepty?: string;
   /** Where the telepty stub goes, relative to the fixture root; that directory goes FIRST on PATH. */
   readonly teleptyDir?: string;
-  /** Directories to create under the fixture root before init runs (the fake orchestrator install). */
+  /** Directories to create under the fixture root before init runs (a fake orchestrator install). */
   readonly dirs?: readonly string[];
-  /** An explicit TELEPTY override, relative to the fixture root. */
-  readonly override?: string;
   /** Provide the POSIX scaffold tools, for the one case that runs a FULL init. */
   readonly scaffold?: boolean;
 }
@@ -125,7 +119,6 @@ interface Fixture {
   readonly argvLog: string;
   readonly tripwireLog: string;
   readonly path: string;
-  readonly override: string | null;
 }
 
 /** A stub the fixture PATH resolves on every OS. One JS body, two placements. */
@@ -154,7 +147,7 @@ function fixture(options: Options = {}): Fixture {
   writeFileSync(argvLog, "");
   writeFileSync(tripwireLog, "");
   // POSIX step 1 checks these for presence only; win32 RUNS jq.exe/python.exe and Git bash, which
-  // the ambient PATH supplies for real.
+  // the ambient tool directories supply for real.
   if (!WIN) {
     for (const tool of ["jq", "python3", "claude", "cmux"]) writeStub(root, bin, tool, `console.log("${tool} 9.9.9");`);
     if (options.scaffold === true) {
@@ -177,12 +170,8 @@ function fixture(options: Options = {}): Fixture {
 fs.appendFileSync(${JSON.stringify(argvLog)}, JSON.stringify({ argv: process.argv.slice(2), file: __filename }) + "\\n");
 ${options.telepty}`);
   }
-  if (WIN) assertNoAmbientTelepty();
-  const dirs = [...(options.teleptyDir === undefined ? [] : [teleptyDir]), bin,
-    ...(WIN ? [process.env.PATH ?? ""] : [])];
-  return { root, bin, home, ws: join(root, "ws"), argvLog, tripwireLog,
-    path: dirs.filter((d) => d !== "").join(delimiter),
-    override: options.override === undefined ? null : join(root, options.override) };
+  const dirs = [...(options.teleptyDir === undefined ? [] : [teleptyDir]), bin, ...(WIN ? windowsToolDirs() : [])];
+  return { root, bin, home, ws: join(root, "ws"), argvLog, tripwireLog, path: dirs.join(delimiter) };
 }
 
 /**
@@ -204,13 +193,13 @@ function envFor(f: Fixture): NodeJS.ProcessEnv {
   env.TMPDIR = f.root;
   env.TMP = f.root;
   env.TEMP = f.root;
-  if (f.override !== null) env.TELEPTY = f.override;
   return env;
 }
 
-function runInit(f: Fixture, args: readonly string[] = ["--dry-run"]): { status: number | null; stdout: string; stderr: string } {
+function runInit(f: Fixture, args: readonly string[] = ["--dry-run"], extra: NodeJS.ProcessEnv = {}):
+  { status: number | null; stdout: string; stderr: string } {
   const r = spawnSync(process.execPath, [INIT_CLI, "init", "--yes", ...args, "--workspace", f.ws],
-    { cwd: f.root, env: envFor(f), encoding: "utf8", timeout: 600_000, windowsHide: true });
+    { cwd: f.root, env: { ...envFor(f), ...extra }, encoding: "utf8", timeout: 600_000, windowsHide: true });
   assert.ifError(r.error);
   return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
@@ -228,12 +217,15 @@ function assertOneRequirementMessage(out: { stdout: string; stderr: string }, ob
   assert.match(out.stderr, /declares NO dependency on @dmsdc-ai\/aigentry-telepty/, `${label}: the requirement is not explicit`);
   assert.match(out.stderr, /installs, upgrades, starts, stops and restarts nothing/, `${label}: the no-self-repair promise is missing`);
   assert.match(out.stderr, /allow-create-v1 and inject-bound-v1/, `${label}: the required capability is not named`);
-  // The exit-code contract, stated by OPERATION (review R5). init used to promise 78 while an
-  // ordinary missing-CLI dispatch returned 6 after spending the whole registration budget;
-  // dispatch now refuses that condition at once with 78 TELEPTY_CLI_UNAVAILABLE, and this says so.
-  assert.match(out.stderr, /exit 78 — TELEPTY_CLI_UNAVAILABLE when the CLI cannot run at all, BOUND_INJECT_UNSUPPORTED/,
+  // The exit-code contract, stated per door and per OPERATION (review R5, F6), and no wider than
+  // the code: dispatch's 78 TELEPTY_CLI_UNAVAILABLE is a command that cannot be STARTED at
+  // registration (tests/dispatch/telepty-cli-unavailable.test.ts), BOUND_INJECT_UNSUPPORTED is bound
+  // delivery to a busy worker, and boot's exit 3 is its own check of the CLI on PATH
+  // (tests/packaging/orchestrator-boot-wizard.test.mjs, "1293").
+  assert.match(out.stderr, /dispatch exits 78: TELEPTY_CLI_UNAVAILABLE when the telepty command cannot be started at registration, BOUND_INJECT_UNSUPPORTED when bound delivery to a busy worker finds no inject-bound-v1/,
     `${label}: the dispatch refusal codes are not stated by operation`);
-  assert.match(out.stderr, /orchestrator-boot with exit 3 boot preflight UNSUPPORTED/, `${label}: the boot refusal code is missing`);
+  assert.match(out.stderr, /orchestrator-boot exits 3 \(boot preflight UNSUPPORTED\) when its own check of the telepty on PATH fails/,
+    `${label}: the boot refusal code is missing`);
   // The 0.2.0 wording this replaces claimed telepty was a declared dependency installed nested
   // under the package. That claim is false and must never come back.
   assert.doesNotMatch(out.stderr, /declared dependency of this package/, `${label}: the message still claims a dependency`);
@@ -243,6 +235,44 @@ function assertChangedNothing(f: Fixture, label: string): void {
   assert.deepEqual(lines(f.tripwireLog), [], `${label}: init invoked an installer, supervisor or signal`);
   assert.equal(existsSync(f.ws), false, `${label}: --dry-run created the workspace`);
   assert.equal(existsSync(join(f.home, ".aigentry")), false, `${label}: --dry-run created AIGENTRY_HOME`);
+}
+
+/** A sufficient telepty: one info line, no requirement message, no service message, one probe. */
+function assertHealthy(f: Fixture, r: { status: number | null; stdout: string; stderr: string }, label: string): void {
+  assert.equal(r.status, 0, `${label}: exit ${r.status}\n${r.stdout}\n${r.stderr}`);
+  assert.match(r.stdout, /telepty found at .*; its boot-capabilities declare allow-create-v1 and inject-bound-v1/, label);
+  assert.equal(occurrences(`${r.stdout}\n${r.stderr}`, INSTALL_COMMAND), 0,
+    `${label}: a sufficient telepty must not be told to install or upgrade:\n${r.stderr}`);
+  assert.doesNotMatch(r.stderr, /MIGRATION|telepty/i, `${label}: a telepty warning was printed:\n${r.stderr}`);
+  assertChangedNothing(f, label);
+  assert.deepEqual(probes(f), [["boot-capabilities"]], `${label}: the telepty argv is not one capability probe`);
+}
+
+/**
+ * A service definition the platform's own supervisor reads, written under the fixture HOME: a
+ * launchd plist on darwin (`Program`/`ProgramArguments` strings, XML-escaped) and a systemd user
+ * unit on linux (`ExecStart=`, double-quoted when `quoted`). win32 inspects none, so none is
+ * written there. Returns the file, or null on win32.
+ */
+function writeService(f: Fixture, name: string, argv: readonly string[], quoted: boolean): string | null {
+  const xml = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  if (process.platform === "darwin") {
+    const file = join(f.home, "Library/LaunchAgents", `${name}.plist`);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>\n' +
+      `  <key>Label</key><string>${name}</string>\n  <key>ProgramArguments</key>\n  <array>\n` +
+      argv.map((a) => `    <string>${xml(a)}</string>\n`).join("") + "  </array>\n</dict></plist>\n");
+    return file;
+  }
+  if (process.platform === "linux") {
+    const file = join(f.home, ".config/systemd/user", `${name}.service`);
+    mkdirSync(dirname(file), { recursive: true });
+    const words = argv.map((a) => (quoted ? `"${a.replace(/(["\\])/g, "\\$1")}"` : a)).join(" ");
+    writeFileSync(file, `[Unit]\nDescription=${name}\n\n[Service]\nExecStart=${words}\nRestart=always\n\n` +
+      "[Install]\nWantedBy=default.target\n");
+    return file;
+  }
+  return null;
 }
 
 // ── the capability verdicts: one message each, and the probe is a capability read ────────────────
@@ -307,111 +337,180 @@ for (const [label, stub, observed] of CASES) {
 test("1293: a sufficient telepty is accepted silently — no requirement message, still nothing installed", () => {
   const f = fixture({ telepty: PRINT_SEALED });
   try {
-    const r = runInit(f);
-    assert.equal(r.status, 0, `exit ${r.status}\n${r.stdout}\n${r.stderr}`);
-    assert.match(r.stdout, /telepty found at .*; its boot-capabilities declare allow-create-v1 and inject-bound-v1/);
-    assert.equal(occurrences(`${r.stdout}\n${r.stderr}`, INSTALL_COMMAND), 0,
-      "a sufficient telepty must not be told to upgrade");
-    assert.doesNotMatch(r.stderr, /MIGRATION \(aigentry-orchestrator/, "a healthy global telepty is not a migration");
-    assertChangedNothing(f, "sufficient");
-    assert.deepEqual(probes(f), [["boot-capabilities"]]);
+    assertHealthy(f, runInit(f), "sufficient");
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }
 });
 
-// ── the migration door (review R1, MAJOR) ────────────────────────────────────────────────────────
+test("1293 r2: a capability document over the boot door's 4096-byte bound is not measured, and draws no advice", () => {
+  // review F5: boot reads at most 4096 bytes and refuses anything longer as an unfinished probe; init
+  // used to accept the same valid one-line document at 5 KiB and report OK where boot refuses.
+  const f = fixture({ telepty: `console.log(JSON.stringify({ ...${JSON.stringify(SEALED)}, ` +
+    `verbs: [...${JSON.stringify(SEALED.verbs)}, ...Array.from({ length: 400 }, (_, i) => "pad-verb-" + i)] }));` });
+  try {
+    const r = runInit(f);
+    assert.equal(r.status, 0, `exit ${r.status}\n${r.stdout}\n${r.stderr}`);
+    assert.match(r.stderr, /'telepty boot-capabilities' printed more than 4096 bytes, more than the boot door reads/, r.stderr);
+    assert.doesNotMatch(r.stdout, /telepty found at/, "an over-long document was accepted");
+    assert.equal(occurrences(`${r.stdout}\n${r.stderr}`, INSTALL_COMMAND), 0, "an unmeasured probe drew install advice");
+    assertChangedNothing(f, "over-long document");
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+// ── review F1 (MAJOR): a healthy telepty is never told to reinstall, wherever it lives ──────────
 //
-// Both real shapes an install of 0.2.5-0.2.7 could leave behind. In each the telepty is SUFFICIENT,
-// so nothing but its LOCATION can produce the warning — which is exactly the finding: the
-// capability is fine and the file is still about to be deleted by the next install of that tree.
-// Neither shape needs a symlink (win32 would need a privilege for one): the stub is placed INSIDE
-// the tree and that directory goes first on PATH, which is what a real hoisted .bin entry does.
-const SHAPES: readonly (readonly [string, string, string, string])[] = [
-  // label, the orchestrator install that must exist, where telepty sits, the root init must name
-  ["a global install's own nested tree", GLOBAL_INSTALL, NESTED_BIN, GLOBAL_INSTALL],
-  ["a hoisted local install, where telepty is a SIBLING of the orchestrator",
-    `project/node_modules/${ORCHESTRATOR_PACKAGE}`, "project/node_modules/.bin",
-    `project/node_modules/${ORCHESTRATOR_PACKAGE}`],
+// Candidate r1 walked up from the telepty it found and called any telepty beside an orchestrator
+// install "the copy npm installed as this package's dependency". That is a guess about ownership,
+// and it is wrong for the most ordinary layout there is: both packages installed globally into one
+// npm prefix. r2 deletes the guess. The first row FAILS on r1 (MIGRATION warning plus the install
+// command); every row must now print one info line and nothing else. The other two rows are r1's
+// own nested shapes: a SUFFICIENT telepty there is still a working telepty, and init says nothing
+// it cannot measure about what a later install of that tree will do.
+const LAYOUTS: readonly (readonly [string, string, string])[] = [
+  // label, the orchestrator install that exists, where the telepty stub lives
+  ["a global telepty installed separately into the SAME npm prefix as the orchestrator",
+    WIN ? `gp/node_modules/${ORCHESTRATOR_PACKAGE}` : `gp/lib/node_modules/${ORCHESTRATOR_PACKAGE}`,
+    WIN ? `gp/node_modules/${TELEPTY_PACKAGE}/bin` : `gp/lib/node_modules/${TELEPTY_PACKAGE}/bin`],
+  ["a telepty inside a global orchestrator install's own nested tree", GLOBAL_INSTALL, NESTED_BIN],
+  ["a hoisted local install's telepty, a sibling of the orchestrator",
+    `project/node_modules/${ORCHESTRATOR_PACKAGE}`, "project/node_modules/.bin"],
 ];
 
-for (const [label, installDir, teleptyDir, named] of SHAPES) {
-  test(`1293: a telepty inside ${label} is detected as the 0.2.5-0.2.7 nested copy, and nothing is repaired`, () => {
-    const f = fixture({ telepty: PRINT_SEALED, teleptyDir, dirs: [installDir] });
+for (const [label, installDir, teleptyDir] of LAYOUTS) {
+  test(`1293 r2: ${label} is healthy and is not told to reinstall`, () => {
+    const made = fixture({ telepty: PRINT_SEALED, teleptyDir, dirs: [installDir] });
+    let f = made;
     try {
-      const r = runInit(f);
-      assert.equal(r.status, 0, `exit ${r.status}\n${r.stdout}\n${r.stderr}`);
-      assertOneRequirementMessage(r, /MIGRATION \(aigentry-orchestrator 0\.2\.5-0\.2\.7 -> /, label);
-      // The install directory it found, and the file that is about to disappear, both by name.
-      assert.ok(r.stderr.includes(join(f.root, named)), `${label}: the orchestrator install is not named:\n${r.stderr}`);
-      assert.match(r.stderr, /the next 'npm install', 'npm ci' or upgrade of that install deletes /, label);
-      assert.match(r.stderr, /Do this BEFORE you upgrade/, label);
-      // Detect-only: no installer, no supervisor, no signal, no write — and the nested copy's
-      // capability was read exactly once, with the capability verb, never `--version`.
-      assertChangedNothing(f, label);
-      assert.deepEqual(probes(f), [["boot-capabilities"]], label);
-      // It IS sufficient, so the message must not also claim a capability refusal.
-      assert.doesNotMatch(r.stderr, /Its capability was also refused/, `${label}: a capability refusal was invented`);
+      if (!WIN && teleptyDir.startsWith("gp/")) {
+        // POSIX npm links <prefix>/bin/telepty to the package's bin file with a REAL symlink, and
+        // r1 followed it (realpath) into the shared node_modules. Reproduce exactly that.
+        const shims = join(made.root, "gp/bin");
+        mkdirSync(shims, { recursive: true });
+        symlinkSync(`../lib/node_modules/${TELEPTY_PACKAGE}/bin/telepty`, join(shims, "telepty"));
+        f = { ...made, path: [shims, made.bin].join(delimiter) };
+      }
+      // A service definition that starts this same, existing telepty is healthy too: silence.
+      const program = join(made.root, teleptyDir, WIN ? "telepty.cmd" : "telepty");
+      writeService(f, "com.aigentry.telepty", [program, "daemon"], true);
+      assertHealthy(f, runInit(f), label);
     } finally {
-      rmSync(f.root, { recursive: true, force: true });
+      rmSync(made.root, { recursive: true, force: true });
     }
   });
 }
 
-test("1293: a stale TELEPTY override into the deleted nested copy is reported even when PATH is healthy", () => {
-  // The exact post-upgrade state, and the one review R2 names: the PATH CLI is current, while the
-  // value dispatch and every bin/*.sh wrapper actually run still points at the dependency copy
-  // that the upgrade deleted. The override is NEVER probed — there is nothing to probe, and a
-  // capability verdict about it would be invented — so the PATH telepty is read exactly once.
-  const f = fixture({ telepty: PRINT_SEALED, dirs: [GLOBAL_INSTALL], override: `${NESTED_BIN}/telepty` });
+test("1293 r2: TELEPTY is not judged by init — a bare command name with a healthy PATH draws no message", () => {
+  // review F3: r1 tested TELEPTY with fs.existsSync relative to init's cwd, so the valid
+  // TELEPTY=telepty (a bare name dispatch resolves through PATH) was called a missing file and given
+  // install advice. init now asks only about the telepty on PATH; this FAILS on r1.
+  const f = fixture({ telepty: PRINT_SEALED });
   try {
-    const r = runInit(f);
-    assert.equal(r.status, 0, `exit ${r.status}\n${r.stdout}\n${r.stderr}`);
-    assertOneRequirementMessage(r, /The explicit TELEPTY .* names a file that does not exist/, "stale override");
-    assert.match(r.stderr, /satisfies the requirement, but it is not what every door uses/, "stale override");
-    assert.ok(r.stderr.includes(join(f.root, GLOBAL_INSTALL)), `the orchestrator install is not named:\n${r.stderr}`);
-    assert.match(r.stderr, /an install or upgrade of that tree deleted it/, "stale override");
-    assertChangedNothing(f, "stale override");
-    assert.deepEqual(probes(f), [["boot-capabilities"]], "exactly the PATH telepty is probed, exactly once");
+    assertHealthy(f, runInit(f, ["--dry-run"], { TELEPTY: "telepty" }), "bare TELEPTY");
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }
 });
 
-test("1293: a user service definition whose program path is the nested telepty is reported, per platform", () => {
-  // darwin reads ~/Library/LaunchAgents, linux reads ~/.config/systemd/user, and win32 has no such
-  // per-user directory for telepty — so win32 says it inspected none rather than guessing at one.
-  const f = fixture({ telepty: PRINT_SEALED, teleptyDir: NESTED_BIN, dirs: [GLOBAL_INSTALL] });
+// ── review F2 (MAJOR): the service check is independent of the CLI and purely factual ────────────
+test("1293 r2: a service definition whose program path is gone is reported even when the PATH telepty is healthy", () => {
+  // r1 inspected services only when the PATH telepty looked nested or missing, so this — a working
+  // standalone CLI and a launchd/systemd definition still starting the deleted 0.2.7 copy — printed
+  // success. This FAILS on r1. Two definitions per platform: a path with a space and an XML/quote
+  // special character (quoted in the unit, entity-escaped in the plist), and a plain one.
+  const f = fixture({ telepty: PRINT_SEALED });
   try {
-    const target = join(f.root, NESTED_BIN, WIN ? "telepty.cmd" : "telepty");
-    const definition = process.platform === "darwin"
-      ? { file: join(f.home, "Library/LaunchAgents/ai.dmsdc.telepty.plist"), dir: join(f.home, "Library/LaunchAgents"),
-        text: `<plist><dict><key>ProgramArguments</key><array><string>${target}</string><string>daemon</string></array></dict></plist>\n` }
-      : process.platform === "linux"
-        ? { file: join(f.home, ".config/systemd/user/telepty.service"), dir: join(f.home, ".config/systemd/user"),
-          text: `[Service]\nExecStart=${target} daemon\nRestart=always\n` }
-        : null;
-    if (definition !== null) {
-      mkdirSync(dirname(definition.file), { recursive: true });
-      writeFileSync(definition.file, definition.text);
+    const spaced = join(f.root, "old & prefix", "lib/node_modules", ORCHESTRATOR_PACKAGE, "node_modules/.bin/telepty");
+    const plain = join(f.root, NESTED_BIN, "telepty");
+    const quotedFile = writeService(f, "com.aigentry.telepty", [spaced, "daemon"], true);
+    const plainFile = writeService(f, "telepty-plain", [plain, "daemon"], false);
+    const r = runInit(f);
+    assert.equal(r.status, 0, `exit ${r.status}\n${r.stdout}\n${r.stderr}`);
+    // The CLI verdict is its own, unchanged answer.
+    assert.match(r.stdout, /telepty found at .*; its boot-capabilities declare allow-create-v1 and inject-bound-v1/);
+    assert.equal(occurrences(`${r.stdout}\n${r.stderr}`, INSTALL_COMMAND), 0, "a healthy CLI must not be told to install");
+    if (quotedFile === null || plainFile === null) {
+      // win32: a scheduled task is not inspected, and nothing is said about it at runtime.
+      assert.doesNotMatch(r.stderr, SERVICE_WARNING, "win32 claimed a service reading it never made");
+      assert.doesNotMatch(r.stderr, /service definition/i, `win32 printed a service sentence:\n${r.stderr}`);
+    } else {
+      assert.equal(r.stderr.split("\n").filter((l) => SERVICE_WARNING.test(l)).length, 1,
+        `exactly one service warning:\n${r.stderr}`);
+      assert.ok(r.stderr.includes(`${quotedFile}: ${spaced} does not exist`),
+        `the quoted/escaped program path was not read exactly:\n${r.stderr}`);
+      assert.ok(r.stderr.includes(`${plainFile}: ${plain} does not exist`),
+        `the plain program path was not reported:\n${r.stderr}`);
+      assert.match(r.stderr, /Re-run telepty's own installer, 'telepty-install', from the telepty you use now/,
+        "the one instruction is missing");
+      assert.match(r.stderr, /init changed no service/, "the no-effect statement is missing");
+    }
+    // Reading a service definition is a READ: launchctl and systemctl are armed tripwires.
+    assertChangedNothing(f, "stale service");
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("1293 r2: a service definition init cannot read exactly is passed over in silence, without blocking", () => {
+  // review F4: only regular files are read, within a size bound, and only the EFFECTIVE program
+  // field counts. Every entry below names a missing telepty somewhere, so any reading of it beyond
+  // those rules would print the service warning. On win32 nothing is inspected at all.
+  const f = fixture({ telepty: PRINT_SEALED });
+  try {
+    const gone = join(f.root, NESTED_BIN, "telepty");
+    const live = join(f.root, "bin", WIN ? "telepty.cmd" : "telepty");
+    const dir = process.platform === "darwin" ? join(f.home, "Library/LaunchAgents")
+      : process.platform === "linux" ? join(f.home, ".config/systemd/user") : null;
+    if (dir !== null) {
+      const ext = process.platform === "darwin" ? ".plist" : ".service";
+      mkdirSync(dir, { recursive: true });
+      // A FIFO: opening it for a blocking read would wait for a writer forever.
+      const fifo = spawnSync("mkfifo", [join(dir, `fifo${ext}`)], { encoding: "utf8" });
+      assert.equal(fifo.status, 0, `mkfifo failed: ${fifo.stderr}`);
+      // A directory with the definition suffix.
+      mkdirSync(join(dir, `directory${ext}`));
+      // A definition over the 64 KiB bound.
+      const big = writeService(f, "oversized", [gone, "daemon"], false)!;
+      writeFileSync(big, readFileSync(big, "utf8") + `${"#".repeat(80)}\n`.repeat(1024));
+      // The stale path only in a comment; the effective program exists.
+      if (process.platform === "darwin") {
+        writeFileSync(join(dir, `commented${ext}`), `<plist><dict><!-- <key>ProgramArguments</key><array>` +
+          `<string>${gone}</string></array> --><key>ProgramArguments</key><array><string>${live}</string>` +
+          "<string>daemon</string></array></dict></plist>\n");
+      } else {
+        writeFileSync(join(dir, `commented${ext}`), `[Service]\n# ExecStart=${gone} daemon\nExecStart=${live} daemon\n`);
+        // A systemd %specifier and a relative program are not exact paths.
+        writeFileSync(join(dir, `specifier${ext}`), `[Service]\nExecStart=%h/missing/node_modules/.bin/telepty daemon\n`);
+        writeFileSync(join(dir, `relative${ext}`), "[Service]\nExecStart=telepty daemon\n");
+      }
     }
     const r = runInit(f);
     assert.equal(r.status, 0, `exit ${r.status}\n${r.stdout}\n${r.stderr}`);
-    assertOneRequirementMessage(r, /MIGRATION \(aigentry-orchestrator 0\.2\.5-0\.2\.7 -> /, "service target");
-    if (definition === null) {
-      assert.match(r.stderr, /User service definitions are not inspected on this platform; check the program path/,
-        "win32 must say it inspected no service definition");
+    assert.doesNotMatch(r.stderr, SERVICE_WARNING, `an unreadable or inexact definition was reported:\n${r.stderr}`);
+    assertHealthy(f, r, "unreadable services");
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("1293 r2: a telepty init cannot probe through the cmd.exe shim door is reported as unmeasured, per platform", () => {
+  // review F8 / R4: the path carries `!`, which winRun refuses to quote for cmd.exe. win32 must say
+  // the capability was NOT measured and give no install advice; POSIX has no shim door and probes it.
+  const f = fixture({ telepty: PRINT_SEALED, teleptyDir: "tools!bin" });
+  try {
+    const r = runInit(f);
+    if (WIN) {
+      assert.equal(r.status, 0, `exit ${r.status}\n${r.stdout}\n${r.stderr}`);
+      assert.match(r.stderr, /init cannot probe .*tools!bin.* through the cmd\.exe shim door/, r.stderr);
+      assert.match(r.stderr, /so the capability was NOT measured/, r.stderr);
+      assert.equal(occurrences(`${r.stdout}\n${r.stderr}`, INSTALL_COMMAND), 0, "an unmeasured probe drew install advice");
+      assert.deepEqual(probes(f), [], "the refused shim was run anyway");
+      assertChangedNothing(f, "unsupported shim path");
     } else {
-      assert.ok(r.stderr.includes(`1 service definition(s) under ${definition.dir} name a telepty inside an orchestrator install`),
-        `the service definition was not reported:\n${r.stderr}`);
-      assert.ok(r.stderr.includes(`${definition.file} -> ${target}`),
-        `the definition and its program path were not named:\n${r.stderr}`);
-      assert.match(r.stderr, /their next start fails too until the program path names a telepty you installed/,
-        "the consequence for the service is not stated");
+      assertHealthy(f, r, "a `!` in a POSIX path");
     }
-    // Reading a service definition is a READ. Nothing was started, stopped, reloaded or written —
-    // launchctl and systemctl are armed tripwires on the fixture PATH.
-    assertChangedNothing(f, "service target");
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }
@@ -459,6 +558,9 @@ test("1293: all three telepty doors name the same floor and install command, and
   const init = readFileSync(join(REPO, "bin/init/cli.mjs"), "utf8");
   assert.ok(!init.includes("declared dependency of this package"), "init still claims a telepty dependency");
   assert.ok(!init.includes('"node_modules", ".bin", "telepty"'), "init still points at a nested telepty");
+  // r2 (review F1): no ownership guess survives in the init door.
+  assert.ok(!init.includes("orchestratorInstallRoot") && !init.includes("@dmsdc-ai/aigentry-orchestrator\""),
+    "init still guesses which install a telepty belongs to");
   // The documented dispatch contract and the code must name the SAME refusal for a telepty that
   // cannot run (review R5): the usage text and the CLI both say exit 78 TELEPTY_CLI_UNAVAILABLE.
   const dispatch = readFileSync(join(REPO, "src/dispatch/cli.ts"), "utf8");

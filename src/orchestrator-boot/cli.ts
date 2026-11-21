@@ -417,14 +417,14 @@ interface Preflight {
   readonly verdict: PreflightVerdict;
   readonly reason: string;
   /**
-   * #1293 (review R2) — true only when the telepty in use (the CLI on PATH, or the daemon it
-   * started) DEMONSTRABLY does not carry the capability, so an operator upgrade is the answer.
+   * #1293 (review R2, F5) — the advice line, present only when the telepty in use DEMONSTRABLY does
+   * not carry the capability: TELEPTY_REQUIREMENT for the CLI on PATH, TELEPTY_DAEMON_REQUIREMENT
+   * for a daemon whose /api/meta lacks it (the CLI already passed, so it is not told to reinstall).
    * UNSUPPORTED also covers probes that could not be completed at all — a missing bash, a timeout,
-   * a signal, a spawn error — and those say nothing about telepty's version, so they must not
-   * produce install or restart advice. The VERDICT is unchanged in every case; only the second
-   * stderr line is conditional.
+   * a signal, a spawn error — and those say nothing about telepty's version, so they carry none.
+   * The VERDICT is unchanged in every case; only the second stderr line is conditional.
    */
-  readonly requirement?: boolean;
+  readonly requirement?: string;
 }
 
 const PREFLIGHT_TIMEOUT_MS = 5000;
@@ -447,6 +447,10 @@ const TELEPTY_REQUIREMENT =
   `nothing here installs, upgrades, starts, stops or restarts it: install @dmsdc-ai/aigentry-telepty ${TELEPTY_MIN_VERSION} ` +
   `or later yourself with '${TELEPTY_INSTALL_COMMAND}', start or restart the daemon with 'telepty-install' and restart ` +
   "every 'telepty allow' bridge it had started — each keeps the code it was started with — then run this boot again.";
+const TELEPTY_DAEMON_REQUIREMENT =
+  "the telepty CLI on PATH passed its capability check, so it is the DAEMON on this port that is older than this " +
+  "orchestrator needs: restart it from that CLI with 'telepty-install' and restart every 'telepty allow' bridge it " +
+  "had started — each keeps the code it was started with — then run this boot again.";
 
 /** An untrusted value for a diagnostic: JSON-quoted (control characters escaped) and bounded. */
 function shown(v: string): string {
@@ -527,7 +531,7 @@ function bootCapabilitiesRefusal(): { readonly reason: string; readonly confirme
   const code = (r.error as NodeJS.ErrnoException | undefined)?.code;
   if (code === "ENOENT") return inconclusive("no 'bash' for the boot command door");
   // bash's own "command not found" for the fixed `telepty` word.
-  if (r.error === undefined && r.signal === null && r.status === 127) return confirmed("no 'telepty' on PATH (bash exit 127)");
+  if (r.error === undefined && r.signal === null && r.status === 127) return confirmed("no 'telepty' on PATH (bash exit 127, which a telepty that itself exits 127 also gives)");
   if (code === "ETIMEDOUT") return inconclusive(`'telepty boot-capabilities' did not answer within ${PREFLIGHT_TIMEOUT_MS} ms`);
   if (r.error !== undefined) return inconclusive(`'telepty boot-capabilities' could not run (${code ?? "spawn error"})`);
   if (r.signal !== null) return inconclusive(`'telepty boot-capabilities' was terminated by ${r.signal}`);
@@ -603,7 +607,8 @@ function bootPreflight(sid: string): Preflight {
   const target = preflightTarget();
   if ("verdict" in target) return target;
   const capRefusal = bootCapabilitiesRefusal();
-  if (capRefusal !== null) return { verdict: "UNSUPPORTED", reason: capRefusal.reason, requirement: capRefusal.confirmed };
+  if (capRefusal !== null)
+    return { verdict: "UNSUPPORTED", reason: capRefusal.reason, ...(capRefusal.confirmed ? { requirement: TELEPTY_REQUIREMENT } : {}) };
   const token = teleptyAuthToken();
   const meta = localGet(target.port, "/api/meta", token);
   if (meta.status === 401 || meta.status === 403) return { verdict: "CREDENTIAL_REFUSED", reason: `GET /api/meta answered ${meta.status}` };
@@ -615,7 +620,7 @@ function bootPreflight(sid: string): Preflight {
   const missing = REQUIRED_DAEMON_CAPS.filter((cap) => !Array.isArray(caps) || !caps.includes(cap));
   if (missing.length > 0)
     // The DAEMON answered and named its capabilities: this is a measured refusal, not a failed probe.
-    return { verdict: "UNSUPPORTED", reason: `the daemon's /api/meta capabilities do not include ${missing.join(" and ")}`, requirement: true };
+    return { verdict: "UNSUPPORTED", reason: `the daemon's /api/meta capabilities do not include ${missing.join(" and ")}`, requirement: TELEPTY_DAEMON_REQUIREMENT };
   const where = `GET /api/sessions/${sidPathSegment(sid)}`;
   const s = localGet(target.port, `/api/sessions/${sidPathSegment(sid)}`, token);
   if (s.status === 401 || s.status === 403) return { verdict: "CREDENTIAL_REFUSED", reason: `${where} answered ${s.status}` };
@@ -638,15 +643,15 @@ function bootPreflight(sid: string): Preflight {
 
 /**
  * Every verdict but FRESH: exit 3, an EMPTY stdout (the shim cannot exec), one stderr line.
- * #1293 adds ONE further line, and only when the preflight CONFIRMED that the telepty in use is
- * missing or too old (`requirement`). The first line is byte-identical for every verdict, so
- * nothing that reads it changes; an UNSUPPORTED verdict from a probe that could not be completed —
+ * #1293 adds ONE further line, and only when the preflight CONFIRMED that the telepty CLI or its
+ * daemon is missing or too old (`requirement`, which names which of the two). The first line is
+ * byte-identical for every verdict, so nothing that reads it changes; an UNSUPPORTED verdict from a probe that could not be completed —
  * no bash, a timeout, a signal, a spawn error — still prints exactly the one line it always did,
  * because telling that operator to install telepty would be advice about something never measured.
  */
 function refusePreflight(sid: string, p: Preflight): never {
   writeOut(2, `orchestrator-boot.sh: boot preflight ${p.verdict} for '${sid}' — ${p.reason}. Nothing was created, attached, signalled, deleted or exec'd.\n` +
-    (p.requirement === true ? `orchestrator-boot.sh: ${TELEPTY_REQUIREMENT}\n` : ""));
+    (p.requirement !== undefined ? `orchestrator-boot.sh: ${p.requirement}\n` : ""));
   process.exit(3);
 }
 

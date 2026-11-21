@@ -18,17 +18,18 @@
 //      believe are inert (optionalDependencies and peerDependencies are both installed by
 //      npm 7+ by default; a bundled or overridden entry is installed too).
 //   2. package-lock.json — no nested telepty subtree, and no lockfile dependency map that
-//      names it.
+//      names it; and npm-shrinkwrap.json, the lockfile npm PUBLISHES, under the same rule if one
+//      is ever added (r2, review F7).
 // and, because a future maintainer may have a real reason to depend on telepty again, it
 // measures the GUARD that would then apply: a declared range that can resolve below the
 // floor this orchestrator needs is refused by name. The floor is 0.11.1 — the first
 // published telepty declaring `inject-bound-v1`, which src/dispatch/cli.ts requires for
 // bound delivery to a busy worker (CHANGELOG 0.2.6 "Requirements").
 //
-// Node built-ins and two file reads only: no npm, no install, no network, no registry query.
+// Node built-ins and file reads only: no npm, no install, no network, no registry query.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 const REPO = resolve(import.meta.dirname, "../../..");
@@ -171,6 +172,50 @@ test("1293: package-lock.json holds no nested telepty subtree and no lockfile ed
   assert.ok(!read("package-lock.json").includes(TELEPTY_PACKAGE),
     `package-lock.json still mentions ${TELEPTY_PACKAGE} (a resolved url or an integrity line is enough ` +
     "for `npm ci` to install it)");
+});
+
+/**
+ * Every way a lockfile-shaped document (package-lock.json, npm-shrinkwrap.json) can install telepty:
+ * a package path naming it, a dependency edge to it from any entry, or the package name anywhere in
+ * its text (a resolved url or an integrity line). Returns one problem line per violation.
+ */
+export function lockfileTeleptyProblems(text: string): string[] {
+  const lock = JSON.parse(text) as { packages?: Record<string, Record<string, unknown>> };
+  const problems: string[] = [];
+  for (const [key, entry] of Object.entries(lock.packages ?? {})) {
+    if (key.includes("aigentry-telepty")) problems.push(`${key} is a telepty package entry`);
+    for (const section of DEPENDENCY_SECTIONS) {
+      const value = entry[section];
+      if (value === null || typeof value !== "object" || Array.isArray(value)) continue;
+      for (const name of Object.keys(value as Record<string, unknown>)) {
+        if (name === TELEPTY_PACKAGE) problems.push(`${key || "<root>"}.${section}.${name} is an edge to telepty`);
+      }
+    }
+  }
+  if (problems.length === 0 && text.includes(TELEPTY_PACKAGE)) problems.push(`the text mentions ${TELEPTY_PACKAGE}`);
+  return problems;
+}
+
+test("1293 r2: a publishable npm-shrinkwrap.json can carry no telepty either", () => {
+  // review F7. npm publishes a root npm-shrinkwrap.json whatever `files` says, and a consumer's
+  // install obeys it — so it is a second authoritative resolution input beside the manifest, which
+  // could pin a transitive optional or peer edge to an old telepty while package-lock.json stays
+  // clean. This repository has none today; if one is ever added, it must pass the lockfile rule.
+  if (existsSync(join(REPO, "npm-shrinkwrap.json"))) {
+    assert.deepEqual(lockfileTeleptyProblems(read("npm-shrinkwrap.json")), [],
+      "npm-shrinkwrap.json would install a telepty with this package");
+  }
+  // The rule is not vacuous: a shrinkwrap pinning telepty under an otherwise permitted package, by
+  // package path, by edge, or only by its resolved url, is refused each way.
+  const nested = JSON.stringify({ packages: { "": { dependencies: { "cross-spawn": "7.0.6" } },
+    "node_modules/cross-spawn": { optionalDependencies: { [TELEPTY_PACKAGE]: "^0.8.0" } },
+    [`node_modules/${TELEPTY_PACKAGE}`]: { version: "0.8.5", hasInstallScript: true } } });
+  assert.equal(lockfileTeleptyProblems(nested).length, 2, "a nested telepty entry and its optional edge must both be refused");
+  const urlOnly = JSON.stringify({ packages: { "node_modules/x": {
+    resolved: `https://registry.npmjs.org/${TELEPTY_PACKAGE}/-/aigentry-telepty-0.8.5.tgz` } } });
+  assert.equal(lockfileTeleptyProblems(urlOnly).length, 1, "a telepty url alone must be refused");
+  assert.deepEqual(lockfileTeleptyProblems(JSON.stringify({ packages: { "node_modules/cross-spawn": {} } })), [],
+    "a clean shrinkwrap passes");
 });
 
 test("1293 r1: no PRODUCTION dependency in the lockfile runs an install script at all", () => {

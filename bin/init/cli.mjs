@@ -160,23 +160,24 @@ function binFilesUsing(tool) {
 // So the nested copy was never EXECUTED, but its postinstall ran on the HOST at install time and
 // replaced a newer running daemon. The dependency is gone; the requirement is stated here instead.
 //
-// WHY THERE IS A MIGRATION DOOR (review R1). "Never executed by this package" is not "never used".
-// npm hoists a dependency's bins, so an install of 0.2.5-0.2.7 left a real, runnable telepty at
-//   <project>/node_modules/.bin/telepty                      (local install; on PATH inside npm run)
-//   <prefix>/lib/node_modules/@dmsdc-ai/aigentry-orchestrator/node_modules/.bin/telepty  (global)
-// and an operator could put either on PATH, point TELEPTY at it, or run its `telepty-install` so a
-// launchd/systemd service target points inside this package's tree. For such a host 0.2.8 removes
-// the only telepty it had. This door DETECTS that — the telepty in use and, where readable, the
-// service target — and prints ONE instruction. It installs, repairs, starts, stops and restarts
-// nothing, and it writes nothing: every call below is a read or a bounded read-only probe.
+// WHAT THIS CHECK ASKS (r2, review F1/F2). Only questions with an exact answer: is there a telepty
+// on PATH, does its `telepty boot-capabilities` declare what the later doors need, and —
+// independently of that answer — does a readable telepty service definition start a program that
+// does not exist or is not executable. It never guesses who installed or "owns" a telepty, so a
+// healthy telepty is never told to reinstall, wherever it lives. It installs, repairs, starts,
+// stops and restarts nothing, and it writes nothing: every call below is a read or a bounded
+// read-only probe.
 const TELEPTY_MIN_VERSION = "0.11.1";
 const TELEPTY_REQUIRED_VERBS = ["allow-create-v1", "inject-bound-v1"];
 const TELEPTY_INSTALL_COMMAND = "npm i -g @dmsdc-ai/aigentry-telepty@latest";
 const TELEPTY_CAPABILITIES_SCHEMA = "telepty-boot-capabilities-v1";
-const ORCHESTRATOR_PACKAGE = "@dmsdc-ai/aigentry-orchestrator";
 const TELEPTY_PROBE_TIMEOUT_MS = 10_000;
-/** A user service definition names its program by absolute path; these are telepty's four bins. */
+/** The most the boot door reads of the capability document (src/orchestrator-boot/cli.ts, bootDoor maxBuffer). */
+const TELEPTY_PROBE_MAX_BYTES = 4096;
+/** telepty's four bins: a service definition is a telepty one when its program, or the script it runs, is one. */
 const TELEPTY_BIN_NAMES = ["telepty", "telepty-install", "telepty-mcp", "aigentry-telepty"];
+/** A service definition larger than this, or any entry that is not a regular file, is not read. */
+const SERVICE_MAX_BYTES = 64 * 1024;
 
 /** An untrusted value for a diagnostic: JSON (never String(), which an object can make throw), bounded. */
 function shownJson(v) {
@@ -203,100 +204,25 @@ function resolveTelepty() {
 }
 
 /**
- * The aigentry-orchestrator install directory `file` lives inside, or null. Three shapes, one walk
- * over the REAL path (so a node_modules/.bin symlink is followed to the package it points into):
- *   a) under this very package root — a linked checkout or this install's own tree;
- *   b) …/node_modules/@dmsdc-ai/aigentry-orchestrator/node_modules/… — a global install's own tree;
- *   c) …/node_modules/@dmsdc-ai/aigentry-telepty/… beside …/node_modules/@dmsdc-ai/aigentry-orchestrator
- *      — the hoisted local-install shape, where the telepty is NOT below the orchestrator directory.
- * Read-only and total: an unreadable or vanished path answers null rather than throwing.
- */
-function orchestratorInstallRoot(file) {
-  // A target that is gone — the exact post-upgrade state a stale TELEPTY or a stale service program
-  // path is left in — cannot be realpath'd, and it is precisely the case this door exists for. Judge
-  // the path AS WRITTEN then: the orchestrator sibling test below is still a real on-disk read.
-  let real = path.resolve(file);
-  try {
-    real = fs.realpathSync.native(file);
-  } catch {
-    // keep the lexical path
-  }
-  let pkgRoot = PKG_ROOT;
-  try {
-    pkgRoot = fs.realpathSync.native(PKG_ROOT);
-  } catch {
-    // keep the unresolved root; the prefix test below is then simply exact
-  }
-  if (real === pkgRoot || real.startsWith(pkgRoot + path.sep)) return pkgRoot;
-  for (let dir = path.dirname(real); ; dir = path.dirname(dir)) {
-    if (path.basename(dir) === "node_modules") {
-      const sibling = path.join(dir, ...ORCHESTRATOR_PACKAGE.split("/"));
-      try {
-        if (fs.existsSync(sibling)) return sibling;
-      } catch {
-        // an unreadable candidate proves nothing; keep walking
-      }
-    }
-    const up = path.dirname(dir);
-    if (up === dir) return null;
-  }
-}
-
-/**
- * The user service definitions readable HERE whose telepty program path is inside an orchestrator
- * install. Reads only the one per-user directory the platform's own supervisor reads, bounded, and
- * never writes, loads, starts, stops or validates a service. win32 has no such per-user directory
- * for telepty, so it is reported as not inspected instead of guessed at.
- */
-function nestedServiceTargets() {
-  const dir = process.platform === "darwin" ? path.join(os.homedir(), "Library", "LaunchAgents")
-    : process.platform === "linux" ? path.join(os.homedir(), ".config", "systemd", "user") : null;
-  if (dir === null) return { dir: null, hits: [], state: "not-inspected" };
-  let names;
-  try {
-    names = fs.readdirSync(dir);
-  } catch (e) {
-    return { dir, hits: [], state: e && e.code === "ENOENT" ? "missing" : "unreadable" };
-  }
-  const hits = [];
-  for (const name of names.slice(0, 256)) {
-    const file = path.join(dir, name);
-    let text;
-    try {
-      if (fs.statSync(file).size > 256 * 1024) continue;
-      text = fs.readFileSync(file, "utf8");
-    } catch {
-      continue;
-    }
-    for (const candidate of new Set(text.match(/\/[^\s"'<>]+/g) ?? [])) {
-      const base = path.basename(candidate);
-      if (!TELEPTY_BIN_NAMES.includes(base) && !candidate.includes("aigentry-telepty")) continue;
-      const root = orchestratorInstallRoot(candidate);
-      if (root !== null) hits.push({ file, target: candidate, root });
-    }
-  }
-  return { dir, hits, state: "read" };
-}
-
-/**
  * Runs `telepty boot-capabilities` ONCE, read-only: printing the sealed document starts, stops,
  * repairs, upgrades and contacts nothing. The verdict is deliberately THREE-valued (review R2/R4):
  *   ok        — the document satisfies both runtime doors
- *   refused   — the telepty in use demonstrably does not carry the capability (operator upgrade)
+ *   refused   — the telepty in use answered, and its answer does not report the capabilities
  *   unprobed  — the probe itself could not be completed, which says nothing about telepty and
  *               must therefore never produce upgrade or install advice
  * The document is validated with EXACTLY the rule the boot door applies (review R3,
- * src/orchestrator-boot/cli.ts:497-524) plus dispatch's verb, so init can never report OK where
- * one of those doors refuses. No untrusted field is coerced with String() (review R8).
+ * src/orchestrator-boot/cli.ts:497-524), within the same 4096-byte bound (review F5), plus
+ * dispatch's verb. No untrusted field is coerced with String() (review R8).
  */
 function teleptyCapabilityVerdict(file) {
   let r;
   if (process.platform === "win32") {
     r = winRun(file, ["boot-capabilities"]);
     if (r.unsupportedPath === true)
-      return { kind: "unprobed", why: `init cannot probe ${file}: its path carries a character ` +
-        "(a quote, %, ^, &, |, <, > or !) that cannot be quoted safely for the cmd.exe shim door, " +
-        "so the capability was NOT measured — run 'telepty boot-capabilities' yourself to read it" };
+      return { kind: "unprobed", why: `init cannot probe ${file} through the cmd.exe shim door: its path ` +
+        "carries a character (a quote, %, ^, &, |, <, > or !) that cannot be quoted safely, or SystemRoot " +
+        "is not an absolute drive path, so the capability was NOT measured — run 'telepty boot-capabilities' " +
+        "yourself to read it" };
   } else {
     // The file RESOLVED above, not the bare word again: one lookup, then exactly what was found, so
     // a PATH change between the two reads cannot make the message describe a different executable.
@@ -304,6 +230,9 @@ function teleptyCapabilityVerdict(file) {
   }
   if (r.error !== undefined && r.error !== null)
     return { kind: "unprobed", why: `'telepty boot-capabilities' could not run (${r.error.code || "spawn error"})` };
+  if (Buffer.byteLength(r.stdout || "") > TELEPTY_PROBE_MAX_BYTES)
+    return { kind: "unprobed", why: `'telepty boot-capabilities' printed more than ${TELEPTY_PROBE_MAX_BYTES} ` +
+      "bytes, more than the boot door reads" };
   if (r.status === null)
     return { kind: "unprobed", why: `'telepty boot-capabilities' did not finish (${r.signal || "no exit status"})` };
   if (r.status !== 0) return { kind: "refused", why: `'telepty boot-capabilities' exited ${r.status}` };
@@ -335,122 +264,179 @@ function teleptyCapabilityVerdict(file) {
 }
 
 /**
- * The ONE message, assembled from what was observed. It states the observation, the migration step
- * when a nested copy is in use, the capability required, the first published version carrying it,
- * the single command the OPERATOR runs, and what each later door does until then. The install
- * command and the version floor appear exactly once each, and nothing here installs or restarts.
+ * The ONE message for a missing or insufficient CLI: the observation, the capability required, the
+ * first published version carrying it, the single command the OPERATOR runs, and what each later
+ * door does until then (review F6: stated per door and per operation, never wider than the code).
  */
-function teleptyMessage(observed, migration) {
-  return `${observed}${migration === null ? "" : ` ${migration}`} aigentry-orchestrator declares NO ` +
-    "dependency on @dmsdc-ai/aigentry-telepty, so no copy of it is installed with this package: it " +
-    "drives the telepty that PATH (or an explicit TELEPTY) names. It needs a telepty whose 'telepty " +
-    `boot-capabilities' declares ${TELEPTY_REQUIRED_VERBS.join(" and ")} with nondeleting-v1 viewer ` +
-    "detach — orchestrator-boot creates with allow-create-v1 and dispatch's bound delivery to a busy " +
-    `worker uses inject-bound-v1. That is @dmsdc-ai/aigentry-telepty ${TELEPTY_MIN_VERSION} or later ` +
-    `(${TELEPTY_MIN_VERSION} is the first published version declaring inject-bound-v1). init detects ` +
-    "only: it installs, upgrades, starts, stops and restarts nothing. Install or upgrade telepty " +
-    `under your own control with '${TELEPTY_INSTALL_COMMAND}', then run 'telepty-install' yourself if ` +
-    "no daemon is listening. Until a sufficient telepty is in use, dispatch refuses by name with exit " +
-    "78 — TELEPTY_CLI_UNAVAILABLE when the CLI cannot run at all, BOUND_INJECT_UNSUPPORTED when it " +
-    "runs but does not carry inject-bound-v1 — and orchestrator-boot with exit 3 boot preflight " +
-    "UNSUPPORTED. No telepty, daemon or bridge is touched by this check.";
-}
-
-/** What the readable service definitions say, as one sentence. Always a sentence, never a guess. */
-function serviceNote() {
-  const services = nestedServiceTargets();
-  if (services.state === "not-inspected")
-    return " User service definitions are not inspected on this platform; check the program path of " +
-      "your telepty service yourself.";
-  if (services.state === "missing")
-    return ` No user service directory ${services.dir} exists, so no service definition here names a telepty.`;
-  if (services.state === "unreadable")
-    return ` The user service directory ${services.dir} is not readable here, so check the program ` +
-      "path of your telepty service yourself.";
-  if (services.hits.length === 0)
-    return ` No service definition under ${services.dir} names a telepty inside an orchestrator install.`;
-  return ` ${services.hits.length} service definition(s) under ${services.dir} name a telepty inside ` +
-    `an orchestrator install (${services.hits.map((h) => `${h.file} -> ${h.target}`).join("; ")}), so ` +
-    "their next start fails too until the program path names a telepty you installed.";
+function teleptyMessage(observed) {
+  return `${observed} aigentry-orchestrator declares NO dependency on @dmsdc-ai/aigentry-telepty, so no ` +
+    "copy of it is installed with this package: it runs the telepty that PATH (or an explicit TELEPTY) " +
+    `names. That telepty's 'telepty boot-capabilities' must declare ${TELEPTY_REQUIRED_VERBS.join(" and ")} ` +
+    `with nondeleting-v1 viewer detach: @dmsdc-ai/aigentry-telepty ${TELEPTY_MIN_VERSION} or later ` +
+    `(${TELEPTY_MIN_VERSION} is the first published version declaring inject-bound-v1). init detects only: ` +
+    "it installs, upgrades, starts, stops and restarts nothing. Install or upgrade telepty under your own " +
+    `control with '${TELEPTY_INSTALL_COMMAND}', then run 'telepty-install' yourself if no daemon is ` +
+    "listening. Until then orchestrator-boot exits 3 (boot preflight UNSUPPORTED) when its own check of " +
+    "the telepty on PATH fails — missing, or without allow-create-v1 and nondeleting-v1 viewer detach — and " +
+    "dispatch exits 78: TELEPTY_CLI_UNAVAILABLE when the telepty command cannot be started at registration, " +
+    "BOUND_INJECT_UNSUPPORTED when bound delivery to a busy worker finds no inject-bound-v1.";
 }
 
 /**
- * What is wrong with an explicit TELEPTY, or null. The override is NOT probed and never replaces
- * the PATH reading: it is a different door's seam — dispatch, the tracker, the reconciler and every
- * `bin/*.sh` wrapper run `${TELEPTY:-telepty}` while the boot door execs the fixed `telepty` word —
- * so a run can have a healthy PATH telepty and a stale override at the same time, which is exactly
- * what an upgrade leaves behind when the override pointed into this package's own node_modules.
- * Reported as an observation, never as a verdict about the capability it never measured.
+ * Exactly the service definitions read (review F2), and nothing else: darwin — every `*.plist`
+ * directly in ~/Library/LaunchAgents; linux — every `*.service` directly in
+ * $XDG_CONFIG_HOME/systemd/user (default ~/.config/systemd/user) and in /etc/systemd/system. Any
+ * other platform (win32: a scheduled task) is not inspected, and nothing is printed about it.
  */
-function teleptyOverrideProblem() {
-  const value = process.env.TELEPTY;
-  if (typeof value !== "string" || value === "") return null;
-  const seam = `The explicit TELEPTY ${value} — which dispatch, the tracker, the reconciler and ` +
-    "every shipped bin/*.sh wrapper run in preference to PATH —";
-  let exists = false;
-  try {
-    exists = fs.existsSync(value);
-  } catch {
-    exists = false;
-  }
-  const root = orchestratorInstallRoot(value);
-  if (!exists)
-    return `${seam} names a file that does not exist${root === null ? "" :
-      `, inside an aigentry-orchestrator install at ${root}: that was the copy npm installed as this ` +
-      "package's dependency, and an install or upgrade of that tree deleted it"}.`;
-  if (root !== null)
-    return `${seam} resolves inside an aigentry-orchestrator install at ${root}, i.e. it is the copy ` +
-      "npm installed as this package's dependency.";
-  return null;
+function serviceDirs() {
+  if (process.platform === "darwin") return [[path.join(os.homedir(), "Library", "LaunchAgents"), ".plist"]];
+  if (process.platform !== "linux") return [];
+  const xdg = process.env.XDG_CONFIG_HOME;
+  const config = typeof xdg === "string" && path.isAbsolute(xdg) ? xdg : path.join(os.homedir(), ".config");
+  return [[path.join(config, "systemd", "user"), ".service"], ["/etc/systemd/system", ".service"]];
 }
 
-/** Step 1's whole telepty handling: exactly one info or one warn, and no effect of any kind. */
+/** A regular file's text, or null. O_NONBLOCK + fstat: a FIFO or device is never read (review F4). */
+function readRegularFile(file) {
+  let fd;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0));
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size > SERVICE_MAX_BYTES) return null;
+    const buf = Buffer.alloc(SERVICE_MAX_BYTES + 1);
+    let n = 0;
+    for (let got = 1; got > 0 && n < buf.length; n += got) got = fs.readSync(fd, buf, n, buf.length - n, n);
+    return n > SERVICE_MAX_BYTES ? null : buf.toString("utf8", 0, n);
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+/** launchd: `Program`, else ProgramArguments[0], then ProgramArguments[1] — XML entities decoded, comments dropped. */
+function plistArgv(text) {
+  const xml = (s) => s.replace(/&(#x[0-9a-f]+|#[0-9]+|amp|lt|gt|quot|apos);/gi, (_, e) => e[0] !== "#"
+    ? { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" }[e.toLowerCase()]
+    : String.fromCodePoint(e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : Number(e.slice(1))));
+  const body = text.replace(/<!--[\s\S]*?-->/g, "");
+  const program = /<key>\s*Program\s*<\/key>\s*<string>([^<]*)<\/string>/.exec(body);
+  const array = /<key>\s*ProgramArguments\s*<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(body);
+  const args = array === null ? [] : [...array[1].matchAll(/<string>([^<]*)<\/string>/g)].map((m) => xml(m[1]));
+  return program === null ? args : [xml(program[1]), ...args.slice(1)];
+}
+
+/**
+ * systemd: the first ExecStart= of [Service], split into words the way systemd splits them (double
+ * or single quotes, a backslash before a quote, a space or a backslash). Comments are skipped. Any
+ * other escape answers [] — not read exactly, so nothing is said about it.
+ */
+function unitArgv(text) {
+  let section = "";
+  let exec = null;
+  for (const line of text.replace(/\\\r?\n/g, " ").split(/\r?\n/)) {
+    const t = line.trim();
+    if (t === "" || t[0] === "#" || t[0] === ";") continue;
+    if (t[0] === "[") section = t;
+    const m = section === "[Service]" ? /^ExecStart\s*=\s*(.*)$/.exec(t) : null;
+    if (m !== null) exec = m[1] === "" ? null : (exec ?? m[1]);
+  }
+  if (exec === null) return [];
+  const prefix = /^[-@:+!]*/.exec(exec)[0];
+  const words = [];
+  for (let i = prefix.length; i < exec.length;) {
+    if (/\s/.test(exec[i])) { i += 1; continue; }
+    const quote = exec[i] === '"' || exec[i] === "'" ? exec[i++] : null;
+    let word = "";
+    for (; i < exec.length; i += 1) {
+      const c = exec[i];
+      if (quote !== null ? c === quote : /\s/.test(c)) { i += 1; break; }
+      if (c === "\\") {
+        if (!/["'\\ ]/.test(exec[i + 1] ?? "")) return [];
+        i += 1;
+      }
+      word += exec[i];
+    }
+    words.push(word);
+  }
+  // `@` makes the second word argv[0] rather than an argument.
+  return prefix.includes("@") ? [words[0], ...words.slice(2)] : words;
+}
+
+/**
+ * What is objectively wrong with one telepty service definition, or null. A definition is a
+ * telepty one when its program, or the script its program runs, is named like a telepty bin or lies
+ * in an aigentry-telepty package directory. Reported ONLY when that program does not exist or is
+ * not an executable regular file, or that script does not exist. A relative path, a %specifier or a
+ * $VARIABLE is not exact, and an unreadable path (EACCES, …) proves nothing: both answer null.
+ */
+function serviceProblem([program, operand]) {
+  const exact = (p) => typeof p === "string" && path.isAbsolute(p) && !/[%$]/.test(p);
+  const telepty = (p) => exact(p) && (TELEPTY_BIN_NAMES.includes(path.basename(p).replace(/\.[cm]?js$/i, "")) ||
+    p.split(path.sep).includes("aigentry-telepty"));
+  if (!exact(program) || !(telepty(program) || telepty(operand))) return null;
+  const gone = (p) => {
+    try {
+      fs.statSync(p);
+      return false;
+    } catch (e) {
+      return e.code === "ENOENT" || e.code === "ENOTDIR";
+    }
+  };
+  if (gone(program)) return `${program} does not exist`;
+  try {
+    if (!fs.statSync(program).isFile()) return `${program} is not an executable file`;
+    fs.accessSync(program, fs.constants.X_OK);
+  } catch (e) {
+    return e.code === "EACCES" ? `${program} is not an executable file` : null;
+  }
+  return !telepty(program) && telepty(operand) && gone(operand) ? `${operand} does not exist` : null;
+}
+
+/** Every read telepty service definition whose program is missing or not executable, as "file: problem". */
+function staleTeleptyServices() {
+  const found = [];
+  for (const [dir, suffix] of serviceDirs()) {
+    let names;
+    try {
+      names = fs.readdirSync(dir).filter((n) => n.endsWith(suffix)).sort().slice(0, 256);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      const file = path.join(dir, name);
+      const text = readRegularFile(file);
+      let problem = null;
+      try {
+        problem = text === null ? null : serviceProblem(suffix === ".plist" ? plistArgv(text) : unitArgv(text));
+      } catch {
+        problem = null;
+      }
+      if (problem !== null) found.push(`${file}: ${problem}`);
+    }
+  }
+  return found;
+}
+
+/** Step 1's telepty handling: the CLI and the service definitions, read independently. No effect of any kind. */
 function teleptyCheck() {
   const file = resolveTelepty();
-  const problem = teleptyOverrideProblem();
-  const extra = problem === null ? "" : ` ${problem}`;
-  const migrate = "Install a telepty of your own, make PATH (and any TELEPTY or service program " +
-    "path) name it, and confirm with 'command -v telepty' and 'telepty boot-capabilities'.";
-  if (file === null) {
-    warn(teleptyMessage(
-      `telepty is not on PATH.${extra}${serviceNote()}`,
-      "If you are upgrading from aigentry-orchestrator 0.2.5-0.2.7 and the only telepty you had was " +
-      "the copy npm installed as this package's dependency, removing that dependency removed it: " +
-      `nothing here can give it back, and nothing here will try. ${migrate}`));
-    return;
-  }
-  const root = orchestratorInstallRoot(file);
-  const verdict = teleptyCapabilityVerdict(file);
-  if (root !== null) {
-    warn(teleptyMessage(
-      `MIGRATION (aigentry-orchestrator 0.2.5-0.2.7 -> ${PKG.version}): the telepty on PATH (${file}) ` +
-      `resolves inside an aigentry-orchestrator install at ${root}, i.e. it is the copy npm installed ` +
-      `as this package's dependency.${extra}${serviceNote()}`,
-      "0.2.8 no longer declares that dependency, so the next 'npm install', 'npm ci' or upgrade of " +
-      `that install deletes ${file} and every service target that points at it. Do this BEFORE you ` +
-      `upgrade: ${migrate}${verdict.kind === "ok" ? "" : ` Its capability was also refused: ${verdict.why}.`}`));
-    return;
-  }
-  if (verdict.kind === "unprobed") {
+  const verdict = file === null ? null : teleptyCapabilityVerdict(file);
+  if (verdict === null) warn(teleptyMessage("telepty is not on PATH."));
+  else if (verdict.kind === "refused")
+    warn(teleptyMessage(`The telepty on PATH (${file}) does not report the required capabilities: ${verdict.why}.`));
+  else if (verdict.kind === "unprobed")
     // The probe, not telepty, is what failed. Report the observation and stop — an upgrade or an
     // install command here would be advice about a component this run never measured (review R2/R4).
     warn(`${verdict.why}. init detects only: it installs, upgrades, starts, stops and restarts ` +
-      `nothing, and it did not decide anything about the telepty on PATH (${file}).${extra}`);
-    return;
-  }
-  if (verdict.kind === "refused") {
-    warn(teleptyMessage(`The telepty on PATH (${file}) is not sufficient: ${verdict.why}.${extra}`, null));
-    return;
-  }
-  if (problem !== null) {
-    // The capability on PATH is fine, so this is purely a migration of the override.
-    warn(teleptyMessage(
-      `The telepty on PATH (${file}) satisfies the requirement, but it is not what every door uses. ` +
-      `${problem}${serviceNote()}`,
-      `0.2.8 no longer declares the telepty dependency, so that path is not coming back. ${migrate}`));
-    return;
-  }
-  info(`telepty found at ${file}; its boot-capabilities declare ${TELEPTY_REQUIRED_VERBS.join(" and ")}`);
+      `nothing, and it did not decide anything about the telepty on PATH (${file}).`);
+  else info(`telepty found at ${file}; its boot-capabilities declare ${TELEPTY_REQUIRED_VERBS.join(" and ")}`);
+  const stale = staleTeleptyServices();
+  if (stale.length > 0)
+    warn("A telepty service definition starts a program that does not exist or is not executable, so " +
+      `the service fails at its next ` +
+      `start: ${stale.join("; ")}. Re-run telepty's own installer, 'telepty-install', from the telepty you ` +
+      "use now so the definition names a program that exists. init changed no service.");
 }
 
 function parseArgs(argv) {
@@ -536,11 +522,11 @@ function dependencyChecks() {
     );
   }
 
-  // #1293: ONE telepty message per run, from the capability the runtime doors read and from where
-  // the telepty in use lives. The 0.2.0 wording this replaces claimed telepty was "a declared
-  // dependency of this package, installed nested under it at …/node_modules/.bin/telepty" — both
-  // halves became false when the dependency was removed, and the nested copy it pointed at is now
-  // the thing an upgrading operator has to replace.
+  // #1293: at most one CLI message per run, from the capability the runtime doors read, and at most
+  // one service message, from the program path a readable telepty service definition names. The
+  // 0.2.0 wording this replaces claimed telepty was "a declared dependency of this package, installed
+  // nested under it at …/node_modules/.bin/telepty" — both halves became false when the dependency
+  // was removed.
   teleptyCheck();
 
   if (has("claude")) info("claude CLI found");
