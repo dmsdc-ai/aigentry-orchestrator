@@ -483,11 +483,32 @@ _wh_cmux_focus_option_supported() {
 # from open-session.sh:open_in_terminal()'s cmux branch (#608 Phase 1, ADR §7).
 # Exit contract (handle emitted ⇒ pane ready; no half-spawned surface on failure):
 #   0  → ref printed on stdout (surface can accept send-key).
-#   2  → new-workspace produced no ref (spawn failed), or background creation was opted into
-#        and this cmux cannot be shown to support it; nothing to clean up.
+#   2  → new-workspace produced no ref (spawn failed); or AIGENTRY_WORKER_AUTO_RESTART or
+#        AIGENTRY_CMUX_BACKGROUND_SPAWN held a value other than 0/1; or background creation
+#        was opted into and this cmux cannot be shown to support it. Nothing to clean up.
 #   3  → ready-gate timed out; the workspace is closed, NO ref emitted.
 # CMUX seam: injectable cmux binary so the readiness gate is hermetically testable
 # (BUG-A); defaults to the real `cmux` in production.
+#
+# AIGENTRY_WORKER_AUTO_RESTART (per launch; default 1 = unchanged behaviour)
+#   1 or unset → the child command keeps `telepty allow … --auto-restart`, so the bridge
+#                restarts the wrapped CLI after it exits.
+#   0          → the flag is omitted for THIS launch: one child launch, no automatic
+#                restart after it exits. The workspace itself is unaffected.
+#   anything else → refused with exit 2 BEFORE anything is spawned. An unreadable
+#                   retry budget is never silently treated as the default.
+#
+#   SCOPE: this setting is read HERE and therefore applies to the cmux adapter ONLY,
+#   despite its general name. Every other backend in this file keeps its existing launch
+#   command, and those commands are NOT all alike — so "they all pass --auto-restart" would
+#   be wrong: the tmux, aterm, wezterm and iTerm arms wrap the CLI in
+#   `telepty allow … --auto-restart`, whereas _wh_headless_open and the no-tmux branch of
+#   _wh_fallback_spawn exec the CLI under `telepty spawn --id … --` and never pass that flag
+#   at all (for those two there is no flag here for this setting to remove). The opt-in
+#   legacy rollback arm (src/session/open-session/legacy-spawn.ts, reached with
+#   AIGENTRY_WH_LEGACY_SPAWN=1) carries a verbatim copy of the pre-seam cmux command line,
+#   `--auto-restart` included. Setting this to 0 for any backend other than cmux has NO
+#   effect and is not an error.
 #
 # AIGENTRY_CMUX_BACKGROUND_SPAWN (per launch; default 0 = unchanged behaviour)
 #   0, or unset → EXACTLY what this adapter has always done, on every cmux version: the same
@@ -519,7 +540,14 @@ _wh_cmux_open() {
   # word-split a cwd containing a space. cli_cmd stays unquoted deliberately: it is a
   # COMMAND LINE (`claude --model … --effort …`), not a value, and must word-split.
   local CMUX_BIN="${CMUX:-cmux}"
-  local out ref q_cwd q_sid child background=0 sup=0
+  local out ref q_cwd q_sid child restart_arg background=0 sup=0
+  # Per-launch retry budget; 0 permits one child launch without automatic retries.
+  # Refused before the spawn, so an invalid value never opens a workspace.
+  case "${AIGENTRY_WORKER_AUTO_RESTART-1}" in
+    1) restart_arg=' --auto-restart';;
+    0) restart_arg='';;
+    *) echo 'ERR AIGENTRY_WORKER_AUTO_RESTART must be 0 or 1' >&2; return 2;;
+  esac
   # Background creation is OPT-IN. Resolved before any work, so an unreadable value cannot
   # half-open anything; 0/unset falls through to the original single call below.
   case "${AIGENTRY_CMUX_BACKGROUND_SPAWN-0}" in
@@ -529,8 +557,9 @@ _wh_cmux_open() {
   esac
   printf -v q_cwd '%q' "$cwd"; printf -v q_sid '%q' "$sid"
   # One child command line, used by both arms, so the two argvs differ in nothing but the
-  # opted-in `--focus false`. Byte-for-byte the string the single call used to build inline.
-  child="bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd' _ $q_cwd $q_sid"
+  # opted-in `--focus false`. With AIGENTRY_WORKER_AUTO_RESTART unset or 1, $restart_arg is
+  # ' --auto-restart' and this is byte-for-byte the string the single call used to build.
+  child="bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\"$restart_arg $cli_cmd' _ $q_cwd $q_sid"
   if [ "$background" = 1 ]; then
     _wh_cmux_focus_option_supported "$CMUX_BIN" || sup=$?
     case "$sup" in

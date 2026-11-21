@@ -286,4 +286,102 @@ rc=0; T23_CMUX_HELP=described-switch AIGENTRY_CMUX_BACKGROUND_SPAWN=1 open_focus
 grep -q -- '^new-workspace' "$FOCUS_LOG" \
   && { echo 'FAIL: a bare --focus switch was handed --focus false'; cat "$FOCUS_LOG"; exit 1; }
 
+# ── AIGENTRY_WORKER_AUTO_RESTART: the per-launch retry budget of the cmux adapter ──
+# Executes the GENERATED child command against an argv-only telepty stub: nothing starts a
+# real CLI, a daemon or a bridge. The stub records the argv `telepty allow` was handed and
+# the cwd it ran in, which is the whole contract under test — the flag is present by
+# default, absent at 0, and an unreadable value refuses before cmux is called at all.
+cat > "$STUB_BIN/telepty" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$T_TMP/allow-argv"
+printf '%s\n' "$PWD" > "$T_TMP/allow-cwd"
+EOF
+cat > "$STUB_BIN/cmux-open" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "$T_TMP/open-calls"
+case "$1" in
+  # Serves block J only: it is the one case that opts into background creation through
+  # this stub. Every other case here leaves that setting unset, so they never probe.
+  --help) echo '  new-workspace [--focus <true|false>] [--cwd <dir>] [--command <cmd>]';;
+  new-workspace)
+    shift
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = --command ]; then bash -c "$2" || exit; break; fi
+      shift
+    done
+    echo 'OK workspace:23';;
+  list-workspaces) echo 'workspace:23 fixture';;
+  surface-health) echo 'type=terminal';;
+  read-screen) [ "${T23_NOT_READY:-0}" = 1 ] || echo 'fixture prompt';;
+  *) :;;
+esac
+EOF
+chmod +x "$STUB_BIN/telepty" "$STUB_BIN/cmux-open"
+# A cwd containing a space: the %q quoting of --command must survive being typed in.
+mkdir -p "$T_TMP/cwd with space"
+open_fixture() (
+  export CMUX="$STUB_BIN/cmux-open" CMUX_READY_TIMEOUT_MS=1 CMUX_READY_INTERVAL_MS=1
+  . "$REPO_ROOT/bin/lib/workspace-host.sh"
+  _wh_cmux_open 'fixture-t23' "$T_TMP/cwd with space" 'fixture-cli --fixture-only'
+)
+for setting in unset 1 0; do
+  if [ "$setting" = unset ]; then unset AIGENTRY_WORKER_AUTO_RESTART;
+  else export AIGENTRY_WORKER_AUTO_RESTART="$setting"; fi
+  [ "$(open_fixture)" = workspace:23 ] \
+    || { echo "FAIL: open result for AIGENTRY_WORKER_AUTO_RESTART=$setting"; exit 1; }
+  printf '%s\n' allow --id fixture-t23 > "$T_TMP/expected-argv"
+  [ "$setting" = 0 ] || printf '%s\n' --auto-restart >> "$T_TMP/expected-argv"
+  printf '%s\n' fixture-cli --fixture-only >> "$T_TMP/expected-argv"
+  cmp "$T_TMP/expected-argv" "$T_TMP/allow-argv" \
+    || { echo "FAIL: restart argv for setting=$setting"; exit 1; }
+  [ "$(cat "$T_TMP/allow-cwd")" = "$T_TMP/cwd with space" ] \
+    || { echo "FAIL: the child did not inherit the quoted cwd (setting=$setting)"; exit 1; }
+done
+# An empty or unrecognized value is refused, and refused BEFORE cmux is invoked.
+for setting in '' invalid 2 true; do
+  : > "$T_TMP/open-calls"
+  export AIGENTRY_WORKER_AUTO_RESTART="$setting"
+  rc=0; open_fixture > "$T_TMP/invalid.out" 2> "$T_TMP/invalid.err" || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL: value '$setting' did not refuse with exit 2 (rc=$rc)"; exit 1; }
+  [ ! -s "$T_TMP/open-calls" ] || { echo "FAIL: value '$setting' reached cmux before refusing"; exit 1; }
+  [ ! -s "$T_TMP/invalid.out" ] || { echo "FAIL: value '$setting' emitted a ref"; exit 1; }
+  grep -q AIGENTRY_WORKER_AUTO_RESTART "$T_TMP/invalid.err" \
+    || { echo "FAIL: value '$setting' did not name the setting on stderr"; exit 1; }
+done
+# The readiness barrier is unchanged by the new setting: still exit 3, still no ref, still
+# a closed workspace.
+export AIGENTRY_WORKER_AUTO_RESTART=0 T23_NOT_READY=1
+: > "$T_TMP/open-calls"
+rc=0; open_fixture > "$T_TMP/not-ready.out" 2> "$T_TMP/not-ready.err" || rc=$?
+[ "$rc" = 3 ] && [ ! -s "$T_TMP/not-ready.out" ] && grep -qx close-workspace "$T_TMP/open-calls" \
+  || { echo 'FAIL: readiness refusal changed'; exit 1; }
+unset AIGENTRY_WORKER_AUTO_RESTART T23_NOT_READY
+
+# J: BOTH settings at once — background creation opted in AND automatic restart off for this
+# launch. They are independent: the argv gains `--focus false` and the child loses
+# ` --auto-restart`, and nothing else moves. Checked through both stubs: the focus stub
+# records the exact new-workspace argv, and the restart stub executes the generated child, so
+# the argv `telepty allow` really receives is checked too.
+: > "$FOCUS_LOG"
+[ "$(AIGENTRY_CMUX_BACKGROUND_SPAWN=1 AIGENTRY_WORKER_AUTO_RESTART=0 open_focus_fixture)" = workspace:56 ] \
+  || { echo 'FAIL: both settings at once did not emit the ref'; cat "$FOCUS_LOG"; exit 1; }
+expected_both_argv="new-workspace --focus false --cwd $T_TMP/focus-cwd --command bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\" fixture-cli --fixture-only' _ $t23_q_cwd fixture-t23-focus"
+[ "$(grep -- '^new-workspace ' "$FOCUS_LOG" | head -1)" = "$expected_both_argv" ] \
+  || { echo "FAIL: the combined argv is wrong
+want: $expected_both_argv
+got : $(grep -- '^new-workspace ' "$FOCUS_LOG" | head -1)"; exit 1; }
+[ "$(grep -n -- '^--help$' "$FOCUS_LOG" | head -1 | cut -d: -f1)" -lt \
+  "$(grep -n -- '^new-workspace ' "$FOCUS_LOG" | head -1 | cut -d: -f1)" ] \
+  || { echo 'FAIL: with both settings the support probe did not run before the spawn'; cat "$FOCUS_LOG"; exit 1; }
+: > "$T_TMP/open-calls"; rm -f "$T_TMP/allow-argv" "$T_TMP/allow-cwd"
+[ "$(AIGENTRY_CMUX_BACKGROUND_SPAWN=1 AIGENTRY_WORKER_AUTO_RESTART=0 open_fixture)" = workspace:23 ] \
+  || { echo 'FAIL: both settings at once (executed child) did not emit the ref'; cat "$T_TMP/open-calls"; exit 1; }
+[ "$(head -2 "$T_TMP/open-calls" | tr '\n' ' ')" = '--help new-workspace ' ] \
+  || { echo 'FAIL: with both settings the stub did not see the probe and then the spawn'; cat "$T_TMP/open-calls"; exit 1; }
+printf '%s\n' allow --id fixture-t23 fixture-cli --fixture-only > "$T_TMP/expected-argv"
+cmp "$T_TMP/expected-argv" "$T_TMP/allow-argv" \
+  || { echo 'FAIL: with both settings telepty allow still got --auto-restart (or another argv change)'; exit 1; }
+[ "$(cat "$T_TMP/allow-cwd")" = "$T_TMP/cwd with space" ] \
+  || { echo 'FAIL: with both settings the child did not inherit the quoted cwd'; exit 1; }
+
 echo "T23 PASS"

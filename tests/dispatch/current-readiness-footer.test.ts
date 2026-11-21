@@ -30,19 +30,22 @@
 // `codex_current_composer` stopped recognizing it, an idle and EMPTY 0.170.0 composer
 // could never read as empty, and no dispatch could be delivered to such a session — safe,
 // but undispatchable. The #1284 block at the end of this file drives the SAME real
-// functions on the measured 0.170.0 capture, copied in verbatim below. Everything above
-// that block is unchanged.
+// functions on the measured 0.170.0 capture, reproduced below (see the SCOPE NOTE). The
+// #1136 cases and assertions it joined are unchanged.
 //
-// SCOPE NOTE on the "Offline and non-sensitive by construction" paragraph above: it
-// describes the #1136 fixtures, where it holds for every screen. Two of its clauses do NOT
-// hold for the #1284 fixture — "every screen below is a synthetic string" and "no private
-// paths, session ids or user content". That fixture is a
-// real capture, not a synthetic string, and it carries the captured session's own cwd — a
-// role-sandbox path containing a session id. It is reproduced verbatim because the point
-// of the case is that the reader meets codex's bytes exactly as codex emits them, and the
-// path is part of the model/cwd row the reader must match. It carries no task content, no
-// credential and no reply text. Still nothing is read from a terminal, telepty/cmux,
-// provider or network at test time, and nothing is written anywhere.
+// A further block of Codex composer/footer fixtures covers the PRE-0.170.0 footer shapes
+// — the `· <n> warnings` tail and the padded `⚠ <n> warning · f2 to view` tail — and the
+// negatives around them, through the same real functions. It adds new case ids only.
+//
+// SCOPE NOTE on the "Offline and non-sensitive by construction" paragraph above: the
+// #1284 fixture is the one screen here that is not written from scratch — it is a real
+// capture of codex's own chrome, reproduced so that the reader meets codex's bytes exactly
+// as codex emits them. The one part of it that was not codex's own chrome, the captured
+// session's working directory, is replaced by a synthetic path (CODEX_0170_CWD), so the
+// clause "no private paths, session ids or user content" holds for every screen in this
+// file. The capture carries no task content, no credential and no reply text. Nothing is
+// read from a terminal, telepty/cmux, provider or network at test time, and nothing is
+// written anywhere.
 import { createHash } from "node:crypto";
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -180,22 +183,61 @@ const UNREADY_SURFACES = ["unknown", "modal", "error", "unsubmitted", "crash", "
 const ready = (id: string, screenText: string, surface: string): Case =>
   ({ id, fn: "ready_by_current_screen", cli: "claude", screen: screenText, surface });
 
-// ── #1284 fixture: the MEASURED idle viewport of codex-cli 0.170.0 ───────────────────
-// Copied in VERBATIM from the capture facts/CODEX-0.170.0-idle-screen-cmux.txt — the real
-// viewport of a freshly started, idle, empty session of codex-cli 0.170.0. One row per
-// array element so that no editor, formatter or lint autofix can rewrite the single-space
-// rows the capture really has, joined by LF with the capture's one trailing LF; the sha256
-// pins the exact bytes, so a later edit to the fixture fails loudly instead of quietly
-// testing something codex never printed. See the SCOPE NOTE in the file header for what
-// this capture does and does not contain.
+// ── Additional Codex composer/footer fixtures ───────────────────────────────────────
+// The reduced shapes of the pre-0.170.0 Codex footer — the `· <n> warnings` tail and the
+// padded `⚠ <n> warning · f2 to view` tail, with and without the measured status segment
+// on the model/cwd row — plus the surrounding negatives. These exercise the SAME real
+// functions as the blocks above; the #1284 `← for agents · ` prefix is covered by the
+// measured 0.170.0 capture further down and is deliberately not duplicated here.
+//
+// Every row is synthetic. The working directories are invented placeholders (absolute and
+// free of `·`, which is all the reader's model/cwd pattern requires) and the bracketed
+// marker rows are fixture text, never a real reference. The padded footer rows are built
+// from an explicit space count rather than pasted, so the run of spaces the reader's
+// ` {2,}` arm consumes stays visible and cannot be reflowed by an editor.
+const CODEX_CWD_CODER = "/sandbox/roles/coder-session";
+const CODEX_CWD_ARCHITECT = "/sandbox/roles/architect-session";
+const CODEX_STATUS = "  GPT-6-Astra medium · /owned/worker · Read [context-ref] source file";
+const CODEX_SHORTCUTS = "  ? for shortcuts · 1 warning";
+/** `? for shortcuts`, a run of `pad` spaces, then the warning tail the reader accepts. */
+const codexWarnFooter = (pad: number) => "  ? for shortcuts" + " ".repeat(pad) + "⚠ 1 warning · f2 to view";
+const codexFrame = (prompt = "› Ask Codex to do anything", status = CODEX_STATUS) =>
+  screen("Completed report.", "", prompt, "", status, CODEX_SHORTCUTS);
+const CODEX_IDLE = codexFrame();
+/** A settled session: status segment present, one trailing newline, padded warning tail. */
+const CODEX_LIVE = "› Ask Codex to do anything\n \n"
+  + `  GPT-6-Astra medium · ${CODEX_CWD_CODER} · Read [context-ref] source file\n`
+  + codexWarnFooter(152) + "\n";
+/** Fresh sessions: NO status segment on the model/cwd row yet, and no trailing newline. */
+const CODEX_FRESH_ARCHITECT = "› Ask Codex to do anything\n \n"
+  + `  GPT-6-Astra medium · ${CODEX_CWD_ARCHITECT}\n` + codexWarnFooter(57);
+const CODEX_FRESH_CODER = "› Ask Codex to do anything\n \n"
+  + `  GPT-6-Astra medium · ${CODEX_CWD_CODER}\n` + codexWarnFooter(152);
+
+// ── #1284 fixture: the measured idle viewport of codex-cli 0.170.0 ───────────────────
+// Taken from the capture facts/CODEX-0.170.0-idle-screen-cmux.txt — the real viewport of a
+// freshly started, idle, empty session of codex-cli 0.170.0 — with ONE substitution: the
+// captured session's own working directory, which appeared on the banner row and again on
+// the model/cwd row, is replaced by the synthetic CODEX_0170_CWD below. Nothing else is
+// altered. One row per array element so that no editor, formatter or lint autofix can
+// rewrite the single-space and padded rows the capture really has, joined by LF with the
+// capture's one trailing LF; the sha256 pins these exact bytes, so a later edit to the
+// fixture fails loudly instead of quietly testing something codex never printed.
+//
+// The substitution is safe for what this fixture measures: the reader's model/cwd pattern
+// requires an absolute path with no `·` in it and does not look at the path's content (see
+// codex_current_composer in bin/session-probe.py), and no assertion in this file reads the
+// directory. It keeps the suite free of a real home path, user name and session id.
 // 0.170.0 renders `← for agents · ` IN FRONT of `? for shortcuts` on the footer row. The
 // closed footer pattern in codex_current_composer refused that row, so the three footer
 // rows stayed in the composer and this screen — an empty composer — read
 // `no-empty-current-prompt` forever: never ready, never dispatchable.
+/** Synthetic stand-in for the captured session's cwd: absolute, no `·`, not a real path. */
+const CODEX_0170_CWD = "/sandbox/roles/analyst-session";
 const CODEX_0170_ROWS = [
   " ",
   "  >_ OpenAI Codex (v0.170.0)",
-  "     /Users/duckyoungkim/.aigentry/role-sandbox/analyst-E-orch652-preflight-codex2-analyst-20261118",
+  "     " + CODEX_0170_CWD,
   "  permissions: YOLO mode",
   " ",
   " ",
@@ -249,12 +291,12 @@ const CODEX_0170_ROWS = [
   " ",
   "› Ask Codex to do anything",
   " ",
-  "  GPT-6.2-Astra medium · /Users/duckyoungkim/.aigentry/role-sandbox/analyst-E-orch652-preflight-codex2-analyst-20261118",
+  "  GPT-6.2-Astra medium · " + CODEX_0170_CWD,
   "  ← for agents · ? for shortcuts                                                                                                                                         ⚠ 1 warning · f2 to view",
 ];
 const CODEX_0170_IDLE = CODEX_0170_ROWS.join("\n") + "\n";
-assert.equal(createHash("sha256").update(CODEX_0170_IDLE).digest("hex"), "6d7b65f24ccf9950433ee4196999b0fd73caca5da00ef59d525f44af3301df74",
-  "CODEX_0170_IDLE must be the measured capture byte-for-byte");
+assert.equal(createHash("sha256").update(CODEX_0170_IDLE).digest("hex"), "eb42baecb360f7a79bf64b535f447033af08c2bbc8397e70fb706e2bbbfc172e",
+  "CODEX_0170_IDLE must be the measured capture byte-for-byte, with only its cwd rows synthetic");
 /** The measured footer, model/cwd and placeholder rows, taken FROM the fixture. */
 const CODEX_0170_FOOTER = CODEX_0170_ROWS[CODEX_0170_ROWS.length - 1];
 const CODEX_0170_MODEL = CODEX_0170_ROWS[CODEX_0170_ROWS.length - 2];
@@ -299,6 +341,66 @@ const CODEX_0170_CASES: [string, string, string, boolean, string][] = [
   // measured status segment has been recognized chrome since #1136 and is untouched here.)
   ["0170-no-separator", CODEX_0170_IDLE.replace(CODEX_0170_PROMPT + "\n \n", CODEX_0170_PROMPT + "\n"), "idle", false, "no-empty-current-prompt"],
   ["0170-model-row-unknown", CODEX_0170_IDLE.replace(CODEX_0170_MODEL, CODEX_0170_MODEL.replace(" medium ", " turbo ")), "idle", false, "no-empty-current-prompt"],
+];
+
+// [name, screen, expected pipeline surface, expected ready]
+const CODEX_CASES: [string, string, string, boolean][] = [
+  ["fresh-architect", CODEX_FRESH_ARCHITECT, "idle", true],
+  ["fresh-coder", CODEX_FRESH_CODER, "idle", true],
+  ...[CODEX_FRESH_ARCHITECT, CODEX_FRESH_CODER].flatMap((frame, i): [string, string, string, boolean][] => [
+    [`fresh-occupied-${i}`, frame.replace("› Ask Codex to do anything", "› [context-ref] pending"), "unsubmitted", false],
+    [`fresh-continuation-${i}`, frame.replace("› Ask Codex to do anything", "› [context-ref] pending\n  › Ask Codex to do anything"), "unsubmitted", false],
+    [`fresh-trailing-${i}`, frame + "[context-ref] pending\n", "unsubmitted", false],
+    [`fresh-partial-hint-${i}`, frame.replace("f2 to view", "f3 to view"), "idle", false],
+    [`fresh-empty-status-${i}`, frame.replace("\n  ? for shortcuts", " · \n  ? for shortcuts"), "idle", false],
+  ]),
+  ["live-warning", CODEX_LIVE, "idle", true],
+  ["live-warning-no-glyph", CODEX_LIVE.replace("⚠ ", ""), "unsubmitted", false],
+  ["live-warning-no-count", CODEX_LIVE.replace("1 warning", "warning"), "unsubmitted", false],
+  ["live-warning-no-hint", CODEX_LIVE.replace(" · f2 to view", ""), "unsubmitted", false],
+  ["live-warning-wrong-hint", CODEX_LIVE.replace("f2 to view", "f3 to view"), "unsubmitted", false],
+  ["live-warning-extra", CODEX_LIVE.trimEnd() + " pending input\n", "unsubmitted", false],
+  ["live-warning-extra-row", CODEX_LIVE + "pending input\n", "unsubmitted", false],
+  ["live-warning-occupied", CODEX_LIVE.replace("› Ask Codex to do anything", "› [context-ref] pending task"), "unsubmitted", false],
+  ["live-warning-continuation", CODEX_LIVE.replace("› Ask Codex to do anything", "› [context-ref] pending task\n  › Ask Codex to do anything"), "unsubmitted", false],
+
+  // Indented prompt-shaped rows remain pending input: an indented glyph may be multiline
+  // input, so it cannot replace an earlier composer anchor.
+  ...[" ", "  ", "   ", "    ", "\t"].flatMap((indent, i): [string, string, string, boolean][] => [
+    [`continuation-marker-${i}`, codexFrame(`› [context-ref] pending task\n${indent}› Ask Codex to do anything`), "unsubmitted", false],
+    [`continuation-text-${i}`, codexFrame(`› pending task\n${indent}› Ask Codex to do anything`), "idle", false],
+  ]),
+  ["continuation-marker-blank", codexFrame("› [context-ref] pending task\n\n  › Ask Codex to do anything"), "unsubmitted", false],
+  ["continuation-framed", codexFrame(RULE + "\n› [context-ref] pending task\n  › Ask Codex to do anything\n" + RULE), "unsubmitted", false],
+  ["continuation-fenced", screen("```", codexFrame("› [context-ref] pending task\n  › Ask Codex to do anything"), "```"), "unsubmitted", false],
+  ["completed-transcript", screen("› previous task", "", "Completed report.", "", CODEX_IDLE), "idle", true],
+  ["fenced-transcript", screen("```", "› [context-ref] historical input", "```", "", CODEX_IDLE), "idle", true],
+
+  ["measured", CODEX_IDLE, "idle", true],
+  ["footer-path", codexFrame(undefined, CODEX_STATUS.replace("[context-ref]", "/shared/abcdef123456.md")), "idle", true],
+  ["typed-marker", codexFrame("› [context-ref] source file"), "unsubmitted", false],
+  ["typed-path", codexFrame("› /shared/abcdef123456.md"), "unsubmitted", false],
+  ["typed-task", codexFrame("› implement the change"), "idle", false],
+  ["hint-trailing", codexFrame("› Ask Codex to do anything extra"), "idle", false],
+  ["multiline-marker", codexFrame("› implement\n  [context-ref] source file\n  next line\n  another line\n  final line"), "unsubmitted", false],
+  ["multiline-text", codexFrame("› Ask Codex to do anything\n  actual pending input"), "idle", false],
+  ["trailing-text", CODEX_IDLE + "\n  pending input", "unsubmitted", false],
+  ["truncated-footer", screen("› Ask Codex to do anything", "", CODEX_STATUS), "unsubmitted", false],
+  ["unframed-marker", screen("› Ask Codex to do anything", "", "  Read [context-ref] source file", CODEX_SHORTCUTS), "unsubmitted", false],
+  ["no-separator", screen("› Ask Codex to do anything", CODEX_STATUS, CODEX_SHORTCUTS), "unsubmitted", false],
+  ["no-prompt", screen(CODEX_STATUS, CODEX_SHORTCUTS), "unsubmitted", false],
+  ["unknown", "Unrecognized viewport", "unknown", false],
+  ["fenced", screen("```", CODEX_IDLE, "```"), "unsubmitted", false],
+  ["indented", CODEX_IDLE.split("\n").map(line => "    " + line).join("\n"), "unsubmitted", false],
+  ["busy", "Working (3s · esc to interrupt)\n" + CODEX_IDLE, "working", false],
+  ["spinner", "⠹ Working\n" + CODEX_IDLE, "working", false],
+  ["trust", "Do you trust this folder?\n" + CODEX_IDLE, "modal", false],
+  ["sandbox", "Would you like to run the following command?\n" + CODEX_IDLE, "sandbox_prompt", false],
+  ["error", "API Error: 503 unavailable\n" + CODEX_IDLE, "error", false],
+  ["plain-placeholder", "› Ask Codex to do anything", "idle", true],
+  ["skills-placeholder", "› Use /skills to list available skills", "idle", true],
+  ["bare-prompt", "›", "idle", true],
+  ["plain-multiline", "› Ask Codex to do anything\n  pending input", "idle", false],
 ];
 
 const CASES: Case[] = [
@@ -379,6 +481,14 @@ const CASES: Case[] = [
   { id: "codex/0170/controls", fn: "current_controls", cli: "codex", screen: CODEX_0170_IDLE },
   { id: "codex/0170/legacy-surface", fn: "legacy_surface", cli: "codex", screen: CODEX_0170_IDLE },
   { id: "codex/0170/legacy-ready", fn: "ready_by_screen", cli: "codex", screen: CODEX_0170_IDLE },
+
+  // The additional Codex composer/footer fixtures. New ids only; every case above is
+  // untouched, and the measured 0.170.0 cases are not duplicated.
+  ...CODEX_CASES.flatMap(([name, screenText]): Case[] => [
+    { id: `codex/${name}/surface`, fn: "pipeline_surface", cli: "codex", screen: screenText },
+    { id: `codex/${name}/ready`, fn: "pipeline_ready", cli: "codex", screen: screenText },
+  ]),
+  { id: "codex/legacy-footer", fn: "legacy_surface", cli: "codex", screen: CODEX_IDLE },
 ];
 
 // ── One bounded subprocess, at module load: an unusable probe or interpreter is a
@@ -552,4 +662,19 @@ test("#1284(c): the 0.170.0 welcome logo art is not a spinner, and the codex con
 test("#1284(d): the legacy --screen-file path is untouched by the footer change", () => {
   assert.equal(got("codex/0170/legacy-surface"), "idle");
   assert.deepEqual(got("codex/0170/legacy-ready"), [true, "prompt"]);
+});
+
+// ── The additional Codex composer/footer fixtures ────────────────────────────────────
+for (const [name, , surface, isReady] of CODEX_CASES) {
+  test(`#1136(k): Codex composer/footer ${name}`, () => {
+    assert.equal(got(`codex/${name}/surface`), surface, name);
+    assert.equal((got(`codex/${name}/ready`) as [boolean, string])[0], isReady, name);
+  });
+}
+
+test("#1136(l): the legacy --screen-file path still refuses a current-viewport Codex frame", () => {
+  // Historical fixture semantics are deliberately separate from the current-viewport
+  // reader: the same frame that reads idle+ready above is NOT admitted by the legacy path.
+  assert.equal(got("codex/legacy-footer"), "unsubmitted");
+  assert.equal(got("codex/measured/surface"), "idle", "the current-viewport reader is the one that admits it");
 });
