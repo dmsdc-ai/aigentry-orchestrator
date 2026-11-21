@@ -72,14 +72,15 @@ export const USAGE = `# dispatch.sh — Wraps \`telepty inject\` with REPL-ready
 #   A telepty command that cannot be STARTED (ENOENT: no such file, EACCES: not
 #   executable) is not a slow spawn (#1293): the first listing of the wait
 #   already proves it, so dispatch refuses there and then with exit 78
-#   (TELEPTY_CLI_UNAVAILABLE), naming the resolved command, the required
-#   @dmsdc-ai/aigentry-telepty version and the one command that installs it,
-#   instead of spending the whole budget and blaming the knob. The knob still
-#   owns every case where telepty starts (exit 6): the session is simply not
-#   there yet, or the listing overflowed its buffer. Bound delivery to a busy
-#   worker keeps exit 78 BOUND_INJECT_UNSUPPORTED for a telepty that does not
-#   declare inject-bound-v1. This package declares no dependency on telepty
-#   and installs, upgrades, starts, stops and restarts nothing.
+#   (TELEPTY_CLI_UNAVAILABLE) instead of spending the whole budget and blaming
+#   the knob. A TELEPTY override that fails is named, with the instruction to
+#   correct or unset it; install advice is given only when PATH holds no
+#   telepty. A telepty that starts but does not list the session (not there
+#   yet, or a listing that overflowed its buffer) still waits for the knob and
+#   exits 6 at its deadline. Bound delivery to a busy worker keeps exit 78
+#   BOUND_INJECT_UNSUPPORTED when inject-bound-v1 is not declared or cannot be
+#   read. This package declares no dependency on telepty and installs,
+#   upgrades, starts, stops and restarts nothing.
 #
 # Retry of an unknown delivery (#1092): a prior attempt left at
 #   delivery_state_unknown holds every identical dispatch (exit 7,

@@ -160,13 +160,13 @@ function binFilesUsing(tool) {
 // So the nested copy was never EXECUTED, but its postinstall ran on the HOST at install time and
 // replaced a newer running daemon. The dependency is gone; the requirement is stated here instead.
 //
-// WHAT THIS CHECK ASKS (r2, review F1/F2). Only questions with an exact answer: is there a telepty
-// on PATH, does its `telepty boot-capabilities` declare what the later doors need, and —
-// independently of that answer — does a readable telepty service definition start a program that
-// does not exist or is not executable. It never guesses who installed or "owns" a telepty, so a
-// healthy telepty is never told to reinstall, wherever it lives. It installs, repairs, starts,
-// stops and restarts nothing, and it writes nothing: every call below is a read or a bounded
-// read-only probe.
+// WHAT THIS CHECK ASKS (r3). Only questions with an exact answer: is there a telepty on PATH, and
+// does its `telepty boot-capabilities` document declare what the later doors need. Install advice
+// follows only an established fact — no telepty on PATH, or a valid document that lacks a
+// capability; any other answer is reported as inconclusive. It never guesses who installed or
+// "owns" a telepty, and it reads no service definition (r3: a single on-disk file cannot establish
+// what a service manager will start; the README/CHANGELOG manual check covers services). It
+// installs, repairs, starts, stops and restarts nothing, and it writes nothing.
 const TELEPTY_MIN_VERSION = "0.11.1";
 const TELEPTY_REQUIRED_VERBS = ["allow-create-v1", "inject-bound-v1"];
 const TELEPTY_INSTALL_COMMAND = "npm i -g @dmsdc-ai/aigentry-telepty@latest";
@@ -174,10 +174,6 @@ const TELEPTY_CAPABILITIES_SCHEMA = "telepty-boot-capabilities-v1";
 const TELEPTY_PROBE_TIMEOUT_MS = 10_000;
 /** The most the boot door reads of the capability document (src/orchestrator-boot/cli.ts, bootDoor maxBuffer). */
 const TELEPTY_PROBE_MAX_BYTES = 4096;
-/** telepty's four bins: a service definition is a telepty one when its program, or the script it runs, is one. */
-const TELEPTY_BIN_NAMES = ["telepty", "telepty-install", "telepty-mcp", "aigentry-telepty"];
-/** A service definition larger than this, or any entry that is not a regular file, is not read. */
-const SERVICE_MAX_BYTES = 64 * 1024;
 
 /** An untrusted value for a diagnostic: JSON (never String(), which an object can make throw), bounded. */
 function shownJson(v) {
@@ -205,41 +201,43 @@ function resolveTelepty() {
 
 /**
  * Runs `telepty boot-capabilities` ONCE, read-only: printing the sealed document starts, stops,
- * repairs, upgrades and contacts nothing. The verdict is deliberately THREE-valued (review R2/R4):
- *   ok        — the document satisfies both runtime doors
- *   refused   — the telepty in use answered, and its answer does not report the capabilities
- *   unprobed  — the probe itself could not be completed, which says nothing about telepty and
- *               must therefore never produce upgrade or install advice
+ * repairs, upgrades and contacts nothing. The verdict is THREE-valued (r3):
+ *   ok           — the document satisfies both runtime doors
+ *   refused      — a valid telepty-boot-capabilities-v1 document that lacks a required verb or
+ *                  declares another viewer detach: the one answer that ESTABLISHES an older telepty
+ *   inconclusive — everything else: no answer (spawn error, signal, timeout, over-long output), a
+ *                  non-zero exit, or output that is not a valid v1 document. None of these says
+ *                  which telepty this is, so none of them may produce replacement advice.
  * The document is validated with EXACTLY the rule the boot door applies (review R3,
- * src/orchestrator-boot/cli.ts:497-524), within the same 4096-byte bound (review F5), plus
- * dispatch's verb. No untrusted field is coerced with String() (review R8).
+ * src/orchestrator-boot/cli.ts bootCapabilitiesRefusal), within the same 4096-byte bound (review F5),
+ * plus dispatch's verb. No untrusted field is coerced with String() (review R8).
  */
 function teleptyCapabilityVerdict(file) {
   let r;
   if (process.platform === "win32") {
     r = winRun(file, ["boot-capabilities"]);
     if (r.unsupportedPath === true)
-      return { kind: "unprobed", why: `init cannot probe ${file} through the cmd.exe shim door: its path ` +
+      return { kind: "inconclusive", why: `init cannot probe ${file} through the cmd.exe shim door: its path ` +
         "carries a character (a quote, %, ^, &, |, <, > or !) that cannot be quoted safely, or SystemRoot " +
-        "is not an absolute drive path, so the capability was NOT measured — run 'telepty boot-capabilities' " +
-        "yourself to read it" };
+        "is not an absolute drive path, so the capability was NOT measured" };
   } else {
     // The file RESOLVED above, not the bare word again: one lookup, then exactly what was found, so
     // a PATH change between the two reads cannot make the message describe a different executable.
     r = spawnSync(file, ["boot-capabilities"], { encoding: "utf8", timeout: TELEPTY_PROBE_TIMEOUT_MS });
   }
+  const inconclusive = (why) => ({ kind: "inconclusive", why });
   if (r.error !== undefined && r.error !== null)
-    return { kind: "unprobed", why: `'telepty boot-capabilities' could not run (${r.error.code || "spawn error"})` };
+    return inconclusive(`'telepty boot-capabilities' could not run (${r.error.code || "spawn error"})`);
   if (Buffer.byteLength(r.stdout || "") > TELEPTY_PROBE_MAX_BYTES)
-    return { kind: "unprobed", why: `'telepty boot-capabilities' printed more than ${TELEPTY_PROBE_MAX_BYTES} ` +
-      "bytes, more than the boot door reads" };
+    return inconclusive(`'telepty boot-capabilities' printed more than ${TELEPTY_PROBE_MAX_BYTES} ` +
+      "bytes, more than the boot door reads");
   if (r.status === null)
-    return { kind: "unprobed", why: `'telepty boot-capabilities' did not finish (${r.signal || "no exit status"})` };
-  if (r.status !== 0) return { kind: "refused", why: `'telepty boot-capabilities' exited ${r.status}` };
+    return inconclusive(`'telepty boot-capabilities' did not finish (${r.signal || "no exit status"})`);
+  if (r.status !== 0) return inconclusive(`'telepty boot-capabilities' exited ${r.status}`);
   const out = r.stdout || "";
   if (!out.endsWith("\n") || out.indexOf("\n") !== out.length - 1)
-    return { kind: "refused", why: "'telepty boot-capabilities' did not print exactly one line (an older " +
-      `telepty prints its help text and exits 0, which is NOT support); it printed ${shownJson(out)}` };
+    return inconclusive("'telepty boot-capabilities' did not print exactly one line (an older " +
+      `telepty prints its help text and exits 0, and so can a wrapper that fails); it printed ${shownJson(out)}`);
   let doc = null;
   try {
     const parsed = JSON.parse(out);
@@ -250,11 +248,11 @@ function teleptyCapabilityVerdict(file) {
   const verbs = doc === null ? null : doc.verbs;
   if (doc === null || Object.keys(doc).sort().join(",") !== "schema,verbs,viewer_detach" ||
     !Array.isArray(verbs) || !verbs.every((v) => typeof v === "string") || new Set(verbs).size !== verbs.length)
-    return { kind: "refused", why: `'telepty boot-capabilities' did not print a ${TELEPTY_CAPABILITIES_SCHEMA} ` +
-      `document with exactly schema/verbs/viewer_detach and unique string verbs; it printed ${shownJson(out)}` };
+    return inconclusive(`'telepty boot-capabilities' did not print a ${TELEPTY_CAPABILITIES_SCHEMA} ` +
+      `document with exactly schema/verbs/viewer_detach and unique string verbs; it printed ${shownJson(out)}`);
   if (doc.schema !== TELEPTY_CAPABILITIES_SCHEMA)
-    return { kind: "refused", why: `'telepty boot-capabilities' printed schema ${shownJson(doc.schema)}, ` +
-      `not ${TELEPTY_CAPABILITIES_SCHEMA}` };
+    return inconclusive(`'telepty boot-capabilities' printed schema ${shownJson(doc.schema)}, ` +
+      `not ${TELEPTY_CAPABILITIES_SCHEMA}`);
   const missing = TELEPTY_REQUIRED_VERBS.filter((v) => !verbs.includes(v));
   if (missing.length > 0)
     return { kind: "refused", why: `the telepty in use does not declare ${missing.join(" or ")} in its boot-capabilities` };
@@ -275,168 +273,33 @@ function teleptyMessage(observed) {
     `with nondeleting-v1 viewer detach: @dmsdc-ai/aigentry-telepty ${TELEPTY_MIN_VERSION} or later ` +
     `(${TELEPTY_MIN_VERSION} is the first published version declaring inject-bound-v1). init detects only: ` +
     "it installs, upgrades, starts, stops and restarts nothing. Install or upgrade telepty under your own " +
-    `control with '${TELEPTY_INSTALL_COMMAND}', then run 'telepty-install' yourself if no daemon is ` +
-    "listening. Until then orchestrator-boot exits 3 (boot preflight UNSUPPORTED) when its own check of " +
-    "the telepty on PATH fails — missing, or without allow-create-v1 and nondeleting-v1 viewer detach — and " +
+    `control with '${TELEPTY_INSTALL_COMMAND}'. Until then orchestrator-boot exits 3 (boot preflight ` +
+    "UNSUPPORTED) when its own check of the telepty on PATH fails — missing, or without allow-create-v1 and nondeleting-v1 viewer detach — and " +
     "dispatch exits 78: TELEPTY_CLI_UNAVAILABLE when the telepty command cannot be started at registration, " +
     "BOUND_INJECT_UNSUPPORTED when bound delivery to a busy worker finds no inject-bound-v1.";
 }
 
 /**
- * Exactly the service definitions read (review F2), and nothing else: darwin — every `*.plist`
- * directly in ~/Library/LaunchAgents; linux — every `*.service` directly in
- * $XDG_CONFIG_HOME/systemd/user (default ~/.config/systemd/user) and in /etc/systemd/system. Any
- * other platform (win32: a scheduled task) is not inspected, and nothing is printed about it.
+ * What init observed when the probe established nothing (r3, review R3-6): the observation, the
+ * requirement as a fact, and one instruction that changes nothing — never install or replace advice.
  */
-function serviceDirs() {
-  if (process.platform === "darwin") return [[path.join(os.homedir(), "Library", "LaunchAgents"), ".plist"]];
-  if (process.platform !== "linux") return [];
-  const xdg = process.env.XDG_CONFIG_HOME;
-  const config = typeof xdg === "string" && path.isAbsolute(xdg) ? xdg : path.join(os.homedir(), ".config");
-  return [[path.join(config, "systemd", "user"), ".service"], ["/etc/systemd/system", ".service"]];
+function teleptyInconclusive(file, why) {
+  return `${why}. So init could not establish whether the telepty on PATH (${file}) declares what the later ` +
+    `doors need: a one-line ${TELEPTY_CAPABILITIES_SCHEMA} document from 'telepty boot-capabilities' declaring ` +
+    `${TELEPTY_REQUIRED_VERBS.join(" and ")} with nondeleting-v1 viewer detach (@dmsdc-ai/aigentry-telepty ` +
+    `${TELEPTY_MIN_VERSION} or later). Run 'telepty boot-capabilities' yourself to see its answer. init detects ` +
+    "only: it installs, upgrades, starts, stops and restarts nothing.";
 }
 
-/** A regular file's text, or null. O_NONBLOCK + fstat: a FIFO or device is never read (review F4). */
-function readRegularFile(file) {
-  let fd;
-  try {
-    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0));
-    const st = fs.fstatSync(fd);
-    if (!st.isFile() || st.size > SERVICE_MAX_BYTES) return null;
-    const buf = Buffer.alloc(SERVICE_MAX_BYTES + 1);
-    let n = 0;
-    for (let got = 1; got > 0 && n < buf.length; n += got) got = fs.readSync(fd, buf, n, buf.length - n, n);
-    return n > SERVICE_MAX_BYTES ? null : buf.toString("utf8", 0, n);
-  } catch {
-    return null;
-  } finally {
-    if (fd !== undefined) fs.closeSync(fd);
-  }
-}
-
-/** launchd: `Program`, else ProgramArguments[0], then ProgramArguments[1] — XML entities decoded, comments dropped. */
-function plistArgv(text) {
-  const xml = (s) => s.replace(/&(#x[0-9a-f]+|#[0-9]+|amp|lt|gt|quot|apos);/gi, (_, e) => e[0] !== "#"
-    ? { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" }[e.toLowerCase()]
-    : String.fromCodePoint(e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : Number(e.slice(1))));
-  const body = text.replace(/<!--[\s\S]*?-->/g, "");
-  const program = /<key>\s*Program\s*<\/key>\s*<string>([^<]*)<\/string>/.exec(body);
-  const array = /<key>\s*ProgramArguments\s*<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(body);
-  const args = array === null ? [] : [...array[1].matchAll(/<string>([^<]*)<\/string>/g)].map((m) => xml(m[1]));
-  return program === null ? args : [xml(program[1]), ...args.slice(1)];
-}
-
-/**
- * systemd: the first ExecStart= of [Service], split into words the way systemd splits them (double
- * or single quotes, a backslash before a quote, a space or a backslash). Comments are skipped. Any
- * other escape answers [] — not read exactly, so nothing is said about it.
- */
-function unitArgv(text) {
-  let section = "";
-  let exec = null;
-  for (const line of text.replace(/\\\r?\n/g, " ").split(/\r?\n/)) {
-    const t = line.trim();
-    if (t === "" || t[0] === "#" || t[0] === ";") continue;
-    if (t[0] === "[") section = t;
-    const m = section === "[Service]" ? /^ExecStart\s*=\s*(.*)$/.exec(t) : null;
-    if (m !== null) exec = m[1] === "" ? null : (exec ?? m[1]);
-  }
-  if (exec === null) return [];
-  const prefix = /^[-@:+!]*/.exec(exec)[0];
-  const words = [];
-  for (let i = prefix.length; i < exec.length;) {
-    if (/\s/.test(exec[i])) { i += 1; continue; }
-    const quote = exec[i] === '"' || exec[i] === "'" ? exec[i++] : null;
-    let word = "";
-    for (; i < exec.length; i += 1) {
-      const c = exec[i];
-      if (quote !== null ? c === quote : /\s/.test(c)) { i += 1; break; }
-      if (c === "\\") {
-        if (!/["'\\ ]/.test(exec[i + 1] ?? "")) return [];
-        i += 1;
-      }
-      word += exec[i];
-    }
-    words.push(word);
-  }
-  // `@` makes the second word argv[0] rather than an argument.
-  return prefix.includes("@") ? [words[0], ...words.slice(2)] : words;
-}
-
-/**
- * What is objectively wrong with one telepty service definition, or null. A definition is a
- * telepty one when its program, or the script its program runs, is named like a telepty bin or lies
- * in an aigentry-telepty package directory. Reported ONLY when that program does not exist or is
- * not an executable regular file, or that script does not exist. A relative path, a %specifier or a
- * $VARIABLE is not exact, and an unreadable path (EACCES, …) proves nothing: both answer null.
- */
-function serviceProblem([program, operand]) {
-  const exact = (p) => typeof p === "string" && path.isAbsolute(p) && !/[%$]/.test(p);
-  const telepty = (p) => exact(p) && (TELEPTY_BIN_NAMES.includes(path.basename(p).replace(/\.[cm]?js$/i, "")) ||
-    p.split(path.sep).includes("aigentry-telepty"));
-  if (!exact(program) || !(telepty(program) || telepty(operand))) return null;
-  const gone = (p) => {
-    try {
-      fs.statSync(p);
-      return false;
-    } catch (e) {
-      return e.code === "ENOENT" || e.code === "ENOTDIR";
-    }
-  };
-  if (gone(program)) return `${program} does not exist`;
-  try {
-    if (!fs.statSync(program).isFile()) return `${program} is not an executable file`;
-    fs.accessSync(program, fs.constants.X_OK);
-  } catch (e) {
-    return e.code === "EACCES" ? `${program} is not an executable file` : null;
-  }
-  return !telepty(program) && telepty(operand) && gone(operand) ? `${operand} does not exist` : null;
-}
-
-/** Every read telepty service definition whose program is missing or not executable, as "file: problem". */
-function staleTeleptyServices() {
-  const found = [];
-  for (const [dir, suffix] of serviceDirs()) {
-    let names;
-    try {
-      names = fs.readdirSync(dir).filter((n) => n.endsWith(suffix)).sort().slice(0, 256);
-    } catch {
-      continue;
-    }
-    for (const name of names) {
-      const file = path.join(dir, name);
-      const text = readRegularFile(file);
-      let problem = null;
-      try {
-        problem = text === null ? null : serviceProblem(suffix === ".plist" ? plistArgv(text) : unitArgv(text));
-      } catch {
-        problem = null;
-      }
-      if (problem !== null) found.push(`${file}: ${problem}`);
-    }
-  }
-  return found;
-}
-
-/** Step 1's telepty handling: the CLI and the service definitions, read independently. No effect of any kind. */
+/** Step 1's telepty handling: the CLI on PATH only. No effect of any kind. */
 function teleptyCheck() {
   const file = resolveTelepty();
   const verdict = file === null ? null : teleptyCapabilityVerdict(file);
   if (verdict === null) warn(teleptyMessage("telepty is not on PATH."));
   else if (verdict.kind === "refused")
     warn(teleptyMessage(`The telepty on PATH (${file}) does not report the required capabilities: ${verdict.why}.`));
-  else if (verdict.kind === "unprobed")
-    // The probe, not telepty, is what failed. Report the observation and stop — an upgrade or an
-    // install command here would be advice about a component this run never measured (review R2/R4).
-    warn(`${verdict.why}. init detects only: it installs, upgrades, starts, stops and restarts ` +
-      `nothing, and it did not decide anything about the telepty on PATH (${file}).`);
+  else if (verdict.kind === "inconclusive") warn(teleptyInconclusive(file, verdict.why));
   else info(`telepty found at ${file}; its boot-capabilities declare ${TELEPTY_REQUIRED_VERBS.join(" and ")}`);
-  const stale = staleTeleptyServices();
-  if (stale.length > 0)
-    warn("A telepty service definition starts a program that does not exist or is not executable, so " +
-      `the service fails at its next ` +
-      `start: ${stale.join("; ")}. Re-run telepty's own installer, 'telepty-install', from the telepty you ` +
-      "use now so the definition names a program that exists. init changed no service.");
 }
 
 function parseArgs(argv) {
@@ -522,11 +385,10 @@ function dependencyChecks() {
     );
   }
 
-  // #1293: at most one CLI message per run, from the capability the runtime doors read, and at most
-  // one service message, from the program path a readable telepty service definition names. The
-  // 0.2.0 wording this replaces claimed telepty was "a declared dependency of this package, installed
-  // nested under it at …/node_modules/.bin/telepty" — both halves became false when the dependency
-  // was removed.
+  // #1293: at most one telepty message per run, from the capability the runtime doors read. The 0.2.0
+  // wording this replaces claimed telepty was a dependency installed nested under this package; that
+  // became false when the dependency was removed (its exact phrase is pinned absent by
+  // tests/packaging/telepty-runtime-requirement.test.ts, so it is not quoted here).
   teleptyCheck();
 
   if (has("claude")) info("claude CLI found");

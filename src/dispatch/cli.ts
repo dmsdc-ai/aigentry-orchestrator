@@ -1164,19 +1164,62 @@ const BOUND_VERB = "inject-bound-v1";
 const BOUND_CAPABILITY = "busy-input-v1";
 // #1293 — this package declares NO dependency on @dmsdc-ai/aigentry-telepty: TELEPTY (:51) is the
 // binary on PATH (or the operator's explicit override), a nested copy would never be executed here,
-// and its postinstall WOULD still run on the host. So a missing or too-old telepty is the
-// operator's to replace, and the refusals below have to say which version and with which command.
-// The CAPABILITY is what is checked; this version is only named, as the first published telepty
-// declaring BOUND_VERB. Both refusals carry the resolved command, because `TELEPTY` can name a
-// different file from the one on PATH (review R2) — and a stale override is exactly what an
-// upgrade from 0.2.5-0.2.7 leaves behind when it pointed into this package's own node_modules.
+// and its postinstall WOULD still run on the host. The refusals below state what was observed and
+// give advice that changes the host ONLY when a fact justifies it (r3): install advice when the
+// normal PATH lookup finds no telepty, or when a telepty's capability document lacks the verb. A
+// failing explicit TELEPTY override is the operator's to correct or unset — a reinstall would leave
+// it failing (review R3-2). The CAPABILITY is what is checked; this version is only named, as the
+// first published telepty declaring BOUND_VERB.
 const TELEPTY_MIN_VERSION = "0.11.1";
 const TELEPTY_INSTALL_COMMAND = "npm i -g @dmsdc-ai/aigentry-telepty@latest";
 const TELEPTY_REQUIREMENT =
   "aigentry-orchestrator declares no dependency on @dmsdc-ai/aigentry-telepty and drives the telepty on PATH, " +
   `so nothing here installs, upgrades, starts, stops or restarts it: install @dmsdc-ai/aigentry-telepty ` +
-  `${TELEPTY_MIN_VERSION} or later yourself with '${TELEPTY_INSTALL_COMMAND}', restart the daemon and every ` +
-  "bridge, then dispatch again";
+  `${TELEPTY_MIN_VERSION} or later yourself with '${TELEPTY_INSTALL_COMMAND}', then dispatch again`;
+/** True when TELEPTY names something other than the bare word the normal PATH lookup resolves. */
+const TELEPTY_OVERRIDDEN = TELEPTY !== "telepty";
+
+/** r3: the first absolute PATH entry holding an executable telepty — the normal lookup — or null. */
+function teleptyOnPath(): string | null {
+  const names = process.platform === "win32"
+    ? (env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";").filter((ext) => ext !== "").map((ext) => `telepty${ext.toLowerCase()}`)
+    : ["telepty"];
+  for (const dir of (env.PATH || "").split(path.delimiter)) {
+    if (!path.isAbsolute(dir)) continue;
+    for (const name of names) if (isExecutable(path.join(dir, name))) return path.join(dir, name);
+  }
+  return null;
+}
+
+/**
+ * r3 (review R3-2): the facts of a telepty command that could not be STARTED (ENOENT/EACCES), and
+ * the one instruction they justify. An override is described by what its file is, and the operator
+ * is told to correct or unset it; install advice only when the PATH lookup finds no telepty either.
+ */
+function teleptyUnstartable(errno: string): string {
+  const onPath = teleptyOnPath();
+  if (TELEPTY_OVERRIDDEN) {
+    let what = `could not be started (${errno})`;
+    if (path.isAbsolute(TELEPTY)) {
+      try {
+        if (!fs.statSync(TELEPTY).isFile() || errno === "EACCES") what = `is not an executable file (${errno})`;
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        if (code === "ENOENT" || code === "ENOTDIR") what = `does not exist (${errno})`;
+      }
+    }
+    return `the TELEPTY override names ${TELEPTY}, which ${what}, so no session can be listed, registered or ` +
+      "delivered to. Correct TELEPTY or unset it; " + (onPath !== null
+      ? `the normal PATH lookup finds telepty at ${onPath}`
+      : `the normal PATH lookup finds no executable telepty either: @dmsdc-ai/aigentry-telepty ${TELEPTY_MIN_VERSION} ` +
+        `or later installs with '${TELEPTY_INSTALL_COMMAND}'`);
+  }
+  // EACCES from the PATH lookup means a telepty file IS there; only ENOENT with none found is "no telepty".
+  if (onPath !== null || errno !== "ENOENT")
+    return `the telepty on PATH${onPath !== null ? ` (${onPath})` : ""} could not be started (${errno}), so no ` +
+      "session can be listed, registered or delivered to. Check that file's permissions and, for a script, its interpreter";
+  return `no telepty is on PATH (${errno}), so no session can be listed, registered or delivered to. ${TELEPTY_REQUIREMENT}`;
+}
 /**
  * The ONE refusal for a telepty that cannot run at all — exit 78, by name, before any wait.
  * 78 is this CLI's existing "a prerequisite this dispatch needs is unavailable; nothing was
@@ -1279,23 +1322,23 @@ function boundSnapshot(sid: string): { cliKind: string; host: string; epoch: str
  * printing it starts, repairs or contacts nothing. An OLD CLI answers an unknown verb
  * with its help text and exit 0, and that is NOT support — so only a JSON object whose
  * `verbs` array names the verb counts. Prose, a non-zero exit or no output is refusal.
- * #1293: the third answer, `unprobed`, is a command that never ran at all — reported
- * separately so the refusal it produces does not claim a version it never observed.
+ * #1293 r3: the refusal is `lacks` only when the CLI printed a JSON object whose `verbs` array
+ * omits the verb — the one answer that establishes an older telepty. A spawn error, a signal, a
+ * non-zero exit, no output or prose is `inconclusive` (`detail` says which) and draws no upgrade advice.
  */
-function boundVerbVerdict(): "ok" | "refused" | "unprobed" {
+function boundVerbVerdict(): { kind: "ok" | "lacks" | "inconclusive"; detail: string } {
   const r = capture(TELEPTY, ["boot-capabilities"]);
-  // #1293 (review R2): a command that could not be STARTED has not told us anything about its
-  // version, so it must not draw upgrade advice. Everything else — a non-zero exit, no output,
-  // prose, a document without the verb — is telepty's own answer, and that answer is "no".
-  // A child killed by a signal (review F5) has not answered either.
-  if (r.spawnError !== undefined || r.signal !== undefined) return "unprobed";
-  if (r.status !== 0 || !r.stdout) return "refused";
+  if (r.spawnError !== undefined) return { kind: "inconclusive", detail: `could not be run (${r.spawnError})` };
+  if (r.signal !== undefined) return { kind: "inconclusive", detail: `was terminated by ${r.signal}` };
+  if (r.status !== 0) return { kind: "inconclusive", detail: `exited ${r.status}` };
   try {
     const doc = JSON.parse(r.stdout) as { verbs?: unknown };
-    return Array.isArray(doc.verbs) && doc.verbs.includes(BOUND_VERB) ? "ok" : "refused";
+    if (doc !== null && typeof doc === "object" && Array.isArray(doc.verbs))
+      return { kind: doc.verbs.includes(BOUND_VERB) ? "ok" : "lacks", detail: "" };
   } catch {
-    return "refused";
+    /* prose, such as an older CLI's help text, or no output */
   }
+  return { kind: "inconclusive", detail: "printed no JSON object with a verbs array (an unknown verb's help text and exit 0 is not support)" };
 }
 
 /**
@@ -1442,15 +1485,20 @@ function admitBoundBusy(o: Opts, sid: string): BusyAdmission {
       `(transport.busy_input=${printable(snap.busyInput || "absent")}), so a busy worker cannot be given input`);
   }
   const boundVerb = boundVerbVerdict();
-  if (boundVerb === "refused") {
-    refuse(`the local telepty CLI ${TELEPTY} does not advertise ${BOUND_VERB} in boot-capabilities ` +
-      `(an unknown verb's help text and exit 0 is not support) — ${TELEPTY_REQUIREMENT}`);
+  if (boundVerb.kind === "lacks") {
+    // An established fact. Through an override, installing another telepty would not change the CLI
+    // dispatch runs, so the one instruction names the override instead (r3).
+    refuse(`the local telepty CLI ${TELEPTY} does not advertise ${BOUND_VERB} in its boot-capabilities verbs — ` +
+      (TELEPTY_OVERRIDDEN
+        ? `TELEPTY names this CLI, so installing another telepty does not change it: point TELEPTY at ` +
+          `@dmsdc-ai/aigentry-telepty ${TELEPTY_MIN_VERSION} or later, or unset it`
+        : TELEPTY_REQUIREMENT));
   }
-  if (boundVerb === "unprobed") {
-    // The probe never reached telepty, so the version is unknown and no upgrade is advised here;
-    // the missing-executable door above already names that condition when it is the cause.
-    refuse(`'${TELEPTY} boot-capabilities' could not be run to completion, so ${BOUND_VERB} support is unknown and ` +
-      "bound delivery to a busy worker cannot be admitted");
+  if (boundVerb.kind === "inconclusive") {
+    // Nothing about the CLI's version was established, so no upgrade is advised (r3, review R3-6).
+    refuse(`'${TELEPTY} boot-capabilities' ${boundVerb.detail}, so ${BOUND_VERB} support is unknown and bound ` +
+      `delivery to a busy worker cannot be admitted (${BOUND_VERB} is declared by @dmsdc-ai/aigentry-telepty ` +
+      `${TELEPTY_MIN_VERSION} or later); run '${TELEPTY} boot-capabilities' to see its answer`);
   }
   return { bound: { epoch: snap.epoch, ownerGeneration: snap.ownerGeneration, busyInput: snap.busyInput },
     cliKind, probe: p, startedAt, probed: true };
@@ -2058,8 +2106,7 @@ async function waitForRegistration(o: Opts, sid: string): Promise<{ kind: string
     if (spawnError === "ENOENT" || spawnError === "EACCES") {
       // On the spawn path a workspace was already opened before this wait, so say so in exactly
       // the words the deadline branch below uses: the refusal is new, the operator's cleanup is not.
-      die(`dispatch.sh: ${TELEPTY_UNAVAILABLE} for ${sid} — the telepty CLI ${TELEPTY} could not be run ` +
-        `(${spawnError}), so no session can be listed, registered or delivered to. ${TELEPTY_REQUIREMENT}. ` +
+      die(`dispatch.sh: ${TELEPTY_UNAVAILABLE} for ${sid} — ${teleptyUnstartable(spawnError)}. ` +
         "Nothing was transported" +
         (o.spawn ? `\ndispatch.sh: the workspace opened for '${sid}' is still running; close it manually before retrying` : ""), 78);
     }

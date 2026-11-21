@@ -205,6 +205,11 @@ test("1293 r2: a publishable npm-shrinkwrap.json can carry no telepty either", (
     assert.deepEqual(lockfileTeleptyProblems(read("npm-shrinkwrap.json")), [],
       "npm-shrinkwrap.json would install a telepty with this package");
   }
+  // r3 (review R3-7): this package needs no shrinkwrap, and a parsed-identity check of every alias,
+  // escape and install marker a shrinkwrap can carry is more than one guard can promise. So a root
+  // npm-shrinkwrap.json is refused outright; a maintainer who needs one must come past this line.
+  assert.equal(existsSync(join(REPO, "npm-shrinkwrap.json")), false,
+    "a root npm-shrinkwrap.json would be published and obeyed by every install of this package");
   // The rule is not vacuous: a shrinkwrap pinning telepty under an otherwise permitted package, by
   // package path, by edge, or only by its resolved url, is refused each way.
   const nested = JSON.stringify({ packages: { "": { dependencies: { "cross-spawn": "7.0.6" } },
@@ -238,4 +243,39 @@ test("1293 r1: no PRODUCTION dependency in the lockfile runs an install script a
   assert.deepEqual(production, [],
     "a production dependency declares an install script; installing this package would run it on " +
     "the host, which is exactly how a nested telepty 0.8.5 replaced a running 0.11.2 daemon");
+});
+
+test("1293 r3: the published upgrade instructions put the migration check before the upgrade command", () => {
+  // review R3-1 (MAJOR). README.md is the npm-facing install page; following its one npm command
+  // deletes a 0.2.5-0.2.7 install's nested telepty before 0.2.8's init could say anything. So the
+  // check that a telepty of the operator's own is installed and that no override or service points
+  // into the orchestrator's directory must come FIRST, wherever the package says how to upgrade:
+  // README.md, the template it is generated from, and the CHANGELOG 0.2.8 upgrade section. This
+  // FAILS on r2, whose README named only the npm command.
+  const CHECKS = [
+    "command -v telepty",
+    'echo "${TELEPTY-}"',
+    "grep -rl 'aigentry-orchestrator/node_modules' ~/Library/LaunchAgents",
+    "grep -rl 'aigentry-orchestrator/node_modules' ~/.config/systemd/user /etc/systemd/system",
+  ];
+  const section = (text: string, start: string, end: string): string => {
+    const from = text.indexOf(start);
+    assert.ok(from >= 0, `missing section ${start}`);
+    const to = text.indexOf(end, from + start.length);
+    return text.slice(from, to < 0 ? undefined : to);
+  };
+  const docs: readonly (readonly [string, string, string])[] = [
+    ["README.md", section(read("README.md"), "## Install\n", "\n## "), "npm i -g @dmsdc-ai/aigentry-orchestrator"],
+    ["README.tmpl.md", section(read("README.tmpl.md"), "## Install\n", "\n## "), "npm i -g {{name}}"],
+    ["CHANGELOG.md 0.2.8", section(read("CHANGELOG.md"), "### Upgrading from 0.2.5-0.2.7\n", "\n### "),
+      "npm i -g @dmsdc-ai/aigentry-orchestrator"],
+  ];
+  for (const [label, text, upgrade] of docs) {
+    const at = text.indexOf(upgrade);
+    assert.ok(at >= 0, `${label}: the upgrade command is missing`);
+    for (const check of CHECKS) {
+      const where = text.indexOf(check);
+      assert.ok(where >= 0 && where < at, `${label}: '${check}' must appear before '${upgrade}'`);
+    }
+  }
 });

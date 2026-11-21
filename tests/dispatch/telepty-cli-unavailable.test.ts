@@ -22,14 +22,38 @@
 // on every OS with no skips.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { delimiter, join } from "node:path";
 import { fixture } from "./model-router-fixtures.js";
 
 const SID = "router-fixture";
 const FROM = "E-dg1293-orchestrator";
 /** The pre-fix line: a knob that cannot help a host with no telepty. */
 const KNOB_ADVICE = /raise AIGENTRY_DISPATCH_REGISTER_TIMEOUT_MS/;
+const INSTALL = "npm i -g @dmsdc-ai/aigentry-telepty@latest";
+const WIN = process.platform === "win32";
+/** Every file name the normal lookup of `telepty` can resolve, on either platform. */
+const TELEPTY_NAMES = ["telepty", "telepty.cmd", "telepty.exe", "telepty.bat", "telepty.com"];
+
+/**
+ * r3: the fixture PATH with NO telepty in it. The fixture's own bin/telepty is removed (these cases
+ * name or need no working telepty), and any other PATH directory holding one is dropped, so a
+ * contributor's own telepty cannot decide the case. On CI no ambient directory holds one.
+ */
+function pathWithoutTelepty(f: ReturnType<typeof fixture>): string {
+  for (const name of TELEPTY_NAMES) rmSync(join(f.bin, name), { force: true });
+  return (f.env.PATH ?? "").split(delimiter)
+    .filter((dir) => !TELEPTY_NAMES.some((name) => existsSync(join(dir, name)))).join(delimiter);
+}
+
+/** r3: a PATH directory holding a telepty the normal lookup finds on this platform; returns [PATH, file]. */
+function pathWithTelepty(f: ReturnType<typeof fixture>): [string, string] {
+  const dir = join(f.root, "path-telepty");
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, WIN ? "telepty.cmd" : "telepty");
+  writeFileSync(file, WIN ? "@echo off\r\nexit /b 0\r\n" : "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  return [[dir, f.env.PATH ?? ""].join(delimiter), file];
+}
 
 /**
  * "Nothing was recorded": no dispatch row in the registry, and the task queue byte-identical. The
@@ -47,19 +71,22 @@ test("1293: a telepty that cannot be run refuses with exit 78 TELEPTY_CLI_UNAVAI
     f.prepareTarget();
     const before = recorded(f.root, f.queue);
     const missing = join(f.root, "no-such-telepty");
+    // r3 (review R3-2): a telepty the normal lookup finds is on PATH, so the stale override is the
+    // whole problem. This FAILS on r2, which advised the global reinstall here.
+    const [withTelepty, found] = pathWithTelepty(f);
     // A registration budget far longer than this process may take. The point of the refusal is
     // that it does not spend it: the first listing already proved the command cannot run.
     const started = Date.now();
     const r = f.dispatch(["--target", SID, "--from", FROM],
-      { TELEPTY: missing, AIGENTRY_DISPATCH_REGISTER_TIMEOUT_MS: "60000" });
+      { TELEPTY: missing, PATH: withTelepty, AIGENTRY_DISPATCH_REGISTER_TIMEOUT_MS: "60000" });
     const elapsed = Date.now() - started;
     assert.equal(r.status, 78, `expected exit 78, got ${r.status}\n${r.stdout}\n${r.stderr}`);
-    assert.ok(r.stderr.includes(`dispatch.sh: TELEPTY_CLI_UNAVAILABLE for ${SID} — the telepty CLI ${missing} could not be run (ENOENT)`),
-      `the refusal does not name the condition and the resolved command:\n${r.stderr}`);
-    // The requirement, with the version floor and the one command the OPERATOR runs. Nothing in
-    // this package installs, upgrades, starts, stops or restarts telepty.
-    assert.match(r.stderr, /declares no dependency on @dmsdc-ai\/aigentry-telepty and drives the telepty on PATH/, r.stderr);
-    assert.match(r.stderr, /install @dmsdc-ai\/aigentry-telepty 0\.11\.1 or later yourself with 'npm i -g @dmsdc-ai\/aigentry-telepty@latest'/, r.stderr);
+    assert.ok(r.stderr.includes(`dispatch.sh: TELEPTY_CLI_UNAVAILABLE for ${SID} — the TELEPTY override names ${missing}, which does not exist (ENOENT)`),
+      `the refusal does not name the override and what its file is:\n${r.stderr}`);
+    // The one instruction is about the override; the fact about PATH is stated, and no reinstall is advised.
+    assert.match(r.stderr, /Correct TELEPTY or unset it; the normal PATH lookup finds telepty at /, r.stderr);
+    assert.ok(r.stderr.includes(found), `the telepty the normal lookup finds is not named:\n${r.stderr}`);
+    assert.ok(!r.stderr.includes(INSTALL), `a stale override was answered with a reinstall:\n${r.stderr}`);
     assert.match(r.stderr, /Nothing was transported/, r.stderr);
     // The advice that could not help is gone from this path.
     assert.doesNotMatch(r.stderr, KNOB_ADVICE, "a host with no telepty was still told to raise the registration timeout");
@@ -106,6 +133,87 @@ test("1293 r2: a telepty that STARTS but overflows the listing buffer keeps the 
     assert.equal(r.status, 6, `expected the registration wait's exit 6, got ${r.status}\n${r.stdout}\n${r.stderr}`);
     assert.match(r.stderr, new RegExp(`session '${SID}' never registered in telepty list`), r.stderr);
     assert.doesNotMatch(r.stderr, /TELEPTY_CLI_UNAVAILABLE/, "a telepty that started must not be reported as unavailable");
+  } finally {
+    f.cleanup();
+  }
+});
+
+// ── r3 (review R3-2): install advice only when the normal lookup finds no telepty either ─────────
+test("1293 r3: a stale override with no telepty on PATH either names the override first and the install command as a fact", () => {
+  const f = fixture();
+  try {
+    f.prepareTarget();
+    const missing = join(f.root, "no-such-telepty");
+    const r = f.dispatch(["--target", SID, "--from", FROM], { TELEPTY: missing, PATH: pathWithoutTelepty(f) });
+    assert.equal(r.status, 78, `expected exit 78, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+    assert.ok(r.stderr.includes(`the TELEPTY override names ${missing}, which does not exist (ENOENT)`), r.stderr);
+    assert.match(r.stderr, /Correct TELEPTY or unset it; the normal PATH lookup finds no executable telepty either: @dmsdc-ai\/aigentry-telepty 0\.11\.1 or later installs with /, r.stderr);
+    assert.equal(r.stderr.split(INSTALL).length - 1, 1, `the install command must appear once:\n${r.stderr}`);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("1293 r3: no override and no telepty on PATH is the one case that advises installing telepty", () => {
+  const f = fixture();
+  try {
+    f.prepareTarget();
+    // TELEPTY empty is the default lookup of the bare word `telepty` (src/dispatch/cli.ts: env.TELEPTY || "telepty").
+    const r = f.dispatch(["--target", SID, "--from", FROM], { TELEPTY: "", PATH: pathWithoutTelepty(f) });
+    assert.equal(r.status, 78, `expected exit 78, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+    assert.ok(r.stderr.includes(`dispatch.sh: TELEPTY_CLI_UNAVAILABLE for ${SID} — no telepty is on PATH (ENOENT)`), r.stderr);
+    assert.match(r.stderr, /install @dmsdc-ai\/aigentry-telepty 0\.11\.1 or later yourself with 'npm i -g @dmsdc-ai\/aigentry-telepty@latest'/, r.stderr);
+    assert.doesNotMatch(r.stderr, /TELEPTY override/, r.stderr);
+    assert.doesNotMatch(r.stderr, KNOB_ADVICE, r.stderr);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("1293 r3: an override that is not executable is named as such, with no reinstall advice, per platform", () => {
+  const f = fixture();
+  try {
+    f.prepareTarget();
+    const [withTelepty] = pathWithTelepty(f);
+    // POSIX: a regular file without an execute bit cannot be started (EACCES). win32 has no execute
+    // bit: a directory is the override that cannot be a program there.
+    const target = join(f.root, WIN ? "telepty-dir" : "telepty-not-executable");
+    if (WIN) mkdirSync(target);
+    else writeFileSync(target, "#!/bin/sh\nexit 0\n", { mode: 0o644 });
+    const r = f.dispatch(["--target", SID, "--from", FROM], { TELEPTY: target, PATH: withTelepty });
+    assert.ok(!r.stderr.includes(INSTALL), `a broken override was answered with a reinstall:\n${r.stderr}`);
+    if (WIN) {
+      // Whatever the shell reports for a directory, it is never install advice, and a refusal names the override.
+      if (r.status === 78) assert.match(r.stderr, /the TELEPTY override names .*Correct TELEPTY or unset it/, r.stderr);
+    } else {
+      assert.equal(r.status, 78, `expected exit 78, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+      assert.ok(r.stderr.includes(`the TELEPTY override names ${target}, which is not an executable file (EACCES)`), r.stderr);
+      assert.match(r.stderr, /Correct TELEPTY or unset it/, r.stderr);
+    }
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("1293 r3: a telepty on PATH that cannot be started is named, with no install advice, per platform", () => {
+  const f = fixture();
+  try {
+    f.prepareTarget();
+    const dir = join(f.root, "path-broken-telepty");
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, WIN ? "telepty.cmd" : "telepty");
+    // POSIX: an executable whose interpreter does not exist cannot be started (ENOENT), yet the
+    // lookup finds it. win32's shim door starts cmd.exe, which then fails: a listing, not a start.
+    writeFileSync(file, WIN ? "@echo off\r\nexit /b 1\r\n" : `#!${join(f.root, "no-such-interpreter")}\n`, { mode: 0o755 });
+    const r = f.dispatch(["--target", SID, "--from", FROM], { TELEPTY: "", PATH: [dir, pathWithoutTelepty(f)].join(delimiter) });
+    assert.ok(!r.stderr.includes(INSTALL), `a telepty on PATH was answered with an install:\n${r.stderr}`);
+    if (WIN) {
+      assert.equal(r.status, 6, `a shim that starts and fails is the registration wait's: ${r.status}\n${r.stderr}`);
+    } else {
+      assert.equal(r.status, 78, `expected exit 78, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+      assert.ok(r.stderr.includes(`the telepty on PATH (${file}) could not be started (ENOENT)`), r.stderr);
+      assert.match(r.stderr, /Check that file's permissions and, for a script, its interpreter/, r.stderr);
+    }
   } finally {
     f.cleanup();
   }
