@@ -200,6 +200,33 @@ function resolveTelepty() {
 }
 
 /**
+ * r5 (review R5-3): whether PATH ESTABLISHES that there is no telepty — true only when PATH is set
+ * and every entry answers ENOENT/ENOTDIR for every name a lookup could take (`telepty`, and on win32
+ * each PATHEXT suffix). A lookup above that did not finish (no /bin/sh, a signal, the timeout), an
+ * entry that holds a non-runnable telepty, or any other error leaves it unknown, and unknown draws no
+ * install command. POSIX entries are joined literally (`<entry>/telepty`), never normalised.
+ */
+function noTeleptyOnPath() {
+  const PATH = process.env.PATH;
+  if (PATH === undefined) return false;
+  const win = process.platform === "win32";
+  const names = win
+    ? ["telepty", ...(process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean).map((ext) => `telepty${ext.toLowerCase()}`)]
+    : ["telepty"];
+  return PATH.split(path.delimiter).every((raw) => {
+    const dir = win ? raw.replace(/^"(.*)"$/, "$1") : raw;
+    return names.every((name) => {
+      try {
+        fs.statSync(win ? path.join(dir, name) : dir === "" ? name : `${dir}/${name}`);
+        return false;
+      } catch (e) {
+        return e.code === "ENOENT" || e.code === "ENOTDIR";
+      }
+    });
+  });
+}
+
+/**
  * Runs `telepty boot-capabilities` ONCE, read-only: printing the sealed document starts, stops,
  * repairs, upgrades and contacts nothing. The verdict is THREE-valued (r3):
  *   ok           — the document satisfies both runtime doors
@@ -287,7 +314,7 @@ function teleptyMessage(observed) {
  * requirement as a fact, and one instruction that changes nothing — never install or replace advice.
  */
 function teleptyInconclusive(file, why) {
-  return `${why}. So init could not establish whether the telepty on PATH (${file}) declares what the later ` +
+  return `${why}. So init could not establish whether the telepty on PATH${file === null ? "" : ` (${file})`} declares what the later ` +
     `doors need: a one-line ${TELEPTY_CAPABILITIES_SCHEMA} document from 'telepty boot-capabilities' declaring ` +
     `${TELEPTY_REQUIRED_VERBS.join(" and ")} with nondeleting-v1 viewer detach (@dmsdc-ai/aigentry-telepty ` +
     `${TELEPTY_MIN_VERSION} or later). Run 'telepty boot-capabilities' yourself to see its answer. init detects ` +
@@ -298,7 +325,11 @@ function teleptyInconclusive(file, why) {
 function teleptyCheck() {
   const file = resolveTelepty();
   const verdict = file === null ? null : teleptyCapabilityVerdict(file);
-  if (verdict === null) warn(teleptyMessage("telepty is not on PATH."));
+  // r5 (review R5-3): "not on PATH", and its install command, only when PATH establishes absence.
+  if (verdict === null && !noTeleptyOnPath())
+    warn(teleptyInconclusive(null, "The lookup of telepty on PATH found none, but did not establish that none is there " +
+      "(the lookup did not finish, or a PATH entry did not answer that no telepty file exists)"));
+  else if (verdict === null) warn(teleptyMessage("telepty is not on PATH."));
   else if (verdict.kind === "refused")
     warn(teleptyMessage(`The telepty on PATH (${file}) does not report the required capabilities: ${verdict.why}.`));
   else if (verdict.kind === "inconclusive") warn(teleptyInconclusive(file, verdict.why));

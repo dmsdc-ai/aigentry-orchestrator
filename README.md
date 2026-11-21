@@ -12,31 +12,43 @@
 
 ## Install
 
-**Upgrading from 0.2.5-0.2.7?** Those versions installed a copy of telepty inside the
-orchestrator's own directory, and upgrading deletes it. Do these steps in this order. Each is
-safe to run whether or not a telepty is already installed:
+**Upgrading from 0.2.5-0.2.7?** Those versions declared a dependency on telepty, so npm
+installed a telepty 0.8.x inside the orchestrator's own directory. This version declares none.
+Do these steps in this order:
 
 1. Install the latest telepty globally: `npm i -g @dmsdc-ai/aigentry-telepty@latest`.
    telepty 0.11.3 or newer never replaces a newer running daemon, and does nothing when it is
    installed as a dependency of another package.
-2. Make the telepty service use that installation: `telepty-install`. This is what repairs a
-   service that pointed into the orchestrator's directory. If you set `TELEPTY`, unset it or
-   point it at that installation.
-3. Only then upgrade the orchestrator: `npm i -g @dmsdc-ai/aigentry-orchestrator`.
-4. Read which versions now run, changing nothing: `telepty --version`, and the `version` the
-   daemon reports:
+2. Upgrade the orchestrator: `npm i -g @dmsdc-ai/aigentry-orchestrator`.
+3. Read what now runs. These reads change nothing:
+   - `command -v telepty` (on Windows, `where telepty`; in PowerShell, `where.exe telepty`)
+     shows the file your shell finds for `telepty`. It does not show what that file runs when it
+     is a wrapper or a symlink, and it does not show what a service starts.
+   - `telepty --version` shows the version of the telepty your shell runs. It does not show the
+     daemon's version.
+   - The `version` that the daemon on `TELEPTY_PORT` (default 3848) reports from its meta
+     endpoint:
 
-   ```sh
-   ( cd "$(npm root -g)/@dmsdc-ai/aigentry-orchestrator" && . bin/lib/telepty-auth.sh &&
-     curl -s --noproxy '*' --max-time 5 -H "x-telepty-token: $(telepty_auth_token)" \
-          "http://127.0.0.1:${TELEPTY_PORT:-3848}/api/meta" )
-   ```
+     ```sh
+     ( cd "$(npm root -g)/@dmsdc-ai/aigentry-orchestrator" && . bin/lib/telepty-auth.sh &&
+       curl -s --noproxy '*' --max-time 5 -H "x-telepty-token: $(telepty_auth_token)" \
+            "http://127.0.0.1:${TELEPTY_PORT:-3848}/api/meta" )
+     ```
 
-   This shows what runs now. It does not prove that nothing else points into the old directory.
+     This shows the version of the daemon that answers on that port now. It does not show which
+     installation that daemon was started from, or what a service will start next time. An
+     answer without a `version` field shows no version.
 
-On Windows, steps 1 and 3 and `telepty --version` are the same, and the daemon command needs
-Git Bash. This release has not verified what `telepty-install` does to the telepty scheduled
-task. Read the task's action with `schtasks /query /v /fo list`.
+   On Windows the commands of steps 1 and 2 and the first two reads are the same. The daemon
+   read is a bash command that also needs `python3` and `curl`. This release has not verified it
+   on Windows.
+
+If they disagree — the CLI and the daemon report different versions, or either reports a version
+older than the telepty you installed in step 1 — then your shell or a service still selects
+another copy of telepty. That can be a wrapper script earlier on PATH, a symlink, a `TELEPTY`
+variable (the orchestrator runs what it names), or a service definition written by an older
+install. Find the one that applies and correct it as telepty's own documentation describes. This
+document prescribes no command for it.
 
 A new install:
 

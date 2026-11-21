@@ -34,6 +34,7 @@ import { loadWorkerScope, prepareWorkerSandbox, assertConfinedTarget, stageWorke
   readSandboxCurrent, readSealedManifest } from "../session/worker-sandbox.js";
 import { CLAUDE_OAUTH_OPT_IN } from "../session/claude-worker-oauth.js";
 import { validateSpawnDecision, type SpawnDecision } from "../session/model-decision.js";
+import { bootCapabilitiesDocument } from "../orchestrator-boot/plan.js";
 
 // ── environment seams (identical names/defaults to the shell) ────────────────
 // SCRIPT_DIR was `cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P` — the repo's
@@ -1180,15 +1181,31 @@ const TELEPTY_REQUIREMENT =
 const TELEPTY_OVERRIDDEN = TELEPTY !== "telepty";
 
 /** r3: the first PATH entry holding an executable telepty — the normal lookup — or null. r4 (review
- *  R4-4): a relative or empty entry is searched too, from this process's cwd, as the spawn does. */
-function teleptyOnPath(): string | null {
-  const names = process.platform === "win32"
+ *  R4-4): a relative or empty entry is searched too, from this process's cwd, as the spawn does.
+ *  r5 (review R5-3): `absent` is true only when PATH is set and EVERY candidate's lookup failed with
+ *  ENOENT/ENOTDIR; a candidate that exists without being runnable, or any other error, leaves absence
+ *  unestablished. POSIX entries are joined literally (`<entry>/telepty`), never normalised, so a
+ *  `link/..` component resolves through the kernel as the spawn's own lookup does. */
+function teleptyOnPath(): { readonly found: string | null; readonly absent: boolean } {
+  const win = process.platform === "win32";
+  const names = win
     ? (env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";").filter((ext) => ext !== "").map((ext) => `telepty${ext.toLowerCase()}`)
     : ["telepty"];
+  let absent = env.PATH !== undefined;
   for (const dir of (env.PATH || "").split(path.delimiter)) {
-    for (const name of names) if (isExecutable(path.join(dir, name))) return path.join(dir, name);
+    for (const name of names) {
+      const file = win ? path.join(dir, name) : dir === "" ? name : `${dir}/${name}`;
+      if (isExecutable(file)) return { found: file, absent: false };
+      try {
+        fs.statSync(file);
+        absent = false;
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ENOTDIR") absent = false;
+      }
+    }
   }
-  return null;
+  return { found: null, absent };
 }
 
 /**
@@ -1198,7 +1215,7 @@ function teleptyOnPath(): string | null {
  * override and the PATH lookup finds no telepty.
  */
 function teleptyUnstartable(errno: string): string {
-  const onPath = teleptyOnPath();
+  const { found: onPath, absent } = teleptyOnPath();
   if (TELEPTY_OVERRIDDEN) {
     let what = `could not be started (${errno})`;
     if (path.isAbsolute(TELEPTY)) {
@@ -1221,6 +1238,10 @@ function teleptyUnstartable(errno: string): string {
   if (onPath !== null || errno !== "ENOENT")
     return `the telepty on PATH${onPath !== null ? ` (${onPath})` : ""} could not be started (${errno}), so no ` +
       "session can be listed, registered or delivered to. Check that file's permissions and, for a script, its interpreter";
+  // r5 (review R5-3): ENOENT with nothing found is "no telepty" only when the lookup ESTABLISHED absence.
+  if (!absent)
+    return `the telepty command could not be started (${errno}), and a look at PATH did not establish that no telepty ` +
+      "is there, so no session can be listed, registered or delivered to. Check the PATH entries that dispatch searches";
   return `no telepty is on PATH (${errno}), so no session can be listed, registered or delivered to. ${TELEPTY_REQUIREMENT}`;
 }
 /**
@@ -1338,10 +1359,10 @@ function boundVerbVerdict(): { kind: "ok" | "lacks" | "inconclusive"; detail: st
     const doc = JSON.parse(r.stdout) as { schema?: unknown; verbs?: unknown };
     if (doc !== null && typeof doc === "object" && Array.isArray(doc.verbs)) {
       if (doc.verbs.includes(BOUND_VERB)) return { kind: "ok", detail: "" };
-      // r4 (review R4-3): only a telepty-boot-capabilities-v1 document of string verbs ESTABLISHES the
+      // r4 (review R4-3): only a well-formed telepty-boot-capabilities-v1 document ESTABLISHES the
       // lack; any other object with a verbs array is malformed, so inconclusive. Admission is unchanged.
-      if (doc.schema === "telepty-boot-capabilities-v1" && doc.verbs.every((v) => typeof v === "string"))
-        return { kind: "lacks", detail: "" };
+      // r5 (review R5-2): "well-formed" is the boot door's own rule (plan.ts bootCapabilitiesDocument).
+      if (bootCapabilitiesDocument(r.stdout) !== null) return { kind: "lacks", detail: "" };
       return { kind: "inconclusive", detail: `printed a verbs array without ${BOUND_VERB} outside a valid telepty-boot-capabilities-v1 document` };
     }
   } catch {

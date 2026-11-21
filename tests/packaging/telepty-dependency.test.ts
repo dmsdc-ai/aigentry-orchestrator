@@ -263,46 +263,76 @@ test("1293 r1: no PRODUCTION dependency in the lockfile runs an install script a
     "the host, which is exactly how a nested telepty 0.8.5 replaced a running 0.11.2 daemon");
 });
 
-test("1293 r4: the published upgrade instructions are the four safe steps, in order, with no check offered as proof", () => {
-  // review R3-1, then R4-1 (MAJOR). README.md is the npm-facing install page; following its one npm
-  // command deletes a 0.2.5-0.2.7 install's nested telepty. r3 put a grep/command -v check first, and
-  // that check could pass while a symlinked CLI or service still pointed into the pruned tree. r4
-  // replaces detection by a sequence that is safe unconditionally: (1) install the latest telepty
-  // globally, (2) re-run telepty's own installer so the service uses it, (3) only then upgrade the
-  // orchestrator, (4) read both versions — in README.md, its template and the CHANGELOG 0.2.8
-  // upgrade section. This FAILS on r3, whose instructions named no installer step and kept the greps.
-  const section = (text: string, start: string, end: string): string => {
+test("1293 r5: the published upgrade instructions are non-destructive — two installs, then read-only reads, and no prescribed fix", () => {
+  // review R4-1, then R5-1 (MAJOR) / R5-4. Three rounds of instructions each told the operator to
+  // CHANGE something (prune a nested tree, run telepty's service installer, unset or repoint a
+  // variable) whose safety depends on host facts no document can establish; a site wrapper or a
+  // service still pointing into the old directory then broke. r5's instructions change nothing beyond
+  // the two npm installs: (1) the latest telepty globally, (2) the orchestrator, (3) read-only reads,
+  // each bounded by what it does not show, and (4) one "if they disagree" paragraph that names the
+  // possible causes and prescribes no command. Driven by README.md, its template and the CHANGELOG
+  // 0.2.8 upgrade section. This FAILS on r4, whose sections run `telepty-install`, tell the operator to
+  // unset TELEPTY and query schtasks, and say step 2 repairs a service.
+  const between = (text: string, start: string, end: string): string => {
     const from = text.indexOf(start);
     assert.ok(from >= 0, `missing section ${start}`);
     const to = text.indexOf(end, from + start.length);
-    return text.slice(from, to < 0 ? undefined : to).replace(/\s+/g, " ");
+    assert.ok(to > from, `section ${start} has no end marker ${end}`);
+    return text.slice(from, to);
   };
   const docs: readonly (readonly [string, string, string])[] = [
-    ["README.md", section(read("README.md"), "## Install\n", "\n## "), "npm i -g @dmsdc-ai/aigentry-orchestrator"],
-    ["README.tmpl.md", section(read("README.tmpl.md"), "## Install\n", "\n## "), "npm i -g {{name}}"],
-    ["CHANGELOG.md 0.2.8", section(read("CHANGELOG.md"), "### Upgrading from 0.2.5-0.2.7\n", "\n### "),
+    ["README.md", between(read("README.md"), "**Upgrading from 0.2.5-0.2.7?**", "\nA new install:"),
+      "npm i -g @dmsdc-ai/aigentry-orchestrator"],
+    ["README.tmpl.md", between(read("README.tmpl.md"), "**Upgrading from 0.2.5-0.2.7?**", "\nA new install:"),
+      "npm i -g {{name}}"],
+    ["CHANGELOG.md 0.2.8", between(read("CHANGELOG.md"), "### Upgrading from 0.2.5-0.2.7\n", "\n### "),
       "npm i -g @dmsdc-ai/aigentry-orchestrator"],
   ];
-  for (const [label, text, upgrade] of docs) {
-    const steps = ["npm i -g @dmsdc-ai/aigentry-telepty@latest", "telepty-install", upgrade, "telepty --version", "/api/meta"];
-    let last = -1;
-    for (const step of steps) {
-      const at = text.indexOf(step);
-      assert.ok(at > last, `${label}: '${step}' is missing or out of order (the order is the safety)`);
-      last = at;
+  // Every instruction class the three rejected rounds used to change host state beyond the two installs.
+  const DESTRUCTIVE: readonly (readonly [string, RegExp])[] = [
+    ["prune", /\bprun(e|ed|es|ing)\b/i],
+    ["uninstall", /uninstall/i],
+    ["rm", /\brm\b/],
+    ["delete", /\bdelet(e|ed|es|ing)\b/i],
+    ["telepty-install", /telepty-install/],
+    ["unset", /\bunset\b/i],
+    ["launchctl", /launchctl/i],
+    ["systemctl", /systemctl/i],
+    ["schtasks", /schtasks/i],
+    ["a step that repairs a service", /repair/i],
+  ];
+  for (const [label, raw, upgrade] of docs) {
+    const text = raw.replace(/\s+/g, " ");
+    for (const [name, pattern] of DESTRUCTIVE)
+      assert.doesNotMatch(text, pattern, `${label}: the upgrade section still carries a '${name}' instruction`);
+    // r4's guards against the r3 check-driven sequence stay (review R4-1/R4-9).
+    for (const detection of ["grep -rl", "If a check fail"])
+      assert.ok(!text.includes(detection), `${label}: the unreliable check '${detection}' is still offered`);
+    // The two installs, in order, then every read-only read AFTER both of them.
+    const telepty = text.indexOf("npm i -g @dmsdc-ai/aigentry-telepty@latest");
+    const orchestrator = text.indexOf(upgrade);
+    assert.ok(telepty >= 0 && orchestrator > telepty, `${label}: telepty must be installed before the orchestrator is upgraded`);
+    assert.equal(text.split("npm i -g ").length - 1, 2, `${label}: the upgrade section must run exactly the two installs`);
+    for (const probe of ["command -v telepty", "where telepty", "telepty --version", "/api/meta"]) {
+      const at = text.indexOf(probe);
+      assert.ok(at > orchestrator, `${label}: the read '${probe}' is missing or precedes the two installs`);
     }
     assert.ok(text.includes("telepty 0.11.3 or newer never replaces a newer running daemon, and does nothing when it is installed as a dependency"),
       `${label}: step 1 does not say why it is safe`);
-    assert.ok(text.includes("This is what repairs a service that pointed into the orchestrator's directory"),
-      `${label}: step 2 does not say what it repairs`);
-    assert.ok(text.includes("It does not prove"), `${label}: the read-only step is not bounded`);
-    assert.ok(text.includes("has not verified what `telepty-install` does to the telepty scheduled task"),
-      `${label}: the Windows coverage is not stated`);
-    for (const detection of ["grep -rl", "command -v telepty", "If a check fail"])
-      assert.ok(!text.includes(detection), `${label}: the unreliable check '${detection}' is still offered`);
+    assert.ok(text.includes("These reads change nothing"), `${label}: the reads are not stated to be read-only`);
+    assert.equal(text.split("It does not show").length - 1, 3, `${label}: each of the three reads must say what it does not show`);
+    // (4) one paragraph: the possible causes are named, and no command is prescribed for any of them.
+    const disagree = raw.split(/\n[ \t]*\n/).filter((p) => p.includes("If they disagree"));
+    assert.equal(disagree.length, 1, `${label}: there must be exactly one "If they disagree" paragraph`);
+    const paragraph = disagree[0].replace(/\s+/g, " ");
+    assert.ok(text.indexOf("If they disagree") > text.indexOf("/api/meta"), `${label}: "If they disagree" precedes the reads`);
+    for (const cause of ["wrapper", "symlink", "`TELEPTY` variable", "service definition written by an older install", "telepty's own documentation"])
+      assert.ok(paragraph.includes(cause), `${label}: "If they disagree" does not name '${cause}'`);
+    assert.deepEqual(paragraph.match(/`[^`]*`/g), ["`TELEPTY`"], `${label}: "If they disagree" prescribes a command`);
+    assert.ok(!/```/.test(paragraph), `${label}: "If they disagree" carries a code block`);
   }
   // The 0.2.8 entry shows no orchestrator install command before its upgrade steps (review R4-1).
-  const entry = section(read("CHANGELOG.md"), "## [0.2.8]", "\n## [");
+  const entry = between(read("CHANGELOG.md"), "## [0.2.8]", "\n## [");
   assert.ok(entry.indexOf("npm i -g @dmsdc-ai/aigentry-orchestrator") > entry.indexOf("### Upgrading from 0.2.5-0.2.7"),
     "CHANGELOG 0.2.8 shows the orchestrator install command before the upgrade steps");
 });

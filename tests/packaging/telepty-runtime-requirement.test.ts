@@ -41,7 +41,9 @@
 //     with). win32's step 1 probes jq.exe/python.exe by RUNNING them and resolves Git for Windows
 //     bash before it reaches the telepty check, and those are real host tools — so win32 appends
 //     ONLY the ambient directories that hold jq.exe, python.exe, bash.exe or git.exe (review F8),
-//     never the whole ambient PATH, so a contributor's own telepty cannot decide a case;
+//     never the whole ambient PATH, so a contributor's own telepty cannot decide a case (the one
+//     FULL init also appends the directory of process.execPath, the win32 stand-in for POSIX's
+//     `node` symlink, under the same no-telepty guard);
 //   * the service case writes a launchd plist on darwin and a systemd unit on linux, and asserts
 //     silence on every platform, because init inspects no service definition.
 import { test } from "node:test";
@@ -127,6 +129,20 @@ function windowsToolDirs(): string[] {
   return dirs;
 }
 
+/**
+ * win32 CI 910 (r5): the FULL init's step 5 runs bin/install-instructions.sh under Git bash, and that
+ * script calls `node` (substitute_tokens). POSIX symlinks process.execPath into the fixture bin for
+ * it; win32 cannot rely on a symlink, so it appends exactly the directory of process.execPath — the
+ * node this suite already runs — under the same guard as windowsToolDirs(). It goes LAST, after the
+ * fixture bin, so the npm/npx tripwires there still shadow the npm.cmd/npx.cmd beside node.exe.
+ */
+function windowsNodeDir(): string {
+  const dir = dirname(process.execPath);
+  const shared = ["telepty.cmd", "telepty.exe", "telepty.bat", "telepty.com"].filter((name) => existsSync(join(dir, name)));
+  assert.deepEqual(shared, [], "the directory of process.execPath also holds a telepty; it would decide these cases");
+  return dir;
+}
+
 interface Options {
   /** The telepty stub's JS body, or undefined for no telepty at all. */
   readonly telepty?: string;
@@ -198,6 +214,10 @@ fs.appendFileSync(${JSON.stringify(argvLog)}, JSON.stringify({ argv: process.arg
 ${options.telepty}`);
   }
   const dirs = [...(options.teleptyDir === undefined ? [] : [teleptyDir]), bin, ...(WIN ? windowsToolDirs() : [])];
+  if (WIN && options.scaffold === true) {
+    const nodeDir = windowsNodeDir();
+    if (!dirs.includes(nodeDir)) dirs.push(nodeDir);
+  }
   return { root, bin, home, ws: join(root, "ws"), argvLog, tripwireLog, path: dirs.join(delimiter) };
 }
 

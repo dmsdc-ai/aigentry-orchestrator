@@ -58,6 +58,8 @@ import { USAGE } from "./usage.js";
 // HERE, at the top of the one module the shim runs, and the plan they produce is resolved
 // BEFORE the first effect below.
 import {
+  BOOT_CAPABILITIES_SCHEMA,
+  bootCapabilitiesDocument,
   type BootPlan,
   type HandoffPreview,
   type InputPolicy,
@@ -429,7 +431,6 @@ interface Preflight {
 
 const PREFLIGHT_TIMEOUT_MS = 5000;
 const PREFLIGHT_OUTPUT_BYTES = 1024 * 1024;
-const BOOT_CAPABILITIES_SCHEMA = "telepty-boot-capabilities-v1";
 const CREATE_VERB = "allow-create-v1";
 const REQUIRED_DAEMON_CAPS = ["wrapped-sessions", "register-create-only"] as const;
 // #1293 — this package declares NO dependency on @dmsdc-ai/aigentry-telepty. The boot door execs the
@@ -518,21 +519,24 @@ function bootDoor(script: BootDoorScript, args: readonly string[], stderr: "pipe
  * exits 127 itself, so a 127 is read as "no telepty" only when no PATH entry holds a `telepty`
  * file — the lookup bash made, repeated without running anything. PATH unset: unknown.
  * r4 (review R4-4): absence is established only by ENOENT/ENOTDIR for every candidate; any other
- * answer (an unreadable directory, say) leaves it unknown. On win32 bash also finds `telepty.exe`.
+ * answer (an unreadable directory, say) leaves it unknown.
+ * r5 (review R5-3): each entry is looked up LITERALLY as `<entry>/telepty`, never normalised, so a
+ * `link/..` component resolves through the kernel as bash's own lookup does. On win32 the door's
+ * bash is Git for Windows' MSYS bash, whose command lookup this walk has not been shown to
+ * reproduce, so a win32 127 never establishes absence: inconclusive, no install advice.
  */
 function noTeleptyOnPath(): boolean {
   const dirs = BOOT_DOOR_ENV.PATH;
-  if (dirs === undefined) return false;
-  const names = process.platform === "win32" ? ["telepty", "telepty.exe"] : ["telepty"];
-  return dirs.split(path.delimiter).every((dir) => names.every((name) => {
+  if (dirs === undefined || process.platform === "win32") return false;
+  return dirs.split(path.delimiter).every((dir) => {
     try {
-      fs.statSync(path.join(dir === "" ? "." : dir, name));
+      fs.statSync(dir === "" ? "telepty" : `${dir}/telepty`);
       return false;
     } catch (e) {
       const code = (e as NodeJS.ErrnoException).code;
       return code === "ENOENT" || code === "ENOTDIR";
     }
-  }));
+  });
 }
 
 /**
@@ -560,23 +564,12 @@ function bootCapabilitiesRefusal(): { readonly reason: string; readonly confirme
   const out = r.stdout ?? "";
   if (!out.endsWith("\n") || out.indexOf("\n") !== out.length - 1)
     return inconclusive("'telepty boot-capabilities' did not print exactly one line (an older telepty prints its help and exits 0)");
-  const doc = jsonObject(out);
-  const verbs = doc?.verbs;
-  if (
-    doc === null ||
-    Object.keys(doc).sort().join(",") !== "schema,verbs,viewer_detach" ||
-    doc.schema !== BOOT_CAPABILITIES_SCHEMA ||
-    !Array.isArray(verbs) ||
-    !verbs.every((v) => typeof v === "string") ||
-    new Set(verbs).size !== verbs.length ||
-    !verbs.includes(CREATE_VERB) ||
-    doc.viewer_detach !== "nondeleting-v1"
-  )
-    // r3: only a WELL-FORMED v1 document that lacks the verb or the detach establishes an older telepty.
-    // r4 (review R4-3): well-formed includes a string viewer_detach; null or any other type is malformed.
-    return (doc !== null && Object.keys(doc).sort().join(",") === "schema,verbs,viewer_detach" &&
-      doc.schema === BOOT_CAPABILITIES_SCHEMA && Array.isArray(verbs) && verbs.every((v) => typeof v === "string") &&
-      new Set(verbs).size === verbs.length && typeof doc.viewer_detach === "string" ? confirmed : inconclusive)(
+  // r3: only a WELL-FORMED v1 document that lacks the verb or the detach establishes an older telepty.
+  // r4 (review R4-3): well-formed includes a string viewer_detach; null or any other type is malformed.
+  // r5 (review R5-2): the well-formedness rule is plan.ts bootCapabilitiesDocument, shared with dispatch.
+  const doc = bootCapabilitiesDocument(out);
+  if (doc === null || !doc.verbs.includes(CREATE_VERB) || doc.viewer_detach !== "nondeleting-v1")
+    return (doc !== null ? confirmed : inconclusive)(
       `'telepty boot-capabilities' did not print a ${BOOT_CAPABILITIES_SCHEMA} document with ${CREATE_VERB} and nondeleting-v1 viewer detach`);
   return null;
 }

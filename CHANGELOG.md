@@ -36,37 +36,47 @@ one dispatch exit code (see **Changed**). **If you use 0.2.5-0.2.7, read
 
 ### Upgrading from 0.2.5-0.2.7
 
-Those versions installed a telepty 0.8.x inside the orchestrator's install
-directory, and upgrading deletes it. As the user the telepty daemon runs as, do
-these steps in this order. Each is safe to run whether or not a telepty is
-already installed:
+Those versions declared a dependency on telepty, so npm installed a telepty
+0.8.x inside the orchestrator's install directory. This version declares none.
+As the user the telepty daemon runs as, do these steps in this order:
 
 1. Install the latest telepty globally:
    `npm i -g @dmsdc-ai/aigentry-telepty@latest`. telepty 0.11.3 or newer never
    replaces a newer running daemon, and does nothing when it is installed as a
    dependency of another package.
-2. Make the telepty service use that installation, with telepty's own
-   installer: `telepty-install`. This is what repairs a service that pointed
-   into the orchestrator's directory. If you set `TELEPTY`, unset it or point
-   it at that installation.
-3. Only then upgrade the orchestrator:
-   `npm i -g @dmsdc-ai/aigentry-orchestrator`.
-4. Read which versions now run, changing nothing: `telepty --version`, and the
-   `version` the daemon reports on its port (`TELEPTY_PORT`, default 3848):
+2. Upgrade the orchestrator: `npm i -g @dmsdc-ai/aigentry-orchestrator`.
+3. Read what now runs. These reads change nothing:
+   - `command -v telepty` (on Windows, `where telepty`; in PowerShell,
+     `where.exe telepty`) shows the file your shell finds for `telepty`. It
+     does not show what that file runs when it is a wrapper or a symlink, and
+     it does not show what a service starts.
+   - `telepty --version` shows the version of the telepty your shell runs. It
+     does not show the daemon's version.
+   - The `version` that the daemon on `TELEPTY_PORT` (default 3848) reports
+     from its meta endpoint:
 
-   ```
-   ( cd "$(npm root -g)/@dmsdc-ai/aigentry-orchestrator" && . bin/lib/telepty-auth.sh &&
-     curl -s --noproxy '*' --max-time 5 -H "x-telepty-token: $(telepty_auth_token)" \
-          "http://127.0.0.1:${TELEPTY_PORT:-3848}/api/meta" )
-   ```
+     ```
+     ( cd "$(npm root -g)/@dmsdc-ai/aigentry-orchestrator" && . bin/lib/telepty-auth.sh &&
+       curl -s --noproxy '*' --max-time 5 -H "x-telepty-token: $(telepty_auth_token)" \
+            "http://127.0.0.1:${TELEPTY_PORT:-3848}/api/meta" )
+     ```
 
-   This shows what runs now. It does not prove that nothing else points into
-   the old directory. The orchestrator does none of these steps for you.
+     This shows the version of the daemon that answers on that port now. It
+     does not show which installation that daemon was started from, or what a
+     service will start next time. An answer without a `version` field shows
+     no version. The orchestrator does none of these steps for you.
 
-On Windows, steps 1 and 3 and `telepty --version` are the same, and the daemon
-command needs Git Bash. This release has not verified what `telepty-install`
-does to the telepty scheduled task. Read the task's action with
-`schtasks /query /v /fo list`.
+   On Windows the commands of steps 1 and 2 and the first two reads are the
+   same. The daemon read is a bash command that also needs `python3` and
+   `curl`. This release has not verified it on Windows.
+
+If they disagree — the CLI and the daemon report different versions, or either
+reports a version older than the telepty you installed in step 1 — then your
+shell or a service still selects another copy of telepty. That can be a
+wrapper script earlier on PATH, a symlink, a `TELEPTY` variable (the
+orchestrator runs what it names), or a service definition written by an older
+install. Find the one that applies and correct it as telepty's own
+documentation describes. This document prescribes no command for it.
 
 After the upgrade, `aigentry-orchestrator init` (also `--dry-run`, which writes
 nothing) checks only the telepty on PATH, by its `telepty boot-capabilities`
@@ -85,9 +95,11 @@ definition, no `TELEPTY` and no running daemon.
   `inject-bound-v1` or `nondeleting-v1` viewer detach, produces exactly **one**
   message: what was observed, the requirement, that this is
   `@dmsdc-ai/aigentry-telepty` **0.11.1 or later**, and the command
-  `npm i -g @dmsdc-ai/aigentry-telepty@latest`. Any other answer — a non-zero
-  exit, a signal, a timeout, output that is not a valid document — is reported
-  as inconclusive, with the requirement and no install advice. init's old
+  `npm i -g @dmsdc-ai/aigentry-telepty@latest`. "No telepty on PATH" means
+  every PATH entry answers ENOENT or ENOTDIR for it. Any other answer — a
+  lookup that does not establish that, a non-zero exit, a signal, a timeout,
+  output that is not a valid document — is reported as inconclusive, with the
+  requirement and no install advice. init's old
   message, which called telepty a dependency installed nested under this
   package, is withdrawn.
 - **A telepty command that cannot be started is refused by dispatch at once,
@@ -97,30 +109,37 @@ definition, no `TELEPTY` and no running daemon.
   registration wait that cannot start the command (`ENOENT` or `EACCES`) exits
   **78 `TELEPTY_CLI_UNAVAILABLE`**. A failing `TELEPTY` override is named, with
   what its file is, and the instruction to correct or unset it, with no install
-  command; install advice is given only with no override and no telepty on
-  PATH. A telepty that starts keeps exit 6,
+  command; install advice is given only with no override and when every PATH
+  entry answers ENOENT or ENOTDIR for telepty. A telepty that starts keeps exit 6,
   including one whose listing overflows its buffer. **This changes an outcome:**
   a lane that read exit 6 as "not up yet, retry" must read 78 as "fix the host".
 - **orchestrator-boot's install advice is given only when a fact justifies it.**
-  The verdict, exit code and first stderr line are unchanged. A second stderr
-  line names the version and install command only when no telepty is on PATH
-  (bash exit 127 and no `telepty` file in any PATH entry) or the CLI's
-  valid capability document lacks `allow-create-v1` or `nondeleting-v1` viewer
-  detach. A daemon whose `/api/meta` does not list a required capability gets a
-  line stating that, with no restart advice. Anything else gets no second line.
+  The verdict (`boot preflight UNSUPPORTED`), exit 3 and the first stderr
+  line's form are unchanged. One reason in that line changed: when bash exits
+  127 and the lookup below does not establish that no telepty is on PATH, the
+  reason no longer says that none is there; it says the exit may be telepty's
+  own. A second stderr line names the version and install command only when
+  bash exits 127 and every PATH entry answers ENOENT or ENOTDIR for
+  `<entry>/telepty` (a PATH that is unset, or any other answer, establishes
+  nothing; on Windows this lookup is not taken as evidence, because it has not
+  been shown to match Git Bash's), or when the CLI's valid capability document
+  lacks `allow-create-v1` or `nondeleting-v1` viewer detach. A daemon whose
+  `/api/meta` does not list a required capability gets a line stating that,
+  with no restart advice. Anything else gets no second line.
 
 For an ordinary missing telepty the three doors therefore answer:
 
 | Door | Answer |
 |---|---|
 | `aigentry-orchestrator init` | one warning, exit 0 — telepty is not a hard dependency of init |
-| `orchestrator-boot` | exit 3, `boot preflight UNSUPPORTED`, plus the install line, when the boot preflight runs; a supervised boot can refuse earlier with exit 2 at its `telepty allow-check` admission |
+| `orchestrator-boot` | exit 3, `boot preflight UNSUPPORTED`, plus the install line on Linux and macOS, when the boot preflight runs; a supervised boot can refuse earlier with exit 2 at its `telepty allow-check` admission |
 | `dispatch` | exit 78 `TELEPTY_CLI_UNAVAILABLE` at the registration wait; a dispatch that ends before that wait keeps that branch's own outcome |
 
 Bound delivery to a busy worker keeps exit 78 `BOUND_INJECT_UNSUPPORTED` when
 the CLI does not declare `inject-bound-v1` or its answer cannot be read; only
-a valid `telepty-boot-capabilities-v1` document without the verb draws upgrade
-advice. Boot does not require that verb.
+a `telepty-boot-capabilities-v1` document that passes the boot door's own
+rule (the one init applies too) and lacks the verb draws upgrade advice. Boot
+does not require that verb.
 
 ### Requirements
 
