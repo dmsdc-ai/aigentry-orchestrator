@@ -109,6 +109,11 @@ const BACKOFF_MAX = env.RECONCILER_BACKOFF_MAX || "1000";
 const SURFACE_ORPHANED_SRC = env.AIGENTRY_SURFACE_ORPHANED_SOURCE || path.join(STATE_DIR, "surface-orphaned.jsonl");
 const SURFACE_MISMATCHED_SRC =
   env.AIGENTRY_SURFACE_MISMATCHED_SOURCE || path.join(STATE_DIR, "surface-mismatched.jsonl");
+// #507/#616 OPT-IN, default OFF: treat a surface_mismatched event as a diagnostic
+// observation and actuate nothing. Unset or any value but "1" keeps the existing behaviour
+// on EVERY adapter — including Warp, whose raise is the only visual cue some operators have
+// (review F3). See consumeSurfaceMismatched for what each arm does and why.
+const SURFACE_MISMATCH_DIAGNOSTIC_ONLY = env.AIGENTRY_SURFACE_MISMATCH_DIAGNOSTIC_ONLY === "1";
 const RESUME_MARKER = env.AIGENTRY_SLEEP_RESUME_MARKER || path.join(STATE_DIR, "sleep-resume.json");
 const RESUME_MAX_PER_HOUR = env.RECONCILER_RESUME_MAX_PER_HOUR || "3";
 const SLEEP_QUEUE = env.AIGENTRY_SLEEP_TELEMETRY_QUEUE || path.join(STATE_DIR, "sleep-telemetry-queue.log");
@@ -1087,19 +1092,29 @@ function consumeSurfaceOrphaned(gcRoot: string, keepAlive: string): void {
 
 /**
  * consume_surface_mismatched — telepty signals a live session whose surface is
- * ALIVE-but-mismatched (task #507). The event is a DIAGNOSTIC OBSERVATION only.
+ * ALIVE-but-mismatched (task #507).
  *
- * Focusing, raising or selecting a workspace RE-BINDS NOTHING: the mismatch is between
- * the session's expected PTY and the surface telepty observed, and moving a window does
- * not change either. What it did do is take the operator's selection away on every tick
- * a worker emitted the event, which is the one thing #616 forbids. So nothing here
- * raises, selects or returns to the orchestrator — a selection the operator made by
- * hand stays as they left it.
+ * DEFAULT (AIGENTRY_SURFACE_MISMATCH_DIAGNOSTIC_ONLY unset): unchanged. Re-bind a live
+ * session's workspace onto its real PTY surface by focusing it. wh_focus is NON-DESTRUCTIVE
+ * (best-effort raise; always 0), so unlike orphan-close it needs no INV-17
+ * kill-corroboration — re-focusing a stray surface cannot lose work. Single safety gate:
+ * the sid must resolve to a host_id.
  *
- * The mismatch is recorded as UNRESOLVED (the read-only lookup only names the host id)
- * and the spool is drained exactly as before, so the bridge's next rename-install still
- * finds a free path. A mismatch line says nothing about whether the task finished or
- * whether the session is alive; inspecting or closing that surface stays a human call.
+ * OPT-IN (=1): the event is recorded as UNRESOLVED and nothing is focused, raised or
+ * selected. The honest reason is that focusing RE-BINDS NOTHING — the mismatch is between
+ * the session's expected PTY and the surface telepty observed, and moving a window changes
+ * neither — while it does take the operator's selection away on every tick a worker emits
+ * the event, which is what #616 is about. It is an OPTION rather than the new default
+ * because this consumer is adapter-independent: cmux selects a workspace, Warp raises a
+ * window, headless no-ops (workspace-host.sh _wh_cmux_focus / _wh_warp_raise_window /
+ * _wh_headless_focus), so dropping the actuation for everyone would silently remove the one
+ * cue a Warp operator gets, to fix a complaint about a cmux-specific spawn path. Whoever
+ * wants the quiet behaviour asks for it.
+ *
+ * Both arms count the event and drain the spool identically, so the bridge's next
+ * rename-install still finds a free path either way. A mismatch line says nothing about
+ * whether the task finished or whether the session is alive; inspecting or closing that
+ * surface stays a human call.
  */
 function consumeSurfaceMismatched(): void {
   let body: string;
@@ -1114,11 +1129,27 @@ function consumeSurfaceMismatched(): void {
     const sid = jqField(line, "sid");
     const exppty = jqField(line, "expectedPtyPid");
     if (!sid) continue;
-    // The lookup is READ-ONLY and is skipped entirely under --dry-run, so a dry tick
-    // still reaches no host adapter at all.
-    const hostId = DRY_RUN === 1 ? "" : chomp(wh(["lookup", sid]).stdout);
-    log(`SURFACE_MISMATCHED unresolved sid=${sid} host=${hostId || "?"} expectedPty=${exppty || "?"} ` +
-      "— diagnostic only; no focus/rebind actuation");
+    if (DRY_RUN === 1) {
+      // A dry tick reaches no adapter in either arm, so it never looks the host up.
+      log(SURFACE_MISMATCH_DIAGNOSTIC_ONLY
+        ? `SURFACE_MISMATCHED unresolved sid=${sid} host=? expectedPty=${exppty || "?"} ` +
+          "— diagnostic only; no focus/rebind actuation"
+        : `SURFACE_MISMATCHED would-refocus sid=${sid} expectedPty=${exppty || "?"}`);
+      processed += 1;
+      continue;
+    }
+    // The lookup is READ-ONLY and is made in both arms, so the log names the host either way.
+    const hostId = chomp(wh(["lookup", sid]).stdout);
+    if (SURFACE_MISMATCH_DIAGNOSTIC_ONLY) {
+      log(`SURFACE_MISMATCHED unresolved sid=${sid} host=${hostId || "?"} expectedPty=${exppty || "?"} ` +
+        "— diagnostic only; no focus/rebind actuation");
+    } else if (hostId) {
+      if (wh(["focus", hostId], { out: "inherit" }).status === 0) {
+        log(`SURFACE_MISMATCHED refocused sid=${sid} host=${hostId} expectedPty=${exppty || "?"}`);
+      } else {
+        log(`SURFACE_MISMATCHED refocus non-zero sid=${sid} host=${hostId}`);
+      }
+    }
     processed += 1;
   }
   // rm, and unconditional — same handoff with bin/telepty-bus-bridge.sh as
@@ -1518,7 +1549,8 @@ function main(argv: string[]): void {
 
   // event-driven surface_orphaned consumer (dormant until a bus→file bridge exists)
   consumeSurfaceOrphaned(gcRoot, keepAlive);
-  // event-driven surface_mismatched consumer — diagnostic observation only, never focus (#507/#616)
+  // event-driven surface_mismatched consumer — re-focus stray surfaces by default, record
+  // without actuating when AIGENTRY_SURFACE_MISMATCH_DIAGNOSTIC_ONLY=1 (#507/#616, dormant)
   consumeSurfaceMismatched();
 
   const candidates: string[] = [];

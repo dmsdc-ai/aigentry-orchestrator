@@ -1,5 +1,11 @@
-// #507 / #616 — a surface_mismatched event is a DIAGNOSTIC OBSERVATION: the reconciler
-// records it and drains the spool, and it must never actuate focus.
+// #507 / #616 — surface_mismatched handling, both arms of an OPT-IN.
+//
+// DEFAULT (AIGENTRY_SURFACE_MISMATCH_DIAGNOSTIC_ONLY unset): unchanged from the public
+// reconciler — resolve the sid and focus the host. Pinned here BECAUSE round 0 of this
+// change removed that actuation on every adapter with no setting at all (review F3), so
+// these default-arm cases are the regression guard against doing it again.
+// OPT-IN (=1): the event is recorded and NOTHING is focused, raised or selected.
+// Both arms count the event and drain the spool identically.
 //
 // The functions under test are taken from the TypeScript source by AST node position
 // (ts.createSourceFile → FunctionDeclaration → getStart/getEnd), type-erased with
@@ -11,7 +17,7 @@
 // host, reads real state or writes anywhere outside this test's own fake filesystem.
 //
 // Portable and offline: pure string/JSON work in one vm context, so it runs on every OS
-// the runner collects compiled tests on, win32 included.
+// the runner collects compiled tests on, win32 included. No case is skipped anywhere.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -38,7 +44,11 @@ if (!COMPILED_DIR.endsWith(path.sep + EXPECTED_TAIL)) {
 const REPO_ROOT = path.resolve(COMPILED_DIR, "..", "..", "..");
 const SOURCE_FILE = path.join(REPO_ROOT, "src", "reconciler", "cli.ts");
 if (!fs.existsSync(SOURCE_FILE)) throw new Error(`candidate source not found: ${SOURCE_FILE}`);
-const WHOLE = fs.readFileSync(SOURCE_FILE, "utf8");
+// CI checks this repo out with LF on win32 too (ci.yml:1109-1111), but a developer whose
+// git sets core.autocrlf=true would otherwise fail the exact-source-line assertion below on
+// a trailing CR alone. Normalised before parsing, so AST positions match these bytes.
+// Same move as tests/packaging/workflow-policy.test.mjs:21.
+const WHOLE = fs.readFileSync(SOURCE_FILE, "utf8").replace(/\r\n/g, "\n");
 
 /** Exact declaration bytes for the named top-level functions, by AST position. */
 function extract(names: string[]): Map<string, string> {
@@ -63,18 +73,29 @@ const PROGRAM = `${ERASED}\n;({ consumeSurfaceMismatched });`;
 
 const SPOOL = "/fake/state/dispatch/surface-mismatched.jsonl";
 
-interface WhCall { args: string[] }
+interface WhCall { args: string[]; out?: string }
 interface Run { logs: string[]; wh: WhCall[]; removed: string[]; spoolPresent: boolean }
+interface Opts {
+  dryRun?: number;
+  hostId?: string;
+  readable?: boolean;
+  /** The opt-in, exactly as the module-level constant computes it. */
+  diagnosticOnly?: boolean;
+  /** Status `wh focus` answers with, when the default arm calls it. */
+  focusStatus?: number;
+}
 
 /**
  * Runs the real consumer over `lines` with a fake spool, a recording `wh` boundary and a
  * recording `log` sink. `lookup` answers with `hostId` so the host-id arm is actually
- * taken — a lookup that returned nothing could never prove that focus was NOT called.
+ * taken — a lookup that returned nothing could never prove whether focus was called.
  */
-function run(lines: string[], opts: { dryRun?: number; hostId?: string; readable?: boolean } = {}): Run {
+function run(lines: string[], opts: Opts = {}): Run {
   const dryRun = opts.dryRun ?? 0;
   const hostId = opts.hostId ?? "workspace:77";
   const readable = opts.readable ?? true;
+  const diagnosticOnly = opts.diagnosticOnly ?? false;
+  const focusStatus = opts.focusStatus ?? 0;
   const logs: string[] = [];
   const wh: WhCall[] = [];
   const removed: string[] = [];
@@ -91,13 +112,15 @@ function run(lines: string[], opts: { dryRun?: number; hostId?: string; readable
   const decls = vm.runInContext(PROGRAM, vm.createContext({
     fs: fakeFs,
     SURFACE_MISMATCHED_SRC: SPOOL,
+    SURFACE_MISMATCH_DIAGNOSTIC_ONLY: diagnosticOnly,
     DRY_RUN: dryRun,
     log: (msg: string) => { logs.push(msg); },
-    wh: (args: string[]) => {
-      wh.push({ args: [...args] });
+    wh: (args: string[], o?: { out?: string }) => {
+      wh.push(o?.out === undefined ? { args: [...args] } : { args: [...args], out: o.out });
       if (args[0] === "lookup") return { status: 0, stdout: hostId + "\n" };
-      // Any OTHER verb reaching this boundary is the regression: say so loudly rather
-      // than answering it.
+      if (args[0] === "focus") return { status: focusStatus, stdout: "" };
+      // Any OTHER verb reaching this boundary is a regression: say so loudly rather than
+      // answering it.
       throw new Error(`UNEXPECTED_WH_VERB: ${args.join(" ")}`);
     },
   }, { name: "extracted-reconciler-decls" })) as { consumeSurfaceMismatched: () => void };
@@ -110,14 +133,53 @@ const MISMATCH = JSON.stringify({
   expectedPtyPid: 4242, observedSurface: "ttys009", mismatchSeconds: 90,
 });
 
-test("#616: a mismatch event actuates NO focus — only a read-only lookup crosses the boundary", () => {
+// ── the DEFAULT arm: public behaviour, unchanged, on every adapter ─────────────────────
+test("#616: with NO setting the consumer still resolves and focuses — the public behaviour", () => {
   const r = run([MISMATCH]);
+  assert.deepEqual(r.wh.map((c) => c.args), [["lookup", "fixture-stray"], ["focus", "workspace:77"]],
+    "the default arm must still look the host up and focus it, exactly as public main does");
+  assert.equal(r.wh[1]!.out, "inherit", "the focus call must keep its inherited output");
+  assert.deepEqual(r.logs, [
+    "SURFACE_MISMATCHED refocused sid=fixture-stray host=workspace:77 expectedPty=4242",
+    "surface_mismatched consumed=1",
+  ]);
+  assert.deepEqual(r.removed, [SPOOL]);
+});
+
+test("#616: with NO setting a non-zero focus is still reported as such", () => {
+  const r = run([MISMATCH], { focusStatus: 1 });
+  assert.deepEqual(r.logs, [
+    "SURFACE_MISMATCHED refocus non-zero sid=fixture-stray host=workspace:77",
+    "surface_mismatched consumed=1",
+  ]);
+});
+
+test("#616: with NO setting an unresolvable sid still skips focus and still drains", () => {
+  const r = run([MISMATCH], { hostId: "" });
+  assert.deepEqual(r.wh.map((c) => c.args[0]), ["lookup"], "no host id ⇒ nothing to focus");
+  assert.deepEqual(r.logs, ["surface_mismatched consumed=1"]);
+  assert.deepEqual(r.removed, [SPOOL]);
+});
+
+test("#616: with NO setting --dry-run still says would-refocus and reaches no adapter", () => {
+  const r = run([MISMATCH], { dryRun: 1 });
+  assert.deepEqual(r.wh, [], "a dry tick must not even look the host up");
+  assert.deepEqual(r.logs, [
+    "SURFACE_MISMATCHED would-refocus sid=fixture-stray expectedPty=4242",
+    "surface_mismatched consumed=1",
+  ]);
+  assert.deepEqual(r.removed, [], "a dry tick must not drain the spool");
+});
+
+// ── the OPT-IN arm: diagnostic observation only ───────────────────────────────────────
+test("#616/opt-in: a mismatch event actuates NO focus — only the read-only lookup crosses", () => {
+  const r = run([MISMATCH], { diagnosticOnly: true });
   // The whole point: not one focus/select/raise call, on any adapter.
   assert.deepEqual(r.wh.map((c) => c.args[0]), ["lookup"],
     "the only host-adapter call may be the read-only lookup");
   for (const call of r.wh) {
     for (const verb of ["focus", "select", "select-workspace", "raise", "activate"]) {
-      assert.ok(!call.args.includes(verb), `focus actuation leaked back in: ${call.args.join(" ")}`);
+      assert.ok(!call.args.includes(verb), `focus actuation leaked in: ${call.args.join(" ")}`);
     }
   }
   assert.equal(r.logs.length, 2);
@@ -126,8 +188,8 @@ test("#616: a mismatch event actuates NO focus — only a read-only lookup cross
   assert.doesNotMatch(r.logs[0]!, /refocus/, "the log must not claim a refocus it did not do");
 });
 
-test("#616: draining continues — the spool is removed and the consumed count is still logged", () => {
-  const r = run([MISMATCH, MISMATCH]);
+test("#616/opt-in: draining continues — the spool is removed and the count is still logged", () => {
+  const r = run([MISMATCH, MISMATCH], { diagnosticOnly: true });
   assert.deepEqual(r.removed, [SPOOL],
     "the drain is unconditional: the bridge installs the next batch by rename onto an ABSENT path");
   assert.equal(r.spoolPresent, false);
@@ -135,16 +197,16 @@ test("#616: draining continues — the spool is removed and the consumed count i
   assert.deepEqual(r.wh.map((c) => c.args[0]), ["lookup", "lookup"]);
 });
 
-test("#616: an unresolvable sid is still recorded and still drained, with no actuation", () => {
-  const r = run([MISMATCH], { hostId: "" });
+test("#616/opt-in: an unresolvable sid is still recorded and still drained, with no actuation", () => {
+  const r = run([MISMATCH], { diagnosticOnly: true, hostId: "" });
   assert.deepEqual(r.wh.map((c) => c.args[0]), ["lookup"]);
   assert.match(r.logs[0]!, /^SURFACE_MISMATCHED unresolved sid=fixture-stray host=\? expectedPty=4242 /);
   assert.deepEqual(r.removed, [SPOOL]);
   assert.equal(r.logs.at(-1), "surface_mismatched consumed=1");
 });
 
-test("#616: --dry-run reaches no host adapter at all, and leaves the spool in place", () => {
-  const r = run([MISMATCH], { dryRun: 1 });
+test("#616/opt-in: --dry-run reaches no host adapter at all, and leaves the spool in place", () => {
+  const r = run([MISMATCH], { diagnosticOnly: true, dryRun: 1 });
   assert.deepEqual(r.wh, [], "a dry tick must not even look the host up");
   assert.equal(r.logs.length, 2);
   assert.match(r.logs[0]!, /^SURFACE_MISMATCHED unresolved sid=fixture-stray host=\? expectedPty=4242 /);
@@ -152,25 +214,49 @@ test("#616: --dry-run reaches no host adapter at all, and leaves the spool in pl
   assert.equal(r.logs.at(-1), "surface_mismatched consumed=1");
 });
 
-test("#616: the consumer stays dormant and silent when no bridge has written a spool", () => {
-  const r = run([], { readable: false });
-  assert.deepEqual(r.logs, []);
-  assert.deepEqual(r.wh, []);
-  assert.deepEqual(r.removed, []);
+// ── shared by both arms ───────────────────────────────────────────────────────────────
+for (const diagnosticOnly of [false, true]) {
+  const arm = diagnosticOnly ? "opt-in" : "default";
+  test(`#616/${arm}: the consumer stays dormant and silent when no bridge has written a spool`, () => {
+    const r = run([], { diagnosticOnly, readable: false });
+    assert.deepEqual(r.logs, []);
+    assert.deepEqual(r.wh, []);
+    assert.deepEqual(r.removed, []);
+  });
+
+  test(`#616/${arm}: lines with no sid are skipped, not actuated, and never counted`, () => {
+    const r = run(["", "not json at all", JSON.stringify({ expectedPtyPid: 7 }), MISMATCH], { diagnosticOnly });
+    assert.equal(r.wh.filter((c) => c.args[0] === "lookup").length, 1,
+      "only the one usable line reaches the lookup");
+    assert.equal(r.logs.at(-1), "surface_mismatched consumed=1");
+    assert.deepEqual(r.removed, [SPOOL], "unusable lines are still drained — they cannot wedge the spool");
+  });
+}
+
+// ── source-level guards ───────────────────────────────────────────────────────────────
+test("#616: the opt-in is a single exact-`1` read, defaulting to the public behaviour", () => {
+  // The constant, not the consumer: a default-on spelling (`!== "0"`, `|| true`, a truthy
+  // read) is the defect F3 names, and it would pass every behavioural case above because
+  // the fake binds the flag directly.
+  const decl = /^const SURFACE_MISMATCH_DIAGNOSTIC_ONLY = .*$/m.exec(WHOLE)?.[0];
+  assert.ok(decl, "SURFACE_MISMATCH_DIAGNOSTIC_ONLY must be a single-line module constant");
+  assert.equal(decl, 'const SURFACE_MISMATCH_DIAGNOSTIC_ONLY = env.AIGENTRY_SURFACE_MISMATCH_DIAGNOSTIC_ONLY === "1";',
+    "the opt-in must be an exact match on \"1\", so absent/empty/anything else is the public behaviour");
+  assert.equal(WHOLE.split("env.AIGENTRY_SURFACE_MISMATCH_DIAGNOSTIC_ONLY").length - 1, 1,
+    "the environment variable may be READ in exactly one place (prose mentions are fine)");
 });
 
-test("#616: lines with no sid are skipped, not actuated, and never counted", () => {
-  const r = run(["", "not json at all", JSON.stringify({ expectedPtyPid: 7 }), MISMATCH]);
-  assert.deepEqual(r.wh.map((c) => c.args[0]), ["lookup"], "only the one usable line reaches the lookup");
-  assert.equal(r.logs.at(-1), "surface_mismatched consumed=1");
-  assert.deepEqual(r.removed, [SPOOL], "unusable lines are still drained — they cannot wedge the spool");
-});
-
-test("#616: the production call site and the declaration agree that nothing is focused", () => {
-  // A source-level guard: the only `wh([...])` call inside the extracted declaration is
-  // the lookup. A future edit that reintroduces a focus call fails HERE as well as above.
+test("#616: the consumer's actuation is reachable only through the opt-in branch", () => {
   const decl = DECLS.get("consumeSurfaceMismatched")!;
   const verbs = [...decl.matchAll(/wh\(\s*\[\s*"([a-z-]+)"/g)].map((m) => m[1]);
-  assert.deepEqual(verbs, ["lookup"], `consumeSurfaceMismatched may only call wh lookup, found: ${verbs.join(", ")}`);
-  assert.ok(!/wh_focus|"focus"/.test(decl), "no focus verb may appear in the consumer");
+  assert.deepEqual(verbs, ["lookup", "focus"],
+    `the consumer may call only lookup and focus, in that order, found: ${verbs.join(", ")}`);
+  // Every `focus` call site must sit inside the `else` of the opt-in test, so the opted-in
+  // arm cannot actuate: the only focus call must appear AFTER the flag's `if`.
+  const flagAt = decl.indexOf("if (SURFACE_MISMATCH_DIAGNOSTIC_ONLY)");
+  assert.ok(flagAt > 0, "the consumer must branch on the opt-in");
+  assert.ok(decl.indexOf('wh(["focus"') > flagAt,
+    "the focus call must be under the non-diagnostic branch of the opt-in");
+  assert.ok(/\} else if \(hostId\) \{/.test(decl),
+    "the public host-id gate must survive as the else-arm of the opt-in");
 });
