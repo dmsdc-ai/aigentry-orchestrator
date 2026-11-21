@@ -1,12 +1,12 @@
 // #652 — AIGENTRY_CODEX_SYSTEM_CA: the opt-in that hands a confined Codex worker the CA
 // bundle FILE macOS ships, and the checks that can refuse it.
 //
-// Round 1 (review C1) moved the subject of this suite: the option no longer validates one
-// pathname and then hand over that pathname. It resolves the chain ONCE, validates the
-// RESOLVED file and every directory component above it, and hands the worker the resolved
-// path. So the assertions here are about (a) which object was inspected, (b) which path the
-// sealed environment receives, and (c) which conditions drop the option — including a
-// replaceable PARENT of a perfectly good file, which the round-0 candidate accepted.
+// The option does not validate one pathname and then hand over that pathname. It resolves
+// the chain ONCE, validates the RESOLVED file and every directory component above it, and
+// hands the worker the resolved path. So the assertions here are about (a) which object was
+// inspected, (b) which path the sealed environment receives, and (c) which conditions drop
+// the option — including a replaceable PARENT of a perfectly good file, which a check on
+// the file alone would accept.
 //
 // `seedAuth` is taken from the TypeScript source by AST node position
 // (ts.createSourceFile → FunctionDeclaration → getStart/getEnd), type-erased with
@@ -128,6 +128,8 @@ interface Opts {
   readable?: boolean;
   /** Effective uid of the host process; 0 disables the W_OK backstop. */
   uid?: number;
+  /** The layout every call sees AFTER the first realpathSync returns: a swap in the race window. */
+  afterResolve?: Layout;
 }
 interface Result {
   env: Record<string, unknown> | null;
@@ -142,7 +144,7 @@ interface Result {
 
 function seed(opts: Opts = {}): Result {
   const platform = opts.platform ?? "darwin";
-  const layout = opts.layout ?? stockLayout();
+  let layout = opts.layout ?? stockLayout();
   const writable = new Set(opts.writable ?? []);
   const readable = opts.readable ?? true;
   const uid = opts.uid ?? 501;
@@ -174,7 +176,12 @@ function seed(opts: Opts = {}): Result {
     readFileSync: (p: string) => (files.has(p) ? files.get(p)! : errno("ENOENT", p)),
     mkdirSync: () => undefined,
     writeFileSync: (p: string, data: string) => { writes.push(p); files.set(p, data); },
-    realpathSync: (p: string) => { inspected.push(p); return realpath(p); },
+    realpathSync: (p: string) => {
+      inspected.push(p);
+      const out = realpath(p);
+      if (opts.afterResolve) layout = opts.afterResolve;
+      return out;
+    },
     lstatSync: (p: string) => {
       inspected.push(p);
       const node = layout[p] ?? errno("ENOENT", p);
@@ -255,8 +262,8 @@ test("#652: the opt-in is Darwin-only — on any other platform nothing is added
   }
 });
 
-// ── C1: the check and the handover are bound to the SAME object ────────────────────────
-test("#652/C1: the worker is handed the RESOLVED path, not the symlink it asked for", () => {
+// ── the check and the handover are bound to the SAME object ────────────────────────────
+test("#652: the worker is handed the RESOLVED path, not the symlink it asked for", () => {
   const r = seed({ env: { [OPT_IN]: "1" } });
   assertSeededNormally(r);
   assert.deepEqual(r.env, { CODEX_HOME, CODEX_CA_CERTIFICATE: RESOLVED },
@@ -265,7 +272,7 @@ test("#652/C1: the worker is handed the RESOLVED path, not the symlink it asked 
     "handing over the pre-resolution path leaves the worker's open bound to a different object");
 });
 
-test("#652/C1: the resolution happens once and every component of the resolved path is checked", () => {
+test("#652: the resolution happens once and every component of the resolved path is checked", () => {
   const r = seed({ env: { [OPT_IN]: "1" } });
   assert.deepEqual(r.inspected, FULL_CHAIN,
     "exactly one realpath of the requested path, then the resolved file and each parent up to /");
@@ -276,8 +283,8 @@ test("#652/C1: the resolution happens once and every component of the resolved p
   ], "readability is checked on the resolved file, and effective write access on the whole chain");
 });
 
-test("#652/C1: a replaceable PARENT drops the option even when the bundle itself is perfect", () => {
-  // The round-0 candidate accepted every one of these: it stat()ed the file and nothing else.
+test("#652: a replaceable PARENT drops the option even when the bundle itself is perfect", () => {
+  // A check that stat()ed the file and nothing else would accept every one of these.
   const cases: Array<[string, Layout, RegExp]> = [
     ["group-writable parent", { ...stockLayout(), "/private/etc/ssl": dir(0, 0o040775) },
       /under a group\/other-writable directory \(\/private\/etc\/ssl, mode 775\)/],
@@ -300,7 +307,7 @@ test("#652/C1: a replaceable PARENT drops the option even when the bundle itself
   }
 });
 
-test("#652/C1: a component this non-root process can write is refused (the ACL backstop)", () => {
+test("#652: a component this non-root process can write is refused (the ACL backstop)", () => {
   // st_mode cannot see an extended ACL; access(W_OK) can, for this process. Each of these
   // layouts is mode-clean, so only the W_OK pass can catch it.
   for (const target of [RESOLVED, "/private/etc/ssl", "/"]) {
@@ -312,7 +319,7 @@ test("#652/C1: a component this non-root process can write is refused (the ACL b
   }
 });
 
-test("#652/C1: as root the W_OK backstop is skipped, because it could only ever say yes", () => {
+test("#652: as root the W_OK backstop is skipped, because it could only ever say yes", () => {
   const r = seed({ env: { [OPT_IN]: "1" }, uid: 0, writable: [RESOLVED, "/private/etc/ssl", "/"] });
   assertSeededNormally(r);
   assert.deepEqual(r.env, { CODEX_HOME, CODEX_CA_CERTIFICATE: RESOLVED });
@@ -320,17 +327,28 @@ test("#652/C1: as root the W_OK backstop is skipped, because it could only ever 
     "a root host checks readability only; W_OK carries no information for uid 0");
 });
 
-test("#652/C1: a symlink that appears after the resolve is not a regular file", () => {
+test("#652: a symlink that appears after the resolve is not a regular file", () => {
   // lstat (not stat) on the resolved path: the only way this node can be a link is that it
   // became one after realpathSync returned, which is exactly the swap being guarded against.
-  const layout = { ...stockLayout(), [RESOLVED]: link("/private/etc/ssl/other.pem") };
-  const r = seed({ env: { [OPT_IN]: "1" }, layout });
+  // So realpathSync answers from the stock layout, and only the calls AFTER it see the link
+  // (a fixture link present from the start would simply be followed by realpathSync). The
+  // link's target is a regular file, so following it (stat) would accept the swap.
+  const swapped = {
+    ...stockLayout(),
+    [RESOLVED]: link("/private/etc/ssl/other.pem"),
+    "/private/etc/ssl/other.pem": file(),
+  };
+  const r = seed({ env: { [OPT_IN]: "1" }, afterResolve: swapped });
   assertSeededNormally(r);
   assert.deepEqual(r.env, { CODEX_HOME });
+  assert.equal(r.warnings.length, 1);
   assert.match(r.warnings[0]!, /is not a regular file/);
+  assert.match(r.warnings[0]!, /\/etc\/ssl\/cert\.pem → \/private\/etc\/ssl\/cert\.pem is not a regular file/,
+    "the refusal must come from the post-resolve lstat, after realpath returned the resolved path");
+  assert.deepEqual(r.inspected, [REQUESTED, RESOLVED], "resolved once, then lstat on the resolved path, which refuses");
 });
 
-test("#652/C1: the warning names both the requested path and what it resolved to", () => {
+test("#652: the warning names both the requested path and what it resolved to", () => {
   const layout = { ...stockLayout(), [RESOLVED]: file(501) };
   const r = seed({ env: { [OPT_IN]: "1" }, layout });
   assert.match(r.warnings[0]!, /\/etc\/ssl\/cert\.pem → \/private\/etc\/ssl\/cert\.pem is not root-owned \(uid 501\)/,
@@ -420,7 +438,7 @@ test("#652: the source pins the fixed public path, the resolve-then-check order 
   assert.ok(/tlsEnv\.CODEX_CA_CERTIFICATE = resolved;/.test(code),
     "the worker must be handed the resolved path — the one the checks were run on");
   assert.ok(!/tlsEnv\.CODEX_CA_CERTIFICATE = (requested|ca|"\/etc)/.test(code),
-    "handing over the unresolved path is the defect C1 names");
+    "handing over the unresolved path would bind the worker's open to an unchecked object");
   assert.ok(code.includes('process.platform === "darwin"'), "the option must stay Darwin-only");
   assert.ok(code.includes('process.env.AIGENTRY_CODEX_SYSTEM_CA === "1"'), "the opt-in must be an exact match on 1");
   assert.ok(!/throw new Error\([^)]*CA/i.test(code), "a rejected bundle must warn, never throw");
@@ -430,7 +448,7 @@ test("#652: the source pins the fixed public path, the resolve-then-check order 
     "the declaration must keep the host-directed fs.* surface the existing suite pins");
 });
 
-test("#652/C2+C3: the option's own documentation claims only what this code establishes", () => {
+test("#652: the option's own documentation claims only what this code establishes", () => {
   const { prose } = codexBranch();
   // Must disclose, in the source a maintainer reads first:
   for (const must of [

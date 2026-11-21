@@ -236,7 +236,7 @@ function seedAuth(cli: string, home: string, cwd: string, oauthSelected = false)
         // replaceable parent makes the file replaceable whatever the file's own mode says.
         for (let dir = path.dirname(resolved); !reject; dir = path.dirname(dir)) {
           const ds = fs.lstatSync(dir);
-          if (!ds.isDirectory()) reject = `reached a non-directory component (${dir})`;
+          if (!ds.isDirectory()) reject = `under a non-directory component (${dir})`;
           else if (ds.uid !== 0) reject = `under a non-root-owned directory (${dir}, uid ${ds.uid})`;
           else if ((ds.mode & 0o022) !== 0) {
             reject = `under a group/other-writable directory (${dir}, mode ${(ds.mode & 0o777).toString(8)})`;
