@@ -66,6 +66,16 @@
 //  4. The handoff rows' "curl/auth never fire" becomes "exactly the preflight's two GETs and one credential read".
 //  5. Every expected argv uses `allow-create-v1` (the supported boot caller's verb).
 // Nothing else was relaxed. The init/doc, help/seam, refusal-table, E/I and F checks and the immutability snapshots are unchanged.
+//
+// ── TASK 1293 AMENDMENT (telepty dependency removal). ONE call site, nothing relaxed. ──
+//
+// 0.2.8 removes the `@dmsdc-ai/aigentry-telepty` dependency and states the requirement where it is
+// checked: `aigentry-orchestrator init` step 1 now reads the SAME sealed `telepty boot-capabilities`
+// document the boot preflight reads, once, read-only. So the refused re-init in the #1181 subtest
+// makes exactly one `caps` call where it previously made none. That one call is now asserted BY
+// ARGV at that site (`assert.deepEqual(calls('caps'), [['boot-capabilities']])`) and excluded from
+// `inert()` there only — `inert()` still requires `caps` to be empty at every other call site, and
+// no other tripwire, hash check or `assert.deepEqual(snapshot(), before)` changed.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -222,8 +232,14 @@ function reset() {
   fs.writeFileSync(path.join(fixture, 'caps.txt'), SEALED_CAPS);
   fs.writeFileSync(path.join(fixture, 'http.json'), JSON.stringify(DAEMON_FRESH));
 }
-const inert = (reads = false) => {
-  for (const k of ['kill', 'curl', 'exec', 'caps', 'claude', 'codex', 'gemini', 'grok', 'cmux', 'auth', ...(reads ? ['ps', 'list'] : [])]) assert.deepEqual(calls(k), [], k);
+// #1293: `except` names a recorder whose calls this ONE site accounts for ITSELF, by exact argv,
+// instead of requiring it to be empty. It exists for a single caller — the refused re-init below,
+// where init step 1 reads the sealed capability document once, read-only, before step 2 refuses —
+// and every other recorder in the list stays an armed, must-be-empty tripwire at every call site.
+const inert = (reads = false, except = []) => {
+  for (const k of ['kill', 'curl', 'exec', 'caps', 'claude', 'codex', 'gemini', 'grok', 'cmux', 'auth', ...(reads ? ['ps', 'list'] : [])]) {
+    if (!except.includes(k)) assert.deepEqual(calls(k), [], k);
+  }
 };
 // Task 1270: the removed SIGKILL guard and DELETE reconcile never run again — on ANY path, a completed boot included.
 const noDestructive = label => { for (const k of ['ps', 'list', 'kill']) assert.deepEqual(calls(k), [], `${label}: the '${k}' tripwire fired`); };
@@ -325,7 +341,15 @@ test('exact installed boot selector acceptance (independent T134 A-I)', async t 
         assert.ok(!/preserved|written|Step 8/.test(again.stdout + again.stderr), 'the refused re-init reported a copy summary');
         assert.equal(hash(placed), editedHash, 'a refused plain re-init changed the operator-edited governance doc');
         assert.deepEqual(treeSnap(ws), wsBefore, 'a refused plain re-init changed the workspace');
-        inert(true);
+        // #1293: init step 1 now states the telepty requirement from the SAME sealed document the
+        // boot preflight reads, so a refused re-init makes exactly one `telepty boot-capabilities`
+        // read and nothing else. That read is the whole of its telepty handling: no install, no
+        // upgrade, no daemon or bridge start/stop/restart, and — per the workspace snapshot above —
+        // no write. Every other tripwire (kill, curl, exec, every provider, the credential read,
+        // and with reads=true ps/list) stays armed and empty.
+        assert.deepEqual(calls('caps'), [['boot-capabilities']],
+          'a refused plain re-init did not make exactly one read-only capability probe');
+        inert(true, ['caps']);
       } finally {
         // Restore the fixture's own bytes (not via init), so the checks below compare like for like.
         fs.writeFileSync(placed, pristine);

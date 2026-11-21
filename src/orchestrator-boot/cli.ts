@@ -416,6 +416,15 @@ type PreflightVerdict = "FRESH" | "EXISTS_IDENTITY_UNPROVEN" | "CREDENTIAL_REFUS
 interface Preflight {
   readonly verdict: PreflightVerdict;
   readonly reason: string;
+  /**
+   * #1293 (review R2) — true only when the telepty in use (the CLI on PATH, or the daemon it
+   * started) DEMONSTRABLY does not carry the capability, so an operator upgrade is the answer.
+   * UNSUPPORTED also covers probes that could not be completed at all — a missing bash, a timeout,
+   * a signal, a spawn error — and those say nothing about telepty's version, so they must not
+   * produce install or restart advice. The VERDICT is unchanged in every case; only the second
+   * stderr line is conditional.
+   */
+  readonly requirement?: boolean;
 }
 
 const PREFLIGHT_TIMEOUT_MS = 5000;
@@ -423,21 +432,21 @@ const PREFLIGHT_OUTPUT_BYTES = 1024 * 1024;
 const BOOT_CAPABILITIES_SCHEMA = "telepty-boot-capabilities-v1";
 const CREATE_VERB = "allow-create-v1";
 const REQUIRED_DAEMON_CAPS = ["wrapped-sessions", "register-create-only"] as const;
-// #1293 — this package declares NO dependency on @dmsdc-ai/aigentry-telepty. The boot door
-// execs the `telepty` word through PATH (bootDoor below), so a nested copy would never be
-// executed here while its postinstall WOULD still run on the host. Every UNSUPPORTED verdict
-// — a missing telepty, an older one that answers the unknown verb with help and exit 0, or a
-// daemon without the capabilities — is therefore an operator upgrade, and the refusal says so
-// by version and command. The CAPABILITY above is what is checked; the version is only named,
-// as the first published telepty carrying every verb this orchestrator uses (dispatch's
-// inject-bound-v1 is the latest of them).
+// #1293 — this package declares NO dependency on @dmsdc-ai/aigentry-telepty. The boot door execs the
+// `telepty` word through PATH (bootDoor below), so a nested copy would never be executed here while
+// its postinstall WOULD still run on the host. A CONFIRMED capability refusal — a telepty bash
+// cannot find, one that answers the verb with help or a non-zero exit, or a daemon whose /api/meta
+// lacks the capabilities — is therefore an operator upgrade, and the refusal says so by version and
+// command. The CAPABILITY above is what is checked; the version is only NAMED, as the first
+// published telepty carrying every verb this orchestrator uses (dispatch's inject-bound-v1 is the
+// latest of them). A probe that could not be completed gets no such advice (review R2).
 const TELEPTY_MIN_VERSION = "0.11.1";
 const TELEPTY_INSTALL_COMMAND = "npm i -g @dmsdc-ai/aigentry-telepty@latest";
 const TELEPTY_REQUIREMENT =
-  "aigentry-orchestrator declares no dependency on @dmsdc-ai/aigentry-telepty and runs the telepty on PATH, " +
-  "so nothing here installs, upgrades, starts, stops or restarts it: install " +
-  `@dmsdc-ai/aigentry-telepty ${TELEPTY_MIN_VERSION} or later yourself with '${TELEPTY_INSTALL_COMMAND}', ` +
-  "restart the daemon, then run this boot again.";
+  "aigentry-orchestrator declares no dependency on @dmsdc-ai/aigentry-telepty and drives the telepty on PATH, so " +
+  `nothing here installs, upgrades, starts, stops or restarts it: install @dmsdc-ai/aigentry-telepty ${TELEPTY_MIN_VERSION} ` +
+  `or later yourself with '${TELEPTY_INSTALL_COMMAND}', start or restart the daemon with 'telepty-install' and restart ` +
+  "every 'telepty allow' bridge it had started — each keeps the code it was started with — then run this boot again.";
 
 /** An untrusted value for a diagnostic: JSON-quoted (control characters escaped) and bounded. */
 function shown(v: string): string {
@@ -509,19 +518,23 @@ function bootDoor(script: BootDoorScript, args: readonly string[], stderr: "pipe
  * with EXACTLY the keys schema/verbs/viewer_detach, schema telepty-boot-capabilities-v1, verbs an
  * array of unique strings containing allow-create-v1, viewer_detach nondeleting-v1.
  */
-function bootCapabilitiesRefusal(): string | null {
+function bootCapabilitiesRefusal(): { readonly reason: string; readonly confirmed: boolean } | null {
+  // #1293: `inconclusive` is a probe that never got an answer FROM telepty — it carries the same
+  // UNSUPPORTED verdict and the same first stderr line as before, and no upgrade advice.
+  const inconclusive = (reason: string) => ({ reason, confirmed: false });
+  const confirmed = (reason: string) => ({ reason, confirmed: true });
   const r = bootDoor("exec telepty boot-capabilities", [], "pipe", PREFLIGHT_TIMEOUT_MS, 4096);
   const code = (r.error as NodeJS.ErrnoException | undefined)?.code;
-  if (code === "ENOENT") return "no 'bash' for the boot command door";
+  if (code === "ENOENT") return inconclusive("no 'bash' for the boot command door");
   // bash's own "command not found" for the fixed `telepty` word.
-  if (r.error === undefined && r.signal === null && r.status === 127) return "no 'telepty' on PATH (bash exit 127)";
-  if (code === "ETIMEDOUT") return `'telepty boot-capabilities' did not answer within ${PREFLIGHT_TIMEOUT_MS} ms`;
-  if (r.error !== undefined) return `'telepty boot-capabilities' could not run (${code ?? "spawn error"})`;
-  if (r.signal !== null) return `'telepty boot-capabilities' was terminated by ${r.signal}`;
-  if (r.status !== 0) return `'telepty boot-capabilities' exited ${String(r.status)}`;
+  if (r.error === undefined && r.signal === null && r.status === 127) return confirmed("no 'telepty' on PATH (bash exit 127)");
+  if (code === "ETIMEDOUT") return inconclusive(`'telepty boot-capabilities' did not answer within ${PREFLIGHT_TIMEOUT_MS} ms`);
+  if (r.error !== undefined) return inconclusive(`'telepty boot-capabilities' could not run (${code ?? "spawn error"})`);
+  if (r.signal !== null) return inconclusive(`'telepty boot-capabilities' was terminated by ${r.signal}`);
+  if (r.status !== 0) return confirmed(`'telepty boot-capabilities' exited ${String(r.status)}`);
   const out = r.stdout ?? "";
   if (!out.endsWith("\n") || out.indexOf("\n") !== out.length - 1)
-    return "'telepty boot-capabilities' did not print exactly one line (an older telepty prints its help and exits 0)";
+    return confirmed("'telepty boot-capabilities' did not print exactly one line (an older telepty prints its help and exits 0)");
   const doc = jsonObject(out);
   const verbs = doc?.verbs;
   if (
@@ -534,7 +547,7 @@ function bootCapabilitiesRefusal(): string | null {
     !verbs.includes(CREATE_VERB) ||
     doc.viewer_detach !== "nondeleting-v1"
   )
-    return `'telepty boot-capabilities' did not print a ${BOOT_CAPABILITIES_SCHEMA} document with ${CREATE_VERB} and nondeleting-v1 viewer detach`;
+    return confirmed(`'telepty boot-capabilities' did not print a ${BOOT_CAPABILITIES_SCHEMA} document with ${CREATE_VERB} and nondeleting-v1 viewer detach`);
   return null;
 }
 
@@ -590,7 +603,7 @@ function bootPreflight(sid: string): Preflight {
   const target = preflightTarget();
   if ("verdict" in target) return target;
   const capRefusal = bootCapabilitiesRefusal();
-  if (capRefusal !== null) return { verdict: "UNSUPPORTED", reason: capRefusal };
+  if (capRefusal !== null) return { verdict: "UNSUPPORTED", reason: capRefusal.reason, requirement: capRefusal.confirmed };
   const token = teleptyAuthToken();
   const meta = localGet(target.port, "/api/meta", token);
   if (meta.status === 401 || meta.status === 403) return { verdict: "CREDENTIAL_REFUSED", reason: `GET /api/meta answered ${meta.status}` };
@@ -601,7 +614,8 @@ function bootPreflight(sid: string): Preflight {
   const caps = m.capabilities;
   const missing = REQUIRED_DAEMON_CAPS.filter((cap) => !Array.isArray(caps) || !caps.includes(cap));
   if (missing.length > 0)
-    return { verdict: "UNSUPPORTED", reason: `the daemon's /api/meta capabilities do not include ${missing.join(" and ")}` };
+    // The DAEMON answered and named its capabilities: this is a measured refusal, not a failed probe.
+    return { verdict: "UNSUPPORTED", reason: `the daemon's /api/meta capabilities do not include ${missing.join(" and ")}`, requirement: true };
   const where = `GET /api/sessions/${sidPathSegment(sid)}`;
   const s = localGet(target.port, `/api/sessions/${sidPathSegment(sid)}`, token);
   if (s.status === 401 || s.status === 403) return { verdict: "CREDENTIAL_REFUSED", reason: `${where} answered ${s.status}` };
@@ -624,13 +638,15 @@ function bootPreflight(sid: string): Preflight {
 
 /**
  * Every verdict but FRESH: exit 3, an EMPTY stdout (the shim cannot exec), one stderr line.
- * #1293 adds ONE further line, and only for UNSUPPORTED — the one verdict that means the
- * telepty on PATH (or the daemon it started) is missing or too old. The first line is
- * byte-identical for every verdict, so nothing that reads it changes.
+ * #1293 adds ONE further line, and only when the preflight CONFIRMED that the telepty in use is
+ * missing or too old (`requirement`). The first line is byte-identical for every verdict, so
+ * nothing that reads it changes; an UNSUPPORTED verdict from a probe that could not be completed —
+ * no bash, a timeout, a signal, a spawn error — still prints exactly the one line it always did,
+ * because telling that operator to install telepty would be advice about something never measured.
  */
 function refusePreflight(sid: string, p: Preflight): never {
   writeOut(2, `orchestrator-boot.sh: boot preflight ${p.verdict} for '${sid}' — ${p.reason}. Nothing was created, attached, signalled, deleted or exec'd.\n` +
-    (p.verdict === "UNSUPPORTED" ? `orchestrator-boot.sh: ${TELEPTY_REQUIREMENT}\n` : ""));
+    (p.requirement === true ? `orchestrator-boot.sh: ${TELEPTY_REQUIREMENT}\n` : ""));
   process.exit(3);
 }
 

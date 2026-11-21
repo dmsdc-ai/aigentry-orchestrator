@@ -53,11 +53,16 @@ const parse = <T>(relative: string): T => JSON.parse(read(relative)) as T;
  * (a union, an upper-bound-only comparator, a hyphen range, an x-range, `*`, a tag, a git or
  * file spec, an `npm:` alias) answers null, and null never satisfies the floor. A guard that
  * guessed in the other direction is how `^0.8.0` survived three releases.
+ *
+ * r1 (review R9): a PRERELEASE or build suffix is refused rather than read as its release.
+ * `0.11.1-rc.1` sorts BELOW `0.11.1` in semver, so treating it as the floor would have admitted a
+ * candidate that does not carry the released `inject-bound-v1`. Any `-`/`+` suffix now fails the
+ * match and answers null, which this guard already treats as "cannot be proven safe".
  */
 export function lowestResolvable(spec: string): Triple | null {
   const value = spec.trim();
   if (value === "" || /\|\||\s-\s|[<*]/.test(value)) return null;
-  const match = /^(?:v|=|>=|>|\^|~)?v?(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?$/.exec(value);
+  const match = /^(?:v|=|>=|>|\^|~)?v?(\d+)\.(\d+)\.(\d+)$/.exec(value);
   if (match === null) return null;
   return [Number(match[1]), Number(match[2]), Number(match[3])];
 }
@@ -123,7 +128,9 @@ test("1293: the guard refuses every range that can resolve a telepty below the f
   // Each of these is a real spelling a maintainer could write. None may pass.
   const refused = ["^0.8.0", "~0.8.0", ">=0.8.0", ">0.8.0", "0.8.5", "0.11.0", "^0.11.0", "~0.11.0",
     "*", "x", "latest", "", ">=0.8.0 <0.12.0", "0.8.0 || 0.11.1", "0.10.1 - 0.11.2",
-    "github:dmsdc-ai/aigentry-telepty", "file:../aigentry-telepty"];
+    "github:dmsdc-ai/aigentry-telepty", "file:../aigentry-telepty",
+    // r1 (review R9): a prerelease of the floor sorts BELOW the floor and must not pass as it.
+    "0.11.1-rc.1", "^0.11.1-rc.1", ">=0.11.1-rc.1", "0.11.1+build.5"];
   for (const section of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
     for (const spec of refused) {
       assert.equal(teleptyViolations(manifest(section, TELEPTY_PACKAGE, spec)).length, 1,
@@ -164,4 +171,26 @@ test("1293: package-lock.json holds no nested telepty subtree and no lockfile ed
   assert.ok(!read("package-lock.json").includes(TELEPTY_PACKAGE),
     `package-lock.json still mentions ${TELEPTY_PACKAGE} (a resolved url or an integrity line is enough ` +
     "for `npm ci` to install it)");
+});
+
+test("1293 r1: no PRODUCTION dependency in the lockfile runs an install script at all", () => {
+  // review R9 — the suite above is specific to telepty by name, so a differently named production
+  // package carrying a lifecycle script would escape it. The INVARIANT this incident actually
+  // establishes is broader and is measurable straight from the lockfile: a `npm i -g` of this
+  // package must not run anybody's postinstall on the host. npm records exactly that as
+  // `hasInstallScript` per entry, and `dev: true` marks the entries a production install never
+  // fetches (devDependencies are not installed by `npm i -g` or `npm ci --omit=dev`).
+  //
+  // This is a measurement, not an aspiration: after the regeneration the production tree carries
+  // ZERO such entries — telepty itself and `node-pty`, reachable only through telepty, were the
+  // only two — and the single remaining marker anywhere is the optional, dev-only `fsevents`.
+  // A maintainer who genuinely needs a production install script has to come past this line and
+  // say so, which is the whole point.
+  const lock = parse<{ packages?: Record<string, { hasInstallScript?: unknown; dev?: unknown; optional?: unknown }> }>("package-lock.json");
+  const production = Object.entries(lock.packages ?? {})
+    .filter(([, entry]) => entry.hasInstallScript === true && entry.dev !== true)
+    .map(([key]) => key || "<root>");
+  assert.deepEqual(production, [],
+    "a production dependency declares an install script; installing this package would run it on " +
+    "the host, which is exactly how a nested telepty 0.8.5 replaced a running 0.11.2 daemon");
 });

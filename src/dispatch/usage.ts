@@ -69,6 +69,14 @@ export const USAGE = `# dispatch.sh — Wraps \`telepty inject\` with REPL-ready
 #   gated path instead of being hand-recovered with a raw \`telepty inject\`
 #   (which bypasses the task-gate ledger, delivery confirm and tracker register).
 #   --target keeps the historical fail-fast; set the knob to make it wait too.
+#   A telepty that cannot be RUN at all is not a slow spawn (#1293): the first
+#   listing already proves it, so dispatch refuses there and then with exit 78
+#   (TELEPTY_CLI_UNAVAILABLE), naming the resolved command, the required
+#   @dmsdc-ai/aigentry-telepty version and the one command that installs it,
+#   instead of spending the whole budget and blaming the knob. The knob still
+#   owns every case where telepty runs and the session is simply not there yet
+#   (exit 6). This package declares no dependency on telepty and installs,
+#   upgrades, starts, stops and restarts nothing.
 #
 # Retry of an unknown delivery (#1092): a prior attempt left at
 #   delivery_state_unknown holds every identical dispatch (exit 7,
