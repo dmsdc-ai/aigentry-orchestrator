@@ -44,6 +44,22 @@ If `$AIGENTRY_REPORT_OUTBOX` is set you are a confined worker and an inject cann
 - First line exactly `AIGENTRY_REPORT v1 request_id=<R> challenge=<C> kind=<KIND> seq=<n>`; last line exactly `AIGENTRY_REPORT_END <R> <KIND>-<n>`; your report in between; at most 64 KiB in total.
 - Write it as `<KIND>-<n>.md.tmp`, then `mv` it to `<KIND>-<n>.md`. Writing the file is your report, not task completion: the orchestrator reviews it.
 
+## Session names across machines
+
+Every machine in an installation runs its own orchestrator session, and it has the
+same id on each of them: `orchestrator`. That is by design, not a collision.
+
+- A bare session id names a session on the machine you are on only while no other
+  registered machine has a session with the same id. When another machine is
+  registered, a bare `orchestrator` is ambiguous and telepty refuses it.
+- Say which machine you mean. Local: `orchestrator@127.0.0.1`. Remote:
+  `orchestrator@<registered peer name>` — the name the peer was registered under,
+  as `telepty list` shows it in the `Host:` line. An address the peer was not
+  registered under (for example its IP and port) is refused.
+- In `telepty list`, identical ids are told apart by their `Host:` line.
+- Never act on another machine's sessions, processes or credentials. Ask that
+  machine's orchestrator through telepty and wait for its answer.
+
 ## Ambiguity gate (Rule 37 — HARD RULE)
 
 For a task-shaped request, resolve what was asked by **reading first**
