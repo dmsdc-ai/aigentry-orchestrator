@@ -178,7 +178,45 @@ function seedAuth(cli: string, home: string, cwd: string, oauthSelected = false)
     writePrivate(path.join(config, "auth.json"), fs.readFileSync(source, "utf8"));
     writePrivate(path.join(config, "config.toml"),
       `check_for_update_on_startup = false\n[sandbox_workspace_write]\nexclude_slash_tmp = true\n[projects.${JSON.stringify(cwd)}]\ntrust_level = "trusted"\n`);
-    return { CODEX_HOME: config };
+    // #652 OPT-IN, macOS only: hand the OS public CA bundle to the confined Codex
+    // worker. Measured (codex-cli 0.170.0, sealed sandbox): without a CA file in its
+    // environment `codex exec` fails every TLS request and the session exits 1 within a
+    // second; with CODEX_CA_CERTIFICATE=/etc/ssl/cert.pem the same command in the same
+    // sandbox answers normally. The bundle is the PUBLIC trust store that is already on
+    // the host, so this grants no keychain/trustd access and widens no allowedDomains.
+    //
+    // Default OFF: unset the variable and nothing below runs, so the sealed environment
+    // is byte-for-byte what it was. The bundle is accepted only if it is a regular file,
+    // root-owned and not group/other-writable — an attacker-writable trust store is
+    // exactly what must not be handed to a worker. stat() FOLLOWS links, so this narrows
+    // rather than eliminates a replace-between-check-and-use window, and host
+    // readability is not proof of readability inside the confinement.
+    //
+    // A rejected bundle is NOT fatal: the opt-in is dropped with a precise warning and
+    // the worker is prepared exactly as it would have been without it. Failing the whole
+    // spawn over an optional convenience would turn a trust-store permission problem
+    // into "no worker starts at all".
+    const tlsEnv: Record<string, string> = {};
+    if (process.platform === "darwin" && process.env.AIGENTRY_CODEX_SYSTEM_CA === "1") {
+      const ca = "/etc/ssl/cert.pem";
+      let reject = "";
+      try {
+        const st = fs.statSync(ca);
+        if (!st.isFile()) reject = "not a regular file";
+        else if (st.uid !== 0) reject = `not root-owned (uid ${st.uid})`;
+        else if ((st.mode & 0o022) !== 0) reject = `group/other-writable (mode ${(st.mode & 0o777).toString(8)})`;
+        if (!reject) fs.accessSync(ca, fs.constants.R_OK);
+      } catch (e) {
+        reject = reject || `unusable (${(e as NodeJS.ErrnoException).code ?? "error"})`;
+      }
+      if (reject) {
+        process.stderr.write(
+          `worker-sandbox: AIGENTRY_CODEX_SYSTEM_CA=1 ignored — ${ca} is ${reject}; CODEX_CA_CERTIFICATE not set\n`);
+      } else {
+        tlsEnv.CODEX_CA_CERTIFICATE = ca;
+      }
+    }
+    return { CODEX_HOME: config, ...tlsEnv };
   }
   if (cli === "claude") {
     const config = path.join(home, ".claude");
