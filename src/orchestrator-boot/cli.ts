@@ -446,8 +446,8 @@ const TELEPTY_REQUIREMENT =
   `or later yourself with '${TELEPTY_INSTALL_COMMAND}', then run this boot again.`;
 const TELEPTY_DAEMON_REQUIREMENT =
   "the telepty CLI on PATH passed its capability check; the daemon answering on this port does not list those " +
-  "capabilities in GET /api/meta. Compare the version that /api/meta reports with 'telepty --version' before you " +
-  "change anything; nothing here starts, stops or restarts the daemon.";
+  "capabilities in GET /api/meta. Compare the version that /api/meta reports with the version the telepty CLI " +
+  "prints for its --version flag before you change anything; nothing here starts, stops or restarts the daemon.";
 
 /** An untrusted value for a diagnostic: JSON-quoted (control characters escaped) and bounded. */
 function shown(v: string): string {
@@ -515,21 +515,24 @@ function bootDoor(script: BootDoorScript, args: readonly string[], stderr: "pipe
 
 /**
  * #1293 r3 (review R3-6): bash exits 127 both for "command not found" and when the telepty it ran
- * exits 127 itself, so a 127 is read as "no telepty" only when no PATH entry holds an executable
- * `telepty` file — the lookup bash made, repeated without running anything. PATH unset: unknown.
+ * exits 127 itself, so a 127 is read as "no telepty" only when no PATH entry holds a `telepty`
+ * file — the lookup bash made, repeated without running anything. PATH unset: unknown.
+ * r4 (review R4-4): absence is established only by ENOENT/ENOTDIR for every candidate; any other
+ * answer (an unreadable directory, say) leaves it unknown. On win32 bash also finds `telepty.exe`.
  */
 function noTeleptyOnPath(): boolean {
   const dirs = BOOT_DOOR_ENV.PATH;
   if (dirs === undefined) return false;
-  return !dirs.split(path.delimiter).some((dir) => {
-    const file = path.join(dir === "" ? "." : dir, "telepty");
+  const names = process.platform === "win32" ? ["telepty", "telepty.exe"] : ["telepty"];
+  return dirs.split(path.delimiter).every((dir) => names.every((name) => {
     try {
-      fs.accessSync(file, fs.constants.X_OK);
-      return fs.statSync(file).isFile();
-    } catch {
+      fs.statSync(path.join(dir === "" ? "." : dir, name));
       return false;
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      return code === "ENOENT" || code === "ENOTDIR";
     }
-  });
+  }));
 }
 
 /**
@@ -549,7 +552,7 @@ function bootCapabilitiesRefusal(): { readonly reason: string; readonly confirme
   // bash's own "command not found" for the fixed `telepty` word.
   if (r.error === undefined && r.signal === null && r.status === 127)
     return noTeleptyOnPath() ? confirmed("no 'telepty' on PATH (bash exit 127)")
-      : inconclusive("'telepty boot-capabilities' exited 127, and an executable 'telepty' is on PATH, so that exit is its own");
+      : inconclusive("'telepty boot-capabilities' exited 127, and a look at PATH did not establish that no 'telepty' is there, so that exit may be its own");
   if (code === "ETIMEDOUT") return inconclusive(`'telepty boot-capabilities' did not answer within ${PREFLIGHT_TIMEOUT_MS} ms`);
   if (r.error !== undefined) return inconclusive(`'telepty boot-capabilities' could not run (${code ?? "spawn error"})`);
   if (r.signal !== null) return inconclusive(`'telepty boot-capabilities' was terminated by ${r.signal}`);
@@ -570,9 +573,10 @@ function bootCapabilitiesRefusal(): { readonly reason: string; readonly confirme
     doc.viewer_detach !== "nondeleting-v1"
   )
     // r3: only a WELL-FORMED v1 document that lacks the verb or the detach establishes an older telepty.
+    // r4 (review R4-3): well-formed includes a string viewer_detach; null or any other type is malformed.
     return (doc !== null && Object.keys(doc).sort().join(",") === "schema,verbs,viewer_detach" &&
       doc.schema === BOOT_CAPABILITIES_SCHEMA && Array.isArray(verbs) && verbs.every((v) => typeof v === "string") &&
-      new Set(verbs).size === verbs.length ? confirmed : inconclusive)(
+      new Set(verbs).size === verbs.length && typeof doc.viewer_detach === "string" ? confirmed : inconclusive)(
       `'telepty boot-capabilities' did not print a ${BOOT_CAPABILITIES_SCHEMA} document with ${CREATE_VERB} and nondeleting-v1 viewer detach`);
   return null;
 }

@@ -74,9 +74,10 @@ export const USAGE = `# dispatch.sh — Wraps \`telepty inject\` with REPL-ready
 #   already proves it, so dispatch refuses there and then with exit 78
 #   (TELEPTY_CLI_UNAVAILABLE) instead of spending the whole budget and blaming
 #   the knob. A TELEPTY override that fails is named, with the instruction to
-#   correct or unset it; install advice is given only when PATH holds no
-#   telepty. A telepty that starts but does not list the session (not there
-#   yet, or a listing that overflowed its buffer) still waits for the knob and
+#   correct or unset it and no install command; install advice is given only
+#   with no override and no telepty on PATH. A telepty that starts but does
+#   not list the session (not there yet, or a listing that overflowed its
+#   buffer) still waits for the knob and
 #   exits 6 at its deadline. Bound delivery to a busy worker keeps exit 78
 #   BOUND_INJECT_UNSUPPORTED when inject-bound-v1 is not declared or cannot be
 #   read. This package declares no dependency on telepty and installs,

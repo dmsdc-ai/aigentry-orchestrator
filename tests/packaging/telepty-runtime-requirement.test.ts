@@ -253,6 +253,10 @@ function assertOneRequirementMessage(out: { stdout: string; stderr: string }, ob
     `${label}: the dispatch refusal codes are not stated by operation`);
   assert.match(out.stderr, /orchestrator-boot exits 3 \(boot preflight UNSUPPORTED\) when its own check of the telepty on PATH fails/,
     `${label}: the boot refusal code is missing`);
+  // r4 (review R4-7): every exit path the message names, and each has a test — boot 3 and the earlier
+  // supervised exit 2 in tests/packaging/orchestrator-boot-wizard.test.mjs ("1293"), the two 78s above.
+  assert.match(out.stderr, /inject-bound-v1 is not part of that check — and a supervised boot exits 2 earlier, when 'telepty allow-check' does not admit it/,
+    `${label}: the supervised boot refusal or the boot/dispatch capability boundary is missing`);
   // The 0.2.0 wording this replaces claimed telepty was a declared dependency installed nested
   // under the package. That claim is false and must never come back.
   assert.doesNotMatch(out.stderr, /declared dependency of this package/, `${label}: the message still claims a dependency`);
@@ -343,6 +347,11 @@ const INCONCLUSIVE: readonly (readonly [string, string, RegExp])[] = [
     /did not print exactly one line/],
   // R8: `schema` is an object whose toString is null, so `String(doc.schema)` THROWS — and main()'s
   // rejection handler would turn an OPTIONAL dependency warning into exit 1.
+  // r4 (review R4-3): a null viewer_detach makes the document malformed, even when a verb is also
+  // missing. FAILS on r3, which reported the missing verb as established and printed the install command.
+  ["null viewer_detach",
+    `console.log(JSON.stringify({ ...${JSON.stringify(SEALED)}, verbs: ["allow-create-v1"], viewer_detach: null }));`,
+    /unique string verbs and a string viewer_detach; it printed /],
   ["a schema value that cannot be coerced to a string",
     `process.stdout.write(JSON.stringify({ schema: { toString: null }, verbs: ${JSON.stringify(SEALED.verbs)}, ` +
     `viewer_detach: "nondeleting-v1" }) + "\\n");`,

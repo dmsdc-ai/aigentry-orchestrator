@@ -247,9 +247,10 @@ function teleptyCapabilityVerdict(file) {
   }
   const verbs = doc === null ? null : doc.verbs;
   if (doc === null || Object.keys(doc).sort().join(",") !== "schema,verbs,viewer_detach" ||
-    !Array.isArray(verbs) || !verbs.every((v) => typeof v === "string") || new Set(verbs).size !== verbs.length)
+    !Array.isArray(verbs) || !verbs.every((v) => typeof v === "string") || new Set(verbs).size !== verbs.length ||
+    typeof doc.viewer_detach !== "string") // r4 (review R4-3): a non-string viewer_detach is malformed, not a refusal
     return inconclusive(`'telepty boot-capabilities' did not print a ${TELEPTY_CAPABILITIES_SCHEMA} ` +
-      `document with exactly schema/verbs/viewer_detach and unique string verbs; it printed ${shownJson(out)}`);
+      `document with exactly schema/verbs/viewer_detach, unique string verbs and a string viewer_detach; it printed ${shownJson(out)}`);
   if (doc.schema !== TELEPTY_CAPABILITIES_SCHEMA)
     return inconclusive(`'telepty boot-capabilities' printed schema ${shownJson(doc.schema)}, ` +
       `not ${TELEPTY_CAPABILITIES_SCHEMA}`);
@@ -274,7 +275,9 @@ function teleptyMessage(observed) {
     `(${TELEPTY_MIN_VERSION} is the first published version declaring inject-bound-v1). init detects only: ` +
     "it installs, upgrades, starts, stops and restarts nothing. Install or upgrade telepty under your own " +
     `control with '${TELEPTY_INSTALL_COMMAND}'. Until then orchestrator-boot exits 3 (boot preflight ` +
-    "UNSUPPORTED) when its own check of the telepty on PATH fails — missing, or without allow-create-v1 and nondeleting-v1 viewer detach — and " +
+    "UNSUPPORTED) when its own check of the telepty on PATH fails — missing, or without allow-create-v1 and nondeleting-v1 viewer detach; " +
+    "inject-bound-v1 is not part of that check — and a supervised boot exits 2 earlier, when 'telepty allow-check' " +
+    "does not admit it; " +
     "dispatch exits 78: TELEPTY_CLI_UNAVAILABLE when the telepty command cannot be started at registration, " +
     "BOUND_INJECT_UNSUPPORTED when bound delivery to a busy worker finds no inject-bound-v1.";
 }

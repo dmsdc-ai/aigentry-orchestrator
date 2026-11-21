@@ -139,7 +139,9 @@ test("1293 r2: a telepty that STARTS but overflows the listing buffer keeps the 
 });
 
 // ── r3 (review R3-2): install advice only when the normal lookup finds no telepty either ─────────
-test("1293 r3: a stale override with no telepty on PATH either names the override first and the install command as a fact", () => {
+// r4 (review R4-2): a failing explicit override never carries an install command, even with no
+// telepty on PATH — the override is what dispatch runs. This FAILS on r3, which appended it here.
+test("1293 r4: a stale override with no telepty on PATH either names the override and carries no install command", () => {
   const f = fixture();
   try {
     f.prepareTarget();
@@ -147,8 +149,9 @@ test("1293 r3: a stale override with no telepty on PATH either names the overrid
     const r = f.dispatch(["--target", SID, "--from", FROM], { TELEPTY: missing, PATH: pathWithoutTelepty(f) });
     assert.equal(r.status, 78, `expected exit 78, got ${r.status}\n${r.stdout}\n${r.stderr}`);
     assert.ok(r.stderr.includes(`the TELEPTY override names ${missing}, which does not exist (ENOENT)`), r.stderr);
-    assert.match(r.stderr, /Correct TELEPTY or unset it; the normal PATH lookup finds no executable telepty either: @dmsdc-ai\/aigentry-telepty 0\.11\.1 or later installs with /, r.stderr);
-    assert.equal(r.stderr.split(INSTALL).length - 1, 1, `the install command must appear once:\n${r.stderr}`);
+    assert.match(r.stderr, /Correct TELEPTY or unset it; the normal PATH lookup finds no executable telepty either/, r.stderr);
+    assert.ok(!r.stderr.includes(INSTALL) && !r.stderr.includes("npm i -g"),
+      `a failing override was answered with an install command:\n${r.stderr}`);
   } finally {
     f.cleanup();
   }
@@ -189,6 +192,30 @@ test("1293 r3: an override that is not executable is named as such, with no rein
       assert.equal(r.status, 78, `expected exit 78, got ${r.status}\n${r.stdout}\n${r.stderr}`);
       assert.ok(r.stderr.includes(`the TELEPTY override names ${target}, which is not an executable file (EACCES)`), r.stderr);
       assert.match(r.stderr, /Correct TELEPTY or unset it/, r.stderr);
+    }
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("1293 r4: an executable override whose interpreter cannot run is not called a non-executable file", () => {
+  // review R4-2: EACCES can come from the interpreter, not the file. FAILS on r3, which called any
+  // EACCES on a regular file "not an executable file". win32 has no execute bit: the override is a
+  // .cmd shim there, and whatever happens it draws no install command.
+  const f = fixture();
+  try {
+    f.prepareTarget();
+    const [withTelepty] = pathWithTelepty(f);
+    const interpreter = join(f.root, "interpreter-not-executable");
+    writeFileSync(interpreter, "#!/bin/sh\nexit 0\n", { mode: 0o644 });
+    const target = join(f.root, WIN ? "telepty-override.cmd" : "telepty-override");
+    writeFileSync(target, WIN ? "@echo off\r\nexit /b 1\r\n" : `#!${interpreter}\n`, { mode: 0o755 });
+    const r = f.dispatch(["--target", SID, "--from", FROM], { TELEPTY: target, PATH: withTelepty });
+    assert.ok(!r.stderr.includes(INSTALL), `a broken override was answered with a reinstall:\n${r.stderr}`);
+    if (!WIN) {
+      assert.equal(r.status, 78, `expected exit 78, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+      assert.ok(r.stderr.includes(`the TELEPTY override names ${target}, which could not be started (EACCES)`), r.stderr);
+      assert.doesNotMatch(r.stderr, /is not an executable file/, r.stderr);
     }
   } finally {
     f.cleanup();

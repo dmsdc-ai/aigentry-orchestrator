@@ -1179,13 +1179,13 @@ const TELEPTY_REQUIREMENT =
 /** True when TELEPTY names something other than the bare word the normal PATH lookup resolves. */
 const TELEPTY_OVERRIDDEN = TELEPTY !== "telepty";
 
-/** r3: the first absolute PATH entry holding an executable telepty — the normal lookup — or null. */
+/** r3: the first PATH entry holding an executable telepty — the normal lookup — or null. r4 (review
+ *  R4-4): a relative or empty entry is searched too, from this process's cwd, as the spawn does. */
 function teleptyOnPath(): string | null {
   const names = process.platform === "win32"
     ? (env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";").filter((ext) => ext !== "").map((ext) => `telepty${ext.toLowerCase()}`)
     : ["telepty"];
   for (const dir of (env.PATH || "").split(path.delimiter)) {
-    if (!path.isAbsolute(dir)) continue;
     for (const name of names) if (isExecutable(path.join(dir, name))) return path.join(dir, name);
   }
   return null;
@@ -1194,7 +1194,8 @@ function teleptyOnPath(): string | null {
 /**
  * r3 (review R3-2): the facts of a telepty command that could not be STARTED (ENOENT/EACCES), and
  * the one instruction they justify. An override is described by what its file is, and the operator
- * is told to correct or unset it; install advice only when the PATH lookup finds no telepty either.
+ * is told to correct or unset it, with no install command (r4); install advice only when there is no
+ * override and the PATH lookup finds no telepty.
  */
 function teleptyUnstartable(errno: string): string {
   const onPath = teleptyOnPath();
@@ -1202,7 +1203,9 @@ function teleptyUnstartable(errno: string): string {
     let what = `could not be started (${errno})`;
     if (path.isAbsolute(TELEPTY)) {
       try {
-        if (!fs.statSync(TELEPTY).isFile() || errno === "EACCES") what = `is not an executable file (${errno})`;
+        // r4 (review R4-2): EACCES alone does not prove the file's own mode; its execute bit does.
+        if (!fs.statSync(TELEPTY).isFile() || (errno === "EACCES" && !isExecutable(TELEPTY)))
+          what = `is not an executable file (${errno})`;
       } catch (e) {
         const code = (e as NodeJS.ErrnoException).code;
         if (code === "ENOENT" || code === "ENOTDIR") what = `does not exist (${errno})`;
@@ -1211,8 +1214,8 @@ function teleptyUnstartable(errno: string): string {
     return `the TELEPTY override names ${TELEPTY}, which ${what}, so no session can be listed, registered or ` +
       "delivered to. Correct TELEPTY or unset it; " + (onPath !== null
       ? `the normal PATH lookup finds telepty at ${onPath}`
-      : `the normal PATH lookup finds no executable telepty either: @dmsdc-ai/aigentry-telepty ${TELEPTY_MIN_VERSION} ` +
-        `or later installs with '${TELEPTY_INSTALL_COMMAND}'`);
+      // r4 (review R4-2): no install command here — the override, not PATH, is what dispatch runs.
+      : "the normal PATH lookup finds no executable telepty either");
   }
   // EACCES from the PATH lookup means a telepty file IS there; only ENOENT with none found is "no telepty".
   if (onPath !== null || errno !== "ENOENT")
@@ -1322,7 +1325,7 @@ function boundSnapshot(sid: string): { cliKind: string; host: string; epoch: str
  * printing it starts, repairs or contacts nothing. An OLD CLI answers an unknown verb
  * with its help text and exit 0, and that is NOT support — so only a JSON object whose
  * `verbs` array names the verb counts. Prose, a non-zero exit or no output is refusal.
- * #1293 r3: the refusal is `lacks` only when the CLI printed a JSON object whose `verbs` array
+ * #1293 r3/r4: the refusal is `lacks` only when the CLI printed a telepty-boot-capabilities-v1 document whose `verbs`
  * omits the verb — the one answer that establishes an older telepty. A spawn error, a signal, a
  * non-zero exit, no output or prose is `inconclusive` (`detail` says which) and draws no upgrade advice.
  */
@@ -1332,9 +1335,15 @@ function boundVerbVerdict(): { kind: "ok" | "lacks" | "inconclusive"; detail: st
   if (r.signal !== undefined) return { kind: "inconclusive", detail: `was terminated by ${r.signal}` };
   if (r.status !== 0) return { kind: "inconclusive", detail: `exited ${r.status}` };
   try {
-    const doc = JSON.parse(r.stdout) as { verbs?: unknown };
-    if (doc !== null && typeof doc === "object" && Array.isArray(doc.verbs))
-      return { kind: doc.verbs.includes(BOUND_VERB) ? "ok" : "lacks", detail: "" };
+    const doc = JSON.parse(r.stdout) as { schema?: unknown; verbs?: unknown };
+    if (doc !== null && typeof doc === "object" && Array.isArray(doc.verbs)) {
+      if (doc.verbs.includes(BOUND_VERB)) return { kind: "ok", detail: "" };
+      // r4 (review R4-3): only a telepty-boot-capabilities-v1 document of string verbs ESTABLISHES the
+      // lack; any other object with a verbs array is malformed, so inconclusive. Admission is unchanged.
+      if (doc.schema === "telepty-boot-capabilities-v1" && doc.verbs.every((v) => typeof v === "string"))
+        return { kind: "lacks", detail: "" };
+      return { kind: "inconclusive", detail: `printed a verbs array without ${BOUND_VERB} outside a valid telepty-boot-capabilities-v1 document` };
+    }
   } catch {
     /* prose, such as an older CLI's help text, or no output */
   }

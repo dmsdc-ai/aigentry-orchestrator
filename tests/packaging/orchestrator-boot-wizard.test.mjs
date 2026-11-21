@@ -1812,6 +1812,20 @@ test('task 1293: a missing telepty is boot exit 3 with the install line; a daemo
     assert.deepEqual(fx.calls('curl'), [], 'a daemon request followed a missing CLI');
   });
 
+  // r4 (review R4-7): the earlier exit init's message names — a SUPERVISED boot with no telepty is
+  // refused at its 'telepty allow-check' admission with exit 2, before any preflight probe or request.
+  await t.test('supervised boot, no telepty on PATH: exit 2 at the allow-check admission, before the preflight', () => {
+    const fx = fixture();
+    fs.rmSync(path.join(fx.bin, 'telepty'));
+    const r = planBoot(fx, { TELEPTY_SUPERVISION_CLIENT_FILE: path.join(fx.dir, 'supervision-client.json') });
+    assert.equal(r.status, 2, `expected exit 2, got ${r.status}: ${r.stderr}`);
+    assert.equal(r.stdout, '', 'a refused admission wrote to the exec-argv channel');
+    assert.match(r.stderr, /'telepty allow-check --input-policy user-supervised' could not run: no 'telepty' on PATH before any effect — refusing to boot/, r.stderr);
+    assert.deepEqual(fx.calls('caps'), [], 'the preflight probe ran after a refused admission');
+    assert.deepEqual(fx.calls('curl'), [], 'a daemon request followed a refused admission');
+    assert.deepEqual(fx.calls('exec'), [], 'the exec was reached');
+  });
+
   await t.test('a daemon without register-create-only: exit 3, the daemon line, and no CLI reinstall', () => {
     const fx = fixture();
     fx.daemon({ meta: { code: '200', body: '{"capabilities":["sessions","wrapped-sessions"]}' } });
@@ -1836,6 +1850,8 @@ test('task 1293: a missing telepty is boot exit 3 with the install line; a daemo
       ['other schema', '{"schema":"telepty-boot-capabilities-v2","verbs":["allow-create-v1"],"viewer_detach":"nondeleting-v1"}\n', 0, 0],
       ['verb missing', '{"schema":"telepty-boot-capabilities-v1","verbs":["allow"],"viewer_detach":"nondeleting-v1"}\n', 0, 1],
       ['deleting viewer detach', '{"schema":"telepty-boot-capabilities-v1","verbs":["allow-create-v1"],"viewer_detach":"deleting"}\n', 0, 1],
+      // r4 (review R4-3): a non-string viewer_detach is malformed, not a refusal. FAILS on r3 (one install line).
+      ['null viewer detach', '{"schema":"telepty-boot-capabilities-v1","verbs":["allow-create-v1"],"viewer_detach":null}\n', 0, 0],
     ];
     for (const [label, text, rc, installs] of rows) {
       const fx = fixture();

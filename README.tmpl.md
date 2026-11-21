@@ -13,22 +13,32 @@
 ## Install
 
 **Upgrading from 0.2.5-0.2.7?** Those versions installed a copy of telepty inside the
-orchestrator's own directory, and upgrading deletes it. Check **before** you upgrade that a
-telepty of your own is installed and that nothing you run points into the orchestrator's
-directory:
+orchestrator's own directory, and upgrading deletes it. Do these steps in this order. Each is
+safe to run whether or not a telepty is already installed:
 
-```sh
-command -v telepty     # must print a path, and not one containing aigentry-orchestrator/node_modules
-echo "${TELEPTY-}"     # an override dispatch prefers: empty, or not inside that directory either
-# the telepty daemon's service; each must print nothing (drop-in overrides included):
-grep -rl 'aigentry-orchestrator/node_modules' ~/Library/LaunchAgents 2>/dev/null                      # macOS
-grep -rl 'aigentry-orchestrator/node_modules' ~/.config/systemd/user /etc/systemd/system 2>/dev/null  # Linux
-```
+1. Install the latest telepty globally: `npm i -g @dmsdc-ai/aigentry-telepty@latest`.
+   telepty 0.11.3 or newer never replaces a newer running daemon, and does nothing when it is
+   installed as a dependency of another package.
+2. Make the telepty service use that installation: `telepty-install`. This is what repairs a
+   service that pointed into the orchestrator's directory. If you set `TELEPTY`, unset it or
+   point it at that installation.
+3. Only then upgrade the orchestrator: `npm i -g {{name}}`.
+4. Read which versions now run, changing nothing: `telepty --version`, and the `version` the
+   daemon reports:
 
-On Windows, look at the action of the telepty scheduled task (`schtasks /query /v /fo list`).
-If a check fails, first install telepty yourself (`npm i -g @dmsdc-ai/aigentry-telepty@latest`)
-and point `TELEPTY` and the service at it — the 0.2.8 entry of `CHANGELOG.md` has the steps.
-Then install or upgrade:
+   ```sh
+   ( cd "$(npm root -g)/{{name}}" && . bin/lib/telepty-auth.sh &&
+     curl -s --noproxy '*' --max-time 5 -H "x-telepty-token: $(telepty_auth_token)" \
+          "http://127.0.0.1:${TELEPTY_PORT:-3848}/api/meta" )
+   ```
+
+   This shows what runs now. It does not prove that nothing else points into the old directory.
+
+On Windows, steps 1 and 3 and `telepty --version` are the same, and the daemon command needs
+Git Bash. This release has not verified what `telepty-install` does to the telepty scheduled
+task. Read the task's action with `schtasks /query /v /fo list`.
+
+A new install:
 
 ```sh
 npm i -g {{name}}

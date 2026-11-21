@@ -78,8 +78,9 @@ interface StubConfig {
   verbs: string[];
   injectId: string;
   mode: "accepted" | "old-cli-help" | "malformed" | "lost";
-  /** #1293 r3: "help" makes `boot-capabilities` answer an older CLI's help text and exit 0. */
-  capsReply?: "help";
+  /** #1293 r3: "help" makes `boot-capabilities` answer an older CLI's help text and exit 0.
+   *  r4: "schemaless" makes it answer `{verbs}` alone, a malformed document (review R4-3). */
+  capsReply?: "help" | "schemaless";
 }
 
 const TELEPTY_STUB = `
@@ -106,7 +107,8 @@ if ((argv[0] === 'boot-capabilities' || argv[0] === 'capabilities') && cfg.capsR
   process.stdout.write('telepty — session multiplexer\\nUsage: telepty <command> [options]\\n');
   process.exit(0);
 }
-if (argv[0] === 'boot-capabilities' || argv[0] === 'capabilities') out({ verbs: cfg.verbs });
+if (argv[0] === 'boot-capabilities' || argv[0] === 'capabilities')
+  out(cfg.capsReply === 'schemaless' ? { verbs: cfg.verbs } : { schema: 'telepty-boot-capabilities-v1', verbs: cfg.verbs });
 if (argv[0] === 'read-screen') { process.stdout.write(${JSON.stringify(BUSY_SCREEN)}); process.exit(0); }
 if (argv[0] === 'inject-bound-v1') {
   // An old daemon does not know the verb: it prints help and exits 0. That is NOT support.
@@ -396,6 +398,21 @@ describe("1270(c) an unsupported bound verb or capability is refused before begi
     } finally { f.cleanup(); }
   });
 
+  // #1293 r4 (review R4-3): `{"verbs":[...]}` with no v1 schema is malformed, not an established
+  // lack. FAILS on r3, which read any verbs array without the verb as "lacks" and advised upgrading.
+  test("1293 r4: a verbs array outside a v1 document exits 78 as inconclusive, with no upgrade advice", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      const r = follow(f, arm(f, { capsReply: "schemaless", verbs: BASE_VERBS }));
+      assertNoInputEffect(f, "caps schemaless");
+      assert.deepEqual(boundSends(entries(f)).map((e) => e.argv), [], "an unread capability was sent anyway");
+      assert.equal(r.status, 78, `expected exit 78, got ${r.status}\n${r.stderr}`);
+      assert.match(r.stderr, /boot-capabilities' printed a verbs array without inject-bound-v1 outside a valid telepty-boot-capabilities-v1 document, so inject-bound-v1 support is unknown/, r.stderr);
+      assert.ok(!r.stderr.includes("npm i -g") && !/point TELEPTY at|does not advertise/.test(r.stderr), `a malformed document drew upgrade advice:\n${r.stderr}`);
+    } finally { f.cleanup(); }
+  });
+
   test("a bridge that does not declare busy-input-v1 is refused with nothing sent at all", () => {
     const f = fixture();
     try {
@@ -665,7 +682,7 @@ const out = (o) => { process.stdout.write(JSON.stringify(o) + '\\n'); process.ex
 if (argv[0] === 'list') out([view]);
 if (argv[0] === 'view' || argv[0] === 'show' || argv[0] === 'info') out(view);
 if (argv[0] === 'session' && argv[1] === 'info') out(view);
-if (argv[0] === 'boot-capabilities' || argv[0] === 'capabilities') out({ verbs: cfg.verbs });
+if (argv[0] === 'boot-capabilities' || argv[0] === 'capabilities') out({ schema: 'telepty-boot-capabilities-v1', verbs: cfg.verbs });
 if (argv[0] === 'read-screen') { process.stdout.write(${JSON.stringify(BUSY_SCREEN)}); process.exit(0); }
 if (argv[0] === 'inject-bound-v1') {
   if (answer.stdout) process.stdout.write(answer.stdout);

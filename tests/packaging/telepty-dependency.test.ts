@@ -172,6 +172,9 @@ test("1293: package-lock.json holds no nested telepty subtree and no lockfile ed
   assert.ok(!read("package-lock.json").includes(TELEPTY_PACKAGE),
     `package-lock.json still mentions ${TELEPTY_PACKAGE} (a resolved url or an integrity line is enough ` +
     "for `npm ci` to install it)");
+  // r4 (review R4-8): and by parsed identity — an escaped name, an alias spec or a mirror url.
+  assert.deepEqual(lockfileTeleptyProblems(read("package-lock.json")), [],
+    "package-lock.json installs a telepty under another name or from another url");
 });
 
 /**
@@ -184,11 +187,19 @@ export function lockfileTeleptyProblems(text: string): string[] {
   const problems: string[] = [];
   for (const [key, entry] of Object.entries(lock.packages ?? {})) {
     if (key.includes("aigentry-telepty")) problems.push(`${key} is a telepty package entry`);
+    // r4 (review R4-8): the PARSED identity — a JSON-escaped name, an alias spec or a mirror url the
+    // raw-text check below cannot see.
+    if (entry.name === TELEPTY_PACKAGE) problems.push(`${key || "<root>"} is named ${TELEPTY_PACKAGE}`);
+    const resolved = entry.resolved;
+    if (typeof resolved === "string" && resolved.includes("aigentry-telepty"))
+      problems.push(`${key || "<root>"} resolves from a telepty url`);
     for (const section of DEPENDENCY_SECTIONS) {
       const value = entry[section];
       if (value === null || typeof value !== "object" || Array.isArray(value)) continue;
-      for (const name of Object.keys(value as Record<string, unknown>)) {
+      for (const [name, spec] of Object.entries(value as Record<string, unknown>)) {
         if (name === TELEPTY_PACKAGE) problems.push(`${key || "<root>"}.${section}.${name} is an edge to telepty`);
+        else if (typeof spec === "string" && spec.includes(TELEPTY_PACKAGE))
+          problems.push(`${key || "<root>"}.${section}.${name} is an alias of telepty`);
       }
     }
   }
@@ -221,6 +232,13 @@ test("1293 r2: a publishable npm-shrinkwrap.json can carry no telepty either", (
   assert.equal(lockfileTeleptyProblems(urlOnly).length, 1, "a telepty url alone must be refused");
   assert.deepEqual(lockfileTeleptyProblems(JSON.stringify({ packages: { "node_modules/cross-spawn": {} } })), [],
     "a clean shrinkwrap passes");
+  // r4 (review R4-8): an alias entry whose name is JSON-escaped and whose url is a mirror's carries no
+  // raw telepty name, and is refused by its parsed identity. FAILS on r3 (no problem found).
+  const escaped = JSON.stringify({ packages: { "": { dependencies: { tp: "npm:x@1" } },
+    "node_modules/tp": { name: "@dmsdc-ai/aigentry-telepty", version: "0.8.5",
+      resolved: "https://mirror.example/tp/-/aigentry-telepty-0.8.5.tgz" } } }).replace(/@dmsdc-ai/g, "\\u0040dmsdc-ai");
+  assert.ok(!escaped.includes(TELEPTY_PACKAGE), "the fixture must hide the raw name");
+  assert.equal(lockfileTeleptyProblems(escaped).length, 2, "an escaped name and a mirror url must both be refused");
 });
 
 test("1293 r1: no PRODUCTION dependency in the lockfile runs an install script at all", () => {
@@ -245,24 +263,19 @@ test("1293 r1: no PRODUCTION dependency in the lockfile runs an install script a
     "the host, which is exactly how a nested telepty 0.8.5 replaced a running 0.11.2 daemon");
 });
 
-test("1293 r3: the published upgrade instructions put the migration check before the upgrade command", () => {
-  // review R3-1 (MAJOR). README.md is the npm-facing install page; following its one npm command
-  // deletes a 0.2.5-0.2.7 install's nested telepty before 0.2.8's init could say anything. So the
-  // check that a telepty of the operator's own is installed and that no override or service points
-  // into the orchestrator's directory must come FIRST, wherever the package says how to upgrade:
-  // README.md, the template it is generated from, and the CHANGELOG 0.2.8 upgrade section. This
-  // FAILS on r2, whose README named only the npm command.
-  const CHECKS = [
-    "command -v telepty",
-    'echo "${TELEPTY-}"',
-    "grep -rl 'aigentry-orchestrator/node_modules' ~/Library/LaunchAgents",
-    "grep -rl 'aigentry-orchestrator/node_modules' ~/.config/systemd/user /etc/systemd/system",
-  ];
+test("1293 r4: the published upgrade instructions are the four safe steps, in order, with no check offered as proof", () => {
+  // review R3-1, then R4-1 (MAJOR). README.md is the npm-facing install page; following its one npm
+  // command deletes a 0.2.5-0.2.7 install's nested telepty. r3 put a grep/command -v check first, and
+  // that check could pass while a symlinked CLI or service still pointed into the pruned tree. r4
+  // replaces detection by a sequence that is safe unconditionally: (1) install the latest telepty
+  // globally, (2) re-run telepty's own installer so the service uses it, (3) only then upgrade the
+  // orchestrator, (4) read both versions — in README.md, its template and the CHANGELOG 0.2.8
+  // upgrade section. This FAILS on r3, whose instructions named no installer step and kept the greps.
   const section = (text: string, start: string, end: string): string => {
     const from = text.indexOf(start);
     assert.ok(from >= 0, `missing section ${start}`);
     const to = text.indexOf(end, from + start.length);
-    return text.slice(from, to < 0 ? undefined : to);
+    return text.slice(from, to < 0 ? undefined : to).replace(/\s+/g, " ");
   };
   const docs: readonly (readonly [string, string, string])[] = [
     ["README.md", section(read("README.md"), "## Install\n", "\n## "), "npm i -g @dmsdc-ai/aigentry-orchestrator"],
@@ -271,11 +284,25 @@ test("1293 r3: the published upgrade instructions put the migration check before
       "npm i -g @dmsdc-ai/aigentry-orchestrator"],
   ];
   for (const [label, text, upgrade] of docs) {
-    const at = text.indexOf(upgrade);
-    assert.ok(at >= 0, `${label}: the upgrade command is missing`);
-    for (const check of CHECKS) {
-      const where = text.indexOf(check);
-      assert.ok(where >= 0 && where < at, `${label}: '${check}' must appear before '${upgrade}'`);
+    const steps = ["npm i -g @dmsdc-ai/aigentry-telepty@latest", "telepty-install", upgrade, "telepty --version", "/api/meta"];
+    let last = -1;
+    for (const step of steps) {
+      const at = text.indexOf(step);
+      assert.ok(at > last, `${label}: '${step}' is missing or out of order (the order is the safety)`);
+      last = at;
     }
+    assert.ok(text.includes("telepty 0.11.3 or newer never replaces a newer running daemon, and does nothing when it is installed as a dependency"),
+      `${label}: step 1 does not say why it is safe`);
+    assert.ok(text.includes("This is what repairs a service that pointed into the orchestrator's directory"),
+      `${label}: step 2 does not say what it repairs`);
+    assert.ok(text.includes("It does not prove"), `${label}: the read-only step is not bounded`);
+    assert.ok(text.includes("has not verified what `telepty-install` does to the telepty scheduled task"),
+      `${label}: the Windows coverage is not stated`);
+    for (const detection of ["grep -rl", "command -v telepty", "If a check fail"])
+      assert.ok(!text.includes(detection), `${label}: the unreliable check '${detection}' is still offered`);
   }
+  // The 0.2.8 entry shows no orchestrator install command before its upgrade steps (review R4-1).
+  const entry = section(read("CHANGELOG.md"), "## [0.2.8]", "\n## [");
+  assert.ok(entry.indexOf("npm i -g @dmsdc-ai/aigentry-orchestrator") > entry.indexOf("### Upgrading from 0.2.5-0.2.7"),
+    "CHANGELOG 0.2.8 shows the orchestrator install command before the upgrade steps");
 });
