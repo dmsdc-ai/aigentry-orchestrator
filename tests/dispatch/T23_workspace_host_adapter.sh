@@ -120,4 +120,72 @@ out4=$("$BASH_BIN" -c "
 echo "$out4" | grep -q "nocmux=present" \
   || { echo "FAIL: an unreachable cmux reported the surface GONE — 'I cannot probe' is not 'it is not there'"; echo "$out4"; exit 1; }
 
+# ── AIGENTRY_WORKER_AUTO_RESTART: the per-launch retry budget of the cmux adapter ──
+# Executes the GENERATED child command against an argv-only telepty stub: nothing starts a
+# real CLI, a daemon or a bridge. The stub records the argv `telepty allow` was handed and
+# the cwd it ran in, which is the whole contract under test — the flag is present by
+# default, absent at 0, and an unreadable value refuses before cmux is called at all.
+cat > "$STUB_BIN/telepty" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$T_TMP/allow-argv"
+printf '%s\n' "$PWD" > "$T_TMP/allow-cwd"
+EOF
+cat > "$STUB_BIN/cmux-open" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "$T_TMP/open-calls"
+case "$1" in
+  new-workspace)
+    shift
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = --command ]; then bash -c "$2" || exit; break; fi
+      shift
+    done
+    echo 'OK workspace:23';;
+  list-workspaces) echo 'workspace:23 fixture';;
+  surface-health) echo 'type=terminal';;
+  read-screen) [ "${T23_NOT_READY:-0}" = 1 ] || echo 'fixture prompt';;
+  *) :;;
+esac
+EOF
+chmod +x "$STUB_BIN/telepty" "$STUB_BIN/cmux-open"
+# A cwd containing a space: the %q quoting of --command must survive being typed in.
+mkdir -p "$T_TMP/cwd with space"
+open_fixture() (
+  export CMUX="$STUB_BIN/cmux-open" CMUX_READY_TIMEOUT_MS=1 CMUX_READY_INTERVAL_MS=1
+  . "$REPO_ROOT/bin/lib/workspace-host.sh"
+  _wh_cmux_open 'fixture-t23' "$T_TMP/cwd with space" 'fixture-cli --fixture-only'
+)
+for setting in unset 1 0; do
+  if [ "$setting" = unset ]; then unset AIGENTRY_WORKER_AUTO_RESTART;
+  else export AIGENTRY_WORKER_AUTO_RESTART="$setting"; fi
+  [ "$(open_fixture)" = workspace:23 ] \
+    || { echo "FAIL: open result for AIGENTRY_WORKER_AUTO_RESTART=$setting"; exit 1; }
+  printf '%s\n' allow --id fixture-t23 > "$T_TMP/expected-argv"
+  [ "$setting" = 0 ] || printf '%s\n' --auto-restart >> "$T_TMP/expected-argv"
+  printf '%s\n' fixture-cli --fixture-only >> "$T_TMP/expected-argv"
+  cmp "$T_TMP/expected-argv" "$T_TMP/allow-argv" \
+    || { echo "FAIL: restart argv for setting=$setting"; exit 1; }
+  [ "$(cat "$T_TMP/allow-cwd")" = "$T_TMP/cwd with space" ] \
+    || { echo "FAIL: the child did not inherit the quoted cwd (setting=$setting)"; exit 1; }
+done
+# An empty or unrecognized value is refused, and refused BEFORE cmux is invoked.
+for setting in '' invalid 2 true; do
+  : > "$T_TMP/open-calls"
+  export AIGENTRY_WORKER_AUTO_RESTART="$setting"
+  rc=0; open_fixture > "$T_TMP/invalid.out" 2> "$T_TMP/invalid.err" || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL: value '$setting' did not refuse with exit 2 (rc=$rc)"; exit 1; }
+  [ ! -s "$T_TMP/open-calls" ] || { echo "FAIL: value '$setting' reached cmux before refusing"; exit 1; }
+  [ ! -s "$T_TMP/invalid.out" ] || { echo "FAIL: value '$setting' emitted a ref"; exit 1; }
+  grep -q AIGENTRY_WORKER_AUTO_RESTART "$T_TMP/invalid.err" \
+    || { echo "FAIL: value '$setting' did not name the setting on stderr"; exit 1; }
+done
+# The readiness barrier is unchanged by the new setting: still exit 3, still no ref, still
+# a closed workspace.
+export AIGENTRY_WORKER_AUTO_RESTART=0 T23_NOT_READY=1
+: > "$T_TMP/open-calls"
+rc=0; open_fixture > "$T_TMP/not-ready.out" 2> "$T_TMP/not-ready.err" || rc=$?
+[ "$rc" = 3 ] && [ ! -s "$T_TMP/not-ready.out" ] && grep -qx close-workspace "$T_TMP/open-calls" \
+  || { echo 'FAIL: readiness refusal changed'; exit 1; }
+unset AIGENTRY_WORKER_AUTO_RESTART T23_NOT_READY
+
 echo "T23 PASS"
