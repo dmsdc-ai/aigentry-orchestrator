@@ -1,28 +1,29 @@
-// #652 — AIGENTRY_CODEX_SYSTEM_CA: the opt-in that hands the macOS public CA bundle to a
-// confined Codex worker, and the metadata checks that can refuse it.
+// #652 — AIGENTRY_CODEX_SYSTEM_CA: the opt-in that hands a confined Codex worker the CA
+// bundle FILE macOS ships, and the checks that can refuse it.
 //
-// Covers the four arms of the opt-in: unset (nothing added), a non-Darwin platform
-// (nothing added), an acceptable bundle (CODEX_CA_CERTIFICATE set to the fixed OS path),
-// and a rejected bundle — wrong owner, group/other-writable, not a regular file, missing
-// or unreadable — where NOTHING is added and a precise warning is written instead.
+// Round 1 (review C1) moved the subject of this suite: the option no longer validates one
+// pathname and then hand over that pathname. It resolves the chain ONCE, validates the
+// RESOLVED file and every directory component above it, and hands the worker the resolved
+// path. So the assertions here are about (a) which object was inspected, (b) which path the
+// sealed environment receives, and (c) which conditions drop the option — including a
+// replaceable PARENT of a perfectly good file, which the round-0 candidate accepted.
 //
 // `seedAuth` is taken from the TypeScript source by AST node position
 // (ts.createSourceFile → FunctionDeclaration → getStart/getEnd), type-erased with
 // ts.transpileModule and evaluated in a node:vm context whose only bindings are the
 // explicit fakes below — the same technique as tests/session/worker-auth-seed.test.ts,
 // which pins the rest of this function's behaviour. The REAL declaration runs; only its
-// process boundary is replaced. The platform and the opt-in are INJECTED, which is what
-// makes the Darwin-only arm and the root-owned-file arm measurable off macOS and without
-// root: nothing here reads /etc, the developer HOME, a credential store or the network,
-// and nothing is written outside the in-memory fake filesystem.
+// process boundary is replaced. The platform, the opt-in, the filesystem layout and the
+// effective uid are INJECTED, which is what makes the Darwin-only arm, the root-owned arm
+// and the symlink arm measurable off macOS, without root and without touching /etc.
 //
-// Scope: this proves which environment variable the sealed manifest gets, and under which
-// file metadata. It does NOT prove that the OS trusts that bundle, that it is readable
-// from inside the sandbox, or that the Codex client honours the variable — those are
-// measurements, recorded with the change that introduced the option.
+// Scope: this proves which environment variable the sealed manifest gets, for which object,
+// under which metadata. It does NOT prove that the OS trusts that bundle, that the bundle
+// is readable from inside the sandbox, or that the Codex client honours the variable —
+// those are measurements, recorded with the change that introduced the option.
 //
 // Portable: pure string/JSON work in one vm context, so it runs on every OS the runner
-// collects compiled tests on, win32 included.
+// collects compiled tests on, win32 included. No case is skipped on any platform.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -73,8 +74,10 @@ const ERASED = ts.transpileModule(`${DECLS.get("writePrivate")}\n${DECLS.get("se
 // each evaluation gets its own sink for that assignment.
 const PROGRAM = `${ERASED}\n;({ seedAuth });`;
 
-/** The fixed OS path the option selects. Pinned literally, not read from the module. */
-const CA = "/etc/ssl/cert.pem";
+/** The path the option asks for. Pinned literally, not read from the module. */
+const REQUESTED = "/etc/ssl/cert.pem";
+/** Where it resolves on a stock macOS layout: /etc is itself a symlink to /private/etc. */
+const RESOLVED = "/private/etc/ssl/cert.pem";
 const OPT_IN = "AIGENTRY_CODEX_SYSTEM_CA";
 const HOST_HOME = "/fake/host-home";
 const WORKER_HOME = "/fake/worker-home";
@@ -82,55 +85,105 @@ const CWD = "/fake/target-cwd";
 /** Fabricated; not derived from any real credential. */
 const FAKE_CODEX_AUTH = JSON.stringify({ fake: "FAKE-652-NOT-A-SECRET" });
 
-interface StatFixture { isFile: boolean; uid: number; mode: number }
+const R_OK = 4, W_OK = 2;
+type Kind = "file" | "dir" | "link";
+interface Node { kind: Kind; uid: number; mode: number; target?: string }
+/** The in-memory layout the fake fs answers from. Absolute paths, no "." or "..". */
+type Layout = Record<string, Node>;
+
+const dir = (uid = 0, mode = 0o040755): Node => ({ kind: "dir", uid, mode });
+const file = (uid = 0, mode = 0o100644): Node => ({ kind: "file", uid, mode });
+const link = (target: string): Node => ({ kind: "link", uid: 0, mode: 0o120755, target });
+
+/**
+ * The stock macOS layout: a SYMLINKED /etc/ssl/cert.pem whose target and whose every
+ * parent is root-owned and not group/other-writable. This is the accepted case, and it is
+ * deliberately the default so that every rejection fixture below is one mutation away
+ * from a bundle that works.
+ */
+function stockLayout(): Layout {
+  return {
+    "/": dir(),
+    "/etc": link("/private/etc"),
+    "/private": dir(),
+    "/private/etc": dir(),
+    "/private/etc/ssl": dir(),
+    [RESOLVED]: file(),
+  };
+}
+
+const errno = (code: string, p: string): never => {
+  const e: NodeJS.ErrnoException = new Error(`${code}: ${p}`);
+  e.code = code;
+  throw e;
+};
+
 interface Opts {
   platform?: NodeJS.Platform;
   env?: Record<string, string>;
-  /** Absent = statSync throws ENOENT. */
-  stat?: StatFixture;
-  /** `false` = accessSync throws EACCES. */
+  layout?: Layout;
+  /** Paths THIS process may write (the ACL backstop's view). */
+  writable?: string[];
+  /** `false` = R_OK on the resolved bundle throws EACCES. */
   readable?: boolean;
+  /** Effective uid of the host process; 0 disables the W_OK backstop. */
+  uid?: number;
 }
 interface Result {
   env: Record<string, unknown> | null;
   threw: Error | null;
   warnings: string[];
-  statted: string[];
+  /** Every path handed to lstat/realpath, in order. */
+  inspected: string[];
+  /** Every `access` call as "<path>:<mode>". */
   accessed: string[];
   writes: string[];
 }
 
 function seed(opts: Opts = {}): Result {
   const platform = opts.platform ?? "darwin";
+  const layout = opts.layout ?? stockLayout();
+  const writable = new Set(opts.writable ?? []);
   const readable = opts.readable ?? true;
+  const uid = opts.uid ?? 501;
   const warnings: string[] = [];
-  const statted: string[] = [];
+  const inspected: string[] = [];
   const accessed: string[] = [];
   const writes: string[] = [];
   const files = new Map<string, string>([[`${HOST_HOME}/.codex/auth.json`, FAKE_CODEX_AUTH]]);
 
-  const enoent = (p: string): never => {
-    const e: NodeJS.ErrnoException = new Error(`ENOENT: ${p}`);
-    e.code = "ENOENT";
-    throw e;
+  /** Component-by-component resolution, following absolute symlinks. */
+  const realpath = (p: string): string => {
+    let cur = "";
+    for (const part of p.split("/").filter(Boolean)) {
+      cur = `${cur}/${part}`;
+      let node: Node | undefined = layout[cur];
+      for (let hops = 0; node && node.kind === "link"; hops += 1) {
+        if (hops > 8) errno("ELOOP", cur);
+        cur = node.target!;
+        node = layout[cur];
+      }
+      if (!node) errno("ENOENT", cur);
+    }
+    return cur;
   };
+
   const fakeFs = {
-    constants: { R_OK: 4, X_OK: 1 },
+    constants: { R_OK, W_OK, X_OK: 1 },
     existsSync: (p: string) => files.has(p),
-    readFileSync: (p: string) => (files.has(p) ? files.get(p)! : enoent(p)),
+    readFileSync: (p: string) => (files.has(p) ? files.get(p)! : errno("ENOENT", p)),
     mkdirSync: () => undefined,
     writeFileSync: (p: string, data: string) => { writes.push(p); files.set(p, data); },
-    statSync: (p: string) => {
-      statted.push(p);
-      if (!opts.stat) return enoent(p);
-      return { isFile: () => opts.stat!.isFile, uid: opts.stat!.uid, mode: opts.stat!.mode };
+    realpathSync: (p: string) => { inspected.push(p); return realpath(p); },
+    lstatSync: (p: string) => {
+      inspected.push(p);
+      const node = layout[p] ?? errno("ENOENT", p);
+      return { isFile: () => node.kind === "file", isDirectory: () => node.kind === "dir", uid: node.uid, mode: node.mode };
     },
-    accessSync: (p: string) => {
-      accessed.push(p);
-      if (readable) return;
-      const e: NodeJS.ErrnoException = new Error(`EACCES: ${p}`);
-      e.code = "EACCES";
-      throw e;
+    accessSync: (p: string, mode: number) => {
+      accessed.push(`${p}:${mode}`);
+      if (mode === W_OK) { if (!writable.has(p)) errno("EACCES", p); return; }
+      if (!readable) errno("EACCES", p);
     },
   };
   const ctx = vm.createContext({
@@ -141,6 +194,7 @@ function seed(opts: Opts = {}): Result {
     process: {
       platform,
       env: opts.env ?? {},
+      getuid: () => uid,
       stderr: { write: (s: string) => { warnings.push(s); return true; } },
     },
     execFileSync: () => assert.fail("the codex branch must never reach the Keychain"),
@@ -159,10 +213,12 @@ function seed(opts: Opts = {}): Result {
   } catch (e) {
     threw = e as Error;
   }
-  return { env, threw, warnings, statted, accessed, writes };
+  return { env, threw, warnings, inspected, accessed, writes };
 }
 
 const CODEX_HOME = `${WORKER_HOME}/.codex`;
+/** The resolved file first, then every directory component up to and including "/". */
+const FULL_CHAIN = [REQUESTED, RESOLVED, "/private/etc/ssl", "/private/etc", "/private", "/"];
 
 /** Every arm must still seed the two codex files and must never throw. */
 function assertSeededNormally(r: Result): void {
@@ -174,52 +230,147 @@ test("#652: opt-out is the default — an unset opt-in adds nothing and inspects
   const r = seed();
   assertSeededNormally(r);
   assert.deepEqual(r.env, { CODEX_HOME });
-  assert.deepEqual(r.statted, [], "nothing may be stat()ed when the opt-in is unset");
+  assert.deepEqual(r.inspected, [], "nothing may be resolved or stat()ed when the opt-in is unset");
+  assert.deepEqual(r.accessed, []);
   assert.deepEqual(r.warnings, []);
 });
 
 test("#652: only the exact value `1` opts in; other values add nothing and warn nothing", () => {
   for (const value of ["0", "", "true", "yes", "2", "01", " 1"]) {
-    const r = seed({ env: { [OPT_IN]: value }, stat: { isFile: true, uid: 0, mode: 0o100644 } });
+    const r = seed({ env: { [OPT_IN]: value } });
     assertSeededNormally(r);
     assert.deepEqual(r.env, { CODEX_HOME }, `value ${JSON.stringify(value)} must not opt in`);
-    assert.deepEqual(r.statted, [], `value ${JSON.stringify(value)} must not inspect the bundle`);
+    assert.deepEqual(r.inspected, [], `value ${JSON.stringify(value)} must not inspect the bundle`);
     assert.deepEqual(r.warnings, []);
   }
 });
 
 test("#652: the opt-in is Darwin-only — on any other platform nothing is added and nothing is read", () => {
   for (const platform of ["linux", "win32", "freebsd", "aix"] as NodeJS.Platform[]) {
-    const r = seed({ platform, env: { [OPT_IN]: "1" }, stat: { isFile: true, uid: 0, mode: 0o100644 } });
+    const r = seed({ platform, env: { [OPT_IN]: "1" } });
     assertSeededNormally(r);
     assert.deepEqual(r.env, { CODEX_HOME }, `${platform} must not get the CA variable`);
-    assert.deepEqual(r.statted, [], `${platform} must not inspect the bundle`);
+    assert.deepEqual(r.inspected, [], `${platform} must not inspect the bundle`);
     assert.deepEqual(r.warnings, [], `${platform} must not warn about an option it never offered`);
   }
 });
 
-test("#652: an acceptable bundle — regular file, root-owned, not group/other-writable — is passed", () => {
-  // 0644 and the stricter 0444/0400: each is root-owned with no write bit outside owner.
-  for (const mode of [0o100644, 0o100444, 0o100400, 0o100600]) {
-    const r = seed({ env: { [OPT_IN]: "1" }, stat: { isFile: true, uid: 0, mode } });
+// ── C1: the check and the handover are bound to the SAME object ────────────────────────
+test("#652/C1: the worker is handed the RESOLVED path, not the symlink it asked for", () => {
+  const r = seed({ env: { [OPT_IN]: "1" } });
+  assertSeededNormally(r);
+  assert.deepEqual(r.env, { CODEX_HOME, CODEX_CA_CERTIFICATE: RESOLVED },
+    "the sealed environment must carry the path whose metadata was actually checked");
+  assert.notEqual(r.env!.CODEX_CA_CERTIFICATE, REQUESTED,
+    "handing over the pre-resolution path leaves the worker's open bound to a different object");
+});
+
+test("#652/C1: the resolution happens once and every component of the resolved path is checked", () => {
+  const r = seed({ env: { [OPT_IN]: "1" } });
+  assert.deepEqual(r.inspected, FULL_CHAIN,
+    "exactly one realpath of the requested path, then the resolved file and each parent up to /");
+  assert.equal(r.inspected.filter((p) => p === REQUESTED).length, 1, "the chain is resolved exactly once");
+  assert.deepEqual(r.accessed, [
+    `${RESOLVED}:${R_OK}`,
+    ...FULL_CHAIN.slice(1).map((p) => `${p}:${W_OK}`),
+  ], "readability is checked on the resolved file, and effective write access on the whole chain");
+});
+
+test("#652/C1: a replaceable PARENT drops the option even when the bundle itself is perfect", () => {
+  // The round-0 candidate accepted every one of these: it stat()ed the file and nothing else.
+  const cases: Array<[string, Layout, RegExp]> = [
+    ["group-writable parent", { ...stockLayout(), "/private/etc/ssl": dir(0, 0o040775) },
+      /under a group\/other-writable directory \(\/private\/etc\/ssl, mode 775\)/],
+    ["other-writable grandparent", { ...stockLayout(), "/private/etc": dir(0, 0o040757) },
+      /under a group\/other-writable directory \(\/private\/etc, mode 757\)/],
+    ["non-root-owned parent", { ...stockLayout(), "/private/etc/ssl": dir(501) },
+      /under a non-root-owned directory \(\/private\/etc\/ssl, uid 501\)/],
+    ["non-root-owned root", { ...stockLayout(), "/": dir(501) },
+      /under a non-root-owned directory \(\/, uid 501\)/],
+    ["world-writable root", { ...stockLayout(), "/": dir(0, 0o040777) },
+      /under a group\/other-writable directory \(\/, mode 777\)/],
+  ];
+  for (const [label, layout, expected] of cases) {
+    const r = seed({ env: { [OPT_IN]: "1" }, layout });
     assertSeededNormally(r);
-    assert.deepEqual(r.env, { CODEX_HOME, CODEX_CA_CERTIFICATE: CA },
+    assert.deepEqual(r.env, { CODEX_HOME }, `${label}: a replaceable chain must add no CA variable`);
+    assert.equal(r.warnings.length, 1, `${label}: exactly one warning`);
+    assert.match(r.warnings[0]!, expected, label);
+    assert.match(r.warnings[0]!, /CODEX_CA_CERTIFICATE not set\n$/, label);
+  }
+});
+
+test("#652/C1: a component this non-root process can write is refused (the ACL backstop)", () => {
+  // st_mode cannot see an extended ACL; access(W_OK) can, for this process. Each of these
+  // layouts is mode-clean, so only the W_OK pass can catch it.
+  for (const target of [RESOLVED, "/private/etc/ssl", "/"]) {
+    const r = seed({ env: { [OPT_IN]: "1" }, writable: [target] });
+    assertSeededNormally(r);
+    assert.deepEqual(r.env, { CODEX_HOME }, `a writable ${target} must drop the option`);
+    assert.equal(r.warnings.length, 1);
+    assert.match(r.warnings[0]!, new RegExp(`writable by this non-root process \\(${target.replace(/\//g, "\\/")}\\)`));
+  }
+});
+
+test("#652/C1: as root the W_OK backstop is skipped, because it could only ever say yes", () => {
+  const r = seed({ env: { [OPT_IN]: "1" }, uid: 0, writable: [RESOLVED, "/private/etc/ssl", "/"] });
+  assertSeededNormally(r);
+  assert.deepEqual(r.env, { CODEX_HOME, CODEX_CA_CERTIFICATE: RESOLVED });
+  assert.deepEqual(r.accessed, [`${RESOLVED}:${R_OK}`],
+    "a root host checks readability only; W_OK carries no information for uid 0");
+});
+
+test("#652/C1: a symlink that appears after the resolve is not a regular file", () => {
+  // lstat (not stat) on the resolved path: the only way this node can be a link is that it
+  // became one after realpathSync returned, which is exactly the swap being guarded against.
+  const layout = { ...stockLayout(), [RESOLVED]: link("/private/etc/ssl/other.pem") };
+  const r = seed({ env: { [OPT_IN]: "1" }, layout });
+  assertSeededNormally(r);
+  assert.deepEqual(r.env, { CODEX_HOME });
+  assert.match(r.warnings[0]!, /is not a regular file/);
+});
+
+test("#652/C1: the warning names both the requested path and what it resolved to", () => {
+  const layout = { ...stockLayout(), [RESOLVED]: file(501) };
+  const r = seed({ env: { [OPT_IN]: "1" }, layout });
+  assert.match(r.warnings[0]!, /\/etc\/ssl\/cert\.pem → \/private\/etc\/ssl\/cert\.pem is not root-owned \(uid 501\)/,
+    "a reader must be able to see WHICH object was refused, not just which one was asked for");
+});
+
+test("#652: an unresolvable chain is reported as unusable, naming the requested path only", () => {
+  const layout = { ...stockLayout() };
+  delete layout[RESOLVED];
+  const r = seed({ env: { [OPT_IN]: "1" }, layout });
+  assertSeededNormally(r);
+  assert.deepEqual(r.env, { CODEX_HOME });
+  assert.equal(r.warnings.length, 1);
+  assert.match(r.warnings[0]!, /^worker-sandbox: AIGENTRY_CODEX_SYSTEM_CA=1 ignored — \/etc\/ssl\/cert\.pem is unusable \(ENOENT\)/);
+});
+
+// ── the metadata gates on the bundle itself ───────────────────────────────────────────
+test("#652: an acceptable bundle — regular file, root-owned, not group/other-writable — is passed", () => {
+  // 0644 and the stricter 0444/0400/0600: each is root-owned with no write bit outside owner.
+  for (const mode of [0o100644, 0o100444, 0o100400, 0o100600]) {
+    const r = seed({ env: { [OPT_IN]: "1" }, layout: { ...stockLayout(), [RESOLVED]: file(0, mode) } });
+    assertSeededNormally(r);
+    assert.deepEqual(r.env, { CODEX_HOME, CODEX_CA_CERTIFICATE: RESOLVED },
       `mode ${mode.toString(8)} must be accepted`);
-    assert.deepEqual(r.statted, [CA], "exactly the one fixed OS path is inspected");
-    assert.deepEqual(r.accessed, [CA], "readability is checked as well as the metadata");
+    assert.deepEqual(r.inspected, FULL_CHAIN, "exactly the requested path and its resolved chain");
     assert.deepEqual(r.warnings, []);
   }
 });
 
-test("#652: a rejected bundle adds NOTHING and warns precisely — owner, mode, type, absence, access", () => {
+test("#652: a rejected bundle adds NOTHING and warns precisely — owner, mode, type, access", () => {
   const cases: Array<[string, Opts, RegExp]> = [
-    ["not root-owned", { stat: { isFile: true, uid: 501, mode: 0o100644 } }, /not root-owned \(uid 501\)/],
-    ["root but group-writable", { stat: { isFile: true, uid: 0, mode: 0o100664 } }, /group\/other-writable \(mode 664\)/],
-    ["root but other-writable", { stat: { isFile: true, uid: 0, mode: 0o100646 } }, /group\/other-writable \(mode 646\)/],
-    ["world-writable", { stat: { isFile: true, uid: 0, mode: 0o100666 } }, /group\/other-writable \(mode 666\)/],
-    ["not a regular file", { stat: { isFile: false, uid: 0, mode: 0o040755 } }, /not a regular file/],
-    ["missing", {}, /unusable \(ENOENT\)/],
-    ["unreadable", { stat: { isFile: true, uid: 0, mode: 0o100644 }, readable: false }, /unusable \(EACCES\)/],
+    ["not root-owned", { layout: { ...stockLayout(), [RESOLVED]: file(501) } }, /not root-owned \(uid 501\)/],
+    ["root but group-writable", { layout: { ...stockLayout(), [RESOLVED]: file(0, 0o100664) } },
+      /group\/other-writable \(mode 664\)/],
+    ["root but other-writable", { layout: { ...stockLayout(), [RESOLVED]: file(0, 0o100646) } },
+      /group\/other-writable \(mode 646\)/],
+    ["world-writable", { layout: { ...stockLayout(), [RESOLVED]: file(0, 0o100666) } },
+      /group\/other-writable \(mode 666\)/],
+    ["not a regular file", { layout: { ...stockLayout(), [RESOLVED]: dir(0, 0o040755) } }, /not a regular file/],
+    ["unreadable", { readable: false }, /unusable \(EACCES\)/],
   ];
   for (const [label, extra, expected] of cases) {
     const r = seed({ env: { [OPT_IN]: "1" }, ...extra });
@@ -231,7 +382,7 @@ test("#652: a rejected bundle adds NOTHING and warns precisely — owner, mode, 
     assert.match(warning, expected, label);
     assert.match(warning, /^worker-sandbox: AIGENTRY_CODEX_SYSTEM_CA=1 ignored — /, label);
     assert.match(warning, /CODEX_CA_CERTIFICATE not set\n$/, label);
-    assert.ok(warning.includes(CA), `${label}: the warning must name the path it refused`);
+    assert.ok(warning.includes(REQUESTED), `${label}: the warning must name the path it refused`);
     // A refusal must not leak the host's own layout or any credential byte.
     assert.ok(!warning.includes(HOST_HOME) && !warning.includes(FAKE_CODEX_AUTH),
       `${label}: the warning must carry no home path and no credential material`);
@@ -239,7 +390,7 @@ test("#652: a rejected bundle adds NOTHING and warns precisely — owner, mode, 
 });
 
 test("#652: the option sets CODEX_CA_CERTIFICATE only — it never widens the rest of the environment", () => {
-  const accepted = seed({ env: { [OPT_IN]: "1" }, stat: { isFile: true, uid: 0, mode: 0o100644 } });
+  const accepted = seed({ env: { [OPT_IN]: "1" } });
   const optedOut = seed();
   assert.deepEqual(Object.keys(accepted.env!).sort(), ["CODEX_CA_CERTIFICATE", "CODEX_HOME"]);
   // Exactly one key more than opt-out, and the same CODEX_HOME.
@@ -247,15 +398,64 @@ test("#652: the option sets CODEX_CA_CERTIFICATE only — it never widens the re
   assert.equal(accepted.env!.CODEX_HOME, optedOut.env!.CODEX_HOME);
 });
 
-test("#652: the source pins the fixed public path and the two metadata gates", () => {
-  // A source-level guard: the accepted path is a constant, not caller-supplied, and the
-  // owner/mode gates are present. An edit that parameterises the path or drops a gate
-  // fails here as well as above.
+// ── source-level guards ───────────────────────────────────────────────────────────────
+/** The codex arm of the real declaration, and its comment text with `//` prefixes removed. */
+function codexBranch(): { code: string; prose: string } {
   const decl = DECLS.get("seedAuth")!;
-  const branch = decl.slice(decl.indexOf('if (cli === "codex")'), decl.indexOf('if (cli === "claude")'));
-  assert.ok(branch.includes(`"${CA}"`), "the bundle path must be the fixed OS path, written literally");
-  assert.ok(branch.includes("st.uid !== 0"), "the root-owner gate must be present");
-  assert.ok(branch.includes("0o022"), "the group/other-writable gate must be present");
-  assert.ok(branch.includes('process.platform === "darwin"'), "the option must stay Darwin-only");
-  assert.ok(!/throw new Error\([^)]*CA/i.test(branch), "a rejected bundle must warn, never throw");
+  const code = decl.slice(decl.indexOf('if (cli === "codex")'), decl.indexOf('if (cli === "claude")'));
+  const prose = code.replace(/^[ \t]*\/\/[ \t]?/gm, "").replace(/\s+/g, " ");
+  return { code, prose };
+}
+
+test("#652: the source pins the fixed public path, the resolve-then-check order and the gates", () => {
+  const { code } = codexBranch();
+  assert.ok(code.includes(`"${REQUESTED}"`), "the bundle path must be the fixed OS path, written literally");
+  assert.ok(code.includes("fs.realpathSync(requested)"), "the chain must be resolved before anything is judged");
+  assert.ok(code.indexOf("fs.realpathSync") < code.indexOf("fs.lstatSync"),
+    "the resolve must come first, or the metadata would describe a different object");
+  assert.ok(code.includes("st.uid !== 0") && code.includes("ds.uid !== 0"),
+    "the root-owner gate must be applied to the file AND to each directory component");
+  assert.equal(code.split("0o022").length - 1, 2,
+    "the group/other-writable gate must be applied to the file AND to each directory component");
+  assert.ok(/tlsEnv\.CODEX_CA_CERTIFICATE = resolved;/.test(code),
+    "the worker must be handed the resolved path — the one the checks were run on");
+  assert.ok(!/tlsEnv\.CODEX_CA_CERTIFICATE = (requested|ca|"\/etc)/.test(code),
+    "handing over the unresolved path is the defect C1 names");
+  assert.ok(code.includes('process.platform === "darwin"'), "the option must stay Darwin-only");
+  assert.ok(code.includes('process.env.AIGENTRY_CODEX_SYSTEM_CA === "1"'), "the opt-in must be an exact match on 1");
+  assert.ok(!/throw new Error\([^)]*CA/i.test(code), "a rejected bundle must warn, never throw");
+  // No snapshot/stage path: the existing suite forbids fs.openSync/copyFileSync inside this
+  // declaration (tests/session/worker-auth-seed.test.ts), so the chain walk is the mechanism.
+  assert.ok(!/fs\.(openSync|copyFileSync|renameSync|chmodSync)\b/.test(code),
+    "the declaration must keep the host-directed fs.* surface the existing suite pins");
+});
+
+test("#652/C2+C3: the option's own documentation claims only what this code establishes", () => {
+  const { prose } = codexBranch();
+  // Must disclose, in the source a maintainer reads first:
+  for (const must of [
+    /is NOT "the system trust"/,
+    /Keychain and trustd/,
+    /may differ IN EITHER DIRECTION/,
+    /neither a subset nor a superset/,
+    /ADDS these roots to any it already has or REPLACES them/,
+    /BOTH CODEX_CA_CERTIFICATE and SSL_CERT_FILE set/,
+    /does not isolate which variable the client honoured/,
+    /TOCTOU/,
+    /st_mode cannot see a macOS extended ACL/,
+    /Host readability is not readability inside the confinement/,
+    /resolved pathname is what the worker is handed/,
+  ]) {
+    assert.match(prose, must, `the option's documentation must state: ${must}`);
+  }
+  // Must NOT claim what no code here checks:
+  for (const mustNot of [
+    /additive-only/i,
+    /equivalent to (the )?(macOS |host )?(effective )?(system )?trust/i,
+    /same (anchors|roots) as the (system|host)/i,
+    /is the PUBLIC trust store/i,
+    /preserv\w* the client's (prior|existing) roots/i,
+  ]) {
+    assert.doesNotMatch(prose, mustNot, `the option's documentation must not claim: ${mustNot}`);
+  }
 });
