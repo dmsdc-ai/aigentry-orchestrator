@@ -1086,11 +1086,20 @@ function consumeSurfaceOrphaned(gcRoot: string, keepAlive: string): void {
 }
 
 /**
- * consume_surface_mismatched — re-bind a live session's workspace onto its real PTY
- * surface when telepty signals the surface is ALIVE-but-mismatched (task #507).
- * wh_focus is NON-DESTRUCTIVE (best-effort raise; always 0), so unlike orphan-close
- * it needs no INV-17 kill-corroboration — re-focusing a stray surface cannot lose
- * work. Single safety gate: the sid must resolve to a host_id.
+ * consume_surface_mismatched — telepty signals a live session whose surface is
+ * ALIVE-but-mismatched (task #507). The event is a DIAGNOSTIC OBSERVATION only.
+ *
+ * Focusing, raising or selecting a workspace RE-BINDS NOTHING: the mismatch is between
+ * the session's expected PTY and the surface telepty observed, and moving a window does
+ * not change either. What it did do is take the operator's selection away on every tick
+ * a worker emitted the event, which is the one thing #616 forbids. So nothing here
+ * raises, selects or returns to the orchestrator — a selection the operator made by
+ * hand stays as they left it.
+ *
+ * The mismatch is recorded as UNRESOLVED (the read-only lookup only names the host id)
+ * and the spool is drained exactly as before, so the bridge's next rename-install still
+ * finds a free path. A mismatch line says nothing about whether the task finished or
+ * whether the session is alive; inspecting or closing that surface stays a human call.
  */
 function consumeSurfaceMismatched(): void {
   let body: string;
@@ -1105,19 +1114,11 @@ function consumeSurfaceMismatched(): void {
     const sid = jqField(line, "sid");
     const exppty = jqField(line, "expectedPtyPid");
     if (!sid) continue;
-    if (DRY_RUN === 1) {
-      log(`SURFACE_MISMATCHED would-refocus sid=${sid} expectedPty=${exppty || "?"}`);
-      processed += 1;
-      continue;
-    }
-    const hostId = chomp(wh(["lookup", sid]).stdout);
-    if (hostId) {
-      if (wh(["focus", hostId], { out: "inherit" }).status === 0) {
-        log(`SURFACE_MISMATCHED refocused sid=${sid} host=${hostId} expectedPty=${exppty || "?"}`);
-      } else {
-        log(`SURFACE_MISMATCHED refocus non-zero sid=${sid} host=${hostId}`);
-      }
-    }
+    // The lookup is READ-ONLY and is skipped entirely under --dry-run, so a dry tick
+    // still reaches no host adapter at all.
+    const hostId = DRY_RUN === 1 ? "" : chomp(wh(["lookup", sid]).stdout);
+    log(`SURFACE_MISMATCHED unresolved sid=${sid} host=${hostId || "?"} expectedPty=${exppty || "?"} ` +
+      "— diagnostic only; no focus/rebind actuation");
     processed += 1;
   }
   // rm, and unconditional — same handoff with bin/telepty-bus-bridge.sh as
@@ -1517,7 +1518,7 @@ function main(argv: string[]): void {
 
   // event-driven surface_orphaned consumer (dormant until a bus→file bridge exists)
   consumeSurfaceOrphaned(gcRoot, keepAlive);
-  // event-driven surface_mismatched consumer — re-focus stray surfaces (#507, dormant)
+  // event-driven surface_mismatched consumer — diagnostic observation only, never focus (#507/#616)
   consumeSurfaceMismatched();
 
   const candidates: string[] = [];

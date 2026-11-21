@@ -423,10 +423,20 @@ _wh_cmux_wait_ready() {
 # from open-session.sh:open_in_terminal()'s cmux branch (#608 Phase 1, ADR §7).
 # Exit contract (handle emitted ⇒ pane ready; no half-spawned surface on failure):
 #   0  → ref printed on stdout (surface can accept send-key).
-#   2  → new-workspace produced no ref (spawn failed); nothing to clean up.
+#   2  → new-workspace produced no ref (spawn failed), or this cmux does not support
+#        `new-workspace --focus` (ERR CMUX_NO_FOCUS_UNSUPPORTED); nothing to clean up.
 #   3  → ready-gate timed out; the workspace is closed, NO ref emitted.
 # CMUX seam: injectable cmux binary so the readiness gate is hermetically testable
 # (BUG-A); defaults to the real `cmux` in production.
+#
+# FOCUS: a worker workspace is created in the BACKGROUND. It is visible in the cmux
+# sidebar and its CLI still runs as the foreground process of its own surface, but
+# creating it does not move the operator's selection — `--focus false` is passed on
+# every spawn. The support check below runs FIRST, so a cmux too old to take that flag
+# is refused before anything is spawned rather than silently stealing focus; there is
+# deliberately no focus-stealing fallback. Scope: the cmux adapter. The opt-in legacy
+# rollback arm (src/session/open-session/legacy-spawn.ts, AIGENTRY_WH_LEGACY_SPAWN=1)
+# carries a verbatim copy of the pre-seam command line and does NOT pass --focus.
 _wh_cmux_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
   # cmux --command sends text+Enter; telepty allow runs as the workspace's foreground process.
@@ -440,7 +450,14 @@ _wh_cmux_open() {
   local CMUX_BIN="${CMUX:-cmux}"
   local out ref q_cwd q_sid
   printf -v q_cwd '%q' "$cwd"; printf -v q_sid '%q' "$sid"
-  out=$("$CMUX_BIN" new-workspace --cwd "$cwd" --command "bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd' _ $q_cwd $q_sid" 2>&1)
+  # Refuse an unsupported cmux BEFORE spawning: a cmux whose `--help` does not advertise
+  # `new-workspace … --focus` would ignore the flag and open the workspace in front of
+  # the operator. A clean refusal is the documented behaviour; there is no fallback.
+  if ! "$CMUX_BIN" --help 2>&1 | grep -qE 'new-workspace.*--focus'; then
+    echo "ERR CMUX_NO_FOCUS_UNSUPPORTED: '$CMUX_BIN --help' does not advertise new-workspace --focus; refusing to open a focus-stealing workspace for $sid (upgrade cmux)" >&2
+    return 2
+  fi
+  out=$("$CMUX_BIN" new-workspace --focus false --cwd "$cwd" --command "bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd' _ $q_cwd $q_sid" 2>&1)
   ref=$(echo "$out" | grep -oE 'workspace:[0-9]+' | head -1)
   [ -z "$ref" ] && { echo "ERR cmux new-workspace failed: $out" >&2; return 2; }
   # title == sid (open-session.sh SID convention); rename to the stable handle.

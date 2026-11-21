@@ -120,4 +120,57 @@ out4=$("$BASH_BIN" -c "
 echo "$out4" | grep -q "nocmux=present" \
   || { echo "FAIL: an unreachable cmux reported the surface GONE — 'I cannot probe' is not 'it is not there'"; echo "$out4"; exit 1; }
 
+# ── background creation: the cmux argv, and the refusal on a cmux without --focus ──
+# A recording stub stands in for cmux: it logs the FULL argv of every call, so the
+# assertions below are about the argument vector the adapter really builds, not about a
+# window. Nothing opens a terminal, and no real cmux is contacted.
+FOCUS_LOG="$T_TMP/focus-cmux-argv.log"
+cat > "$STUB_BIN/cmux-focus" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$T_TMP/focus-cmux-argv.log"
+case "$1" in
+  --help)
+    [ "${T23_CMUX_NO_FOCUS:-0}" = 1 ] && exit 0   # an older cmux: no --focus advertised
+    echo '  new-workspace [--focus <true|false>] [--cwd <dir>] [--command <cmd>]';;
+  new-workspace) echo 'OK workspace:56';;
+  list-workspaces) echo 'workspace:56 fixture';;
+  surface-health) echo 'type=terminal';;
+  read-screen) echo 'fixture prompt';;
+  *) :;;
+esac
+EOF
+chmod +x "$STUB_BIN/cmux-focus"
+open_focus_fixture() (
+  export CMUX="$STUB_BIN/cmux-focus" CMUX_READY_TIMEOUT_MS=1 CMUX_READY_INTERVAL_MS=1
+  . "$REPO_ROOT/bin/lib/workspace-host.sh"
+  _wh_cmux_open 'fixture-t23-focus' "$T_TMP/focus-cwd" 'fixture-cli --fixture-only'
+)
+mkdir -p "$T_TMP/focus-cwd"
+
+# A: the spawn passes --focus false, and asks cmux whether it supports it first.
+: > "$FOCUS_LOG"; unset T23_CMUX_NO_FOCUS
+[ "$(open_focus_fixture)" = workspace:56 ] || { echo 'FAIL: focus-aware open did not emit its ref'; exit 1; }
+grep -q -- '^--help$' "$FOCUS_LOG" \
+  || { echo 'FAIL: the adapter did not probe cmux --help for --focus support'; cat "$FOCUS_LOG"; exit 1; }
+grep -q -- '^new-workspace --focus false --cwd ' "$FOCUS_LOG" \
+  || { echo 'FAIL: new-workspace did not receive --focus false as its first argument pair'; cat "$FOCUS_LOG"; exit 1; }
+# The support probe must come BEFORE the spawn, or the refusal would arrive too late.
+[ "$(grep -n -- '^--help$' "$FOCUS_LOG" | head -1 | cut -d: -f1)" -lt \
+  "$(grep -n -- '^new-workspace ' "$FOCUS_LOG" | head -1 | cut -d: -f1)" ] \
+  || { echo 'FAIL: the --focus support probe ran after the spawn'; cat "$FOCUS_LOG"; exit 1; }
+# Focus is never ACTUATED on spawn: no select/focus verb is issued at all (cf. T56 part C).
+grep -qE 'select-workspace|^focus' "$FOCUS_LOG" \
+  && { echo 'FAIL: FOCUS THEFT — the adapter actuated focus while creating a worker workspace'; cat "$FOCUS_LOG"; exit 1; }
+
+# B: a cmux whose --help does not advertise --focus is refused, cleanly and before spawn.
+: > "$FOCUS_LOG"; export T23_CMUX_NO_FOCUS=1
+rc=0; out5=$(open_focus_fixture 2> "$T_TMP/focus.err") || rc=$?
+[ "$rc" = 2 ] || { echo "FAIL: an older cmux must be refused with exit 2, got $rc"; cat "$T_TMP/focus.err"; exit 1; }
+[ -z "$out5" ] || { echo "FAIL: a refused spawn must emit no ref, got '$out5'"; exit 1; }
+grep -q CMUX_NO_FOCUS_UNSUPPORTED "$T_TMP/focus.err" \
+  || { echo 'FAIL: the refusal did not name CMUX_NO_FOCUS_UNSUPPORTED'; cat "$T_TMP/focus.err"; exit 1; }
+grep -q -- '^new-workspace' "$FOCUS_LOG" \
+  && { echo 'FAIL: a workspace was spawned despite the refusal — there must be no fallback'; cat "$FOCUS_LOG"; exit 1; }
+unset T23_CMUX_NO_FOCUS
+
 echo "T23 PASS"

@@ -46,6 +46,10 @@ ref="${CMUX_STUB_REF:-workspace:616}"
 cnt="${CMUX_STUB_CNT:?}"; log="${CMUX_STUB_LOG:?}"
 echo "$*" >> "$log"
 case "$1" in
+  # The adapter refuses to spawn unless `--help` advertises `new-workspace … --focus`
+  # (#507/#616). This stub models a cmux that supports it; the catch-all below used to
+  # answer --help with nothing, which the adapter now reads as an unsupported cmux.
+  --help)           echo "  new-workspace [--focus <true|false>] [--cwd <dir>] [--command <cmd>]" ;;
   new-workspace)    echo "OK $ref" ;;
   list-workspaces)
     n=$(( $(cat "$cnt" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$cnt"
