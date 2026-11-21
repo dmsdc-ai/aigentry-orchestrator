@@ -438,11 +438,16 @@ _wh_cmux_wait_ready() {
 #                   retry budget is never silently treated as the default.
 #
 #   SCOPE: this setting is read HERE and therefore applies to the cmux adapter ONLY,
-#   despite its general name. The other workspace backends in this file build their own
-#   child command and still emit `--auto-restart` unconditionally, and so does the
-#   opt-in legacy rollback arm (src/session/open-session/legacy-spawn.ts, reached with
-#   AIGENTRY_WH_LEGACY_SPAWN=1), which carries a verbatim copy of the pre-seam command
-#   line. Setting this to 0 for a non-cmux backend has NO effect and is not an error.
+#   despite its general name. Every other backend in this file keeps its existing launch
+#   command, and those commands are NOT all alike — so "they all pass --auto-restart" would
+#   be wrong: the tmux, aterm, wezterm and iTerm arms wrap the CLI in
+#   `telepty allow … --auto-restart`, whereas _wh_headless_open and the no-tmux branch of
+#   _wh_fallback_spawn exec the CLI under `telepty spawn --id … --` and never pass that flag
+#   at all (for those two there is no flag here for this setting to remove). The opt-in
+#   legacy rollback arm (src/session/open-session/legacy-spawn.ts, reached with
+#   AIGENTRY_WH_LEGACY_SPAWN=1) carries a verbatim copy of the pre-seam cmux command line,
+#   `--auto-restart` included. Setting this to 0 for any backend other than cmux has NO
+#   effect and is not an error.
 _wh_cmux_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
   # cmux --command sends text+Enter; telepty allow runs as the workspace's foreground process.
