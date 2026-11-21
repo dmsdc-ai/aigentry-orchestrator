@@ -111,8 +111,8 @@ const SURFACE_MISMATCHED_SRC =
   env.AIGENTRY_SURFACE_MISMATCHED_SOURCE || path.join(STATE_DIR, "surface-mismatched.jsonl");
 // #507/#616 OPT-IN, default OFF: treat a surface_mismatched event as a diagnostic
 // observation and actuate nothing. Unset or any value but "1" keeps the existing behaviour
-// on EVERY adapter — including Warp, whose raise is the only visual cue some operators have
-// (review F3). See consumeSurfaceMismatched for what each arm does and why.
+// on EVERY adapter — including Warp, whose raise is the only visual cue some operators have.
+// See consumeSurfaceMismatched for what each arm does and why.
 const SURFACE_MISMATCH_DIAGNOSTIC_ONLY = env.AIGENTRY_SURFACE_MISMATCH_DIAGNOSTIC_ONLY === "1";
 const RESUME_MARKER = env.AIGENTRY_SLEEP_RESUME_MARKER || path.join(STATE_DIR, "sleep-resume.json");
 const RESUME_MAX_PER_HOUR = env.RECONCILER_RESUME_MAX_PER_HOUR || "3";

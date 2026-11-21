@@ -136,11 +136,16 @@ case "$1" in
     case "${T23_CMUX_HELP:-single-line}" in
       # The layout observed on a cmux that supports the option.
       single-line) echo '  new-workspace [--focus <true|false>] [--cwd <dir>] [--command <cmd>]';;
-      # Same support, options on continuation lines: a FALSE REFUSAL in the round-0 check.
+      # Same support, options on continuation lines: a same-line grep would refuse this.
       continuation) printf '%s\n' 'Commands:' '  new-workspace' '      --cwd <dir>' \
                       '      --focus <true|false>' '      --command <cmd>' '  close-workspace';;
-      # An unrelated option that merely BEGINS with --focus: FALSE SUPPORT in round 0.
+      # An unrelated option that merely BEGINS with --focus: a prefix grep would accept this.
       prefix-only) echo '  new-workspace [--cwd <dir>] [--focus-follows-mouse <true|false>]';;
+      # A bare SWITCH whose description text says "(bool)": no value placeholder, so passing
+      # `--focus false` would leave `false` as a positional. A value rule that accepts any
+      # punctuation-then-bool after --focus would read this as support.
+      described-switch) printf '%s\n' 'Commands:' '  new-workspace' '      --cwd <dir>' \
+                          '      --focus   (bool) focus the new workspace' '      --command <cmd>';;
       # A cmux too old to know the option at all.
       no-focus) echo '  new-workspace [--cwd <dir>] [--command <cmd>]';;
       # A probe that cannot be read: usable-looking help but a non-zero status, and silence.
@@ -171,8 +176,8 @@ expected_default_argv="new-workspace --cwd $T_TMP/focus-cwd --command bash -c 'c
 # A: THE DEFAULT. With the setting absent the adapter must behave exactly as the public
 # adapter always has — on EVERY cmux version. The stub answers --help like a cmux that has
 # never heard of --focus, and the spawn must still succeed, with the old argv and with no
-# probe at all. This is the case the round-0 candidate broke: it probed on every spawn and
-# refused this cmux with exit 2, so an ordinary install created no workers.
+# probe at all. A probe on every spawn would refuse this cmux with exit 2, so an ordinary
+# install would create no workers.
 : > "$FOCUS_LOG"; unset AIGENTRY_CMUX_BACKGROUND_SPAWN
 [ "$(T23_CMUX_HELP=no-focus open_focus_fixture)" = workspace:56 ] \
   || { echo 'FAIL: a DEFAULT launch on a cmux without --focus must still open a workspace'; cat "$FOCUS_LOG"; exit 1; }
@@ -205,16 +210,16 @@ grep -qE 'select-workspace|^focus' "$FOCUS_LOG" \
   || { echo "FAIL: the opted-in argv differs from the default by more than --focus false
 got : $(grep -- '^new-workspace ' "$FOCUS_LOG" | head -1)"; exit 1; }
 
-# C: opted in, support documented on CONTINUATION lines. Round 0 required `new-workspace`
-# and `--focus` on one line and refused this cmux; the option IS there.
+# C: opted in, support documented on CONTINUATION lines. A check requiring `new-workspace`
+# and `--focus` on one line would refuse this cmux; the option IS there.
 : > "$FOCUS_LOG"
 [ "$(T23_CMUX_HELP=continuation AIGENTRY_CMUX_BACKGROUND_SPAWN=1 open_focus_fixture)" = workspace:56 ] \
   || { echo 'FAIL: a help layout with the option on a continuation line must count as support'; cat "$FOCUS_LOG"; exit 1; }
 grep -q -- '^new-workspace --focus false --cwd ' "$FOCUS_LOG" \
   || { echo 'FAIL: continuation-line support did not reach the spawn'; cat "$FOCUS_LOG"; exit 1; }
 
-# D: opted in, and the ONLY match is a longer option that begins with --focus. Round 0's
-# `new-workspace.*--focus` matched this and spawned with an argument this cmux never
+# D: opted in, and the ONLY match is a longer option that begins with --focus. A
+# `new-workspace.*--focus` grep matches this and spawns with an argument this cmux never
 # documented; the exact-token rule must refuse instead, and refuse before new-workspace.
 : > "$FOCUS_LOG"
 rc=0; out5=$(T23_CMUX_HELP=prefix-only AIGENTRY_CMUX_BACKGROUND_SPAWN=1 open_focus_fixture 2> "$T_TMP/focus.err") || rc=$?
@@ -234,8 +239,8 @@ rc=0; T23_CMUX_HELP=no-focus AIGENTRY_CMUX_BACKGROUND_SPAWN=1 open_focus_fixture
 grep -q -- '^new-workspace' "$FOCUS_LOG" \
   && { echo 'FAIL: the refusal reached new-workspace'; cat "$FOCUS_LOG"; exit 1; }
 
-# F: a probe that could not be READ is reported as such, NOT as an old cmux. Round 0 told
-# the operator to upgrade in both cases; a non-zero `--help` and a silent `--help` are
+# F: a probe that could not be READ is reported as such, NOT as an old cmux. Telling the
+# operator to upgrade in both cases is wrong: a non-zero `--help` and a silent `--help` are
 # "unknown", and conflating them sends people after the wrong fault.
 for layout in rc-nonzero silent; do
   : > "$FOCUS_LOG"
@@ -270,5 +275,15 @@ done
   || { echo 'FAIL: =0 changed the default argv'; cat "$FOCUS_LOG"; exit 1; }
 grep -q -- '^--help' "$FOCUS_LOG" \
   && { echo 'FAIL: =0 probed --help'; cat "$FOCUS_LOG"; exit 1; }
+
+# I: opted in, and `--focus` is documented only as a bare switch whose DESCRIPTION mentions
+# bool. That is not a value syntax: refuse as UNSUPPORTED, before new-workspace.
+: > "$FOCUS_LOG"
+rc=0; T23_CMUX_HELP=described-switch AIGENTRY_CMUX_BACKGROUND_SPAWN=1 open_focus_fixture \
+  > "$T_TMP/focus.out" 2> "$T_TMP/focus.err" || rc=$?
+[ "$rc" = 2 ] && [ ! -s "$T_TMP/focus.out" ] && grep -q CMUX_FOCUS_UNSUPPORTED "$T_TMP/focus.err" \
+  || { echo "FAIL: description text after a bare --focus switch must not read as support (rc=$rc)"; cat "$T_TMP/focus.err"; cat "$FOCUS_LOG"; exit 1; }
+grep -q -- '^new-workspace' "$FOCUS_LOG" \
+  && { echo 'FAIL: a bare --focus switch was handed --focus false'; cat "$FOCUS_LOG"; exit 1; }
 
 echo "T23 PASS"

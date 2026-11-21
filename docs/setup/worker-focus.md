@@ -10,8 +10,13 @@ set something.
 | `AIGENTRY_CMUX_BACKGROUND_SPAWN` | unset = off | a cmux worker workspace is **created in the background** |
 | `AIGENTRY_SURFACE_MISMATCH_DIAGNOSTIC_ONLY` | unset = off | a surface-mismatch event is **recorded, not actuated** |
 
-Any value other than `1` or `0` is refused rather than guessed at: an unreadable setting
-exits 2 with the variable named on stderr, before anything is spawned.
+The two settings treat other values differently:
+
+- `AIGENTRY_CMUX_BACKGROUND_SPAWN` refuses any value other than `1` or `0` (the empty string
+  included) rather than guess: the launch exits 2 with the variable named on stderr, before
+  anything is spawned.
+- `AIGENTRY_SURFACE_MISMATCH_DIAGNOSTIC_ONLY` is on for exactly `1` and nothing else. Every
+  other value, `true` included, means off — silently, with no warning and no exit.
 
 ## Background creation — `AIGENTRY_CMUX_BACKGROUND_SPAWN=1`
 
@@ -24,21 +29,23 @@ emitted only once the pane can accept `send-key`.
 **Unset (the default), nothing changes.** The adapter builds the same
 `new-workspace --cwd … --command …` argument vector it always has, asks cmux nothing
 beforehand, and cannot fail in any new way. This matters because a cmux that does not know
-`--focus` would accept the flag silently and take focus anyway, so the option cannot be
+`--focus` may ignore the flag and take focus anyway, or fail, so the option cannot be
 applied blindly — and the cost of checking must not fall on people who never asked for it.
 
 ### How support is established, and the two refusals
 
 When you opt in, the adapter first reads `cmux --help` and looks for the **exact** option
-`--focus` **with a boolean value syntax** inside the `new-workspace` block of the help text
+`--focus` **followed directly by a boolean value placeholder** (`<true|false>`, `[true|false]`,
+`{true,false}`, `=<bool>`, `true|false`, …) inside the `new-workspace` block of the help text
 (the command's own line plus its indented continuation lines, so both one-line and
-multi-line help layouts work). Then, and only then, does it spawn.
+multi-line help layouts work). A bare `--focus` switch whose description merely mentions
+`bool` does not count. Then, and only then, does it spawn.
 
 Two different refusals, both exit 2 with nothing spawned:
 
 | stderr | meaning | what to do |
 |---|---|---|
-| `ERR CMUX_FOCUS_UNSUPPORTED: …` | the help was read and documents no `new-workspace --focus <true\|false>` | upgrade cmux, or unset the setting |
+| `ERR CMUX_FOCUS_UNSUPPORTED: …` | the top-level help was read and documents no `new-workspace --focus <true\|false>` | upgrade cmux if it predates the option, or unset the setting |
 | `ERR CMUX_FOCUS_PROBE_FAILED: …` | `cmux --help` failed or printed nothing, so support is **unknown**, not absent | fix the cmux install, or unset the setting |
 
 They are kept apart on purpose: "your cmux is too old" and "I could not ask your cmux"
@@ -46,9 +53,13 @@ need different actions, and reporting the second as the first sends you after th
 fault. There is deliberately no fallback that would open the workspace in front of you
 instead, and no refusal of any kind on a default (not opted-in) launch.
 
-What this check cannot do: it reads cmux's own description of itself. A cmux that documents
-the option and then ignores it would still take focus, and no pre-spawn check can detect
-that without spending a workspace to observe it.
+What this check cannot do: it reads cmux's own description of itself, and only the top-level
+`cmux --help`. A cmux that lists the option only under `cmux new-workspace --help` is refused
+as unsupported although it has the option; the subcommand's help is not run, because on a
+cmux that does not treat `--help` there as help, that call could itself open a workspace. A
+help layout outside the shapes above may likewise be refused. A cmux that documents the
+option and then ignores it would still take focus, and no pre-spawn check can detect that
+without spending a workspace to observe it.
 
 **Scope.** This is the cmux adapter only. Other adapters keep their launch commands, and the
 opt-in legacy rollback arm `AIGENTRY_WH_LEGACY_SPAWN=1`
@@ -63,6 +74,12 @@ When telepty reports a live session whose surface is mismatched
 existing one: resolve the sid to a host id and focus it, logging
 `SURFACE_MISMATCHED refocused sid=… host=… expectedPty=…`. On cmux that selects the
 workspace; on Warp it raises the window; headless does nothing.
+
+The reconciler reads this setting from its own process environment, which every tick
+inherits from the long-lived `--loop` process (the one its launchd agent or systemd unit
+starts): set it in that environment and restart that process. Exporting it only in the shell
+that launches workers changes nothing. Only exactly `1` turns it on; any other value leaves
+the default behaviour, without a warning.
 
 With the setting at `1`, the event is only recorded:
 

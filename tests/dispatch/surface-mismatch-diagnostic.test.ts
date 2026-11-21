@@ -1,9 +1,9 @@
 // #507 / #616 — surface_mismatched handling, both arms of an OPT-IN.
 //
 // DEFAULT (AIGENTRY_SURFACE_MISMATCH_DIAGNOSTIC_ONLY unset): unchanged from the public
-// reconciler — resolve the sid and focus the host. Pinned here BECAUSE round 0 of this
-// change removed that actuation on every adapter with no setting at all (review F3), so
-// these default-arm cases are the regression guard against doing it again.
+// reconciler — resolve the sid and focus the host. Pinned here because removing that
+// actuation for every adapter, with no setting, would take away the only visual cue a Warp
+// operator gets; these default-arm cases are the regression guard against that.
 // OPT-IN (=1): the event is recorded and NOTHING is focused, raised or selected.
 // Both arms count the event and drain the spool identically.
 //
@@ -236,8 +236,8 @@ for (const diagnosticOnly of [false, true]) {
 // ── source-level guards ───────────────────────────────────────────────────────────────
 test("#616: the opt-in is a single exact-`1` read, defaulting to the public behaviour", () => {
   // The constant, not the consumer: a default-on spelling (`!== "0"`, `|| true`, a truthy
-  // read) is the defect F3 names, and it would pass every behavioural case above because
-  // the fake binds the flag directly.
+  // read) would make the opt-in the default, and it would pass every behavioural case
+  // above because the fake binds the flag directly.
   const decl = /^const SURFACE_MISMATCH_DIAGNOSTIC_ONLY = .*$/m.exec(WHOLE)?.[0];
   assert.ok(decl, "SURFACE_MISMATCH_DIAGNOSTIC_ONLY must be a single-line module constant");
   assert.equal(decl, 'const SURFACE_MISMATCH_DIAGNOSTIC_ONLY = env.AIGENTRY_SURFACE_MISMATCH_DIAGNOSTIC_ONLY === "1";',

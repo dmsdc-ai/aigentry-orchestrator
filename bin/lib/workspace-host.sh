@@ -425,28 +425,39 @@ _wh_cmux_wait_ready() {
 # Exit: 0 = documented. 1 = the probe answered and does not document it. 2 = the probe
 # itself could not be read. The caller owns the operator-facing message, so this is quiet.
 #
-# Why this is not `cmux --help | grep -qE 'new-workspace.*--focus'` (#616 review F2). That
-# form accepted three wrong answers:
-#   (a) a longer option that merely BEGINS with `--focus` (`--focus-follows-mouse`) matched,
-#       so an unrelated flag read as support;
-#   (b) it needed `new-workspace` and `--focus` on the SAME line, so a help layout that puts
-#       a command's options on continuation lines read as "unsupported" when the option is
+# Why this is not `cmux --help | grep -qE 'new-workspace.*--focus'`. That form accepts three
+# wrong answers:
+#   (a) a longer option that merely BEGINS with `--focus` (`--focus-follows-mouse`) matches,
+#       so an unrelated flag reads as support;
+#   (b) it needs `new-workspace` and `--focus` on the SAME line, so a help layout that puts
+#       a command's options on continuation lines reads as "unsupported" when the option is
 #       there;
-#   (c) the match ran inside a pipeline under `set -o pipefail` (bin/wh-cli.sh:67), so a cmux
-#       that prints usable help and exits non-zero — or cannot run at all — also came out as
+#   (c) the match runs inside a pipeline under `set -o pipefail` (bin/wh-cli.sh:67), so a cmux
+#       that prints usable help and exits non-zero — or cannot run at all — also comes out as
 #       "unsupported", i.e. "upgrade cmux" for what is really a broken probe.
 # Hence: capture the help with NO pipeline (so the status is the binary's own), decline to
 # interpret a failed or empty probe, cut out the `new-workspace` BLOCK (its own line plus
 # every more-indented continuation line — that covers (b)), and require inside that block an
-# exact `--focus` TOKEN followed by a boolean VALUE syntax, which is the syntax this adapter
-# uses. A bare switch `--focus` with no value, or a `--no-focus` spelling, is deliberately
-# NOT accepted: passing `--focus false` to such a cmux would leave `false` as a positional.
+# exact `--focus` TOKEN followed DIRECTLY by a boolean value PLACEHOLDER: `<…>`, `[…]` or
+# `{…}` naming true/false/bool, `=` plus a boolean word, or a bare `true|false` alternation.
+# A bare switch `--focus` with no value, or a `--no-focus` spelling, is deliberately NOT
+# accepted: passing `--focus false` to such a cmux would leave `false` as a positional. The
+# placeholder shape is what keeps description text out: `--focus  (bool) focus it` or
+# `--focus  true to focus` describes a bare switch and is refused.
 #
-# Limit, stated: this reads cmux's self-description. A cmux that documents the option and
-# then ignores it cannot be caught before spawning by any check; it would need an observed
-# selection, which costs a workspace. The opted-in operator is told as much in the docs.
+# Limits, stated: this reads cmux's self-description, and only its TOP-LEVEL `--help`.
+#   * A cmux that lists the option only under `cmux new-workspace --help` is refused as
+#     UNSUPPORTED although the option exists. The subcommand's help is deliberately not run:
+#     on a cmux whose new-workspace does not treat `--help` as help, that call could itself
+#     create a workspace — in front of the operator who opted out of exactly that.
+#   * A help layout outside the shapes above may be refused; that costs the opted-in launch
+#     only, never a default one.
+#   * A cmux that documents the option and then ignores it cannot be caught before spawning
+#     by any check; it would need an observed selection, which costs a workspace. The
+#     opted-in operator is told as much in the docs.
 _wh_cmux_focus_option_supported() {
   local bin="$1" help rc=0 block
+  local focus_value_re='(^|[^A-Za-z0-9_-])--focus((=|[[:space:]]+)(<[^>]*(true|false|bool|BOOL|TRUE|FALSE)[^>]*>|[[][^]]*(true|false|bool|BOOL|TRUE|FALSE)[^]]*[]]|[{][^}]*(true|false|bool|BOOL|TRUE|FALSE)[^}]*[}]|(true|false|TRUE|FALSE)[|](true|false|TRUE|FALSE))|=(true|false|bool|BOOL|TRUE|FALSE))'
   help=$("$bin" --help 2>&1) || rc=$?
   [ "$rc" -ne 0 ] && return 2
   [ -z "$(printf '%s' "$help" | tr -d '[:space:]')" ] && return 2
@@ -461,7 +472,7 @@ _wh_cmux_focus_option_supported() {
   ')
   [ -z "$block" ] && return 1
   printf '%s\n' "$block" \
-    | grep -Eq '(^|[^A-Za-z0-9_-])--focus[[:space:]=]+[[:punct:]]?(true|false|bool|BOOL|TRUE|FALSE)' \
+    | grep -Eq -- "$focus_value_re" \
     || return 1
   return 0
 }
@@ -485,8 +496,8 @@ _wh_cmux_focus_option_supported() {
 #   1           → the worker workspace is created in the BACKGROUND (`--focus false`), so a
 #                 spawn no longer moves the operator's selection. The workspace is still in
 #                 the sidebar and its CLI is still the foreground process of its own surface.
-#                 Because a cmux that does not know the flag would IGNORE it and take focus
-#                 anyway, support is established FIRST
+#                 Because a cmux that does not know the flag may IGNORE it and take focus
+#                 anyway (or fail), support is established FIRST
 #                 (_wh_cmux_focus_option_supported) and a cmux that cannot be shown to
 #                 support it is refused with exit 2 before anything is spawned. That refusal
 #                 is reachable ONLY under this setting.
@@ -525,7 +536,7 @@ _wh_cmux_open() {
     case "$sup" in
       0) ;;
       2) echo "ERR CMUX_FOCUS_PROBE_FAILED: '$CMUX_BIN --help' could not be read (it failed or printed nothing), so new-workspace --focus support is UNKNOWN, not absent. Refusing to spawn $sid in the background rather than guess — fix or unset AIGENTRY_CMUX_BACKGROUND_SPAWN for the default foreground launch." >&2; return 2;;
-      *) echo "ERR CMUX_FOCUS_UNSUPPORTED: this cmux's help documents no 'new-workspace --focus <true|false>', so passing it would be ignored and the workspace would open in front of you. Refusing to spawn $sid in the background (upgrade cmux, or unset AIGENTRY_CMUX_BACKGROUND_SPAWN for the default foreground launch)." >&2; return 2;;
+      *) echo "ERR CMUX_FOCUS_UNSUPPORTED: this cmux's top-level --help documents no 'new-workspace --focus <true|false>', and a cmux that does not know the option may ignore it (opening the workspace in front of you) or fail. Refusing to spawn $sid in the background (upgrade cmux if it predates the option, or unset AIGENTRY_CMUX_BACKGROUND_SPAWN for the default foreground launch)." >&2; return 2;;
     esac
     out=$("$CMUX_BIN" new-workspace --focus false --cwd "$cwd" --command "$child" 2>&1)
   else
