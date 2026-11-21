@@ -442,6 +442,24 @@ def codex_current_composer(screen: str) -> str | None:
     Only the complete, blank-separated model/cwd + shortcuts suffix is
     chrome. Unknown tails stay in the composer and cannot establish empty input.
     This frames text only; current_screen still owns binding and currentness.
+
+    #1284: codex-cli 0.170.0 prints its agents affordance IN FRONT of the shortcuts
+    hint on that same footer row -- measured verbatim on an idle, empty 0.170.0
+    session (facts/CODEX-0.170.0-idle-screen-cmux.txt, codex-cli 0.170.0):
+    `  ← for agents · ? for shortcuts<pad>⚠ 1 warning · f2 to view`. The row therefore
+    failed the closed pattern below, the footer stayed in the composer, and a freshly
+    started idle session could never read as an empty composer -- the safe direction,
+    but it meant no dispatch could ever be delivered to 0.170.0. ONE optional literal
+    prefix is admitted: exactly `← for agents · `, only at the start of the row, only
+    for this already-closed pattern. The two recognized warning tails are untouched
+    and one of them is still REQUIRED, the two-space indent is still required, and
+    the model/cwd row above plus the blank separator row are still required, so the
+    only strings newly accepted are the measured prefix in front of a footer that
+    already matched. Anything else on the row -- a second affordance segment, a
+    different glyph or separator, a different key hint, any trailing segment -- still
+    fails to match, keeps the three rows in the composer, and keeps the session
+    not-ready. As before, this FRAMES text by position and does not authenticate it:
+    a verbatim copy of a whole viewport is indistinguishable from the viewport.
     """
     lines = screen.splitlines()
     prompts = [i for i, line in enumerate(lines) if re.match(r"^[ \t]*›", line)]
@@ -463,7 +481,7 @@ def codex_current_composer(screen: str) -> str | None:
                 r"  GPT-[A-Za-z0-9.-]+ (?:low|medium|high|xhigh|max|ultra)"
                 r" · /[^·\n]+(?: · \S[^\n]*)?", lines[-2])
             and re.fullmatch(
-                r"  \? for shortcuts(?: · \d+ warnings?"
+                r"  (?:← for agents · )?\? for shortcuts(?: · \d+ warnings?"
                 r"| {2,}⚠ \d+ warnings? · f2 to view)", lines[-1])):
         lines = lines[:-3]
     return "\n".join(lines[start:]).strip()
