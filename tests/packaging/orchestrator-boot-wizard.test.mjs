@@ -1792,6 +1792,64 @@ test('task 1270: the boot preflight is exact-local, create-only and non-destruct
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// TASK 1293 — the boot door's half of the exit-code contract for an ordinary missing telepty
+// (review F5/F6). init only warns and exits 0 (tests/packaging/telepty-runtime-requirement.test.ts),
+// dispatch refuses a command it cannot START at registration with 78 TELEPTY_CLI_UNAVAILABLE
+// (tests/dispatch/telepty-cli-unavailable.test.ts), and boot refuses with exit 3, printing the
+// install line only when a fact justifies it (r3): no telepty on PATH, or a valid capability document
+// that lacks a capability. A daemon-only refusal states what the daemon lists and advises no restart
+// or reinstall (r1 told the CLI to reinstall; r2 called the daemon older and advised a restart).
+test('task 1293: a missing telepty is boot exit 3 with the install line; a daemon-only refusal names the daemon instead', async t => {
+  const INSTALL = 'npm i -g @dmsdc-ai/aigentry-telepty@latest';
+
+  await t.test('no telepty on PATH: exit 3, UNSUPPORTED, the install command named once, no daemon request', () => {
+    const fx = fixture();
+    fs.rmSync(path.join(fx.bin, 'telepty'));
+    const r = planBoot(fx);
+    assertPreflightRefused(fx, r, 'UNSUPPORTED', 'missing telepty');
+    assert.match(r.stderr, /no 'telepty' on PATH \(bash exit 127/, r.stderr);
+    assert.equal(r.stderr.split(INSTALL).length - 1, 1, `the install command must be named once:\n${r.stderr}`);
+    assert.deepEqual(fx.calls('curl'), [], 'a daemon request followed a missing CLI');
+  });
+
+  await t.test('a daemon without register-create-only: exit 3, the daemon line, and no CLI reinstall', () => {
+    const fx = fixture();
+    fx.daemon({ meta: { code: '200', body: '{"capabilities":["sessions","wrapped-sessions"]}' } });
+    const r = planBoot(fx);
+    assertPreflightRefused(fx, r, 'UNSUPPORTED', 'daemon-only');
+    assert.deepEqual(fx.calls('caps'), [['boot-capabilities']]);
+    assert.match(r.stderr, /the daemon answering on this port does not list those capabilities in GET \/api\/meta/, r.stderr);
+    assert.ok(!r.stderr.includes(INSTALL), `a CLI that passed its check was told to reinstall:\n${r.stderr}`);
+    // r3 (review R3-6): a capability the daemon does not list is not a measured version, and a restart is host-changing.
+    assert.doesNotMatch(r.stderr, /older|telepty-install|restart (it|every)/, `the daemon line inferred a version or advised a restart:\n${r.stderr}`);
+  });
+
+  // r3 (review R3-6): exit 3 for every row; the install line ONLY for an established fact. The 127 row
+  // FAILS on r2, which read any bash exit 127 as "no telepty" and printed the install line for a
+  // telepty that is on PATH and exited 127 itself; the exit-1 and help rows FAIL on r2 the same way.
+  await t.test('an answer that establishes nothing gets no install line; a valid document lacking a capability gets it once', () => {
+    const rows = [
+      ['a telepty on PATH that exits 127 itself', '', 127, 0],
+      ['sealed line, exit 1', SEALED_CAPS, 1, 0],
+      ['old CLI: help and exit 0', '\nUsage: telepty <command>\n  telepty allow [--id <id>] <command>\n', 0, 0],
+      ['extra key', '{"schema":"telepty-boot-capabilities-v1","verbs":["allow-create-v1"],"viewer_detach":"nondeleting-v1","x":1}\n', 0, 0],
+      ['other schema', '{"schema":"telepty-boot-capabilities-v2","verbs":["allow-create-v1"],"viewer_detach":"nondeleting-v1"}\n', 0, 0],
+      ['verb missing', '{"schema":"telepty-boot-capabilities-v1","verbs":["allow"],"viewer_detach":"nondeleting-v1"}\n', 0, 1],
+      ['deleting viewer detach', '{"schema":"telepty-boot-capabilities-v1","verbs":["allow-create-v1"],"viewer_detach":"deleting"}\n', 0, 1],
+    ];
+    for (const [label, text, rc, installs] of rows) {
+      const fx = fixture();
+      fx.bootCaps(text, rc);
+      const r = planBoot(fx);
+      assertPreflightRefused(fx, r, 'UNSUPPORTED', label);
+      assert.deepEqual(fx.calls('caps'), [['boot-capabilities']], `${label}: the probe ran a different number of times`);
+      assert.equal(r.stderr.split(INSTALL).length - 1, installs, `${label}: the install command count is wrong:\n${r.stderr}`);
+      assert.doesNotMatch(r.stderr, /no 'telepty' on PATH/, `${label}: a telepty on PATH was reported missing:\n${r.stderr}`);
+    }
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // SHIPPING METADATA (bt1181jm-v4). SOURCE-LEVEL ONLY — read this boundary first.
 //
 // These cases read the package's OWN declarations out of the repo: `package.json`

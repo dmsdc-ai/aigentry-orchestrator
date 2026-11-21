@@ -78,6 +78,8 @@ interface StubConfig {
   verbs: string[];
   injectId: string;
   mode: "accepted" | "old-cli-help" | "malformed" | "lost";
+  /** #1293 r3: "help" makes `boot-capabilities` answer an older CLI's help text and exit 0. */
+  capsReply?: "help";
 }
 
 const TELEPTY_STUB = `
@@ -100,6 +102,10 @@ const out = (o) => { process.stdout.write(JSON.stringify(o) + '\\n'); process.ex
 if (argv[0] === 'list') out([view]);
 if (argv[0] === 'view' || argv[0] === 'show' || argv[0] === 'info') out(view);
 if (argv[0] === 'session' && argv[1] === 'info') out(view);
+if ((argv[0] === 'boot-capabilities' || argv[0] === 'capabilities') && cfg.capsReply === 'help') {
+  process.stdout.write('telepty — session multiplexer\\nUsage: telepty <command> [options]\\n');
+  process.exit(0);
+}
 if (argv[0] === 'boot-capabilities' || argv[0] === 'capabilities') out({ verbs: cfg.verbs });
 if (argv[0] === 'read-screen') { process.stdout.write(${JSON.stringify(BUSY_SCREEN)}); process.exit(0); }
 if (argv[0] === 'inject-bound-v1') {
@@ -175,6 +181,7 @@ function arm(f: F, cfg: Partial<StubConfig> = {}, probe: NodeJS.ProcessEnv = {})
     verbs: cfg.verbs ?? [...BASE_VERBS, "inject-bound-v1"],
     injectId: cfg.injectId ?? INJECT_ID,
     mode: cfg.mode ?? "accepted",
+    ...(cfg.capsReply === undefined ? {} : { capsReply: cfg.capsReply }),
   };
   const configFile = join(f.root, "telepty-stub.json");
   writeFileSync(configFile, JSON.stringify(full));
@@ -355,6 +362,37 @@ describe("1270(c) an unsupported bound verb or capability is refused before begi
         "the refusal must name the unsupported bound capability, not a readiness timeout");
       assert.match(r.stderr, /inject-bound-v1|busy-input-v1/,
         "the refusal must name the verb/capability it found unsupported");
+    } finally { f.cleanup(); }
+  });
+
+  // #1293 r3 (review answer c): the too-old exit is PINNED, not just "non-zero", and the advice is
+  // conditional on what was established. This fixture's TELEPTY is an explicit override, so even an
+  // established missing verb is answered by pointing TELEPTY, never by a global install.
+  test("1293: a CLI whose capability verbs lack inject-bound-v1 exits exactly 78 BOUND_INJECT_UNSUPPORTED", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      const r = follow(f, arm(f, { verbs: BASE_VERBS }));
+      assertNoInputEffect(f, "verb absent");
+      assert.deepEqual(boundSends(entries(f)).map((e) => e.argv), [], "a refused verb was sent anyway");
+      assert.equal(r.status, 78, `expected exit 78, got ${r.status}\n${r.stderr}`);
+      assert.match(r.stderr, new RegExp(`dispatch\\.sh: BOUND_INJECT_UNSUPPORTED for ${SID} — the local telepty CLI .* does not advertise inject-bound-v1`), r.stderr);
+      assert.match(r.stderr, /TELEPTY names this CLI, so installing another telepty does not change it: point TELEPTY at @dmsdc-ai\/aigentry-telepty 0\.11\.1 or later, or unset it/, r.stderr);
+      assert.ok(!r.stderr.includes("npm i -g"), `an override was answered with a global install:\n${r.stderr}`);
+    } finally { f.cleanup(); }
+  });
+
+  test("1293: a CLI whose boot-capabilities answer is help text exits 78 as inconclusive, with no upgrade advice", () => {
+    const f = fixture();
+    try {
+      f.prepareTarget();
+      const r = follow(f, arm(f, { capsReply: "help" }));
+      assertNoInputEffect(f, "caps help");
+      assert.deepEqual(boundSends(entries(f)).map((e) => e.argv), [], "an unread capability was sent anyway");
+      assert.equal(r.status, 78, `expected exit 78, got ${r.status}\n${r.stderr}`);
+      assert.match(r.stderr, /boot-capabilities' printed no JSON object with a verbs array .* so inject-bound-v1 support is unknown/, r.stderr);
+      assert.match(r.stderr, /boot-capabilities' to see its answer/, r.stderr);
+      assert.ok(!r.stderr.includes("npm i -g") && !/point TELEPTY at/.test(r.stderr), `an inconclusive probe drew upgrade advice:\n${r.stderr}`);
     } finally { f.cleanup(); }
   });
 

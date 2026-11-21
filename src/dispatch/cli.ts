@@ -66,15 +66,22 @@ function isExecutable(p: string): boolean {
   }
 }
 
-/** stdout+status, stderr swallowed — the shell's `$(cmd 2>/dev/null || true)`. */
-function capture(cmd: string, args: string[], extraEnv?: NodeJS.ProcessEnv, timeoutMs?: number): { status: number; stdout: string } {
+/**
+ * stdout+status, stderr swallowed — the shell's `$(cmd 2>/dev/null || true)`.
+ * #1293: `spawnError` is the errno code of any child error — a command that could not be STARTED
+ * (a missing telepty is ENOENT) but also a timeout or an output overflow (ENOBUFS) of one that did
+ * start — which a status of 127 cannot distinguish. `signal` is set when the child was killed by
+ * one, which a status of 1 would otherwise hide (review F5). Purely additive: every existing caller
+ * reads `status`/`stdout` and is unchanged.
+ */
+function capture(cmd: string, args: string[], extraEnv?: NodeJS.ProcessEnv, timeoutMs?: number): { status: number; stdout: string; spawnError?: string; signal?: string } {
   const r = (process.platform === "win32" ? crossSpawn.sync : spawnSync)(cmd, args, {
     encoding: "utf8",
     env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
     ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }),
   });
-  if (r.error) return { status: 127, stdout: "" };
-  return { status: r.status ?? 1, stdout: r.stdout ?? "" };
+  if (r.error) return { status: 127, stdout: "", spawnError: (r.error as NodeJS.ErrnoException).code ?? "spawn error" };
+  return { status: r.status ?? 1, stdout: r.stdout ?? "", ...(r.status === null && r.signal ? { signal: r.signal } : {}) };
 }
 
 /** stdout captured, stderr inherited — the shell's plain `out=$(cmd)`. */
@@ -227,22 +234,30 @@ function writeWorkerLauncher(
 }
 
 // ── readiness / registration ────────────────────────────────────────────────
-/** Look up the wrapped CLI ("claude"/"codex"/"gemini") for a sid, "" if absent. */
-function cliOf(sid: string): string {
-  const { stdout } = capture(TELEPTY, ["list", "--json"]);
+/**
+ * Look up the wrapped CLI ("claude"/"codex"/"gemini") for a sid; `kind` is "" if absent.
+ *
+ * #1293: it also reports the listing's child error code, if any (`capture`), so the caller can tell a
+ * telepty COMMAND that could not be started from a session that is not listed. Both answers
+ * used to be the same empty string, so a host with no telepty at all waited out the whole
+ * registration budget and then blamed the timeout knob — see waitForRegistration.
+ */
+function cliOf(sid: string): { kind: string; spawnError: string | null } {
+  const { stdout, spawnError } = capture(TELEPTY, ["list", "--json"]);
+  const absent = { kind: "", spawnError: spawnError ?? null };
   try {
     const list = JSON.parse(stdout);
-    if (!Array.isArray(list)) return "";
+    if (!Array.isArray(list)) return absent;
     for (const s of list) {
       // #1084: a worker's command is its guard launcher; resolve the CLI kind so the
       // readiness probe and the codex ready-timeout see "codex", not a path. Unknown
       // commands still return raw (registration must stay truthy for them).
-      if (s && s.id === sid) { const cmd = String(s.command || ""); return cliKindOf(cmd) || cmd; }
+      if (s && s.id === sid) { const cmd = String(s.command || ""); return { kind: cliKindOf(cmd) || cmd, spawnError: null }; }
     }
   } catch {
     /* the python arm swallowed every parse error too */
   }
-  return "";
+  return absent;
 }
 
 /**
@@ -541,7 +556,7 @@ function parseArgs(argv: string[]): Opts {
 
 function resolveRoute(o: Opts, sid: string, skipPreparation: boolean): void {
   if (!o.spawn || skipPreparation) {
-    o.cli = cliOf(sid) || "unknown";
+    o.cli = cliOf(sid).kind || "unknown";
     o.route = { label: "unknown", model: "unknown", decided_by: "existing",
       reason: "existing worker; command observed via telepty, model not reported" };
     return;
@@ -1147,6 +1162,72 @@ function recordTransport(d: Delivery, sid: string, result: string): number {
 // never `write_observed`, never a fresh VERIFIED, never a replay.
 const BOUND_VERB = "inject-bound-v1";
 const BOUND_CAPABILITY = "busy-input-v1";
+// #1293 — this package declares NO dependency on @dmsdc-ai/aigentry-telepty: TELEPTY (:51) is the
+// binary on PATH (or the operator's explicit override), a nested copy would never be executed here,
+// and its postinstall WOULD still run on the host. The refusals below state what was observed and
+// give advice that changes the host ONLY when a fact justifies it (r3): install advice when the
+// normal PATH lookup finds no telepty, or when a telepty's capability document lacks the verb. A
+// failing explicit TELEPTY override is the operator's to correct or unset — a reinstall would leave
+// it failing (review R3-2). The CAPABILITY is what is checked; this version is only named, as the
+// first published telepty declaring BOUND_VERB.
+const TELEPTY_MIN_VERSION = "0.11.1";
+const TELEPTY_INSTALL_COMMAND = "npm i -g @dmsdc-ai/aigentry-telepty@latest";
+const TELEPTY_REQUIREMENT =
+  "aigentry-orchestrator declares no dependency on @dmsdc-ai/aigentry-telepty and drives the telepty on PATH, " +
+  `so nothing here installs, upgrades, starts, stops or restarts it: install @dmsdc-ai/aigentry-telepty ` +
+  `${TELEPTY_MIN_VERSION} or later yourself with '${TELEPTY_INSTALL_COMMAND}', then dispatch again`;
+/** True when TELEPTY names something other than the bare word the normal PATH lookup resolves. */
+const TELEPTY_OVERRIDDEN = TELEPTY !== "telepty";
+
+/** r3: the first absolute PATH entry holding an executable telepty — the normal lookup — or null. */
+function teleptyOnPath(): string | null {
+  const names = process.platform === "win32"
+    ? (env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";").filter((ext) => ext !== "").map((ext) => `telepty${ext.toLowerCase()}`)
+    : ["telepty"];
+  for (const dir of (env.PATH || "").split(path.delimiter)) {
+    if (!path.isAbsolute(dir)) continue;
+    for (const name of names) if (isExecutable(path.join(dir, name))) return path.join(dir, name);
+  }
+  return null;
+}
+
+/**
+ * r3 (review R3-2): the facts of a telepty command that could not be STARTED (ENOENT/EACCES), and
+ * the one instruction they justify. An override is described by what its file is, and the operator
+ * is told to correct or unset it; install advice only when the PATH lookup finds no telepty either.
+ */
+function teleptyUnstartable(errno: string): string {
+  const onPath = teleptyOnPath();
+  if (TELEPTY_OVERRIDDEN) {
+    let what = `could not be started (${errno})`;
+    if (path.isAbsolute(TELEPTY)) {
+      try {
+        if (!fs.statSync(TELEPTY).isFile() || errno === "EACCES") what = `is not an executable file (${errno})`;
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        if (code === "ENOENT" || code === "ENOTDIR") what = `does not exist (${errno})`;
+      }
+    }
+    return `the TELEPTY override names ${TELEPTY}, which ${what}, so no session can be listed, registered or ` +
+      "delivered to. Correct TELEPTY or unset it; " + (onPath !== null
+      ? `the normal PATH lookup finds telepty at ${onPath}`
+      : `the normal PATH lookup finds no executable telepty either: @dmsdc-ai/aigentry-telepty ${TELEPTY_MIN_VERSION} ` +
+        `or later installs with '${TELEPTY_INSTALL_COMMAND}'`);
+  }
+  // EACCES from the PATH lookup means a telepty file IS there; only ENOENT with none found is "no telepty".
+  if (onPath !== null || errno !== "ENOENT")
+    return `the telepty on PATH${onPath !== null ? ` (${onPath})` : ""} could not be started (${errno}), so no ` +
+      "session can be listed, registered or delivered to. Check that file's permissions and, for a script, its interpreter";
+  return `no telepty is on PATH (${errno}), so no session can be listed, registered or delivered to. ${TELEPTY_REQUIREMENT}`;
+}
+/**
+ * The ONE refusal for a telepty that cannot run at all — exit 78, by name, before any wait.
+ * 78 is this CLI's existing "a prerequisite this dispatch needs is unavailable; nothing was
+ * transported" code (SANDBOX_PLATFORM_UNSUPPORTED at :2097, the exhausted router at usage.ts:37,
+ * BOUND_INJECT_UNSUPPORTED at :1398), and `aigentry-orchestrator init` now promises exactly this
+ * code for exactly this condition.
+ */
+const TELEPTY_UNAVAILABLE = "TELEPTY_CLI_UNAVAILABLE";
 const BOUND_RESULT_SCHEMA = "telepty.bound-inject-result/v1";
 const BOUND_LOOPBACK = "127.0.0.1";
 // The frozen result vocabulary. Anything outside it is read as `unknown`, never coerced.
@@ -1219,7 +1300,7 @@ interface BoundResult {
  */
 function boundSnapshot(sid: string): { cliKind: string; host: string; epoch: string; ownerGeneration: string; busyInput: string } | null {
   // r1 m1: the read's own verdict decides whether it has authority, exactly as its sibling
-  // boundVerbAdvertised does. A degraded or half-written listing that still happens to parse
+  // boundVerbVerdict does. A degraded or half-written listing that still happens to parse
   // may not supply the identity a body is bound to.
   const { status, stdout } = capture(TELEPTY, ["list", "--json"]);
   if (status !== 0) return null;
@@ -1241,16 +1322,23 @@ function boundSnapshot(sid: string): { cliKind: string; host: string; epoch: str
  * printing it starts, repairs or contacts nothing. An OLD CLI answers an unknown verb
  * with its help text and exit 0, and that is NOT support — so only a JSON object whose
  * `verbs` array names the verb counts. Prose, a non-zero exit or no output is refusal.
+ * #1293 r3: the refusal is `lacks` only when the CLI printed a JSON object whose `verbs` array
+ * omits the verb — the one answer that establishes an older telepty. A spawn error, a signal, a
+ * non-zero exit, no output or prose is `inconclusive` (`detail` says which) and draws no upgrade advice.
  */
-function boundVerbAdvertised(): boolean {
+function boundVerbVerdict(): { kind: "ok" | "lacks" | "inconclusive"; detail: string } {
   const r = capture(TELEPTY, ["boot-capabilities"]);
-  if (r.status !== 0 || !r.stdout) return false;
+  if (r.spawnError !== undefined) return { kind: "inconclusive", detail: `could not be run (${r.spawnError})` };
+  if (r.signal !== undefined) return { kind: "inconclusive", detail: `was terminated by ${r.signal}` };
+  if (r.status !== 0) return { kind: "inconclusive", detail: `exited ${r.status}` };
   try {
     const doc = JSON.parse(r.stdout) as { verbs?: unknown };
-    return Array.isArray(doc.verbs) && doc.verbs.includes(BOUND_VERB);
+    if (doc !== null && typeof doc === "object" && Array.isArray(doc.verbs))
+      return { kind: doc.verbs.includes(BOUND_VERB) ? "ok" : "lacks", detail: "" };
   } catch {
-    return false;
+    /* prose, such as an older CLI's help text, or no output */
   }
+  return { kind: "inconclusive", detail: "printed no JSON object with a verbs array (an unknown verb's help text and exit 0 is not support)" };
 }
 
 /**
@@ -1396,9 +1484,21 @@ function admitBoundBusy(o: Opts, sid: string): BusyAdmission {
     refuse(`the bridge does not declare ${BOUND_CAPABILITY} for the current owner generation ` +
       `(transport.busy_input=${printable(snap.busyInput || "absent")}), so a busy worker cannot be given input`);
   }
-  if (!boundVerbAdvertised()) {
-    refuse(`the local telepty CLI does not advertise ${BOUND_VERB} in boot-capabilities ` +
-      "(an unknown verb's help text and exit 0 is not support)");
+  const boundVerb = boundVerbVerdict();
+  if (boundVerb.kind === "lacks") {
+    // An established fact. Through an override, installing another telepty would not change the CLI
+    // dispatch runs, so the one instruction names the override instead (r3).
+    refuse(`the local telepty CLI ${TELEPTY} does not advertise ${BOUND_VERB} in its boot-capabilities verbs — ` +
+      (TELEPTY_OVERRIDDEN
+        ? `TELEPTY names this CLI, so installing another telepty does not change it: point TELEPTY at ` +
+          `@dmsdc-ai/aigentry-telepty ${TELEPTY_MIN_VERSION} or later, or unset it`
+        : TELEPTY_REQUIREMENT));
+  }
+  if (boundVerb.kind === "inconclusive") {
+    // Nothing about the CLI's version was established, so no upgrade is advised (r3, review R3-6).
+    refuse(`'${TELEPTY} boot-capabilities' ${boundVerb.detail}, so ${BOUND_VERB} support is unknown and bound ` +
+      `delivery to a busy worker cannot be admitted (${BOUND_VERB} is declared by @dmsdc-ai/aigentry-telepty ` +
+      `${TELEPTY_MIN_VERSION} or later); run '${TELEPTY} boot-capabilities' to see its answer`);
   }
   return { bound: { epoch: snap.epoch, ownerGeneration: snap.ownerGeneration, busyInput: snap.busyInput },
     cliKind, probe: p, startedAt, probed: true };
@@ -1995,8 +2095,21 @@ async function waitForRegistration(o: Opts, sid: string): Promise<{ kind: string
   let notes = 0;
   let slept = false;
   for (;;) {
-    const kind = cliOf(sid);
+    const { kind, spawnError } = cliOf(sid);
     if (kind) return { kind, slept };
+    // #1293: this is where dispatch first NEEDS telepty, and where a host without one used to spend
+    // the whole budget (180000 ms for a spawn) before advising a longer timeout — advice that cannot
+    // help, for a condition the very first listing had already proved. Refuse here instead, by name
+    // and at once. Only a command that could not be STARTED lands here — ENOENT (no such file) or
+    // EACCES (not executable): a telepty that runs and reports no such session, or overflows the
+    // listing buffer (ENOBUFS, review F6), is the registration wait's business and is untouched.
+    if (spawnError === "ENOENT" || spawnError === "EACCES") {
+      // On the spawn path a workspace was already opened before this wait, so say so in exactly
+      // the words the deadline branch below uses: the refusal is new, the operator's cleanup is not.
+      die(`dispatch.sh: ${TELEPTY_UNAVAILABLE} for ${sid} — ${teleptyUnstartable(spawnError)}. ` +
+        "Nothing was transported" +
+        (o.spawn ? `\ndispatch.sh: the workspace opened for '${sid}' is still running; close it manually before retrying` : ""), 78);
+    }
     const now = nowMs();
     if (now >= deadline) {
       process.stderr.write(

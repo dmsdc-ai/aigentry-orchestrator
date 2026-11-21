@@ -12,6 +12,24 @@
 
 ## Install
 
+**Upgrading from 0.2.5-0.2.7?** Those versions installed a copy of telepty inside the
+orchestrator's own directory, and upgrading deletes it. Check **before** you upgrade that a
+telepty of your own is installed and that nothing you run points into the orchestrator's
+directory:
+
+```sh
+command -v telepty     # must print a path, and not one containing aigentry-orchestrator/node_modules
+echo "${TELEPTY-}"     # an override dispatch prefers: empty, or not inside that directory either
+# the telepty daemon's service; each must print nothing (drop-in overrides included):
+grep -rl 'aigentry-orchestrator/node_modules' ~/Library/LaunchAgents 2>/dev/null                      # macOS
+grep -rl 'aigentry-orchestrator/node_modules' ~/.config/systemd/user /etc/systemd/system 2>/dev/null  # Linux
+```
+
+On Windows, look at the action of the telepty scheduled task (`schtasks /query /v /fo list`).
+If a check fails, first install telepty yourself (`npm i -g @dmsdc-ai/aigentry-telepty@latest`)
+and point `TELEPTY` and the service at it — the 0.2.8 entry of `CHANGELOG.md` has the steps.
+Then install or upgrade:
+
 ```sh
 npm i -g {{name}}
 aigentry-orchestrator init

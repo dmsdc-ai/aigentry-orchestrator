@@ -175,7 +175,13 @@ function fixture() {
     fs.chmodSync(target, frozenBefore[rel].mode);
   }
   verifyManifest(f.pkg);
-  f.log = path.join(base, 'port-calls.jsonl'); write(f.log, '');
+  // #1293: the port-call recorder is TEST INSTRUMENTATION, so it lives in the evidence root beside
+  // the other records and NOT inside `base`. Every `assert.deepEqual(snapshot(f.base), before)`
+  // below therefore measures product writes only — which is what it was written to measure. What it
+  // used to measure incidentally (that a refused init made no port call at all) is now stated
+  // directly by capabilityProbes(), because init step 1 reads the sealed capability document of the
+  // telepty in use once, read-only, before step 2 resolves the workspace.
+  f.log = path.join(run, `${path.basename(base)}-port-calls.jsonl`); write(f.log, '');
   f.env = { HOME: f.userhome, AIGENTRY_HOME: f.home, TMPDIR: f.tmp, PATH: f.ports,
     AIGENTRY_CONTROL_WORKSPACE: f.workspace, AIGENTRY_SHIM_SCRIPT_DIR: path.join(f.workspace, 'bin'),
     ORCHESTRATOR_CLI: 'codex', ORCHESTRATOR_SID: 'native-fixture', SINGLETON_SELF_PID: '3333' };
@@ -194,6 +200,16 @@ function fixture() {
     KILL_CMD: path.join(f.ports, 'kill'), CURL: path.join(f.ports, 'curl') });
   return f;
 }
+// #1293: init's ONE read-only capability probe, stated per invocation instead of being implied by
+// a directory snapshot. `telepty boot-capabilities` is the exact argv both runtime doors use; any
+// other port call — an installer, a supervisor, a signal, a second probe — fails these.
+const PORT_CALLS = f => read(f.log).trim().split('\n').filter(Boolean).map(JSON.parse);
+const CAPABILITY_PROBE = { name: 'telepty', args: ['boot-capabilities'] };
+const resetPorts = f => write(f.log, '');
+const capabilityProbes = (f, label, count) => assert.deepEqual(PORT_CALLS(f),
+  Array.from({ length: count }, () => CAPABILITY_PROBE),
+  `${label}: init's port calls are not exactly ${count} read-only capability probe(s)`);
+
 function record(f, label, executable, args, result) {
   const id = `${commands.length}-${label}`;
   write(path.join(run, `${id}.stdout`), result.stdout || '');
@@ -259,10 +275,12 @@ test('actual native init accepts private executable ancestry and refuses a writa
   assert.equal(executableImage(insecureNode).hash, executableImage(NODE).hash);
   const unsafe = fixture();
   const before = snapshot(unsafe.base);
+  resetPorts(unsafe);
   const result = invoke(unsafe, 'writable-runtime-preflight', initArgs(unsafe), {}, insecureNode);
   refused(result);
   assert.match(result.stderr, /Native capture refused: missing, symlinked or writable ancestor/);
   assert.deepEqual(snapshot(unsafe.base), before);
+  capabilityProbes(unsafe, 'writable-runtime-preflight', 1);
   assert.equal(fs.existsSync(path.join(unsafe.workspace, '.codex/hooks.json')), false);
   assert.equal(fs.existsSync(path.join(unsafe.workspace, '.aigentry-init.json')), false);
   assert.equal(fs.existsSync(path.join(unsafe.workspace, '.aigentry-native-capture.lock')), false);
@@ -315,7 +333,12 @@ for (const fault of ['missing-capture', 'missing-backup', 'missing-dist', 'wrong
     if (fault === 'symlink') { fs.symlinkSync(f.capture, path.join(f.base, 'alias')); args[args.indexOf('--capture-root') + 1] = path.join(f.base, 'alias'); }
     if (fault === 'permissions') fs.chmodSync(f.capture, 0o755);
     if (fault === 'cleanup-overlap') env.DISPATCH_STATE_DIR = f.capture;
-    const before = snapshot(f.base); refused(invoke(f, 'preflight', args, env)); assert.deepEqual(snapshot(f.base), before);
+    const before = snapshot(f.base); resetPorts(f);
+    refused(invoke(f, 'preflight', args, env)); assert.deepEqual(snapshot(f.base), before);
+    // #1293: `missing-capture`/`missing-backup` are refused by ARGUMENT validation, which runs
+    // before step 1, so those two make no port call at all; every other fault is refused by the
+    // native preflight, after step 1's single capability probe.
+    capabilityProbes(f, fault, ['missing-capture', 'missing-backup'].includes(fault) ? 0 : 1);
   });
 }
 
@@ -323,8 +346,9 @@ for (const flags of [['--upgrade'], ['--force'], ['--force', '--yes']]) {
   test(`unowned/shared hooks survive generic flags ${flags.join(' ')}`, () => {
     const f = fixture(); ok(init(f, [], false)); mkdir(path.join(f.workspace, '.codex'));
     write(path.join(f.workspace, '.codex/hooks.json'), '{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"custom"}]}]}}\n');
-    const before = snapshot(f.base); const r = init(f, flags); refused(r);
+    const before = snapshot(f.base); resetPorts(f); const r = init(f, flags); refused(r);
     assert.match(r.stderr, /unowned\/shared/); assert.deepEqual(snapshot(f.base), before);
+    capabilityProbes(f, `unowned/shared ${flags.join(' ')}`, 1);
   });
 }
 
@@ -414,8 +438,11 @@ for (const native of [false, true]) {
     const f = fixture(); write(path.join(f.home, 'instructions'), 'intentional filesystem failure\n');
     const failed = init(f, [], native); assert.equal(failed.status, 6, failed.stderr);
     const lock = path.join(f.workspace, '.aigentry-native-capture.lock'); assert.ok(fs.existsSync(lock));
-    const before = snapshot(f.base); refused(init(f, ['--force'], native)); refused(init(f, ['--force'], !native));
-    assert.deepEqual(snapshot(f.base), before); blockedBoot(f);
+    const before = snapshot(f.base); resetPorts(f);
+    refused(init(f, ['--force'], native)); refused(init(f, ['--force'], !native));
+    assert.deepEqual(snapshot(f.base), before);
+    capabilityProbes(f, `${native ? 'native' : 'legacy'} retry`, 2);
+    blockedBoot(f);
     if (native) {
       const id = json(path.join(lock, 'owner.json')).operationId;
       ok(operation(f, 'inspect', id)); const r = operation(f, 'restore', id); refused(r);
