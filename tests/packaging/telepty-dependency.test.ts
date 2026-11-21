@@ -314,13 +314,15 @@ test("1293 r5: the published upgrade instructions are non-destructive — two in
     assert.ok(telepty >= 0 && orchestrator > telepty, `${label}: telepty must be installed before the orchestrator is upgraded`);
     assert.equal(text.split("npm i -g ").length - 1, 2, `${label}: the upgrade section must run exactly the two installs`);
     for (const probe of ["command -v telepty", "where telepty", "telepty --version", "/api/meta"]) {
-      const at = text.indexOf(probe);
+      // r6 (R6-1): `command -v telepty` and `where telepty` now also appear, as the pre-upgrade read, before
+      // the upgrade; the read-only checks must still all come after it.
+      const at = text.indexOf(probe, orchestrator);
       assert.ok(at > orchestrator, `${label}: the read '${probe}' is missing or precedes the two installs`);
     }
     assert.ok(text.includes("telepty 0.11.3 or newer never replaces a newer running daemon, and does nothing when it is installed as a dependency"),
       `${label}: step 1 does not say why it is safe`);
     assert.ok(text.includes("These reads change nothing"), `${label}: the reads are not stated to be read-only`);
-    assert.equal(text.split("It does not show").length - 1, 3, `${label}: each of the three reads must say what it does not show`);
+    assert.equal(text.slice(orchestrator).split("It does not show").length - 1, 3, `${label}: each of the three reads must say what it does not show`);
     // (4) one paragraph: the possible causes are named, and no command is prescribed for any of them.
     const disagree = raw.split(/\n[ \t]*\n/).filter((p) => p.includes("If they disagree"));
     assert.equal(disagree.length, 1, `${label}: there must be exactly one "If they disagree" paragraph`);
@@ -335,4 +337,102 @@ test("1293 r5: the published upgrade instructions are non-destructive — two in
   const entry = between(read("CHANGELOG.md"), "## [0.2.8]", "\n## [");
   assert.ok(entry.indexOf("npm i -g @dmsdc-ai/aigentry-orchestrator") > entry.indexOf("### Upgrading from 0.2.5-0.2.7"),
     "CHANGELOG 0.2.8 shows the orchestrator install command before the upgrade steps");
+});
+
+test("1293 r6: the upgrade states what it removes BEFORE the upgrade step, and the section carries only the two installs and the read-only reads", () => {
+  // review R6-1 (MAJOR) / R6-2 / R6-4. 0.2.8 no longer depends on telepty, so upgrading removes the copy
+  // that 0.2.5-0.2.7 nested inside this package; a wrapper, symlink, TELEPTY variable or service still
+  // running that copy stops working. r5 said so nowhere and only read the host AFTER the upgrade. The
+  // fact and its consequence must now stand before the orchestrator upgrade command, with one read-only
+  // read and what it does not show, and no command that changes anything. Instead of banning words, the
+  // section's commands are an ALLOWLIST: every inline code span, every fenced block and every line that
+  // looks like a command must be one of the two installs, a reviewed read, or a plain name. Driven by
+  // README.md, its template and the CHANGELOG 0.2.8 upgrade section. This FAILS on r5: none of its three
+  // files has a "Before you upgrade" step, and each offers `where.exe telepty`.
+  const between = (text: string, start: string, end: string): string => {
+    const from = text.indexOf(start);
+    assert.ok(from >= 0, `missing section ${start}`);
+    const to = text.indexOf(end, from + start.length);
+    assert.ok(to > from, `section ${start} has no end marker ${end}`);
+    return text.slice(from, to);
+  };
+  const ORCH = "@dmsdc-ai/aigentry-orchestrator";
+  const docs: readonly (readonly [string, string, string])[] = [
+    ["README.md", between(read("README.md"), "**Upgrading from 0.2.5-0.2.7?**", "\nA new install:"), ORCH],
+    ["README.tmpl.md", between(read("README.tmpl.md"), "**Upgrading from 0.2.5-0.2.7?**", "\nA new install:"), "{{name}}"],
+    ["CHANGELOG.md 0.2.8", between(read("CHANGELOG.md"), "### Upgrading from 0.2.5-0.2.7\n", "\n### "), ORCH],
+  ];
+  for (const [label, raw, pkg] of docs) {
+    const INSTALLS = ["npm i -g @dmsdc-ai/aigentry-telepty@latest", `npm i -g ${pkg}`];
+    const READS = ["command -v telepty", "Get-Command telepty", "where telepty", "telepty --version", "npm root -g"];
+    const NAMES = ["TELEPTY", "TELEPTY_PORT", "version", "python3", "curl", "telepty", pkg];
+    const META_READ = `( cd "$(npm root -g)/${pkg}" && . bin/lib/telepty-auth.sh && ` +
+      `curl -s --noproxy '*' --max-time 5 -H "x-telepty-token: $(telepty_auth_token)" \\ ` +
+      `"http://127.0.0.1:\${TELEPTY_PORT:-3848}/api/meta" )`;
+    const text = raw.replace(/\s+/g, " ");
+
+    // (a) The pre-upgrade step: after the telepty install, before the orchestrator upgrade, naming the consequence.
+    const telepty = text.indexOf(INSTALLS[0]);
+    const orchestrator = text.indexOf(INSTALLS[1]);
+    const before = text.indexOf("Before you upgrade");
+    assert.ok(telepty >= 0 && before > telepty && orchestrator > before,
+      `${label}: the paragraph on what the upgrade removes must stand between the telepty install and the orchestrator upgrade`);
+    const step = text.slice(before, orchestrator);
+    for (const fact of [
+      "This release no longer contains a telepty",
+      "upgrading removes the copy of telepty that earlier versions carried inside this package's directory",
+      "a shell wrapper", "a symlink", "a `TELEPTY` variable",
+      "a service definition whose program path lies inside this package's directory",
+      "stops working after the upgrade, until it is pointed at the telepty installed in step 1",
+      "It is not downgraded",
+      "it changes nothing: `command -v telepty` shows the file your shell runs",
+      "`where telepty` lists the files named telepty that it finds, and does not establish which one cmd runs",
+      "it does not show what a service runs",
+      "If you cannot tell whether anything on this host still runs that copy, upgrade at a time when a short telepty interruption is acceptable",
+    ])
+      assert.ok(step.includes(fact), `${label}: the pre-upgrade step does not state '${fact}'`);
+    assert.doesNotMatch(step, /cannot be affected|not affected|unaffected|is safe|are safe/i,
+      `${label}: the pre-upgrade step claims a host is safe from the removal`);
+    for (const span of step.match(/`[^`]*`/g) ?? [])
+      assert.ok([...READS, ...NAMES].includes(span.slice(1, -1)), `${label}: the pre-upgrade step carries ${span}, which is not a read-only read`);
+
+    // (b) The allowlist: every command in the section is one of the two installs or a reviewed read.
+    const fences = raw.match(/```[^\n]*\n[\s\S]*?```/g) ?? [];
+    assert.equal(fences.length, 1, `${label}: the only fenced block allowed is the daemon meta read`);
+    assert.equal(fences[0].replace(/^```[^\n]*\n/, "").replace(/```$/, "").replace(/\s+/g, " ").trim(), META_READ,
+      `${label}: the fenced block is not exactly the reviewed daemon meta read`);
+    const prose = raw.replace(/```[^\n]*\n[\s\S]*?```/g, "");
+    // The CHANGELOG section ends with r5's paragraph on what init checks after the upgrade; it names init and
+    // the document it reads, and is the one place those three spans are allowed.
+    const INIT_NOTE = "After the upgrade, `aigentry-orchestrator init`";
+    for (const paragraph of prose.split(/\n[ \t]*\n/)) {
+      const described = paragraph.startsWith(INIT_NOTE) ? ["aigentry-orchestrator init", "--dry-run", "telepty boot-capabilities"] : [];
+      for (const span of paragraph.match(/`[^`]*`/g) ?? [])
+        assert.ok([...INSTALLS, ...READS, ...NAMES, ...described].includes(span.slice(1, -1).replace(/\s+/g, " ")),
+          `${label}: ${span} is not one of the two installs, a reviewed read or a plain name`);
+    }
+    assert.doesNotMatch(prose, /<\s*(code|pre|kbd|samp)\b/i, `${label}: the section carries an HTML code element`);
+    for (const line of prose.replace(/`[^`]*`/g, "``").split("\n")) {
+      const body = line.replace(/^\s*(?:[-*+]|\d+\.)?\s*/, "");
+      assert.doesNotMatch(body, /^(?:[$#>]\s+\S|PS\s*[A-Za-z]:\\|PS>|[A-Za-z]:\\[^\s>]*>)/,
+        `${label}: a prompt-style command line outside the reviewed commands: ${line}`);
+      assert.doesNotMatch(body, /\s&&\s|\s\|\|?\s|\$\(|\\$|;\s*$/,
+        `${label}: a command-looking line outside the reviewed commands: ${line}`);
+      assert.doesNotMatch(body, /^(?:sudo\s+)?[a-z][\w.-]*(?:\s+\S+)*?\s--?[A-Za-z]/,
+        `${label}: a word followed by an option, outside the reviewed commands: ${line}`);
+    }
+
+    // R6-2: the Windows file search and a version mismatch are described by what they establish.
+    assert.ok(!text.includes("where.exe"), `${label}: 'where.exe' is offered as showing what the shell runs`);
+    const after = text.slice(orchestrator);
+    for (const phrase of ["`Get-Command telepty` shows the command PowerShell selects",
+      "`where telepty` lists the files named telepty that it finds, not which one cmd runs"])
+      assert.ok(after.includes(phrase), `${label}: the read after the upgrade does not say '${phrase}'`);
+    const disagree = after.slice(after.indexOf("If they disagree"));
+    for (const fact of ["that alone does not say why", "The daemon may have been started before step 1 and still be running",
+      "The CLI and the daemon may come from different installations", "This document prescribes no command"])
+      assert.ok(disagree.includes(fact), `${label}: "If they disagree" does not say '${fact}'`);
+    assert.doesNotMatch(disagree, /then your shell or a service still selects|correct it/i,
+      `${label}: "If they disagree" still reads a mismatch as one cause and directs a correction`);
+  }
 });

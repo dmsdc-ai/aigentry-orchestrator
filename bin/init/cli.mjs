@@ -188,15 +188,23 @@ function shownJson(v) {
 }
 
 /**
- * The telepty the runtime doors would run, as an absolute file, or null when PATH names none.
- * POSIX asks the same `command -v` shell the rest of step 1 asks; win32 uses the C3 PATH x PATHEXT
- * walk, so a Store alias or the WSL launcher is never taken for the real tool.
+ * The telepty the runtime doors would run: `file` is an absolute file, or null when the lookup named
+ * none. POSIX asks the same `command -v` shell the rest of step 1 asks; win32 uses the C3 PATH x
+ * PATHEXT walk, so a Store alias or the WSL launcher is never taken for the real tool.
+ * r6 (review R6-3): `failed` keeps the lookup's own outcome. It is null when the lookup answered (a
+ * file, or "none": a finished non-zero exit with no output), and otherwise says what happened (no
+ * /bin/sh, a signal, the timeout, an exit 0 that named nothing). Only an answered "none" can draw
+ * install advice, as only bash's 127 (boot) and the spawn's ENOENT (dispatch) can in the other doors.
  */
 function resolveTelepty() {
-  if (process.platform === "win32") return winWhich("telepty")[0] ?? null;
+  if (process.platform === "win32") return { file: winWhich("telepty")[0] ?? null, failed: null };
   const r = spawnSync("/bin/sh", ["-c", "command -v telepty"], { encoding: "utf8", timeout: TELEPTY_PROBE_TIMEOUT_MS });
   const out = (r.stdout || "").trim();
-  return r.status === 0 && out !== "" ? out : null;
+  if (r.status === 0 && out !== "") return { file: out, failed: null };
+  if (r.error !== undefined && r.error !== null) return { file: null, failed: `it could not run (${r.error.code || "spawn error"})` };
+  if (r.status === null) return { file: null, failed: `it did not finish (${r.signal || "no exit status"})` };
+  if (r.status === 0 || out !== "") return { file: null, failed: `it exited ${r.status} and named no file` };
+  return { file: null, failed: null };
 }
 
 /**
@@ -323,12 +331,16 @@ function teleptyInconclusive(file, why) {
 
 /** Step 1's telepty handling: the CLI on PATH only. No effect of any kind. */
 function teleptyCheck() {
-  const file = resolveTelepty();
+  const { file, failed } = resolveTelepty();
   const verdict = file === null ? null : teleptyCapabilityVerdict(file);
   // r5 (review R5-3): "not on PATH", and its install command, only when PATH establishes absence.
-  if (verdict === null && !noTeleptyOnPath())
-    warn(teleptyInconclusive(null, "The lookup of telepty on PATH found none, but did not establish that none is there " +
-      "(the lookup did not finish, or a PATH entry did not answer that no telepty file exists)"));
+  // r6 (review R6-3): and only when the lookup itself answered "none"; a failed lookup is reported as
+  // what it was, with no install command, whatever a later look at PATH finds.
+  if (verdict === null && failed !== null)
+    warn(teleptyInconclusive(null, `The lookup of telepty on PATH ('command -v telepty') gave no answer: ${failed}`));
+  else if (verdict === null && !noTeleptyOnPath())
+    warn(teleptyInconclusive(null, "The lookup of telepty on PATH found none, but a PATH entry did not answer that " +
+      "no telepty file exists there, so it is not established that none is there"));
   else if (verdict === null) warn(teleptyMessage("telepty is not on PATH."));
   else if (verdict.kind === "refused")
     warn(teleptyMessage(`The telepty on PATH (${file}) does not report the required capabilities: ${verdict.why}.`));

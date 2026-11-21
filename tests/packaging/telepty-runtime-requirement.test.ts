@@ -42,8 +42,10 @@
 //     bash before it reaches the telepty check, and those are real host tools — so win32 appends
 //     ONLY the ambient directories that hold jq.exe, python.exe, bash.exe or git.exe (review F8),
 //     never the whole ambient PATH, so a contributor's own telepty cannot decide a case (the one
-//     FULL init also appends the directory of process.execPath, the win32 stand-in for POSIX's
-//     `node` symlink, under the same no-telepty guard);
+//     FULL init also appends a directory this file creates holding ONLY a `node` launcher — node.cmd
+//     and an extensionless shell shim, each running process.execPath by absolute path — the win32
+//     stand-in for POSIX's `node` symlink; r6, review R6-5: never Node's own directory, whose
+//     npm/npx siblings Git bash could run by bare name past the `.cmd` tripwires);
 //   * the service case writes a launchd plist on darwin and a systemd unit on linux, and asserts
 //     silence on every platform, because init inspects no service definition.
 import { test } from "node:test";
@@ -132,14 +134,20 @@ function windowsToolDirs(): string[] {
 /**
  * win32 CI 910 (r5): the FULL init's step 5 runs bin/install-instructions.sh under Git bash, and that
  * script calls `node` (substitute_tokens). POSIX symlinks process.execPath into the fixture bin for
- * it; win32 cannot rely on a symlink, so it appends exactly the directory of process.execPath — the
- * node this suite already runs — under the same guard as windowsToolDirs(). It goes LAST, after the
- * fixture bin, so the npm/npx tripwires there still shadow the npm.cmd/npx.cmd beside node.exe.
+ * it; win32 cannot rely on a symlink. r6 (review R6-5): r5 appended the directory of
+ * process.execPath, which also holds Node's npm/npx — and their extensionless shell shims, which Git
+ * bash runs by bare name, past the `.cmd` tripwires. So win32 now gets a directory this function
+ * creates and that holds nothing else: `node.cmd` for cmd.exe and an extensionless `node` shell shim
+ * for Git bash, each running the node this suite already runs by its absolute path. Nothing in it
+ * can be a telepty, npm or npx. It goes LAST, after the fixture bin, as in r5.
  */
-function windowsNodeDir(): string {
-  const dir = dirname(process.execPath);
-  const shared = ["telepty.cmd", "telepty.exe", "telepty.bat", "telepty.com"].filter((name) => existsSync(join(dir, name)));
-  assert.deepEqual(shared, [], "the directory of process.execPath also holds a telepty; it would decide these cases");
+function windowsNodeDir(root: string): string {
+  const node = process.execPath;
+  assert.ok(!/["'%]/.test(node), `process.execPath ${node} cannot be quoted safely in the node launchers`);
+  const dir = join(root, "node-launcher");
+  mkdirSync(dir);
+  writeFileSync(join(dir, "node.cmd"), `@echo off\r\n"${node}" %*\r\nexit /b %ERRORLEVEL%\r\n`);
+  writeFileSync(join(dir, "node"), `#!/bin/sh\nexec '${node.replace(/\\/g, "/")}' "$@"\n`, { mode: 0o755 });
   return dir;
 }
 
@@ -214,10 +222,7 @@ fs.appendFileSync(${JSON.stringify(argvLog)}, JSON.stringify({ argv: process.arg
 ${options.telepty}`);
   }
   const dirs = [...(options.teleptyDir === undefined ? [] : [teleptyDir]), bin, ...(WIN ? windowsToolDirs() : [])];
-  if (WIN && options.scaffold === true) {
-    const nodeDir = windowsNodeDir();
-    if (!dirs.includes(nodeDir)) dirs.push(nodeDir);
-  }
+  if (WIN && options.scaffold === true) dirs.push(windowsNodeDir(root));
   return { root, bin, home, ws: join(root, "ws"), argvLog, tripwireLog, path: dirs.join(delimiter) };
 }
 
