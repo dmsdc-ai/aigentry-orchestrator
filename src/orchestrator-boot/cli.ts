@@ -423,6 +423,21 @@ const PREFLIGHT_OUTPUT_BYTES = 1024 * 1024;
 const BOOT_CAPABILITIES_SCHEMA = "telepty-boot-capabilities-v1";
 const CREATE_VERB = "allow-create-v1";
 const REQUIRED_DAEMON_CAPS = ["wrapped-sessions", "register-create-only"] as const;
+// #1293 — this package declares NO dependency on @dmsdc-ai/aigentry-telepty. The boot door
+// execs the `telepty` word through PATH (bootDoor below), so a nested copy would never be
+// executed here while its postinstall WOULD still run on the host. Every UNSUPPORTED verdict
+// — a missing telepty, an older one that answers the unknown verb with help and exit 0, or a
+// daemon without the capabilities — is therefore an operator upgrade, and the refusal says so
+// by version and command. The CAPABILITY above is what is checked; the version is only named,
+// as the first published telepty carrying every verb this orchestrator uses (dispatch's
+// inject-bound-v1 is the latest of them).
+const TELEPTY_MIN_VERSION = "0.11.1";
+const TELEPTY_INSTALL_COMMAND = "npm i -g @dmsdc-ai/aigentry-telepty@latest";
+const TELEPTY_REQUIREMENT =
+  "aigentry-orchestrator declares no dependency on @dmsdc-ai/aigentry-telepty and runs the telepty on PATH, " +
+  "so nothing here installs, upgrades, starts, stops or restarts it: install " +
+  `@dmsdc-ai/aigentry-telepty ${TELEPTY_MIN_VERSION} or later yourself with '${TELEPTY_INSTALL_COMMAND}', ` +
+  "restart the daemon, then run this boot again.";
 
 /** An untrusted value for a diagnostic: JSON-quoted (control characters escaped) and bounded. */
 function shown(v: string): string {
@@ -607,9 +622,15 @@ function bootPreflight(sid: string): Preflight {
   return { verdict: "UNKNOWN", reason: s.status === null ? `${where} gave no complete answer within the bound` : `${where} answered ${s.status}` };
 }
 
-/** Every verdict but FRESH: exit 3, an EMPTY stdout (the shim cannot exec), one stderr line. */
+/**
+ * Every verdict but FRESH: exit 3, an EMPTY stdout (the shim cannot exec), one stderr line.
+ * #1293 adds ONE further line, and only for UNSUPPORTED — the one verdict that means the
+ * telepty on PATH (or the daemon it started) is missing or too old. The first line is
+ * byte-identical for every verdict, so nothing that reads it changes.
+ */
 function refusePreflight(sid: string, p: Preflight): never {
-  writeOut(2, `orchestrator-boot.sh: boot preflight ${p.verdict} for '${sid}' — ${p.reason}. Nothing was created, attached, signalled, deleted or exec'd.\n`);
+  writeOut(2, `orchestrator-boot.sh: boot preflight ${p.verdict} for '${sid}' — ${p.reason}. Nothing was created, attached, signalled, deleted or exec'd.\n` +
+    (p.verdict === "UNSUPPORTED" ? `orchestrator-boot.sh: ${TELEPTY_REQUIREMENT}\n` : ""));
   process.exit(3);
 }
 

@@ -144,6 +144,88 @@ function binFilesUsing(tool) {
   });
 }
 
+// ------------------------------------------------ the telepty requirement (task #1293)
+//
+// This package declares NO dependency on @dmsdc-ai/aigentry-telepty, and must not. Nothing
+// under src/ or bin/ imports or resolves the package: every call site runs the `telepty`
+// found on PATH (`env.TELEPTY || "telepty"` — src/dispatch/cli.ts:51 and its siblings — or
+// the fixed `telepty` word in the boot command door, src/orchestrator-boot/cli.ts:473). A
+// nested copy would therefore never be EXECUTED, while its postinstall would still run on
+// the host: installing 0.2.7 pulled a nested telepty 0.8.5 whose postinstall stopped a
+// running 0.11.2 daemon and started 0.8.5 in its place.
+//
+// What this orchestrator needs is a CAPABILITY, not a version string, so it is checked here
+// with the same sealed document the two runtime doors read (`telepty boot-capabilities`):
+//   allow-create-v1 + nondeleting-v1 viewer detach — src/orchestrator-boot/cli.ts:497-524
+//   inject-bound-v1                                — src/dispatch/cli.ts:1245-1254
+// Checking the union means init can never report OK where one of those doors refuses. The
+// version below is named in the MESSAGE only, as the first published telepty that declares
+// inject-bound-v1 (CHANGELOG 0.2.6 "Requirements").
+const TELEPTY_MIN_VERSION = "0.11.1";
+const TELEPTY_REQUIRED_VERBS = ["allow-create-v1", "inject-bound-v1"];
+const TELEPTY_INSTALL_COMMAND = "npm i -g @dmsdc-ai/aigentry-telepty@latest";
+const TELEPTY_CAPABILITIES_SCHEMA = "telepty-boot-capabilities-v1";
+
+/**
+ * Runs `telepty boot-capabilities` ONCE, read-only: printing the sealed document starts,
+ * stops, repairs, upgrades or contacts nothing. Returns null when the telepty on PATH
+ * satisfies the requirement, otherwise the one observed fact that refuses it.
+ */
+function teleptyCapabilityRefusal() {
+  let r;
+  if (process.platform === "win32") {
+    // win32 (C4): the resolved file, run with a constant argv, exactly as the hard-dependency
+    // probes above do — never a Store alias or the WSL launcher taken for the real tool.
+    const file = winWhich("telepty")[0];
+    if (file === undefined) return "telepty is not on PATH";
+    r = winRun(file, ["boot-capabilities"]);
+  } else {
+    r = spawnSync("telepty", ["boot-capabilities"], { encoding: "utf8", timeout: 10_000 });
+  }
+  if (r.error !== undefined) return `'telepty boot-capabilities' could not run (${r.error.code || "spawn error"})`;
+  if (r.status === null) return `'telepty boot-capabilities' did not finish (${r.signal || "no exit status"})`;
+  if (r.status !== 0) return `'telepty boot-capabilities' exited ${r.status}`;
+  let doc = null;
+  try {
+    doc = JSON.parse(r.stdout || "");
+  } catch {
+    doc = null;
+  }
+  if (doc === null || typeof doc !== "object" || Array.isArray(doc) || !Array.isArray(doc.verbs) ||
+    !doc.verbs.every((v) => typeof v === "string"))
+    return `'telepty boot-capabilities' did not print a ${TELEPTY_CAPABILITIES_SCHEMA} document ` +
+      "(an older telepty answers an unknown verb with its help text and exit 0, which is NOT support)";
+  if (doc.schema !== TELEPTY_CAPABILITIES_SCHEMA)
+    return `'telepty boot-capabilities' printed schema ${JSON.stringify(String(doc.schema ?? "none"))}, ` +
+      `not ${TELEPTY_CAPABILITIES_SCHEMA}`;
+  const missing = TELEPTY_REQUIRED_VERBS.filter((v) => !doc.verbs.includes(v));
+  if (missing.length > 0)
+    return `the telepty on PATH does not declare ${missing.join(" or ")} in its boot-capabilities`;
+  if (doc.viewer_detach !== "nondeleting-v1")
+    return "the telepty on PATH declares viewer_detach " +
+      `${JSON.stringify(String(doc.viewer_detach ?? "none"))}, not nondeleting-v1`;
+  return null;
+}
+
+/**
+ * The ONE message. It states what was observed, the capability required, the minimum
+ * published version that carries it and the command the operator runs — and it is the whole
+ * of init's telepty handling: init installs, upgrades, starts, stops and restarts nothing.
+ */
+function teleptyRequirementMessage(observed) {
+  return `${observed}. aigentry-orchestrator drives the telepty on PATH and declares NO ` +
+    "dependency on @dmsdc-ai/aigentry-telepty, so no copy of it is installed with this " +
+    "package. It needs a telepty whose 'telepty boot-capabilities' declares " +
+    `${TELEPTY_REQUIRED_VERBS.join(" and ")} with nondeleting-v1 viewer detach: dispatch's ` +
+    "bound delivery to a busy worker uses inject-bound-v1 and orchestrator-boot creates with " +
+    `allow-create-v1. That is @dmsdc-ai/aigentry-telepty ${TELEPTY_MIN_VERSION} or later ` +
+    `(${TELEPTY_MIN_VERSION} is the first published version declaring inject-bound-v1). init ` +
+    "installs, upgrades, starts, stops and restarts nothing — install or upgrade telepty " +
+    `yourself with '${TELEPTY_INSTALL_COMMAND}', then run 'telepty-install' if the daemon is ` +
+    "not running. Until then dispatch refuses by name with exit 78 BOUND_INJECT_UNSUPPORTED " +
+    "and orchestrator-boot with exit 3 boot preflight UNSUPPORTED.";
+}
+
 function parseArgs(argv) {
   const opts = { workspace: null, yes: false, dryRun: false, force: false, upgrade: false,
     captureRoot: null, preservationRoot: null, inspectNative: null, restoreNative: null };
@@ -227,15 +309,14 @@ function dependencyChecks() {
     );
   }
 
-  if (has("telepty")) info("telepty found");
-  else
-    warn(
-      "telepty CLI not on PATH. It is a declared dependency of this package, installed nested under " +
-        `it at ${path.join(PKG_ROOT, "node_modules", ".bin", "telepty")}, and npm does not link a ` +
-        "dependency's commands onto PATH. Install telepty globally with " +
-        "'npm i -g @dmsdc-ai/aigentry-telepty' to put telepty and telepty-install on PATH, then run " +
-        "'telepty-install' to set up the daemon. Dispatch will not function until it is reachable.",
-    );
+  // #1293: exactly ONE telepty message per run, from the capability the runtime doors read —
+  // never a version-string comparison, and never an install, upgrade or restart of anything.
+  if (!has("telepty")) warn(teleptyRequirementMessage("telepty is not on PATH"));
+  else {
+    const why = teleptyCapabilityRefusal();
+    if (why === null) info(`telepty found; its boot-capabilities declare ${TELEPTY_REQUIRED_VERBS.join(" and ")}`);
+    else warn(teleptyRequirementMessage(why));
+  }
 
   if (has("claude")) info("claude CLI found");
   else

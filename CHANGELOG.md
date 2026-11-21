@@ -7,6 +7,116 @@ extracts the matching section as the GitHub Release notes, so a publish fails
 without one. Unreleased harness work is still grouped under a dated
 `## [<YYYY-MM-DD>]` section beneath the ongoing `## [Unreleased]` working set.
 
+## [0.2.8] - 2026-11-21
+
+Hotfix for task #1293. Installing this package used to install a second,
+old copy of telepty, and that copy's postinstall replaced the telepty daemon
+already running on the host. This release removes the telepty dependency
+entirely and states the real requirement where it is checked. No behaviour
+of the orchestrator itself changes.
+
+### Fixed
+
+- **The package no longer installs a nested telepty (#1293).**
+  `package.json` declared `"@dmsdc-ai/aigentry-telepty": "^0.8.0"` from 0.2.0
+  onward, so every `npm i -g @dmsdc-ai/aigentry-orchestrator` also installed a
+  telepty 0.8.x under this package. Nothing in this package ever ran that
+  copy — `dispatch`, `orchestrator-boot`, the tracker, the reconciler and the
+  auditors all run the `telepty` found on PATH — but its **postinstall** ran
+  on the host, and telepty's postinstall stops a running daemon whose version
+  differs from its own **in both directions**, newer included. Measured on
+  2026-11-21: installing 0.2.7 on a Linux host pulled a nested telepty 0.8.5,
+  whose postinstall stopped the supervised 0.11.2 daemon (pid 345424) and
+  started 0.8.5 in its place (pid 352821). Every tracked inject then failed
+  with `TRACKING_PERSISTENCE_FAILED`, because the tracked-injection ledger
+  became a directory store in telepty 0.10.0 and 0.8.5 cannot write it. The
+  dependency is gone from `dependencies` and from the lockfile; the
+  orchestrator keeps running the telepty on PATH, which is what it always did.
+
+### Who is affected, and how to check
+
+- **Anyone who installed 0.2.5, 0.2.6 or 0.2.7 on a host that was running a
+  newer telepty daemon.** The published postinstall of an already released
+  telepty cannot be changed, so an install that already happened must be
+  repaired by hand. (The `^0.8.0` range was declared from 0.2.0 onward, so any
+  earlier install placed the same nested copy; the repair below is identical.)
+- **Check** — compare the CLI on PATH with the daemon that is actually
+  running. The daemon reports its own version on its local metadata endpoint,
+  which is the same read `bin/orchestrator-boot.sh` makes:
+
+  ```
+  telepty --version                      # the CLI on PATH
+  . bin/lib/telepty-auth.sh              # the one shipped credential reader
+  curl -s -H "x-telepty-token: $(telepty_auth_token)" \
+       http://127.0.0.1:3848/api/meta    # the running daemon's own version
+  ```
+
+  If the daemon reports a version lower than the CLI you installed
+  deliberately — or if tracked injects fail with
+  `TRACKING_PERSISTENCE_FAILED` — the nested postinstall replaced your daemon.
+- **Repair** — reinstall the latest telepty globally and restart the daemon
+  and every bridge, so each one carries the code you chose:
+
+  ```
+  npm i -g @dmsdc-ai/aigentry-telepty@latest
+  telepty-install
+  ```
+
+  A bridge keeps the code it was started with, so bridges started by the
+  downgraded daemon must be restarted too. Nothing in the orchestrator does
+  this for you, by design.
+
+### Changed
+
+- **The telepty requirement is now stated where it is checked, as a
+  capability.** `aigentry-orchestrator init` step 1 reads the sealed
+  `telepty boot-capabilities` document instead of only testing that the
+  command exists, and a missing or too-old telepty produces exactly one
+  message: what was observed, that `allow-create-v1` and `inject-bound-v1`
+  with `nondeleting-v1` viewer detach are required, that this is
+  `@dmsdc-ai/aigentry-telepty` **0.11.1 or later** (0.11.1 is the first
+  published version declaring `inject-bound-v1`), and the command
+  `npm i -g @dmsdc-ai/aigentry-telepty@latest`. The two later doors name the
+  same floor and command in their existing refusals — dispatch's exit 78
+  `BOUND_INJECT_UNSUPPORTED` and boot's exit 3
+  `boot preflight UNSUPPORTED`. The orchestrator installs, upgrades, starts,
+  stops and restarts nothing: every verdict is detect-only.
+- **init's old telepty message is withdrawn.** It told the user telepty was
+  "a declared dependency of this package, installed nested under it at
+  `…/node_modules/.bin/telepty`". Both halves are now false.
+
+### Requirements
+
+- Unchanged from 0.2.6: the telepty daemon and every `telepty allow` bridge
+  must run `@dmsdc-ai/aigentry-telepty` 0.11.1 or later for bound delivery
+  and the strand report. This release only stops shipping a telepty of its
+  own; it does not lower or raise that floor.
+
+### Release gates
+
+- The lockfile is regenerated without running lifecycle scripts, and a new
+  packaging suite fails if any dependency section — `dependencies`,
+  `devDependencies`, `optionalDependencies`, `peerDependencies`, a bundled
+  list, an `npm:` alias or an override — can resolve a telepty at all, or
+  below 0.11.1, or if the lockfile carries a nested telepty subtree again.
+- `.github/workflows/release.yml` carries
+  `RELEASE_SECURITY_POLICY_SHA256: UNREVIEWED` until the reviewed
+  `release/security/0.2.8/policy.json` exists; the admission gate refuses
+  `UNREVIEWED`, so nothing can publish before that review.
+- Publication requires exact integrated CI, including Windows W1 (full
+  suite) and W0 (installed package), followed by registry verification.
+
+### Known limits
+
+- Removing the dependency cannot undo an install that already happened: a
+  host whose daemon was replaced stays replaced until the repair above is
+  run. Nothing in this release detects or reverts that.
+- A capability probe answers for the **CLI on PATH**, not for the daemon or
+  the bridges that are already running. A bridge started by an older daemon
+  still refuses bound delivery with exit 78 even after the CLI is upgraded —
+  restart it.
+- All Known limits of 0.2.7 still apply.
+
 ## [0.2.7] - 2026-11-18
 
 Release-engineering change for task #1282. The package contents are

@@ -1147,6 +1147,18 @@ function recordTransport(d: Delivery, sid: string, result: string): number {
 // never `write_observed`, never a fresh VERIFIED, never a replay.
 const BOUND_VERB = "inject-bound-v1";
 const BOUND_CAPABILITY = "busy-input-v1";
+// #1293 — this package declares NO dependency on @dmsdc-ai/aigentry-telepty: TELEPTY (:51) is
+// the binary on PATH, a nested copy would never be executed here, and its postinstall WOULD
+// still run on the host. So a too-old telepty is the operator's to replace, and the refusal
+// below has to say which version and with which command. The CAPABILITY is what is checked;
+// this version is only named, as the first published telepty declaring BOUND_VERB.
+const TELEPTY_MIN_VERSION = "0.11.1";
+const TELEPTY_INSTALL_COMMAND = "npm i -g @dmsdc-ai/aigentry-telepty@latest";
+const TELEPTY_REQUIREMENT =
+  "aigentry-orchestrator declares no dependency on @dmsdc-ai/aigentry-telepty and runs the telepty on PATH, " +
+  `so nothing here installs, upgrades, starts, stops or restarts it: install @dmsdc-ai/aigentry-telepty ` +
+  `${TELEPTY_MIN_VERSION} or later yourself with '${TELEPTY_INSTALL_COMMAND}', restart the daemon and every ` +
+  "bridge, then dispatch again";
 const BOUND_RESULT_SCHEMA = "telepty.bound-inject-result/v1";
 const BOUND_LOOPBACK = "127.0.0.1";
 // The frozen result vocabulary. Anything outside it is read as `unknown`, never coerced.
@@ -1398,7 +1410,7 @@ function admitBoundBusy(o: Opts, sid: string): BusyAdmission {
   }
   if (!boundVerbAdvertised()) {
     refuse(`the local telepty CLI does not advertise ${BOUND_VERB} in boot-capabilities ` +
-      "(an unknown verb's help text and exit 0 is not support)");
+      `(an unknown verb's help text and exit 0 is not support) — ${TELEPTY_REQUIREMENT}`);
   }
   return { bound: { epoch: snap.epoch, ownerGeneration: snap.ownerGeneration, busyInput: snap.busyInput },
     cliKind, probe: p, startedAt, probed: true };
