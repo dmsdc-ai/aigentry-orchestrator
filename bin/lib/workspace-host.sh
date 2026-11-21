@@ -417,14 +417,75 @@ _wh_cmux_wait_ready() {
   return 1
 }
 
+# _wh_cmux_focus_option_supported <cmux-bin> — does THIS cmux document the exact option
+# `new-workspace --focus <true|false>`? Called ONLY when background creation was explicitly
+# opted into (AIGENTRY_CMUX_BACKGROUND_SPAWN=1), so neither answer can affect a default
+# launch: an ordinary install never reaches this function.
+#
+# Exit: 0 = documented. 1 = the probe answered and does not document it. 2 = the probe
+# itself could not be read. The caller owns the operator-facing message, so this is quiet.
+#
+# Why this is not `cmux --help | grep -qE 'new-workspace.*--focus'`. That form accepts three
+# wrong answers:
+#   (a) a longer option that merely BEGINS with `--focus` (`--focus-follows-mouse`) matches,
+#       so an unrelated flag reads as support;
+#   (b) it needs `new-workspace` and `--focus` on the SAME line, so a help layout that puts
+#       a command's options on continuation lines reads as "unsupported" when the option is
+#       there;
+#   (c) the match runs inside a pipeline under `set -o pipefail` (bin/wh-cli.sh:67), so a cmux
+#       that prints usable help and exits non-zero — or cannot run at all — also comes out as
+#       "unsupported", i.e. "upgrade cmux" for what is really a broken probe.
+# Hence: capture the help with NO pipeline (so the status is the binary's own), decline to
+# interpret a failed or empty probe, cut out the `new-workspace` BLOCK (its own line plus
+# every more-indented continuation line — that covers (b)), and require inside that block an
+# exact `--focus` TOKEN followed DIRECTLY by a boolean value PLACEHOLDER: `<…>`, `[…]` or
+# `{…}` naming true/false/bool, `=` plus a boolean word, or a bare `true|false` alternation.
+# A bare switch `--focus` with no value, or a `--no-focus` spelling, is deliberately NOT
+# accepted: passing `--focus false` to such a cmux would leave `false` as a positional. The
+# placeholder shape is what keeps description text out: `--focus  (bool) focus it` or
+# `--focus  true to focus` describes a bare switch and is refused.
+#
+# Limits, stated: this reads cmux's self-description, and only its TOP-LEVEL `--help`.
+#   * A cmux that lists the option only under `cmux new-workspace --help` is refused as
+#     UNSUPPORTED although the option exists. The subcommand's help is deliberately not run:
+#     on a cmux whose new-workspace does not treat `--help` as help, that call could itself
+#     create a workspace — in front of the operator who opted out of exactly that.
+#   * A help layout outside the shapes above may be refused; that costs the opted-in launch
+#     only, never a default one.
+#   * A cmux that documents the option and then ignores it cannot be caught before spawning
+#     by any check; it would need an observed selection, which costs a workspace. The
+#     opted-in operator is told as much in the docs.
+_wh_cmux_focus_option_supported() {
+  local bin="$1" help rc=0 block
+  local focus_value_re='(^|[^A-Za-z0-9_-])--focus((=|[[:space:]]+)(<[^>]*(true|false|bool|BOOL|TRUE|FALSE)[^>]*>|[[][^]]*(true|false|bool|BOOL|TRUE|FALSE)[^]]*[]]|[{][^}]*(true|false|bool|BOOL|TRUE|FALSE)[^}]*[}]|(true|false|TRUE|FALSE)[|](true|false|TRUE|FALSE))|=(true|false|bool|BOOL|TRUE|FALSE))'
+  help=$("$bin" --help 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] && return 2
+  [ -z "$(printf '%s' "$help" | tr -d '[:space:]')" ] && return 2
+  # Every `new-workspace`-anchored block, not just the first: a CLI may name the command once
+  # in a command list and again in a per-command options section.
+  block=$(printf '%s\n' "$help" | awk '
+    { ind = match($0, /[^ \t]/) }
+    found && $0 ~ /^[ \t]*$/ { print; next }
+    found && ind > indent     { print; next }
+    { found = 0 }
+    $0 ~ /(^|[^A-Za-z0-9_-])new-workspace([^A-Za-z0-9_-]|$)/ { found = 1; indent = ind; print; next }
+  ')
+  [ -z "$block" ] && return 1
+  printf '%s\n' "$block" \
+    | grep -Eq -- "$focus_value_re" \
+    || return 1
+  return 0
+}
+
 # _wh_cmux_open <sid> <cwd> <cli_cmd> — spawn a visible cmux workspace wrapping
 # `telepty allow --id <sid>`, BLOCK until the ready-gate passes, then emit the
 # workspace ref (workspace:N) as the host_id (ADR §3 D1 contract). Moved byte-for-byte
 # from open-session.sh:open_in_terminal()'s cmux branch (#608 Phase 1, ADR §7).
 # Exit contract (handle emitted ⇒ pane ready; no half-spawned surface on failure):
 #   0  → ref printed on stdout (surface can accept send-key).
-#   2  → new-workspace produced no ref (spawn failed), or AIGENTRY_WORKER_AUTO_RESTART
-#        held a value other than 0/1; nothing to clean up.
+#   2  → new-workspace produced no ref (spawn failed); or AIGENTRY_WORKER_AUTO_RESTART or
+#        AIGENTRY_CMUX_BACKGROUND_SPAWN held a value other than 0/1; or background creation
+#        was opted into and this cmux cannot be shown to support it. Nothing to clean up.
 #   3  → ready-gate timed out; the workspace is closed, NO ref emitted.
 # CMUX seam: injectable cmux binary so the readiness gate is hermetically testable
 # (BUG-A); defaults to the real `cmux` in production.
@@ -448,6 +509,26 @@ _wh_cmux_wait_ready() {
 #   AIGENTRY_WH_LEGACY_SPAWN=1) carries a verbatim copy of the pre-seam cmux command line,
 #   `--auto-restart` included. Setting this to 0 for any backend other than cmux has NO
 #   effect and is not an error.
+#
+# AIGENTRY_CMUX_BACKGROUND_SPAWN (per launch; default 0 = unchanged behaviour)
+#   0, or unset → EXACTLY what this adapter has always done, on every cmux version: the same
+#                 `new-workspace --cwd … --command …` argv, no support probe, and no new way
+#                 to fail. An ordinary install is untouched by this setting's existence.
+#   1           → the worker workspace is created in the BACKGROUND (`--focus false`), so a
+#                 spawn no longer moves the operator's selection. The workspace is still in
+#                 the sidebar and its CLI is still the foreground process of its own surface.
+#                 Because a cmux that does not know the flag may IGNORE it and take focus
+#                 anyway (or fail), support is established FIRST
+#                 (_wh_cmux_focus_option_supported) and a cmux that cannot be shown to
+#                 support it is refused with exit 2 before anything is spawned. That refusal
+#                 is reachable ONLY under this setting.
+#   anything else → refused with exit 2 before anything is spawned.
+#
+#   SCOPE: read HERE, so it applies to the cmux adapter only. No other backend in this file
+#   and no other adapter verb reads it, and neither does the opt-in legacy rollback arm
+#   (src/session/open-session/legacy-spawn.ts, AIGENTRY_WH_LEGACY_SPAWN=1), which carries a
+#   verbatim copy of the pre-seam command line. Setting it for a non-cmux backend has no
+#   effect and is not an error.
 _wh_cmux_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
   # cmux --command sends text+Enter; telepty allow runs as the workspace's foreground process.
@@ -459,7 +540,7 @@ _wh_cmux_open() {
   # word-split a cwd containing a space. cli_cmd stays unquoted deliberately: it is a
   # COMMAND LINE (`claude --model … --effort …`), not a value, and must word-split.
   local CMUX_BIN="${CMUX:-cmux}"
-  local out ref q_cwd q_sid restart_arg
+  local out ref q_cwd q_sid child restart_arg background=0 sup=0
   # Per-launch retry budget; 0 permits one child launch without automatic retries.
   # Refused before the spawn, so an invalid value never opens a workspace.
   case "${AIGENTRY_WORKER_AUTO_RESTART-1}" in
@@ -467,8 +548,29 @@ _wh_cmux_open() {
     0) restart_arg='';;
     *) echo 'ERR AIGENTRY_WORKER_AUTO_RESTART must be 0 or 1' >&2; return 2;;
   esac
+  # Background creation is OPT-IN. Resolved before any work, so an unreadable value cannot
+  # half-open anything; 0/unset falls through to the original single call below.
+  case "${AIGENTRY_CMUX_BACKGROUND_SPAWN-0}" in
+    0) ;;
+    1) background=1;;
+    *) echo 'ERR AIGENTRY_CMUX_BACKGROUND_SPAWN must be 0 or 1' >&2; return 2;;
+  esac
   printf -v q_cwd '%q' "$cwd"; printf -v q_sid '%q' "$sid"
-  out=$("$CMUX_BIN" new-workspace --cwd "$cwd" --command "bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\"$restart_arg $cli_cmd' _ $q_cwd $q_sid" 2>&1)
+  # One child command line, used by both arms, so the two argvs differ in nothing but the
+  # opted-in `--focus false`. With AIGENTRY_WORKER_AUTO_RESTART unset or 1, $restart_arg is
+  # ' --auto-restart' and this is byte-for-byte the string the single call used to build.
+  child="bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\"$restart_arg $cli_cmd' _ $q_cwd $q_sid"
+  if [ "$background" = 1 ]; then
+    _wh_cmux_focus_option_supported "$CMUX_BIN" || sup=$?
+    case "$sup" in
+      0) ;;
+      2) echo "ERR CMUX_FOCUS_PROBE_FAILED: '$CMUX_BIN --help' could not be read (it failed or printed nothing), so new-workspace --focus support is UNKNOWN, not absent. Refusing to spawn $sid in the background rather than guess — fix or unset AIGENTRY_CMUX_BACKGROUND_SPAWN for the default foreground launch." >&2; return 2;;
+      *) echo "ERR CMUX_FOCUS_UNSUPPORTED: this cmux's top-level --help documents no 'new-workspace --focus <true|false>', and a cmux that does not know the option may ignore it (opening the workspace in front of you) or fail. Refusing to spawn $sid in the background (upgrade cmux if it predates the option, or unset AIGENTRY_CMUX_BACKGROUND_SPAWN for the default foreground launch)." >&2; return 2;;
+    esac
+    out=$("$CMUX_BIN" new-workspace --focus false --cwd "$cwd" --command "$child" 2>&1)
+  else
+    out=$("$CMUX_BIN" new-workspace --cwd "$cwd" --command "$child" 2>&1)
+  fi
   ref=$(echo "$out" | grep -oE 'workspace:[0-9]+' | head -1)
   [ -z "$ref" ] && { echo "ERR cmux new-workspace failed: $out" >&2; return 2; }
   # title == sid (open-session.sh SID convention); rename to the stable handle.
