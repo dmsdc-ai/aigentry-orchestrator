@@ -9,6 +9,8 @@
 //   inbox/<peer label>/<id>.json    receiver records
 //   raw/<sha256>.env                exact canonical envelope bytes, write-once, content-addressed
 //   probe-answers.json              record-less probe answers of the last 60 s (SPEC §8.1 throttle)
+//   retention.json                  {"v":1,"request_floor":<ISO>}: the newest `sent_at` of an inbox REQUEST that
+//                                   retention deleted (review CL-07); ingest refuses a REQUEST not after it
 //
 // Every path component is a validated UUID, label or hex64 before any filesystem call; no other
 // record value becomes a path. Every mutation runs under withIndexLock(store.json): read, check,
@@ -47,14 +49,28 @@ export const SENDS_MAX = 32;
 export const OPEN_RECORDS_MAX = 256;
 export const UNVERIFIED_COPIES_MAX = 4;
 export const RETENTION_MS = 30 * 86_400 * 1000;
+/**
+ * The ONE admission bound (review CL-07). ingest admits a REQUEST or REPLY only when its `sent_at` S satisfies
+ * now − ADMIT_MAX_AGE_MS ≤ S ≤ now + ADMIT_MAX_AHEAD_MS (cli.ts STALE_MESSAGE_MS / FUTURE_SKEW_MS are these
+ * values) and, for a REQUEST, S is after the store's request floor. Retention deletes an inbox record only when
+ * its REQUEST is already outside that window (now − S > ADMIT_MAX_AGE_MS), and raises the floor to that S before
+ * anything is deleted. So no clock correction can make a deleted REQUEST key admissible again.
+ */
+export const ADMIT_MAX_AGE_MS = 25 * 86_400 * 1000;
+export const ADMIT_MAX_AHEAD_MS = 86_400 * 1000;
 /** At most this many record-less probe answers are remembered (all younger than the throttle interval). */
 export const RECORDLESS_ANSWERS_MAX = 256;
 /**
  * Windows device names (CON, PRN, AUX, NUL, COM0-9, LPT0-9; case-insensitive there). LABEL_RE accepts
- * them, but no directory can carry such a name on native Windows, so the store refuses them as a
- * peer label on every platform, and behaves the same everywhere.
+ * them, but no directory can carry such a name on native Windows, so the store refuses to CREATE an inbox
+ * directory with such a name on every platform (review CL-15). A directory that already exists (made by an
+ * earlier version on POSIX) is an ordinary inbox: it is listed, read, written and protected from retention.
  */
 export const RESERVED_LABEL_RE = /^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])$/;
+/** CL-09: a REPLY stored by ingest awaits the sender controller's `handled` until it is set to "handled". */
+export const PICKUP_STATES = ["awaiting", "handled"] as const;
+/** The result of claimRecordlessAnswer (CL-11): answer now, already answered recently, or the table is full. */
+export type RecordlessClaim = "claimed" | "recent" | "full";
 
 export const SENDER_STATES = [
   "prepared", "sent", "send_unknown", "send_refused", "unverified_at_peer", "received",
@@ -111,6 +127,11 @@ export interface MessageEntry {
   final?: string;
   /** Receiver's REQUEST-1 only (SPEC §4.2). */
   corroboration?: Corroboration;
+  /**
+   * Sender's REPLY-n only (review CL-09): "awaiting" from the ingest that stored it until the controller runs
+   * `handled`, then "handled". Absent (a record written before this field) means nothing awaits.
+   */
+  pickup?: (typeof PICKUP_STATES)[number];
   [extra: string]: unknown;
 }
 
@@ -264,6 +285,27 @@ export function classifyAck(record: LinkRecord, ref: MessageKey, seq: number): "
   return seen !== undefined && seq <= seen.last_seq ? "stale" : "new";
 }
 
+/**
+ * CL-09: the REPLY keys of a sender record that ingest stored and the controller has not yet marked `handled`,
+ * in seq order. A record that names one awaits the controller's action, terminal or not.
+ */
+export function awaitingPickup(record: LinkRecord): string[] {
+  if (record.role !== "sender") return [];
+  return Object.keys(record.messages)
+    .filter((k) => k.startsWith("REPLY-") && record.messages[k]!.pickup === "awaiting")
+    .sort((x, y) => Number(x.slice(6)) - Number(y.slice(6)));
+}
+
+/** `sent_at` of canonical envelope bytes (first line, SPEC §3.1), in ms; null if the bytes do not show one. */
+export function envelopeSentAtMs(bytes: Uint8Array): number | null {
+  const text = Buffer.from(bytes).toString("utf8");
+  const nl = text.indexOf("\n");
+  const m = / sent_at=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z) /.exec(nl < 0 ? text : text.slice(0, nl));
+  if (m === null) return null;
+  const t = Date.parse(m[1]!);
+  return Number.isNaN(t) ? null : t;
+}
+
 export function statusOf(record: LinkRecord): StatusEntry {
   return {
     role: record.role,
@@ -302,11 +344,12 @@ function checkRequestId(id: unknown): string {
   return id;
 }
 
-/** A label that can name a directory on every platform. */
-const safeLabel = (label: string): boolean => LABEL_RE.test(label) && !RESERVED_LABEL_RE.test(label);
-
+/**
+ * A label of the config grammar. A Windows device name passes here (an existing directory with that name is a
+ * record directory, CL-15); only the creation of a new one is refused (mutate).
+ */
 function checkLabel(label: unknown): string {
-  if (typeof label !== "string" || !safeLabel(label)) {
+  if (typeof label !== "string" || !LABEL_RE.test(label)) {
     throw new StoreError("STORE_UNAVAILABLE", "path component invalid (peer label)");
   }
   return label;
@@ -387,6 +430,9 @@ function validateRecord(value: unknown, ref: RecordRef, mode: Mode): LinkRecord 
     if (m.raw !== rawRef(m.sha256)) corrupt(mode, `${key} raw`);
     if ("sends" in m) checkSends(m.sends, mode, key);
     if ("ingested_at" in m && !isIso(m.ingested_at)) corrupt(mode, `${key} ingested_at`);
+    if ("pickup" in m && (!key.startsWith("REPLY-") || !(PICKUP_STATES as readonly unknown[]).includes(m.pickup))) {
+      corrupt(mode, `${key} pickup`);
+    }
     if ("corroboration" in m) {
       const c = m.corroboration;
       if (key !== "REQUEST-1" || !isObj(c) || !(CORROBORATION_STATES as readonly unknown[]).includes(c.state)
@@ -569,6 +615,11 @@ export class ControllerLinkStore {
     return path.join(this.root, "store.json");
   }
 
+  /** CL-07 request floor file. */
+  get floorPath(): string {
+    return path.join(this.root, "retention.json");
+  }
+
   recordPath(ref: RecordRef): string {
     const r = checkRef(ref);
     return r.role === "sender"
@@ -637,8 +688,15 @@ export class ControllerLinkStore {
    *
    * The 30 days run from the later of `state_at` and every message's `ingested_at`, so a key is kept
    * at least 30 days after its last arrival by this clock even when the clock went back in between, or
-   * a message was stored on an already terminal record. With ingest's bound on future `sent_at`
-   * (STALE_MESSAGE, cli.ts) that is longer than the 25 days an exact copy stays admissible.
+   * a message was stored on an already terminal record.
+   *
+   * CL-07 (one bound, ADMIT_MAX_AGE_MS): an inbox record is selected only when its REQUEST-1 is already
+   * outside the admission window (now − sent_at > ADMIT_MAX_AGE_MS; sent_at read from its raw bytes, or, if
+   * they do not show it, the latest time ingest could have admitted, last change + ADMIT_MAX_AHEAD_MS). Before
+   * returning, the store's request floor is raised to the newest such sent_at (retention.json, atomic), so it
+   * is durable BEFORE the caller deletes anything; ingest refuses a REQUEST whose sent_at is not after it.
+   * An outbox record has no admissible key to protect: a REPLY or ACK for a deleted outbox record is
+   * UNKNOWN_REQUEST and is never applied. CL-09: a record with a REPLY awaiting `handled` is kept.
    */
   async selectRetention(): Promise<RetentionSelection> {
     const now = this.clock.nowMs();
@@ -646,11 +704,21 @@ export class ControllerLinkStore {
       if (!(await this.readable())) return { records: [], raws: [] };
       const named = new Set<string>();
       const records: RecordRef[] = [];
+      let floor: number | null = null;
       for (const ref of await this.scanRefs(undefined, undefined)) {
         const rec = await this.readRecordFile(this.recordPath(ref), ref);
         if (rec === null) continue;
-        if (isTerminal(rec.state) && now - lastChangeMs(rec) >= RETENTION_MS) {
+        let selected = isTerminal(rec.state) && now - lastChangeMs(rec) >= RETENTION_MS && awaitingPickup(rec).length === 0;
+        let sentAt: number | null = null;
+        if (selected && rec.role === "receiver") {
+          const req = rec.messages["REQUEST-1"]!;
+          const raw = await readPrivateFile(this.rawPath(req.sha256), MAX_RECORD_BYTES);
+          sentAt = (raw === null ? null : envelopeSentAtMs(raw)) ?? lastChangeMs(rec) + ADMIT_MAX_AHEAD_MS;
+          selected = now - sentAt > ADMIT_MAX_AGE_MS;
+        }
+        if (selected) {
           records.push(ref);
+          if (sentAt !== null) floor = Math.max(floor ?? sentAt, sentAt);
         } else {
           for (const sha of rawsNamedBy(rec)) named.add(sha);
         }
@@ -662,7 +730,24 @@ export class ControllerLinkStore {
           if (m !== null && !named.has(m[1]!)) raws.push(m[1]!);
         }
       }
+      const current = await this.readRequestFloor();
+      if (floor !== null && (current === null || floor > current)) {
+        await atomicWrite(this.floorPath, Buffer.from(JSON.stringify({ v: 1, request_floor: new Date(floor).toISOString() }), "utf8"),
+          { sessionId: randomUUID() });
+      }
       return { records, raws };
+    });
+  }
+
+  /**
+   * CL-07: the newest `sent_at` (ms) of an inbox REQUEST that retention selected for deletion, or null when none
+   * was. ingest refuses a REQUEST whose `sent_at` is not after it (STALE_MESSAGE). No lock: the file is replaced
+   * by an atomic rename. A missing store is null.
+   */
+  async requestFloorMs(): Promise<number | null> {
+    return this.guard(async () => {
+      if (!(await this.readable())) return null;
+      return this.readRequestFloor();
     });
   }
 
@@ -696,6 +781,15 @@ export class ControllerLinkStore {
   async mutate<T>(ref: RecordRef, fn: (current: LinkRecord | null, ctx: MutationContext) => Mutation<T> | Promise<Mutation<T>>): Promise<T> {
     const r = checkRef(ref);
     const file = this.recordPath(r);
+    // CL-15: a NEW inbox directory never gets a Windows device name (refused before anything is created); an
+    // existing one, made by an earlier version on POSIX, is used as it is. Only a real directory counts: on
+    // Windows the name can resolve to the device itself, which is refused here too.
+    if (r.role === "receiver" && RESERVED_LABEL_RE.test(r.peer)) {
+      const existing = await this.guard(() => lstatIfPresent(path.join(this.root, "inbox", r.peer)));
+      if (existing === null || !existing.isDirectory() || existing.isSymbolicLink()) {
+        throw new StoreError("STORE_UNAVAILABLE", `peer label ${r.peer} is a Windows device name; no new inbox directory is created for it`);
+      }
+    }
     return this.withLock(async () => {
       const current = await this.internal(async () => {
         await this.recordDirs(r, true);
@@ -738,30 +832,42 @@ export class ControllerLinkStore {
 
   /**
    * SPEC §8.1 PROBE throttle for a probe about a request with no record (the record keeps its own
-   * `probe_answers`): true, and remembered under the store lock, when no answer to (peer, id, ref) was
-   * given in the last `intervalMs`; false when one was. Entries older than `intervalMs` are dropped
-   * on every claim, so the file holds only the last interval's answers; at RECORDLESS_ANSWERS_MAX of
-   * them a further claim is false (no answer), so a flood cannot grow it.
+   * `probe_answers`): "claimed", and remembered under the store lock, when no answer to (peer, id, ref) was
+   * given in the last `intervalMs`; "recent" when one was; "full" when RECORDLESS_ANSWERS_MAX other answers
+   * of the last interval are remembered (no answer, so a flood cannot grow the file; CL-11: its own outcome,
+   * not a duplicate). Entries older than `intervalMs` are dropped on every claim. An entry dated after now
+   * (the clock went back) is kept and counted from now (CL-11), so a backward clock step never frees a key
+   * early, and it still expires one interval later.
    */
-  async claimRecordlessAnswer(peer: string, requestId: string, ref: MessageKey, intervalMs: number): Promise<boolean> {
+  async claimRecordlessAnswer(peer: string, requestId: string, ref: MessageKey, intervalMs: number): Promise<RecordlessClaim> {
     const key = `${checkLabel(peer)}/${checkRequestId(requestId)}/${ref}`;
     if (!RECORDLESS_KEY_RE.test(key)) throw new StoreError("STORE_UNAVAILABLE", "path component invalid (ref)");
     const file = path.join(this.root, "probe-answers.json");
     return this.withLock(() => this.internal(async () => {
       const nowMs = this.clock.nowMs();
+      const nowIso = new Date(nowMs).toISOString();
       const bytes = await readPrivateFile(file, MAX_RECORD_BYTES);
       const v = bytes === null ? { v: 1, answers: {} } : parseJson(bytes);
       if (!isObj(v) || v.v !== 1 || !isObj(v.answers)) throw new StoreError("STORE_CORRUPT", "probe-answers.json");
       const answers: Record<string, string> = {};
+      let restamped = false;
       for (const [k, at] of Object.entries(v.answers)) {
         if (!RECORDLESS_KEY_RE.test(k) || !isIso(at)) throw new StoreError("STORE_CORRUPT", "probe-answers.json entry");
         const age = nowMs - Date.parse(at);
-        if (age >= 0 && age < intervalMs) answers[k] = at;
+        if (age < 0) {
+          answers[k] = nowIso;
+          restamped = true;
+        } else if (age < intervalMs) {
+          answers[k] = at;
+        }
       }
-      if (answers[key] !== undefined || Object.keys(answers).length >= RECORDLESS_ANSWERS_MAX) return false;
-      answers[key] = new Date(nowMs).toISOString();
-      await atomicWrite(file, Buffer.from(JSON.stringify({ v: 1, answers }), "utf8"), { sessionId: randomUUID() });
-      return true;
+      const outcome: RecordlessClaim = answers[key] !== undefined ? "recent"
+        : Object.keys(answers).length >= RECORDLESS_ANSWERS_MAX ? "full" : "claimed";
+      if (outcome === "claimed") answers[key] = nowIso;
+      if (outcome === "claimed" || restamped) {
+        await atomicWrite(file, Buffer.from(JSON.stringify({ v: 1, answers }), "utf8"), { sessionId: randomUUID() });
+      }
+      return outcome;
     }));
   }
 
@@ -800,6 +906,15 @@ export class ControllerLinkStore {
     }
     this.checkMarker(marker);
     return true;
+  }
+
+  /** retention.json's request floor in ms, or null when there is none. */
+  private async readRequestFloor(): Promise<number | null> {
+    const bytes = await readPrivateFile(this.floorPath, 1024);
+    if (bytes === null) return null;
+    const v = parseJson(bytes);
+    if (!isObj(v) || v.v !== 1 || !isIso(v.request_floor)) throw new StoreError("STORE_CORRUPT", "retention.json");
+    return Date.parse(String(v.request_floor));
   }
 
   private checkMarker(bytes: Buffer): void {
@@ -842,7 +957,9 @@ export class ControllerLinkStore {
       }
     }
     if (role !== "sender" && (await checkDirectory(path.join(this.root, "inbox")))) {
-      const labels = peer !== undefined ? [peer] : (await readDirNames(path.join(this.root, "inbox"))).filter(safeLabel);
+      // CL-15: every directory whose name is a label is scanned, a Windows device name included, so a record a
+      // previous version stored there is listed and its raw files are never taken for orphans by retention.
+      const labels = peer !== undefined ? [peer] : (await readDirNames(path.join(this.root, "inbox"))).filter((l) => LABEL_RE.test(l));
       for (const label of labels) {
         if (!(await checkDirectory(path.join(this.root, "inbox", label)))) continue;
         for (const name of await readDirNames(path.join(this.root, "inbox", label))) {

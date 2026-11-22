@@ -7,8 +7,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   ANSWER_RESENDS_MAX, NO_ACK_STALL_MS, PENDING_MAX_AGE_MS, QUEUED_WAIT_MS, REFUSAL_STALL_MS,
-  decide, nextPoint, type DecideFacts, type NoticeKind, type Step,
+  decide, nextPoint, retentionStartMs, type DecideFacts, type NoticeKind, type Step,
 } from "../../src/controller-link/decide.js";
+import { RECEIVER_STATES, SENDER_STATES } from "../../src/controller-link/store.js";
 import type { LinkRecord, RecordState, SendAttempt } from "../../src/controller-link/store.js";
 
 const T0 = Date.parse("2026-11-22T12:00:00.000Z");
@@ -543,4 +544,165 @@ test("CL-05 a stored copy the pump found corroborated is presented by a notice (
   out.notices.corroborated = { shas: [OTHER_SHA], at: iso(T0 + MIN) };
   assert.deepEqual(decide(out, facts(T0 + MIN)), { kind: "remind", notice: "corroborated", anchor: iso(T0 + MIN) },
     "a corroborated final REPLY is presented, not applied: the sender stays `accepted`");
+});
+
+// ── Second review (round 2): CL-05, CL-12 ────────────────────────────────────────────────
+/** A REPLY-n copy (U6 `unverified_copies` entry with its `key`) stored at `atMs`. */
+function replyCopy(rec: LinkRecord, key: string, sha: string, atMs: number): void {
+  rec.unverified_copies = [...(rec.unverified_copies ?? []),
+    Object.assign({ sha256: sha, raw: `raw/${sha}.env`, at: iso(atMs) }, { key })];
+}
+
+/** The receiver record ingest leaves for an uncorroborated REQUEST (`unverified`, REQUEST-1 not corroborated). */
+function unverifiedInbox(): LinkRecord {
+  const rec = base("receiver", "unverified", "REPLY-1", []);
+  delete rec.messages["REPLY-1"];
+  rec.receiver_task = null;
+  rec.messages["REQUEST-1"]!.ingested_at = iso(T0);
+  rec.messages["REQUEST-1"]!.corroboration = { state: "not_found", at: iso(T0), inject_id: null, checks: 1 };
+  return rec;
+}
+
+test("CL-05 round 2: a request the pump found corroborated stays presented after the 48 h stall, every 2 h, until the record shows the controller acted", () => {
+  const rec = unverifiedInbox();
+  rec.notices.corroborated = { shas: [OTHER_SHA], at: iso(T0 + MIN) };
+  countNotice(rec, "corroborated", iso(T0 + MIN), T0 + 46 * HOUR + MIN); // presented on its 2 h cadence, not picked up
+  assert.equal(decide(rec, facts(T0 + 48 * HOUR)).kind, "stall", "the 48 h limit still holds");
+  rec.state = "stalled";
+  rec.state_at = iso(T0 + 48 * HOUR);
+  assert.equal(decide(rec, facts(T0 + 48 * HOUR)).kind, "none", "the stall does not replace the presentation with a STALLED series");
+  assert.deepEqual(noticeTimes(rec, T0 + 48 * HOUR, T0 + 54 * HOUR, MIN), [1, 121, 241], "CORROBORATED keeps its 2 h cadence on the stalled record");
+  assert.equal((rec.notices.series as { kind?: string }).kind, "corroborated");
+  const inactive = JSON.parse(JSON.stringify(rec)) as LinkRecord;
+  assert.deepEqual(noticeTimes(inactive, T0 + 55 * HOUR, T0 + 80 * HOUR, 10 * MIN, false), [0, 1020],
+    "with the peer unconfigured ingest cannot pick it up: the stall is noticed instead (then daily)");
+  assert.equal((inactive.notices.series as { kind?: string }).kind, "stalled");
+  // The controller acted: its own ingest promoted the request (stalled is a placeholder state, cli.ts:651).
+  const picked = JSON.parse(JSON.stringify(rec)) as LinkRecord;
+  picked.state = "received";
+  picked.messages["REQUEST-1"]!.corroboration = { state: "corroborated", at: iso(T0 + 55 * HOUR), inject_id: null, checks: 2 };
+  for (let t = T0 + 55 * HOUR; t < T0 + 80 * HOUR; t += 10 * MIN) {
+    const s = decide(picked, facts(t));
+    assert.ok(!(s.kind === "remind" && s.notice === "corroborated"), "acted: no more presentation");
+  }
+  // Or it closed the record.
+  const closed = JSON.parse(JSON.stringify(rec)) as LinkRecord;
+  closed.state = "closed";
+  assert.equal(decide(closed, facts(T0 + 56 * HOUR)).kind, "none", "closed: nothing awaits the controller");
+});
+
+test("CL-05 round 2: a REPLY copy the pump found corroborated is presented past the 48 h re-check window, never downgraded to REPLY_UNVERIFIED", () => {
+  const out = sender([attempt(1, T0 - DAY, "handed_over")], "accepted");
+  out.acks_in["REQUEST-1"] = { last_seq: 1, state: "accepted", at: iso(T0 - DAY) };
+  replyCopy(out, "REPLY-1", OTHER_SHA, T0);
+  out.notices.corroborated = { shas: [OTHER_SHA], at: iso(T0 + MIN) };
+  countNotice(out, "corroborated", iso(T0 + MIN), T0 + MIN);
+  const kinds: string[] = [];
+  for (let t = T0 + 47 * HOUR; t <= T0 + 4 * DAY; t += 10 * MIN) {
+    const s = decide(out, facts(t));
+    assert.ok(s.kind === "remind" || s.kind === "none", `nothing but notices (${s.kind})`);
+    if (s.kind === "remind") {
+      kinds.push(s.notice);
+      countNotice(out, s.notice, s.anchor, t);
+    }
+  }
+  assert.ok(kinds.length >= 12, `repeats (${kinds.length})`);
+  assert.deepEqual([...new Set(kinds)], ["corroborated"], "the awaiting fact has no time limit");
+  out.unverified_copies = [];
+  out.messages["REPLY-1"] = { sha256: OTHER_SHA, body_sha256: "e".repeat(64), raw: `raw/${OTHER_SHA}.env`, outcome: "done",
+    final: "yes", ingested_at: iso(T0 + 4 * DAY) };
+  out.state = "replied";
+  assert.equal(decide(out, facts(T0 + 4 * DAY + HOUR)).kind, "none", "its own ingest stored it: the presentation ends");
+});
+
+test("CL-05 round 2: a REPLY copy first stored on a terminal or stalled sender record is re-checked and presented; not on `closed`", () => {
+  const done = sender([attempt(1, T0 - DAY, "handed_over")], "replied");
+  replyCopy(done, "REPLY-2", OTHER_SHA, T0);
+  assert.deepEqual(decide(done, facts(T0 + MIN)), { kind: "verify", shas: [OTHER_SHA] });
+  assert.deepEqual(decide(done, facts(T0 + 48 * HOUR - 1)), { kind: "verify", shas: [OTHER_SHA] });
+  assert.equal(decide(done, facts(T0 + 48 * HOUR)).kind, "none", "48 h of re-checks, as for any copy (§9.3)");
+  done.notices.corroborated = { shas: [OTHER_SHA], at: iso(T0 + 2 * MIN) };
+  assert.deepEqual(decide(done, facts(T0 + 2 * MIN)), { kind: "remind", notice: "corroborated", anchor: iso(T0 + 2 * MIN) });
+  const closed = sender([attempt(1, T0 - DAY, "handed_over")], "closed");
+  replyCopy(closed, "REPLY-2", OTHER_SHA, T0);
+  assert.equal(decide(closed, facts(T0 + MIN)).kind, "none");
+  closed.notices.corroborated = { shas: [OTHER_SHA], at: iso(T0 + 2 * MIN) };
+  assert.equal(decide(closed, facts(T0 + 2 * MIN)).kind, "none", "closed by the controller: nothing awaits it");
+  const stalled = sender([attempt(1, T0 - 3 * DAY, "unknown")], "stalled");
+  countNotice(stalled, "stalled", iso(T0), T0);
+  replyCopy(stalled, "REPLY-1", OTHER_SHA, T0);
+  assert.deepEqual(decide(stalled, facts(T0 + MIN)), { kind: "verify", shas: [OTHER_SHA] });
+});
+
+test("CL-12 round 2: a terminal record expires with the store's retention selector (later of state_at and ingested_at), so a late CONFLICT is noticed", () => {
+  const done = sender([attempt(1, T0 - 40 * DAY, "handed_over")], "replied");
+  done.state_at = iso(T0 - 29 * DAY);
+  done.messages["REPLY-2"] = { sha256: OTHER_SHA, body_sha256: "e".repeat(64), raw: `raw/${OTHER_SHA}.env`, outcome: "done",
+    final: "no", ingested_at: iso(T0 - HOUR) };
+  done.history.push({ at: iso(T0 + DAY + HOUR), event: "conflict", detail: `REPLY-2 sha256=${"f".repeat(64)}` });
+  assert.equal(retentionStartMs(done), T0 - HOUR);
+  assert.deepEqual(decide(done, facts(T0 + DAY + HOUR)), { kind: "remind", notice: "conflict", anchor: iso(T0 + DAY + HOUR) },
+    "30 days after state_at, but the record is still retained: its conflict is noticed");
+  assert.notEqual(decide(done, facts(T0 - HOUR + 30 * DAY - 1)).kind, "expire");
+  assert.equal(decide(done, facts(T0 - HOUR + 30 * DAY)).kind, "expire");
+});
+
+test("CL-12 round 2: on a stalled record a CONFLICT newer than the stall gets its own notice series; an older one does not displace the stall", () => {
+  const st = sender([attempt(1, T0 - 3 * DAY, "unknown")], "stalled");
+  countNotice(st, "stalled", iso(T0), T0);
+  st.history.push({ at: iso(T0 + HOUR), event: "conflict", detail: `REQUEST-1 sha256=${"f".repeat(64)}` });
+  assert.deepEqual(decide(st, facts(T0 + HOUR)), { kind: "remind", notice: "conflict", anchor: iso(T0 + HOUR) });
+  countNotice(st, "conflict", iso(T0 + HOUR), T0 + HOUR);
+  assert.equal(noticeTimes(st, T0 + HOUR + MIN, T0 + 3 * DAY, 10 * MIN).length, 2, "then daily");
+  const old = sender([attempt(1, T0 - 3 * DAY, "unknown")], "stalled");
+  old.history.push({ at: iso(T0 - HOUR), event: "conflict", detail: `REQUEST-1 sha256=${"f".repeat(64)}` });
+  assert.deepEqual(decide(old, facts(T0)), { kind: "remind", notice: "stalled", anchor: iso(T0) });
+});
+
+test("P2 on the round-2 paths: re-checks and notices on stalled, terminal and awaiting records never send and never re-check unknown bytes", () => {
+  const COPY_SHA = "9".repeat(64);
+  let verifies = 0;
+  let awaitingReminds = 0;
+  for (const role of ["sender", "receiver"] as const) {
+    for (const state of role === "sender" ? SENDER_STATES : RECEIVER_STATES) {
+      for (const copy of ["none", "fresh", "old"] as const) {
+        for (const marked of [false, true]) {
+          for (const conflict of ["none", "before", "after"] as const) {
+            for (const t of [T0 + MIN, T0 + HOUR, T0 + 47 * HOUR, T0 + 49 * HOUR, T0 + 20 * DAY, T0 + 40 * DAY]) {
+              const rec = role === "sender" ? sender([attempt(1, T0 - HOUR, "handed_over")], state)
+                : receiver([attempt(1, T0 - HOUR, "handed_over")], state);
+              if (role === "receiver" && state === "unverified") {
+                rec.messages["REQUEST-1"]!.corroboration = { state: "not_found", at: iso(T0), inject_id: null, checks: 1 };
+                rec.messages["REQUEST-1"]!.ingested_at = iso(T0);
+              }
+              if (copy !== "none") replyCopy(rec, role === "sender" ? "REPLY-2" : "REQUEST-1", COPY_SHA, copy === "fresh" ? T0 : T0 - 3 * DAY);
+              if (marked) rec.notices.corroborated = { shas: [COPY_SHA], at: iso(T0) };
+              if (conflict !== "none") {
+                rec.history.push({ at: iso(conflict === "before" ? T0 - HOUR : T0 + HOUR), event: "conflict", detail: "REQUEST-1 sha256=x" });
+              }
+              const s = decide(rec, facts(t));
+              const where = `${role} ${state} copy=${copy} marked=${marked} conflict=${conflict} t=${(t - T0) / MIN}`;
+              assert.notEqual(s.kind, "resend", `no trigger, no re-send: ${where}`);
+              if (state === "stalled" || ["refused", "replied", "closed"].includes(state)) {
+                assert.ok(s.kind !== "probe" && s.kind !== "stall", `nothing scheduled to send: ${where}`);
+              }
+              if (s.kind === "verify") {
+                verifies += 1;
+                const known = new Set([...Object.values(rec.messages).map((m) => m.sha256), ...(rec.unverified_copies ?? []).map((c) => c.sha256)]);
+                assert.ok(s.shas.every((x) => known.has(x)), `only stored bytes are re-checked: ${where}`);
+                assert.ok(!(marked && s.shas.includes(COPY_SHA)), `a corroborated copy is not re-checked again: ${where}`);
+                assert.notEqual(state, "closed", where);
+              }
+              if (s.kind === "remind" && s.notice === "corroborated") {
+                awaitingReminds += 1;
+                assert.ok(marked && state !== "closed", where);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  assert.ok(verifies > 20, `exercised re-checks (${verifies})`);
+  assert.ok(awaitingReminds > 20, `exercised the awaiting presentation (${awaitingReminds})`);
 });

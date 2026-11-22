@@ -15,7 +15,8 @@
 // own task and binds on `RESULT=NEW` REQUESTs, replies, follows the pump's local notices when told
 // to, and crashes or restarts when told to. No real telepty, daemon, network or session is touched.
 // Every scenario asserts the exact number of envelopes each side handed to telepty and that no
-// REQUEST was applied twice.
+// REQUEST was applied twice. Review CL-09: the sender model marks every REPLY it is shown
+// (`RESULT=NEW` or `RESULT=AWAITING`) `handled`, as the controller instruction says; that sends nothing.
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -293,6 +294,11 @@ async function turn(sim: Sim, side: Side): Promise<boolean> {
       const m = /^RESULT=(\S+) kind=(\S+) id=(\S+) seq=(\S+) peer=(\S+) state=(\S+)/.exec(line);
       if (m === null) continue;
       side.ingests.push({ result: m[1]!, kind: m[2]!, id: m[3]!, seq: m[4]!, state: m[6]!, at: sim.now, incarnation: side.incarnation });
+      if ((m[1] === "NEW" || m[1] === "AWAITING") && m[2] === "REPLY") {
+        // CL-09: the sender records the REPLY on its own task, then marks it handled (it is not shown again).
+        const handled = await cli(sim, side, ["handled", "--request", m[3]!, "--ref", `REPLY-${m[4]!}`]);
+        assert.equal(handled.code, 0, `${side.label} handled: ${handled.err.join("\n")}`);
+      }
       if (m[1] !== "NEW" || m[2] !== "REQUEST") continue;
       if (side.policy.crashAfterNextNewRequest) {
         side.policy.crashAfterNextNewRequest = false;
@@ -613,7 +619,7 @@ test("L2 a refusal run longer than 68 min continues every 60 min after the +30 s
 // =============================================================================================
 // L3 — TEST-PLAN §3 L3, incident 2 (1294)
 
-test("L3 (incident 2) receiver crashes after ingest, before bind: the boot line and the +10 min notice name bind; the flow completes", async (t) => {
+test("L3 (incident 2) receiver crashes after ingest, before bind: the boot line names bind, the +10 min UNBOUND notice the status command; the flow completes", async (t) => {
   const sim = makeSim(t);
   sim.linux.policy.crashAfterNextNewRequest = true;
   sim.linux.policy.followNotices = true;
@@ -644,7 +650,8 @@ test("L3 (incident 2) receiver crashes after ingest, before bind: the boot line 
   const notice = sim.linux.ep.notices[0]!;
   assert.equal(notice.at, t0 + 10 * MIN, "the unbound notice came at +10 min");
   assert.ok(notice.text.startsWith(`${NOTICE_MARKER} UNBOUND request_id=${d.id} `), notice.text);
-  assert.ok(notice.text.includes(`bind --request ${d.id}`), notice.text);
+  // CL-10 (coder B round-2 notice text): the notice names only the fixed status command; the record names bind.
+  assert.ok(notice.text.endsWith(`\nnext: bin/controller-link.sh status --request ${d.id}`), notice.text);
   assert.deepEqual(sim.linux.registered.map((r) => r.requestId), [d.id], "bound after the notice, with no human input");
   assert.equal((await record(sim.mac, d.id, "sender")).state, "accepted");
 
@@ -892,7 +899,7 @@ test("L5 receiver crashes inside ingest after the commit and before its ACK: the
   inb = await record(sim.linux, d.id, "receiver");
   await runUntil(sim, Date.parse(inb.state_at) + 10 * MIN);
   assert.equal(sim.linux.ep.notices.length, 1);
-  assert.ok(sim.linux.ep.notices[0]!.text.includes(`bind --request ${d.id}`));
+  assert.ok(sim.linux.ep.notices[0]!.text.endsWith(`\nnext: bin/controller-link.sh status --request ${d.id}`), sim.linux.ep.notices[0]!.text);
   assert.equal((await record(sim.mac, d.id, "sender")).state, "accepted");
 
   assert.equal(await replyTo(sim, sim.linux, d.id), 0);
@@ -956,7 +963,7 @@ test("L6 a restart of either controller resumes from the records with no human i
   assert.equal(sim.linux.ep.notices.length, 1);
   assert.equal(sim.linux.ep.notices[0]!.at, bindAt + DAY);
   assert.ok(sim.linux.ep.notices[0]!.text.startsWith(`${NOTICE_MARKER} NO_FINAL request_id=${d.id} `));
-  assert.ok(sim.linux.ep.notices[0]!.text.includes(`reply --request ${d.id}`));
+  assert.ok(sim.linux.ep.notices[0]!.text.endsWith(`\nnext: bin/controller-link.sh status --request ${d.id}`), sim.linux.ep.notices[0]!.text);
   out = await record(sim.mac, d.id, "sender");
   assert.equal(out.state, "replied");
   await assertCorrelated(sim.mac, sim.linux, d.id, "linux-r1");

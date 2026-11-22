@@ -7,11 +7,14 @@
 // step and perform it — recover a crashed `pending` attempt as `unknown`, mark `stalled`, send a PROBE,
 // re-send the SAME raw bytes (only on the triggers decide() allows), re-check corroboration (U6
 // `corroborate`, read only: the pump never applies a message; CL-05), or post a local notice — within the
-// per-pass budget (≤ 240 s, ≤ 20 cross-machine sends, ≤ 10 notices). The pass has ONE deadline (CL-08):
-// every step, every audit query and retention check it before they start, each with its own worst case
-// (a send its 120 s timeout, a notice the report pump's inject timeout, an audit query 5 pages × 30 s).
+// per-pass budget (≤ 240 s, ≤ 20 cross-machine sends, ≤ 10 notices, ≤ 256 records visited). The pass has ONE
+// deadline (CL-08): every step, every audit query and retention check it before they start, each with its own
+// worst case (a send its 120 s timeout, a notice the report pump's inject timeout, an audit query 5 pages × 30 s),
+// and every child the pass starts (the sender, the audit reader) runs with its timeout cut to the time left, so
+// the deadline kills it; a killed or unstarted child is `unknown` (a send) or `audit_unavailable`, never refused.
 // Then, if the deadline still allows, delete what the store's retention selector returns (records
-// first, then raw files), under the store lock.
+// first, then raw files), under the store lock, checking the deadline before every file. CL-18: a pass starts
+// at a rotating cursor (`pump-cursor.json` in the store root) so every record is eventually visited.
 //
 // Every send follows SPEC §6.1: under the lock the attempt is written `pending` with `owner=<pid>@<host>`
 // and committed BEFORE telepty runs (U3 sendEnvelope); the result is written afterwards. A claim (a
@@ -19,24 +22,29 @@
 // Notices go to this machine's own controller through the report pump's sender (src/report/pump.ts),
 // injected as a port, with `--from controller-link` (HOLD-1 Q1, option B). Off switch: AIGENTRY_CONTROLLER_LINK_PUMP=0 (the pass reads and sends nothing).
 // The clock, monotonic clock, process runner, pid liveness, notice sender, sleep and store root are injected.
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
+import * as path from "node:path";
 import { performance } from "node:perf_hooks";
 
 import { parseInjectId } from "../dispatch/inject-id.js";
 import { sanitizeBody } from "../report/envelope.js";
+import { atomicWrite } from "../session/persistence/atomic-write.js";
 import { INJECT_TIMEOUT_MS, defaultPidAlive, defaultTeleptyPort, submitOutcome, type TeleptyPort } from "../report/pump.js";
 import {
-  AUDIT_MAX_PAGES, AUDIT_TIMEOUT_MS, CliError, EXIT, activePeer, corroborate, loadPeerConfig, nextActionFor, sentAt,
-  type CliDeps, type PeerConfig,
+  AUDIT_MAX_PAGES, AUDIT_TIMEOUT_MS, CliError, EXIT, activePeer, corroborate, defaultAuditReader, loadPeerConfig, nextActionFor,
+  sentAt, type AuditReader, type CliDeps, type PeerConfig,
 } from "./cli.js";
 import {
-  answerResends, awaitingIngest, corroboratedMark, decide, dueOf, noticeClaimOf, noticeSeriesOf, pendingOwners, SETTLING_ACK_STATES,
+  answerResends, corroboratedMark, decide, dueOf, noticeClaimOf, noticeSeriesOf, pendingOwners, SETTLING_ACK_STATES,
   type AttemptSlot, type DecideFacts, type NoticeKind, type Step,
 } from "./decide.js";
-import { REQUEST_ID_RE, SEQ_MAX, renderEnvelope } from "./envelope.js";
-import { SEND_FROM, SEND_TIMEOUT_MS, sendEnvelope, type SendClassification, type SendResult } from "./send.js";
+import { REFUSE_REASONS, REQUEST_ID_RE, SEQ_MAX, renderEnvelope } from "./envelope.js";
+import {
+  KILL_GRACE_MS, SEND_FROM, SEND_TIMEOUT_MS, sendEnvelope, type ProcessRunner, type SendClassification, type SendResult,
+} from "./send.js";
 import {
   ControllerLinkStore, StoreError, resolveStoreRoot,
   type LinkRecord, type RecordRef, type RecordState, type SendAttempt,
@@ -59,6 +67,10 @@ export const AUDIT_CHECK_MS = AUDIT_TIMEOUT_MS * AUDIT_MAX_PAGES;
 export const NOTICE_MARKER = "⟦controller-link notice⟧";
 /** Local steps (recover, stall, verify) a record may take in one pass before its one send or notice. */
 export const RECORD_STEPS_MAX = 4;
+/** CL-18: records visited per pass (the store's open-record cap per scope, OPEN_RECORDS_MAX); the rest go next pass. */
+export const PASS_RECORDS_MAX = 256;
+/** CL-18: the rotating cursor, a fixed file name in the store root: `{"v":1,"next":"<visit key>"}`. Never a path source. */
+export const CURSOR_FILE = "pump-cursor.json";
 /** `resend --reason`: one line, at most this many characters. */
 export const RESEND_REASON_MAX = 512;
 export const PUMP_USAGE = "usage: bin/controller-link.sh pump (--once | --loop <seconds>)";
@@ -88,6 +100,11 @@ export interface PumpDeps extends CliDeps {
   sleep(ms: number): Promise<void>;
   /** Host tokens that mean "this machine" in an owner `<pid>@<host>` (dispatch writes os.hostname() raw). */
   localHosts: readonly string[];
+  /**
+   * CL-08: builds the audit reader over the pass's deadline-bounded runner (production: cli.ts
+   * defaultAuditReader), so the deadline kills an audit child too. Absent: `audit` is used as given.
+   */
+  auditWith?: (runner: ProcessRunner) => AuditReader;
   /** Tests only: stop `--loop` after this many passes. */
   maxPasses?: number;
 }
@@ -113,12 +130,16 @@ interface SendCtx {
   store: ControllerLinkStore;
   owner: string;
   facts(rec: LinkRecord, nowMs: number): DecideFacts;
+  /** The runner a send uses; the pump's is deadline-bounded (CL-08). Absent: `deps.runner`. */
+  runner?: ProcessRunner;
 }
 
 interface PumpCtx extends SendCtx {
   deps: PumpDeps;
   t0: number;
   res: PassResult;
+  runner: ProcessRunner;
+  audit: AuditReader;
 }
 
 interface PendingSend {
@@ -213,7 +234,7 @@ function countNotice(rec: LinkRecord, kind: NoticeKind, anchor: string, atIso: s
 
 async function deliver(c: SendCtx, p: PendingSend): Promise<SendClassification> {
   c.deps.fault?.("after_commit");
-  const out = await sendEnvelope(p.target, p.text, { runner: c.deps.runner, bin: c.deps.teleptyBin, baseEnv: c.deps.env });
+  const out = await sendEnvelope(p.target, p.text, { runner: c.runner ?? c.deps.runner, bin: c.deps.teleptyBin, baseEnv: c.deps.env });
   const cls: SendClassification = out.attempted
     ? out.classification
     : { result: "refused_definite", submit: null, inject_id: null, detail: `not_attempted:${out.code}` };
@@ -356,9 +377,9 @@ async function doResend(c: PumpCtx, rec: LinkRecord, step: Extract<Step, { kind:
 /**
  * §9.3: re-run §8.1 step 3 (U6 `corroborate`, read only) for each stored copy. CL-05: the pump applies
  * nothing — no state change, no ACK, no consumed presentation; a corroborated sha256 is recorded in
- * `notices.corroborated` and the `corroborated` notice tells the controller to feed the stored copy to its
- * own ingest (RESULT=NEW with the quoted body, the ACK, the state change). CL-08: no cross-machine send
- * happens here, and each audit query starts only if its worst case fits before the pass deadline.
+ * `notices.corroborated` and the `corroborated` notice repeats until the record shows the controller acted
+ * (decide.ts awaitingIngest). CL-08: no cross-machine send happens here, each audit query starts only if its
+ * worst case fits before the pass deadline, and its child is killed by the deadline (the pass runner).
  * Returns the record when a new corroboration was recorded (its notice may follow in this pass), else null.
  */
 async function doVerify(c: PumpCtx, rec: LinkRecord, step: Extract<Step, { kind: "verify" }>): Promise<LinkRecord | null> {
@@ -371,7 +392,7 @@ async function doVerify(c: PumpCtx, rec: LinkRecord, step: Extract<Step, { kind:
     }
     if ((await c.store.readRaw(sha)) === null) continue;
     checked += 1;
-    const r = await corroborate(c.deps.audit, sha, c.cfg.self.controller_sid, c.deps.clock.nowMs());
+    const r = await corroborate(c.audit, sha, c.cfg.self.controller_sid, c.deps.clock.nowMs());
     if (r.state === "corroborated") found.push(sha);
   }
   if (checked === 0) return null;
@@ -391,32 +412,29 @@ async function doVerify(c: PumpCtx, rec: LinkRecord, step: Extract<Step, { kind:
 }
 
 /**
- * The local notice text (§9.3): names the record, its state and the exact next command. For `corroborated`
- * (CL-05) `ingestFile` is the stored raw copy the controller feeds to its own ingest.
+ * The local notice text (§9.3). CL-19 / CL-10: two lines — the marker, the kind and the record's validated
+ * identity fields (request id, role, peer label, state, task ids), a fixed description — and the one fixed next
+ * command `bin/controller-link.sh status --request <id>`. No file path, no stored free text, no command built
+ * from stored text; what to do is read from the record by `status`. `_ingestFile` is ignored (kept so existing
+ * callers compile): a notice never names the stored copy's path.
  */
-export function renderControllerNotice(rec: LinkRecord, kind: NoticeKind, n: number, ingestFile: string | null = null): string {
+export function renderControllerNotice(rec: LinkRecord, kind: NoticeKind, n: number, _ingestFile: string | null = null): string {
   const id = rec.request_id;
-  const status = `${SHIM} status --request ${id}`;
-  const lastStall = [...rec.history].reverse().find((h) => h.event === "stalled");
-  const reason = typeof rec.refuse_reason === "string" ? rec.refuse_reason : "-";
-  const text: Record<NoticeKind, [string, string]> = {
-    stalled: [`reconciliation stopped (${typeof lastStall?.detail === "string" ? lastStall.detail : "limit reached"}); nothing more is sent automatically`,
-      `${status}  # then: ${SHIM} resend --request ${id} --reason "<why>"  or  ${SHIM} close --request ${id}`],
-    conflict: ["two corroborated copies of one message have different bytes; nothing was sent; held for a human", status],
-    refused: [`the peer refused this request (reason=${reason})`, status],
-    peer_unconfigured: [`peer ${rec.peer} is not configured with link "v1"; nothing is sent for this record and its state is kept`,
-      `fix state/controller-peers.json, then ${status}`],
-    corroborated: [`a ${rec.role === "receiver" ? "REQUEST" : "REPLY"} from peer ${rec.peer} stored unverified is now corroborated by ` +
-      "this machine's telepty audit; it has not been shown or applied; run the next command and act only on its RESULT=NEW",
-    ingestFile === null ? status : `${SHIM} ingest < "${ingestFile}"`],
-    reply_unverified: ["a REPLY from the peer is still not corroborated by this machine's telepty audit after 48 h; " +
-      "it is not acted on and the record's state is kept", `${status}  # a corroborated copy is still ingested when it arrives`],
-    unbound: ["a peer request waits for bind or refuse", nextActionFor("receiver", "received", id, rec.state_at).text],
-    no_final: ["your bound task has no final REPLY yet", nextActionFor("receiver", "accepted", id, rec.state_at).text],
+  const reason = (REFUSE_REASONS as readonly unknown[]).includes(rec.refuse_reason) ? String(rec.refuse_reason) : "-";
+  const what: Record<NoticeKind, string> = {
+    stalled: "reconciliation stopped; nothing more is sent automatically; a human decides (resend or close)",
+    conflict: "two corroborated copies of one message have different bytes; nothing was sent; held for a human",
+    refused: `the peer refused this request (reason=${reason})`,
+    peer_unconfigured: 'the peer is not configured with link "v1"; nothing is sent for this record and its state is kept',
+    corroborated: `a ${rec.role === "receiver" ? "REQUEST" : "REPLY"} from the peer stored unverified is now corroborated by ` +
+      "this machine's telepty audit; it has not been shown or applied; this notice repeats until the record shows it was picked up",
+    reply_unverified: "a REPLY from the peer is still not corroborated by this machine's telepty audit after 48 h; " +
+      "it is not acted on and the record's state is kept",
+    unbound: "a peer request waits for bind or refuse",
+    no_final: "your bound task has no final REPLY yet",
   };
-  const [what, next] = text[kind];
   return `${NOTICE_MARKER} ${kind.toUpperCase()} request_id=${id} role=${rec.role} peer=${rec.peer} state=${rec.state} ` +
-    `sender_task=${rec.sender_task} receiver_task=${rec.receiver_task ?? "-"} n=${n} — ${oneLine(what)}\nnext: ${oneLine(next)}`;
+    `sender_task=${rec.sender_task} receiver_task=${rec.receiver_task ?? "-"} n=${n} — ${what[kind]}\nnext: ${SHIM} status --request ${id}`;
 }
 
 async function doRemind(c: PumpCtx, rec: LinkRecord, step: Extract<Step, { kind: "remind" }>): Promise<void> {
@@ -429,9 +447,7 @@ async function doRemind(c: PumpCtx, rec: LinkRecord, step: Extract<Step, { kind:
   c.res.notices += 1;
   const s = noticeSeriesOf(claimed.rec);
   const n = (s !== null && s.kind === step.notice && s.anchor === step.anchor ? s.n : 0) + 1;
-  const pick = step.notice === "corroborated" ? awaitingIngest(claimed.rec, Date.parse(claimed.at))[0] : undefined;
-  const r = c.deps.notice.inject(c.cfg.self.controller_sid,
-    renderControllerNotice(claimed.rec, step.notice, n, pick === undefined ? null : c.store.rawPath(pick)));
+  const r = c.deps.notice.inject(c.cfg.self.controller_sid, renderControllerNotice(claimed.rec, step.notice, n));
   const submit = submitOutcome(r);
   const injectId = parseInjectId(r.stdout) || null;
   const delivered = r.rc === 0;
@@ -524,20 +540,83 @@ async function unlinkIfPresent(file: string): Promise<boolean> {
   }
 }
 
-/** §4 retention: under the store lock, delete the selected records first, then the selected raw files. */
+/**
+ * §4 retention: under the store lock, delete the selected records first, then the selected raw files.
+ * CL-08: the pass deadline is checked before every file; a selected raw is deleted only after every selected
+ * record is (a record left behind may name it), and what is left stays selectable for the next pass.
+ */
 async function retention(c: PumpCtx): Promise<void> {
   if (!fs.existsSync(c.store.markerPath)) return; // no store: nothing to delete, and nothing is created
   const done = await c.store.withLock(async () => {
     const sel = await c.store.selectRetention();
     let records = 0;
     let raws = 0;
-    for (const ref of sel.records) if (await unlinkIfPresent(c.store.recordPath(ref))) records += 1;
-    for (const sha of sel.raws) if (await unlinkIfPresent(c.store.rawPath(sha))) raws += 1;
-    return { records, raws };
+    let stopped = false;
+    for (const ref of sel.records) {
+      if ((stopped = pastDeadline(c))) break;
+      if (await unlinkIfPresent(c.store.recordPath(ref))) records += 1;
+    }
+    for (const sha of stopped ? [] : sel.raws) {
+      if ((stopped = pastDeadline(c))) break;
+      if (await unlinkIfPresent(c.store.rawPath(sha))) raws += 1;
+    }
+    return { records, raws, stopped };
   });
   c.res.deleted_records = done.records;
   c.res.deleted_raws = done.raws;
   if (done.records + done.raws > 0) c.res.lines.push(`PUMP_RETENTION records=${done.records} raws=${done.raws}`);
+  if (done.stopped) {
+    if (!c.res.errors.includes("pass_deadline")) c.res.errors.push("pass_deadline");
+    c.res.lines.push("PUMP_DEADLINE retention stopped; the rest is deleted by the next pass");
+  }
+}
+
+/**
+ * CL-08: the runner every child of this pass uses (a send, an audit query). Its timeout is cut to the time
+ * left before the pass deadline minus the runner's kill grace (send.ts KILL_GRACE_MS), so the deadline kills
+ * the child; with no time left the child is not started. Either way the runner reports rc null: a send is
+ * classified `unknown` (send.ts classifySend), an audit query `audit_unavailable` — never a definite refusal.
+ */
+function passRunner(deps: PumpDeps, t0: number): ProcessRunner {
+  return {
+    run(bin, argv, opts) {
+      const left = PASS_WALL_MS - (deps.monoMs() - t0) - KILL_GRACE_MS;
+      if (!(left >= 1)) {
+        return Promise.resolve({ rc: null, stdout: "", stderr: "\n[controller-link] not started: pass deadline", truncated: false });
+      }
+      return deps.runner.run(bin, argv, { ...opts, timeoutMs: Math.min(opts.timeoutMs, left) });
+    },
+  };
+}
+
+/** CL-18: a record's place in the rotation — the store's list order (outbox, then inbox by peer label, by id). */
+const visitKey = (rec: LinkRecord): string =>
+  rec.role === "sender" ? `0\u0000\u0000${rec.request_id}` : `1\u0000${rec.peer}\u0000${rec.request_id}`;
+const byVisitKey = (a: LinkRecord, b: LinkRecord): number => {
+  const x = visitKey(a);
+  const y = visitKey(b);
+  return x < y ? -1 : x > y ? 1 : 0;
+};
+
+async function readCursor(c: PumpCtx): Promise<string | null> {
+  try {
+    const v: unknown = JSON.parse(await fsp.readFile(path.join(path.dirname(c.store.markerPath), CURSOR_FILE), "utf8"));
+    const next = v !== null && typeof v === "object" ? (v as { v?: unknown; next?: unknown }) : null;
+    return next !== null && next.v === 1 && typeof next.next === "string" && next.next.length <= 128 ? next.next : null;
+  } catch {
+    return null; // absent or unreadable: start at the first record
+  }
+}
+
+/** Best effort: a cursor that cannot be saved costs fairness for one pass, never correctness. */
+async function saveCursor(c: PumpCtx, next: string): Promise<void> {
+  if (!fs.existsSync(c.store.markerPath)) return;
+  try {
+    await atomicWrite(path.join(path.dirname(c.store.markerPath), CURSOR_FILE),
+      Buffer.from(JSON.stringify({ v: 1, next })), { sessionId: randomUUID() });
+  } catch {
+    c.res.lines.push("PUMP_CURSOR not saved; the next pass starts at the first record");
+  }
 }
 
 /** One pass over every record (SPEC §9). Throws CliError (config) / StoreError (store) for the whole pass. */
@@ -548,18 +627,36 @@ export async function pumpOnce(deps: PumpDeps): Promise<PassResult> {
   };
   const cfg = loadPeerConfig(deps.env, deps.packageRoot);
   const store = new ControllerLinkStore({ root: resolveStoreRoot(deps.env, deps.packageRoot), clock: deps.clock });
+  const t0 = deps.monoMs();
+  const runner = passRunner(deps, t0);
   const c: PumpCtx = {
-    deps, cfg, store, owner: `${deps.proc.pid}@${deps.proc.host}`, t0: deps.monoMs(), res,
+    deps, cfg, store, owner: `${deps.proc.pid}@${deps.proc.host}`, t0, res, runner,
+    audit: deps.auditWith === undefined ? deps.audit : deps.auditWith(runner),
     facts: (rec, nowMs) => ({ nowMs, peerActive: activePeer(cfg, rec.peer) !== null, goneOwners: goneOwnersOf(rec, deps) }),
   };
-  const records = await store.list();
+  const records = (await store.list()).sort(byVisitKey);
   res.records = records.length;
-  for (const rec of records) {
+  // CL-18: the pass starts at the cursor (the first record whose key is not before it) and visits at most
+  // PASS_RECORDS_MAX records in rotation. The next pass starts at the first record this one deferred, else at the
+  // first one it did not reach; a pass that visited every record without deferring one leaves the cursor as is.
+  const from = await readCursor(c);
+  const start = from === null ? 0 : Math.max(0, records.findIndex((r) => visitKey(r) >= from));
+  const order = [...records.slice(start), ...records.slice(0, start)];
+  let resume: string | null = null;
+  for (let i = 0; i < order.length; i++) {
+    const rec = order[i]!;
+    if (i >= PASS_RECORDS_MAX) {
+      resume ??= visitKey(rec);
+      res.lines.push(`PUMP_DEFERRED records=${order.length - i} reason=pass_record_limit`);
+      break;
+    }
     if (pastDeadline(c)) {
+      resume ??= visitKey(rec);
       res.errors.push("pass_deadline");
       res.lines.push("PUMP_DEADLINE remaining records are left for the next pass");
       break;
     }
+    const deferred = res.deferred;
     try {
       await processRecord(c, rec);
     } catch (e) {
@@ -567,7 +664,9 @@ export async function pumpOnce(deps: PumpDeps): Promise<PassResult> {
       res.errors.push(`${id8(rec)}:${code}`);
       res.lines.push(`PUMP_ERROR request=${rec.request_id} role=${rec.role} error=${oneLine(e instanceof Error ? e.message : String(e))}`);
     }
+    if (res.deferred > deferred) resume ??= visitKey(rec);
   }
+  if (resume !== null) await saveCursor(c, resume);
   // CL-08 / CL-18: retention re-reads the whole store, so it starts only before the pass deadline; what it
   // would delete stays selectable and is deleted by the next pass.
   if (pastDeadline(c)) {
@@ -632,6 +731,7 @@ export function defaultPumpDeps(cli: CliDeps): PumpDeps {
     monoMs: () => performance.now(),
     pidAlive: defaultPidAlive,
     notice: defaultTeleptyPort(cli.teleptyBin, SEND_FROM),
+    auditWith: (runner) => defaultAuditReader(runner, cli.teleptyBin, cli.env),
     sleep: (msv) => new Promise<void>((resolve) => { setTimeout(resolve, msv); }),
     localHosts: [...new Set([cli.proc.host, os.hostname()])],
   };

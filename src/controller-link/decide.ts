@@ -63,7 +63,7 @@ export const NOTICE_PRIORITY: readonly NoticeKind[] = [
  * a final REPLY once a day; `stalled` and CONFLICT once, then daily; sender `refused` once (§7.1);
  * an unconfigured peer once (§9.3 last bullet); an uncorroborated REPLY copy at the sender once its 48 h of
  * re-checks are over, then daily, without a state change (Root decision on HOLD-1 Q4); a stored message
- * the pump found corroborated at once, then every 2 h, until the controller's own ingest applies it (CL-05).
+ * the pump found corroborated at once, then every 2 h, until the record shows the controller acted (CL-05, awaitingIngest).
  */
 export const NOTICE_SCHEDULES: Readonly<Record<NoticeKind, { offsets: readonly number[]; everyMs: number | null }>> = {
   stalled: { offsets: [0], everyMs: DAY },
@@ -332,43 +332,62 @@ export function corroboratedMark(rec: LinkRecord): { shas: Set<string>; at: stri
 }
 
 /**
- * Stored messages the pump found corroborated that no ingest has applied yet (CL-05), in presentation
- * order: an `unverified` inbox request (and its copies), then REPLY copies, each only inside its 48 h
- * re-check window (the audit query of a later ingest covers 48 h; then the request stalls and an older REPLY
- * copy falls back to `reply_unverified`).
+ * Stored messages the pump found corroborated that await the controller's action (CL-05), in presentation
+ * order: an inbox request still uncorroborated in `unverified` or `stalled` (and its copies), then REPLY
+ * copies not stored as a message. The fact is read from the record only and has no time limit: it ends when
+ * the record shows the controller acted — its own ingest applied the copy (the request left `unverified` /
+ * `stalled` with REQUEST-1 corroborated, or the REPLY-n message is stored), or it closed the record.
+ * Non-empty: the `corroborated` notice repeats.
  */
-export function awaitingIngest(rec: LinkRecord, nowMs: number): string[] {
+export function awaitingIngest(rec: LinkRecord): string[] {
   const mark = corroboratedMark(rec);
-  if (mark === null) return [];
+  if (mark === null || rec.state === "closed") return [];
   const out: string[] = [];
-  if (rec.role === "receiver" && rec.state === "unverified") {
-    const req = rec.messages["REQUEST-1"];
-    if (nowMs - ms(req?.ingested_at ?? rec.state_at) < VERIFY_WINDOW_MS) {
-      if (req !== undefined && mark.shas.has(req.sha256)) out.push(req.sha256);
-      for (const c of rec.unverified_copies ?? []) if (mark.shas.has(c.sha256)) out.push(c.sha256);
-    }
+  const req = rec.messages["REQUEST-1"];
+  if (rec.role === "receiver" && (rec.state === "unverified" ||
+      (rec.state === "stalled" && req?.corroboration?.state !== "corroborated"))) {
+    if (req !== undefined && mark.shas.has(req.sha256)) out.push(req.sha256);
+    for (const c of rec.unverified_copies ?? []) if (mark.shas.has(c.sha256)) out.push(c.sha256);
   }
-  for (const c of unverifiedReplyCopies(rec)) {
-    if (mark.shas.has(c.sha256) && nowMs - ms(c.at) < VERIFY_WINDOW_MS) out.push(c.sha256);
-  }
+  for (const c of unverifiedReplyCopies(rec)) if (mark.shas.has(c.sha256)) out.push(c.sha256);
   return [...new Set(out)];
 }
 
+/**
+ * CL-12: the start of a terminal record's 30 days, by the retention selector's own rule (store.ts
+ * `lastChangeMs`): the later of `state_at` and every message's `ingested_at`.
+ */
+export function retentionStartMs(rec: LinkRecord): number {
+  let t = ms(rec.state_at);
+  for (const m of Object.values(rec.messages)) {
+    if (typeof m.ingested_at === "string") t = Math.max(t, Date.parse(m.ingested_at));
+  }
+  return t;
+}
+
 /** The kind of local notice this record is subject to now (highest priority), with its series anchor. */
-export function noticeKindOf(rec: LinkRecord, peerActive: boolean, nowMs: number): { kind: NoticeKind; anchor: string; anchorMs: number } | null {
+export function noticeKindOf(rec: LinkRecord, peerActive: boolean): { kind: NoticeKind; anchor: string; anchorMs: number } | null {
   const at = (kind: NoticeKind, iso: string) => ({ kind, anchor: iso, anchorMs: ms(iso) });
   const conflicts = rec.history.filter((h) => h.event === "conflict");
   const conflict = lastOf(conflicts);
+  // CL-05: a stored copy awaiting the controller keeps its notice series in every state it can be in.
+  const mark = corroboratedMark(rec);
+  const awaiting = mark !== null && awaitingIngest(rec).length > 0 ? at("corroborated", mark.at) : null;
   if (isTerminal(rec.state)) {
     // CL-12: a CONFLICT is reminded on a terminal record too (once, then daily until retention).
     if (conflict !== undefined) return at("conflict", conflict.at);
+    if (awaiting !== null) return awaiting;
     return rec.role === "sender" && rec.state === "refused" ? at("refused", rec.state_at) : null;
   }
-  if (rec.state === "stalled") return at("stalled", rec.state_at);
+  if (rec.state === "stalled") {
+    if (awaiting !== null && peerActive) return awaiting;
+    // CL-12: a CONFLICT that arrived after the stall is new information: its own series, not the stall's.
+    if (conflict !== undefined && ms(conflict.at) > ms(rec.state_at)) return at("conflict", conflict.at);
+    return at("stalled", rec.state_at);
+  }
   if (conflict !== undefined) return at("conflict", conflict.at);
   if (!peerActive) return { kind: "peer_unconfigured", anchor: rec.peer, anchorMs: NaN };
-  const mark = corroboratedMark(rec);
-  if (mark !== null && awaitingIngest(rec, nowMs).length > 0) return at("corroborated", mark.at);
+  if (awaiting !== null) return awaiting;
   const copies = unverifiedReplyCopies(rec);
   if (copies.length > 0) {
     // Due when the oldest copy's 48 h of re-checks end (anchor), then daily; the record's state is never changed.
@@ -393,7 +412,7 @@ function noticeEval(rec: LinkRecord, facts: DecideFacts): MsgEval {
     }
     return { kind: "wait", due_ms: ms(claim.at) + NOTICE_LEASE_MS, why: "notice claimed" };
   }
-  const k = noticeKindOf(rec, facts.peerActive, facts.nowMs);
+  const k = noticeKindOf(rec, facts.peerActive);
   if (k === null) return { kind: "done" };
   const s = noticeSeriesOf(rec);
   const same: NoticeSeries | null = s !== null && s.kind === k.kind && s.anchor === k.anchor ? s : null;
@@ -413,12 +432,20 @@ const minDue = (a: number | null, b: number | null): number | null => (a === nul
 /** SPEC §9: the single next step for one record. Pure. */
 export function decide(rec: LinkRecord, facts: DecideFacts): Step {
   const now = facts.nowMs;
-  // Terminal: retention after 30 days (§4); the sender's `refused` notice (once).
+  const marked = corroboratedMark(rec)?.shas ?? new Set<string>();
+  const freshReplyCopies = (): string[] => [...new Set(unverifiedReplyCopies(rec)
+    .filter((c) => now - ms(c.at) < VERIFY_WINDOW_MS && !marked.has(c.sha256)).map((c) => c.sha256))];
+  // Terminal: retention after 30 days (§4) from the retention selector's own start (CL-12); the sender's
+  // `refused` notice (once). CL-05: a REPLY copy first stored on a terminal record is re-checked like any
+  // other (§9.3), except on `closed` (the controller closed it: nothing awaits it there).
   if (isTerminal(rec.state)) {
-    if (now - ms(rec.state_at) >= RETENTION_MS) return { kind: "expire" };
+    const start = retentionStartMs(rec);
+    if (now - start >= RETENTION_MS) return { kind: "expire" };
     const n = noticeEval(rec, facts);
     if (n.kind === "act") return n.step;
-    return { kind: "none", due_ms: minDue(n.kind === "wait" ? n.due_ms : null, ms(rec.state_at) + RETENTION_MS), why: "terminal" };
+    const shas = rec.state === "closed" ? [] : freshReplyCopies();
+    if (shas.length > 0) return { kind: "verify", shas };
+    return { kind: "none", due_ms: minDue(n.kind === "wait" ? n.due_ms : null, start + RETENTION_MS), why: "terminal" };
   }
   // §9.3 last bullet: an unconfigured peer — no send, no state change; one notice.
   if (!facts.peerActive) {
@@ -435,30 +462,35 @@ export function decide(rec: LinkRecord, facts: DecideFacts): Step {
   if (rec.state === "stalled") {
     const n = noticeEval(rec, facts);
     if (n.kind === "act") return n.step;
+    // CL-05: a REPLY copy stored on a stalled sender record is re-checked too (§9.3; no send).
+    const shas = freshReplyCopies();
+    if (shas.length > 0) return { kind: "verify", shas };
     return { kind: "none", due_ms: n.kind === "wait" ? n.due_ms : null, why: "stalled: a human decides" };
   }
   // §9.3: an unverified inbox request is re-checked each pass for 48 h, then stalled. An uncorroborated REPLY
   // copy is re-checked for 48 h; after that only the daily `reply_unverified` notice (no state change, HOLD-1 Q4).
   // CL-05: the re-check only records corroboration; a corroborated copy is presented by the `corroborated`
-  // notice (before any further re-check) and applied by the controller's own ingest, never by the pump.
-  const marked = corroboratedMark(rec)?.shas ?? new Set<string>();
+  // notice (before any further re-check) and applied by the controller's own ingest, never by the pump. The
+  // 48 h stall comes first; the `corroborated` notice then continues on the stalled record (noticeKindOf).
+  const req = rec.messages["REQUEST-1"];
+  const since = ms(req?.ingested_at ?? rec.state_at);
+  if (rec.role === "receiver" && rec.state === "unverified" && !(now - since < VERIFY_WINDOW_MS)) {
+    return { kind: "stall", why: "request not corroborated within 48 h" };
+  }
   let presentWait: number | null = null;
-  if (awaitingIngest(rec, now).length > 0) {
+  if (awaitingIngest(rec).length > 0) {
     const n = noticeEval(rec, facts);
     if (n.kind === "act") return n.step;
     if (n.kind === "wait") presentWait = n.due_ms;
   }
   if (rec.role === "receiver" && rec.state === "unverified") {
-    const req = rec.messages["REQUEST-1"];
-    const since = ms(req?.ingested_at ?? rec.state_at);
-    if (!(now - since < VERIFY_WINDOW_MS)) return { kind: "stall", why: "request not corroborated within 48 h" };
     const shas = [req?.sha256, ...(rec.unverified_copies ?? []).map((c) => c.sha256)]
       .filter((x): x is string => typeof x === "string" && !marked.has(x));
     if (shas.length > 0) return { kind: "verify", shas: [...new Set(shas)] };
     return { kind: "none", due_ms: minDue(presentWait, since + VERIFY_WINDOW_MS), why: "corroborated; waiting for the controller's ingest" };
   }
-  const freshCopies = unverifiedReplyCopies(rec).filter((c) => now - ms(c.at) < VERIFY_WINDOW_MS && !marked.has(c.sha256));
-  if (freshCopies.length > 0) return { kind: "verify", shas: [...new Set(freshCopies.map((c) => c.sha256))] };
+  const freshCopies = freshReplyCopies();
+  if (freshCopies.length > 0) return { kind: "verify", shas: freshCopies };
   // §9.2 for every obligation message, in order.
   let due: number | null = null;
   const whys: string[] = [];
