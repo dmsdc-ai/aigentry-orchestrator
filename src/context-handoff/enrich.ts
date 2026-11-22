@@ -2,6 +2,7 @@
 // unreadable or malformed source is `null` and simply drops its line. None is a prerequisite.
 import { execFileSync } from "node:child_process";
 import * as path from "node:path";
+import { ControllerLinkStore, resolveStoreRoot } from "../controller-link/store.js";
 import { listCaptureInventory } from "../request-capture/inventory.js";
 import { redact } from "./redact.js";
 import { isObject, lstatOrNull, readBounded, regularFile, str, type Env } from "./types.js";
@@ -30,6 +31,20 @@ export interface Enrichment {
   readonly capture: { readonly count: number; readonly truncated: boolean; readonly newest: string | null } | null;
   readonly snapshotMtime: string | null;
   readonly git: { readonly branch: string; readonly changed: number } | null;
+  /** Open controller-link records (task 1294, SPEC §9.4); absent or null drops the lines. */
+  readonly controllerLink?: readonly ControllerLinkEntry[] | null;
+}
+
+/** One open controller-link record as the boot line shows it (SPEC §9.4). */
+export interface ControllerLinkEntry {
+  readonly role: string;
+  readonly id8: string;
+  readonly peer: string;
+  readonly state: string;
+  readonly next: string;
+  readonly due: string | null;
+  readonly senderTask: string;
+  readonly receiverTask: string | null;
 }
 
 function cutBytes(s: string, max: number): string {
@@ -159,6 +174,44 @@ export async function readCapture(workspace: string): Promise<{ count: number; t
     if (inv.items.length === 0 && !inv.complete) return null;
     const truncated = inv.anomalies.some((a) => a.code === "scan_limit");
     return { count: inv.items.length, truncated, newest: truncated ? null : inv.items[inv.items.length - 1]?.received_at ?? null };
+  } catch {
+    return null;
+  }
+}
+
+const LINK_MAX = 10;
+
+/** Epoch ms of a due date; a null or unparseable one sorts last. */
+function dueMs(due: string | null): number {
+  const t = due === null ? NaN : Date.parse(due);
+  return Number.isFinite(t) ? t : -Infinity;
+}
+
+/**
+ * Open controller-link records (task 1294, SPEC §9.4), through the store's read-only listing:
+ * non-terminal only, newest `next_action.due_at` first (null last, ties in the store's list
+ * order), at most 10. Nothing is written, locked or sent. A missing store is `[]`; any store
+ * error is `null`. Async like readCapture: the boot and the script entry await it and pass the
+ * result in (resolveHandoff stays synchronous).
+ */
+export async function readControllerLink(workspace: string, env: Env): Promise<ControllerLinkEntry[] | null> {
+  try {
+    const store = new ControllerLinkStore({ root: resolveStoreRoot(env, workspace), clock: { nowMs: () => Date.now() } });
+    const open = await store.status({ open: true });
+    return open
+      .map((s, i) => ({ s, i, due: dueMs(s.due_at) }))
+      .sort((a, b) => b.due - a.due || a.i - b.i)
+      .slice(0, LINK_MAX)
+      .map(({ s }) => ({
+        role: s.role,
+        id8: s.id8,
+        peer: s.peer,
+        state: s.state,
+        next: oneLine(redact(s.next)).slice(0, 40),
+        due: s.due_at === null ? null : oneLine(redact(s.due_at)).slice(0, 40),
+        senderTask: s.sender_task,
+        receiverTask: s.receiver_task,
+      }));
   } catch {
     return null;
   }

@@ -110,6 +110,9 @@ function enrichmentLines(e: Enrichment): string[] {
     const note = t.note === null ? "" : ` — latest note${t.noteDate === null ? "" : ` ${t.noteDate}`}: ${t.note}`;
     out.push(line(`- open task ${t.id} ${t.status} ${t.priority} ${t.desc}${note}`));
   }
+  for (const c of e.controllerLink ?? []) {
+    out.push(line(`- controller-link ${c.role} ${c.id8} peer=${c.peer} state=${c.state} next=${c.next} due=${c.due ?? "-"} sender_task=${c.senderTask} receiver_task=${c.receiverTask ?? "-"}`));
+  }
   if (e.dispatches !== null && e.dispatches.length > 0) {
     out.push(line(`- live dispatches: ${e.dispatches.map((d) => `${d.sid} (${d.lifecycle})`).join(", ")}`));
   }

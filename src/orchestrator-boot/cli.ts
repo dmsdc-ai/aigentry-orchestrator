@@ -826,7 +826,25 @@ function handoffStep(engine: HandoffEngine | null, plan: BootPlan, bootId: strin
 
 async function runHandoffStep(plan: BootPlan, bootId: string, write: boolean): Promise<HandoffStep> {
   const engine = handoffEnabled() && plan.history.kind === "new" ? await loadHandoffEngine() : null;
-  return handoffStep(engine, plan, bootId, write);
+  if (engine === null) return handoffStep(engine, plan, bootId, write);
+  // Task 1294 (SPEC §9.4): the open controller-link records, read-only, at most 500 ms of the
+  // handoff budget. A failure or timeout is null (no line). The engine's deadline is moved
+  // earlier by the time spent here, so the step takes no longer than HANDOFF_BUDGET_MS.
+  const readerStarted = Date.now();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const controllerLink = await Promise.race([
+    Promise.resolve().then(() => engine.readControllerLink(process.cwd(), env)).catch(() => null),
+    new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), Math.min(500, HANDOFF_BUDGET_MS));
+      timer.unref();
+    }),
+  ]).finally(() => clearTimeout(timer));
+  const spent = Date.now() - readerStarted;
+  const bounded: HandoffEngine = {
+    ...engine,
+    resolveHandoff: (o) => engine.resolveHandoff({ ...o, deadlineMs: o.deadlineMs - spent, controllerLink }),
+  };
+  return handoffStep(bounded, plan, bootId, write);
 }
 
 function previewOf(step: HandoffStep): HandoffPreview {
