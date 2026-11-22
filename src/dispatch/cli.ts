@@ -2319,6 +2319,208 @@ async function main(argv: string[]): Promise<never> {
   verifyWorkerInputs(o);
   taskGateCheck(o);
 
+  // controller-link v1 (task 1291, SPEC §10): a target with `@` names a peer CONTROLLER, never a
+  // worker. Everything for it is inside this guard and every path in it exits. The controller-link
+  // modules are loaded here by dynamic import, so a dispatch without `@` loads, reads, writes and
+  // prints nothing it did not before. This branch creates no registry record, stages nothing and
+  // never spawns, probes or cleans up anything on either machine: one telepty inject, recorded in
+  // the controller-link outbox before it is sent.
+  if (o.target.includes("@")) {
+    const { LABEL_RE, REQUEST_ID_RE, TASK_ID_RE, normaliseBody, renderEnvelope } = await import("../controller-link/envelope.js");
+    const { defaultProcessRunner, sendEnvelope, validPeerTarget } = await import("../controller-link/send.js");
+    const { ControllerLinkStore, rawRef, resolveStoreRoot } = await import("../controller-link/store.js");
+    type LinkRecordT = import("../controller-link/store.js").LinkRecord;
+    type SendClassificationT = import("../controller-link/send.js").SendClassification;
+    const packageRoot = path.resolve(SCRIPT_DIR, "..");
+    const target = o.target;
+
+    // SPEC §2 strict reader of the hand-written peer list. Any defect refuses the whole file.
+    type PeerEntry = { label: string; target: string; link: string | null };
+    const readPeers = (): { self: { label: string; controller_sid: string }; peers: PeerEntry[] } => {
+      const override = env.AIGENTRY_CONTROLLER_PEERS;
+      let file = path.join(packageRoot, "state", "controller-peers.json");
+      if (override !== undefined && override !== "") {
+        if (override.includes("\0") || override.split(/[/\\]/).includes("..") || !path.isAbsolute(override)) {
+          throw new Error("AIGENTRY_CONTROLLER_PEERS must be an absolute path without '..' segments");
+        }
+        file = path.resolve(override);
+      }
+      let st: fs.Stats;
+      try { st = fs.statSync(file); } catch { throw new Error("peer list missing or unreadable"); }
+      if (!st.isFile() || st.size > 65536) throw new Error("peer list is not a regular file of at most 65536 bytes");
+      let doc: unknown;
+      try {
+        doc = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(fs.readFileSync(file)));
+      } catch {
+        throw new Error("peer list is not valid UTF-8 JSON");
+      }
+      const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
+      const only = (v: Record<string, unknown>, allowed: readonly string[], where: string): void => {
+        for (const k of Object.keys(v)) if (!allowed.includes(k)) throw new Error(`unknown key in ${where}`);
+      };
+      if (!isObj(doc)) throw new Error("peer list is not a JSON object");
+      only(doc, ["v", "self", "peers"], "the top level");
+      if (doc.v !== 1) throw new Error("v must be 1");
+      const self = doc.self;
+      if (!isObj(self)) throw new Error("self missing or not an object");
+      only(self, ["label", "controller_sid"], "self");
+      const selfLabel = self.label, selfSid = self.controller_sid;
+      if (typeof selfLabel !== "string" || !LABEL_RE.test(selfLabel)) throw new Error("self.label fails its pattern");
+      if (typeof selfSid !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(selfSid)) {
+        throw new Error("self.controller_sid fails its pattern");
+      }
+      if (!isObj(doc.peers)) throw new Error("peers missing or not an object");
+      const peers: PeerEntry[] = [];
+      for (const [label, p] of Object.entries(doc.peers)) {
+        if (!LABEL_RE.test(label)) throw new Error("a peer label fails its pattern");
+        if (!isObj(p)) throw new Error(`peer ${label} is not an object`);
+        only(p, ["target", "link"], `peer ${label}`);
+        const peerTarget = p.target, link = p.link;
+        if (typeof peerTarget !== "string" || !validPeerTarget(peerTarget)) throw new Error(`peer ${label} target is not <controller_sid>@<peer>`);
+        if (link !== undefined && typeof link !== "string") throw new Error(`peer ${label} link is not a string`);
+        if (peers.some((q) => q.target === peerTarget)) throw new Error(`peer ${label} repeats another peer's target`);
+        peers.push({ label, target: peerTarget, link: typeof link === "string" ? link : null });
+      }
+      return { self: { label: selfLabel, controller_sid: selfSid }, peers };
+    };
+    let config: ReturnType<typeof readPeers>;
+    try { config = readPeers(); } catch (e) {
+      die(`dispatch.sh: PEER_CONFIG_INVALID: ${printable(String((e as Error)?.message ?? e))}; nothing sent`, 78);
+    }
+    const peer = config.peers.find((p) => p.target === target && p.link === "v1");
+    if (peer === undefined) {
+      die(`dispatch.sh: PEER_TARGET_REFUSED: ${printable(target)} is not a listed peer controller with link "v1"; nothing sent`, 78);
+    }
+
+    // Flags that only make sense for a local worker (SPEC §10). argv is walked as parseArgs did.
+    const VALUE_FLAGS = new Set(["--target", "--ref", "--from", "--timeout-ms", "--track", "--name", "--cwd", "--worktree", "--cli",
+      "--role", "--task-class", "--task", "--no-task", "--input-root", "--input-manifest", "--input-sha256", "--observe", "--retry-unknown"]);
+    const LOCAL_ONLY = new Set(["--spawn-and-dispatch", "--retry-unknown", "--worktree", "--verify-delivered", "--keep-alive", "--cli",
+      "--role", "--task-class", "--observe", "--input-root", "--input-manifest", "--input-sha256", "--from"]);
+    const unsupported: string[] = [];
+    for (let i = 0; i < argv.length; i += VALUE_FLAGS.has(argv[i]!) ? 2 : 1) {
+      if (LOCAL_ONLY.has(argv[i]!) && !unsupported.includes(argv[i]!)) unsupported.push(argv[i]!);
+    }
+    if (unsupported.length > 0) {
+      die(`dispatch.sh: PEER_FLAG_UNSUPPORTED: ${unsupported.join(", ")} not supported for a peer controller target; nothing sent`, 4);
+    }
+    if (o.taskId && !TASK_ID_RE.test(o.taskId)) {
+      die("dispatch.sh: PEER_FLAG_UNSUPPORTED: --task id not representable in the envelope; nothing sent", 4);
+    }
+
+    // The ref is read locally and becomes the envelope body (SPEC §3.3).
+    if (fs.statSync(o.refFile).size > 262144) {
+      die("dispatch.sh: PEER_BODY_TOO_LARGE: ref file larger than 262144 bytes; nothing sent", 4);
+    }
+    let refBytes: Buffer;
+    try { refBytes = fs.readFileSync(o.refFile); } catch {
+      die("dispatch.sh: PEER_BODY_INVALID: ref file unreadable; nothing sent", 4);
+    }
+    const body = normaliseBody(refBytes);
+    if (!body.ok) {
+      const at = body.error.line === null ? "" : ` (line ${body.error.line})`;
+      die(`dispatch.sh: ${body.error.code}: ${printable(body.error.detail)}${at}; nothing sent`, 4);
+    }
+    if (body.body.includes("{{ORCHESTRATOR_REPORT_TARGET}}")) {
+      die("dispatch.sh: PEER_REF_PLACEHOLDER: the ref contains {{ORCHESTRATOR_REPORT_TARGET}}, which names this machine's report target for local workers; nothing sent", 4);
+    }
+
+    const { randomUUID } = await import("node:crypto");
+    const requestId = randomUUID();
+    if (!REQUEST_ID_RE.test(requestId)) die("dispatch.sh: PEER_NOT_RECORDED: minted request id fails its pattern; nothing sent", 9);
+    const senderTask = o.taskId || "-";
+    const rendered = renderEnvelope({ kind: "REQUEST", id: requestId, seq: 1, ref: null, from: config.self.label, to: peer.label,
+      sent_at: isoSeconds(utcNow()), sender_task: o.taskId || null, receiver_task: null, state: null, outcome: null, final: null,
+      reason: null }, body.body);
+    if (!rendered.ok) die(`dispatch.sh: ${rendered.error.code}: ${printable(rendered.error.detail)}; nothing sent`, 4);
+    const envelope = rendered.envelope;
+
+    // SPEC §6.1 step 1 + §10 de-duplication, in ONE store transaction: an open outbox record with the
+    // same peer, sender task and body sha256 wins; otherwise the record is written (state `prepared`,
+    // attempt `pending`) BEFORE anything is sent.
+    const owner = `${process.pid}@${os.hostname()}`;
+    const ref = { role: "sender" as const, requestId };
+    const storeFailure = (e: unknown): string => printable(String((e as Error)?.message ?? e));
+    const openStore = (): InstanceType<typeof ControllerLinkStore> => {
+      try {
+        return new ControllerLinkStore({ root: resolveStoreRoot(env, packageRoot), clock: { nowMs: () => Date.now() } });
+      } catch (e) {
+        return die(`dispatch.sh: PEER_NOT_RECORDED: ${storeFailure(e)}; nothing sent`, 9);
+      }
+    };
+    const store = openStore();
+    let duplicateOf: string | null;
+    try {
+      duplicateOf = await store.mutate<string | null>(ref, async (current, ctx) => {
+        if (current !== null) throw new Error("request id already recorded");
+        const open = await store.list({ role: "sender", peer: peer.label, open: true });
+        const dup = open.find((r) => r.sender_task === senderTask && r.messages["REQUEST-1"]?.body_sha256 === envelope.body_sha256);
+        if (dup !== undefined) return { write: null, value: dup.request_id };
+        const record: LinkRecordT = {
+          v: 1, role: "sender", request_id: requestId, peer: peer.label, peer_target: target, self_label: config.self.label,
+          sender_task: senderTask, receiver_task: null, state: "prepared", state_at: ctx.nowIso,
+          next_action: { code: "SEND", due_at: null, text: "dispatch is sending REQUEST-1" },
+          messages: { "REQUEST-1": { sha256: envelope.sha256, body_sha256: envelope.body_sha256, raw: rawRef(envelope.sha256),
+            sends: [{ n: 1, at: ctx.nowIso, owner, result: "pending" }] } },
+          acks_in: {}, probes_out: { "REQUEST-1": { last_seq: 0, sends: [] } }, acks_out: { last_seq: 0, sends: [] },
+          notices: { n: 0, last_at: null },
+          history: [{ at: ctx.nowIso, event: "created", detail: "dispatch" }], history_dropped: 0,
+        };
+        return { write: record, raws: [{ sha256: envelope.sha256, bytes: Buffer.from(envelope.text, "utf8") }], value: null };
+      });
+    } catch (e) {
+      die(`dispatch.sh: PEER_NOT_RECORDED: ${storeFailure(e)}; nothing sent`, 9);
+    }
+    if (duplicateOf !== null) {
+      die(`dispatch.sh: PEER_REQUEST_DEDUPLICATED: open request ${duplicateOf} to ${target} has the same sender task and body; nothing sent`, 8);
+    }
+
+    // SPEC §6.1 steps 2–3 (U3), then step 4: the classified result goes into the same attempt.
+    const sent = await sendEnvelope(target, envelope.text, { runner: defaultProcessRunner, bin: TELEPTY });
+    const cls: SendClassificationT = sent.attempted ? sent.classification
+      : { result: "unknown", submit: null, inject_id: null, detail: `not_started_${sent.code}` };
+    const outcome = {
+      handed_over: { state: "sent", code: "WAIT_ACK", min: cls.submit === "queued" ? 30 : 5, text: "wait for the peer's ACK; probe when due" },
+      unknown: { state: "send_unknown", code: "PROBE", min: 5, text: "delivery unknown; probe the peer, never re-send blindly" },
+      refused_definite: { state: "send_refused", code: "RESEND", min: 1, text: "definite refusal; re-send the same bytes on the back-off" },
+    }[cls.result];
+    let recorded = true;
+    try {
+      await store.mutate<null>(ref, (current, ctx) => {
+        if (current === null) throw new Error("record vanished");
+        const next = JSON.parse(JSON.stringify(current)) as LinkRecordT;
+        const sends = next.messages["REQUEST-1"]?.sends ?? [];
+        const attempt = sends[sends.length - 1];
+        if (attempt === undefined || attempt.result !== "pending" || attempt.owner !== owner) throw new Error("attempt changed");
+        attempt.result = cls.result;
+        attempt.submit = cls.submit;
+        attempt.inject_id = cls.inject_id;
+        attempt.detail = cls.detail;
+        next.state = outcome.state as LinkRecordT["state"];
+        next.state_at = ctx.nowIso;
+        next.next_action = { code: outcome.code, due_at: new Date(Date.parse(attempt.at) + outcome.min * 60_000).toISOString(), text: outcome.text };
+        next.history.push({ at: ctx.nowIso, event: "send", detail: `REQUEST-1 n=${attempt.n} ${cls.result}` });
+        return { write: next, value: null };
+      });
+    } catch {
+      recorded = false;
+    }
+    const why = cls.detail === null ? "" : ` (${printable(cls.detail)})`;
+    const reconcile = "the pump reconciles this automatically; do not re-run dispatch";
+    if (!recorded) {
+      die(`dispatch.sh: PEER_DELIVERY_UNKNOWN: request ${requestId} to ${target} — result not recorded (telepty ${cls.result}${why}); ${reconcile}`, 7);
+    }
+    if (cls.result === "handed_over") {
+      taskLedgerUpdate(o, target);
+      process.stdout.write(`OK peer request ${requestId} to ${target} consumption=${cls.submit ?? "unknown"}\n`);
+      process.exit(0);
+    }
+    if (cls.result === "refused_definite") {
+      die(`dispatch.sh: PEER_NOT_DELIVERED: request ${requestId} to ${target} definitely refused${why}; ${reconcile}`, 11);
+    }
+    die(`dispatch.sh: PEER_DELIVERY_UNKNOWN: request ${requestId} to ${target}${why}; ${reconcile}`, 7);
+  }
+
   let sid: string;
   if (o.spawn) {
     if (!o.track || !o.name || !o.cwd) {

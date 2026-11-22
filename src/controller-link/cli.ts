@@ -1,0 +1,1222 @@
+// controller-link v1 CLI (SPEC §8, §9.4 status, §11; task 1291, unit U6):
+//
+//   bin/controller-link.sh ingest                                   (whole message on stdin)
+//   bin/controller-link.sh bind    --request <U> --task <local id>
+//   bin/controller-link.sh refuse  --request <U> --reason <code>
+//   bin/controller-link.sh reply   --request <U> --outcome <O> (--final | --interim) --body-file <path>
+//   bin/controller-link.sh status  [--json] [--request <U>]
+//   bin/controller-link.sh probe   --request <U>
+//   bin/controller-link.sh close   --request <U>
+//
+// A remote request never carries authority. This file has no code path that registers a task,
+// writes a task queue, dispatches or spawns a worker, or reads or changes credentials: `bind` only
+// READS the local queue (U4 task-row reader) to attach a task that already exists. The only
+// process it starts is telepty, through U3 (`inject` to the configured peer controller, and
+// `injects --json` to read this machine's own audit log). A peer's body is printed only as quoted
+// data lines.
+//
+// Every record change is committed under the store lock BEFORE anything is sent (SPEC §6.1 step 1,
+// §7.3); the send runs outside the lock and its result is written afterwards (step 4).
+//
+// Task 1291 alone (WORK-BREAKDOWN §4): there is no pump, no automatic probe or re-send and no
+// reminder here (U8). Where SPEC's exit 7 / 11 wording names the pump, this CLI says
+// "run `controller-link probe`" instead.
+import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { taskQueueStatus, type TaskQueueResult } from "../dispatch/task-queue-read.js";
+import {
+  INGEST_MAX_BYTES, LABEL_RE, REFUSE_REASONS, REPLY_MAX_SEQ, REPLY_OUTCOMES, REQUEST_ID_RE, SEQ_MAX, TASK_ID_RE,
+  normaliseBody, renderEnvelope, scanInput,
+  type AckState, type Envelope, type EnvelopeFields, type EnvelopeResult, type RefuseReason, type ReplyOutcome,
+} from "./envelope.js";
+import {
+  SEND_FROM, defaultProcessRunner, defaultTeleptyBin, sendChildEnv, sendEnvelope, validPeerTarget,
+  type ProcessRunner, type SendClassification,
+} from "./send.js";
+import {
+  ControllerLinkStore, StoreError, isTerminal, rawRef, resolveStoreRoot, statusOf,
+  type LinkRecord, type MessageEntry, type RecordRef, type RecordState, type Role, type SendAttempt, type StatusEntry,
+  type UnverifiedCopy,
+} from "./store.js";
+
+// ---------------------------------------------------------------------------------------------
+// Constants
+
+/** §8.1 step 2: a REQUEST or REPLY sent more than 25 days before now is STALE_MESSAGE. */
+export const STALE_MESSAGE_MS = 25 * 86_400 * 1000;
+/** §8.1 step 3: the audit query window, page size and page limit. */
+export const AUDIT_WINDOW_MS = 48 * 3_600 * 1000;
+export const AUDIT_PAGE_LIMIT = 200;
+export const AUDIT_MAX_PAGES = 5;
+/** One `telepty injects` call; a slower audit read is `audit_unavailable`. */
+export const AUDIT_TIMEOUT_MS = 30_000;
+/** §8.1 PROBE: at most one answer per (id, ref) per 60 s. */
+export const PROBE_ANSWER_INTERVAL_MS = 60_000;
+/** controller-peers.json is a short hand-written file; anything larger is PEER_CONFIG_INVALID. */
+export const PEER_CONFIG_MAX_BYTES = 65_536;
+/** A `--body-file` larger than this is refused before it is read (the body limit is 12288 bytes). */
+export const BODY_FILE_MAX_BYTES = INGEST_MAX_BYTES;
+const SID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+const SHIM = "bin/controller-link.sh";
+
+/** SPEC §11 exit codes used by this CLI. */
+export const EXIT = {
+  OK: 0, STATE: 3, REFUSED: 4, NOT_ACTIONABLE: 5, DELIVERY_UNKNOWN: 7, STORE: 9, NOT_DELIVERED: 11,
+} as const;
+
+export const USAGE = [
+  "usage: bin/controller-link.sh <command> [options]",
+  "",
+  "  ingest                                    read one whole message on stdin; act ONLY on RESULT=NEW",
+  "  bind    --request <U> --task <local id>   attach your own, already registered task; sends ACK accepted",
+  "  refuse  --request <U> --reason <code>     codes: " + REFUSE_REASONS.join(", "),
+  "  reply   --request <U> --outcome <" + REPLY_OUTCOMES.join("|") + "> (--final | --interim) --body-file <path>",
+  "  status  [--json] [--request <U>]          open records (or one request, any state)",
+  "  probe   --request <U>                     ask the peer for the state of your last obligation message",
+  "  close   --request <U>                     close a stalled record",
+  "",
+  "exit: 0 ok | 3 refused, nothing changed | 4 refused, nothing stored | 5 stored, not actionable",
+  "      7 delivery unknown | 9 store/config failure | 11 not delivered",
+].join("\n");
+
+// ---------------------------------------------------------------------------------------------
+// Errors
+
+export type CliErrorCode =
+  | "USAGE" | "PEER_CONFIG_INVALID" | "PEER_BODY_INVALID" | "PEER_BODY_TOO_LARGE"
+  | "TASK_UNKNOWN" | "TASK_AMBIGUOUS" | "TASK_NOT_DISPATCHABLE" | "STATE_INVALID";
+
+const CLI_EXIT: Record<CliErrorCode, number> = {
+  USAGE: EXIT.REFUSED, PEER_BODY_INVALID: EXIT.REFUSED, PEER_BODY_TOO_LARGE: EXIT.REFUSED,
+  PEER_CONFIG_INVALID: EXIT.STORE,
+  TASK_UNKNOWN: EXIT.STATE, TASK_AMBIGUOUS: EXIT.STATE, TASK_NOT_DISPATCHABLE: EXIT.STATE, STATE_INVALID: EXIT.STATE,
+};
+
+/** A refusal decided by this CLI. Thrown inside a store mutation it passes through and nothing is written. */
+export class CliError extends Error {
+  readonly code: CliErrorCode;
+  readonly exit: number;
+  constructor(code: CliErrorCode, detail: string) {
+    super(`${code}: ${detail}`);
+    this.name = "CliError";
+    this.code = code;
+    this.exit = CLI_EXIT[code];
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// §2 configuration — state/controller-peers.json (read only; never written by code)
+
+export interface PeerEntry {
+  target: string;
+  /** Only "v1" enables the peer; absent (null) or any other string disables it. */
+  link: string | null;
+}
+
+export interface PeerConfig {
+  self: { label: string; controller_sid: string };
+  peers: Record<string, PeerEntry>;
+}
+
+const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
+const onlyKeys = (o: Record<string, unknown>, allowed: readonly string[]): boolean => Object.keys(o).every((k) => allowed.includes(k));
+const badConfig = (detail: string): never => { throw new CliError("PEER_CONFIG_INVALID", detail); };
+
+/** `<package root>/state/controller-peers.json`, or AIGENTRY_CONTROLLER_PEERS (absolute, no `..` segment, no NUL). */
+export function peersConfigPath(env: Record<string, string | undefined>, packageRoot: string): string {
+  const override = env.AIGENTRY_CONTROLLER_PEERS;
+  if (override === undefined || override === "") return path.join(packageRoot, "state", "controller-peers.json");
+  if (override.includes("\0") || override.split(/[/\\]/).includes("..") || !path.isAbsolute(override)) {
+    return badConfig("AIGENTRY_CONTROLLER_PEERS must be an absolute path without '..' segments");
+  }
+  return path.resolve(override);
+}
+
+/** SPEC §2 validation. Any failure is PEER_CONFIG_INVALID. */
+export function parsePeerConfig(text: string): PeerConfig {
+  let v: unknown;
+  try {
+    v = JSON.parse(text);
+  } catch {
+    return badConfig("not JSON");
+  }
+  if (!isObj(v) || !onlyKeys(v, ["v", "self", "peers"])) return badConfig("top level must be {v, self, peers}");
+  if (v.v !== 1) return badConfig("v must be 1");
+  const self = v.self;
+  if (!isObj(self) || !onlyKeys(self, ["label", "controller_sid"])) return badConfig("self must be {label, controller_sid}");
+  if (typeof self.label !== "string" || !LABEL_RE.test(self.label)) return badConfig("self.label fails its pattern");
+  if (typeof self.controller_sid !== "string" || !SID_RE.test(self.controller_sid)) return badConfig("self.controller_sid fails its pattern");
+  if (!isObj(v.peers)) return badConfig("peers must be an object");
+  const peers: Record<string, PeerEntry> = {};
+  const targets = new Set<string>();
+  for (const [label, p] of Object.entries(v.peers)) {
+    if (!LABEL_RE.test(label)) return badConfig("a peer label fails its pattern");
+    if (!isObj(p) || !onlyKeys(p, ["target", "link"])) return badConfig(`peer ${label} must be {target, link}`);
+    if (typeof p.target !== "string" || !validPeerTarget(p.target)) return badConfig(`peer ${label} target is not <controller_sid>@<peer>`);
+    if (p.link !== undefined && typeof p.link !== "string") return badConfig(`peer ${label} link must be a string`);
+    if (targets.has(p.target)) return badConfig("duplicate target");
+    targets.add(p.target);
+    peers[label] = { target: p.target, link: typeof p.link === "string" ? p.link : null };
+  }
+  return { self: { label: self.label, controller_sid: self.controller_sid }, peers };
+}
+
+export function loadPeerConfig(env: Record<string, string | undefined>, packageRoot: string): PeerConfig {
+  const file = peersConfigPath(env, packageRoot);
+  let text: string;
+  try {
+    const st = fs.statSync(file);
+    if (!st.isFile() || st.size > PEER_CONFIG_MAX_BYTES) return badConfig("not a regular file of at most 64 KiB");
+    text = fs.readFileSync(file, "utf8");
+  } catch (e) {
+    if (e instanceof CliError) throw e;
+    return badConfig("missing or unreadable");
+  }
+  return parsePeerConfig(text);
+}
+
+/** The peer entry if `label` is configured with `link:"v1"`, else null. */
+export function activePeer(cfg: PeerConfig, label: string): PeerEntry | null {
+  const p = Object.prototype.hasOwnProperty.call(cfg.peers, label) ? cfg.peers[label] : undefined;
+  return p !== undefined && p.link === "v1" ? p : null;
+}
+
+// ---------------------------------------------------------------------------------------------
+// §8.1 step 3 — corroboration against this machine's own telepty audit log
+
+/** One row of `telepty injects --json` (T/src/audit/inject-log.js:60-69 as cited by SPEC). */
+export interface AuditRow {
+  inject_id?: unknown;
+  to?: unknown;
+  claimed_from?: unknown;
+  payload_sha256?: unknown;
+  claimed_cross_host?: unknown;
+  delivery_result?: unknown;
+  [extra: string]: unknown;
+}
+
+export interface AuditQuery {
+  to: string;
+  from: string;
+  since: string;
+  limit: number;
+  /** null for the first page. */
+  cursor: string | null;
+}
+
+export interface AuditPage {
+  rows: AuditRow[];
+  /** null = no further page. */
+  next_cursor: string | null;
+}
+
+export interface AuditReader {
+  /** One page; null when the query failed (→ audit_unavailable). */
+  page(q: AuditQuery): Promise<AuditPage | null>;
+}
+
+export type CorroborationState = "corroborated" | "not_found" | "audit_unavailable";
+
+export interface CorroborationResult {
+  state: CorroborationState;
+  inject_id: string | null;
+  /** Pages read (≤ AUDIT_MAX_PAGES). */
+  pages: number;
+}
+
+/** True iff the row shows exactly these bytes arriving cross-host from controller-link at this controller. */
+export function rowCorroborates(row: AuditRow, sha256: string, selfSid: string): boolean {
+  if (!isObj(row)) return false;
+  if (row.payload_sha256 !== sha256) return false;
+  if (row.claimed_cross_host !== true) return false;
+  if (row.delivery_result !== "success" && row.delivery_result !== "queued") return false;
+  if (row.to !== selfSid) return false;
+  if (typeof row.claimed_from === "string" && row.claimed_from !== SEND_FROM) return false;
+  return true;
+}
+
+/**
+ * Query `injects --to <self sid> --from controller-link --since <now − 48 h> --limit 200`, following
+ * the cursor for at most 5 pages. A failed page before a match is `audit_unavailable`.
+ */
+export async function corroborate(reader: AuditReader, sha256: string, selfSid: string, nowMs: number): Promise<CorroborationResult> {
+  const since = new Date(nowMs - AUDIT_WINDOW_MS).toISOString();
+  let cursor: string | null = null;
+  for (let pages = 1; pages <= AUDIT_MAX_PAGES; pages++) {
+    let page: AuditPage | null;
+    try {
+      page = await reader.page({ to: selfSid, from: SEND_FROM, since, limit: AUDIT_PAGE_LIMIT, cursor });
+    } catch {
+      page = null;
+    }
+    if (page === null || !Array.isArray(page.rows)) return { state: "audit_unavailable", inject_id: null, pages };
+    const hit = page.rows.find((r) => rowCorroborates(r, sha256, selfSid));
+    if (hit !== undefined) return { state: "corroborated", inject_id: typeof hit.inject_id === "string" ? hit.inject_id : null, pages };
+    if (typeof page.next_cursor !== "string" || page.next_cursor === "") return { state: "not_found", inject_id: null, pages };
+    cursor = page.next_cursor;
+  }
+  return { state: "not_found", inject_id: null, pages: AUDIT_MAX_PAGES };
+}
+
+/**
+ * The real reader: `telepty injects --json --to <sid> --from controller-link --since <iso> --limit 200`
+ * (the report pump's query, src/report/pump.ts:339, plus `--from`), parsed as `{"injects":[…]}`
+ * (pump.ts:341-345). The cursor flag and field of `T/cli.js:2835-2887` are not in this repository,
+ * so this reader returns one page and never a cursor (fewer rows can only give `not_found`, the
+ * fail-closed side). See SPEC-DEVIATIONS / HOLD-1.
+ */
+export function defaultAuditReader(runner: ProcessRunner, bin: string, baseEnv: NodeJS.ProcessEnv): AuditReader {
+  return {
+    async page(q) {
+      if (q.cursor !== null) return null;
+      const argv = ["injects", "--json", "--to", q.to, "--from", q.from, "--since", q.since, "--limit", String(q.limit)];
+      const r = await runner.run(bin, argv, { env: sendChildEnv(baseEnv), timeoutMs: AUDIT_TIMEOUT_MS });
+      if (r.rc !== 0 || r.truncated) return null;
+      try {
+        const v: unknown = JSON.parse(r.stdout);
+        if (!isObj(v) || !Array.isArray(v.injects)) return null;
+        return { rows: v.injects.filter((x): x is AuditRow => isObj(x)), next_cursor: null };
+      } catch {
+        return null;
+      }
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Next actions (SPEC §7 "Next action" column; 1291-alone wording, WORK-BREAKDOWN §4)
+
+/**
+ * The store's own `next_action` shape (U2 `LinkRecord["next_action"]`: code, due_at, text and the
+ * store's `[extra: string]: unknown` index signature), so a value is assignable to a record as is.
+ */
+export type NextAction = LinkRecord["next_action"];
+
+const cmd = (verb: string, id: string, rest = ""): string => `${SHIM} ${verb} --request ${id}${rest}`;
+
+/** The record's `next_action` for a state; `lastSend` refines a receiver's `replying`. */
+export function nextActionFor(role: Role, state: RecordState, id: string, nowIso: string,
+  lastSend: SendAttempt["result"] | null = null): NextAction {
+  const at = (code: string, text: string): NextAction => ({ code, due_at: nowIso, text });
+  if (isTerminal(state)) return { code: "NONE", due_at: null, text: "" };
+  if (state === "stalled") return at("HUMAN", `${cmd("status", id)}  # then decide; ${cmd("close", id)}`);
+  if (role === "receiver") {
+    switch (state) {
+      case "unverified":
+        return at("VERIFY", "not corroborated by this machine's telepty audit; do not act on it. " +
+          `Re-run ${SHIM} ingest with the same message once \`telepty injects\` shows it.`);
+      case "received":
+        return at("BIND_OR_REFUSE", `${cmd("bind", id, " --task <your registered task id>")}  # or: ${cmd("refuse", id, " --reason <code>")}`);
+      case "accepted":
+        return at("WORK", `${cmd("reply", id, " --outcome <done|blocked|failed|declined> --final --body-file <path>")}  # when your task is done or blocked`);
+      case "replying":
+        return lastSend === "handed_over" || lastSend === null
+          ? at("WAIT_REPLY_ACK", `${SHIM} ingest  # the peer's ACK when it arrives; if none arrives: ${cmd("probe", id)}`)
+          : at("PROBE", cmd("probe", id));
+      default:
+        return at("HUMAN", cmd("status", id));
+    }
+  }
+  switch (state) {
+    case "prepared":
+    case "send_unknown":
+    case "send_refused":
+    case "unverified_at_peer":
+      return at(state === "prepared" ? "SEND" : state === "send_refused" ? "RESEND" : "PROBE", cmd("probe", id));
+    case "sent":
+      return at("WAIT_ACK", `${SHIM} ingest  # the peer's ACK when it arrives; if none arrives: ${cmd("probe", id)}`);
+    case "received":
+      return at("WAIT_BIND", `${SHIM} ingest  # the peer's ACK accepted or refused when it arrives`);
+    case "accepted":
+      return at("WAIT_REPLY", `${SHIM} ingest  # the peer's REPLY when it arrives`);
+    default:
+      return at("HUMAN", cmd("status", id));
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Injected dependencies
+
+export type FaultPoint = "after_commit" | "after_inject";
+
+export interface CliDeps {
+  /** Environment for AIGENTRY_CONTROLLER_PEERS / AIGENTRY_CONTROLLER_LINK_DIR and the telepty child env. */
+  env: NodeJS.ProcessEnv;
+  /** `<package root>`; default store and config live under `<package root>/state/`. */
+  packageRoot: string;
+  clock: { nowMs(): number };
+  /** U3 process runner (telepty inject). */
+  runner: ProcessRunner;
+  teleptyBin: string;
+  audit: AuditReader;
+  /** U4 task-row reader (taskQueueStatus in production). Read only. */
+  taskStatus(taskId: string): TaskQueueResult;
+  /** `<pid>@<host>` owner of a send attempt. */
+  proc: { pid: number; host: string };
+  /** All of stdin, or at least INGEST_MAX_BYTES + 1 bytes of it. */
+  readStdin(): Promise<Uint8Array>;
+  /** `--body-file` bytes; throws CliError on failure. */
+  readBodyFile(file: string): Promise<Uint8Array>;
+  out(line: string): void;
+  err(line: string): void;
+  /** Test seam (TEST-PLAN §1 fault points). Called after the commit and after the inject. */
+  fault?: (point: FaultPoint) => void;
+}
+
+interface Ctx {
+  deps: CliDeps;
+  cfg: PeerConfig;
+  store: ControllerLinkStore;
+  owner: string;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Small helpers
+
+const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
+const wireTask = (t: string | null): string | null => (t === null || t === "-" ? null : t);
+/** §3.2 `sent_at`: YYYY-MM-DDTHH:MM:SSZ. */
+export const sentAt = (ms: number): string => `${new Date(ms).toISOString().slice(0, 19)}Z`;
+
+function refOf(rec: LinkRecord): RecordRef {
+  return rec.role === "sender"
+    ? { role: "sender", requestId: rec.request_id }
+    : { role: "receiver", peer: rec.peer, requestId: rec.request_id };
+}
+
+function setState(rec: LinkRecord, state: RecordState, nowIso: string, lastSend: SendAttempt["result"] | null = null): void {
+  rec.state = state;
+  rec.state_at = nowIso;
+  rec.next_action = nextActionFor(rec.role, state, rec.request_id, nowIso, lastSend);
+}
+
+function addHistory(rec: LinkRecord, at: string, event: string, detail: string | null): void {
+  rec.history.push({ at, event, detail });
+}
+
+function mustRender(r: EnvelopeResult): Envelope {
+  if (!r.ok) throw new Error(`controller-link: internal envelope error ${r.error.code}: ${r.error.detail}`);
+  return r.envelope;
+}
+
+function ackFields(id: string, seq: number, ref: string, from: string, to: string, nowMs: number,
+  senderTask: string | null, receiverTask: string | null, state: AckState, reason: RefuseReason | null): EnvelopeFields {
+  return {
+    kind: "ACK", id, seq, ref, from, to, sent_at: sentAt(nowMs), sender_task: senderTask, receiver_task: receiverTask,
+    state, outcome: null, final: null, reason: state === "refused" ? reason : null,
+  };
+}
+
+/** Where a send attempt lives in the record. */
+type Slot = { where: "ack" } | { where: "probe"; key: string } | { where: "message"; key: string };
+
+interface PendingSend {
+  ref: RecordRef | null;
+  slot: Slot | null;
+  n: number;
+  text: string;
+  target: string;
+}
+
+/**
+ * Adds an ACK to `rec` (in place): next acks_out seq, a `pending` attempt (§6.1 step 1). The ACK is
+ * not stored as a raw file: it is never re-sent (§9.2), only answered again.
+ */
+function addAck(c: Ctx, rec: LinkRecord, ref: string, state: AckState, reason: RefuseReason | null,
+  nowMs: number, nowIso: string): PendingSend {
+  const peer = activePeer(c.cfg, rec.peer);
+  if (peer === null) throw new CliError("STATE_INVALID", `peer ${rec.peer} is not configured with link v1`);
+  const seq = rec.acks_out.last_seq + 1;
+  if (seq > SEQ_MAX) throw new CliError("STATE_INVALID", "ACK sequence exhausted for this request");
+  const env = mustRender(renderEnvelope(ackFields(rec.request_id, seq, ref, c.cfg.self.label, rec.peer, nowMs,
+    wireTask(rec.sender_task), rec.receiver_task, state, reason), ""));
+  rec.acks_out.last_seq = seq;
+  rec.acks_out.sends.push({ n: seq, at: nowIso, owner: c.owner, result: "pending", ref, ack_state: state, sha256: env.sha256 });
+  return { ref: refOf(rec), slot: { where: "ack" }, n: seq, text: env.text, target: peer.target };
+}
+
+function attemptsOf(rec: LinkRecord, slot: Slot): SendAttempt[] | null {
+  if (slot.where === "ack") return rec.acks_out.sends;
+  if (slot.where === "probe") return rec.probes_out[slot.key]?.sends ?? null;
+  return rec.messages[slot.key]?.sends ?? null;
+}
+
+/**
+ * §6.1 steps 2–4: (fault after_commit) → one telepty inject through U3 → (fault after_inject) →
+ * write the result into the pending attempt. Returns the classification.
+ */
+async function deliver(c: Ctx, p: PendingSend): Promise<SendClassification> {
+  c.deps.fault?.("after_commit");
+  const out = await sendEnvelope(p.target, p.text, { runner: c.deps.runner, bin: c.deps.teleptyBin, baseEnv: c.deps.env });
+  const cls: SendClassification = out.attempted
+    ? out.classification
+    : { result: "refused_definite", submit: null, inject_id: null, detail: `not_attempted:${out.code}` };
+  c.deps.fault?.("after_inject");
+  const ref = p.ref;
+  const slot = p.slot;
+  if (ref !== null && slot !== null) {
+    await c.store.mutate(ref, (cur, m) => {
+      if (cur === null) return { write: null, value: null };
+      const rec = clone(cur);
+      const list = attemptsOf(rec, slot);
+      const a = list?.find((x) => x.n === p.n && x.result === "pending");
+      if (a === undefined) return { write: null, value: null };
+      a.result = cls.result;
+      a.submit = cls.submit;
+      a.inject_id = cls.inject_id;
+      a.detail = cls.detail;
+      a.done_at = m.nowIso;
+      if (slot.where === "message" && rec.role === "receiver" && rec.state === "replying") {
+        rec.next_action = nextActionFor("receiver", "replying", rec.request_id, m.nowIso, cls.result);
+      }
+      return { write: rec, value: null };
+    });
+  }
+  return cls;
+}
+
+const sendWord = (cls: SendClassification): string => `${cls.result}${cls.submit ? `/${cls.submit}` : ""}`;
+
+/** Exit and stderr wording for an obligation message's send result (1291 alone: no pump). */
+function obligationExit(c: Ctx, cls: SendClassification, id: string): number {
+  if (cls.result === "handed_over") return EXIT.OK;
+  if (cls.result === "unknown") {
+    c.deps.err(`PEER_DELIVERY_UNKNOWN: record kept; run \`${SHIM} probe --request ${id}\` later; do not re-run this command`);
+    return EXIT.DELIVERY_UNKNOWN;
+  }
+  c.deps.err(`PEER_NOT_DELIVERED: ${cls.detail ?? "definite refusal"}; record kept; run \`${SHIM} probe --request ${id}\` later; do not re-run this command`);
+  return EXIT.NOT_DELIVERED;
+}
+
+/** Records with this request id (both roles). */
+async function recordsFor(c: Ctx, id: string): Promise<LinkRecord[]> {
+  return (await c.store.list()).filter((r) => r.request_id === id);
+}
+
+async function oneRecord(c: Ctx, id: string, role: Role | null): Promise<LinkRecord> {
+  const recs = (await recordsFor(c, id)).filter((r) => role === null || r.role === role);
+  if (recs.length === 0) throw new CliError("STATE_INVALID", `no ${role === "receiver" ? "inbox record" : "record"} for request ${id}`);
+  if (recs.length > 1) throw new CliError("STATE_INVALID", `request ${id} names more than one record`);
+  return recs[0]!;
+}
+
+function requirePeer(c: Ctx, rec: LinkRecord): PeerEntry {
+  const p = activePeer(c.cfg, rec.peer);
+  if (p === null) throw new CliError("STATE_INVALID", `peer ${rec.peer} is not configured with link v1; nothing changed`);
+  return p;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Argument parsing
+
+const FLAGS: Record<string, { value: readonly string[]; bool: readonly string[] }> = {
+  ingest: { value: [], bool: [] },
+  bind: { value: ["--request", "--task"], bool: [] },
+  refuse: { value: ["--request", "--reason"], bool: [] },
+  reply: { value: ["--request", "--outcome", "--body-file"], bool: ["--final", "--interim"] },
+  status: { value: ["--request"], bool: ["--json"] },
+  probe: { value: ["--request"], bool: [] },
+  close: { value: ["--request"], bool: [] },
+};
+
+interface Args {
+  cmd: string;
+  v: Map<string, string>;
+  b: Set<string>;
+}
+
+export function parseArgs(argv: readonly string[]): Args {
+  const [command, ...rest] = argv;
+  const spec = command !== undefined && Object.prototype.hasOwnProperty.call(FLAGS, command) ? FLAGS[command] : undefined;
+  if (command === undefined || spec === undefined) throw new CliError("USAGE", `unknown command${command ? ` '${command.slice(0, 32)}'` : ""}`);
+  const v = new Map<string, string>();
+  const b = new Set<string>();
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]!;
+    if (spec.bool.includes(a)) {
+      if (b.has(a)) throw new CliError("USAGE", `${a} given twice`);
+      b.add(a);
+    } else if (spec.value.includes(a)) {
+      const val = rest[i + 1];
+      if (val === undefined) throw new CliError("USAGE", `${a} needs a value`);
+      if (v.has(a)) throw new CliError("USAGE", `${a} given twice`);
+      v.set(a, val);
+      i++;
+    } else {
+      throw new CliError("USAGE", `unknown argument for ${command}: '${a.slice(0, 32)}'`);
+    }
+  }
+  return { cmd: command, v, b };
+}
+
+function requestArg(a: Args, required: boolean): string | null {
+  const id = a.v.get("--request");
+  if (id === undefined) {
+    if (required) throw new CliError("USAGE", "--request <request id> is required");
+    return null;
+  }
+  if (!REQUEST_ID_RE.test(id)) throw new CliError("USAGE", "--request is not a request id");
+  return id;
+}
+
+function required(a: Args, flag: string): string {
+  const v = a.v.get(flag);
+  if (v === undefined) throw new CliError("USAGE", `${flag} is required`);
+  return v;
+}
+
+// ---------------------------------------------------------------------------------------------
+// ingest (§8.1)
+
+type IngestResult =
+  | "NEW" | "ANSWERED" | "DUPLICATE" | "STALE" | "UNVERIFIED" | "CONFLICT"
+  | "ENVELOPE_INVALID" | "COPY_MISMATCH" | "VERSION_UNSUPPORTED" | "NOT_FOR_THIS_CONTROLLER" | "PEER_UNKNOWN"
+  | "UNKNOWN_REQUEST" | "STALE_MESSAGE" | "INPUT_TOO_LARGE" | "STORE_CORRUPT" | "STORE_UNAVAILABLE" | "LINK_CAPACITY";
+
+/** §8.1 exit: 0 applied/answered/no-op, 5 stored not actionable, 4 refused without storing, 9 store error. */
+export function ingestExitOf(result: string): number {
+  if (["NEW", "ANSWERED", "DUPLICATE", "STALE"].includes(result)) return EXIT.OK;
+  if (result === "UNVERIFIED" || result === "CONFLICT") return EXIT.NOT_ACTIONABLE;
+  if (["STORE_CORRUPT", "STORE_UNAVAILABLE", "LINK_CAPACITY"].includes(result)) return EXIT.STORE;
+  return EXIT.REFUSED;
+}
+
+/** Aggregated exit over blocks: 9 > 4 > 5 > 0. */
+export function worseExit(a: number, b: number): number {
+  const rank = (x: number): number => (x === EXIT.STORE ? 3 : x === EXIT.REFUSED ? 2 : x === EXIT.NOT_ACTIONABLE ? 1 : 0);
+  return rank(b) > rank(a) ? b : a;
+}
+
+interface BlockOutcome {
+  result: IngestResult;
+  kind: string;
+  id: string;
+  seq: string;
+  peer: string;
+  state: string;
+  /** ACK sent as the answer, if any. */
+  answer: AckState | null;
+  send: SendClassification | null;
+  next: string | null;
+  body: { from: string; sha256: string; bytes: number; text: string } | null;
+  note: string | null;
+}
+
+interface Applied {
+  result: IngestResult;
+  rec: LinkRecord | null;
+  pending: PendingSend | null;
+  answer: AckState | null;
+  showBody: boolean;
+  note: string | null;
+}
+
+const none = (result: IngestResult, rec: LinkRecord | null, note: string | null = null): Applied =>
+  ({ result, rec, pending: null, answer: null, showBody: false, note });
+
+const RECEIVER_ACCEPTED_LIKE = new Set(["accepted", "replying", "replied"]);
+const SENDER_RANK: Record<string, number> = { received: 1, accepted: 2 };
+
+/** §7.1: the sender state an ACK for REQUEST-1 moves to, or null (no change; never backwards). */
+export function senderStateAfterAck(state: RecordState, ack: AckState): RecordState | null {
+  if (isTerminal(state)) return null;
+  const rank = SENDER_RANK[state] ?? 0;
+  switch (ack) {
+    case "received": return rank < 1 ? "received" : null;
+    case "accepted": return rank < 2 ? "accepted" : null;
+    case "refused": return "refused";
+    case "unverified": return rank === 0 && state !== "unverified_at_peer" && state !== "stalled" ? "unverified_at_peer" : null;
+    default: return null;
+  }
+}
+
+/** The ACK a PROBE about `ref` is answered with (§8.1 PROBE). */
+export function probeAnswer(rec: LinkRecord | null, ref: string): { state: AckState; reason: RefuseReason | null } {
+  const unknown = { state: "unknown" as AckState, reason: null };
+  if (rec === null) return unknown;
+  if (rec.role === "receiver") {
+    if (ref !== "REQUEST-1") return unknown;
+    const corroborated = rec.messages["REQUEST-1"]?.corroboration?.state === "corroborated";
+    if (rec.state === "refused") {
+      const r = rec.refuse_reason;
+      return { state: "refused", reason: typeof r === "string" && (REFUSE_REASONS as readonly string[]).includes(r) ? r as RefuseReason : "cannot_do" };
+    }
+    if (rec.state === "unverified") return { state: "unverified", reason: null };
+    if (rec.state === "received") return { state: "received", reason: null };
+    if (RECEIVER_ACCEPTED_LIKE.has(rec.state)) return { state: "accepted", reason: null };
+    return { state: rec.receiver_task !== null ? "accepted" : corroborated ? "received" : "unverified", reason: null };
+  }
+  if (!ref.startsWith("REPLY-")) return unknown;
+  if (rec.messages[ref] !== undefined) return { state: "received", reason: null };
+  if ((rec.unverified_copies ?? []).some((u) => (u as unknown as { key?: unknown }).key === ref)) return { state: "unverified", reason: null };
+  return unknown;
+}
+
+function newReceiverRecord(c: Ctx, e: Envelope, peer: PeerEntry, entry: MessageEntry, corroborated: boolean, nowIso: string): LinkRecord {
+  const state: RecordState = corroborated ? "received" : "unverified";
+  return {
+    v: 1, role: "receiver", request_id: e.fields.id, peer: e.fields.from, peer_target: peer.target,
+    self_label: c.cfg.self.label, sender_task: e.fields.sender_task ?? "-", receiver_task: null,
+    state, state_at: nowIso, next_action: nextActionFor("receiver", state, e.fields.id, nowIso),
+    messages: { "REQUEST-1": entry }, acks_in: {}, probes_out: {}, acks_out: { last_seq: 0, sends: [] },
+    notices: { n: 0, last_at: null },
+    history: [{ at: nowIso, event: "created", detail: `ingest corroboration=${entry.corroboration?.state ?? "-"}` }],
+    history_dropped: 0,
+  };
+}
+
+function addUnverifiedCopy(rec: LinkRecord, sha256: string, key: string, nowIso: string): boolean {
+  const copies = rec.unverified_copies ?? [];
+  if (copies.some((u) => u.sha256 === sha256)) return false;
+  // `key` (the message the copy claims to be) is an extra key the store keeps; probeAnswer() reads it.
+  copies.push({ sha256, raw: rawRef(sha256), at: nowIso, key } as UnverifiedCopy);
+  rec.unverified_copies = copies;
+  return true;
+}
+
+function dropUnverifiedCopy(rec: LinkRecord, sha256: string): void {
+  if (rec.unverified_copies === undefined) return;
+  rec.unverified_copies = rec.unverified_copies.filter((u) => u.sha256 !== sha256);
+}
+
+async function ingestRequest(c: Ctx, e: Envelope, peer: PeerEntry, corr: CorroborationResult): Promise<Applied> {
+  const f = e.fields;
+  const ref: RecordRef = { role: "receiver", peer: f.from, requestId: f.id };
+  const corroborated = corr.state === "corroborated";
+  const raw = { sha256: e.sha256, bytes: Buffer.from(e.text, "utf8") };
+  return c.store.mutate<Applied>(ref, (cur, m) => {
+    const entry: MessageEntry = {
+      sha256: e.sha256, body_sha256: e.body_sha256, raw: rawRef(e.sha256), ingested_at: m.nowIso,
+      corroboration: { state: corr.state, at: m.nowIso, inject_id: corr.inject_id, checks: 1 },
+    };
+    if (cur === null) {
+      const rec = newReceiverRecord(c, e, peer, entry, corroborated, m.nowIso);
+      const pending = corroborated ? addAck(c, rec, "REQUEST-1", "received", null, m.nowMs, m.nowIso) : null;
+      return { write: rec, raws: [raw], value: { result: corroborated ? "NEW" : "UNVERIFIED", rec, pending,
+        answer: corroborated ? "received" : null, showBody: corroborated, note: null } };
+    }
+    const stored = cur.messages["REQUEST-1"]!;
+    const storedCorroborated = stored.corroboration?.state === "corroborated";
+    if (stored.sha256 === e.sha256) {
+      if (cur.state === "unverified" && corroborated) {
+        const rec = clone(cur);
+        rec.messages["REQUEST-1"] = { ...stored, corroboration: entry.corroboration! };
+        setState(rec, "received", m.nowIso);
+        addHistory(rec, m.nowIso, "corroborated", `sha256=${e.sha256}`);
+        const pending = addAck(c, rec, "REQUEST-1", "received", null, m.nowMs, m.nowIso);
+        return { write: rec, value: { result: "NEW", rec, pending, answer: "received", showBody: true, note: null } };
+      }
+      return { write: null, value: none("DUPLICATE", cur) };
+    }
+    // Same key, other bytes.
+    if (corroborated && !storedCorroborated && cur.state === "unverified") {
+      // An unverified copy never claims the key: the corroborated copy replaces it.
+      const rec = clone(cur);
+      addHistory(rec, m.nowIso, "replaced_unverified", `old sha256=${stored.sha256}`);
+      rec.messages["REQUEST-1"] = entry;
+      rec.sender_task = f.sender_task ?? "-";
+      dropUnverifiedCopy(rec, e.sha256);
+      setState(rec, "received", m.nowIso);
+      const pending = addAck(c, rec, "REQUEST-1", "received", null, m.nowMs, m.nowIso);
+      return { write: rec, raws: [raw], value: { result: "NEW", rec, pending, answer: "received", showBody: true, note: null } };
+    }
+    if (corroborated && storedCorroborated) {
+      const rec = clone(cur);
+      addHistory(rec, m.nowIso, "conflict", `REQUEST-1 sha256=${e.sha256}`);
+      return { write: rec, value: none("CONFLICT", rec, "a second corroborated REQUEST with other bytes; held for a human, nothing sent") };
+    }
+    // Not corroborated (or the stored copy is not in `unverified` any more): kept beside, never replacing.
+    const rec = clone(cur);
+    if (!addUnverifiedCopy(rec, e.sha256, "REQUEST-1", m.nowIso)) return { write: null, value: none("UNVERIFIED", cur) };
+    addHistory(rec, m.nowIso, "unverified_copy", `REQUEST-1 sha256=${e.sha256}`);
+    return { write: rec, raws: [raw], value: none("UNVERIFIED", rec) };
+  });
+}
+
+/** Lock-free check, so a message about no record of ours creates nothing on disk (not even the store). */
+async function exists(c: Ctx, ref: RecordRef, peer: string): Promise<boolean> {
+  const r = await c.store.read(ref);
+  return r !== null && r.peer === peer;
+}
+
+async function ingestReply(c: Ctx, e: Envelope, corr: CorroborationResult): Promise<Applied> {
+  const f = e.fields;
+  const ref: RecordRef = { role: "sender", requestId: f.id };
+  const corroborated = corr.state === "corroborated";
+  const key = `REPLY-${f.seq}`;
+  const raw = { sha256: e.sha256, bytes: Buffer.from(e.text, "utf8") };
+  const applied = !(await exists(c, ref, f.from)) ? none("UNKNOWN_REQUEST", null) : await c.store.mutate<Applied>(ref, (cur, m) => {
+    if (cur === null || cur.peer !== f.from) return { write: null, value: none("UNKNOWN_REQUEST", null) };
+    const existing = cur.messages[key];
+    if (existing !== undefined && existing.sha256 === e.sha256) {
+      if (!corroborated) return { write: null, value: none("DUPLICATE", cur) };
+      const rec = clone(cur);
+      const pending = addAck(c, rec, key, "received", null, m.nowMs, m.nowIso);
+      return { write: rec, value: { result: "DUPLICATE", rec, pending, answer: "received", showBody: false, note: null } };
+    }
+    if (existing !== undefined && corroborated) {
+      const rec = clone(cur);
+      addHistory(rec, m.nowIso, "conflict", `${key} sha256=${e.sha256}`);
+      return { write: rec, value: none("CONFLICT", rec, `a second corroborated ${key} with other bytes; held for a human, nothing sent`) };
+    }
+    if (!corroborated) {
+      const rec = clone(cur);
+      if (!addUnverifiedCopy(rec, e.sha256, key, m.nowIso)) return { write: null, value: none("UNVERIFIED", cur) };
+      addHistory(rec, m.nowIso, "unverified_copy", `${key} sha256=${e.sha256}`);
+      return { write: rec, raws: [raw], value: none("UNVERIFIED", rec) };
+    }
+    const rec = clone(cur);
+    rec.messages[key] = {
+      sha256: e.sha256, body_sha256: e.body_sha256, raw: rawRef(e.sha256),
+      outcome: f.outcome ?? "-", final: f.final ?? "-", ingested_at: m.nowIso,
+    };
+    dropUnverifiedCopy(rec, e.sha256);
+    if (rec.receiver_task === null && f.receiver_task !== null) rec.receiver_task = f.receiver_task;
+    addHistory(rec, m.nowIso, "reply_in", `${key} outcome=${f.outcome ?? "-"} final=${f.final ?? "-"}`);
+    if (!isTerminal(rec.state)) {
+      const to: RecordState = f.final === "yes" ? "replied" : "accepted";
+      if (to !== rec.state) setState(rec, to, m.nowIso);
+    }
+    const pending = addAck(c, rec, key, "received", null, m.nowMs, m.nowIso);
+    return { write: rec, raws: [raw], value: { result: "NEW", rec, pending, answer: "received", showBody: true, note: null } };
+  });
+  if (applied.result === "UNKNOWN_REQUEST" && corroborated) {
+    // No record: answer ACK unknown (seq 1; there is no record to keep a counter in), store nothing.
+    const peer = activePeer(c.cfg, f.from)!;
+    const env = mustRender(renderEnvelope(ackFields(f.id, 1, key, c.cfg.self.label, f.from, c.deps.clock.nowMs(),
+      f.sender_task, f.receiver_task, "unknown", null), ""));
+    return { ...applied, pending: { ref: null, slot: null, n: 1, text: env.text, target: peer.target }, answer: "unknown" };
+  }
+  return applied;
+}
+
+async function ingestAck(c: Ctx, e: Envelope, corr: CorroborationResult): Promise<Applied> {
+  const f = e.fields;
+  const ackRef = f.ref!;
+  const toSender = ackRef === "REQUEST-1";
+  const ref: RecordRef = toSender ? { role: "sender", requestId: f.id } : { role: "receiver", peer: f.from, requestId: f.id };
+  const state = f.state!;
+  if (!(await exists(c, ref, f.from))) return none("UNKNOWN_REQUEST", null);
+  return c.store.mutate<Applied>(ref, (cur, m) => {
+    if (cur === null || cur.peer !== f.from) return { write: null, value: none("UNKNOWN_REQUEST", null) };
+    if (!toSender && cur.messages[ackRef] === undefined) {
+      return { write: null, value: none("UNKNOWN_REQUEST", cur, `no ${ackRef} was sent for this request`) };
+    }
+    if (corr.state !== "corroborated") {
+      const rec = clone(cur);
+      addHistory(rec, m.nowIso, "ack_unverified", `${ackRef} seq=${f.seq} state=${state} corroboration=${corr.state}`);
+      return { write: rec, value: none("UNVERIFIED", rec, "ACK not corroborated by this machine's telepty audit; not applied") };
+    }
+    const seen = cur.acks_in[ackRef];
+    if (seen !== undefined && f.seq <= seen.last_seq) return { write: null, value: none("STALE", cur) };
+    const rec = clone(cur);
+    rec.acks_in[ackRef] = { last_seq: f.seq, state, at: m.nowIso };
+    addHistory(rec, m.nowIso, "ack_in", `${ackRef} seq=${f.seq} state=${state}`);
+    let to: RecordState | null = null;
+    if (toSender) {
+      to = senderStateAfterAck(rec.state, state);
+      if (to === "accepted" && f.receiver_task !== null) rec.receiver_task = f.receiver_task;
+      if (to === "refused" && f.reason !== null) rec.refuse_reason = f.reason;
+    } else if (state === "received" && rec.messages[ackRef]!.final === "yes" && !isTerminal(rec.state)) {
+      to = "replied";
+    }
+    if (to !== null) setState(rec, to, m.nowIso);
+    return { write: rec, value: none(to !== null ? "NEW" : "DUPLICATE", rec) };
+  });
+}
+
+async function ingestProbe(c: Ctx, e: Envelope, peer: PeerEntry): Promise<Applied> {
+  const f = e.fields;
+  const probeRef = f.ref!;
+  const ref: RecordRef = probeRef === "REQUEST-1" ? { role: "receiver", peer: f.from, requestId: f.id } : { role: "sender", requestId: f.id };
+  const applied = !(await exists(c, ref, f.from)) ? none("ANSWERED", null) : await c.store.mutate<Applied>(ref, (cur, m) => {
+    if (cur === null || cur.peer !== f.from) return { write: null, value: none("ANSWERED", null) };
+    const last = cur.probe_answers?.[probeRef];
+    if (last !== undefined && m.nowMs - Date.parse(last) < PROBE_ANSWER_INTERVAL_MS) return { write: null, value: none("DUPLICATE", cur) };
+    const rec = clone(cur);
+    rec.probe_answers = { ...(rec.probe_answers ?? {}), [probeRef]: m.nowIso };
+    const a = probeAnswer(rec, probeRef);
+    const pending = addAck(c, rec, probeRef, a.state, a.reason, m.nowMs, m.nowIso);
+    return { write: rec, value: { result: "ANSWERED", rec, pending, answer: a.state, showBody: false, note: null } };
+  });
+  if (applied.result === "ANSWERED" && applied.rec === null) {
+    const env = mustRender(renderEnvelope(ackFields(f.id, 1, probeRef, c.cfg.self.label, f.from, c.deps.clock.nowMs(),
+      f.sender_task, f.receiver_task, "unknown", null), ""));
+    return { ...applied, pending: { ref: null, slot: null, n: 1, text: env.text, target: peer.target }, answer: "unknown" };
+  }
+  return applied;
+}
+
+async function ingestBlock(c: Ctx, parsed: EnvelopeResult): Promise<BlockOutcome> {
+  const blank = { kind: "-", id: "-", seq: "-", peer: "-", state: "-", answer: null, send: null, next: null, body: null };
+  if (!parsed.ok) return { ...blank, result: parsed.error.code as IngestResult, note: parsed.error.detail };
+  const e = parsed.envelope;
+  const f = e.fields;
+  const head = { kind: f.kind, id: f.id, seq: String(f.seq), peer: f.from };
+  const refuse = (result: IngestResult, note: string): BlockOutcome => ({ ...blank, ...head, result, note });
+  if (f.to !== c.cfg.self.label) return refuse("NOT_FOR_THIS_CONTROLLER", `to=${f.to} but this controller is ${c.cfg.self.label}`);
+  const peer = activePeer(c.cfg, f.from);
+  if (peer === null) return refuse("PEER_UNKNOWN", `from=${f.from} is not a configured peer with link v1`);
+  const nowMs = c.deps.clock.nowMs();
+  if ((f.kind === "REQUEST" || f.kind === "REPLY") && nowMs - Date.parse(f.sent_at) > STALE_MESSAGE_MS) {
+    return refuse("STALE_MESSAGE", `sent_at ${f.sent_at} is more than 25 days ago`);
+  }
+  const corr: CorroborationResult = f.kind === "PROBE"
+    ? { state: "not_found", inject_id: null, pages: 0 }
+    : await corroborate(c.deps.audit, e.sha256, c.cfg.self.controller_sid, nowMs);
+  let applied: Applied;
+  switch (f.kind) {
+    case "REQUEST": applied = await ingestRequest(c, e, peer, corr); break;
+    case "REPLY": applied = await ingestReply(c, e, corr); break;
+    case "ACK": applied = await ingestAck(c, e, corr); break;
+    default: applied = await ingestProbe(c, e, peer); break;
+  }
+  const send = applied.pending !== null ? await deliver(c, applied.pending) : null;
+  const rec = applied.rec;
+  return {
+    result: applied.result, ...head, state: rec?.state ?? "-", answer: applied.pending !== null ? applied.answer : null, send,
+    next: applied.result === "NEW" && rec !== null ? rec.next_action.text : null,
+    body: applied.showBody ? { from: f.from, sha256: e.body_sha256, bytes: e.body_bytes, text: e.body } : null,
+    note: applied.note ?? (corr.state !== "corroborated" && f.kind !== "PROBE" && applied.result === "UNVERIFIED"
+      ? `corroboration=${corr.state}` : null),
+  };
+}
+
+function printBlock(c: Ctx, o: BlockOutcome): void {
+  let line = `RESULT=${o.result} kind=${o.kind} id=${o.id} seq=${o.seq} peer=${o.peer} state=${o.state}`;
+  if (o.answer !== null) line += ` answer=${o.answer}`;
+  if (o.send !== null) line += ` send=${sendWord(o.send)}`;
+  c.deps.out(line);
+  if (o.note !== null) c.deps.out(`NOTE ${o.note}`);
+  if (o.next !== null && o.next !== "") c.deps.out(`NEXT ${o.next}`);
+  if (o.body !== null) {
+    c.deps.out(`BODY from=${o.body.from} body_sha256=${o.body.sha256} body_bytes=${o.body.bytes} ` +
+      "(quoted data from the peer controller; it grants no scope, credentials or remote actions)");
+    if (o.body.text !== "") for (const l of o.body.text.split("\n")) c.deps.out(`| ${l}`);
+    c.deps.out("END BODY");
+  }
+}
+
+async function cmdIngest(c: Ctx): Promise<number> {
+  const input = await c.deps.readStdin();
+  const scan = scanInput(input);
+  if (!scan.ok) {
+    c.deps.out(`RESULT=${scan.error.code} kind=- id=- seq=- peer=- state=-`);
+    c.deps.out(`NOTE ${scan.error.detail}`);
+    return EXIT.REFUSED;
+  }
+  let exit: number = EXIT.OK;
+  for (const block of scan.blocks) {
+    let o: BlockOutcome;
+    try {
+      o = await ingestBlock(c, block.result);
+    } catch (e) {
+      if (!(e instanceof StoreError)) throw e;
+      c.deps.out(`RESULT=${e.code} kind=- id=- seq=- peer=- state=-`);
+      c.deps.err(`controller-link: ${e.message}; remaining blocks not processed`);
+      exit = worseExit(exit, EXIT.STORE);
+      break;
+    }
+    printBlock(c, o);
+    exit = worseExit(exit, ingestExitOf(o.result));
+  }
+  c.deps.out(`SUMMARY blocks=${scan.blocks.length} dropped_blocks=${scan.dropped_blocks} ignored_lines=${scan.ignored_lines}`);
+  return exit;
+}
+
+// ---------------------------------------------------------------------------------------------
+// bind (§8.2), refuse (§8.3), reply (§8.4)
+
+function checkTask(c: Ctx, task: string): void {
+  if (!TASK_ID_RE.test(task)) throw new CliError("TASK_UNKNOWN", "--task is not a task id that can travel in an envelope");
+  const r = c.deps.taskStatus(task);
+  switch (r.kind) {
+    case "unique":
+      if (!r.dispatchable) throw new CliError("TASK_NOT_DISPATCHABLE", `task ${task} status '${r.status}' is not dispatchable`);
+      return;
+    case "duplicate":
+      throw new CliError("TASK_AMBIGUOUS", `task id ${task} matches ${r.hits.length} rows in the local queue`);
+    case "archived":
+      throw new CliError("TASK_NOT_DISPATCHABLE", `task ${task} is archived as completed`);
+    case "not-found":
+      throw new CliError("TASK_UNKNOWN", `task ${task} is not in the local queue; register it first`);
+    default:
+      throw new CliError("TASK_UNKNOWN", "the local task queue is unreadable");
+  }
+}
+
+async function cmdBind(c: Ctx, a: Args): Promise<number> {
+  const id = requestArg(a, true)!;
+  const task = required(a, "--task");
+  const found = await oneRecord(c, id, "receiver");
+  if (found.state !== "received") throw new CliError("STATE_INVALID", `request ${id} is '${found.state}', bind needs 'received'`);
+  requirePeer(c, found);
+  checkTask(c, task);
+  const pending = await c.store.mutate<PendingSend>(refOf(found), (cur, m) => {
+    if (cur === null || cur.state !== "received") throw new CliError("STATE_INVALID", `request ${id} is no longer 'received'`);
+    const rec = clone(cur);
+    rec.receiver_task = task;
+    setState(rec, "accepted", m.nowIso);
+    addHistory(rec, m.nowIso, "bind", `receiver_task=${task}`);
+    return { write: rec, value: addAck(c, rec, "REQUEST-1", "accepted", null, m.nowMs, m.nowIso) };
+  });
+  const cls = await deliver(c, pending);
+  c.deps.out(`OK bind request=${id} peer=${found.peer} receiver_task=${task} state=accepted answer=accepted send=${sendWord(cls)}`);
+  return EXIT.OK;
+}
+
+async function cmdRefuse(c: Ctx, a: Args): Promise<number> {
+  const id = requestArg(a, true)!;
+  const reason = required(a, "--reason");
+  if (!(REFUSE_REASONS as readonly string[]).includes(reason)) {
+    throw new CliError("USAGE", `--reason must be one of ${REFUSE_REASONS.join(", ")}`);
+  }
+  const found = await oneRecord(c, id, "receiver");
+  const allowed = (s: string): boolean => s === "received" || s === "accepted";
+  if (!allowed(found.state)) throw new CliError("STATE_INVALID", `request ${id} is '${found.state}', refuse needs 'received' or 'accepted'`);
+  requirePeer(c, found);
+  const pending = await c.store.mutate<PendingSend>(refOf(found), (cur, m) => {
+    if (cur === null || !allowed(cur.state)) throw new CliError("STATE_INVALID", `request ${id} is no longer 'received' or 'accepted'`);
+    const rec = clone(cur);
+    rec.refuse_reason = reason;
+    setState(rec, "refused", m.nowIso);
+    addHistory(rec, m.nowIso, "refuse", `reason=${reason}`);
+    return { write: rec, value: addAck(c, rec, "REQUEST-1", "refused", reason as RefuseReason, m.nowMs, m.nowIso) };
+  });
+  const cls = await deliver(c, pending);
+  c.deps.out(`OK refuse request=${id} peer=${found.peer} reason=${reason} state=refused answer=refused send=${sendWord(cls)}`);
+  return EXIT.OK;
+}
+
+const replyKeys = (rec: LinkRecord): string[] => Object.keys(rec.messages).filter((k) => k.startsWith("REPLY-"));
+
+function replyAllowed(rec: LinkRecord, id: string): number {
+  if (rec.state !== "accepted" && rec.state !== "replying") {
+    throw new CliError("STATE_INVALID", `request ${id} is '${rec.state}', reply needs 'accepted' or 'replying'`);
+  }
+  const keys = replyKeys(rec);
+  if (keys.some((k) => rec.messages[k]!.final === "yes")) throw new CliError("STATE_INVALID", `request ${id} already has a final REPLY`);
+  const seq = keys.length + 1;
+  if (seq > REPLY_MAX_SEQ) throw new CliError("STATE_INVALID", `request ${id} already has ${REPLY_MAX_SEQ} REPLYs`);
+  return seq;
+}
+
+async function cmdReply(c: Ctx, a: Args): Promise<number> {
+  const id = requestArg(a, true)!;
+  const outcome = required(a, "--outcome");
+  if (!(REPLY_OUTCOMES as readonly string[]).includes(outcome)) throw new CliError("USAGE", `--outcome must be one of ${REPLY_OUTCOMES.join(", ")}`);
+  if (a.b.has("--final") === a.b.has("--interim")) throw new CliError("USAGE", "exactly one of --final or --interim is required");
+  const final = a.b.has("--final") ? "yes" : "no";
+  const bodyBytes = await c.deps.readBodyFile(required(a, "--body-file"));
+  const body = normaliseBody(bodyBytes);
+  if (!body.ok) throw new CliError(body.error.code === "PEER_BODY_TOO_LARGE" ? "PEER_BODY_TOO_LARGE" : "PEER_BODY_INVALID", body.error.detail);
+  const bodyText = body.body;
+  const found = await oneRecord(c, id, "receiver");
+  replyAllowed(found, id);
+  requirePeer(c, found);
+  const render = (rec: LinkRecord, seq: number, nowMs: number): Envelope => {
+    const r = renderEnvelope({
+      kind: "REPLY", id, seq, ref: null, from: c.cfg.self.label, to: rec.peer, sent_at: sentAt(nowMs),
+      sender_task: wireTask(rec.sender_task), receiver_task: rec.receiver_task, state: null,
+      outcome: outcome as ReplyOutcome, final, reason: null,
+    }, bodyText);
+    if (!r.ok) throw new CliError(r.error.code === "PEER_BODY_TOO_LARGE" ? "PEER_BODY_TOO_LARGE" : "PEER_BODY_INVALID", r.error.detail);
+    return r.envelope;
+  };
+  render(found, replyAllowed(found, id), c.deps.clock.nowMs()); // size and domain check before anything is written
+  const { pending, seq } = await c.store.mutate<{ pending: PendingSend; seq: number }>(refOf(found), (cur, m) => {
+    if (cur === null) throw new CliError("STATE_INVALID", `request ${id} has no record any more`);
+    const n = replyAllowed(cur, id);
+    const peer = requirePeer(c, cur);
+    const env = render(cur, n, m.nowMs);
+    const key = `REPLY-${n}`;
+    const rec = clone(cur);
+    rec.messages[key] = {
+      sha256: env.sha256, body_sha256: env.body_sha256, raw: rawRef(env.sha256), outcome, final,
+      sends: [{ n: 1, at: m.nowIso, owner: c.owner, result: "pending" }],
+    };
+    setState(rec, "replying", m.nowIso);
+    addHistory(rec, m.nowIso, "reply", `${key} outcome=${outcome} final=${final}`);
+    return {
+      write: rec, raws: [{ sha256: env.sha256, bytes: Buffer.from(env.text, "utf8") }],
+      value: { pending: { ref: refOf(rec), slot: { where: "message", key }, n: 1, text: env.text, target: peer.target }, seq: n },
+    };
+  });
+  const cls = await deliver(c, pending);
+  c.deps.out(`OK reply request=${id} seq=${seq} outcome=${outcome} final=${final} state=replying send=${sendWord(cls)}`);
+  return obligationExit(c, cls, id);
+}
+
+// ---------------------------------------------------------------------------------------------
+// status (§9.4), probe (manual; WORK-BREAKDOWN §4), close (§7)
+
+export function statusLine(s: StatusEntry): string {
+  return `controller-link ${s.role} ${s.id8} peer=${s.peer} state=${s.state} next=${s.next} due=${s.due_at ?? "-"} ` +
+    `sender_task=${s.sender_task} receiver_task=${s.receiver_task ?? "-"}`;
+}
+
+async function cmdStatus(c: Ctx, a: Args): Promise<number> {
+  const id = requestArg(a, false);
+  const all = id === null ? await c.store.status({ open: true }) : (await recordsFor(c, id)).map(statusOf);
+  if (id !== null && all.length === 0) throw new CliError("STATE_INVALID", `no record for request ${id}`);
+  const rows = [...all].sort((x, y) => (y.due_at ?? "").localeCompare(x.due_at ?? "") || x.request_id.localeCompare(y.request_id));
+  if (a.b.has("--json")) c.deps.out(JSON.stringify(rows));
+  else for (const s of rows) c.deps.out(statusLine(s));
+  return EXIT.OK;
+}
+
+/** The message a probe asks about: REQUEST-1 for a sender; for a receiver the newest REPLY not ACKed `received`. */
+function probeTarget(rec: LinkRecord): string | null {
+  if (rec.role === "sender") return "REQUEST-1";
+  const keys = replyKeys(rec).sort((x, y) => Number(y.slice(6)) - Number(x.slice(6)));
+  return keys.find((k) => rec.acks_in[k]?.state !== "received") ?? keys[0] ?? null;
+}
+
+async function cmdProbe(c: Ctx, a: Args): Promise<number> {
+  const id = requestArg(a, true)!;
+  const found = await oneRecord(c, id, null);
+  if (isTerminal(found.state)) throw new CliError("STATE_INVALID", `request ${id} is '${found.state}' (terminal)`);
+  if (probeTarget(found) === null) throw new CliError("STATE_INVALID", `request ${id} has no message of yours to probe`);
+  requirePeer(c, found);
+  const { pending, key, seq } = await c.store.mutate<{ pending: PendingSend; key: string; seq: number }>(refOf(found), (cur, m) => {
+    if (cur === null || isTerminal(cur.state)) throw new CliError("STATE_INVALID", `request ${id} is no longer open`);
+    const k = probeTarget(cur);
+    if (k === null) throw new CliError("STATE_INVALID", `request ${id} has no message of yours to probe`);
+    const peer = requirePeer(c, cur);
+    const rec = clone(cur);
+    const n = Math.max(0, ...Object.values(rec.probes_out).map((p) => p.last_seq)) + 1;
+    if (n > SEQ_MAX) throw new CliError("STATE_INVALID", "PROBE sequence exhausted for this request");
+    const env = mustRender(renderEnvelope({
+      kind: "PROBE", id, seq: n, ref: k, from: c.cfg.self.label, to: rec.peer, sent_at: sentAt(m.nowMs),
+      sender_task: wireTask(rec.sender_task), receiver_task: rec.receiver_task, state: null, outcome: null, final: null, reason: null,
+    }, ""));
+    const slot: LinkRecord["probes_out"][string] = rec.probes_out[k] ?? { last_seq: 0, sends: [] };
+    slot.last_seq = n;
+    slot.sends.push({ n, at: m.nowIso, owner: c.owner, result: "pending", sha256: env.sha256 });
+    rec.probes_out[k] = slot;
+    addHistory(rec, m.nowIso, "probe", `${k} seq=${n} manual`);
+    return { write: rec, value: { pending: { ref: refOf(rec), slot: { where: "probe", key: k }, n, text: env.text, target: peer.target }, key: k, seq: n } };
+  });
+  const cls = await deliver(c, pending);
+  c.deps.out(`OK probe request=${id} ref=${key} seq=${seq} send=${sendWord(cls)}`);
+  return obligationExit(c, cls, id);
+}
+
+async function cmdClose(c: Ctx, a: Args): Promise<number> {
+  const id = requestArg(a, true)!;
+  const found = await oneRecord(c, id, null);
+  if (found.state !== "stalled") throw new CliError("STATE_INVALID", `request ${id} is '${found.state}', close needs 'stalled'`);
+  await c.store.mutate<null>(refOf(found), (cur, m) => {
+    if (cur === null || cur.state !== "stalled") throw new CliError("STATE_INVALID", `request ${id} is no longer 'stalled'`);
+    const rec = clone(cur);
+    setState(rec, "closed", m.nowIso);
+    addHistory(rec, m.nowIso, "close", "human");
+    return { write: rec, value: null };
+  });
+  c.deps.out(`OK close request=${id} state=closed`);
+  return EXIT.OK;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Entry
+
+/** Runs one command; returns the exit code. Never throws for CliError/StoreError. */
+export async function runCli(argv: readonly string[], deps: CliDeps): Promise<number> {
+  if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h" || argv[0] === "help") {
+    (argv.length === 0 ? deps.err : deps.out)(USAGE);
+    return argv.length === 0 ? EXIT.REFUSED : EXIT.OK;
+  }
+  try {
+    const args = parseArgs(argv);
+    const cfg = loadPeerConfig(deps.env, deps.packageRoot);
+    const store = new ControllerLinkStore({ root: resolveStoreRoot(deps.env, deps.packageRoot), clock: deps.clock });
+    const c: Ctx = { deps, cfg, store, owner: `${deps.proc.pid}@${deps.proc.host}` };
+    switch (args.cmd) {
+      case "ingest": return await cmdIngest(c);
+      case "bind": return await cmdBind(c, args);
+      case "refuse": return await cmdRefuse(c, args);
+      case "reply": return await cmdReply(c, args);
+      case "status": return await cmdStatus(c, args);
+      case "probe": return await cmdProbe(c, args);
+      default: return await cmdClose(c, args);
+    }
+  } catch (e) {
+    if (e instanceof CliError) {
+      deps.err(`controller-link: ${e.message}`);
+      if (e.code === "USAGE") deps.err(USAGE);
+      return e.exit;
+    }
+    if (e instanceof StoreError) {
+      deps.err(`controller-link: ${e.message}`);
+      return EXIT.STORE;
+    }
+    throw e;
+  }
+}
+
+async function readStdinCapped(limit: number): Promise<Uint8Array> {
+  const chunks: Buffer[] = [];
+  let n = 0;
+  for await (const chunk of process.stdin) {
+    const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), "utf8");
+    chunks.push(b);
+    n += b.length;
+    if (n > limit) break;
+  }
+  return Buffer.concat(chunks);
+}
+
+async function readBodyFile(file: string): Promise<Uint8Array> {
+  try {
+    const st = await fsp.stat(file);
+    if (!st.isFile()) throw new CliError("USAGE", "--body-file is not a regular file");
+    if (st.size > BODY_FILE_MAX_BYTES) throw new CliError("PEER_BODY_TOO_LARGE", `--body-file is ${st.size} bytes`);
+    return await fsp.readFile(file);
+  } catch (e) {
+    if (e instanceof CliError) throw e;
+    throw new CliError("USAGE", "--body-file cannot be read");
+  }
+}
+
+/** Production dependencies. */
+export function defaultCliDeps(env: NodeJS.ProcessEnv = process.env): CliDeps {
+  const packageRoot = env.AIGENTRY_SHIM_SCRIPT_DIR
+    ? path.resolve(env.AIGENTRY_SHIM_SCRIPT_DIR, "..")
+    : path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+  const bin = defaultTeleptyBin(env);
+  const faultPoint = env.AIGENTRY_CONTROLLER_LINK_FAULT;
+  const deps: CliDeps = {
+    env, packageRoot,
+    clock: { nowMs: () => Date.now() },
+    runner: defaultProcessRunner,
+    teleptyBin: bin,
+    audit: defaultAuditReader(defaultProcessRunner, bin, env),
+    taskStatus: taskQueueStatus,
+    proc: { pid: process.pid, host: os.hostname().replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 64) || "_" },
+    readStdin: () => readStdinCapped(INGEST_MAX_BYTES),
+    readBodyFile,
+    out: (line) => { process.stdout.write(`${line}\n`); },
+    err: (line) => { process.stderr.write(`${line}\n`); },
+  };
+  if (faultPoint === "after_commit" || faultPoint === "after_inject") {
+    deps.fault = (p) => { if (p === faultPoint) throw new Error(`controller-link: fault injected at ${p}`); };
+  }
+  return deps;
+}
+
+let isMain = false;
+try {
+  isMain = !!process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+} catch {
+  isMain = false;
+}
+if (isMain) {
+  runCli(process.argv.slice(2), defaultCliDeps()).then((code) => { process.exitCode = code; }, (e: unknown) => {
+    process.stderr.write(`controller-link: ${e instanceof Error ? e.message : String(e)}\n`);
+    process.exitCode = 1;
+  });
+}
