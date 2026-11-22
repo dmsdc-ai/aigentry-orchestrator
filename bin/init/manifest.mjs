@@ -24,6 +24,7 @@ const MANIFEST = [
   "bin/context-compact.sh",
   "bin/context-handoff.mjs",
   "bin/context-handoff.sh",
+  "bin/controller-link.sh",
   "bin/boot-prepare.mjs",
   // #751: bin/session-probe.py's read-only current-viewport adapter module. It is imported
   // as a SIBLING from the probe's own directory, so a workspace that holds the probe
@@ -91,6 +92,7 @@ const MANIFEST = [
   "docs/model-profiles/model-routing-profile.md",
   // #1148: dated bootstrap/policy metadata the resolver and the classifier retirement gate read.
   "docs/model-profiles/model-catalog.json",
+  "docs/setup/controller-link.md",
   // #1181: orchestrator-boot usage and init guidance cite this path. Exact leaf only.
   "docs/setup/orchestrator-boot.md",
   "docs/setup/worker-reports.md",
@@ -140,6 +142,7 @@ const GOVERNANCE_ROOTS = [
   "bin/",
   "docs/model-profiles/",
   "docs/rules.md",
+  "docs/setup/controller-link.md",
   "docs/setup/orchestrator-boot.md",
   "docs/setup/worker-reports.md",
   "docs/templates/",
