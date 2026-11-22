@@ -1,0 +1,262 @@
+{
+  "schema_version": 1,
+  "release": {
+    "package": "@dmsdc-ai/aigentry-orchestrator",
+    "version": "0.2.8",
+    "group": "release-1293",
+    "task": 1293,
+    "planning_manifest_sha256": "17446fe06ba4d581d3718c17cc39962eb49004e6198ac106a72b166866b2a8b9"
+  },
+  "candidate": {
+    "inventory_sha256": "29408e7bbd6edc62422cdb2e30f97a12d0ca305bc9ac97d3acae8eb092a305b8",
+    "source_ids": [
+      "src-00001",
+      "src-00002",
+      "src-00003",
+      "src-00004",
+      "src-00005",
+      "src-00006",
+      "src-00007",
+      "src-00008",
+      "src-00009",
+      "src-00010",
+      "src-00011",
+      "src-00012",
+      "src-00013",
+      "src-00014",
+      "src-00015",
+      "src-00016",
+      "src-00017",
+      "src-00018",
+      "src-00019",
+      "src-00020",
+      "src-00021",
+      "src-00022"
+    ],
+    "dependency_ids": [
+      "dep-package-lock-json",
+      "dep-package-json"
+    ]
+  },
+  "scan": {
+    "sarif_id": "sarif",
+    "receipt_id": "receipt",
+    "projected_ids": [
+      "src-00001",
+      "src-00002",
+      "src-00003",
+      "src-00004",
+      "src-00005",
+      "src-00006",
+      "src-00007",
+      "src-00008",
+      "src-00009",
+      "src-00010",
+      "src-00011",
+      "src-00012",
+      "src-00013",
+      "src-00014",
+      "src-00015",
+      "src-00016",
+      "src-00017",
+      "src-00018",
+      "src-00019",
+      "src-00020",
+      "src-00021",
+      "src-00022"
+    ],
+    "scope_id": "scope"
+  },
+  "files": [
+    {
+      "id": "src-00001",
+      "kind": "source",
+      "path": "bin/init/cli.mjs",
+      "bytes": 46776,
+      "sha256": "c057d25e13727753c0cb8d95c8e5736cb1b3d955caaca86853d25a8bcd96a4b1"
+    },
+    {
+      "id": "src-00002",
+      "kind": "source",
+      "path": "bin/lib/workspace-host.sh",
+      "bytes": 69262,
+      "sha256": "f8fb4ab15c4512b7e144610f29bc1a990076c8d615e73465b593d8d87094bc13"
+    },
+    {
+      "id": "src-00003",
+      "kind": "source",
+      "path": "bin/session-probe.py",
+      "bytes": 34940,
+      "sha256": "cb7761e977a1a5c2aca5f4ab98d12252828e38c7b063da6258de25771c8d9a17"
+    },
+    {
+      "id": "dep-package-lock-json",
+      "kind": "dependency",
+      "path": "package-lock.json",
+      "bytes": 24447,
+      "sha256": "d6300cf37d076150a45ca1954f1fb0d72ffe66b4f6e39027033fb330d2a17d80"
+    },
+    {
+      "id": "dep-package-json",
+      "kind": "dependency",
+      "path": "package.json",
+      "bytes": 2552,
+      "sha256": "d1232649d9b7785db9000bf06160c8d9f83563a6a00dfdba84c4107552e33790"
+    },
+    {
+      "id": "src-00004",
+      "kind": "source",
+      "path": "src/dispatch/cli.ts",
+      "bytes": 142087,
+      "sha256": "085e3b7345f6f27e8c94c9d23a6e9e796c66cbdcb525d8abcc60b538b39c6e66"
+    },
+    {
+      "id": "src-00005",
+      "kind": "source",
+      "path": "src/dispatch/usage.ts",
+      "bytes": 12354,
+      "sha256": "9960f393d4b7878113bd3d58759956460b6423b178f44ec8b4adb4f9dc86f0d7"
+    },
+    {
+      "id": "src-00006",
+      "kind": "source",
+      "path": "src/orchestrator-boot/cli.ts",
+      "bytes": 66436,
+      "sha256": "4297d6f9e88b4c53a2de8358f231fa2a20fcf942ec2c1b2e612b54a3ff5609b1"
+    },
+    {
+      "id": "src-00007",
+      "kind": "source",
+      "path": "src/orchestrator-boot/plan.ts",
+      "bytes": 42037,
+      "sha256": "98b7d810bd5454d95db842c7715134c2f0cfb6a60a68e1b92b7ca87f3b59cb19"
+    },
+    {
+      "id": "src-00008",
+      "kind": "source",
+      "path": "src/reconciler/cli.ts",
+      "bytes": 78472,
+      "sha256": "9ddeb77de97e1c47dd2a99ccd9b1869387543b985224e2a5be6dbaa1b65c3abf"
+    },
+    {
+      "id": "src-00009",
+      "kind": "source",
+      "path": "src/session/worker-sandbox.ts",
+      "bytes": 46478,
+      "sha256": "f5dab4a2418affec7b652bc972adfff88ac79d68a1edb3ab297be571f1db4a9e"
+    },
+    {
+      "id": "src-00010",
+      "kind": "source",
+      "path": "tests/dispatch/T23_workspace_host_adapter.sh",
+      "bytes": 22895,
+      "sha256": "f2f803894f5c0074dd59afe9d2774e05e0c689080d315c47c2bbb5d5a12cf988"
+    },
+    {
+      "id": "src-00011",
+      "kind": "source",
+      "path": "tests/dispatch/busy-bound-inject.test.ts",
+      "bytes": 137735,
+      "sha256": "2774297f285e136aa036ace9f9dd2cb3cdac1111757aea88893514717e4570f5"
+    },
+    {
+      "id": "src-00012",
+      "kind": "source",
+      "path": "tests/dispatch/current-readiness-footer.test.ts",
+      "bytes": 44613,
+      "sha256": "177f49dd2882395a6b46893dcbe343fb4418437412c477063e7166c3adf7caa0"
+    },
+    {
+      "id": "src-00013",
+      "kind": "source",
+      "path": "tests/dispatch/current-screen-budget-482.test.ts",
+      "bytes": 14154,
+      "sha256": "927b459801dbe18842fb1409d7ddebfebfcce8ecca60240d61e09d4ef28f65e5"
+    },
+    {
+      "id": "src-00014",
+      "kind": "source",
+      "path": "tests/dispatch/submit-policy-439.test.ts",
+      "bytes": 3364,
+      "sha256": "56498935124ea54f52d979b6c49149d39e73838d71aa8b8770587ef4a588edf5"
+    },
+    {
+      "id": "src-00015",
+      "kind": "source",
+      "path": "tests/dispatch/surface-mismatch-diagnostic.test.ts",
+      "bytes": 14546,
+      "sha256": "52484c0accf03748c8babc95311163af89158279e4c594fb98263bb778470908"
+    },
+    {
+      "id": "src-00016",
+      "kind": "source",
+      "path": "tests/dispatch/telepty-cli-unavailable.test.ts",
+      "bytes": 15089,
+      "sha256": "52b2e9bd0c806f71b4d74561f638430f629cdcf6308796ddb9677baadaed6c72"
+    },
+    {
+      "id": "src-00017",
+      "kind": "source",
+      "path": "tests/packaging/installed-boot-selector.test.mjs",
+      "bytes": 44182,
+      "sha256": "83eb132962a701593c239ed92d910fd0bbbab3688eaf096e7f3d0c04cc509ba9"
+    },
+    {
+      "id": "src-00018",
+      "kind": "source",
+      "path": "tests/packaging/native-capture.test.mjs",
+      "bytes": 35351,
+      "sha256": "4236e3cb7dbdcdd9f6cffb72026c4efe8b98feff6f0f78122317edaec33c18c4"
+    },
+    {
+      "id": "src-00019",
+      "kind": "source",
+      "path": "tests/packaging/orchestrator-boot-wizard.test.mjs",
+      "bytes": 119475,
+      "sha256": "ac419d4da7f514a8c749390ce349c924985268335052157133ac96903114a18f"
+    },
+    {
+      "id": "src-00020",
+      "kind": "source",
+      "path": "tests/packaging/telepty-dependency.test.ts",
+      "bytes": 30046,
+      "sha256": "522ad7c33c6306aad04d04bddc78ae0520648054c81287e8acfd0d394e3e0db4"
+    },
+    {
+      "id": "src-00021",
+      "kind": "source",
+      "path": "tests/packaging/telepty-runtime-requirement.test.ts",
+      "bytes": 38836,
+      "sha256": "722ab04d263434c734bdad78c8ac52000964b4353e4d3f5bc4a2d57ce225b959"
+    },
+    {
+      "id": "src-00022",
+      "kind": "source",
+      "path": "tests/session/worker-codex-system-ca.test.ts",
+      "bytes": 24835,
+      "sha256": "983b0f5f6ca13c0b9a93d89a4bd589fe35e03e8df926ed8d4f6f15261c84c5bb"
+    },
+    {
+      "id": "sarif",
+      "kind": "evidence",
+      "path": null,
+      "bytes": 598,
+      "sha256": "fcf3fa10c38697c4f1c80fa3386f8295a00cf3c9ab6cffcca302b85d824260ba"
+    },
+    {
+      "id": "receipt",
+      "kind": "evidence",
+      "path": null,
+      "bytes": 621,
+      "sha256": "af6ceb082b6da807e8624ae30bf8f7fe709e20f548671897b9cd73232b1cebfc"
+    },
+    {
+      "id": "scope",
+      "kind": "evidence",
+      "path": null,
+      "bytes": 1274,
+      "sha256": "a1df661f706aae7e59c8493a243f70090a6e512189a0a79ab34a9366e7b46eba"
+    }
+  ],
+  "findings": []
+}
