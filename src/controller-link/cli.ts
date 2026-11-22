@@ -1260,8 +1260,14 @@ async function cmdStatus(c: Ctx, a: Args): Promise<number> {
   // Without --request: open records, and terminal ones that still await the controller (CL-09, a REPLY not handled).
   const recs = id === null ? await c.store.list() : await recordsFor(c, id);
   // CL4-10: request ids used by inbox records under more than one peer (counted over every record read, as pickup does).
-  const inboxIds = recs.filter((r) => r.role === "receiver").map((r) => r.request_id);
-  const shared = new Set(inboxIds.filter((x, i) => inboxIds.indexOf(x) !== i));
+  // CL5-03: one traversal (a set of ids seen, a set of ids seen again), not a nested scan.
+  const seen = new Set<string>();
+  const shared = new Set<string>();
+  for (const r of recs) {
+    if (r.role !== "receiver") continue;
+    if (seen.has(r.request_id)) shared.add(r.request_id);
+    else seen.add(r.request_id);
+  }
   const all = recs
     .map((r) => ({ s: statusOf(r), next: awaitingCommands(r, r.role === "receiver" && shared.has(r.request_id)) }))
     .filter((x) => id !== null || !x.s.terminal || x.next.length > 0);

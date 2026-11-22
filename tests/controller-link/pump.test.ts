@@ -656,6 +656,8 @@ test("CL3-02 / CL3-07: the pump deletes nothing — a terminal record of any age
   const orphan = envelope(fields("REQUEST", randomUUID(), SELF, PEER), "orphan");
   fs.writeFileSync(h.store.rawPath(orphan.sha256), orphan.text, { mode: 0o600 });
   assert.equal(await pump(h), 0, h.err.join("\n"));
+  // CL5-04: the pass reports no deletion either (no deletion line, counter or retention result in its output).
+  assert.doesNotMatch([...h.out, ...h.err].join("\n"), /delet|remov|retention|purg|prun/i);
   assert.equal(fs.existsSync(h.store.recordPath(outbox(old))), true);
   assert.equal(fs.existsSync(h.store.rawPath(oldEnv.sha256)), true);
   assert.equal(fs.existsSync(h.store.rawPath(orphan.sha256)), true);

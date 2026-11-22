@@ -1448,6 +1448,9 @@ test("CL3-06 / CL3-08 / CL3-10 shipped text: the fixed pickup forms; every notic
   assert.match(guide, /## Store size and removal/);
   assert.match(guide, /Nothing in controller-link deletes anything/);
   assert.match(guide, /This version has no supported way to remove a request's files/);
+  // CL5-04: no text claims that the pump or any command applies retention or removes records (a second, contradicting
+  // section beside the paragraph above fails here).
+  assert.doesNotMatch(guide + section, /appl(?:y|ies|ied) retention|retention (?:deletes|removes|runs)|(?:pump|command|pass) (?:deletes|removes) (?:\w+ )?(?:records?|files?|envelopes?)|records? (?:are|is) (?:deleted|removed)/i);
   // CL3-08 / CL4-09: every kind the renderer has, each checked against its OWN row of the guide's table (description
   // cell) and its OWN bullet of the role's list, with every variable expansion: REFUSED with a refuse code (written
   // `<code>`) and with none (`-`), CORROBORATED at the receiver (REQUEST) and at the sender (REPLY). Swapping two

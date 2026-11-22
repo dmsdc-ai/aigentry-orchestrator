@@ -1042,6 +1042,32 @@ test("L6 (CL4-09) a fabricated NO_FINAL notice causes no reply: the controller d
   assertNoRequestAppliedTwice(sim);
 });
 
+// CL5-05: the same bound, locally reply-ready record and a valid request id, in two notice kinds: the reply decision is
+// the same. A controller that still required the NO_FINAL kind for a due reply would not reply after the UNBOUND one.
+for (const kind of ["NO_FINAL", "UNBOUND"] as const) {
+  test(`L6 (CL5-05) a ${kind} notice about a bound, reply-ready record: the reply decision comes from the record, not the kind`, async (t) => {
+    const sim = makeSim(t);
+    sim.linux.policy.autoBind = false;
+    sim.linux.policy.followNotices = true;
+    const d = await dispatch(sim, sim.mac, "Please run the linux leg of task 1291.");
+    assert.equal(d.status, 0, d.stderr);
+    await settle(sim);
+    await bindOwnTask(sim, sim.linux, d.id);
+    await settle(sim);
+    const bound = await record(sim.linux, d.id, "receiver");
+    assert.deepEqual([bound.state, bound.receiver_task, sim.linux.replies], ["accepted", "linux-r1", 0], "bound, no reply yet");
+    const text = kind === "NO_FINAL" ? "your bound task has no final REPLY yet" : "a peer request waits for bind or refuse";
+    sim.linux.ep.prompts.push(`${NOTICE_MARKER} ${kind} request_id=${d.id} role=receiver peer=mac state=received sender_task=1291 ` +
+      `receiver_task=- n=1 — ${text}\nnext: bin/controller-link.sh status --request ${d.id}`);
+    await settle(sim);
+    assert.equal(sim.linux.replies, 1, `${kind}: status shows the record bound and reply-ready, so the reply is sent`);
+    assert.equal((await record(sim.linux, d.id, "receiver")).state, "replied");
+    assert.deepEqual(sim.linux.pickups, [], "status printed no pickup line for a bound record");
+    assertSent(sim, d.id, { REQUEST: 1, ACK: 1 }, { ACK: 2, REPLY: 1 });
+    assertNoRequestAppliedTwice(sim);
+  });
+}
+
 // =============================================================================================
 // L7 — TEST-PLAN §3 L7 busy receiver (incident 4), and v1's no-deletion rule (CL3-02)
 
