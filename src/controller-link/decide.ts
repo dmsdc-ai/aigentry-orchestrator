@@ -10,6 +10,9 @@
 // latest attempt); steps 6 and 7 together at most 3 times per message. A human `resend` is not a
 // decision of this function. A re-send always names the message's own stored sha256 (same raw bytes,
 // same id, same seq). An uncertain send (`unknown`, a crashed `pending`) is only ever probed.
+// "Newer than the latest attempt" is decided by ACK sequence, never by wall time (CL-01): every
+// re-send records `ack_seq` (the acks_in sequence it was committed with), so an answer authorises
+// at most one re-send even when the clock moves backward.
 import { RETENTION_MS, isTerminal, type LinkRecord, type SendAttempt, type UnverifiedCopy } from "./store.js";
 
 const MIN = 60_000;
@@ -48,23 +51,26 @@ export type ResendTrigger = "refused_definite" | "ack_unknown" | "ack_unverified
 /** `human` is written by the `resend` command only; it starts a new run of definite refusals. */
 export const RESEND_TRIGGERS = ["refused_definite", "ack_unknown", "ack_unverified", "human"] as const;
 
-export type NoticeKind = "stalled" | "conflict" | "refused" | "peer_unconfigured" | "reply_unverified" | "unbound" | "no_final";
+export type NoticeKind =
+  | "stalled" | "conflict" | "refused" | "peer_unconfigured" | "corroborated" | "reply_unverified" | "unbound" | "no_final";
 /** Highest first; one series per record at a time (the highest applicable kind). */
 export const NOTICE_PRIORITY: readonly NoticeKind[] = [
-  "stalled", "conflict", "refused", "peer_unconfigured", "reply_unverified", "unbound", "no_final",
+  "stalled", "conflict", "refused", "peer_unconfigured", "corroborated", "reply_unverified", "unbound", "no_final",
 ];
 /**
  * §9.3 schedules, as offsets from the series anchor, then every `everyMs` after the last offset
  * (null = no repeat): inbox `received` unbound +10 min, +30 min, then every 2 h; inbox bound without
  * a final REPLY once a day; `stalled` and CONFLICT once, then daily; sender `refused` once (§7.1);
  * an unconfigured peer once (§9.3 last bullet); an uncorroborated REPLY copy at the sender once its 48 h of
- * re-checks are over, then daily, without a state change (Root decision on HOLD-1 Q4).
+ * re-checks are over, then daily, without a state change (Root decision on HOLD-1 Q4); a stored message
+ * the pump found corroborated at once, then every 2 h, until the controller's own ingest applies it (CL-05).
  */
 export const NOTICE_SCHEDULES: Readonly<Record<NoticeKind, { offsets: readonly number[]; everyMs: number | null }>> = {
   stalled: { offsets: [0], everyMs: DAY },
   conflict: { offsets: [0], everyMs: DAY },
   refused: { offsets: [0], everyMs: null },
   peer_unconfigured: { offsets: [0], everyMs: null },
+  corroborated: { offsets: [0], everyMs: 2 * HOUR },
   reply_unverified: { offsets: [0], everyMs: DAY },
   unbound: { offsets: [10 * MIN, 30 * MIN], everyMs: 2 * HOUR },
   no_final: { offsets: [DAY], everyMs: DAY },
@@ -209,16 +215,28 @@ export function answerResends(rec: LinkRecord, key: string): number {
 }
 
 /**
- * Distinct `unverified` answers for `key` ingested after `afterMs`, from the `ack_in` history events
- * U6 writes (`<ref> seq=<n> state=<s>`). History is bounded (64): a dropped entry can only lower the
- * count, which delays a re-send, never adds one.
+ * CL-01: the ACK sequence an attempt was committed with (`ack_seq`, written by pump.ts for every
+ * re-send): an answer is newer than the attempt iff its sequence is greater. An attempt without one
+ * is a message's first send (dispatch, reply), before which no ACK for that message can exist: 0.
+ * Any other attempt without one never authorises an answer re-send (fail closed: probe, then stall).
  */
-export function unverifiedAnswersAfter(rec: LinkRecord, key: string, afterMs: number): number {
-  const seqs = new Set<string>();
+export function ackWatermark(a: SendAttempt): number {
+  const v = a.ack_seq;
+  if (typeof v === "number" && Number.isSafeInteger(v) && v >= 0) return v;
+  return a.n === 1 ? 0 : Number.POSITIVE_INFINITY;
+}
+
+/**
+ * Distinct `unverified` answers for `key` with an ACK sequence greater than `afterSeq`, from the
+ * `ack_in` history events U6 writes (`<ref> seq=<n> state=<s>`). Wall time is not compared (CL-01).
+ * History is bounded (64): a dropped entry can only lower the count, which delays a re-send, never adds one.
+ */
+export function unverifiedAnswersAfter(rec: LinkRecord, key: string, afterSeq: number): number {
+  const seqs = new Set<number>();
   for (const h of rec.history) {
-    if (h.event !== "ack_in" || typeof h.detail !== "string" || !(ms(h.at) > afterMs)) continue;
+    if (h.event !== "ack_in" || typeof h.detail !== "string") continue;
     const m = /^(\S+) seq=([0-9]+) state=unverified$/.exec(h.detail);
-    if (m !== null && m[1] === key) seqs.add(m[2]!);
+    if (m !== null && m[1] === key && Number(m[2]) > afterSeq) seqs.add(Number(m[2]));
   }
   return seqs.size;
 }
@@ -269,12 +287,14 @@ export function evaluateMessage(rec: LinkRecord, key: string, nowMs: number): Ms
   if (a.result === "handed_over" && a.submit === "queued" && nowMs - aAt < QUEUED_WAIT_MS) {
     return { kind: "wait", due_ms: aAt + QUEUED_WAIT_MS, why: `${key} queued at the receiver` };
   }
-  // Steps 6 and 7: a peer answer newer than the latest attempt (at most 3 such re-sends in total).
+  // Steps 6 and 7: a peer answer newer than the latest attempt by ACK sequence (at most 3 such re-sends in
+  // total). The re-send records the sequence it consumed as its own `ack_seq` (CL-01): one answer, one re-send.
   if (ack !== undefined && answerResends(rec, key) < ANSWER_RESENDS_MAX) {
-    if (ack.state === "unknown" && ms(ack.at) > aAt) {
+    const consumed = ackWatermark(a);
+    if (ack.state === "unknown" && ack.last_seq > consumed) {
       return { kind: "act", step: { kind: "resend", key, trigger: "ack_unknown", sha256: entry.sha256 } };
     }
-    if (ack.state === "unverified" && unverifiedAnswersAfter(rec, key, aAt) >= UNVERIFIED_ANSWERS_FOR_RESEND) {
+    if (ack.state === "unverified" && unverifiedAnswersAfter(rec, key, consumed) >= UNVERIFIED_ANSWERS_FOR_RESEND) {
       return { kind: "act", step: { kind: "resend", key, trigger: "ack_unverified", sha256: entry.sha256 } };
     }
   }
@@ -299,15 +319,56 @@ export function unverifiedReplyCopies(rec: LinkRecord): UnverifiedCopy[] {
   });
 }
 
+/**
+ * CL-05: the pump's corroboration re-check (§9.3) never applies a message itself; it records here
+ * (`notices.corroborated`, written by pump.ts) the stored sha256s it found corroborated, and the
+ * `corroborated` notice tells the controller to feed that stored copy to its own `ingest`, whose
+ * RESULT=NEW (with the quoted body) is the only actionable presentation.
+ */
+export function corroboratedMark(rec: LinkRecord): { shas: Set<string>; at: string } | null {
+  const v = rec.notices.corroborated;
+  if (!isObj(v) || !Array.isArray(v.shas) || typeof v.at !== "string") return null;
+  return { shas: new Set(v.shas.filter((s): s is string => typeof s === "string")), at: v.at };
+}
+
+/**
+ * Stored messages the pump found corroborated that no ingest has applied yet (CL-05), in presentation
+ * order: an `unverified` inbox request (and its copies), then REPLY copies, each only inside its 48 h
+ * re-check window (the audit query of a later ingest covers 48 h; then the request stalls and an older REPLY
+ * copy falls back to `reply_unverified`).
+ */
+export function awaitingIngest(rec: LinkRecord, nowMs: number): string[] {
+  const mark = corroboratedMark(rec);
+  if (mark === null) return [];
+  const out: string[] = [];
+  if (rec.role === "receiver" && rec.state === "unverified") {
+    const req = rec.messages["REQUEST-1"];
+    if (nowMs - ms(req?.ingested_at ?? rec.state_at) < VERIFY_WINDOW_MS) {
+      if (req !== undefined && mark.shas.has(req.sha256)) out.push(req.sha256);
+      for (const c of rec.unverified_copies ?? []) if (mark.shas.has(c.sha256)) out.push(c.sha256);
+    }
+  }
+  for (const c of unverifiedReplyCopies(rec)) {
+    if (mark.shas.has(c.sha256) && nowMs - ms(c.at) < VERIFY_WINDOW_MS) out.push(c.sha256);
+  }
+  return [...new Set(out)];
+}
+
 /** The kind of local notice this record is subject to now (highest priority), with its series anchor. */
-export function noticeKindOf(rec: LinkRecord, peerActive: boolean): { kind: NoticeKind; anchor: string; anchorMs: number } | null {
+export function noticeKindOf(rec: LinkRecord, peerActive: boolean, nowMs: number): { kind: NoticeKind; anchor: string; anchorMs: number } | null {
   const at = (kind: NoticeKind, iso: string) => ({ kind, anchor: iso, anchorMs: ms(iso) });
-  if (isTerminal(rec.state)) return rec.role === "sender" && rec.state === "refused" ? at("refused", rec.state_at) : null;
-  if (rec.state === "stalled") return at("stalled", rec.state_at);
   const conflicts = rec.history.filter((h) => h.event === "conflict");
   const conflict = lastOf(conflicts);
+  if (isTerminal(rec.state)) {
+    // CL-12: a CONFLICT is reminded on a terminal record too (once, then daily until retention).
+    if (conflict !== undefined) return at("conflict", conflict.at);
+    return rec.role === "sender" && rec.state === "refused" ? at("refused", rec.state_at) : null;
+  }
+  if (rec.state === "stalled") return at("stalled", rec.state_at);
   if (conflict !== undefined) return at("conflict", conflict.at);
   if (!peerActive) return { kind: "peer_unconfigured", anchor: rec.peer, anchorMs: NaN };
+  const mark = corroboratedMark(rec);
+  if (mark !== null && awaitingIngest(rec, nowMs).length > 0) return at("corroborated", mark.at);
   const copies = unverifiedReplyCopies(rec);
   if (copies.length > 0) {
     // Due when the oldest copy's 48 h of re-checks end (anchor), then daily; the record's state is never changed.
@@ -332,7 +393,7 @@ function noticeEval(rec: LinkRecord, facts: DecideFacts): MsgEval {
     }
     return { kind: "wait", due_ms: ms(claim.at) + NOTICE_LEASE_MS, why: "notice claimed" };
   }
-  const k = noticeKindOf(rec, facts.peerActive);
+  const k = noticeKindOf(rec, facts.peerActive, facts.nowMs);
   if (k === null) return { kind: "done" };
   const s = noticeSeriesOf(rec);
   const same: NoticeSeries | null = s !== null && s.kind === k.kind && s.anchor === k.anchor ? s : null;
@@ -378,14 +439,25 @@ export function decide(rec: LinkRecord, facts: DecideFacts): Step {
   }
   // §9.3: an unverified inbox request is re-checked each pass for 48 h, then stalled. An uncorroborated REPLY
   // copy is re-checked for 48 h; after that only the daily `reply_unverified` notice (no state change, HOLD-1 Q4).
+  // CL-05: the re-check only records corroboration; a corroborated copy is presented by the `corroborated`
+  // notice (before any further re-check) and applied by the controller's own ingest, never by the pump.
+  const marked = corroboratedMark(rec)?.shas ?? new Set<string>();
+  let presentWait: number | null = null;
+  if (awaitingIngest(rec, now).length > 0) {
+    const n = noticeEval(rec, facts);
+    if (n.kind === "act") return n.step;
+    if (n.kind === "wait") presentWait = n.due_ms;
+  }
   if (rec.role === "receiver" && rec.state === "unverified") {
     const req = rec.messages["REQUEST-1"];
     const since = ms(req?.ingested_at ?? rec.state_at);
     if (!(now - since < VERIFY_WINDOW_MS)) return { kind: "stall", why: "request not corroborated within 48 h" };
-    const shas = [req?.sha256, ...(rec.unverified_copies ?? []).map((c) => c.sha256)].filter((x): x is string => typeof x === "string");
-    return { kind: "verify", shas: [...new Set(shas)] };
+    const shas = [req?.sha256, ...(rec.unverified_copies ?? []).map((c) => c.sha256)]
+      .filter((x): x is string => typeof x === "string" && !marked.has(x));
+    if (shas.length > 0) return { kind: "verify", shas: [...new Set(shas)] };
+    return { kind: "none", due_ms: minDue(presentWait, since + VERIFY_WINDOW_MS), why: "corroborated; waiting for the controller's ingest" };
   }
-  const freshCopies = unverifiedReplyCopies(rec).filter((c) => now - ms(c.at) < VERIFY_WINDOW_MS);
+  const freshCopies = unverifiedReplyCopies(rec).filter((c) => now - ms(c.at) < VERIFY_WINDOW_MS && !marked.has(c.sha256));
   if (freshCopies.length > 0) return { kind: "verify", shas: [...new Set(freshCopies.map((c) => c.sha256))] };
   // §9.2 for every obligation message, in order.
   let due: number | null = null;

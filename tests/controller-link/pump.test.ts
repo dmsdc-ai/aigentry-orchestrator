@@ -13,7 +13,7 @@ import { test, type TestContext } from "node:test";
 import { USAGE, runCli, type AuditReader, type AuditRow } from "../../src/controller-link/cli.js";
 import { parseEnvelope, renderEnvelope, type Envelope, type EnvelopeFields } from "../../src/controller-link/envelope.js";
 import {
-  NOTICE_MARKER, PASS_NOTICES_MAX, PASS_SENDS_MAX, PUMP_SWITCH_ENV, pumpOnce, runPump, runResendCli, type PumpDeps,
+  NOTICE_MARKER, PASS_NOTICES_MAX, PASS_SENDS_MAX, PASS_WALL_MS, PUMP_SWITCH_ENV, pumpOnce, runPump, runResendCli, type PumpDeps,
 } from "../../src/controller-link/pump.js";
 import type { ProcessRunner, RunnerResult } from "../../src/controller-link/send.js";
 import { ControllerLinkStore, type LinkRecord, type RecordRef, type RecordState, type SendAttempt } from "../../src/controller-link/store.js";
@@ -484,7 +484,17 @@ test("P8 a claimed attempt with a live owner is never taken over; two concurrent
 });
 
 // ── §9.3 verify, §4 retention, off switch, usage ─────────────────────────────────────────
-test("§9.3 an unverified inbox request is re-checked through ingest and promoted once corroborated", async (t) => {
+/** The controller follows a CORROBORATED notice: its own `ingest` of the named stored copy (CL-05). */
+async function ingestStoredCopy(h: H, sha256: string): Promise<number> {
+  h.out.length = 0;
+  h.err.length = 0;
+  return runCli(["ingest"], { ...h.deps, proc: { pid: CLI_PID, host: HOST }, readStdin: async () => fs.readFileSync(h.store.rawPath(sha256)) });
+}
+
+const corroboratedNotices = (h: H, id: string): string[] =>
+  h.notices.map((n) => n.text).filter((x) => x.startsWith(`${NOTICE_MARKER} CORROBORATED request_id=${id} `));
+
+test("§9.3 / CL-05 an unverified inbox request is re-checked; once corroborated the pump applies nothing and a notice hands it to the controller's own ingest", async (t) => {
   const h = harness(t);
   const id = randomUUID();
   const e = await seedReceiver(h, id, "unverified");
@@ -492,13 +502,164 @@ test("§9.3 an unverified inbox request is re-checked through ingest and promote
   await pump(h);
   assert.equal((await rec(h, inbox(id))).state, "unverified", "still not in the audit");
   assert.equal(h.calls.length, 0);
+  assert.equal(h.notices.length, 0);
   h.rows.push({ inject_id: randomUUID(), to: SID, claimed_from: "controller-link", payload_sha256: e.sha256,
     claimed_cross_host: true, delivery_result: "success" });
   h.now.ms = T0 + 2 * MIN;
-  await pump(h);
-  assert.equal((await rec(h, inbox(id))).state, "received");
-  assert.ok(h.out.some((l) => l.startsWith(`PUMP_VERIFY request=${id} `) && l.includes("results=NEW")));
+  assert.equal(await pump(h), 0, h.err.join("\n"));
+  let r = await rec(h, inbox(id));
+  assert.equal(r.state, "unverified", "the pump does not apply the request: no NEW is consumed out of the controller's sight");
+  assert.equal(h.calls.length, 0, "the pump sends no ACK");
+  assert.ok(h.out.some((l) => l.startsWith(`PUMP_VERIFY request=${id} `) && l.includes("corroborated=1")));
+  const shown = corroboratedNotices(h, id);
+  assert.equal(shown.length, 1, "presented to the controller in the same pass");
+  assert.ok(shown[0]!.includes(`\nnext: bin/controller-link.sh ingest < "${h.store.rawPath(e.sha256)}"`), shown[0]);
+  assert.ok(!shown[0]!.includes("linux asks mac for work"), "the notice carries no peer body");
+  // The controller follows the notice: its own ingest prints RESULT=NEW with the quoted body, sends the ACK.
+  assert.equal(await ingestStoredCopy(h, e.sha256), 0, h.out.join("\n"));
+  assert.ok(h.out.some((l) => l.startsWith(`RESULT=NEW kind=REQUEST id=${id} `)), h.out.join("\n"));
+  assert.ok(h.out.includes("| linux asks mac for work"), h.out.join("\n"));
+  r = await rec(h, inbox(id));
+  assert.equal(r.state, "received");
   assert.equal(sentEnvelopes(h).filter((f) => f.kind === "ACK" && f.state === "received").length, 1);
+  h.now.ms = T0 + 5 * HOUR;
+  await pump(h);
+  assert.equal(corroboratedNotices(h, id).length, 1, "applied: no further presentation");
+});
+
+test("CL-05 a final REPLY corroborated only by the pump's re-check is presented, not applied: the sender stays `accepted` until its own ingest", async (t) => {
+  const h = harness(t);
+  const id = randomUUID();
+  await seedSender(h, id, "accepted", [attempt(1, T0 - DAY, "handed_over")]);
+  const reply = envelope(fields("REPLY", id, PEER, SELF, { outcome: "done", final: "yes", receiver_task: "2026112102" }), "the final result");
+  await h.store.mutate(outbox(id), (cur, m) => {
+    const next = JSON.parse(JSON.stringify(cur)) as LinkRecord;
+    next.acks_in["REQUEST-1"] = { last_seq: 1, state: "accepted", at: iso(T0 - DAY) };
+    next.unverified_copies = [Object.assign({ sha256: reply.sha256, raw: `raw/${reply.sha256}.env`, at: m.nowIso }, { key: "REPLY-1" })];
+    return { write: next, raws: [{ sha256: reply.sha256, bytes: Buffer.from(reply.text, "utf8") }], value: null };
+  });
+  h.now.ms = T0 + MIN;
+  await pump(h);
+  assert.equal(h.notices.length, 0, "not corroborated yet (the audit had no row)");
+  h.rows.push({ inject_id: randomUUID(), to: SID, claimed_from: "controller-link", payload_sha256: reply.sha256,
+    claimed_cross_host: true, delivery_result: "success" });
+  h.now.ms = T0 + 2 * MIN;
+  await pump(h);
+  let r = await rec(h, outbox(id));
+  assert.equal(r.state, "accepted", "the pump never marks the sender replied");
+  assert.equal(r.messages["REPLY-1"], undefined);
+  assert.equal(h.calls.length, 0, "the pump sends no ACK");
+  const shown = corroboratedNotices(h, id);
+  assert.equal(shown.length, 1);
+  assert.ok(shown[0]!.includes(`ingest < "${h.store.rawPath(reply.sha256)}"`), shown[0]);
+  assert.equal(await ingestStoredCopy(h, reply.sha256), 0, h.out.join("\n"));
+  assert.ok(h.out.some((l) => l.startsWith(`RESULT=NEW kind=REPLY id=${id} `)), h.out.join("\n"));
+  assert.ok(h.out.includes("| the final result"), h.out.join("\n"));
+  r = await rec(h, outbox(id));
+  assert.equal(r.state, "replied");
+  assert.equal(sentEnvelopes(h).filter((f) => f.kind === "ACK" && f.ref === "REPLY-1" && f.state === "received").length, 1);
+  h.now.ms = T0 + 5 * HOUR;
+  await pump(h);
+  assert.equal(corroboratedNotices(h, id).length, 1, "applied: no further presentation");
+});
+
+test("CL-01 at the pump: one ACK `unknown` authorises one re-send even when the wall clock moves backward", async (t) => {
+  const h = harness(t);
+  const id = randomUUID();
+  const e = await seedSender(h, id, "send_unknown", [attempt(1, T0, "unknown")]);
+  h.now.ms = T0 + 30 * MIN;
+  await h.store.mutate(outbox(id), (cur, m) => {
+    const next = JSON.parse(JSON.stringify(cur)) as LinkRecord;
+    next.acks_in["REQUEST-1"] = { last_seq: 1, state: "unknown", at: m.nowIso };
+    next.history.push({ at: m.nowIso, event: "ack_in", detail: "REQUEST-1 seq=1 state=unknown" });
+    return { write: next, value: null };
+  });
+  h.now.ms = T0 + 20 * MIN; // the wall clock moves back 10 min
+  h.replies.push({ rc: null, stdout: "", stderr: "", truncated: false }); // the re-send's result is unknown
+  await pump(h);
+  assert.equal(h.calls.length, 1);
+  assert.equal(lastArg(h.calls[0]!), e.text);
+  let r = await rec(h, outbox(id));
+  const a2 = r.messages["REQUEST-1"]!.sends!.at(-1)!;
+  assert.equal(a2.trigger, "ack_unknown");
+  assert.equal(a2.result, "unknown");
+  assert.equal(a2.ack_seq, 1, "the consumed ACK sequence is recorded with the attempt");
+  for (const m of [21, 22, 24]) {
+    h.now.ms = T0 + m * MIN;
+    await pump(h);
+  }
+  assert.equal(h.calls.length, 1, "the same ACK never authorises a second re-send");
+  r = await rec(h, outbox(id));
+  assert.equal(r.messages["REQUEST-1"]!.answer_resends, 1);
+  assert.equal(r.messages["REQUEST-1"]!.sends!.length, 2);
+});
+
+test("CL-01 at the pump: a refusal re-send records the refused attempt it consumed (`trigger_n`)", async (t) => {
+  const h = harness(t);
+  const id = randomUUID();
+  await seedSender(h, id, "send_refused", [attempt(1, T0, "refused_definite")]);
+  h.now.ms = T0 + MIN;
+  await pump(h);
+  const a2 = (await rec(h, outbox(id))).messages["REQUEST-1"]!.sends!.at(-1)!;
+  assert.equal(a2.trigger, "refused_definite");
+  assert.equal(a2.trigger_n, 1);
+  assert.equal(a2.ack_seq, 0);
+});
+
+test("CL-08 a re-check's audit queries each start only if their worst case fits before the pass deadline; nothing is sent", async (t) => {
+  const h = harness(t);
+  const id = randomUUID();
+  await seedReceiver(h, id, "unverified");
+  const other = envelope(fields("REQUEST", id, PEER, SELF), "another copy of the request");
+  await h.store.mutate(inbox(id), (cur, m) => {
+    const next = JSON.parse(JSON.stringify(cur)) as LinkRecord;
+    next.unverified_copies = [Object.assign({ sha256: other.sha256, raw: `raw/${other.sha256}.env`, at: m.nowIso }, { key: "REQUEST-1" })];
+    return { write: next, raws: [{ sha256: other.sha256, bytes: Buffer.from(other.text, "utf8") }], value: null };
+  });
+  let pages = 0;
+  const slow: PumpDeps = { ...h.deps, audit: { async page() { pages += 1; h.mono.ms += 100_000; return { rows: [], next_cursor: null }; } } };
+  h.now.ms = T0 + MIN;
+  await pump(h, slow);
+  assert.equal(pages, 1, "after 100 s a second query (worst case 150 s) does not fit in the 240 s pass");
+  assert.ok(h.out.some((l) => l.startsWith(`PUMP_DEFERRED request=${id} `) && l.includes("step=verify")), h.out.join("\n"));
+  assert.equal(h.calls.length, 0, "a re-check sends nothing cross-machine");
+});
+
+test("CL-08 / CL-18 retention starts only before the pass deadline; what it would delete goes next pass", async (t) => {
+  const h = harness(t);
+  const old = randomUUID();
+  await seedSender(h, old, "replied", [attempt(1, T0 - 31 * DAY, "handed_over")]);
+  await seedSender(h, randomUUID(), "sent", [attempt(1, T0, "handed_over")]);
+  h.monoPerSend = PASS_WALL_MS + 10_000;
+  h.now.ms = T0 + 5 * MIN;
+  assert.equal(await pump(h), 3, "a pass that reached its deadline reports it");
+  assert.equal(h.calls.length, 1);
+  assert.ok(h.out.includes("PUMP_DEADLINE retention is left for the next pass"), h.out.join("\n"));
+  assert.equal(fs.existsSync(h.store.recordPath(outbox(old))), true, "retention did not start after the deadline");
+  h.monoPerSend = 0;
+  h.now.ms = T0 + 6 * MIN;
+  assert.equal(await pump(h), 0, h.err.join("\n"));
+  assert.equal(fs.existsSync(h.store.recordPath(outbox(old))), false);
+});
+
+test("CL-12 a CONFLICT on a terminal record gets its notice, then daily", async (t) => {
+  const h = harness(t);
+  const id = randomUUID();
+  await seedSender(h, id, "replied", [attempt(1, T0 - HOUR, "handed_over")], {
+    history: [{ at: iso(T0 - HOUR), event: "created", detail: "dispatch" }, { at: iso(T0), event: "conflict", detail: `REPLY-1 sha256=${"f".repeat(64)}` }],
+  });
+  h.now.ms = T0 + MIN;
+  await pump(h);
+  assert.equal(h.notices.length, 1);
+  assert.ok(h.notices[0]!.text.startsWith(`${NOTICE_MARKER} CONFLICT request_id=${id} `), h.notices[0]!.text);
+  assert.match(h.notices[0]!.text, /state=replied/);
+  h.now.ms = T0 + DAY - MIN;
+  await pump(h);
+  assert.equal(h.notices.length, 1);
+  h.now.ms = T0 + DAY;
+  await pump(h);
+  assert.equal(h.notices.length, 2, "daily until retention");
+  assert.equal(h.calls.length, 0);
 });
 
 test("§4 retention: terminal records 30 days old and raw files no record names are deleted; open records kept", async (t) => {

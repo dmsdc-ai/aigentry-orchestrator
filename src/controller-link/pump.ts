@@ -5,10 +5,13 @@
 //
 // One pass: load every record through the U2 store, ask decide() (pure) for each record's single next
 // step and perform it — recover a crashed `pending` attempt as `unknown`, mark `stalled`, send a PROBE,
-// re-send the SAME raw bytes (only on the triggers decide() allows), re-check corroboration through U6
-// `ingest`, or post a local notice — within the per-pass budget (≤ 240 s, ≤ 20 cross-machine sends,
-// ≤ 10 notices; a send starts only if its 120 s timeout fits). Then delete what the store's retention
-// selector returns (records first, then raw files), under the store lock.
+// re-send the SAME raw bytes (only on the triggers decide() allows), re-check corroboration (U6
+// `corroborate`, read only: the pump never applies a message; CL-05), or post a local notice — within the
+// per-pass budget (≤ 240 s, ≤ 20 cross-machine sends, ≤ 10 notices). The pass has ONE deadline (CL-08):
+// every step, every audit query and retention check it before they start, each with its own worst case
+// (a send its 120 s timeout, a notice the report pump's inject timeout, an audit query 5 pages × 30 s).
+// Then, if the deadline still allows, delete what the store's retention selector returns (records
+// first, then raw files), under the store lock.
 //
 // Every send follows SPEC §6.1: under the lock the attempt is written `pending` with `owner=<pid>@<host>`
 // and committed BEFORE telepty runs (U3 sendEnvelope); the result is written afterwards. A claim (a
@@ -24,9 +27,12 @@ import { performance } from "node:perf_hooks";
 import { parseInjectId } from "../dispatch/inject-id.js";
 import { sanitizeBody } from "../report/envelope.js";
 import { INJECT_TIMEOUT_MS, defaultPidAlive, defaultTeleptyPort, submitOutcome, type TeleptyPort } from "../report/pump.js";
-import { CliError, EXIT, activePeer, loadPeerConfig, nextActionFor, runCli, sentAt, type CliDeps, type PeerConfig } from "./cli.js";
 import {
-  answerResends, decide, dueOf, noticeClaimOf, noticeSeriesOf, pendingOwners, SETTLING_ACK_STATES,
+  AUDIT_MAX_PAGES, AUDIT_TIMEOUT_MS, CliError, EXIT, activePeer, corroborate, loadPeerConfig, nextActionFor, sentAt,
+  type CliDeps, type PeerConfig,
+} from "./cli.js";
+import {
+  answerResends, awaitingIngest, corroboratedMark, decide, dueOf, noticeClaimOf, noticeSeriesOf, pendingOwners, SETTLING_ACK_STATES,
   type AttemptSlot, type DecideFacts, type NoticeKind, type Step,
 } from "./decide.js";
 import { REQUEST_ID_RE, SEQ_MAX, renderEnvelope } from "./envelope.js";
@@ -47,9 +53,11 @@ export const PASS_SENDS_MAX = 20;
 export const PASS_NOTICES_MAX = 10;
 /** A notice starts only if the report pump sender's own inject timeout fits in the pass. */
 export const NOTICE_TIMEOUT_MS = INJECT_TIMEOUT_MS;
+/** One corroboration re-check starts only if its worst case (every page at its timeout) fits in the pass (CL-08). */
+export const AUDIT_CHECK_MS = AUDIT_TIMEOUT_MS * AUDIT_MAX_PAGES;
 /** First token of every local notice (not an envelope; ingest ignores it). */
 export const NOTICE_MARKER = "⟦controller-link notice⟧";
-/** Local steps (recover, stall) a record may take in one pass before its one send or notice. */
+/** Local steps (recover, stall, verify) a record may take in one pass before its one send or notice. */
 export const RECORD_STEPS_MAX = 4;
 /** `resend --reason`: one line, at most this many characters. */
 export const RESEND_REASON_MAX = 512;
@@ -328,7 +336,11 @@ async function doResend(c: PumpCtx, rec: LinkRecord, step: Extract<Step, { kind:
     const sends = entry.sends ?? [];
     const n = Math.max(0, ...sends.map((x) => x.n)) + 1;
     if (step.trigger !== "refused_definite") entry.answer_resends = answerResends(next, step.key) + 1;
-    sends.push({ n, at: nowIso, owner: c.owner, result: "pending", trigger: step.trigger });
+    // CL-01: the trigger this re-send consumes, by identity — `ack_seq` (the ACK sequence it answers; decide()
+    // allows the next answer re-send only for a greater one) and, for a refusal, `trigger_n` (the refused attempt).
+    const latest = sends[sends.length - 1];
+    sends.push({ n, at: nowIso, owner: c.owner, result: "pending", trigger: step.trigger, ack_seq: next.acks_in[step.key]?.last_seq ?? 0,
+      ...(step.trigger === "refused_definite" && latest !== undefined ? { trigger_n: latest.n } : {}) });
     entry.sends = sends;
     addHistory(next, nowIso, "resend", `${step.key} n=${n} trigger=${step.trigger} sha256=${step.sha256}`);
     refreshNext(c, next, nowMs);
@@ -341,27 +353,48 @@ async function doResend(c: PumpCtx, rec: LinkRecord, step: Extract<Step, { kind:
     `sha256=${step.sha256} send=${sendWord(cls)}`);
 }
 
-/** §9.3: re-run §8.1 step 3 by feeding the stored raw bytes to U6 `ingest` ("as if newly ingested"). */
-async function doVerify(c: PumpCtx, rec: LinkRecord, step: Extract<Step, { kind: "verify" }>): Promise<void> {
-  const blocks: string[] = [];
+/**
+ * §9.3: re-run §8.1 step 3 (U6 `corroborate`, read only) for each stored copy. CL-05: the pump applies
+ * nothing — no state change, no ACK, no consumed presentation; a corroborated sha256 is recorded in
+ * `notices.corroborated` and the `corroborated` notice tells the controller to feed the stored copy to its
+ * own ingest (RESULT=NEW with the quoted body, the ACK, the state change). CL-08: no cross-machine send
+ * happens here, and each audit query starts only if its worst case fits before the pass deadline.
+ * Returns the record when a new corroboration was recorded (its notice may follow in this pass), else null.
+ */
+async function doVerify(c: PumpCtx, rec: LinkRecord, step: Extract<Step, { kind: "verify" }>): Promise<LinkRecord | null> {
+  const found: string[] = [];
+  let checked = 0;
   for (const sha of step.shas) {
-    const raw = await c.store.readRaw(sha);
-    if (raw !== null) blocks.push(raw.toString("utf8"));
+    if (!auditFits(c)) {
+      defer(c, rec, step);
+      break;
+    }
+    if ((await c.store.readRaw(sha)) === null) continue;
+    checked += 1;
+    const r = await corroborate(c.deps.audit, sha, c.cfg.self.controller_sid, c.deps.clock.nowMs());
+    if (r.state === "corroborated") found.push(sha);
   }
-  if (blocks.length === 0) return;
-  c.res.sends += 1; // ingest may answer with an ACK: counted as one cross-machine send
+  if (checked === 0) return null;
   c.res.verified += 1;
-  const lines: string[] = [];
-  const input = Buffer.from(blocks.join("\n"), "utf8");
-  const code = await runCli(["ingest"], {
-    ...c.deps, readStdin: async () => input, out: (l) => { lines.push(l); }, err: (l) => { lines.push(l); },
+  const marked = found.length === 0 ? null : await underSameStep<LinkRecord>(c, rec, step, (cur, nowIso, nowMs) => {
+    const known = corroboratedMark(cur)?.shas ?? new Set<string>();
+    const added = found.filter((s) => !known.has(s));
+    if (added.length === 0) return null;
+    const next = clone(cur);
+    next.notices.corroborated = { shas: [...known, ...added], at: nowIso };
+    addHistory(next, nowIso, "corroborated_by_pump", `${added.join(",")} awaiting the controller's ingest`);
+    refreshNext(c, next, nowMs);
+    return { write: next, value: next };
   });
-  const results = lines.filter((l) => l.startsWith("RESULT=")).map((l) => l.split(" ")[0]!.slice("RESULT=".length));
-  c.res.lines.push(`PUMP_VERIFY request=${rec.request_id} role=${rec.role} blocks=${blocks.length} results=${results.join(",") || "-"} exit=${code}`);
+  c.res.lines.push(`PUMP_VERIFY request=${rec.request_id} role=${rec.role} checked=${checked} corroborated=${found.length}`);
+  return marked;
 }
 
-/** The local notice text (§9.3): names the record, its state and the exact next command. */
-export function renderControllerNotice(rec: LinkRecord, kind: NoticeKind, n: number): string {
+/**
+ * The local notice text (§9.3): names the record, its state and the exact next command. For `corroborated`
+ * (CL-05) `ingestFile` is the stored raw copy the controller feeds to its own ingest.
+ */
+export function renderControllerNotice(rec: LinkRecord, kind: NoticeKind, n: number, ingestFile: string | null = null): string {
   const id = rec.request_id;
   const status = `${SHIM} status --request ${id}`;
   const lastStall = [...rec.history].reverse().find((h) => h.event === "stalled");
@@ -373,6 +406,9 @@ export function renderControllerNotice(rec: LinkRecord, kind: NoticeKind, n: num
     refused: [`the peer refused this request (reason=${reason})`, status],
     peer_unconfigured: [`peer ${rec.peer} is not configured with link "v1"; nothing is sent for this record and its state is kept`,
       `fix state/controller-peers.json, then ${status}`],
+    corroborated: [`a ${rec.role === "receiver" ? "REQUEST" : "REPLY"} from peer ${rec.peer} stored unverified is now corroborated by ` +
+      "this machine's telepty audit; it has not been shown or applied; run the next command and act only on its RESULT=NEW",
+    ingestFile === null ? status : `${SHIM} ingest < "${ingestFile}"`],
     reply_unverified: ["a REPLY from the peer is still not corroborated by this machine's telepty audit after 48 h; " +
       "it is not acted on and the record's state is kept", `${status}  # a corroborated copy is still ingested when it arrives`],
     unbound: ["a peer request waits for bind or refuse", nextActionFor("receiver", "received", id, rec.state_at).text],
@@ -393,7 +429,9 @@ async function doRemind(c: PumpCtx, rec: LinkRecord, step: Extract<Step, { kind:
   c.res.notices += 1;
   const s = noticeSeriesOf(claimed.rec);
   const n = (s !== null && s.kind === step.notice && s.anchor === step.anchor ? s.n : 0) + 1;
-  const r = c.deps.notice.inject(c.cfg.self.controller_sid, renderControllerNotice(claimed.rec, step.notice, n));
+  const pick = step.notice === "corroborated" ? awaitingIngest(claimed.rec, Date.parse(claimed.at))[0] : undefined;
+  const r = c.deps.notice.inject(c.cfg.self.controller_sid,
+    renderControllerNotice(claimed.rec, step.notice, n, pick === undefined ? null : c.store.rawPath(pick)));
   const submit = submitOutcome(r);
   const injectId = parseInjectId(r.stdout) || null;
   const delivered = r.rc === 0;
@@ -422,6 +460,16 @@ function noticeFits(c: PumpCtx): boolean {
   return c.res.notices < PASS_NOTICES_MAX && c.deps.monoMs() - c.t0 + NOTICE_TIMEOUT_MS <= PASS_WALL_MS;
 }
 
+/** CL-08: one corroboration re-check (an audit query, no cross-machine send) starts only if its worst case fits. */
+function auditFits(c: PumpCtx): boolean {
+  return c.deps.monoMs() - c.t0 + AUDIT_CHECK_MS <= PASS_WALL_MS;
+}
+
+/** CL-08: the pass's single deadline, checked before every step (local ones included) and before retention. */
+function pastDeadline(c: PumpCtx): boolean {
+  return c.deps.monoMs() - c.t0 >= PASS_WALL_MS;
+}
+
 function defer(c: PumpCtx, rec: LinkRecord, step: Step): void {
   c.res.deferred += 1;
   c.res.lines.push(`PUMP_DEFERRED request=${rec.request_id} role=${rec.role} step=${step.kind} reason=pass_budget`);
@@ -433,10 +481,12 @@ async function processRecord(c: PumpCtx, first: LinkRecord): Promise<void> {
     if (next === null) return;
     const rec: LinkRecord = next;
     const step = decide(rec, c.facts(rec, c.deps.clock.nowMs()));
+    if (step.kind === "none" || step.kind === "expire") return;
+    if (pastDeadline(c)) {
+      defer(c, rec, step);
+      return;
+    }
     switch (step.kind) {
-      case "none":
-      case "expire":
-        return;
       case "recover":
         next = await applyRecover(c, rec, step);
         break;
@@ -452,9 +502,10 @@ async function processRecord(c: PumpCtx, first: LinkRecord): Promise<void> {
         else defer(c, rec, step);
         return;
       case "verify":
-        if (sendFits(c)) await doVerify(c, rec, step);
-        else defer(c, rec, step);
-        return;
+        // Local (no send); each audit query checks the deadline itself (auditFits). A new corroboration
+        // continues to its `corroborated` notice in this pass (CL-05).
+        next = await doVerify(c, rec, step);
+        break;
       default:
         if (noticeFits(c)) await doRemind(c, rec, step);
         else defer(c, rec, step);
@@ -504,7 +555,7 @@ export async function pumpOnce(deps: PumpDeps): Promise<PassResult> {
   const records = await store.list();
   res.records = records.length;
   for (const rec of records) {
-    if (deps.monoMs() - c.t0 >= PASS_WALL_MS) {
+    if (pastDeadline(c)) {
       res.errors.push("pass_deadline");
       res.lines.push("PUMP_DEADLINE remaining records are left for the next pass");
       break;
@@ -517,7 +568,14 @@ export async function pumpOnce(deps: PumpDeps): Promise<PassResult> {
       res.lines.push(`PUMP_ERROR request=${rec.request_id} role=${rec.role} error=${oneLine(e instanceof Error ? e.message : String(e))}`);
     }
   }
-  await retention(c);
+  // CL-08 / CL-18: retention re-reads the whole store, so it starts only before the pass deadline; what it
+  // would delete stays selectable and is deleted by the next pass.
+  if (pastDeadline(c)) {
+    if (!res.errors.includes("pass_deadline")) res.errors.push("pass_deadline");
+    res.lines.push("PUMP_DEADLINE retention is left for the next pass");
+  } else {
+    await retention(c);
+  }
   return res;
 }
 
@@ -639,7 +697,7 @@ async function humanResend(c: SendCtx, id: string, reason: string): Promise<numb
     const sends = entry.sends ?? [];
     if (sends.some((a) => a.result === "pending")) throw new CliError("STATE_INVALID", `request ${id} has an attempt in flight`);
     const n = Math.max(0, ...sends.map((x) => x.n)) + 1;
-    sends.push({ n, at: m.nowIso, owner: c.owner, result: "pending", trigger: "human" });
+    sends.push({ n, at: m.nowIso, owner: c.owner, result: "pending", trigger: "human", ack_seq: next.acks_in[key]?.last_seq ?? 0 });
     entry.sends = sends;
     setState(next, next.role === "sender" ? "sent" : "replying", m.nowIso); // §7.1 / §7.2: stalled → sent / replying (resend)
     addHistory(next, m.nowIso, "resend", `${key} n=${n} human reason=${reason}`);

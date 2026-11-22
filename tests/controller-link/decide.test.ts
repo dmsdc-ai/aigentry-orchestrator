@@ -147,11 +147,13 @@ function prng(seed: number): () => number {
   };
 }
 
-test("P2 property: a re-send appears only after a definite refusal, an `unknown` answer or the second `unverified` answer (or a human), and names the same sha", () => {
+test("P2 property: a re-send appears only after a definite refusal, an `unknown` answer or the second `unverified` answer (or a human), names the same sha, and consumes its trigger once even when the clock moves backward", () => {
   const RESULTS: SendAttempt["result"][] = ["handed_over", "unknown", "refused_definite", "pending"];
   const ACKS = ["received", "accepted", "refused", "unverified", "unknown"];
   let resendsSeen = 0;
   let uncertainChecks = 0;
+  let rollbacks = 0;
+  let answerResendsAfterRollback = 0;
   for (let run = 0; run < 400; run++) {
     const rnd = prng(0x1294 + run);
     const pick = <T>(xs: readonly T[]): T => xs[Math.floor(rnd() * xs.length)]!;
@@ -164,12 +166,27 @@ test("P2 property: a re-send appears only after a definite refusal, an `unknown`
     let now = T0;
     let answerResends = 0;
     const gone = new Set<string>();
+    // The once-only trigger state (CL-01), kept by this oracle in EVENT ORDER, never by wall time:
+    // `ackEv` = the event at which each ACK sequence arrived and its state; `attemptEv` = the event of
+    // the latest attempt; `consumed` = ACK sequences an `ack_unknown` re-send has already spent.
+    const ackEv = new Map<number, { ev: number; state: string }>();
+    let attemptEv = -1;
+    const consumed = new Set<number>();
+    let rolledBack = false;
+    // What pump.ts commits with every attempt: the ACK sequence seen at that moment.
+    const ackSeqNow = (): number => rec.acks_in[key]?.last_seq ?? 0;
     for (let ev = 0; ev < 80; ev++) {
       const r = rnd();
-      if (r < 0.3) {
+      if (r < 0.25) {
         now += pick([MIN, 5 * MIN, 17 * MIN, HOUR, 3 * HOUR, 11 * HOUR]);
+      } else if (r < 0.3) {
+        // the wall clock moves backward (NTP step, VM restore): ACK and attempt times stop being ordered
+        now -= pick([MIN, 10 * MIN, 2 * HOUR]);
+        rollbacks += 1;
+        rolledBack = true;
       } else if (r < 0.45) {
         addAck(rec, key, pick(ACKS), now);
+        ackEv.set(rec.acks_in[key]!.last_seq, { ev, state: rec.acks_in[key]!.state });
         const a = rec.acks_in[key]!.state;
         if (role === "sender" && !["refused", "replied", "closed", "stalled"].includes(rec.state)) {
           if (a === "received" && rec.state !== "accepted") rec.state = "received";
@@ -180,20 +197,22 @@ test("P2 property: a re-send appears only after a definite refusal, an `unknown`
       } else if (r < 0.52) {
         // a crash after §6.1 step 1 (dispatch, ingest answer or another pump): an orphaned pending attempt
         const sends = sendsOf(rec, key);
-        sends.push(attempt(sends.length + 1, now, "pending", { owner: DEAD }));
+        sends.push(attempt(sends.length + 1, now, "pending", { owner: DEAD, ack_seq: ackSeqNow() }));
+        attemptEv = ev;
         if (rnd() < 0.5) gone.add(DEAD); else gone.delete(DEAD);
       } else if (r < 0.55 && rec.state === "stalled") {
         // the human `resend` command (not a decision of decide()); recorded as trigger "human"
         const sends = sendsOf(rec, key);
-        sends.push(attempt(sends.length + 1, now, pick(RESULTS.filter((x) => x !== "pending")), { trigger: "human" }));
+        sends.push(attempt(sends.length + 1, now, pick(RESULTS.filter((x) => x !== "pending")), { trigger: "human", ack_seq: ackSeqNow() }));
+        attemptEv = ev;
         rec.state = role === "sender" ? "sent" : "replying";
       } else {
         const s: Step = decide(rec, facts(now, { goneOwners: gone }));
         const last = latest(rec, key);
         const ack = rec.acks_in[key];
-        const unverifiedAfter = new Set(rec.history.filter((h) => h.event === "ack_in" && Date.parse(h.at) > Date.parse(last.at) &&
-          typeof h.detail === "string" && h.detail.startsWith(`${key} `) && h.detail.endsWith("state=unverified")).map((h) => h.detail)).size;
-        const unknownAnswer = ack !== undefined && ack.state === "unknown" && Date.parse(String(ack.at)) > Date.parse(last.at);
+        const newer = [...ackEv.values()].filter((x) => x.ev > attemptEv);
+        const unverifiedAfter = newer.filter((x) => x.state === "unverified").length;
+        const unknownAnswer = ack !== undefined && ack.state === "unknown" && (ackEv.get(ack.last_seq)?.ev ?? -1) > attemptEv;
         if (last.result === "unknown" || last.result === "pending") {
           uncertainChecks += 1;
           if (s.kind === "resend") assert.notEqual(s.trigger, "refused_definite", "an uncertain send is never re-sent as a refusal");
@@ -210,6 +229,9 @@ test("P2 property: a re-send appears only after a definite refusal, an `unknown`
           } else if (s.trigger === "ack_unknown") {
             assert.ok(unknownAnswer, "step 6 only after an `unknown` answer newer than the latest attempt");
             assert.ok(answerResends < ANSWER_RESENDS_MAX, "at most 3 answer re-sends");
+            assert.ok(!consumed.has(ack!.last_seq), "one `unknown` answer authorises one re-send, whatever the clock did (CL-01)");
+            consumed.add(ack!.last_seq);
+            if (rolledBack) answerResendsAfterRollback += 1;
           } else {
             assert.equal(s.trigger, "ack_unverified");
             assert.equal(ack?.state, "unverified");
@@ -221,7 +243,8 @@ test("P2 property: a re-send appears only after a definite refusal, an `unknown`
             rec.messages[key]!.answer_resends = answerResends;
           }
           const sends = sendsOf(rec, key);
-          sends.push(attempt(sends.length + 1, now, pick(RESULTS), { trigger: s.trigger }));
+          sends.push(attempt(sends.length + 1, now, pick(RESULTS), { trigger: s.trigger, ack_seq: ackSeqNow() }));
+          attemptEv = ev;
         } else if (s.kind === "recover" && s.slot.where === "message") {
           const a = sendsOf(rec, s.slot.key).find((x) => x.n === s.n && x.result === "pending");
           assert.ok(a, "recover names a pending attempt");
@@ -240,6 +263,8 @@ test("P2 property: a re-send appears only after a definite refusal, an `unknown`
   }
   assert.ok(resendsSeen > 20, `the property run exercised re-sends (${resendsSeen})`);
   assert.ok(uncertainChecks > 50, `the property run exercised uncertain sends (${uncertainChecks})`);
+  assert.ok(rollbacks > 100, `the property run moved the clock backward (${rollbacks})`);
+  assert.ok(answerResendsAfterRollback > 0, `the property run exercised answer re-sends after a rollback (${answerResendsAfterRollback})`);
 });
 
 test("P2 an `unknown` send with no answer is probed and never re-sent, for 48 h, then stalled", () => {
@@ -253,8 +278,9 @@ test("P2 an `unknown` send with no answer is probed and never re-sent, for 48 h,
 });
 
 test("P2 step 6: one re-send per `unknown` answer newer than the latest attempt, at most 3 in total", () => {
-  const rec = sender([attempt(1, T0, "handed_over")]);
-  addAck(rec, "REQUEST-1", "unknown", T0 - MIN); // older than the attempt: no re-send
+  // older than the attempt: the attempt was committed after ACK seq 1 arrived (its ack_seq) — no re-send
+  const rec = sender([attempt(1, T0, "handed_over", { ack_seq: 1 })]);
+  addAck(rec, "REQUEST-1", "unknown", T0 - MIN);
   assert.notEqual(decide(rec, facts(T0 + MIN)).kind, "resend");
   let t = T0;
   for (let i = 1; i <= 4; i++) {
@@ -264,7 +290,7 @@ test("P2 step 6: one re-send per `unknown` answer newer than the latest attempt,
     if (i <= ANSWER_RESENDS_MAX) {
       assert.deepEqual(s, { kind: "resend", key: "REQUEST-1", trigger: "ack_unknown", sha256: SHA });
       rec.messages["REQUEST-1"]!.answer_resends = i;
-      sendsOf(rec, "REQUEST-1").push(attempt(i + 1, t + 1, "handed_over", { trigger: "ack_unknown" }));
+      sendsOf(rec, "REQUEST-1").push(attempt(i + 1, t + 1, "handed_over", { trigger: "ack_unknown", ack_seq: rec.acks_in["REQUEST-1"]!.last_seq }));
       assert.notEqual(decide(rec, facts(t + 2)).kind, "resend", "once per answer");
     } else {
       assert.notEqual(s.kind, "resend", "the fourth answer re-send is refused");
@@ -278,6 +304,37 @@ test("P2 step 7: the first `unverified` answer keeps probing; the second newer o
   assert.notEqual(decide(rec, facts(T0 + 7 * MIN)).kind, "resend");
   addAck(rec, "REQUEST-1", "unverified", T0 + 16 * MIN);
   assert.deepEqual(decide(rec, facts(T0 + 17 * MIN)), { kind: "resend", key: "REQUEST-1", trigger: "ack_unverified", sha256: SHA });
+});
+
+test("CL-01 step 6 after a backward clock step: one `unknown` answer authorises exactly one re-send; the next answer (by sequence) the next", () => {
+  const rec = sender([attempt(1, T0, "unknown")], "send_unknown");
+  addAck(rec, "REQUEST-1", "unknown", T0 + 30 * MIN); // seq 1
+  // the sender's wall clock moves back 10 min; the re-send consuming seq 1 is committed at T0 + 20 min
+  assert.deepEqual(decide(rec, facts(T0 + 20 * MIN)), { kind: "resend", key: "REQUEST-1", trigger: "ack_unknown", sha256: SHA });
+  rec.messages["REQUEST-1"]!.answer_resends = 1;
+  sendsOf(rec, "REQUEST-1").push(attempt(2, T0 + 20 * MIN, "unknown", { trigger: "ack_unknown", ack_seq: 1 }));
+  for (let t = T0 + 20 * MIN; t < T0 + 3 * HOUR; t += MIN) {
+    assert.notEqual(decide(rec, facts(t)).kind, "resend", `ACK seq 1 is spent (its wall time is later than the re-send) at +${(t - T0) / MIN} min`);
+  }
+  addAck(rec, "REQUEST-1", "unknown", T0 + 10 * MIN); // seq 2: newer by sequence although its wall time is older
+  assert.deepEqual(decide(rec, facts(T0 + 3 * HOUR)), { kind: "resend", key: "REQUEST-1", trigger: "ack_unknown", sha256: SHA });
+});
+
+test("CL-01 step 7 counts `unverified` answers by sequence after the latest attempt, not by wall time", () => {
+  const rec = sender([attempt(1, T0, "handed_over"), attempt(2, T0 + HOUR, "handed_over", { trigger: "ack_unknown", ack_seq: 1 })],
+    "unverified_at_peer");
+  addAck(rec, "REQUEST-1", "unknown", T0 + 30 * MIN); // seq 1, consumed by attempt 2
+  rec.messages["REQUEST-1"]!.answer_resends = 1;
+  addAck(rec, "REQUEST-1", "unverified", T0 + 10 * MIN); // seq 2: after attempt 2, wall clock moved back
+  assert.notEqual(decide(rec, facts(T0 + HOUR + MIN)).kind, "resend", "the first `unverified` answer keeps probing");
+  addAck(rec, "REQUEST-1", "unverified", T0 + 20 * MIN); // seq 3
+  assert.deepEqual(decide(rec, facts(T0 + HOUR + MIN)), { kind: "resend", key: "REQUEST-1", trigger: "ack_unverified", sha256: SHA });
+});
+
+test("CL-01 fail closed: a later attempt without a recorded ack_seq never authorises an answer re-send", () => {
+  const rec = sender([attempt(1, T0, "unknown"), attempt(2, T0 + MIN, "unknown")], "send_unknown");
+  addAck(rec, "REQUEST-1", "unknown", T0 + 10 * MIN);
+  for (let t = T0 + 10 * MIN; t < T0 + 47 * HOUR; t += 10 * MIN) assert.notEqual(decide(rec, facts(t)).kind, "resend");
 });
 
 test("P2 settled messages and stalled records send nothing", () => {
@@ -443,4 +500,47 @@ test("§9.3 / HOLD-1 Q4: an uncorroborated REPLY copy is re-checked for 48 h, th
   rec.messages["REPLY-1"] = { sha256: OTHER_SHA, body_sha256: "e".repeat(64), raw: `raw/${OTHER_SHA}.env`, outcome: "done",
     final: "yes", ingested_at: iso(T0 + 4 * DAY) };
   assert.equal(decide(rec, facts(T0 + 5 * DAY)).kind, "none", "a later corroborated copy ends the notices");
+});
+
+test("CL-12 a CONFLICT on a terminal record is reminded once, then daily, until retention", () => {
+  const done = sender([attempt(1, T0 - HOUR, "handed_over")], "replied");
+  done.history.push({ at: iso(T0), event: "conflict", detail: `REPLY-1 sha256=${OTHER_SHA}` });
+  assert.deepEqual(noticeTimes(done, T0, T0 + 2 * DAY, 10 * MIN), [0, 1440, 2880]);
+  assert.equal(decide(done, facts(T0 + 30 * DAY)).kind, "expire", "until retention (30 days after state_at)");
+  const refused = sender([attempt(1, T0, "handed_over")], "refused");
+  refused.history.push({ at: iso(T0 + HOUR), event: "conflict", detail: `REQUEST-1 sha256=${OTHER_SHA}` });
+  const kinds: string[] = [];
+  for (let t = T0 + HOUR; t <= T0 + HOUR + DAY; t += 10 * MIN) {
+    const s = decide(refused, facts(t));
+    if (s.kind === "remind") {
+      kinds.push(s.notice);
+      countNotice(refused, s.notice, s.anchor, t);
+    }
+  }
+  assert.deepEqual(kinds, ["conflict", "conflict"], "terminal: CONFLICT before `refused` (NOTICE_PRIORITY)");
+});
+
+test("CL-05 a stored copy the pump found corroborated is presented by a notice (then every 2 h), never re-checked or applied by decide()", () => {
+  const rec = base("receiver", "unverified", "REPLY-1", []);
+  delete rec.messages["REPLY-1"];
+  rec.receiver_task = null;
+  rec.messages["REQUEST-1"]!.ingested_at = iso(T0);
+  rec.notices.corroborated = { shas: [OTHER_SHA], at: iso(T0 + MIN) };
+  assert.deepEqual(decide(rec, facts(T0 + MIN)), { kind: "remind", notice: "corroborated", anchor: iso(T0 + MIN) });
+  countNotice(rec, "corroborated", iso(T0 + MIN), T0 + MIN);
+  for (let t = T0 + MIN; t < T0 + MIN + 2 * HOUR; t += 10 * MIN) assert.equal(decide(rec, facts(t)).kind, "none", "no re-check, no stall, no send");
+  assert.equal(decide(rec, facts(T0 + MIN + 2 * HOUR)).kind, "remind", "repeated every 2 h until the controller's ingest applies it");
+  assert.equal(decide(rec, facts(T0 + 48 * HOUR)).kind, "stall", "the 48 h limit still holds");
+  rec.state = "received";
+  rec.state_at = iso(T0 + 3 * HOUR);
+  const after = decide(rec, facts(T0 + 3 * HOUR));
+  assert.ok(!(after.kind === "remind" && after.notice === "corroborated"), "applied by ingest: no more presentation");
+
+  const out = sender([attempt(1, T0 - DAY, "handed_over")], "accepted");
+  out.acks_in["REQUEST-1"] = { last_seq: 1, state: "accepted", at: iso(T0 - DAY) };
+  out.unverified_copies = [Object.assign({ sha256: OTHER_SHA, raw: `raw/${OTHER_SHA}.env`, at: iso(T0) }, { key: "REPLY-1" })];
+  assert.deepEqual(decide(out, facts(T0 + MIN)), { kind: "verify", shas: [OTHER_SHA] });
+  out.notices.corroborated = { shas: [OTHER_SHA], at: iso(T0 + MIN) };
+  assert.deepEqual(decide(out, facts(T0 + MIN)), { kind: "remind", notice: "corroborated", anchor: iso(T0 + MIN) },
+    "a corroborated final REPLY is presented, not applied: the sender stays `accepted`");
 });
