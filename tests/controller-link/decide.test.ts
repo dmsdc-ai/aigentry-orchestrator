@@ -663,14 +663,17 @@ test("P2 on the round-2 paths: re-checks and notices on stalled, terminal and aw
   const COPY_SHA = "9".repeat(64);
   let verifies = 0;
   let awaitingReminds = 0;
+  let pickupReminds = 0;
   for (const role of ["sender", "receiver"] as const) {
     for (const state of role === "sender" ? SENDER_STATES : RECEIVER_STATES) {
       for (const copy of ["none", "fresh", "old"] as const) {
         for (const marked of [false, true]) {
           for (const conflict of ["none", "before", "after"] as const) {
+           for (const pickup of role === "sender" ? [false, true] : [false]) {
             for (const t of [T0 + MIN, T0 + HOUR, T0 + 47 * HOUR, T0 + 49 * HOUR, T0 + 20 * DAY, T0 + 40 * DAY]) {
               const rec = role === "sender" ? sender([attempt(1, T0 - HOUR, "handed_over")], state)
                 : receiver([attempt(1, T0 - HOUR, "handed_over")], state);
+              if (pickup) awaitingReply(rec, "REPLY-1", T0 - HOUR);
               if (role === "receiver" && state === "unverified") {
                 rec.messages["REQUEST-1"]!.corroboration = { state: "not_found", at: iso(T0), inject_id: null, checks: 1 };
                 rec.messages["REQUEST-1"]!.ingested_at = iso(T0);
@@ -681,7 +684,12 @@ test("P2 on the round-2 paths: re-checks and notices on stalled, terminal and aw
                 rec.history.push({ at: iso(conflict === "before" ? T0 - HOUR : T0 + HOUR), event: "conflict", detail: "REQUEST-1 sha256=x" });
               }
               const s = decide(rec, facts(t));
-              const where = `${role} ${state} copy=${copy} marked=${marked} conflict=${conflict} t=${(t - T0) / MIN}`;
+              const where = `${role} ${state} copy=${copy} marked=${marked} conflict=${conflict} pickup=${pickup} t=${(t - T0) / MIN}`;
+              if (s.kind === "expire") assert.ok(!pickup, `a REPLY awaiting pickup is never expired: ${where}`);
+              if (s.kind === "remind" && s.notice === "reply_awaiting") {
+                pickupReminds += 1;
+                assert.ok(pickup, where);
+              }
               assert.notEqual(s.kind, "resend", `no trigger, no re-send: ${where}`);
               if (state === "stalled" || ["refused", "replied", "closed"].includes(state)) {
                 assert.ok(s.kind !== "probe" && s.kind !== "stall", `nothing scheduled to send: ${where}`);
@@ -698,6 +706,7 @@ test("P2 on the round-2 paths: re-checks and notices on stalled, terminal and aw
                 assert.ok(marked && state !== "closed", where);
               }
             }
+           }
           }
         }
       }
@@ -705,4 +714,47 @@ test("P2 on the round-2 paths: re-checks and notices on stalled, terminal and aw
   }
   assert.ok(verifies > 20, `exercised re-checks (${verifies})`);
   assert.ok(awaitingReminds > 20, `exercised the awaiting presentation (${awaitingReminds})`);
+  assert.ok(pickupReminds > 20, `exercised the REPLY pickup presentation (${pickupReminds})`);
+});
+
+// ── Round 2 fix (P1 / CL-09): a REPLY awaiting `handled` ───────────────────────────────────
+/** A REPLY the sender's ingest applied, as coder A's ingest stores it: `pickup: "awaiting"` (store.ts awaitingPickup). */
+function awaitingReply(rec: LinkRecord, key: string, ingestedMs: number): void {
+  rec.messages[key] = { sha256: "8".repeat(64), body_sha256: "e".repeat(64), raw: `raw/${"8".repeat(64)}.env`, outcome: "done",
+    final: "yes", ingested_at: iso(ingestedMs), pickup: "awaiting" };
+}
+
+test("CL-09 pickup (P1): a REPLY awaiting pickup on a terminal `replied` record is reminded +10, +30 min, then every 2 h; never expired; it stops once handled", () => {
+  const rec = sender([attempt(1, T0 - DAY, "handed_over")], "replied");
+  awaitingReply(rec, "REPLY-1", T0);
+  assert.deepEqual(noticeTimes(rec, T0, T0 + 7 * HOUR, MIN), [10, 30, 150, 270, 390]);
+  assert.equal((rec.notices.series as { kind?: string }).kind, "reply_awaiting");
+  const late = decide(rec, facts(T0 + 40 * DAY));
+  assert.deepEqual(late, { kind: "remind", notice: "reply_awaiting", anchor: iso(T0) }, "40 days later: still reminded, not expired");
+  countNotice(rec, "reply_awaiting", iso(T0), T0 + 40 * DAY);
+  const waiting = decide(rec, facts(T0 + 40 * DAY + MIN));
+  assert.equal(waiting.kind, "none");
+  assert.ok(waiting.kind === "none" && waiting.due_ms !== null && waiting.due_ms <= T0 + 40 * DAY + 2 * HOUR, "the next reminder is due, not retention");
+  // The controller recorded the pickup (`handled`, coder A): no more reminders; retention applies again.
+  rec.messages["REPLY-1"]!.pickup = "handled";
+  assert.equal(decide(rec, facts(T0 + 40 * DAY + 2 * HOUR)).kind, "expire");
+  assert.equal(decide(rec, facts(T0 + 29 * DAY)).kind, "none", "handled: nothing more to say before retention");
+  // A second REPLY awaiting starts its own series at its own ingest time.
+  awaitingReply(rec, "REPLY-2", T0 + 29 * DAY);
+  assert.equal(decide(rec, facts(T0 + 29 * DAY + 9 * MIN)).kind, "none");
+  assert.deepEqual(decide(rec, facts(T0 + 29 * DAY + 10 * MIN)), { kind: "remind", notice: "reply_awaiting", anchor: iso(T0 + 29 * DAY) });
+});
+
+test("CL-09 pickup (P1): a REPLY awaiting pickup is reminded on open and stalled sender records too, also when the peer is no longer configured", () => {
+  const open = sender([attempt(1, T0 - DAY, "handed_over")], "accepted");
+  open.acks_in["REQUEST-1"] = { last_seq: 1, state: "accepted", at: iso(T0 - DAY) };
+  awaitingReply(open, "REPLY-1", T0);
+  open.messages["REPLY-1"]!.final = "no";
+  assert.deepEqual(decide(open, facts(T0 + 10 * MIN)), { kind: "remind", notice: "reply_awaiting", anchor: iso(T0) });
+  assert.deepEqual(decide(open, facts(T0 + 10 * MIN, { peerActive: false })), { kind: "remind", notice: "reply_awaiting", anchor: iso(T0) },
+    "status and handled are local: the peer is not needed");
+  const stalled = sender([attempt(1, T0 - 3 * DAY, "unknown")], "stalled");
+  countNotice(stalled, "stalled", iso(T0 - DAY), T0 - DAY);
+  awaitingReply(stalled, "REPLY-1", T0);
+  assert.deepEqual(decide(stalled, facts(T0 + 10 * MIN)), { kind: "remind", notice: "reply_awaiting", anchor: iso(T0) });
 });

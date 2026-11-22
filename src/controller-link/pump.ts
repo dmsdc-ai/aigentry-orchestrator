@@ -428,6 +428,8 @@ export function renderControllerNotice(rec: LinkRecord, kind: NoticeKind, n: num
     peer_unconfigured: 'the peer is not configured with link "v1"; nothing is sent for this record and its state is kept',
     corroborated: `a ${rec.role === "receiver" ? "REQUEST" : "REPLY"} from the peer stored unverified is now corroborated by ` +
       "this machine's telepty audit; it has not been shown or applied; this notice repeats until the record shows it was picked up",
+    reply_awaiting: "a REPLY from the peer was applied by ingest but is not yet recorded as handled; " +
+      "this notice repeats until the record shows it was handled",
     reply_unverified: "a REPLY from the peer is still not corroborated by this machine's telepty audit after 48 h; " +
       "it is not acted on and the record's state is kept",
     unbound: "a peer request waits for bind or refuse",

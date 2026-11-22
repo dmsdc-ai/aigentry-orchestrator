@@ -13,7 +13,7 @@
 // "Newer than the latest attempt" is decided by ACK sequence, never by wall time (CL-01): every
 // re-send records `ack_seq` (the acks_in sequence it was committed with), so an answer authorises
 // at most one re-send even when the clock moves backward.
-import { RETENTION_MS, isTerminal, type LinkRecord, type SendAttempt, type UnverifiedCopy } from "./store.js";
+import { RETENTION_MS, awaitingPickup, isTerminal, type LinkRecord, type SendAttempt, type UnverifiedCopy } from "./store.js";
 
 const MIN = 60_000;
 const HOUR = 60 * MIN;
@@ -52,10 +52,11 @@ export type ResendTrigger = "refused_definite" | "ack_unknown" | "ack_unverified
 export const RESEND_TRIGGERS = ["refused_definite", "ack_unknown", "ack_unverified", "human"] as const;
 
 export type NoticeKind =
-  | "stalled" | "conflict" | "refused" | "peer_unconfigured" | "corroborated" | "reply_unverified" | "unbound" | "no_final";
+  | "stalled" | "conflict" | "refused" | "peer_unconfigured" | "corroborated" | "reply_awaiting" | "reply_unverified" | "unbound"
+  | "no_final";
 /** Highest first; one series per record at a time (the highest applicable kind). */
 export const NOTICE_PRIORITY: readonly NoticeKind[] = [
-  "stalled", "conflict", "refused", "peer_unconfigured", "corroborated", "reply_unverified", "unbound", "no_final",
+  "stalled", "conflict", "refused", "peer_unconfigured", "corroborated", "reply_awaiting", "reply_unverified", "unbound", "no_final",
 ];
 /**
  * §9.3 schedules, as offsets from the series anchor, then every `everyMs` after the last offset
@@ -63,7 +64,10 @@ export const NOTICE_PRIORITY: readonly NoticeKind[] = [
  * a final REPLY once a day; `stalled` and CONFLICT once, then daily; sender `refused` once (§7.1);
  * an unconfigured peer once (§9.3 last bullet); an uncorroborated REPLY copy at the sender once its 48 h of
  * re-checks are over, then daily, without a state change (Root decision on HOLD-1 Q4); a stored message
- * the pump found corroborated at once, then every 2 h, until the record shows the controller acted (CL-05, awaitingIngest).
+ * the pump found corroborated at once, then every 2 h, until the record shows the controller acted (CL-05, awaitingIngest);
+ * a REPLY the sender's ingest applied but the controller has not recorded as handled (coder A's
+ * `pickup: "awaiting"`, store.ts awaitingPickup) on the unbound cadence, +10 min, +30 min, then every 2 h,
+ * until `handled` — also on a terminal record (CL-09 / P1).
  */
 export const NOTICE_SCHEDULES: Readonly<Record<NoticeKind, { offsets: readonly number[]; everyMs: number | null }>> = {
   stalled: { offsets: [0], everyMs: DAY },
@@ -71,6 +75,7 @@ export const NOTICE_SCHEDULES: Readonly<Record<NoticeKind, { offsets: readonly n
   refused: { offsets: [0], everyMs: null },
   peer_unconfigured: { offsets: [0], everyMs: null },
   corroborated: { offsets: [0], everyMs: 2 * HOUR },
+  reply_awaiting: { offsets: [10 * MIN, 30 * MIN], everyMs: 2 * HOUR },
   reply_unverified: { offsets: [0], everyMs: DAY },
   unbound: { offsets: [10 * MIN, 30 * MIN], everyMs: 2 * HOUR },
   no_final: { offsets: [DAY], everyMs: DAY },
@@ -373,19 +378,28 @@ export function noticeKindOf(rec: LinkRecord, peerActive: boolean): { kind: Noti
   // CL-05: a stored copy awaiting the controller keeps its notice series in every state it can be in.
   const mark = corroboratedMark(rec);
   const awaiting = mark !== null && awaitingIngest(rec).length > 0 ? at("corroborated", mark.at) : null;
+  // CL-09 / P1: a REPLY applied by ingest that the controller has not recorded as `handled` (store.ts
+  // awaitingPickup: REPLY keys with `pickup: "awaiting"`, in seq order). The series is anchored at the first such
+  // REPLY's ingest time, so the next awaiting REPLY starts a new series. Needs no peer: `status` and `handled` are local.
+  const pickupKey = awaitingPickup(rec)[0];
+  const pickupAt = pickupKey === undefined ? undefined : rec.messages[pickupKey]?.ingested_at;
+  const pickup = pickupKey === undefined ? null : at("reply_awaiting", typeof pickupAt === "string" ? pickupAt : rec.state_at);
   if (isTerminal(rec.state)) {
     // CL-12: a CONFLICT is reminded on a terminal record too (once, then daily until retention).
     if (conflict !== undefined) return at("conflict", conflict.at);
     if (awaiting !== null) return awaiting;
+    if (pickup !== null) return pickup;
     return rec.role === "sender" && rec.state === "refused" ? at("refused", rec.state_at) : null;
   }
   if (rec.state === "stalled") {
     if (awaiting !== null && peerActive) return awaiting;
+    if (pickup !== null) return pickup;
     // CL-12: a CONFLICT that arrived after the stall is new information: its own series, not the stall's.
     if (conflict !== undefined && ms(conflict.at) > ms(rec.state_at)) return at("conflict", conflict.at);
     return at("stalled", rec.state_at);
   }
   if (conflict !== undefined) return at("conflict", conflict.at);
+  if (pickup !== null) return pickup;
   if (!peerActive) return { kind: "peer_unconfigured", anchor: rec.peer, anchorMs: NaN };
   if (awaiting !== null) return awaiting;
   const copies = unverifiedReplyCopies(rec);
@@ -440,12 +454,14 @@ export function decide(rec: LinkRecord, facts: DecideFacts): Step {
   // other (§9.3), except on `closed` (the controller closed it: nothing awaits it there).
   if (isTerminal(rec.state)) {
     const start = retentionStartMs(rec);
-    if (now - start >= RETENTION_MS) return { kind: "expire" };
+    // CL-09 / P1: a REPLY awaiting pickup is never expired (the store never selects such a record either).
+    const keep = awaitingPickup(rec).length > 0;
+    if (!keep && now - start >= RETENTION_MS) return { kind: "expire" };
     const n = noticeEval(rec, facts);
     if (n.kind === "act") return n.step;
     const shas = rec.state === "closed" ? [] : freshReplyCopies();
     if (shas.length > 0) return { kind: "verify", shas };
-    return { kind: "none", due_ms: minDue(n.kind === "wait" ? n.due_ms : null, start + RETENTION_MS), why: "terminal" };
+    return { kind: "none", due_ms: minDue(n.kind === "wait" ? n.due_ms : null, keep ? null : start + RETENTION_MS), why: "terminal" };
   }
   // §9.3 last bullet: an unconfigured peer — no send, no state change; one notice.
   if (!facts.peerActive) {

@@ -986,3 +986,44 @@ test("CL-19 round 2: every notice is two lines naming only the request and `bin/
     }
   }
 });
+
+// ── Round 2 fix (P1 / CL-09): a REPLY awaiting `handled` ───────────────────────────────────
+test("CL-09 pickup (P1): a REPLY awaiting pickup on a terminal `replied` record past 30 days gets REPLY_AWAITING notices that repeat (+10, +30 min, every 2 h) and is not deleted; once handled they stop and retention applies", async (t) => {
+  const h = harness(t);
+  const id = randomUUID();
+  await seedSender(h, id, "replied", [attempt(1, T0 - 40 * DAY, "handed_over")]); // state_at = T0 − 40 days
+  const reply = envelope(fields("REPLY", id, PEER, SELF, { outcome: "done", final: "yes", receiver_task: "2026112102" }), "the final result");
+  await h.store.mutate(outbox(id), (cur) => {
+    const next = JSON.parse(JSON.stringify(cur)) as LinkRecord;
+    // As coder A's ingest stores a NEW REPLY: `pickup: "awaiting"` until `handled --request <id> --ref REPLY-1`.
+    next.messages["REPLY-1"] = { sha256: reply.sha256, body_sha256: reply.body_sha256, raw: `raw/${reply.sha256}.env`, outcome: "done",
+      final: "yes", ingested_at: iso(T0 - 35 * DAY), pickup: "awaiting" };
+    return { write: next, raws: [{ sha256: reply.sha256, bytes: Buffer.from(reply.text, "utf8") }], value: null };
+  });
+  const awaiting = (): string[] => h.notices.map((n) => n.text).filter((x) => x.startsWith(`${NOTICE_MARKER} REPLY_AWAITING request_id=${id} `));
+  h.now.ms = T0;
+  assert.equal(await pump(h), 0, h.err.join("\n"));
+  assert.equal(awaiting().length, 1, "reminded although the record is 35 days past its last change");
+  assert.equal(fs.existsSync(h.store.recordPath(outbox(id))), true, "not deleted while the REPLY awaits pickup");
+  for (const [at, count] of [[T0 + MIN, 1], [T0 + 30 * MIN, 2], [T0 + 2 * HOUR, 2], [T0 + 2 * HOUR + 30 * MIN, 3]] as const) {
+    h.now.ms = at;
+    assert.equal(await pump(h), 0, h.err.join("\n"));
+    assert.equal(awaiting().length, count, `at +${(at - T0) / MIN} min`);
+  }
+  for (const text of awaiting()) {
+    assert.ok(text.includes(" role=sender ") && text.includes(" state=replied "), text);
+    assert.ok(text.endsWith(`\nnext: bin/controller-link.sh status --request ${id}`), text);
+    assert.ok(!text.includes(h.store.rawPath(reply.sha256)) && !text.includes("the final result"), "no path, no body");
+  }
+  assert.equal(h.calls.length, 0, "a notice sends nothing to the peer");
+  // The controller records the pickup (coder A's `handled`): the reminders stop and the record is retained no longer.
+  await h.store.mutate(outbox(id), (cur) => {
+    const next = JSON.parse(JSON.stringify(cur)) as LinkRecord;
+    next.messages["REPLY-1"]!.pickup = "handled";
+    return { write: next, value: null };
+  });
+  h.now.ms = T0 + 4 * HOUR + 30 * MIN;
+  assert.equal(await pump(h), 0, h.err.join("\n"));
+  assert.equal(awaiting().length, 3, "handled: no more reminders");
+  assert.equal(fs.existsSync(h.store.recordPath(outbox(id))), false, "handled and 30 days old: retention deletes it");
+});
