@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "release_group": "release-1282",
+  "release_group": "release-1293",
   "tasks": [
     {
       "id": 507,
@@ -65,6 +65,22 @@
     {
       "id": 1282,
       "release_component": "trusted-publishing"
+    },
+    {
+      "id": 1284,
+      "release_component": "codex-footer-reader"
+    },
+    {
+      "id": 1286,
+      "release_component": "workspace-line-integration"
+    },
+    {
+      "id": 1289,
+      "release_component": "same-named-controller"
+    },
+    {
+      "id": 1293,
+      "release_component": "no-nested-telepty"
     }
   ]
 }
