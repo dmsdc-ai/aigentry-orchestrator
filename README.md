@@ -12,6 +12,65 @@
 
 ## Install
 
+**Upgrading from 0.2.5-0.2.7?** Those versions declared a dependency on telepty, so npm
+installed a telepty 0.8.x inside the orchestrator's own directory. This version declares none.
+Do these steps in this order:
+
+1. Install the latest telepty globally: `npm i -g @dmsdc-ai/aigentry-telepty@latest`.
+   telepty 0.11.3 or newer never replaces a newer running daemon, and does nothing when it is
+   installed as a dependency of another package.
+2. Before you upgrade, know what the upgrade removes. This release no longer contains a telepty,
+   so upgrading removes the copy of telepty that earlier versions carried inside this package's
+   directory (`@dmsdc-ai/aigentry-orchestrator` under `npm root -g`). Anything that still runs
+   that copy — a shell wrapper, a symlink, a `TELEPTY` variable, or a service definition whose
+   program path lies inside this package's directory — stops working after the upgrade, until it
+   is pointed at the telepty installed in step 1. It is not downgraded: its telepty command or
+   daemon program is gone. A daemon already running from that copy may keep answering until it
+   stops, and then cannot start again from there. One read helps, and it changes nothing:
+   `command -v telepty` shows the file your shell runs for `telepty`; if that file lies inside
+   this package's directory, your shell runs the copy the upgrade removes. On Windows, in
+   PowerShell, `Get-Command telepty` shows the command PowerShell selects for `telepty`; in cmd,
+   `where telepty` lists the files named telepty that it finds, and does not establish which one
+   cmd runs. It does not show what that file runs when it is a wrapper or a symlink, and it does
+   not show what a service runs. If you cannot tell whether anything on this host still runs that
+   copy, upgrade at a time when a short telepty interruption is acceptable.
+3. Upgrade the orchestrator: `npm i -g @dmsdc-ai/aigentry-orchestrator`.
+4. Read what now runs. These reads change nothing:
+   - `command -v telepty` shows the file your shell runs for `telepty`. On Windows, in
+     PowerShell, `Get-Command telepty` shows the command PowerShell selects; in cmd,
+     `where telepty` lists the files named telepty that it finds, not which one cmd runs. It does
+     not show what that file runs when it is a wrapper or a symlink, and it does not show what a
+     service starts.
+   - `telepty --version` shows the version of the telepty your shell runs. It does not show the
+     daemon's version.
+   - The `version` that the daemon on `TELEPTY_PORT` (default 3848) reports from its meta
+     endpoint:
+
+     ```sh
+     ( cd "$(npm root -g)/@dmsdc-ai/aigentry-orchestrator" && . bin/lib/telepty-auth.sh &&
+       curl -s --noproxy '*' --max-time 5 -H "x-telepty-token: $(telepty_auth_token)" \
+            "http://127.0.0.1:${TELEPTY_PORT:-3848}/api/meta" )
+     ```
+
+     This shows the version of the daemon that answers on that port now. It does not show which
+     installation that daemon was started from, or what a service will start next time. An
+     answer without a `version` field shows no version.
+
+   On Windows the commands of steps 1 and 3 and `telepty --version` are the same. The daemon
+   read is a bash command that also needs `python3` and `curl`. This release has not verified it
+   on Windows.
+
+If they disagree — the CLI and the daemon report different versions, or either reports a version
+older than the telepty you installed in step 1 — that alone does not say why. The daemon may have
+been started before step 1 and still be running: telepty 0.11.3 or newer leaves a newer running
+daemon in place on purpose. The CLI and the daemon may come from different installations. Or your
+shell or a service may still select another copy of telepty: a wrapper script earlier on PATH, a
+symlink, a `TELEPTY` variable (the orchestrator runs what it names), or a service definition
+written by an older install. telepty's own documentation describes its daemon and its service.
+This document prescribes no command for any of these.
+
+A new install:
+
 ```sh
 npm i -g @dmsdc-ai/aigentry-orchestrator
 aigentry-orchestrator init

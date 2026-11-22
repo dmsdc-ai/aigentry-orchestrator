@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "release_group": "release-1293",
+  "release_task": 1293,
+  "package": "@dmsdc-ai/aigentry-orchestrator",
+  "version": "0.2.8",
+  "base_tag": "v0.2.7",
+  "base_commit": "a8b9215437008bfde490b5cec3da0fc3ea8d77c2",
+  "tasks": [
+    {
+      "task_id": 1284,
+      "disposition": "shipping",
+      "scope": "The dispatch readiness reader (bin/session-probe.py) recognises the idle footer of codex-cli 0.170.0, with fixtures in tests/dispatch/current-readiness-footer.test.ts. Limit: two reader gaps stay open under this task and are not in this candidate: a Codex working screen and a footer row that wraps onto a second line are not recognised.",
+      "paths": [
+        "bin/session-probe.py",
+        "tests/dispatch/current-readiness-footer.test.ts"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.8-dispositions.md",
+          "sha256": "62985ef1ab390dafd494cab42b888fe10f9bb4eab17da85321dcc179e9841931"
+        }
+      ]
+    },
+    {
+      "task_id": 1286,
+      "disposition": "shipping",
+      "scope": "Opt-in units integrated from the local workspace line, each inert unless its setting is given: a per-launch opt-out of the automatic cmux worker restart and two settings that keep the workspace host and the reconciler from taking the operator's screen (bin/lib/workspace-host.sh, src/reconciler/cli.ts, docs/setup/worker-focus.md); on macOS, a setting that gives a confined Codex worker the OS-shipped CA bundle file (src/session/worker-sandbox.ts); regression tests for the single-attempt submission argv of the dispatch caller and for bounded screen reads and the readiness budget. Limit: the control workspace itself is not switched to this line by the release; local-only documents of that line are not included.",
+      "paths": [
+        "bin/lib/workspace-host.sh",
+        "docs/setup/worker-focus.md",
+        "src/reconciler/cli.ts",
+        "src/session/worker-sandbox.ts",
+        "tests/dispatch/T23_workspace_host_adapter.sh",
+        "tests/dispatch/current-screen-budget-482.test.ts",
+        "tests/dispatch/submit-policy-439.test.ts",
+        "tests/dispatch/surface-mismatch-diagnostic.test.ts",
+        "tests/session/worker-codex-system-ca.test.ts"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.8-dispositions.md",
+          "sha256": "62985ef1ab390dafd494cab42b888fe10f9bb4eab17da85321dcc179e9841931"
+        }
+      ]
+    },
+    {
+      "task_id": 1289,
+      "disposition": "shipping",
+      "scope": "Instruction text only (tooling/instructions/common.md): every machine runs a controller session with the same id, a bare id is ambiguous across machines, and how to address the local and the remote one. Limit: no tool changes its addressing in this candidate; the resolver change is a telepty task.",
+      "paths": [
+        "tooling/instructions/common.md"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.8-dispositions.md",
+          "sha256": "62985ef1ab390dafd494cab42b888fe10f9bb4eab17da85321dcc179e9841931"
+        }
+      ]
+    },
+    {
+      "task_id": 1293,
+      "disposition": "shipping",
+      "scope": "The package no longer declares a dependency on @dmsdc-ai/aigentry-telepty, so installing it no longer installs a nested telepty whose install script could replace a newer running daemon. The telepty requirement is stated by capability at init, boot and bound dispatch: each door reads the sealed boot-capabilities document with one shared rule, prints install advice only when absence is established on every PATH entry or a valid document lacks a required verb, and names its exit code. README and CHANGELOG give a non-destructive upgrade order and say, before the upgrade step, that the copy earlier versions carried is removed and that anything still running it stops until it is pointed at a global install. Packaging tests fail on a reintroduced telepty dependency, lockfile entry, install script or root shrinkwrap, and on any command in the upgrade section other than the allowed installs and read-only reads. Also included are the release records: package version, lockfile, changelog, public projection, this file, the planning manifest, the security evidence blobs, the policy path and the workflow's security-policy pin. Limits: six independent reviews rejected successive wordings of the upgrade section and the last finding is stated as a known limit rather than removed (an upgrade can stop a host whose wrapper or service still runs the nested copy); the release repairs nothing on a host; versions 0.2.5 to 0.2.7 stay published as they are; Windows guidance is less verified than Linux and macOS. The maintainer accepted these residuals for this patch release on 2026-11-22.",
+      "paths": [
+        ".github/workflows/release.yml",
+        "CHANGELOG.md",
+        "README.md",
+        "README.tmpl.md",
+        "bin/init/cli.mjs",
+        "package-lock.json",
+        "package.json",
+        "release/0.2.8-dispositions.md",
+        "release/0.2.8.json",
+        "release/security/0.2.8/blobs/a1df661f706aae7e59c8493a243f70090a6e512189a0a79ab34a9366e7b46eba",
+        "release/security/0.2.8/blobs/af6ceb082b6da807e8624ae30bf8f7fe709e20f548671897b9cd73232b1cebfc",
+        "release/security/0.2.8/blobs/fcf3fa10c38697c4f1c80fa3386f8295a00cf3c9ab6cffcca302b85d824260ba",
+        "release/security/0.2.8/policy.json",
+        "release/tasks.json",
+        "src/dispatch/cli.ts",
+        "src/dispatch/usage.ts",
+        "src/orchestrator-boot/cli.ts",
+        "src/orchestrator-boot/plan.ts",
+        "tests/dispatch/busy-bound-inject.test.ts",
+        "tests/dispatch/telepty-cli-unavailable.test.ts",
+        "tests/packaging/installed-boot-selector.test.mjs",
+        "tests/packaging/native-capture.test.mjs",
+        "tests/packaging/orchestrator-boot-wizard.test.mjs",
+        "tests/packaging/telepty-dependency.test.ts",
+        "tests/packaging/telepty-runtime-requirement.test.ts"
+      ],
+      "evidence": [
+        {
+          "path": "release/0.2.8-dispositions.md",
+          "sha256": "62985ef1ab390dafd494cab42b888fe10f9bb4eab17da85321dcc179e9841931"
+        }
+      ]
+    }
+  ]
+}

@@ -756,3 +756,41 @@ export function restrictiveDefaults(cap: ProviderCapability): readonly AxisChoic
     return { axis: axis.axis, value: v.value, argv: v.argv, risk: v.risk, covers: v.covers };
   });
 }
+
+// ── #1293: the telepty-boot-capabilities-v1 document rule, in one place ─────
+export const BOOT_CAPABILITIES_SCHEMA = "telepty-boot-capabilities-v1";
+/** The most the boot door reads of the document (src/orchestrator-boot/cli.ts, bootDoor maxBuffer). */
+export const BOOT_CAPABILITIES_MAX_BYTES = 4096;
+
+/**
+ * The output of `telepty boot-capabilities` as a WELL-FORMED v1 document, or null. Well-formed:
+ * at most 4096 bytes, exactly one newline-terminated line, one JSON object with EXACTLY the keys
+ * schema/verbs/viewer_detach, schema telepty-boot-capabilities-v1, verbs an array of unique strings,
+ * viewer_detach a string. Which verbs and which detach a door requires is the door's own question.
+ * Pure: the boot door (src/orchestrator-boot/cli.ts) and dispatch's bound gate (src/dispatch/cli.ts)
+ * both call it, so a document one door calls malformed cannot draw advice from the other (r5, R5-2).
+ */
+export function bootCapabilitiesDocument(out: string): { readonly verbs: readonly string[]; readonly viewer_detach: string } | null {
+  if (Buffer.byteLength(out) > BOOT_CAPABILITIES_MAX_BYTES || !out.endsWith("\n") || out.indexOf("\n") !== out.length - 1)
+    return null;
+  let v: unknown;
+  try {
+    v = JSON.parse(out);
+  } catch {
+    return null;
+  }
+  if (v === null || typeof v !== "object" || Array.isArray(v)) return null;
+  const doc = v as Record<string, unknown>;
+  const verbs = doc.verbs;
+  const detach = doc.viewer_detach;
+  if (
+    Object.keys(doc).sort().join(",") !== "schema,verbs,viewer_detach" ||
+    doc.schema !== BOOT_CAPABILITIES_SCHEMA ||
+    !Array.isArray(verbs) ||
+    !verbs.every((x) => typeof x === "string") ||
+    new Set(verbs).size !== verbs.length ||
+    typeof detach !== "string"
+  )
+    return null;
+  return { verbs: verbs as string[], viewer_detach: detach };
+}
