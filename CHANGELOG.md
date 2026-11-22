@@ -7,7 +7,7 @@ extracts the matching section as the GitHub Release notes, so a publish fails
 without one. Unreleased harness work is still grouped under a dated
 `## [<YYYY-MM-DD>]` section beneath the ongoing `## [Unreleased]` working set.
 
-## [0.2.8] - 2026-11-21
+## [0.2.8] - 2026-11-22
 
 Hotfix for task #1293. Installing this package used to install a second, old
 copy of telepty, and that copy's postinstall replaced the telepty daemon
@@ -167,6 +167,30 @@ a `telepty-boot-capabilities-v1` document that passes the boot door's own
 rule (the one init applies too) and lacks the verb draws upgrade advice. Boot
 does not require that verb.
 
+### Also in this release
+
+These changes were merged after 0.2.7 and ship here for the first time. Each
+is covered by its own tests in the full suite.
+
+- **Codex idle footer (task #1284).** The dispatch readiness reader recognises
+  the idle footer of codex-cli 0.170.0, so a ready Codex worker is no longer
+  reported as not ready. Fixtures for earlier footer forms are added. Two
+  reader gaps remain open under the same task: a Codex "working" screen and a
+  footer row that wraps onto a second line are still not recognised.
+- **Opt-in settings from the local workspace line (task #1286).** Nothing
+  changes unless a setting is given: a per-launch opt-out of the automatic
+  cmux worker restart; two settings that keep the workspace host and the
+  reconciler from taking the operator's screen; and, on macOS, a setting that
+  gives a confined Codex worker the CA bundle file shipped with the operating
+  system. Regression tests are added for the single-attempt submission
+  arguments of the dispatch caller and for bounded screen reads and the
+  readiness budget.
+- **Session names across machines (task #1289).** The shared instructions now
+  say that every machine runs a controller session with the same id, that a
+  bare id is therefore ambiguous across machines, and how to address the local
+  and the remote one. This is instruction text only; tools still address the
+  local session by bare id.
+
 ### Requirements
 
 - Unchanged from 0.2.6: the telepty daemon and every `telepty allow` bridge must
@@ -185,6 +209,10 @@ does not require that verb.
   `RELEASE_SECURITY_POLICY_SHA256: UNREVIEWED` until the reviewed
   `release/security/0.2.8/policy.json` exists; the admission gate refuses
   `UNREVIEWED`, so nothing can publish before that review.
+- The release scan covers the changed files under `bin`, `src`, `scripts` and
+  `tests` and the package manifests (24 files). It completed with exit 0 and 0
+  findings. It is a changed-source projection, not whole-repository or
+  dependency coverage.
 - Publication requires exact integrated CI, including Windows W1 (full suite,
   zero failures and zero skips) and W0 (installed package), followed by registry
   verification.

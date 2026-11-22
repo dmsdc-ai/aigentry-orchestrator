@@ -1,0 +1,15 @@
+{
+  "base_commit": "a8b9215437008bfde490b5cec3da0fc3ea8d77c2",
+  "roots": [
+    "bin",
+    "src",
+    "scripts",
+    "tests"
+  ],
+  "leaves": [
+    "package.json",
+    "package-lock.json"
+  ],
+  "assumptions": "Select every changed committed file under bin, src, scripts and tests since v0.2.7, plus exact package dependency identities. The changed first-party code is the telepty requirement handling in init, boot and dispatch, the Codex idle-footer readiness reader, the opt-in workspace-host, reconciler and worker-sandbox settings, and their tests. Snyk supported-language static findings are source evidence; no runtime exploit or clearance is inferred.",
+  "limits": "This is a changed-source projection, not whole-repository or dependency vulnerability coverage. The release workflow (.github/workflows/release.yml), documentation and tooling/instructions changed in this range and are outside these roots; they are reviewed and CI-verified, not scanned here. Shell and Markdown under the roots are inventoried but Snyk Code language coverage is not asserted for them. Generated dist, native/installed execution, secret configuration and unchanged source are not scanned here. Any finding requires exact per-fingerprint source/evidence review; no blanket waiver."
+}
