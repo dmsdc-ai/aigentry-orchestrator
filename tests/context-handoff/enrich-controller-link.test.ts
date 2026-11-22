@@ -11,7 +11,7 @@ import { test } from "node:test";
 import { compose, type ComposeInput } from "../../src/context-handoff/compose.js";
 import { readControllerLink, type ControllerLinkEntry } from "../../src/context-handoff/enrich.js";
 import { ControllerLinkStore, type LinkRecord, type RecordRef, type RecordState } from "../../src/controller-link/store.js";
-import { at, dropBox, items, makeBox, parseHandoff, plantClaude, runCli } from "./harness.js";
+import { at, boundViolations, dropBox, items, makeBox, parseHandoff, plantClaude, runCli } from "./harness.js";
 
 const T0 = Date.parse("2026-11-22T00:00:00.000Z");
 const sha = (b: Uint8Array | string): string => createHash("sha256").update(b).digest("hex");
@@ -118,18 +118,80 @@ test("R2 golden: no records (absent, null, []) → compose output byte-for-byte 
   assert.equal(compose(baseInput([])), GOLDEN);
 });
 
-test("R2 line format (SPEC §9.4 verbatim), '-' for null, placed right after the open-task lines", () => {
+test("R2 line format (SPEC §9.4 verbatim), '-' for null, placed right before the open-task lines (U12-01)", () => {
   const entries: ControllerLinkEntry[] = [
     { role: "sender", id8: "0a1b2c3d", peer: "linux", state: "sent", next: "WAIT_ACK", due: "2026-11-22T00:05:00.000Z", senderTask: "1291", receiverTask: null },
     { role: "receiver", id8: "deadbeef", peer: "mac", state: "accepted", next: "WORK", due: null, senderTask: "-", receiverTask: "88" },
   ];
   const md = compose(baseInput(entries));
   assert.equal(md, GOLDEN.replace("- open task 7 pending P1 d\n", [
-    "- open task 7 pending P1 d",
     "- controller-link sender 0a1b2c3d peer=linux state=sent next=WAIT_ACK due=2026-11-22T00:05:00.000Z sender_task=1291 receiver_task=-",
     "- controller-link receiver deadbeef peer=mac state=accepted next=WORK due=- sender_task=- receiver_task=88",
+    "- open task 7 pending P1 d",
     "",
   ].join("\n")));
+});
+
+// U12-01: a full task queue must not push the controller-link rows out of the enrichment budget.
+const byteLen = (s: string): number => Buffer.byteLength(s, "utf8");
+/** Section bytes as compose() counts them: each row plus its newline. */
+const sectionBytes = (rows: readonly string[]): number => rows.reduce((n, l) => n + byteLen(l) + 1, 0);
+/** Ten open tasks whose rows are each cut at 300 chars: 304 B + newline (one "—" and the "…"). */
+const LONG_TASKS = Array.from({ length: 10 }, (_, i) => ({
+  id: `t${i}`, status: "pending", priority: "P1", desc: "d".repeat(120), noteDate: "2026-11-22", note: "n".repeat(200),
+}));
+/** The composed row of LONG_TASKS[i]: 173 chars of prefix, desc and note label, 126 of note, then "…". */
+const longTaskRow = (i: number): string => `- open task t${i} pending P1 ${"d".repeat(120)} — latest note 2026-11-22: ${"n".repeat(126)}…`;
+const linkEntry = (i: number): ControllerLinkEntry => (
+  { role: "sender", id8: `0000000${i}`, peer: "linux", state: "sent", next: "WAIT_ACK", due: "2026-11-22T00:05:00.000Z", senderTask: "1291", receiverTask: null });
+const linkRow = (i: number): string =>
+  `- controller-link sender 0000000${i} peer=linux state=sent next=WAIT_ACK due=2026-11-22T00:05:00.000Z sender_task=1291 receiver_task=-`;
+
+function withTasks(controllerLink?: readonly ControllerLinkEntry[] | null): ComposeInput {
+  const b = baseInput(controllerLink);
+  return { ...b, enrichment: { ...b.enrichment, tasks: LONG_TASKS } };
+}
+
+test("U12-01 no link rows, 10 long task rows: the budget cut is unchanged (5 task rows, dispatches dropped)", () => {
+  assert.equal(byteLen(longTaskRow(0)), 304);
+  for (const links of [undefined, null, []]) {
+    const md = compose(withTasks(links));
+    assert.deepEqual(items(parseHandoff(md), "byproduct"), [0, 1, 2, 3, 4].map(longTaskRow));
+  }
+});
+
+test("U12-01 10 long task rows + 2 link rows → both link rows first, then the task rows that fit", () => {
+  const md = compose(withTasks([linkEntry(1), linkEntry(2)]));
+  const rows = items(parseHandoff(md), "byproduct");
+  // 2 link rows = 264 B, so 1536 B are left: 5 task rows (1525 B) fit, a sixth (1830 B) does not.
+  assert.deepEqual(rows, [linkRow(1), linkRow(2), ...[0, 1, 2, 3, 4].map(longTaskRow)]);
+  assert.ok(sectionBytes(rows) <= 1800, `${sectionBytes(rows)} B`);
+  assert.ok(rows.length <= 20);
+  assert.deepEqual(boundViolations(md), []);
+});
+
+test("U12-01 10 link rows + 10 long task rows → all 10 link rows, short or at the per-line maximum", () => {
+  // Short rows (132 B each): 1320 B, then one task row fits in the 480 B left.
+  const short = Array.from({ length: 10 }, (_, i) => linkEntry(i));
+  const md = compose(withTasks(short));
+  const rows = items(parseHandoff(md), "byproduct");
+  assert.deepEqual(rows, [...short.map((_, i) => linkRow(i)), longTaskRow(0)]);
+  assert.ok(sectionBytes(rows) <= 1800, `${sectionBytes(rows)} B`);
+  assert.deepEqual(boundViolations(md), []);
+  // Rows at the store's field maxima (327 chars, cut to 300 = 302 B): ten need 3030 B > 1800 B,
+  // so the section is exactly the link rows and no task row.
+  const long = Array.from({ length: 10 }, (_, i): ControllerLinkEntry => ({
+    role: "sender", id8: `0000000${i}`, peer: "p".repeat(32), state: "unverified_at_peer", next: "N".repeat(40),
+    due: "2026-11-22T00:05:00.000Z", senderTask: "s".repeat(64), receiverTask: "r".repeat(64),
+  }));
+  const fullRow = (i: number): string =>
+    `- controller-link sender 0000000${i} peer=${"p".repeat(32)} state=unverified_at_peer next=${"N".repeat(40)} due=2026-11-22T00:05:00.000Z sender_task=${"s".repeat(64)} receiver_task=${"r".repeat(64)}`;
+  assert.equal(fullRow(0).length, 327);
+  const mdLong = compose(withTasks(long));
+  const rowsLong = items(parseHandoff(mdLong), "byproduct");
+  assert.deepEqual(rowsLong, long.map((_, i) => `${fullRow(i).slice(0, 299)}…`));
+  assert.equal(sectionBytes(rowsLong), 3030);
+  assert.deepEqual(boundViolations(mdLong), []);
 });
 
 test("R2 missing store → [] (no line), no error, nothing created", async (t) => {

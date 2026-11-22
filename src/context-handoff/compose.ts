@@ -104,14 +104,16 @@ function header(c: ComposeInput): string[] {
   return out;
 }
 
+/** One row per open controller-link record (SPEC §9.4); compose() puts them first (U12-01). */
+function controllerLinkLines(e: Enrichment): string[] {
+  return (e.controllerLink ?? []).map((c) => line(`- controller-link ${c.role} ${c.id8} peer=${c.peer} state=${c.state} next=${c.next} due=${c.due ?? "-"} sender_task=${c.senderTask} receiver_task=${c.receiverTask ?? "-"}`));
+}
+
 function enrichmentLines(e: Enrichment): string[] {
   const out: string[] = [];
   for (const t of e.tasks ?? []) {
     const note = t.note === null ? "" : ` — latest note${t.noteDate === null ? "" : ` ${t.noteDate}`}: ${t.note}`;
     out.push(line(`- open task ${t.id} ${t.status} ${t.priority} ${t.desc}${note}`));
-  }
-  for (const c of e.controllerLink ?? []) {
-    out.push(line(`- controller-link ${c.role} ${c.id8} peer=${c.peer} state=${c.state} next=${c.next} due=${c.due ?? "-"} sender_task=${c.senderTask} receiver_task=${c.receiverTask ?? "-"}`));
   }
   if (e.dispatches !== null && e.dispatches.length > 0) {
     out.push(line(`- live dispatches: ${e.dispatches.map((d) => `${d.sid} (${d.lifecycle})`).join(", ")}`));
@@ -177,7 +179,12 @@ export function compose(c: ComposeInput): string {
   }
   const decisions = decisionItems.length === 0 ? [] : newestWithin(decisionItems, DECISION_ITEMS, DECISION_BYTES);
 
-  const enrich = firstWithin(enrichmentLines(c.enrichment), 20, ENRICH_BYTES);
+  // U12-01: the controller-link rows (≤ 10, readControllerLink) come first and are never cut for
+  // the rows after them, which fill what is left of the 20 lines and ENRICH_BYTES. One row can be
+  // 383 B with its newline, so ten can exceed ENRICH_BYTES: the section is then exactly theirs.
+  const links = controllerLinkLines(c.enrichment);
+  const linkBytes = links.reduce((n, l) => n + bytes(l) + 1, 0);
+  const enrich = [...links, ...firstWithin(enrichmentLines(c.enrichment), Math.max(0, 20 - links.length), ENRICH_BYTES - linkBytes)];
   const where = [line(`- transcript: ${oneLine(redact(c.ref.path))}`), line(`- task queue: ${oneLine(redact(c.taskQueue))}`)];
   if (c.enrichment.snapshotMtime !== null) where.push(line(`- snapshot: .context-snapshot.md (${c.enrichment.snapshotMtime})`));
 
