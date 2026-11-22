@@ -78,6 +78,8 @@ export const USAGE = [
   "  status  [--json] [--request <U>]          open records (or one request, any state)",
   "  probe   --request <U>                     ask the peer for the state of your last obligation message",
   "  close   --request <U>                     close a stalled record",
+  "  resend  --request <U> --reason \"<text>\"   re-send a stalled record's message (same bytes); reason kept in history",
+  "  pump    --once | --loop <seconds>         probes, same-byte re-sends, reminders, retention (off: AIGENTRY_CONTROLLER_LINK_PUMP=0)",
   "",
   "exit: 0 ok | 3 refused, nothing changed | 4 refused, nothing stored | 5 stored, not actionable",
   "      7 delivery unknown | 9 store/config failure | 11 not delivered",
@@ -1130,6 +1132,8 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
     (argv.length === 0 ? deps.err : deps.out)(USAGE);
     return argv.length === 0 ? EXIT.REFUSED : EXIT.OK;
   }
+  if (argv[0] === "pump") return (await import("./pump.js")).runPumpCli(argv.slice(1), deps);
+  if (argv[0] === "resend") return (await import("./pump.js")).runResendCli(argv.slice(1), deps);
   try {
     const args = parseArgs(argv);
     const cfg = loadPeerConfig(deps.env, deps.packageRoot);

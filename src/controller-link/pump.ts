@@ -1,0 +1,683 @@
+// controller-link v1 — pump and human re-send (SPEC §9, §6.1, §6.2, §4 retention; task 1294, unit U8).
+//
+//   bin/controller-link.sh pump   --once | --loop <seconds>        (reconciler step 0b4 runs `pump --once`)
+//   bin/controller-link.sh resend --request <U> --reason "<text>"   (human, from `stalled` only)
+//
+// One pass: load every record through the U2 store, ask decide() (pure) for each record's single next
+// step and perform it — recover a crashed `pending` attempt as `unknown`, mark `stalled`, send a PROBE,
+// re-send the SAME raw bytes (only on the triggers decide() allows), re-check corroboration through U6
+// `ingest`, or post a local notice — within the per-pass budget (≤ 240 s, ≤ 20 cross-machine sends,
+// ≤ 10 notices; a send starts only if its 120 s timeout fits). Then delete what the store's retention
+// selector returns (records first, then raw files), under the store lock.
+//
+// Every send follows SPEC §6.1: under the lock the attempt is written `pending` with `owner=<pid>@<host>`
+// and committed BEFORE telepty runs (U3 sendEnvelope); the result is written afterwards. A claim (a
+// pending attempt, a notice claim) whose owner may still be working is never taken over (§9.1).
+// Notices go to this machine's own controller through the report pump's sender (src/report/pump.ts),
+// injected as a port, with `--from controller-link` (HOLD-1 Q1, option B). Off switch: AIGENTRY_CONTROLLER_LINK_PUMP=0 (the pass reads and sends nothing).
+// The clock, monotonic clock, process runner, pid liveness, notice sender, sleep and store root are injected.
+import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
+import * as os from "node:os";
+import { performance } from "node:perf_hooks";
+
+import { parseInjectId } from "../dispatch/inject-id.js";
+import { sanitizeBody } from "../report/envelope.js";
+import { INJECT_TIMEOUT_MS, defaultPidAlive, defaultTeleptyPort, submitOutcome, type TeleptyPort } from "../report/pump.js";
+import { CliError, EXIT, activePeer, loadPeerConfig, nextActionFor, runCli, sentAt, type CliDeps, type PeerConfig } from "./cli.js";
+import {
+  answerResends, decide, dueOf, noticeClaimOf, noticeSeriesOf, pendingOwners, SETTLING_ACK_STATES,
+  type AttemptSlot, type DecideFacts, type NoticeKind, type Step,
+} from "./decide.js";
+import { REQUEST_ID_RE, SEQ_MAX, renderEnvelope } from "./envelope.js";
+import { SEND_FROM, SEND_TIMEOUT_MS, sendEnvelope, type SendClassification, type SendResult } from "./send.js";
+import {
+  ControllerLinkStore, StoreError, resolveStoreRoot,
+  type LinkRecord, type RecordRef, type RecordState, type SendAttempt,
+} from "./store.js";
+
+// ---------------------------------------------------------------------------------------------
+// Constants (SPEC §9.1)
+
+/** Off switch (DECISIONS Q2): `0` = the pump reads and sends nothing. */
+export const PUMP_SWITCH_ENV = "AIGENTRY_CONTROLLER_LINK_PUMP";
+/** One pass: wall time, cross-machine sends, local notices. */
+export const PASS_WALL_MS = 240_000;
+export const PASS_SENDS_MAX = 20;
+export const PASS_NOTICES_MAX = 10;
+/** A notice starts only if the report pump sender's own inject timeout fits in the pass. */
+export const NOTICE_TIMEOUT_MS = INJECT_TIMEOUT_MS;
+/** First token of every local notice (not an envelope; ingest ignores it). */
+export const NOTICE_MARKER = "⟦controller-link notice⟧";
+/** Local steps (recover, stall) a record may take in one pass before its one send or notice. */
+export const RECORD_STEPS_MAX = 4;
+/** `resend --reason`: one line, at most this many characters. */
+export const RESEND_REASON_MAX = 512;
+export const PUMP_USAGE = "usage: bin/controller-link.sh pump (--once | --loop <seconds>)";
+export const RESEND_USAGE = 'usage: bin/controller-link.sh resend --request <U> --reason "<text>"';
+const LOOP_SECONDS_RE = /^[1-9][0-9]{0,4}$/;
+const REASON_FORBIDDEN_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\u27e6\u27e7]/;
+const OWNER_RE = /^([0-9]{1,10})@(.+)$/;
+const SHIM = "bin/controller-link.sh";
+const RECONCILE = "the pump reconciles this automatically; do not re-run resend";
+
+/** Sender states an obligation-message send result may move (§7.1); later states never move back. */
+const SEND_STATES = new Set<string>(["prepared", "sent", "send_unknown", "send_refused", "unverified_at_peer"]);
+const AFTER_SEND: Record<SendResult, RecordState> = { handed_over: "sent", unknown: "send_unknown", refused_definite: "send_refused" };
+
+// ---------------------------------------------------------------------------------------------
+// Injected dependencies
+
+/** The report pump's notice sender (src/report/pump.ts `TeleptyPort.inject`), reused; production passes `from` = controller-link. */
+export type NoticePort = Pick<TeleptyPort, "inject">;
+
+export interface PumpDeps extends CliDeps {
+  /** Monotonic milliseconds for the per-pass deadline. */
+  monoMs(): number;
+  /** true alive, false gone (ESRCH), null unknown — src/report/pump.ts defaultPidAlive. */
+  pidAlive(pid: number): boolean | null;
+  notice: NoticePort;
+  sleep(ms: number): Promise<void>;
+  /** Host tokens that mean "this machine" in an owner `<pid>@<host>` (dispatch writes os.hostname() raw). */
+  localHosts: readonly string[];
+  /** Tests only: stop `--loop` after this many passes. */
+  maxPasses?: number;
+}
+
+export interface PassResult {
+  records: number;
+  sends: number;
+  notices: number;
+  recovered: number;
+  stalled: number;
+  verified: number;
+  /** Steps due but left for the next pass (budget or deadline). */
+  deferred: number;
+  deleted_records: number;
+  deleted_raws: number;
+  errors: string[];
+  lines: string[];
+}
+
+interface SendCtx {
+  deps: CliDeps;
+  cfg: PeerConfig;
+  store: ControllerLinkStore;
+  owner: string;
+  facts(rec: LinkRecord, nowMs: number): DecideFacts;
+}
+
+interface PumpCtx extends SendCtx {
+  deps: PumpDeps;
+  t0: number;
+  res: PassResult;
+}
+
+interface PendingSend {
+  ref: RecordRef;
+  slot: AttemptSlot;
+  n: number;
+  text: string;
+  target: string;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Small helpers
+
+const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
+const isoOf = (msv: number): string => new Date(msv).toISOString();
+const wireTask = (t: string | null): string | null => (t === null || t === "-" ? null : t);
+const id8 = (rec: LinkRecord): string => rec.request_id.slice(0, 8);
+const oneLine = (s: string): string => sanitizeBody(s, 512).text.replace(/\s+/g, " ").trim();
+const sendWord = (cls: SendClassification): string => `${cls.result}${cls.submit ? `/${cls.submit}` : ""}`;
+
+function refOf(rec: LinkRecord): RecordRef {
+  return rec.role === "sender"
+    ? { role: "sender", requestId: rec.request_id }
+    : { role: "receiver", peer: rec.peer, requestId: rec.request_id };
+}
+
+function setState(rec: LinkRecord, state: RecordState, nowIso: string): void {
+  if (rec.state === state) return;
+  rec.state = state;
+  rec.state_at = nowIso;
+}
+
+function addHistory(rec: LinkRecord, at: string, event: string, detail: string | null): void {
+  rec.history.push({ at, event, detail });
+}
+
+function attemptsOf(rec: LinkRecord, slot: AttemptSlot): SendAttempt[] | null {
+  switch (slot.where) {
+    case "ack": return rec.acks_out.sends;
+    case "probe": return rec.probes_out[slot.key]?.sends ?? null;
+    case "message": return rec.messages[slot.key]?.sends ?? null;
+    default: return null;
+  }
+}
+
+const slotName = (slot: AttemptSlot): string =>
+  slot.where === "message" ? slot.key : slot.where === "probe" ? `PROBE:${slot.key}` : slot.where === "ack" ? "ACK" : "NOTICE";
+
+/** Identity of a step, to re-check under the lock that the step decided outside it still applies. */
+function stepKey(s: Step): string {
+  switch (s.kind) {
+    case "recover": return `recover:${slotName(s.slot)}:${s.n}`;
+    case "probe": return `probe:${s.key}`;
+    case "resend": return `resend:${s.key}:${s.trigger}:${s.sha256}`;
+    case "remind": return `remind:${s.notice}:${s.anchor}`;
+    default: return s.kind;
+  }
+}
+
+/** Owners of the record's claims that are provably gone: same host and the pid is not alive (§6.2). */
+function goneOwnersOf(rec: LinkRecord, deps: PumpDeps): Set<string> {
+  const out = new Set<string>();
+  for (const owner of pendingOwners(rec)) {
+    const m = OWNER_RE.exec(owner);
+    if (m !== null && deps.localHosts.includes(m[2]!) && deps.pidAlive(Number(m[1])) === false) out.add(owner);
+  }
+  return out;
+}
+
+/** next_action from U6's wording, with the due time of the next pump step (U8 owns due times). */
+function refreshNext(c: SendCtx, rec: LinkRecord, nowMs: number, lastSend: SendAttempt["result"] | null = null): void {
+  const na = nextActionFor(rec.role, rec.state, rec.request_id, isoOf(nowMs), lastSend);
+  if (na.code !== "NONE") {
+    const due = dueOf(decide(rec, c.facts(rec, nowMs)), nowMs);
+    na.due_at = due === null || !Number.isFinite(due) ? null : isoOf(due);
+  }
+  rec.next_action = na;
+}
+
+/** Counts a notice in the record's series (`notices.series`) and in the U2 `notices` counters. */
+function countNotice(rec: LinkRecord, kind: NoticeKind, anchor: string, atIso: string, submit: string, injectId: string | null): number {
+  const s = noticeSeriesOf(rec);
+  const n = (s !== null && s.kind === kind && s.anchor === anchor ? s.n : 0) + 1;
+  rec.notices.series = { kind, anchor, n, last_at: atIso, last_submit: submit, last_inject_id: injectId };
+  rec.notices.n += 1;
+  rec.notices.last_at = atIso;
+  return n;
+}
+
+// ---------------------------------------------------------------------------------------------
+// §6.1 steps 2–4 for an attempt already committed `pending` (step 1)
+
+async function deliver(c: SendCtx, p: PendingSend): Promise<SendClassification> {
+  c.deps.fault?.("after_commit");
+  const out = await sendEnvelope(p.target, p.text, { runner: c.deps.runner, bin: c.deps.teleptyBin, baseEnv: c.deps.env });
+  const cls: SendClassification = out.attempted
+    ? out.classification
+    : { result: "refused_definite", submit: null, inject_id: null, detail: `not_attempted:${out.code}` };
+  c.deps.fault?.("after_inject");
+  await c.store.mutate<null>(p.ref, (cur, m) => {
+    if (cur === null) return { write: null, value: null };
+    const next = clone(cur);
+    const a = attemptsOf(next, p.slot)?.find((x) => x.n === p.n && x.result === "pending" && x.owner === c.owner);
+    if (a === undefined) return { write: null, value: null };
+    a.result = cls.result;
+    a.submit = cls.submit;
+    a.inject_id = cls.inject_id;
+    a.detail = cls.detail;
+    a.done_at = m.nowIso;
+    if (p.slot.where === "message") {
+      if (next.role === "sender" && SEND_STATES.has(next.state)) setState(next, AFTER_SEND[cls.result], m.nowIso);
+      addHistory(next, m.nowIso, "send", `${p.slot.key} n=${p.n} ${cls.result}`);
+    }
+    refreshNext(c, next, m.nowMs, p.slot.where === "message" ? cls.result : null);
+    return { write: next, value: null };
+  });
+  return cls;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Steps
+
+/** Runs `fn` on the current record only if decide() still returns the same step under the lock. */
+async function underSameStep<T>(c: PumpCtx, rec: LinkRecord, step: Step,
+  fn: (cur: LinkRecord, nowIso: string, nowMs: number) => { write: LinkRecord; value: T } | null): Promise<T | null> {
+  return c.store.mutate<T | null>(refOf(rec), (cur, m) => {
+    if (cur === null) return { write: null, value: null };
+    if (stepKey(decide(cur, c.facts(cur, m.nowMs))) !== stepKey(step)) return { write: null, value: null };
+    const r = fn(cur, m.nowIso, m.nowMs);
+    return r === null ? { write: null, value: null } : { write: r.write, value: r.value };
+  });
+}
+
+async function applyRecover(c: PumpCtx, rec: LinkRecord, step: Extract<Step, { kind: "recover" }>): Promise<LinkRecord | null> {
+  const done = await underSameStep<LinkRecord>(c, rec, step, (cur, nowIso, nowMs) => {
+    const next = clone(cur);
+    if (step.slot.where === "notice") {
+      // §9.1: an expired or orphaned notice claim is counted as sent (result unknown); never re-sent at once.
+      const claim = noticeClaimOf(next);
+      if (claim === null) return null;
+      countNotice(next, claim.kind, claim.anchor, claim.at, "unknown", null);
+      next.notices.claim = null;
+    } else {
+      // §6.2: the attempt becomes `unknown`; the probe path follows. Never re-sent at once.
+      const a = attemptsOf(next, step.slot)?.find((x) => x.n === step.n && x.result === "pending");
+      if (a === undefined) return null;
+      a.result = "unknown";
+      a.submit = null;
+      a.inject_id = null;
+      a.detail = `pending_recovered:${step.why}`;
+      a.done_at = nowIso;
+      if (step.slot.where === "message" && next.role === "sender" && SEND_STATES.has(next.state)) setState(next, "send_unknown", nowIso);
+      addHistory(next, nowIso, "recover", `${slotName(step.slot)} n=${step.n} pending->unknown (${step.why})`);
+      refreshNext(c, next, nowMs, step.slot.where === "message" ? "unknown" : null);
+    }
+    return { write: next, value: next };
+  });
+  if (done !== null) {
+    c.res.recovered += 1;
+    c.res.lines.push(`PUMP_RECOVER request=${rec.request_id} role=${rec.role} slot=${slotName(step.slot)} n=${step.n} why=${step.why} result=unknown`);
+  }
+  return done ?? (await c.store.read(refOf(rec)));
+}
+
+async function applyStall(c: PumpCtx, rec: LinkRecord, step: Extract<Step, { kind: "stall" }>): Promise<LinkRecord | null> {
+  const done = await underSameStep<LinkRecord>(c, rec, step, (cur, nowIso, nowMs) => {
+    const next = clone(cur);
+    setState(next, "stalled", nowIso);
+    addHistory(next, nowIso, "stalled", step.why);
+    refreshNext(c, next, nowMs);
+    return { write: next, value: next };
+  });
+  if (done !== null) {
+    c.res.stalled += 1;
+    c.res.lines.push(`PUMP_STALL request=${rec.request_id} role=${rec.role} state=stalled why=${oneLine(step.why).replace(/ /g, "_")}`);
+  }
+  return done ?? (await c.store.read(refOf(rec)));
+}
+
+async function doProbe(c: PumpCtx, rec: LinkRecord, step: Extract<Step, { kind: "probe" }>): Promise<void> {
+  const peer = activePeer(c.cfg, rec.peer);
+  if (peer === null) return;
+  const p = await underSameStep<PendingSend>(c, rec, step, (cur, nowIso, nowMs) => {
+    const next = clone(cur);
+    const n = Math.max(0, ...Object.values(next.probes_out).map((x) => x.last_seq)) + 1;
+    if (n > SEQ_MAX) throw new CliError("STATE_INVALID", "PROBE sequence exhausted for this request");
+    const r = renderEnvelope({
+      kind: "PROBE", id: next.request_id, seq: n, ref: step.key, from: c.cfg.self.label, to: next.peer, sent_at: sentAt(nowMs),
+      sender_task: wireTask(next.sender_task), receiver_task: next.receiver_task, state: null, outcome: null, final: null, reason: null,
+    }, "");
+    if (!r.ok) throw new Error(`controller-link pump: internal envelope error ${r.error.code}`);
+    const slot: LinkRecord["probes_out"][string] = next.probes_out[step.key] ?? { last_seq: 0, sends: [] };
+    slot.last_seq = n;
+    slot.sends.push({ n, at: nowIso, owner: c.owner, result: "pending", sha256: r.envelope.sha256, trigger: "pump" });
+    next.probes_out[step.key] = slot;
+    addHistory(next, nowIso, "probe", `${step.key} seq=${n} pump`);
+    refreshNext(c, next, nowMs);
+    return { write: next, value: { ref: refOf(next), slot: { where: "probe", key: step.key }, n, text: r.envelope.text, target: peer.target } };
+  });
+  if (p === null) return;
+  c.res.sends += 1;
+  const cls = await deliver(c, p);
+  c.res.lines.push(`PUMP_PROBE request=${rec.request_id} role=${rec.role} ref=${step.key} seq=${p.n} send=${sendWord(cls)}`);
+}
+
+async function doResend(c: PumpCtx, rec: LinkRecord, step: Extract<Step, { kind: "resend" }>): Promise<void> {
+  const peer = activePeer(c.cfg, rec.peer);
+  if (peer === null) return;
+  const raw = await c.store.readRaw(step.sha256);
+  if (raw === null) throw new StoreError("STORE_CORRUPT", "a message's raw file is missing");
+  const p = await underSameStep<PendingSend>(c, rec, step, (cur, nowIso, nowMs) => {
+    const next = clone(cur);
+    const entry = next.messages[step.key];
+    if (entry === undefined || entry.sha256 !== step.sha256) return null;
+    const sends = entry.sends ?? [];
+    const n = Math.max(0, ...sends.map((x) => x.n)) + 1;
+    if (step.trigger !== "refused_definite") entry.answer_resends = answerResends(next, step.key) + 1;
+    sends.push({ n, at: nowIso, owner: c.owner, result: "pending", trigger: step.trigger });
+    entry.sends = sends;
+    addHistory(next, nowIso, "resend", `${step.key} n=${n} trigger=${step.trigger} sha256=${step.sha256}`);
+    refreshNext(c, next, nowMs);
+    return { write: next, value: { ref: refOf(next), slot: { where: "message", key: step.key }, n, text: raw.toString("utf8"), target: peer.target } };
+  });
+  if (p === null) return;
+  c.res.sends += 1;
+  const cls = await deliver(c, p);
+  c.res.lines.push(`PUMP_RESEND request=${rec.request_id} role=${rec.role} ref=${step.key} n=${p.n} trigger=${step.trigger} ` +
+    `sha256=${step.sha256} send=${sendWord(cls)}`);
+}
+
+/** §9.3: re-run §8.1 step 3 by feeding the stored raw bytes to U6 `ingest` ("as if newly ingested"). */
+async function doVerify(c: PumpCtx, rec: LinkRecord, step: Extract<Step, { kind: "verify" }>): Promise<void> {
+  const blocks: string[] = [];
+  for (const sha of step.shas) {
+    const raw = await c.store.readRaw(sha);
+    if (raw !== null) blocks.push(raw.toString("utf8"));
+  }
+  if (blocks.length === 0) return;
+  c.res.sends += 1; // ingest may answer with an ACK: counted as one cross-machine send
+  c.res.verified += 1;
+  const lines: string[] = [];
+  const input = Buffer.from(blocks.join("\n"), "utf8");
+  const code = await runCli(["ingest"], {
+    ...c.deps, readStdin: async () => input, out: (l) => { lines.push(l); }, err: (l) => { lines.push(l); },
+  });
+  const results = lines.filter((l) => l.startsWith("RESULT=")).map((l) => l.split(" ")[0]!.slice("RESULT=".length));
+  c.res.lines.push(`PUMP_VERIFY request=${rec.request_id} role=${rec.role} blocks=${blocks.length} results=${results.join(",") || "-"} exit=${code}`);
+}
+
+/** The local notice text (§9.3): names the record, its state and the exact next command. */
+export function renderControllerNotice(rec: LinkRecord, kind: NoticeKind, n: number): string {
+  const id = rec.request_id;
+  const status = `${SHIM} status --request ${id}`;
+  const lastStall = [...rec.history].reverse().find((h) => h.event === "stalled");
+  const reason = typeof rec.refuse_reason === "string" ? rec.refuse_reason : "-";
+  const text: Record<NoticeKind, [string, string]> = {
+    stalled: [`reconciliation stopped (${typeof lastStall?.detail === "string" ? lastStall.detail : "limit reached"}); nothing more is sent automatically`,
+      `${status}  # then: ${SHIM} resend --request ${id} --reason "<why>"  or  ${SHIM} close --request ${id}`],
+    conflict: ["two corroborated copies of one message have different bytes; nothing was sent; held for a human", status],
+    refused: [`the peer refused this request (reason=${reason})`, status],
+    peer_unconfigured: [`peer ${rec.peer} is not configured with link "v1"; nothing is sent for this record and its state is kept`,
+      `fix state/controller-peers.json, then ${status}`],
+    reply_unverified: ["a REPLY from the peer is still not corroborated by this machine's telepty audit after 48 h; " +
+      "it is not acted on and the record's state is kept", `${status}  # a corroborated copy is still ingested when it arrives`],
+    unbound: ["a peer request waits for bind or refuse", nextActionFor("receiver", "received", id, rec.state_at).text],
+    no_final: ["your bound task has no final REPLY yet", nextActionFor("receiver", "accepted", id, rec.state_at).text],
+  };
+  const [what, next] = text[kind];
+  return `${NOTICE_MARKER} ${kind.toUpperCase()} request_id=${id} role=${rec.role} peer=${rec.peer} state=${rec.state} ` +
+    `sender_task=${rec.sender_task} receiver_task=${rec.receiver_task ?? "-"} n=${n} — ${oneLine(what)}\nnext: ${oneLine(next)}`;
+}
+
+async function doRemind(c: PumpCtx, rec: LinkRecord, step: Extract<Step, { kind: "remind" }>): Promise<void> {
+  const claimed = await underSameStep<{ rec: LinkRecord; at: string }>(c, rec, step, (cur, nowIso) => {
+    const next = clone(cur);
+    next.notices.claim = { owner: c.owner, at: nowIso, kind: step.notice, anchor: step.anchor };
+    return { write: next, value: { rec: next, at: nowIso } };
+  });
+  if (claimed === null) return;
+  c.res.notices += 1;
+  const s = noticeSeriesOf(claimed.rec);
+  const n = (s !== null && s.kind === step.notice && s.anchor === step.anchor ? s.n : 0) + 1;
+  const r = c.deps.notice.inject(c.cfg.self.controller_sid, renderControllerNotice(claimed.rec, step.notice, n));
+  const submit = submitOutcome(r);
+  const injectId = parseInjectId(r.stdout) || null;
+  const delivered = r.rc === 0;
+  await c.store.mutate<null>(refOf(rec), (cur) => {
+    if (cur === null) return { write: null, value: null };
+    const claim = noticeClaimOf(cur);
+    if (claim === null || claim.owner !== c.owner || claim.at !== claimed.at) return { write: null, value: null };
+    const next = clone(cur);
+    // A notice telepty refused is not counted: it is due again next pass.
+    if (delivered) countNotice(next, claim.kind, claim.anchor, claim.at, submit, injectId);
+    next.notices.claim = null;
+    return { write: next, value: null };
+  });
+  c.res.lines.push(`PUMP_NOTICE request=${rec.request_id} role=${rec.role} kind=${step.notice} n=${n} rc=${r.rc ?? "null"} ` +
+    `submit=${submit} inject_id=${injectId ?? "null"}`);
+}
+
+// ---------------------------------------------------------------------------------------------
+// One pass
+
+function sendFits(c: PumpCtx): boolean {
+  return c.res.sends < PASS_SENDS_MAX && c.deps.monoMs() - c.t0 + SEND_TIMEOUT_MS <= PASS_WALL_MS;
+}
+
+function noticeFits(c: PumpCtx): boolean {
+  return c.res.notices < PASS_NOTICES_MAX && c.deps.monoMs() - c.t0 + NOTICE_TIMEOUT_MS <= PASS_WALL_MS;
+}
+
+function defer(c: PumpCtx, rec: LinkRecord, step: Step): void {
+  c.res.deferred += 1;
+  c.res.lines.push(`PUMP_DEFERRED request=${rec.request_id} role=${rec.role} step=${step.kind} reason=pass_budget`);
+}
+
+async function processRecord(c: PumpCtx, first: LinkRecord): Promise<void> {
+  let next: LinkRecord | null = first;
+  for (let i = 0; i < RECORD_STEPS_MAX; i++) {
+    if (next === null) return;
+    const rec: LinkRecord = next;
+    const step = decide(rec, c.facts(rec, c.deps.clock.nowMs()));
+    switch (step.kind) {
+      case "none":
+      case "expire":
+        return;
+      case "recover":
+        next = await applyRecover(c, rec, step);
+        break;
+      case "stall":
+        next = await applyStall(c, rec, step);
+        break;
+      case "probe":
+        if (sendFits(c)) await doProbe(c, rec, step);
+        else defer(c, rec, step);
+        return;
+      case "resend":
+        if (sendFits(c)) await doResend(c, rec, step);
+        else defer(c, rec, step);
+        return;
+      case "verify":
+        if (sendFits(c)) await doVerify(c, rec, step);
+        else defer(c, rec, step);
+        return;
+      default:
+        if (noticeFits(c)) await doRemind(c, rec, step);
+        else defer(c, rec, step);
+        return;
+    }
+  }
+}
+
+async function unlinkIfPresent(file: string): Promise<boolean> {
+  try {
+    await fsp.unlink(file);
+    return true;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw new StoreError("STORE_UNAVAILABLE", "retention could not delete a file");
+  }
+}
+
+/** §4 retention: under the store lock, delete the selected records first, then the selected raw files. */
+async function retention(c: PumpCtx): Promise<void> {
+  if (!fs.existsSync(c.store.markerPath)) return; // no store: nothing to delete, and nothing is created
+  const done = await c.store.withLock(async () => {
+    const sel = await c.store.selectRetention();
+    let records = 0;
+    let raws = 0;
+    for (const ref of sel.records) if (await unlinkIfPresent(c.store.recordPath(ref))) records += 1;
+    for (const sha of sel.raws) if (await unlinkIfPresent(c.store.rawPath(sha))) raws += 1;
+    return { records, raws };
+  });
+  c.res.deleted_records = done.records;
+  c.res.deleted_raws = done.raws;
+  if (done.records + done.raws > 0) c.res.lines.push(`PUMP_RETENTION records=${done.records} raws=${done.raws}`);
+}
+
+/** One pass over every record (SPEC §9). Throws CliError (config) / StoreError (store) for the whole pass. */
+export async function pumpOnce(deps: PumpDeps): Promise<PassResult> {
+  const res: PassResult = {
+    records: 0, sends: 0, notices: 0, recovered: 0, stalled: 0, verified: 0, deferred: 0, deleted_records: 0, deleted_raws: 0,
+    errors: [], lines: [],
+  };
+  const cfg = loadPeerConfig(deps.env, deps.packageRoot);
+  const store = new ControllerLinkStore({ root: resolveStoreRoot(deps.env, deps.packageRoot), clock: deps.clock });
+  const c: PumpCtx = {
+    deps, cfg, store, owner: `${deps.proc.pid}@${deps.proc.host}`, t0: deps.monoMs(), res,
+    facts: (rec, nowMs) => ({ nowMs, peerActive: activePeer(cfg, rec.peer) !== null, goneOwners: goneOwnersOf(rec, deps) }),
+  };
+  const records = await store.list();
+  res.records = records.length;
+  for (const rec of records) {
+    if (deps.monoMs() - c.t0 >= PASS_WALL_MS) {
+      res.errors.push("pass_deadline");
+      res.lines.push("PUMP_DEADLINE remaining records are left for the next pass");
+      break;
+    }
+    try {
+      await processRecord(c, rec);
+    } catch (e) {
+      const code = e instanceof StoreError || e instanceof CliError ? e.code : "exception";
+      res.errors.push(`${id8(rec)}:${code}`);
+      res.lines.push(`PUMP_ERROR request=${rec.request_id} role=${rec.role} error=${oneLine(e instanceof Error ? e.message : String(e))}`);
+    }
+  }
+  await retention(c);
+  return res;
+}
+
+function summary(r: PassResult): string {
+  return `controller-link pump: records=${r.records} sends=${r.sends} notices=${r.notices} recovered=${r.recovered} ` +
+    `stalled=${r.stalled} verified=${r.verified} deferred=${r.deferred} deleted_records=${r.deleted_records} ` +
+    `deleted_raws=${r.deleted_raws} errors=${r.errors.length > 0 ? r.errors.join(",") : "none"}`;
+}
+
+async function onePass(deps: PumpDeps): Promise<number> {
+  if (deps.env[PUMP_SWITCH_ENV] === "0") {
+    deps.out(`controller-link pump: disabled (${PUMP_SWITCH_ENV}=0); nothing read, nothing sent`);
+    return EXIT.OK;
+  }
+  try {
+    const res = await pumpOnce(deps);
+    for (const l of res.lines) deps.out(l);
+    deps.out(summary(res));
+    return res.errors.length > 0 ? EXIT.STATE : EXIT.OK;
+  } catch (e) {
+    if (e instanceof CliError) {
+      deps.err(`controller-link: ${e.message}`);
+      return e.exit;
+    }
+    if (e instanceof StoreError) {
+      deps.err(`controller-link: ${e.message}`);
+      return EXIT.STORE;
+    }
+    deps.err(`controller-link: pump pass failed: ${oneLine(e instanceof Error ? e.message : String(e))}`);
+    return 1;
+  }
+}
+
+/** `pump --once | --loop <seconds>`. Exit (last pass): 0 ok, 3 some record failed, 4 usage, 9 store/config. */
+export async function runPump(argv: readonly string[], deps: PumpDeps): Promise<number> {
+  let loopSeconds = 0;
+  if (argv.length === 1 && argv[0] === "--once") loopSeconds = 0;
+  else if (argv.length === 2 && argv[0] === "--loop" && LOOP_SECONDS_RE.test(argv[1]!)) loopSeconds = Number(argv[1]);
+  else {
+    deps.err(`controller-link: USAGE: ${PUMP_USAGE}`);
+    return EXIT.REFUSED;
+  }
+  for (let pass = 1; ; pass++) {
+    const rc = await onePass(deps);
+    if (loopSeconds === 0 || (deps.maxPasses !== undefined && pass >= deps.maxPasses)) return rc;
+    await deps.sleep(loopSeconds * 1000);
+  }
+}
+
+/** Production pump ports added to the CLI's dependencies. */
+export function defaultPumpDeps(cli: CliDeps): PumpDeps {
+  return {
+    ...cli,
+    monoMs: () => performance.now(),
+    pidAlive: defaultPidAlive,
+    notice: defaultTeleptyPort(cli.teleptyBin, SEND_FROM),
+    sleep: (msv) => new Promise<void>((resolve) => { setTimeout(resolve, msv); }),
+    localHosts: [...new Set([cli.proc.host, os.hostname()])],
+  };
+}
+
+/** Entry from cli.ts `runCli` for `pump`. */
+export async function runPumpCli(argv: readonly string[], cli: CliDeps): Promise<number> {
+  return runPump(argv, defaultPumpDeps(cli));
+}
+
+// ---------------------------------------------------------------------------------------------
+// resend --request <U> --reason "<text>" (§9.2 last paragraph; human, from `stalled` only)
+
+export function parseResendArgs(argv: readonly string[]): { requestId: string; reason: string } {
+  const v = new Map<string, string>();
+  for (let i = 0; i < argv.length; i += 2) {
+    const flag = argv[i]!;
+    const val = argv[i + 1];
+    if ((flag !== "--request" && flag !== "--reason") || val === undefined || v.has(flag)) {
+      throw new CliError("USAGE", `unknown, repeated or valueless argument for resend: '${flag.slice(0, 32)}'`);
+    }
+    v.set(flag, val);
+  }
+  const requestId = v.get("--request");
+  const reason = v.get("--reason")?.trim();
+  if (requestId === undefined || !REQUEST_ID_RE.test(requestId)) throw new CliError("USAGE", "--request <request id> is required");
+  if (reason === undefined || reason === "") throw new CliError("USAGE", "--reason \"<text>\" is required");
+  if (reason.length > RESEND_REASON_MAX || REASON_FORBIDDEN_RE.test(reason)) {
+    throw new CliError("USAGE", `--reason must be one line of at most ${RESEND_REASON_MAX} characters without control or fence characters`);
+  }
+  return { requestId, reason };
+}
+
+/** The message a human re-send repeats: the sender's unsettled REQUEST-1, or the receiver's newest REPLY not ACKed `received`. */
+export function resendTarget(rec: LinkRecord): string | null {
+  const unsettled = (k: string): boolean => {
+    const ack = rec.acks_in[k];
+    return (rec.messages[k]?.sends?.length ?? 0) > 0 && (ack === undefined || !SETTLING_ACK_STATES.includes(ack.state));
+  };
+  if (rec.role === "sender") return unsettled("REQUEST-1") ? "REQUEST-1" : null;
+  const keys = Object.keys(rec.messages).filter((k) => k.startsWith("REPLY-")).sort((x, y) => Number(y.slice(6)) - Number(x.slice(6)));
+  return keys.find(unsettled) ?? null;
+}
+
+async function humanResend(c: SendCtx, id: string, reason: string): Promise<number> {
+  const recs = (await c.store.list()).filter((r) => r.request_id === id);
+  if (recs.length === 0) throw new CliError("STATE_INVALID", `no record for request ${id}`);
+  if (recs.length > 1) throw new CliError("STATE_INVALID", `request ${id} names more than one record`);
+  const found = recs[0]!;
+  if (found.state !== "stalled") throw new CliError("STATE_INVALID", `request ${id} is '${found.state}', resend needs 'stalled'`);
+  const peer = activePeer(c.cfg, found.peer);
+  if (peer === null) throw new CliError("STATE_INVALID", `peer ${found.peer} is not configured with link v1; nothing changed`);
+  const key = resendTarget(found);
+  if (key === null) throw new CliError("STATE_INVALID", `request ${id} has no unsettled message of yours to re-send; use close`);
+  const sha = found.messages[key]!.sha256;
+  const raw = await c.store.readRaw(sha);
+  if (raw === null) throw new StoreError("STORE_CORRUPT", "a message's raw file is missing");
+  const p = await c.store.mutate<PendingSend>(refOf(found), (cur, m) => {
+    if (cur === null || cur.state !== "stalled") throw new CliError("STATE_INVALID", `request ${id} is no longer 'stalled'`);
+    if (resendTarget(cur) !== key || cur.messages[key]!.sha256 !== sha) throw new CliError("STATE_INVALID", `request ${id} changed; nothing sent`);
+    const next = clone(cur);
+    const entry = next.messages[key]!;
+    const sends = entry.sends ?? [];
+    if (sends.some((a) => a.result === "pending")) throw new CliError("STATE_INVALID", `request ${id} has an attempt in flight`);
+    const n = Math.max(0, ...sends.map((x) => x.n)) + 1;
+    sends.push({ n, at: m.nowIso, owner: c.owner, result: "pending", trigger: "human" });
+    entry.sends = sends;
+    setState(next, next.role === "sender" ? "sent" : "replying", m.nowIso); // §7.1 / §7.2: stalled → sent / replying (resend)
+    addHistory(next, m.nowIso, "resend", `${key} n=${n} human reason=${reason}`);
+    refreshNext(c, next, m.nowMs);
+    return { write: next, value: { ref: refOf(next), slot: { where: "message", key }, n, text: raw.toString("utf8"), target: peer.target } };
+  });
+  const cls = await deliver(c, p);
+  c.deps.out(`OK resend request=${id} ref=${key} n=${p.n} send=${sendWord(cls)}`);
+  if (cls.result === "handed_over") return EXIT.OK;
+  if (cls.result === "unknown") {
+    c.deps.err(`PEER_DELIVERY_UNKNOWN: request ${id} ${key} — ${cls.detail ?? "result unknown"}; ${RECONCILE}`);
+    return EXIT.DELIVERY_UNKNOWN;
+  }
+  c.deps.err(`PEER_NOT_DELIVERED: request ${id} ${key} definitely refused (${cls.detail ?? "-"}); ${RECONCILE}`);
+  return EXIT.NOT_DELIVERED;
+}
+
+/** Entry from cli.ts `runCli` for `resend`. Exit: 0, 3, 4, 7, 9, 11 (as `probe`). */
+export async function runResendCli(argv: readonly string[], deps: CliDeps): Promise<number> {
+  try {
+    const a = parseResendArgs(argv);
+    const cfg = loadPeerConfig(deps.env, deps.packageRoot);
+    const store = new ControllerLinkStore({ root: resolveStoreRoot(deps.env, deps.packageRoot), clock: deps.clock });
+    const c: SendCtx = {
+      deps, cfg, store, owner: `${deps.proc.pid}@${deps.proc.host}`,
+      facts: (rec, nowMs) => ({ nowMs, peerActive: activePeer(cfg, rec.peer) !== null, goneOwners: new Set<string>() }),
+    };
+    return await humanResend(c, a.requestId, a.reason);
+  } catch (e) {
+    if (e instanceof CliError) {
+      deps.err(`controller-link: ${e.message}`);
+      if (e.code === "USAGE") deps.err(RESEND_USAGE);
+      return e.exit;
+    }
+    if (e instanceof StoreError) {
+      deps.err(`controller-link: ${e.message}`);
+      return EXIT.STORE;
+    }
+    throw e;
+  }
+}
