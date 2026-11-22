@@ -100,7 +100,15 @@ export const USAGE = `# dispatch.sh — Wraps \`telepty inject\` with REPL-ready
 #   never a worker. It is accepted only when it equals a peers.*.target with link "v1" in
 #   the hand-written state/controller-peers.json (AIGENTRY_CONTROLLER_PEERS overrides the
 #   path); any other \`@\` target, or a missing or malformed list, exits 78
-#   (PEER_TARGET_REFUSED / PEER_CONFIG_INVALID). The task gate runs first, unchanged. The
+#   (PEER_TARGET_REFUSED / PEER_CONFIG_INVALID). A local alias (localhost, 127.x, ::1, 0.0.0.0
+#   and their spellings) names this machine and exits 78 PEER_TARGET_REFUSED even when listed.
+#   The task gate runs first, unchanged. Checks run in ONE fixed order and the first failing
+#   one answers: (1) argument parsing, --ref present and a file, the --input-* triple (#1172),
+#   the Rule 34 task gate, all as for any target (a --no-task audit line is written here);
+#   (2) peer list, 78 PEER_CONFIG_INVALID; (3) local alias, then listed with link "v1", 78
+#   PEER_TARGET_REFUSED; (4) local-only flags, then a --task id the envelope cannot carry, 4
+#   PEER_FLAG_UNSUPPORTED; (5) ref size and body, 4; (6) record and de-duplication, 9 / 8;
+#   (7) the send. So an unlisted host with a missing --ref exits 4 (step 1). The
 #   ref is read locally and sent inline as the body of one envelope (at most 12288 bytes
 #   after normalisation) by ONE \`telepty inject --submit --no-submit-force --submit-retry 0
 #   --from controller-link\`; never --ref, never a worker spawn, registry record, staging,

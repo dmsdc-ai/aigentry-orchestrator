@@ -36,6 +36,19 @@ if (mode === 'corrupt') {
   for (const n of fs.readdirSync(dir)) fs.writeFileSync(path.join(dir, n), '{');
   mode = 'consumed';
 }
+if (process.env.PEER_SETTLE) {
+  // CL-02: a faster path (an ACK or REPLY ingest) settles the record while "telepty" still runs.
+  const dir = path.join(process.env.AIGENTRY_CONTROLLER_LINK_DIR, 'outbox');
+  for (const n of fs.readdirSync(dir)) {
+    const rec = JSON.parse(fs.readFileSync(path.join(dir, n), 'utf8'));
+    rec.state = process.env.PEER_SETTLE;
+    rec.state_at = '2026-01-02T03:04:05Z';
+    rec.next_action = JSON.parse(process.env.PEER_SETTLE_NEXT);
+    rec.acks_in['REQUEST-1'] = { last_seq: 1, state: 'received', at: rec.state_at };
+    rec.history.push({ at: rec.state_at, event: 'ack_in', detail: 'REQUEST-1 seq=1 state=received' });
+    fs.writeFileSync(path.join(dir, n), JSON.stringify(rec));
+  }
+}
 if (mode === 'consumed') { console.log('inject_id: ${INJECT_ID}'); console.log('✅ Submitted — consumed as a new turn.'); process.exit(0); }
 if (mode === 'queued') { console.log('inject_id: ${INJECT_ID}'); console.log('⏳ QUEUED, NOT consumed'); process.exit(0); }
 if (mode === 'refused') { console.log('❌ [SESSION_NOT_FOUND] Session not found'); process.exit(1); }
@@ -202,6 +215,85 @@ test("D2 '..' segment in AIGENTRY_CONTROLLER_PEERS → exit 78 PEER_CONFIG_INVAL
     assert.equal(r.status, 78, r.stderr);
     assert.ok(stderrLine(r.stderr, "dispatch.sh: PEER_CONFIG_INVALID: "), r.stderr);
     s.assertUntouched("dotdot");
+  } finally { s.f.cleanup(); }
+});
+
+// ── CL-16: a configured local alias is still refused; one fixed order of refusals ──
+const LOCAL_ALIASES = ["orchestrator@127.0.0.1", "orchestrator@127.1", "orchestrator@127.0.0.1:3848", "orchestrator@localhost",
+  "orchestrator@LOCALHOST.", "orchestrator@box.localhost", "orchestrator@::1", "orchestrator@[::1]", "orchestrator@0.0.0.0"];
+for (const alias of LOCAL_ALIASES) {
+  test(`CL-16 ${alias} listed with link "v1" → exit 78 PEER_TARGET_REFUSED, nothing written anywhere`, () => {
+    const s = setup(peersWith((c) => ({ ...c, peers: { ...c.peers, loop: { target: alias, link: "v1" } } })));
+    try {
+      const r = s.run(["--target", alias, "--task", "1083"]);
+      assert.equal(r.status, 78, r.stderr);
+      const line = stderrLine(r.stderr, "dispatch.sh: PEER_TARGET_REFUSED: ");
+      assert.ok(line && line.includes("local alias"), r.stderr);
+      assert.equal(r.stdout, "");
+      s.assertUntouched(alias);
+    } finally { s.f.cleanup(); }
+  });
+}
+
+test("CL-16 a listed local alias does not refuse the other peers in the same list", () => {
+  const s = setup(peersWith((c) => ({ ...c, peers: { ...c.peers, loop: { target: "orchestrator@127.0.0.1", link: "v1" } } })));
+  try {
+    const r = s.run(["--target", TARGET, "--task", "1083"]);
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(s.calls().length, 1);
+    assert.equal(s.calls()[0]!.argv[7], TARGET);
+  } finally { s.f.cleanup(); }
+});
+
+// The order stated in usage: (1) parse, --ref, --input-*, task gate; (2) peer list; (3) local alias, then listed;
+// (4) local-only flags / task id; (5) body; (6) record / dedup; (7) send. Each row combines two defects and
+// pins which one answers.
+const ORDER: [string, string[], string | null, NodeJS.ProcessEnv, number, RegExp][] = [
+  ["unlisted host + missing ref file → step 1", ["--target", "orchestrator@unlisted", "--task", "1083", "--ref", "MISSING"], null, {},
+    4, /^dispatch\.sh: ref file not found: /m],
+  ["unlisted host + unknown task → step 1", ["--target", "orchestrator@unlisted", "--task", "9999"], null, {},
+    4, /^dispatch\.sh: Rule 34 task-gate: unknown task id '9999'/m],
+  ["local alias + missing ref file → step 1", ["--target", "orchestrator@127.0.0.1", "--task", "1083", "--ref", "MISSING"], null, {},
+    4, /^dispatch\.sh: ref file not found: /m],
+  ["invalid peer list + local alias → step 2", ["--target", "orchestrator@127.0.0.1", "--task", "1083"], "{", {},
+    78, /^dispatch\.sh: PEER_CONFIG_INVALID: /m],
+  ["invalid peer list + local-only flag → step 2", ["--target", TARGET, "--task", "1083", "--cli", "claude"], "{", {},
+    78, /^dispatch\.sh: PEER_CONFIG_INVALID: /m],
+  ["listed local alias + local-only flag → step 3", ["--target", "orchestrator@localhost", "--task", "1083", "--cli", "claude"],
+    peersWith((c) => ({ ...c, peers: { ...c.peers, loop: { target: "orchestrator@localhost", link: "v1" } } })), {},
+    78, /^dispatch\.sh: PEER_TARGET_REFUSED: .*local alias/m],
+  ["unlisted host + local-only flag → step 3", ["--target", "orchestrator@unlisted", "--task", "1083", "--cli", "claude"], null, {},
+    78, /^dispatch\.sh: PEER_TARGET_REFUSED: /m],
+  ["listed peer + local-only flag + placeholder body → step 4", ["--target", TARGET, "--task", "1083", "--from", "x", "--ref", "PLACEHOLDER"],
+    null, {}, 4, /^dispatch\.sh: PEER_FLAG_UNSUPPORTED: --from/m],
+];
+for (const [name, args, peers, overrides, exit, line] of ORDER) {
+  test(`CL-16 order: ${name}`, () => {
+    const s = setup();
+    try {
+      if (peers !== null) writeFileSync(s.peers, peers);
+      const placeholder = join(s.f.root, "placeholder.md");
+      writeFileSync(placeholder, "Report to {{ORCHESTRATOR_REPORT_TARGET}}.\n");
+      const resolved = args.map((a) => a === "MISSING" ? join(s.f.root, "missing.md") : a === "PLACEHOLDER" ? placeholder : a);
+      const r = s.run(resolved, overrides);
+      assert.equal(r.status, exit, r.stderr);
+      assert.match(r.stderr, line);
+      s.assertUntouched(name);
+    } finally { s.f.cleanup(); }
+  });
+}
+
+test("CL-16 usage states the fixed order and the local-alias refusal", () => {
+  const s = setup();
+  try {
+    const r = s.run(["--help"]);
+    assert.equal(r.status, 0, r.stderr);
+    for (const want of [
+      "A local alias (localhost, 127.x, ::1, 0.0.0.0",
+      "Checks run in ONE fixed order and the first failing",
+      "(2) peer list, 78 PEER_CONFIG_INVALID; (3) local alias, then listed with link \"v1\", 78",
+      "(7) the send. So an unlisted host with a missing --ref exits 4 (step 1).",
+    ]) assert.ok(r.stdout.includes(want), `usage lacks: ${want}`);
   } finally { s.f.cleanup(); }
 });
 
@@ -417,6 +509,32 @@ test("D7 (Root Q3) result cannot be recorded after the send → exit 7 'result n
     assert.equal(readFileSync(s.f.queue, "utf8"), s.seeded.queue, "no task-ledger update");
   } finally { s.f.cleanup(); }
 });
+
+// ── CL-02: the result of the initial inject never moves a record a faster path already settled ──
+const SETTLED: [string, string, string, number, { code: string; due_at: string | null; text: string }][] = [
+  // A final REPLY ingested while telepty still runs; the send then reports handed_over.
+  ["replied", "consumed", "handed_over", 0, { code: "NONE", due_at: null, text: "" }],
+  // An ACK received ingested while telepty still runs; the send then reports unknown.
+  ["received", "unknown", "unknown", 7, { code: "WAIT_BIND", due_at: "2026-01-02T03:04:05Z", text: "settled by ACK" }],
+];
+for (const [state, mode, result, exit, nextAction] of SETTLED) {
+  test(`CL-02 record settled to ${state} during the send, then ${result} → stays ${state}, attempt still recorded`, () => {
+    const s = setup();
+    try {
+      const r = s.run(["--target", TARGET, "--task", "1083"],
+        { PEER_MODE: mode, PEER_SETTLE: state, PEER_SETTLE_NEXT: JSON.stringify(nextAction) });
+      assert.equal(r.status, exit, r.stderr);
+      const rec = s.record(s.idFrom(exit === 0 ? r.stdout : r.stderr));
+      assert.equal(rec.state, state, "the late send result moved the record backwards");
+      assert.equal(rec.state_at, "2026-01-02T03:04:05Z");
+      assert.deepEqual(rec.next_action, nextAction);
+      assert.equal(rec.messages["REQUEST-1"].sends.length, 1);
+      assert.equal(rec.messages["REQUEST-1"].sends[0].result, result, "attempt metadata is still written");
+      assert.deepEqual(rec.history.map((h: { event: string }) => h.event), ["created", "ack_in", "send"]);
+      assert.equal(s.calls().length, 1);
+    } finally { s.f.cleanup(); }
+  });
+}
 
 // ── D8 ────────────────────────────────────────────────────────────────────────
 test("D8 a target without '@' never consults the peer list or the store", () => {

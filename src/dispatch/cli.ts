@@ -2387,6 +2387,19 @@ async function main(argv: string[]): Promise<never> {
     try { config = readPeers(); } catch (e) {
       die(`dispatch.sh: PEER_CONFIG_INVALID: ${printable(String((e as Error)?.message ?? e))}; nothing sent`, 78);
     }
+    // CL-16 (SPEC §10): a local alias names THIS machine, never a peer controller, so it is refused even
+    // when the peer list names it. The host is normalised as a URL parser does (127.1, 0x7f.0.0.1,
+    // LOCALHOST., [0:0:0:0:0:0:0:1], a :port suffix); a host no URL can hold is left to the list check.
+    const urlHost = (h: string): string | null => {
+      try { return new URL(`http://${h}/`).hostname.toLowerCase().replace(/\.$/, ""); } catch { return null; }
+    };
+    const peerHost = target.slice(target.lastIndexOf("@") + 1);
+    const localAlias = [urlHost(peerHost), peerHost.startsWith("[") ? null : urlHost(`[${peerHost}]`)].some((h) => h !== null
+      && (h === "localhost" || h.endsWith(".localhost") || /^127\.\d+\.\d+\.\d+$/.test(h) || h === "0.0.0.0"
+        || h === "[::1]" || h === "[::]" || /^\[::ffff:(7f[0-9a-f]{2}:[0-9a-f]{1,4}|0:0)\]$/.test(h)));
+    if (localAlias) {
+      die(`dispatch.sh: PEER_TARGET_REFUSED: ${printable(target)} names this machine (a local alias), never a peer controller; nothing sent`, 78);
+    }
     const peer = config.peers.find((p) => p.target === target && p.link === "v1");
     if (peer === undefined) {
       die(`dispatch.sh: PEER_TARGET_REFUSED: ${printable(target)} is not a listed peer controller with link "v1"; nothing sent`, 78);
@@ -2496,9 +2509,13 @@ async function main(argv: string[]): Promise<never> {
         attempt.submit = cls.submit;
         attempt.inject_id = cls.inject_id;
         attempt.detail = cls.detail;
-        next.state = outcome.state as LinkRecordT["state"];
-        next.state_at = ctx.nowIso;
-        next.next_action = { code: outcome.code, due_at: new Date(Date.parse(attempt.at) + outcome.min * 60_000).toISOString(), text: outcome.text };
+        // CL-02: only `prepared` (step 1 of THIS send) is moved by the result. An ACK or REPLY ingested
+        // while telepty ran has already settled the record further; it is never moved backwards.
+        if (next.state === "prepared") {
+          next.state = outcome.state as LinkRecordT["state"];
+          next.state_at = ctx.nowIso;
+          next.next_action = { code: outcome.code, due_at: new Date(Date.parse(attempt.at) + outcome.min * 60_000).toISOString(), text: outcome.text };
+        }
         next.history.push({ at: ctx.nowIso, event: "send", detail: `REQUEST-1 n=${attempt.n} ${cls.result}` });
         return { write: next, value: null };
       });
