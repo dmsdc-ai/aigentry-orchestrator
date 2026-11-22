@@ -7,14 +7,13 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, type TestContext } from "node:test";
 import { withIndexLock } from "../../src/session/persistence/index-lock.js";
-import { renderEnvelope } from "../../src/controller-link/envelope.js";
+import { DEVICE_LABEL_RE, LABEL_RE as WIRE_LABEL_RE } from "../../src/controller-link/envelope.js";
 import {
-  ADMIT_MAX_AGE_MS,
   ControllerLinkStore,
   HISTORY_MAX,
   OPEN_RECORDS_MAX,
   RECORDLESS_ANSWERS_MAX,
-  RETENTION_MS,
+  RESERVED_LABEL_RE,
   SENDS_MAX,
   StoreError,
   type LinkRecord,
@@ -25,7 +24,7 @@ import {
 
 const T0 = Date.parse("2026-11-22T00:00:00.000Z");
 const POSIX = process.platform !== "win32";
-const R5_SKIP = POSIX ? false : "POSIX modes are not checked on win32 (THREAT-MODEL R5)";
+const DAY = 86_400_000;
 
 const sha = (b: Uint8Array | string): string => createHash("sha256").update(b).digest("hex");
 const iso = (ms: number): string => new Date(ms).toISOString();
@@ -360,8 +359,11 @@ test("S4 history keeps the newest 64 plus history_dropped; sends keep 32; size a
 
 // --- S5 -----------------------------------------------------------------------------------------
 
-test("S5 retention selects terminal records 30 days old and unnamed raws only; deletes nothing", async (t) => {
+test("S5 (CL3-02, v1) the store deletes nothing: it has no retention, expiry, floor or clean-up, and old terminal records and orphan raws stay", async (t) => {
   const { store, root, clock } = await box(t);
+  for (const name of ["selectRetention", "requestFloorMs", "floorPath"]) {
+    assert.equal(name in store, false, `no ${name}`);
+  }
   const mk = async (state: RecordState, stateAt: number, peer?: string) => {
     const id = randomUUID();
     const raw = envelope(id);
@@ -369,32 +371,23 @@ test("S5 retention selects terminal records 30 days old and unnamed raws only; d
     await create(store, ref, record(peer === undefined ? "sender" : "receiver", id, { state, stateAt, raw, ...(peer ? { peer } : {}) }), raw);
     return { ref, sha: sha(raw) };
   };
-  const old = await mk("closed", T0);
-  const oldInbox = await mk("replied", T0, "linux");
-  const young = await mk("refused", T0 + 1000);
-  const openOld = await mk("stalled", T0 - 100 * 86_400_000);
-  const openInbox = await mk("unverified", T0 - 100 * 86_400_000, "linux");
+  const kept = [await mk("closed", T0), await mk("replied", T0, "linux"), await mk("refused", T0 - 400 * DAY, "linux")];
   const orphan = Buffer.from("orphan raw");
   await fs.writeFile(path.join(root, "raw", `${sha(orphan)}.env`), orphan, { mode: 0o600 });
-  await fs.writeFile(path.join(root, "raw", "not-a-raw.tmp"), "x", { mode: 0o600 });
-
-  clock.now = T0 + RETENTION_MS;
-  const sel = await store.selectRetention();
-  assert.deepEqual(new Set(sel.records.map((r) => r.requestId)), new Set([old.ref.requestId, oldInbox.ref.requestId]));
-  assert.deepEqual(new Set(sel.raws), new Set([old.sha, oldInbox.sha, sha(orphan)]));
-  for (const keep of [young, openOld, openInbox]) {
-    assert.ok(!sel.records.some((r) => r.requestId === keep.ref.requestId));
-    assert.ok(!sel.raws.includes(keep.sha));
+  clock.now = T0 + 1000 * DAY;
+  // Every read and write path, a whole-store mutation included: nothing disappears.
+  assert.equal((await store.list()).length, 3);
+  await store.mutate(kept[0]!.ref, (cur) => ({ write: cur, value: undefined }));
+  for (const k of kept) {
+    assert.ok(await store.read(k.ref), k.ref.requestId);
+    assert.ok(await exists(path.join(root, "raw", `${k.sha}.env`)), k.sha);
   }
-  assert.equal((await store.list()).length, 5, "selection deletes nothing");
-
-  clock.now = T0 + RETENTION_MS - 1;
-  assert.equal((await store.selectRetention()).records.length, 0);
+  assert.ok(await exists(path.join(root, "raw", `${sha(orphan)}.env`)), "an unreferenced raw file stays too");
+  assert.equal(await exists(path.join(root, "retention.json")), false, "no floor file");
 });
 
 test("S5 a missing store selects and lists nothing and creates nothing", async (t) => {
   const { store, root } = await box(t);
-  assert.deepEqual(await store.selectRetention(), { records: [], raws: [] });
   assert.deepEqual(await store.list(), []);
   assert.equal(await store.read(sender(randomUUID())), null);
   assert.equal(await exists(root), false);
@@ -438,7 +431,10 @@ test("S6 an unknown state name is STORE_CORRUPT on read and refused on write", a
 
 // --- S7 -----------------------------------------------------------------------------------------
 
-test("S7 created directories are 0700 and files 0600", { skip: R5_SKIP }, async (t) => {
+// CI-WIN-SKIP: no test is skipped on win32. POSIX registers the mode checks; win32 registers what the store does there
+// (THREAT-MODEL R5: modes are not checked, so a store is created and used and other mode bits are never refused).
+if (POSIX) {
+test("S7 created directories are 0700 and files 0600", async (t) => {
   const { store, root } = await box(t);
   const id = randomUUID();
   const raw = envelope(id);
@@ -451,7 +447,7 @@ test("S7 created directories are 0700 and files 0600", { skip: R5_SKIP }, async 
   }
 });
 
-test("S7 a 0755 store directory or a 0644 record is refused", { skip: R5_SKIP }, async (t) => {
+test("S7 a 0755 store directory or a 0644 record is refused", async (t) => {
   const { store, root } = await box(t);
   const id = randomUUID();
   await create(store, sender(id), record("sender", id));
@@ -470,11 +466,44 @@ test("S7 a 0755 store directory or a 0644 record is refused", { skip: R5_SKIP },
   await fs.chmod(path.join(root, "outbox"), 0o700);
   assert.ok(await store.read(sender(id)));
 });
+} else {
+test("S7 (win32) modes are not checked: the store's directories and files are created and read back", async (t) => {
+  const { store, root } = await box(t);
+  const id = randomUUID();
+  const raw = envelope(id);
+  await create(store, receiver("linux", id), record("receiver", id, { raw }), raw);
+  for (const d of ["", "inbox", "inbox/linux", "raw"]) {
+    assert.ok((await fs.stat(path.join(root, d))).isDirectory(), d || "root");
+  }
+  for (const f of ["store.json", `inbox/linux/${id}.json`, `raw/${sha(raw)}.env`]) {
+    assert.ok((await fs.stat(path.join(root, f))).isFile(), f);
+  }
+  assert.equal((await store.read(receiver("linux", id)))?.request_id, id);
+  assert.deepEqual(await store.readRaw(sha(raw)), raw);
+});
+
+test("S7 (win32) a store directory or a record with other mode bits is accepted: no mode refusal", async (t) => {
+  const { store, root } = await box(t);
+  const id = randomUUID();
+  await create(store, sender(id), record("sender", id));
+  await fs.chmod(path.join(root, "outbox", `${id}.json`), 0o644);
+  await fs.chmod(path.join(root, "outbox"), 0o755);
+  await fs.chmod(root, 0o755);
+  assert.ok(await store.read(sender(id)));
+  assert.equal((await store.list({ role: "sender" })).length, 1);
+  await store.mutate(sender(id), (cur, m) => ({ write: { ...cur!, state: "received" as const, state_at: m.nowIso }, value: undefined }));
+  assert.equal((await store.read(sender(id)))!.state, "received");
+});
+}
 
 // --- review round 1 (CL-03, CL-07, CL-11, CL-15) ------------------------------------------------
 
-test("CL-15 a Windows device name never gets a NEW inbox directory on any platform; an existing one is a live inbox, kept by retention", async (t) => {
-  const { store, root, clock } = await box(t);
+test("CL-15 / CL3-05 a Windows device name never gets a NEW inbox directory on any platform; it is the label rule's own list; an existing one is a live inbox", async (t) => {
+  const { store, root } = await box(t);
+  // CL3-05: the store refuses exactly the names the one label rule refuses at setup.
+  assert.equal(RESERVED_LABEL_RE, DEVICE_LABEL_RE);
+  for (const label of ["con", "prn", "aux", "nul", "com0", "com9", "lpt0", "lpt9"]) assert.equal(WIRE_LABEL_RE.test(label), false, label);
+  for (const label of ["console", "com10", "lpt-1", "nul-box", "auxiliary", "con1", "prnt", "linux"]) assert.equal(WIRE_LABEL_RE.test(label), true, label);
   const id = randomUUID();
   for (const label of ["con", "prn", "aux", "nul", "com0", "com1", "com9", "lpt0", "lpt1", "lpt9"]) {
     await rejectsWith(store.mutate(receiver(label, id), () => assert.fail("callback must not run")), "STORE_UNAVAILABLE");
@@ -488,7 +517,7 @@ test("CL-15 a Windows device name never gets a NEW inbox directory on any platfo
     assert.equal(store.recordPath(receiver(label, id)), path.join(root, "inbox", label, `${id}.json`), label);
   }
   // POSIX only (a directory named `con` cannot be made on native Windows): one made by an older version holds an
-  // open record. It is listed, its raw file is not an orphan for retention, and it is written like any inbox.
+  // open record. It is listed and written like any inbox.
   if (POSIX) {
     const seed = randomUUID();
     await create(store, receiver("linux", seed), record("receiver", seed));
@@ -497,81 +526,20 @@ test("CL-15 a Windows device name never gets a NEW inbox directory on any platfo
     await plant(root, `inbox/con/${id}.json`, record("receiver", id, { peer: "con", state: "accepted", raw }));
     assert.deepEqual((await store.list()).map((r) => r.request_id).sort(), [seed, id].sort());
     assert.deepEqual((await store.list({ peer: "con" })).map((r) => r.request_id), [id]);
-    clock.now = T0 + 2 * RETENTION_MS;
-    const sel = await store.selectRetention();
-    assert.ok(!sel.raws.includes(sha(raw)), "the live record's raw file is not taken for an orphan");
-    assert.deepEqual(sel.records, []);
     await store.mutate(receiver("con", id), (cur, m) => ({ write: { ...cur!, state: "replying" as const, state_at: m.nowIso }, value: undefined }));
     assert.equal((await store.read(receiver("con", id)))!.state, "replying");
   }
 });
 
-test("CL-07 retention runs 30 days from the later of state_at and every message's ingested_at", async (t) => {
-  const { store, clock } = await box(t);
-  const DAY = 86_400_000;
-  const id = randomUUID();
-  const raw = envelope(id);
-  // Terminal at T0 by this clock, its REQUEST-1 stored at T0 + 10 days (the clock went back in between).
-  const rec = record("receiver", id, { state: "refused", stateAt: T0, raw });
-  rec.messages["REQUEST-1"]!.ingested_at = iso(T0 + 10 * DAY);
-  await create(store, receiver("linux", id), rec, raw);
-  clock.now = T0 + RETENTION_MS;
-  assert.deepEqual((await store.selectRetention()).records, [], "30 days after state_at but not after ingested_at");
-  clock.now = T0 + 10 * DAY + RETENTION_MS - 1;
-  assert.deepEqual((await store.selectRetention()).records, []);
-  clock.now = T0 + 10 * DAY + RETENTION_MS;
-  assert.deepEqual((await store.selectRetention()).records.map((r) => r.requestId), [id]);
-});
-
-test("CL-07 an inbox record is selected only once its REQUEST is outside the admission window; the request floor is raised first and never lowered", async (t) => {
-  const { store, root, clock } = await box(t);
-  const DAY = 86_400_000;
-  const requestBytes = (id: string, sentAt: number): Buffer => {
-    const r = renderEnvelope({ kind: "REQUEST", id, seq: 1, ref: null, from: "linux", to: "mac", sent_at: `${iso(sentAt).slice(0, 19)}Z`,
-      sender_task: "1291", receiver_task: null, state: null, outcome: null, final: null, reason: null }, "body");
-    assert.ok(r.ok);
-    return Buffer.from(r.envelope.text, "utf8");
-  };
-  assert.equal(ADMIT_MAX_AGE_MS, 25 * DAY);
-  // Stored while this clock was 6 days behind the sender's: sent_at is 6 days after state_at and ingested_at.
-  const id = randomUUID();
-  const raw = requestBytes(id, T0 + 6 * DAY);
-  await create(store, receiver("linux", id), record("receiver", id, { state: "refused", stateAt: T0, raw }), raw);
-  assert.equal(await store.requestFloorMs(), null);
-  clock.now = T0 + RETENTION_MS; // 30 days after the last change, only 24 days after sent_at: a copy is still admissible
-  let sel = await store.selectRetention();
-  assert.deepEqual(sel.records, [], "a key the stale check would still admit is not deleted");
-  assert.ok(!sel.raws.includes(sha(raw)));
-  assert.equal(await store.requestFloorMs(), null);
-  clock.now = T0 + 6 * DAY + ADMIT_MAX_AGE_MS + 1;
-  sel = await store.selectRetention();
-  assert.deepEqual(sel.records.map((r) => r.requestId), [id]);
-  assert.ok(sel.raws.includes(sha(raw)));
-  assert.equal(await store.requestFloorMs(), T0 + 6 * DAY, "the floor is durable before the caller deletes anything");
-  // The caller deletes it (as the pump does); an older deleted request never lowers the floor.
-  await fs.unlink(store.recordPath(receiver("linux", id)));
-  const older = randomUUID();
-  const olderRaw = requestBytes(older, T0);
-  await create(store, receiver("linux", older), record("receiver", older, { state: "closed", stateAt: T0, raw: olderRaw }), olderRaw);
-  assert.deepEqual((await store.selectRetention()).records.map((r) => r.requestId), [older]);
-  assert.equal(await store.requestFloorMs(), T0 + 6 * DAY);
-  await fs.writeFile(store.floorPath, "{\"v\":1}", { mode: 0o600 });
-  await rejectsWith(store.requestFloorMs(), "STORE_CORRUPT");
-  assert.equal(path.dirname(store.floorPath), root);
-});
-
-test("CL-09 retention keeps a terminal record whose REPLY awaits `handled`; `pickup` is validated", async (t) => {
-  const { store, clock } = await box(t);
+test("CL-09 a terminal record whose REPLY awaits `handled` is listed; `pickup` is validated", async (t) => {
+  const { store } = await box(t);
   const id = randomUUID();
   const raw = envelope(id);
   const reply = Buffer.from(`⟦aigentry-ctl v1⟧ kind=REPLY id=${id} seq=1 test=reply`, "utf8");
   const rec = record("sender", id, { state: "replied", stateAt: T0, raw });
   rec.messages["REPLY-1"] = { sha256: sha(reply), body_sha256: sha(""), raw: `raw/${sha(reply)}.env`, pickup: "awaiting" };
   await store.mutate(sender(id), () => ({ write: rec, raws: [{ sha256: sha(raw), bytes: raw }, { sha256: sha(reply), bytes: reply }], value: undefined }));
-  clock.now = T0 + 2 * RETENTION_MS;
-  let sel = await store.selectRetention();
-  assert.deepEqual(sel.records, [], "the REPLY still awaits the controller");
-  assert.ok(!sel.raws.includes(sha(reply)));
+  assert.deepEqual((await store.list()).map((r) => r.request_id), [id], "the REPLY still awaits the controller");
   const edit = (value: unknown, key = "REPLY-1") => store.mutate(sender(id), (cur) => {
     const next = JSON.parse(JSON.stringify(cur)) as LinkRecord;
     (next.messages[key] as Record<string, unknown>).pickup = value;
@@ -580,8 +548,8 @@ test("CL-09 retention keeps a terminal record whose REPLY awaits `handled`; `pic
   await rejectsWith(edit("seen"), "STORE_CORRUPT");
   await rejectsWith(edit("awaiting", "REQUEST-1"), "STORE_CORRUPT");
   await edit("handled");
-  sel = await store.selectRetention();
-  assert.deepEqual(sel.records.map((r) => r.requestId), [id]);
+  assert.equal((await store.read(sender(id)))!.messages["REPLY-1"]!.pickup, "handled");
+  assert.ok(await exists(store.rawPath(sha(reply))), "kept after handled: v1 deletes nothing");
 });
 
 test("CL-11 record-less probe answers: one per (peer, id, ref) per interval; bounded; no record is created", async (t) => {

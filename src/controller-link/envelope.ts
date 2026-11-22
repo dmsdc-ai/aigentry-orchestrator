@@ -49,7 +49,15 @@ export const FIELD_ORDER = ["kind", "id", "seq", "ref", "from", "to", "sent_at",
   "state", "outcome", "final", "reason", "body_sha256", "body_bytes"] as const;
 
 export const REQUEST_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-export const LABEL_RE = /^[a-z][a-z0-9-]{0,31}$/;
+/** Windows device names (CON, PRN, AUX, NUL, COM0-9, LPT0-9): no directory can carry one on native Windows. */
+const DEVICE_NAMES = "con|prn|aux|nul|com[0-9]|lpt[0-9]";
+export const DEVICE_LABEL_RE = new RegExp(`^(?:${DEVICE_NAMES})$`);
+/**
+ * The ONE label rule (review CL3-05): the peers file (controller-link and dispatch), the envelope's from/to and the
+ * store's new inbox directory all use it, so a label accepted at setup is never refused at receipt. A Windows
+ * device name is refused everywhere, on every platform, because it cannot be an inbox directory on Windows.
+ */
+export const LABEL_RE = new RegExp(`^(?!(?:${DEVICE_NAMES})$)[a-z][a-z0-9-]{0,31}$`);
 export const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 export const HEX64_RE = /^[0-9a-f]{64}$/;
 /** `REQUEST-1` or `REPLY-<1..32>`: the message an ACK or PROBE refers to. */

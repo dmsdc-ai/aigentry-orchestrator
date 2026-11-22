@@ -8,7 +8,7 @@ import { resolve } from "node:path";
 import { test } from "node:test";
 import {
   BODY_MAX_BYTES, CTL_END_MARKER, CTL_LINE2, CTL_VERSION_MARKER, ENVELOPE_MAX_BYTES, FIELD_ORDER, INGEST_MAX_BLOCKS,
-  INGEST_MAX_BYTES, normaliseBody, parseEnvelope, renderEnvelope, scanInput,
+  DEVICE_LABEL_RE, INGEST_MAX_BYTES, LABEL_RE, normaliseBody, parseEnvelope, renderEnvelope, scanInput,
   type BodyResult, type Envelope, type EnvelopeFields, type EnvelopeKind, type EnvelopeResult, type ScannedBlock,
 } from "../../src/controller-link/envelope.js";
 
@@ -400,4 +400,21 @@ test("envelope.ts is pure: imports node:crypto only; no clock, process, file or 
   const imports = [...src.matchAll(/^import .* from "([^"]+)";$/gm)].map((m) => m[1]);
   assert.deepEqual(imports, ["node:crypto"]);
   assert.doesNotMatch(src, /\b(?:Date\.now|process\.|require\(|import\(|fetch\(|setTimeout|setInterval|Math\.random|randomUUID|readFile|writeFile)/);
+});
+
+test("CL3-05 the one label rule: a Windows device name is not a label, in the peers file or on the wire", () => {
+  const devices = ["con", "prn", "aux", "nul", "com0", "com5", "com9", "lpt0", "lpt5", "lpt9"];
+  for (const label of devices) {
+    assert.equal(DEVICE_LABEL_RE.test(label), true, label);
+    assert.equal(LABEL_RE.test(label), false, label);
+    for (const side of ["from", "to"] as const) {
+      const r = renderEnvelope(side === "from" ? { ...base("REQUEST"), from: label } : { ...base("REQUEST"), to: label }, "x");
+      assert.equal(code(r), "ENVELOPE_INVALID", `${side}=${label}`);
+    }
+  }
+  for (const label of ["console", "com10", "lpt", "aux-1", "nul-box", "conn", "mac", "a", `a${"b".repeat(31)}`]) {
+    assert.equal(DEVICE_LABEL_RE.test(label), false, label);
+    assert.equal(LABEL_RE.test(label), true, label);
+  }
+  for (const label of ["Con", "-a", "1a", `a${"b".repeat(32)}`, "a_b", ""]) assert.equal(LABEL_RE.test(label), false, label);
 });

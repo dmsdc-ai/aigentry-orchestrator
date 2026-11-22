@@ -9,8 +9,9 @@
 //   inbox/<peer label>/<id>.json    receiver records
 //   raw/<sha256>.env                exact canonical envelope bytes, write-once, content-addressed
 //   probe-answers.json              record-less probe answers of the last 60 s (SPEC §8.1 throttle)
-//   retention.json                  {"v":1,"request_floor":<ISO>}: the newest `sent_at` of an inbox REQUEST that
-//                                   retention deleted (review CL-07); ingest refuses a REQUEST not after it
+//
+// v1 deletes nothing (Root decision, review CL3-02/CL3-07): no retention, no expiry, no orphan clean-up. A record
+// and its raw files stay until a human removes them (docs/setup/controller-link.md "Store size and removal").
 //
 // Every path component is a validated UUID, label or hex64 before any filesystem call; no other
 // record value becomes a path. Every mutation runs under withIndexLock(store.json): read, check,
@@ -28,6 +29,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { atomicWrite } from "../session/persistence/atomic-write.js";
 import { withIndexLock } from "../session/persistence/index-lock.js";
+import { DEVICE_LABEL_RE } from "./envelope.js";
 
 // ---------------------------------------------------------------------------------------------
 // Constants (SPEC §3.2, §4)
@@ -40,7 +42,6 @@ export const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 export const MESSAGE_KEY_RE = /^(?:REQUEST-1|REPLY-(?:[1-9]|[12][0-9]|3[0-2]))$/;
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 const RECORD_FILE_RE = /^([0-9a-f-]{36})\.json$/;
-const RAW_FILE_RE = /^([0-9a-f]{64})\.env$/;
 const RECORDLESS_KEY_RE = /^[a-z][a-z0-9-]{0,31}\/[0-9a-f-]{36}\/(?:REQUEST-1|REPLY-(?:[1-9]|[12][0-9]|3[0-2]))$/;
 
 export const MAX_RECORD_BYTES = 262_144;
@@ -48,25 +49,23 @@ export const HISTORY_MAX = 64;
 export const SENDS_MAX = 32;
 export const OPEN_RECORDS_MAX = 256;
 export const UNVERIFIED_COPIES_MAX = 4;
-export const RETENTION_MS = 30 * 86_400 * 1000;
 /**
- * The ONE admission bound (review CL-07). ingest admits a REQUEST or REPLY only when its `sent_at` S satisfies
+ * The admission bound (review CL-07). ingest admits a REQUEST or REPLY only when its `sent_at` S satisfies
  * now − ADMIT_MAX_AGE_MS ≤ S ≤ now + ADMIT_MAX_AHEAD_MS (cli.ts STALE_MESSAGE_MS / FUTURE_SKEW_MS are these
- * values) and, for a REQUEST, S is after the store's request floor. Retention deletes an inbox record only when
- * its REQUEST is already outside that window (now − S > ADMIT_MAX_AGE_MS), and raises the floor to that S before
- * anything is deleted. So no clock correction can make a deleted REQUEST key admissible again.
+ * values). The setup guide's removal rule uses the same bound: a human removes an inbox record only once its
+ * REQUEST is outside it, so a copy of a removed request is STALE_MESSAGE.
  */
 export const ADMIT_MAX_AGE_MS = 25 * 86_400 * 1000;
 export const ADMIT_MAX_AHEAD_MS = 86_400 * 1000;
 /** At most this many record-less probe answers are remembered (all younger than the throttle interval). */
 export const RECORDLESS_ANSWERS_MAX = 256;
 /**
- * Windows device names (CON, PRN, AUX, NUL, COM0-9, LPT0-9; case-insensitive there). LABEL_RE accepts
- * them, but no directory can carry such a name on native Windows, so the store refuses to CREATE an inbox
- * directory with such a name on every platform (review CL-15). A directory that already exists (made by an
- * earlier version on POSIX) is an ordinary inbox: it is listed, read, written and protected from retention.
+ * Windows device names (CON, PRN, AUX, NUL, COM0-9, LPT0-9; case-insensitive there): envelope.ts DEVICE_LABEL_RE,
+ * the list the one label rule (envelope.ts LABEL_RE, CL3-05) refuses at setup. So the store never CREATES an inbox
+ * directory with such a name (review CL-15). A directory that already exists (made by an earlier version on POSIX)
+ * is an ordinary inbox: it is listed, read and written.
  */
-export const RESERVED_LABEL_RE = /^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])$/;
+export const RESERVED_LABEL_RE = DEVICE_LABEL_RE;
 /** CL-09: a REPLY stored by ingest awaits the sender controller's `handled` until it is set to "handled". */
 export const PICKUP_STATES = ["awaiting", "handled"] as const;
 /** The result of claimRecordlessAnswer (CL-11): answer now, already answered recently, or the table is full. */
@@ -236,13 +235,6 @@ export interface StatusEntry {
   terminal: boolean;
 }
 
-export interface RetentionSelection {
-  /** Terminal records with now − (the later of state_at and every message's ingested_at) ≥ 30 days. */
-  records: RecordRef[];
-  /** Raw files no record outside `records` names (orphans, or named only by selected records). */
-  raws: string[];
-}
-
 export type StoreErrorCode = "STORE_CORRUPT" | "STORE_UNAVAILABLE" | "LINK_CAPACITY";
 
 export class StoreError extends Error {
@@ -294,16 +286,6 @@ export function awaitingPickup(record: LinkRecord): string[] {
   return Object.keys(record.messages)
     .filter((k) => k.startsWith("REPLY-") && record.messages[k]!.pickup === "awaiting")
     .sort((x, y) => Number(x.slice(6)) - Number(y.slice(6)));
-}
-
-/** `sent_at` of canonical envelope bytes (first line, SPEC §3.1), in ms; null if the bytes do not show one. */
-export function envelopeSentAtMs(bytes: Uint8Array): number | null {
-  const text = Buffer.from(bytes).toString("utf8");
-  const nl = text.indexOf("\n");
-  const m = / sent_at=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z) /.exec(nl < 0 ? text : text.slice(0, nl));
-  if (m === null) return null;
-  const t = Date.parse(m[1]!);
-  return Number.isNaN(t) ? null : t;
 }
 
 export function statusOf(record: LinkRecord): StatusEntry {
@@ -489,15 +471,6 @@ export function rawsNamedBy(record: LinkRecord): string[] {
   return [...out];
 }
 
-/** The later of `state_at` and every message's `ingested_at` (retention's start). */
-function lastChangeMs(record: LinkRecord): number {
-  let t = Date.parse(record.state_at);
-  for (const m of Object.values(record.messages)) {
-    if (typeof m.ingested_at === "string") t = Math.max(t, Date.parse(m.ingested_at));
-  }
-  return t;
-}
-
 /** history ≤ 64 newest (+ history_dropped), every sends list ≤ 32 newest. Operates on a copy. */
 function trimmed(record: LinkRecord): LinkRecord {
   const r = JSON.parse(JSON.stringify(record)) as LinkRecord;
@@ -615,11 +588,6 @@ export class ControllerLinkStore {
     return path.join(this.root, "store.json");
   }
 
-  /** CL-07 request floor file. */
-  get floorPath(): string {
-    return path.join(this.root, "retention.json");
-  }
-
   recordPath(ref: RecordRef): string {
     const r = checkRef(ref);
     return r.role === "sender"
@@ -668,7 +636,7 @@ export class ControllerLinkStore {
       const out: LinkRecord[] = [];
       for (const ref of refs) {
         const rec = await this.readRecordFile(this.recordPath(ref), ref);
-        if (rec === null) continue; // removed by retention between readdir and read
+        if (rec === null) continue; // removed by a human between readdir and read
         if (peerFilter !== undefined && rec.peer !== peerFilter) continue;
         if (filter.open === true && isTerminal(rec.state)) continue;
         out.push(rec);
@@ -680,75 +648,6 @@ export class ControllerLinkStore {
   /** status / boot lines: statusOf() of every record matching `filter`. */
   async status(filter: { role?: Role; peer?: string; open?: boolean } = {}): Promise<StatusEntry[]> {
     return (await this.list(filter)).map(statusOf);
-  }
-
-  /**
-   * Retention selector (SPEC §4; selection only, deletion belongs to the pump). Call it inside
-   * withLock() and delete the selected records BEFORE the selected raw files.
-   *
-   * The 30 days run from the later of `state_at` and every message's `ingested_at`, so a key is kept
-   * at least 30 days after its last arrival by this clock even when the clock went back in between, or
-   * a message was stored on an already terminal record.
-   *
-   * CL-07 (one bound, ADMIT_MAX_AGE_MS): an inbox record is selected only when its REQUEST-1 is already
-   * outside the admission window (now − sent_at > ADMIT_MAX_AGE_MS; sent_at read from its raw bytes, or, if
-   * they do not show it, the latest time ingest could have admitted, last change + ADMIT_MAX_AHEAD_MS). Before
-   * returning, the store's request floor is raised to the newest such sent_at (retention.json, atomic), so it
-   * is durable BEFORE the caller deletes anything; ingest refuses a REQUEST whose sent_at is not after it.
-   * An outbox record has no admissible key to protect: a REPLY or ACK for a deleted outbox record is
-   * UNKNOWN_REQUEST and is never applied. CL-09: a record with a REPLY awaiting `handled` is kept.
-   */
-  async selectRetention(): Promise<RetentionSelection> {
-    const now = this.clock.nowMs();
-    return this.guard(async () => {
-      if (!(await this.readable())) return { records: [], raws: [] };
-      const named = new Set<string>();
-      const records: RecordRef[] = [];
-      let floor: number | null = null;
-      for (const ref of await this.scanRefs(undefined, undefined)) {
-        const rec = await this.readRecordFile(this.recordPath(ref), ref);
-        if (rec === null) continue;
-        let selected = isTerminal(rec.state) && now - lastChangeMs(rec) >= RETENTION_MS && awaitingPickup(rec).length === 0;
-        let sentAt: number | null = null;
-        if (selected && rec.role === "receiver") {
-          const req = rec.messages["REQUEST-1"]!;
-          const raw = await readPrivateFile(this.rawPath(req.sha256), MAX_RECORD_BYTES);
-          sentAt = (raw === null ? null : envelopeSentAtMs(raw)) ?? lastChangeMs(rec) + ADMIT_MAX_AHEAD_MS;
-          selected = now - sentAt > ADMIT_MAX_AGE_MS;
-        }
-        if (selected) {
-          records.push(ref);
-          if (sentAt !== null) floor = Math.max(floor ?? sentAt, sentAt);
-        } else {
-          for (const sha of rawsNamedBy(rec)) named.add(sha);
-        }
-      }
-      const raws: string[] = [];
-      if (await checkDirectory(path.join(this.root, "raw"))) {
-        for (const name of await readDirNames(path.join(this.root, "raw"))) {
-          const m = RAW_FILE_RE.exec(name);
-          if (m !== null && !named.has(m[1]!)) raws.push(m[1]!);
-        }
-      }
-      const current = await this.readRequestFloor();
-      if (floor !== null && (current === null || floor > current)) {
-        await atomicWrite(this.floorPath, Buffer.from(JSON.stringify({ v: 1, request_floor: new Date(floor).toISOString() }), "utf8"),
-          { sessionId: randomUUID() });
-      }
-      return { records, raws };
-    });
-  }
-
-  /**
-   * CL-07: the newest `sent_at` (ms) of an inbox REQUEST that retention selected for deletion, or null when none
-   * was. ingest refuses a REQUEST whose `sent_at` is not after it (STALE_MESSAGE). No lock: the file is replaced
-   * by an atomic rename. A missing store is null.
-   */
-  async requestFloorMs(): Promise<number | null> {
-    return this.guard(async () => {
-      if (!(await this.readable())) return null;
-      return this.readRequestFloor();
-    });
   }
 
   // --- mutations ------------------------------------------------------------------------------
@@ -908,15 +807,6 @@ export class ControllerLinkStore {
     return true;
   }
 
-  /** retention.json's request floor in ms, or null when there is none. */
-  private async readRequestFloor(): Promise<number | null> {
-    const bytes = await readPrivateFile(this.floorPath, 1024);
-    if (bytes === null) return null;
-    const v = parseJson(bytes);
-    if (!isObj(v) || v.v !== 1 || !isIso(v.request_floor)) throw new StoreError("STORE_CORRUPT", "retention.json");
-    return Date.parse(String(v.request_floor));
-  }
-
   private checkMarker(bytes: Buffer): void {
     const m = parseJson(bytes);
     if (!isObj(m) || Object.keys(m).length !== 2 || m.v !== STORE_MARKER.v || m.kind !== STORE_MARKER.kind) {
@@ -957,8 +847,8 @@ export class ControllerLinkStore {
       }
     }
     if (role !== "sender" && (await checkDirectory(path.join(this.root, "inbox")))) {
-      // CL-15: every directory whose name is a label is scanned, a Windows device name included, so a record a
-      // previous version stored there is listed and its raw files are never taken for orphans by retention.
+      // CL-15: every directory whose name is a store label is scanned, a Windows device name included, so a record
+      // a previous version stored there is listed.
       const labels = peer !== undefined ? [peer] : (await readDirNames(path.join(this.root, "inbox"))).filter((l) => LABEL_RE.test(l));
       for (const label of labels) {
         if (!(await checkDirectory(path.join(this.root, "inbox", label)))) continue;

@@ -1,6 +1,6 @@
 // Task 1291 + 1294 (unit U11) — controller-link two-store simulation: TEST-PLAN §3 L1–L7, plus the
 // scenarios of the U11 dispatch list (an uncertain send, conflicting copies, a crash between record
-// and send on either side, a restart of either controller, retention). See TESTS.md for the mapping.
+// and send on either side, a restart of either controller, and v1's no-deletion rule). See TESTS.md for the mapping.
 //
 // Two controllers, `mac` and `linux`, each with its own store root, peers file, task queue, fake
 // audit log and injected clock, connected by the fake telepty of ./fake-telepty.ts that the test
@@ -12,8 +12,9 @@
 //     injected ports (wall clock, pid liveness, notice sender, process runner, audit reader);
 //   - the boot line is U10 `readControllerLink`; the time of the next event is U8 `decide`.
 // The test only plays the two controller models: it pipes each prompt to `ingest`, registers its
-// own task and binds on `RESULT=NEW` REQUESTs, replies, follows the pump's local notices when told
-// to, and crashes or restarts when told to. No real telepty, daemon, network or session is touched.
+// own task and binds on `RESULT=NEW` (and `RESULT=AWAITING`) REQUESTs, replies, follows the pump's local
+// notices when told to — as the instruction says: `status --request <id>`, then only its fixed `pickup`
+// lines (review CL3-06 / CL3-10) — and crashes or restarts when told to. No real telepty, daemon, network or session is touched.
 // Every scenario asserts the exact number of envelopes each side handed to telepty and that no
 // REQUEST was applied twice. Review CL-09: the sender model marks every REPLY it is shown
 // (`RESULT=NEW` or `RESULT=AWAITING`) `handled`, as the controller instruction says; that sends nothing.
@@ -55,7 +56,7 @@ interface Policy {
   autoBind: boolean;
   /** The session never reads its prompts (TEST-PLAN L6). */
   ignorePrompts: boolean;
-  /** Act on the pump's UNBOUND (bind) and NO_FINAL (reply) notices. */
+  /** Follow the pump's notices: status, then its fixed pickup lines; NO_FINAL (reply). */
   followNotices: boolean;
   /** Crash right after the next `RESULT=NEW` REQUEST, before acting on it (TEST-PLAN L3). */
   crashAfterNextNewRequest: boolean;
@@ -95,6 +96,8 @@ interface Side {
   incarnation: number;
   policy: Policy;
   ingests: IngestLine[];
+  /** RESULT lines of `pickup` runs (CL3-01), handled like `ingest` output. */
+  pickups: IngestLine[];
   ingestExits: number[];
   registered: Array<{ task: string; requestId: string }>;
   lost: string[];
@@ -130,7 +133,7 @@ function makeSide(sim: Sim, label: string, host: string, peerLabel: string, peer
     live: new Set<number>(), nextPid: pidBase, incarnation: 1,
     policy: { autoBind: true, ignorePrompts: false, followNotices: false, crashAfterNextNewRequest: false,
       restartBeforeNextTurn: false, faultNextIngest: null },
-    ingests: [], ingestExits: [], registered: [], lost: [], pumpLines: [], replies: 0,
+    ingests: [], pickups: [], ingestExits: [], registered: [], lost: [], pumpLines: [], replies: 0,
   };
 }
 
@@ -258,12 +261,62 @@ async function replyTo(sim: Sim, side: Side, requestId: string,
   return r.code;
 }
 
+/** The only lines the controller takes from `status` (CL3-06): one of three fixed forms, validated tokens only. */
+const PICKUP_LINE = /^NEXT bin\/controller-link\.sh (pickup --request ([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}) (?:--ref (?:REQUEST-1|REPLY-(?:[1-9]|[12][0-9]|3[0-2]))|--copy [0-9a-f]{64}))$/;
+
+/**
+ * The controller model acts on the RESULT lines of one `ingest` or `pickup` run, as the instruction says; `into` keeps
+ * them. Returns true when the session crashed (crashAfterNextNewRequest).
+ */
+async function actOn(sim: Sim, side: Side, out: string[], into: IngestLine[]): Promise<boolean> {
+  let crashed = false;
+  for (const line of out) {
+    const m = /^RESULT=(\S+) kind=(\S+) id=(\S+) seq=(\S+) peer=(\S+) state=(\S+)/.exec(line);
+    if (m === null) continue;
+    into.push({ result: m[1]!, kind: m[2]!, id: m[3]!, seq: m[4]!, state: m[6]!, at: sim.now, incarnation: side.incarnation });
+    if ((m[1] === "NEW" || m[1] === "AWAITING") && m[2] === "REPLY") {
+      // CL-09: the sender records the REPLY on its own task, then marks it handled (it is not shown again).
+      const handled = await cli(sim, side, ["handled", "--request", m[3]!, "--ref", `REPLY-${m[4]!}`]);
+      assert.equal(handled.code, 0, `${side.label} handled: ${handled.err.join("\n")}`);
+    }
+    if (m[1] === "AWAITING" && m[2] === "REQUEST" && side.policy.autoBind) {
+      // As RESULT=NEW, after checking for an own task that already names the request (then no new registration).
+      const own = side.registered.find((r) => r.requestId === m[3]);
+      if (own === undefined) await bindOwnTask(sim, side, m[3]!);
+      else assert.equal((await cli(sim, side, ["bind", "--request", m[3]!, "--task", own.task])).code, 0);
+    }
+    if (m[1] !== "NEW" || m[2] !== "REQUEST") continue;
+    if (side.policy.crashAfterNextNewRequest) {
+      side.policy.crashAfterNextNewRequest = false;
+      crashed = true;
+    } else if (side.policy.autoBind) {
+      await bindOwnTask(sim, side, m[3]!);
+    }
+  }
+  return crashed;
+}
+
+/**
+ * A local notice, handled as the instruction says (CL-10 / CL3-06): the request id only; `status --request <id>`;
+ * then only the fixed `pickup` lines it prints for that id, each run and handled like `ingest` output; NO_FINAL: reply.
+ */
 async function onNotice(sim: Sim, side: Side, text: string): Promise<void> {
   const m = /^ (\S+) request_id=(\S+) /.exec(text.slice(NOTICE_MARKER.length));
   assert.ok(m, `unparseable local notice: ${text}`);
   if (!side.policy.followNotices) return;
-  if (m[1] === "UNBOUND") await bindOwnTask(sim, side, m[2]!);
-  else if (m[1] === "NO_FINAL") assert.equal(await replyTo(sim, side, m[2]!), 0);
+  const id = m[2]!;
+  assert.match(id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  const st = await cli(sim, side, ["status", "--request", id]);
+  assert.equal(st.code, 0, `${side.label} status: ${st.err.join("\n")}`);
+  for (const line of st.out.filter((l) => l.startsWith("NEXT "))) {
+    const p = PICKUP_LINE.exec(line);
+    assert.ok(p, `${side.label} status printed a NEXT line outside the fixed forms: ${line}`);
+    assert.equal(p[2], id);
+    const r = await cli(sim, side, p[1]!.split(" "));
+    assert.ok(r.code === 0 || r.code === 5, `${side.label} ${p[1]}: ${r.code} ${r.err.join("\n")}`);
+    assert.equal(await actOn(sim, side, r.out, side.pickups), false);
+  }
+  if (m[1] === "NO_FINAL") assert.equal(await replyTo(sim, side, id), 0);
 }
 
 /** The controller model reads every waiting prompt: notices are followed, everything else goes to `ingest`. */
@@ -289,25 +342,7 @@ async function turn(sim: Sim, side: Side): Promise<boolean> {
       return true;
     }
     side.ingestExits.push(r.code);
-    let crashed = false;
-    for (const line of r.out) {
-      const m = /^RESULT=(\S+) kind=(\S+) id=(\S+) seq=(\S+) peer=(\S+) state=(\S+)/.exec(line);
-      if (m === null) continue;
-      side.ingests.push({ result: m[1]!, kind: m[2]!, id: m[3]!, seq: m[4]!, state: m[6]!, at: sim.now, incarnation: side.incarnation });
-      if ((m[1] === "NEW" || m[1] === "AWAITING") && m[2] === "REPLY") {
-        // CL-09: the sender records the REPLY on its own task, then marks it handled (it is not shown again).
-        const handled = await cli(sim, side, ["handled", "--request", m[3]!, "--ref", `REPLY-${m[4]!}`]);
-        assert.equal(handled.code, 0, `${side.label} handled: ${handled.err.join("\n")}`);
-      }
-      if (m[1] !== "NEW" || m[2] !== "REQUEST") continue;
-      if (side.policy.crashAfterNextNewRequest) {
-        side.policy.crashAfterNextNewRequest = false;
-        crashed = true;
-      } else if (side.policy.autoBind) {
-        await bindOwnTask(sim, side, m[3]!);
-      }
-    }
-    if (crashed) {
+    if (await actOn(sim, side, r.out, side.ingests)) {
       restart(side);
       return true;
     }
@@ -455,7 +490,7 @@ function assertNoRequestAppliedTwice(sim: Sim): void {
   assert.deepEqual(sim.fake.violations.slice(), [], "the fake telepty saw only canonical C7 sends"); // a copy: no never[] narrowing
   for (const side of [sim.mac, sim.linux]) {
     const applied = new Map<string, number>();
-    for (const i of side.ingests) if (i.result === "NEW" && i.kind === "REQUEST") applied.set(i.id, (applied.get(i.id) ?? 0) + 1);
+    for (const i of [...side.ingests, ...side.pickups]) if (i.result === "NEW" && i.kind === "REQUEST") applied.set(i.id, (applied.get(i.id) ?? 0) + 1);
     for (const [id, n] of applied) assert.equal(n, 1, `${side.label} applied REQUEST ${id} ${n} times`);
     const regs = new Map<string, number>();
     for (const r of side.registered) regs.set(r.requestId, (regs.get(r.requestId) ?? 0) + 1);
@@ -653,6 +688,8 @@ test("L3 (incident 2) receiver crashes after ingest, before bind: the boot line 
   // CL-10 (coder B round-2 notice text): the notice names only the fixed status command; the record names bind.
   assert.ok(notice.text.endsWith(`\nnext: bin/controller-link.sh status --request ${d.id}`), notice.text);
   assert.deepEqual(sim.linux.registered.map((r) => r.requestId), [d.id], "bound after the notice, with no human input");
+  // CL3-10: the model ran status, then its fixed `pickup --ref REQUEST-1` line, which showed the request again.
+  assert.deepEqual(sim.linux.pickups.map((p) => `${p.result}:${p.kind}:${p.id}`), [`AWAITING:REQUEST:${d.id}`]);
   assert.equal((await record(sim.mac, d.id, "sender")).state, "accepted");
 
   assert.equal(await replyTo(sim, sim.linux, d.id), 0);
@@ -973,7 +1010,7 @@ test("L6 a restart of either controller resumes from the records with no human i
 });
 
 // =============================================================================================
-// L7 — TEST-PLAN §3 L7 busy receiver (incident 4), and retention
+// L7 — TEST-PLAN §3 L7 busy receiver (incident 4), and v1's no-deletion rule (CL3-02)
 
 test("L7 (incident 4) busy receiver: `QUEUED, NOT consumed` → no probe for 30 min, no re-send", async (t) => {
   const sim = makeSim(t);
@@ -1003,7 +1040,7 @@ test("L7 (incident 4) busy receiver: `QUEUED, NOT consumed` → no probe for 30 
   assertNoRequestAppliedTwice(sim);
 });
 
-test("L7 retention: terminal records and their raw files go 30 days after they became terminal; open records stay", async (t) => {
+test("L7 (CL3-02, v1) nothing is deleted: terminal and open records and their raw files stay through 31 days of pump passes", async (t) => {
   const sim = makeSim(t);
   const x = await dispatch(sim, sim.mac, "Please run the linux leg of task 1291 (finished).");
   const z = await dispatch(sim, sim.mac, "Please run the linux leg of task 1291 (still open).");
@@ -1023,29 +1060,88 @@ test("L7 retention: terminal records and their raw files go 30 days after they b
   assert.equal(zIn.state, "accepted");
   const raws = (s: Side): string[] => listDir(path.join(s.storeRoot, "raw"));
   const rawOf = (sha: string): string => `${sha}.env`;
-  assert.deepEqual(raws(sim.mac), [rawOf(xOut.messages["REQUEST-1"]!.sha256), rawOf(xOut.messages["REPLY-1"]!.sha256), rawOf(zOut.messages["REQUEST-1"]!.sha256)].sort());
-  assert.deepEqual(raws(sim.linux), [rawOf(xIn.messages["REQUEST-1"]!.sha256), rawOf(xIn.messages["REPLY-1"]!.sha256), rawOf(zIn.messages["REQUEST-1"]!.sha256)].sort());
+  const macRaws = [rawOf(xOut.messages["REQUEST-1"]!.sha256), rawOf(xOut.messages["REPLY-1"]!.sha256), rawOf(zOut.messages["REQUEST-1"]!.sha256)].sort();
+  const linuxRaws = [rawOf(xIn.messages["REQUEST-1"]!.sha256), rawOf(xIn.messages["REPLY-1"]!.sha256), rawOf(zIn.messages["REQUEST-1"]!.sha256)].sort();
+  assert.deepEqual(raws(sim.mac), macRaws);
+  assert.deepEqual(raws(sim.linux), linuxRaws);
   const sentBefore = sim.fake.sent.length;
 
   await runUntil(sim, t1 + 30 * DAY - MIN);
-  assert.deepEqual(listDir(path.join(sim.mac.storeRoot, "outbox")), [`${x.id}.json`, `${z.id}.json`].sort(), "nothing deleted before 30 days");
-  assert.deepEqual(listDir(path.join(sim.linux.storeRoot, "inbox", "mac")), [`${x.id}.json`, `${z.id}.json`].sort());
-  assert.equal(raws(sim.mac).length, 3);
-  assert.equal(raws(sim.linux).length, 3);
   assert.equal(sim.linux.ep.notices.length, 29, "the open bound request is reminded once a day (no final REPLY)");
-
-  await runUntil(sim, t1 + 30 * DAY);
-  assert.deepEqual(listDir(path.join(sim.mac.storeRoot, "outbox")), [`${z.id}.json`]);
-  assert.deepEqual(listDir(path.join(sim.linux.storeRoot, "inbox", "mac")), [`${z.id}.json`]);
-  assert.deepEqual(raws(sim.mac), [rawOf(zOut.messages["REQUEST-1"]!.sha256)]);
-  assert.deepEqual(raws(sim.linux), [rawOf(zIn.messages["REQUEST-1"]!.sha256)]);
+  await runUntil(sim, t1 + 31 * DAY);
+  assert.deepEqual(listDir(path.join(sim.mac.storeRoot, "outbox")), [`${x.id}.json`, `${z.id}.json`].sort(), "nothing deleted");
+  assert.deepEqual(listDir(path.join(sim.linux.storeRoot, "inbox", "mac")), [`${x.id}.json`, `${z.id}.json`].sort());
+  assert.deepEqual(raws(sim.mac), macRaws);
+  assert.deepEqual(raws(sim.linux), linuxRaws);
   for (const side of [sim.mac, sim.linux]) {
-    assert.deepEqual(side.pumpLines.filter((l) => l.includes("PUMP_RETENTION")), [`${iso(t1 + 30 * DAY)} PUMP_RETENTION records=1 raws=2`]);
+    assert.deepEqual(side.pumpLines.filter((l) => l.includes("PUMP_RETENTION")), [], `${side.label}: no retention`);
+    assert.equal(fs.existsSync(path.join(side.storeRoot, "retention.json")), false);
   }
+  assert.equal((await record(sim.mac, x.id, "sender")).state, "replied", "the terminal record is kept");
+  assert.equal((await record(sim.linux, x.id, "receiver")).state, "replied");
   assert.equal((await record(sim.mac, z.id, "sender")).state, "accepted", "the open record is kept");
   assert.equal((await record(sim.linux, z.id, "receiver")).state, "accepted");
-  assert.equal(sim.fake.sent.length, sentBefore, "30 days of pump passes sent no envelope");
+  assert.equal(sim.fake.sent.length, sentBefore, "31 days of pump passes sent no envelope");
   assertSent(sim, x.id, { REQUEST: 1, ACK: 1 }, { ACK: 2, REPLY: 1 });
   assertSent(sim, z.id, { REQUEST: 1 }, { ACK: 2 });
+  assertNoRequestAppliedTwice(sim);
+});
+
+// =============================================================================================
+// L8 — review CL3-01 / CL3-06 / CL3-10: a lost transcript, picked up from status long after
+
+test("L8 lost transcripts on both sides: 26 and 30 days later each controller picks up from status with the fixed command; nothing is applied twice", async (t) => {
+  const sim = makeSim(t);
+  sim.linux.policy.crashAfterNextNewRequest = true; // the receiver's RESULT=NEW output is lost with its session
+  const d = await dispatch(sim, sim.mac, "Please run the linux leg of task 1291.");
+  assert.equal(d.status, 0, d.stderr);
+  await settle(sim);
+  assert.deepEqual(ingested(sim.linux, d.id, "REQUEST"), ["NEW:1"]);
+  assert.equal(sim.linux.registered.length, 0, "nothing was bound before the crash");
+  assert.equal((await record(sim.mac, d.id, "sender")).state, "received");
+
+  // The receiver machine is away for 26 days (no pump pass meanwhile): past the 25-day admission window.
+  sim.now = d.at + 26 * DAY;
+  sim.linux.policy.followNotices = true;
+  await settle(sim);
+  assert.equal(sim.linux.ep.notices.length, 1);
+  assert.ok(sim.linux.ep.notices[0]!.text.startsWith(`${NOTICE_MARKER} UNBOUND request_id=${d.id} `), sim.linux.ep.notices[0]!.text);
+  assert.deepEqual(sim.linux.pickups.map((p) => `${p.result}:${p.kind}:${p.id}`), [`AWAITING:REQUEST:${d.id}`], "picked up from status");
+  assert.deepEqual(sim.linux.registered.map((r) => r.requestId), [d.id]);
+  assert.equal((await record(sim.linux, d.id, "receiver")).state, "accepted");
+  assert.equal((await record(sim.mac, d.id, "sender")).state, "accepted");
+  // The same bytes through ingest are past the window: STALE_MESSAGE. pickup after bind: DUPLICATE. Nothing sent.
+  const sentNow = sim.fake.sent.length;
+  const reqSha = (await record(sim.linux, d.id, "receiver")).messages["REQUEST-1"]!.sha256;
+  const again = await cli(sim, sim.linux, ["ingest"], { stdin: fs.readFileSync(path.join(sim.linux.storeRoot, "raw", `${reqSha}.env`)) });
+  assert.equal(again.code, 4);
+  assert.ok(again.out[0]!.startsWith(`RESULT=STALE_MESSAGE kind=REQUEST id=${d.id} `), again.out.join("\n"));
+  const twice = await cli(sim, sim.linux, ["pickup", "--request", d.id, "--ref", "REQUEST-1"]);
+  assert.equal(twice.code, 0);
+  assert.ok(twice.out[0]!.startsWith(`RESULT=DUPLICATE kind=REQUEST id=${d.id} `), twice.out.join("\n"));
+  assert.equal(sim.fake.sent.length, sentNow);
+
+  // The REPLY: the sender's ingest dies after its commit (no output, no ACK); its session ignores notices for now.
+  sim.mac.policy.faultNextIngest = "after_commit";
+  assert.equal(await replyTo(sim, sim.linux, d.id), 0);
+  await settle(sim);
+  assert.equal(sim.mac.incarnation, 2, "the sender's session restarted");
+  let out = await record(sim.mac, d.id, "sender");
+  assert.deepEqual([out.state, out.messages["REPLY-1"]!.pickup], ["replied", "awaiting"]);
+  await runUntil(sim, sim.now + 10 * MIN); // the receiver's probe at +5 min is answered from the sender's record
+  assert.equal((await record(sim.linux, d.id, "receiver")).state, "replied");
+  assert.equal((await record(sim.mac, d.id, "sender")).messages["REPLY-1"]!.pickup, "awaiting");
+
+  // The sender machine is away for 30 days; then its controller follows the REPLY_AWAITING notice.
+  sim.now += 30 * DAY;
+  sim.mac.policy.followNotices = true;
+  await settle(sim);
+  assert.ok(sim.mac.ep.notices.some((n) => n.text.startsWith(`${NOTICE_MARKER} REPLY_AWAITING request_id=${d.id} `)));
+  assert.deepEqual(sim.mac.pickups.map((p) => `${p.result}:${p.kind}:${p.id}:${p.seq}`), [`AWAITING:REPLY:${d.id}:1`], "picked up from status");
+  out = await record(sim.mac, d.id, "sender");
+  assert.equal(out.messages["REPLY-1"]!.pickup, "handled");
+  assert.equal(out.history.filter((h) => h.event === "reply_in").length, 1, "the REPLY was applied once");
+  await assertCorrelated(sim.mac, sim.linux, d.id, "linux-r1");
+  assertSent(sim, d.id, { REQUEST: 1, ACK: 1 }, { ACK: 2, REPLY: 1, PROBE: 1 });
   assertNoRequestAppliedTwice(sim);
 });

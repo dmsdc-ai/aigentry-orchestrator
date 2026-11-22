@@ -1,13 +1,13 @@
 // Task 1294 — controller-link pump decision (U8, pure src/controller-link/decide.ts): TEST-PLAN §2.8
 // P1 (exact schedules), P2 (property: no re-send without an allowed trigger, always the same sha),
 // P3 (queued wait), P4 (stall + notice schedule), P5 (notice offsets), P6 (unconfigured peer), plus the
-// §6.2 pending recovery rule and §4 retention selection. Records are plain objects; nothing touches
+// §6.2 pending recovery rule; v1 expires nothing (no retention). Records are plain objects; nothing touches
 // the filesystem, a clock or a process: the clock and the owner facts are arguments.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   ANSWER_RESENDS_MAX, NO_ACK_STALL_MS, PENDING_MAX_AGE_MS, QUEUED_WAIT_MS, REFUSAL_STALL_MS,
-  decide, nextPoint, retentionStartMs, type DecideFacts, type NoticeKind, type Step,
+  decide, nextPoint, noticeSlot, type DecideFacts, type NoticeKind, type Step,
 } from "../../src/controller-link/decide.js";
 import { RECEIVER_STATES, SENDER_STATES } from "../../src/controller-link/store.js";
 import type { LinkRecord, RecordState, SendAttempt } from "../../src/controller-link/store.js";
@@ -64,10 +64,11 @@ function addAck(rec: LinkRecord, key: string, state: string, atMs: number): void
   rec.history.push({ at: iso(atMs), event: "ack_in", detail: `${key} seq=${seq} state=${state}` });
 }
 
+/** As pump.ts countNotice: the kind's own slot (`notices.series` repeating, `notices.once` one-shot; CL3-03). */
 function countNotice(rec: LinkRecord, kind: NoticeKind, anchor: string, atMs: number): void {
-  const s = rec.notices.series as { kind?: string; anchor?: string; n?: number } | null | undefined;
+  const s = rec.notices[noticeSlot(kind)] as { kind?: string; anchor?: string; n?: number } | null | undefined;
   const n = s !== undefined && s !== null && s.kind === kind && s.anchor === anchor ? (s.n ?? 0) + 1 : 1;
-  rec.notices.series = { kind, anchor, n, last_at: iso(atMs) };
+  rec.notices[noticeSlot(kind)] = { kind, anchor, n, last_at: iso(atMs) };
   rec.notices.n += 1;
   rec.notices.last_at = iso(atMs);
 }
@@ -447,7 +448,7 @@ test("P6 peer no longer configured: no send, no state change, one notice", () =>
   assert.ok(steps.every((k) => k === "remind" || k === "none"), "no probe, re-send, recovery or stall");
 });
 
-// ── §6.2 pending recovery, §4 retention, §9.3 verify ──────────────────────────────────────
+// ── §6.2 pending recovery, §9.3 verify ──────────────────────────────────────
 test("K-rule: a pending attempt is recovered when its same-host owner is gone or it is 10 min old; never re-sent at once", () => {
   const rec = sender([attempt(1, T0, "pending", { owner: DEAD })], "prepared");
   assert.equal(decide(rec, facts(T0 + MIN)).kind, "none", "owner may be alive: wait");
@@ -458,14 +459,6 @@ test("K-rule: a pending attempt is recovered when its same-host owner is gone or
   latest(rec, "REQUEST-1").result = "unknown";
   rec.state = "send_unknown";
   assert.equal(decide(rec, facts(T0 + PENDING_MAX_AGE_MS)).kind, "probe", "the probe path (+5 min already passed)");
-});
-
-test("§4 retention: a terminal record 30 days after state_at is selected; non-terminal never", () => {
-  const done = sender([attempt(1, T0, "handed_over")], "replied");
-  assert.notEqual(decide(done, facts(T0 + 30 * DAY - 1)).kind, "expire");
-  assert.equal(decide(done, facts(T0 + 30 * DAY)).kind, "expire");
-  const open = sender([attempt(1, T0, "handed_over")], "accepted");
-  assert.notEqual(decide(open, facts(T0 + 90 * DAY)).kind, "expire");
 });
 
 test("§9.3 verify: an unverified inbox request is re-checked each pass for 48 h, then stalled", () => {
@@ -507,7 +500,6 @@ test("CL-12 a CONFLICT on a terminal record is reminded once, then daily, until 
   const done = sender([attempt(1, T0 - HOUR, "handed_over")], "replied");
   done.history.push({ at: iso(T0), event: "conflict", detail: `REPLY-1 sha256=${OTHER_SHA}` });
   assert.deepEqual(noticeTimes(done, T0, T0 + 2 * DAY, 10 * MIN), [0, 1440, 2880]);
-  assert.equal(decide(done, facts(T0 + 30 * DAY)).kind, "expire", "until retention (30 days after state_at)");
   const refused = sender([attempt(1, T0, "handed_over")], "refused");
   refused.history.push({ at: iso(T0 + HOUR), event: "conflict", detail: `REQUEST-1 sha256=${OTHER_SHA}` });
   const kinds: string[] = [];
@@ -518,7 +510,7 @@ test("CL-12 a CONFLICT on a terminal record is reminded once, then daily, until 
       countNotice(refused, s.notice, s.anchor, t);
     }
   }
-  assert.deepEqual(kinds, ["conflict", "conflict"], "terminal: CONFLICT before `refused` (NOTICE_PRIORITY)");
+  assert.deepEqual(kinds, ["conflict", "refused", "conflict"], "terminal: CONFLICT first; the one-shot `refused` is posted too and does not reset it (CL3-03)");
 });
 
 test("CL-05 a stored copy the pump found corroborated is presented by a notice (then every 2 h), never re-checked or applied by decide()", () => {
@@ -574,9 +566,10 @@ test("CL-05 round 2: a request the pump found corroborated stays presented after
   assert.deepEqual(noticeTimes(rec, T0 + 48 * HOUR, T0 + 54 * HOUR, MIN), [1, 121, 241], "CORROBORATED keeps its 2 h cadence on the stalled record");
   assert.equal((rec.notices.series as { kind?: string }).kind, "corroborated");
   const inactive = JSON.parse(JSON.stringify(rec)) as LinkRecord;
-  assert.deepEqual(noticeTimes(inactive, T0 + 55 * HOUR, T0 + 80 * HOUR, 10 * MIN, false), [0, 1020],
-    "with the peer unconfigured ingest cannot pick it up: the stall is noticed instead (then daily)");
-  assert.equal((inactive.notices.series as { kind?: string }).kind, "stalled");
+  assert.deepEqual(noticeTimes(inactive, T0 + 55 * HOUR, T0 + 80 * HOUR, 10 * MIN, false),
+    [0, 70, 190, 310, 430, 550, 670, 790, 910, 1030, 1150, 1270, 1390],
+    "pickup is local (CL3-01 / CL3-03): with the peer unconfigured CORROBORATED keeps its 2 h cadence; no STALLED series replaces it");
+  assert.equal((inactive.notices.series as { kind?: string }).kind, "corroborated");
   // The controller acted: its own ingest promoted the request (stalled is a placeholder state, cli.ts:651).
   const picked = JSON.parse(JSON.stringify(rec)) as LinkRecord;
   picked.state = "received";
@@ -634,17 +627,14 @@ test("CL-05 round 2: a REPLY copy first stored on a terminal or stalled sender r
   assert.deepEqual(decide(stalled, facts(T0 + MIN)), { kind: "verify", shas: [OTHER_SHA] });
 });
 
-test("CL-12 round 2: a terminal record expires with the store's retention selector (later of state_at and ingested_at), so a late CONFLICT is noticed", () => {
+test("CL-12 round 2 / CL3-02: a terminal record is never expired, so a CONFLICT long after state_at is noticed", () => {
   const done = sender([attempt(1, T0 - 40 * DAY, "handed_over")], "replied");
   done.state_at = iso(T0 - 29 * DAY);
   done.messages["REPLY-2"] = { sha256: OTHER_SHA, body_sha256: "e".repeat(64), raw: `raw/${OTHER_SHA}.env`, outcome: "done",
     final: "no", ingested_at: iso(T0 - HOUR) };
   done.history.push({ at: iso(T0 + DAY + HOUR), event: "conflict", detail: `REPLY-2 sha256=${"f".repeat(64)}` });
-  assert.equal(retentionStartMs(done), T0 - HOUR);
   assert.deepEqual(decide(done, facts(T0 + DAY + HOUR)), { kind: "remind", notice: "conflict", anchor: iso(T0 + DAY + HOUR) },
     "30 days after state_at, but the record is still retained: its conflict is noticed");
-  assert.notEqual(decide(done, facts(T0 - HOUR + 30 * DAY - 1)).kind, "expire");
-  assert.equal(decide(done, facts(T0 - HOUR + 30 * DAY)).kind, "expire");
 });
 
 test("CL-12 round 2: on a stalled record a CONFLICT newer than the stall gets its own notice series; an older one does not displace the stall", () => {
@@ -685,7 +675,6 @@ test("P2 on the round-2 paths: re-checks and notices on stalled, terminal and aw
               }
               const s = decide(rec, facts(t));
               const where = `${role} ${state} copy=${copy} marked=${marked} conflict=${conflict} pickup=${pickup} t=${(t - T0) / MIN}`;
-              if (s.kind === "expire") assert.ok(!pickup, `a REPLY awaiting pickup is never expired: ${where}`);
               if (s.kind === "remind" && s.notice === "reply_awaiting") {
                 pickupReminds += 1;
                 assert.ok(pickup, where);
@@ -735,10 +724,10 @@ test("CL-09 pickup (P1): a REPLY awaiting pickup on a terminal `replied` record 
   const waiting = decide(rec, facts(T0 + 40 * DAY + MIN));
   assert.equal(waiting.kind, "none");
   assert.ok(waiting.kind === "none" && waiting.due_ms !== null && waiting.due_ms <= T0 + 40 * DAY + 2 * HOUR, "the next reminder is due, not retention");
-  // The controller recorded the pickup (`handled`, coder A): no more reminders; retention applies again.
+  // The controller recorded the pickup (`handled`, coder A): no more reminders; nothing is expired (CL3-02).
   rec.messages["REPLY-1"]!.pickup = "handled";
-  assert.equal(decide(rec, facts(T0 + 40 * DAY + 2 * HOUR)).kind, "expire");
-  assert.equal(decide(rec, facts(T0 + 29 * DAY)).kind, "none", "handled: nothing more to say before retention");
+  assert.deepEqual(decide(rec, facts(T0 + 40 * DAY + 2 * HOUR)), { kind: "none", due_ms: null, why: "terminal" });
+  assert.equal(decide(rec, facts(T0 + 29 * DAY)).kind, "none", "handled: nothing more to say");
   // A second REPLY awaiting starts its own series at its own ingest time.
   awaitingReply(rec, "REPLY-2", T0 + 29 * DAY);
   assert.equal(decide(rec, facts(T0 + 29 * DAY + 9 * MIN)).kind, "none");
@@ -757,4 +746,67 @@ test("CL-09 pickup (P1): a REPLY awaiting pickup is reminded on open and stalled
   countNotice(stalled, "stalled", iso(T0 - DAY), T0 - DAY);
   awaitingReply(stalled, "REPLY-1", T0);
   assert.deepEqual(decide(stalled, facts(T0 + 10 * MIN)), { kind: "remind", notice: "reply_awaiting", anchor: iso(T0) });
+});
+
+// ── Third review (round 3): CL3-02 / CL3-07 no retention, CL3-03 notice slots ─────────────────
+/** Every step decide() returns at `t` until it returns no further notice (the pump posts both slots in one pass). */
+function remindsAt(rec: LinkRecord, t: number, peerActive = true): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < 4; i++) {
+    const s = decide(rec, facts(t, { peerActive }));
+    if (s.kind !== "remind") break;
+    out.push(s.notice);
+    countNotice(rec, s.notice, s.anchor, t);
+  }
+  return out;
+}
+
+test("CL3-02 / CL3-07: v1 expires nothing — a terminal record a year old gets no step and no due time", () => {
+  for (const state of ["replied", "refused", "closed"] as const) {
+    const done = sender([attempt(1, T0, "handed_over")], state);
+    if (state === "refused") countNotice(done, "refused", iso(T0), T0);
+    assert.deepEqual(decide(done, facts(T0 + 365 * DAY)), { kind: "none", due_ms: null, why: "terminal" }, state);
+  }
+  const inbox = receiver([attempt(1, T0, "handed_over")], "replied");
+  assert.deepEqual(decide(inbox, facts(T0 + 365 * DAY)), { kind: "none", due_ms: null, why: "terminal" });
+});
+
+test("CL3-03: an unbound request whose peer is unconfigured keeps its repeating UNBOUND series; PEER_UNCONFIGURED is posted once beside it, after it", () => {
+  const rec = base("receiver", "received", "REPLY-1", []);
+  delete rec.messages["REPLY-1"];
+  rec.receiver_task = null;
+  assert.deepEqual(remindsAt(rec, T0, false), ["peer_unconfigured"], "nothing awaits yet at +0: only the one-shot");
+  const seen: Array<[number, string[]]> = [];
+  for (let t = T0 + MIN; t <= T0 + 7 * HOUR; t += MIN) {
+    const r = remindsAt(rec, t, false);
+    if (r.length > 0) seen.push([(t - T0) / MIN, r]);
+  }
+  assert.deepEqual(seen, [[10, ["unbound"]], [30, ["unbound"]], [150, ["unbound"]], [270, ["unbound"]], [390, ["unbound"]]],
+    "the one-shot notice neither suppressed nor reset the unbound cadence");
+  // Both due in one pass: the awaiting kind first, then the one-shot kind.
+  const both = base("receiver", "received", "REPLY-1", []);
+  delete both.messages["REPLY-1"];
+  both.receiver_task = null;
+  assert.deepEqual(remindsAt(both, T0 + 10 * MIN, false), ["unbound", "peer_unconfigured"]);
+  assert.deepEqual(remindsAt(both, T0 + 30 * MIN, false), ["unbound"], "the one-shot is not repeated");
+});
+
+test("CL3-03: a REPLY awaiting pickup keeps its own cadence on a terminal record with a CONFLICT; the CONFLICT series follows once it is handled", () => {
+  const rec = sender([attempt(1, T0 - DAY, "handed_over")], "replied");
+  awaitingReply(rec, "REPLY-1", T0);
+  rec.history.push({ at: iso(T0 + 20 * MIN), event: "conflict", detail: `REPLY-1 sha256=${"f".repeat(64)}` });
+  const kinds: string[] = [];
+  const times: number[] = [];
+  for (let t = T0; t <= T0 + 7 * HOUR; t += MIN) {
+    const r = remindsAt(rec, t);
+    if (r.length > 0) times.push((t - T0) / MIN);
+    kinds.push(...r);
+  }
+  assert.deepEqual(times, [10, 30, 150, 270, 390], "REPLY_AWAITING keeps +10, +30 min, then every 2 h");
+  assert.deepEqual([...new Set(kinds)], ["reply_awaiting"], "the CONFLICT does not take over the awaiting series");
+  rec.messages["REPLY-1"]!.pickup = "handled";
+  assert.deepEqual(remindsAt(rec, T0 + 8 * HOUR), ["conflict"]);
+  const refused = sender([attempt(1, T0, "handed_over")], "refused");
+  awaitingReply(refused, "REPLY-1", T0);
+  assert.deepEqual(remindsAt(refused, T0 + 10 * MIN), ["reply_awaiting", "refused"], "awaiting first, then the one-shot");
 });

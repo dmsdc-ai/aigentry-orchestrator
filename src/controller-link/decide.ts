@@ -1,4 +1,4 @@
-// controller-link v1 — pump decision (SPEC §9.2, §9.3, §4 retention, §6.2 crash points; task 1294, unit U8).
+// controller-link v1 — pump decision (SPEC §9.2, §9.3, §6.2 crash points; task 1294, unit U8). v1 expires nothing (no retention).
 //
 // PURE: decide(record, facts) returns the single next step SPEC §9 allows for one record. It reads
 // nothing but its arguments (no file, clock, process, randomness or network); the pump (pump.ts)
@@ -13,7 +13,7 @@
 // "Newer than the latest attempt" is decided by ACK sequence, never by wall time (CL-01): every
 // re-send records `ack_seq` (the acks_in sequence it was committed with), so an answer authorises
 // at most one re-send even when the clock moves backward.
-import { RETENTION_MS, awaitingPickup, isTerminal, type LinkRecord, type SendAttempt, type UnverifiedCopy } from "./store.js";
+import { awaitingPickup, isTerminal, type LinkRecord, type SendAttempt, type UnverifiedCopy } from "./store.js";
 
 const MIN = 60_000;
 const HOUR = 60 * MIN;
@@ -54,10 +54,17 @@ export const RESEND_TRIGGERS = ["refused_definite", "ack_unknown", "ack_unverifi
 export type NoticeKind =
   | "stalled" | "conflict" | "refused" | "peer_unconfigured" | "corroborated" | "reply_awaiting" | "reply_unverified" | "unbound"
   | "no_final";
-/** Highest first; one series per record at a time (the highest applicable kind). */
+/** Every kind, highest first: what awaits the controller, then the other repeating kinds, then the one-shot kinds (CL3-03). */
 export const NOTICE_PRIORITY: readonly NoticeKind[] = [
-  "stalled", "conflict", "refused", "peer_unconfigured", "corroborated", "reply_awaiting", "reply_unverified", "unbound", "no_final",
+  "corroborated", "reply_awaiting", "unbound", "stalled", "conflict", "reply_unverified", "no_final", "refused", "peer_unconfigured",
 ];
+/**
+ * CL3-03: a record has two notice series at a time, each in its own slot of `notices`: the highest applicable
+ * repeating kind (`series`; a kind that awaits the controller first) and the applicable one-shot kind (`once`).
+ * A one-shot kind therefore never suppresses or resets a repeating series; both can be due in one pass.
+ */
+export const ONE_SHOT_KINDS: readonly NoticeKind[] = ["refused", "peer_unconfigured"];
+export const noticeSlot = (kind: NoticeKind): "series" | "once" => (ONE_SHOT_KINDS.includes(kind) ? "once" : "series");
 /**
  * §9.3 schedules, as offsets from the series anchor, then every `everyMs` after the last offset
  * (null = no repeat): inbox `received` unbound +10 min, +30 min, then every 2 h; inbox bound without
@@ -114,9 +121,7 @@ export type Step =
   /** §9.2 / §9.3 limits. */
   | { kind: "stall"; why: string }
   /** §9.3 local notice. `anchor` identifies the series (ISO time, or the peer label for peer_unconfigured). */
-  | { kind: "remind"; notice: NoticeKind; anchor: string }
-  /** §4: terminal for 30 days; deleted by the store's retention selector. */
-  | { kind: "expire" };
+  | { kind: "remind"; notice: NoticeKind; anchor: string };
 
 export interface NoticeSeries {
   kind: NoticeKind;
@@ -197,9 +202,9 @@ export function noticeClaimOf(rec: LinkRecord): NoticeClaim | null {
   return { owner: c.owner, at: c.at, kind: c.kind as NoticeKind, anchor: c.anchor };
 }
 
-/** The record's current notice series (pump.ts writes `notices.series`), or null. */
-export function noticeSeriesOf(rec: LinkRecord): NoticeSeries | null {
-  const s = rec.notices.series;
+/** The record's notice series in `slot` (pump.ts writes `notices.series` and `notices.once`), or null. */
+export function noticeSeriesOf(rec: LinkRecord, slot: "series" | "once" = "series"): NoticeSeries | null {
+  const s = rec.notices[slot];
   if (!isObj(s) || typeof s.anchor !== "string" || typeof s.n !== "number" ||
       !(NOTICE_PRIORITY as readonly unknown[]).includes(s.kind)) return null;
   return { kind: s.kind as NoticeKind, anchor: s.anchor, n: s.n, last_at: typeof s.last_at === "string" ? s.last_at : null };
@@ -358,50 +363,34 @@ export function awaitingIngest(rec: LinkRecord): string[] {
   return [...new Set(out)];
 }
 
-/**
- * CL-12: the start of a terminal record's 30 days, by the retention selector's own rule (store.ts
- * `lastChangeMs`): the later of `state_at` and every message's `ingested_at`.
- */
-export function retentionStartMs(rec: LinkRecord): number {
-  let t = ms(rec.state_at);
-  for (const m of Object.values(rec.messages)) {
-    if (typeof m.ingested_at === "string") t = Math.max(t, Date.parse(m.ingested_at));
-  }
-  return t;
-}
+interface NoticeTarget { kind: NoticeKind; anchor: string; anchorMs: number }
 
-/** The kind of local notice this record is subject to now (highest priority), with its series anchor. */
-export function noticeKindOf(rec: LinkRecord, peerActive: boolean): { kind: NoticeKind; anchor: string; anchorMs: number } | null {
-  const at = (kind: NoticeKind, iso: string) => ({ kind, anchor: iso, anchorMs: ms(iso) });
-  const conflicts = rec.history.filter((h) => h.event === "conflict");
-  const conflict = lastOf(conflicts);
-  // CL-05: a stored copy awaiting the controller keeps its notice series in every state it can be in.
+/**
+ * CL3-03: the repeating notice kind this record is subject to now (highest priority), with its series anchor.
+ * What awaits the controller comes first, in every state and whatever the peer configuration: pickup is
+ * local (`status`, `handled`, the controller's own ingest), so its reminders do not depend on transport.
+ */
+function repeatingKindOf(rec: LinkRecord): NoticeTarget | null {
+  const at = (kind: NoticeKind, iso: string): NoticeTarget => ({ kind, anchor: iso, anchorMs: ms(iso) });
+  const conflict = lastOf(rec.history.filter((h) => h.event === "conflict"));
+  // CL-05: a stored copy the pump found corroborated keeps its series until the record shows the controller acted.
   const mark = corroboratedMark(rec);
-  const awaiting = mark !== null && awaitingIngest(rec).length > 0 ? at("corroborated", mark.at) : null;
-  // CL-09 / P1: a REPLY applied by ingest that the controller has not recorded as `handled` (store.ts
-  // awaitingPickup: REPLY keys with `pickup: "awaiting"`, in seq order). The series is anchored at the first such
-  // REPLY's ingest time, so the next awaiting REPLY starts a new series. Needs no peer: `status` and `handled` are local.
+  if (mark !== null && awaitingIngest(rec).length > 0) return at("corroborated", mark.at);
+  // CL-09 / P1: a REPLY applied by ingest that the controller has not recorded as `handled` (store.ts awaitingPickup,
+  // in seq order), anchored at that REPLY's ingest time, so the next awaiting REPLY starts a new series.
   const pickupKey = awaitingPickup(rec)[0];
-  const pickupAt = pickupKey === undefined ? undefined : rec.messages[pickupKey]?.ingested_at;
-  const pickup = pickupKey === undefined ? null : at("reply_awaiting", typeof pickupAt === "string" ? pickupAt : rec.state_at);
-  if (isTerminal(rec.state)) {
-    // CL-12: a CONFLICT is reminded on a terminal record too (once, then daily until retention).
-    if (conflict !== undefined) return at("conflict", conflict.at);
-    if (awaiting !== null) return awaiting;
-    if (pickup !== null) return pickup;
-    return rec.role === "sender" && rec.state === "refused" ? at("refused", rec.state_at) : null;
+  if (pickupKey !== undefined) {
+    const pickupAt = rec.messages[pickupKey]?.ingested_at;
+    return at("reply_awaiting", typeof pickupAt === "string" ? pickupAt : rec.state_at);
   }
+  if (rec.role === "receiver" && rec.state === "received") return at("unbound", rec.state_at);
+  // CL-12: a CONFLICT is reminded on a terminal record too (once, then daily).
+  if (isTerminal(rec.state)) return conflict === undefined ? null : at("conflict", conflict.at);
   if (rec.state === "stalled") {
-    if (awaiting !== null && peerActive) return awaiting;
-    if (pickup !== null) return pickup;
     // CL-12: a CONFLICT that arrived after the stall is new information: its own series, not the stall's.
-    if (conflict !== undefined && ms(conflict.at) > ms(rec.state_at)) return at("conflict", conflict.at);
-    return at("stalled", rec.state_at);
+    return conflict !== undefined && ms(conflict.at) > ms(rec.state_at) ? at("conflict", conflict.at) : at("stalled", rec.state_at);
   }
   if (conflict !== undefined) return at("conflict", conflict.at);
-  if (pickup !== null) return pickup;
-  if (!peerActive) return { kind: "peer_unconfigured", anchor: rec.peer, anchorMs: NaN };
-  if (awaiting !== null) return awaiting;
   const copies = unverifiedReplyCopies(rec);
   if (copies.length > 0) {
     // Due when the oldest copy's 48 h of re-checks end (anchor), then daily; the record's state is never changed.
@@ -409,13 +398,20 @@ export function noticeKindOf(rec: LinkRecord, peerActive: boolean): { kind: Noti
     return at("reply_unverified", new Date(oldest + VERIFY_WINDOW_MS).toISOString());
   }
   if (rec.role !== "receiver") return null;
-  if (rec.state === "received") return at("unbound", rec.state_at);
   const final = Object.keys(rec.messages).some((k) => k.startsWith("REPLY-") && rec.messages[k]!.final === "yes");
   if (rec.state === "accepted" || (rec.state === "replying" && !final)) return at("no_final", rec.state_at);
   return null;
 }
 
-/** §9.3 local notice for this record: a step, a wait, or nothing. */
+/** CL3-03: the one-shot notice kind this record is subject to now (its own slot, `notices.once`). */
+function oneShotKindOf(rec: LinkRecord, peerActive: boolean): NoticeTarget | null {
+  if (isTerminal(rec.state)) {
+    return rec.role === "sender" && rec.state === "refused" ? { kind: "refused", anchor: rec.state_at, anchorMs: ms(rec.state_at) } : null;
+  }
+  return rec.state === "stalled" || peerActive ? null : { kind: "peer_unconfigured", anchor: rec.peer, anchorMs: NaN };
+}
+
+/** §9.3 local notices for this record: the first due one (repeating slot first), a wait, or nothing. */
 function noticeEval(rec: LinkRecord, facts: DecideFacts): MsgEval {
   const claim = noticeClaimOf(rec);
   if (claim !== null) {
@@ -426,19 +422,24 @@ function noticeEval(rec: LinkRecord, facts: DecideFacts): MsgEval {
     }
     return { kind: "wait", due_ms: ms(claim.at) + NOTICE_LEASE_MS, why: "notice claimed" };
   }
-  const k = noticeKindOf(rec, facts.peerActive);
-  if (k === null) return { kind: "done" };
-  const s = noticeSeriesOf(rec);
-  const same: NoticeSeries | null = s !== null && s.kind === k.kind && s.anchor === k.anchor ? s : null;
-  if (k.kind === "peer_unconfigured") {
-    return same !== null && same.n >= 1 ? { kind: "done" } : { kind: "act", step: { kind: "remind", notice: k.kind, anchor: k.anchor } };
+  let wait: { due_ms: number; why: string } | null = null;
+  for (const k of [repeatingKindOf(rec), oneShotKindOf(rec, facts.peerActive)]) {
+    if (k === null) continue;
+    const s = noticeSeriesOf(rec, noticeSlot(k.kind));
+    const same: NoticeSeries | null = s !== null && s.kind === k.kind && s.anchor === k.anchor ? s : null;
+    const remind: MsgEval = { kind: "act", step: { kind: "remind", notice: k.kind, anchor: k.anchor } };
+    if (noticeSlot(k.kind) === "once") {
+      if (same === null || same.n < 1) return remind;
+      continue;
+    }
+    const sched = NOTICE_SCHEDULES[k.kind];
+    const lastAt = same !== null && same.last_at !== null ? ms(same.last_at) : null;
+    const due = Number.isNaN(k.anchorMs) ? null : nextPoint(k.anchorMs, sched.offsets, sched.everyMs, lastAt);
+    if (due === null) continue;
+    if (facts.nowMs >= due) return remind;
+    if (wait === null || due < wait.due_ms) wait = { due_ms: due, why: `${k.kind} notice` };
   }
-  const sched = NOTICE_SCHEDULES[k.kind];
-  const lastAt = same !== null && same.last_at !== null ? ms(same.last_at) : null;
-  const due = Number.isNaN(k.anchorMs) ? null : nextPoint(k.anchorMs, sched.offsets, sched.everyMs, lastAt);
-  if (due === null) return { kind: "done" };
-  if (facts.nowMs >= due) return { kind: "act", step: { kind: "remind", notice: k.kind, anchor: k.anchor } };
-  return { kind: "wait", due_ms: due, why: `${k.kind} notice` };
+  return wait === null ? { kind: "done" } : { kind: "wait", ...wait };
 }
 
 const minDue = (a: number | null, b: number | null): number | null => (a === null ? b : b === null ? a : Math.min(a, b));
@@ -449,21 +450,16 @@ export function decide(rec: LinkRecord, facts: DecideFacts): Step {
   const marked = corroboratedMark(rec)?.shas ?? new Set<string>();
   const freshReplyCopies = (): string[] => [...new Set(unverifiedReplyCopies(rec)
     .filter((c) => now - ms(c.at) < VERIFY_WINDOW_MS && !marked.has(c.sha256)).map((c) => c.sha256))];
-  // Terminal: retention after 30 days (§4) from the retention selector's own start (CL-12); the sender's
-  // `refused` notice (once). CL-05: a REPLY copy first stored on a terminal record is re-checked like any
-  // other (§9.3), except on `closed` (the controller closed it: nothing awaits it there).
+  // Terminal: notices only (v1 expires nothing, CL3-02 / CL3-07). CL-05: a REPLY copy first stored on a
+  // terminal record is re-checked like any other (§9.3), except on `closed` (the controller closed it: nothing awaits it there).
   if (isTerminal(rec.state)) {
-    const start = retentionStartMs(rec);
-    // CL-09 / P1: a REPLY awaiting pickup is never expired (the store never selects such a record either).
-    const keep = awaitingPickup(rec).length > 0;
-    if (!keep && now - start >= RETENTION_MS) return { kind: "expire" };
     const n = noticeEval(rec, facts);
     if (n.kind === "act") return n.step;
     const shas = rec.state === "closed" ? [] : freshReplyCopies();
     if (shas.length > 0) return { kind: "verify", shas };
-    return { kind: "none", due_ms: minDue(n.kind === "wait" ? n.due_ms : null, keep ? null : start + RETENTION_MS), why: "terminal" };
+    return { kind: "none", due_ms: n.kind === "wait" ? n.due_ms : null, why: "terminal" };
   }
-  // §9.3 last bullet: an unconfigured peer — no send, no state change; one notice.
+  // §9.3 last bullet: an unconfigured peer — no send, no state change; one PEER_UNCONFIGURED notice beside the repeating one.
   if (!facts.peerActive) {
     const n = noticeEval(rec, facts);
     if (n.kind === "act") return n.step;
@@ -487,7 +483,7 @@ export function decide(rec: LinkRecord, facts: DecideFacts): Step {
   // copy is re-checked for 48 h; after that only the daily `reply_unverified` notice (no state change, HOLD-1 Q4).
   // CL-05: the re-check only records corroboration; a corroborated copy is presented by the `corroborated`
   // notice (before any further re-check) and applied by the controller's own ingest, never by the pump. The
-  // 48 h stall comes first; the `corroborated` notice then continues on the stalled record (noticeKindOf).
+  // 48 h stall comes first; the `corroborated` notice then continues on the stalled record (repeatingKindOf).
   const req = rec.messages["REQUEST-1"];
   const since = ms(req?.ingested_at ?? rec.state_at);
   if (rec.role === "receiver" && rec.state === "unverified" && !(now - since < VERIFY_WINDOW_MS)) {
@@ -530,5 +526,5 @@ export function decide(rec: LinkRecord, facts: DecideFacts): Step {
 
 /** The time the next step is due: now for an action, the wait's due time, or null. */
 export function dueOf(step: Step, nowMs: number): number | null {
-  return step.kind === "none" ? step.due_ms : step.kind === "expire" ? null : nowMs;
+  return step.kind === "none" ? step.due_ms : nowMs;
 }

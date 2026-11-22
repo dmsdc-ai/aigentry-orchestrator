@@ -1,6 +1,6 @@
 // Task 1294 — controller-link pump (U8, src/controller-link/pump.ts): TEST-PLAN §2.4 K1–K4 and §2.8
 // P4–P8 at the pump, plus the §6.1 record-before-send rule, same-byte re-sends, the human `resend`,
-// retention, the off switch and the `pump`/`resend` registration in cli.ts.
+// no deletion (v1 has no retention), the off switch and the `pump`/`resend` registration in cli.ts.
 // Injected: wall clock, monotonic clock, process runner (fake telepty inject), pid liveness, notice
 // sender (fake report-pump TeleptyPort.inject), audit reader, sleep; store root and peer config are
 // a temp dir per test. No real telepty, daemon or session is touched.
@@ -14,8 +14,8 @@ import { USAGE, defaultAuditReader, runCli, type AuditReader, type AuditRow } fr
 import { NOTICE_PRIORITY } from "../../src/controller-link/decide.js";
 import { parseEnvelope, renderEnvelope, type Envelope, type EnvelopeFields } from "../../src/controller-link/envelope.js";
 import {
-  CURSOR_FILE, NOTICE_MARKER, PASS_NOTICES_MAX, PASS_RECORDS_MAX, PASS_SENDS_MAX, PASS_WALL_MS, PUMP_SWITCH_ENV, pumpOnce,
-  renderControllerNotice, runPump, runResendCli, type PumpDeps,
+  CURSOR_FILE, NOTICE_MARKER, NOTICE_TIMEOUT_MS, PASS_NOTICES_MAX, PASS_RECORDS_MAX, PASS_SENDS_MAX, PASS_WALL_MS, PUMP_SWITCH_ENV,
+  pumpOnce, renderControllerNotice, runPump, runResendCli, runnerNoticePort, type PumpDeps,
 } from "../../src/controller-link/pump.js";
 import { KILL_GRACE_MS, type ProcessRunner, type RunnerResult } from "../../src/controller-link/send.js";
 import { ControllerLinkStore, type LinkRecord, type RecordRef, type RecordState, type SendAttempt } from "../../src/controller-link/store.js";
@@ -485,7 +485,7 @@ test("P8 a claimed attempt with a live owner is never taken over; two concurrent
   assert.equal(probes.length, 1, "exactly one PROBE for one due record");
 });
 
-// ── §9.3 verify, §4 retention, off switch, usage ─────────────────────────────────────────
+// ── §9.3 verify, no deletion, off switch, usage ─────────────────────────────────────────
 /** The controller follows a CORROBORATED notice: its own `ingest` of the named stored copy (CL-05). */
 async function ingestStoredCopy(h: H, sha256: string): Promise<number> {
   h.out.length = 0;
@@ -629,23 +629,6 @@ test("CL-08 a re-check's audit queries each start only if their worst case fits 
   assert.equal(h.calls.length, 0, "a re-check sends nothing cross-machine");
 });
 
-test("CL-08 / CL-18 retention starts only before the pass deadline; what it would delete goes next pass", async (t) => {
-  const h = harness(t);
-  const old = randomUUID();
-  await seedSender(h, old, "replied", [attempt(1, T0 - 31 * DAY, "handed_over")]);
-  await seedSender(h, randomUUID(), "sent", [attempt(1, T0, "handed_over")]);
-  h.monoPerSend = PASS_WALL_MS + 10_000;
-  h.now.ms = T0 + 5 * MIN;
-  assert.equal(await pump(h), 3, "a pass that reached its deadline reports it");
-  assert.equal(h.calls.length, 1);
-  assert.ok(h.out.includes("PUMP_DEADLINE retention is left for the next pass"), h.out.join("\n"));
-  assert.equal(fs.existsSync(h.store.recordPath(outbox(old))), true, "retention did not start after the deadline");
-  h.monoPerSend = 0;
-  h.now.ms = T0 + 6 * MIN;
-  assert.equal(await pump(h), 0, h.err.join("\n"));
-  assert.equal(fs.existsSync(h.store.recordPath(outbox(old))), false);
-});
-
 test("CL-12 a CONFLICT on a terminal record gets its notice, then daily", async (t) => {
   const h = harness(t);
   const id = randomUUID();
@@ -666,21 +649,17 @@ test("CL-12 a CONFLICT on a terminal record gets its notice, then daily", async 
   assert.equal(h.calls.length, 0);
 });
 
-test("§4 retention: terminal records 30 days old and raw files no record names are deleted; open records kept", async (t) => {
+test("CL3-02 / CL3-07: the pump deletes nothing — a terminal record of any age, its raw file and a raw file no record names stay", async (t) => {
   const h = harness(t);
   const old = randomUUID();
-  const open = randomUUID();
-  const oldEnv = await seedSender(h, old, "replied", [attempt(1, T0 - 31 * DAY, "handed_over")]);
-  const openEnv = await seedSender(h, open, "accepted", [attempt(1, T0 - 31 * DAY, "handed_over")]);
+  const oldEnv = await seedSender(h, old, "replied", [attempt(1, T0 - 400 * DAY, "handed_over")]);
   const orphan = envelope(fields("REQUEST", randomUUID(), SELF, PEER), "orphan");
   fs.writeFileSync(h.store.rawPath(orphan.sha256), orphan.text, { mode: 0o600 });
-  await pump(h);
-  assert.equal(fs.existsSync(h.store.recordPath(outbox(old))), false);
-  assert.equal(fs.existsSync(h.store.rawPath(oldEnv.sha256)), false);
-  assert.equal(fs.existsSync(h.store.rawPath(orphan.sha256)), false);
-  assert.equal(fs.existsSync(h.store.recordPath(outbox(open))), true);
-  assert.equal(fs.existsSync(h.store.rawPath(openEnv.sha256)), true);
-  assert.ok(h.out.includes("PUMP_RETENTION records=1 raws=2"));
+  assert.equal(await pump(h), 0, h.err.join("\n"));
+  assert.equal(fs.existsSync(h.store.recordPath(outbox(old))), true);
+  assert.equal(fs.existsSync(h.store.rawPath(oldEnv.sha256)), true);
+  assert.equal(fs.existsSync(h.store.rawPath(orphan.sha256)), true);
+  assert.ok(!h.out.some((l) => l.startsWith("PUMP_RETENTION") || l.includes("deleted_")), h.out.join("\n"));
 });
 
 test("off switch AIGENTRY_CONTROLLER_LINK_PUMP=0: nothing read, nothing sent, no store created; --loop sleeps between passes", async (t) => {
@@ -898,26 +877,6 @@ test("CL-08 round 2: an audit query's child is killed by the pass deadline too (
   assert.ok(h.out.some((l) => l.startsWith(`PUMP_VERIFY request=${id} `) && l.includes("corroborated=0")), h.out.join("\n"));
 });
 
-test("CL-08 round 2: retention checks the deadline before every file; selected raws wait until every selected record is gone", async (t) => {
-  const h = harness(t);
-  const ids = [randomUUID(), randomUUID(), randomUUID()];
-  const envs: Envelope[] = [];
-  for (const id of ids) envs.push(await seedSender(h, id, "replied", [attempt(1, T0 - 31 * DAY, "handed_over")]));
-  // Every monotonic read advances 40 s: #1 the pass start, #2–#4 one deadline check per record, #5 before
-  // retention (160 s elapsed), #6 before the first file (200 s: deleted), #7 before the second (240 s: stop).
-  let mono = 0;
-  const deps: PumpDeps = { ...h.deps, monoMs: () => (mono += 40_000) };
-  h.now.ms = T0;
-  assert.equal(await pump(h, deps), 3, "a pass that reached its deadline reports it");
-  assert.equal(ids.filter((id) => fs.existsSync(h.store.recordPath(outbox(id)))).length, 2, "one record deleted, the rest left");
-  assert.ok(envs.every((e) => fs.existsSync(h.store.rawPath(e.sha256))), "no raw deleted while a selected record remains");
-  assert.ok(h.out.includes("PUMP_RETENTION records=1 raws=0"), h.out.join("\n"));
-  assert.ok(h.out.includes("PUMP_DEADLINE retention stopped; the rest is deleted by the next pass"), h.out.join("\n"));
-  assert.equal(await pump(h), 0, h.err.join("\n"));
-  assert.ok(ids.every((id) => !fs.existsSync(h.store.recordPath(outbox(id)))));
-  assert.ok(envs.every((e) => !fs.existsSync(h.store.rawPath(e.sha256))));
-});
-
 test("CL-12 round 2: a terminal record the store still retains (a message stored after it became terminal) gets its CONFLICT notice past 30 days from state_at", async (t) => {
   const h = harness(t);
   const id = randomUUID();
@@ -988,7 +947,7 @@ test("CL-19 round 2: every notice is two lines naming only the request and `bin/
 });
 
 // ── Round 2 fix (P1 / CL-09): a REPLY awaiting `handled` ───────────────────────────────────
-test("CL-09 pickup (P1): a REPLY awaiting pickup on a terminal `replied` record past 30 days gets REPLY_AWAITING notices that repeat (+10, +30 min, every 2 h) and is not deleted; once handled they stop and retention applies", async (t) => {
+test("CL-09 pickup (P1): a REPLY awaiting pickup on a terminal `replied` record past 30 days gets REPLY_AWAITING notices that repeat (+10, +30 min, every 2 h) and is not deleted; once handled they stop and the record stays (CL3-02)", async (t) => {
   const h = harness(t);
   const id = randomUUID();
   await seedSender(h, id, "replied", [attempt(1, T0 - 40 * DAY, "handed_over")]); // state_at = T0 − 40 days
@@ -1016,7 +975,7 @@ test("CL-09 pickup (P1): a REPLY awaiting pickup on a terminal `replied` record 
     assert.ok(!text.includes(h.store.rawPath(reply.sha256)) && !text.includes("the final result"), "no path, no body");
   }
   assert.equal(h.calls.length, 0, "a notice sends nothing to the peer");
-  // The controller records the pickup (coder A's `handled`): the reminders stop and the record is retained no longer.
+  // The controller records the pickup (coder A's `handled`): the reminders stop; v1 deletes nothing (CL3-02).
   await h.store.mutate(outbox(id), (cur) => {
     const next = JSON.parse(JSON.stringify(cur)) as LinkRecord;
     next.messages["REPLY-1"]!.pickup = "handled";
@@ -1025,5 +984,97 @@ test("CL-09 pickup (P1): a REPLY awaiting pickup on a terminal `replied` record 
   h.now.ms = T0 + 4 * HOUR + 30 * MIN;
   assert.equal(await pump(h), 0, h.err.join("\n"));
   assert.equal(awaiting().length, 3, "handled: no more reminders");
-  assert.equal(fs.existsSync(h.store.recordPath(outbox(id))), false, "handled and 30 days old: retention deletes it");
+  assert.equal(fs.existsSync(h.store.recordPath(outbox(id))), true, "handled and 35 days old: still on disk (no retention)");
+});
+
+// ── Third review (round 3): CL3-03 notice slots, CL3-04 the notice inside the pass deadline ────────────
+const noticeKinds = (h: H): string[] => h.notices.map((n) => n.text.slice(NOTICE_MARKER.length + 1).split(" ")[0]!);
+
+test("CL3-03 at the pump: an unbound request whose peer was unconfigured gets UNBOUND and PEER_UNCONFIGURED in one pass, then UNBOUND keeps repeating", async (t) => {
+  const h = harness(t);
+  const id = randomUUID();
+  await seedReceiver(h, id, "received");
+  fs.writeFileSync(path.join(h.base, "controller-peers.json"), JSON.stringify({ v: 1, self: { label: SELF, controller_sid: SID },
+    peers: { linux: { target: PEER_TARGET }, old: { target: "orchestrator@old-box" } } }));
+  h.now.ms = T0 + 10 * MIN;
+  assert.equal(await pump(h), 0, h.err.join("\n"));
+  assert.deepEqual(noticeKinds(h), ["UNBOUND", "PEER_UNCONFIGURED"], "both due in one pass: the awaiting kind first");
+  for (const m of [30, 150]) {
+    h.now.ms = T0 + m * MIN;
+    assert.equal(await pump(h), 0, h.err.join("\n"));
+  }
+  assert.deepEqual(noticeKinds(h), ["UNBOUND", "PEER_UNCONFIGURED", "UNBOUND", "UNBOUND"], "the one-shot neither repeats nor resets UNBOUND");
+  for (const n of h.notices) assert.ok(n.text.endsWith(`\nnext: bin/controller-link.sh status --request ${id}`), n.text);
+  const r = await rec(h, inbox(id));
+  assert.equal((r.notices.series as { kind?: string }).kind, "unbound");
+  assert.equal((r.notices.once as { kind?: string }).kind, "peer_unconfigured");
+  assert.equal(h.calls.length, 0, "nothing sent to the peer");
+});
+
+test("CL3-04: a notice whose claim's lock wait used the notice's time is released unsent and uncounted; the next pass posts it", async (t) => {
+  const h = harness(t);
+  const id = randomUUID();
+  await seedSender(h, id, "stalled", [attempt(1, T0, "unknown")]);
+  const file = h.store.recordPath(outbox(id));
+  const claimHeld = (): boolean => fs.existsSync(file) && ((JSON.parse(fs.readFileSync(file, "utf8")) as LinkRecord).notices.claim ?? null) !== null;
+  // Monotonic time is 200 s while the claim is committed: the claim's lock wait, between the first check and the inject.
+  const lagged: PumpDeps = { ...h.deps, monoMs: () => (claimHeld() ? 200_000 : 0) };
+  h.now.ms = T0 + MIN;
+  assert.equal(await pump(h, lagged), 0, h.err.join("\n"));
+  assert.equal(h.notices.length, 0, "40 s left, the notice needs 90 s: not started");
+  assert.ok(h.out.some((l) => l.startsWith(`PUMP_DEFERRED request=${id} `) && l.includes("step=remind")), h.out.join("\n"));
+  let r = await rec(h, outbox(id));
+  assert.equal(r.notices.claim, null, "the claim is released");
+  assert.equal(r.notices.n, 0, "not counted: it was never started");
+  h.now.ms = T0 + 2 * MIN;
+  assert.equal(await pump(h), 0, h.err.join("\n"));
+  assert.deepEqual(noticeKinds(h), ["STALLED"]);
+  r = await rec(h, outbox(id));
+  assert.equal(r.notices.n, 1);
+});
+
+test("CL3-04: the production notice port runs through the pass runner with its timeout cut to the time left; a notice killed by it is counted `unknown` and not re-posted at once; a spawn failure is retried", async (t) => {
+  const h = harness(t);
+  const id = randomUUID();
+  await seedSender(h, id, "stalled", [attempt(1, T0, "unknown")]);
+  const file = (x: string): string => h.store.recordPath(outbox(x));
+  const claimed = (x: string): boolean => fs.existsSync(file(x)) && ((JSON.parse(fs.readFileSync(file(x), "utf8")) as LinkRecord).notices.claim ?? null) !== null;
+  const seen: Array<{ argv: string[]; timeoutMs: number }> = [];
+  let reply: RunnerResult = { rc: null, stdout: "", stderr: "\n[controller-link] killed after the send timeout", truncated: false };
+  let current = id;
+  const deps: PumpDeps = {
+    ...h.deps,
+    // 150 s of the pass are gone once the claim is committed: the notice still fits (150 + 90 ≤ 240), 85 s are left after the kill grace.
+    monoMs: () => (claimed(current) ? 150_000 : 0),
+    runner: { async run(_bin, argv, opts) { seen.push({ argv: [...argv], timeoutMs: opts.timeoutMs }); return reply; } },
+    noticeWith: (runner) => runnerNoticePort(runner, "telepty-fake", {}),
+  };
+  h.now.ms = T0 + MIN;
+  assert.equal(await pump(h, deps), 0, h.err.join("\n"));
+  assert.equal(seen.length, 1);
+  assert.deepEqual(seen[0]!.argv.slice(0, -1), ["inject", "--submit", "--no-submit-force", "--submit-retry", "2", "--from", "controller-link", SID]);
+  assert.ok(seen[0]!.argv.at(-1)!.startsWith(`${NOTICE_MARKER} STALLED request_id=${id} `));
+  assert.equal(seen[0]!.timeoutMs, PASS_WALL_MS - 150_000 - KILL_GRACE_MS, "cut to the time left of the pass");
+  assert.ok(seen[0]!.timeoutMs < NOTICE_TIMEOUT_MS);
+  let r = await rec(h, outbox(id));
+  assert.equal(r.notices.n, 1, "killed: it may have been delivered, so it is counted");
+  assert.equal((r.notices.series as { last_submit?: string }).last_submit, "unknown");
+  h.now.ms = T0 + 2 * MIN;
+  await pump(h, deps);
+  assert.equal(seen.length, 1, "not re-posted at once");
+  // A notice that could not be spawned was not delivered: not counted, due again next pass.
+  const other = randomUUID();
+  await seedSender(h, other, "stalled", [attempt(1, T0, "unknown")]);
+  current = other;
+  reply = { rc: null, stdout: "", stderr: "\n[controller-link] spawn error: ENOENT", truncated: false };
+  h.now.ms = T0 + 3 * MIN;
+  await pump(h, deps);
+  assert.equal(seen.length, 2);
+  r = await rec(h, outbox(other));
+  assert.equal(r.notices.n, 0);
+  reply = { rc: 0, stdout: `inject_id: ${randomUUID()}\n✅ Submitted — consumed as a new turn.\n`, stderr: "", truncated: false };
+  h.now.ms = T0 + 4 * MIN;
+  await pump(h, deps);
+  assert.equal(seen.length, 3, "retried");
+  assert.equal((await rec(h, outbox(other))).notices.n, 1);
 });

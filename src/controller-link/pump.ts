@@ -1,4 +1,4 @@
-// controller-link v1 — pump and human re-send (SPEC §9, §6.1, §6.2, §4 retention; task 1294, unit U8).
+// controller-link v1 — pump and human re-send (SPEC §9, §6.1, §6.2; task 1294, unit U8). The pump deletes nothing (v1 has no retention).
 //
 //   bin/controller-link.sh pump   --once | --loop <seconds>        (reconciler step 0b4 runs `pump --once`)
 //   bin/controller-link.sh resend --request <U> --reason "<text>"   (human, from `stalled` only)
@@ -8,19 +8,21 @@
 // re-send the SAME raw bytes (only on the triggers decide() allows), re-check corroboration (U6
 // `corroborate`, read only: the pump never applies a message; CL-05), or post a local notice — within the
 // per-pass budget (≤ 240 s, ≤ 20 cross-machine sends, ≤ 10 notices, ≤ 256 records visited). The pass has ONE
-// deadline (CL-08): every step, every audit query and retention check it before they start, each with its own
+// deadline (CL-08, CL3-04): every step and every audit query check it before they start, each with its own
 // worst case (a send its 120 s timeout, a notice the report pump's inject timeout, an audit query 5 pages × 30 s),
-// and every child the pass starts (the sender, the audit reader) runs with its timeout cut to the time left, so
-// the deadline kills it; a killed or unstarted child is `unknown` (a send) or `audit_unavailable`, never refused.
-// Then, if the deadline still allows, delete what the store's retention selector returns (records
-// first, then raw files), under the store lock, checking the deadline before every file. CL-18: a pass starts
-// at a rotating cursor (`pump-cursor.json` in the store root) so every record is eventually visited.
+// a notice re-checks it after its claim, and every child the pass starts (the sender, the audit reader, the
+// notice inject) runs through one runner with its timeout cut to the time left, so the deadline kills it; a killed
+// or unstarted child is `unknown` (a send, a notice) or `audit_unavailable`, never refused. Worst case, with
+// W = the store walk and cursor read at the start, L = one store mutation (lock wait ≤ 30 s + one record's I/O)
+// and A = the cursor write: pass ≤ max(W, PASS_WALL_MS + 2·L) + A — the last step starts before the deadline,
+// its claim takes ≤ L, its child ends by the deadline, its result write takes ≤ L. CL-18: a pass starts at a
+// rotating cursor (`pump-cursor.json` in the store root) so every record is eventually visited.
 //
 // Every send follows SPEC §6.1: under the lock the attempt is written `pending` with `owner=<pid>@<host>`
 // and committed BEFORE telepty runs (U3 sendEnvelope); the result is written afterwards. A claim (a
 // pending attempt, a notice claim) whose owner may still be working is never taken over (§9.1).
-// Notices go to this machine's own controller through the report pump's sender (src/report/pump.ts),
-// injected as a port, with `--from controller-link` (HOLD-1 Q1, option B). Off switch: AIGENTRY_CONTROLLER_LINK_PUMP=0 (the pass reads and sends nothing).
+// Notices go to this machine's own controller with the report pump's inject argv (src/report/pump.ts) and
+// `--from controller-link` (HOLD-1 Q1, option B), through the pass runner (runnerNoticePort). Off switch: AIGENTRY_CONTROLLER_LINK_PUMP=0 (the pass reads and sends nothing).
 // The clock, monotonic clock, process runner, pid liveness, notice sender, sleep and store root are injected.
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
@@ -32,13 +34,13 @@ import { performance } from "node:perf_hooks";
 import { parseInjectId } from "../dispatch/inject-id.js";
 import { sanitizeBody } from "../report/envelope.js";
 import { atomicWrite } from "../session/persistence/atomic-write.js";
-import { INJECT_TIMEOUT_MS, defaultPidAlive, defaultTeleptyPort, submitOutcome, type TeleptyPort } from "../report/pump.js";
+import { INJECT_TIMEOUT_MS, defaultPidAlive, submitOutcome, teleptyChildEnv, type InjectResult } from "../report/pump.js";
 import {
   AUDIT_MAX_PAGES, AUDIT_TIMEOUT_MS, CliError, EXIT, activePeer, corroborate, defaultAuditReader, loadPeerConfig, nextActionFor,
   sentAt, type AuditReader, type CliDeps, type PeerConfig,
 } from "./cli.js";
 import {
-  answerResends, corroboratedMark, decide, dueOf, noticeClaimOf, noticeSeriesOf, pendingOwners, SETTLING_ACK_STATES,
+  answerResends, corroboratedMark, decide, dueOf, noticeClaimOf, noticeSeriesOf, noticeSlot, pendingOwners, SETTLING_ACK_STATES,
   type AttemptSlot, type DecideFacts, type NoticeKind, type Step,
 } from "./decide.js";
 import { REFUSE_REASONS, REQUEST_ID_RE, SEQ_MAX, renderEnvelope } from "./envelope.js";
@@ -88,8 +90,10 @@ const AFTER_SEND: Record<SendResult, RecordState> = { handed_over: "sent", unkno
 // ---------------------------------------------------------------------------------------------
 // Injected dependencies
 
-/** The report pump's notice sender (src/report/pump.ts `TeleptyPort.inject`), reused; production passes `from` = controller-link. */
-export type NoticePort = Pick<TeleptyPort, "inject">;
+/** The local notice sender (production: runnerNoticePort); `rc` null = killed or no exit status (outcome unknown). */
+export interface NoticePort {
+  inject(dest: string, text: string): InjectResult | Promise<InjectResult>;
+}
 
 export interface PumpDeps extends CliDeps {
   /** Monotonic milliseconds for the per-pass deadline. */
@@ -105,6 +109,8 @@ export interface PumpDeps extends CliDeps {
    * defaultAuditReader), so the deadline kills an audit child too. Absent: `audit` is used as given.
    */
   auditWith?: (runner: ProcessRunner) => AuditReader;
+  /** CL3-04: builds the notice port over the same deadline-bounded runner (production: runnerNoticePort). Absent: `notice`. */
+  noticeWith?: (runner: ProcessRunner) => NoticePort;
   /** Tests only: stop `--loop` after this many passes. */
   maxPasses?: number;
 }
@@ -118,8 +124,6 @@ export interface PassResult {
   verified: number;
   /** Steps due but left for the next pass (budget or deadline). */
   deferred: number;
-  deleted_records: number;
-  deleted_raws: number;
   errors: string[];
   lines: string[];
 }
@@ -140,6 +144,7 @@ interface PumpCtx extends SendCtx {
   res: PassResult;
   runner: ProcessRunner;
   audit: AuditReader;
+  notice: NoticePort;
 }
 
 interface PendingSend {
@@ -219,11 +224,11 @@ function refreshNext(c: SendCtx, rec: LinkRecord, nowMs: number, lastSend: SendA
   rec.next_action = na;
 }
 
-/** Counts a notice in the record's series (`notices.series`) and in the U2 `notices` counters. */
+/** Counts a notice in its kind's slot (`notices.series` or `notices.once`, CL3-03) and in the U2 `notices` counters. */
 function countNotice(rec: LinkRecord, kind: NoticeKind, anchor: string, atIso: string, submit: string, injectId: string | null): number {
-  const s = noticeSeriesOf(rec);
+  const s = noticeSeriesOf(rec, noticeSlot(kind));
   const n = (s !== null && s.kind === kind && s.anchor === anchor ? s.n : 0) + 1;
-  rec.notices.series = { kind, anchor, n, last_at: atIso, last_submit: submit, last_inject_id: injectId };
+  rec.notices[noticeSlot(kind)] = { kind, anchor, n, last_at: atIso, last_submit: submit, last_inject_id: injectId };
   rec.notices.n += 1;
   rec.notices.last_at = atIso;
   return n;
@@ -439,32 +444,44 @@ export function renderControllerNotice(rec: LinkRecord, kind: NoticeKind, n: num
     `sender_task=${rec.sender_task} receiver_task=${rec.receiver_task ?? "-"} n=${n} — ${what[kind]}\nnext: ${SHIM} status --request ${id}`;
 }
 
-async function doRemind(c: PumpCtx, rec: LinkRecord, step: Extract<Step, { kind: "remind" }>): Promise<void> {
+/**
+ * §9.1 / CL3-04: claim, re-check the pass deadline (the claim's lock wait may have used the notice's time: then the
+ * claim is released unsent and uncounted and the notice is left for the next pass), inject through the pass runner,
+ * then settle the claim. Returns the record after the settlement, or null when nothing was posted.
+ */
+async function doRemind(c: PumpCtx, rec: LinkRecord, step: Extract<Step, { kind: "remind" }>): Promise<LinkRecord | null> {
   const claimed = await underSameStep<{ rec: LinkRecord; at: string }>(c, rec, step, (cur, nowIso) => {
     const next = clone(cur);
     next.notices.claim = { owner: c.owner, at: nowIso, kind: step.notice, anchor: step.anchor };
     return { write: next, value: { rec: next, at: nowIso } };
   });
-  if (claimed === null) return;
-  c.res.notices += 1;
-  const s = noticeSeriesOf(claimed.rec);
-  const n = (s !== null && s.kind === step.notice && s.anchor === step.anchor ? s.n : 0) + 1;
-  const r = c.deps.notice.inject(c.cfg.self.controller_sid, renderControllerNotice(claimed.rec, step.notice, n));
-  const submit = submitOutcome(r);
-  const injectId = parseInjectId(r.stdout) || null;
-  const delivered = r.rc === 0;
-  await c.store.mutate<null>(refOf(rec), (cur) => {
+  if (claimed === null) return null;
+  const settle = (r: InjectResult | null): Promise<LinkRecord | null> => c.store.mutate<LinkRecord | null>(refOf(rec), (cur) => {
     if (cur === null) return { write: null, value: null };
     const claim = noticeClaimOf(cur);
-    if (claim === null || claim.owner !== c.owner || claim.at !== claimed.at) return { write: null, value: null };
+    if (claim === null || claim.owner !== c.owner || claim.at !== claimed.at) return { write: null, value: cur };
     const next = clone(cur);
-    // A notice telepty refused is not counted: it is due again next pass.
-    if (delivered) countNotice(next, claim.kind, claim.anchor, claim.at, submit, injectId);
+    if (r !== null) countNotice(next, claim.kind, claim.anchor, claim.at, submitOutcome(r), parseInjectId(r.stdout) || null);
     next.notices.claim = null;
-    return { write: next, value: null };
+    return { write: next, value: next };
   });
+  if (!noticeFits(c)) {
+    defer(c, rec, step);
+    await settle(null);
+    return null;
+  }
+  c.res.notices += 1;
+  const s = noticeSeriesOf(claimed.rec, noticeSlot(step.notice));
+  const n = (s !== null && s.kind === step.notice && s.anchor === step.anchor ? s.n : 0) + 1;
+  const r = await c.notice.inject(c.cfg.self.controller_sid, renderControllerNotice(claimed.rec, step.notice, n));
+  const submit = submitOutcome(r);
+  const injectId = parseInjectId(r.stdout) || null;
+  // A notice telepty refused (rc ≠ 0) is not counted: it is due again next pass. CL3-04: one killed by its timeout
+  // (rc null) may have been delivered: it is counted with submit=unknown, as an expired claim is, and not re-posted at once.
+  const after = await settle(r.rc === 0 || r.rc === null ? r : null);
   c.res.lines.push(`PUMP_NOTICE request=${rec.request_id} role=${rec.role} kind=${step.notice} n=${n} rc=${r.rc ?? "null"} ` +
     `submit=${submit} inject_id=${injectId ?? "null"}`);
+  return after;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -483,7 +500,7 @@ function auditFits(c: PumpCtx): boolean {
   return c.deps.monoMs() - c.t0 + AUDIT_CHECK_MS <= PASS_WALL_MS;
 }
 
-/** CL-08: the pass's single deadline, checked before every step (local ones included) and before retention. */
+/** CL-08: the pass's single deadline, checked before every step (local ones included). */
 function pastDeadline(c: PumpCtx): boolean {
   return c.deps.monoMs() - c.t0 >= PASS_WALL_MS;
 }
@@ -495,11 +512,14 @@ function defer(c: PumpCtx, rec: LinkRecord, step: Step): void {
 
 async function processRecord(c: PumpCtx, first: LinkRecord): Promise<void> {
   let next: LinkRecord | null = first;
+  let noticed: string | null = null;
   for (let i = 0; i < RECORD_STEPS_MAX; i++) {
     if (next === null) return;
     const rec: LinkRecord = next;
     const step = decide(rec, c.facts(rec, c.deps.clock.nowMs()));
-    if (step.kind === "none" || step.kind === "expire") return;
+    if (step.kind === "none") return;
+    // CL3-03: after a notice only another due notice (the record's other slot) follows in this pass, never the same one.
+    if (noticed !== null && (step.kind !== "remind" || stepKey(step) === noticed)) return;
     if (pastDeadline(c)) {
       defer(c, rec, step);
       return;
@@ -525,56 +545,19 @@ async function processRecord(c: PumpCtx, first: LinkRecord): Promise<void> {
         next = await doVerify(c, rec, step);
         break;
       default:
-        if (noticeFits(c)) await doRemind(c, rec, step);
-        else defer(c, rec, step);
-        return;
+        if (!noticeFits(c)) {
+          defer(c, rec, step);
+          return;
+        }
+        next = await doRemind(c, rec, step);
+        noticed = stepKey(step);
+        break;
     }
-  }
-}
-
-async function unlinkIfPresent(file: string): Promise<boolean> {
-  try {
-    await fsp.unlink(file);
-    return true;
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw new StoreError("STORE_UNAVAILABLE", "retention could not delete a file");
   }
 }
 
 /**
- * §4 retention: under the store lock, delete the selected records first, then the selected raw files.
- * CL-08: the pass deadline is checked before every file; a selected raw is deleted only after every selected
- * record is (a record left behind may name it), and what is left stays selectable for the next pass.
- */
-async function retention(c: PumpCtx): Promise<void> {
-  if (!fs.existsSync(c.store.markerPath)) return; // no store: nothing to delete, and nothing is created
-  const done = await c.store.withLock(async () => {
-    const sel = await c.store.selectRetention();
-    let records = 0;
-    let raws = 0;
-    let stopped = false;
-    for (const ref of sel.records) {
-      if ((stopped = pastDeadline(c))) break;
-      if (await unlinkIfPresent(c.store.recordPath(ref))) records += 1;
-    }
-    for (const sha of stopped ? [] : sel.raws) {
-      if ((stopped = pastDeadline(c))) break;
-      if (await unlinkIfPresent(c.store.rawPath(sha))) raws += 1;
-    }
-    return { records, raws, stopped };
-  });
-  c.res.deleted_records = done.records;
-  c.res.deleted_raws = done.raws;
-  if (done.records + done.raws > 0) c.res.lines.push(`PUMP_RETENTION records=${done.records} raws=${done.raws}`);
-  if (done.stopped) {
-    if (!c.res.errors.includes("pass_deadline")) c.res.errors.push("pass_deadline");
-    c.res.lines.push("PUMP_DEADLINE retention stopped; the rest is deleted by the next pass");
-  }
-}
-
-/**
- * CL-08: the runner every child of this pass uses (a send, an audit query). Its timeout is cut to the time
+ * CL-08: the runner every child of this pass uses (a send, an audit query, a notice). Its timeout is cut to the time
  * left before the pass deadline minus the runner's kill grace (send.ts KILL_GRACE_MS), so the deadline kills
  * the child; with no time left the child is not started. Either way the runner reports rc null: a send is
  * classified `unknown` (send.ts classifySend), an audit query `audit_unavailable` — never a definite refusal.
@@ -624,8 +607,7 @@ async function saveCursor(c: PumpCtx, next: string): Promise<void> {
 /** One pass over every record (SPEC §9). Throws CliError (config) / StoreError (store) for the whole pass. */
 export async function pumpOnce(deps: PumpDeps): Promise<PassResult> {
   const res: PassResult = {
-    records: 0, sends: 0, notices: 0, recovered: 0, stalled: 0, verified: 0, deferred: 0, deleted_records: 0, deleted_raws: 0,
-    errors: [], lines: [],
+    records: 0, sends: 0, notices: 0, recovered: 0, stalled: 0, verified: 0, deferred: 0, errors: [], lines: [],
   };
   const cfg = loadPeerConfig(deps.env, deps.packageRoot);
   const store = new ControllerLinkStore({ root: resolveStoreRoot(deps.env, deps.packageRoot), clock: deps.clock });
@@ -634,6 +616,7 @@ export async function pumpOnce(deps: PumpDeps): Promise<PassResult> {
   const c: PumpCtx = {
     deps, cfg, store, owner: `${deps.proc.pid}@${deps.proc.host}`, t0, res, runner,
     audit: deps.auditWith === undefined ? deps.audit : deps.auditWith(runner),
+    notice: deps.noticeWith === undefined ? deps.notice : deps.noticeWith(runner),
     facts: (rec, nowMs) => ({ nowMs, peerActive: activePeer(cfg, rec.peer) !== null, goneOwners: goneOwnersOf(rec, deps) }),
   };
   const records = (await store.list()).sort(byVisitKey);
@@ -669,21 +652,12 @@ export async function pumpOnce(deps: PumpDeps): Promise<PassResult> {
     if (res.deferred > deferred) resume ??= visitKey(rec);
   }
   if (resume !== null) await saveCursor(c, resume);
-  // CL-08 / CL-18: retention re-reads the whole store, so it starts only before the pass deadline; what it
-  // would delete stays selectable and is deleted by the next pass.
-  if (pastDeadline(c)) {
-    if (!res.errors.includes("pass_deadline")) res.errors.push("pass_deadline");
-    res.lines.push("PUMP_DEADLINE retention is left for the next pass");
-  } else {
-    await retention(c);
-  }
   return res;
 }
 
 function summary(r: PassResult): string {
   return `controller-link pump: records=${r.records} sends=${r.sends} notices=${r.notices} recovered=${r.recovered} ` +
-    `stalled=${r.stalled} verified=${r.verified} deferred=${r.deferred} deleted_records=${r.deleted_records} ` +
-    `deleted_raws=${r.deleted_raws} errors=${r.errors.length > 0 ? r.errors.join(",") : "none"}`;
+    `stalled=${r.stalled} verified=${r.verified} deferred=${r.deferred} errors=${r.errors.length > 0 ? r.errors.join(",") : "none"}`;
 }
 
 async function onePass(deps: PumpDeps): Promise<number> {
@@ -726,13 +700,31 @@ export async function runPump(argv: readonly string[], deps: PumpDeps): Promise<
   }
 }
 
+/**
+ * CL3-04: the local notice inject — the report pump's argv (`inject --submit --no-submit-force --submit-retry 2
+ * --from controller-link <sid> <text>`) and child env — run by a ProcessRunner, so the pass runner cuts its
+ * timeout to the time left and kills it like a send. A spawn failure is rc 127 (not delivered), as the report
+ * pump's port reports it; a kill by the timeout stays rc null (outcome unknown).
+ */
+export function runnerNoticePort(runner: ProcessRunner, bin: string, env: NodeJS.ProcessEnv): NoticePort {
+  return {
+    async inject(dest, text) {
+      const r = await runner.run(bin, ["inject", "--submit", "--no-submit-force", "--submit-retry", "2", "--from", SEND_FROM, dest, text],
+        { env: teleptyChildEnv(env), timeoutMs: NOTICE_TIMEOUT_MS });
+      const spawnFailed = r.rc === null && /\n\[controller-link\] spawn (?:failed|error):/.test(r.stderr);
+      return { rc: spawnFailed ? 127 : r.rc, stdout: r.stdout, stderr: r.stderr };
+    },
+  };
+}
+
 /** Production pump ports added to the CLI's dependencies. */
 export function defaultPumpDeps(cli: CliDeps): PumpDeps {
   return {
     ...cli,
     monoMs: () => performance.now(),
     pidAlive: defaultPidAlive,
-    notice: defaultTeleptyPort(cli.teleptyBin, SEND_FROM),
+    notice: runnerNoticePort(cli.runner, cli.teleptyBin, cli.env),
+    noticeWith: (runner) => runnerNoticePort(runner, cli.teleptyBin, cli.env),
     auditWith: (runner) => defaultAuditReader(runner, cli.teleptyBin, cli.env),
     sleep: (msv) => new Promise<void>((resolve) => { setTimeout(resolve, msv); }),
     localHosts: [...new Set([cli.proc.host, os.hostname()])],

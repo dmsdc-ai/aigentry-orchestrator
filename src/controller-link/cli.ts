@@ -8,6 +8,7 @@
 //   bin/controller-link.sh probe   --request <U>
 //   bin/controller-link.sh close   --request <U>
 //   bin/controller-link.sh handled --request <U> --ref REPLY-<n>         (review CL-09)
+//   bin/controller-link.sh pickup  --request <U> (--ref <REQUEST-1|REPLY-n> | --copy <sha256>)   (review CL3-01/06)
 //
 // A remote request never carries authority. This file has no code path that registers a task,
 // writes a task queue, dispatches or spawns a worker, or reads or changes credentials: `bind` only
@@ -32,8 +33,8 @@ import { fileURLToPath } from "node:url";
 // loadTaskQueueReader(), after pointing it where bin/dispatch.sh points it (review CL-06).
 import type { TaskQueueResult } from "../dispatch/task-queue-read.js";
 import {
-  INGEST_MAX_BYTES, LABEL_RE, REFUSE_REASONS, REPLY_MAX_SEQ, REPLY_OUTCOMES, REQUEST_ID_RE, SEQ_MAX, TASK_ID_RE,
-  normaliseBody, renderEnvelope, scanInput,
+  DEVICE_LABEL_RE, HEX64_RE, INGEST_MAX_BYTES, LABEL_RE, REFUSE_REASONS, REPLY_MAX_SEQ, REPLY_OUTCOMES, REQUEST_ID_RE, SEQ_MAX,
+  TASK_ID_RE, normaliseBody, parseEnvelope, renderEnvelope, scanInput,
   type AckState, type Envelope, type EnvelopeFields, type EnvelopeResult, type RefuseReason, type ReplyOutcome,
 } from "./envelope.js";
 import {
@@ -42,7 +43,7 @@ import {
 } from "./send.js";
 import {
   ADMIT_MAX_AGE_MS, ADMIT_MAX_AHEAD_MS, ControllerLinkStore, MESSAGE_KEY_RE, RECORDLESS_ANSWERS_MAX, StoreError, awaitingPickup,
-  isTerminal, rawRef, resolveStoreRoot, statusOf,
+  isTerminal, rawRef, rawsNamedBy, resolveStoreRoot, statusOf,
   type LinkRecord, type MessageEntry, type RecordRef, type RecordState, type Role, type SendAttempt, type StatusEntry,
   type UnverifiedCopy,
 } from "./store.js";
@@ -53,9 +54,8 @@ import { awaitingIngest } from "./decide.js";
 // Constants
 
 /**
- * §8.1 step 2: a REQUEST or REPLY sent more than 25 days before now is STALE_MESSAGE. The same bound (store.ts
- * ADMIT_MAX_AGE_MS) decides which inbox records retention may delete, and the request floor that retention
- * raises keeps a deleted REQUEST key from being admitted again after a clock correction (review CL-07).
+ * §8.1 step 2: a REQUEST or REPLY sent more than 25 days before now is STALE_MESSAGE (store.ts ADMIT_MAX_AGE_MS).
+ * Nothing is deleted automatically (v1, CL3-02); the setup guide's manual removal rule uses this bound.
  */
 export const STALE_MESSAGE_MS = ADMIT_MAX_AGE_MS;
 /** A REQUEST or REPLY whose `sent_at` is more than this AFTER now is STALE_MESSAGE too (review CL-07). */
@@ -101,8 +101,10 @@ export const USAGE = [
   "  probe   --request <U>                     ask the peer for the state of your last obligation message",
   "  close   --request <U>                     close a stalled record",
   "  handled --request <U> --ref REPLY-<n>     you have recorded that REPLY on your own task; it is not shown again",
+  "  pickup  --request <U> --ref <REQUEST-1|REPLY-n>   show again / apply what status lists as awaiting you",
+  "  pickup  --request <U> --copy <sha256>     apply a stored copy status lists as found corroborated by the pump",
   "  resend  --request <U> --reason \"<text>\"   re-send a stalled record's message (same bytes); reason kept in history",
-  "  pump    --once | --loop <seconds>         probes, same-byte re-sends, reminders, retention (off: AIGENTRY_CONTROLLER_LINK_PUMP=0)",
+  "  pump    --once | --loop <seconds>         probes, same-byte re-sends, reminders (off: AIGENTRY_CONTROLLER_LINK_PUMP=0)",
   "",
   "exit: 0 ok | 3 refused, nothing changed | 4 refused, nothing stored | 5 stored, not actionable",
   "      7 delivery unknown | 9 store/config failure | 11 not delivered",
@@ -161,6 +163,11 @@ export function peersConfigPath(env: Record<string, string | undefined>, package
   return path.resolve(override);
 }
 
+/** CL3-05: the one label rule (envelope.ts LABEL_RE) refuses a Windows device name at setup, on every platform. */
+const deviceLabel = (what: string): string =>
+  `${what} is a Windows device name (con, prn, aux, nul, com0-9, lpt0-9), which cannot be an inbox directory on Windows; ` +
+  "it is refused on every platform";
+
 /** SPEC §2 validation. Any failure is PEER_CONFIG_INVALID. */
 export function parsePeerConfig(text: string): PeerConfig {
   let v: unknown;
@@ -173,12 +180,14 @@ export function parsePeerConfig(text: string): PeerConfig {
   if (v.v !== 1) return badConfig("v must be 1");
   const self = v.self;
   if (!isObj(self) || !onlyKeys(self, ["label", "controller_sid"])) return badConfig("self must be {label, controller_sid}");
+  if (typeof self.label === "string" && DEVICE_LABEL_RE.test(self.label)) return badConfig(deviceLabel("self.label"));
   if (typeof self.label !== "string" || !LABEL_RE.test(self.label)) return badConfig("self.label fails its pattern");
   if (typeof self.controller_sid !== "string" || !SID_RE.test(self.controller_sid)) return badConfig("self.controller_sid fails its pattern");
   if (!isObj(v.peers)) return badConfig("peers must be an object");
   const peers: Record<string, PeerEntry> = {};
   const targets = new Set<string>();
   for (const [label, p] of Object.entries(v.peers)) {
+    if (DEVICE_LABEL_RE.test(label)) return badConfig(deviceLabel(`peer label ${label}`));
     if (!LABEL_RE.test(label)) return badConfig("a peer label fails its pattern");
     if (!isObj(p) || !onlyKeys(p, ["target", "link"])) return badConfig(`peer ${label} must be {target, link}`);
     if (typeof p.target !== "string" || !validPeerTarget(p.target)) return badConfig(`peer ${label} target is not <controller_sid>@<peer>`);
@@ -423,7 +432,8 @@ export interface CliDeps {
 
 interface Ctx {
   deps: CliDeps;
-  cfg: PeerConfig;
+  /** Loaded before the command runs, except for the store-only commands (STORE_ONLY), where nothing reads it. */
+  readonly cfg: PeerConfig;
   store: ControllerLinkStore;
   owner: string;
 }
@@ -581,7 +591,11 @@ const FLAGS: Record<string, { value: readonly string[]; bool: readonly string[] 
   probe: { value: ["--request"], bool: [] },
   close: { value: ["--request"], bool: [] },
   handled: { value: ["--request", "--ref"], bool: [] },
+  pickup: { value: ["--request", "--ref", "--copy"], bool: [] },
 };
+
+/** CL3-01: commands that only read or change the local store; they never read the peers file. */
+const STORE_ONLY: ReadonlySet<string> = new Set(["status", "handled", "pickup"]);
 
 interface Args {
   cmd: string;
@@ -686,19 +700,22 @@ const handledNext = (id: string, key: string): string =>
   `${SHIM} handled --request ${id} --ref ${key}  # after you have recorded this REPLY on your own task`;
 
 /**
- * CL-07 / §8.1 step 2: why a REQUEST or REPLY with this `sent_at` is not admissible now, or null. One bound for
- * all three checks (store.ts ADMIT_MAX_AGE_MS / ADMIT_MAX_AHEAD_MS and the request floor retention raised).
+ * CL-07 / §8.1 step 2: why a REQUEST or REPLY with this `sent_at` is not admissible now, or null (store.ts
+ * ADMIT_MAX_AGE_MS / ADMIT_MAX_AHEAD_MS). Fresh admission only: `pickup` never runs it (CL3-01).
  */
-function admissionRefusal(sentAt: string, nowMs: number, floorMs: number | null): string | null {
+function admissionRefusal(sentAt: string, nowMs: number): string | null {
   const s = Date.parse(sentAt);
   if (nowMs - s > STALE_MESSAGE_MS) return `sent_at ${sentAt} is more than 25 days ago`;
   if (s - nowMs > FUTURE_SKEW_MS) return `sent_at ${sentAt} is more than 1 day ahead of this machine's clock`;
-  if (floorMs !== null && s <= floorMs) {
-    return `sent_at ${sentAt} is not after ${new Date(floorMs).toISOString()}, the newest request this store's retention ` +
-      "deleted: a copy this old could be applied a second time";
-  }
   return null;
 }
+
+/**
+ * CL3-01: `pickup` hands a stored copy to the same application code as `ingest` with this in place of a fresh audit
+ * result: no audit is read. Only the evidence already in the record (the stored corroboration, or the pump's mark
+ * read through decide.ts awaitingIngest) can make it applicable.
+ */
+const STORED_ONLY: CorroborationResult = { state: "not_found", inject_id: null };
 
 const none = (result: IngestResult, rec: LinkRecord | null, note: string | null = null): Applied =>
   ({ result, rec, pending: null, answer: null, showBody: false, note });
@@ -770,10 +787,17 @@ function dropUnverifiedCopy(rec: LinkRecord, sha256: string): void {
   rec.unverified_copies = rec.unverified_copies.filter((u) => u.sha256 !== sha256);
 }
 
-async function ingestRequest(c: Ctx, e: Envelope, peer: PeerEntry, corr: CorroborationResult): Promise<Applied> {
+/**
+ * The application of a REQUEST, shared by `ingest` (fresh admission done, `local` false) and `pickup` (`local` true:
+ * a copy already stored; no record is created and no acknowledgement is sent, so no peer entry is read; the peer
+ * learns the new state from its next probe, which ingest answers from the record).
+ */
+async function ingestRequest(c: Ctx, e: Envelope, peer: PeerEntry | null, corr: CorroborationResult, local = false): Promise<Applied> {
   const f = e.fields;
   const ref: RecordRef = { role: "receiver", peer: f.from, requestId: f.id };
   const raw = { sha256: e.sha256, bytes: Buffer.from(e.text, "utf8") };
+  const ack = (rec: LinkRecord, m: { nowMs: number; nowIso: string }): PendingSend | null =>
+    local ? null : addAck(c, rec, "REQUEST-1", "received", null, m.nowMs, m.nowIso);
   return c.store.mutate<Applied>(ref, async (cur, m) => {
     // Pickup (coder B contract, CL-05/CL-10): this machine's pump already found these exact bytes in its own audit
     // (notices.corroborated, read through decide.ts awaitingIngest). That is the same evidence; it stands in for an
@@ -786,11 +810,13 @@ async function ingestRequest(c: Ctx, e: Envelope, peer: PeerEntry, corr: Corrobo
         : { state: corr.state, at: m.nowIso, inject_id: corr.inject_id, checks: 1 },
     };
     if (cur === null) {
-      // CL-07: re-checked under the store lock, where retention also runs, with this transaction's clock.
-      const why = admissionRefusal(f.sent_at, m.nowMs, await c.store.requestFloorMs());
+      const admitted = peer; // pickup (`local`) never creates a record
+      if (local || admitted === null) throw new CliError("STATE_INVALID", `request ${f.id} has no inbox record any more`);
+      // CL-07: the fresh admission bound is re-checked under the store lock with this transaction's clock.
+      const why = admissionRefusal(f.sent_at, m.nowMs);
       if (why !== null) return { write: null, value: none("STALE_MESSAGE", null, why) };
-      const rec = newReceiverRecord(c, e, peer, entry, corroborated, m.nowIso);
-      const pending = corroborated ? addAck(c, rec, "REQUEST-1", "received", null, m.nowMs, m.nowIso) : null;
+      const rec = newReceiverRecord(c, e, admitted, entry, corroborated, m.nowIso);
+      const pending = corroborated ? ack(rec, m) : null;
       return { write: rec, raws: [raw], value: { result: corroborated ? "NEW" : "UNVERIFIED", rec, pending,
         answer: corroborated ? "received" : null, showBody: corroborated, note: null } };
     }
@@ -805,7 +831,7 @@ async function ingestRequest(c: Ctx, e: Envelope, peer: PeerEntry, corr: Corrobo
         rec.messages["REQUEST-1"] = { ...stored, corroboration: entry.corroboration! };
         setState(rec, "received", m.nowIso);
         addHistory(rec, m.nowIso, "corroborated", `sha256=${e.sha256}`);
-        const pending = addAck(c, rec, "REQUEST-1", "received", null, m.nowMs, m.nowIso);
+        const pending = ack(rec, m);
         return { write: rec, value: { result: "NEW", rec, pending, answer: "received", showBody: true, note: null } };
       }
       // CL-09: the request was recorded (and its ACK sent) by an earlier ingest whose output may never have been
@@ -822,7 +848,7 @@ async function ingestRequest(c: Ctx, e: Envelope, peer: PeerEntry, corr: Corrobo
       rec.sender_task = f.sender_task ?? "-";
       dropUnverifiedCopy(rec, e.sha256);
       setState(rec, "received", m.nowIso);
-      const pending = addAck(c, rec, "REQUEST-1", "received", null, m.nowMs, m.nowIso);
+      const pending = ack(rec, m);
       return { write: rec, raws: [raw], value: { result: "NEW", rec, pending, answer: "received", showBody: true, note: null } };
     }
     if (corroborated && storedCorroborated) {
@@ -844,7 +870,8 @@ async function exists(c: Ctx, ref: RecordRef, peer: string): Promise<boolean> {
   return r !== null && r.peer === peer;
 }
 
-async function ingestReply(c: Ctx, e: Envelope, corr: CorroborationResult): Promise<Applied> {
+/** The application of a REPLY at the sender, shared by `ingest` and `pickup` (`local`: as for ingestRequest). */
+async function ingestReply(c: Ctx, e: Envelope, corr: CorroborationResult, local = false): Promise<Applied> {
   const f = e.fields;
   const ref: RecordRef = { role: "sender", requestId: f.id };
   const corroborated = corr.state === "corroborated";
@@ -862,7 +889,7 @@ async function ingestReply(c: Ctx, e: Envelope, corr: CorroborationResult): Prom
       const again = existing.pickup === "awaiting";
       const result: IngestResult = again ? "AWAITING" : "DUPLICATE";
       const next = again ? handledNext(f.id, key) : null;
-      if (!verified) return { write: null, value: { ...none(result, cur), showBody: again, next } };
+      if (!verified || local) return { write: null, value: { ...none(result, cur), showBody: again, next } };
       const rec = clone(cur);
       const pending = addAck(c, rec, key, "received", null, m.nowMs, m.nowIso);
       return { write: rec, value: { result, rec, pending, answer: "received", showBody: again, note: null, next } };
@@ -890,11 +917,11 @@ async function ingestReply(c: Ctx, e: Envelope, corr: CorroborationResult): Prom
       const to: RecordState = f.final === "yes" ? "replied" : "accepted";
       if (to !== rec.state) setState(rec, to, m.nowIso);
     }
-    const pending = addAck(c, rec, key, "received", null, m.nowMs, m.nowIso);
+    const pending = local ? null : addAck(c, rec, key, "received", null, m.nowMs, m.nowIso);
     return { write: rec, raws: [raw], value: { result: "NEW", rec, pending, answer: "received", showBody: true, note: null,
       next: handledNext(f.id, key) } };
   });
-  if (applied.result === "UNKNOWN_REQUEST" && corroborated) {
+  if (applied.result === "UNKNOWN_REQUEST" && corroborated && !local) {
     // No record: answer ACK unknown (seq 1; there is no record to keep a counter in), store nothing.
     const peer = activePeer(c.cfg, f.from)!;
     const env = mustRender(renderEnvelope(ackFields(f.id, 1, key, c.cfg.self.label, f.from, c.deps.clock.nowMs(),
@@ -964,8 +991,9 @@ async function ingestProbe(c: Ctx, e: Envelope, peer: PeerEntry): Promise<Applie
     const claim = await c.store.claimRecordlessAnswer(f.from, f.id, probeRef, PROBE_ANSWER_INTERVAL_MS);
     if (claim === "recent") return none("DUPLICATE", null);
     if (claim === "full") {
-      return none("LINK_CAPACITY", null, `probe not answered: ${RECORDLESS_ANSWERS_MAX} probes about requests this side has ` +
-        "no record of were answered in the last 60 s, the limit; the peer's next probe is answered once that falls");
+      return none("LINK_CAPACITY", null, `probe not answered: the table of answers to probes about requests this side has no ` +
+        `record of holds ${RECORDLESS_ANSWERS_MAX} entries claimed in the last 60 s, the limit (a claim is written before its ` +
+        "answer is sent); a probe that arrives after older entries have dropped out can be answered");
     }
     const env = mustRender(renderEnvelope(ackFields(f.id, 1, probeRef, c.cfg.self.label, f.from, c.deps.clock.nowMs(),
       f.sender_task, f.receiver_task, "unknown", null), ""));
@@ -986,10 +1014,7 @@ async function ingestBlock(c: Ctx, parsed: EnvelopeResult): Promise<BlockOutcome
   if (peer === null) return refuse("PEER_UNKNOWN", `from=${f.from}: ${inactiveWhy(c.cfg, f.from)}`);
   const nowMs = c.deps.clock.nowMs();
   if (f.kind === "REQUEST" || f.kind === "REPLY") {
-    // CL-07: the age and clock bounds first, then (a REQUEST only) the store's request floor; ingestRequest checks
-    // all three again under the store lock before it creates a record.
-    let why = admissionRefusal(f.sent_at, nowMs, null);
-    if (why === null && f.kind === "REQUEST") why = admissionRefusal(f.sent_at, nowMs, await c.store.requestFloorMs());
+    const why = admissionRefusal(f.sent_at, nowMs);
     if (why !== null) return refuse("STALE_MESSAGE", why);
   }
   const corr: CorroborationResult = f.kind === "PROBE"
@@ -1002,6 +1027,13 @@ async function ingestBlock(c: Ctx, parsed: EnvelopeResult): Promise<BlockOutcome
     case "ACK": applied = await ingestAck(c, e, corr); break;
     default: applied = await ingestProbe(c, e, peer); break;
   }
+  return outcomeOf(c, e, applied, corr.state !== "corroborated" && f.kind !== "PROBE" && applied.result === "UNVERIFIED"
+    ? `corroboration=${corr.state}` : null);
+}
+
+/** The printed block of an applied envelope, shared by `ingest` and `pickup`; sends the answer, if any. */
+async function outcomeOf(c: Ctx, e: Envelope, applied: Applied, note: string | null): Promise<BlockOutcome> {
+  const f = e.fields;
   // The block is committed. A store failure while writing the answer's send result must not hide it
   // (review CL-09): the block is still printed in full; cmdIngest reports the failure separately.
   const failed: { ackNotRecorded?: StoreError } = {};
@@ -1009,12 +1041,12 @@ async function ingestBlock(c: Ctx, parsed: EnvelopeResult): Promise<BlockOutcome
   const rec = applied.rec;
   return {
     ...failed,
-    result: applied.result, ...head, state: rec?.state ?? "-", answer: applied.pending !== null ? applied.answer : null, send,
+    result: applied.result, kind: f.kind, id: f.id, seq: String(f.seq), peer: f.from, state: rec?.state ?? "-",
+    answer: applied.pending !== null ? applied.answer : null, send,
     next: applied.next !== undefined ? applied.next
       : (applied.result === "NEW" || applied.result === "AWAITING") && rec !== null ? rec.next_action.text : null,
     body: applied.showBody ? { from: f.from, sha256: e.body_sha256, bytes: e.body_bytes, text: e.body } : null,
-    note: applied.note ?? (corr.state !== "corroborated" && f.kind !== "PROBE" && applied.result === "UNVERIFIED"
-      ? `corroboration=${corr.state}` : null),
+    note: applied.note ?? note,
   };
 }
 
@@ -1049,9 +1081,11 @@ async function cmdIngest(c: Ctx): Promise<number> {
     } catch (e) {
       if (!(e instanceof StoreError)) throw e;
       c.deps.out(`RESULT=${e.code} kind=- id=- seq=- peer=- state=-`);
-      // CL-09: a record may already be written (an atomic rename can precede the failure it reports).
-      c.deps.err(`controller-link: ${e.message}; remaining blocks not processed; once the store works, run ingest again on ` +
-        "the same saved message: a REQUEST or REPLY recorded before the failure is shown again as RESULT=AWAITING");
+      // CL-09 / CL3-09: whether this block was recorded is not known here (an atomic rename can precede the failure it
+      // reports); status, read from the records, says what still awaits the controller.
+      c.deps.err(`controller-link: ${e.message}; this block may or may not have been recorded; remaining blocks not ` +
+        `processed; once the store works, run \`${SHIM} status\`: anything recorded that still awaits you is listed there ` +
+        "with its pickup command");
       exit = worseExit(exit, EXIT.STORE);
       break;
     }
@@ -1201,25 +1235,21 @@ export function statusLine(s: StatusEntry): string {
 }
 
 /**
- * CL-09 / CL-10: what in this record awaits the controller's own action, each as the fixed command that shows it
- * (again), built from the record and the store root only: a REQUEST in `received` (not yet bound or refused), a
- * stored REPLY not yet `handled`, and a stored copy the pump found corroborated that no ingest has applied yet.
- * The path is the content-addressed raw file of those exact bytes, so the command shows nothing else.
+ * CL-09 / CL-10 / CL3-06: what in this record awaits the controller's own action, each as ONE fixed command built only
+ * from the wrapper name and validated tokens (the request id, a message key, a sha256 the record validation checked):
+ * no file path, no quoting, no stored free text. A REQUEST in `received` (not yet bound or refused) and a stored REPLY
+ * not yet `handled` are `pickup --ref <key>`; a stored copy the pump found corroborated and nothing has applied yet is
+ * `pickup --copy <sha256>`. `pickup` reads the record and that raw file only.
  */
-export function awaitingCommands(store: ControllerLinkStore, rec: LinkRecord): string[] {
-  const show = (sha: string, what: string): string => `${SHIM} ingest < "${store.rawPath(sha)}"  # ${what}`;
+export function awaitingCommands(rec: LinkRecord): string[] {
+  const pickup = (arg: string): string => `${SHIM} pickup --request ${rec.request_id} ${arg}`;
   const out: string[] = [];
   const req = rec.messages["REQUEST-1"];
   if (rec.role === "receiver" && rec.state === "received" && req?.corroboration?.state === "corroborated") {
-    out.push(show(req.sha256, "the REQUEST awaits your decision; prints it again as RESULT=AWAITING; then bind or refuse"));
+    out.push(pickup("--ref REQUEST-1"));
   }
-  for (const k of awaitingPickup(rec)) {
-    out.push(show(rec.messages[k]!.sha256, `${k} awaits you; prints it again as RESULT=AWAITING; then ` +
-      `${SHIM} handled --request ${rec.request_id} --ref ${k}`));
-  }
-  for (const sha of awaitingIngest(rec)) {
-    out.push(show(sha, "a stored copy the pump found corroborated, not yet applied; act only on its RESULT=NEW"));
-  }
+  for (const k of awaitingPickup(rec)) out.push(pickup(`--ref ${k}`));
+  for (const sha of awaitingIngest(rec)) out.push(pickup(`--copy ${sha}`));
   return out;
 }
 
@@ -1227,7 +1257,7 @@ async function cmdStatus(c: Ctx, a: Args): Promise<number> {
   const id = requestArg(a, false);
   // Without --request: open records, and terminal ones that still await the controller (CL-09, a REPLY not handled).
   const all = (id === null ? await c.store.list() : await recordsFor(c, id))
-    .map((r) => ({ s: statusOf(r), next: awaitingCommands(c.store, r) }))
+    .map((r) => ({ s: statusOf(r), next: awaitingCommands(r) }))
     .filter((x) => id !== null || !x.s.terminal || x.next.length > 0);
   if (id !== null && all.length === 0) throw new CliError("STATE_INVALID", `no record for request ${id}`);
   const rows = [...all].sort((x, y) => (y.s.due_at ?? "").localeCompare(x.s.due_at ?? "") || x.s.request_id.localeCompare(y.s.request_id));
@@ -1248,17 +1278,61 @@ async function cmdHandled(c: Ctx, a: Args): Promise<number> {
   if (!key.startsWith("REPLY-") || !MESSAGE_KEY_RE.test(key)) throw new CliError("USAGE", "--ref must be REPLY-<1..32>");
   const found = await oneRecord(c, id, "sender");
   if (found.messages[key]?.pickup !== "awaiting") throw new CliError("STATE_INVALID", `request ${id} has no ${key} awaiting handled`);
-  await c.store.mutate<null>(refOf(found), (cur, m) => {
+  // CL3-09: the state printed is the one this command committed with, read under the lock.
+  const state = await c.store.mutate<RecordState>(refOf(found), (cur, m) => {
     if (cur === null || cur.messages[key]?.pickup !== "awaiting") {
       throw new CliError("STATE_INVALID", `request ${id} has no ${key} awaiting handled any more`);
     }
     const rec = clone(cur);
     rec.messages[key]!.pickup = "handled";
     addHistory(rec, m.nowIso, "handled", key);
-    return { write: rec, value: null };
+    return { write: rec, value: rec.state };
   });
-  c.deps.out(`OK handled request=${id} ref=${key} state=${found.state}`);
+  c.deps.out(`OK handled request=${id} ref=${key} state=${state}`);
   return EXIT.OK;
+}
+
+/**
+ * CL3-01 / CL3-06: shows again, or applies, one thing `status` lists as awaiting the controller, from the store alone.
+ * It reads the record and the raw file it names; it runs no fresh admission (no sent_at window, no peer
+ * configuration, no audit query: those were decided when the copy was stored) and sends nothing. Checks that run:
+ * the raw file's bytes hash to the name the record gives them (store readRaw), they parse as the envelope the record
+ * says they are (id, kind and seq, from = the record's peer, to = the record's own label), and then the same
+ * application code as `ingest` (ingestRequest / ingestReply), under the store lock, decides from the record's
+ * current state. A second pickup cannot apply twice: RESULT=NEW needs, under the lock, a REQUEST-1 not yet
+ * corroborated or a REPLY key with no stored message, and the first NEW commits the corroborated REQUEST-1 or the
+ * REPLY message in the same atomic record write, so a repeat finds it and prints AWAITING or DUPLICATE.
+ */
+async function cmdPickup(c: Ctx, a: Args): Promise<number> {
+  const id = requestArg(a, true)!;
+  const ref = a.v.get("--ref");
+  const copy = a.v.get("--copy");
+  if ((ref === undefined) === (copy === undefined)) {
+    throw new CliError("USAGE", "exactly one of --ref <REQUEST-1|REPLY-n> or --copy <sha256> is required");
+  }
+  if (ref !== undefined && !MESSAGE_KEY_RE.test(ref)) throw new CliError("USAGE", "--ref must be REQUEST-1 or REPLY-<1..32>");
+  if (copy !== undefined && !HEX64_RE.test(copy)) throw new CliError("USAGE", "--copy must be a sha256 (64 lowercase hex characters)");
+  const role: Role | null = ref === undefined ? null : ref === "REQUEST-1" ? "receiver" : "sender";
+  const recs = (await recordsFor(c, id)).filter((r) => (role === null || r.role === role)
+    && (ref !== undefined ? r.messages[ref] !== undefined : rawsNamedBy(r).includes(copy!)));
+  if (recs.length === 0) throw new CliError("STATE_INVALID", `request ${id} has no stored ${ref ?? `copy ${copy}`}; nothing changed`);
+  if (recs.length > 1) throw new CliError("STATE_INVALID", `request ${id} names more than one record; nothing changed`);
+  const rec = recs[0]!;
+  const sha = ref !== undefined ? rec.messages[ref]!.sha256 : copy!;
+  const bytes = await c.store.readRaw(sha);
+  if (bytes === null) throw new StoreError("STORE_CORRUPT", `the record of request ${id} names raw/${sha}.env, which is missing`);
+  const parsed = parseEnvelope(bytes.toString("utf8"));
+  const e = parsed.ok ? parsed.envelope : null;
+  const key = e === null ? null : e.fields.kind === "REQUEST" ? "REQUEST-1" : e.fields.kind === "REPLY" ? `REPLY-${e.fields.seq}` : null;
+  if (e === null || key === null || e.sha256 !== sha || e.fields.id !== id || e.fields.from !== rec.peer
+    || e.fields.to !== rec.self_label || (key === "REQUEST-1") !== (rec.role === "receiver") || (ref !== undefined && key !== ref)) {
+    throw new StoreError("STORE_CORRUPT", `the stored copy raw/${sha}.env is not the message the record of request ${id} names`);
+  }
+  const applied = rec.role === "receiver" ? await ingestRequest(c, e, null, STORED_ONLY, true) : await ingestReply(c, e, STORED_ONLY, true);
+  const o = await outcomeOf(c, e, applied, applied.result === "UNVERIFIED"
+    ? "this stored copy is not corroborated by any check recorded for it; nothing applied" : null);
+  printBlock(c, o);
+  return ingestExitOf(o.result);
 }
 
 /** The message a probe asks about: REQUEST-1 for a sender; for a receiver the newest REPLY not ACKed `received`. */
@@ -1326,9 +1400,12 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
   if (argv[0] === "resend") return (await import("./pump.js")).runResendCli(argv.slice(1), deps);
   try {
     const args = parseArgs(argv);
-    const cfg = loadPeerConfig(deps.env, deps.packageRoot);
+    let cfg: PeerConfig | null = STORE_ONLY.has(args.cmd) ? null : loadPeerConfig(deps.env, deps.packageRoot);
     const store = new ControllerLinkStore({ root: resolveStoreRoot(deps.env, deps.packageRoot), clock: deps.clock });
-    const c: Ctx = { deps, cfg, store, owner: `${deps.proc.pid}@${deps.proc.host}` };
+    const c: Ctx = {
+      deps, store, owner: `${deps.proc.pid}@${deps.proc.host}`,
+      get cfg(): PeerConfig { return cfg ??= loadPeerConfig(deps.env, deps.packageRoot); },
+    };
     switch (args.cmd) {
       case "ingest": return await cmdIngest(c);
       case "bind": return await cmdBind(c, args);
@@ -1337,6 +1414,7 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
       case "status": return await cmdStatus(c, args);
       case "probe": return await cmdProbe(c, args);
       case "handled": return await cmdHandled(c, args);
+      case "pickup": return await cmdPickup(c, args);
       default: return await cmdClose(c, args);
     }
   } catch (e) {
