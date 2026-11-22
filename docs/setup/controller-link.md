@@ -349,28 +349,22 @@ Nothing in controller-link deletes anything: there is no retention, no expiry an
 unreferenced files. Every record and every stored envelope stays in `state/controller-link/` until a
 human removes it.
 
-How large it can grow, by the limits the code enforces: a record file is at most 262144 bytes (256 KiB)
-and one stored envelope at most 16384 bytes (16 KiB). One request names at most 37 stored envelopes (its
-REQUEST, up to 32 REPLYs and up to 4 unverified copies), so one request takes at most about
+What the code bounds: a record file is at most 262144 bytes (256 KiB) and one stored envelope at most
+16384 bytes (16 KiB). One record names at most 37 stored envelopes (its REQUEST, up to 32 REPLYs and up
+to 4 unverified copies), so one record together with the envelopes it names takes at most about
 256 KiB + 37 × 16 KiB = 848 KiB; a usual request (one REQUEST and one REPLY, short bodies) takes a few
 KiB. Acknowledgements and probes are never stored as envelopes. `probe-answers.json` holds at most 256
 short entries.
 
-A finished request's files may be removed when all of these hold:
+What the code does not bound: the total size of `state/controller-link/`. Finished records accumulate,
+and so do stored envelopes that no record names any more (a replaced unverified copy, or a file written
+just before an interrupted record write). 848 KiB is therefore not a limit on the disk use of one
+request, and there is no limit on the whole store.
 
-1. `bin/controller-link.sh status --request <id>` shows a terminal state (`refused`, `replied` or
-   `closed`) and no `NEXT` line;
-2. its REQUEST's `sent_at` (in the first line of the stored REQUEST envelope) is more than 26 days ago by
-   a correct clock. From then on `ingest` refuses any copy of that REQUEST as `STALE_MESSAGE` (25 days,
-   plus the one day of clock difference the link accepts), so it cannot be applied a second time. Before
-   that, removing an inbox record lets a copy of the same request be applied as new;
-3. no `controller-link` command and no pump pass runs meanwhile (set `AIGENTRY_CONTROLLER_LINK_PUMP=0`).
-
-How: remove the record file first (`state/controller-link/outbox/<id>.json` for a request you sent,
-`state/controller-link/inbox/<peer label>/<id>.json` for one you received), then each
-`state/controller-link/raw/<sha256>.env` that the record named (its `"raw"` values), unless another
-record names it too (search the other record files for the name). Never remove a raw file before its
-record: a record whose raw file is missing is `STORE_CORRUPT` for every later change of it.
+This version has no supported way to remove a request's files. Do not remove them by hand: a record is
+the only evidence that its REQUEST was already applied and the only thing a late REPLY can be matched
+to, and `status` showing a terminal state without a `NEXT` line does not prove that neither can still
+arrive. A removal command that checks this is not part of this version.
 
 ## Rollout order
 
