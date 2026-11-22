@@ -27,7 +27,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { taskQueueStatus, type TaskQueueResult } from "../dispatch/task-queue-read.js";
+// Type only: the reader fixes its queue path when it is first loaded, so production loads it in
+// loadTaskQueueReader(), after pointing it where bin/dispatch.sh points it (review CL-06).
+import type { TaskQueueResult } from "../dispatch/task-queue-read.js";
 import {
   INGEST_MAX_BYTES, LABEL_RE, REFUSE_REASONS, REPLY_MAX_SEQ, REPLY_OUTCOMES, REQUEST_ID_RE, SEQ_MAX, TASK_ID_RE,
   normaliseBody, renderEnvelope, scanInput,
@@ -48,6 +50,12 @@ import {
 
 /** §8.1 step 2: a REQUEST or REPLY sent more than 25 days before now is STALE_MESSAGE. */
 export const STALE_MESSAGE_MS = 25 * 86_400 * 1000;
+/**
+ * A REQUEST or REPLY whose `sent_at` is more than this AFTER now is STALE_MESSAGE too (review CL-07). With the
+ * 25-day bound an exact copy is admissible for at most 26 days after its first arrival, inside the 30 days the
+ * store keeps its key (store.ts selectRetention, measured from the later of state_at and ingested_at).
+ */
+export const FUTURE_SKEW_MS = 86_400 * 1000;
 /** §8.1 step 3: the audit query window, page size and page limit. */
 export const AUDIT_WINDOW_MS = 48 * 3_600 * 1000;
 export const AUDIT_PAGE_LIMIT = 200;
@@ -230,7 +238,13 @@ export interface CorroborationResult {
   pages: number;
 }
 
-/** True iff the row shows exactly these bytes arriving cross-host from controller-link at this controller. */
+/**
+ * True iff this machine's own audit row names exactly these bytes (`payload_sha256`), addressed to this
+ * controller (`to`), with the daemon's `claimed_cross_host` flag true and a `success` or `queued` result.
+ * `claimed_from` is the sender claim the daemon recorded: a string other than `controller-link` fails; a row
+ * without a string value passes, relying on the query's `--from controller-link` filter. The check proves
+ * neither the sending machine nor that the claim is true; see docs/setup/controller-link.md "Limits".
+ */
 export function rowCorroborates(row: AuditRow, sha256: string, selfSid: string): boolean {
   if (!isObj(row)) return false;
   if (row.payload_sha256 !== sha256) return false;
@@ -449,9 +463,11 @@ function attemptsOf(rec: LinkRecord, slot: Slot): SendAttempt[] | null {
 
 /**
  * §6.1 steps 2–4: (fault after_commit) → one telepty inject through U3 → (fault after_inject) →
- * write the result into the pending attempt. Returns the classification.
+ * write the result into the pending attempt. Returns the classification. With `onResultNotRecorded`,
+ * a StoreError of that last write is handed to it instead of thrown (the attempt stays `pending`,
+ * which the pump's pending recovery settles as `unknown`).
  */
-async function deliver(c: Ctx, p: PendingSend): Promise<SendClassification> {
+async function deliver(c: Ctx, p: PendingSend, onResultNotRecorded?: (e: StoreError) => void): Promise<SendClassification> {
   c.deps.fault?.("after_commit");
   const out = await sendEnvelope(p.target, p.text, { runner: c.deps.runner, bin: c.deps.teleptyBin, baseEnv: c.deps.env });
   const cls: SendClassification = out.attempted
@@ -476,6 +492,9 @@ async function deliver(c: Ctx, p: PendingSend): Promise<SendClassification> {
         rec.next_action = nextActionFor("receiver", "replying", rec.request_id, m.nowIso, cls.result);
       }
       return { write: rec, value: null };
+    }).catch((e: unknown) => {
+      if (onResultNotRecorded === undefined || !(e instanceof StoreError)) throw e;
+      onResultNotRecorded(e);
     });
   }
   return cls;
@@ -606,6 +625,8 @@ interface BlockOutcome {
   next: string | null;
   body: { from: string; sha256: string; bytes: number; text: string } | null;
   note: string | null;
+  /** The answer's send result could not be written after the block was committed (review CL-09). */
+  ackNotRecorded?: StoreError;
 }
 
 interface Applied {
@@ -621,6 +642,8 @@ const none = (result: IngestResult, rec: LinkRecord | null, note: string | null 
   ({ result, rec, pending: null, answer: null, showBody: false, note });
 
 const RECEIVER_ACCEPTED_LIKE = new Set(["accepted", "replying", "replied"]);
+/** Receiver states an uncorroborated REQUEST-1 can be in: `unverified`, and what §9.3 / `close` make of it. */
+const PLACEHOLDER_STATES = new Set(["unverified", "stalled", "closed"]);
 const SENDER_RANK: Record<string, number> = { received: 1, accepted: 2 };
 
 /** §7.1: the sender state an ACK for REQUEST-1 moves to, or null (no change; never backwards). */
@@ -703,8 +726,11 @@ async function ingestRequest(c: Ctx, e: Envelope, peer: PeerEntry, corr: Corrobo
     }
     const stored = cur.messages["REQUEST-1"]!;
     const storedCorroborated = stored.corroboration?.state === "corroborated";
+    // Ownership of the key follows the STORED copy's corroboration: a copy that was never corroborated owns
+    // nothing, also after its `unverified` record stalled or was closed (the only states it can reach).
+    const placeholder = !storedCorroborated && PLACEHOLDER_STATES.has(cur.state);
     if (stored.sha256 === e.sha256) {
-      if (cur.state === "unverified" && corroborated) {
+      if (corroborated && placeholder) {
         const rec = clone(cur);
         rec.messages["REQUEST-1"] = { ...stored, corroboration: entry.corroboration! };
         setState(rec, "received", m.nowIso);
@@ -715,7 +741,7 @@ async function ingestRequest(c: Ctx, e: Envelope, peer: PeerEntry, corr: Corrobo
       return { write: null, value: none("DUPLICATE", cur) };
     }
     // Same key, other bytes.
-    if (corroborated && !storedCorroborated && cur.state === "unverified") {
+    if (corroborated && placeholder) {
       // An unverified copy never claims the key: the corroborated copy replaces it.
       const rec = clone(cur);
       addHistory(rec, m.nowIso, "replaced_unverified", `old sha256=${stored.sha256}`);
@@ -731,7 +757,7 @@ async function ingestRequest(c: Ctx, e: Envelope, peer: PeerEntry, corr: Corrobo
       addHistory(rec, m.nowIso, "conflict", `REQUEST-1 sha256=${e.sha256}`);
       return { write: rec, value: none("CONFLICT", rec, "a second corroborated REQUEST with other bytes; held for a human, nothing sent") };
     }
-    // Not corroborated (or the stored copy is not in `unverified` any more): kept beside, never replacing.
+    // Not corroborated (or an uncorroborated record outside the placeholder states): kept beside, never replacing.
     const rec = clone(cur);
     if (!addUnverifiedCopy(rec, e.sha256, "REQUEST-1", m.nowIso)) return { write: null, value: none("UNVERIFIED", cur) };
     addHistory(rec, m.nowIso, "unverified_copy", `REQUEST-1 sha256=${e.sha256}`);
@@ -816,7 +842,11 @@ async function ingestAck(c: Ctx, e: Envelope, corr: CorroborationResult): Promis
     const seen = cur.acks_in[ackRef];
     if (seen !== undefined && f.seq <= seen.last_seq) return { write: null, value: none("STALE", cur) };
     const rec = clone(cur);
-    rec.acks_in[ackRef] = { last_seq: f.seq, state, at: m.nowIso };
+    // An `unknown` answer may come from a peer with no record, which has no counter and always uses seq 1
+    // (ingestProbe / ingestReply), so its seq never becomes the ordering mark the peer's first real ACK is
+    // compared with (review CL-11). It never changes a state (senderStateAfterAck), so nothing it could undo.
+    const mark = state === "unknown" ? seen?.last_seq ?? 0 : f.seq;
+    rec.acks_in[ackRef] = { last_seq: mark, state, at: m.nowIso };
     addHistory(rec, m.nowIso, "ack_in", `${ackRef} seq=${f.seq} state=${state}`);
     let to: RecordState | null = null;
     if (toSender) {
@@ -846,6 +876,8 @@ async function ingestProbe(c: Ctx, e: Envelope, peer: PeerEntry): Promise<Applie
     return { write: rec, value: { result: "ANSWERED", rec, pending, answer: a.state, showBody: false, note: null } };
   });
   if (applied.result === "ANSWERED" && applied.rec === null) {
+    // §8.1: at most one answer per (id, ref) per 60 s also without a record (review CL-11).
+    if (!(await c.store.claimRecordlessAnswer(f.from, f.id, probeRef, PROBE_ANSWER_INTERVAL_MS))) return none("DUPLICATE", null);
     const env = mustRender(renderEnvelope(ackFields(f.id, 1, probeRef, c.cfg.self.label, f.from, c.deps.clock.nowMs(),
       f.sender_task, f.receiver_task, "unknown", null), ""));
     return { ...applied, pending: { ref: null, slot: null, n: 1, text: env.text, target: peer.target }, answer: "unknown" };
@@ -867,6 +899,9 @@ async function ingestBlock(c: Ctx, parsed: EnvelopeResult): Promise<BlockOutcome
   if ((f.kind === "REQUEST" || f.kind === "REPLY") && nowMs - Date.parse(f.sent_at) > STALE_MESSAGE_MS) {
     return refuse("STALE_MESSAGE", `sent_at ${f.sent_at} is more than 25 days ago`);
   }
+  if ((f.kind === "REQUEST" || f.kind === "REPLY") && Date.parse(f.sent_at) - nowMs > FUTURE_SKEW_MS) {
+    return refuse("STALE_MESSAGE", `sent_at ${f.sent_at} is more than 1 day ahead of this machine's clock`);
+  }
   const corr: CorroborationResult = f.kind === "PROBE"
     ? { state: "not_found", inject_id: null, pages: 0 }
     : await corroborate(c.deps.audit, e.sha256, c.cfg.self.controller_sid, nowMs);
@@ -877,9 +912,13 @@ async function ingestBlock(c: Ctx, parsed: EnvelopeResult): Promise<BlockOutcome
     case "ACK": applied = await ingestAck(c, e, corr); break;
     default: applied = await ingestProbe(c, e, peer); break;
   }
-  const send = applied.pending !== null ? await deliver(c, applied.pending) : null;
+  // The block is committed. A store failure while writing the answer's send result must not hide it
+  // (review CL-09): the block is still printed in full; cmdIngest reports the failure separately.
+  const failed: { ackNotRecorded?: StoreError } = {};
+  const send = applied.pending !== null ? await deliver(c, applied.pending, (err) => { failed.ackNotRecorded = err; }) : null;
   const rec = applied.rec;
   return {
+    ...failed,
     result: applied.result, ...head, state: rec?.state ?? "-", answer: applied.pending !== null ? applied.answer : null, send,
     next: applied.result === "NEW" && rec !== null ? rec.next_action.text : null,
     body: applied.showBody ? { from: f.from, sha256: e.body_sha256, bytes: e.body_bytes, text: e.body } : null,
@@ -925,6 +964,13 @@ async function cmdIngest(c: Ctx): Promise<number> {
     }
     printBlock(c, o);
     exit = worseExit(exit, ingestExitOf(o.result));
+    if (o.ackNotRecorded !== undefined) {
+      c.deps.err(`controller-link: ${o.ackNotRecorded.message}; the ${o.answer ?? "-"} answer for request ${o.id} was sent ` +
+        `(send=${o.send !== null ? sendWord(o.send) : "-"}) but its result is not recorded; RESULT=${o.result} above stands; ` +
+        "remaining blocks not processed");
+      exit = worseExit(exit, EXIT.STORE);
+      break;
+    }
   }
   c.deps.out(`SUMMARY blocks=${scan.blocks.length} dropped_blocks=${scan.dropped_blocks} ignored_lines=${scan.ignored_lines}`);
   return exit;
@@ -1186,8 +1232,26 @@ async function readBodyFile(file: string): Promise<Uint8Array> {
   }
 }
 
-/** Production dependencies. */
-export function defaultCliDeps(env: NodeJS.ProcessEnv = process.env): CliDeps {
+/**
+ * The shared dispatch queue reader (src/dispatch/task-queue-read.ts), resolving the queue exactly as a
+ * dispatch run does: bin/dispatch.sh:39-40 sets DISPATCH_SCRIPT_DIR to the shim's own bin/
+ * (AIGENTRY_SHIM_SCRIPT_DIR) before node starts, and the reader takes AIGENTRY_TASK_QUEUE, else
+ * `<DISPATCH_SCRIPT_DIR>/../state/task-queue.json`, else the package's own state/. bin/controller-link.sh
+ * exports AIGENTRY_SHIM_SCRIPT_DIR only, so the same assignment is made here, before the reader's first
+ * load. In a control workspace the shim is `<workspace>/bin`, so `bind` reads `<workspace>/state/task-queue.json`
+ * as dispatch does, not the npm package's. Without the shim (node run directly) nothing is changed, again as dispatch.
+ */
+async function loadTaskQueueReader(env: NodeJS.ProcessEnv): Promise<(taskId: string) => TaskQueueResult> {
+  if (env.AIGENTRY_SHIM_SCRIPT_DIR) env.DISPATCH_SCRIPT_DIR = env.AIGENTRY_SHIM_SCRIPT_DIR;
+  return (await import("../dispatch/task-queue-read.js")).taskQueueStatus;
+}
+
+/** Fails closed (TASK_UNKNOWN "unreadable") where no reader was given to defaultCliDeps. */
+const noTaskQueue = (): TaskQueueResult => ({ kind: "unreadable" });
+
+/** Production dependencies. `taskStatus` is loadTaskQueueReader()'s reader (the entry point passes it). */
+export function defaultCliDeps(env: NodeJS.ProcessEnv = process.env,
+  taskStatus: (taskId: string) => TaskQueueResult = noTaskQueue): CliDeps {
   const packageRoot = env.AIGENTRY_SHIM_SCRIPT_DIR
     ? path.resolve(env.AIGENTRY_SHIM_SCRIPT_DIR, "..")
     : path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -1199,7 +1263,7 @@ export function defaultCliDeps(env: NodeJS.ProcessEnv = process.env): CliDeps {
     runner: defaultProcessRunner,
     teleptyBin: bin,
     audit: defaultAuditReader(defaultProcessRunner, bin, env),
-    taskStatus: taskQueueStatus,
+    taskStatus,
     proc: { pid: process.pid, host: os.hostname().replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 64) || "_" },
     readStdin: () => readStdinCapped(INGEST_MAX_BYTES),
     readBodyFile,
@@ -1219,7 +1283,7 @@ try {
   isMain = false;
 }
 if (isMain) {
-  runCli(process.argv.slice(2), defaultCliDeps()).then((code) => { process.exitCode = code; }, (e: unknown) => {
+  loadTaskQueueReader(process.env).then((reader) => runCli(process.argv.slice(2), defaultCliDeps(process.env, reader))).then((code) => { process.exitCode = code; }, (e: unknown) => {
     process.stderr.write(`controller-link: ${e instanceof Error ? e.message : String(e)}\n`);
     process.exitCode = 1;
   });

@@ -4,11 +4,13 @@
 // store root and peer config (temp dir per test), task queue (fixture file via AIGENTRY_TASK_QUEUE,
 // read by the real U4 reader). No real telepty, daemon or session is touched.
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test, type TestContext } from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { REFUSE_REASONS, parseEnvelope, renderEnvelope, type Envelope, type EnvelopeFields } from "../../src/controller-link/envelope.js";
 import type { ProcessRunner, RunnerResult } from "../../src/controller-link/send.js";
 import { ControllerLinkStore, type LinkRecord, type RecordRef, type RecordState } from "../../src/controller-link/store.js";
@@ -692,4 +694,194 @@ test("§2 configuration: missing, unknown key, duplicate target, bad label or ba
   assert.equal(await run(h, ["status"]), 9);
   assert.equal(fs.existsSync(h.storeRoot), false);
   assert.equal(h.calls.length + h.queries.length, 0);
+});
+
+// ── review round 1 (CL-03, CL-06, CL-07, CL-09, CL-11) ────────────────────────────────────
+
+test("CL-03 an uncorroborated placeholder that stalled or was closed owns no key: a corroborated copy is NEW", async (t) => {
+  const h = harness(t, [{ id: "2026112102", status: "pending" }]);
+  const toState = (id: string, state: RecordState): Promise<null> =>
+    h.store.mutate(inbox(id), (cur, m) => ({ write: { ...cur!, state, state_at: m.nowIso }, value: null }));
+  // (a) Same bytes: pasted during an audit outage, stalled after 48 h, then the delivery's audit row is there.
+  const a = randomUUID();
+  const e = request(a);
+  h.auditDown = true;
+  assert.equal(await run(h, ["ingest"], e.text), 5);
+  h.auditDown = false;
+  await toState(a, "stalled");
+  audited(h, e);
+  assert.equal(await run(h, ["ingest"], e.text), 0);
+  assert.equal(h.out[0], `RESULT=NEW kind=REQUEST id=${a} seq=1 peer=mac state=received answer=received send=handed_over/consumed`);
+  assert.ok(h.out.includes("| Two lines."), "the body is shown");
+  let r = await rec(h, inbox(a));
+  assert.equal(r.state, "received");
+  assert.equal(r.messages["REQUEST-1"]!.corroboration!.state, "corroborated");
+  assert.deepEqual(sent(h).map((f) => [f.id, f.kind, f.state]), [[a, "ACK", "received"]]);
+  assert.equal(await run(h, ["bind", "--request", a, "--task", "2026112102"]), 0, h.err.join("\n"));
+  // (b) Other bytes, after the stalled placeholder was closed by a human.
+  const b = randomUUID();
+  const forged = request(b, "a pasted look-alike");
+  assert.equal(await run(h, ["ingest"], forged.text), 5);
+  await toState(b, "stalled");
+  await toState(b, "closed");
+  const real = request(b, "the real body");
+  audited(h, real);
+  assert.equal(await run(h, ["ingest"], real.text), 0);
+  assert.equal(result(h), "RESULT=NEW");
+  r = await rec(h, inbox(b));
+  assert.equal(r.state, "received");
+  assert.equal(r.messages["REQUEST-1"]!.sha256, real.sha256);
+  assert.ok(r.history.some((x) => x.event === "replaced_unverified" && x.detail === `old sha256=${forged.sha256}`));
+  // (c) A corroborated record still owns its key: another corroborated copy is CONFLICT, as before.
+  await toState(b, "stalled");
+  const second = request(b, "a second corroborated body");
+  audited(h, second);
+  assert.equal(await run(h, ["ingest"], second.text), 5);
+  assert.equal(result(h), "RESULT=CONFLICT");
+  assert.equal((await rec(h, inbox(b))).messages["REQUEST-1"]!.sha256, real.sha256);
+});
+
+test("CL-06 installed control workspace: `bind` run as the workspace shim runs it reads <workspace>/state/task-queue.json, the queue dispatch reads", async (t) => {
+  const h = harness(t);
+  // init copies bin/ into the workspace and leaves dist/ in the package (bin/lib/node-shim.sh), so the
+  // workspace shim execs the package's compiled cli.js with AIGENTRY_SHIM_SCRIPT_DIR=<workspace>/bin.
+  const ws = path.join(h.base, "workspace");
+  fs.mkdirSync(path.join(ws, "bin"), { recursive: true });
+  fs.mkdirSync(path.join(ws, "state"), { recursive: true });
+  fs.writeFileSync(path.join(ws, "state", "controller-peers.json"),
+    JSON.stringify({ v: 1, self: { label: SELF, controller_sid: SID }, peers: { mac: { target: PEER_TARGET, link: "v1" } } }));
+  const task = `cl06-${randomUUID().slice(0, 8)}`;
+  fs.writeFileSync(path.join(ws, "state", "task-queue.json"), JSON.stringify({ tasks: [{ id: task, status: "pending" }] }));
+  // The request arrives first (in process, through the default paths under the workspace).
+  const id = randomUUID();
+  const e = request(id);
+  audited(h, e);
+  assert.equal(await cli.runCli(["ingest"], { ...h.deps, env: {}, packageRoot: ws, readStdin: async () => Buffer.from(e.text, "utf8") }), 0,
+    h.out.join("\n"));
+  const env: NodeJS.ProcessEnv = { ...process.env, AIGENTRY_SHIM_SCRIPT_DIR: path.join(ws, "bin"), TELEPTY: path.join(ws, "no-telepty") };
+  for (const k of ["AIGENTRY_TASK_QUEUE", "DISPATCH_SCRIPT_DIR", "AIGENTRY_CONTROLLER_PEERS", "AIGENTRY_CONTROLLER_LINK_DIR",
+    "AIGENTRY_CONTROLLER_LINK_FAULT"]) delete env[k];
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const cliJs = path.resolve(here, "..", "..", "src", "controller-link", "cli.js");
+  const child = spawnSync(process.execPath, [cliJs, "bind", "--request", id, "--task", task], { env, encoding: "utf8", timeout: 60_000 });
+  assert.equal(child.status, 0, `${child.stdout}\n${child.stderr}`);
+  assert.ok(child.stdout.startsWith(`OK bind request=${id} peer=mac receiver_task=${task} state=accepted answer=accepted send=`), child.stdout);
+  const store = new ControllerLinkStore({ root: path.join(ws, "state", "controller-link"), clock: { nowMs: () => Date.now() } });
+  const bound = await store.read(inbox(id));
+  assert.equal(bound?.state, "accepted");
+  assert.equal(bound?.receiver_task, task);
+  // The shared reader, given what bin/dispatch.sh:39-40 gives it, names that same file.
+  const readerJs = pathToFileURL(path.resolve(here, "..", "..", "src", "dispatch", "task-queue-read.js")).href;
+  const dispatchView = spawnSync(process.execPath, ["--input-type=module", "-e",
+    `import(${JSON.stringify(readerJs)}).then((m) => { process.stdout.write(m.TASK_QUEUE); });`],
+  { env: { ...env, DISPATCH_SCRIPT_DIR: path.join(ws, "bin") }, encoding: "utf8", timeout: 60_000 });
+  assert.equal(dispatchView.status, 0, dispatchView.stderr);
+  assert.equal(dispatchView.stdout, path.join(ws, "state", "task-queue.json"));
+});
+
+test("CL-07 a REQUEST or REPLY dated more than 1 day ahead is STALE_MESSAGE: nothing queried, stored or sent", async (t) => {
+  const h = harness(t);
+  // The sender's clock is a week ahead: such a copy would stay admissible after the receiver's retention.
+  const ahead = request(randomUUID(), "Please run the linux leg of task 1291.", { sent_at: wire(T0 + 7 * DAY) });
+  audited(h, ahead);
+  assert.equal(await run(h, ["ingest"], ahead.text), 4);
+  assert.equal(result(h), "RESULT=STALE_MESSAGE");
+  assert.ok(h.out.some((l) => l.startsWith("NOTE ") && l.includes("ahead of this machine's clock")), h.out.join("\n"));
+  assert.equal(fs.existsSync(h.storeRoot), false, "nothing stored");
+  assert.equal(h.calls.length + h.queries.length, 0);
+  const lost = randomUUID();
+  await seedOutbox(h, lost);
+  const reply = envelope(fields("REPLY", lost, { outcome: "done", final: "yes", sent_at: wire(T0 + DAY + 1000) }), "done");
+  audited(h, reply);
+  assert.equal(await run(h, ["ingest"], reply.text), 4);
+  assert.equal(result(h), "RESULT=STALE_MESSAGE");
+  assert.equal((await rec(h, outbox(lost))).messages["REPLY-1"], undefined);
+  // Exactly 1 day ahead is still accepted.
+  const edge = request(randomUUID(), "Please run the linux leg of task 1291.", { sent_at: wire(T0 + DAY) });
+  audited(h, edge);
+  assert.equal(await run(h, ["ingest"], edge.text), 0);
+  assert.equal(result(h), "RESULT=NEW");
+});
+
+test("CL-09 a store failure while recording the ACK's send result does not hide RESULT=NEW", async (t) => {
+  const h = harness(t);
+  const id = randomUUID();
+  const e = request(id);
+  audited(h, e);
+  // The record and its pending ACK are committed before the inject; while telepty runs, the store breaks.
+  h.onInject = async () => { fs.writeFileSync(h.store.markerPath, "{}"); };
+  const code = await run(h, ["ingest"], e.text);
+  assert.equal(h.out[0], `RESULT=NEW kind=REQUEST id=${id} seq=1 peer=mac state=received answer=received send=handed_over/consumed`);
+  assert.ok(h.out.some((l) => l.startsWith("NEXT ") && l.includes(`bind --request ${id} --task`)));
+  assert.ok(h.out.includes("| Two lines."), "the body is printed");
+  assert.ok(h.out.at(-1)!.startsWith("SUMMARY blocks=1 "));
+  assert.equal(code, 9, "the store failure is still reported, by exit code");
+  assert.ok(h.err.some((l) => l.includes("STORE_CORRUPT") && l.includes("RESULT=NEW above stands")), h.err.join("\n"));
+  // Committed: the record is there; the ACK attempt stays `pending` (the pump's pending recovery settles it).
+  h.onInject = null;
+  fs.writeFileSync(h.store.markerPath, JSON.stringify({ v: 1, kind: "controller-link" }));
+  const r = await rec(h, inbox(id));
+  assert.equal(r.state, "received");
+  assert.deepEqual(r.acks_out.sends.map((s) => s.result), ["pending"]);
+  // Re-running ingest is only a DUPLICATE: a hidden NEW could never be seen again.
+  assert.equal(await run(h, ["ingest"], e.text), 0);
+  assert.equal(result(h), "RESULT=DUPLICATE");
+});
+
+test("CL-11 record-less probe answers are throttled per (id, ref); an `unknown` answer's seq does not make the first real ACK STALE", async (t) => {
+  const h = harness(t);
+  // Receiver side: a probe about a request this side has no record of.
+  const stranger = randomUUID();
+  const probe = (seq: number): string => envelope(fields("PROBE", stranger, { ref: "REQUEST-1", seq })).text;
+  assert.equal(await run(h, ["ingest"], probe(1)), 0);
+  assert.equal(result(h), "RESULT=ANSWERED");
+  assert.equal(await run(h, ["ingest"], probe(2)), 0);
+  assert.equal(result(h), "RESULT=DUPLICATE", "a second record-less probe within 60 s");
+  assert.deepEqual(sent(h).map((f) => [f.id, f.seq, f.state]), [[stranger, 1, "unknown"]]);
+  h.now.ms += 60_000;
+  assert.equal(await run(h, ["ingest"], probe(3)), 0);
+  assert.equal(result(h), "RESULT=ANSWERED");
+  assert.equal(h.calls.length, 2);
+  assert.equal(await h.store.read(inbox(stranger)), null, "no record");
+
+  // Sender side: the peer's record-less `unknown` (seq 1), then its first real ACKs (seq 1, 2).
+  const id = randomUUID();
+  await seedOutbox(h, id, "send_unknown");
+  const ack = (seq: number, state: EnvelopeFields["state"]): Envelope => {
+    const a = envelope(fields("ACK", id, { ref: "REQUEST-1", seq, state }));
+    audited(h, a);
+    return a;
+  };
+  const results: string[] = [];
+  for (const a of [ack(1, "unknown"), ack(1, "received"), ack(2, "accepted")]) {
+    await run(h, ["ingest"], a.text);
+    results.push(`${result(h).slice("RESULT=".length)}:${a.fields.seq}`);
+  }
+  assert.deepEqual(results, ["DUPLICATE:1", "NEW:1", "NEW:2"]);
+  const r = await rec(h, outbox(id));
+  assert.equal(r.state, "accepted");
+  assert.equal(r.acks_in["REQUEST-1"]!.last_seq, 2);
+  // A late copy of the `unknown` answer is STALE and does not overwrite the settled state.
+  await run(h, ["ingest"], ack(1, "unknown").text);
+  assert.equal(result(h), "RESULT=STALE");
+  assert.equal((await rec(h, outbox(id))).acks_in["REQUEST-1"]!.state, "accepted");
+});
+
+test("CL-10 / CL-14 / CL-17 shipped text: decide before register or bind; pump and resend documented; audit claim as narrow as the check", () => {
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+  const role = fs.readFileSync(path.join(root, "tooling", "instructions", "roles", "orchestrator.md"), "utf8");
+  const section = role.slice(role.indexOf("## Peer controller messages"));
+  const req = section.slice(section.indexOf("**A new REQUEST**"), section.indexOf("**Never answer"));
+  const at = (s: string): number => req.indexOf(s);
+  assert.ok(at("not an approval") > 0, "RESULT=NEW is said not to be an approval");
+  assert.ok(at("Decide first WHETHER") > 0, "the decision is the first step");
+  assert.ok(at("Decide first WHETHER") < at("controller-link.sh refuse"), "decision before the refusal path");
+  assert.ok(at("controller-link.sh refuse") < at("register your own task"), "refusal path before registration");
+  assert.ok(at("register your own task") < at("controller-link.sh bind"), "registration before bind");
+  const guide = fs.readFileSync(path.join(root, "docs", "setup", "controller-link.md"), "utf8");
+  assert.doesNotMatch(guide, /pump is NOT in this snapshot|no `resend` and no `pump`|wait for task 1294/, "the pump ships");
+  assert.ok(guide.includes("controller-link.sh resend  --request") && guide.includes("controller-link.sh pump    --once"));
+  assert.doesNotMatch(guide, /resend --reason "manual duplicate test"/, "the old duplicate recipe could not run");
+  assert.match(guide, /it first decides, by its own rules/);
+  assert.match(guide, /a row without one is \(the\s+query's `--from` filter is relied on\)/);
 });

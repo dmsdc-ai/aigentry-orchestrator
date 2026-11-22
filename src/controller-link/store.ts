@@ -8,6 +8,7 @@
 //   outbox/<id>.json                sender records
 //   inbox/<peer label>/<id>.json    receiver records
 //   raw/<sha256>.env                exact canonical envelope bytes, write-once, content-addressed
+//   probe-answers.json              record-less probe answers of the last 60 s (SPEC §8.1 throttle)
 //
 // Every path component is a validated UUID, label or hex64 before any filesystem call; no other
 // record value becomes a path. Every mutation runs under withIndexLock(store.json): read, check,
@@ -38,6 +39,7 @@ export const MESSAGE_KEY_RE = /^(?:REQUEST-1|REPLY-(?:[1-9]|[12][0-9]|3[0-2]))$/
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 const RECORD_FILE_RE = /^([0-9a-f-]{36})\.json$/;
 const RAW_FILE_RE = /^([0-9a-f]{64})\.env$/;
+const RECORDLESS_KEY_RE = /^[a-z][a-z0-9-]{0,31}\/[0-9a-f-]{36}\/(?:REQUEST-1|REPLY-(?:[1-9]|[12][0-9]|3[0-2]))$/;
 
 export const MAX_RECORD_BYTES = 262_144;
 export const HISTORY_MAX = 64;
@@ -45,6 +47,14 @@ export const SENDS_MAX = 32;
 export const OPEN_RECORDS_MAX = 256;
 export const UNVERIFIED_COPIES_MAX = 4;
 export const RETENTION_MS = 30 * 86_400 * 1000;
+/** At most this many record-less probe answers are remembered (all younger than the throttle interval). */
+export const RECORDLESS_ANSWERS_MAX = 256;
+/**
+ * Windows device names (CON, PRN, AUX, NUL, COM0-9, LPT0-9; case-insensitive there). LABEL_RE accepts
+ * them, but no directory can carry such a name on native Windows, so the store refuses them as a
+ * peer label on every platform, and behaves the same everywhere.
+ */
+export const RESERVED_LABEL_RE = /^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])$/;
 
 export const SENDER_STATES = [
   "prepared", "sent", "send_unknown", "send_refused", "unverified_at_peer", "received",
@@ -206,7 +216,7 @@ export interface StatusEntry {
 }
 
 export interface RetentionSelection {
-  /** Terminal records with now − state_at ≥ 30 days. */
+  /** Terminal records with now − (the later of state_at and every message's ingested_at) ≥ 30 days. */
   records: RecordRef[];
   /** Raw files no record outside `records` names (orphans, or named only by selected records). */
   raws: string[];
@@ -292,8 +302,11 @@ function checkRequestId(id: unknown): string {
   return id;
 }
 
+/** A label that can name a directory on every platform. */
+const safeLabel = (label: string): boolean => LABEL_RE.test(label) && !RESERVED_LABEL_RE.test(label);
+
 function checkLabel(label: unknown): string {
-  if (typeof label !== "string" || !LABEL_RE.test(label)) {
+  if (typeof label !== "string" || !safeLabel(label)) {
     throw new StoreError("STORE_UNAVAILABLE", "path component invalid (peer label)");
   }
   return label;
@@ -428,6 +441,15 @@ export function rawsNamedBy(record: LinkRecord): string[] {
   for (const m of Object.values(record.messages)) out.add(m.sha256);
   for (const c of record.unverified_copies ?? []) out.add(c.sha256);
   return [...out];
+}
+
+/** The later of `state_at` and every message's `ingested_at` (retention's start). */
+function lastChangeMs(record: LinkRecord): number {
+  let t = Date.parse(record.state_at);
+  for (const m of Object.values(record.messages)) {
+    if (typeof m.ingested_at === "string") t = Math.max(t, Date.parse(m.ingested_at));
+  }
+  return t;
 }
 
 /** history ≤ 64 newest (+ history_dropped), every sends list ≤ 32 newest. Operates on a copy. */
@@ -612,6 +634,11 @@ export class ControllerLinkStore {
   /**
    * Retention selector (SPEC §4; selection only, deletion belongs to the pump). Call it inside
    * withLock() and delete the selected records BEFORE the selected raw files.
+   *
+   * The 30 days run from the later of `state_at` and every message's `ingested_at`, so a key is kept
+   * at least 30 days after its last arrival by this clock even when the clock went back in between, or
+   * a message was stored on an already terminal record. With ingest's bound on future `sent_at`
+   * (STALE_MESSAGE, cli.ts) that is longer than the 25 days an exact copy stays admissible.
    */
   async selectRetention(): Promise<RetentionSelection> {
     const now = this.clock.nowMs();
@@ -622,7 +649,7 @@ export class ControllerLinkStore {
       for (const ref of await this.scanRefs(undefined, undefined)) {
         const rec = await this.readRecordFile(this.recordPath(ref), ref);
         if (rec === null) continue;
-        if (isTerminal(rec.state) && now - Date.parse(rec.state_at) >= RETENTION_MS) {
+        if (isTerminal(rec.state) && now - lastChangeMs(rec) >= RETENTION_MS) {
           records.push(ref);
         } else {
           for (const sha of rawsNamedBy(rec)) named.add(sha);
@@ -709,6 +736,35 @@ export class ControllerLinkStore {
     });
   }
 
+  /**
+   * SPEC §8.1 PROBE throttle for a probe about a request with no record (the record keeps its own
+   * `probe_answers`): true, and remembered under the store lock, when no answer to (peer, id, ref) was
+   * given in the last `intervalMs`; false when one was. Entries older than `intervalMs` are dropped
+   * on every claim, so the file holds only the last interval's answers; at RECORDLESS_ANSWERS_MAX of
+   * them a further claim is false (no answer), so a flood cannot grow it.
+   */
+  async claimRecordlessAnswer(peer: string, requestId: string, ref: MessageKey, intervalMs: number): Promise<boolean> {
+    const key = `${checkLabel(peer)}/${checkRequestId(requestId)}/${ref}`;
+    if (!RECORDLESS_KEY_RE.test(key)) throw new StoreError("STORE_UNAVAILABLE", "path component invalid (ref)");
+    const file = path.join(this.root, "probe-answers.json");
+    return this.withLock(() => this.internal(async () => {
+      const nowMs = this.clock.nowMs();
+      const bytes = await readPrivateFile(file, MAX_RECORD_BYTES);
+      const v = bytes === null ? { v: 1, answers: {} } : parseJson(bytes);
+      if (!isObj(v) || v.v !== 1 || !isObj(v.answers)) throw new StoreError("STORE_CORRUPT", "probe-answers.json");
+      const answers: Record<string, string> = {};
+      for (const [k, at] of Object.entries(v.answers)) {
+        if (!RECORDLESS_KEY_RE.test(k) || !isIso(at)) throw new StoreError("STORE_CORRUPT", "probe-answers.json entry");
+        const age = nowMs - Date.parse(at);
+        if (age >= 0 && age < intervalMs) answers[k] = at;
+      }
+      if (answers[key] !== undefined || Object.keys(answers).length >= RECORDLESS_ANSWERS_MAX) return false;
+      answers[key] = new Date(nowMs).toISOString();
+      await atomicWrite(file, Buffer.from(JSON.stringify({ v: 1, answers }), "utf8"), { sessionId: randomUUID() });
+      return true;
+    }));
+  }
+
   // --- internals --------------------------------------------------------------------------------
 
   /** Maps any non-store failure of store code to STORE_UNAVAILABLE; caller failures pass through. */
@@ -786,7 +842,7 @@ export class ControllerLinkStore {
       }
     }
     if (role !== "sender" && (await checkDirectory(path.join(this.root, "inbox")))) {
-      const labels = peer !== undefined ? [peer] : (await readDirNames(path.join(this.root, "inbox"))).filter((n) => LABEL_RE.test(n));
+      const labels = peer !== undefined ? [peer] : (await readDirNames(path.join(this.root, "inbox"))).filter(safeLabel);
       for (const label of labels) {
         if (!(await checkDirectory(path.join(this.root, "inbox", label)))) continue;
         for (const name of await readDirNames(path.join(this.root, "inbox", label))) {
@@ -826,7 +882,7 @@ export class ControllerLinkStore {
     const record = trimmed(next);
     const bytes = Buffer.from(JSON.stringify(record), "utf8");
     if (bytes.byteLength > MAX_RECORD_BYTES) throw new StoreError("LINK_CAPACITY", "record larger than 256 KiB");
-    if (current === null && !isTerminal(record.state) && (await this.countOpen(ref)) >= OPEN_RECORDS_MAX) {
+    if ((current === null || isTerminal(current.state)) && !isTerminal(record.state) && (await this.countOpen(ref)) >= OPEN_RECORDS_MAX) {
       throw new StoreError("LINK_CAPACITY", `${OPEN_RECORDS_MAX} open records`);
     }
     // A raw file is written (if absent) before the record that names it.

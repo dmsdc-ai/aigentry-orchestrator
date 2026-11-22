@@ -11,6 +11,7 @@ import {
   ControllerLinkStore,
   HISTORY_MAX,
   OPEN_RECORDS_MAX,
+  RECORDLESS_ANSWERS_MAX,
   RETENTION_MS,
   SENDS_MAX,
   StoreError,
@@ -466,4 +467,85 @@ test("S7 a 0755 store directory or a 0644 record is refused", { skip: R5_SKIP },
   await rejectsWith(store.list({ role: "sender" }), "STORE_UNAVAILABLE");
   await fs.chmod(path.join(root, "outbox"), 0o700);
   assert.ok(await store.read(sender(id)));
+});
+
+// --- review round 1 (CL-03, CL-07, CL-11, CL-15) ------------------------------------------------
+
+test("CL-15 Windows device names are refused as a peer label on every platform; similar names are accepted", async (t) => {
+  const { store, root } = await box(t);
+  const id = randomUUID();
+  for (const label of ["con", "prn", "aux", "nul", "com0", "com1", "com9", "lpt0", "lpt1", "lpt9"]) {
+    assert.throws(() => store.recordPath(receiver(label, id)), (e: unknown) => e instanceof StoreError && e.code === "STORE_UNAVAILABLE", label);
+    await rejectsWith(store.read(receiver(label, id)), "STORE_UNAVAILABLE");
+    await rejectsWith(store.mutate(receiver(label, id), () => assert.fail("callback must not run")), "STORE_UNAVAILABLE");
+    await rejectsWith(store.list({ peer: label }), "STORE_UNAVAILABLE");
+    await rejectsWith(store.claimRecordlessAnswer(label, id, "REQUEST-1", 60_000), "STORE_UNAVAILABLE");
+  }
+  assert.equal(await exists(root), false, "no filesystem change");
+  for (const label of ["console", "com10", "lpt-1", "nul-box", "auxiliary", "con1", "prnt"]) {
+    assert.equal(store.recordPath(receiver(label, id)), path.join(root, "inbox", label, `${id}.json`), label);
+  }
+  // POSIX only (a directory named `con` cannot be made on native Windows): one planted by an older
+  // version is not a record directory, so listing skips it instead of failing.
+  if (POSIX) {
+    const seed = randomUUID();
+    await create(store, receiver("linux", seed), record("receiver", seed));
+    await plant(root, `inbox/con/${id}.json`, record("receiver", id, { peer: "con" }));
+    assert.deepEqual((await store.list()).map((r) => r.request_id), [seed]);
+  }
+});
+
+test("CL-07 retention runs 30 days from the later of state_at and every message's ingested_at", async (t) => {
+  const { store, clock } = await box(t);
+  const DAY = 86_400_000;
+  const id = randomUUID();
+  const raw = envelope(id);
+  // Terminal at T0 by this clock, its REQUEST-1 stored at T0 + 10 days (the clock went back in between).
+  const rec = record("receiver", id, { state: "refused", stateAt: T0, raw });
+  rec.messages["REQUEST-1"]!.ingested_at = iso(T0 + 10 * DAY);
+  await create(store, receiver("linux", id), rec, raw);
+  clock.now = T0 + RETENTION_MS;
+  assert.deepEqual((await store.selectRetention()).records, [], "30 days after state_at but not after ingested_at");
+  clock.now = T0 + 10 * DAY + RETENTION_MS - 1;
+  assert.deepEqual((await store.selectRetention()).records, []);
+  clock.now = T0 + 10 * DAY + RETENTION_MS;
+  assert.deepEqual((await store.selectRetention()).records.map((r) => r.requestId), [id]);
+});
+
+test("CL-11 record-less probe answers: one per (peer, id, ref) per interval; bounded; no record is created", async (t) => {
+  const { store, root, clock } = await box(t);
+  const id = randomUUID();
+  assert.equal(await store.claimRecordlessAnswer("linux", id, "REQUEST-1", 60_000), true);
+  assert.equal(await store.claimRecordlessAnswer("linux", id, "REQUEST-1", 60_000), false, "same (peer, id, ref) within 60 s");
+  assert.equal(await store.claimRecordlessAnswer("linux", id, "REPLY-1", 60_000), true, "another ref");
+  assert.equal(await store.claimRecordlessAnswer("mac", id, "REQUEST-1", 60_000), true, "another peer");
+  clock.now += 59_999;
+  assert.equal(await store.claimRecordlessAnswer("linux", id, "REQUEST-1", 60_000), false);
+  clock.now += 1;
+  assert.equal(await store.claimRecordlessAnswer("linux", id, "REQUEST-1", 60_000), true, "60 s later");
+  // Bounded: at most RECORDLESS_ANSWERS_MAX answers of the last interval are remembered; beyond that none is given.
+  clock.now += 60_000;
+  for (let i = 0; i < RECORDLESS_ANSWERS_MAX; i += 1) assert.equal(await store.claimRecordlessAnswer("linux", randomUUID(), "REQUEST-1", 60_000), true);
+  assert.equal(await store.claimRecordlessAnswer("linux", randomUUID(), "REQUEST-1", 60_000), false, "full: no answer");
+  clock.now += 60_000;
+  assert.equal(await store.claimRecordlessAnswer("linux", id, "REQUEST-1", 60_000), true, "expired entries are dropped");
+  const kept = JSON.parse(await fs.readFile(path.join(root, "probe-answers.json"), "utf8")) as { answers: Record<string, string> };
+  assert.deepEqual(Object.keys(kept.answers), [`linux/${id}/REQUEST-1`]);
+  assert.deepEqual(await store.list(), [], "no record");
+  await fs.writeFile(path.join(root, "probe-answers.json"), "{\"v\":2}", { mode: 0o600 });
+  await rejectsWith(store.claimRecordlessAnswer("linux", id, "REPLY-2", 60_000), "STORE_CORRUPT");
+});
+
+test("CL-03 a terminal record made open again counts against the open-record capacity", async (t) => {
+  const { store, root } = await box(t);
+  const closed = randomUUID();
+  await create(store, receiver("linux", closed), record("receiver", closed, { state: "closed" }));
+  for (let i = 0; i < OPEN_RECORDS_MAX; i += 1) {
+    const id = randomUUID();
+    const raw = envelope(id);
+    await fs.writeFile(path.join(root, "raw", `${sha(raw)}.env`), raw, { mode: 0o600 });
+    await plant(root, `inbox/linux/${id}.json`, record("receiver", id, { raw }));
+  }
+  await rejectsWith(store.mutate(receiver("linux", closed), (cur) => ({ write: { ...cur!, state: "received" as const }, value: undefined })), "LINK_CAPACITY");
+  assert.equal((await store.read(receiver("linux", closed)))!.state, "closed");
 });

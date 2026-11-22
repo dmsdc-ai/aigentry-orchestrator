@@ -60,6 +60,10 @@ const BYTES_RE = /^(?:0|[1-9][0-9]{0,4})$/;
 /** §3.3 step 5: the report sanitiser's class (report/envelope.ts:195-196) plus U+2028/2029, and the fence glyphs. */
 const FORBIDDEN_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\u27e6\u27e7]/;
 const LONE_SURROGATE_RE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+/** FORBIDDEN_RE's class, global: received text quoted in a diagnostic gets each such code point replaced. */
+const FORBIDDEN_ALL_RE = new RegExp(FORBIDDEN_RE.source, "g");
+/** Received text shown in a diagnostic: at most 32 code points, forbidden code points (§3.3 step 5) as `?`. */
+const shown = (s: string): string => Array.from(s).slice(0, 32).join("").replace(FORBIDDEN_ALL_RE, "?");
 /** Any line that starts like a controller-link marker of any version. */
 const ANY_VERSION_RE = /^⟦aigentry-ctl v([^⟧]*)⟧/;
 
@@ -256,7 +260,7 @@ export function parseEnvelope(block: string): EnvelopeResult {
   const lines = text.split("\n");
   const head = lines[0]!;
   const ver = ANY_VERSION_RE.exec(head);
-  if (ver && ver[1] !== "1") return err("VERSION_UNSUPPORTED", `marker version v${ver[1]} is not supported (v1 only)`);
+  if (ver && ver[1] !== "1") return err("VERSION_UNSUPPORTED", `marker version v${shown(ver[1]!)} is not supported (v1 only)`);
   if (!head.startsWith(`${CTL_VERSION_MARKER} `)) return err("ENVELOPE_INVALID", "first line is not a v1 marker line");
   const bytes = utf8Bytes(text);
   if (bytes > ENVELOPE_MAX_BYTES) return err("ENVELOPE_INVALID", `envelope is ${bytes} bytes, limit ${ENVELOPE_MAX_BYTES}`);
@@ -272,7 +276,7 @@ export function parseEnvelope(block: string): EnvelopeResult {
     const t = tokens[i]!;
     const eq = t.indexOf("=");
     const name = eq < 0 ? t : t.slice(0, eq);
-    if (eq < 0 || name !== FIELD_ORDER[i]) return err("ENVELOPE_INVALID", `field ${i + 1} is "${name.slice(0, 32)}", expected ${FIELD_ORDER[i]}`);
+    if (eq < 0 || name !== FIELD_ORDER[i]) return err("ENVELOPE_INVALID", `field ${i + 1} is "${shown(name)}", expected ${FIELD_ORDER[i]}`);
     values.push(t.slice(eq + 1));
   }
   const bad = checkValues(values);

@@ -374,6 +374,26 @@ test("E8 a marker of another version → VERSION_UNSUPPORTED, never parsed as v1
   assert.deepEqual(mixed.blocks.map((b) => code(b.result)), ["VERSION_UNSUPPORTED", "OK"]);
 });
 
+// ---------------------------------------------------------------- CL-13 (review round 1)
+test("CL-13 received header text quoted in a diagnostic: §3.3 forbidden code points become ?, at most 32 code points", () => {
+  const SHOWN_FORBIDDEN = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\u27e6\u27e7]/;
+  const v1 = must(renderEnvelope(base("REQUEST"), "hello")).text;
+  // A field name carrying terminal escapes (CSI clear screen, OSC title + BEL), a bidi override and U+2028.
+  const named = parseEnvelope(withTokens(v1, (x) => ["\u001b[2J\u001b]0;x\u0007k\u202eind\u2028=REQUEST", ...x.slice(1)]));
+  assert.ok(!named.ok && named.error.code === "ENVELOPE_INVALID");
+  assert.equal(named.error.detail, 'field 1 is "?[2J?]0;x?k?ind?", expected kind');
+  assert.doesNotMatch(named.error.detail, SHOWN_FORBIDDEN);
+  // A marker version is received text too; it is also cut at 32 code points.
+  const version = parseEnvelope(v1.replace(CTL_VERSION_MARKER, `⟦aigentry-ctl v\u001b[31m9${"x".repeat(40)}⟧`));
+  assert.ok(!version.ok && version.error.code === "VERSION_UNSUPPORTED");
+  assert.equal(version.error.detail, `marker version v?[31m9${"x".repeat(26)} is not supported (v1 only)`);
+  // The same text through scanInput (what `ingest` prints after NOTE).
+  const s = scan(`banner\n${withTokens(v1, (x) => ["\u001b[31mkind=REQUEST", ...x.slice(1)])}`);
+  const r = s.blocks[0]!.result;
+  assert.ok(!r.ok && r.error.code === "ENVELOPE_INVALID");
+  assert.doesNotMatch(r.error.detail, SHOWN_FORBIDDEN);
+});
+
 // ---------------------------------------------------------------- unit constraint: pure
 test("envelope.ts is pure: imports node:crypto only; no clock, process, file or network access", () => {
   const src = readFileSync(resolve(import.meta.dirname, "../../../src/controller-link/envelope.ts"), "utf8");
