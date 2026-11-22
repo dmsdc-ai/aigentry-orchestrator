@@ -840,7 +840,7 @@ test("CL-06 installed control workspace: `bind` run as the workspace shim runs i
 
 test("CL-07 a REQUEST or REPLY dated more than 1 day ahead is STALE_MESSAGE: nothing queried, stored or sent", async (t) => {
   const h = harness(t);
-  // The sender's clock is a week ahead: such a copy would stay admissible after the receiver's retention.
+  // The sender's clock is a week ahead.
   const ahead = request(randomUUID(), "Please run the linux leg of task 1291.", { sent_at: wire(T0 + 7 * DAY) });
   audited(h, ahead);
   assert.equal(await run(h, ["ingest"], ahead.text), 4);
@@ -1413,7 +1413,7 @@ test("CL-05 shipped text: the CORROBORATED notice, its `next:` command and what 
   assert.ok(guide.includes(`${NOTICE_MARKER} CORROBORATED request_id=<id> role=<receiver|sender> `));
   assert.ok(guide.includes(fixed), "the guide shows the notice text the pump renders");
   assert.ok(guide.includes("next: bin/controller-link.sh status --request <id>"));
-  assert.match(guide, /act only on a `RESULT=NEW` line it prints/);
+  assert.match(guide, /act only on a `RESULT=NEW` or `RESULT=AWAITING` line it prints/);
   assert.match(guide, /repeats every 2 hours until the record\s+shows the copy was picked up/);
   assert.doesNotMatch(guide, /for at most 48 hours/, "the presentation is not limited to 48 hours any more");
   const role = fs.readFileSync(path.join(root, "tooling", "instructions", "roles", "orchestrator.md"), "utf8");
@@ -1421,7 +1421,7 @@ test("CL-05 shipped text: the CORROBORATED notice, its `next:` command and what 
   assert.ok(section.includes(`\`${NOTICE_MARKER} CORROBORATED request_id=<id> …\``));
   assert.ok(section.includes("`NEXT bin/controller-link.sh pickup --request <id> --copy <sha256>`"), "the command comes from status");
   assert.ok(section.includes("`next: bin/controller-link.sh status --request <id>`"));
-  assert.match(section, /act ONLY on a `RESULT=NEW` line/);
+  assert.match(section, /act ONLY on a `RESULT=NEW` or `RESULT=AWAITING` line/);
   assert.match(section, /never `ingest` the notice text/);
   assert.match(section, /repeats every 2 hours/);
   assert.doesNotMatch(section, /for at most 48 hours/);
@@ -1437,7 +1437,6 @@ test("CL3-06 / CL3-08 / CL3-10 shipped text: the fixed pickup forms; every notic
   const guide = fs.readFileSync(path.join(root, "docs", "setup", "controller-link.md"), "utf8");
   const role = fs.readFileSync(path.join(root, "tooling", "instructions", "roles", "orchestrator.md"), "utf8");
   const section = role.slice(role.indexOf("## Peer controller messages"));
-  const flat = section.replace(/\s+/g, " ");
   // CL3-06: the three fixed forms, in both texts; no path-carrying command is left.
   for (const form of ["NEXT bin/controller-link.sh pickup --request <id> --ref REQUEST-1",
     "NEXT bin/controller-link.sh pickup --request <id> --ref REPLY-<n>", "NEXT bin/controller-link.sh pickup --request <id> --copy <sha256>"]) {
@@ -1445,33 +1444,111 @@ test("CL3-06 / CL3-08 / CL3-10 shipped text: the fixed pickup forms; every notic
     assert.ok(section.includes(form), `role: ${form}`);
   }
   assert.doesNotMatch(guide + section, /ingest < "|<store root>|<the stored copy>/);
-  assert.doesNotMatch(guide + section, /retention\.json|retention deletes|applies retention/);
+  assert.doesNotMatch(guide + section, /until a human removes|removal rule|earlier version|previous version/i);
   assert.match(guide, /## Store size and removal/);
   assert.match(guide, /Nothing in controller-link deletes anything/);
-  // CL3-08: every kind the renderer has, with its exact description (the variable parts excepted).
-  const rec = { v: 1, role: "sender", request_id: randomUUID(), peer: PEER, peer_target: PEER_TARGET, self_label: SELF, sender_task: "1291",
-    receiver_task: null, state: "accepted", state_at: iso(T0), history: [] } as unknown as LinkRecord;
-  assert.equal(NOTICE_PRIORITY.length, 9);
-  for (const kind of NOTICE_PRIORITY) {
-    const first = renderControllerNotice(rec, kind, 1).split("\n")[0]!;
+  assert.match(guide, /This version has no supported way to remove a request's files/);
+  // CL3-08 / CL4-09: every kind the renderer has, each checked against its OWN row of the guide's table (description
+  // cell) and its OWN bullet of the role's list, with every variable expansion: REFUSED with a refuse code (written
+  // `<code>`) and with none (`-`), CORROBORATED at the receiver (REQUEST) and at the sender (REPLY). Swapping two
+  // descriptions fails.
+  type Kind = (typeof NOTICE_PRIORITY)[number];
+  const base = { v: 1, request_id: randomUUID(), peer: PEER, peer_target: PEER_TARGET, self_label: SELF, sender_task: "1291",
+    receiver_task: null, state: "accepted", state_at: iso(T0), history: [] };
+  const what = (kind: Kind, over: Record<string, unknown>): string => {
+    const first = renderControllerNotice({ ...base, ...over } as unknown as LinkRecord, kind, 1).split("\n")[0]!;
     assert.ok(first.startsWith(`${NOTICE_MARKER} ${kind.toUpperCase()} `), first);
-    const what = first.slice(first.indexOf(" — ") + 3);
-    const fixed = kind === "refused" ? "the peer refused this request (reason="
-      : kind === "corroborated" ? what.slice(what.indexOf(" from the peer stored unverified")) : what;
-    assert.ok(guide.includes(`| \`${kind.toUpperCase()}\` |`), `guide lists ${kind}`);
-    assert.ok(guide.includes(fixed), `guide has the exact ${kind} text: ${fixed}`);
-    assert.ok(flat.includes(`\`${kind.toUpperCase()}\` — `), `role lists ${kind}`);
-    assert.ok(flat.includes(fixed), `role has the exact ${kind} text: ${fixed}`);
+    return first.slice(first.indexOf(" — ") + 3);
+  };
+  const expansions = (kind: Kind): string[] => {
+    if (kind === "corroborated") return [what(kind, { role: "receiver" }), what(kind, { role: "sender" })];
+    if (kind !== "refused") return [what(kind, { role: "sender" })];
+    const code = REFUSE_REASONS[0];
+    const withCode = what(kind, { role: "sender", refuse_reason: code });
+    assert.ok(withCode.endsWith(`(reason=${code})`), withCode);
+    return [withCode.replace(`(reason=${code})`, "(reason=<code>)"), what(kind, { role: "sender" })];
+  };
+  assert.deepEqual(expansions("refused")[1], "the peer refused this request (reason=-)");
+  assert.notEqual(expansions("corroborated")[0], expansions("corroborated")[1]);
+  const table = guide.slice(guide.indexOf("| KIND | description"), guide.indexOf("A notice is not an envelope")).split("\n")
+    .filter((l) => l.startsWith("| `"));
+  const kindsBlock = section.slice(section.indexOf("The kinds, each with its exact description:"), section.indexOf("What the kinds need from you:"));
+  const bullets = kindsBlock.split("\n- ").slice(1).map((b) => b.replace(/\s+/g, " ").trim());
+  assert.equal(NOTICE_PRIORITY.length, 9);
+  assert.equal(table.length, 9, table.join("\n"));
+  assert.equal(bullets.length, 9, bullets.join("\n"));
+  for (const kind of NOTICE_PRIORITY) {
+    const name = `\`${kind.toUpperCase()}\``;
+    const rows = table.filter((l) => l.startsWith(`| ${name} |`));
+    assert.equal(rows.length, 1, `guide: one row for ${kind}`);
+    const description = rows[0]!.split(" | ")[1]!;
+    const own = bullets.filter((b) => b.startsWith(`${name} — `));
+    assert.equal(own.length, 1, `role: one bullet for ${kind}`);
+    for (const text of expansions(kind)) {
+      assert.ok(description.includes(text), `guide row ${kind} has the exact text: ${text}`);
+      assert.ok(own[0]!.includes(text), `role bullet ${kind} has the exact text: ${text}`);
+    }
   }
   assert.doesNotMatch(guide, /The pump has no notice for/);
-  // Every RESULT word of the code's IngestResult union, in the guide's list and in the role section.
+  assert.doesNotMatch(guide, /one notice series at a time/);
+  // Every RESULT word of the code's IngestResult union: in its own row of the guide's RESULT table with the exit the
+  // code gives it, and in its own bullet of the role's result list, whose head gives the same exit.
   const src = fs.readFileSync(path.join(root, "src", "controller-link", "cli.ts"), "utf8");
   const union = src.slice(src.indexOf("type IngestResult ="), src.indexOf(";", src.indexOf("type IngestResult =")));
   const words = [...union.matchAll(/"([A-Z_]+)"/g)].map((m) => m[1]!);
   assert.equal(words.length, 18, union);
+  const resultRows = guide.slice(guide.indexOf("### Every `RESULT=` word"), guide.indexOf("## Two-machine test")).split("\n")
+    .filter((l) => l.startsWith("| `"));
+  const resultBlock = section.slice(section.indexOf("**Each result:**"), section.indexOf("**Picking up what waits for you.**"));
+  const resultBullets = resultBlock.split("\n- ").slice(1).map((b) => b.replace(/\s+/g, " ").trim())
+    .map((b) => ({ head: b.slice(0, b.indexOf(" — ")), text: b }));
   for (const w of words) {
-    assert.ok(guide.includes(`\`${w}\``), `guide: ${w}`);
-    assert.ok(section.includes(w), `role: ${w}`);
+    const exit = cli.ingestExitOf(w);
+    const rows = resultRows.filter((r) => r.split(" | ")[0]!.slice(2).split(", ").includes(`\`${w}\``));
+    assert.equal(rows.length, 1, `guide: one RESULT row for ${w}`);
+    assert.equal(rows[0]!.split(" | ")[1], String(exit), `guide: ${w} exits ${exit}`);
+    const own = exit === 9
+      ? resultBullets.filter((b) => b.head === "Exit 9" && b.text.includes(`RESULT=${w}`))
+      : resultBullets.filter((b) => b.head.includes(`RESULT=${w}`) || b.head.includes(`\`${w}\``));
+    assert.equal(own.length, 1, `role: one bullet for ${w}`);
+    const head = own[0]!.head;
+    if (exit === 0) assert.equal(head, `\`RESULT=${w}\``, w);
+    if (exit === 5) assert.equal(head, `\`RESULT=${w}\` (exit 5)`, w);
+    if (exit === 4) assert.ok(head.startsWith("Exit 4 (") && head.includes(`\`${w}\``), `${w}: ${head}`);
   }
   assert.equal(section.includes("{{"), false, "no double-brace token in the instruction section");
+});
+
+test("CL4-10 status: a REQUEST whose id inbox records of two peers share is listed with --copy and its own sha256; each pickup shows its own; other rows keep --ref", async (t) => {
+  const h = harness(t);
+  fs.writeFileSync(String(h.deps.env.AIGENTRY_CONTROLLER_PEERS), JSON.stringify({ v: 1, self: { label: SELF, controller_sid: SID },
+    peers: { mac: { target: PEER_TARGET, link: "v1" }, pc: { target: "orchestrator@pc-box", link: "v1" } } }));
+  const id = randomUUID();
+  const fromMac = await received(h, id, "the request from mac");
+  const fromPc = request(id, "the request from pc", { from: "pc" });
+  audited(h, fromPc);
+  assert.equal(await run(h, ["ingest"], fromPc.text), 0, h.out.join("\n"));
+  assert.equal(result(h), "RESULT=NEW");
+  const solo = randomUUID();
+  await received(h, solo);
+  const copy = (e: Envelope): string => `bin/controller-link.sh pickup --request ${id} --copy ${e.sha256}`;
+  for (const argv of [["status"], ["status", "--request", id]]) {
+    assert.equal(await run(h, argv), 0, h.err.join("\n"));
+    const next = h.out.filter((l) => l.startsWith("NEXT "));
+    assert.ok(next.includes(`NEXT ${copy(fromMac)}`) && next.includes(`NEXT ${copy(fromPc)}`), next.join("\n"));
+    assert.ok(!next.includes(`NEXT bin/controller-link.sh pickup --request ${id} --ref REQUEST-1`), "no form that names two records");
+  }
+  assert.equal(await run(h, ["status"]), 0);
+  assert.ok(h.out.includes(`NEXT bin/controller-link.sh pickup --request ${solo} --ref REQUEST-1`), "an unambiguous row keeps --ref");
+  assert.equal(await run(h, ["status", "--json"]), 0);
+  const rows = JSON.parse(h.out[0]!) as Array<{ request_id: string; peer: string; awaiting: string[] }>;
+  assert.deepEqual(rows.filter((r) => r.request_id === id).map((r) => [r.peer, r.awaiting]).sort(),
+    [["mac", [copy(fromMac)]], ["pc", [copy(fromPc)]]]);
+  // The --ref form names both records (exit 3); each --copy command names one and shows that peer's request.
+  assert.equal(await run(h, ["pickup", "--request", id, "--ref", "REQUEST-1"]), 3);
+  for (const [e, peer] of [[fromMac, "mac"], [fromPc, "pc"]] as const) {
+    assert.equal(await run(h, copy(e).split(" ").slice(1)), 0, h.err.join("\n"));
+    assert.equal(h.out[0], `RESULT=AWAITING kind=REQUEST id=${id} seq=1 peer=${peer} state=received`);
+    assert.ok(h.out.includes(`| the request from ${peer}`), h.out.join("\n"));
+  }
 });

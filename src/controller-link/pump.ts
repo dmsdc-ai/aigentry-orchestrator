@@ -7,15 +7,16 @@
 // step and perform it — recover a crashed `pending` attempt as `unknown`, mark `stalled`, send a PROBE,
 // re-send the SAME raw bytes (only on the triggers decide() allows), re-check corroboration (U6
 // `corroborate`, read only: the pump never applies a message; CL-05), or post a local notice — within the
-// per-pass budget (≤ 240 s, ≤ 20 cross-machine sends, ≤ 10 notices, ≤ 256 records visited). The pass has ONE
-// deadline (CL-08, CL3-04): every step and every audit query check it before they start, each with its own
-// worst case (a send its 120 s timeout, a notice the report pump's inject timeout, an audit query 5 pages × 30 s),
-// a notice re-checks it after its claim, and every child the pass starts (the sender, the audit reader, the
-// notice inject) runs through one runner with its timeout cut to the time left, so the deadline kills it; a killed
-// or unstarted child is `unknown` (a send, a notice) or `audit_unavailable`, never refused. Worst case, with
-// W = the store walk and cursor read at the start, L = one store mutation (lock wait ≤ 30 s + one record's I/O)
-// and A = the cursor write: pass ≤ max(W, PASS_WALL_MS + 2·L) + A — the last step starts before the deadline,
-// its claim takes ≤ L, its child ends by the deadline, its result write takes ≤ L. CL-18: a pass starts at a
+// per-pass budget (≤ 240 s, ≤ 20 cross-machine sends, ≤ 10 notices, ≤ 256 records visited). The 240 s is a
+// cooperative bound on the pass's children, not a limit on the pass or on a child's lifetime (CL-08, CL3-04,
+// CL4-06). The pass has one monotonic deadline: every step and every audit query check it before they start (a
+// send, a notice and an audit query only if their own timeout fits; a notice re-checks it after its claim), so
+// no child is started once the budget is used up; every child the pass starts (the sender, the audit reader, the
+// notice inject) runs through one runner that caps its timeout at the time left; a timed-out or unstarted child is
+// `unknown` (a send, a notice) or `audit_unavailable`, never refused. Local file work (the peers file, the store
+// walk, lock waits, record and raw reads and writes, the cursor) is not bounded and can run past the deadline. On
+// a timeout the runner asks the child to stop (child.kill(); SIGTERM on POSIX) and stops waiting after its grace
+// without confirming an exit: a child that ignores termination can outlive the pass. CL-18: a pass starts at a
 // rotating cursor (`pump-cursor.json` in the store root) so every record is eventually visited.
 //
 // Every send follows SPEC §6.1: under the lock the attempt is written `pending` with `owner=<pid>@<host>`
@@ -106,7 +107,7 @@ export interface PumpDeps extends CliDeps {
   localHosts: readonly string[];
   /**
    * CL-08: builds the audit reader over the pass's deadline-bounded runner (production: cli.ts
-   * defaultAuditReader), so the deadline kills an audit child too. Absent: `audit` is used as given.
+   * defaultAuditReader), so an audit child's timeout is capped by the time left too. Absent: `audit` is used as given.
    */
   auditWith?: (runner: ProcessRunner) => AuditReader;
   /** CL3-04: builds the notice port over the same deadline-bounded runner (production: runnerNoticePort). Absent: `notice`. */
@@ -384,7 +385,7 @@ async function doResend(c: PumpCtx, rec: LinkRecord, step: Extract<Step, { kind:
  * nothing — no state change, no ACK, no consumed presentation; a corroborated sha256 is recorded in
  * `notices.corroborated` and the `corroborated` notice repeats until the record shows the controller acted
  * (decide.ts awaitingIngest). CL-08: no cross-machine send happens here, each audit query starts only if its
- * worst case fits before the pass deadline, and its child is killed by the deadline (the pass runner).
+ * worst case fits before the pass deadline, and its child's timeout is capped by the time left (the pass runner).
  * Returns the record when a new corroboration was recorded (its notice may follow in this pass), else null.
  */
 async function doVerify(c: PumpCtx, rec: LinkRecord, step: Extract<Step, { kind: "verify" }>): Promise<LinkRecord | null> {
@@ -433,7 +434,7 @@ export function renderControllerNotice(rec: LinkRecord, kind: NoticeKind, n: num
     peer_unconfigured: 'the peer is not configured with link "v1"; nothing is sent for this record and its state is kept',
     corroborated: `a ${rec.role === "receiver" ? "REQUEST" : "REPLY"} from the peer stored unverified is now corroborated by ` +
       "this machine's telepty audit; it has not been shown or applied; this notice repeats until the record shows it was picked up",
-    reply_awaiting: "a REPLY from the peer was applied by ingest but is not yet recorded as handled; " +
+    reply_awaiting: "a REPLY from the peer was applied by ingest or pickup but is not yet recorded as handled; " +
       "this notice repeats until the record shows it was handled",
     reply_unverified: "a REPLY from the peer is still not corroborated by this machine's telepty audit after 48 h; " +
       "it is not acted on and the record's state is kept",
@@ -558,8 +559,9 @@ async function processRecord(c: PumpCtx, first: LinkRecord): Promise<void> {
 
 /**
  * CL-08: the runner every child of this pass uses (a send, an audit query, a notice). Its timeout is cut to the time
- * left before the pass deadline minus the runner's kill grace (send.ts KILL_GRACE_MS), so the deadline kills
- * the child; with no time left the child is not started. Either way the runner reports rc null: a send is
+ * left before the pass deadline minus the runner's kill grace (send.ts KILL_GRACE_MS), so the runner asks the child
+ * to stop and stops waiting for it by the deadline (CL4-06: a child that ignores termination can run on); with no
+ * time left the child is not started. Either way the runner reports rc null: a send is
  * classified `unknown` (send.ts classifySend), an audit query `audit_unavailable` — never a definite refusal.
  */
 function passRunner(deps: PumpDeps, t0: number): ProcessRunner {
@@ -703,8 +705,8 @@ export async function runPump(argv: readonly string[], deps: PumpDeps): Promise<
 /**
  * CL3-04: the local notice inject — the report pump's argv (`inject --submit --no-submit-force --submit-retry 2
  * --from controller-link <sid> <text>`) and child env — run by a ProcessRunner, so the pass runner cuts its
- * timeout to the time left and kills it like a send. A spawn failure is rc 127 (not delivered), as the report
- * pump's port reports it; a kill by the timeout stays rc null (outcome unknown).
+ * timeout to the time left and asks it to stop like a send. A spawn failure is rc 127 (not delivered), as the report
+ * pump's port reports it; a timeout stays rc null (outcome unknown).
  */
 export function runnerNoticePort(runner: ProcessRunner, bin: string, env: NodeJS.ProcessEnv): NoticePort {
   return {

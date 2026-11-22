@@ -645,7 +645,7 @@ test("CL-12 a CONFLICT on a terminal record gets its notice, then daily", async 
   assert.equal(h.notices.length, 1);
   h.now.ms = T0 + DAY;
   await pump(h);
-  assert.equal(h.notices.length, 2, "daily until retention");
+  assert.equal(h.notices.length, 2, "daily");
   assert.equal(h.calls.length, 0);
 });
 
@@ -659,7 +659,6 @@ test("CL3-02 / CL3-07: the pump deletes nothing — a terminal record of any age
   assert.equal(fs.existsSync(h.store.recordPath(outbox(old))), true);
   assert.equal(fs.existsSync(h.store.rawPath(oldEnv.sha256)), true);
   assert.equal(fs.existsSync(h.store.rawPath(orphan.sha256)), true);
-  assert.ok(!h.out.some((l) => l.startsWith("PUMP_RETENTION") || l.includes("deleted_")), h.out.join("\n"));
 });
 
 test("off switch AIGENTRY_CONTROLLER_LINK_PUMP=0: nothing read, nothing sent, no store created; --loop sleeps between passes", async (t) => {

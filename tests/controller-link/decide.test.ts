@@ -496,7 +496,7 @@ test("§9.3 / HOLD-1 Q4: an uncorroborated REPLY copy is re-checked for 48 h, th
   assert.equal(decide(rec, facts(T0 + 5 * DAY)).kind, "none", "a later corroborated copy ends the notices");
 });
 
-test("CL-12 a CONFLICT on a terminal record is reminded once, then daily, until retention", () => {
+test("CL-12 a CONFLICT on a terminal record is reminded once, then daily", () => {
   const done = sender([attempt(1, T0 - HOUR, "handed_over")], "replied");
   done.history.push({ at: iso(T0), event: "conflict", detail: `REPLY-1 sha256=${OTHER_SHA}` });
   assert.deepEqual(noticeTimes(done, T0, T0 + 2 * DAY, 10 * MIN), [0, 1440, 2880]);
@@ -723,7 +723,7 @@ test("CL-09 pickup (P1): a REPLY awaiting pickup on a terminal `replied` record 
   countNotice(rec, "reply_awaiting", iso(T0), T0 + 40 * DAY);
   const waiting = decide(rec, facts(T0 + 40 * DAY + MIN));
   assert.equal(waiting.kind, "none");
-  assert.ok(waiting.kind === "none" && waiting.due_ms !== null && waiting.due_ms <= T0 + 40 * DAY + 2 * HOUR, "the next reminder is due, not retention");
+  assert.ok(waiting.kind === "none" && waiting.due_ms !== null && waiting.due_ms <= T0 + 40 * DAY + 2 * HOUR, "the next reminder is due");
   // The controller recorded the pickup (`handled`, coder A): no more reminders; nothing is expired (CL3-02).
   rec.messages["REPLY-1"]!.pickup = "handled";
   assert.deepEqual(decide(rec, facts(T0 + 40 * DAY + 2 * HOUR)), { kind: "none", due_ms: null, why: "terminal" });

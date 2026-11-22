@@ -11,7 +11,7 @@
 //   probe-answers.json              record-less probe answers of the last 60 s (SPEC §8.1 throttle)
 //
 // v1 deletes nothing (Root decision, review CL3-02/CL3-07): no retention, no expiry, no orphan clean-up. A record
-// and its raw files stay until a human removes them (docs/setup/controller-link.md "Store size and removal").
+// and its raw files stay; this version has no supported removal (docs/setup/controller-link.md "Store size and removal").
 //
 // Every path component is a validated UUID, label or hex64 before any filesystem call; no other
 // record value becomes a path. Every mutation runs under withIndexLock(store.json): read, check,
@@ -29,13 +29,18 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { atomicWrite } from "../session/persistence/atomic-write.js";
 import { withIndexLock } from "../session/persistence/index-lock.js";
-import { DEVICE_LABEL_RE } from "./envelope.js";
+import { LABEL_RE as WIRE_LABEL_RE } from "./envelope.js";
 
 // ---------------------------------------------------------------------------------------------
 // Constants (SPEC §3.2, §4)
 
 export const REQUEST_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-export const LABEL_RE = /^[a-z][a-z0-9-]{0,31}$/;
+/**
+ * The one label rule (envelope.ts LABEL_RE, CL3-05), which also refuses the Windows device names: every label the
+ * store is given comes from the peers file or an envelope, which passed it already, so no inbox directory gets a
+ * device name (review CL-15) and a directory whose name fails it is not an inbox.
+ */
+export const LABEL_RE = WIRE_LABEL_RE;
 export const HEX64_RE = /^[0-9a-f]{64}$/;
 export const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 /** Obligation messages stored in `messages`: REQUEST-1 and REPLY-1..32. */
@@ -52,20 +57,13 @@ export const UNVERIFIED_COPIES_MAX = 4;
 /**
  * The admission bound (review CL-07). ingest admits a REQUEST or REPLY only when its `sent_at` S satisfies
  * now − ADMIT_MAX_AGE_MS ≤ S ≤ now + ADMIT_MAX_AHEAD_MS (cli.ts STALE_MESSAGE_MS / FUTURE_SKEW_MS are these
- * values). The setup guide's removal rule uses the same bound: a human removes an inbox record only once its
- * REQUEST is outside it, so a copy of a removed request is STALE_MESSAGE.
+ * values). Nothing removes an inbox record (this version has no supported removal), so a later copy of an applied
+ * REQUEST finds its record (DUPLICATE or AWAITING) or is STALE_MESSAGE.
  */
 export const ADMIT_MAX_AGE_MS = 25 * 86_400 * 1000;
 export const ADMIT_MAX_AHEAD_MS = 86_400 * 1000;
 /** At most this many record-less probe answers are remembered (all younger than the throttle interval). */
 export const RECORDLESS_ANSWERS_MAX = 256;
-/**
- * Windows device names (CON, PRN, AUX, NUL, COM0-9, LPT0-9; case-insensitive there): envelope.ts DEVICE_LABEL_RE,
- * the list the one label rule (envelope.ts LABEL_RE, CL3-05) refuses at setup. So the store never CREATES an inbox
- * directory with such a name (review CL-15). A directory that already exists (made by an earlier version on POSIX)
- * is an ordinary inbox: it is listed, read and written.
- */
-export const RESERVED_LABEL_RE = DEVICE_LABEL_RE;
 /** CL-09: a REPLY stored by ingest awaits the sender controller's `handled` until it is set to "handled". */
 export const PICKUP_STATES = ["awaiting", "handled"] as const;
 /** The result of claimRecordlessAnswer (CL-11): answer now, already answered recently, or the table is full. */
@@ -326,10 +324,7 @@ function checkRequestId(id: unknown): string {
   return id;
 }
 
-/**
- * A label of the config grammar. A Windows device name passes here (an existing directory with that name is a
- * record directory, CL-15); only the creation of a new one is refused (mutate).
- */
+/** A label of the one label rule (LABEL_RE); a Windows device name is refused here (CL-15). */
 function checkLabel(label: unknown): string {
   if (typeof label !== "string" || !LABEL_RE.test(label)) {
     throw new StoreError("STORE_UNAVAILABLE", "path component invalid (peer label)");
@@ -636,7 +631,7 @@ export class ControllerLinkStore {
       const out: LinkRecord[] = [];
       for (const ref of refs) {
         const rec = await this.readRecordFile(this.recordPath(ref), ref);
-        if (rec === null) continue; // removed by a human between readdir and read
+        if (rec === null) continue; // gone between readdir and read
         if (peerFilter !== undefined && rec.peer !== peerFilter) continue;
         if (filter.open === true && isTerminal(rec.state)) continue;
         out.push(rec);
@@ -680,15 +675,6 @@ export class ControllerLinkStore {
   async mutate<T>(ref: RecordRef, fn: (current: LinkRecord | null, ctx: MutationContext) => Mutation<T> | Promise<Mutation<T>>): Promise<T> {
     const r = checkRef(ref);
     const file = this.recordPath(r);
-    // CL-15: a NEW inbox directory never gets a Windows device name (refused before anything is created); an
-    // existing one, made by an earlier version on POSIX, is used as it is. Only a real directory counts: on
-    // Windows the name can resolve to the device itself, which is refused here too.
-    if (r.role === "receiver" && RESERVED_LABEL_RE.test(r.peer)) {
-      const existing = await this.guard(() => lstatIfPresent(path.join(this.root, "inbox", r.peer)));
-      if (existing === null || !existing.isDirectory() || existing.isSymbolicLink()) {
-        throw new StoreError("STORE_UNAVAILABLE", `peer label ${r.peer} is a Windows device name; no new inbox directory is created for it`);
-      }
-    }
     return this.withLock(async () => {
       const current = await this.internal(async () => {
         await this.recordDirs(r, true);
@@ -847,8 +833,7 @@ export class ControllerLinkStore {
       }
     }
     if (role !== "sender" && (await checkDirectory(path.join(this.root, "inbox")))) {
-      // CL-15: every directory whose name is a store label is scanned, a Windows device name included, so a record
-      // a previous version stored there is listed.
+      // CL-15: only a directory whose name passes the one label rule is an inbox; any other name is not scanned.
       const labels = peer !== undefined ? [peer] : (await readDirNames(path.join(this.root, "inbox"))).filter((l) => LABEL_RE.test(l));
       for (const label of labels) {
         if (!(await checkDirectory(path.join(this.root, "inbox", label)))) continue;

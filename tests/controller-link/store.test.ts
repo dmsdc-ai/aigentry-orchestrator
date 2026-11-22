@@ -11,9 +11,9 @@ import { DEVICE_LABEL_RE, LABEL_RE as WIRE_LABEL_RE } from "../../src/controller
 import {
   ControllerLinkStore,
   HISTORY_MAX,
+  LABEL_RE as STORE_LABEL_RE,
   OPEN_RECORDS_MAX,
   RECORDLESS_ANSWERS_MAX,
-  RESERVED_LABEL_RE,
   SENDS_MAX,
   StoreError,
   type LinkRecord,
@@ -359,11 +359,8 @@ test("S4 history keeps the newest 64 plus history_dropped; sends keep 32; size a
 
 // --- S5 -----------------------------------------------------------------------------------------
 
-test("S5 (CL3-02, v1) the store deletes nothing: it has no retention, expiry, floor or clean-up, and old terminal records and orphan raws stay", async (t) => {
+test("S5 (CL3-02, v1) the store deletes nothing: old terminal records and orphan raws stay", async (t) => {
   const { store, root, clock } = await box(t);
-  for (const name of ["selectRetention", "requestFloorMs", "floorPath"]) {
-    assert.equal(name in store, false, `no ${name}`);
-  }
   const mk = async (state: RecordState, stateAt: number, peer?: string) => {
     const id = randomUUID();
     const raw = envelope(id);
@@ -383,7 +380,6 @@ test("S5 (CL3-02, v1) the store deletes nothing: it has no retention, expiry, fl
     assert.ok(await exists(path.join(root, "raw", `${k.sha}.env`)), k.sha);
   }
   assert.ok(await exists(path.join(root, "raw", `${sha(orphan)}.env`)), "an unreferenced raw file stays too");
-  assert.equal(await exists(path.join(root, "retention.json")), false, "no floor file");
 });
 
 test("S5 a missing store selects and lists nothing and creates nothing", async (t) => {
@@ -498,36 +494,34 @@ test("S7 (win32) a store directory or a record with other mode bits is accepted:
 
 // --- review round 1 (CL-03, CL-07, CL-11, CL-15) ------------------------------------------------
 
-test("CL-15 / CL3-05 a Windows device name never gets a NEW inbox directory on any platform; it is the label rule's own list; an existing one is a live inbox", async (t) => {
+test("CL-15 / CL3-05 a Windows device name never gets an inbox directory on any platform: the store uses the one label rule", async (t) => {
   const { store, root } = await box(t);
-  // CL3-05: the store refuses exactly the names the one label rule refuses at setup.
-  assert.equal(RESERVED_LABEL_RE, DEVICE_LABEL_RE);
-  for (const label of ["con", "prn", "aux", "nul", "com0", "com9", "lpt0", "lpt9"]) assert.equal(WIRE_LABEL_RE.test(label), false, label);
+  // CL3-05 / item 6: the store's label rule is the one label rule of the peers file and the wire.
+  assert.equal(STORE_LABEL_RE, WIRE_LABEL_RE);
+  for (const label of ["con", "prn", "aux", "nul", "com0", "com9", "lpt0", "lpt9"]) {
+    assert.equal(DEVICE_LABEL_RE.test(label), true, label);
+    assert.equal(WIRE_LABEL_RE.test(label), false, label);
+  }
   for (const label of ["console", "com10", "lpt-1", "nul-box", "auxiliary", "con1", "prnt", "linux"]) assert.equal(WIRE_LABEL_RE.test(label), true, label);
   const id = randomUUID();
   for (const label of ["con", "prn", "aux", "nul", "com0", "com1", "com9", "lpt0", "lpt1", "lpt9"]) {
     await rejectsWith(store.mutate(receiver(label, id), () => assert.fail("callback must not run")), "STORE_UNAVAILABLE");
     await rejectsWith(store.putMessage(receiver(label, id), { key: "REQUEST-1", entry: { sha256: sha("x"), body_sha256: sha(""),
       raw: `raw/${sha("x")}.env` }, raw: Buffer.from("x"), create: () => assert.fail("must not create") }), "STORE_UNAVAILABLE");
-    assert.equal(await store.read(receiver(label, id)), null, label);
-    assert.deepEqual(await store.list({ peer: label }), [], label);
+    await rejectsWith(store.read(receiver(label, id)), "STORE_UNAVAILABLE");
+    await rejectsWith(store.list({ peer: label }), "STORE_UNAVAILABLE");
   }
   assert.equal(await exists(root), false, "no filesystem change");
   for (const label of ["console", "com10", "lpt-1", "nul-box", "auxiliary", "con1", "prnt"]) {
     assert.equal(store.recordPath(receiver(label, id)), path.join(root, "inbox", label, `${id}.json`), label);
   }
-  // POSIX only (a directory named `con` cannot be made on native Windows): one made by an older version holds an
-  // open record. It is listed and written like any inbox.
+  // POSIX only (a directory named `con` cannot be made on native Windows): a directory whose name fails the label
+  // rule is not an inbox, so a record file put there by hand is not listed.
   if (POSIX) {
     const seed = randomUUID();
     await create(store, receiver("linux", seed), record("receiver", seed));
-    const raw = envelope(id, "legacy");
-    await fs.writeFile(path.join(root, "raw", `${sha(raw)}.env`), raw, { mode: 0o600 });
-    await plant(root, `inbox/con/${id}.json`, record("receiver", id, { peer: "con", state: "accepted", raw }));
-    assert.deepEqual((await store.list()).map((r) => r.request_id).sort(), [seed, id].sort());
-    assert.deepEqual((await store.list({ peer: "con" })).map((r) => r.request_id), [id]);
-    await store.mutate(receiver("con", id), (cur, m) => ({ write: { ...cur!, state: "replying" as const, state_at: m.nowIso }, value: undefined }));
-    assert.equal((await store.read(receiver("con", id)))!.state, "replying");
+    await plant(root, `inbox/con/${id}.json`, record("receiver", id, { peer: "con", state: "accepted" }));
+    assert.deepEqual((await store.list()).map((r) => r.request_id), [seed]);
   }
 });
 

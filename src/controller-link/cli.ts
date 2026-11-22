@@ -55,7 +55,7 @@ import { awaitingIngest } from "./decide.js";
 
 /**
  * §8.1 step 2: a REQUEST or REPLY sent more than 25 days before now is STALE_MESSAGE (store.ts ADMIT_MAX_AGE_MS).
- * Nothing is deleted automatically (v1, CL3-02); the setup guide's manual removal rule uses this bound.
+ * Nothing is deleted (v1, CL3-02); this version has no supported removal.
  */
 export const STALE_MESSAGE_MS = ADMIT_MAX_AGE_MS;
 /** A REQUEST or REPLY whose `sent_at` is more than this AFTER now is STALE_MESSAGE too (review CL-07). */
@@ -1239,14 +1239,16 @@ export function statusLine(s: StatusEntry): string {
  * from the wrapper name and validated tokens (the request id, a message key, a sha256 the record validation checked):
  * no file path, no quoting, no stored free text. A REQUEST in `received` (not yet bound or refused) and a stored REPLY
  * not yet `handled` are `pickup --ref <key>`; a stored copy the pump found corroborated and nothing has applied yet is
- * `pickup --copy <sha256>`. `pickup` reads the record and that raw file only.
+ * `pickup --copy <sha256>`. `pickup` reads the record and that raw file only. CL4-10: `sharedId` (inbox records under
+ * more than one peer use this request id, so `pickup --ref REQUEST-1` would name more than one record and exit 3):
+ * the REQUEST is listed as `pickup --copy <its stored sha256>`, which names this record's own envelope.
  */
-export function awaitingCommands(rec: LinkRecord): string[] {
+export function awaitingCommands(rec: LinkRecord, sharedId = false): string[] {
   const pickup = (arg: string): string => `${SHIM} pickup --request ${rec.request_id} ${arg}`;
   const out: string[] = [];
   const req = rec.messages["REQUEST-1"];
   if (rec.role === "receiver" && rec.state === "received" && req?.corroboration?.state === "corroborated") {
-    out.push(pickup("--ref REQUEST-1"));
+    out.push(pickup(sharedId ? `--copy ${req!.sha256}` : "--ref REQUEST-1"));
   }
   for (const k of awaitingPickup(rec)) out.push(pickup(`--ref ${k}`));
   for (const sha of awaitingIngest(rec)) out.push(pickup(`--copy ${sha}`));
@@ -1256,8 +1258,12 @@ export function awaitingCommands(rec: LinkRecord): string[] {
 async function cmdStatus(c: Ctx, a: Args): Promise<number> {
   const id = requestArg(a, false);
   // Without --request: open records, and terminal ones that still await the controller (CL-09, a REPLY not handled).
-  const all = (id === null ? await c.store.list() : await recordsFor(c, id))
-    .map((r) => ({ s: statusOf(r), next: awaitingCommands(r) }))
+  const recs = id === null ? await c.store.list() : await recordsFor(c, id);
+  // CL4-10: request ids used by inbox records under more than one peer (counted over every record read, as pickup does).
+  const inboxIds = recs.filter((r) => r.role === "receiver").map((r) => r.request_id);
+  const shared = new Set(inboxIds.filter((x, i) => inboxIds.indexOf(x) !== i));
+  const all = recs
+    .map((r) => ({ s: statusOf(r), next: awaitingCommands(r, r.role === "receiver" && shared.has(r.request_id)) }))
     .filter((x) => id !== null || !x.s.terminal || x.next.length > 0);
   if (id !== null && all.length === 0) throw new CliError("STATE_INVALID", `no record for request ${id}`);
   const rows = [...all].sort((x, y) => (y.s.due_at ?? "").localeCompare(x.s.due_at ?? "") || x.s.request_id.localeCompare(y.s.request_id));

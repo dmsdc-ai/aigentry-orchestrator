@@ -1453,9 +1453,9 @@ function main(argv: string[]): void {
   }
 
   // --- step 0b4: controller-link pump (#1294, SPEC §9.1) — probes, same-byte re-sends,
-  // reminders and retention for the controller-to-controller records. Same shape as
-  // step 0b3: the compiled entrypoint next to this file, a 300 s kill (one pass ends
-  // within 240 s plus one running send), act-only (so also off under a HITL pause),
+  // and reminders for the controller-to-controller records. Same shape as
+  // step 0b3: the compiled entrypoint next to this file, a 300 s kill (the pass's 240 s
+  // is a cooperative bound, see controller-link/pump.ts), act-only (so also off under a HITL pause),
   // best-effort. AIGENTRY_CONTROLLER_LINK_PUMP=0 disables it. The store root is the
   // one the pump itself resolves (U2 resolveStoreRoot, same package root); while it
   // does not exist this step does nothing at all — no process, no file, no output.
