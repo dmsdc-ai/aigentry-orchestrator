@@ -35,6 +35,7 @@ import { loadWorkerScope, prepareWorkerSandbox, assertConfinedTarget, stageWorke
 import { CLAUDE_OAUTH_OPT_IN } from "../session/claude-worker-oauth.js";
 import { validateSpawnDecision, type SpawnDecision } from "../session/model-decision.js";
 import { bootCapabilitiesDocument } from "../orchestrator-boot/plan.js";
+import { findTaskRows, TASK_QUEUE, taskQueueStatus } from "./task-queue-read.js";
 
 // ── environment seams (identical names/defaults to the shell) ────────────────
 // SCRIPT_DIR was `cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P` — the repo's
@@ -789,13 +790,9 @@ function decisionAudit(d: SpawnDecision): Record<string, unknown> {
 // lives here — dispatch.sh is the actuation chokepoint every delegation flows
 // through. It runs BEFORE any side effect so a violation can never leave a
 // half-started worker behind.
-const TASK_QUEUE = env.AIGENTRY_TASK_QUEUE || path.join(SCRIPT_DIR, "..", "state", "task-queue.json");
 const TASK_GATE_MODE = env.AIGENTRY_TASK_GATE || "hard";
 const TASK_GATE_HINT =
   'register the task in state/task-queue.json first (--task <id>), or use --no-task "<reason>" for exempt work.';
-
-const ALLOWED_STATUS = new Set(["pending", "in_progress", "delegated", "queued", "blocked-by-observation"]);
-const TERMINAL_STATUS = new Set(["done", "completed", "superseded", "cancelled", "closed"]);
 
 function utcNow(): Date {
   return new Date();
@@ -846,15 +843,6 @@ function taskGateReject(o: Opts, msg: string): void {
   die(`dispatch.sh: ${msg}`, 4);
 }
 
-/** Every row whose id matches. The COUNT is the point: two rows is an id nobody can resolve. */
-function findTaskRows(rows: unknown[], taskId: string): number[] {
-  const hits: number[] = [];
-  rows.forEach((t, i) => {
-    if (t && String((t as { id?: unknown }).id) === taskId) hits.push(i);
-  });
-  return hits;
-}
-
 /**
  * #1110: both find sites word it the same way. `tasks.find(...)` answered with the first
  * match, so `--task 522` read a desc-less `pending` row while the row a human meant sat
@@ -875,31 +863,21 @@ function ambiguousTaskIdMessage(rows: unknown[], hits: number[], taskId: string)
   );
 }
 
-/** The queue lookup — rc mirrors the retired python block's exit codes. */
-function taskQueueStatus(taskId: string): { rc: number; status: string } {
-  let data: { tasks?: unknown[]; completed?: unknown[] };
-  try {
-    data = JSON.parse(fs.readFileSync(TASK_QUEUE, "utf8"));
-  } catch {
-    return { rc: 2, status: "" };
+// Preserve the dispatch gate's exit codes and keep duplicate refusals outside gate mode policy.
+function dispatchTaskQueueStatus(taskId: string): { rc: number; status: string } {
+  const result = taskQueueStatus(taskId);
+  switch (result.kind) {
+    case "unreadable":
+      return { rc: 2, status: "" };
+    case "not-found":
+      return { rc: 3, status: "" };
+    case "archived":
+      return { rc: 4, status: result.status };
+    case "unique":
+      return { rc: result.dispatchable ? 0 : result.terminal ? 4 : 5, status: result.status };
+    case "duplicate":
+      return die(`dispatch.sh: ${ambiguousTaskIdMessage(result.rows, result.hits, taskId)}`, 5);
   }
-  const tasks = Array.isArray(data.tasks) ? data.tasks : [];
-  const hits = findTaskRows(tasks, taskId);
-  // rc 5 — distinct from the gate's rc 4, so a caller can tell a collision from a bad status.
-  if (hits.length > 1) die(`dispatch.sh: ${ambiguousTaskIdMessage(tasks, hits, taskId)}`, 5);
-  const task = (hits.length === 1 ? tasks[hits[0]!] : undefined) as { status?: unknown } | undefined;
-  if (task === undefined) {
-    // completed[] is the archive tail — a hit there is a stale id, not an unknown one.
-    const completed = Array.isArray(data.completed) ? data.completed : [];
-    if (completed.some((t) => t && String((t as { id?: unknown }).id) === taskId)) {
-      return { rc: 4, status: "completed" };
-    }
-    return { rc: 3, status: "" };
-  }
-  const status = String(task.status || "");
-  if (ALLOWED_STATUS.has(status)) return { rc: 0, status };
-  const terminal = TERMINAL_STATUS.has(status) || status.startsWith("done") || status.startsWith("completed");
-  return { rc: terminal ? 4 : 5, status };
 }
 
 function taskGateCheck(o: Opts): void {
@@ -918,7 +896,7 @@ function taskGateCheck(o: Opts): void {
     taskGateReject(o, `Rule 34 task-gate: ${TASK_GATE_HINT}`);
     return;
   }
-  const { rc, status } = taskQueueStatus(o.taskId);
+  const { rc, status } = dispatchTaskQueueStatus(o.taskId);
   switch (rc) {
     case 0:
       return;
