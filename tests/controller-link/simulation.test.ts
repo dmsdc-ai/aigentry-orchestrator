@@ -799,6 +799,13 @@ test("L4 conflicting copies: a corroborated copy with other bytes is CONFLICT (n
   assert.deepEqual(ingested(sim.mac, d.id, "REPLY"), ["NEW:1", "CONFLICT:1"]);
   const out = await record(sim.mac, d.id, "sender");
   assert.equal(out.messages["REPLY-1"]!.sha256, reply.sha256, "the stored REPLY is unchanged");
+  // CL-12: the CONFLICT on mac's terminal (`replied`) record is reminded too: one local notice, no envelope.
+  assert.equal(out.history.filter((h) => h.event === "conflict").length, 1);
+  assert.equal(sim.mac.ep.notices.length, 1, "one CONFLICT notice for the terminal record");
+  assert.ok(sim.mac.ep.notices[0]!.text.startsWith(`${NOTICE_MARKER} CONFLICT request_id=${d.id} role=sender `), sim.mac.ep.notices[0]!.text);
+  assert.ok(sim.mac.ep.notices[0]!.text.includes(`state=replied `), sim.mac.ep.notices[0]!.text);
+  // linux's record is terminal now too; its CONFLICT series keeps its anchor, so no second notice at this instant.
+  assert.equal(sim.linux.ep.notices.length, 1);
   await assertCorrelated(sim.mac, sim.linux, d.id, "linux-r1");
   assertSent(sim, d.id, { REQUEST: 1, ACK: 1 }, { ACK: 2, REPLY: 1 });
   assert.equal(sim.fake.foreign.length, 3);

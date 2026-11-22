@@ -56,9 +56,19 @@ export const STALE_MESSAGE_MS = 25 * 86_400 * 1000;
  * store keeps its key (store.ts selectRetention, measured from the later of state_at and ingested_at).
  */
 export const FUTURE_SKEW_MS = 86_400 * 1000;
-/** §8.1 step 3: the audit query window, page size and page limit. */
+/**
+ * §8.1 step 3 as amended (review CL-04, SPEC-DEVIATIONS): ONE `telepty injects` call, no paging. The
+ * `injects` CLI has no paging flag; `--limit` takes at most 1000 rows. The window is the last 48 h, narrowed
+ * to start no earlier than the envelope's `sent_at` minus AUDIT_SINCE_MARGIN_MS when that value is usable.
+ */
 export const AUDIT_WINDOW_MS = 48 * 3_600 * 1000;
-export const AUDIT_PAGE_LIMIT = 200;
+export const AUDIT_ROW_LIMIT = 1000;
+/** The clock difference between two controllers this feature tolerates (the CL-07 future bound). */
+export const AUDIT_SINCE_MARGIN_MS = FUTURE_SKEW_MS;
+/**
+ * Not a page count of this reader (it makes one call). pump.ts multiplies AUDIT_TIMEOUT_MS by it for its
+ * per-check time reservation (AUDIT_CHECK_MS), so the value is kept until pump.ts is changed (CL-04 residual).
+ */
 export const AUDIT_MAX_PAGES = 5;
 /** One `telepty injects` call; a slower audit read is `audit_unavailable`. */
 export const AUDIT_TIMEOUT_MS = 30_000;
@@ -214,18 +224,15 @@ export interface AuditQuery {
   from: string;
   since: string;
   limit: number;
-  /** null for the first page. */
-  cursor: string | null;
 }
 
+/** The rows of the one `injects` call. */
 export interface AuditPage {
   rows: AuditRow[];
-  /** null = no further page. */
-  next_cursor: string | null;
 }
 
 export interface AuditReader {
-  /** One page; null when the query failed (→ audit_unavailable). */
+  /** The one query; null when it failed (→ audit_unavailable). */
   page(q: AuditQuery): Promise<AuditPage | null>;
 }
 
@@ -234,8 +241,6 @@ export type CorroborationState = "corroborated" | "not_found" | "audit_unavailab
 export interface CorroborationResult {
   state: CorroborationState;
   inject_id: string | null;
-  /** Pages read (≤ AUDIT_MAX_PAGES). */
-  pages: number;
 }
 
 /**
@@ -256,46 +261,46 @@ export function rowCorroborates(row: AuditRow, sha256: string, selfSid: string):
 }
 
 /**
- * Query `injects --to <self sid> --from controller-link --since <now − 48 h> --limit 200`, following
- * the cursor for at most 5 pages. A failed page before a match is `audit_unavailable`.
+ * One query (CL-04; SPEC §8.1 step 3 as amended, no paging): `injects --to <self sid> --from controller-link
+ * --since <S> --limit 1000`, where S is now − 48 h, or `sentAtMs` − AUDIT_SINCE_MARGIN_MS when that is later
+ * and `sentAtMs` (the envelope's own `sent_at`) is a usable time not after now + the margin. A failed query is
+ * `audit_unavailable`. A result without a matching row is `not_found` — also when it holds all 1000 rows the
+ * limit allows: a full result is not evidence of absence, so the answer stays "not corroborated yet" and a
+ * later re-check (the pump's, or a re-run of ingest) can still find the row.
  */
-export async function corroborate(reader: AuditReader, sha256: string, selfSid: string, nowMs: number): Promise<CorroborationResult> {
-  const since = new Date(nowMs - AUDIT_WINDOW_MS).toISOString();
-  let cursor: string | null = null;
-  for (let pages = 1; pages <= AUDIT_MAX_PAGES; pages++) {
-    let page: AuditPage | null;
-    try {
-      page = await reader.page({ to: selfSid, from: SEND_FROM, since, limit: AUDIT_PAGE_LIMIT, cursor });
-    } catch {
-      page = null;
-    }
-    if (page === null || !Array.isArray(page.rows)) return { state: "audit_unavailable", inject_id: null, pages };
-    const hit = page.rows.find((r) => rowCorroborates(r, sha256, selfSid));
-    if (hit !== undefined) return { state: "corroborated", inject_id: typeof hit.inject_id === "string" ? hit.inject_id : null, pages };
-    if (typeof page.next_cursor !== "string" || page.next_cursor === "") return { state: "not_found", inject_id: null, pages };
-    cursor = page.next_cursor;
+export async function corroborate(reader: AuditReader, sha256: string, selfSid: string, nowMs: number,
+  sentAtMs: number | null = null): Promise<CorroborationResult> {
+  let sinceMs = nowMs - AUDIT_WINDOW_MS;
+  if (sentAtMs !== null && Number.isFinite(sentAtMs) && sentAtMs - AUDIT_SINCE_MARGIN_MS <= nowMs) {
+    sinceMs = Math.max(sinceMs, sentAtMs - AUDIT_SINCE_MARGIN_MS);
   }
-  return { state: "not_found", inject_id: null, pages: AUDIT_MAX_PAGES };
+  let page: AuditPage | null;
+  try {
+    page = await reader.page({ to: selfSid, from: SEND_FROM, since: new Date(sinceMs).toISOString(), limit: AUDIT_ROW_LIMIT });
+  } catch {
+    page = null;
+  }
+  if (page === null || !Array.isArray(page.rows)) return { state: "audit_unavailable", inject_id: null };
+  const hit = page.rows.find((r) => rowCorroborates(r, sha256, selfSid));
+  if (hit !== undefined) return { state: "corroborated", inject_id: typeof hit.inject_id === "string" ? hit.inject_id : null };
+  return { state: "not_found", inject_id: null };
 }
 
 /**
- * The real reader: `telepty injects --json --to <sid> --from controller-link --since <iso> --limit 200`
- * (the report pump's query, src/report/pump.ts:339, plus `--from`), parsed as `{"injects":[…]}`
- * (pump.ts:341-345). The cursor flag and field of `T/cli.js:2835-2887` are not in this repository,
- * so this reader returns one page and never a cursor (fewer rows can only give `not_found`, the
- * fail-closed side). See SPEC-DEVIATIONS / HOLD-1.
+ * The real reader: exactly `telepty injects --json --to <sid> --from controller-link --since <iso> --limit 1000`
+ * (the report pump's query, src/report/pump.ts:339, plus `--from` and the larger limit), parsed as
+ * `{"injects":[…]}` (pump.ts:341-345). The `injects` command has no paging flag, so none is ever sent.
  */
 export function defaultAuditReader(runner: ProcessRunner, bin: string, baseEnv: NodeJS.ProcessEnv): AuditReader {
   return {
     async page(q) {
-      if (q.cursor !== null) return null;
       const argv = ["injects", "--json", "--to", q.to, "--from", q.from, "--since", q.since, "--limit", String(q.limit)];
       const r = await runner.run(bin, argv, { env: sendChildEnv(baseEnv), timeoutMs: AUDIT_TIMEOUT_MS });
       if (r.rc !== 0 || r.truncated) return null;
       try {
         const v: unknown = JSON.parse(r.stdout);
         if (!isObj(v) || !Array.isArray(v.injects)) return null;
-        return { rows: v.injects.filter((x): x is AuditRow => isObj(x)), next_cursor: null };
+        return { rows: v.injects.filter((x): x is AuditRow => isObj(x)) };
       } catch {
         return null;
       }
@@ -842,11 +847,12 @@ async function ingestAck(c: Ctx, e: Envelope, corr: CorroborationResult): Promis
     const seen = cur.acks_in[ackRef];
     if (seen !== undefined && f.seq <= seen.last_seq) return { write: null, value: none("STALE", cur) };
     const rec = clone(cur);
-    // An `unknown` answer may come from a peer with no record, which has no counter and always uses seq 1
-    // (ingestProbe / ingestReply), so its seq never becomes the ordering mark the peer's first real ACK is
-    // compared with (review CL-11). It never changes a state (senderStateAfterAck), so nothing it could undo.
-    const mark = state === "unknown" ? seen?.last_seq ?? 0 : f.seq;
-    rec.acks_in[ackRef] = { last_seq: mark, state, at: m.nowIso };
+    // Every applied ACK's own seq is the ordering mark, an `unknown` one included: decide.ts step 6 re-sends only
+    // on an `unknown` answer whose seq is above the consumed watermark (CL-01), so §9.2 step 6 needs this mark.
+    // Known limit (Root decision, CL-11 accepted with residual): a record-less `unknown` answer always has seq 1
+    // (ingestProbe / ingestReply), so the receiver's first real ACK `received` (also seq 1) is STALE here; its next
+    // ACK (`accepted`, seq 2) or the next probe answer moves the record. The record-less throttle stays.
+    rec.acks_in[ackRef] = { last_seq: f.seq, state, at: m.nowIso };
     addHistory(rec, m.nowIso, "ack_in", `${ackRef} seq=${f.seq} state=${state}`);
     let to: RecordState | null = null;
     if (toSender) {
@@ -903,8 +909,8 @@ async function ingestBlock(c: Ctx, parsed: EnvelopeResult): Promise<BlockOutcome
     return refuse("STALE_MESSAGE", `sent_at ${f.sent_at} is more than 1 day ahead of this machine's clock`);
   }
   const corr: CorroborationResult = f.kind === "PROBE"
-    ? { state: "not_found", inject_id: null, pages: 0 }
-    : await corroborate(c.deps.audit, e.sha256, c.cfg.self.controller_sid, nowMs);
+    ? { state: "not_found", inject_id: null }
+    : await corroborate(c.deps.audit, e.sha256, c.cfg.self.controller_sid, nowMs, Date.parse(f.sent_at));
   let applied: Applied;
   switch (f.kind) {
     case "REQUEST": applied = await ingestRequest(c, e, peer, corr); break;

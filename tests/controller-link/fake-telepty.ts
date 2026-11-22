@@ -289,16 +289,14 @@ export class FakeTelepty {
     return lines.length;
   }
 
-  /** U6 AuditReader over this machine's fake `telepty injects --json --to <sid> --from controller-link --since <iso>`. */
+  /** U6 AuditReader over this machine's fake `telepty injects --json --to <sid> --from controller-link --since <iso> --limit <n>` (one query, no paging). */
   auditReader(label: string): AuditReader {
     const ep = this.endpoint(label);
     return {
       page: async (q) => {
-        if (q.cursor !== null) return { rows: [], next_cursor: null };
         const since = Date.parse(q.since);
         return {
           rows: ep.audit.filter((r) => r.to === q.to && r.claimed_from === q.from && Date.parse(String(r.at)) >= since),
-          next_cursor: null,
         };
       },
     };

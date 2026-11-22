@@ -202,6 +202,29 @@ On native Windows run `pump --loop 60` yourself. `AIGENTRY_CONTROLLER_LINK_PUMP=
 Commands and `ingest` keep working; automatic probes, safe re-sends, reminders and retention stop
 until the variable is removed. A peer removed from the peers file is not probed or re-sent to.
 
+The pump's reminders are local notices to your own controller session. Each starts with
+`⟦controller-link notice⟧ <KIND> request_id=<id> role=… peer=… state=… sender_task=… receiver_task=… n=<k> —`,
+says what happened, and has a second line `next: <command>`. A notice is not an envelope and is never
+ingested itself.
+
+**`CORROBORATED`.** For 48 hours after an envelope was stored as `RESULT=UNVERIFIED` (a REQUEST, or a
+REPLY copy), the pump re-runs the audit check for it on every pass. When the audit shows it, the pump
+records that and posts:
+
+```text
+⟦controller-link notice⟧ CORROBORATED request_id=<id> role=<receiver|sender> peer=<label> state=<state> sender_task=<task> receiver_task=<task> n=<k> — a <REQUEST|REPLY> from peer <label> stored unverified is now corroborated by this machine's telepty audit; it has not been shown or applied; run the next command and act only on its RESULT=NEW
+next: bin/controller-link.sh ingest < "<store root>/raw/<sha256>.env"
+```
+
+Run the `next:` command as printed and act only on a `RESULT=NEW` line it prints, as for any `ingest`.
+The notice itself is never actionable. The pump does not apply the copy and sends no acknowledgement: the
+`ingest` you run applies it, shows the body and sends the ACK `received` (a deviation from SPEC §9.3,
+where the pump applied it). The notice repeats every 2 hours until that `ingest` applies the copy, for at
+most 48 hours after the copy arrived; after that an unverified request becomes `stalled` (a `STALLED`
+notice), and a REPLY copy gets a daily `REPLY_UNVERIFIED` notice. On native Windows run the same `ingest`
+with `node dist/src/controller-link/cli.js` from cmd.exe or Git Bash: PowerShell has no `<` redirection.
+If `next:` names `status` instead, the copy no longer waits.
+
 ## Rollout order
 
 1. Install the release with controller-link. On its own this changes nothing: without the peers file,
@@ -232,6 +255,20 @@ restoring the entry resumes them.
   `queued`. A row whose `claimed_from` is another string is not accepted; a row without one is (the
   query's `--from` filter is relied on). These are values the local daemon recorded and claimed. They
   do not prove which machine sent the bytes.
+- **One audit query, at most 1000 rows.** `telepty injects` has no paging flag, so `ingest` makes one
+  call: `telepty injects --json --to <your sid> --from controller-link --since <S> --limit 1000`. `<S>`
+  is 48 hours ago, or one day before the envelope's `sent_at` when that is later (one day is the clock
+  difference between the two machines that this feature tolerates). If 1000 or more matching injects
+  arrived in that window, the row may not be among the 1000 returned. The message is then
+  `RESULT=UNVERIFIED`, never refused: for a REQUEST or REPLY, the pump's re-checks during the next 48 hours (each one query of
+  the last 48 hours, without the `sent_at` bound) or a later `ingest` of the same copy can still find
+  it. If the peer's clock is more than one day ahead of yours, its acknowledgements are `UNVERIFIED` too
+  (its REQUESTs and REPLYs are then already `STALE_MESSAGE`): keep both clocks right.
+- **One acknowledgement may be STALE after a probe of an unknown request.** If your probe reaches the peer before
+  the request does, the peer has no record and answers ACK `unknown` with sequence 1. The pump then re-sends the
+  request once, as it must. The peer's first real acknowledgement (`received`) also carries sequence 1, so `ingest`
+  prints `RESULT=STALE` for it. Nothing is lost: the peer's next acknowledgement (`accepted`, sequence 2) or the
+  answer to the pump's next probe moves the record. At most this costs one extra probe.
 - **Body at most 12 KiB.** A request or reply body is at most 12288 bytes after normalisation, and
   the whole envelope at most 16384 bytes. There is no splitting. Send a longer text by other means.
 - **The receiving model must run `ingest`.** Nothing reads the envelope automatically. If the

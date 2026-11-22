@@ -15,6 +15,7 @@ import { REFUSE_REASONS, parseEnvelope, renderEnvelope, type Envelope, type Enve
 import type { ProcessRunner, RunnerResult } from "../../src/controller-link/send.js";
 import { ControllerLinkStore, type LinkRecord, type RecordRef, type RecordState } from "../../src/controller-link/store.js";
 import type { AuditQuery, AuditReader, AuditRow, CliDeps } from "../../src/controller-link/cli.js";
+import type { PumpDeps } from "../../src/controller-link/pump.js";
 
 // U4's reader captures AIGENTRY_TASK_QUEUE when it is first imported, so the variable is set
 // before cli.js (which imports it) is loaded. Each test rewrites this one fixture file.
@@ -78,7 +79,7 @@ function harness(t: TestContext, tasks: unknown[] = []): H {
   const audit: AuditReader = {
     async page(q) {
       h.queries.push(q);
-      return h.auditDown ? null : { rows: [...h.rows], next_cursor: null };
+      return h.auditDown ? null : { rows: [...h.rows] };
     },
   };
   h.deps = {
@@ -180,7 +181,7 @@ async function seedOutbox(h: H, id: string, state: RecordState = "sent"): Promis
 }
 
 // ── I1 corroboration ──────────────────────────────────────────────────────────────────────
-test("I1 corroboration: exact sha + claimed_cross_host:true + success|queued; each deviation is not; 5-page cap; query error", async (t) => {
+test("I1 corroboration: exact sha + claimed_cross_host:true + success|queued; each deviation is not; one query, no paging; query error", async (t) => {
   const sha = "a".repeat(64);
   const good: AuditRow = { inject_id: "row-1", to: SID, claimed_from: "controller-link", payload_sha256: sha,
     claimed_cross_host: true, delivery_result: "success" };
@@ -200,37 +201,52 @@ test("I1 corroboration: exact sha + claimed_cross_host:true + success|queued; ea
   ];
   for (const [name, row] of deviations) {
     assert.equal(cli.rowCorroborates(row, sha, SID), false, name);
-    const one: AuditReader = { async page() { return { rows: [row], next_cursor: null }; } };
-    assert.deepEqual(await cli.corroborate(one, sha, SID, T0), { state: "not_found", inject_id: null, pages: 1 }, name);
+    const one: AuditReader = { async page() { return { rows: [row] }; } };
+    assert.deepEqual(await cli.corroborate(one, sha, SID, T0), { state: "not_found", inject_id: null }, name);
   }
 
-  // The query, and the cursor followed for at most 5 pages.
+  // CL-04: exactly one query. Without a usable sent_at the window is the last 48 h.
   const queries: AuditQuery[] = [];
-  const endless: AuditReader = {
-    async page(q) {
-      queries.push(q);
-      return { rows: [{ ...good, payload_sha256: "c".repeat(64) }], next_cursor: `p${queries.length}` };
-    },
+  const other: AuditRow = { ...good, payload_sha256: "c".repeat(64) };
+  const recorder = (rows: AuditRow[]): AuditReader => ({ async page(q) { queries.push(q); return { rows }; } });
+  assert.deepEqual(await cli.corroborate(recorder([other]), sha, SID, T0), { state: "not_found", inject_id: null });
+  assert.deepEqual(queries, [{ to: SID, from: "controller-link", since: iso(T0 - 48 * 3_600_000), limit: 1000 }]);
+  // A result holding all 1000 rows the limit allows, none matching, is not evidence of absence: still
+  // `not_found` (not corroborated yet), with no second query.
+  queries.length = 0;
+  const full: AuditRow[] = Array.from({ length: 1000 }, (_, i) => ({ ...other, inject_id: `row-${i + 2}` }));
+  assert.deepEqual(await cli.corroborate(recorder(full), sha, SID, T0), { state: "not_found", inject_id: null });
+  assert.equal(queries.length, 1, "a full result never triggers another query");
+  queries.length = 0;
+  assert.deepEqual(await cli.corroborate(recorder([...full.slice(0, 999), good]), sha, SID, T0),
+    { state: "corroborated", inject_id: "row-1" });
+  assert.equal(queries.length, 1);
+  // --since: sent_at − 1 day when that is later than now − 48 h and sent_at is not after now + 1 day; else now − 48 h.
+  const sinceFor = async (sentAtMs: number | null): Promise<string> => {
+    queries.length = 0;
+    await cli.corroborate(recorder([]), sha, SID, T0, sentAtMs);
+    assert.equal(queries.length, 1);
+    return queries[0]!.since;
   };
-  assert.deepEqual(await cli.corroborate(endless, sha, SID, T0), { state: "not_found", inject_id: null, pages: 5 });
-  assert.equal(queries.length, 5);
-  assert.deepEqual(queries[0], { to: SID, from: "controller-link", since: iso(T0 - 48 * 3_600_000), limit: 200, cursor: null });
-  assert.deepEqual(queries.slice(1).map((q) => q.cursor), ["p1", "p2", "p3", "p4"]);
-  let n = 0;
-  const third: AuditReader = { async page() { n++; return { rows: n === 3 ? [good] : [], next_cursor: `p${n}` }; } };
-  assert.deepEqual(await cli.corroborate(third, sha, SID, T0), { state: "corroborated", inject_id: "row-1", pages: 3 });
+  assert.equal(await sinceFor(T0 - 60_000), iso(T0 - 60_000 - DAY));
+  assert.equal(await sinceFor(T0 + DAY), iso(T0), "a sent_at at the 1-day future bound: since = now");
+  assert.equal(await sinceFor(T0 - 47 * 3_600_000), iso(T0 - 48 * 3_600_000), "never wider than 48 h");
+  assert.equal(await sinceFor(T0 - 10 * DAY), iso(T0 - 48 * 3_600_000));
+  assert.equal(await sinceFor(T0 + DAY + 1000), iso(T0 - 48 * 3_600_000), "a sent_at beyond the bound is not used");
+  assert.equal(await sinceFor(Number.NaN), iso(T0 - 48 * 3_600_000));
+  assert.equal(await sinceFor(null), iso(T0 - 48 * 3_600_000));
   assert.equal((await cli.corroborate({ async page() { return null; } }, sha, SID, T0)).state, "audit_unavailable");
   assert.equal((await cli.corroborate({ async page() { throw new Error("daemon down"); } }, sha, SID, T0)).state, "audit_unavailable");
 
-  // The real reader: argv, child env, `{"injects":[…]}` parsing, failures → null, no cursor guessing.
+  // The real reader: argv, child env, `{"injects":[…]}` parsing, failures → null, no guessed paging flag.
   const calls: Array<{ bin: string; argv: string[]; env: NodeJS.ProcessEnv }> = [];
   let reply: RunnerResult = { rc: 0, stdout: JSON.stringify({ injects: [good, 7, null] }), stderr: "", truncated: false };
   const runner: ProcessRunner = { async run(bin, argv, opts) { calls.push({ bin, argv: [...argv], env: opts.env }); return reply; } };
   const reader = cli.defaultAuditReader(runner, "telepty-x", { HOME: "/h", TELEPTY_SESSION_ID: "worker-sid" });
-  const q: AuditQuery = { to: SID, from: "controller-link", since: iso(T0), limit: 200, cursor: null };
-  assert.deepEqual(await reader.page(q), { rows: [good], next_cursor: null });
+  const q: AuditQuery = { to: SID, from: "controller-link", since: iso(T0), limit: 1000 };
+  assert.deepEqual(await reader.page(q), { rows: [good] });
   assert.equal(calls[0]!.bin, "telepty-x");
-  assert.deepEqual(calls[0]!.argv, ["injects", "--json", "--to", SID, "--from", "controller-link", "--since", iso(T0), "--limit", "200"]);
+  assert.deepEqual(calls[0]!.argv, ["injects", "--json", "--to", SID, "--from", "controller-link", "--since", iso(T0), "--limit", "1000"]);
   assert.equal(calls[0]!.env.TELEPTY_SESSION_ID, undefined);
   reply = { ...reply, rc: 1 };
   assert.equal(await reader.page(q), null);
@@ -238,9 +254,39 @@ test("I1 corroboration: exact sha + claimed_cross_host:true + success|queued; ea
   assert.equal(await reader.page(q), null);
   reply = { rc: 0, stdout: JSON.stringify({ injects: [good] }), stderr: "", truncated: true };
   assert.equal(await reader.page(q), null);
-  const before = calls.length;
-  assert.equal(await reader.page({ ...q, cursor: "p1" }), null);
-  assert.equal(calls.length, before, "a cursor page is never requested with a guessed flag");
+  // corroborate() through the real reader: the exact argv of the one call, also when the result is full.
+  calls.length = 0;
+  reply = { rc: 0, stdout: JSON.stringify({ injects: full }), stderr: "", truncated: false };
+  assert.deepEqual(await cli.corroborate(reader, sha, SID, T0, T0 - 60_000), { state: "not_found", inject_id: null });
+  assert.equal(calls.length, 1, "one `telepty injects` call per corroboration");
+  assert.deepEqual(calls[0]!.argv, ["injects", "--json", "--to", SID, "--from", "controller-link",
+    "--since", iso(T0 - 60_000 - DAY), "--limit", "1000"]);
+  // `telepty injects` takes exactly --to --from --since --spoof --limit --json --tail: no paging flag exists,
+  // so none is ever sent (a guessed cursor/offset/page flag would reach the real daemon).
+  const flags = calls.flatMap((c) => c.argv.filter((a) => a.startsWith("-")));
+  assert.deepEqual(flags.filter((f) => !["--json", "--to", "--from", "--since", "--limit"].includes(f)), [],
+    "a paging flag is never requested");
+
+  // Through ingest: the query is the narrowed one (sent_at of the fixture REQUEST is T0 − 60 s).
+  const hq = harness(t);
+  const eq = request(randomUUID());
+  audited(hq, eq);
+  assert.equal(await run(hq, ["ingest"], eq.text), 0);
+  assert.deepEqual(hq.queries, [{ to: SID, from: "controller-link", since: iso(T0 - 60_000 - DAY), limit: 1000 }]);
+
+  // Through ingest: a full result without the row stays UNVERIFIED (not evidence of absence); once the
+  // row is found, the same message is NEW.
+  const hf = harness(t);
+  const ef = request(randomUUID());
+  hf.rows.push(...full);
+  assert.equal(await run(hf, ["ingest"], ef.text), 5);
+  assert.equal(result(hf), "RESULT=UNVERIFIED");
+  assert.equal(hf.queries.length, 1);
+  assert.equal(hf.calls.length, 0);
+  hf.rows.length = 0;
+  audited(hf, ef);
+  assert.equal(await run(hf, ["ingest"], ef.text), 0);
+  assert.equal(result(hf), "RESULT=NEW");
 
   // Through ingest: a failed audit query stores the REQUEST as unverified and sends nothing.
   const h = harness(t);
@@ -828,7 +874,7 @@ test("CL-09 a store failure while recording the ACK's send result does not hide 
   assert.equal(result(h), "RESULT=DUPLICATE");
 });
 
-test("CL-11 record-less probe answers are throttled per (id, ref); an `unknown` answer's seq does not make the first real ACK STALE", async (t) => {
+test("CL-11 record-less probe answers are throttled per (id, ref); after a record-less `unknown` (seq 1) the first real ACK (seq 1) is STALE and ACK accepted (seq 2) moves the record (known limit)", async (t) => {
   const h = harness(t);
   // Receiver side: a probe about a request this side has no record of.
   const stranger = randomUUID();
@@ -844,7 +890,9 @@ test("CL-11 record-less probe answers are throttled per (id, ref); an `unknown` 
   assert.equal(h.calls.length, 2);
   assert.equal(await h.store.read(inbox(stranger)), null, "no record");
 
-  // Sender side: the peer's record-less `unknown` (seq 1), then its first real ACKs (seq 1, 2).
+  // Sender side: the peer's record-less `unknown` (seq 1), then its first real ACKs (seq 1, 2). The `unknown` sets the
+  // ordering mark to 1 (needed for the §9.2 step 6 re-send, Root decision on CL-11 × CL-01), so the real ACK received
+  // (seq 1) is STALE; ACK accepted (seq 2) moves the record (docs/setup/controller-link.md "Limits").
   const id = randomUUID();
   await seedOutbox(h, id, "send_unknown");
   const ack = (seq: number, state: EnvelopeFields["state"]): Envelope => {
@@ -857,7 +905,7 @@ test("CL-11 record-less probe answers are throttled per (id, ref); an `unknown` 
     await run(h, ["ingest"], a.text);
     results.push(`${result(h).slice("RESULT=".length)}:${a.fields.seq}`);
   }
-  assert.deepEqual(results, ["DUPLICATE:1", "NEW:1", "NEW:2"]);
+  assert.deepEqual(results, ["DUPLICATE:1", "STALE:1", "NEW:2"]);
   const r = await rec(h, outbox(id));
   assert.equal(r.state, "accepted");
   assert.equal(r.acks_in["REQUEST-1"]!.last_seq, 2);
@@ -865,6 +913,45 @@ test("CL-11 record-less probe answers are throttled per (id, ref); an `unknown` 
   await run(h, ["ingest"], ack(1, "unknown").text);
   assert.equal(result(h), "RESULT=STALE");
   assert.equal((await rec(h, outbox(id))).acks_in["REQUEST-1"]!.state, "accepted");
+});
+
+test("CL-11 × CL-01 (Root decision): an `unknown` ACK applied by the real ingestAck authorises exactly one §9.2 step-6 re-send", async (t) => {
+  const { decide } = await import("../../src/controller-link/decide.js");
+  const { runPump } = await import("../../src/controller-link/pump.js");
+  const h = harness(t);
+  const id = randomUUID();
+  const req = await seedOutbox(h, id, "send_unknown");
+  const facts = () => ({ nowMs: h.now.ms, peerActive: true, goneOwners: new Set<string>() });
+  assert.notEqual(decide(await rec(h, outbox(id)), facts()).kind, "resend", "no answer yet: no re-send");
+
+  // The peer's answer about REQUEST-1: ACK `unknown` (record-less, seq 1), corroborated, through the real ingest.
+  const unknown = envelope(fields("ACK", id, { ref: "REQUEST-1", seq: 1, state: "unknown" }));
+  audited(h, unknown);
+  assert.equal(await run(h, ["ingest"], unknown.text), 0);
+  assert.equal(result(h), "RESULT=DUPLICATE", "an `unknown` answer changes no state");
+  const answered = await rec(h, outbox(id));
+  assert.deepEqual([answered.acks_in["REQUEST-1"]!.last_seq, answered.acks_in["REQUEST-1"]!.state], [1, "unknown"]);
+  // The real decide: the one re-send (same bytes).
+  assert.deepEqual(decide(answered, facts()), { kind: "resend", key: "REQUEST-1", trigger: "ack_unknown", sha256: req.sha256 });
+
+  // The real pump performs it once and records the answer it consumed (ack_seq 1).
+  const deps: PumpDeps = {
+    ...h.deps, monoMs: () => 0, pidAlive: () => true, sleep: async () => undefined, localHosts: ["test-host"],
+    notice: { inject: () => ({ rc: 0, stdout: "", stderr: "" }) },
+  };
+  const before = h.calls.length;
+  assert.equal(await runPump(["--once"], deps), 0);
+  const resent = sent(h).slice(before);
+  assert.deepEqual(resent.map((f) => [f.kind, f.id, f.seq]), [["REQUEST", id, 1]]);
+  assert.equal(h.calls[before]!.argv[h.calls[before]!.argv.length - 1], req.text, "the same bytes");
+  const after = await rec(h, outbox(id));
+  const sends = after.messages["REQUEST-1"]!.sends!;
+  assert.equal(sends.length, 2);
+  assert.deepEqual([sends[1]!.trigger, sends[1]!.ack_seq], ["ack_unknown", 1]);
+  // A second evaluation of the same answer: no re-send, and nothing is due now.
+  assert.equal(decide(after, facts()).kind, "none", "the answer authorised exactly one re-send");
+  assert.equal(await runPump(["--once"], deps), 0);
+  assert.equal(h.calls.length, before + 1, "a second pump pass sends nothing");
 });
 
 test("CL-10 / CL-14 / CL-17 shipped text: decide before register or bind; pump and resend documented; audit claim as narrow as the check", () => {
@@ -884,4 +971,40 @@ test("CL-10 / CL-14 / CL-17 shipped text: decide before register or bind; pump a
   assert.doesNotMatch(guide, /resend --reason "manual duplicate test"/, "the old duplicate recipe could not run");
   assert.match(guide, /it first decides, by its own rules/);
   assert.match(guide, /a row without one is \(the\s+query's `--from` filter is relied on\)/);
+});
+
+test("CL-05 shipped text: the CORROBORATED notice, its `next:` command and what to do are documented as the pump renders them", async () => {
+  const { NOTICE_MARKER, renderControllerNotice } = await import("../../src/controller-link/pump.js");
+  const { NOTICE_SCHEDULES, VERIFY_WINDOW_MS } = await import("../../src/controller-link/decide.js");
+  const id = randomUUID();
+  const raw = path.join(tmpdir(), "store", "raw", `${"d".repeat(64)}.env`);
+  const rec = { v: 1, role: "receiver", request_id: id, peer: PEER, peer_target: PEER_TARGET, self_label: SELF, sender_task: "1291",
+    receiver_task: null, state: "unverified", state_at: iso(T0), history: [] } as unknown as LinkRecord;
+  const [first, second, ...more] = renderControllerNotice(rec, "corroborated", 1, raw).split("\n");
+  assert.deepEqual(more, []);
+  assert.ok(first!.startsWith(`${NOTICE_MARKER} CORROBORATED request_id=${id} role=receiver peer=${PEER} state=unverified `), first);
+  assert.equal(second, `next: bin/controller-link.sh ingest < "${raw}"`);
+  const fixed = "stored unverified is now corroborated by this machine's telepty audit; it has not been shown or applied; " +
+    "run the next command and act only on its RESULT=NEW";
+  assert.ok(first!.endsWith(fixed), first);
+  assert.equal(NOTICE_SCHEDULES.corroborated.everyMs, 2 * 3_600_000, "documented: every 2 hours");
+  assert.equal(VERIFY_WINDOW_MS, 48 * 3_600_000, "documented: for at most 48 hours");
+
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+  const guide = fs.readFileSync(path.join(root, "docs", "setup", "controller-link.md"), "utf8");
+  assert.ok(guide.includes(`${NOTICE_MARKER} CORROBORATED request_id=<id> role=<receiver|sender> `));
+  assert.ok(guide.includes(fixed), "the guide shows the notice text the pump renders");
+  assert.ok(guide.includes('next: bin/controller-link.sh ingest < "<store root>/raw/<sha256>.env"'));
+  assert.match(guide, /act only on a `RESULT=NEW` line it prints/);
+  assert.match(guide, /repeats every 2 hours until that\s+`ingest` applies the copy/);
+  const role = fs.readFileSync(path.join(root, "tooling", "instructions", "roles", "orchestrator.md"), "utf8");
+  const section = role.slice(role.indexOf("## Peer controller messages"));
+  assert.ok(section.includes(`\`${NOTICE_MARKER} CORROBORATED request_id=<id> …\``));
+  assert.ok(section.includes('`bin/controller-link.sh ingest < "<the stored copy>"`'));
+  assert.match(section, /act ONLY on a `RESULT=NEW` line/);
+  assert.match(section, /never `ingest` the notice text/);
+  assert.match(section, /repeats every 2 hours/);
+  assert.equal(section.includes("{{"), false, "the installer refuses an unsubstituted double-brace token");
+  // CL-04: no paging wording is shipped.
+  assert.doesNotMatch(guide + section, /cursor|at most 5 pages|pages two/i);
 });
