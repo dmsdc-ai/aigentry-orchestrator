@@ -275,7 +275,7 @@ envelope by hand.
   `--observe`, `--task-class`, `--keep-alive`, `--verify-delivered`,
   `--retry-unknown` or `--input-*` (exit 4).
 - The ref file is sent inline as the body: at most 12288 bytes, no `⟦` or
-  `⟧`, no `{{ORCHESTRATOR_REPORT_TARGET}}`. Write it as a request between
+  `⟧`, no report-target placeholder (the double-brace token a worker dispatch ref carries). Write it as a request between
   peers, not as a worker prompt.
 - Exit 0 prints `OK peer request <id> to <target> consumption=<submit>`;
   note the id on your task. Exit 8: an open request with the same task and
