@@ -45,8 +45,13 @@ function world(): World {
   const sh = (p: string, body: string): void => writeFileSync(p, `#!/bin/sh\n${body}`, { mode: 0o755 });
   sh(join(bin, "telepty"), `printf 'telepty %s\\n' "$*" >> "$T1303_LOG"\n[ "$1" = list ] && printf '[]'\n[ "$1" = spawn ] && exit "\${T1303_SPAWN_RC:-0}"\nexit 0\n`);
   // tmux / wezterm recorders: argv recorded, nothing started; status from the env (default 0).
-  sh(join(bin, "tmux"), `printf 'tmux %s\\n' "$*" >> "$T1303_LOG"\nexit "\${T1303_TMUX_RC:-0}"\n`);
+  // Task 1304 D3: a successful `new-window -P -F '#{window_id}'` prints the window id, as tmux does.
+  sh(join(bin, "tmux"), `printf 'tmux %s\\n' "$*" >> "$T1303_LOG"\n[ "$1" = new-window ] && [ "\${T1303_TMUX_RC:-0}" = 0 ] && echo "@1303"\nexit "\${T1303_TMUX_RC:-0}"\n`);
   sh(join(bin, "wezterm"), `printf 'wezterm %s\\n' "$*" >> "$T1303_LOG"\nexit "\${T1303_WEZTERM_RC:-0}"\n`);
+  // R2-03: an aterm that always FAILS, first on PATH. open-session.sh appends /opt/homebrew/bin and
+  // /usr/local/bin, so without it a host's real aterm could open a real terminal; failing, it sends every
+  // aterm leg down _wh_fallback_spawn exactly as an absent aterm would, and the call is recorded.
+  sh(join(bin, "aterm"), `printf 'aterm %s\\n' "$*" >> "$T1303_LOG"\nexit 1\n`);
   // The Warp deeplink handoff: recorded, then refused, so _wh_warp_open stops at its exit 2.
   sh(join(bin, "open"), `printf 'opener %s\\n' "$*" >> "$T1303_LOG"\nexit 1\n`);
   sh(join(bin, "xdg-open"), `printf 'opener %s\\n' "$*" >> "$T1303_LOG"\nexit 1\n`);
@@ -165,9 +170,11 @@ if (!WIN) {
     assert.doesNotMatch(r.err, /telepty attach/, "an attach hint was printed for a session that was never started");
   });
 
-  test("forced aterm with no aterm CLI, daemon fallback whose `telepty spawn` fails: exit 2, NO sid", () => {
+  test("forced aterm whose CLI fails, daemon fallback whose `telepty spawn` fails: exit 2, NO sid", () => {
     const W = world(), r = openSession(W, "atfail", { AIGENTRY_WORKSPACE_HOST: "aterm", T1303_SPAWN_RC: "1" });
     assert.match(r.err, /\[workspace-host\] open: adapter=aterm sid=t1303-atfail/);
+    // R2-03: the aterm that was resolved is the failing recorder, never a host binary.
+    assert.match(r.calls, /^aterm new-session /m, r.calls);
     assert.match(r.calls, /^telepty spawn --id t1303-atfail -- /m, r.calls);
     assert.equal(r.status, 2, r.err);
     assert.equal(r.out, "");
@@ -184,19 +191,20 @@ if (!WIN) {
     return { status: r.status, out: (r.stdout ?? "").trim(), err: r.stderr ?? "", calls: readFileSync(W.log, "utf8") };
   }
 
-  test("forced tmux: a failing `tmux new-window` gives rc 2 and NO sid; a working one prints the sid", () => {
+  test("forced tmux: a failing `tmux new-window` gives rc 2 and NO handle; a working one prints the window id", () => {
     const W = world();
     const bad = whOpen(W, "t1303-tmuxfail", { AIGENTRY_WORKSPACE_HOST: "tmux", T1303_TMUX_RC: "1" });
     assert.match(bad.calls, /^tmux new-window -c .* -n t1303-tmuxfail /m, bad.calls);
     assert.equal(bad.status, 2, bad.err);
-    assert.equal(bad.out, "", "a sid was printed for a tmux window that was never opened");
+    assert.equal(bad.out, "", "a handle was printed for a tmux window that was never opened");
     assert.match(bad.err, /ERR tmux spawn failed \(rc=1\)/);
     const ok = whOpen(W, "t1303-tmuxok", { AIGENTRY_WORKSPACE_HOST: "tmux" });
     assert.equal(ok.status, 0, ok.err);
-    assert.equal(ok.out, "t1303-tmuxok");
+    // Task 1304 D3: the handle is the window id the lifecycle verbs address, not the sid.
+    assert.equal(ok.out, "@1303");
   });
 
-  test("fallback tmux branch (aterm absent, inside tmux): a failing window gives rc 2 and NO sid; a working one prints it", () => {
+  test("fallback tmux branch (aterm fails, inside tmux): a failing window gives rc 2 and NO sid; a working one prints it", () => {
     const W = world();
     const bad = whOpen(W, "t1303-fbfail", { AIGENTRY_WORKSPACE_HOST: "aterm", TMUX: "/tmp/t1303-fake-tmux", T1303_TMUX_RC: "1" });
     assert.match(bad.calls, /^tmux new-window -c .* -n t1303-fbfail /m, bad.calls);
@@ -215,11 +223,38 @@ if (!WIN) {
     // otherwise execs the bash this PATH would have found without it, so detection and `open` still work.
     const realBash = [dirname(process.execPath), "/usr/bin", "/bin"].map((d) => join(d, "bash")).find((p) => existsSync(p));
     assert.ok(realBash, "no bash on the test PATH");
+    // R2-03: the real bash path travels in the environment, so no character in it (an apostrophe
+    // included) can break the wrapper's own shell text.
     writeFileSync(join(W.bin, "bash"),
-      `#!/bin/sh\nfor a in "$@"; do case "$a" in *_wh_is_registered*) exit 1;; esac; done\nexec '${realBash}' "$@"\n`, { mode: 0o755 });
-    const r = openSession(W, "probefail", { AIGENTRY_WORKSPACE_HOST: "wezterm" });
+      `#!/bin/sh\nfor a in "$@"; do case "$a" in *_wh_is_registered*) exit 1;; esac; done\nexec "$T1303_REAL_BASH" "$@"\n`, { mode: 0o755 });
+    const r = openSession(W, "probefail", { AIGENTRY_WORKSPACE_HOST: "wezterm", T1303_REAL_BASH: realBash! });
     assert.equal(r.status, 0, r.err);
     assert.equal(r.out, "t1303-probefail");
+    assert.doesNotMatch(r.calls, /^wezterm /m, "an unverified force was applied");
+    oneDiag(r, "open-session.sh: terminal detected=headless forced=registry-probe-failed-ignored adapter=headless", W);
+  });
+
+  // ── R2-01: an unreadable registry table is a failed probe, never an authoritative miss ──
+  test("the registry predicate answers 0 registered, 1 explicit miss, 2 unreadable table", () => {
+    const W = world();
+    const ask = (name: string, path: string): number | null =>
+      spawnSync("bash", ["-c", '. "$1"; _wh_is_registered "$2"', "_", WH_LIB, name],
+        { env: { PATH: path, HOME: W.home }, encoding: "utf8", timeout: 30000 }).status;
+    assert.equal(ask("wezterm", `${W.bin}:/usr/bin:/bin`), 0);
+    assert.equal(ask("not-a-registered-adapter-1303", `${W.bin}:/usr/bin:/bin`), 1);
+    // A `cat` that fails with no output: the table cannot be read, so a REGISTERED name is not a miss.
+    const broken = join(W.root, "broken-cat");
+    mkdirSync(broken, { recursive: true });
+    writeFileSync(join(broken, "cat"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    assert.equal(ask("wezterm", `${broken}:${W.bin}:/usr/bin:/bin`), 2);
+  });
+
+  test("a registered force whose registry table cannot be read is labelled registry-probe-failed, not unregistered", () => {
+    const W = world();
+    writeFileSync(join(W.bin, "cat"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    const r = openSession(W, "catfail", { AIGENTRY_WORKSPACE_HOST: "wezterm" });
+    assert.equal(r.status, 0, r.err);
+    assert.equal(r.out, "t1303-catfail");
     assert.doesNotMatch(r.calls, /^wezterm /m, "an unverified force was applied");
     oneDiag(r, "open-session.sh: terminal detected=headless forced=registry-probe-failed-ignored adapter=headless", W);
   });

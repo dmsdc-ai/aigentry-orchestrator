@@ -105,6 +105,10 @@ t_setup() {
   # harness spawns with the guard off; T100 turns it back on against a recorder
   # binary, which is the only place a hold_awake call is ever observed.
   export AIGENTRY_SLEEP_GUARD=0
+  # task 1304 D2: every successful wh_open writes a per-sid adapter record, and every
+  # lifecycle verb and the readiness reader consult it. Hermetic means no guard writes
+  # into, or reads a stale record from, the operator's ~/.aigentry/workspace-host.
+  export AIGENTRY_WH_STATE_DIR="$T_TMP/wh-state"
   export DISPATCH_STATE_DIR="$T_TMP/state"
   mkdir -p "$DISPATCH_STATE_DIR"
   # telepty#60 Stage A: the registry is a versioned envelope, not a root array.

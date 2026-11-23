@@ -292,7 +292,12 @@ interface ProbeState {
   /** r4 B1: `detail.tracker_class`, already emitted — the independent live-work signal. */
   trackerClass: string;
   probeError: boolean;
+  /** Task 1304 D4: the adapter named by a `READINESS_UNATTESTABLE adapter=<name>` probe error
+   *  (the session's terminal has no screen reader), else "". */
+  unattestable: string;
 }
+
+const UNATTESTABLE = /^READINESS_UNATTESTABLE adapter=([a-z]{1,32})$/;
 
 function probeState(sid: string, cliKind: string, timeoutMs = READINESS_CAPTURE_MAX_MS): ProbeState | null {
   const { stdout } = capture(SESSION_PROBE_PY, ["--sid", sid, "--cli", cliKind], { TELEPTY }, timeoutMs);
@@ -307,6 +312,7 @@ function probeState(sid: string, cliKind: string, timeoutMs = READINESS_CAPTURE_
       readyReason: typeof detail.ready_reason === "string" ? detail.ready_reason : "",
       trackerClass: typeof detail.tracker_class === "string" ? detail.tracker_class : "",
       probeError: detail.probe_error !== undefined,
+      unattestable: typeof detail.probe_error === "string" ? (UNATTESTABLE.exec(detail.probe_error)?.[1] ?? "") : "",
     };
   } catch {
     return null;
@@ -2183,13 +2189,24 @@ async function waitForReady(o: Opts, sid: string, measured?: BusyAdmission): Pro
   const anchored = measured !== undefined && measured.probed;
   const deadline = (anchored ? measured!.startedAt : nowMs()) + effectiveTimeout;
   for (;;) {
-    let ready: boolean;
+    // Task 1304 D4: the same probe isReady() reads (its `ready` is isReady's verdict), kept
+    // whole so an adapter with no screen reader is seen on the first answer.
+    let state: ProbeState | null;
     if (reused !== undefined) {
-      ready = reused !== null && reused.ready;
+      state = reused;
       reused = undefined;
     } else {
-      ready = isReady(sid, cliKind, Math.max(1, Math.min(READINESS_CAPTURE_MAX_MS, deadline - nowMs())));
+      state = probeState(sid, cliKind, Math.max(1, Math.min(READINESS_CAPTURE_MAX_MS, deadline - nowMs())));
     }
+    if (state !== null && state.unattestable !== "") {
+      process.stderr.write(
+        `dispatch.sh: READINESS_UNATTESTABLE adapter=${state.unattestable} — ${sid}'s terminal adapter has no ` +
+        `current-screen reader, so REPL readiness cannot be attested (cli=${cliKind}); stopping now instead of ` +
+        `waiting ${effectiveTimeout}ms. Choose an adapter that can read the screen (cmux, warp or tmux) with AIGENTRY_WORKSPACE_HOST.\n`,
+      );
+      return 1;
+    }
+    const ready = state !== null && state.ready;
     if (ready) return 0;
     if (nowMs() >= deadline) {
       process.stderr.write(

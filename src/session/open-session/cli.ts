@@ -174,10 +174,12 @@ function platform(fn: string, args: string[] = [], opts: RunOpts = {}): { status
  * #1303: `_wh_is_registered <name>` — the same registry check _wh_adapter applies to an env-force.
  * Only an explicit answer on stdout counts: a lib that could not be sourced, a missing predicate,
  * a shell that could not start or was killed is "probe-failed", never a confirmed miss.
+ * R2-01: only the predicate's explicit-miss status (1) is "unregistered"; any other non-zero —
+ * the registry table could not be read (2) — is probe-failed too.
  */
 function registryAnswer(name: string): "registered" | "unregistered" | "probe-failed" {
   const r = run("bash", ["-c",
-    '. "$1" || exit 70; declare -F _wh_is_registered >/dev/null || exit 70; if _wh_is_registered "$2"; then echo registered; else echo unregistered; fi',
+    '. "$1" || exit 70; declare -F _wh_is_registered >/dev/null || exit 70; _wh_is_registered "$2"; case $? in 0) echo registered;; 1) echo unregistered;; *) exit 71;; esac',
     "_", WH_LIB, name], { err: "ignore" });
   const answer = chomp(r.stdout);
   return r.status === 0 && (answer === "registered" || answer === "unregistered") ? answer : "probe-failed";

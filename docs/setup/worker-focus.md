@@ -103,6 +103,26 @@ reaches a host adapter at all and the spool is left in place. A mismatch line sa
 about whether the task finished or whether the session is alive. Inspecting or closing that
 surface is a human call.
 
+## Warp workers — `tmux` is required
+
+Warp can only open a tab from outside; nothing else in it can be driven. A worker spawned
+with the `warp` adapter therefore runs inside its own tmux session (`aigentry-warp-<sid>`,
+with `.` written as `%2E`), and the Warp tab only attaches to it, in the active Warp window.
+Readiness, liveness, close and the screen read all go through tmux on macOS and Linux
+alike; macOS Accessibility is used only to raise the window for focus (exact title match).
+
+- Install `tmux` on every machine that spawns Warp workers, and make sure it is on the PATH
+  of the processes that close them (the reconciler and `session-cleanup.sh`). Without tmux,
+  a Warp spawn fails at once with exit 2 and leaves nothing behind.
+- `TERM_PROGRAM=WarpTerminal` selects Warp for a controller started inside Warp. Tool
+  shells and launchd do not carry it, so pin a machine's terminal with
+  `AIGENTRY_WORKSPACE_HOST=warp` in the controller's environment.
+- Each spawn records its adapter in `~/.aigentry/workspace-host/<sid>.rec`
+  (`AIGENTRY_WH_STATE_DIR` overrides the directory), so later close, liveness and focus
+  calls reach the right terminal without the override. A session without a record keeps
+  the old rule (cmux if installed, else headless), and a line on stderr says so.
+- Warp has no sidebar, so status pills are a no-op there.
+
 ## Packaging note
 
 This file is not listed in `package.json` `files`, so it is in the repository but not in the
