@@ -21,6 +21,9 @@
 //     _wh_adapter and _wh_fallback_spawn appear in the shell's COMMENTS only
 //     (:141-144) and are NOT doors — T104 part F pins that set at 11 so a 12th
 //     cannot appear unmeasured.
+//     #1303 adds one read-only lib predicate, NOT a door: _wh_is_registered, through
+//     the same `bash -c '. <lib>; <fn>'` idiom as platform.sh below, so an explicit
+//     AIGENTRY_WORKSPACE_HOST is validated against the ONE registry (no TS copy of it).
 //   lib/platform.sh → `bash -c '. <lib>; <fn> "${@:3}"'`, the idiom
 //     src/reconciler/cli.ts:340 and src/tracker/cli.ts already run in production,
 //     for platform::session_pid and platform::hold_awake (the shell's :283-285).
@@ -90,6 +93,7 @@ const SCRIPT_DIR =
 const INVOKED_DIR = path.dirname(env.AIGENTRY_SHIM_SCRIPT_PATH || path.join(SCRIPT_DIR, "open-session.sh"));
 const WH_CLI = path.join(SCRIPT_DIR, "wh-cli.sh");
 const PLATFORM_SH = path.join(SCRIPT_DIR, "lib/platform.sh");
+const WH_LIB = path.join(SCRIPT_DIR, "lib/workspace-host.sh");
 const HOME = env.HOME || "";
 const CONFIG_FILE = env.AIGENTRY_CONFIG || path.join(HOME, ".aigentry/config.json");
 
@@ -164,6 +168,11 @@ function wh(args: string[], opts: RunOpts = {}): { status: number; stdout: strin
 /** `platform::<fn>` from bin/lib/platform.sh, as a subprocess (src/reconciler/cli.ts's idiom). */
 function platform(fn: string, args: string[] = [], opts: RunOpts = {}): { status: number; stdout: string } {
   return run("bash", ["-c", `. "$1"; ${fn} "\${@:3}"`, "_", PLATFORM_SH, "_", ...args], { err: "inherit", ...opts });
+}
+
+/** #1303: `_wh_is_registered <name>` — the same registry check _wh_adapter applies to an env-force. */
+function registeredAdapter(name: string): boolean {
+  return run("bash", ["-c", '. "$1"; _wh_is_registered "$2"', "_", WH_LIB, name], { out: "ignore", err: "ignore" }).status === 0;
 }
 
 // ── argv (the shell's :60-96) ───────────────────────────────────────────────
@@ -388,16 +397,27 @@ function cleanupOnExit(ec: number): never {
 /**
  * Open session in the detected terminal (ADR §7 Phase 3, D1/D2). Always wraps in
  * `telepty allow --id <sid>` so the daemon registers it (visible to `telepty list`
- * + inject targets). A THIN dispatch: detect-terminal names the adapter, `open`
+ * + inject targets). A THIN dispatch: a registered explicit AIGENTRY_WORKSPACE_HOST,
+ * else detect-terminal, names the adapter (#1303), `open`
  * spawns through the single Workspace Host seam. BC4-a: AIGENTRY_WH_LEGACY_SPAWN=1
  * still forces the original inline cmux path for an immediate revert if the cmux
  * seam regresses (live daemon 3848 protection) — see ./legacy-spawn.ts.
  */
 function openInTerminal(): string {
   const term = chomp(wh(["detect-terminal"]).stdout);
+  // #1303: an explicit AIGENTRY_WORKSPACE_HOST naming a REGISTERED adapter wins (the
+  // _wh_adapter contract); detect_terminal decides only when nothing valid was forced.
+  // An unregistered value is ignored exactly as _wh_adapter ignores it, and is never
+  // echoed: the diagnostic below carries registry names and fixed words only.
+  const forced = env.AIGENTRY_WORKSPACE_HOST || "";
+  const forcedValid = forced !== "" && registeredAdapter(forced);
+  const adapter = forcedValid ? forced : term;
+  process.stderr.write(
+    `open-session.sh: terminal detected=${term || "none"} forced=${forced === "" ? "none" : forcedValid ? forced : "unregistered-ignored"} adapter=${adapter || "auto"}\n`,
+  );
   const cliCmd = `${cli} ${extraFlags}`;
 
-  if (term === "cmux" && env.AIGENTRY_WH_LEGACY_SPAWN === "1") {
+  if (adapter === "cmux" && env.AIGENTRY_WH_LEGACY_SPAWN === "1") {
     const r = spawnSync("bash", ["-c", LEGACY_CMUX_SPAWN, "_", cwd, sid, cliCmd, title], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "inherit"],
@@ -410,12 +430,13 @@ function openInTerminal(): string {
     return chomp(r.stdout ?? "");
   }
 
-  // Phase 3 single dispatch (D1/D2): the detected terminal IS the adapter. Force it
-  // so `open` routes to _wh_<term>_open (env-force beats _wh_adapter auto-detect,
-  // which only auto-selects cmux/headless). Adapter exit codes propagate verbatim —
+  // Phase 3 single dispatch (D1/D2): the resolved adapter (#1303: a valid explicit
+  // force, else the detected terminal). Force it so `open` routes to _wh_<adapter>_open
+  // (env-force beats _wh_adapter auto-detect, which only auto-selects cmux/headless).
+  // Adapter exit codes propagate verbatim —
   // e.g. the cmux contract: 2 = spawn failure, 3 = ready-timeout with the workspace
   // closed, 64 = no such adapter.
-  const opened = wh(["open", sid, cwd, cliCmd], { env: { ...env, AIGENTRY_WORKSPACE_HOST: term } });
+  const opened = wh(["open", sid, cwd, cliCmd], { env: { ...env, AIGENTRY_WORKSPACE_HOST: adapter } });
   if (opened.status !== 0) cleanupOnExit(opened.status);
   const ref = chomp(opened.stdout);
 
