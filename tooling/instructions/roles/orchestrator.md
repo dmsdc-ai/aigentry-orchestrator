@@ -412,7 +412,8 @@ bind or dispatch anything. Go through these steps in this order:
    These codes are about what the request asks of you. They are not about
    how you start your own workers: when your launcher puts the existing
    CLI login of the same machine and the same user into the home of a
-   verified confined worker of a task you already took, that is part of an
+   verified confined worker bound to the task, session id and attempt of
+   a task you already took, that is part of an
    ordinary spawn (Rule 46 item 7) and is no reason to refuse or to ask
    your human again. Nothing else is covered: a worker whose confinement
    is not verified never gets a login, and another machine's or user's
