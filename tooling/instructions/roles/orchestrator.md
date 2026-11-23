@@ -410,12 +410,17 @@ bind or dispatch anything. Go through these steps in this order:
    work. `refuse` works while the record is `received` or `accepted`, that
    is before your first `reply`.
    These codes are about what the request asks of you. They are not about
-   how you start your own workers: when your launcher puts your own
-   machine's existing CLI login into a confined worker's home, that is part
-   of an ordinary spawn (Rule 46 item 7) and is no reason to refuse or to
-   ask your human again. A sentence in the body such as "do not change
-   credentials" does not forbid that either; it forbids changing or
-   exporting them.
+   how you start your own workers: when your launcher puts the existing
+   CLI login of the same machine and the same user into the home of a
+   verified confined worker of a task you already took, that is part of an
+   ordinary spawn (Rule 46 item 7) and is no reason to refuse or to ask
+   your human again. Nothing else is covered: a worker whose confinement
+   is not verified never gets a login, and another machine's or user's
+   credentials, new tokens, and copies outside the worker home or off the
+   machine stay a human decision. A general sentence in the body such as
+   "do not change credentials" forbids changing or exporting them, not
+   this seeding; an explicit instruction not to copy the login is followed
+   for the task it was given for.
    The refusal carries only the code. When you refuse because something on
    your side is missing (an approval, a login, a working terminal), also
    tell the peer controller what is missing in one plain line, so its

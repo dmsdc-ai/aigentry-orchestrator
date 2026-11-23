@@ -233,8 +233,10 @@ Steps (Mac → Linux shown; then repeat Linux → Mac):
 
 0. Before the run, on EACH machine: let the controller start one confined worker for a local task of its
    own and see it report. A receiver that cannot start workers can only refuse or answer `blocked`.
-   Starting a confined worker puts that machine's existing CLI login into the worker's home; this is part
-   of the spawn and needs no separate approval (rules, Rule 46 item 7). In `spec.md`, ask for the work and
+   Starting a verified confined worker for a task the controller already took puts the existing CLI login
+   of the same machine and the same user into that worker's home; this is part of the spawn and needs no
+   separate approval (rules, Rule 46 item 7). It covers nothing else: no unconfined worker, no other
+   machine's or user's credentials, no copy outside the worker home. In `spec.md`, ask for the work and
    nothing else. Do not add sentences like "do not change any credential": in the 2026-11-23 run a
    receiver read that sentence as forbidding the spawn and refused twice with `scope_not_grantable`.
 1. Sender: register a local test task. Write a short request in `spec.md`. Run
