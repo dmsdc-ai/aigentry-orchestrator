@@ -109,31 +109,39 @@ _wh_fail_category() {
   esac
 }
 
-# _wh_foreign_env_scrub <host> — task 1304 round 3 (incident 2026-11-23): the `env -u …`
-# prefix every NON-cmux spawn puts in front of its worker command, so a worker hosted
-# somewhere else never carries the controller's terminal identity. Measured: a worker
-# in a tmux session inherited the tmux SERVER's environment, captured when the server
-# was first started from the cmux controller's shell; telepty then stored backend=cmux
-# and the controller's cmuxWorkspaceId for it, and cleanup closed the controller.
-# The prefix runs INSIDE the pane/worker command, so it also beats a stale tmux server
-# environment, not only the caller's.
-#   Always removed: CMUX_WORKSPACE_ID, CMUX_SURFACE_ID, CMUX_TERMINAL_LIFECYCLE_ID (the
-#     cmux markers this code and telepty read) and TELEPTY_SESSION_ID (the controller's
-#     own session id).
-#   ATERM_IPC_SOCKET unless aterm hosts the worker.
-#   TMUX / TMUX_PANE unless tmux hosts it: a worker legitimately inside tmux (warp,
-#     tmux, the fallback's tmux branch) KEEPS them, because tmux sets them for that
-#     pane itself and they name the worker's own pane.
-#   TERM_PROGRAM / TERM_PROGRAM_VERSION unless the host sets its own for the pane
-#     (tmux, WezTerm, iTerm); elsewhere they would name the controller's terminal.
-# Every token is a fixed literal name, so the result is safe both as shell text and
-# word-split as argv (#926's quoting rules are untouched). cmux spawns do not use it.
+# _wh_foreign_env_scrub <host> — task 1304 rounds 3–4 (incident 2026-11-23): the prefix
+# every NON-cmux spawn puts in front of its worker command, so a worker hosted somewhere
+# else never carries the controller's terminal identity. Measured: a worker in a tmux
+# session inherited the tmux SERVER's environment, captured when the server was first
+# started from the cmux controller's shell — first the cmux workspace/surface ids
+# (telepty then attributed the worker to the controller's workspace and cleanup closed
+# it), and, after round 3, still 39 other CMUX_* names (panel/tab ids, socket paths,
+# agent-launch data, wrapper-shim paths, a token-file path).
+#
+# The prefix is `/bin/sh -c '<script>' sh <worker command…>`, run INSIDE the pane/worker
+# command, so a stale tmux server environment cannot bring anything back. The script:
+#   - unsets EVERY variable whose name starts with CMUX_. Names come from `env | sed`;
+#     values are never printed, logged or kept;
+#   - unsets TELEPTY_SESSION_ID (the controller's own session id);
+#   - unsets ATERM_IPC_SOCKET unless aterm hosts the worker, and TMUX / TMUX_PANE
+#     unless tmux does (a worker legitimately inside tmux keeps them: tmux sets them
+#     for its own pane);
+#   - keeps TERM_PROGRAM / TERM_PROGRAM_VERSION ONLY when TERM_PROGRAM is the host's own
+#     value (tmux → "tmux", WezTerm → "WezTerm", iTerm → "iTerm.app"; measured on the Mac:
+#     a tmux-hosted worker sees "tmux", which tmux sets for every pane). Anything else
+#     — an older tmux that sets nothing, a value inherited from the controller — is
+#     removed. With no visible host (headless, daemon fallback, aterm) both go;
+#   - then `exec "$@"`, so the worker command runs exactly as before.
+# POSIX sh, `env`, `sed` only (bash 3.2, macOS and Linux userland; no GNU-only flag).
+# The script holds no single quote, so the prefix is one literal shell text that every
+# spawn site embeds unchanged (#926's quoting rules are untouched). cmux spawns do not
+# use it.
 _wh_foreign_env_scrub() {
-  local host="${1:-none}" out="env -u CMUX_WORKSPACE_ID -u CMUX_SURFACE_ID -u CMUX_TERMINAL_LIFECYCLE_ID -u TELEPTY_SESSION_ID"
-  [ "$host" = "aterm" ] || out="$out -u ATERM_IPC_SOCKET"
-  [ "$host" = "tmux" ] || out="$out -u TMUX -u TMUX_PANE"
-  case "$host" in tmux|wezterm|iterm) ;; *) out="$out -u TERM_PROGRAM -u TERM_PROGRAM_VERSION" ;; esac
-  printf '%s' "$out"
+  local host="${1:-none}" drop="TELEPTY_SESSION_ID" own=""
+  [ "$host" = "aterm" ] || drop="$drop ATERM_IPC_SOCKET"
+  [ "$host" = "tmux" ] || drop="$drop TMUX TMUX_PANE"
+  case "$host" in tmux) own="tmux" ;; wezterm) own="WezTerm" ;; iterm) own="iTerm.app" ;; esac
+  printf '%s' "/bin/sh -c 'for v in \$(env | sed -n \"s/^\\(CMUX_[A-Za-z0-9_]*\\)=.*/\\1/p\"); do unset \"\$v\"; done; unset $drop; [ \"\${TERM_PROGRAM:-}\" = \"$own\" ] && [ -n \"$own\" ] || unset TERM_PROGRAM TERM_PROGRAM_VERSION; exec \"\$@\"' sh"
 }
 
 # _wh_refuse_own_surface <adapter> <host_id> — task 1304 round 3: 0, plus ONE labelled
@@ -1149,8 +1157,7 @@ _wh_fallback_spawn() {
     # `telepty spawn -- …` execs its argv directly, so this takes the true argv
     # shape and needs no quoting pass at all.
     local _scrub; _scrub=$(_wh_foreign_env_scrub none)
-    # shellcheck disable=SC2086 # fixed literal tokens, split into argv on purpose
-    telepty spawn --id "$_sid" -- $_scrub bash -c "cd \"\$1\" && exec $_cli_cmd" _ "$_cwd" >/dev/null
+    telepty spawn --id "$_sid" -- bash -c "cd \"\$1\" && exec $_scrub $_cli_cmd" _ "$_cwd" >/dev/null
     # #1303: same contract — a failed daemon spawn returns 2 with no handle and no attach hint.
     local _rc=$?
     [ "$_rc" -eq 0 ] || { echo "ERR telepty spawn failed (rc=$_rc) — the spawn command did not confirm success, so no handle is returned" >&2; return 2; }
@@ -1255,8 +1262,7 @@ _wh_wezterm_open() {
     # #926: `wezterm cli spawn -- …` execs its argv directly (no shell re-parse),
     # so cwd and sid go on argv as-is — no %q pass needed.
     local scrub; scrub=$(_wh_foreign_env_scrub wezterm)
-    # shellcheck disable=SC2086 # fixed literal tokens, split into argv on purpose
-    wezterm cli spawn --cwd "$cwd" -- $scrub bash -c "cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd" _ "$cwd" "$sid" >/dev/null
+    wezterm cli spawn --cwd "$cwd" -- bash -c "cd \"\$1\" && exec $scrub telepty allow --id \"\$2\" --auto-restart $cli_cmd" _ "$cwd" "$sid" >/dev/null
     # #1303: a spawn that did not happen hands back NO handle — _wh_iterm_open's contract (2).
     local rc=$?
     [ "$rc" -eq 0 ] || { echo "ERR wezterm spawn failed (rc=$rc) — the spawn command did not confirm success, so no handle is returned" >&2; return 2; }
@@ -1304,8 +1310,7 @@ _wh_headless_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
   # #926: argv shape — `telepty spawn -- …` execs its argv directly.
   local scrub; scrub=$(_wh_foreign_env_scrub none)
-  # shellcheck disable=SC2086 # fixed literal tokens, split into argv on purpose
-  telepty spawn --id "$sid" -- $scrub bash -c "cd \"\$1\" && exec $cli_cmd" _ "$cwd" >/dev/null
+  telepty spawn --id "$sid" -- bash -c "cd \"\$1\" && exec $scrub $cli_cmd" _ "$cwd" >/dev/null
   # #1303: a spawn that did not happen hands back NO handle — _wh_iterm_open's contract (2).
   local rc=$?
   [ "$rc" -eq 0 ] || { echo "ERR telepty spawn failed (rc=$rc) — the spawn command did not confirm success, so no handle is returned" >&2; return 2; }
@@ -1536,8 +1541,10 @@ _wh_record_write() {
 # same sid fell back to "cmux if installed", and cmux closed the CONTROLLER's workspace
 # that telepty had wrongly attributed to the worker. With the tombstone that later call
 # resolves the original adapter and its close is an idempotent no-op. A tombstone is
-# removed by a re-open of the sid (_wh_record_write) or when a close-for-sid finds no
-# mapping at all (the session is gone from every host, so there is nothing to misroute).
+# removed by a re-open of the sid (_wh_record_write), when a close-for-sid finds no
+# mapping at all (the session is gone from every host, so there is nothing to misroute),
+# or by wh_prune_orphans once the sid has been absent from the live set on two ticks
+# (_wh_tombstone_gc, round 4).
 
 # _wh_record_drop_sid <sid> — remove that sid's record AND tombstone (idempotent).
 _wh_record_drop_sid() {
@@ -1678,8 +1685,47 @@ wh_focus() {
 # wh_prune_orphans <live_ids_csv> <protected_refs_csv> — close host workspaces
 # whose session has vanished, gated (SPEC §A). Prints count closed; always 0.
 wh_prune_orphans() {
-  local adapter; adapter=$(_wh_adapter)
-  "_wh_${adapter}_prune_orphans" "$@"
+  local adapter rc=0; adapter=$(_wh_adapter)
+  "_wh_${adapter}_prune_orphans" "$@" || rc=$?
+  _wh_tombstone_gc "${1:-}"
+  return "$rc"
+}
+
+# _wh_tombstone_gc <live_ids_csv> — task 1304 r4: the END of a tombstone's life. A
+# tombstone whose sid is absent from the live set on TWO consecutive prune ticks (the
+# same seen-twice debounce the host prunes use; ledger next to the records) is removed.
+# The live set is the reconciler's telepty ids, so a session telepty still lists keeps
+# its tombstone: through close-for-sid, through session-cleanup (whose DELETE comes after
+# its surface close) and for as long as a leftover `telepty allow` keeps it registered.
+# Once telepty has no row for the sid there is no telepty-provided host id left that the
+# default rule could misroute. Prints nothing (the prune count stays the host prune's);
+# honours DRY_RUN; logs the sid only.
+_wh_tombstone_gc() {
+  local live_csv="${1:-}" dry="${DRY_RUN:-0}" dir ledger old new="" f sid nl=$'\n'
+  dir=$(_wh_state_dir)
+  [ -d "$dir" ] || return 0
+  ledger="$dir/tombstone-ledger"
+  old=$(cat "$ledger" 2>/dev/null || true)
+  for f in "$dir"/*.closed; do
+    [ -e "$f" ] || continue
+    sid="${f##*/}"; sid="${sid%.closed}"
+    _wh_safe_sid "$sid" || continue
+    case ",$live_csv," in *",$sid,"*) continue ;; esac
+    case "$nl$old$nl" in
+      *"$nl$sid$nl"*)
+        if [ "$dry" = "1" ]; then
+          _wh_log "PRUNE would-remove tombstone sid=$sid"
+          new="$new$sid$nl"
+        elif rm -f "$f" 2>/dev/null; then
+          _wh_log "PRUNE removed tombstone sid=$sid (absent from the live set on two ticks)"
+        else
+          new="$new$sid$nl"
+        fi ;;
+      *) new="$new$sid$nl" ;; # first sighting → record + keep (debounce floor)
+    esac
+  done
+  printf '%s' "$new" > "$ledger" 2>/dev/null || true
+  return 0
 }
 
 # wh_set_status <host_id> <state> — push session state to the host sidebar

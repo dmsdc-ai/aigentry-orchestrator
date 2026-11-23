@@ -122,15 +122,18 @@ alike; macOS Accessibility is used only to raise the window for focus (exact tit
   calls reach the right terminal without the override. A session without a record keeps
   the old rule (cmux if installed, else headless), and a line on stderr says so.
 - Warp has no sidebar, so status pills are a no-op there.
-- A worker hosted outside cmux never gets the controller's terminal identity: every
-  non-cmux spawn starts the worker through `env -u CMUX_WORKSPACE_ID -u CMUX_SURFACE_ID
-  -u CMUX_TERMINAL_LIFECYCLE_ID -u TELEPTY_SESSION_ID …`. This matters because a tmux server
-  started from a cmux shell keeps that shell's environment for every later session.
+- A worker hosted outside cmux never gets the controller's terminal identity. Every
+  non-cmux spawn starts the worker through a small `/bin/sh` prefix that unsets every
+  `CMUX_*` variable, `TELEPTY_SESSION_ID`, and the markers of terminals other than its
+  host. It keeps `TERM_PROGRAM` only when it is the host's own value, for example `tmux`
+  inside tmux. This matters because a tmux server started from a cmux shell keeps that
+  shell's environment for every later session.
 - `wh-cli.sh close` and `close-for-sid` release the surface only, and they refuse (exit 4,
   nothing closed) a surface the caller itself runs in. A closed session keeps a tombstone
   (`<sid>.closed`), so a later `session-cleanup.sh <sid>` still uses the adapter that
-  opened it. Ending the worker's `telepty allow` process and its registry entry is
-  `session-cleanup.sh`'s job.
+  opened it. The reconciler's prune removes the tombstone once the session has been absent
+  from telepty on two consecutive ticks. Ending the worker's `telepty allow` process and
+  its registry entry is `session-cleanup.sh`'s job.
 
 ## Packaging note
 

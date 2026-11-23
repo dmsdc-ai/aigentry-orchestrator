@@ -211,9 +211,11 @@ import sys
 path, name, cwd, sid = sys.argv[1:5]
 got = open(path, "rb").read().split(b"\0")[:-1]
 got = [g.decode("utf-8") for g in got]
-# task 1304 r3: the worker command starts with the foreign-terminal scrub (host = tmux,
-# so TMUX/TMUX_PANE and TERM_PROGRAM stay: tmux sets them for the pane itself).
-scrub = "env -u CMUX_WORKSPACE_ID -u CMUX_SURFACE_ID -u CMUX_TERMINAL_LIFECYCLE_ID -u TELEPTY_SESSION_ID -u ATERM_IPC_SOCKET"
+# task 1304 r3/r4: the worker command starts with the foreign-terminal scrub (host = tmux:
+# every CMUX_* goes; TMUX/TMUX_PANE stay; TERM_PROGRAM stays only if it is tmux's own).
+scrub = (r"""/bin/sh -c 'for v in $(env | sed -n "s/^\(CMUX_[A-Za-z0-9_]*\)=.*/\1/p"); do unset "$v"; done; """
+         r"""unset TELEPTY_SESSION_ID ATERM_IPC_SOCKET; [ "${TERM_PROGRAM:-}" = "tmux" ] && [ -n "tmux" ] """
+         r"""|| unset TERM_PROGRAM TERM_PROGRAM_VERSION; exec "$@"' sh""")
 want = ["new-session", "-A", "-s", name, "-c", cwd, f"{scrub} telepty allow --id '{sid}' --auto-restart claude --x"]
 if got != want:
     print(f"  got:  {got!r}\n  want: {want!r}", file=sys.stderr)

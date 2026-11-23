@@ -49,7 +49,7 @@ for p in telepty claude; do
   cat > "$PROBE_DIR/$p" <<'EOF'
 #!/usr/bin/env bash
 { echo "RUN $(basename "$0") $*"
-  env | grep -E '^(CMUX_WORKSPACE_ID|CMUX_SURFACE_ID|CMUX_TERMINAL_LIFECYCLE_ID|TELEPTY_SESSION_ID|ATERM_IPC_SOCKET|TMUX|TMUX_PANE|TERM_PROGRAM|TERM_PROGRAM_VERSION)=' | sed 's/^/ENV /'
+  env | grep -E '^(CMUX_[A-Za-z0-9_]*|TELEPTY_SESSION_ID|ATERM_IPC_SOCKET|TMUX|TMUX_PANE|TERM_PROGRAM|TERM_PROGRAM_VERSION)=' | sed 's/=.*//; s/^/ENV /'
 } >> "${PROBE_LOG:?}"
 EOF
   chmod +x "$PROBE_DIR/$p"
@@ -126,9 +126,15 @@ wh() { "$CC_BASH_BIN" "$CC_WH_CLI" "$@"; }
 AMBIENT=(CMUX_WORKSPACE_ID="$CTRL" CMUX_SURFACE_ID="7879253D-0000-4000-8000-00000000C0DE"
          CMUX_TERMINAL_LIFECYCLE_ID="11111111-0000-4000-8000-00000000C0DE"
          TELEPTY_SESSION_ID=orchestrator ATERM_IPC_SOCKET=/tmp/t1304-fake-aterm
-         TERM_PROGRAM=ghostty TERM_PROGRAM_VERSION=0.0-fixture)
-probe_has() { grep -qE "^ENV ($1)=" "$PROBE_LOG"; }
-LEAK='CMUX_WORKSPACE_ID|CMUX_SURFACE_ID|CMUX_TERMINAL_LIFECYCLE_ID|TELEPTY_SESSION_ID|ATERM_IPC_SOCKET'
+         TERM_PROGRAM=ghostty TERM_PROGRAM_VERSION=0.0-fixture
+         CMUX_PANEL_ID=fixture-panel CMUX_TAB_ID=fixture-tab CMUX_SOCKET=/tmp/t1304-fake-cmux.sock
+         CMUX_SOCKET_PATH=/tmp/t1304-fake-cmux.sock CMUX_CLAUDE_PID=1
+         CMUX_AGENT_LAUNCH_KIND=fixture CMUX_CLAUDE_WRAPPER_SHIM=/tmp/t1304-fake-shim
+         CMUX_CUA_AUTH_TOKEN_FILE=/tmp/t1304-fake-token CMUX_FUTURE_UNNAMED_FIXTURE=1)
+probe_has() { grep -qE "^ENV ($1)\$" "$PROBE_LOG"; }
+# r4: EVERY CMUX_* name counts as a leak, not just the identity ids (measured after r3:
+# 39 others reached the worker — panel/tab ids, sockets, wrapper shims, a token file).
+LEAK='CMUX_[A-Za-z0-9_]*|TELEPTY_SESSION_ID|ATERM_IPC_SOCKET'
 
 # ════ (1) P1 — the scrub ════════════════════════════════════════════════════════════
 : > "$PROBE_LOG"; cc_reset_logs P1-warp
@@ -138,8 +144,11 @@ cc_expect_exit "$?" 0 "P1 warp open with the controller's markers in the environ
 cc_has "RUN telepty allow --id t1304-s1" "P1 warp: the worker command really ran inside the pane" "$PROBE_LOG"
 if probe_has "$LEAK"; then cc_not_ok "P1 warp: the worker does not see CMUX_*/TELEPTY_SESSION_ID/ATERM_IPC_SOCKET" "$(cat "$PROBE_LOG")"
 else cc_ok "P1 warp: the worker does not see CMUX_*/TELEPTY_SESSION_ID/ATERM_IPC_SOCKET"; fi
-cc_has 'env -u CMUX_WORKSPACE_ID -u CMUX_SURFACE_ID -u CMUX_TERMINAL_LIFECYCLE_ID -u TELEPTY_SESSION_ID' \
+cc_has 'sed -n \"s/^\\(CMUX_[A-Za-z0-9_]*\\)=' \
   "P1 warp: the scrub is IN the tab config's pane command (beats a stale tmux server env)" "$T_TMP/kept.toml"
+# r4: the controller's TERM_PROGRAM (ghostty) is not tmux's own value, so it is removed
+if probe_has 'TERM_PROGRAM|TERM_PROGRAM_VERSION'; then cc_not_ok "R4-1 warp: a TERM_PROGRAM that is not tmux's own does not reach the worker" "$(cat "$PROBE_LOG")"
+else cc_ok "R4-1 warp: a TERM_PROGRAM that is not tmux's own does not reach the worker"; fi
 
 : > "$PROBE_LOG"
 env "${AMBIENT[@]}" TMUX=/tmp/t1304-fake-tmux,1,0 AIGENTRY_WORKSPACE_HOST=tmux "$CC_BASH_BIN" "$CC_WH_CLI" open t1304-s2 "$T_TMP" "claude --x" \
@@ -150,6 +159,17 @@ if probe_has "$LEAK"; then cc_not_ok "P1 tmux: the worker does not see the contr
 else cc_ok "P1 tmux: the worker does not see the controller's markers"; fi
 if probe_has 'TMUX'; then cc_ok "P1 tmux: a tmux-hosted worker KEEPS TMUX (its own pane's)"
 else cc_not_ok "P1 tmux: a tmux-hosted worker KEEPS TMUX (its own pane's)" "$(cat "$PROBE_LOG")"; fi
+if probe_has 'TERM_PROGRAM'; then cc_not_ok "R4-1 tmux: the controller's TERM_PROGRAM (ghostty) is removed" "$(cat "$PROBE_LOG")"
+else cc_ok "R4-1 tmux: the controller's TERM_PROGRAM (ghostty) is removed"; fi
+# …and tmux's own value (what a real tmux pane carries) is kept
+: > "$PROBE_LOG"
+env "${AMBIENT[@]}" TERM_PROGRAM=tmux TERM_PROGRAM_VERSION=3.5 TMUX=/tmp/t1304-fake-tmux,1,0 AIGENTRY_WORKSPACE_HOST=tmux \
+  "$CC_BASH_BIN" "$CC_WH_CLI" open t1304-s2b "$T_TMP" "claude --x" > /dev/null 2> "$CC_EVID/p1-tmux-own.err"
+cc_has "RUN telepty allow --id t1304-s2b" "R4-1 tmux (own TERM_PROGRAM): the window command ran" "$PROBE_LOG"
+if probe_has 'TERM_PROGRAM' && probe_has 'TERM_PROGRAM_VERSION'; then cc_ok "R4-1 tmux: tmux's own TERM_PROGRAM/_VERSION are kept"
+else cc_not_ok "R4-1 tmux: tmux's own TERM_PROGRAM/_VERSION are kept" "$(cat "$PROBE_LOG")"; fi
+if probe_has "$LEAK"; then cc_not_ok "R4-1 tmux (own TERM_PROGRAM): still no CMUX_* at all" "$(cat "$PROBE_LOG")"
+else cc_ok "R4-1 tmux (own TERM_PROGRAM): still no CMUX_* at all"; fi
 
 : > "$PROBE_LOG"
 env "${AMBIENT[@]}" TMUX=/tmp/t1304-ctrl-tmux,1,0 TMUX_PANE=%9 AIGENTRY_WORKSPACE_HOST=headless \
@@ -223,6 +243,26 @@ rc=$(r3_run_cleanup P3-cleanup "$SID")
 cc_assert_cmux_count "close-workspace" 0 "P3 the incident sequence: session-cleanup performs NO cmux close"
 cc_none "$CTRL" "P3: the controller's workspace id is never named as a host closed" "$CC_EVID/P3-cleanup.out" "$CC_EVID/P3-cleanup.err"
 cc_assert_no_kills "P3: kill tripwire stayed empty"
+
+# ── R4-2: the tombstone's END. It survives every prune tick while telepty still lists the
+# sid (between close and the end of cleanup the adapter is never unknown), and goes on the
+# SECOND consecutive tick on which the sid is absent from the live set (seen-twice).
+[ -e "$STATE/$SID.closed" ] && cc_ok "R4-2: the tombstone is still there after session-cleanup's surface close" \
+  || cc_not_ok "R4-2: the tombstone is still there after session-cleanup's surface close" "$(ls -A "$STATE" 2>&1)"
+for tick in 1 2 3; do
+  env -u AIGENTRY_WORKSPACE_HOST AIGENTRY_CMUX_ORPHAN_LEDGER="$T_TMP/cmux-ledger.json" "$CC_BASH_BIN" "$CC_WH_CLI" prune-orphans "$SID,sid-A" "" > "$CC_EVID/r42-live-$tick.out" 2>/dev/null
+done
+[ -e "$STATE/$SID.closed" ] && cc_ok "R4-2: three ticks with the sid LIVE keep the tombstone" \
+  || cc_not_ok "R4-2: three ticks with the sid LIVE keep the tombstone" "$(ls -A "$STATE" 2>&1)"
+env -u AIGENTRY_WORKSPACE_HOST AIGENTRY_CMUX_ORPHAN_LEDGER="$T_TMP/cmux-ledger.json" "$CC_BASH_BIN" "$CC_WH_CLI" prune-orphans "sid-A" "" > "$CC_EVID/r42-gone-1.out" 2>/dev/null
+[ -e "$STATE/$SID.closed" ] && cc_ok "R4-2: the first tick with the sid gone keeps it (debounce floor)" \
+  || cc_not_ok "R4-2: the first tick with the sid gone keeps it (debounce floor)"
+env -u AIGENTRY_WORKSPACE_HOST AIGENTRY_CMUX_ORPHAN_LEDGER="$T_TMP/cmux-ledger.json" "$CC_BASH_BIN" "$CC_WH_CLI" prune-orphans "sid-A" "" > "$CC_EVID/r42-gone-2.out" 2> "$CC_EVID/r42-gone-2.err"
+[ -e "$STATE/$SID.closed" ] && cc_not_ok "R4-2: the second tick with the sid gone removes the tombstone" "$(ls -A "$STATE" 2>&1)" \
+  || cc_ok "R4-2: the second tick with the sid gone removes the tombstone"
+[ "$(cat "$CC_EVID/r42-gone-2.out")" = "0" ] && cc_ok "R4-2: prune's stdout is still only the host prune's count" \
+  || cc_not_ok "R4-2: prune's stdout is still only the host prune's count" "$(cat "$CC_EVID/r42-gone-2.out")"
+cc_assert_cmux_count "close-workspace" 0 "R4-2: tombstone removal closed nothing"
 
 # the record AND its tombstone lost: the cmux lookup itself must refuse the id
 rm -f "$STATE/$SID.rec" "$STATE/$SID.closed"
