@@ -111,7 +111,8 @@ bin/controller-link.sh pump    --once | --loop <seconds>                        
   `pending`, `in_progress`, `delegated`, `queued` or `blocked-by-observation`. It does not create tasks.
 - `refuse` codes: `scope_not_grantable`, `credentials_requested`, `remote_action_requested`,
   `registration_bypass_requested`, `out_of_policy`, `cannot_do`, `duplicate_of_existing`.
-  It needs `received` or `accepted`.
+  It needs `received` or `accepted`. The acknowledgement carries the code and no text, so the sender
+  cannot see what was missing; the refusing controller says that in a separate plain message.
 - `reply` needs `accepted` or `replying` and no earlier `--final`. Outcomes: `done`, `blocked`,
   `failed`, `declined`. Exactly one of `--final` / `--interim`. At most 32 replies.
 - `probe` works on any open record that has a message of yours to ask about. The sender asks about
@@ -230,6 +231,12 @@ Preconditions:
 
 Steps (Mac → Linux shown; then repeat Linux → Mac):
 
+0. Before the run, on EACH machine: let the controller start one confined worker for a local task of its
+   own and see it report. A receiver that cannot start workers can only refuse or answer `blocked`.
+   Starting a confined worker puts that machine's existing CLI login into the worker's home; this is part
+   of the spawn and needs no separate approval (rules, Rule 46 item 7). In `spec.md`, ask for the work and
+   nothing else. Do not add sentences like "do not change any credential": in the 2026-11-23 run a
+   receiver read that sentence as forbidding the spawn and refused twice with `scope_not_grantable`.
 1. Sender: register a local test task. Write a short request in `spec.md`. Run
    `bin/dispatch.sh --target orchestrator@<peer> --ref spec.md --task <id>`.
    Save the command line, its stdout, stderr and exit code. The exit must be 0 with
