@@ -4,12 +4,15 @@
 # Source via:
 #   source "$SCRIPT_DIR/lib/workspace-host.sh"
 #
-# Adapter selection (env override → auto-detect):
+# Adapter selection (env override → per-sid record → auto-detect):
 #   AIGENTRY_WORKSPACE_HOST=cmux     # force cmux
-#   AIGENTRY_WORKSPACE_HOST=warp     # force warp (macOS UI-scripting; Warp has no
-#                                    #   desktop CLI → never auto-detected, env-force only)
+#   AIGENTRY_WORKSPACE_HOST=warp     # force warp (Warp shows, tmux controls — task 1304 D3;
+#                                    #   lifecycle auto rule never picks it, the record does)
 #   AIGENTRY_WORKSPACE_HOST=headless # no-op (CI / docker / windows-terminal fallback)
-#   (unset)                          # auto: cmux if `cmux` on PATH, else headless
+#   (unset)                          # the adapter recorded by wh_open for that sid/handle
+#                                    #   (${AIGENTRY_WH_STATE_DIR:-~/.aigentry/workspace-host});
+#                                    #   with no record: cmux if `cmux` on PATH, else headless,
+#                                    #   plus one stderr line saying the adapter is unknown
 #
 # Contract (5 methods — every adapter MUST implement all five):
 #
@@ -52,6 +55,14 @@
 #
 #   wh_clear_status <host_id>
 #       Remove the aigentry status pill. Idempotent. Exit: 0 (always).
+#
+# Screen read (task 1304 ADR D4 — reopens the verb boundary on purpose: dispatch
+# readiness consumes it outside wh_open):
+#
+#   wh_read_screen <host_id|sid>
+#       Print the CURRENT viewport text of the surface (no scrollback).
+#       Exit: 0 text printed, 1 the read failed, 20 the adapter has no screen reader
+#       (one labelled line `read_screen unsupported adapter=<name>` on stdout).
 #
 # Per-surface agent metadata (#1162 G2c, controller interface lock). Terminal-neutral
 # verbs; cmux forwards to dist/src/session/agent-metadata.js, every other adapter is
@@ -98,6 +109,72 @@ _wh_fail_category() {
   esac
 }
 
+# _wh_foreign_env_scrub <host> — task 1304 rounds 3–4 (incident 2026-11-23): the prefix
+# every NON-cmux spawn puts in front of its worker command, so a worker hosted somewhere
+# else never carries the controller's terminal identity. Measured: a worker in a tmux
+# session inherited the tmux SERVER's environment, captured when the server was first
+# started from the cmux controller's shell — first the cmux workspace/surface ids
+# (telepty then attributed the worker to the controller's workspace and cleanup closed
+# it), and, after round 3, still 39 other CMUX_* names (panel/tab ids, socket paths,
+# agent-launch data, wrapper-shim paths, a token-file path).
+#
+# The prefix is `/bin/sh -c '<script>' sh <worker command…>`, run INSIDE the pane/worker
+# command, so a stale tmux server environment cannot bring anything back. The script:
+#   - unsets EVERY variable whose name starts with CMUX_. Names come from `env | sed`;
+#     values are never printed, logged or kept;
+#   - unsets TELEPTY_SESSION_ID (the controller's own session id);
+#   - unsets ATERM_IPC_SOCKET unless aterm hosts the worker, and TMUX / TMUX_PANE
+#     unless tmux does (a worker legitimately inside tmux keeps them: tmux sets them
+#     for its own pane);
+#   - keeps TERM_PROGRAM / TERM_PROGRAM_VERSION ONLY when TERM_PROGRAM is the host's own
+#     value (tmux → "tmux", WezTerm → "WezTerm", iTerm → "iTerm.app"; measured on the Mac:
+#     a tmux-hosted worker sees "tmux", which tmux sets for every pane). Anything else
+#     — an older tmux that sets nothing, a value inherited from the controller — is
+#     removed. With no visible host (headless, daemon fallback, aterm) both go;
+#   - then `exec "$@"`, so the worker command runs exactly as before.
+# POSIX sh, `env`, `sed` only (bash 3.2, macOS and Linux userland; no GNU-only flag).
+# The script holds no single quote, so the prefix is one literal shell text that every
+# spawn site embeds unchanged (#926's quoting rules are untouched). cmux spawns do not
+# use it.
+_wh_foreign_env_scrub() {
+  local host="${1:-none}" drop="TELEPTY_SESSION_ID" own=""
+  [ "$host" = "aterm" ] || drop="$drop ATERM_IPC_SOCKET"
+  [ "$host" = "tmux" ] || drop="$drop TMUX TMUX_PANE"
+  case "$host" in tmux) own="tmux" ;; wezterm) own="WezTerm" ;; iterm) own="iTerm.app" ;; esac
+  printf '%s' "/bin/sh -c 'for v in \$(env | sed -n \"s/^\\(CMUX_[A-Za-z0-9_]*\\)=.*/\\1/p\"); do unset \"\$v\"; done; unset $drop; [ \"\${TERM_PROGRAM:-}\" = \"$own\" ] && [ -n \"$own\" ] || unset TERM_PROGRAM TERM_PROGRAM_VERSION; exec \"\$@\"' sh"
+}
+
+# _wh_refuse_own_surface <adapter> <host_id> — task 1304 round 3: 0, plus ONE labelled
+# line, when <host_id> is the surface THIS process runs in, so the caller must not close
+# it (the close verbs then answer 4 and close nothing). "Own" is knowable for:
+#   cmux — the caller's CMUX_WORKSPACE_ID (a UUID; compared case-insensitively). A
+#          `workspace:N` ref cannot be compared with it, so a ref is never refused here.
+#   tmux — the window of the caller's TMUX_PANE.
+#   warp — the warp tmux session the caller's TMUX_PANE is in.
+# 1 means "not this process's surface, or not knowable": the close proceeds as before.
+_wh_refuse_own_surface() {
+  local adapter="$1" handle="${2:-}" mine="" name
+  [ -n "$handle" ] || return 1
+  case "$adapter" in
+    cmux)
+      mine="${CMUX_WORKSPACE_ID:-}"
+      [ -n "$mine" ] || return 1
+      [ "$(printf '%s' "$handle" | LC_ALL=C tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$mine" | LC_ALL=C tr '[:upper:]' '[:lower:]')" ] || return 1 ;;
+    tmux|warp)
+      [ -n "${TMUX_PANE:-}" ] && command -v tmux >/dev/null 2>&1 || return 1
+      if [ "$adapter" = "tmux" ]; then
+        mine=$(tmux display-message -p -t "$TMUX_PANE" '#{window_id}' 2>/dev/null) || return 1
+      else
+        name=$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null) || return 1
+        case "$name" in "$_WH_WARP_TMUX_PREFIX"?*) mine="telepty::$(_wh_warp_tmux_sid "$name")" ;; *) return 1 ;; esac
+      fi
+      [ -n "$mine" ] && [ "$handle" = "$mine" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  _wh_log "close REFUSED: $handle is the surface this process runs in (adapter=$adapter) — nothing was closed (wh_close_refused=own-surface wh_close_category=close-refused)"
+  return 0
+}
+
 # -----------------------------------------------------------------------------
 # cmux adapter
 # -----------------------------------------------------------------------------
@@ -112,12 +189,32 @@ _wh_cmux_lookup() {
     _wh_cmux_list_titles | awk -F'\t' -v s="$sid" '$2==s {print $1; exit}'
     return 0
   fi
+  # task 1304 r3: telepty attributes a session to cmux from the markers in its
+  # ENVIRONMENT, and a worker hosted in tmux could inherit the controller's (incident
+  # 2026-11-23: backend=cmux, terminal=tmux, cmuxWorkspaceId = the controller's). When
+  # the session's own evidence says another host — its layer record/tombstone names a
+  # non-cmux adapter, or telepty itself reports terminal/termProgram tmux — that id is
+  # NOT this session's workspace and is not returned. Only a workspace TITLED with this
+  # sid (the #523 fallback, the title cmux opens are renamed to) may still be returned.
+  local elsewhere=""
+  if _wh_safe_sid "$sid" && { _wh_record_read "$(_wh_state_dir)/$sid.rec" \
+       || _wh_record_read "$(_wh_state_dir)/$sid.closed"; } && [ "$_WH_REC_ADAPTER" != "cmux" ]; then
+    elsewhere="record adapter=$_WH_REC_ADAPTER"
+  elif [ "$(echo "$info" | jq -r 'if (.terminal == "tmux" or .termProgram == "tmux") then "tmux" else empty end' 2>/dev/null)" = "tmux" ]; then
+    elsewhere="telepty terminal=tmux"
+  fi
+  if [ -n "$elsewhere" ]; then
+    _wh_log "cmux lookup: $sid is hosted outside cmux ($elsewhere) — its telepty cmuxWorkspaceId is not used; only a workspace titled $sid may be returned"
+    _wh_cmux_list_titles | awk -F'\t' -v s="$sid" '$2==s {print $1; exit}'
+    return 0
+  fi
   echo "$info" | jq -r '.cmuxWorkspaceId // empty' 2>/dev/null || true
 }
 
 _wh_cmux_close() {
   local host_id="$1" out fcat
   [ -z "$host_id" ] && return 0
+  _wh_refuse_own_surface cmux "$host_id" && return 4 # task 1304 r3: never the caller's own workspace
   if ! command -v cmux >/dev/null 2>&1; then
     return 0 # cmux not installed — treat as already-gone (no-op)
   fi
@@ -362,6 +459,20 @@ _wh_cmux_focus() {
   cmux select-workspace --workspace "$host_id" >/dev/null 2>&1
 }
 
+# _wh_cmux_read_screen <workspace-ref> — task 1304 D4: cmux's own current-viewport read.
+# No --lines: cmux --lines implies scrollback (bin/current_screen.py). cmux's exit status
+# is unreliable (it prints `Error:` with rc 0, see _wh_cmux_wait_ready), so an `Error:`
+# answer is a failed read too. Dispatch readiness for a cmux session does NOT come here:
+# bin/current_screen.py keeps its bound in-process reader for cmux, unchanged.
+_wh_cmux_read_screen() {
+  local host_id="$1" cmux_bin="${CMUX:-cmux}" out
+  [ -z "$host_id" ] && return 1
+  command -v "$cmux_bin" >/dev/null 2>&1 || { _wh_log "read_screen: cmux not installed — cannot read $host_id"; return 1; }
+  out=$("$cmux_bin" read-screen --workspace "$host_id" 2>&1) || return 1
+  case "$out" in Error:*) return 1 ;; esac
+  printf '%s\n' "$out"
+}
+
 # _wh_cmux_ready_attestation — capability metadata (§12 BC2). ready_attestation ∈
 # {surface,process,none}: HOW this adapter's wh_open ready-gate attests pane
 # readiness. cmux reads the pane content (read-screen) → surface-attested. This is
@@ -586,25 +697,102 @@ _wh_cmux_open() {
 }
 
 # -----------------------------------------------------------------------------
-# warp adapter (macOS System Events UI-scripting + sentinel files)
+# warp adapter — Warp shows, tmux controls (task 1304 ADR D3)
 # -----------------------------------------------------------------------------
-# Warp exposes NO desktop CLI, AppleScript dictionary, or IPC (design
-# 2026-05-29-warp-automanage-design.md). Spawn happens at the dispatch layer via
-# a `warp://tab_config/` deeplink that (a) titles its window "telepty::<sid>" —
-# the only find-handle — and (b) writes a sentinel
-# ~/.aigentry/warp-surfaces/<sid>.live. This adapter owns close / focus / alive
-# of an already-spawned Warp surface:
-#   - host_id == the window marker "telepty::<sid>" (Warp supplies no id).
-#   - liveness == sentinel-file presence, GATED by "is Warp running?" so a Warp
-#     quit (all surfaces vanish at once) reports INDETERMINATE→alive, never
-#     "gone" (INV-17 / #486 mass-kill guard).
-#   - close / focus == macOS System Events with IME-safe physical `key code`s;
-#     degrade to a logged no-op when osascript / AX / macOS is unavailable
-#     (§17). close / focus NEVER throw or block teardown → always return 0.
+# Warp exposes NO desktop CLI, AppleScript dictionary or IPC: its URI scheme can open a
+# tab (warp://tab_config/<file stem>, in the active window) and nothing else. So a Warp
+# worker runs inside its OWN tmux session and the Warp tab only attaches to it — the tab
+# config's single command is `tmux new-session -A -s <name> -c <cwd> <worker wrapper>`,
+# which creates the session and attaches in one step, with no typed input. tmux then gives
+# every primitive Warp lacks, on macOS and Linux alike, without Accessibility permission:
+#   - host_id   == the marker "telepty::<sid>" (also the tab title, used by focus only).
+#   - tmux name == "aigentry-warp-<sid>" with '.' spelled %2E (tmux forbids '.' and ':'
+#                  in session names; a recordable sid never contains ':' or '%', so the
+#                  mapping is exactly reversible — _wh_warp_tmux_sid).
+#   - ready     == the tmux session exists (tmux has-session).
+#   - alive     == tmux has-session; a probe tmux cannot answer stays INDETERMINATE→alive
+#                  (INV-17, as cmux does). Only tmux's own "no such session / no server"
+#                  answer says gone.
+#   - close     == tmux kill-session, then the tab config and the pre-1304 sentinel are
+#                  removed and the record becomes a tombstone (task 1304 r3). Measured on
+#                  the Mac: Warp closes the tab when its `exec tmux` client exits, but the
+#                  worker's `telepty allow` process can outlive the session and telepty
+#                  keeps it CONNECTED. Ending that process and the registry entry is
+#                  session-cleanup's job (parent kill with its #606 self/ancestor guard,
+#                  then DELETE), not close's: close releases the SURFACE only, for every
+#                  adapter, exactly as cmux close does.
+#   - list/prune== tmux list-sessions filtered by the name prefix (no GUI action).
+#   - read      == tmux capture-pane -p (current viewport, no scrollback).
+#   - focus     == macOS Accessibility raise of the window whose title is EXACTLY the
+#                  marker; a logged no-op where AX is unavailable.
+# tmux is a REQUIREMENT of this adapter: without it `open` fails at once (exit 2) and
+# leaves nothing behind — there is no silent fallback to an invisible worker.
 AIGENTRY_WARP_SURFACE_DIR="${AIGENTRY_WARP_SURFACE_DIR:-$HOME/.aigentry/warp-surfaces}"
+_WH_WARP_TMUX_PREFIX="aigentry-warp-"
 
 # _wh_warp_sid_from_marker <marker> — recover sid from the "telepty::<sid>" marker.
 _wh_warp_sid_from_marker() { printf '%s' "${1#telepty::}"; }
+
+# _wh_warp_tmux_name <sid> / _wh_warp_tmux_sid <name> — the sid ↔ tmux session name map.
+_wh_warp_tmux_name() { local sid="$1"; printf '%s%s' "$_WH_WARP_TMUX_PREFIX" "${sid//./%2E}"; }
+_wh_warp_tmux_sid() { printf '%s' "${1#"$_WH_WARP_TMUX_PREFIX"}" | sed 's/%2E/./g'; }
+
+# _wh_warp_session_for <marker|sid> — the tmux session name, or non-zero when the sid is
+# not one this layer could have opened (an untrusted handle never reaches tmux or a path).
+_wh_warp_session_for() {
+  local sid; sid=$(_wh_warp_sid_from_marker "${1:-}")
+  _wh_safe_sid "$sid" || return 1
+  _wh_warp_tmux_name "$sid"
+}
+
+# _wh_sq <value> — POSIX single-quoted shell word ('it'\''s'). Used for the pane command,
+# which Warp hands to the user's login shell as one command LINE (no argv channel).
+_wh_sq() { local s="$1" q="'\\''"; printf "'%s'" "${s//\'/$q}"; }
+
+# _wh_toml_str <value> — a TOML basic string: backslash and double quote escaped, control
+# characters as \n \t \r or \u00XX. Bytes >= 0x80 pass through, so UTF-8 (Hangul) stays
+# readable. Runs in a C-locale subshell so the loop walks bytes, not characters.
+_wh_toml_str() (
+  LC_ALL=C
+  s="$1"; out=""; i=0; n=${#s}
+  while [ "$i" -lt "$n" ]; do
+    c="${s:$i:1}"
+    case "$c" in
+      '\') out="$out\\\\" ;;
+      '"') out="$out\\\"" ;;
+      $'\n') out="$out\\n" ;;
+      $'\t') out="$out\\t" ;;
+      $'\r') out="$out\\r" ;;
+      *)
+        printf -v code '%d' "'$c"
+        if { [ "$code" -ge 0 ] && [ "$code" -lt 32 ]; } || [ "$code" -eq 127 ]; then
+          printf -v c '\\u%04X' "$code"
+        fi
+        out="$out$c" ;;
+    esac
+    i=$((i + 1))
+  done
+  printf '"%s"' "$out"
+)
+
+# _wh_tmux_answer_gone <tmux output> — 0 when tmux ANSWERED that the target does not exist
+# (no such session/window, or no server on this socket: the sessions die with the server).
+# Anything else — permission denied, an unknown message, silence — is not an answer.
+_wh_tmux_answer_gone() {
+  case "$1" in
+    *"can't find session"*|*"can't find window"*|*"no server running"*) return 0 ;;
+    *"error connecting to"*"(No such file or directory)"*|*"error connecting to"*"(Connection refused)"*) return 0 ;;
+  esac
+  return 1
+}
+
+# _wh_tmux_session_state <name> — print present | gone | unknown for an exact session name.
+_wh_tmux_session_state() {
+  local name="$1" out
+  command -v tmux >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+  if out=$(tmux has-session -t "=$name" 2>&1); then printf 'present'; return 0; fi
+  if _wh_tmux_answer_gone "$out"; then printf 'gone'; else printf 'unknown'; fi
+}
 
 # _wh_warp_can_uiscript — 0 if macOS + osascript present (UI-scripting possible).
 # AX-permission denial surfaces later as a non-zero osascript exit (degrade).
@@ -614,16 +802,10 @@ _wh_warp_can_uiscript() {
   return 0
 }
 
-# _wh_warp_app_running — 0 if a Warp desktop process is alive (caller guarantees pgrep).
-_wh_warp_app_running() {
-  pgrep -f 'Warp.app' >/dev/null 2>&1 && return 0      # macOS (exec name "stable")
-  pgrep -f 'warp-terminal' >/dev/null 2>&1 && return 0 # Linux
-  return 1
-}
-
-# _wh_warp_raise_window <marker> — best-effort: activate Warp and AXRaise the
-# window whose title contains <marker>. marker passed as argv (no string-interp
-# into AppleScript → injection-safe). 0 raised, non-zero not-found/denied.
+# _wh_warp_raise_window <marker> — best-effort: activate Warp and AXRaise the window whose
+# title IS <marker> (exact: `telepty::w-1` must never raise `telepty::w-10`). marker passed
+# as argv (no string-interp into AppleScript → injection-safe). 0 raised, non-zero
+# not-found/denied. Focus is the only Accessibility use left in this adapter.
 _wh_warp_raise_window() {
   local marker="$1"
   osascript - "$marker" >/dev/null 2>&1 <<'OSA'
@@ -636,7 +818,7 @@ on run argv
     repeat with p in procs
       try
         repeat with w in (windows of p)
-          if (name of w as string) contains marker then
+          if (name of w as string) is marker then
             perform action "AXRaise" of w
             return true
           end if
@@ -645,18 +827,6 @@ on run argv
     end repeat
   end tell
   error "window not found"
-end run
-OSA
-}
-
-# _wh_warp_send_cmd_key <keycode> — System Events `key code <n> using command down`.
-# Physical key codes ONLY (IME-immune; `keystroke "x"` mangles under Korean IME).
-_wh_warp_send_cmd_key() {
-  local code="$1"
-  osascript - "$code" >/dev/null 2>&1 <<'OSA'
-on run argv
-  set kc to (item 1 of argv) as integer
-  tell application "System Events" to key code kc using {command down}
 end run
 OSA
 }
@@ -677,11 +847,11 @@ _wh_warp_tab_config_dir() {
   esac
 }
 
-# _wh_warp_rm_tab_config <sid> — best-effort GC of the spawn-written TOML. The
-# dispatch layer owns the exact (sanitized) name; this removes the documented
-# default "telepty-<sid>.toml". A miss leaves a harmless stale config.
+# _wh_warp_rm_tab_config <sid> — remove the spawn-written "telepty-<sid>.toml". Only a
+# recordable sid ever names a file here (no path traversal from an untrusted handle).
 _wh_warp_rm_tab_config() {
   local sid="$1" dir
+  _wh_safe_sid "$sid" || return 0
   dir=$(_wh_warp_tab_config_dir) || return 0
   rm -f "$dir/telepty-$sid.toml" 2>/dev/null || true
 }
@@ -691,7 +861,13 @@ _wh_warp_lookup() {
   if [ -z "$info" ]; then
     info=$(telepty list --json 2>/dev/null | jq -c --arg sid "$sid" '.[] | select(.id == $sid)' 2>/dev/null | head -1)
   fi
-  [ -z "$info" ] && { echo ""; return 0; } # no telepty entry → no mapping
+  if [ -z "$info" ]; then
+    # task 1304 D2: no telepty row (the worker exited or was deregistered), but a sid
+    # opened as warp has its handle on record, so close-for-sid still reaches its tmux
+    # session — the warp analogue of cmux's title fallback (#523). No record → no mapping.
+    _wh_record_handle_for warp "$sid"
+    return 0
+  fi
   local marker
   marker=$(printf '%s' "$info" | jq -r '.warpWindowMarker // .warpSurfaceId // empty' 2>/dev/null || true)
   # telepty may not persist the marker yet → synthesize the spawn-time contract.
@@ -699,49 +875,51 @@ _wh_warp_lookup() {
   printf '%s' "$marker"
 }
 
+# _wh_warp_close <marker> — kill the worker's tmux session, then remove what open wrote.
+# 0 released or already gone; 1 the release is UNCONFIRMED (tmux unreachable from this
+# caller, or a failed kill that tmux did not answer as "no such session").
 _wh_warp_close() {
-  local marker="$1"
+  local marker="$1" sid name out
   [ -z "$marker" ] && return 0
-  local sid; sid=$(_wh_warp_sid_from_marker "$marker")
-  # Always remove orchestrator-written surface state (sentinel + config).
-  rm -f "$AIGENTRY_WARP_SURFACE_DIR/$sid.live" 2>/dev/null || true
-  _wh_warp_rm_tab_config "$sid"
-  if ! _wh_warp_can_uiscript; then
-    # §17: no UI-scripting (non-macOS / no osascript) → orphan tab is cosmetic.
-    echo "[workspace-host] warp close no-op (UI-scripting unavailable): $marker" >&2
+  sid=$(_wh_warp_sid_from_marker "$marker")
+  if ! _wh_safe_sid "$sid"; then
+    _wh_log "warp close: '$marker' names no sid this layer opens — nothing to release"
     return 0
   fi
-  if _wh_warp_raise_window "$marker"; then
-    _wh_warp_send_cmd_key 13 \
-      || echo "[workspace-host] warp close: Cmd+W failed for $marker (AX denied?)" >&2
-  else
-    # Never blind-close the frontmost: a wrong Cmd+W destroys unrelated work
-    # (design §7.2). Leave the orphan tab rather than risk it.
-    echo "[workspace-host] warp close: window '$marker' not found; left as orphan tab (no blind close)" >&2
+  name=$(_wh_warp_tmux_name "$sid")
+  _wh_refuse_own_surface warp "telepty::$sid" && return 4 # task 1304 r3: never the caller's own session
+  if ! command -v tmux >/dev/null 2>&1; then
+    _wh_log "warp close: tmux is not on this caller's PATH, so session $name cannot be released — release UNCONFIRMED (wh_close_status=unconfirmed)"
+    return 1
   fi
+  if ! out=$(tmux kill-session -t "=$name" 2>&1) && ! _wh_tmux_answer_gone "$out" \
+     && [ "$(_wh_tmux_session_state "$name")" != "gone" ]; then
+    _wh_log "warp close: kill-session failed for $name and the session was not proven gone — release UNCONFIRMED (wh_close_status=unconfirmed wh_close_category=$(_wh_fail_category "$out"))"
+    return 1
+  fi
+  rm -f "$AIGENTRY_WARP_SURFACE_DIR/$sid.live" 2>/dev/null || true # pre-1304 sentinel, if any
+  _wh_warp_rm_tab_config "$sid"
+  _wh_record_tombstone_sid "$sid"
   return 0
 }
 
 _wh_warp_alive() {
-  local marker="$1"
+  local marker="$1" name
   [ -z "$marker" ] && return 1
-  command -v pgrep >/dev/null 2>&1 || return 0 # cannot probe Warp → INDETERMINATE→alive (INV-17)
-  if ! _wh_warp_app_running; then
-    return 0 # Warp down → all surfaces vanish at once → INDETERMINATE→alive (INV-17 #486 guard)
-  fi
-  local sid; sid=$(_wh_warp_sid_from_marker "$marker")
-  [ -f "$AIGENTRY_WARP_SURFACE_DIR/$sid.live" ] && return 0
-  return 1 # Warp up, sentinel gone → surface gone
+  name=$(_wh_warp_session_for "$marker") || return 0 # unaddressable → cannot ask → INDETERMINATE→alive
+  [ "$(_wh_tmux_session_state "$name")" = "gone" ] && return 1
+  return 0 # present, or tmux could not answer → INDETERMINATE→alive (INV-17, as cmux)
 }
 
 _wh_warp_list_ids() {
-  [ -d "$AIGENTRY_WARP_SURFACE_DIR" ] || return 0
-  local f sid
-  for f in "$AIGENTRY_WARP_SURFACE_DIR"/*.live; do
-    [ -e "$f" ] || continue # no matches → glob stayed literal
-    sid=$(basename "$f" .live)
-    printf 'telepty::%s\n' "$sid"
-  done
+  local out name
+  command -v tmux >/dev/null 2>&1 || return 0
+  out=$(tmux list-sessions -F '#{session_name}' 2>/dev/null) || return 0
+  while IFS= read -r name; do
+    case "$name" in "$_WH_WARP_TMUX_PREFIX"?*) printf 'telepty::%s\n' "$(_wh_warp_tmux_sid "$name")" ;; esac
+  done <<EOF
+$out
+EOF
 }
 
 _wh_warp_focus() {
@@ -759,46 +937,81 @@ _wh_warp_focus() {
   return 0
 }
 
-# Warp has no status/listing CLI → prune/status degrade to no-ops (§17).
-_wh_warp_prune_orphans() { echo 0; return 0; }
+# _wh_warp_prune_orphans <live_ids_csv> <protected_refs_csv> — close warp tmux sessions
+# (name prefix == ownership: only sessions this layer named) whose sid left the live set,
+# with cmux's seen-twice debounce: a candidate is closed only if it was ALSO a candidate
+# on the previous tick (ledger next to the records). Never a GUI action. Honors DRY_RUN.
+# Prints the count closed; always 0.
+_wh_warp_prune_orphans() {
+  local live_csv="${1:-}" protected_csv="${2:-}" dry="${DRY_RUN:-0}"
+  local ledger old new="" closed=0 marker sid nl=$'\n'
+  command -v tmux >/dev/null 2>&1 || { echo 0; return 0; }
+  ledger="$(_wh_state_dir)/warp-orphan-ledger"
+  old=$(cat "$ledger" 2>/dev/null || true)
+  while IFS= read -r marker; do
+    [ -z "$marker" ] && continue
+    sid=$(_wh_warp_sid_from_marker "$marker")
+    case ",$live_csv," in *",$sid,"*) continue ;; esac
+    case ",$protected_csv," in *",$marker,"*|*",$sid,"*) continue ;; esac
+    case "$nl$old$nl" in
+      *"$nl$marker$nl"*)
+        if [ "$dry" = "1" ]; then
+          _wh_log "PRUNE would-close warp $marker"
+          new="$new$marker$nl"
+        elif _wh_warp_close "$marker"; then
+          _wh_log "PRUNE closed warp $marker"
+          closed=$((closed + 1))
+        else
+          _wh_log "PRUNE close-failed warp $marker"
+          new="$new$marker$nl"
+        fi ;;
+      *) new="$new$marker$nl" ;; # first sighting → record + skip (debounce floor)
+    esac
+  done <<EOF
+$(_wh_warp_list_ids)
+EOF
+  if ( umask 077; mkdir -p "$(dirname "$ledger")" ) 2>/dev/null; then
+    printf '%s' "$new" > "$ledger" 2>/dev/null || true
+  fi
+  echo "$closed"
+  return 0
+}
+
+# Warp has no status CLI → status degrades to a no-op (§17).
 _wh_warp_set_status()    { return 0; }
 _wh_warp_clear_status()  { return 0; }
 
-# ---- warp wh_open: deeplink spawn + sentinel writer + V2 ready-gate (#608 P2) --
-# Closes G5 (warp spawn was a comment, no `warp://` call site) and G6 (the
-# sentinel ~/.aigentry/warp-surfaces/<sid>.live that alive/list_ids read had no
-# writer → warp surfaces were born-orphaned). ADR §5 D5 + §12 BC1/BC2/BC3.
-
-# _wh_warp_ready_attestation — capability metadata (§12 BC2). HOW warp's wh_open
-# ready-gate attests pane readiness, per the runtime's AX capability:
-#   surface — macOS + osascript present → bounded AX read-screen (V2, BC1).
-#   process — no AX, but Warp liveness is probeable → sentinel+Warp-alive only.
-#   none    — cannot even probe (no pgrep) → readiness is unattestable.
-# A declared FIELD, not a 10th verb (BC2 9-verb boundary invariant; readiness is
-# an internal obligation of wh_open, D3). Asymmetry vs cmux(surface) is the
-# honest bounded declaration of a platform limit (Warp has no CLI), not a defect
-# (BC6). Mirrors _wh_cmux_ready_attestation.
-_wh_warp_ready_attestation() {
-  if _wh_warp_can_uiscript; then printf 'surface'; return 0; fi
-  command -v pgrep >/dev/null 2>&1 && { printf 'process'; return 0; }
-  printf 'none'
+# _wh_warp_read_screen <marker|sid> — task 1304 D4: the current viewport of the worker's
+# tmux pane (`capture-pane -p`, no -S: no scrollback). Non-zero when tmux cannot read it.
+_wh_warp_read_screen() {
+  local name
+  name=$(_wh_warp_session_for "${1:-}") || return 1
+  command -v tmux >/dev/null 2>&1 || { _wh_log "warp read_screen: tmux is not on PATH"; return 1; }
+  tmux capture-pane -p -t "=$name:"
 }
 
-# _wh_warp_write_tab_config <toml> <marker> <cwd> <wrapper> — write the Warp
-# tab_config (ADR §5 D5 step 1): one tab whose window title is the find-handle
-# marker "telepty::<sid>" and whose command is the sentinel-writing wrapper. This
-# is the missing dual of _wh_warp_rm_tab_config. The wrapper has no single quotes
-# (TOML literal strings cannot contain one), so a literal string is injection-safe.
+# _wh_warp_ready_attestation — capability metadata (§12 BC2). wh_open's gate proves the
+# worker's tmux session exists, a process-level fact; the surface itself is read by
+# dispatch readiness through wh_read_screen (capture-pane), not by this gate.
+_wh_warp_ready_attestation() { printf 'process'; }
+
+# _wh_warp_write_tab_config <toml> <marker> <cwd> <pane_cmd> — write the documented Warp
+# tab config schema (ADR D5): top-level name + title, one [[panes]] with id, type =
+# "terminal", directory and commands = [<one shell line>], every value a TOML basic string
+# (_wh_toml_str), so a cwd with a space, an apostrophe, a double quote, a backslash or
+# Hangul stays one value and can never add a key.
 _wh_warp_write_tab_config() {
-  local toml="$1" marker="$2" cwd="$3" wrapper="$4"
+  local toml="$1" marker="$2" cwd="$3" pane_cmd="$4"
   mkdir -p "$(dirname "$toml")" 2>/dev/null || return 1
   {
-    printf '# aigentry warp tab_config — generated by _wh_warp_open (#608 Phase 2, ADR §5 D5)\n'
-    printf "name = '%s'\n\n" "$marker"
-    printf '[[tabs]]\n'
-    printf "title = '%s'\n" "$marker"
-    printf "cwd = '%s'\n" "$cwd"
-    printf "command = '%s'\n" "$wrapper"
+    printf '# aigentry warp tab_config - generated by _wh_warp_open (task 1304 ADR D3/D5)\n'
+    printf 'name = %s\n' "$(_wh_toml_str "$marker")"
+    printf 'title = %s\n\n' "$(_wh_toml_str "$marker")"
+    printf '[[panes]]\n'
+    printf 'id = "main"\n'
+    printf 'type = "terminal"\n'
+    printf 'directory = %s\n' "$(_wh_toml_str "$cwd")"
+    printf 'commands = [%s]\n' "$(_wh_toml_str "$pane_cmd")"
   } > "$toml" 2>/dev/null || return 1
   return 0
 }
@@ -817,157 +1030,94 @@ _wh_warp_deeplink_open() {
   "$opener" "warp://tab_config/$name" >/dev/null 2>&1
 }
 
-# _wh_warp_read_screen <marker> — bounded AX read of the Warp window's visible
-# text for <marker> (BC1 V2 — the surface-attested analogue of cmux read-screen;
-# Warp has no read-screen CLI). Prints whatever AX yields; non-zero if the window
-# is absent / AX denied. macOS+osascript only (caller gates via can_uiscript).
-# marker via argv → injection-safe.
-_wh_warp_read_screen() {
-  local marker="$1"
-  osascript - "$marker" 2>/dev/null <<'OSA'
-on run argv
-  set marker to item 1 of argv
-  tell application "System Events"
-    set procs to (every process whose name is "Warp" or name is "stable")
-    repeat with p in procs
-      try
-        repeat with w in (windows of p)
-          if (name of w as string) contains marker then
-            return (name of w as string)
-          end if
-        end repeat
-      end try
-    end repeat
-  end tell
-  error "window not found"
-end run
-OSA
-}
-
-# _wh_warp_wait_ready <sid> <marker> — the warp ready-gate (BC1 V2). Polls up to
-# WARP_READY_TIMEOUT_MS for the process floor (Warp-app-alive AND sentinel present);
-# when AX is usable it ALSO tries to surface-attest via an AX read-screen. Prints
-# the attestation LEVEL achieved on stdout and signals via exit code:
-#   "surface" rc0 — AX read-screen returned content (V2 strong, == cmux semantics).
-#   "process" rc0 — the surface DID spawn (Warp-alive + sentinel) but could not be
-#                   surface-attested in time (no AX, AX denied, or slow render).
-#                   DEGRADED success — spawn worked; ready-attestation is the bounded
-#                   asymmetry (BC6), NOT a failure. Caller declares it loudly.
-#   ""        rc1 — the process floor was NEVER met → the surface never spawned →
-#                   genuine timeout (caller GCs + returns non-zero, no handle).
-# REJECTS V1 (no `telepty allow --on-ready` hook): the sentinel is written by the
-# in-surface wrapper's own `touch`, and surface readiness is proven by reading the
-# Warp window (AX), never by a transport/process callback — Warp's `warp://` is an
-# async launchd handoff with no surface-ready IPC (BC1).
+# _wh_warp_wait_ready <tmux-name> — the warp ready-gate: poll up to WARP_READY_TIMEOUT_MS
+# for the worker's tmux session to exist (the tab ran its command). 0 ready, 1 timeout.
 _wh_warp_wait_ready() {
-  local sid="$1" marker="$2"
-  local sentinel="$AIGENTRY_WARP_SURFACE_DIR/$sid.live"
+  local name="$1"
   local timeout_ms="${WARP_READY_TIMEOUT_MS:-10000}"
   local interval_ms="${WARP_READY_INTERVAL_MS:-200}"
   local interval_s; interval_s=$(awk -v ms="$interval_ms" 'BEGIN{printf "%.3f", ms/1000}')
   local max_iters=$(( timeout_ms / interval_ms )); [ "$max_iters" -lt 1 ] && max_iters=1
-  local ax=0; _wh_warp_can_uiscript && ax=1
-  local i=0 proc_seen=0 rs
+  local i=0
   while [ "$i" -lt "$max_iters" ]; do
-    if _wh_warp_app_running && [ -f "$sentinel" ]; then
-      proc_seen=1
-      if [ "$ax" = "1" ]; then
-        rs=$(_wh_warp_read_screen "$marker" || true)
-        [ -n "$(printf '%s' "$rs" | tr -d '[:space:]')" ] && { printf 'surface'; return 0; }
-        # AX present but no readable surface yet (rendering… or AX denied) → keep polling
-        # for the stronger signal; degrade to process-attested only after the timeout.
-      else
-        printf 'process'; return 0  # no AX capability → process floor is the ceiling
-      fi
-    fi
+    [ "$(_wh_tmux_session_state "$name")" = "present" ] && return 0
     i=$((i+1))
     sleep "$interval_s"
   done
-  # Timed out: if the surface ever spawned (process floor met) but stayed
-  # un-surface-attested (AX denied / slow render), that is DEGRADED success (BC6),
-  # not a failure — spawn worked. Only a never-spawned surface is a real timeout.
-  [ "$proc_seen" = "1" ] && { printf 'process'; return 0; }
   return 1
 }
 
-# _wh_warp_open <sid> <cwd> <cli_cmd> — spawn a VISIBLE Warp surface wrapping
-# `telepty allow --id <sid>`, BLOCK until the ready-gate passes, then emit the
-# marker "telepty::<sid>" as the host_id (ADR §3 D1 contract; the handle every
-# other warp verb already consumes). Tier 2 (fire-and-forget spawn — BC3): Warp
-# has no CLI to drive the surface, so spawn is a deeplink handoff + a sentinel
-# written by the in-surface wrapper.
-# Exit contract (handle emitted ⇒ surface ready; no half-spawned surface on fail):
-#   0  → marker printed on stdout (surface ready; DEGRADED line on stderr if AX absent).
-#   2  → spawn could not be issued (no tab_config path / deeplink open failed);
-#        tab_config + sentinel GC'd, no handle.
-#   3  → ready-gate timed out; tab_config + sentinel GC'd, NO marker emitted.
+# _wh_warp_open <sid> <cwd> <cli_cmd> — open a Warp tab attached to the worker's own tmux
+# session, BLOCK until that session exists, then emit the marker "telepty::<sid>".
+# Exit contract (handle emitted ⇒ session exists; nothing half-spawned on failure):
+#   0  → marker printed on stdout.
+#   2  → nothing opened, nothing left behind: tmux not on PATH; AIGENTRY_WORKER_AUTO_RESTART
+#        not 0/1; a sid that cannot name a file; no tab_config path on this OS; the tab
+#        config could not be written or the deeplink could not be opened (the tab config
+#        is removed again).
+#   3  → ready-gate timed out; tab config removed (and the session, should it appear late),
+#        NO marker emitted.
+# AIGENTRY_WORKER_AUTO_RESTART is honoured exactly as _wh_cmux_open does (1/unset keeps
+# `--auto-restart`, 0 drops it, anything else is refused before anything is written).
 _wh_warp_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
-  local marker="telepty::$sid"
-  local sentinel="$AIGENTRY_WARP_SURFACE_DIR/$sid.live"
-  local tcdir toml
+  local marker="telepty::$sid" tmux_bin restart_arg tcdir toml name wrapper pane
+  tmux_bin=$(command -v tmux 2>/dev/null || true)
+  case "$tmux_bin" in
+    /*) ;;
+    *) echo "ERR warp adapter needs tmux, which is not on PATH (a Warp worker runs in its own tmux session that the Warp tab attaches to): install tmux, or choose another adapter with AIGENTRY_WORKSPACE_HOST — nothing was opened" >&2
+       return 2 ;;
+  esac
+  case "${AIGENTRY_WORKER_AUTO_RESTART-1}" in
+    1) restart_arg=' --auto-restart';;
+    0) restart_arg='';;
+    *) echo 'ERR AIGENTRY_WORKER_AUTO_RESTART must be 0 or 1' >&2; return 2;;
+  esac
+  if ! _wh_safe_sid "$sid"; then
+    echo "ERR warp wh_open: the sid names the tab config file and the tmux session, so it must match [A-Za-z0-9][A-Za-z0-9._-]* — nothing was opened" >&2
+    return 2
+  fi
   tcdir=$(_wh_warp_tab_config_dir) || {
     echo "[workspace-host] warp wh_open: UNSUPPORTED — no Warp tab_config path on $(uname -s)" >&2
     return 2
   }
   toml="$tcdir/telepty-$sid.toml"
-  mkdir -p "$AIGENTRY_WARP_SURFACE_DIR" 2>/dev/null || true
+  name=$(_wh_warp_tmux_name "$sid")
 
-  # In-surface wrapper (ADR §5 D5 step 2): cd, write the sentinel (G6 fix — gives
-  # alive/list_ids the writer they lacked), then exec telepty allow. NO `--on-ready`
-  # (BC1: no V1 code path ships — readiness is proven by the ready-gate, not a hook).
-  #
-  # #926: %q-quoted, not raw. Unlike cmux/aterm there is NO argv channel here — Warp
-  # is handed one shell command LINE via the tab_config's `command =`, so the values
-  # have to be safe inside that line itself. %q also renders a newline as $'\n', so a
-  # crafted cwd cannot break out of the TOML string and add a key. cli_cmd stays
-  # unquoted for the same reason as _wh_cmux_open: it is a command line, not a value.
-  # ponytail: a cwd containing an apostrophe still breaks the TOML *literal* string
-  # (`command = '…'` admits no escape) — a parse failure, not an execution, and the
-  # neighbouring `cwd = '%s'` line has had the same limitation since #608. Fixing it
-  # means moving the writer to TOML basic strings; separate ticket, not this one.
-  local q_cwd q_sid q_sentinel
-  printf -v q_cwd '%q' "$cwd"; printf -v q_sid '%q' "$sid"; printf -v q_sentinel '%q' "$sentinel"
-  local wrapper="cd $q_cwd && touch $q_sentinel && exec telepty allow --id $q_sid --auto-restart $cli_cmd"
+  # The worker wrapper is what tmux runs (through its default shell) inside the session;
+  # cli_cmd stays unquoted because it is a COMMAND LINE that must word-split. The pane
+  # command is ONE shell line for the tab's login shell: every value in it is a POSIX
+  # single-quoted word (an apostrophe or `$( )` in a cwd stays data), and tmux is called
+  # by its absolute path so the tab's PATH cannot pick another binary.
+  wrapper="$(_wh_foreign_env_scrub tmux) telepty allow --id $(_wh_sq "$sid")$restart_arg $cli_cmd"
+  pane="exec $(_wh_sq "$tmux_bin") new-session -A -s $(_wh_sq "$name") -c $(_wh_sq "$cwd") $(_wh_sq "$wrapper")"
 
-  if ! _wh_warp_write_tab_config "$toml" "$marker" "$cwd" "$wrapper"; then
+  if ! _wh_warp_write_tab_config "$toml" "$marker" "$cwd" "$pane"; then
     echo "[workspace-host] warp wh_open: failed to write tab_config $toml" >&2
+    rm -f "$toml" 2>/dev/null || true
     return 2
   fi
-
-  # Spawn (G5 fix): the `warp://tab_config/` deeplink — the call site that was a comment.
   if ! _wh_warp_deeplink_open "telepty-$sid"; then
     echo "[workspace-host] warp wh_open: deeplink open failed (no open/xdg-open) — no surface spawned" >&2
-    rm -f "$toml" "$sentinel" 2>/dev/null || true
+    rm -f "$toml" 2>/dev/null || true
     return 2
   fi
-
-  # Ready-gate (BC1 V2). att = attestation level achieved; rc!=0 ⇒ the surface
-  # never spawned → leave no half-spawned surface (GC TOML+sentinel).
-  local att; att=$(_wh_warp_wait_ready "$sid" "$marker"); local grc=$?
-  if [ "$grc" -ne 0 ]; then
-    echo "[workspace-host] warp wh_open: ready-gate timed out after ${WARP_READY_TIMEOUT_MS:-10000}ms — surface never spawned (no Warp-alive+sentinel); GCing tab_config+sentinel, no handle emitted." >&2
-    rm -f "$toml" "$sentinel" 2>/dev/null || true
+  if ! _wh_warp_wait_ready "$name"; then
+    echo "[workspace-host] warp wh_open: ready-gate timed out after ${WARP_READY_TIMEOUT_MS:-10000}ms — tmux session $name never appeared; removing the tab_config, no handle emitted." >&2
+    rm -f "$toml" 2>/dev/null || true
+    tmux kill-session -t "=$name" >/dev/null 2>&1 || true
     return 3
   fi
-
-  # BC1/BC6: the surface spawned but readiness is only process-attested (AX absent
-  # or denied) — declare it LOUDLY so the orchestrator does NOT route
-  # guaranteed-visible-foreground work to this degraded surface (no silent no-op, §13).
-  if [ "$att" != "surface" ]; then
-    echo "[workspace-host] warp wh_open: DEGRADED ready-gate ($att-attested) — surface readiness could not be AX-attested (osascript/AX unavailable or denied); readiness rests on sentinel+Warp-alive, NOT a surface read. Do not route guaranteed-visible-foreground work here (BC1/BC6)." >&2
-  fi
-
   printf '%s\n' "$marker"
 }
 
 # -----------------------------------------------------------------------------
 # legacy terminal spawn adapters — aterm / tmux / wezterm / iterm (#608 Phase 3).
 # Each _wh_<term>_open is the inline open-session.sh:open_in_terminal() spawn branch
-# moved 1:1 (byte-equivalent — current behavior preserved, Rule 29). These are
-# SPAWN-only adapters: the orchestrator runs inside cmux, so lifecycle verbs
-# (lookup/close/alive/...) keep routing through the cmux adapter — only `open`
-# dispatches to the host the user is actually in. They consume platform.sh
+# moved 1:1 (byte-equivalent — current behavior preserved, Rule 29). aterm/wezterm/iterm
+# are SPAWN-only adapters: lifecycle verbs (lookup/close/alive/...) for them keep the
+# default rule. tmux is not (task 1304 D3): its open returns the new window's id, and
+# lookup/alive/close/list_ids/read_screen address that window. They consume platform.sh
 # primitives (platform::spawn_*), sourced by the caller (open-session.sh) and by
 # the Tier-1 contract tests; cmux/warp/headless paths never touch them.
 #
@@ -996,12 +1146,21 @@ _wh_fallback_spawn() {
     # The sid IS in it, because tmux runs the 3rd argument through a shell and the
     # signature offers no argv channel for it; `%q` is that guarantee here (a real
     # shell parses it, so there is no second parser to fight — unlike iTerm).
-    platform::spawn_tmux_window "$_sid" "$_cwd" "telepty allow --id $_q_sid --auto-restart $_cli_cmd"
+    # task 1304: spawn_tmux_window now prints the new window's id; this branch keeps
+    # handing back the sid, so that id is discarded here rather than doubling stdout.
+    platform::spawn_tmux_window "$_sid" "$_cwd" "$(_wh_foreign_env_scrub tmux) telepty allow --id $_q_sid --auto-restart $_cli_cmd" >/dev/null
+    # #1303: a spawn that did not happen hands back NO handle — _wh_iterm_open's contract (2).
+    local _rc=$?
+    [ "$_rc" -eq 0 ] || { echo "ERR tmux spawn failed (rc=$_rc) — the spawn command did not confirm success, so no handle is returned" >&2; return 2; }
     echo "$_sid"
   else
     # `telepty spawn -- …` execs its argv directly, so this takes the true argv
     # shape and needs no quoting pass at all.
-    telepty spawn --id "$_sid" -- bash -c "cd \"\$1\" && exec $_cli_cmd" _ "$_cwd" >/dev/null
+    local _scrub; _scrub=$(_wh_foreign_env_scrub none)
+    telepty spawn --id "$_sid" -- bash -c "cd \"\$1\" && exec $_scrub $_cli_cmd" _ "$_cwd" >/dev/null
+    # #1303: same contract — a failed daemon spawn returns 2 with no handle and no attach hint.
+    local _rc=$?
+    [ "$_rc" -eq 0 ] || { echo "ERR telepty spawn failed (rc=$_rc) — the spawn command did not confirm success, so no handle is returned" >&2; return 2; }
     echo "⚠️  Session spawned as daemon (no visible terminal). Attach: telepty attach $_sid" >&2
     echo "$_sid"
   fi
@@ -1016,7 +1175,7 @@ _wh_aterm_open() {
   local q_cwd q_sid
   printf -v q_cwd '%q' "$cwd"; printf -v q_sid '%q' "$sid"
   if command -v aterm >/dev/null 2>&1 \
-    && aterm new-session --cwd "$cwd" --cmd "bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd' _ $q_cwd $q_sid" 2>/dev/null; then
+    && aterm new-session --cwd "$cwd" --cmd "$(_wh_foreign_env_scrub aterm) bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd' _ $q_cwd $q_sid" 2>/dev/null; then
     echo "$sid"
   else
     _wh_fallback_spawn "$sid" "$cwd" "$cli_cmd"
@@ -1024,14 +1183,75 @@ _wh_aterm_open() {
 }
 
 # _wh_tmux_open <sid> <cwd> <cli_cmd> — tmux new-window via platform:: (Tier 1).
-# `tmux new-window -c` propagates cwd correctly. (Legacy used $title == $sid.)
+# `tmux new-window -c` propagates cwd correctly. The window is still named $sid; the
+# handle is its window id (`@N`, task 1304 D3), which tmux keeps unique per server and
+# which the lifecycle verbs below can address later — not the sid.
 _wh_tmux_open() {
-  local sid="$1" cwd="$2" cli_cmd="$3"
+  local sid="$1" cwd="$2" cli_cmd="$3" out id
   # #926: see _wh_fallback_spawn's tmux branch — cwd never enters this string, the
   # sid is %q-quoted because spawn_tmux_window's 3rd argument is shell text.
   local q_sid; printf -v q_sid '%q' "$sid"
-  platform::spawn_tmux_window "$sid" "$cwd" "telepty allow --id $q_sid --auto-restart $cli_cmd"
-  echo "$sid"
+  out=$(platform::spawn_tmux_window "$sid" "$cwd" "$(_wh_foreign_env_scrub tmux) telepty allow --id $q_sid --auto-restart $cli_cmd")
+  # #1303: a spawn that did not happen hands back NO handle — _wh_iterm_open's contract (2).
+  local rc=$?
+  [ "$rc" -eq 0 ] || { echo "ERR tmux spawn failed (rc=$rc) — the spawn command did not confirm success, so no handle is returned" >&2; return 2; }
+  id=$(printf '%s\n' "$out" | grep -E '^@[0-9]+$' | tail -n 1)
+  [ -n "$id" ] || { echo "ERR tmux new-window printed no window id — no handle to return (a window named $sid may exist)" >&2; return 2; }
+  echo "$id"
+}
+
+# tmux lifecycle on the window id (task 1304 D3). tmux's own "no such window / no
+# server" answer is the only gone; a probe tmux cannot answer stays INDETERMINATE→alive.
+_wh_tmux_lookup() { _wh_record_handle_for tmux "$1"; }
+
+# _wh_tmux_window_state <@id> — present | gone | unknown.
+_wh_tmux_window_state() {
+  local id="$1" out nl=$'\n'
+  command -v tmux >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+  if ! out=$(tmux list-windows -a -F '#{window_id}' 2>&1); then
+    if _wh_tmux_answer_gone "$out"; then printf 'gone'; else printf 'unknown'; fi
+    return 0
+  fi
+  case "$nl$out$nl" in *"$nl$id$nl"*) printf 'present' ;; *) printf 'gone' ;; esac
+}
+
+_wh_tmux_alive() {
+  local id="$1"
+  case "$id" in @[0-9]*) ;; *) return 0 ;; esac # not a window id → cannot ask → alive
+  [ "$(_wh_tmux_window_state "$id")" = "gone" ] && return 1
+  return 0
+}
+
+_wh_tmux_close() {
+  local id="$1" out
+  case "$id" in @[0-9]*) ;; "") return 0 ;; *) _wh_log "tmux close: '$id' is not a window id — nothing to release"; return 0 ;; esac
+  _wh_refuse_own_surface tmux "$id" && return 4 # task 1304 r3: never the caller's own window
+  command -v tmux >/dev/null 2>&1 || { _wh_log "tmux close: tmux is not on this caller's PATH, so $id cannot be released — release UNCONFIRMED (wh_close_status=unconfirmed)"; return 1; }
+  if ! out=$(tmux kill-window -t "$id" 2>&1) && ! _wh_tmux_answer_gone "$out" \
+     && [ "$(_wh_tmux_window_state "$id")" != "gone" ]; then
+    _wh_log "tmux close: kill-window failed for $id and the window was not proven gone — release UNCONFIRMED (wh_close_status=unconfirmed wh_close_category=$(_wh_fail_category "$out"))"
+    return 1
+  fi
+  return 0
+}
+
+# _wh_tmux_list_ids — the recorded tmux handles whose window still exists.
+_wh_tmux_list_ids() {
+  local f
+  for f in "$(_wh_state_dir)"/*.rec; do
+    [ -e "$f" ] || continue
+    _wh_record_read "$f" || continue
+    [ "$_WH_REC_ADAPTER" = "tmux" ] || continue
+    [ "$(_wh_tmux_window_state "$_WH_REC_HANDLE")" = "present" ] && printf '%s\n' "$_WH_REC_HANDLE"
+  done
+  return 0
+}
+
+_wh_tmux_read_screen() {
+  local id="$1"
+  case "$id" in @[0-9]*) ;; *) return 1 ;; esac
+  command -v tmux >/dev/null 2>&1 || { _wh_log "tmux read_screen: tmux is not on PATH"; return 1; }
+  tmux capture-pane -p -t "$id"
 }
 
 # _wh_wezterm_open <sid> <cwd> <cli_cmd> — wezterm cli spawn, else fallback (Tier 1).
@@ -1041,7 +1261,11 @@ _wh_wezterm_open() {
   if command -v wezterm >/dev/null 2>&1; then
     # #926: `wezterm cli spawn -- …` execs its argv directly (no shell re-parse),
     # so cwd and sid go on argv as-is — no %q pass needed.
-    wezterm cli spawn --cwd "$cwd" -- bash -c "cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd" _ "$cwd" "$sid" >/dev/null
+    local scrub; scrub=$(_wh_foreign_env_scrub wezterm)
+    wezterm cli spawn --cwd "$cwd" -- bash -c "cd \"\$1\" && exec $scrub telepty allow --id \"\$2\" --auto-restart $cli_cmd" _ "$cwd" "$sid" >/dev/null
+    # #1303: a spawn that did not happen hands back NO handle — _wh_iterm_open's contract (2).
+    local rc=$?
+    [ "$rc" -eq 0 ] || { echo "ERR wezterm spawn failed (rc=$rc) — the spawn command did not confirm success, so no handle is returned" >&2; return 2; }
     echo "$sid"
   else
     _wh_fallback_spawn "$sid" "$cwd" "$cli_cmd"
@@ -1064,7 +1288,7 @@ _wh_iterm_open() {
   # because it is a value inside a command LINE, while cli_cmd stays unquoted because
   # it IS the command line and must word-split.
   local q_sid; printf -v q_sid '%q' "$sid"
-  platform::spawn_iterm_tab "$cwd" "telepty allow --id $q_sid --auto-restart $cli_cmd" \
+  platform::spawn_iterm_tab "$cwd" "$(_wh_foreign_env_scrub iterm) telepty allow --id $q_sid --auto-restart $cli_cmd" \
     || { echo "ERR iTerm spawn failed" >&2; return 2; }
   echo "$sid"
 }
@@ -1085,7 +1309,11 @@ _wh_iterm_ready_attestation()   { printf 'none'; }
 _wh_headless_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
   # #926: argv shape — `telepty spawn -- …` execs its argv directly.
-  telepty spawn --id "$sid" -- bash -c "cd \"\$1\" && exec $cli_cmd" _ "$cwd" >/dev/null
+  local scrub; scrub=$(_wh_foreign_env_scrub none)
+  telepty spawn --id "$sid" -- bash -c "cd \"\$1\" && exec $scrub $cli_cmd" _ "$cwd" >/dev/null
+  # #1303: a spawn that did not happen hands back NO handle — _wh_iterm_open's contract (2).
+  local rc=$?
+  [ "$rc" -eq 0 ] || { echo "ERR telepty spawn failed (rc=$rc) — the spawn command did not confirm success, so no handle is returned" >&2; return 2; }
   echo "⚠️  Session spawned as daemon (headless: no spawn-tab CLI)." >&2
   echo "    Attach via: telepty attach $sid" >&2
   echo "$sid"
@@ -1093,7 +1321,7 @@ _wh_headless_open() {
 _wh_headless_ready_attestation() { printf 'none'; }
 _wh_headless_lookup()        { echo ""; }
 _wh_headless_close()         { return 0; }
-_wh_headless_alive()         { return 1; }
+_wh_headless_alive()         { return 0; } # no host to ask → INDETERMINATE→alive (task 1304 D5, INV-17)
 _wh_headless_list_ids()      { :; }
 _wh_headless_focus()         { return 0; }
 _wh_headless_prune_orphans() { echo 0; return 0; }
@@ -1170,7 +1398,7 @@ _wh_detect_match() {
     tmux)     [ -n "${TMUX:-}" ] ;;
     wezterm)  [ "${TERM_PROGRAM:-}" = "WezTerm" ] ;;
     iterm)    [ "${TERM_PROGRAM:-}" = "iTerm.app" ] ;;
-    warp)     return 1 ;;     # no desktop CLI → never auto-detected (env-force only)
+    warp)     [ "${TERM_PROGRAM:-}" = "WarpTerminal" ] ;; # task 1304 D2: a controller started inside Warp
     headless) return 0 ;;     # always matches — folds the ghostty/generic fallback
     *)        return 1 ;;
   esac
@@ -1190,12 +1418,16 @@ _wh_host_available() {
 }
 
 # _wh_is_registered <name> — 0 if <name> is a registry adapter (env-force validation).
+# Exit: 0 registered, 1 an explicit miss (the table was read and <name> is not in it),
+# 2 the table itself could not be read (it failed or came back empty) — never a miss.
 _wh_is_registered() {
-  local want="$1" name rest
+  local want="$1" name rest table
+  table=$(_wh_registry) || return 2
+  [ -n "$table" ] || return 2
   while IFS=$'\t' read -r name rest; do
     [ "$name" = "$want" ] && return 0
   done <<EOF
-$(_wh_registry)
+$table
 EOF
   return 1
 }
@@ -1243,6 +1475,158 @@ EOF
   printf '%s' "headless"
 }
 
+# -----------------------------------------------------------------------------
+# per-sid adapter record (task 1304 ADR D2) — the adapter follows the session
+# -----------------------------------------------------------------------------
+# A successful wh_open writes ONE line `v1<TAB><adapter><TAB><host_id>` to
+# ${AIGENTRY_WH_STATE_DIR:-$HOME/.aigentry/workspace-host}/<sid>.rec; the close verbs
+# remove it. Sids are untrusted: only a sid matching [A-Za-z0-9][A-Za-z0-9._-]{0,199}
+# names a file (no '/', never '.' or '..'), and a record is DATA — read with `read -r`,
+# checked field by field, its adapter accepted only if registered; nothing in it is
+# ever evaluated. A malformed or symlinked record is treated as absent.
+_WH_SID_CHARS='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+
+_wh_state_dir() { printf '%s' "${AIGENTRY_WH_STATE_DIR:-$HOME/.aigentry/workspace-host}"; }
+
+# _wh_safe_sid <sid> — 0 when <sid> may name a record, a tab config or a tmux session.
+_wh_safe_sid() {
+  case "${1:-}" in
+    ""|[!$_WH_SID_CHARS]*|*[!$_WH_SID_CHARS._-]*) return 1 ;;
+  esac
+  [ "${#1}" -le 200 ]
+}
+
+# _wh_record_read <file> — set _WH_REC_ADAPTER / _WH_REC_HANDLE from a record; non-zero
+# (and both empty) when the file is absent, a symlink or malformed.
+_wh_record_read() {
+  local f="$1" ver="" adapter="" handle="" extra=""
+  _WH_REC_ADAPTER=""; _WH_REC_HANDLE=""
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  { IFS=$'\t' read -r ver adapter handle extra || :; } < "$f" 2>/dev/null || return 1
+  [ "$ver" = "v1" ] && [ -n "$handle" ] && [ -z "$extra" ] || return 1
+  _wh_is_registered "$adapter" || return 1
+  _WH_REC_ADAPTER="$adapter"; _WH_REC_HANDLE="$handle"
+  return 0
+}
+
+# _wh_record_write <sid> <adapter> <host_id> — best-effort; a sid or handle that cannot be
+# recorded is said once on stderr and later verbs fall back to the default rule.
+_wh_record_write() {
+  local sid="$1" adapter="$2" handle="$3" dir tmp
+  if ! _wh_safe_sid "$sid"; then
+    _wh_log "record: sid has characters a record name cannot carry — adapter=$adapter not remembered; later verbs use the default rule"
+    return 0
+  fi
+  case "$handle" in
+    ""|*$'\t'*|*$'\n'*|*$'\r'*) _wh_log "record: adapter=$adapter gave no single-line host id for $sid — not remembered"; return 0 ;;
+  esac
+  dir=$(_wh_state_dir)
+  if ! ( umask 077; mkdir -p "$dir" ) 2>/dev/null; then
+    _wh_log "record: state dir cannot be created — adapter=$adapter for $sid not remembered"
+    return 0
+  fi
+  tmp="$dir/.$sid.rec.$$"
+  if printf 'v1\t%s\t%s\n' "$adapter" "$handle" > "$tmp" 2>/dev/null && mv -f "$tmp" "$dir/$sid.rec" 2>/dev/null; then
+    rm -f "$dir/$sid.closed" 2>/dev/null || true # a re-open supersedes an old tombstone
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+  _wh_log "record: write failed — adapter=$adapter for $sid not remembered"
+  return 0
+}
+
+# task 1304 r3 — the TOMBSTONE. A close does not forget which adapter owned the session:
+# <sid>.rec is renamed to <sid>.closed (same line format), and the resolver still reads
+# it. Measured incident: close-for-sid removed the record, a later session-cleanup of the
+# same sid fell back to "cmux if installed", and cmux closed the CONTROLLER's workspace
+# that telepty had wrongly attributed to the worker. With the tombstone that later call
+# resolves the original adapter and its close is an idempotent no-op. A tombstone is
+# removed by a re-open of the sid (_wh_record_write), when a close-for-sid finds no
+# mapping at all (the session is gone from every host, so there is nothing to misroute),
+# or by wh_prune_orphans once the sid has been absent from the live set on two ticks
+# (_wh_tombstone_gc, round 4).
+
+# _wh_record_drop_sid <sid> — remove that sid's record AND tombstone (idempotent).
+_wh_record_drop_sid() {
+  _wh_safe_sid "${1:-}" || return 0
+  rm -f "$(_wh_state_dir)/$1.rec" "$(_wh_state_dir)/$1.closed" 2>/dev/null || true
+}
+
+# _wh_record_tombstone_sid <sid> — turn the live record into the tombstone (idempotent).
+_wh_record_tombstone_sid() {
+  local dir
+  _wh_safe_sid "${1:-}" || return 0
+  dir=$(_wh_state_dir)
+  [ -f "$dir/$1.rec" ] && [ ! -L "$dir/$1.rec" ] && mv -f "$dir/$1.rec" "$dir/$1.closed" 2>/dev/null
+  return 0
+}
+
+# _wh_record_tombstone_handle <adapter> <host_id> — tombstone every live record naming that pair.
+_wh_record_tombstone_handle() {
+  local adapter="$1" handle="$2" f
+  [ -n "$handle" ] || return 0
+  for f in "$(_wh_state_dir)"/*.rec; do
+    [ -e "$f" ] || continue
+    _wh_record_read "$f" || continue
+    [ "$_WH_REC_ADAPTER" = "$adapter" ] && [ "$_WH_REC_HANDLE" = "$handle" ] \
+      && mv -f "$f" "${f%.rec}.closed" 2>/dev/null
+  done
+  return 0
+}
+
+# _wh_record_handle_for <adapter> <sid> — print the recorded host_id when <sid> was opened
+# by <adapter>; print nothing otherwise. Always 0 (lookup semantics).
+_wh_record_handle_for() {
+  local adapter="$1" sid="${2:-}"
+  _wh_safe_sid "$sid" || return 0
+  _wh_record_read "$(_wh_state_dir)/$sid.rec" || return 0
+  [ "$_WH_REC_ADAPTER" = "$adapter" ] && printf '%s' "$_WH_REC_HANDLE"
+  return 0
+}
+
+# _wh_resolve <sid|host_id> — the adapter for a verb about ONE session: an explicit,
+# registered AIGENTRY_WORKSPACE_HOST wins; else the record (by sid, then by host_id);
+# else today's rule (_wh_adapter) plus one stderr line saying the adapter is unknown.
+# Sets _WH_ADAPTER, _WH_FROM (env|record|default) and _WH_RES_HANDLE (the recorded
+# host_id when a record matched, else empty). Runs in the caller's shell.
+_wh_resolve() {
+  local key="${1:-}" pref="${AIGENTRY_WORKSPACE_HOST:-}" f sid
+  _WH_RES_HANDLE=""
+  if [ -n "$pref" ] && _wh_is_registered "$pref"; then
+    _WH_ADAPTER="$pref"; _WH_FROM=env; return 0
+  fi
+  if [ -n "$key" ]; then
+    if _wh_safe_sid "$key" && { _wh_record_read "$(_wh_state_dir)/$key.rec" \
+         || _wh_record_read "$(_wh_state_dir)/$key.closed"; }; then
+      _WH_ADAPTER="$_WH_REC_ADAPTER"; _WH_FROM=record; _WH_RES_HANDLE="$_WH_REC_HANDLE"; return 0
+    fi
+    for f in "$(_wh_state_dir)"/*.rec "$(_wh_state_dir)"/*.closed; do
+      [ -e "$f" ] || continue
+      _wh_record_read "$f" || continue
+      [ "$_WH_REC_HANDLE" = "$key" ] || continue
+      _WH_ADAPTER="$_WH_REC_ADAPTER"; _WH_FROM=record; _WH_RES_HANDLE="$_WH_REC_HANDLE"; return 0
+    done
+  fi
+  _WH_ADAPTER=$(_wh_adapter); _WH_FROM=default
+  sid=$(printf '%s' "$key" | LC_ALL=C tr -d '\000-\037\177')
+  _wh_log "adapter unknown for '$sid' (no AIGENTRY_WORKSPACE_HOST, no record) — using the default rule: $_WH_ADAPTER"
+  return 0
+}
+
+# _wh_resolve_verb <verb> <sid|host_id> — _wh_resolve, then make sure the adapter has
+# that verb: a RECORDED adapter without it (aterm/wezterm/iterm are spawn-only, and tmux
+# has no focus/status) keeps today's rule for that verb, said on stderr. An explicit
+# AIGENTRY_WORKSPACE_HOST is never second-guessed.
+_wh_resolve_verb() {
+  local verb="$1"
+  _wh_resolve "${2:-}"
+  if [ "$_WH_FROM" = "record" ] && ! declare -F "_wh_${_WH_ADAPTER}_${verb}" >/dev/null 2>&1; then
+    local d; d=$(_wh_adapter)
+    _wh_log "adapter=$_WH_ADAPTER (recorded) has no $verb — using the default rule: $d"
+    _WH_ADAPTER="$d"; _WH_FROM=default; _WH_RES_HANDLE=""
+  fi
+}
+
 # wh_open <sid> <cwd> <cli_cmd> — spawn a visible surface wrapping
 # `telepty allow --id <sid>`, block until the per-adapter ready-gate passes (an
 # internal obligation — NOT a public verb, BC2/D3), then print the stable host_id.
@@ -1259,22 +1643,33 @@ wh_open() {
     _wh_log "$adapter wh_open: UNSUPPORTED — no _wh_${adapter}_open spawn adapter registered (#608: cmux/warp/aterm/tmux/wezterm/iterm/headless migrated)"
     return 64
   fi
-  "_wh_${adapter}_open" "$@"
+  # task 1304 D2: the handle is captured so the adapter can be recorded for this sid; it
+  # is printed exactly as the adapter printed it (one line), and only after success.
+  local out rc nl=$'\n'
+  out=$("_wh_${adapter}_open" "$@"); rc=$?
+  [ -n "$out" ] && printf '%s\n' "$out"
+  [ "$rc" -eq 0 ] && _wh_record_write "${1:-}" "$adapter" "${out##*"$nl"}"
+  return "$rc"
 }
 
+# The verbs about ONE session resolve their adapter per session (task 1304 D2): explicit
+# AIGENTRY_WORKSPACE_HOST, else the record wh_open wrote, else the default rule + a line.
 wh_lookup() {
-  local adapter; adapter=$(_wh_adapter)
-  "_wh_${adapter}_lookup" "$@"
+  _wh_resolve_verb lookup "${1:-}"
+  "_wh_${_WH_ADAPTER}_lookup" "$@"
 }
 
 wh_close() {
-  local adapter; adapter=$(_wh_adapter)
-  "_wh_${adapter}_close" "$@"
+  local rc=0
+  _wh_resolve_verb close "${1:-}"
+  "_wh_${_WH_ADAPTER}_close" "$@" || rc=$?
+  [ "$rc" -eq 0 ] && _wh_record_tombstone_handle "$_WH_ADAPTER" "${1:-}"
+  return "$rc"
 }
 
 wh_alive() {
-  local adapter; adapter=$(_wh_adapter)
-  "_wh_${adapter}_alive" "$@"
+  _wh_resolve_verb alive "${1:-}"
+  "_wh_${_WH_ADAPTER}_alive" "$@"
 }
 
 wh_list_ids() {
@@ -1283,28 +1678,84 @@ wh_list_ids() {
 }
 
 wh_focus() {
-  local adapter; adapter=$(_wh_adapter)
-  "_wh_${adapter}_focus" "$@"
+  _wh_resolve_verb focus "${1:-}"
+  "_wh_${_WH_ADAPTER}_focus" "$@"
 }
 
 # wh_prune_orphans <live_ids_csv> <protected_refs_csv> — close host workspaces
 # whose session has vanished, gated (SPEC §A). Prints count closed; always 0.
 wh_prune_orphans() {
-  local adapter; adapter=$(_wh_adapter)
-  "_wh_${adapter}_prune_orphans" "$@"
+  local adapter rc=0; adapter=$(_wh_adapter)
+  "_wh_${adapter}_prune_orphans" "$@" || rc=$?
+  _wh_tombstone_gc "${1:-}"
+  return "$rc"
+}
+
+# _wh_tombstone_gc <live_ids_csv> — task 1304 r4: the END of a tombstone's life. A
+# tombstone whose sid is absent from the live set on TWO consecutive prune ticks (the
+# same seen-twice debounce the host prunes use; ledger next to the records) is removed.
+# The live set is the reconciler's telepty ids, so a session telepty still lists keeps
+# its tombstone: through close-for-sid, through session-cleanup (whose DELETE comes after
+# its surface close) and for as long as a leftover `telepty allow` keeps it registered.
+# Once telepty has no row for the sid there is no telepty-provided host id left that the
+# default rule could misroute. Prints nothing (the prune count stays the host prune's);
+# honours DRY_RUN; logs the sid only.
+_wh_tombstone_gc() {
+  local live_csv="${1:-}" dry="${DRY_RUN:-0}" dir ledger old new="" f sid nl=$'\n'
+  dir=$(_wh_state_dir)
+  [ -d "$dir" ] || return 0
+  ledger="$dir/tombstone-ledger"
+  old=$(cat "$ledger" 2>/dev/null || true)
+  for f in "$dir"/*.closed; do
+    [ -e "$f" ] || continue
+    sid="${f##*/}"; sid="${sid%.closed}"
+    _wh_safe_sid "$sid" || continue
+    case ",$live_csv," in *",$sid,"*) continue ;; esac
+    case "$nl$old$nl" in
+      *"$nl$sid$nl"*)
+        if [ "$dry" = "1" ]; then
+          _wh_log "PRUNE would-remove tombstone sid=$sid"
+          new="$new$sid$nl"
+        elif rm -f "$f" 2>/dev/null; then
+          _wh_log "PRUNE removed tombstone sid=$sid (absent from the live set on two ticks)"
+        else
+          new="$new$sid$nl"
+        fi ;;
+      *) new="$new$sid$nl" ;; # first sighting → record + keep (debounce floor)
+    esac
+  done
+  printf '%s' "$new" > "$ledger" 2>/dev/null || true
+  return 0
 }
 
 # wh_set_status <host_id> <state> — push session state to the host sidebar
 # (SPEC §B). state ∈ {working,idle,disconnected,connected,unknown}. Best-effort; always 0.
 wh_set_status() {
-  local adapter; adapter=$(_wh_adapter)
-  "_wh_${adapter}_set_status" "$@"
+  _wh_resolve_verb set_status "${1:-}"
+  "_wh_${_WH_ADAPTER}_set_status" "$@"
 }
 
 # wh_clear_status <host_id> — remove the aigentry status pill. Idempotent; 0.
 wh_clear_status() {
-  local adapter; adapter=$(_wh_adapter)
-  "_wh_${adapter}_clear_status" "$@"
+  _wh_resolve_verb clear_status "${1:-}"
+  "_wh_${_WH_ADAPTER}_clear_status" "$@"
+}
+
+# wh_read_screen <host_id|sid> — task 1304 D4: the surface's CURRENT viewport text (no
+# scrollback). cmux: its read-screen; warp and tmux: tmux capture-pane -p; every other
+# adapter: unsupported — exit 20 and one labelled line on stdout, never a guess.
+wh_read_screen() {
+  local key="${1:-}" handle
+  _wh_resolve "$key"
+  if ! declare -F "_wh_${_WH_ADAPTER}_read_screen" >/dev/null 2>&1; then
+    printf 'read_screen unsupported adapter=%s\n' "$_WH_ADAPTER"
+    return 20
+  fi
+  handle="$_WH_RES_HANDLE"
+  if [ -z "$handle" ] && declare -F "_wh_${_WH_ADAPTER}_lookup" >/dev/null 2>&1; then
+    handle=$("_wh_${_WH_ADAPTER}_lookup" "$key" 2>/dev/null)
+  fi
+  "_wh_${_WH_ADAPTER}_read_screen" "${handle:-$key}"
 }
 
 # wh_agent_meta_{caps,set,clear} — #1162 G2c per-surface agent metadata; see the
@@ -1324,9 +1775,23 @@ wh_agent_meta_set()   { _wh_agent_meta_dispatch set "$@"; }
 wh_agent_meta_clear() { _wh_agent_meta_dispatch clear "$@"; }
 
 # Convenience composite: lookup + close for a sid in one call.
+# task 1304 D2: ONE resolution for both halves — the adapter that opened <sid> both looks
+# it up and closes it — and the record goes once the session is released or unmapped.
 wh_close_for_sid() {
-  local sid="$1" info="${2:-}" host_id
-  host_id=$(wh_lookup "$sid" "$info")
-  [ -z "$host_id" ] && return 0
-  wh_close "$host_id"
+  local sid="$1" info="${2:-}" host_id rc=0 lrc=0
+  _wh_resolve_verb lookup "$sid"
+  host_id=$("_wh_${_WH_ADAPTER}_lookup" "$sid" "$info") || lrc=$?
+  # task 1304 r3: a lookup that FAILED is not "no mapping" — nothing was closed, say so.
+  if [ "$lrc" -ne 0 ]; then
+    _wh_log "close-for-sid: lookup failed for $sid (adapter=$_WH_ADAPTER rc=$lrc) — nothing was closed, release UNCONFIRMED (wh_close_status=unconfirmed)"
+    return 1
+  fi
+  if [ -z "$host_id" ]; then
+    _wh_record_drop_sid "$sid"
+    return 0
+  fi
+  declare -F "_wh_${_WH_ADAPTER}_close" >/dev/null 2>&1 || _wh_resolve_verb close "$host_id"
+  "_wh_${_WH_ADAPTER}_close" "$host_id" || rc=$?
+  [ "$rc" -eq 0 ] && _wh_record_tombstone_sid "$sid"
+  return "$rc"
 }

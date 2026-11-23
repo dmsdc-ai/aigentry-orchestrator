@@ -99,6 +99,15 @@ cat > "$STUB_BIN/uname" <<'EOF'
 printf 'Linux\n'
 EOF
 chmod +x "$STUB_BIN/uname"
+# task 1304 D3: warp close is `tmux kill-session`. A tmux that answers "no such
+# session" (already gone) is what both closes must meet → 0,0. Stubbed so a runner's
+# own tmux (or none) cannot decide the outcome.
+cat > "$STUB_BIN/tmux" <<'EOF'
+#!/usr/bin/env bash
+echo "can't find session: aigentry-warp-sid-w" >&2
+exit 1
+EOF
+chmod +x "$STUB_BIN/tmux"
 export AIGENTRY_WARP_SURFACE_DIR="$T_TMP/warp-surfaces"; mkdir -p "$AIGENTRY_WARP_SURFACE_DIR"
 out=$(PATH="$STUB_BIN:/bin:/usr/bin" AIGENTRY_WORKSPACE_HOST=warp \
   AIGENTRY_WARP_SURFACE_DIR="$AIGENTRY_WARP_SURFACE_DIR" "$BASH_BIN" -c '

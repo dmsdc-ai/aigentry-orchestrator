@@ -50,6 +50,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { resolveStoreRoot } from "../controller-link/store.js";
 import { registryEnvironment, registryInvocation } from "../dispatch/registry-command.js";
 import { defaultPathConfig } from "../session/persist-context.js";
 
@@ -1449,6 +1450,31 @@ function main(argv: string[]): void {
     });
     for (const line of readLines((pump.stdout ?? "") + (pump.stderr ?? ""))) log(line);
     if (pump.error || (pump.status ?? 1) !== 0) log("ERR report-pump non-zero (continuing)");
+  }
+
+  // --- step 0b4: controller-link pump (#1294, SPEC §9.1) — probes, same-byte re-sends,
+  // and reminders for the controller-to-controller records. Same shape as
+  // step 0b3: the compiled entrypoint next to this file, a 300 s kill (the pass's 240 s
+  // is a cooperative bound, see controller-link/pump.ts), act-only (so also off under a HITL pause),
+  // best-effort. AIGENTRY_CONTROLLER_LINK_PUMP=0 disables it. The store root is the
+  // one the pump itself resolves (U2 resolveStoreRoot, same package root); while it
+  // does not exist this step does nothing at all — no process, no file, no output.
+  // Its own failure boundary: nothing here can fail or abort the steps below it.
+  if (DRY_RUN === 0 && (env.AIGENTRY_CONTROLLER_LINK_PUMP || "1") !== "0") {
+    try {
+      if (fs.existsSync(resolveStoreRoot(env, REPO_DIR))) {
+        const link = spawnSync(process.execPath, [fileURLToPath(new URL("../controller-link/cli.js", import.meta.url)), "pump", "--once"], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+          env,
+          timeout: 300_000,
+        });
+        for (const line of readLines((link.stdout ?? "") + (link.stderr ?? ""))) log(line);
+        if (link.error || (link.status ?? 1) !== 0) log("ERR controller-link pump non-zero (continuing)");
+      }
+    } catch (e) {
+      log(`ERR controller-link pump: ${e instanceof Error ? e.message : String(e)} (continuing)`);
+    }
   }
 
   // --- step 0c: PEER-LANE comms auditor (#533 Phase 1) — tail telepty's peer-inject

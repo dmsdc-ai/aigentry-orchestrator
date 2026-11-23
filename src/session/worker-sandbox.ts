@@ -425,7 +425,8 @@ export function prepareWorkerSandbox(scope: WorkerScope, cli: string, roleCwd: s
   const childEnv: Record<string, string> = {
     HOME: home, TMPDIR: tmp, TMP: tmp, TEMP: tmp, CLAUDE_CODE_TMPDIR: tmp,
     PATH: `${localBin}${path.delimiter}${process.env.PATH || "/usr/bin:/bin"}`, SHELL: "/bin/bash",
-    TERM: process.env.TERM || "xterm-256color", LANG: process.env.LANG || "en_US.UTF-8",
+    // #1303: the worker always runs in a real PTY; a controller tool shell's TERM=dumb would stop Codex at a y/N prompt.
+    TERM: process.env.TERM && process.env.TERM !== "dumb" ? process.env.TERM : "xterm-256color", LANG: process.env.LANG || "en_US.UTF-8",
     AIGENTRY_WORKER_SESSION: "1", AIGENTRY_TASK_ID: scope.task,
     AIGENTRY_WORKER_SESSION_ID: scope.sid, AIGENTRY_WORKER_ATTEMPT: attempt,
     AIGENTRY_TARGET_CWD: canonical(targetCwd), AIGENTRY_REPORT_OUTBOX: reportOutbox,

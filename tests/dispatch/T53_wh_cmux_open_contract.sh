@@ -123,7 +123,8 @@ att=$(AIGENTRY_WORKSPACE_HOST=cmux "$BASH_BIN" -c '. "'"$LIB"'"; _wh_cmux_ready_
 verbs=$("$BASH_BIN" -c '. "'"$LIB"'"; declare -F | sed -n "s/^declare -f //p" | grep "^wh_" | sort | tr "\n" " "')
 # #1162 G2c: the three reviewed per-surface metadata verbs, listed literally (never
 # derived from workspace-host.sh) so an added or dropped wh_ export still fails here.
-want="wh_agent_meta_caps wh_agent_meta_clear wh_agent_meta_set wh_alive wh_clear_status wh_close wh_close_for_sid wh_focus wh_list_ids wh_lookup wh_open wh_prune_orphans wh_set_status "
+# task 1304 ADR D4: wh_read_screen reopens the boundary on purpose (readiness reads it).
+want="wh_agent_meta_caps wh_agent_meta_clear wh_agent_meta_set wh_alive wh_clear_status wh_close wh_close_for_sid wh_focus wh_list_ids wh_lookup wh_open wh_prune_orphans wh_read_screen wh_set_status "
 [ "$verbs" = "$want" ] || fail "F: public verb set drift (BC2 9-verb boundary).
   got:  $verbs
   want: $want"

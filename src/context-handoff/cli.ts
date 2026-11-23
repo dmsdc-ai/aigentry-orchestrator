@@ -16,7 +16,10 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { compose } from "./compose.js";
-import { readCapture, readDispatches, readGit, readSnapshotMtime, readTasks, type Enrichment } from "./enrich.js";
+import {
+  readCapture, readControllerLink, readDispatches, readGit, readSnapshotMtime, readTasks,
+  type ControllerLinkEntry, type Enrichment,
+} from "./enrich.js";
 import { selectSource } from "./select.js";
 import { checkStateDir, handoffDir, writeHandoff } from "./write.js";
 import {
@@ -26,6 +29,9 @@ import {
 } from "./types.js";
 
 export type { Handoff, HandoffDelivery, HandoffOutcome, HandoffRecord, TranscriptRef } from "./types.js";
+// Task 1294: the boot reaches the reader through this dynamically imported engine module.
+export { readControllerLink };
+export type { ControllerLinkEntry };
 
 const K = 20;
 const TAIL_BYTES = 8 * 1024 * 1024;
@@ -52,6 +58,11 @@ export interface ResolveOptions {
    * `delivery=unset`. The engine never decides delivery itself (F6: one source of argv truth).
    */
   readonly delivery?: HandoffDelivery;
+  /**
+   * Optional, additive (task 1294, SPEC §9.4): the open controller-link records, read by the
+   * caller with `readControllerLink` (async, so it cannot run in here). Absent → null, no line.
+   */
+  readonly controllerLink?: readonly ControllerLinkEntry[] | null;
 }
 
 interface ScriptExtras {
@@ -198,6 +209,7 @@ function computeHandoff(o: ResolveOptions, extra: ScriptExtras): Handoff {
       capture: extra.capture ?? null,
       snapshotMtime: readSnapshotMtime(workspace),
       git: deadlineAt - Date.now() > GIT_RESERVE_MS ? readGit(workspace, o.env) : null,
+      controllerLink: o.controllerLink ?? null,
     };
     const markdown = compose({
       ref: source,
@@ -304,8 +316,9 @@ export async function runHandoff(argv: readonly string[]): Promise<number> {
   }
   const self = env.CLAUDE_CODE_SESSION_ID;
   const capture = await readCapture(workspace).catch(() => null);
+  const controllerLink = await readControllerLink(workspace, env).catch(() => null);
   const result = computeHandoff(
-    { workspace, env, now: new Date(), bootId: randomUUID(), write: args.write, deadlineMs: SCRIPT_DEADLINE_MS },
+    { workspace, env, now: new Date(), bootId: randomUUID(), write: args.write, deadlineMs: SCRIPT_DEADLINE_MS, controllerLink },
     {
       ...(before !== null ? { before } : {}),
       ...(self ? { excludeSessionId: self } : {}),

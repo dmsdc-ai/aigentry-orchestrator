@@ -25,6 +25,8 @@
 #   lookup <sid> [session_json]              host_id or empty    0 always (empty == no mapping)
 #   close <host_id>                          —                   0 released or already gone
 #                                                                1 real failure (still alive)
+#                                                                4 refused: the caller's own surface
+#                                                                  (task 1304 r3; nothing closed)
 #   alive <host_id>                          —                   0 alive OR cannot-probe
 #                                                                    (INV-17 INDETERMINATE→alive)
 #                                                                1 host answered "no such handle"
@@ -36,7 +38,12 @@
 #   set-status <host_id> <state>             —                   0 always (unrecognized state = no-op)
 #   clear-status <host_id>                   —                   0 always
 #   close-for-sid <sid> [session_json]       —                   0 no mapping, or closed
-#                                                                1 mapped but close failed
+#                                                                1 mapped but close failed, or the
+#                                                                  lookup itself failed
+#                                                                4 refused: the caller's own surface
+#   read-screen <host_id|sid>                viewport text       0 read, 1 read failed,
+#                                            (20: one labelled   20 adapter has no screen reader
+#                                             line)                 (task 1304 D4)
 #   detect-terminal                          adapter name        0 always (headless is the catch-all)
 #   agent-meta-caps                          one caps line       0 supported, 20 unsupported, 30 error
 #   agent-meta-set <sid> --stage <root>      one result line     0 applied, 10 refused,
@@ -70,6 +77,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # Relative source: bin/lib/workspace-host.sh ships in the init manifest alongside
 # this file, so a control workspace (bin/ copied, no repo, no dist/) resolves it the
 # same way the repo tree does. T104 part E materializes that layout and proves it.
+# task 1304 D5: platform.sh first, exactly as open-session.sh used to source it, so the
+# tmux and iTerm spawns (platform::spawn_tmux_window / platform::spawn_iterm_tab) exist
+# when the TypeScript opener reaches `open` through this door. It picks its own backend
+# (platform-unix.sh on macOS/Linux, platform-windows.sh's labelled stubs on Windows) and
+# ships in the same init manifest. No verb that worked before uses a platform:: function.
+# shellcheck source=lib/platform.sh
+. "$SCRIPT_DIR/lib/platform.sh"
 # shellcheck source=lib/workspace-host.sh
 . "$SCRIPT_DIR/lib/workspace-host.sh"
 
@@ -83,7 +97,7 @@ matching shell function with the same exit code and the same stdout.
   open <sid> <cwd> <cli_cmd>              spawn a ready surface; prints host_id
                                           (2=spawn failed, 3=ready-gate timeout)
   lookup <sid> [session_json]             print host_id, or empty if unmapped
-  close <host_id>                         release the surface (1=still alive)
+  close <host_id>                         release the surface (1=still alive, 4=own surface)
   alive <host_id>                         0=alive or cannot-probe, 1=gone
   list-ids                                print every known host_id, one per line
   focus <host_id>                         raise the surface
@@ -91,6 +105,8 @@ matching shell function with the same exit code and the same stdout.
   set-status <host_id> <state>            sidebar pill: working|idle|disconnected|connected|unknown
   clear-status <host_id>                  remove the aigentry pill
   close-for-sid <sid> [session_json]      lookup + close in one call
+  read-screen <host_id|sid>               print the current viewport text
+                                          (1=read failed, 20=adapter has no reader)
   detect-terminal                         print the host terminal adapter name
   agent-meta-caps                         per-surface agent metadata supported?
                                           (20=unsupported, 30=error)
@@ -122,6 +138,7 @@ case "$verb" in
   set-status)      wh_set_status "$@" ;;
   clear-status)    wh_clear_status "$@" ;;
   close-for-sid)   wh_close_for_sid "$@" ;;
+  read-screen)     wh_read_screen "$@" ;;
   detect-terminal) detect_terminal "$@" ;;
   agent-meta-caps)  wh_agent_meta_caps "$@" ;;
   agent-meta-set)   wh_agent_meta_set "$@" ;;

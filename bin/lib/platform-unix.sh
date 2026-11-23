@@ -13,11 +13,13 @@ platform::has_tmux_session() {
 
 # platform::spawn_tmux_window <name> <cwd> <cmd>
 # Wraps `tmux new-window`. Name becomes the window label, cwd the starting dir.
+# Prints the new window's id (`@N`) on stdout — the handle the tmux adapter keeps
+# (task 1304 D3).
 platform::spawn_tmux_window() {
   local name="${1:-}" cwd="${2:-}" cmd="${3:-}"
   [[ -z "$name" || -z "$cwd" || -z "$cmd" ]] && { echo "spawn_tmux_window: 3 args" >&2; return 2; }
   command -v tmux >/dev/null 2>&1 || { echo "tmux not installed" >&2; return 4; }
-  tmux new-window -c "$cwd" -n "$name" "$cmd"
+  tmux new-window -c "$cwd" -n "$name" -P -F '#{window_id}' "$cmd"
 }
 
 # platform::spawn_iterm_tab <cwd> <cmd>  (macOS-only, via AppleScript)

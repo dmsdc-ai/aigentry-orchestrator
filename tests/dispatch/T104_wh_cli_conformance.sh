@@ -1,3 +1,6 @@
+# task 1304 ADR D5: headless has no host to ask, so alive is INDETERMINATE→alive (0).
+[ "$e2_rc" -eq 0 ] || fail "E: workspace copy alive rc=$e2_rc want 0 (headless INDETERMINATE→alive, ADR D5)"grep -q "platform" "$T_TMP/e.err" && fail "E: the workspace copy could not load lib/platform.sh relative to the door:
+$(cat "$T_TMP/e.err")"
 #!/usr/bin/env bash
 # T104 (#899 pre-tranche-2) — bin/wh-cli.sh is the SAME thing as sourcing
 # bin/lib/workspace-host.sh and calling the function.
@@ -146,6 +149,7 @@ all_verbs() {
   eq clear-status "$REF"
   eq close-for-sid "$SID"
   eq close-for-sid "no-such-sid"
+  eq read-screen "$REF"
   eq detect-terminal
 }
 
@@ -169,6 +173,7 @@ eq prune-orphans "$SID" "workspace:1"
 eq set-status "$REF" working
 eq clear-status "$REF"
 eq close-for-sid "$SID"
+eq read-screen "$REF"
 eq detect-terminal
 eq open "$SID" "$T_TMP/cwd" "claude --x"
 
@@ -217,6 +222,9 @@ WS="$T_TMP/workspace"
 mkdir -p "$WS/bin/lib"
 cp "$CLI" "$WS/bin/wh-cli.sh"
 cp "$LIB" "$WS/bin/lib/workspace-host.sh"
+# task 1304 D5: the door sources lib/platform.sh too; the init manifest ships it and both
+# backends next to workspace-host.sh (bin/init/manifest.mjs), so the copy does as well.
+for p in platform.sh platform-unix.sh platform-windows.sh; do cp "$REPO_ROOT/bin/lib/$p" "$WS/bin/lib/$p"; done
 chmod +x "$WS/bin/wh-cli.sh"
 set +e
 e_out=$(cd / && AIGENTRY_WORKSPACE_HOST=headless "$BASH_BIN" "$WS/bin/wh-cli.sh" detect-terminal 2>"$T_TMP/e.err")
@@ -225,10 +233,13 @@ set -e
 [ "$e_rc" -eq 0 ] || fail "E: workspace copy failed (rc=$e_rc) — the lib is resolved relative to cwd, not to the script.
 $(cat "$T_TMP/e.err")"
 [ -n "$e_out" ] || fail "E: workspace copy printed nothing for detect-terminal"
+grep -q "platform" "$T_TMP/e.err" && fail "E: the workspace copy could not load lib/platform.sh relative to the door:
+$(cat "$T_TMP/e.err")"
 set +e
 (cd / && AIGENTRY_WORKSPACE_HOST=headless "$BASH_BIN" "$WS/bin/wh-cli.sh" alive x >/dev/null 2>&1); e2_rc=$?
 set -e
-[ "$e2_rc" -eq 1 ] || fail "E: workspace copy alive rc=$e2_rc want 1 (headless gone)"
+# task 1304 ADR D5: headless has no host to ask, so alive is INDETERMINATE→alive (0).
+[ "$e2_rc" -eq 0 ] || fail "E: workspace copy alive rc=$e2_rc want 0 (headless INDETERMINATE→alive, ADR D5)"
 
 # --- F: coverage — declared verbs == public lib surface -------------------------
 declared=$(sed -n 's/^  \([a-z][a-z-]*\) .*/\1/p' "$T_TMP/help.txt" | sort -u | tr '\n' ' ')

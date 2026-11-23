@@ -299,11 +299,13 @@ test('exact installed boot selector acceptance (independent T134 A-I)', async t 
       // Task 1270 (CI 43736341103): init places EXACTLY TWO docs/setup leaves — this boot doc and
       // docs/setup/worker-reports.md (#1170, the confined report pump). Both are required documents, each placed
       // once, each a governance-root LEAF. (Was: "exactly one docs/setup leaf".) No manifest or doc is changed here.
-      const INIT_SETUP_DOCS = [BOOT_DOC, 'docs/setup/worker-reports.md'];
+      // Task 1291: a THIRD leaf, docs/setup/controller-link.md (controller-link v1), which the shipped orchestrator
+      // instruction cites; shipped, a governance-root leaf and init-placed exactly as worker-reports.md.
+      const INIT_SETUP_DOCS = [BOOT_DOC, 'docs/setup/worker-reports.md', 'docs/setup/controller-link.md'];
       const setupLeaves = manifest.MANIFEST.filter(p => p.startsWith('docs/setup/'));
       assert.deepEqual([...setupLeaves].sort(), [...INIT_SETUP_DOCS].sort(),
-        `init must place exactly these two docs/setup leaves, got: ${JSON.stringify(setupLeaves)}`);
-      assert.equal(setupLeaves.length, 2, 'each init-placed docs/setup leaf appears exactly once');
+        `init must place exactly these three docs/setup leaves, got: ${JSON.stringify(setupLeaves)}`);
+      assert.equal(setupLeaves.length, 3, 'each init-placed docs/setup leaf appears exactly once');
       for (const leaf of INIT_SETUP_DOCS) assert.ok(manifest.GOVERNANCE_ROOTS.includes(leaf), `${leaf} is not a governance-root leaf`);
       assert.ok(!manifest.GOVERNANCE_ROOTS.includes('docs/setup/'),
         'docs/setup/ as a root would require MANIFEST entries for the other shipped setup docs');

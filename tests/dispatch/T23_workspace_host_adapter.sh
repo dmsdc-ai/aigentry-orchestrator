@@ -67,7 +67,8 @@ echo "$out" | grep -q "gone=1"              || { echo "FAIL: alive-gone"; echo "
 echo "$out" | grep -q "list_ids=ws-alive,ws-other," || { echo "FAIL: list_ids"; echo "$out"; exit 1; }
 echo "$out" | grep -q "close-alive=ok"      || { echo "FAIL: close"; echo "$out"; exit 1; }
 
-# Headless adapter — all no-ops, alive=1.
+# Headless adapter — all no-ops; alive answers INDETERMINATE→alive (0), task 1304 ADR D5:
+# headless has no host to ask, and "cannot ask" is never "gone" (INV-17).
 out2=$(AIGENTRY_WORKSPACE_HOST=headless bash -c "
   set -e
   . '$REPO_ROOT/bin/lib/workspace-host.sh'
@@ -76,7 +77,7 @@ out2=$(AIGENTRY_WORKSPACE_HOST=headless bash -c "
   wh_close any && echo close-ok || echo close-fail
 ")
 echo "$out2" | grep -q "lookup=$"     || { echo "FAIL: headless lookup not empty"; echo "$out2"; exit 1; }
-echo "$out2" | grep -q "alive-gone"   || { echo "FAIL: headless alive (should be gone)"; echo "$out2"; exit 1; }
+echo "$out2" | grep -q "alive-ok"     || { echo "FAIL: headless alive (should be INDETERMINATE→alive, ADR D5)"; echo "$out2"; exit 1; }
 echo "$out2" | grep -q "close-ok"     || { echo "FAIL: headless close"; echo "$out2"; exit 1; }
 
 # --- #835: only a real answer may say "gone" -------------------------------
@@ -108,8 +109,8 @@ echo "$out3" | grep -q "silent=present" \
 
 # cmux not on PATH at all — same reasoning, stronger case. Probed at the adapter
 # function directly (as T25 does for _wh_warp_alive) because with cmux absent the
-# public wh_alive resolves to the headless adapter, whose documented "gone" is a
-# separate contract asserted above and is unreachable from the sweep (headless
+# public wh_alive resolves to the headless adapter, whose own answer (alive since task
+# 1304 D5) is a separate contract asserted above and is unreachable from the sweep (headless
 # wh_lookup returns no host_id, so the reconciler never probes).
 EMPTY_DIR="$T_TMP/empty-bin"; mkdir -p "$EMPTY_DIR"
 out4=$("$BASH_BIN" -c "

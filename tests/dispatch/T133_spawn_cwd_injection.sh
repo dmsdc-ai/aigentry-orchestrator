@@ -21,7 +21,7 @@
 #   A  src/session/open-session/cli.ts   evalCwd — was `eval cwd="$1"` in bash
 #   B  bin/lib/workspace-host.sh:333     _wh_cmux_open      (the default arm)
 #   C  src/session/open-session/legacy-spawn.ts  the AIGENTRY_WH_LEGACY_SPAWN=1 arm
-#   D  bin/lib/workspace-host.sh:679     _wh_warp_open      (the TOML `command =`)
+#   D  bin/lib/workspace-host.sh         _wh_warp_open      (the TOML `commands = [...]`, task 1304)
 #   E  bin/lib/workspace-host.sh:752     _wh_aterm_open     (aterm --cmd)
 # A/B/C go through the real CLI; D/E drive wh_open directly, because Warp and aterm
 # have no hermetic spawn — what is executed there is the command STRING they build,
@@ -171,15 +171,30 @@ for form in semi dollar tick quote; do
   assert_clean "C ($form, AIGENTRY_WH_LEGACY_SPAWN=1 inline arm, rc=$RC)"
 done
 
-# --- D) _wh_warp_open — the wrapper it writes into the tab_config TOML -------------
-# Warp runs `command = '<wrapper>'` as a shell command line in the new surface. There
-# is no hermetic Warp, so the seam is the OPENER: `_wh_warp_deeplink_open` shells out
-# to open(1)/xdg-open, and a fake one does exactly what Warp does — read the TOML,
-# run its command line — plus keeps a copy, because _wh_warp_open GCs the TOML the
-# moment its ready-gate times out (which it always does here: no Warp is running).
+# --- D) _wh_warp_open — the pane command it writes into the tab_config TOML --------
+# Warp runs `commands = ["<line>"]` as a shell command line in the new surface; since
+# task 1304 that line is `exec tmux new-session -A -s <name> -c <cwd> <wrapper>`, and
+# tmux runs <wrapper> through a shell in <cwd>. There is no hermetic Warp, so the seam
+# is the OPENER: `_wh_warp_deeplink_open` shells out to open(1)/xdg-open, and a fake one
+# does exactly what Warp does — read the TOML, TOML-unescape commands[0], run it — plus
+# keeps a copy, because _wh_warp_open GCs the TOML when its ready-gate times out. A fake
+# tmux in the same dir does what tmux does with new-session: run the wrapper in -c's
+# directory. Both EXECUTE, so a payload that survived either layer of quoting would run.
 LIB="$REPO_ROOT/bin/lib/workspace-host.sh"
 WARP_TC="$T_TMP/warp-tc"
 WARP_OPENER="$T_TMP/warpbin"; mkdir -p "$WARP_OPENER"
+# commands[0] of a tab config: tomllib where Python has it, else json.loads of the value
+# (the writer emits only escapes TOML basic strings and JSON share).
+cat > "$WARP_OPENER/tab-command.py" <<'EOF'
+import json, re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+try:
+    import tomllib
+    print(tomllib.loads(text)["panes"][0]["commands"][0], end="")
+except ModuleNotFoundError:
+    m = re.search(r'^commands = \[(".*")\]$', text, re.M)
+    print(json.loads(m.group(1)) if m else "", end="")
+EOF
 cat > "$WARP_OPENER/open" <<'EOF'
 #!/usr/bin/env bash
 # stand-in for the Warp deeplink handoff: warp://tab_config/<name> → run the config.
@@ -187,17 +202,30 @@ name="${1##*/}"
 toml="$AIGENTRY_WARP_TAB_CONFIG_DIR/$name.toml"
 [ -f "$toml" ] || exit 1
 cp "$toml" "$T133_WARP_KEEP"
-cmd=$(sed -n "s/^command = '\(.*\)'$/\1/p" "$toml")
+cmd=$(python3 "$(dirname "$0")/tab-command.py" "$toml")
 ( PATH="$T133_PROBE_DIR:$PATH"; bash -c "$cmd" >/dev/null 2>&1 || true )
 exit 0
 EOF
 cp "$WARP_OPENER/open" "$WARP_OPENER/xdg-open"
-chmod +x "$WARP_OPENER/open" "$WARP_OPENER/xdg-open"
+cat > "$WARP_OPENER/tmux" <<'EOF'
+#!/usr/bin/env bash
+# new-session -A -s NAME -c DIR CMD → run CMD through a shell in DIR, as tmux does.
+[ "${1:-}" = new-session ] || { echo "can't find session: stub" >&2; exit 1; }
+shift; dir=""; cmd=""
+while [ $# -gt 0 ]; do case "$1" in -A) shift;; -s) shift 2;; -c) dir="$2"; shift 2;; *) cmd="$1"; shift;; esac; done
+( cd "$dir" 2>/dev/null || true; PATH="$T133_PROBE_DIR:$PATH"; bash -c "$cmd" >/dev/null 2>&1 || true )
+exit 0
+EOF
+chmod +x "$WARP_OPENER/open" "$WARP_OPENER/xdg-open" "$WARP_OPENER/tmux"
 
 for form in semi dollar tick quote; do
   eval "cwd=\$payload_$form"
   rm -rf "$WARP_TC"; mkdir -p "$WARP_TC"
   KEEP="$T_TMP/warp-$form.toml"; : > "$KEEP"
+  : > "$T133_TELEPTY_LOG"
+  # open-session mkdir -p's the cwd before any adapter runs (see the header); wh_open is
+  # driven directly here, so the payload-named directory is made the same way.
+  mkdir -p "$cwd"
   env HOME="$T_TMP/home-warp" \
       AIGENTRY_WARP_TAB_CONFIG_DIR="$WARP_TC" \
       AIGENTRY_WARP_SURFACE_DIR="$T_TMP/warp-surf" \
@@ -207,9 +235,13 @@ for form in semi dollar tick quote; do
       PATH="$WARP_OPENER:$PROBE_DIR:/usr/bin:/bin" \
       bash -c '. "$1"; wh_open "$2" "$3" "claude --x"' _ "$LIB" t133-warp "$cwd" \
       >/dev/null 2>&1 || true
-  W=$(sed -n "s/^command = '\(.*\)'$/\1/p" "$KEEP" 2>/dev/null || true)
+  W=$(python3 "$WARP_OPENER/tab-command.py" "$KEEP" 2>/dev/null || true)
   [ -n "$W" ] || fail "D ($form): _wh_warp_open wrote no tab_config command line — the seam did not fire"
-  assert_clean "D ($form, _wh_warp_open tab_config wrapper: $W)"
+  assert_clean "D ($form, _wh_warp_open tab_config pane command: $W)"
+  # …and it really ran: the wrapper reached telepty allow, in the hostile cwd taken as a PATH.
+  grep -qF "telepty allow --id t133-warp --auto-restart claude --x pwd=$cwd" "$T133_TELEPTY_LOG" \
+    || fail "D ($form): the pane command did not start telepty allow in the requested cwd — D may be passing by running nothing. log:
+$(cat "$T133_TELEPTY_LOG")"
 done
 
 # --- E) _wh_aterm_open — the string handed to `aterm new-session --cmd` ------------
@@ -434,7 +466,11 @@ EOF
   # must still reach the shell as one intact directory and actually start telepty.
   HCWD="$T_TMP/h plain"; mkdir -p "$HCWD"
   h_open "$HCWD"
-  grep -qF "TYPED cd '$HCWD' && telepty allow --id t133-h" "$T_TMP/h.log" \
+  # task 1304 r3/r4: the typed line starts the worker through the foreign-terminal scrub
+  # (`/bin/sh -c '<scrub>' sh telepty allow …`); both ends of it are pinned.
+  grep -qF "TYPED cd '$HCWD' && /bin/sh -c 'for v in \$(env | sed -n " "$T_TMP/h.log" \
+    && grep -qF "[ \"\${TERM_PROGRAM:-}\" = \"iTerm.app\" ]" "$T_TMP/h.log" \
+    && grep -qF "exec \"\$@\"' sh telepty allow --id t133-h" "$T_TMP/h.log" \
     || fail "H4: a legitimate cwd with a space did not survive as one quoted argument. log:
 $(cat "$T_TMP/h.log")"
   grep -qF "pwd=$HCWD" "$T_TMP/h.log" "$T133_TELEPTY_LOG" 2>/dev/null \

@@ -40,6 +40,7 @@
     "docs/rules.md",
     "docs/model-profiles/model-routing-profile.md",
     "docs/model-profiles/model-catalog.json",
+    "docs/setup/controller-link.md",
     "docs/setup/dispatch-capacity.md",
     "docs/setup/orchestrator-boot.md",
     "docs/setup/worker-reports.md",

@@ -216,6 +216,16 @@ function whCloseCategory(stderr: string): string {
   return WH_CLOSE_CATEGORIES.has(only) ? only : "unknown-failure";
 }
 
+/**
+ * Task 1304 r3: the layer REFUSED the close because the handle is the surface this
+ * controller runs in (exit 4, token `wh_close_refused=own-surface`). Nothing was closed,
+ * and that is said as such — never as a success, and never as an unconfirmed release.
+ * Same closed-vocabulary rule as whCloseCategory: only the exact token is read.
+ */
+function whCloseRefused(status: number, stderr: string): boolean {
+  return status === 4 && /(^|[^A-Za-z0-9_-])wh_close_refused=own-surface([^A-Za-z0-9_-]|$)/m.test(stderr);
+}
+
 // ── output ──────────────────────────────────────────────────────────────────
 function err(msg: string): void {
   process.stderr.write(`ERR ${msg}\n`);
@@ -371,6 +381,11 @@ function closeWorkspaceFor(sid: string, json: string): boolean {
   if (closed.status === 0) {
     log(`workspace host closed: ${sid} (${hostId})`);
     return true;
+  }
+  if (whCloseRefused(closed.status, closed.stderr)) {
+    log(`workspace host close REFUSED for ${sid} (${hostId}): that surface is this controller's own — nothing was closed`);
+    err(`workspace host close refused for ${sid} (${hostId}): own surface`);
+    return false;
   }
   // #1162: a non-zero close is not "already closed?" — that asserted an absence no
   // adapter reported. Nor is it "nothing was released": the adapter's liveness
@@ -784,7 +799,10 @@ function cleanupOne(sid: string, force: boolean): number {
     // there is no close and no failure to propagate.
     const closed = captureBoth(WH_CLI, ["close-for-sid", sid]);
     const closeOk = closed.status === 0;
-    if (!closeOk) {
+    if (!closeOk && whCloseRefused(closed.status, closed.stderr)) {
+      log(`workspace host close REFUSED for ${sid} (by sid): that surface is this controller's own — nothing was closed`);
+      err(`workspace host close-for-sid refused for ${sid}: own surface`);
+    } else if (!closeOk) {
       const category = whCloseCategory(closed.stderr);
       log(`workspace host close failed for ${sid} (by sid): release UNCONFIRMED — neither release nor retention was observed [${category}]`);
       err(`workspace host close-for-sid non-zero for ${sid} [${category}]`);

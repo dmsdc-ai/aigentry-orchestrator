@@ -18,6 +18,7 @@ export const USAGE = `# dispatch.sh — Wraps \`telepty inject\` with REPL-ready
 #               [--retry-unknown "<reason>"]
 #   dispatch.sh --spawn-and-dispatch --track T --name N --cwd P --cli claude \\
 #               --ref <file> [--from <orch-sid>] [--role coder|architect|...] [--task-class C] [--worktree P]
+#   dispatch.sh --target <controller-sid>@<peer> --ref <file> (--task <id> | --no-task "<reason>")
 #   dispatch.sh --help
 #
 # Rule 34 task-gate (#736): every dispatch must name the task it actuates.
@@ -94,6 +95,36 @@ export const USAGE = `# dispatch.sh — Wraps \`telepty inject\` with REPL-ready
 #   (transport observed, or no held attempt) refuses the flag with exit 4
 #   (DISPATCH_RETRY_REFUSED) naming lifecycle= and transport=, so the override
 #   cannot double a known delivery. Without the flag the hold is unchanged.
+#
+# Peer controller target (controller-link v1, task 1291): a --target containing \`@\` is
+#   never a worker. It is accepted only when it equals a peers.*.target with link "v1" in
+#   the hand-written state/controller-peers.json (AIGENTRY_CONTROLLER_PEERS overrides the
+#   path); any other \`@\` target, or a missing or malformed list, exits 78
+#   (PEER_TARGET_REFUSED / PEER_CONFIG_INVALID). A local alias (localhost, 127.x, ::1, 0.0.0.0
+#   and their spellings) names this machine and exits 78 PEER_TARGET_REFUSED even when listed.
+#   The task gate runs first, unchanged. Checks run in ONE fixed order and the first failing
+#   one answers: (1) argument parsing, --ref present and a file, the --input-* triple (#1172),
+#   the Rule 34 task gate, all as for any target (a --no-task audit line is written here);
+#   (2) peer list, 78 PEER_CONFIG_INVALID; (3) local alias, then listed with link "v1", 78
+#   PEER_TARGET_REFUSED; (4) local-only flags, then a --task id the envelope cannot carry, 4
+#   PEER_FLAG_UNSUPPORTED; (5) ref size and body, 4; (6) record and de-duplication, 9 / 8;
+#   (7) the send. So an unlisted host with a missing --ref exits 4 (step 1). The
+#   ref is read locally and sent inline as the body of one envelope (at most 12288 bytes
+#   after normalisation) by ONE \`telepty inject --submit --no-submit-force --submit-retry 0
+#   --from controller-link\`; never --ref, never a worker spawn, registry record, staging,
+#   probe or cleanup on either machine. The request is recorded in state/controller-link/
+#   (AIGENTRY_CONTROLLER_LINK_DIR overrides) BEFORE it is sent. Exits:
+#     0  OK peer request <id> to <target> consumption=<submit> (the task row is ledgered)
+#     4  PEER_FLAG_UNSUPPORTED (--spawn-and-dispatch --retry-unknown --worktree
+#        --verify-delivered --keep-alive --cli --role --task-class --observe --input-*
+#        --from), PEER_BODY_INVALID, PEER_BODY_TOO_LARGE, PEER_REF_PLACEHOLDER
+#        ({{ORCHESTRATOR_REPORT_TARGET}} in the ref); nothing sent
+#     7  PEER_DELIVERY_UNKNOWN, 11 PEER_NOT_DELIVERED: the record is kept and the pump
+#        reconciles it automatically; do not re-run dispatch
+#     8  PEER_REQUEST_DEDUPLICATED: an open request to that peer has the same task and
+#        body (its id is printed); nothing sent
+#     9  PEER_NOT_RECORDED: the store failed before the send; nothing sent
+#   A --target without \`@\` behaves exactly as before.
 #
 # Ready detection: per-CLI prompt-symbol probe of \`telepty read-screen\` plus
 # welcome/boot banner absence (claude ❯ / codex › / gemini ›|│ >).

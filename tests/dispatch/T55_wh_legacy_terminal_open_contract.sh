@@ -7,7 +7,8 @@
 #
 # A) fire-and-forget spawn: wh_open routes via AIGENTRY_WORKSPACE_HOST=<term> to
 #    _wh_<term>_open, issues the host spawn command wrapping `telepty allow --id <sid>`
-#    (or `telepty spawn` for headless), and emits exactly <sid> on stdout, rc 0.
+#    (or `telepty spawn` for headless), and emits exactly <sid> on stdout, rc 0 —
+#    except tmux, which emits its new window's id `@N` (task 1304 D3 handle).
 # B) aterm/wezterm CLI absent → _wh_fallback_spawn (daemon PTY), still emits <sid>.
 # C) iterm spawn failure (osascript fails) → return 2, NO handle (legacy `exit 2`).
 # D) BC2 ready_attestation declared per adapter (= `none`: the byte-equivalent move
@@ -104,12 +105,24 @@ run_open aterm
 [ "$RC" -eq 0 ]                        || fail "aterm-fallback: rc=$RC want 0 (err: $ERRTXT)"
 printf '%s\n' "$OUT" | grep -qx "$SID" || fail "aterm-fallback: stdout='$OUT' want '$SID'"
 
-# A-tmux: tmux new-window issued via platform::, wrapping telepty allow, emits sid.
+# A-tmux: tmux new-window issued via platform::, wrapping telepty allow, emits the new
+# window's id (task 1304 D3: a handle the lifecycle verbs can address, not the sid).
 mk_stub tmux "$TMUX_LOG"
+# The recorder above answers nothing on stdout; real tmux prints the id `-P -F
+# '#{window_id}'` asks for, so this stub does too (and still records argv).
+cat > "$STUB_BIN/tmux" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "tmux \$*" >> "$TMUX_LOG"
+[ "\$1" = new-window ] && echo "@55"
+exit \${STUB_RC:-0}
+EOF
+chmod +x "$STUB_BIN/tmux"
 run_open tmux
 [ "$RC" -eq 0 ]                        || fail "tmux: rc=$RC want 0 (err: $ERRTXT)"
-printf '%s\n' "$OUT" | grep -qx "$SID" || fail "tmux: stdout='$OUT' want '$SID'"
+[ "$OUT" = "@55" ]                     || fail "tmux: stdout='$OUT' want the window id '@55' (task 1304 handle)"
 grep -q 'new-window' "$TMUX_LOG"       || fail "tmux: new-window not issued. log:
+$(cat "$TMUX_LOG")"
+grep -qF -- "-n $SID -P -F #{window_id} " "$TMUX_LOG" || fail "tmux: the window is not named for the sid, or its id was not requested. log:
 $(cat "$TMUX_LOG")"
 # #926: `--id '$SID'` -> `--id $(printf %q)`. Computed, not hardcoded, so this stays
 # an assertion about the SHAPE (sid is %q-quoted) rather than about one sid's bytes.
@@ -207,7 +220,8 @@ done
 verbs=$("$BASH_BIN" -c '. "'"$LIB"'"; declare -F | sed -n "s/^declare -f //p" | grep "^wh_" | sort | tr "\n" " "')
 # #1162 G2c: the three reviewed per-surface metadata verbs, listed literally (never
 # derived from workspace-host.sh) so an added or dropped wh_ export still fails here.
-want="wh_agent_meta_caps wh_agent_meta_clear wh_agent_meta_set wh_alive wh_clear_status wh_close wh_close_for_sid wh_focus wh_list_ids wh_lookup wh_open wh_prune_orphans wh_set_status "
+# task 1304 ADR D4: wh_read_screen reopens the boundary on purpose (readiness reads it).
+want="wh_agent_meta_caps wh_agent_meta_clear wh_agent_meta_set wh_alive wh_clear_status wh_close wh_close_for_sid wh_focus wh_list_ids wh_lookup wh_open wh_prune_orphans wh_read_screen wh_set_status "
 [ "$verbs" = "$want" ] || fail "G: public verb set drift (BC2 9-verb boundary).
   got:  $verbs
   want: $want"

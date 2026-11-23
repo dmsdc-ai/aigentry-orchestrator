@@ -313,7 +313,7 @@ export function defaultRegistryPort(script: string): RegistryPort {
   return { list: (a) => run(["report-list", ...a]), event: (a) => run(["report-event", ...a]) };
 }
 
-export function defaultTeleptyPort(bin: string): TeleptyPort {
+export function defaultTeleptyPort(bin: string, from: string = BROKER_SID): TeleptyPort {
   const run = (args: string[], timeout: number) =>
     (process.platform === "win32" ? crossSpawn.sync : spawnSync)(bin, args, { encoding: "utf8",
       env: teleptyChildEnv(), stdio: ["ignore", "pipe", "pipe"], timeout, maxBuffer: 16 * 1024 * 1024 });
@@ -329,7 +329,7 @@ export function defaultTeleptyPort(bin: string): TeleptyPort {
       }
     },
     inject(dest, text) {
-      const r = run(["inject", "--submit", "--no-submit-force", "--submit-retry", "2", "--from", BROKER_SID, dest, text],
+      const r = run(["inject", "--submit", "--no-submit-force", "--submit-retry", "2", "--from", from, dest, text],
         INJECT_TIMEOUT_MS);
       const timedOut = (r.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT";
       const rc = r.error && !timedOut ? 127 : r.status;

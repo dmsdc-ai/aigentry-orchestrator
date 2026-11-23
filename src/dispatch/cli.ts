@@ -35,6 +35,7 @@ import { loadWorkerScope, prepareWorkerSandbox, assertConfinedTarget, stageWorke
 import { CLAUDE_OAUTH_OPT_IN } from "../session/claude-worker-oauth.js";
 import { validateSpawnDecision, type SpawnDecision } from "../session/model-decision.js";
 import { bootCapabilitiesDocument } from "../orchestrator-boot/plan.js";
+import { findTaskRows, TASK_QUEUE, taskQueueStatus } from "./task-queue-read.js";
 
 // ── environment seams (identical names/defaults to the shell) ────────────────
 // SCRIPT_DIR was `cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P` — the repo's
@@ -291,7 +292,12 @@ interface ProbeState {
   /** r4 B1: `detail.tracker_class`, already emitted — the independent live-work signal. */
   trackerClass: string;
   probeError: boolean;
+  /** Task 1304 D4: the adapter named by a `READINESS_UNATTESTABLE adapter=<name>` probe error
+   *  (the session's terminal has no screen reader), else "". */
+  unattestable: string;
 }
+
+const UNATTESTABLE = /^READINESS_UNATTESTABLE adapter=([a-z]{1,32})$/;
 
 function probeState(sid: string, cliKind: string, timeoutMs = READINESS_CAPTURE_MAX_MS): ProbeState | null {
   const { stdout } = capture(SESSION_PROBE_PY, ["--sid", sid, "--cli", cliKind], { TELEPTY }, timeoutMs);
@@ -306,6 +312,7 @@ function probeState(sid: string, cliKind: string, timeoutMs = READINESS_CAPTURE_
       readyReason: typeof detail.ready_reason === "string" ? detail.ready_reason : "",
       trackerClass: typeof detail.tracker_class === "string" ? detail.tracker_class : "",
       probeError: detail.probe_error !== undefined,
+      unattestable: typeof detail.probe_error === "string" ? (UNATTESTABLE.exec(detail.probe_error)?.[1] ?? "") : "",
     };
   } catch {
     return null;
@@ -789,13 +796,9 @@ function decisionAudit(d: SpawnDecision): Record<string, unknown> {
 // lives here — dispatch.sh is the actuation chokepoint every delegation flows
 // through. It runs BEFORE any side effect so a violation can never leave a
 // half-started worker behind.
-const TASK_QUEUE = env.AIGENTRY_TASK_QUEUE || path.join(SCRIPT_DIR, "..", "state", "task-queue.json");
 const TASK_GATE_MODE = env.AIGENTRY_TASK_GATE || "hard";
 const TASK_GATE_HINT =
   'register the task in state/task-queue.json first (--task <id>), or use --no-task "<reason>" for exempt work.';
-
-const ALLOWED_STATUS = new Set(["pending", "in_progress", "delegated", "queued", "blocked-by-observation"]);
-const TERMINAL_STATUS = new Set(["done", "completed", "superseded", "cancelled", "closed"]);
 
 function utcNow(): Date {
   return new Date();
@@ -846,15 +849,6 @@ function taskGateReject(o: Opts, msg: string): void {
   die(`dispatch.sh: ${msg}`, 4);
 }
 
-/** Every row whose id matches. The COUNT is the point: two rows is an id nobody can resolve. */
-function findTaskRows(rows: unknown[], taskId: string): number[] {
-  const hits: number[] = [];
-  rows.forEach((t, i) => {
-    if (t && String((t as { id?: unknown }).id) === taskId) hits.push(i);
-  });
-  return hits;
-}
-
 /**
  * #1110: both find sites word it the same way. `tasks.find(...)` answered with the first
  * match, so `--task 522` read a desc-less `pending` row while the row a human meant sat
@@ -875,31 +869,21 @@ function ambiguousTaskIdMessage(rows: unknown[], hits: number[], taskId: string)
   );
 }
 
-/** The queue lookup — rc mirrors the retired python block's exit codes. */
-function taskQueueStatus(taskId: string): { rc: number; status: string } {
-  let data: { tasks?: unknown[]; completed?: unknown[] };
-  try {
-    data = JSON.parse(fs.readFileSync(TASK_QUEUE, "utf8"));
-  } catch {
-    return { rc: 2, status: "" };
+// Preserve the dispatch gate's exit codes and keep duplicate refusals outside gate mode policy.
+function dispatchTaskQueueStatus(taskId: string): { rc: number; status: string } {
+  const result = taskQueueStatus(taskId);
+  switch (result.kind) {
+    case "unreadable":
+      return { rc: 2, status: "" };
+    case "not-found":
+      return { rc: 3, status: "" };
+    case "archived":
+      return { rc: 4, status: result.status };
+    case "unique":
+      return { rc: result.dispatchable ? 0 : result.terminal ? 4 : 5, status: result.status };
+    case "duplicate":
+      return die(`dispatch.sh: ${ambiguousTaskIdMessage(result.rows, result.hits, taskId)}`, 5);
   }
-  const tasks = Array.isArray(data.tasks) ? data.tasks : [];
-  const hits = findTaskRows(tasks, taskId);
-  // rc 5 — distinct from the gate's rc 4, so a caller can tell a collision from a bad status.
-  if (hits.length > 1) die(`dispatch.sh: ${ambiguousTaskIdMessage(tasks, hits, taskId)}`, 5);
-  const task = (hits.length === 1 ? tasks[hits[0]!] : undefined) as { status?: unknown } | undefined;
-  if (task === undefined) {
-    // completed[] is the archive tail — a hit there is a stale id, not an unknown one.
-    const completed = Array.isArray(data.completed) ? data.completed : [];
-    if (completed.some((t) => t && String((t as { id?: unknown }).id) === taskId)) {
-      return { rc: 4, status: "completed" };
-    }
-    return { rc: 3, status: "" };
-  }
-  const status = String(task.status || "");
-  if (ALLOWED_STATUS.has(status)) return { rc: 0, status };
-  const terminal = TERMINAL_STATUS.has(status) || status.startsWith("done") || status.startsWith("completed");
-  return { rc: terminal ? 4 : 5, status };
 }
 
 function taskGateCheck(o: Opts): void {
@@ -918,7 +902,7 @@ function taskGateCheck(o: Opts): void {
     taskGateReject(o, `Rule 34 task-gate: ${TASK_GATE_HINT}`);
     return;
   }
-  const { rc, status } = taskQueueStatus(o.taskId);
+  const { rc, status } = dispatchTaskQueueStatus(o.taskId);
   switch (rc) {
     case 0:
       return;
@@ -2205,13 +2189,24 @@ async function waitForReady(o: Opts, sid: string, measured?: BusyAdmission): Pro
   const anchored = measured !== undefined && measured.probed;
   const deadline = (anchored ? measured!.startedAt : nowMs()) + effectiveTimeout;
   for (;;) {
-    let ready: boolean;
+    // Task 1304 D4: the same probe isReady() reads (its `ready` is isReady's verdict), kept
+    // whole so an adapter with no screen reader is seen on the first answer.
+    let state: ProbeState | null;
     if (reused !== undefined) {
-      ready = reused !== null && reused.ready;
+      state = reused;
       reused = undefined;
     } else {
-      ready = isReady(sid, cliKind, Math.max(1, Math.min(READINESS_CAPTURE_MAX_MS, deadline - nowMs())));
+      state = probeState(sid, cliKind, Math.max(1, Math.min(READINESS_CAPTURE_MAX_MS, deadline - nowMs())));
     }
+    if (state !== null && state.unattestable !== "") {
+      process.stderr.write(
+        `dispatch.sh: READINESS_UNATTESTABLE adapter=${state.unattestable} — ${sid}'s terminal adapter has no ` +
+        `current-screen reader, so REPL readiness cannot be attested (cli=${cliKind}); stopping now instead of ` +
+        `waiting ${effectiveTimeout}ms. Choose an adapter that can read the screen (cmux, warp or tmux) with AIGENTRY_WORKSPACE_HOST.\n`,
+      );
+      return 1;
+    }
+    const ready = state !== null && state.ready;
     if (ready) return 0;
     if (nowMs() >= deadline) {
       process.stderr.write(
@@ -2340,6 +2335,225 @@ async function main(argv: string[]): Promise<never> {
 
   verifyWorkerInputs(o);
   taskGateCheck(o);
+
+  // controller-link v1 (task 1291, SPEC §10): a target with `@` names a peer CONTROLLER, never a
+  // worker. Everything for it is inside this guard and every path in it exits. The controller-link
+  // modules are loaded here by dynamic import, so a dispatch without `@` loads, reads, writes and
+  // prints nothing it did not before. This branch creates no registry record, stages nothing and
+  // never spawns, probes or cleans up anything on either machine: one telepty inject, recorded in
+  // the controller-link outbox before it is sent.
+  if (o.target.includes("@")) {
+    const { LABEL_RE, REQUEST_ID_RE, TASK_ID_RE, normaliseBody, renderEnvelope } = await import("../controller-link/envelope.js");
+    const { defaultProcessRunner, sendEnvelope, validPeerTarget } = await import("../controller-link/send.js");
+    const { ControllerLinkStore, rawRef, resolveStoreRoot } = await import("../controller-link/store.js");
+    type LinkRecordT = import("../controller-link/store.js").LinkRecord;
+    type SendClassificationT = import("../controller-link/send.js").SendClassification;
+    const packageRoot = path.resolve(SCRIPT_DIR, "..");
+    const target = o.target;
+
+    // SPEC §2 strict reader of the hand-written peer list. Any defect refuses the whole file.
+    type PeerEntry = { label: string; target: string; link: string | null };
+    const readPeers = (): { self: { label: string; controller_sid: string }; peers: PeerEntry[] } => {
+      const override = env.AIGENTRY_CONTROLLER_PEERS;
+      let file = path.join(packageRoot, "state", "controller-peers.json");
+      if (override !== undefined && override !== "") {
+        if (override.includes("\0") || override.split(/[/\\]/).includes("..") || !path.isAbsolute(override)) {
+          throw new Error("AIGENTRY_CONTROLLER_PEERS must be an absolute path without '..' segments");
+        }
+        file = path.resolve(override);
+      }
+      let st: fs.Stats;
+      try { st = fs.statSync(file); } catch { throw new Error("peer list missing or unreadable"); }
+      if (!st.isFile() || st.size > 65536) throw new Error("peer list is not a regular file of at most 65536 bytes");
+      let doc: unknown;
+      try {
+        doc = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(fs.readFileSync(file)));
+      } catch {
+        throw new Error("peer list is not valid UTF-8 JSON");
+      }
+      const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
+      const only = (v: Record<string, unknown>, allowed: readonly string[], where: string): void => {
+        for (const k of Object.keys(v)) if (!allowed.includes(k)) throw new Error(`unknown key in ${where}`);
+      };
+      if (!isObj(doc)) throw new Error("peer list is not a JSON object");
+      only(doc, ["v", "self", "peers"], "the top level");
+      if (doc.v !== 1) throw new Error("v must be 1");
+      const self = doc.self;
+      if (!isObj(self)) throw new Error("self missing or not an object");
+      only(self, ["label", "controller_sid"], "self");
+      const selfLabel = self.label, selfSid = self.controller_sid;
+      if (typeof selfLabel !== "string" || !LABEL_RE.test(selfLabel)) throw new Error("self.label fails its pattern");
+      if (typeof selfSid !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(selfSid)) {
+        throw new Error("self.controller_sid fails its pattern");
+      }
+      if (!isObj(doc.peers)) throw new Error("peers missing or not an object");
+      const peers: PeerEntry[] = [];
+      for (const [label, p] of Object.entries(doc.peers)) {
+        if (!LABEL_RE.test(label)) throw new Error("a peer label fails its pattern");
+        if (!isObj(p)) throw new Error(`peer ${label} is not an object`);
+        only(p, ["target", "link"], `peer ${label}`);
+        const peerTarget = p.target, link = p.link;
+        if (typeof peerTarget !== "string" || !validPeerTarget(peerTarget)) throw new Error(`peer ${label} target is not <controller_sid>@<peer>`);
+        if (link !== undefined && typeof link !== "string") throw new Error(`peer ${label} link is not a string`);
+        if (peers.some((q) => q.target === peerTarget)) throw new Error(`peer ${label} repeats another peer's target`);
+        peers.push({ label, target: peerTarget, link: typeof link === "string" ? link : null });
+      }
+      return { self: { label: selfLabel, controller_sid: selfSid }, peers };
+    };
+    let config: ReturnType<typeof readPeers>;
+    try { config = readPeers(); } catch (e) {
+      die(`dispatch.sh: PEER_CONFIG_INVALID: ${printable(String((e as Error)?.message ?? e))}; nothing sent`, 78);
+    }
+    // CL-16 (SPEC §10): a local alias names THIS machine, never a peer controller, so it is refused even
+    // when the peer list names it. The host is normalised as a URL parser does (127.1, 0x7f.0.0.1,
+    // LOCALHOST., [0:0:0:0:0:0:0:1], a :port suffix); a host no URL can hold is left to the list check.
+    const urlHost = (h: string): string | null => {
+      try { return new URL(`http://${h}/`).hostname.toLowerCase().replace(/\.$/, ""); } catch { return null; }
+    };
+    const peerHost = target.slice(target.lastIndexOf("@") + 1);
+    const localAlias = [urlHost(peerHost), peerHost.startsWith("[") ? null : urlHost(`[${peerHost}]`)].some((h) => h !== null
+      && (h === "localhost" || h.endsWith(".localhost") || /^127\.\d+\.\d+\.\d+$/.test(h) || h === "0.0.0.0"
+        || h === "[::1]" || h === "[::]" || /^\[::ffff:(7f[0-9a-f]{2}:[0-9a-f]{1,4}|0:0)\]$/.test(h)));
+    if (localAlias) {
+      die(`dispatch.sh: PEER_TARGET_REFUSED: ${printable(target)} names this machine (a local alias), never a peer controller; nothing sent`, 78);
+    }
+    const peer = config.peers.find((p) => p.target === target && p.link === "v1");
+    if (peer === undefined) {
+      die(`dispatch.sh: PEER_TARGET_REFUSED: ${printable(target)} is not a listed peer controller with link "v1"; nothing sent`, 78);
+    }
+
+    // Flags that only make sense for a local worker (SPEC §10). argv is walked as parseArgs did.
+    const VALUE_FLAGS = new Set(["--target", "--ref", "--from", "--timeout-ms", "--track", "--name", "--cwd", "--worktree", "--cli",
+      "--role", "--task-class", "--task", "--no-task", "--input-root", "--input-manifest", "--input-sha256", "--observe", "--retry-unknown"]);
+    const LOCAL_ONLY = new Set(["--spawn-and-dispatch", "--retry-unknown", "--worktree", "--verify-delivered", "--keep-alive", "--cli",
+      "--role", "--task-class", "--observe", "--input-root", "--input-manifest", "--input-sha256", "--from"]);
+    const unsupported: string[] = [];
+    for (let i = 0; i < argv.length; i += VALUE_FLAGS.has(argv[i]!) ? 2 : 1) {
+      if (LOCAL_ONLY.has(argv[i]!) && !unsupported.includes(argv[i]!)) unsupported.push(argv[i]!);
+    }
+    if (unsupported.length > 0) {
+      die(`dispatch.sh: PEER_FLAG_UNSUPPORTED: ${unsupported.join(", ")} not supported for a peer controller target; nothing sent`, 4);
+    }
+    if (o.taskId && !TASK_ID_RE.test(o.taskId)) {
+      die("dispatch.sh: PEER_FLAG_UNSUPPORTED: --task id not representable in the envelope; nothing sent", 4);
+    }
+
+    // The ref is read locally and becomes the envelope body (SPEC §3.3).
+    if (fs.statSync(o.refFile).size > 262144) {
+      die("dispatch.sh: PEER_BODY_TOO_LARGE: ref file larger than 262144 bytes; nothing sent", 4);
+    }
+    let refBytes: Buffer;
+    try { refBytes = fs.readFileSync(o.refFile); } catch {
+      die("dispatch.sh: PEER_BODY_INVALID: ref file unreadable; nothing sent", 4);
+    }
+    const body = normaliseBody(refBytes);
+    if (!body.ok) {
+      const at = body.error.line === null ? "" : ` (line ${body.error.line})`;
+      die(`dispatch.sh: ${body.error.code}: ${printable(body.error.detail)}${at}; nothing sent`, 4);
+    }
+    if (body.body.includes("{{ORCHESTRATOR_REPORT_TARGET}}")) {
+      die("dispatch.sh: PEER_REF_PLACEHOLDER: the ref contains {{ORCHESTRATOR_REPORT_TARGET}}, which names this machine's report target for local workers; nothing sent", 4);
+    }
+
+    const { randomUUID } = await import("node:crypto");
+    const requestId = randomUUID();
+    if (!REQUEST_ID_RE.test(requestId)) die("dispatch.sh: PEER_NOT_RECORDED: minted request id fails its pattern; nothing sent", 9);
+    const senderTask = o.taskId || "-";
+    const rendered = renderEnvelope({ kind: "REQUEST", id: requestId, seq: 1, ref: null, from: config.self.label, to: peer.label,
+      sent_at: isoSeconds(utcNow()), sender_task: o.taskId || null, receiver_task: null, state: null, outcome: null, final: null,
+      reason: null }, body.body);
+    if (!rendered.ok) die(`dispatch.sh: ${rendered.error.code}: ${printable(rendered.error.detail)}; nothing sent`, 4);
+    const envelope = rendered.envelope;
+
+    // SPEC §6.1 step 1 + §10 de-duplication, in ONE store transaction: an open outbox record with the
+    // same peer, sender task and body sha256 wins; otherwise the record is written (state `prepared`,
+    // attempt `pending`) BEFORE anything is sent.
+    const owner = `${process.pid}@${os.hostname()}`;
+    const ref = { role: "sender" as const, requestId };
+    const storeFailure = (e: unknown): string => printable(String((e as Error)?.message ?? e));
+    const openStore = (): InstanceType<typeof ControllerLinkStore> => {
+      try {
+        return new ControllerLinkStore({ root: resolveStoreRoot(env, packageRoot), clock: { nowMs: () => Date.now() } });
+      } catch (e) {
+        return die(`dispatch.sh: PEER_NOT_RECORDED: ${storeFailure(e)}; nothing sent`, 9);
+      }
+    };
+    const store = openStore();
+    let duplicateOf: string | null;
+    try {
+      duplicateOf = await store.mutate<string | null>(ref, async (current, ctx) => {
+        if (current !== null) throw new Error("request id already recorded");
+        const open = await store.list({ role: "sender", peer: peer.label, open: true });
+        const dup = open.find((r) => r.sender_task === senderTask && r.messages["REQUEST-1"]?.body_sha256 === envelope.body_sha256);
+        if (dup !== undefined) return { write: null, value: dup.request_id };
+        const record: LinkRecordT = {
+          v: 1, role: "sender", request_id: requestId, peer: peer.label, peer_target: target, self_label: config.self.label,
+          sender_task: senderTask, receiver_task: null, state: "prepared", state_at: ctx.nowIso,
+          next_action: { code: "SEND", due_at: null, text: "dispatch is sending REQUEST-1" },
+          messages: { "REQUEST-1": { sha256: envelope.sha256, body_sha256: envelope.body_sha256, raw: rawRef(envelope.sha256),
+            sends: [{ n: 1, at: ctx.nowIso, owner, result: "pending" }] } },
+          acks_in: {}, probes_out: { "REQUEST-1": { last_seq: 0, sends: [] } }, acks_out: { last_seq: 0, sends: [] },
+          notices: { n: 0, last_at: null },
+          history: [{ at: ctx.nowIso, event: "created", detail: "dispatch" }], history_dropped: 0,
+        };
+        return { write: record, raws: [{ sha256: envelope.sha256, bytes: Buffer.from(envelope.text, "utf8") }], value: null };
+      });
+    } catch (e) {
+      die(`dispatch.sh: PEER_NOT_RECORDED: ${storeFailure(e)}; nothing sent`, 9);
+    }
+    if (duplicateOf !== null) {
+      die(`dispatch.sh: PEER_REQUEST_DEDUPLICATED: open request ${duplicateOf} to ${target} has the same sender task and body; nothing sent`, 8);
+    }
+
+    // SPEC §6.1 steps 2–3 (U3), then step 4: the classified result goes into the same attempt.
+    const sent = await sendEnvelope(target, envelope.text, { runner: defaultProcessRunner, bin: TELEPTY });
+    const cls: SendClassificationT = sent.attempted ? sent.classification
+      : { result: "unknown", submit: null, inject_id: null, detail: `not_started_${sent.code}` };
+    const outcome = {
+      handed_over: { state: "sent", code: "WAIT_ACK", min: cls.submit === "queued" ? 30 : 5, text: "wait for the peer's ACK; probe when due" },
+      unknown: { state: "send_unknown", code: "PROBE", min: 5, text: "delivery unknown; probe the peer, never re-send blindly" },
+      refused_definite: { state: "send_refused", code: "RESEND", min: 1, text: "definite refusal; re-send the same bytes on the back-off" },
+    }[cls.result];
+    let recorded = true;
+    try {
+      await store.mutate<null>(ref, (current, ctx) => {
+        if (current === null) throw new Error("record vanished");
+        const next = JSON.parse(JSON.stringify(current)) as LinkRecordT;
+        const sends = next.messages["REQUEST-1"]?.sends ?? [];
+        const attempt = sends[sends.length - 1];
+        if (attempt === undefined || attempt.result !== "pending" || attempt.owner !== owner) throw new Error("attempt changed");
+        attempt.result = cls.result;
+        attempt.submit = cls.submit;
+        attempt.inject_id = cls.inject_id;
+        attempt.detail = cls.detail;
+        // CL-02: only `prepared` (step 1 of THIS send) is moved by the result. An ACK or REPLY ingested
+        // while telepty ran has already settled the record further; it is never moved backwards.
+        if (next.state === "prepared") {
+          next.state = outcome.state as LinkRecordT["state"];
+          next.state_at = ctx.nowIso;
+          next.next_action = { code: outcome.code, due_at: new Date(Date.parse(attempt.at) + outcome.min * 60_000).toISOString(), text: outcome.text };
+        }
+        next.history.push({ at: ctx.nowIso, event: "send", detail: `REQUEST-1 n=${attempt.n} ${cls.result}` });
+        return { write: next, value: null };
+      });
+    } catch {
+      recorded = false;
+    }
+    const why = cls.detail === null ? "" : ` (${printable(cls.detail)})`;
+    const reconcile = "the pump reconciles this automatically; do not re-run dispatch";
+    if (!recorded) {
+      die(`dispatch.sh: PEER_DELIVERY_UNKNOWN: request ${requestId} to ${target} — result not recorded (telepty ${cls.result}${why}); ${reconcile}`, 7);
+    }
+    if (cls.result === "handed_over") {
+      taskLedgerUpdate(o, target);
+      process.stdout.write(`OK peer request ${requestId} to ${target} consumption=${cls.submit ?? "unknown"}\n`);
+      process.exit(0);
+    }
+    if (cls.result === "refused_definite") {
+      die(`dispatch.sh: PEER_NOT_DELIVERED: request ${requestId} to ${target} definitely refused${why}; ${reconcile}`, 11);
+    }
+    die(`dispatch.sh: PEER_DELIVERY_UNKNOWN: request ${requestId} to ${target}${why}; ${reconcile}`, 7);
+  }
 
   let sid: string;
   if (o.spawn) {
