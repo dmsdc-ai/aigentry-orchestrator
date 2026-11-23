@@ -1,8 +1,13 @@
 // #1303 D2 — the sealed worker environment's TERM. The worker always runs in a real PTY, so an
 // inherited TERM of `dumb` (a controller tool shell, e.g. Codex's) or an empty/unset one is sealed as
-// xterm-256color; any other inherited value is kept. The manifest's env IS the runner's launch env
-// (worker-sandbox-runner.ts replaces process.env with m.env), so asserting the sealed manifest asserts
-// what the worker starts with.
+// xterm-256color; any other inherited value is kept.
+//
+// WHAT THIS ATTESTS, exactly: the TERM in the SEALED launch environment (the hash-verified manifest's
+// env, read through readSealedManifest as the runner reads it). It does NOT attest the TERM the CLI
+// finally sees: worker-sandbox-runner.ts:15 starts the worker with { ...m.env, ...wrapped.env,
+// ...secretEnv }, so a sandbox-runtime whose wrapped.env set TERM would override the sealed value. No
+// such override is known for the pinned runtime; the effective TERM is verified on Linux in the release
+// owner's controlled launch (task 1303 Linux verification), not here.
 //
 // Same seam as worker-sandbox-providers.test.ts: the REAL compiled loadWorkerScope + prepareWorkerSandbox
 // through tests/dispatch/agent-metadata/support/prepare-sandbox.mjs, with a FAKE host HOME, FAKE
@@ -63,12 +68,12 @@ function sealedTerm(W: World, sid: string, term: string | undefined): { status: 
   const out = r.stdout + r.stderr;
   if (r.status !== 0) return { status: r.status, out, term: undefined };
   const res = JSON.parse(r.stdout.trim()) as { manifest: string; hash: string };
-  // The hash-verified read the runner itself uses: what is sealed is what the worker gets.
+  // The hash-verified read the runner itself uses: this is the sealed launch env, before wrapped.env.
   const sealed = readSealedManifest(res.manifest, res.hash).m;
   return { status: r.status, out, term: sealed.env.TERM };
 }
 
-test("worker TERM: inherited dumb and unset/empty become xterm-256color; a normal value is kept", () => {
+test("sealed launch env TERM: inherited dumb and unset/empty are sealed as xterm-256color; a normal value is kept", () => {
   const W = world();
   const cases: Array<[string, string | undefined, string]> = [
     ["dumb", "dumb", "xterm-256color"],

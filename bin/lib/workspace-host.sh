@@ -997,11 +997,17 @@ _wh_fallback_spawn() {
     # signature offers no argv channel for it; `%q` is that guarantee here (a real
     # shell parses it, so there is no second parser to fight — unlike iTerm).
     platform::spawn_tmux_window "$_sid" "$_cwd" "telepty allow --id $_q_sid --auto-restart $_cli_cmd"
+    # #1303: a spawn that did not happen hands back NO handle — _wh_iterm_open's contract (2).
+    local _rc=$?
+    [ "$_rc" -eq 0 ] || { echo "ERR tmux spawn failed (rc=$_rc) — no session was started" >&2; return 2; }
     echo "$_sid"
   else
     # `telepty spawn -- …` execs its argv directly, so this takes the true argv
     # shape and needs no quoting pass at all.
     telepty spawn --id "$_sid" -- bash -c "cd \"\$1\" && exec $_cli_cmd" _ "$_cwd" >/dev/null
+    # #1303: same contract — a failed daemon spawn returns 2 with no handle and no attach hint.
+    local _rc=$?
+    [ "$_rc" -eq 0 ] || { echo "ERR telepty spawn failed (rc=$_rc) — no session was started" >&2; return 2; }
     echo "⚠️  Session spawned as daemon (no visible terminal). Attach: telepty attach $_sid" >&2
     echo "$_sid"
   fi
@@ -1031,6 +1037,9 @@ _wh_tmux_open() {
   # sid is %q-quoted because spawn_tmux_window's 3rd argument is shell text.
   local q_sid; printf -v q_sid '%q' "$sid"
   platform::spawn_tmux_window "$sid" "$cwd" "telepty allow --id $q_sid --auto-restart $cli_cmd"
+  # #1303: a spawn that did not happen hands back NO handle — _wh_iterm_open's contract (2).
+  local rc=$?
+  [ "$rc" -eq 0 ] || { echo "ERR tmux spawn failed (rc=$rc) — no session was started" >&2; return 2; }
   echo "$sid"
 }
 
@@ -1042,6 +1051,9 @@ _wh_wezterm_open() {
     # #926: `wezterm cli spawn -- …` execs its argv directly (no shell re-parse),
     # so cwd and sid go on argv as-is — no %q pass needed.
     wezterm cli spawn --cwd "$cwd" -- bash -c "cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd" _ "$cwd" "$sid" >/dev/null
+    # #1303: a spawn that did not happen hands back NO handle — _wh_iterm_open's contract (2).
+    local rc=$?
+    [ "$rc" -eq 0 ] || { echo "ERR wezterm spawn failed (rc=$rc) — no session was started" >&2; return 2; }
     echo "$sid"
   else
     _wh_fallback_spawn "$sid" "$cwd" "$cli_cmd"
@@ -1086,6 +1098,9 @@ _wh_headless_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
   # #926: argv shape — `telepty spawn -- …` execs its argv directly.
   telepty spawn --id "$sid" -- bash -c "cd \"\$1\" && exec $cli_cmd" _ "$cwd" >/dev/null
+  # #1303: a spawn that did not happen hands back NO handle — _wh_iterm_open's contract (2).
+  local rc=$?
+  [ "$rc" -eq 0 ] || { echo "ERR telepty spawn failed (rc=$rc) — no session was started" >&2; return 2; }
   echo "⚠️  Session spawned as daemon (headless: no spawn-tab CLI)." >&2
   echo "    Attach via: telepty attach $sid" >&2
   echo "$sid"

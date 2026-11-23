@@ -8,6 +8,12 @@
 // `list --json`), open/xdg-open (the Warp deeplink opener; it FAILS, so no real Warp is ever asked to
 // open anything) and a fake cmux through the CMUX seam. Nothing reaches a live daemon or terminal.
 //
+// R1303-01: a spawn that did not happen must fail at once — non-zero, NO sid on stdout. The tmux/wezterm
+// recorders below exit with T1303_TMUX_RC / T1303_WEZTERM_RC, `telepty spawn` with T1303_SPAWN_RC (all
+// default 0, so every earlier leg is unchanged). The tmux arms consume platform:: primitives, which only a
+// caller that sources bin/lib/platform.sh provides, so they are driven through wh_open with platform.sh
+// sourced (T55's idiom) rather than through open-session.
+//
 // win32: open-session is a bash entrypoint and the confined spawn path is POSIX-only, so these legs are
 // registered off win32 only (T143's split), never skipped by condition inside a test.
 import { test } from "node:test";
@@ -19,6 +25,8 @@ import { dirname, join, resolve } from "node:path";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..", "..", "..");
 const OPEN_SESSION = join(REPO_ROOT, "bin", "open-session.sh");
+const WH_LIB = join(REPO_ROOT, "bin", "lib", "workspace-host.sh");
+const PLATFORM_LIB = join(REPO_ROOT, "bin", "lib", "platform.sh");
 const WIN = process.platform === "win32";
 const REF = "workspace:1303";
 const DIAG = /^open-session\.sh: terminal /;
@@ -35,7 +43,10 @@ function world(): World {
   mkdirSync(home, { recursive: true });
   writeFileSync(log, "");
   const sh = (p: string, body: string): void => writeFileSync(p, `#!/bin/sh\n${body}`, { mode: 0o755 });
-  sh(join(bin, "telepty"), `printf 'telepty %s\\n' "$*" >> "$T1303_LOG"\n[ "$1" = list ] && printf '[]'\nexit 0\n`);
+  sh(join(bin, "telepty"), `printf 'telepty %s\\n' "$*" >> "$T1303_LOG"\n[ "$1" = list ] && printf '[]'\n[ "$1" = spawn ] && exit "\${T1303_SPAWN_RC:-0}"\nexit 0\n`);
+  // tmux / wezterm recorders: argv recorded, nothing started; status from the env (default 0).
+  sh(join(bin, "tmux"), `printf 'tmux %s\\n' "$*" >> "$T1303_LOG"\nexit "\${T1303_TMUX_RC:-0}"\n`);
+  sh(join(bin, "wezterm"), `printf 'wezterm %s\\n' "$*" >> "$T1303_LOG"\nexit "\${T1303_WEZTERM_RC:-0}"\n`);
   // The Warp deeplink handoff: recorded, then refused, so _wh_warp_open stops at its exit 2.
   sh(join(bin, "open"), `printf 'opener %s\\n' "$*" >> "$T1303_LOG"\nexit 1\n`);
   sh(join(bin, "xdg-open"), `printf 'opener %s\\n' "$*" >> "$T1303_LOG"\nexit 1\n`);
@@ -126,5 +137,112 @@ if (!WIN) {
     assert.match(r.err, /\[workspace-host\] open: adapter=headless sid=t1303-bogus/);
     assert.ok(!r.err.includes(bogus), `the raw forced value reached stderr:\n${r.err}`);
     oneDiag(r, "open-session.sh: terminal detected=headless forced=unregistered-ignored adapter=headless", W);
+  });
+
+  // ── R1303-01 / N-01: a failed spawn is non-zero with no sid; the success path still prints it ──
+  test("forced wezterm whose `wezterm cli spawn` fails: open-session exits 2 and prints NO sid", () => {
+    const W = world(), r = openSession(W, "wezfail", { AIGENTRY_WORKSPACE_HOST: "wezterm", T1303_WEZTERM_RC: "1" });
+    assert.match(r.calls, /^wezterm cli spawn --cwd /m, r.calls);
+    assert.equal(r.status, 2, r.err);
+    assert.equal(r.out, "", "a sid was printed for a spawn that did not happen");
+    assert.match(r.err, /ERR wezterm spawn failed \(rc=1\)/);
+    oneDiag(r, "open-session.sh: terminal detected=headless forced=wezterm adapter=wezterm", W);
+  });
+
+  test("forced wezterm whose spawn succeeds: exit 0 and the sid is the sole stdout line", () => {
+    const W = world(), r = openSession(W, "wezok", { AIGENTRY_WORKSPACE_HOST: "wezterm" });
+    assert.match(r.calls, /^wezterm cli spawn --cwd /m, r.calls);
+    assert.equal(r.status, 0, r.err);
+    assert.equal(r.out, "t1303-wezok");
+  });
+
+  test("forced headless whose `telepty spawn` fails: exit 2, NO sid, no attach hint", () => {
+    const W = world(), r = openSession(W, "hlfail", { AIGENTRY_WORKSPACE_HOST: "headless", T1303_SPAWN_RC: "1" });
+    assert.match(r.calls, /^telepty spawn --id t1303-hlfail -- /m, r.calls);
+    assert.equal(r.status, 2, r.err);
+    assert.equal(r.out, "");
+    assert.match(r.err, /ERR telepty spawn failed \(rc=1\)/);
+    assert.doesNotMatch(r.err, /telepty attach/, "an attach hint was printed for a session that was never started");
+  });
+
+  test("forced aterm with no aterm CLI, daemon fallback whose `telepty spawn` fails: exit 2, NO sid", () => {
+    const W = world(), r = openSession(W, "atfail", { AIGENTRY_WORKSPACE_HOST: "aterm", T1303_SPAWN_RC: "1" });
+    assert.match(r.err, /\[workspace-host\] open: adapter=aterm sid=t1303-atfail/);
+    assert.match(r.calls, /^telepty spawn --id t1303-atfail -- /m, r.calls);
+    assert.equal(r.status, 2, r.err);
+    assert.equal(r.out, "");
+    assert.doesNotMatch(r.err, /Session spawned as daemon/);
+  });
+
+  /** wh_open through the real lib with platform.sh sourced (T55's idiom) — the tmux arms' caller contract. */
+  function whOpen(W: World, sid: string, extra: Record<string, string>): { status: number | null; out: string; err: string; calls: string } {
+    const cwd = join(W.root, `cwd-${sid}`);
+    mkdirSync(cwd, { recursive: true });
+    const env: Record<string, string> = { PATH: `${W.bin}:/usr/bin:/bin`, HOME: W.home, LANG: "en_US.UTF-8", T1303_LOG: W.log, ...extra };
+    const r = spawnSync("bash", ["-c", '. "$1"; . "$2"; wh_open "$3" "$4" "codex"', "_", PLATFORM_LIB, WH_LIB, sid, cwd],
+      { encoding: "utf8", env, timeout: 30000 });
+    return { status: r.status, out: (r.stdout ?? "").trim(), err: r.stderr ?? "", calls: readFileSync(W.log, "utf8") };
+  }
+
+  test("forced tmux: a failing `tmux new-window` gives rc 2 and NO sid; a working one prints the sid", () => {
+    const W = world();
+    const bad = whOpen(W, "t1303-tmuxfail", { AIGENTRY_WORKSPACE_HOST: "tmux", T1303_TMUX_RC: "1" });
+    assert.match(bad.calls, /^tmux new-window -c .* -n t1303-tmuxfail /m, bad.calls);
+    assert.equal(bad.status, 2, bad.err);
+    assert.equal(bad.out, "", "a sid was printed for a tmux window that was never opened");
+    assert.match(bad.err, /ERR tmux spawn failed \(rc=1\)/);
+    const ok = whOpen(W, "t1303-tmuxok", { AIGENTRY_WORKSPACE_HOST: "tmux" });
+    assert.equal(ok.status, 0, ok.err);
+    assert.equal(ok.out, "t1303-tmuxok");
+  });
+
+  test("fallback tmux branch (aterm absent, inside tmux): a failing window gives rc 2 and NO sid; a working one prints it", () => {
+    const W = world();
+    const bad = whOpen(W, "t1303-fbfail", { AIGENTRY_WORKSPACE_HOST: "aterm", TMUX: "/tmp/t1303-fake-tmux", T1303_TMUX_RC: "1" });
+    assert.match(bad.calls, /^tmux new-window -c .* -n t1303-fbfail /m, bad.calls);
+    assert.doesNotMatch(bad.calls, /^telepty spawn/m, "the tmux branch was not the one exercised");
+    assert.equal(bad.status, 2, bad.err);
+    assert.equal(bad.out, "");
+    const ok = whOpen(W, "t1303-fbok", { AIGENTRY_WORKSPACE_HOST: "aterm", TMUX: "/tmp/t1303-fake-tmux" });
+    assert.equal(ok.status, 0, ok.err);
+    assert.equal(ok.out, "t1303-fbok");
+  });
+
+  // ── R1303-02: a registry probe that could not answer is not called an unregistered value ──
+  test("a failed registry probe is labelled registry-probe-failed, not unregistered, and the value is not echoed", () => {
+    const W = world();
+    // A `bash` first on PATH that fails ONLY the registry probe (its script names _wh_is_registered) and
+    // otherwise execs the bash this PATH would have found without it, so detection and `open` still work.
+    const realBash = [dirname(process.execPath), "/usr/bin", "/bin"].map((d) => join(d, "bash")).find((p) => existsSync(p));
+    assert.ok(realBash, "no bash on the test PATH");
+    writeFileSync(join(W.bin, "bash"),
+      `#!/bin/sh\nfor a in "$@"; do case "$a" in *_wh_is_registered*) exit 1;; esac; done\nexec '${realBash}' "$@"\n`, { mode: 0o755 });
+    const r = openSession(W, "probefail", { AIGENTRY_WORKSPACE_HOST: "wezterm" });
+    assert.equal(r.status, 0, r.err);
+    assert.equal(r.out, "t1303-probefail");
+    assert.doesNotMatch(r.calls, /^wezterm /m, "an unverified force was applied");
+    oneDiag(r, "open-session.sh: terminal detected=headless forced=registry-probe-failed-ignored adapter=headless", W);
+  });
+
+  // ── R1303-03: both forced directions across the legacy cmux switch ──
+  test("a non-cmux force inside cmux with AIGENTRY_WH_LEGACY_SPAWN=1 goes to wh_open, never the inline cmux arm", () => {
+    const W = world();
+    const r = openSession(W, "lgfh", { CMUX_WORKSPACE_ID: "t1303", AIGENTRY_WH_LEGACY_SPAWN: "1", AIGENTRY_WORKSPACE_HOST: "headless" });
+    assert.equal(r.status, 0, r.err);
+    assert.equal(r.out, "t1303-lgfh");
+    assert.match(r.err, /\[workspace-host\] open: adapter=headless sid=t1303-lgfh/);
+    assert.match(r.calls, /^telepty spawn --id t1303-lgfh -- /m, r.calls);
+    assert.doesNotMatch(r.calls, /^cmux (new|rename)-workspace/m, "the inline legacy cmux arm ran for a non-cmux force");
+    oneDiag(r, "open-session.sh: terminal detected=cmux forced=headless adapter=headless", W);
+  });
+
+  test("a cmux force with no cmux markers and AIGENTRY_WH_LEGACY_SPAWN=1 takes the inline cmux arm", () => {
+    const W = world();
+    const r = openSession(W, "lgfc", { AIGENTRY_WH_LEGACY_SPAWN: "1", AIGENTRY_WORKSPACE_HOST: "cmux" });
+    assert.equal(r.status, 0, r.err);
+    assert.equal(r.out, REF);
+    assert.doesNotMatch(r.err, /\[workspace-host\] open:/, "the cmux force bypassed the legacy switch");
+    assert.match(r.calls, /^cmux rename-workspace --workspace workspace:1303 t1303-lgfc$/m, r.calls);
+    oneDiag(r, "open-session.sh: terminal detected=headless forced=cmux adapter=cmux", W);
   });
 }

@@ -170,9 +170,17 @@ function platform(fn: string, args: string[] = [], opts: RunOpts = {}): { status
   return run("bash", ["-c", `. "$1"; ${fn} "\${@:3}"`, "_", PLATFORM_SH, "_", ...args], { err: "inherit", ...opts });
 }
 
-/** #1303: `_wh_is_registered <name>` — the same registry check _wh_adapter applies to an env-force. */
-function registeredAdapter(name: string): boolean {
-  return run("bash", ["-c", '. "$1"; _wh_is_registered "$2"', "_", WH_LIB, name], { out: "ignore", err: "ignore" }).status === 0;
+/**
+ * #1303: `_wh_is_registered <name>` — the same registry check _wh_adapter applies to an env-force.
+ * Only an explicit answer on stdout counts: a lib that could not be sourced, a missing predicate,
+ * a shell that could not start or was killed is "probe-failed", never a confirmed miss.
+ */
+function registryAnswer(name: string): "registered" | "unregistered" | "probe-failed" {
+  const r = run("bash", ["-c",
+    '. "$1" || exit 70; declare -F _wh_is_registered >/dev/null || exit 70; if _wh_is_registered "$2"; then echo registered; else echo unregistered; fi',
+    "_", WH_LIB, name], { err: "ignore" });
+  const answer = chomp(r.stdout);
+  return r.status === 0 && (answer === "registered" || answer === "unregistered") ? answer : "probe-failed";
 }
 
 // ── argv (the shell's :60-96) ───────────────────────────────────────────────
@@ -408,12 +416,17 @@ function openInTerminal(): string {
   // #1303: an explicit AIGENTRY_WORKSPACE_HOST naming a REGISTERED adapter wins (the
   // _wh_adapter contract); detect_terminal decides only when nothing valid was forced.
   // An unregistered value is ignored exactly as _wh_adapter ignores it, and is never
-  // echoed: the diagnostic below carries registry names and fixed words only.
+  // echoed: the diagnostic below carries registry names and fixed words only. A registry
+  // probe that gave no answer is not a miss: it is named as such, and the force is not applied.
   const forced = env.AIGENTRY_WORKSPACE_HOST || "";
-  const forcedValid = forced !== "" && registeredAdapter(forced);
+  const registry = forced === "" ? "none" : registryAnswer(forced);
+  const forcedValid = registry === "registered";
   const adapter = forcedValid ? forced : term;
+  const forcedLabel = registry === "none" ? "none"
+    : forcedValid ? forced
+    : registry === "unregistered" ? "unregistered-ignored" : "registry-probe-failed-ignored";
   process.stderr.write(
-    `open-session.sh: terminal detected=${term || "none"} forced=${forced === "" ? "none" : forcedValid ? forced : "unregistered-ignored"} adapter=${adapter || "auto"}\n`,
+    `open-session.sh: terminal detected=${term || "none"} forced=${forcedLabel} adapter=${adapter || "auto"}\n`,
   );
   const cliCmd = `${cli} ${extraFlags}`;
 
