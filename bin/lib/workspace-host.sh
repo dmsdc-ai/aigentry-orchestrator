@@ -109,6 +109,64 @@ _wh_fail_category() {
   esac
 }
 
+# _wh_foreign_env_scrub <host> — task 1304 round 3 (incident 2026-11-23): the `env -u …`
+# prefix every NON-cmux spawn puts in front of its worker command, so a worker hosted
+# somewhere else never carries the controller's terminal identity. Measured: a worker
+# in a tmux session inherited the tmux SERVER's environment, captured when the server
+# was first started from the cmux controller's shell; telepty then stored backend=cmux
+# and the controller's cmuxWorkspaceId for it, and cleanup closed the controller.
+# The prefix runs INSIDE the pane/worker command, so it also beats a stale tmux server
+# environment, not only the caller's.
+#   Always removed: CMUX_WORKSPACE_ID, CMUX_SURFACE_ID, CMUX_TERMINAL_LIFECYCLE_ID (the
+#     cmux markers this code and telepty read) and TELEPTY_SESSION_ID (the controller's
+#     own session id).
+#   ATERM_IPC_SOCKET unless aterm hosts the worker.
+#   TMUX / TMUX_PANE unless tmux hosts it: a worker legitimately inside tmux (warp,
+#     tmux, the fallback's tmux branch) KEEPS them, because tmux sets them for that
+#     pane itself and they name the worker's own pane.
+#   TERM_PROGRAM / TERM_PROGRAM_VERSION unless the host sets its own for the pane
+#     (tmux, WezTerm, iTerm); elsewhere they would name the controller's terminal.
+# Every token is a fixed literal name, so the result is safe both as shell text and
+# word-split as argv (#926's quoting rules are untouched). cmux spawns do not use it.
+_wh_foreign_env_scrub() {
+  local host="${1:-none}" out="env -u CMUX_WORKSPACE_ID -u CMUX_SURFACE_ID -u CMUX_TERMINAL_LIFECYCLE_ID -u TELEPTY_SESSION_ID"
+  [ "$host" = "aterm" ] || out="$out -u ATERM_IPC_SOCKET"
+  [ "$host" = "tmux" ] || out="$out -u TMUX -u TMUX_PANE"
+  case "$host" in tmux|wezterm|iterm) ;; *) out="$out -u TERM_PROGRAM -u TERM_PROGRAM_VERSION" ;; esac
+  printf '%s' "$out"
+}
+
+# _wh_refuse_own_surface <adapter> <host_id> — task 1304 round 3: 0, plus ONE labelled
+# line, when <host_id> is the surface THIS process runs in, so the caller must not close
+# it (the close verbs then answer 4 and close nothing). "Own" is knowable for:
+#   cmux — the caller's CMUX_WORKSPACE_ID (a UUID; compared case-insensitively). A
+#          `workspace:N` ref cannot be compared with it, so a ref is never refused here.
+#   tmux — the window of the caller's TMUX_PANE.
+#   warp — the warp tmux session the caller's TMUX_PANE is in.
+# 1 means "not this process's surface, or not knowable": the close proceeds as before.
+_wh_refuse_own_surface() {
+  local adapter="$1" handle="${2:-}" mine="" name
+  [ -n "$handle" ] || return 1
+  case "$adapter" in
+    cmux)
+      mine="${CMUX_WORKSPACE_ID:-}"
+      [ -n "$mine" ] || return 1
+      [ "$(printf '%s' "$handle" | LC_ALL=C tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$mine" | LC_ALL=C tr '[:upper:]' '[:lower:]')" ] || return 1 ;;
+    tmux|warp)
+      [ -n "${TMUX_PANE:-}" ] && command -v tmux >/dev/null 2>&1 || return 1
+      if [ "$adapter" = "tmux" ]; then
+        mine=$(tmux display-message -p -t "$TMUX_PANE" '#{window_id}' 2>/dev/null) || return 1
+      else
+        name=$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null) || return 1
+        case "$name" in "$_WH_WARP_TMUX_PREFIX"?*) mine="telepty::$(_wh_warp_tmux_sid "$name")" ;; *) return 1 ;; esac
+      fi
+      [ -n "$mine" ] && [ "$handle" = "$mine" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  _wh_log "close REFUSED: $handle is the surface this process runs in (adapter=$adapter) — nothing was closed (wh_close_refused=own-surface wh_close_category=close-refused)"
+  return 0
+}
+
 # -----------------------------------------------------------------------------
 # cmux adapter
 # -----------------------------------------------------------------------------
@@ -123,12 +181,32 @@ _wh_cmux_lookup() {
     _wh_cmux_list_titles | awk -F'\t' -v s="$sid" '$2==s {print $1; exit}'
     return 0
   fi
+  # task 1304 r3: telepty attributes a session to cmux from the markers in its
+  # ENVIRONMENT, and a worker hosted in tmux could inherit the controller's (incident
+  # 2026-11-23: backend=cmux, terminal=tmux, cmuxWorkspaceId = the controller's). When
+  # the session's own evidence says another host — its layer record/tombstone names a
+  # non-cmux adapter, or telepty itself reports terminal/termProgram tmux — that id is
+  # NOT this session's workspace and is not returned. Only a workspace TITLED with this
+  # sid (the #523 fallback, the title cmux opens are renamed to) may still be returned.
+  local elsewhere=""
+  if _wh_safe_sid "$sid" && { _wh_record_read "$(_wh_state_dir)/$sid.rec" \
+       || _wh_record_read "$(_wh_state_dir)/$sid.closed"; } && [ "$_WH_REC_ADAPTER" != "cmux" ]; then
+    elsewhere="record adapter=$_WH_REC_ADAPTER"
+  elif [ "$(echo "$info" | jq -r 'if (.terminal == "tmux" or .termProgram == "tmux") then "tmux" else empty end' 2>/dev/null)" = "tmux" ]; then
+    elsewhere="telepty terminal=tmux"
+  fi
+  if [ -n "$elsewhere" ]; then
+    _wh_log "cmux lookup: $sid is hosted outside cmux ($elsewhere) — its telepty cmuxWorkspaceId is not used; only a workspace titled $sid may be returned"
+    _wh_cmux_list_titles | awk -F'\t' -v s="$sid" '$2==s {print $1; exit}'
+    return 0
+  fi
   echo "$info" | jq -r '.cmuxWorkspaceId // empty' 2>/dev/null || true
 }
 
 _wh_cmux_close() {
   local host_id="$1" out fcat
   [ -z "$host_id" ] && return 0
+  _wh_refuse_own_surface cmux "$host_id" && return 4 # task 1304 r3: never the caller's own workspace
   if ! command -v cmux >/dev/null 2>&1; then
     return 0 # cmux not installed — treat as already-gone (no-op)
   fi
@@ -627,9 +705,14 @@ _wh_cmux_open() {
 #   - alive     == tmux has-session; a probe tmux cannot answer stays INDETERMINATE→alive
 #                  (INV-17, as cmux does). Only tmux's own "no such session / no server"
 #                  answer says gone.
-#   - close     == tmux kill-session, then the tab config, the pre-1304 sentinel and the
-#                  record are removed. The tab's own command is `exec tmux …`, so the tab's
-#                  process ends with the session.
+#   - close     == tmux kill-session, then the tab config and the pre-1304 sentinel are
+#                  removed and the record becomes a tombstone (task 1304 r3). Measured on
+#                  the Mac: Warp closes the tab when its `exec tmux` client exits, but the
+#                  worker's `telepty allow` process can outlive the session and telepty
+#                  keeps it CONNECTED. Ending that process and the registry entry is
+#                  session-cleanup's job (parent kill with its #606 self/ancestor guard,
+#                  then DELETE), not close's: close releases the SURFACE only, for every
+#                  adapter, exactly as cmux close does.
 #   - list/prune== tmux list-sessions filtered by the name prefix (no GUI action).
 #   - read      == tmux capture-pane -p (current viewport, no scrollback).
 #   - focus     == macOS Accessibility raise of the window whose title is EXACTLY the
@@ -796,6 +879,7 @@ _wh_warp_close() {
     return 0
   fi
   name=$(_wh_warp_tmux_name "$sid")
+  _wh_refuse_own_surface warp "telepty::$sid" && return 4 # task 1304 r3: never the caller's own session
   if ! command -v tmux >/dev/null 2>&1; then
     _wh_log "warp close: tmux is not on this caller's PATH, so session $name cannot be released — release UNCONFIRMED (wh_close_status=unconfirmed)"
     return 1
@@ -807,7 +891,7 @@ _wh_warp_close() {
   fi
   rm -f "$AIGENTRY_WARP_SURFACE_DIR/$sid.live" 2>/dev/null || true # pre-1304 sentinel, if any
   _wh_warp_rm_tab_config "$sid"
-  _wh_record_drop_sid "$sid"
+  _wh_record_tombstone_sid "$sid"
   return 0
 }
 
@@ -997,7 +1081,7 @@ _wh_warp_open() {
   # command is ONE shell line for the tab's login shell: every value in it is a POSIX
   # single-quoted word (an apostrophe or `$( )` in a cwd stays data), and tmux is called
   # by its absolute path so the tab's PATH cannot pick another binary.
-  wrapper="telepty allow --id $(_wh_sq "$sid")$restart_arg $cli_cmd"
+  wrapper="$(_wh_foreign_env_scrub tmux) telepty allow --id $(_wh_sq "$sid")$restart_arg $cli_cmd"
   pane="exec $(_wh_sq "$tmux_bin") new-session -A -s $(_wh_sq "$name") -c $(_wh_sq "$cwd") $(_wh_sq "$wrapper")"
 
   if ! _wh_warp_write_tab_config "$toml" "$marker" "$cwd" "$pane"; then
@@ -1056,7 +1140,7 @@ _wh_fallback_spawn() {
     # shell parses it, so there is no second parser to fight — unlike iTerm).
     # task 1304: spawn_tmux_window now prints the new window's id; this branch keeps
     # handing back the sid, so that id is discarded here rather than doubling stdout.
-    platform::spawn_tmux_window "$_sid" "$_cwd" "telepty allow --id $_q_sid --auto-restart $_cli_cmd" >/dev/null
+    platform::spawn_tmux_window "$_sid" "$_cwd" "$(_wh_foreign_env_scrub tmux) telepty allow --id $_q_sid --auto-restart $_cli_cmd" >/dev/null
     # #1303: a spawn that did not happen hands back NO handle — _wh_iterm_open's contract (2).
     local _rc=$?
     [ "$_rc" -eq 0 ] || { echo "ERR tmux spawn failed (rc=$_rc) — the spawn command did not confirm success, so no handle is returned" >&2; return 2; }
@@ -1064,7 +1148,9 @@ _wh_fallback_spawn() {
   else
     # `telepty spawn -- …` execs its argv directly, so this takes the true argv
     # shape and needs no quoting pass at all.
-    telepty spawn --id "$_sid" -- bash -c "cd \"\$1\" && exec $_cli_cmd" _ "$_cwd" >/dev/null
+    local _scrub; _scrub=$(_wh_foreign_env_scrub none)
+    # shellcheck disable=SC2086 # fixed literal tokens, split into argv on purpose
+    telepty spawn --id "$_sid" -- $_scrub bash -c "cd \"\$1\" && exec $_cli_cmd" _ "$_cwd" >/dev/null
     # #1303: same contract — a failed daemon spawn returns 2 with no handle and no attach hint.
     local _rc=$?
     [ "$_rc" -eq 0 ] || { echo "ERR telepty spawn failed (rc=$_rc) — the spawn command did not confirm success, so no handle is returned" >&2; return 2; }
@@ -1082,7 +1168,7 @@ _wh_aterm_open() {
   local q_cwd q_sid
   printf -v q_cwd '%q' "$cwd"; printf -v q_sid '%q' "$sid"
   if command -v aterm >/dev/null 2>&1 \
-    && aterm new-session --cwd "$cwd" --cmd "bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd' _ $q_cwd $q_sid" 2>/dev/null; then
+    && aterm new-session --cwd "$cwd" --cmd "$(_wh_foreign_env_scrub aterm) bash -c 'cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd' _ $q_cwd $q_sid" 2>/dev/null; then
     echo "$sid"
   else
     _wh_fallback_spawn "$sid" "$cwd" "$cli_cmd"
@@ -1098,7 +1184,7 @@ _wh_tmux_open() {
   # #926: see _wh_fallback_spawn's tmux branch — cwd never enters this string, the
   # sid is %q-quoted because spawn_tmux_window's 3rd argument is shell text.
   local q_sid; printf -v q_sid '%q' "$sid"
-  out=$(platform::spawn_tmux_window "$sid" "$cwd" "telepty allow --id $q_sid --auto-restart $cli_cmd")
+  out=$(platform::spawn_tmux_window "$sid" "$cwd" "$(_wh_foreign_env_scrub tmux) telepty allow --id $q_sid --auto-restart $cli_cmd")
   # #1303: a spawn that did not happen hands back NO handle — _wh_iterm_open's contract (2).
   local rc=$?
   [ "$rc" -eq 0 ] || { echo "ERR tmux spawn failed (rc=$rc) — the spawn command did not confirm success, so no handle is returned" >&2; return 2; }
@@ -1132,6 +1218,7 @@ _wh_tmux_alive() {
 _wh_tmux_close() {
   local id="$1" out
   case "$id" in @[0-9]*) ;; "") return 0 ;; *) _wh_log "tmux close: '$id' is not a window id — nothing to release"; return 0 ;; esac
+  _wh_refuse_own_surface tmux "$id" && return 4 # task 1304 r3: never the caller's own window
   command -v tmux >/dev/null 2>&1 || { _wh_log "tmux close: tmux is not on this caller's PATH, so $id cannot be released — release UNCONFIRMED (wh_close_status=unconfirmed)"; return 1; }
   if ! out=$(tmux kill-window -t "$id" 2>&1) && ! _wh_tmux_answer_gone "$out" \
      && [ "$(_wh_tmux_window_state "$id")" != "gone" ]; then
@@ -1167,7 +1254,9 @@ _wh_wezterm_open() {
   if command -v wezterm >/dev/null 2>&1; then
     # #926: `wezterm cli spawn -- …` execs its argv directly (no shell re-parse),
     # so cwd and sid go on argv as-is — no %q pass needed.
-    wezterm cli spawn --cwd "$cwd" -- bash -c "cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd" _ "$cwd" "$sid" >/dev/null
+    local scrub; scrub=$(_wh_foreign_env_scrub wezterm)
+    # shellcheck disable=SC2086 # fixed literal tokens, split into argv on purpose
+    wezterm cli spawn --cwd "$cwd" -- $scrub bash -c "cd \"\$1\" && exec telepty allow --id \"\$2\" --auto-restart $cli_cmd" _ "$cwd" "$sid" >/dev/null
     # #1303: a spawn that did not happen hands back NO handle — _wh_iterm_open's contract (2).
     local rc=$?
     [ "$rc" -eq 0 ] || { echo "ERR wezterm spawn failed (rc=$rc) — the spawn command did not confirm success, so no handle is returned" >&2; return 2; }
@@ -1193,7 +1282,7 @@ _wh_iterm_open() {
   # because it is a value inside a command LINE, while cli_cmd stays unquoted because
   # it IS the command line and must word-split.
   local q_sid; printf -v q_sid '%q' "$sid"
-  platform::spawn_iterm_tab "$cwd" "telepty allow --id $q_sid --auto-restart $cli_cmd" \
+  platform::spawn_iterm_tab "$cwd" "$(_wh_foreign_env_scrub iterm) telepty allow --id $q_sid --auto-restart $cli_cmd" \
     || { echo "ERR iTerm spawn failed" >&2; return 2; }
   echo "$sid"
 }
@@ -1214,7 +1303,9 @@ _wh_iterm_ready_attestation()   { printf 'none'; }
 _wh_headless_open() {
   local sid="$1" cwd="$2" cli_cmd="$3"
   # #926: argv shape — `telepty spawn -- …` execs its argv directly.
-  telepty spawn --id "$sid" -- bash -c "cd \"\$1\" && exec $cli_cmd" _ "$cwd" >/dev/null
+  local scrub; scrub=$(_wh_foreign_env_scrub none)
+  # shellcheck disable=SC2086 # fixed literal tokens, split into argv on purpose
+  telepty spawn --id "$sid" -- $scrub bash -c "cd \"\$1\" && exec $cli_cmd" _ "$cwd" >/dev/null
   # #1303: a spawn that did not happen hands back NO handle — _wh_iterm_open's contract (2).
   local rc=$?
   [ "$rc" -eq 0 ] || { echo "ERR telepty spawn failed (rc=$rc) — the spawn command did not confirm success, so no handle is returned" >&2; return 2; }
@@ -1431,6 +1522,7 @@ _wh_record_write() {
   fi
   tmp="$dir/.$sid.rec.$$"
   if printf 'v1\t%s\t%s\n' "$adapter" "$handle" > "$tmp" 2>/dev/null && mv -f "$tmp" "$dir/$sid.rec" 2>/dev/null; then
+    rm -f "$dir/$sid.closed" 2>/dev/null || true # a re-open supersedes an old tombstone
     return 0
   fi
   rm -f "$tmp" 2>/dev/null || true
@@ -1438,20 +1530,39 @@ _wh_record_write() {
   return 0
 }
 
-# _wh_record_drop_sid <sid> — remove that sid's record (idempotent).
+# task 1304 r3 — the TOMBSTONE. A close does not forget which adapter owned the session:
+# <sid>.rec is renamed to <sid>.closed (same line format), and the resolver still reads
+# it. Measured incident: close-for-sid removed the record, a later session-cleanup of the
+# same sid fell back to "cmux if installed", and cmux closed the CONTROLLER's workspace
+# that telepty had wrongly attributed to the worker. With the tombstone that later call
+# resolves the original adapter and its close is an idempotent no-op. A tombstone is
+# removed by a re-open of the sid (_wh_record_write) or when a close-for-sid finds no
+# mapping at all (the session is gone from every host, so there is nothing to misroute).
+
+# _wh_record_drop_sid <sid> — remove that sid's record AND tombstone (idempotent).
 _wh_record_drop_sid() {
   _wh_safe_sid "${1:-}" || return 0
-  rm -f "$(_wh_state_dir)/$1.rec" 2>/dev/null || true
+  rm -f "$(_wh_state_dir)/$1.rec" "$(_wh_state_dir)/$1.closed" 2>/dev/null || true
 }
 
-# _wh_record_drop_handle <adapter> <host_id> — remove every record naming exactly that pair.
-_wh_record_drop_handle() {
+# _wh_record_tombstone_sid <sid> — turn the live record into the tombstone (idempotent).
+_wh_record_tombstone_sid() {
+  local dir
+  _wh_safe_sid "${1:-}" || return 0
+  dir=$(_wh_state_dir)
+  [ -f "$dir/$1.rec" ] && [ ! -L "$dir/$1.rec" ] && mv -f "$dir/$1.rec" "$dir/$1.closed" 2>/dev/null
+  return 0
+}
+
+# _wh_record_tombstone_handle <adapter> <host_id> — tombstone every live record naming that pair.
+_wh_record_tombstone_handle() {
   local adapter="$1" handle="$2" f
   [ -n "$handle" ] || return 0
   for f in "$(_wh_state_dir)"/*.rec; do
     [ -e "$f" ] || continue
     _wh_record_read "$f" || continue
-    [ "$_WH_REC_ADAPTER" = "$adapter" ] && [ "$_WH_REC_HANDLE" = "$handle" ] && rm -f "$f" 2>/dev/null
+    [ "$_WH_REC_ADAPTER" = "$adapter" ] && [ "$_WH_REC_HANDLE" = "$handle" ] \
+      && mv -f "$f" "${f%.rec}.closed" 2>/dev/null
   done
   return 0
 }
@@ -1478,10 +1589,11 @@ _wh_resolve() {
     _WH_ADAPTER="$pref"; _WH_FROM=env; return 0
   fi
   if [ -n "$key" ]; then
-    if _wh_safe_sid "$key" && _wh_record_read "$(_wh_state_dir)/$key.rec"; then
+    if _wh_safe_sid "$key" && { _wh_record_read "$(_wh_state_dir)/$key.rec" \
+         || _wh_record_read "$(_wh_state_dir)/$key.closed"; }; then
       _WH_ADAPTER="$_WH_REC_ADAPTER"; _WH_FROM=record; _WH_RES_HANDLE="$_WH_REC_HANDLE"; return 0
     fi
-    for f in "$(_wh_state_dir)"/*.rec; do
+    for f in "$(_wh_state_dir)"/*.rec "$(_wh_state_dir)"/*.closed; do
       [ -e "$f" ] || continue
       _wh_record_read "$f" || continue
       [ "$_WH_REC_HANDLE" = "$key" ] || continue
@@ -1544,7 +1656,7 @@ wh_close() {
   local rc=0
   _wh_resolve_verb close "${1:-}"
   "_wh_${_WH_ADAPTER}_close" "$@" || rc=$?
-  [ "$rc" -eq 0 ] && _wh_record_drop_handle "$_WH_ADAPTER" "${1:-}"
+  [ "$rc" -eq 0 ] && _wh_record_tombstone_handle "$_WH_ADAPTER" "${1:-}"
   return "$rc"
 }
 
@@ -1620,15 +1732,20 @@ wh_agent_meta_clear() { _wh_agent_meta_dispatch clear "$@"; }
 # task 1304 D2: ONE resolution for both halves — the adapter that opened <sid> both looks
 # it up and closes it — and the record goes once the session is released or unmapped.
 wh_close_for_sid() {
-  local sid="$1" info="${2:-}" host_id rc=0
+  local sid="$1" info="${2:-}" host_id rc=0 lrc=0
   _wh_resolve_verb lookup "$sid"
-  host_id=$("_wh_${_WH_ADAPTER}_lookup" "$sid" "$info")
+  host_id=$("_wh_${_WH_ADAPTER}_lookup" "$sid" "$info") || lrc=$?
+  # task 1304 r3: a lookup that FAILED is not "no mapping" — nothing was closed, say so.
+  if [ "$lrc" -ne 0 ]; then
+    _wh_log "close-for-sid: lookup failed for $sid (adapter=$_WH_ADAPTER rc=$lrc) — nothing was closed, release UNCONFIRMED (wh_close_status=unconfirmed)"
+    return 1
+  fi
   if [ -z "$host_id" ]; then
     _wh_record_drop_sid "$sid"
     return 0
   fi
   declare -F "_wh_${_WH_ADAPTER}_close" >/dev/null 2>&1 || _wh_resolve_verb close "$host_id"
   "_wh_${_WH_ADAPTER}_close" "$host_id" || rc=$?
-  [ "$rc" -eq 0 ] && _wh_record_drop_sid "$sid"
+  [ "$rc" -eq 0 ] && _wh_record_tombstone_sid "$sid"
   return "$rc"
 }

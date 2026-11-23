@@ -466,7 +466,8 @@ EOF
   # must still reach the shell as one intact directory and actually start telepty.
   HCWD="$T_TMP/h plain"; mkdir -p "$HCWD"
   h_open "$HCWD"
-  grep -qF "TYPED cd '$HCWD' && telepty allow --id t133-h" "$T_TMP/h.log" \
+  # task 1304 r3: the typed line now starts the worker through the foreign-terminal scrub.
+  grep -qF "TYPED cd '$HCWD' && env -u CMUX_WORKSPACE_ID -u CMUX_SURFACE_ID -u CMUX_TERMINAL_LIFECYCLE_ID -u TELEPTY_SESSION_ID -u ATERM_IPC_SOCKET -u TMUX -u TMUX_PANE telepty allow --id t133-h" "$T_TMP/h.log" \
     || fail "H4: a legitimate cwd with a space did not survive as one quoted argument. log:
 $(cat "$T_TMP/h.log")"
   grep -qF "pwd=$HCWD" "$T_TMP/h.log" "$T133_TELEPTY_LOG" 2>/dev/null \

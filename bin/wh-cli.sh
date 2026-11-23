@@ -25,6 +25,8 @@
 #   lookup <sid> [session_json]              host_id or empty    0 always (empty == no mapping)
 #   close <host_id>                          —                   0 released or already gone
 #                                                                1 real failure (still alive)
+#                                                                4 refused: the caller's own surface
+#                                                                  (task 1304 r3; nothing closed)
 #   alive <host_id>                          —                   0 alive OR cannot-probe
 #                                                                    (INV-17 INDETERMINATE→alive)
 #                                                                1 host answered "no such handle"
@@ -36,7 +38,9 @@
 #   set-status <host_id> <state>             —                   0 always (unrecognized state = no-op)
 #   clear-status <host_id>                   —                   0 always
 #   close-for-sid <sid> [session_json]       —                   0 no mapping, or closed
-#                                                                1 mapped but close failed
+#                                                                1 mapped but close failed, or the
+#                                                                  lookup itself failed
+#                                                                4 refused: the caller's own surface
 #   read-screen <host_id|sid>                viewport text       0 read, 1 read failed,
 #                                            (20: one labelled   20 adapter has no screen reader
 #                                             line)                 (task 1304 D4)
@@ -93,7 +97,7 @@ matching shell function with the same exit code and the same stdout.
   open <sid> <cwd> <cli_cmd>              spawn a ready surface; prints host_id
                                           (2=spawn failed, 3=ready-gate timeout)
   lookup <sid> [session_json]             print host_id, or empty if unmapped
-  close <host_id>                         release the surface (1=still alive)
+  close <host_id>                         release the surface (1=still alive, 4=own surface)
   alive <host_id>                         0=alive or cannot-probe, 1=gone
   list-ids                                print every known host_id, one per line
   focus <host_id>                         raise the surface
